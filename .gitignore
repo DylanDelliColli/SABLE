@@ -1,0 +1,10 @@
+# Personal feedback notes captured by sable-note — never committed.
+# These are raw observations; curate via /sable-review into clean PRs when ready.
+feedback/*.md
+
+# Backups created by install.sh / install.ps1 when prepending Prime Directives
+*.bak.*
+
+# Editor noise
+.DS_Store
+*.swp

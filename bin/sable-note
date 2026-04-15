@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# sable-note — frictionless capture of SABLE methodology observations.
+#
+# Appends a timestamped entry to ~/dev-environment/SABLE/feedback/YYYY-MM-DD.md
+# (or to $SABLE_FEEDBACK_DIR/YYYY-MM-DD.md if that env var is set).
+#
+# Each entry captures: timestamp, working directory, git context (branch + short
+# rev if in a repo), and the observation text. Designed to be runnable from
+# anywhere on PATH so capture is a 3-second action, not a context switch.
+#
+# Usage:
+#   sable-note "<observation>"           # capture a one-liner
+#   sable-note --list                    # show today's notes
+#   sable-note --dir                     # print the feedback dir path and exit
+#   sable-note --help                    # show this help
+
+set -eu
+
+# Resolve feedback dir. Default: alongside this script in the SABLE repo.
+# Override via SABLE_FEEDBACK_DIR env var.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+DEFAULT_FEEDBACK_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)/feedback"
+FEEDBACK_DIR="${SABLE_FEEDBACK_DIR:-${DEFAULT_FEEDBACK_DIR}}"
+
+usage() {
+    cat <<EOF
+sable-note — capture SABLE methodology observations from any directory.
+
+Usage:
+  sable-note "<observation>"     Append an observation to today's feedback file
+  sable-note --list              Print today's notes
+  sable-note --dir               Print the feedback directory path
+  sable-note --help              Show this help
+
+Environment:
+  SABLE_FEEDBACK_DIR             Override feedback dir location
+                                 (default: ${DEFAULT_FEEDBACK_DIR})
+
+Files are appended to: <feedback-dir>/YYYY-MM-DD.md
+
+Each entry records: timestamp · cwd · git branch+rev (if applicable) · observation.
+
+Use this whenever you notice the SABLE methodology hits a gap, a friction point,
+or anything not covered by the current framework. Don't pause to think about
+whether it's worth filing — capture first, curate later (via /sable-review).
+EOF
+}
+
+# Handle flags / no-args
+if [ $# -eq 0 ]; then
+    usage
+    exit 1
+fi
+
+case "${1}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    --dir)
+        printf '%s\n' "${FEEDBACK_DIR}"
+        exit 0
+        ;;
+    --list)
+        TODAY_FILE="${FEEDBACK_DIR}/$(date +%Y-%m-%d).md"
+        if [ -f "${TODAY_FILE}" ]; then
+            cat "${TODAY_FILE}"
+        else
+            printf 'No notes yet for %s\n' "$(date +%Y-%m-%d)"
+        fi
+        exit 0
+        ;;
+esac
+
+# Treat all positional args as the observation text (allows unquoted multi-word use).
+OBSERVATION="$*"
+
+# Gather context
+TIMESTAMP="$(date +%Y-%m-%dT%H:%M:%S%z)"
+CWD="$(pwd)"
+GIT_CONTEXT=""
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+    REV="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    GIT_CONTEXT=" · git: ${BRANCH}@${REV}"
+fi
+
+# Ensure feedback dir exists
+mkdir -p "${FEEDBACK_DIR}"
+
+# Determine today's file
+TODAY_FILE="${FEEDBACK_DIR}/$(date +%Y-%m-%d).md"
+
+# If new file, write a header
+if [ ! -f "${TODAY_FILE}" ]; then
+    cat > "${TODAY_FILE}" <<EOF
+# SABLE feedback — $(date +%Y-%m-%d)
+
+Raw observations captured from work sessions. Curate via \`/sable-review\` when ready.
+
+EOF
+fi
+
+# Append the entry
+{
+    printf -- '---\n\n'
+    printf '**%s** · cwd: `%s`%s\n\n' "${TIMESTAMP}" "${CWD}" "${GIT_CONTEXT}"
+    printf '%s\n\n' "${OBSERVATION}"
+} >> "${TODAY_FILE}"
+
+# Confirm to stderr so output doesn't pollute pipelines
+printf 'noted → %s\n' "${TODAY_FILE}" >&2
