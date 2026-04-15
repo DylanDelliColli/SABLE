@@ -4,6 +4,23 @@
 
 ---
 
+## ⚠️ Prime Directive: All Work Flows Through Beads
+
+**This is the single non-negotiable rule of the entire methodology. Every other section of this document exists to support it.**
+
+If you are an agent reading this document, internalize the following before doing anything else:
+
+- **Every unit of work — bug fix, feature, refactor, investigation, doc edit, even one-line changes — must exist as a bead before you start it.** No exceptions for "quick" tasks. No exceptions for "I'll log it after." No exceptions because the bead "feels like overkill."
+- **Every bug, smell, or unexpected behavior you notice — at any time, in any context, even tangential to your current task — must immediately become a bead.** Do not ask "should I log this?" Do not finish your current thought first. Stop, log, then continue. See §3.7.
+- **Never use TodoWrite, in-conversation task lists, scratch markdown plans, or your own memory as a substitute for beads.** The user has told you explicitly: this framework is the foundation of all programming work. Bypassing it — even for "small" things — corrupts the foundation.
+- **If you cannot articulate which bead your current action serves, stop and create one.** This is the single best test of whether you are inside the methodology or drifting out of it.
+
+The reasoning is in §2 (Core Principles), but the rule does not depend on you understanding the reasoning. **Follow it first; the rest of the document explains why it works.**
+
+If you find yourself in a situation where the rule seems impractical — the bead would be trivial, the work is "obviously" too small, the user "just wants a quick fix" — the answer is still to create the bead. `bd q "<title>"` makes capture take three seconds. Your sense that "this one doesn't need a bead" is the failure mode this document was written to prevent.
+
+---
+
 ## Table of Contents
 
 1. [Introduction & Thesis](#1-introduction--thesis)
@@ -177,20 +194,57 @@ Check blocking relationships:
 ```bash
 bd blocked          # Show all blocked beads
 bd show <id>        # See what blocks/is blocked by this bead
+bd dep tree <id>    # Visualize the full dependency tree under a bead
 ```
 
-### 3.5 The Backlog Is the Plan
+`bd dep add` is for **blocking** dependencies (work order). For non-blocking links between beads that are merely *related* (same area, share context), use:
+
+```bash
+bd dep relate A B    # Bidirectional "relates to" — does NOT block
+bd dep unrelate A B  # Remove the relation
+```
+
+This matters for swarm planning: blocking deps reduce parallelism (children of a sequential chain can't run concurrently). Use `relate` when you want discoverability without sacrificing throughput.
+
+### 3.5 Hierarchy & Structure
+
+Epics group child beads. Children inherit context (and optionally labels) from their parent. SABLE uses this hierarchy to make swarm execution legible — one epic per coherent body of work, children for individual deliverables.
+
+```bash
+# Create a child bead linked to a parent on creation
+bd create --title="..." --description="..." --type=task --parent=<epic-id>
+
+# Reparent an existing bead (use empty string to detach)
+bd update <id> --parent=<new-parent-id>
+
+# List all children of a parent (closed children included by default)
+bd children <epic-id>
+bd children <epic-id> --pretty   # Tree view
+
+# Epic lifecycle
+bd epic status <epic-id>          # Show completion progress
+bd epic close-eligible            # Auto-close epics whose children are all done
+```
+
+Children inherit labels from their parent unless you pass `--no-inherit-labels`. This means tagging the epic correctly propagates to the swarm.
+
+The `--waits-for-gate` flag controls when an epic considers itself "ready":
+- `all-children` (default) — epic stays open until every child closes
+- `any-children` — epic closes as soon as any child closes (rare; useful for "first one wins" patterns)
+
+### 3.6 The Backlog Is the Plan
 
 In SABLE, you don't write a separate implementation plan and then create beads. **The beads are the plan.** The design-to-beads workflow:
 
 1. **Think through the approach.** Understand the problem, identify the solution, consider edge cases.
-2. **Convert every deliverable into beads.** Each bead gets a full description that passes the Fresh Agent Test. Create an epic for the overall goal and child beads for individual deliverables.
+2. **Convert every deliverable into beads.** Each bead gets a full description that passes the Fresh Agent Test. Create an epic for the overall goal (`bd create --type=epic`) and child beads for individual deliverables (`bd create --parent=<epic-id>`).
 3. **Add dependencies.** Use requirement language: "B needs A."
-4. **Work from `bd ready`.** Claim, implement, verify, close, repeat.
+4. **Validate the structure.** Run `bd swarm validate <epic-id>` to see ready fronts (waves of parallel work), estimated worker-sessions, and warnings.
+5. **Work from `bd ready`** (or kick off a swarm — see section 6.5).
 
 If a session ends mid-work, the next agent runs `bd ready` and continues. No re-reading plans. No lost context. The beads are the single source of truth.
 
-### 3.6 Issue Discovery Is Mandatory
+### 3.7 Issue Discovery Is Mandatory
 
 Any bug, bad practice, incorrect behavior, pre-existing error, or code smell noticed at any time — by any agent, during any task — must be immediately logged as a bead. This is non-negotiable.
 
@@ -276,6 +330,53 @@ The `[no-test]` marker in the bead's notes field tells the gate hook to allow th
 Rules for the escape hatch:
 - Only works on **single-bead closes** (`bd close <id>`). Multi-bead closes (`bd close id1 id2 id3`) always require test evidence — this prevents one `[no-test]` bead from bypassing the gate for code beads bundled in the same close.
 - The `[no-test]` marker must be added explicitly. Agents can't accidentally skip tests — they have to consciously opt out.
+
+### 4.5 Test Coverage Required: Unit + Integration
+
+**Unit tests alone are not sufficient. Every code change requires both unit AND integration coverage for the behavior it touches.** This is not a stylistic preference — it is a hard requirement of the methodology, on the same level as the Prime Directive.
+
+The reasoning: agents are excellent at writing unit tests that pass while still shipping broken systems. Mocked dependencies hide the bugs that actually cause production outages. Two functions that each pass their unit tests can still fail when composed. The only test that proves a feature works is one that exercises the real composition of the moving parts.
+
+**The required layers:**
+
+| Layer | Required? | What it tests | Examples |
+|-------|-----------|---------------|----------|
+| **Unit** | **Required** | A single function/class/module in isolation. Mocks for everything external. | `test_calculate_affordability_with_zero_income()` |
+| **Integration** | **Required** | Multiple components working together against real dependencies (real DB, real HTTP, real file system). No mocks for the things being integrated. | `test_briefing_generation_writes_to_supabase()`, `test_geocoding_pipeline_against_local_db()` |
+| **Smoke** | **Strongly encouraged, not gated** | The smallest end-to-end "does the thing start and respond at all?" check. Not exhaustive — just proof of life. | `test_app_starts_and_health_endpoint_returns_200()`, `test_cli_invokes_without_crash()` |
+
+**Concrete rules:**
+
+1. **Every bead description must specify both a unit test file/assertion AND an integration test file/assertion.** If only one is specified, the bead fails the Fresh Agent Test — the next worker won't know whether integration coverage was waived deliberately or forgotten.
+2. **If a change cannot be integration-tested, the bead must explicitly say why** in the description (e.g. "no integration test — pure type-level refactor with no runtime effect"). This is treated like the `[no-test]` escape hatch: an explicit, audited opt-out, not a default.
+3. **Mocking the database in integration tests defeats the purpose.** Use a real local database (Docker, sqlite, ephemeral postgres). Mocks belong in unit tests; integration tests must hit real systems or they are unit tests with a misleading label.
+4. **Smoke tests are encouraged for any service with a startup path** (web server, CLI, worker). They catch the entire class of bugs where "the code is correct but the service won't boot." But they are not blocked by the gate hook — missing smoke tests are a code review issue, not a close-time block.
+
+**Updated bead-description template:**
+
+```
+Fix _build_cache_key collisions in orchestrator.py:142
+
+Test spec:
+  Unit:        tests/unit/test_cache.py::test_cache_key_with_slashes
+               Assert keys with "/" produce distinct cache entries.
+  Integration: tests/integration/test_orchestrator.py::test_orchestrator_caches_distinct_locations
+               Run two locations whose names differ only by slash placement;
+               assert both make it through the orchestrator without collision
+               (real local Supabase, no mocks).
+  Smoke:       (optional) make sure the orchestrator starts cleanly with the new key fn.
+```
+
+**For dispatch prompts**, the worker must be told to run BOTH layers before closing:
+
+```
+Run:
+  pytest tests/unit/test_cache.py -v
+  pytest tests/integration/test_orchestrator.py -v -m integration
+Both must pass before bd close.
+```
+
+The `tdd-gate` hook accepts evidence from any test invocation, so it does not distinguish layers. **The discipline lives in the bead description and dispatch prompt, not in the hook.** This is intentional — you cannot mechanically detect "did the test actually exercise the real integration." You can only enforce that the bead specified what was required and the worker executed it.
 
 ---
 
@@ -759,19 +860,90 @@ Cluster 2-3 related beads per worker when they share context (same file, same di
 
 Don't over-bundle. If beads touch different subsystems, dispatch them as separate workers — parallelism is more valuable than reducing agent count.
 
-### 6.4 Overlap Resilience
+### 6.4 Worktree Isolation
+
+Parallel agents editing the same working tree is the single biggest source of merge conflicts in swarm execution. The fix is `git worktree` — separate working directories sharing one git repo, so each worker operates in its own checkout.
+
+Beads provides `bd worktree` as the right way to do this. Plain `git worktree add` works but creates two problems: (1) the new worktree has no `.beads` database, so `bd` commands fail; (2) you have to wire up branch naming and gitignore manually.
+
+```bash
+# Create a worktree at ./feature-auth on a new branch of the same name
+bd worktree create feature-auth
+
+# With a specific branch name
+bd worktree create worker-1 --branch=fix/cache-keys
+
+# Outside the repo (avoid cluttering main checkout)
+bd worktree create ../agents/worker-1
+
+# Inspect
+bd worktree list           # All worktrees
+bd worktree info           # Info about the current one
+bd worktree remove <name>  # Remove (with safety checks)
+```
+
+`bd worktree create` automatically:
+- Creates the git worktree at `./<name>` (or specified path)
+- Sets up `.beads/redirect` pointing to the main repo's beads database (workers see the same issue state)
+- Adds the worktree path to `.gitignore` if inside the repo root
+
+**The pattern for swarms:** before dispatching N parallel workers, the orchestrator creates N worktrees (one per worker), and each worker's dispatch prompt specifies its worktree path. Workers can edit overlapping areas without stepping on each other; the orchestrator merges their branches sequentially after they close.
+
+**Anti-pattern:** dispatching multiple workers into the same working tree because "they're touching different files." This breaks the moment one worker imports from a file another is editing, when shared config changes, or when test runners cache state. Use a worktree per worker; the cost is one bash call.
+
+### 6.5 Formal Swarms with `bd swarm`
+
+Section 6.2 covered the dispatch pattern. `bd swarm` formalizes it: an epic + its children become a registered "swarm molecule" with structure-aware tooling.
+
+```bash
+# Validate before dispatching — surfaces ready fronts and warnings
+bd swarm validate <epic-id>
+bd swarm validate <epic-id> --verbose   # Include detailed graph
+
+# Create the swarm molecule (registers it for discovery)
+bd swarm create <epic-id>
+
+# Live status
+bd swarm status
+
+# List all swarms
+bd swarm list
+```
+
+`bd swarm validate` is the highest-leverage piece. It outputs:
+- **Ready fronts** — waves of parallel work (children with no remaining blockers)
+- **Estimated worker-sessions** — how many dispatches the swarm will need
+- **Maximum parallelism** — the widest front in the DAG
+- **Warnings** — circular deps, stranded children, missing test files
+
+Run this before creating worktrees. If max parallelism is 2, you don't need 5 worktrees. If validate shows warnings, fix them before dispatching — debugging a swarm mid-execution is much harder than fixing the plan.
+
+**When to use `bd swarm` vs ad-hoc dispatch:**
+- **Ad-hoc**: 2-3 beads, all clearly independent, you can hold the whole plan in your head. Just dispatch.
+- **Formal swarm**: 4+ beads with non-trivial dependencies, or work that will span multiple sessions. The extra ceremony pays for itself in legibility.
+
+### 6.6 Advanced Coordination Primitives
+
+Two primitives exist for cross-cutting coordination but are situational. Use them when you actually need them; don't pre-emptively build workflows around them.
+
+- **`bd gate`** — async wait conditions that block downstream work. Types: `human` (manual close), `timer`, `gh:run` (waits for a workflow), `gh:pr` (waits for a PR merge), `bead` (waits for a bead in another rig). Use when one bead's progress depends on something happening *outside* the local issue tracker.
+- **`bd merge-slot`** — a mutex for the merge queue. Only one agent holds the slot at a time, preventing parallel agents from racing to resolve conflicts and creating cascading conflicts. Use when running auto-merging swarms; not needed when a human reviews and merges each PR sequentially.
+
+`bd gate --help` and `bd merge-slot --help` have full reference. Document a project-specific use case in the project's CLAUDE.md *after* you've used the primitive once.
+
+### 6.7 Overlap Resilience
 
 In a swarm, things don't always go as planned:
 
 - **A worker finds its bead already closed.** Another worker completed it (perhaps it was a dependency that got resolved). The worker should skip gracefully and continue to its next bead.
 
-- **Two workers edit the same file.** This happens when bundling isn't perfect. Git handles most merge conflicts automatically. For the rest, the orchestrator resolves conflicts after workers complete.
+- **Two workers edit the same file.** This happens when worktree isolation isn't used or when bundling isn't perfect. Git handles most merge conflicts automatically. For the rest, the orchestrator resolves conflicts after workers complete.
 
 - **A worker fails mid-task.** The bead stays open (in_progress status). The orchestrator can dispatch a new worker to pick it up, or investigate and re-plan.
 
 The key insight: **beads make recovery trivial.** Because every unit of work is tracked independently, a failed worker doesn't corrupt the overall plan. You just re-dispatch.
 
-### 6.5 Grep After Refactors
+### 6.8 Grep After Refactors
 
 When a worker removes or renames a variable, function, import, or prop, it **must** grep for all references across the codebase before closing. Removing a declaration without updating every consumer causes runtime errors that surface later and are harder to debug.
 
@@ -783,7 +955,7 @@ before closing. Removing a declaration without updating consumers
 causes runtime errors.
 ```
 
-### 6.6 Model Selection for Workers
+### 6.9 Model Selection for Workers
 
 Different tasks benefit from different models:
 
@@ -1079,6 +1251,12 @@ Create `~/.claude/CLAUDE.md` with your cross-project workflow rules. Keep it und
 ```markdown
 # Global Instructions
 
+## ⚠️ Prime Directive
+
+**ALL work flows through beads. No exceptions.**
+
+Every bug fix, feature, refactor, investigation, and noticed issue must exist as a bead before you act on it. If you cannot point to the bead your current action serves, stop and create one. `bd q "<title>"` takes three seconds — there is no task too small. Never substitute TodoWrite, scratch lists, or memory for beads. This is the foundation; bypassing it corrupts every other practice.
+
 ## Beads Issue Tracker
 
 All projects use **bd (beads)** for issue tracking.
@@ -1089,17 +1267,27 @@ All projects use **bd (beads)** for issue tracking.
 - `bd update <id> --claim` — Claim work
 - `bd close <id>` — Complete work
 - `bd create --title="..." --description="..." --type=bug|task|feature --priority=2`
+- `bd q "<title>"` — Quick capture (just outputs ID; use for failure-trigger logging)
+- `bd defer <id>` — Real bead but not for now (drops out of `bd ready`)
+- `bd children <id> --pretty` — Tree view of children under a parent/epic
+- `bd swarm validate <epic-id>` — Pre-flight a swarm: see ready fronts, parallelism, warnings
+- `bd worktree create <name>` — Isolated worktree with shared beads database (use before parallel dispatch)
+- `bd preflight` — PR readiness check before `git push`
 
 ### Rules
 - Use `bd` for ALL task tracking
 - Issue discovery is mandatory — see a bug, log a bead
+- **Every code change requires both unit AND integration tests** (smoke tests encouraged). Unit tests alone are insufficient — see SABLE §4.5.
 - One `bd` command per Bash call (no chaining with && or ;)
 - Never use `bd edit` — it opens $EDITOR and hangs agents
 
 ### Description Quality: The Fresh Agent Test
 Could a fresh agent act on this bead without re-exploring source files?
 A good description includes: file paths, function names, what's wrong,
-suggested approach, test spec (which test file, what assertions).
+suggested approach, **and a test spec listing BOTH a unit test
+(file::test_name + assertions) AND an integration test (file::test_name +
+real dependencies it exercises).** If integration testing is genuinely
+not applicable, the bead must say so explicitly.
 
 ### Dependencies
 "B needs A" → `bd dep add B A` (requirement language, not temporal)
@@ -1108,21 +1296,52 @@ suggested approach, test spec (which test file, what assertions).
 - Bundle 2-3 related beads per agent
 - Include test file path and failing assertion in every prompt
 - Grep all references after refactors before closing
+- **Subagent capability inheritance is not automatic** — Bash, Edit, and Write permissions don't propagate from the orchestrator. If a subagent needs to run shell commands or modify files, either enable Accept Edits at the conversation level OR scope the subagent to read-only work (Read/Glob/Grep/Write to a known output path).
+
+### Shell Command Style
+Claude Code's ambiguous-syntax check fires **before** the allow list and prompts the user for any of these, even inside correctly-quoted strings:
+
+| Trigger | Example |
+|---------|---------|
+| Command chaining | `cmd1 && cmd2`, `cmd1 \|\| cmd2`, `cmd1; cmd2` |
+| Pipes / redirection | `cmd \| grep`, `cmd > file`, `cmd 2>&1` |
+| Command substitution | `$(cat foo)`, `` `cmd` `` |
+| Heredoc | `<<'EOF'` |
+
+**To run commands without permission prompts:**
+1. **Use Read / Glob / Grep / Edit / Write tools for file operations** — never bash for file reading or editing
+2. **One command per Bash call** — never chain with `&&`, `||`, or `;`
+3. **Resolve dynamic values once and hardcode** — instead of `$(cat .interpreter) script.py`, look up the path with Read, then call the absolute path directly
+4. **Write multi-step pipelines to a file, then run as one line** — `python3 /tmp/pipeline.py` beats inlining `python3 -c "..."` with chained commands
+5. **No heredocs** — use Write to create the file, then Bash to run it
+
+The cost of one extra Bash call is small. The cost of breaking flow on every permission prompt compounds.
 
 ### Anti-Patterns
 | Anti-Pattern | Why | Instead |
 |---|---|---|
 | `bd edit` | Hangs agent | `bd update <id> --field "..."` |
 | Code without tests | Hook blocks close | Test first; `[no-test]` for docs-only |
+| Code with only unit tests | Mocks hide composition bugs that ship to prod | Add integration tests against real deps; `[no-integration]` only with explicit reason in bead |
+| Mocking the database in integration tests | Tests pass while real system breaks | Use a real local DB (Docker, sqlite); mocks belong in unit tests |
 | Vague descriptions | Wastes agent cycle | Pass the Fresh Agent Test |
 | Stopping without push | Strands work | Push always |
+| `&&` / `\|\|` / `;` chains in Bash | Triggers permission prompt | One command per Bash call |
+| `$(cmd)` substitution in Bash | Triggers permission prompt | Resolve once, hardcode the value |
+| `python3 -c "long script"` | Hard to debug, often chained | Write to file, run with `python3 /tmp/foo.py` |
+| Subagent assumes Bash works | Permissions don't propagate | Verify capability or scope to read-only |
+| Manual `git worktree add` for parallel agents | Misses beads redirect; no `bd` access in worktree | `bd worktree create <name>` |
+| Multiple workers in same working tree | Cascading merge conflicts | One worktree per worker |
+| Skipping `bd swarm validate` before swarm dispatch | Find structural issues mid-execution | Validate first; warnings before workers |
 
 ## Session Close Protocol
 1. Close finished beads
-2. Create beads for remaining work
-3. git commit + git push
-4. bd dolt push
-5. git status must show "up to date with origin"
+2. Create beads for remaining work (use `bd q` for quick capture; `bd defer` for "real but not now")
+3. Run `bd preflight` for the PR readiness checklist
+4. git commit + git push
+5. bd dolt push
+6. git status must show "up to date with origin"
+7. If worktrees were used: `bd worktree remove <name>` for any completed ones
 ```
 
 #### Step 5: Write Project CLAUDE.md

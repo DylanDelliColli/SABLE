@@ -4,6 +4,14 @@
 
 ---
 
+## 🚀 Want to use SABLE in your own project?
+
+**Read [QUICKSTART.md](QUICKSTART.md) first.** It covers prerequisites, the install script (`bash install.sh`), the bootstrap prompt to give your agent on the first session, and a verification smoke test. ~10 minutes to get running.
+
+**This README is the long-form methodology document** — same content as `SABLE.md`, kept here for searchability on GitHub. Use it as a reference once you're on the framework, not as your starting point.
+
+---
+
 ## Table of Contents
 
 1. [Introduction & Thesis](#1-introduction--thesis)
