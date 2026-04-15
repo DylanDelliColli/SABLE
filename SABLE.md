@@ -54,7 +54,21 @@ But enforcement alone produces rigid, fragile systems. The second insight is tha
 
 ### SABLE in One Paragraph
 
-SABLE is a methodology for AI-assisted software development that combines three reinforcing systems: **Beads** (a granular issue tracker that serves as the execution contract between human planners and agent workers), **Test-Driven Development** (enforced mechanically via hooks, not just documented), and **Swarm Execution** (parallel agent dispatch with overlap resilience and mandatory verification). The human invests deeply in planning and specification. The agents execute quickly and correctly. Hooks ensure the rigorous checks and balances that make this possible are never skipped.
+SABLE is a methodology for AI-assisted software development that combines three reinforcing systems: **Beads** (a granular issue tracker that serves as the execution contract between human planners and agent workers), **Test-Driven Development** (enforced mechanically via hooks, not just documented), and **Swarm Execution** (parallel agent dispatch with overlap resilience and mandatory verification). The human invests deeply in planning and specification. The agents execute quickly and correctly. Hooks ensure the rigorous checks and balances that make this possible are never skipped. Swarm execution is in the name for a reason — it's where the throughput multiplier lives — but the methodology rewards a deliberate ramp into it (see Adoption Path below).
+
+### Adoption Path
+
+SABLE is designed so you can adopt it incrementally. The full methodology — including swarm — is the goal; new adopters reach it through a learning ramp rather than all at once.
+
+| Stage | What you use | When to climb |
+|-------|--------------|---------------|
+| **Foundation** | Beads + the Prime Directive + integration tests + hooks. Single agent, sequential work. | Day 1. Stay here until your bead descriptions consistently pass the Fresh Agent Test without conscious effort. |
+| **Hierarchy** | Add: epics, child beads, `bd dep tree`, `bd preflight`. | When you start hitting features that need 3+ beads with ordering. Usually after a week or two on Foundation. |
+| **Swarm** | Add: parallel agent dispatch via `bd swarm` and `bd worktree`. The full methodology. | Once spec-writing is automatic, you've shipped a few hierarchical features cleanly, and your usage budget supports running multiple agents in parallel. See §6. |
+
+**If you're new to AI-assisted development:** start at Foundation, even though the goal is Swarm. The discipline built at each stage is what makes the next stage work — bad beads in a swarm waste 5× the agent cycles of bad beads sequentially. Skipping the ramp is the most common failure mode this methodology was built to prevent.
+
+**If you're already comfortable with agentic coding:** you can climb the ramp in days, not weeks. The stages exist as guardrails, not gates.
 
 ---
 
@@ -811,6 +825,15 @@ Hook design principles:
 ---
 
 ## 6. Swarm Execution
+
+> **Swarm is core to SABLE — it's literally in the name (Swarm Architecture with Bead-Led Execution).** This section describes the full execution model the methodology was built for.
+>
+> **For new adopters:** climb here from Foundation deliberately, not on day one. Swarm assumes:
+> - **Sufficient API/usage budget** — parallel agents multiply token cost. A 5-agent swarm runs ~5× the cost of sequential.
+> - **Strong bead-writing discipline** — bad beads in a swarm waste 5× the agent cycles. The Fresh Agent Test must be second nature.
+> - **Comfort with merge orchestration** — even with `bd worktree`, you'll be merging multiple branches per session.
+>
+> If any of those aren't yet true for you, ship 2–3 features on the sequential pattern first. The discipline you build at Foundation is what makes swarms work — skipping the ramp is the most common failure mode. **Once you're ready, this is the level the methodology is designed for.**
 
 ### 6.1 The Orchestrator/Worker Model
 

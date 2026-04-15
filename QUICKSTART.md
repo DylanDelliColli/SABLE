@@ -11,10 +11,22 @@ After this guide, your coding agent (Claude Code, Codex CLI, or any tool that lo
 - Track every unit of work as a **bead** in a queryable issue database (no more lost context between sessions)
 - Refuse to close beads without test evidence (mechanically — not just by convention)
 - Require both unit AND integration tests for every code change
-- Coordinate parallel agents through `bd swarm` and `bd worktree` to prevent merge conflicts
 - Enforce description quality on every bead so the next amnesiac agent can pick up where the last one left off
+- Coordinate parallel agents through `bd swarm` and `bd worktree` once you climb to that stage
 
 This is opinionated. The whole point of the framework is that the rules are non-negotiable.
+
+### Adoption ramp — the install is the same, the practice ramps over time
+
+The full methodology (including swarm execution — it's in the name) is the destination. New adopters reach it through three stages:
+
+| Stage | Practice | When to climb |
+|-------|----------|---------------|
+| **Foundation** | Beads + integration tests + hooks. One agent at a time, sequential work. | Day 1. Stay here until your bead descriptions consistently pass the Fresh Agent Test without thinking about it. |
+| **Hierarchy** | Add: epics, child beads, dependencies, `bd preflight`. | When you start hitting multi-bead features that need ordering. |
+| **Swarm** | Add: parallel agents via `bd swarm` and `bd worktree`. | When spec-writing is automatic and your API budget supports it. See SABLE.md §6. |
+
+The install in this QUICKSTART is the same regardless of stage — all hooks, all bd commands, the full toolkit. **The ramp is about how you use it, not what you install.** New to agentic coding? Start sequential. Already comfortable? Climb fast.
 
 ---
 
@@ -23,7 +35,7 @@ This is opinionated. The whole point of the framework is that the rules are non-
 1. **A coding agent** that loads `~/.claude/CLAUDE.md` on session start. Confirmed working: Claude Code (CLI, desktop, IDE extensions), Codex CLI. Other agents work if they support a global instructions file.
 2. **bd (beads) installed.** Install from https://github.com/steveyegge/beads#installation. Verify with `bd version`.
 3. **Dolt (bd's storage backend).** Install from https://docs.dolthub.com/introduction/installation. Required for `bd dolt push` (session-close protocol). The installer will warn if dolt is missing but won't block on it.
-4. **git ≥ 2.5** (for worktrees).
+4. **git ≥ 2.5** (worktrees are used by swarm execution).
 5. **bash** to execute the hook scripts:
    - **Linux:** native bash.
    - **macOS:** native bash 3.2+ (the installer script supports this).
@@ -92,8 +104,11 @@ After reading, confirm in one short message that you understand and will follow:
    Smoke tests are encouraged but not gated.
 3. Issue Discovery: the moment you notice any bug, smell, or unexpected
    behavior — even tangential to the current task — log a bead immediately.
-4. Swarm hygiene: before any multi-agent dispatch, run `bd swarm validate`
-   then create one `bd worktree` per worker. Never share a working tree.
+4. Adoption stage: I am at the [Foundation | Hierarchy | Swarm] stage today.
+   Default to single-agent sequential work unless I explicitly ask for swarm
+   execution OR I've told you I'm at the Swarm stage. The full methodology
+   includes parallel agents (see SABLE.md §6) — that's the destination, not
+   necessarily the starting point.
 
 Then ask me what we're working on. Apply SABLE rigorously from the first bead onward.
 ```
@@ -126,17 +141,26 @@ If `bd close` succeeded the first time without asking for tests, the hooks aren'
 
 ## Day-1 workflow
 
-Your first real task on SABLE looks like this:
+Your first task on SABLE — at any stage — starts with the Foundation pattern:
 
-1. **Plan** — think through the change. Identify the deliverables.
-2. **Create an epic** for the overall goal: `bd create --title="..." --type=epic --description="..."`
-3. **Create child beads** for each deliverable: `bd create --parent=<epic-id> --title="..." --description="..."`. Each child must pass the Fresh Agent Test (file paths, function names, what's wrong, what tests to add at both unit AND integration layers).
-4. **Add dependencies** with requirement language: `bd dep add <child-B> <child-A>` means "B needs A."
-5. **Validate the structure**: `bd swarm validate <epic-id>`. Fix warnings before dispatching.
-6. **Dispatch**:
-   - Single bead: `bd update <id> --claim`, work, `bd close <id>` (gate fires)
-   - Parallel swarm: `bd worktree create worker-1`, `bd worktree create worker-2`, dispatch one agent per worktree, merge sequentially after they close
-7. **Session close**: `bd preflight`, then `git push`, `bd dolt push`. Work is not done until pushed.
+1. **Plan** — think through the change. Identify the deliverable.
+2. **Create the bead**: `bd create --title="..." --description="..." --type=bug|task|feature --priority=2`. The description must pass the Fresh Agent Test (file paths, function names, what's wrong, suggested approach, AND a test spec listing both unit and integration tests).
+3. **Claim and work**: `bd update <id> --claim`. Write the failing tests first (red), then the implementation (green), then run both unit and integration tests.
+4. **Close**: `bd close <id>`. The TDD gate hook fires here — if no tests ran this session, the close is blocked.
+5. **Session close**: `bd preflight`, then `git push`, `bd dolt push`. Work is not done until pushed.
+
+**Hierarchy stage** — add when features need 3+ beads with ordering:
+- Create an epic: `bd create --type=epic --title="..." --description="..."`
+- Create child beads: `bd create --parent=<epic-id> --title="..." --description="..."`
+- Add dependencies with requirement language: `bd dep add <child-B> <child-A>` means "B needs A"
+- Visualize: `bd dep tree <epic-id>` or `bd children <epic-id> --pretty`
+
+**Swarm stage** — add when spec-writing is automatic and your usage budget supports parallel agents:
+- Validate the structure: `bd swarm validate <epic-id>`. Fix warnings before dispatching.
+- Create one worktree per worker: `bd worktree create worker-1`, `bd worktree create worker-2`
+- Dispatch one agent per worktree
+- Merge their branches sequentially after they close
+- See SABLE.md §6 for the full pattern, gotchas, and coordination primitives (`bd gate`, `bd merge-slot`)
 
 The SABLE.md "Getting Started" section (§10) walks through this in more detail with worked examples.
 
