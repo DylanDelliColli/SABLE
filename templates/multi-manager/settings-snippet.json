@@ -1,6 +1,7 @@
 {
   "_comment": "Multi-Manager Pattern hooks — APPEND to your existing ~/.claude/settings.json. Do not replace existing arrays; merge with them.",
   "_install": "Copy each entry under the matching event/matcher into your existing settings.json hooks block.",
+  "_timeout_coupling": "pre-push-rebase-test.sh has TWO timeouts that must be kept in sync: the 'timeout' field below (ms, enforced by Claude Code) and the SABLE_PRE_PUSH_TEST_TIMEOUT env var (seconds, enforced by `timeout` inside the script). Default pairing: inner 60s test budget, outer 90000ms hook = 60s + ~30s buffer for fetch/rebase. To allow longer tests, raise BOTH: e.g. SABLE_PRE_PUSH_TEST_TIMEOUT=300 AND set 'timeout' here to 330000. Recommended: keep inner under 60s by running a fast subset (smoke + changed units), leave full-suite validation in CI.",
 
   "hooks": {
     "SessionStart": [
@@ -46,7 +47,7 @@
           {
             "type": "command",
             "command": "bash ~/.claude/hooks/multi-manager/pre-push-rebase-test.sh",
-            "timeout": 60000
+            "timeout": 90000
           }
         ]
       },

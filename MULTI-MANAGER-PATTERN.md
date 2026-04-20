@@ -216,10 +216,36 @@ A `PreToolUse:Bash` hook matching `git push` enforces:
 ```bash
 git fetch origin
 git rebase $SABLE_BASE_BRANCH
-<test command from project CLAUDE.md>
+<test command>
 ```
 
 Push is denied if the rebase fails or tests fail. Catches "my branch is behind main" and regression cases *locally* before exposing them to CI.
+
+**Run a fast subset, not the full suite.** Pre-push blocks the manager agent while tests run — if the suite takes 5 minutes, that's 5 minutes of dead time per push. The recommended pattern is to scope `SABLE_TEST_COMMAND` to a fast subset (smoke + changed unit tests), target <60 seconds, and keep full-suite validation in CI. Anything slower and operators reach for `SABLE_SKIP_PRE_PUSH=1`, defeating the purpose.
+
+Examples:
+
+```bash
+# Vitest — changed-only tests
+export SABLE_TEST_COMMAND="npm test -- --changed --run"
+
+# Pytest — unit layer with fail-fast and last-failed prioritization
+export SABLE_TEST_COMMAND="pytest tests/unit -x --lf"
+
+# Custom script
+export SABLE_TEST_COMMAND="bash ./scripts/pre-push-smoke.sh"
+```
+
+**Timeout coupling — both values must match.** The hook has two independent timeouts:
+
+| Timeout | Location | Default | Controls |
+|---------|----------|---------|----------|
+| Inner (test budget) | `$SABLE_PRE_PUSH_TEST_TIMEOUT` (seconds) | 60 | How long the test command may run |
+| Outer (hook budget) | `"timeout"` in settings.json (ms) | 90000 | How long Claude Code lets the entire hook run |
+
+The outer MUST exceed the inner plus ~30s buffer for fetch/rebase. If you raise one, raise the other. If the outer is lower than the inner, Claude Code kills the hook before tests finish — they appear to "pass" because the hook exits nonzero without returning a deny decision.
+
+Default pairing (inner 60s / outer 90000ms) is sized for a fast pre-push subset. For a 5-minute test budget: set `SABLE_PRE_PUSH_TEST_TIMEOUT=300` AND change settings.json to `"timeout": 330000`.
 
 ### 6. Post-push Chuck notification
 
@@ -310,14 +336,18 @@ cp templates/multi-manager/commands/inbox.md ~/.claude/commands/inbox.md
 
 Add to your existing `~/.claude/settings.json` (do not replace — append to existing arrays). See [`templates/multi-manager/settings-snippet.json`](templates/multi-manager/settings-snippet.json) for the exact JSON to merge.
 
-### Step 5: Configure base branch (per repo)
+### Step 5: Configure base branch and test subset (per repo)
 
 ```bash
 # In each repo's project CLAUDE.md or shell wrapper
-export SABLE_BASE_BRANCH=origin/dev    # or origin/main, or whatever you integrate against
+export SABLE_BASE_BRANCH=origin/dev           # or origin/main
+export SABLE_TEST_COMMAND="npm test -- --changed --run"   # fast subset, see §Coordination mechanism 5
+export SABLE_PRE_PUSH_TEST_TIMEOUT=60         # seconds, pair with settings.json outer timeout
 ```
 
-If unset, hooks default to `origin/main`.
+Defaults: `SABLE_BASE_BRANCH=origin/main`, `SABLE_TEST_COMMAND` auto-detected from project files (`npm test` / `pytest` / `cargo test` / `go test ./...`), `SABLE_PRE_PUSH_TEST_TIMEOUT=60`.
+
+If you need a longer test budget, remember to raise `"timeout"` in settings.json to match — see Coordination mechanism 5 for the coupling rule.
 
 ### Step 6: Add aliases
 
