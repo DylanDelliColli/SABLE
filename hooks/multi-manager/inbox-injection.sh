@@ -86,6 +86,9 @@ import json, os
 items = os.environ.get('NEW_ITEMS', '')
 name = os.environ.get('CLAUDE_AGENT_NAME', '').upper()
 print(json.dumps({
-    'additionalContext': f'INBOX ({name}) — new addressed beads:\n{items}\n\nRun \`bd show <id>\` to read. Run \`/inbox\` to see all current items.'
+    'hookSpecificOutput': {
+        'hookEventName': 'PostToolUse',
+        'additionalContext': f'INBOX ({name}) — new addressed beads:\n{items}\n\nRun \`bd show <id>\` to read. Run \`/inbox\` to see all current items.'
+    }
 }))
 "

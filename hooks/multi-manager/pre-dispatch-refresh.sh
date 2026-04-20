@@ -83,7 +83,10 @@ wt = os.environ.get('WORKTREE', '')
 bb = os.environ.get('BASE_BRANCH', '')
 out = os.environ.get('REBASE_OUT', '')[:500]
 print(json.dumps({
-    'additionalContext': f'PRE-DISPATCH WARNING: rebase of {wt} on {bb} failed and was aborted. Resolve manually before dispatching this worker, or dispatch into a fresh worktree. Output:\n{out}'
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'additionalContext': f'PRE-DISPATCH WARNING: rebase of {wt} on {bb} failed and was aborted. Resolve manually before dispatching this worker, or dispatch into a fresh worktree. Output:\n{out}'
+    }
 }))
 "
   exit 0

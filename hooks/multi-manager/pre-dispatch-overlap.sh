@@ -130,6 +130,9 @@ OVERLAPS="$OVERLAPS" python3 -c "
 import json, os
 overlaps = os.environ.get('OVERLAPS', '')
 print(json.dumps({
-    'additionalContext': f'OVERLAP DETECTED — proposed dispatch shares files with active in-progress work:\n{overlaps}\n\nDispatch will proceed. If intentional collaboration is needed, file a coord bead. Chuck will see this overlap context on PR submission and can sequence merges accordingly.'
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'additionalContext': f'OVERLAP DETECTED — proposed dispatch shares files with active in-progress work:\n{overlaps}\n\nDispatch will proceed. If intentional collaboration is needed, file a coord bead. Chuck will see this overlap context on PR submission and can sequence merges accordingly.'
+    }
 }))
 "

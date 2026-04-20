@@ -23,7 +23,20 @@ ROLE_CONTENT="$ROLE_CONTENT" python3 -c "
 import json, os, sys
 content = os.environ.get('ROLE_CONTENT', '')
 name = os.environ.get('CLAUDE_AGENT_NAME', '').upper()
+
+# Detect which event fired us (SessionStart or PreCompact) so we emit the
+# correct hookEventName in hookSpecificOutput. Claude Code silently drops
+# additionalContext payloads if the wrapper/event name is missing or wrong.
+try:
+    hook_input = json.load(sys.stdin)
+    event = hook_input.get('hook_event_name', 'SessionStart')
+except Exception:
+    event = 'SessionStart'
+
 print(json.dumps({
-    'additionalContext': f'=== AGENT IDENTITY: {name} ===\n\n{content}\n\n=== END IDENTITY ===\n\nYou are {name}. Operate within this role. Do not act as another manager.'
+    'hookSpecificOutput': {
+        'hookEventName': event,
+        'additionalContext': f'=== AGENT IDENTITY: {name} ===\n\n{content}\n\n=== END IDENTITY ===\n\nYou are {name}. Operate within this role. Do not act as another manager.'
+    }
 }))
 "

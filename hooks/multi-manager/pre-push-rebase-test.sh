@@ -131,7 +131,10 @@ if [ "$TEST_PHASE" = "skip" ]; then
   python3 -c "
 import json
 print(json.dumps({
-    'additionalContext': 'Pre-push: rebase complete; test phase skipped (SABLE_PRE_PUSH_TEST_PHASE=skip). Repo git hooks handle test gating.'
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'additionalContext': 'Pre-push: rebase complete; test phase skipped (SABLE_PRE_PUSH_TEST_PHASE=skip). Repo git hooks handle test gating.'
+    }
 }))
 "
   exit 0
@@ -157,7 +160,10 @@ if [ -z "$TEST_CMD" ]; then
   python3 -c "
 import json
 print(json.dumps({
-    'additionalContext': 'Pre-push: rebase complete, but no test command detected (no package.json/pyproject.toml/Cargo.toml/go.mod). Set SABLE_TEST_COMMAND to enforce tests before push.'
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'additionalContext': 'Pre-push: rebase complete, but no test command detected (no package.json/pyproject.toml/Cargo.toml/go.mod). Set SABLE_TEST_COMMAND to enforce tests before push.'
+    }
 }))
 "
   exit 0
