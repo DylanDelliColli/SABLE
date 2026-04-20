@@ -1,0 +1,108 @@
+{
+  "_comment": "Multi-Manager Pattern hooks — APPEND to your existing ~/.claude/settings.json. Do not replace existing arrays; merge with them.",
+  "_install": "Copy each entry under the matching event/matcher into your existing settings.json hooks block.",
+
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/session-role-anchor.sh",
+            "timeout": 3000
+          }
+        ]
+      }
+    ],
+
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/session-role-anchor.sh",
+            "timeout": 3000
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/inbox-injection-precompact.sh",
+            "timeout": 2000
+          }
+        ]
+      }
+    ],
+
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/read-guard.sh",
+            "timeout": 3000
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/pre-push-rebase-test.sh",
+            "timeout": 60000
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-preempt.sh",
+            "timeout": 3000
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-refresh.sh",
+            "timeout": 30000
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-claim.sh",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-overlap.sh",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/edit-write-claim-reconciler.sh",
+            "timeout": 3000
+          }
+        ]
+      }
+    ],
+
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/inbox-injection.sh",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/post-push-merge-notify.sh",
+            "timeout": 10000
+          }
+        ]
+      }
+    ]
+  }
+}

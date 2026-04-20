@@ -1,0 +1,66 @@
+# SABLE Multi-Manager Pattern: agent registry
+# Install location: ~/.claude/sable/agents.yaml
+#
+# This file is the single source of truth for agent identities, scopes, and
+# coordination rules. All multi-manager hooks read it dynamically. Adding,
+# removing, or modifying an agent requires no hook code changes — just edit
+# this file and create/update the matching role prompt in roles/<name>.md.
+
+agents:
+  optimus:
+    type: epic_manager
+    scope: "Large feature epics, hardening work, multi-bead sequences requiring continuity"
+    claim_filter: "--has-parent"        # bd ready filter for general pool work
+    inbox_label: for-optimus
+    role_prompt: roles/optimus.md
+    dispatches_workers: true
+
+  tarzan:
+    type: one_off_manager
+    scope: "Bugfixes, one-offs, doc updates, anything standalone (regardless of priority)"
+    claim_filter: "--no-parent"
+    inbox_label: for-tarzan
+    role_prompt: roles/tarzan.md
+    dispatches_workers: true
+
+  chuck:
+    type: integrator
+    scope: "Merge queue, PR review, conflict resolution, sequencing"
+    claim_filter: "for-chuck-only"      # only acts on addressed coord beads
+    inbox_label: for-chuck
+    role_prompt: roles/chuck.md
+    dispatches_workers: false
+
+    # Chuck-specific: when to fix in place vs delegate to PR author
+    fix_directly:
+      - imports                # import order, grouping
+      - lockfile               # package-lock.json, Cargo.lock, yarn.lock
+      - whitespace             # formatting, trailing whitespace
+      - non_overlapping_diffs  # different line ranges in same file
+      - docs                   # pure documentation conflicts
+
+    delegate_to_author:
+      - overlapping_logic      # both branches modified the same logic
+      - semantic_conflicts     # competing implementations
+      - test_divergence        # test expectations differ
+      - config_changes         # env defaults, feature flags
+
+    post_push_autoack: true    # Chuck files an ack bead when PR is reviewed
+
+# Add new agents here using the same shape. Common additions:
+#
+#  researcher:
+#    type: investigator
+#    scope: "Codebase exploration, design proposals, spike investigation"
+#    claim_filter: "--label=research"
+#    inbox_label: for-researcher
+#    role_prompt: roles/researcher.md
+#    dispatches_workers: true
+#
+#  qa:
+#    type: quality_validator
+#    scope: "Cross-cutting test coverage, regression analysis, integration suites"
+#    claim_filter: "--label=qa"
+#    inbox_label: for-qa
+#    role_prompt: roles/qa.md
+#    dispatches_workers: true
