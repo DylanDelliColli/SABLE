@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pre-push-rebase-test.sh — Force rebase + tests before git push succeeds
+# pre-push-rebase-test.sh — Force rebase (+ optional tests) before git push succeeds
 # Trigger: PreToolUse:Bash matching `git push`
 #
 # Catches "branch is behind main" and regression cases LOCALLY before exposing
@@ -7,28 +7,46 @@
 #
 # Configuration:
 #   $SABLE_BASE_BRANCH              — branch to rebase against (default: origin/main)
-#   $SABLE_TEST_COMMAND             — test invocation (see notes below)
+#   $SABLE_PRE_PUSH_TEST_PHASE      — "auto" (default) | "skip"
+#                                     "skip" runs rebase only; delegates tests to the
+#                                     repo's own tooling (e.g. .githooks/pre-push).
+#   $SABLE_TEST_COMMAND             — test invocation (used when PHASE=auto; see below)
 #   $SABLE_PRE_PUSH_TEST_TIMEOUT    — seconds allowed for tests (default: 60)
-#   $SABLE_SKIP_PRE_PUSH            — set to "1" to bypass (for emergency push)
+#   $SABLE_SKIP_PRE_PUSH            — set to "1" to bypass entirely (emergency push)
 #
-# IMPORTANT — timeout coupling:
-#   The outer hook timeout in settings.json MUST exceed SABLE_PRE_PUSH_TEST_TIMEOUT
-#   (plus ~30s buffer for fetch/rebase). If the outer timeout is lower, Claude Code
-#   kills the hook before the tests complete regardless of the inner budget.
+# Two operating modes:
 #
-#   Default pairing: inner 60s, outer 90000ms (settings.json "timeout": 90000).
-#   For a 5-minute test budget: inner 300, outer 330000.
+# 1. AUTO (default) — SABLE rebases, then runs tests.
+#    - Timeout-coupling caveat applies: the outer hook timeout in settings.json
+#      MUST exceed SABLE_PRE_PUSH_TEST_TIMEOUT plus ~30s for fetch/rebase.
+#    - Default pairing: inner 60s, outer 90000ms. For a 5-minute test budget:
+#      inner 300, outer 330000. Mismatch → Claude Code kills the hook before
+#      tests finish, they appear to "pass" via nonzero-without-deny, and
+#      regressions sneak through.
+#    - Recommended SABLE_TEST_COMMAND: a FAST SUBSET (smoke + changed units).
+#      Keep the full suite in CI. Under 60s keeps the pause tolerable.
 #
-# Recommended pattern: run a FAST SUBSET (smoke + changed unit tests) pre-push,
-# not the full suite. Set SABLE_TEST_COMMAND to something like:
+# 2. SKIP — SABLE rebases only; your repo's git hooks handle tests.
+#    - Set SABLE_PRE_PUSH_TEST_PHASE=skip in the repo's project config when the
+#      repo has a real .githooks/pre-push (or equivalent) that already runs
+#      lint/test/build. This avoids duplication AND the timeout-coupling
+#      footgun — SABLE's hook only runs fetch+rebase, which finishes in seconds.
+#    - Tests run on the REBASED state (git's native pre-push fires AFTER ours),
+#      so you still get the "tests pass on what would actually merge" guarantee.
+#    - Bypass via the repo's own bypass mechanism (e.g. SKIP_PREPUSH=1) or
+#      SABLE_SKIP_PRE_PUSH=1 to skip everything.
+#
+# Examples:
+#   # Repo with its own .githooks/pre-push (Twine, etc.)
+#   export SABLE_PRE_PUSH_TEST_PHASE=skip
+#   export SABLE_BASE_BRANCH=origin/dev
+#
+#   # Repo using SABLE for everything
 #   export SABLE_TEST_COMMAND="npm test -- --changed --run"
-#   export SABLE_TEST_COMMAND="pytest tests/unit -x --lf"
-#   export SABLE_TEST_COMMAND="bash ./scripts/pre-push-smoke.sh"
-# Keep the full suite in CI. Pre-push under 60s keeps the human-visible pause
-# tolerable and discourages SABLE_SKIP_PRE_PUSH escape hatches.
+#   export SABLE_PRE_PUSH_TEST_TIMEOUT=60
 #
-# Skips: subagent context (workers shouldn't push), --force pushes (let user bypass
-# explicitly with their own intent), pushes that aren't to a feature branch.
+# Skips: subagent context (workers shouldn't push), --force pushes (explicit
+# override intent), pushes that aren't to a feature branch.
 
 set -euo pipefail
 
@@ -103,7 +121,22 @@ print(json.dumps({
   }
 fi
 
-# Step 3: run tests
+# Step 3: test phase — skipped when the repo delegates tests to its own git hooks
+TEST_PHASE="${SABLE_PRE_PUSH_TEST_PHASE:-auto}"
+
+if [ "$TEST_PHASE" = "skip" ]; then
+  # Repo is responsible for its own test gating (e.g. .githooks/pre-push).
+  # SABLE's contribution is the rebase — tests run on the rebased state when
+  # the repo's native pre-push fires after ours.
+  python3 -c "
+import json
+print(json.dumps({
+    'additionalContext': 'Pre-push: rebase complete; test phase skipped (SABLE_PRE_PUSH_TEST_PHASE=skip). Repo git hooks handle test gating.'
+}))
+"
+  exit 0
+fi
+
 TEST_CMD="${SABLE_TEST_COMMAND:-}"
 
 if [ -z "$TEST_CMD" ]; then

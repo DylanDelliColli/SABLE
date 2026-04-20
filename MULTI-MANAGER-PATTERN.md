@@ -216,10 +216,16 @@ A `PreToolUse:Bash` hook matching `git push` enforces:
 ```bash
 git fetch origin
 git rebase $SABLE_BASE_BRANCH
-<test command>
+<test command>           # auto mode only
 ```
 
 Push is denied if the rebase fails or tests fail. Catches "my branch is behind main" and regression cases *locally* before exposing them to CI.
+
+The hook has **two operating modes**:
+
+#### Mode: `auto` (default)
+
+SABLE rebases, then runs tests. Fast subset recommended. Subject to the timeout-coupling rule (below).
 
 **Run a fast subset, not the full suite.** Pre-push blocks the manager agent while tests run — if the suite takes 5 minutes, that's 5 minutes of dead time per push. The recommended pattern is to scope `SABLE_TEST_COMMAND` to a fast subset (smoke + changed unit tests), target <60 seconds, and keep full-suite validation in CI. Anything slower and operators reach for `SABLE_SKIP_PRE_PUSH=1`, defeating the purpose.
 
@@ -246,6 +252,28 @@ export SABLE_TEST_COMMAND="bash ./scripts/pre-push-smoke.sh"
 The outer MUST exceed the inner plus ~30s buffer for fetch/rebase. If you raise one, raise the other. If the outer is lower than the inner, Claude Code kills the hook before tests finish — they appear to "pass" because the hook exits nonzero without returning a deny decision.
 
 Default pairing (inner 60s / outer 90000ms) is sized for a fast pre-push subset. For a 5-minute test budget: set `SABLE_PRE_PUSH_TEST_TIMEOUT=300` AND change settings.json to `"timeout": 330000`.
+
+#### Mode: `skip` (delegate to repo's own git hooks)
+
+For repos that already have a real `.githooks/pre-push` (or `.git/hooks/pre-push`) that runs lint/test/build, duplicating test execution in SABLE's hook is waste — and opens the timeout-coupling footgun for no gain. Set `SABLE_PRE_PUSH_TEST_PHASE=skip` in the repo's project config:
+
+```bash
+# In the project's CLAUDE.md or shell wrapper:
+export SABLE_PRE_PUSH_TEST_PHASE=skip
+export SABLE_BASE_BRANCH=origin/dev
+```
+
+SABLE's hook then runs `git fetch && git rebase` only (completes in seconds; the outer hook timeout becomes irrelevant). Git's native pre-push hook fires AFTER SABLE's, so tests still run on the **rebased** state — you keep the "tests pass on what would actually merge" guarantee without duplicating the test command in two places.
+
+When to pick which:
+
+| Use `auto` when | Use `skip` when |
+|-----------------|-----------------|
+| Repo has no native pre-push hook | Repo has `.githooks/pre-push` already running lint+test+build |
+| You want SABLE to define the test contract | Repo's own git tooling is the source of truth |
+| Single-tool-chain project | Project already has pre-push infrastructure you don't want to re-litigate |
+
+Emergency bypass works the same in both modes: `SABLE_SKIP_PRE_PUSH=1` (and the repo's own bypass, e.g. `SKIP_PREPUSH=1`, for the native hook).
 
 ### 6. Post-push Chuck notification
 
@@ -336,18 +364,24 @@ cp templates/multi-manager/commands/inbox.md ~/.claude/commands/inbox.md
 
 Add to your existing `~/.claude/settings.json` (do not replace — append to existing arrays). See [`templates/multi-manager/settings-snippet.json`](templates/multi-manager/settings-snippet.json) for the exact JSON to merge.
 
-### Step 5: Configure base branch and test subset (per repo)
+### Step 5: Configure base branch and test phase (per repo)
 
 ```bash
 # In each repo's project CLAUDE.md or shell wrapper
+
+# Option A — SABLE owns the test gate (auto mode):
 export SABLE_BASE_BRANCH=origin/dev           # or origin/main
-export SABLE_TEST_COMMAND="npm test -- --changed --run"   # fast subset, see §Coordination mechanism 5
+export SABLE_TEST_COMMAND="npm test -- --changed --run"   # fast subset; see §Coordination mechanism 5
 export SABLE_PRE_PUSH_TEST_TIMEOUT=60         # seconds, pair with settings.json outer timeout
+
+# Option B — Repo's native git hook owns the test gate (skip mode):
+export SABLE_BASE_BRANCH=origin/dev
+export SABLE_PRE_PUSH_TEST_PHASE=skip         # SABLE rebases only; .githooks/pre-push runs tests
 ```
 
-Defaults: `SABLE_BASE_BRANCH=origin/main`, `SABLE_TEST_COMMAND` auto-detected from project files (`npm test` / `pytest` / `cargo test` / `go test ./...`), `SABLE_PRE_PUSH_TEST_TIMEOUT=60`.
+Defaults: `SABLE_BASE_BRANCH=origin/main`, `SABLE_PRE_PUSH_TEST_PHASE=auto`, `SABLE_TEST_COMMAND` auto-detected from project files (`npm test` / `pytest` / `cargo test` / `go test ./...`), `SABLE_PRE_PUSH_TEST_TIMEOUT=60`.
 
-If you need a longer test budget, remember to raise `"timeout"` in settings.json to match — see Coordination mechanism 5 for the coupling rule.
+If you need a longer test budget in auto mode, remember to raise `"timeout"` in settings.json to match — see Coordination mechanism 5 for the coupling rule. Or switch to skip mode if your repo already has a native pre-push hook.
 
 ### Step 6: Add aliases
 
