@@ -77,7 +77,7 @@ if echo "$REBASE_OUT" | grep -q "REBASE_FAILED"; then
   # Abort the half-done rebase so the worktree isn't left in conflict state
   git -C "$WORKTREE" rebase --abort 2>/dev/null || true
 
-  python3 -c "
+  WORKTREE="$WORKTREE" BASE_BRANCH="$BASE_BRANCH" REBASE_OUT="$REBASE_OUT" python3 -c "
 import json, os
 wt = os.environ.get('WORKTREE', '')
 bb = os.environ.get('BASE_BRANCH', '')
@@ -85,7 +85,7 @@ out = os.environ.get('REBASE_OUT', '')[:500]
 print(json.dumps({
     'additionalContext': f'PRE-DISPATCH WARNING: rebase of {wt} on {bb} failed and was aborted. Resolve manually before dispatching this worker, or dispatch into a fresh worktree. Output:\n{out}'
 }))
-" WORKTREE="$WORKTREE" BASE_BRANCH="$BASE_BRANCH" REBASE_OUT="$REBASE_OUT"
+"
   exit 0
 fi
 

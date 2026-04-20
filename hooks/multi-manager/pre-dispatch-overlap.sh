@@ -73,7 +73,7 @@ done | sort -u)
 # Find all in-progress beads (status=in_progress) not in dispatch set
 IN_PROGRESS=$(bd list --status=in_progress --json 2>/dev/null || echo "[]")
 
-OVERLAPS=$(echo "$IN_PROGRESS" | python3 -c "
+OVERLAPS=$(echo "$IN_PROGRESS" | DISPATCH_IDS="$DISPATCH_IDS" DISPATCH_FILES="$DISPATCH_FILES" python3 -c "
 import json, sys, os, re
 
 dispatch_ids = set(os.environ.get('DISPATCH_IDS', '').split())
@@ -121,15 +121,15 @@ for o in overlaps:
     files_str = ', '.join(o['files'])
     lines.append(f\"  - {o['bead']} ({o['assignee']}, in-progress): {files_str}\")
 print('\n'.join(lines))
-" DISPATCH_IDS="$DISPATCH_IDS" DISPATCH_FILES="$DISPATCH_FILES" 2>/dev/null)
+" 2>/dev/null)
 
 [ -z "$OVERLAPS" ] && exit 0
 
 # Inject overlap warning — advisory, dispatch still proceeds
-python3 -c "
+OVERLAPS="$OVERLAPS" python3 -c "
 import json, os
 overlaps = os.environ.get('OVERLAPS', '')
 print(json.dumps({
     'additionalContext': f'OVERLAP DETECTED — proposed dispatch shares files with active in-progress work:\n{overlaps}\n\nDispatch will proceed. If intentional collaboration is needed, file a coord bead. Chuck will see this overlap context on PR submission and can sequence merges accordingly.'
 }))
-" OVERLAPS="$OVERLAPS"
+"

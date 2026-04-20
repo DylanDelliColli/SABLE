@@ -76,7 +76,7 @@ echo "$CURRENT" | grep -qF "$FILE_PATH" && exit 0
 # Append to claims
 if echo "$CURRENT" | grep -q "^WIP-CLAIMS:"; then
   # Existing claim line — append file
-  NEW_NOTES=$(echo "$CURRENT" | python3 -c "
+  NEW_NOTES=$(echo "$CURRENT" | FILE_PATH="$FILE_PATH" python3 -c "
 import sys, os
 file_path = os.environ.get('FILE_PATH', '')
 text = sys.stdin.read()
@@ -89,7 +89,7 @@ for line in lines:
     else:
         out.append(line)
 print('\n'.join(out))
-" FILE_PATH="$FILE_PATH")
+")
 else
   # No claim line yet — add one
   if [ -n "$CURRENT" ]; then

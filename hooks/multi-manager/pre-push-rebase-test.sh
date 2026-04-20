@@ -85,7 +85,7 @@ BASE_BRANCH="${SABLE_BASE_BRANCH:-origin/main}"
 
 # Step 1: fetch
 FETCH_OUT=$(git -C "$CWD" fetch origin 2>&1) || {
-  python3 -c "
+  FETCH_OUT="$FETCH_OUT" python3 -c "
 import json, os
 out = os.environ.get('FETCH_OUT', '')[:300]
 print(json.dumps({
@@ -95,7 +95,7 @@ print(json.dumps({
         'permissionDecisionReason': f'Pre-push: git fetch failed:\n{out}\nResolve network/auth and retry, or set SABLE_SKIP_PRE_PUSH=1 to bypass.'
     }
 }))
-" FETCH_OUT="$FETCH_OUT"
+"
   exit 0
 }
 
@@ -105,7 +105,7 @@ BEHIND=$(git -C "$CWD" rev-list --count "HEAD..$BASE_BRANCH" 2>/dev/null || echo
 if [ "$BEHIND" -gt 0 ]; then
   REBASE_OUT=$(git -C "$CWD" rebase "$BASE_BRANCH" 2>&1) || {
     git -C "$CWD" rebase --abort 2>/dev/null || true
-    python3 -c "
+    REBASE_OUT="$REBASE_OUT" BASE_BRANCH="$BASE_BRANCH" python3 -c "
 import json, os
 out = os.environ.get('REBASE_OUT', '')[:500]
 bb = os.environ.get('BASE_BRANCH', '')
@@ -116,7 +116,7 @@ print(json.dumps({
         'permissionDecisionReason': f'Pre-push: rebase on {bb} failed (and was aborted). Resolve conflicts manually, then retry push.\n{out}'
     }
 }))
-" REBASE_OUT="$REBASE_OUT" BASE_BRANCH="$BASE_BRANCH"
+"
     exit 0
   }
 fi
@@ -177,7 +177,7 @@ if [ "$TEST_EXIT" -ne 0 ]; then
   else
     REASON_SUFFIX="Tests failed. Fix before pushing, or set SABLE_SKIP_PRE_PUSH=1 with explicit intent."
   fi
-  python3 -c "
+  TEST_OUT="$TEST_OUT" TEST_CMD="$TEST_CMD" REASON_SUFFIX="$REASON_SUFFIX" python3 -c "
 import json, os
 out = os.environ.get('TEST_OUT', '')[-1500:]
 cmd = os.environ.get('TEST_CMD', '')
@@ -189,7 +189,7 @@ print(json.dumps({
         'permissionDecisionReason': f'Pre-push: command failed ({cmd}).\n{suffix}\n\n{out}'
     }
 }))
-" TEST_OUT="$TEST_OUT" TEST_CMD="$TEST_CMD" REASON_SUFFIX="$REASON_SUFFIX"
+"
   exit 0
 fi
 

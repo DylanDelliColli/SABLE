@@ -46,7 +46,7 @@ OWN_LABEL="for-${CLAUDE_AGENT_NAME}"
 [ "$QUERIED_LABEL" = "for-coord" ] && exit 0
 
 # Foreign inbox query — deny
-python3 -c "
+OWN_LABEL="$OWN_LABEL" QUERIED_LABEL="$QUERIED_LABEL" python3 -c "
 import json, os
 own = os.environ.get('OWN_LABEL', '')
 queried = os.environ.get('QUERIED_LABEL', '')
@@ -57,4 +57,4 @@ print(json.dumps({
         'permissionDecisionReason': f'Read guard: you are {own.replace(\"for-\", \"\")}; cannot query {queried}. Use {own} for your own inbox or /inbox slash command.'
     }
 }))
-" OWN_LABEL="$OWN_LABEL" QUERIED_LABEL="$QUERIED_LABEL"
+"

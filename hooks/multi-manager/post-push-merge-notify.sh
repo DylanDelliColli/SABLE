@@ -64,7 +64,7 @@ PR_URL=$(gh pr view --json url -q .url 2>/dev/null || echo "")
 # Find overlaps with in-progress beads' WIP-CLAIMS
 FILES_CSV=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')
 
-OVERLAPS=$(bd list --status=in_progress --json 2>/dev/null | python3 -c "
+OVERLAPS=$(bd list --status=in_progress --json 2>/dev/null | FILES_CSV="$FILES_CSV" python3 -c "
 import json, sys, os, re
 
 pushed = set(os.environ.get('FILES_CSV', '').split(','))
@@ -104,7 +104,7 @@ lines = []
 for o in overlaps:
     lines.append(f\"  - {o['bead']} ({o['assignee']}): {', '.join(o['files'])}\")
 print('\n'.join(lines))
-" FILES_CSV="$FILES_CSV" 2>/dev/null)
+" 2>/dev/null)
 
 # Build description
 DESC_LINES=""

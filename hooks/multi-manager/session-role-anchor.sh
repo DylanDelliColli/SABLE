@@ -19,11 +19,11 @@ ROLE_FILE="$HOME/.claude/sable/roles/${CLAUDE_AGENT_NAME}.md"
 
 ROLE_CONTENT=$(cat "$ROLE_FILE")
 
-python3 -c "
+ROLE_CONTENT="$ROLE_CONTENT" python3 -c "
 import json, os, sys
 content = os.environ.get('ROLE_CONTENT', '')
 name = os.environ.get('CLAUDE_AGENT_NAME', '').upper()
 print(json.dumps({
     'additionalContext': f'=== AGENT IDENTITY: {name} ===\n\n{content}\n\n=== END IDENTITY ===\n\nYou are {name}. Operate within this role. Do not act as another manager.'
 }))
-" ROLE_CONTENT="$ROLE_CONTENT"
+"

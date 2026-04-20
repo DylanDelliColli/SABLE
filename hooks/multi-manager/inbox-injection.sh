@@ -39,7 +39,7 @@ SEEN_FILE="/tmp/inbox-seen-${SESSION_ID}"
 INBOX_JSON=$(bd ready -l "$INBOX_LABEL" --json 2>/dev/null || echo "[]")
 
 # Extract bead IDs and titles
-NEW_ITEMS=$(echo "$INBOX_JSON" | python3 -c "
+NEW_ITEMS=$(echo "$INBOX_JSON" | SEEN_FILE="$SEEN_FILE" python3 -c "
 import json, sys, os
 seen_file = os.environ.get('SEEN_FILE', '')
 seen = set()
@@ -77,15 +77,15 @@ for bid, title, pri in new:
     pri_marker = f'[P{pri}] ' if pri != '' else ''
     lines.append(f'  - {pri_marker}{bid}: {title}')
 print('\n'.join(lines))
-" SEEN_FILE="$SEEN_FILE")
+")
 
 [ -z "$NEW_ITEMS" ] && exit 0
 
-python3 -c "
+NEW_ITEMS="$NEW_ITEMS" python3 -c "
 import json, os
 items = os.environ.get('NEW_ITEMS', '')
 name = os.environ.get('CLAUDE_AGENT_NAME', '').upper()
 print(json.dumps({
     'additionalContext': f'INBOX ({name}) — new addressed beads:\n{items}\n\nRun \`bd show <id>\` to read. Run \`/inbox\` to see all current items.'
 }))
-" NEW_ITEMS="$NEW_ITEMS"
+"
