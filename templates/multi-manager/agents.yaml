@@ -5,6 +5,13 @@
 # coordination rules. All multi-manager hooks read it dynamically. Adding,
 # removing, or modifying an agent requires no hook code changes — just edit
 # this file and create/update the matching role prompt in roles/<name>.md.
+#
+# Per-bead model selection: beads optionally carry a `model:<haiku|sonnet|
+# opus>` label that drives worker model choice at dispatch time. The
+# pre-dispatch-model-check.sh hook validates that the dispatch's model
+# parameter matches the bead's label (or that the prompt includes a
+# `Model override: <reason>` line). See SABLE.md §6.9 for the ladder rules
+# and roles/optimus.md / roles/tarzan.md for per-manager guidance.
 
 agents:
   optimus:

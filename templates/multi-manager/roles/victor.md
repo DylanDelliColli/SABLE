@@ -90,13 +90,22 @@ Dispatch read-only Explore subagents in parallel, 1-3 beads per worker. Each wor
    - **(c) Fallback: LLM judgement** — read the cited files at HEAD, judge whether the bead's described issue still exists. If unclear, flag as `needs-verification-spec` rather than guessing.
 4. Report back: bead-id, classification, evidence
 
-Worker classifications (one per bead):
+Worker classifications (one per bead, can stack with `model-stale`):
 - `valid` — issue still reproduces / fingerprint matches / verification passes
 - `stale-fixed` — issue no longer reproduces; code at the cited site has been changed
 - `stale-moved` — fingerprint no longer matches; code may have been refactored elsewhere
 - `description-rotted` — paths no longer exist or symbols renamed; bead needs description update
 - `ambiguous` — codebase has shifted enough that intent isn't clear; needs human or Sherlock re-pass
 - `needs-verification-spec` — bead doesn't have a "Verify current state" section and LLM judgement is unclear; description should add one
+- `model-stale` — bead's `model:<x>` label disagrees with the model ladder when applied to current cited code (e.g. cited code has moved into auth subsystem since label was set, or has been simplified to mechanical work). This is a SECONDARY classification: it can stack with any of the above, or fire on its own when freshness is otherwise OK.
+
+### Model-ladder check (Phase 3 sub-step)
+
+After running fingerprint validation, also evaluate whether the bead's current `model:` label still matches what the ladder would recommend for the current cited code. The ladder:
+
+- Default Sonnet. Step DOWN to Haiku if ALL: mechanical, deterministic spec, low-risk path, no judgment. Step UP to Opus if ANY: design thinking, security-sensitive (auth/payments/RLS/PII), cross-cutting, spec gaps, unclear debugging.
+- Re-apply the ladder to the bead AS IT EXISTS NOW. If the recommendation differs from the current label → `model-stale`.
+- If the bead has no `model:` label at all → recommend one and flag as `model-stale` (so the next dispatch doesn't have to re-derive).
 
 ### Phase 4: Apply actions
 
@@ -110,6 +119,7 @@ For each bead, take ONE action based on classification:
 | `description-rotted` | Add `needs-rewrite` label, append note describing what's wrong, leave open for human/Sherlock to re-author | No silent rewrites |
 | `ambiguous` | Add `needs-rewrite` AND `for-sherlock-followup` labels, append note. Do NOT modify the description. | |
 | `needs-verification-spec` | Append a `for-author` note suggesting a "Verify current state" section be added. Don't modify description. | |
+| `model-stale` | Append `victor-model-suggestion: <recommended-model> — <reason>` note to the bead. Do NOT silently update the `model:` label — flag for human/manager to confirm. The label change is a judgment call (cost vs. quality trade-off) that belongs to the user, not Victor. | Reason must cite the ladder dimension that triggered the change (mechanical/risk/design/etc.) |
 
 **Ramp-up gate.** For your first 5 runs in any rig, NEVER auto-close. Always label `victor-suspects-stale` and let the user batch-confirm. After 5 successful runs (validated by user closing the suspects without overrides), graduate to auto-close on `stale-fixed`. Track the run count in `~/.claude/sable/victor-run-history.json`.
 

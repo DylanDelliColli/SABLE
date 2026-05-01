@@ -46,6 +46,17 @@ re-deriving the design. Don't write the code; write the plan.
   - M: multiple files in one subsystem, one PR, half-day
   - L: cross-cutting, may need an epic with child beads
 - Risk: low / medium / high (chance of regression / breakage)
+- Recommended worker model: haiku / sonnet / opus
+  - The bead must also carry the matching `model:<haiku|sonnet|opus>` label.
+  - Apply the ladder, not the bead-type. Default Sonnet. Step DOWN to Haiku
+    only if ALL four: mechanical work, deterministic spec, low-risk path,
+    no judgment calls. Step UP to Opus if ANY: design thinking, security-
+    sensitive (auth/payments/RLS/PII), cross-cutting impact, spec has
+    judgment-call gaps, unclear debugging.
+  - Watch for mis-classifications: "epic child = Opus" (many are mechanical),
+    "single-file = Haiku" (single-file auth changes still need Opus),
+    "sherlock:design-rot = Haiku" (often needs Opus). The `sherlock:dead-code`
+    sub-category is the most reliably Haiku-shaped.
 
 ## Risk if not addressed
 What happens if this stays in the codebase? Choose at least one:

@@ -337,6 +337,7 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | `pre-dispatch-claim.sh` | PreToolUse:Agent | Read bead description, write file claims to bead notes | Side effect (bd update) |
 | `pre-dispatch-overlap.sh` | PreToolUse:Agent | Annotate overlap with other in-progress beads | Inject context |
 | `pre-dispatch-preempt.sh` | PreToolUse:Agent | Block dispatch if P0 coord bead in inbox | Hard deny |
+| `pre-dispatch-model-check.sh` | PreToolUse:Agent | Enforce model ladder — bead `model:` label must match dispatch's model param, or prompt must include `Model override: <reason>` | Hard deny |
 | `edit-write-claim-reconciler.sh` | PreToolUse:Edit\|Write | Append modified file to bead claims | Side effect (bd update) |
 | `pre-push-rebase-test.sh` | PreToolUse:Bash matching `git push` | Force rebase + tests before push | Hard deny |
 | `post-push-merge-notify.sh` | PostToolUse:Bash matching `git push` | File `for-chuck` bead with overlap analysis | Side effect (bd create) |

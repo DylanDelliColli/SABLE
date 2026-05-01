@@ -49,10 +49,32 @@ Run `/inbox` deliberately at cycle boundaries. Automatic inbox injection runs on
    - On successful push, post-push hook files a `for-chuck` bead with overlap analysis
 7. Continue loop. Do not batch — workers dispatch concurrently.
 
+## Worker model selection (the ladder)
+
+Every dispatch specifies a worker model — Haiku, Sonnet, or Opus. The bead's `model:` label is the primary signal; if missing, you apply the ladder and (after dispatch) `bd update <id> --add-label=model:<x>` so the next dispatch doesn't re-derive.
+
+**Default: Sonnet** (claude-sonnet-4-6). All work starts here.
+
+**Step DOWN to Haiku** only if ALL four are true:
+- Mechanical work (rename, format, copy-paste pattern, typo, regex replace)
+- Deterministic spec (file path + exact change, OR a clear template at N sites)
+- Low-risk path (dev tooling, docs, tests, internal scripts, comments)
+- No judgment calls — worker purely executes
+
+**Step UP to Opus** if ANY of:
+- Design thinking required (which approach? trade-offs? novel pattern?)
+- Security-sensitive path (auth, payments, RLS, PII, secrets, session boundaries)
+- Cross-cutting impact (multi-subsystem, ripples through data flow)
+- Spec has judgment-call gaps ("decide the right pattern")
+- Unclear / intermittent debugging (race conditions, flaky tests, unknown root cause)
+
+**Apply the ladder per-child, not per-epic.** Many epic children are mechanical apply-the-pattern work. A 12-file rename is Haiku regardless of count. A single-file auth change is still Opus. Mechanical-ness wins on count; risk wins on path. The `pre-dispatch-model-check.sh` hook hard-blocks dispatches where the bead's `model:` label disagrees with the dispatch's chosen model unless the prompt includes a `Model override: <reason>` line.
+
 ## Boundaries
 - You may not query other managers' inboxes (read guard hook will deny).
 - You may not claim orphan beads (your `claim_filter` is `--has-parent`).
 - You may not bypass pre-push rebase + tests (set `SABLE_SKIP_PRE_PUSH=1` only with explicit user authorization).
+- You may not dispatch without specifying a worker model — the dispatch hook denies.
 
 ## Communicating with the user
 When surfacing questions or status to the human:

@@ -1010,12 +1010,40 @@ causes runtime errors.
 
 ### 6.9 Model Selection for Workers
 
-Different tasks benefit from different models:
+Different tasks need different models. Picking by bead structure (epic/feature/task) is wrong — bead structure is orthogonal to actual complexity. A 12-file rename is mechanical regardless of count; a single-file auth change is still security-sensitive. Apply the **model ladder** instead:
 
-- **Sonnet** (or equivalent fast model): Implementation tasks, test writing, bug fixes, refactoring. The majority of worker dispatches.
-- **Opus** (or equivalent reasoning model): Architecture decisions, complex debugging, nuanced code review. Used by the orchestrator or for specific difficult beads.
+**Default: Sonnet** (claude-sonnet-4-6). All work starts here.
 
-The orchestrator runs on the most capable model available. Workers run on the fastest model that can handle the task. This optimizes for total throughput — many fast workers executing well-specified beads is faster than one powerful agent doing everything sequentially.
+**Step DOWN to Haiku** only if ALL four are true:
+- Mechanical work (rename, format, copy-paste pattern, typo, regex replace)
+- Deterministic spec (file path + exact change, OR a clear template at N sites)
+- Low-risk path (dev tooling, docs, tests, internal scripts, comments)
+- No judgment calls — worker is purely executing
+
+**Step UP to Opus** if ANY one is true:
+- Design thinking required (which approach? what trade-offs? novel pattern?)
+- Security-sensitive path (auth, payments, RLS, PII, secrets, session boundaries)
+- Cross-cutting impact (multi-subsystem, ripples through data flow)
+- Spec has judgment-call gaps ("decide the right pattern", "investigate why X")
+- Unclear / intermittent debugging (race conditions, flaky tests, unknown root cause)
+
+**Common mis-classifications:**
+
+| Tempting wrong call | Why wrong | Right answer |
+|---|---|---|
+| "Epic child → Opus" | Many epic children are mechanical | Apply per-child |
+| "Single-file → Haiku" | Single-file auth/payments still need Opus | Risk dimension wins |
+| "Bug fix → Sonnet" | Typo is Haiku; race condition is Opus | Depends on debugging complexity |
+| "Sherlock-finding → Haiku" | `sherlock:design-rot` often needs Opus | Per sub-category |
+| "Many files → Opus" | Same pattern at every site is still mechanical | Mechanical-ness wins |
+
+**Encoding the choice on beads.** Beads can carry a `model:<haiku|sonnet|opus>` label set by the bead author (Sherlock auto-recommends in its bead template; manual creation should set it after applying the ladder). The label is the primary signal at dispatch time. If absent, the manager applies the ladder and adds the label after dispatch so the next worker doesn't re-derive.
+
+**Mechanical enforcement.** When the multi-manager pattern is active, the `pre-dispatch-model-check.sh` hook hard-blocks dispatches where the dispatch's model parameter disagrees with the bead's `model:` label, unless the prompt includes a `Model override: <reason>` line. This catches "let's just send it to Opus" reflexes that compound on cost across a session of dispatches.
+
+**Why this matters.** A swarm of all-Sonnet workers runs ~3-4× cheaper than all-Opus. Adding Haiku for mechanical work cuts another ~3× on those dispatches. Across 20+ dispatches per session, the difference compounds — and Sonnet handles 80%+ of standard implementation work without quality loss.
+
+The orchestrator (manager session) still runs on the most capable model available. Workers run on the fastest model that can handle the task. This optimizes for total throughput — many right-sized workers executing well-specified beads is faster AND cheaper than one powerful agent doing everything.
 
 ---
 

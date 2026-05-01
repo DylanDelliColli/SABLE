@@ -45,10 +45,27 @@ Inbox injection fires on every Bash tool call so you'll see items continuously. 
 
 Tarzan-specific: your beads are smaller, so cycle time is faster (5-10min). Don't queue work serially — dispatch the next worker as soon as the previous one is in flight.
 
+## Worker model selection (the ladder)
+
+Every dispatch specifies a worker model — Haiku, Sonnet, or Opus. The bead's `model:` label is the primary signal; if missing, you apply the ladder and (after dispatch) `bd update <id> --add-label=model:<x>` so the next dispatch doesn't re-derive.
+
+Tarzan's work tends to skew Haiku/Sonnet — single-PR fixes against well-spec'd beads. But P0 swarm-blockers (handled in your main session, not via dispatch) and unclear regressions are Opus-shaped, so the ladder still applies.
+
+**Default: Sonnet** (claude-sonnet-4-6). Step DOWN to Haiku only if ALL: mechanical, deterministic spec, low-risk path, no judgment. Step UP to Opus if ANY: design thinking, security-sensitive (auth/payments/RLS/PII), cross-cutting, spec gaps, unclear debugging.
+
+**Common mis-classifications:**
+- "Standalone bug → Sonnet" — depends. Typo is Haiku; race condition is Opus.
+- "Single-file → Haiku" — single-file auth/payments still needs Opus.
+- "Doc fix → Haiku" — yes, almost always.
+- "Sherlock dead-code finding → Haiku" — yes, that's the only sherlock sub-category that's reliably Haiku.
+
+The `pre-dispatch-model-check.sh` hook hard-blocks dispatches where the bead's `model:` label disagrees with the chosen model unless the prompt includes a `Model override: <reason>` line.
+
 ## Boundaries
 - Do not claim epic-attached beads (your `claim_filter` is `--no-parent`).
 - Do not query for-optimus or for-chuck inboxes (read guard will deny).
 - Do not push without pre-push rebase + tests.
+- Do not dispatch without specifying a worker model — the dispatch hook denies.
 
 ## Communicating with the user
 - Bead ID, title, one-sentence problem

@@ -21,6 +21,15 @@ fixing already-fixed bugs).
 ```
 You are working in {WORKING_DIR} on the {BRANCH} branch.
 
+## Worker model
+
+{haiku | sonnet | opus}
+
+(This must match the bead's `model:` label, OR include a `Model override: <reason>`
+line below if you're stepping the model up/down. The pre-dispatch-model-check
+hook reads both. Default Sonnet. Apply the ladder — see "Model selection"
+section below for rules.)
+
 ## Bead
 
 {BEAD_ID}: {BEAD_TITLE}
@@ -71,6 +80,49 @@ Return:
 - Any constraint you bent and why
 - Test output: link or paste the relevant lines proving the test gate ran
 ```
+
+---
+
+## Model selection (the ladder)
+
+The bead's `model:` label is the primary signal. If absent, apply the ladder
+to pick — and add the `model:` label to the bead via `bd update` so the next
+dispatch doesn't re-litigate.
+
+**Default: Sonnet** (claude-sonnet-4-6). All work starts here.
+
+**Step DOWN to Haiku** only if ALL four are true:
+- Mechanical work (rename, format, copy-paste pattern, typo, regex replace)
+- Deterministic spec (file path + exact change, OR a clear template at N sites)
+- Low-risk path (dev tooling, docs, tests, internal scripts, comments)
+- No judgment calls — worker purely executes
+
+**Step UP to Opus** if ANY of:
+- Design thinking required (which approach? what trade-offs?)
+- Security-sensitive path (auth, payments, RLS, PII, secrets, session boundaries)
+- Cross-cutting impact (multi-subsystem, ripples through data flow)
+- Spec has judgment-call gaps ("decide the right pattern", "investigate why X")
+- Unclear / intermittent debugging (race conditions, flaky tests with unknown cause)
+
+**Common mis-classifications to avoid:**
+
+| Tempting wrong call | Why wrong | Right answer |
+|---|---|---|
+| "Epic child → Opus" | Many epic children are mechanical apply-the-pattern | Apply the ladder per child |
+| "Single-file → Haiku" | Single-file auth/payments changes still need Opus | Risk dimension wins |
+| "Bug fix → Sonnet" | Typo is Haiku; race condition is Opus | Depends on debugging complexity |
+| "sherlock-finding → Haiku" | `sherlock:design-rot` often needs Opus | Per-category; only `sherlock:dead-code` is reliably Haiku |
+| "12 files → Opus" | Same pattern at every site is still mechanical | Mechanical-ness wins regardless of count |
+
+**Override syntax.** If the bead has `model:sonnet` but you've decided based on
+day-of context that it should be Opus (e.g., the cited code has moved into auth
+since the label was set), include a line in the dispatch prompt:
+
+```
+Model override: cited code now lives in src/auth/middleware.ts, raised to opus
+```
+
+The hook reads that line and allows. Without it, mismatch denies.
 
 ---
 
