@@ -273,7 +273,9 @@ When to pick which:
 | You want SABLE to define the test contract | Repo's own git tooling is the source of truth |
 | Single-tool-chain project | Project already has pre-push infrastructure you don't want to re-litigate |
 
-Emergency bypass works the same in both modes: `SABLE_SKIP_PRE_PUSH=1` (and the repo's own bypass, e.g. `SKIP_PREPUSH=1`, for the native hook).
+**Emergency bypass is for emergencies, not failing tests.** `SABLE_SKIP_PRE_PUSH=1` (and the repo's own bypass, e.g. `SKIP_PREPUSH=1`) exists for known-acceptable infra failures (e.g. a date timebomb tracked under a named bead). It is NOT permission to skip when pre-push complains. If pre-push fails for any reason not on your dispatch's "Known acceptable issues" list, STOP and report — do not bypass. Workers that bypass routinely cost more in CI fix-rounds than the pre-push budget saves.
+
+**Typecheck independently of pre-push, always.** Even when bypass is legitimate (a tracked, known-acceptable failure), run typecheck as its own step before push: `npx tsc --noEmit`, `mypy`, `cargo check`, `go vet ./...`, etc. Pre-push bypass must not hide type errors — they will catch in CI either way and waste a fix-round. The dispatch template's Constraints block enforces this; this paragraph is the "why."
 
 ### 6. Post-push Chuck notification
 
@@ -419,7 +421,8 @@ Should return Optimus's addressed beads (or "Inbox empty" if none). Try `bd read
 2. Resolve any urgent coord beads (P0)
 3. Pick next bead from claim_filter pool: bd ready <claim_filter> --no-label for-*
 4. Pre-dispatch hooks fire automatically (refresh, claim, overlap, preempt)
-5. Dispatch worker via Agent tool
+5. Dispatch worker via Agent tool — fill the canonical worker-dispatch template
+   (templates/worker-dispatch.md). All required slots; no shortcuts.
 6. While worker runs: plan next dispatch, handle returned worker if any
 7. When a worker returns:
    a. Review their output
@@ -427,6 +430,34 @@ Should return Optimus's addressed beads (or "Inbox empty" if none). Try `bd read
    c. Successful push triggers post-push hook (file for-chuck)
 8. Repeat
 ```
+
+**The dispatch prompt is load-bearing.** Ad-hoc prompts drift mid-session
+(early dispatches say one thing, later ones say another), and workers absorb
+the inconsistency. Use the canonical template at
+[`templates/worker-dispatch.md`](templates/worker-dispatch.md) for every
+dispatch. The slots aren't decorative — each one prevents a specific failure
+mode documented from real sessions.
+
+### Idle-state inbox polling
+
+The standard inbox-injection hook fires on every Bash call — fast latency while the manager is actively working. **When the manager goes idle** (last worker returned, no next bead picked, mid-session pause, end-of-session waiting on the user), no tool calls fire, so the inbox stops being checked. New `for-<self>` coord beads land silently until you type a message.
+
+To close the gap, idle managers run a `/loop 3m /inbox` — the same continuous-polling discipline Chuck uses, scoped to idle windows.
+
+```
+> /loop 3m /inbox
+```
+
+When to invoke:
+- After the last worker returns and there's no next bead to dispatch immediately
+- During AFK or mid-session pauses where new urgent coord beads might land
+- End-of-session before close, to keep the session reachable for late-breaking unblocks (e.g. "Tarzan just shipped your blocker — re-dispatch")
+
+When to drop:
+- Active dispatches in flight — the regular Bash hook fires fast enough; `/loop` adds nothing
+- Full session close — `/loop` consumes usage continuously; don't leave it running past the end of work
+
+This is the structural answer to "ring-the-bell" for cross-manager urgent signals. Async by design, predictable cadence, no new primitives. Cost: 3-minute worst-case latency on receiving an urgent unblock vs. immediate, in exchange for not building a bell mechanism that would still hit the same idle-prompt ceiling.
 
 ### Chuck loop (continuous polling)
 
@@ -453,6 +484,31 @@ Tell each active manager:
 ```
 
 Managers comply via `bd defer`. Dispatch resumes; deferred beads stay visible for resolution on return.
+
+### Tarzan's emergency mode (P0 swarm-blockers)
+
+Tarzan's default mode is "claim orphan bead → dispatch worker → review → push." For most one-offs, dispatch is right.
+
+**Exception: when an orphan bead is actively blocking 2+ other managers' dispatches** (e.g. a date-timebomb test breaking pre-push for everyone, a CI infra outage, a corrupt lockfile in main), dispatch overhead is the wrong tradeoff. Worker spin-up + pre-push round-trip + Chuck handoff easily costs 10+ minutes of compounded blocked-manager time. Tarzan handles these directly:
+
+1. Claim the bead (`bd update <id> --claim`)
+2. Edit + test + push from Tarzan's main session — **no `Agent` dispatch**
+3. Notify the user + other managers via the fix-shipped coord bead
+
+**Trigger conditions** (any one is sufficient):
+- 2+ in-progress beads have WIP-CLAIMS on files this bead would touch
+- Another manager files a P0 `for-tarzan` coord bead saying "I'm blocked, can't dispatch"
+- Pre-push is failing repo-wide on the manager's own attempts
+
+**Why not dispatch:** for non-emergency one-offs, dispatch is right (parallelism, isolation, hooks fire correctly). For swarm-wide blockers, latency is the dominant variable — every minute of dispatch overhead is N minutes of multi-manager blocked time. Tarzan's session is already the right scope.
+
+**Why not Optimus:** role purity. Optimus claims by `--has-parent` (epic children). A swarm-blocker is structurally an orphan — Tarzan's lane.
+
+### Verify before batch-closing on user merge cues
+
+When the user signals "Chuck merged X" or "those PRs are in," verify each PR's state via `gh pr view <num> --json state,mergedAt -q '.state + " " + (.mergedAt // "")'` before `bd close`. User shorthand ("everything," "those," "the auth ones") is approximate; bead state is permanent. Cheap to verify, expensive to unwind a bead closed against an unmerged PR.
+
+The Chuck loop already does this implicitly (it watches PR state directly). Other managers should mirror the discipline when triggered by user cues.
 
 ---
 
@@ -505,6 +561,20 @@ WIP claims are written at dispatch time from bead descriptions. Files modified d
 
 This pattern operates per-repo (per `.beads/` instance). Managers running across multiple repos do not see each other's beads. Out of scope for this version.
 
+### Worktree creation dirties parent and is cwd-sensitive
+
+Two related `bd worktree create` issues bit hard in real sessions:
+
+1. **cwd-sensitive placement.** When the manager's cwd has drifted into a subdirectory (`frontend/`, another worktree from rebase work), new worktrees nest there instead of landing at repo root. Mitigation: always `cd "$(git rev-parse --show-toplevel)"` before `bd worktree create`. Better fix lives upstream as a `bd worktree create --at <path>` flag or root-resolution.
+
+2. **gitignore append dirties parent.** Each `bd worktree create` appends the new worktree path to the parent's `.gitignore`. The parent now has uncommitted changes, which makes the next pre-dispatch rebase hook noisy or fail. Mitigation: commit gitignore-only changes immediately after `bd worktree create`, or set up a manager-side helper that auto-stages gitignore-only diffs before the next dispatch.
+
+Both are tracked as upstream `bd` improvements; until landed, the mitigations above are the workaround.
+
+### Parallel incidental fixes (rare)
+
+Two workers occasionally fix the same bug in parallel — one as a side effect of investigating an unrelated bead, another as the deliberate target of a sibling dispatch. Result: ~10 minutes of duplicated worker compute, one PR closed as superseded. Currently undefended; the cost is low enough that the per-dispatch overhead of a registry mechanism doesn't pay for itself. Promote to a real mechanism if observed 3+ times in a quarter.
+
 ### Subagent contamination upper bound
 
 Subagents inherit `CLAUDE_AGENT_NAME` from their parent's environment. The `agent_id` discriminator handles inbox injection and identity-aware hooks correctly. But a subagent that runs `bd ready -l for-optimus` would still get Optimus's inbox (the read guard treats them as Optimus). Mitigation lives in dispatch prompts: explicitly forbid inbox queries in worker prompts. Not a hard block.
@@ -535,7 +605,8 @@ This pattern remains on the `personal-tooling` branch until:
 1. Operated continuously for 4+ weeks without architectural revision
 2. Demonstrated measurable conflict reduction in at least one real project
 3. Documented at least one failure mode that the design correctly handled (proves the gates earn their slots)
-4. Peer review by at least one other SABLE adopter at the Swarm stage
+4. Survived a deliberately contentious session (Optimus + Tarzan sharing an epic with cross-cutting children, race-prone bead-claim windows, intentional same-file edits) — observed where the scope filter actually breaks
+5. Peer review by at least one other SABLE adopter at the Swarm stage
 
 When promoted to main, this doc becomes a section in `SABLE.md` under "Section 6.X — Multi-Manager Coordination" or a sibling document referenced from the Adoption Path table.
 

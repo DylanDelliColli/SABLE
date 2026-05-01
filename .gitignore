@@ -1,6 +1,10 @@
 # Personal feedback notes captured by sable-note — never committed.
 # These are raw observations; curate via /sable-review into clean PRs when ready.
+# Curated archives in feedback/processed/ are also personal — they retain
+# verbatim observations and project-specific bead IDs that don't belong in
+# the shared methodology repo.
 feedback/*.md
+feedback/processed/
 
 # Backups created by install.sh / install.ps1 when prepending Prime Directives
 *.bak.*

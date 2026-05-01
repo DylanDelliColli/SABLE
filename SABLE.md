@@ -871,7 +871,22 @@ What NOT to include in dispatch prompts:
 - Bash rules (global settings handle permissions)
 - TDD instructions (hooks enforce this mechanically)
 
+What to ALWAYS include:
+- **"Verify current state before touching code."** Have the worker run the
+  relevant test or check command first. If it's already clean, the bead may
+  be stale — STOP and report instead of writing code for a passing test.
+- File paths the worker will modify (the Fresh Agent Test material).
+- The exact test command to run before close.
+- Any **known acceptable failures** the worker shouldn't re-litigate
+  (named bead IDs + status). Workers reliably refile duplicate beads for
+  in-flight issues unless the dispatch explicitly names them.
+
 The prompt should answer three questions: **Which beads? What files? What commands?**
+
+For high-throughput sessions where prompt drift is a real cost, see the
+canonical worker-dispatch template at `templates/worker-dispatch.md` (in the
+SABLE repo). It formalizes the slots above plus a constraints block and
+report-back rubric.
 
 ### 6.3 Bead Bundling
 
@@ -965,6 +980,21 @@ In a swarm, things don't always go as planned:
 - **A worker fails mid-task.** The bead stays open (in_progress status). The orchestrator can dispatch a new worker to pick it up, or investigate and re-plan.
 
 The key insight: **beads make recovery trivial.** Because every unit of work is tracked independently, a failed worker doesn't corrupt the overall plan. You just re-dispatch.
+
+### 6.7a Scenario Packs as Compliance Audits
+
+A **scenario pack** is a bead whose deliverable is "tests modeling expected behavior in domain X" — TCPA consent gating, accessibility, auth boundaries, RBAC, payment-state transitions. The pattern: write the tests against what the bead specifies, run them, and the gap between assertion and real behavior IS the audit signal. When an assertion fails, the bug is typically in shipped code, not the test.
+
+File each drift as a separate bead and route it. The scenario pack becomes both ongoing test coverage AND a one-shot audit, in one worker run.
+
+This outperforms standalone "security audit" or "compliance audit" beads because:
+- Audit beads produce a report; scenario packs produce a regression suite.
+- The audit findings are inherently evidence-backed (the failing test IS the evidence).
+- Future regressions in the same domain catch automatically — the audit becomes self-renewing.
+
+**Best fit:** regulated surfaces (TCPA, CCPA, accessibility, auth boundaries, payment flows) where "what should happen" can be enumerated. Less useful for "find any security issue" — that needs human review.
+
+**Smoke-test corollary:** when the audit domain is auth-gated, the scenario pack should test the page-render leg, not just the API. A `/onboarding/invite-code` API can return 200 while middleware bounces unauthenticated users to `/landing` — the API test passes, the user-facing flow is broken. Hit both legs.
 
 ### 6.8 Grep After Refactors
 
