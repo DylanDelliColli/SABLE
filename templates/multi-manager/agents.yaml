@@ -47,20 +47,42 @@ agents:
 
     post_push_autoack: true    # Chuck files an ack bead when PR is reviewed
 
+  # Planning-session agent. Session-scoped, not continuous. User invokes
+  # `critique` with a scope arg; agent explores, writes findings, self-reviews,
+  # addresses to managers, exits. Never dispatched continuously.
+  critique:
+    type: auditor
+    scope: "Read-only repo audit producing high-quality finding beads (design rot, redundancy, verbosity, dead code, test gaps)"
+    claim_filter: null         # doesn't claim — pure producer
+    inbox_label: null          # no inbox — invoked synchronously, scope from session args
+    role_prompt: roles/critique.md
+    dispatches_workers: true   # read-only Explore subagents only
+    bead_template: templates/critique-bead.md   # required for all critique-finding beads
+    quality_bar: above_default  # see role_prompt for what this means
+
 # Add new agents here using the same shape. Common additions:
 #
-#  researcher:
-#    type: investigator
-#    scope: "Codebase exploration, design proposals, spike investigation"
-#    claim_filter: "--label=research"
-#    inbox_label: for-researcher
-#    role_prompt: roles/researcher.md
-#    dispatches_workers: true
+#  doctor:
+#    type: bead_validator
+#    scope: "Periodically validate open beads against current HEAD, update or close stale ones"
+#    claim_filter: null         # doesn't claim — operates over bd list
+#    inbox_label: for-doctor
+#    role_prompt: roles/doctor.md
+#    dispatches_workers: true   # read-only Explore subagents only
 #
 #  qa:
 #    type: quality_validator
-#    scope: "Cross-cutting test coverage, regression analysis, integration suites"
-#    claim_filter: "--label=qa"
+#    scope: "Scenario testing, regression hunting, smoke validation"
+#    claim_filter: "for-qa-only"
 #    inbox_label: for-qa
 #    role_prompt: roles/qa.md
-#    dispatches_workers: true
+#    dispatches_workers: false
+#
+#  president:
+#    type: strategist
+#    scope: "Status reporting, strategic planning, cross-manager brokering during execution sessions"
+#    claim_filter: null
+#    inbox_label: for-president
+#    role_prompt: roles/president.md
+#    dispatches_workers: true   # read-only research subagents only
+#    cross_inbox_read: true     # bypass read-guard to give status across all managers
