@@ -94,6 +94,27 @@ agents:
         - pr_preview
         - local_dev_server
 
+  # Execution-session agent. Strategic partner running as a peer alongside
+  # Optimus/Tarzan/Chuck — NOT an orchestrator. User runs 4 terminals during
+  # working sessions and primarily talks to President. Three lightweight
+  # modes: Quick strategy / Arbitration / What's next. Recommends (does not
+  # invoke) office-hours / plan-eng-review / critique / doctor / qa for
+  # questions that genuinely need deep design work.
+  president:
+    type: strategist
+    scope: "Status reporting, strategic conversation, cross-manager brokering during execution sessions"
+    claim_filter: null         # doesn't claim — pure strategic interlocutor
+    inbox_label: for-president # accepts arbitration asks from O/T/C, direction from user
+    role_prompt: roles/president.md
+    dispatches_workers: true   # read-only Explore subagents only
+    cross_inbox_read: true     # bypass read-guard to give status across all managers
+    idle_polling: "/loop 5m /inbox"  # slower than Chuck; strategic conversation is reactive
+    files_addressed_beads: true      # may file for-X coord beads (one-line, not detailed specs)
+    forbidden_invocations:
+      - critique  # planning-session agent, user invokes
+      - doctor    # planning-session agent, user invokes
+      - qa        # planning-session agent, user invokes
+
 # Add new agents here using the same shape. Common additions:
 #
 #  qa:
