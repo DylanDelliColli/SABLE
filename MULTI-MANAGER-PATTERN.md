@@ -209,19 +209,36 @@ Existing dispatched workers are unaffected — only the *next* dispatch is block
 
 **Escape valve**: `bd defer <id> --reason="..."` removes the bead from the block list while keeping it visible. Use when the user is AFK and has explicitly told the agent to defer blockers.
 
-### 5. Pre-push rebase + test
+### 5. Pre-push three-phase gate (rebase → static → tests)
 
-A `PreToolUse:Bash` hook matching `git push` enforces:
+A `PreToolUse:Bash` hook matching `git push` enforces three sequential phases:
 
 ```bash
+# Phase 1: REBASE (always runs, never skippable)
 git fetch origin
 git rebase $SABLE_BASE_BRANCH
-<test command>           # auto mode only
+
+# Phase 2: STATIC (always runs, never skippable)
+$SABLE_PRE_PUSH_TYPECHECK_COMMAND   # auto-detected if unset
+$SABLE_PRE_PUSH_LINT_COMMAND        # only if explicitly set
+
+# Phase 3: TESTS (skippable via SABLE_SKIP_PRE_PUSH=1 or PHASE=skip)
+<test command>
 ```
 
-Push is denied if the rebase fails or tests fail. Catches "my branch is behind main" and regression cases *locally* before exposing them to CI.
+Push is denied if any phase fails. Catches "my branch is behind main," typecheck regressions, lint errors, and unit-test breakage *locally* before exposing to CI.
 
-The hook has **two operating modes**:
+**Critical: SABLE_SKIP_PRE_PUSH=1 only skips Phase 3 (tests).** Rebase and static analysis still run. This is a deliberate weakening of the bypass to prevent typecheck regressions from sneaking through to CI under the cover of "I'm bypassing for the date timebomb." If you need to bypass everything (true emergency, e.g. CI infra outage), disable the hook in `settings.json` explicitly, or use `git push --force` which short-circuits the hook entirely.
+
+Static phase auto-detects:
+- `tsconfig.json` present → `npx --no-install tsc --noEmit`
+- `pyproject.toml` with `[tool.mypy]` → `mypy .`
+- `Cargo.toml` → `cargo check --all-targets`
+- `go.mod` → `go vet ./...`
+
+Override via `SABLE_PRE_PUSH_TYPECHECK_COMMAND`. Lint is opt-in only (no auto-detect across linter ecosystems) — set `SABLE_PRE_PUSH_LINT_COMMAND` if you want a lint phase.
+
+The hook has **two operating modes for Phase 3 (tests)**:
 
 #### Mode: `auto` (default)
 
@@ -273,9 +290,9 @@ When to pick which:
 | You want SABLE to define the test contract | Repo's own git tooling is the source of truth |
 | Single-tool-chain project | Project already has pre-push infrastructure you don't want to re-litigate |
 
-**Emergency bypass is for emergencies, not failing tests.** `SABLE_SKIP_PRE_PUSH=1` (and the repo's own bypass, e.g. `SKIP_PREPUSH=1`) exists for known-acceptable infra failures (e.g. a date timebomb tracked under a named bead). It is NOT permission to skip when pre-push complains. If pre-push fails for any reason not on your dispatch's "Known acceptable issues" list, STOP and report — do not bypass. Workers that bypass routinely cost more in CI fix-rounds than the pre-push budget saves.
+**Emergency bypass is for emergencies, not failing tests.** `SABLE_SKIP_PRE_PUSH=1` (and the repo's own bypass, e.g. `SKIP_PREPUSH=1`) exists for known-acceptable test failures (e.g. a date timebomb tracked under a named bead). It scopes to **Phase 3 only** — rebase and static analysis still run regardless. It is NOT permission to skip when pre-push complains. If pre-push fails for any reason not on your dispatch's "Known acceptable issues" list, STOP and report — do not bypass. Workers that bypass routinely cost more in CI fix-rounds than the pre-push budget saves.
 
-**Typecheck independently of pre-push, always.** Even when bypass is legitimate (a tracked, known-acceptable failure), run typecheck as its own step before push: `npx tsc --noEmit`, `mypy`, `cargo check`, `go vet ./...`, etc. Pre-push bypass must not hide type errors — they will catch in CI either way and waste a fix-round. The dispatch template's Constraints block enforces this; this paragraph is the "why."
+**Typecheck is now structurally enforced via Phase 2** (since SABLE-cew). Workers can't ship typecheck regressions through bypass anymore — the static phase runs unconditionally. The dispatch template's typecheck advisory is now belt-and-braces with the hook gate; both layers reinforce the same outcome.
 
 ### 6. Post-push Chuck notification
 
