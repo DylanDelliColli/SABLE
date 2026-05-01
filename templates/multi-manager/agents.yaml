@@ -74,6 +74,26 @@ agents:
                                 # after, auto-close stale-fixed beads
     validation_marker: doctor-validated-at  # appended to bead notes per validation
 
+  # Planning-session agent. End-to-end browser validation against the
+  # integration branch's dev deployment (Vercel preview + Supabase dev).
+  # Does NOT run during execution sessions. Does NOT validate prod, PR
+  # branches, or local dev servers.
+  qa:
+    type: quality_validator
+    scope: "End-to-end validation on integration-branch dev deploys (Vercel preview + Supabase dev)"
+    claim_filter: null         # doesn't claim — operates on user-invoked scope
+    inbox_label: for-qa        # accepts validation requests from user only
+    role_prompt: roles/qa.md
+    dispatches_workers: false  # QA runs browser interaction itself; coherent session needed
+    test_target:
+      url_env: SABLE_QA_BASE_URL          # Vercel preview URL for integration branch
+      supabase_env: SABLE_QA_SUPABASE_URL # Supabase dev project URL
+      branch_env: SABLE_QA_INTEGRATION_BRANCH  # e.g. "dev"
+      forbidden_targets:
+        - production
+        - pr_preview
+        - local_dev_server
+
 # Add new agents here using the same shape. Common additions:
 #
 #  qa:
