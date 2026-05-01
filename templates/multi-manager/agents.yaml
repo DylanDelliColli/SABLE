@@ -60,15 +60,21 @@ agents:
     bead_template: templates/critique-bead.md   # required for all critique-finding beads
     quality_bar: above_default  # see role_prompt for what this means
 
+  # Planning-session agent. Validates open beads against current HEAD,
+  # updates or closes stale ones. Differential-validation optimization:
+  # only re-validates beads whose cited paths have changed since last marker.
+  doctor:
+    type: bead_validator
+    scope: "Validate open beads against current HEAD, update or close stale ones"
+    claim_filter: null         # doesn't claim — operates over bd list
+    inbox_label: for-doctor    # accepts freshness-pass requests from user/President only
+    role_prompt: roles/doctor.md
+    dispatches_workers: true   # read-only Explore subagents only
+    auto_close_ramp_up: 5      # first 5 runs label doctor-suspects-stale only;
+                                # after, auto-close stale-fixed beads
+    validation_marker: doctor-validated-at  # appended to bead notes per validation
+
 # Add new agents here using the same shape. Common additions:
-#
-#  doctor:
-#    type: bead_validator
-#    scope: "Periodically validate open beads against current HEAD, update or close stale ones"
-#    claim_filter: null         # doesn't claim — operates over bd list
-#    inbox_label: for-doctor
-#    role_prompt: roles/doctor.md
-#    dispatches_workers: true   # read-only Explore subagents only
 #
 #  qa:
 #    type: quality_validator
