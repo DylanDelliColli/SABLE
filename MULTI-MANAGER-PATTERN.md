@@ -324,7 +324,9 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | `pre-push-rebase-test.sh` | PreToolUse:Bash matching `git push` | Force rebase + tests before push | Hard deny |
 | `post-push-merge-notify.sh` | PostToolUse:Bash matching `git push` | File `for-chuck` bead with overlap analysis | Side effect (bd create) |
 
-**Bead quality hook upgrade**: when this pattern is active, `bead-description-gate.sh` (existing SABLE hook) should be upgraded from warning to blocking. Rolling execution depends on bead descriptions reliably naming files. See [`hooks/multi-manager/upgrade-notes.md`](hooks/multi-manager/upgrade-notes.md).
+**Bead quality hook**: `bead-description-gate.sh` (existing SABLE hook) is now mode-aware. When `CLAUDE_AGENT_NAME` is set or `CLAUDE_AGENT_ROLE=manager` (i.e. a multi-manager session), the hook hard-blocks (denies) `bd create` if the description is missing required content. Outside that context (single-agent SABLE), it nudges via `additionalContext`. Rolling execution depends on bead descriptions reliably naming files; the manager-context hard-block is the structural answer to bead-quality drift.
+
+**Critique-finding label enforcement**: when `bd create` includes `--labels=critique-finding`, the hook additionally requires the sections from `templates/critique-bead.md`: `## Rationale`, an Evidence block with at least one `Fingerprint:` line, `## Proposed approach`, `## Scope estimate`, `## Risk if not addressed`. Critique commits to this contract in its role file; the hook makes it mechanical. See `hooks/test/test-bead-description-gate.sh` for the full behavior matrix.
 
 ---
 
