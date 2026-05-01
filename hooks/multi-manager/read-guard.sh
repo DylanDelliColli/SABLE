@@ -8,18 +8,18 @@
 # Allows queries against the agent's own inbox.
 # Allows umbrella `coord` queries.
 # Skips for non-manager sessions (env var unset).
-# Skips entirely for President (cross-inbox read is its job — see roles/president.md).
+# Skips entirely for Lincoln (cross-inbox read is its job — see roles/lincoln.md).
 
 set -euo pipefail
 
 [ -z "${CLAUDE_AGENT_NAME:-}" ] && exit 0
 [ "${CLAUDE_AGENT_ROLE:-}" != "manager" ] && exit 0
 
-# President has the cross-inbox read exception per agents.yaml cross_inbox_read: true.
+# Lincoln has the cross-inbox read exception per agents.yaml cross_inbox_read: true.
 # Status reporting (Mode 1) and What's-next (Mode 3) require visibility across all
-# managers' inboxes. President may NOT modify other inboxes; that's enforced separately
+# managers' inboxes. Lincoln may NOT modify other inboxes; that's enforced separately
 # via the role prompt (no bd update/close on foreign labels).
-[ "$CLAUDE_AGENT_NAME" = "president" ] && exit 0
+[ "$CLAUDE_AGENT_NAME" = "lincoln" ] && exit 0
 
 PARSED=$(python3 -c "
 import json, sys

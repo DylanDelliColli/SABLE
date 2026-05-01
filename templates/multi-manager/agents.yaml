@@ -48,47 +48,47 @@ agents:
     post_push_autoack: true    # Chuck files an ack bead when PR is reviewed
 
   # Planning-session agent. Session-scoped, not continuous. User invokes
-  # `critique` with a scope arg; agent explores, writes findings, self-reviews,
+  # `sherlock` with a scope arg; agent explores, writes findings, self-reviews,
   # addresses to managers, exits. Never dispatched continuously.
-  critique:
+  sherlock:
     type: auditor
     scope: "Read-only repo audit producing high-quality finding beads (design rot, redundancy, verbosity, dead code, test gaps)"
     claim_filter: null         # doesn't claim — pure producer
     inbox_label: null          # no inbox — invoked synchronously, scope from session args
-    role_prompt: roles/critique.md
+    role_prompt: roles/sherlock.md
     dispatches_workers: true   # read-only Explore subagents only
-    bead_template: templates/critique-bead.md   # required for all critique-finding beads
+    bead_template: templates/sherlock-bead.md   # required for all sherlock-finding beads
     quality_bar: above_default  # see role_prompt for what this means
 
   # Planning-session agent. Validates open beads against current HEAD,
   # updates or closes stale ones. Differential-validation optimization:
   # only re-validates beads whose cited paths have changed since last marker.
-  doctor:
+  victor:
     type: bead_validator
     scope: "Validate open beads against current HEAD, update or close stale ones"
     claim_filter: null         # doesn't claim — operates over bd list
-    inbox_label: for-doctor    # accepts freshness-pass requests from user/President only
-    role_prompt: roles/doctor.md
+    inbox_label: for-victor    # accepts freshness-pass requests from user/Lincoln only
+    role_prompt: roles/victor.md
     dispatches_workers: true   # read-only Explore subagents only
-    auto_close_ramp_up: 5      # first 5 runs label doctor-suspects-stale only;
+    auto_close_ramp_up: 5      # first 5 runs label victor-suspects-stale only;
                                 # after, auto-close stale-fixed beads
-    validation_marker: doctor-validated-at  # appended to bead notes per validation
+    validation_marker: victor-validated-at  # appended to bead notes per validation
 
   # Planning-session agent. End-to-end browser validation against the
   # integration branch's dev deployment (Vercel preview + Supabase dev).
   # Does NOT run during execution sessions. Does NOT validate prod, PR
   # branches, or local dev servers.
-  qa:
+  rudy:
     type: quality_validator
     scope: "End-to-end validation on integration-branch dev deploys (Vercel preview + Supabase dev)"
     claim_filter: null         # doesn't claim — operates on user-invoked scope
-    inbox_label: for-qa        # accepts validation requests from user only
-    role_prompt: roles/qa.md
-    dispatches_workers: false  # QA runs browser interaction itself; coherent session needed
+    inbox_label: for-rudy      # accepts validation requests from user only
+    role_prompt: roles/rudy.md
+    dispatches_workers: false  # Rudy runs browser interaction itself; coherent session needed
     test_target:
-      url_env: SABLE_QA_BASE_URL          # Vercel preview URL for integration branch
-      supabase_env: SABLE_QA_SUPABASE_URL # Supabase dev project URL
-      branch_env: SABLE_QA_INTEGRATION_BRANCH  # e.g. "dev"
+      url_env: SABLE_RUDY_BASE_URL          # Vercel preview URL for integration branch
+      supabase_env: SABLE_RUDY_SUPABASE_URL # Supabase dev project URL
+      branch_env: SABLE_RUDY_INTEGRATION_BRANCH  # e.g. "dev"
       forbidden_targets:
         - production
         - pr_preview
@@ -96,40 +96,23 @@ agents:
 
   # Execution-session agent. Strategic partner running as a peer alongside
   # Optimus/Tarzan/Chuck — NOT an orchestrator. User runs 4 terminals during
-  # working sessions and primarily talks to President. Three lightweight
+  # working sessions and primarily talks to Lincoln. Three lightweight
   # modes: Quick strategy / Arbitration / What's next. Recommends (does not
-  # invoke) office-hours / plan-eng-review / critique / doctor / qa for
+  # invoke) office-hours / plan-eng-review / sherlock / victor / rudy for
   # questions that genuinely need deep design work.
-  president:
+  lincoln:
     type: strategist
     scope: "Status reporting, strategic conversation, cross-manager brokering during execution sessions"
     claim_filter: null         # doesn't claim — pure strategic interlocutor
-    inbox_label: for-president # accepts arbitration asks from O/T/C, direction from user
-    role_prompt: roles/president.md
+    inbox_label: for-lincoln   # accepts arbitration asks from O/T/C, direction from user
+    role_prompt: roles/lincoln.md
     dispatches_workers: true   # read-only Explore subagents only
     cross_inbox_read: true     # bypass read-guard to give status across all managers
     idle_polling: "/loop 5m /inbox"  # slower than Chuck; strategic conversation is reactive
     files_addressed_beads: true      # may file for-X coord beads (one-line, not detailed specs)
     forbidden_invocations:
-      - critique  # planning-session agent, user invokes
-      - doctor    # planning-session agent, user invokes
-      - qa        # planning-session agent, user invokes
+      - sherlock  # planning-session agent, user invokes
+      - victor    # planning-session agent, user invokes
+      - rudy      # planning-session agent, user invokes
 
-# Add new agents here using the same shape. Common additions:
-#
-#  qa:
-#    type: quality_validator
-#    scope: "Scenario testing, regression hunting, smoke validation"
-#    claim_filter: "for-qa-only"
-#    inbox_label: for-qa
-#    role_prompt: roles/qa.md
-#    dispatches_workers: false
-#
-#  president:
-#    type: strategist
-#    scope: "Status reporting, strategic planning, cross-manager brokering during execution sessions"
-#    claim_filter: null
-#    inbox_label: for-president
-#    role_prompt: roles/president.md
-#    dispatches_workers: true   # read-only research subagents only
-#    cross_inbox_read: true     # bypass read-guard to give status across all managers
+# Add new agents here using the same shape.

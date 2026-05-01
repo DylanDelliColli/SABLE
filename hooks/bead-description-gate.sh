@@ -8,10 +8,10 @@
 #       depends on bead descriptions reliably naming files; nudge isn't enough.
 #   - Default mode (no agent identity): nudge via additionalContext.
 #
-# Label-aware: when --labels includes critique-finding, additional sections
-# from templates/critique-bead.md are required (Rationale, Evidence with
+# Label-aware: when --labels includes sherlock-finding, additional sections
+# from templates/sherlock-bead.md are required (Rationale, Evidence with
 # Fingerprint, Proposed approach, Scope estimate, Risk if not addressed).
-# These are the contract Critique commits to in its role file.
+# These are the contract Sherlock commits to in its role file.
 
 set -euo pipefail
 
@@ -50,9 +50,9 @@ m = (
 print(m.group(1) if m else '')
 " 2>/dev/null || echo "")
 
-CRITIQUE_FINDING=0
-if echo ",$LABELS," | grep -q ',critique-finding,'; then
-  CRITIQUE_FINDING=1
+SHERLOCK_FINDING=0
+if echo ",$LABELS," | grep -q ',sherlock-finding,'; then
+  SHERLOCK_FINDING=1
 fi
 
 # Extract description content (between quotes after --description)
@@ -105,8 +105,8 @@ append_missing() {
   fi
 }
 
-# Critique-finding additional checks (only if labeled)
-if [ "$CRITIQUE_FINDING" = "1" ]; then
+# Sherlock-finding additional checks (only if labeled)
+if [ "$SHERLOCK_FINDING" = "1" ]; then
   echo "$DESC" | grep -qE '^## Rationale' \
     || append_missing "## Rationale section"
   echo "$DESC" | grep -qE 'Fingerprint:' \
@@ -133,8 +133,8 @@ fi
 
 # Emit verdict based on mode
 if [ "$MODE" = "block" ]; then
-  if [ "$CRITIQUE_FINDING" = "1" ]; then
-    REASON="SABLE bead quality (critique-finding): Description missing required sections per templates/critique-bead.md — $MISSING_LIST. Fix the description and retry. Critique findings have a higher quality bar than the default Fresh Agent Test."
+  if [ "$SHERLOCK_FINDING" = "1" ]; then
+    REASON="SABLE bead quality (sherlock-finding): Description missing required sections per templates/sherlock-bead.md — $MISSING_LIST. Fix the description and retry. Sherlock findings have a higher quality bar than the default Fresh Agent Test."
   else
     REASON="SABLE bead quality: Description missing — $MISSING_LIST. Manager context requires beads pass the Fresh Agent Test before creation. Add the missing sections and retry."
   fi

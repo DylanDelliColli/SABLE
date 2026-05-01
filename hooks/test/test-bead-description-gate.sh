@@ -96,10 +96,10 @@ assert_nudge() {
   fi
 }
 
-# Build a critique-complete description with real newlines (matches what
+# Build a sherlock-complete description with real newlines (matches what
 # `bd create --description="..."` produces when the agent types a multi-line
 # heredoc-style quoted string).
-COMPLETE_CRITIQUE_DESC=$'## Rationale\nFoo\n\n## Evidence\n### File: src/auth/middleware.ts\n- Symbol: publicPaths\n- Fingerprint: const publicPaths = [\n\n## Proposed approach\nBar\n\n## Scope estimate\nS\n\n## Risk if not addressed\nBaz\n\nTest spec: src/auth/test_middleware.test.ts'
+COMPLETE_SHERLOCK_DESC=$'## Rationale\nFoo\n\n## Evidence\n### File: src/auth/middleware.ts\n- Symbol: publicPaths\n- Fingerprint: const publicPaths = [\n\n## Proposed approach\nBar\n\n## Scope estimate\nS\n\n## Risk if not addressed\nBaz\n\nTest spec: src/auth/test_middleware.test.ts'
 
 # ---------- Default mode (no agent identity) ----------
 
@@ -134,25 +134,25 @@ assert_allow "manager: complete description allowed" "$MANAGER_ENV" "bd create -
 # Test 9: epic creation skipped in manager mode
 assert_allow "manager: epic exempt" "$MANAGER_ENV" "bd create --type=epic --title=foo --description=\"bar\""
 
-# ---------- Critique-finding label checks (manager mode only) ----------
+# ---------- Sherlock-finding label checks (manager mode only) ----------
 
-# Test 10: critique-finding label without required sections → DENY listing them
-assert_deny "manager: critique-finding incomplete denied" "$MANAGER_ENV" \
-  "bd create --title=foo --labels=critique-finding --description=\"Update src/foo.ts. Test in src/foo.test.ts.\"" \
+# Test 10: sherlock-finding label without required sections → DENY listing them
+assert_deny "manager: sherlock-finding incomplete denied" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=sherlock-finding --description=\"Update src/foo.ts. Test in src/foo.test.ts.\"" \
   "Rationale"
 
-# Test 11: critique-finding label with all required sections → allow
-assert_allow "manager: critique-finding complete allowed" "$MANAGER_ENV" \
-  "bd create --title=foo --labels=critique-finding --description=\"$COMPLETE_CRITIQUE_DESC\""
+# Test 11: sherlock-finding label with all required sections → allow
+assert_allow "manager: sherlock-finding complete allowed" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=sherlock-finding --description=\"$COMPLETE_SHERLOCK_DESC\""
 
-# Test 12: critique-finding label with everything except Fingerprint → DENY mentioning Fingerprint
+# Test 12: sherlock-finding label with everything except Fingerprint → DENY mentioning Fingerprint
 PARTIAL_NO_FP=$'## Rationale\nFoo\n\n## Evidence\n### File: src/auth.ts\n- Symbol: foo\n\n## Proposed approach\nBar\n\n## Scope estimate\nS\n\n## Risk if not addressed\nBaz\n\nTest spec: src/auth.test.ts'
-assert_deny "manager: critique-finding without fingerprint denied" "$MANAGER_ENV" \
-  "bd create --title=foo --labels=critique-finding --description=\"$PARTIAL_NO_FP\"" \
+assert_deny "manager: sherlock-finding without fingerprint denied" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=sherlock-finding --description=\"$PARTIAL_NO_FP\"" \
   "Fingerprint"
 
-# Test 13: non-critique-finding label, complete description → allow even in manager mode
-assert_allow "manager: non-critique label allowed when complete" "$MANAGER_ENV" \
+# Test 13: non-sherlock-finding label, complete description → allow even in manager mode
+assert_allow "manager: non-sherlock label allowed when complete" "$MANAGER_ENV" \
   "bd create --title=foo --labels=bug,for-tarzan --description=\"Update src/foo.ts. Test in src/foo.test.ts.\""
 
 # ---------- Summary ----------

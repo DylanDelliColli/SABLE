@@ -1,7 +1,7 @@
-# Critique Finding Bead Template
+# Sherlock Finding Bead Template
 
-Required sections for any bead labeled `critique-finding`. Critique writes
-these. Doctor validates them. Optimus/Tarzan execute them.
+Required sections for any bead labeled `sherlock-finding`. Sherlock writes
+these. Victor validates them. Optimus/Tarzan execute them.
 
 The standard Fresh Agent Test is the floor; this template is the ceiling.
 
@@ -13,11 +13,11 @@ The standard Fresh Agent Test is the floor; this template is the ceiling.
 
 ## Category
 {{ pick exactly one sub-label, the bead must also carry it }}
-- `critique:design-rot`     — architectural smell, wrong abstraction, leaky boundary
-- `critique:redundancy`     — duplicated logic, parallel implementations
-- `critique:verbosity`      — overlong module/function/configuration that obscures intent
-- `critique:dead-code`      — unreachable, unreferenced, gated by a removed flag
-- `critique:test-gap`       — missing or weak coverage of a documented behavior
+- `sherlock:design-rot`     — architectural smell, wrong abstraction, leaky boundary
+- `sherlock:redundancy`     — duplicated logic, parallel implementations
+- `sherlock:verbosity`      — overlong module/function/configuration that obscures intent
+- `sherlock:dead-code`      — unreachable, unreferenced, gated by a removed flag
+- `sherlock:test-gap`       — missing or weak coverage of a documented behavior
 
 ## Rationale
 Why is this bad? What does it cost (correctness, performance, readability,
@@ -52,7 +52,7 @@ What happens if this stays in the codebase? Choose at least one:
 - Future development cost (specific examples)
 - Reliability or correctness risk (specific failure mode)
 - Onboarding friction (concrete pattern that confuses readers)
-- Silent contributor to other findings in this critique pass
+- Silent contributor to other findings in this audit pass
 
 ## Test spec
 Both unit AND integration unless explicitly opted out. Required by SABLE
@@ -60,7 +60,7 @@ Prime Directive #2 — same as any bead.
 
 - **Unit:** <file::test_name + assertion>
 - **Integration:** <file::test_name + real dependency it exercises>
-- **If [no-integration]:** explicit reason. Critique should rarely use this
+- **If [no-integration]:** explicit reason. Sherlock should rarely use this
   exemption — most design findings ARE composition issues that integration
   tests exercise.
 
@@ -86,7 +86,7 @@ Prime Directive #2 — same as any bead.
 | Test spec | Standard SABLE non-negotiable |
 | AC with fingerprint check | Verifying the fix actually addressed the cited site |
 
-## Self-review checklist (Critique runs before submitting any bead)
+## Self-review checklist (Sherlock runs before submitting any bead)
 
 Before `bd create`, re-read the draft and confirm:
 

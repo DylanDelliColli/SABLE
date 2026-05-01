@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""sable-agents — quick reminder of what each SABLE agent does.
+
+Reads ~/.claude/sable/agents.yaml (the registry) and prints a scannable
+summary. Designed for the "I forgot what victor does" moment — fast,
+opinionated, decision-driving output.
+
+Usage:
+  sable-agents                  # all agents, default multi-line summary
+  sable-agents --list           # one-line-each compact mode
+  sable-agents <name>           # single agent + path to its role file
+  sable-agents --json           # machine-readable
+  sable-agents --help
+
+Env:
+  SABLE_REGISTRY                Override registry path (default: ~/.claude/sable/agents.yaml)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+DEFAULT_REGISTRY = Path.home() / ".claude" / "sable" / "agents.yaml"
+
+# ANSI styling (skipped when not a TTY).
+def _supports_color() -> bool:
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR", "") == ""
+
+def _bold(s: str) -> str:
+    return f"\033[1m{s}\033[0m" if _supports_color() else s
+
+def _dim(s: str) -> str:
+    return f"\033[2m{s}\033[0m" if _supports_color() else s
+
+def _color(s: str, code: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if _supports_color() else s
+
+
+# Minimal YAML reader — avoid pulling pyyaml as a dependency. The registry
+# uses a small subset of YAML (top-level "agents:", nested mappings,
+# scalar values, boolean/null/string types, simple lists). This parser
+# handles exactly that shape and refuses anything fancier.
+def _load_registry(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        sys.stderr.write(f"sable-agents: registry not found at {path}\n")
+        sys.stderr.write("  Run install.sh or copy templates/multi-manager/agents.yaml manually.\n")
+        sys.exit(2)
+
+    text = path.read_text()
+    # Strip comments
+    cleaned = re.sub(r"^\s*#.*$|\s+#.*$", "", text, flags=re.MULTILINE)
+
+    agents: dict[str, dict[str, Any]] = {}
+    current_agent: str | None = None
+    current_subkey: str | None = None
+    in_agents_section = False
+
+    for raw_line in cleaned.splitlines():
+        line = raw_line.rstrip()
+        if not line.strip():
+            continue
+        # Top level
+        if line.startswith("agents:"):
+            in_agents_section = True
+            continue
+        if not in_agents_section:
+            continue
+
+        # Indent level via leading spaces
+        stripped = line.lstrip(" ")
+        indent = len(line) - len(stripped)
+
+        # Agent name at 2-space indent
+        if indent == 2 and stripped.endswith(":"):
+            name = stripped[:-1].strip()
+            if name and not name.startswith("-"):
+                current_agent = name
+                current_subkey = None
+                agents[current_agent] = {}
+            continue
+
+        # Nested key:value at 4-space indent
+        if indent == 4 and current_agent is not None and ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+            current_subkey = key
+            parsed = _parse_scalar(val)
+            agents[current_agent][key] = parsed
+            continue
+
+        # Sub-mapping content (e.g. test_target.url_env) at 6-space indent
+        if indent == 6 and current_agent is not None and current_subkey:
+            # Treat as nested dict under current_subkey
+            existing = agents[current_agent].get(current_subkey)
+            if not isinstance(existing, dict):
+                existing = {}
+                agents[current_agent][current_subkey] = existing
+            if ":" in stripped:
+                k, _, v = stripped.partition(":")
+                existing[k.strip()] = _parse_scalar(v.strip())
+            elif stripped.startswith("- "):
+                lst = existing.setdefault("_list", [])
+                lst.append(_parse_scalar(stripped[2:].strip()))
+            continue
+
+        # List items under top-level key (e.g. forbidden_invocations)
+        if indent == 6 and stripped.startswith("- "):
+            existing = agents[current_agent].get(current_subkey)
+            if not isinstance(existing, list):
+                existing = []
+                agents[current_agent][current_subkey] = existing
+            existing.append(_parse_scalar(stripped[2:].strip()))
+            continue
+
+    return agents
+
+
+def _parse_scalar(val: str) -> Any:
+    if val == "" or val == "null":
+        return None
+    if val in ("true", "True"):
+        return True
+    if val in ("false", "False"):
+        return False
+    # Quoted string
+    if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+        return val[1:-1]
+    # Numeric
+    try:
+        return int(val)
+    except ValueError:
+        pass
+    try:
+        return float(val)
+    except ValueError:
+        pass
+    return val
+
+
+def _summary_line(name: str, info: dict[str, Any]) -> str:
+    """One-line compact summary."""
+    type_ = info.get("type", "?")
+    scope = info.get("scope", "")
+    # Trim long scopes
+    if isinstance(scope, str) and len(scope) > 70:
+        scope = scope[:67] + "..."
+    return f"{_bold(name.ljust(10))} {_color(type_.ljust(18), '36')} {scope}"
+
+
+def _detail_block(name: str, info: dict[str, Any]) -> list[str]:
+    """Multi-line detailed summary."""
+    type_ = info.get("type", "?")
+    scope = info.get("scope", "")
+    claim = info.get("claim_filter") or "-"
+    inbox = info.get("inbox_label") or "-"
+    dispatches = info.get("dispatches_workers")
+    if dispatches is True:
+        # Refine based on agent comments — read-only vs full-write isn't in the
+        # registry directly. Best-effort heuristic: planning-session agents
+        # dispatch read-only Explore subagents; everyone else dispatches workers.
+        type_lc = (type_ or "").lower()
+        if type_lc in ("auditor", "bead_validator", "strategist"):
+            dispatches_str = "read-only"
+        else:
+            dispatches_str = "yes"
+    elif dispatches is False:
+        dispatches_str = "no"
+    else:
+        dispatches_str = "?"
+
+    lifecycle = _infer_lifecycle(name, info)
+
+    lines = [
+        f"{_bold(name.ljust(10))} {_color(type_, '36')}  {scope}",
+        f"{'':10} claim: {_dim(str(claim))}  inbox: {_dim(str(inbox))}  dispatches: {_dim(dispatches_str)}  lifecycle: {_dim(lifecycle)}",
+    ]
+    if info.get("cross_inbox_read"):
+        lines.append(f"{'':10} {_color('* cross-inbox read enabled', '33')}")
+    return lines
+
+
+def _infer_lifecycle(name: str, info: dict[str, Any]) -> str:
+    type_ = (info.get("type") or "").lower()
+    if type_ in ("auditor", "bead_validator", "quality_validator"):
+        return "planning-session"
+    if name == "chuck":
+        return "continuous (3m loop)"
+    if name == "lincoln" or info.get("idle_polling"):
+        polling = info.get("idle_polling", "")
+        m = re.search(r"(\d+m)", polling)
+        return f"continuous ({m.group(1)} loop)" if m else "continuous"
+    return "continuous"
+
+
+def _print_role_path(name: str, info: dict[str, Any]) -> None:
+    role = info.get("role_prompt", "")
+    if role:
+        # Resolve to ~/.claude/sable/<role_prompt>
+        installed = Path.home() / ".claude" / "sable" / role
+        repo = Path.home() / "dev-env" / "SABLE" / "templates" / "multi-manager" / role
+        sys.stdout.write(f"\n  Role file:\n")
+        if installed.exists():
+            sys.stdout.write(f"    installed: {installed}\n")
+        if repo.exists():
+            sys.stdout.write(f"    source:    {repo}\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Quick reminder of what each SABLE agent does.")
+    parser.add_argument("name", nargs="?", help="Filter to a single agent")
+    parser.add_argument("--list", action="store_true", help="One-line-each compact mode")
+    parser.add_argument("--json", action="store_true", help="Machine-readable JSON")
+    parser.add_argument("--registry", default=os.environ.get("SABLE_REGISTRY", str(DEFAULT_REGISTRY)),
+                        help="Path to agents.yaml (default: ~/.claude/sable/agents.yaml)")
+    args = parser.parse_args(argv)
+
+    registry = _load_registry(Path(args.registry))
+
+    # Filter
+    if args.name:
+        if args.name not in registry:
+            available = ", ".join(sorted(registry.keys()))
+            sys.stderr.write(f"sable-agents: no agent named '{args.name}'. Known: {available}\n")
+            return 1
+        registry = {args.name: registry[args.name]}
+
+    if args.json:
+        # Filter to keys that survive our minimal parser cleanly
+        out = {n: {k: v for k, v in info.items() if k != "_list"} for n, info in registry.items()}
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+
+    if args.list:
+        for name, info in registry.items():
+            print(_summary_line(name, info))
+        return 0
+
+    # Default detailed mode
+    for i, (name, info) in enumerate(registry.items()):
+        if i > 0:
+            print()
+        for line in _detail_block(name, info):
+            print(line)
+        if args.name:
+            _print_role_path(name, info)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
