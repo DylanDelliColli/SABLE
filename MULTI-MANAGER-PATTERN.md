@@ -2,7 +2,9 @@
 
 > **Status: experimental — `personal-tooling` branch only.** This pattern extends SABLE for high-throughput, multi-agent power-user workflows. Do not adopt until the prerequisites below are second nature.
 
-A coordination pattern for running 2-3 named manager agents (each commanding their own worker swarm) in parallel against the same repository, with mechanical conflict prevention, addressed inter-agent messaging, and selective dispatch preemption.
+A coordination pattern for running a roster of named agents in parallel against the same repository — three continuous **execution managers** (each commanding their own worker swarm), three session-scoped **planning agents**, and one execution-session **strategist** — with mechanical conflict prevention, addressed inter-agent messaging, and selective dispatch preemption.
+
+The pattern's name still says "multi-manager" because the manager trio (Optimus / Tarzan / Chuck) is the load-bearing piece — the hooks key off `CLAUDE_AGENT_ROLE=manager` and only managers operate continuously. The other agents extend the same registry and identity infrastructure to cover bead-quality production (Sherlock), bead-pool freshness (Victor), end-to-end validation (Rudy), and strategic conversation during execution (Lincoln) without bolting on a parallel system.
 
 ---
 
@@ -20,9 +22,11 @@ If any of these aren't true, stay on standard SABLE. Adopt this pattern after yo
 
 ---
 
-## The three-manager architecture
+## The agent set
 
-This pattern is described in terms of three concrete managers — adapt the names and scopes to your setup. The mechanism is the same.
+This pattern is described in terms of a concrete seven-agent roster — adapt the names and scopes to your setup. The mechanism is the same. All seven live in a single `agents.yaml` registry; what differs is lifecycle and which hooks act on them.
+
+### Tier 1 — Continuous execution managers (run during execution sessions)
 
 | Agent | Type | Scope | Claims |
 |-------|------|-------|--------|
@@ -32,15 +36,56 @@ This pattern is described in terms of three concrete managers — adapt the name
 
 **Critical**: ownership is based on **work shape**, not priority. A P0 auth-breaking bug is Tarzan's territory if it's standalone. A P3 nice-to-have refactor is Optimus's territory if it's an epic. Priority signals urgency; structure signals ownership.
 
-### Why three?
+These three are the original "managers." They launch with `CLAUDE_AGENT_ROLE=manager`, so all the coordination hooks (inbox injection, pre-dispatch refresh/claim/overlap/preempt/model-check, pre-push gate, post-push notify) fire for them.
 
-Two managers (Optimus + Tarzan) plus an integrator (Chuck) is the minimum viable shape for separation of concerns:
+### Tier 2 — Session-scoped planning agents (run during planning sessions, not continuous)
+
+| Agent | Type | Scope | Lifecycle |
+|-------|------|-------|-----------|
+| **Sherlock** | auditor | Read-only repo audit producing high-quality finding beads (design rot, redundancy, verbosity, dead code, test gaps) | User invokes with scope arg (`sherlock src/auth`); writes beads, self-reviews, addresses, exits |
+| **Victor** | bead_validator | Validate open beads against current HEAD; update or close stale ones using differential validation | User invokes (`victor`, `victor --epic=…`); 5-run ramp-up before auto-closing |
+| **Rudy** | quality_validator | End-to-end browser validation on the integration-branch dev deploy (Vercel preview + Supabase dev only) | User invokes (`rudy`, `rudy --feature=…`); files bug beads + a `rudy-report` at session end; refuses prod / PR-preview / local-dev targets |
+
+These never run continuously. They are pure producers (Sherlock, Rudy) or pool-maintainers (Victor) — the user kicks them off, they do their pass, they exit. Sherlock and Victor may dispatch read-only Explore subagents. Rudy runs browser interaction itself (browser sessions need state continuity).
+
+The continuous-mode hooks are gated on `CLAUDE_AGENT_ROLE=manager`, so they no-op for these three. Planning agents rely on a different discipline: bead-template enforcement (`templates/sherlock-bead.md` is mechanically required for `sherlock-finding` labels via `bead-description-gate.sh`).
+
+### Tier 3 — Execution-session strategist (runs as peer, not orchestrator)
+
+| Agent | Type | Scope | Lifecycle |
+|-------|------|-------|-----------|
+| **Lincoln** | strategist | Status reporting, strategic conversation, cross-manager brokering during execution sessions | Runs in a 4th terminal alongside Optimus / Tarzan / Chuck. Three modes: Quick strategy, Arbitration, What's next. Idle-polls inbox via `/loop 5m /inbox`. |
+
+Lincoln is the agent the user **primarily talks to** during a working session. Optimus / Tarzan / Chuck are autonomous — they don't need conversation, they need beads. Lincoln gives status, brokers `for-lincoln` arbitration asks from the other three, and helps the user think strategically without becoming an orchestrator. Lincoln has `cross_inbox_read: true` (bypasses the read guard so it can give status across all managers) and may file `for-X` coord beads (one-line, not detailed specs).
+
+Lincoln is forbidden from invoking Sherlock, Victor, or Rudy — those are user-driven planning sessions, not Lincoln's tools.
+
+### Why this shape?
+
+Two execution managers (Optimus + Tarzan) plus an integrator (Chuck) is the minimum viable shape for execution separation of concerns:
 
 - Without Tarzan, Optimus gets pulled into one-liner bugs that interrupt epic work
 - Without Optimus, Tarzan tries to run epics they're not structured for
 - Without Chuck, the human becomes the merge-queue bottleneck and the messenger between the other two
 
-Adding more agents (e.g., a Researcher, a QA specialist) is supported via the registry pattern — see [Adding agents](#adding-agents).
+The planning trio + strategist were added because:
+
+- **Sherlock** moves audit-style finding production out of the manager loop. Optimus and Tarzan execute — they shouldn't be writing audit beads in the same session they're shipping fixes.
+- **Victor** prevents the bead pool from rotting. Without it, fixed bugs stay open and workers waste cycles on already-resolved issues.
+- **Rudy** validates integrated state before promotion to prod. Worker-level unit + integration tests aren't enough — the dev environment needs a separate human-style sanity pass.
+- **Lincoln** removes the human-as-orchestrator pressure during execution. Without Lincoln, the user is constantly re-deriving cross-manager state to give direction; with Lincoln, the user has a strategic conversation partner that already knows what's happening.
+
+Adding more agents is supported via the registry pattern — see [Adding agents](#adding-agents).
+
+### Quick reminder helper
+
+`bin/sable-agents` reads the registry and prints a scannable summary of who does what. Use it for the "I forgot what victor does" moment:
+
+```bash
+sable-agents              # all agents, multi-line detail
+sable-agents --list       # one-line each
+sable-agents victor       # single agent + role file path
+```
 
 ---
 
@@ -52,12 +97,28 @@ Each manager launches with an immutable identity established at the OS level, no
 
 ```bash
 # In ~/.zshrc or equivalent
+
+# Tier 1 — continuous execution managers (CLAUDE_AGENT_ROLE=manager triggers
+# the continuous-mode hooks: inbox injection, pre-dispatch refresh/claim/
+# overlap/preempt/model-check, pre-push gate, post-push notify)
 alias optimus='CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager claude'
 alias tarzan='CLAUDE_AGENT_NAME=tarzan CLAUDE_AGENT_ROLE=manager claude'
 alias chuck='CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude'
+
+# Tier 3 — execution-session strategist (runs as a manager so it gets
+# inbox injection and the read-guard bypass via cross_inbox_read)
+alias lincoln='CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude'
+
+# Tier 2 — session-scoped planning agents (CLAUDE_AGENT_ROLE not "manager",
+# so continuous-mode hooks no-op; pass scope as the initial prompt)
+sherlock() { CLAUDE_AGENT_NAME=sherlock CLAUDE_AGENT_ROLE=auditor claude "$@"; }
+victor()   { CLAUDE_AGENT_NAME=victor   CLAUDE_AGENT_ROLE=bead_validator    claude "$@"; }
+rudy()     { CLAUDE_AGENT_NAME=rudy     CLAUDE_AGENT_ROLE=quality_validator claude "$@"; }
 ```
 
 Hooks inherit the Claude Code process's environment. An agent running `export CLAUDE_AGENT_NAME=tarzan` inside a Bash tool only affects that subshell, which is discarded after the command. The env var is effectively immutable from the agent's perspective.
+
+**On role values.** All continuous-mode hooks (`pre-dispatch-*`, `inbox-injection`, `pre-push-rebase-test`, `post-push-merge-notify`) hard-exit when `CLAUDE_AGENT_ROLE != "manager"`. Lincoln launches with `manager` so it gets inbox injection; Sherlock / Victor / Rudy launch with their own roles so the continuous hooks no-op for them. Their discipline comes from session-scoped invocation patterns and bead-template enforcement, not from runtime hooks.
 
 ### Identity injection
 
@@ -80,45 +141,69 @@ fi
 
 ## Registry
 
-`~/.claude/sable/agents.yaml` is the single source of truth for agent properties. All hooks read it dynamically. Adding or modifying an agent requires no hook code changes.
+`~/.claude/sable/agents.yaml` is the single source of truth for agent properties. All hooks read it dynamically. Adding or modifying an agent requires no hook code changes. The canonical file is at [`templates/multi-manager/agents.yaml`](templates/multi-manager/agents.yaml) — copy it during install. The condensed shape:
 
 ```yaml
 agents:
+  # Tier 1 — continuous execution managers
   optimus:
     type: epic_manager
-    scope: "Large feature epics, hardening work, multi-bead sequences"
-    claim_filter: "--has-parent"          # bd ready filter for general pool
+    claim_filter: "--has-parent"
     inbox_label: for-optimus
-    role_prompt: roles/optimus.md
     dispatches_workers: true
-
   tarzan:
     type: one_off_manager
-    scope: "Bugfixes, one-offs, docs — anything standalone"
     claim_filter: "--no-parent"
     inbox_label: for-tarzan
-    role_prompt: roles/tarzan.md
     dispatches_workers: true
-
   chuck:
     type: integrator
-    scope: "Merge queue, PR review, conflict resolution"
-    claim_filter: "for-chuck-only"        # only acts on addressed coord beads
+    claim_filter: "for-chuck-only"
     inbox_label: for-chuck
-    role_prompt: roles/chuck.md
     dispatches_workers: false
-    fix_directly:
-      - imports
-      - lockfile
-      - whitespace
-      - non_overlapping_diffs
-      - docs
-    delegate_to_author:
-      - overlapping_logic
-      - semantic_conflicts
-      - test_divergence
+    fix_directly: [imports, lockfile, whitespace, non_overlapping_diffs, docs]
+    delegate_to_author: [overlapping_logic, semantic_conflicts, test_divergence, config_changes]
     post_push_autoack: true
+
+  # Tier 2 — session-scoped planning agents
+  sherlock:
+    type: auditor
+    claim_filter: null              # pure producer, doesn't claim
+    inbox_label: null               # no inbox; scope passed at invocation
+    dispatches_workers: true        # read-only Explore subagents only
+    bead_template: templates/sherlock-bead.md   # required for sherlock-finding labels
+    quality_bar: above_default
+  victor:
+    type: bead_validator
+    claim_filter: null              # operates over bd list, doesn't claim
+    inbox_label: for-victor         # accepts freshness-pass requests from user/Lincoln
+    dispatches_workers: true        # read-only Explore subagents only
+    auto_close_ramp_up: 5           # first 5 runs label only; auto-close after
+    validation_marker: victor-validated-at
+  rudy:
+    type: quality_validator
+    claim_filter: null              # operates on user-invoked scope
+    inbox_label: for-rudy
+    dispatches_workers: false       # browser sessions need single-process state
+    test_target:
+      url_env: SABLE_RUDY_BASE_URL                  # Vercel preview for integration branch
+      supabase_env: SABLE_RUDY_SUPABASE_URL
+      branch_env: SABLE_RUDY_INTEGRATION_BRANCH
+      forbidden_targets: [production, pr_preview, local_dev_server]
+
+  # Tier 3 — execution-session strategist
+  lincoln:
+    type: strategist
+    claim_filter: null              # pure interlocutor
+    inbox_label: for-lincoln
+    dispatches_workers: true        # read-only Explore subagents only
+    cross_inbox_read: true          # bypass read-guard to give cross-manager status
+    idle_polling: "/loop 5m /inbox" # slower than Chuck (3m); strategic conversation is reactive
+    files_addressed_beads: true     # may file for-X coord beads (one-line, not specs)
+    forbidden_invocations: [sherlock, victor, rudy]
 ```
+
+**Per-bead model selection.** Beads optionally carry a `model:<haiku|sonnet|opus>` label that drives worker model choice at dispatch time. The `pre-dispatch-model-check.sh` hook validates that the dispatch's model parameter matches the label (or that the prompt includes a `Model override: <reason>` line). See SABLE.md §6.9 for the ladder rules.
 
 ---
 
@@ -128,10 +213,20 @@ agents:
 
 | Label | Meaning |
 |-------|---------|
-| `for-optimus` | Addressed to Optimus's inbox |
-| `for-tarzan` | Addressed to Tarzan's inbox |
-| `for-chuck` | Addressed to Chuck's inbox |
+| `for-optimus` | Addressed to Optimus's inbox (epic-track work, coord asks from O's lane) |
+| `for-tarzan` | Addressed to Tarzan's inbox (orphan work, swarm-blocker P0s) |
+| `for-chuck` | Addressed to Chuck's inbox (PR-ready notifications, conflict delegations) |
+| `for-victor` | Bead-pool freshness-pass request (user or Lincoln files; Sherlock sometimes self-files) |
+| `for-rudy` | E2E validation request on the integration-branch dev deploy (user-only origin) |
+| `for-lincoln` | Arbitration ask from Optimus / Tarzan / Chuck, or direction from user |
+| `sherlock-finding` | Audit finding from Sherlock (mechanically validated against `templates/sherlock-bead.md`) |
+| `sherlock:<category>` | Sub-category on Sherlock findings (`design-rot`, `redundancy`, `verbosity`, `dead-code`, `test-gap`) |
+| `rudy-report` | Per-session Rudy summary bead filed at end of validation pass |
+| `victor-report` | Per-session Victor summary bead filed at end of freshness pass |
+| `victor-suspects-stale` | Victor's pre-auto-close label during the 5-run ramp-up |
 | `coord` | Umbrella label for all coordination traffic (filterable in one query) |
+
+Sherlock has no inbox — it's a pure producer invoked synchronously with a scope arg. Findings it produces are addressed to `for-optimus` (epic candidates) or `for-tarzan` (standalone fixes) at the addressing pass, not to Sherlock itself.
 
 ### When to address at creation
 
@@ -331,8 +426,9 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | Hook | Trigger | Purpose | Mode |
 |------|---------|---------|------|
 | `session-role-anchor.sh` | SessionStart, PreCompact | Inject role identity from `~/.claude/sable/roles/<name>.md` | Inject context |
-| `read-guard.sh` | PreToolUse:Bash | Deny `bd ready -l for-<foreign>` queries | Hard deny |
+| `read-guard.sh` | PreToolUse:Bash | Deny `bd ready -l for-<foreign>` queries (Lincoln bypassed via `cross_inbox_read: true`) | Hard deny |
 | `inbox-injection.sh` | PostToolUse:Bash | Inject unread for-self bead notifications (with dedup, agent_id skip) | Inject context |
+| `inbox-injection-precompact.sh` | PreCompact | Clear inbox dedup file so post-compact re-injection re-orients the manager | Side effect (clear cache) |
 | `pre-dispatch-refresh.sh` | PreToolUse:Agent | Rebase target worktree on `$SABLE_BASE_BRANCH` | Side effect (rebase) |
 | `pre-dispatch-claim.sh` | PreToolUse:Agent | Read bead description, write file claims to bead notes | Side effect (bd update) |
 | `pre-dispatch-overlap.sh` | PreToolUse:Agent | Annotate overlap with other in-progress beads | Inject context |
@@ -340,7 +436,9 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | `pre-dispatch-model-check.sh` | PreToolUse:Agent | Enforce model ladder — bead `model:` label must match dispatch's model param, or prompt must include `Model override: <reason>` | Hard deny |
 | `edit-write-claim-reconciler.sh` | PreToolUse:Edit\|Write | Append modified file to bead claims | Side effect (bd update) |
 | `pre-push-rebase-test.sh` | PreToolUse:Bash matching `git push` | Force rebase + tests before push | Hard deny |
-| `post-push-merge-notify.sh` | PostToolUse:Bash matching `git push` | File `for-chuck` bead with overlap analysis | Side effect (bd create) |
+| `post-push-merge-notify.sh` | PostToolUse:Bash matching `git push` | File `for-chuck` bead with overlap analysis (Chuck's own pushes are skipped) | Side effect (bd create) |
+
+All twelve hooks live in `hooks/multi-manager/`. Every continuous-mode hook (everything except `session-role-anchor.sh` and `read-guard.sh`) hard-exits when `CLAUDE_AGENT_ROLE != "manager"`, so they no-op in Sherlock / Victor / Rudy sessions.
 
 **Bead quality hook**: `bead-description-gate.sh` (existing SABLE hook) is now mode-aware. When `CLAUDE_AGENT_NAME` is set or `CLAUDE_AGENT_ROLE=manager` (i.e. a multi-manager session), the hook hard-blocks (denies) `bd create` if the description is missing required content. Outside that context (single-agent SABLE), it nudges via `additionalContext`. Rolling execution depends on bead descriptions reliably naming files; the manager-context hard-block is the structural answer to bead-quality drift.
 
@@ -407,11 +505,19 @@ If you need a longer test budget in auto mode, remember to raise `"timeout"` in 
 
 ### Step 6: Add aliases
 
+See [Identity & immutability → Launch aliases](#launch-aliases) for the full set. Minimum viable for an execution session is the manager trio plus Lincoln; planning agents can be added incrementally as you start using them.
+
 ```bash
-# In ~/.zshrc
+# In ~/.zshrc — start with the execution-session set:
 alias optimus='CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager claude'
 alias tarzan='CLAUDE_AGENT_NAME=tarzan CLAUDE_AGENT_ROLE=manager claude'
 alias chuck='CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude'
+alias lincoln='CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude'
+
+# Add when you start running planning sessions:
+sherlock() { CLAUDE_AGENT_NAME=sherlock CLAUDE_AGENT_ROLE=auditor          claude "$@"; }
+victor()   { CLAUDE_AGENT_NAME=victor   CLAUDE_AGENT_ROLE=bead_validator   claude "$@"; }
+rudy()     { CLAUDE_AGENT_NAME=rudy     CLAUDE_AGENT_ROLE=quality_validator claude "$@"; }
 ```
 
 ### Step 7: Verify
@@ -429,6 +535,8 @@ Inside that session:
 ```
 
 Should return Optimus's addressed beads (or "Inbox empty" if none). Try `bd ready -l for-tarzan` — should be denied by the read guard.
+
+For each agent you've added an alias/function for, repeat: launch, confirm role injection ran (the SessionStart message will reference the role file), confirm `/inbox` returns the right `for-<name>` set (or rejects with "not in multi-manager identity context" for Sherlock, which has no inbox). `sable-agents <name>` should print details for any registered agent — useful for spot-checking that the registry was copied to `~/.claude/sable/agents.yaml` correctly.
 
 ---
 
@@ -534,7 +642,7 @@ The Chuck loop already does this implicitly (it watches PR state directly). Othe
 
 ## Adding agents
 
-To add a new manager (e.g. a Researcher):
+To add a new agent — manager, planning-session, or anything else:
 
 1. Add entry to `~/.claude/sable/agents.yaml`:
    ```yaml
@@ -547,14 +655,22 @@ To add a new manager (e.g. a Researcher):
      dispatches_workers: true
    ```
 
-2. Create `~/.claude/sable/roles/researcher.md` defining the role's responsibilities, scope, exclusions.
+2. Create `~/.claude/sable/roles/researcher.md` defining the role's responsibilities, scope, exclusions. (Use the existing role files in `templates/multi-manager/roles/` as a shape reference.)
 
-3. Add an alias:
+3. Add an alias or function. The role value determines whether continuous-mode hooks fire:
    ```bash
+   # If the agent runs continuously and should get inbox injection / pre-dispatch
+   # / pre-push hooks, use CLAUDE_AGENT_ROLE=manager:
    alias researcher='CLAUDE_AGENT_NAME=researcher CLAUDE_AGENT_ROLE=manager claude'
+
+   # If session-scoped (Sherlock/Victor/Rudy pattern), pick a role string that
+   # is NOT "manager" so the continuous-mode hooks no-op:
+   researcher() { CLAUDE_AGENT_NAME=researcher CLAUDE_AGENT_ROLE=investigator claude "$@"; }
    ```
 
 No hook code changes required. The hooks read the registry dynamically.
+
+If the new agent produces beads that should be mechanically validated against a template (Sherlock's pattern), add a `bead_template:` entry to its registry record and extend `hooks/bead-description-gate.sh` to recognize a new label gate. That's the only case that touches hook code.
 
 ---
 
