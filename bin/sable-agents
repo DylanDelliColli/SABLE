@@ -166,7 +166,7 @@ def _detail_block(name: str, info: dict[str, Any]) -> list[str]:
         # registry directly. Best-effort heuristic: planning-session agents
         # dispatch read-only Explore subagents; everyone else dispatches workers.
         type_lc = (type_ or "").lower()
-        if type_lc in ("auditor", "bead_validator", "strategist"):
+        if type_lc in ("auditor", "bead_validator", "strategist", "test_planner"):
             dispatches_str = "read-only"
         else:
             dispatches_str = "yes"
@@ -183,12 +183,21 @@ def _detail_block(name: str, info: dict[str, Any]) -> list[str]:
     ]
     if info.get("cross_inbox_read"):
         lines.append(f"{'':10} {_color('* cross-inbox read enabled', '33')}")
+    bead_template = info.get("bead_template")
+    quality_bar = info.get("quality_bar")
+    if bead_template or quality_bar:
+        bits = []
+        if bead_template:
+            bits.append(f"bead_template: {_dim(str(bead_template))}")
+        if quality_bar:
+            bits.append(f"quality_bar: {_dim(str(quality_bar))}")
+        lines.append(f"{'':10} " + "  ".join(bits))
     return lines
 
 
 def _infer_lifecycle(name: str, info: dict[str, Any]) -> str:
     type_ = (info.get("type") or "").lower()
-    if type_ in ("auditor", "bead_validator", "quality_validator"):
+    if type_ in ("auditor", "bead_validator", "quality_validator", "test_planner"):
         return "planning-session"
     if name == "chuck":
         return "continuous (3m loop)"

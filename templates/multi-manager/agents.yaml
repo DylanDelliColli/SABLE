@@ -101,6 +101,31 @@ agents:
         - pr_preview
         - local_dev_server
 
+  # Planning-session agent. Test-coverage planner — interview the user about
+  # what could break, then produce test beads + skeleton test files (forward
+  # mode) or test-gap finding beads (audit mode). Read-only with respect to
+  # source code; only writes test scaffolds and bead descriptions. Three
+  # invocations:
+  #   columbo --feature "<description>"   forward mode for new feature work
+  #                                       that has no feature bead yet
+  #   columbo --bead SABLE-xxx            forward mode that enriches an
+  #                                       existing feature bead with child
+  #                                       test beads + skeletons
+  #   columbo --audit <path>              audit mode against an existing
+  #                                       module — files columbo-test-gap
+  #                                       beads where coverage is shallow
+  # Pairs with the bead-description-gate to enforce templates/columbo-bead.md
+  # required sections on both label families.
+  columbo:
+    type: test_planner
+    scope: "Interview-driven test-coverage planning — produces test beads + skeleton test files (forward) or test-gap findings (audit)"
+    claim_filter: null         # doesn't claim — pure producer, conversation-driven
+    inbox_label: for-columbo   # accepts --bead requests from managers
+    role_prompt: roles/columbo.md
+    dispatches_workers: true   # read-only Explore subagents only
+    bead_template: templates/columbo-bead.md   # required for all columbo beads
+    quality_bar: above_default  # see role_prompt for what this means
+
   # Execution-session agent. Strategic partner running as a peer alongside
   # Optimus/Tarzan/Chuck — NOT an orchestrator. User runs 4 terminals during
   # working sessions and primarily talks to Lincoln. Three lightweight
