@@ -6,7 +6,17 @@ Contents:
 - `bin/sable-note` — shell script for frictionless capture of SABLE methodology observations
 - `skills/sable-review/SKILL.md` — Claude Code skill for triaging accumulated feedback
 - `skills/audit-deep-dive/SKILL.md` — Claude Code skill for converting AUDIT: beads into epic+children
+- `skills/columbo/SKILL.md` + `skills/columbo/columbo-prefilter.py` — Claude Code skill that delivers the Columbo test-coverage planning workflow without requiring the multi-manager registry, role files, agent identity, or coordination hooks. Use this on machines where you want Columbo's interview + skeleton-test output but not the full multi-manager pattern (typical for work computers where you bounce between many repos). Invokable as `/columbo` once installed at `~/.claude/skills/columbo/`.
 - `MULTI-MANAGER-PATTERN.md` — experimental coordination pattern for power-user multi-agent swarms. Eight-agent roster: continuous execution managers (Optimus / Tarzan / Chuck), session-scoped planning agents (Sherlock / Victor / Rudy / Columbo), and execution-session strategist (Lincoln). Companion `hooks/multi-manager/`, `templates/multi-manager/`, `bin/columbo-prefilter.py` (Columbo's audit-mode triage tool), and `bin/sable-agents` reminder helper.
+
+## Columbo: skill vs. multi-manager pattern
+
+Columbo's interview workflow (taxonomy, decision rubric, 5-phase flow, skeleton-test convention, one-more-thing rule) ships in two forms:
+
+- **Skill (`skills/columbo/`)** — portable, single-file, no dependencies beyond `bd`. Right for work computers, repos where you don't run a manager swarm, or any setup where you want the workflow without the agent-coordination plumbing. Invokable as `/columbo` from any cwd.
+- **Multi-manager agent (`templates/multi-manager/roles/columbo.md`)** — full implementation with identity injection, `for-columbo` inbox, bead-template gate enforcement, runs as a peer to Sherlock / Victor / Rudy. Right for personal projects with the full SABLE stack installed.
+
+Both produce the same outputs: `columbo-test-spec` / `columbo-test-gap` beads + `*.skel.test.<ext>` skeleton files. Pick the one that matches your setup; the workflow content is the same.
 
 ## Install on a new machine
 
@@ -29,6 +39,16 @@ cp skills/sable-review/SKILL.md ~/.claude/skills/sable-review/SKILL.md
 ```
 
 Confirm by starting a fresh Claude Code session and checking the skill list — `sable-review` should appear.
+
+### 2b. `/columbo` skill available to Claude Code (work-machine variant)
+
+```bash
+mkdir -p ~/.claude/skills/columbo
+cp skills/columbo/SKILL.md           ~/.claude/skills/columbo/SKILL.md
+cp skills/columbo/columbo-prefilter.py ~/.claude/skills/columbo/columbo-prefilter.py
+```
+
+Confirm by starting a fresh Claude Code session and checking the skill list — `columbo` should appear. Skip on machines where you've installed the full multi-manager pattern (the `columbo()` shell function + `~/.claude/sable/roles/columbo.md` registry entry give you the same workflow with the additional agent-coordination plumbing).
 
 ## Syncing changes between machines
 
