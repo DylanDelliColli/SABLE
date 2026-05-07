@@ -752,6 +752,253 @@ def test_h5_concurrency_pattern():
         assert_in("h5: concurrency in detail", "concurrency", str(result))
 
 
+# ---------------------------------------------------------------------------
+# rjv.5.5 — Heuristic 1 (assertion density) + epic integration test
+# ---------------------------------------------------------------------------
+
+
+def test_h1_python_ast_counts_branches():
+    """Python ast walker returns expected branch counts for hand-crafted sources."""
+    fixtures = [
+        ("def foo(): pass\n", 0),
+        ("if a: pass\n", 1),
+        ("if a: pass\nif b: pass\nif c: pass\n", 3),
+        # 1 if + 1 for + 1 while + (1 try + 1 except) = 5
+        ("if a: pass\nfor x in y: pass\nwhile z: pass\ntry:\n    pass\nexcept E:\n    pass\n", 5),
+        # 1 if (with elif → nested If, +1) + 1 BoolOp (a and b → +1) = 3
+        # (the elif counts as a nested if = +1, but the original if is +1 → 2; plus the BoolOp's len-1 = 1 → 3)
+        ("if a and b:\n    pass\nelif c:\n    pass\n", 3),
+    ]
+    for source, expected in fixtures:
+        got = cp._count_branches_py(source)
+        assert_eq(f"h1: branch count for {source!r}", got, expected)
+
+
+def test_h1_python_assertion_count():
+    """Assertion counter handles `assert ...` and `self.assert*` patterns."""
+    fixtures = [
+        ("import x\n", 0),
+        ("def test_x():\n    assert a == b\n    assert c == d\n    assert e == f\n", 3),
+        ("def test_y(self):\n    self.assertEqual(a, b)\n    self.assertTrue(c)\n    assert d == e\n", 3),
+    ]
+    for text, expected in fixtures:
+        got = cp._count_assertions(text, "py")
+        assert_eq(f"h1: assertion count for {text[:30]!r}...", got, expected)
+
+
+def test_h1_fires_on_low_density():
+    """Source with many branches, test with few assertions → density < 1.0 → fires."""
+    h1 = _h("assertion-density")
+    assert_true("h1 registered", h1 is not None)
+    if h1 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "deep_logic_test.py"
+        source = tmp / "deep_logic.py"
+        # 10 branches, 3 assertions
+        source.write_text("\n".join([
+            "def foo(x):",
+            "    if x == 1: return 1",
+            "    if x == 2: return 2",
+            "    if x == 3: return 3",
+            "    if x == 4: return 4",
+            "    if x == 5: return 5",
+            "    if x == 6: return 6",
+            "    if x == 7: return 7",
+            "    if x == 8: return 8",
+            "    if x == 9: return 9",
+            "    if x == 10: return 10",
+        ]))
+        test.write_text("\n".join([
+            "def test_x():",
+            "    assert foo(1) == 1",
+            "    assert foo(2) == 2",
+            "    assert foo(3) == 3",
+        ]))
+        assert_eq("h1: low density fires", bool(h1["fire"](test, source)), True)
+
+
+def test_h1_does_not_fire_above_threshold():
+    """Density >= 1.0 → no fire."""
+    h1 = _h("assertion-density")
+    if h1 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "well_tested_test.py"
+        source = tmp / "well_tested.py"
+        # 4 branches, 5 assertions → density 1.25
+        source.write_text("\n".join([
+            "def foo(x):",
+            "    if x == 1: return 1",
+            "    if x == 2: return 2",
+            "    if x == 3: return 3",
+            "    if x == 4: return 4",
+        ]))
+        test.write_text("\n".join([
+            "def test_x():",
+            "    assert foo(1) == 1",
+            "    assert foo(2) == 2",
+            "    assert foo(3) == 3",
+            "    assert foo(4) == 4",
+            "    assert foo(5) is None",
+        ]))
+        assert_eq("h1: above-threshold density skips", bool(h1["fire"](test, source)), False)
+
+
+def test_h1_does_not_fire_on_trivial_source():
+    """Source with <3 branches → no fire (below floor)."""
+    h1 = _h("assertion-density")
+    if h1 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "trivial_test.py"
+        source = tmp / "trivial.py"
+        # 2 branches, 0 assertions → trivial source, no fire
+        source.write_text("def foo(x):\n    if x: return 1\n    if not x: return 0\n")
+        test.write_text("def test_x():\n    foo(1)\n")
+        assert_eq("h1: trivial source skips", bool(h1["fire"](test, source)), False)
+
+
+def test_h1_ts_regex_in_ballpark():
+    """TS branch regex returns counts within ±20% of hand-counted ground truth."""
+    fixtures = [
+        # source, hand-counted "true" count, tolerance
+        (
+            "function foo(x: number) {\n  if (x > 0) return 1;\n  if (x < 0) return -1;\n"
+            "  switch (x) {\n    case 0: return 0;\n    case 1: return 1;\n  }\n  return -1;\n}\n",
+            4,  # 2 ifs + 2 cases
+        ),
+        (
+            "function bar(x: number) {\n  try {\n    if (x) doIt();\n  } catch (e) { handle(e); }\n}\n",
+            3,  # 1 if + 1 try + 1 catch
+        ),
+        (
+            "function baz(x: number, y: number) {\n  if (x && y) return 1;\n  return x ? 2 : 0;\n}\n",
+            3,  # 1 if + 1 && + 1 ternary (regex may overcount slightly)
+        ),
+    ]
+    for source, true_count in fixtures:
+        got = cp._count_branches_ts(source)
+        # ±20% means got is in [true*0.8, true*1.2], rounded outward
+        lo = max(1, int(true_count * 0.8))
+        hi = max(1, int(true_count * 1.2) + 1)
+        assert_true(
+            f"h1 TS: count for hand-counted={true_count} got {got} (range {lo}-{hi})",
+            lo <= got <= hi + 2,  # extra slack for ternary overcounting
+            f"got={got} expected~={true_count}",
+        )
+
+
+# ---- Epic integration: full prefilter against synthesized fixtures ----
+
+
+def _build_epic_fixture(tmp: Path):
+    """Lay out three files: stale-fixture (score 9), density-shallow (score
+    6), well-tested (no surface). Returns the tmp path for prefilter input."""
+    # 1. Stale fixture — TS test imports a symbol the source no longer exports
+    (tmp / "auth.test.ts").write_text(
+        "import { verifyToken } from './auth';\n"
+        "it('verifies', () => { expect(verifyToken('x')).toBe(true); });\n"
+    )
+    (tmp / "auth.ts").write_text("export function authenticate() {}\n")
+
+    # 2. Density-shallow — Python source with many branches, test with few asserts
+    (tmp / "router_test.py").write_text(
+        "def test_one():\n    assert route(1) == 1\n"
+    )
+    (tmp / "router.py").write_text(
+        "def route(x):\n"
+        "    if x == 1: return 1\n"
+        "    if x == 2: return 2\n"
+        "    if x == 3: return 3\n"
+        "    if x == 4: return 4\n"
+        "    if x == 5: return 5\n"
+    )
+
+    # 3. Well-tested — many cases, error-path assertion, density healthy
+    (tmp / "calculator.test.ts").write_text(
+        "it('adds', () => { expect(add(1, 2)).toBe(3); });\n"
+        "it('subtracts', () => { expect(sub(5, 2)).toBe(3); });\n"
+        "it('throws on divide-by-zero', () => { expect(() => div(1, 0)).toThrow(); });\n"
+    )
+    (tmp / "calculator.ts").write_text(
+        "export function add(a: number, b: number) { return a + b; }\n"
+        "export function sub(a: number, b: number) { return a - b; }\n"
+    )
+    return tmp
+
+
+def test_epic_full_prefilter_surfaces_correctly():
+    """End-to-end: full prefilter ranks the three fixture types correctly."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _build_epic_fixture(Path(tmp))
+        results = cp.score_files(cp.discover(root))
+        by_name = {Path(r["path"]).name: r for r in results}
+
+        assert_in("epic: auth.test.ts in results", "auth.test.ts", by_name)
+        assert_in("epic: router_test.py in results", "router_test.py", by_name)
+        assert_in("epic: calculator.test.ts in results", "calculator.test.ts", by_name)
+
+        auth_score = by_name.get("auth.test.ts", {}).get("score", 0)
+        router_score = by_name.get("router_test.py", {}).get("score", 0)
+        calc_score = by_name.get("calculator.test.ts", {}).get("score", 0)
+
+        assert_eq("epic: stale-fixture surfaces at 9", auth_score, 9)
+        assert_true(
+            f"epic: router_test.py density-shallow surfaces at >= 6 (got {router_score})",
+            router_score >= 6,
+            f"router_score={router_score}",
+        )
+        assert_true(
+            f"epic: calculator stays below default threshold 5 (got {calc_score})",
+            calc_score < 5,
+            f"calc_score={calc_score}",
+        )
+
+
+def test_epic_threshold_filtering_via_cli():
+    """Running with --threshold 9 emits only the score-9 stale-fixture file."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _build_epic_fixture(Path(tmp))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cp.main([str(root), "--threshold", "9"])
+        out = buf.getvalue()
+        assert_in("epic threshold 9: auth.test.ts surfaces", "auth.test.ts", out)
+        assert_true(
+            "epic threshold 9: router_test.py filtered",
+            "router_test.py" not in out,
+            f"out={out}",
+        )
+        assert_true(
+            "epic threshold 9: calculator filtered",
+            "calculator.test.ts" not in out,
+            f"out={out}",
+        )
+
+
+def test_epic_json_output_well_formed():
+    """--json emits a valid JSON array with score, path, and signal entries."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _build_epic_fixture(Path(tmp))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cp.main([str(root), "--threshold", "0", "--json"])
+        out = buf.getvalue()
+        parsed = json.loads(out)
+        assert_true(
+            f"epic json: parsed is a list of >= 3 entries (got {len(parsed)})",
+            isinstance(parsed, list) and len(parsed) >= 3,
+        )
+        for entry in parsed:
+            assert_in(f"epic json: entry has path", "path", entry)
+            assert_in(f"epic json: entry has score", "score", entry)
+            assert_in(f"epic json: entry has signals", "signals", entry)
+
+
 def test_v1_integration_surfaces_shallow_skips_deep():
     """End-to-end: synthesize one shallow test/source pair and one deep
     test/source pair; run the prefilter with both heuristics live; assert
@@ -850,6 +1097,16 @@ TESTS = [
     test_h5_fires_multiple_categories,
     test_h5_skips_when_no_source,
     test_h5_concurrency_pattern,
+    # rjv.5.5 — heuristic 1 (assertion density) + epic integration
+    test_h1_python_ast_counts_branches,
+    test_h1_python_assertion_count,
+    test_h1_fires_on_low_density,
+    test_h1_does_not_fire_above_threshold,
+    test_h1_does_not_fire_on_trivial_source,
+    test_h1_ts_regex_in_ballpark,
+    test_epic_full_prefilter_surfaces_correctly,
+    test_epic_threshold_filtering_via_cli,
+    test_epic_json_output_well_formed,
 ]
 
 

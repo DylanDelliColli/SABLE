@@ -43,6 +43,7 @@ rest follow.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import sys
@@ -645,6 +646,98 @@ def _h5_fire(test_path: Path, source_path: Optional[Path]):
 
 
 HEURISTICS.append({"name": "missing-categories", "score": 6, "fire": _h5_fire})
+
+
+# ---------------------------------------------------------------------------
+# Heuristic 1 — assertion density (score 6)
+# ---------------------------------------------------------------------------
+#
+# Fires when assertions / max(branches, 1) < 1.0 AND branches >= 3. The
+# >=3 floor keeps the heuristic from flagging trivial sources where one
+# assertion is genuinely enough.
+#
+# Branch counting:
+#   Python — stdlib `ast` walk. Precise: counts If/For/While/IfExp,
+#     Match cases, Try (1 + len(handlers)), and BoolOp short-circuit
+#     branches (len(values) - 1).
+#   TypeScript — regex approximation. Documented lossy: counts
+#     if(/case /try{/catch(/&&/||/ternary `? ... :`. Can be ±20% on
+#     dense ternary expressions; acceptable because the heuristic uses
+#     a < 1.0 ratio threshold (rough is fine).
+
+
+def _count_assertions(text: str, lang: str) -> int:
+    if lang == "ts":
+        patterns = [
+            re.compile(r"\bexpect\("),
+            re.compile(r"\bassert\.(?:equal|deepEqual|strictEqual|throws)\b"),
+        ]
+    elif lang == "py":
+        patterns = [
+            re.compile(r"(?m)^\s*assert\s"),
+            re.compile(r"\bself\.assert[A-Z]\w*\("),
+        ]
+    else:
+        return 0
+    return sum(len(p.findall(text)) for p in patterns)
+
+
+def _count_branches_py(source: str) -> int:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return 0
+    count = 0
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.If, ast.For, ast.While, ast.IfExp)):
+            count += 1
+        elif isinstance(node, ast.Try):
+            # Try block itself + each except handler is a separate branch
+            count += 1 + len(node.handlers)
+        elif isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
+            # Each operand beyond the first is a short-circuit branch
+            count += max(0, len(node.values) - 1)
+        elif isinstance(node, getattr(ast, "Match", type(None))):
+            count += len(node.cases)
+    return count
+
+
+_TS_BRANCH_PATTERNS = [
+    re.compile(r"\bif\s*\("),
+    re.compile(r"\bcase\s+"),
+    re.compile(r"\btry\s*\{"),
+    re.compile(r"\bcatch\s*\("),
+    re.compile(r"&&"),
+    re.compile(r"\|\|"),
+    # Ternary — `cond ? a : b`. Loose; may overcount when `?:` appears
+    # in optional chaining or type annotations. Bead-spec accepts ±20%.
+    re.compile(r"\?\s*[^:]+:"),
+]
+
+
+def _count_branches_ts(source: str) -> int:
+    return sum(len(p.findall(source)) for p in _TS_BRANCH_PATTERNS)
+
+
+def _h1_fire(test_path: Path, source_path: Optional[Path]) -> bool:
+    if source_path is None:
+        return False
+    lang = _lang(test_path)
+    if lang not in ("ts", "py"):
+        return False
+    test_text = _read(test_path)
+    source_text = _read(source_path)
+    assertions = _count_assertions(test_text, lang)
+    if lang == "py":
+        branches = _count_branches_py(source_text)
+    else:
+        branches = _count_branches_ts(source_text)
+    if branches < 3:
+        return False
+    return (assertions / branches) < 1.0
+
+
+HEURISTICS.append({"name": "assertion-density", "score": 6, "fire": _h1_fire})
 
 
 # ---------------------------------------------------------------------------
