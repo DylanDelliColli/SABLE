@@ -6,7 +6,7 @@ Contents:
 - `bin/sable-note` — shell script for frictionless capture of SABLE methodology observations
 - `skills/sable-review/SKILL.md` — Claude Code skill for triaging accumulated feedback
 - `skills/audit-deep-dive/SKILL.md` — Claude Code skill for converting AUDIT: beads into epic+children
-- `MULTI-MANAGER-PATTERN.md` — experimental coordination pattern for power-user multi-agent swarms. Seven-agent roster: continuous execution managers (Optimus / Tarzan / Chuck), session-scoped planning agents (Sherlock / Victor / Rudy), and execution-session strategist (Lincoln). Companion `hooks/multi-manager/`, `templates/multi-manager/`, and `bin/sable-agents` reminder helper.
+- `MULTI-MANAGER-PATTERN.md` — experimental coordination pattern for power-user multi-agent swarms. Eight-agent roster: continuous execution managers (Optimus / Tarzan / Chuck), session-scoped planning agents (Sherlock / Victor / Rudy / Columbo), and execution-session strategist (Lincoln). Companion `hooks/multi-manager/`, `templates/multi-manager/`, `bin/columbo-prefilter.py` (Columbo's audit-mode triage tool), and `bin/sable-agents` reminder helper.
 
 ## Install on a new machine
 
@@ -60,12 +60,14 @@ See [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) for the full design a
 Files:
 - `MULTI-MANAGER-PATTERN.md` — design doc and setup instructions
 - `hooks/multi-manager/*.sh` — twelve coordination hooks (session-role-anchor, read-guard, inbox-injection, inbox-injection-precompact, pre-dispatch refresh/claim/overlap/preempt/model-check, edit-write-claim-reconciler, pre-push-rebase-test, post-push-merge-notify) + `upgrade-notes.md`
-- `templates/multi-manager/agents.yaml` — agent registry: Optimus / Tarzan / Chuck (managers), Sherlock / Victor / Rudy (planning agents), Lincoln (strategist)
+- `templates/multi-manager/agents.yaml` — agent registry: Optimus / Tarzan / Chuck (managers), Sherlock / Victor / Rudy / Columbo (planning agents), Lincoln (strategist)
 - `templates/multi-manager/roles/*.md` — role prompts injected at SessionStart (one per agent)
 - `templates/multi-manager/commands/inbox.md` — `/inbox` slash command
 - `templates/multi-manager/settings-snippet.json` — JSON to merge into `~/.claude/settings.json`
 - `bin/sable-agents` — quick-reference helper that reads the registry and prints a scannable summary
+- `bin/columbo-prefilter.py` — static-analysis test-shallowness ranker. Runs before Columbo's interview in audit mode to triage which test files are worth talking about. Six heuristics across TS + Python: happy-path-only, single-case-wonder, mock-saturation, missing-categories, stale-fixture, assertion-density.
 - `templates/sherlock-bead.md` — required template for `sherlock-finding` beads (mechanically enforced by `bead-description-gate.sh`)
+- `templates/columbo-bead.md` — required template for `columbo-test-spec` (forward) and `columbo-test-gap` (audit) beads (mechanically enforced by `bead-description-gate.sh`)
 
 ## Promotion to `main`
 

@@ -2,9 +2,9 @@
 
 > **Status: experimental — `personal-tooling` branch only.** This pattern extends SABLE for high-throughput, multi-agent power-user workflows. Do not adopt until the prerequisites below are second nature.
 
-A coordination pattern for running a roster of named agents in parallel against the same repository — three continuous **execution managers** (each commanding their own worker swarm), three session-scoped **planning agents**, and one execution-session **strategist** — with mechanical conflict prevention, addressed inter-agent messaging, and selective dispatch preemption.
+A coordination pattern for running a roster of named agents in parallel against the same repository — three continuous **execution managers** (each commanding their own worker swarm), four session-scoped **planning agents**, and one execution-session **strategist** — with mechanical conflict prevention, addressed inter-agent messaging, and selective dispatch preemption.
 
-The pattern's name still says "multi-manager" because the manager trio (Optimus / Tarzan / Chuck) is the load-bearing piece — the hooks key off `CLAUDE_AGENT_ROLE=manager` and only managers operate continuously. The other agents extend the same registry and identity infrastructure to cover bead-quality production (Sherlock), bead-pool freshness (Victor), end-to-end validation (Rudy), and strategic conversation during execution (Lincoln) without bolting on a parallel system.
+The pattern's name still says "multi-manager" because the manager trio (Optimus / Tarzan / Chuck) is the load-bearing piece — the hooks key off `CLAUDE_AGENT_ROLE=manager` and only managers operate continuously. The other agents extend the same registry and identity infrastructure to cover bead-quality production (Sherlock), bead-pool freshness (Victor), end-to-end validation (Rudy), test-coverage scoping (Columbo), and strategic conversation during execution (Lincoln) without bolting on a parallel system.
 
 ---
 
@@ -24,7 +24,7 @@ If any of these aren't true, stay on standard SABLE. Adopt this pattern after yo
 
 ## The agent set
 
-This pattern is described in terms of a concrete seven-agent roster — adapt the names and scopes to your setup. The mechanism is the same. All seven live in a single `agents.yaml` registry; what differs is lifecycle and which hooks act on them.
+This pattern is described in terms of a concrete eight-agent roster — adapt the names and scopes to your setup. The mechanism is the same. All eight live in a single `agents.yaml` registry; what differs is lifecycle and which hooks act on them.
 
 ### Tier 1 — Continuous execution managers (run during execution sessions)
 
@@ -45,10 +45,11 @@ These three are the original "managers." They launch with `CLAUDE_AGENT_ROLE=man
 | **Sherlock** | auditor | Read-only repo audit producing high-quality finding beads (design rot, redundancy, verbosity, dead code, test gaps) | User invokes with scope arg (`sherlock src/auth`); writes beads, self-reviews, addresses, exits |
 | **Victor** | bead_validator | Validate open beads against current HEAD; update or close stale ones using differential validation | User invokes (`victor`, `victor --epic=…`); 5-run ramp-up before auto-closing |
 | **Rudy** | quality_validator | End-to-end browser validation on the integration-branch dev deploy (Vercel preview + Supabase dev only) | User invokes (`rudy`, `rudy --feature=…`); files bug beads + a `rudy-report` at session end; refuses prod / PR-preview / local-dev targets |
+| **Columbo** | test_planner | Interview-driven test-coverage planning. Forward mode produces `columbo-test-spec` beads + skeleton test files (`*.skel.test.<ext>`) for new feature work; audit mode produces `columbo-test-gap` finding beads against existing modules. | User invokes (`columbo --feature "<desc>"`, `columbo --bead SABLE-xxx`, `columbo --audit src/auth`); audit mode runs `bin/columbo-prefilter` first to triage; writes beads, self-reviews, exits |
 
-These never run continuously. They are pure producers (Sherlock, Rudy) or pool-maintainers (Victor) — the user kicks them off, they do their pass, they exit. Sherlock and Victor may dispatch read-only Explore subagents. Rudy runs browser interaction itself (browser sessions need state continuity).
+These never run continuously. They are pure producers (Sherlock, Rudy, Columbo) or pool-maintainers (Victor) — the user kicks them off, they do their pass, they exit. Sherlock, Victor, and Columbo may dispatch read-only Explore subagents. Rudy runs browser interaction itself (browser sessions need state continuity).
 
-The continuous-mode hooks are gated on `CLAUDE_AGENT_ROLE=manager`, so they no-op for these three. Planning agents rely on a different discipline: bead-template enforcement (`templates/sherlock-bead.md` is mechanically required for `sherlock-finding` labels via `bead-description-gate.sh`).
+The continuous-mode hooks are gated on `CLAUDE_AGENT_ROLE=manager`, so they no-op for these four. Planning agents rely on a different discipline: bead-template enforcement (`templates/sherlock-bead.md` for `sherlock-finding` labels and `templates/columbo-bead.md` for `columbo-test-spec` / `columbo-test-gap` labels are mechanically required via `bead-description-gate.sh`).
 
 ### Tier 3 — Execution-session strategist (runs as peer, not orchestrator)
 
@@ -58,7 +59,7 @@ The continuous-mode hooks are gated on `CLAUDE_AGENT_ROLE=manager`, so they no-o
 
 Lincoln is the agent the user **primarily talks to** during a working session. Optimus / Tarzan / Chuck are autonomous — they don't need conversation, they need beads. Lincoln gives status, brokers `for-lincoln` arbitration asks from the other three, and helps the user think strategically without becoming an orchestrator. Lincoln has `cross_inbox_read: true` (bypasses the read guard so it can give status across all managers) and may file `for-X` coord beads (one-line, not detailed specs).
 
-Lincoln is forbidden from invoking Sherlock, Victor, or Rudy — those are user-driven planning sessions, not Lincoln's tools.
+Lincoln is forbidden from invoking Sherlock, Victor, Rudy, or Columbo — those are user-driven planning sessions, not Lincoln's tools.
 
 ### Why this shape?
 
@@ -73,6 +74,7 @@ The planning trio + strategist were added because:
 - **Sherlock** moves audit-style finding production out of the manager loop. Optimus and Tarzan execute — they shouldn't be writing audit beads in the same session they're shipping fixes.
 - **Victor** prevents the bead pool from rotting. Without it, fixed bugs stay open and workers waste cycles on already-resolved issues.
 - **Rudy** validates integrated state before promotion to prod. Worker-level unit + integration tests aren't enough — the dev environment needs a separate human-style sanity pass.
+- **Columbo** lifts test-coverage scoping out of the manager loop. Workers execute TDD, but TDD given only a behavioral spec ships happy-path-only suites. Columbo writes the test contract — concrete cases plus skeleton files — that makes TDD produce robust suites instead of green-by-omission ones.
 - **Lincoln** removes the human-as-orchestrator pressure during execution. Without Lincoln, the user is constantly re-deriving cross-manager state to give direction; with Lincoln, the user has a strategic conversation partner that already knows what's happening.
 
 Adding more agents is supported via the registry pattern — see [Adding agents](#adding-agents).
@@ -111,14 +113,15 @@ alias lincoln='CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude'
 
 # Tier 2 — session-scoped planning agents (CLAUDE_AGENT_ROLE not "manager",
 # so continuous-mode hooks no-op; pass scope as the initial prompt)
-sherlock() { CLAUDE_AGENT_NAME=sherlock CLAUDE_AGENT_ROLE=auditor claude "$@"; }
-victor()   { CLAUDE_AGENT_NAME=victor   CLAUDE_AGENT_ROLE=bead_validator    claude "$@"; }
+sherlock() { CLAUDE_AGENT_NAME=sherlock CLAUDE_AGENT_ROLE=auditor          claude "$@"; }
+victor()   { CLAUDE_AGENT_NAME=victor   CLAUDE_AGENT_ROLE=bead_validator   claude "$@"; }
 rudy()     { CLAUDE_AGENT_NAME=rudy     CLAUDE_AGENT_ROLE=quality_validator claude "$@"; }
+columbo()  { CLAUDE_AGENT_NAME=columbo  CLAUDE_AGENT_ROLE=test_planner     claude "$@"; }
 ```
 
 Hooks inherit the Claude Code process's environment. An agent running `export CLAUDE_AGENT_NAME=tarzan` inside a Bash tool only affects that subshell, which is discarded after the command. The env var is effectively immutable from the agent's perspective.
 
-**On role values.** All continuous-mode hooks (`pre-dispatch-*`, `inbox-injection`, `pre-push-rebase-test`, `post-push-merge-notify`) hard-exit when `CLAUDE_AGENT_ROLE != "manager"`. Lincoln launches with `manager` so it gets inbox injection; Sherlock / Victor / Rudy launch with their own roles so the continuous hooks no-op for them. Their discipline comes from session-scoped invocation patterns and bead-template enforcement, not from runtime hooks.
+**On role values.** All continuous-mode hooks (`pre-dispatch-*`, `inbox-injection`, `pre-push-rebase-test`, `post-push-merge-notify`) hard-exit when `CLAUDE_AGENT_ROLE != "manager"`. Lincoln launches with `manager` so it gets inbox injection; Sherlock / Victor / Rudy / Columbo launch with their own roles so the continuous hooks no-op for them. Their discipline comes from session-scoped invocation patterns and bead-template enforcement, not from runtime hooks.
 
 ### Identity injection
 
@@ -190,6 +193,13 @@ agents:
       supabase_env: SABLE_RUDY_SUPABASE_URL
       branch_env: SABLE_RUDY_INTEGRATION_BRANCH
       forbidden_targets: [production, pr_preview, local_dev_server]
+  columbo:
+    type: test_planner
+    claim_filter: null              # pure producer, conversation-driven
+    inbox_label: for-columbo        # accepts --bead requests from managers
+    dispatches_workers: true        # read-only Explore subagents only
+    bead_template: templates/columbo-bead.md   # required for columbo-test-spec / columbo-test-gap
+    quality_bar: above_default
 
   # Tier 3 — execution-session strategist
   lincoln:
@@ -200,7 +210,7 @@ agents:
     cross_inbox_read: true          # bypass read-guard to give cross-manager status
     idle_polling: "/loop 5m /inbox" # slower than Chuck (3m); strategic conversation is reactive
     files_addressed_beads: true     # may file for-X coord beads (one-line, not specs)
-    forbidden_invocations: [sherlock, victor, rudy]
+    forbidden_invocations: [sherlock, victor, rudy, columbo]
 ```
 
 **Per-bead model selection.** Beads optionally carry a `model:<haiku|sonnet|opus>` label that drives worker model choice at dispatch time. The `pre-dispatch-model-check.sh` hook validates that the dispatch's model parameter matches the label (or that the prompt includes a `Model override: <reason>` line). See SABLE.md §6.9 for the ladder rules.
@@ -218,15 +228,21 @@ agents:
 | `for-chuck` | Addressed to Chuck's inbox (PR-ready notifications, conflict delegations) |
 | `for-victor` | Bead-pool freshness-pass request (user or Lincoln files; Sherlock sometimes self-files) |
 | `for-rudy` | E2E validation request on the integration-branch dev deploy (user-only origin) |
+| `for-columbo` | Test-coverage scoping request — managers file these to ask Columbo to enrich an existing feature bead with child test beads |
 | `for-lincoln` | Arbitration ask from Optimus / Tarzan / Chuck, or direction from user |
 | `sherlock-finding` | Audit finding from Sherlock (mechanically validated against `templates/sherlock-bead.md`) |
 | `sherlock:<category>` | Sub-category on Sherlock findings (`design-rot`, `redundancy`, `verbosity`, `dead-code`, `test-gap`) |
+| `columbo-test-spec` | Forward-mode Columbo output — one bead per skeleton test file or coherent case cluster (mechanically validated against `templates/columbo-bead.md`) |
+| `columbo-test-gap` | Audit-mode Columbo output — one bead per shallow-test gap, with fingerprint + cited test/source files (mechanically validated against `templates/columbo-bead.md`) |
+| `columbo-test-spec:<category>` / `columbo-test-gap:<category>` | Sub-category mirroring the 12-category taxonomy in `roles/columbo.md` (`behavioral`, `boundary`, `negative`, `state-machine`, `failure-modes`, `concurrency`, `integration`, `regression`, `invariants`, `security`, `performance`, `observability`) |
 | `rudy-report` | Per-session Rudy summary bead filed at end of validation pass |
 | `victor-report` | Per-session Victor summary bead filed at end of freshness pass |
 | `victor-suspects-stale` | Victor's pre-auto-close label during the 5-run ramp-up |
 | `coord` | Umbrella label for all coordination traffic (filterable in one query) |
 
 Sherlock has no inbox — it's a pure producer invoked synchronously with a scope arg. Findings it produces are addressed to `for-optimus` (epic candidates) or `for-tarzan` (standalone fixes) at the addressing pass, not to Sherlock itself.
+
+Columbo's `for-columbo` inbox is the exception among planning agents: managers file `for-columbo` requests to enrich an existing feature bead with child test specs (e.g. Optimus shipping a new endpoint files a one-liner to ask Columbo to scope its tests in a separate session). Forward-mode invocations from the user (`columbo --feature` / `columbo --bead`) bypass the inbox entirely.
 
 ### When to address at creation
 
@@ -438,11 +454,13 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | `pre-push-rebase-test.sh` | PreToolUse:Bash matching `git push` | Force rebase + tests before push | Hard deny |
 | `post-push-merge-notify.sh` | PostToolUse:Bash matching `git push` | File `for-chuck` bead with overlap analysis (Chuck's own pushes are skipped) | Side effect (bd create) |
 
-All twelve hooks live in `hooks/multi-manager/`. Every continuous-mode hook (everything except `session-role-anchor.sh` and `read-guard.sh`) hard-exits when `CLAUDE_AGENT_ROLE != "manager"`, so they no-op in Sherlock / Victor / Rudy sessions.
+All twelve hooks live in `hooks/multi-manager/`. Every continuous-mode hook (everything except `session-role-anchor.sh` and `read-guard.sh`) hard-exits when `CLAUDE_AGENT_ROLE != "manager"`, so they no-op in Sherlock / Victor / Rudy / Columbo sessions.
 
 **Bead quality hook**: `bead-description-gate.sh` (existing SABLE hook) is now mode-aware. When `CLAUDE_AGENT_NAME` is set or `CLAUDE_AGENT_ROLE=manager` (i.e. a multi-manager session), the hook hard-blocks (denies) `bd create` if the description is missing required content. Outside that context (single-agent SABLE), it nudges via `additionalContext`. Rolling execution depends on bead descriptions reliably naming files; the manager-context hard-block is the structural answer to bead-quality drift.
 
 **Sherlock-finding label enforcement**: when `bd create` includes `--labels=sherlock-finding`, the hook additionally requires the sections from `templates/sherlock-bead.md`: `## Rationale`, an Evidence block with at least one `Fingerprint:` line, `## Proposed approach`, `## Scope estimate`, `## Risk if not addressed`. Sherlock commits to this contract in its role file; the hook makes it mechanical. See `hooks/test/test-bead-description-gate.sh` for the full behavior matrix.
+
+**Columbo label enforcement**: the same hook also recognizes `columbo-test-spec` (forward-mode test specs) and `columbo-test-gap` (audit-mode gap findings) labels and enforces the per-template required sections from `templates/columbo-bead.md`. Spec beads must include `## Feature under test`, `## Test file`, `## Cases` with at least one `Why:` sub-line per case, `## Categories`, `## Fixtures / setup`, and `## Out of scope`. Gap beads must include `## Symptom`, `## Cited test file`, `## Cited source file`, `## Fingerprint`, `## Cases to add`, `## Categories`, and `## Risk if not addressed`. Both labels compose with sibling labels (e.g. `model:sonnet`, `for-tarzan`) without interference — see `hooks/test/test-bead-description-gate.sh` for the cross-label cases.
 
 ---
 
@@ -518,6 +536,7 @@ alias lincoln='CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude'
 sherlock() { CLAUDE_AGENT_NAME=sherlock CLAUDE_AGENT_ROLE=auditor          claude "$@"; }
 victor()   { CLAUDE_AGENT_NAME=victor   CLAUDE_AGENT_ROLE=bead_validator   claude "$@"; }
 rudy()     { CLAUDE_AGENT_NAME=rudy     CLAUDE_AGENT_ROLE=quality_validator claude "$@"; }
+columbo()  { CLAUDE_AGENT_NAME=columbo  CLAUDE_AGENT_ROLE=test_planner     claude "$@"; }
 ```
 
 ### Step 7: Verify
@@ -663,7 +682,7 @@ To add a new agent — manager, planning-session, or anything else:
    # / pre-push hooks, use CLAUDE_AGENT_ROLE=manager:
    alias researcher='CLAUDE_AGENT_NAME=researcher CLAUDE_AGENT_ROLE=manager claude'
 
-   # If session-scoped (Sherlock/Victor/Rudy pattern), pick a role string that
+   # If session-scoped (Sherlock/Victor/Rudy/Columbo pattern), pick a role string that
    # is NOT "manager" so the continuous-mode hooks no-op:
    researcher() { CLAUDE_AGENT_NAME=researcher CLAUDE_AGENT_ROLE=investigator claude "$@"; }
    ```
