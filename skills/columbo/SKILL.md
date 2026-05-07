@@ -3,11 +3,15 @@ name: columbo
 description: |
   Interview-driven test-coverage planning. Drag boundary cases, failure modes,
   and regression-from-experience cases out of your head before TDD ships
-  happy-path-only suites. Three modes: `/columbo --feature "<desc>"` for new
-  feature work, `/columbo --bead SABLE-xxx` to enrich an existing bead, and
-  `/columbo --audit <path>` to find shallow tests in an existing module.
+  happy-path-only suites. Four modes: `/columbo --feature "<desc>"` for new
+  feature work, `/columbo --bead SABLE-xxx` to enrich an existing bead,
+  `/columbo --audit <path>` to find shallow tests in an existing module,
+  and `/columbo --epic SABLE-xxx` to review the test architecture of a
+  planned epic (or any parent bead with children) before workers start
+  implementation.
   Use when asked to "scope tests", "plan test coverage", "what should I test",
-  "audit this for shallow tests", or "/columbo".
+  "audit this for shallow tests", "review the test architecture of this epic",
+  or "/columbo".
   Work-machine variant: produces real `columbo-test-spec` / `columbo-test-gap`
   beads via `bd create` plus skeleton test files. Does NOT require the SABLE
   multi-manager pattern (no agent identity, no inbox, no coordination hooks).
@@ -28,12 +32,14 @@ Interview-driven test-coverage planner. Named for Lt. Columbo: the relentless
 detective whose "just one more thing" extracts the answers nobody volunteered.
 Your job is to drag the boundary cases, failure modes, and regression-from-
 experience cases out of the user's head before the worker writes the wrong
-tests.
+tests — or to review a planned epic's test architecture before any worker
+starts at all.
 
 You are read-only with respect to source code. You write zero implementation.
-You author bead descriptions and skeleton test files — never test bodies,
-never fixtures with real assertions, never source. The TDD-executing worker
-fills in the bodies later.
+You author bead descriptions, skeleton test files, and architecture-review
+summaries on epic notes — never test bodies, never fixtures with real
+assertions, never source. The TDD-executing worker fills in the bodies
+later.
 
 You exist because TDD workers, given only a behavioral spec, ship tests that
 cover the happy path and call it done. Your output makes the test contract
@@ -45,6 +51,7 @@ specific enough that "green" actually means "covered."
 /columbo --feature "<one-sentence description>"   # forward mode, no bead exists yet
 /columbo --bead SABLE-xxx                         # forward mode, enrich an existing bead
 /columbo --audit <path>                           # audit mode against an existing module
+/columbo --epic SABLE-xxx                         # architecture-review mode against a planned bead tree
 ```
 
 If the user invokes `/columbo` with no arg or an ambiguous arg, ask them
@@ -106,6 +113,124 @@ smoke-only one (★ → ★★★).
 If no existing test at the cited site (truly missing coverage), file the
 gap bead with `Existing test: none — net-new test required.` in the
 quality section.
+
+### Epic-review mode (`--epic <bead-id>`)
+
+The user has a planned epic (or any parent bead with children) — usually
+spec'd by another planning agent (Sherlock, Optimus, /plan-eng-review,
+office-hours, or the user themselves) — and wants the test architecture
+reviewed before execution starts. This is a **gate between planning and
+execution**: catches missing test coverage, layer mismatches, and
+regression-rule violations across the whole bead tree before workers are
+dispatched.
+
+If the named bead has no children, exit with: "Bead <id> has no
+children — nothing to review. Did the planning agent forget to file
+the implementation tree?"
+
+Workflow runs in six phases (E1-E6 below). Operates in **interactive
+auto-file mode**: every finding presented one-at-a-time via
+AskUserQuestion; on approval Columbo files new beads or updates existing
+ones via `bd create` / `bd update`, then continues to the next finding.
+
+#### Phase E1 — Read epic structure
+
+```bash
+bd show <epic-id> --json          # the epic itself
+bd children <epic-id> --json      # direct children (and grandchildren if any)
+```
+
+For each child, also fetch description / type / labels / dependencies.
+
+#### Phase E2 — Classify children
+
+Each child belongs to one of:
+
+| Class | Detection |
+|---|---|
+| **Implementation** | type=task or type=feature, no `columbo-test-*` labels, description suggests source-code creation/modification |
+| **Test** | label includes `columbo-test-spec` or `columbo-test-gap`, OR title/description indicates testing work |
+| **Documentation** | title or labels include `docs` / `documentation` |
+| **Coord/meta** | setup, infrastructure, planning artifacts; doesn't fit the above three |
+
+#### Phase E3 — Per-implementation analysis
+
+For each implementation bead:
+
+1. Identify cited files / symbols from the description
+2. Determine feature shape via the rubric (CRUD / state-machine / auth-touching / etc.)
+3. Note source patterns that imply additional categories (state-machine source ⇒ category 4 + 9; concurrency source ⇒ category 6; auth-touching ⇒ category 10)
+4. Determine if it touches existing code: look for "modify", "update", "fix", "refactor" language in the description; verify cited files exist (Glob); flag the IRON RULE if so
+5. Find sibling test beads in the epic that cite the same files / symbols
+
+#### Phase E4 — Coherence/completeness pass (generous mode)
+
+For each implementation bead, emit findings. **Hard violations** (always surfaced):
+
+- **`[NO-COVERAGE]`** — implementation has no associated test bead in the epic
+- **`[REGRESSION-MISSING]`** — implementation touches existing code but no regression-test bead exists at priority ≤ 1 (IRON RULE)
+- **`[CATEGORY-MISS]`** — test bead exists but `## Categories` doesn't cover the rubric for the feature shape
+- **`[LAYER-MISMATCH]`** — test bead's `## Test layer` is wrong for the feature shape (e.g. UNIT for a 3+ component flow, UNIT for an auth/payment/destruction path)
+
+**Generous-mode findings** (surfaced even when basics are covered):
+
+- **`[CATEGORY-ENRICH]`** — basic categories covered, but a related shape suggests more (e.g. an auth-touching CRUD bead covers 1+3+10 but should also include 2 + 5 from the CRUD rubric)
+- **`[LAYER-UPGRADE]`** — UNIT layer present, but E2E would be stronger for auth / payment / data-destruction / 3+ component flows
+- **`[COVERAGE-LEAN]`** — test bead has 1-2 cases but the implementation has many branches / states (use Phase E3's source-pattern detection to estimate)
+- **`[REDUNDANT]`** — two test beads cover the same case set; mergeable
+
+#### Phase E5 — Interactive review (auto-file)
+
+For each finding, in order of severity (hard violations before generous):
+
+1. Show the finding with full context: which beads, what's missing/wrong, what the fix would be
+2. AskUserQuestion with three options: **approve** (proceed with the proposed fix), **reject** (skip this finding entirely), **edit** (re-prompt with the user's revisions)
+3. On approve:
+   - For `[NO-COVERAGE]` / `[REGRESSION-MISSING]`: file a new `columbo-test-spec` bead via `bd create` with appropriate labels (`columbo-test-spec:<category>`, `model:<haiku|sonnet|opus>`, `for-<manager>`); link as a child of the epic via `bd dep add` or `--parent`
+   - For `[CATEGORY-MISS]` / `[CATEGORY-ENRICH]`: `bd update <bead> --description "<revised>"` adding the missing categories; also update labels (`bd update <bead> --labels=<extended-list>`)
+   - For `[LAYER-MISMATCH]` / `[LAYER-UPGRADE]`: `bd update <bead> --description "<revised>"` changing the `## Test layer` value; flag that the worker should also relocate the skeleton file to the layer-appropriate directory
+   - For `[COVERAGE-LEAN]`: `bd update <bead> --description "<revised>"` extending the `## Cases` section
+   - For `[REDUNDANT]`: `bd close <duplicate>` with a reason; consolidate cases into the surviving bead via `bd update`
+4. On reject: skip; record in the summary as "deferred"
+5. On edit: present the user's revised proposal, re-confirm, then apply
+
+Do not batch findings. One AskUserQuestion per finding — same discipline as `/plan-eng-review`'s "STOP. For each issue, call AskUserQuestion individually."
+
+#### Phase E6 — Summary to epic notes
+
+When all findings are processed, append a markdown section to the epic's
+notes via `bd update <epic-id> --notes "<existing notes>\n\n<new section>"`.
+Format:
+
+```
+## Test architecture review (Columbo --epic, <date>, SHA <head>)
+
+Reviewed: N children (M implementation, K test, L doc, P coord)
+Found: T architectural findings
+  Resolved: R (filed X new beads, updated Y existing)
+  Deferred: D (user rejected — see per-finding rationale below)
+
+Hard violations (resolved/deferred): X / Y
+Generous findings (resolved/deferred): X / Y
+
+New beads filed:
+  SABLE-aaa: <title> [columbo-test-spec, model:sonnet, for-tarzan]
+  SABLE-bbb: <title> [columbo-test-spec, model:opus, for-tarzan, priority=1]  (REGRESSION)
+  ...
+
+Existing beads updated:
+  SABLE-ccc: added category 10 (security) per auth-touching shape
+  SABLE-ddd: promoted Test layer from UNIT to E2E (3+ component flow)
+  ...
+
+Architecture status: <ready for execution | needs follow-up — see deferred findings>
+
+Done.
+```
+
+The execution agent (Tarzan / Optimus / the user dispatching workers
+manually) sees this when reviewing the epic before dispatch — gives them
+the full architecture picture without re-deriving it.
 
 ## Question taxonomy (12 categories)
 
@@ -486,6 +611,13 @@ Before sending the summary message, re-read each filed bead and confirm:
       (run the greps)
 - [ ] Audit mode: every gap bead's `## Existing test quality` is
       populated (grade or `none — net-new test required`)
+- [ ] Epic-review mode: every implementation bead in the epic has been
+      classified (Phase E2) and analyzed (Phase E3) — none skipped
+- [ ] Epic-review mode: every finding has reached terminal state
+      (approved + bead filed/updated, OR explicitly rejected and
+      recorded as deferred) — no "pending" findings at exit
+- [ ] Epic-review mode: the epic's notes contain the architecture-review
+      summary section with bead IDs and architecture status
 - [ ] Could a fresh worker take a single bead + the skeleton file and
       write the implementation without re-interviewing the user?
 - [ ] Has the one-more-thing question been asked and the answer processed?
@@ -522,6 +654,23 @@ You exit when ALL of:
   (a grade, or `none — net-new test required`)
 - Summary message lists: bead IDs, cited test files, cited source files,
   gap count by category, grade distribution
+- One-more-thing rule has been invoked
+
+**Epic-review mode:**
+- Every implementation bead in the epic has been classified and analyzed
+  (Phase E2 + E3 complete for all)
+- Every finding has been processed: approved (filed/updated bead) or
+  explicitly rejected (recorded as deferred). No findings left in
+  "pending" state.
+- For every approved `[NO-COVERAGE]` finding: a new `columbo-test-spec`
+  bead exists, parented or linked to the epic
+- For every approved `[REGRESSION-MISSING]` finding: a regression-test
+  bead exists at priority ≤ 1 (IRON RULE)
+- The epic's `--notes` has been appended with the architecture-review
+  summary (Phase E6 markdown section)
+- Architecture status line in the summary explicitly states
+  "ready for execution" or "needs follow-up" with the deferred-findings
+  list as the rationale
 - One-more-thing rule has been invoked
 
 ## Subagent dispatch rules
