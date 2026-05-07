@@ -248,11 +248,209 @@ def test_max_score_not_sum():
 
 
 # ---------------------------------------------------------------------------
+# rjv.5.2 — Heuristic 2 (happy-path-only) + Heuristic 4 (single-case wonder)
+# ---------------------------------------------------------------------------
+
+
+def _h(name: str):
+    """Return the registered heuristic by name, or None if not registered."""
+    for h in cp.HEURISTICS:
+        if h["name"] == name:
+            return h
+    return None
+
+
+def test_h2_fires_on_only_happy_assertions():
+    """TS test with only happy expects → heuristic 2 fires."""
+    h2 = _h("happy-path-only")
+    assert_true("h2 registered", h2 is not None)
+    if h2 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "foo.test.ts"
+        test.write_text("it('works', () => { expect(x).toBe(1); expect(y).toEqual(2); });\n")
+        assert_eq("h2: fires on happy-only TS", h2["fire"](test, None), True)
+
+
+def test_h2_does_not_fire_with_toThrow():
+    """TS test with .toThrow → heuristic 2 does not fire."""
+    h2 = _h("happy-path-only")
+    if h2 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "foo.test.ts"
+        test.write_text("it('throws', () => { expect(() => bad()).toThrow(); });\n")
+        assert_eq("h2: skip TS toThrow", h2["fire"](test, None), False)
+
+
+def test_h2_does_not_fire_with_pytest_raises():
+    """Python test with pytest.raises → heuristic 2 does not fire."""
+    h2 = _h("happy-path-only")
+    if h2 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "foo_test.py"
+        test.write_text("def test_x():\n    with pytest.raises(ValueError):\n        bad()\n")
+        assert_eq("h2: skip pytest.raises", h2["fire"](test, None), False)
+
+
+def test_h2_fires_on_pure_python_assertions():
+    """Python test with only happy assert statements → heuristic 2 fires."""
+    h2 = _h("happy-path-only")
+    if h2 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "foo_test.py"
+        test.write_text("def test_x():\n    assert foo(1) == 1\n    assert foo(2) == 2\n")
+        assert_eq("h2: fires on happy-only Python", h2["fire"](test, None), True)
+
+
+def test_h4_fires_when_one_case_many_functions():
+    """1 it block + source with 5 export functions → heuristic 4 fires."""
+    h4 = _h("single-case-wonder")
+    assert_true("h4 registered", h4 is not None)
+    if h4 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "foo.test.ts"
+        source = Path(tmp) / "foo.ts"
+        test.write_text("it('one', () => { expect(x).toBe(1); });\n")
+        source.write_text("\n".join([
+            "export function a() {}",
+            "export function b() {}",
+            "export function c() {}",
+            "export function d() {}",
+            "export function e() {}",
+        ]) + "\n")
+        assert_eq("h4: fires 1-vs-5", h4["fire"](test, source), True)
+
+
+def test_h4_does_not_fire_when_many_cases():
+    """4 it blocks + source with 5 functions → heuristic 4 does not fire."""
+    h4 = _h("single-case-wonder")
+    if h4 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "foo.test.ts"
+        source = Path(tmp) / "foo.ts"
+        test.write_text("\n".join([
+            "it('a', () => { expect(x).toBe(1); });",
+            "it('b', () => { expect(x).toBe(2); });",
+            "it('c', () => { expect(x).toBe(3); });",
+            "it('d', () => { expect(x).toBe(4); });",
+        ]) + "\n")
+        source.write_text("\n".join([
+            "export function a() {}",
+            "export function b() {}",
+            "export function c() {}",
+            "export function d() {}",
+            "export function e() {}",
+        ]) + "\n")
+        assert_eq("h4: skip many cases", h4["fire"](test, source), False)
+
+
+def test_h4_does_not_fire_when_few_source_functions():
+    """1 it block + source with 2 functions → heuristic 4 does not fire (below floor)."""
+    h4 = _h("single-case-wonder")
+    if h4 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "foo.test.ts"
+        source = Path(tmp) / "foo.ts"
+        test.write_text("it('one', () => { expect(x).toBe(1); });\n")
+        source.write_text("export function a() {}\nexport function b() {}\n")
+        assert_eq("h4: skip below floor", h4["fire"](test, source), False)
+
+
+def test_h4_skips_when_no_source():
+    """1 it block + source=None → heuristic 4 does not fire (and does not error)."""
+    h4 = _h("single-case-wonder")
+    if h4 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "foo.test.ts"
+        test.write_text("it('one', () => { expect(x).toBe(1); });\n")
+        assert_eq("h4: skip no source", h4["fire"](test, None), False)
+
+
+def test_h4_python_class_methods_counted():
+    """Python source with class C: 4 public methods + 1 single test → heuristic 4 fires."""
+    h4 = _h("single-case-wonder")
+    if h4 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "foo_test.py"
+        source = Path(tmp) / "foo.py"
+        test.write_text("def test_a():\n    assert foo() == 1\n")
+        source.write_text("\n".join([
+            "class C:",
+            "    def a(self): pass",
+            "    def b(self): pass",
+            "    def c(self): pass",
+            "    def d(self): pass",
+            "    def _private(self): pass",
+        ]) + "\n")
+        assert_eq("h4: counts class methods, skips _private", h4["fire"](test, source), True)
+
+
+def test_v1_integration_surfaces_shallow_skips_deep():
+    """End-to-end: synthesize one shallow test/source pair and one deep
+    test/source pair; run the prefilter with both heuristics live; assert
+    the shallow pair surfaces (score >= 5) and the deep pair does not."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        # Shallow TS: 1 case, no toThrow, source has 5 exports → both H2 + H4 fire
+        (tmp / "shallow.test.ts").write_text(
+            "it('only one case', () => { expect(x).toBe(1); });\n"
+        )
+        (tmp / "shallow.ts").write_text("\n".join([
+            "export function a() {}",
+            "export function b() {}",
+            "export function c() {}",
+            "export function d() {}",
+            "export function e() {}",
+        ]) + "\n")
+        # Deep TS: 4 cases, includes toThrow, source has 5 exports → neither H2 nor H4 fires
+        (tmp / "deep.test.ts").write_text("\n".join([
+            "it('a', () => { expect(x).toBe(1); });",
+            "it('b', () => { expect(() => bad()).toThrow(); });",
+            "it('c', () => { expect(x).toBe(3); });",
+            "it('d', () => { expect(x).toBe(4); });",
+        ]) + "\n")
+        (tmp / "deep.ts").write_text("\n".join([
+            "export function a() {}",
+            "export function b() {}",
+            "export function c() {}",
+            "export function d() {}",
+            "export function e() {}",
+        ]) + "\n")
+        results = cp.score_files(cp.discover(tmp))
+        by_path = {Path(r["path"]).name: r for r in results}
+
+        assert_in("v1_integration: shallow.test.ts in results", "shallow.test.ts", by_path)
+        assert_in("v1_integration: deep.test.ts in results", "deep.test.ts", by_path)
+
+        shallow_score = by_path.get("shallow.test.ts", {}).get("score", 0)
+        deep_score = by_path.get("deep.test.ts", {}).get("score", 0)
+        assert_true(
+            f"v1_integration: shallow surfaces at >= 5 (got {shallow_score})",
+            shallow_score >= 5,
+            f"shallow_score={shallow_score}",
+        )
+        assert_true(
+            f"v1_integration: deep stays below 5 (got {deep_score})",
+            deep_score < 5,
+            f"deep_score={deep_score}",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
 
 TESTS = [
+    # rjv.5.1 — scaffolding
     test_argparse_help,
     test_argparse_threshold,
     test_text_output_format,
@@ -262,6 +460,17 @@ TESTS = [
     test_file_discovery_no_source,
     test_heuristic_registry,
     test_max_score_not_sum,
+    # rjv.5.2 — heuristics 2 + 4
+    test_h2_fires_on_only_happy_assertions,
+    test_h2_does_not_fire_with_toThrow,
+    test_h2_does_not_fire_with_pytest_raises,
+    test_h2_fires_on_pure_python_assertions,
+    test_h4_fires_when_one_case_many_functions,
+    test_h4_does_not_fire_when_many_cases,
+    test_h4_does_not_fire_when_few_source_functions,
+    test_h4_skips_when_no_source,
+    test_h4_python_class_methods_counted,
+    test_v1_integration_surfaces_shallow_skips_deep,
 ]
 
 

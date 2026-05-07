@@ -38,12 +38,33 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 # Public registry — heuristic beads append to this.
 HEURISTICS: list[dict] = []
+
+
+# ---------------------------------------------------------------------------
+# Language detection
+# ---------------------------------------------------------------------------
+
+
+def _lang(path: Path) -> str:
+    """Return 'ts' for JS/TS files, 'py' for Python, 'other' for the rest."""
+    name = path.name
+    if name.endswith((".ts", ".tsx", ".js", ".jsx")):
+        return "ts"
+    if name.endswith(".py"):
+        return "py"
+    return "other"
+
+
+def _read(path: Path) -> str:
+    """Read text with error replacement; non-UTF8 bytes won't crash a heuristic."""
+    return path.read_text(errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +181,91 @@ def format_text(results: list[dict]) -> str:
 def format_json(results: list[dict]) -> str:
     """Pretty JSON. Each entry preserves per-signal scores."""
     return json.dumps(results, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Heuristic 2 — happy-path-only (score 7)
+# ---------------------------------------------------------------------------
+#
+# Fires when a test file contains zero negative-space assertions (toThrow,
+# rejects, pytest.raises, etc.). Pure regex against the test file; ignores
+# the source. False negatives possible if a comment in the test mentions a
+# negative-space pattern — accepted per bead spec.
+
+_H2_NEGATIVE_SPACE = re.compile(
+    r"expect.*toThrow"
+    r"|expect.*rejects"
+    r"|expect.*toReject"
+    r"|\.toThrowError\("
+    r"|expect.*not\.toBe(?:Undefined|Null)"
+    r"|pytest\.raises"
+    r"|self\.assertRaises"
+    r"|with raises"
+    r"|with pytest\.raises"
+)
+
+
+def _h2_fire(test_path: Path, source_path: Optional[Path]) -> bool:
+    if _lang(test_path) not in ("ts", "py"):
+        return False
+    return _H2_NEGATIVE_SPACE.search(_read(test_path)) is None
+
+
+HEURISTICS.append({"name": "happy-path-only", "score": 7, "fire": _h2_fire})
+
+
+# ---------------------------------------------------------------------------
+# Heuristic 4 — single-case wonder (score 5)
+# ---------------------------------------------------------------------------
+#
+# Fires when test has exactly 1 case AND source has >3 public functions.
+# Skipped when source is None (can't compare) or test has 0 cases (empty
+# test is a different problem). Source detection is regex-approximate per
+# bead spec — TS class methods are NOT counted to avoid keyword false
+# positives; Python class methods ARE counted (lowercase-first-letter
+# requirement excludes _private).
+
+_TS_TEST = re.compile(r"(?m)^\s*(?:it|test)\s*\(")
+_PY_TEST = re.compile(r"(?m)^\s*(?:async\s+)?def\s+test_")
+
+# TS source: count exported functions and exported arrow consts. Skipping
+# class methods avoids false positives from `if (`, `for (`, etc. — at the
+# cost of undercounting tests that target classes. Acceptable for a
+# heuristic; user can always opt in to interview the file regardless.
+_TS_SOURCE_FUNCS = [
+    re.compile(r"(?m)^export\s+(?:async\s+)?function\b"),
+    re.compile(r"(?m)^export\s+const\s+\w+\s*=\s*(?:async\s+)?\("),
+]
+
+# Python source: top-level + indented `def` / `async def`, where the
+# function name starts with a lowercase letter (excludes `_private` and
+# `__dunder__`).
+_PY_SOURCE_FUNCS = [
+    re.compile(r"(?m)^(?:async\s+)?def\s+[a-z]\w*"),
+    re.compile(r"(?m)^\s+(?:async\s+)?def\s+[a-z]\w*"),
+]
+
+
+def _h4_fire(test_path: Path, source_path: Optional[Path]) -> bool:
+    if source_path is None:
+        return False
+    lang = _lang(test_path)
+    if lang not in ("ts", "py"):
+        return False
+    test_text = _read(test_path)
+    source_text = _read(source_path)
+    if lang == "ts":
+        test_count = len(_TS_TEST.findall(test_text))
+        source_count = sum(len(p.findall(source_text)) for p in _TS_SOURCE_FUNCS)
+    else:
+        test_count = len(_PY_TEST.findall(test_text))
+        source_count = sum(len(p.findall(source_text)) for p in _PY_SOURCE_FUNCS)
+    if test_count == 0:
+        return False
+    return test_count == 1 and source_count > 3
+
+
+HEURISTICS.append({"name": "single-case-wonder", "score": 5, "fire": _h4_fire})
 
 
 # ---------------------------------------------------------------------------
