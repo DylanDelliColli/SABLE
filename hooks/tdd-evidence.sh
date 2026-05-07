@@ -20,8 +20,12 @@ COMMAND=$(echo "$PARSED" | sed -n '2p')
 [ -z "$COMMAND" ] && exit 0
 [ -z "$SESSION_ID" ] && exit 0
 
-# Match test runner commands
-if echo "$COMMAND" | grep -qE '(vitest|pytest|npm test|npx vitest|python -m pytest)'; then
+# Match test runner commands. The bash-harness pattern matches any
+# `bash <path>test-<name>.sh` invocation — covers SABLE's hook tests
+# (hooks/test/test-*.sh) plus any project that names test scripts test-*.sh.
+# The character class [^&|;] prevents `&&`/`||`/`;` chains from making the
+# match leak into the wrong half of a compound command.
+if echo "$COMMAND" | grep -qE '(vitest|pytest|npm test|npx vitest|python -m pytest|bash [^&|;]*test-[A-Za-z0-9_-]+\.sh)'; then
   EVIDENCE_FILE="/tmp/tdd-evidence-${SESSION_ID}"
   echo "$(date -Iseconds) $COMMAND" >> "$EVIDENCE_FILE"
 fi
