@@ -153,6 +153,44 @@ assert_hatch_skipped "two beads with --reason= still routes to evidence check" \
 assert_hatch_skipped "two beads with --reason \"text\" still routes to evidence check" \
   'bd close SABLE-stub SABLE-other --reason "cleanup batch"'
 
+# ---------- Piped / redirected / chained single-bead close (SABLE-sqz fix) ----------
+# Pipes, redirects, and command chains in the close command must not inflate
+# the bead-ID count. Only tokens shaped like bead IDs (e.g. SABLE-stub,
+# SABLE-rjv.1, BEADS-abc) should be counted.
+
+assert_hatch_used "single bead piped to tail" \
+  'bd close SABLE-stub | tail -3'
+
+assert_hatch_used "single bead redirected stderr to stdout" \
+  'bd close SABLE-stub 2>&1'
+
+assert_hatch_used "single bead piped + tail with stderr merge" \
+  'bd close SABLE-stub 2>&1 | tail -3'
+
+assert_hatch_used "single bead redirected to file" \
+  'bd close SABLE-stub > /tmp/out'
+
+assert_hatch_used "single bead chained with &&" \
+  'bd close SABLE-stub && echo done'
+
+assert_hatch_used "single bead chained with semicolon" \
+  'bd close SABLE-stub ; echo done'
+
+assert_hatch_used "single bead with --reason and a pipe" \
+  'bd close SABLE-stub --reason "shipped" | tail -3'
+
+# Multi-bead with pipes still routes to evidence check (preserves existing
+# behavior — pipes don't magically convert multi-bead into single-bead).
+assert_hatch_skipped "two beads piped to tail still routes to evidence check" \
+  'bd close SABLE-stub SABLE-other 2>&1 | tail -3'
+
+# Dotted child bead IDs are recognized (SABLE-rjv.1, SABLE-rjv.12).
+assert_hatch_used "dotted child bead ID alone" \
+  'bd close SABLE-rjv.1'
+
+assert_hatch_used "dotted child bead ID piped" \
+  'bd close SABLE-rjv.1 2>&1'
+
 # ---------- Summary ----------
 
 echo
