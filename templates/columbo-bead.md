@@ -70,6 +70,17 @@ gaps or the area is debugging-heavy. Watch the mis-classifications: a
 fills in the it.todo bodies and renames `.skel.test.<ext>` → `.test.<ext>`,
 or merges the cases into an existing test file with the same coverage shape.
 
+## Test layer
+{{ One of: UNIT | E2E | EVAL. Drives skeleton-file placement and tells
+   the worker what kind of test to write. Decision rules:
+   - UNIT (default): pure functions, internal helpers, single-function
+     edge cases, obscure flows
+   - E2E: common user flow spanning 3+ components/services; integration
+     where mocking would hide failures; auth/payment/destruction flows
+   - EVAL: critical LLM call needing a quality eval; prompt-template
+     change; system-instruction change
+   One layer per bead — if cases span layers, split the bead. }}
+
 ## Cases
 For EACH test case in this bead, fill all four fields:
 
@@ -117,6 +128,27 @@ Repeat per case. Bead with one case is fine. Bead with >12 cases → split.
 - **Path:** `<path-relative-to-repo-root>` — the source the gap concerns.
 - **Symbol:** `<function / class / handler / method>` — what is undertested.
 
+## Existing test quality
+{{ Grade the cited existing test on the three-tier rubric, or note its
+   absence. The grade tells the executing worker whether they're upgrading
+   a thin test or near-rewriting one. Required for every columbo-test-gap
+   bead.
+
+   - **★★★** — tests behavior with edge cases AND error paths (covered;
+     should NOT be a gap — drop the bead instead)
+   - **★★** — tests correct behavior, happy path only; gap is missing
+     edges / error paths
+   - **★** — smoke test / existence check / trivial assertion (`it
+     renders`, `doesn't throw`, single field equality); essentially no
+     real coverage
+   - **none — net-new test required** — no existing test at the cited
+     site; the gap is true missing coverage
+
+   Format:
+     Grade: ★★ (or ★, or "none — net-new test required")
+     Rationale: <1-2 sentences citing the existing test's actual shape:
+                what it checks, what it skips> }}
+
 ## Fingerprint
 A literal substring grep-able from the cited test file (or source if the
 test doesn't exist yet). Choose something unique — `grep -n '<fingerprint>'`
@@ -157,12 +189,14 @@ Repeat per case.
 |---------|------------------|
 | Feature under test (spec) | Worker building tests for the wrong behavior |
 | Test file (spec) | Worker creating a parallel test file when a skeleton already exists |
+| Test layer (spec) | Worker writing a unit test when E2E was needed (or vice versa) — different cost/coverage profile |
 | Cases with Why/Inputs/Expected | Generic happy-path tests that pass without exercising the case |
 | Categories | Optimus/Tarzan can't filter by test shape without it; orientation for code review |
 | Fixtures / setup | Worker reverse-engineering setup from prod code |
 | Out of scope (spec) | Worker speculatively adding cases the user explicitly declined |
 | Symptom (gap) | Vague "tests need work" gaps that reviewers can't act on |
 | Cited test/source file (gap) | Worker re-exploring to find the audited site |
+| Existing test quality (gap) | Worker not knowing whether to upgrade a thin test (★★) or near-rewrite a smoke-only one (★) |
 | Fingerprint (gap) | Line drift between bead creation and execution |
 | Cases to add (gap) | Worker fixing the wrong shallow spot |
 | Risk if not addressed (gap) | De-prioritization without justification |
@@ -173,12 +207,17 @@ Before `bd create`, re-read the draft and confirm:
 
 - [ ] Could a fresh worker take this bead + the cited skeleton file and write the implementation without re-interviewing the user? (Fresh Agent Test)
 - [ ] Does every `## Cases` bullet have Why + Inputs + Expected (all three, not "various" or "edge cases")?
+- [ ] Forward only: is `## Test layer` set to one of UNIT / E2E / EVAL, with the cases all matching that layer (no mixed-layer beads)?
 - [ ] Forward only: do the case names exactly match `it.todo` strings in the cited skeleton file? (Run a grep.)
+- [ ] Forward only: does the skeleton file's directory match the test layer (unit-test dir / e2e dir / evals dir)?
+- [ ] Audit only: is `## Existing test quality` filled with a grade (★/★★/★★★) or `none — net-new test required`?
+- [ ] Audit only: if grade is ★★★, this should NOT be a gap bead — drop it. (★★★ tests are covered, not gaps.)
 - [ ] Audit only: does the fingerprint grep to ≤3 matches in the cited file? (Run the grep.)
 - [ ] Are categories listed consistent with sub-labels on the bead?
 - [ ] Is the model: label appropriate per the heuristic table — and if stepped UP, is the reason in `## Notes`?
 - [ ] Is `## Out of scope` filled (forward) — even if "none — full coverage map landed"?
 - [ ] Is `## Risk if not addressed` (gap) a concrete cost, not a generic "tests are good"?
+- [ ] **Regression rule (forward, IRON):** if the feature touches existing code, is at least one filed bead a regression-test bead at priority ≤ 1?
 - [ ] Could two beads merge? (Often `:behavioral` + `:boundary` for the same feature collapse cleanly.)
 - [ ] Could one bead split? (Often a `:state-machine` bead is actually `:state-machine` + `:invariants` stapled together — split.)
 

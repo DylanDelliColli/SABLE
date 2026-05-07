@@ -141,6 +141,8 @@ if [ "$COLUMBO_SPEC" = "1" ]; then
     || append_missing "## Feature under test section"
   echo "$DESC" | grep -qE '^## Test file' \
     || append_missing "## Test file section"
+  echo "$DESC" | grep -qE '^## Test layer' \
+    || append_missing "## Test layer section (UNIT | E2E | EVAL)"
   echo "$DESC" | grep -qE '^## Cases' \
     || append_missing "## Cases section"
   # Cases must contain at least one bullet with a Why: sub-line
@@ -162,6 +164,8 @@ if [ "$COLUMBO_GAP" = "1" ]; then
     || append_missing "## Cited test file section"
   echo "$DESC" | grep -qE '^## Cited source file' \
     || append_missing "## Cited source file section"
+  echo "$DESC" | grep -qE '^## Existing test quality' \
+    || append_missing "## Existing test quality section (★/★★/★★★ grade or 'none — net-new test required')"
   echo "$DESC" | grep -qE '^## Fingerprint' \
     || append_missing "## Fingerprint section (literal substring grep-able from cited file)"
   echo "$DESC" | grep -qE '^## Cases to add' \

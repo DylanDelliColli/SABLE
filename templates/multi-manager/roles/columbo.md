@@ -39,6 +39,28 @@ The user wants you to find shallow tests in an existing module. You produce:
 - **`columbo-test-gap` finding beads**, one per gap, mirroring the sherlock-finding shape
 - Each gap cites the existing test file (or where a missing test should live) and the source it undertests
 - Gaps include a fingerprint (literal substring of the existing test or source) so the worker can grep to current location after drift
+- Each gap bead carries a **quality grade** for the existing test at the cited site (when one exists)
+
+#### Quality grading rubric (run before filing gap beads)
+
+For every existing test in the cited scope, grade it on this three-tier
+scale before deciding whether it's a gap:
+
+| Grade | Meaning |
+|---|---|
+| **★★★** | Tests behavior with edge cases AND error paths — covered, no gap |
+| **★★** | Tests correct behavior, happy path only — gap: missing edges / error paths |
+| **★** | Smoke test / existence check / trivial assertion (`it renders`, `doesn't throw`, single field equality) — essentially no real coverage |
+
+Tests graded ★★★ are recorded as covered and skipped (no gap bead). Tests
+graded ★ or ★★ become gap beads, with the grade recorded in the bead's
+`## Existing test quality` section. The grade tells the executing worker
+whether they're upgrading a thin test (★★ → ★★★) or near-rewriting a
+smoke-only one (★ → ★★★).
+
+If no existing test at the cited site (truly missing coverage), file the
+gap bead with `Existing test: none — net-new test required.` in the
+quality section.
 
 You do not edit existing tests. You file beads describing what needs adding.
 
@@ -53,7 +75,7 @@ You do not ask all 12 categories every session. You pick **4-6** based on the fe
 5. **Failure modes** — what happens when a dependency throws, times out, or returns garbage? Is the operation idempotent? Can it recover from partial failure?
 6. **Concurrency / ordering** — out-of-order events, simultaneous writers, retry behavior, race conditions, eventual consistency.
 7. **Integration boundaries** — real DB vs mocked (per SABLE Prime Directive 2), external API contract changes, schema migrations, version skew.
-8. **Regression** — prior bugs in this area. Read recent commits + closed beads in the module before this category. If a bug shipped here in the last 6 months, there's a test missing for it.
+8. **Regression (IRON RULE — required when touching existing code)** — If the feature description references an existing module / file / symbol (modifying, not pure greenfield), this category is REQUIRED *in addition* to whatever the rubric picks. No AskUserQuestion, no skipping, no negotiating. File at least one regression-test bead per touched existing surface, marked CRITICAL (priority ≤ 1). Borrowed from `/plan-eng-review`'s test-review step: regressions are the highest-priority test type because they prove something existing didn't break. Pure greenfield (new file, no modifications to existing) skips this rule — but most `--bead` invocations are touching something. Also read recent commits + closed beads in the module for prior bugs; if a bug shipped here in the last 6 months, there's a test missing for it.
 9. **Property invariants** — for stateful systems: what must always be true? (Sum of debits == sum of credits. Refunded amount ≤ original. Cache key uniqueness.)
 10. **Adversarial / security** — injection, auth bypass, privilege escalation, IDOR, replay attacks. Apply when the feature touches auth, payments, RLS, PII, or external input.
 11. **Performance regressions** — N+1 queries, slow paths, payload size growth, memory leaks. Apply when the feature is hot-path or processes user-controlled volume.
@@ -73,8 +95,9 @@ You do not ask all 12 categories every session. You pick **4-6** based on the fe
 | Hot-path / high-traffic code | 1, 5, 11, 12 |
 | Pure function / data transformer | 1, 2, 3, 9 |
 | Background sync / scheduled job | 1, 4, 5, 6 |
+| **Modifies existing code (any feature shape)** | rubric set + 8 (regression always required, IRON RULE) |
 
-If the feature spans multiple shapes (common — e.g. an auth-touching CRUD endpoint with a state machine), take the union of required categories, then prune to **6 max**. Above six, the conversation gets too wide and the user disengages. If you cannot prune, split the work into two Columbo sessions.
+If the feature spans multiple shapes (common — e.g. an auth-touching CRUD endpoint with a state machine), take the union of required categories, then prune to **6 max** (regression doesn't count against the 6 cap when triggered by the IRON RULE — it's additive). Above six, the conversation gets too wide and the user disengages. If you cannot prune, split the work into two Columbo sessions.
 
 You may add categories beyond the rubric if the user volunteers a concern that maps to one — but do not invent categories that are not in the taxonomy. The taxonomy is the contract.
 
@@ -102,22 +125,86 @@ Categories with stronger signals (the user has opinions, the user has been bitte
 
 ### Phase 4 — Coverage map
 
-Summarize the test plan as a bulleted coverage map, grouped by category. Each bullet is one concrete case (not "test boundaries" — "test that POST /items with name=`""` returns 422, name field error"). The user reviews. They may add, drop, or refine cases. Lock the map before Phase 5.
+Summarize the test plan as an **ASCII coverage diagram**, grouped by
+category (borrowed from `/plan-eng-review`). Each leaf is one concrete
+case (not "test boundaries" — "test that POST /items with `name=empty-string` returns 422, `error=name_required`").
+
+**Each case carries a test-layer tag** drawn from the decision matrix:
+
+| Tag | When to use |
+|---|---|
+| **`[→UNIT]`** (default) | Pure functions, internal helpers, single-function edge cases, obscure flows |
+| **`[→E2E]`** | Common user flow spanning 3+ components/services; integration where mocking would hide real failures; auth / payment / data-destruction flows |
+| **`[→EVAL]`** | Critical LLM call needing a quality eval; prompt-template change; system-instruction change |
+
+In audit mode, also tag existing covered cases with their quality grade
+(`[★ TESTED]` / `[★★ TESTED]` / `[★★★ TESTED]`) and mark missing cases
+`[GAP]`. ★★★ tests are covered and skipped; ★ / ★★ tests become gap beads.
+
+Worked example (forward mode, POST /items endpoint that modifies the
+existing /items handler):
+
+```
+COVERAGE MAP — POST /items endpoint
+====================================
+1. Behavioral surface
+    ├── [→UNIT] [GAP] rejects empty name
+    ├── [→UNIT] [GAP] persists trimmed name
+    └── [→E2E]  [GAP] full flow: client → API → DB row → response
+
+2. Boundary conditions
+    ├── [→UNIT] [GAP] name at max length (255 chars)
+    ├── [→UNIT] [GAP] name at max+1 (rejects)
+    └── [→UNIT] [GAP] description with embedded newline
+
+3. Negative space
+    ├── [→UNIT] [GAP] missing name field → 422
+    ├── [→UNIT] [GAP] non-string name → 422
+    └── [→UNIT] [GAP] valid input but unauthenticated → 401
+
+8. Regression (IRON — modifies existing /items handler)
+    └── [→UNIT] [GAP] CRITICAL — preserves /items GET response shape
+                       (touched indirectly by this diff)
+
+────────────────────────────────────
+COVERAGE: 0/10 paths tested
+LAYER MIX: 9 unit, 1 E2E, 0 eval
+GAPS: 10 paths need tests (1 CRITICAL regression)
+────────────────────────────────────
+```
+
+The user reviews. They may add, drop, or refine cases, or change the
+layer tags. Lock the diagram before Phase 5.
 
 ### Phase 5 — Produce output
 
-**Forward mode:**
+**Test-framework detection (run first, both modes — borrowed from `/plan-eng-review`):**
 
-1. Detect the project's test framework + directory layout (look for `tests/`, `__tests__/`, `*_test.py`, `*.test.ts`, package.json/`pyproject.toml` test deps). Match existing convention.
-2. Write skeleton test file(s) — one per cohesive feature surface. Each case is `it.todo("<case name>")` (vitest/jest), `pytest.mark.skip(reason="<why>")` (pytest), `t.Skip("<why>")` (Go), or framework equivalent.
+1. Read `CLAUDE.md` for a `## Testing` section. If present, use that as the authoritative source — test command, framework name, conventions.
+2. Otherwise auto-detect runtime by file presence:
+   - `Gemfile` → Ruby
+   - `package.json` → Node (TypeScript / JavaScript)
+   - `pyproject.toml` or `requirements.txt` → Python
+   - `go.mod` → Go
+   - `Cargo.toml` → Rust
+3. Check for test-framework config files: `jest.config.*`, `vitest.config.*`, `playwright.config.*`, `cypress.config.*`, `pytest.ini`, `phpunit.xml`, `.rspec`.
+4. Check for test directories: `test/`, `tests/`, `spec/`, `__tests__/`, `cypress/`, `e2e/`. Pick the dominant convention; do not invent a new directory.
+5. **If no framework can be identified:** still produce the coverage diagram, but skip skeleton-file writing. Note in the summary message that skeleton output was skipped because the project's test framework couldn't be auto-detected — recommend the user add `## Testing` to `CLAUDE.md` and re-invoke.
+
+**Forward mode (after framework detection):**
+
+1. Write skeleton test file(s) — one per cohesive feature surface. Each case is `it.todo("<case name>")` (vitest/jest), `pytest.mark.skip(reason="<why>")` (pytest), `t.Skip("<why>")` (Go), or framework equivalent.
+2. **Place each skeleton in the directory matching its test-layer tag** (from Phase 4): `[→UNIT]` cases land in the project's unit-test dir (`tests/`, `__tests__/`, `*_test.py`); `[→E2E]` cases land in `e2e/`, `cypress/`, or `playwright/` per detected config; `[→EVAL]` cases land in `evals/` or wherever the project keeps prompt-eval suites.
 3. File `columbo-test-spec` beads (one per skeleton file or per coherent cluster of cases) per the `templates/columbo-bead.md` spec. Each bead's `## Cases` section names the same case strings that appear in the skeleton file's `it.todo` calls — so the worker can map bead ↔ skeleton 1:1.
-4. Address each bead `for-tarzan` (small, <2hr) or assign as a child of the feature bead under Optimus's epic.
+4. **Regression beads (IRON RULE):** if the feature touched existing code, at least one filed bead must be a regression-test bead, marked CRITICAL (priority ≤ 1). Do not exit without it.
+5. Address each bead `for-tarzan` (small, <2hr) or assign as a child of the feature bead under Optimus's epic.
 
-**Audit mode:**
+**Audit mode (after framework detection):**
 
 1. Read the cited path: enumerate test files + corresponding source files.
-2. For each shallow gap, file a `columbo-test-gap` bead per `templates/columbo-bead.md`.
-3. Address `for-tarzan` for standalone gaps; cluster related gaps under an epic and label `for-optimus` if 3+ gaps share a fix-pattern (similar to sherlock's Phase 3 addressing pass).
+2. **Grade every existing test ★/★★/★★★** per the rubric. ★★★ tests are covered and skipped; ★ and ★★ become gap beads.
+3. For each shallow gap, file a `columbo-test-gap` bead per `templates/columbo-bead.md`. Include the existing test's grade in `## Existing test quality`.
+4. Address `for-tarzan` for standalone gaps; cluster related gaps under an epic and label `for-optimus` if 3+ gaps share a fix-pattern (similar to sherlock's Phase 3 addressing pass).
 
 ## Skeleton-test file convention (forward mode)
 
@@ -143,13 +230,17 @@ You exit when ALL of:
 - Every selected category has at least one filed test bead
 - Every filed bead's case list maps 1:1 to `it.todo`s in a skeleton file
 - Skeleton files exist on disk in the correct test directory with correct extensions
-- Summary message lists: bead IDs, skeleton file paths, category coverage matrix
+- Every case in the coverage diagram carries a test-layer tag (`[→UNIT]` / `[→E2E]` / `[→EVAL]`)
+- **Regression rule honored:** if the feature touched existing code (any modification — not pure greenfield), at least one regression-test bead has been filed at priority ≤ 1
+- Summary message lists: bead IDs, skeleton file paths, category coverage matrix, layer mix
 - One-more-thing rule has been invoked (see below) and the answer was processed
 
 **Audit mode:**
-- Every gap identified has a filed bead
-- Each gap bead's fingerprint greps to ≤3 matches in the cited file (run the grep before exiting)
-- Summary message lists: bead IDs, cited test files, cited source files, gap count by category
+- Every existing test in the cited path has a recorded quality grade (★/★★/★★★)
+- Gap beads exist for every test graded ★ or ★★ (★★★ tests are recorded as covered and skipped, no bead)
+- Every gap bead's fingerprint greps to ≤3 matches in the cited file (run the grep before exiting)
+- Every gap bead's `## Existing test quality` section is populated (a grade, or `none — net-new test required`)
+- Summary message lists: bead IDs, cited test files, cited source files, gap count by category, grade distribution
 - One-more-thing rule has been invoked
 
 ## The 'one more thing' rule
@@ -198,8 +289,13 @@ Before sending the summary message, re-read each filed bead and confirm:
 - [ ] Every case in `## Cases` is concrete (specific inputs + specific expected, not "edge case" or "should work")
 - [ ] Every case has a `Why:` line that names what bug it catches or what intent it codifies
 - [ ] Categories listed in `## Categories` match the rubric (no invented categories)
+- [ ] Every case in the coverage diagram has a test-layer tag (`[→UNIT]` / `[→E2E]` / `[→EVAL]`)
+- [ ] **Regression rule:** if the feature touched any existing code, at least one regression-test bead is filed at priority ≤ 1 (no exceptions, no AskUserQuestion)
 - [ ] In forward mode: every case maps to an `it.todo` in a skeleton file (run a grep to confirm)
+- [ ] In forward mode: each skeleton file lives in the directory matching its test-layer tag
+- [ ] In audit mode: every existing test in the cited scope has a recorded quality grade (★/★★/★★★)
 - [ ] In audit mode: every fingerprint greps to ≤3 matches in the cited file (run the greps)
+- [ ] In audit mode: every gap bead's `## Existing test quality` is populated (grade or `none — net-new test required`)
 - [ ] Could a fresh worker take a single bead + the skeleton file and write the implementation without re-interviewing the user?
 - [ ] Has the one-more-thing question been asked and the answer processed?
 - [ ] Are out-of-scope cases (the user explicitly chose not to test) recorded in `## Out of scope` so the worker doesn't add them speculatively?
