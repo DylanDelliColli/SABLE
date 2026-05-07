@@ -155,6 +155,96 @@ assert_deny "manager: sherlock-finding without fingerprint denied" "$MANAGER_ENV
 assert_allow "manager: non-sherlock label allowed when complete" "$MANAGER_ENV" \
   "bd create --title=foo --labels=bug,for-tarzan --description=\"Update src/foo.ts. Test in src/foo.test.ts.\""
 
+# ---------- Columbo-test-spec label checks ----------
+
+# Build a complete columbo-test-spec description — all six required sections,
+# Cases includes a bullet with a Why: sub-line. Avoid embedded double quotes
+# in fixtures since they terminate the bash-quoted --description argument.
+COMPLETE_COLUMBO_SPEC=$'## Feature under test\nPOST /items endpoint creates an item from a JSON body.\n\n## Test file\ntests/items.skel.test.ts\n\n## Cases\n- Case name: rejects empty name\n  - Why: catches the bug where empty strings bypassed the not-null constraint\n  - Inputs: name=empty-string\n  - Expected: 422 with body error=name_required\n\n## Categories\n2, 3\n\n## Fixtures / setup\nFixtures: none.\n\n## Out of scope\nMulti-tenant rate limiting (deferred to SABLE-future).'
+
+# Test 14: columbo-test-spec missing ## Cases → DENY mentioning Cases (manager mode)
+SPEC_NO_CASES=$'## Feature under test\nPOST /items.\n\n## Test file\ntests/items.skel.test.ts\n\n## Categories\n2, 3\n\n## Fixtures / setup\nFixtures: none.\n\n## Out of scope\nNone.'
+assert_deny "manager: columbo-test-spec without Cases denied" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=columbo-test-spec --description=\"$SPEC_NO_CASES\"" \
+  "Cases"
+
+# Test 15: columbo-test-spec missing Why: sub-line in Cases → DENY mentioning Why
+SPEC_NO_WHY=$'## Feature under test\nPOST /items.\n\n## Test file\ntests/items.skel.test.ts\n\n## Cases\n- Case name: rejects empty name\n  - Inputs: name=""\n  - Expected: 422\n\n## Categories\n2, 3\n\n## Fixtures / setup\nFixtures: none.\n\n## Out of scope\nNone.'
+assert_deny "manager: columbo-test-spec without Why denied" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=columbo-test-spec --description=\"$SPEC_NO_WHY\"" \
+  "Why"
+
+# Test 16: complete columbo-test-spec → allow (manager mode)
+assert_allow "manager: columbo-test-spec complete allowed" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=columbo-test-spec --description=\"$COMPLETE_COLUMBO_SPEC\""
+
+# Test 17: complete columbo-test-spec in default mode → allow (no agent identity)
+assert_allow "default: columbo-test-spec complete allowed" "" \
+  "bd create --title=foo --labels=columbo-test-spec --description=\"$COMPLETE_COLUMBO_SPEC\""
+
+# Test 18: incomplete columbo-test-spec in default mode → nudge (not deny)
+assert_nudge "default: columbo-test-spec incomplete nudges" "" \
+  "bd create --title=foo --labels=columbo-test-spec --description=\"$SPEC_NO_CASES\"" \
+  "Cases"
+
+# Test 19: columbo-test-spec coexists with model + for-tarzan labels — complete → allow
+assert_allow "manager: columbo-test-spec with sibling labels allowed" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=columbo-test-spec,model:sonnet,for-tarzan --description=\"$COMPLETE_COLUMBO_SPEC\""
+
+# ---------- Columbo-test-gap label checks ----------
+
+COMPLETE_COLUMBO_GAP=$'## Symptom\nThe existing test for process_refund only covers the success path; nothing exercises partial-failure mid-batch.\n\n## Cited test file\ntests/refund.test.ts — refund_success_block\n\n## Cited source file\nsrc/refund.ts — process_refund\n\n## Fingerprint\nfor (const item of refundBatch)\n\n## Cases to add\n- Case name: handles 503 mid-batch without losing successful refunds\n  - Why: catches silent partial-failure regression\n  - Inputs: batch of 5 items, gateway returns 200 for items 0-2, 503 for items 3-4\n  - Expected: items 0-2 marked refunded; items 3-4 retained as pending; no double-refund on retry\n\n## Categories\n5, 8\n\n## Risk if not addressed\nA partial-failure mid-batch will silently drop pending refunds, causing customer-visible refund delays and accounting drift.'
+
+# Test 20: columbo-test-gap missing ## Fingerprint → DENY mentioning Fingerprint
+GAP_NO_FP=$'## Symptom\nFoo.\n\n## Cited test file\ntests/refund.test.ts\n\n## Cited source file\nsrc/refund.ts\n\n## Cases to add\n- Case name: x\n  - Why: y\n  - Inputs: z\n  - Expected: q\n\n## Categories\n5\n\n## Risk if not addressed\nBar.'
+assert_deny "manager: columbo-test-gap without Fingerprint denied" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=columbo-test-gap --description=\"$GAP_NO_FP\"" \
+  "Fingerprint"
+
+# Test 21: columbo-test-gap missing ## Risk if not addressed → DENY mentioning Risk
+GAP_NO_RISK=$'## Symptom\nFoo.\n\n## Cited test file\ntests/refund.test.ts\n\n## Cited source file\nsrc/refund.ts\n\n## Fingerprint\nfor (const item of refundBatch)\n\n## Cases to add\n- Case name: x\n  - Why: y\n  - Inputs: z\n  - Expected: q\n\n## Categories\n5'
+assert_deny "manager: columbo-test-gap without Risk denied" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=columbo-test-gap --description=\"$GAP_NO_RISK\"" \
+  "Risk"
+
+# Test 22: complete columbo-test-gap → allow (manager mode)
+assert_allow "manager: columbo-test-gap complete allowed" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=columbo-test-gap --description=\"$COMPLETE_COLUMBO_GAP\""
+
+# Test 23: complete columbo-test-gap in default mode → allow
+assert_allow "default: columbo-test-gap complete allowed" "" \
+  "bd create --title=foo --labels=columbo-test-gap --description=\"$COMPLETE_COLUMBO_GAP\""
+
+# Test 24: columbo-test-gap incomplete in default mode → nudge (not deny)
+assert_nudge "default: columbo-test-gap incomplete nudges" "" \
+  "bd create --title=foo --labels=columbo-test-gap --description=\"$GAP_NO_FP\"" \
+  "Fingerprint"
+
+# Test 25: columbo-test-gap coexists with sibling labels — complete → allow
+assert_allow "manager: columbo-test-gap with sibling labels allowed" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=columbo-test-gap,model:opus,for-optimus --description=\"$COMPLETE_COLUMBO_GAP\""
+
+# Test 26: existing sherlock-finding behavior unchanged when columbo gate is also active
+assert_allow "regression: sherlock-finding still allowed after columbo gate added" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=sherlock-finding --description=\"$COMPLETE_SHERLOCK_DESC\""
+
+# Test 27: cross-label — bead carries BOTH columbo-test-spec and sherlock-finding.
+# Both gates fire; description must satisfy both contracts. Composing the
+# COMPLETE_SHERLOCK_DESC + columbo sections produces a description that
+# passes everything. Confirms the gate ANDs label requirements rather than
+# silently picking one and ignoring the other.
+DUAL_DESC=$'## Rationale\nFoo\n\n## Evidence\n### File: src/auth.ts\n- Symbol: foo\n- Fingerprint: const foo = [\n\n## Proposed approach\nBar\n\n## Scope estimate\nS\n\n## Risk if not addressed\nBaz\n\n## Feature under test\nAuth middleware.\n\n## Test file\ntests/auth.skel.test.ts\n\n## Cases\n- Case name: rejects unsigned token\n  - Why: catches signature-bypass regression\n  - Inputs: token with empty signature\n  - Expected: 401 with reason invalid_signature\n\n## Categories\n3, 10\n\n## Fixtures / setup\nFixtures: none.\n\n## Out of scope\nRefresh-token rotation.'
+assert_allow "manager: dual-label spec + sherlock-finding allowed when both contracts satisfied" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=columbo-test-spec,sherlock-finding --description=\"$DUAL_DESC\""
+
+# Test 28: cross-label — same dual-label bead but missing columbo's Cases →
+# DENY mentioning Cases (proves columbo gate fires even when sherlock gate
+# would otherwise pass).
+DUAL_NO_CASES=$'## Rationale\nFoo\n\n## Evidence\n### File: src/auth.ts\n- Symbol: foo\n- Fingerprint: const foo = [\n\n## Proposed approach\nBar\n\n## Scope estimate\nS\n\n## Risk if not addressed\nBaz\n\n## Feature under test\nAuth middleware.\n\n## Test file\ntests/auth.skel.test.ts\n\n## Categories\n3\n\n## Fixtures / setup\nFixtures: none.\n\n## Out of scope\nNone.'
+assert_deny "manager: dual-label spec + sherlock-finding denied when columbo Cases missing" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=columbo-test-spec,sherlock-finding --description=\"$DUAL_NO_CASES\"" \
+  "Cases"
+
 # ---------- Summary ----------
 
 echo
