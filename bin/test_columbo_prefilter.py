@@ -528,6 +528,230 @@ def test_h6_handles_named_reexport():
         assert_eq("h6: named re-export counts as export", bool(h6["fire"](test, source)), False)
 
 
+# ---------------------------------------------------------------------------
+# rjv.5.4 — Heuristic 3 (mock saturation) + Heuristic 5 (missing categories)
+# ---------------------------------------------------------------------------
+
+
+def test_h3_fires_on_overmocked_integration():
+    """integration.test.ts with 5 imports and 4 vi.mock calls → fires."""
+    h3 = _h("mock-saturation")
+    assert_true("h3 registered", h3 is not None)
+    if h3 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "user.integration.test.ts"
+        test.write_text("\n".join([
+            "import { a } from './a';",
+            "import { b } from './b';",
+            "import { c } from './c';",
+            "import { d } from './d';",
+            "import { e } from './e';",
+            "vi.mock('./a');",
+            "vi.mock('./b');",
+            "vi.mock('./c');",
+            "vi.mock('./d');",
+            "it('x', () => { expect(1).toBe(1); });",
+        ]))
+        assert_eq("h3: overmocked integration fires", bool(h3["fire"](test, None)), True)
+
+
+def test_h3_does_not_fire_below_threshold():
+    """integration.test.ts with 5 imports and 2 mocks → no fire (40% < 70%)."""
+    h3 = _h("mock-saturation")
+    if h3 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "user.integration.test.ts"
+        test.write_text("\n".join([
+            "import { a } from './a';",
+            "import { b } from './b';",
+            "import { c } from './c';",
+            "import { d } from './d';",
+            "import { e } from './e';",
+            "vi.mock('./a');",
+            "vi.mock('./b');",
+            "it('x', () => { expect(1).toBe(1); });",
+        ]))
+        assert_eq("h3: under-threshold skips", bool(h3["fire"](test, None)), False)
+
+
+def test_h3_does_not_fire_on_unit_tests():
+    """foo.test.ts (no integration tag) with 5 imports and 5 mocks → no fire."""
+    h3 = _h("mock-saturation")
+    if h3 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "foo.test.ts"
+        test.write_text("\n".join([
+            "import { a } from './a';",
+            "import { b } from './b';",
+            "import { c } from './c';",
+            "import { d } from './d';",
+            "import { e } from './e';",
+            "vi.mock('./a');",
+            "vi.mock('./b');",
+            "vi.mock('./c');",
+            "vi.mock('./d');",
+            "vi.mock('./e');",
+            "it('x', () => { expect(1).toBe(1); });",
+        ]))
+        assert_eq("h3: unit test skips even when fully mocked", bool(h3["fire"](test, None)), False)
+
+
+def test_h3_python_unittest_mock():
+    """Python integration_test.py with 4 patches over 5 imports → fires."""
+    h3 = _h("mock-saturation")
+    if h3 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "user_integration_test.py"
+        test.write_text("\n".join([
+            "import a",
+            "import b",
+            "from c import x",
+            "from d import y",
+            "from e import z",
+            "@mock.patch('a.foo')",
+            "@mock.patch('b.bar')",
+            "@mock.patch('c.x')",
+            "@mock.patch('d.y')",
+            "def test_one():",
+            "    assert True",
+        ]))
+        assert_eq("h3: Python @patch saturated", bool(h3["fire"](test, None)), True)
+
+
+def test_h3_describe_block_tag():
+    """foo.test.ts with describe('integration: ...') and 4/5 mocks → fires."""
+    h3 = _h("mock-saturation")
+    if h3 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "foo.test.ts"
+        test.write_text("\n".join([
+            "import { a } from './a';",
+            "import { b } from './b';",
+            "import { c } from './c';",
+            "import { d } from './d';",
+            "import { e } from './e';",
+            "vi.mock('./a');",
+            "vi.mock('./b');",
+            "vi.mock('./c');",
+            "vi.mock('./d');",
+            "describe('integration: user flow', () => {",
+            "  it('x', () => { expect(1).toBe(1); });",
+            "});",
+        ]))
+        assert_eq("h3: describe-block integration tag triggers fire", bool(h3["fire"](test, None)), True)
+
+
+def test_h5_fires_on_state_machine_no_transition_tests():
+    """Source has switch + 3 cases; test never mentions transition → fires with state-machine in detail."""
+    h5 = _h("missing-categories")
+    assert_true("h5 registered", h5 is not None)
+    if h5 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "fsm.test.ts"
+        source = tmp / "fsm.ts"
+        source.write_text("\n".join([
+            "export function next(s: string) {",
+            "  switch (s) {",
+            "    case 'a': return 'b';",
+            "    case 'b': return 'c';",
+            "    case 'c': return 'a';",
+            "  }",
+            "}",
+        ]))
+        test.write_text("it('returns next', () => { expect(next('a')).toBe('b'); });\n")
+        result = h5["fire"](test, source)
+        assert_true("h5: state-machine missing fires", bool(result), f"got: {result!r}")
+        assert_in("h5: detail names state-machine", "state-machine", str(result))
+
+
+def test_h5_does_not_fire_when_test_mentions_transition():
+    """Same source + test with describe('transitions') → no fire."""
+    h5 = _h("missing-categories")
+    if h5 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "fsm.test.ts"
+        source = tmp / "fsm.ts"
+        source.write_text("\n".join([
+            "export function next(s: string) {",
+            "  switch (s) {",
+            "    case 'a': return 'b';",
+            "    case 'b': return 'c';",
+            "    case 'c': return 'a';",
+            "  }",
+            "}",
+        ]))
+        test.write_text("describe('transitions', () => { it('a→b', () => { expect(next('a')).toBe('b'); }); });\n")
+        assert_eq("h5: covered category skips", bool(h5["fire"](test, source)), False)
+
+
+def test_h5_fires_multiple_categories():
+    """Source with state-machine + security; tests cover neither → detail lists both."""
+    h5 = _h("missing-categories")
+    if h5 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "auth_fsm.test.ts"
+        source = tmp / "auth_fsm.ts"
+        source.write_text("\n".join([
+            "export function authenticate(t: string) { return verify_token(t); }",
+            "export function next(s: string) {",
+            "  switch (s) {",
+            "    case 'a': return 'b';",
+            "    case 'b': return 'c';",
+            "    case 'c': return 'a';",
+            "  }",
+            "}",
+        ]))
+        test.write_text("it('default path', () => { expect(next('a')).toBe('b'); });\n")
+        result = h5["fire"](test, source)
+        assert_true("h5: multiple missing fires", bool(result))
+        assert_in("h5: state-machine in detail", "state-machine", str(result))
+        assert_in("h5: security in detail", "security", str(result))
+
+
+def test_h5_skips_when_no_source():
+    """source_path=None → no fire (and no exception)."""
+    h5 = _h("missing-categories")
+    if h5 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        test = Path(tmp) / "x.test.ts"
+        test.write_text("it('x', () => { expect(1).toBe(1); });\n")
+        assert_eq("h5: no-source skips", bool(h5["fire"](test, None)), False)
+
+
+def test_h5_concurrency_pattern():
+    """Source has async + Mutex; test never mentions race/concurrent → fires with concurrency."""
+    h5 = _h("missing-categories")
+    if h5 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "queue.test.ts"
+        source = tmp / "queue.ts"
+        source.write_text("\n".join([
+            "import { Mutex } from 'async-mutex';",
+            "const lock = new Mutex();",
+            "export async function push(x: number) {",
+            "  await lock.runExclusive(() => { /* ... */ });",
+            "}",
+        ]))
+        test.write_text("it('pushes', async () => { await push(1); expect(1).toBe(1); });\n")
+        result = h5["fire"](test, source)
+        assert_true("h5: concurrency missing fires", bool(result))
+        assert_in("h5: concurrency in detail", "concurrency", str(result))
+
+
 def test_v1_integration_surfaces_shallow_skips_deep():
     """End-to-end: synthesize one shallow test/source pair and one deep
     test/source pair; run the prefilter with both heuristics live; assert
@@ -615,6 +839,17 @@ TESTS = [
     test_h6_skips_unresolved_target,
     test_h6_handles_default_export,
     test_h6_handles_named_reexport,
+    # rjv.5.4 — heuristics 3 + 5
+    test_h3_fires_on_overmocked_integration,
+    test_h3_does_not_fire_below_threshold,
+    test_h3_does_not_fire_on_unit_tests,
+    test_h3_python_unittest_mock,
+    test_h3_describe_block_tag,
+    test_h5_fires_on_state_machine_no_transition_tests,
+    test_h5_does_not_fire_when_test_mentions_transition,
+    test_h5_fires_multiple_categories,
+    test_h5_skips_when_no_source,
+    test_h5_concurrency_pattern,
 ]
 
 

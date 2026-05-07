@@ -477,6 +477,177 @@ HEURISTICS.append({"name": "stale-fixture", "score": 9, "fire": _h6_fire})
 
 
 # ---------------------------------------------------------------------------
+# Heuristic 3 — mock saturation (score 8)
+# ---------------------------------------------------------------------------
+#
+# Fires when an integration-tagged test mocks more than 70% of its
+# imports. Skips non-integration tests entirely (mocks in unit tests
+# are expected and not a signal of shallowness).
+
+_INTEGRATION_TAG_FILENAME = re.compile(r"\.(integration|it|e2e)\.|_integration_test\.py$")
+_INTEGRATION_TAG_PRAGMA = re.compile(r"(?://|#)\s*@integration\b")
+_INTEGRATION_TAG_DESCRIBE = re.compile(
+    r"\b(?:describe|context)\s*\(\s*[\'\"][^\'\"]*\bintegration\b",
+    re.IGNORECASE,
+)
+
+_TS_MOCK_PATTERNS = [
+    re.compile(r"\bvi\.mock\("),
+    re.compile(r"\bjest\.mock\("),
+    re.compile(r"\bvi\.fn\(\)"),
+    re.compile(r"\bMockedFunction\b"),
+]
+_PY_MOCK_PATTERNS = [
+    re.compile(r"@mock\.patch\("),
+    re.compile(r"@patch\("),
+    re.compile(r"\bmock\.patch\("),
+    re.compile(r"\bMagicMock\("),
+    re.compile(r"\bMock\("),
+]
+
+_TS_IMPORT_LINE = re.compile(r"(?m)^import\s")
+_PY_IMPORT_LINE = re.compile(r"(?m)^(?:from\s+\S+\s+import\s|import\s)")
+
+
+def _is_integration_test(test_path: Path, text: str) -> bool:
+    if _INTEGRATION_TAG_FILENAME.search(test_path.name.lower()):
+        return True
+    head = "\n".join(text.split("\n")[:10])
+    if _INTEGRATION_TAG_PRAGMA.search(head):
+        return True
+    if _INTEGRATION_TAG_DESCRIBE.search(text):
+        return True
+    return False
+
+
+def _h3_fire(test_path: Path, source_path: Optional[Path]) -> bool:
+    lang = _lang(test_path)
+    if lang not in ("ts", "py"):
+        return False
+    text = _read(test_path)
+    if not _is_integration_test(test_path, text):
+        return False
+    if lang == "ts":
+        mock_count = sum(len(p.findall(text)) for p in _TS_MOCK_PATTERNS)
+        import_count = len(_TS_IMPORT_LINE.findall(text))
+    else:
+        mock_count = sum(len(p.findall(text)) for p in _PY_MOCK_PATTERNS)
+        import_count = len(_PY_IMPORT_LINE.findall(text))
+    if import_count == 0:
+        return False
+    return (mock_count / import_count) > 0.7
+
+
+HEURISTICS.append({"name": "mock-saturation", "score": 8, "fire": _h3_fire})
+
+
+# ---------------------------------------------------------------------------
+# Heuristic 5 — missing categories (score 6)
+# ---------------------------------------------------------------------------
+#
+# Pattern → category lookup table (closed list — keep small to avoid
+# noise). Each entry: (source-pattern detector, category name,
+# test-reference matcher). If the source matches the detector but the
+# test never references the category keywords, fire with that category
+# in the detail.
+#
+# Bead-spec note: spec called for "score 6 per missing" with stacking;
+# implemented here as a single fire(score=6) with all missing categories
+# joined in the detail (e.g. detail="state-machine,security"). The user
+# still gets the full category list; ranking against other heuristics
+# uses the static 6 rather than 6×N. Simpler model, same surface
+# information.
+
+
+def _has_state_machine(text: str, lang: str) -> bool:
+    """switch (TS) or match (PY) with at least 3 case clauses."""
+    if lang == "ts":
+        if not re.search(r"\bswitch\s*\(", text):
+            return False
+    elif lang == "py":
+        if not re.search(r"\bmatch\s+\w", text):
+            return False
+    else:
+        return False
+    return len(re.findall(r"\bcase\s+", text)) >= 3
+
+
+def _has_concurrency(text: str, lang: str) -> bool:
+    """async + a synchronization primitive."""
+    if lang == "ts":
+        return bool(
+            re.search(r"\basync\b", text)
+            and re.search(r"\b(?:Lock|Mutex|Semaphore)\b", text)
+        )
+    if lang == "py":
+        return bool(
+            re.search(r"\basync\s+def\b", text)
+            and re.search(
+                r"\b(?:asyncio\.Lock|threading\.Lock|Mutex|Semaphore)\b", text
+            )
+        )
+    return False
+
+
+def _has_security(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:authenticate|verify_token|requireRole|hasPermission|RLS)\b",
+            text,
+        )
+    )
+
+
+def _has_boundary_handler(text: str) -> bool:
+    """Co-occurrence of an HTTP-route-ish keyword with a request-ish keyword."""
+    return bool(
+        re.search(r"\b(?:handler|route|endpoint)\b", text)
+        and re.search(r"\b(?:req|request)\b", text)
+    )
+
+
+_TEST_REF_STATE_MACHINE = re.compile(
+    r"\b(?:transition|state[\s-]?machine|state\b)", re.IGNORECASE
+)
+_TEST_REF_CONCURRENCY = re.compile(
+    r"\b(?:concurren|race|simultaneous|out[\s-]of[\s-]order)", re.IGNORECASE
+)
+_TEST_REF_SECURITY = re.compile(
+    r"\b(?:auth|unauthor|forbid|permission|injection)", re.IGNORECASE
+)
+_TEST_REF_BOUNDARY = re.compile(
+    r"\b(?:invalid input|malformed|negative space)", re.IGNORECASE
+)
+
+
+def _h5_fire(test_path: Path, source_path: Optional[Path]):
+    if source_path is None:
+        return False
+    lang = _lang(test_path)
+    if lang not in ("ts", "py"):
+        return False
+    test_text = _read(test_path)
+    source_text = _read(source_path)
+
+    checks = [
+        ("state-machine", _has_state_machine(source_text, lang), _TEST_REF_STATE_MACHINE),
+        ("concurrency",   _has_concurrency(source_text, lang),   _TEST_REF_CONCURRENCY),
+        ("security",      _has_security(source_text),            _TEST_REF_SECURITY),
+        ("boundary",      _has_boundary_handler(source_text),    _TEST_REF_BOUNDARY),
+    ]
+    missing = [
+        name for name, source_has_pattern, test_ref in checks
+        if source_has_pattern and not test_ref.search(test_text)
+    ]
+    if not missing:
+        return False
+    return ",".join(missing)
+
+
+HEURISTICS.append({"name": "missing-categories", "score": 6, "fire": _h5_fire})
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
