@@ -16,15 +16,21 @@ Heuristic registry — extension contract:
 
   Each entry in HEURISTICS is a dict:
     {
-      "name":  str,                                  # signal label, e.g. "happy-path-only"
-      "score": int,                                  # 0-10, fixed per heuristic
-      "fire":  Callable[[Path, Path|None], bool],    # (test_path, source_path) -> fired?
+      "name":  str,                                       # signal label
+      "score": int,                                       # 0-10, fixed per heuristic
+      "fire":  Callable[[Path, Path|None], bool | str],   # (test, source) -> fired?
     }
 
+  fire() returns:
+    - True  → fired (no detail; signal label is just `name`)
+    - str   → fired with detail (signal label is `name:detail`, e.g.
+              `stale-fixture:processRefund`); falsy strings ("") count as
+              not fired
+    - False → not fired
+
   Sibling beads (rjv.5.2-5.5) plug into HEURISTICS by appending entries.
-  Per-file scoring: triggered = [h for h in HEURISTICS if h["fire"](t, s)];
-  final score = max((h["score"] for h in triggered), default=0). Signals
-  list = the names of triggered heuristics.
+  Per-file scoring: triggered heuristics contribute to the file's signal
+  list. Final score = max(h["score"] for triggered) — not sum.
 
   Note: max — not sum. A single strong signal (e.g. stale-fixture, score 9)
   should outrank a pile of weak signals.
@@ -138,24 +144,37 @@ def discover(path: Path) -> list[tuple[Path, Optional[Path]]]:
 
 def score_files(pairs: Iterable[tuple[Path, Optional[Path]]]) -> list[dict]:
     """Run each (test, source) pair through HEURISTICS, return a list of
-    {path, score, signals} dicts sorted descending by score."""
+    {path, score, signals} dicts sorted descending by score.
+
+    Each triggered heuristic contributes a signal entry. If the heuristic's
+    fire() returned a non-empty string, that string is included as a
+    `detail` field on the signal (the registry contract — see module
+    docstring)."""
     results: list[dict] = []
     for test_path, source_path in pairs:
-        triggered: list[dict] = []
+        triggered: list[tuple[dict, Optional[str]]] = []
         for h in HEURISTICS:
             try:
-                if h["fire"](test_path, source_path):
-                    triggered.append(h)
+                outcome = h["fire"](test_path, source_path)
             except Exception:
-                # A misbehaving heuristic shouldn't crash the whole run;
-                # treat exceptions as "did not fire" so the rest of the
-                # heuristics still get a chance.
+                # Misbehaving heuristic doesn't crash the run; treat as
+                # "did not fire" and let the others have their chance.
                 continue
-        score = max((h["score"] for h in triggered), default=0)
+            if not outcome:
+                continue
+            detail = outcome if isinstance(outcome, str) else None
+            triggered.append((h, detail))
+        score = max((h["score"] for h, _ in triggered), default=0)
+        signals = []
+        for h, d in triggered:
+            entry = {"name": h["name"], "score": h["score"]}
+            if d:
+                entry["detail"] = d
+            signals.append(entry)
         results.append({
             "path": str(test_path),
             "score": score,
-            "signals": [{"name": h["name"], "score": h["score"]} for h in triggered],
+            "signals": signals,
         })
     results.sort(key=lambda r: (-r["score"], r["path"]))
     return results
@@ -167,13 +186,16 @@ def score_files(pairs: Iterable[tuple[Path, Optional[Path]]]) -> list[dict]:
 
 
 def format_text(results: list[dict]) -> str:
-    """Aligned text output: <path>  score=N  signals=a,b,c (one per line)."""
+    """Aligned text output: <path>  score=N  signals=a,b:detail,c (one per line)."""
     if not results:
         return ""
     width = max(len(r["path"]) for r in results)
     lines = []
     for r in results:
-        names = ",".join(s["name"] for s in r["signals"]) or "-"
+        names = ",".join(
+            f"{s['name']}:{s['detail']}" if s.get("detail") else s["name"]
+            for s in r["signals"]
+        ) or "-"
         lines.append(f"{r['path'].ljust(width)}  score={r['score']}  signals={names}")
     return "\n".join(lines)
 
@@ -266,6 +288,192 @@ def _h4_fire(test_path: Path, source_path: Optional[Path]) -> bool:
 
 
 HEURISTICS.append({"name": "single-case-wonder", "score": 5, "fire": _h4_fire})
+
+
+# ---------------------------------------------------------------------------
+# Heuristic 6 — stale fixture (score 9)
+# ---------------------------------------------------------------------------
+#
+# Fires when a test file imports a symbol that the target module no
+# longer exports. The fire() function returns the missing symbol name
+# (truthy str) so the signal can be reported as `stale-fixture:<symbol>`.
+#
+# Documented limitations:
+#   - Re-export chains (`export * from './bar'`) are NOT followed —
+#     accept the false negative to avoid expensive multi-file traversal.
+#   - Combined imports (`import foo, { bar } from 'x'`) only have their
+#     named portion verified; the default name is missed. Rare in tests.
+#   - External imports (non-relative paths like 'react') are skipped.
+
+_TS_NAMED_IMPORT = re.compile(
+    r"import\s*\{([^}]+)\}\s*from\s*['\"]([^'\"]+)['\"]"
+)
+_TS_DEFAULT_IMPORT = re.compile(
+    r"import\s+(\w+)\s+from\s*['\"]([^'\"]+)['\"]"
+)
+# We don't need to capture namespace imports — they're unverifiable, so
+# we just exclude them by structure (no \w+ first-token match thanks to *).
+
+_PY_FROM_IMPORT = re.compile(
+    r"^from\s+(\S+)\s+import\s+(.+)$",
+    re.MULTILINE,
+)
+
+
+def _parse_imports_ts(text: str) -> list[tuple[list[str], str]]:
+    """Return list of (symbols, module_spec). symbols may include the
+    sentinel '__default__' for default imports."""
+    imports: list[tuple[list[str], str]] = []
+    for m in _TS_NAMED_IMPORT.finditer(text):
+        names_part, module = m.group(1), m.group(2)
+        symbols: list[str] = []
+        for piece in names_part.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            # `foo as bar` → keep `foo` (verify export of original name)
+            if " as " in piece:
+                piece = piece.split(" as ")[0].strip()
+            symbols.append(piece)
+        if symbols:
+            imports.append((symbols, module))
+    for m in _TS_DEFAULT_IMPORT.finditer(text):
+        # _TS_DEFAULT_IMPORT also matches what _TS_NAMED_IMPORT caught
+        # because both start with `import`. We separate them by checking
+        # whether the next non-whitespace after `import` is `{` or `*`.
+        # If so, this isn't a default import — skip.
+        before = text[max(0, m.start()): m.start() + 7]
+        # Look right after the 'import' keyword
+        after_import_idx = m.start() + len("import")
+        rest = text[after_import_idx:m.start() + 200].lstrip()
+        if rest.startswith("{") or rest.startswith("*"):
+            continue
+        imports.append((["__default__"], m.group(2)))
+    return imports
+
+
+def _parse_imports_py(text: str) -> list[tuple[list[str], str]]:
+    imports: list[tuple[list[str], str]] = []
+    for m in _PY_FROM_IMPORT.finditer(text):
+        module, names_part = m.group(1), m.group(2).strip()
+        if names_part == "*":
+            continue
+        # Strip parentheses for the rare multi-line case
+        names_part = names_part.replace("(", "").replace(")", "")
+        symbols: list[str] = []
+        for piece in names_part.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            if " as " in piece:
+                piece = piece.split(" as ")[0].strip()
+            symbols.append(piece)
+        if symbols:
+            imports.append((symbols, module))
+    return imports
+
+
+def _resolve_target_ts(test_dir: Path, module_spec: str) -> Optional[Path]:
+    if not module_spec.startswith("."):
+        return None  # external dep
+    base = (test_dir / module_spec).resolve()
+    # If the spec already points at an existing file with extension, use it.
+    if base.is_file():
+        return base
+    for ext in (".ts", ".tsx", ".js", ".jsx"):
+        candidate = base.with_suffix(ext)
+        if candidate.exists():
+            return candidate
+    # /index variants for directory-style imports
+    for ext in (".ts", ".tsx"):
+        candidate = base / f"index{ext}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _resolve_target_py(test_dir: Path, module_spec: str) -> Optional[Path]:
+    if not module_spec.startswith("."):
+        return None  # external dep
+    parts = module_spec.lstrip(".").split(".")
+    if not parts or parts == [""]:
+        return None
+    base = test_dir.joinpath(*parts)
+    candidate = base.with_suffix(".py")
+    if candidate.exists():
+        return candidate
+    candidate = base / "__init__.py"
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def _is_exported_ts(text: str, symbol: str) -> bool:
+    if symbol == "__default__":
+        return bool(re.search(r"export\s+default\b", text))
+    s = re.escape(symbol)
+    patterns = [
+        rf"export\s+(?:async\s+)?function\s+{s}\b",
+        rf"export\s+class\s+{s}\b",
+        rf"export\s+const\s+{s}\b",
+        rf"export\s+let\s+{s}\b",
+        rf"export\s+var\s+{s}\b",
+        rf"export\s+type\s+{s}\b",
+        rf"export\s+interface\s+{s}\b",
+        rf"export\s+enum\s+{s}\b",
+        rf"export\s+default\s+(?:async\s+)?function\s+{s}\b",
+        rf"export\s+default\s+class\s+{s}\b",
+        # Named re-export — matches `export { foo }` or `export { foo, bar }`
+        # with or without a trailing `from './path'` clause.
+        rf"export\s*\{{[^}}]*\b{s}\b[^}}]*\}}",
+    ]
+    return any(re.search(p, text) for p in patterns)
+
+
+def _is_exported_py(text: str, symbol: str) -> bool:
+    s = re.escape(symbol)
+    patterns = [
+        rf"^def\s+{s}\b",
+        rf"^async\s+def\s+{s}\b",
+        rf"^class\s+{s}\b",
+        rf"^{s}\s*=",
+    ]
+    if any(re.search(p, text, re.MULTILINE) for p in patterns):
+        return True
+    # __all__ entry
+    return bool(re.search(rf"__all__\s*=\s*\[[^\]]*['\"]{s}['\"]", text))
+
+
+def _h6_fire(test_path: Path, source_path: Optional[Path]):
+    lang = _lang(test_path)
+    if lang not in ("ts", "py"):
+        return False
+    text = _read(test_path)
+    test_dir = test_path.parent
+    if lang == "ts":
+        imports = _parse_imports_ts(text)
+        resolve = _resolve_target_ts
+        is_exported = _is_exported_ts
+    else:
+        imports = _parse_imports_py(text)
+        resolve = _resolve_target_py
+        is_exported = _is_exported_py
+
+    for symbols, module_spec in imports:
+        target = resolve(test_dir, module_spec)
+        if target is None:
+            continue
+        target_text = _read(target)
+        for symbol in symbols:
+            if not is_exported(target_text, symbol):
+                # Return the missing symbol — the registry treats truthy
+                # strings as "fired with this detail."
+                display = "default" if symbol == "__default__" else symbol
+                return display
+    return False
+
+
+HEURISTICS.append({"name": "stale-fixture", "score": 9, "fire": _h6_fire})
 
 
 # ---------------------------------------------------------------------------

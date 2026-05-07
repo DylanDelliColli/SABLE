@@ -393,6 +393,141 @@ def test_h4_python_class_methods_counted():
         assert_eq("h4: counts class methods, skips _private", h4["fire"](test, source), True)
 
 
+# ---------------------------------------------------------------------------
+# rjv.5.3 — Heuristic 6 (stale fixture, score 9)
+# ---------------------------------------------------------------------------
+
+
+def test_h6_fires_on_deleted_ts_export():
+    """TS test imports {processRefund}, source has only processOrder → fires."""
+    h6 = _h("stale-fixture")
+    assert_true("h6 registered", h6 is not None)
+    if h6 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "refund.test.ts"
+        source = tmp / "refund.ts"
+        test.write_text("import { processRefund } from './refund';\nit('x', () => {});\n")
+        source.write_text("export function processOrder() {}\n")
+        result = h6["fire"](test, source)
+        assert_true(
+            "h6: deleted TS export fires (truthy detail)",
+            bool(result),
+            f"got: {result!r}",
+        )
+        assert_in("h6: detail names processRefund", "processRefund", str(result))
+
+
+def test_h6_fires_on_deleted_py_function():
+    """Python test does 'from .refund import process_refund'; module has only process_order → fires."""
+    h6 = _h("stale-fixture")
+    if h6 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "refund_test.py"
+        source = tmp / "refund.py"
+        test.write_text("from .refund import process_refund\n\ndef test_x():\n    assert True\n")
+        source.write_text("def process_order():\n    return 1\n")
+        result = h6["fire"](test, source)
+        assert_true(
+            "h6: deleted Python export fires",
+            bool(result),
+            f"got: {result!r}",
+        )
+        assert_in("h6: detail names process_refund", "process_refund", str(result))
+
+
+def test_h6_does_not_fire_on_valid_ts_export():
+    """TS test imports {processRefund}, source exports processRefund → no fire."""
+    h6 = _h("stale-fixture")
+    if h6 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "refund.test.ts"
+        source = tmp / "refund.ts"
+        test.write_text("import { processRefund } from './refund';\nit('x', () => {});\n")
+        source.write_text("export function processRefund() {}\n")
+        assert_eq("h6: valid TS export skips", bool(h6["fire"](test, source)), False)
+
+
+def test_h6_does_not_fire_on_valid_py_export():
+    """Python test imports process_refund, source defines it → no fire."""
+    h6 = _h("stale-fixture")
+    if h6 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "refund_test.py"
+        source = tmp / "refund.py"
+        test.write_text("from .refund import process_refund\n\ndef test_x():\n    assert True\n")
+        source.write_text("def process_refund():\n    return 1\n")
+        assert_eq("h6: valid Python export skips", bool(h6["fire"](test, source)), False)
+
+
+def test_h6_skips_namespace_import():
+    """`import * as foo from './bar'` is unverifiable; skipped without firing."""
+    h6 = _h("stale-fixture")
+    if h6 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "bar.test.ts"
+        source = tmp / "bar.ts"
+        # bar.ts is empty — namespace import would normally seem stale, but
+        # the heuristic must skip namespace imports entirely.
+        test.write_text("import * as bar from './bar';\nit('x', () => {});\n")
+        source.write_text("\n")
+        assert_eq("h6: namespace import skipped", bool(h6["fire"](test, source)), False)
+
+
+def test_h6_skips_unresolved_target():
+    """Imports from non-relative paths (node_modules / pip) are skipped."""
+    h6 = _h("stale-fixture")
+    if h6 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "comp.test.ts"
+        source = tmp / "comp.ts"
+        # 'react' is non-relative; the heuristic shouldn't try to resolve it.
+        test.write_text("import { useState } from 'react';\nit('x', () => {});\n")
+        source.write_text("export function comp() {}\n")
+        assert_eq("h6: external import skipped", bool(h6["fire"](test, source)), False)
+
+
+def test_h6_handles_default_export():
+    """`import bar from './foo'` + foo.ts has any `export default` → no fire."""
+    h6 = _h("stale-fixture")
+    if h6 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "foo.test.ts"
+        # foo.ts default-exports a function; the local name in the test ('bar')
+        # is the import alias and doesn't need to match the export's actual name.
+        target = tmp / "foo.ts"
+        test.write_text("import bar from './foo';\nit('x', () => {});\n")
+        target.write_text("export default function whatever() {}\n")
+        assert_eq("h6: default import accepts any default export", bool(h6["fire"](test, target)), False)
+
+
+def test_h6_handles_named_reexport():
+    """`export { processRefund } from './inner'` counts as an export of processRefund."""
+    h6 = _h("stale-fixture")
+    if h6 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "refund.test.ts"
+        source = tmp / "refund.ts"
+        test.write_text("import { processRefund } from './refund';\nit('x', () => {});\n")
+        source.write_text("export { processRefund } from './inner';\n")
+        assert_eq("h6: named re-export counts as export", bool(h6["fire"](test, source)), False)
+
+
 def test_v1_integration_surfaces_shallow_skips_deep():
     """End-to-end: synthesize one shallow test/source pair and one deep
     test/source pair; run the prefilter with both heuristics live; assert
@@ -471,6 +606,15 @@ TESTS = [
     test_h4_skips_when_no_source,
     test_h4_python_class_methods_counted,
     test_v1_integration_surfaces_shallow_skips_deep,
+    # rjv.5.3 — heuristic 6 (stale fixture)
+    test_h6_fires_on_deleted_ts_export,
+    test_h6_fires_on_deleted_py_function,
+    test_h6_does_not_fire_on_valid_ts_export,
+    test_h6_does_not_fire_on_valid_py_export,
+    test_h6_skips_namespace_import,
+    test_h6_skips_unresolved_target,
+    test_h6_handles_default_export,
+    test_h6_handles_named_reexport,
 ]
 
 
