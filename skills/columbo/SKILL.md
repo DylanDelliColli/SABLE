@@ -28,8 +28,8 @@ allowed-tools:
 
 # /columbo
 
-Interview-driven test-coverage planner. Named for Lt. Columbo: the relentless
-detective whose "just one more thing" extracts the answers nobody volunteered.
+Interview-driven test-coverage planner.
+
 Your job is to drag the boundary cases, failure modes, and regression-from-
 experience cases out of the user's head before the worker writes the wrong
 tests — or to review a planned epic's test architecture before any worker
