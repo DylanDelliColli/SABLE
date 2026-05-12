@@ -1091,6 +1091,26 @@ Practical guidelines:
 - **Remove lines that duplicate what the code shows.** If the convention is obvious from reading the codebase, documenting it is redundant.
 - **Audit quarterly.** Read every line and ask: is this still true? Is this still necessary? Has a hook replaced this? Remove aggressively.
 
+### 7.4 Companion Planning Skills — Columbo and Gaudi
+
+SABLE-native skills that gate the planning phase of a bead or epic before workers write code. Both are interview-driven, read-only with respect to source, and produce beads (never implementation).
+
+- **`/columbo`** — interview-driven test-coverage planning. Drags boundary cases, failure modes, and regression-from-experience cases out of the user before TDD workers ship happy-path-only suites. Four modes: `--feature` (no bead yet), `--bead <id>` (enrich existing), `--audit <path>` (find shallow tests), `--epic <id>` (gate test architecture of a planned bead tree). Produces `columbo-test-spec` / `columbo-test-gap` beads plus skeleton test files.
+- **`/gaudi`** — interview-driven architecture review. Surfaces named code smells (Fowler catalog) in existing modules, or gates the architectural shape — interface contracts, locked system-design tradeoffs, smell risks — of a planned epic before swarm workers dispatch. **Pedagogical voice**: explains every named concept (smells, tradeoffs, refactoring techniques, vocabulary) in plain language on first use within a session — designed for users with mixed system-design and DS&A experience. v1 modes: `--audit <path>`, `--epic <id>`. Produces `gaudi-arch-gap` beads.
+
+**The two skills are complementary, not redundant.** Columbo plans *what to test*; Gaudi plans *the shape of the code itself*. Recommended workflow for a planned epic:
+
+```
+/gaudi --epic SABLE-xxx    # lock interfaces and named tradeoffs
+/columbo --epic SABLE-xxx  # lock the test contract
+bd swarm validate SABLE-xxx
+# dispatch workers
+```
+
+Both skills append an architecture-review or test-architecture-review summary to the epic's notes, so workers see the locked decisions when claiming a child bead — no re-deriving the design from scratch.
+
+Companion-skill discipline: neither writes source. If they identify a smell or coverage gap that needs fixing, they file a bead; a worker (or the user) executes.
+
 ---
 
 ## 8. Session Management
