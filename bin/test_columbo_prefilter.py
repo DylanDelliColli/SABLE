@@ -211,6 +211,108 @@ def test_file_discovery_no_source():
         assert_eq("discovery_no_source: source is None", source, None)
 
 
+def test_file_discovery_pytest_prefix():
+    """test_<name>.py (pytest convention) is recognized and paired co-located."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "test_foo.py").write_text("# stub\n")
+        (tmp / "foo.py").write_text("# stub\n")
+        pairs = cp.discover(tmp)
+        assert_eq("discovery_pytest_prefix: one pair found", len(pairs), 1)
+        test, source = pairs[0]
+        assert_eq("discovery_pytest_prefix: test path", test.name, "test_foo.py")
+        assert_eq(
+            "discovery_pytest_prefix: source paired",
+            source.name if source else None,
+            "foo.py",
+        )
+
+
+def test_file_discovery_pytest_tests_sibling_dir():
+    """tests/test_foo.py paired with foo.py one directory up (project root)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "tests").mkdir()
+        (tmp / "tests" / "test_foo.py").write_text("# stub\n")
+        (tmp / "foo.py").write_text("# stub\n")
+        pairs = cp.discover(tmp)
+        assert_eq("discovery_pytest_sibling: one pair found", len(pairs), 1)
+        test, source = pairs[0]
+        assert_eq(
+            "discovery_pytest_sibling: source paired across dirs",
+            source.name if source else None,
+            "foo.py",
+        )
+
+
+def test_file_discovery_pytest_tests_to_src_subdir():
+    """tests/test_foo.py paired with src/foo.py (common Python layout)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "tests").mkdir()
+        (tmp / "src").mkdir()
+        (tmp / "tests" / "test_foo.py").write_text("# stub\n")
+        (tmp / "src" / "foo.py").write_text("# stub\n")
+        pairs = cp.discover(tmp)
+        assert_eq("discovery_pytest_to_src: one pair found", len(pairs), 1)
+        test, source = pairs[0]
+        assert_true(
+            "discovery_pytest_to_src: source resolved to src/",
+            source is not None and source.parent.name == "src",
+            f"got {source}",
+        )
+
+
+def test_file_discovery_ts_tests_dir_mirror():
+    """__tests__/lib/foo.test.ts paired with lib/foo.ts (mirror layout)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "__tests__" / "lib").mkdir(parents=True)
+        (tmp / "lib").mkdir()
+        (tmp / "__tests__" / "lib" / "foo.test.ts").write_text("// stub\n")
+        (tmp / "lib" / "foo.ts").write_text("// stub\n")
+        pairs = cp.discover(tmp)
+        assert_eq("discovery_ts_mirror: one pair found", len(pairs), 1)
+        test, source = pairs[0]
+        assert_true(
+            "discovery_ts_mirror: source resolved across __tests__ strip",
+            source is not None and source.name == "foo.ts" and source.parent.name == "lib",
+            f"got {source}",
+        )
+
+
+def test_file_discovery_ts_tests_dir_at_root():
+    """__tests__/foo.test.ts paired with foo.ts one level up."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "__tests__").mkdir()
+        (tmp / "__tests__" / "foo.test.ts").write_text("// stub\n")
+        (tmp / "foo.ts").write_text("// stub\n")
+        pairs = cp.discover(tmp)
+        assert_eq("discovery_ts_at_root: one pair found", len(pairs), 1)
+        test, source = pairs[0]
+        assert_eq(
+            "discovery_ts_at_root: source paired",
+            source.name if source else None,
+            "foo.ts",
+        )
+
+
+def test_file_discovery_skips_node_modules():
+    """Files inside node_modules/.next/.venv/__pycache__ are skipped."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "node_modules" / "pkg").mkdir(parents=True)
+        (tmp / "node_modules" / "pkg" / "foo.test.ts").write_text("// stub\n")
+        (tmp / ".venv" / "lib").mkdir(parents=True)
+        (tmp / ".venv" / "lib" / "test_bar.py").write_text("# stub\n")
+        # Legit one outside skip dirs to confirm discovery still works.
+        (tmp / "ok.test.ts").write_text("// stub\n")
+        pairs = cp.discover(tmp)
+        names = sorted(p[0].name for p in pairs)
+        assert_eq("discovery_skip_dirs: only non-skipped test found", names, ["ok.test.ts"])
+
+
 def test_heuristic_registry():
     """A registered heuristic that fires contributes its score and name to output."""
     @with_heuristics([
@@ -1064,6 +1166,12 @@ TESTS = [
     test_file_discovery_ts,
     test_file_discovery_py,
     test_file_discovery_no_source,
+    test_file_discovery_pytest_prefix,
+    test_file_discovery_pytest_tests_sibling_dir,
+    test_file_discovery_pytest_tests_to_src_subdir,
+    test_file_discovery_ts_tests_dir_mirror,
+    test_file_discovery_ts_tests_dir_at_root,
+    test_file_discovery_skips_node_modules,
     test_heuristic_registry,
     test_max_score_not_sum,
     # rjv.5.2 — heuristics 2 + 4

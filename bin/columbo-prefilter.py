@@ -94,47 +94,137 @@ _TEST_SUFFIX_PAIRS: list[tuple[str, str]] = [
     ("_test.py",  ".py"),
 ]
 
+# Directory names treated as test-only roots. Encountering one in a test
+# file's ancestor chain lets us strip it to find a mirrored source path
+# (e.g. `frontend/__tests__/lib/foo.test.ts` ↔ `frontend/lib/foo.ts`).
+_TEST_DIR_NAMES = frozenset({
+    "__tests__", "__test__", "tests", "test", "spec", "specs", "__specs__",
+})
+
+# Common source-dir conventions to try when stripping a test-dir segment
+# (covers `tests/test_foo.py` ↔ `src/foo.py` and similar). "" means
+# "directly under the project root with no source subdir".
+_SOURCE_DIR_FALLBACKS = ("", "src", "lib", "app", "utils", "internal")
+
+# Skipped during directory walks — keeps `discover()` fast on a project
+# root and prevents false hits in vendored or build-output trees.
+_SKIP_DIRS = frozenset({
+    "node_modules", ".next", ".nuxt", ".svelte-kit", ".turbo",
+    "dist", "build", "out", "target", "coverage",
+    ".venv", "venv", "env",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".git", ".cache", ".tox",
+})
+
 
 def _is_test_file(path: Path) -> Optional[tuple[str, str]]:
-    """Return the (test-suffix, source-suffix) pair that matches path, or None."""
+    """Return (basename, source_suffix) for a test file, else None.
+
+    `basename` is the source-side stem we expect to find — for
+    `foo.test.ts` it's `foo`; for pytest-style `test_foo.py` it's `foo`.
+    """
     name = path.name
     for test_suffix, source_suffix in _TEST_SUFFIX_PAIRS:
         if name.endswith(test_suffix):
-            return (test_suffix, source_suffix)
+            return (name[: -len(test_suffix)], source_suffix)
+    # Pytest convention: test_<name>.py — the dominant Python pattern,
+    # which the suffix-only table missed entirely.
+    if name.startswith("test_") and name.endswith(".py"):
+        base = name[len("test_"): -len(".py")]
+        if base:
+            return (base, ".py")
     return None
 
 
-def _source_for(test_path: Path, suffixes: tuple[str, str]) -> Optional[Path]:
-    """Given a test file and its (test-suffix, source-suffix) pair, return the
-    source file if it exists alongside, else None."""
-    test_suffix, source_suffix = suffixes
-    base = test_path.name[: -len(test_suffix)]
-    candidate = test_path.parent / (base + source_suffix)
-    return candidate if candidate.exists() else None
+def _source_for(test_path: Path, pair: tuple[str, str]) -> Optional[Path]:
+    """Find the source file paired with a test file across the layouts
+    that actually appear in real repos:
+
+      1. Co-located: `<dir>/foo.ts` next to `<dir>/foo.test.ts`.
+      2. `__tests__/` mirror: `<root>/__tests__/lib/foo.test.ts` ↔
+         `<root>/lib/foo.ts` (strip the test-dir segment, keep the rest
+         of the path intact).
+      3. `tests/` sibling dir: `<root>/tests/test_foo.py` ↔
+         `<root>/foo.py`, with fallbacks into `src/`, `lib/`, `utils/`,
+         `app/`, `internal/` (Python repos commonly split tests from
+         source by a top-level dir rather than co-locating).
+
+    Returns the first candidate that exists, or None.
+    """
+    base, source_suffix = pair
+    filename = base + source_suffix
+
+    candidates: list[Path] = [test_path.parent / filename]
+
+    # Walk ancestors looking for the deepest test-dir segment to strip.
+    # Anything below that segment (e.g. `lib/` in `__tests__/lib/`) is
+    # preserved as the mirror suffix on the source side.
+    mirror_suffix_parts: list[str] = []
+    current = test_path.parent
+    while True:
+        if current.name in _TEST_DIR_NAMES:
+            project_root = current.parent
+            for src_dir in _SOURCE_DIR_FALLBACKS:
+                base_dir = project_root / src_dir if src_dir else project_root
+                target_dir = base_dir
+                for p in mirror_suffix_parts:
+                    target_dir = target_dir / p
+                candidates.append(target_dir / filename)
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        mirror_suffix_parts.insert(0, current.name)
+        current = parent
+
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _walk_files(root: Path) -> Iterable[Path]:
+    """Yield files under root, pruning common vendored / build / cache dirs.
+
+    Replaces a naive rglob — passing a project root used to slow-walk
+    `node_modules/`, `.venv/`, etc., which both inflates runtime and
+    surfaces test files from third-party packages that aren't ours.
+    """
+    if root.is_file():
+        yield root
+        return
+    if not root.is_dir():
+        return
+    stack: list[Path] = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            entries = sorted(d.iterdir())
+        except (PermissionError, OSError):
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    if entry.name in _SKIP_DIRS:
+                        continue
+                    stack.append(entry)
+                elif entry.is_file():
+                    yield entry
+            except OSError:
+                continue
 
 
 def discover(path: Path) -> list[tuple[Path, Optional[Path]]]:
-    """Walk path (file, directory, or implicit recursive) and return
-    (test_file, source_file_or_None) pairs.
-
-    - If path is a file: treat as a single candidate.
-    - If path is a directory: walk recursively for test files.
-    """
+    """Walk path (file or directory) and return (test_file, source_or_None)
+    pairs. See `_source_for` for the pairing strategies."""
     pairs: list[tuple[Path, Optional[Path]]] = []
-    if path.is_file():
-        match = _is_test_file(path)
+    for f in _walk_files(path):
+        match = _is_test_file(f)
         if match is not None:
-            pairs.append((path, _source_for(path, match)))
-        return pairs
-
-    # Directory walk
-    if path.is_dir():
-        for f in sorted(path.rglob("*")):
-            if not f.is_file():
-                continue
-            match = _is_test_file(f)
-            if match is not None:
-                pairs.append((f, _source_for(f, match)))
+            pairs.append((f, _source_for(f, match)))
     return pairs
 
 
