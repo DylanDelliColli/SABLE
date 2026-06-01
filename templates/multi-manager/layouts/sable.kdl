@@ -1,0 +1,26 @@
+// SABLE cockpit — Zellij layout
+// Install location: ~/.claude/sable/layouts/sable.kdl
+// Launch with: zellij --layout sable.kdl   (or: sable-cockpit)
+//
+// Two panes side by side: the cockpit session you talk to on the left, the
+// read-only sable-status dashboard on the right. Zellij runs inside whatever
+// terminal you already use (Windows Terminal, etc.) — no emulator swap — and
+// this file is a git-syncable artifact, so the layout travels between machines.
+//
+// The dashboard binary is host-agnostic; only this layout file is host-specific.
+// To move to WezTerm/tmux later, replace just this file.
+
+layout {
+    pane split_direction="vertical" {
+        // Left: the cockpit. Identity is set inline so the SessionStart role
+        // injection + coordination hooks apply. ~60% width.
+        pane size="60%" name="cockpit" {
+            command "bash"
+            args "-c" "CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager claude"
+        }
+        // Right: the live read-only status dashboard. ~40% width.
+        pane size="40%" name="sable-status" {
+            command "sable-status"
+        }
+    }
+}

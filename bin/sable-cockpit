@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# sable-cockpit — launch the cockpit + dashboard in a two-pane Zellij layout.
+#
+# Resolves the installed layout (~/.claude/sable/layouts/sable.kdl), falling
+# back to the in-repo template, then runs `zellij --layout <it>`. If zellij is
+# not installed, prints the manual two-pane workaround instead of failing
+# opaquely.
+#
+# Usage:
+#   sable-cockpit                 launch the Zellij cockpit layout
+#   sable-cockpit --print-layout  print the resolved layout path and exit
+#   sable-cockpit --help
+#
+# Env:
+#   SABLE_COCKPIT_LAYOUT          override the layout file path
+
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+resolve_layout() {
+    if [ -n "${SABLE_COCKPIT_LAYOUT:-}" ]; then
+        printf '%s\n' "$SABLE_COCKPIT_LAYOUT"
+        return
+    fi
+    local installed="$HOME/.claude/sable/layouts/sable.kdl"
+    if [ -f "$installed" ]; then
+        printf '%s\n' "$installed"
+        return
+    fi
+    # In-repo fallback (running from a checkout before install).
+    printf '%s\n' "$(cd "$SCRIPT_DIR/.." && pwd)/templates/multi-manager/layouts/sable.kdl"
+}
+
+usage() {
+    cat <<EOF
+sable-cockpit — launch the cockpit + dashboard Zellij layout.
+
+Usage:
+  sable-cockpit                 Launch the two-pane Zellij cockpit layout
+  sable-cockpit --print-layout  Print the resolved layout path and exit
+  sable-cockpit --help
+
+Env:
+  SABLE_COCKPIT_LAYOUT          Override the layout file path
+EOF
+}
+
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    --print-layout)
+        resolve_layout
+        exit 0
+        ;;
+esac
+
+LAYOUT="$(resolve_layout)"
+
+if ! command -v zellij >/dev/null 2>&1; then
+    {
+        echo "sable-cockpit: zellij is not installed."
+        echo "Install it (https://zellij.dev) for the one-command cockpit, or open two panes manually:"
+        echo "  pane 1:  CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager claude"
+        echo "  pane 2:  sable-status"
+    } >&2
+    exit 1
+fi
+
+if [ ! -f "$LAYOUT" ]; then
+    echo "sable-cockpit: layout not found at $LAYOUT" >&2
+    exit 1
+fi
+
+exec zellij --layout "$LAYOUT"
