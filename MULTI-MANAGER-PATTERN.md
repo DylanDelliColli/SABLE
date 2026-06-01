@@ -91,6 +91,54 @@ sable-agents victor       # single agent + role file path
 
 ---
 
+## The Cockpit (Planning/Execution surface)
+
+The roster above is powerful but operationally heavy — you juggle several
+terminals and track by hand which agents are *filling* the bead pool versus
+*draining* it. The **cockpit** promotes that latent split to a first-class
+surface. See [`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md) for the full rationale;
+the summary:
+
+A single **cockpit** session (Lincoln evolved — `roles/cockpit.md`, registered
+in `agents.yaml` as `type: cockpit`) is the one session you talk to. It runs in
+one of two modes at a time, flipped by the `/plan` and `/execute` skills:
+
+| Mode | Job | Fleet it launches | Interlock blocks |
+|------|-----|-------------------|------------------|
+| **planning** | fill & groom the bead pool | Tier-2 producers (Sherlock/Columbo/Gaudi/Victor) | execution-manager spawns + code `git push` |
+| **execution** | drain the bead pool | Optimus / Tarzan / Chuck | planning-only producer spawns from the cockpit |
+
+The mode is a property of the cockpit session only — **managers always run with
+their hooks live** (they exist only during execution anyway). The mode governs
+what the cockpit may launch and which persona it wears, which avoids a
+planning-cockpit vs draining-manager race.
+
+Mechanics:
+
+- **`bin/sable-mode`** — reads/writes the mode-state file
+  `~/.claude/sable/state/cockpit-mode.json` (`{mode, since, fleet}`). The single
+  source of truth shared by the skills, the interlock, and the dashboard.
+- **`/plan` and `/execute`** (`skills/cockpit-plan`, `skills/cockpit-execute`) —
+  flip the mode and swap the cockpit's persona.
+- **`hooks/multi-manager/cockpit-mode-interlock.sh`** — the mechanical guarantee.
+  A `PreToolUse:Bash` guard that enforces the mode boundary (soft `--force` /
+  `SABLE_COCKPIT_FORCE=1` override). No-ops for non-cockpit and subagent
+  contexts. Registered first in the `Bash` matcher in `settings-snippet.json`.
+- **`bin/sable-status`** — a read-only dashboard for the second pane. Polls the
+  mode-state, the bead pool (`bd ready` / `bd blocked` / label counts), and
+  `claude agents --json`, rendering per-mode rows. `sable-status --once` prints
+  one frame; the default is a live Textual loop.
+- **`bin/sable-cockpit`** + **`templates/multi-manager/layouts/sable.kdl`** — one
+  command opens a two-pane Zellij layout (cockpit | dashboard). Zellij runs
+  inside your existing terminal; the KDL layout is a git-syncable artifact, so
+  the only host-specific file travels with the repo.
+
+The hybrid topology: the cockpit launches agents as **pinned background
+sessions** (identity set at spawn, so hooks + parallelism stay intact) and you
+can attach to any. One surface to you; full multi-agent fidelity underneath.
+
+---
+
 ## Identity & immutability
 
 Each manager launches with an immutable identity established at the OS level, not in conversation context.

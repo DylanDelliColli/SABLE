@@ -8,6 +8,7 @@ Contents:
 - `skills/audit-deep-dive/SKILL.md` — Claude Code skill for converting AUDIT: beads into epic+children
 - `skills/columbo/SKILL.md` + `skills/columbo/columbo-prefilter.py` — Claude Code skill that delivers the Columbo test-coverage planning workflow without requiring the multi-manager registry, role files, agent identity, or coordination hooks. Use this on machines where you want Columbo's interview + skeleton-test output but not the full multi-manager pattern (typical for work computers where you bounce between many repos). Invokable as `/columbo` once installed at `~/.claude/skills/columbo/`.
 - `MULTI-MANAGER-PATTERN.md` — experimental coordination pattern for power-user multi-agent swarms. Eight-agent roster: continuous execution managers (Optimus / Tarzan / Chuck), session-scoped planning agents (Sherlock / Victor / Rudy / Columbo), and execution-session strategist (Lincoln). Companion `hooks/multi-manager/`, `templates/multi-manager/`, `bin/columbo-prefilter.py` (Columbo's audit-mode triage tool), and `bin/sable-agents` reminder helper.
+- `COCKPIT-DESIGN.md` + cockpit tooling — a Planning/Execution UI over the multi-manager roster. One `cockpit` session you talk to; `/plan` fills the bead pool, `/execute` drains it. Companion `bin/sable-mode`, `bin/sable-status` (Textual dashboard), `bin/sable-cockpit`, `skills/cockpit-plan`, `skills/cockpit-execute`, `hooks/multi-manager/cockpit-mode-interlock.sh`, `templates/multi-manager/layouts/sable.kdl`. See install step 4 below.
 
 ## Columbo: skill vs. multi-manager pattern
 
@@ -88,6 +89,53 @@ Files:
 - `bin/columbo-prefilter.py` — static-analysis test-shallowness ranker. Runs before Columbo's interview in audit mode to triage which test files are worth talking about. Six heuristics across TS + Python: happy-path-only, single-case-wonder, mock-saturation, missing-categories, stale-fixture, assertion-density.
 - `templates/sherlock-bead.md` — required template for `sherlock-finding` beads (mechanically enforced by `bead-description-gate.sh`)
 - `templates/columbo-bead.md` — required template for `columbo-test-spec` (forward) and `columbo-test-gap` (audit) beads (mechanically enforced by `bead-description-gate.sh`)
+
+### 4. Cockpit (Planning/Execution UI — extends the Multi-Manager Pattern)
+
+The cockpit is a single operator-facing session over the roster: `/plan` fills
+the bead pool via the Tier-2 producers, `/execute` drains it via the manager
+swarm. It is an extension of the Multi-Manager Pattern (step 3) — install that
+first. Full rationale in [`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md); the surface is
+summarized in `MULTI-MANAGER-PATTERN.md` → "The Cockpit".
+
+Files:
+- `bin/sable-mode` — mode-state read/write helper (shell+jq); single source of truth at `~/.claude/sable/state/cockpit-mode.json`
+- `skills/cockpit-plan/SKILL.md`, `skills/cockpit-execute/SKILL.md` — the `/plan` and `/execute` mode-flip skills
+- `templates/multi-manager/roles/cockpit.md` — cockpit identity (Lincoln evolved + fleet launch)
+- `hooks/multi-manager/cockpit-mode-interlock.sh` — the mode interlock (PreToolUse:Bash)
+- `bin/sable-status` + `bin/test_sable_status.py` — the read-only dashboard (requires `textual`)
+- `bin/sable-cockpit` + `templates/multi-manager/layouts/sable.kdl` — one-command Zellij launch
+
+Install (after the Multi-Manager Pattern is in place):
+
+```bash
+# 1. helpers on PATH (bin/ is already on PATH from step 1)
+chmod +x bin/sable-mode bin/sable-status bin/sable-cockpit
+
+# 2. cockpit role + skills
+cp templates/multi-manager/roles/cockpit.md ~/.claude/sable/roles/cockpit.md
+mkdir -p ~/.claude/skills/plan ~/.claude/skills/execute
+cp skills/cockpit-plan/SKILL.md    ~/.claude/skills/plan/SKILL.md
+cp skills/cockpit-execute/SKILL.md ~/.claude/skills/execute/SKILL.md
+
+# 3. interlock hook — already in templates/multi-manager/settings-snippet.json;
+#    copy the hook alongside the other multi-manager hooks
+cp hooks/multi-manager/cockpit-mode-interlock.sh ~/.claude/hooks/multi-manager/
+
+# 4. dashboard dependency + Zellij layout
+python3 -m pip install textual
+mkdir -p ~/.claude/sable/layouts
+cp templates/multi-manager/layouts/sable.kdl ~/.claude/sable/layouts/sable.kdl
+
+# 5. cockpit launch alias
+echo "alias cockpit='sable-cockpit'" >> ~/.zshrc   # or run sable-cockpit directly
+```
+
+Requirements: `zellij` (https://zellij.dev — runs inside Windows Terminal, no
+emulator swap) and the `textual` Python package. If zellij is absent,
+`sable-cockpit` prints the manual two-pane workaround. Launch with
+`sable-cockpit` (or `zellij --layout ~/.claude/sable/layouts/sable.kdl`), then
+type `/plan` or `/execute` in the cockpit pane.
 
 ## Promotion to `main`
 
