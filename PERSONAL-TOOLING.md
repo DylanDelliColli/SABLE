@@ -99,43 +99,55 @@ first. Full rationale in [`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md); the surface i
 summarized in `MULTI-MANAGER-PATTERN.md` → "The Cockpit".
 
 Files:
-- `bin/sable-mode` — mode-state read/write helper (shell+jq); single source of truth at `~/.claude/sable/state/cockpit-mode.json`
+- `bin/sable-mode` — mode-state read/write helper (python3, no jq); single source of truth at `~/.claude/sable/state/cockpit-mode.json`. Honors the `SABLE_COCKPIT` off-switch.
 - `skills/cockpit-plan/SKILL.md`, `skills/cockpit-execute/SKILL.md` — the `/plan` and `/execute` mode-flip skills
 - `templates/multi-manager/roles/cockpit.md` — cockpit identity (Lincoln evolved + fleet launch)
-- `hooks/multi-manager/cockpit-mode-interlock.sh` — the mode interlock (PreToolUse:Bash)
+- `hooks/multi-manager/cockpit-mode-interlock.sh` — the mode interlock (PreToolUse:Bash); honors `SABLE_COCKPIT=off`
 - `bin/sable-status` + `bin/test_sable_status.py` — the read-only dashboard (requires `textual`)
 - `bin/sable-cockpit` + `templates/multi-manager/layouts/sable.kdl` — one-command Zellij launch
+- `bin/sable-cockpit-install` — the installer (below)
 
-Install (after the Multi-Manager Pattern is in place):
+Install with the installer (do NOT hand-copy):
 
 ```bash
-# 1. helpers on PATH (bin/ is already on PATH from step 1)
-chmod +x bin/sable-mode bin/sable-status bin/sable-cockpit
+# from the repo, install into the CURRENT project's ./.claude (default, contained):
+sable-cockpit-install
 
-# 2. cockpit role + skills
-cp templates/multi-manager/roles/cockpit.md ~/.claude/sable/roles/cockpit.md
-mkdir -p ~/.claude/skills/plan ~/.claude/skills/execute
-cp skills/cockpit-plan/SKILL.md    ~/.claude/skills/plan/SKILL.md
-cp skills/cockpit-execute/SKILL.md ~/.claude/skills/execute/SKILL.md
+# or install globally into ~/.claude for use everywhere:
+sable-cockpit-install --user
 
-# 3. interlock hook — already in templates/multi-manager/settings-snippet.json;
-#    copy the hook alongside the other multi-manager hooks
-cp hooks/multi-manager/cockpit-mode-interlock.sh ~/.claude/hooks/multi-manager/
-
-# 4. dashboard dependency + Zellij layout
-python3 -m pip install textual
-mkdir -p ~/.claude/sable/layouts
-cp templates/multi-manager/layouts/sable.kdl ~/.claude/sable/layouts/sable.kdl
-
-# 5. cockpit launch alias
-echo "alias cockpit='sable-cockpit'" >> ~/.zshrc   # or run sable-cockpit directly
+# undo, same scope:
+sable-cockpit-install --uninstall            # project
+sable-cockpit-install --user --uninstall     # global
 ```
 
+The installer copies the skills, role, layout, and interlock hook into the chosen
+scope and registers the interlock idempotently (project scope writes the
+uncommitted `.claude/settings.local.json`; `--user` writes `~/.claude/settings.json`,
+backed up first and JSON-validated). It warns if `textual` or the Multi-Manager
+base is missing.
+
+**Scope.** Default is **project** (`./.claude`) so the machinery stays contained
+to the repos where you want it and is trivially removable. `--user` opts into a
+global install. Project-scoped skills/layout are discovered when you launch the
+cockpit from that repo.
+
+**Off-switch (no uninstall needed).** Export `SABLE_COCKPIT=off` (also `0`,
+`false`, `no`) to disable at runtime — `sable-mode` refuses to flip mode and the
+interlock no-ops. Unset to re-enable. The interlock is already self-gating (it
+only acts in a `CLAUDE_AGENT_NAME=cockpit` session), so it never touches your
+normal sessions regardless.
+
 Requirements: `zellij` (https://zellij.dev — runs inside Windows Terminal, no
-emulator swap) and the `textual` Python package. If zellij is absent,
-`sable-cockpit` prints the manual two-pane workaround. Launch with
-`sable-cockpit` (or `zellij --layout ~/.claude/sable/layouts/sable.kdl`), then
-type `/plan` or `/execute` in the cockpit pane.
+emulator swap) and the `textual` Python package (`python3 -m pip install textual`).
+If zellij is absent, `sable-cockpit` prints the manual two-pane workaround. After
+installing, **restart the session** (skills + hooks load at startup), then launch
+with `sable-cockpit` and type `/plan` or `/execute` in the cockpit pane.
+
+Note: cockpit identity injection (the role) and the interlock only fire when the
+**Multi-Manager base** (step 3) is installed — its SessionStart role-anchor hook
+is what injects `roles/cockpit.md`. `/plan` and `/execute` themselves work without
+the base (they only call `sable-mode` + carry persona guidance).
 
 ## Promotion to `main`
 

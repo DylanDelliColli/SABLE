@@ -115,6 +115,13 @@ if is_deny "$out_unset"; then fail "no-op when agent name unset" "got deny"; els
 clear_mode
 assert_allow "no mode set allows everything" 'CLAUDE_AGENT_NAME=optimus claude'
 
+# ---------- runtime enable gate (SABLE_COCKPIT) ----------
+# In planning mode a manager spawn would normally be denied; with the cockpit
+# disabled the interlock must no-op entirely (SABLE-cav.7).
+set_mode planning
+out_disabled="$(printf '%s' '{"tool_input":{"command":"CLAUDE_AGENT_NAME=optimus claude"}}' | SABLE_COCKPIT=off bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_disabled"; then fail "SABLE_COCKPIT=off no-ops the interlock" "got deny"; else pass "SABLE_COCKPIT=off no-ops the interlock"; fi
+
 # ---------- settings-snippet registration ----------
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 if jq -e . "$SNIPPET" >/dev/null 2>&1; then pass "settings-snippet.json is valid JSON"; else fail "settings-snippet.json is valid JSON"; fi

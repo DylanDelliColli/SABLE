@@ -59,9 +59,19 @@ if [ -n "$resolved" ] && [ -f "$resolved" ]; then pass "helper resolves an exist
 resolved_override="$(SABLE_COCKPIT_LAYOUT="$LAYOUT" "$HELPER" --print-layout 2>/dev/null)"
 if [ "$resolved_override" = "$LAYOUT" ]; then pass "helper honors SABLE_COCKPIT_LAYOUT override"; else fail "helper honors SABLE_COCKPIT_LAYOUT override" "got '$resolved_override'"; fi
 
-# no-zellij fallback: zellij is absent here, so a bare launch must explain the
-# manual two-pane workaround and exit nonzero (not crash).
-out="$("$HELPER" 2>&1)"; rc=$?
+# project-scoped layout (./.claude) takes priority when present
+TMPPROJ="$(mktemp -d)"
+mkdir -p "$TMPPROJ/.claude/sable/layouts"
+cp "$LAYOUT" "$TMPPROJ/.claude/sable/layouts/sable.kdl"
+resolved_proj="$(cd "$TMPPROJ" && "$HELPER" --print-layout 2>/dev/null)"
+if [ "$resolved_proj" = "$TMPPROJ/.claude/sable/layouts/sable.kdl" ]; then pass "helper prefers project-scoped layout"; else fail "helper prefers project-scoped layout" "got '$resolved_proj'"; fi
+rm -rf "$TMPPROJ"
+
+# no-zellij fallback: force a zellij-free PATH (keep coreutils in /usr/bin:/bin,
+# drop the conda/cargo bin where zellij lives) so this is deterministic whether
+# or not zellij is installed. A bare launch must explain the manual two-pane
+# workaround and exit nonzero (not crash).
+out="$(PATH=/usr/bin:/bin bash "$HELPER" 2>&1)"; rc=$?
 if [ "$rc" -ne 0 ]; then pass "bare launch without zellij exits nonzero"; else fail "bare launch without zellij exits nonzero"; fi
 printf '%s' "$out" | grep -qi 'zellij' && printf '%s' "$out" | grep -qi 'sable-status' \
   && pass "no-zellij message gives the manual fallback" \

@@ -26,6 +26,11 @@ set -uo pipefail
 # Only the cockpit session is governed.
 [ "${CLAUDE_AGENT_NAME:-}" = "cockpit" ] || exit 0
 
+# Runtime enable gate — no-op when the cockpit is disabled (SABLE-cav.7).
+case "$(printf '%s' "${SABLE_COCKPIT:-}" | tr '[:upper:]' '[:lower:]')" in
+    off|0|false|no) exit 0 ;;
+esac
+
 INPUT="$(cat)"
 
 # Subagent context — never govern dispatched workers.
@@ -60,7 +65,7 @@ MODE=""
 if [ -x "$MODE_BIN" ]; then
   MODE="$("$MODE_BIN" get 2>/dev/null || true)"
 elif [ -f "$STATE" ]; then
-  MODE="$(jq -r '.mode // empty' "$STATE" 2>/dev/null || true)"
+  MODE="$(STATE="$STATE" python3 -c "import json,os; print(json.load(open(os.environ['STATE'])).get('mode','') or '')" 2>/dev/null || true)"
 fi
 [ -z "$MODE" ] && exit 0
 

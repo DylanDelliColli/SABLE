@@ -55,6 +55,9 @@ fresh_state() {
   export SABLE_COCKPIT_STATE
 }
 
+# JSON field reader (python3 — keeps the test jq-free, matching sable-mode; SABLE-cav.8)
+jget() { python3 -c "import json,sys; print(json.load(sys.stdin)$1)"; }
+
 # ---------- set + get round-trip ----------
 
 fresh_state
@@ -70,15 +73,15 @@ assert_eq "set execution then get" "execution" "$("$MODE_BIN" get 2>/dev/null)"
 fresh_state
 "$MODE_BIN" set planning --fleet sherlock,columbo >/dev/null 2>&1
 SHOW="$("$MODE_BIN" show 2>/dev/null)"
-assert_eq "show mode after --fleet"  "planning" "$(printf '%s' "$SHOW" | jq -r '.mode')"
-assert_eq "fleet[0]"                 "sherlock" "$(printf '%s' "$SHOW" | jq -r '.fleet[0]')"
-assert_eq "fleet[1]"                 "columbo"  "$(printf '%s' "$SHOW" | jq -r '.fleet[1]')"
+assert_eq "show mode after --fleet"  "planning" "$(printf '%s' "$SHOW" | jget "['mode']")"
+assert_eq "fleet[0]"                 "sherlock" "$(printf '%s' "$SHOW" | jget "['fleet'][0]")"
+assert_eq "fleet[1]"                 "columbo"  "$(printf '%s' "$SHOW" | jget "['fleet'][1]")"
 
 # ---------- since timestamp present ----------
 
 fresh_state
 "$MODE_BIN" set execution >/dev/null 2>&1
-SINCE="$("$MODE_BIN" show 2>/dev/null | jq -r '.since')"
+SINCE="$("$MODE_BIN" show 2>/dev/null | jget ".get('since','')")"
 if [ -n "$SINCE" ] && [ "$SINCE" != "null" ]; then
   pass "since timestamp is non-empty"
 else
@@ -116,6 +119,31 @@ fresh_state
 "$MODE_BIN" set planning >/dev/null 2>&1
 "$MODE_BIN" set execution >/dev/null 2>&1
 assert_eq "second set overwrites first" "execution" "$("$MODE_BIN" get 2>/dev/null)"
+
+# ---------- runtime env gate (SABLE_COCKPIT) ----------
+# Disabled: `set` refuses (so /plan /execute can't flip mode) and writes nothing.
+fresh_state
+SABLE_COCKPIT=off "$MODE_BIN" set planning >/dev/null 2>&1
+assert_nonzero "set refused when SABLE_COCKPIT=off" "$?"
+if [ ! -f "$SABLE_COCKPIT_STATE" ]; then pass "disabled set writes nothing"; else fail "disabled set writes nothing" "file created"; fi
+
+fresh_state
+SABLE_COCKPIT=0 "$MODE_BIN" set execution >/dev/null 2>&1
+assert_nonzero "set refused when SABLE_COCKPIT=0" "$?"
+
+fresh_state
+SABLE_COCKPIT=FALSE "$MODE_BIN" set planning >/dev/null 2>&1
+assert_nonzero "gate is case-insensitive (FALSE)" "$?"
+
+# Reading is never gated — get/show still work when disabled.
+fresh_state
+"$MODE_BIN" set planning >/dev/null 2>&1
+assert_eq "get works when disabled" "planning" "$(SABLE_COCKPIT=off "$MODE_BIN" get 2>/dev/null)"
+
+# A non-disabling value still allows set.
+fresh_state
+SABLE_COCKPIT=on "$MODE_BIN" set execution >/dev/null 2>&1
+assert_eq "set allowed when SABLE_COCKPIT=on" "execution" "$("$MODE_BIN" get 2>/dev/null)"
 
 # ---------- Summary ----------
 

@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# sable-cockpit-install — install (or uninstall) the cockpit layer.
+#
+# Default scope is PROJECT: everything lands in ./.claude (skills, role, layout,
+# interlock hook) and the hook is registered in ./.claude/settings.local.json
+# (uncommitted) — contained to this repo and trivially removable. Pass --user to
+# install globally into ~/.claude instead.
+#
+# Turn the cockpit off at runtime WITHOUT uninstalling: export SABLE_COCKPIT=off
+# (honored mechanically by sable-mode and the interlock hook).
+#
+# Usage:
+#   sable-cockpit-install [--project|--user] [--uninstall] [--help]
+#
+# Env (mainly for tests):
+#   SABLE_PROJECT_DIR   project root for --project scope (default: $PWD)
+#   CLAUDE_USER_DIR     user config dir for --user scope (default: ~/.claude)
+
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+SCOPE="project"
+UNINSTALL=0
+for arg in "${@:-}"; do
+    case "$arg" in
+        --project)   SCOPE="project" ;;
+        --user)      SCOPE="user" ;;
+        --uninstall) UNINSTALL=1 ;;
+        -h|--help)   usage; exit 0 ;;
+        "")          ;;
+        *)           echo "sable-cockpit-install: unknown argument '$arg'" >&2; exit 1 ;;
+    esac
+done
+
+if [ "$SCOPE" = "user" ]; then
+    BASE="${CLAUDE_USER_DIR:-$HOME/.claude}"
+    SETTINGS="$BASE/settings.json"
+else
+    PROJECT="${SABLE_PROJECT_DIR:-$PWD}"
+    BASE="$PROJECT/.claude"
+    SETTINGS="$BASE/settings.local.json"
+fi
+SKILLS="$BASE/skills"
+HOOK_DEST="$BASE/hooks/multi-manager/cockpit-mode-interlock.sh"
+HOOK_CMD="bash $HOOK_DEST"
+
+# Settings merge: add the interlock to a PreToolUse:Bash block exactly once.
+# Backs up, validates JSON before writing, never clobbers existing hooks.
+add_interlock() {
+    SETTINGS_PATH="$1" HOOK_CMD="$2" python3 - <<'PY'
+import json, os, shutil
+path = os.environ['SETTINGS_PATH']; cmd = os.environ['HOOK_CMD']
+data = {}
+if os.path.exists(path):
+    shutil.copy(path, path + '.bak')
+    try:
+        with open(path) as f: data = json.load(f)
+    except Exception:
+        data = {}
+hooks = data.setdefault('hooks', {})
+pre = hooks.get('PreToolUse')
+if not isinstance(pre, list):
+    pre = hooks['PreToolUse'] = []
+blk = next((b for b in pre if isinstance(b, dict) and b.get('matcher') == 'Bash'), None)
+if blk is None:
+    blk = {'matcher': 'Bash', 'hooks': []}; pre.append(blk)
+hl = blk.setdefault('hooks', [])
+if not any('cockpit-mode-interlock.sh' in (h.get('command', '') if isinstance(h, dict) else '') for h in hl):
+    hl.insert(0, {'type': 'command', 'command': cmd, 'timeout': 3000})
+out = json.dumps(data, indent=2); json.loads(out)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, 'w') as f: f.write(out + '\n')
+PY
+}
+
+remove_interlock() {
+    SETTINGS_PATH="$1" python3 - <<'PY'
+import json, os
+path = os.environ['SETTINGS_PATH']
+if not os.path.exists(path):
+    raise SystemExit
+try:
+    with open(path) as f: data = json.load(f)
+except Exception:
+    raise SystemExit
+for b in data.get('hooks', {}).get('PreToolUse', []):
+    if isinstance(b, dict) and isinstance(b.get('hooks'), list):
+        b['hooks'] = [h for h in b['hooks']
+                      if 'cockpit-mode-interlock.sh' not in (h.get('command', '') if isinstance(h, dict) else '')]
+out = json.dumps(data, indent=2); json.loads(out)
+with open(path, 'w') as f: f.write(out + '\n')
+PY
+}
+
+if [ "$UNINSTALL" = "1" ]; then
+    rm -rf "$SKILLS/plan" "$SKILLS/execute"
+    rm -f "$BASE/sable/roles/cockpit.md" "$BASE/sable/layouts/sable.kdl" "$HOOK_DEST"
+    remove_interlock "$SETTINGS"
+    echo "Cockpit uninstalled from $BASE (scope: $SCOPE)."
+    echo "  (left other hooks and the settings file intact)"
+    exit 0
+fi
+
+# Install.
+mkdir -p "$SKILLS/plan" "$SKILLS/execute" "$BASE/sable/roles" "$BASE/sable/layouts" "$BASE/hooks/multi-manager"
+cp "$REPO/skills/cockpit-plan/SKILL.md"                      "$SKILLS/plan/SKILL.md"
+cp "$REPO/skills/cockpit-execute/SKILL.md"                   "$SKILLS/execute/SKILL.md"
+cp "$REPO/templates/multi-manager/roles/cockpit.md"         "$BASE/sable/roles/cockpit.md"
+cp "$REPO/templates/multi-manager/layouts/sable.kdl"        "$BASE/sable/layouts/sable.kdl"
+cp "$REPO/hooks/multi-manager/cockpit-mode-interlock.sh"    "$HOOK_DEST"
+chmod +x "$HOOK_DEST"
+add_interlock "$SETTINGS" "$HOOK_CMD"
+
+# Dependency + base checks (warn, don't fail).
+python3 -c "import textual" 2>/dev/null || \
+    echo "WARN: python package 'textual' not importable by $(command -v python3) — run: python3 -m pip install textual" >&2
+[ -f "${CLAUDE_USER_DIR:-$HOME/.claude}/sable/agents.yaml" ] || {
+    echo "WARN: multi-manager base not installed (~/.claude/sable/agents.yaml missing)." >&2
+    echo "      /plan and /execute will work, but cockpit identity injection and the" >&2
+    echo "      interlock only fire once the Multi-Manager Pattern is installed" >&2
+    echo "      (see MULTI-MANAGER-PATTERN.md Setup)." >&2
+}
+
+echo "Cockpit installed to $BASE (scope: $SCOPE)."
+echo "  • /plan and /execute become available after you restart the session."
+echo "  • Launch the cockpit:  sable-cockpit"
+echo "  • Disable anytime without uninstalling:  export SABLE_COCKPIT=off"
+echo "  • Uninstall:  sable-cockpit-install --$SCOPE --uninstall"

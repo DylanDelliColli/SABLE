@@ -23,6 +23,12 @@ resolve_layout() {
         printf '%s\n' "$SABLE_COCKPIT_LAYOUT"
         return
     fi
+    # Project-scoped install (./.claude) takes priority over the user-global one.
+    local project="$PWD/.claude/sable/layouts/sable.kdl"
+    if [ -f "$project" ]; then
+        printf '%s\n' "$project"
+        return
+    fi
     local installed="$HOME/.claude/sable/layouts/sable.kdl"
     if [ -f "$installed" ]; then
         printf '%s\n' "$installed"

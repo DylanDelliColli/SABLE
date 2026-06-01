@@ -21,3 +21,11 @@ __pycache__/
 .dolt/
 *.db
 .beads-credential-key
+
+# Cockpit install artifacts (project-scoped sable-cockpit-install output —
+# installed copies of repo sources under skills/, templates/, hooks/; not source)
+.claude/settings.local.json
+.claude/skills/plan/
+.claude/skills/execute/
+.claude/sable/
+.claude/hooks/multi-manager/cockpit-mode-interlock.sh
