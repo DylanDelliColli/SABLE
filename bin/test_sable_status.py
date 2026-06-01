@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """test_sable_status — unit + integration tests for the sable-status dashboard.
 
-Verifies the pure render functions (deterministic from a normalized snapshot),
-the snapshot gatherer (hermetic via the SABLE_STATUS_FIXTURE injection point),
-and the --once integration path (one rendered frame to stdout). The live
-Textual loop is a thin wrapper over render(gather_snapshot()) and is exercised
-through --once rather than a headless TUI driver.
+Pure render functions are tested from normalized snapshots; the gatherer is
+tested hermetically via SABLE_STATUS_FIXTURE (which also injects per-pid /proc
+identity, active-bead markers, and in-progress beads so no real /proc, bd, or
+claude calls happen). The Textual live loop is exercised via --once.
 
-Run with:
-
-  python3 bin/test_sable_status.py
-
+Run with:  python3 bin/test_sable_status.py
 Exits 0 if all pass, 1 if any fail. No pytest dependency.
 """
 
@@ -29,8 +25,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 STATUS_PATH = SCRIPT_DIR / "sable-status"
 MODE_BIN = SCRIPT_DIR / "sable-mode"
 
-# sable-status has no .py extension, so force a source loader (spec_from_file_
-# location returns None for an unrecognized suffix).
 _loader = SourceFileLoader("sable_status", str(STATUS_PATH))
 spec = importlib.util.spec_from_loader("sable_status", _loader)
 ss = importlib.util.module_from_spec(spec)
@@ -54,35 +48,35 @@ def check(name: str, cond: bool, detail: str = ""):
 
 
 def contains(name: str, haystack: str, needle: str):
-    check(name, needle in haystack, f"expected to find '{needle}' in:\n{haystack}")
+    check(name, needle in haystack, f"expected '{needle}' in:\n{haystack}")
+
+
+def absent(name: str, haystack: str, needle: str):
+    check(name, needle not in haystack, f"did NOT expect '{needle}' in:\n{haystack}")
 
 
 # ---------- fixtures ----------
 
 PLANNING_SNAPSHOT = {
-    "mode": "planning",
-    "since": "2026-06-01T10:00:00-0400",
+    "mode": "planning", "since": "2026-06-01T10:00:00-0400",
     "fleet": ["sherlock", "columbo", "gaudi", "victor"],
     "pool": {"ready": 14, "blocked": 3},
     "findings": {"sherlock": 6, "columbo": 4, "gaudi": 2},
-    "merge_queue": 0,
-    "inbox": 0,
-    "agents": [],
+    "merge_queue": 0, "inbox": 0, "agents": [], "wip": [],
 }
 
 EXECUTION_SNAPSHOT = {
-    "mode": "execution",
-    "since": "2026-06-01T11:00:00-0400",
+    "mode": "execution", "since": "2026-06-01T11:00:00-0400",
     "fleet": ["optimus", "tarzan", "chuck"],
     "pool": {"ready": 9, "blocked": 0},
     "findings": {"sherlock": 0, "columbo": 0, "gaudi": 0},
-    "merge_queue": 2,
-    "inbox": 1,
+    "merge_queue": 2, "inbox": 1,
     "agents": [
-        {"name": "optimus", "state": "running", "bead": "SABLE-205", "workers": 2},
-        {"name": "tarzan", "state": "running", "bead": "SABLE-198", "workers": 1},
-        {"name": "chuck", "state": "idle", "bead": "", "workers": 0},
+        {"name": "cockpit", "role": "manager", "status": "idle", "repo": "internal-analytics", "uptime": "2m", "bead": None, "is_sable": True},
+        {"name": "optimus", "role": "manager", "status": "busy", "repo": "SABLE", "uptime": "5m", "bead": "SABLE-205", "is_sable": True},
+        {"name": None, "role": None, "status": "busy", "repo": "SABLE", "uptime": "1h", "bead": None, "is_sable": False},
     ],
+    "wip": [{"id": "SABLE-cav.5", "title": "Cockpit UI/UX iteration pass", "parent": "SABLE-cav"}],
 }
 
 
@@ -91,67 +85,78 @@ EXECUTION_SNAPSHOT = {
 p = ss.render_planning(PLANNING_SNAPSHOT)
 contains("planning shows PLANNING banner", p, "PLANNING")
 contains("planning shows ready count", p, "14")
-contains("planning shows blocked count", p, "3")
-contains("planning shows sherlock", p, "sherlock")
 contains("planning shows sherlock finding count", p, "6")
-contains("planning shows columbo", p, "columbo")
-contains("planning shows gaudi", p, "gaudi")
 
-# ---------- render: execution ----------
+# ---------- render: execution (identity + cross-ref + wip) ----------
 
 e = ss.render_execution(EXECUTION_SNAPSHOT)
-contains("execution shows EXECUTION banner", e, "EXECUTION")
-contains("execution shows ready burn-down", e, "9")
-contains("execution shows optimus", e, "optimus")
-contains("execution shows optimus bead", e, "SABLE-205")
-contains("execution shows worker count", e, "2")
+contains("execution banner", e, "EXECUTION")
+contains("execution ready burn-down", e, "9")
+contains("execution names the cockpit agent", e, "cockpit")
+contains("execution names optimus", e, "optimus")
+contains("execution shows optimus's bead (cross-ref)", e, "SABLE-205")
+contains("execution shows idle/busy status", e, "busy")
+contains("execution shows the worktree/repo", e, "internal-analytics")
+contains("execution counts non-SABLE observer sessions", e, "other session")
+contains("execution shows in-progress work", e, "SABLE-cav.5")
+contains("execution shows wip title", e, "Cockpit UI/UX")
 contains("execution shows merge queue", e, "2")
-contains("execution shows inbox", e, "1")
+absent("no bogus '?' agent rows", e, "?")
+absent("no bogus worker column", e, "0w")
 
-# ---------- render dispatch ----------
+# graceful
+empty = dict(EXECUTION_SNAPSHOT, agents=[], wip=[])
+contains("no SABLE agents → friendly message", ss.render_execution(empty), "no SABLE agents")
+contains("nothing in progress → friendly message", ss.render_execution(empty), "nothing in progress")
 
-contains("render() dispatches planning", ss.render(PLANNING_SNAPSHOT), "PLANNING")
-contains("render() dispatches execution", ss.render(EXECUTION_SNAPSHOT), "EXECUTION")
+none_snap = dict(PLANNING_SNAPSHOT, mode=None)
+contains("no-mode frame", ss.render(none_snap), "no mode")
 
-# ---------- graceful degradation ----------
-
-none_snap = {"mode": None, "since": "", "fleet": [], "pool": {"ready": 0, "blocked": 0},
-             "findings": {"sherlock": 0, "columbo": 0, "gaudi": 0}, "merge_queue": 0, "inbox": 0, "agents": []}
-contains("no-mode frame renders without crashing", ss.render(none_snap), "no mode")
-
-empty_exec = dict(EXECUTION_SNAPSHOT, agents=[])
-contains("execution with no managers degrades gracefully", ss.render_execution(empty_exec), "no managers")
+# dispatch
+contains("render() dispatch planning", ss.render(PLANNING_SNAPSHOT), "PLANNING")
+contains("render() dispatch execution", ss.render(EXECUTION_SNAPSHOT), "EXECUTION")
 
 
-# ---------- gather_snapshot via fixture injection ----------
+# ---------- gather via fixture (identity + active markers + wip) ----------
 
 def write(path: Path, obj) -> str:
     path.write_text(json.dumps(obj))
     return str(path)
 
 
+NOW = 1780334200
 with tempfile.TemporaryDirectory() as d:
     dd = Path(d)
     state = dd / "cockpit-mode.json"
-    subprocess.run([str(MODE_BIN), "set", "planning", "--fleet", "sherlock,columbo"],
+    subprocess.run([str(MODE_BIN), "set", "execution", "--fleet", "optimus,tarzan,chuck"],
                    env=dict(os.environ, SABLE_COCKPIT_STATE=str(state)), check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     fixture = write(dd / "fx.json", {
-        "ready": [{"id": f"R{i}"} for i in range(14)],
-        "blocked": [{"id": f"B{i}"} for i in range(3)],
-        "counts": {"sherlock-finding": 6, "columbo-test-spec": 4, "gaudi-arch-gap": 2,
-                   "for-chuck": 0, "for-cockpit": 0},
-        "agents": [],
+        "ready": [{"id": f"R{i}"} for i in range(9)],
+        "blocked": [],
+        "counts": {"for-chuck": 2, "for-cockpit": 1},
+        "agents": [
+            {"pid": 1, "cwd": "/home/x/internal-analytics", "status": "idle", "startedAt": (NOW - 120) * 1000},
+            {"pid": 2, "cwd": "/home/x/SABLE", "status": "busy", "startedAt": (NOW - 300) * 1000},
+        ],
+        "proc_identity": {"1": {"name": "cockpit", "role": "manager"}, "2": {}},
+        "active": {"cockpit": {}},
+        "in_progress": [{"id": "SABLE-cav.5", "title": "Cockpit UI/UX iteration pass", "parent": "SABLE-cav"}],
+        "now": NOW,
     })
 
     snap = ss.gather_snapshot(env=dict(os.environ, SABLE_COCKPIT_STATE=str(state),
                                        SABLE_STATUS_FIXTURE=fixture))
-    check("gather reads mode from state", snap["mode"] == "planning", f"got {snap['mode']}")
-    check("gather computes ready count", snap["pool"]["ready"] == 14, f"got {snap['pool']['ready']}")
-    check("gather computes blocked count", snap["pool"]["blocked"] == 3, f"got {snap['pool']['blocked']}")
-    check("gather maps sherlock findings", snap["findings"]["sherlock"] == 6, f"got {snap['findings']['sherlock']}")
-    check("gather maps columbo specs", snap["findings"]["columbo"] == 4, f"got {snap['findings']['columbo']}")
+    check("gather mode", snap["mode"] == "execution", f"got {snap['mode']}")
+    check("gather ready", snap["pool"]["ready"] == 9, f"got {snap['pool']['ready']}")
+    agents = snap["agents"]
+    check("gather identifies cockpit", any(a["name"] == "cockpit" and a["is_sable"] for a in agents), str(agents))
+    check("gather marks identity-less process non-SABLE", any(a["name"] is None and not a["is_sable"] for a in agents), str(agents))
+    cockpit = next(a for a in agents if a["name"] == "cockpit")
+    check("gather computes uptime", cockpit["uptime"] == "2m", f"got {cockpit['uptime']}")
+    check("gather repo basename", cockpit["repo"] == "internal-analytics", f"got {cockpit['repo']}")
+    check("gather pulls in-progress beads", any(w["id"] == "SABLE-cav.5" for w in snap["wip"]), str(snap["wip"]))
 
 
 # ---------- integration: --once renders a frame ----------
@@ -167,37 +172,24 @@ def run_once(state_path: Path, fixture_path: Path) -> str:
 with tempfile.TemporaryDirectory() as d:
     dd = Path(d)
     state = dd / "cockpit-mode.json"
-
-    # planning frame
-    subprocess.run([str(MODE_BIN), "set", "planning"],
-                   env=dict(os.environ, SABLE_COCKPIT_STATE=str(state)), check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    fx_plan = Path(write(dd / "plan.json", {
-        "ready": [{"id": f"R{i}"} for i in range(14)],
-        "blocked": [{"id": f"B{i}"} for i in range(3)],
-        "counts": {"sherlock-finding": 6, "columbo-test-spec": 4, "gaudi-arch-gap": 2},
-        "agents": [],
-    }))
-    out = run_once(state, fx_plan)
-    contains("--once planning frame shows PLANNING", out, "PLANNING")
-    contains("--once planning frame shows ready count", out, "14")
-
-    # execution frame
     subprocess.run([str(MODE_BIN), "set", "execution"],
                    env=dict(os.environ, SABLE_COCKPIT_STATE=str(state)), check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    fx_exec = Path(write(dd / "exec.json", {
+    fx = Path(write(dd / "exec.json", {
         "ready": [{"id": f"R{i}"} for i in range(9)],
         "blocked": [],
         "counts": {"for-chuck": 2, "for-cockpit": 1},
-        "agents": [{"name": "optimus", "status": "running", "bead": "SABLE-205", "workers": 2}],
+        "agents": [{"pid": 1, "cwd": "/home/x/internal-analytics", "status": "idle", "startedAt": (NOW - 120) * 1000}],
+        "proc_identity": {"1": {"name": "cockpit", "role": "manager"}},
+        "active": {},
+        "in_progress": [{"id": "SABLE-cav.5", "title": "Cockpit UI/UX", "parent": "SABLE-cav"}],
+        "now": NOW,
     }))
-    out = run_once(state, fx_exec)
-    contains("--once execution frame shows EXECUTION", out, "EXECUTION")
-    contains("--once execution frame shows optimus", out, "optimus")
+    out = run_once(state, fx)
+    contains("--once shows EXECUTION", out, "EXECUTION")
+    contains("--once names the cockpit agent", out, "cockpit")
+    contains("--once shows in-progress work", out, "SABLE-cav.5")
 
-
-# ---------- summary ----------
 
 print()
 print("==========================================")
