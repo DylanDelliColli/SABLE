@@ -144,10 +144,12 @@ If zellij is absent, `sable-cockpit` prints the manual two-pane workaround. Afte
 installing, **restart the session** (skills + hooks load at startup), then launch
 with `sable-cockpit` and type `/plan` or `/execute` in the cockpit pane.
 
-Note: cockpit identity injection (the role) and the interlock only fire when the
-**Multi-Manager base** (step 3) is installed — its SessionStart role-anchor hook
-is what injects `roles/cockpit.md`. `/plan` and `/execute` themselves work without
-the base (they only call `sable-mode` + carry persona guidance).
+Note: `/plan`, `/execute`, the dashboard, and the interlock all work without the
+**Multi-Manager base** — the installer registers the interlock in your scope's
+settings and it self-gates to `CLAUDE_AGENT_NAME=cockpit` sessions. The base adds
+only **automatic identity injection** (its SessionStart role-anchor hook auto-loads
+`roles/cockpit.md` so the session knows it is the cockpit) plus the full manager
+swarm. Install it (step 3) only if you want those.
 
 ## Promotion to `main`
 

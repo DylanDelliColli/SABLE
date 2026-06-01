@@ -121,10 +121,11 @@ add_interlock "$SETTINGS" "$HOOK_CMD"
 python3 -c "import textual" 2>/dev/null || \
     echo "WARN: python package 'textual' not importable by $(command -v python3) — run: python3 -m pip install textual" >&2
 [ -f "${CLAUDE_USER_DIR:-$HOME/.claude}/sable/agents.yaml" ] || {
-    echo "WARN: multi-manager base not installed (~/.claude/sable/agents.yaml missing)." >&2
-    echo "      /plan and /execute will work, but cockpit identity injection and the" >&2
-    echo "      interlock only fire once the Multi-Manager Pattern is installed" >&2
-    echo "      (see MULTI-MANAGER-PATTERN.md Setup)." >&2
+    echo "NOTE: multi-manager base not installed (~/.claude/sable/agents.yaml missing)." >&2
+    echo "      /plan, /execute, the dashboard, and the interlock all work without it." >&2
+    echo "      The base adds only AUTOMATIC cockpit identity injection (auto-loading" >&2
+    echo "      roles/cockpit.md at session start) plus the full manager swarm." >&2
+    echo "      See MULTI-MANAGER-PATTERN.md Setup if you want it." >&2
 }
 
 echo "Cockpit installed to $BASE (scope: $SCOPE)."
