@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# sable-mode — read/write the cockpit mode-state file.
+#
+# Single source of truth for which mode the cockpit session is in. Written by
+# the /plan and /execute skills; read by the mode interlock hook
+# (cockpit-mode-interlock.sh) and the sable-status dashboard. Dependency-free
+# beyond `jq`, matching the other shell helpers in bin/.
+#
+# State file (override with SABLE_COCKPIT_STATE for testing):
+#   ~/.claude/sable/state/cockpit-mode.json
+# Shape:
+#   { "mode": "planning|execution", "since": "<ISO-8601>", "fleet": ["a","b"] }
+#
+# Usage:
+#   sable-mode set <planning|execution> [--fleet a,b,c]
+#   sable-mode get                 # print the bare mode word (nonzero if unset)
+#   sable-mode show                # print the full JSON (nonzero if unset)
+#   sable-mode --help
+
+set -eu
+
+STATE="${SABLE_COCKPIT_STATE:-$HOME/.claude/sable/state/cockpit-mode.json}"
+
+usage() {
+    cat <<EOF
+sable-mode — read/write the cockpit mode-state file.
+
+Usage:
+  sable-mode set <planning|execution> [--fleet a,b,c]
+      Write the mode-state file. --fleet is a comma-separated list of the
+      agents launched for this mode (recorded for the dashboard).
+  sable-mode get      Print the current mode word; nonzero exit if unset.
+  sable-mode show     Print the full mode-state JSON; nonzero exit if unset.
+  sable-mode --help
+
+State file: ${STATE}
+  (override location with the SABLE_COCKPIT_STATE environment variable)
+EOF
+}
+
+require_state() {
+    if [ ! -f "$STATE" ]; then
+        printf 'sable-mode: no mode set (no state file at %s)\n' "$STATE" >&2
+        exit 1
+    fi
+}
+
+cmd="${1:-}"
+case "$cmd" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    get)
+        require_state
+        jq -r '.mode' "$STATE"
+        ;;
+    show)
+        require_state
+        cat "$STATE"
+        ;;
+    set)
+        mode="${2:-}"
+        case "$mode" in
+            planning|execution) ;;
+            *)
+                printf "sable-mode: invalid mode '%s' (must be planning or execution)\n" "$mode" >&2
+                exit 2
+                ;;
+        esac
+
+        # Consume the verb + mode, then scan for --fleet.
+        shift 2 || true
+        fleet_csv=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --fleet)    fleet_csv="${2:-}"; shift 2 || shift ;;
+                --fleet=*)  fleet_csv="${1#--fleet=}"; shift ;;
+                *)          shift ;;
+            esac
+        done
+
+        if [ -n "$fleet_csv" ]; then
+            fleet_json="$(printf '%s' "$fleet_csv" | jq -R 'split(",")')"
+        else
+            fleet_json='[]'
+        fi
+
+        since="$(date +%Y-%m-%dT%H:%M:%S%z)"
+        mkdir -p "$(dirname "$STATE")"
+        jq -n --arg mode "$mode" --arg since "$since" --argjson fleet "$fleet_json" \
+            '{mode: $mode, since: $since, fleet: $fleet}' > "$STATE"
+        ;;
+    ""|*)
+        usage
+        exit 1
+        ;;
+esac

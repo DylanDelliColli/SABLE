@@ -147,4 +147,26 @@ agents:
       - victor    # planning-session agent, user invokes
       - rudy      # planning-session agent, user invokes
 
+  # The cockpit. A single named session the operator talks to, sitting over
+  # the whole roster. /plan and /execute (skills/cockpit-plan, cockpit-execute)
+  # flip its mode via bin/sable-mode; the mode-state file then governs what the
+  # cockpit may launch (the cockpit-mode-interlock.sh hook) and what the
+  # sable-status dashboard emphasizes. In planning mode it directs the Tier-2
+  # producers (Sherlock/Columbo/Gaudi/Victor) to fill the bead pool; in
+  # execution mode it launches Optimus/Tarzan/Chuck as pinned background
+  # sessions and oversees them. Unlike Lincoln (a pure peer interlocutor), the
+  # cockpit is allowed to launch fleets — that is its defining new
+  # responsibility. See COCKPIT-DESIGN.md and roles/cockpit.md.
+  cockpit:
+    type: cockpit
+    scope: "Single operator-facing session over the roster; /plan fills the bead pool via Tier-2 producers, /execute drains it via the manager swarm"
+    claim_filter: null         # doesn't claim — it directs and oversees
+    inbox_label: for-cockpit   # operator direction + escalations from launched agents
+    role_prompt: roles/cockpit.md
+    dispatches_workers: true   # read-only Explore for status; launches fleets as background sessions
+    cross_inbox_read: true     # must see every agent's plate to oversee both modes
+    idle_polling: "/loop 5m /inbox"
+    files_addressed_beads: true      # may file for-X coord/direction beads
+    launches_fleets: true            # the new responsibility vs Lincoln: mode-aware fleet launch
+
 # Add new agents here using the same shape.
