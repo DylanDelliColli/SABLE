@@ -94,15 +94,19 @@ Files:
 
 The cockpit is a single operator-facing session over the roster: `/plan` fills
 the bead pool via the Tier-2 producers, `/execute` drains it via the manager
-swarm. It is an extension of the Multi-Manager Pattern (step 3) — install that
-first. Full rationale in [`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md); the surface is
-summarized in `MULTI-MANAGER-PATTERN.md` → "The Cockpit".
+swarm. The installer is **self-sufficient** — it installs its own registry
+(`agents.yaml`) and identity injection, so cockpit identity works standalone;
+the full *running* manager swarm (step 3) is optional. Full rationale in
+[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md); the surface is summarized in
+`MULTI-MANAGER-PATTERN.md` → "The Cockpit".
 
 Files:
 - `bin/sable-mode` — mode-state read/write helper (python3, no jq); single source of truth at `~/.claude/sable/state/cockpit-mode.json`. Honors the `SABLE_COCKPIT` off-switch.
 - `skills/cockpit-plan/SKILL.md`, `skills/cockpit-execute/SKILL.md` — the `/plan` and `/execute` mode-flip skills
 - `templates/multi-manager/roles/cockpit.md` — cockpit identity (Lincoln evolved + fleet launch)
+- `templates/multi-manager/agents.yaml` — the agent registry / source of truth (the cockpit is registered here)
 - `hooks/multi-manager/cockpit-mode-interlock.sh` — the mode interlock (PreToolUse:Bash); honors `SABLE_COCKPIT=off`
+- `hooks/multi-manager/session-role-anchor.sh` — identity injection (SessionStart+PreCompact); resolves the role project-first then user
 - `bin/sable-status` + `bin/test_sable_status.py` — the read-only dashboard (requires `textual`)
 - `bin/sable-cockpit` + `templates/multi-manager/layouts/sable.kdl` — one-command Zellij launch
 - `bin/sable-cockpit-install` — the installer (below)
@@ -121,11 +125,13 @@ sable-cockpit-install --uninstall            # project
 sable-cockpit-install --user --uninstall     # global
 ```
 
-The installer copies the skills, role, layout, and interlock hook into the chosen
-scope and registers the interlock idempotently (project scope writes the
+The installer copies the skills, role, layout, **registry (`agents.yaml`)**, the
+interlock hook, and the **identity hook (`session-role-anchor`)** into the chosen
+scope, and registers the hooks idempotently — the interlock on `PreToolUse:Bash`
+and identity injection on `SessionStart`+`PreCompact` (project scope writes the
 uncommitted `.claude/settings.local.json`; `--user` writes `~/.claude/settings.json`,
-backed up first and JSON-validated). It warns if `textual` or the Multi-Manager
-base is missing.
+backed up first and JSON-validated, never clobbering existing hooks). It warns
+only if `textual` is missing.
 
 **Scope.** Default is **project** (`./.claude`) so the machinery stays contained
 to the repos where you want it and is trivially removable. `--user` opts into a
@@ -144,12 +150,13 @@ If zellij is absent, `sable-cockpit` prints the manual two-pane workaround. Afte
 installing, **restart the session** (skills + hooks load at startup), then launch
 with `sable-cockpit` and type `/plan` or `/execute` in the cockpit pane.
 
-Note: `/plan`, `/execute`, the dashboard, and the interlock all work without the
-**Multi-Manager base** — the installer registers the interlock in your scope's
-settings and it self-gates to `CLAUDE_AGENT_NAME=cockpit` sessions. The base adds
-only **automatic identity injection** (its SessionStart role-anchor hook auto-loads
-`roles/cockpit.md` so the session knows it is the cockpit) plus the full manager
-swarm. Install it (step 3) only if you want those.
+Note: the installer is self-sufficient — `/plan`, `/execute`, the dashboard, the
+interlock, **and identity injection** (the cockpit session auto-adopts
+`roles/cockpit.md` at startup via the `session-role-anchor` hook it installs) all
+work from the cockpit install alone. The only thing the **full Multi-Manager
+Pattern** (step 3) adds on top is the *running* manager swarm — Optimus / Tarzan /
+Chuck as live sessions plus their continuous coordination hooks (inbox, claim,
+overlap, preempt, pre-push). Install that only when you want the swarm.
 
 ## Promotion to `main`
 

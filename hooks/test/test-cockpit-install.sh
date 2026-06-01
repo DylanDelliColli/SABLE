@@ -26,6 +26,14 @@ import json,sys
 d=json.load(open(sys.argv[1]))
 print(sum(1 for b in d.get('hooks',{}).get('PreToolUse',[]) if isinstance(b,dict)
           for h in b.get('hooks',[]) if 'cockpit-mode-interlock.sh' in h.get('command','')))" "$1" 2>/dev/null || echo ERR; }
+count_in_event(){ python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1])); ev=sys.argv[2]; m=sys.argv[3]
+print(sum(1 for b in d.get('hooks',{}).get(ev,[]) if isinstance(b,dict) for h in b.get('hooks',[]) if m in h.get('command','')))" "$1" "$2" "$3" 2>/dev/null || echo ERR; }
+count_marker(){ python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1])); m=sys.argv[2]
+print(sum(1 for blocks in d.get('hooks',{}).values() if isinstance(blocks,list) for b in blocks if isinstance(b,dict) for h in b.get('hooks',[]) if m in h.get('command','')))" "$1" "$2" 2>/dev/null || echo ERR; }
 valid_json(){ python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$1" 2>/dev/null; }
 
 # ---------- project scope (explicit) ----------
@@ -40,7 +48,10 @@ SET="$P/.claude/settings.local.json"
 exists "$SET" "project: settings.local.json created"
 if valid_json "$SET"; then pass "project: settings is valid JSON"; else fail "project: settings is valid JSON"; fi
 if [ "$(count_interlock "$SET")" = "1" ]; then pass "project: interlock registered once"; else fail "project: interlock registered once" "count=$(count_interlock "$SET")"; fi
-if printf '%s' "$out1" | grep -qi 'multi-manager base'; then pass "project: warns when base missing"; else fail "project: warns when base missing"; fi
+exists "$P/.claude/sable/agents.yaml" "project: registry (agents.yaml) installed"
+if [ -x "$P/.claude/hooks/multi-manager/session-role-anchor.sh" ]; then pass "project: identity hook installed+exec"; else fail "project: identity hook installed+exec"; fi
+if [ "$(count_in_event "$SET" SessionStart session-role-anchor.sh)" = "1" ]; then pass "project: identity hook registered SessionStart"; else fail "project: identity hook registered SessionStart" "count=$(count_in_event "$SET" SessionStart session-role-anchor.sh)"; fi
+if [ "$(count_in_event "$SET" PreCompact session-role-anchor.sh)" = "1" ]; then pass "project: identity hook registered PreCompact"; else fail "project: identity hook registered PreCompact"; fi
 
 # idempotent re-run
 SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project >/dev/null 2>&1
@@ -72,7 +83,9 @@ if [ "$(count_interlock "$U/.claude/settings.json")" = "1" ]; then pass "user: i
 # ---------- uninstall (project) ----------
 SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --uninstall >/dev/null 2>&1
 if [ ! -e "$P/.claude/skills/plan/SKILL.md" ]; then pass "uninstall removes skills"; else fail "uninstall removes skills"; fi
+if [ ! -e "$P/.claude/sable/agents.yaml" ]; then pass "uninstall removes registry"; else fail "uninstall removes registry"; fi
 if [ "$(count_interlock "$SET")" = "0" ]; then pass "uninstall de-registers interlock"; else fail "uninstall de-registers interlock" "count=$(count_interlock "$SET")"; fi
+if [ "$(count_marker "$SET" session-role-anchor.sh)" = "0" ]; then pass "uninstall de-registers identity hook"; else fail "uninstall de-registers identity hook" "count=$(count_marker "$SET" session-role-anchor.sh)"; fi
 if grep -q 'other-hook.sh' "$SET"; then pass "uninstall keeps unrelated hooks"; else fail "uninstall keeps unrelated hooks"; fi
 
 rm -rf "$P" "$P2" "$U"

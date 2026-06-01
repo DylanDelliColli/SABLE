@@ -14,8 +14,14 @@ set -euo pipefail
 [ -z "${CLAUDE_AGENT_NAME:-}" ] && exit 0
 [ "${CLAUDE_AGENT_ROLE:-}" != "manager" ] && exit 0
 
-ROLE_FILE="$HOME/.claude/sable/roles/${CLAUDE_AGENT_NAME}.md"
-[ ! -f "$ROLE_FILE" ] && exit 0
+# Resolve the role PROJECT-FIRST (a project-scoped cockpit install lives in
+# ./.claude) then fall back to the user-level install (~/.claude).
+ROLE_FILE=""
+for _cand in "$PWD/.claude/sable/roles/${CLAUDE_AGENT_NAME}.md" \
+             "$HOME/.claude/sable/roles/${CLAUDE_AGENT_NAME}.md"; do
+    if [ -f "$_cand" ]; then ROLE_FILE="$_cand"; break; fi
+done
+[ -z "$ROLE_FILE" ] && exit 0
 
 ROLE_CONTENT=$(cat "$ROLE_FILE")
 
