@@ -79,13 +79,20 @@ for s in specs:
     ev = hooks.get(s['event'])
     if not isinstance(ev, list):
         ev = hooks[s['event']] = []
+    marker = s['command'].rsplit('/', 1)[-1]   # script basename
+    # Idempotency: skip if this hook is already registered in ANY block of the
+    # event, not just the first same-matcher one. An event can hold several blocks
+    # with the same matcher (e.g. '' for both `bd prime` and session-role-anchor),
+    # so a block-local check would double-register (SABLE-md7).
+    if any(marker in (h.get('command', '') if isinstance(h, dict) else '')
+           for b in ev if isinstance(b, dict)
+           for h in b.get('hooks', [])):
+        continue
     blk = next((b for b in ev if isinstance(b, dict) and b.get('matcher', '') == s['matcher']), None)
     if blk is None:
         blk = {'matcher': s['matcher'], 'hooks': []}; ev.append(blk)
     hl = blk.setdefault('hooks', [])
-    marker = s['command'].rsplit('/', 1)[-1]   # script basename
-    if not any(marker in (h.get('command', '') if isinstance(h, dict) else '') for h in hl):
-        hl.insert(0, {'type': 'command', 'command': s['command'], 'timeout': 3000})
+    hl.insert(0, {'type': 'command', 'command': s['command'], 'timeout': 3000})
 out = json.dumps(data, indent=2); json.loads(out)
 os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path, 'w') as f: f.write(out + '\n')

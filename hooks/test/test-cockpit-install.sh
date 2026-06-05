@@ -88,7 +88,62 @@ if [ "$(count_interlock "$SET")" = "0" ]; then pass "uninstall de-registers inte
 if [ "$(count_marker "$SET" session-role-anchor.sh)" = "0" ]; then pass "uninstall de-registers identity hook"; else fail "uninstall de-registers identity hook" "count=$(count_marker "$SET" session-role-anchor.sh)"; fi
 if grep -q 'other-hook.sh' "$SET"; then pass "uninstall keeps unrelated hooks"; else fail "uninstall keeps unrelated hooks"; fi
 
-rm -rf "$P" "$P2" "$U"
+# ---------- SABLE-md7: idempotent across sibling same-matcher blocks ----------
+# Repro: an event already has TWO matcher='' blocks — one for `bd prime`, one for
+# session-role-anchor. The installer must detect the existing registration in the
+# sibling block and NOT add a second one. (Buggy add_hooks only checked the first
+# same-matcher block, so it double-registered session-role-anchor.)
+
+seed_sibling_blocks(){ python3 - "$1" <<'PY'
+import json, sys
+seed = {
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "bash ~/.claude/hooks/tdd-gate.sh", "timeout": 5000}]}
+    ],
+    "SessionStart": [
+      {"matcher": "", "hooks": [
+        {"type": "command", "command": "bd prime 2>/dev/null || true"}]},
+      {"matcher": "", "hooks": [
+        {"type": "command", "command": "bash ~/.claude/hooks/multi-manager/session-role-anchor.sh", "timeout": 3000}]}
+    ],
+    "PreCompact": [
+      {"matcher": "", "hooks": [
+        {"type": "command", "command": "bd prime 2>/dev/null || true"}]},
+      {"matcher": "", "hooks": [
+        {"type": "command", "command": "bash ~/.claude/hooks/multi-manager/session-role-anchor.sh", "timeout": 3000}]}
+    ]
+  }
+}
+open(sys.argv[1], 'w').write(json.dumps(seed, indent=2))
+PY
+}
+
+# Unit: add_hooks stays idempotent across sibling same-matcher blocks (SessionStart only,
+# run the real installer twice — count must remain 1).
+PU="$(mktemp -d)"; mkdir -p "$PU/.claude"
+seed_sibling_blocks "$PU/.claude/settings.json"
+CLAUDE_USER_DIR="$PU/.claude" bash "$INSTALLER" --user >/dev/null 2>&1
+CLAUDE_USER_DIR="$PU/.claude" bash "$INSTALLER" --user >/dev/null 2>&1
+PUSET="$PU/.claude/settings.json"
+if [ "$(count_in_event "$PUSET" SessionStart session-role-anchor.sh)" = "1" ]; then pass "md7: sibling-block dedup keeps identity hook once (SessionStart)"; else fail "md7: sibling-block dedup keeps identity hook once (SessionStart)" "count=$(count_in_event "$PUSET" SessionStart session-role-anchor.sh)"; fi
+if valid_json "$PUSET"; then pass "md7: settings valid after sibling-block dedup"; else fail "md7: settings valid after sibling-block dedup"; fi
+
+# Integration: real `sable-cockpit-install --user` over a realistic pre-seeded
+# multi-manager user scope leaves exactly one identity registration per event and
+# one interlock, and preserves the bd prime entries.
+M="$(mktemp -d)"; mkdir -p "$M/.claude"
+seed_sibling_blocks "$M/.claude/settings.json"
+CLAUDE_USER_DIR="$M/.claude" bash "$INSTALLER" --user >/dev/null 2>&1
+MSET="$M/.claude/settings.json"
+if [ "$(count_in_event "$MSET" SessionStart session-role-anchor.sh)" = "1" ]; then pass "md7: multi-manager re-install — identity once (SessionStart)"; else fail "md7: multi-manager re-install — identity once (SessionStart)" "count=$(count_in_event "$MSET" SessionStart session-role-anchor.sh)"; fi
+if [ "$(count_in_event "$MSET" PreCompact session-role-anchor.sh)" = "1" ]; then pass "md7: multi-manager re-install — identity once (PreCompact)"; else fail "md7: multi-manager re-install — identity once (PreCompact)" "count=$(count_in_event "$MSET" PreCompact session-role-anchor.sh)"; fi
+if [ "$(count_interlock "$MSET")" = "1" ]; then pass "md7: multi-manager re-install — interlock once"; else fail "md7: multi-manager re-install — interlock once" "count=$(count_interlock "$MSET")"; fi
+if [ "$(count_marker "$MSET" 'bd prime')" = "2" ]; then pass "md7: multi-manager re-install — bd prime preserved"; else fail "md7: multi-manager re-install — bd prime preserved" "count=$(count_marker "$MSET" 'bd prime')"; fi
+if valid_json "$MSET"; then pass "md7: settings valid after multi-manager re-install"; else fail "md7: settings valid after multi-manager re-install"; fi
+
+rm -rf "$P" "$P2" "$U" "$PU" "$M"
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
