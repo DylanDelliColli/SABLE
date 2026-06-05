@@ -18,6 +18,7 @@ The standard Fresh Agent Test is the floor; this template is the ceiling.
 - `sherlock:verbosity`      — overlong module/function/configuration that obscures intent
 - `sherlock:dead-code`      — unreachable, unreferenced, gated by a removed flag
 - `sherlock:test-gap`       — missing or weak coverage of a documented behavior
+- `sherlock:research`       — (greenfield `--research` mode) prior art, domain pitfalls, unknowns to de-risk before architecture
 
 ## Rationale
 Why is this bad? What does it cost (correctness, performance, readability,
@@ -35,6 +36,11 @@ For EACH location involved in this finding, provide all of:
 
 Repeat the block per file/site. If the finding spans many sites, list at
 least the 3 most representative; note the total count.
+
+**Greenfield `sherlock:research` exception:** there is no repo yet, so Evidence
+cites **sources** instead — for each: the source (URL / title), the claim it
+supports, and why it matters to this design. Fingerprint/symbol/anchor do not
+apply.
 
 ## Proposed approach
 What should be done? Concrete enough that a worker can execute without

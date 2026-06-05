@@ -66,13 +66,19 @@ draining manager.
 
 ## The two modes
 
-### Planning Mode — fill the pool
-- Cockpit wears the planning persona: brainstorm → backlog, runs the
-  design-to-beads workflow, grooms deps.
-- Launches Tier-2 producers as background sessions (kept as-is — no rewrite to
-  workflows in v1).
-- Interlock blocks execution-manager spawn + code `git push`.
-- Dashboard emphasizes: pool growing, findings per producer, dep graph forming.
+### Planning Mode — fill the pool (staged, human-in-the-loop)
+- Cockpit walks the **gated substage machine**: FRAMING (cockpit, Lincoln
+  strategist hat, live) → RESEARCH (Sherlock greenfield) → ARCHITECTURE (Gaudi
+  `--epic`) → TEST-STRATEGY (Columbo `--epic`) → DECOMPOSITION (cockpit +
+  Victor). The human signs off before each `sable-mode substage advance`.
+- Launches Tier-2 producers as background sessions for the research / architecture
+  / test-strategy stages.
+- Interlock blocks execution-manager spawn, code `git push`, and backlog
+  population (`bd create --parent`/`--graph`/`--file`) until
+  `substage=decomposition` — the bare epic shell is allowed early as the
+  producers' planning home.
+- Dashboard emphasizes: current substage, pool growing, findings per producer,
+  dep graph forming.
 
 ### Execution Mode — drain the pool
 - Cockpit wears the overseer/strategist persona (Lincoln's original job):

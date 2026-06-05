@@ -105,7 +105,7 @@ one of two modes at a time, flipped by the `/plan` and `/execute` skills:
 
 | Mode | Job | Fleet it launches | Interlock blocks |
 |------|-----|-------------------|------------------|
-| **planning** | fill & groom the bead pool | Tier-2 producers (Sherlock/Columbo/Gaudi/Victor) | execution-manager spawns + code `git push` |
+| **planning** | fill & groom the pool via the staged substages (FRAMING → RESEARCH → ARCHITECTURE → TEST-STRATEGY → DECOMPOSITION) | Tier-2 producers (Sherlock/Columbo/Gaudi/Victor) | execution-manager spawns, code `git push`, and backlog population (`bd create --parent`/`--graph`/`--file`) until `substage=decomposition` |
 | **execution** | drain the bead pool | Optimus / Tarzan / Chuck | planning-only producer spawns from the cockpit |
 
 The mode is a property of the cockpit session only — **managers always run with
@@ -113,11 +113,22 @@ their hooks live** (they exist only during execution anyway). The mode governs
 what the cockpit may launch and which persona it wears, which avoids a
 planning-cockpit vs draining-manager race.
 
+**Planning is staged, not a single step.** Planning mode is a gated substage
+state machine — FRAMING (cockpit, Lincoln strategist hat, live) → RESEARCH
+(Sherlock greenfield) → ARCHITECTURE (Gaudi `--epic`) → TEST-STRATEGY (Columbo
+`--epic`) → DECOMPOSITION (cockpit + Victor) — and the human signs off before
+each `sable-mode substage advance`. The interlock blocks the cockpit from
+populating the implementation backlog until `substage=decomposition`, so a
+half-formed plan can't reach execution; the bare epic shell is created early as
+the planning home Gaudi/Columbo `--epic` attach their locked review to. See
+[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md) and the `/plan` skill.
+
 Mechanics:
 
 - **`bin/sable-mode`** — reads/writes the mode-state file
-  `~/.claude/sable/state/cockpit-mode.json` (`{mode, since, fleet}`). The single
-  source of truth shared by the skills, the interlock, and the dashboard.
+  `~/.claude/sable/state/cockpit-mode.json` (`{mode, since, fleet, substage}`).
+  The single source of truth shared by the skills, the interlock, and the
+  dashboard. `sable-mode substage get|set|advance` walks the planning substages.
 - **`/plan` and `/execute`** (`skills/cockpit-plan`, `skills/cockpit-execute`) —
   flip the mode and swap the cockpit's persona.
 - **`hooks/multi-manager/cockpit-mode-interlock.sh`** — the mechanical guarantee.

@@ -87,6 +87,44 @@ assert_allow "planning --force allows manager" 'CLAUDE_AGENT_NAME=optimus claude
 out_env="$(printf '%s' '{"tool_input":{"command":"CLAUDE_AGENT_NAME=optimus claude"}}' | SABLE_COCKPIT_FORCE=1 bash "$HOOK" 2>/dev/null)"
 if is_deny "$out_env"; then fail "planning SABLE_COCKPIT_FORCE=1 allows manager" "got deny"; else pass "planning SABLE_COCKPIT_FORCE=1 allows manager"; fi
 
+# ---------- PLANNING substage gate (backlog population) ----------
+# The cockpit may stand up the BARE epic shell early (planning home for
+# producers / the framing artifact), but cannot POPULATE the implementation
+# backlog — --parent children, or --graph / --file batches — until substage ==
+# decomposition. Plain artifact-bead creates the upstream stages need stay
+# allowed throughout.
+set_substage() { "$MODE_BIN" substage set "$1" >/dev/null 2>&1; }
+
+set_mode planning   # re-initializes substage=framing
+
+assert_allow "framing allows bare epic shell"    'bd create --type=epic --title="x"'
+assert_allow "framing allows bare epic (-t)"     'bd create -t epic --title="x"'
+assert_deny  "framing blocks graph create"       'bd create --graph /tmp/plan.json --description "see nodes"'
+assert_deny  "framing blocks file create"        'bd create --file /tmp/beads.md'
+assert_deny  "framing blocks child (--parent)"   'bd create --type=task --parent=SABLE-ni8 --title="x"'
+assert_allow "framing allows plain task create"  'bd create --type=task --title="framing note" --description="src/foo.py; test spec"'
+assert_allow "framing allows non-create bd"      'bd update SABLE-x --claim'
+
+set_substage research
+assert_deny  "research blocks child create"      'bd create --type=task --parent=SABLE-ni8 --title="x"'
+set_substage architecture
+assert_deny  "architecture blocks graph create"  'bd create --graph /tmp/plan.json'
+set_substage test-strategy
+assert_deny  "test-strategy blocks file create"  'bd create --file /tmp/beads.md'
+
+set_substage decomposition
+assert_allow "decomposition allows child create" 'bd create --type=task --parent=SABLE-ni8 --title="x"'
+assert_allow "decomposition allows graph create" 'bd create --graph /tmp/plan.json'
+assert_allow "decomposition allows file create"  'bd create --file /tmp/beads.md'
+
+# soft override regardless of substage (use a gated shape — bare epic is always allowed)
+set_mode planning   # back to framing
+assert_allow "framing --force allows child create" 'bd create --type=task --parent=SABLE-ni8 --title="x" --force'
+
+# not the cockpit → no-op even on a gated child-create in framing
+out_nc="$(printf '%s' '{"tool_input":{"command":"bd create --type=task --parent=SABLE-ni8 --title=x"}}' | CLAUDE_AGENT_NAME=sherlock bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_nc"; then fail "framing child-create no-op when not cockpit" "got deny"; else pass "framing child-create no-op when not cockpit"; fi
+
 # ---------- EXECUTION mode ----------
 set_mode execution
 

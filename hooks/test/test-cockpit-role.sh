@@ -27,6 +27,13 @@ assert_grep "$ROLE" "sable-mode"     "role reads mode via sable-mode"
 assert_grep "$ROLE" "background"     "role launches agents as background sessions"
 assert_grep "$ROLE" "interlock"      "role references the mode interlock"
 
+# staged-planning substages + the Lincoln/FRAMING front door
+assert_grep "$ROLE" "substage" "role describes the planning substage machine"
+for s in framing research architecture test-strategy decomposition; do
+  assert_grep "$ROLE" "$s" "role names substage: $s"
+done
+assert_grep "$ROLE" "Lincoln strategist hat" "role frames FRAMING as the Lincoln strategist hat"
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

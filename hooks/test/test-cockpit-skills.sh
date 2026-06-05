@@ -51,6 +51,10 @@ assert_grep "$PLAN_SKILL" "producer"  "/plan references the Tier-2 producers"
 assert_grep "$EXEC_SKILL" "execution" "/execute loads the execution persona"
 assert_grep "$EXEC_SKILL" "oversee"   "/execute references overseeing the managers"
 
+# /execute documents the soft handoff-readiness gate (substage + open-questions)
+assert_grep "$EXEC_SKILL" "open-question" "/execute documents the open-questions handoff gate"
+assert_grep "$EXEC_SKILL" "substage"      "/execute checks the planning substage before handoff"
+
 # 5. end-to-end mechanism: the documented command flips state correctly
 STATE_TMP="$(mktemp -u)"
 SABLE_COCKPIT_STATE="$STATE_TMP" "$MODE_BIN" set planning --fleet sherlock,columbo,gaudi,victor >/dev/null 2>&1
@@ -61,6 +65,30 @@ SABLE_COCKPIT_STATE="$STATE_TMP" "$MODE_BIN" set execution --fleet optimus,tarza
 assert_exec="$(SABLE_COCKPIT_STATE="$STATE_TMP" "$MODE_BIN" get 2>/dev/null)"
 if [ "$assert_exec" = "execution" ]; then pass "documented /execute mechanism yields mode=execution"; else fail "documented /execute mechanism yields mode=execution" "got '$assert_exec'"; fi
 rm -f "$STATE_TMP"
+
+# 6. staged-planning substages: all five present, named in canonical order
+for s in framing research architecture test-strategy decomposition; do
+  assert_grep "$PLAN_SKILL" "$s" "/plan names substage: $s"
+done
+order_ok="$(PLAN_SKILL="$PLAN_SKILL" python3 -c "
+import os
+text = open(os.environ['PLAN_SKILL']).read().lower()
+stages = ['framing','research','architecture','test-strategy','decomposition']
+pos = [text.find(s) for s in stages]
+print('ok' if all(p >= 0 for p in pos) and pos == sorted(pos) else 'no')
+" 2>/dev/null)"
+if [ "$order_ok" = "ok" ]; then pass "/plan lists substages in canonical order"; else fail "/plan lists substages in canonical order" "got '$order_ok'"; fi
+
+# 7. wired to the substage machine + the interlock backlog gate
+assert_grep "$PLAN_SKILL" "sable-mode substage advance" "/plan advances substages via sable-mode"
+assert_grep "$PLAN_SKILL" "interlock"                    "/plan references the interlock backlog gate"
+
+# 8. end-to-end: documented step-1 command initializes substage=framing
+STATE_TMP2="$(mktemp -u)"
+SABLE_COCKPIT_STATE="$STATE_TMP2" "$MODE_BIN" set planning --fleet sherlock,columbo,gaudi,victor >/dev/null 2>&1
+init_sub="$(SABLE_COCKPIT_STATE="$STATE_TMP2" "$MODE_BIN" substage get 2>/dev/null)"
+if [ "$init_sub" = "framing" ]; then pass "documented /plan step 1 initializes substage=framing"; else fail "documented /plan step 1 initializes substage=framing" "got '$init_sub'"; fi
+rm -f "$STATE_TMP2"
 
 echo
 echo "=========================================="

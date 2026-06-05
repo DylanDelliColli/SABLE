@@ -94,6 +94,29 @@ launches() {
   return 1
 }
 
+# Detect an attempt to populate the implementation backlog via bd create. The
+# BARE epic shell (bd create --type=epic) is intentionally allowed early — it is
+# the planning home that producers (gaudi/columbo --epic) attach their gating
+# review to, and it holds the framing artifact. What is gated is populating it:
+# --parent (implementation children), and --graph / --file (batch backlog).
+# Plain artifact-bead creates (findings, test specs, framing/question beads) the
+# upstream substages produce are NOT blocked either.
+authors_backlog() {
+  printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])bd[[:space:]]+create([[:space:]]|$)' || return 1
+  printf '%s' "$COMMAND" | grep -qE '(--graph|--file|--parent)' && return 0
+  return 1
+}
+
+# Resolve the planning substage the same way MODE is resolved (helper preferred,
+# file fallback). Empty when unset or not in planning mode.
+get_substage() {
+  if [ -x "$MODE_BIN" ]; then
+    "$MODE_BIN" substage get 2>/dev/null || true
+  elif [ -f "$STATE" ]; then
+    STATE="$STATE" python3 -c "import json,os; print(json.load(open(os.environ['STATE'])).get('substage','') or '')" 2>/dev/null || true
+  fi
+}
+
 case "$MODE" in
   planning)
     if launches 'optimus|tarzan|chuck'; then
@@ -101,6 +124,12 @@ case "$MODE" in
     fi
     if printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])git[[:space:]]+push([[:space:]]|$)'; then
       deny "Cockpit is in PLANNING mode — code 'git push' is blocked so you don't ship from a half-formed backlog. Run /execute first, or append --force to override."
+    fi
+    if authors_backlog; then
+      SUBSTAGE="$(get_substage)"
+      if [ "$SUBSTAGE" != "decomposition" ]; then
+        deny "Cockpit is in PLANNING mode at substage '${SUBSTAGE:-unset}' — populating the implementation backlog (bd create --parent/--graph/--file) is blocked until substage=decomposition. The bare epic shell (bd create --type=epic) is allowed now as the planning home; producers attach their review to it. Walk the staged flow (framing → research → architecture → test-strategy → decomposition), advancing with 'sable-mode substage advance' after each human sign-off. Append --force to override."
+      fi
     fi
     ;;
   execution)

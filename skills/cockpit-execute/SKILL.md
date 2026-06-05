@@ -23,6 +23,23 @@ allowed-tools:
 You are the **cockpit** (see `roles/cockpit.md`). This skill flips you into
 **execution mode**, whose single job is to **drain the bead pool**.
 
+## 0. Verify handoff readiness (soft gate)
+
+Before flipping to execution, confirm the backlog is actually drainable —
+otherwise you send managers into under-scoped work. Two checks:
+
+- **Planning reached the end.** `sable-mode substage get` returns
+  `decomposition` (or a prior planning session already handed off). If it returns
+  an earlier substage, the staged flow isn't finished.
+- **No open questions remain.** `bd ready -l open-question` is empty — every
+  ambiguity the human needed to resolve has been resolved.
+
+If either fails, the pool is half-formed: return to `/plan`, or drain the
+`open-question` beads, before proceeding. This is a **discipline gate, not a hard
+lock** — nothing stops you, but skipping it means execution surfaces questions
+the human should have answered during planning, which is exactly what staged
+planning exists to prevent.
+
 ## 1. Flip the mode-state
 
 Run exactly one command:

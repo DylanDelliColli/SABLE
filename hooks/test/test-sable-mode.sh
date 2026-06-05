@@ -145,6 +145,71 @@ fresh_state
 SABLE_COCKPIT=on "$MODE_BIN" set execution >/dev/null 2>&1
 assert_eq "set allowed when SABLE_COCKPIT=on" "execution" "$("$MODE_BIN" get 2>/dev/null)"
 
+# ---------- substage axis (planning sub-state machine) ----------
+# Ordered substages: framing -> research -> architecture -> test-strategy -> decomposition.
+# Only meaningful in planning mode. `set planning` initializes framing.
+
+# set planning initializes substage=framing
+fresh_state
+"$MODE_BIN" set planning >/dev/null 2>&1
+assert_eq "set planning inits substage=framing" "framing" "$("$MODE_BIN" substage get 2>/dev/null)"
+
+# advance walks the ordered list
+fresh_state
+"$MODE_BIN" set planning >/dev/null 2>&1
+"$MODE_BIN" substage advance >/dev/null 2>&1
+assert_eq "advance 1 -> research"       "research"      "$("$MODE_BIN" substage get 2>/dev/null)"
+"$MODE_BIN" substage advance >/dev/null 2>&1
+assert_eq "advance 2 -> architecture"   "architecture"  "$("$MODE_BIN" substage get 2>/dev/null)"
+"$MODE_BIN" substage advance >/dev/null 2>&1
+assert_eq "advance 3 -> test-strategy"  "test-strategy" "$("$MODE_BIN" substage get 2>/dev/null)"
+"$MODE_BIN" substage advance >/dev/null 2>&1
+assert_eq "advance 4 -> decomposition"  "decomposition" "$("$MODE_BIN" substage get 2>/dev/null)"
+
+# advancing past decomposition is rejected (nonzero) and leaves substage unchanged
+"$MODE_BIN" substage advance >/dev/null 2>&1
+assert_nonzero "advance past decomposition exits nonzero" "$?"
+assert_eq "substage unchanged after rejected advance" "decomposition" "$("$MODE_BIN" substage get 2>/dev/null)"
+
+# substage set to a valid stage
+fresh_state
+"$MODE_BIN" set planning >/dev/null 2>&1
+"$MODE_BIN" substage set architecture >/dev/null 2>&1
+assert_eq "substage set architecture" "architecture" "$("$MODE_BIN" substage get 2>/dev/null)"
+
+# substage set rejects unknown (nonzero) and does not change current substage
+fresh_state
+"$MODE_BIN" set planning >/dev/null 2>&1
+"$MODE_BIN" substage set bogus >/dev/null 2>&1
+assert_nonzero "substage set bogus exits nonzero" "$?"
+assert_eq "substage unchanged after rejected set" "framing" "$("$MODE_BIN" substage get 2>/dev/null)"
+
+# set planning re-inits substage to framing even after advancing
+fresh_state
+"$MODE_BIN" set planning >/dev/null 2>&1
+"$MODE_BIN" substage set decomposition >/dev/null 2>&1
+"$MODE_BIN" set planning >/dev/null 2>&1
+assert_eq "set planning resets substage to framing" "framing" "$("$MODE_BIN" substage get 2>/dev/null)"
+
+# execution mode has no substage — substage get exits nonzero
+fresh_state
+"$MODE_BIN" set execution >/dev/null 2>&1
+"$MODE_BIN" substage get >/dev/null 2>&1
+assert_nonzero "execution has no substage (get nonzero)" "$?"
+
+# substage get with no state set exits nonzero
+fresh_state
+"$MODE_BIN" substage get >/dev/null 2>&1
+assert_nonzero "substage get with no state exits nonzero" "$?"
+
+# mode + fleet preserved across a substage advance
+fresh_state
+"$MODE_BIN" set planning --fleet sherlock,gaudi >/dev/null 2>&1
+"$MODE_BIN" substage advance >/dev/null 2>&1
+SHOW="$("$MODE_BIN" show 2>/dev/null)"
+assert_eq "mode preserved after advance"  "planning" "$(printf '%s' "$SHOW" | jget "['mode']")"
+assert_eq "fleet preserved after advance" "sherlock" "$(printf '%s' "$SHOW" | jget "['fleet'][0]")"
+
 # ---------- Summary ----------
 
 echo
