@@ -292,6 +292,185 @@ else
 fi
 
 # ============================================================
+# Defect-regression tests (SABLE-ct8 verdict)
+# ============================================================
+
+echo "--- Defect-regression (a): git -C <other-repo> from cwd with foreign fresh claim ---"
+
+# Two independent repos; repoA holds a fresh foreign claim for sess-OTHER.
+# sess-ME runs 'git -C repoB add .' from repoA's cwd.
+# Expected: allow (target is repoB), repoB gets sess-ME's claim, repoA untouched.
+REG_ROOT="$(mktemp -d)"
+trap 'rm -rf "$REG_ROOT"' EXIT
+REG_A="$REG_ROOT/repoA"
+REG_B="$REG_ROOT/repoB"
+git init "$REG_A" -q
+git -C "$REG_A" commit --allow-empty -m "init" -q
+git init "$REG_B" -q
+git -C "$REG_B" commit --allow-empty -m "init" -q
+
+CF_A="$(claim_file "$REG_A")"
+CF_B="$(claim_file "$REG_B")"
+# Write a fresh foreign claim on repoA
+printf 'sess-OTHER %s\n' "$(date +%s)" > "$CF_A"
+# No claim on repoB
+
+JSON=$(make_json "git -C $REG_B add ." "sess-ME" "$REG_A")
+OUT=$(run_hook "$JSON")
+if is_allow "$OUT"; then
+  pass "defect-a: -C target allowed (repoA has foreign claim, target=repoB)"
+else
+  fail "defect-a: -C target allowed (repoA has foreign claim, target=repoB)" "got deny: $OUT"
+fi
+if [ -f "$CF_B" ]; then
+  pass "defect-a: claim written in TARGET repo (repoB)"
+else
+  fail "defect-a: claim written in TARGET repo (repoB)" "no claim at $CF_B"
+fi
+if [ "$(awk '{print $1}' "$CF_B" 2>/dev/null)" = "sess-ME" ]; then
+  pass "defect-a: TARGET repo claim owner is sess-ME"
+else
+  fail "defect-a: TARGET repo claim owner is sess-ME" "got: $(awk '{print $1}' "$CF_B" 2>/dev/null)"
+fi
+# repoA claim must be untouched (still sess-OTHER)
+if [ "$(awk '{print $1}' "$CF_A" 2>/dev/null)" = "sess-OTHER" ]; then
+  pass "defect-a: repoA (cwd) claim unchanged"
+else
+  fail "defect-a: repoA (cwd) claim unchanged" "got: $(awk '{print $1}' "$CF_A" 2>/dev/null)"
+fi
+rm -rf "$REG_ROOT"
+
+echo "--- Defect-regression (b): identity-unknown does not overwrite existing fresh claim ---"
+
+# sess-HOLDER owns a fresh claim; an identity-unknown invocation must not
+# overwrite it and must not cause sess-HOLDER to be denied on its next command.
+clear_claim "$SCRATCH"
+CF="$(claim_file "$SCRATCH")"
+printf 'sess-HOLDER %s\n' "$(date +%s)" > "$CF"
+ORIGINAL_CONTENT="$(cat "$CF")"
+
+# identity-unknown invocation (no session_id, CLAUDE_SESSION_ID unset)
+JSON_UNK=$(python3 -c "
+import json
+print(json.dumps({'tool_name':'Bash','tool_input':{'command':'git add .'},'cwd':'$SCRATCH'}))
+")
+OUT_UNK=$(
+  unset CLAUDE_SESSION_ID
+  printf '%s' "$JSON_UNK" | bash "$HOOK" 2>/dev/null
+)
+if is_allow "$OUT_UNK"; then
+  pass "defect-b: identity-unknown allows"
+else
+  fail "defect-b: identity-unknown allows" "got deny: $OUT_UNK"
+fi
+if has_additional_context "$OUT_UNK"; then
+  pass "defect-b: identity-unknown has additionalContext"
+else
+  fail "defect-b: identity-unknown has additionalContext" "output: $OUT_UNK"
+fi
+AFTER_CONTENT="$(cat "$CF" 2>/dev/null)"
+if [ "$AFTER_CONTENT" = "$ORIGINAL_CONTENT" ]; then
+  pass "defect-b: claim file content unchanged after identity-unknown"
+else
+  fail "defect-b: claim file content unchanged after identity-unknown" "before='$ORIGINAL_CONTENT' after='$AFTER_CONTENT'"
+fi
+
+# sess-HOLDER must still be allowed on the next mutating command
+JSON_H=$(make_json "git commit -m x" "sess-HOLDER" "$SCRATCH")
+OUT_H=$(run_hook "$JSON_H")
+if is_allow "$OUT_H"; then
+  pass "defect-b: original holder still allowed after identity-unknown pass"
+else
+  fail "defect-b: original holder still allowed after identity-unknown pass" "got deny: $OUT_H"
+fi
+
+echo "--- Defect-regression (c): chained 'cd /x && git add .' is protected ---"
+
+clear_claim "$SCRATCH"
+JSON=$(make_json "cd $SCRATCH && git add ." "sess-A" "$SCRATCH")
+OUT=$(run_hook "$JSON")
+# After fix: the 'git add .' segment is at a command position after '&&'
+# and must be detected as mutating.
+if is_allow "$OUT"; then
+  pass "defect-c: chained cd && git add . allowed (first claim written)"
+else
+  fail "defect-c: chained cd && git add . allowed (first claim written)" "got deny: $OUT"
+fi
+CF="$(claim_file "$SCRATCH")"
+if [ -f "$CF" ]; then
+  pass "defect-c: claim written for chained command"
+else
+  fail "defect-c: claim written for chained command" "no claim at $CF"
+fi
+
+# Now sess-B must be denied (foreign fresh claim held by sess-A)
+clear_claim "$SCRATCH"
+printf 'sess-A %s\n' "$(date +%s)" > "$CF"
+JSON=$(make_json "cd $SCRATCH && git add ." "sess-B" "$SCRATCH")
+OUT=$(run_hook "$JSON")
+if is_deny "$OUT"; then
+  pass "defect-c: chained cd && git add . denied for foreign session"
+else
+  fail "defect-c: chained cd && git add . denied for foreign session" "got allow: ${OUT:-<empty>}"
+fi
+
+echo "--- Defect-regression (d): 'FOO=1 git add .' is protected ---"
+
+clear_claim "$SCRATCH"
+JSON=$(make_json "FOO=1 git add ." "sess-A" "$SCRATCH")
+OUT=$(run_hook "$JSON")
+if is_allow "$OUT"; then
+  pass "defect-d: FOO=1 git add . allowed (first claim written)"
+else
+  fail "defect-d: FOO=1 git add . allowed (first claim written)" "got deny: $OUT"
+fi
+CF="$(claim_file "$SCRATCH")"
+if [ -f "$CF" ]; then
+  pass "defect-d: claim written for env-prefixed command"
+else
+  fail "defect-d: claim written for env-prefixed command" "no claim at $CF"
+fi
+
+# Now sess-B must be denied
+clear_claim "$SCRATCH"
+printf 'sess-A %s\n' "$(date +%s)" > "$CF"
+JSON=$(make_json "FOO=1 git add ." "sess-B" "$SCRATCH")
+OUT=$(run_hook "$JSON")
+if is_deny "$OUT"; then
+  pass "defect-d: FOO=1 git add . denied for foreign session"
+else
+  fail "defect-d: FOO=1 git add . denied for foreign session" "got allow: ${OUT:-<empty>}"
+fi
+
+echo "--- Defect-regression (e): 'git stash && git add .' is protected (mutating segment not first) ---"
+
+clear_claim "$SCRATCH"
+JSON=$(make_json "git stash && git add ." "sess-A" "$SCRATCH")
+OUT=$(run_hook "$JSON")
+if is_allow "$OUT"; then
+  pass "defect-e: git stash && git add . allowed (first claim written)"
+else
+  fail "defect-e: git stash && git add . allowed (first claim written)" "got deny: $OUT"
+fi
+CF="$(claim_file "$SCRATCH")"
+if [ -f "$CF" ]; then
+  pass "defect-e: claim written for compound command with non-first mutating segment"
+else
+  fail "defect-e: claim written for compound command with non-first mutating segment" "no claim at $CF"
+fi
+
+# Now sess-B must be denied
+clear_claim "$SCRATCH"
+printf 'sess-A %s\n' "$(date +%s)" > "$CF"
+JSON=$(make_json "git stash && git add ." "sess-B" "$SCRATCH")
+OUT=$(run_hook "$JSON")
+if is_deny "$OUT"; then
+  pass "defect-e: git stash && git add . denied for foreign session"
+else
+  fail "defect-e: git stash && git add . denied for foreign session" "got allow: ${OUT:-<empty>}"
+fi
+
+# ============================================================
 # settings-snippet registration
 # ============================================================
 

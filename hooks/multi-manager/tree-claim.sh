@@ -129,95 +129,172 @@ print(json.dumps({
 }
 
 # ---------------------------------------------------------------------------
-# sable__is_index_mutating_git_command <command>
+# sable__is_index_mutating_git_command <command> <cwd>
 #
-# Tokenises the command with Python shlex (handles quoting), skips any git
-# global flags, then checks whether the first positional argument is one of
-# the index-mutating subcommands.
+# Tokenises the command with Python shlex (handles quoting).  Walks ALL
+# command positions (start of string, and after shell separators ; && || |)
+# transparently through NAME=VALUE environment-assignment prefixes and env(1)
+# invocations — aligning with the sable_is_git_push walk in lib-identity.sh.
 #
-# Returns 0 (match) or 1 (no match).
+# If ANY command-position segment resolves to an index-mutating git invocation,
+# the function prints the effective repo directory to stdout and returns 0.
+# When multiple segments match, the FIRST mutating segment's -C path wins
+# (multi-segment chained mutating git commands are rare; using the first keeps
+# the scope conservative).
+#
+# Returns 0 (match, effective-dir printed to stdout) or 1 (no match).
 #
 # Index-mutating subcommands: add, commit, rm, mv, restore (only when
-# --staged is also present), reset (any form).
+# --staged/-S is also present), reset (any form).
+#
+# Effective repo directory:
+#   - No -C flags on the matching segment → CWD (passed as argv[2]).
+#   - One or more -C flags → accumulated left-to-right, resolved against CWD
+#     (relative -C args are joined to the accumulated base; absolute args
+#     replace it), matching git's own -C behaviour.
 # ---------------------------------------------------------------------------
 sable__is_index_mutating_git_command() {
   local cmd="$1"
-  python3 - "$cmd" <<'PYEOF'
-import sys, shlex
+  local cwd="$2"
+  CWD_VAL="$cwd" CMD_STR="$cmd" python3 -c "
+import os, re, shlex, sys
 
-CMD = sys.argv[1]
+cmd = os.environ.get('CMD_STR', '')
+cwd = os.environ.get('CWD_VAL', '')
+
 try:
-    tokens = shlex.split(CMD)
+    tokens = shlex.split(cmd)
 except ValueError:
     sys.exit(1)
 
-if not tokens or tokens[0] != 'git':
-    sys.exit(1)
-
-# Skip git global flags: -C <path>, -c <k=v>, --git-dir=..., --work-tree=...,
-# --no-pager, -p, --no-optional-locks, --exec-path, --html-path, --man-path,
-# --info-path, --version, --help, --bare, --namespace=..., --super-prefix=...
-# Generically: skip any token starting with '-' and its value if the flag
-# takes a mandatory argument. We use a simple approach: if a token starts
-# with '-', advance past it. For flags known to consume a following arg
-# (-C, -c, --git-dir, --work-tree, --exec-path, --namespace, --super-prefix)
-# also advance past their value.
-TAKES_ARG = {'-C', '-c', '--git-dir', '--work-tree', '--exec-path',
-             '--namespace', '--super-prefix'}
-
-idx = 1  # skip 'git'
-while idx < len(tokens):
-    t = tokens[idx]
-    if t == '--':
-        idx += 1
-        break
-    if not t.startswith('-'):
-        break
-    idx += 1
-    # If the flag takes a following argument (no '='), skip the next token too
-    if t in TAKES_ARG:
-        idx += 1
-
-if idx >= len(tokens):
-    sys.exit(1)
-
-subcommand = tokens[idx]
-remaining = tokens[idx+1:]
-
+SHELL_SEPS = {';', '&&', '||', '|'}
+# git global flags that consume the next token as an argument
+CONSUME_NEXT = {'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path'}
+STANDALONE = {
+    '--no-pager', '-p', '--paginate', '-P', '--no-replace-objects', '--bare',
+    '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs',
+    '--icase-pathspecs', '--no-optional-locks', '--html-path', '--man-path',
+    '--info-path', '--version', '--help',
+}
+STANDALONE_PREFIXES = ('--exec-path=', '--git-dir=', '--work-tree=', '--namespace=')
 MUTATING = {'add', 'commit', 'rm', 'mv', 'reset'}
-if subcommand in MUTATING:
-    sys.exit(0)
+ENV_ASSIGN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
-if subcommand == 'restore':
-    # Only index-mutating when --staged (or -S) is present
-    for t in remaining:
-        if t in ('--staged', '-S'):
-            sys.exit(0)
-    sys.exit(1)
+def resolve_effective_dir(c_paths, base_cwd):
+    \"\"\"Accumulate -C paths left-to-right, resolved against base_cwd.\"\"\"
+    cur = base_cwd
+    for p in c_paths:
+        if os.path.isabs(p):
+            cur = p
+        else:
+            cur = os.path.join(cur, p)
+    return cur
+
+i = 0
+n = len(tokens)
+at_cmd_pos = True
+while i < n:
+    tok = tokens[i]
+    # Shell separator -> next token is a new command position
+    if tok in SHELL_SEPS:
+        at_cmd_pos = True
+        i += 1
+        continue
+    # At command position: transparent NAME=VALUE env-assignment prefix
+    if at_cmd_pos and ENV_ASSIGN_RE.match(tok):
+        i += 1
+        continue
+    # At command position: env(1) prefix — consume it and its own options
+    if at_cmd_pos and tok == 'env':
+        i += 1
+        while i < n:
+            t = tokens[i]
+            if ENV_ASSIGN_RE.match(t):
+                i += 1
+                continue
+            if t == '-u' and i + 1 < n:
+                i += 2
+                continue
+            break
+        continue  # re-evaluate tokens[i] still at command position
+    # At command position: found 'git' — walk flags and identify subcommand
+    if at_cmd_pos and tok == 'git':
+        i += 1
+        c_paths = []
+        while i < n:
+            t = tokens[i]
+            if t in SHELL_SEPS:
+                break
+            if t == '-C' and i + 1 < n:
+                c_paths.append(tokens[i + 1])
+                i += 2
+                continue
+            if t in CONSUME_NEXT:
+                i += 2
+                continue
+            if t in STANDALONE or any(t.startswith(p) for p in STANDALONE_PREFIXES):
+                i += 1
+                continue
+            if t == '--':
+                i += 1
+                break
+            if t.startswith('-'):
+                i += 1
+                continue
+            # This is the subcommand
+            subcommand = t
+            remaining = tokens[i + 1:]
+            is_mutating = False
+            if subcommand in MUTATING:
+                is_mutating = True
+            elif subcommand == 'restore':
+                for rt in remaining:
+                    if rt in ('--staged', '-S'):
+                        is_mutating = True
+                        break
+            if is_mutating:
+                eff = resolve_effective_dir(c_paths, cwd)
+                print(eff)
+                sys.exit(0)
+            # Not mutating — this segment is done, continue outer loop
+            i += 1
+            # Skip rest of this segment's args until a separator
+            while i < n and tokens[i] not in SHELL_SEPS:
+                i += 1
+            at_cmd_pos = False
+            break
+        # If we exhausted tokens inside the git-flag walk (no subcommand found)
+        # or hit a separator — just continue outer loop
+        continue
+    # Not at command position, or not a recognised command-position token
+    at_cmd_pos = False
+    i += 1
 
 sys.exit(1)
-PYEOF
+" 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
-# Step 1: Check if this command is index-mutating
+# Step 1: Check if this command is index-mutating; capture effective repo dir
 # ---------------------------------------------------------------------------
 [ -z "$COMMAND" ] && exit 0
-sable__is_index_mutating_git_command "$COMMAND" || exit 0
+EFFECTIVE_DIR=$(sable__is_index_mutating_git_command "$COMMAND" "$CWD") || exit 0
+# Normalise: if EFFECTIVE_DIR came back empty for any reason, fall back to CWD
+[ -z "$EFFECTIVE_DIR" ] && EFFECTIVE_DIR="$CWD"
 
 # ---------------------------------------------------------------------------
 # Step 2: Resolve the claim file (per-checkout via git-dir)
 # ---------------------------------------------------------------------------
-GIT_DIR=$(git -C "$CWD" rev-parse --git-dir 2>/dev/null) || {
+GIT_DIR=$(git -C "$EFFECTIVE_DIR" rev-parse --git-dir 2>/dev/null) || {
   # Not inside a git repo — fail open
   exit 0
 }
 
 # git rev-parse --git-dir returns a relative path when called without -C on
-# older git versions; resolve it relative to CWD.
+# older git versions; resolve it relative to EFFECTIVE_DIR (the -C target).
 case "$GIT_DIR" in
   /*) ;;                             # already absolute
-  *)  GIT_DIR="$CWD/$GIT_DIR" ;;
+  *)  GIT_DIR="$EFFECTIVE_DIR/$GIT_DIR" ;;
 esac
 
 CLAIM_FILE="$GIT_DIR/sable-tree-claim"
@@ -225,12 +302,18 @@ TTL="${SABLE_TREE_CLAIM_TTL:-3600}"
 NOW=$(date +%s 2>/dev/null) || NOW=0
 
 # ---------------------------------------------------------------------------
-# Step 3: Missing identity — fail open
+# Step 3: Missing identity — fail open, but never clobber an existing claim
 # ---------------------------------------------------------------------------
 if [ "$IDENTITY_KNOWN" -eq 0 ]; then
-  # Write claim anyway so we're not completely invisible, then allow
-  printf '%s %s\n' "$SESSION_ID" "$NOW" > "$CLAIM_FILE" 2>/dev/null || true
-  allow_with_context "tree-claim: session identity unknowable (PPID=${PPID:-?}); claim written as $SESSION_ID. If two sessions share this checkout, set CLAUDE_SESSION_ID or use 'bd worktree create <name>' for isolation."
+  # Write a claim ONLY when no claim file exists yet.  An existing claim
+  # (regardless of holder or age) must never be overwritten by an
+  # identity-unknown invocation — doing so would evict the legitimate holder.
+  if [ ! -f "$CLAIM_FILE" ]; then
+    printf '%s %s\n' "$SESSION_ID" "$NOW" > "$CLAIM_FILE" 2>/dev/null || true
+    allow_with_context "tree-claim: session identity unknowable (PPID=${PPID:-?}); claim written as $SESSION_ID. If two sessions share this checkout, set CLAUDE_SESSION_ID or use 'bd worktree create <name>' for isolation."
+  else
+    allow_with_context "tree-claim: session identity unknowable (PPID=${PPID:-?}); existing claim preserved (holder: $(awk '{print $1}' "$CLAIM_FILE" 2>/dev/null)). If two sessions share this checkout, set CLAUDE_SESSION_ID or use 'bd worktree create <name>' for isolation."
+  fi
 fi
 
 # ---------------------------------------------------------------------------
