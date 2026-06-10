@@ -153,7 +153,7 @@ Your first task on SABLE — at any stage — starts with the Foundation pattern
 - Create an epic: `bd create --type=epic --title="..." --description="..."`
 - Create child beads: `bd create --parent=<epic-id> --title="..." --description="..."`
 - Add dependencies with requirement language: `bd dep add <child-B> <child-A>` means "B needs A"
-- Visualize: `bd dep tree <epic-id>` or `bd children <epic-id> --pretty`
+- Visualize: `bd dep tree <epic-id>` or `bd children <epic-id>`
 
 **Swarm stage** — add when spec-writing is automatic and your usage budget supports parallel agents:
 - Validate the structure: `bd swarm validate <epic-id>`. Fix warnings before dispatching.

@@ -51,6 +51,21 @@ These never run continuously. They are pure producers (Sherlock, Rudy, Columbo) 
 
 The continuous-mode hooks are gated on `CLAUDE_AGENT_ROLE=manager`, so they no-op for these four. Planning agents rely on a different discipline: bead-template enforcement (`templates/sherlock-bead.md` for `sherlock-finding` labels and `templates/columbo-bead.md` for `columbo-test-spec` / `columbo-test-gap` labels are mechanically required via `bead-description-gate.sh`).
 
+#### Victor's canonical execution shape — parallel validators over source-file clusters
+
+A freshness pass is not a single-agent read-everything sweep. The validated shape (six validators over ~24 beads caught a deleted file, a moved component, off-by-N anchors, an already-shipped feature, and systemic enum laundering — with code quotes for each):
+
+1. **Cluster** the open beads by the source file(s) they reference.
+2. **Dispatch one read-only validator per cluster** (Explore subagents), in parallel.
+3. Each validator returns a **structured per-bead verdict**:
+   - `anchor_status`: VALID / DRIFTED / GONE
+   - `gap_status`: REPRODUCES / FIXED / PARTIAL / CANT_TELL
+   - `planning_bar`: MEETS / LAUNDERED_DECISION / UNDERSPECCED
+   - `recommended_action`, plus **evidence as a file:line code quote**
+4. Victor reconciles verdicts into bead updates/closes (subject to the auto-close ramp-up) and the `victor-report`.
+
+Clustering by file means each validator reads its sources once and judges every bead against them — cheaper and more accurate than per-bead dispatch, and the structured verdict prevents free-form "looks fine" reports from slipping through.
+
 ### Tier 3 — Execution-session strategist (runs as peer, not orchestrator)
 
 | Agent | Type | Scope | Lifecycle |
@@ -377,7 +392,7 @@ A `PreToolUse:Agent` hook checks the manager's inbox for any `priority=0` coord 
 
 Existing dispatched workers are unaffected — only the *next* dispatch is blocked. This is structural, not discretionary: the manager cannot dispatch new work while urgent feedback is pending.
 
-**Escape valve**: `bd defer <id> --reason="..."` removes the bead from the block list while keeping it visible. Use when the user is AFK and has explicitly told the agent to defer blockers.
+**Escape valve**: `bd defer <id>` removes the bead from the block list while keeping it visible. `bd defer` takes no `--reason` flag — record WHY first with `bd update <id> --notes "deferred: <reason> (existing notes preserved)"` (remember `--notes` overwrites; fetch-and-append), then defer. Use when the user is AFK and has explicitly told the agent to defer blockers.
 
 ### 5. Pre-push three-phase gate (rebase → static → tests)
 
@@ -686,7 +701,7 @@ Chuck runs on a tight loop (`/loop 3m`) or fully continuous via the `loop` skill
 Tell each active manager:
 
 ```
-> I'm AFK for 30min. If any P0 coord beads land, defer them with bd defer <id> --reason="user AFK 30min" so dispatches don't block. I'll resolve when back.
+> I'm AFK for 30min. If any P0 coord beads land, note the reason (bd update <id> --notes "deferred: user AFK 30min") and defer them (bd defer <id>) so dispatches don't block. I'll resolve when back.
 ```
 
 Managers comply via `bd defer`. Dispatch resumes; deferred beads stay visible for resolution on return.

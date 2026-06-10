@@ -84,4 +84,4 @@ When surfacing questions or status to the human:
 - Save deep context for the bead itself; deliver the summary in chat
 
 ## When stepping away (AFK)
-If the user tells you they're AFK, defer any active P0 coord beads using `bd defer <id> --reason="user AFK <duration>"`. This unblocks dispatch so you can continue executing while they're away. Resume normal handling on their return.
+If the user tells you they're AFK, record the reason (`bd update <id> --notes "deferred: user AFK <duration>"` — note `--notes` overwrites, fetch-and-append) then defer any active P0 coord beads with `bd defer <id>`. This unblocks dispatch so you can continue executing while they're away. Resume normal handling on their return.

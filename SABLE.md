@@ -190,6 +190,25 @@ bd update <id> --design "Architectural approach decided on"
 bd update <id> --acceptance "How to verify it's done"
 ```
 
+**Warning:** `bd update --notes` **overwrites** the field — it does not append. Fetch the existing notes (`bd show <id>`) and include them in the new value, or you clobber the audit trail.
+
+#### Anchors and the verify command
+
+Line-number anchors rot faster than anything else in a bead. Across real validation passes, titles and notes consistently carried stale line numbers while a fingerprint block paired with a verify command held up. The rules:
+
+- **Line-number anchors belong ONLY inside a `## Fingerprint at HEAD (<sha>)` block** in the description — never in the title (keep titles reference-free) and never as bare notes. A fingerprint records the file, the line, and a short code quote at a named commit, so drift is detectable instead of silently misleading.
+- **Every actionable bead should carry a machine-runnable verify command** — a grep or test invocation that confirms the gap still reproduces. The worker runs it FIRST, before writing any code. If it doesn't reproduce, the bead may be stale: stop and report instead of implementing against a fixed problem.
+
+```
+## Fingerprint at HEAD (a1b4bdc)
+orchestrator.py:142 — `key = location + ":" + str(date)`
+
+## Verify
+grep -n 'location + ":"' orchestrator.py   # gap reproduces while this matches
+```
+
+The Fresh Agent Test (§3.2) validates "could a fresh agent ACT on this"; the verify command validates "is this STILL TRUE." A bead can pass the first perfectly while pointing at a deleted file or an already-fixed bug — the verify command makes stale beads self-identifying.
+
 ### 3.4 Dependencies
 
 Dependencies encode ordering constraints between beads. The syntax uses **requirement language**, not temporal language:
@@ -233,7 +252,8 @@ bd update <id> --parent=<new-parent-id>
 
 # List all children of a parent (closed children included by default)
 bd children <epic-id>
-bd children <epic-id> --pretty   # Tree view
+bd dep tree <epic-id>            # Tree view (bd children --pretty appears in bd's
+                                 # own help but the flag is not implemented)
 
 # Epic lifecycle
 bd epic status <epic-id>          # Show completion progress
@@ -295,6 +315,28 @@ bd create --title="<what's wrong>" --type=bug --priority=2 \
 The reasoning: agents are amnesiac. If it's not in a bead, it doesn't exist in the next session. The cost of a false-positive bead (turns out it wasn't a real issue) is trivial. The cost of a missed bug (nobody remembers it existed) compounds over time.
 
 **Important**: Before creating a bead, verify the referenced file or function actually exists (grep or glob). Hallucinated beads waste full agent cycles when the next agent tries to act on them.
+
+### 3.8 Backlog Hygiene: Freshness Before Form
+
+A backlog rots between sessions: code moves under the beads. Periodic "doctor the backlog" passes keep it trustworthy — but **a form-only pass is worse than no pass**. A lint/structure sweep that promotes existing acceptance prose into the `acceptance` field, or polishes sections, WITHOUT reading the referenced source launders stale references and unvalidated decisions into authoritative status. (Observed in practice: a form-only doctor pass cleared 33 lint warnings while promoting 12 laundered design decisions and several stale file:line anchors; the codebase-grounded follow-up found 4 beads already fixed in-tree and one citing a file deleted 100+ commits ago.)
+
+The rules:
+
+1. **Freshness validation is a prerequisite to authoring or promoting acceptance criteria.** Read the referenced source first. Run the bead's verify command (§3.3). Confirm the gap still reproduces at HEAD.
+2. **If a pass is form-only, label its output provisional** — it must not be treated as validated until a source-grounded pass confirms it.
+3. **Acceptance criteria that assert a design decision** (an invented enum value, prescribed copy, a threshold, a "cleanest" approach) **with no trace to a framing/architecture artifact are laundered decisions, not requirements.** Flag and rewrite them as explicit open questions rather than promoting them.
+4. **Capture needs a consolidation counterpart.** Issue discovery (§3.7) optimizes capture, but fragments of one decision get logged as N independent beads — e.g. five sighting beads each inventing a different value for the same enum is one architecture decision laundered five ways. Periodically detect beads sharing one upstream decision and group them under an epic parked at the architecture gate before any is decomposed.
+
+**The doctor recipe.** `bd doctor` is unavailable in embedded-dolt mode, so the composed equivalent is:
+
+```bash
+bd lint       # missing sections
+bd orphans    # broken dependencies
+bd stale      # no recent activity
+bd blocked    # dependency health
+```
+
+Run the composed recipe for structure, then a codebase-grounded freshness pass (one read-only validator per source-file cluster — see MULTI-MANAGER-PATTERN.md, Victor) before promoting anything.
 
 ---
 
@@ -1393,7 +1435,7 @@ All projects use **bd (beads)** for issue tracking.
 - `bd create --title="..." --description="..." --type=bug|task|feature --priority=2`
 - `bd q "<title>"` — Quick capture (just outputs ID; use for failure-trigger logging)
 - `bd defer <id>` — Real bead but not for now (drops out of `bd ready`)
-- `bd children <id> --pretty` — Tree view of children under a parent/epic
+- `bd dep tree <id>` — Tree view of the dependency/child graph under a bead
 - `bd swarm validate <epic-id>` — Pre-flight a swarm: see ready fronts, parallelism, warnings
 - `bd worktree create <name>` — Isolated worktree with shared beads database (use before parallel dispatch)
 - `bd preflight` — PR readiness check before `git push`
