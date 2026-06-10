@@ -19,7 +19,7 @@ set -uo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 AGENTS_DIR="$REPO/templates/agents"
 BUILDER="$REPO/bin/sable-build-agents"
-AGENTS="sherlock victor rudy columbo"
+AGENTS="optimus tarzan sherlock victor rudy columbo"
 
 PASS=0
 FAIL=0
@@ -78,6 +78,12 @@ assert_grep "$AGENTS_DIR/rudy.md"     "never. Catastrophic"    "rudy keeps the p
 assert_grep "$AGENTS_DIR/rudy.md"     "SABLE_RUDY_BASE_URL"    "rudy keeps the target env-var config"
 assert_grep "$AGENTS_DIR/columbo.md"  "columbo-test-spec"      "columbo keeps the test-spec bead label"
 assert_grep "$AGENTS_DIR/columbo.md"  "it.todo"                "columbo keeps the skeleton-file contract"
+assert_grep "$AGENTS_DIR/optimus.md"  "DISPATCH-REQUEST"       "optimus carries the dispatch-request protocol"
+assert_grep "$AGENTS_DIR/optimus.md"  "has-parent"             "optimus keeps the epic claim filter"
+assert_grep "$AGENTS_DIR/optimus.md"  "APPROVE-PUSH"           "optimus carries the review verdict protocol"
+assert_grep "$AGENTS_DIR/tarzan.md"   "DISPATCH-REQUEST"       "tarzan carries the dispatch-request protocol"
+assert_grep "$AGENTS_DIR/tarzan.md"   "no-parent"              "tarzan keeps the orphan claim filter"
+assert_grep "$AGENTS_DIR/tarzan.md"   "emergency"              "tarzan keeps emergency mode"
 
 echo
 echo "=========================================="

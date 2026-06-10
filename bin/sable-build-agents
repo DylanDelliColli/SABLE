@@ -22,10 +22,22 @@ DEFAULT_OUT = REPO / "templates" / "agents"
 
 # Agents converted to subagent definitions in SABLE v2.
 # Deliberately absent: chuck (env-var terminal holdout, SABLE-uz9.6),
-# optimus/tarzan (land behind the identity ledger, SABLE-uz9.4),
-# cockpit/lincoln (main-session role, not a subagent, SABLE-uz9.5),
-# gaudi (skill, not a role file — open question on SABLE-uz9.2).
+# lincoln (main-session role, anchored by name via session-role-anchor, not a
+# subagent definition — SABLE-uz9.5), gaudi (inline skill, not an agent —
+# decision on SABLE-uz9.2).
 AGENTS = {
+    "optimus": (
+        "Epic manager (SABLE execution lane). Plans, bundles, and reviews beads with a "
+        "parent epic; returns DISPATCH-REQUEST blocks for Lincoln to execute as "
+        "background workers and issues APPROVE-PUSH/REVISE verdicts on results. Does "
+        "not dispatch, push, or open PRs itself."
+    ),
+    "tarzan": (
+        "One-off manager (SABLE execution lane). Plans, bundles, and reviews standalone "
+        "orphan beads — bugfixes, docs, small refactors; returns DISPATCH-REQUEST blocks "
+        "for Lincoln to execute as background workers and issues APPROVE-PUSH/REVISE "
+        "verdicts. Emergency mode: fixes swarm-blockers directly in its own context."
+    ),
     "sherlock": (
         "Read-only repo auditor producing exceptional finding beads — design rot, "
         "redundancy, verbosity, dead code, test gaps — or greenfield research findings "
