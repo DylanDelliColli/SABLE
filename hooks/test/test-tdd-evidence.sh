@@ -97,10 +97,10 @@ run_hook_writes "bash with relative path to test-foo.sh recognized" \
   "bash test-foo.sh"
 
 run_hook_writes "bash with cd prefix to hooks/test recognized" \
-  "cd /home/ddc/dev-environment/SABLE && bash hooks/test/test-bead-description-gate.sh"
+  "cd /home/ddc/dev-env/SABLE && bash hooks/test/test-bead-description-gate.sh"
 
 run_hook_writes "bash with absolute path to hooks/test recognized" \
-  "bash /home/ddc/dev-environment/SABLE/hooks/test/test-tdd-evidence.sh"
+  "bash /home/ddc/dev-env/SABLE/hooks/test/test-tdd-evidence.sh"
 
 # ---------- Negative cases ----------
 
