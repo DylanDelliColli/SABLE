@@ -221,6 +221,37 @@ SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 if jq -e . "$SNIPPET" >/dev/null 2>&1; then pass "settings-snippet.json is valid JSON"; else fail "settings-snippet.json is valid JSON"; fi
 if grep -q 'cockpit-mode-interlock.sh' "$SNIPPET"; then pass "interlock registered in settings-snippet.json"; else fail "interlock registered in settings-snippet.json"; fi
 
+# ---------- BrokenPipeError regression (SABLE-dc0) ----------
+# Exercises the two early-exit paths (non-governed identity, subagent context)
+# to confirm the hook drains stdin before exiting so the upstream python3
+# writer never sees a broken pipe.  Capture stderr of each invocation and fail
+# if "BrokenPipeError" appears.
+_no_pipe_err() {
+  local label="$1"; shift
+  local err
+  err="$( "$@" 2>&1 1>/dev/null )"
+  if printf '%s' "$err" | grep -q 'BrokenPipeError'; then
+    fail "$label" "BrokenPipeError in stderr: $err"
+  else
+    pass "$label"
+  fi
+}
+set_mode planning
+_no_pipe_err "no BrokenPipeError: early-exit non-governed identity" \
+  bash -c 'agent_json(){ python3 -c "
+import json,sys
+d={\"tool_name\":\"Agent\",\"tool_input\":{\"subagent_type\":sys.argv[1],\"prompt\":\"work\",\"description\":\"spawn\"}}
+if len(sys.argv)>2 and sys.argv[2]: d[\"agent_id\"]=sys.argv[2]
+print(json.dumps(d))
+" "$@"; }; agent_json sherlock "" | CLAUDE_AGENT_NAME=optimus bash "'"$HOOK"'" '
+_no_pipe_err "no BrokenPipeError: early-exit subagent context" \
+  bash -c 'agent_json(){ python3 -c "
+import json,sys
+d={\"tool_name\":\"Agent\",\"tool_input\":{\"subagent_type\":sys.argv[1],\"prompt\":\"work\",\"description\":\"spawn\"}}
+if len(sys.argv)>2 and sys.argv[2]: d[\"agent_id\"]=sys.argv[2]
+print(json.dumps(d))
+" "$@"; }; SABLE_COCKPIT_STATE="'"$SABLE_COCKPIT_STATE"'" agent_json sherlock sub-9 | CLAUDE_AGENT_NAME=lincoln bash "'"$HOOK"'" '
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

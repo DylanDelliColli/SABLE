@@ -33,6 +33,13 @@
 
 set -uo pipefail
 
+# Consume stdin unconditionally so that the upstream writer (e.g. a python3
+# subprocess in the test harness) can flush and exit cleanly regardless of
+# whether this hook no-ops early. Without this drain, any early exit below
+# leaves the pipe read-end closed while the writer is still flushing, which
+# produces a BrokenPipeError in the writer's stderr.
+INPUT="$(cat)"
+
 # Only the Lincoln/cockpit main session is governed.
 case "${CLAUDE_AGENT_NAME:-}" in
   lincoln|cockpit) ;;
@@ -43,8 +50,6 @@ esac
 case "$(printf '%s' "${SABLE_COCKPIT:-}" | tr '[:upper:]' '[:lower:]')" in
     off|0|false|no) exit 0 ;;
 esac
-
-INPUT="$(cat)"
 
 # Subagent context — never govern dispatched agents.
 AGENT_ID="$(printf '%s' "$INPUT" | python3 -c "
