@@ -257,6 +257,116 @@ assert_deny "manager: columbo-test-gap without Existing test quality denied" "$M
   "bd create --title=foo --labels=columbo-test-gap --description=\"$GAP_NO_QUALITY\"" \
   "Existing test quality"
 
+# ---------- --body-file / batch mode tests (SABLE-e8w, SABLE-bvw) ----------
+
+# Create temp body files for the --body-file tests
+GOOD_BODY=$(mktemp /tmp/good_body.XXXXXX.md)
+BAD_BODY=$(mktemp /tmp/bad_body.XXXXXX.md)
+trap 'rm -f "$GOOD_BODY" "$BAD_BODY"' EXIT
+
+# Good body: passes the Fresh Agent Test — has file paths and test spec
+cat > "$GOOD_BODY" << 'BODYEOF'
+## Problem
+The bead-description-gate.sh hook false-positives on bd create --body-file
+because it requires --description inline. Fix: detect --body-file early and
+read the referenced file, then apply the same quality checks.
+
+## Approach
+Modify hooks/bead-description-gate.sh lines 84-106 to detect --body-file,
+--graph, --file, --stdin before the --description check. For --body-file PATH
+(not "-"), read the file and run DESC checks against its contents.
+
+## Test spec
+Unit: hooks/test/test-bead-description-gate.sh — assert_allow for
+--body-file with a good file, assert_deny for --body-file with a bad file.
+Integration: same harness — writes real temp files to /tmp, runs the real
+hook via bash, checks exit behavior and JSON output.
+
+## Acceptance criteria
+- bd create --body-file /tmp/good.md with compliant content exits 0 (allow).
+- bd create --body-file /tmp/bad.md with non-compliant content is denied/nudged.
+- bd create --stdin / --graph / --file are never hard-denied.
+- bd create without any description source remains gated exactly as before.
+BODYEOF
+
+# Bad body: missing test spec and file paths
+cat > "$BAD_BODY" << 'BODYEOF'
+## Problem
+Something is broken somewhere. Fix it.
+BODYEOF
+
+MANAGER_ENV="CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager"
+
+# Test 31: --body-file good content (manager mode) → allow
+assert_allow "body-file: good content allowed (manager)" "$MANAGER_ENV" \
+  "bd create --title=foo --body-file $GOOD_BODY"
+
+# Test 32: --body-file bad content (manager mode) → deny (same verdict as inline bad desc)
+assert_deny "body-file: bad content denied (manager)" "$MANAGER_ENV" \
+  "bd create --title=foo --body-file $BAD_BODY" \
+  "missing"
+
+# Test 33: --body-file good content (default mode) → allow
+assert_allow "body-file: good content allowed (default)" "" \
+  "bd create --title=foo --body-file $GOOD_BODY"
+
+# Test 34: --body-file bad content (default mode) → nudge
+assert_nudge "body-file: bad content nudges (default)" "" \
+  "bd create --title=foo --body-file $BAD_BODY" \
+  "missing"
+
+# Test 35: --body-file - (stdin) → nudge only, no deny (batch/stdin mode)
+assert_nudge "body-file -: nudge only, no deny (manager)" "$MANAGER_ENV" \
+  "bd create --title=foo --body-file -" \
+  "batch/stdin mode"
+
+# Test 36: --graph FILE → nudge only, no deny (manager mode)
+assert_nudge "graph: nudge only, no deny (manager)" "$MANAGER_ENV" \
+  "bd create --graph /tmp/g.json" \
+  "batch/stdin mode"
+
+# Test 37: --file FILE → nudge only, no deny (manager mode)
+assert_nudge "file-flag: nudge only, no deny (manager)" "$MANAGER_ENV" \
+  "bd create --file /tmp/batch.md" \
+  "batch/stdin mode"
+
+# Test 38: --stdin → nudge only, no deny (manager mode)
+assert_nudge "stdin: nudge only, no deny (manager)" "$MANAGER_ENV" \
+  "bd create --title=foo --stdin" \
+  "batch/stdin mode"
+
+# Test 39: plain create with no description source still denied (regression guard)
+assert_deny "regression: plain create no desc still denied (manager)" "$MANAGER_ENV" \
+  "bd create --title=foo" \
+  "no --description"
+
+# ---------- Docs-only path tests (SABLE-ue4) ----------
+
+# Test 40: docs-only description citing feedback/foo.md + [no-test] → passes file-path check
+DOCS_DESC="Update feedback/bead-quality.md to clarify the Fresh Agent Test. [no-test] — docs-only edit, no code changed."
+assert_allow "docs: feedback/ path passes file-path check (default)" "" \
+  "bd create --title=foo --description=\"$DOCS_DESC\""
+
+# Test 41: docs-only description citing docs/ path → passes
+DOCS2_DESC="Revise docs/architecture.md section on dispatch protocol. [no-test] — documentation only."
+assert_allow "docs: docs/ path passes file-path check (default)" "" \
+  "bd create --title=foo --description=\"$DOCS2_DESC\""
+
+# Test 42: description citing a .md file path → passes
+MD_PATH_DESC="Rewrite CLAUDE.md workflow section for clarity. [no-test] — docs only, no source changes."
+assert_allow "docs: .md extension passes file-path check (default)" "" \
+  "bd create --title=foo --description=\"$MD_PATH_DESC\""
+
+# Test 43: description citing a .json file path → passes
+JSON_PATH_DESC="Update hooks/test/fixtures/sample.json to add new test vectors. Test in hooks/test/test-bead-description-gate.sh."
+assert_allow "docs: .json extension passes file-path check (default)" "" \
+  "bd create --title=foo --description=\"$JSON_PATH_DESC\""
+
+# Test 44: description with NO path of any kind → still flagged (regression guard)
+assert_nudge "docs: pathless description still flagged (default)" "" \
+  "bd create --title=foo --description=\"Fix the thing. Test in the test file.\"" \
+  "file paths"
+
 # ---------- Summary ----------
 
 echo
