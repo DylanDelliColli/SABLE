@@ -301,6 +301,50 @@ goal: by the time execution runs, the beads are scoped well enough to need only
 confirmations and prioritization — the human invests in planning so the swarm
 executes without questions.
 
+#### 3.6.2 Batch Creation with `--graph` — Correct Schema and Known Bugs
+
+`bd create --graph FILE` creates multiple issues in a single command from a JSON plan file. As of bd 0.63.3, the feature works but has two upstream bugs that affect reliability.
+
+**Correct `--graph` JSON schema:**
+
+```json
+{
+  "nodes": [
+    { "key": "A", "title": "Parent Epic", "type": "epic", "description": "..." },
+    { "key": "B", "title": "Child Task",  "type": "task", "parent_key": "A" },
+    { "key": "C", "title": "Blocked Task","type": "task", "parent_key": "A" }
+  ],
+  "edges": [
+    { "from_key": "B", "to_key": "C", "type": "blocks" }
+  ]
+}
+```
+
+Key fields:
+
+| Field | Scope | Notes |
+|---|---|---|
+| `key` | node | Local reference ID — required; unique within the file |
+| `title` | node | Issue title |
+| `type` | node | `epic`, `task`, `bug`, `feature`, `chore` |
+| `description` | node | Issue description |
+| `parent_key` | node | Sets the parent-child hierarchy (epic → child) |
+| `edges` | top-level | Array of dependency edges |
+| `from_key` / `to_key` | edge | Keys matching nodes above |
+| `type` on edges | edge | `"blocks"` for blocking dependency |
+
+**Common wrong-key pitfalls (silently dropped — upstream bug GH#4362):**
+
+The parser silently ignores unknown node-level keys. These commonly-intuited keys do NOT work and produce no warning:
+
+- `"parent": "A"` — use `"parent_key": "A"` instead
+- `"deps": ["B"]` — use a top-level `"edges"` entry instead
+- `"id": "..."` — use `"key": "..."` instead
+
+**Do NOT use `--dry-run` with `--graph` (upstream bug GH#4363):**
+
+`bd create --graph FILE --dry-run` creates real, persisted issues despite the flag name. There is currently no safe way to do a non-destructive preview of a graph file. Validate the JSON structure manually before running. Both bugs are filed upstream; check the issue tracker for fix status.
+
 ### 3.7 Issue Discovery Is Mandatory
 
 Any bug, bad practice, incorrect behavior, pre-existing error, or code smell noticed at any time — by any agent, during any task — must be immediately logged as a bead. This is non-negotiable.
