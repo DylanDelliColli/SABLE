@@ -69,7 +69,7 @@ print(d.get('agent_type', '') or '')
 
   [ -z "$SABLE_ID_NAME" ] && return 0
 
-  local yaml="${SABLE_AGENTS_YAML:-$HOME/.claude/sable/agents.yaml}"
+  local yaml="${SABLE_AGENTS_YAML:-${HOME:-}/.claude/sable/agents.yaml}"
   if [ -f "$yaml" ]; then
     SABLE_ID_TYPE=$(awk -v name="$SABLE_ID_NAME" '
       $0 == "  " name ":" { found = 1; next }
@@ -109,6 +109,26 @@ print(d.get('agent_type', '') or '')
 #
 # Sets: SABLE_DISPATCH_ACTIVE (0|1), SABLE_DISPATCH_LANE (lowercase name or "").
 # Mode-state path override for tests: SABLE_COCKPIT_MODE_FILE.
+# Internal: extract the "Dispatching-for: <name>" attribution from the dispatch
+# prompt in the hook input. Prints the lowercase lane name, or "$2" (default)
+# when no attribution line exists.
+sable__parse_dispatch_for() {
+  local json="${1:-}" default="${2:-cockpit}"
+  local lane
+  lane=$(printf '%s' "$json" | python3 -c "
+import json, sys, re
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+prompt = (d.get('tool_input') or {}).get('prompt', '') or ''
+m = re.search(r'^Dispatching-for:[ \t]*([a-zA-Z0-9_-]+)', prompt, re.M | re.I)
+print(m.group(1).lower() if m else '')
+" 2>/dev/null)
+  [ -z "$lane" ] && lane="$default"
+  printf '%s' "$lane"
+}
+
 sable_resolve_dispatch_lane() {
   local json="${1:-}"
   SABLE_DISPATCH_ACTIVE=0
@@ -121,12 +141,21 @@ sable_resolve_dispatch_lane() {
   if [ "$SABLE_ID_SOURCE" = "env" ]; then
     if [ "$SABLE_ID_IS_MANAGER" -eq 1 ]; then
       SABLE_DISPATCH_ACTIVE=1
-      SABLE_DISPATCH_LANE="$SABLE_ID_NAME"
+      case "$SABLE_ID_TYPE" in
+        cockpit|strategist)
+          # Dispatcher session (v2 Lincoln/cockpit): the dispatch may be on a
+          # manager's behalf — honor the attribution line, default to self.
+          SABLE_DISPATCH_LANE=$(sable__parse_dispatch_for "$json" "$SABLE_ID_NAME")
+          ;;
+        *)
+          SABLE_DISPATCH_LANE="$SABLE_ID_NAME"
+          ;;
+      esac
     fi
     return 0
   fi
 
-  local mode_file="${SABLE_COCKPIT_MODE_FILE:-$HOME/.claude/sable/state/cockpit-mode.json}"
+  local mode_file="${SABLE_COCKPIT_MODE_FILE:-${HOME:-}/.claude/sable/state/cockpit-mode.json}"
   [ -f "$mode_file" ] || return 0
   local mode
   mode=$(MODE_FILE="$mode_file" python3 -c "
@@ -139,16 +168,6 @@ except Exception:
   [ "$mode" = "execution" ] || return 0
 
   SABLE_DISPATCH_ACTIVE=1
-  SABLE_DISPATCH_LANE=$(printf '%s' "$json" | python3 -c "
-import json, sys, re
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    d = {}
-prompt = (d.get('tool_input') or {}).get('prompt', '') or ''
-m = re.search(r'^Dispatching-for:[ \t]*([a-zA-Z0-9_-]+)', prompt, re.M | re.I)
-print(m.group(1).lower() if m else 'cockpit')
-" 2>/dev/null)
-  [ -z "$SABLE_DISPATCH_LANE" ] && SABLE_DISPATCH_LANE="cockpit"
+  SABLE_DISPATCH_LANE=$(sable__parse_dispatch_for "$json" "cockpit")
   return 0
 }

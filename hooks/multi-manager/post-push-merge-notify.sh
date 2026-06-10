@@ -11,32 +11,38 @@
 
 set -euo pipefail
 
-[ -z "${CLAUDE_AGENT_NAME:-}" ] && exit 0
-[ "${CLAUDE_AGENT_ROLE:-}" != "manager" ] && exit 0
-# Don't notify on chuck's own pushes
-[ "$CLAUDE_AGENT_NAME" = "chuck" ] && exit 0
+HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
 
-PARSED=$(python3 -c "
+# Identity via lib-identity.sh (SABLE-uz9.3): fires for any manager identity
+# (legacy env terminals, v2 cockpit/Lincoln main session, manager subagents);
+# workers and anonymous sessions stand down.
+# shellcheck source=lib-identity.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib-identity.sh"
+sable_resolve_identity "$HOOK_INPUT"
+[ "$SABLE_ID_IS_MANAGER" -eq 1 ] || exit 0
+# Don't notify on chuck's own pushes
+[ "$SABLE_ID_NAME" = "chuck" ] && exit 0
+
+PARSED=$(printf '%s' "$HOOK_INPUT" | python3 -c "
 import json, sys
-d = json.load(sys.stdin)
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
 cmd = d.get('tool_input', {}).get('command', '')
-agent_id = d.get('agent_id', '')
 cwd = d.get('cwd', '')
 resp = d.get('tool_response', {})
 stdout = resp.get('stdout', '') if isinstance(resp, dict) else ''
 stderr = resp.get('stderr', '') if isinstance(resp, dict) else ''
-print(f'{agent_id}\n{cwd}\n{cmd}')
+print(f'{cwd}\n{cmd}')
 print('---STDOUT---')
 print(stdout)
 print('---STDERR---')
 print(stderr)
 " 2>/dev/null) || exit 0
 
-NESTED_AGENT_ID=$(echo "$PARSED" | sed -n '1p')
-CWD=$(echo "$PARSED" | sed -n '2p')
-COMMAND=$(echo "$PARSED" | sed -n '3p')
-
-[ -n "$NESTED_AGENT_ID" ] && exit 0
+CWD=$(echo "$PARSED" | sed -n '1p')
+COMMAND=$(echo "$PARSED" | sed -n '2p')
 
 # Only act on successful git push
 echo "$COMMAND" | grep -qE '\bgit\s+push\b' || exit 0

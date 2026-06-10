@@ -32,31 +32,35 @@
 
 set -euo pipefail
 
-[ -z "${CLAUDE_AGENT_NAME:-}" ] && exit 0
-[ "${CLAUDE_AGENT_ROLE:-}" != "manager" ] && exit 0
+HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
 
-PARSED=$(python3 -c "
+# Identity/lane gating via lib-identity.sh (SABLE-uz9.3): legacy manager
+# terminals OR the v2 one-window main session in execution mode; subagent
+# contexts stand down inside sable_resolve_dispatch_lane.
+# shellcheck source=lib-identity.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib-identity.sh"
+sable_resolve_dispatch_lane "$HOOK_INPUT"
+[ "$SABLE_DISPATCH_ACTIVE" -eq 1 ] || exit 0
+
+PARSED=$(printf '%s' "$HOOK_INPUT" | python3 -c "
 import json, sys
-d = json.load(sys.stdin)
-tool_input = d.get('tool_input', {})
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+tool_input = d.get('tool_input', {}) or {}
 prompt = tool_input.get('prompt', '')
 subtype = tool_input.get('subagent_type', '')
 model = tool_input.get('model', '')
-agent_id = d.get('agent_id', '')
-print(agent_id)
 print(subtype)
 print(model)
 print('---PROMPT---')
 print(prompt)
 " 2>/dev/null) || exit 0
 
-NESTED_AGENT_ID=$(echo "$PARSED" | sed -n '1p')
-SUBTYPE=$(echo "$PARSED" | sed -n '2p')
-DISPATCH_MODEL=$(echo "$PARSED" | sed -n '3p')
-PROMPT=$(echo "$PARSED" | sed -n '5,$p')
-
-# Skip subagent context — workers don't dispatch peers
-[ -n "$NESTED_AGENT_ID" ] && exit 0
+SUBTYPE=$(echo "$PARSED" | sed -n '1p')
+DISPATCH_MODEL=$(echo "$PARSED" | sed -n '2p')
+PROMPT=$(echo "$PARSED" | sed -n '4,$p')
 
 # Skip read-only / exploration agents — model is manager's call
 echo "$SUBTYPE" | grep -qiE '^(Explore|Plan|claude-code-guide|general-purpose|feature-dev:code-explorer)$' && exit 0

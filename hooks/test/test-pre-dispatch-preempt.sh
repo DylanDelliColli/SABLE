@@ -28,6 +28,8 @@ agents:
     type: epic_manager
   tarzan:
     type: one_off_manager
+  lincoln:
+    type: strategist
 YAML
 export SABLE_AGENTS_YAML="$FIXTURE_DIR/agents.yaml"
 
@@ -120,6 +122,16 @@ assert_allowed "no mode-state file: inactive outside SABLE context" "$OUT"
 # 9. Subagent context → stand down
 OUT=$(run_hook "$(json a1 optimus 'spawn something')" "" "" "$EXEC_MODE")
 assert_allowed "subagent context stands down" "$OUT"
+
+# 10. Dispatcher-typed env session (lincoln) honors Dispatching-for attribution
+OUT=$(run_hook "$(json '' '' 'Dispatching-for: optimus
+Implement SABLE-abc')" "lincoln" "manager" "")
+assert_denied "env lincoln dispatching for optimus blocked by optimus P0" "$OUT"
+printf '%s' "$OUT" | grep -q "PREEMPTION (optimus)" && pass "env dispatcher lane attribution honored" || fail "env dispatcher lane attribution honored" "got: $OUT"
+
+# 11. Dispatcher-typed env session without attribution defaults to own lane
+OUT=$(run_hook "$(json '' '' 'Explore something')" "lincoln" "manager" "")
+assert_allowed "env lincoln unattributed dispatch uses own clean lane" "$OUT"
 
 echo
 echo "=========================================="
