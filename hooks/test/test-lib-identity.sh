@@ -122,9 +122,83 @@ run_case "malformed hook JSON falls back to env identity" \
   "tarzan" "manager" \
   "tarzan|one_off_manager|env|0|1|1"
 
+# --------------------------------------------------------------------------
+# sable_is_git_push unit tests (SABLE-jpr / SABLE-0u1)
+# --------------------------------------------------------------------------
+# shellcheck disable=SC1090
+source "$LIB"
+
+is_push_test() {
+  local label="$1" cmd="$2" expect_exit="$3"
+  if sable_is_git_push "$cmd"; then
+    local actual=0
+  else
+    local actual=1
+  fi
+  if [ "$actual" -eq "$expect_exit" ]; then
+    pass "$label"
+  else
+    fail "$label" "expected exit $expect_exit, got $actual for cmd: $cmd"
+  fi
+}
+
+is_push_test "sable_is_git_push: plain 'git push'" "git push" 0
+is_push_test "sable_is_git_push: 'git push origin main'" "git push origin main" 0
+is_push_test "sable_is_git_push: 'git -C /x push'" "git -C /x push" 0
+is_push_test "sable_is_git_push: 'git -c a=b push origin main'" "git -c a=b push origin main" 0
+is_push_test "sable_is_git_push: 'git --no-pager push'" "git --no-pager push" 0
+is_push_test "sable_is_git_push: 'git -C /x -c a=b push'" "git -C /x -c a=b push" 0
+is_push_test "sable_is_git_push: 'git pushd' is NOT push" "git pushd" 1
+is_push_test "sable_is_git_push: 'git status' is NOT push" "git status" 1
+is_push_test "sable_is_git_push: text mention only is NOT push" 'bd create --description="git push"' 1
+is_push_test "sable_is_git_push: 'echo git push' is NOT push" "echo git push" 1
+is_push_test "sable_is_git_push: 'git pull' is NOT push" "git pull" 1
+is_push_test "sable_is_git_push: empty string is NOT push" "" 1
+
+# --------------------------------------------------------------------------
+# sable_validate_base_ref unit tests (SABLE-61n)
+# --------------------------------------------------------------------------
+
+# Set up a minimal git repo for ref validation tests
+VAL_REPO=$(mktemp -d)
+VAL_BARE=$(mktemp -d)
+trap 'rm -rf "$VAL_REPO" "$VAL_BARE"' EXIT
+git init -q --bare "$VAL_BARE"
+git clone -q "$VAL_BARE" "$VAL_REPO"
+cd "$VAL_REPO"
+git config user.email "v@test"
+git config user.name "Validator"
+echo "x" > f.txt
+git add f.txt
+git commit -q -m "init"
+git push -q origin HEAD:refs/heads/main 2>/dev/null
+cd - >/dev/null
+
+validate_ref_test() {
+  local label="$1" repo="$2" desired="$3" expected_pattern="$4"
+  # shellcheck disable=SC1090
+  source "$LIB"
+  local result
+  result=$(sable_validate_base_ref "$repo" "$desired")
+  if echo "$result" | grep -qE "$expected_pattern"; then
+    pass "$label"
+  else
+    fail "$label" "expected pattern '$expected_pattern', got '$result'"
+  fi
+}
+
+validate_ref_test "sable_validate_base_ref: valid ref returned unchanged" \
+  "$VAL_REPO" "origin/main" "^origin/main$"
+
+validate_ref_test "sable_validate_base_ref: nonexistent ref falls back to origin/main" \
+  "$VAL_REPO" "origin/nonexistent" "^origin/main$"
+
+validate_ref_test "sable_validate_base_ref: empty repo path returns desired ref unchanged" \
+  "" "origin/dev" "^origin/dev$"
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
 echo "=========================================="
-if [ "$FAIL" -gt 0 ]; then echo -e "Failed tests:$FAIL_NAMES"; exit 1; fi
+if [ "$FAIL" -gt 0 ]; then printf "Failed tests:%b\n" "$FAIL_NAMES"; exit 1; fi
 exit 0

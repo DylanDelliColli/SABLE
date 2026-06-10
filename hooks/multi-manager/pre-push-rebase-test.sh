@@ -61,13 +61,18 @@ print(f'{cwd}\n{cmd}')
 CWD=$(echo "$PARSED" | sed -n '1p')
 COMMAND=$(echo "$PARSED" | sed -n '2,$p')
 
-echo "$COMMAND" | grep -qE '\bgit\s+push\b' || exit 0
+# Use shared matcher so 'git -C <path> push' and other flag-interleaved forms
+# are matched correctly; also prevents false-positives when "git push" appears
+# only as a quoted argument in another command (SABLE-0u1)
+sable_is_git_push "$COMMAND" || exit 0
 echo "$COMMAND" | grep -qE '(\-\-force|\-f\b)' && exit 0
 
 [ -z "$CWD" ] && exit 0
 [ ! -d "$CWD/.git" ] && [ ! -f "$CWD/.git" ] && exit 0
 
-BASE_BRANCH="${SABLE_BASE_BRANCH:-origin/main}"
+# Validate base ref and fall back gracefully when SABLE_BASE_BRANCH points to
+# a ref that doesn't exist in this repo (SABLE-61n)
+BASE_BRANCH=$(sable_validate_base_ref "$CWD" "${SABLE_BASE_BRANCH:-origin/main}")
 
 # ---------------------------------------------------------------------------
 # Helpers
