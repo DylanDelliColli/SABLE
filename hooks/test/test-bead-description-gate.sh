@@ -367,6 +367,49 @@ assert_nudge "docs: pathless description still flagged (default)" "" \
   "bd create --title=foo --description=\"Fix the thing. Test in the test file.\"" \
   "file paths"
 
+# ---------- Short-flag alias tests (-d / -f) (SABLE-iyv) ----------
+
+GOOD_SHORT_DESC="hooks/bead-description-gate.sh line 98: extend HAS_FILE_FLAG regex. Test in hooks/test/test-bead-description-gate.sh — assert_nudge for -f."
+
+# Test 45: bd create -d "<good desc>" → allow in manager mode
+assert_allow "short-alias: -d good desc allowed (manager)" "$MANAGER_ENV" \
+  "bd create --title=foo -d \"$GOOD_SHORT_DESC\""
+
+# Test 46: bd create -d "<good desc>" → allow in default mode
+assert_allow "short-alias: -d good desc allowed (default)" "" \
+  "bd create --title=foo -d \"$GOOD_SHORT_DESC\""
+
+# Test 47: bd create -d "<vague desc>" → deny in manager mode (same verdict as --description vague)
+assert_deny "short-alias: -d vague desc denied (manager)" "$MANAGER_ENV" \
+  "bd create --title=foo -d \"do the thing\"" \
+  "missing"
+
+# Test 48: bd create -d "<vague desc>" → nudge in default mode (same verdict as --description vague)
+assert_nudge "short-alias: -d vague desc nudges (default)" "" \
+  "bd create --title=foo -d \"do the thing\"" \
+  "missing"
+
+# Test 49: bd create -f /tmp/batch.md → nudge only, no deny (manager mode)
+assert_nudge "short-alias: -f file nudge only (manager)" "$MANAGER_ENV" \
+  "bd create --title=foo -f /tmp/batch.md" \
+  "batch/stdin mode"
+
+# Test 50: bd create -f /tmp/batch.md → nudge only, no deny (default mode)
+assert_nudge "short-alias: -f file nudge only (default)" "" \
+  "bd create --title=foo -f /tmp/batch.md" \
+  "batch/stdin mode"
+
+# Test 51: regression — bd create with neither -d nor --description nor any batch flag → still denied (manager)
+assert_deny "short-alias regression: no desc still denied (manager)" "$MANAGER_ENV" \
+  "bd create --title=foo --priority=1" \
+  "no --description"
+
+# Test 52: --description whose CONTENT contains " -d " must not confuse extraction
+# The desc has a literal "-d " inside the value; extraction must pull the full content.
+TRICKY_DESC="hooks/bead-description-gate.sh: check that -d inside a quoted value does not break flag parsing. Test in hooks/test/test-bead-description-gate.sh."
+assert_allow "short-alias: -d inside desc content not confused (manager)" "$MANAGER_ENV" \
+  "bd create --title=foo --description=\"$TRICKY_DESC\""
+
 # ---------- Summary ----------
 
 echo

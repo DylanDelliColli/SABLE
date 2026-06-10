@@ -95,7 +95,7 @@ HAS_GRAPH=0
 echo "$COMMAND" | grep -qE -- '--graph(\s|=)' && HAS_GRAPH=1
 
 HAS_FILE_FLAG=0
-echo "$COMMAND" | grep -qE -- '--file(\s|=)' && HAS_FILE_FLAG=1
+echo "$COMMAND" | grep -qE -- '(--file(\s|=)|(^|\s)-f(\s|=))' && HAS_FILE_FLAG=1
 
 HAS_STDIN=0
 echo "$COMMAND" | grep -q -- '--stdin' && HAS_STDIN=1
@@ -134,17 +134,24 @@ print(json.dumps({
 else
   # No batch mode — require --description inline
 
-  # Extract description content (between quotes after --description)
+  # Extract description content (between quotes after --description or -d)
+  # Anchor on word boundary: (?:--description|-d(?=[ =])) to prevent
+  # a literal " -d " inside a quoted description string from confusing
+  # extraction — the outer flag must appear as a standalone token.
   DESC=$(echo "$COMMAND" | python3 -c "
 import sys, re
 cmd = sys.stdin.read()
-m = re.search(r'--description[= ]\"((?:[^\"\\\\]|\\\\.)*)\"', cmd, re.DOTALL) \
-    or re.search(r\"--description[= ]'((?:[^'\\\\]|\\\\.)*)'\", cmd, re.DOTALL)
+# Match --description or -d (short alias), both space and equals forms.
+# The negative-lookbehind on -d ensures we only match it as a standalone
+# flag (preceded by start-of-string or whitespace), not inside a value.
+flag_pat = r'(?:--description|(?<![^\s])-d)(?:\s|=)'
+m = re.search(flag_pat + r'\"((?:[^\"\\\\]|\\\\.)*)\"', cmd, re.DOTALL) \
+    or re.search(flag_pat + r\"'((?:[^'\\\\]|\\\\.)*)'\" , cmd, re.DOTALL)
 print(m.group(1) if m else '')
 " 2>/dev/null || echo "")
 
-  # No --description at all
-  if ! echo "$COMMAND" | grep -qE -- '--description'; then
+  # No --description / -d at all
+  if ! echo "$COMMAND" | grep -qE -- '(--description|(^|\s)-d(\s|=))'; then
     if [ "$MODE" = "block" ]; then
       python3 -c "
 import json
