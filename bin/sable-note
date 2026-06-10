@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # sable-note — frictionless capture of SABLE methodology observations.
 #
-# Appends a timestamped entry to ~/dev-environment/SABLE/feedback/YYYY-MM-DD.md
+# Appends a timestamped entry to ~/dev-env/SABLE/feedback/YYYY-MM-DD.md
 # (or to $SABLE_FEEDBACK_DIR/YYYY-MM-DD.md if that env var is set).
 #
 # Each entry captures: timestamp, working directory, git context (branch + short

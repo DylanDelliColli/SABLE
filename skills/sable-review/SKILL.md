@@ -2,7 +2,7 @@
 name: sable-review
 description: |
   Review accumulated SABLE methodology feedback captured by `sable-note`.
-  Reads ~/dev-environment/SABLE/feedback/*.md, classifies each observation
+  Reads ~/dev-env/SABLE/feedback/*.md, classifies each observation
   (edit-SABLE / file-as-bead / discuss / discard), proposes specific changes
   with diffs, and after user approval, applies edits to SABLE.md and archives
   processed entries to feedback/processed/.
@@ -25,9 +25,9 @@ Curate raw SABLE feedback (captured via `sable-note`) into actionable changes.
 
 ## Inputs
 
-- `~/dev-environment/SABLE/feedback/*.md` — raw observations (skip `processed/` subdir)
-- `~/dev-environment/SABLE/SABLE.md` — current methodology
-- `~/dev-environment/SABLE/QUICKSTART.md` — current quickstart
+- `~/dev-env/SABLE/feedback/*.md` — raw observations (skip `processed/` subdir)
+- `~/dev-env/SABLE/SABLE.md` — current methodology
+- `~/dev-env/SABLE/QUICKSTART.md` — current quickstart
 - Recent git log for the SABLE repo — what's already been changed
 - (Optional) the user's project context — to ground "is this still a real issue"
 
@@ -36,7 +36,7 @@ Curate raw SABLE feedback (captured via `sable-note`) into actionable changes.
 ### 1. Detect feedback
 
 ```bash
-ls -1 ~/dev-environment/SABLE/feedback/*.md 2>/dev/null
+ls -1 ~/dev-env/SABLE/feedback/*.md 2>/dev/null
 ```
 
 If the dir doesn't exist or no `.md` files: tell the user "No feedback to review. Capture observations with `sable-note '<text>'` first." Then stop.
@@ -51,7 +51,7 @@ For each entry, capture: timestamp, cwd, git context, observation text.
 
 - Read `SABLE.md` (full file) so you know what's already covered.
 - Read `QUICKSTART.md` so you know the public-facing entry point.
-- Run `cd ~/dev-environment/SABLE && git log --oneline -20 -- SABLE.md QUICKSTART.md` to see recent changes — avoid proposing things already done.
+- Run `cd ~/dev-env/SABLE && git log --oneline -20 -- SABLE.md QUICKSTART.md` to see recent changes — avoid proposing things already done.
 
 ### 4. Classify each entry
 
@@ -127,7 +127,7 @@ For DISCUSS items: capture the user's resolution and reclassify (EDIT, BEAD, DIS
 ### 7. Apply approved changes
 
 - **EDITs**: use the Edit tool against `SABLE.md` or `QUICKSTART.md`.
-- **BEADs**: do NOT auto-create. Print the exact `bd create ...` command for the user to run (or, if the user asks, run it from `~/dev-environment/SABLE`). Beads belong in their target rig — don't assume.
+- **BEADs**: do NOT auto-create. Print the exact `bd create ...` command for the user to run (or, if the user asks, run it from `~/dev-env/SABLE`). Beads belong in their target rig — don't assume.
 - **DISCARDs**: no action beyond archiving.
 
 ### 8. Archive processed entries

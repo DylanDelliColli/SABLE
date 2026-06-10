@@ -42,7 +42,7 @@ out="$(cd "$NOPROJ" && printf '%s' "$SS" | HOME="$NOPROJ" CLAUDE_AGENT_NAME=cock
 if [ -z "$out" ]; then pass "no role file → no injection"; else fail "no role file → no injection" "got: $out"; fi
 
 # ---------- gates ----------
-out="$(cd "$PROJ" && printf '%s' "$SS" | CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"   # name unset
+out="$(cd "$PROJ" && printf '%s' "$SS" | env -u CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"   # name unset
 if [ -z "$out" ]; then pass "unset CLAUDE_AGENT_NAME no-ops"; else fail "unset CLAUDE_AGENT_NAME no-ops" "got: $out"; fi
 
 out="$(cd "$PROJ" && printf '%s' "$SS" | CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=auditor bash "$HOOK" 2>/dev/null)"   # non-manager
