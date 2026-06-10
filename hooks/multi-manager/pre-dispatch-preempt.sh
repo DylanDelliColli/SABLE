@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
-# pre-dispatch-preempt.sh — Block dispatch if P0 coord bead in inbox
+# pre-dispatch-preempt.sh — Block dispatch if P0 coord bead in the lane's inbox
 # Trigger: PreToolUse:Agent | Timeout: 3000ms
 #
-# Selective preemption: when a priority=0 bead exists in the manager's inbox
-# (`for-<self>`), the next dispatch is denied until the bead is resolved or
-# explicitly deferred via `bd defer <id>`.
+# Selective preemption: when a priority=0 bead exists in the dispatch lane's
+# inbox (`for-<lane>`), the next dispatch is denied until the bead is resolved
+# or explicitly deferred (`bd defer <id>` — record the reason first via
+# bd update --notes; defer has no --reason flag).
 #
 # Existing dispatched workers are unaffected — only the next dispatch.
 #
-# Escape valve: `bd defer <id> --reason="..."` removes the bead from the active
-# inbox query, so dispatch resumes. Use this when stepping away.
+# Lane resolution via lib-identity.sh sable_resolve_dispatch_lane
+# (SABLE-uz9.3/uz9.4 option A): legacy manager terminals govern their own
+# lane; the v2 one-window main session governs the lane named by the
+# "Dispatching-for: <manager>" prompt line (default cockpit) and only while
+# the cockpit is in execution mode.
 
 set -euo pipefail
 
-[ -z "${CLAUDE_AGENT_NAME:-}" ] && exit 0
-[ "${CLAUDE_AGENT_ROLE:-}" != "manager" ] && exit 0
+HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
 
-NESTED_AGENT_ID=$(python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print(d.get('agent_id', ''))
-" 2>/dev/null) || exit 0
+# shellcheck source=lib-identity.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib-identity.sh"
+sable_resolve_dispatch_lane "$HOOK_INPUT"
 
-# Subagent context — let workers dispatch their own children freely
-[ -n "$NESTED_AGENT_ID" ] && exit 0
+[ "$SABLE_DISPATCH_ACTIVE" -eq 1 ] || exit 0
 
-INBOX_LABEL="for-${CLAUDE_AGENT_NAME}"
+INBOX_LABEL="for-${SABLE_DISPATCH_LANE}"
 
-# Query inbox for P0 items
+# Query the lane's inbox for P0 items
 P0_BEADS=$(bd ready -l "$INBOX_LABEL" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
@@ -47,14 +47,15 @@ except Exception:
 [ -z "$P0_BEADS" ] && exit 0
 
 # P0 in inbox — deny dispatch
-python3 -c "
+P0_BEADS="$P0_BEADS" LANE="$SABLE_DISPATCH_LANE" python3 -c "
 import json, os
 beads = os.environ.get('P0_BEADS', '')
+lane = os.environ.get('LANE', '')
 print(json.dumps({
     'hookSpecificOutput': {
         'hookEventName': 'PreToolUse',
         'permissionDecision': 'deny',
-        'permissionDecisionReason': f'PREEMPTION: priority-0 coord bead(s) in your inbox blocking next dispatch:\n{beads}\n\nResolve with bd close, or defer with bd defer <id> --reason=\"...\" to unblock dispatch (use when AFK or when explicitly setting aside).'
+        'permissionDecisionReason': f'PREEMPTION ({lane}): priority-0 coord bead(s) in the lane inbox blocking next dispatch:\n{beads}\n\nResolve with bd close, or set aside with: bd update <id> --notes \"deferred: <reason>\" (notes overwrites — fetch and append) then bd defer <id>. Use when AFK or explicitly deferring.'
     }
 }))
-" P0_BEADS="$P0_BEADS"
+"

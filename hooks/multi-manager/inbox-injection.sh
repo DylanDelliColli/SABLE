@@ -2,38 +2,43 @@
 # inbox-injection.sh — PostToolUse:Bash, automatic inbox push notification
 # Trigger: PostToolUse:Bash | Timeout: 5000ms
 #
-# After every Bash tool call in a manager's main session, query for-<self> beads.
+# After every Bash tool call by a manager identity, query for-<self> beads.
 # If new (unannounced) beads exist, inject a notification via additionalContext.
 #
-# Critical safety mechanisms:
-#  - Skip if agent_id is present (subagent context — workers must not see manager inbox)
-#  - Skip if CLAUDE_AGENT_NAME unset / CLAUDE_AGENT_ROLE != manager
-#  - Dedup via session-scoped file at /tmp/inbox-seen-${SESSION_ID}
+# Identity via lib-identity.sh (SABLE-uz9.3): manager SUBAGENTS (v2 one-window
+# topology, agent_type from hook input) now RECEIVE inbox injection — the old
+# blanket agent_id fast-exit is gone. Workers and other unregistered subagent
+# types resolve as non-managers and stay excluded, which preserves the original
+# safety property (workers never see manager inbox material).
 #
-# Companion: inbox-injection-precompact.sh clears the dedup file on PreCompact.
+# Dedup is keyed per identity AND session (/tmp/inbox-seen-<session>-<name>)
+# because in v2 multiple manager subagents share one session_id.
+#
+# Companion: inbox-injection-precompact.sh clears the dedup files on PreCompact.
 
 set -euo pipefail
 
-[ -z "${CLAUDE_AGENT_NAME:-}" ] && exit 0
-[ "${CLAUDE_AGENT_ROLE:-}" != "manager" ] && exit 0
+HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
 
-PARSED=$(python3 -c "
+# shellcheck source=lib-identity.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib-identity.sh"
+sable_resolve_identity "$HOOK_INPUT"
+
+[ "$SABLE_ID_IS_MANAGER" -eq 1 ] || exit 0
+
+SESSION_ID=$(printf '%s' "$HOOK_INPUT" | python3 -c "
 import json, sys
-d = json.load(sys.stdin)
-sid = d.get('session_id', '')
-agent_id = d.get('agent_id', '')
-print(f'{sid}\n{agent_id}')
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+print(d.get('session_id', ''))
 " 2>/dev/null) || exit 0
 
-SESSION_ID=$(echo "$PARSED" | sed -n '1p')
-AGENT_ID=$(echo "$PARSED" | sed -n '2p')
-
-# Subagent context — skip
-[ -n "$AGENT_ID" ] && exit 0
 [ -z "$SESSION_ID" ] && exit 0
 
-INBOX_LABEL="for-${CLAUDE_AGENT_NAME}"
-SEEN_FILE="/tmp/inbox-seen-${SESSION_ID}"
+INBOX_LABEL="for-${SABLE_ID_NAME}"
+SEEN_FILE="/tmp/inbox-seen-${SESSION_ID}-${SABLE_ID_NAME}"
 
 # Query inbox (open + ready). Use --json for parseable output.
 INBOX_JSON=$(bd ready -l "$INBOX_LABEL" --json 2>/dev/null || echo "[]")
@@ -81,10 +86,10 @@ print('\n'.join(lines))
 
 [ -z "$NEW_ITEMS" ] && exit 0
 
-NEW_ITEMS="$NEW_ITEMS" python3 -c "
+NEW_ITEMS="$NEW_ITEMS" SABLE_ID_NAME="$SABLE_ID_NAME" python3 -c "
 import json, os
 items = os.environ.get('NEW_ITEMS', '')
-name = os.environ.get('CLAUDE_AGENT_NAME', '').upper()
+name = os.environ.get('SABLE_ID_NAME', '').upper()
 print(json.dumps({
     'hookSpecificOutput': {
         'hookEventName': 'PostToolUse',
