@@ -511,7 +511,41 @@ When to pick which:
 
 **Typecheck is now structurally enforced via Phase 2** (since SABLE-cew). Workers can't ship typecheck regressions through bypass anymore — the static phase runs unconditionally. The dispatch template's typecheck advisory is now belt-and-braces with the hook gate; both layers reinforce the same outcome.
 
-### 6. Post-push Chuck notification
+### 6. Tree claims (one main session per checkout)
+
+**The ba5424d incident.** Two main sessions (Lincoln + a side session) shared the same working tree. The side session ran `git add` and `git commit` while Lincoln had staged resident-manager changes. The side session swept all staged content — including Lincoln's unrelated edits — into its gitignore commit. The commit message was misleading and the diff was wrong. Both sessions had write access to the shared git index with no coordination.
+
+**The rule.** One main session may hold the index-claim on a given checkout at a time. If you need a second concurrent session, create an isolated worktree: `bd worktree create <name>`. Extra sessions in the same checkout must wait or take an explicit override.
+
+**Mechanism.** A `PreToolUse:Bash` hook (`hooks/multi-manager/tree-claim.sh`) fires on every index-mutating git command:
+
+```
+git add, git commit, git rm, git mv, git restore --staged, git reset
+```
+
+Global git flags (`-C`, `-c k=v`, `--no-pager`, etc.) are tolerated. All other commands pass through immediately (non-mutating commands do not touch the claim).
+
+The claim file lives at `$(git -C <cwd> rev-parse --git-dir)/sable-tree-claim` and contains `"session_id timestamp"`. Because `rev-parse --git-dir` resolves to the per-worktree gitdir for `git worktree add` worktrees, each checkout has an independent claim file — the main checkout and any worktrees never compete.
+
+**Claim lifecycle (TTL default: 3600s, override `SABLE_TREE_CLAIM_TTL`):**
+
+| State | Action |
+|-------|--------|
+| No claim file | Write claim for this session, allow |
+| Own claim | Refresh timestamp, allow |
+| Foreign claim, age < TTL | Deny — name the holder, the claim age, and both escape hatches |
+| Foreign claim, age ≥ TTL | Take over (overwrite), allow + `additionalContext` noting the takeover |
+
+**Escape hatches:**
+1. `SABLE_TREE_CLAIM_OVERRIDE=1` — allow the command, take over the claim, emit `additionalContext` recording the override.
+2. Delete the claim file manually (`rm $(git rev-parse --git-dir)/sable-tree-claim`) and retry.
+
+**Fail-open guarantees.** The hook never denies when:
+- The cwd is not inside a git repo (`git rev-parse` fails → exit 0).
+- Session identity is unknowable (no `session_id` in JSON, no `CLAUDE_SESSION_ID` env) → allow + `additionalContext`.
+- The claim file is unreadable or corrupt → take over + allow + `additionalContext`.
+
+### 7. Post-push Chuck notification
 
 A `PostToolUse:Bash` hook matching successful `git push` files a `for-chuck` bead:
 
@@ -548,6 +582,7 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | Hook | Trigger | Purpose | Mode |
 |------|---------|---------|------|
 | `session-role-anchor.sh` | SessionStart, PreCompact | Inject role identity from `~/.claude/sable/roles/<name>.md` | Inject context |
+| `tree-claim.sh` | PreToolUse:Bash | Lockfile: one main session per checkout — deny index-mutating git commands when another session holds a fresh claim (TTL 3600s; `SABLE_TREE_CLAIM_OVERRIDE=1` or manual delete to escape) | Hard deny |
 | `read-guard.sh` | PreToolUse:Bash | Deny `bd ready -l for-<foreign>` queries (Lincoln bypassed via `cross_inbox_read: true`) | Hard deny |
 | `inbox-injection.sh` | PostToolUse:Bash | Inject unread for-self bead notifications (with dedup, agent_id skip) | Inject context |
 | `inbox-injection-precompact.sh` | PreCompact | Clear inbox dedup file so post-compact re-injection re-orients the manager | Side effect (clear cache) |
