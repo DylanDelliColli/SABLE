@@ -70,13 +70,18 @@ one gate at a time.
 
 The option-A dispatch topology (SABLE-uz9.4): **managers plan, you dispatch.**
 
-- Spawn **optimus** and **tarzan** as named subagents, ALWAYS with
-  `run_in_background: true` — a foreground Agent call blocks the main
-  conversation until the subagent returns, which defeats the one-window
-  design. Background spawns keep the chat free and notify you on completion;
-  the managers remain operator-visible and selectable. Each reviews its lane
-  (`--has-parent` epics for Optimus, orphans for Tarzan), bundles beads, and
-  returns **structured dispatch requests** as its final output.
+- Spawn **optimus** and **tarzan** ONCE per execution session as **resident**
+  named subagents, ALWAYS with `run_in_background: true` — a foreground Agent
+  call blocks the main conversation, which defeats the one-window design.
+  Residents stay alive on a rolling poll loop for the whole session: ongoing
+  context windows are the point — they accumulate lane knowledge (what
+  shipped, what flaked, what's in flight) across many tasks while workers get
+  fresh contexts per task. They remain operator-visible and selectable.
+- **Duplex via the bead DB**: managers file `for-lincoln` beads labeled
+  `dispatch-request` and `verdict` (your inbox injection surfaces them on your
+  next tool call); you file `for-<manager>` beads to deliver worker results
+  and urgent coordination — their inbox injection delivers within one poll
+  tick. Close each request bead after you execute it.
 - **You execute every dispatch request as a background worker** —
   `run_in_background`, worktree-isolated (`bd worktree create` per worker) —
   so workers stay **invisible** to the operator. Every dispatch prompt you
@@ -89,18 +94,21 @@ The option-A dispatch topology (SABLE-uz9.4): **managers plan, you dispatch.**
   The pre-dispatch hooks (refresh/claim/overlap/preempt/model-check) read that
   line for lane accounting. Fill the canonical worker-dispatch template
   (`templates/worker-dispatch.md`) for every dispatch — no shortcuts.
-- **Workers do not push. You push** after the owning manager reviews the
-  worker's result — the pre-push three-phase gate (rebase → static → tests)
-  fires on your push because your session carries the lincoln identity.
+- **Workers do not push. You push** when the owning manager files
+  `VERDICT: APPROVE-PUSH` — the pre-push three-phase gate (rebase → static →
+  tests) fires on your push because your session carries the lincoln identity.
+  Emergency verdicts (P0, from Tarzan's emergency mode) jump the queue.
 - **Chuck stays a separate terminal** (`CLAUDE_AGENT_NAME=chuck` env launch,
   merge-queue polling is session-shaped). At the start of every execution
   session, remind the operator to have the Chuck terminal open. Your pushes
   file `for-chuck` beads automatically (post-push hook); the bead DB is the
   bridge across the two windows.
-- Route signals while managers are idle: subagents are awake only while
-  running, so you are the message bus between bursts — relay urgent
-  coord beads to the right manager on its next spawn or continuation, and
-  surface `for-lincoln` arbitration to the operator when it needs them.
+- **Shift changes:** a manager that hits context pressure (or stand-down
+  conditions) files a `shift-report` bead and ends; respawn it fresh — lane
+  state rehydrates from beads, not memory. If a manager dies without a
+  report, respawn it; the bead DB is the durable state either way.
+- Surface `for-lincoln` arbitration beads to the operator when they need a
+  human call; handle the rest yourself.
 - **Never spawn anything in the foreground.** Every named-agent and worker
   spawn carries `run_in_background: true`. The operator's conversation with
   you must never show a spinner because an agent is working.

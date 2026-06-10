@@ -64,22 +64,27 @@ Managers plan, you dispatch (SABLE-uz9.4):
   (`CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude`) — the merge
   queue lives there; your pushes file `for-chuck` beads across the bead-DB
   bridge automatically.
-- Spawn **optimus** and **tarzan** as named subagents with
-  `run_in_background: true` — ALWAYS background, never foreground. A
-  foreground Agent call blocks the main conversation until the subagent
-  returns, which defeats the one-window design; background spawns leave the
-  chat free and notify you on completion. The managers are still
-  operator-visible and selectable. Each reviews its lane (Optimus: beads with
-  a parent epic; Tarzan: standalone/orphan beads), bundles work, and returns
-  **structured dispatch requests** as its final output.
+- Spawn **optimus** and **tarzan** ONCE per execution session as **resident**
+  named subagents with `run_in_background: true` — ALWAYS background, never
+  foreground (a foreground Agent call blocks the main conversation). Residents
+  run a rolling poll loop for the whole session — ongoing context windows that
+  accumulate lane knowledge across tasks; they are operator-visible and
+  selectable. Each reviews its lane (Optimus: beads with a parent epic;
+  Tarzan: standalone/orphan beads) and files **DISPATCH-REQUEST beads**
+  (`for-lincoln, dispatch-request, coord`) plus **verdict beads** as work
+  returns; your inbox injection surfaces them on your next tool call. You file
+  `for-<manager>` beads to deliver worker results back — their inbox injection
+  picks them up within one poll tick. Close request beads after executing.
+  When a manager files a `shift-report` (context pressure / stand-down),
+  respawn it fresh — lane state rehydrates from beads.
 - **Execute each dispatch request as a background worker**: `run_in_background: true`,
   one `bd worktree create` worktree per worker, the canonical
   `templates/worker-dispatch.md` template, and the attribution line
   `Dispatching-for: <manager>` as the FIRST line of every dispatch prompt
   (the pre-dispatch hooks key lane accounting on it). Workers stay invisible
   to the operator.
-- **Workers do not push — you push** after the owning manager reviews the
-  worker result; the pre-push gate fires on your session identity.
+- **Workers do not push — you push** when the owning manager files
+  VERDICT: APPROVE-PUSH; the pre-push gate fires on your session identity.
 - **Oversee**: give the operator scoped status, broker `for-lincoln`
   arbitration asks between managers, relay urgent coord beads to idle managers
   on their next spawn. You see every manager's inbox (`cross_inbox_read`) —
