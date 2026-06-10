@@ -102,6 +102,10 @@ print(d.get('agent_type', '') or '')
 #   git -C /path push
 #   git -c a=b push origin main
 #   git --no-pager push
+#   SABLE_SKIP_PRE_PUSH=1 git push        (env-assignment prefix)
+#   FOO=bar BAZ=qux git -C /x push       (multiple env assignments)
+#   env FOO=bar git push                  (env(1) prefix)
+#   env -u GIT_DIR git push              (env -u NAME prefix)
 #
 # Does NOT match:
 #   Commands where "git push" appears only inside a quoted argument
@@ -111,8 +115,13 @@ print(d.get('agent_type', '') or '')
 # Algorithm:
 #   shlex-tokenize the command (same approach proven in hooks/tdd-gate.sh
 #   post SABLE-sqz).  Walk the token list:
-#     - Find the first `git` token at "command position" (first token, or after
-#       a shell separator: ; && || |).
+#     - At command position, NAME=VALUE tokens are transparent env assignments —
+#       consume them WITHOUT leaving command position.
+#     - At command position, the token `env` is also transparent: after it,
+#       continue consuming NAME=VALUE tokens and -u NAME pairs (env(1) options)
+#       while staying at command position.
+#     - Find the first `git` token at "command position" (first token, after
+#       a shell separator: ; && || |, or after leading env assignments/env(1)).
 #     - Skip git global flags: -C <arg>, -c <arg>, --no-pager, --git-dir=*, --work-tree=*,
 #       --namespace=*, -p/--paginate, -P/--no-pager, --no-replace-objects, --bare,
 #       --literal-pathspecs, --glob-pathspecs, --noglob-pathspecs, --icase-pathspecs,
@@ -123,7 +132,7 @@ sable_is_git_push() {
   local cmd="${1:-}"
   [ -z "$cmd" ] && return 1
   CMD_STR="$cmd" python3 -c "
-import os, shlex, sys
+import os, re, shlex, sys
 
 cmd = os.environ.get('CMD_STR', '')
 try:
@@ -139,10 +148,12 @@ STANDALONE = {
     '--no-pager', '-p', '--paginate', '-P', '--no-replace-objects', '--bare',
     '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs',
     '--icase-pathspecs', '--no-optional-locks', '--html-path', '--man-path',
-    '--info-path', '--version', '--help', '--no-optional-locks',
+    '--info-path', '--version', '--help',
 }
 # prefixes that are standalone flags (--exec-path=, --git-dir=, etc.)
 STANDALONE_PREFIXES = ('--exec-path=', '--git-dir=', '--work-tree=', '--namespace=')
+
+ENV_ASSIGN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
 i = 0
 n = len(tokens)
@@ -154,6 +165,23 @@ while i < n:
         at_cmd_pos = True
         i += 1
         continue
+    # At command position: transparent env-assignment prefix (NAME=VALUE)
+    if at_cmd_pos and ENV_ASSIGN_RE.match(tok):
+        i += 1  # consume assignment, stay at command position
+        continue
+    # At command position: env(1) prefix — consume it and its own options
+    if at_cmd_pos and tok == 'env':
+        i += 1
+        while i < n:
+            t = tokens[i]
+            if ENV_ASSIGN_RE.match(t):
+                i += 1   # env NAME=VALUE — consume, stay in env-option walk
+                continue
+            if t == '-u' and i + 1 < n:
+                i += 2   # env -u NAME — consume both, stay in env-option walk
+                continue
+            break        # next token is the real command — fall through to outer loop
+        continue         # re-evaluate tokens[i] at command position (at_cmd_pos still True)
     if at_cmd_pos and tok == 'git':
         # Found git at command position — now walk flags
         i += 1
@@ -169,7 +197,7 @@ while i < n:
             sys.exit(0 if t == 'push' else 1)
         # Ran out of tokens after git — no subcommand found
         sys.exit(1)
-    # Not at command position or not git
+    # Not at command position or not git/env/assignment
     at_cmd_pos = False
     i += 1
 sys.exit(1)

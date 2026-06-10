@@ -154,6 +154,13 @@ is_push_test "sable_is_git_push: text mention only is NOT push" 'bd create --des
 is_push_test "sable_is_git_push: 'echo git push' is NOT push" "echo git push" 1
 is_push_test "sable_is_git_push: 'git pull' is NOT push" "git pull" 1
 is_push_test "sable_is_git_push: empty string is NOT push" "" 1
+# env-assignment prefix cases (SABLE-531 regression fix)
+is_push_test "sable_is_git_push: 'SABLE_SKIP_PRE_PUSH=1 git push'" "SABLE_SKIP_PRE_PUSH=1 git push" 0
+is_push_test "sable_is_git_push: 'FOO=bar BAZ=qux git -C /x push'" "FOO=bar BAZ=qux git -C /x push" 0
+is_push_test "sable_is_git_push: 'env FOO=bar git push'" "env FOO=bar git push" 0
+is_push_test "sable_is_git_push: 'env -u GIT_DIR git push'" "env -u GIT_DIR git push" 0
+is_push_test "sable_is_git_push: 'echo SABLE_SKIP_PRE_PUSH=1 git push' is NOT push" "echo SABLE_SKIP_PRE_PUSH=1 git push" 1
+is_push_test "sable_is_git_push: 'bd create --description=FOO=1 git push' is NOT push" 'bd create --description="FOO=1 git push"' 1
 
 # --------------------------------------------------------------------------
 # sable_validate_base_ref unit tests (SABLE-61n)

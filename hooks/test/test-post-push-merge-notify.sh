@@ -170,6 +170,11 @@ INPUT=$(make_post_input "echo 'just ran git push'" "$FIXTURE_REPO")
 run_hook "$MGR_ENV" "$INPUT" >/dev/null
 assert_bd_not_called "matcher: 'echo git push' does NOT trigger"
 
+# Test 7b: 'SABLE_SKIP_PRE_PUSH=1 git push' DOES trigger for-chuck (env-assignment prefix, SABLE-531)
+INPUT=$(make_post_input "SABLE_SKIP_PRE_PUSH=1 git push" "$FIXTURE_REPO")
+run_hook "$MGR_ENV" "$INPUT" >/dev/null
+assert_bd_called "matcher: 'SABLE_SKIP_PRE_PUSH=1 git push' triggers for-chuck (env-assignment prefix)"
+
 # Test 8: No manager identity → no-op
 INPUT=$(make_post_input "git push" "$FIXTURE_REPO")
 run_hook "" "$INPUT" >/dev/null

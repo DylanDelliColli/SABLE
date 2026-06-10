@@ -246,6 +246,14 @@ assert_allow "matcher: 'echo git pushed' does NOT trigger gate" \
 assert_allow "matcher: 'git pushd' does NOT trigger gate" \
   "$MGR_ENV" "git pushd" "$REPO_DIR"
 
+# Test 18: 'SABLE_SKIP_PRE_PUSH=1 git push' reaches gate (env-assignment prefix, SABLE-531)
+# The env-assignment is part of the command string seen by the hook; the hook itself is
+# invoked normally (no SABLE_SKIP_PRE_PUSH in the env-i context).  With TEST_PHASE=skip
+# and a passing typecheck the hook should produce additionalContext (phase skipped),
+# confirming it passed the matcher and entered the gate.
+assert_context "matcher: 'SABLE_SKIP_PRE_PUSH=1 git push' reaches gate (env-assignment prefix)" \
+  "$MATCHER_ENV" "SABLE_SKIP_PRE_PUSH=1 git push" "$REPO_DIR" "phase skipped"
+
 # Cleanup
 rm -rf "$REPO_DIR" "$BARE_DIR"
 
