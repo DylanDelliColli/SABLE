@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# DEPRECATED (SABLE-uz9.7): sable-cockpit is no longer the default launch path for the v2
+# one-window topology. The v2 standard is a single Lincoln main session (claude with
+# CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager) that spawns named subagents; no
+# second Zellij pane is required. This helper is kept because the Zellij/sable-status
+# surface may return as an optional pane — do not delete.
 # sable-cockpit — launch the cockpit + dashboard in a two-pane Zellij layout.
 #
 # Resolves the installed layout (~/.claude/sable/layouts/sable.kdl), falling

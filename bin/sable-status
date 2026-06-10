@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# DEPRECATED (SABLE-uz9.7): sable-status is no longer the default surface for the v2
+# one-window topology. The Lincoln main session + named subagents pattern does not require
+# a separate dashboard pane. This binary is kept because the dashboard may return as an
+# optional pane in a future iteration — do not delete. The Zellij/sable-status surface has
+# been superseded by the one-window topology documented in COCKPIT-DESIGN.md.
 """sable-status — read-only cockpit dashboard for the second Zellij pane.
 
 Polls the cockpit mode-state, the bead pool, and the live agent processes, and

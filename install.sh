@@ -62,7 +62,7 @@ print_dep_hint() {
 }
 
 # 1. Verify bd is installed (check both bd and bd.exe for Windows)
-bold "Step 1/5: Verify bd is installed"
+bold "Step 1/6: Verify bd is installed"
 if command -v bd >/dev/null 2>&1; then
     BD_CMD="bd"
 elif command -v bd.exe >/dev/null 2>&1; then
@@ -84,7 +84,7 @@ fi
 echo
 
 # 2. Verify Claude config dir exists
-bold "Step 2/5: Verify ~/.claude exists"
+bold "Step 2/6: Verify ~/.claude exists"
 if [ ! -d "${CLAUDE_DIR}" ]; then
     yellow "  ~/.claude not found. Creating it."
     mkdir -p "${CLAUDE_DIR}"
@@ -93,7 +93,7 @@ green "  OK"
 echo
 
 # 3. Copy hooks (chmod is a no-op on Windows but doesn't error)
-bold "Step 3/5: Copy hooks to ${HOOKS_DST}"
+bold "Step 3/6: Copy hooks to ${HOOKS_DST}"
 mkdir -p "${HOOKS_DST}"
 for hook in "${HOOKS_SRC}"/*.sh; do
     name="$(basename "${hook}")"
@@ -109,8 +109,29 @@ if [ "${OS_NAME}" = "Windows (Git Bash / MSYS)" ]; then
     echo
 fi
 
-# 4. Prepend Prime Directives to CLAUDE.md (with backup)
-bold "Step 4/5: Add Prime Directives to ${GLOBAL_CLAUDE_MD}"
+# 4. Copy agent definitions to ~/.claude/agents/ (idempotent; preserves non-SABLE agent files)
+bold "Step 4/6: Copy agent definitions to ${CLAUDE_DIR}/agents/"
+AGENTS_SRC="${TEMPLATE_DIR}/agents"
+AGENTS_DST="${CLAUDE_DIR}/agents"
+if [ -d "${AGENTS_SRC}" ]; then
+    mkdir -p "${AGENTS_DST}"
+    SABLE_AGENT_NAMES="columbo optimus rudy sherlock tarzan victor"
+    for name in ${SABLE_AGENT_NAMES}; do
+        src="${AGENTS_SRC}/${name}.md"
+        dst="${AGENTS_DST}/${name}.md"
+        if [ -f "${src}" ]; then
+            cp "${src}" "${dst}"
+            green "  ${name}.md"
+        fi
+    done
+    green "  Agent definitions installed (non-SABLE agent files preserved)"
+else
+    yellow "  templates/agents/ not found — skipping agent definitions install"
+fi
+echo
+
+# 5. Prepend Prime Directives to CLAUDE.md (with backup)
+bold "Step 5/6: Add Prime Directives to ${GLOBAL_CLAUDE_MD}"
 if [ ! -f "${PRIME_TEMPLATE}" ]; then
     red "  Missing template: ${PRIME_TEMPLATE}"
     exit 1
@@ -131,8 +152,8 @@ else
 fi
 echo
 
-# 5. Print settings.json snippet (do NOT auto-edit — settings is too important to clobber)
-bold "Step 5/5: Settings.json hook block"
+# 6. Print settings.json snippet (do NOT auto-edit — settings is too important to clobber)
+bold "Step 6/6: Settings.json hook block"
 echo "Add the following block to your ${SETTINGS_FILE} under the top-level 'hooks' key."
 echo "If you already have a 'hooks' key, merge carefully (don't overwrite existing entries)."
 echo
@@ -185,5 +206,6 @@ echo
 echo "Next steps:"
 echo "  1. Paste the hook block above into ${SETTINGS_FILE} (merge with existing config)."
 echo "  2. In your project: bd init && bd hooks install"
-echo "  3. Open a fresh agent session and use the bootstrap prompt from QUICKSTART.md"
-echo "  4. Verify: see 'Verify the install' section of QUICKSTART.md"
+echo "  3. Agent definitions are now in ${CLAUDE_DIR}/agents/ — restart Claude Code for them to take effect."
+echo "  4. Open a fresh agent session and use the bootstrap prompt from QUICKSTART.md"
+echo "  5. Verify: see 'Verify the install' section of QUICKSTART.md"

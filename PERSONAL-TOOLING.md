@@ -8,7 +8,7 @@ Contents:
 - `skills/audit-deep-dive/SKILL.md` — Claude Code skill for converting AUDIT: beads into epic+children
 - `skills/columbo/SKILL.md` + `skills/columbo/columbo-prefilter.py` — Claude Code skill that delivers the Columbo test-coverage planning workflow without requiring the multi-manager registry, role files, agent identity, or coordination hooks. Use this on machines where you want Columbo's interview + skeleton-test output but not the full multi-manager pattern (typical for work computers where you bounce between many repos). Invokable as `/columbo` once installed at `~/.claude/skills/columbo/`.
 - `MULTI-MANAGER-PATTERN.md` — experimental coordination pattern for power-user multi-agent swarms. Eight-agent roster: continuous execution managers (Optimus / Tarzan / Chuck), session-scoped planning agents (Sherlock / Victor / Rudy / Columbo), and execution-session strategist (Lincoln). Companion `hooks/multi-manager/`, `templates/multi-manager/`, `bin/columbo-prefilter.py` (Columbo's audit-mode triage tool), and `bin/sable-agents` reminder helper.
-- `COCKPIT-DESIGN.md` + cockpit tooling — a Planning/Execution UI over the multi-manager roster. One `cockpit` session you talk to; `/plan` fills the bead pool, `/execute` drains it. Companion `bin/sable-mode`, `bin/sable-status` (Textual dashboard), `bin/sable-cockpit`, `skills/cockpit-plan`, `skills/cockpit-execute`, `hooks/multi-manager/cockpit-mode-interlock.sh`, `templates/multi-manager/layouts/sable.kdl`. See install step 4 below.
+- `COCKPIT-DESIGN.md` + cockpit tooling — v2 one-window topology: one Lincoln main session hosts Optimus and Tarzan as resident subagents; Chuck stays a second terminal. Planning is a five-stage gated machine (framing → research → architecture → test-strategy → decomposition) controlled by `/plan` and `/execute`. Companion `bin/sable-mode`, `hooks/multi-manager/cockpit-mode-interlock.sh`, `skills/cockpit-plan`, `skills/cockpit-execute`. See install step 4 below. **Note**: `bin/sable-status`, `bin/sable-cockpit`, and `templates/multi-manager/layouts/sable.kdl` are deprecated (v1 Zellij surface) — not deleted, may return as an optional pane.
 
 ## Columbo: skill vs. multi-manager pattern
 
@@ -107,8 +107,8 @@ Files:
 - `templates/multi-manager/agents.yaml` — the agent registry / source of truth (the cockpit is registered here)
 - `hooks/multi-manager/cockpit-mode-interlock.sh` — the mode interlock (PreToolUse:Bash); honors `SABLE_COCKPIT=off`
 - `hooks/multi-manager/session-role-anchor.sh` — identity injection (SessionStart+PreCompact); resolves the role project-first then user
-- `bin/sable-status` + `bin/test_sable_status.py` — the read-only dashboard (requires `textual`)
-- `bin/sable-cockpit` + `templates/multi-manager/layouts/sable.kdl` — one-command Zellij launch
+- `bin/sable-status` + `bin/test_sable_status.py` — **DEPRECATED** (v1 Zellij surface) — read-only dashboard, kept for possible future use as optional pane
+- `bin/sable-cockpit` + `templates/multi-manager/layouts/sable.kdl` — **DEPRECATED** (v1 Zellij surface) — one-command Zellij launch, kept for possible future use
 - `bin/sable-cockpit-install` — the installer (below)
 
 Install with the installer (do NOT hand-copy):
@@ -144,11 +144,17 @@ interlock no-ops. Unset to re-enable. The interlock is already self-gating (it
 only acts in a `CLAUDE_AGENT_NAME=cockpit` session), so it never touches your
 normal sessions regardless.
 
-Requirements: `zellij` (https://zellij.dev — runs inside Windows Terminal, no
-emulator swap) and the `textual` Python package (`python3 -m pip install textual`).
-If zellij is absent, `sable-cockpit` prints the manual two-pane workaround. After
-installing, **restart the session** (skills + hooks load at startup), then launch
-with `sable-cockpit` and type `/plan` or `/execute` in the cockpit pane.
+Requirements: the `textual` Python package (`python3 -m pip install textual`) for
+the deprecated `sable-status` dashboard only. `zellij` (https://zellij.dev) is
+required only for the deprecated `sable-cockpit` helper. **The v2 one-window
+topology requires neither** — launch Lincoln directly with:
+
+```bash
+lincoln   # or: CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude
+```
+
+After installing, **restart the session** (skills + hooks load at startup), then
+type `/plan` or `/execute` in the Lincoln session.
 
 Note: the installer is self-sufficient — `/plan`, `/execute`, the dashboard, the
 interlock, **and identity injection** (the cockpit session auto-adopts

@@ -1,137 +1,206 @@
-# SABLE Cockpit — Planning / Execution mode UI
+# SABLE Cockpit — v2 Design (one-window topology)
 
-> **Status: design — `personal-tooling` branch.** Reference artifact for the
-> SABLE-cockpit epic. The execution contract is the beads, not this file; this
-> doc exists so a fresh agent can understand *why* the beads are shaped the way
-> they are. Extends [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md).
+> **Status: v2 — `sable-v2` branch.** Reference artifact for the SABLE v2
+> one-window topology. The execution contract is the beads, not this file; this
+> doc exists so a fresh agent can understand *why* the topology is shaped the
+> way it is. Extends [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md).
 
-## Problem
+## The v2 topology in brief
 
-The multi-manager pattern is powerful but operationally heavy: the operator
-juggles up to four-plus terminals (Optimus / Tarzan / Chuck / Lincoln, plus
-session-scoped producers), mentally tracks which agents are filling the bead
-pool versus draining it, and re-derives cross-agent state by hand. The agents
-and their coordination machinery are good; the **surface** is the friction.
+SABLE v2 reduces the operator surface to **one primary window**: a Lincoln main
+session (`CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude`) that
+spawns Optimus and Tarzan as **resident manager subagents** (one spawn per
+session, bead-DB duplex protocol). Chuck remains a second terminal — a
+deliberate hybrid holdout, explained below.
 
-## Core insight
+```
+┌─ Lincoln main session (one window) ─────────────────────────────────────┐
+│ You talk here. Lincoln is the strategist + overseer.                     │
+│                                                                           │
+│ Resident subagents (spawned once at session start, live in background):  │
+│   ● Optimus  — epic_manager, claims --has-parent beads                   │
+│   ● Tarzan   — one_off_manager, claims --no-parent beads                 │
+│                                                                           │
+│ Background workers (invisible, dispatched on demand by Optimus/Tarzan):  │
+│   ○ worker-1, worker-2, ... (Explore/Agent subagents, short-lived)       │
+│                                                                           │
+│ Identity: ledger-based (agent_type in hook input JSON). Fallback:        │
+│   env-var CLAUDE_AGENT_NAME/CLAUDE_AGENT_ROLE for terminal sessions.     │
+└──────────────────────────────────────────────────────────────────────────┘
 
-The pattern already has an implicit Planning/Execution split — it's latent in
-the tier structure:
+┌─ Chuck terminal (second window, env-var identity) ──────────────────────┐
+│ CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude                 │
+│ Runs the merge queue continuously. Always-on, session-shaped.            │
+│ Receives for-chuck beads from post-push-merge-notify.                    │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+Lincoln pushes completed work; the hook suite (pre-push gate, post-push notify)
+fires in the Lincoln session. Chuck's `for-chuck` notification beads land via
+the bead DB — a cross-boundary handoff that needs no IPC.
+
+## Chuck: the hybrid holdout
+
+Chuck stays an env-var terminal (`CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager
+claude`) rather than a subagent because **always-on merge-queue polling is
+session-shaped** — subagents cannot self-schedule or block-poll. A Claude Code
+subagent runs to completion and exits; Chuck's loop (`/loop 3m /inbox`) never
+reaches completion. Chuck therefore lives as a persistent main session with
+env-var identity, exactly as in v1.
+
+No code changes to Chuck's role or hooks were needed for v2. The env-var
+fallback from SABLE-uz9.3 keeps his suite live. Chuck's coordination hooks
+(`inbox-injection.sh`, `pre-push-rebase-test.sh`, `post-push-merge-notify.sh`)
+are all triggered by `CLAUDE_AGENT_ROLE=manager` — satisfied by env-var.
+
+### Cross-boundary handoff — verified evidence
+
+The v2 topology's cross-boundary handoff was verified during the SABLE-uz9.4
+live scenario: after Lincoln (with resident Optimus/Tarzan subagents) pushed
+work, the `post-push-merge-notify.sh` hook filed **SABLE-m7c** ("Review PR
+from lincoln: sable-v2", labels `coord`, `for-chuck`). Chuck's inbox-injection
+hook picked this up in the next poll cycle.
+
+Evidence on record:
+- **Bead ID**: SABLE-m7c
+- **Title**: "Review PR from lincoln: sable-v2"
+- **Labels**: `coord`, `for-chuck`
+- **How produced**: `post-push-merge-notify.sh` fired during the SABLE-uz9.4
+  live scenario (controlled re-fire with `origin/main` after findings
+  SABLE-jpr/61n/8rv). The hook requires no knowledge of whether the pushing
+  session is a main session or subagent — it just fires on a successful `git
+  push` matching `CLAUDE_AGENT_ROLE=manager`. The bead DB is the bridge.
+- **Implication**: the two-window topology works end-to-end. Lincoln's session
+  fires the notify hook; Chuck's inbox-injection hook (polling `for-chuck`
+  beads) delivers the message. No new IPC required.
+
+### Chuck migration options (revisit later)
+
+Chuck's env-var terminal model is correct for now. If future scenarios warrant
+migrating Chuck to the one-window topology, the options are:
+
+1. **Scheduled main-session wakeups** — Lincoln periodically invokes Chuck's
+   merge-queue logic as a short-lived subagent, accepting up-to-N-minute latency
+   on merge processing.
+2. **Cron routine** — an external cron job spawns a Claude Code session with
+   Chuck's identity at a fixed interval (e.g. every 3 minutes), runs the inbox
+   check, and exits.
+3. **Push-event routing through Lincoln** — the post-push hook files a
+   `for-lincoln` coord bead instead of (or in addition to) `for-chuck`; Lincoln
+   triages and routes to Chuck when a Chuck session is not running.
+
+None of these are better than the current approach today. Revisit when: (a) the
+operator no longer wants a second terminal, or (b) Chuck's polling frequency
+creates usage pressure that outweighs the simplicity cost.
+
+## Core insight: the bead pool as mode hinge
+
+The v2 topology preserves the v1 planning/execution split at the semantic level:
 
 - **Tier-2 producers** (Sherlock, Columbo, Gaudi, Victor) *fill and groom the
-  bead pool*. The continuous-mode hooks deliberately no-op for them.
-- **Tier-1 + integrator** (Optimus, Tarzan, Chuck) plus the **Tier-3
-  strategist** (Lincoln) *drain the pool*. The whole coordination surface —
-  inbox injection, claim/overlap/preempt, the pre-push gate — fires only for
-  `CLAUDE_AGENT_ROLE=manager`.
+  bead pool*. They are session-scoped: user invokes them, they run, they exit.
+- **Tier-1 managers** (Optimus, Tarzan) plus the **strategist** (Lincoln) *drain
+  the pool*. All coordination hooks fire for `CLAUDE_AGENT_ROLE=manager`.
 
-The cockpit promotes that latent split to a first-class surface. **The mode is a
-property of one cockpit session; the bead pool is the hinge both modes pivot
-on.** Planning fills it, Execution drains it. Because the bead DB is durable,
-you can plan one day and execute the next — the UI is the beads-as-state
-principle made visible.
+The bead pool is the hinge: planning fills it, execution drains it. The v2
+change is that Optimus and Tarzan now live inside Lincoln's main session as
+resident subagents, not as separate terminals.
 
-## What changes vs. what is reused
+## Planning Mode — fill the pool (staged, human-in-the-loop)
 
-**Reused unchanged:** `agents.yaml` registry, every role file, all twelve
-coordination hooks, the bead DB, identity injection, inbox + read-guard,
-`sable-note`, every existing skill. The *engine does not change* — only the
-surface does. Producers and managers run exactly as they do today.
+Planning is a gated substage state machine run from within the Lincoln session.
+The five substages are ordered and each requires human sign-off before advance:
 
-**New (small surface):**
+1. **FRAMING** — Lincoln (strategist hat, live conversation): scope, constraints,
+   goal statement. Human reviews and approves the frame before proceeding.
+2. **RESEARCH** — Sherlock (greenfield audit): filing finding beads, identifying
+   design gaps and unknowns. Sherlock self-reviews, addresses, exits.
+3. **ARCHITECTURE** — Gaudi (`--epic`): structural design, component breakdown,
+   interface contracts. Output: locked architecture review attached to the epic.
+4. **TEST-STRATEGY** — Columbo (`--epic`): test contract per component, skeleton
+   test files, gap analysis. Output: `columbo-test-spec` beads + `*.skel.test.*`
+   files.
+5. **DECOMPOSITION** — Lincoln + Victor: decompose architecture into
+   implementation beads, validate pool freshness, finalize the backlog.
 
-| Piece | What it is |
-|-------|------------|
-| `cockpit` role | Lincoln evolved: the single named session you talk to. Launcher + overseer (Execution) + planning-director (Planning). |
-| `/plan`, `/execute` skills | Flip the cockpit's mode: swap injected persona context, write the mode-state file, set which fleet is launchable. |
-| mode-state file | `~/.claude/sable/state/cockpit-mode.json` → `{mode, since, fleet[]}`. Single source of truth read by the interlock hook and the dashboard. |
-| mode interlock (1 hook) | `PreToolUse:Bash` guard. Planning: blocks spawning execution managers and blocks `git push` of code (don't drain a half-formed backlog). Execution: blocks spawning planning-only producers. Soft — `--force` override. The *mechanical guarantee* the two modes buy. |
-| `sable-status` binary | Read-only dashboard — the one real build. Polls bead DB + `claude agents --json` + mode-state; renders per-mode rows. |
-| `sable.kdl` layout | Git-syncable Zellij layout opening `cockpit ∣ sable-status`. Runs inside Windows Terminal; no emulator swap. |
+The interlock (`cockpit-mode-interlock.sh`) blocks execution-manager spawns and
+code `git push` until `substage=decomposition`, so a half-formed plan cannot
+reach execution. The bare epic shell is created early as the planning home Gaudi
+and Columbo attach locked reviews to.
 
-## How the swarm runs underneath (the hybrid)
+## Execution Mode — drain the pool
 
-The cockpit spawns managers and producers as **pinned background sessions**
-(`claude agents`, with `CLAUDE_AGENT_NAME`/`CLAUDE_AGENT_ROLE` set at spawn so
-OS-level identity, hooks, and parallelism are all intact). You primarily talk to
-the cockpit; you can **attach** to any agent to watch or intervene. The
-dashboard renders all of them from `claude agents --json` + bead state. One
-surface to the operator, full multi-agent fidelity underneath.
+In execution mode, Lincoln oversees the resident subagents:
 
-Critically: **managers always run with their hooks live** — they only exist
-during execution anyway. The mode does *not* change the managers; it changes
-what the cockpit is allowed to launch and which persona it wears. This keeps the
-interlock clean and avoids a global-state race between a planning cockpit and a
-draining manager.
+- Optimus and Tarzan run their dispatch loops autonomously (claiming beads,
+  dispatching workers, reviewing, pushing).
+- Lincoln gives status, brokers `for-lincoln` arbitration, and helps the user
+  think strategically.
+- All execution hooks are live: inbox injection, pre-dispatch
+  refresh/claim/overlap/preempt/model-check, pre-push gate, post-push notify.
+- Chuck handles the merge queue in the second terminal, receiving `for-chuck`
+  beads from Lincoln's post-push hook.
 
-## The two modes
+## Identity: ledger-based vs. env-var
 
-### Planning Mode — fill the pool (staged, human-in-the-loop)
-- Cockpit walks the **gated substage machine**: FRAMING (cockpit, Lincoln
-  strategist hat, live) → RESEARCH (Sherlock greenfield) → ARCHITECTURE (Gaudi
-  `--epic`) → TEST-STRATEGY (Columbo `--epic`) → DECOMPOSITION (cockpit +
-  Victor). The human signs off before each `sable-mode substage advance`.
-- Launches Tier-2 producers as background sessions for the research / architecture
-  / test-strategy stages.
-- Interlock blocks execution-manager spawn, code `git push`, and backlog
-  population (`bd create --parent`/`--graph`/`--file`) until
-  `substage=decomposition` — the bare epic shell is allowed early as the
-  producers' planning home.
-- Dashboard emphasizes: current substage, pool growing, findings per producer,
-  dep graph forming.
+V2 uses **dual identity modes**:
 
-### Execution Mode — drain the pool
-- Cockpit wears the overseer/strategist persona (Lincoln's original job):
-  launches Optimus / Tarzan / Chuck, gives status, brokers `for-lincoln`
-  arbitration.
-- All execution hooks live (unchanged).
-- Interlock blocks spawning planning-only producers from the cockpit.
-- Dashboard emphasizes: managers + workers, burn-down, merge queue, overlaps,
-  push-gate status, inbox.
+| Mode | When used | How hooks discriminate |
+|------|-----------|------------------------|
+| **Ledger-based** (`agent_type` in hook input JSON) | Resident subagents (Optimus, Tarzan) spawned inside Lincoln's session | Hooks read `agent_type` from the `agent_id`-qualified hook input to determine the agent's role |
+| **Env-var** (`CLAUDE_AGENT_NAME` / `CLAUDE_AGENT_ROLE`) | Terminal sessions (Lincoln, Chuck) and pre-v2 installs | Hooks read `$CLAUDE_AGENT_NAME` and `$CLAUDE_AGENT_ROLE` from the process environment |
 
-### Dashboard sketch
+Subagents dispatched via the `Agent` tool carry `agent_id` in the hook input.
+This is the discriminator: `agent_id` present → subagent context; absent →
+main-session context. The env-var fallback remains fully functional for any
+agent launched from a terminal (Chuck, Lincoln, or standalone installs).
 
-```
-PLANNING                                    EXECUTION
-┌ sable-status ──────────────┐    ┌ sable-status ──────────────┐
-│ MODE: ▣ PLANNING           │    │ MODE: ▶ EXECUTION          │
-│ pool  ▁▂▃▄▅ 14 ready ↑     │    │ pool  ▅▄▃▂▁ 14→9 burn ↓    │
-│ deps  3 blocked            │    │ optimus ▶ bd-205 · 2 wkrs  │
-│ producers                  │    │ tarzan  ▶ bd-198 push      │
-│   sherlock  6 findings     │    │ chuck   ⧗ merge queue (2)  │
-│   columbo   4 specs        │    │ overlap bd-205⇄147 foo.ts  │
-│   gaudi     2 arch-gaps    │    │ push-gate optimus: tests ✓ │
-│   victor    pool fresh 7m  │    │ inbox   for-lincoln (1)    │
-└────────────────────────────┘    └────────────────────────────┘
-```
+## Supersedes: v1 Zellij/sable-status surface
 
-Same binary, same poll loop; the mode banner selects which rows to emphasize.
+The v1 topology (documented in git history) required:
+- A two-pane **Zellij** layout (`templates/multi-manager/layouts/sable.kdl`)
+  opening a cockpit pane (left) and a `sable-status` dashboard pane (right).
+- **`bin/sable-status`** — a Textual Python dashboard polling the bead DB,
+  `claude agents --json`, and the mode-state file.
+- **`bin/sable-cockpit`** — a helper that resolved and launched the Zellij
+  layout.
+- **`~/.claude/sable/state/cockpit-mode.json`** — the mode-state file
+  toggled by `/plan` and `/execute` skills.
 
-## Host: Zellij
+These pieces are **deprecated** (marked with DEPRECATED headers) but not
+deleted — the dashboard may return as an optional monitoring pane in a future
+iteration. The v1 full text lives in git history; it is not kept inline.
 
-No attachment to Windows Terminal + cross-machine sync via `git pull` → Zellij
-runs *inside* Windows Terminal (no emulator swap), its layout is a **KDL file
-that travels in the repo**, and it has a native status bar and friendly keys.
-`zellij --layout sable.kdl` is the one launch command. (WezTerm is the
-alternative if replacing the emulator is ever desired; avoid `wt split-pane` —
-the layout is not a syncable artifact.) The dashboard binary is host-agnostic;
-only the ~20-line layout file changes per host.
+**Why replaced:** the two-pane surface added operational complexity
+(Zellij dependency, layout file maintenance, dashboard binary) that proved
+unnecessary once Optimus and Tarzan became resident subagents. The bead DB and
+Lincoln's natural strategist role already surface status on demand. The Zellij
+surface added no information that `bd ready` and `/inbox` don't already provide.
 
-## Build order
+## What is reused from v1 (unchanged)
 
-1. `cockpit` role + identity registration + `/plan` `/execute` skills +
-   mode-state file. *The modes exist and the persona flips; useful alone.*
-2. Mode interlock hook. *The mechanical guarantee.*
-3. `sable-status` dashboard binary. *The visible payoff.*
-4. `sable.kdl` Zellij layout + launch wiring.
-5. UI/UX iteration pass on the Zellij/dashboard surface (explicitly expected —
-   the layout and dashboard ergonomics will need real dogfooding).
-6. Docs: extend `PERSONAL-TOOLING.md` + `MULTI-MANAGER-PATTERN.md` with cockpit
-   install/usage.
+- All twelve coordination hooks in `hooks/multi-manager/` — unchanged.
+- The `agents.yaml` registry and all role files — unchanged.
+- The bead DB as the single coordination surface — unchanged.
+- Chuck's continuous merge-queue discipline — unchanged.
+- All six planning agents (Sherlock, Victor, Rudy, Columbo + Lincoln + Gaudi)
+  and their session-scoped invocation patterns — unchanged.
+- The `/inbox` slash command — unchanged.
+- The mode interlock (`cockpit-mode-interlock.sh`) — unchanged, guards the
+  planning/execution boundary in the Lincoln session.
+- `bin/sable-mode` — unchanged, reads/writes mode-state.
 
-## Out of scope (YAGNI)
+## The installer (install.sh)
 
-Web/Electron dashboard, hosting the chat PTY ourselves, multi-repo control,
-clickable bead graph, rewriting producers as dynamic workflows. All re-addable
-later; none needed for a single power operator. The producer-as-workflow upgrade
-is a deliberate future option, not v1.
+`install.sh` now ships:
+
+1. The six named agent definitions (`templates/agents/*.md`) to
+   `~/.claude/agents/` (idempotent; preserves any non-SABLE agent files already
+   present — only the six SABLE agents are written).
+2. The hook suite (unchanged).
+3. Prime Directives prepended to `~/.claude/CLAUDE.md`.
+4. Settings.json snippet for hook registration (printed, not auto-applied).
+
+The multi-manager cockpit installer (`bin/sable-cockpit-install`) installs the
+cockpit-specific pieces (interlock, identity injection, `/plan`/`/execute`
+skills, registry, layout) separately with project or user scope.

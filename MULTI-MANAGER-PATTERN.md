@@ -70,7 +70,7 @@ Clustering by file means each validator reads its sources once and judges every 
 
 | Agent | Type | Scope | Lifecycle |
 |-------|------|-------|-----------|
-| **Lincoln** | strategist | Status reporting, strategic conversation, cross-manager brokering during execution sessions | Runs in a 4th terminal alongside Optimus / Tarzan / Chuck. Three modes: Quick strategy, Arbitration, What's next. Idle-polls inbox via `/loop 5m /inbox`. |
+| **Lincoln** | strategist | Status reporting, strategic conversation, cross-manager brokering during execution sessions | The primary window in v2: one main session that hosts Optimus and Tarzan as resident subagents. Chuck runs in a second terminal. Three modes: Quick strategy, Arbitration, What's next. Idle-polls inbox via `/loop 5m /inbox`. |
 
 Lincoln is the agent the user **primarily talks to** during a working session. Optimus / Tarzan / Chuck are autonomous — they don't need conversation, they need beads. Lincoln gives status, brokers `for-lincoln` arbitration asks from the other three, and helps the user think strategically without becoming an orchestrator. Lincoln has `cross_inbox_read: true` (bypasses the read guard so it can give status across all managers) and may file `for-X` coord beads (one-line, not detailed specs).
 
@@ -106,62 +106,58 @@ sable-agents victor       # single agent + role file path
 
 ---
 
-## The Cockpit (Planning/Execution surface)
+## The v2 topology (one-window)
 
-The roster above is powerful but operationally heavy — you juggle several
-terminals and track by hand which agents are *filling* the bead pool versus
-*draining* it. The **cockpit** promotes that latent split to a first-class
-surface. See [`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md) for the full rationale;
-the summary:
+SABLE v2 reduces the operator surface to **one primary window**. See
+[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md) for the full rationale; the summary:
 
-A single **cockpit** session (Lincoln evolved — `roles/cockpit.md`, registered
-in `agents.yaml` as `type: cockpit`) is the one session you talk to. It runs in
-one of two modes at a time, flipped by the `/plan` and `/execute` skills:
+A single **Lincoln main session** (`CLAUDE_AGENT_NAME=lincoln
+CLAUDE_AGENT_ROLE=manager claude`) is the one session you talk to. Optimus and
+Tarzan run as **resident manager subagents** inside it — spawned once at session
+start, receiving DISPATCH-REQUEST messages from Lincoln, living in the
+background. Chuck stays a separate terminal (env-var identity) because always-on
+merge-queue polling is session-shaped — see the "Chuck hybrid holdout" section in
+[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md).
 
-| Mode | Job | Fleet it launches | Interlock blocks |
-|------|-----|-------------------|------------------|
-| **planning** | fill & groom the pool via the staged substages (FRAMING → RESEARCH → ARCHITECTURE → TEST-STRATEGY → DECOMPOSITION) | Tier-2 producers (Sherlock/Columbo/Gaudi/Victor) | execution-manager spawns, code `git push`, and backlog population (`bd create --parent`/`--graph`/`--file`) until `substage=decomposition` |
-| **execution** | drain the bead pool | Optimus / Tarzan / Chuck | planning-only producer spawns from the cockpit |
+| Mode | Job | Mechanics |
+|------|-----|-----------|
+| **Planning** | fill & groom the pool via the staged substages (FRAMING → RESEARCH → ARCHITECTURE → TEST-STRATEGY → DECOMPOSITION) | Lincoln runs the substage machine; Tier-2 producers invoked on demand; interlock blocks execution dispatches until `substage=decomposition` |
+| **Execution** | drain the bead pool | Lincoln oversees resident Optimus + Tarzan subagents; Chuck handles merge queue in second terminal |
 
-The mode is a property of the cockpit session only — **managers always run with
-their hooks live** (they exist only during execution anyway). The mode governs
-what the cockpit may launch and which persona it wears, which avoids a
-planning-cockpit vs draining-manager race.
+Planning is staged, not a single step. The five substages are:
 
-**Planning is staged, not a single step.** Planning mode is a gated substage
-state machine — FRAMING (cockpit, Lincoln strategist hat, live) → RESEARCH
-(Sherlock greenfield) → ARCHITECTURE (Gaudi `--epic`) → TEST-STRATEGY (Columbo
-`--epic`) → DECOMPOSITION (cockpit + Victor) — and the human signs off before
-each `sable-mode substage advance`. The interlock blocks the cockpit from
-populating the implementation backlog until `substage=decomposition`, so a
-half-formed plan can't reach execution; the bare epic shell is created early as
-the planning home Gaudi/Columbo `--epic` attach their locked review to. See
-[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md) and the `/plan` skill.
+- **FRAMING** (Lincoln strategist hat, live conversation)
+- **RESEARCH** (Sherlock greenfield — findings → beads, exits)
+- **ARCHITECTURE** (Gaudi `--epic` — locked review attached to the epic)
+- **TEST-STRATEGY** (Columbo `--epic` — test-spec beads + skeleton files)
+- **DECOMPOSITION** (Lincoln + Victor — finalize implementation backlog)
+
+Human signs off before each `sable-mode substage advance`. The interlock blocks
+the Lincoln session from populating the implementation backlog until
+`substage=decomposition`. See [`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md) and the
+`/plan` skill.
 
 Mechanics:
 
 - **`bin/sable-mode`** — reads/writes the mode-state file
   `~/.claude/sable/state/cockpit-mode.json` (`{mode, since, fleet, substage}`).
-  The single source of truth shared by the skills, the interlock, and the
-  dashboard. `sable-mode substage get|set|advance` walks the planning substages.
+  The single source of truth shared by the skills and the interlock.
+  `sable-mode substage get|set|advance` walks the planning substages.
 - **`/plan` and `/execute`** (`skills/cockpit-plan`, `skills/cockpit-execute`) —
-  flip the mode and swap the cockpit's persona.
+  flip the mode and swap Lincoln's persona.
 - **`hooks/multi-manager/cockpit-mode-interlock.sh`** — the mechanical guarantee.
   A `PreToolUse:Bash` guard that enforces the mode boundary (soft `--force` /
-  `SABLE_COCKPIT_FORCE=1` override). No-ops for non-cockpit and subagent
+  `SABLE_COCKPIT_FORCE=1` override). No-ops for non-Lincoln and subagent
   contexts. Registered first in the `Bash` matcher in `settings-snippet.json`.
-- **`bin/sable-status`** — a read-only dashboard for the second pane. Polls the
-  mode-state, the bead pool (`bd ready` / `bd blocked` / label counts), and
-  `claude agents --json`, rendering per-mode rows. `sable-status --once` prints
-  one frame; the default is a live Textual loop.
-- **`bin/sable-cockpit`** + **`templates/multi-manager/layouts/sable.kdl`** — one
-  command opens a two-pane Zellij layout (cockpit | dashboard). Zellij runs
-  inside your existing terminal; the KDL layout is a git-syncable artifact, so
-  the only host-specific file travels with the repo.
+- **`bin/sable-status`** *(deprecated v1 surface — see below)*
+- **`bin/sable-cockpit`** + **`templates/multi-manager/layouts/sable.kdl`**
+  *(deprecated v1 surface — see below)*
 
-The hybrid topology: the cockpit launches agents as **pinned background
-sessions** (identity set at spawn, so hooks + parallelism stay intact) and you
-can attach to any. One surface to you; full multi-agent fidelity underneath.
+**Deprecated v1 surface (not deleted):** The v1 topology used a two-pane Zellij
+layout (`sable-cockpit` + `sable-status` dashboard). These files are kept with
+DEPRECATED headers because the dashboard may return as an optional monitoring
+pane. They do not affect v2 operation. See [`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md)
+§ "Supersedes: v1 Zellij/sable-status surface" for the full rationale.
 
 ---
 
@@ -169,28 +165,44 @@ can attach to any. One surface to you; full multi-agent fidelity underneath.
 
 Each manager launches with an immutable identity established at the OS level, not in conversation context.
 
-### Launch aliases
+### Launch aliases (legacy / Chuck-only in v2)
+
+In v2, **Optimus and Tarzan are resident subagents** spawned by Lincoln — you do
+not launch them from the shell directly. The Lincoln alias is still needed for
+the main session, and Chuck still requires an env-var terminal (see
+[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md) for the Chuck hybrid holdout rationale).
+
+**Minimum for a v2 execution session:**
 
 ```bash
 # In ~/.zshrc or equivalent
 
-# Tier 1 — continuous execution managers (CLAUDE_AGENT_ROLE=manager triggers
-# the continuous-mode hooks: inbox injection, pre-dispatch refresh/claim/
-# overlap/preempt/model-check, pre-push gate, post-push notify)
-alias optimus='CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager claude'
-alias tarzan='CLAUDE_AGENT_NAME=tarzan CLAUDE_AGENT_ROLE=manager claude'
-alias chuck='CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude'
-
-# Tier 3 — execution-session strategist (runs as a manager so it gets
-# inbox injection and the read-guard bypass via cross_inbox_read)
+# Primary session — the one window you talk to
 alias lincoln='CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude'
 
-# Tier 2 — session-scoped planning agents (CLAUDE_AGENT_ROLE not "manager",
-# so continuous-mode hooks no-op; pass scope as the initial prompt)
+# Chuck's terminal — merge queue, always-on, env-var identity required
+alias chuck='CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude'
+```
+
+Optimus and Tarzan are started by Lincoln via `claude --agent-id` / the Agent
+tool; no shell aliases needed. Planning agents are also still invokable directly
+if you want to run a standalone session:
+
+```bash
+# Session-scoped planning agents (continuous-mode hooks no-op for these roles)
 sherlock() { CLAUDE_AGENT_NAME=sherlock CLAUDE_AGENT_ROLE=auditor          claude "$@"; }
 victor()   { CLAUDE_AGENT_NAME=victor   CLAUDE_AGENT_ROLE=bead_validator   claude "$@"; }
 rudy()     { CLAUDE_AGENT_NAME=rudy     CLAUDE_AGENT_ROLE=quality_validator claude "$@"; }
 columbo()  { CLAUDE_AGENT_NAME=columbo  CLAUDE_AGENT_ROLE=test_planner     claude "$@"; }
+```
+
+**Legacy (pre-v2 / standalone installs):** if you are running Optimus or Tarzan
+as separate terminal sessions rather than as subagents, the original aliases
+still work:
+
+```bash
+alias optimus='CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager claude'
+alias tarzan='CLAUDE_AGENT_NAME=tarzan CLAUDE_AGENT_ROLE=manager claude'
 ```
 
 Hooks inherit the Claude Code process's environment. An agent running `export CLAUDE_AGENT_NAME=tarzan` inside a Bash tool only affects that subshell, which is discarded after the command. The env var is effectively immutable from the agent's perspective.
@@ -201,9 +213,21 @@ Hooks inherit the Claude Code process's environment. An agent running `export CL
 
 A `SessionStart` hook reads `$CLAUDE_AGENT_NAME`, loads the corresponding role file from `~/.claude/sable/roles/<name>.md`, and injects it as the agent's identity context. A `PreCompact` hook re-injects after compaction (identity erodes silently otherwise).
 
-### Subagent context discrimination
+### Dual identity mode (v2)
 
-Subagents dispatched via the `Agent` tool inherit the parent's environment, so `$CLAUDE_AGENT_NAME` propagates. To prevent subagents from being mistaken for managers (and triggering manager-specific hooks), every relevant hook checks for the `agent_id` field in hook input JSON:
+V2 supports two identity modes that coexist:
+
+| Mode | Context | Mechanism |
+|------|---------|-----------|
+| **Env-var** | Terminal sessions (Lincoln, Chuck, standalone agents) | `CLAUDE_AGENT_NAME` / `CLAUDE_AGENT_ROLE` set in the shell before launch; hooks read them from the process environment |
+| **Ledger-based** | Resident subagents (Optimus, Tarzan) inside Lincoln's session | `agent_type` field in hook input JSON; the agent's named definition (`~/.claude/agents/<name>.md`) sets identity at spawn time |
+
+The ledger-based mode is what `claude --agent-id` / the `Agent` tool uses when
+spawning named agents from `~/.claude/agents/`. The env-var mode is the fallback
+for terminal sessions and remains fully functional — Chuck's env-var identity is
+correct and required for his continuous polling model.
+
+In practice, the hooks use the `agent_id` discriminator to tell contexts apart:
 
 ```bash
 AGENT_ID=$(jq -r '.agent_id // empty')
@@ -212,7 +236,15 @@ if [ -n "$AGENT_ID" ]; then
 fi
 ```
 
-`agent_id` is documented to be **present in subagent contexts and absent in main-session contexts**. This is the discriminator. Without it, env-var-based identity would leak from manager sessions into their dispatched subagents.
+`agent_id` is **present in subagent contexts and absent in main-session contexts**.
+This is the discriminator for all manager-specific hooks (inbox injection,
+pre-dispatch refresh/claim/overlap/preempt, pre-push gate, post-push notify).
+Without it, env-var-based identity would leak from manager sessions into their
+dispatched subagents.
+
+### Subagent context discrimination
+
+Subagents dispatched via the `Agent` tool inherit the parent's environment, so `$CLAUDE_AGENT_NAME` propagates. Every relevant hook checks for `agent_id` as above. The ledger-based agents (Optimus, Tarzan) additionally carry their identity in the agent definition file injected at spawn — the env-var in the environment is their parent's (Lincoln's) identity, not theirs, so hooks must rely on the input JSON for correct discrimination.
 
 ---
 
@@ -547,7 +579,27 @@ All twelve hooks live in `hooks/multi-manager/`. Every continuous-mode hook (eve
 3. The six existing SABLE hooks installed and registered in `~/.claude/settings.json`
 4. Bead descriptions reliably naming files (verify with `bd lint`)
 
-### Step 1: Install registry and roles
+### Step 1: Install agent definitions
+
+```bash
+# install.sh does this automatically — run it instead of copying by hand.
+# Manual copy (same idempotent logic):
+mkdir -p ~/.claude/agents
+for name in columbo optimus rudy sherlock tarzan victor; do
+    cp templates/agents/${name}.md ~/.claude/agents/${name}.md
+done
+```
+
+The named agent definitions in `~/.claude/agents/` are the v2 identity source
+for resident subagents (Optimus, Tarzan). Non-SABLE agent files in
+`~/.claude/agents/` are preserved — the installer only writes the six SABLE
+agents by name.
+
+**Note:** edit the role source files in `templates/multi-manager/roles/` and
+re-run `bin/sable-build-agents` (then `install.sh`) to propagate changes. Hand-
+edits to `~/.claude/agents/` are overwritten on the next install.
+
+### Step 2: Install registry and roles
 
 ```bash
 mkdir -p ~/.claude/sable/roles
@@ -557,7 +609,7 @@ cp templates/multi-manager/roles/*.md ~/.claude/sable/roles/
 
 Edit `~/.claude/sable/agents.yaml` to match your agent set (rename, add, remove as needed).
 
-### Step 2: Install hooks
+### Step 4: Install hooks
 
 ```bash
 mkdir -p ~/.claude/hooks/multi-manager
@@ -565,18 +617,18 @@ cp hooks/multi-manager/*.sh ~/.claude/hooks/multi-manager/
 chmod +x ~/.claude/hooks/multi-manager/*.sh
 ```
 
-### Step 3: Install slash command
+### Step 5: Install slash command
 
 ```bash
 mkdir -p ~/.claude/commands
 cp templates/multi-manager/commands/inbox.md ~/.claude/commands/inbox.md
 ```
 
-### Step 4: Register hooks in `settings.json`
+### Step 6: Register hooks in `settings.json`
 
 Add to your existing `~/.claude/settings.json` (do not replace — append to existing arrays). See [`templates/multi-manager/settings-snippet.json`](templates/multi-manager/settings-snippet.json) for the exact JSON to merge.
 
-### Step 5: Configure base branch and test phase (per repo)
+### Step 7: Configure base branch and test phase (per repo)
 
 ```bash
 # In each repo's project CLAUDE.md or shell wrapper
@@ -595,16 +647,17 @@ Defaults: `SABLE_BASE_BRANCH=origin/main`, `SABLE_PRE_PUSH_TEST_PHASE=auto`, `SA
 
 If you need a longer test budget in auto mode, remember to raise `"timeout"` in settings.json to match — see Coordination mechanism 5 for the coupling rule. Or switch to skip mode if your repo already has a native pre-push hook.
 
-### Step 6: Add aliases
+### Step 8: Add aliases
 
-See [Identity & immutability → Launch aliases](#launch-aliases) for the full set. Minimum viable for an execution session is the manager trio plus Lincoln; planning agents can be added incrementally as you start using them.
+See [Identity & immutability → Launch aliases](#launch-aliases) for the v2 set.
+**Minimum for a v2 execution session** is just Lincoln and Chuck — Optimus and
+Tarzan are resident subagents, not separate shells. Add planning agent functions
+when you start running planning sessions.
 
 ```bash
-# In ~/.zshrc — start with the execution-session set:
-alias optimus='CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager claude'
-alias tarzan='CLAUDE_AGENT_NAME=tarzan CLAUDE_AGENT_ROLE=manager claude'
-alias chuck='CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude'
+# In ~/.zshrc — minimum for v2:
 alias lincoln='CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude'
+alias chuck='CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude'
 
 # Add when you start running planning sessions:
 sherlock() { CLAUDE_AGENT_NAME=sherlock CLAUDE_AGENT_ROLE=auditor          claude "$@"; }
@@ -613,12 +666,12 @@ rudy()     { CLAUDE_AGENT_NAME=rudy     CLAUDE_AGENT_ROLE=quality_validator clau
 columbo()  { CLAUDE_AGENT_NAME=columbo  CLAUDE_AGENT_ROLE=test_planner     claude "$@"; }
 ```
 
-### Step 7: Verify
+### Step 9: Verify
 
-In separate terminals:
+In your Lincoln terminal:
 
 ```bash
-optimus    # session opens; SessionStart hook should inject Optimus role
+lincoln    # session opens; SessionStart hook should inject Lincoln role
 ```
 
 Inside that session:
@@ -627,9 +680,15 @@ Inside that session:
 > /inbox
 ```
 
-Should return Optimus's addressed beads (or "Inbox empty" if none). Try `bd ready -l for-tarzan` — should be denied by the read guard.
+Should return Lincoln's addressed beads (or "Inbox empty" if none). Try `bd ready -l for-tarzan` — should be denied by the read guard (Lincoln does not have cross-inbox read for Tarzan).
 
-For each agent you've added an alias/function for, repeat: launch, confirm role injection ran (the SessionStart message will reference the role file), confirm `/inbox` returns the right `for-<name>` set (or rejects with "not in multi-manager identity context" for Sherlock, which has no inbox). `sable-agents <name>` should print details for any registered agent — useful for spot-checking that the registry was copied to `~/.claude/sable/agents.yaml` correctly.
+Confirm that the agent definitions installed correctly:
+
+```bash
+ls ~/.claude/agents/   # should list columbo.md optimus.md rudy.md sherlock.md tarzan.md victor.md
+```
+
+`sable-agents <name>` should print details for any registered agent — useful for spot-checking that the registry was copied to `~/.claude/sable/agents.yaml` correctly.
 
 ---
 
