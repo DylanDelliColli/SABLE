@@ -24,7 +24,7 @@ echo "$COMMAND" | grep -q '^bd close' || exit 0
 
 # Extract bead IDs from the close command. Strategy: shlex-tokenize the
 # string, then keep only tokens that match the bead-ID shape
-# (PREFIX-suffix or PREFIX-suffix.N, with uppercase prefix + lowercase
+# (PREFIX-suffix or PREFIX-suffix.N, with any-case prefix + lowercase
 # alphanumeric suffix). This naturally excludes flags (--reason, --json),
 # flag values (text after a flag), pipes (|), redirects (2>&1, > file),
 # and command chains (&&, ||, ;) — none of those tokens look like a
@@ -33,6 +33,8 @@ echo "$COMMAND" | grep -q '^bd close' || exit 0
 # Replaces the previous sed pipeline (SABLE-1n2: missed --flag value
 # forms) and the shlex+flag-walker variant (SABLE-sqz: missed pipe /
 # redirect / chain tokens since they aren't flags but aren't IDs either).
+# Updated to accept lowercase prefixes (SABLE-i2m) for rigs using twine-*,
+# chess-*, or other any-case prefix schemes.
 BEAD_ARGS=$(BEAD_CMD="$COMMAND" python3 -c "
 import os, re, shlex
 cmd = re.sub(r'^bd close\s+', '', os.environ.get('BEAD_CMD', ''))
@@ -40,7 +42,7 @@ try:
     tokens = shlex.split(cmd)
 except ValueError:
     tokens = []
-ID_PATTERN = re.compile(r'^[A-Z][A-Z0-9]*-[a-z0-9]+(\.[0-9]+)?\$')
+ID_PATTERN = re.compile(r'^[A-Za-z][A-Za-z0-9]*-[a-z0-9]+(\.[0-9]+)?\$')
 ids = [t for t in tokens if ID_PATTERN.match(t)]
 print(' '.join(ids))
 ")

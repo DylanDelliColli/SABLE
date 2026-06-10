@@ -191,6 +191,26 @@ assert_hatch_used "dotted child bead ID alone" \
 assert_hatch_used "dotted child bead ID piped" \
   'bd close SABLE-rjv.1 2>&1'
 
+# ---------- New: lowercase-prefix rigs (SABLE-i2m fix) ----------
+# Bead prefixes can be lowercase (twine-*, chess-*) on some rigs.
+# The ID_PATTERN regex must accept any-case prefixes so the [no-test]
+# escape hatch fires for single-close on lowercase IDs.
+
+assert_hatch_used "lowercase bare ID" \
+  'bd close twine-stub'
+
+assert_hatch_used "lowercase ID with --reason" \
+  'bd close twine-stub --reason "docs only"'
+
+assert_hatch_used "lowercase ID piped" \
+  'bd close twine-stub 2>&1 | tail -3'
+
+assert_hatch_used "lowercase dotted child ID" \
+  'bd close chess-ab.1'
+
+assert_hatch_skipped "two lowercase beads still route to evidence check" \
+  'bd close twine-stub twine-other --reason=cleanup'
+
 # ---------- Summary ----------
 
 echo
