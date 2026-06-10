@@ -144,7 +144,7 @@ agents:
     scope: "The one operator-facing main session: strategist + mode-aware fleet launch; /plan fills the pool via producer subagents, /execute drains it via manager subagents + background workers"
     claim_filter: null         # doesn't claim — directs, dispatches, oversees
     inbox_label: for-lincoln   # arbitration asks from managers, direction from user
-    role_prompt: roles/cockpit.md
+    role_prompt: roles/lincoln.md
     dispatches_workers: true   # executes manager dispatch requests as background workers
     cross_inbox_read: true     # must see every agent's plate to oversee both modes
     files_addressed_beads: true      # may file for-X coord/direction beads

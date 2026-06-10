@@ -40,7 +40,7 @@ assert_field() {
 
 assert_field "lincoln type is cockpit (the seat)" '.lincoln.type'             "cockpit"
 assert_field "lincoln cross_inbox_read true"      '.lincoln.cross_inbox_read' "true"
-assert_field "lincoln role_prompt path"           '.lincoln.role_prompt'      "roles/cockpit.md"
+assert_field "lincoln role_prompt path"           '.lincoln.role_prompt'      "roles/lincoln.md"
 
 # The standalone cockpit agent entry must be GONE (merged into lincoln).
 if printf '%s' "$OUT" | jq -e '.cockpit' >/dev/null 2>&1; then

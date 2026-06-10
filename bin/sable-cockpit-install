@@ -123,7 +123,8 @@ PY
 
 if [ "$UNINSTALL" = "1" ]; then
     rm -rf "$SKILLS/plan" "$SKILLS/execute"
-    rm -f "$BASE/sable/roles/cockpit.md" "$BASE/sable/layouts/sable.kdl" \
+    rm -f "$BASE/sable/roles/lincoln.md" "$BASE/sable/roles/cockpit.md" \
+          "$BASE/sable/layouts/sable.kdl" \
           "$BASE/sable/agents.yaml" "$INTERLOCK_DEST" "$ROLEANCHOR_DEST"
     remove_hooks "$SETTINGS"
     echo "Cockpit uninstalled from $BASE (scope: $SCOPE)."
@@ -135,7 +136,10 @@ fi
 mkdir -p "$SKILLS/plan" "$SKILLS/execute" "$BASE/sable/roles" "$BASE/sable/layouts" "$HOOKS_DIR"
 cp "$REPO/skills/cockpit-plan/SKILL.md"                   "$SKILLS/plan/SKILL.md"
 cp "$REPO/skills/cockpit-execute/SKILL.md"                "$SKILLS/execute/SKILL.md"
-cp "$REPO/templates/multi-manager/roles/cockpit.md"      "$BASE/sable/roles/cockpit.md"
+cp "$REPO/templates/multi-manager/roles/lincoln.md"      "$BASE/sable/roles/lincoln.md"
+# v2 (SABLE-uz9.5): the agent is lincoln; remove a stale installed cockpit role
+# so a legacy CLAUDE_AGENT_NAME=cockpit session doesn't anchor outdated content.
+rm -f "$BASE/sable/roles/cockpit.md"
 cp "$REPO/templates/multi-manager/layouts/sable.kdl"     "$BASE/sable/layouts/sable.kdl"
 cp "$REPO/templates/multi-manager/agents.yaml"           "$BASE/sable/agents.yaml"
 cp "$REPO/hooks/multi-manager/cockpit-mode-interlock.sh" "$INTERLOCK_DEST"
@@ -149,7 +153,7 @@ python3 -c "import textual" 2>/dev/null || \
 
 echo "Cockpit installed to $BASE (scope: $SCOPE)."
 echo "  • Registry (agents.yaml) + identity injection (session-role-anchor) installed —"
-echo "    a CLAUDE_AGENT_NAME=cockpit session now adopts roles/cockpit.md at startup."
+echo "    a CLAUDE_AGENT_NAME=lincoln session now adopts roles/lincoln.md at startup."
 echo "  • /plan and /execute become available after you restart the session."
 echo "  • Launch the cockpit:  sable-cockpit"
 echo "  • Disable anytime without uninstalling:  export SABLE_COCKPIT=off"

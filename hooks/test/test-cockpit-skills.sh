@@ -90,6 +90,21 @@ init_sub="$(SABLE_COCKPIT_STATE="$STATE_TMP2" "$MODE_BIN" substage get 2>/dev/nu
 if [ "$init_sub" = "framing" ]; then pass "documented /plan step 1 initializes substage=framing"; else fail "documented /plan step 1 initializes substage=framing" "got '$init_sub'"; fi
 rm -f "$STATE_TMP2"
 
+# 9. v2 one-window topology (SABLE-uz9.5 / uz9.4 option A)
+assert_grep "$PLAN_SKILL" "lincoln"          "/plan addresses Lincoln (v2 identity)"
+assert_grep "$PLAN_SKILL" "subagent"         "/plan spawns producers as subagents"
+assert_grep "$PLAN_SKILL" "gaudi.*skill\|skill.*gaudi" "/plan runs gaudi as an inline skill"
+assert_grep "$EXEC_SKILL" "lincoln"          "/execute addresses Lincoln (v2 identity)"
+assert_grep "$EXEC_SKILL" "Dispatching-for"  "/execute carries the dispatch attribution convention"
+assert_grep "$EXEC_SKILL" "run_in_background" "/execute dispatches workers as invisible background agents"
+assert_grep "$EXEC_SKILL" "Chuck terminal"   "/execute reminds the operator about the Chuck terminal"
+assert_grep "$EXEC_SKILL" "do not push"      "/execute keeps the push path with Lincoln"
+
+# 10. DECOMPOSITION post-batch-create verification (SABLE-xy1)
+assert_grep "$PLAN_SKILL" "bd dep tree"        "/plan DECOMPOSITION verifies edges via bd dep tree"
+assert_grep "$PLAN_SKILL" "bd ready"           "/plan DECOMPOSITION sanity-checks bd ready"
+assert_grep "$PLAN_SKILL" "bd swarm validate"  "/plan DECOMPOSITION runs bd swarm validate"
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

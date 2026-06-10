@@ -15,7 +15,7 @@ layout {
         // Left: the cockpit. Identity is set inline so the SessionStart role
         // injection + coordination hooks apply. ~60% width.
         pane size="60%" name="cockpit" command="bash" {
-            args "-c" "CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager claude"
+            args "-c" "CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude"
         }
         // Right: the live read-only status dashboard. ~40% width.
         pane size="40%" name="sable-status" command="sable-status"

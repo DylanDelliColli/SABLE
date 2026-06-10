@@ -22,7 +22,8 @@ allowed-tools:
 
 # /plan — enter PLANNING mode (staged, human-in-the-loop)
 
-You are the **cockpit** (see `roles/cockpit.md`). Planning mode's job is NOT to
+You are **Lincoln** in the cockpit seat (see `roles/lincoln.md`). Planning
+mode's job is NOT to
 dump a backlog as fast as possible — it is to do the human-in-the-loop thinking
 that makes execution boring. You move through five substages; **the human signs
 off before each advance**, and the interlock mechanically blocks you from
@@ -51,30 +52,36 @@ producers attach their review to.
 Check position with `sable-mode substage get`. Advance ONLY after the human signs
 off on the current deliverable: `sable-mode substage advance`.
 
-### FRAMING — owner: the cockpit, Lincoln strategist hat (live with the user)
+### FRAMING — owner: you, strategist hat (live with the user)
 Most human-intensive, not parallelizable. Run it as a conversation via
 `/office-hours` or `/plan-ceo-review`. Produce: user stories, non-goals, success
 metric, the narrowest valuable wedge. Stand up the bare epic shell and record the
-framing artifact on it. (This is Lincoln's strategist identity expressed in
-planning — same essence that does status/arbitration in execution.)
+framing artifact on it. (This is the strategist identity expressed in planning —
+same essence that does status/arbitration in execution.)
 
-### RESEARCH — owner: Sherlock (greenfield mode); fallback: cockpit `/deep-research`
-Prior art, domain pitfalls, unknowns to de-risk. Dispatch Sherlock as a
-background session (not governed by the interlock). Surface findings to the user.
+### RESEARCH — owner: sherlock subagent (greenfield mode); fallback: `/deep-research`
+Prior art, domain pitfalls, unknowns to de-risk. Spawn the **sherlock** named
+subagent with the research scope in the spawn prompt (e.g. "scope: --research
+'<topic>'"). The interlock allows producer subagents in planning mode. Surface
+findings to the user.
 
-### ARCHITECTURE — owner: Gaudi (`gaudi --epic <id>`)
-Lock interface contracts, system-design tradeoffs, smell risks. Gaudi appends the
-locked decisions to the epic's notes.
+### ARCHITECTURE — owner: the /gaudi skill, run inline (`/gaudi --epic <id>`)
+Lock interface contracts, system-design tradeoffs, smell risks. Gaudi is a
+SKILL, not a subagent — it runs in your own conversation. It appends the locked
+decisions to the epic's notes.
 
-### TEST-STRATEGY — owner: Columbo (`columbo --epic <id>`)
+### TEST-STRATEGY — owner: columbo subagent (`--epic` in the spawn prompt)
 Lock the test contract: boundary cases, failure modes, the unit+integration
-matrix per story. Columbo appends the locked test architecture to the epic.
+matrix per story. Spawn the **columbo** named subagent; it appends the locked
+test architecture to the epic.
 
-### DECOMPOSITION — owner: the cockpit + Victor
+### DECOMPOSITION — owner: you + a victor subagent
 The interlock now unblocks backlog population. Author the implementation children
 under the epic — each tracing to a story + acceptance scenario, passing the Fresh
-Agent Test (file paths, unit+integration test spec). Victor freshness pass, then
-`bd swarm validate <epic-id>`.
+Agent Test (file paths, unit+integration test spec, fingerprint + verify
+command). Spawn **victor** for a freshness pass, then run the post-batch-create
+verification: `bd dep tree <epic-id>` (edges match intent), `bd ready` (children
+that should be blocked are NOT ready), and `bd swarm validate <epic-id>`.
 
 ## 3. Open-questions ledger
 

@@ -29,7 +29,7 @@ assert_grep() { if grep -qi -- "$2" "$1" 2>/dev/null; then pass "$3"; else fail 
 assert_file "$LAYOUT" "sable.kdl exists"
 assert_grep "$LAYOUT" "layout"                     "layout declares a layout block"
 assert_grep "$LAYOUT" "pane"                        "layout has panes"
-assert_grep "$LAYOUT" "CLAUDE_AGENT_NAME=cockpit"   "left pane launches the cockpit identity"
+assert_grep "$LAYOUT" "CLAUDE_AGENT_NAME=lincoln"   "left pane launches the lincoln identity (v2, SABLE-uz9.5)"
 assert_grep "$LAYOUT" "claude"                      "left pane runs claude"
 assert_grep "$LAYOUT" "sable-status"                "right pane runs the dashboard"
 

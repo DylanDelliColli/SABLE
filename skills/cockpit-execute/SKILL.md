@@ -2,11 +2,12 @@
 name: execute
 description: |
   Flip the SABLE cockpit into EXECUTION mode — drain the bead pool. Writes the
-  cockpit mode-state file via `sable-mode set execution`, adopts the overseer
-  persona (Lincoln's original strategist job plus fleet launch), and launches
-  Optimus / Tarzan / Chuck as pinned background sessions to claim and ship work.
-  In execution mode the interlock hook blocks spawning planning-only producers
-  from the cockpit — you are draining the pool, not filling it.
+  cockpit mode-state file via `sable-mode set execution`, spawns Optimus and
+  Tarzan as named manager subagents, executes their dispatch requests as
+  invisible background workers (Dispatching-for: attribution), and reminds the
+  operator to open the Chuck terminal. In execution mode the interlock hook
+  blocks spawning planning-only producers — you are draining the pool, not
+  filling it.
   Use when asked to "/execute", "enter execution mode", "start executing", or
   "drain the backlog".
 allowed-tools:
@@ -20,8 +21,9 @@ allowed-tools:
 
 # /execute — enter EXECUTION mode
 
-You are the **cockpit** (see `roles/cockpit.md`). This skill flips you into
-**execution mode**, whose single job is to **drain the bead pool**.
+You are **Lincoln** in the cockpit seat (see `roles/lincoln.md`). This skill
+flips you into **execution mode**, whose single job is to **drain the bead
+pool**.
 
 ## 0. Verify handoff readiness (soft gate)
 
@@ -45,28 +47,42 @@ planning exists to prevent.
 Run exactly one command:
 
 ```bash
-sable-mode set execution --fleet optimus,tarzan,chuck
+sable-mode set execution --fleet optimus,tarzan
 ```
 
 This writes `~/.claude/sable/state/cockpit-mode.json`. From this point the
 `cockpit-mode-interlock.sh` hook is in execution posture: spawning planning-only
-producers (Sherlock / Victor / Columbo / Gaudi) from the cockpit is blocked
-(soft — `--force` overrides). Keep planning and execution sessions distinct.
+producers (sherlock / victor / columbo) is blocked on both the Agent and Bash
+legs (soft — `SABLE_COCKPIT_FORCE=1` / `--force` overrides). Mode flips are
+mid-conversation; no restart.
 
-## 2. Adopt the overseer persona
+## 2. Run the option-A dispatch topology
 
-In execution mode you carry Lincoln's strategist role **plus** fleet launch:
+Managers plan, you dispatch (SABLE-uz9.4):
 
-- Launch the managers as **pinned background sessions**, each with its identity
-  set at spawn so OS-level identity, hooks, and parallelism stay intact:
-  - **Optimus** (epic_manager) — beads with a parent epic
-  - **Tarzan** (one_off_manager) — standalone/orphan beads
-  - **Chuck** (integrator) — `for-chuck` merge-queue work only
-- **Oversee** them: give the operator scoped status, broker `for-cockpit`
-  arbitration asks between managers, and keep the merge queue moving. You see
-  every manager's inbox (`cross_inbox_read`) — synthesize, don't enumerate.
+- **Remind the operator to open the Chuck terminal**
+  (`CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude`) — the merge
+  queue lives there; your pushes file `for-chuck` beads across the bead-DB
+  bridge automatically.
+- Spawn **optimus** and **tarzan** as named subagents — the operator-visible,
+  selectable agents. Each reviews its lane (Optimus: beads with a parent epic;
+  Tarzan: standalone/orphan beads), bundles work, and returns **structured
+  dispatch requests** to you.
+- **Execute each dispatch request as a background worker**: `run_in_background`,
+  one `bd worktree create` worktree per worker, the canonical
+  `templates/worker-dispatch.md` template, and the attribution line
+  `Dispatching-for: <manager>` as the FIRST line of every dispatch prompt
+  (the pre-dispatch hooks key lane accounting on it). Workers stay invisible
+  to the operator.
+- **Workers do not push — you push** after the owning manager reviews the
+  worker result; the pre-push gate fires on your session identity.
+- **Oversee**: give the operator scoped status, broker `for-lincoln`
+  arbitration asks between managers, relay urgent coord beads to idle managers
+  on their next spawn. You see every manager's inbox (`cross_inbox_read`) —
+  synthesize, don't enumerate.
 - You do not write application code and you do not claim beads yourself; the
-  managers and their workers do the draining. You direct and unblock.
+  managers plan the draining and the workers do it. You direct, dispatch, and
+  unblock.
 
 ## 3. Hand back to planning
 

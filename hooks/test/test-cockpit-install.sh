@@ -41,7 +41,7 @@ P="$(mktemp -d)"
 out1="$(SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project 2>&1)"
 exists "$P/.claude/skills/plan/SKILL.md"    "project: /plan skill installed"
 exists "$P/.claude/skills/execute/SKILL.md" "project: /execute skill installed"
-exists "$P/.claude/sable/roles/cockpit.md"  "project: cockpit role installed"
+exists "$P/.claude/sable/roles/lincoln.md"  "project: lincoln role installed"
 exists "$P/.claude/sable/layouts/sable.kdl" "project: layout installed"
 if [ -x "$P/.claude/hooks/multi-manager/cockpit-mode-interlock.sh" ]; then pass "project: interlock hook installed+exec"; else fail "project: interlock hook installed+exec"; fi
 SET="$P/.claude/settings.local.json"

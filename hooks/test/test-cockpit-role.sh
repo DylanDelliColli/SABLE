@@ -9,7 +9,9 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-ROLE="$REPO/templates/multi-manager/roles/cockpit.md"
+# v2 (SABLE-uz9.5): the main-session role lives at roles/lincoln.md — the
+# session-role-anchor resolves by CLAUDE_AGENT_NAME, and the agent is lincoln.
+ROLE="$REPO/templates/multi-manager/roles/lincoln.md"
 
 PASS=0
 FAIL=0
@@ -18,7 +20,12 @@ pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 assert_grep() { if grep -qi -- "$2" "$1" 2>/dev/null; then pass "$3"; else fail "$3" "pattern not found: $2"; fi; }
 
-if [ -f "$ROLE" ]; then pass "roles/cockpit.md exists"; else fail "roles/cockpit.md exists" "missing: $ROLE"; fi
+if [ -f "$ROLE" ]; then pass "roles/lincoln.md exists"; else fail "roles/lincoln.md exists" "missing: $ROLE"; fi
+if [ -f "$REPO/templates/multi-manager/roles/cockpit.md" ]; then
+  fail "roles/cockpit.md retired (merged into lincoln.md)" "file still exists"
+else
+  pass "roles/cockpit.md retired (merged into lincoln.md)"
+fi
 
 assert_grep "$ROLE" "cockpit"        "role declares the cockpit identity"
 assert_grep "$ROLE" "planning"       "role describes planning mode"
@@ -32,7 +39,17 @@ assert_grep "$ROLE" "substage" "role describes the planning substage machine"
 for s in framing research architecture test-strategy decomposition; do
   assert_grep "$ROLE" "$s" "role names substage: $s"
 done
-assert_grep "$ROLE" "Lincoln strategist hat" "role frames FRAMING as the Lincoln strategist hat"
+# v2 (SABLE-uz9.5): the role IS Lincoln, so FRAMING wears "the strategist hat"
+# rather than "the Lincoln strategist hat".
+assert_grep "$ROLE" "strategist hat" "role frames FRAMING as the strategist hat"
+
+# v2 one-window topology markers (SABLE-uz9.5 / uz9.4 option A)
+assert_grep "$ROLE" "LINCOLN" "role declares the Lincoln identity"
+assert_grep "$ROLE" "Dispatching-for" "role carries the dispatch attribution convention"
+assert_grep "$ROLE" "run_in_background" "role dispatches workers as invisible background agents"
+assert_grep "$ROLE" "Chuck terminal" "role reminds the operator about the Chuck terminal"
+assert_grep "$ROLE" "Workers do not push" "role keeps the push path with Lincoln"
+assert_grep "$ROLE" "gaudi skill" "role runs gaudi as an inline skill at ARCHITECTURE"
 
 echo
 echo "=========================================="

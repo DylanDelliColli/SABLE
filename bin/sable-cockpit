@@ -69,7 +69,7 @@ if ! command -v zellij >/dev/null 2>&1; then
     {
         echo "sable-cockpit: zellij is not installed."
         echo "Install it (https://zellij.dev) for the one-command cockpit, or open two panes manually:"
-        echo "  pane 1:  CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager claude"
+        echo "  pane 1:  CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude"
         echo "  pane 2:  sable-status"
     } >&2
     exit 1
