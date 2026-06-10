@@ -42,8 +42,16 @@ try:
     tokens = shlex.split(cmd)
 except ValueError:
     tokens = []
+# Only consider tokens before the first flag (first token starting with '-').
+# Flag values after a flag token (e.g. 'docs-only' after '--reason') can
+# match the bead-ID shape and would inflate ID_COUNT — SABLE-3uw / SABLE-9we.
+positional = []
+for t in tokens:
+    if t.startswith('-'):
+        break
+    positional.append(t)
 ID_PATTERN = re.compile(r'^[A-Za-z][A-Za-z0-9]*-[a-z0-9]+(\.[0-9]+)?\$')
-ids = [t for t in tokens if ID_PATTERN.match(t)]
+ids = [t for t in positional if ID_PATTERN.match(t)]
 print(' '.join(ids))
 ")
 ID_COUNT=$(echo "$BEAD_ARGS" | wc -w)

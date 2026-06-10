@@ -48,7 +48,7 @@ try:
             except Exception:
                 continue
             text = json.dumps(msg)
-            for m in re.finditer(r'\b((?:bd|sable|epic|task|bug|feat)-[a-zA-Z0-9_-]+)\b', text):
+            for m in re.finditer(r'\b((?:bd|sable|epic|task|bug|feat)-[a-zA-Z0-9_-]+)\b', text, re.IGNORECASE):
                 ids.append(m.group(1))
 except Exception:
     sys.exit(0)

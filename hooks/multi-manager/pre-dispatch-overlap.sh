@@ -37,7 +37,7 @@ print((d.get('tool_input', {}) or {}).get('prompt', ''))
 DISPATCH_IDS=$(echo "$PROMPT" | python3 -c "
 import sys, re
 text = sys.stdin.read()
-ids = set(re.findall(r'\b((?:bd|sable|epic|task|bug|feat)-[a-zA-Z0-9_-]+)\b', text))
+ids = set(re.findall(r'\b((?:bd|sable|epic|task|bug|feat)-[a-zA-Z0-9_-]+)\b', text, re.IGNORECASE))
 for i in sorted(ids):
     print(i)
 " 2>/dev/null)

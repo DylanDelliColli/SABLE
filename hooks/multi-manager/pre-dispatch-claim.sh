@@ -39,7 +39,7 @@ print((d.get('tool_input', {}) or {}).get('prompt', ''))
 BEAD_IDS=$(echo "$PROMPT" | python3 -c "
 import sys, re
 text = sys.stdin.read()
-ids = set(re.findall(r'\b((?:bd|sable|epic|task|bug|feat)-[a-zA-Z0-9_-]+)\b', text))
+ids = set(re.findall(r'\b((?:bd|sable|epic|task|bug|feat)-[a-zA-Z0-9_-]+)\b', text, re.IGNORECASE))
 for i in sorted(ids):
     print(i)
 " 2>/dev/null)
@@ -66,7 +66,7 @@ import sys, re
 text = sys.stdin.read()
 # Match file paths with code extensions
 paths = set()
-for m in re.finditer(r'(?:^|[\s\(\[\"\\'])((?:[\w\-./]+/)?[\w\-./]+\.(?:ts|tsx|js|jsx|py|rs|go|java|rb|md|yaml|yml|toml|json|sh|sql|css|scss|html))(?=[\s\)\]\"\\',:;]|$)', text, re.MULTILINE)
+for m in re.finditer(r'(?:^|[\s\(\[\"\\'])((?:[\w\-./]+/)?[\w\-./]+\.(?:ts|tsx|js|jsx|py|rs|go|java|rb|md|yaml|yml|toml|json|sh|sql|css|scss|html))(?=[\s\)\]\"\\',:;]|$)', text, re.MULTILINE):
     paths.add(m.group(1))
 print(','.join(sorted(paths)))
 " 2>/dev/null || echo "")
