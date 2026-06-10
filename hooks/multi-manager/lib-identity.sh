@@ -92,6 +92,159 @@ print(d.get('agent_type', '') or '')
   return 0
 }
 
+# sable_is_git_push <command-string>
+#
+# Returns 0 (true) when <command-string> is a real `git push` invocation;
+# 1 (false) otherwise.
+#
+# Matches:
+#   git push
+#   git -C /path push
+#   git -c a=b push origin main
+#   git --no-pager push
+#   SABLE_SKIP_PRE_PUSH=1 git push        (env-assignment prefix)
+#   FOO=bar BAZ=qux git -C /x push       (multiple env assignments)
+#   env FOO=bar git push                  (env(1) prefix)
+#   env -u GIT_DIR git push              (env -u NAME prefix)
+#
+# Does NOT match:
+#   Commands where "git push" appears only inside a quoted argument
+#     e.g.  bd create --description="... git push ..."
+#   Substrings like `git pushd`, `echo git pushed`
+#
+# Algorithm:
+#   shlex-tokenize the command (same approach proven in hooks/tdd-gate.sh
+#   post SABLE-sqz).  Walk the token list:
+#     - At command position, NAME=VALUE tokens are transparent env assignments —
+#       consume them WITHOUT leaving command position.
+#     - At command position, the token `env` is also transparent: after it,
+#       continue consuming NAME=VALUE tokens and -u NAME pairs (env(1) options)
+#       while staying at command position.
+#     - Find the first `git` token at "command position" (first token, after
+#       a shell separator: ; && || |, or after leading env assignments/env(1)).
+#     - Skip git global flags: -C <arg>, -c <arg>, --no-pager, --git-dir=*, --work-tree=*,
+#       --namespace=*, -p/--paginate, -P/--no-pager, --no-replace-objects, --bare,
+#       --literal-pathspecs, --glob-pathspecs, --noglob-pathspecs, --icase-pathspecs,
+#       --no-optional-locks, --exec-path=*, --html-path, --man-path, --info-path,
+#       --version, --help.
+#     - If the next non-flag token is exactly `push`, return 0.
+sable_is_git_push() {
+  local cmd="${1:-}"
+  [ -z "$cmd" ] && return 1
+  CMD_STR="$cmd" python3 -c "
+import os, re, shlex, sys
+
+cmd = os.environ.get('CMD_STR', '')
+try:
+    tokens = shlex.split(cmd)
+except ValueError:
+    sys.exit(1)
+
+SHELL_SEPS = {';', '&&', '||', '|'}
+# git global flags that consume the next token as an argument
+CONSUME_NEXT = {'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path'}
+# git global flags that are standalone (no next-arg consumed)
+STANDALONE = {
+    '--no-pager', '-p', '--paginate', '-P', '--no-replace-objects', '--bare',
+    '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs',
+    '--icase-pathspecs', '--no-optional-locks', '--html-path', '--man-path',
+    '--info-path', '--version', '--help',
+}
+# prefixes that are standalone flags (--exec-path=, --git-dir=, etc.)
+STANDALONE_PREFIXES = ('--exec-path=', '--git-dir=', '--work-tree=', '--namespace=')
+
+ENV_ASSIGN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+
+i = 0
+n = len(tokens)
+# Track whether we are at a command-position (start or after separator)
+at_cmd_pos = True
+while i < n:
+    tok = tokens[i]
+    if tok in SHELL_SEPS:
+        at_cmd_pos = True
+        i += 1
+        continue
+    # At command position: transparent env-assignment prefix (NAME=VALUE)
+    if at_cmd_pos and ENV_ASSIGN_RE.match(tok):
+        i += 1  # consume assignment, stay at command position
+        continue
+    # At command position: env(1) prefix — consume it and its own options
+    if at_cmd_pos and tok == 'env':
+        i += 1
+        while i < n:
+            t = tokens[i]
+            if ENV_ASSIGN_RE.match(t):
+                i += 1   # env NAME=VALUE — consume, stay in env-option walk
+                continue
+            if t == '-u' and i + 1 < n:
+                i += 2   # env -u NAME — consume both, stay in env-option walk
+                continue
+            break        # next token is the real command — fall through to outer loop
+        continue         # re-evaluate tokens[i] at command position (at_cmd_pos still True)
+    if at_cmd_pos and tok == 'git':
+        # Found git at command position — now walk flags
+        i += 1
+        while i < n:
+            t = tokens[i]
+            if t in CONSUME_NEXT:
+                i += 2  # skip flag + its argument
+                continue
+            if t in STANDALONE or any(t.startswith(p) for p in STANDALONE_PREFIXES):
+                i += 1
+                continue
+            # Not a known flag — this must be the subcommand
+            sys.exit(0 if t == 'push' else 1)
+        # Ran out of tokens after git — no subcommand found
+        sys.exit(1)
+    # Not at command position or not git/env/assignment
+    at_cmd_pos = False
+    i += 1
+sys.exit(1)
+" 2>/dev/null
+}
+
+# sable_validate_base_ref <repo-path> <desired-ref>
+#
+# Validates that <desired-ref> exists in <repo-path>.
+# If it does, prints <desired-ref> and returns 0.
+# If it does not, falls back in order:
+#   1. origin/main
+#   2. @{upstream} (the current branch's configured upstream)
+# Prints the resolved ref and always returns 0 (one of the three will work
+# or we fall back to the empty string to let the caller decide).
+# This prevents hooks from aborting under set -euo pipefail when
+# SABLE_BASE_BRANCH points to a ref that doesn't exist in the local repo.
+sable_validate_base_ref() {
+  local repo_path="${1:-}"
+  local desired="${2:-origin/main}"
+  [ -z "$repo_path" ] && { printf '%s' "$desired"; return 0; }
+
+  if git -C "$repo_path" rev-parse --verify --quiet "$desired" >/dev/null 2>&1; then
+    printf '%s' "$desired"
+    return 0
+  fi
+
+  # Try origin/main as first fallback
+  if [ "$desired" != "origin/main" ] && \
+     git -C "$repo_path" rev-parse --verify --quiet "origin/main" >/dev/null 2>&1; then
+    printf '%s' "origin/main"
+    return 0
+  fi
+
+  # Try @{upstream} as second fallback
+  local upstream
+  upstream=$(git -C "$repo_path" rev-parse --abbrev-ref --symbolic-full-name "@{upstream}" 2>/dev/null || true)
+  if [ -n "$upstream" ]; then
+    printf '%s' "$upstream"
+    return 0
+  fi
+
+  # Nothing worked — return the desired ref and let the caller handle failure
+  printf '%s' "$desired"
+  return 0
+}
+
 # sable_resolve_dispatch_lane <hook-input-json>
 #
 # For PreToolUse:Agent / PostToolUse:Agent hooks. Decides whether pre-dispatch

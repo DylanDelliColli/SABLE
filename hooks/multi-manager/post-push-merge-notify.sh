@@ -44,8 +44,9 @@ print(stderr)
 CWD=$(echo "$PARSED" | sed -n '1p')
 COMMAND=$(echo "$PARSED" | sed -n '2p')
 
-# Only act on successful git push
-echo "$COMMAND" | grep -qE '\bgit\s+push\b' || exit 0
+# Only act on successful git push (SABLE-jpr: use shared matcher so
+# 'git -C <path> push' and other flag-interleaved forms are matched correctly)
+sable_is_git_push "$COMMAND" || exit 0
 [ -z "$CWD" ] && exit 0
 
 # Quick success heuristic: rejected/error/fatal in stderr means failure
@@ -54,7 +55,10 @@ if echo "$STDOUT_STDERR" | grep -qiE '(rejected|! \[remote rejected\]|error: fai
   exit 0
 fi
 
-BASE_BRANCH="${SABLE_BASE_BRANCH:-origin/main}"
+# Validate the base ref and fall back gracefully (SABLE-61n: an invalid
+# SABLE_BASE_BRANCH caused git to exit 128 under set -euo pipefail, silently
+# killing the hook before the bd create was reached)
+BASE_BRANCH=$(sable_validate_base_ref "$CWD" "${SABLE_BASE_BRANCH:-origin/main}")
 
 # Determine current branch and modified files
 BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")

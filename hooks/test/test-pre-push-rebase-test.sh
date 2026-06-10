@@ -211,6 +211,49 @@ assert_deny "failing lint command → static phase denies" "$FAIL_LINT" "git pus
 NO_STATIC="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TEST_PHASE=skip"
 assert_context "no typecheck detected → static no-ops" "$NO_STATIC" "git push" "$REPO_DIR" "phase skipped"
 
+# ---------- Shared matcher tests (SABLE-jpr / SABLE-0u1) ----------
+# The pre-push gate must fire for real git push variants (positives) and
+# must NOT fire for commands where "git push" only appears as a quoted string
+# argument or in a different word like "git pushd" (negatives).
+#
+# We use PHASE=skip + passing typecheck so a positive match produces an
+# additionalContext response (phase skipped), while a negative match
+# produces no output at all (hook exits 0 silently).
+MATCHER_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true SABLE_PRE_PUSH_TEST_PHASE=skip"
+
+# Test 12: 'git -C <path> push' reaches the gate (SABLE-jpr)
+assert_context "matcher: 'git -C <path> push' reaches gate" \
+  "$MATCHER_ENV" "git -C $REPO_DIR push origin main" "$REPO_DIR" "phase skipped"
+
+# Test 13: 'git -c a=b push origin main' reaches the gate
+assert_context "matcher: 'git -c a=b push origin main' reaches gate" \
+  "$MATCHER_ENV" "git -c http.extraheader=Authorization:bearer push origin main" "$REPO_DIR" "phase skipped"
+
+# Test 14: 'git --no-pager push' reaches the gate
+assert_context "matcher: 'git --no-pager push' reaches gate" \
+  "$MATCHER_ENV" "git --no-pager push" "$REPO_DIR" "phase skipped"
+
+# Test 15: 'bd create --description="mentions git push"' does NOT reach gate (SABLE-0u1)
+# This should exit 0 silently — no additionalContext, no deny
+assert_allow "matcher: text mention 'git push' in description does NOT trigger gate" \
+  "$MGR_ENV" 'bd create --description="Please git push to deploy"' "$REPO_DIR"
+
+# Test 16: 'echo git pushed' does NOT reach gate
+assert_allow "matcher: 'echo git pushed' does NOT trigger gate" \
+  "$MGR_ENV" "echo 'done, git pushed'" "$REPO_DIR"
+
+# Test 17: 'git pushd' does NOT reach gate
+assert_allow "matcher: 'git pushd' does NOT trigger gate" \
+  "$MGR_ENV" "git pushd" "$REPO_DIR"
+
+# Test 18: 'SABLE_SKIP_PRE_PUSH=1 git push' reaches gate (env-assignment prefix, SABLE-531)
+# The env-assignment is part of the command string seen by the hook; the hook itself is
+# invoked normally (no SABLE_SKIP_PRE_PUSH in the env-i context).  With TEST_PHASE=skip
+# and a passing typecheck the hook should produce additionalContext (phase skipped),
+# confirming it passed the matcher and entered the gate.
+assert_context "matcher: 'SABLE_SKIP_PRE_PUSH=1 git push' reaches gate (env-assignment prefix)" \
+  "$MATCHER_ENV" "SABLE_SKIP_PRE_PUSH=1 git push" "$REPO_DIR" "phase skipped"
+
 # Cleanup
 rm -rf "$REPO_DIR" "$BARE_DIR"
 
