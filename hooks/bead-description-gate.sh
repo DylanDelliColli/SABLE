@@ -71,8 +71,71 @@ if echo ",$LABELS," | grep -q ',columbo-test-gap,'; then
   COLUMBO_GAP=1
 fi
 
-# Extract description content (between quotes after --description)
-DESC=$(echo "$COMMAND" | python3 -c "
+# Detect batch/file description modes early — content lives in a file or
+# structured format, not inline in the --description flag.
+#
+# --body-file <path>  (not "-"): read the file and apply the same quality
+#                     checks against its content.
+# --body-file -       : content comes from stdin at runtime — unavailable
+#                     here; exempt from hard-deny, emit nudge.
+# --graph <file>      : batch import — structured JSON; exempt/nudge.
+# --file <file>       : batch create from markdown file; exempt/nudge.
+# --stdin             : content piped in at runtime; exempt/nudge.
+
+BODY_FILE=$(echo "$COMMAND" | python3 -c "
+import sys, re
+cmd = sys.stdin.read()
+m = re.search(r'--body-file[= ]\"([^\"]+)\"', cmd) \
+    or re.search(r\"--body-file[= ]'([^']+)'\", cmd) \
+    or re.search(r'--body-file[= ](\S+)', cmd)
+print(m.group(1) if m else '')
+" 2>/dev/null || echo "")
+
+HAS_GRAPH=0
+echo "$COMMAND" | grep -qE -- '--graph(\s|=)' && HAS_GRAPH=1
+
+HAS_FILE_FLAG=0
+echo "$COMMAND" | grep -qE -- '--file(\s|=)' && HAS_FILE_FLAG=1
+
+HAS_STDIN=0
+echo "$COMMAND" | grep -q -- '--stdin' && HAS_STDIN=1
+
+# --body-file <real path>: read and quality-check the file content
+if [ -n "$BODY_FILE" ] && [ "$BODY_FILE" != "-" ]; then
+  if [ ! -f "$BODY_FILE" ]; then
+    # File doesn't exist yet — can't check; let it through with a nudge
+    python3 -c "
+import json
+print(json.dumps({
+    'additionalContext': 'SABLE bead quality: --body-file path does not exist yet; quality check skipped. Ensure the file passes the Fresh Agent Test (file paths, test spec, acceptance criteria) before creating.'
+}))
+"
+    exit 0
+  fi
+  # Read the file content and use it as DESC for quality checks below
+  DESC=$(python3 -c "
+import sys
+try:
+    with open(sys.argv[1]) as f:
+        print(f.read())
+except Exception as e:
+    print('')
+" "$BODY_FILE" 2>/dev/null || echo "")
+  # Fall through to quality checks with DESC set from file
+elif [ -n "$BODY_FILE" ] || [ "$HAS_GRAPH" = "1" ] || [ "$HAS_FILE_FLAG" = "1" ] || [ "$HAS_STDIN" = "1" ]; then
+  # Batch/stdin modes — content unavailable at hook time; nudge only, never deny
+  python3 -c "
+import json
+print(json.dumps({
+    'additionalContext': 'SABLE bead quality: bd create uses a batch/stdin mode (--graph/--file/--stdin/--body-file -). Quality check skipped at hook time. Ensure each bead in the batch passes the Fresh Agent Test: file paths, function names, what to change, test file reference, acceptance criteria.'
+}))
+"
+  exit 0
+else
+  # No batch mode — require --description inline
+
+  # Extract description content (between quotes after --description)
+  DESC=$(echo "$COMMAND" | python3 -c "
 import sys, re
 cmd = sys.stdin.read()
 m = re.search(r'--description[= ]\"((?:[^\"\\\\]|\\\\.)*)\"', cmd, re.DOTALL) \
@@ -80,10 +143,10 @@ m = re.search(r'--description[= ]\"((?:[^\"\\\\]|\\\\.)*)\"', cmd, re.DOTALL) \
 print(m.group(1) if m else '')
 " 2>/dev/null || echo "")
 
-# No --description at all
-if ! echo "$COMMAND" | grep -qE -- '--description'; then
-  if [ "$MODE" = "block" ]; then
-    python3 -c "
+  # No --description at all
+  if ! echo "$COMMAND" | grep -qE -- '--description'; then
+    if [ "$MODE" = "block" ]; then
+      python3 -c "
 import json
 print(json.dumps({
     'hookSpecificOutput': {
@@ -93,19 +156,25 @@ print(json.dumps({
     }
 }))
 "
-    exit 0
-  else
-    python3 -c "
+      exit 0
+    else
+      python3 -c "
 import json
 print(json.dumps({
     'additionalContext': 'SABLE bead quality: This bd create has no --description flag. Every bead needs a description that passes the Fresh Agent Test: file paths, function names, what to change, test file path, and acceptance criteria.'
 }))
 "
+      exit 0
+    fi
+  fi
+
+  # Description present but empty
+  if [ -z "$DESC" ]; then
     exit 0
   fi
 fi
 
-# Description present but empty
+# Guard: if DESC is still empty after all paths, exit clean
 if [ -z "$DESC" ]; then
   exit 0
 fi
@@ -181,7 +250,7 @@ if ! echo "$DESC" | grep -qiE '(test|\.test\.|\.spec\.|__tests__|pytest|vitest|T
   append_missing "test spec (which test file, what assertions)"
 fi
 
-if ! echo "$DESC" | grep -qiE '(\.(ts|tsx|py|js|jsx|sh|go|rs|rb)|frontend/|src/|lib/|components/|hooks/|templates/)'; then
+if ! echo "$DESC" | grep -qiE '(\.(ts|tsx|py|js|jsx|sh|go|rs|rb|md|json|yaml|toml|kdl)|frontend/|src/|lib/|components/|hooks/|templates/|docs/|feedback/)'; then
   append_missing "file paths (exact files to create/modify)"
 fi
 
