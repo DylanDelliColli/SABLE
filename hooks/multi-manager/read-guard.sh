@@ -3,32 +3,43 @@
 # Trigger: PreToolUse:Bash | Timeout: 3000ms
 #
 # Denies `bd ready -l for-<other>` or `bd list -l for-<other>` queries where
-# <other> != $CLAUDE_AGENT_NAME. Hard mechanical guard against role drift.
+# <other> is not the acting agent. Hard mechanical guard against role drift.
+#
+# Identity is resolved via lib-identity.sh (SABLE-uz9.3): agent_type from the
+# hook input for subagent contexts (v2 one-window managers), env vars for
+# legacy terminal launches (Chuck holdout). This also closes the old
+# contamination hole — a worker subagent inside a manager terminal used to
+# inherit the manager's env identity and could read its inbox; now it resolves
+# as the worker type and the guard simply doesn't apply manager privileges.
 #
 # Allows queries against the agent's own inbox.
 # Allows umbrella `coord` queries.
-# Skips for non-manager sessions (env var unset).
-# Skips entirely for Lincoln (cross-inbox read is its job — see roles/lincoln.md).
+# Skips for non-manager identities (workers, planning agents, anonymous).
+# Skips for lincoln/cockpit (cross-inbox read is their job — agents.yaml
+# cross_inbox_read: true; they may NOT modify foreign inboxes, enforced via
+# role prompt).
 
 set -euo pipefail
 
-[ -z "${CLAUDE_AGENT_NAME:-}" ] && exit 0
-[ "${CLAUDE_AGENT_ROLE:-}" != "manager" ] && exit 0
+HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
 
-# Lincoln has the cross-inbox read exception per agents.yaml cross_inbox_read: true.
-# Status reporting (Mode 1) and What's-next (Mode 3) require visibility across all
-# managers' inboxes. Lincoln may NOT modify other inboxes; that's enforced separately
-# via the role prompt (no bd update/close on foreign labels).
-[ "$CLAUDE_AGENT_NAME" = "lincoln" ] && exit 0
+# shellcheck source=lib-identity.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib-identity.sh"
+sable_resolve_identity "$HOOK_INPUT"
 
-PARSED=$(python3 -c "
+[ "$SABLE_ID_IS_MANAGER" -eq 1 ] || exit 0
+[ "$SABLE_ID_NAME" = "lincoln" ] && exit 0
+[ "$SABLE_ID_NAME" = "cockpit" ] && exit 0
+
+COMMAND=$(printf '%s' "$HOOK_INPUT" | python3 -c "
 import json, sys
-d = json.load(sys.stdin)
-cmd = d.get('tool_input', {}).get('command', '')
-print(cmd)
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+print(d.get('tool_input', {}).get('command', ''))
 " 2>/dev/null) || exit 0
 
-COMMAND="$PARSED"
 [ -z "$COMMAND" ] && exit 0
 
 # Only act on bd ready / bd list with -l for-<name>
@@ -45,7 +56,7 @@ print(m.group(1) if m else '')
 
 [ -z "$QUERIED_LABEL" ] && exit 0
 
-OWN_LABEL="for-${CLAUDE_AGENT_NAME}"
+OWN_LABEL="for-${SABLE_ID_NAME}"
 
 # Allow own inbox
 [ "$QUERIED_LABEL" = "$OWN_LABEL" ] && exit 0
