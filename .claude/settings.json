@@ -1,4 +1,7 @@
 {
+  "env": {
+    "SABLE_BASE_BRANCH": "origin/main"
+  },
   "hooks": {
     "PreCompact": [
       {
