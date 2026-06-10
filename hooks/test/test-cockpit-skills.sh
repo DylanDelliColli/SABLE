@@ -97,6 +97,8 @@ assert_grep "$PLAN_SKILL" "gaudi.*skill\|skill.*gaudi" "/plan runs gaudi as an i
 assert_grep "$EXEC_SKILL" "lincoln"          "/execute addresses Lincoln (v2 identity)"
 assert_grep "$EXEC_SKILL" "Dispatching-for"  "/execute carries the dispatch attribution convention"
 assert_grep "$EXEC_SKILL" "run_in_background" "/execute dispatches workers as invisible background agents"
+assert_grep "$EXEC_SKILL" "ALWAYS background" "/execute spawns managers in the background (never blocks the chat)"
+assert_grep "$PLAN_SKILL" "run_in_background" "/plan spawns producers in the background"
 assert_grep "$EXEC_SKILL" "Chuck terminal"   "/execute reminds the operator about the Chuck terminal"
 assert_grep "$EXEC_SKILL" "do not push"      "/execute keeps the push path with Lincoln"
 

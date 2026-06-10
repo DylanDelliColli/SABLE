@@ -62,7 +62,9 @@ same essence that does status/arbitration in execution.)
 ### RESEARCH — owner: sherlock subagent (greenfield mode); fallback: `/deep-research`
 Prior art, domain pitfalls, unknowns to de-risk. Spawn the **sherlock** named
 subagent with the research scope in the spawn prompt (e.g. "scope: --research
-'<topic>'"). The interlock allows producer subagents in planning mode. Surface
+'<topic>'") and `run_in_background: true` — producer spawns are ALWAYS
+background so the conversation stays free while they work; you are notified on
+completion. The interlock allows producer subagents in planning mode. Surface
 findings to the user.
 
 ### ARCHITECTURE — owner: the /gaudi skill, run inline (`/gaudi --epic <id>`)

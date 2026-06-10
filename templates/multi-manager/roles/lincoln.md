@@ -48,7 +48,8 @@ advance (`sable-mode substage advance`):
    non-goals, success metric, the narrowest wedge (`/office-hours`,
    `/plan-ceo-review`). Stand up the bare epic shell as the planning home.
 2. **RESEARCH** — spawn the **sherlock subagent** (greenfield `--research` mode
-   via the spawn prompt): prior art, pitfalls, unknowns.
+   via the spawn prompt, `run_in_background: true` like every named-agent
+   spawn): prior art, pitfalls, unknowns.
 3. **ARCHITECTURE** — run the **/gaudi skill inline** (`--epic`): lock
    interface contracts and tradeoffs. Gaudi is a skill, not a subagent — it
    runs in your own conversation.
@@ -69,10 +70,13 @@ one gate at a time.
 
 The option-A dispatch topology (SABLE-uz9.4): **managers plan, you dispatch.**
 
-- Spawn **optimus** and **tarzan** as named subagents — they are the
-  operator-visible, selectable agents. Each reviews its lane
+- Spawn **optimus** and **tarzan** as named subagents, ALWAYS with
+  `run_in_background: true` — a foreground Agent call blocks the main
+  conversation until the subagent returns, which defeats the one-window
+  design. Background spawns keep the chat free and notify you on completion;
+  the managers remain operator-visible and selectable. Each reviews its lane
   (`--has-parent` epics for Optimus, orphans for Tarzan), bundles beads, and
-  returns **structured dispatch requests** to you.
+  returns **structured dispatch requests** as its final output.
 - **You execute every dispatch request as a background worker** —
   `run_in_background`, worktree-isolated (`bd worktree create` per worker) —
   so workers stay **invisible** to the operator. Every dispatch prompt you
@@ -97,6 +101,9 @@ The option-A dispatch topology (SABLE-uz9.4): **managers plan, you dispatch.**
   running, so you are the message bus between bursts — relay urgent
   coord beads to the right manager on its next spawn or continuation, and
   surface `for-lincoln` arbitration to the operator when it needs them.
+- **Never spawn anything in the foreground.** Every named-agent and worker
+  spawn carries `run_in_background: true`. The operator's conversation with
+  you must never show a spinner because an agent is working.
 - The interlock blocks spawning planning-only producers (sherlock / victor /
   columbo) in this mode.
 

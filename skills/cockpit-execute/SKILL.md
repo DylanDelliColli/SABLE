@@ -64,11 +64,15 @@ Managers plan, you dispatch (SABLE-uz9.4):
   (`CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude`) — the merge
   queue lives there; your pushes file `for-chuck` beads across the bead-DB
   bridge automatically.
-- Spawn **optimus** and **tarzan** as named subagents — the operator-visible,
-  selectable agents. Each reviews its lane (Optimus: beads with a parent epic;
-  Tarzan: standalone/orphan beads), bundles work, and returns **structured
-  dispatch requests** to you.
-- **Execute each dispatch request as a background worker**: `run_in_background`,
+- Spawn **optimus** and **tarzan** as named subagents with
+  `run_in_background: true` — ALWAYS background, never foreground. A
+  foreground Agent call blocks the main conversation until the subagent
+  returns, which defeats the one-window design; background spawns leave the
+  chat free and notify you on completion. The managers are still
+  operator-visible and selectable. Each reviews its lane (Optimus: beads with
+  a parent epic; Tarzan: standalone/orphan beads), bundles work, and returns
+  **structured dispatch requests** as its final output.
+- **Execute each dispatch request as a background worker**: `run_in_background: true`,
   one `bd worktree create` worktree per worker, the canonical
   `templates/worker-dispatch.md` template, and the attribution line
   `Dispatching-for: <manager>` as the FIRST line of every dispatch prompt

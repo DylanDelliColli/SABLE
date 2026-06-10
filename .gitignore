@@ -29,3 +29,5 @@ __pycache__/
 .claude/skills/execute/
 .claude/sable/
 .claude/hooks/multi-manager/cockpit-mode-interlock.sh
+# bd worktree
+wk-tdd-gate-lowercase/
