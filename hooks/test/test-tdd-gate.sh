@@ -211,6 +211,29 @@ assert_hatch_used "lowercase dotted child ID" \
 assert_hatch_skipped "two lowercase beads still route to evidence check" \
   'bd close twine-stub twine-other --reason=cleanup'
 
+# ---------- New: flag values that look like IDs (SABLE-3uw / SABLE-9we fix) ----------
+# Flag values such as 'docs-only' or 'shipped-v2' match the bead-ID shape
+# (PREFIX-suffix). They must NOT inflate ID_COUNT.
+
+assert_hatch_used "single bead, --reason docs-only (space-separated)" \
+  'bd close SABLE-stub --reason docs-only'
+
+assert_hatch_used "single bead, --reason shipped-v2 (space-separated)" \
+  'bd close SABLE-stub --reason shipped-v2'
+
+assert_hatch_used "single bead, --reason \"docs-only\" (space, double-quoted)" \
+  'bd close SABLE-stub --reason "docs-only"'
+
+assert_hatch_used "single bead, --reason '\''docs-only'\'' (space, single-quoted)" \
+  "bd close SABLE-stub --reason 'docs-only'"
+
+assert_hatch_used "single bead, multiple flags with flag-value IDs" \
+  'bd close SABLE-stub --reason docs-only --suggest-next follow-up-v2'
+
+# Multi-bead close with flag values must still route to evidence check
+assert_hatch_skipped "two beads + flag value still routes to evidence check" \
+  'bd close SABLE-stub SABLE-other --reason docs-only'
+
 # ---------- Summary ----------
 
 echo
