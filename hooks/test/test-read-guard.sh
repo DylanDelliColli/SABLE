@@ -30,6 +30,8 @@ agents:
     type: integrator
   lincoln:
     type: strategist
+  seward:
+    type: strategist
   sherlock:
     type: auditor
 YAML
@@ -97,6 +99,9 @@ assert_allowed "legacy env chuck allowed own inbox" "$OUT"
 
 OUT=$(run_hook "$(json '' '' 'bd ready -l for-optimus')" "lincoln" "manager")
 assert_allowed "legacy env lincoln cross-inbox exception" "$OUT"
+
+OUT=$(run_hook "$(json '' '' 'bd ready -l for-tarzan')" "seward" "manager")
+assert_allowed "seward strategist overlay cross-inbox exception (SABLE-nps)" "$OUT"
 
 # --- non-matching commands stay silent ---
 OUT=$(run_hook "$(json a6 optimus 'git status')" "" "")

@@ -150,4 +150,22 @@ agents:
     files_addressed_beads: true      # may file for-X coord/direction beads
     launches_fleets: true            # mode-aware fleet spawn (subagents, not terminals)
 
+  # Seward — TEMPORARY strategist overlay (SABLE-nps). Second terminal beside
+  # the Lincoln main session, exists ONLY because Lincoln is saturated by
+  # dispatch logistics until nested subagents ship (watch SABLE-uz9.8 — when
+  # managers self-dispatch, Lincoln's load collapses and Seward folds back
+  # into him; delete this entry then). Seward is the conversation partner:
+  # strategic discussion with the operator, status synthesis across all
+  # inboxes, and for-lincoln direction beads the operational Lincoln picks up
+  # between logistics ticks. Writes no code, never dispatches, never pushes.
+  seward:
+    type: strategist
+    scope: "TEMPORARY strategist overlay: strategic conversation + status synthesis + for-lincoln direction beads while Lincoln orchestrates"
+    claim_filter: null         # doesn't claim — pure interlocutor
+    inbox_label: for-seward    # escalations the operator wants surfaced here
+    role_prompt: roles/seward.md
+    dispatches_workers: false  # read-only Explore at most; never workers
+    cross_inbox_read: true     # status synthesis needs every lane's plate
+    files_addressed_beads: true
+
 # Add new agents here using the same shape.
