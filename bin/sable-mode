@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# sable-mode — read/write the cockpit mode-state file.
+#
+# Single source of truth for which mode the cockpit session is in. Written by
+# the /plan and /execute skills; read by the mode interlock hook
+# (cockpit-mode-interlock.sh) and the sable-status dashboard. Uses python3 for
+# JSON (always present — it defines the env); deliberately NO jq dependency,
+# which is fragile across conda envs (see SABLE-cav.8).
+#
+# State file (override with SABLE_COCKPIT_STATE for testing):
+#   ~/.claude/sable/state/cockpit-mode.json
+# Shape:
+#   { "mode": "planning|execution", "since": "<ISO-8601>", "fleet": ["a","b"],
+#     "substage": "framing|research|architecture|test-strategy|decomposition" }
+#   substage is present only in planning mode (entering planning starts at
+#   framing). It is the gated sub-state machine the /plan flow walks and the
+#   interlock reads to block backlog authoring before decomposition.
+#
+# Runtime enable gate: when SABLE_COCKPIT is off/0/false/no (case-insensitive),
+# `set` refuses (so /plan and /execute cannot flip mode); `get`/`show` still
+# read. Unset (or any other value) = enabled.
+#
+# Usage:
+#   sable-mode set <planning|execution> [--fleet a,b,c]
+#   sable-mode get                 # print the bare mode word (nonzero if unset)
+#   sable-mode show                # print the full JSON (nonzero if unset)
+#   sable-mode substage get        # print the planning substage (nonzero if none)
+#   sable-mode substage set <name> # set substage to a named stage
+#   sable-mode substage advance    # move to the next substage (nonzero past end)
+#   sable-mode --help
+
+set -eu
+
+STATE="${SABLE_COCKPIT_STATE:-$HOME/.claude/sable/state/cockpit-mode.json}"
+
+usage() {
+    cat <<EOF
+sable-mode — read/write the cockpit mode-state file.
+
+Usage:
+  sable-mode set <planning|execution> [--fleet a,b,c]
+      Write the mode-state file. --fleet is a comma-separated list of the
+      agents launched for this mode (recorded for the dashboard).
+  sable-mode get      Print the current mode word; nonzero exit if unset.
+  sable-mode show     Print the full mode-state JSON; nonzero exit if unset.
+  sable-mode substage get        Print the current planning substage; nonzero
+                                 if unset or not in planning mode.
+  sable-mode substage set <name> Set the substage to one of:
+                                 framing research architecture test-strategy decomposition
+  sable-mode substage advance    Advance to the next substage in order; nonzero
+                                 if already at decomposition.
+  sable-mode --help
+
+State file: ${STATE}
+  (override location with the SABLE_COCKPIT_STATE environment variable)
+
+Disable at runtime with: SABLE_COCKPIT=off
+EOF
+}
+
+# Runtime enable gate. Disabled when SABLE_COCKPIT is off/0/false/no.
+cockpit_enabled() {
+    case "$(printf '%s' "${SABLE_COCKPIT:-}" | tr '[:upper:]' '[:lower:]')" in
+        off|0|false|no) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+require_state() {
+    if [ ! -f "$STATE" ]; then
+        printf 'sable-mode: no mode set (no state file at %s)\n' "$STATE" >&2
+        exit 1
+    fi
+}
+
+cmd="${1:-}"
+case "$cmd" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    get)
+        require_state
+        STATE="$STATE" python3 -c "import json,os; print(json.load(open(os.environ['STATE'])).get('mode','') or '')"
+        ;;
+    show)
+        require_state
+        cat "$STATE"
+        ;;
+    set)
+        if ! cockpit_enabled; then
+            printf 'sable-mode: cockpit disabled (SABLE_COCKPIT=%s); unset SABLE_COCKPIT to enable\n' "${SABLE_COCKPIT:-}" >&2
+            exit 3
+        fi
+        mode="${2:-}"
+        case "$mode" in
+            planning|execution) ;;
+            *)
+                printf "sable-mode: invalid mode '%s' (must be planning or execution)\n" "$mode" >&2
+                exit 2
+                ;;
+        esac
+
+        # Consume the verb + mode, then scan for --fleet.
+        shift 2 || true
+        fleet_csv=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --fleet)    fleet_csv="${2:-}"; shift 2 || shift ;;
+                --fleet=*)  fleet_csv="${1#--fleet=}"; shift ;;
+                *)          shift ;;
+            esac
+        done
+
+        since="$(date +%Y-%m-%dT%H:%M:%S%z)"
+        mkdir -p "$(dirname "$STATE")"
+        STATE="$STATE" MODE="$mode" SINCE="$since" FLEET="$fleet_csv" python3 -c "
+import json, os
+fleet = [s for s in os.environ.get('FLEET', '').split(',') if s]
+mode = os.environ['MODE']
+data = {'mode': mode, 'since': os.environ['SINCE'], 'fleet': fleet}
+# Planning is a staged sub-state machine; entering it starts at framing.
+# Execution has no substage.
+if mode == 'planning':
+    data['substage'] = 'framing'
+with open(os.environ['STATE'], 'w') as f:
+    f.write(json.dumps(data, indent=2) + chr(10))
+"
+        ;;
+    substage)
+        # Planning sub-state machine. Ordered:
+        #   framing -> research -> architecture -> test-strategy -> decomposition
+        # Only meaningful while mode == planning.
+        require_state
+        action="${2:-}"
+        substages="framing research architecture test-strategy decomposition"
+        case "$action" in
+            get)
+                STATE="$STATE" python3 -c "
+import json, os
+d = json.load(open(os.environ['STATE']))
+if d.get('mode') != 'planning':
+    raise SystemExit(1)
+s = d.get('substage') or ''
+if not s:
+    raise SystemExit(1)
+print(s)
+"
+                ;;
+            set)
+                name="${3:-}"
+                case " $substages " in
+                    *" $name "*) ;;
+                    *)
+                        printf "sable-mode: invalid substage '%s' (must be one of: %s)\n" "$name" "$substages" >&2
+                        exit 2
+                        ;;
+                esac
+                STATE="$STATE" NAME="$name" python3 -c "
+import json, os
+d = json.load(open(os.environ['STATE']))
+if d.get('mode') != 'planning':
+    raise SystemExit(1)
+d['substage'] = os.environ['NAME']
+with open(os.environ['STATE'], 'w') as f:
+    f.write(json.dumps(d, indent=2) + chr(10))
+"
+                ;;
+            advance)
+                STATE="$STATE" SUBSTAGES="$substages" python3 -c "
+import json, os
+order = os.environ['SUBSTAGES'].split()
+d = json.load(open(os.environ['STATE']))
+if d.get('mode') != 'planning':
+    raise SystemExit(1)
+cur = d.get('substage')
+if cur not in order:
+    raise SystemExit(1)
+i = order.index(cur)
+if i + 1 >= len(order):
+    raise SystemExit(1)   # already at decomposition — cannot advance further
+d['substage'] = order[i + 1]
+with open(os.environ['STATE'], 'w') as f:
+    f.write(json.dumps(d, indent=2) + chr(10))
+"
+                ;;
+            *)
+                printf 'sable-mode: substage requires: get | set <name> | advance\n' >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    ""|*)
+        usage
+        exit 1
+        ;;
+esac

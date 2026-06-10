@@ -190,6 +190,25 @@ bd update <id> --design "Architectural approach decided on"
 bd update <id> --acceptance "How to verify it's done"
 ```
 
+**Warning:** `bd update --notes` **overwrites** the field — it does not append. Fetch the existing notes (`bd show <id>`) and include them in the new value, or you clobber the audit trail.
+
+#### Anchors and the verify command
+
+Line-number anchors rot faster than anything else in a bead. Across real validation passes, titles and notes consistently carried stale line numbers while a fingerprint block paired with a verify command held up. The rules:
+
+- **Line-number anchors belong ONLY inside a `## Fingerprint at HEAD (<sha>)` block** in the description — never in the title (keep titles reference-free) and never as bare notes. A fingerprint records the file, the line, and a short code quote at a named commit, so drift is detectable instead of silently misleading.
+- **Every actionable bead should carry a machine-runnable verify command** — a grep or test invocation that confirms the gap still reproduces. The worker runs it FIRST, before writing any code. If it doesn't reproduce, the bead may be stale: stop and report instead of implementing against a fixed problem.
+
+```
+## Fingerprint at HEAD (a1b4bdc)
+orchestrator.py:142 — `key = location + ":" + str(date)`
+
+## Verify
+grep -n 'location + ":"' orchestrator.py   # gap reproduces while this matches
+```
+
+The Fresh Agent Test (§3.2) validates "could a fresh agent ACT on this"; the verify command validates "is this STILL TRUE." A bead can pass the first perfectly while pointing at a deleted file or an already-fixed bug — the verify command makes stale beads self-identifying.
+
 ### 3.4 Dependencies
 
 Dependencies encode ordering constraints between beads. The syntax uses **requirement language**, not temporal language:
@@ -233,7 +252,8 @@ bd update <id> --parent=<new-parent-id>
 
 # List all children of a parent (closed children included by default)
 bd children <epic-id>
-bd children <epic-id> --pretty   # Tree view
+bd dep tree <epic-id>            # Tree view (bd children --pretty appears in bd's
+                                 # own help but the flag is not implemented)
 
 # Epic lifecycle
 bd epic status <epic-id>          # Show completion progress
@@ -258,6 +278,73 @@ In SABLE, you don't write a separate implementation plan and then create beads. 
 
 If a session ends mid-work, the next agent runs `bd ready` and continues. No re-reading plans. No lost context. The beads are the single source of truth.
 
+#### 3.6.1 Staged Planning (cockpit extension)
+
+The design-to-beads workflow above is the single-agent form. When the cockpit
+multi-agent layer is active (see `COCKPIT-DESIGN.md`), planning becomes a **gated
+substage state machine** so no implementation bead is authored before the
+upstream thinking is done and human-signed-off:
+
+**FRAMING → RESEARCH → ARCHITECTURE → TEST-STRATEGY → DECOMPOSITION**
+
+- **FRAMING** — the cockpit, live with the user: stories, non-goals, success
+  metric, the narrowest wedge. Stands up the bare epic shell.
+- **RESEARCH** — Sherlock (greenfield): prior art, pitfalls, unknowns to de-risk.
+- **ARCHITECTURE** — Gaudi: locked interface contracts and tradeoffs.
+- **TEST-STRATEGY** — Columbo: the locked unit+integration test contract.
+- **DECOMPOSITION** — the cockpit authors the implementation children, each
+  tracing to a story + acceptance scenario.
+
+The human signs off before each `sable-mode substage advance`, and the mode
+interlock mechanically blocks populating the backlog until DECOMPOSITION. The
+goal: by the time execution runs, the beads are scoped well enough to need only
+confirmations and prioritization — the human invests in planning so the swarm
+executes without questions.
+
+#### 3.6.2 Batch Creation with `--graph` — Correct Schema and Known Bugs
+
+`bd create --graph FILE` creates multiple issues in a single command from a JSON plan file. As of bd 0.63.3, the feature works but has two upstream bugs that affect reliability.
+
+**Correct `--graph` JSON schema:**
+
+```json
+{
+  "nodes": [
+    { "key": "A", "title": "Parent Epic", "type": "epic", "description": "..." },
+    { "key": "B", "title": "Child Task",  "type": "task", "parent_key": "A" },
+    { "key": "C", "title": "Blocked Task","type": "task", "parent_key": "A" }
+  ],
+  "edges": [
+    { "from_key": "B", "to_key": "C", "type": "blocks" }
+  ]
+}
+```
+
+Key fields:
+
+| Field | Scope | Notes |
+|---|---|---|
+| `key` | node | Local reference ID — required; unique within the file |
+| `title` | node | Issue title |
+| `type` | node | `epic`, `task`, `bug`, `feature`, `chore` |
+| `description` | node | Issue description |
+| `parent_key` | node | Sets the parent-child hierarchy (epic → child) |
+| `edges` | top-level | Array of dependency edges |
+| `from_key` / `to_key` | edge | Keys matching nodes above |
+| `type` on edges | edge | `"blocks"` for blocking dependency |
+
+**Common wrong-key pitfalls (silently dropped — upstream bug GH#4362):**
+
+The parser silently ignores unknown node-level keys. These commonly-intuited keys do NOT work and produce no warning:
+
+- `"parent": "A"` — use `"parent_key": "A"` instead
+- `"deps": ["B"]` — use a top-level `"edges"` entry instead
+- `"id": "..."` — use `"key": "..."` instead
+
+**Do NOT use `--dry-run` with `--graph` (upstream bug GH#4363):**
+
+`bd create --graph FILE --dry-run` creates real, persisted issues despite the flag name. There is currently no safe way to do a non-destructive preview of a graph file. Validate the JSON structure manually before running. Both bugs are filed upstream; check the issue tracker for fix status.
+
 ### 3.7 Issue Discovery Is Mandatory
 
 Any bug, bad practice, incorrect behavior, pre-existing error, or code smell noticed at any time — by any agent, during any task — must be immediately logged as a bead. This is non-negotiable.
@@ -272,6 +359,28 @@ bd create --title="<what's wrong>" --type=bug --priority=2 \
 The reasoning: agents are amnesiac. If it's not in a bead, it doesn't exist in the next session. The cost of a false-positive bead (turns out it wasn't a real issue) is trivial. The cost of a missed bug (nobody remembers it existed) compounds over time.
 
 **Important**: Before creating a bead, verify the referenced file or function actually exists (grep or glob). Hallucinated beads waste full agent cycles when the next agent tries to act on them.
+
+### 3.8 Backlog Hygiene: Freshness Before Form
+
+A backlog rots between sessions: code moves under the beads. Periodic "doctor the backlog" passes keep it trustworthy — but **a form-only pass is worse than no pass**. A lint/structure sweep that promotes existing acceptance prose into the `acceptance` field, or polishes sections, WITHOUT reading the referenced source launders stale references and unvalidated decisions into authoritative status. (Observed in practice: a form-only doctor pass cleared 33 lint warnings while promoting 12 laundered design decisions and several stale file:line anchors; the codebase-grounded follow-up found 4 beads already fixed in-tree and one citing a file deleted 100+ commits ago.)
+
+The rules:
+
+1. **Freshness validation is a prerequisite to authoring or promoting acceptance criteria.** Read the referenced source first. Run the bead's verify command (§3.3). Confirm the gap still reproduces at HEAD.
+2. **If a pass is form-only, label its output provisional** — it must not be treated as validated until a source-grounded pass confirms it.
+3. **Acceptance criteria that assert a design decision** (an invented enum value, prescribed copy, a threshold, a "cleanest" approach) **with no trace to a framing/architecture artifact are laundered decisions, not requirements.** Flag and rewrite them as explicit open questions rather than promoting them.
+4. **Capture needs a consolidation counterpart.** Issue discovery (§3.7) optimizes capture, but fragments of one decision get logged as N independent beads — e.g. five sighting beads each inventing a different value for the same enum is one architecture decision laundered five ways. Periodically detect beads sharing one upstream decision and group them under an epic parked at the architecture gate before any is decomposed.
+
+**The doctor recipe.** `bd doctor` is unavailable in embedded-dolt mode, so the composed equivalent is:
+
+```bash
+bd lint       # missing sections
+bd orphans    # broken dependencies
+bd stale      # no recent activity
+bd blocked    # dependency health
+```
+
+Run the composed recipe for structure, then a codebase-grounded freshness pass (one read-only validator per source-file cluster — see MULTI-MANAGER-PATTERN.md, Victor) before promoting anything.
 
 ---
 
@@ -871,7 +980,22 @@ What NOT to include in dispatch prompts:
 - Bash rules (global settings handle permissions)
 - TDD instructions (hooks enforce this mechanically)
 
+What to ALWAYS include:
+- **"Verify current state before touching code."** Have the worker run the
+  relevant test or check command first. If it's already clean, the bead may
+  be stale — STOP and report instead of writing code for a passing test.
+- File paths the worker will modify (the Fresh Agent Test material).
+- The exact test command to run before close.
+- Any **known acceptable failures** the worker shouldn't re-litigate
+  (named bead IDs + status). Workers reliably refile duplicate beads for
+  in-flight issues unless the dispatch explicitly names them.
+
 The prompt should answer three questions: **Which beads? What files? What commands?**
+
+For high-throughput sessions where prompt drift is a real cost, see the
+canonical worker-dispatch template at `templates/worker-dispatch.md` (in the
+SABLE repo). It formalizes the slots above plus a constraints block and
+report-back rubric.
 
 ### 6.3 Bead Bundling
 
@@ -966,6 +1090,21 @@ In a swarm, things don't always go as planned:
 
 The key insight: **beads make recovery trivial.** Because every unit of work is tracked independently, a failed worker doesn't corrupt the overall plan. You just re-dispatch.
 
+### 6.7a Scenario Packs as Compliance Audits
+
+A **scenario pack** is a bead whose deliverable is "tests modeling expected behavior in domain X" — TCPA consent gating, accessibility, auth boundaries, RBAC, payment-state transitions. The pattern: write the tests against what the bead specifies, run them, and the gap between assertion and real behavior IS the audit signal. When an assertion fails, the bug is typically in shipped code, not the test.
+
+File each drift as a separate bead and route it. The scenario pack becomes both ongoing test coverage AND a one-shot audit, in one worker run.
+
+This outperforms standalone "security audit" or "compliance audit" beads because:
+- Audit beads produce a report; scenario packs produce a regression suite.
+- The audit findings are inherently evidence-backed (the failing test IS the evidence).
+- Future regressions in the same domain catch automatically — the audit becomes self-renewing.
+
+**Best fit:** regulated surfaces (TCPA, CCPA, accessibility, auth boundaries, payment flows) where "what should happen" can be enumerated. Less useful for "find any security issue" — that needs human review.
+
+**Smoke-test corollary:** when the audit domain is auth-gated, the scenario pack should test the page-render leg, not just the API. A `/onboarding/invite-code` API can return 200 while middleware bounces unauthenticated users to `/landing` — the API test passes, the user-facing flow is broken. Hit both legs.
+
 ### 6.8 Grep After Refactors
 
 When a worker removes or renames a variable, function, import, or prop, it **must** grep for all references across the codebase before closing. Removing a declaration without updating every consumer causes runtime errors that surface later and are harder to debug.
@@ -980,12 +1119,40 @@ causes runtime errors.
 
 ### 6.9 Model Selection for Workers
 
-Different tasks benefit from different models:
+Different tasks need different models. Picking by bead structure (epic/feature/task) is wrong — bead structure is orthogonal to actual complexity. A 12-file rename is mechanical regardless of count; a single-file auth change is still security-sensitive. Apply the **model ladder** instead:
 
-- **Sonnet** (or equivalent fast model): Implementation tasks, test writing, bug fixes, refactoring. The majority of worker dispatches.
-- **Opus** (or equivalent reasoning model): Architecture decisions, complex debugging, nuanced code review. Used by the orchestrator or for specific difficult beads.
+**Default: Sonnet** (claude-sonnet-4-6). All work starts here.
 
-The orchestrator runs on the most capable model available. Workers run on the fastest model that can handle the task. This optimizes for total throughput — many fast workers executing well-specified beads is faster than one powerful agent doing everything sequentially.
+**Step DOWN to Haiku** only if ALL four are true:
+- Mechanical work (rename, format, copy-paste pattern, typo, regex replace)
+- Deterministic spec (file path + exact change, OR a clear template at N sites)
+- Low-risk path (dev tooling, docs, tests, internal scripts, comments)
+- No judgment calls — worker is purely executing
+
+**Step UP to Opus** if ANY one is true:
+- Design thinking required (which approach? what trade-offs? novel pattern?)
+- Security-sensitive path (auth, payments, RLS, PII, secrets, session boundaries)
+- Cross-cutting impact (multi-subsystem, ripples through data flow)
+- Spec has judgment-call gaps ("decide the right pattern", "investigate why X")
+- Unclear / intermittent debugging (race conditions, flaky tests, unknown root cause)
+
+**Common mis-classifications:**
+
+| Tempting wrong call | Why wrong | Right answer |
+|---|---|---|
+| "Epic child → Opus" | Many epic children are mechanical | Apply per-child |
+| "Single-file → Haiku" | Single-file auth/payments still need Opus | Risk dimension wins |
+| "Bug fix → Sonnet" | Typo is Haiku; race condition is Opus | Depends on debugging complexity |
+| "Sherlock-finding → Haiku" | `sherlock:design-rot` often needs Opus | Per sub-category |
+| "Many files → Opus" | Same pattern at every site is still mechanical | Mechanical-ness wins |
+
+**Encoding the choice on beads.** Beads can carry a `model:<haiku|sonnet|opus>` label set by the bead author (Sherlock auto-recommends in its bead template; manual creation should set it after applying the ladder). The label is the primary signal at dispatch time. If absent, the manager applies the ladder and adds the label after dispatch so the next worker doesn't re-derive.
+
+**Mechanical enforcement.** When the multi-manager pattern is active, the `pre-dispatch-model-check.sh` hook hard-blocks dispatches where the dispatch's model parameter disagrees with the bead's `model:` label, unless the prompt includes a `Model override: <reason>` line. This catches "let's just send it to Opus" reflexes that compound on cost across a session of dispatches.
+
+**Why this matters.** A swarm of all-Sonnet workers runs ~3-4× cheaper than all-Opus. Adding Haiku for mechanical work cuts another ~3× on those dispatches. Across 20+ dispatches per session, the difference compounds — and Sonnet handles 80%+ of standard implementation work without quality loss.
+
+The orchestrator (manager session) still runs on the most capable model available. Workers run on the fastest model that can handle the task. This optimizes for total throughput — many right-sized workers executing well-specified beads is faster AND cheaper than one powerful agent doing everything.
 
 ---
 
@@ -1032,6 +1199,26 @@ Practical guidelines:
 - **Before adding to CLAUDE.md, ask: can a hook enforce this instead?** If yes, write the hook.
 - **Remove lines that duplicate what the code shows.** If the convention is obvious from reading the codebase, documenting it is redundant.
 - **Audit quarterly.** Read every line and ask: is this still true? Is this still necessary? Has a hook replaced this? Remove aggressively.
+
+### 7.4 Companion Planning Skills — Columbo and Gaudi
+
+SABLE-native skills that gate the planning phase of a bead or epic before workers write code. Both are interview-driven, read-only with respect to source, and produce beads (never implementation).
+
+- **`/columbo`** — interview-driven test-coverage planning. Drags boundary cases, failure modes, and regression-from-experience cases out of the user before TDD workers ship happy-path-only suites. Four modes: `--feature` (no bead yet), `--bead <id>` (enrich existing), `--audit <path>` (find shallow tests), `--epic <id>` (gate test architecture of a planned bead tree). Produces `columbo-test-spec` / `columbo-test-gap` beads plus skeleton test files.
+- **`/gaudi`** — interview-driven architecture review. Surfaces named code smells (Fowler catalog) in existing modules, or gates the architectural shape — interface contracts, locked system-design tradeoffs, smell risks — of a planned epic before swarm workers dispatch. **Pedagogical voice**: explains every named concept (smells, tradeoffs, refactoring techniques, vocabulary) in plain language on first use within a session — designed for users with mixed system-design and DS&A experience. v1 modes: `--audit <path>`, `--epic <id>`. Produces `gaudi-arch-gap` beads.
+
+**The two skills are complementary, not redundant.** Columbo plans *what to test*; Gaudi plans *the shape of the code itself*. Recommended workflow for a planned epic:
+
+```
+/gaudi --epic SABLE-xxx    # lock interfaces and named tradeoffs
+/columbo --epic SABLE-xxx  # lock the test contract
+bd swarm validate SABLE-xxx
+# dispatch workers
+```
+
+Both skills append an architecture-review or test-architecture-review summary to the epic's notes, so workers see the locked decisions when claiming a child bead — no re-deriving the design from scratch.
+
+Companion-skill discipline: neither writes source. If they identify a smell or coverage gap that needs fixing, they file a bead; a worker (or the user) executes.
 
 ---
 
@@ -1292,7 +1479,7 @@ All projects use **bd (beads)** for issue tracking.
 - `bd create --title="..." --description="..." --type=bug|task|feature --priority=2`
 - `bd q "<title>"` — Quick capture (just outputs ID; use for failure-trigger logging)
 - `bd defer <id>` — Real bead but not for now (drops out of `bd ready`)
-- `bd children <id> --pretty` — Tree view of children under a parent/epic
+- `bd dep tree <id>` — Tree view of the dependency/child graph under a bead
 - `bd swarm validate <epic-id>` — Pre-flight a swarm: see ready fronts, parallelism, warnings
 - `bd worktree create <name>` — Isolated worktree with shared beads database (use before parallel dispatch)
 - `bd preflight` — PR readiness check before `git push`

@@ -1,0 +1,31 @@
+# Personal feedback notes captured by sable-note — never committed.
+# These are raw observations; curate via /sable-review into clean PRs when ready.
+# Curated archives in feedback/processed/ are also personal — they retain
+# verbatim observations and project-specific bead IDs that don't belong in
+# the shared methodology repo.
+feedback/*.md
+feedback/processed/
+
+# Backups created by install.sh / install.ps1 when prepending Prime Directives
+*.bak.*
+
+# Editor noise
+.DS_Store
+*.swp
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+# Cockpit install artifacts (project-scoped sable-cockpit-install output —
+# installed copies of repo sources under skills/, templates/, hooks/; not source)
+.claude/settings.local.json
+.claude/skills/plan/
+.claude/skills/execute/
+.claude/sable/
+.claude/hooks/multi-manager/cockpit-mode-interlock.sh

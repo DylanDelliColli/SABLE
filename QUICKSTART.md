@@ -153,7 +153,7 @@ Your first task on SABLE — at any stage — starts with the Foundation pattern
 - Create an epic: `bd create --type=epic --title="..." --description="..."`
 - Create child beads: `bd create --parent=<epic-id> --title="..." --description="..."`
 - Add dependencies with requirement language: `bd dep add <child-B> <child-A>` means "B needs A"
-- Visualize: `bd dep tree <epic-id>` or `bd children <epic-id> --pretty`
+- Visualize: `bd dep tree <epic-id>` or `bd children <epic-id>`
 
 **Swarm stage** — add when spec-writing is automatic and your usage budget supports parallel agents:
 - Validate the structure: `bd swarm validate <epic-id>`. Fix warnings before dispatching.
@@ -163,6 +163,15 @@ Your first task on SABLE — at any stage — starts with the Foundation pattern
 - See SABLE.md §6 for the full pattern, gotchas, and coordination primitives (`bd gate`, `bd merge-slot`)
 
 The SABLE.md "Getting Started" section (§10) walks through this in more detail with worked examples.
+
+### Optional companion skills — pre-execution planning
+
+SABLE ships with two companion skills that gate the planning phase of a bead or epic before workers start writing code. Both are interview-driven and produce beads (never source).
+
+- **`/columbo`** — test-coverage planning. Drag boundary cases, failure modes, and regression-from-experience cases out of your head before TDD ships happy-path-only suites. Four modes: `--feature` / `--bead` / `--audit` / `--epic`.
+- **`/gaudi`** — architecture review. Audit existing modules for named code smells (Fowler catalog) or gate the architectural shape of a planned epic before swarm workers dispatch. Pedagogical voice — explains tradeoffs and smells in plain language. Two modes in v1: `--audit` / `--epic`.
+
+Recommended pattern: run `/gaudi --epic <id>` first to lock interfaces and named tradeoffs, then `/columbo --epic <id>` to lock the test contract, then dispatch workers. The two skills are independent and can be run in either order.
 
 ---
 

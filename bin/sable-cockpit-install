@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# sable-cockpit-install — install (or uninstall) the cockpit layer.
+#
+# Default scope is PROJECT: everything lands in ./.claude (skills, role, layout,
+# registry, interlock hook, identity hook) and the hooks are registered in
+# ./.claude/settings.local.json (uncommitted) — contained to this repo and
+# trivially removable. Pass --user to install globally into ~/.claude instead.
+#
+# Installs the REGISTRY (agents.yaml) and IDENTITY injection (session-role-anchor,
+# SessionStart+PreCompact) so a CLAUDE_AGENT_NAME=cockpit session adopts its role
+# out of the box. Only the RUNNING manager swarm + its continuous coordination
+# hooks remain optional (see MULTI-MANAGER-PATTERN.md).
+#
+# Turn the cockpit off at runtime WITHOUT uninstalling: export SABLE_COCKPIT=off
+# (honored mechanically by sable-mode and the interlock hook).
+#
+# Usage:
+#   sable-cockpit-install [--project|--user] [--uninstall] [--help]
+#
+# Env (mainly for tests):
+#   SABLE_PROJECT_DIR   project root for --project scope (default: $PWD)
+#   CLAUDE_USER_DIR     user config dir for --user scope (default: ~/.claude)
+
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+usage() {
+    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+SCOPE="project"
+UNINSTALL=0
+for arg in "${@:-}"; do
+    case "$arg" in
+        --project)   SCOPE="project" ;;
+        --user)      SCOPE="user" ;;
+        --uninstall) UNINSTALL=1 ;;
+        -h|--help)   usage; exit 0 ;;
+        "")          ;;
+        *)           echo "sable-cockpit-install: unknown argument '$arg'" >&2; exit 1 ;;
+    esac
+done
+
+if [ "$SCOPE" = "user" ]; then
+    BASE="${CLAUDE_USER_DIR:-$HOME/.claude}"
+    SETTINGS="$BASE/settings.json"
+else
+    PROJECT="${SABLE_PROJECT_DIR:-$PWD}"
+    BASE="$PROJECT/.claude"
+    SETTINGS="$BASE/settings.local.json"
+fi
+SKILLS="$BASE/skills"
+HOOKS_DIR="$BASE/hooks/multi-manager"
+INTERLOCK_DEST="$HOOKS_DIR/cockpit-mode-interlock.sh"
+ROLEANCHOR_DEST="$HOOKS_DIR/session-role-anchor.sh"
+
+# Register the cockpit hooks (interlock + identity) idempotently across the
+# right events. Backs up, validates JSON before writing, never clobbers others.
+add_hooks() {
+    SETTINGS_PATH="$1" INTERLOCK_CMD="$2" ROLEANCHOR_CMD="$3" python3 - <<'PY'
+import json, os, shutil
+path = os.environ['SETTINGS_PATH']
+specs = [
+    {'event': 'PreToolUse',  'matcher': 'Bash', 'command': os.environ['INTERLOCK_CMD']},
+    {'event': 'SessionStart', 'matcher': '',    'command': os.environ['ROLEANCHOR_CMD']},
+    {'event': 'PreCompact',   'matcher': '',    'command': os.environ['ROLEANCHOR_CMD']},
+]
+data = {}
+if os.path.exists(path):
+    shutil.copy(path, path + '.bak')
+    try:
+        with open(path) as f: data = json.load(f)
+    except Exception:
+        data = {}
+hooks = data.setdefault('hooks', {})
+for s in specs:
+    ev = hooks.get(s['event'])
+    if not isinstance(ev, list):
+        ev = hooks[s['event']] = []
+    marker = s['command'].rsplit('/', 1)[-1]   # script basename
+    # Idempotency: skip if this hook is already registered in ANY block of the
+    # event, not just the first same-matcher one. An event can hold several blocks
+    # with the same matcher (e.g. '' for both `bd prime` and session-role-anchor),
+    # so a block-local check would double-register (SABLE-md7).
+    if any(marker in (h.get('command', '') if isinstance(h, dict) else '')
+           for b in ev if isinstance(b, dict)
+           for h in b.get('hooks', [])):
+        continue
+    blk = next((b for b in ev if isinstance(b, dict) and b.get('matcher', '') == s['matcher']), None)
+    if blk is None:
+        blk = {'matcher': s['matcher'], 'hooks': []}; ev.append(blk)
+    hl = blk.setdefault('hooks', [])
+    hl.insert(0, {'type': 'command', 'command': s['command'], 'timeout': 3000})
+out = json.dumps(data, indent=2); json.loads(out)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, 'w') as f: f.write(out + '\n')
+PY
+}
+
+remove_hooks() {
+    SETTINGS_PATH="$1" python3 - <<'PY'
+import json, os
+path = os.environ['SETTINGS_PATH']
+markers = ('cockpit-mode-interlock.sh', 'session-role-anchor.sh')
+if not os.path.exists(path):
+    raise SystemExit
+try:
+    with open(path) as f: data = json.load(f)
+except Exception:
+    raise SystemExit
+for blocks in data.get('hooks', {}).values():
+    if isinstance(blocks, list):
+        for b in blocks:
+            if isinstance(b, dict) and isinstance(b.get('hooks'), list):
+                b['hooks'] = [h for h in b['hooks']
+                              if not any(m in (h.get('command', '') if isinstance(h, dict) else '') for m in markers)]
+out = json.dumps(data, indent=2); json.loads(out)
+with open(path, 'w') as f: f.write(out + '\n')
+PY
+}
+
+if [ "$UNINSTALL" = "1" ]; then
+    rm -rf "$SKILLS/plan" "$SKILLS/execute"
+    rm -f "$BASE/sable/roles/lincoln.md" "$BASE/sable/roles/cockpit.md" \
+          "$BASE/sable/layouts/sable.kdl" \
+          "$BASE/sable/agents.yaml" "$INTERLOCK_DEST" "$ROLEANCHOR_DEST"
+    remove_hooks "$SETTINGS"
+    echo "Cockpit uninstalled from $BASE (scope: $SCOPE)."
+    echo "  (left other hooks and the settings file intact)"
+    exit 0
+fi
+
+# Install.
+mkdir -p "$SKILLS/plan" "$SKILLS/execute" "$BASE/sable/roles" "$BASE/sable/layouts" "$HOOKS_DIR"
+cp "$REPO/skills/cockpit-plan/SKILL.md"                   "$SKILLS/plan/SKILL.md"
+cp "$REPO/skills/cockpit-execute/SKILL.md"                "$SKILLS/execute/SKILL.md"
+cp "$REPO/templates/multi-manager/roles/lincoln.md"      "$BASE/sable/roles/lincoln.md"
+# v2 (SABLE-uz9.5): the agent is lincoln; remove a stale installed cockpit role
+# so a legacy CLAUDE_AGENT_NAME=cockpit session doesn't anchor outdated content.
+rm -f "$BASE/sable/roles/cockpit.md"
+cp "$REPO/templates/multi-manager/layouts/sable.kdl"     "$BASE/sable/layouts/sable.kdl"
+cp "$REPO/templates/multi-manager/agents.yaml"           "$BASE/sable/agents.yaml"
+cp "$REPO/hooks/multi-manager/cockpit-mode-interlock.sh" "$INTERLOCK_DEST"
+cp "$REPO/hooks/multi-manager/session-role-anchor.sh"    "$ROLEANCHOR_DEST"
+chmod +x "$INTERLOCK_DEST" "$ROLEANCHOR_DEST"
+add_hooks "$SETTINGS" "bash $INTERLOCK_DEST" "bash $ROLEANCHOR_DEST"
+
+# Dependency check (warn, don't fail).
+python3 -c "import textual" 2>/dev/null || \
+    echo "NOTE: python package 'textual' not importable by $(command -v python3) — run: python3 -m pip install textual" >&2
+
+echo "Cockpit installed to $BASE (scope: $SCOPE)."
+echo "  • Registry (agents.yaml) + identity injection (session-role-anchor) installed —"
+echo "    a CLAUDE_AGENT_NAME=lincoln session now adopts roles/lincoln.md at startup."
+echo "  • /plan and /execute become available after you restart the session."
+echo "  • Launch the cockpit:  sable-cockpit"
+echo "  • Disable anytime without uninstalling:  export SABLE_COCKPIT=off"
+echo "  • Uninstall:  sable-cockpit-install --$SCOPE --uninstall"
+echo "  • The running manager swarm (Optimus/Tarzan/Chuck + their coordination"
+echo "    hooks) stays optional — see MULTI-MANAGER-PATTERN.md if you want it."

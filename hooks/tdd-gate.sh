@@ -22,8 +22,38 @@ COMMAND=$(echo "$PARSED" | sed -n '2p')
 # Only act on bd close commands
 echo "$COMMAND" | grep -q '^bd close' || exit 0
 
-# Extract bead IDs (everything after "bd close", stripping flags like --reason="...")
-BEAD_ARGS=$(echo "$COMMAND" | sed 's/^bd close //' | sed 's/--[a-z]*="[^"]*"//g' | sed 's/--[a-z]*=[^ ]*//g' | xargs)
+# Extract bead IDs from the close command. Strategy: shlex-tokenize the
+# string, then keep only tokens that match the bead-ID shape
+# (PREFIX-suffix or PREFIX-suffix.N, with any-case prefix + lowercase
+# alphanumeric suffix). This naturally excludes flags (--reason, --json),
+# flag values (text after a flag), pipes (|), redirects (2>&1, > file),
+# and command chains (&&, ||, ;) — none of those tokens look like a
+# bead ID, so they don't inflate ID_COUNT.
+#
+# Replaces the previous sed pipeline (SABLE-1n2: missed --flag value
+# forms) and the shlex+flag-walker variant (SABLE-sqz: missed pipe /
+# redirect / chain tokens since they aren't flags but aren't IDs either).
+# Updated to accept lowercase prefixes (SABLE-i2m) for rigs using twine-*,
+# chess-*, or other any-case prefix schemes.
+BEAD_ARGS=$(BEAD_CMD="$COMMAND" python3 -c "
+import os, re, shlex
+cmd = re.sub(r'^bd close\s+', '', os.environ.get('BEAD_CMD', ''))
+try:
+    tokens = shlex.split(cmd)
+except ValueError:
+    tokens = []
+# Only consider tokens before the first flag (first token starting with '-').
+# Flag values after a flag token (e.g. 'docs-only' after '--reason') can
+# match the bead-ID shape and would inflate ID_COUNT — SABLE-3uw / SABLE-9we.
+positional = []
+for t in tokens:
+    if t.startswith('-'):
+        break
+    positional.append(t)
+ID_PATTERN = re.compile(r'^[A-Za-z][A-Za-z0-9]*-[a-z0-9]+(\.[0-9]+)?\$')
+ids = [t for t in positional if ID_PATTERN.match(t)]
+print(' '.join(ids))
+")
 ID_COUNT=$(echo "$BEAD_ARGS" | wc -w)
 
 # Single-bead close: check [no-test] escape hatch
