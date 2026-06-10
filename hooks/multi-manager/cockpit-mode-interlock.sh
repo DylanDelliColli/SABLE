@@ -1,30 +1,43 @@
 #!/usr/bin/env bash
 # cockpit-mode-interlock.sh — Enforce the cockpit's planning/execution boundary.
-# Trigger: PreToolUse:Bash | Timeout: 3000ms
+# Trigger: PreToolUse:Bash AND PreToolUse:Agent | Timeout: 3000ms
 #
 # This is the mechanical guarantee that makes the cockpit's two modes real
-# rather than advisory persona. It governs ONLY the cockpit session.
+# rather than advisory persona. It governs ONLY the Lincoln main session
+# (the cockpit seat). Modes flip mid-conversation via /plan and /execute —
+# the state file is re-read on every tool call, so the boundary moves the
+# moment the skill rewrites it.
 #
 #   PLANNING mode  → deny spawning execution managers (optimus/tarzan/chuck)
-#                    and deny `git push` of code. You fill the pool here; you
-#                    do not drain it or push from a half-formed backlog.
+#                    — as Agent-tool subagent spawns (v2 one-window topology)
+#                    or legacy Bash launch aliases — and deny `git push` of
+#                    code. You fill the pool here; you do not drain it or push
+#                    from a half-formed backlog. Backlog population (bd create
+#                    --parent/--graph/--file) stays blocked until
+#                    substage=decomposition.
 #   EXECUTION mode → deny spawning planning-only producers
-#                    (sherlock/victor/columbo/gaudi) from the cockpit. You drain
-#                    the pool here; producers belong to planning sessions.
+#                    (sherlock/victor/columbo, and legacy gaudi launches) from
+#                    the cockpit. You drain the pool here; producers belong to
+#                    planning. (Gaudi is a skill in v2 — skill invocations are
+#                    not Agent spawns and are not governed here.)
 #
-# Soft override: a command carrying `--force`, or env SABLE_COCKPIT_FORCE=1,
+# Soft override: a Bash command carrying `--force`, or env SABLE_COCKPIT_FORCE=1,
 # is always allowed. The interlock is a guardrail, not a wall.
 #
-# No-op unless CLAUDE_AGENT_NAME=cockpit. No-op in subagent contexts (agent_id
-# present in the hook input) so dispatched workers are never governed by it.
-# No-op when no mode is set. Mode is read from the mode-state file that
-# bin/sable-mode owns (SABLE_COCKPIT_STATE or ~/.claude/sable/state/
-# cockpit-mode.json), preferring the helper when resolvable.
+# No-op unless CLAUDE_AGENT_NAME is lincoln (v2) or cockpit (legacy/transition).
+# No-op in subagent contexts (agent_id present) so dispatched agents are never
+# governed by it. No-op when no mode is set. Mode is read from the mode-state
+# file that bin/sable-mode owns (SABLE_COCKPIT_STATE or
+# ~/.claude/sable/state/cockpit-mode.json), preferring the helper when
+# resolvable.
 
 set -uo pipefail
 
-# Only the cockpit session is governed.
-[ "${CLAUDE_AGENT_NAME:-}" = "cockpit" ] || exit 0
+# Only the Lincoln/cockpit main session is governed.
+case "${CLAUDE_AGENT_NAME:-}" in
+  lincoln|cockpit) ;;
+  *) exit 0 ;;
+esac
 
 # Runtime enable gate — no-op when the cockpit is disabled (SABLE-cav.7).
 case "$(printf '%s' "${SABLE_COCKPIT:-}" | tr '[:upper:]' '[:lower:]')" in
@@ -33,7 +46,7 @@ esac
 
 INPUT="$(cat)"
 
-# Subagent context — never govern dispatched workers.
+# Subagent context — never govern dispatched agents.
 AGENT_ID="$(printf '%s' "$INPUT" | python3 -c "
 import json, sys
 try:
@@ -43,18 +56,16 @@ except Exception:
 " 2>/dev/null)"
 [ -n "$AGENT_ID" ] && exit 0
 
-COMMAND="$(printf '%s' "$INPUT" | python3 -c "
+# Env opt-out applies to every leg.
+[ "${SABLE_COCKPIT_FORCE:-}" = "1" ] && exit 0
+
+TOOL_NAME="$(printf '%s' "$INPUT" | python3 -c "
 import json, sys
 try:
-    print(json.load(sys.stdin).get('tool_input', {}).get('command', '') or '')
+    print(json.load(sys.stdin).get('tool_name', '') or '')
 except Exception:
     print('')
 " 2>/dev/null)"
-[ -z "$COMMAND" ] && exit 0
-
-# Soft override: explicit --force flag or env opt-out.
-[ "${SABLE_COCKPIT_FORCE:-}" = "1" ] && exit 0
-printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exit 0
 
 # Resolve current mode. Prefer the helper; fall back to reading the file.
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -83,6 +94,54 @@ print(json.dumps({
 "
   exit 0
 }
+
+# ---------------------------------------------------------------------------
+# Agent leg (v2): spawning named agents happens via the Agent tool.
+# ---------------------------------------------------------------------------
+if [ "$TOOL_NAME" = "Agent" ]; then
+  SUBTYPE="$(printf '%s' "$INPUT" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print((d.get('tool_input') or {}).get('subagent_type', '') or '')
+except Exception:
+    print('')
+" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  [ -z "$SUBTYPE" ] && exit 0
+
+  case "$MODE" in
+    planning)
+      case "$SUBTYPE" in
+        optimus|tarzan|chuck)
+          deny "Cockpit is in PLANNING mode — spawning execution managers (optimus/tarzan/chuck) is blocked. Run /execute to drain the pool, or set SABLE_COCKPIT_FORCE=1 to override."
+          ;;
+      esac
+      ;;
+    execution)
+      case "$SUBTYPE" in
+        sherlock|victor|columbo)
+          deny "Cockpit is in EXECUTION mode — spawning planning-only producers (sherlock/victor/columbo) is blocked. Run /plan for a planning session, or set SABLE_COCKPIT_FORCE=1 to override."
+          ;;
+      esac
+      ;;
+  esac
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Bash leg: legacy launch aliases, git push, backlog population.
+# ---------------------------------------------------------------------------
+COMMAND="$(printf '%s' "$INPUT" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('tool_input', {}).get('command', '') or '')
+except Exception:
+    print('')
+" 2>/dev/null)"
+[ -z "$COMMAND" ] && exit 0
+
+# Soft override: explicit --force flag on the command.
+printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exit 0
 
 # Detect an attempt to launch a given set of named agents — either by setting
 # CLAUDE_AGENT_NAME=<name> on a claude invocation, or by invoking the bare

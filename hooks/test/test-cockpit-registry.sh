@@ -23,10 +23,12 @@ fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n
 # into the cockpit entry this is empty/absent.
 OUT="$(python3 "$AGENTS_BIN" --json --registry "$REGISTRY" 2>/dev/null)"
 
-if printf '%s' "$OUT" | jq -e '.cockpit' >/dev/null 2>&1; then
-  pass "cockpit present in registry"
+# v2 (SABLE-uz9.5): the cockpit seat merged into the lincoln entry — the
+# main session IS Lincoln; "cockpit" is the type/mode machinery, not an agent.
+if printf '%s' "$OUT" | jq -e '.lincoln' >/dev/null 2>&1; then
+  pass "lincoln present in registry"
 else
-  fail "cockpit present in registry" "sable-agents --json has no .cockpit key"
+  fail "lincoln present in registry" "sable-agents --json has no .lincoln key"
 fi
 
 assert_field() {
@@ -36,9 +38,16 @@ assert_field() {
   if [ "$got" = "$3" ]; then pass "$1"; else fail "$1" "expected '$3', got '$got'"; fi
 }
 
-assert_field "cockpit type is cockpit"        '.cockpit.type'             "cockpit"
-assert_field "cockpit cross_inbox_read true"   '.cockpit.cross_inbox_read' "true"
-assert_field "cockpit role_prompt path"        '.cockpit.role_prompt'      "roles/cockpit.md"
+assert_field "lincoln type is cockpit (the seat)" '.lincoln.type'             "cockpit"
+assert_field "lincoln cross_inbox_read true"      '.lincoln.cross_inbox_read' "true"
+assert_field "lincoln role_prompt path"           '.lincoln.role_prompt'      "roles/cockpit.md"
+
+# The standalone cockpit agent entry must be GONE (merged into lincoln).
+if printf '%s' "$OUT" | jq -e '.cockpit' >/dev/null 2>&1; then
+  fail "standalone cockpit entry retired" "registry still has a .cockpit agent"
+else
+  pass "standalone cockpit entry retired"
+fi
 
 # The existing roster must still be intact (no accidental clobber).
 for a in optimus tarzan chuck lincoln sherlock victor rudy columbo; do

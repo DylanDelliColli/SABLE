@@ -160,6 +160,62 @@ set_mode planning
 out_disabled="$(printf '%s' '{"tool_input":{"command":"CLAUDE_AGENT_NAME=optimus claude"}}' | SABLE_COCKPIT=off bash "$HOOK" 2>/dev/null)"
 if is_deny "$out_disabled"; then fail "SABLE_COCKPIT=off no-ops the interlock" "got deny"; else pass "SABLE_COCKPIT=off no-ops the interlock"; fi
 
+# ---------- v2: lincoln identity + Agent-tool leg (SABLE-uz9.5) ----------
+
+# agent_json <subagent_type> [agent_id] → hook input for an Agent spawn
+agent_json() {
+  python3 -c "
+import json, sys
+d = {'tool_name': 'Agent', 'tool_input': {'subagent_type': sys.argv[1], 'prompt': 'work', 'description': 'spawn'}}
+if len(sys.argv) > 2 and sys.argv[2]:
+    d['agent_id'] = sys.argv[2]
+print(json.dumps(d))
+" "$1" "${2:-}"
+}
+
+run_agent() { # <subagent_type> <env_name> [agent_id]
+  agent_json "$1" "${3:-}" | CLAUDE_AGENT_NAME="$2" bash "$HOOK" 2>/dev/null
+}
+
+set_mode planning
+
+out="$(run_agent optimus lincoln)"
+if is_deny "$out"; then pass "v2 planning blocks Agent spawn of optimus (lincoln identity)"; else fail "v2 planning blocks Agent spawn of optimus (lincoln identity)" "got: ${out:-<empty>}"; fi
+
+out="$(run_agent sherlock lincoln)"
+if is_deny "$out"; then fail "v2 planning allows Agent spawn of sherlock" "got deny"; else pass "v2 planning allows Agent spawn of sherlock"; fi
+
+out="$(run_agent Explore lincoln)"
+if is_deny "$out"; then fail "v2 planning allows Agent spawn of Explore" "got deny"; else pass "v2 planning allows Agent spawn of Explore"; fi
+
+# lincoln identity also governed on the Bash leg
+out_lb="$(printf '%s' '{"tool_input":{"command":"git push"}}' | CLAUDE_AGENT_NAME=lincoln bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_lb"; then pass "v2 planning blocks git push under lincoln identity"; else fail "v2 planning blocks git push under lincoln identity" "got: ${out_lb:-<empty>}"; fi
+
+set_mode execution
+
+out="$(run_agent sherlock lincoln)"
+if is_deny "$out"; then pass "v2 execution blocks Agent spawn of sherlock"; else fail "v2 execution blocks Agent spawn of sherlock" "got: ${out:-<empty>}"; fi
+
+out="$(run_agent victor cockpit)"
+if is_deny "$out"; then pass "v2 execution blocks Agent spawn of victor (legacy cockpit name)"; else fail "v2 execution blocks Agent spawn of victor (legacy cockpit name)" "got: ${out:-<empty>}"; fi
+
+out="$(run_agent optimus lincoln)"
+if is_deny "$out"; then fail "v2 execution allows Agent spawn of optimus" "got deny"; else pass "v2 execution allows Agent spawn of optimus"; fi
+
+out="$(run_agent rudy lincoln)"
+if is_deny "$out"; then fail "v2 execution allows Agent spawn of rudy (not producer-gated)" "got deny"; else pass "v2 execution allows Agent spawn of rudy (not producer-gated)"; fi
+
+# Agent leg: subagent context no-op
+out="$(run_agent sherlock lincoln sub-9)"
+if is_deny "$out"; then fail "v2 Agent leg no-op in subagent context" "got deny"; else pass "v2 Agent leg no-op in subagent context"; fi
+
+# Agent leg: non-cockpit identity no-op
+out="$(run_agent sherlock optimus)"
+if is_deny "$out"; then fail "v2 Agent leg no-op for non-lincoln identity" "got deny"; else pass "v2 Agent leg no-op for non-lincoln identity"; fi
+
+set_mode planning
+
 # ---------- settings-snippet registration ----------
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 if jq -e . "$SNIPPET" >/dev/null 2>&1; then pass "settings-snippet.json is valid JSON"; else fail "settings-snippet.json is valid JSON"; fi

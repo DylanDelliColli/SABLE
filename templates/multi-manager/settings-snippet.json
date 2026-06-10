@@ -61,6 +61,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/cockpit-mode-interlock.sh",
+            "timeout": 3000
+          },
+          {
+            "type": "command",
             "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-preempt.sh",
             "timeout": 3000
           },

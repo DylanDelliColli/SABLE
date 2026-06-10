@@ -126,47 +126,28 @@ agents:
     bead_template: templates/columbo-bead.md   # required for all columbo beads
     quality_bar: above_default  # see role_prompt for what this means
 
-  # Execution-session agent. Strategic partner running as a peer alongside
-  # Optimus/Tarzan/Chuck — NOT an orchestrator. User runs 4 terminals during
-  # working sessions and primarily talks to Lincoln. Three lightweight
-  # modes: Quick strategy / Arbitration / What's next. Recommends (does not
-  # invoke) office-hours / plan-eng-review / sherlock / victor / rudy for
-  # questions that genuinely need deep design work.
+  # Lincoln — the v2 main session (SABLE-uz9.5). One entry, two heritages
+  # merged: the original Tier-3 strategist (status, arbitration, strategic
+  # conversation) and the cockpit seat (mode-aware fleet launch). The user
+  # talks to Lincoln in ONE window; /plan and /execute (skills/cockpit-plan,
+  # cockpit-execute) flip the mode via bin/sable-mode, and the mode-state file
+  # governs what Lincoln may spawn (cockpit-mode-interlock.sh, Bash + Agent
+  # legs). Planning mode: walks the gated substages, spawning Tier-2 producers
+  # as named subagents (gaudi runs as an inline skill). Execution mode: spawns
+  # Optimus/Tarzan as manager subagents, executes their dispatch requests as
+  # invisible background workers (Dispatching-for: attribution), pushes after
+  # review, and brokers for-lincoln arbitration. Chuck remains an env-var
+  # terminal (SABLE-uz9.6). "Cockpit" survives as the name of the mode
+  # machinery — the seat, not the person.
   lincoln:
-    type: strategist
-    scope: "Status reporting, strategic conversation, cross-manager brokering during execution sessions"
-    claim_filter: null         # doesn't claim — pure strategic interlocutor
-    inbox_label: for-lincoln   # accepts arbitration asks from O/T/C, direction from user
-    role_prompt: roles/lincoln.md
-    dispatches_workers: true   # read-only Explore subagents only
-    cross_inbox_read: true     # bypass read-guard to give status across all managers
-    idle_polling: "/loop 5m /inbox"  # slower than Chuck; strategic conversation is reactive
-    files_addressed_beads: true      # may file for-X coord beads (one-line, not detailed specs)
-    forbidden_invocations:
-      - sherlock  # planning-session agent, user invokes
-      - victor    # planning-session agent, user invokes
-      - rudy      # planning-session agent, user invokes
-
-  # The cockpit. A single named session the operator talks to, sitting over
-  # the whole roster. /plan and /execute (skills/cockpit-plan, cockpit-execute)
-  # flip its mode via bin/sable-mode; the mode-state file then governs what the
-  # cockpit may launch (the cockpit-mode-interlock.sh hook) and what the
-  # sable-status dashboard emphasizes. In planning mode it directs the Tier-2
-  # producers (Sherlock/Columbo/Gaudi/Victor) to fill the bead pool; in
-  # execution mode it launches Optimus/Tarzan/Chuck as pinned background
-  # sessions and oversees them. Unlike Lincoln (a pure peer interlocutor), the
-  # cockpit is allowed to launch fleets — that is its defining new
-  # responsibility. See COCKPIT-DESIGN.md and roles/cockpit.md.
-  cockpit:
     type: cockpit
-    scope: "Single operator-facing session over the roster; /plan fills the bead pool via Tier-2 producers, /execute drains it via the manager swarm"
-    claim_filter: null         # doesn't claim — it directs and oversees
-    inbox_label: for-cockpit   # operator direction + escalations from launched agents
+    scope: "The one operator-facing main session: strategist + mode-aware fleet launch; /plan fills the pool via producer subagents, /execute drains it via manager subagents + background workers"
+    claim_filter: null         # doesn't claim — directs, dispatches, oversees
+    inbox_label: for-lincoln   # arbitration asks from managers, direction from user
     role_prompt: roles/cockpit.md
-    dispatches_workers: true   # read-only Explore for status; launches fleets as background sessions
+    dispatches_workers: true   # executes manager dispatch requests as background workers
     cross_inbox_read: true     # must see every agent's plate to oversee both modes
-    idle_polling: "/loop 5m /inbox"
     files_addressed_beads: true      # may file for-X coord/direction beads
-    launches_fleets: true            # the new responsibility vs Lincoln: mode-aware fleet launch
+    launches_fleets: true            # mode-aware fleet spawn (subagents, not terminals)
 
 # Add new agents here using the same shape.
