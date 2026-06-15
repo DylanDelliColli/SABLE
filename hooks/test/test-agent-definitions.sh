@@ -28,6 +28,7 @@ pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 assert_file() { if [ -f "$1" ]; then pass "$2"; else fail "$2" "missing: $1"; fi; }
 assert_grep() { if grep -q -- "$2" "$1" 2>/dev/null; then pass "$3"; else fail "$3" "pattern not found: $2"; fi; }
+assert_no_grep() { if grep -q -- "$2" "$1" 2>/dev/null; then fail "$3" "pattern unexpectedly present: $2"; else pass "$3"; fi; }
 
 assert_file "$BUILDER" "builder script exists"
 
@@ -78,15 +79,30 @@ assert_grep "$AGENTS_DIR/rudy.md"     "never. Catastrophic"    "rudy keeps the p
 assert_grep "$AGENTS_DIR/rudy.md"     "SABLE_RUDY_BASE_URL"    "rudy keeps the target env-var config"
 assert_grep "$AGENTS_DIR/columbo.md"  "columbo-test-spec"      "columbo keeps the test-spec bead label"
 assert_grep "$AGENTS_DIR/columbo.md"  "it.todo"                "columbo keeps the skeleton-file contract"
-assert_grep "$AGENTS_DIR/optimus.md"  "DISPATCH-REQUEST"       "optimus carries the dispatch-request protocol"
-assert_grep "$AGENTS_DIR/optimus.md"  "RESIDENT"               "optimus is a resident manager (one spawn per session)"
-assert_grep "$AGENTS_DIR/optimus.md"  "shift-report"           "optimus carries the shift-change protocol"
-assert_grep "$AGENTS_DIR/tarzan.md"   "RESIDENT"               "tarzan is a resident manager (one spawn per session)"
-assert_grep "$AGENTS_DIR/optimus.md"  "has-parent"             "optimus keeps the epic claim filter"
-assert_grep "$AGENTS_DIR/optimus.md"  "APPROVE-PUSH"           "optimus carries the review verdict protocol"
-assert_grep "$AGENTS_DIR/tarzan.md"   "DISPATCH-REQUEST"       "tarzan carries the dispatch-request protocol"
-assert_grep "$AGENTS_DIR/tarzan.md"   "no-parent"              "tarzan keeps the orphan claim filter"
-assert_grep "$AGENTS_DIR/tarzan.md"   "emergency"              "tarzan keeps emergency mode"
+# --- SABLE-uz9.11: managers dispatch workers natively + push directly ---
+# Managers must be granted the Agent tool and must NOT carry the old
+# DISPATCH-REQUEST coord-bead duplex (nested spawn works, CC 2.1.177, uz9.8).
+for mgr in optimus tarzan; do
+  DEF="$AGENTS_DIR/$mgr.md"
+  # Frontmatter tools: line that grants Agent (the spawn capability).
+  if grep -E "^tools:.*\bAgent\b" "$DEF" >/dev/null 2>&1; then
+    pass "$mgr.md frontmatter grants the Agent tool"
+  else
+    fail "$mgr.md frontmatter grants the Agent tool" "no 'tools:' line containing Agent"
+  fi
+  assert_no_grep "$DEF" "DISPATCH-REQUEST"  "$mgr no longer files DISPATCH-REQUEST coord beads"
+  assert_grep    "$DEF" "Agent tool"        "$mgr dispatches workers via the Agent tool (native spawn)"
+  assert_grep    "$DEF" "git -C"            "$mgr pushes the approved worktree directly (git -C <worktree> push)"
+  assert_grep    "$DEF" "RESIDENT"          "$mgr is a resident manager (one spawn per session)"
+done
+assert_grep    "$AGENTS_DIR/optimus.md" "shift-report"  "optimus carries the shift-change protocol"
+assert_grep    "$AGENTS_DIR/optimus.md" "has-parent"    "optimus keeps the epic claim filter"
+assert_grep    "$AGENTS_DIR/optimus.md" "APPROVE-PUSH"  "optimus carries the approve-then-push verdict"
+assert_grep    "$AGENTS_DIR/tarzan.md"  "no-parent"     "tarzan keeps the orphan claim filter"
+assert_grep    "$AGENTS_DIR/tarzan.md"  "emergency"     "tarzan keeps emergency mode"
+# The shared preamble's stale "NO Agent tool" line must not reach managers.
+assert_no_grep "$AGENTS_DIR/optimus.md" "you have NO Agent tool"  "optimus preamble does not claim it lacks the Agent tool"
+assert_no_grep "$AGENTS_DIR/tarzan.md"  "you have NO Agent tool"  "tarzan preamble does not claim it lacks the Agent tool"
 
 echo
 echo "=========================================="
