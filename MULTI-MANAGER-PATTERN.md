@@ -114,15 +114,18 @@ SABLE v2 reduces the operator surface to **one primary window**. See
 A single **Lincoln main session** (`CLAUDE_AGENT_NAME=lincoln
 CLAUDE_AGENT_ROLE=manager claude`) is the one session you talk to. Optimus and
 Tarzan run as **resident manager subagents** inside it — spawned once at session
-start, receiving DISPATCH-REQUEST messages from Lincoln, living in the
-background. Chuck stays a separate terminal (env-var identity) because always-on
-merge-queue polling is session-shaped — see the "Chuck hybrid holdout" section in
+start, living in the background, where each **dispatches its own workers** (via
+the `Agent` tool — nested spawn, CC 2.1.177, SABLE-uz9.8/uz9.9) and **pushes its
+own approved lanes** (`git -C <worktree> push`). Lincoln spawns and oversees
+them; it no longer relays dispatch requests or pushes on their behalf. Chuck
+stays a separate terminal (env-var identity) because always-on merge-queue
+polling is session-shaped — see the "Chuck hybrid holdout" section in
 [`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md).
 
 | Mode | Job | Mechanics |
 |------|-----|-----------|
 | **Planning** | fill & groom the pool via the staged substages (FRAMING → RESEARCH → ARCHITECTURE → TEST-STRATEGY → DECOMPOSITION) | Lincoln runs the substage machine; Tier-2 producers invoked on demand; interlock blocks execution dispatches until `substage=decomposition` |
-| **Execution** | drain the bead pool | Lincoln oversees resident Optimus + Tarzan subagents; Chuck handles merge queue in second terminal |
+| **Execution** | drain the bead pool | Lincoln spawns + oversees resident Optimus + Tarzan subagents, which self-dispatch workers and self-push approved lanes; Chuck handles merge queue in second terminal |
 
 Planning is staged, not a single step. The five substages are:
 
