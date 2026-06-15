@@ -169,8 +169,14 @@ This adds, on top of the Foundation install:
   refresh/claim/overlap/preempt/model-check, the cockpit-mode interlock, the
   pre-push gate, post-push notify, identity discrimination).
 - `~/.claude/sable/agents.yaml` — the agent registry (identities, lanes, inboxes).
+- `~/.claude/skills/` — the SABLE slash commands (`/plan`, `/execute`, `/gaudi`,
+  `/columbo`, `/audit-deep-dive`, `/sable-review`), installed by their skill
+  name (so `cockpit-plan` lands as `/plan`).
 - The named agent definitions are already in `~/.claude/agents/` from the
   Foundation install.
+
+**Restart Claude Code** after installing the cockpit tier — the agent
+definitions *and the slash commands* register at session start.
 
 Then **merge the cockpit hook block** into `~/.claude/settings.json` — the
 canonical block is committed at `templates/multi-manager/settings-snippet.json`
