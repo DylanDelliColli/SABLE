@@ -46,12 +46,50 @@ DESC=$(echo "$PARSED" | sed -n '2p')
 CWD=$(echo "$PARSED" | sed -n '3p')
 PROMPT=$(echo "$PARSED" | sed -n '5,$p')
 
-# Skip exploration / read-only subagents
-echo "$SUBTYPE" | grep -qiE '^(Explore|Plan|claude-code-guide|general-purpose)$' && exit 0
-echo "$DESC" | grep -qiE '(explore|research|search|find|read.only|investigate|audit)' && exit 0
+emit_advisory() { # <text> — emit a single non-blocking additionalContext object
+  TEXT="$1" python3 -c "
+import json, os
+print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': os.environ.get('TEXT', '')}}))
+"
+}
 
-# Locate worktree path from prompt — look for "worktree" or "cd /path" or "in <path>"
-WORKTREE=$(echo "$PROMPT" | python3 -c "
+# ---- Resolve the rebase target (SABLE-uz9.15) ----
+# A structured 'Worktree: /abs/path' line in the dispatch prompt is the
+# AUTHORITATIVE target and takes priority. Under native dispatch the hook-input
+# cwd is the MANAGER's main checkout, not the worker's worktree, so a manager
+# that created a per-bundle worktree names it explicitly. cwd / loose inference
+# is the fallback only when no usable structured line is present.
+ADVISORY=""
+
+WT_LINE=$(printf '%s' "$PROMPT" | python3 -c "
+import sys, re
+text = sys.stdin.read()
+m = re.search(r'^[ \t]*Worktree:[ \t]*(\S+)', text, re.MULTILINE)
+if not m:
+    sys.exit(0)
+path = m.group(1).strip().rstrip('\r')
+print(('ABS' if path.startswith('/') else 'REL') + '\t' + path)
+" 2>/dev/null || echo "")
+WT_KIND=$(printf '%s' "$WT_LINE" | cut -f1)
+WT_PATH=$(printf '%s' "$WT_LINE" | cut -sf2)
+
+WORKTREE=""
+if [ "$WT_KIND" = "ABS" ]; then
+  if [ ! -d "$WT_PATH" ]; then
+    emit_advisory "PRE-DISPATCH WARNING: Worktree path '$WT_PATH' named in the dispatch prompt was not found on disk; skipping rebase (failing open). Create it with 'bd worktree create' before dispatching this worker."
+    exit 0
+  fi
+  # Explicit work target — do not apply the exploration skip.
+  WORKTREE="$WT_PATH"
+elif [ "$WT_KIND" = "REL" ]; then
+  ADVISORY="PRE-DISPATCH WARNING: Worktree line must be an absolute path, got '$WT_PATH'; ignoring it and falling back to the dispatch cwd."
+  WORKTREE="$CWD"
+else
+  # No structured line: skip genuine read-only agents, then infer from the
+  # prompt, then fall back to cwd.
+  echo "$SUBTYPE" | grep -qiE '^(Explore|Plan|claude-code-guide)$' && exit 0
+  echo "$DESC" | grep -qiE '(explore|research|search|find|read.only|investigate|audit)' && exit 0
+  WORKTREE=$(echo "$PROMPT" | python3 -c "
 import sys, re
 text = sys.stdin.read()
 patterns = [
@@ -65,12 +103,15 @@ for p in patterns:
         print(m.group(1))
         sys.exit(0)
 " 2>/dev/null || echo "")
+  [ -z "$WORKTREE" ] && WORKTREE="$CWD"
+fi
 
-# Fall back to current working directory if no worktree explicit
-[ -z "$WORKTREE" ] && WORKTREE="$CWD"
-[ -z "$WORKTREE" ] && exit 0
-[ ! -d "$WORKTREE" ] && exit 0
-[ ! -d "$WORKTREE/.git" ] && [ ! -f "$WORKTREE/.git" ] && exit 0
+# Target must be an existing git worktree; otherwise stand down (surfacing any
+# pending advisory).
+if [ -z "$WORKTREE" ] || [ ! -d "$WORKTREE" ] || { [ ! -d "$WORKTREE/.git" ] && [ ! -f "$WORKTREE/.git" ]; }; then
+  [ -n "$ADVISORY" ] && emit_advisory "$ADVISORY"
+  exit 0
+fi
 
 # Validate base ref and fall back gracefully when SABLE_BASE_BRANCH points to
 # a ref that doesn't exist in this repo (SABLE-61n)
@@ -83,21 +124,14 @@ REBASE_OUT=$(git -C "$WORKTREE" rebase "$BASE_BRANCH" 2>&1 || echo "REBASE_FAILE
 if echo "$REBASE_OUT" | grep -q "REBASE_FAILED"; then
   # Abort the half-done rebase so the worktree isn't left in conflict state
   git -C "$WORKTREE" rebase --abort 2>/dev/null || true
-
-  WORKTREE="$WORKTREE" BASE_BRANCH="$BASE_BRANCH" REBASE_OUT="$REBASE_OUT" python3 -c "
-import json, os
-wt = os.environ.get('WORKTREE', '')
-bb = os.environ.get('BASE_BRANCH', '')
-out = os.environ.get('REBASE_OUT', '')[:500]
-print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'PreToolUse',
-        'additionalContext': f'PRE-DISPATCH WARNING: rebase of {wt} on {bb} failed and was aborted. Resolve manually before dispatching this worker, or dispatch into a fresh worktree. Output:\n{out}'
-    }
-}))
-"
+  REBASE_MSG="PRE-DISPATCH WARNING: rebase of $WORKTREE on $BASE_BRANCH failed and was aborted. Resolve manually before dispatching this worker, or dispatch into a fresh worktree. Output:
+$(printf '%s' "$REBASE_OUT" | head -c 500)"
+  [ -n "$ADVISORY" ] && REBASE_MSG="$ADVISORY
+$REBASE_MSG"
+  emit_advisory "$REBASE_MSG"
   exit 0
 fi
 
-# Success: silent
+# Success: surface any pending advisory (e.g. relative-path fallback), else silent.
+[ -n "$ADVISORY" ] && emit_advisory "$ADVISORY"
 exit 0
