@@ -71,11 +71,19 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 Both installers do the same thing:
 1. Verify `bd` is on PATH (and on Windows, that `bash` is available — warns if not)
-2. Copy the six hook scripts into `~/.claude/hooks/` (`%USERPROFILE%\.claude\hooks\` on Windows)
-3. Prepend the SABLE Prime Directives to `~/.claude/CLAUDE.md` (with a timestamped backup if one already exists)
-4. Print the JSON snippet you paste into `~/.claude/settings.json` (does NOT auto-edit your settings — you review and paste, so existing config is never clobbered)
+2. Copy the Foundation hook scripts into `~/.claude/hooks/` (`%USERPROFILE%\.claude\hooks\` on Windows)
+3. Copy the named agent definitions into `~/.claude/agents/`
+4. Prepend the SABLE Prime Directives to `~/.claude/CLAUDE.md` (with a timestamped backup if one already exists)
+5. Print the JSON snippet you paste into `~/.claude/settings.json` (does NOT auto-edit your settings — you review and paste, so existing config is never clobbered)
 
-Both are idempotent and safe to re-run. If you'd rather do it manually, see [Manual install](#manual-install) below.
+Both are idempotent and safe to re-run. Useful flags:
+- `bash install.sh --dry-run` — report exactly what would be copied, write nothing.
+- `bash install.sh --cockpit` — also install the **cockpit (multi-manager) tier**
+  (the one-window manager hooks + `agents.yaml` registry). Foundation adopters
+  skip this; climb to it when you're ready for swarm execution (see
+  [Climbing to the cockpit](#climbing-to-the-cockpit-advanced) below).
+
+If you'd rather do it manually, see [Manual install](#manual-install) below.
 
 ### Step 3 — Initialize beads in your project
 
@@ -136,6 +144,53 @@ bd close <id>                      # Should now succeed (escape hatch in action)
 ```
 
 If `bd close` succeeded the first time without asking for tests, the hooks aren't firing — re-run `install.sh` and verify the JSON in `~/.claude/settings.json` matches.
+
+---
+
+## Climbing to the cockpit (advanced)
+
+Foundation gets you single-agent, sequential SABLE. The **cockpit** is the top
+rung of the [adoption ramp](#adoption-ramp--the-install-is-the-same-the-practice-ramps-over-time):
+the **one-window native-spawn topology** where you talk to a single *Lincoln*
+session that hosts the named execution managers (*Optimus*, *Tarzan*) as resident
+subagents — and each manager dispatches its own background workers and pushes its
+own approved lane. Climb here once your bead-writing is automatic and your usage
+budget supports parallel agents (see SABLE.md §6).
+
+**Install the cockpit tier:**
+
+```bash
+cd ~/sable
+bash install.sh --cockpit          # or: SABLE_MULTI_MANAGER=1 bash install.sh
+```
+
+This adds, on top of the Foundation install:
+- `~/.claude/hooks/multi-manager/*.sh` — the governance hooks (pre-dispatch
+  refresh/claim/overlap/preempt/model-check, the cockpit-mode interlock, the
+  pre-push gate, post-push notify, identity discrimination).
+- `~/.claude/sable/agents.yaml` — the agent registry (identities, lanes, inboxes).
+- The named agent definitions are already in `~/.claude/agents/` from the
+  Foundation install.
+
+Then **merge the cockpit hook block** into `~/.claude/settings.json` — the
+canonical block is committed at `templates/multi-manager/settings-snippet.json`
+(the installer prints the path). **Restart Claude Code** so the new agent
+definitions and hook registrations load.
+
+**Verify the cockpit:**
+
+```bash
+ls ~/.claude/hooks/multi-manager/        # governance hooks present
+head -1 ~/.claude/sable/agents.yaml      # registry present
+sable-mode get                           # mode-state helper resolves (planning|execution)
+```
+
+In a fresh session, `/plan` walks the staged planning substages and `/execute`
+drains the pool via the resident managers. Chuck (the merge-queue integrator)
+stays a second terminal — add its env-var alias from the installer's printed
+snippet if you run a merge queue. The full topology lives in
+[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) and
+[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md).
 
 ---
 
