@@ -28,15 +28,15 @@ DEFAULT_OUT = REPO / "templates" / "agents"
 AGENTS = {
     "optimus": (
         "Epic manager (SABLE execution lane). Plans, bundles, and reviews beads with a "
-        "parent epic; returns DISPATCH-REQUEST blocks for Lincoln to execute as "
-        "background workers and issues APPROVE-PUSH/REVISE verdicts on results. Does "
-        "not dispatch, push, or open PRs itself."
+        "parent epic; spawns workers natively via the Agent tool, reviews their "
+        "stopped-before-push results, and pushes approved work itself (git -C <worktree> "
+        "push). Issues APPROVE-PUSH/REVISE verdicts on its own lane."
     ),
     "tarzan": (
         "One-off manager (SABLE execution lane). Plans, bundles, and reviews standalone "
-        "orphan beads — bugfixes, docs, small refactors; returns DISPATCH-REQUEST blocks "
-        "for Lincoln to execute as background workers and issues APPROVE-PUSH/REVISE "
-        "verdicts. Emergency mode: fixes swarm-blockers directly in its own context."
+        "orphan beads — bugfixes, docs, small refactors; spawns workers natively via the "
+        "Agent tool, reviews stopped-before-push results, and pushes approved work itself. "
+        "Emergency mode: fixes swarm-blockers directly in its own context."
     ),
     "sherlock": (
         "Read-only repo auditor producing exceptional finding beads — design rot, "
@@ -79,6 +79,34 @@ PREAMBLE = """\
 > end-of-session summary as your final message back to the spawning session.
 """
 
+# Managers (SABLE-uz9.11) are granted the Agent tool and dispatch their own
+# workers natively; the stale "NO Agent tool" line in PREAMBLE does not apply to
+# them. Nested spawn + nested PreToolUse:Agent firing confirmed on CC 2.1.177
+# (SABLE-uz9.8/uz9.9).
+MANAGER_NAMES = {"optimus", "tarzan"}
+
+# Explicit whitelist: declaring `tools:` restricts the agent to exactly this
+# set, and Agent is silently filtered unless named here (anthropic/claude-code
+# #47927). Generous superset covering bd/git (Bash), diff review (Read/Grep/Glob),
+# emergency in-context edits (Edit/Write), worker spawn (Agent), and skills/MCP
+# (Skill/ToolSearch/TodoWrite).
+MANAGER_TOOLS = "Agent, Bash, Edit, Glob, Grep, Read, Skill, TodoWrite, ToolSearch, Write"
+
+MANAGER_PREAMBLE = """\
+> **v2 invocation (one-window topology).** You are spawned as a named subagent
+> by the Lincoln main session (or directly by the user from the main
+> conversation). Your scope/mode arrives in the spawn prompt rather than a
+> shell argument — read the legacy shell invocations below (e.g.
+> `{name} <scope>`) as prompt parameters (e.g. "scope: <scope>"). Your identity
+> comes from this agent definition's system prompt, not CLAUDE_AGENT_NAME; the
+> continuous-mode manager hooks never applied to you and still don't. You HAVE
+> the Agent tool: you dispatch your own workers as background subagents, and the
+> pre-dispatch governance hooks (refresh/claim/overlap/preempt/model-check) fire
+> on your Agent call with your lane identity (verified CC 2.1.177,
+> SABLE-uz9.8/uz9.9). Everything else in this role is binding. Deliver your
+> end-of-session summary as your final message back to the spawning session.
+"""
+
 
 def build(out_dir: Path) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -88,14 +116,18 @@ def build(out_dir: Path) -> int:
             print(f"ERROR: missing role file {role}", file=sys.stderr)
             return 1
         body = role.read_text()
+        is_manager = name in MANAGER_NAMES
+        preamble = MANAGER_PREAMBLE if is_manager else PREAMBLE
+        tools_line = f"tools: {MANAGER_TOOLS}\n" if is_manager else ""
         generated = (
             "---\n"
             f"name: {name}\n"
             f"description: {description}\n"
+            f"{tools_line}"
             "---\n"
             f"<!-- GENERATED from templates/multi-manager/roles/{name}.md by "
             "bin/sable-build-agents — edit the role file and re-run; do not hand-edit. -->\n\n"
-            f"{PREAMBLE.format(name=name)}\n"
+            f"{preamble.format(name=name)}\n"
             f"{body}"
         )
         target = out_dir / f"{name}.md"
