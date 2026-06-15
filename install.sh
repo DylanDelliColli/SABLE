@@ -17,6 +17,8 @@ MM_HOOKS_SRC="${HOOKS_SRC}/multi-manager"
 MM_HOOKS_DST="${HOOKS_DST}/multi-manager"
 SABLE_DST="${CLAUDE_DIR}/sable"
 AGENTS_YAML_SRC="${TEMPLATE_DIR}/multi-manager/agents.yaml"
+SKILLS_SRC="${REPO_DIR}/skills"
+SKILLS_DST="${CLAUDE_DIR}/skills"
 
 # --- CLI flags (SABLE-106) ---
 DRY_RUN=0
@@ -187,6 +189,21 @@ else
     else
         yellow "  templates/multi-manager/agents.yaml not found — skipping registry"
     fi
+    # Skills (slash commands) — installed by their frontmatter 'name:' (the repo
+    # dir may differ, e.g. cockpit-plan -> plan), with all sibling files.
+    if [ -d "${SKILLS_SRC}" ]; then
+        for skdir in "${SKILLS_SRC}"/*/; do
+            [ -f "${skdir}SKILL.md" ] || continue
+            skname="$(grep -m1 '^name:' "${skdir}SKILL.md" | sed 's/^name:[[:space:]]*//' | tr -d '[:space:]\r')"
+            [ -n "${skname}" ] || skname="$(basename "${skdir}")"
+            make_dir "${SKILLS_DST}/${skname}"
+            for f in "${skdir}"*; do
+                [ -f "${f}" ] && copy_file "${f}" "${SKILLS_DST}/${skname}/$(basename "${f}")" "skills/${skname}/$(basename "${f}")"
+            done
+        done
+    else
+        yellow "  skills/ not found — skipping skills install"
+    fi
     [ "$DRY_RUN" = "1" ] || green "  Cockpit tier installed. Add the multi-manager hook block (printed below) to settings.json."
 fi
 echo
@@ -282,8 +299,9 @@ echo "  1. Paste the hook block(s) above into ${SETTINGS_FILE} (merge with exist
 echo "  2. In your project: bd init && bd hooks install"
 echo "  3. Agent definitions are now in ${CLAUDE_DIR}/agents/ — restart Claude Code for them to take effect."
 if [ "$COCKPIT" = "1" ]; then
-    echo "  4. Cockpit installed: ${MM_HOOKS_DST}/ + ${SABLE_DST}/agents.yaml. Verify with:"
-    echo "       ls ${MM_HOOKS_DST} && head -1 ${SABLE_DST}/agents.yaml"
+    echo "  4. Cockpit installed: ${MM_HOOKS_DST}/ + ${SABLE_DST}/agents.yaml + ${SKILLS_DST}/ skills. Verify:"
+    echo "       ls ${MM_HOOKS_DST} && ls ${SKILLS_DST} && head -1 ${SABLE_DST}/agents.yaml"
+    echo "     RESTART Claude Code so the /plan /execute /gaudi /columbo slash commands register."
     echo "     Chuck stays a terminal — add the env-var alias from QUICKSTART.md if you run merge-queue."
 fi
 echo "  5. Open a fresh agent session and use the bootstrap prompt from QUICKSTART.md"

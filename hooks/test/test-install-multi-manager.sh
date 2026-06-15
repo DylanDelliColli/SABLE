@@ -33,15 +33,28 @@ else
 fi
 if [ -f "$TH/.claude/sable/agents.yaml" ]; then pass "--cockpit installs the agents.yaml registry"; else fail "--cockpit installs the agents.yaml registry"; fi
 if grep -qE "^tools:.*Agent" "$TH/.claude/agents/optimus.md" 2>/dev/null; then pass "--cockpit ships optimus.md with the Agent tool grant"; else fail "--cockpit ships optimus.md with the Agent tool grant"; fi
+# Skills install by frontmatter name (cockpit-plan -> plan, cockpit-execute -> execute).
+if [ -f "$TH/.claude/skills/plan/SKILL.md" ] && [ -f "$TH/.claude/skills/execute/SKILL.md" ] && [ -f "$TH/.claude/skills/columbo/SKILL.md" ] && [ -f "$TH/.claude/skills/gaudi/SKILL.md" ]; then
+  pass "--cockpit installs SABLE skills by frontmatter name (plan/execute/columbo/gaudi)"
+else
+  fail "--cockpit installs SABLE skills by frontmatter name (plan/execute/columbo/gaudi)" "missing under $TH/.claude/skills/"
+fi
+if [ -f "$TH/.claude/skills/gaudi/SMELLS.md" ] && [ -f "$TH/.claude/skills/columbo/columbo-prefilter.py" ]; then
+  pass "--cockpit copies skill sibling files (gaudi/SMELLS.md, columbo prefilter)"
+else
+  fail "--cockpit copies skill sibling files (gaudi/SMELLS.md, columbo prefilter)" "sibling files missing"
+fi
 
 # --- DRY-RUN: copies nothing ---
 out="$(HOME="$TH2" bash "$INSTALL" --cockpit --dry-run 2>&1 || true)"
 if [ ! -e "$TH2/.claude/hooks/multi-manager" ]; then pass "--dry-run copies no multi-manager hooks"; else fail "--dry-run copies no multi-manager hooks" "dir was created"; fi
+if [ ! -e "$TH2/.claude/skills/plan" ]; then pass "--dry-run installs no skills"; else fail "--dry-run installs no skills" "skills dir created"; fi
 if echo "$out" | grep -qiE "dry.run|would (copy|install)"; then pass "--dry-run output marks it as a dry run"; else fail "--dry-run output marks it as a dry run" "got: $(echo "$out" | head -3)"; fi
 
 # --- FOUNDATION: no --cockpit → no multi-manager tier ---
 HOME="$TH3" bash "$INSTALL" >/dev/null 2>&1 || true
 if [ ! -e "$TH3/.claude/hooks/multi-manager" ]; then pass "Foundation install (no --cockpit) skips the multi-manager tier"; else fail "Foundation install skips the multi-manager tier" "dir present"; fi
+if [ ! -e "$TH3/.claude/skills/plan" ]; then pass "Foundation install installs no SABLE skills"; else fail "Foundation install installs no SABLE skills" "skills present"; fi
 
 echo
 echo "=========================================="
