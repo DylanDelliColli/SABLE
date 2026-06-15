@@ -57,6 +57,9 @@ EXEC_MODE="$FIXTURE_DIR/mode-exec.json"
 PLAN_MODE="$FIXTURE_DIR/mode-plan.json"
 echo '{"mode": "execution", "since": "2026-06-10"}' > "$EXEC_MODE"
 echo '{"mode": "planning", "since": "2026-06-10"}' > "$PLAN_MODE"
+# Deliberately-absent path for the "no mode-state file" case — must NOT fall
+# back to the live ~/.claude/sable/state/cockpit-mode.json (SABLE-wtv).
+NONEXISTENT_MODE="$FIXTURE_DIR/mode-nonexistent.json"
 
 json() { # <agent_id> <agent_type> <prompt>
   python3 -c "
@@ -115,13 +118,22 @@ OUT=$(run_hook "$(json '' '' 'Dispatching-for: optimus
 anything')" "" "" "$PLAN_MODE")
 assert_allowed "planning mode: pre-dispatch preemption inactive" "$OUT"
 
-# 8. Anonymous session, no mode file → inactive
-OUT=$(run_hook "$(json '' '' 'Dispatching-for: optimus')" "" "" "")
+# 8. Anonymous session, no mode file → inactive (SABLE-wtv: pin to an absent
+#    fixture path so the live cockpit-mode.json cannot leak into the test).
+OUT=$(run_hook "$(json '' '' 'Dispatching-for: optimus')" "" "" "$NONEXISTENT_MODE")
 assert_allowed "no mode-state file: inactive outside SABLE context" "$OUT"
 
-# 9. Subagent context → stand down
-OUT=$(run_hook "$(json a1 optimus 'spawn something')" "" "" "$EXEC_MODE")
-assert_allowed "subagent context stands down" "$OUT"
+# 9. Manager-subagent dispatching natively (SABLE-uz9.9): governance is ACTIVE
+#    on its own lane — a P0 in for-optimus preempts the dispatch. (Pre-uz9.9
+#    this stood down because all subagents stood down; nested spawn now works,
+#    CC 2.1.177, SABLE-uz9.8.)
+OUT=$(run_hook "$(json a1 optimus 'spawn a worker on SABLE-xyz')" "" "" "$EXEC_MODE")
+assert_denied "manager-subagent optimus preempted by own P0 (native dispatch)" "$OUT"
+printf '%s' "$OUT" | grep -q "PREEMPTION (optimus)" && pass "manager-subagent deny names the lane" || fail "manager-subagent deny names the lane" "got: $OUT"
+
+# 9b. Worker subagent (non-manager type) still stands down, even in execution mode.
+OUT=$(run_hook "$(json a2 general-purpose 'do the work')" "" "" "$EXEC_MODE")
+assert_allowed "worker subagent (general-purpose) stands down" "$OUT"
 
 # 10. Dispatcher-typed env session (lincoln) honors Dispatching-for attribution
 OUT=$(run_hook "$(json '' '' 'Dispatching-for: optimus

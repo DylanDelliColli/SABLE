@@ -117,6 +117,24 @@ print(json.dumps({
 " "$1"
 }
 
+# make_manager_subagent_input <prompt> <agent_type>
+# PreToolUse:Agent payload from a MANAGER subagent dispatching a worker natively
+# (agent_id present + manager agent_type, NO env identity) — the SABLE-uz9.9
+# native-dispatch path.
+make_manager_subagent_input() {
+  python3 -c "
+import json, sys
+prompt, atype = sys.argv[1], sys.argv[2]
+print(json.dumps({
+    'tool_name': 'Agent',
+    'agent_id': 'mgr-sub-001',
+    'agent_type': atype,
+    'tool_input': {'prompt': prompt, 'subagent_type': 'general-purpose'},
+    'hook_event_name': 'PreToolUse'
+}))
+" "$1" "$2"
+}
+
 # run_hook_as_manager <prompt>
 # Runs the hook in manager context (via CLAUDE_AGENT_NAME/ROLE env vars).
 run_hook_as_manager() {
@@ -216,6 +234,42 @@ else
   fi
 fi
 
+# --- Test 7 (SABLE-uz9.9): MANAGER-subagent dispatch → governance RUNS ---
+# A subagent whose agent_type is a registered manager (optimus) now dispatches
+# workers natively. The hook must NOT stand down — it claims like a manager,
+# with NO env identity present (identity is purely the subagent agent_type).
+: > "$BD_CALL_LOG"
+make_manager_subagent_input "SABLE-xyz: implement hooks/foo.sh" "optimus" | \
+  env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE \
+      SABLE_AGENTS_YAML="$AGENTS_YAML" \
+      SABLE_COCKPIT_MODE_FILE="$EXEC_MODE_FILE" \
+      BD_CALL_LOG="$BD_CALL_LOG" \
+      PATH="$STUB_DIR:$PATH" \
+      bash "$HOOK" 2>/dev/null
+if grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+  pass "manager-subagent (agent_type=optimus, no env) dispatch → governance runs (bd update)"
+else
+  fail "manager-subagent (agent_type=optimus, no env) dispatch → governance runs (bd update)" \
+       "bd call log: $(cat "$BD_CALL_LOG" 2>/dev/null || echo '(empty)')"
+fi
+
+# --- Test 8 (SABLE-uz9.9): worker-subagent dispatch → still stands down ---
+# Same shape but a NON-manager agent_type: must stand down (no governance).
+: > "$BD_CALL_LOG"
+make_manager_subagent_input "SABLE-xyz: do work hooks/foo.sh" "general-purpose" | \
+  env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE \
+      SABLE_AGENTS_YAML="$AGENTS_YAML" \
+      SABLE_COCKPIT_MODE_FILE="$EXEC_MODE_FILE" \
+      BD_CALL_LOG="$BD_CALL_LOG" \
+      PATH="$STUB_DIR:$PATH" \
+      bash "$HOOK" 2>/dev/null
+if grep -q 'BD_CALLED: show\|BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+  fail "worker-subagent (agent_type=general-purpose) → stands down" \
+       "bd calls: $(cat "$BD_CALL_LOG")"
+else
+  pass "worker-subagent (agent_type=general-purpose) → stands down"
+fi
+
 # ---------------------------------------------------------------------------
 # INTEGRATION TEST — real bd in the project repo
 # ---------------------------------------------------------------------------
@@ -269,6 +323,47 @@ except Exception:
 
     # Clean up: close the scratch bead
     bd close "$SCRATCH_ID" 2>/dev/null || true
+  fi
+
+  # --- Integration (SABLE-uz9.9): MANAGER-SUBAGENT native dispatch, real bd ---
+  # The new path with NO env identity: identity is purely the subagent
+  # agent_type=optimus. Proves the real hook + real lib-identity + real bd DB
+  # compose to land WIP-CLAIMS for a manager-subagent dispatch.
+  SCRATCH_ID2=$(bd create \
+    --title="[int-test] pre-dispatch-claim manager-subagent scratch" \
+    --description="hooks/foo.sh is the implementation file for this scratch bead" \
+    --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+
+  if [ -z "$SCRATCH_ID2" ]; then
+    echo "SKIP (integration): could not create manager-subagent scratch bead"
+  else
+    echo "Integration: created manager-subagent scratch bead $SCRATCH_ID2"
+    bd update "$SCRATCH_ID2" --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
+
+    make_manager_subagent_input "${SCRATCH_ID2}: implement the feature — hooks/foo.sh needs updating" "optimus" | \
+      env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE \
+          SABLE_AGENTS_YAML="$AGENTS_YAML" \
+          SABLE_COCKPIT_MODE_FILE="$EXEC_MODE_FILE" \
+          bash "$HOOK" 2>/dev/null
+
+    NOTES2=$(bd show "$SCRATCH_ID2" --json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    if isinstance(d, list) and d:
+        print(d[0].get('notes', '') or '')
+except Exception:
+    pass
+" 2>/dev/null || echo "")
+
+    if echo "$NOTES2" | grep -q 'WIP-CLAIMS'; then
+      pass "integration: manager-subagent dispatch lands WIP-CLAIMS on $SCRATCH_ID2 (real bd)"
+    else
+      fail "integration: manager-subagent dispatch lands WIP-CLAIMS on $SCRATCH_ID2 (real bd)" \
+           "notes: '$NOTES2'"
+    fi
+
+    bd close "$SCRATCH_ID2" 2>/dev/null || true
   fi
 fi
 

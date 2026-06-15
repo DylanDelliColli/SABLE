@@ -257,8 +257,12 @@ sable_validate_base_ref() {
 #     mode-state file says mode=execution. Lane = the "Dispatching-for: <name>"
 #     attribution line in the dispatch prompt; defaults to "cockpit" when the
 #     dispatch isn't on a manager's behalf (e.g. Lincoln's own utility spawns).
-#   - Subagent contexts: stand down (subagents cannot dispatch on current
-#     builds — spike SABLE-uz9.1; if that changes, revisit deliberately).
+#   - Manager-subagent (v2 native dispatch, SABLE-uz9.9): governance active,
+#     lane = the manager's own name. Nested subagent spawning + nested
+#     PreToolUse:Agent firing confirmed on CC 2.1.177 (SABLE-uz9.8), so the
+#     managers-spawn-their-own-workers premise now holds.
+#   - Worker / planning subagent contexts: stand down (non-manager subagents
+#     do not dispatch).
 #
 # Sets: SABLE_DISPATCH_ACTIVE (0|1), SABLE_DISPATCH_LANE (lowercase name or "").
 # Mode-state path override for tests: SABLE_COCKPIT_MODE_FILE.
@@ -289,7 +293,18 @@ sable_resolve_dispatch_lane() {
 
   sable_resolve_identity "$json"
 
-  [ "$SABLE_ID_IS_SUBAGENT" -eq 1 ] && return 0
+  # Manager-subagents dispatch their own workers natively (nested Agent +
+  # nested PreToolUse:Agent firing with the dispatcher's agent_type, confirmed
+  # CC 2.1.177, SABLE-uz9.8/uz9.9). Governance applies to them, lane = the
+  # manager's own name (a manager always dispatches for itself). Workers and
+  # planning subagents (non-manager) still stand down.
+  if [ "$SABLE_ID_IS_SUBAGENT" -eq 1 ]; then
+    if [ "$SABLE_ID_IS_MANAGER" -eq 1 ]; then
+      SABLE_DISPATCH_ACTIVE=1
+      SABLE_DISPATCH_LANE="$SABLE_ID_NAME"
+    fi
+    return 0
+  fi
 
   if [ "$SABLE_ID_SOURCE" = "env" ]; then
     if [ "$SABLE_ID_IS_MANAGER" -eq 1 ]; then
