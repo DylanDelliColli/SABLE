@@ -123,6 +123,70 @@ run_case "malformed hook JSON falls back to env identity" \
   "tarzan|one_off_manager|env|0|1|1"
 
 # --------------------------------------------------------------------------
+# sable_resolve_dispatch_lane unit tests (SABLE-uz9.9)
+# Manager-subagents now dispatch workers natively (nested Agent, CC 2.1.177,
+# SABLE-uz9.8) — governance must ACTIVATE for them where it previously stood
+# down for all subagents. Workers (non-manager subagents) still stand down.
+# --------------------------------------------------------------------------
+
+# run_lane_case <case-name> <json> <env_name> <env_role> <expect: active|lane>
+run_lane_case() {
+  local label="$1" json="$2" env_name="$3" env_role="$4" expect="$5"
+  local got
+  got=$(
+    unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE
+    [ -n "$env_name" ] && export CLAUDE_AGENT_NAME="$env_name"
+    [ -n "$env_role" ] && export CLAUDE_AGENT_ROLE="$env_role"
+    # Pin mode-file to a nonexistent fixture so the live cockpit state cannot
+    # contaminate main-session cases (cf. SABLE-wtv).
+    export SABLE_COCKPIT_MODE_FILE="$FIXTURE_DIR/nonexistent-cockpit-mode.json"
+    # shellcheck disable=SC1090
+    source "$LIB"
+    sable_resolve_dispatch_lane "$json"
+    printf '%s|%s' "$SABLE_DISPATCH_ACTIVE" "$SABLE_DISPATCH_LANE"
+  )
+  if [ "$got" = "$expect" ]; then
+    pass "$label"
+  else
+    fail "$label" "expected [$expect] got [$got]"
+  fi
+}
+
+# NEW BEHAVIOR — manager-subagent dispatches a worker: governance active, lane=self
+run_lane_case "manager-subagent optimus dispatching a worker: active, lane=optimus" \
+  '{"agent_id":"d1","agent_type":"optimus","tool_name":"Agent","tool_input":{"subagent_type":"general-purpose","prompt":"work on SABLE-x"}}' \
+  "" "" \
+  "1|optimus"
+
+run_lane_case "manager-subagent tarzan dispatching a worker: active, lane=tarzan" \
+  '{"agent_id":"d2","agent_type":"tarzan","tool_name":"Agent","tool_input":{"subagent_type":"general-purpose","prompt":"fix SABLE-y"}}' \
+  "" "" \
+  "1|tarzan"
+
+# GUARD — non-manager subagents (workers / planning agents) still stand down
+run_lane_case "worker-subagent Explore does NOT trigger governance" \
+  '{"agent_id":"d3","agent_type":"Explore","tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"}}' \
+  "" "" \
+  "0|"
+
+run_lane_case "planning-subagent sherlock does NOT dispatch (registered non-manager)" \
+  '{"agent_id":"d4","agent_type":"sherlock","tool_name":"Agent"}' \
+  "" "" \
+  "0|"
+
+# REGRESSION — env-launched legacy manager terminal still active
+run_lane_case "env chuck manager terminal: active, lane=chuck (legacy dual-mode)" \
+  '{"tool_name":"Agent","session_id":"s1"}' \
+  "chuck" "manager" \
+  "1|chuck"
+
+# REGRESSION — anonymous main session with no execution-mode file stands down
+run_lane_case "anonymous main session, no cockpit mode file: stands down" \
+  '{"tool_name":"Agent","session_id":"s2"}' \
+  "" "" \
+  "0|"
+
+# --------------------------------------------------------------------------
 # sable_is_git_push unit tests (SABLE-jpr / SABLE-0u1)
 # --------------------------------------------------------------------------
 # shellcheck disable=SC1090
