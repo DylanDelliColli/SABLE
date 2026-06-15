@@ -19,6 +19,7 @@ FAIL_NAMES=""
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 assert_grep() { if grep -qi -- "$2" "$1" 2>/dev/null; then pass "$3"; else fail "$3" "pattern not found: $2"; fi; }
+assert_no_grep() { if grep -qi -- "$2" "$1" 2>/dev/null; then fail "$3" "pattern unexpectedly present: $2"; else pass "$3"; fi; }
 
 if [ -f "$ROLE" ]; then pass "roles/lincoln.md exists"; else fail "roles/lincoln.md exists" "missing: $ROLE"; fi
 if [ -f "$REPO/templates/multi-manager/roles/cockpit.md" ]; then
@@ -45,11 +46,12 @@ assert_grep "$ROLE" "strategist hat" "role frames FRAMING as the strategist hat"
 
 # v2 one-window topology markers (SABLE-uz9.5 / uz9.4 option A)
 assert_grep "$ROLE" "LINCOLN" "role declares the Lincoln identity"
-assert_grep "$ROLE" "Dispatching-for" "role carries the dispatch attribution convention"
-assert_grep "$ROLE" "run_in_background" "role dispatches workers as invisible background agents"
-assert_grep "$ROLE" "Never spawn anything in the foreground" "role forbids foreground spawns (chat never blocks)"
+assert_grep "$ROLE" "self-dispatch and self-push" "role: managers self-dispatch and self-push (SABLE-uz9.11)"
+assert_no_grep "$ROLE" "Dispatching-for" "role drops the old DISPATCH-REQUEST relay attribution"
+assert_grep "$ROLE" "run_in_background" "role spawns managers as invisible background subagents"
+assert_grep "$ROLE" "Never spawn a manager in the foreground" "role forbids foreground manager spawns (chat never blocks)"
 assert_grep "$ROLE" "Chuck terminal" "role reminds the operator about the Chuck terminal"
-assert_grep "$ROLE" "Workers do not push" "role keeps the push path with Lincoln"
+assert_grep "$ROLE" "push their own approved" "role: managers push their own approved lanes (Lincoln does not push)"
 assert_grep "$ROLE" "gaudi skill" "role runs gaudi as an inline skill at ARCHITECTURE"
 
 echo

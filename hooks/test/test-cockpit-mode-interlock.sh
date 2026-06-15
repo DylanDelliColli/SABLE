@@ -210,6 +210,12 @@ if is_deny "$out"; then fail "v2 execution allows Agent spawn of rudy (not produ
 out="$(run_agent sherlock lincoln sub-9)"
 if is_deny "$out"; then fail "v2 Agent leg no-op in subagent context" "got deny"; else pass "v2 Agent leg no-op in subagent context"; fi
 
+# Native dispatch (SABLE-uz9.13): a manager-subagent spawning its own worker is
+# a subagent-context Agent call (agent_id present); the interlock must NOT block
+# it in execution mode, even under the governed lincoln identity.
+out="$(run_agent general-purpose lincoln mgr-sub-1)"
+if is_deny "$out"; then fail "execution allows manager-subagent worker spawn (general-purpose, agent_id)" "got deny"; else pass "execution allows manager-subagent worker spawn (general-purpose, agent_id)"; fi
+
 # Agent leg: non-cockpit identity no-op
 out="$(run_agent sherlock optimus)"
 if is_deny "$out"; then fail "v2 Agent leg no-op for non-lincoln identity" "got deny"; else pass "v2 Agent leg no-op for non-lincoln identity"; fi

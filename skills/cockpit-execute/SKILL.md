@@ -3,11 +3,10 @@ name: execute
 description: |
   Flip the SABLE cockpit into EXECUTION mode — drain the bead pool. Writes the
   cockpit mode-state file via `sable-mode set execution`, spawns Optimus and
-  Tarzan as named manager subagents, executes their dispatch requests as
-  invisible background workers (Dispatching-for: attribution), and reminds the
-  operator to open the Chuck terminal. In execution mode the interlock hook
-  blocks spawning planning-only producers — you are draining the pool, not
-  filling it.
+  Tarzan as resident manager subagents that dispatch their OWN workers and push
+  their own approved work, and reminds the operator to open the Chuck terminal.
+  In execution mode the interlock hook blocks spawning planning-only producers
+  — you are draining the pool, not filling it.
   Use when asked to "/execute", "enter execution mode", "start executing", or
   "drain the backlog".
 allowed-tools:
@@ -56,42 +55,38 @@ producers (sherlock / victor / columbo) is blocked on both the Agent and Bash
 legs (soft — `SABLE_COCKPIT_FORCE=1` / `--force` overrides). Mode flips are
 mid-conversation; no restart.
 
-## 2. Run the option-A dispatch topology
+## 2. Run the native-spawn dispatch topology
 
-Managers plan, you dispatch (SABLE-uz9.4):
+Managers dispatch and push their own lanes (SABLE-uz9.11); you spawn them and
+oversee:
 
 - **Remind the operator to open the Chuck terminal**
   (`CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude`) — the merge
-  queue lives there; your pushes file `for-chuck` beads across the bead-DB
-  bridge automatically.
+  queue lives there; the managers' pushes file `for-chuck` beads across the
+  bead-DB bridge automatically.
 - Spawn **optimus** and **tarzan** ONCE per execution session as **resident**
   named subagents with `run_in_background: true` — ALWAYS background, never
   foreground (a foreground Agent call blocks the main conversation). Residents
   run a rolling poll loop for the whole session — ongoing context windows that
   accumulate lane knowledge across tasks; they are operator-visible and
-  selectable. Each reviews its lane (Optimus: beads with a parent epic;
-  Tarzan: standalone/orphan beads) and files **DISPATCH-REQUEST beads**
-  (`for-lincoln, dispatch-request, coord`) plus **verdict beads** as work
-  returns; your inbox injection surfaces them on your next tool call. You file
-  `for-<manager>` beads to deliver worker results back — their inbox injection
-  picks them up within one poll tick. Close request beads after executing.
-  When a manager files a `shift-report` (context pressure / stand-down),
-  respawn it fresh — lane state rehydrates from beads.
-- **Execute each dispatch request as a background worker**: `run_in_background: true`,
-  one `bd worktree create` worktree per worker, the canonical
-  `templates/worker-dispatch.md` template, and the attribution line
-  `Dispatching-for: <manager>` as the FIRST line of every dispatch prompt
-  (the pre-dispatch hooks key lane accounting on it). Workers stay invisible
-  to the operator.
-- **Workers do not push — you push** when the owning manager files
-  VERDICT: APPROVE-PUSH; the pre-push gate fires on your session identity.
+  selectable. Each works its lane (Optimus: beads with a parent epic; Tarzan:
+  standalone/orphan beads).
+- **Managers dispatch their own workers** now (nested spawn, CC 2.1.177,
+  SABLE-uz9.8/uz9.9): each manager creates a worktree (`bd worktree create`),
+  spawns background workers via the Agent tool filling
+  `templates/worker-dispatch.md` gate mode (the pre-dispatch governance hooks
+  fire on the manager's own Agent call with its lane identity), reviews the
+  stopped-before-push results, and **pushes approved work itself**
+  (`git -C <worktree> push`, gated by `pre-push-rebase-test`). You do NOT
+  execute dispatch requests and you do NOT push — that relay is gone.
 - **Oversee**: give the operator scoped status, broker `for-lincoln`
-  arbitration asks between managers, relay urgent coord beads to idle managers
-  on their next spawn. You see every manager's inbox (`cross_inbox_read`) —
-  synthesize, don't enumerate.
-- You do not write application code and you do not claim beads yourself; the
-  managers plan the draining and the workers do it. You direct, dispatch, and
-  unblock.
+  arbitration asks between managers, relay urgent coord beads. You see every
+  manager's inbox (`cross_inbox_read`) — synthesize, don't enumerate. When a
+  manager files a `shift-report` (context pressure / stand-down), respawn it
+  fresh — lane state rehydrates from beads.
+- You do not write application code, claim beads, dispatch workers, or push.
+  The managers plan, dispatch, review, and push their lanes; you spawn them and
+  keep the session coherent.
 
 ## 3. Hand back to planning
 
