@@ -21,6 +21,10 @@ fixing already-fixed bugs).
 ```
 You are working in {WORKING_DIR} on the {BRANCH} branch.
 
+Worktree: {WORKING_DIR}
+(Absolute path. The pre-dispatch-refresh hook rebases THIS checkout on the base
+branch before you start — SABLE-uz9.15. Keep this structured line intact.)
+
 ## Worker model
 
 {haiku | sonnet | opus}
@@ -80,6 +84,43 @@ Return:
 - Any constraint you bent and why
 - Test output: link or paste the relevant lines proving the test gate ran
 ```
+
+---
+
+## Gate mode (manager-reviewed) vs self-push
+
+SABLE has two dispatch modes. **Which one applies is set by who dispatched you
+and is stated in your prompt.**
+
+### Gate mode — DEFAULT for manager (Optimus/Tarzan) dispatch
+
+The manager reviews your work *before* anything is pushed (the APPROVE-PUSH
+gate). You do everything up to the push, then **STOP**:
+
+1. Implement the bead(s) in the worktree named by the `Worktree:` line.
+2. Run the unit AND integration tests; capture the output.
+3. Rebase on the base branch (`{BASE_BRANCH}`).
+4. Commit. **Do NOT push, and do NOT open a PR.**
+5. Return — as your final message, not a bead — a STOP-BEFORE-PUSH report:
+   - **Worktree** path and **branch** name
+   - **Parked commit SHA** (`git -C <worktree> rev-parse HEAD`) — the exact
+     state you are handing over for review
+   - **Test output** proving unit + integration gates ran green
+   - Bead IDs ready to close, and any constraint you bent and why
+
+The manager reviews this, and on APPROVE pushes it itself
+(`git -C <worktree> push`, gated by `pre-push-rebase-test`). On REVISE you (or a
+follow-up worker) get dispatched again into the same worktree. **You never push
+in gate mode.**
+
+### Self-push — for low-stakes / Lincoln-utility dispatch
+
+Doc-only fixes, bd hygiene, and Lincoln's own utility spawns may self-push: do
+the work, rebase, push, open the PR, and report the **PR URL** per the Report
+back rubric above. Use this only when no manager review gate applies.
+
+**If your prompt is ambiguous about which mode, assume gate mode and STOP before
+push** — a needless review round-trip is cheap; an unreviewed push is not.
 
 ---
 
