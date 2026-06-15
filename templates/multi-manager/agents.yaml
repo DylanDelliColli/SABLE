@@ -134,18 +134,18 @@ agents:
   # governs what Lincoln may spawn (cockpit-mode-interlock.sh, Bash + Agent
   # legs). Planning mode: walks the gated substages, spawning Tier-2 producers
   # as named subagents (gaudi runs as an inline skill). Execution mode: spawns
-  # Optimus/Tarzan as manager subagents, executes their dispatch requests as
-  # invisible background workers (Dispatching-for: attribution), pushes after
-  # review, and brokers for-lincoln arbitration. Chuck remains an env-var
+  # Optimus/Tarzan as resident manager subagents that dispatch their own workers
+  # and push their own approved lanes (SABLE-uz9.11); Lincoln oversees and
+  # brokers for-lincoln arbitration. Chuck remains an env-var
   # terminal (SABLE-uz9.6). "Cockpit" survives as the name of the mode
   # machinery — the seat, not the person.
   lincoln:
     type: cockpit
-    scope: "The one operator-facing main session: strategist + mode-aware fleet launch; /plan fills the pool via producer subagents, /execute drains it via manager subagents + background workers"
-    claim_filter: null         # doesn't claim — directs, dispatches, oversees
+    scope: "The one operator-facing main session: strategist + mode-aware fleet launch; /plan fills the pool via producer subagents, /execute drains it via resident manager subagents that self-dispatch and self-push"
+    claim_filter: null         # doesn't claim — directs, spawns managers, oversees
     inbox_label: for-lincoln   # arbitration asks from managers, direction from user
     role_prompt: roles/lincoln.md
-    dispatches_workers: true   # executes manager dispatch requests as background workers
+    dispatches_workers: false  # spawns managers (who dispatch their own workers); does not dispatch or push itself
     cross_inbox_read: true     # must see every agent's plate to oversee both modes
     files_addressed_beads: true      # may file for-X coord/direction beads
     launches_fleets: true            # mode-aware fleet spawn (subagents, not terminals)

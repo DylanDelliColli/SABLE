@@ -32,6 +32,10 @@ assert_grep() {
   # file pattern name
   if grep -qi -- "$2" "$1" 2>/dev/null; then pass "$3"; else fail "$3" "pattern not found: $2"; fi
 }
+assert_no_grep() {
+  # file pattern name
+  if grep -qi -- "$2" "$1" 2>/dev/null; then fail "$3" "pattern unexpectedly present: $2"; else pass "$3"; fi
+}
 
 # 1. files exist
 assert_file "$PLAN_SKILL" "/plan skill file exists"
@@ -95,12 +99,14 @@ assert_grep "$PLAN_SKILL" "lincoln"          "/plan addresses Lincoln (v2 identi
 assert_grep "$PLAN_SKILL" "subagent"         "/plan spawns producers as subagents"
 assert_grep "$PLAN_SKILL" "gaudi.*skill\|skill.*gaudi" "/plan runs gaudi as an inline skill"
 assert_grep "$EXEC_SKILL" "lincoln"          "/execute addresses Lincoln (v2 identity)"
-assert_grep "$EXEC_SKILL" "Dispatching-for"  "/execute carries the dispatch attribution convention"
-assert_grep "$EXEC_SKILL" "run_in_background" "/execute dispatches workers as invisible background agents"
+assert_grep "$EXEC_SKILL" "dispatch their own workers" "/execute: managers dispatch their own workers (native spawn, SABLE-uz9.11)"
+assert_no_grep "$EXEC_SKILL" "Dispatching-for"  "/execute drops the old DISPATCH-REQUEST relay attribution"
+assert_grep "$EXEC_SKILL" "run_in_background" "/execute spawns managers as invisible background subagents"
 assert_grep "$EXEC_SKILL" "ALWAYS background" "/execute spawns managers in the background (never blocks the chat)"
 assert_grep "$PLAN_SKILL" "run_in_background" "/plan spawns producers in the background"
 assert_grep "$EXEC_SKILL" "Chuck terminal"   "/execute reminds the operator about the Chuck terminal"
-assert_grep "$EXEC_SKILL" "do not push"      "/execute keeps the push path with Lincoln"
+assert_grep "$EXEC_SKILL" "pushes approved work itself" "/execute: managers push their own approved work (Lincoln does not)"
+assert_no_grep "$EXEC_SKILL" "execute dispatch requests as" "/execute: Lincoln no longer executes manager dispatch requests"
 
 # 10. DECOMPOSITION post-batch-create verification (SABLE-xy1)
 assert_grep "$PLAN_SKILL" "bd dep tree"        "/plan DECOMPOSITION verifies edges via bd dep tree"
