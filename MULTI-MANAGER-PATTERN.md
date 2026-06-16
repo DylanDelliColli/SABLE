@@ -111,6 +111,10 @@ sable-agents victor       # single agent + role file path
 SABLE v2 reduces the operator surface to **one primary window**. See
 [`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md) for the full rationale; the summary:
 
+> **Teams variant (opt-in):** an alternative topology built on Claude Code Agent
+> Teams — managers and Chuck as live `SendMessage` members in one window — is
+> designed in [`AGENT-TEAMS-DESIGN.md`](AGENT-TEAMS-DESIGN.md).
+
 A single **Lincoln main session** (`CLAUDE_AGENT_NAME=lincoln
 CLAUDE_AGENT_ROLE=manager claude`) is the one session you talk to. Optimus and
 Tarzan run as **resident manager subagents** inside it — spawned once at session

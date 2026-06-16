@@ -198,6 +198,26 @@ snippet if you run a merge queue. The full topology lives in
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) and
 [`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md).
 
+### Teams topology (experimental)
+
+The cockpit can run on Claude Code's experimental **Agent Teams** feature instead
+of background subagents — managers and Chuck become live team members that
+coordinate over `SendMessage`, collapsing the second terminal into one window. It
+is **opt-in and parallel** to the default (nested) topology:
+
+```bash
+# 1. Enable the Claude Code flag in ~/.claude/settings.json (env block):
+#      "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
+# 2. Launch Lincoln with SABLE_TEAMS set:
+SABLE_TEAMS=1 CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude
+# 3. Merge templates/multi-manager/settings-snippet-teams.json (NOT the nested
+#    snippet) into settings.json — it omits the three poll hooks.
+```
+
+`/execute` runs `sable-teams-preflight`, sees `SABLE_TEAMS=1`, and spawns Optimus,
+Tarzan, and Chuck as team members (no separate Chuck terminal). The full design is
+in [`AGENT-TEAMS-DESIGN.md`](AGENT-TEAMS-DESIGN.md).
+
 ---
 
 ## Day-1 workflow

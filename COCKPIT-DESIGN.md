@@ -4,6 +4,10 @@
 > one-window topology. The execution contract is the beads, not this file; this
 > doc exists so a fresh agent can understand *why* the topology is shaped the
 > way it is. Extends [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md).
+>
+> **Teams topology:** an opt-in parallel topology built on Claude Code Agent Teams
+> is designed in [`AGENT-TEAMS-DESIGN.md`](AGENT-TEAMS-DESIGN.md) — it collapses the
+> Chuck terminal into the one-window team via live `SendMessage`.
 
 ## The v2 topology in brief
 

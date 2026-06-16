@@ -43,6 +43,8 @@ exists "$P/.claude/skills/plan/SKILL.md"    "project: /plan skill installed"
 exists "$P/.claude/skills/execute/SKILL.md" "project: /execute skill installed"
 exists "$P/.claude/sable/roles/lincoln.md"  "project: lincoln role installed"
 exists "$P/.claude/sable/layouts/sable.kdl" "project: layout installed"
+exists "$P/.claude/agents-teams/optimus.md" "project: teams agent defs installed (SABLE-amj.8)"
+exists "$P/.claude/agents-teams/chuck.md"   "project: teams chuck def installed (folds into the team)"
 if [ -x "$P/.claude/hooks/multi-manager/cockpit-mode-interlock.sh" ]; then pass "project: interlock hook installed+exec"; else fail "project: interlock hook installed+exec"; fi
 SET="$P/.claude/settings.local.json"
 exists "$SET" "project: settings.local.json created"
@@ -84,6 +86,7 @@ if [ "$(count_interlock "$U/.claude/settings.json")" = "1" ]; then pass "user: i
 SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --uninstall >/dev/null 2>&1
 if [ ! -e "$P/.claude/skills/plan/SKILL.md" ]; then pass "uninstall removes skills"; else fail "uninstall removes skills"; fi
 if [ ! -e "$P/.claude/sable/agents.yaml" ]; then pass "uninstall removes registry"; else fail "uninstall removes registry"; fi
+if [ ! -e "$P/.claude/agents-teams" ]; then pass "uninstall removes teams agent defs"; else fail "uninstall removes teams agent defs"; fi
 if [ "$(count_interlock "$SET")" = "0" ]; then pass "uninstall de-registers interlock"; else fail "uninstall de-registers interlock" "count=$(count_interlock "$SET")"; fi
 if [ "$(count_marker "$SET" session-role-anchor.sh)" = "0" ]; then pass "uninstall de-registers identity hook"; else fail "uninstall de-registers identity hook" "count=$(count_marker "$SET" session-role-anchor.sh)"; fi
 if grep -q 'other-hook.sh' "$SET"; then pass "uninstall keeps unrelated hooks"; else fail "uninstall keeps unrelated hooks"; fi
@@ -142,6 +145,12 @@ if [ "$(count_in_event "$MSET" PreCompact session-role-anchor.sh)" = "1" ]; then
 if [ "$(count_interlock "$MSET")" = "1" ]; then pass "md7: multi-manager re-install — interlock once"; else fail "md7: multi-manager re-install — interlock once" "count=$(count_interlock "$MSET")"; fi
 if [ "$(count_marker "$MSET" 'bd prime')" = "2" ]; then pass "md7: multi-manager re-install — bd prime preserved"; else fail "md7: multi-manager re-install — bd prime preserved" "count=$(count_marker "$MSET" 'bd prime')"; fi
 if valid_json "$MSET"; then pass "md7: settings valid after multi-manager re-install"; else fail "md7: settings valid after multi-manager re-install"; fi
+
+# ---------- SABLE-amj.8: teams-flag warning on install ----------
+WARNDIR="$(mktemp -d)"
+WARN_OUT="$(env -u CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS SABLE_PROJECT_DIR="$WARNDIR" bash "$INSTALLER" --project 2>&1)"
+if printf '%s' "$WARN_OUT" | grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"; then pass "install warns when the teams flag is unset"; else fail "install warns when the teams flag is unset" "no warning in output"; fi
+rm -rf "$WARNDIR"
 
 rm -rf "$P" "$P2" "$U" "$PU" "$M"
 echo

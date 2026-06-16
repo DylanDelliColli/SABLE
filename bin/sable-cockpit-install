@@ -126,6 +126,7 @@ if [ "$UNINSTALL" = "1" ]; then
     rm -f "$BASE/sable/roles/lincoln.md" "$BASE/sable/roles/cockpit.md" \
           "$BASE/sable/layouts/sable.kdl" \
           "$BASE/sable/agents.yaml" "$INTERLOCK_DEST" "$ROLEANCHOR_DEST"
+    rm -rf "$BASE/agents-teams"
     remove_hooks "$SETTINGS"
     echo "Cockpit uninstalled from $BASE (scope: $SCOPE)."
     echo "  (left other hooks and the settings file intact)"
@@ -146,6 +147,15 @@ cp "$REPO/hooks/multi-manager/cockpit-mode-interlock.sh" "$INTERLOCK_DEST"
 cp "$REPO/hooks/multi-manager/session-role-anchor.sh"    "$ROLEANCHOR_DEST"
 chmod +x "$INTERLOCK_DEST" "$ROLEANCHOR_DEST"
 add_hooks "$SETTINGS" "bash $INTERLOCK_DEST" "bash $ROLEANCHOR_DEST"
+
+# Teams topology (SABLE-amj.8): install the built teams member defs so the
+# /execute teams branch can inline-spawn them from <base>/agents-teams/.
+# Harmless when SABLE_TEAMS is never used; uninstall removes them.
+mkdir -p "$BASE/agents-teams"
+cp "$REPO"/templates/agents-teams/*.md "$BASE/agents-teams/"
+if [ "${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-}" != "1" ]; then
+    echo "NOTE: teams agent defs installed (agents-teams/). To run the teams topology, set CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 in settings.json (env) and SABLE_TEAMS=1, then restart." >&2
+fi
 
 # Dependency check (warn, don't fail).
 python3 -c "import textual" 2>/dev/null || \
