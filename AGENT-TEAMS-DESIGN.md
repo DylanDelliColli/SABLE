@@ -55,11 +55,11 @@ decisions:
 6. **Member construction: build artifact + inline-spawn.** A second build target
    emits committed, test-enforced teams member definitions; `/execute` reads them
    and spawns members with inline prompts (no agent-name registration, so no
-   collision with the nested defs). **Identity cost (spike SABLE-amj.1):** inline
-   spawn means a member's hook-input `agent_type` is the generic subagent type
-   (`general-purpose`), *not* the role — so identity must resolve from `agent_id`
-   (`name@team`), and member spawn-names must equal registry names (`optimus`, not
-   `optimus-probe`). See §5.
+   collision with the nested defs). **Identity (spike SABLE-amj.1, capture-verified):**
+   a member's hook-input `agent_type` field carries the member's spawn **`name`**
+   (not the subagent type), so `lib-identity` resolves it unchanged — *provided the
+   member is spawned with `name` = its registry name* (`optimus`, not
+   `optimus-probe`). That naming rule is the load-bearing constraint. See §5.
 7. **Rollout: parallel mode, spike-gated.** Teams is opt-in
    (`SABLE_TEAMS=1`); the existing topology stays the default. The first
    implementation bead is a validation spike that gates all build work.
@@ -199,7 +199,7 @@ transport is the `SendMessage` tool + the startup-card catch-up).
 | `edit-write-claim-reconciler` | worker WIP file claims | **shared** |
 | `pre-dispatch-{claim,refresh,overlap,preempt,model-check}` | worker dispatch governance | **shared** |
 | `session-role-anchor` | name → role-file injection | **lead/terminal only** — members have no env name; their role comes from the inline-spawned prompt |
-| `lib-identity` | identity-resolution library | **shared** (+ `agent_id`-parsing branch, *not* `agent_type`) |
+| `lib-identity` | identity-resolution library | **shared, unchanged** — hook-input `agent_type` already carries the member name (given registry-name spawn) |
 | `post-push-merge-notify` | writes `for-merge` bead on push | **shared** — the durability mirror |
 | `inbox-injection` | continuous poll of `for-X` beads | **nested-only** → wake-on-message |
 | `inbox-injection-precompact` | re-inject inbox on compaction | **nested-only** → team runtime handles |
@@ -210,25 +210,30 @@ time — are 100% shared, so changes benefit both modes automatically.
 
 ## 5. Identity binding
 
-Identity is the one place the spike (SABLE-amj.1) overturned the original
-assumption. In-process team members get **no identity env vars** (no
-`CLAUDE_AGENT_NAME/ROLE`), share the lead's `CLAUDE_CODE_SESSION_ID`, and carry
-`CLAUDE_CODE_CHILD_SESSION=1`. And `lib-identity` keys the role off the hook-input
-`agent_type` — which for an inline-spawned member (decision 6) is the generic
-subagent type (`general-purpose`), *not* the role. So the env path cannot resolve a
-member, and the `agent_type` path would mis-resolve a manager member as an
-unregistered **worker** (its hooks would stand down). The teams branch must
-therefore resolve the role from **`agent_id`**: members carry `agent_id = name@team`
-(per the team config), so parse the name before `@` and map it to the registry,
-falling back to a `~/.claude/teams/<team>/config.json` lookup (`agentId → name`) if
-the id is opaque. This makes member spawn-names load-bearing — they **must equal
-registry names** (`optimus`, not `optimus-probe`).
+Identity was the one place the spike shifted the design — twice. An early
+inference (members would resolve as the generic subagent type) was then corrected
+by **capturing a real member's `PreToolUse` hook input**. Two facts, both verified:
+
+1. **Env can't identify a member.** In-process members get **no identity env vars**
+   (no `CLAUDE_AGENT_NAME/ROLE`), share the lead's `CLAUDE_CODE_SESSION_ID`, and
+   carry `CLAUDE_CODE_CHILD_SESSION=1`. So `session-role-anchor`'s env read does not
+   apply to members — their role comes from the inline-spawned prompt.
+2. **The hook input already identifies a member.** A member spawned with
+   `name=optimus` produces a hook input with `agent_id` present (an opaque internal
+   id) and **`agent_type = "optimus"`** — the spawn `name`, *not* the `subagent_type`
+   (`general-purpose`). So `lib-identity`'s existing path resolves it with **no
+   change**: `agent_id` present → subagent; `agent_type` → registry → manager.
+
+The practical consequence: `lib-identity` needs no teams-specific branch. The
+load-bearing rule is **naming** — members must be spawned with `name` = their
+registry name (`optimus`, not `optimus-probe`), because that name becomes the
+hook-input `agent_type` the resolver keys on.
 
 | Who | Nested identity | Teams identity |
 |---|---|---|
 | **Lincoln** (team lead = your session) | env-var `CLAUDE_AGENT_NAME=lincoln` | **same** — env-var, unchanged |
-| **optimus / tarzan** | ledger `agent_type` via `agent_id` | parse role from `agent_id` (`name@team`); registry-name spawn required |
-| **chuck** | env-var (separate terminal) | parse role from `agent_id` (now a member); registry-name spawn required |
+| **optimus / tarzan** | ledger `agent_type` via `agent_id` | **same path** — hook-input `agent_type` = spawn `name`; spawn with registry name |
+| **chuck** | env-var (separate terminal) | hook-input `agent_type` = spawn `name` (now a member); spawn with registry name |
 
 **Build consequence:** `sable-build-agents` today excludes `chuck` (env-var
 terminal), `lincoln` (lead), and `gaudi` (inline skill). In teams mode **chuck
