@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# sable-teams-preflight — decide the /execute dispatch topology from the env
+# (SABLE-amj.6). Prints "teams" or "nested" on stdout. Exits 1 with a one-line
+# fix on stderr if SABLE_TEAMS is requested but the Claude Code experimental
+# Agent-Teams flag is absent.
+#
+# Topology selection is an env var (matching SABLE_MULTI_MANAGER / SABLE_COCKPIT
+# convention) and is orthogonal to planning/execution MODE (cockpit-mode.json).
+#
+# Usage:
+#   sable-teams-preflight        # -> "nested" | "teams" | (exit 1 + stderr fix)
+
+set -u
+
+case "$(printf '%s' "${SABLE_TEAMS:-}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on)
+    if [ "${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-}" = "1" ]; then
+      echo "teams"
+    else
+      echo "sable-teams-preflight: SABLE_TEAMS is set but CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS is not. Add \"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS\": \"1\" to the env block of ~/.claude/settings.json and restart Claude Code, or unset SABLE_TEAMS to use the nested topology." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "nested"
+    ;;
+esac
+exit 0

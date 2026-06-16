@@ -108,6 +108,13 @@ assert_grep "$EXEC_SKILL" "Chuck terminal"   "/execute reminds the operator abou
 assert_grep "$EXEC_SKILL" "pushes approved work itself" "/execute: managers push their own approved work (Lincoln does not)"
 assert_no_grep "$EXEC_SKILL" "execute dispatch requests as" "/execute: Lincoln no longer executes manager dispatch requests"
 
+# 9b. Teams topology branch (SABLE-amj.6)
+assert_grep "$EXEC_SKILL" "sable-teams-preflight" "/execute runs the topology preflight"
+assert_grep "$EXEC_SKILL" "SABLE_TEAMS"            "/execute documents the SABLE_TEAMS toggle"
+assert_grep "$EXEC_SKILL" "TeamCreate"             "/execute teams branch creates the sable team"
+assert_grep "$EXEC_SKILL" "agents-teams"           "/execute teams branch inline-spawns from the built teams defs"
+assert_grep "$EXEC_SKILL" "no separate Chuck"      "/execute teams branch folds Chuck into the team (no second terminal)"
+
 # 10. DECOMPOSITION post-batch-create verification (SABLE-xy1)
 assert_grep "$PLAN_SKILL" "bd dep tree"        "/plan DECOMPOSITION verifies edges via bd dep tree"
 assert_grep "$PLAN_SKILL" "bd ready"           "/plan DECOMPOSITION sanity-checks bd ready"

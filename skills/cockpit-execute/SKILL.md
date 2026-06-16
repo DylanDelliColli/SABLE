@@ -16,6 +16,9 @@ allowed-tools:
   - Grep
   - AskUserQuestion
   - Agent
+  - TeamCreate
+  - TeamDelete
+  - SendMessage
 ---
 
 # /execute — enter EXECUTION mode
@@ -55,7 +58,22 @@ producers (sherlock / victor / columbo) is blocked on both the Agent and Bash
 legs (soft — `SABLE_COCKPIT_FORCE=1` / `--force` overrides). Mode flips are
 mid-conversation; no restart.
 
-## 2. Run the native-spawn dispatch topology
+## 2. Choose the dispatch topology
+
+Run the preflight to pick the topology from the environment — this is orthogonal
+to the execution MODE you just set; it selects *how* agents are wired:
+
+```bash
+sable-teams-preflight
+```
+
+- prints `nested` → the resident-subagent topology (§2a, default).
+- prints `teams` → the Agent-Teams topology (§2b; needs `SABLE_TEAMS=1` and
+  `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`).
+- exits non-zero → `SABLE_TEAMS=1` but the experimental flag is missing; relay
+  the one-line fix it prints to the operator and stop.
+
+### 2a. Nested topology (default)
 
 Managers dispatch and push their own lanes (SABLE-uz9.11); you spawn them and
 oversee:
@@ -87,6 +105,35 @@ oversee:
 - You do not write application code, claim beads, dispatch workers, or push.
   The managers plan, dispatch, review, and push their lanes; you spawn them and
   keep the session coherent.
+
+### 2b. Teams topology (`SABLE_TEAMS=1`)
+
+The Agent-Teams topology collapses the second terminal: Chuck folds into the team
+and coordination is live over `SendMessage` instead of polling. You (Lincoln) are
+the team lead.
+
+- **Create the team:** `TeamCreate` a team named `sable`.
+- **Spawn the members** — optimus, tarzan, and chuck — as persistent team members
+  via the Agent tool with `team_name: sable` and `name:` = the registry name (so
+  each member's hook-input `agent_type` carries its role and `lib-identity`
+  resolves it, SABLE-amj.2). Use the built teams definition at
+  `~/.claude/agents-teams/<name>.md` as the member's **inline prompt**; do NOT pass
+  `agentType` (these are inline-spawned to avoid colliding with the nested
+  named-agent defs — SABLE-amj.4 / design decision 6). There is **no separate Chuck
+  terminal** in teams mode.
+- **Coordination is live** (the teams card, SABLE-amj.3): a manager pushes its
+  approved worktree and `SendMessage chuck` "PR ready: <bead>, <branch>"; chuck
+  wakes, merges, replies; `for-lincoln` arbitration is a direct message to you.
+  The durable `for-merge` bead still lands via `post-push-merge-notify` (the
+  recovery record) — beads stays the ledger, SendMessage is the fast path.
+- **Workers are unchanged:** managers dispatch their own workers via the Agent
+  tool as plain sub-subagents (no `team_name`) and push their own approved work.
+- **The team is disposable; beads is the recovery substrate.** If the session
+  ends, re-run `/execute` to recreate the team — members catch up from beads on
+  join (the startup sweep in the teams card), then go idle and wake on
+  `SendMessage`. `TeamDelete` when draining is done.
+- **Oversee** as in §2a, but broker `for-lincoln` arbitration live over
+  `SendMessage`.
 
 ## 3. Hand back to planning
 
