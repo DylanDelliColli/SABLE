@@ -123,7 +123,7 @@ DESC_LINES="${DESC_LINES}PR ready for review."
 PR URL: $PR_URL"
 DESC_LINES="${DESC_LINES}
 Branch: $BRANCH
-Submitted by: $CLAUDE_AGENT_NAME
+Submitted by: $SABLE_ID_NAME
 
 ## Files Modified
 $(echo "$FILES" | sed 's/^/  - /')"
@@ -140,10 +140,10 @@ DESC_LINES="${DESC_LINES}
 
 ## Acceptance Criteria
 - CI green
-- Conflict resolution applied (mechanical fixes inline; semantic conflicts deferred to author via for-${CLAUDE_AGENT_NAME} bead)
+- Conflict resolution applied (mechanical fixes inline; semantic conflicts deferred to author via for-${SABLE_ID_NAME} bead)
 - PR merged or held with reason"
 
-TITLE="Review PR from ${CLAUDE_AGENT_NAME}: ${BRANCH}"
+TITLE="Review PR from ${SABLE_ID_NAME}: ${BRANCH}"
 
 bd create \
   --title "$TITLE" \

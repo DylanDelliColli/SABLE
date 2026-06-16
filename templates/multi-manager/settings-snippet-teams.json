@@ -1,0 +1,61 @@
+{
+  "_comment": "Multi-Manager TEAMS-mode hooks (SABLE-amj.5) — APPEND to ~/.claude/settings.json when running the agent-teams topology (SABLE_TEAMS=1). Identical to settings-snippet.json EXCEPT the three poll-based messaging hooks are OMITTED: inbox-injection (PostToolUse:Bash), inbox-injection-precompact (PreCompact), and read-guard (PreToolUse:Bash). In teams mode coordination is live via SendMessage, so members wake on a teammate's message instead of polling for-X beads (clean cutover, AGENT-TEAMS-DESIGN.md decision 5 / section 4).",
+  "_install": "Copy each entry under the matching event/matcher into your existing settings.json hooks block. Use this INSTEAD of settings-snippet.json when running SABLE_TEAMS=1.",
+  "_timeout_coupling": "pre-push-rebase-test.sh has TWO timeouts that must stay in sync: the 'timeout' field here (ms) and the SABLE_PRE_PUSH_TEST_TIMEOUT env var (seconds). Default pairing: inner 60s test budget, outer 90000ms hook. See settings-snippet.json for the full note.",
+
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/session-role-anchor.sh", "timeout": 3000 }
+        ]
+      }
+    ],
+
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/session-role-anchor.sh", "timeout": 3000 }
+        ]
+      }
+    ],
+
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/cockpit-mode-interlock.sh", "timeout": 3000 },
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/tree-claim.sh", "timeout": 3000 },
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-push-rebase-test.sh", "timeout": 90000 }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/cockpit-mode-interlock.sh", "timeout": 3000 },
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-preempt.sh", "timeout": 3000 },
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-refresh.sh", "timeout": 30000 },
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-claim.sh", "timeout": 5000 },
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-overlap.sh", "timeout": 5000 }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/edit-write-claim-reconciler.sh", "timeout": 3000 }
+        ]
+      }
+    ],
+
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/post-push-merge-notify.sh", "timeout": 10000 }
+        ]
+      }
+    ]
+  }
+}

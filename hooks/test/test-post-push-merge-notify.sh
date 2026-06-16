@@ -102,6 +102,26 @@ print(json.dumps({
 " "$cmd" "$cwd" "$stdout" "$stderr"
 }
 
+# make_member_post_input <command> <cwd> <agent_type> [stdout] [stderr]
+# Builds a PostToolUse payload shaped like a TEAMS MEMBER / subagent: carries
+# agent_id + agent_type (the member's spawn name) and NO env identity, so the
+# hook must attribute via lib-identity's resolved name, not $CLAUDE_AGENT_NAME
+# (SABLE-amj.5; the same resolved-identity fix as SABLE-8fp for nested v2).
+make_member_post_input() {
+  local cmd="$1" cwd="$2" atype="$3" stdout="${4:-}" stderr="${5:-}"
+  python3 -c "
+import json, sys
+cmd, cwd, atype, stdout, stderr = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+print(json.dumps({
+    'agent_id': 'opaque-member-id',
+    'agent_type': atype,
+    'tool_input': {'command': cmd},
+    'cwd': cwd,
+    'tool_response': {'stdout': stdout, 'stderr': stderr},
+}))
+" "$cmd" "$cwd" "$atype" "$stdout" "$stderr"
+}
+
 # run_hook <env_prefix> <json> → prints hook stdout+stderr
 run_hook() {
   local env_prefix="$1" json="$2"
@@ -232,6 +252,37 @@ if grep -q 'for-chuck' "$BD_LOG" 2>/dev/null; then
   pass "integration: for-chuck bead filed despite missing origin/dev"
 else
   fail "integration: for-chuck bead NOT filed despite missing origin/dev (BD_LOG: $(cat "$BD_LOG" 2>/dev/null | head -3))"
+fi
+rm -f "$BD_LOG"
+
+# --------------------------------------------------------------------------
+# Teams-member attribution — SABLE-amj.5
+# A manager spawned as a team member has NO env CLAUDE_AGENT_NAME; its identity
+# is the hook-input agent_type. The for-chuck bead must attribute to the resolved
+# name (optimus), not an empty env var. Pre-fix the title was "Review PR from : ".
+# --------------------------------------------------------------------------
+
+# Hermetic fixture registry so resolution does not depend on the installed one.
+FIX_YAML="$STUB_DIR/agents.yaml"
+cat > "$FIX_YAML" <<'YAML'
+agents:
+  optimus:
+    type: epic_manager
+  chuck:
+    type: integrator
+YAML
+
+MEMBER_INPUT=$(make_member_post_input "git push" "$FIXTURE_REPO" "optimus")
+run_hook "SABLE_AGENTS_YAML=$FIX_YAML" "$MEMBER_INPUT" >/dev/null
+if grep -q 'for-chuck' "$BD_LOG" 2>/dev/null; then
+  pass "teams member (no env identity): for-chuck bead filed via resolved identity"
+else
+  fail "teams member (no env identity): for-chuck bead filed via resolved identity" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null | head -3)"
+fi
+if grep -q 'from optimus' "$BD_LOG" 2>/dev/null; then
+  pass "teams member: PR attributed to resolved name (optimus), not empty env"
+else
+  fail "teams member: PR attributed to resolved name (optimus)" "title missing resolved name (BD_LOG: $(cat "$BD_LOG" 2>/dev/null | head -3))"
 fi
 rm -f "$BD_LOG"
 
