@@ -4,6 +4,12 @@
 > file) is identical across modes; only this card differs. See
 > [`AGENT-TEAMS-DESIGN.md`](../../../AGENT-TEAMS-DESIGN.md) §3.
 >
+> **This card supersedes nested coordination.** It OVERRIDES any nested-mode
+> coordination described in your role below: continuous polling loops (`/loop`,
+> `/inbox` cadences) and `for-<name>`-bead intake do NOT apply in teams mode —
+> we do not need a polling loop because teammates ping you to wake. You are woken
+> by a teammate's `SendMessage`; act, reply, then go idle.
+>
 > You are a **persistent team member** in the `sable` team led by Lincoln (the
 > operator session). You go idle between turns and wake when a teammate messages
 > you. Your plain-text output is NOT visible to teammates — to communicate you

@@ -104,6 +104,53 @@ assert_grep    "$AGENTS_DIR/tarzan.md"  "emergency"     "tarzan keeps emergency 
 assert_no_grep "$AGENTS_DIR/optimus.md" "you have NO Agent tool"  "optimus preamble does not claim it lacks the Agent tool"
 assert_no_grep "$AGENTS_DIR/tarzan.md"  "you have NO Agent tool"  "tarzan preamble does not claim it lacks the Agent tool"
 
+# --- SABLE-amj.4: teams build target (templates/agents-teams/) ---
+# Same role files, wrapped with the teams coordination card instead of the
+# nested preamble; member set = the six nested agents + chuck.
+TEAMS_DIR="$REPO/templates/agents-teams"
+TEAMS_AGENTS="optimus tarzan sherlock victor rudy columbo chuck"
+
+# Layer 1 (teams): generated == committed
+TMP_TEAMS="$(mktemp -d)"
+trap 'rm -rf "$TMP_OUT" "$TMP_TEAMS"' EXIT
+if python3 "$BUILDER" --mode teams --out-dir "$TMP_TEAMS" >/dev/null 2>&1; then
+  pass "builder regenerates teams cleanly"
+else
+  fail "builder regenerates teams cleanly" "bin/sable-build-agents --mode teams exited nonzero"
+fi
+for name in $TEAMS_AGENTS; do
+  if diff -q "$TMP_TEAMS/$name.md" "$TEAMS_DIR/$name.md" >/dev/null 2>&1; then
+    pass "teams $name.md committed copy matches regeneration (no drift)"
+  else
+    fail "teams $name.md committed copy matches regeneration (no drift)" "re-run bin/sable-build-agents --mode teams"
+  fi
+done
+
+# Layer 2 (teams): per-member contract
+for name in $TEAMS_AGENTS; do
+  DEF="$TEAMS_DIR/$name.md"
+  assert_file "$DEF" "teams $name.md exists"
+  [ -f "$DEF" ] || continue
+  assert_grep "$DEF" "^name: $name\$" "teams $name.md frontmatter name matches filename"
+  assert_grep "$DEF" "Teams coordination card" "teams $name.md carries the teams coordination card"
+  assert_grep "$DEF" "supersedes nested coordination" "teams $name.md carries the supersede-nested clause"
+  assert_grep "$DEF" "GENERATED from templates/multi-manager/roles/$name.md" "teams $name.md carries the generated-file marker"
+done
+
+# chuck folds into the teams build but stays out of the nested build
+assert_file "$TEAMS_DIR/chuck.md" "teams build includes chuck (merge queue folds into the team)"
+assert_no_grep_file() { if [ -e "$1" ]; then fail "$2" "unexpectedly present: $1"; else pass "$2"; fi; }
+assert_no_grep_file "$AGENTS_DIR/chuck.md" "nested build still excludes chuck"
+
+# managers keep the Agent tool in the teams build
+for mgr in optimus tarzan; do
+  if grep -E "^tools:.*\bAgent\b" "$TEAMS_DIR/$mgr.md" >/dev/null 2>&1; then
+    pass "teams $mgr.md frontmatter grants the Agent tool"
+  else
+    fail "teams $mgr.md frontmatter grants the Agent tool" "no 'tools:' line containing Agent"
+  fi
+done
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
