@@ -134,6 +134,7 @@ for name in $TEAMS_AGENTS; do
   assert_grep "$DEF" "^name: $name\$" "teams $name.md frontmatter name matches filename"
   assert_grep "$DEF" "Teams coordination card" "teams $name.md carries the teams coordination card"
   assert_grep "$DEF" "supersedes nested coordination" "teams $name.md carries the supersede-nested clause"
+  assert_grep "$DEF" "Startup catch-up" "teams $name.md carries the startup catch-up (recovery from beads — SABLE-amj.7)"
   assert_grep "$DEF" "GENERATED from templates/multi-manager/roles/$name.md" "teams $name.md carries the generated-file marker"
 done
 
