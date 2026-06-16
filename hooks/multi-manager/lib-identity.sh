@@ -7,6 +7,11 @@
 #      CC 2.1.170, spike SABLE-uz9.1). Env vars are the PARENT session's
 #      identity in this context and MUST be ignored — this closes the
 #      "subagent contamination" hole documented in MULTI-MANAGER-PATTERN.md.
+#      Agent-Teams members resolve here too (SABLE-amj.2): a member spawned with
+#      name=<role> carries agent_type=<role> in its hook input (capture-verified,
+#      SABLE-amj.1) — the team config's agentType field (e.g. general-purpose) is
+#      a DIFFERENT field and is NOT what appears here. Members thus need no
+#      special branch, but they MUST be spawned under their registry name.
 #   2. CLAUDE_AGENT_NAME / CLAUDE_AGENT_ROLE env vars (legacy terminal
 #      launches — Chuck's holdout terminal and any pre-v2 alias). Dual-mode
 #      support is a hard requirement of SABLE-uz9.3.

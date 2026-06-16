@@ -123,6 +123,31 @@ run_case "malformed hook JSON falls back to env identity" \
   "tarzan|one_off_manager|env|0|1|1"
 
 # --------------------------------------------------------------------------
+# Agent-Teams member identity (SABLE-amj.2). Capture-verified (SABLE-amj.1):
+# a team member spawned with name=<registry name> produces a hook input whose
+# agent_type field carries that NAME — the subagent_type (e.g. general-purpose)
+# does NOT appear in agent_type, and agent_id is an opaque internal id. So a
+# member named "optimus" resolves through the SAME agent_type path as a nested
+# subagent; lib-identity needs no teams-specific branch. The load-bearing rule
+# lives at spawn time: member name MUST equal the registry name (see SABLE-amj.6).
+# --------------------------------------------------------------------------
+
+# 11. Real captured team-member hook-input shape (name=optimus, opaque agent_id,
+#     plus the session_id/cwd/permission_mode/effort fields a member actually
+#     carries): resolves as the optimus manager via agent_type.
+run_case "teams member optimus (captured shape) resolves as manager via agent_type" \
+  '{"session_id":"shared-with-lead","cwd":"/repo","permission_mode":"auto","agent_id":"a9aeafeb6cf464770","agent_type":"optimus","effort":{"level":"xhigh"},"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"touch x"}}' \
+  "" "" \
+  "optimus|epic_manager|agent_type|1|1|1"
+
+# 12. A member spawned with a NON-registry name stands down — this is precisely
+#     why amj.6 must spawn members under their registry name (naming rationale).
+run_case "teams member with non-registry name (optimus-probe) stands down" \
+  '{"agent_id":"b2teamopq","agent_type":"optimus-probe","hook_event_name":"PreToolUse","tool_name":"Bash"}' \
+  "" "" \
+  "optimus-probe||agent_type|1|0|0"
+
+# --------------------------------------------------------------------------
 # sable_resolve_dispatch_lane unit tests (SABLE-uz9.9)
 # Manager-subagents now dispatch workers natively (nested Agent, CC 2.1.177,
 # SABLE-uz9.8) — governance must ACTIVATE for them where it previously stood
