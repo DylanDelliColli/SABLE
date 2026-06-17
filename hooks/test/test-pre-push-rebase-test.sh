@@ -401,6 +401,16 @@ else
   v3fail "(k) SABLE_WORKER_PUSH_OVERRIDE does not weaken the manager gate" "got: ${OUT:0:300}"
 fi
 
+# ===================================================================
+# SABLE-041: the gate must act on the `git -C <repo>` target, not the
+# shell cwd. cwd is a NON-repo; -C points at the real fixture repo. The
+# buggy hook checks cwd/.git (absent) and no-ops (allow); the fixed hook
+# resolves the -C dir, finds .git, and the forced static failure DENIES.
+# ===================================================================
+C041_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=false SABLE_PRE_PUSH_TEST_PHASE=skip"
+assert_deny "SABLE-041: 'git -C <repo> push' from a non-repo cwd resolves the -C dir (static gate runs)" \
+  "$C041_ENV" "git -C $REPO_DIR push" "/tmp/sable-041-nonrepo-cwd" "phase 2 (static)"
+
 # Cleanup
 rm -rf "$REPO_DIR" "$BARE_DIR" "$V3_YAML"
 

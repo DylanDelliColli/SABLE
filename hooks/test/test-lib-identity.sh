@@ -360,6 +360,36 @@ validate_ref_test "sable_validate_base_ref: nonexistent ref falls back to origin
 validate_ref_test "sable_validate_base_ref: empty repo path returns desired ref unchanged" \
   "" "origin/dev" "^origin/dev$"
 
+# --------------------------------------------------------------------------
+# sable_resolve_push_repo_dir unit tests (SABLE-041)
+# Resolves the effective git dir from a push command's `git -C <path>`,
+# applied to the shell cwd with git semantics; falls back to cwd when absent.
+# --------------------------------------------------------------------------
+resolve_dir_test() {
+  local label="$1" cwd="$2" cmd="$3" expect="$4" got
+  got=$(sable_resolve_push_repo_dir "$cwd" "$cmd")
+  if [ "$got" = "$expect" ]; then
+    pass "$label"
+  else
+    fail "$label" "expected [$expect] got [$got]"
+  fi
+}
+
+resolve_dir_test "resolve_push_repo_dir: no -C falls back to cwd" \
+  "/main" "git push" "/main"
+resolve_dir_test "resolve_push_repo_dir: absolute -C overrides cwd" \
+  "/main" "git -C /wt push" "/wt"
+resolve_dir_test "resolve_push_repo_dir: absolute -C with push args" \
+  "/main" "git -C /wt push -u origin wk-x" "/wt"
+resolve_dir_test "resolve_push_repo_dir: relative -C joins cwd" \
+  "/main" "git -C sub push" "/main/sub"
+resolve_dir_test "resolve_push_repo_dir: -c before -C is skipped, -C wins" \
+  "/main" "git -c http.x=y -C /wt push" "/wt"
+resolve_dir_test "resolve_push_repo_dir: env-assignment prefix + -C" \
+  "/main" "SABLE_SKIP_PRE_PUSH=1 git -C /wt push" "/wt"
+resolve_dir_test "resolve_push_repo_dir: double -C composes (git semantics)" \
+  "/main" "git -C /a -C b push" "/a/b"
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

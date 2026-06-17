@@ -209,6 +209,77 @@ sys.exit(1)
 " 2>/dev/null
 }
 
+# sable_resolve_push_repo_dir <cwd> <command>
+#
+# Returns the effective git working directory for a push command: the shell
+# <cwd> with every `git -C <path>` option from <command> applied in order,
+# matching git's own semantics (an absolute -C replaces the accumulated dir;
+# a relative -C is joined onto it). Falls back to <cwd> when no -C is present.
+#
+# This is the directory git ACTUALLY operates in. The pre-push gate must
+# rebase/typecheck/test there, and post-push must read its branch + diff
+# there — NOT the raw shell cwd, which differs whenever a manager pushes a
+# worktree via `git -C <worktree> push` from the main checkout (SABLE-041).
+#
+# Tokenizes with shlex and reuses the same command-position / env-prefix walk
+# as sable_is_git_push so env-assignment and env(1) prefixes are transparent.
+sable_resolve_push_repo_dir() {
+  local cwd="${1:-}" cmd="${2:-}"
+  CWD_STR="$cwd" CMD_STR="$cmd" python3 -c "
+import os, re, shlex, sys
+
+cwd = os.environ.get('CWD_STR', '')
+cmd = os.environ.get('CMD_STR', '')
+try:
+    tokens = shlex.split(cmd)
+except ValueError:
+    print(cwd); sys.exit(0)
+
+SHELL_SEPS = {';', '&&', '||', '|'}
+CONSUME_NEXT = {'-c', '--git-dir', '--work-tree', '--namespace', '--exec-path'}
+ENV_ASSIGN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+
+# Walk to the first 'git' at command position (env-assignment / env(1)
+# prefixes are transparent — mirror sable_is_git_push).
+i, n = 0, len(tokens)
+at_cmd_pos = True
+git_idx = -1
+while i < n:
+    tok = tokens[i]
+    if tok in SHELL_SEPS:
+        at_cmd_pos = True; i += 1; continue
+    if at_cmd_pos and ENV_ASSIGN_RE.match(tok):
+        i += 1; continue
+    if at_cmd_pos and tok == 'env':
+        i += 1
+        while i < n:
+            t = tokens[i]
+            if ENV_ASSIGN_RE.match(t): i += 1; continue
+            if t == '-u' and i + 1 < n: i += 2; continue
+            break
+        continue
+    if at_cmd_pos and tok == 'git':
+        git_idx = i; break
+    at_cmd_pos = False; i += 1
+
+eff = cwd
+if git_idx >= 0:
+    j = git_idx + 1
+    while j < n:
+        t = tokens[j]
+        if t == '-C' and j + 1 < n:
+            p = tokens[j + 1]
+            eff = p if os.path.isabs(p) else os.path.join(eff or '.', p)
+            j += 2; continue
+        if t in CONSUME_NEXT and j + 1 < n:
+            j += 2; continue
+        if t.startswith('-'):
+            j += 1; continue
+        break  # subcommand reached — stop scanning global flags
+print(eff)
+" 2>/dev/null || printf '%s' "$cwd"
+}
+
 # sable_validate_base_ref <repo-path> <desired-ref>
 #
 # Validates that <desired-ref> exists in <repo-path>.

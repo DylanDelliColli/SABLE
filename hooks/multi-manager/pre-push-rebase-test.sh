@@ -122,6 +122,13 @@ fi
 sable_is_git_push "$COMMAND" || exit 0
 echo "$COMMAND" | grep -qE '(\-\-force|\-f\b)' && exit 0
 
+# Resolve the effective repo dir from the push command's `git -C <path>`
+# target, falling back to the shell cwd. Managers push worktrees via
+# `git -C <worktree> push` from the main checkout, so the dir git operates in
+# is the -C target, not the shell cwd — rebase/static/test must run THERE
+# (SABLE-041).
+CWD=$(sable_resolve_push_repo_dir "$CWD" "$COMMAND")
+
 [ -z "$CWD" ] && exit 0
 [ ! -d "$CWD/.git" ] && [ ! -f "$CWD/.git" ] && exit 0
 

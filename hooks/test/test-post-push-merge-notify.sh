@@ -345,6 +345,29 @@ fi
 rm -f "$BD_LOG"
 
 # --------------------------------------------------------------------------
+# SABLE-041: worktree push via `git -C <worktree>` from the main checkout
+# cwd must report the WORKTREE's branch, not the cwd's branch. Buggy hook
+# rev-parses cwd (FIXTURE_REPO's branch); fixed hook resolves the -C dir.
+# --------------------------------------------------------------------------
+WT_041="$STUB_DIR/wt-041"
+git -C "$FIXTURE_REPO" worktree add -q -b wk-041 "$WT_041" >/dev/null 2>&1
+cd "$WT_041"
+echo "z" > wt_change.txt
+git add wt_change.txt
+git commit -q -m "wt change on wk-041"
+cd - >/dev/null
+
+INPUT=$(make_post_input "git -C $WT_041 push" "$FIXTURE_REPO")
+run_hook "$MGR_ENV" "$INPUT" >/dev/null
+if grep -q 'wk-041' "$BD_LOG" 2>/dev/null; then
+  pass "SABLE-041: for-chuck reports the -C worktree branch (wk-041), not the cwd branch"
+else
+  fail "SABLE-041: for-chuck reports the -C worktree branch (wk-041)" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null | head -4)"
+fi
+rm -f "$BD_LOG"
+git -C "$FIXTURE_REPO" worktree remove --force "$WT_041" 2>/dev/null
+
+# --------------------------------------------------------------------------
 # Summary
 # --------------------------------------------------------------------------
 

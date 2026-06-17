@@ -49,6 +49,12 @@ COMMAND=$(echo "$PARSED" | sed -n '2p')
 # Only act on successful git push (SABLE-jpr: use shared matcher so
 # 'git -C <path> push' and other flag-interleaved forms are matched correctly)
 sable_is_git_push "$COMMAND" || exit 0
+
+# Resolve the effective repo dir from the push command's `git -C <path>`
+# target, falling back to the shell cwd. A manager pushing a worktree via
+# `git -C <worktree> push` runs from the main checkout, so the pushed branch
+# and its diff live in the -C target, not the shell cwd (SABLE-041).
+CWD=$(sable_resolve_push_repo_dir "$CWD" "$COMMAND")
 [ -z "$CWD" ] && exit 0
 
 # Quick success heuristic: rejected/error/fatal in stderr means failure
