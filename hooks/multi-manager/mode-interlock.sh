@@ -181,6 +181,18 @@ get_substage() {
   fi
 }
 
+# Resolve the planning tier (quick|full). Empty/full => the full substage gate
+# applies; quick => the gate is telescoped to the single /sable-plan approval, so
+# the quick-tier flow may author its 1-3 beads without walking all five substages.
+# Fail-safe: anything other than the literal 'quick' keeps the strict gate.
+get_tier() {
+  if [ -x "$MODE_BIN" ]; then
+    "$MODE_BIN" tier get 2>/dev/null || true
+  elif [ -f "$STATE" ]; then
+    STATE="$STATE" python3 -c "import json,os; print(json.load(open(os.environ['STATE'])).get('tier','') or '')" 2>/dev/null || true
+  fi
+}
+
 case "$MODE" in
   planning)
     if launches 'optimus|tarzan|chuck'; then
@@ -189,7 +201,7 @@ case "$MODE" in
     if printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])git[[:space:]]+push([[:space:]]|$)'; then
       deny "Orchestration is in PLANNING mode — code 'git push' is blocked so you don't ship from a half-formed backlog. Run /execute first, or append --force to override."
     fi
-    if authors_backlog; then
+    if authors_backlog && [ "$(get_tier)" != "quick" ]; then
       SUBSTAGE="$(get_substage)"
       if [ "$SUBSTAGE" != "decomposition" ]; then
         deny "Orchestration is in PLANNING mode at substage '${SUBSTAGE:-unset}' — populating the implementation backlog (bd create --parent/--graph/--file) is blocked until substage=decomposition. The bare epic shell (bd create --type=epic) is allowed now as the planning home; producers attach their review to it. Walk the staged flow (framing → research → architecture → test-strategy → decomposition), advancing with 'sable-mode substage advance' after each human sign-off. Append --force to override."

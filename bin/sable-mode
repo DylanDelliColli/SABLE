@@ -38,9 +38,10 @@ usage() {
 sable-mode — read/write the orchestration mode-state file.
 
 Usage:
-  sable-mode set <planning|execution> [--fleet a,b,c]
+  sable-mode set <planning|execution> [--fleet a,b,c] [--tier quick|full]
       Write the mode-state file. --fleet is a comma-separated list of the
-      agents launched for this mode (recorded for the dashboard).
+      agents launched for this mode (recorded for the dashboard). --tier sets
+      the planning tier (default full); quick telescopes the backlog gate.
   sable-mode get      Print the current mode word; nonzero exit if unset.
   sable-mode show     Print the full mode-state JSON; nonzero exit if unset.
   sable-mode substage get        Print the current planning substage; nonzero
@@ -49,6 +50,8 @@ Usage:
                                  framing research architecture test-strategy decomposition
   sable-mode substage advance    Advance to the next substage in order; nonzero
                                  if already at decomposition.
+  sable-mode tier get            Print the planning tier (quick|full, default
+                                 full); nonzero if unset or not in planning.
   sable-mode --help
 
 State file: ${STATE}
@@ -101,28 +104,38 @@ case "$cmd" in
                 ;;
         esac
 
-        # Consume the verb + mode, then scan for --fleet.
+        # Consume the verb + mode, then scan for --fleet and --tier.
         shift 2 || true
         fleet_csv=""
+        tier=""
         while [ $# -gt 0 ]; do
             case "$1" in
                 --fleet)    fleet_csv="${2:-}"; shift 2 || shift ;;
                 --fleet=*)  fleet_csv="${1#--fleet=}"; shift ;;
+                --tier)     tier="${2:-}"; shift 2 || shift ;;
+                --tier=*)   tier="${1#--tier=}"; shift ;;
                 *)          shift ;;
             esac
         done
+        case "${tier:-full}" in
+            quick|full) ;;
+            *) printf "sable-mode: invalid tier '%s' (must be quick or full)\n" "$tier" >&2; exit 2 ;;
+        esac
 
         since="$(date +%Y-%m-%dT%H:%M:%S%z)"
         mkdir -p "$(dirname "$STATE")"
-        STATE="$STATE" MODE="$mode" SINCE="$since" FLEET="$fleet_csv" python3 -c "
+        STATE="$STATE" MODE="$mode" SINCE="$since" FLEET="$fleet_csv" TIER="${tier:-full}" python3 -c "
 import json, os
 fleet = [s for s in os.environ.get('FLEET', '').split(',') if s]
 mode = os.environ['MODE']
 data = {'mode': mode, 'since': os.environ['SINCE'], 'fleet': fleet}
 # Planning is a staged sub-state machine; entering it starts at framing.
-# Execution has no substage.
+# Execution has no substage. The tier (quick|full, default full) telescopes the
+# substage gate: quick-tier planning lets the interlock allow backlog authoring
+# under the single /sable-plan approval instead of walking all five substages.
 if mode == 'planning':
     data['substage'] = 'framing'
+    data['tier'] = os.environ.get('TIER') or 'full'
 with open(os.environ['STATE'], 'w') as f:
     f.write(json.dumps(data, indent=2) + chr(10))
 "
@@ -186,6 +199,27 @@ with open(os.environ['STATE'], 'w') as f:
                 ;;
             *)
                 printf 'sable-mode: substage requires: get | set <name> | advance\n' >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    tier)
+        # Planning tier (quick|full). Read by the interlock to telescope the
+        # backlog gate. Defaults to full when in planning mode and unset.
+        require_state
+        action="${2:-}"
+        case "$action" in
+            get)
+                STATE="$STATE" python3 -c "
+import json, os
+d = json.load(open(os.environ['STATE']))
+if d.get('mode') != 'planning':
+    raise SystemExit(1)
+print(d.get('tier') or 'full')
+"
+                ;;
+            *)
+                printf 'sable-mode: tier requires: get\n' >&2
                 exit 1
                 ;;
         esac
