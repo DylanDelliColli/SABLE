@@ -66,6 +66,17 @@ for a in optimus tarzan chuck lincoln sherlock victor rudy columbo; do
   fi
 done
 
+# SABLE-2l4: 'sable-agents <name>' prints a 'source:' line into the repo when the
+# role file exists. The repo path was hardcoded to ~/dev-env/SABLE (wrong: the
+# repo dir is dev-environment), so the line never appeared. The fix derives the
+# repo from the script location, so it is correct AND symlink-safe.
+DETAIL="$(python3 "$AGENTS_BIN" --registry "$REGISTRY" lincoln 2>/dev/null)"
+if printf '%s' "$DETAIL" | grep -q "source:" && printf '%s' "$DETAIL" | grep -qF "$REPO/templates/multi-manager/roles/lincoln.md"; then
+  pass "sable-agents prints the repo source path for a role (SABLE-2l4)"
+else
+  fail "sable-agents prints the repo source path for a role (SABLE-2l4)" "got: ${DETAIL:-<empty>}"
+fi
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

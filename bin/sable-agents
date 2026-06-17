@@ -213,7 +213,10 @@ def _print_role_path(name: str, info: dict[str, Any]) -> None:
     if role:
         # Resolve to ~/.claude/sable/<role_prompt>
         installed = Path.home() / ".claude" / "sable" / role
-        repo = Path.home() / "dev-env" / "SABLE" / "templates" / "multi-manager" / role
+        # Repo source: derive from this script's own location (bin/ -> repo root)
+        # rather than a hardcoded ~/dev-env path (SABLE-2l4). resolve() follows
+        # symlinks, so this is correct even when sable-agents is symlink-installed.
+        repo = Path(__file__).resolve().parent.parent / "templates" / "multi-manager" / role
         sys.stdout.write(f"\n  Role file:\n")
         if installed.exists():
             sys.stdout.write(f"    installed: {installed}\n")
