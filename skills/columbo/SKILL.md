@@ -6,9 +6,10 @@ description: |
   happy-path-only suites. Four modes: `/columbo --feature "<desc>"` for new
   feature work, `/columbo --bead SABLE-xxx` to enrich an existing bead,
   `/columbo --audit <path>` to find shallow tests in an existing module,
-  and `/columbo --epic SABLE-xxx` to review the test architecture of a
+  `/columbo --epic SABLE-xxx` to review the test architecture of a
   planned epic (or any parent bead with children) before workers start
-  implementation.
+  implementation, and `/columbo --quick "<scope>"` for a non-interview
+  test-spec on a small ask (quick-tier /sable-plan).
   Use when asked to "scope tests", "plan test coverage", "what should I test",
   "audit this for shallow tests", "review the test architecture of this epic",
   or "/columbo".
@@ -52,10 +53,33 @@ specific enough that "green" actually means "covered."
 /columbo --bead SABLE-xxx                         # forward mode, enrich an existing bead
 /columbo --audit <path>                           # audit mode against an existing module
 /columbo --epic SABLE-xxx                         # architecture-review mode against a planned bead tree
+/columbo --quick "<scope>"                        # quick mode, non-interview test-spec for a small ask
 ```
 
 If the user invokes `/columbo` with no arg or an ambiguous arg, ask them
 which mode and target before starting.
+
+### Quick mode (`--quick "<scope>"`)
+
+For small, self-specified asks during quick-tier `/sable-plan`. **NON-INTERVIEW:**
+given a sufficiently-specified scope, emit the test spec in ONE pass — no
+boundary-case interview, no `AskUserQuestion`. Return the spec **inline** (do NOT
+file beads or skeleton files); the caller folds it into the implementation bead.
+
+**Default to EXTENDING existing test files:** grep the test dir for the touched
+component/module, find the test(s) already covering it, and specify the delta —
+which assertions to add to which existing unit + integration test. Only when
+nothing covers the area, specify a NEW test file and say so explicitly
+(`no existing coverage — new test: <path>`).
+
+Emit both layers (the unit+integration mandate):
+- **unit** — the assertion(s) at the component/function boundary.
+- **integration** — the assertion(s) at the real-composition boundary (page
+  mount, HTTP, DB).
+
+Scope the spec to the ask, not the module — quick mode trades the exhaustive
+interview for speed. If the scope turns out ambiguous or architecturally risky,
+say so and recommend the caller bump to full planning rather than guessing.
 
 ### Forward mode (`--feature` or `--bead`)
 
