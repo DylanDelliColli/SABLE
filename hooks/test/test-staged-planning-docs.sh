@@ -17,7 +17,7 @@ FAIL_NAMES=""
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 
-DOCS="SABLE.md COCKPIT-DESIGN.md MULTI-MANAGER-PATTERN.md"
+DOCS="SABLE.md ENTRY-POINTS-DESIGN.md MULTI-MANAGER-PATTERN.md"
 STAGES="framing research architecture test-strategy decomposition"
 
 for doc in $DOCS; do

@@ -58,7 +58,7 @@ PLAN_MODE="$FIXTURE_DIR/mode-plan.json"
 echo '{"mode": "execution", "since": "2026-06-10"}' > "$EXEC_MODE"
 echo '{"mode": "planning", "since": "2026-06-10"}' > "$PLAN_MODE"
 # Deliberately-absent path for the "no mode-state file" case — must NOT fall
-# back to the live ~/.claude/sable/state/cockpit-mode.json (SABLE-wtv).
+# back to the live ~/.claude/sable/state/mode-state.json (SABLE-wtv).
 NONEXISTENT_MODE="$FIXTURE_DIR/mode-nonexistent.json"
 
 json() { # <agent_id> <agent_type> <prompt>
@@ -74,10 +74,10 @@ print(json.dumps(d))
 
 run_hook() { # <json> <env_name> <env_role> <mode_file>
   (
-    unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_COCKPIT_MODE_FILE
+    unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_MODE_FILE
     [ -n "$2" ] && export CLAUDE_AGENT_NAME="$2"
     [ -n "$3" ] && export CLAUDE_AGENT_ROLE="$3"
-    [ -n "$4" ] && export SABLE_COCKPIT_MODE_FILE="$4"
+    [ -n "$4" ] && export SABLE_MODE_FILE="$4"
     printf '%s' "$1" | bash "$HOOK" 2>/dev/null
   )
 }
@@ -119,7 +119,7 @@ anything')" "" "" "$PLAN_MODE")
 assert_allowed "planning mode: pre-dispatch preemption inactive" "$OUT"
 
 # 8. Anonymous session, no mode file → inactive (SABLE-wtv: pin to an absent
-#    fixture path so the live cockpit-mode.json cannot leak into the test).
+#    fixture path so the live mode-state.json cannot leak into the test).
 OUT=$(run_hook "$(json '' '' 'Dispatching-for: optimus')" "" "" "$NONEXISTENT_MODE")
 assert_allowed "no mode-state file: inactive outside SABLE context" "$OUT"
 

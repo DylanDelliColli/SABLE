@@ -194,7 +194,7 @@ transport is the `SendMessage` tool + the startup-card catch-up).
 | Hook | Role | Teams mode |
 |---|---|---|
 | `pre-push-rebase-test` | 3-phase gate (rebase→static→tests) | **shared, unchanged** |
-| `cockpit-mode-interlock` | planning/execution gate | **shared** |
+| `mode-interlock` | planning/execution gate | **shared** |
 | `tree-claim` | one operator per checkout | **shared** (one team lead per checkout) |
 | `edit-write-claim-reconciler` | worker WIP file claims | **shared** |
 | `pre-dispatch-{claim,refresh,overlap,preempt,model-check}` | worker dispatch governance | **shared** |

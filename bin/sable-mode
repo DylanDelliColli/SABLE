@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# sable-mode — read/write the cockpit mode-state file.
+# sable-mode — read/write the orchestration mode-state file.
 #
-# Single source of truth for which mode the cockpit session is in. Written by
+# Single source of truth for which mode the orchestration session is in. Written by
 # the /plan and /execute skills; read by the mode interlock hook
-# (cockpit-mode-interlock.sh) and the sable-status dashboard. Uses python3 for
+# (mode-interlock.sh) and the sable-status dashboard. Uses python3 for
 # JSON (always present — it defines the env); deliberately NO jq dependency,
 # which is fragile across conda envs (see SABLE-cav.8).
 #
-# State file (override with SABLE_COCKPIT_STATE for testing):
-#   ~/.claude/sable/state/cockpit-mode.json
+# State file (override with SABLE_MODE_STATE for testing):
+#   ~/.claude/sable/state/mode-state.json
 # Shape:
 #   { "mode": "planning|execution", "since": "<ISO-8601>", "fleet": ["a","b"],
 #     "substage": "framing|research|architecture|test-strategy|decomposition" }
@@ -16,7 +16,7 @@
 #   framing). It is the gated sub-state machine the /plan flow walks and the
 #   interlock reads to block backlog authoring before decomposition.
 #
-# Runtime enable gate: when SABLE_COCKPIT is off/0/false/no (case-insensitive),
+# Runtime enable gate: when SABLE_ORCHESTRATION is off/0/false/no (case-insensitive),
 # `set` refuses (so /plan and /execute cannot flip mode); `get`/`show` still
 # read. Unset (or any other value) = enabled.
 #
@@ -31,11 +31,11 @@
 
 set -eu
 
-STATE="${SABLE_COCKPIT_STATE:-$HOME/.claude/sable/state/cockpit-mode.json}"
+STATE="${SABLE_MODE_STATE:-$HOME/.claude/sable/state/mode-state.json}"
 
 usage() {
     cat <<EOF
-sable-mode — read/write the cockpit mode-state file.
+sable-mode — read/write the orchestration mode-state file.
 
 Usage:
   sable-mode set <planning|execution> [--fleet a,b,c]
@@ -52,15 +52,15 @@ Usage:
   sable-mode --help
 
 State file: ${STATE}
-  (override location with the SABLE_COCKPIT_STATE environment variable)
+  (override location with the SABLE_MODE_STATE environment variable)
 
-Disable at runtime with: SABLE_COCKPIT=off
+Disable at runtime with: SABLE_ORCHESTRATION=off
 EOF
 }
 
-# Runtime enable gate. Disabled when SABLE_COCKPIT is off/0/false/no.
-cockpit_enabled() {
-    case "$(printf '%s' "${SABLE_COCKPIT:-}" | tr '[:upper:]' '[:lower:]')" in
+# Runtime enable gate. Disabled when SABLE_ORCHESTRATION is off/0/false/no.
+orchestration_enabled() {
+    case "$(printf '%s' "${SABLE_ORCHESTRATION:-}" | tr '[:upper:]' '[:lower:]')" in
         off|0|false|no) return 1 ;;
         *) return 0 ;;
     esac
@@ -88,8 +88,8 @@ case "$cmd" in
         cat "$STATE"
         ;;
     set)
-        if ! cockpit_enabled; then
-            printf 'sable-mode: cockpit disabled (SABLE_COCKPIT=%s); unset SABLE_COCKPIT to enable\n' "${SABLE_COCKPIT:-}" >&2
+        if ! orchestration_enabled; then
+            printf 'sable-mode: orchestration disabled (SABLE_ORCHESTRATION=%s); unset SABLE_ORCHESTRATION to enable\n' "${SABLE_ORCHESTRATION:-}" >&2
             exit 3
         fi
         mode="${2:-}"

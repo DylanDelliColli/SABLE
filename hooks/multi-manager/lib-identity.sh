@@ -270,7 +270,7 @@ sable_validate_base_ref() {
 #     do not dispatch).
 #
 # Sets: SABLE_DISPATCH_ACTIVE (0|1), SABLE_DISPATCH_LANE (lowercase name or "").
-# Mode-state path override for tests: SABLE_COCKPIT_MODE_FILE.
+# Mode-state path override for tests: SABLE_MODE_FILE.
 # Internal: extract the "Dispatching-for: <name>" attribution from the dispatch
 # prompt in the hook input. Prints the lowercase lane name, or "$2" (default)
 # when no attribution line exists.
@@ -328,7 +328,7 @@ sable_resolve_dispatch_lane() {
     return 0
   fi
 
-  local mode_file="${SABLE_COCKPIT_MODE_FILE:-${HOME:-}/.claude/sable/state/cockpit-mode.json}"
+  local mode_file="${SABLE_MODE_FILE:-${HOME:-}/.claude/sable/state/mode-state.json}"
   [ -f "$mode_file" ] || return 0
   local mode
   mode=$(MODE_FILE="$mode_file" python3 -c "

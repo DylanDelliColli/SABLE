@@ -129,9 +129,9 @@ agents:
   # Lincoln — the v2 main session (SABLE-uz9.5). One entry, two heritages
   # merged: the original Tier-3 strategist (status, arbitration, strategic
   # conversation) and the cockpit seat (mode-aware fleet launch). The user
-  # talks to Lincoln in ONE window; /plan and /execute (skills/cockpit-plan,
-  # cockpit-execute) flip the mode via bin/sable-mode, and the mode-state file
-  # governs what Lincoln may spawn (cockpit-mode-interlock.sh, Bash + Agent
+  # talks to Lincoln in ONE window; /plan and /execute (skills/sable-plan,
+  # sable-execute) flip the mode via bin/sable-mode, and the mode-state file
+  # governs what Lincoln may spawn (mode-interlock.sh, Bash + Agent
   # legs). Planning mode: walks the gated substages, spawning Tier-2 producers
   # as named subagents (gaudi runs as an inline skill). Execution mode: spawns
   # Optimus/Tarzan as resident manager subagents that dispatch their own workers

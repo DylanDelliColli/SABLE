@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-cockpit-install.sh — tests bin/sable-cockpit-install (SABLE-cav.7).
+# test-cockpit-install.sh — tests bin/sable-orchestration-install (SABLE-cav.7).
 #
 # Verifies: project-default scope (./.claude) + --user scope (~/.claude),
 # idempotent + non-clobbering settings merge, --uninstall, and the
@@ -12,7 +12,7 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-INSTALLER="$REPO/bin/sable-cockpit-install"
+INSTALLER="$REPO/bin/sable-orchestration-install"
 
 PASS=0; FAIL=0; FAIL_NAMES=""
 pass(){ PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -25,7 +25,7 @@ count_interlock(){ python3 -c "
 import json,sys
 d=json.load(open(sys.argv[1]))
 print(sum(1 for b in d.get('hooks',{}).get('PreToolUse',[]) if isinstance(b,dict)
-          for h in b.get('hooks',[]) if 'cockpit-mode-interlock.sh' in h.get('command','')))" "$1" 2>/dev/null || echo ERR; }
+          for h in b.get('hooks',[]) if 'mode-interlock.sh' in h.get('command','')))" "$1" 2>/dev/null || echo ERR; }
 count_in_event(){ python3 -c "
 import json,sys
 d=json.load(open(sys.argv[1])); ev=sys.argv[2]; m=sys.argv[3]
@@ -39,13 +39,13 @@ valid_json(){ python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$1" 2>
 # ---------- project scope (explicit) ----------
 P="$(mktemp -d)"
 out1="$(SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project 2>&1)"
-exists "$P/.claude/skills/plan/SKILL.md"    "project: /plan skill installed"
-exists "$P/.claude/skills/execute/SKILL.md" "project: /execute skill installed"
+exists "$P/.claude/skills/sable-plan/SKILL.md"    "project: /plan skill installed"
+exists "$P/.claude/skills/sable-execute/SKILL.md" "project: /execute skill installed"
 exists "$P/.claude/sable/roles/lincoln.md"  "project: lincoln role installed"
 exists "$P/.claude/sable/layouts/sable.kdl" "project: layout installed"
 exists "$P/.claude/agents-teams/optimus.md" "project: teams agent defs installed (SABLE-amj.8)"
 exists "$P/.claude/agents-teams/chuck.md"   "project: teams chuck def installed (folds into the team)"
-if [ -x "$P/.claude/hooks/multi-manager/cockpit-mode-interlock.sh" ]; then pass "project: interlock hook installed+exec"; else fail "project: interlock hook installed+exec"; fi
+if [ -x "$P/.claude/hooks/multi-manager/mode-interlock.sh" ]; then pass "project: interlock hook installed+exec"; else fail "project: interlock hook installed+exec"; fi
 SET="$P/.claude/settings.local.json"
 exists "$SET" "project: settings.local.json created"
 if valid_json "$SET"; then pass "project: settings is valid JSON"; else fail "project: settings is valid JSON"; fi
@@ -73,18 +73,18 @@ if grep -q 'other-hook.sh' "$SET"; then pass "project: preserves existing hooks"
 # ---------- default scope is project ----------
 P2="$(mktemp -d)"
 SABLE_PROJECT_DIR="$P2" bash "$INSTALLER" >/dev/null 2>&1
-exists "$P2/.claude/skills/plan/SKILL.md" "default (no flag) installs into project ./.claude"
+exists "$P2/.claude/skills/sable-plan/SKILL.md" "default (no flag) installs into project ./.claude"
 
 # ---------- user scope ----------
 U="$(mktemp -d)"
 CLAUDE_USER_DIR="$U/.claude" bash "$INSTALLER" --user >/dev/null 2>&1
-exists "$U/.claude/skills/execute/SKILL.md" "user: skill installed under ~/.claude"
+exists "$U/.claude/skills/sable-execute/SKILL.md" "user: skill installed under ~/.claude"
 exists "$U/.claude/settings.json" "user: settings.json created"
 if [ "$(count_interlock "$U/.claude/settings.json")" = "1" ]; then pass "user: interlock registered once"; else fail "user: interlock registered once"; fi
 
 # ---------- uninstall (project) ----------
 SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --uninstall >/dev/null 2>&1
-if [ ! -e "$P/.claude/skills/plan/SKILL.md" ]; then pass "uninstall removes skills"; else fail "uninstall removes skills"; fi
+if [ ! -e "$P/.claude/skills/sable-plan/SKILL.md" ]; then pass "uninstall removes skills"; else fail "uninstall removes skills"; fi
 if [ ! -e "$P/.claude/sable/agents.yaml" ]; then pass "uninstall removes registry"; else fail "uninstall removes registry"; fi
 if [ ! -e "$P/.claude/agents-teams" ]; then pass "uninstall removes teams agent defs"; else fail "uninstall removes teams agent defs"; fi
 if [ "$(count_interlock "$SET")" = "0" ]; then pass "uninstall de-registers interlock"; else fail "uninstall de-registers interlock" "count=$(count_interlock "$SET")"; fi
@@ -133,7 +133,7 @@ PUSET="$PU/.claude/settings.json"
 if [ "$(count_in_event "$PUSET" SessionStart session-role-anchor.sh)" = "1" ]; then pass "md7: sibling-block dedup keeps identity hook once (SessionStart)"; else fail "md7: sibling-block dedup keeps identity hook once (SessionStart)" "count=$(count_in_event "$PUSET" SessionStart session-role-anchor.sh)"; fi
 if valid_json "$PUSET"; then pass "md7: settings valid after sibling-block dedup"; else fail "md7: settings valid after sibling-block dedup"; fi
 
-# Integration: real `sable-cockpit-install --user` over a realistic pre-seeded
+# Integration: real `sable-orchestration-install --user` over a realistic pre-seeded
 # multi-manager user scope leaves exactly one identity registration per event and
 # one interlock, and preserves the bd prime entries.
 M="$(mktemp -d)"; mkdir -p "$M/.claude"

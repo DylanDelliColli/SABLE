@@ -164,7 +164,7 @@ run_lane_case() {
     [ -n "$env_role" ] && export CLAUDE_AGENT_ROLE="$env_role"
     # Pin mode-file to a nonexistent fixture so the live cockpit state cannot
     # contaminate main-session cases (cf. SABLE-wtv).
-    export SABLE_COCKPIT_MODE_FILE="$FIXTURE_DIR/nonexistent-cockpit-mode.json"
+    export SABLE_MODE_FILE="$FIXTURE_DIR/nonexistent-mode-state.json"
     # shellcheck disable=SC1090
     source "$LIB"
     sable_resolve_dispatch_lane "$json"

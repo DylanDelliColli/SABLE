@@ -32,9 +32,9 @@ sable-mode substage get    # in planning: which staged substage am I in?
 
 The operator flips your mode with the `/plan` and `/execute` skills, which call
 `sable-mode set <mode>` — **mid-conversation, same window; no restart**. The
-`cockpit-mode-interlock.sh` hook (Bash + Agent legs) enforces the boundary
+`mode-interlock.sh` hook (Bash + Agent legs) enforces the boundary
 mechanically: out-of-mode spawns and pushes are blocked (soft override:
-`SABLE_COCKPIT_FORCE=1`, or `--force` on a Bash command). The interlock is a
+`SABLE_ORCHESTRATION_FORCE=1`, or `--force` on a Bash command). The interlock is a
 feature, not an obstacle: it stops you draining a half-formed backlog or
 cluttering an execution session with producers. **Always know your current
 mode** — run `sable-mode get` if unsure.

@@ -78,7 +78,7 @@ Both installers do the same thing:
 
 Both are idempotent and safe to re-run. Useful flags:
 - `bash install.sh --dry-run` — report exactly what would be copied, write nothing.
-- `bash install.sh --cockpit` — also install the **cockpit (multi-manager) tier**
+- `bash install.sh --orchestration` — also install the **cockpit (multi-manager) tier**
   (the one-window manager hooks + `agents.yaml` registry). Foundation adopters
   skip this; climb to it when you're ready for swarm execution (see
   [Climbing to the cockpit](#climbing-to-the-cockpit-advanced) below).
@@ -161,7 +161,7 @@ budget supports parallel agents (see SABLE.md §6).
 
 ```bash
 cd ~/sable
-bash install.sh --cockpit          # or: SABLE_MULTI_MANAGER=1 bash install.sh
+bash install.sh --orchestration          # or: SABLE_ORCHESTRATION=1 bash install.sh
 ```
 
 This adds, on top of the Foundation install:
@@ -171,7 +171,7 @@ This adds, on top of the Foundation install:
 - `~/.claude/sable/agents.yaml` — the agent registry (identities, lanes, inboxes).
 - `~/.claude/skills/` — the SABLE slash commands (`/plan`, `/execute`, `/gaudi`,
   `/columbo`, `/audit-deep-dive`, `/sable-review`), installed by their skill
-  name (so `cockpit-plan` lands as `/plan`).
+  name (so `sable-plan` lands as `/plan`).
 - The named agent definitions are already in `~/.claude/agents/` from the
   Foundation install.
 

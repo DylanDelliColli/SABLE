@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# sable-cockpit-install — install (or uninstall) the cockpit layer.
+# sable-orchestration-install — install (or uninstall) the cockpit layer.
 #
 # Default scope is PROJECT: everything lands in ./.claude (skills, role, layout,
 # registry, interlock hook, identity hook) and the hooks are registered in
@@ -11,11 +11,11 @@
 # out of the box. Only the RUNNING manager swarm + its continuous coordination
 # hooks remain optional (see MULTI-MANAGER-PATTERN.md).
 #
-# Turn the cockpit off at runtime WITHOUT uninstalling: export SABLE_COCKPIT=off
+# Turn the cockpit off at runtime WITHOUT uninstalling: export SABLE_ORCHESTRATION=off
 # (honored mechanically by sable-mode and the interlock hook).
 #
 # Usage:
-#   sable-cockpit-install [--project|--user] [--uninstall] [--help]
+#   sable-orchestration-install [--project|--user] [--uninstall] [--help]
 #
 # Env (mainly for tests):
 #   SABLE_PROJECT_DIR   project root for --project scope (default: $PWD)
@@ -39,7 +39,7 @@ for arg in "${@:-}"; do
         --uninstall) UNINSTALL=1 ;;
         -h|--help)   usage; exit 0 ;;
         "")          ;;
-        *)           echo "sable-cockpit-install: unknown argument '$arg'" >&2; exit 1 ;;
+        *)           echo "sable-orchestration-install: unknown argument '$arg'" >&2; exit 1 ;;
     esac
 done
 
@@ -53,7 +53,7 @@ else
 fi
 SKILLS="$BASE/skills"
 HOOKS_DIR="$BASE/hooks/multi-manager"
-INTERLOCK_DEST="$HOOKS_DIR/cockpit-mode-interlock.sh"
+INTERLOCK_DEST="$HOOKS_DIR/mode-interlock.sh"
 ROLEANCHOR_DEST="$HOOKS_DIR/session-role-anchor.sh"
 
 # Register the cockpit hooks (interlock + identity) idempotently across the
@@ -103,7 +103,7 @@ remove_hooks() {
     SETTINGS_PATH="$1" python3 - <<'PY'
 import json, os
 path = os.environ['SETTINGS_PATH']
-markers = ('cockpit-mode-interlock.sh', 'session-role-anchor.sh')
+markers = ('mode-interlock.sh', 'session-role-anchor.sh')
 if not os.path.exists(path):
     raise SystemExit
 try:
@@ -122,28 +122,28 @@ PY
 }
 
 if [ "$UNINSTALL" = "1" ]; then
-    rm -rf "$SKILLS/plan" "$SKILLS/execute"
+    rm -rf "$SKILLS/sable-plan" "$SKILLS/sable-execute"
     rm -f "$BASE/sable/roles/lincoln.md" "$BASE/sable/roles/cockpit.md" \
           "$BASE/sable/layouts/sable.kdl" \
           "$BASE/sable/agents.yaml" "$INTERLOCK_DEST" "$ROLEANCHOR_DEST"
     rm -rf "$BASE/agents-teams"
     remove_hooks "$SETTINGS"
-    echo "Cockpit uninstalled from $BASE (scope: $SCOPE)."
+    echo "Orchestration layer uninstalled from $BASE (scope: $SCOPE)."
     echo "  (left other hooks and the settings file intact)"
     exit 0
 fi
 
 # Install.
-mkdir -p "$SKILLS/plan" "$SKILLS/execute" "$BASE/sable/roles" "$BASE/sable/layouts" "$HOOKS_DIR"
-cp "$REPO/skills/cockpit-plan/SKILL.md"                   "$SKILLS/plan/SKILL.md"
-cp "$REPO/skills/cockpit-execute/SKILL.md"                "$SKILLS/execute/SKILL.md"
+mkdir -p "$SKILLS/sable-plan" "$SKILLS/sable-execute" "$BASE/sable/roles" "$BASE/sable/layouts" "$HOOKS_DIR"
+cp "$REPO/skills/sable-plan/SKILL.md"                   "$SKILLS/sable-plan/SKILL.md"
+cp "$REPO/skills/sable-execute/SKILL.md"                "$SKILLS/sable-execute/SKILL.md"
 cp "$REPO/templates/multi-manager/roles/lincoln.md"      "$BASE/sable/roles/lincoln.md"
 # v2 (SABLE-uz9.5): the agent is lincoln; remove a stale installed cockpit role
 # so a legacy CLAUDE_AGENT_NAME=cockpit session doesn't anchor outdated content.
 rm -f "$BASE/sable/roles/cockpit.md"
 cp "$REPO/templates/multi-manager/layouts/sable.kdl"     "$BASE/sable/layouts/sable.kdl"
 cp "$REPO/templates/multi-manager/agents.yaml"           "$BASE/sable/agents.yaml"
-cp "$REPO/hooks/multi-manager/cockpit-mode-interlock.sh" "$INTERLOCK_DEST"
+cp "$REPO/hooks/multi-manager/mode-interlock.sh" "$INTERLOCK_DEST"
 cp "$REPO/hooks/multi-manager/session-role-anchor.sh"    "$ROLEANCHOR_DEST"
 chmod +x "$INTERLOCK_DEST" "$ROLEANCHOR_DEST"
 add_hooks "$SETTINGS" "bash $INTERLOCK_DEST" "bash $ROLEANCHOR_DEST"
@@ -166,7 +166,7 @@ echo "  • Registry (agents.yaml) + identity injection (session-role-anchor) in
 echo "    a CLAUDE_AGENT_NAME=lincoln session now adopts roles/lincoln.md at startup."
 echo "  • /plan and /execute become available after you restart the session."
 echo "  • Launch the cockpit:  sable-cockpit"
-echo "  • Disable anytime without uninstalling:  export SABLE_COCKPIT=off"
-echo "  • Uninstall:  sable-cockpit-install --$SCOPE --uninstall"
+echo "  • Disable anytime without uninstalling:  export SABLE_ORCHESTRATION=off"
+echo "  • Uninstall:  sable-orchestration-install --$SCOPE --uninstall"
 echo "  • The running manager swarm (Optimus/Tarzan/Chuck + their coordination"
 echo "    hooks) stays optional — see MULTI-MANAGER-PATTERN.md if you want it."

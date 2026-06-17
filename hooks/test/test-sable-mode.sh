@@ -10,8 +10,8 @@
 #   sable-mode get      Prints the bare mode word; nonzero exit if unset.
 #   sable-mode show     Prints the full JSON; nonzero exit if unset.
 #
-# State file location is overridable via SABLE_COCKPIT_STATE so tests never
-# touch the real ~/.claude/sable/state/cockpit-mode.json.
+# State file location is overridable via SABLE_MODE_STATE so tests never
+# touch the real ~/.claude/sable/state/mode-state.json.
 #
 # Run with:
 #   bash hooks/test/test-sable-mode.sh
@@ -51,8 +51,8 @@ assert_zero() {
 
 # fresh, nonexistent state path per test
 fresh_state() {
-  SABLE_COCKPIT_STATE="$(mktemp -u)"
-  export SABLE_COCKPIT_STATE
+  SABLE_MODE_STATE="$(mktemp -u)"
+  export SABLE_MODE_STATE
 }
 
 # JSON field reader (python3 — keeps the test jq-free, matching sable-mode; SABLE-cav.8)
@@ -93,7 +93,7 @@ fi
 fresh_state
 "$MODE_BIN" set bogus >/dev/null 2>&1
 assert_nonzero "set bogus exits nonzero" "$?"
-if [ ! -f "$SABLE_COCKPIT_STATE" ]; then
+if [ ! -f "$SABLE_MODE_STATE" ]; then
   pass "set bogus does not write state file"
 else
   fail "set bogus does not write state file" "file was created"
@@ -120,30 +120,30 @@ fresh_state
 "$MODE_BIN" set execution >/dev/null 2>&1
 assert_eq "second set overwrites first" "execution" "$("$MODE_BIN" get 2>/dev/null)"
 
-# ---------- runtime env gate (SABLE_COCKPIT) ----------
+# ---------- runtime env gate (SABLE_ORCHESTRATION) ----------
 # Disabled: `set` refuses (so /plan /execute can't flip mode) and writes nothing.
 fresh_state
-SABLE_COCKPIT=off "$MODE_BIN" set planning >/dev/null 2>&1
-assert_nonzero "set refused when SABLE_COCKPIT=off" "$?"
-if [ ! -f "$SABLE_COCKPIT_STATE" ]; then pass "disabled set writes nothing"; else fail "disabled set writes nothing" "file created"; fi
+SABLE_ORCHESTRATION=off "$MODE_BIN" set planning >/dev/null 2>&1
+assert_nonzero "set refused when SABLE_ORCHESTRATION=off" "$?"
+if [ ! -f "$SABLE_MODE_STATE" ]; then pass "disabled set writes nothing"; else fail "disabled set writes nothing" "file created"; fi
 
 fresh_state
-SABLE_COCKPIT=0 "$MODE_BIN" set execution >/dev/null 2>&1
-assert_nonzero "set refused when SABLE_COCKPIT=0" "$?"
+SABLE_ORCHESTRATION=0 "$MODE_BIN" set execution >/dev/null 2>&1
+assert_nonzero "set refused when SABLE_ORCHESTRATION=0" "$?"
 
 fresh_state
-SABLE_COCKPIT=FALSE "$MODE_BIN" set planning >/dev/null 2>&1
+SABLE_ORCHESTRATION=FALSE "$MODE_BIN" set planning >/dev/null 2>&1
 assert_nonzero "gate is case-insensitive (FALSE)" "$?"
 
 # Reading is never gated — get/show still work when disabled.
 fresh_state
 "$MODE_BIN" set planning >/dev/null 2>&1
-assert_eq "get works when disabled" "planning" "$(SABLE_COCKPIT=off "$MODE_BIN" get 2>/dev/null)"
+assert_eq "get works when disabled" "planning" "$(SABLE_ORCHESTRATION=off "$MODE_BIN" get 2>/dev/null)"
 
 # A non-disabling value still allows set.
 fresh_state
-SABLE_COCKPIT=on "$MODE_BIN" set execution >/dev/null 2>&1
-assert_eq "set allowed when SABLE_COCKPIT=on" "execution" "$("$MODE_BIN" get 2>/dev/null)"
+SABLE_ORCHESTRATION=on "$MODE_BIN" set execution >/dev/null 2>&1
+assert_eq "set allowed when SABLE_ORCHESTRATION=on" "execution" "$("$MODE_BIN" get 2>/dev/null)"
 
 # ---------- substage axis (planning sub-state machine) ----------
 # Ordered substages: framing -> research -> architecture -> test-strategy -> decomposition.

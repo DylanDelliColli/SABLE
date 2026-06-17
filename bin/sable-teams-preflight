@@ -4,8 +4,8 @@
 # fix on stderr if SABLE_TEAMS is requested but the Claude Code experimental
 # Agent-Teams flag is absent.
 #
-# Topology selection is an env var (matching SABLE_MULTI_MANAGER / SABLE_COCKPIT
-# convention) and is orthogonal to planning/execution MODE (cockpit-mode.json).
+# Topology selection is an env var (matching SABLE_ORCHESTRATION / SABLE_ORCHESTRATION
+# convention) and is orthogonal to planning/execution MODE (mode-state.json).
 #
 # Usage:
 #   sable-teams-preflight        # -> "nested" | "teams" | (exit 1 + stderr fix)

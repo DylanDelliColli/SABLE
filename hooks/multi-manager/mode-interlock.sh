@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cockpit-mode-interlock.sh — Enforce the cockpit's planning/execution boundary.
+# mode-interlock.sh — Enforce the cockpit's planning/execution boundary.
 # Trigger: PreToolUse:Bash AND PreToolUse:Agent | Timeout: 3000ms
 #
 # This is the mechanical guarantee that makes the cockpit's two modes real
@@ -21,14 +21,14 @@
 #                    planning. (Gaudi is a skill in v2 — skill invocations are
 #                    not Agent spawns and are not governed here.)
 #
-# Soft override: a Bash command carrying `--force`, or env SABLE_COCKPIT_FORCE=1,
+# Soft override: a Bash command carrying `--force`, or env SABLE_ORCHESTRATION_FORCE=1,
 # is always allowed. The interlock is a guardrail, not a wall.
 #
 # No-op unless CLAUDE_AGENT_NAME is lincoln (v2) or cockpit (legacy/transition).
 # No-op in subagent contexts (agent_id present) so dispatched agents are never
 # governed by it. No-op when no mode is set. Mode is read from the mode-state
-# file that bin/sable-mode owns (SABLE_COCKPIT_STATE or
-# ~/.claude/sable/state/cockpit-mode.json), preferring the helper when
+# file that bin/sable-mode owns (SABLE_MODE_STATE or
+# ~/.claude/sable/state/mode-state.json), preferring the helper when
 # resolvable.
 
 set -uo pipefail
@@ -47,7 +47,7 @@ case "${CLAUDE_AGENT_NAME:-}" in
 esac
 
 # Runtime enable gate — no-op when the cockpit is disabled (SABLE-cav.7).
-case "$(printf '%s' "${SABLE_COCKPIT:-}" | tr '[:upper:]' '[:lower:]')" in
+case "$(printf '%s' "${SABLE_ORCHESTRATION:-}" | tr '[:upper:]' '[:lower:]')" in
     off|0|false|no) exit 0 ;;
 esac
 
@@ -62,7 +62,7 @@ except Exception:
 [ -n "$AGENT_ID" ] && exit 0
 
 # Env opt-out applies to every leg.
-[ "${SABLE_COCKPIT_FORCE:-}" = "1" ] && exit 0
+[ "${SABLE_ORCHESTRATION_FORCE:-}" = "1" ] && exit 0
 
 TOOL_NAME="$(printf '%s' "$INPUT" | python3 -c "
 import json, sys
@@ -75,7 +75,7 @@ except Exception:
 # Resolve current mode. Prefer the helper; fall back to reading the file.
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 MODE_BIN="$HOOK_DIR/../../bin/sable-mode"
-STATE="${SABLE_COCKPIT_STATE:-$HOME/.claude/sable/state/cockpit-mode.json}"
+STATE="${SABLE_MODE_STATE:-$HOME/.claude/sable/state/mode-state.json}"
 
 MODE=""
 if [ -x "$MODE_BIN" ]; then
@@ -118,14 +118,14 @@ except Exception:
     planning)
       case "$SUBTYPE" in
         optimus|tarzan|chuck)
-          deny "Cockpit is in PLANNING mode — spawning execution managers (optimus/tarzan/chuck) is blocked. Run /execute to drain the pool, or set SABLE_COCKPIT_FORCE=1 to override."
+          deny "Orchestration is in PLANNING mode — spawning execution managers (optimus/tarzan/chuck) is blocked. Run /execute to drain the pool, or set SABLE_ORCHESTRATION_FORCE=1 to override."
           ;;
       esac
       ;;
     execution)
       case "$SUBTYPE" in
         sherlock|victor|columbo)
-          deny "Cockpit is in EXECUTION mode — spawning planning-only producers (sherlock/victor/columbo) is blocked. Run /plan for a planning session, or set SABLE_COCKPIT_FORCE=1 to override."
+          deny "Orchestration is in EXECUTION mode — spawning planning-only producers (sherlock/victor/columbo) is blocked. Run /plan for a planning session, or set SABLE_ORCHESTRATION_FORCE=1 to override."
           ;;
       esac
       ;;
@@ -184,21 +184,21 @@ get_substage() {
 case "$MODE" in
   planning)
     if launches 'optimus|tarzan|chuck'; then
-      deny "Cockpit is in PLANNING mode — launching execution managers (optimus/tarzan/chuck) is blocked. Run /execute to drain the pool, or append --force to override."
+      deny "Orchestration is in PLANNING mode — launching execution managers (optimus/tarzan/chuck) is blocked. Run /execute to drain the pool, or append --force to override."
     fi
     if printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])git[[:space:]]+push([[:space:]]|$)'; then
-      deny "Cockpit is in PLANNING mode — code 'git push' is blocked so you don't ship from a half-formed backlog. Run /execute first, or append --force to override."
+      deny "Orchestration is in PLANNING mode — code 'git push' is blocked so you don't ship from a half-formed backlog. Run /execute first, or append --force to override."
     fi
     if authors_backlog; then
       SUBSTAGE="$(get_substage)"
       if [ "$SUBSTAGE" != "decomposition" ]; then
-        deny "Cockpit is in PLANNING mode at substage '${SUBSTAGE:-unset}' — populating the implementation backlog (bd create --parent/--graph/--file) is blocked until substage=decomposition. The bare epic shell (bd create --type=epic) is allowed now as the planning home; producers attach their review to it. Walk the staged flow (framing → research → architecture → test-strategy → decomposition), advancing with 'sable-mode substage advance' after each human sign-off. Append --force to override."
+        deny "Orchestration is in PLANNING mode at substage '${SUBSTAGE:-unset}' — populating the implementation backlog (bd create --parent/--graph/--file) is blocked until substage=decomposition. The bare epic shell (bd create --type=epic) is allowed now as the planning home; producers attach their review to it. Walk the staged flow (framing → research → architecture → test-strategy → decomposition), advancing with 'sable-mode substage advance' after each human sign-off. Append --force to override."
       fi
     fi
     ;;
   execution)
     if launches 'sherlock|victor|columbo|gaudi'; then
-      deny "Cockpit is in EXECUTION mode — launching planning-only producers (sherlock/victor/columbo/gaudi) from the cockpit is blocked. Run /plan for a planning session, or append --force to override."
+      deny "Orchestration is in EXECUTION mode — launching planning-only producers (sherlock/victor/columbo/gaudi) from the cockpit is blocked. Run /plan for a planning session, or append --force to override."
     fi
     ;;
 esac

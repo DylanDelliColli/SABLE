@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test-cockpit-skills.sh — Integration test for the /plan and /execute mode-flip
-# skills (SABLE-cav.1 acceptance: "/plan writes cockpit-mode.json with
+# skills (SABLE-cav.1 acceptance: "/plan writes mode-state.json with
 # mode=planning and loads the planning persona; /execute writes mode=execution
 # and loads the overseer persona").
 #
@@ -17,8 +17,8 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-PLAN_SKILL="$REPO/skills/cockpit-plan/SKILL.md"
-EXEC_SKILL="$REPO/skills/cockpit-execute/SKILL.md"
+PLAN_SKILL="$REPO/skills/sable-plan/SKILL.md"
+EXEC_SKILL="$REPO/skills/sable-execute/SKILL.md"
 MODE_BIN="$REPO/bin/sable-mode"
 
 PASS=0
@@ -42,8 +42,8 @@ assert_file "$PLAN_SKILL" "/plan skill file exists"
 assert_file "$EXEC_SKILL" "/execute skill file exists"
 
 # 2. invocation name in frontmatter
-assert_grep "$PLAN_SKILL" "name: plan"    "/plan declares name: plan"
-assert_grep "$EXEC_SKILL" "name: execute" "/execute declares name: execute"
+assert_grep "$PLAN_SKILL" "name: sable-plan"    "/plan declares name: sable-plan"
+assert_grep "$EXEC_SKILL" "name: sable-execute" "/execute declares name: sable-execute"
 
 # 3. wired to the shared mechanism
 assert_grep "$PLAN_SKILL" "sable-mode set planning"  "/plan invokes sable-mode set planning"
@@ -61,12 +61,12 @@ assert_grep "$EXEC_SKILL" "substage"      "/execute checks the planning substage
 
 # 5. end-to-end mechanism: the documented command flips state correctly
 STATE_TMP="$(mktemp -u)"
-SABLE_COCKPIT_STATE="$STATE_TMP" "$MODE_BIN" set planning --fleet sherlock,columbo,gaudi,victor >/dev/null 2>&1
-assert_planning="$(SABLE_COCKPIT_STATE="$STATE_TMP" "$MODE_BIN" get 2>/dev/null)"
+SABLE_MODE_STATE="$STATE_TMP" "$MODE_BIN" set planning --fleet sherlock,columbo,gaudi,victor >/dev/null 2>&1
+assert_planning="$(SABLE_MODE_STATE="$STATE_TMP" "$MODE_BIN" get 2>/dev/null)"
 if [ "$assert_planning" = "planning" ]; then pass "documented /plan mechanism yields mode=planning"; else fail "documented /plan mechanism yields mode=planning" "got '$assert_planning'"; fi
 
-SABLE_COCKPIT_STATE="$STATE_TMP" "$MODE_BIN" set execution --fleet optimus,tarzan,chuck >/dev/null 2>&1
-assert_exec="$(SABLE_COCKPIT_STATE="$STATE_TMP" "$MODE_BIN" get 2>/dev/null)"
+SABLE_MODE_STATE="$STATE_TMP" "$MODE_BIN" set execution --fleet optimus,tarzan,chuck >/dev/null 2>&1
+assert_exec="$(SABLE_MODE_STATE="$STATE_TMP" "$MODE_BIN" get 2>/dev/null)"
 if [ "$assert_exec" = "execution" ]; then pass "documented /execute mechanism yields mode=execution"; else fail "documented /execute mechanism yields mode=execution" "got '$assert_exec'"; fi
 rm -f "$STATE_TMP"
 
@@ -89,8 +89,8 @@ assert_grep "$PLAN_SKILL" "interlock"                    "/plan references the i
 
 # 8. end-to-end: documented step-1 command initializes substage=framing
 STATE_TMP2="$(mktemp -u)"
-SABLE_COCKPIT_STATE="$STATE_TMP2" "$MODE_BIN" set planning --fleet sherlock,columbo,gaudi,victor >/dev/null 2>&1
-init_sub="$(SABLE_COCKPIT_STATE="$STATE_TMP2" "$MODE_BIN" substage get 2>/dev/null)"
+SABLE_MODE_STATE="$STATE_TMP2" "$MODE_BIN" set planning --fleet sherlock,columbo,gaudi,victor >/dev/null 2>&1
+init_sub="$(SABLE_MODE_STATE="$STATE_TMP2" "$MODE_BIN" substage get 2>/dev/null)"
 if [ "$init_sub" = "framing" ]; then pass "documented /plan step 1 initializes substage=framing"; else fail "documented /plan step 1 initializes substage=framing" "got '$init_sub'"; fi
 rm -f "$STATE_TMP2"
 

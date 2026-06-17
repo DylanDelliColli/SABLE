@@ -3,7 +3,7 @@
 # implementation bead SABLE-ppy).
 #
 # install.sh absorbs the cockpit layer (roles, agents.yaml, /plan + /execute
-# skills, interlock + role-anchor hooks); bin/sable-cockpit-install becomes a
+# skills, interlock + role-anchor hooks); bin/sable-orchestration-install becomes a
 # deprecation stub; the v1 Zellij surface (sable-cockpit, sable-status,
 # sable.kdl) is deleted outright; a CC>=2.1.172 version-floor warning lands.
 #
@@ -27,7 +27,7 @@ todo() { TODO=$((TODO+1)); echo "TODO (unimplemented case): $1"; }
 todo "fresh install lands the full Lincoln layer in scratch HOME"
 
 # Why: duplicate hook entries double-fire every PreToolUse; the python merge
-# proven in sable-cockpit-install add_hooks must survive the move.
+# proven in sable-orchestration-install add_hooks must survive the move.
 todo "second run is idempotent: hooks registered exactly once"
 
 # Why: install must merge, not overwrite — wiping a user's own hooks is the
@@ -39,7 +39,7 @@ todo "pre-existing user settings survive the merge (non-clobber)"
 todo "version floor: claude below 2.1.172 warns, at/above stays silent, absent does not crash"
 
 # Why: a stub that silently succeeds forks two divergent install paths.
-todo "deprecation stub: sable-cockpit-install refuses with pointer"
+todo "deprecation stub: sable-orchestration-install refuses with pointer"
 
 # Why: the deletion boundary is precise — Zellij viewer dies, sable-mode and
 # the state machinery survive; overshooting the delete bricks the interlock.

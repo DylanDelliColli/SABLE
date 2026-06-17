@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# test-cockpit-mode-interlock.sh — Unit+integration tests for
-# cockpit-mode-interlock.sh, the PreToolUse:Bash guard that makes the cockpit's
+# test-mode-interlock.sh — Unit+integration tests for
+# mode-interlock.sh, the PreToolUse:Bash guard that makes the cockpit's
 # planning/execution modes a mechanical guarantee rather than advisory persona.
 #
 # Contract:
@@ -11,16 +11,16 @@
 #   - EXECUTION mode: deny spawning planning-only producers
 #     (sherlock/victor/columbo/gaudi) from the cockpit.
 #   - Soft override: allow when the command carries --force or env
-#     SABLE_COCKPIT_FORCE=1.
+#     SABLE_ORCHESTRATION_FORCE=1.
 #   - No mode set → allow (nothing to enforce).
 #
 # Run with:
-#   bash hooks/test/test-cockpit-mode-interlock.sh
+#   bash hooks/test/test-mode-interlock.sh
 
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-HOOK="$REPO/hooks/multi-manager/cockpit-mode-interlock.sh"
+HOOK="$REPO/hooks/multi-manager/mode-interlock.sh"
 MODE_BIN="$REPO/bin/sable-mode"
 
 if [ ! -x "$HOOK" ]; then
@@ -35,12 +35,12 @@ pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 
 # Shared temp state; set mode per test group via the real helper.
-SABLE_COCKPIT_STATE="$(mktemp -u)"
-export SABLE_COCKPIT_STATE
-trap 'rm -f "$SABLE_COCKPIT_STATE"' EXIT
+SABLE_MODE_STATE="$(mktemp -u)"
+export SABLE_MODE_STATE
+trap 'rm -f "$SABLE_MODE_STATE"' EXIT
 
 set_mode() { "$MODE_BIN" set "$1" >/dev/null 2>&1; }
-clear_mode() { rm -f "$SABLE_COCKPIT_STATE"; }
+clear_mode() { rm -f "$SABLE_MODE_STATE"; }
 
 # run_hook <command> [agent_id] → stdout
 run_hook() {
@@ -67,7 +67,7 @@ assert_allow() {
 
 # Default identity: the cockpit.
 export CLAUDE_AGENT_NAME=cockpit
-unset SABLE_COCKPIT_FORCE 2>/dev/null || true
+unset SABLE_ORCHESTRATION_FORCE 2>/dev/null || true
 
 # ---------- PLANNING mode ----------
 set_mode planning
@@ -84,8 +84,8 @@ assert_allow "planning allows bd commands"    'bd ready'
 
 # Soft override
 assert_allow "planning --force allows manager" 'CLAUDE_AGENT_NAME=optimus claude --force'
-out_env="$(printf '%s' '{"tool_input":{"command":"CLAUDE_AGENT_NAME=optimus claude"}}' | SABLE_COCKPIT_FORCE=1 bash "$HOOK" 2>/dev/null)"
-if is_deny "$out_env"; then fail "planning SABLE_COCKPIT_FORCE=1 allows manager" "got deny"; else pass "planning SABLE_COCKPIT_FORCE=1 allows manager"; fi
+out_env="$(printf '%s' '{"tool_input":{"command":"CLAUDE_AGENT_NAME=optimus claude"}}' | SABLE_ORCHESTRATION_FORCE=1 bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_env"; then fail "planning SABLE_ORCHESTRATION_FORCE=1 allows manager" "got deny"; else pass "planning SABLE_ORCHESTRATION_FORCE=1 allows manager"; fi
 
 # ---------- PLANNING substage gate (backlog population) ----------
 # The cockpit may stand up the BARE epic shell early (planning home for
@@ -153,12 +153,12 @@ if is_deny "$out_unset"; then fail "no-op when agent name unset" "got deny"; els
 clear_mode
 assert_allow "no mode set allows everything" 'CLAUDE_AGENT_NAME=optimus claude'
 
-# ---------- runtime enable gate (SABLE_COCKPIT) ----------
+# ---------- runtime enable gate (SABLE_ORCHESTRATION) ----------
 # In planning mode a manager spawn would normally be denied; with the cockpit
 # disabled the interlock must no-op entirely (SABLE-cav.7).
 set_mode planning
-out_disabled="$(printf '%s' '{"tool_input":{"command":"CLAUDE_AGENT_NAME=optimus claude"}}' | SABLE_COCKPIT=off bash "$HOOK" 2>/dev/null)"
-if is_deny "$out_disabled"; then fail "SABLE_COCKPIT=off no-ops the interlock" "got deny"; else pass "SABLE_COCKPIT=off no-ops the interlock"; fi
+out_disabled="$(printf '%s' '{"tool_input":{"command":"CLAUDE_AGENT_NAME=optimus claude"}}' | SABLE_ORCHESTRATION=off bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_disabled"; then fail "SABLE_ORCHESTRATION=off no-ops the interlock" "got deny"; else pass "SABLE_ORCHESTRATION=off no-ops the interlock"; fi
 
 # ---------- v2: lincoln identity + Agent-tool leg (SABLE-uz9.5) ----------
 
@@ -225,7 +225,7 @@ set_mode planning
 # ---------- settings-snippet registration ----------
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 if jq -e . "$SNIPPET" >/dev/null 2>&1; then pass "settings-snippet.json is valid JSON"; else fail "settings-snippet.json is valid JSON"; fi
-if grep -q 'cockpit-mode-interlock.sh' "$SNIPPET"; then pass "interlock registered in settings-snippet.json"; else fail "interlock registered in settings-snippet.json"; fi
+if grep -q 'mode-interlock.sh' "$SNIPPET"; then pass "interlock registered in settings-snippet.json"; else fail "interlock registered in settings-snippet.json"; fi
 
 # ---------- BrokenPipeError regression (SABLE-dc0) ----------
 # Exercises the two early-exit paths (non-governed identity, subagent context)
@@ -256,7 +256,7 @@ import json,sys
 d={\"tool_name\":\"Agent\",\"tool_input\":{\"subagent_type\":sys.argv[1],\"prompt\":\"work\",\"description\":\"spawn\"}}
 if len(sys.argv)>2 and sys.argv[2]: d[\"agent_id\"]=sys.argv[2]
 print(json.dumps(d))
-" "$@"; }; SABLE_COCKPIT_STATE="'"$SABLE_COCKPIT_STATE"'" agent_json sherlock sub-9 | CLAUDE_AGENT_NAME=lincoln bash "'"$HOOK"'" '
+" "$@"; }; SABLE_MODE_STATE="'"$SABLE_MODE_STATE"'" agent_json sherlock sub-9 | CLAUDE_AGENT_NAME=lincoln bash "'"$HOOK"'" '
 
 echo
 echo "=========================================="

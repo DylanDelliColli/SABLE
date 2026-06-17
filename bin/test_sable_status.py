@@ -127,9 +127,9 @@ def write(path: Path, obj) -> str:
 NOW = 1780334200
 with tempfile.TemporaryDirectory() as d:
     dd = Path(d)
-    state = dd / "cockpit-mode.json"
+    state = dd / "mode-state.json"
     subprocess.run([str(MODE_BIN), "set", "execution", "--fleet", "optimus,tarzan,chuck"],
-                   env=dict(os.environ, SABLE_COCKPIT_STATE=str(state)), check=True,
+                   env=dict(os.environ, SABLE_MODE_STATE=str(state)), check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     fixture = write(dd / "fx.json", {
@@ -146,7 +146,7 @@ with tempfile.TemporaryDirectory() as d:
         "now": NOW,
     })
 
-    snap = ss.gather_snapshot(env=dict(os.environ, SABLE_COCKPIT_STATE=str(state),
+    snap = ss.gather_snapshot(env=dict(os.environ, SABLE_MODE_STATE=str(state),
                                        SABLE_STATUS_FIXTURE=fixture))
     check("gather mode", snap["mode"] == "execution", f"got {snap['mode']}")
     check("gather ready", snap["pool"]["ready"] == 9, f"got {snap['pool']['ready']}")
@@ -163,7 +163,7 @@ with tempfile.TemporaryDirectory() as d:
 
 def run_once(state_path: Path, fixture_path: Path) -> str:
     res = subprocess.run([sys.executable, str(STATUS_PATH), "--once"],
-                         env=dict(os.environ, SABLE_COCKPIT_STATE=str(state_path),
+                         env=dict(os.environ, SABLE_MODE_STATE=str(state_path),
                                   SABLE_STATUS_FIXTURE=str(fixture_path)),
                          capture_output=True, text=True)
     return res.stdout + res.stderr
@@ -171,9 +171,9 @@ def run_once(state_path: Path, fixture_path: Path) -> str:
 
 with tempfile.TemporaryDirectory() as d:
     dd = Path(d)
-    state = dd / "cockpit-mode.json"
+    state = dd / "mode-state.json"
     subprocess.run([str(MODE_BIN), "set", "execution"],
-                   env=dict(os.environ, SABLE_COCKPIT_STATE=str(state)), check=True,
+                   env=dict(os.environ, SABLE_MODE_STATE=str(state)), check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     fx = Path(write(dd / "exec.json", {
         "ready": [{"id": f"R{i}"} for i in range(9)],

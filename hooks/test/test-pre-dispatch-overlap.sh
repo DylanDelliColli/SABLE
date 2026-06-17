@@ -45,7 +45,7 @@ agents:
 YAML
 
 # Execution-mode fixture (unused by the subagent path, set for hermeticity so
-# the live cockpit-mode.json can never leak in — cf. SABLE-wtv).
+# the live mode-state.json can never leak in — cf. SABLE-wtv).
 EXEC_MODE="$FIXTURE_DIR/mode-exec.json"
 echo '{"mode":"execution","since":"2026-06-15"}' > "$EXEC_MODE"
 NONEXISTENT_MODE="$FIXTURE_DIR/mode-absent.json"
@@ -88,7 +88,7 @@ run_hook() {
   printf '%s' "$1" | \
     env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE \
         SABLE_AGENTS_YAML="$AGENTS_YAML" \
-        SABLE_COCKPIT_MODE_FILE="$NONEXISTENT_MODE" \
+        SABLE_MODE_FILE="$NONEXISTENT_MODE" \
         OVERLAP_FILE="$2" \
         PATH="$STUB_DIR:$PATH" \
         bash "$HOOK" 2>/dev/null

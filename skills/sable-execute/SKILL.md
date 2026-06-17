@@ -1,8 +1,8 @@
 ---
-name: execute
+name: sable-execute
 description: |
-  Flip the SABLE cockpit into EXECUTION mode — drain the bead pool. Writes the
-  cockpit mode-state file via `sable-mode set execution`, spawns Optimus and
+  Flip SABLE into EXECUTION mode — drain the bead pool. Writes the
+  mode-state file via `sable-mode set execution`, spawns Optimus and
   Tarzan as resident manager subagents that dispatch their OWN workers and push
   their own approved work, and reminds the operator to open the Chuck terminal.
   In execution mode the interlock hook blocks spawning planning-only producers
@@ -52,10 +52,10 @@ Run exactly one command:
 sable-mode set execution --fleet optimus,tarzan
 ```
 
-This writes `~/.claude/sable/state/cockpit-mode.json`. From this point the
-`cockpit-mode-interlock.sh` hook is in execution posture: spawning planning-only
+This writes `~/.claude/sable/state/mode-state.json`. From this point the
+`mode-interlock.sh` hook is in execution posture: spawning planning-only
 producers (sherlock / victor / columbo) is blocked on both the Agent and Bash
-legs (soft — `SABLE_COCKPIT_FORCE=1` / `--force` overrides). Mode flips are
+legs (soft — `SABLE_ORCHESTRATION_FORCE=1` / `--force` overrides). Mode flips are
 mid-conversation; no restart.
 
 ## 2. Choose the dispatch topology

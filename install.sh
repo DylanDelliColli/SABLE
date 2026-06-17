@@ -22,16 +22,16 @@ SKILLS_DST="${CLAUDE_DIR}/skills"
 
 # --- CLI flags (SABLE-106) ---
 DRY_RUN=0
-COCKPIT=0
-[ "${SABLE_MULTI_MANAGER:-}" = "1" ] && COCKPIT=1
+ORCHESTRATION=0
+[ "${SABLE_ORCHESTRATION:-}" = "1" ] && ORCHESTRATION=1
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
-        --cockpit) COCKPIT=1 ;;
+        --orchestration) ORCHESTRATION=1 ;;
         -h|--help)
-            echo "Usage: install.sh [--cockpit] [--dry-run]"
-            echo "  --cockpit   also install the multi-manager cockpit tier"
-            echo "              (hooks/multi-manager + agents.yaml; or SABLE_MULTI_MANAGER=1)"
+            echo "Usage: install.sh [--orchestration] [--dry-run]"
+            echo "  --orchestration   also install the multi-manager Orchestration tier"
+            echo "              (hooks/multi-manager + agents.yaml; or SABLE_ORCHESTRATION=1)"
             echo "  --dry-run   report what would be copied; write nothing"
             exit 0 ;;
     esac
@@ -67,7 +67,7 @@ bold "SABLE installer"
 printf 'OS:         %s\n' "${OS_NAME}"
 printf 'Repo:       %s\n' "${REPO_DIR}"
 printf 'Target dir: %s\n' "${CLAUDE_DIR}"
-printf 'Cockpit:    %s\n\n' "$([ "$COCKPIT" = "1" ] && echo "yes (multi-manager tier)" || echo "no (Foundation tier; pass --cockpit to add)")"
+printf 'Orchestration:    %s\n\n' "$([ "$ORCHESTRATION" = "1" ] && echo "yes (multi-manager tier)" || echo "no (Foundation tier; pass --orchestration to add)")"
 [ "$DRY_RUN" = "1" ] && { yellow "DRY RUN — no files will be written."; echo; }
 
 if [ "${OS_NAME}" = "Unknown" ]; then
@@ -163,10 +163,10 @@ else
 fi
 echo
 
-# 5. Install the cockpit (multi-manager) tier — gated so Foundation adopters opt in (SABLE-106)
-bold "Step 5/7: Install cockpit (multi-manager) extensions"
-if [ "$COCKPIT" != "1" ]; then
-    yellow "  Skipped — Foundation tier. Re-run with --cockpit (or SABLE_MULTI_MANAGER=1) to"
+# 5. Install the Orchestration (multi-manager) tier — gated so Foundation adopters opt in (SABLE-106)
+bold "Step 5/7: Install Orchestration (multi-manager) extensions"
+if [ "$ORCHESTRATION" != "1" ]; then
+    yellow "  Skipped — Foundation tier. Re-run with --orchestration (or SABLE_ORCHESTRATION=1) to"
     yellow "  install the one-window manager hooks + agents.yaml registry."
 else
     if [ -d "${MM_HOOKS_SRC}" ]; then
@@ -176,7 +176,7 @@ else
             copy_file "${hook}" "${MM_HOOKS_DST}/$(basename "${hook}")" "multi-manager/$(basename "${hook}")"
         done
     else
-        yellow "  hooks/multi-manager/ not found — skipping cockpit hooks"
+        yellow "  hooks/multi-manager/ not found — skipping Orchestration hooks"
     fi
     if [ -f "${AGENTS_YAML_SRC}" ]; then
         make_dir "${SABLE_DST}"
@@ -190,7 +190,7 @@ else
         yellow "  templates/multi-manager/agents.yaml not found — skipping registry"
     fi
     # Skills (slash commands) — installed by their frontmatter 'name:' (the repo
-    # dir may differ, e.g. cockpit-plan -> plan), with all sibling files.
+    # dir may differ, e.g. sable-plan -> plan), with all sibling files.
     if [ -d "${SKILLS_SRC}" ]; then
         for skdir in "${SKILLS_SRC}"/*/; do
             [ -f "${skdir}SKILL.md" ] || continue
@@ -204,7 +204,7 @@ else
     else
         yellow "  skills/ not found — skipping skills install"
     fi
-    [ "$DRY_RUN" = "1" ] || green "  Cockpit tier installed. Add the multi-manager hook block (printed below) to settings.json."
+    [ "$DRY_RUN" = "1" ] || green "  Orchestration tier installed. Add the multi-manager hook block (printed below) to settings.json."
 fi
 echo
 
@@ -281,12 +281,12 @@ cat <<EOF
 EOF
 echo
 
-if [ "$COCKPIT" = "1" ]; then
-    bold "Cockpit (multi-manager) hook block"
+if [ "$ORCHESTRATION" = "1" ]; then
+    bold "Orchestration (multi-manager) hook block"
     echo "ALSO merge the multi-manager hook entries into ${SETTINGS_FILE}. The canonical"
     echo "block is committed at:"
     echo "    ${TEMPLATE_DIR}/multi-manager/settings-snippet.json"
-    echo "It registers the pre-dispatch governance (PreToolUse:Agent), the cockpit-mode"
+    echo "It registers the pre-dispatch governance (PreToolUse:Agent), the mode"
     echo "interlock + tree-claim + pre-push gate (PreToolUse:Bash), the claim reconciler"
     echo "(PreToolUse:Edit|Write), and the post-push notify (PostToolUse:Bash)."
     echo
@@ -298,8 +298,8 @@ echo "Next steps:"
 echo "  1. Paste the hook block(s) above into ${SETTINGS_FILE} (merge with existing config)."
 echo "  2. In your project: bd init && bd hooks install"
 echo "  3. Agent definitions are now in ${CLAUDE_DIR}/agents/ — restart Claude Code for them to take effect."
-if [ "$COCKPIT" = "1" ]; then
-    echo "  4. Cockpit installed: ${MM_HOOKS_DST}/ + ${SABLE_DST}/agents.yaml + ${SKILLS_DST}/ skills. Verify:"
+if [ "$ORCHESTRATION" = "1" ]; then
+    echo "  4. Orchestration installed: ${MM_HOOKS_DST}/ + ${SABLE_DST}/agents.yaml + ${SKILLS_DST}/ skills. Verify:"
     echo "       ls ${MM_HOOKS_DST} && ls ${SKILLS_DST} && head -1 ${SABLE_DST}/agents.yaml"
     echo "     RESTART Claude Code so the /plan /execute /gaudi /columbo slash commands register."
     echo "     Chuck stays a terminal — add the env-var alias from QUICKSTART.md if you run merge-queue."

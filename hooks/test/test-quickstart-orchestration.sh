@@ -16,8 +16,8 @@ has() { if grep -qiF -- "$2" "$DOC" 2>/dev/null; then pass "$1"; else fail "$1" 
 
 [ -f "$DOC" ] || { echo "FAIL: $DOC missing"; exit 2; }
 
-has "documents the --cockpit install flag"        "install.sh --cockpit"
-has "mentions the SABLE_MULTI_MANAGER env toggle"  "SABLE_MULTI_MANAGER=1"
+has "documents the --orchestration install flag"        "install.sh --orchestration"
+has "mentions the SABLE_ORCHESTRATION env toggle"  "SABLE_ORCHESTRATION=1"
 has "documents the --dry-run flag"                 "--dry-run"
 has "has a Climbing to the cockpit section"        "Climbing to the cockpit"
 has "names the multi-manager hooks install dir"    ".claude/hooks/multi-manager"

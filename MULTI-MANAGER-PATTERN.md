@@ -147,14 +147,14 @@ the Lincoln session from populating the implementation backlog until
 Mechanics:
 
 - **`bin/sable-mode`** — reads/writes the mode-state file
-  `~/.claude/sable/state/cockpit-mode.json` (`{mode, since, fleet, substage}`).
+  `~/.claude/sable/state/mode-state.json` (`{mode, since, fleet, substage}`).
   The single source of truth shared by the skills and the interlock.
   `sable-mode substage get|set|advance` walks the planning substages.
-- **`/plan` and `/execute`** (`skills/cockpit-plan`, `skills/cockpit-execute`) —
+- **`/plan` and `/execute`** (`skills/sable-plan`, `skills/sable-execute`) —
   flip the mode and swap Lincoln's persona.
-- **`hooks/multi-manager/cockpit-mode-interlock.sh`** — the mechanical guarantee.
+- **`hooks/multi-manager/mode-interlock.sh`** — the mechanical guarantee.
   A `PreToolUse:Bash` guard that enforces the mode boundary (soft `--force` /
-  `SABLE_COCKPIT_FORCE=1` override). No-ops for non-Lincoln and subagent
+  `SABLE_ORCHESTRATION_FORCE=1` override). No-ops for non-Lincoln and subagent
   contexts. Registered first in the `Bash` matcher in `settings-snippet.json`.
 - **`bin/sable-status`** *(deprecated v1 surface — see below)*
 - **`bin/sable-cockpit`** + **`templates/multi-manager/layouts/sable.kdl`**

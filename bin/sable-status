@@ -26,7 +26,7 @@ Usage:
   sable-status --help
 
 Env:
-  SABLE_COCKPIT_STATE     mode-state path (default ~/.claude/sable/state/cockpit-mode.json)
+  SABLE_MODE_STATE     mode-state path (default ~/.claude/sable/state/mode-state.json)
   SABLE_STATUS_FIXTURE    JSON fixture; when set, bd/claude//proc are not consulted
   SABLE_STATUS_INTERVAL   live refresh seconds (default 2.0)
 """
@@ -90,7 +90,7 @@ def _read_active_markers(env: dict) -> dict:
 
 
 def _read_mode_state(env: dict) -> dict:
-    path = env.get("SABLE_COCKPIT_STATE") or str(Path.home() / ".claude" / "sable" / "state" / "cockpit-mode.json")
+    path = env.get("SABLE_MODE_STATE") or str(Path.home() / ".claude" / "sable" / "state" / "mode-state.json")
     try:
         with open(path) as fh:
             d = json.load(fh)

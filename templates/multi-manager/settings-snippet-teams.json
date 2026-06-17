@@ -26,7 +26,7 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/cockpit-mode-interlock.sh", "timeout": 3000 },
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/mode-interlock.sh", "timeout": 3000 },
           { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/tree-claim.sh", "timeout": 3000 },
           { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-push-rebase-test.sh", "timeout": 90000 }
         ]
@@ -34,7 +34,7 @@
       {
         "matcher": "Agent",
         "hooks": [
-          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/cockpit-mode-interlock.sh", "timeout": 3000 },
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/mode-interlock.sh", "timeout": 3000 },
           { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-preempt.sh", "timeout": 3000 },
           { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-refresh.sh", "timeout": 30000 },
           { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-claim.sh", "timeout": 5000 },

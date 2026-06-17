@@ -9,7 +9,7 @@
 #   - Subagent context (agent_id present in hook input) causes the hook to
 #     stand down — subagents don't dispatch.
 #
-# Unit tests stub `bd` on PATH and point SABLE_COCKPIT_MODE_FILE to an
+# Unit tests stub `bd` on PATH and point SABLE_MODE_FILE to an
 # execution-mode fixture so governance is always active for the manager path.
 #
 # Integration tests use a real bd sandbox (bd init in a temp dir) to verify
@@ -142,7 +142,7 @@ run_hook_as_manager() {
   make_dispatch_input "$1" | \
     env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
         SABLE_AGENTS_YAML="$AGENTS_YAML" \
-        SABLE_COCKPIT_MODE_FILE="$EXEC_MODE_FILE" \
+        SABLE_MODE_FILE="$EXEC_MODE_FILE" \
         BD_CALL_LOG="$BD_CALL_LOG" \
         PATH="$STUB_DIR:$PATH" \
         bash "$HOOK" 2>/dev/null
@@ -204,7 +204,7 @@ fi
 make_subagent_input "SABLE-xyz: do work — hooks/foo.sh" | \
   env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
       SABLE_AGENTS_YAML="$AGENTS_YAML" \
-      SABLE_COCKPIT_MODE_FILE="$EXEC_MODE_FILE" \
+      SABLE_MODE_FILE="$EXEC_MODE_FILE" \
       BD_CALL_LOG="$BD_CALL_LOG" \
       PATH="$STUB_DIR:$PATH" \
       bash "$HOOK" 2>/dev/null
@@ -242,7 +242,7 @@ fi
 make_manager_subagent_input "SABLE-xyz: implement hooks/foo.sh" "optimus" | \
   env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE \
       SABLE_AGENTS_YAML="$AGENTS_YAML" \
-      SABLE_COCKPIT_MODE_FILE="$EXEC_MODE_FILE" \
+      SABLE_MODE_FILE="$EXEC_MODE_FILE" \
       BD_CALL_LOG="$BD_CALL_LOG" \
       PATH="$STUB_DIR:$PATH" \
       bash "$HOOK" 2>/dev/null
@@ -259,7 +259,7 @@ fi
 make_manager_subagent_input "SABLE-xyz: do work hooks/foo.sh" "general-purpose" | \
   env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE \
       SABLE_AGENTS_YAML="$AGENTS_YAML" \
-      SABLE_COCKPIT_MODE_FILE="$EXEC_MODE_FILE" \
+      SABLE_MODE_FILE="$EXEC_MODE_FILE" \
       BD_CALL_LOG="$BD_CALL_LOG" \
       PATH="$STUB_DIR:$PATH" \
       bash "$HOOK" 2>/dev/null
@@ -300,7 +300,7 @@ else
 ${SCRATCH_ID}: implement the feature — hooks/foo.sh needs updating" | \
       env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
           SABLE_AGENTS_YAML="$AGENTS_YAML" \
-          SABLE_COCKPIT_MODE_FILE="$EXEC_MODE_FILE" \
+          SABLE_MODE_FILE="$EXEC_MODE_FILE" \
           bash "$HOOK" 2>/dev/null
 
     # Check that WIP-CLAIMS landed in the bead notes
@@ -343,7 +343,7 @@ except Exception:
     make_manager_subagent_input "${SCRATCH_ID2}: implement the feature — hooks/foo.sh needs updating" "optimus" | \
       env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE \
           SABLE_AGENTS_YAML="$AGENTS_YAML" \
-          SABLE_COCKPIT_MODE_FILE="$EXEC_MODE_FILE" \
+          SABLE_MODE_FILE="$EXEC_MODE_FILE" \
           bash "$HOOK" 2>/dev/null
 
     NOTES2=$(bd show "$SCRATCH_ID2" --json 2>/dev/null | python3 -c "

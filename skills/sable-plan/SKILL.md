@@ -1,7 +1,7 @@
 ---
-name: plan
+name: sable-plan
 description: |
-  Flip the SABLE cockpit into PLANNING mode and walk the gated, human-in-the-loop
+  Flip SABLE into PLANNING mode and walk the gated, human-in-the-loop
   staged-planning flow: FRAMING → RESEARCH → ARCHITECTURE → TEST-STRATEGY →
   DECOMPOSITION. Each substage has an owner and a human sign-off gate; the
   interlock blocks populating the implementation backlog until DECOMPOSITION, so

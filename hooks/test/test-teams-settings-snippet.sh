@@ -36,7 +36,7 @@ absent()  { if grep -q -- "$1" "$SNIPPET"; then fail "teams snippet OMITS $1" "u
 
 # Shared guard hooks must be present (transport-agnostic)
 for h in \
-  cockpit-mode-interlock.sh \
+  mode-interlock.sh \
   tree-claim.sh \
   pre-push-rebase-test.sh \
   pre-dispatch-preempt.sh \
