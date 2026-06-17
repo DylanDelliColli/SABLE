@@ -42,7 +42,6 @@ out1="$(SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project 2>&1)"
 exists "$P/.claude/skills/sable-plan/SKILL.md"    "project: /plan skill installed"
 exists "$P/.claude/skills/sable-execute/SKILL.md" "project: /execute skill installed"
 exists "$P/.claude/sable/roles/lincoln.md"  "project: lincoln role installed"
-exists "$P/.claude/sable/layouts/sable.kdl" "project: layout installed"
 exists "$P/.claude/agents-teams/optimus.md" "project: teams agent defs installed (SABLE-amj.8)"
 exists "$P/.claude/agents-teams/chuck.md"   "project: teams chuck def installed (folds into the team)"
 if [ -x "$P/.claude/hooks/multi-manager/mode-interlock.sh" ]; then pass "project: interlock hook installed+exec"; else fail "project: interlock hook installed+exec"; fi

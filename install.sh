@@ -121,6 +121,14 @@ if ! command -v dolt >/dev/null 2>&1 && ! command -v dolt.exe >/dev/null 2>&1; t
 fi
 echo
 
+# CC version floor (warn, don't fail) — the Orchestration tier's nested-subagent
+# dispatch needs Claude Code >= 2.1.172. Foundation installs fine on any version.
+CC_VER="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+if [ -n "${CC_VER}" ] && ! python3 -c "import sys;v=tuple(int(x) for x in '${CC_VER}'.split('.'));sys.exit(0 if v>=(2,1,172) else 1)" 2>/dev/null; then
+    yellow "  Note: Claude Code ${CC_VER} is below 2.1.172 — the Orchestration tier needs >= 2.1.172 for nested-subagent dispatch. Foundation installs fine; upgrade before using managers."
+    echo
+fi
+
 # 2. Verify Claude config dir exists
 bold "Step 2/7: Verify ~/.claude exists"
 if [ ! -d "${CLAUDE_DIR}" ]; then

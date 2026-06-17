@@ -3,7 +3,7 @@
 #
 # Single source of truth for which mode the orchestration session is in. Written by
 # the /plan and /execute skills; read by the mode interlock hook
-# (mode-interlock.sh) and the sable-status dashboard. Uses python3 for
+# (mode-interlock.sh). Uses python3 for
 # JSON (always present — it defines the env); deliberately NO jq dependency,
 # which is fragile across conda envs (see SABLE-cav.8).
 #

@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# sable-orchestration-install — install (or uninstall) the cockpit layer.
+# sable-orchestration-install — install (or uninstall) the Orchestration layer.
 #
-# Default scope is PROJECT: everything lands in ./.claude (skills, role, layout,
+# Default scope is PROJECT: everything lands in ./.claude (skills, role,
 # registry, interlock hook, identity hook) and the hooks are registered in
 # ./.claude/settings.local.json (uncommitted) — contained to this repo and
 # trivially removable. Pass --user to install globally into ~/.claude instead.
 #
 # Installs the REGISTRY (agents.yaml) and IDENTITY injection (session-role-anchor,
-# SessionStart+PreCompact) so a CLAUDE_AGENT_NAME=cockpit session adopts its role
+# SessionStart+PreCompact) so a CLAUDE_AGENT_NAME=lincoln session adopts its role
 # out of the box. Only the RUNNING manager swarm + its continuous coordination
 # hooks remain optional (see MULTI-MANAGER-PATTERN.md).
 #
-# Turn the cockpit off at runtime WITHOUT uninstalling: export SABLE_ORCHESTRATION=off
+# Turn orchestration off at runtime WITHOUT uninstalling: export SABLE_ORCHESTRATION=off
 # (honored mechanically by sable-mode and the interlock hook).
 #
 # Usage:
@@ -124,7 +124,6 @@ PY
 if [ "$UNINSTALL" = "1" ]; then
     rm -rf "$SKILLS/sable-plan" "$SKILLS/sable-execute"
     rm -f "$BASE/sable/roles/lincoln.md" "$BASE/sable/roles/cockpit.md" \
-          "$BASE/sable/layouts/sable.kdl" \
           "$BASE/sable/agents.yaml" "$INTERLOCK_DEST" "$ROLEANCHOR_DEST"
     rm -rf "$BASE/agents-teams"
     remove_hooks "$SETTINGS"
@@ -134,14 +133,13 @@ if [ "$UNINSTALL" = "1" ]; then
 fi
 
 # Install.
-mkdir -p "$SKILLS/sable-plan" "$SKILLS/sable-execute" "$BASE/sable/roles" "$BASE/sable/layouts" "$HOOKS_DIR"
+mkdir -p "$SKILLS/sable-plan" "$SKILLS/sable-execute" "$BASE/sable/roles" "$HOOKS_DIR"
 cp "$REPO/skills/sable-plan/SKILL.md"                   "$SKILLS/sable-plan/SKILL.md"
 cp "$REPO/skills/sable-execute/SKILL.md"                "$SKILLS/sable-execute/SKILL.md"
 cp "$REPO/templates/multi-manager/roles/lincoln.md"      "$BASE/sable/roles/lincoln.md"
 # v2 (SABLE-uz9.5): the agent is lincoln; remove a stale installed cockpit role
 # so a legacy CLAUDE_AGENT_NAME=cockpit session doesn't anchor outdated content.
 rm -f "$BASE/sable/roles/cockpit.md"
-cp "$REPO/templates/multi-manager/layouts/sable.kdl"     "$BASE/sable/layouts/sable.kdl"
 cp "$REPO/templates/multi-manager/agents.yaml"           "$BASE/sable/agents.yaml"
 cp "$REPO/hooks/multi-manager/mode-interlock.sh" "$INTERLOCK_DEST"
 cp "$REPO/hooks/multi-manager/session-role-anchor.sh"    "$ROLEANCHOR_DEST"
@@ -157,15 +155,10 @@ if [ "${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-}" != "1" ]; then
     echo "NOTE: teams agent defs installed (agents-teams/). To run the teams topology, set CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 in settings.json (env) and SABLE_TEAMS=1, then restart." >&2
 fi
 
-# Dependency check (warn, don't fail).
-python3 -c "import textual" 2>/dev/null || \
-    echo "NOTE: python package 'textual' not importable by $(command -v python3) — run: python3 -m pip install textual" >&2
-
-echo "Cockpit installed to $BASE (scope: $SCOPE)."
+echo "Orchestration layer installed to $BASE (scope: $SCOPE)."
 echo "  • Registry (agents.yaml) + identity injection (session-role-anchor) installed —"
 echo "    a CLAUDE_AGENT_NAME=lincoln session now adopts roles/lincoln.md at startup."
-echo "  • /plan and /execute become available after you restart the session."
-echo "  • Launch the cockpit:  sable-cockpit"
+echo "  • /sable-plan and /sable-execute become available after you restart the session."
 echo "  • Disable anytime without uninstalling:  export SABLE_ORCHESTRATION=off"
 echo "  • Uninstall:  sable-orchestration-install --$SCOPE --uninstall"
 echo "  • The running manager swarm (Optimus/Tarzan/Chuck + their coordination"
