@@ -255,42 +255,25 @@ sable_validate_base_ref() {
 # For PreToolUse:Agent / PostToolUse:Agent hooks. Decides whether pre-dispatch
 # governance applies to this Agent call and which manager LANE it belongs to.
 #
-# Lanes (SABLE-uz9.4, option A — Lincoln dispatches):
-#   - Legacy env-launched manager terminal: governance active, lane = the
-#     manager itself (today's behavior, unchanged).
-#   - v2 one-window main session: governance active only when the cockpit
-#     mode-state file says mode=execution. Lane = the "Dispatching-for: <name>"
-#     attribution line in the dispatch prompt; defaults to "cockpit" when the
-#     dispatch isn't on a manager's behalf (e.g. Lincoln's own utility spawns).
-#   - Manager-subagent (v2 native dispatch, SABLE-uz9.9): governance active,
-#     lane = the manager's own name. Nested subagent spawning + nested
-#     PreToolUse:Agent firing confirmed on CC 2.1.177 (SABLE-uz9.8), so the
-#     managers-spawn-their-own-workers premise now holds.
-#   - Worker / planning subagent contexts: stand down (non-manager subagents
-#     do not dispatch).
+# v3 (SABLE-4it): identity is the ONLY lane source — NEVER parsed from prompt text.
+#
+# Lanes:
+#   - Manager-typed subagent (Optimus/Tarzan spawning a worker natively): active,
+#     lane = the manager's own name. Confirmed on CC 2.1.173+ (spike SABLE-d50.1):
+#     a nested PreToolUse:Agent fires carrying the spawner's agent_type.
+#   - Legacy env-launched manager terminal (Chuck): active, lane = the manager.
+#   - Anonymous main session (Lincoln, no agent_id) in execution mode: active,
+#     lane = lincoln (self — Lincoln's utility spawns carry no bead IDs, so
+#     claim/overlap/preempt no-op naturally).
+#   - Everything else (workers, planning subagents, non-execution main session,
+#     unreadable registry): stand down. Fail open.
+#
+# The v2 "Dispatching-for: <name>" relay parse (sable__parse_dispatch_for) is
+# DELETED per the clean-break operator decision — identity (env or agent_type) is
+# authoritative.
 #
 # Sets: SABLE_DISPATCH_ACTIVE (0|1), SABLE_DISPATCH_LANE (lowercase name or "").
 # Mode-state path override for tests: SABLE_MODE_FILE.
-# Internal: extract the "Dispatching-for: <name>" attribution from the dispatch
-# prompt in the hook input. Prints the lowercase lane name, or "$2" (default)
-# when no attribution line exists.
-sable__parse_dispatch_for() {
-  local json="${1:-}" default="${2:-cockpit}"
-  local lane
-  lane=$(printf '%s' "$json" | python3 -c "
-import json, sys, re
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    d = {}
-prompt = (d.get('tool_input') or {}).get('prompt', '') or ''
-m = re.search(r'^Dispatching-for:[ \t]*([a-zA-Z0-9_-]+)', prompt, re.M | re.I)
-print(m.group(1).lower() if m else '')
-" 2>/dev/null)
-  [ -z "$lane" ] && lane="$default"
-  printf '%s' "$lane"
-}
-
 sable_resolve_dispatch_lane() {
   local json="${1:-}"
   SABLE_DISPATCH_ACTIVE=0
@@ -314,16 +297,7 @@ sable_resolve_dispatch_lane() {
   if [ "$SABLE_ID_SOURCE" = "env" ]; then
     if [ "$SABLE_ID_IS_MANAGER" -eq 1 ]; then
       SABLE_DISPATCH_ACTIVE=1
-      case "$SABLE_ID_TYPE" in
-        cockpit|strategist)
-          # Dispatcher session (v2 Lincoln/cockpit): the dispatch may be on a
-          # manager's behalf — honor the attribution line, default to self.
-          SABLE_DISPATCH_LANE=$(sable__parse_dispatch_for "$json" "$SABLE_ID_NAME")
-          ;;
-        *)
-          SABLE_DISPATCH_LANE="$SABLE_ID_NAME"
-          ;;
-      esac
+      SABLE_DISPATCH_LANE="$SABLE_ID_NAME"
     fi
     return 0
   fi
@@ -340,7 +314,9 @@ except Exception:
 " 2>/dev/null)
   [ "$mode" = "execution" ] || return 0
 
+  # Lincoln main session in execution mode: lane = self. (Contract invariant 4 —
+  # never the legacy "cockpit" default, never parsed from the prompt.)
   SABLE_DISPATCH_ACTIVE=1
-  SABLE_DISPATCH_LANE=$(sable__parse_dispatch_for "$json" "cockpit")
+  SABLE_DISPATCH_LANE="lincoln"
   return 0
 }

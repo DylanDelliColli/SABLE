@@ -103,15 +103,15 @@ fi
 OUT=$(run_hook "$(json '' '' 'do work')" "tarzan" "manager" "")
 assert_allowed "legacy env tarzan not blocked by P1" "$OUT"
 
-# 5. v2 main session, execution mode, attributed lane with P0 → denied
+# 5. v3 (SABLE-4it): a main-session exec dispatch IGNORES the Dispatching-for relay —
+#    lane = lincoln (self), NOT optimus — so an optimus P0 does not preempt it.
 OUT=$(run_hook "$(json '' '' 'Dispatching-for: optimus
 Implement SABLE-xyz in worktree wk1')" "" "" "$EXEC_MODE")
-assert_denied "v2 main session blocked when optimus lane has P0" "$OUT"
-printf '%s' "$OUT" | grep -q "PREEMPTION (optimus)" && pass "deny names the lane" || fail "deny names the lane" "got: $OUT"
+assert_allowed "main-session dispatch ignores Dispatching-for (lane=lincoln, not preempted by optimus P0)" "$OUT"
 
-# 6. v2 main session, execution mode, unattributed dispatch → cockpit lane, clean → allowed
+# 6. Main session, execution mode, plain dispatch → lincoln lane, clean → allowed
 OUT=$(run_hook "$(json '' '' 'Explore the repo layout')" "" "" "$EXEC_MODE")
-assert_allowed "v2 unattributed dispatch defaults to clean cockpit lane" "$OUT"
+assert_allowed "main-session dispatch uses the clean lincoln lane" "$OUT"
 
 # 7. v2 main session in PLANNING mode → governance inactive
 OUT=$(run_hook "$(json '' '' 'Dispatching-for: optimus
@@ -135,11 +135,11 @@ printf '%s' "$OUT" | grep -q "PREEMPTION (optimus)" && pass "manager-subagent de
 OUT=$(run_hook "$(json a2 general-purpose 'do the work')" "" "" "$EXEC_MODE")
 assert_allowed "worker subagent (general-purpose) stands down" "$OUT"
 
-# 10. Dispatcher-typed env session (lincoln) honors Dispatching-for attribution
+# 10. v3: env lincoln (manager) IGNORES the Dispatching-for relay — lane = self
+#     (lincoln), NOT optimus — so an optimus P0 does not preempt its dispatch.
 OUT=$(run_hook "$(json '' '' 'Dispatching-for: optimus
 Implement SABLE-abc')" "lincoln" "manager" "")
-assert_denied "env lincoln dispatching for optimus blocked by optimus P0" "$OUT"
-printf '%s' "$OUT" | grep -q "PREEMPTION (optimus)" && pass "env dispatcher lane attribution honored" || fail "env dispatcher lane attribution honored" "got: $OUT"
+assert_allowed "env lincoln ignores Dispatching-for (lane=self, not preempted by optimus P0)" "$OUT"
 
 # 11. Dispatcher-typed env session without attribution defaults to own lane
 OUT=$(run_hook "$(json '' '' 'Explore something')" "lincoln" "manager" "")

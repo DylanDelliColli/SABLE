@@ -212,6 +212,74 @@ run_lane_case "anonymous main session, no cockpit mode file: stands down" \
   "0|"
 
 # --------------------------------------------------------------------------
+# v3 lane contract (SABLE-how 7-row table delta + SABLE-dd1 fail-open / deletion)
+# Identity is the ONLY lane source; Lincoln main-session exec lane = self;
+# sable__parse_dispatch_for is deleted; infra errors fail open to ACTIVE=0.
+# --------------------------------------------------------------------------
+
+# Like run_lane_case but with a writable mode file and optional registry override.
+# Args: label, json, mode_json (""=nonexistent mode file), yaml ("" = fixture), expect
+run_lane_env() {
+  local label="$1" json="$2" mode_json="$3" yaml="$4" expect="$5" got
+  got=$(
+    unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE
+    if [ -n "$mode_json" ]; then
+      printf '%s' "$mode_json" > "$FIXTURE_DIR/mode-case.json"
+      export SABLE_MODE_FILE="$FIXTURE_DIR/mode-case.json"
+    else
+      export SABLE_MODE_FILE="$FIXTURE_DIR/nonexistent-mode-state.json"
+    fi
+    [ -n "$yaml" ] && export SABLE_AGENTS_YAML="$yaml"
+    # shellcheck disable=SC1090
+    source "$LIB"
+    sable_resolve_dispatch_lane "$json"
+    printf '%s|%s' "$SABLE_DISPATCH_ACTIVE" "$SABLE_DISPATCH_LANE"
+  )
+  if [ "$got" = "$expect" ]; then pass "$label"; else fail "$label" "expected [$expect] got [$got]"; fi
+}
+
+# Row 2 — anonymous main session in EXECUTION mode → lane=lincoln (NOT cockpit)
+run_lane_env "lane row2: exec-mode main session → active, lane=lincoln (not cockpit)" \
+  '{"tool_name":"Agent"}' '{"mode":"execution"}' "" "1|lincoln"
+# Row 3a — planning mode stands down
+run_lane_env "lane row3a: planning-mode main session stands down" \
+  '{"tool_name":"Agent"}' '{"mode":"planning"}' "" "0|"
+# dd1 — Dispatching-for prompt IGNORED for main-session exec lane (lincoln, not optimus)
+run_lane_env "dd1: Dispatching-for prompt ignored for main-session lane (lincoln)" \
+  '{"tool_name":"Agent","tool_input":{"prompt":"Dispatching-for: optimus\nwork on x"}}' '{"mode":"execution"}' "" "1|lincoln"
+# dd1 — malformed mode-file JSON fails open
+run_lane_env "dd1: malformed mode-file JSON stands down (fail open)" \
+  '{"tool_name":"Agent"}' 'not-json{' "" "0|"
+# dd1 — registry missing → manager subagent fails open (stands down)
+run_lane_env "dd1: registry missing → manager subagent fails open" \
+  '{"agent_id":"a1","agent_type":"tarzan","tool_name":"Agent"}' "" "/nonexistent/agents.yaml" "0|"
+# dd1 — registry unreadable (chmod 000) fails open
+UNREAD="$FIXTURE_DIR/unreadable.yaml"; cp "$FIXTURE_DIR/agents.yaml" "$UNREAD"; chmod 000 "$UNREAD" 2>/dev/null
+run_lane_env "dd1: registry unreadable (chmod 000) fails open" \
+  '{"agent_id":"a5","agent_type":"tarzan","tool_name":"Agent"}' "" "$UNREAD" "0|"
+chmod 644 "$UNREAD" 2>/dev/null
+
+# dd1 — empty agent_type stands down (missing/empty equivalence)
+run_lane_case "dd1: empty agent_type stands down" \
+  '{"agent_id":"a2","agent_type":""}' "" "" "0|"
+# dd1 — Dispatching-for IGNORED for manager subagent (lane=tarzan, not optimus)
+run_lane_case "dd1: Dispatching-for prompt ignored for manager subagent (tarzan)" \
+  '{"agent_id":"a3","agent_type":"tarzan","tool_name":"Agent","tool_input":{"prompt":"Dispatching-for: optimus\nx"}}' "" "" "1|tarzan"
+# dd1 — contamination: env=tarzan manager with agent_type=Explore child stands down
+run_lane_case "dd1: env=tarzan + child agent_type=Explore stands down (agent_id wins)" \
+  '{"agent_id":"a4","agent_type":"Explore","tool_name":"Agent"}' "tarzan" "manager" "0|"
+# dd1 — malformed hook JSON + env chuck → lane=chuck (legacy path intact)
+run_lane_case "dd1: malformed hook JSON + env chuck → active, lane=chuck" \
+  'not-json-at-all' "chuck" "manager" "1|chuck"
+
+# dd1 — sable__parse_dispatch_for is DELETED (no dead relay helper survives)
+if ( unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE; source "$LIB"; declare -F sable__parse_dispatch_for >/dev/null 2>&1 ); then
+  fail "dd1: sable__parse_dispatch_for is deleted" "function still defined after sourcing"
+else
+  pass "dd1: sable__parse_dispatch_for is deleted"
+fi
+
+# --------------------------------------------------------------------------
 # sable_is_git_push unit tests (SABLE-jpr / SABLE-0u1)
 # --------------------------------------------------------------------------
 # shellcheck disable=SC1090
