@@ -615,7 +615,7 @@ result, and pushes its own approved lane. The two-tier model becomes multi-tier 
 the mechanical governance firing on each *manager's own* dispatch. This is the top
 rung of the adoption ramp; the full topology and coordination hooks live in
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) and
-[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md).
+[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md).
 
 ### 6.2 Dispatching Workers
 

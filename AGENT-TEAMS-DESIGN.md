@@ -5,7 +5,7 @@
 > (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`: `TeamCreate`, `SendMessage`,
 > persistent named members). Offered as an **opt-in parallel mode** alongside the
 > existing nested-subagents topology — not a replacement. Extends
-> [`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md) and
+> [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) and
 > [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md). The execution contract
 > is the beads, not this file; this doc explains *why* the topology is shaped the
 > way it is so a fresh agent can act on the epic.

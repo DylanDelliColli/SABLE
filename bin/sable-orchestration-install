@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
-# sable-orchestration-install — install (or uninstall) the Orchestration layer.
+# sable-orchestration-install — install (or uninstall) the complete Orchestration layer.
 #
-# Default scope is PROJECT: everything lands in ./.claude (skills, role,
-# registry, interlock hook, identity hook) and the hooks are registered in
-# ./.claude/settings.local.json (uncommitted) — contained to this repo and
-# trivially removable. Pass --user to install globally into ~/.claude instead.
+# Installs the full manager-tier layer into ./.claude (project, default) or
+# ~/.claude (--user): all multi-manager hooks, the agents.yaml registry, the SABLE
+# skills (/sable-plan, /sable-execute, /columbo, /gaudi, ...), the lincoln role +
+# identity injection, and — for the teams topology — the agents-teams member defs.
+# The matching settings snippet is merged idempotently into the scope's settings
+# file (backed up + validated; existing entries never clobbered).
 #
-# Installs the REGISTRY (agents.yaml) and IDENTITY injection (session-role-anchor,
-# SessionStart+PreCompact) so a CLAUDE_AGENT_NAME=lincoln session adopts its role
-# out of the box. Only the RUNNING manager swarm + its continuous coordination
-# hooks remain optional (see MULTI-MANAGER-PATTERN.md).
+# Topology (--subagent default | --teams): selects the settings snippet. Teams
+# omits the three poll hooks (inbox-injection, inbox-injection-precompact,
+# read-guard) because coordination is live via SendMessage, and installs the
+# agents-teams/ member defs. The CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 line is the
+# one thing this can't safely auto-write — it is PRINTED for you to add.
 #
+# install.sh delegates here for the Orchestration tier; you can also run it directly.
 # Turn orchestration off at runtime WITHOUT uninstalling: export SABLE_ORCHESTRATION=off
-# (honored mechanically by sable-mode and the interlock hook).
 #
 # Usage:
-#   sable-orchestration-install [--project|--user] [--uninstall] [--help]
+#   sable-orchestration-install [--project|--user] [--subagent|--teams] [--uninstall] [--help]
 #
 # Env (mainly for tests):
 #   SABLE_PROJECT_DIR   project root for --project scope (default: $PWD)
@@ -27,15 +30,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 usage() {
-    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 SCOPE="project"
+TOPOLOGY="subagent"
 UNINSTALL=0
 for arg in "${@:-}"; do
     case "$arg" in
         --project)   SCOPE="project" ;;
         --user)      SCOPE="user" ;;
+        --subagent)  TOPOLOGY="subagent" ;;
+        --teams)     TOPOLOGY="teams" ;;
         --uninstall) UNINSTALL=1 ;;
         -h|--help)   usage; exit 0 ;;
         "")          ;;
@@ -53,57 +59,67 @@ else
 fi
 SKILLS="$BASE/skills"
 HOOKS_DIR="$BASE/hooks/multi-manager"
-INTERLOCK_DEST="$HOOKS_DIR/mode-interlock.sh"
-ROLEANCHOR_DEST="$HOOKS_DIR/session-role-anchor.sh"
+if [ "$TOPOLOGY" = "teams" ]; then
+    SNIPPET="$REPO/templates/multi-manager/settings-snippet-teams.json"
+else
+    SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
+fi
 
-# Register the cockpit hooks (interlock + identity) idempotently across the
-# right events. Backs up, validates JSON before writing, never clobbers others.
-add_hooks() {
-    SETTINGS_PATH="$1" INTERLOCK_CMD="$2" ROLEANCHOR_CMD="$3" python3 - <<'PY'
+# Merge a settings snippet's hooks into the target settings file, idempotently.
+# Rewrites the snippet's ~/.claude paths to the install BASE. Idempotency keys on
+# (event, matcher, command-basename) so a hook registered under two matchers (e.g.
+# mode-interlock.sh under both Bash and Agent) is preserved, while a re-run adds
+# nothing. Backs up, validates JSON, never clobbers existing entries.
+merge_snippet() {
+    SETTINGS_PATH="$1" SNIPPET_PATH="$2" BASE_DIR="$3" python3 - <<'PY'
 import json, os, shutil
-path = os.environ['SETTINGS_PATH']
-specs = [
-    {'event': 'PreToolUse',  'matcher': 'Bash', 'command': os.environ['INTERLOCK_CMD']},
-    {'event': 'SessionStart', 'matcher': '',    'command': os.environ['ROLEANCHOR_CMD']},
-    {'event': 'PreCompact',   'matcher': '',    'command': os.environ['ROLEANCHOR_CMD']},
-]
+settings = os.environ['SETTINGS_PATH']
+with open(os.environ['SNIPPET_PATH']) as f: snip = json.load(f)
+base = os.environ['BASE_DIR']
 data = {}
-if os.path.exists(path):
-    shutil.copy(path, path + '.bak')
+if os.path.exists(settings):
+    shutil.copy(settings, settings + '.bak')
     try:
-        with open(path) as f: data = json.load(f)
+        with open(settings) as f: data = json.load(f)
     except Exception:
         data = {}
 hooks = data.setdefault('hooks', {})
-for s in specs:
-    ev = hooks.get(s['event'])
+def marker(cmd): return (cmd or '').rsplit('/', 1)[-1]
+for event, blocks in snip.get('hooks', {}).items():
+    ev = hooks.get(event)
     if not isinstance(ev, list):
-        ev = hooks[s['event']] = []
-    marker = s['command'].rsplit('/', 1)[-1]   # script basename
-    # Idempotency: skip if this hook is already registered in ANY block of the
-    # event, not just the first same-matcher one. An event can hold several blocks
-    # with the same matcher (e.g. '' for both `bd prime` and session-role-anchor),
-    # so a block-local check would double-register (SABLE-md7).
-    if any(marker in (h.get('command', '') if isinstance(h, dict) else '')
-           for b in ev if isinstance(b, dict)
-           for h in b.get('hooks', [])):
-        continue
-    blk = next((b for b in ev if isinstance(b, dict) and b.get('matcher', '') == s['matcher']), None)
-    if blk is None:
-        blk = {'matcher': s['matcher'], 'hooks': []}; ev.append(blk)
-    hl = blk.setdefault('hooks', [])
-    hl.insert(0, {'type': 'command', 'command': s['command'], 'timeout': 3000})
+        ev = hooks[event] = []
+    existing = set()
+    for b in ev:
+        if isinstance(b, dict):
+            bm = b.get('matcher', '')
+            for h in b.get('hooks', []):
+                if isinstance(h, dict): existing.add((bm, marker(h.get('command', ''))))
+    for b in blocks:
+        if not isinstance(b, dict): continue
+        m = b.get('matcher', '')
+        target = next((x for x in ev if isinstance(x, dict) and x.get('matcher', '') == m), None)
+        if target is None:
+            target = {'matcher': m, 'hooks': []}; ev.append(target)
+        tl = target.setdefault('hooks', [])
+        for h in b.get('hooks', []):
+            if not isinstance(h, dict): continue
+            cmd = (h.get('command', '') or '').replace('~/.claude', base)
+            key = (m, marker(cmd))
+            if key in existing: continue
+            existing.add(key)
+            tl.append({**h, 'command': cmd})
 out = json.dumps(data, indent=2); json.loads(out)
-os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path, 'w') as f: f.write(out + '\n')
+os.makedirs(os.path.dirname(settings), exist_ok=True)
+with open(settings, 'w') as f: f.write(out + '\n')
 PY
 }
 
-remove_hooks() {
+# Remove every layer hook (any command referencing multi-manager/) from settings.
+remove_layer_hooks() {
     SETTINGS_PATH="$1" python3 - <<'PY'
 import json, os
 path = os.environ['SETTINGS_PATH']
-markers = ('mode-interlock.sh', 'session-role-anchor.sh')
 if not os.path.exists(path):
     raise SystemExit
 try:
@@ -115,51 +131,79 @@ for blocks in data.get('hooks', {}).values():
         for b in blocks:
             if isinstance(b, dict) and isinstance(b.get('hooks'), list):
                 b['hooks'] = [h for h in b['hooks']
-                              if not any(m in (h.get('command', '') if isinstance(h, dict) else '') for m in markers)]
+                              if not (isinstance(h, dict) and 'multi-manager/' in (h.get('command', '') or ''))]
 out = json.dumps(data, indent=2); json.loads(out)
 with open(path, 'w') as f: f.write(out + '\n')
 PY
 }
 
+# Resolve the SABLE skill names the repo ships (by frontmatter 'name:').
+skill_names() {
+    for skdir in "$REPO"/skills/*/; do
+        [ -f "${skdir}SKILL.md" ] || continue
+        n="$(grep -m1 '^name:' "${skdir}SKILL.md" | sed 's/^name:[[:space:]]*//' | tr -d '[:space:]\r')"
+        [ -n "$n" ] || n="$(basename "$skdir")"
+        printf '%s\n' "$n"
+    done
+}
+
 if [ "$UNINSTALL" = "1" ]; then
-    rm -rf "$SKILLS/sable-plan" "$SKILLS/sable-execute"
-    rm -f "$BASE/sable/roles/lincoln.md" "$BASE/sable/roles/cockpit.md" \
-          "$BASE/sable/agents.yaml" "$INTERLOCK_DEST" "$ROLEANCHOR_DEST"
-    rm -rf "$BASE/agents-teams"
-    remove_hooks "$SETTINGS"
+    while IFS= read -r n; do rm -rf "$SKILLS/$n"; done <<EOF
+$(skill_names)
+EOF
+    rm -f "$BASE/sable/roles/lincoln.md" "$BASE/sable/roles/cockpit.md" "$BASE/sable/agents.yaml"
+    rm -rf "$HOOKS_DIR" "$BASE/agents-teams"
+    remove_layer_hooks "$SETTINGS"
     echo "Orchestration layer uninstalled from $BASE (scope: $SCOPE)."
     echo "  (left other hooks and the settings file intact)"
     exit 0
 fi
 
-# Install.
-mkdir -p "$SKILLS/sable-plan" "$SKILLS/sable-execute" "$BASE/sable/roles" "$HOOKS_DIR"
-cp "$REPO/skills/sable-plan/SKILL.md"                   "$SKILLS/sable-plan/SKILL.md"
-cp "$REPO/skills/sable-execute/SKILL.md"                "$SKILLS/sable-execute/SKILL.md"
-cp "$REPO/templates/multi-manager/roles/lincoln.md"      "$BASE/sable/roles/lincoln.md"
-# v2 (SABLE-uz9.5): the agent is lincoln; remove a stale installed cockpit role
-# so a legacy CLAUDE_AGENT_NAME=cockpit session doesn't anchor outdated content.
-rm -f "$BASE/sable/roles/cockpit.md"
-cp "$REPO/templates/multi-manager/agents.yaml"           "$BASE/sable/agents.yaml"
-cp "$REPO/hooks/multi-manager/mode-interlock.sh" "$INTERLOCK_DEST"
-cp "$REPO/hooks/multi-manager/session-role-anchor.sh"    "$ROLEANCHOR_DEST"
-chmod +x "$INTERLOCK_DEST" "$ROLEANCHOR_DEST"
-add_hooks "$SETTINGS" "bash $INTERLOCK_DEST" "bash $ROLEANCHOR_DEST"
+# --- Install the complete layer ---
+mkdir -p "$HOOKS_DIR" "$BASE/sable/roles" "$SKILLS"
 
-# Teams topology (SABLE-amj.8): install the built teams member defs so the
-# /execute teams branch can inline-spawn them from <base>/agents-teams/.
-# Harmless when SABLE_TEAMS is never used; uninstall removes them.
-mkdir -p "$BASE/agents-teams"
-cp "$REPO"/templates/agents-teams/*.md "$BASE/agents-teams/"
-if [ "${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-}" != "1" ]; then
-    echo "NOTE: teams agent defs installed (agents-teams/). To run the teams topology, set CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 in settings.json (env) and SABLE_TEAMS=1, then restart." >&2
+# All multi-manager hooks (lib-identity.sh included — sourced by the others).
+for hook in "$REPO"/hooks/multi-manager/*.sh; do
+    [ -f "$hook" ] || continue
+    cp "$hook" "$HOOKS_DIR/$(basename "$hook")"
+    chmod +x "$HOOKS_DIR/$(basename "$hook")" 2>/dev/null || true
+done
+
+# Registry + lincoln role + identity. Remove a stale installed cockpit role
+# (v2: the agent is lincoln; SABLE-uz9.5).
+cp "$REPO/templates/multi-manager/agents.yaml"      "$BASE/sable/agents.yaml"
+cp "$REPO/templates/multi-manager/roles/lincoln.md" "$BASE/sable/roles/lincoln.md"
+rm -f "$BASE/sable/roles/cockpit.md"
+
+# SABLE skills, installed by frontmatter 'name:' (repo dir may differ).
+for skdir in "$REPO"/skills/*/; do
+    [ -f "${skdir}SKILL.md" ] || continue
+    skname="$(grep -m1 '^name:' "${skdir}SKILL.md" | sed 's/^name:[[:space:]]*//' | tr -d '[:space:]\r')"
+    [ -n "$skname" ] || skname="$(basename "$skdir")"
+    mkdir -p "$SKILLS/$skname"
+    for f in "${skdir}"*; do [ -f "$f" ] && cp "$f" "$SKILLS/$skname/$(basename "$f")"; done
+done
+
+# Teams topology: install the member defs so /sable-execute can inline-spawn them.
+if [ "$TOPOLOGY" = "teams" ]; then
+    mkdir -p "$BASE/agents-teams"
+    cp "$REPO"/templates/agents-teams/*.md "$BASE/agents-teams/"
 fi
 
-echo "Orchestration layer installed to $BASE (scope: $SCOPE)."
-echo "  • Registry (agents.yaml) + identity injection (session-role-anchor) installed —"
-echo "    a CLAUDE_AGENT_NAME=lincoln session now adopts roles/lincoln.md at startup."
+# Merge the topology-appropriate settings snippet.
+merge_snippet "$SETTINGS" "$SNIPPET" "$BASE"
+
+echo "Orchestration layer installed to $BASE (scope: $SCOPE, topology: $TOPOLOGY)."
+echo "  • All multi-manager hooks + agents.yaml + SABLE skills + lincoln role installed."
+echo "  • Settings snippet ($(basename "$SNIPPET")) merged into $SETTINGS (existing entries kept)."
 echo "  • /sable-plan and /sable-execute become available after you restart the session."
+if [ "$TOPOLOGY" = "teams" ]; then
+    echo "  • Teams member defs installed (agents-teams/)."
+    if [ "${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-}" != "1" ]; then
+        echo "  • ACTION REQUIRED for teams: add this to settings.json env, then restart:"
+        echo "        \"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS\": \"1\""
+        echo "    (and export SABLE_TEAMS=1). This is the one line we won't auto-write."
+    fi
+fi
 echo "  • Disable anytime without uninstalling:  export SABLE_ORCHESTRATION=off"
 echo "  • Uninstall:  sable-orchestration-install --$SCOPE --uninstall"
-echo "  • The running manager swarm (Optimus/Tarzan/Chuck + their coordination"
-echo "    hooks) stays optional — see MULTI-MANAGER-PATTERN.md if you want it."

@@ -42,13 +42,12 @@ out1="$(SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project 2>&1)"
 exists "$P/.claude/skills/sable-plan/SKILL.md"    "project: /plan skill installed"
 exists "$P/.claude/skills/sable-execute/SKILL.md" "project: /execute skill installed"
 exists "$P/.claude/sable/roles/lincoln.md"  "project: lincoln role installed"
-exists "$P/.claude/agents-teams/optimus.md" "project: teams agent defs installed (SABLE-amj.8)"
-exists "$P/.claude/agents-teams/chuck.md"   "project: teams chuck def installed (folds into the team)"
+if [ ! -e "$P/.claude/agents-teams" ]; then pass "project subagent: no agents-teams (teams-only, SABLE-ppy)"; else fail "project subagent: no agents-teams" "agents-teams present in a subagent install"; fi
 if [ -x "$P/.claude/hooks/multi-manager/mode-interlock.sh" ]; then pass "project: interlock hook installed+exec"; else fail "project: interlock hook installed+exec"; fi
 SET="$P/.claude/settings.local.json"
 exists "$SET" "project: settings.local.json created"
 if valid_json "$SET"; then pass "project: settings is valid JSON"; else fail "project: settings is valid JSON"; fi
-if [ "$(count_interlock "$SET")" = "1" ]; then pass "project: interlock registered once"; else fail "project: interlock registered once" "count=$(count_interlock "$SET")"; fi
+if [ "$(count_interlock "$SET")" = "2" ]; then pass "project: interlock registered on both legs (Bash+Agent)"; else fail "project: interlock registered on both legs (Bash+Agent)" "count=$(count_interlock "$SET")"; fi
 exists "$P/.claude/sable/agents.yaml" "project: registry (agents.yaml) installed"
 if [ -x "$P/.claude/hooks/multi-manager/session-role-anchor.sh" ]; then pass "project: identity hook installed+exec"; else fail "project: identity hook installed+exec"; fi
 if [ "$(count_in_event "$SET" SessionStart session-role-anchor.sh)" = "1" ]; then pass "project: identity hook registered SessionStart"; else fail "project: identity hook registered SessionStart" "count=$(count_in_event "$SET" SessionStart session-role-anchor.sh)"; fi
@@ -56,7 +55,7 @@ if [ "$(count_in_event "$SET" PreCompact session-role-anchor.sh)" = "1" ]; then 
 
 # idempotent re-run
 SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project >/dev/null 2>&1
-if [ "$(count_interlock "$SET")" = "1" ]; then pass "project: re-run stays idempotent"; else fail "project: re-run idempotent" "count=$(count_interlock "$SET")"; fi
+if [ "$(count_interlock "$SET")" = "2" ]; then pass "project: re-run stays idempotent"; else fail "project: re-run idempotent" "count=$(count_interlock "$SET")"; fi
 if valid_json "$SET"; then pass "project: settings valid after re-run"; else fail "project: settings valid after re-run"; fi
 
 # preserves an existing unrelated hook
@@ -79,7 +78,7 @@ U="$(mktemp -d)"
 CLAUDE_USER_DIR="$U/.claude" bash "$INSTALLER" --user >/dev/null 2>&1
 exists "$U/.claude/skills/sable-execute/SKILL.md" "user: skill installed under ~/.claude"
 exists "$U/.claude/settings.json" "user: settings.json created"
-if [ "$(count_interlock "$U/.claude/settings.json")" = "1" ]; then pass "user: interlock registered once"; else fail "user: interlock registered once"; fi
+if [ "$(count_interlock "$U/.claude/settings.json")" = "2" ]; then pass "user: interlock registered on both legs"; else fail "user: interlock registered on both legs" "count=$(count_interlock "$U/.claude/settings.json")"; fi
 
 # ---------- uninstall (project) ----------
 SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --uninstall >/dev/null 2>&1
@@ -141,14 +140,17 @@ CLAUDE_USER_DIR="$M/.claude" bash "$INSTALLER" --user >/dev/null 2>&1
 MSET="$M/.claude/settings.json"
 if [ "$(count_in_event "$MSET" SessionStart session-role-anchor.sh)" = "1" ]; then pass "md7: multi-manager re-install — identity once (SessionStart)"; else fail "md7: multi-manager re-install — identity once (SessionStart)" "count=$(count_in_event "$MSET" SessionStart session-role-anchor.sh)"; fi
 if [ "$(count_in_event "$MSET" PreCompact session-role-anchor.sh)" = "1" ]; then pass "md7: multi-manager re-install — identity once (PreCompact)"; else fail "md7: multi-manager re-install — identity once (PreCompact)" "count=$(count_in_event "$MSET" PreCompact session-role-anchor.sh)"; fi
-if [ "$(count_interlock "$MSET")" = "1" ]; then pass "md7: multi-manager re-install — interlock once"; else fail "md7: multi-manager re-install — interlock once" "count=$(count_interlock "$MSET")"; fi
+if [ "$(count_interlock "$MSET")" = "2" ]; then pass "md7: multi-manager re-install — interlock on both legs"; else fail "md7: multi-manager re-install — interlock on both legs" "count=$(count_interlock "$MSET")"; fi
 if [ "$(count_marker "$MSET" 'bd prime')" = "2" ]; then pass "md7: multi-manager re-install — bd prime preserved"; else fail "md7: multi-manager re-install — bd prime preserved" "count=$(count_marker "$MSET" 'bd prime')"; fi
 if valid_json "$MSET"; then pass "md7: settings valid after multi-manager re-install"; else fail "md7: settings valid after multi-manager re-install"; fi
 
-# ---------- SABLE-amj.8: teams-flag warning on install ----------
+# ---------- SABLE-ppy: teams topology installs member defs + warns on the flag ----------
 WARNDIR="$(mktemp -d)"
-WARN_OUT="$(env -u CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS SABLE_PROJECT_DIR="$WARNDIR" bash "$INSTALLER" --project 2>&1)"
-if printf '%s' "$WARN_OUT" | grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"; then pass "install warns when the teams flag is unset"; else fail "install warns when the teams flag is unset" "no warning in output"; fi
+WARN_OUT="$(env -u CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS SABLE_PROJECT_DIR="$WARNDIR" bash "$INSTALLER" --teams --project 2>&1)"
+if printf '%s' "$WARN_OUT" | grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"; then pass "teams install warns when the experimental flag is unset"; else fail "teams install warns when the experimental flag is unset" "no warning in output"; fi
+exists "$WARNDIR/.claude/agents-teams/optimus.md" "teams install: agents-teams member defs present"
+WSET="$WARNDIR/.claude/settings.local.json"
+if [ "$(count_marker "$WSET" inbox-injection)" = "0" ]; then pass "teams install: poll hooks omitted from settings"; else fail "teams install: poll hooks omitted" "count=$(count_marker "$WSET" inbox-injection)"; fi
 rm -rf "$WARNDIR"
 
 rm -rf "$P" "$P2" "$U" "$PU" "$M"

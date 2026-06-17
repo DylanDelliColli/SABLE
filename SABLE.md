@@ -281,7 +281,7 @@ If a session ends mid-work, the next agent runs `bd ready` and continues. No re-
 #### 3.6.1 Staged Planning (cockpit extension)
 
 The design-to-beads workflow above is the single-agent form. When the cockpit
-multi-agent layer is active (see `COCKPIT-DESIGN.md`), planning becomes a **gated
+multi-agent layer is active (see `MULTI-MANAGER-PATTERN.md`), planning becomes a **gated
 substage state machine** so no implementation bead is authored before the
 upstream thinking is done and human-signed-off:
 
@@ -971,7 +971,7 @@ refresh/claim/overlap/preempt/model-check and the pre-push gate) firing on each
 *manager's own* dispatch, not the operator's. This is the top rung of the
 adoption ramp; the full topology, identity discrimination, and coordination hooks
 live in [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) and
-[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md). The rest of this section describes the
+[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md). The rest of this section describes the
 base orchestrator/worker pattern that every tier is built from.
 
 ### 6.2 Dispatching Workers

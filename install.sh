@@ -20,19 +20,27 @@ AGENTS_YAML_SRC="${TEMPLATE_DIR}/multi-manager/agents.yaml"
 SKILLS_SRC="${REPO_DIR}/skills"
 SKILLS_DST="${CLAUDE_DIR}/skills"
 
-# --- CLI flags (SABLE-106) ---
+# --- CLI flags (SABLE-106, front door SABLE-ppy) ---
 DRY_RUN=0
 ORCHESTRATION=0
-[ "${SABLE_ORCHESTRATION:-}" = "1" ] && ORCHESTRATION=1
+TOPOLOGY="subagent"
+TIER_SET=0
+[ "${SABLE_ORCHESTRATION:-}" = "1" ] && { ORCHESTRATION=1; TIER_SET=1; }
 for arg in "$@"; do
     case "$arg" in
-        --dry-run) DRY_RUN=1 ;;
-        --orchestration) ORCHESTRATION=1 ;;
+        --dry-run)       DRY_RUN=1 ;;
+        --orchestration) ORCHESTRATION=1; TIER_SET=1 ;;
+        --foundation)    ORCHESTRATION=0; TIER_SET=1 ;;
+        --subagent)      TOPOLOGY="subagent" ;;
+        --teams)         TOPOLOGY="teams" ;;
         -h|--help)
-            echo "Usage: install.sh [--orchestration] [--dry-run]"
-            echo "  --orchestration   also install the multi-manager Orchestration tier"
-            echo "              (hooks/multi-manager + agents.yaml; or SABLE_ORCHESTRATION=1)"
-            echo "  --dry-run   report what would be copied; write nothing"
+            echo "Usage: install.sh [--foundation|--orchestration] [--subagent|--teams] [--dry-run]"
+            echo "  --orchestration    install the Orchestration tier (manager workflow)"
+            echo "  --foundation       base methodology only (default if neither chosen non-interactively)"
+            echo "  --subagent|--teams Orchestration topology (default subagent; teams is experimental)"
+            echo "  --dry-run          report what would be done; write nothing"
+            echo "  (run with no tier flag on a terminal to choose interactively;"
+            echo "   or set SABLE_ORCHESTRATION=1 for the Orchestration tier)"
             exit 0 ;;
     esac
 done
@@ -62,6 +70,31 @@ bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
 green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 red()    { printf '\033[31m%s\033[0m\n' "$*"; }
+
+# Interactive front door: on a terminal with no tier flag, ask. Non-interactive
+# runs (CI, pipes) fall through to the flags/defaults — Foundation unless told.
+if [ "$TIER_SET" = "0" ] && [ -t 0 ]; then
+    bold "SABLE install — choose a tier"
+    echo "  [1] Foundation    A disciplined workflow for AI-assisted coding. Every task"
+    echo "                    becomes a tracked issue, code changes require tests, and"
+    echo "                    quality checks run automatically. Works in your normal"
+    echo "                    coding sessions — nothing new to launch or learn. (default)"
+    echo "  [2] Orchestration Everything in Foundation, plus a hands-off multi-agent mode:"
+    echo "                    a lead session breaks work into a plan and delegates it to"
+    echo "                    specialist agents that write, review, and merge code with"
+    echo "                    minimal supervision. Best for larger efforts to delegate."
+    printf 'Tier [1]: '; read -r _tier
+    if [ "$_tier" = "2" ]; then
+        ORCHESTRATION=1
+        bold "  Topology"
+        echo "    [1] Subagent (default)    Managers run as background subagents. Stable."
+        echo "    [2] Teams (experimental)  Managers coordinate live via messaging — more"
+        echo "                              parallelism. Needs CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1."
+        printf '  Topology [1]: '; read -r _topo
+        [ "$_topo" = "2" ] && TOPOLOGY="teams"
+    fi
+    echo
+fi
 
 bold "SABLE installer"
 printf 'OS:         %s\n' "${OS_NAME}"
@@ -171,48 +204,20 @@ else
 fi
 echo
 
-# 5. Install the Orchestration (multi-manager) tier — gated so Foundation adopters opt in (SABLE-106)
-bold "Step 5/7: Install Orchestration (multi-manager) extensions"
+# 5. Install the Orchestration (multi-manager) tier by DELEGATING to the
+# complete-layer installer (SABLE-ppy). Foundation adopters opt out. The delegate
+# installs all hooks + registry + skills + role + (teams) member defs and merges
+# the topology-appropriate settings snippet.
+bold "Step 5/7: Orchestration (multi-manager) tier"
 if [ "$ORCHESTRATION" != "1" ]; then
-    yellow "  Skipped — Foundation tier. Re-run with --orchestration (or SABLE_ORCHESTRATION=1) to"
-    yellow "  install the one-window manager hooks + agents.yaml registry."
+    yellow "  Skipped — Foundation tier. Re-run with --orchestration (or SABLE_ORCHESTRATION=1)."
+elif [ "$DRY_RUN" = "1" ]; then
+    yellow "  would delegate: sable-orchestration-install --user --${TOPOLOGY}"
+elif [ -x "${REPO_DIR}/bin/sable-orchestration-install" ]; then
+    green "  Delegating to sable-orchestration-install (--user --${TOPOLOGY})..."
+    bash "${REPO_DIR}/bin/sable-orchestration-install" --user --"${TOPOLOGY}"
 else
-    if [ -d "${MM_HOOKS_SRC}" ]; then
-        make_dir "${MM_HOOKS_DST}"
-        for hook in "${MM_HOOKS_SRC}"/*.sh; do
-            [ -f "${hook}" ] || continue
-            copy_file "${hook}" "${MM_HOOKS_DST}/$(basename "${hook}")" "multi-manager/$(basename "${hook}")"
-        done
-    else
-        yellow "  hooks/multi-manager/ not found — skipping Orchestration hooks"
-    fi
-    if [ -f "${AGENTS_YAML_SRC}" ]; then
-        make_dir "${SABLE_DST}"
-        if [ "$DRY_RUN" != "1" ] && [ -f "${SABLE_DST}/agents.yaml" ] \
-           && ! cmp -s "${AGENTS_YAML_SRC}" "${SABLE_DST}/agents.yaml"; then
-            cp "${SABLE_DST}/agents.yaml" "${SABLE_DST}/agents.yaml.bak.$(date +%Y%m%d%H%M%S)"
-            yellow "  Existing agents.yaml differed — backed up before overwrite"
-        fi
-        copy_file "${AGENTS_YAML_SRC}" "${SABLE_DST}/agents.yaml" "sable/agents.yaml"
-    else
-        yellow "  templates/multi-manager/agents.yaml not found — skipping registry"
-    fi
-    # Skills (slash commands) — installed by their frontmatter 'name:' (the repo
-    # dir may differ, e.g. sable-plan -> plan), with all sibling files.
-    if [ -d "${SKILLS_SRC}" ]; then
-        for skdir in "${SKILLS_SRC}"/*/; do
-            [ -f "${skdir}SKILL.md" ] || continue
-            skname="$(grep -m1 '^name:' "${skdir}SKILL.md" | sed 's/^name:[[:space:]]*//' | tr -d '[:space:]\r')"
-            [ -n "${skname}" ] || skname="$(basename "${skdir}")"
-            make_dir "${SKILLS_DST}/${skname}"
-            for f in "${skdir}"*; do
-                [ -f "${f}" ] && copy_file "${f}" "${SKILLS_DST}/${skname}/$(basename "${f}")" "skills/${skname}/$(basename "${f}")"
-            done
-        done
-    else
-        yellow "  skills/ not found — skipping skills install"
-    fi
-    [ "$DRY_RUN" = "1" ] || green "  Orchestration tier installed. Add the multi-manager hook block (printed below) to settings.json."
+    yellow "  bin/sable-orchestration-install not found — skipping Orchestration tier"
 fi
 echo
 
@@ -290,13 +295,9 @@ EOF
 echo
 
 if [ "$ORCHESTRATION" = "1" ]; then
-    bold "Orchestration (multi-manager) hook block"
-    echo "ALSO merge the multi-manager hook entries into ${SETTINGS_FILE}. The canonical"
-    echo "block is committed at:"
-    echo "    ${TEMPLATE_DIR}/multi-manager/settings-snippet.json"
-    echo "It registers the pre-dispatch governance (PreToolUse:Agent), the mode"
-    echo "interlock + tree-claim + pre-push gate (PreToolUse:Bash), the claim reconciler"
-    echo "(PreToolUse:Edit|Write), and the post-push notify (PostToolUse:Bash)."
+    bold "Orchestration hooks"
+    echo "The Orchestration settings snippet was merged into the scope's settings file"
+    echo "automatically by sable-orchestration-install (backed up; existing entries kept)."
     echo
 fi
 
@@ -307,10 +308,12 @@ echo "  1. Paste the hook block(s) above into ${SETTINGS_FILE} (merge with exist
 echo "  2. In your project: bd init && bd hooks install"
 echo "  3. Agent definitions are now in ${CLAUDE_DIR}/agents/ — restart Claude Code for them to take effect."
 if [ "$ORCHESTRATION" = "1" ]; then
-    echo "  4. Orchestration installed: ${MM_HOOKS_DST}/ + ${SABLE_DST}/agents.yaml + ${SKILLS_DST}/ skills. Verify:"
-    echo "       ls ${MM_HOOKS_DST} && ls ${SKILLS_DST} && head -1 ${SABLE_DST}/agents.yaml"
-    echo "     RESTART Claude Code so the /plan /execute /gaudi /columbo slash commands register."
-    echo "     Chuck stays a terminal — add the env-var alias from QUICKSTART.md if you run merge-queue."
+    echo "  4. Orchestration tier installed (topology: ${TOPOLOGY}) — its settings snippet was merged automatically."
+    echo "     RESTART Claude Code so /sable-plan /sable-execute /gaudi /columbo register."
+    if [ "$TOPOLOGY" = "teams" ]; then
+        echo "     Teams: add CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 to settings.json env + export SABLE_TEAMS=1 (see step 5 output)."
+    fi
+    echo "     Chuck stays a terminal — add the env-var alias from QUICKSTART.md if you run the merge queue."
 fi
 echo "  5. Open a fresh agent session and use the bootstrap prompt from QUICKSTART.md"
 echo "  6. Verify: see 'Verify the install' section of QUICKSTART.md"

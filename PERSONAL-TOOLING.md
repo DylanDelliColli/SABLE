@@ -8,7 +8,7 @@ Contents:
 - `skills/audit-deep-dive/SKILL.md` — Claude Code skill for converting AUDIT: beads into epic+children
 - `skills/columbo/SKILL.md` + `skills/columbo/columbo-prefilter.py` — Claude Code skill that delivers the Columbo test-coverage planning workflow without requiring the multi-manager registry, role files, agent identity, or coordination hooks. Use this on machines where you want Columbo's interview + skeleton-test output but not the full multi-manager pattern (typical for work computers where you bounce between many repos). Invokable as `/columbo` once installed at `~/.claude/skills/columbo/`.
 - `MULTI-MANAGER-PATTERN.md` — experimental coordination pattern for power-user multi-agent swarms. Eight-agent roster: continuous execution managers (Optimus / Tarzan / Chuck), session-scoped planning agents (Sherlock / Victor / Rudy / Columbo), and execution-session strategist (Lincoln). Companion `hooks/multi-manager/`, `templates/multi-manager/`, `bin/columbo-prefilter.py` (Columbo's audit-mode triage tool), and `bin/sable-agents` reminder helper.
-- `COCKPIT-DESIGN.md` + cockpit tooling — v2 one-window topology: one Lincoln main session hosts Optimus and Tarzan as resident subagents; Chuck stays a second terminal. Planning is a five-stage gated machine (framing → research → architecture → test-strategy → decomposition) controlled by `/plan` and `/execute`. Companion `bin/sable-mode`, `hooks/multi-manager/mode-interlock.sh`, `skills/sable-plan`, `skills/sable-execute`. See install step 4 below. **Note**: `bin/sable-status`, `bin/sable-cockpit`, and `templates/multi-manager/layouts/sable.kdl` are deprecated (v1 Zellij surface) — not deleted, may return as an optional pane.
+- `MULTI-MANAGER-PATTERN.md` + cockpit tooling — v2 one-window topology: one Lincoln main session hosts Optimus and Tarzan as resident subagents; Chuck stays a second terminal. Planning is a five-stage gated machine (framing → research → architecture → test-strategy → decomposition) controlled by `/plan` and `/execute`. Companion `bin/sable-mode`, `hooks/multi-manager/mode-interlock.sh`, `skills/sable-plan`, `skills/sable-execute`. See install step 4 below. **Note**: `bin/sable-status`, `bin/sable-cockpit`, and `templates/multi-manager/layouts/sable.kdl` are deprecated (v1 Zellij surface) — not deleted, may return as an optional pane.
 
 ## Columbo: skill vs. multi-manager pattern
 
@@ -97,7 +97,7 @@ the bead pool via the Tier-2 producers, `/execute` drains it via the manager
 swarm. The installer is **self-sufficient** — it installs its own registry
 (`agents.yaml`) and identity injection, so cockpit identity works standalone;
 the full *running* manager swarm (step 3) is optional. Full rationale in
-[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md); the surface is summarized in
+[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md); the surface is summarized in
 `MULTI-MANAGER-PATTERN.md` → "The Cockpit".
 
 Files:

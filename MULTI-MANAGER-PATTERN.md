@@ -109,7 +109,7 @@ sable-agents victor       # single agent + role file path
 ## The v2 topology (one-window)
 
 SABLE v2 reduces the operator surface to **one primary window**. See
-[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md) for the full rationale; the summary:
+[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) for the full rationale; the summary:
 
 > **Teams variant (opt-in):** an alternative topology built on Claude Code Agent
 > Teams — managers and Chuck as live `SendMessage` members in one window — is
@@ -124,7 +124,7 @@ own approved lanes** (`git -C <worktree> push`). Lincoln spawns and oversees
 them; it no longer relays dispatch requests or pushes on their behalf. Chuck
 stays a separate terminal (env-var identity) because always-on merge-queue
 polling is session-shaped — see the "Chuck hybrid holdout" section in
-[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md).
+[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md).
 
 | Mode | Job | Mechanics |
 |------|-----|-----------|
@@ -141,7 +141,7 @@ Planning is staged, not a single step. The five substages are:
 
 Human signs off before each `sable-mode substage advance`. The interlock blocks
 the Lincoln session from populating the implementation backlog until
-`substage=decomposition`. See [`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md) and the
+`substage=decomposition`. See [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) and the
 `/plan` skill.
 
 Mechanics:
@@ -163,7 +163,7 @@ Mechanics:
 **Deprecated v1 surface (not deleted):** The v1 topology used a two-pane Zellij
 layout (`sable-cockpit` + `sable-status` dashboard). These files are kept with
 DEPRECATED headers because the dashboard may return as an optional monitoring
-pane. They do not affect v2 operation. See [`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md)
+pane. They do not affect v2 operation. See [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md)
 § "Supersedes: v1 Zellij/sable-status surface" for the full rationale.
 
 ---
@@ -177,7 +177,7 @@ Each manager launches with an immutable identity established at the OS level, no
 In v2, **Optimus and Tarzan are resident subagents** spawned by Lincoln — you do
 not launch them from the shell directly. The Lincoln alias is still needed for
 the main session, and Chuck still requires an env-var terminal (see
-[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md) for the Chuck hybrid holdout rationale).
+[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) for the Chuck hybrid holdout rationale).
 
 **Minimum for a v2 execution session:**
 

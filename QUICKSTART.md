@@ -161,27 +161,30 @@ budget supports parallel agents (see SABLE.md §6).
 
 ```bash
 cd ~/sable
-bash install.sh --orchestration          # or: SABLE_ORCHESTRATION=1 bash install.sh
+bash install.sh --orchestration              # subagent topology (default)
+bash install.sh --orchestration --teams      # experimental Agent-Teams topology
+bash install.sh                              # no flag on a terminal → interactive tier/topology prompt
+SABLE_ORCHESTRATION=1 bash install.sh        # non-interactive equivalent of --orchestration
 ```
 
 This adds, on top of the Foundation install:
 - `~/.claude/hooks/multi-manager/*.sh` — the governance hooks (pre-dispatch
-  refresh/claim/overlap/preempt/model-check, the cockpit-mode interlock, the
+  refresh/claim/overlap/preempt/model-check, the mode interlock, the
   pre-push gate, post-push notify, identity discrimination).
 - `~/.claude/sable/agents.yaml` — the agent registry (identities, lanes, inboxes).
-- `~/.claude/skills/` — the SABLE slash commands (`/plan`, `/execute`, `/gaudi`,
-  `/columbo`, `/audit-deep-dive`, `/sable-review`), installed by their skill
-  name (so `sable-plan` lands as `/plan`).
+- `~/.claude/skills/` — the SABLE slash commands (`/sable-plan`, `/sable-execute`,
+  `/gaudi`, `/columbo`, `/audit-deep-dive`, `/sable-review`), installed by their
+  skill name.
+- The topology settings snippet is **merged into `~/.claude/settings.json`
+  automatically** (backed up first; existing entries preserved).
 - The named agent definitions are already in `~/.claude/agents/` from the
   Foundation install.
 
-**Restart Claude Code** after installing the cockpit tier — the agent
-definitions *and the slash commands* register at session start.
-
-Then **merge the cockpit hook block** into `~/.claude/settings.json` — the
-canonical block is committed at `templates/multi-manager/settings-snippet.json`
-(the installer prints the path). **Restart Claude Code** so the new agent
-definitions and hook registrations load.
+The installer **auto-merges** the Orchestration hook block into
+`~/.claude/settings.json` (the subagent snippet by default; the teams snippet with
+`--teams`) — it backs the file up first and never clobbers existing entries.
+**Restart Claude Code** afterward so the agent definitions, slash commands, and
+hook registrations load.
 
 **Verify the cockpit:**
 
@@ -196,7 +199,7 @@ drains the pool via the resident managers. Chuck (the merge-queue integrator)
 stays a second terminal — add its env-var alias from the installer's printed
 snippet if you run a merge queue. The full topology lives in
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) and
-[`COCKPIT-DESIGN.md`](COCKPIT-DESIGN.md).
+[`ENTRY-POINTS-DESIGN.md`](ENTRY-POINTS-DESIGN.md).
 
 ### Teams topology (experimental)
 
@@ -206,12 +209,13 @@ coordinate over `SendMessage`, collapsing the second terminal into one window. I
 is **opt-in and parallel** to the default (nested) topology:
 
 ```bash
-# 1. Enable the Claude Code flag in ~/.claude/settings.json (env block):
+# 1. Install the teams topology — auto-merges the teams snippet (omits the poll hooks):
+bash install.sh --orchestration --teams
+# 2. Add the Claude Code flag to ~/.claude/settings.json (env block) — the one line
+#    the installer won't auto-write:
 #      "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
-# 2. Launch Lincoln with SABLE_TEAMS set:
+# 3. Launch Lincoln with SABLE_TEAMS set:
 SABLE_TEAMS=1 CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude
-# 3. Merge templates/multi-manager/settings-snippet-teams.json (NOT the nested
-#    snippet) into settings.json — it omits the three poll hooks.
 ```
 
 `/execute` runs `sable-teams-preflight`, sees `SABLE_TEAMS=1`, and spawns Optimus,
