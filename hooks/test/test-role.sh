@@ -54,6 +54,21 @@ assert_grep "$ROLE" "Chuck terminal" "role reminds the operator about the Chuck 
 assert_grep "$ROLE" "push their own approved" "role: managers push their own approved lanes (Lincoln does not push)"
 assert_grep "$ROLE" "gaudi skill" "role runs gaudi as an inline skill at ARCHITECTURE"
 
+# --- v3 manager role-file source prose (SABLE-a0n cases 3/4) ---
+# Pin the CONVERTED state of both manager role files so relay phrasing cannot
+# silently return in a future merge. Both managers were converted at HEAD
+# (SABLE-uz9.11): the planned phase-1 (tarzan)/phase-2 (optimus) split collapsed,
+# so a0n case 4's "optimus retains relay" is obsolete — we pin direct-dispatch for
+# BOTH. (The generated agent defs are separately pinned in test-agent-definitions.sh;
+# 4ba remains the manual live acceptance run.)
+for mgr in tarzan optimus; do
+  MROLE="$REPO/templates/multi-manager/roles/$mgr.md"
+  assert_no_grep "$MROLE" "DISPATCH-REQUEST" "$mgr role drops the DISPATCH-REQUEST relay"
+  assert_grep    "$MROLE" "Agent tool"       "$mgr role dispatches workers via the Agent tool"
+  assert_grep    "$MROLE" "git -C"           "$mgr role pushes its own approved lane (git -C <worktree> push)"
+  assert_grep    "$MROLE" "Worktree:"        "$mgr role carries the Worktree prompt-line rule"
+done
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
