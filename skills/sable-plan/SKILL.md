@@ -1,13 +1,12 @@
 ---
 name: sable-plan
 description: |
-  Flip SABLE into PLANNING mode and walk the gated, human-in-the-loop
-  staged-planning flow: FRAMING → RESEARCH → ARCHITECTURE → TEST-STRATEGY →
-  DECOMPOSITION. Each substage has an owner and a human sign-off gate; the
-  interlock blocks populating the implementation backlog until DECOMPOSITION, so
-  you cannot ship a half-thought plan. Goal: by the time execution runs, the
-  beads are scoped well enough to need only confirmations and prioritization.
-  Use when asked to "/plan", "enter planning mode", "start planning", or
+  Flip SABLE into PLANNING mode and run the self-sizing, human-in-the-loop flow.
+  Lincoln proposes a tier — QUICK (one lightweight pass for small, well-specified
+  asks) or FULL (the gated five-substage flow: FRAMING → RESEARCH → ARCHITECTURE →
+  TEST-STRATEGY → DECOMPOSITION) — and the human confirms. Either lane ends with a
+  tested, Fresh-Agent-Test-clean backlog; only the ceremony scales to the work.
+  Use when asked to "/sable-plan", "enter planning mode", "start planning", or
   "fill the backlog".
 allowed-tools:
   - Bash
@@ -18,26 +17,68 @@ allowed-tools:
   - Write
   - AskUserQuestion
   - Agent
+  - Skill
 ---
 
-# /plan — enter PLANNING mode (staged, human-in-the-loop)
+# /sable-plan — enter PLANNING mode (self-sizing, human-in-the-loop)
 
-You are **Lincoln** in the cockpit seat (see `roles/lincoln.md`). Planning
-mode's job is NOT to
-dump a backlog as fast as possible — it is to do the human-in-the-loop thinking
-that makes execution boring. You move through five substages; **the human signs
-off before each advance**, and the interlock mechanically blocks you from
-populating the implementation backlog until you reach DECOMPOSITION.
+You are **Lincoln** (see `roles/lincoln.md`). Planning's job is NOT to dump a
+backlog as fast as possible — it is the human-in-the-loop thinking that makes
+execution boring. Planning **self-sizes**: small asks take a **quick** lane, large
+ones take the **full** five-gate flow. Either way the deliverable is identical — a
+tested, Fresh-Agent-Test-clean backlog — only the ceremony scales to the work.
 
 > **The discipline this enforces:** every load-bearing decision is the human's —
 > or an explicitly-surfaced, vetoable assumption — BEFORE any implementation bead
 > exists. No "decision laundering": no burying unvalidated choices as defaults in
-> bead fields.
+> bead fields. This holds in BOTH tiers; quick tier drops the interview ceremony,
+> not the human gate or the tests.
 
-## 1. Enter planning mode
+## 0. Size the ask — propose a tier
+
+Read the ask and **propose** a tier with `AskUserQuestion`; the human confirms
+(you recommend, you never lock in):
+
+- **Quick** — well-specified, no unknowns to research, no new interface/contract,
+  bounded blast radius (~1–3 beads). e.g. "resize these 3 login cards L→XL".
+- **Full** — unknowns to de-risk, architecture decisions to lock, or wide blast
+  radius. When in doubt, propose Full.
+
+The human's answer selects the lane below.
+
+## Quick tier — one lightweight pass
 
 ```bash
-sable-mode set planning --fleet sherlock,columbo,gaudi,victor
+sable-mode set planning --tier quick --fleet columbo
+```
+
+This telescopes the interlock's backlog gate to a single approval — you may author
+the bead(s) without walking all five substages. Manager spawns and code `git push`
+stay blocked (you hand to `/sable-execute` afterward).
+
+1. **Frame it (one strategic line).** State what you'll do in a sentence; ask a
+   question only if it's genuinely ambiguous. This is your lane — strategy, not
+   spec.
+2. **Test spec — run `/columbo --quick "<scope>"` inline.** columbo's process,
+   non-interview: it emits the unit+integration delta, biased to *extending
+   existing tests*. You do NOT author the test contract yourself — columbo does.
+3. **Author the bead(s).** Fold columbo's spec into 1–3 implementation beads, each
+   Fresh-Agent-Test-clean (file paths, the unit+integration test spec, acceptance).
+   Stand up a bare epic only if there's more than one bead. A pure docs/config ask
+   with no code change takes the `[no-test]` path — skip step 2.
+4. **One consolidated gate.** Show the human the frame + columbo's test spec + the
+   bead(s) in a single review. On approval, tell the operator to run
+   `/sable-execute` (→ Tarzan drains it).
+
+**Escalation (one-way only).** If a quick plan hits a real unknown or an
+architecture fork mid-flight, say so and offer to bump to Full — never silently
+downgrade rigor. Bump with `sable-mode set planning --tier full` and continue in
+the full flow below from the substage that matters.
+
+## Full tier — the gated five-substage flow
+
+```bash
+sable-mode set planning --tier full --fleet sherlock,columbo,gaudi,victor
 ```
 
 Writes the mode-state file and initializes `substage=framing`. The interlock now
@@ -46,8 +87,6 @@ populating the backlog (`bd create --parent` / `--graph` / `--file`) until
 `substage=decomposition`** (soft — `--force` overrides). The bare epic shell
 (`bd create --type=epic`) is allowed now: stand it up early as the planning home
 producers attach their review to.
-
-## 2. Walk the substages
 
 Check position with `sable-mode substage get`. Advance ONLY after the human signs
 off on the current deliverable: `sable-mode substage advance`.
@@ -85,19 +124,21 @@ command). Spawn **victor** for a freshness pass, then run the post-batch-create
 verification: `bd dep tree <epic-id>` (edges match intent), `bd ready` (children
 that should be blocked are NOT ready), and `bd swarm validate <epic-id>`.
 
-## 3. Open-questions ledger
+## Open-questions ledger
 
-Any ambiguity surfacing in ANY substage becomes a bead labelled `open-question`
-addressed to the user. You may not hand off to `/execute` while open questions
-remain — draining them is what guarantees execution doesn't need the human.
+Any ambiguity surfacing in ANY substage (either tier) becomes a bead labelled
+`open-question` addressed to the user. You may not hand off to `/sable-execute`
+while open questions remain — draining them is what guarantees execution doesn't
+need the human.
 
-## 4. Hand off to execution
+## Hand off to execution
 
-When `substage=decomposition`, the backlog passes `bd swarm validate`, and no
-`open-question` beads remain, tell the operator to run `/execute`. Don't launch
-managers from planning mode — the interlock blocks it, correctly.
+When the backlog is authored (quick: approved; full: `substage=decomposition`,
+passes `bd swarm validate`) and no `open-question` beads remain, tell the operator
+to run `/sable-execute`. Don't launch managers from planning mode — the interlock
+blocks it, correctly.
 
 ## Deploying changes to this flow
-Cockpit hooks/skills run from INSTALLED copies in `~/.claude/`. After editing the
-SABLE repo (this skill, the interlock, `sable-mode`), run `install.sh` to re-sync
-before changes take effect live.
+Orchestration hooks/skills run from INSTALLED copies in `~/.claude/`. After editing
+the SABLE repo (this skill, the interlock, `sable-mode`), run `install.sh` to
+re-sync before changes take effect live.
