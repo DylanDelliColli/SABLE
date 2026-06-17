@@ -49,8 +49,11 @@ for f in bin/sable-mode hooks/multi-manager/mode-interlock.sh hooks/multi-manage
   lacks "$f" "SABLE_COCKPIT"
   lacks "$f" "cockpit-mode.json"
 done
+# Mode-state override env var unified to SABLE_MODE_STATE across all three
+# components; the retired SABLE_MODE_FILE name is gone (SABLE-d50.4)
 has bin/sable-mode "SABLE_MODE_STATE"
-has hooks/multi-manager/lib-identity.sh "SABLE_MODE_FILE"
+has hooks/multi-manager/lib-identity.sh "SABLE_MODE_STATE"
+lacks hooks/multi-manager/lib-identity.sh "SABLE_MODE_FILE"
 has hooks/multi-manager/mode-interlock.sh "SABLE_ORCHESTRATION_FORCE"
 
 # COCKPIT-DESIGN.md folded away

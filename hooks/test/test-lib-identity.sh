@@ -164,7 +164,7 @@ run_lane_case() {
     [ -n "$env_role" ] && export CLAUDE_AGENT_ROLE="$env_role"
     # Pin mode-file to a nonexistent fixture so the live cockpit state cannot
     # contaminate main-session cases (cf. SABLE-wtv).
-    export SABLE_MODE_FILE="$FIXTURE_DIR/nonexistent-mode-state.json"
+    export SABLE_MODE_STATE="$FIXTURE_DIR/nonexistent-mode-state.json"
     # shellcheck disable=SC1090
     source "$LIB"
     sable_resolve_dispatch_lane "$json"
@@ -225,9 +225,9 @@ run_lane_env() {
     unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE
     if [ -n "$mode_json" ]; then
       printf '%s' "$mode_json" > "$FIXTURE_DIR/mode-case.json"
-      export SABLE_MODE_FILE="$FIXTURE_DIR/mode-case.json"
+      export SABLE_MODE_STATE="$FIXTURE_DIR/mode-case.json"
     else
-      export SABLE_MODE_FILE="$FIXTURE_DIR/nonexistent-mode-state.json"
+      export SABLE_MODE_STATE="$FIXTURE_DIR/nonexistent-mode-state.json"
     fi
     [ -n "$yaml" ] && export SABLE_AGENTS_YAML="$yaml"
     # shellcheck disable=SC1090
@@ -278,6 +278,38 @@ if ( unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE; source "$LIB"; declare -F sable_
 else
   pass "dd1: sable__parse_dispatch_for is deleted"
 fi
+
+# --------------------------------------------------------------------------
+# SABLE-d50.4 — unified mode-state override env var (SABLE_MODE_STATE).
+# lib-identity must read the SAME override name as bin/sable-mode and
+# mode-interlock.sh. The retired SABLE_MODE_FILE name must NOT be honored.
+# --------------------------------------------------------------------------
+
+# Helper: resolve the lane with HOME pinned to an empty dir (no default mode
+# file) and the named env var pointing at an execution-mode fixture.
+run_mode_state_case() {
+  local label="$1" var_name="$2" expect="$3" got
+  got=$(
+    unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_MODE_STATE SABLE_MODE_FILE
+    local home="$FIXTURE_DIR/d504-home"
+    mkdir -p "$home"
+    export HOME="$home"
+    printf '%s' '{"mode":"execution"}' > "$FIXTURE_DIR/d504-mode.json"
+    export "$var_name=$FIXTURE_DIR/d504-mode.json"
+    # shellcheck disable=SC1090
+    source "$LIB"
+    sable_resolve_dispatch_lane '{"tool_name":"Agent"}'
+    printf '%s|%s' "$SABLE_DISPATCH_ACTIVE" "$SABLE_DISPATCH_LANE"
+  )
+  if [ "$got" = "$expect" ]; then pass "$label"; else fail "$label" "expected [$expect] got [$got]"; fi
+}
+
+# SABLE_MODE_STATE drives lib-identity (unified override name)
+run_mode_state_case "d50.4: SABLE_MODE_STATE overrides lib-identity mode path → lane=lincoln" \
+  "SABLE_MODE_STATE" "1|lincoln"
+# Retired SABLE_MODE_FILE name is NOT honored (no default file at the pinned HOME → stands down)
+run_mode_state_case "d50.4: retired SABLE_MODE_FILE is ignored by lib-identity → stands down" \
+  "SABLE_MODE_FILE" "0|"
 
 # --------------------------------------------------------------------------
 # sable_is_git_push unit tests (SABLE-jpr / SABLE-0u1)

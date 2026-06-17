@@ -88,7 +88,7 @@ run_hook() {
   printf '%s' "$1" | \
     env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE \
         SABLE_AGENTS_YAML="$AGENTS_YAML" \
-        SABLE_MODE_FILE="$NONEXISTENT_MODE" \
+        SABLE_MODE_STATE="$NONEXISTENT_MODE" \
         OVERLAP_FILE="$2" \
         PATH="$STUB_DIR:$PATH" \
         bash "$HOOK" 2>/dev/null

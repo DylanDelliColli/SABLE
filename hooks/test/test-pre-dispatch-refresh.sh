@@ -59,7 +59,7 @@ print(json.dumps({'tool_name':'Agent','agent_id':'a1','agent_type':at,'cwd':cwd,
 
 run() { # <json> ; echoes hook stdout
   printf '%s' "$1" | env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE \
-    SABLE_AGENTS_YAML="$AGENTS_YAML" SABLE_MODE_FILE="$NONEXISTENT_MODE" \
+    SABLE_AGENTS_YAML="$AGENTS_YAML" SABLE_MODE_STATE="$NONEXISTENT_MODE" \
     SABLE_BASE_BRANCH=origin/main bash "$HOOK" 2>/dev/null
 }
 

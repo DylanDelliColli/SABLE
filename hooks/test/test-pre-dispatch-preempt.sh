@@ -74,10 +74,10 @@ print(json.dumps(d))
 
 run_hook() { # <json> <env_name> <env_role> <mode_file>
   (
-    unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_MODE_FILE
+    unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_MODE_STATE
     [ -n "$2" ] && export CLAUDE_AGENT_NAME="$2"
     [ -n "$3" ] && export CLAUDE_AGENT_ROLE="$3"
-    [ -n "$4" ] && export SABLE_MODE_FILE="$4"
+    [ -n "$4" ] && export SABLE_MODE_STATE="$4"
     printf '%s' "$1" | bash "$HOOK" 2>/dev/null
   )
 }
