@@ -129,7 +129,7 @@ agents:
   # Lincoln — the v2 main session (SABLE-uz9.5). One entry, two heritages
   # merged: the original Tier-3 strategist (status, arbitration, strategic
   # conversation) and the cockpit seat (mode-aware fleet launch). The user
-  # talks to Lincoln in ONE window; /plan and /execute (skills/sable-plan,
+  # talks to Lincoln in ONE window; /sable-plan and /sable-execute (skills/sable-plan,
   # sable-execute) flip the mode via bin/sable-mode, and the mode-state file
   # governs what Lincoln may spawn (mode-interlock.sh, Bash + Agent
   # legs). Planning mode: walks the gated substages, spawning Tier-2 producers
@@ -141,7 +141,7 @@ agents:
   # machinery — the seat, not the person.
   lincoln:
     type: cockpit
-    scope: "The one operator-facing main session: strategist + mode-aware fleet launch; /plan fills the pool via producer subagents, /execute drains it via resident manager subagents that self-dispatch and self-push"
+    scope: "The one operator-facing main session: strategist + mode-aware fleet launch; /sable-plan fills the pool via producer subagents, /sable-execute drains it via resident manager subagents that self-dispatch and self-push"
     claim_filter: null         # doesn't claim — directs, spawns managers, oversees
     inbox_label: for-lincoln   # arbitration asks from managers, direction from user
     role_prompt: roles/lincoln.md

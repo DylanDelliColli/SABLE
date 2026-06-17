@@ -194,7 +194,7 @@ head -1 ~/.claude/sable/agents.yaml      # registry present
 sable-mode get                           # mode-state helper resolves (planning|execution)
 ```
 
-In a fresh session, `/plan` walks the staged planning substages and `/execute`
+In a fresh session, `/sable-plan` walks the staged planning substages and `/sable-execute`
 drains the pool via the resident managers. Chuck (the merge-queue integrator)
 stays a second terminal — add its env-var alias from the installer's printed
 snippet if you run a merge queue. The full topology lives in
@@ -218,7 +218,7 @@ bash install.sh --orchestration --teams
 SABLE_TEAMS=1 CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude
 ```
 
-`/execute` runs `sable-teams-preflight`, sees `SABLE_TEAMS=1`, and spawns Optimus,
+`/sable-execute` runs `sable-teams-preflight`, sees `SABLE_TEAMS=1`, and spawns Optimus,
 Tarzan, and Chuck as team members (no separate Chuck terminal). The full design is
 in [`AGENT-TEAMS-DESIGN.md`](AGENT-TEAMS-DESIGN.md).
 

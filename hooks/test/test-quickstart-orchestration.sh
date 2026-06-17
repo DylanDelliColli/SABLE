@@ -24,7 +24,7 @@ has "names the multi-manager hooks install dir"    ".claude/hooks/multi-manager"
 has "names the agents.yaml registry install"       ".claude/sable/agents.yaml"
 has "names the skills (slash command) install"      ".claude/skills"
 has "points at sable-mode for cockpit verify"      "sable-mode get"
-has "frames /plan and /execute"                    "/execute"
+has "frames /sable-plan and /sable-execute"        "/sable-execute"
 has "links to the pattern doc for depth"           "MULTI-MANAGER-PATTERN.md"
 
 echo

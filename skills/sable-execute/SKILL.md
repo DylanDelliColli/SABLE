@@ -7,7 +7,7 @@ description: |
   their own approved work, and reminds the operator to open the Chuck terminal.
   In execution mode the interlock hook blocks spawning planning-only producers
   — you are draining the pool, not filling it.
-  Use when asked to "/execute", "enter execution mode", "start executing", or
+  Use when asked to "/sable-execute", "enter execution mode", "start executing", or
   "drain the backlog".
 allowed-tools:
   - Bash
@@ -21,9 +21,9 @@ allowed-tools:
   - SendMessage
 ---
 
-# /execute — enter EXECUTION mode
+# /sable-execute — enter EXECUTION mode
 
-You are **Lincoln** in the cockpit seat (see `roles/lincoln.md`). This skill
+You are **Lincoln**, the orchestrator main session (see `roles/lincoln.md`). This skill
 flips you into **execution mode**, whose single job is to **drain the bead
 pool**.
 
@@ -38,7 +38,7 @@ otherwise you send managers into under-scoped work. Two checks:
 - **No open questions remain.** `bd ready -l open-question` is empty — every
   ambiguity the human needed to resolve has been resolved.
 
-If either fails, the pool is half-formed: return to `/plan`, or drain the
+If either fails, the pool is half-formed: return to `/sable-plan`, or drain the
 `open-question` beads, before proceeding. This is a **discipline gate, not a hard
 lock** — nothing stops you, but skipping it means execution surfaces questions
 the human should have answered during planning, which is exactly what staged
@@ -129,7 +129,7 @@ the team lead.
 - **Workers are unchanged:** managers dispatch their own workers via the Agent
   tool as plain sub-subagents (no `team_name`) and push their own approved work.
 - **The team is disposable; beads is the recovery substrate.** If the session
-  ends, re-run `/execute` to recreate the team — members catch up from beads on
+  ends, re-run `/sable-execute` to recreate the team — members catch up from beads on
   join (the startup sweep in the teams card), then go idle and wake on
   `SendMessage`. `TeamDelete` when draining is done.
 - **Oversee** as in §2a, but broker `for-lincoln` arbitration live over
@@ -137,6 +137,6 @@ the team lead.
 
 ## 3. Hand back to planning
 
-When the pool runs dry or needs regrooming, tell the operator to run `/plan`.
+When the pool runs dry or needs regrooming, tell the operator to run `/sable-plan`.
 Do not spawn producers yourself from execution mode — the interlock will block
 it, and that is correct.

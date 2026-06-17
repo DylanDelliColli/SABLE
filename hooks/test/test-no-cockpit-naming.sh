@@ -14,6 +14,7 @@ exists() { [ -e "$1" ] && pass "exists: $1" || fail "exists: $1" "missing"; }
 absent() { [ ! -e "$1" ] && pass "absent: $1" || fail "absent: $1" "still present"; }
 has()  { grep -q -- "$2" "$1" 2>/dev/null && pass "$1 has '$2'" || fail "$1 has '$2'" "not found"; }
 lacks(){ ! grep -q -- "$2" "$1" 2>/dev/null && pass "$1 lacks '$2'" || fail "$1 lacks '$2'" "still present"; }
+lacks_re(){ ! grep -Eq -- "$2" "$1" 2>/dev/null && pass "$1 lacks /$2/" || fail "$1 lacks /$2/" "still present"; }
 
 # Skills renamed + frontmatter
 exists skills/sable-plan/SKILL.md
@@ -58,5 +59,42 @@ has hooks/multi-manager/mode-interlock.sh "SABLE_ORCHESTRATION_FORCE"
 
 # COCKPIT-DESIGN.md folded away
 absent COCKPIT-DESIGN.md
+
+# --- SABLE-d50.3: residual cockpit-prose scrub + slash-command mapping ---
+# Fully-scrubbed files: the bare word 'cockpit' is gone. (It legitimately
+# survives as the registry type/env-name identifier in agents.yaml + the hook
+# code, and as the mode-machinery name in lincoln.md / the topology docs — those
+# are owned by other beads and intentionally NOT asserted here.)
+for f in skills/sable-plan/SKILL.md \
+         skills/sable-execute/SKILL.md \
+         templates/multi-manager/roles/sherlock.md \
+         templates/agents/sherlock.md \
+         templates/agents-teams/sherlock.md \
+         SABLE.md \
+         hooks/multi-manager/session-role-anchor.sh; do
+  lacks "$f" "cockpit"
+done
+# Mixed files: prose scrubbed but legit identifiers (type list / env-name match)
+# retained — assert the specific scrubbed phrases are gone, not the whole word.
+lacks hooks/multi-manager/mode-interlock.sh "cockpit seat"
+lacks hooks/multi-manager/mode-interlock.sh "cockpit main"
+lacks hooks/multi-manager/mode-interlock.sh "from the cockpit"
+lacks hooks/multi-manager/lib-identity.sh 'cockpit" default'
+
+# Slash-command mapping: the skills resolve as /sable-plan and /sable-execute
+# (their frontmatter names — there is no /plan or /execute command alias). The
+# word-boundary regex catches the bare stale form while sparing /sable-plan and
+# the unrelated /plan-ceo-review skill (a '-' after 'plan' is excluded).
+for f in skills/sable-execute/SKILL.md \
+         QUICKSTART.md \
+         MULTI-MANAGER-PATTERN.md \
+         PERSONAL-TOOLING.md \
+         templates/multi-manager/agents.yaml \
+         templates/multi-manager/roles/lincoln.md \
+         hooks/multi-manager/mode-interlock.sh; do
+  lacks_re "$f" "/plan([^A-Za-z-]|$)"
+  lacks_re "$f" "/execute([^A-Za-z-]|$)"
+done
+has skills/sable-execute/SKILL.md "/sable-execute"
 
 if [ "$fails" -eq 0 ]; then printf 'PASS test-no-cockpit-naming\n'; else printf 'FAIL test-no-cockpit-naming (%d)\n' "$fails"; exit 1; fi

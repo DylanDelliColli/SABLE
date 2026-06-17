@@ -278,21 +278,21 @@ In SABLE, you don't write a separate implementation plan and then create beads. 
 
 If a session ends mid-work, the next agent runs `bd ready` and continues. No re-reading plans. No lost context. The beads are the single source of truth.
 
-#### 3.6.1 Staged Planning (cockpit extension)
+#### 3.6.1 Staged Planning (orchestration extension)
 
-The design-to-beads workflow above is the single-agent form. When the cockpit
+The design-to-beads workflow above is the single-agent form. When the orchestration
 multi-agent layer is active (see `MULTI-MANAGER-PATTERN.md`), planning becomes a **gated
 substage state machine** so no implementation bead is authored before the
 upstream thinking is done and human-signed-off:
 
 **FRAMING → RESEARCH → ARCHITECTURE → TEST-STRATEGY → DECOMPOSITION**
 
-- **FRAMING** — the cockpit, live with the user: stories, non-goals, success
+- **FRAMING** — the orchestrator, live with the user: stories, non-goals, success
   metric, the narrowest wedge. Stands up the bare epic shell.
 - **RESEARCH** — Sherlock (greenfield): prior art, pitfalls, unknowns to de-risk.
 - **ARCHITECTURE** — Gaudi: locked interface contracts and tradeoffs.
 - **TEST-STRATEGY** — Columbo: the locked unit+integration test contract.
-- **DECOMPOSITION** — the cockpit authors the implementation children, each
+- **DECOMPOSITION** — the orchestrator authors the implementation children, each
   tracing to a story + acceptance scenario.
 
 The human signs off before each `sable-mode substage advance`, and the mode

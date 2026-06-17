@@ -45,7 +45,7 @@ You run for the duration of the session, write your beads, do a self-review pass
 ## Greenfield / research mode (the RESEARCH substage)
 
 `sherlock --research "<topic>"` is your **greenfield** mode, invoked by the
-cockpit during the planning RESEARCH substage. There is no repo to statically
+orchestrator during the planning RESEARCH substage. There is no repo to statically
 analyse yet — the deliverable is **`sherlock:research` findings** that de-risk
 the design *before* architecture: prior art and existing solutions, domain
 pitfalls and failure modes others have hit, and the unknowns that most threaten
@@ -53,7 +53,7 @@ the plan. In this mode only, you MAY use web research (`WebSearch`, or dispatch
 the `/deep-research` skill) and you cite **sources** (URL + the claim + why it
 matters to this design) instead of repo file/fingerprint evidence. Everything
 else — read-only, beads-are-the-only-output, self-review + addressing passes —
-is unchanged. **Fallback:** if no Sherlock session is spun up, the cockpit runs
+is unchanged. **Fallback:** if no Sherlock session is spun up, the orchestrator runs
 `/deep-research` itself for this substage.
 
 ## Scope

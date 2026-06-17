@@ -142,7 +142,7 @@ Planning is staged, not a single step. The five substages are:
 Human signs off before each `sable-mode substage advance`. The interlock blocks
 the Lincoln session from populating the implementation backlog until
 `substage=decomposition`. See [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) and the
-`/plan` skill.
+`/sable-plan` skill.
 
 Mechanics:
 
@@ -150,7 +150,7 @@ Mechanics:
   `~/.claude/sable/state/mode-state.json` (`{mode, since, fleet, substage}`).
   The single source of truth shared by the skills and the interlock.
   `sable-mode substage get|set|advance` walks the planning substages.
-- **`/plan` and `/execute`** (`skills/sable-plan`, `skills/sable-execute`) —
+- **`/sable-plan` and `/sable-execute`** (`skills/sable-plan`, `skills/sable-execute`) —
   flip the mode and swap Lincoln's persona.
 - **`hooks/multi-manager/mode-interlock.sh`** — the mechanical guarantee.
   A `PreToolUse:Bash` guard that enforces the mode boundary (soft `--force` /

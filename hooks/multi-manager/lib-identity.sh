@@ -387,7 +387,7 @@ except Exception:
   [ "$mode" = "execution" ] || return 0
 
   # Lincoln main session in execution mode: lane = self. (Contract invariant 4 —
-  # never the legacy "cockpit" default, never parsed from the prompt.)
+  # never a legacy default lane, never parsed from the prompt.)
   SABLE_DISPATCH_ACTIVE=1
   SABLE_DISPATCH_LANE="lincoln"
   return 0

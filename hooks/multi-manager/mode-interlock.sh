@@ -3,7 +3,7 @@
 # Trigger: PreToolUse:Bash AND PreToolUse:Agent | Timeout: 3000ms
 #
 # The mechanical guarantee that makes the two modes real rather than advisory
-# persona. Modes flip mid-conversation via /plan and /execute — the state file
+# persona. Modes flip mid-conversation via /sable-plan and /sable-execute — the state file
 # is re-read on every tool call, so the boundary moves the moment the skill
 # rewrites it.
 #
@@ -13,7 +13,7 @@
 # for the current mode — the boundary the interlock exists to make mechanical
 # would go advisory for the entire subtree. It is enforced as an identity-aware
 # matrix:
-#   spawner = main (cockpit seat: no agent_id, env lincoln/cockpit)
+#   spawner = main (main session: no agent_id, env lincoln/cockpit)
 #           | subagent (agent_id present)
 #   target  = manager-typed | producer-typed | unregistered
 #             (tool_input.subagent_type looked up in agents.yaml: a registered
@@ -28,7 +28,7 @@
 # guards the MODE boundary, not tree shape.
 #
 # The Bash leg (legacy launch aliases, git push, backlog population + the
-# SABLE-kwr.3 quick-tier substage telescope) governs only the cockpit main
+# SABLE-kwr.3 quick-tier substage telescope) governs only the main
 # session — in v3 subagents spawn via the Agent tool, not via bash claude aliases.
 #
 # Soft override: a Bash command carrying `--force`, or env
@@ -133,13 +133,13 @@ except Exception:
 " 2>/dev/null | tr '[:upper:]' '[:lower:]')"
   [ -z "$SUBTYPE" ] && exit 0
 
-  # Spawner dimension: subagent (agent_id present) vs cockpit main session.
+  # Spawner dimension: subagent (agent_id present) vs main session.
   if [ -n "$AGENT_ID" ]; then
     SPAWNER="subagent"
   else
     case "${CLAUDE_AGENT_NAME:-}" in
       lincoln|cockpit) SPAWNER="main" ;;
-      *) exit 0 ;;   # non-cockpit env terminal / plain session: Agent leg ungoverned
+      *) exit 0 ;;   # other env terminal / plain session: Agent leg ungoverned
     esac
   fi
 
@@ -150,7 +150,7 @@ except Exception:
     planning)
       case "$TARGET" in
         manager)
-          deny "Orchestration is in PLANNING mode — spawning an execution manager ($SUBTYPE) is blocked. You fill the pool here; you do not stand up the fleet. Run /execute to drain it, or set SABLE_ORCHESTRATION_FORCE=1 to override."
+          deny "Orchestration is in PLANNING mode — spawning an execution manager ($SUBTYPE) is blocked. You fill the pool here; you do not stand up the fleet. Run /sable-execute to drain it, or set SABLE_ORCHESTRATION_FORCE=1 to override."
           ;;
         producer)
           [ "$SPAWNER" = "subagent" ] && deny "Orchestration is in PLANNING mode — a subagent may not spawn planning producers ($SUBTYPE); producer fan-out stays under the main session. Set SABLE_ORCHESTRATION_FORCE=1 to override."
@@ -163,7 +163,7 @@ except Exception:
           [ "$SPAWNER" = "subagent" ] && deny "Orchestration is in EXECUTION mode — only the main session spawns the manager fleet; a subagent may not spawn $SUBTYPE (managers do not clone managers). Set SABLE_ORCHESTRATION_FORCE=1 to override."
           ;;
         producer)
-          deny "Orchestration is in EXECUTION mode — spawning a planning producer ($SUBTYPE) is blocked; you drain the pool here, you do not fill it. Run /plan for a planning session, or set SABLE_ORCHESTRATION_FORCE=1 to override."
+          deny "Orchestration is in EXECUTION mode — spawning a planning producer ($SUBTYPE) is blocked; you drain the pool here, you do not fill it. Run /sable-plan for a planning session, or set SABLE_ORCHESTRATION_FORCE=1 to override."
           ;;
       esac
       ;;
@@ -172,7 +172,7 @@ except Exception:
 fi
 
 # ---------------------------------------------------------------------------
-# Bash leg: governs the cockpit main session only — legacy launch aliases, git
+# Bash leg: governs the main session only — legacy launch aliases, git
 # push, backlog population. Subagents spawn via the Agent tool in v3, so the
 # Bash leg stays main-session scoped (subagent Bash launches are a non-scenario).
 # ---------------------------------------------------------------------------
@@ -242,10 +242,10 @@ get_tier() {
 case "$MODE" in
   planning)
     if launches 'optimus|tarzan|chuck'; then
-      deny "Orchestration is in PLANNING mode — launching execution managers (optimus/tarzan/chuck) is blocked. Run /execute to drain the pool, or append --force to override."
+      deny "Orchestration is in PLANNING mode — launching execution managers (optimus/tarzan/chuck) is blocked. Run /sable-execute to drain the pool, or append --force to override."
     fi
     if printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])git[[:space:]]+push([[:space:]]|$)'; then
-      deny "Orchestration is in PLANNING mode — code 'git push' is blocked so you don't ship from a half-formed backlog. Run /execute first, or append --force to override."
+      deny "Orchestration is in PLANNING mode — code 'git push' is blocked so you don't ship from a half-formed backlog. Run /sable-execute first, or append --force to override."
     fi
     if authors_backlog && [ "$(get_tier)" != "quick" ]; then
       SUBSTAGE="$(get_substage)"
@@ -256,7 +256,7 @@ case "$MODE" in
     ;;
   execution)
     if launches 'sherlock|victor|columbo|gaudi'; then
-      deny "Orchestration is in EXECUTION mode — launching planning-only producers (sherlock/victor/columbo/gaudi) from the cockpit is blocked. Run /plan for a planning session, or append --force to override."
+      deny "Orchestration is in EXECUTION mode — launching planning-only producers (sherlock/victor/columbo/gaudi) is blocked. Run /sable-plan for a planning session, or append --force to override."
     fi
     ;;
 esac
