@@ -37,46 +37,16 @@ set -euo pipefail
 
 HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
 
-# Identity via lib-identity.sh (SABLE-uz9.3): the gate fires for ANY manager
-# identity — legacy env terminals (Chuck holdout), the v2 cockpit/Lincoln main
-# session (env CLAUDE_AGENT_NAME=cockpit set by the launcher — Lincoln pushes
-# under option A since workers don't), and manager-typed subagents. Workers
-# and anonymous sessions stand down.
+# Identity via lib-identity.sh (SABLE-uz9.3 / SABLE-404): the gated phases fire
+# for ANY manager identity — legacy env terminals (Chuck holdout), the Lincoln
+# main session in execution mode, and manager-typed subagents (Optimus/Tarzan
+# pushing their OWN lane from a nested subagent context; v3 moved push authority
+# to the managers). Worker subagents are mechanically DENIED below (they return
+# their stopped-before-push results to the manager, who reviews and pushes the
+# lane); anonymous main sessions stand down.
 # shellcheck source=lib-identity.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib-identity.sh"
 sable_resolve_identity "$HOOK_INPUT"
-[ "$SABLE_ID_IS_MANAGER" -eq 1 ] || exit 0
-
-PARSED=$(printf '%s' "$HOOK_INPUT" | python3 -c "
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    d = {}
-cmd = d.get('tool_input', {}).get('command', '')
-cwd = d.get('cwd', '')
-print(f'{cwd}\n{cmd}')
-" 2>/dev/null) || exit 0
-
-CWD=$(echo "$PARSED" | sed -n '1p')
-COMMAND=$(echo "$PARSED" | sed -n '2,$p')
-
-# Use shared matcher so 'git -C <path> push' and other flag-interleaved forms
-# are matched correctly; also prevents false-positives when "git push" appears
-# only as a quoted argument in another command (SABLE-0u1)
-sable_is_git_push "$COMMAND" || exit 0
-echo "$COMMAND" | grep -qE '(\-\-force|\-f\b)' && exit 0
-
-[ -z "$CWD" ] && exit 0
-[ ! -d "$CWD/.git" ] && [ ! -f "$CWD/.git" ] && exit 0
-
-# Validate base ref and fall back gracefully when SABLE_BASE_BRANCH points to
-# a ref that doesn't exist in this repo (SABLE-61n)
-BASE_BRANCH=$(sable_validate_base_ref "$CWD" "${SABLE_BASE_BRANCH:-origin/main}")
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 emit_deny() {
   # $1 = reason text
@@ -104,6 +74,65 @@ print(json.dumps({
 }))
 "
 }
+
+PARSED=$(printf '%s' "$HOOK_INPUT" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+cmd = d.get('tool_input', {}).get('command', '')
+cwd = d.get('cwd', '')
+print(f'{cwd}\n{cmd}')
+" 2>/dev/null) || exit 0
+
+CWD=$(echo "$PARSED" | sed -n '1p')
+COMMAND=$(echo "$PARSED" | sed -n '2,$p')
+
+# --- v3 worker-push deny leg (SABLE-404, locked Gaudi decision; consolidates
+# SABLE-myg). A subagent that is NOT a manager (a worker type, or an unnamed
+# agent_id) must not push: workers return their stopped-before-push results to
+# the manager that dispatched them, and the manager reviews and pushes the lane.
+# This is the mechanical backstop for the prompt-level "workers don't push" rule.
+# It fires ONLY on a real git push (non-push git commands are untouched) and
+# BEFORE the manager path's --force skip below, so --force cannot bypass it.
+# SABLE_WORKER_PUSH_OVERRIDE=1 authorizes an exceptional worker push (mirrors the
+# tree-claim override shape). Error mode: identity resolution must have succeeded
+# to reach here on a clean worker resolution — fail open only on a resolution
+# crash, never on a clean worker identity.
+if [ "$SABLE_ID_IS_SUBAGENT" -eq 1 ] && [ "$SABLE_ID_IS_MANAGER" -eq 0 ]; then
+  if sable_is_git_push "$COMMAND"; then
+    if [ "${SABLE_WORKER_PUSH_OVERRIDE:-}" = "1" ]; then
+      emit_context "Pre-push: worker-identity push (${SABLE_ID_NAME:-unnamed}) ALLOWED via SABLE_WORKER_PUSH_OVERRIDE=1. Workers normally return results to their manager, who reviews and pushes the lane; this explicit override was recorded."
+      exit 0
+    fi
+    emit_deny "Pre-push denied: worker subagents do not push. This identity (${SABLE_ID_NAME:-unnamed agent}) is a worker, not a registered manager. Return your results to the manager that dispatched you; the manager reviews your stopped-before-push result and pushes the lane itself (git -C <worktree> push). If you genuinely must push from this worker, set SABLE_WORKER_PUSH_OVERRIDE=1 in the hook environment."
+    exit 0
+  fi
+  # Worker identity, but not a git push — leave untouched.
+  exit 0
+fi
+
+# Only manager identities reach the gated phases below.
+[ "$SABLE_ID_IS_MANAGER" -eq 1 ] || exit 0
+
+# Use shared matcher so 'git -C <path> push' and other flag-interleaved forms
+# are matched correctly; also prevents false-positives when "git push" appears
+# only as a quoted argument in another command (SABLE-0u1)
+sable_is_git_push "$COMMAND" || exit 0
+echo "$COMMAND" | grep -qE '(\-\-force|\-f\b)' && exit 0
+
+[ -z "$CWD" ] && exit 0
+[ ! -d "$CWD/.git" ] && [ ! -f "$CWD/.git" ] && exit 0
+
+# Validate base ref and fall back gracefully when SABLE_BASE_BRANCH points to
+# a ref that doesn't exist in this repo (SABLE-61n)
+BASE_BRANCH=$(sable_validate_base_ref "$CWD" "${SABLE_BASE_BRANCH:-origin/main}")
+
+# ---------------------------------------------------------------------------
+# Helpers  (emit_deny / emit_context are defined above, before the worker-deny
+# leg that needs them)
+# ---------------------------------------------------------------------------
 
 # Auto-detect typecheck command from project markers.
 # Echoes the command (or empty if no typechecker found).
