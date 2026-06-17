@@ -268,6 +268,8 @@ cat > "$FIX_YAML" <<'YAML'
 agents:
   optimus:
     type: epic_manager
+  tarzan:
+    type: one_off_manager
   chuck:
     type: integrator
 YAML
@@ -283,6 +285,62 @@ if grep -q 'from optimus' "$BD_LOG" 2>/dev/null; then
   pass "teams member: PR attributed to resolved name (optimus), not empty env"
 else
   fail "teams member: PR attributed to resolved name (optimus)" "title missing resolved name (BD_LOG: $(cat "$BD_LOG" 2>/dev/null | head -3))"
+fi
+rm -f "$BD_LOG"
+
+# --------------------------------------------------------------------------
+# v3 resolved-identity attribution — SABLE-8fp / SABLE-aok
+# In v3 the push happens inside a manager SUBAGENT: env belongs to the PARENT
+# session and must be ignored. Attribution comes from SABLE_ID_NAME, never the
+# raw CLAUDE_AGENT_NAME env var, and the hook must survive an unset env var
+# under set -euo pipefail.
+# --------------------------------------------------------------------------
+
+# Case 1: manager-subagent push (tarzan) with deliberate env contamination
+# (CLAUDE_AGENT_NAME=lincoln). Resolved identity must win; lincoln must NOT leak.
+MEMBER_INPUT_C=$(make_member_post_input "git push" "$FIXTURE_REPO" "tarzan")
+run_hook "CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager SABLE_AGENTS_YAML=$FIX_YAML" "$MEMBER_INPUT_C" >/dev/null
+if grep -q 'Review PR from tarzan' "$BD_LOG" 2>/dev/null \
+   && grep -q 'Submitted by: tarzan' "$BD_LOG" 2>/dev/null \
+   && grep -q 'for-tarzan' "$BD_LOG" 2>/dev/null; then
+  pass "manager-subagent (tarzan) attributes to resolved identity despite env CLAUDE_AGENT_NAME=lincoln"
+else
+  fail "manager-subagent (tarzan) attributes to resolved identity despite env contamination" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null | head -8)"
+fi
+if grep -qi 'lincoln' "$BD_LOG" 2>/dev/null; then
+  fail "env contamination: no 'lincoln' leaks into the for-chuck bead" "BD_LOG contains lincoln: $(grep -i lincoln "$BD_LOG" | head -2)"
+else
+  pass "env contamination: no 'lincoln' leaks into the for-chuck bead"
+fi
+rm -f "$BD_LOG"
+
+# Case 2: unset CLAUDE_AGENT_NAME must not crash under set -euo pipefail
+# (the silent-failure regression: a dereference of $CLAUDE_AGENT_NAME would kill
+# the hook before bd create and drop the Chuck handoff).
+MEMBER_INPUT_T=$(make_member_post_input "git push" "$FIXTURE_REPO" "tarzan")
+ERR=$(env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" SABLE_AGENTS_YAML="$FIX_YAML" bash "$HOOK" <<< "$MEMBER_INPUT_T" 2>&1 >/dev/null); RC=$?
+if [ "$RC" -eq 0 ] && ! echo "$ERR" | grep -qi "unbound variable"; then
+  pass "unset CLAUDE_AGENT_NAME: hook survives set -u (exit 0, no unbound variable)"
+else
+  fail "unset CLAUDE_AGENT_NAME: hook survives set -u" "rc=$RC err=${ERR:-<none>}"
+fi
+if grep -q 'for-chuck' "$BD_LOG" 2>/dev/null && grep -q 'from tarzan' "$BD_LOG" 2>/dev/null; then
+  pass "unset CLAUDE_AGENT_NAME: bead still files attributed to tarzan"
+else
+  fail "unset CLAUDE_AGENT_NAME: bead still files attributed to tarzan" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null | head -8)"
+fi
+rm -f "$BD_LOG"
+
+# Case 3: env-identified legacy manager attributes by env name (resolved == env).
+# NB: the spec's 'chuck' example is moot — the hook skips chuck's own pushes (it
+# IS the merge integrator, line 24); optimus is the representative env-terminal
+# manager and exercises the legacy escape path in lib-identity.
+INPUT_ENV=$(make_post_input "git push" "$FIXTURE_REPO")
+run_hook "CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager" "$INPUT_ENV" >/dev/null
+if grep -q 'Review PR from optimus' "$BD_LOG" 2>/dev/null && grep -q 'Submitted by: optimus' "$BD_LOG" 2>/dev/null; then
+  pass "env-identified manager (optimus) attributes by resolved env name"
+else
+  fail "env-identified manager (optimus) attributes by resolved env name" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null | head -8)"
 fi
 rm -f "$BD_LOG"
 

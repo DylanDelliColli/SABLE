@@ -13,8 +13,10 @@ set -euo pipefail
 
 HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
 
-# Identity via lib-identity.sh (SABLE-uz9.3): fires for any manager identity
-# (legacy env terminals, v2 cockpit/Lincoln main session, manager subagents);
+# Identity via lib-identity.sh (SABLE-uz9.3 / SABLE-aok): fires for any manager
+# identity (legacy env terminals, the Lincoln main session in execution mode,
+# and manager subagents — attribution uses the RESOLVED name SABLE_ID_NAME, never
+# the raw CLAUDE_AGENT_NAME env, which belongs to the parent session in v3);
 # workers and anonymous sessions stand down.
 # shellcheck source=lib-identity.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib-identity.sh"
