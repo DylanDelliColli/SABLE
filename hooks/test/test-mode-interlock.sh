@@ -37,7 +37,35 @@ fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n
 # Shared temp state; set mode per test group via the real helper.
 SABLE_MODE_STATE="$(mktemp -u)"
 export SABLE_MODE_STATE
-trap 'rm -f "$SABLE_MODE_STATE"' EXIT
+
+# Hermetic registry so the v3 Agent-leg matrix (SABLE-4k7) classifies spawn
+# TARGETS by registry type: manager-typed (epic_manager/one_off_manager/
+# integrator/strategist/cockpit) vs producer-typed (any other registered type)
+# vs unregistered (free). Without this the matrix would read the installed
+# ~/.claude registry and the suite would not be hermetic.
+SABLE_AGENTS_YAML="$(mktemp)"
+export SABLE_AGENTS_YAML
+cat > "$SABLE_AGENTS_YAML" <<'YAML'
+agents:
+  optimus:
+    type: epic_manager
+  tarzan:
+    type: one_off_manager
+  chuck:
+    type: integrator
+  lincoln:
+    type: cockpit
+  sherlock:
+    type: auditor
+  victor:
+    type: bead_validator
+  columbo:
+    type: test_planner
+  rudy:
+    type: quality_validator
+YAML
+
+trap 'rm -f "$SABLE_MODE_STATE" "$SABLE_AGENTS_YAML"' EXIT
 
 set_mode() { "$MODE_BIN" set "$1" >/dev/null 2>&1; }
 clear_mode() { rm -f "$SABLE_MODE_STATE"; }
@@ -162,19 +190,28 @@ if is_deny "$out_disabled"; then fail "SABLE_ORCHESTRATION=off no-ops the interl
 
 # ---------- v2: lincoln identity + Agent-tool leg (SABLE-uz9.5) ----------
 
-# agent_json <subagent_type> [agent_id] → hook input for an Agent spawn
+# agent_json <subagent_type> [agent_id] [agent_type] → hook input for an Agent spawn
 agent_json() {
   python3 -c "
 import json, sys
 d = {'tool_name': 'Agent', 'tool_input': {'subagent_type': sys.argv[1], 'prompt': 'work', 'description': 'spawn'}}
 if len(sys.argv) > 2 and sys.argv[2]:
     d['agent_id'] = sys.argv[2]
+if len(sys.argv) > 3 and sys.argv[3]:
+    d['agent_type'] = sys.argv[3]
 print(json.dumps(d))
-" "$1" "${2:-}"
+" "$1" "${2:-}" "${3:-}"
 }
 
 run_agent() { # <subagent_type> <env_name> [agent_id]
   agent_json "$1" "${3:-}" | CLAUDE_AGENT_NAME="$2" bash "$HOOK" 2>/dev/null
+}
+
+# run_agent_t <subagent_type> <env_name> <agent_id> <agent_type> [extra_env]
+# The v3 native-dispatch shape: the spawner is a subagent (agent_id present)
+# carrying its own agent_type. env_name is the inherited PARENT env identity.
+run_agent_t() {
+  agent_json "$1" "$3" "$4" | CLAUDE_AGENT_NAME="$2" ${5:-} bash "$HOOK" 2>/dev/null
 }
 
 set_mode planning
@@ -203,12 +240,16 @@ if is_deny "$out"; then pass "v2 execution blocks Agent spawn of victor (legacy 
 out="$(run_agent optimus lincoln)"
 if is_deny "$out"; then fail "v2 execution allows Agent spawn of optimus" "got deny"; else pass "v2 execution allows Agent spawn of optimus"; fi
 
+# v3 (SABLE-4k7): registry-based classification catches rudy (quality_validator =
+# producer) that the v2 hardcoded sherlock|victor|columbo list missed. rudy is a
+# planning-session agent and must be blocked in execution.
 out="$(run_agent rudy lincoln)"
-if is_deny "$out"; then fail "v2 execution allows Agent spawn of rudy (not producer-gated)" "got deny"; else pass "v2 execution allows Agent spawn of rudy (not producer-gated)"; fi
+if is_deny "$out"; then pass "v3 execution blocks Agent spawn of rudy (quality_validator = producer)"; else fail "v3 execution blocks Agent spawn of rudy (quality_validator = producer)" "got: ${out:-<empty>}"; fi
 
-# Agent leg: subagent context no-op
+# Agent leg (v3 SABLE-4k7): the blanket subagent no-op is GONE — a subagent
+# spawning a PRODUCER in execution is DENIED (governance extends tree-wide).
 out="$(run_agent sherlock lincoln sub-9)"
-if is_deny "$out"; then fail "v2 Agent leg no-op in subagent context" "got deny"; else pass "v2 Agent leg no-op in subagent context"; fi
+if is_deny "$out"; then pass "v3 execution: subagent spawning a producer (sherlock) is DENIED"; else fail "v3 execution: subagent spawning a producer (sherlock) is DENIED" "got: ${out:-<empty>}"; fi
 
 # Native dispatch (SABLE-uz9.13): a manager-subagent spawning its own worker is
 # a subagent-context Agent call (agent_id present); the interlock must NOT block
@@ -216,9 +257,87 @@ if is_deny "$out"; then fail "v2 Agent leg no-op in subagent context" "got deny"
 out="$(run_agent general-purpose lincoln mgr-sub-1)"
 if is_deny "$out"; then fail "execution allows manager-subagent worker spawn (general-purpose, agent_id)" "got deny"; else pass "execution allows manager-subagent worker spawn (general-purpose, agent_id)"; fi
 
-# Agent leg: non-cockpit identity no-op
+# Agent leg: non-cockpit identity no-op (a legacy env-manager terminal with no
+# agent_id is neither the cockpit seat nor a subagent → Agent leg ungoverned).
 out="$(run_agent sherlock optimus)"
-if is_deny "$out"; then fail "v2 Agent leg no-op for non-lincoln identity" "got deny"; else pass "v2 Agent leg no-op for non-lincoln identity"; fi
+if is_deny "$out"; then fail "v3 Agent leg no-op for non-cockpit env identity" "got deny"; else pass "v3 Agent leg no-op for non-cockpit env identity"; fi
+
+# ===================================================================
+# v3 enforcement matrix — SABLE-4k7 / SABLE-zf1
+# The Agent leg now governs the WHOLE subtree, not just the main session.
+# Spawner dimension: main (cockpit seat, no agent_id) vs subagent (agent_id).
+# Target dimension (registry type): manager | producer | unregistered(free).
+#   PLANNING:  manager target → DENY any spawner;
+#              producer target → ALLOW main, DENY subagent; unregistered → FREE.
+#   EXECUTION: manager target → ALLOW main only, DENY subagent;
+#              producer target → DENY any spawner; unregistered → FREE (worker lane).
+# Main-session cells (1,5) are covered by the regression assertions above.
+# ===================================================================
+
+# ---- PLANNING subagent-spawner cells ----
+set_mode planning
+
+# (2) manager-typed subagent spawning a manager → DENY
+out="$(run_agent_t optimus lincoln mgr-sub-1 tarzan)"
+if is_deny "$out"; then pass "planning: manager-subagent (tarzan) spawning a manager (optimus) DENIED"; else fail "planning: manager-subagent (tarzan) spawning a manager (optimus) DENIED" "got: ${out:-<empty>}"; fi
+
+# (3) producer-typed subagent spawning a producer → DENY
+out="$(run_agent_t victor lincoln prod-sub-1 sherlock)"
+if is_deny "$out"; then pass "planning: producer-subagent (sherlock) spawning a producer (victor) DENIED"; else fail "planning: producer-subagent (sherlock) spawning a producer (victor) DENIED" "got: ${out:-<empty>}"; fi
+
+# (4) producer subagent spawning Explore (unregistered) → ALLOW
+out="$(run_agent_t Explore lincoln prod-sub-2 sherlock)"
+if is_deny "$out"; then fail "planning: producer-subagent spawning Explore (unregistered) ALLOWED" "got deny: $out"; else pass "planning: producer-subagent spawning Explore (unregistered) ALLOWED"; fi
+
+# ---- EXECUTION subagent-spawner cells ----
+set_mode execution
+
+# (6) manager subagent spawning a manager → DENY (only the main session spawns the fleet)
+out="$(run_agent_t optimus lincoln mgr-sub-2 tarzan)"
+if is_deny "$out"; then pass "execution: manager-subagent (tarzan) spawning a manager (optimus) DENIED"; else fail "execution: manager-subagent (tarzan) spawning a manager (optimus) DENIED" "got: ${out:-<empty>}"; fi
+
+# (7) manager subagent spawning a producer → DENY (execution drains, never fills)
+out="$(run_agent_t sherlock lincoln mgr-sub-3 tarzan)"
+if is_deny "$out"; then pass "execution: manager-subagent (tarzan) spawning a producer (sherlock) DENIED"; else fail "execution: manager-subagent (tarzan) spawning a producer (sherlock) DENIED" "got: ${out:-<empty>}"; fi
+
+# (8) manager subagent spawning unregistered worker types → ALLOW (THE load-bearing
+# v3 allow: the lane manager worker dispatches ride on; a false deny bricks v3).
+out="$(run_agent_t general-purpose lincoln mgr-sub-4 tarzan)"
+if is_deny "$out"; then fail "execution: manager-subagent spawning general-purpose worker ALLOWED" "got deny: $out"; else pass "execution: manager-subagent spawning general-purpose worker ALLOWED"; fi
+out="$(run_agent_t Explore lincoln mgr-sub-5 tarzan)"
+if is_deny "$out"; then fail "execution: manager-subagent spawning Explore worker ALLOWED" "got deny: $out"; else pass "execution: manager-subagent spawning Explore worker ALLOWED"; fi
+
+# (9) override: SABLE_ORCHESTRATION_FORCE=1 flips a subagent-spawner deny to allow
+out="$(agent_json sherlock mgr-sub-6 tarzan | SABLE_ORCHESTRATION_FORCE=1 CLAUDE_AGENT_NAME=lincoln bash "$HOOK" 2>/dev/null)"
+if is_deny "$out"; then fail "execution: SABLE_ORCHESTRATION_FORCE=1 flips subagent deny to allow" "got deny: $out"; else pass "execution: SABLE_ORCHESTRATION_FORCE=1 flips subagent deny to allow"; fi
+
+# (10) mode-file lifecycle: missing file and malformed JSON both leave it inert
+clear_mode
+out="$(run_agent_t sherlock lincoln mgr-sub-7 tarzan)"
+if is_deny "$out"; then fail "lifecycle: missing mode file → interlock inert (allow)" "got deny: $out"; else pass "lifecycle: missing mode file → interlock inert (allow)"; fi
+printf '%s' '{broken json' > "$SABLE_MODE_STATE"
+out="$(run_agent_t sherlock lincoln mgr-sub-8 tarzan)"
+if is_deny "$out"; then fail "lifecycle: malformed mode file → fail open (allow)" "got deny: $out"; else pass "lifecycle: malformed mode file → fail open (allow)"; fi
+
+# (11) mode flip mid-session honored without caching: same input, decisions track the file
+set_mode planning
+o1="$(run_agent sherlock lincoln)"   # planning + producer + main → allow
+set_mode execution
+o2="$(run_agent sherlock lincoln)"   # execution + producer + main → deny
+set_mode planning
+o3="$(run_agent sherlock lincoln)"   # planning again → allow
+if ! is_deny "$o1" && is_deny "$o2" && ! is_deny "$o3"; then
+  pass "mode flip mid-session honored without caching (allow → deny → allow)"
+else
+  fail "mode flip mid-session honored without caching (allow → deny → allow)" "o1=$(is_deny "$o1" && echo deny || echo allow) o2=$(is_deny "$o2" && echo deny || echo allow) o3=$(is_deny "$o3" && echo deny || echo allow)"
+fi
+
+# (12) fail open: agents.yaml unreadable → allow, and stdin is drained (no BrokenPipeError)
+set_mode execution
+err="$(agent_json sherlock mgr-sub-9 tarzan | SABLE_AGENTS_YAML=/nonexistent/registry.yaml CLAUDE_AGENT_NAME=lincoln bash "$HOOK" 2>&1 1>/dev/null)"
+out="$(agent_json sherlock mgr-sub-9 tarzan | SABLE_AGENTS_YAML=/nonexistent/registry.yaml CLAUDE_AGENT_NAME=lincoln bash "$HOOK" 2>/dev/null)"
+if is_deny "$out"; then fail "fail open: unreadable registry → allow" "got deny: $out"; else pass "fail open: unreadable registry → allow"; fi
+if printf '%s' "$err" | grep -q 'BrokenPipeError'; then fail "fail open: no BrokenPipeError on unreadable registry" "$err"; else pass "fail open: no BrokenPipeError on unreadable registry"; fi
 
 set_mode planning
 

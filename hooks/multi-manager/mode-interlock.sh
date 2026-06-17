@@ -1,73 +1,70 @@
 #!/usr/bin/env bash
-# mode-interlock.sh — Enforce the cockpit's planning/execution boundary.
+# mode-interlock.sh — Enforce the orchestration planning/execution boundary.
 # Trigger: PreToolUse:Bash AND PreToolUse:Agent | Timeout: 3000ms
 #
-# This is the mechanical guarantee that makes the cockpit's two modes real
-# rather than advisory persona. It governs ONLY the Lincoln main session
-# (the cockpit seat). Modes flip mid-conversation via /plan and /execute —
-# the state file is re-read on every tool call, so the boundary moves the
-# moment the skill rewrites it.
+# The mechanical guarantee that makes the two modes real rather than advisory
+# persona. Modes flip mid-conversation via /plan and /execute — the state file
+# is re-read on every tool call, so the boundary moves the moment the skill
+# rewrites it.
 #
-#   PLANNING mode  → deny spawning execution managers (optimus/tarzan/chuck)
-#                    — as Agent-tool subagent spawns (v2 one-window topology)
-#                    or legacy Bash launch aliases — and deny `git push` of
-#                    code. You fill the pool here; you do not drain it or push
-#                    from a half-formed backlog. Backlog population (bd create
-#                    --parent/--graph/--file) stays blocked until
-#                    substage=decomposition.
-#   EXECUTION mode → deny spawning planning-only producers
-#                    (sherlock/victor/columbo, and legacy gaudi launches) from
-#                    the cockpit. You drain the pool here; producers belong to
-#                    planning. (Gaudi is a skill in v2 — skill invocations are
-#                    not Agent spawns and are not governed here.)
+# v3 (SABLE-4k7): the Agent leg governs the WHOLE subtree, not just the Lincoln
+# main session. Once subagents can spawn agents (nested Agent tool, SABLE-d50.1),
+# a manager- or producer-typed subagent could otherwise stand up the wrong fleet
+# for the current mode — the boundary the interlock exists to make mechanical
+# would go advisory for the entire subtree. It is enforced as an identity-aware
+# matrix:
+#   spawner = main (cockpit seat: no agent_id, env lincoln/cockpit)
+#           | subagent (agent_id present)
+#   target  = manager-typed | producer-typed | unregistered
+#             (tool_input.subagent_type looked up in agents.yaml: a registered
+#              manager-class type is a manager; any other registered type is a
+#              producer; unregistered — Explore/general-purpose/… — is free)
+#   PLANNING  → manager target: DENY any spawner. producer target: ALLOW from
+#               main, DENY from a subagent. unregistered: FREE.
+#   EXECUTION → manager target: ALLOW from main only, DENY from a subagent.
+#               producer target: DENY any spawner. unregistered: FREE (this is
+#               the lane manager worker dispatches ride on).
+# Depth-3+ worker sub-delegation is deliberately ungoverned — the interlock
+# guards the MODE boundary, not tree shape.
 #
-# Soft override: a Bash command carrying `--force`, or env SABLE_ORCHESTRATION_FORCE=1,
-# is always allowed. The interlock is a guardrail, not a wall.
+# The Bash leg (legacy launch aliases, git push, backlog population + the
+# SABLE-kwr.3 quick-tier substage telescope) governs only the cockpit main
+# session — in v3 subagents spawn via the Agent tool, not via bash claude aliases.
 #
-# No-op unless CLAUDE_AGENT_NAME is lincoln (v2) or cockpit (legacy/transition).
-# No-op in subagent contexts (agent_id present) so dispatched agents are never
-# governed by it. No-op when no mode is set. Mode is read from the mode-state
-# file that bin/sable-mode owns (SABLE_MODE_STATE or
-# ~/.claude/sable/state/mode-state.json), preferring the helper when
-# resolvable.
+# Soft override: a Bash command carrying `--force`, or env
+# SABLE_ORCHESTRATION_FORCE=1, is always allowed. The interlock is a guardrail,
+# not a wall. No mode set → inert. SABLE_ORCHESTRATION=off → inert. Mode is read
+# from the mode-state file that bin/sable-mode owns (SABLE_MODE_STATE or
+# ~/.claude/sable/state/mode-state.json), preferring the helper when resolvable.
 
 set -uo pipefail
 
-# Consume stdin unconditionally so that the upstream writer (e.g. a python3
-# subprocess in the test harness) can flush and exit cleanly regardless of
-# whether this hook no-ops early. Without this drain, any early exit below
-# leaves the pipe read-end closed while the writer is still flushing, which
-# produces a BrokenPipeError in the writer's stderr.
+# Consume stdin unconditionally so the upstream writer (e.g. a python3 subprocess
+# in the test harness) can flush and exit cleanly regardless of whether this hook
+# no-ops early. Without this drain, an early exit leaves the pipe read-end closed
+# while the writer is still flushing, producing a BrokenPipeError (SABLE-dc0).
 INPUT="$(cat)"
 
-# Only the Lincoln/cockpit main session is governed.
-case "${CLAUDE_AGENT_NAME:-}" in
-  lincoln|cockpit) ;;
-  *) exit 0 ;;
-esac
-
-# Runtime enable gate — no-op when the cockpit is disabled (SABLE-cav.7).
+# Runtime enable gate — no-op when orchestration is disabled (SABLE-cav.7).
 case "$(printf '%s' "${SABLE_ORCHESTRATION:-}" | tr '[:upper:]' '[:lower:]')" in
     off|0|false|no) exit 0 ;;
 esac
 
-# Subagent context — never govern dispatched agents.
-AGENT_ID="$(printf '%s' "$INPUT" | python3 -c "
-import json, sys
-try:
-    print(json.load(sys.stdin).get('agent_id', '') or '')
-except Exception:
-    print('')
-" 2>/dev/null)"
-[ -n "$AGENT_ID" ] && exit 0
-
-# Env opt-out applies to every leg.
+# Env soft override applies to every leg (Agent matrix + Bash).
 [ "${SABLE_ORCHESTRATION_FORCE:-}" = "1" ] && exit 0
 
 TOOL_NAME="$(printf '%s' "$INPUT" | python3 -c "
 import json, sys
 try:
     print(json.load(sys.stdin).get('tool_name', '') or '')
+except Exception:
+    print('')
+" 2>/dev/null)"
+
+AGENT_ID="$(printf '%s' "$INPUT" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('agent_id', '') or '')
 except Exception:
     print('')
 " 2>/dev/null)"
@@ -100,8 +97,30 @@ print(json.dumps({
   exit 0
 }
 
+# classify_target <name> → echoes "manager" | "producer" | "free".
+# Looks the spawn target up in agents.yaml. Registered manager-class types are
+# managers; any other registered type is a producer; unregistered (or an
+# unreadable registry) is free. Fail open: registry read errors yield "free".
+classify_target() {
+  local name; name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [ -z "$name" ] && { echo "free"; return; }
+  local yaml="${SABLE_AGENTS_YAML:-${HOME:-}/.claude/sable/agents.yaml}"
+  [ -f "$yaml" ] || { echo "free"; return; }
+  local t
+  t="$(awk -v n="$name" '
+    $0 == "  " n ":" { f=1; next }
+    f && /^    type:/ { sub(/^    type:[ ]*/,""); sub(/[ \t#].*$/,""); print; exit }
+    f && /^  [a-zA-Z0-9_-]+:/ { exit }
+  ' "$yaml" 2>/dev/null)"
+  [ -z "$t" ] && { echo "free"; return; }
+  case " epic_manager one_off_manager integrator strategist cockpit " in
+    *" $t "*) echo "manager"; return ;;
+  esac
+  echo "producer"
+}
+
 # ---------------------------------------------------------------------------
-# Agent leg (v2): spawning named agents happens via the Agent tool.
+# Agent leg (v3): identity-aware mode-boundary matrix — governs main + subagents.
 # ---------------------------------------------------------------------------
 if [ "$TOOL_NAME" = "Agent" ]; then
   SUBTYPE="$(printf '%s' "$INPUT" | python3 -c "
@@ -114,18 +133,37 @@ except Exception:
 " 2>/dev/null | tr '[:upper:]' '[:lower:]')"
   [ -z "$SUBTYPE" ] && exit 0
 
+  # Spawner dimension: subagent (agent_id present) vs cockpit main session.
+  if [ -n "$AGENT_ID" ]; then
+    SPAWNER="subagent"
+  else
+    case "${CLAUDE_AGENT_NAME:-}" in
+      lincoln|cockpit) SPAWNER="main" ;;
+      *) exit 0 ;;   # non-cockpit env terminal / plain session: Agent leg ungoverned
+    esac
+  fi
+
+  TARGET="$(classify_target "$SUBTYPE")"
+  [ "$TARGET" = "free" ] && exit 0
+
   case "$MODE" in
     planning)
-      case "$SUBTYPE" in
-        optimus|tarzan|chuck)
-          deny "Orchestration is in PLANNING mode — spawning execution managers (optimus/tarzan/chuck) is blocked. Run /execute to drain the pool, or set SABLE_ORCHESTRATION_FORCE=1 to override."
+      case "$TARGET" in
+        manager)
+          deny "Orchestration is in PLANNING mode — spawning an execution manager ($SUBTYPE) is blocked. You fill the pool here; you do not stand up the fleet. Run /execute to drain it, or set SABLE_ORCHESTRATION_FORCE=1 to override."
+          ;;
+        producer)
+          [ "$SPAWNER" = "subagent" ] && deny "Orchestration is in PLANNING mode — a subagent may not spawn planning producers ($SUBTYPE); producer fan-out stays under the main session. Set SABLE_ORCHESTRATION_FORCE=1 to override."
           ;;
       esac
       ;;
     execution)
-      case "$SUBTYPE" in
-        sherlock|victor|columbo)
-          deny "Orchestration is in EXECUTION mode — spawning planning-only producers (sherlock/victor/columbo) is blocked. Run /plan for a planning session, or set SABLE_ORCHESTRATION_FORCE=1 to override."
+      case "$TARGET" in
+        manager)
+          [ "$SPAWNER" = "subagent" ] && deny "Orchestration is in EXECUTION mode — only the main session spawns the manager fleet; a subagent may not spawn $SUBTYPE (managers do not clone managers). Set SABLE_ORCHESTRATION_FORCE=1 to override."
+          ;;
+        producer)
+          deny "Orchestration is in EXECUTION mode — spawning a planning producer ($SUBTYPE) is blocked; you drain the pool here, you do not fill it. Run /plan for a planning session, or set SABLE_ORCHESTRATION_FORCE=1 to override."
           ;;
       esac
       ;;
@@ -134,8 +172,16 @@ except Exception:
 fi
 
 # ---------------------------------------------------------------------------
-# Bash leg: legacy launch aliases, git push, backlog population.
+# Bash leg: governs the cockpit main session only — legacy launch aliases, git
+# push, backlog population. Subagents spawn via the Agent tool in v3, so the
+# Bash leg stays main-session scoped (subagent Bash launches are a non-scenario).
 # ---------------------------------------------------------------------------
+case "${CLAUDE_AGENT_NAME:-}" in
+  lincoln|cockpit) ;;
+  *) exit 0 ;;
+esac
+[ -n "$AGENT_ID" ] && exit 0
+
 COMMAND="$(printf '%s' "$INPUT" | python3 -c "
 import json, sys
 try:
