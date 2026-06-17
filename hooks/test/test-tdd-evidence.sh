@@ -102,7 +102,11 @@ run_hook_writes "bash with cd prefix to hooks/test recognized" \
 run_hook_writes "bash with absolute path to hooks/test recognized" \
   "bash /home/ddc/dev-env/SABLE/hooks/test/test-tdd-evidence.sh"
 
+run_hook_writes "python3 bin/test_foo.py recognized" "python3 bin/test_foo.py"
+
 # ---------- Negative cases ----------
+
+run_hook_silent "python3 deploy.py not recognized" "python3 deploy.py"
 
 run_hook_silent "git status not recognized"          "git status"
 run_hook_silent "ls not recognized"                  "ls hooks/"

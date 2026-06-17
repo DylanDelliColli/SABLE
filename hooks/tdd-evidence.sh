@@ -27,7 +27,7 @@ COMMAND=$(echo "$PARSED" | sed -n '3p')
 # (hooks/test/test-*.sh) plus any project that names test scripts test-*.sh.
 # The character class [^&|;] prevents `&&`/`||`/`;` chains from making the
 # match leak into the wrong half of a compound command.
-if echo "$COMMAND" | grep -qE '(vitest|pytest|npm test|npx vitest|python -m pytest|bash [^&|;]*test-[A-Za-z0-9_-]+\.sh)'; then
+if echo "$COMMAND" | grep -qE '(vitest|pytest|npm test|npx vitest|python -m pytest|python3? [^&|;]*test_[A-Za-z0-9_-]+\.py|bash [^&|;]*test-[A-Za-z0-9_-]+\.sh)'; then
   # Per-agent keying (SABLE-d72): session_id is SHARED across the whole nested
   # agent tree, so key by session_id + agent_id when a subagent ran the tests.
   # Main sessions (no agent_id) keep the session-global file unchanged.
