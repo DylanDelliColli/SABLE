@@ -265,6 +265,19 @@ else
   echo "FAIL: manager-subagent (agent_type=optimus) matching model → allow"; echo "  Got: ${OUT:0:300}"
 fi
 
+# ---- SABLE-82j/2dm: settings-snippet registration completeness ----
+# Every pre-dispatch-*.sh hook must be registered under PreToolUse:Agent in the
+# install snippet, or it silently never fires on new installs — the gap that
+# left pre-dispatch-model-check.sh unregistered while the others were present.
+SNIPPET="$(cd "$(dirname "$0")/../.." && pwd)/templates/multi-manager/settings-snippet.json"
+for h in pre-dispatch-claim pre-dispatch-model-check pre-dispatch-overlap pre-dispatch-preempt pre-dispatch-refresh; do
+  if grep -q "$h.sh" "$SNIPPET" 2>/dev/null; then
+    PASS=$((PASS+1)); echo "PASS: $h.sh registered in settings-snippet.json"
+  else
+    FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $h.sh registered in settings-snippet.json"; echo "FAIL: $h.sh registered in settings-snippet.json"
+  fi
+done
+
 # ---- Summary ----
 
 echo
