@@ -18,7 +18,18 @@ set -eu
 
 # Resolve feedback dir. Default: alongside this script in the SABLE repo.
 # Override via SABLE_FEEDBACK_DIR env var.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+#
+# Resolve the script's PHYSICAL path first, following any symlink chain, so a
+# symlinked install (e.g. ~/.local/bin/sable-note -> repo bin/sable-note) still
+# derives the repo feedback/ dir rather than the symlink's parent (SABLE-5p2).
+# Portable (no GNU readlink -f; works on macOS bash 3.2).
+SOURCE="${BASH_SOURCE[0]:-$0}"
+while [ -h "${SOURCE}" ]; do
+    _dir="$(cd -P "$(dirname "${SOURCE}")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "${SOURCE}")"
+    case "${SOURCE}" in /*) ;; *) SOURCE="${_dir}/${SOURCE}" ;; esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "${SOURCE}")" >/dev/null 2>&1 && pwd)"
 DEFAULT_FEEDBACK_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)/feedback"
 FEEDBACK_DIR="${SABLE_FEEDBACK_DIR:-${DEFAULT_FEEDBACK_DIR}}"
 
