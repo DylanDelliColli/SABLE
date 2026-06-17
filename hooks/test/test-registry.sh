@@ -49,6 +49,14 @@ else
   pass "standalone cockpit entry retired"
 fi
 
+# SABLE-xt6: the Seward strategist overlay was retired — its registry entry,
+# role file, and read-guard exemption deleted together. The entry must be gone.
+if printf '%s' "$OUT" | jq -e '.seward' >/dev/null 2>&1; then
+  fail "seward entry retired (SABLE-xt6)" "registry still has a .seward agent"
+else
+  pass "seward entry retired (SABLE-xt6)"
+fi
+
 # The existing roster must still be intact (no accidental clobber).
 for a in optimus tarzan chuck lincoln sherlock victor rudy columbo; do
   if printf '%s' "$OUT" | jq -e ".$a" >/dev/null 2>&1; then

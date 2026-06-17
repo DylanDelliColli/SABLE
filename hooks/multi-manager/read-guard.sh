@@ -30,9 +30,6 @@ sable_resolve_identity "$HOOK_INPUT"
 [ "$SABLE_ID_IS_MANAGER" -eq 1 ] || exit 0
 [ "$SABLE_ID_NAME" = "lincoln" ] && exit 0
 [ "$SABLE_ID_NAME" = "cockpit" ] && exit 0
-# Seward: TEMPORARY strategist overlay (SABLE-nps) — cross-inbox read for
-# status synthesis; remove this line when Seward retires (see SABLE-uz9.8).
-[ "$SABLE_ID_NAME" = "seward" ] && exit 0
 
 COMMAND=$(printf '%s' "$HOOK_INPUT" | python3 -c "
 import json, sys

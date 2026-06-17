@@ -30,8 +30,6 @@ agents:
     type: integrator
   lincoln:
     type: strategist
-  seward:
-    type: strategist
   sherlock:
     type: auditor
 YAML
@@ -100,8 +98,16 @@ assert_allowed "legacy env chuck allowed own inbox" "$OUT"
 OUT=$(run_hook "$(json '' '' 'bd ready -l for-optimus')" "lincoln" "manager")
 assert_allowed "legacy env lincoln cross-inbox exception" "$OUT"
 
+# SABLE-xt6: Seward retired — the cross-inbox exemption is gone. An env seward
+# (manager via the legacy ROLE=manager escape) is now subject to the guard like
+# any other manager: it may read its own inbox, not a peer's.
 OUT=$(run_hook "$(json '' '' 'bd ready -l for-tarzan')" "seward" "manager")
-assert_allowed "seward strategist overlay cross-inbox exception (SABLE-nps)" "$OUT"
+assert_denied "retired seward (env manager) subject to guard — no cross-inbox bypass (SABLE-xt6)" "$OUT"
+
+# A subagent claiming the now-unregistered agent_type=seward behaves like any
+# unregistered worker (the guard governs managers only) — it is not special.
+OUT=$(run_hook "$(json a8 seward 'bd ready -l for-optimus')" "" "")
+assert_allowed "retired seward (agent_type) not subject to guard — like unregistered (SABLE-xt6)" "$OUT"
 
 # --- non-matching commands stay silent ---
 OUT=$(run_hook "$(json a6 optimus 'git status')" "" "")
