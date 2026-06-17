@@ -10,10 +10,11 @@
 # Existing dispatched workers are unaffected — only the next dispatch.
 #
 # Lane resolution via lib-identity.sh sable_resolve_dispatch_lane
-# (SABLE-uz9.3/uz9.4 option A): legacy manager terminals govern their own
-# lane; the v2 one-window main session governs the lane named by the
-# "Dispatching-for: <manager>" prompt line (default cockpit) and only while
-# the cockpit is in execution mode.
+# (SABLE-uz9.3/uz9.4 / SABLE-4it): manager-typed subagents (native worker
+# dispatch) and legacy manager terminals govern their own lane; the Lincoln
+# main session governs its own (self) lane only while in execution mode. Lane
+# comes from identity — the v2 "Dispatching-for: <manager>" relay parse is
+# deleted, never read from the prompt.
 
 set -euo pipefail
 

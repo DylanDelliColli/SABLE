@@ -10,15 +10,18 @@
 #
 # Companion: edit-write-claim-reconciler.sh appends emergent claims as workers edit.
 #
-# Skips if: no bead ID inferrable, no file paths in description, subagent context.
+# Skips if: no bead ID inferrable, no file paths in description, worker/bare
+# subagent context (manager-typed subagents ARE governed — they dispatch workers).
 
 set -euo pipefail
 
 HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
 
-# Identity/lane gating via lib-identity.sh (SABLE-uz9.3): legacy manager
-# terminals OR the v2 one-window main session in execution mode; subagent
-# contexts stand down inside sable_resolve_dispatch_lane.
+# Identity/lane gating via lib-identity.sh (SABLE-uz9.3 / SABLE-4it): governance
+# runs for manager-typed subagents (native worker dispatch), legacy manager
+# terminals, and the Lincoln main session in execution mode; worker/bare-id
+# subagent contexts stand down inside sable_resolve_dispatch_lane. Lane comes
+# from identity — the "Dispatching-for:" relay parse is deleted.
 # shellcheck source=lib-identity.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib-identity.sh"
 sable_resolve_dispatch_lane "$HOOK_INPUT"

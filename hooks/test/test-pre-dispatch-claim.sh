@@ -6,8 +6,12 @@
 #     produce WIP-CLAIMS notes on the bead. (SABLE-2ff: case-insensitive fix)
 #   - Lowercase bead IDs (bd-xyz legacy form) are also extracted.
 #   - When no bead ID is found, the hook exits silently (no bd show/update).
-#   - Subagent context (agent_id present in hook input) causes the hook to
-#     stand down — subagents don't dispatch.
+#   - Worker/bare subagent context (agent_id present, non-manager or no
+#     agent_type) causes the hook to stand down — workers don't dispatch.
+#   - Manager-typed subagent context (agent_id + agent_type=optimus/tarzan, the
+#     v3 native-dispatch path) ACTIVATES governance — managers dispatch their
+#     own workers (SABLE-uz9.9 / SABLE-6zt). The relay "Dispatching-for:" parse
+#     is deleted: lane comes from identity, never from prompt text (SABLE-4it).
 #
 # Unit tests stub `bd` on PATH and point SABLE_MODE_FILE to an
 # execution-mode fixture so governance is always active for the manager path.
@@ -153,9 +157,7 @@ run_hook_as_manager() {
 # ---------------------------------------------------------------------------
 
 # --- Test 1: uppercase SABLE-xyz ID in prompt → bd update --notes called ---
-run_hook_as_manager "Dispatching-for: tarzan
-
-SABLE-xyz: implement the feature"
+run_hook_as_manager "SABLE-xyz: implement the feature"
 if grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
   pass "uppercase SABLE-xyz in prompt → bd update --notes called"
 else
@@ -165,9 +167,7 @@ fi
 
 # --- Test 2: lowercase bd-xyz ID (legacy format) → bd update --notes called ---
 : > "$BD_CALL_LOG"
-run_hook_as_manager "Dispatching-for: tarzan
-
-Working on bd-xyz — hooks/foo.sh needs a refactor"
+run_hook_as_manager "Working on bd-xyz — hooks/foo.sh needs a refactor"
 if grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
   pass "lowercase bd-xyz in prompt → bd update --notes called"
 else
@@ -177,9 +177,7 @@ fi
 
 # --- Test 3: no bead ID in prompt → no bd show/update calls ---
 : > "$BD_CALL_LOG"
-run_hook_as_manager "Dispatching-for: tarzan
-
-Explore the codebase and report findings."
+run_hook_as_manager "Explore the codebase and report findings."
 if grep -q 'BD_CALLED: show\|BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
   fail "no bead ID in prompt → no bd show/update calls" \
        "bd calls: $(cat "$BD_CALL_LOG")"
@@ -189,9 +187,7 @@ fi
 
 # --- Test 4: mixed-case Sable-AbC → matched (case-insensitive) ---
 : > "$BD_CALL_LOG"
-run_hook_as_manager "Dispatching-for: tarzan
-
-Task for Sable-AbC — hooks/foo.sh needs work"
+run_hook_as_manager "Task for Sable-AbC — hooks/foo.sh needs work"
 if grep -q 'BD_CALLED: show' "$BD_CALL_LOG" 2>/dev/null; then
   pass "mixed-case Sable-AbC → hook attempts to claim (case-insensitive match)"
 else
@@ -217,9 +213,7 @@ fi
 
 # --- Test 6: WIP-CLAIMS content includes the file path from description ---
 : > "$BD_CALL_LOG"
-run_hook_as_manager "Dispatching-for: tarzan
-
-SABLE-xyz: implement hooks/foo.sh"
+run_hook_as_manager "SABLE-xyz: implement hooks/foo.sh"
 # The update call args are all in one line in the log (--notes ... appends path)
 UPDATE_LINE=$(grep 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null | head -1)
 if echo "$UPDATE_LINE" | grep -q 'WIP-CLAIMS.*hooks/foo.sh\|hooks/foo.sh'; then
@@ -295,9 +289,7 @@ else
 
     # Run real hook with scratch bead ID in the dispatch prompt.
     # Do NOT use stub bd — use real bd so WIP-CLAIMS is written to the real DB.
-    make_dispatch_input "Dispatching-for: tarzan
-
-${SCRATCH_ID}: implement the feature — hooks/foo.sh needs updating" | \
+    make_dispatch_input "${SCRATCH_ID}: implement the feature — hooks/foo.sh needs updating" | \
       env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
           SABLE_AGENTS_YAML="$AGENTS_YAML" \
           SABLE_MODE_FILE="$EXEC_MODE_FILE" \

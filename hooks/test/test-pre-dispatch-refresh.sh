@@ -93,9 +93,12 @@ else fail "case C: relative Worktree line falls back to cwd" "cwd worktree lacks
 R="$FIX/N"; mkdir -p "$R"; setup_repo "$R"
 OUT=$(run "$(hook_input optimus "$MAIN" "Work SABLE-x.
 Worktree: $R/does-not-exist
-Run tests.")")
+Run tests.")"); RC=$?
 if echo "$OUT" | grep -qi "not found\|does not exist"; then pass "nonexistent Worktree path emits an advisory"
 else fail "nonexistent Worktree path emits an advisory" "got: ${OUT:-<empty>}"; fi
+# A manager typo in the Worktree path must never crash the dispatch (SABLE-sp2 case 5).
+if [ "$RC" -eq 0 ]; then pass "nonexistent Worktree path fails open (exit 0, no crash)"
+else fail "nonexistent Worktree path fails open (exit 0, no crash)" "hook exited $RC"; fi
 
 # --- Duplicate Worktree lines: first match wins ---
 R="$FIX/D"; mkdir -p "$R"; setup_repo "$R"

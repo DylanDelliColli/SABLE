@@ -204,6 +204,67 @@ assert_deny "no bead + no dispatch model → deny" "$MGR_ENV" "Just do this gene
 # Test 15: no bead in prompt + explicit dispatch model → allow
 assert_allow "no bead + explicit model → allow" "$MGR_ENV" "Just do this generic thing" "" "sonnet"
 
+# ---- Native manager-subagent path (SABLE-6zt cases 5 & 6) ----
+# In v3 a manager dispatches workers natively: identity is the subagent
+# agent_type (agent_id present, NO env), resolved against the registry by
+# lib-identity. Model gating must engage on this path exactly as on the legacy
+# env path — otherwise the model ladder is advisory for every nested dispatch.
+# subagent_type=claude is a real implementing worker (NOT in the read-only
+# exempt list at the hook's line 66), so the gate stays active.
+
+AGENTS_YAML="$TMP_DIR/agents.yaml"
+cat > "$AGENTS_YAML" <<'YAML'
+agents:
+  optimus:
+    type: epic_manager
+  tarzan:
+    type: one_off_manager
+YAML
+
+# make_subagent_input <prompt> <model> — agent_id + agent_type=optimus payload
+make_subagent_input() {
+  python3 -c "
+import json, sys
+prompt, model = sys.argv[1], sys.argv[2]
+ti = {'prompt': prompt, 'subagent_type': 'claude'}
+if model:
+    ti['model'] = model
+print(json.dumps({
+    'tool_name': 'Agent',
+    'agent_id': 'mgr-sub-001',
+    'agent_type': 'optimus',
+    'tool_input': ti,
+    'hook_event_name': 'PreToolUse'
+}))
+" "$1" "$2"
+}
+
+# run_hook_subagent <prompt> <model> — no env identity; registry resolves optimus
+run_hook_subagent() {
+  make_subagent_input "$1" "$2" | \
+    env -i PATH="$TMP_DIR:$PATH" TMP_DIR="$TMP_DIR" SABLE_AGENTS_YAML="$AGENTS_YAML" \
+        bash "$HOOK" 2>/dev/null || echo "RUN_ERR:$?"
+}
+
+# Test 16 (6zt case 5): manager-subagent dispatch, bead model:opus, dispatch
+# model unspecified → DENY (activation proves the gate engaged via agent_type).
+OUT=$(run_hook_subagent "Working on SABLE-aaa, the auth refactor" "")
+if echo "$OUT" | grep -q '"permissionDecision": "deny"' && echo "$OUT" | grep -qF "model:opus but dispatch model is unspecified"; then
+  PASS=$((PASS+1)); echo "PASS: manager-subagent (agent_type=optimus) missing model → deny"
+else
+  FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  manager-subagent (agent_type=optimus) missing model → deny"
+  echo "FAIL: manager-subagent (agent_type=optimus) missing model → deny"; echo "  Got: ${OUT:0:300}"
+fi
+
+# Test 17 (6zt case 6): manager-subagent dispatch with the matching model → allow.
+OUT=$(run_hook_subagent "Working on SABLE-aaa, the auth refactor" "opus")
+if [ -z "$OUT" ]; then
+  PASS=$((PASS+1)); echo "PASS: manager-subagent (agent_type=optimus) matching model → allow"
+else
+  FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  manager-subagent (agent_type=optimus) matching model → allow"
+  echo "FAIL: manager-subagent (agent_type=optimus) matching model → allow"; echo "  Got: ${OUT:0:300}"
+fi
+
 # ---- Summary ----
 
 echo
