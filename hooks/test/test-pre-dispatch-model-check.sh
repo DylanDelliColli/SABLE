@@ -156,6 +156,13 @@ assert_allow "Explore subagent skipped" "$MGR_ENV" "Bead SABLE-aaa: explore" "Ex
 # Test 3: research-keyword prompt → skip
 assert_allow "research-keyword prompt skipped" "$MGR_ENV" "Task: explore the auth subsystem" "general-purpose" ""
 
+# SABLE-6qn: general-purpose is ALSO the natural subtype for an implementation
+# worker, so it must NOT bypass the model gate by subtype alone — only the
+# explore-PROMPT heuristic (Test 3) skips read-only work. A general-purpose
+# code worker with a model mismatch is denied like any other.
+assert_deny "general-purpose implementation worker is gated, not skipped (SABLE-6qn)" "$MGR_ENV" "Working on SABLE-aaa, implement the refactor" "general-purpose" "sonnet" "model:opus but dispatch chose sonnet"
+assert_allow "general-purpose worker with matching model allowed (no over-deny)" "$MGR_ENV" "Working on SABLE-aaa, implement the refactor" "general-purpose" "opus"
+
 # ---- Match cases (silent allow) ----
 
 # Test 4: bead has model:opus, dispatch uses opus → allow

@@ -65,8 +65,12 @@ SUBTYPE=$(echo "$PARSED" | sed -n '1p')
 DISPATCH_MODEL=$(echo "$PARSED" | sed -n '2p')
 PROMPT=$(echo "$PARSED" | sed -n '4,$p')
 
-# Skip read-only / exploration agents — model is manager's call
-echo "$SUBTYPE" | grep -qiE '^(Explore|Plan|claude-code-guide|general-purpose|feature-dev:code-explorer)$' && exit 0
+# Skip read-only / exploration agents — model is manager's call.
+# NOT general-purpose: that is also the natural subtype for an implementation
+# worker ("executing multi-step tasks"), so skipping it by type opened a hole
+# (SABLE-6qn). Exploration dispatched as general-purpose is still skipped by the
+# prompt heuristic below.
+echo "$SUBTYPE" | grep -qiE '^(Explore|Plan|claude-code-guide|feature-dev:code-explorer)$' && exit 0
 
 # Skip if dispatch prompt indicates investigation/exploration (manager judgment)
 echo "$PROMPT" | grep -qiE '^Task: (explore|investigate|research|audit|read-only)' && exit 0
