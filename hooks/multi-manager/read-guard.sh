@@ -42,15 +42,17 @@ print(d.get('tool_input', {}).get('command', ''))
 
 [ -z "$COMMAND" ] && exit 0
 
-# Only act on bd ready / bd list with -l for-<name>
+# Only act on bd ready / bd list with -l / --label for-<name>
+# (SABLE-bwy: the long-flag spellings --label=for-X and --label for-X must be
+# guarded too, else a manager reads a foreign inbox via the long flag.)
 echo "$COMMAND" | grep -qE '^bd (ready|list)' || exit 0
-echo "$COMMAND" | grep -qE '\-l[= ]for-' || exit 0
+echo "$COMMAND" | grep -qE '(--label|-l)[= ]for-' || exit 0
 
 # Extract the label being queried
 QUERIED_LABEL=$(echo "$COMMAND" | python3 -c "
 import sys, re
 cmd = sys.stdin.read()
-m = re.search(r'-l[= ](for-[a-zA-Z0-9_-]+)', cmd)
+m = re.search(r'(?:--label|-l)[= ](for-[a-zA-Z0-9_-]+)', cmd)
 print(m.group(1) if m else '')
 ")
 

@@ -75,6 +75,19 @@ assert_allowed "subagent optimus allowed own inbox" "$OUT"
 OUT=$(run_hook "$(json a1 optimus 'bd list -l for-coord')" "" "")
 assert_allowed "subagent optimus allowed umbrella coord label" "$OUT"
 
+# --- SABLE-bwy: long-flag --label spellings must be guarded like -l ---
+OUT=$(run_hook "$(json a1 optimus 'bd list --label=for-tarzan')" "" "")
+assert_denied "subagent optimus denied --label=for-tarzan (long flag)" "$OUT"
+
+OUT=$(run_hook "$(json a1 optimus 'bd list --label for-tarzan')" "" "")
+assert_denied "subagent optimus denied --label for-tarzan (long flag, space)" "$OUT"
+
+OUT=$(run_hook "$(json a1 optimus 'bd ready --label=for-tarzan')" "" "")
+assert_denied "subagent optimus denied 'bd ready --label=for-tarzan'" "$OUT"
+
+OUT=$(run_hook "$(json a1 optimus 'bd list --label=for-optimus')" "" "")
+assert_allowed "subagent optimus allowed own inbox via --label (no over-deny)" "$OUT"
+
 OUT=$(run_hook "$(json a2 lincoln 'bd ready -l for-optimus')" "" "")
 assert_allowed "subagent lincoln has cross-inbox read exception" "$OUT"
 
