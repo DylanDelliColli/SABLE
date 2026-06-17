@@ -145,6 +145,27 @@ assert_allowed "env lincoln ignores Dispatching-for (lane=self, not preempted by
 OUT=$(run_hook "$(json '' '' 'Explore something')" "lincoln" "manager" "")
 assert_allowed "env lincoln unattributed dispatch uses own clean lane" "$OUT"
 
+# 12. SABLE-mji: bd failing (e.g. cwd outside any beads workspace) must FAIL OPEN
+#     — rc=0, silent allow — not die rc=1 under set -euo pipefail.
+mkdir -p "$FIXTURE_DIR/bin-fail"
+cat > "$FIXTURE_DIR/bin-fail/bd" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+chmod +x "$FIXTURE_DIR/bin-fail/bd"
+mji_out=$(
+  unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_MODE_STATE
+  export SABLE_MODE_STATE="$EXEC_MODE"
+  export PATH="$FIXTURE_DIR/bin-fail:$PATH"
+  printf '%s' "$(json a1 optimus 'spawn a worker on SABLE-xyz')" | bash "$HOOK" 2>/dev/null
+)
+mji_rc=$?
+if [ "$mji_rc" -eq 0 ] && [ -z "$mji_out" ]; then
+  pass "SABLE-mji: bd failure fails open (rc=0, silent allow)"
+else
+  fail "SABLE-mji: bd failure fails open (rc=0, silent allow)" "rc=$mji_rc out=${mji_out:-<empty>}"
+fi
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

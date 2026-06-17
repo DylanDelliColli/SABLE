@@ -28,7 +28,10 @@ sable_resolve_dispatch_lane "$HOOK_INPUT"
 
 INBOX_LABEL="for-${SABLE_DISPATCH_LANE}"
 
-# Query the lane's inbox for P0 items
+# Query the lane's inbox for P0 items. Fail OPEN if bd errors (e.g. the hook
+# fires with cwd outside any beads workspace): under set -euo pipefail a failed
+# pipe would otherwise kill the hook rc=1 instead of allowing silently
+# (SABLE-mji; matches the suite's fail-open-on-infra-error convention).
 P0_BEADS=$(bd ready -l "$INBOX_LABEL" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
@@ -43,7 +46,7 @@ try:
             print(f'{bid}: {title}')
 except Exception:
     pass
-" 2>/dev/null)
+" 2>/dev/null) || exit 0
 
 [ -z "$P0_BEADS" ] && exit 0
 
