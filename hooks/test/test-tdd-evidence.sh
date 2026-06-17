@@ -110,6 +110,45 @@ run_hook_silent "bash setup.sh not recognized"       "bash setup.sh"
 run_hook_silent "bash deploy-script.sh not recognized" "bash deploy-script.sh"
 run_hook_silent "bd close not recognized as test"    "bd close SABLE-xxx"
 
+# ---------- SABLE-d72/lcs: per-agent evidence keying ----------
+# When agent_id is present (a nested subagent), evidence is keyed by
+# session_id + agent_id so one worker's test run cannot satisfy another worker's
+# gate in the same (shared) session. Main sessions (no agent_id) keep the
+# session-global key, preserving single-agent behavior.
+
+pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
+
+# make_input_agent <command> <session_id> <agent_id>
+make_input_agent() {
+  python3 -c "
+import json, sys
+d = {'tool_input': {'command': sys.argv[1]}, 'session_id': sys.argv[2]}
+if sys.argv[3]:
+    d['agent_id'] = sys.argv[3]
+print(json.dumps(d))
+" "$1" "$2" "$3"
+}
+
+PA_SID="tdd-ev-peragent-$$-$RANDOM"
+EV_MAIN="/tmp/tdd-evidence-${PA_SID}"
+EV_A="/tmp/tdd-evidence-${PA_SID}-agentA"
+EV_B="/tmp/tdd-evidence-${PA_SID}-agentB"
+rm -f "$EV_MAIN" "$EV_A" "$EV_B"
+
+make_input_agent "pytest tests/" "$PA_SID" "agentA" | bash "$HOOK" >/dev/null 2>&1 || true
+if [ -s "$EV_A" ]; then pass "per-agent: evidence keyed to <session>-<agent_id>"; else fail "per-agent: evidence keyed to <session>-<agent_id>" "no $EV_A"; fi
+if [ ! -s "$EV_MAIN" ]; then pass "per-agent: agent A evidence does NOT leak into the session-global file"; else fail "per-agent: agent A evidence does NOT leak into the session-global file" "$EV_MAIN written"; fi
+if [ ! -s "$EV_B" ]; then pass "per-agent: agent A evidence does NOT leak into agent B's file"; else fail "per-agent: agent A evidence does NOT leak into agent B's file" "$EV_B written"; fi
+rm -f "$EV_MAIN" "$EV_A" "$EV_B"
+
+PA_SID2="tdd-ev-main-$$-$RANDOM"
+EV_MAIN2="/tmp/tdd-evidence-${PA_SID2}"
+rm -f "$EV_MAIN2"
+make_input_agent "pytest tests/" "$PA_SID2" "" | bash "$HOOK" >/dev/null 2>&1 || true
+if [ -s "$EV_MAIN2" ]; then pass "main-session (empty agent_id) uses the session-global key (single-agent unchanged)"; else fail "main-session (empty agent_id) uses the session-global key" "no $EV_MAIN2"; fi
+rm -f "$EV_MAIN2"
+
 # ---------- Summary ----------
 
 echo

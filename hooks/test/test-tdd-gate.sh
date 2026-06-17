@@ -234,6 +234,50 @@ assert_hatch_used "single bead, multiple flags with flag-value IDs" \
 assert_hatch_skipped "two beads + flag value still routes to evidence check" \
   'bd close SABLE-stub SABLE-other --reason docs-only'
 
+# ---------- SABLE-d72/lcs: per-agent evidence keying ----------
+# The gate must read the SAME per-agent key tdd-evidence.sh writes: with agent_id
+# present, /tmp/tdd-evidence-<sid>-<agent_id>; without, the session-global file.
+# A two-bead close routes past the [no-test] hatch to the evidence check, so we
+# exercise the keying directly. Worker A's evidence must NOT let worker B close.
+pa_pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
+pa_fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
+
+make_input_agent() {
+  # $1 = command, $2 = session_id, $3 = agent_id
+  python3 -c "
+import json, sys
+d = {'tool_input': {'command': sys.argv[1]}, 'session_id': sys.argv[2]}
+if sys.argv[3]:
+    d['agent_id'] = sys.argv[3]
+print(json.dumps(d))
+" "$1" "$2" "$3"
+}
+run_gate_agent() { # <command> <session_id> <agent_id>
+  make_input_agent "$1" "$2" "$3" | env PATH="$STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null
+}
+
+PG_SID="tdd-gate-peragent-$$-$RANDOM"
+PG_MAIN="/tmp/tdd-evidence-${PG_SID}"
+PG_A="/tmp/tdd-evidence-${PG_SID}-agentA"
+PG_B="/tmp/tdd-evidence-${PG_SID}-agentB"
+rm -f "$PG_MAIN" "$PG_A" "$PG_B"
+echo "ran tests" > "$PG_A"   # only agent A has evidence
+CLOSE2='bd close SABLE-stub SABLE-other'   # two beads → skip [no-test] hatch → evidence check
+
+out=$(run_gate_agent "$CLOSE2" "$PG_SID" "agentA")
+if [ -z "$out" ]; then pa_pass "per-agent gate: close under agent A (ran tests) is allowed"; else pa_fail "per-agent gate: close under agent A is allowed" "got: $out"; fi
+
+out=$(run_gate_agent "$CLOSE2" "$PG_SID" "agentB")
+if echo "$out" | grep -q '"permissionDecision": "deny"'; then pa_pass "per-agent gate: close under agent B (no own evidence) is BLOCKED — cross-agent leak closed"; else pa_fail "per-agent gate: close under agent B is BLOCKED" "got: ${out:-<empty>}"; fi
+
+out=$(run_gate_agent "$CLOSE2" "$PG_SID" "")
+if echo "$out" | grep -q '"permissionDecision": "deny"'; then pa_pass "per-agent gate: main-session close uses the session-global key (agent A evidence does not satisfy it)"; else pa_fail "per-agent gate: main-session uses the session-global key" "got: ${out:-<empty>}"; fi
+
+echo "ran tests" > "$PG_MAIN"
+out=$(run_gate_agent "$CLOSE2" "$PG_SID" "")
+if [ -z "$out" ]; then pa_pass "per-agent gate: main-session close allowed by session-global evidence (single-agent unchanged)"; else pa_fail "per-agent gate: main-session allowed by session-global evidence" "got: $out"; fi
+rm -f "$PG_MAIN" "$PG_A" "$PG_B"
+
 # ---------- Summary ----------
 
 echo

@@ -11,11 +11,13 @@ import json, sys
 d = json.load(sys.stdin)
 cmd = d.get('tool_input', {}).get('command', '')
 sid = d.get('session_id', '')
-print(f'{sid}\n{cmd}')
+aid = d.get('agent_id', '') or ''
+print(f'{sid}\n{aid}\n{cmd}')
 " 2>/dev/null) || exit 0
 
 SESSION_ID=$(echo "$PARSED" | sed -n '1p')
-COMMAND=$(echo "$PARSED" | sed -n '2p')
+AGENT_ID=$(echo "$PARSED" | sed -n '2p')
+COMMAND=$(echo "$PARSED" | sed -n '3p')
 
 [ -z "$COMMAND" ] && exit 0
 
@@ -71,10 +73,18 @@ if isinstance(data, list) and len(data) > 0:
   fi
 fi
 
-# Check for test evidence
-EVIDENCE_FILE="/tmp/tdd-evidence-${SESSION_ID}"
+# Check for test evidence. Per-agent keying (SABLE-d72): read the SAME key
+# tdd-evidence.sh writes — session_id + agent_id for subagents (so worker A's
+# test run can't satisfy worker B's close in a shared session), session-global
+# for main sessions. Companion convention: workers close their OWN beads after
+# green, so the test run and the bd close share one agent context.
+if [ -n "$AGENT_ID" ]; then
+  EVIDENCE_FILE="/tmp/tdd-evidence-${SESSION_ID}-${AGENT_ID}"
+else
+  EVIDENCE_FILE="/tmp/tdd-evidence-${SESSION_ID}"
+fi
 if [ -s "$EVIDENCE_FILE" ]; then
-  exit 0  # Tests were run this session — allow close
+  exit 0  # Tests were run by this agent this session — allow close
 fi
 
 # No evidence found — block the close
