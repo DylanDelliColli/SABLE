@@ -74,12 +74,14 @@ PREAMBLE = """\
 > shell argument — read the legacy shell invocations below (e.g.
 > `{name} <scope>`) as prompt parameters (e.g. "scope: <scope>"). Your identity
 > comes from this agent definition's system prompt, not CLAUDE_AGENT_NAME; the
-> continuous-mode manager hooks never applied to you and still don't. One
-> capability difference: in subagent context you have NO Agent tool — where this
-> role says to dispatch read-only Explore subagents, do that exploration
-> yourself with Read/Glob/Grep/Bash instead (verified CC 2.1.170, SABLE-uz9.1).
-> Everything else in this role is unchanged and binding. Deliver your
-> end-of-session summary as your final message back to the spawning session.
+> continuous-mode manager hooks never applied to you and still don't.
+> The Agent tool IS available in subagent context (nested spawns ship on
+> CC>=2.1.172, verified SABLE-d50.1; 5-level cap, results collapse upward): you
+> may spawn READ-ONLY children (subagent_type Explore) to parallelize
+> exploration, but you may NOT spawn code-writing workers — producers write
+> beads, not code, and the mode-interlock enforces this mechanically. Everything
+> else in this role is unchanged and binding. Deliver your end-of-session
+> summary as your final message back to the spawning session.
 """
 
 # Managers (SABLE-uz9.11) are granted the Agent tool and dispatch their own

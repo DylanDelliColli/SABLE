@@ -152,6 +152,58 @@ for mgr in optimus tarzan; do
   fi
 done
 
+# ---------------------------------------------------------------------------
+# SABLE-m22: per-agent capability preamble (implements SABLE-chk)
+# ---------------------------------------------------------------------------
+# Case 1: no generated def carries the stale "no Agent tool" claim — false since
+# the nested-spawn spike (SABLE-d50.1, CC 2.1.173) and actively harmful (forced
+# producers into single-threaded exploration).
+for name in optimus tarzan sherlock victor rudy columbo; do
+  assert_no_grep "$AGENTS_DIR/$name.md" "no Agent tool" "$name.md preamble drops the stale 'no Agent tool' claim"
+done
+
+# Case 2: consistency — no file may carry BOTH the old and new capability strings
+# (a half-regenerated def would whipsaw the agent at runtime).
+for name in optimus tarzan sherlock victor rudy columbo; do
+  DEF="$AGENTS_DIR/$name.md"
+  if grep -qi "no Agent tool" "$DEF" 2>/dev/null && grep -qi "Agent tool IS available" "$DEF" 2>/dev/null; then
+    fail "$name.md not self-contradictory (not both 'no Agent tool' + 'Agent tool IS available')" "carries both strings"
+  else
+    pass "$name.md not self-contradictory (not both 'no Agent tool' + 'Agent tool IS available')"
+  fi
+done
+
+# Case 3: producers carry the read-only-children capability text and NOT the
+# manager direct-dispatch text.
+for name in sherlock victor rudy columbo; do
+  DEF="$AGENTS_DIR/$name.md"
+  assert_grep    "$DEF" "Agent tool IS available"     "$name.md (producer) states the Agent tool is available"
+  assert_grep    "$DEF" "READ-ONLY children"          "$name.md (producer) may spawn read-only Explore children"
+  assert_grep    "$DEF" "may NOT spawn code-writing"  "$name.md (producer) may not spawn code-writing workers"
+  assert_no_grep "$DEF" "dispatch your own workers"   "$name.md (producer) lacks the manager direct-dispatch text"
+done
+
+# Case 4/5 (accept-HEAD decision 2026-06-17): BOTH managers carry the full
+# direct-dispatch capability text. optimus was converted by SABLE-uz9.11 (the
+# phase-1/phase-2 split collapsed), so it is NOT transition text. Role-body
+# markers are covered by SABLE-a0n.
+for mgr in tarzan optimus; do
+  DEF="$AGENTS_DIR/$mgr.md"
+  assert_grep    "$DEF" "dispatch your own workers"   "$mgr.md (manager) carries the direct-dispatch capability text"
+  assert_no_grep "$DEF" "continue the relay protocol" "$mgr.md (manager) carries no relay-transition text"
+done
+
+# Case 7: regeneration is idempotent — two consecutive runs are byte-identical.
+IDEM_A="$(mktemp -d)"; IDEM_B="$(mktemp -d)"
+python3 "$BUILDER" --out-dir "$IDEM_A" >/dev/null 2>&1
+python3 "$BUILDER" --out-dir "$IDEM_B" >/dev/null 2>&1
+if diff -rq "$IDEM_A" "$IDEM_B" >/dev/null 2>&1; then
+  pass "regeneration is idempotent (two runs byte-identical)"
+else
+  fail "regeneration is idempotent (two runs byte-identical)" "consecutive builds differ"
+fi
+rm -rf "$IDEM_A" "$IDEM_B"
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
