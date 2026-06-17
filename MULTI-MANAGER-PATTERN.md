@@ -156,15 +156,6 @@ Mechanics:
   A `PreToolUse:Bash` guard that enforces the mode boundary (soft `--force` /
   `SABLE_ORCHESTRATION_FORCE=1` override). No-ops for non-Lincoln and subagent
   contexts. Registered first in the `Bash` matcher in `settings-snippet.json`.
-- **`bin/sable-status`** *(deprecated v1 surface — see below)*
-- **`bin/sable-cockpit`** + **`templates/multi-manager/layouts/sable.kdl`**
-  *(deprecated v1 surface — see below)*
-
-**Deprecated v1 surface (not deleted):** The v1 topology used a two-pane Zellij
-layout (`sable-cockpit` + `sable-status` dashboard). These files are kept with
-DEPRECATED headers because the dashboard may return as an optional monitoring
-pane. They do not affect v2 operation. See [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md)
-§ "Supersedes: v1 Zellij/sable-status surface" for the full rationale.
 
 ---
 

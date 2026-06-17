@@ -78,10 +78,10 @@ Both installers do the same thing:
 
 Both are idempotent and safe to re-run. Useful flags:
 - `bash install.sh --dry-run` — report exactly what would be copied, write nothing.
-- `bash install.sh --orchestration` — also install the **cockpit (multi-manager) tier**
+- `bash install.sh --orchestration` — also install the **Orchestration (multi-manager) tier**
   (the one-window manager hooks + `agents.yaml` registry). Foundation adopters
   skip this; climb to it when you're ready for swarm execution (see
-  [Climbing to the cockpit](#climbing-to-the-cockpit-advanced) below).
+  [Climbing to orchestration](#climbing-to-orchestration-advanced) below).
 
 If you'd rather do it manually, see [Manual install](#manual-install) below.
 
@@ -147,9 +147,9 @@ If `bd close` succeeded the first time without asking for tests, the hooks aren'
 
 ---
 
-## Climbing to the cockpit (advanced)
+## Climbing to orchestration (advanced)
 
-Foundation gets you single-agent, sequential SABLE. The **cockpit** is the top
+Foundation gets you single-agent, sequential SABLE. The **Orchestration tier** is the top
 rung of the [adoption ramp](#adoption-ramp--the-install-is-the-same-the-practice-ramps-over-time):
 the **one-window native-spawn topology** where you talk to a single *Lincoln*
 session that hosts the named execution managers (*Optimus*, *Tarzan*) as resident
@@ -157,7 +157,7 @@ subagents — and each manager dispatches its own background workers and pushes 
 own approved lane. Climb here once your bead-writing is automatic and your usage
 budget supports parallel agents (see SABLE.md §6).
 
-**Install the cockpit tier:**
+**Install the Orchestration tier:**
 
 ```bash
 cd ~/sable
@@ -186,7 +186,7 @@ The installer **auto-merges** the Orchestration hook block into
 **Restart Claude Code** afterward so the agent definitions, slash commands, and
 hook registrations load.
 
-**Verify the cockpit:**
+**Verify orchestration:**
 
 ```bash
 ls ~/.claude/hooks/multi-manager/        # governance hooks present
@@ -203,7 +203,7 @@ snippet if you run a merge queue. The full topology lives in
 
 ### Teams topology (experimental)
 
-The cockpit can run on Claude Code's experimental **Agent Teams** feature instead
+The Orchestration tier can run on Claude Code's experimental **Agent Teams** feature instead
 of background subagents — managers and Chuck become live team members that
 coordinate over `SendMessage`, collapsing the second terminal into one window. It
 is **opt-in and parallel** to the default (nested) topology:

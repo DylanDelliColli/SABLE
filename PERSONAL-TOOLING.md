@@ -8,7 +8,7 @@ Contents:
 - `skills/audit-deep-dive/SKILL.md` — Claude Code skill for converting AUDIT: beads into epic+children
 - `skills/columbo/SKILL.md` + `skills/columbo/columbo-prefilter.py` — Claude Code skill that delivers the Columbo test-coverage planning workflow without requiring the multi-manager registry, role files, agent identity, or coordination hooks. Use this on machines where you want Columbo's interview + skeleton-test output but not the full multi-manager pattern (typical for work computers where you bounce between many repos). Invokable as `/columbo` once installed at `~/.claude/skills/columbo/`.
 - `MULTI-MANAGER-PATTERN.md` — experimental coordination pattern for power-user multi-agent swarms. Eight-agent roster: continuous execution managers (Optimus / Tarzan / Chuck), session-scoped planning agents (Sherlock / Victor / Rudy / Columbo), and execution-session strategist (Lincoln). Companion `hooks/multi-manager/`, `templates/multi-manager/`, `bin/columbo-prefilter.py` (Columbo's audit-mode triage tool), and `bin/sable-agents` reminder helper.
-- `MULTI-MANAGER-PATTERN.md` + cockpit tooling — v2 one-window topology: one Lincoln main session hosts Optimus and Tarzan as resident subagents; Chuck stays a second terminal. Planning is a five-stage gated machine (framing → research → architecture → test-strategy → decomposition) controlled by `/sable-plan` and `/sable-execute`. Companion `bin/sable-mode`, `hooks/multi-manager/mode-interlock.sh`, `skills/sable-plan`, `skills/sable-execute`. See install step 4 below. **Note**: `bin/sable-status`, `bin/sable-cockpit`, and `templates/multi-manager/layouts/sable.kdl` are deprecated (v1 Zellij surface) — not deleted, may return as an optional pane.
+- `MULTI-MANAGER-PATTERN.md` + orchestration tooling — v2 one-window topology: one Lincoln main session hosts Optimus and Tarzan as resident subagents; Chuck stays a second terminal. Planning is a five-stage gated machine (framing → research → architecture → test-strategy → decomposition) controlled by `/sable-plan` and `/sable-execute`. Companion `bin/sable-mode`, `hooks/multi-manager/mode-interlock.sh`, `skills/sable-plan`, `skills/sable-execute`. See install step 4 below.
 
 ## Columbo: skill vs. multi-manager pattern
 
@@ -90,25 +90,23 @@ Files:
 - `templates/sherlock-bead.md` — required template for `sherlock-finding` beads (mechanically enforced by `bead-description-gate.sh`)
 - `templates/columbo-bead.md` — required template for `columbo-test-spec` (forward) and `columbo-test-gap` (audit) beads (mechanically enforced by `bead-description-gate.sh`)
 
-### 4. Cockpit (Planning/Execution UI — extends the Multi-Manager Pattern)
+### 4. Orchestration (Planning/Execution UI — extends the Multi-Manager Pattern)
 
-The cockpit is a single operator-facing session over the roster: `/sable-plan` fills
+The orchestration tier is a single operator-facing session over the roster: `/sable-plan` fills
 the bead pool via the Tier-2 producers, `/sable-execute` drains it via the manager
 swarm. The installer is **self-sufficient** — it installs its own registry
-(`agents.yaml`) and identity injection, so cockpit identity works standalone;
+(`agents.yaml`) and identity injection, so orchestration identity works standalone;
 the full *running* manager swarm (step 3) is optional. Full rationale in
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md); the surface is summarized in
-`MULTI-MANAGER-PATTERN.md` → "The Cockpit".
+`MULTI-MANAGER-PATTERN.md` → "The v2 topology (one-window)".
 
 Files:
 - `bin/sable-mode` — mode-state read/write helper (python3, no jq); single source of truth at `~/.claude/sable/state/mode-state.json`. Honors the `SABLE_ORCHESTRATION` off-switch.
 - `skills/sable-plan/SKILL.md`, `skills/sable-execute/SKILL.md` — the `/sable-plan` and `/sable-execute` mode-flip skills
-- `templates/multi-manager/roles/cockpit.md` — cockpit identity (Lincoln evolved + fleet launch)
-- `templates/multi-manager/agents.yaml` — the agent registry / source of truth (the cockpit is registered here)
+- `templates/multi-manager/roles/lincoln.md` — Lincoln identity (strategist + fleet launch)
+- `templates/multi-manager/agents.yaml` — the agent registry / source of truth (Lincoln is registered here)
 - `hooks/multi-manager/mode-interlock.sh` — the mode interlock (PreToolUse:Bash); honors `SABLE_ORCHESTRATION=off`
 - `hooks/multi-manager/session-role-anchor.sh` — identity injection (SessionStart+PreCompact); resolves the role project-first then user
-- `bin/sable-status` + `bin/test_sable_status.py` — **DEPRECATED** (v1 Zellij surface) — read-only dashboard, kept for possible future use as optional pane
-- `bin/sable-cockpit` + `templates/multi-manager/layouts/sable.kdl` — **DEPRECATED** (v1 Zellij surface) — one-command Zellij launch, kept for possible future use
 - `bin/sable-orchestration-install` — the installer (below)
 
 Install with the installer (do NOT hand-copy):
@@ -135,8 +133,8 @@ only if `textual` is missing.
 
 **Scope.** Default is **project** (`./.claude`) so the machinery stays contained
 to the repos where you want it and is trivially removable. `--user` opts into a
-global install. Project-scoped skills/layout are discovered when you launch the
-cockpit from that repo.
+global install. Project-scoped skills are discovered when you launch
+Lincoln from that repo.
 
 **Off-switch (no uninstall needed).** Export `SABLE_ORCHESTRATION=off` (also `0`,
 `false`, `no`) to disable at runtime — `sable-mode` refuses to flip mode and the
@@ -144,10 +142,7 @@ interlock no-ops. Unset to re-enable. The interlock is already self-gating (it
 only acts in a `CLAUDE_AGENT_NAME=cockpit` session), so it never touches your
 normal sessions regardless.
 
-Requirements: the `textual` Python package (`python3 -m pip install textual`) for
-the deprecated `sable-status` dashboard only. `zellij` (https://zellij.dev) is
-required only for the deprecated `sable-cockpit` helper. **The v2 one-window
-topology requires neither** — launch Lincoln directly with:
+Requirements: none beyond the Foundation install. Launch Lincoln directly with:
 
 ```bash
 lincoln   # or: CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude
@@ -156,10 +151,10 @@ lincoln   # or: CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude
 After installing, **restart the session** (skills + hooks load at startup), then
 type `/sable-plan` or `/sable-execute` in the Lincoln session.
 
-Note: the installer is self-sufficient — `/sable-plan`, `/sable-execute`, the dashboard, the
-interlock, **and identity injection** (the cockpit session auto-adopts
-`roles/cockpit.md` at startup via the `session-role-anchor` hook it installs) all
-work from the cockpit install alone. The only thing the **full Multi-Manager
+Note: the installer is self-sufficient — `/sable-plan`, `/sable-execute`, the
+interlock, **and identity injection** (the Lincoln session auto-adopts
+`roles/lincoln.md` at startup via the `session-role-anchor` hook it installs) all
+work from the orchestration install alone. The only thing the **full Multi-Manager
 Pattern** (step 3) adds on top is the *running* manager swarm — Optimus / Tarzan /
 Chuck as live sessions plus their continuous coordination hooks (inbox, claim,
 overlap, preempt, pre-push). Install that only when you want the swarm.

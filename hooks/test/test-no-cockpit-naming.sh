@@ -97,4 +97,19 @@ for f in skills/sable-execute/SKILL.md \
 done
 has skills/sable-execute/SKILL.md "/sable-execute"
 
+# --- SABLE-d50.5: ppy/86n-owned doc residuals the de-cockpit sweep missed ---
+# roles/cockpit.md was renamed to roles/lincoln.md (a dead path before this);
+# the v1 Zellij surface (sable-cockpit / sable-status / sable.kdl) is DELETED,
+# not merely "deprecated, not deleted". In PERSONAL-TOOLING 'cockpit' survives
+# only as the CLAUDE_AGENT_NAME env identity, so assert the prose phrases —
+# QUICKSTART and MULTI-MANAGER-PATTERN scrub fully.
+lacks PERSONAL-TOOLING.md "roles/cockpit.md"
+lacks PERSONAL-TOOLING.md "Cockpit"
+lacks PERSONAL-TOOLING.md "the cockpit"
+lacks PERSONAL-TOOLING.md "sable-cockpit"
+lacks PERSONAL-TOOLING.md "sable-status"
+lacks QUICKSTART.md "cockpit"
+lacks MULTI-MANAGER-PATTERN.md "cockpit"
+lacks MULTI-MANAGER-PATTERN.md "sable-status"
+
 if [ "$fails" -eq 0 ]; then printf 'PASS test-no-cockpit-naming\n'; else printf 'FAIL test-no-cockpit-naming (%d)\n' "$fails"; exit 1; fi
