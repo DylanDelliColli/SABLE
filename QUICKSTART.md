@@ -161,8 +161,8 @@ budget supports parallel agents (see SABLE.md §6).
 
 ```bash
 cd ~/sable
-bash install.sh --orchestration              # subagent topology (default)
-bash install.sh --orchestration --teams      # experimental Agent-Teams topology
+bash install.sh --orchestration              # teams topology (default, with nested fallback)
+bash install.sh --orchestration --subagent   # nested-subagent topology (opt-out)
 bash install.sh                              # no flag on a terminal → interactive tier/topology prompt
 SABLE_ORCHESTRATION=1 bash install.sh        # non-interactive equivalent of --orchestration
 ```
@@ -181,10 +181,10 @@ This adds, on top of the Foundation install:
   Foundation install.
 
 The installer **auto-merges** the Orchestration hook block into
-`~/.claude/settings.json` (the subagent snippet by default; the teams snippet with
-`--teams`) — it backs the file up first and never clobbers existing entries.
-**Restart Claude Code** afterward so the agent definitions, slash commands, and
-hook registrations load.
+`~/.claude/settings.json` (the teams governance-union snippet by default; the subagent
+snippet with `--subagent`/`--nested`) — it backs the file up first and never clobbers
+existing entries. **Restart Claude Code** afterward so the agent definitions, slash
+commands, and hook registrations load.
 
 **Verify orchestration:**
 
@@ -201,26 +201,37 @@ snippet if you run a merge queue. The full topology lives in
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) and
 [`ENTRY-POINTS-DESIGN.md`](ENTRY-POINTS-DESIGN.md).
 
-### Teams topology (experimental)
+### Teams topology (default when available)
 
-The Orchestration tier can run on Claude Code's experimental **Agent Teams** feature instead
-of background subagents — managers and Chuck become live team members that
-coordinate over `SendMessage`, collapsing the second terminal into one window. It
-is **opt-in and parallel** to the default (nested) topology:
+The Orchestration tier defaults to Claude Code's **Agent Teams** surface — managers and
+Chuck become live team members that coordinate over `SendMessage`, collapsing the second
+terminal into one window. Teams is the default; nested subagents are the fallback when
+the experimental tooling is not active:
+
+- **Default (teams):** `bash install.sh --orchestration` — merges the teams governance-union
+  snippet. Requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in `~/.claude/settings.json`
+  (operator-added, never auto-written by the installer — locked decision). Without that flag
+  (or without the Team\* tools loaded) `/sable-execute` transparently falls back to the nested
+  topology.
+- **Explicit opt-out (nested):** `bash install.sh --orchestration --subagent` — merges the
+  nested-subagent snippet instead; Chuck stays a second terminal.
 
 ```bash
-# 1. Install the teams topology — auto-merges the teams snippet (omits the poll hooks):
-bash install.sh --orchestration --teams
-# 2. Add the Claude Code flag to ~/.claude/settings.json (env block) — the one line
-#    the installer won't auto-write:
-#      "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
-# 3. Launch Lincoln with SABLE_TEAMS set:
-SABLE_TEAMS=1 CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude
+# Default: teams topology with automatic nested fallback
+bash install.sh --orchestration
+# Then add this ONE line to ~/.claude/settings.json env block (operator step, not auto-written):
+#   "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
+# Launch Lincoln:
+CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude
+
+# Explicit opt-out: nested-subagent topology
+bash install.sh --orchestration --subagent
 ```
 
-`/sable-execute` runs `sable-teams-preflight`, sees `SABLE_TEAMS=1`, and spawns Optimus,
-Tarzan, and Chuck as team members (no separate Chuck terminal). The full design is
-in [`AGENT-TEAMS-DESIGN.md`](AGENT-TEAMS-DESIGN.md).
+`/sable-execute` runs `sable-teams-preflight`; when the Agent Teams tooling is available it
+spawns Optimus, Tarzan, and Chuck as team members (no separate Chuck terminal). Without the
+flag it falls back to nested subagents seamlessly. The full design is in
+[`AGENT-TEAMS-DESIGN.md`](AGENT-TEAMS-DESIGN.md).
 
 ---
 

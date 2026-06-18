@@ -111,25 +111,29 @@ sable-agents victor       # single agent + role file path
 SABLE v3 reduces the operator surface to **one primary window**. See
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) for the full rationale; the summary:
 
-> **Teams variant (opt-in):** an alternative topology built on Claude Code Agent
-> Teams — managers and Chuck as live `SendMessage` members in one window — is
-> designed in [`AGENT-TEAMS-DESIGN.md`](AGENT-TEAMS-DESIGN.md).
+> **Teams topology (default when available):** the default surface — managers and Chuck as live
+> `SendMessage` team members in one window — built on Claude Code Agent Teams.
+> Requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in `~/.claude/settings.json`
+> (operator-added, never auto-written). Without that flag, `/sable-execute`
+> transparently falls back to the nested-subagent topology. Designed in
+> [`AGENT-TEAMS-DESIGN.md`](AGENT-TEAMS-DESIGN.md).
 
 A single **Lincoln main session** (`CLAUDE_AGENT_NAME=lincoln
-CLAUDE_AGENT_ROLE=manager claude`) is the one session you talk to. Optimus and
-Tarzan run as **resident manager subagents** inside it — spawned once at session
-start, living in the background, where each **dispatches its own workers** (via
-the `Agent` tool — nested spawn, CC 2.1.177, SABLE-uz9.8/uz9.9) and **pushes its
-own approved lanes** (`git -C <worktree> push`). Lincoln spawns and oversees
-them; it no longer relays dispatch requests or pushes on their behalf. Chuck
-stays a separate terminal (env-var identity) because always-on merge-queue
-polling is session-shaped — see the "Chuck hybrid holdout" section in
+CLAUDE_AGENT_ROLE=manager claude`) is the one session you talk to. With the teams
+topology (default), Optimus, Tarzan, and Chuck run as live team members — Chuck
+folds into the same window, eliminating the second terminal. With the nested fallback,
+Optimus and Tarzan run as **resident manager subagents** inside Lincoln — spawned once
+at session start, living in the background, where each **dispatches its own workers**
+(via the `Agent` tool — nested spawn, CC 2.1.177, SABLE-uz9.8/uz9.9) and **pushes its
+own approved lanes** (`git -C <worktree> push`). In the nested topology Chuck stays a
+separate terminal (env-var identity) because always-on merge-queue polling is
+session-shaped — see the "Chuck hybrid holdout" section in
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md).
 
 | Mode | Job | Mechanics |
 |------|-----|-----------|
 | **Planning** | fill & groom the pool via the staged substages (FRAMING → RESEARCH → ARCHITECTURE → TEST-STRATEGY → DECOMPOSITION) | Lincoln runs the substage machine; Tier-2 producers invoked on demand; interlock blocks execution dispatches until `substage=decomposition` |
-| **Execution** | drain the bead pool | Lincoln spawns + oversees resident Optimus + Tarzan subagents, which self-dispatch workers and self-push approved lanes; Chuck handles merge queue in second terminal |
+| **Execution** | drain the bead pool | Teams (default): Lincoln spawns Optimus, Tarzan, Chuck as team members — each manager can self-dispatch workers and self-push approved lanes; Chuck folds in, no second terminal. Nested fallback: Optimus + Tarzan as resident subagents, Chuck in second terminal |
 
 Planning is staged, not a single step. The five substages are:
 

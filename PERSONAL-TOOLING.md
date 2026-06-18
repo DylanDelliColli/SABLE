@@ -8,7 +8,7 @@ Contents:
 - `skills/audit-deep-dive/SKILL.md` — Claude Code skill for converting AUDIT: beads into epic+children
 - `skills/columbo/SKILL.md` + `skills/columbo/columbo-prefilter.py` — Claude Code skill that delivers the Columbo test-coverage planning workflow without requiring the multi-manager registry, role files, agent identity, or coordination hooks. Use this on machines where you want Columbo's interview + skeleton-test output but not the full multi-manager pattern (typical for work computers where you bounce between many repos). Invokable as `/columbo` once installed at `~/.claude/skills/columbo/`.
 - `MULTI-MANAGER-PATTERN.md` — experimental coordination pattern for power-user multi-agent swarms. Eight-agent roster: continuous execution managers (Optimus / Tarzan / Chuck), session-scoped planning agents (Sherlock / Victor / Rudy / Columbo), and execution-session strategist (Lincoln). Companion `hooks/multi-manager/`, `templates/multi-manager/`, `bin/columbo-prefilter.py` (Columbo's audit-mode triage tool), and `bin/sable-agents` reminder helper.
-- `MULTI-MANAGER-PATTERN.md` + orchestration tooling — v3 one-window topology: one Lincoln main session hosts Optimus and Tarzan as resident subagents; Chuck stays a second terminal. Planning is a five-stage gated machine (framing → research → architecture → test-strategy → decomposition) controlled by `/sable-plan` and `/sable-execute`. Companion `bin/sable-mode`, `hooks/multi-manager/mode-interlock.sh`, `skills/sable-plan`, `skills/sable-execute`. See install step 4 below.
+- `MULTI-MANAGER-PATTERN.md` + orchestration tooling — v3 one-window topology: teams surface is the default (Optimus, Tarzan, and Chuck as live team members — Chuck folds in, no second terminal); nested subagents are the automatic fallback when `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is absent. Planning is a five-stage gated machine (framing → research → architecture → test-strategy → decomposition) controlled by `/sable-plan` and `/sable-execute`. Companion `bin/sable-mode`, `hooks/multi-manager/mode-interlock.sh`, `skills/sable-plan`, `skills/sable-execute`. See install step 4 below.
 
 ## Columbo: skill vs. multi-manager pattern
 
@@ -113,7 +113,8 @@ Install with the installer (do NOT hand-copy):
 
 ```bash
 # from the repo, install into the CURRENT project's ./.claude (default, contained):
-sable-orchestration-install
+sable-orchestration-install                    # teams topology (default, with nested fallback)
+sable-orchestration-install --subagent         # nested-subagent topology (opt-out)
 
 # or install globally into ~/.claude for use everywhere:
 sable-orchestration-install --user
@@ -130,6 +131,19 @@ and identity injection on `SessionStart`+`PreCompact` (project scope writes the
 uncommitted `.claude/settings.local.json`; `--user` writes `~/.claude/settings.json`,
 backed up first and JSON-validated, never clobbering existing hooks). It warns
 only if `textual` is missing.
+
+**Teams topology and the experimental flag.** The default install merges the teams
+governance-union snippet. For teams to activate at runtime you must add one line to
+`~/.claude/settings.json` yourself (the installer never auto-writes it — locked
+decision):
+
+```json
+"env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
+```
+
+Without that flag (or without the Team\* tools loaded) `/sable-execute` transparently
+falls back to the nested-subagent topology — Chuck stays a second terminal in that
+case. With it, Chuck folds into the team and the second terminal is eliminated.
 
 **Scope.** Default is **project** (`./.claude`) so the machinery stays contained
 to the repos where you want it and is trivially removable. `--user` opts into a
