@@ -25,13 +25,20 @@ SS="$TS/.claude/settings.json"
 present "$TS/.claude/hooks/multi-manager/mode-interlock.sh" "subagent: delegate installed multi-manager hooks"
 present "$TS/.claude/sable/agents.yaml"                     "subagent: registry installed"
 present "$TS/.claude/skills/sable-plan/SKILL.md"           "subagent: /sable-plan skill installed"
-absent  "$TS/.claude/agents-teams"                          "subagent: no agents-teams"
+present "$TS/.claude/agents-teams/chuck.md"                 "subagent: agents-teams defs always installed"
 [ "$(count_marker "$SS" mode-interlock.sh)" = "2" ] && pass "subagent: interlock merged on both legs" || fail "subagent: interlock merged on both legs" "count=$(count_marker "$SS" mode-interlock.sh)"
 [ "$(count_marker "$SS" inbox-injection)" -ge 1 ] && pass "subagent: poll hooks present in settings" || fail "subagent: poll hooks present" "count=$(count_marker "$SS" inbox-injection)"
 
 # installed hook copy is runnable (no-op on benign input → exit 0)
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"echo hi"}}' | bash "$TS/.claude/hooks/multi-manager/mode-interlock.sh" >/dev/null 2>&1
 [ "$?" = "0" ] && pass "subagent: installed interlock copy runs" || fail "subagent: installed interlock copy runs"
+
+# --nested is an alias for --subagent
+TN2="$(mktemp -d)"
+HOME="$TN2" bash "$INSTALL" --orchestration --nested >/dev/null 2>&1
+present "$TN2/.claude/hooks/multi-manager/mode-interlock.sh" "--nested: hooks installed"
+present "$TN2/.claude/agents-teams/chuck.md"                  "--nested: agents-teams defs installed"
+rm -rf "$TN2"
 
 # idempotent re-run: interlock count stable
 HOME="$TS" bash "$INSTALL" --orchestration --subagent >/dev/null 2>&1
@@ -52,6 +59,15 @@ present "$TT/.claude/agents-teams/optimus.md" "teams: member defs installed"
 [ "$(count_marker "$TSET" mode-interlock.sh)" = "2" ] && pass "teams: interlock merged on both legs" || fail "teams: interlock merged" "count=$(count_marker "$TSET" mode-interlock.sh)"
 grep -q 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS' /tmp/ti-teams.log && pass "teams: experimental flag PRINTED" || fail "teams: experimental flag printed"
 ! grep -q 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS' "$TSET" && pass "teams: flag NOT auto-written to settings" || fail "teams: flag not auto-written"
+
+# ---------- default topology is teams ----------
+TD="$(mktemp -d)"
+HOME="$TD" bash "$INSTALL" --orchestration >/tmp/ti-default.log 2>&1
+TDSET="$TD/.claude/settings.json"
+present "$TD/.claude/agents-teams/chuck.md"                           "default topology: agents-teams defs installed"
+[ "$(count_marker "$TDSET" inbox-injection)" -ge 1 ] && pass "default topology: governance hooks in settings" || fail "default topology: governance hooks in settings" "count=$(count_marker "$TDSET" inbox-injection)"
+grep -q 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS' /tmp/ti-default.log && pass "default topology: teams flag PRINTED" || fail "default topology: teams flag PRINTED"
+rm -rf "$TD"
 
 # ---------- tier gate: Foundation skips the layer ----------
 TF="$(mktemp -d)"

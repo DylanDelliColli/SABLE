@@ -23,7 +23,7 @@ SKILLS_DST="${CLAUDE_DIR}/skills"
 # --- CLI flags (SABLE-106, front door SABLE-ppy) ---
 DRY_RUN=0
 ORCHESTRATION=0
-TOPOLOGY="subagent"
+TOPOLOGY="teams"
 TIER_SET=0
 [ "${SABLE_ORCHESTRATION:-}" = "1" ] && { ORCHESTRATION=1; TIER_SET=1; }
 for arg in "$@"; do
@@ -31,14 +31,16 @@ for arg in "$@"; do
         --dry-run)       DRY_RUN=1 ;;
         --orchestration) ORCHESTRATION=1; TIER_SET=1 ;;
         --foundation)    ORCHESTRATION=0; TIER_SET=1 ;;
-        --subagent)      TOPOLOGY="subagent" ;;
+        --subagent|--nested) TOPOLOGY="subagent" ;;
         --teams)         TOPOLOGY="teams" ;;
         -h|--help)
-            echo "Usage: install.sh [--foundation|--orchestration] [--subagent|--teams] [--dry-run]"
-            echo "  --orchestration    install the Orchestration tier (manager workflow)"
-            echo "  --foundation       base methodology only (default if neither chosen non-interactively)"
-            echo "  --subagent|--teams Orchestration topology (default subagent; teams is experimental)"
-            echo "  --dry-run          report what would be done; write nothing"
+            echo "Usage: install.sh [--foundation|--orchestration] [--subagent|--nested|--teams] [--dry-run]"
+            echo "  --orchestration        install the Orchestration tier (manager workflow)"
+            echo "  --foundation           base methodology only (default if neither chosen non-interactively)"
+            echo "  --teams                Orchestration topology: teams (default) — live agent coordination"
+            echo "                         Needs CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1."
+            echo "  --subagent|--nested    Orchestration topology: nested subagents (opt-out from teams)"
+            echo "  --dry-run              report what would be done; write nothing"
             echo "  (run with no tier flag on a terminal to choose interactively;"
             echo "   or set SABLE_ORCHESTRATION=1 for the Orchestration tier)"
             exit 0 ;;
@@ -87,11 +89,11 @@ if [ "$TIER_SET" = "0" ] && [ -t 0 ]; then
     if [ "$_tier" = "2" ]; then
         ORCHESTRATION=1
         bold "  Topology"
-        echo "    [1] Subagent (default)    Managers run as background subagents. Stable."
-        echo "    [2] Teams (experimental)  Managers coordinate live via messaging — more"
+        echo "    [1] Teams (default)       Managers coordinate live via messaging — more"
         echo "                              parallelism. Needs CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1."
+        echo "    [2] Subagent/nested       Managers run as background subagents. Stable fallback."
         printf '  Topology [1]: '; read -r _topo
-        [ "$_topo" = "2" ] && TOPOLOGY="teams"
+        [ "$_topo" = "2" ] && TOPOLOGY="subagent"
     fi
     echo
 fi

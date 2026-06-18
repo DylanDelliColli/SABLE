@@ -42,7 +42,7 @@ out1="$(SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project 2>&1)"
 exists "$P/.claude/skills/sable-plan/SKILL.md"    "project: /plan skill installed"
 exists "$P/.claude/skills/sable-execute/SKILL.md" "project: /execute skill installed"
 exists "$P/.claude/sable/roles/lincoln.md"  "project: lincoln role installed"
-if [ ! -e "$P/.claude/agents-teams" ]; then pass "project subagent: no agents-teams (teams-only, SABLE-ppy)"; else fail "project subagent: no agents-teams" "agents-teams present in a subagent install"; fi
+if [ -e "$P/.claude/agents-teams/chuck.md" ]; then pass "project default: agents-teams defs always installed"; else fail "project default: agents-teams defs always installed" "chuck.md missing from $P/.claude/agents-teams/"; fi
 if [ -x "$P/.claude/hooks/multi-manager/mode-interlock.sh" ]; then pass "project: interlock hook installed+exec"; else fail "project: interlock hook installed+exec"; fi
 SET="$P/.claude/settings.local.json"
 exists "$SET" "project: settings.local.json created"
@@ -68,10 +68,19 @@ PY
 SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project >/dev/null 2>&1
 if grep -q 'other-hook.sh' "$SET"; then pass "project: preserves existing hooks"; else fail "project: preserves existing hooks"; fi
 
-# ---------- default scope is project ----------
+# ---------- default scope is project; default topology is teams ----------
 P2="$(mktemp -d)"
 SABLE_PROJECT_DIR="$P2" bash "$INSTALLER" >/dev/null 2>&1
 exists "$P2/.claude/skills/sable-plan/SKILL.md" "default (no flag) installs into project ./.claude"
+if [ -e "$P2/.claude/agents-teams/chuck.md" ]; then pass "default topology teams: agents-teams defs installed"; else fail "default topology teams: agents-teams defs installed" "chuck.md missing"; fi
+SET2="$P2/.claude/settings.local.json"
+if [ "$(count_marker "$SET2" inbox-injection)" -ge 1 ]; then pass "default topology teams: governance hooks in settings"; else fail "default topology teams: governance hooks in settings" "count=$(count_marker "$SET2" inbox-injection)"; fi
+
+# --nested alias installs agents-teams defs (same as --subagent)
+PN="$(mktemp -d)"
+SABLE_PROJECT_DIR="$PN" bash "$INSTALLER" --nested >/dev/null 2>&1
+if [ -e "$PN/.claude/agents-teams/chuck.md" ]; then pass "--nested alias: agents-teams defs installed"; else fail "--nested alias: agents-teams defs installed" "chuck.md missing"; fi
+rm -rf "$PN" "$P2"
 
 # ---------- user scope ----------
 U="$(mktemp -d)"
@@ -84,7 +93,7 @@ if [ "$(count_interlock "$U/.claude/settings.json")" = "2" ]; then pass "user: i
 SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --uninstall >/dev/null 2>&1
 if [ ! -e "$P/.claude/skills/sable-plan/SKILL.md" ]; then pass "uninstall removes skills"; else fail "uninstall removes skills"; fi
 if [ ! -e "$P/.claude/sable/agents.yaml" ]; then pass "uninstall removes registry"; else fail "uninstall removes registry"; fi
-if [ ! -e "$P/.claude/agents-teams" ]; then pass "uninstall removes teams agent defs"; else fail "uninstall removes teams agent defs"; fi
+if [ ! -e "$P/.claude/agents-teams/chuck.md" ]; then pass "uninstall removes teams agent defs"; else fail "uninstall removes teams agent defs"; fi
 if [ "$(count_interlock "$SET")" = "0" ]; then pass "uninstall de-registers interlock"; else fail "uninstall de-registers interlock" "count=$(count_interlock "$SET")"; fi
 if [ "$(count_marker "$SET" session-role-anchor.sh)" = "0" ]; then pass "uninstall de-registers identity hook"; else fail "uninstall de-registers identity hook" "count=$(count_marker "$SET" session-role-anchor.sh)"; fi
 if grep -q 'other-hook.sh' "$SET"; then pass "uninstall keeps unrelated hooks"; else fail "uninstall keeps unrelated hooks"; fi
