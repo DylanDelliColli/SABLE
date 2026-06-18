@@ -604,9 +604,9 @@ The orchestrator's job is to make workers successful by:
 3. Ensuring no two workers touch the same files
 4. Reviewing results and handling failures
 
-**The one-window evolution (v2).** On builds with nested subagents (Claude Code
+**The one-window evolution (v3).** On builds with nested subagents (Claude Code
 2.1.177+), the orchestrator no longer has to be the operator's own session. SABLE
-v2 runs **one operator-facing window** — the *Lincoln* main session — that hosts
+v3 runs **one operator-facing window** — the *Lincoln* main session — that hosts
 the named execution managers (*Optimus* for epic work, *Tarzan* for one-offs) as
 **resident subagents**. Each manager is itself an orchestrator: it nest-dispatches
 its own worker swarm via the Agent tool, reviews each worker's stopped-before-push
@@ -614,7 +614,6 @@ result, and pushes its own approved lane. The two-tier model becomes multi-tier 
 **operator → resident managers → per-lane workers** — all inside one window, with
 the mechanical governance firing on each *manager's own* dispatch. This is the top
 rung of the adoption ramp; the full topology and coordination hooks live in
-[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) and
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md).
 
 ### 6.2 Dispatching Workers

@@ -70,7 +70,7 @@ Clustering by file means each validator reads its sources once and judges every 
 
 | Agent | Type | Scope | Lifecycle |
 |-------|------|-------|-----------|
-| **Lincoln** | strategist | Status reporting, strategic conversation, cross-manager brokering during execution sessions | The primary window in v2: one main session that hosts Optimus and Tarzan as resident subagents. Chuck runs in a second terminal. Three modes: Quick strategy, Arbitration, What's next. Idle-polls inbox via `/loop 5m /inbox`. |
+| **Lincoln** | strategist | Status reporting, strategic conversation, cross-manager brokering during execution sessions | The primary window in v3: one main session that hosts Optimus and Tarzan as resident subagents. Chuck runs in a second terminal. Three modes: Quick strategy, Arbitration, What's next. Idle-polls inbox via `/loop 5m /inbox`. |
 
 Lincoln is the agent the user **primarily talks to** during a working session. Optimus / Tarzan / Chuck are autonomous — they don't need conversation, they need beads. Lincoln gives status, brokers `for-lincoln` arbitration asks from the other three, and helps the user think strategically without becoming an orchestrator. Lincoln has `cross_inbox_read: true` (bypasses the read guard so it can give status across all managers) and may file `for-X` coord beads (one-line, not detailed specs).
 
@@ -106,9 +106,9 @@ sable-agents victor       # single agent + role file path
 
 ---
 
-## The v2 topology (one-window)
+## The v3 topology (one-window)
 
-SABLE v2 reduces the operator surface to **one primary window**. See
+SABLE v3 reduces the operator surface to **one primary window**. See
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) for the full rationale; the summary:
 
 > **Teams variant (opt-in):** an alternative topology built on Claude Code Agent
@@ -163,14 +163,14 @@ Mechanics:
 
 Each manager launches with an immutable identity established at the OS level, not in conversation context.
 
-### Launch aliases (legacy / Chuck-only in v2)
+### Launch aliases (legacy / Chuck-only in v3)
 
-In v2, **Optimus and Tarzan are resident subagents** spawned by Lincoln — you do
+In v3, **Optimus and Tarzan are resident subagents** spawned by Lincoln — you do
 not launch them from the shell directly. The Lincoln alias is still needed for
 the main session, and Chuck still requires an env-var terminal (see
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) for the Chuck hybrid holdout rationale).
 
-**Minimum for a v2 execution session:**
+**Minimum for a v3 execution session:**
 
 ```bash
 # In ~/.zshrc or equivalent
@@ -194,7 +194,7 @@ rudy()     { CLAUDE_AGENT_NAME=rudy     CLAUDE_AGENT_ROLE=quality_validator clau
 columbo()  { CLAUDE_AGENT_NAME=columbo  CLAUDE_AGENT_ROLE=test_planner     claude "$@"; }
 ```
 
-**Legacy (pre-v2 / standalone installs):** if you are running Optimus or Tarzan
+**Legacy (pre-v3 / standalone installs):** if you are running Optimus or Tarzan
 as separate terminal sessions rather than as subagents, the original aliases
 still work:
 
@@ -211,9 +211,9 @@ Hooks inherit the Claude Code process's environment. An agent running `export CL
 
 A `SessionStart` hook reads `$CLAUDE_AGENT_NAME`, loads the corresponding role file from `~/.claude/sable/roles/<name>.md`, and injects it as the agent's identity context. A `PreCompact` hook re-injects after compaction (identity erodes silently otherwise).
 
-### Dual identity mode (v2)
+### Dual identity mode (v3)
 
-V2 supports two identity modes that coexist:
+v3 supports two identity modes that coexist:
 
 | Mode | Context | Mechanism |
 |------|---------|-----------|
@@ -623,7 +623,7 @@ for name in columbo optimus rudy sherlock tarzan victor; do
 done
 ```
 
-The named agent definitions in `~/.claude/agents/` are the v2 identity source
+The named agent definitions in `~/.claude/agents/` are the v3 identity source
 for resident subagents (Optimus, Tarzan). Non-SABLE agent files in
 `~/.claude/agents/` are preserved — the installer only writes the six SABLE
 agents by name.
@@ -682,13 +682,13 @@ If you need a longer test budget in auto mode, remember to raise `"timeout"` in 
 
 ### Step 8: Add aliases
 
-See [Identity & immutability → Launch aliases](#launch-aliases) for the v2 set.
-**Minimum for a v2 execution session** is just Lincoln and Chuck — Optimus and
+See [Identity & immutability → Launch aliases](#launch-aliases) for the v3 set.
+**Minimum for a v3 execution session** is just Lincoln and Chuck — Optimus and
 Tarzan are resident subagents, not separate shells. Add planning agent functions
 when you start running planning sessions.
 
 ```bash
-# In ~/.zshrc — minimum for v2:
+# In ~/.zshrc — minimum for v3:
 alias lincoln='CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude'
 alias chuck='CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude'
 

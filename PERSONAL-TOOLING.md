@@ -8,7 +8,7 @@ Contents:
 - `skills/audit-deep-dive/SKILL.md` — Claude Code skill for converting AUDIT: beads into epic+children
 - `skills/columbo/SKILL.md` + `skills/columbo/columbo-prefilter.py` — Claude Code skill that delivers the Columbo test-coverage planning workflow without requiring the multi-manager registry, role files, agent identity, or coordination hooks. Use this on machines where you want Columbo's interview + skeleton-test output but not the full multi-manager pattern (typical for work computers where you bounce between many repos). Invokable as `/columbo` once installed at `~/.claude/skills/columbo/`.
 - `MULTI-MANAGER-PATTERN.md` — experimental coordination pattern for power-user multi-agent swarms. Eight-agent roster: continuous execution managers (Optimus / Tarzan / Chuck), session-scoped planning agents (Sherlock / Victor / Rudy / Columbo), and execution-session strategist (Lincoln). Companion `hooks/multi-manager/`, `templates/multi-manager/`, `bin/columbo-prefilter.py` (Columbo's audit-mode triage tool), and `bin/sable-agents` reminder helper.
-- `MULTI-MANAGER-PATTERN.md` + orchestration tooling — v2 one-window topology: one Lincoln main session hosts Optimus and Tarzan as resident subagents; Chuck stays a second terminal. Planning is a five-stage gated machine (framing → research → architecture → test-strategy → decomposition) controlled by `/sable-plan` and `/sable-execute`. Companion `bin/sable-mode`, `hooks/multi-manager/mode-interlock.sh`, `skills/sable-plan`, `skills/sable-execute`. See install step 4 below.
+- `MULTI-MANAGER-PATTERN.md` + orchestration tooling — v3 one-window topology: one Lincoln main session hosts Optimus and Tarzan as resident subagents; Chuck stays a second terminal. Planning is a five-stage gated machine (framing → research → architecture → test-strategy → decomposition) controlled by `/sable-plan` and `/sable-execute`. Companion `bin/sable-mode`, `hooks/multi-manager/mode-interlock.sh`, `skills/sable-plan`, `skills/sable-execute`. See install step 4 below.
 
 ## Columbo: skill vs. multi-manager pattern
 
@@ -98,7 +98,7 @@ swarm. The installer is **self-sufficient** — it installs its own registry
 (`agents.yaml`) and identity injection, so orchestration identity works standalone;
 the full *running* manager swarm (step 3) is optional. Full rationale in
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md); the surface is summarized in
-`MULTI-MANAGER-PATTERN.md` → "The v2 topology (one-window)".
+`MULTI-MANAGER-PATTERN.md` → "The v3 topology (one-window)".
 
 Files:
 - `bin/sable-mode` — mode-state read/write helper (python3, no jq); single source of truth at `~/.claude/sable/state/mode-state.json`. Honors the `SABLE_ORCHESTRATION` off-switch.
