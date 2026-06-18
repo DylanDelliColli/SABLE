@@ -98,6 +98,35 @@ run_case_with_home \
   "$TMPDIR_WITH_DEFS" \
   "teams" 0
 
+# ---- Default flip: SABLE_TEAMS unset -> teams-when-available (SABLE-c2j.3) ----
+
+# Case 1: unset SABLE_TEAMS + flag set + defs present -> teams (exit 0)
+run_case_with_home \
+  "unset SABLE_TEAMS + flag=1 + defs present -> teams" \
+  "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1" \
+  "$TMPDIR_WITH_DEFS" \
+  "teams" 0
+
+# Case 2: unset SABLE_TEAMS + flag set + defs absent -> nested (exit 0, stderr defs hint)
+run_case_with_home \
+  "unset SABLE_TEAMS + flag=1 + defs absent -> nested (defs hint)" \
+  "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1" \
+  "$TMPDIR_NO_DEFS" \
+  "nested" 0 "agents-teams"
+
+# Case 3: unset SABLE_TEAMS + flag absent -> nested (exit 0)
+run_case \
+  "unset SABLE_TEAMS + flag absent -> nested" \
+  "" \
+  "nested" 0
+
+# Case 4: SABLE_TEAMS=off + flag=1 + defs present -> nested (explicit opt-out wins)
+run_case_with_home \
+  "SABLE_TEAMS=off + flag=1 + defs present -> nested (opt-out)" \
+  "SABLE_TEAMS=off CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1" \
+  "$TMPDIR_WITH_DEFS" \
+  "nested" 0
+
 # Cleanup
 rm -rf "$TMPDIR_NO_DEFS" "$TMPDIR_WITH_DEFS" "$EMPTY_HOME"
 

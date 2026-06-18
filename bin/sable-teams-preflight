@@ -1,29 +1,43 @@
 #!/usr/bin/env bash
 # sable-teams-preflight — decide the /execute dispatch topology from the env
-# (SABLE-amj.6). Prints "teams" or "nested" on stdout. Exits 1 with a one-line
-# fix on stderr if SABLE_TEAMS is requested but the Claude Code experimental
-# Agent-Teams flag is absent.
+# (SABLE-amj.6, SABLE-c2j.3). Prints "teams" or "nested" on stdout.
 #
-# Topology selection is an env var (matching SABLE_ORCHESTRATION / SABLE_ORCHESTRATION
-# convention) and is orthogonal to planning/execution MODE (mode-state.json).
+# Default (SABLE_TEAMS unset): prefer teams WHEN AVAILABLE — i.e. when
+# CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 AND agents-teams/ defs are on disk.
+# Explicit opt-out: SABLE_TEAMS=0/off/false/no forces nested even when teams
+# would be available.
+# Explicit opt-in: SABLE_TEAMS=1/true/yes/on requires the flag (exits 1 if
+# absent) and the defs (degrades to nested with a hint if absent).
+#
+# Topology selection is an env var (matching SABLE_ORCHESTRATION convention)
+# and is orthogonal to planning/execution MODE (mode-state.json).
 #
 # Usage:
 #   sable-teams-preflight        # -> "nested" | "teams" | (exit 1 + stderr fix)
 
 set -u
 
-case "$(printf '%s' "${SABLE_TEAMS:-}" | tr '[:upper:]' '[:lower:]')" in
+# _check_defs: shared defs-on-disk probe. Sets _DEFS_FOUND=1 if
+# agents-teams/ exists under .claude/ (project) or $HOME/.claude/ (global).
+_check_defs() {
+  _DEFS_FOUND=0
+  if [ -d ".claude/agents-teams" ]; then
+    _DEFS_FOUND=1
+  elif [ -n "${HOME:-}" ] && [ -d "$HOME/.claude/agents-teams" ]; then
+    _DEFS_FOUND=1
+  fi
+}
+
+_SABLE_TEAMS_NORM="$(printf '%s' "${SABLE_TEAMS:-}" | tr '[:upper:]' '[:lower:]')"
+
+case "$_SABLE_TEAMS_NORM" in
   1|true|yes|on)
+    # Explicit opt-in: require the experimental flag.
     if [ "${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-}" = "1" ]; then
-      # Check that agents-teams/ member defs exist on disk (project .claude/ first, then ~/.claude/).
-      # The experimental flag being set does not guarantee the defs are installed — a
-      # --orchestration install never creates them. If absent, degrade gracefully to nested.
-      _DEFS_FOUND=0
-      if [ -d ".claude/agents-teams" ]; then
-        _DEFS_FOUND=1
-      elif [ -n "${HOME:-}" ] && [ -d "$HOME/.claude/agents-teams" ]; then
-        _DEFS_FOUND=1
-      fi
+      # Check that agents-teams/ member defs exist on disk (project .claude/ first,
+      # then ~/.claude/). The experimental flag being set does not guarantee the defs
+      # are installed — a --orchestration install never creates them.
+      _check_defs
       if [ "$_DEFS_FOUND" -eq 1 ]; then
         echo "teams"
       else
@@ -35,8 +49,24 @@ case "$(printf '%s' "${SABLE_TEAMS:-}" | tr '[:upper:]' '[:lower:]')" in
       exit 1
     fi
     ;;
-  *)
+  0|false|no|off)
+    # Explicit opt-out: force nested even when teams would be fully available.
     echo "nested"
+    ;;
+  *)
+    # SABLE_TEAMS unset (or empty): teams-when-available.
+    # Prefer teams iff both the experimental flag AND defs are present; else nested.
+    if [ "${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-}" = "1" ]; then
+      _check_defs
+      if [ "$_DEFS_FOUND" -eq 1 ]; then
+        echo "teams"
+      else
+        echo "sable-teams-preflight: agents-teams/ defs not found; run install.sh --teams to install them (or add .claude/agents-teams/ to the project). Falling back to nested topology." >&2
+        echo "nested"
+      fi
+    else
+      echo "nested"
+    fi
     ;;
 esac
 exit 0
