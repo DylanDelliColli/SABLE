@@ -150,7 +150,7 @@ WARN_OUT="$(env -u CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS SABLE_PROJECT_DIR="$WARN
 if printf '%s' "$WARN_OUT" | grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"; then pass "teams install warns when the experimental flag is unset"; else fail "teams install warns when the experimental flag is unset" "no warning in output"; fi
 exists "$WARNDIR/.claude/agents-teams/optimus.md" "teams install: agents-teams member defs present"
 WSET="$WARNDIR/.claude/settings.local.json"
-if [ "$(count_marker "$WSET" inbox-injection)" = "0" ]; then pass "teams install: poll hooks omitted from settings"; else fail "teams install: poll hooks omitted" "count=$(count_marker "$WSET" inbox-injection)"; fi
+if [ "$(count_marker "$WSET" inbox-injection)" -ge 1 ]; then pass "teams install: governance hooks present in settings"; else fail "teams install: governance hooks present" "count=$(count_marker "$WSET" inbox-injection)"; fi
 rm -rf "$WARNDIR"
 
 rm -rf "$P" "$P2" "$U" "$PU" "$M"

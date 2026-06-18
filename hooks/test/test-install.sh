@@ -43,12 +43,12 @@ printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"comma
 HOME="$TN" bash "$INSTALL" --orchestration --subagent >/dev/null 2>&1
 grep -q 'user-own.sh' "$TN/.claude/settings.json" && pass "non-clobber: pre-existing user hook survives" || fail "non-clobber: pre-existing user hook survives"
 
-# ---------- topology: teams adds member defs, omits poll hooks, PRINTS the flag ----------
+# ---------- topology: teams adds member defs, governance hooks present, PRINTS the flag ----------
 TT="$(mktemp -d)"
 HOME="$TT" bash "$INSTALL" --orchestration --teams >/tmp/ti-teams.log 2>&1
 TSET="$TT/.claude/settings.json"
 present "$TT/.claude/agents-teams/optimus.md" "teams: member defs installed"
-[ "$(count_marker "$TSET" inbox-injection)" = "0" ] && pass "teams: poll hooks omitted from settings" || fail "teams: poll hooks omitted" "count=$(count_marker "$TSET" inbox-injection)"
+[ "$(count_marker "$TSET" inbox-injection)" -ge 1 ] && pass "teams: governance hooks present in settings" || fail "teams: governance hooks present" "count=$(count_marker "$TSET" inbox-injection)"
 [ "$(count_marker "$TSET" mode-interlock.sh)" = "2" ] && pass "teams: interlock merged on both legs" || fail "teams: interlock merged" "count=$(count_marker "$TSET" mode-interlock.sh)"
 grep -q 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS' /tmp/ti-teams.log && pass "teams: experimental flag PRINTED" || fail "teams: experimental flag printed"
 ! grep -q 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS' "$TSET" && pass "teams: flag NOT auto-written to settings" || fail "teams: flag not auto-written"

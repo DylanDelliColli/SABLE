@@ -1,5 +1,5 @@
 {
-  "_comment": "Multi-Manager TEAMS-mode hooks (SABLE-amj.5) — APPEND to ~/.claude/settings.json when running the agent-teams topology (SABLE_TEAMS=1). Identical to settings-snippet.json EXCEPT the three poll-based messaging hooks are OMITTED: inbox-injection (PostToolUse:Bash), inbox-injection-precompact (PreCompact), and read-guard (PreToolUse:Bash). In teams mode coordination is live via SendMessage, so members wake on a teammate's message instead of polling for-X beads (clean cutover, AGENT-TEAMS-DESIGN.md decision 5 / section 4).",
+  "_comment": "Multi-Manager TEAMS-mode hooks (SABLE-amj.5 / SABLE-c2j.1) — APPEND to ~/.claude/settings.json when running the agent-teams topology (SABLE_TEAMS=1). Identical to settings-snippet.json: all governance hooks (read-guard, model-check, inbox-injection, inbox-injection-precompact) are included for parity. inbox-injection is a harmless no-op under SendMessage; read-guard and pre-dispatch-model-check are transport-agnostic safety guards required equally in both topologies (SABLE-c2j locked decision 1).",
   "_install": "Copy each entry under the matching event/matcher into your existing settings.json hooks block. Use this INSTEAD of settings-snippet.json when running SABLE_TEAMS=1.",
   "_timeout_coupling": "pre-push-rebase-test.sh has TWO timeouts that must stay in sync: the 'timeout' field here (ms) and the SABLE_PRE_PUSH_TEST_TIMEOUT env var (seconds). Default pairing: inner 60s test budget, outer 90000ms hook. See settings-snippet.json for the full note.",
 
@@ -17,7 +17,8 @@
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/session-role-anchor.sh", "timeout": 3000 }
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/session-role-anchor.sh", "timeout": 3000 },
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/inbox-injection-precompact.sh", "timeout": 2000 }
         ]
       }
     ],
@@ -28,6 +29,7 @@
         "hooks": [
           { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/mode-interlock.sh", "timeout": 3000 },
           { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/tree-claim.sh", "timeout": 3000 },
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/read-guard.sh", "timeout": 3000 },
           { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-push-rebase-test.sh", "timeout": 90000 }
         ]
       },
@@ -38,7 +40,8 @@
           { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-preempt.sh", "timeout": 3000 },
           { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-refresh.sh", "timeout": 30000 },
           { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-claim.sh", "timeout": 5000 },
-          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-overlap.sh", "timeout": 5000 }
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-overlap.sh", "timeout": 5000 },
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/pre-dispatch-model-check.sh", "timeout": 5000 }
         ]
       },
       {
@@ -53,6 +56,7 @@
       {
         "matcher": "Bash",
         "hooks": [
+          { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/inbox-injection.sh", "timeout": 5000 },
           { "type": "command", "command": "bash ~/.claude/hooks/multi-manager/post-push-merge-notify.sh", "timeout": 10000 }
         ]
       }

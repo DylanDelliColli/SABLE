@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# test-teams-settings-snippet.sh — SABLE-amj.5
+# test-teams-settings-snippet.sh — SABLE-amj.5 / SABLE-c2j.1
 # The teams hook wiring (settings-snippet-teams.json) must register the shared
-# guard hooks and OMIT the three nested poll hooks (clean cutover: teams members
-# wake on SendMessage, they do not poll for-X beads).
+# guard hooks AND the governance hooks (read-guard, model-check, inbox-injection).
+# Governance parity with the nested topology is required (SABLE-c2j decision 1):
+# inbox-injection is a harmless no-op under SendMessage; read-guard and
+# model-check are transport-agnostic safety guards that teams needs equally.
 #
 # Run with:
 #   bash hooks/test/test-teams-settings-snippet.sh
@@ -49,10 +51,11 @@ for h in \
   present "$h"
 done
 
-# The three poll-based messaging hooks must be omitted (clean cutover)
-absent "inbox-injection.sh"
-absent "inbox-injection-precompact.sh"
-absent "read-guard.sh"
+# Governance hooks must be present (parity with nested topology — SABLE-c2j.1)
+present "inbox-injection.sh"
+present "inbox-injection-precompact.sh"
+present "read-guard.sh"
+present "pre-dispatch-model-check.sh"
 
 echo
 echo "=========================================="
