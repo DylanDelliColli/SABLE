@@ -36,7 +36,10 @@ echo "$COMMAND" | grep -q '^bd close' || exit 0
 # forms) and the shlex+flag-walker variant (SABLE-sqz: missed pipe /
 # redirect / chain tokens since they aren't flags but aren't IDs either).
 # Updated to accept lowercase prefixes (SABLE-i2m) for rigs using twine-*,
-# chess-*, or other any-case prefix schemes.
+# chess-*, or other any-case prefix schemes. Prefix class now allows hyphens
+# (market-brief-package-2e4o) so monorepo rigs with multi-hyphen prefixes
+# (market-brief-package-*) bind the suffix to the LAST hyphen segment; without
+# it those IDs matched zero tokens and the [no-test] hatch was silently skipped.
 BEAD_ARGS=$(BEAD_CMD="$COMMAND" python3 -c "
 import os, re, shlex
 cmd = re.sub(r'^bd close\s+', '', os.environ.get('BEAD_CMD', ''))
@@ -52,7 +55,7 @@ for t in tokens:
     if t.startswith('-'):
         break
     positional.append(t)
-ID_PATTERN = re.compile(r'^[A-Za-z][A-Za-z0-9]*-[a-z0-9]+(\.[0-9]+)?\$')
+ID_PATTERN = re.compile(r'^[A-Za-z][A-Za-z0-9-]*-[a-z0-9]+(\.[0-9]+)?\$')
 ids = [t for t in positional if ID_PATTERN.match(t)]
 print(' '.join(ids))
 ")

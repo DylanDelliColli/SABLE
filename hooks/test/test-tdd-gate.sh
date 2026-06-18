@@ -211,6 +211,28 @@ assert_hatch_used "lowercase dotted child ID" \
 assert_hatch_skipped "two lowercase beads still route to evidence check" \
   'bd close twine-stub twine-other --reason=cleanup'
 
+# ---------- New: multi-hyphen prefix rigs (market-brief-package-* fix) ----------
+# Monorepo rigs use hyphenated prefixes (market-brief-package-*). The ID_PATTERN
+# regex must bind the suffix to the LAST hyphen segment so the [no-test] escape
+# hatch fires for single-close on multi-hyphen IDs. Before the fix the prefix
+# class excluded hyphens, so these IDs matched zero tokens, ID_COUNT was 0, the
+# hatch was skipped, and every non-code close was wrongly denied.
+
+assert_hatch_used "multi-hyphen bare ID" \
+  'bd close market-brief-package-stub'
+
+assert_hatch_used "multi-hyphen ID with --reason" \
+  'bd close market-brief-package-stub --reason "docs only"'
+
+assert_hatch_used "multi-hyphen ID piped" \
+  'bd close market-brief-package-stub 2>&1 | tail -3'
+
+assert_hatch_used "multi-hyphen dotted child ID" \
+  'bd close market-brief-package-kqnu.3'
+
+assert_hatch_skipped "two multi-hyphen beads still route to evidence check" \
+  'bd close market-brief-package-stub market-brief-package-other --reason=cleanup'
+
 # ---------- New: flag values that look like IDs (SABLE-3uw / SABLE-9we fix) ----------
 # Flag values such as 'docs-only' or 'shipped-v2' match the bead-ID shape
 # (PREFIX-suffix). They must NOT inflate ID_COUNT.
