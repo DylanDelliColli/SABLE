@@ -15,7 +15,21 @@ set -u
 case "$(printf '%s' "${SABLE_TEAMS:-}" | tr '[:upper:]' '[:lower:]')" in
   1|true|yes|on)
     if [ "${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-}" = "1" ]; then
-      echo "teams"
+      # Check that agents-teams/ member defs exist on disk (project .claude/ first, then ~/.claude/).
+      # The experimental flag being set does not guarantee the defs are installed — a
+      # --orchestration install never creates them. If absent, degrade gracefully to nested.
+      _DEFS_FOUND=0
+      if [ -d ".claude/agents-teams" ]; then
+        _DEFS_FOUND=1
+      elif [ -n "${HOME:-}" ] && [ -d "$HOME/.claude/agents-teams" ]; then
+        _DEFS_FOUND=1
+      fi
+      if [ "$_DEFS_FOUND" -eq 1 ]; then
+        echo "teams"
+      else
+        echo "sable-teams-preflight: agents-teams/ defs not found; run install.sh --teams to install them (or add .claude/agents-teams/ to the project). Falling back to nested topology." >&2
+        echo "nested"
+      fi
     else
       echo "sable-teams-preflight: SABLE_TEAMS is set but CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS is not. Add \"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS\": \"1\" to the env block of ~/.claude/settings.json and restart Claude Code, or unset SABLE_TEAMS to use the nested topology." >&2
       exit 1

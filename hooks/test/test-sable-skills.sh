@@ -115,6 +115,14 @@ assert_grep "$EXEC_SKILL" "TeamCreate"             "/sable-execute teams branch 
 assert_grep "$EXEC_SKILL" "agents-teams"           "/sable-execute teams branch inline-spawns from the built teams defs"
 assert_grep "$EXEC_SKILL" "no separate Chuck"      "/sable-execute teams branch folds Chuck into the team (no second terminal)"
 
+# 9c. Runtime Team* tools availability probe (SABLE-1qt)
+# After preflight prints "teams", Lincoln must probe whether TeamCreate/TeamDelete are
+# actually live in the session (not just deferred/disconnected) before entering §2b.
+assert_grep "$EXEC_SKILL" "runtime tool-availability probe\|runtime.*probe\|tool-availability probe" \
+  "/sable-execute: if preflight=teams, Lincoln probes runtime tool availability (SABLE-1qt)"
+assert_grep "$EXEC_SKILL" "Teams tools not yet loaded\|Team.*tools.*not.*loaded\|Team\* tools" \
+  "/sable-execute: runtime fallback message instructs operator on Teams tools absence (SABLE-1qt)"
+
 # 10. DECOMPOSITION post-batch-create verification (SABLE-xy1)
 assert_grep "$PLAN_SKILL" "bd dep tree"        "/sable-plan DECOMPOSITION verifies edges via bd dep tree"
 assert_grep "$PLAN_SKILL" "bd ready"           "/sable-plan DECOMPOSITION sanity-checks bd ready"

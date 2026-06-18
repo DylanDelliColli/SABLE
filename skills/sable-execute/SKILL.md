@@ -73,6 +73,17 @@ sable-teams-preflight
 - exits non-zero → `SABLE_TEAMS=1` but the experimental flag is missing; relay
   the one-line fix it prints to the operator and stop.
 
+**If preflight prints `teams`, you MUST do a runtime tool-availability probe before
+proceeding to §2b.** The preflight can only check env flags and defs on disk — it
+cannot see which tools the current CC session has loaded. Use ToolSearch (query
+`"select:TeamCreate,TeamDelete,TeamList"`) or check your allowed-tools list to
+confirm `TeamCreate` and `TeamDelete` are actually available in this session.
+If they are absent or deferred (e.g. "MCP server disconnected: TeamCreate,
+TeamDelete"), fall back to the nested topology (§2a) and notify the operator:
+"Teams tools not yet loaded — using nested topology; add
+`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` to settings.json and restart to enable
+teams."  Do NOT proceed to §2b without confirming Team* tools are live.
+
 ### 2a. Nested topology (default)
 
 Managers dispatch and push their own lanes (SABLE-uz9.11); you spawn them and
