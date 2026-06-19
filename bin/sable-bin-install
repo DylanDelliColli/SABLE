@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# sable-bin-install — link the SABLE CLI tools (sable-*) onto your PATH (SABLE-cmql).
+#
+# The repo's bin/ holds the operator CLI tools (sable-launch, sable-note, sable-mode,
+# sable-teams-preflight, ...). Skills and docs invoke them by bare name, so they must
+# be on PATH. This installs them into ~/.local/bin (or --dir) so adopters don't have
+# to hand-edit PATH.
+#
+# Symlink is the default and is load-bearing: a linked tool resolves its physical
+# path back to the repo (SABLE-5p2), so sable-note finds the REPO feedback dir
+# instead of a copy's stray ../feedback (the SABLE-ofl fragmentation), and the tools
+# never go stale. --copy is the fallback for filesystems without symlink support.
+#
+# Usage:
+#   sable-bin-install [--dir DIR] [--copy] [--uninstall] [--dry-run]
+
+set -u
+
+# Resolve this script's PHYSICAL dir (follow the symlink chain) so we link FROM the
+# repo bin/ even when invoked via an already-installed symlink (SABLE-5p2 pattern).
+SOURCE="${BASH_SOURCE[0]:-$0}"
+while [ -h "$SOURCE" ]; do
+  _dir="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  case "$SOURCE" in /*) ;; *) SOURCE="$_dir/$SOURCE" ;; esac
+done
+BIN_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+DEST="${HOME:-}/.local/bin"
+MODE="symlink"
+ACTION="install"
+DRY_RUN=0
+
+usage() {
+  cat <<EOF
+sable-bin-install — link the SABLE CLI tools (sable-*) onto your PATH.
+
+Usage:
+  sable-bin-install [--dir DIR] [--copy] [--uninstall] [--dry-run]
+    --dir DIR     target directory (default: ~/.local/bin)
+    --copy        copy the tools instead of symlinking (filesystems w/o symlinks)
+    --uninstall   remove the SABLE tools previously installed into DIR
+    --dry-run     print what would happen; write nothing
+
+Installs every sable-* shell entrypoint in $BIN_DIR; skips *.py (skill-bundled
+prefilters) and tests. Symlink (default) is preferred — a linked tool resolves
+back to the repo and never goes stale.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dir) DEST="${2:?--dir needs a path}"; shift 2 ;;
+    --dir=*) DEST="${1#--dir=}"; shift ;;
+    --copy) MODE="copy"; shift ;;
+    --uninstall) ACTION="uninstall"; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'sable-bin-install: unknown arg %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+note() { printf '%s\n' "$*" >&2; }
+
+# Collect the tools to install: sable-* shell entrypoints (excludes *.py / *.bak / *~).
+TOOLS=""
+for f in "$BIN_DIR"/sable-*; do
+  [ -f "$f" ] || continue
+  case "$f" in *.py|*.bak|*~) continue ;; esac
+  TOOLS="$TOOLS $(basename "$f")"
+done
+
+if [ "$ACTION" = "uninstall" ]; then
+  for t in $TOOLS; do
+    if [ "$DRY_RUN" = "1" ]; then note "  would remove: $DEST/$t"; else rm -f "$DEST/$t"; fi
+  done
+  [ "$DRY_RUN" = "1" ] || note "sable-bin-install: removed SABLE tools from $DEST"
+  exit 0
+fi
+
+if [ "$DRY_RUN" = "1" ]; then
+  note "  would mkdir: $DEST"
+else
+  mkdir -p "$DEST" || { note "sable-bin-install: cannot create $DEST"; exit 1; }
+fi
+
+for t in $TOOLS; do
+  src="$BIN_DIR/$t"; dst="$DEST/$t"
+  if [ "$DRY_RUN" = "1" ]; then
+    note "  would $MODE: $dst -> $src"
+    continue
+  fi
+  if [ "$MODE" = "copy" ]; then
+    cp "$src" "$dst" 2>/dev/null && chmod +x "$dst" 2>/dev/null || true
+  else
+    ln -sf "$src" "$dst"
+  fi
+done
+[ "$DRY_RUN" = "1" ] || note "sable-bin-install: installed ($MODE) into $DEST:$TOOLS"
+
+# Warn (with the exact export line) if DEST is not on PATH.
+case ":${PATH:-}:" in
+  *":$DEST:"*) : ;;  # already on PATH — nothing to do
+  *)
+    note ""
+    note "sable-bin-install: $DEST is not on your PATH. Add it so the tools resolve:"
+    note "    export PATH=\"\$PATH:$DEST\"   # add to ~/.zshrc or ~/.bashrc, then restart your shell"
+    ;;
+esac
+exit 0

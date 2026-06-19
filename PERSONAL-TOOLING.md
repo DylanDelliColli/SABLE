@@ -23,10 +23,25 @@ Both produce the same outputs: `columbo-test-spec` / `columbo-test-gap` beads + 
 
 After `git fetch` + `git checkout personal-tooling`:
 
-### 1. `sable-note` on PATH
+### 1. SABLE CLI tools on PATH
+
+`bash install.sh` links the `sable-*` tools (`sable-launch`, `sable-note`,
+`sable-mode`, `sable-teams-preflight`, ...) into `~/.local/bin` for you via
+`bin/sable-bin-install` (symlinks by default, so a tool resolves back to the repo —
+`sable-note` finds the repo feedback dir — and never goes stale). If `~/.local/bin`
+is on your PATH you are done: verify with `sable-note --help`.
+
+Run it standalone (or to a custom dir / as copies) any time:
 
 ```bash
-chmod +x bin/sable-note
+bash bin/sable-bin-install                 # -> ~/.local/bin (symlinks)
+bash bin/sable-bin-install --dir ~/bin     # custom target dir
+bash bin/sable-bin-install --copy          # copy instead of symlink
+```
+
+Manual fallback — add the repo `bin/` to PATH directly instead:
+
+```bash
 echo 'export PATH="$PATH:'"$(pwd)"'/bin"' >> ~/.zshrc   # or ~/.bashrc
 source ~/.zshrc
 sable-note --help

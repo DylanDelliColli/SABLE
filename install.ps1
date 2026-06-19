@@ -73,6 +73,10 @@ if (-not $bash) {
     Write-Green "  bash found: $($bash.Source)"
 }
 Write-Host ''
+Write-Yellow '  Note: the SABLE CLI tools (sable-launch, sable-note, sable-mode, ...) are bash scripts.'
+Write-Yellow '  Once bash is available, run:  bash bin/sable-bin-install'
+Write-Yellow '  (or add the repo bin/ to your Git Bash / WSL PATH) to put them on PATH.'
+Write-Host ''
 
 # 3. Verify Claude config dir exists
 Write-Bold 'Step 3/6: Verify ~/.claude exists'

@@ -135,7 +135,7 @@ print_dep_hint() {
 }
 
 # 1. Verify bd is installed (check both bd and bd.exe for Windows)
-bold "Step 1/7: Verify bd is installed"
+bold "Step 1/8: Verify bd is installed"
 if command -v bd >/dev/null 2>&1; then
     BD_CMD="bd"
 elif command -v bd.exe >/dev/null 2>&1; then
@@ -165,7 +165,7 @@ if [ -n "${CC_VER}" ] && ! python3 -c "import sys;v=tuple(int(x) for x in '${CC_
 fi
 
 # 2. Verify Claude config dir exists
-bold "Step 2/7: Verify ~/.claude exists"
+bold "Step 2/8: Verify ~/.claude exists"
 if [ ! -d "${CLAUDE_DIR}" ]; then
     yellow "  ~/.claude not found. Creating it."
     mkdir -p "${CLAUDE_DIR}"
@@ -173,8 +173,23 @@ fi
 green "  OK"
 echo
 
-# 3. Copy hooks (chmod is a no-op on Windows but doesn't error)
-bold "Step 3/7: Copy hooks to ${HOOKS_DST}"
+# 3. Link the SABLE CLI tools (sable-*) onto PATH (SABLE-cmql). Runs for ALL tiers:
+# Foundation needs sable-note; Orchestration needs sable-launch / sable-mode / etc.
+# Symlinks (default) so a linked tool resolves back to the repo (sable-note finds the
+# repo feedback dir) and never goes stale.
+bold "Step 3/8: Link SABLE CLI tools onto PATH"
+if [ "$DRY_RUN" = "1" ]; then
+    yellow "  would delegate: sable-bin-install (symlink bin/sable-* into ~/.local/bin)"
+elif [ -x "${REPO_DIR}/bin/sable-bin-install" ]; then
+    bash "${REPO_DIR}/bin/sable-bin-install"
+    green "  SABLE CLI tools linked (sable-launch, sable-note, sable-mode, ...)"
+else
+    yellow "  bin/sable-bin-install not found — add ${REPO_DIR}/bin to PATH manually (see PERSONAL-TOOLING.md)"
+fi
+echo
+
+# 4. Copy hooks (chmod is a no-op on Windows but doesn't error)
+bold "Step 4/8: Copy hooks to ${HOOKS_DST}"
 make_dir "${HOOKS_DST}"
 for hook in "${HOOKS_SRC}"/*.sh; do
     name="$(basename "${hook}")"
@@ -188,8 +203,8 @@ if [ "${OS_NAME}" = "Windows (Git Bash / MSYS)" ]; then
     echo
 fi
 
-# 4. Copy agent definitions to ~/.claude/agents/ (idempotent; preserves non-SABLE agent files)
-bold "Step 4/7: Copy agent definitions to ${CLAUDE_DIR}/agents/"
+# 5. Copy agent definitions to ~/.claude/agents/ (idempotent; preserves non-SABLE agent files)
+bold "Step 5/8: Copy agent definitions to ${CLAUDE_DIR}/agents/"
 AGENTS_SRC="${TEMPLATE_DIR}/agents"
 AGENTS_DST="${CLAUDE_DIR}/agents"
 if [ -d "${AGENTS_SRC}" ]; then
@@ -206,11 +221,11 @@ else
 fi
 echo
 
-# 5. Install the Orchestration (multi-manager) tier by DELEGATING to the
+# 6. Install the Orchestration (multi-manager) tier by DELEGATING to the
 # complete-layer installer (SABLE-ppy). Foundation adopters opt out. The delegate
 # installs all hooks + registry + skills + role + (teams) member defs and merges
 # the topology-appropriate settings snippet.
-bold "Step 5/7: Orchestration (multi-manager) tier"
+bold "Step 6/8: Orchestration (multi-manager) tier"
 if [ "$ORCHESTRATION" != "1" ]; then
     yellow "  Skipped — Foundation tier. Re-run with --orchestration (or SABLE_ORCHESTRATION=1)."
 elif [ "$DRY_RUN" = "1" ]; then
@@ -223,8 +238,8 @@ else
 fi
 echo
 
-# 6. Prepend Prime Directives to CLAUDE.md (with backup)
-bold "Step 6/7: Add Prime Directives to ${GLOBAL_CLAUDE_MD}"
+# 7. Prepend Prime Directives to CLAUDE.md (with backup)
+bold "Step 7/8: Add Prime Directives to ${GLOBAL_CLAUDE_MD}"
 if [ ! -f "${PRIME_TEMPLATE}" ]; then
     red "  Missing template: ${PRIME_TEMPLATE}"
     exit 1
@@ -247,8 +262,8 @@ else
 fi
 echo
 
-# 6. Print settings.json snippet (do NOT auto-edit — settings is too important to clobber)
-bold "Step 7/7: Settings.json hook block"
+# 8. Print settings.json snippet (do NOT auto-edit — settings is too important to clobber)
+bold "Step 8/8: Settings.json hook block"
 echo "Add the following block to your ${SETTINGS_FILE} under the top-level 'hooks' key."
 echo "If you already have a 'hooks' key, merge carefully (don't overwrite existing entries)."
 echo
