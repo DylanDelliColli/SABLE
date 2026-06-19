@@ -335,6 +335,66 @@ EPIC: SABLE teams topology (parallel mode)
        └─ install + docs ship the teams tier             (needs /execute)
 ```
 
+## Live-dogfooding amendments (2026-06-18)
+
+The first full execution-drain dogfooding run (teams mode, `market-brief-package`)
+validated the topology end-to-end but amended the optimistic spike findings above.
+Recorded here so a fresh agent inherits the real shape; each item has a tracking
+bead.
+
+**Decision of record reaffirmed: teams stays the default topology** despite the
+throughput cost below. Rationale (operator, 2026-06-18): nested's manager agents
+are spawned as *ephemeral* subagents that die when their turn ends; teams members
+are *live* until explicitly dismissed, accumulating lane context across the whole
+drain. The persistence of live named members outweighs the serialized-first-pass
+degradation — the fix is to recover parallelism *within* teams, not to retreat to
+nested.
+
+1. **Worker parallelism is degraded, not absent (the throughput cost).** An
+   in-process team member can spawn a worker via the Agent tool only
+   SYNCHRONOUSLY — fresh `run_in_background:true` spawns are BLOCKED
+   ("In-process teammates cannot spawn background agents"). Only workers *resumed*
+   via `SendMessage(to: agentId)` run in background, and a resumed worker
+   reparents to MAIN (its completion surfaces to the lead, not the dispatching
+   manager). Net: each lane's FIRST pass over a bead is serialized
+   (spawn → review → push → next); only revisions parallelize. This removes the
+   per-manager worker parallelism the execution model treats as its throughput
+   engine. Recovery options (a bead): route fresh dispatch through a backgrounding
+   path (lead-owned dispatch, or the SendMessage-resume mechanism), or formally
+   accept serialized first-pass and scale *lanes* instead of workers.
+
+2. **The lead needs a stable identity or its SendMessages bleed.** When the lead
+   (Lincoln) session is NOT launched with `CLAUDE_AGENT_NAME=lincoln`, its
+   outbound `SendMessage` sender is mis-derived from whichever sub-agent's
+   message/notification triggered the current turn. Not cosmetic: a reply
+   addressed to that same agent becomes a self-message (`optimus→optimus`) and can
+   be silently DROPPED — observed losing an active "rebase before push" warning.
+   Fix: `/sable-execute` now verifies `CLAUDE_AGENT_NAME=lincoln` before spawning
+   members. The §5 table's "Lincoln env-var, unchanged" row is load-bearing.
+
+3. **`post-push-merge-notify` does not reliably fire for member pushes.** The
+   durable `for-merge`/`for-chuck` mirror (decision 2, §3) — the recovery record
+   the merge queue depends on — repeatedly failed to land on in-process member
+   pushes (≥3 occurrences in one session; branches stranded invisible to chuck).
+   Managers compensated by filing the handoff bead by hand, defeating "the durable
+   bead is the recovery substrate." Until fixed (a bead): managers verify the
+   `for-merge` bead exists after every push and file it manually if missing; chuck
+   gets a stranded-recovery exception to file rescue beads.
+
+4. **API drift: implicit team replaced named teams.** CC 2.1.181 removed explicit
+   `TeamCreate`/`TeamDelete`/`TeamList` + named teams in favor of a single
+   implicit team (spawn `Agent` with `name:` + `run_in_background:true`,
+   coordinate via `SendMessage`; `team_name` is deprecated/ignored). This doc and
+   `/sable-execute` §2b still describe the old `TeamCreate`-based API. Updating the
+   spawn protocol to the implicit-team API is a tracked bead.
+
+5. **Notification noise.** `idle_notification` replays already-delivered SendMessage
+   summaries (including `[to optimus]` notes surfaced to main) and the task system
+   replays completed `task_assignment`s back to their owner as fresh assignments —
+   both with no "already handled" guard. Members must re-derive state from `bd`+git
+   before acting on any notification, never trust recency. Largely a CC-harness
+   behavior; documented as a known tradeoff.
+
 ## Open risks
 
 - **Experimental-feature drift.** The whole mode depends on a flag-gated feature

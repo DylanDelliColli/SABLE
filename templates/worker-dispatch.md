@@ -57,8 +57,13 @@ report — the bead may be stale. Do not "find something to do" on a clean bead.
 - Run typecheck independently of pre-push (`{TYPECHECK_COMMAND}`) before push.
   Even if you bypass pre-push for a known failure, do not let type errors
   through to CI.
-- Rebase on `{BASE_BRANCH}` before push (the pre-dispatch hook does this at
-  start; do it again before push if you've been working a while).
+- **Re-fetch and rebase immediately before your final commit** — not just at
+  start. Run `git fetch origin && git rebase origin/{BASE_BRANCH}` right before
+  you commit/hand off. The pre-dispatch hook rebases at spawn, but in a
+  fast-moving multi-manager drain the base advances *during* your task; a commit
+  on a spawn-time base surfaces another lane's just-merged work as spurious
+  deletions in `git diff origin/{BASE_BRANCH}..HEAD` (observed live: a 40-file
+  phantom-deletion diff). Rebase late, not just early.
 - Target the correct base branch on the PR ({BASE_BRANCH}).
 - After renaming/removing any declaration, grep for ALL references across the
   codebase before closing.
@@ -82,7 +87,11 @@ Return:
 - Bead IDs you closed
 - Any new beads filed for sightings (with IDs)
 - Any constraint you bent and why
-- Test output: link or paste the relevant lines proving the test gate ran
+- Test output: the EXACT copy-pasteable command you ran (e.g.
+  `cd location-briefing && pytest tests/integration/test_x.py`) AND the relevant
+  output lines proving the gate ran. Report the REAL command, not a reconstructed
+  path — a wrong path makes the reviewer's re-run `collect 0 items` and falsely
+  read as green (observed live, twice).
 ```
 
 ---
@@ -105,7 +114,9 @@ gate). You do everything up to the push, then **STOP**:
    - **Worktree** path and **branch** name
    - **Parked commit SHA** (`git -C <worktree> rev-parse HEAD`) — the exact
      state you are handing over for review
-   - **Test output** proving unit + integration gates ran green
+   - **Test output** — the EXACT copy-pasteable command(s) you ran AND output
+     proving unit + integration gates ran green (report the real command, not a
+     reconstructed path — a wrong path re-runs as `collect 0 items` and false-greens)
    - Bead IDs ready to close, and any constraint you bent and why
 
 The manager reviews this, and on APPROVE pushes it itself

@@ -123,6 +123,18 @@ The Agent-Teams topology collapses the second terminal: Chuck folds into the tea
 and coordination is live over `SendMessage` instead of polling. You (Lincoln) are
 the team lead.
 
+**Verify your lead identity BEFORE spawning members.** Run
+`echo "${CLAUDE_AGENT_NAME:-UNSET}"`. It MUST print `lincoln`. If it prints
+`UNSET` (or anything else), your outbound `SendMessage` sender is mis-derived from
+whichever sub-agent's message/notification triggered the current turn — producing
+self-addressed messages (`optimus→optimus`) that can silently DROP operational
+directives (observed live 2026-06-18, losing an active "rebase before push"
+warning). The env var is read at session launch and cannot be set mid-session:
+STOP and tell the operator to relaunch the lead with
+`CLAUDE_AGENT_NAME=lincoln claude` before proceeding. See
+[`AGENT-TEAMS-DESIGN.md`](../../../AGENT-TEAMS-DESIGN.md) §5 + the live-dogfooding
+amendments.
+
 - **Create the team:** `TeamCreate` a team named `sable`.
 - **Spawn the members** — optimus, tarzan, and chuck — as persistent team members
   via the Agent tool with `team_name: sable` and `name:` = the registry name (so

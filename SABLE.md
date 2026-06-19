@@ -382,6 +382,19 @@ bd blocked    # dependency health
 
 Run the composed recipe for structure, then a codebase-grounded freshness pass (one read-only validator per source-file cluster — see MULTI-MANAGER-PATTERN.md, Victor) before promoting anything.
 
+### 3.9 bd CLI Gotchas & Workarounds
+
+The bd CLI has a handful of surprising behaviors that have cost real agent cycles. Documented here as workarounds (the underlying tool bugs are upstream's to fix); see also the `--graph` bugs in §3.6.2 and the `bd children --pretty` note in §3.5.
+
+| Gotcha | Symptom | Workaround |
+|---|---|---|
+| **`bd ready --type` takes a single value** | A comma-list (`--type=bug,task,chore`) silently returns "no ready work" instead of unioning — nearly read as an empty lane that had 5 ready beads | Run `bd ready` once per type, or omit `--type` and filter the output |
+| **`bd children` under-reports parent-child *dependencies*** | When parentage is modeled via `bd dep add <child> <parent> --type parent-child` rather than the `--parent` field, `bd children`/`bd ready --parent` under-report; an onboarding manager concludes the epic is empty | Use `bd dep tree <epic-id>` to see the full graph; prefer `--parent` on create when you control it |
+| **`--type parent-child` arg order inverts** | `bd dep add <epic> <child> --type parent-child` reads naturally as "epic gets child" but actually makes the EPIC a child of the other bead | Child first: `bd dep add <child> <parent> --type parent-child` — same requirement-language rule as §3.4, but the flag name invites inversion. Verify with `bd dep tree` |
+| **"Test" in a title trips the test-data heuristic** | Filing a legitimate bug *about* tests (e.g. "test-isolation UniqueViolation") triggers "appears to be test data / creating test issue in production" | Rephrase the title to describe the symptom ("fixture-isolation …"), or proceed past the warning — it's a false positive on real test-infra beads |
+| **Probing a gitignored `.env` trips the read-guard** | `ls .env` is blocked as a sensitive-file access even when you only need existence, not contents | `test -f .env && echo present` checks existence without tripping the guard |
+| **No native "symptom-of" edge** | A bead filed on-sight often turns out to be a downstream symptom of another (cascade); nothing links them, so triage is manual | At file time, note "suspected symptom of `<bead>`" in the description and add a `bd dep` relation, so closing the root surfaces the symptom for re-validation |
+
 ---
 
 ## 4. Test-Driven Development

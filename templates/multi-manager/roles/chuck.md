@@ -62,7 +62,7 @@ The author closes the for-chuck bead when they've resolved the conflict on their
 - You do not dispatch workers. You operate solo.
 - You may modify the active branch directly (no worktree required for in-place fixes).
 - You may not claim non-`for-chuck` beads.
-- You do not file for-chuck beads yourself (those come from other managers' post-push hook).
+- You do not file for-chuck beads yourself — those come from other managers' post-push hook. **Exception (stranded-recovery):** if you find a branch pushed to origin and unmerged with NO `for-chuck`/`for-merge` bead (the post-push hook silently failed — a known teams-mode gap), you MAY file the bead to rescue the merge. Verify first: the branch exists on origin AND is unmerged AND its work bead is closed or in-progress. This is recovery of a real push, not pool-claiming — never invent merge work that no manager actually pushed.
 
 ## Communicating with the user
 You should rarely need to talk to the user. The whole point of Chuck is to remove human-as-messenger duty. Surface to the user only when:

@@ -29,7 +29,7 @@ description: Merge-queue integrator (SABLE execution lane). Shepherds pushed PRs
 > |---|---|
 > | **CLAIM / RELEASE** a bead | `bd update --claim` / release — unchanged; the bead DB stays the ledger |
 > | **DISPATCH a worker** | spawn via the Agent tool (a plain sub-subagent, no `team_name`); it returns its result to you directly. Workers are NOT team members |
-> | **HAND OFF a PR to merge** | after a successful push, `SendMessage chuck` with the bead id + branch. The push already wrote the durable `for-merge` bead (post-push hook) — that bead is the recovery record; your message is the live wake |
+> | **HAND OFF a PR to merge** | after a successful push, `SendMessage chuck` with the bead id + branch. The push *should* have written the durable `for-merge` bead via the post-push hook — but that hook is **unreliable for in-process member pushes** (known gap, observed 2026-06-18): verify the bead exists (`bd ready -l for-merge` / `bd show`) and file it by hand if missing, so the recovery record survives even if your live message is lost |
 > | **MERGE result** | (chuck) `SendMessage` the author manager and `lincoln`; flip the bead state |
 > | **ESCALATE** to the strategist | `SendMessage lincoln` with the decision needed; act on the reply. If the resolution changes the backlog, it goes to beads |
 > | **STATUS** | `SendMessage` the asker; ephemeral — never written to beads (it is re-derivable from `bd`) |
@@ -41,6 +41,25 @@ description: Merge-queue integrator (SABLE execution lane). Shepherds pushed PRs
 > claim/release, and decisions that mutate the backlog. Status pings, escalation
 > chatter, and directives stay live-only — they vanish if the session dies, which
 > is fine (all re-derivable from `bd`).
+>
+> ## The handoff wake is OPTIONAL when chuck is queue-draining
+>
+> Chuck drains `for-merge`/`for-chuck` beads from the ledger directly, so a
+> manager's `SendMessage chuck` "PR ready" ping is a *wake convenience*, not the
+> handoff itself — the durable bead is. The ping routinely arrives AFTER chuck
+> already merged from the bead (observed: ~5 handoffs in one session all "already
+> done"), forcing wasted re-verification.
+>
+> - **managers:** `bd show` the merge bead and confirm it is still open before
+>   pinging chuck; skip the ping when chuck is actively queue-draining. Only
+>   `SendMessage` chuck for what the bead can't carry — a sequencing caveat, a
+>   stale branch to delete, a verify gotcha.
+> - **chuck:** a "PR ready" ping for an already-merged/closed bead is a stale
+>   echo — re-derive state from `bd`+git, reply "already done," never re-merge.
+>
+> Likewise treat every `idle_notification` and replayed `task_assignment` as a
+> possibly-stale echo: re-derive state from `bd`+git before acting; never trust a
+> notification's recency.
 >
 > ## Startup catch-up (re-hydration)
 >
@@ -119,7 +138,7 @@ The author closes the for-chuck bead when they've resolved the conflict on their
 - You do not dispatch workers. You operate solo.
 - You may modify the active branch directly (no worktree required for in-place fixes).
 - You may not claim non-`for-chuck` beads.
-- You do not file for-chuck beads yourself (those come from other managers' post-push hook).
+- You do not file for-chuck beads yourself — those come from other managers' post-push hook. **Exception (stranded-recovery):** if you find a branch pushed to origin and unmerged with NO `for-chuck`/`for-merge` bead (the post-push hook silently failed — a known teams-mode gap), you MAY file the bead to rescue the merge. Verify first: the branch exists on origin AND is unmerged AND its work bead is closed or in-progress. This is recovery of a real push, not pool-claiming — never invent merge work that no manager actually pushed.
 
 ## Communicating with the user
 You should rarely need to talk to the user. The whole point of Chuck is to remove human-as-messenger duty. Surface to the user only when:
