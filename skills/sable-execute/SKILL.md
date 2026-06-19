@@ -16,8 +16,6 @@ allowed-tools:
   - Grep
   - AskUserQuestion
   - Agent
-  - TeamCreate
-  - TeamDelete
   - SendMessage
 ---
 
@@ -74,15 +72,16 @@ sable-teams-preflight
   the one-line fix it prints to the operator and stop.
 
 **If preflight prints `teams`, you MUST do a runtime tool-availability probe before
-proceeding to §2b.** The preflight can only check env flags and defs on disk — it
-cannot see which tools the current CC session has loaded. Use ToolSearch (query
-`"select:TeamCreate,TeamDelete,TeamList"`) or check your allowed-tools list to
-confirm `TeamCreate` and `TeamDelete` are actually available in this session.
-If they are absent or deferred (e.g. "MCP server disconnected: TeamCreate,
-TeamDelete"), fall back to the nested topology (§2a) and notify the operator:
-"Teams tools not yet loaded — using nested topology; add
-`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` to settings.json and restart to enable
-teams."  Do NOT proceed to §2b without confirming Team* tools are live.
+proceeding to §2b.** The preflight only checks env flags and defs on disk — it
+cannot see which tools the current CC session has loaded. The teams transport is
+`SendMessage` (CC 2.1.181 uses a single implicit team — the old named-team
+construction tools were removed). Confirm `SendMessage` is available
+— ToolSearch query `"select:SendMessage"`, or check your allowed-tools list. If
+`SendMessage` is absent or deferred (e.g. "MCP server disconnected"), fall back to
+the nested topology (§2a) and notify the operator: "Teams transport (SendMessage)
+not loaded — using nested topology; add `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` to
+settings.json and restart to enable teams." Do NOT proceed to §2b without confirming
+`SendMessage` is live.
 
 ### 2a. Nested topology (default)
 
@@ -135,26 +134,29 @@ STOP and tell the operator to relaunch the lead with
 [`AGENT-TEAMS-DESIGN.md`](../../../AGENT-TEAMS-DESIGN.md) §5 + the live-dogfooding
 amendments.
 
-- **Create the team:** `TeamCreate` a team named `sable`.
-- **Spawn the members** — optimus, tarzan, and chuck — as persistent team members
-  via the Agent tool with `team_name: sable` and `name:` = the registry name (so
-  each member's hook-input `agent_type` carries its role and `lib-identity`
-  resolves it, SABLE-amj.2). Use the built teams definition at
-  `~/.claude/agents-teams/<name>.md` as the member's **inline prompt**; do NOT pass
-  `agentType` (these are inline-spawned to avoid colliding with the nested
+- **Spawn the members as a single implicit team.** CC 2.1.181 uses ONE implicit team
+  (the old named-team construction tools were removed); you join it simply by spawning
+  named background agents. Spawn optimus, tarzan, and chuck via the Agent
+  tool with `name:` = the registry name and `run_in_background: true` — and do NOT pass
+  `team_name` (deprecated/ignored). The `name:` carries each member's role into the
+  hook-input `agent_type` so `lib-identity` resolves it (SABLE-amj.2). Use the built
+  teams definition at `~/.claude/agents-teams/<name>.md` as the member's **inline
+  prompt**; do NOT pass `agentType` (inline-spawned to avoid colliding with the nested
   named-agent defs — SABLE-amj.4 / design decision 6). There is **no separate Chuck
   terminal** in teams mode.
 - **Coordination is live** (the teams card, SABLE-amj.3): a manager pushes its
   approved worktree and `SendMessage chuck` "PR ready: <bead>, <branch>"; chuck
   wakes, merges, replies; `for-lincoln` arbitration is a direct message to you.
-  The durable `for-merge` bead still lands via `post-push-merge-notify` (the
-  recovery record) — beads stays the ledger, SendMessage is the fast path.
+  Continue a member with `SendMessage(to: <name or agent-id>)`. The durable
+  `for-merge` bead still lands via `post-push-merge-notify` (the recovery record) —
+  beads stays the ledger, SendMessage is the fast path.
 - **Workers are unchanged:** managers dispatch their own workers via the Agent
   tool as plain sub-subagents (no `team_name`) and push their own approved work.
-- **The team is disposable; beads is the recovery substrate.** If the session
-  ends, re-run `/sable-execute` to recreate the team — members catch up from beads on
-  join (the startup sweep in the teams card), then go idle and wake on
-  `SendMessage`. `TeamDelete` when draining is done.
+- **The implicit team is disposable; beads is the recovery substrate.** Members stay
+  live until the session ends or you dismiss them — there is **no team-delete step**;
+  when the drain is done, simply stop messaging them and end the session. If the session
+  ends, re-run `/sable-execute` to respawn the members — they catch up from beads on
+  join (the startup sweep in the teams card), then go idle and wake on `SendMessage`.
 - **Oversee** as in §2a, but broker `for-lincoln` arbitration live over
   `SendMessage`.
 

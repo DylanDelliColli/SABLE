@@ -108,20 +108,24 @@ assert_grep "$EXEC_SKILL" "Chuck terminal"   "/sable-execute reminds the operato
 assert_grep "$EXEC_SKILL" "pushes approved work itself" "/sable-execute: managers push their own approved work (Lincoln does not)"
 assert_no_grep "$EXEC_SKILL" "execute dispatch requests as" "/sable-execute: Lincoln no longer executes manager dispatch requests"
 
-# 9b. Teams topology branch (SABLE-amj.6)
-assert_grep "$EXEC_SKILL" "sable-teams-preflight" "/sable-execute runs the topology preflight"
-assert_grep "$EXEC_SKILL" "SABLE_TEAMS"            "/sable-execute documents the SABLE_TEAMS toggle"
-assert_grep "$EXEC_SKILL" "TeamCreate"             "/sable-execute teams branch creates the sable team"
-assert_grep "$EXEC_SKILL" "agents-teams"           "/sable-execute teams branch inline-spawns from the built teams defs"
-assert_grep "$EXEC_SKILL" "no separate Chuck"      "/sable-execute teams branch folds Chuck into the team (no second terminal)"
+# 9b. Teams topology branch — implicit-team API (SABLE-hybq; CC 2.1.181 removed TeamCreate)
+assert_grep    "$EXEC_SKILL" "sable-teams-preflight" "/sable-execute runs the topology preflight"
+assert_grep    "$EXEC_SKILL" "SABLE_TEAMS"           "/sable-execute documents the SABLE_TEAMS toggle"
+assert_no_grep "$EXEC_SKILL" "TeamCreate"            "/sable-execute does NOT use the removed TeamCreate API (implicit team, SABLE-hybq)"
+assert_no_grep "$EXEC_SKILL" "TeamDelete"            "/sable-execute does NOT use the removed TeamDelete API (SABLE-hybq)"
+assert_no_grep "$EXEC_SKILL" "team_name: sable"      "/sable-execute does NOT pass the deprecated team_name param (SABLE-hybq)"
+assert_grep    "$EXEC_SKILL" "run_in_background"     "/sable-execute spawns teams members as background named agents (implicit team)"
+assert_grep    "$EXEC_SKILL" "SendMessage"           "/sable-execute teams coordination is live over SendMessage"
+assert_grep    "$EXEC_SKILL" "agents-teams"          "/sable-execute teams branch inline-spawns from the built teams defs"
+assert_grep    "$EXEC_SKILL" "no separate Chuck"     "/sable-execute teams branch folds Chuck into the team (no second terminal)"
 
-# 9c. Runtime Team* tools availability probe (SABLE-1qt)
-# After preflight prints "teams", Lincoln must probe whether TeamCreate/TeamDelete are
-# actually live in the session (not just deferred/disconnected) before entering §2b.
+# 9c. Runtime transport-availability probe (SABLE-1qt, updated for implicit-team SABLE-hybq)
+# After preflight prints "teams", Lincoln probes whether the teams TRANSPORT (SendMessage)
+# is live this session before entering §2b; absent -> nested fallback.
 assert_grep "$EXEC_SKILL" "runtime tool-availability probe\|runtime.*probe\|tool-availability probe" \
-  "/sable-execute: if preflight=teams, Lincoln probes runtime tool availability (SABLE-1qt)"
-assert_grep "$EXEC_SKILL" "Teams tools not yet loaded\|Team.*tools.*not.*loaded\|Team\* tools" \
-  "/sable-execute: runtime fallback message instructs operator on Teams tools absence (SABLE-1qt)"
+  "/sable-execute: if preflight=teams, Lincoln probes runtime transport availability (SABLE-1qt)"
+assert_grep "$EXEC_SKILL" "fall back to the nested topology\|using nested topology" \
+  "/sable-execute: runtime probe falls back to nested when the teams transport is absent (SABLE-1qt)"
 
 # 10. DECOMPOSITION post-batch-create verification (SABLE-xy1)
 assert_grep "$PLAN_SKILL" "bd dep tree"        "/sable-plan DECOMPOSITION verifies edges via bd dep tree"

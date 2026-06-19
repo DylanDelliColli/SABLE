@@ -98,7 +98,7 @@ mode:
 ┌─ ORCHESTRATION (mode-specific, small) ────────────────────────────┐
 │  Launch + who-spawns-whom + hook wiring.                          │
 │  nested: Lincoln spawns resident subagents + Chuck terminal.      │
-│  teams:  TeamCreate + spawn members; Chuck is a member.           │
+│  teams:  spawn named bg members (implicit team); Chuck is a member.│
 │  Lives in the /execute skill + install, NOT in agent behaviour.   │
 └───────────────────────────────────────────────────────────────────┘
 ```
@@ -112,8 +112,9 @@ coordination cards; the launch/orchestration path in `/execute`; the hook split
 ## 2. Topology & lifecycle
 
 You talk to **Lincoln**, and Lincoln is the team lead (the orchestrator session,
-as Opus is in the `code-council-teams` skill). On entering execution Lincoln runs
-`TeamCreate("sable")` and spawns the persistent members:
+as Opus is in the `code-council-teams` skill). On entering execution Lincoln spawns
+the persistent members as named background agents — one implicit team (CC 2.1.181
+removed `TeamCreate`; see the Live-dogfooding amendments):
 
 ```
 ┌─ One window = Lincoln (team lead) ───────────────────────────────┐
@@ -251,8 +252,8 @@ CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1   # Claude Code's flag (prerequisite)
 SABLE_TEAMS=1                            # SABLE: use the teams topology
 ```
 
-`/execute` reads `SABLE_TEAMS` and branches: set → `TeamCreate` + spawn members;
-unset → today's resident-subagent path. This is **orthogonal** to
+`/execute` reads `SABLE_TEAMS` and branches: set → spawn named background members
+(one implicit team); unset → today's resident-subagent path. This is **orthogonal** to
 planning/execution mode (which stays in `cockpit-mode.json` + the interlock). If
 `SABLE_TEAMS=1` but the experimental flag is missing, `/execute` errors with the
 one-line fix.
