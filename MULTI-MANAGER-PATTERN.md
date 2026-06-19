@@ -174,7 +174,17 @@ not launch them from the shell directly. The Lincoln alias is still needed for
 the main session, and Chuck still requires an env-var terminal (see
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) for the Chuck hybrid holdout rationale).
 
-**Minimum for a v3 execution session:**
+**Minimum for a v3 execution session.** With the repo `bin/` on your PATH (see
+PERSONAL-TOOLING.md), `sable-launch` is the one-command entry point — it sets the
+identity + role and verifies the teams flag, so the lead never launches without
+`CLAUDE_AGENT_NAME=lincoln` (the identity-bleed root cause, SABLE-njiv):
+
+```bash
+sable-launch          # the lead (lincoln) — the one window you talk to
+sable-launch chuck    # the merge-queue terminal (nested topology only)
+```
+
+If you prefer raw shell aliases, the equivalent forms are:
 
 ```bash
 # In ~/.zshrc or equivalent

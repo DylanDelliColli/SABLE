@@ -221,8 +221,10 @@ the experimental tooling is not active:
 bash install.sh --orchestration
 # Then add this ONE line to ~/.claude/settings.json env block (operator step, not auto-written):
 #   "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
-# Launch Lincoln:
-CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude
+# Launch Lincoln (sets identity + role and verifies the teams flag for you):
+sable-launch
+#   equivalent to: CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude
+#   (requires the repo bin/ on PATH — see PERSONAL-TOOLING.md)
 
 # Explicit opt-out: nested-subagent topology
 bash install.sh --orchestration --subagent
