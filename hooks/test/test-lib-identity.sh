@@ -294,6 +294,10 @@ run_mode_state_case() {
     local home="$FIXTURE_DIR/d504-home"
     mkdir -p "$home"
     export HOME="$home"
+    # Run from a NON-git dir so the no-override path exercises the HOME fallback
+    # (post SABLE-5hck the resolver uses cwd's repo when in git; HOME is only the
+    # non-git fallback). $home is under a mktemp dir, so it is not a git repo.
+    cd "$home" || return 1
     printf '%s' '{"mode":"execution"}' > "$FIXTURE_DIR/d504-mode.json"
     export "$var_name=$FIXTURE_DIR/d504-mode.json"
     # shellcheck disable=SC1090
@@ -310,6 +314,51 @@ run_mode_state_case "d50.4: SABLE_MODE_STATE overrides lib-identity mode path �
 # Retired SABLE_MODE_FILE name is NOT honored (no default file at the pinned HOME → stands down)
 run_mode_state_case "d50.4: retired SABLE_MODE_FILE is ignored by lib-identity → stands down" \
   "SABLE_MODE_FILE" "0|"
+
+# --------------------------------------------------------------------------
+# SABLE-5hck.4 — per-repo dispatch-lane mode resolution.
+# With NO SABLE_MODE_STATE override, lib-identity must resolve the mode from the
+# repo the call runs in (hook-input cwd, else process cwd), so the lincoln
+# main-session exec lane keys off the right repo when sessions run in several
+# repos at once. The hook-input cwd takes precedence over the process cwd.
+# --------------------------------------------------------------------------
+mk_mode_repo() {
+  # $1 = mode word; echoes a fresh git repo carrying that in-repo mode-state file
+  local d; d="$(mktemp -d)"
+  git -C "$d" init -q
+  git -C "$d" -c user.email=t@t -c user.name=t commit --allow-empty -m init -q
+  mkdir -p "$d/.claude/sable/state"
+  printf '%s' "{\"mode\":\"$1\"}" > "$d/.claude/sable/state/mode-state.json"
+  printf '%s\n' "$d"
+}
+run_lane_inrepo() {
+  # label, json, process_cwd, expect
+  local label="$1" json="$2" pcwd="$3" expect="$4" got
+  got=$(
+    unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_MODE_STATE SABLE_MODE_FILE
+    cd "$pcwd" || exit 1
+    # shellcheck disable=SC1090
+    source "$LIB"
+    sable_resolve_dispatch_lane "$json"
+    printf '%s|%s' "$SABLE_DISPATCH_ACTIVE" "$SABLE_DISPATCH_LANE"
+  )
+  if [ "$got" = "$expect" ]; then pass "$label"; else fail "$label" "expected [$expect] got [$got]"; fi
+}
+
+LANE_RX="$(mk_mode_repo execution)"
+LANE_RY="$(mk_mode_repo planning)"
+# cwd-in-json: execution repo → lane=lincoln; planning repo → stands down
+run_lane_inrepo "5hck.4: exec repo via cwd-in-json → lane=lincoln" \
+  "{\"tool_name\":\"Agent\",\"cwd\":\"$LANE_RX\"}" "$LANE_RX" "1|lincoln"
+run_lane_inrepo "5hck.4: planning repo via cwd-in-json → stands down" \
+  "{\"tool_name\":\"Agent\",\"cwd\":\"$LANE_RY\"}" "$LANE_RY" "0|"
+# no cwd field → falls back to process cwd
+run_lane_inrepo "5hck.4: exec repo via process cwd (no cwd field) → lane=lincoln" \
+  '{"tool_name":"Agent"}' "$LANE_RX" "1|lincoln"
+# hook-input cwd (planning) takes precedence over process cwd (execution)
+run_lane_inrepo "5hck.4: json cwd (planning) wins over process cwd (exec) → stands down" \
+  "{\"tool_name\":\"Agent\",\"cwd\":\"$LANE_RY\"}" "$LANE_RX" "0|"
+rm -rf "$LANE_RX" "$LANE_RY"
 
 # --------------------------------------------------------------------------
 # sable_is_git_push unit tests (SABLE-jpr / SABLE-0u1)

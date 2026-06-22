@@ -38,6 +38,14 @@
 # Registry path: ~/.claude/sable/agents.yaml (override with SABLE_AGENTS_YAML,
 # used by tests). Parsed with awk — no python-yaml dependency.
 
+# Per-repo mode-state resolver (SABLE-5hck), used by sable_resolve_dispatch_lane.
+# Sourced as a sibling; guard keeps re-sourcing lib-identity idempotent and won't
+# clobber a definition a caller already loaded.
+if ! declare -f sable_mode_state_path >/dev/null 2>&1; then
+  # shellcheck source=lib-mode-path.sh
+  . "$(dirname "${BASH_SOURCE[0]:-$0}")/lib-mode-path.sh"
+fi
+
 sable_resolve_identity() {
   local json="${1:-}"
   SABLE_ID_NAME=""
@@ -344,8 +352,9 @@ sable_validate_base_ref() {
 # authoritative.
 #
 # Sets: SABLE_DISPATCH_ACTIVE (0|1), SABLE_DISPATCH_LANE (lowercase name or "").
-# Mode-state path override for tests: SABLE_MODE_STATE (unified with
-# bin/sable-mode and mode-interlock.sh — SABLE-d50.4).
+# Mode-state path: resolved per-repo from the hook-input cwd via
+# sable_mode_state_path (SABLE-5hck), unified with bin/sable-mode and
+# mode-interlock.sh. SABLE_MODE_STATE still overrides (tests + d50.4).
 sable_resolve_dispatch_lane() {
   local json="${1:-}"
   SABLE_DISPATCH_ACTIVE=0
@@ -374,7 +383,20 @@ sable_resolve_dispatch_lane() {
     return 0
   fi
 
-  local mode_file="${SABLE_MODE_STATE:-${HOME:-}/.claude/sable/state/mode-state.json}"
+  # Resolve the mode-state file from the repo this tool call runs in (hook-input
+  # cwd, the dir git operates in — mirrors sable_resolve_push_repo_dir/SABLE-041),
+  # so the dispatch lane keys off the right repo when sessions run in several
+  # repos at once (SABLE-5hck). Empty cwd falls back to the process PWD; a set
+  # SABLE_MODE_STATE still wins inside the resolver.
+  local cwd mode_file
+  cwd=$(printf '%s' "$json" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('cwd', '') or '')
+except Exception:
+    print('')
+" 2>/dev/null)
+  mode_file="$(sable_mode_state_path "$cwd")"
   [ -f "$mode_file" ] || return 0
   local mode
   mode=$(MODE_FILE="$mode_file" python3 -c "
