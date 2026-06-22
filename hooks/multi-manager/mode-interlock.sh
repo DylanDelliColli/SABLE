@@ -72,7 +72,25 @@ except Exception:
 # Resolve current mode. Prefer the helper; fall back to reading the file.
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 MODE_BIN="$HOOK_DIR/../../bin/sable-mode"
-STATE="${SABLE_MODE_STATE:-$HOME/.claude/sable/state/mode-state.json}"
+
+# Resolve the mode-state file from the repo the tool call runs in (the hook-input
+# cwd, the dir git actually operates in — mirrors SABLE-041's push-repo resolve)
+# so per-repo modes are honored and two sessions in different repos stay
+# independent. Export the resolved path as SABLE_MODE_STATE so the MODE_BIN call,
+# the file fallback, and the substage/tier reads all agree regardless of THIS
+# hook process's own cwd. sable_mode_state_path returns an already-set
+# SABLE_MODE_STATE unchanged, so a test/operator override is preserved.
+# shellcheck source=lib-mode-path.sh
+. "$HOOK_DIR/lib-mode-path.sh"
+HOOK_CWD="$(printf '%s' "$INPUT" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('cwd', '') or '')
+except Exception:
+    print('')
+" 2>/dev/null)"
+STATE="$(sable_mode_state_path "$HOOK_CWD")"
+export SABLE_MODE_STATE="$STATE"
 
 MODE=""
 if [ -x "$MODE_BIN" ]; then

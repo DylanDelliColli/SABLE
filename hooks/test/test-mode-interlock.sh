@@ -377,6 +377,42 @@ if len(sys.argv)>2 and sys.argv[2]: d[\"agent_id\"]=sys.argv[2]
 print(json.dumps(d))
 " "$@"; }; SABLE_MODE_STATE="'"$SABLE_MODE_STATE"'" agent_json sherlock sub-9 | CLAUDE_AGENT_NAME=lincoln bash "'"$HOOK"'" '
 
+# ---------- per-repo mode resolution (SABLE-5hck.3) ----------
+# The interlock must read the mode of the repo the tool call runs in (hook-input
+# cwd), so two sessions in different repos enforce independent modes. These cases
+# run WITHOUT the global SABLE_MODE_STATE override (env -u) so the hook resolves
+# from cwd. SABLE_AGENTS_YAML stays exported; CLAUDE_AGENT_NAME=cockpit is set.
+mk_modes_repo() {
+  local d; d="$(mktemp -d)"
+  git -C "$d" init -q
+  git -C "$d" -c user.email=t@t -c user.name=t commit --allow-empty -m init -q
+  printf '%s\n' "$d"
+}
+run_hook_cwd() {
+  # $1=command $2=cwd → hook stdout, run with SABLE_MODE_STATE stripped
+  python3 -c "
+import json, sys
+print(json.dumps({'tool_input': {'command': sys.argv[1]}, 'cwd': sys.argv[2]}))
+" "$1" "$2" | env -u SABLE_MODE_STATE bash "$HOOK" 2>/dev/null
+}
+assert_deny_cwd()  { local out; out="$(run_hook_cwd "$2" "$3")"; if is_deny "$out"; then pass "$1"; else fail "$1" "expected deny, got: ${out:-<empty>}"; fi; }
+assert_allow_cwd() { local out; out="$(run_hook_cwd "$2" "$3")"; if is_deny "$out"; then fail "$1" "expected allow, got deny: $out"; else pass "$1"; fi; }
+
+REPO_EXEC="$(mk_modes_repo)"
+REPO_PLAN="$(mk_modes_repo)"
+( cd "$REPO_EXEC" && env -u SABLE_MODE_STATE "$MODE_BIN" set execution >/dev/null 2>&1 )
+( cd "$REPO_PLAN" && env -u SABLE_MODE_STATE "$MODE_BIN" set planning  >/dev/null 2>&1 )
+
+# Same command, opposite verdicts depending on which repo's cwd the call carries.
+assert_deny_cwd  "exec repo (by cwd) blocks producer launch" 'columbo'  "$REPO_EXEC"
+assert_allow_cwd "plan repo (by cwd) allows producer launch" 'columbo'  "$REPO_PLAN"
+assert_deny_cwd  "plan repo (by cwd) blocks manager launch"  'optimus'  "$REPO_PLAN"
+assert_allow_cwd "exec repo (by cwd) allows manager launch"  'optimus'  "$REPO_EXEC"
+assert_deny_cwd  "plan repo (by cwd) blocks git push"        'git push' "$REPO_PLAN"
+assert_allow_cwd "exec repo (by cwd) allows git push"        'git push' "$REPO_EXEC"
+
+rm -rf "$REPO_EXEC" "$REPO_PLAN"
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
