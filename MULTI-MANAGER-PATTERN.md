@@ -150,10 +150,14 @@ the Lincoln session from populating the implementation backlog until
 
 Mechanics:
 
-- **`bin/sable-mode`** — reads/writes the mode-state file
-  `~/.claude/sable/state/mode-state.json` (`{mode, since, fleet, substage}`).
-  The single source of truth shared by the skills and the interlock.
-  `sable-mode substage get|set|advance` walks the planning substages.
+- **`bin/sable-mode`** — reads/writes the **per-repo** mode-state file
+  `<repo>/.claude/sable/state/mode-state.json` (`{mode, since, fleet, substage}`),
+  resolved from the git common-dir so a repo's worktrees share one mode (falls
+  back to `~/.claude/sable/state/mode-state.json` outside a git repo;
+  `SABLE_MODE_STATE` overrides). The source of truth shared by the skills and the
+  interlock — scoped per-repo so concurrent SABLE sessions in different repos
+  keep independent modes. `sable-mode substage get|set|advance` walks the
+  planning substages; `sable-mode path` prints the resolved path.
 - **`/sable-plan` and `/sable-execute`** (`skills/sable-plan`, `skills/sable-execute`) —
   flip the mode and swap Lincoln's persona.
 - **`hooks/multi-manager/mode-interlock.sh`** — the mechanical guarantee.

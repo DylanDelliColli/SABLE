@@ -194,6 +194,14 @@ head -1 ~/.claude/sable/agents.yaml      # registry present
 sable-mode get                           # mode-state helper resolves (planning|execution)
 ```
 
+The mode is **per-repo** — `sable-mode` resolves the state file from the repo you
+are in (`<repo>/.claude/sable/state/mode-state.json`, shared across that repo's
+worktrees; it falls back to `~/.claude/sable/state/mode-state.json` outside a git
+repo, and `SABLE_MODE_STATE` overrides). So you can run **concurrent** SABLE
+sessions in different repos — e.g. plan project B while project A executes — and
+their modes never collide. (`sable-mode set` also adds the state dir to the
+repo's `.gitignore`, so it never shows up as an untracked file.)
+
 In a fresh session, `/sable-plan` walks the staged planning substages and `/sable-execute`
 drains the pool via the resident managers. Chuck (the merge-queue integrator)
 stays a second terminal — add its env-var alias from the installer's printed

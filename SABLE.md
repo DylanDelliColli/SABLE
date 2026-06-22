@@ -301,6 +301,16 @@ goal: by the time execution runs, the beads are scoped well enough to need only
 confirmations and prioritization — the human invests in planning so the swarm
 executes without questions.
 
+**The mode is per-repo.** `sable-mode` and the interlock resolve the mode-state
+file from the repo the session operates on — `<repo>/.claude/sable/state/mode-state.json`,
+keyed off the git common-dir so a repo's worktrees share one mode, falling back
+to `~/.claude/sable/state/mode-state.json` only outside a git repo (and
+`SABLE_MODE_STATE` overrides). Scoping the mode to the repo lets you run
+**concurrent** SABLE sessions across repos — for example a PLANNING session
+filling project B's backlog while project A drains its pool in EXECUTION — with
+no cross-repo clobbering. `sable-mode set` also gitignores the state dir so the
+ephemeral file never appears as untracked.
+
 #### 3.6.2 Batch Creation with `--graph` — Correct Schema and Known Bugs
 
 `bd create --graph FILE` creates multiple issues in a single command from a JSON plan file. As of bd 0.63.3, the feature works but has two upstream bugs that affect reliability.

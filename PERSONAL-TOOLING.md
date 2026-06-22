@@ -116,7 +116,7 @@ the full *running* manager swarm (step 3) is optional. Full rationale in
 `MULTI-MANAGER-PATTERN.md` → "The v3 topology (one-window)".
 
 Files:
-- `bin/sable-mode` — mode-state read/write helper (python3, no jq); single source of truth at `~/.claude/sable/state/mode-state.json`. Honors the `SABLE_ORCHESTRATION` off-switch.
+- `bin/sable-mode` — mode-state read/write helper (python3, no jq); **per-repo** source of truth at `<repo>/.claude/sable/state/mode-state.json` (resolved from the git common-dir so worktrees share it; `~/.claude/sable/state/mode-state.json` fallback outside a git repo; `SABLE_MODE_STATE` overrides) — lets concurrent SABLE sessions in different repos keep independent modes. `sable-mode path` prints the resolved path. Honors the `SABLE_ORCHESTRATION` off-switch.
 - `skills/sable-plan/SKILL.md`, `skills/sable-execute/SKILL.md` — the `/sable-plan` and `/sable-execute` mode-flip skills
 - `templates/multi-manager/roles/lincoln.md` — Lincoln identity (strategist + fleet launch)
 - `templates/multi-manager/agents.yaml` — the agent registry / source of truth (Lincoln is registered here)

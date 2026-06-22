@@ -81,7 +81,10 @@ the full flow below from the substage that matters.
 sable-mode set planning --tier full --fleet sherlock,columbo,gaudi,victor
 ```
 
-Writes the mode-state file and initializes `substage=framing`. The interlock now
+Writes the **per-repo** mode-state file (`<repo>/.claude/sable/state/mode-state.json`,
+resolved from the git common-dir) and initializes `substage=framing`. Because the
+mode is scoped to this repo, a planning session here does not collide with an
+execution session running in another repo. The interlock now
 blocks spawning Optimus/Tarzan/Chuck, blocks code `git push`, and **blocks
 populating the backlog (`bd create --parent` / `--graph` / `--file`) until
 `substage=decomposition`** (soft — `--force` overrides). The bare epic shell

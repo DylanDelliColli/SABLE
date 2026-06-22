@@ -50,7 +50,12 @@ Run exactly one command:
 sable-mode set execution --fleet optimus,tarzan
 ```
 
-This writes `~/.claude/sable/state/mode-state.json`. From this point the
+This writes the **per-repo** mode-state file — `<repo>/.claude/sable/state/mode-state.json`
+when inside a git repo (resolved from the git common-dir, so all of the repo's
+worktrees share one mode), or `~/.claude/sable/state/mode-state.json` outside a
+git repo. Because the mode lives in the repo, you can run a separate SABLE
+session in **another** repo at the same time — e.g. plan project B while project
+A executes — without the two clobbering each other's mode. From this point the
 `mode-interlock.sh` hook is in execution posture: spawning planning-only
 producers (sherlock / victor / columbo) is blocked on both the Agent and Bash
 legs (soft — `SABLE_ORCHESTRATION_FORCE=1` / `--force` overrides). Mode flips are
