@@ -210,6 +210,65 @@ SHOW="$("$MODE_BIN" show 2>/dev/null)"
 assert_eq "mode preserved after advance"  "planning" "$(printf '%s' "$SHOW" | jget "['mode']")"
 assert_eq "fleet preserved after advance" "sherlock" "$(printf '%s' "$SHOW" | jget "['fleet'][0]")"
 
+# ---------- per-repo state path resolution (SABLE-5hck.2) ----------
+# bin/sable-mode resolves the state file from the repo it runs in (mirroring
+# hooks/multi-manager/lib-mode-path.sh) so independent repos keep independent
+# modes. These cases run WITHOUT the SABLE_MODE_STATE override to exercise the
+# real git resolution, and a drift guard asserts the binary's mirrored copy of
+# the resolver stays identical to the library function.
+
+LIB_MODE_PATH="$(cd "$(dirname "$0")/../.." && pwd)/hooks/multi-manager/lib-mode-path.sh"
+# shellcheck source=../multi-manager/lib-mode-path.sh
+. "$LIB_MODE_PATH"
+
+canon() { ( cd "$1" && pwd ); }
+make_repo() {
+  local d; d="$(mktemp -d)"
+  git -C "$d" init -q
+  git -C "$d" -c user.email=t@t -c user.name=t commit --allow-empty -m init -q
+  printf '%s\n' "$d"
+}
+
+# `sable-mode path` honors the SABLE_MODE_STATE override
+OVR="$(mktemp -u)"
+assert_eq "path honors SABLE_MODE_STATE override" "$OVR" \
+  "$(SABLE_MODE_STATE="$OVR" "$MODE_BIN" path 2>/dev/null)"
+
+# `sable-mode path` resolves to the in-repo state file (no override)
+RP="$(make_repo)"; RP_C="$(canon "$RP")"
+unset SABLE_MODE_STATE
+assert_eq "path resolves to in-repo state file" \
+  "$RP_C/.claude/sable/state/mode-state.json" \
+  "$(cd "$RP" && "$MODE_BIN" path 2>/dev/null)"
+
+# in-repo set/get round-trip without an override writes under the repo
+( cd "$RP" && "$MODE_BIN" set execution >/dev/null 2>&1 )
+assert_eq "in-repo set then get (no override)" "execution" \
+  "$(cd "$RP" && "$MODE_BIN" get 2>/dev/null)"
+if [ -f "$RP_C/.claude/sable/state/mode-state.json" ]; then
+  pass "in-repo set writes the in-repo state file"
+else
+  fail "in-repo set writes the in-repo state file" "not at $RP_C/.claude/sable/state/mode-state.json"
+fi
+
+# drift guard: bin/sable-mode `path` agrees with the lib resolver for every shape
+WT="$(mktemp -u)"; git -C "$RP" worktree add -q "$WT" -b drift-test
+ND="$(mktemp -d)"
+DRIFT_OK=1
+for d in "$RP" "$WT" "$ND"; do
+  BINP="$(cd "$d" && "$MODE_BIN" path 2>/dev/null)"
+  LIBP="$(sable_mode_state_path "$d")"
+  [ "$BINP" = "$LIBP" ] || { DRIFT_OK=0; echo "  drift at $d: bin='$BINP' lib='$LIBP'"; }
+done
+if [ "$DRIFT_OK" -eq 1 ]; then
+  pass "bin/sable-mode path matches lib resolver (no drift)"
+else
+  fail "bin/sable-mode path matches lib resolver (no drift)"
+fi
+
+git -C "$RP" worktree remove --force "$WT" 2>/dev/null || rm -rf "$WT"
+rm -rf "$RP" "$ND"
+
 # ---------- Summary ----------
 
 echo

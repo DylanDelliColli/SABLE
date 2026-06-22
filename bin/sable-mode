@@ -7,7 +7,12 @@
 # JSON (always present — it defines the env); deliberately NO jq dependency,
 # which is fragile across conda envs (see SABLE-cav.8).
 #
-# State file (override with SABLE_MODE_STATE for testing):
+# State file — resolved PER-REPO by resolve_state_path (mirrors
+# hooks/multi-manager/lib-mode-path.sh): inside a git repo it is the repo's
+# main-worktree .claude/sable/state/mode-state.json (shared across the repo's
+# worktrees), so independent SABLE sessions in different repos keep independent
+# modes; outside a git repo it falls back to ~/.claude/sable/state/mode-state.json.
+# Override the location with SABLE_MODE_STATE (testing + manual escape hatch).
 #   ~/.claude/sable/state/mode-state.json
 # Shape:
 #   { "mode": "planning|execution", "since": "<ISO-8601>", "fleet": ["a","b"],
@@ -31,7 +36,32 @@
 
 set -eu
 
-STATE="${SABLE_MODE_STATE:-$HOME/.claude/sable/state/mode-state.json}"
+# resolve_state_path [base_dir] — MIRROR of sable_mode_state_path in
+# hooks/multi-manager/lib-mode-path.sh. Kept as a copy (not a source) because
+# post-install there is no stable path from this binary (~/.local/bin symlink)
+# to the hooks dir (~/.claude/hooks copy); a drift-guard test in
+# test-sable-mode.sh asserts the two implementations stay identical.
+resolve_state_path() {
+    if [ -n "${SABLE_MODE_STATE:-}" ]; then
+        printf '%s\n' "$SABLE_MODE_STATE"
+        return 0
+    fi
+    local base="${1:-$PWD}"
+    local common root
+    if common="$(git -C "$base" rev-parse --git-common-dir 2>/dev/null)" && [ -n "$common" ]; then
+        case "$common" in
+            /*) ;;
+            *)  common="$base/$common" ;;
+        esac
+        if root="$(cd "$(dirname "$common")" 2>/dev/null && pwd)" && [ -n "$root" ]; then
+            printf '%s\n' "$root/.claude/sable/state/mode-state.json"
+            return 0
+        fi
+    fi
+    printf '%s\n' "${HOME:-}/.claude/sable/state/mode-state.json"
+}
+
+STATE="$(resolve_state_path)"
 
 usage() {
     cat <<EOF
@@ -44,6 +74,7 @@ Usage:
       the planning tier (default full); quick telescopes the backlog gate.
   sable-mode get      Print the current mode word; nonzero exit if unset.
   sable-mode show     Print the full mode-state JSON; nonzero exit if unset.
+  sable-mode path     Print the resolved mode-state file path (no state needed).
   sable-mode substage get        Print the current planning substage; nonzero
                                  if unset or not in planning mode.
   sable-mode substage set <name> Set the substage to one of:
@@ -54,8 +85,10 @@ Usage:
                                  full); nonzero if unset or not in planning.
   sable-mode --help
 
-State file: ${STATE}
-  (override location with the SABLE_MODE_STATE environment variable)
+State file (resolved per-repo): ${STATE}
+  Inside a git repo this is <repo>/.claude/sable/state/mode-state.json (shared
+  across the repo's worktrees); otherwise ~/.claude/sable/state/mode-state.json.
+  Override the location with the SABLE_MODE_STATE environment variable.
 
 Disable at runtime with: SABLE_ORCHESTRATION=off
 EOF
@@ -89,6 +122,11 @@ case "$cmd" in
     show)
         require_state
         cat "$STATE"
+        ;;
+    path)
+        # Print the resolved state-file path. No state required — answers
+        # "where would the mode-state for this repo live?" even when unset.
+        printf '%s\n' "$STATE"
         ;;
     set)
         if ! orchestration_enabled; then
