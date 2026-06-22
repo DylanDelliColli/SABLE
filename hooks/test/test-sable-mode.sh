@@ -269,6 +269,24 @@ fi
 git -C "$RP" worktree remove --force "$WT" 2>/dev/null || rm -rf "$WT"
 rm -rf "$RP" "$ND"
 
+# ---------- in-repo set gitignores the state dir (SABLE-5hck.5) ----------
+# Writing the in-repo mode-state must not leave an untracked file in the
+# adopter's repo, regardless of install tier — `set` ensures the ignore.
+GIR="$(make_repo)"
+unset SABLE_MODE_STATE
+( cd "$GIR" && "$MODE_BIN" set planning >/dev/null 2>&1 )
+if grep -q '\.claude/sable/' "$GIR/.gitignore" 2>/dev/null; then
+  pass "in-repo set adds .claude/sable to .gitignore"
+else
+  fail "in-repo set adds .claude/sable to .gitignore"
+fi
+UNTRACKED="$(cd "$GIR" && git status --porcelain --untracked-files=all 2>/dev/null | grep -c 'mode-state.json')"
+assert_eq "in-repo state file is not untracked" "0" "$UNTRACKED"
+( cd "$GIR" && "$MODE_BIN" set execution >/dev/null 2>&1 )
+COUNT="$(grep -c '\.claude/sable/' "$GIR/.gitignore" 2>/dev/null)"
+assert_eq "gitignore entry not duplicated on repeat set" "1" "$COUNT"
+rm -rf "$GIR"
+
 # ---------- Summary ----------
 
 echo

@@ -61,6 +61,27 @@ resolve_state_path() {
     printf '%s\n' "${HOME:-}/.claude/sable/state/mode-state.json"
 }
 
+# ensure_state_gitignored <state-path> — best-effort: when the state file lives
+# inside a git repo at the canonical <root>/.claude/sable/state/ location, make
+# sure that path is gitignored so the ephemeral mode-state never shows up as
+# untracked in an adopter's repo (any install tier). Idempotent; respects a
+# pre-existing broader '.claude/sable/' ignore; silent on any failure. Skips
+# override / non-git paths (they don't match the canonical suffix).
+ensure_state_gitignored() {
+    local state="$1" root gi pattern=".claude/sable/state/"
+    case "$state" in
+        */.claude/sable/state/mode-state.json)
+            root="${state%/.claude/sable/state/mode-state.json}" ;;
+        *) return 0 ;;
+    esac
+    git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+    gi="$root/.gitignore"
+    if [ -f "$gi" ] && grep -q '\.claude/sable/' "$gi" 2>/dev/null; then
+        return 0
+    fi
+    printf '%s\n' "$pattern" >> "$gi" 2>/dev/null || true
+}
+
 STATE="$(resolve_state_path)"
 
 usage() {
@@ -177,6 +198,7 @@ if mode == 'planning':
 with open(os.environ['STATE'], 'w') as f:
     f.write(json.dumps(data, indent=2) + chr(10))
 "
+        ensure_state_gitignored "$STATE"
         ;;
     substage)
         # Planning sub-state machine. Ordered:
