@@ -1,5 +1,22 @@
 # Gas City Implementation — Spike Handoff (2026-06-24)
 
+> **PHASE 1 STATUS (updated 2026-06-24):** Build EPIC `SABLE-vj4x` is decomposed
+> into an 8-bead backlog (`bd children SABLE-vj4x` for live state). Done + pushed:
+> `.1` pack scaffold (canonical at `SABLE/pack/sable/`; durable checkout at
+> `~/dev-environment/gascity-packs/` with `sable` a **symlink sibling** of `gascity`;
+> gc resolves the `../gascity` import lexically through the symlink), `.2`
+> test-evidence gate (unit+integration mandate, now mechanical), `.3` scope-creep
+> gate (builds SABLE-bijh), `.4` `sable-build`+`sable-review` formulas (reuse `gc.*`
+> base roles; two gate steps wired `review → sable-test-evidence → sable-scope-check
+> → finalize`), `.5` stub `sable-planning` + office-hours agent. 31 pack tests pass
+> (`python3 -m pytest pack/sable/tests/`). `.6` end-to-end is **structurally
+> validated** — `sable-build` resolves fully (29 steps) in a real `gc-dev` city with
+> the gates correctly wired — with only the **live multi-agent walk-away drain**
+> remaining (see `.6` notes for the exact setup: roles import bound as `gc`, a rig,
+> worker idle-drain tuning, autonomous-mode sling). Next: finish `.6` (watched live
+> drain), then Phase 2 `.7` (the planning redesign), Phase 3 `.8` (full contract +
+> register). Sections below are the original spike handoff (historical context).
+
 **Branch:** `gascity-impl` (cut from `agent-teams`). This is the entry point for continuing the
 Gas City build. Read this, then `bd show` the open beads listed below. The auto-memory
 `active-work-gas-city-build` carries the same state in condensed form.
