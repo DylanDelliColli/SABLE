@@ -1,0 +1,3 @@
+description = "SABLE office-hours framing planner"
+scope = "rig"
+fallback = true

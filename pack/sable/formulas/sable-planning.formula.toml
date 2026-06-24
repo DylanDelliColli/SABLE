@@ -1,0 +1,37 @@
+description = """
+SABLE implementation of the planning-base methodology contract.
+
+PHASE 1 STUB: overrides only the `requirements` step to route framing to the
+SABLE office-hours agent; `plan` and `plan-review` stay inherited from
+planning-base (gc.design-author / gc.review-synthesizer). The full SABLE
+planning process (framing -> research -> architecture -> test-strategy ->
+adversarial plan-review gauntlet) replaces this single slot in Phase 2
+(SABLE-vj4x.7). The architecture makes that a one-formula swap; the required
+requirements.v1 + plan.v1 artifact gates are preserved across the swap.
+"""
+formula = "sable-planning"
+version = 1
+contract = "graph.v2"
+extends = ["planning-base"]
+target_required = false
+internal = true
+
+[vars]
+[vars.interaction_mode]
+description = "Planning interaction posture: interactive (SABLE default — the human lives in planning), autonomous, or headless."
+default = "interactive"
+
+[[steps]]
+id = "requirements"
+title = "SABLE office-hours framing"
+needs = ["prepare-planning"]
+metadata = { "gc.run_target" = "sable.office-hours", "gc.build.artifact_schema" = "gc.build.requirements.v1", "gc.build.artifact_path_keys" = "gc.build.requirements_path,gc.var.requirements_path" }
+description_file = "../assets/workflows/sable-planning/requirements.md"
+
+[steps.check]
+max_attempts = 3
+
+[steps.check.check]
+mode = "exec"
+path = ".gc/scripts/checks/build-artifact-valid.sh"
+timeout = "5m"
