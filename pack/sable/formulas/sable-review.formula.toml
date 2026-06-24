@@ -1,0 +1,28 @@
+description = """
+SABLE code-review methodology formula (Phase 1: thin extension of the
+code-review-base contract). It is the pack-local code_review_formula selector
+target and the documented home for SABLE's review opinion. Phase 1 inherits base
+review behavior and routes synthesis to gc.review-synthesizer; SABLE's
+adversarial review lenses + the 3-verdict gate philosophy are elaborated in
+later phases. SABLE's *mechanical* gates (test-evidence, scope-creep) run as
+dedicated steps in sable-build, independent of this agent-judged review.
+"""
+formula = "sable-review"
+version = 1
+contract = "graph.v2"
+extends = ["code-review-base"]
+target_required = false
+internal = true
+mode = "report"
+
+[vars]
+[vars.review_mode]
+description = "Review authority: report, agent, or interactive."
+default = "report"
+
+[[steps]]
+id = "write-report"
+title = "Run SABLE review"
+needs = ["validate-context"]
+metadata = { "gc.run_target" = "gc.review-synthesizer", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "gc.build.review_report_path,gc.var.report_path" }
+description_file = "../assets/workflows/sable-review/write-report.md"

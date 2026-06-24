@@ -1,0 +1,99 @@
+description = """
+SABLE implementation of the Gas City build-base contract.
+
+PHASE 1 BOOTSTRAP: reuses the base gc.* roles and base methodology formulas for
+everything except (a) framing, routed to the SABLE office-hours agent, and (b)
+two SABLE mechanical gate steps (test-evidence + scope-creep) inserted between
+`review` and `finalize`. The adversarial planning swap lands in Phase 2
+(SABLE-vj4x.7); the full pack-local formula set + THIRD_PARTY_BUILD_PACKS
+registration land in Phase 3 (SABLE-vj4x.8). The base anchor order is preserved;
+the gate steps are the only additions.
+"""
+formula = "sable-build"
+version = 1
+contract = "graph.v2"
+extends = ["build-base"]
+target_required = true
+
+[catalog]
+name = "sable-build"
+description = "Run build-base with SABLE office-hours framing and SABLE mechanical gates (test-evidence + scope-creep)."
+
+[metadata.gc.methodology]
+allowed_drain_policies = ["separate", "same-session"]
+implementation_strategy = "drain"
+interaction_modes = ["interactive", "autonomous", "headless"]
+review_modes = ["report", "agent", "interactive"]
+
+[vars]
+[vars.planning_formula]
+description = "SABLE planning methodology formula."
+default = "sable-planning"
+
+[vars.code_review_formula]
+description = "SABLE code-review methodology formula."
+default = "sable-review"
+
+[vars.interaction_mode]
+description = "Workflow interaction posture: interactive (SABLE default), autonomous, or headless."
+default = "interactive"
+
+[[steps]]
+id = "requirements"
+title = "SABLE office-hours framing"
+needs = ["prepare"]
+metadata = { "gc.run_target" = "sable.office-hours", "gc.build.artifact_schema" = "gc.build.requirements.v1", "gc.build.artifact_path_keys" = "gc.build.requirements_path,gc.var.requirements_path" }
+description_file = "../assets/workflows/sable-build/requirements.md"
+
+[steps.check]
+max_attempts = 3
+
+[steps.check.check]
+mode = "exec"
+path = ".gc/scripts/checks/build-artifact-valid.sh"
+timeout = "5m"
+
+[[steps]]
+id = "sable-test-evidence"
+title = "SABLE gate: test-evidence (unit + integration mandate)"
+needs = ["review"]
+metadata = { "gc.run_target" = "gc.run-operator" }
+description_file = "../assets/workflows/sable-build/sable-test-evidence.md"
+
+[steps.check]
+max_attempts = 1
+
+[steps.check.check]
+mode = "exec"
+path = ".gc/scripts/checks/test-evidence.sh"
+timeout = "5m"
+
+[[steps]]
+id = "sable-scope-check"
+title = "SABLE gate: scope-creep containment"
+needs = ["sable-test-evidence"]
+metadata = { "gc.run_target" = "gc.run-operator" }
+description_file = "../assets/workflows/sable-build/sable-scope-check.md"
+
+[steps.check]
+max_attempts = 1
+
+[steps.check.check]
+mode = "exec"
+path = ".gc/scripts/checks/scope-creep-diff.sh"
+timeout = "5m"
+
+[[steps]]
+id = "finalize"
+title = "Finalize SABLE build"
+needs = ["sable-scope-check"]
+metadata = { "gc.run_target" = "gc.run-operator", "gc.build.artifact_schema" = "gc.build.final-report.v1", "gc.build.artifact_path_keys" = "gc.build.final_report_path" }
+description_file = "../assets/workflows/sable-build/finalize.md"
+
+[steps.check]
+max_attempts = 3
+
+[steps.check.check]
+mode = "exec"
+path = ".gc/scripts/checks/build-artifact-valid.sh"
+timeout = "5m"
