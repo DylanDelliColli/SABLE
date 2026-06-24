@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # test-thesis-docs.sh — lock the one-window nested-manager evolution into the
-# methodology thesis docs (SABLE-uz9.17). SABLE.md §6 and its public mirror
-# README.md §6 must document that the v2 orchestrator can be a resident manager
-# subagent that nest-dispatches its own workers, and must link to the pattern doc.
+# canonical methodology doc (SABLE-uz9.17). SABLE.md §6 must document that the
+# v2 orchestrator can be a resident manager subagent that nest-dispatches its
+# own workers, and must link to the pattern doc.
+#
+# README.md is no longer asserted here: as of SABLE-uar2.1 it is the human-facing
+# pitch, not a full mirror of SABLE.md, so the thesis lock targets SABLE.md only.
 #
 # Run with: bash hooks/test/test-thesis-docs.sh
 
@@ -14,7 +17,7 @@ pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 has() { if grep -qiF -- "$3" "$REPO/$2" 2>/dev/null; then pass "$1"; else fail "$1" "$2 missing: $3"; fi; }
 
-for doc in SABLE.md README.md; do
+for doc in SABLE.md; do
   has "$doc documents the one-window evolution"          "$doc" "one-window evolution"
   has "$doc names the resident-manager nesting model"    "$doc" "nest-dispatch"
   has "$doc frames the multi-tier operator->managers->workers" "$doc" "operator → resident managers → per-lane workers"

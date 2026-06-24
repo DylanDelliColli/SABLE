@@ -1,6 +1,15 @@
 # Agent Instructions
 
-This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
+This repository develops and runs **SABLE** (Swarm Architecture with Bead-Led
+Execution) — a methodology for rigorous, test-driven development by AI agents.
+This file is your lean entry point; read the full framework before doing
+substantive work:
+
+- **[SABLE.md](SABLE.md)** — the complete methodology: beads, hook-enforced TDD,
+  swarm execution, and the multi-manager pattern. The source of truth.
+- **[QUICKSTART.md](QUICKSTART.md)** — how the setup installs and bootstraps.
+
+The essentials below get you moving; SABLE.md is where the rules and rationale live.
 
 ## Quick Reference
 
