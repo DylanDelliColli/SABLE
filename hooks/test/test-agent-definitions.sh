@@ -67,7 +67,12 @@ for name in $AGENTS; do
     fail "$name.md has a non-empty description"
   fi
   assert_grep "$DEF" "GENERATED from templates/multi-manager/roles/$name.md" "$name.md carries the generated-file marker"
-  assert_grep "$DEF" "v2 invocation (one-window topology)" "$name.md carries the v2 invocation preamble"
+  # Managers carry the tmux warm-pane preamble (SABLE-bldh); producers still carry
+  # the v2 one-window subagent preamble (they remain Agent-tool planning subagents).
+  case " optimus tarzan " in
+    *" $name "*) assert_grep "$DEF" "tmux warm-pane topology" "$name.md (manager) carries the tmux warm-pane preamble" ;;
+    *) assert_grep "$DEF" "v2 invocation (one-window topology)" "$name.md (producer) carries the v2 invocation preamble" ;;
+  esac
 done
 
 # load-bearing contract markers per role (the conversion must not lose these)
@@ -183,13 +188,11 @@ for name in sherlock victor rudy columbo; do
   assert_no_grep "$DEF" "dispatch your own workers"   "$name.md (producer) lacks the manager direct-dispatch text"
 done
 
-# Case 4/5 (accept-HEAD decision 2026-06-17): BOTH managers carry the full
-# direct-dispatch capability text. optimus was converted by SABLE-uz9.11 (the
-# phase-1/phase-2 split collapsed), so it is NOT transition text. Role-body
-# markers are covered by SABLE-a0n.
+# Case 4/5 (tmux warm-pane, SABLE-bldh): BOTH managers dispatch via
+# sable-spawn-worker (not the Agent tool) and carry no relay-transition text.
 for mgr in tarzan optimus; do
   DEF="$AGENTS_DIR/$mgr.md"
-  assert_grep    "$DEF" "dispatch your own workers"   "$mgr.md (manager) carries the direct-dispatch capability text"
+  assert_grep    "$DEF" "sable-spawn-worker"          "$mgr.md (manager) carries the sable-spawn-worker dispatch text"
   assert_no_grep "$DEF" "continue the relay protocol" "$mgr.md (manager) carries no relay-transition text"
 done
 

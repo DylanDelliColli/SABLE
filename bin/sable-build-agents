@@ -98,18 +98,15 @@ MANAGER_NAMES = {"optimus", "tarzan"}
 MANAGER_TOOLS = "Agent, Bash, Edit, Glob, Grep, Read, Skill, TodoWrite, ToolSearch, Write"
 
 MANAGER_PREAMBLE = """\
-> **v2 invocation (one-window topology).** You are spawned as a named subagent
-> by the Lincoln main session (or directly by the user from the main
-> conversation). Your scope/mode arrives in the spawn prompt rather than a
-> shell argument — read the legacy shell invocations below (e.g.
-> `{name} <scope>`) as prompt parameters (e.g. "scope: <scope>"). Your identity
-> comes from this agent definition's system prompt, not CLAUDE_AGENT_NAME; the
-> continuous-mode manager hooks never applied to you and still don't. You HAVE
-> the Agent tool: you dispatch your own workers as background subagents, and the
-> pre-dispatch governance hooks (refresh/claim/overlap/preempt/model-check) fire
-> on your Agent call with your lane identity (verified CC 2.1.177,
-> SABLE-uz9.8/uz9.9). Everything else in this role is binding. Deliver your
-> end-of-session summary as your final message back to the spawning session.
+> **tmux warm-pane topology (SABLE-bldh).** You normally run as a real, warm
+> `claude` session in your own tmux pane, launched by `sable-tmux` with your
+> `CLAUDE_AGENT_NAME`. You dispatch workers with `sable-spawn-worker` (a new tmux
+> window + worktree, model-pinned), NOT the Agent tool; workers self-push their
+> own worktree branches and Chuck merges. You direct and are directed over
+> `sable-msg` (honor the sender-framing rule in the role body). The mode-interlock
+> gates `sable-spawn-worker` to execution mode; the model-check runs in the
+> helper. If you are instead invoked as a one-off subagent, your scope/mode
+> arrives in the spawn prompt — everything else in this role is binding.
 """
 
 
