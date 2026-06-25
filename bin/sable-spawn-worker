@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""sable-spawn-worker — manager-invoked worker spawn for the tmux warm-pane
+topology (SABLE-bldh.3). Replaces the in-process Agent-tool dispatch.
+
+Per bead, a manager (Optimus/Tarzan) calls this to:
+  1. resolve the worker model from the bead's `model:` label (or --model override),
+  2. (re)use a worktree (--worktree) or create one (`bd worktree create wk-<name>`),
+  3. write the full dispatch prompt to a dispatch file (keeps the worktree clean),
+  4. open a new tmux WINDOW running `claude --model <model>` with CWD = the worktree,
+  5. tag the worker pane (@sable_role=worker / @sable_bead / @sable_status=running),
+  6. send a single-line "read your dispatch file and execute it" instruction.
+
+The worker then runs the warm-pane self-push lifecycle (worker-dispatch.md):
+self-push its branch, bd close, then `tmux set-option -p @sable_status done`.
+Results flow back via the bead pool; `sable-worker-status --reap` cleans up.
+
+Governance (claim) runs before the spawn unless --skip-governance; the full
+pre-dispatch interlock/overlap re-home lands in SABLE-bldh.6.
+
+Usage:
+  sable-spawn-worker <bead-id> [--worktree PATH] [--model M|--model M:reason]
+                     [--scope NAME] [--session NAME] [--skip-governance]
+
+Env:
+  SABLE_TMUX_SOCKET    tmux socket (-L) for isolation/tests
+  SABLE_TMUX_SESSION   target session to spawn the worker window into (default: sable)
+  SABLE_WORKER_CMD     override the worker command (default: 'claude --model <model>')
+  SABLE_DISPATCH_DIR   where dispatch prompt files are written
+                       (default: ~/.claude/sable/dispatch)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+DEFAULT_SESSION = "sable"
+DEFAULT_MODEL = "sonnet"
+
+
+def _sanitize(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+def worktree_name(bead_id: str, scope: str | None) -> str:
+    return f"wk-{_sanitize(scope) if scope else _sanitize(bead_id)}"
+
+
+def window_name(bead_id: str) -> str:
+    return f"worker-{_sanitize(bead_id)}"
+
+
+def resolve_model(labels: list[str], override: str | None):
+    """Return (model, reason). Override syntax: 'opus' or 'opus:why'. Label
+    'model:<m>' is the primary signal; default sonnet."""
+    if override:
+        model, _, reason = override.partition(":")
+        return model.strip(), (reason.strip() or None)
+    for lab in labels:
+        if lab.startswith("model:"):
+            return lab.split(":", 1)[1].strip(), None
+    return DEFAULT_MODEL, None
+
+
+def parse_bead(raw: str) -> dict:
+    data = json.loads(raw)
+    return data[0] if isinstance(data, list) else data
+
+
+def bead_labels(bead: dict) -> list[str]:
+    return bead.get("labels") or []
+
+
+def worker_command(model: str, override: str | None) -> str:
+    return override if override else f"claude --model {model}"
+
+
+def assemble_dispatch_prompt(bead_id, title, description, worktree, branch, model) -> str:
+    return f"""# SABLE worker dispatch — warm-pane self-push
+
+You are a SABLE worker. You are a warm `claude` session in your own tmux pane,
+and your shell CWD already IS your worktree. Run the warm-pane self-push
+lifecycle from templates/worker-dispatch.md.
+
+Worktree: {worktree}
+Branch: {branch}
+Worker model: {model}
+
+## Bead
+{bead_id}: {title}
+
+{description}
+
+## Contract
+- Verify current state first; if the work is already done / clean, STOP and report.
+- Implement, then run the UNIT and INTEGRATION tests; capture the exact command + output.
+- Rebase on the base branch, commit, and push YOUR OWN branch with plain
+  `git push` from this CWD. NEVER use `git -C <other-tree>` — your CWD is the
+  worktree (this deletes the SABLE-041 wrong-tree bug). Do NOT bypass pre-push.
+- The post-push hook files the for-chuck handoff; Chuck merges. You do NOT open PRs.
+- `bd close {bead_id}` with the test evidence.
+- Finally, flag done for the reaper: `tmux set-option -p @sable_status done`.
+"""
+
+
+def read_instruction(dispatch_path: str) -> str:
+    return (f"Read {dispatch_path} in full and execute the SABLE worker dispatch "
+            f"it contains. It is your complete task.")
+
+
+def dispatch_dir() -> Path:
+    return Path(os.environ.get("SABLE_DISPATCH_DIR")
+                or (Path.home() / ".claude" / "sable" / "dispatch"))
+
+
+def tmux_base(socket: str | None) -> list[str]:
+    return ["tmux", "-L", socket] if socket else ["tmux"]
+
+
+def _run(args: list[str]) -> str:
+    return subprocess.run(args, capture_output=True, text=True, check=True).stdout
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="sable-spawn-worker")
+    p.add_argument("bead_id")
+    p.add_argument("--worktree", help="existing worktree path (else bd worktree create)")
+    p.add_argument("--model", help="model or 'model:reason' override")
+    p.add_argument("--scope", help="short name for the worktree (else derived from bead)")
+    p.add_argument("--session", default=os.environ.get("SABLE_TMUX_SESSION") or DEFAULT_SESSION)
+    p.add_argument("--skip-governance", action="store_true")
+    ns = p.parse_args(sys.argv[1:] if argv is None else argv)
+
+    socket = os.environ.get("SABLE_TMUX_SOCKET") or None
+    base = tmux_base(socket)
+    bid = ns.bead_id
+
+    # --- fetch bead for the prompt + label-based model resolution ---
+    bead = parse_bead(_run(["bd", "show", bid, "--json"]))
+    model, reason = resolve_model(bead_labels(bead), ns.model)
+
+    # --- governance (light here; full interlock/overlap in SABLE-bldh.6) ---
+    if not ns.skip_governance:
+        subprocess.run(["bd", "update", bid, "--claim"], check=True)
+
+    # --- worktree ---
+    if ns.worktree:
+        worktree = ns.worktree
+    else:
+        wt_name = worktree_name(bid, ns.scope)
+        _run(["bd", "worktree", "create", wt_name])
+        worktree = _run(["git", "rev-parse", "--show-toplevel"]).strip()
+        worktree = str(Path(worktree).parent / wt_name)
+    branch = Path(worktree).name
+
+    # --- write the dispatch prompt file (keeps the worktree clean) ---
+    ddir = dispatch_dir()
+    ddir.mkdir(parents=True, exist_ok=True)
+    dispatch_path = ddir / f"{bid}.md"
+    dispatch_path.write_text(assemble_dispatch_prompt(
+        bid, bead.get("title", ""), bead.get("description", ""),
+        worktree, branch, model))
+
+    # --- open the worker window + capture its pane id ---
+    win = window_name(bid)
+    wcmd = worker_command(model, os.environ.get("SABLE_WORKER_CMD"))
+    pane_id = _run(base + ["new-window", "-t", ns.session, "-n", win,
+                           "-c", worktree, "-P", "-F", "#{pane_id}", wcmd]).strip()
+
+    # --- tag the pane for the registry + reaper ---
+    for key, val in (("@sable_role", "worker"), ("@sable_bead", bid),
+                     ("@sable_status", "running")):
+        subprocess.run(base + ["set-option", "-p", "-t", pane_id, key, val], check=True)
+
+    # --- deliver the single-line read-instruction as the worker's first turn ---
+    subprocess.run(base + ["send-keys", "-t", pane_id, "-l",
+                           read_instruction(str(dispatch_path))], check=True)
+    subprocess.run(base + ["send-keys", "-t", pane_id, "Enter"], check=True)
+
+    note = f" (model {model}" + (f", override: {reason}" if reason else "") + ")"
+    sys.stderr.write(f"sable-spawn-worker: spawned {win} for {bid} at {pane_id}{note}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
