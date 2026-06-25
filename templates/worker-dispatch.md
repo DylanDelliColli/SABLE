@@ -133,6 +133,31 @@ back rubric above. Use this only when no manager review gate applies.
 **If your prompt is ambiguous about which mode, assume gate mode and STOP before
 push** — a needless review round-trip is cheap; an unreviewed push is not.
 
+### Warm-pane self-push — DEFAULT in the tmux-native topology
+
+When a manager spawns you via `sable-spawn-worker` (the tmux warm-pane topology,
+TMUX-AGENTS-DESIGN.md), you are a **real, warm `claude` session in your own tmux
+pane**, and your shell **CWD is your worktree**. The result channel is the bead
+pool: the manager watches your bead's status, not a returned message. Lifecycle:
+
+1. Implement the bead(s). Your CWD already *is* the worktree — there is **no
+   `git -C`** anywhere in your flow (the old in-process model's `git -C <tree>`
+   validated the wrong tree, SABLE-041; warm panes delete that bug).
+2. Run the unit AND integration tests; capture the exact command + output.
+3. Rebase on the base branch, commit, and **push your own worktree branch**:
+   plain `git push` from your CWD. The `pre-push-rebase-test` gate runs; on
+   failure STOP and report — do not bypass. The post-push hook files the
+   `for-chuck` handoff; **Chuck merges your branch** as usual. You do NOT open PRs.
+4. `bd close <bead-id>` with the test evidence (the tdd-gate keys off your real
+   session — warm panes satisfy it natively).
+5. **Flag done for the reaper:** `tmux set-option -p @sable_status done`. Your
+   spawn already set `@sable_role=worker` and `@sable_bead=<id>` on this pane;
+   `sable-worker-status --reap` will clean the pane up once you are done.
+
+You self-push your OWN branch only — never another lane's. The manager reviews
+the *result* via the closed bead + the `for-chuck` PR; there is no stop-before-push
+hand-back in this mode.
+
 ---
 
 ## Model selection (the ladder)
