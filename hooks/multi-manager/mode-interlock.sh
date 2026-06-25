@@ -190,6 +190,29 @@ except Exception:
 fi
 
 # ---------------------------------------------------------------------------
+# Worker-dispatch leg (tmux-native, SABLE-bldh.6): `sable-spawn-worker` stands up
+# a worker pane — the EXECUTION-mode dispatch path that replaced the in-process
+# Agent spawn. Gate it to execution mode regardless of which agent (lincoln OR a
+# manager) invokes it, since managers now run it from their own Bash. The env
+# override (SABLE_ORCHESTRATION_FORCE=1) is already handled above; a `--force`
+# flag on the command also overrides.
+# ---------------------------------------------------------------------------
+SPAWN_CMD="$(printf '%s' "$INPUT" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('tool_input', {}).get('command', '') or '')
+except Exception:
+    print('')
+" 2>/dev/null)"
+if printf '%s' "$SPAWN_CMD" | grep -qE '(^|[[:space:];&|])sable-spawn-worker([[:space:]]|$)'; then
+  printf '%s' "$SPAWN_CMD" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exit 0
+  if [ "$MODE" != "execution" ]; then
+    deny "Orchestration is in ${MODE} mode — sable-spawn-worker dispatches an execution worker and is blocked outside EXECUTION mode. Run /sable-execute, or append --force to override."
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # Bash leg: governs the main session only — legacy launch aliases, git
 # push, backlog population. Subagents spawn via the Agent tool in v3, so the
 # Bash leg stays main-session scoped (subagent Bash launches are a non-scenario).

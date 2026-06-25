@@ -72,6 +72,31 @@ def test_bead_labels_handles_null():
     assert ssw.bead_labels({}) == []
 
 
+# --- model-check enforcement (re-homed governance, SABLE-bldh.6) -------------
+
+def test_label_model_extracts():
+    assert ssw.label_model(["x", "model:opus"]) == "opus"
+    assert ssw.label_model(["x"]) is None
+
+
+def test_model_check_blocks_silent_override():
+    err = ssw.model_check(["model:sonnet"], "opus")
+    assert err is not None and "opus" in err and "sonnet" in err
+
+
+def test_model_check_allows_override_with_reason():
+    assert ssw.model_check(["model:sonnet"], "opus:auth path now") is None
+
+
+def test_model_check_allows_matching_override():
+    assert ssw.model_check(["model:sonnet"], "sonnet") is None
+
+
+def test_model_check_allows_when_no_label_or_no_override():
+    assert ssw.model_check([], "opus") is None
+    assert ssw.model_check(["model:sonnet"], None) is None
+
+
 # --- dispatch prompt assembly -----------------------------------------------
 
 def test_assemble_dispatch_prompt_has_load_bearing_slots():

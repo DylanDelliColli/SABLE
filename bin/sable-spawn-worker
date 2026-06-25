@@ -75,6 +75,28 @@ def bead_labels(bead: dict) -> list[str]:
     return bead.get("labels") or []
 
 
+def label_model(labels: list[str]) -> str | None:
+    for lab in labels:
+        if lab.startswith("model:"):
+            return lab.split(":", 1)[1].strip()
+    return None
+
+
+def model_check(labels: list[str], override: str | None) -> str | None:
+    """Re-homed pre-dispatch-model-check (SABLE-bldh.6): block an override that
+    silently disagrees with the bead's model: label. Returns an error string to
+    block, or None to allow. No label or no override => allow."""
+    lm = label_model(labels)
+    if not override or not lm:
+        return None
+    om, _, reason = override.partition(":")
+    if om.strip() != lm and not reason.strip():
+        return (f"--model override '{om.strip()}' disagrees with bead label "
+                f"'model:{lm}' and gives no reason. Use --model {om.strip()}:<reason> "
+                f"to override deliberately.")
+    return None
+
+
 def worker_command(model: str, override: str | None) -> str:
     return override if override else f"claude --model {model}"
 
@@ -143,8 +165,14 @@ def main(argv: list[str] | None = None) -> int:
     bead = parse_bead(_run(["bd", "show", bid, "--json"]))
     model, reason = resolve_model(bead_labels(bead), ns.model)
 
-    # --- governance (light here; full interlock/overlap in SABLE-bldh.6) ---
+    # --- governance: model-check + claim (SABLE-bldh.6). The execution-mode
+    # interlock gates this command upstream; overlap/preempt/refresh re-home is a
+    # tracked follow-up. ---
     if not ns.skip_governance:
+        err = model_check(bead_labels(bead), ns.model)
+        if err:
+            sys.stderr.write(f"sable-spawn-worker: model-check blocked — {err}\n")
+            return 3
         subprocess.run(["bd", "update", bid, "--claim"], check=True)
 
     # --- worktree ---

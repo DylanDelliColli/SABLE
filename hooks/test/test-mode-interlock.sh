@@ -341,6 +341,21 @@ if printf '%s' "$err" | grep -q 'BrokenPipeError'; then fail "fail open: no Brok
 
 set_mode planning
 
+# ---------- worker-dispatch leg (tmux-native, SABLE-bldh.6) ----------
+# sable-spawn-worker is the execution-mode dispatch path; gate it to EXECUTION
+# regardless of which agent (lincoln OR a manager) invokes it. --force overrides.
+set_mode planning
+assert_deny  "planning blocks sable-spawn-worker (lincoln)" 'sable-spawn-worker SABLE-x --worktree /wt'
+out_mgr="$(printf '%s' '{"tool_input":{"command":"sable-spawn-worker SABLE-x --worktree /wt"}}' | CLAUDE_AGENT_NAME=optimus bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_mgr"; then pass "planning blocks sable-spawn-worker (manager identity)"; else fail "planning blocks sable-spawn-worker (manager identity)" "got: ${out_mgr:-<empty>}"; fi
+assert_allow "planning sable-spawn-worker --force overrides" 'sable-spawn-worker SABLE-x --worktree /wt --force'
+
+set_mode execution
+assert_allow "execution allows sable-spawn-worker (lincoln)" 'sable-spawn-worker SABLE-x --worktree /wt'
+out_mgr_e="$(printf '%s' '{"tool_input":{"command":"sable-spawn-worker SABLE-x --worktree /wt"}}' | CLAUDE_AGENT_NAME=optimus bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_mgr_e"; then fail "execution allows sable-spawn-worker (manager identity)" "got deny"; else pass "execution allows sable-spawn-worker (manager identity)"; fi
+set_mode planning
+
 # ---------- settings-snippet registration ----------
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 if jq -e . "$SNIPPET" >/dev/null 2>&1; then pass "settings-snippet.json is valid JSON"; else fail "settings-snippet.json is valid JSON"; fi
