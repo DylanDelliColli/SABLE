@@ -81,6 +81,47 @@ def test_spawn_creates_tagged_worker_window(sock):
         assert "worker-sable-bldh-2" in win
 
 
+def test_spawn_without_worktree_lands_where_dispatch_points(sock):
+    """SABLE-bldh.11 regression: with NO --worktree, the path `bd worktree create`
+    actually creates MUST equal the path embedded in the dispatch file (== the
+    tmux -c target) AND exist on disk. The original bug created the worktree
+    inside the repo but pointed tmux at the repo's sibling, dropping the worker in
+    $HOME. Runs against real bd in THIS repo with a unique scope; removes the
+    worktree + branch afterward."""
+    repo = Path(__file__).resolve().parent.parent  # the SABLE repo root
+    scope = f"sw-it-{uuid.uuid4().hex[:8]}"
+    wt_name = f"wk-{scope}"
+    expected = repo.parent / wt_name  # sibling of the repo, NOT inside it
+    with tempfile.TemporaryDirectory() as dd:
+        env = {
+            **os.environ,
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
+            "SABLE_DISPATCH_DIR": dd,
+        }
+        try:
+            r = subprocess.run(
+                ["python3", str(BIN), BEAD, "--scope", scope,
+                 "--model", "haiku", "--skip-governance"],
+                capture_output=True, text=True, env=env, cwd=str(repo),
+            )
+            assert r.returncode == 0, r.stderr
+            # the worktree dir actually exists at the computed sibling path
+            assert expected.is_dir(), f"no worktree at {expected}; stderr={r.stderr}"
+            # the dispatch file points workers at that SAME existing path
+            body = (Path(dd) / f"{BEAD}.md").read_text()
+            assert f"Worktree: {expected}" in body, body
+            # and it is NOT inside the repo (no main-checkout pollution)
+            assert not str(expected).startswith(str(repo) + os.sep)
+        finally:
+            subprocess.run(["git", "-C", str(repo), "worktree", "remove",
+                            "--force", str(expected)],
+                           capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(repo), "branch", "-D", wt_name],
+                           capture_output=True, text=True)
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

@@ -54,6 +54,16 @@ def window_name(bead_id: str) -> str:
     return f"worker-{_sanitize(bead_id)}"
 
 
+def resolve_worktree_path(toplevel: str, wt_name: str) -> str:
+    """Absolute worktree path = SIBLING of the repo root (its parent dir), NOT
+    inside the repo. The SAME value must be handed to `bd worktree create` and to
+    tmux `-c`; computing those two separately is what dropped the worker in $HOME
+    (SABLE-bldh.11). Sibling (not inside-repo) also keeps the main checkout clean,
+    which Chuck's merge requires (SABLE-936y) — an inside-repo worktree pollutes
+    the repo-root .gitignore / shows as untracked."""
+    return str(Path(toplevel).parent / wt_name)
+
+
 def resolve_model(labels: list[str], override: str | None):
     """Return (model, reason). Override syntax: 'opus' or 'opus:why'. Label
     'model:<m>' is the primary signal; default sonnet."""
@@ -180,9 +190,13 @@ def main(argv: list[str] | None = None) -> int:
         worktree = ns.worktree
     else:
         wt_name = worktree_name(bid, ns.scope)
-        _run(["bd", "worktree", "create", wt_name])
-        worktree = _run(["git", "rev-parse", "--show-toplevel"]).strip()
-        worktree = str(Path(worktree).parent / wt_name)
+        toplevel = _run(["git", "rev-parse", "--show-toplevel"]).strip()
+        # Compute the path ONCE and use it for BOTH the bd-create target and the
+        # tmux -c target — computing them separately dropped the worker in $HOME
+        # (SABLE-bldh.11). Pass --branch explicitly so the absolute path is not
+        # also taken as the branch name.
+        worktree = resolve_worktree_path(toplevel, wt_name)
+        _run(["bd", "worktree", "create", worktree, "--branch", wt_name])
     branch = Path(worktree).name
 
     # --- write the dispatch prompt file (keeps the worktree clean) ---

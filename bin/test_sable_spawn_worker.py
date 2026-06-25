@@ -57,6 +57,15 @@ def test_window_name():
     assert ssw.window_name("SABLE-bldh.3") == "worker-sable-bldh-3"
 
 
+def test_resolve_worktree_path_is_sibling_of_repo():
+    # SABLE-bldh.11: the worktree must be the repo's SIBLING (parent dir), and the
+    # value handed to `bd worktree create` must equal the value handed to tmux -c.
+    assert (ssw.resolve_worktree_path("/home/u/dev/SABLE", "wk-parity")
+            == "/home/u/dev/wk-parity")
+    assert (ssw.resolve_worktree_path("/a/b/c/REPO", "wk-x")
+            == "/a/b/c/wk-x")
+
+
 # --- bead JSON parsing ------------------------------------------------------
 
 def test_parse_bead_takes_first_of_list():
