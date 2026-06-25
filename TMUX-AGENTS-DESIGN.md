@@ -192,3 +192,36 @@ Conclusion: the Lincoln→busy-manager path works with nothing dropped, and
    to flag idle/hung worker panes.
 6. **Multi-line / special-char messages** — `send-keys -l` + newline escaping in
    the helper; keep lead↔manager messages single-paragraph by convention.
+
+---
+
+## Operator runbook — live walk-away acceptance (SABLE-bldh.7)
+
+The plumbing is automated-tested end-to-end (`hooks/test/test-tmux-e2e.sh`:
+sable-tmux → sable-msg → sable-spawn-worker → sable-worker-status --reap, all
+with stand-in panes). The **live** walk-away — real `claude` workers doing TDD,
+self-pushing, Chuck merging — is the operator's acceptance run. To perform it:
+
+1. **Plan a tiny backlog** in planning mode (`/sable-plan`): 2-3 trivial,
+   independent beads with full Fresh-Agent-Test descriptions + unit/integration
+   test specs, under a throwaway epic.
+2. **Flip to execution** (`/sable-execute`) and bring up the session:
+   ```bash
+   sable-tmux            # lincoln + optimus + tarzan + chuck panes
+   tmux attach -t sable
+   ```
+3. **From the optimus pane**, dispatch a bead:
+   `sable-spawn-worker <bead-id> --scope <name>` — watch a worker window open,
+   the model pin, and the worker run TDD → push its own branch → `bd close` →
+   flag `@sable_status=done`.
+4. **From the lincoln pane**, exercise messaging: `sable-msg optimus "status?"`
+   (and `--interrupt` mid-turn). Confirm the `⟦SABLE-MSG⟧ from=lincoln` framing
+   appears in optimus and that optimus replies via `sable-msg lincoln "..."`.
+5. **Chuck** merges the `for-chuck` PR the worker's push filed.
+6. **Reap**: `sable-worker-status --reap` clears done worker panes.
+
+**Acceptance checks:** zero identity-bleed (every push/message carries the right
+agent), zero `git -C` wrong-tree incidents (workers push from their own CWD),
+gates fired on each worker's `bd close` (tdd/scope-creep/test-evidence), and
+per-item wall-clock far below gc's ~22–27 min floor (warm panes; record the
+number in SABLE-bldh.7).
