@@ -151,7 +151,9 @@ if [ "$UNINSTALL" = "1" ]; then
     while IFS= read -r n; do rm -rf "$SKILLS/$n"; done <<EOF
 $(skill_names)
 EOF
-    rm -f "$BASE/sable/roles/lincoln.md" "$BASE/sable/roles/cockpit.md" "$BASE/sable/agents.yaml"
+    rm -f "$BASE/sable/roles/lincoln.md" "$BASE/sable/roles/optimus.md" \
+          "$BASE/sable/roles/tarzan.md" "$BASE/sable/roles/chuck.md" \
+          "$BASE/sable/roles/cockpit.md" "$BASE/sable/agents.yaml"
     rm -rf "$HOOKS_DIR" "$BASE/agents-teams"
     remove_layer_hooks "$SETTINGS"
     echo "Orchestration layer uninstalled from $BASE (scope: $SCOPE)."
@@ -172,7 +174,12 @@ done
 # Registry + lincoln role + identity. Remove a stale installed cockpit role
 # (v2: the agent is lincoln; SABLE-uz9.5).
 cp "$REPO/templates/multi-manager/agents.yaml"      "$BASE/sable/agents.yaml"
-cp "$REPO/templates/multi-manager/roles/lincoln.md" "$BASE/sable/roles/lincoln.md"
+# tmux warm-pane topology (SABLE-bldh): lincoln + optimus/tarzan/chuck all run as
+# panes whose role session-role-anchor.sh injects from BASE/sable/roles/<name>.md
+# (CLAUDE_AGENT_ROLE=manager set by sable-tmux). Install all four, not just lincoln.
+for _role in lincoln optimus tarzan chuck; do
+    cp "$REPO/templates/multi-manager/roles/$_role.md" "$BASE/sable/roles/$_role.md"
+done
 rm -f "$BASE/sable/roles/cockpit.md"
 
 # SABLE skills, installed by frontmatter 'name:' (repo dir may differ).

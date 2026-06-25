@@ -42,6 +42,9 @@ out1="$(SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project 2>&1)"
 exists "$P/.claude/skills/sable-plan/SKILL.md"    "project: /plan skill installed"
 exists "$P/.claude/skills/sable-execute/SKILL.md" "project: /execute skill installed"
 exists "$P/.claude/sable/roles/lincoln.md"  "project: lincoln role installed"
+exists "$P/.claude/sable/roles/optimus.md"  "project: optimus pane role installed (tmux-native)"
+exists "$P/.claude/sable/roles/tarzan.md"   "project: tarzan pane role installed (tmux-native)"
+exists "$P/.claude/sable/roles/chuck.md"    "project: chuck pane role installed (tmux-native)"
 if [ -e "$P/.claude/agents-teams/chuck.md" ]; then pass "project default: agents-teams defs always installed"; else fail "project default: agents-teams defs always installed" "chuck.md missing from $P/.claude/agents-teams/"; fi
 if [ -x "$P/.claude/hooks/multi-manager/mode-interlock.sh" ]; then pass "project: interlock hook installed+exec"; else fail "project: interlock hook installed+exec"; fi
 SET="$P/.claude/settings.local.json"
@@ -93,6 +96,7 @@ if [ "$(count_interlock "$U/.claude/settings.json")" = "2" ]; then pass "user: i
 SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --uninstall >/dev/null 2>&1
 if [ ! -e "$P/.claude/skills/sable-plan/SKILL.md" ]; then pass "uninstall removes skills"; else fail "uninstall removes skills"; fi
 if [ ! -e "$P/.claude/sable/agents.yaml" ]; then pass "uninstall removes registry"; else fail "uninstall removes registry"; fi
+if [ ! -e "$P/.claude/sable/roles/optimus.md" ] && [ ! -e "$P/.claude/sable/roles/chuck.md" ]; then pass "uninstall removes tmux-native pane roles"; else fail "uninstall removes tmux-native pane roles"; fi
 if [ ! -e "$P/.claude/agents-teams/chuck.md" ]; then pass "uninstall removes teams agent defs"; else fail "uninstall removes teams agent defs"; fi
 if [ "$(count_interlock "$SET")" = "0" ]; then pass "uninstall de-registers interlock"; else fail "uninstall de-registers interlock" "count=$(count_interlock "$SET")"; fi
 if [ "$(count_marker "$SET" session-role-anchor.sh)" = "0" ]; then pass "uninstall de-registers identity hook"; else fail "uninstall de-registers identity hook" "count=$(count_marker "$SET" session-role-anchor.sh)"; fi
