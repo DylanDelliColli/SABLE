@@ -89,10 +89,12 @@ usage() {
 sable-mode — read/write the orchestration mode-state file.
 
 Usage:
-  sable-mode set <planning|execution> [--fleet a,b,c] [--tier quick|full]
+  sable-mode set <planning|execution> [--fleet a,b,c] [--tier quick|full|discovery]
       Write the mode-state file. --fleet is a comma-separated list of the
       agents launched for this mode (recorded for the dashboard). --tier sets
-      the planning tier (default full); quick telescopes the backlog gate.
+      the planning tier (default full); quick telescopes the backlog gate, and
+      discovery (Mode 1) is the lightest sub-mode — no backlog gate, since
+      Discovery authors no implementation beads (it writes charters).
   sable-mode get      Print the current mode word; nonzero exit if unset.
   sable-mode show     Print the full mode-state JSON; nonzero exit if unset.
   sable-mode path     Print the resolved mode-state file path (no state needed).
@@ -102,8 +104,8 @@ Usage:
                                  framing research architecture test-strategy decomposition
   sable-mode substage advance    Advance to the next substage in order; nonzero
                                  if already at decomposition.
-  sable-mode tier get            Print the planning tier (quick|full, default
-                                 full); nonzero if unset or not in planning.
+  sable-mode tier get            Print the planning tier (quick|full|discovery,
+                                 default full); nonzero if unset or not in planning.
   sable-mode --help
 
 State file (resolved per-repo): ${STATE}
@@ -177,8 +179,8 @@ case "$cmd" in
             esac
         done
         case "${tier:-full}" in
-            quick|full) ;;
-            *) printf "sable-mode: invalid tier '%s' (must be quick or full)\n" "$tier" >&2; exit 2 ;;
+            quick|full|discovery) ;;
+            *) printf "sable-mode: invalid tier '%s' (must be quick, full, or discovery)\n" "$tier" >&2; exit 2 ;;
         esac
 
         since="$(date +%Y-%m-%dT%H:%M:%S%z)"
@@ -189,9 +191,11 @@ fleet = [s for s in os.environ.get('FLEET', '').split(',') if s]
 mode = os.environ['MODE']
 data = {'mode': mode, 'since': os.environ['SINCE'], 'fleet': fleet}
 # Planning is a staged sub-state machine; entering it starts at framing.
-# Execution has no substage. The tier (quick|full, default full) telescopes the
-# substage gate: quick-tier planning lets the interlock allow backlog authoring
-# under the single /sable-plan approval instead of walking all five substages.
+# Execution has no substage. The tier (quick|full|discovery, default full)
+# telescopes the substage gate: quick-tier planning lets the interlock allow
+# backlog authoring under the single /sable-plan approval instead of walking all
+# five substages; discovery (Mode 1) likewise bypasses the backlog gate (it
+# authors no implementation beads).
 if mode == 'planning':
     data['substage'] = 'framing'
     data['tier'] = os.environ.get('TIER') or 'full'

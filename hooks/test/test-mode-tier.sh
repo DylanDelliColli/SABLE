@@ -43,4 +43,18 @@ if is_deny "$(fire)"; then no "full tier allows backlog at decomposition" "got d
 printf '%s\n' '{"mode":"planning","since":"x","fleet":[],"substage":"framing"}' > "$STATE"
 if is_deny "$(fire)"; then ok "absent tier fails safe to full (blocks)"; else no "absent tier fails safe to full (blocks)" "no deny"; fi
 
+# --- discovery sub-mode (SABLE-7v1r.4): lightest planning sub-mode ---
+"$MODE_BIN" set planning --tier discovery >/dev/null 2>&1
+eq "discovery tier stored + read" "$("$MODE_BIN" tier get 2>/dev/null)" "discovery"
+# no backlog gate: even an impl-child create is allowed at framing
+if is_deny "$(fire)"; then no "discovery tier allows backlog (no gate)" "got deny"; else ok "discovery tier allows backlog (no gate)"; fi
+# bare epic-intention shell allowed (matches the quick/full epic-shell rule)
+EPIC_JSON='{"tool_name":"Bash","tool_input":{"command":"bd create --type=epic --title intent"}}'
+if is_deny "$(printf '%s' "$EPIC_JSON" | CLAUDE_AGENT_NAME=lincoln bash "$HOOK" 2>/dev/null)"; then no "discovery allows bare epic-intention shell" "got deny"; else ok "discovery allows bare epic-intention shell"; fi
+# planning blocks STILL apply under discovery: git push + manager launch denied
+PUSH_JSON='{"tool_name":"Bash","tool_input":{"command":"git push"}}'
+if is_deny "$(printf '%s' "$PUSH_JSON" | CLAUDE_AGENT_NAME=lincoln bash "$HOOK" 2>/dev/null)"; then ok "discovery still blocks git push"; else no "discovery still blocks git push" "no deny"; fi
+MGR_JSON='{"tool_name":"Bash","tool_input":{"command":"optimus"}}'
+if is_deny "$(printf '%s' "$MGR_JSON" | CLAUDE_AGENT_NAME=lincoln bash "$HOOK" 2>/dev/null)"; then ok "discovery still blocks manager launch"; else no "discovery still blocks manager launch" "no deny"; fi
+
 if [ "$fails" -eq 0 ]; then printf 'PASS test-mode-tier\n'; else printf 'FAIL test-mode-tier (%d)\n' "$fails"; exit 1; fi
