@@ -160,6 +160,42 @@ def test_worker_window_inherits_lane_manager_identity(sock):
         assert "CLAUDE_AGENT_ROLE=manager" in content, content
 
 
+def test_worker_bypass_gate_is_accepted(sock):
+    """SABLE-91m3 regression: sable-spawn-worker must accept the bypass-permissions
+    warning (whose default is 'No, exit') before delivering, or the worker dies.
+    A stand-in pane prints the warning, reads the key the helper sends, and records
+    it; we assert it received '2' (Yes, I accept)."""
+    with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
+        rec = Path(dd) / "gate-key.txt"
+        script = Path(dd) / "fake-worker.sh"
+        script.write_text(
+            "echo 'WARNING: Claude Code running in Bypass Permissions mode'\n"
+            "echo '  2. Yes, I accept'\n"
+            "read k\n"
+            f"printf '%s' \"$k\" > {rec}\n"
+            "sleep 1\n"
+        )
+        env = {
+            **os.environ,
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": f"bash --noprofile --norc {script}",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "2",   # poll long enough to see + clear the gate
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.2",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+        }
+        r = subprocess.run(
+            ["python3", str(BIN), BEAD, "--worktree", wt, "--model", "haiku",
+             "--skip-governance"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        time.sleep(0.5)
+        assert rec.exists(), "stand-in never received a key (gate not accepted)"
+        assert rec.read_text().strip() == "2", rec.read_text()
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

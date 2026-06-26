@@ -212,5 +212,35 @@ def test_dispatch_landed_false_when_absent():
     assert ssw.dispatch_landed(cap, "SABLE-2cao.1") is False
 
 
+# --- startup gate clearing (SABLE-91m3 / bldh.12) ---------------------------
+
+BYPASS_WARNING = (
+    "  WARNING: Claude Code running in Bypass Permissions mode\n"
+    "  By proceeding, you accept all responsibility.\n"
+    "  ❯ 1. No, exit\n    2. Yes, I accept\n  Enter to confirm")
+
+TRUST_DIALOG = (
+    "  Is this a project you trust?\n"
+    "  ❯ 1. Yes, I trust this folder\n    2. No, exit\n  Enter to confirm")
+
+
+def test_accept_startup_gate_bypass_returns_accept_key():
+    # default is '1. No, exit' -> must actively pick '2. Yes, I accept'
+    assert ssw.accept_startup_gate(BYPASS_WARNING) == "2"
+
+
+def test_accept_startup_gate_trust_returns_yes_key():
+    assert ssw.accept_startup_gate(TRUST_DIALOG) == "1"
+
+
+def test_accept_startup_gate_none_when_ready():
+    assert ssw.accept_startup_gate("❯ \n  ddc@host:~/wt\n  bypass permissions on") is None
+
+
+def test_pane_ready_false_on_bypass_warning():
+    # the warning's prompt line is '❯ 1. No, exit', not an empty box -> not ready
+    assert ssw.pane_ready(BYPASS_WARNING) is False
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
