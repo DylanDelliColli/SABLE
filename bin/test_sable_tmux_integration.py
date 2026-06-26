@@ -62,6 +62,47 @@ def test_layout_tags_and_identity(sock):
         assert f"RID={role}" in cap, f"identity not set for {role}: {cap}"
 
 
+def test_autostart_kicks_autonomous_roles_only(sock, tmp_path):
+    """SABLE-bldh.14: --autostart kicks optimus/tarzan/chuck into their operating
+    loops but NOT lincoln (the operator's pane). Stand-in panes record the lines
+    they receive, keyed by their per-pane CLAUDE_AGENT_NAME."""
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    script = tmp_path / "fake-pane.sh"
+    # Emulate a claude prompt box ("❯ ") so deliver_text's submit-detection
+    # (dispatch_landed) behaves as it does against a real TUI: the typed line sits
+    # in the box until Enter, then is consumed. Record each submitted line under
+    # this pane's role name; the loop keeps the pane alive.
+    script.write_text(
+        'while true; do printf "\\342\\235\\257 "; IFS= read -r line || break; '
+        'echo "$line" >> "$REC_DIR/$CLAUDE_AGENT_NAME.txt"; done\n'
+    )
+    env = {
+        **os.environ,
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_PANE_CMD": f"bash --noprofile --norc {script}",
+        "REC_DIR": str(rec),
+        "SABLE_DISPATCH_READY_TIMEOUT": "0",      # stand-in pane has no claude prompt
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+    }
+    r = subprocess.run(["python3", str(BIN), "--session", "sable", "--autostart"],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    time.sleep(1.0)
+
+    # autonomous roles each received the kick
+    for role in ("optimus", "tarzan", "chuck"):
+        f = rec / f"{role}.txt"
+        assert f.exists(), f"{role} got no kick ({sorted(p.name for p in rec.iterdir())})"
+        assert "SABLE-AUTOSTART" in f.read_text(), f"{role} kick missing tag: {f.read_text()!r}"
+
+    # lincoln (operator pane) must NOT be kicked
+    lf = rec / "lincoln.txt"
+    assert not lf.exists() or "SABLE-AUTOSTART" not in lf.read_text(), \
+        "lincoln should not be auto-kicked"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

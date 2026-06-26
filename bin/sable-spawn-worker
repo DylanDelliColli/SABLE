@@ -39,6 +39,15 @@ import sys
 import time
 from pathlib import Path
 
+# Shared pane-readiness/dispatch helpers (SABLE-bldh.14). Resolve the lib next to
+# THIS script even when invoked via a PATH symlink.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_pane_lib import (  # noqa: E402
+    accept_startup_gate, dispatch_landed, pane_ready, wait_for_ready,
+)
+from sable_pane_lib import capture_pane as _capture_pane  # noqa: E402
+from sable_pane_lib import deliver_text as deliver_dispatch  # noqa: E402
+
 DEFAULT_SESSION = "sable"
 DEFAULT_MODEL = "sonnet"
 
@@ -140,95 +149,9 @@ def worker_env_args(lane: str) -> list[str]:
     return ["-e", f"CLAUDE_AGENT_NAME={lane}", "-e", "CLAUDE_AGENT_ROLE=manager"]
 
 
-def pane_ready(capture: str) -> bool:
-    """The worker TUI is ready to accept input once its input box shows an EMPTY
-    prompt line (just the prompt glyph). While booting (splash) or on a blocking
-    gate screen there is no such empty line. Used to beat the send-keys-before-
-    ready race (SABLE-91m3)."""
-    for line in reversed(capture.splitlines()):
-        s = line.strip()
-        if s in ("❯", ">"):
-            return True
-    return False
-
-
-def accept_startup_gate(capture: str) -> str | None:
-    """The menu key that ACCEPTS a known blocking startup gate, or None. The
-    bypass-permissions warning defaults to '1. No, exit' (so a blind dispatch
-    Enter kills the worker), and a fresh worktree may show a trust dialog. Accept
-    bypass with '2' (Yes, I accept) and trust with '1' (Yes, I trust this
-    folder) so a hands-off worker boots through them (SABLE-91m3 / bldh.12)."""
-    low = capture.lower()
-    if "bypass permissions mode" in low and "accept" in low:
-        return "2"
-    if "trust this folder" in low or ("do you trust" in low and "yes" in low):
-        return "1"
-    return None
-
-
-def dispatch_landed(capture: str, snippet: str) -> bool:
-    """True once the instruction has been SUBMITTED: the snippet appears in the
-    pane but no longer sits in the (last) input-box prompt line. If it is still in
-    the input box, the Enter was dropped (SABLE-91m3) and must be resent."""
-    if snippet not in " ".join(capture.split()):
-        return False
-    box = None
-    for line in capture.splitlines():
-        s = line.strip()
-        if s.startswith("❯") or s.startswith(">"):
-            box = s
-    if box is None:
-        return True
-    return snippet not in box
-
-
-def _capture_pane(base: list[str], pane: str) -> str:
-    return subprocess.run(base + ["capture-pane", "-p", "-t", pane],
-                          capture_output=True, text=True).stdout
-
-
-def wait_for_ready(base, pane, timeout, interval=0.5, capture=None, sleep=None,
-                   run=None) -> bool:
-    """Poll until the worker TUI shows its empty prompt, accepting any blocking
-    startup gate (bypass warning / trust dialog) encountered on the way so the
-    worker doesn't die on the gate's default 'No, exit' (SABLE-91m3)."""
-    capture = capture or (lambda: _capture_pane(base, pane))
-    sleep = sleep or time.sleep
-    # tolerant runner: a dead pane (worker exited) must not crash the spawn helper
-    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True).returncode == 0)
-    waited = 0.0
-    while waited < timeout:
-        cap = capture()
-        if pane_ready(cap):
-            return True
-        key = accept_startup_gate(cap)
-        if key is not None:
-            run(base + ["send-keys", "-t", pane, key])
-            run(base + ["send-keys", "-t", pane, "Enter"])
-        sleep(interval)
-        waited += interval
-    return False
-
-
-def deliver_dispatch(base, pane, instruction, snippet, tries=8, interval=1.0,
-                     run=None, capture=None, sleep=None) -> bool:
-    """Type the instruction, then submit — resending Enter until the instruction
-    leaves the input box (the dropped-Enter race, SABLE-91m3). A resent Enter on
-    an already-empty box is a harmless no-op."""
-    # tolerant runner: send-keys to a vanished pane returns False rather than
-    # raising, so a dead worker yields a clean WARNING, not a traceback.
-    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True).returncode == 0)
-    capture = capture or (lambda: _capture_pane(base, pane))
-    sleep = sleep or time.sleep
-    if run(base + ["send-keys", "-t", pane, "-l", instruction]) is False:
-        return False
-    for _ in range(max(1, tries)):
-        sleep(interval)
-        if dispatch_landed(capture(), snippet):
-            return True
-        if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
-            return False
-    return dispatch_landed(capture(), snippet)
+# pane_ready / accept_startup_gate / dispatch_landed / wait_for_ready /
+# deliver_dispatch (= deliver_text) now live in sable_pane_lib (imported above),
+# shared with sable-tmux --autostart (SABLE-bldh.14).
 
 
 def assemble_dispatch_prompt(bead_id, title, description, worktree, branch, model) -> str:

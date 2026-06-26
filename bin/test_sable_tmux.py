@@ -27,14 +27,34 @@ def test_pane_env_args_sets_identity_and_role():
     assert args == ["-e", "CLAUDE_AGENT_NAME=optimus", "-e", "CLAUDE_AGENT_ROLE=manager"]
 
 
-def test_pane_command_default(monkeypatch):
+def test_pane_command_plain_when_not_autostart(monkeypatch):
     monkeypatch.delenv("SABLE_TMUX_PANE_CMD", raising=False)
-    assert st.pane_command() == "claude"
+    assert st.pane_command("optimus", False) == "claude"
+    assert st.pane_command("lincoln", True) == "claude"  # lincoln is never bypass/kicked
 
 
-def test_pane_command_override(monkeypatch):
+def test_pane_command_autostart_bypass_for_autonomous(monkeypatch):
+    monkeypatch.delenv("SABLE_TMUX_PANE_CMD", raising=False)
+    monkeypatch.delenv("SABLE_WORKER_PERMISSION", raising=False)
+    assert st.pane_command("optimus", True) == "claude --permission-mode bypassPermissions"
+    assert st.pane_command("chuck", True) == "claude --permission-mode bypassPermissions"
+
+
+def test_pane_command_override_wins(monkeypatch):
     monkeypatch.setenv("SABLE_TMUX_PANE_CMD", "bash --norc")
-    assert st.pane_command() == "bash --norc"
+    assert st.pane_command("optimus", True) == "bash --norc"
+
+
+def test_autonomous_roles_excludes_lincoln():
+    assert st.AUTONOMOUS_ROLES == {"optimus", "tarzan", "chuck"}
+    assert "lincoln" not in st.AUTONOMOUS_ROLES
+
+
+def test_kick_message_is_tagged_and_role_specific():
+    assert st.KICK_TAG in st.kick_message("optimus")
+    assert "sable-spawn-worker" in st.kick_message("optimus")
+    assert "sable-spawn-worker" in st.kick_message("tarzan")
+    assert "merge" in st.kick_message("chuck").lower()
 
 
 def test_tmux_base():

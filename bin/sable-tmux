@@ -27,7 +27,17 @@ import os
 import subprocess
 import sys
 
+# Shared pane-readiness/dispatch helpers (SABLE-bldh.14). Resolve the lib next to
+# THIS script even when invoked via a PATH symlink.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_pane_lib import deliver_text, wait_for_ready  # noqa: E402
+
 DEFAULT_ROLES = ["lincoln", "optimus", "tarzan", "chuck"]
+
+# Roles that run unattended (--autostart): launched with a bypass posture and
+# kicked into their operating loop. Lincoln is the operator's pane — never kicked.
+AUTONOMOUS_ROLES = {"optimus", "tarzan", "chuck"}
+KICK_TAG = "SABLE-AUTOSTART"
 
 
 def parse_roles(arg: str | None) -> list[str]:
@@ -40,8 +50,35 @@ def pane_env_args(role: str) -> list[str]:
     return ["-e", f"CLAUDE_AGENT_NAME={role}", "-e", "CLAUDE_AGENT_ROLE=manager"]
 
 
-def pane_command() -> str:
-    return os.environ.get("SABLE_TMUX_PANE_CMD") or "claude"
+def pane_command(role: str, autostart: bool) -> str:
+    """Stand-in override wins verbatim (tests). Otherwise `claude`, plus a bypass
+    permission posture for the autonomous roles under --autostart so they can run
+    sable-spawn-worker / git merge without prompting (SABLE-bldh.14 / .12)."""
+    override = os.environ.get("SABLE_TMUX_PANE_CMD")
+    if override:
+        return override
+    cmd = "claude"
+    if autostart and role in AUTONOMOUS_ROLES:
+        perm = os.environ.get("SABLE_WORKER_PERMISSION", "--permission-mode bypassPermissions")
+        cmd = f"{cmd} {perm}"
+    return cmd
+
+
+def kick_message(role: str) -> str:
+    """The turn that starts a role's operating loop under --autostart."""
+    common = (f"[{KICK_TAG}] Operator: begin your operating loop now and run it "
+              f"autonomously — do not wait for further input.")
+    if role in ("optimus", "tarzan"):
+        return (f"{common} Drain your lane from `bd ready`: verify each ready bead, "
+                f"claim it, and `sable-spawn-worker <id> --scope <name>`; review the "
+                f"results, reap done panes, then pause briefly and loop. Stand down "
+                f"when the pool and your inbox are empty.")
+    if role == "chuck":
+        return (f"{common} You are event-driven: each ⟦SABLE-MSG⟧ PR-ready "
+                f"message from a manager is a merge request — review and merge it, then "
+                f"report back. Also drain any existing for-chuck beads and run a "
+                f"stranded-recovery sweep now, then idle waiting for messages.")
+    return common
 
 
 def tmux_base(socket: str | None) -> list[str]:
@@ -61,6 +98,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--session", default=os.environ.get("SABLE_TMUX_SESSION") or "sable")
     p.add_argument("--roles", help="comma-separated role list (default: all four)")
     p.add_argument("--attach", action="store_true", help="attach after layout")
+    p.add_argument("--autostart", action="store_true",
+                   help="launch the autonomous roles (optimus/tarzan/chuck) with a "
+                        "bypass posture and kick them into their operating loops")
     ns = p.parse_args(sys.argv[1:] if argv is None else argv)
 
     roles = parse_roles(ns.roles)
@@ -70,7 +110,6 @@ def main(argv: list[str] | None = None) -> int:
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
     base = tmux_base(socket)
     sess = ns.session
-    cmd = pane_command()
 
     # refuse to clobber an existing session
     if subprocess.run(base + ["has-session", "-t", sess],
@@ -80,17 +119,42 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # first role -> new session; rest -> tiled splits
+    panes: dict[str, str] = {}
     first = roles[0]
     pane = _run(base + ["new-session", "-d", "-s", sess, "-x", "220", "-y", "55",
-                        "-P", "-F", "#{pane_id}", *pane_env_args(first), cmd]).strip()
+                        "-P", "-F", "#{pane_id}", *pane_env_args(first),
+                        pane_command(first, ns.autostart)]).strip()
     _tag(base, pane, first)
+    panes[first] = pane
     for role in roles[1:]:
         pane = _run(base + ["split-window", "-t", sess, "-P", "-F", "#{pane_id}",
-                            *pane_env_args(role), cmd]).strip()
+                            *pane_env_args(role),
+                            pane_command(role, ns.autostart)]).strip()
         _tag(base, pane, role)
+        panes[role] = pane
         subprocess.run(base + ["select-layout", "-t", sess, "tiled"], check=True)
 
     sys.stderr.write(f"sable-tmux: session '{sess}' up with roles: {', '.join(roles)}\n")
+
+    # --autostart: kick the autonomous roles into their operating loops once their
+    # TUIs are ready (wait_for_ready also accepts the bypass-permissions gate).
+    if ns.autostart:
+        ready_timeout = float(os.environ.get("SABLE_DISPATCH_READY_TIMEOUT", "25"))
+        submit_tries = int(os.environ.get("SABLE_DISPATCH_SUBMIT_TRIES", "8"))
+        poll_interval = float(os.environ.get("SABLE_DISPATCH_POLL_INTERVAL", "1.0"))
+        for role in roles:
+            if role not in AUTONOMOUS_ROLES:
+                continue
+            kpane = panes[role]
+            if ready_timeout > 0:
+                wait_for_ready(base, kpane, ready_timeout, interval=poll_interval)
+            if deliver_text(base, kpane, kick_message(role), KICK_TAG,
+                            tries=submit_tries, interval=poll_interval):
+                sys.stderr.write(f"sable-tmux: kicked {role} into its operating loop\n")
+            else:
+                sys.stderr.write(f"sable-tmux: WARNING kick to {role} ({kpane}) "
+                                 f"may be unsubmitted\n")
+
     sys.stderr.write(f"  attach: tmux{' -L ' + socket if socket else ''} attach -t {sess}\n")
     if ns.attach:
         os.execvp("tmux", base[0:1] + base[1:] + ["attach", "-t", sess])
