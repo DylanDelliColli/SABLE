@@ -124,7 +124,23 @@ for o in overlaps:
 print('\n'.join(lines))
 " 2>/dev/null)
 
-# Build description
+# --- Message-first handoff (SABLE-bldh.15) --------------------------------
+# In the tmux warm-pane topology the worker->merge handoff is a direct message
+# to Chuck: event-driven, no polled bead. If a Chuck pane is reachable, that IS
+# the handoff and we stop here. Fall through to the durable for-chuck bead only
+# when Chuck is unreachable (nested/teams topology has no Chuck pane, or Chuck is
+# down) — Chuck's stranded-recovery covers the crash case. Disable with
+# SABLE_MERGE_NOTIFY_VIA_MSG=0.
+if [ "${SABLE_MERGE_NOTIFY_VIA_MSG:-1}" = "1" ] && command -v sable-msg >/dev/null 2>&1; then
+  FILES_BRIEF=$(echo "$FILES" | sed 's#.*/##' | head -8 | tr '\n' ' ')
+  MSG="PR ready from ${SABLE_ID_NAME}: branch ${BRANCH} (${FILES_BRIEF}). Review and merge into the integration branch, then report."
+  [ -n "$OVERLAPS" ] && MSG="${MSG} OVERLAP-WARNING: shares files with in-flight work — sequence carefully."
+  if sable-msg chuck "$MSG" --from "$SABLE_ID_NAME" >/dev/null 2>&1; then
+    exit 0
+  fi
+fi
+
+# Build description (durable for-chuck bead — fallback path)
 DESC_LINES=""
 DESC_LINES="${DESC_LINES}PR ready for review."
 [ -n "$PR_URL" ] && DESC_LINES="${DESC_LINES}

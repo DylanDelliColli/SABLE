@@ -82,6 +82,18 @@ exit 1
 EOF
 chmod +x "$STUB_DIR/gh"
 
+# Stub sable-msg (SABLE-bldh.15): logs its args and exits with SABLE_MSG_STUB_RC.
+# Default rc=1 simulates "no Chuck pane reachable" so the hook falls back to the
+# durable for-chuck bead — keeping every pre-existing assertion valid unchanged.
+SABLE_MSG_LOG="$STUB_DIR/sable-msg-calls.log"
+cat > "$STUB_DIR/sable-msg" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >> "${SABLE_MSG_LOG:-/dev/null}"
+exit "${SABLE_MSG_STUB_RC:-1}"
+EOF
+chmod +x "$STUB_DIR/sable-msg"
+export SABLE_MSG_LOG
+
 # Manager identity env
 MGR_ENV="CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager"
 
@@ -125,7 +137,9 @@ print(json.dumps({
 # run_hook <env_prefix> <json> → prints hook stdout+stderr
 run_hook() {
   local env_prefix="$1" json="$2"
-  env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" $env_prefix bash "$HOOK" <<< "$json" 2>/dev/null
+  env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" \
+    SABLE_MSG_LOG="$SABLE_MSG_LOG" SABLE_MSG_STUB_RC="${SABLE_MSG_STUB_RC:-1}" \
+    $env_prefix bash "$HOOK" <<< "$json" 2>/dev/null
 }
 
 # assert_bd_called <test-name> → check BD_LOG has an entry
@@ -366,6 +380,40 @@ else
 fi
 rm -f "$BD_LOG"
 git -C "$FIXTURE_REPO" worktree remove --force "$WT_041" 2>/dev/null
+
+# --------------------------------------------------------------------------
+# SABLE-bldh.15: message-first handoff (event-driven Chuck) vs bead fallback
+# --------------------------------------------------------------------------
+
+# (a) Chuck reachable (sable-msg rc=0): the message IS the handoff; NO for-chuck bead.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV" "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -q 'chuck' "$SABLE_MSG_LOG" 2>/dev/null && grep -q 'from optimus' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "message-first: sable-msg chuck sent (from optimus) when Chuck reachable"
+else
+  fail "message-first: sable-msg chuck sent (from optimus)" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null | head -3)"
+fi
+assert_bd_not_called "message-first: NO for-chuck bead when Chuck reachable"
+
+# (b) Chuck unreachable (sable-msg rc=1): message attempted, bead filed (fallback).
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+SABLE_MSG_STUB_RC=1 run_hook "$MGR_ENV" "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -q 'chuck' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "fallback: sable-msg chuck attempted before falling back to bead"
+else
+  fail "fallback: sable-msg chuck attempted" "MSG_LOG empty: $(cat "$SABLE_MSG_LOG" 2>/dev/null | head -3)"
+fi
+assert_bd_called "fallback: for-chuck bead filed when Chuck unreachable"
+
+# (c) Messaging disabled (SABLE_MERGE_NOTIFY_VIA_MSG=0): no message attempt; bead filed.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV SABLE_MERGE_NOTIFY_VIA_MSG=0" "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if [ -s "$SABLE_MSG_LOG" ]; then
+  fail "disabled: sable-msg NOT attempted when SABLE_MERGE_NOTIFY_VIA_MSG=0" "MSG_LOG: $(cat "$SABLE_MSG_LOG")"
+else
+  pass "disabled: sable-msg NOT attempted when SABLE_MERGE_NOTIFY_VIA_MSG=0"
+fi
+assert_bd_called "disabled: for-chuck bead filed when messaging disabled"
 
 # --------------------------------------------------------------------------
 # Summary
