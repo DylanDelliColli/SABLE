@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""sable-charter — write/locate Discovery artifacts (SABLE-7v1r.1).
+
+Thin CLI over sable_charter_lib. Charters + decision records are COMMITTED
+markdown under <repo>/.claude/sable/charters/. Logic lives in the importable lib
+(shared with pytest); this bin resolves it via realpath so PATH symlinks work.
+
+Usage:
+  sable-charter dir                         print the resolved charters dir
+  sable-charter write-charter --json FILE   write a charter (FILE or - for stdin)
+  sable-charter write-decision --json FILE  write a decision record
+  sable-charter locate <slug>               print a charter's path (nonzero if none)
+  sable-charter list                        list charter paths (excludes decisions)
+
+Charter / decision JSON keys match the dataclass fields in sable_charter_lib
+(decision JSON carries a "candidates" list of {title, verdict, rationale, charter}).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import sable_charter_lib as lib  # noqa: E402
+
+
+def _load_json(src):
+    if src == "-":
+        return json.load(sys.stdin)
+    with open(src) as f:
+        return json.load(f)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="sable-charter")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("dir")
+    wc = sub.add_parser("write-charter")
+    wc.add_argument("--json", required=True, dest="json_src")
+    wd = sub.add_parser("write-decision")
+    wd.add_argument("--json", required=True, dest="json_src")
+    loc = sub.add_parser("locate")
+    loc.add_argument("slug")
+    sub.add_parser("list")
+    args = ap.parse_args(argv)
+
+    if args.cmd == "dir":
+        print(lib.charters_dir())
+        return 0
+
+    if args.cmd == "write-charter":
+        data = _load_json(args.json_src)
+        if "slug" not in data and "title" in data:
+            data["slug"] = lib.slugify(data["title"])
+        print(lib.write_charter(lib.Charter(**data)))
+        return 0
+
+    if args.cmd == "write-decision":
+        data = _load_json(args.json_src)
+        cands = [lib.Candidate(**c) for c in data.pop("candidates", [])]
+        print(lib.write_decision_record(lib.DecisionRecord(candidates=cands, **data)))
+        return 0
+
+    if args.cmd == "locate":
+        p = lib.locate(args.slug)
+        if p is None:
+            print(f"sable-charter: no charter '{args.slug}'", file=sys.stderr)
+            return 1
+        print(p)
+        return 0
+
+    if args.cmd == "list":
+        for p in lib.list_charters():
+            print(p)
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
