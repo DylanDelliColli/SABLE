@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""sable-discover-emit — deterministic Discovery fan-out (SABLE-7v1r.2).
+
+Given a triage object (session + candidates with verdicts), write the durable
+artifacts: one charter per survivor (go/reshape) carrying its epic_intention
+linkage, and the session decision record listing EVERY candidate verdict with the
+no-go rationales kept verbatim. no-go candidates get no charter. The Discovery
+skill (/sable-discover) creates the epic-intention shells (bd create --type=epic)
+and passes their ids in; this helper is the mechanical, testable emission step.
+
+Usage:
+  sable-discover-emit --json FILE|-
+
+Triage JSON:
+  {"session": "...", "title": "...", "created": "...",
+   "candidates": [
+     {"title": "...", "verdict": "go|reshape", "rationale": "...",
+      "epic_intention": "SABLE-xxx", "charter": {<charter section fields>}},
+     {"title": "...", "verdict": "no-go", "rationale": "..."}]}
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import sable_charter_lib as lib  # noqa: E402
+
+SURVIVOR_VERDICTS = ("go", "reshape")
+_MANAGED = ("slug", "title", "epic_intention", "decision_record")
+
+
+def emit(triage: dict, base: str | None = None) -> dict:
+    session = triage["session"]
+    decision_slug = f"{lib.slugify(session)}-decisions"
+    candidates, survivors, nogos = [], [], []
+    for cand in triage.get("candidates", []):
+        title = cand["title"]
+        verdict = cand["verdict"]
+        rationale = cand.get("rationale", "")
+        slug = None
+        if verdict in SURVIVOR_VERDICTS:
+            epic = cand.get("epic_intention")
+            if not epic:
+                raise ValueError(f"survivor '{title}' needs an epic_intention")
+            slug = lib.slugify(title)
+            fields = {k: v for k, v in (cand.get("charter") or {}).items()
+                      if k not in _MANAGED}
+            lib.write_charter(
+                lib.Charter(slug=slug, title=title, epic_intention=epic,
+                            decision_record=decision_slug, **fields), base)
+            survivors.append(slug)
+        else:
+            nogos.append(title)
+        candidates.append(lib.Candidate(
+            title=title, verdict=verdict, rationale=rationale, charter=slug))
+    decision_path = lib.write_decision_record(
+        lib.DecisionRecord(session=session, title=triage.get("title"),
+                           created=triage.get("created"), candidates=candidates), base)
+    return {
+        "survivors": survivors,
+        "nogos": nogos,
+        "decision": str(decision_path),
+        "charters": {s: str(lib.charters_dir(base) / f"{s}.md") for s in survivors},
+    }
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="sable-discover-emit")
+    ap.add_argument("--json", required=True, dest="json_src")
+    args = ap.parse_args(argv)
+    if args.json_src == "-":
+        triage = json.load(sys.stdin)
+    else:
+        with open(args.json_src) as f:
+            triage = json.load(f)
+    print(json.dumps(emit(triage), indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
