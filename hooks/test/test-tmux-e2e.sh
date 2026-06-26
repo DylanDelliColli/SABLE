@@ -58,6 +58,7 @@ if printf '%s' "$cap" | grep -q 'FREE' && [ "$(printf '%s' "$cap" | grep -n 'FRE
 
 # 3) A manager spawns a worker via sable-spawn-worker ------------------------
 SABLE_WORKER_CMD="bash --noprofile --norc" SABLE_DISPATCH_DIR="$DD" \
+  SABLE_DISPATCH_READY_TIMEOUT=0 SABLE_DISPATCH_POLL_INTERVAL=0.05 SABLE_DISPATCH_SUBMIT_TRIES=2 \
   python3 "$BIN/sable-spawn-worker" "$READ_BEAD" --worktree "$WT" --model haiku --skip-governance >/dev/null 2>&1 \
   && pass "sable-spawn-worker spawns a worker" || fail "sable-spawn-worker spawns a worker"
 sleep 0.6

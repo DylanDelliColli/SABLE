@@ -131,12 +131,85 @@ def test_read_instruction_is_single_line():
 
 # --- worker command ---------------------------------------------------------
 
-def test_worker_command_default_pins_model():
-    assert ssw.worker_command("haiku", None) == "claude --model haiku"
+def test_worker_command_default_pins_model_and_auto_approves(monkeypatch):
+    # SABLE-bldh.12: a hands-off worker must auto-approve writes AND bash, so the
+    # default carries a bypass permission posture (configurable).
+    monkeypatch.delenv("SABLE_WORKER_PERMISSION", raising=False)
+    assert ssw.worker_command("haiku", None) == (
+        "claude --model haiku --permission-mode bypassPermissions"
+    )
+
+
+def test_worker_command_permission_env_override(monkeypatch):
+    monkeypatch.setenv("SABLE_WORKER_PERMISSION", "--permission-mode acceptEdits")
+    assert ssw.worker_command("sonnet", None) == (
+        "claude --model sonnet --permission-mode acceptEdits"
+    )
 
 
 def test_worker_command_override_used_verbatim():
     assert ssw.worker_command("haiku", "bash --norc") == "bash --norc"
+
+
+# --- lane identity (SABLE-bldh.13) ------------------------------------------
+
+def test_resolve_lane_prefers_explicit_override(monkeypatch):
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "lincoln")
+    assert ssw.resolve_lane("optimus") == "optimus"
+
+
+def test_resolve_lane_falls_back_to_invoking_manager_env(monkeypatch):
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "tarzan")
+    assert ssw.resolve_lane(None) == "tarzan"
+
+
+def test_resolve_lane_empty_when_no_identity(monkeypatch):
+    monkeypatch.delenv("CLAUDE_AGENT_NAME", raising=False)
+    assert ssw.resolve_lane(None) == ""
+
+
+def test_worker_env_args_stamps_manager_identity():
+    # post-push-merge-notify fires only for MANAGER identities, so the worker must
+    # carry the lane manager's name + manager role for the for-chuck handoff to
+    # fire AND be attributed correctly.
+    assert ssw.worker_env_args("optimus") == [
+        "-e", "CLAUDE_AGENT_NAME=optimus", "-e", "CLAUDE_AGENT_ROLE=manager",
+    ]
+
+
+def test_worker_env_args_empty_when_no_lane():
+    assert ssw.worker_env_args("") == []
+
+
+# --- dispatch readiness + submission (SABLE-91m3) ---------------------------
+
+def test_pane_ready_true_on_empty_prompt():
+    cap = "splash\n\n❯ \n  ddc@host:~/wt\n  bypass permissions on"
+    assert ssw.pane_ready(cap) is True
+
+
+def test_pane_ready_false_while_booting():
+    cap = "╭─ Claude Code ─╮\n│ Welcome back │\n╰──────────────╯"
+    assert ssw.pane_ready(cap) is False
+
+
+def test_dispatch_landed_false_when_still_in_input_box():
+    # the instruction is sitting unsubmitted in the input box (the dropped-Enter
+    # race) -> NOT landed.
+    cap = "❯ Read /x/SABLE-2cao.1.md in full and execute it.\n  ddc@host:~/wt"
+    assert ssw.dispatch_landed(cap, "SABLE-2cao.1") is False
+
+
+def test_dispatch_landed_true_when_submitted():
+    # the instruction moved out of the input box (now empty) into the turn above.
+    cap = ("❯ Read /x/SABLE-2cao.1.md in full and execute it.\n"
+           "● Reading the dispatch...\n✻ Crystallizing…\n❯ \n  ddc@host:~/wt")
+    assert ssw.dispatch_landed(cap, "SABLE-2cao.1") is True
+
+
+def test_dispatch_landed_false_when_absent():
+    cap = "❯ \n  ddc@host:~/wt"
+    assert ssw.dispatch_landed(cap, "SABLE-2cao.1") is False
 
 
 if __name__ == "__main__":

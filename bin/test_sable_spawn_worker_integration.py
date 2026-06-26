@@ -53,6 +53,9 @@ def test_spawn_creates_tagged_worker_window(sock):
             "SABLE_TMUX_SESSION": "sable",
             "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
             "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",   # skip TUI readiness wait (stand-in pane)
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
         }
         r = subprocess.run(
             ["python3", str(BIN), BEAD, "--worktree", wt,
@@ -99,6 +102,9 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock):
             "SABLE_TMUX_SESSION": "sable",
             "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
             "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",   # skip TUI readiness wait (stand-in pane)
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
         }
         try:
             r = subprocess.run(
@@ -120,6 +126,38 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock):
                            capture_output=True, text=True)
             subprocess.run(["git", "-C", str(repo), "branch", "-D", wt_name],
                            capture_output=True, text=True)
+
+
+def test_worker_window_inherits_lane_manager_identity(sock):
+    """SABLE-bldh.13 regression: the worker window must carry the invoking lane
+    manager's CLAUDE_AGENT_NAME (+ manager role) so its push's for-chuck handoff
+    fires (post-push-merge-notify gates on manager identity) and is attributed to
+    the lane, not the session-default 'lincoln'. Verified by dumping the worker
+    process env to a file."""
+    with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
+        dump = Path(dd) / "worker-env.txt"
+        env = {
+            **os.environ,
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "CLAUDE_AGENT_NAME": "optimus",   # the invoking manager (lane)
+            # worker dumps its OWN env, proving the -e propagation reached it
+            "SABLE_WORKER_CMD": f"bash --noprofile --norc -c 'env > {dump}; sleep 2'",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+        r = subprocess.run(
+            ["python3", str(BIN), BEAD, "--worktree", wt, "--model", "haiku",
+             "--skip-governance"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        time.sleep(0.8)
+        content = dump.read_text() if dump.exists() else ""
+        assert "CLAUDE_AGENT_NAME=optimus" in content, content
+        assert "CLAUDE_AGENT_ROLE=manager" in content, content
 
 
 if __name__ == "__main__":

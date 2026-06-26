@@ -36,6 +36,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 DEFAULT_SESSION = "sable"
@@ -108,7 +109,96 @@ def model_check(labels: list[str], override: str | None) -> str | None:
 
 
 def worker_command(model: str, override: str | None) -> str:
-    return override if override else f"claude --model {model}"
+    """Default worker command pins the model AND an auto-approving permission
+    posture — a hands-off worker must run writes AND bash (mkdir/pytest/git/tmux)
+    without prompting (SABLE-bldh.12). Tune via SABLE_WORKER_PERMISSION; a full
+    SABLE_WORKER_CMD override (e.g. tests) replaces everything verbatim."""
+    if override:
+        return override
+    perm = os.environ.get("SABLE_WORKER_PERMISSION", "--permission-mode bypassPermissions")
+    return f"claude --model {model} {perm}".strip()
+
+
+def resolve_lane(override: str | None) -> str:
+    """The identity to stamp on the worker = the invoking LANE MANAGER. Explicit
+    --lane wins; else this process's CLAUDE_AGENT_NAME (the manager pane that ran
+    sable-spawn-worker); else empty. The worker must carry a MANAGER identity
+    because post-push-merge-notify (which files the for-chuck handoff) fires only
+    for managers (SABLE-bldh.13)."""
+    if override:
+        return override.strip()
+    return (os.environ.get("CLAUDE_AGENT_NAME") or "").strip()
+
+
+def worker_env_args(lane: str) -> list[str]:
+    """tmux `-e` args giving the worker the lane manager's identity. Without this
+    the worker inherits the tmux SESSION env (CLAUDE_AGENT_NAME=lincoln, set by
+    sable-tmux's `new-session -e`), so its push is mis-attributed to lincoln
+    (SABLE-bldh.13). Empty when no lane is resolvable."""
+    if not lane:
+        return []
+    return ["-e", f"CLAUDE_AGENT_NAME={lane}", "-e", "CLAUDE_AGENT_ROLE=manager"]
+
+
+def pane_ready(capture: str) -> bool:
+    """The worker TUI is ready to accept input once its input box shows an EMPTY
+    prompt line (just the prompt glyph). While booting (splash) there is no such
+    line. Used to beat the send-keys-before-ready race (SABLE-91m3)."""
+    for line in reversed(capture.splitlines()):
+        s = line.strip()
+        if s in ("❯", ">"):
+            return True
+    return False
+
+
+def dispatch_landed(capture: str, snippet: str) -> bool:
+    """True once the instruction has been SUBMITTED: the snippet appears in the
+    pane but no longer sits in the (last) input-box prompt line. If it is still in
+    the input box, the Enter was dropped (SABLE-91m3) and must be resent."""
+    if snippet not in " ".join(capture.split()):
+        return False
+    box = None
+    for line in capture.splitlines():
+        s = line.strip()
+        if s.startswith("❯") or s.startswith(">"):
+            box = s
+    if box is None:
+        return True
+    return snippet not in box
+
+
+def _capture_pane(base: list[str], pane: str) -> str:
+    return subprocess.run(base + ["capture-pane", "-p", "-t", pane],
+                          capture_output=True, text=True).stdout
+
+
+def wait_for_ready(base, pane, timeout, interval=0.5, capture=None, sleep=None) -> bool:
+    capture = capture or (lambda: _capture_pane(base, pane))
+    sleep = sleep or time.sleep
+    waited = 0.0
+    while waited < timeout:
+        if pane_ready(capture()):
+            return True
+        sleep(interval)
+        waited += interval
+    return False
+
+
+def deliver_dispatch(base, pane, instruction, snippet, tries=8, interval=1.0,
+                     run=None, capture=None, sleep=None) -> bool:
+    """Type the instruction, then submit — resending Enter until the instruction
+    leaves the input box (the dropped-Enter race, SABLE-91m3). A resent Enter on
+    an already-empty box is a harmless no-op."""
+    run = run or (lambda cmd: subprocess.run(cmd, check=True))
+    capture = capture or (lambda: _capture_pane(base, pane))
+    sleep = sleep or time.sleep
+    run(base + ["send-keys", "-t", pane, "-l", instruction])
+    for _ in range(max(1, tries)):
+        sleep(interval)
+        if dispatch_landed(capture(), snippet):
+            return True
+        run(base + ["send-keys", "-t", pane, "Enter"])
+    return dispatch_landed(capture(), snippet)
 
 
 def assemble_dispatch_prompt(bead_id, title, description, worktree, branch, model) -> str:
@@ -163,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--worktree", help="existing worktree path (else bd worktree create)")
     p.add_argument("--model", help="model or 'model:reason' override")
     p.add_argument("--scope", help="short name for the worktree (else derived from bead)")
+    p.add_argument("--lane", help="lane manager identity stamped on the worker "
+                                  "(default: $CLAUDE_AGENT_NAME of the invoking pane)")
     p.add_argument("--session", default=os.environ.get("SABLE_TMUX_SESSION") or DEFAULT_SESSION)
     p.add_argument("--skip-governance", action="store_true")
     ns = p.parse_args(sys.argv[1:] if argv is None else argv)
@@ -207,23 +299,34 @@ def main(argv: list[str] | None = None) -> int:
         bid, bead.get("title", ""), bead.get("description", ""),
         worktree, branch, model))
 
-    # --- open the worker window + capture its pane id ---
+    # --- open the worker window (stamped with the lane identity) + capture pane ---
+    lane = resolve_lane(ns.lane)
     win = window_name(bid)
     wcmd = worker_command(model, os.environ.get("SABLE_WORKER_CMD"))
     pane_id = _run(base + ["new-window", "-t", ns.session, "-n", win,
-                           "-c", worktree, "-P", "-F", "#{pane_id}", wcmd]).strip()
+                           "-c", worktree, *worker_env_args(lane),
+                           "-P", "-F", "#{pane_id}", wcmd]).strip()
 
     # --- tag the pane for the registry + reaper ---
     for key, val in (("@sable_role", "worker"), ("@sable_bead", bid),
                      ("@sable_status", "running")):
         subprocess.run(base + ["set-option", "-p", "-t", pane_id, key, val], check=True)
 
-    # --- deliver the single-line read-instruction as the worker's first turn ---
-    subprocess.run(base + ["send-keys", "-t", pane_id, "-l",
-                           read_instruction(str(dispatch_path))], check=True)
-    subprocess.run(base + ["send-keys", "-t", pane_id, "Enter"], check=True)
+    # --- deliver the read-instruction, beating the boot + dropped-Enter race
+    #     (SABLE-91m3): wait for the TUI to be ready, then submit with retries. ---
+    ready_timeout = float(os.environ.get("SABLE_DISPATCH_READY_TIMEOUT", "25"))
+    submit_tries = int(os.environ.get("SABLE_DISPATCH_SUBMIT_TRIES", "8"))
+    poll_interval = float(os.environ.get("SABLE_DISPATCH_POLL_INTERVAL", "1.0"))
+    if ready_timeout > 0:
+        wait_for_ready(base, pane_id, ready_timeout, interval=poll_interval)
+    delivered = deliver_dispatch(base, pane_id, read_instruction(str(dispatch_path)),
+                                 bid, tries=submit_tries, interval=poll_interval)
+    if not delivered:
+        sys.stderr.write(f"sable-spawn-worker: WARNING dispatch may be unsubmitted in "
+                         f"{pane_id}; nudge with: tmux send-keys -t {pane_id} Enter\n")
 
-    note = f" (model {model}" + (f", override: {reason}" if reason else "") + ")"
+    note = (f" (model {model}" + (f", override: {reason}" if reason else "")
+            + (f", lane {lane}" if lane else "") + ")")
     sys.stderr.write(f"sable-spawn-worker: spawned {win} for {bid} at {pane_id}{note}\n")
     return 0
 
