@@ -311,6 +311,17 @@ filling project B's backlog while project A drains its pool in EXECUTION — wit
 no cross-repo clobbering. `sable-mode set` also gitignores the state dir so the
 ephemeral file never appears as untracked.
 
+**Three planning modes (free entry).** The staged flow above is **Full** — the
+high-rigor specification mode. It has two siblings. **Quick** telescopes the gate
+to a single approval for small, well-specified asks (1–3 beads). **Discovery**
+(Mode 1, `/sable-discover`) is the strategic, business-lens partner *upstream* of
+both: it decides WHAT should exist across a set of candidate features, emitting a
+decision record + one charter per survivor (committed, durable) — not
+implementation beads. Entry is free: start at Discovery, Full, or Quick. A Full
+run launched on a Discovery charter starts at RESEARCH, its FRAMING already
+carried in (`sable-charter ingest`). Full design:
+[`PLANNING-MODES-DESIGN.md`](PLANNING-MODES-DESIGN.md).
+
 #### 3.6.2 Batch Creation with `--graph` — Correct Schema and Known Bugs
 
 `bd create --graph FILE` creates multiple issues in a single command from a JSON plan file. As of bd 0.63.3, the feature works but has two upstream bugs that affect reliability.

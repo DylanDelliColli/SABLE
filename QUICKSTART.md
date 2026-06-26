@@ -209,6 +209,15 @@ snippet if you run a merge queue. The full topology lives in
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) and
 [`ENTRY-POINTS-DESIGN.md`](ENTRY-POINTS-DESIGN.md).
 
+**Three planning modes (free entry).** `/sable-discover` is **Mode 1** — a
+strategic, business-lens partner that decides *what* to build across a set of
+candidate features and emits a decision record + one charter per survivor (durable
+markdown, not beads). `/sable-plan` is the specification half: **Full** (the five
+gated substages) and **Quick** (small, well-specified asks), both producing an
+executable backlog. Enter at any mode; a Full run started from a Discovery charter
+skips straight to RESEARCH. See
+[`PLANNING-MODES-DESIGN.md`](PLANNING-MODES-DESIGN.md).
+
 ### Teams topology (default when available)
 
 The Orchestration tier defaults to Claude Code's **Agent Teams** surface — managers and

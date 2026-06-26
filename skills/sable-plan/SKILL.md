@@ -34,6 +34,15 @@ tested, Fresh-Agent-Test-clean backlog — only the ceremony scales to the work.
 > bead fields. This holds in BOTH tiers; quick tier drops the interview ceremony,
 > not the human gate or the tests.
 
+> **Three planning modes, free entry.** This skill is the *specification* half —
+> **Quick** and **Full**, two rigor levels that both output an executable backlog.
+> The third mode, **Discovery** (`/sable-discover`), is the *strategic* half: a
+> business-lens partner that decides WHAT should exist across a set of candidates
+> and emits charters, not beads. Entry is free — start at Discovery, Full, or
+> Quick directly; there is no mandatory ladder. A Full run launched on a Discovery
+> charter starts at RESEARCH (its FRAMING already carried in via
+> `sable-charter ingest`). See `PLANNING-MODES-DESIGN.md`.
+
 ## 0. Size the ask — propose a tier
 
 Read the ask and **propose** a tier with `AskUserQuestion`; the human confirms
