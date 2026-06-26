@@ -266,3 +266,35 @@ def list_charters(base: str | None = None) -> list:
     if not d.exists():
         return []
     return sorted(p for p in d.glob("*.md") if not p.name.endswith("-decisions.md"))
+
+
+# --- Full ingestion seam (SABLE-7v1r.3) ------------------------------------
+
+def find_charter_for_epic(epic_id: str, base: str | None = None) -> Charter | None:
+    """The charter whose epic_intention matches this epic, or None. Lets a Full
+    run launched on a Discovery epic-intention shell load FRAMING from the charter
+    instead of generating it cold; None means fall back to cold framing."""
+    for p in list_charters(base):
+        try:
+            c = Charter.from_markdown(p.read_text())
+        except Exception:
+            continue
+        if c.epic_intention == epic_id:
+            return c
+    return None
+
+
+def framing_fields(charter: Charter) -> dict:
+    """Map a charter onto Full's FRAMING outputs (wedge, success metric, non-goals,
+    user-story context)."""
+    return {
+        "charter_slug": charter.slug,
+        "title": charter.title,
+        "epic_intention": charter.epic_intention,
+        "wedge": charter.target_user_and_wedge,
+        "success_metric": charter.success_metric,
+        "non_goals": charter.non_goals,
+        "user_story_context": "\n\n".join(
+            x for x in (charter.problem_statement, charter.demand_evidence) if x
+        ),
+    }

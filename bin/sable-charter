@@ -44,6 +44,8 @@ def main(argv=None):
     loc = sub.add_parser("locate")
     loc.add_argument("slug")
     sub.add_parser("list")
+    ing = sub.add_parser("ingest")
+    ing.add_argument("epic")
     args = ap.parse_args(argv)
 
     if args.cmd == "dir":
@@ -74,6 +76,14 @@ def main(argv=None):
     if args.cmd == "list":
         for p in lib.list_charters():
             print(p)
+        return 0
+
+    if args.cmd == "ingest":
+        c = lib.find_charter_for_epic(args.epic)
+        if c is None:
+            print(f"sable-charter: no charter for epic '{args.epic}'", file=sys.stderr)
+            return 1
+        print(json.dumps(lib.framing_fields(c), indent=2))
         return 0
 
     return 1

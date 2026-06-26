@@ -101,6 +101,15 @@ metric, the narrowest valuable wedge. Stand up the bare epic shell and record th
 framing artifact on it. (This is the strategist identity expressed in planning —
 same essence that does status/arbitration in execution.)
 
+**Charter ingestion (Discovery composition).** Before generating framing cold,
+check whether this epic came from a Discovery charter: run
+`sable-charter ingest <epic-id>`. If it returns framing fields (a charter whose
+`epic_intention` matches this epic exists), FRAMING is already done — record those
+fields as the framing artifact on the epic and skip straight ahead with
+`sable-mode substage set research`. Only generate framing as above when ingest
+returns nothing (exits nonzero). See PLANNING-MODES-DESIGN.md for the
+Discovery→Full seam.
+
 ### RESEARCH — owner: sherlock subagent (greenfield mode); fallback: `/deep-research`
 Prior art, domain pitfalls, unknowns to de-risk. Spawn the **sherlock** named
 subagent with the research scope in the spawn prompt (e.g. "scope: --research
