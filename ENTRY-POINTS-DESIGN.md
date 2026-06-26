@@ -1,10 +1,15 @@
 # SABLE Entry Points — Design (onboarding + small-ask planning)
 
-> **Status: design — 2026-06-16.** Reference artifact for the two main
-> interaction points into SABLE: **install** (how you get in) and **`/sable-plan`**
-> (how you start a unit of work). Extends [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md).
-> The execution contract is the beads, not this file; this doc exists so a fresh
-> agent understands *why* the entry points are shaped this way.
+> **Status: design — 2026-06-16 (planning entry points updated 2026-06-26).**
+> Reference artifact for the interaction points into SABLE: **install** (how you
+> get in) and the **planning doors** (how you start a unit of work). Planning now
+> has **three modes with free entry** — **`/sable-discover`** (Mode 1: strategic,
+> business-lens; decides *what* to build, emits charters), and **`/sable-plan`**
+> (the specification half: Full and Quick). See
+> [`PLANNING-MODES-DESIGN.md`](PLANNING-MODES-DESIGN.md). Extends
+> [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md). The execution contract is
+> the beads, not this file; this doc exists so a fresh agent understands *why* the
+> entry points are shaped this way.
 >
 > **Reconciliation with v3 (`SABLE-d50`):** the install work here **supersedes**
 > the inline-and-delete plan in `SABLE-ppy`/`SABLE-iw0` with a front-door +

@@ -135,6 +135,14 @@ session-shaped — see the "Chuck hybrid holdout" section in
 | **Planning** | fill & groom the pool via the staged substages (FRAMING → RESEARCH → ARCHITECTURE → TEST-STRATEGY → DECOMPOSITION) | Lincoln runs the substage machine; Tier-2 producers invoked on demand; interlock blocks execution dispatches until `substage=decomposition` |
 | **Execution** | drain the bead pool | Teams (default): Lincoln spawns Optimus, Tarzan, Chuck as team members — each manager can self-dispatch workers and self-push approved lanes; Chuck folds in, no second terminal. Nested fallback: Optimus + Tarzan as resident subagents, Chuck in second terminal |
 
+> **Planning has three modes (free entry).** The Planning row above is the **Full**
+> mode (the high-rigor five-substage flow). Its siblings: **Quick** (telescopes the
+> gate to a single approval for small, well-specified asks) and **Discovery**
+> (Mode 1, `/sable-discover`) — the strategic, business-lens partner *upstream* of
+> both that decides WHAT should exist across a candidate set and emits charters
+> (not beads). A Full run started from a Discovery charter begins at RESEARCH. Full
+> model: [`PLANNING-MODES-DESIGN.md`](PLANNING-MODES-DESIGN.md).
+
 Planning is staged, not a single step. The five substages are:
 
 - **FRAMING** (Lincoln strategist hat, live conversation)

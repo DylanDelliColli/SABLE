@@ -8,7 +8,7 @@ Contents:
 - `skills/audit-deep-dive/SKILL.md` — Claude Code skill for converting AUDIT: beads into epic+children
 - `skills/columbo/SKILL.md` + `skills/columbo/columbo-prefilter.py` — Claude Code skill that delivers the Columbo test-coverage planning workflow without requiring the multi-manager registry, role files, agent identity, or coordination hooks. Use this on machines where you want Columbo's interview + skeleton-test output but not the full multi-manager pattern (typical for work computers where you bounce between many repos). Invokable as `/columbo` once installed at `~/.claude/skills/columbo/`.
 - `MULTI-MANAGER-PATTERN.md` — experimental coordination pattern for power-user multi-agent swarms. Eight-agent roster: continuous execution managers (Optimus / Tarzan / Chuck), session-scoped planning agents (Sherlock / Victor / Rudy / Columbo), and execution-session strategist (Lincoln). Companion `hooks/multi-manager/`, `templates/multi-manager/`, `bin/columbo-prefilter.py` (Columbo's audit-mode triage tool), and `bin/sable-agents` reminder helper.
-- `MULTI-MANAGER-PATTERN.md` + orchestration tooling — v3 one-window topology: teams surface is the default (Optimus, Tarzan, and Chuck as live team members — Chuck folds in, no second terminal); nested subagents are the automatic fallback when `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is absent. Planning is a five-stage gated machine (framing → research → architecture → test-strategy → decomposition) controlled by `/sable-plan` and `/sable-execute`. Companion `bin/sable-mode`, `hooks/multi-manager/mode-interlock.sh`, `skills/sable-plan`, `skills/sable-execute`. See install step 4 below.
+- `MULTI-MANAGER-PATTERN.md` + orchestration tooling — v3 one-window topology: teams surface is the default (Optimus, Tarzan, and Chuck as live team members — Chuck folds in, no second terminal); nested subagents are the automatic fallback when `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is absent. Planning has three modes with free entry (see PLANNING-MODES-DESIGN.md): Discovery (`/sable-discover`, Mode 1 — strategic/business-lens, decides *what* to build and emits charters), plus the specification half — Full (the five-stage gated machine: framing → research → architecture → test-strategy → decomposition) and Quick — both via `/sable-plan`; `/sable-execute` drains. Companion `bin/sable-mode`, `bin/sable-charter`, `hooks/multi-manager/mode-interlock.sh`, `skills/sable-plan`, `skills/sable-discover`, `skills/sable-execute`. See install step 4 below.
 
 ## Columbo: skill vs. multi-manager pattern
 
@@ -107,9 +107,11 @@ Files:
 
 ### 4. Orchestration (Planning/Execution UI — extends the Multi-Manager Pattern)
 
-The orchestration tier is a single operator-facing session over the roster: `/sable-plan` fills
-the bead pool via the Tier-2 producers, `/sable-execute` drains it via the manager
-swarm. The installer is **self-sufficient** — it installs its own registry
+The orchestration tier is a single operator-facing session over the roster.
+Planning has three free-entry modes ([`PLANNING-MODES-DESIGN.md`](PLANNING-MODES-DESIGN.md)):
+`/sable-discover` (Mode 1) decides *what* to build and emits charters; `/sable-plan`
+fills the bead pool via Full or Quick (Tier-2 producers); `/sable-execute` drains it
+via the manager swarm. The installer is **self-sufficient** — it installs its own registry
 (`agents.yaml`) and identity injection, so orchestration identity works standalone;
 the full *running* manager swarm (step 3) is optional. Full rationale in
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md); the surface is summarized in
@@ -118,6 +120,7 @@ the full *running* manager swarm (step 3) is optional. Full rationale in
 Files:
 - `bin/sable-mode` — mode-state read/write helper (python3, no jq); **per-repo** source of truth at `<repo>/.claude/sable/state/mode-state.json` (resolved from the git common-dir so worktrees share it; `~/.claude/sable/state/mode-state.json` fallback outside a git repo; `SABLE_MODE_STATE` overrides) — lets concurrent SABLE sessions in different repos keep independent modes. `sable-mode path` prints the resolved path. Honors the `SABLE_ORCHESTRATION` off-switch.
 - `skills/sable-plan/SKILL.md`, `skills/sable-execute/SKILL.md` — the `/sable-plan` and `/sable-execute` mode-flip skills
+- `skills/sable-discover/SKILL.md` — `/sable-discover`, the Discovery (Mode 1) planning door; `bin/sable-charter` + `bin/sable-discover-emit` write the durable charter/decision artifacts under `.claude/sable/charters/`
 - `templates/multi-manager/roles/lincoln.md` — Lincoln identity (strategist + fleet launch)
 - `templates/multi-manager/agents.yaml` — the agent registry / source of truth (Lincoln is registered here)
 - `hooks/multi-manager/mode-interlock.sh` — the mode interlock (PreToolUse:Bash); honors `SABLE_ORCHESTRATION=off`
