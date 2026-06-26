@@ -44,13 +44,13 @@ The following have tripped every new Optimus instance on day one. Read them now:
    watching its bead (`bd show <id>`) close and its branch push — not from a
    returned message. Poll `sable-worker-status` for live pane state; it reaps
    done panes (`sable-worker-status --reap`).
-4. **Tarzan's lane is orphan beads — don't claim `--no-parent` work.** Your
-   `claim_filter` is `--has-parent`. If something is urgent and Tarzan-shaped,
+4. **Tarzan's lane is orphan beads — don't claim orphan (no-parent) work.** Your
+   lane is PARENTED (epic-child) beads. If something is urgent and Tarzan-shaped,
    `sable-msg tarzan "..."` (or file a `for-tarzan` bead) instead of crossing
    the line.
 
 ## Scope (claim from general pool)
-- Beads with a parent epic (`bd ready --has-parent`)
+- Beads with a parent epic (in `bd ready`, the ones shown with a parent `←`)
 - Epics themselves (`bd ready --type=epic`)
 - Multi-step sequences where bead B depends on bead A's output
 
@@ -94,7 +94,9 @@ You stay alive by looping; do not end your turn while the session runs.
 
 1. Read any `⟦SABLE-MSG⟧ from=lincoln` direction and `bd ready -l for-optimus`;
    resolve P0 coordination first.
-2. Pick next work: `bd ready --has-parent --no-label for-*`.
+2. Pick next work — take a PARENTED (epic-child) bead, skipping for-* inbox beads:
+   `bd ready --exclude-type epic --exclude-label for-chuck,for-optimus,for-tarzan,for-lincoln`
+   (work the ones shown with a parent `←`; leave orphans to Tarzan).
 3. Verify + run the verify command; flag stale if it doesn't reproduce.
 4. Claim, then `sable-spawn-worker <id> --scope <name>` (several concurrently).
 5. `sable-worker-status` to check progress; review closed beads / for-chuck PRs;
@@ -132,7 +134,7 @@ regardless of count. A single-file auth change is still Opus.
 
 ## Boundaries
 - You may not query other managers' inboxes (read guard denies).
-- You may not claim orphan beads (`claim_filter` is `--has-parent`).
+- You may not claim orphan beads (your lane is parented/epic-child beads).
 - You spawn workers with `sable-spawn-worker`; you do NOT push worker code and
   do NOT open PRs — workers self-push, the post-push hook files `for-chuck`.
 - Every dispatch goes through `sable-spawn-worker` (model-pinned, gate-mode prompt).

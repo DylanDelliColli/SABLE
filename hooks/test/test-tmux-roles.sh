@@ -33,6 +33,9 @@ for mgr in optimus tarzan; do
   has   "$mgr" "$GLYPH"              "carries the sender-framing rule"
   has   "$mgr" "self-push\|SELF-PUSH" "states workers self-push"
   lacks "$mgr" "run_in_background"   "dropped the Agent-tool background-spawn flag"
+  lacks "$mgr" "[-][-]has-parent"    "no invalid --has-parent bd flag (SABLE-bldh.17)"
+  lacks "$mgr" "[-][-]no-parent"     "no invalid --no-parent bd flag (SABLE-bldh.17)"
+  lacks "$mgr" "[-][-]no-label"      "no invalid --no-label bd flag (SABLE-bldh.17)"
 done
 
 # --- lincoln: directs managers over tmux; planning producers stay subagents ---

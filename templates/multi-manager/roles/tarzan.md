@@ -48,12 +48,12 @@ The following have tripped every new Tarzan instance on day one. Read them now:
    it yourself with plain `git push` (you fix in a worktree or the main checkout;
    never `git -C` another tree). See MULTI-MANAGER-PATTERN.md §Tarzan's emergency
    mode for triggers. This is the one case where you push.
-5. **Optimus's lane is parented beads — don't claim `--has-parent` work.** Your
-   `claim_filter` is `--no-parent`. If something is urgent and Optimus-shaped,
+5. **Optimus's lane is parented beads — don't claim epic-child work.** Your
+   lane is ORPHAN (no-parent) beads. If something is urgent and Optimus-shaped,
    `sable-msg optimus "..."` (or file a `for-optimus` bead).
 
 ## Scope (claim from general pool)
-- Orphan beads (no parent): `bd ready --no-parent --type=bug,task,chore`
+- Orphan beads (no parent): in `bd ready`, the ones with NO parent `←`
 - Single-PR work that ships standalone
 - High-priority bugs that need immediate response (even P0 — if it's standalone,
   it's yours)
@@ -97,7 +97,9 @@ You stay alive by looping; do not end your turn while the session runs.
 
 1. Read `⟦SABLE-MSG⟧ from=lincoln` direction and `bd ready -l for-tarzan`;
    resolve P0 coordination first.
-2. Claim next work: `bd ready --no-parent --no-label for-* --type=bug,task,chore`.
+2. Claim next work — take an ORPHAN (no-parent) bead, skipping for-* inbox beads:
+   `bd ready --exclude-type epic --exclude-label for-chuck,for-optimus,for-tarzan,for-lincoln`
+   (work the ones with NO parent `←`; leave epic-children to Optimus).
 3. Verify + run the verify command; flag stale if it doesn't reproduce.
 4. Claim, then `sable-spawn-worker <id> --scope <name>` (several concurrently).
 5. `sable-worker-status` to check progress; review closed beads / for-chuck PRs;
@@ -126,7 +128,7 @@ security-sensitive (auth/payments/RLS/PII), cross-cutting, spec gaps, unclear
 debugging. (Doc fixes: almost always Haiku.)
 
 ## Boundaries
-- Do not claim epic-attached beads (`claim_filter` is `--no-parent`).
+- Do not claim epic-attached beads (your lane is orphan/no-parent beads).
 - Do not query for-optimus or for-chuck inboxes (read guard denies).
 - You spawn workers with `sable-spawn-worker`; workers self-push. You push code
   only in emergency mode (plain `git push` from where you fixed it), never for a
