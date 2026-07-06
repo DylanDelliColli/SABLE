@@ -45,7 +45,8 @@ exists "$P/.claude/sable/roles/lincoln.md"  "project: lincoln role installed"
 exists "$P/.claude/sable/roles/optimus.md"  "project: optimus pane role installed (tmux-native)"
 exists "$P/.claude/sable/roles/tarzan.md"   "project: tarzan pane role installed (tmux-native)"
 exists "$P/.claude/sable/roles/chuck.md"    "project: chuck pane role installed (tmux-native)"
-if [ -e "$P/.claude/agents-teams/chuck.md" ]; then pass "project default: agents-teams defs always installed"; else fail "project default: agents-teams defs always installed" "chuck.md missing from $P/.claude/agents-teams/"; fi
+if [ ! -e "$P/.claude/agents-teams" ]; then pass "project: agents-teams defs NOT installed (tmux-only)"; else fail "project: agents-teams defs NOT installed (tmux-only)" "unexpected $P/.claude/agents-teams/"; fi
+if printf '%s' "$out1" | grep -q "sable-tmux"; then pass "project: install output points at the sable-tmux bring-up"; else fail "project: install output points at the sable-tmux bring-up" "no sable-tmux mention"; fi
 if [ -x "$P/.claude/hooks/multi-manager/mode-interlock.sh" ]; then pass "project: interlock hook installed+exec"; else fail "project: interlock hook installed+exec"; fi
 SET="$P/.claude/settings.local.json"
 exists "$SET" "project: settings.local.json created"
@@ -71,19 +72,25 @@ PY
 SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project >/dev/null 2>&1
 if grep -q 'other-hook.sh' "$SET"; then pass "project: preserves existing hooks"; else fail "project: preserves existing hooks"; fi
 
-# ---------- default scope is project; default topology is teams ----------
+# ---------- default scope is project; there is NO topology choice ----------
 P2="$(mktemp -d)"
 SABLE_PROJECT_DIR="$P2" bash "$INSTALLER" >/dev/null 2>&1
 exists "$P2/.claude/skills/sable-plan/SKILL.md" "default (no flag) installs into project ./.claude"
-if [ -e "$P2/.claude/agents-teams/chuck.md" ]; then pass "default topology teams: agents-teams defs installed"; else fail "default topology teams: agents-teams defs installed" "chuck.md missing"; fi
+if [ ! -e "$P2/.claude/agents-teams" ]; then pass "default install: no agents-teams defs (tmux-only)"; else fail "default install: no agents-teams defs (tmux-only)" "unexpected agents-teams/"; fi
 SET2="$P2/.claude/settings.local.json"
-if [ "$(count_marker "$SET2" inbox-injection)" -ge 1 ]; then pass "default topology teams: governance hooks in settings"; else fail "default topology teams: governance hooks in settings" "count=$(count_marker "$SET2" inbox-injection)"; fi
+if [ "$(count_marker "$SET2" pre-push-rebase-test)" -ge 1 ]; then pass "default install: governance hooks in settings"; else fail "default install: governance hooks in settings" "count=$(count_marker "$SET2" pre-push-rebase-test)"; fi
 
-# --nested alias installs agents-teams defs (same as --subagent)
-PN="$(mktemp -d)"
-SABLE_PROJECT_DIR="$PN" bash "$INSTALLER" --nested >/dev/null 2>&1
-if [ -e "$PN/.claude/agents-teams/chuck.md" ]; then pass "--nested alias: agents-teams defs installed"; else fail "--nested alias: agents-teams defs installed" "chuck.md missing"; fi
-rm -rf "$PN" "$P2"
+# retired topology flags are rejected with a clear error (tmux is the only topology)
+for _flag in --teams --subagent --nested; do
+  PN="$(mktemp -d)"
+  if SABLE_PROJECT_DIR="$PN" bash "$INSTALLER" "$_flag" >/dev/null 2>&1; then
+    fail "retired topology flag $_flag is rejected" "installer exited 0"
+  else
+    pass "retired topology flag $_flag is rejected"
+  fi
+  rm -rf "$PN"
+done
+rm -rf "$P2"
 
 # ---------- user scope ----------
 U="$(mktemp -d)"
@@ -93,11 +100,13 @@ exists "$U/.claude/settings.json" "user: settings.json created"
 if [ "$(count_interlock "$U/.claude/settings.json")" = "2" ]; then pass "user: interlock registered on both legs"; else fail "user: interlock registered on both legs" "count=$(count_interlock "$U/.claude/settings.json")"; fi
 
 # ---------- uninstall (project) ----------
+# seed a legacy agents-teams dir from a pre-tmux-only install: uninstall must still clean it
+mkdir -p "$P/.claude/agents-teams"; touch "$P/.claude/agents-teams/chuck.md"
 SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --uninstall >/dev/null 2>&1
 if [ ! -e "$P/.claude/skills/sable-plan/SKILL.md" ]; then pass "uninstall removes skills"; else fail "uninstall removes skills"; fi
 if [ ! -e "$P/.claude/sable/agents.yaml" ]; then pass "uninstall removes registry"; else fail "uninstall removes registry"; fi
 if [ ! -e "$P/.claude/sable/roles/optimus.md" ] && [ ! -e "$P/.claude/sable/roles/chuck.md" ]; then pass "uninstall removes tmux-native pane roles"; else fail "uninstall removes tmux-native pane roles"; fi
-if [ ! -e "$P/.claude/agents-teams/chuck.md" ]; then pass "uninstall removes teams agent defs"; else fail "uninstall removes teams agent defs"; fi
+if [ ! -e "$P/.claude/agents-teams" ]; then pass "uninstall cleans up legacy agents-teams defs"; else fail "uninstall cleans up legacy agents-teams defs"; fi
 if [ "$(count_interlock "$SET")" = "0" ]; then pass "uninstall de-registers interlock"; else fail "uninstall de-registers interlock" "count=$(count_interlock "$SET")"; fi
 if [ "$(count_marker "$SET" session-role-anchor.sh)" = "0" ]; then pass "uninstall de-registers identity hook"; else fail "uninstall de-registers identity hook" "count=$(count_marker "$SET" session-role-anchor.sh)"; fi
 if grep -q 'other-hook.sh' "$SET"; then pass "uninstall keeps unrelated hooks"; else fail "uninstall keeps unrelated hooks"; fi
@@ -157,14 +166,12 @@ if [ "$(count_interlock "$MSET")" = "2" ]; then pass "md7: multi-manager re-inst
 if [ "$(count_marker "$MSET" 'bd prime')" = "2" ]; then pass "md7: multi-manager re-install — bd prime preserved"; else fail "md7: multi-manager re-install — bd prime preserved" "count=$(count_marker "$MSET" 'bd prime')"; fi
 if valid_json "$MSET"; then pass "md7: settings valid after multi-manager re-install"; else fail "md7: settings valid after multi-manager re-install"; fi
 
-# ---------- SABLE-ppy: teams topology installs member defs + warns on the flag ----------
-WARNDIR="$(mktemp -d)"
-WARN_OUT="$(env -u CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS SABLE_PROJECT_DIR="$WARNDIR" bash "$INSTALLER" --teams --project 2>&1)"
-if printf '%s' "$WARN_OUT" | grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"; then pass "teams install warns when the experimental flag is unset"; else fail "teams install warns when the experimental flag is unset" "no warning in output"; fi
-exists "$WARNDIR/.claude/agents-teams/optimus.md" "teams install: agents-teams member defs present"
-WSET="$WARNDIR/.claude/settings.local.json"
-if [ "$(count_marker "$WSET" inbox-injection)" -ge 1 ]; then pass "teams install: governance hooks present in settings"; else fail "teams install: governance hooks present" "count=$(count_marker "$WSET" inbox-injection)"; fi
-rm -rf "$WARNDIR"
+# ---------- SABLE-qa4d.2: no teams residue in a fresh install ----------
+TMONLY="$(mktemp -d)"
+TM_OUT="$(SABLE_PROJECT_DIR="$TMONLY" bash "$INSTALLER" --project 2>&1)"
+if printf '%s' "$TM_OUT" | grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"; then fail "install output has no experimental-teams-flag instruction" "flag instruction still printed"; else pass "install output has no experimental-teams-flag instruction"; fi
+if printf '%s' "$TM_OUT" | grep -qi "topology"; then fail "install output does not speak of topologies" "topology wording still printed"; else pass "install output does not speak of topologies"; fi
+rm -rf "$TMONLY"
 
 rm -rf "$P" "$P2" "$U" "$PU" "$M"
 echo

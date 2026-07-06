@@ -3,22 +3,19 @@
 #
 # Installs the full manager-tier layer into ./.claude (project, default) or
 # ~/.claude (--user): all multi-manager hooks, the agents.yaml registry, the SABLE
-# skills (/sable-plan, /sable-execute, /columbo, /gaudi, ...), the lincoln role +
-# identity injection, and — for the teams topology — the agents-teams member defs.
-# The matching settings snippet is merged idempotently into the scope's settings
-# file (backed up + validated; existing entries never clobbered).
+# skills (/sable-plan, /sable-execute, /columbo, /gaudi, ...), and the four
+# warm-pane roles (lincoln, optimus, tarzan, chuck) with identity injection.
+# The settings snippet is merged idempotently into the scope's settings file
+# (backed up + validated; existing entries never clobbered).
 #
-# Topology (--teams default | --subagent/--nested opts out): selects the settings snippet.
-# Teams installs agents-teams/ member defs and the governance snippet (inbox-injection,
-# read-guard). agents-teams/ defs are ALWAYS installed regardless of topology so the
-# runtime fallback works. The CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 line is the
-# one thing this can't safely auto-write — it is PRINTED for you to add.
+# Execution runs on the tmux warm-pane topology — the only topology (see
+# TMUX-AGENTS-DESIGN.md): bring the session up with `sable-tmux --autostart`.
 #
 # install.sh delegates here for the Orchestration tier; you can also run it directly.
 # Turn orchestration off at runtime WITHOUT uninstalling: export SABLE_ORCHESTRATION=off
 #
 # Usage:
-#   sable-orchestration-install [--project|--user] [--teams|--subagent|--nested] [--uninstall] [--help]
+#   sable-orchestration-install [--project|--user] [--uninstall] [--help]
 #
 # Env (mainly for tests):
 #   SABLE_PROJECT_DIR   project root for --project scope (default: $PWD)
@@ -30,21 +27,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 usage() {
-    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 SCOPE="project"
-TOPOLOGY="teams"
 UNINSTALL=0
 for arg in "${@:-}"; do
     case "$arg" in
         --project)          SCOPE="project" ;;
         --user)             SCOPE="user" ;;
-        --subagent|--nested) TOPOLOGY="subagent" ;;
-        --teams)            TOPOLOGY="teams" ;;
         --uninstall)        UNINSTALL=1 ;;
         -h|--help)          usage; exit 0 ;;
         "")                 ;;
+        --teams|--subagent|--nested)
+            echo "sable-orchestration-install: '$arg' was retired — the tmux warm-pane path is the only execution layout (see TMUX-AGENTS-DESIGN.md)" >&2; exit 1 ;;
         *)                  echo "sable-orchestration-install: unknown argument '$arg'" >&2; exit 1 ;;
     esac
 done
@@ -59,11 +55,7 @@ else
 fi
 SKILLS="$BASE/skills"
 HOOKS_DIR="$BASE/hooks/multi-manager"
-if [ "$TOPOLOGY" = "teams" ]; then
-    SNIPPET="$REPO/templates/multi-manager/settings-snippet-teams.json"
-else
-    SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
-fi
+SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 
 # Merge a settings snippet's hooks into the target settings file, idempotently.
 # Rewrites the snippet's ~/.claude paths to the install BASE. Idempotency keys on
@@ -154,6 +146,8 @@ EOF
     rm -f "$BASE/sable/roles/lincoln.md" "$BASE/sable/roles/optimus.md" \
           "$BASE/sable/roles/tarzan.md" "$BASE/sable/roles/chuck.md" \
           "$BASE/sable/roles/cockpit.md" "$BASE/sable/agents.yaml"
+    # agents-teams/ is no longer installed; the rm below cleans up installs
+    # that predate the tmux-only layer.
     rm -rf "$HOOKS_DIR" "$BASE/agents-teams"
     remove_layer_hooks "$SETTINGS"
     echo "Orchestration layer uninstalled from $BASE (scope: $SCOPE)."
@@ -191,25 +185,13 @@ for skdir in "$REPO"/skills/*/; do
     for f in "${skdir}"*; do [ -f "$f" ] && cp "$f" "$SKILLS/$skname/$(basename "$f")"; done
 done
 
-# Always install agents-teams/ member defs so /sable-execute can inline-spawn them
-# and so teams-when-available / nested-otherwise runtime fallback works.
-mkdir -p "$BASE/agents-teams"
-cp "$REPO"/templates/agents-teams/*.md "$BASE/agents-teams/"
-
-# Merge the topology-appropriate settings snippet.
+# Merge the settings snippet.
 merge_snippet "$SETTINGS" "$SNIPPET" "$BASE"
 
-echo "Orchestration layer installed to $BASE (scope: $SCOPE, topology: $TOPOLOGY)."
-echo "  • All multi-manager hooks + agents.yaml + SABLE skills + lincoln role installed."
-echo "  • agents-teams/ member defs installed (always present for runtime fallback)."
+echo "Orchestration layer installed to $BASE (scope: $SCOPE)."
+echo "  • All multi-manager hooks + agents.yaml + SABLE skills + the four pane roles installed."
 echo "  • Settings snippet ($(basename "$SNIPPET")) merged into $SETTINGS (existing entries kept)."
 echo "  • /sable-plan and /sable-execute become available after you restart the session."
-if [ "$TOPOLOGY" = "teams" ]; then
-    if [ "${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-}" != "1" ]; then
-        echo "  • ACTION REQUIRED for teams topology: add this to settings.json env, then restart:"
-        echo "        \"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS\": \"1\""
-        echo "    (and export SABLE_TEAMS=1). This is the one line we won't auto-write."
-    fi
-fi
+echo "  • Bring up the warm-pane session:  sable-tmux --autostart   (then: tmux attach -t sable)"
 echo "  • Disable anytime without uninstalling:  export SABLE_ORCHESTRATION=off"
 echo "  • Uninstall:  sable-orchestration-install --$SCOPE --uninstall"
