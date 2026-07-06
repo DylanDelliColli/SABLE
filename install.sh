@@ -199,7 +199,9 @@ AGENTS_SRC="${TEMPLATE_DIR}/agents"
 AGENTS_DST="${CLAUDE_DIR}/agents"
 if [ -d "${AGENTS_SRC}" ]; then
     make_dir "${AGENTS_DST}"
-    SABLE_AGENT_NAMES="columbo optimus rudy sherlock tarzan victor"
+    # Producers only — managers (optimus/tarzan/chuck) are tmux panes whose
+    # identity comes from role files, not agent definitions (SABLE-qa4d.5).
+    SABLE_AGENT_NAMES="columbo rudy sherlock victor"
     for name in ${SABLE_AGENT_NAMES}; do
         src="${AGENTS_SRC}/${name}.md"
         dst="${AGENTS_DST}/${name}.md"

@@ -32,7 +32,9 @@ else
   fail "--orchestration installs the multi-manager hooks" "missing under $TH/.claude/hooks/multi-manager/"
 fi
 if [ -f "$TH/.claude/sable/agents.yaml" ]; then pass "--orchestration installs the agents.yaml registry"; else fail "--orchestration installs the agents.yaml registry"; fi
-if grep -qE "^tools:.*Agent" "$TH/.claude/agents/optimus.md" 2>/dev/null; then pass "--orchestration ships optimus.md with the Agent tool grant"; else fail "--orchestration ships optimus.md with the Agent tool grant"; fi
+# Managers are warm panes (SABLE-qa4d.5): their role files install under
+# sable/roles/, and no manager agent def lands in agents/.
+if [ -f "$TH/.claude/sable/roles/optimus.md" ] && [ ! -e "$TH/.claude/agents/optimus.md" ]; then pass "--orchestration ships optimus as a pane role, not an agent def"; else fail "--orchestration ships optimus as a pane role, not an agent def"; fi
 # Skills install by frontmatter name (sable-plan -> plan, sable-execute -> execute).
 if [ -f "$TH/.claude/skills/sable-plan/SKILL.md" ] && [ -f "$TH/.claude/skills/sable-execute/SKILL.md" ] && [ -f "$TH/.claude/skills/columbo/SKILL.md" ] && [ -f "$TH/.claude/skills/gaudi/SKILL.md" ]; then
   pass "--orchestration installs SABLE skills by frontmatter name (plan/execute/columbo/gaudi)"

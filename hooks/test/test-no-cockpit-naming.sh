@@ -68,7 +68,6 @@ for f in skills/sable-plan/SKILL.md \
          skills/sable-execute/SKILL.md \
          templates/multi-manager/roles/sherlock.md \
          templates/agents/sherlock.md \
-         templates/agents-teams/sherlock.md \
          SABLE.md \
          hooks/multi-manager/session-role-anchor.sh; do
   lacks "$f" "cockpit"

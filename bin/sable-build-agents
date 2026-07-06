@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""sable-build-agents — generate custom agent definitions from SABLE role files.
+"""sable-build-agents — generate producer agent definitions from SABLE role files.
 
 The role files under templates/multi-manager/roles/ remain the single source of
-truth (legacy env-var launches and Chuck's terminal still read them). This
-script wraps each converted role in agent-definition frontmatter and a v2
-invocation preamble, writing templates/agents/<name>.md.
+truth. This script wraps each PRODUCER role (sherlock, victor, rudy, columbo) in
+agent-definition frontmatter and the v2 invocation preamble, writing
+templates/agents/<name>.md. Producers are the only roles spawned via the Agent
+tool (planning sessions); the execution roles — lincoln, optimus, tarzan, chuck —
+are warm tmux panes whose identity is injected from their role files by
+session-role-anchor, so they have no agent definitions.
 
 Edit the ROLE FILE and re-run this script; never hand-edit the generated files.
 hooks/test/test-agent-definitions.sh asserts generated == committed.
 
 Usage:
-  sable-build-agents [--mode nested|teams] [--out-dir DIR]
-      # nested (default) -> templates/agents/ ; teams -> templates/agents-teams/
+  sable-build-agents [--out-dir DIR]     # default: templates/agents/
 """
 
 import sys
@@ -19,28 +21,13 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 ROLES = REPO / "templates" / "multi-manager" / "roles"
-CARDS = REPO / "templates" / "multi-manager" / "cards"
 DEFAULT_OUT = REPO / "templates" / "agents"
-DEFAULT_OUT_TEAMS = REPO / "templates" / "agents-teams"
 
-# Agents converted to subagent definitions in SABLE v2.
-# Deliberately absent: chuck (env-var terminal holdout, SABLE-uz9.6),
-# lincoln (main-session role, anchored by name via session-role-anchor, not a
-# subagent definition — SABLE-uz9.5), gaudi (inline skill, not an agent —
-# decision on SABLE-uz9.2).
+# Producer agents converted to subagent definitions.
+# Deliberately absent: lincoln/optimus/tarzan/chuck (warm tmux panes — identity
+# via session-role-anchor from roles/<name>.md, SABLE-bldh/SABLE-qa4d) and gaudi
+# (inline skill, not an agent — decision on SABLE-uz9.2).
 AGENTS = {
-    "optimus": (
-        "Epic manager (SABLE execution lane). Plans, bundles, and reviews beads with a "
-        "parent epic; spawns workers natively via the Agent tool, reviews their "
-        "stopped-before-push results, and pushes approved work itself (git -C <worktree> "
-        "push). Issues APPROVE-PUSH/REVISE verdicts on its own lane."
-    ),
-    "tarzan": (
-        "One-off manager (SABLE execution lane). Plans, bundles, and reviews standalone "
-        "orphan beads — bugfixes, docs, small refactors; spawns workers natively via the "
-        "Agent tool, reviews stopped-before-push results, and pushes approved work itself. "
-        "Emergency mode: fixes swarm-blockers directly in its own context."
-    ),
     "sherlock": (
         "Read-only repo auditor producing exceptional finding beads — design rot, "
         "redundancy, verbosity, dead code, test gaps — or greenfield research findings "
@@ -84,77 +71,23 @@ PREAMBLE = """\
 > summary as your final message back to the spawning session.
 """
 
-# Managers (SABLE-uz9.11) are granted the Agent tool and dispatch their own
-# workers natively; the stale "NO Agent tool" line in PREAMBLE does not apply to
-# them. Nested spawn + nested PreToolUse:Agent firing confirmed on CC 2.1.177
-# (SABLE-uz9.8/uz9.9).
-MANAGER_NAMES = {"optimus", "tarzan"}
 
-# Explicit whitelist: declaring `tools:` restricts the agent to exactly this
-# set, and Agent is silently filtered unless named here (anthropic/claude-code
-# #47927). Generous superset covering bd/git (Bash), diff review (Read/Grep/Glob),
-# emergency in-context edits (Edit/Write), worker spawn (Agent), and skills/MCP
-# (Skill/ToolSearch/TodoWrite).
-MANAGER_TOOLS = "Agent, Bash, Edit, Glob, Grep, Read, Skill, TodoWrite, ToolSearch, Write"
-
-MANAGER_PREAMBLE = """\
-> **tmux warm-pane topology (SABLE-bldh).** You normally run as a real, warm
-> `claude` session in your own tmux pane, launched by `sable-tmux` with your
-> `CLAUDE_AGENT_NAME`. You dispatch workers with `sable-spawn-worker` (a new tmux
-> window + worktree, model-pinned), NOT the Agent tool; workers self-push their
-> own worktree branches and Chuck merges. You direct and are directed over
-> `sable-msg` (honor the sender-framing rule in the role body). The mode-interlock
-> gates `sable-spawn-worker` to execution mode; the model-check runs in the
-> helper. If you are instead invoked as a one-off subagent, your scope/mode
-> arrives in the spawn prompt — everything else in this role is binding.
-"""
-
-
-TEAMS_CARD = (CARDS / "teams-coordination.md").read_text()
-
-# chuck is excluded from the nested build (env-var merge terminal) but is a
-# persistent TEAMS member — the merge queue folds into the one-window team
-# (SABLE-amj.4). Teams members are spawned with name=<registry name>, so their
-# hook-input agent_type carries the role name and lib-identity resolves them
-# unchanged (SABLE-amj.2). The teams card is the per-member wrapper and
-# supersedes any nested polling/inbox coordination in the role body.
-TEAMS_EXTRA = {
-    "chuck": (
-        "Merge-queue integrator (SABLE execution lane). Shepherds pushed PRs from "
-        "ready-to-merge to merged-or-held: classifies conflicts (mechanical fix-in-place "
-        "vs semantic delegate-to-author), rebases/resolves/merges clean PRs, and files "
-        "for-author beads for semantic conflicts. Does not dispatch workers or claim from "
-        "the general pool."
-    ),
-}
-
-
-def build(out_dir: Path, mode: str = "nested") -> int:
+def build(out_dir: Path) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
-    agents = dict(AGENTS)
-    if mode == "teams":
-        agents.update(TEAMS_EXTRA)
-    for name, description in agents.items():
+    for name, description in AGENTS.items():
         role = ROLES / f"{name}.md"
         if not role.exists():
             print(f"ERROR: missing role file {role}", file=sys.stderr)
             return 1
         body = role.read_text()
-        is_manager = name in MANAGER_NAMES
-        tools_line = f"tools: {MANAGER_TOOLS}\n" if is_manager else ""
-        if mode == "teams":
-            wrapper = TEAMS_CARD  # generic card — no {name} substitution
-        else:
-            wrapper = (MANAGER_PREAMBLE if is_manager else PREAMBLE).format(name=name)
         generated = (
             "---\n"
             f"name: {name}\n"
             f"description: {description}\n"
-            f"{tools_line}"
             "---\n"
             f"<!-- GENERATED from templates/multi-manager/roles/{name}.md by "
             "bin/sable-build-agents — edit the role file and re-run; do not hand-edit. -->\n\n"
-            f"{wrapper}\n"
+            f"{PREAMBLE.format(name=name)}\n"
             f"{body}"
         )
         target = out_dir / f"{name}.md"
@@ -165,22 +98,13 @@ def build(out_dir: Path, mode: str = "nested") -> int:
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    mode = "nested"
     out = None
     i = 0
     while i < len(args):
-        if args[i] == "--mode" and i + 1 < len(args):
-            mode = args[i + 1]
-            i += 2
-        elif args[i] == "--out-dir" and i + 1 < len(args):
+        if args[i] == "--out-dir" and i + 1 < len(args):
             out = Path(args[i + 1])
             i += 2
         else:
             print(__doc__, file=sys.stderr)
             sys.exit(2)
-    if mode not in ("nested", "teams"):
-        print(f"unknown mode: {mode} (expected nested|teams)", file=sys.stderr)
-        sys.exit(2)
-    if out is None:
-        out = DEFAULT_OUT_TEAMS if mode == "teams" else DEFAULT_OUT
-    sys.exit(build(out, mode))
+    sys.exit(build(out or DEFAULT_OUT))

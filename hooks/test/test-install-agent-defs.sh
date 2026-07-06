@@ -18,7 +18,8 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 INSTALLER="$REPO/install.sh"
-SABLE_AGENTS="columbo optimus rudy sherlock tarzan victor"
+# Producers only (tmux-only, SABLE-qa4d.5): managers are panes, not agent defs.
+SABLE_AGENTS="columbo rudy sherlock victor"
 
 PASS=0; FAIL=0; FAIL_NAMES=""
 pass(){ PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -112,6 +113,11 @@ done
 for hook in tdd-gate.sh bead-description-gate.sh tdd-evidence.sh; do
     f="$T2/.claude/hooks/$hook"
     if [ -f "$f" ]; then pass "integration: hook $hook installed"; else fail "integration: hook $hook installed" "missing: $f"; fi
+done
+
+# Manager defs are NOT installed on a fresh HOME (managers are panes, SABLE-qa4d.5)
+for name in optimus tarzan chuck; do
+    if [ ! -e "$T2/.claude/agents/$name.md" ]; then pass "integration: $name.md not installed (managers are panes)"; else fail "integration: $name.md not installed (managers are panes)" "present: $T2/.claude/agents/$name.md"; fi
 done
 
 # ──────────────────────────────────────────────────────────────────────────────
