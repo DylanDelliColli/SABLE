@@ -178,20 +178,23 @@ Mechanics:
 
 Each manager launches with an immutable identity established at the OS level, not in conversation context.
 
-### Launching sessions (sable-tmux + sable-launch)
+### Launching sessions (sable-launch + sable-view)
 
-The normal bring-up is **`sable-tmux --autostart`**: it launches every execution
-role (lincoln, optimus, tarzan, chuck) as a warm pane with its identity set at
-the OS level — no aliases, no hand-typed env vars. Attach with
-`tmux attach -t sable`.
+The session door is **`sable-launch`**: it brings the warm-pane session up if
+absent (wrapping `sable-tmux --autostart` — every execution role launched as a
+pane with its identity set at the OS level, no aliases, no hand-typed env vars;
+existing sessions are reused) and attaches. Mid-session, **`sable-view`** is
+the peek tool: a status table of every agent pane and hidden worker window,
+`sable-view <role>` to focus one, `sable-view <role> --tail` to read one
+without switching. `sable --help` prints the whole operator map.
 
 For a **single role by hand** (a solo Lincoln session, or re-launching one
-pane), `sable-launch` is the one-command entry point — it sets the identity +
-role so a session never launches unnamed (the identity-bleed root cause,
-SABLE-njiv). With the repo `bin/` on your PATH (see PERSONAL-TOOLING.md):
+pane), the role form sets the identity + role so a session never launches
+unnamed (the identity-bleed root cause, SABLE-njiv). With the repo `bin/` on
+your PATH (see PERSONAL-TOOLING.md):
 
 ```bash
-sable-launch          # the lead (lincoln) — the pane you talk to
+sable-launch lincoln  # the lead — one identity claude session, no tmux
 sable-launch chuck    # the merge-queue role (normally a sable-tmux pane)
 ```
 

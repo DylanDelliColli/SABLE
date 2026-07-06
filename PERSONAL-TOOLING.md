@@ -25,8 +25,9 @@ After `git fetch` + `git checkout personal-tooling`:
 
 ### 1. SABLE CLI tools on PATH
 
-`bash install.sh` links the `sable-*` tools (`sable-launch`, `sable-note`,
-`sable-mode`, `sable-tmux`, `sable-msg`, ...) into `~/.local/bin` for you via
+`bash install.sh` links the `sable` umbrella plus the `sable-*` tools
+(`sable-launch`, `sable-view`, `sable-note`, `sable-mode`, `sable-msg`, ...)
+into `~/.local/bin` for you via
 `bin/sable-bin-install` (symlinks by default, so a tool resolves back to the repo —
 `sable-note` finds the repo feedback dir — and never goes stale). If `~/.local/bin`
 is on your PATH you are done: verify with `sable-note --help`.

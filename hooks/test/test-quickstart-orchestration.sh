@@ -17,8 +17,9 @@ hasno() { if grep -qF -- "$2" "$DOC" 2>/dev/null; then fail "$1" "unexpectedly p
 
 [ -f "$DOC" ] || { echo "FAIL: $DOC missing"; exit 2; }
 
-has "documents the --orchestration install flag"        "install.sh --orchestration"
-has "mentions the SABLE_ORCHESTRATION env toggle"  "SABLE_ORCHESTRATION=1"
+has "documents the single install command"         "bash install.sh"
+hasno "no --orchestration install flag remains"    "install.sh --orchestration"
+hasno "no SABLE_ORCHESTRATION tier toggle remains" "SABLE_ORCHESTRATION=1"
 has "documents the --dry-run flag"                 "--dry-run"
 has "has a Climbing to orchestration section"      "Climbing to orchestration"
 has "names the multi-manager hooks install dir"    ".claude/hooks/multi-manager"
@@ -30,12 +31,16 @@ has "links to the pattern doc for depth"           "MULTI-MANAGER-PATTERN.md"
 
 # tmux-only (SABLE-qa4d): the warm-pane bring-up is documented; the retired
 # topology fork and teams flag are gone.
-has   "documents the sable-tmux bring-up"          "sable-tmux --autostart"
+has   "documents the sable-tmux plumbing"          "sable-tmux"
 has   "documents attaching to the session"         "tmux attach"
 hasno "no teams experimental flag remains"         "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"
 hasno "no SABLE_TEAMS toggle remains"              "SABLE_TEAMS"
 hasno "no --subagent topology flag remains"        "--subagent"
-hasno "no --teams topology flag remains"           "install.sh --orchestration --teams"
+
+# memorable session doors + the umbrella (SABLE-ssws)
+has "teaches sable-launch as the session start"    "sable-launch"
+has "teaches sable-view as the mid-session peek"   "sable-view"
+has "points at the sable umbrella help"            "sable --help"
 
 echo
 echo "=========================================="

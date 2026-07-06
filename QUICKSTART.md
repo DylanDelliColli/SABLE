@@ -36,10 +36,12 @@ The install in this QUICKSTART is the same regardless of stage — all hooks, al
 2. **bd (beads) installed.** Install from https://github.com/steveyegge/beads#installation. Verify with `bd version`.
 3. **Dolt (bd's storage backend).** Install from https://docs.dolthub.com/introduction/installation. Required for `bd dolt push` (session-close protocol). The installer will warn if dolt is missing but won't block on it.
 4. **git ≥ 2.5** (worktrees are used by swarm execution).
-5. **bash** to execute the hook scripts:
-   - **Linux:** native bash.
-   - **macOS:** native bash 3.2+ (the installer script supports this).
-   - **Windows:** Git Bash (bundled with [Git for Windows](https://git-scm.com/download/win)) **or** WSL2. The PowerShell installer copies files but won't run hooks until bash is on PATH.
+5. **bash + tmux** — the hooks are bash scripts and the execution layer runs
+   every agent as a persistent `claude` session in a tmux pane:
+   - **Linux:** native bash; `apt install tmux` (or your package manager).
+   - **macOS:** native bash 3.2+; `brew install tmux`.
+   - **Windows:** **WSL2 only.** tmux does not exist on native Windows;
+     `install.ps1` is a guidance shim that points you into WSL.
 6. **Optional but recommended:** Docker (for spinning up local databases for integration tests).
 
 ---
@@ -57,31 +59,25 @@ cd ~/sable
 
 ### Step 2 — Run the installer
 
-**Linux, macOS, Windows (Git Bash or WSL):**
+**Linux, macOS, Windows (inside WSL):**
 ```bash
 bash install.sh
 ```
 
-**Windows (native PowerShell):**
-```powershell
-pwsh ./install.ps1     # PowerShell 7+, recommended
-# or, on stock Windows:
-powershell -ExecutionPolicy Bypass -File install.ps1
-```
+There is **one install** — no tiers, no topology choices. It:
+1. Verifies `bd` is on PATH (warns about missing dolt / tmux with install hints)
+2. Links the `sable-*` CLI tools onto your PATH (`~/.local/bin`, symlinks)
+3. Copies the base hook scripts into `~/.claude/hooks/`
+4. Copies the producer agent definitions into `~/.claude/agents/`
+5. Installs the orchestration layer (multi-manager hooks, `agents.yaml`
+   registry, the four pane role files, the SABLE skills) and auto-merges its
+   settings snippet (backed up; existing entries preserved)
+6. Prepends the SABLE Prime Directives to `~/.claude/CLAUDE.md` (with a timestamped backup if one already exists)
+7. Prints the base-hook JSON snippet you paste into `~/.claude/settings.json` (does NOT auto-edit that block — you review and paste)
 
-Both installers do the same thing:
-1. Verify `bd` is on PATH (and on Windows, that `bash` is available — warns if not)
-2. Copy the Foundation hook scripts into `~/.claude/hooks/` (`%USERPROFILE%\.claude\hooks\` on Windows)
-3. Copy the named agent definitions into `~/.claude/agents/`
-4. Prepend the SABLE Prime Directives to `~/.claude/CLAUDE.md` (with a timestamped backup if one already exists)
-5. Print the JSON snippet you paste into `~/.claude/settings.json` (does NOT auto-edit your settings — you review and paste, so existing config is never clobbered)
-
-Both are idempotent and safe to re-run. Useful flags:
-- `bash install.sh --dry-run` — report exactly what would be copied, write nothing.
-- `bash install.sh --orchestration` — also install the **Orchestration (multi-manager) tier**
-  (the one-window manager hooks + `agents.yaml` registry). Foundation adopters
-  skip this; climb to it when you're ready for swarm execution (see
-  [Climbing to orchestration](#climbing-to-orchestration-advanced) below).
+Idempotent and safe to re-run. `bash install.sh --dry-run` reports exactly what
+would be copied and writes nothing. On native Windows, `pwsh ./install.ps1`
+prints the WSL instructions and exits.
 
 If you'd rather do it manually, see [Manual install](#manual-install) below.
 
@@ -149,25 +145,17 @@ If `bd close` succeeded the first time without asking for tests, the hooks aren'
 
 ## Climbing to orchestration (advanced)
 
-Foundation gets you single-agent, sequential SABLE. The **Orchestration tier** is the top
-rung of the [adoption ramp](#adoption-ramp--the-install-is-the-same-the-practice-ramps-over-time):
+The orchestration layer is **installed by default** — climbing is about
+*practice*, not installing. It is the top rung of the
+[adoption ramp](#adoption-ramp--the-install-is-the-same-the-practice-ramps-over-time):
 the **tmux warm-pane topology**, where every role is a real, persistent `claude`
 session in its own tmux pane — you talk to *Lincoln* (the lead pane), the
 execution managers (*Optimus*, *Tarzan*) dispatch one ephemeral worker pane per
 bead, workers self-push their own worktree branches, and *Chuck* (the merge-queue
-pane) merges them. Climb here once your bead-writing is automatic and your usage
-budget supports parallel agents (see SABLE.md §6).
+pane) merges them. Start using it once your bead-writing is automatic and your
+usage budget supports parallel agents (see SABLE.md §6).
 
-**Install the Orchestration tier:**
-
-```bash
-cd ~/sable
-bash install.sh --orchestration              # the tmux warm-pane layer (the only topology)
-bash install.sh                              # no flag on a terminal → interactive tier prompt
-SABLE_ORCHESTRATION=1 bash install.sh        # non-interactive equivalent of --orchestration
-```
-
-This adds, on top of the Foundation install:
+The install already put in place:
 - `~/.claude/hooks/multi-manager/*.sh` — the governance hooks (pre-dispatch
   refresh/claim/overlap/preempt/model-check, the mode interlock, the
   pre-push gate, post-push notify, identity discrimination).
@@ -177,13 +165,13 @@ This adds, on top of the Foundation install:
 - `~/.claude/skills/` — the SABLE slash commands (`/sable-plan`, `/sable-execute`,
   `/gaudi`, `/columbo`, `/audit-deep-dive`, `/sable-review`), installed by their
   skill name.
-- The settings snippet is **merged into `~/.claude/settings.json`
+- The settings snippet, **merged into `~/.claude/settings.json`
   automatically** (backed up first; existing entries preserved).
-- The producer agent definitions are already in `~/.claude/agents/` from the
-  Foundation install.
+- The producer agent definitions in `~/.claude/agents/`.
 
-**Restart Claude Code** afterward so the agent definitions, slash commands, and
-hook registrations load.
+**Restart Claude Code** after installing so the agent definitions, slash
+commands, and hook registrations load. Lost? `sable --help` prints the whole
+operator map.
 
 **Verify orchestration:**
 
@@ -217,25 +205,28 @@ skips straight to RESEARCH. See
 
 ### The warm-pane session (the only topology)
 
-Execution runs in one tmux session with one persistent `claude` pane per role.
-`sable-tmux` lays it out, sets each pane's identity (`CLAUDE_AGENT_NAME`), and —
-with `--autostart` — kicks the autonomous roles (optimus / tarzan / chuck) into
-their operating loops:
+Two commands to remember:
 
 ```bash
-# Bring up the session (lincoln + optimus + tarzan + chuck panes):
-sable-tmux --autostart
-tmux attach -t sable
-# Talk to Lincoln in its pane; direct managers with sable-msg:
-#   sable-msg optimus "status?"       (--interrupt to land mid-turn)
-# Reap finished worker panes:
-#   sable-worker-status --reap
-
-# Launching a single role by hand (e.g. a solo Lincoln session):
-sable-launch
-#   equivalent to: CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude
-#   (requires the repo bin/ on PATH — see PERSONAL-TOOLING.md)
+sable-launch      # START: bring up the session (or reuse it) and attach —
+                  # lincoln + optimus + tarzan + chuck panes, autonomous roles
+                  # kicked into their operating loops
+sable-view        # PEEK: status table of every agent pane + worker window
 ```
+
+Once attached, talk to Lincoln in its pane. Mid-session:
+
+```bash
+sable-view optimus          # jump to a pane
+sable-view worker --tail    # read a hidden worker window without switching
+sable-msg optimus "status?" # message a pane (--interrupt to land mid-turn)
+sable-worker-status --reap  # clear finished worker panes
+sable --help                # the full operator map, any time
+```
+
+(`sable-launch` wraps the lower-level `sable-tmux --autostart` layout tool and
+attaches with `tmux attach -t sable`; `sable-launch lincoln` still launches a
+single identity session by hand.)
 
 Managers dispatch one worker pane per bead (worktree = pane CWD, model pinned
 from the bead's `model:` label); workers do TDD, pass the gates, self-push, and

@@ -81,15 +81,15 @@ Determine which of two states you are in:
   operator to run, from a plain terminal:
 
   ```bash
-  sable-tmux --autostart
-  tmux attach -t sable
+  sable-launch
   ```
 
   and to continue this conversation in the **lincoln pane** of that session.
-  `sable-tmux` lays out one pane per role (lincoln, optimus, tarzan, chuck),
-  refuses to clobber an existing session, and with `--autostart` launches the
-  autonomous roles (optimus / tarzan / chuck) with a bypass permission posture
-  and kicks each into its operating loop once its TUI is ready.
+  `sable-launch` wraps `sable-tmux --autostart` (one pane per role — lincoln,
+  optimus, tarzan, chuck; existing sessions are reused, never clobbered; the
+  autonomous roles launch with a bypass permission posture and are kicked into
+  their operating loops once their TUIs are ready) and then attaches
+  (`tmux attach -t sable`).
 
 How the drain works (all of it happens in the panes, not in your context):
 
@@ -107,6 +107,9 @@ How the drain works (all of it happens in the panes, not in your context):
   `for-chuck` bead as the fallback when his pane is unreachable; he merges,
   replies, and idles. There is no second terminal to open.
 - **Reap** finished worker panes with `sable-worker-status --reap`.
+- **Peek** at any pane or hidden worker window with `sable-view` (status
+  table), `sable-view <role>` (focus), or `sable-view <role> --tail` (read
+  without switching).
 
 ## 3. Talk to the managers (sable-msg)
 
