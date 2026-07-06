@@ -22,8 +22,8 @@ cleanup() { rm -rf "$TH" "$TH2" "$TH3" 2>/dev/null || true; }
 trap cleanup EXIT
 TH="$(mktemp -d)"; TH2="$(mktemp -d)"; TH3="$(mktemp -d)"
 
-# --- INTEGRATION: --orchestration installs the multi-manager tier into a temp HOME ---
-HOME="$TH" bash "$INSTALL" --orchestration >/dev/null 2>&1 || true
+# --- INTEGRATION: the plain install lands the multi-manager layer (no tiers) ---
+HOME="$TH" bash "$INSTALL" >/dev/null 2>&1 || true
 if [ -f "$TH/.claude/hooks/multi-manager/lib-identity.sh" ] && \
    [ -f "$TH/.claude/hooks/multi-manager/pre-dispatch-refresh.sh" ] && \
    [ -f "$TH/.claude/hooks/multi-manager/mode-interlock.sh" ]; then
@@ -48,15 +48,20 @@ else
 fi
 
 # --- DRY-RUN: copies nothing ---
-out="$(HOME="$TH2" bash "$INSTALL" --orchestration --dry-run 2>&1 || true)"
+out="$(HOME="$TH2" bash "$INSTALL" --dry-run 2>&1 || true)"
 if [ ! -e "$TH2/.claude/hooks/multi-manager" ]; then pass "--dry-run copies no multi-manager hooks"; else fail "--dry-run copies no multi-manager hooks" "dir was created"; fi
 if [ ! -e "$TH2/.claude/skills/sable-plan" ]; then pass "--dry-run installs no skills"; else fail "--dry-run installs no skills" "skills dir created"; fi
 if echo "$out" | grep -qiE "dry.run|would (copy|install)"; then pass "--dry-run output marks it as a dry run"; else fail "--dry-run output marks it as a dry run" "got: $(echo "$out" | head -3)"; fi
 
-# --- FOUNDATION: no --orchestration → no multi-manager tier ---
-HOME="$TH3" bash "$INSTALL" >/dev/null 2>&1 || true
-if [ ! -e "$TH3/.claude/hooks/multi-manager" ]; then pass "Foundation install (no --orchestration) skips the multi-manager tier"; else fail "Foundation install skips the multi-manager tier" "dir present"; fi
-if [ ! -e "$TH3/.claude/skills/sable-plan" ]; then pass "Foundation install installs no SABLE skills"; else fail "Foundation install installs no SABLE skills" "skills present"; fi
+# --- RETIRED TIER FLAGS: rejected, install nothing (SABLE-ssws.1) ---
+for _flag in --orchestration --foundation; do
+  if HOME="$TH3" bash "$INSTALL" "$_flag" >/dev/null 2>&1; then
+    fail "retired tier flag $_flag is rejected" "install.sh exited 0"
+  else
+    pass "retired tier flag $_flag is rejected"
+  fi
+done
+if [ ! -e "$TH3/.claude/hooks/multi-manager" ]; then pass "retired tier flags install nothing"; else fail "retired tier flags install nothing" "dir present"; fi
 
 echo
 echo "=========================================="

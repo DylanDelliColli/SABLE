@@ -20,26 +20,23 @@ AGENTS_YAML_SRC="${TEMPLATE_DIR}/multi-manager/agents.yaml"
 SKILLS_SRC="${REPO_DIR}/skills"
 SKILLS_DST="${CLAUDE_DIR}/skills"
 
-# --- CLI flags (SABLE-106, front door SABLE-ppy; tmux-only SABLE-qa4d) ---
+# --- CLI flags (SABLE-106, front door SABLE-ppy; tmux-only SABLE-qa4d;
+# single-path install SABLE-ssws.1 — there are no tiers and no topologies) ---
 DRY_RUN=0
-ORCHESTRATION=0
-TIER_SET=0
-[ "${SABLE_ORCHESTRATION:-}" = "1" ] && { ORCHESTRATION=1; TIER_SET=1; }
 for arg in "$@"; do
     case "$arg" in
         --dry-run)       DRY_RUN=1 ;;
-        --orchestration) ORCHESTRATION=1; TIER_SET=1 ;;
-        --foundation)    ORCHESTRATION=0; TIER_SET=1 ;;
         --subagent|--nested|--teams)
-            echo "install.sh: '$arg' was retired — the Orchestration tier runs on the tmux warm-pane layout only (see TMUX-AGENTS-DESIGN.md)" >&2
+            echo "install.sh: '$arg' was retired — SABLE runs on the tmux warm-pane layout only (see TMUX-AGENTS-DESIGN.md)" >&2
+            exit 1 ;;
+        --orchestration|--foundation)
+            echo "install.sh: '$arg' was retired — there is one install: the full workflow including the orchestration layer (see QUICKSTART.md)" >&2
             exit 1 ;;
         -h|--help)
-            echo "Usage: install.sh [--foundation|--orchestration] [--dry-run]"
-            echo "  --orchestration        install the Orchestration tier (manager workflow, tmux warm panes)"
-            echo "  --foundation           base methodology only (default if neither chosen non-interactively)"
+            echo "Usage: install.sh [--dry-run]"
+            echo "  Installs the complete SABLE workflow: beads discipline + hooks,"
+            echo "  producer agent defs, and the tmux warm-pane orchestration layer."
             echo "  --dry-run              report what would be done; write nothing"
-            echo "  (run with no tier flag on a terminal to choose interactively;"
-            echo "   or set SABLE_ORCHESTRATION=1 for the Orchestration tier)"
             exit 0 ;;
     esac
 done
@@ -70,28 +67,10 @@ green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 red()    { printf '\033[31m%s\033[0m\n' "$*"; }
 
-# Interactive front door: on a terminal with no tier flag, ask. Non-interactive
-# runs (CI, pipes) fall through to the flags/defaults — Foundation unless told.
-if [ "$TIER_SET" = "0" ] && [ -t 0 ]; then
-    bold "SABLE install — choose a tier"
-    echo "  [1] Foundation    A disciplined workflow for AI-assisted coding. Every task"
-    echo "                    becomes a tracked issue, code changes require tests, and"
-    echo "                    quality checks run automatically. Works in your normal"
-    echo "                    coding sessions — nothing new to launch or learn. (default)"
-    echo "  [2] Orchestration Everything in Foundation, plus a hands-off multi-agent mode:"
-    echo "                    a lead session breaks work into a plan and delegates it to"
-    echo "                    specialist agents that write, review, and merge code with"
-    echo "                    minimal supervision. Best for larger efforts to delegate."
-    printf 'Tier [1]: '; read -r _tier
-    [ "$_tier" = "2" ] && ORCHESTRATION=1
-    echo
-fi
-
 bold "SABLE installer"
 printf 'OS:         %s\n' "${OS_NAME}"
 printf 'Repo:       %s\n' "${REPO_DIR}"
-printf 'Target dir: %s\n' "${CLAUDE_DIR}"
-printf 'Orchestration:    %s\n\n' "$([ "$ORCHESTRATION" = "1" ] && echo "yes (multi-manager tier)" || echo "no (Foundation tier; pass --orchestration to add)")"
+printf 'Target dir: %s\n\n' "${CLAUDE_DIR}"
 [ "$DRY_RUN" = "1" ] && { yellow "DRY RUN — no files will be written."; echo; }
 
 if [ "${OS_NAME}" = "Unknown" ]; then
@@ -143,14 +122,25 @@ if ! command -v dolt >/dev/null 2>&1 && ! command -v dolt.exe >/dev/null 2>&1; t
     yellow "  Note: dolt not found on PATH. \`bd dolt push\` (used in session-close protocol) will fail."
     yellow "  Install: https://docs.dolthub.com/introduction/installation (not required to finish this install)"
 fi
+
+# tmux check — non-fatal warning, but the execution layer is unusable without it:
+# sable-launch / sable-tmux stand up the warm-pane session on tmux.
+if ! command -v tmux >/dev/null 2>&1; then
+    yellow "  Note: tmux not found on PATH. The warm-pane session (sable-launch / sable-tmux) needs it."
+    case "${OS_NAME}" in
+        macOS)   yellow "  Install: brew install tmux" ;;
+        Linux*)  yellow "  Install: your distro package manager (e.g. apt install tmux)" ;;
+        "Windows (Git Bash / MSYS)") yellow "  tmux is not available on native Windows — use WSL and re-run this installer there." ;;
+        *)       yellow "  Install tmux via your platform's package manager." ;;
+    esac
+fi
 echo
 
-# CC version floor (warn, don't fail) — the Orchestration tier's named-agent
-# (producer) dispatch needs Claude Code >= 2.1.172. Foundation installs fine on
-# any version.
+# CC version floor (warn, don't fail) — named-agent (producer) dispatch during
+# planning needs Claude Code >= 2.1.172. The install completes on any version.
 CC_VER="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
 if [ -n "${CC_VER}" ] && ! python3 -c "import sys;v=tuple(int(x) for x in '${CC_VER}'.split('.'));sys.exit(0 if v>=(2,1,172) else 1)" 2>/dev/null; then
-    yellow "  Note: Claude Code ${CC_VER} is below 2.1.172 — the Orchestration tier needs >= 2.1.172 for named-agent (producer) dispatch. Foundation installs fine; upgrade before using managers."
+    yellow "  Note: Claude Code ${CC_VER} is below 2.1.172 — named-agent (producer) dispatch needs >= 2.1.172. The install completes fine; upgrade before running planning producers."
     echo
 fi
 
@@ -213,20 +203,18 @@ else
 fi
 echo
 
-# 6. Install the Orchestration (multi-manager) tier by DELEGATING to the
-# complete-layer installer (SABLE-ppy). Foundation adopters opt out. The delegate
-# installs all hooks + registry + skills + role + (teams) member defs and merges
-# the topology-appropriate settings snippet.
-bold "Step 6/8: Orchestration (multi-manager) tier"
-if [ "$ORCHESTRATION" != "1" ]; then
-    yellow "  Skipped — Foundation tier. Re-run with --orchestration (or SABLE_ORCHESTRATION=1)."
-elif [ "$DRY_RUN" = "1" ]; then
+# 6. Install the orchestration (multi-manager) layer by DELEGATING to the
+# complete-layer installer (SABLE-ppy). Always runs — there is one install
+# (SABLE-ssws.1). The delegate installs all hooks + registry + skills + the four
+# pane roles and merges the settings snippet.
+bold "Step 6/8: Orchestration (multi-manager) layer"
+if [ "$DRY_RUN" = "1" ]; then
     yellow "  would delegate: sable-orchestration-install --user"
 elif [ -x "${REPO_DIR}/bin/sable-orchestration-install" ]; then
     green "  Delegating to sable-orchestration-install (--user)..."
     bash "${REPO_DIR}/bin/sable-orchestration-install" --user
 else
-    yellow "  bin/sable-orchestration-install not found — skipping Orchestration tier"
+    yellow "  bin/sable-orchestration-install not found — skipping the orchestration layer"
 fi
 echo
 
@@ -303,23 +291,17 @@ cat <<EOF
 EOF
 echo
 
-if [ "$ORCHESTRATION" = "1" ]; then
-    bold "Orchestration hooks"
-    echo "The Orchestration settings snippet was merged into the scope's settings file"
-    echo "automatically by sable-orchestration-install (backed up; existing entries kept)."
-    echo
-fi
+bold "Orchestration hooks"
+echo "The orchestration settings snippet was merged into the scope's settings file"
+echo "automatically by sable-orchestration-install (backed up; existing entries kept)."
+echo
 
 bold "Install complete."
 echo
 echo "Next steps:"
 echo "  1. Paste the hook block(s) above into ${SETTINGS_FILE} (merge with existing config)."
 echo "  2. In your project: bd init && bd hooks install"
-echo "  3. Agent definitions are now in ${CLAUDE_DIR}/agents/ — restart Claude Code for them to take effect."
-if [ "$ORCHESTRATION" = "1" ]; then
-    echo "  4. Orchestration tier installed — its settings snippet was merged automatically."
-    echo "     RESTART Claude Code so /sable-plan /sable-execute /gaudi /columbo register."
-    echo "     Bring up the warm-pane session:  sable-tmux --autostart   (then: tmux attach -t sable)"
-fi
+echo "  3. RESTART Claude Code so the agent defs, /sable-plan /sable-execute /gaudi /columbo, and hooks register."
+echo "  4. Start the warm-pane session:  sable-launch   (wraps sable-tmux --autostart + attach)"
 echo "  5. Open a fresh agent session and use the bootstrap prompt from QUICKSTART.md"
-echo "  6. Verify: see 'Verify the install' section of QUICKSTART.md"
+echo "  6. Verify: see 'Verify the install' section of QUICKSTART.md — or type: sable --help"
