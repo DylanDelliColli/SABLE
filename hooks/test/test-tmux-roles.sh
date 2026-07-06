@@ -46,6 +46,16 @@ has "lincoln" "sable-tmux"  "references the sable-tmux launcher"
 # --- chuck: a warm pane ---
 has "chuck" "sable-tmux"    "is a sable-tmux pane"
 
+# --- SABLE-qa4d.7: no stale nested/teams topology framing remains ---
+lacks "chuck" "nested/teams"       "for-chuck fallback framed as pane-unreachable, not a topology"
+lacks "chuck" "teams-mode gap"     "stranded-recovery no longer blamed on a teams-mode gap"
+file_lacks() { if grep -q "$2" "$1" 2>/dev/null; then fail "$3 (found stale: $2)"; else pass "$3"; fi; }
+file_has()   { if grep -q "$2" "$1" 2>/dev/null; then pass "$3"; else fail "$3 (missing: $2)"; fi; }
+file_lacks "$REPO/hooks/multi-manager/post-push-merge-notify.sh" "nested/teams" "post-push comment framed as pane-unreachable, not a topology"
+file_lacks "$REPO/templates/multi-manager/agents.yaml" "resident manager subagents" "agents.yaml lincoln entry drops resident-subagent framing"
+file_lacks "$REPO/templates/multi-manager/agents.yaml" "env-var.*terminal\|terminal (SABLE-uz9.6)" "agents.yaml no longer frames chuck as an env-var terminal"
+file_has   "$REPO/templates/multi-manager/agents.yaml" "warm pane\|tmux pane" "agents.yaml describes the warm-pane execution surface"
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

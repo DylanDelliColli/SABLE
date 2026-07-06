@@ -128,8 +128,8 @@ print('\n'.join(lines))
 # In the tmux warm-pane topology the worker->merge handoff is a direct message
 # to Chuck: event-driven, no polled bead. If a Chuck pane is reachable, that IS
 # the handoff and we stop here. Fall through to the durable for-chuck bead only
-# when Chuck is unreachable (nested/teams topology has no Chuck pane, or Chuck is
-# down) — Chuck's stranded-recovery covers the crash case. Disable with
+# when Chuck is unreachable (pane not launched, or Chuck is down) — Chuck's
+# stranded-recovery covers the crash case. Disable with
 # SABLE_MERGE_NOTIFY_VIA_MSG=0.
 if [ "${SABLE_MERGE_NOTIFY_VIA_MSG:-1}" = "1" ] && command -v sable-msg >/dev/null 2>&1; then
   FILES_BRIEF=$(echo "$FILES" | sed 's#.*/##' | head -8 | tr '\n' ' ')

@@ -126,29 +126,29 @@ agents:
     bead_template: templates/columbo-bead.md   # required for all columbo beads
     quality_bar: above_default  # see role_prompt for what this means
 
-  # Lincoln — the v2 main session (SABLE-uz9.5). One entry, two heritages
-  # merged: the original Tier-3 strategist (status, arbitration, strategic
-  # conversation) and the cockpit seat (mode-aware fleet launch). The user
-  # talks to Lincoln in ONE window; /sable-plan and /sable-execute (skills/sable-plan,
-  # sable-execute) flip the mode via bin/sable-mode, and the mode-state file
-  # governs what Lincoln may spawn (mode-interlock.sh, Bash + Agent
-  # legs). Planning mode: walks the gated substages, spawning Tier-2 producers
-  # as named subagents (gaudi runs as an inline skill). Execution mode: spawns
-  # Optimus/Tarzan as resident manager subagents that dispatch their own workers
-  # and push their own approved lanes (SABLE-uz9.11); Lincoln oversees and
-  # brokers for-lincoln arbitration. Chuck remains an env-var
-  # terminal (SABLE-uz9.6). "Cockpit" survives as the name of the mode
-  # machinery — the seat, not the person.
+  # Lincoln — the operator-facing lead (SABLE-uz9.5, warm panes SABLE-bldh).
+  # One entry, two heritages merged: the original Tier-3 strategist (status,
+  # arbitration, strategic conversation) and the cockpit seat (mode-aware
+  # launch). The user talks to Lincoln in the lincoln tmux pane; /sable-plan and
+  # /sable-execute (skills/sable-plan, sable-execute) flip the mode via
+  # bin/sable-mode, and the mode-state file governs what Lincoln may spawn
+  # (mode-interlock.sh, Bash + Agent legs). Planning mode: walks the gated
+  # substages, spawning Tier-2 producers as named subagents (gaudi runs as an
+  # inline skill). Execution mode: every execution role — lincoln, optimus,
+  # tarzan, chuck — is a warm tmux pane launched by sable-tmux; managers spawn
+  # a worker pane per bead, workers self-push, Chuck merges; Lincoln directs
+  # over sable-msg, oversees, and brokers for-lincoln arbitration. "Cockpit"
+  # survives as the name of the mode machinery — the seat, not the person.
   lincoln:
     type: cockpit
-    scope: "The one operator-facing main session: strategist + mode-aware fleet launch; /sable-plan fills the pool via producer subagents, /sable-execute drains it via resident manager subagents that self-dispatch and self-push"
-    claim_filter: null         # doesn't claim — directs, spawns managers, oversees
+    scope: "The one operator-facing lead pane: strategist + mode-aware launch; /sable-plan fills the pool via producer subagents, /sable-execute drains it via the warm-pane session (sable-tmux) whose managers dispatch worker panes and whose workers self-push"
+    claim_filter: null         # doesn't claim — directs managers over sable-msg, oversees
     inbox_label: for-lincoln   # arbitration asks from managers, direction from user
     role_prompt: roles/lincoln.md
-    dispatches_workers: false  # spawns managers (who dispatch their own workers); does not dispatch or push itself
+    dispatches_workers: false  # managers dispatch their own worker panes; lincoln never dispatches or pushes
     cross_inbox_read: true     # must see every agent's plate to oversee both modes
     files_addressed_beads: true      # may file for-X coord/direction beads
-    launches_fleets: true            # mode-aware fleet spawn (subagents, not terminals)
+    launches_fleets: true            # mode-aware bring-up of the warm-pane session (sable-tmux)
 
 # Seward (TEMPORARY strategist overlay, SABLE-nps) was RETIRED in v3 (SABLE-xt6):
 # its sunset clause triggered when nested subagents shipped and managers began
