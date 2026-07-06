@@ -39,11 +39,10 @@ lacks install.sh "--cockpit"
 lacks install.sh "SABLE_MULTI_MANAGER"
 lacks install.sh "SABLE_COCKPIT"
 
-# Settings snippets point at the renamed hook
+# Settings snippet points at the renamed hook (the teams snippet was deleted
+# with the teams topology, SABLE-qa4d.4)
 has templates/multi-manager/settings-snippet.json "mode-interlock.sh"
 lacks templates/multi-manager/settings-snippet.json "cockpit-mode-interlock.sh"
-has templates/multi-manager/settings-snippet-teams.json "mode-interlock.sh"
-lacks templates/multi-manager/settings-snippet-teams.json "cockpit-mode-interlock.sh"
 
 # Live mode machinery — no SABLE_COCKPIT* tokens, no cockpit-mode.json
 for f in bin/sable-mode hooks/multi-manager/mode-interlock.sh hooks/multi-manager/lib-identity.sh; do

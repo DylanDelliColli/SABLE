@@ -1,23 +1,20 @@
 #!/usr/bin/env bash
-# sable-launch — one-command operator entry point for a SABLE session (SABLE-njiv).
+# sable-launch — one-command operator entry point for a standalone SABLE session
+# (SABLE-njiv).
 #
 # Replaces the hand-copied `CLAUDE_AGENT_NAME=... CLAUDE_AGENT_ROLE=manager claude`
-# aliases so the lead session NEVER launches without its identity — a lead with no
-# CLAUDE_AGENT_NAME=lincoln is the root cause of the teams SendMessage identity-bleed
-# (its outbound sender is mis-derived from the triggering sub-agent, dropping
-# operational directives; see AGENT-TEAMS-DESIGN.md "Live-dogfooding amendments").
+# aliases so a session NEVER launches without its identity — an unnamed lead was
+# the root cause of a live identity-bleed incident (outbound messages mis-derived
+# their sender, dropping operational directives).
 #
-# It sets identity + role, then VERIFIES (warn-only, never writes) that the teams
-# experimental flag is enabled, then exec's claude. The flag lives in
-# ~/.claude/settings.json (a locked "installer never auto-writes it" decision), not
-# the shell env, so we read settings.json directly rather than delegating to
-# sable-teams-preflight (which inspects the shell env and would misreport pre-launch).
-# Complements — does not replace — the in-session verify in /sable-execute.
+# The normal execution bring-up is `sable-tmux --autostart`, which launches every
+# role pane with its identity set. sable-launch remains for launching a single
+# role by hand (e.g. a solo lincoln session, or re-launching one pane).
 #
 # Usage:
 #   sable-launch [role] [claude-args...]
 #     role   lincoln (default) — the orchestrator/lead session you talk to
-#            chuck             — the merge-queue terminal (nested topology only)
+#            chuck             — the merge-queue role (normally a sable-tmux pane)
 #   sable-launch --help
 
 set -u
@@ -29,13 +26,12 @@ sable-launch — launch a SABLE session with the correct agent identity + env.
 Usage:
   sable-launch [role] [claude-args...]
     role   lincoln (default) — the orchestrator/lead session you talk to
-           chuck             — the merge-queue terminal (nested topology only)
+           chuck             — the merge-queue role (normally a sable-tmux pane)
   sable-launch --help
 
 Sets CLAUDE_AGENT_NAME=<role> and CLAUDE_AGENT_ROLE=manager so the session has a
-stable identity. Verifies (warn-only, never writes) that the teams experimental
-flag is enabled; if absent, teams transparently falls back to nested. All other
-arguments are passed through to `claude`.
+stable identity. All other arguments are passed through to `claude`. The full
+warm-pane session (all four roles) is launched by `sable-tmux --autostart`.
 EOF
 }
 
@@ -55,35 +51,6 @@ esac
 
 export CLAUDE_AGENT_NAME="$ROLE"
 export CLAUDE_AGENT_ROLE="manager"
-
-# --- Verify the teams experimental flag (warn-only; NEVER write settings.json) ---
-# Present if it is in the process env OR env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=="1"
-# in any global/project settings file.
-_flag_present() {
-  [ "${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-}" = "1" ] && return 0
-  local f
-  for f in "${HOME:-}/.claude/settings.json" "${HOME:-}/.claude/settings.local.json" \
-           ".claude/settings.json" ".claude/settings.local.json"; do
-    [ -f "$f" ] || continue
-    if command -v python3 >/dev/null 2>&1; then
-      python3 -c 'import json,sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(1)
-v = str(d.get("env", {}).get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", ""))
-sys.exit(0 if v == "1" else 1)' "$f" && return 0
-    else
-      grep -Eq '"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"[[:space:]]*:[[:space:]]*"1"' "$f" && return 0
-    fi
-  done
-  return 1
-}
-
-if ! _flag_present; then
-  printf 'sable-launch: CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 not found (process env or ~/.claude/settings.json) — teams topology will fall back to nested.\n' >&2
-  printf '  To enable teams, add "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" to the env block of ~/.claude/settings.json and restart.\n' >&2
-fi
 
 command -v claude >/dev/null 2>&1 || { printf 'sable-launch: `claude` not found on PATH.\n' >&2; exit 127; }
 

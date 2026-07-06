@@ -2,7 +2,7 @@
 # sable-bin-install — link the SABLE CLI tools (sable-*) onto your PATH (SABLE-cmql).
 #
 # The repo's bin/ holds the operator CLI tools (sable-launch, sable-note, sable-mode,
-# sable-teams-preflight, ...). Skills and docs invoke them by bare name, so they must
+# sable-tmux, sable-msg, ...). Skills and docs invoke them by bare name, so they must
 # be on PATH. This installs them into ~/.local/bin (or --dir) so adopters don't have
 # to hand-edit PATH.
 #

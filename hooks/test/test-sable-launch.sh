@@ -104,35 +104,27 @@ else
   fail "leading flag passthrough with default role" "out=[$OUT] err=[$ERR] code=$CODE"
 fi
 
-# ---- INTEGRATION: teams-flag verify (warn-only, never write) ----
+# ---- INTEGRATION: no teams-flag machinery remains (tmux-only, SABLE-qa4d) ----
 
 run_launch "$HOME_NOFLAG" ""
-if printf '%s' "$ERR" | grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" && printf '%s' "$OUT" | grep -q "NAME=lincoln"; then
-  pass "missing teams flag -> warning on stderr AND still exec's claude (graceful)"
+if ! printf '%s' "$ERR" | grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" && printf '%s' "$OUT" | grep -q "NAME=lincoln"; then
+  pass "no teams-flag warning is ever printed (tmux-only)"
 else
-  fail "missing flag warns + continues" "out=[$OUT] err=[$ERR] code=$CODE"
+  fail "no teams-flag warning is ever printed (tmux-only)" "out=[$OUT] err=[$ERR] code=$CODE"
 fi
 
-# It must NOT have written the flag into settings.json (locked decision)
+# It must not have touched settings.json
 if grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" "$HOME_NOFLAG/.claude/settings.json"; then
   fail "never writes settings.json" "settings.json was modified to add the flag"
 else
-  pass "never writes the flag into settings.json (locked decision)"
+  pass "never writes settings.json"
 fi
 
-run_launch "$HOME_FLAG" ""
-if ! printf '%s' "$ERR" | grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"; then
-  pass "flag present in settings.json -> no warning"
+# Static: the launcher itself carries no teams-flag machinery
+if ! grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" "$LAUNCH"; then
+  pass "sable-launch carries no teams-flag machinery"
 else
-  fail "no warning when flag present" "err=[$ERR]"
-fi
-
-# Flag present in the process env (exported) also suppresses the warning
-run_launch "$HOME_NOFLAG" "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1"
-if ! printf '%s' "$ERR" | grep -q "Add .*CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"; then
-  pass "flag present in process env -> no settings.json warning"
-else
-  fail "env flag suppresses warning" "err=[$ERR]"
+  fail "sable-launch carries no teams-flag machinery" "flag still referenced in $LAUNCH"
 fi
 
 # Cleanup
