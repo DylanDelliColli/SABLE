@@ -1,8 +1,10 @@
 # tmux-native SABLE — Design (2026-06-25)
 
-**Status:** design locked this session; execution contract is the `SABLE-*` EPIC
-created alongside this doc. Branch: `tmux-agents` (off `main`). No code yet — next
-session executes from `bd ready`.
+**Status: CANONICAL — the only execution topology (2026-07-06).** Built under
+EPIC `SABLE-bldh` on branch `tmux-agents`; made the sole topology under epic
+`SABLE-qa4d` on branch `tmux-only` (the nested-subagent and agent-teams
+topologies, their installers, selection machinery, and poll-based inbox hooks
+were removed). The original design text follows.
 
 This replaces the in-process, subagent-heavy manager methodology (v2 one-window /
 v3 nested / teams) with a **warm-pane substrate**: every role is a real,

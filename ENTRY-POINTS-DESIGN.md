@@ -1,5 +1,14 @@
 # SABLE Entry Points — Design (onboarding + small-ask planning)
 
+> **Amendment (2026-07-06, tmux-only — epic `SABLE-qa4d`):** the §2 install
+> decision tree's second fork ("If Orchestration — Subagent or Teams?") no
+> longer exists. The nested-subagent and agent-teams topologies were removed;
+> the Orchestration tier installs the **tmux warm-pane topology**
+> unconditionally ([`TMUX-AGENTS-DESIGN.md`](TMUX-AGENTS-DESIGN.md)), and the
+> teams experimental-flag step (§4 / Open risks) is resolved by removal. The
+> tier fork (Foundation vs Orchestration), the de-cockpit rename, and the
+> planning doors below remain current.
+
 > **Status: design — 2026-06-16 (planning entry points updated 2026-06-26).**
 > Reference artifact for the interaction points into SABLE: **install** (how you
 > get in) and the **planning doors** (how you start a unit of work). Planning now

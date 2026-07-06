@@ -70,7 +70,7 @@ Clustering by file means each validator reads its sources once and judges every 
 
 | Agent | Type | Scope | Lifecycle |
 |-------|------|-------|-----------|
-| **Lincoln** | strategist | Status reporting, strategic conversation, cross-manager brokering during execution sessions | The primary window in v3: one main session that hosts Optimus and Tarzan as resident subagents. Chuck runs in a second terminal. Three modes: Quick strategy, Arbitration, What's next. Idle-polls inbox via `/loop 5m /inbox`. |
+| **Lincoln** | strategist | Status reporting, strategic conversation, cross-manager brokering during execution sessions | The lead pane of the warm-pane tmux session (optimus, tarzan, and chuck run in their own panes). Three modes: Quick strategy, Arbitration, What's next. Managers reach it over `sable-msg`; `/inbox` remains the manual pull for durable `for-lincoln` beads. |
 
 Lincoln is the agent the user **primarily talks to** during a working session. Optimus / Tarzan / Chuck are autonomous — they don't need conversation, they need beads. Lincoln gives status, brokers `for-lincoln` arbitration asks from the other three, and helps the user think strategically without becoming an orchestrator. Lincoln has `cross_inbox_read: true` (bypasses the read guard so it can give status across all managers) and may file `for-X` coord beads (one-line, not detailed specs).
 
@@ -106,34 +106,33 @@ sable-agents victor       # single agent + role file path
 
 ---
 
-## The v3 topology (one-window)
+## The warm-pane topology (tmux)
 
-SABLE v3 reduces the operator surface to **one primary window**. See
-[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) for the full rationale; the summary:
+SABLE's execution surface is **one tmux session, one warm `claude` pane per
+role** — the only topology (SABLE-qa4d; designed in
+[`TMUX-AGENTS-DESIGN.md`](TMUX-AGENTS-DESIGN.md)). `sable-tmux` lays out the
+panes (lincoln, optimus, tarzan, chuck), sets each pane's identity
+(`CLAUDE_AGENT_NAME` / `CLAUDE_AGENT_ROLE=manager`), and registers each role in
+the role→pane registry; `--autostart` kicks the autonomous roles into their
+operating loops.
 
-> **Teams topology (default when available):** the default surface — managers and Chuck as live
-> `SendMessage` team members in one window — built on Claude Code Agent Teams.
-> Requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in `~/.claude/settings.json`
-> (operator-added, never auto-written). Without that flag, `/sable-execute`
-> transparently falls back to the nested-subagent topology. Designed in
-> [`AGENT-TEAMS-DESIGN.md`](AGENT-TEAMS-DESIGN.md).
-
-A single **Lincoln main session** (`CLAUDE_AGENT_NAME=lincoln
-CLAUDE_AGENT_ROLE=manager claude`) is the one session you talk to. With the teams
-topology (default), Optimus, Tarzan, and Chuck run as live team members — Chuck
-folds into the same window, eliminating the second terminal. With the nested fallback,
-Optimus and Tarzan run as **resident manager subagents** inside Lincoln — spawned once
-at session start, living in the background, where each **dispatches its own workers**
-(via the `Agent` tool — nested spawn, CC 2.1.177, SABLE-uz9.8/uz9.9) and **pushes its
-own approved lanes** (`git -C <worktree> push`). In the nested topology Chuck stays a
-separate terminal (env-var identity) because always-on merge-queue polling is
-session-shaped — see the "Chuck hybrid holdout" section in
-[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md).
+**Lincoln** is the pane you talk to. **Optimus and Tarzan** are resident manager
+panes: each drains its lane from `bd ready`, and each **dispatches its own
+worker panes** — one ephemeral pane per bead via the worker-spawn helper
+(worktree = pane CWD, model pinned from the bead's `model:` label, governance
+checks inside the helper). **Workers self-push** their own worktree branches
+from their own CWD and close their beads with gate evidence; managers never
+push worker code. **Chuck** is the merge-queue pane — a manager's push notifies
+him message-first (`sable-msg chuck`, sent by the post-push hook), with the
+durable `for-chuck` bead as the fallback when his pane is unreachable.
+Lead↔manager conversation is `sable-msg` with the `⟦SABLE-MSG⟧ from=<sender>`
+framing header; the high-volume worker path is deliberately message-free
+(workers are spawned with their instructions and report via the bead pool).
 
 | Mode | Job | Mechanics |
 |------|-----|-----------|
 | **Planning** | fill & groom the pool via the staged substages (FRAMING → RESEARCH → ARCHITECTURE → TEST-STRATEGY → DECOMPOSITION) | Lincoln runs the substage machine; Tier-2 producers invoked on demand; interlock blocks execution dispatches until `substage=decomposition` |
-| **Execution** | drain the bead pool | Teams (default): Lincoln spawns Optimus, Tarzan, Chuck as team members — each manager can self-dispatch workers and self-push approved lanes; Chuck folds in, no second terminal. Nested fallback: Optimus + Tarzan as resident subagents, Chuck in second terminal |
+| **Execution** | drain the bead pool | `sable-tmux --autostart` brings up the warm-pane session; managers dispatch a worker pane per bead, workers self-push, Chuck merges; Lincoln directs over `sable-msg` and oversees |
 
 > **Planning has three modes (free entry).** The Planning row above is the **Full**
 > mode (the high-rigor five-substage flow). Its siblings: **Quick** (telescopes the
@@ -179,37 +178,32 @@ Mechanics:
 
 Each manager launches with an immutable identity established at the OS level, not in conversation context.
 
-### Launch aliases (legacy / Chuck-only in v3)
+### Launching sessions (sable-tmux + sable-launch)
 
-In v3, **Optimus and Tarzan are resident subagents** spawned by Lincoln — you do
-not launch them from the shell directly. The Lincoln alias is still needed for
-the main session, and Chuck still requires an env-var terminal (see
-[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) for the Chuck hybrid holdout rationale).
+The normal bring-up is **`sable-tmux --autostart`**: it launches every execution
+role (lincoln, optimus, tarzan, chuck) as a warm pane with its identity set at
+the OS level — no aliases, no hand-typed env vars. Attach with
+`tmux attach -t sable`.
 
-**Minimum for a v3 execution session.** With the repo `bin/` on your PATH (see
-PERSONAL-TOOLING.md), `sable-launch` is the one-command entry point — it sets the
-identity + role and verifies the teams flag, so the lead never launches without
-`CLAUDE_AGENT_NAME=lincoln` (the identity-bleed root cause, SABLE-njiv):
+For a **single role by hand** (a solo Lincoln session, or re-launching one
+pane), `sable-launch` is the one-command entry point — it sets the identity +
+role so a session never launches unnamed (the identity-bleed root cause,
+SABLE-njiv). With the repo `bin/` on your PATH (see PERSONAL-TOOLING.md):
 
 ```bash
-sable-launch          # the lead (lincoln) — the one window you talk to
-sable-launch chuck    # the merge-queue terminal (nested topology only)
+sable-launch          # the lead (lincoln) — the pane you talk to
+sable-launch chuck    # the merge-queue role (normally a sable-tmux pane)
 ```
 
 If you prefer raw shell aliases, the equivalent forms are:
 
 ```bash
 # In ~/.zshrc or equivalent
-
-# Primary session — the one window you talk to
 alias lincoln='CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude'
-
-# Chuck's terminal — merge queue, always-on, env-var identity required
 alias chuck='CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude'
 ```
 
-Optimus and Tarzan are started by Lincoln via `claude --agent-id` / the Agent
-tool; no shell aliases needed. Planning agents are also still invokable directly
+Planning agents are also still invokable directly
 if you want to run a standalone session:
 
 ```bash
@@ -220,9 +214,10 @@ rudy()     { CLAUDE_AGENT_NAME=rudy     CLAUDE_AGENT_ROLE=quality_validator clau
 columbo()  { CLAUDE_AGENT_NAME=columbo  CLAUDE_AGENT_ROLE=test_planner     claude "$@"; }
 ```
 
-**Legacy (pre-v3 / standalone installs):** if you are running Optimus or Tarzan
-as separate terminal sessions rather than as subagents, the original aliases
-still work:
+**Manual launch:** if you are running Optimus or Tarzan
+by hand outside the tmux session (debugging a single lane, or a machine without
+tmux), the raw aliases still work — they are exactly what `sable-tmux` sets per
+pane:
 
 ```bash
 alias optimus='CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager claude'
@@ -231,25 +226,25 @@ alias tarzan='CLAUDE_AGENT_NAME=tarzan CLAUDE_AGENT_ROLE=manager claude'
 
 Hooks inherit the Claude Code process's environment. An agent running `export CLAUDE_AGENT_NAME=tarzan` inside a Bash tool only affects that subshell, which is discarded after the command. The env var is effectively immutable from the agent's perspective.
 
-**On role values.** All continuous-mode hooks (`pre-dispatch-*`, `inbox-injection`, `pre-push-rebase-test`, `post-push-merge-notify`) hard-exit when `CLAUDE_AGENT_ROLE != "manager"`. Lincoln launches with `manager` so it gets inbox injection; Sherlock / Victor / Rudy / Columbo launch with their own roles so the continuous hooks no-op for them. Their discipline comes from session-scoped invocation patterns and bead-template enforcement, not from runtime hooks.
+**On role values.** All continuous-mode hooks (`pre-dispatch-*`, `pre-push-rebase-test`, `post-push-merge-notify`) hard-exit when `CLAUDE_AGENT_ROLE != "manager"`. Every warm pane launches with `manager` (set by `sable-tmux`); Sherlock / Victor / Rudy / Columbo launch with their own roles so the continuous hooks no-op for them. Their discipline comes from session-scoped invocation patterns and bead-template enforcement, not from runtime hooks.
 
 ### Identity injection
 
 A `SessionStart` hook reads `$CLAUDE_AGENT_NAME`, loads the corresponding role file from `~/.claude/sable/roles/<name>.md`, and injects it as the agent's identity context. A `PreCompact` hook re-injects after compaction (identity erodes silently otherwise).
 
-### Dual identity mode (v3)
+### Dual identity mode
 
-v3 supports two identity modes that coexist:
+Two identity modes coexist:
 
 | Mode | Context | Mechanism |
 |------|---------|-----------|
-| **Env-var** | Terminal sessions (Lincoln, Chuck, standalone agents) | `CLAUDE_AGENT_NAME` / `CLAUDE_AGENT_ROLE` set in the shell before launch; hooks read them from the process environment |
-| **Ledger-based** | Resident subagents (Optimus, Tarzan) inside Lincoln's session | `agent_type` field in hook input JSON; the agent's named definition (`~/.claude/agents/<name>.md`) sets identity at spawn time |
+| **Env-var** | Warm panes (lincoln, optimus, tarzan, chuck — launched by `sable-tmux`) and standalone sessions | `CLAUDE_AGENT_NAME` / `CLAUDE_AGENT_ROLE` set at launch; hooks read them from the process environment |
+| **Ledger-based** | Producer subagents (Sherlock, Victor, Columbo) spawned via the `Agent` tool during planning | `agent_type` field in hook input JSON; the agent's named definition (`~/.claude/agents/<name>.md`) sets identity at spawn time |
 
 The ledger-based mode is what `claude --agent-id` / the `Agent` tool uses when
-spawning named agents from `~/.claude/agents/`. The env-var mode is the fallback
-for terminal sessions and remains fully functional — Chuck's env-var identity is
-correct and required for his continuous polling model.
+spawning named agents from `~/.claude/agents/`. The env-var mode is how every
+execution pane is identified — real sessions with real session IDs, which is
+exactly what the warm-pane topology exists to guarantee.
 
 In practice, the hooks use the `agent_id` discriminator to tell contexts apart:
 
@@ -261,14 +256,14 @@ fi
 ```
 
 `agent_id` is **present in subagent contexts and absent in main-session contexts**.
-This is the discriminator for all manager-specific hooks (inbox injection,
-pre-dispatch refresh/claim/overlap/preempt, pre-push gate, post-push notify).
-Without it, env-var-based identity would leak from manager sessions into their
-dispatched subagents.
+This is the discriminator for all manager-specific hooks (pre-dispatch
+refresh/claim/overlap/preempt, pre-push gate, post-push notify).
+Without it, env-var-based identity would leak from a pane into the
+subagents it spawns.
 
 ### Subagent context discrimination
 
-Subagents dispatched via the `Agent` tool inherit the parent's environment, so `$CLAUDE_AGENT_NAME` propagates. Every relevant hook checks for `agent_id` as above. The ledger-based agents (Optimus, Tarzan) additionally carry their identity in the agent definition file injected at spawn — the env-var in the environment is their parent's (Lincoln's) identity, not theirs, so hooks must rely on the input JSON for correct discrimination.
+Subagents dispatched via the `Agent` tool inherit the parent's environment, so `$CLAUDE_AGENT_NAME` propagates. Every relevant hook checks for `agent_id` as above. The ledger-based producers additionally carry their identity in the agent definition file injected at spawn — the env-var in the environment is their parent's (Lincoln's) identity, not theirs, so hooks must rely on the input JSON for correct discrimination.
 
 ---
 
@@ -338,7 +333,6 @@ agents:
     inbox_label: for-lincoln
     dispatches_workers: true        # read-only Explore subagents only
     cross_inbox_read: true          # bypass read-guard to give cross-manager status
-    idle_polling: "/loop 5m /inbox" # slower than Chuck (3m); strategic conversation is reactive
     files_addressed_beads: true     # may file for-X coord beads (one-line, not specs)
     forbidden_invocations: [sherlock, victor, rudy, columbo]
 ```
@@ -384,15 +378,18 @@ Columbo's `for-columbo` inbox is the exception among planning agents: managers f
 
 ### `/inbox` slash command
 
-Manual pull for managers who want to deliberately check their inbox without waiting for an automatic injection. Backed by `bd ready -l for-$CLAUDE_AGENT_NAME`. Lives at `~/.claude/commands/inbox.md`.
+Manual pull for managers who want to deliberately check their durable inbox. Backed by `bd ready -l for-$CLAUDE_AGENT_NAME`. Lives at `~/.claude/commands/inbox.md`.
 
-### Inbox injection (automatic push)
+### Live messaging (sable-msg)
 
-A `PostToolUse` hook on `Bash` queries `bd ready -l for-<self>` after every tool call in the main session. If there are unread items (compared against a session-scoped dedup file), it injects a notification via `additionalContext`. Effective latency for active managers: seconds.
-
-The hook fast-exits when `agent_id` is present (subagent context) so workers never see manager inbox material.
-
-A `PreCompact` hook clears the dedup file so post-compact re-injection re-orients the manager to outstanding messages.
+Lead↔manager conversation is direct: `sable-msg <role> "<text>"` resolves the
+target pane via the role→pane registry and injects the message as a turn,
+prefixed with the `⟦SABLE-MSG⟧ from=<sender>` framing header (`--interrupt`
+sends Escape first so it lands mid-turn). The old poll-based inbox-injection
+hooks are gone — the `for-X` labels survive as the **durable fallback channel**
+(e.g. `post-push-merge-notify` files a `for-chuck` bead when Chuck's pane is
+unreachable), drained by each role's operating loop via `bd ready -l for-<self>`
+and the `/inbox` manual pull.
 
 ### Read guard (no cross-inbox queries)
 
@@ -608,8 +605,6 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | `session-role-anchor.sh` | SessionStart, PreCompact | Inject role identity from `~/.claude/sable/roles/<name>.md` | Inject context |
 | `tree-claim.sh` | PreToolUse:Bash | Lockfile: one main session per checkout — deny index-mutating git commands when another session holds a fresh claim (TTL 3600s; `SABLE_TREE_CLAIM_OVERRIDE=1` or manual delete to escape) | Hard deny |
 | `read-guard.sh` | PreToolUse:Bash | Deny `bd ready -l for-<foreign>` queries (Lincoln bypassed via `cross_inbox_read: true`) | Hard deny |
-| `inbox-injection.sh` | PostToolUse:Bash | Inject unread for-self bead notifications (with dedup, agent_id skip) | Inject context |
-| `inbox-injection-precompact.sh` | PreCompact | Clear inbox dedup file so post-compact re-injection re-orients the manager | Side effect (clear cache) |
 | `pre-dispatch-refresh.sh` | PreToolUse:Agent | Rebase target worktree on `$SABLE_BASE_BRANCH` | Side effect (rebase) |
 | `pre-dispatch-claim.sh` | PreToolUse:Agent | Read bead description, write file claims to bead notes | Side effect (bd update) |
 | `pre-dispatch-overlap.sh` | PreToolUse:Agent | Annotate overlap with other in-progress beads | Inject context |
@@ -619,7 +614,7 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | `pre-push-rebase-test.sh` | PreToolUse:Bash matching `git push` | Force rebase + tests before push | Hard deny |
 | `post-push-merge-notify.sh` | PostToolUse:Bash matching `git push` | File `for-chuck` bead with overlap analysis (Chuck's own pushes are skipped) | Side effect (bd create) |
 
-All twelve hooks live in `hooks/multi-manager/`. Every continuous-mode hook (everything except `session-role-anchor.sh` and `read-guard.sh`) hard-exits when `CLAUDE_AGENT_ROLE != "manager"`, so they no-op in Sherlock / Victor / Rudy / Columbo sessions.
+Every continuous-mode hook (everything except `session-role-anchor.sh` and `read-guard.sh`) hard-exits when `CLAUDE_AGENT_ROLE != "manager"`, so they no-op in Sherlock / Victor / Rudy / Columbo sessions. (The former poll-based `inbox-injection` hooks were deleted with the tmux-only cutover — live messaging is `sable-msg`; the durable `for-X` labels remain the fallback channel.)
 
 **Bead quality hook**: `bead-description-gate.sh` (existing SABLE hook) is now mode-aware. When `CLAUDE_AGENT_NAME` is set or `CLAUDE_AGENT_ROLE=manager` (i.e. a multi-manager session), the hook hard-blocks (denies) `bd create` if the description is missing required content. Outside that context (single-agent SABLE), it nudges via `additionalContext`. Rolling execution depends on bead descriptions reliably naming files; the manager-context hard-block is the structural answer to bead-quality drift.
 
@@ -644,15 +639,16 @@ All twelve hooks live in `hooks/multi-manager/`. Every continuous-mode hook (eve
 # install.sh does this automatically — run it instead of copying by hand.
 # Manual copy (same idempotent logic):
 mkdir -p ~/.claude/agents
-for name in columbo optimus rudy sherlock tarzan victor; do
+for name in columbo rudy sherlock victor; do
     cp templates/agents/${name}.md ~/.claude/agents/${name}.md
 done
 ```
 
-The named agent definitions in `~/.claude/agents/` are the v3 identity source
-for resident subagents (Optimus, Tarzan). Non-SABLE agent files in
-`~/.claude/agents/` are preserved — the installer only writes the six SABLE
-agents by name.
+The named agent definitions in `~/.claude/agents/` are the identity source for
+the planning **producers** only. The execution roles (lincoln, optimus, tarzan,
+chuck) are warm panes identified by `CLAUDE_AGENT_NAME` + their role files —
+they have no agent definitions. Non-SABLE agent files in `~/.claude/agents/`
+are preserved — the installer only writes the four producers by name.
 
 **Note:** edit the role source files in `templates/multi-manager/roles/` and
 re-run `bin/sable-build-agents` (then `install.sh`) to propagate changes. Hand-
@@ -706,15 +702,15 @@ Defaults: `SABLE_BASE_BRANCH=origin/main`, `SABLE_PRE_PUSH_TEST_PHASE=auto`, `SA
 
 If you need a longer test budget in auto mode, remember to raise `"timeout"` in settings.json to match — see Coordination mechanism 5 for the coupling rule. Or switch to skip mode if your repo already has a native pre-push hook.
 
-### Step 8: Add aliases
+### Step 8: Add aliases (optional)
 
-See [Identity & immutability → Launch aliases](#launch-aliases) for the v3 set.
-**Minimum for a v3 execution session** is just Lincoln and Chuck — Optimus and
-Tarzan are resident subagents, not separate shells. Add planning agent functions
-when you start running planning sessions.
+**An execution session needs no aliases** — `sable-tmux --autostart` launches
+every pane with its identity set. The aliases below are for launching a single
+role by hand (see [Launching sessions](#launching-sessions-sable-tmux--sable-launch));
+add planning agent functions when you start running planning sessions.
 
 ```bash
-# In ~/.zshrc — minimum for v3:
+# In ~/.zshrc — optional manual-launch forms:
 alias lincoln='CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude'
 alias chuck='CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude'
 
@@ -744,7 +740,7 @@ Should return Lincoln's addressed beads (or "Inbox empty" if none). Try `bd read
 Confirm that the agent definitions installed correctly:
 
 ```bash
-ls ~/.claude/agents/   # should list columbo.md optimus.md rudy.md sherlock.md tarzan.md victor.md
+ls ~/.claude/agents/   # should list columbo.md rudy.md sherlock.md victor.md (producers only)
 ```
 
 `sable-agents <name>` should print details for any registered agent — useful for spot-checking that the registry was copied to `~/.claude/sable/agents.yaml` correctly.
@@ -756,47 +752,37 @@ ls ~/.claude/agents/   # should list columbo.md optimus.md rudy.md sherlock.md t
 ### Manager loop (rolling)
 
 ```
-1. Check /inbox at the top of each cycle (auto-injected on every bash call anyway)
+1. Read any ⟦SABLE-MSG⟧ direction and drain /inbox (bd ready -l for-<self>)
 2. Resolve any urgent coord beads (P0)
 3. Pick next bead from claim_filter pool: bd ready <claim_filter> --no-label for-*
-4. Pre-dispatch hooks fire automatically (refresh, claim, overlap, preempt)
-5. Dispatch worker via Agent tool — fill the canonical worker-dispatch template
+4. Verify the bead against HEAD, claim it
+5. Dispatch a worker pane via the worker-spawn helper — it creates the
+   worktree, pins the model from the bead's model: label, runs the
+   governance checks, and delivers the canonical worker-dispatch template
    (templates/worker-dispatch.md). All required slots; no shortcuts.
-6. While worker runs: plan next dispatch, handle returned worker if any
-7. When a worker returns:
-   a. Review their output
-   b. git push triggers pre-push hook (rebase + test)
-   c. Successful push triggers post-push hook (file for-chuck)
-8. Repeat
+6. While workers run: plan the next dispatch; poll sable-worker-status
+7. When a worker finishes (bead closed, @sable_status=done):
+   a. Review the result via the bead pool + the pushed branch
+   b. The worker already self-pushed; its push notified Chuck message-first
+      (durable for-chuck bead as fallback)
+   c. Reap done panes: sable-worker-status --reap
+8. Repeat; stand down when the pool and the inbox are empty
 ```
 
 **The dispatch prompt is load-bearing.** Ad-hoc prompts drift mid-session
 (early dispatches say one thing, later ones say another), and workers absorb
-the inconsistency. Use the canonical template at
+the inconsistency. The worker-spawn helper delivers the canonical template at
 [`templates/worker-dispatch.md`](templates/worker-dispatch.md) for every
 dispatch. The slots aren't decorative — each one prevents a specific failure
 mode documented from real sessions.
 
-### Idle-state inbox polling
+### Reaching an idle manager
 
-The standard inbox-injection hook fires on every Bash call — fast latency while the manager is actively working. **When the manager goes idle** (last worker returned, no next bead picked, mid-session pause, end-of-session waiting on the user), no tool calls fire, so the inbox stops being checked. New `for-<self>` coord beads land silently until you type a message.
-
-To close the gap, idle managers run a `/loop 3m /inbox` — the same continuous-polling discipline Chuck uses, scoped to idle windows.
-
-```
-> /loop 3m /inbox
-```
-
-When to invoke:
-- After the last worker returns and there's no next bead to dispatch immediately
-- During AFK or mid-session pauses where new urgent coord beads might land
-- End-of-session before close, to keep the session reachable for late-breaking unblocks (e.g. "Tarzan just shipped your blocker — re-dispatch")
-
-When to drop:
-- Active dispatches in flight — the regular Bash hook fires fast enough; `/loop` adds nothing
-- Full session close — `/loop` consumes usage continuously; don't leave it running past the end of work
-
-This is the structural answer to "ring-the-bell" for cross-manager urgent signals. Async by design, predictable cadence, no new primitives. Cost: 3-minute worst-case latency on receiving an urgent unblock vs. immediate, in exchange for not building a bell mechanism that would still hit the same idle-prompt ceiling.
+A warm pane that has gone idle is still a live session: `sable-msg <role>
+"<text>"` lands as its next turn the moment it is free (verified through the
+type-ahead queue), and `--interrupt` lands it mid-turn. There is no polling gap
+to engineer around — the durable `for-<self>` beads are drained at the top of
+each loop cycle and via the `/inbox` manual pull.
 
 ### Chuck loop (continuous polling)
 
@@ -939,7 +925,7 @@ These were considered and dropped during design:
 - **Path ownership for epics** (mechanical block on writes outside owned paths) — too elaborate for the actual conflict surface; replaced by soft awareness via PR annotation
 - **`for-user` inbox** — beads aren't an effective human medium per the methodology owner's explicit feedback
 - **Custom MCP mailbox server** — premature; revisit if pull latency becomes painful
-- **Tmux send-keys cross-terminal doorbell** — superseded by `agent_id`-aware inbox injection hook
+- **Tmux send-keys cross-terminal doorbell** — dropped 2026-06-18 in favor of the `agent_id`-aware inbox injection hook, then **reversed 2026-06-25** after the injection-hook approach proved to be the bug-farm: send-keys was spike-tested for real and became `sable-msg`, the live lead↔manager channel (see `TMUX-AGENTS-DESIGN.md`)
 - **Presence/AFK file infrastructure** — `bd defer` + verbal instruction sufficient
 - **Batch execution mode** — fallback design; rolling is primary
 

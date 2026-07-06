@@ -25,17 +25,25 @@ hasno()  { if grep -qF  -- "$2" "$DOC" 2>/dev/null; then fail "$1" "unexpectedly
 hasno "no DISPATCH-REQUEST relay language"          "DISPATCH-REQUEST"
 hasno "Lincoln no longer receives dispatch messages" "receiving DISPATCH-REQUEST messages from Lincoln"
 
-# Native-spawn topology documented.
-has "managers dispatch their own workers"            "dispatches its own workers"
-has "managers push their own approved lanes"         "approved lanes"
-has "doc names the manager push command"             "git -C <worktree> push"
-has "managers self-dispatch + self-push (table)"     "self-dispatch workers and self-push"
+# Warm-pane topology documented (tmux-only, SABLE-qa4d).
+has "managers dispatch their own worker panes"       "worker pane"
+has "doc names the pane launcher"                    "sable-tmux"
+has "doc names the lead<->manager messaging path"    "sable-msg"
+has "workers self-push their own branches"           "self-push"
+has "doc links the tmux design doc"                  "TMUX-AGENTS-DESIGN.md"
+hasno "no manager git -C push lane remains"          "git -C <worktree> push"
+hasno "no resident-subagent manager framing remains" "resident manager subagents"
+hasno "no teams-topology default remains"            "Teams topology (default"
 
 # Still-accurate sections preserved.
 has "keeps the subagent-context identity discrimination" "Subagent context discrimination"
 has "keeps agent_type identity resolution"               "agent_type"
 has "keeps the read guard section"                       "Read guard"
 has "keeps the pre-push three-phase gate"                "three-phase gate"
+
+# Poll-based inbox-injection hooks are gone from the catalog (SABLE-qa4d.6).
+hasno "hook catalog drops inbox-injection"           "inbox-injection.sh"
+hasno "hook catalog drops inbox-injection-precompact" "inbox-injection-precompact.sh"
 
 echo
 echo "=========================================="

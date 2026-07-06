@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# test-thesis-docs.sh — lock the one-window nested-manager evolution into the
-# methodology thesis docs (SABLE-uz9.17). SABLE.md §6 and its public mirror
-# README.md §6 must document that the v2 orchestrator can be a resident manager
-# subagent that nest-dispatches its own workers, and must link to the pattern doc.
+# test-thesis-docs.sh — lock the warm-pane evolution into the methodology
+# thesis docs (SABLE-uz9.17; tmux-only SABLE-qa4d). SABLE.md §6 and its public
+# mirror README.md §6 must document that orchestrated execution runs as warm
+# tmux panes — operator → manager panes → per-bead worker panes — and must
+# link to the pattern doc.
 #
 # Run with: bash hooks/test/test-thesis-docs.sh
 
@@ -13,12 +14,15 @@ PASS=0; FAIL=0; FAIL_NAMES=""
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 has() { if grep -qiF -- "$3" "$REPO/$2" 2>/dev/null; then pass "$1"; else fail "$1" "$2 missing: $3"; fi; }
+hasno() { if grep -qF -- "$3" "$REPO/$2" 2>/dev/null; then fail "$1" "$2 unexpectedly has: $3"; else pass "$1"; fi; }
 
 for doc in SABLE.md README.md; do
-  has "$doc documents the one-window evolution"          "$doc" "one-window evolution"
-  has "$doc names the resident-manager nesting model"    "$doc" "nest-dispatch"
-  has "$doc frames the multi-tier operator->managers->workers" "$doc" "operator → resident managers → per-lane workers"
+  has "$doc documents the warm-pane evolution"           "$doc" "warm-pane evolution"
+  has "$doc names the pane launcher"                     "$doc" "sable-tmux"
+  has "$doc frames operator -> manager panes -> workers" "$doc" "operator → manager panes → per-bead worker panes"
   has "$doc links to the multi-manager pattern doc"      "$doc" "MULTI-MANAGER-PATTERN.md"
+  hasno "$doc drops the one-window evolution framing"    "$doc" "one-window evolution"
+  hasno "$doc drops the nest-dispatch model"             "$doc" "nest-dispatch"
 done
 
 echo

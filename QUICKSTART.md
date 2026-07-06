@@ -151,19 +151,19 @@ If `bd close` succeeded the first time without asking for tests, the hooks aren'
 
 Foundation gets you single-agent, sequential SABLE. The **Orchestration tier** is the top
 rung of the [adoption ramp](#adoption-ramp--the-install-is-the-same-the-practice-ramps-over-time):
-the **one-window native-spawn topology** where you talk to a single *Lincoln*
-session that hosts the named execution managers (*Optimus*, *Tarzan*) as resident
-subagents — and each manager dispatches its own background workers and pushes its
-own approved lane. Climb here once your bead-writing is automatic and your usage
+the **tmux warm-pane topology**, where every role is a real, persistent `claude`
+session in its own tmux pane — you talk to *Lincoln* (the lead pane), the
+execution managers (*Optimus*, *Tarzan*) dispatch one ephemeral worker pane per
+bead, workers self-push their own worktree branches, and *Chuck* (the merge-queue
+pane) merges them. Climb here once your bead-writing is automatic and your usage
 budget supports parallel agents (see SABLE.md §6).
 
 **Install the Orchestration tier:**
 
 ```bash
 cd ~/sable
-bash install.sh --orchestration              # teams topology (default, with nested fallback)
-bash install.sh --orchestration --subagent   # nested-subagent topology (opt-out)
-bash install.sh                              # no flag on a terminal → interactive tier/topology prompt
+bash install.sh --orchestration              # the tmux warm-pane layer (the only topology)
+bash install.sh                              # no flag on a terminal → interactive tier prompt
 SABLE_ORCHESTRATION=1 bash install.sh        # non-interactive equivalent of --orchestration
 ```
 
@@ -172,19 +172,18 @@ This adds, on top of the Foundation install:
   refresh/claim/overlap/preempt/model-check, the mode interlock, the
   pre-push gate, post-push notify, identity discrimination).
 - `~/.claude/sable/agents.yaml` — the agent registry (identities, lanes, inboxes).
+- `~/.claude/sable/roles/` — the four warm-pane role files (lincoln, optimus,
+  tarzan, chuck) that `session-role-anchor` injects into each pane.
 - `~/.claude/skills/` — the SABLE slash commands (`/sable-plan`, `/sable-execute`,
   `/gaudi`, `/columbo`, `/audit-deep-dive`, `/sable-review`), installed by their
   skill name.
-- The topology settings snippet is **merged into `~/.claude/settings.json`
+- The settings snippet is **merged into `~/.claude/settings.json`
   automatically** (backed up first; existing entries preserved).
-- The named agent definitions are already in `~/.claude/agents/` from the
+- The producer agent definitions are already in `~/.claude/agents/` from the
   Foundation install.
 
-The installer **auto-merges** the Orchestration hook block into
-`~/.claude/settings.json` (the teams governance-union snippet by default; the subagent
-snippet with `--subagent`/`--nested`) — it backs the file up first and never clobbers
-existing entries. **Restart Claude Code** afterward so the agent definitions, slash
-commands, and hook registrations load.
+**Restart Claude Code** afterward so the agent definitions, slash commands, and
+hook registrations load.
 
 **Verify orchestration:**
 
@@ -203,11 +202,9 @@ their modes never collide. (`sable-mode set` also adds the state dir to the
 repo's `.gitignore`, so it never shows up as an untracked file.)
 
 In a fresh session, `/sable-plan` walks the staged planning substages and `/sable-execute`
-drains the pool via the resident managers. Chuck (the merge-queue integrator)
-stays a second terminal — add its env-var alias from the installer's printed
-snippet if you run a merge queue. The full topology lives in
-[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) and
-[`ENTRY-POINTS-DESIGN.md`](ENTRY-POINTS-DESIGN.md).
+drains the pool via the warm-pane session (below). The full topology lives in
+[`TMUX-AGENTS-DESIGN.md`](TMUX-AGENTS-DESIGN.md) and
+[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md).
 
 **Three planning modes (free entry).** `/sable-discover` is **Mode 1** — a
 strategic, business-lens partner that decides *what* to build across a set of
@@ -218,39 +215,33 @@ executable backlog. Enter at any mode; a Full run started from a Discovery chart
 skips straight to RESEARCH. See
 [`PLANNING-MODES-DESIGN.md`](PLANNING-MODES-DESIGN.md).
 
-### Teams topology (default when available)
+### The warm-pane session (the only topology)
 
-The Orchestration tier defaults to Claude Code's **Agent Teams** surface — managers and
-Chuck become live team members that coordinate over `SendMessage`, collapsing the second
-terminal into one window. Teams is the default; nested subagents are the fallback when
-the experimental tooling is not active:
-
-- **Default (teams):** `bash install.sh --orchestration` — merges the teams governance-union
-  snippet. Requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in `~/.claude/settings.json`
-  (operator-added, never auto-written by the installer — locked decision). Without that flag
-  (or without the Team\* tools loaded) `/sable-execute` transparently falls back to the nested
-  topology.
-- **Explicit opt-out (nested):** `bash install.sh --orchestration --subagent` — merges the
-  nested-subagent snippet instead; Chuck stays a second terminal.
+Execution runs in one tmux session with one persistent `claude` pane per role.
+`sable-tmux` lays it out, sets each pane's identity (`CLAUDE_AGENT_NAME`), and —
+with `--autostart` — kicks the autonomous roles (optimus / tarzan / chuck) into
+their operating loops:
 
 ```bash
-# Default: teams topology with automatic nested fallback
-bash install.sh --orchestration
-# Then add this ONE line to ~/.claude/settings.json env block (operator step, not auto-written):
-#   "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
-# Launch Lincoln (sets identity + role and verifies the teams flag for you):
+# Bring up the session (lincoln + optimus + tarzan + chuck panes):
+sable-tmux --autostart
+tmux attach -t sable
+# Talk to Lincoln in its pane; direct managers with sable-msg:
+#   sable-msg optimus "status?"       (--interrupt to land mid-turn)
+# Reap finished worker panes:
+#   sable-worker-status --reap
+
+# Launching a single role by hand (e.g. a solo Lincoln session):
 sable-launch
 #   equivalent to: CLAUDE_AGENT_NAME=lincoln CLAUDE_AGENT_ROLE=manager claude
 #   (requires the repo bin/ on PATH — see PERSONAL-TOOLING.md)
-
-# Explicit opt-out: nested-subagent topology
-bash install.sh --orchestration --subagent
 ```
 
-`/sable-execute` runs `sable-teams-preflight`; when the Agent Teams tooling is available it
-spawns Optimus, Tarzan, and Chuck as team members (no separate Chuck terminal). Without the
-flag it falls back to nested subagents seamlessly. The full design is in
-[`AGENT-TEAMS-DESIGN.md`](AGENT-TEAMS-DESIGN.md).
+Managers dispatch one worker pane per bead (worktree = pane CWD, model pinned
+from the bead's `model:` label); workers do TDD, pass the gates, self-push, and
+close their beads; Chuck merges, notified message-first with a durable
+`for-chuck` bead as fallback. No experimental flags, no second terminal. The
+full design is in [`TMUX-AGENTS-DESIGN.md`](TMUX-AGENTS-DESIGN.md).
 
 ---
 

@@ -604,17 +604,18 @@ The orchestrator's job is to make workers successful by:
 3. Ensuring no two workers touch the same files
 4. Reviewing results and handling failures
 
-**The one-window evolution (v3).** On builds with nested subagents (Claude Code
-2.1.177+), the orchestrator no longer has to be the operator's own session. SABLE
-v3 runs **one operator-facing window** — the *Lincoln* main session — that hosts
-the named execution managers (*Optimus* for epic work, *Tarzan* for one-offs) as
-**resident subagents**. Each manager is itself an orchestrator: it nest-dispatches
-its own worker swarm via the Agent tool, reviews each worker's stopped-before-push
-result, and pushes its own approved lane. The two-tier model becomes multi-tier —
-**operator → resident managers → per-lane workers** — all inside one window, with
-the mechanical governance firing on each *manager's own* dispatch. This is the top
-rung of the adoption ramp; the full topology and coordination hooks live in
-[`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md).
+**The warm-pane evolution (tmux).** The orchestrator no longer has to be the
+operator's own session. Orchestrated SABLE runs **one tmux session with a warm
+`claude` pane per role** — the operator talks to the *Lincoln* lead pane, while
+the named execution managers (*Optimus* for epic work, *Tarzan* for one-offs)
+and the merge queue (*Chuck*) run warm in their own panes, launched by
+`sable-tmux` and directed over `sable-msg`. Each manager is itself an
+orchestrator: it dispatches one ephemeral worker pane per bead, and its workers
+**self-push** their own branches. The two-tier model becomes multi-tier —
+**operator → manager panes → per-bead worker panes** — with the mechanical
+governance firing on each real session. This is the top rung of the adoption
+ramp; the full topology lives in [`TMUX-AGENTS-DESIGN.md`](TMUX-AGENTS-DESIGN.md)
+and [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md).
 
 ### 6.2 Dispatching Workers
 

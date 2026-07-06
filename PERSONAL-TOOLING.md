@@ -8,7 +8,7 @@ Contents:
 - `skills/audit-deep-dive/SKILL.md` — Claude Code skill for converting AUDIT: beads into epic+children
 - `skills/columbo/SKILL.md` + `skills/columbo/columbo-prefilter.py` — Claude Code skill that delivers the Columbo test-coverage planning workflow without requiring the multi-manager registry, role files, agent identity, or coordination hooks. Use this on machines where you want Columbo's interview + skeleton-test output but not the full multi-manager pattern (typical for work computers where you bounce between many repos). Invokable as `/columbo` once installed at `~/.claude/skills/columbo/`.
 - `MULTI-MANAGER-PATTERN.md` — experimental coordination pattern for power-user multi-agent swarms. Eight-agent roster: continuous execution managers (Optimus / Tarzan / Chuck), session-scoped planning agents (Sherlock / Victor / Rudy / Columbo), and execution-session strategist (Lincoln). Companion `hooks/multi-manager/`, `templates/multi-manager/`, `bin/columbo-prefilter.py` (Columbo's audit-mode triage tool), and `bin/sable-agents` reminder helper.
-- `MULTI-MANAGER-PATTERN.md` + orchestration tooling — v3 one-window topology: teams surface is the default (Optimus, Tarzan, and Chuck as live team members — Chuck folds in, no second terminal); nested subagents are the automatic fallback when `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is absent. Planning has three modes with free entry (see PLANNING-MODES-DESIGN.md): Discovery (`/sable-discover`, Mode 1 — strategic/business-lens, decides *what* to build and emits charters), plus the specification half — Full (the five-stage gated machine: framing → research → architecture → test-strategy → decomposition) and Quick — both via `/sable-plan`; `/sable-execute` drains. Companion `bin/sable-mode`, `bin/sable-charter`, `hooks/multi-manager/mode-interlock.sh`, `skills/sable-plan`, `skills/sable-discover`, `skills/sable-execute`. See install step 4 below.
+- `MULTI-MANAGER-PATTERN.md` + orchestration tooling — the tmux warm-pane topology (the only one, TMUX-AGENTS-DESIGN.md): every execution role (lincoln, optimus, tarzan, chuck) is a persistent `claude` pane launched by `sable-tmux --autostart`; managers dispatch one worker pane per bead, workers self-push, Chuck merges; lead↔manager messaging is `sable-msg`. Planning has three modes with free entry (see PLANNING-MODES-DESIGN.md): Discovery (`/sable-discover`, Mode 1 — strategic/business-lens, decides *what* to build and emits charters), plus the specification half — Full (the five-stage gated machine: framing → research → architecture → test-strategy → decomposition) and Quick — both via `/sable-plan`; `/sable-execute` drains. Companion `bin/sable-tmux`, `bin/sable-msg`, `bin/sable-worker-status`, `bin/sable-mode`, `bin/sable-charter`, `hooks/multi-manager/mode-interlock.sh`, `skills/sable-plan`, `skills/sable-discover`, `skills/sable-execute`. See install step 4 below.
 
 ## Columbo: skill vs. multi-manager pattern
 
@@ -26,7 +26,7 @@ After `git fetch` + `git checkout personal-tooling`:
 ### 1. SABLE CLI tools on PATH
 
 `bash install.sh` links the `sable-*` tools (`sable-launch`, `sable-note`,
-`sable-mode`, `sable-teams-preflight`, ...) into `~/.local/bin` for you via
+`sable-mode`, `sable-tmux`, `sable-msg`, ...) into `~/.local/bin` for you via
 `bin/sable-bin-install` (symlinks by default, so a tool resolves back to the repo —
 `sable-note` finds the repo feedback dir — and never goes stale). If `~/.local/bin`
 is on your PATH you are done: verify with `sable-note --help`.
@@ -115,7 +115,7 @@ via the manager swarm. The installer is **self-sufficient** — it installs its 
 (`agents.yaml`) and identity injection, so orchestration identity works standalone;
 the full *running* manager swarm (step 3) is optional. Full rationale in
 [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md); the surface is summarized in
-`MULTI-MANAGER-PATTERN.md` → "The v3 topology (one-window)".
+`MULTI-MANAGER-PATTERN.md` → "The warm-pane topology (tmux)".
 
 Files:
 - `bin/sable-mode` — mode-state read/write helper (python3, no jq); **per-repo** source of truth at `<repo>/.claude/sable/state/mode-state.json` (resolved from the git common-dir so worktrees share it; `~/.claude/sable/state/mode-state.json` fallback outside a git repo; `SABLE_MODE_STATE` overrides) — lets concurrent SABLE sessions in different repos keep independent modes. `sable-mode path` prints the resolved path. Honors the `SABLE_ORCHESTRATION` off-switch.
@@ -131,8 +131,7 @@ Install with the installer (do NOT hand-copy):
 
 ```bash
 # from the repo, install into the CURRENT project's ./.claude (default, contained):
-sable-orchestration-install                    # teams topology (default, with nested fallback)
-sable-orchestration-install --subagent         # nested-subagent topology (opt-out)
+sable-orchestration-install                    # the tmux warm-pane layer (the only topology)
 
 # or install globally into ~/.claude for use everywhere:
 sable-orchestration-install --user
@@ -150,18 +149,18 @@ uncommitted `.claude/settings.local.json`; `--user` writes `~/.claude/settings.j
 backed up first and JSON-validated, never clobbering existing hooks). It warns
 only if `textual` is missing.
 
-**Teams topology and the experimental flag.** The default install merges the teams
-governance-union snippet. For teams to activate at runtime you must add one line to
-`~/.claude/settings.json` yourself (the installer never auto-writes it — locked
-decision):
+**The warm-pane session.** Execution runs as one tmux session with a persistent
+`claude` pane per role (lincoln, optimus, tarzan, chuck) — no experimental
+flags, no second terminal:
 
-```json
-"env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
+```bash
+sable-tmux --autostart     # lay out the panes + kick the autonomous roles
+tmux attach -t sable
 ```
 
-Without that flag (or without the Team\* tools loaded) `/sable-execute` transparently
-falls back to the nested-subagent topology — Chuck stays a second terminal in that
-case. With it, Chuck folds into the team and the second terminal is eliminated.
+Managers dispatch one worker pane per bead; workers self-push; Chuck merges
+(message-first via `sable-msg`, durable `for-chuck` bead as fallback). Design:
+[`TMUX-AGENTS-DESIGN.md`](TMUX-AGENTS-DESIGN.md).
 
 **Scope.** Default is **project** (`./.claude`) so the machinery stays contained
 to the repos where you want it and is trivially removable. `--user` opts into a

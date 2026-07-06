@@ -13,6 +13,7 @@ PASS=0; FAIL=0; FAIL_NAMES=""
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 has() { if grep -qiF -- "$2" "$DOC" 2>/dev/null; then pass "$1"; else fail "$1" "missing: $2"; fi; }
+hasno() { if grep -qF -- "$2" "$DOC" 2>/dev/null; then fail "$1" "unexpectedly present: $2"; else pass "$1"; fi; }
 
 [ -f "$DOC" ] || { echo "FAIL: $DOC missing"; exit 2; }
 
@@ -26,6 +27,15 @@ has "names the skills (slash command) install"      ".claude/skills"
 has "points at sable-mode for orchestration verify" "sable-mode get"
 has "frames /sable-plan and /sable-execute"        "/sable-execute"
 has "links to the pattern doc for depth"           "MULTI-MANAGER-PATTERN.md"
+
+# tmux-only (SABLE-qa4d): the warm-pane bring-up is documented; the retired
+# topology fork and teams flag are gone.
+has   "documents the sable-tmux bring-up"          "sable-tmux --autostart"
+has   "documents attaching to the session"         "tmux attach"
+hasno "no teams experimental flag remains"         "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"
+hasno "no SABLE_TEAMS toggle remains"              "SABLE_TEAMS"
+hasno "no --subagent topology flag remains"        "--subagent"
+hasno "no --teams topology flag remains"           "install.sh --orchestration --teams"
 
 echo
 echo "=========================================="

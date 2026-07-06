@@ -1,5 +1,15 @@
 # SABLE Agent-Teams Topology — Design (parallel mode)
 
+> **Status: SUPERSEDED (2026-07-06).** The agent-teams topology (and the
+> nested-subagent topology it paralleled) was removed under epic `SABLE-qa4d`
+> in favor of the **tmux warm-pane topology** — see
+> [`TMUX-AGENTS-DESIGN.md`](TMUX-AGENTS-DESIGN.md) for the diagnosis (identity
+> bleed, inbox-keying misses, non-persistent managers, unreliable member-push
+> hooks — several first documented in this file's live-dogfooding amendments)
+> and the replacement design. This document is kept unedited below as the
+> historical record of what was built, what the spikes found, and why it was
+> retired. Nothing below is current guidance.
+
 > **Status: design, `agent-teams` branch.** A second coordination topology for
 > SABLE built on Claude Code's experimental **Agent Teams** feature
 > (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`: `TeamCreate`, `SendMessage`,
