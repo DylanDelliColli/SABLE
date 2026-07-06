@@ -81,11 +81,15 @@ one gate at a time.
 tmux warm-pane topology (SABLE-bldh): **managers are warm panes; you direct them
 over tmux and they spawn + watch their own workers.**
 
-- **The managers are panes, not subagents.** `sable-tmux` brings up the session
-  — lincoln (you), optimus, tarzan, chuck — each a real warm `claude` session
-  with its own `CLAUDE_AGENT_NAME`. You do not spawn managers via the Agent tool;
-  remind the operator to run `sable-tmux` (or confirm the panes are up) at the
-  start of an execution session.
+- **The managers are panes, not subagents.** The session starts Lincoln-only
+  (`sable-launch` — mode-neutral: launching says nothing about executing).
+  Entering execution is when the fleet stands up: run `sable-spawn-manager
+  --all` (or per role) — each manager opens as a real warm `claude` session in
+  its OWN detached window with its own `CLAUDE_AGENT_NAME`, kicked into its
+  operating loop, never a split of the window the operator is looking at. You
+  do not spawn managers via the Agent tool, and never in planning mode (the
+  interlock blocks it). The operator deep-dives into manager windows with
+  `sable-view <role>`, typically from a second terminal.
 - **You direct managers via `sable-msg`, not bead relays.** `sable-msg optimus
   "drop the auth epic, the API one is urgent now"` injects the message as a turn
   in Optimus's pane (`--interrupt` to land it now vs. queue behind its current

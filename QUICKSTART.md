@@ -208,25 +208,31 @@ skips straight to RESEARCH. See
 Two commands to remember:
 
 ```bash
-sable-launch      # START: bring up the session (or reuse it) and attach —
-                  # lincoln + optimus + tarzan + chuck panes, autonomous roles
-                  # kicked into their operating loops
-sable-view        # PEEK: status table of every agent pane + worker window
+sable-launch      # START: your session — a tmux session holding ONLY the
+                  # lincoln pane, the agent you talk to. Mode-neutral: plan
+                  # or execute from here; no managers yet.
+sable-view        # DEEP-DIVE: inspect the agent panes — best from a SECOND
+                  # terminal (it attaches via a grouped session, so your
+                  # Lincoln view is never stolen)
 ```
 
-Once attached, talk to Lincoln in its pane. Mid-session:
+Talk to Lincoln full-screen. When execution starts (`/sable-execute`), the
+managers stand up **on demand** — `sable-spawn-manager --all` opens optimus,
+tarzan, and chuck in their own *hidden windows*, kicked into their operating
+loops; your Lincoln window stays exactly where it is. Mid-session:
 
 ```bash
-sable-view optimus          # jump to a pane
+sable-view                  # status table: every role pane + worker window
+sable-view optimus          # deep-dive into a manager (second terminal)
 sable-view worker --tail    # read a hidden worker window without switching
 sable-msg optimus "status?" # message a pane (--interrupt to land mid-turn)
 sable-worker-status --reap  # clear finished worker panes
 sable --help                # the full operator map, any time
 ```
 
-(`sable-launch` wraps the lower-level `sable-tmux --autostart` layout tool and
-attaches with `tmux attach -t sable`; `sable-launch lincoln` still launches a
-single identity session by hand.)
+(`sable-launch` wraps the lower-level `sable-tmux` layout tool and attaches
+with `tmux attach -t sable`; `sable-launch lincoln` still launches a single
+identity session by hand.)
 
 Managers dispatch one worker pane per bead (worktree = pane CWD, model pinned
 from the bead's `model:` label); workers do TDD, pass the gates, self-push, and

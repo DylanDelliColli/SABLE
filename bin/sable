@@ -24,11 +24,14 @@ operator_map() {
 sable — the SABLE operator map
 
 START HERE
-  sable-launch              start (or re-attach) the warm-pane session:
-                            one persistent claude pane per role — lincoln,
-                            optimus, tarzan, chuck — managers kicked into
-                            their operating loops
-  sable-view                peek at the agent panes mid-session:
+  sable-launch              start (or re-attach) YOUR session: a tmux session
+                            holding only the lincoln pane — the agent you talk
+                            to. Mode-neutral: plan or execute from here.
+                            Managers appear later, in their own hidden windows
+                            (sable-spawn-manager, driven by /sable-execute).
+  sable-view                deep-dive into the agent panes — best from a
+                            SECOND terminal (grouped session: your Lincoln
+                            view is never stolen):
                               sable-view                 status table
                               sable-view <role>          focus that pane
                               sable-view <role> --tail   read it without switching
@@ -40,6 +43,7 @@ WORK DOORS (type these to Lincoln, in its pane)
                             workers self-push, Chuck merges
 
 TOOLBOX (each also runs as `sable <name> ...`, e.g. `sable msg ...`)
+  sable-spawn-manager <role>|--all  stand up manager windows (execution mode)
   sable-msg <role> "<text>"      message a pane (--interrupt to land mid-turn)
   sable-worker-status [--reap]   list / reap worker panes
   sable-mode                     read or flip the planning|execution mode state

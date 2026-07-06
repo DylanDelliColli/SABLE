@@ -41,7 +41,9 @@ done
 # --- lincoln: directs managers over tmux; planning producers stay subagents ---
 has "lincoln" "sable-msg"   "directs managers via sable-msg"
 has "lincoln" "$GLYPH"      "carries the sender-framing rule"
-has "lincoln" "sable-tmux"  "references the sable-tmux launcher"
+has "lincoln" "sable-launch" "references the mode-neutral session door (SABLE-dqhn)"
+has "lincoln" "sable-spawn-manager" "stands up managers on demand via sable-spawn-manager"
+lacks "lincoln" "all four roles" "no longer claims launch brings up all four roles"
 
 # --- chuck: a warm pane ---
 has "chuck" "sable-tmux"    "is a sable-tmux pane"

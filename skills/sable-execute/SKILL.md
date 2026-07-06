@@ -2,13 +2,14 @@
 name: sable-execute
 description: |
   Flip SABLE into EXECUTION mode — drain the bead pool. Writes the
-  mode-state file via `sable-mode set execution`, brings up (or verifies) the
-  warm-pane tmux session — one persistent claude pane per role (lincoln,
-  optimus, tarzan, chuck) — and kicks the autonomous panes into their
-  operating loops. Managers spawn a worker pane per bead; workers self-push
-  their worktree branches; Chuck merges. In execution mode the interlock hook
-  blocks spawning planning-only producers — you are draining the pool, not
-  filling it.
+  mode-state file via `sable-mode set execution`, then stands up the manager
+  fleet on demand: `sable-spawn-manager --all` opens optimus, tarzan, and
+  chuck as warm claude panes in their own hidden windows and kicks their
+  operating loops (the session itself is Lincoln-only until now —
+  sable-launch is mode-neutral). Managers spawn a worker pane per bead;
+  workers self-push their worktree branches; Chuck merges. In execution mode
+  the interlock hook blocks spawning planning-only producers — you are
+  draining the pool, not filling it.
   Use when asked to "/sable-execute", "enter execution mode", "start executing", or
   "drain the backlog".
 allowed-tools:
@@ -71,25 +72,21 @@ worker-spawn tooling resolve against.
 
 Determine which of two states you are in:
 
-- **You are already the lincoln pane** of a running sable session — you were
-  launched by `sable-tmux` (check: `CLAUDE_AGENT_NAME` is `lincoln` and `$TMUX`
-  is set; `tmux display-message -p '#{@sable_role}'` prints `lincoln`). The
-  managers are warm in their own panes. If they were started with
-  `--autostart` they are already in their operating loops; otherwise kick them
-  now via `sable-msg` (step 3).
+- **You are the lincoln pane** of a running sable session (check:
+  `CLAUDE_AGENT_NAME` is `lincoln` and `$TMUX` is set;
+  `tmux display-message -p '#{@sable_role}'` prints `lincoln`). This is the
+  normal case — `sable-launch` creates a Lincoln-only session. **Stand up the
+  fleet now**: run `sable-spawn-manager --all` — each manager (optimus,
+  tarzan, chuck) opens as a warm `claude` session in its OWN detached window
+  (your window is not disturbed), launched with a bypass permission posture
+  and kicked into its operating loop. Idempotent: already-running managers are
+  skipped. The interlock allows this only in execution mode — which you just
+  set in step 1.
 - **No sable session exists yet** (`tmux has-session -t sable` fails). Tell the
-  operator to run, from a plain terminal:
-
-  ```bash
-  sable-launch
-  ```
-
-  and to continue this conversation in the **lincoln pane** of that session.
-  `sable-launch` wraps `sable-tmux --autostart` (one pane per role — lincoln,
-  optimus, tarzan, chuck; existing sessions are reused, never clobbered; the
-  autonomous roles launch with a bypass permission posture and are kicked into
-  their operating loops once their TUIs are ready) and then attaches
-  (`tmux attach -t sable`).
+  operator to run `sable-launch` from a plain terminal (it wraps `sable-tmux`,
+  creates the Lincoln-only session, and attaches — `tmux attach -t sable`),
+  continue this conversation in the **lincoln pane**, then stand up the fleet
+  as above.
 
 How the drain works (all of it happens in the panes, not in your context):
 

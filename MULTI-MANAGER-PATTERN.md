@@ -110,11 +110,14 @@ sable-agents victor       # single agent + role file path
 
 SABLE's execution surface is **one tmux session, one warm `claude` pane per
 role** — the only topology (SABLE-qa4d; designed in
-[`TMUX-AGENTS-DESIGN.md`](TMUX-AGENTS-DESIGN.md)). `sable-tmux` lays out the
-panes (lincoln, optimus, tarzan, chuck), sets each pane's identity
-(`CLAUDE_AGENT_NAME` / `CLAUDE_AGENT_ROLE=manager`), and registers each role in
-the role→pane registry; `--autostart` kicks the autonomous roles into their
-operating loops.
+[`TMUX-AGENTS-DESIGN.md`](TMUX-AGENTS-DESIGN.md)). The session starts
+**Lincoln-only** (`sable-launch`, wrapping the `sable-tmux` layout tool —
+mode-neutral: a planning session needs no fleet). When execution begins,
+`sable-spawn-manager` stands up optimus/tarzan/chuck **on demand** — each in
+its own detached window (the operator's Lincoln window is never disturbed),
+with its identity (`CLAUDE_AGENT_NAME` / `CLAUDE_AGENT_ROLE=manager`) set at
+launch, registered in the role→pane registry, and kicked into its operating
+loop. The interlock gates manager spawning to execution mode.
 
 **Lincoln** is the pane you talk to. **Optimus and Tarzan** are resident manager
 panes: each drains its lane from `bd ready`, and each **dispatches its own
@@ -180,12 +183,14 @@ Each manager launches with an immutable identity established at the OS level, no
 
 ### Launching sessions (sable-launch + sable-view)
 
-The session door is **`sable-launch`**: it brings the warm-pane session up if
-absent (wrapping `sable-tmux --autostart` — every execution role launched as a
-pane with its identity set at the OS level, no aliases, no hand-typed env vars;
-existing sessions are reused) and attaches. Mid-session, **`sable-view`** is
-the peek tool: a status table of every agent pane and hidden worker window,
-`sable-view <role>` to focus one, `sable-view <role> --tail` to read one
+The session door is **`sable-launch`**: a tmux session holding only the
+lincoln pane (identity set at the OS level, no aliases; existing sessions
+reused), attached — mode-neutral. The fleet arrives later via
+**`sable-spawn-manager`** (execution mode only), each manager in its own
+hidden window. **`sable-view`** is the inspection tool: a status table of
+every agent pane and worker window, `sable-view <role>` to deep-dive
+(from a second terminal it attaches through a grouped session so the
+Lincoln client's focus is untouched), `sable-view <role> --tail` to read one
 without switching. `sable --help` prints the whole operator map.
 
 For a **single role by hand** (a solo Lincoln session, or re-launching one
