@@ -20,10 +20,9 @@ AGENTS_YAML_SRC="${TEMPLATE_DIR}/multi-manager/agents.yaml"
 SKILLS_SRC="${REPO_DIR}/skills"
 SKILLS_DST="${CLAUDE_DIR}/skills"
 
-# --- CLI flags (SABLE-106, front door SABLE-ppy) ---
+# --- CLI flags (SABLE-106, front door SABLE-ppy; tmux-only SABLE-qa4d) ---
 DRY_RUN=0
 ORCHESTRATION=0
-TOPOLOGY="teams"
 TIER_SET=0
 [ "${SABLE_ORCHESTRATION:-}" = "1" ] && { ORCHESTRATION=1; TIER_SET=1; }
 for arg in "$@"; do
@@ -31,15 +30,13 @@ for arg in "$@"; do
         --dry-run)       DRY_RUN=1 ;;
         --orchestration) ORCHESTRATION=1; TIER_SET=1 ;;
         --foundation)    ORCHESTRATION=0; TIER_SET=1 ;;
-        --subagent|--nested) TOPOLOGY="subagent" ;;
-        --teams)         TOPOLOGY="teams" ;;
+        --subagent|--nested|--teams)
+            echo "install.sh: '$arg' was retired — the Orchestration tier runs on the tmux warm-pane layout only (see TMUX-AGENTS-DESIGN.md)" >&2
+            exit 1 ;;
         -h|--help)
-            echo "Usage: install.sh [--foundation|--orchestration] [--subagent|--nested|--teams] [--dry-run]"
-            echo "  --orchestration        install the Orchestration tier (manager workflow)"
+            echo "Usage: install.sh [--foundation|--orchestration] [--dry-run]"
+            echo "  --orchestration        install the Orchestration tier (manager workflow, tmux warm panes)"
             echo "  --foundation           base methodology only (default if neither chosen non-interactively)"
-            echo "  --teams                Orchestration topology: teams (default) — live agent coordination"
-            echo "                         Needs CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1."
-            echo "  --subagent|--nested    Orchestration topology: nested subagents (opt-out from teams)"
             echo "  --dry-run              report what would be done; write nothing"
             echo "  (run with no tier flag on a terminal to choose interactively;"
             echo "   or set SABLE_ORCHESTRATION=1 for the Orchestration tier)"
@@ -86,15 +83,7 @@ if [ "$TIER_SET" = "0" ] && [ -t 0 ]; then
     echo "                    specialist agents that write, review, and merge code with"
     echo "                    minimal supervision. Best for larger efforts to delegate."
     printf 'Tier [1]: '; read -r _tier
-    if [ "$_tier" = "2" ]; then
-        ORCHESTRATION=1
-        bold "  Topology"
-        echo "    [1] Teams (default)       Managers coordinate live via messaging — more"
-        echo "                              parallelism. Needs CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1."
-        echo "    [2] Subagent/nested       Managers run as background subagents. Stable fallback."
-        printf '  Topology [1]: '; read -r _topo
-        [ "$_topo" = "2" ] && TOPOLOGY="subagent"
-    fi
+    [ "$_tier" = "2" ] && ORCHESTRATION=1
     echo
 fi
 
@@ -156,11 +145,12 @@ if ! command -v dolt >/dev/null 2>&1 && ! command -v dolt.exe >/dev/null 2>&1; t
 fi
 echo
 
-# CC version floor (warn, don't fail) — the Orchestration tier's nested-subagent
-# dispatch needs Claude Code >= 2.1.172. Foundation installs fine on any version.
+# CC version floor (warn, don't fail) — the Orchestration tier's named-agent
+# (producer) dispatch needs Claude Code >= 2.1.172. Foundation installs fine on
+# any version.
 CC_VER="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
 if [ -n "${CC_VER}" ] && ! python3 -c "import sys;v=tuple(int(x) for x in '${CC_VER}'.split('.'));sys.exit(0 if v>=(2,1,172) else 1)" 2>/dev/null; then
-    yellow "  Note: Claude Code ${CC_VER} is below 2.1.172 — the Orchestration tier needs >= 2.1.172 for nested-subagent dispatch. Foundation installs fine; upgrade before using managers."
+    yellow "  Note: Claude Code ${CC_VER} is below 2.1.172 — the Orchestration tier needs >= 2.1.172 for named-agent (producer) dispatch. Foundation installs fine; upgrade before using managers."
     echo
 fi
 
@@ -229,10 +219,10 @@ bold "Step 6/8: Orchestration (multi-manager) tier"
 if [ "$ORCHESTRATION" != "1" ]; then
     yellow "  Skipped — Foundation tier. Re-run with --orchestration (or SABLE_ORCHESTRATION=1)."
 elif [ "$DRY_RUN" = "1" ]; then
-    yellow "  would delegate: sable-orchestration-install --user --${TOPOLOGY}"
+    yellow "  would delegate: sable-orchestration-install --user"
 elif [ -x "${REPO_DIR}/bin/sable-orchestration-install" ]; then
-    green "  Delegating to sable-orchestration-install (--user --${TOPOLOGY})..."
-    bash "${REPO_DIR}/bin/sable-orchestration-install" --user --"${TOPOLOGY}"
+    green "  Delegating to sable-orchestration-install (--user)..."
+    bash "${REPO_DIR}/bin/sable-orchestration-install" --user
 else
     yellow "  bin/sable-orchestration-install not found — skipping Orchestration tier"
 fi
@@ -325,12 +315,9 @@ echo "  1. Paste the hook block(s) above into ${SETTINGS_FILE} (merge with exist
 echo "  2. In your project: bd init && bd hooks install"
 echo "  3. Agent definitions are now in ${CLAUDE_DIR}/agents/ — restart Claude Code for them to take effect."
 if [ "$ORCHESTRATION" = "1" ]; then
-    echo "  4. Orchestration tier installed (topology: ${TOPOLOGY}) — its settings snippet was merged automatically."
+    echo "  4. Orchestration tier installed — its settings snippet was merged automatically."
     echo "     RESTART Claude Code so /sable-plan /sable-execute /gaudi /columbo register."
-    if [ "$TOPOLOGY" = "teams" ]; then
-        echo "     Teams: add CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 to settings.json env + export SABLE_TEAMS=1 (see step 5 output)."
-    fi
-    echo "     Chuck stays a terminal — add the env-var alias from QUICKSTART.md if you run the merge queue."
+    echo "     Bring up the warm-pane session:  sable-tmux --autostart   (then: tmux attach -t sable)"
 fi
 echo "  5. Open a fresh agent session and use the bootstrap prompt from QUICKSTART.md"
 echo "  6. Verify: see 'Verify the install' section of QUICKSTART.md"
