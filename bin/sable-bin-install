@@ -62,8 +62,10 @@ done
 
 note() { printf '%s\n' "$*" >&2; }
 
-# Collect the tools to install: sable-* shell entrypoints (excludes *.py / *.bak / *~).
+# Collect the tools to install: the bare `sable` umbrella + sable-* shell
+# entrypoints (excludes *.py / *.bak / *~).
 TOOLS=""
+[ -f "$BIN_DIR/sable" ] && TOOLS="sable"
 for f in "$BIN_DIR"/sable-*; do
   [ -f "$f" ] || continue
   case "$f" in *.py|*.bak|*~) continue ;; esac

@@ -25,7 +25,7 @@ fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n
 [ -x "$INSTALL" ] || { fail "sable-bin-install is executable"; echo "Tests: 1 | Passed: 0 | Failed: 1"; exit 1; }
 pass "sable-bin-install is executable"
 
-CORE_TOOLS="sable-launch sable-note sable-mode sable-tmux sable-msg"
+CORE_TOOLS="sable sable-launch sable-note sable-mode sable-tmux sable-msg sable-view"
 
 # ---- UNIT: symlink install into a dir NOT on PATH ----
 D1=$(mktemp -d)

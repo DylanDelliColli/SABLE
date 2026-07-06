@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# sable — the umbrella command (SABLE-ssws.4). `sable --help` is the operator
+# map; `sable <sub> ...` dispatches to the sable-<sub> sibling tool; `sable
+# help <sub>` shows that tool's usage.
+
+set -u
+
+# Resolve siblings next to the REAL script (works via the ~/.local/bin symlink).
+SELF="${BASH_SOURCE[0]}"
+[ -L "$SELF" ] && SELF="$(readlink -f "$SELF" 2>/dev/null || echo "$SELF")"
+BIN_DIR="${SELF%/*}"
+
+subcommands() {
+  local f
+  for f in "$BIN_DIR"/sable-*; do
+    [ -f "$f" ] && [ -x "$f" ] || continue
+    case "$f" in *.py|*.bak|*~) continue ;; esac
+    printf '%s\n' "${f##*/sable-}"
+  done
+}
+
+operator_map() {
+  cat <<'EOF'
+sable — the SABLE operator map
+
+START HERE
+  sable-launch              start (or re-attach) the warm-pane session:
+                            one persistent claude pane per role — lincoln,
+                            optimus, tarzan, chuck — managers kicked into
+                            their operating loops
+  sable-view                peek at the agent panes mid-session:
+                              sable-view                 status table
+                              sable-view <role>          focus that pane
+                              sable-view <role> --tail   read it without switching
+
+WORK DOORS (type these to Lincoln, in its pane)
+  /sable-discover           decide WHAT to build — triage candidates, emit charters
+  /sable-plan               fill the backlog — Quick or Full (five gated substages)
+  /sable-execute            drain the backlog — managers dispatch worker panes,
+                            workers self-push, Chuck merges
+
+TOOLBOX (each also runs as `sable <name> ...`, e.g. `sable msg ...`)
+  sable-msg <role> "<text>"      message a pane (--interrupt to land mid-turn)
+  sable-worker-status [--reap]   list / reap worker panes
+  sable-mode                     read or flip the planning|execution mode state
+  sable-note "<text>"            capture a SABLE methodology observation
+  sable-agents [name]            who does what (roster reminder)
+  sable-charter                  charter/decision artifacts (Discovery outputs)
+  sable-tmux                     low-level session layout (sable-launch wraps it)
+
+DOCS
+  QUICKSTART.md             install + first session, in ~10 minutes
+  TMUX-AGENTS-DESIGN.md     the warm-pane topology (canonical design)
+  MULTI-MANAGER-PATTERN.md  the full coordination pattern, hooks, discipline
+
+Any subcommand: sable <name> --help   (or: sable help <name>)
+EOF
+}
+
+case "${1:-}" in
+  ""|-h|--help)
+    operator_map
+    exit 0 ;;
+  help)
+    if [ -n "${2:-}" ]; then
+      TOOL="$BIN_DIR/sable-$2"
+      [ -x "$TOOL" ] || { printf 'sable: no such subcommand: %s\n' "$2" >&2; exit 2; }
+      exec "$TOOL" --help
+    fi
+    operator_map
+    exit 0 ;;
+  *)
+    SUB="$1"; shift
+    TOOL="$BIN_DIR/sable-$SUB"
+    if [ ! -x "$TOOL" ]; then
+      printf 'sable: unknown subcommand %s\navailable: %s\n' \
+        "$SUB" "$(subcommands | tr '\n' ' ')" >&2
+      exit 2
+    fi
+    exec "$TOOL" "$@" ;;
+esac
