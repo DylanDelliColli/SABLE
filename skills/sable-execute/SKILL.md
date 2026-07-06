@@ -2,11 +2,13 @@
 name: sable-execute
 description: |
   Flip SABLE into EXECUTION mode — drain the bead pool. Writes the
-  mode-state file via `sable-mode set execution`, spawns Optimus and
-  Tarzan as resident manager subagents that dispatch their OWN workers and push
-  their own approved work, and reminds the operator to open the Chuck terminal.
-  In execution mode the interlock hook blocks spawning planning-only producers
-  — you are draining the pool, not filling it.
+  mode-state file via `sable-mode set execution`, brings up (or verifies) the
+  warm-pane tmux session — one persistent claude pane per role (lincoln,
+  optimus, tarzan, chuck) — and kicks the autonomous panes into their
+  operating loops. Managers spawn a worker pane per bead; workers self-push
+  their worktree branches; Chuck merges. In execution mode the interlock hook
+  blocks spawning planning-only producers — you are draining the pool, not
+  filling it.
   Use when asked to "/sable-execute", "enter execution mode", "start executing", or
   "drain the backlog".
 allowed-tools:
@@ -15,8 +17,6 @@ allowed-tools:
   - Glob
   - Grep
   - AskUserQuestion
-  - Agent
-  - SendMessage
 ---
 
 # /sable-execute — enter EXECUTION mode
@@ -47,7 +47,7 @@ planning exists to prevent.
 Run exactly one command:
 
 ```bash
-sable-mode set execution --fleet optimus,tarzan
+sable-mode set execution --fleet optimus,tarzan,chuck
 ```
 
 This writes the **per-repo** mode-state file — `<repo>/.claude/sable/state/mode-state.json`
@@ -61,111 +61,81 @@ producers (sherlock / victor / columbo) is blocked on both the Agent and Bash
 legs (soft — `SABLE_ORCHESTRATION_FORCE=1` / `--force` overrides). Mode flips are
 mid-conversation; no restart.
 
-## 2. Choose the dispatch topology
+## 2. Bring up the warm-pane session
 
-Run the preflight to pick the topology from the environment — this is orthogonal
-to the execution MODE you just set; it selects *how* agents are wired:
+Execution runs on the **tmux warm-pane topology** — the only execution topology
+(see `TMUX-AGENTS-DESIGN.md`): every role is a real, persistent `claude` session
+in its own tmux pane with an env-var identity (`CLAUDE_AGENT_NAME`), registered
+in the role→pane registry (`@sable_role` pane option) that `sable-msg` and the
+worker-spawn tooling resolve against.
+
+Determine which of two states you are in:
+
+- **You are already the lincoln pane** of a running sable session — you were
+  launched by `sable-tmux` (check: `CLAUDE_AGENT_NAME` is `lincoln` and `$TMUX`
+  is set; `tmux display-message -p '#{@sable_role}'` prints `lincoln`). The
+  managers are warm in their own panes. If they were started with
+  `--autostart` they are already in their operating loops; otherwise kick them
+  now via `sable-msg` (step 3).
+- **No sable session exists yet** (`tmux has-session -t sable` fails). Tell the
+  operator to run, from a plain terminal:
+
+  ```bash
+  sable-tmux --autostart
+  tmux attach -t sable
+  ```
+
+  and to continue this conversation in the **lincoln pane** of that session.
+  `sable-tmux` lays out one pane per role (lincoln, optimus, tarzan, chuck),
+  refuses to clobber an existing session, and with `--autostart` launches the
+  autonomous roles (optimus / tarzan / chuck) with a bypass permission posture
+  and kicks each into its operating loop once its TUI is ready.
+
+How the drain works (all of it happens in the panes, not in your context):
+
+- **Managers (optimus, tarzan)** drain their lanes from `bd ready`: verify each
+  ready bead, claim it, and **dispatch their own workers** — one ephemeral
+  worker pane per bead via the worker-spawn helper (worktree = pane CWD, model
+  pinned from the bead's `model:` label, pre-dispatch governance runs inside
+  the helper). Managers review results through the bead pool; they do **not**
+  push worker code.
+- **Workers** do TDD in their own worktree, pass the gates, **self-push** their
+  own worktree branch from their pane CWD, close their bead with gate evidence,
+  and flag `@sable_status=done`.
+- **Chuck** is the merge-queue **pane**. A manager's push notifies him
+  message-first (`sable-msg chuck`, sent by the post-push hook), with a durable
+  `for-chuck` bead as the fallback when his pane is unreachable; he merges,
+  replies, and idles. There is no second terminal to open.
+- **Reap** finished worker panes with `sable-worker-status --reap`.
+
+## 3. Talk to the managers (sable-msg)
+
+Lead↔manager conversation is low-volume, direct, and message-first:
 
 ```bash
-sable-teams-preflight
+sable-msg optimus "status?"                      # queued behind the current turn
+sable-msg tarzan  "drop the auth epic, API is urgent now" --interrupt
 ```
 
-- prints `nested` → the resident-subagent topology (§2a, default).
-- prints `teams` → the Agent-Teams topology (§2b; needs `SABLE_TEAMS=1` and
-  `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`).
-- exits non-zero → `SABLE_TEAMS=1` but the experimental flag is missing; relay
-  the one-line fix it prints to the operator and stop.
+`--interrupt` sends Escape first so the message lands mid-turn instead of
+queueing. Every injected turn opens with the fixed header
+`⟦SABLE-MSG⟧ from=<sender>` — the framing rule that lets every pane distinguish
+agent traffic from the operator. Replies from managers arrive in your pane the
+same way; treat any turn without that header as the human.
 
-**If preflight prints `teams`, you MUST do a runtime tool-availability probe before
-proceeding to §2b.** The preflight only checks env flags and defs on disk — it
-cannot see which tools the current CC session has loaded. The teams transport is
-`SendMessage` (CC 2.1.181 uses a single implicit team — the old named-team
-construction tools were removed). Confirm `SendMessage` is available
-— ToolSearch query `"select:SendMessage"`, or check your allowed-tools list. If
-`SendMessage` is absent or deferred (e.g. "MCP server disconnected"), fall back to
-the nested topology (§2a) and notify the operator: "Teams transport (SendMessage)
-not loaded — using nested topology; add `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` to
-settings.json and restart to enable teams." Do NOT proceed to §2b without confirming
-`SendMessage` is live.
+## 4. Oversee
 
-### 2a. Nested topology (default)
+- Give the operator scoped status: managers report over `sable-msg`; work state
+  and worker results live in the bead pool (`bd show`, `bd list
+  --status=in_progress`) — synthesize, don't enumerate.
+- Broker arbitration: when a manager messages you with a conflict or a
+  priority question, decide (or relay to the operator) and reply via
+  `sable-msg`.
+- You do **not** write application code, claim beads, dispatch workers, or
+  push. The managers plan, dispatch, review; the workers build and self-push;
+  Chuck merges. You keep the session coherent.
 
-Managers dispatch and push their own lanes (SABLE-uz9.11); you spawn them and
-oversee:
-
-- **Remind the operator to open the Chuck terminal**
-  (`CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager claude`) — the merge
-  queue lives there; the managers' pushes file `for-chuck` beads across the
-  bead-DB bridge automatically.
-- Spawn **optimus** and **tarzan** ONCE per execution session as **resident**
-  named subagents with `run_in_background: true` — ALWAYS background, never
-  foreground (a foreground Agent call blocks the main conversation). Residents
-  run a rolling poll loop for the whole session — ongoing context windows that
-  accumulate lane knowledge across tasks; they are operator-visible and
-  selectable. Each works its lane (Optimus: beads with a parent epic; Tarzan:
-  standalone/orphan beads).
-- **Managers dispatch their own workers** now (nested spawn, CC 2.1.177,
-  SABLE-uz9.8/uz9.9): each manager creates a worktree (`bd worktree create`),
-  spawns background workers via the Agent tool filling
-  `templates/worker-dispatch.md` gate mode (the pre-dispatch governance hooks
-  fire on the manager's own Agent call with its lane identity), reviews the
-  stopped-before-push results, and **pushes approved work itself**
-  (`git -C <worktree> push`, gated by `pre-push-rebase-test`). You do NOT
-  execute dispatch requests and you do NOT push — that relay is gone.
-- **Oversee**: give the operator scoped status, broker `for-lincoln`
-  arbitration asks between managers, relay urgent coord beads. You see every
-  manager's inbox (`cross_inbox_read`) — synthesize, don't enumerate. When a
-  manager files a `shift-report` (context pressure / stand-down), respawn it
-  fresh — lane state rehydrates from beads.
-- You do not write application code, claim beads, dispatch workers, or push.
-  The managers plan, dispatch, review, and push their lanes; you spawn them and
-  keep the session coherent.
-
-### 2b. Teams topology (`SABLE_TEAMS=1`)
-
-The Agent-Teams topology collapses the second terminal: Chuck folds into the team
-and coordination is live over `SendMessage` instead of polling. You (Lincoln) are
-the team lead.
-
-**Verify your lead identity BEFORE spawning members.** Run
-`echo "${CLAUDE_AGENT_NAME:-UNSET}"`. It MUST print `lincoln`. If it prints
-`UNSET` (or anything else), your outbound `SendMessage` sender is mis-derived from
-whichever sub-agent's message/notification triggered the current turn — producing
-self-addressed messages (`optimus→optimus`) that can silently DROP operational
-directives (observed live 2026-06-18, losing an active "rebase before push"
-warning). The env var is read at session launch and cannot be set mid-session:
-STOP and tell the operator to relaunch the lead with
-`CLAUDE_AGENT_NAME=lincoln claude` before proceeding. See
-[`AGENT-TEAMS-DESIGN.md`](../../../AGENT-TEAMS-DESIGN.md) §5 + the live-dogfooding
-amendments.
-
-- **Spawn the members as a single implicit team.** CC 2.1.181 uses ONE implicit team
-  (the old named-team construction tools were removed); you join it simply by spawning
-  named background agents. Spawn optimus, tarzan, and chuck via the Agent
-  tool with `name:` = the registry name and `run_in_background: true` — and do NOT pass
-  `team_name` (deprecated/ignored). The `name:` carries each member's role into the
-  hook-input `agent_type` so `lib-identity` resolves it (SABLE-amj.2). Use the built
-  teams definition at `~/.claude/agents-teams/<name>.md` as the member's **inline
-  prompt**; do NOT pass `agentType` (inline-spawned to avoid colliding with the nested
-  named-agent defs — SABLE-amj.4 / design decision 6). There is **no separate Chuck
-  terminal** in teams mode.
-- **Coordination is live** (the teams card, SABLE-amj.3): a manager pushes its
-  approved worktree and `SendMessage chuck` "PR ready: <bead>, <branch>"; chuck
-  wakes, merges, replies; `for-lincoln` arbitration is a direct message to you.
-  Continue a member with `SendMessage(to: <name or agent-id>)`. The durable
-  `for-merge` bead still lands via `post-push-merge-notify` (the recovery record) —
-  beads stays the ledger, SendMessage is the fast path.
-- **Workers are unchanged:** managers dispatch their own workers via the Agent
-  tool as plain sub-subagents (no `team_name`) and push their own approved work.
-- **The implicit team is disposable; beads is the recovery substrate.** Members stay
-  live until the session ends or you dismiss them — there is **no team-delete step**;
-  when the drain is done, simply stop messaging them and end the session. If the session
-  ends, re-run `/sable-execute` to respawn the members — they catch up from beads on
-  join (the startup sweep in the teams card), then go idle and wake on `SendMessage`.
-- **Oversee** as in §2a, but broker `for-lincoln` arbitration live over
-  `SendMessage`.
-
-## 3. Hand back to planning
+## 5. Hand back to planning
 
 When the pool runs dry or needs regrooming, tell the operator to run `/sable-plan`.
 Do not spawn producers yourself from execution mode — the interlock will block

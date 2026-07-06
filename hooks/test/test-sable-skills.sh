@@ -94,38 +94,29 @@ init_sub="$(SABLE_MODE_STATE="$STATE_TMP2" "$MODE_BIN" substage get 2>/dev/null)
 if [ "$init_sub" = "framing" ]; then pass "documented /sable-plan step 1 initializes substage=framing"; else fail "documented /sable-plan step 1 initializes substage=framing" "got '$init_sub'"; fi
 rm -f "$STATE_TMP2"
 
-# 9. v2 one-window topology (SABLE-uz9.5 / uz9.4 option A)
+# 9. Warm-pane tmux topology — the ONLY execution topology (SABLE-qa4d)
 assert_grep "$PLAN_SKILL" "lincoln"          "/sable-plan addresses Lincoln (v2 identity)"
 assert_grep "$PLAN_SKILL" "subagent"         "/sable-plan spawns producers as subagents"
 assert_grep "$PLAN_SKILL" "gaudi.*skill\|skill.*gaudi" "/sable-plan runs gaudi as an inline skill"
-assert_grep "$EXEC_SKILL" "lincoln"          "/sable-execute addresses Lincoln (v2 identity)"
-assert_grep "$EXEC_SKILL" "dispatch their own workers" "/sable-execute: managers dispatch their own workers (native spawn, SABLE-uz9.11)"
-assert_no_grep "$EXEC_SKILL" "Dispatching-for"  "/sable-execute drops the old DISPATCH-REQUEST relay attribution"
-assert_grep "$EXEC_SKILL" "run_in_background" "/sable-execute spawns managers as invisible background subagents"
-assert_grep "$EXEC_SKILL" "ALWAYS background" "/sable-execute spawns managers in the background (never blocks the chat)"
 assert_grep "$PLAN_SKILL" "run_in_background" "/sable-plan spawns producers in the background"
-assert_grep "$EXEC_SKILL" "Chuck terminal"   "/sable-execute reminds the operator about the Chuck terminal"
-assert_grep "$EXEC_SKILL" "pushes approved work itself" "/sable-execute: managers push their own approved work (Lincoln does not)"
+assert_grep "$EXEC_SKILL" "lincoln"          "/sable-execute addresses Lincoln (v2 identity)"
+assert_grep "$EXEC_SKILL" "sable-tmux"       "/sable-execute brings up the warm-pane session via sable-tmux"
+assert_grep "$EXEC_SKILL" "autostart"        "/sable-execute kicks the autonomous panes via --autostart"
+assert_grep "$EXEC_SKILL" "tmux attach"      "/sable-execute tells the operator how to attach"
+assert_grep "$EXEC_SKILL" "sable-msg"        "/sable-execute talks to managers via sable-msg"
+assert_grep "$EXEC_SKILL" "SABLE-MSG"        "/sable-execute documents the sender-framing header rule"
+assert_grep "$EXEC_SKILL" "dispatch their own workers" "/sable-execute: managers dispatch their own workers (worker panes)"
+assert_grep "$EXEC_SKILL" "self-push"        "/sable-execute: workers self-push their own worktree branches"
+assert_grep "$EXEC_SKILL" "sable-worker-status" "/sable-execute documents reaping finished worker panes"
+assert_no_grep "$EXEC_SKILL" "Dispatching-for"  "/sable-execute drops the old DISPATCH-REQUEST relay attribution"
 assert_no_grep "$EXEC_SKILL" "execute dispatch requests as" "/sable-execute: Lincoln no longer executes manager dispatch requests"
-
-# 9b. Teams topology branch — implicit-team API (SABLE-hybq; CC 2.1.181 removed TeamCreate)
-assert_grep    "$EXEC_SKILL" "sable-teams-preflight" "/sable-execute runs the topology preflight"
-assert_grep    "$EXEC_SKILL" "SABLE_TEAMS"           "/sable-execute documents the SABLE_TEAMS toggle"
-assert_no_grep "$EXEC_SKILL" "TeamCreate"            "/sable-execute does NOT use the removed TeamCreate API (implicit team, SABLE-hybq)"
-assert_no_grep "$EXEC_SKILL" "TeamDelete"            "/sable-execute does NOT use the removed TeamDelete API (SABLE-hybq)"
-assert_no_grep "$EXEC_SKILL" "team_name: sable"      "/sable-execute does NOT pass the deprecated team_name param (SABLE-hybq)"
-assert_grep    "$EXEC_SKILL" "run_in_background"     "/sable-execute spawns teams members as background named agents (implicit team)"
-assert_grep    "$EXEC_SKILL" "SendMessage"           "/sable-execute teams coordination is live over SendMessage"
-assert_grep    "$EXEC_SKILL" "agents-teams"          "/sable-execute teams branch inline-spawns from the built teams defs"
-assert_grep    "$EXEC_SKILL" "no separate Chuck"     "/sable-execute teams branch folds Chuck into the team (no second terminal)"
-
-# 9c. Runtime transport-availability probe (SABLE-1qt, updated for implicit-team SABLE-hybq)
-# After preflight prints "teams", Lincoln probes whether the teams TRANSPORT (SendMessage)
-# is live this session before entering §2b; absent -> nested fallback.
-assert_grep "$EXEC_SKILL" "runtime tool-availability probe\|runtime.*probe\|tool-availability probe" \
-  "/sable-execute: if preflight=teams, Lincoln probes runtime transport availability (SABLE-1qt)"
-assert_grep "$EXEC_SKILL" "fall back to the nested topology\|using nested topology" \
-  "/sable-execute: runtime probe falls back to nested when the teams transport is absent (SABLE-1qt)"
+assert_no_grep "$EXEC_SKILL" "Chuck terminal"   "/sable-execute: Chuck is a pane, not a second terminal"
+assert_no_grep "$EXEC_SKILL" "run_in_background" "/sable-execute: managers are warm panes, never background subagents"
+assert_no_grep "$EXEC_SKILL" "sable-teams-preflight" "/sable-execute: no topology preflight remains (tmux is the only topology)"
+assert_no_grep "$EXEC_SKILL" "SABLE_TEAMS"      "/sable-execute: no SABLE_TEAMS toggle remains"
+assert_no_grep "$EXEC_SKILL" "SendMessage"      "/sable-execute: no SendMessage transport remains"
+assert_no_grep "$EXEC_SKILL" "agents-teams"     "/sable-execute: no teams member defs remain"
+assert_no_grep "$EXEC_SKILL" "nested"           "/sable-execute: no nested-topology branch remains"
 
 # 10. DECOMPOSITION post-batch-create verification (SABLE-xy1)
 assert_grep "$PLAN_SKILL" "bd dep tree"        "/sable-plan DECOMPOSITION verifies edges via bd dep tree"
