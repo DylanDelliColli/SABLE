@@ -212,6 +212,17 @@ if printf '%s' "$SPAWN_CMD" | grep -qE '(^|[[:space:];&|])sable-spawn-worker([[:
   exit 0
 fi
 
+# sable-spawn-manager stands up the execution fleet (manager windows) — gated
+# to EXECUTION mode the same way (SABLE-dqhn.2). Launching a session is
+# mode-neutral (lincoln only); spawning managers is not.
+if printf '%s' "$SPAWN_CMD" | grep -qE '(^|[[:space:];&|])sable-spawn-manager([[:space:]]|$)'; then
+  printf '%s' "$SPAWN_CMD" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exit 0
+  if [ "$MODE" != "execution" ]; then
+    deny "Orchestration is in ${MODE} mode — sable-spawn-manager stands up the execution fleet and is blocked outside EXECUTION mode. Run /sable-execute, or append --force to override."
+  fi
+  exit 0
+fi
+
 # ---------------------------------------------------------------------------
 # Bash leg: governs the main session only — legacy launch aliases, git
 # push, backlog population. Subagents spawn via the Agent tool in v3, so the

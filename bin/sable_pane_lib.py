@@ -99,3 +99,27 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
         if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
             return False
     return dispatch_landed(capture(), snippet)
+
+
+# --- Autonomous-role operating-loop kicks (SABLE-bldh.14, moved here for
+# SABLE-dqhn.2 so sable-tmux --autostart and sable-spawn-manager share ONE
+# source). Lincoln is the operator's pane — never kicked.
+AUTONOMOUS_ROLES = {"optimus", "tarzan", "chuck"}
+KICK_TAG = "SABLE-AUTOSTART"
+
+
+def kick_message(role: str) -> str:
+    """The turn that starts a role's operating loop."""
+    common = (f"[{KICK_TAG}] Operator: begin your operating loop now and run it "
+              f"autonomously — do not wait for further input.")
+    if role in ("optimus", "tarzan"):
+        return (f"{common} Drain your lane from `bd ready`: verify each ready bead, "
+                f"claim it, and `sable-spawn-worker <id> --scope <name>`; review the "
+                f"results, reap done panes, then pause briefly and loop. Stand down "
+                f"when the pool and your inbox are empty.")
+    if role == "chuck":
+        return (f"{common} You are event-driven: each ⟦SABLE-MSG⟧ PR-ready "
+                f"message from a manager is a merge request — review and merge it, then "
+                f"report back. Also drain any existing for-chuck beads and run a "
+                f"stranded-recovery sweep now, then idle waiting for messages.")
+    return common

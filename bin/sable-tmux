@@ -27,17 +27,15 @@ import os
 import subprocess
 import sys
 
-# Shared pane-readiness/dispatch helpers (SABLE-bldh.14). Resolve the lib next to
-# THIS script even when invoked via a PATH symlink.
+# Shared pane-readiness/dispatch helpers (SABLE-bldh.14) + the autonomous-role
+# kick logic (SABLE-dqhn.2 — shared with sable-spawn-manager). Resolve the lib
+# next to THIS script even when invoked via a PATH symlink.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from sable_pane_lib import deliver_text, wait_for_ready  # noqa: E402
+from sable_pane_lib import (  # noqa: E402
+    AUTONOMOUS_ROLES, KICK_TAG, deliver_text, kick_message, wait_for_ready,
+)
 
 DEFAULT_ROLES = ["lincoln", "optimus", "tarzan", "chuck"]
-
-# Roles that run unattended (--autostart): launched with a bypass posture and
-# kicked into their operating loop. Lincoln is the operator's pane — never kicked.
-AUTONOMOUS_ROLES = {"optimus", "tarzan", "chuck"}
-KICK_TAG = "SABLE-AUTOSTART"
 
 
 def parse_roles(arg: str | None) -> list[str]:
@@ -62,23 +60,6 @@ def pane_command(role: str, autostart: bool) -> str:
         perm = os.environ.get("SABLE_WORKER_PERMISSION", "--permission-mode bypassPermissions")
         cmd = f"{cmd} {perm}"
     return cmd
-
-
-def kick_message(role: str) -> str:
-    """The turn that starts a role's operating loop under --autostart."""
-    common = (f"[{KICK_TAG}] Operator: begin your operating loop now and run it "
-              f"autonomously — do not wait for further input.")
-    if role in ("optimus", "tarzan"):
-        return (f"{common} Drain your lane from `bd ready`: verify each ready bead, "
-                f"claim it, and `sable-spawn-worker <id> --scope <name>`; review the "
-                f"results, reap done panes, then pause briefly and loop. Stand down "
-                f"when the pool and your inbox are empty.")
-    if role == "chuck":
-        return (f"{common} You are event-driven: each ⟦SABLE-MSG⟧ PR-ready "
-                f"message from a manager is a merge request — review and merge it, then "
-                f"report back. Also drain any existing for-chuck beads and run a "
-                f"stranded-recovery sweep now, then idle waiting for messages.")
-    return common
 
 
 def tmux_base(socket: str | None) -> list[str]:

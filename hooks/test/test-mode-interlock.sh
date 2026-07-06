@@ -356,6 +356,17 @@ out_mgr_e="$(printf '%s' '{"tool_input":{"command":"sable-spawn-worker SABLE-x -
 if is_deny "$out_mgr_e"; then fail "execution allows sable-spawn-worker (manager identity)" "got deny"; else pass "execution allows sable-spawn-worker (manager identity)"; fi
 set_mode planning
 
+# ---------- manager-spawn leg (mode-neutral launch, SABLE-dqhn.2) ----------
+# sable-spawn-manager stands up the execution fleet; gate it to EXECUTION.
+set_mode planning
+assert_deny  "planning blocks sable-spawn-manager" 'sable-spawn-manager --all'
+assert_deny  "planning blocks sable-spawn-manager (single role)" 'sable-spawn-manager optimus'
+assert_allow "planning sable-spawn-manager --force overrides" 'sable-spawn-manager --all --force'
+
+set_mode execution
+assert_allow "execution allows sable-spawn-manager" 'sable-spawn-manager --all'
+set_mode planning
+
 # ---------- settings-snippet registration ----------
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 if jq -e . "$SNIPPET" >/dev/null 2>&1; then pass "settings-snippet.json is valid JSON"; else fail "settings-snippet.json is valid JSON"; fi
