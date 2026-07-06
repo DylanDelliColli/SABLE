@@ -6,7 +6,9 @@ panes and workers open in separate WINDOWS behind the one you are looking at.
 This is the peek tool:
 
   sable-view                     status table of every role pane + worker window
-  sable-view <role>              focus that pane (switch/attach as appropriate)
+  sable-view <role>              deep-dive into that pane — from a second
+                                 terminal this attaches via a grouped session,
+                                 so the Lincoln client's window is never stolen
   sable-view <role> --tail [-n N]  print the pane's last N lines, no focus change
   sable-view --json              machine-readable status
 
@@ -77,6 +79,24 @@ def render_table(panes: list[dict], activity: dict[str, str]) -> str:
     return "\n".join(rows)
 
 
+def view_session_name(session: str, pid: int) -> str:
+    return f"{session}-view-{pid}"
+
+
+def grouped_view_commands(base: list[str], session: str, vname: str,
+                          target: dict, destroy_on_detach: bool) -> list[list[str]]:
+    """The second-terminal deep-dive (SABLE-dqhn.3): tmux clients attached to
+    the SAME session share the active window, so a plain second attach would
+    yank the operator's Lincoln view. A GROUPED session (new-session -t) shares
+    the window list but keeps an INDEPENDENT current window."""
+    cmds = [base + ["new-session", "-d", "-t", session, "-s", vname]]
+    if destroy_on_detach:
+        cmds.append(base + ["set-option", "-t", vname, "destroy-unattached", "on"])
+    cmds.append(base + ["select-window", "-t", f"{vname}:{target['window']}"])
+    cmds.append(base + ["select-pane", "-t", target["pane"]])
+    return cmds
+
+
 def _run(args: list[str]) -> str:
     return subprocess.run(args, capture_output=True, text=True, check=True).stdout
 
@@ -114,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
                                  capture_output=True, text=True).stdout
             activity[pane["pane"]] = last_line(cap)
         print(render_table(panes, activity))
+        if not os.environ.get("TMUX"):
+            sys.stderr.write("deep-dive into a pane: sable-view <role>\n")
         return 0
 
     try:
@@ -128,19 +150,28 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(lines[-ns.n:]))
         return 0
 
-    # Focus form: select server-side, then bring a client there.
-    subprocess.run(base + ["select-window", "-t", f"{session}:{target['window']}"],
-                   check=True)
-    subprocess.run(base + ["select-pane", "-t", target["pane"]], check=True)
-    if ns.no_attach:
-        return 0
+    # Focus form. Inside the sable session itself: plain select (one client,
+    # nothing to protect). Anywhere else: go through a grouped view session so
+    # this deep-dive never steals the operator's Lincoln window.
     if os.environ.get("TMUX"):
         cur = subprocess.run(base + ["display-message", "-p", "#S"],
                              capture_output=True, text=True).stdout.strip()
         if cur == session:
+            subprocess.run(base + ["select-window",
+                                   "-t", f"{session}:{target['window']}"], check=True)
+            subprocess.run(base + ["select-pane", "-t", target["pane"]], check=True)
             return 0
-        os.execvp("tmux", base + ["switch-client", "-t", session])
-    os.execvp("tmux", base + ["attach", "-t", session])
+
+    vname = view_session_name(session, os.getpid())
+    for cmd in grouped_view_commands(base, session, vname, target,
+                                     destroy_on_detach=not ns.no_attach):
+        subprocess.run(cmd, check=True)
+    if ns.no_attach:
+        print(vname)          # caller owns cleanup (tests/scripts)
+        return 0
+    if os.environ.get("TMUX"):
+        os.execvp("tmux", base + ["switch-client", "-t", vname])
+    os.execvp("tmux", base + ["attach", "-t", vname])
 
 
 if __name__ == "__main__":

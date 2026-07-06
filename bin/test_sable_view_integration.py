@@ -94,13 +94,29 @@ def test_tail_returns_pane_content_without_focus_change(sock):
     assert active == "0"
 
 
-def test_focus_selects_target_window(sock):
+def test_focus_outside_tmux_uses_grouped_session_independent_focus(sock):
+    """A deep-dive from a second terminal must NOT yank the operator's Lincoln
+    view: outside tmux the focus form goes through a GROUPED session whose
+    current window is the target, while the original session stays put."""
     _seed_session(sock)
     r = _run(sock, "worker", "--no-attach")
     assert r.returncode == 0, r.stderr
+    # the original session's active window is untouched (Lincoln keeps window 0)
     active = _tmux(sock, "display-message", "-t", SESSION, "-p",
                    "#{window_index}").stdout.strip()
-    assert active == "1"
+    assert active == "0"
+    # a grouped view session exists and its current window is the worker's
+    sessions = _tmux(sock, "list-sessions", "-F",
+                     "#{session_name} #{session_group}").stdout
+    view_names = [ln.split()[0] for ln in sessions.splitlines()
+                  if ln.split()[0].startswith(f"{SESSION}-view-")]
+    assert view_names, f"no grouped view session in: {sessions}"
+    vactive = _tmux(sock, "display-message", "-t", view_names[0], "-p",
+                    "#{window_index}").stdout.strip()
+    assert vactive == "1"
+    # and both sessions are in the same group (shared windows)
+    groups = {ln.split()[1] for ln in sessions.splitlines() if len(ln.split()) > 1}
+    assert len(groups) == 1
 
 
 def test_unknown_role_exits_2_listing_known(sock):

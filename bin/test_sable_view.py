@@ -69,6 +69,26 @@ def test_render_table_contains_roles_and_status():
     assert "npm test ok" in table
 
 
+def test_view_session_name_is_grouped_and_unique():
+    assert sv.view_session_name("sable", 123) == "sable-view-123"
+
+
+def test_grouped_view_commands_shape():
+    """The attach path creates a grouped session, self-destructs on detach,
+    and selects the target window/pane in the VIEW session only."""
+    target = {"window": "1", "pane": "%4", "role": "worker", "bead": "", "status": ""}
+    cmds = sv.grouped_view_commands(["tmux"], "sable", "sable-view-9", target,
+                                    destroy_on_detach=True)
+    flat = [" ".join(c) for c in cmds]
+    assert any("new-session" in c and "-t sable" in c and "-s sable-view-9" in c
+               for c in flat)
+    assert any("destroy-unattached" in c for c in flat)
+    assert any("select-window" in c and "sable-view-9:1" in c for c in flat)
+    cmds_na = sv.grouped_view_commands(["tmux"], "sable", "sable-view-9", target,
+                                       destroy_on_detach=False)
+    assert not any("destroy-unattached" in " ".join(c) for c in cmds_na)
+
+
 if __name__ == "__main__":
     import sys
     import pytest as _p
