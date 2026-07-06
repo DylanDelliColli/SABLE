@@ -25,11 +25,6 @@
             "type": "command",
             "command": "bash ~/.claude/hooks/multi-manager/session-role-anchor.sh",
             "timeout": 3000
-          },
-          {
-            "type": "command",
-            "command": "bash ~/.claude/hooks/multi-manager/inbox-injection-precompact.sh",
-            "timeout": 2000
           }
         ]
       }
@@ -112,11 +107,6 @@
       {
         "matcher": "Bash",
         "hooks": [
-          {
-            "type": "command",
-            "command": "bash ~/.claude/hooks/multi-manager/inbox-injection.sh",
-            "timeout": 5000
-          },
           {
             "type": "command",
             "command": "bash ~/.claude/hooks/multi-manager/post-push-merge-notify.sh",

@@ -166,6 +166,15 @@ if [ "$(count_interlock "$MSET")" = "2" ]; then pass "md7: multi-manager re-inst
 if [ "$(count_marker "$MSET" 'bd prime')" = "2" ]; then pass "md7: multi-manager re-install — bd prime preserved"; else fail "md7: multi-manager re-install — bd prime preserved" "count=$(count_marker "$MSET" 'bd prime')"; fi
 if valid_json "$MSET"; then pass "md7: settings valid after multi-manager re-install"; else fail "md7: settings valid after multi-manager re-install"; fi
 
+# ---------- SABLE-qa4d.6: poll-based inbox hooks are gone ----------
+PIH="$(mktemp -d)"
+SABLE_PROJECT_DIR="$PIH" bash "$INSTALLER" --project >/dev/null 2>&1
+PIHSET="$PIH/.claude/settings.local.json"
+if [ "$(count_marker "$PIHSET" inbox-injection)" = "0" ]; then pass "settings register no inbox-injection hooks (sable-msg replaces the poll)"; else fail "settings register no inbox-injection hooks" "count=$(count_marker "$PIHSET" inbox-injection)"; fi
+if [ ! -e "$PIH/.claude/hooks/multi-manager/inbox-injection.sh" ] && [ ! -e "$PIH/.claude/hooks/multi-manager/inbox-injection-precompact.sh" ]; then pass "no inbox-injection hook files installed"; else fail "no inbox-injection hook files installed"; fi
+if [ -e "$PIH/.claude/hooks/multi-manager/read-guard.sh" ]; then pass "read-guard survives (durable-inbox guard stays)"; else fail "read-guard survives (durable-inbox guard stays)"; fi
+rm -rf "$PIH"
+
 # ---------- SABLE-qa4d.2: no teams residue in a fresh install ----------
 TMONLY="$(mktemp -d)"
 TM_OUT="$(SABLE_PROJECT_DIR="$TMONLY" bash "$INSTALLER" --project 2>&1)"
