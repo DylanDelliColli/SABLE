@@ -1,58 +1,115 @@
 #!/usr/bin/env bash
-# sable-launch — one-command operator entry point for a standalone SABLE session
-# (SABLE-njiv).
+# sable-launch — the memorable session door (SABLE-njiv, SABLE-ssws.2).
 #
-# Replaces the hand-copied `CLAUDE_AGENT_NAME=... CLAUDE_AGENT_ROLE=manager claude`
-# aliases so a session NEVER launches without its identity — an unnamed lead was
-# the root cause of a live identity-bleed incident (outbound messages mis-derived
-# their sender, dropping operational directives).
+# No arguments: START the SABLE warm-pane session — bring it up via
+# `sable-tmux --autostart` if it doesn't exist yet (four identity-set panes:
+# lincoln, optimus, tarzan, chuck; autonomous roles kicked into their loops),
+# then attach. Re-running is safe: an existing session is reused.
 #
-# The normal execution bring-up is `sable-tmux --autostart`, which launches every
-# role pane with its identity set. sable-launch remains for launching a single
-# role by hand (e.g. a solo lincoln session, or re-launching one pane).
+# With a role argument: the advanced single-pane door — launch one identity
+# claude session by hand (e.g. a solo lincoln, or re-launching one pane). A
+# session must NEVER launch unnamed: an unnamed lead was the root cause of a
+# live identity-bleed incident (outbound messages mis-derived their sender).
 #
 # Usage:
-#   sable-launch [role] [claude-args...]
-#     role   lincoln (default) — the orchestrator/lead session you talk to
-#            chuck             — the merge-queue role (normally a sable-tmux pane)
+#   sable-launch [--no-attach]           start (or reuse) the warm-pane session
+#   sable-launch <role> [claude-args...] advanced: one identity claude session
+#     role   lincoln | chuck
 #   sable-launch --help
+#
+# Env: SABLE_TMUX_SESSION (default: sable), SABLE_TMUX_SOCKET (tmux -L),
+#      SABLE_TMUX_BIN (override the sable-tmux helper; tests).
 
 set -u
 
 usage() {
   cat <<'EOF'
-sable-launch — launch a SABLE session with the correct agent identity + env.
+sable-launch — start the SABLE warm-pane session (or one identity session).
 
 Usage:
-  sable-launch [role] [claude-args...]
-    role   lincoln (default) — the orchestrator/lead session you talk to
-           chuck             — the merge-queue role (normally a sable-tmux pane)
+  sable-launch                start the tmux session (create if needed) + attach
+  sable-launch --no-attach    bring the session up without attaching
+  sable-launch <role> [claude-args...]
+                              advanced: launch ONE identity claude session
+                              (role: lincoln | chuck)
   sable-launch --help
 
-Sets CLAUDE_AGENT_NAME=<role> and CLAUDE_AGENT_ROLE=manager so the session has a
-stable identity. All other arguments are passed through to `claude`. The full
-warm-pane session (all four roles) is launched by `sable-tmux --autostart`.
+The session form lays out one persistent claude pane per role (lincoln,
+optimus, tarzan, chuck) via `sable-tmux --autostart` and attaches. Once
+attached: talk to Lincoln in its pane, peek at the others with `sable-view`.
+The role form sets CLAUDE_AGENT_NAME=<role> and CLAUDE_AGENT_ROLE=manager and
+execs `claude` directly.
 EOF
 }
 
-# --- Parse role / help. First token: -h/--help -> usage; a known role -> consume;
-#     a leading claude flag or no args -> default role + pass through; anything
-#     else -> unknown role error. ---
+# --- Parse. Bare / --no-attach -> session form. -h/--help -> usage. A known
+#     role -> single-pane form. Any other leading claude flag -> single-pane
+#     form with the default role (back-compat). Unknown role -> error. ---
+MODE="session"
+NO_ATTACH=0
 ROLE="lincoln"
 case "${1:-}" in
-  -h|--help) usage; exit 0 ;;
-  lincoln|chuck) ROLE="$1"; shift ;;
-  -*) : ;;   # leading claude flag -> default role, pass through
-  "") : ;;   # no args -> default role
+  -h|--help)     usage; exit 0 ;;
+  "")            MODE="session" ;;
+  --no-attach)   MODE="session"; NO_ATTACH=1; shift ;;
+  lincoln|chuck) MODE="role"; ROLE="$1"; shift ;;
+  -*)            MODE="role" ;;   # leading claude flag -> default role, pass through
   *) printf 'sable-launch: unknown role %s (valid roles: lincoln, chuck)\n\n' "$1" >&2
      usage >&2
      exit 2 ;;
 esac
 
-export CLAUDE_AGENT_NAME="$ROLE"
-export CLAUDE_AGENT_ROLE="manager"
+if [ "$MODE" = "role" ]; then
+  export CLAUDE_AGENT_NAME="$ROLE"
+  export CLAUDE_AGENT_ROLE="manager"
+  command -v claude >/dev/null 2>&1 || { printf 'sable-launch: `claude` not found on PATH.\n' >&2; exit 127; }
+  printf 'sable-launch: launching as %s (role=manager)\n' "$ROLE" >&2
+  exec claude "$@"
+fi
 
-command -v claude >/dev/null 2>&1 || { printf 'sable-launch: `claude` not found on PATH.\n' >&2; exit 127; }
+# --- Session form ---
+command -v tmux >/dev/null 2>&1 || {
+  printf 'sable-launch: tmux not found on PATH — the warm-pane session needs it (e.g. apt install tmux / brew install tmux).\n' >&2
+  exit 127
+}
 
-printf 'sable-launch: launching as %s (role=manager)\n' "$ROLE" >&2
-exec claude "$@"
+SESSION="${SABLE_TMUX_SESSION:-sable}"
+TMUX_CMD=(tmux)
+[ -n "${SABLE_TMUX_SOCKET:-}" ] && TMUX_CMD=(tmux -L "$SABLE_TMUX_SOCKET")
+
+if "${TMUX_CMD[@]}" has-session -t "$SESSION" 2>/dev/null; then
+  printf 'sable-launch: session %s already up — reusing it.\n' "$SESSION" >&2
+else
+  # Resolve the layout helper: env override (tests) -> sibling (repo checkout
+  # or the ~/.local/bin symlink dir, where bin-install links all tools) -> PATH.
+  SIBLING="${BASH_SOURCE[0]%/*}/sable-tmux"
+  if [ -n "${SABLE_TMUX_BIN:-}" ]; then
+    ST="$SABLE_TMUX_BIN"
+  elif [ -x "$SIBLING" ]; then
+    ST="$SIBLING"
+  elif command -v sable-tmux >/dev/null 2>&1; then
+    ST="sable-tmux"
+  else
+    printf 'sable-launch: sable-tmux not found (looked next to this script and on PATH).\n' >&2
+    exit 127
+  fi
+  printf 'sable-launch: bringing up session %s (sable-tmux --autostart)...\n' "$SESSION" >&2
+  "$ST" --autostart --session "$SESSION" || exit $?
+fi
+
+if [ "$NO_ATTACH" = "1" ]; then
+  printf 'sable-launch: session %s up. Attach with: tmux%s attach -t %s\n' \
+    "$SESSION" "${SABLE_TMUX_SOCKET:+ -L $SABLE_TMUX_SOCKET}" "$SESSION" >&2
+  exit 0
+fi
+
+if [ -n "${TMUX:-}" ]; then
+  CUR="$("${TMUX_CMD[@]}" display-message -p '#S' 2>/dev/null || true)"
+  if [ "$CUR" = "$SESSION" ]; then
+    printf 'sable-launch: you are already inside session %s.\n' "$SESSION" >&2
+    exit 0
+  fi
+  exec "${TMUX_CMD[@]}" switch-client -t "$SESSION"
+fi
+
+exec "${TMUX_CMD[@]}" attach -t "$SESSION"

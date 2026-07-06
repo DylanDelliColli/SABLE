@@ -58,13 +58,70 @@ run_launch() {
   rm -f "$tmpout" "$tmperr"
 }
 
-# ---- UNIT: identity ----
+# ---- UNIT: session form (no-arg = bring up + attach; SABLE-ssws.2) ----
+# Stub tmux records argv; has-session behavior driven by STUB_HAS_SESSION.
+cat > "$STUB_BIN/tmux" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${TMUX_LOG:-}" ] && echo "tmux $*" >> "$TMUX_LOG"
+case "$1" in
+  has-session)      exit "${STUB_HAS_SESSION:-1}" ;;
+  attach|attach-session) echo "STUB_ATTACH=1"; exit 0 ;;
+  display-message)  echo "not-sable"; exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$STUB_BIN/tmux"
+# Recording sable-tmux stand-in (selected via SABLE_TMUX_BIN)
+cat > "$STUB_BIN/sable-tmux-rec" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${ST_LOG:-}" ] && echo "sable-tmux $*" >> "$ST_LOG"
+exit 0
+STUB
+chmod +x "$STUB_BIN/sable-tmux-rec"
 
-run_launch "$HOME_FLAG" ""
-if printf '%s' "$OUT" | grep -q "NAME=lincoln" && printf '%s' "$OUT" | grep -q "ROLE=manager"; then
-  pass "default role -> CLAUDE_AGENT_NAME=lincoln, ROLE=manager, exec'd claude"
+WORK="$(mktemp -d)"
+# 1. no session yet -> creates via sable-tmux --autostart, then attaches
+run_launch "$HOME_FLAG" "TMUX_LOG=$WORK/t1.log ST_LOG=$WORK/s1.log STUB_HAS_SESSION=1 SABLE_TMUX_BIN=$STUB_BIN/sable-tmux-rec"
+if [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "STUB_ATTACH=1" && grep -q -- "--autostart" "$WORK/s1.log" 2>/dev/null; then
+  pass "no-arg + no session -> sable-tmux --autostart then attach"
 else
-  fail "default role -> lincoln/manager" "out=[$OUT] err=[$ERR] code=$CODE"
+  fail "no-arg + no session -> sable-tmux --autostart then attach" "out=[$OUT] err=[$ERR] code=$CODE s1=[$(cat "$WORK/s1.log" 2>/dev/null)]"
+fi
+
+# 2. session already exists -> reuses (no sable-tmux), attaches
+run_launch "$HOME_FLAG" "TMUX_LOG=$WORK/t2.log ST_LOG=$WORK/s2.log STUB_HAS_SESSION=0 SABLE_TMUX_BIN=$STUB_BIN/sable-tmux-rec"
+if [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "STUB_ATTACH=1" && [ ! -s "$WORK/s2.log" ]; then
+  pass "no-arg + existing session -> reuse (no re-create) then attach"
+else
+  fail "no-arg + existing session -> reuse then attach" "out=[$OUT] err=[$ERR] code=$CODE s2=[$(cat "$WORK/s2.log" 2>/dev/null)]"
+fi
+
+# 3. --no-attach -> brings up only, never attaches
+run_launch "$HOME_FLAG" "TMUX_LOG=$WORK/t3.log ST_LOG=$WORK/s3.log STUB_HAS_SESSION=1 SABLE_TMUX_BIN=$STUB_BIN/sable-tmux-rec" --no-attach
+if [ "$CODE" -eq 0 ] && ! printf '%s' "$OUT" | grep -q "STUB_ATTACH=1" && grep -q -- "--autostart" "$WORK/s3.log" 2>/dev/null; then
+  pass "--no-attach brings up the session without attaching"
+else
+  fail "--no-attach brings up the session without attaching" "out=[$OUT] err=[$ERR] code=$CODE"
+fi
+
+# 4. tmux missing -> clear error naming tmux, non-zero exit
+EMPTY_BIN="$(mktemp -d)"
+ln -s "$(command -v bash)" "$EMPTY_BIN/bash"
+OUT4="$(env -i PATH="$EMPTY_BIN" HOME="$HOME_FLAG" bash "$LAUNCH" 2>&1)"; CODE4=$?
+if [ "$CODE4" -ne 0 ] && printf '%s' "$OUT4" | grep -qi "tmux"; then
+  pass "missing tmux -> non-zero exit with a message naming tmux"
+else
+  fail "missing tmux -> non-zero exit with a message naming tmux" "out=[$OUT4] code=$CODE4"
+fi
+rm -rf "$EMPTY_BIN"
+
+# ---- UNIT: role form (advanced single-pane door — unchanged) ----
+
+run_launch "$HOME_FLAG" "" lincoln
+if printf '%s' "$OUT" | grep -q "NAME=lincoln" && printf '%s' "$OUT" | grep -q "ROLE=manager"; then
+  pass "explicit role lincoln -> CLAUDE_AGENT_NAME=lincoln, ROLE=manager, exec'd claude"
+else
+  fail "explicit role lincoln -> lincoln/manager" "out=[$OUT] err=[$ERR] code=$CODE"
 fi
 
 run_launch "$HOME_FLAG" "" chuck
@@ -106,7 +163,7 @@ fi
 
 # ---- INTEGRATION: no teams-flag machinery remains (tmux-only, SABLE-qa4d) ----
 
-run_launch "$HOME_NOFLAG" ""
+run_launch "$HOME_NOFLAG" "" lincoln
 if ! printf '%s' "$ERR" | grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" && printf '%s' "$OUT" | grep -q "NAME=lincoln"; then
   pass "no teams-flag warning is ever printed (tmux-only)"
 else
@@ -125,6 +182,38 @@ if ! grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" "$LAUNCH"; then
   pass "sable-launch carries no teams-flag machinery"
 else
   fail "sable-launch carries no teams-flag machinery" "flag still referenced in $LAUNCH"
+fi
+
+# ---- INTEGRATION: real tmux on an isolated socket (SABLE-ssws.2) ----
+if command -v tmux >/dev/null 2>&1; then
+  SOCK="sable-launch-test-$$"
+  ISESS="slaunch"
+  int_env=(SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION="$ISESS" SABLE_TMUX_PANE_CMD="bash"
+           SABLE_DISPATCH_READY_TIMEOUT=0 SABLE_DISPATCH_SUBMIT_TRIES=1 SABLE_DISPATCH_POLL_INTERVAL=0.1)
+  if env "${int_env[@]}" bash "$LAUNCH" --no-attach >/dev/null 2>&1; then
+    pass "integration: sable-launch --no-attach exits 0"
+  else
+    fail "integration: sable-launch --no-attach exits 0"
+  fi
+  if tmux -L "$SOCK" has-session -t "$ISESS" 2>/dev/null; then
+    pass "integration: session created"
+  else
+    fail "integration: session created"
+  fi
+  NROLES="$(tmux -L "$SOCK" list-panes -s -t "$ISESS" -F '#{@sable_role}' 2>/dev/null | grep -c .)"
+  if [ "$NROLES" = "4" ]; then
+    pass "integration: four role-tagged panes"
+  else
+    fail "integration: four role-tagged panes" "got $NROLES"
+  fi
+  if env "${int_env[@]}" bash "$LAUNCH" --no-attach >/dev/null 2>&1; then
+    pass "integration: second run reuses the existing session (exit 0)"
+  else
+    fail "integration: second run reuses the existing session (exit 0)"
+  fi
+  tmux -L "$SOCK" kill-server 2>/dev/null || true
+else
+  echo "SKIP: tmux not available — integration cases skipped"
 fi
 
 # Cleanup
