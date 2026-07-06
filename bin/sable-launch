@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# sable-launch — the memorable session door (SABLE-njiv, SABLE-ssws.2).
+# sable-launch — the memorable session door (SABLE-njiv, SABLE-ssws.2,
+# mode-neutral SABLE-dqhn.1).
 #
-# No arguments: START the SABLE warm-pane session — bring it up via
-# `sable-tmux --autostart` if it doesn't exist yet (four identity-set panes:
-# lincoln, optimus, tarzan, chuck; autonomous roles kicked into their loops),
-# then attach. Re-running is safe: an existing session is reused.
+# No arguments: START your SABLE session — a tmux session holding ONLY the
+# lincoln pane (the one agent you talk to), then attach. Mode-neutral:
+# launching says nothing about planning vs execution, and no managers are
+# spawned or kicked. Managers appear later, on demand, in their OWN windows
+# (sable-spawn-manager — normally invoked by /sable-execute); peek at them
+# with sable-view. Re-running is safe: an existing session is reused.
 #
 # With a role argument: the advanced single-pane door — launch one identity
 # claude session by hand (e.g. a solo lincoln, or re-launching one pane). A
@@ -12,7 +15,7 @@
 # live identity-bleed incident (outbound messages mis-derived their sender).
 #
 # Usage:
-#   sable-launch [--no-attach]           start (or reuse) the warm-pane session
+#   sable-launch [--no-attach]           start (or reuse) your Lincoln session
 #   sable-launch <role> [claude-args...] advanced: one identity claude session
 #     role   lincoln | chuck
 #   sable-launch --help
@@ -24,7 +27,7 @@ set -u
 
 usage() {
   cat <<'EOF'
-sable-launch — start the SABLE warm-pane session (or one identity session).
+sable-launch — start your SABLE session (Lincoln only, mode-neutral).
 
 Usage:
   sable-launch                start the tmux session (create if needed) + attach
@@ -34,9 +37,11 @@ Usage:
                               (role: lincoln | chuck)
   sable-launch --help
 
-The session form lays out one persistent claude pane per role (lincoln,
-optimus, tarzan, chuck) via `sable-tmux --autostart` and attaches. Once
-attached: talk to Lincoln in its pane, peek at the others with `sable-view`.
+The session form creates a tmux session holding ONLY the lincoln pane — the
+agent you talk to, whether you are planning or executing. Managers are NOT
+started here: they spawn on demand into their own hidden windows
+(sable-spawn-manager, normally driven by /sable-execute). Deep-dive into them
+with `sable-view`, typically from a second terminal.
 The role form sets CLAUDE_AGENT_NAME=<role> and CLAUDE_AGENT_ROLE=manager and
 execs `claude` directly.
 EOF
@@ -93,8 +98,8 @@ else
     printf 'sable-launch: sable-tmux not found (looked next to this script and on PATH).\n' >&2
     exit 127
   fi
-  printf 'sable-launch: bringing up session %s (sable-tmux --autostart)...\n' "$SESSION" >&2
-  "$ST" --autostart --session "$SESSION" || exit $?
+  printf 'sable-launch: bringing up session %s (lincoln pane only)...\n' "$SESSION" >&2
+  "$ST" --roles lincoln --session "$SESSION" || exit $?
 fi
 
 if [ "$NO_ATTACH" = "1" ]; then

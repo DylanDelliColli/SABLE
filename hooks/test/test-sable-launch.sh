@@ -80,12 +80,15 @@ STUB
 chmod +x "$STUB_BIN/sable-tmux-rec"
 
 WORK="$(mktemp -d)"
-# 1. no session yet -> creates via sable-tmux --autostart, then attaches
+# 1. no session yet -> creates a LINCOLN-ONLY session (mode-neutral: no manager
+#    panes, no autostart kicks — SABLE-dqhn.1), then attaches
 run_launch "$HOME_FLAG" "TMUX_LOG=$WORK/t1.log ST_LOG=$WORK/s1.log STUB_HAS_SESSION=1 SABLE_TMUX_BIN=$STUB_BIN/sable-tmux-rec"
-if [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "STUB_ATTACH=1" && grep -q -- "--autostart" "$WORK/s1.log" 2>/dev/null; then
-  pass "no-arg + no session -> sable-tmux --autostart then attach"
+if [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "STUB_ATTACH=1" \
+   && grep -q -- "--roles lincoln" "$WORK/s1.log" 2>/dev/null \
+   && ! grep -q -- "--autostart" "$WORK/s1.log" 2>/dev/null; then
+  pass "no-arg + no session -> lincoln-only layout (no --autostart) then attach"
 else
-  fail "no-arg + no session -> sable-tmux --autostart then attach" "out=[$OUT] err=[$ERR] code=$CODE s1=[$(cat "$WORK/s1.log" 2>/dev/null)]"
+  fail "no-arg + no session -> lincoln-only layout (no --autostart) then attach" "out=[$OUT] err=[$ERR] code=$CODE s1=[$(cat "$WORK/s1.log" 2>/dev/null)]"
 fi
 
 # 2. session already exists -> reuses (no sable-tmux), attaches
@@ -98,7 +101,7 @@ fi
 
 # 3. --no-attach -> brings up only, never attaches
 run_launch "$HOME_FLAG" "TMUX_LOG=$WORK/t3.log ST_LOG=$WORK/s3.log STUB_HAS_SESSION=1 SABLE_TMUX_BIN=$STUB_BIN/sable-tmux-rec" --no-attach
-if [ "$CODE" -eq 0 ] && ! printf '%s' "$OUT" | grep -q "STUB_ATTACH=1" && grep -q -- "--autostart" "$WORK/s3.log" 2>/dev/null; then
+if [ "$CODE" -eq 0 ] && ! printf '%s' "$OUT" | grep -q "STUB_ATTACH=1" && grep -q -- "--roles lincoln" "$WORK/s3.log" 2>/dev/null; then
   pass "--no-attach brings up the session without attaching"
 else
   fail "--no-attach brings up the session without attaching" "out=[$OUT] err=[$ERR] code=$CODE"
@@ -188,8 +191,7 @@ fi
 if command -v tmux >/dev/null 2>&1; then
   SOCK="sable-launch-test-$$"
   ISESS="slaunch"
-  int_env=(SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION="$ISESS" SABLE_TMUX_PANE_CMD="bash"
-           SABLE_DISPATCH_READY_TIMEOUT=0 SABLE_DISPATCH_SUBMIT_TRIES=1 SABLE_DISPATCH_POLL_INTERVAL=0.1)
+  int_env=(SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION="$ISESS" SABLE_TMUX_PANE_CMD="bash")
   if env "${int_env[@]}" bash "$LAUNCH" --no-attach >/dev/null 2>&1; then
     pass "integration: sable-launch --no-attach exits 0"
   else
@@ -200,11 +202,11 @@ if command -v tmux >/dev/null 2>&1; then
   else
     fail "integration: session created"
   fi
-  NROLES="$(tmux -L "$SOCK" list-panes -s -t "$ISESS" -F '#{@sable_role}' 2>/dev/null | grep -c .)"
-  if [ "$NROLES" = "4" ]; then
-    pass "integration: four role-tagged panes"
+  ROLES_LIST="$(tmux -L "$SOCK" list-panes -s -t "$ISESS" -F '#{@sable_role}' 2>/dev/null | grep .)"
+  if [ "$ROLES_LIST" = "lincoln" ]; then
+    pass "integration: exactly one pane, role lincoln (mode-neutral launch)"
   else
-    fail "integration: four role-tagged panes" "got $NROLES"
+    fail "integration: exactly one pane, role lincoln (mode-neutral launch)" "got [$ROLES_LIST]"
   fi
   if env "${int_env[@]}" bash "$LAUNCH" --no-attach >/dev/null 2>&1; then
     pass "integration: second run reuses the existing session (exit 0)"
