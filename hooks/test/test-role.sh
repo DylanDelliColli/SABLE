@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# test-cockpit-role.sh — Verifies the cockpit role-prompt exists and carries the
-# defining duties: it is mode-aware (planning + execution), reads its mode from
-# the shared mechanism, and — unlike Lincoln — launches fleets.
+# test-role.sh — Verifies the lincoln role-prompt exists and carries the
+# defining duties (mode-aware planning + execution, reads its mode from the
+# shared mechanism, brings up the warm-pane session), and pins the manager
+# role files' warm-pane mandate + lane boundaries. Complements
+# test-tmux-roles.sh (which lints the tmux-native dispatch/messaging markers).
 #
 # Run with:
-#   bash hooks/test/test-cockpit-role.sh
+#   bash hooks/test/test-role.sh
 
 set -uo pipefail
 
@@ -44,30 +46,30 @@ done
 # rather than "the Lincoln strategist hat".
 assert_grep "$ROLE" "strategist hat" "role frames FRAMING as the strategist hat"
 
-# v2 one-window topology markers (SABLE-uz9.5 / uz9.4 option A)
+# warm-pane topology markers (SABLE-bldh / tmux-only SABLE-qa4d)
 assert_grep "$ROLE" "LINCOLN" "role declares the Lincoln identity"
-assert_grep "$ROLE" "self-dispatch and self-push" "role: managers self-dispatch and self-push (SABLE-uz9.11)"
 assert_no_grep "$ROLE" "Dispatching-for" "role drops the old DISPATCH-REQUEST relay attribution"
-assert_grep "$ROLE" "run_in_background" "role spawns managers as invisible background subagents"
-assert_grep "$ROLE" "Never spawn a manager in the foreground" "role forbids foreground manager spawns (chat never blocks)"
-assert_grep "$ROLE" "Chuck terminal" "role reminds the operator about the Chuck terminal"
-assert_grep "$ROLE" "push their own approved" "role: managers push their own approved lanes (Lincoln does not push)"
+assert_grep "$ROLE" "panes, not subagents" "role: managers are warm panes, never Agent-tool spawns"
+assert_grep "$ROLE" "sable-tmux" "role brings up (or verifies) the session via sable-tmux"
+assert_grep "$ROLE" "sable-msg" "role directs managers over sable-msg"
+assert_grep "$ROLE" "workers self-push" "role: workers self-push their own worktree branches (Lincoln does not push)"
+assert_no_grep "$ROLE" "Chuck terminal" "role no longer reminds about a Chuck terminal (chuck is a pane)"
+assert_grep "$ROLE" "run_in_background" "role spawns PLANNING producers as background subagents"
 assert_grep "$ROLE" "gaudi skill" "role runs gaudi as an inline skill at ARCHITECTURE"
 
-# --- v3 manager role-file source prose (SABLE-a0n cases 3/4) ---
-# Pin the CONVERTED state of both manager role files so relay phrasing cannot
-# silently return in a future merge. Both managers were converted at HEAD
-# (SABLE-uz9.11): the planned phase-1 (tarzan)/phase-2 (optimus) split collapsed,
-# so a0n case 4's "optimus retains relay" is obsolete — we pin direct-dispatch for
-# BOTH. (The generated agent defs are separately pinned in test-agent-definitions.sh;
-# 4ba remains the manual live acceptance run.)
+# --- manager role-file source prose: warm-pane mandate + lane boundaries ---
+# Pin the CONVERTED state of both manager role files so relay or Agent-tool
+# dispatch phrasing cannot silently return in a future merge. (The tmux
+# dispatch/messaging markers are separately linted in test-tmux-roles.sh.)
 for mgr in tarzan optimus; do
   MROLE="$REPO/templates/multi-manager/roles/$mgr.md"
-  assert_no_grep "$MROLE" "DISPATCH-REQUEST" "$mgr role drops the DISPATCH-REQUEST relay"
-  assert_grep    "$MROLE" "Agent tool"       "$mgr role dispatches workers via the Agent tool"
-  assert_grep    "$MROLE" "git -C"           "$mgr role pushes its own approved lane (git -C <worktree> push)"
-  assert_grep    "$MROLE" "Worktree:"        "$mgr role carries the Worktree prompt-line rule"
+  assert_no_grep "$MROLE" "DISPATCH-REQUEST"   "$mgr role drops the DISPATCH-REQUEST relay"
+  assert_grep    "$MROLE" "not the Agent tool" "$mgr role dispatches via the spawn helper, NOT the Agent tool"
+  assert_grep    "$MROLE" "sable-worker-status" "$mgr role monitors/reaps worker panes"
 done
+assert_grep "$REPO/templates/multi-manager/roles/optimus.md" "parent epic" "optimus keeps the epic lane boundary"
+assert_grep "$REPO/templates/multi-manager/roles/tarzan.md"  "orphan"      "tarzan keeps the orphan lane boundary"
+assert_grep "$REPO/templates/multi-manager/roles/tarzan.md"  "emergency"   "tarzan keeps emergency mode"
 
 echo
 echo "=========================================="
