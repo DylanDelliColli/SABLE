@@ -73,7 +73,30 @@ BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 [ -z "$BRANCH" ] && exit 0
 [ "$BRANCH" = "HEAD" ] && exit 0
 
-FILES=$(git -C "$CWD" diff "$BASE_BRANCH"...HEAD --name-only 2>/dev/null | head -50)
+# Skip when the pushed branch IS the integration/base branch itself
+# publishing or syncing to its own remote -- this is not a merge request (a
+# branch cannot be merged into itself). Compare BRANCH against BASE_BRANCH's
+# short name, stripping any remote prefix (e.g. "origin/llm-integration" ->
+# "llm-integration"). SABLE-d038: fixes the self-merge-into-itself framing
+# bug (first observed 2026-06-29 publishing origin/llm-integration, recurred
+# 2026-07-03 per bead h201).
+BASE_BRANCH_SHORT="${BASE_BRANCH#*/}"
+[ "$BRANCH" = "$BASE_BRANCH_SHORT" ] && exit 0
+
+# Compute the file list scoped to what THIS push actually moved, not the
+# branch's full historical divergence from BASE_BRANCH (SABLE-d038 second
+# symptom, per chuck's h201 evidence: an auto-filed bead's file list showed
+# ~49 files representing the whole llm-integration-vs-dev divergence, when
+# only 3 files across 7 commits were actually pushed). Prefer the old..new
+# range git itself reports in the push output; fall back to BASE_BRANCH for
+# a brand-new branch's first publish (no prior remote position to diff from).
+PUSH_RANGE_LINE=$(echo "$STDOUT_STDERR" | grep -E '^[[:space:]]*[0-9a-f]{7,40}\.\.[0-9a-f]{7,40}[[:space:]].*->' | head -1)
+PUSH_RANGE_OLD=$(echo "$PUSH_RANGE_LINE" | grep -oE '^[[:space:]]*[0-9a-f]{7,40}' | tr -d '[:space:]')
+if [ -n "$PUSH_RANGE_OLD" ] && git -C "$CWD" cat-file -e "${PUSH_RANGE_OLD}^{commit}" 2>/dev/null; then
+  FILES=$(git -C "$CWD" diff "$PUSH_RANGE_OLD"...HEAD --name-only 2>/dev/null | head -50)
+else
+  FILES=$(git -C "$CWD" diff "$BASE_BRANCH"...HEAD --name-only 2>/dev/null | head -50)
+fi
 [ -z "$FILES" ] && exit 0
 
 # Try to detect PR URL via gh (best-effort, optional)

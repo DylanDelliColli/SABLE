@@ -84,8 +84,11 @@ if [ "$WT_KIND" = "ABS" ]; then
   # Explicit work target — do not apply the exploration skip.
   WORKTREE="$WT_PATH"
 elif [ "$WT_KIND" = "REL" ]; then
-  ADVISORY="PRE-DISPATCH WARNING: Worktree line must be an absolute path, got '$WT_PATH'; ignoring it and falling back to the dispatch cwd."
-  WORKTREE="$CWD"
+  # Stand down instead of falling back to cwd: under member/producer spawns the
+  # dispatch cwd is the MAIN CHECKOUT, and rebasing it races concurrent
+  # dispatches and rewrites the session branch (market-brief-package-o45j).
+  emit_advisory "PRE-DISPATCH WARNING: Worktree line must be an absolute path, got '$WT_PATH'; standing down (no pre-dispatch rebase). Name an absolute worktree path to enable refresh."
+  exit 0
 else
   # No structured line: skip genuine read-only agents, then infer from the
   # prompt, then fall back to cwd.
@@ -105,12 +108,26 @@ for p in patterns:
         print(m.group(1))
         sys.exit(0)
 " 2>/dev/null || echo "")
-  [ -z "$WORKTREE" ] && WORKTREE="$CWD"
+  # No inferable worktree: stand down. NEVER fall back to cwd — under member/
+  # producer spawns cwd is the MAIN CHECKOUT, and rebasing it races concurrent
+  # dispatches and rewrites the session branch (market-brief-package-o45j).
+  [ -z "$WORKTREE" ] && exit 0
 fi
 
 # Target must be an existing git worktree; otherwise stand down (surfacing any
 # pending advisory).
 if [ -z "$WORKTREE" ] || [ ! -d "$WORKTREE" ] || { [ ! -d "$WORKTREE/.git" ] && [ ! -f "$WORKTREE/.git" ]; }; then
+  [ -n "$ADVISORY" ] && emit_advisory "$ADVISORY"
+  exit 0
+fi
+
+# Primary-checkout guard (market-brief-package-o45j): only LINKED worktrees are
+# refresh targets — never the primary checkout, even when named explicitly. In a
+# linked worktree git-dir differs from git-common-dir; in the primary checkout
+# they resolve identically. Fail-safe: if resolution fails, stand down.
+GIT_DIR_RESOLVED=$(git -C "$WORKTREE" rev-parse --absolute-git-dir 2>/dev/null || echo "")
+GIT_COMMON_RESOLVED=$(git -C "$WORKTREE" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "")
+if [ -z "$GIT_DIR_RESOLVED" ] || [ "$GIT_DIR_RESOLVED" = "$GIT_COMMON_RESOLVED" ]; then
   [ -n "$ADVISORY" ] && emit_advisory "$ADVISORY"
   exit 0
 fi
