@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# sable-claim — inspect and release a repo's tree-claim lock
+# (hooks/multi-manager/tree-claim.sh).
+#
+# market-brief-package-q6yu: the tree-claim holder previously had no way to
+# discover or self-release their own claim — the canonical record lives at
+# $(git -C <repo> rev-parse --git-dir)/sable-tree-claim and nothing surfaced
+# that path to the HOLDER (only the deny message, shown to the BLOCKED
+# party, named it). This CLI gives the holder (and an operator/manager)
+# status + release without reading hook source.
+#
+# Claim file format (one line): "<session_id> <epoch> <agent_name>"
+# agent_name is "-" when unresolved. Files written before this bead land
+# have only two fields; status/release treat a missing third field as "-".
+#
+# Usage:
+#   sable-claim status [<repo>]            # holder, agent, age, TTL remaining
+#   sable-claim release [<repo>] [--force] # release; refuses non-holders
+#   sable-claim --help
+#
+# Holder identity for 'release': this CLI is not a hook, so it has no
+# Claude-Code-issued session_id to compare directly. It proves holder-ness
+# via whichever of these the caller's environment actually carries:
+#   1. $CLAUDE_SESSION_ID matches the claim's session_id field, OR
+#   2. $CLAUDE_AGENT_NAME matches the claim's agent_name field
+# Neither set (the common case for an unnamed session) => release requires
+# --force — the operator/manager override, mirroring
+# SABLE_TREE_CLAIM_OVERRIDE=1 in the hook itself.
+
+set -eu
+
+TTL="${SABLE_TREE_CLAIM_TTL:-3600}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  sable-claim status [<repo>]
+  sable-claim release [<repo>] [--force]
+  sable-claim --help
+EOF
+}
+
+resolve_claim_file() {
+  # $1 = repo path (default: PWD). Prints the claim file path on success.
+  local repo="${1:-$PWD}"
+  local gdir
+  gdir=$(git -C "$repo" rev-parse --git-dir 2>/dev/null) || return 1
+  case "$gdir" in
+    /*) ;;
+    *)  gdir="$repo/$gdir" ;;
+  esac
+  printf '%s/sable-tree-claim\n' "$gdir"
+}
+
+cmd_status() {
+  local repo="${1:-$PWD}"
+  local cf
+  if ! cf=$(resolve_claim_file "$repo"); then
+    echo "sable-claim: '$repo' is not a git repository" >&2
+    return 1
+  fi
+  if [ ! -f "$cf" ]; then
+    echo "no claim (file: $cf)"
+    return 0
+  fi
+  local session ts agent now age remaining
+  session=$(awk '{print $1}' "$cf" 2>/dev/null)
+  ts=$(awk '{print $2}' "$cf" 2>/dev/null)
+  agent=$(awk '{print $3}' "$cf" 2>/dev/null)
+  [ -z "$agent" ] && agent="-"
+  now=$(date +%s)
+  age=$(( now - ${ts:-0} ))
+  [ "$age" -lt 0 ] && age=0
+  remaining=$(( TTL - age ))
+  echo "claim file: $cf"
+  echo "holder:     ${session:-<unparseable>} (agent: $agent)"
+  echo "age:        ${age}s"
+  if [ "$remaining" -gt 0 ]; then
+    echo "TTL:        ${remaining}s remaining (of ${TTL}s)"
+  else
+    echo "TTL:        expired $(( -remaining ))s ago (stale — the next mutating git command in this repo will take over automatically)"
+  fi
+}
+
+cmd_release() {
+  local repo="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      *) repo="$1"; shift ;;
+    esac
+  done
+  [ -z "$repo" ] && repo="$PWD"
+  local cf
+  if ! cf=$(resolve_claim_file "$repo"); then
+    echo "sable-claim: '$repo' is not a git repository" >&2
+    return 1
+  fi
+  if [ ! -f "$cf" ]; then
+    echo "sable-claim: no claim held on '$repo' — nothing to release"
+    return 0
+  fi
+  local session agent
+  session=$(awk '{print $1}' "$cf" 2>/dev/null)
+  agent=$(awk '{print $3}' "$cf" 2>/dev/null)
+  [ -z "$agent" ] && agent="-"
+
+  if [ "$force" -eq 1 ]; then
+    rm -f "$cf"
+    echo "sable-claim: released (was held by '$session', agent '$agent') via --force"
+    return 0
+  fi
+
+  local is_holder=0
+  if [ -n "${CLAUDE_SESSION_ID:-}" ] && [ "${CLAUDE_SESSION_ID:-}" = "$session" ]; then
+    is_holder=1
+  fi
+  if [ "$is_holder" -eq 0 ] && [ -n "${CLAUDE_AGENT_NAME:-}" ] && [ "${CLAUDE_AGENT_NAME:-}" = "$agent" ]; then
+    is_holder=1
+  fi
+
+  if [ "$is_holder" -eq 1 ]; then
+    rm -f "$cf"
+    echo "sable-claim: released (was held by '$session', agent '$agent')"
+    return 0
+  fi
+
+  echo "sable-claim: refused — claim on '$repo' is held by '$session' (agent '$agent'), which does not match this session (CLAUDE_SESSION_ID=${CLAUDE_SESSION_ID:-<unset>}, CLAUDE_AGENT_NAME=${CLAUDE_AGENT_NAME:-<unset>}). Use --force to override (operator/manager escape hatch)." >&2
+  return 1
+}
+
+case "${1:-}" in
+  status)        shift; cmd_status "${1:-}" ;;
+  release)       shift; cmd_release "$@" ;;
+  --help|-h|help|"") usage ;;
+  *) echo "sable-claim: unknown subcommand '$1'" >&2; usage >&2; exit 1 ;;
+esac

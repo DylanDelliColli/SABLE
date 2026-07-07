@@ -92,6 +92,24 @@ if [ -z "$SESSION_ID" ]; then
   IDENTITY_KNOWN=0
 fi
 
+# market-brief-package-q6yu: a human-attributable name for the claim record's
+# third field (status output shows "lincoln", not just a raw session UUID —
+# the misidentification that led to a wrong release against an ACTIVE
+# holder). Same signal order as SESSION_ID: hook-input agent_type (subagent
+# context) first, then the legacy env terminal name. "-" when neither is set
+# (the common case for an unnamed session) — sable-claim status/release still
+# work off the session_id field in that case.
+AGENT_NAME=$(printf '%s' "$HOOK_INPUT" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+print(d.get('agent_type', '') or '')
+" 2>/dev/null) || AGENT_NAME=""
+[ -z "$AGENT_NAME" ] && AGENT_NAME="${CLAUDE_AGENT_NAME:-}"
+[ -z "$AGENT_NAME" ] && AGENT_NAME="-"
+
 # ---------------------------------------------------------------------------
 # Helper: emit an additionalContext response and exit 0 (allow)
 # ---------------------------------------------------------------------------
@@ -301,6 +319,17 @@ CLAIM_FILE="$GIT_DIR/sable-tree-claim"
 TTL="${SABLE_TREE_CLAIM_TTL:-3600}"
 NOW=$(date +%s 2>/dev/null) || NOW=0
 
+# market-brief-package-q6yu: helper for every "this session now HOLDS the
+# claim" message. Names the claim file + a release reminder — the gap the
+# bead was filed for: the claim-TAKER previously learned nothing about where
+# the record lives or how to release it (only the deny message, shown to the
+# BLOCKED party, named the path). Use `sable-claim status/release
+# <repo>` — see bin/sable-claim.
+claim_taken_suffix() {
+  printf ' Claim file: %s. Release when done: sable-claim release "%s" (from this session/agent), or sable-claim status "%s" to inspect.' \
+    "$CLAIM_FILE" "$EFFECTIVE_DIR" "$EFFECTIVE_DIR"
+}
+
 # ---------------------------------------------------------------------------
 # Step 3: Missing identity — fail open, but never clobber an existing claim
 # ---------------------------------------------------------------------------
@@ -309,8 +338,8 @@ if [ "$IDENTITY_KNOWN" -eq 0 ]; then
   # (regardless of holder or age) must never be overwritten by an
   # identity-unknown invocation — doing so would evict the legitimate holder.
   if [ ! -f "$CLAIM_FILE" ]; then
-    printf '%s %s\n' "$SESSION_ID" "$NOW" > "$CLAIM_FILE" 2>/dev/null || true
-    allow_with_context "tree-claim: session identity unknowable (PPID=${PPID:-?}); claim written as $SESSION_ID. If two sessions share this checkout, set CLAUDE_SESSION_ID or use 'bd worktree create <name>' for isolation."
+    printf '%s %s %s\n' "$SESSION_ID" "$NOW" "$AGENT_NAME" > "$CLAIM_FILE" 2>/dev/null || true
+    allow_with_context "tree-claim: session identity unknowable (PPID=${PPID:-?}); claim written as $SESSION_ID.$(claim_taken_suffix) If two sessions share this checkout, set CLAUDE_SESSION_ID or use 'bd worktree create <name>' for isolation."
   else
     allow_with_context "tree-claim: session identity unknowable (PPID=${PPID:-?}); existing claim preserved (holder: $(awk '{print $1}' "$CLAIM_FILE" 2>/dev/null)). If two sessions share this checkout, set CLAUDE_SESSION_ID or use 'bd worktree create <name>' for isolation."
   fi
@@ -320,47 +349,55 @@ fi
 # Step 4: SABLE_TREE_CLAIM_OVERRIDE — allow unconditionally, take over
 # ---------------------------------------------------------------------------
 if [ "${SABLE_TREE_CLAIM_OVERRIDE:-}" = "1" ]; then
-  printf '%s %s\n' "$SESSION_ID" "$NOW" > "$CLAIM_FILE" 2>/dev/null || true
-  allow_with_context "tree-claim: override active (SABLE_TREE_CLAIM_OVERRIDE=1). Claim taken over by session $SESSION_ID."
+  printf '%s %s %s\n' "$SESSION_ID" "$NOW" "$AGENT_NAME" > "$CLAIM_FILE" 2>/dev/null || true
+  allow_with_context "tree-claim: override active (SABLE_TREE_CLAIM_OVERRIDE=1). Claim taken over by session $SESSION_ID.$(claim_taken_suffix)"
 fi
 
 # ---------------------------------------------------------------------------
 # Step 5: Read the existing claim (if any)
 # ---------------------------------------------------------------------------
 if [ ! -f "$CLAIM_FILE" ]; then
-  # No claim — write and allow
-  printf '%s %s\n' "$SESSION_ID" "$NOW" > "$CLAIM_FILE" 2>/dev/null || true
-  exit 0
+  # No claim — write and allow, naming the path so the new holder can find
+  # and release it later without reading hook source (market-brief-package-q6yu).
+  printf '%s %s %s\n' "$SESSION_ID" "$NOW" "$AGENT_NAME" > "$CLAIM_FILE" 2>/dev/null || true
+  allow_with_context "tree-claim: claim taken by session $SESSION_ID.$(claim_taken_suffix)"
 fi
 
-# Read claim: "session_id timestamp"
+# Read claim: "session_id timestamp agent_name"
 CLAIM_SESSION=$(awk '{print $1}' "$CLAIM_FILE" 2>/dev/null) || CLAIM_SESSION=""
 CLAIM_TS=$(awk '{print $2}' "$CLAIM_FILE" 2>/dev/null) || CLAIM_TS=0
 
 # Unreadable / corrupt claim — fail open
 if [ -z "$CLAIM_SESSION" ] || [ -z "$CLAIM_TS" ]; then
-  printf '%s %s\n' "$SESSION_ID" "$NOW" > "$CLAIM_FILE" 2>/dev/null || true
-  allow_with_context "tree-claim: could not parse existing claim file; took over for session $SESSION_ID."
+  printf '%s %s %s\n' "$SESSION_ID" "$NOW" "$AGENT_NAME" > "$CLAIM_FILE" 2>/dev/null || true
+  allow_with_context "tree-claim: could not parse existing claim file; took over for session $SESSION_ID.$(claim_taken_suffix)"
 fi
 
 # ---------------------------------------------------------------------------
 # Step 6: Evaluate claim ownership
 # ---------------------------------------------------------------------------
 if [ "$CLAIM_SESSION" = "$SESSION_ID" ]; then
-  # Own claim — refresh timestamp and allow
-  printf '%s %s\n' "$SESSION_ID" "$NOW" > "$CLAIM_FILE" 2>/dev/null || true
+  # Own claim — refresh timestamp and allow. Stays silent (no context): this
+  # is the common per-command path for a session that already knows it holds
+  # the claim, not a "you just took a new claim" event.
+  printf '%s %s %s\n' "$SESSION_ID" "$NOW" "$AGENT_NAME" > "$CLAIM_FILE" 2>/dev/null || true
   exit 0
 fi
 
 # Foreign claim
 CLAIM_AGE=$(( NOW - CLAIM_TS ))
 if [ "$CLAIM_AGE" -lt 0 ]; then CLAIM_AGE=0; fi
+# market-brief-package-q6yu: attributable name, not just a raw session UUID
+# (LIVE EVIDENCE ROUND 2 — an anonymous uuid+epoch record invited a wrong
+# release against an ACTIVE holder via timing-correlation misattribution).
+CLAIM_AGENT=$(awk '{print $3}' "$CLAIM_FILE" 2>/dev/null) || CLAIM_AGENT=""
+[ -z "$CLAIM_AGENT" ] && CLAIM_AGENT="-"
 
 if [ "$CLAIM_AGE" -lt "$TTL" ]; then
   # Fresh foreign claim — deny
-  deny_with_reason "tree-claim: index locked by session '$CLAIM_SESSION' (${CLAIM_AGE}s ago, TTL ${TTL}s). Your session: $SESSION_ID. Escape hatches: (1) set SABLE_TREE_CLAIM_OVERRIDE=1 to take over, or (2) delete $CLAIM_FILE manually and retry. If the other session is no longer active, the claim will expire automatically after $((TTL - CLAIM_AGE))s."
+  deny_with_reason "tree-claim: index locked by session '$CLAIM_SESSION' (agent '$CLAIM_AGENT', ${CLAIM_AGE}s ago, TTL ${TTL}s). Your session: $SESSION_ID. Escape hatches: (1) set SABLE_TREE_CLAIM_OVERRIDE=1 to take over, or (2) delete $CLAIM_FILE manually and retry, or (3) if you ARE '$CLAIM_AGENT', run: sable-claim release \"$EFFECTIVE_DIR\". If the other session is no longer active, the claim will expire automatically after $((TTL - CLAIM_AGE))s."
 else
   # Stale claim — take over and allow
-  printf '%s %s\n' "$SESSION_ID" "$NOW" > "$CLAIM_FILE" 2>/dev/null || true
-  allow_with_context "tree-claim: stale claim by '$CLAIM_SESSION' (${CLAIM_AGE}s old, TTL ${TTL}s) taken over by session $SESSION_ID."
+  printf '%s %s %s\n' "$SESSION_ID" "$NOW" "$AGENT_NAME" > "$CLAIM_FILE" 2>/dev/null || true
+  allow_with_context "tree-claim: stale claim by '$CLAIM_SESSION' (agent '$CLAIM_AGENT', ${CLAIM_AGE}s old, TTL ${TTL}s) taken over by session $SESSION_ID.$(claim_taken_suffix)"
 fi
