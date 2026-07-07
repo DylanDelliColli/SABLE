@@ -153,6 +153,75 @@ make_input_agent "pytest tests/" "$PA_SID2" "" | bash "$HOOK" >/dev/null 2>&1 ||
 if [ -s "$EV_MAIN2" ]; then pass "main-session (empty agent_id) uses the session-global key (single-agent unchanged)"; else fail "main-session (empty agent_id) uses the session-global key" "no $EV_MAIN2"; fi
 rm -f "$EV_MAIN2"
 
+# ---------- market-brief-package-sqcr: compound-command + cross-repo blind spots ----------
+# Direct/interpreter-agnostic script execution (no 'bash '/'sh ' prefix), and
+# cross-repo runs tagged with the repo they actually ran against, so tdd-gate
+# can recognize companion-repo evidence for a cross-repo bead (73t4-style: a
+# SABLE-hooks fix tracked as a market-brief-package bead).
+
+run_hook_writes "direct execution (./test-foo.sh, no interpreter prefix) recognized" \
+  "./hooks/test/test-foo.sh"
+
+run_hook_writes "direct execution with absolute path recognized" \
+  "/home/ddc/dev-environment/SABLE/hooks/test/test-foo.sh"
+
+run_hook_silent "direct execution of a non-test script not recognized" \
+  "./hooks/setup.sh"
+
+# repo-tagging: a cd-compound into a companion repo must tag the evidence
+# line with that repo, not the hook's own cwd.
+CROSSREPO_SID="tdd-ev-crossrepo-$$-$RANDOM"
+CROSSREPO_EV="/tmp/tdd-evidence-${CROSSREPO_SID}"
+rm -f "$CROSSREPO_EV"
+make_input "cd /home/ddc/dev-environment/SABLE && bash hooks/test/test-tree-claim.sh" "$CROSSREPO_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if grep -q 'REPO=/home/ddc/dev-environment/SABLE' "$CROSSREPO_EV" 2>/dev/null; then
+  pass "cross-repo (cd-compound): evidence line tagged with the companion repo"
+else
+  fail "cross-repo (cd-compound): evidence line tagged with the companion repo" "got: $(cat "$CROSSREPO_EV" 2>/dev/null)"
+fi
+rm -f "$CROSSREPO_EV"
+
+# repo-tagging: git -C <repo> establishes the effective repo for a later
+# segment in the same compound command (the bug report's literal shape).
+GITC_SID="tdd-ev-gitc-$$-$RANDOM"
+GITC_EV="/tmp/tdd-evidence-${GITC_SID}"
+rm -f "$GITC_EV"
+make_input "git -C /home/ddc/dev-environment/SABLE fetch && bash /home/ddc/dev-environment/SABLE/hooks/test/test-tree-claim.sh" "$GITC_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if grep -q 'REPO=/home/ddc/dev-environment/SABLE' "$GITC_EV" 2>/dev/null; then
+  pass "cross-repo (git -C prefix): evidence line tagged with the companion repo"
+else
+  fail "cross-repo (git -C prefix): evidence line tagged with the companion repo" "got: $(cat "$GITC_EV" 2>/dev/null)"
+fi
+rm -f "$GITC_EV"
+
+# repo-tagging: an absolute path naming its own hooks/ tree is a self-tagging
+# signal, with no cd/-C needed at all.
+ABS_SID="tdd-ev-abs-$$-$RANDOM"
+ABS_EV="/tmp/tdd-evidence-${ABS_SID}"
+rm -f "$ABS_EV"
+make_input "bash /home/ddc/dev-environment/SABLE/hooks/test/test-tree-claim.sh" "$ABS_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if grep -q 'REPO=/home/ddc/dev-environment/SABLE' "$ABS_EV" 2>/dev/null; then
+  pass "cross-repo (self-tagging absolute path): evidence line tagged with the companion repo"
+else
+  fail "cross-repo (self-tagging absolute path): evidence line tagged with the companion repo" "got: $(cat "$ABS_EV" 2>/dev/null)"
+fi
+rm -f "$ABS_EV"
+
+# same-repo run (no cd/-C, relative path): tagged with the hook's own cwd.
+SAMEREPO_SID="tdd-ev-samerepo-$$-$RANDOM"
+SAMEREPO_EV="/tmp/tdd-evidence-${SAMEREPO_SID}"
+rm -f "$SAMEREPO_EV"
+python3 -c "
+import json, sys
+print(json.dumps({'tool_input': {'command': 'pytest tests/'}, 'session_id': sys.argv[1], 'cwd': '/home/ddc/dev-environment/market-brief-package'}))
+" "$SAMEREPO_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if grep -q 'REPO=/home/ddc/dev-environment/market-brief-package' "$SAMEREPO_EV" 2>/dev/null; then
+  pass "same-repo run tagged with the hook's own cwd (no cd/-C in the command)"
+else
+  fail "same-repo run tagged with the hook's own cwd" "got: $(cat "$SAMEREPO_EV" 2>/dev/null)"
+fi
+rm -f "$SAMEREPO_EV"
+
 # ---------- Summary ----------
 
 echo

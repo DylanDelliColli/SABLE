@@ -300,6 +300,72 @@ out=$(run_gate_agent "$CLOSE2" "$PG_SID" "")
 if [ -z "$out" ]; then pa_pass "per-agent gate: main-session close allowed by session-global evidence (single-agent unchanged)"; else pa_fail "per-agent gate: main-session allowed by session-global evidence" "got: $out"; fi
 rm -f "$PG_MAIN" "$PG_A" "$PG_B"
 
+# ---------- market-brief-package-sqcr: companion-repo evidence acceptance ----------
+# A cross-repo bead (73t4 pattern: a SABLE-hooks fix tracked as a
+# market-brief-package bead) declares its companion repo in notes
+# ("Companion repo: <path>"). tdd-evidence.sh tags cross-repo test runs with
+# REPO=<path>; the gate must accept that tag even when it lives under a
+# DIFFERENT agent_id than the one closing the bead (a nested sub-call may
+# have run the companion suite) — but must NOT special-case a bead that
+# never declared a companion repo.
+
+CR_STUB_DIR=$(mktemp -d)
+cat > "$CR_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"market-brief-package-companion","notes":"Companion repo: /home/ddc/dev-environment/SABLE"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$CR_STUB_DIR/bd"
+
+CR_SID="tdd-gate-companion-$$-$RANDOM"
+CR_CLOSE='bd close market-brief-package-companion market-brief-package-other'
+rm -f /tmp/tdd-evidence-"${CR_SID}"*
+
+# (a) companion declared, but no REPO=-tagged evidence anywhere → still denied
+CR_OUT=$(make_input "$CR_CLOSE" "$CR_SID" | env PATH="$CR_STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null)
+if echo "$CR_OUT" | grep -q '"permissionDecision": "deny"'; then
+  pa_pass "companion-repo: no matching REPO= evidence anywhere → still denied"
+else
+  pa_fail "companion-repo: no matching REPO= evidence anywhere → still denied" "got: ${CR_OUT:-<empty>}"
+fi
+
+# (b) REPO=-tagged evidence recorded under a DIFFERENT agent_id in the same
+# session → accepted, even though the exact-key file for this close is empty.
+echo "$(date -Iseconds) REPO=/home/ddc/dev-environment/SABLE CMD=bash hooks/test/test-tree-claim.sh" > "/tmp/tdd-evidence-${CR_SID}-agentX"
+CR_OUT2=$(make_input "$CR_CLOSE" "$CR_SID" | env PATH="$CR_STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null)
+if [ -z "$CR_OUT2" ]; then
+  pa_pass "companion-repo: REPO=-tagged evidence under a different agent_id accepted"
+else
+  pa_fail "companion-repo: REPO=-tagged evidence under a different agent_id accepted" "got: $CR_OUT2"
+fi
+rm -f /tmp/tdd-evidence-"${CR_SID}"*
+
+# (c) a bead with NO companion-repo declaration gets no special treatment.
+cat > "$CR_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"market-brief-package-plain","notes":"just a normal bead, no companion repo"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+CR_SID2="tdd-gate-nocomp-$$-$RANDOM"
+rm -f /tmp/tdd-evidence-"${CR_SID2}"*
+CR_OUT3=$(make_input 'bd close market-brief-package-plain market-brief-package-other' "$CR_SID2" | env PATH="$CR_STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null)
+if echo "$CR_OUT3" | grep -q '"permissionDecision": "deny"'; then
+  pa_pass "companion-repo: bead without a declaration gets no special treatment (still denied)"
+else
+  pa_fail "companion-repo: bead without a declaration gets no special treatment" "got: ${CR_OUT3:-<empty>}"
+fi
+rm -rf "$CR_STUB_DIR"
+
 # ---------- Summary ----------
 
 echo

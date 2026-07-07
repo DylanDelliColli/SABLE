@@ -90,6 +90,36 @@ if [ -s "$EVIDENCE_FILE" ]; then
   exit 0  # Tests were run by this agent this session — allow close
 fi
 
+# market-brief-package-sqcr: companion-repo acceptance. A cross-repo bead (a
+# fix tracked in one bd tracker whose acceptance evidence is a test suite in a
+# DIFFERENT repo — the 73t4 pattern: a SABLE-hooks fix tracked as a
+# market-brief-package bead) declares that repo in its notes as a line
+# "Companion repo: <path>". If any bead in this close command carries that
+# declaration, and ANY evidence file for this session (any agent — a nested
+# sub-call may have run the companion suite under a different agent_id) has a
+# REPO=<path>-tagged line from tdd-evidence.sh, accept. This is purely
+# additive: it only fires when the exact-key evidence file above was empty,
+# so it cannot weaken the existing per-agent gate.
+if [ -n "$BEAD_ARGS" ]; then
+  for _bid in $BEAD_ARGS; do
+    _companion=$(bd show "$_bid" --json 2>/dev/null | python3 -c "
+import json, re, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(data, list) or not data:
+    sys.exit(0)
+notes = data[0].get('notes', '') or ''
+m = re.search(r'Companion repo:\s*(\S+)', notes)
+print(m.group(1) if m else '')
+" 2>/dev/null) || _companion=""
+    if [ -n "$_companion" ] && grep -qF "REPO=${_companion}" /tmp/tdd-evidence-"${SESSION_ID}"* 2>/dev/null; then
+      exit 0
+    fi
+  done
+fi
+
 # No evidence found — block the close
 python3 -c "
 import json
