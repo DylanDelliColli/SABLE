@@ -541,7 +541,12 @@ git init -q "$INT_REPO"
 
 resolve_int_test() {
   local label="$1" repo="$2" env_assignments="$3" expect="$4" got
-  got=$(env $env_assignments bash -c "source '$LIB'; sable_resolve_integration_branch '$repo'")
+  # market-brief-package-wxnd: 'env $env_assignments' ADDS variables but does
+  # not clear inherited ones, so a case with no assignments (e.g. "no config
+  # anywhere defaults to main") leaked the CALLING session's own
+  # SABLE_BASE_BRANCH/SABLE_INTEGRATION_BRANCH into the test. -u unsets run
+  # first; later assignments (this test's own env_assignments) still apply.
+  got=$(env -u SABLE_BASE_BRANCH -u SABLE_INTEGRATION_BRANCH $env_assignments bash -c "source '$LIB'; sable_resolve_integration_branch '$repo'")
   if [ "$got" = "$expect" ]; then
     pass "$label"
   else
