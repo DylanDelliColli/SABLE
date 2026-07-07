@@ -5,38 +5,119 @@
 
 set -euo pipefail
 
-# Read stdin and parse with python3 (jq not available)
-PARSED=$(python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-cmd = d.get('tool_input', {}).get('command', '')
-sid = d.get('session_id', '')
+HOOK_INPUT=$(cat 2>/dev/null) || exit 0
+
+# market-brief-package-sqcr: detect test-runner commands even when wrapped in
+# a compound command (cd/git -C prefix, &&/;/| chains) or invoked directly
+# without a 'bash '/'sh ' prefix (./test-x.sh, /abs/path/test-x.sh), and TAG
+# each recorded run with the repo it actually ran against. A plain substring
+# grep can already find "pytest" anywhere in a line regardless of a leading
+# cd-compound — the real gaps were (a) direct/absolute script execution with
+# no interpreter token to anchor on, and (b) no record of WHICH repo a
+# cross-repo run (git -C <repo> / cd <repo> && ...) targeted, which is what
+# tdd-gate needs to recognize companion-repo evidence for a cross-repo bead
+# (73t4-style: a SABLE-hooks fix tracked as a market-brief-package bead).
+# Mirrors sable_is_git_push's shlex-tokenize-then-walk approach
+# (hooks/multi-manager/lib-identity.sh) — token-level parsing, not a blind
+# substring grep, is what lets us track "which repo did THIS segment run in."
+RESULT=$(printf '%s' "$HOOK_INPUT" | python3 -c "
+import json, re, shlex, sys
+
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+
+cmd = d.get('tool_input', {}).get('command', '') or ''
+cwd = d.get('cwd', '') or ''
+sid = d.get('session_id', '') or ''
 aid = d.get('agent_id', '') or ''
-print(f'{sid}\n{aid}\n{cmd}')
+if not cmd or not sid:
+    sys.exit(0)
+
+SEPS = {';', '&&', '||', '|'}
+SCRIPT_RE = re.compile(r'test-[A-Za-z0-9_-]+\.sh\$')
+PYTEST_FILE_RE = re.compile(r'test_[A-Za-z0-9_-]+\.py')
+
+try:
+    tokens = shlex.split(cmd)
+except ValueError:
+    sys.exit(0)
+
+segments = [[]]
+for t in tokens:
+    if t in SEPS:
+        segments.append([])
+    else:
+        segments[-1].append(t)
+
+def join_path(base, p):
+    if p.startswith('/'):
+        return p
+    return (base.rstrip('/') + '/' + p) if base else p
+
+effective_repo = cwd
+hits = []  # list of (repo, joined-segment-text)
+for seg in segments:
+    if not seg:
+        continue
+    head = seg[0]
+
+    # 'cd <path>' persists as the effective repo for later segments in this
+    # same compound command (real shell semantics within one bash -c).
+    if head == 'cd' and len(seg) > 1:
+        effective_repo = join_path(effective_repo, seg[1])
+        continue
+
+    # 'git -C <path> ...' declares an effective repo too (precedent:
+    # sable_resolve_push_repo_dir treats -C the same way for push commands).
+    if head == 'git' and '-C' in seg:
+        ci = seg.index('-C')
+        if ci + 1 < len(seg):
+            effective_repo = join_path(effective_repo, seg[ci + 1])
+        continue
+
+    joined = ' '.join(seg)
+    matched = False
+    if 'vitest' in joined:
+        matched = True
+    elif 'pytest' in joined:
+        matched = True
+    elif 'npm test' in joined:
+        matched = True
+    elif re.match(r'^python3?\$', head) and PYTEST_FILE_RE.search(joined):
+        matched = True
+    else:
+        last = seg[-1]
+        # 'bash x' / 'sh x' / 'source x' style, OR direct execution
+        # (./test-x.sh, /abs/path/test-x.sh — no interpreter token at all).
+        interpreted = head in ('bash', 'sh', 'source', '.') and SCRIPT_RE.search(last)
+        direct_exec = (last == head) and (last.startswith('./') or last.startswith('/')) and SCRIPT_RE.search(last)
+        if interpreted or direct_exec:
+            matched = True
+            # An absolute path naming its own hooks/ tree is a stronger repo
+            # signal than any earlier cd/-C tracking — use it directly.
+            if last.startswith('/') and '/hooks/' in last:
+                effective_repo = last.split('/hooks/')[0]
+
+    if matched:
+        hits.append((effective_repo or cwd or '', joined))
+
+if not hits:
+    sys.exit(0)
+
+evidence_file = ('/tmp/tdd-evidence-%s-%s' % (sid, aid)) if aid else ('/tmp/tdd-evidence-%s' % sid)
+print(evidence_file)
+for repo, seg_text in hits:
+    print('REPO=%s CMD=%s' % (repo, seg_text))
 " 2>/dev/null) || exit 0
 
-SESSION_ID=$(echo "$PARSED" | sed -n '1p')
-AGENT_ID=$(echo "$PARSED" | sed -n '2p')
-COMMAND=$(echo "$PARSED" | sed -n '3p')
+[ -z "$RESULT" ] && exit 0
 
-[ -z "$COMMAND" ] && exit 0
-[ -z "$SESSION_ID" ] && exit 0
-
-# Match test runner commands. The bash-harness pattern matches any
-# `bash <path>test-<name>.sh` invocation — covers SABLE's hook tests
-# (hooks/test/test-*.sh) plus any project that names test scripts test-*.sh.
-# The character class [^&|;] prevents `&&`/`||`/`;` chains from making the
-# match leak into the wrong half of a compound command.
-if echo "$COMMAND" | grep -qE '(vitest|pytest|npm test|npx vitest|python -m pytest|python3? [^&|;]*test_[A-Za-z0-9_-]+\.py|bash [^&|;]*test-[A-Za-z0-9_-]+\.sh)'; then
-  # Per-agent keying (SABLE-d72): session_id is SHARED across the whole nested
-  # agent tree, so key by session_id + agent_id when a subagent ran the tests.
-  # Main sessions (no agent_id) keep the session-global file unchanged.
-  if [ -n "$AGENT_ID" ]; then
-    EVIDENCE_FILE="/tmp/tdd-evidence-${SESSION_ID}-${AGENT_ID}"
-  else
-    EVIDENCE_FILE="/tmp/tdd-evidence-${SESSION_ID}"
-  fi
-  echo "$(date -Iseconds) $COMMAND" >> "$EVIDENCE_FILE"
-fi
+EVIDENCE_FILE=$(printf '%s\n' "$RESULT" | head -1)
+TS="$(date -Iseconds)"
+printf '%s\n' "$RESULT" | tail -n +2 | while IFS= read -r line; do
+  printf '%s %s\n' "$TS" "$line" >> "$EVIDENCE_FILE"
+done
 
 exit 0

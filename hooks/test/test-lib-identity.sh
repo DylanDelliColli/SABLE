@@ -531,6 +531,57 @@ validate_ref_test "sable_validate_base_ref: empty repo path returns desired ref 
   "" "origin/dev" "^origin/dev$"
 
 # --------------------------------------------------------------------------
+# sable_resolve_integration_branch unit tests (market-brief-package-2u25)
+# Repo-local config must win over session env, so a push in a DIFFERENT repo
+# than the one that set the env resolves THAT repo's own integration branch.
+# --------------------------------------------------------------------------
+INT_REPO=$(mktemp -d)
+trap 'rm -rf "$VAL_REPO" "$VAL_BARE" "$INT_REPO"' EXIT
+git init -q "$INT_REPO"
+
+resolve_int_test() {
+  local label="$1" repo="$2" env_assignments="$3" expect="$4" got
+  # market-brief-package-wxnd: 'env $env_assignments' ADDS variables but does
+  # not clear inherited ones, so a case with no assignments (e.g. "no config
+  # anywhere defaults to main") leaked the CALLING session's own
+  # SABLE_BASE_BRANCH/SABLE_INTEGRATION_BRANCH into the test. -u unsets run
+  # first; later assignments (this test's own env_assignments) still apply.
+  got=$(env -u SABLE_BASE_BRANCH -u SABLE_INTEGRATION_BRANCH $env_assignments bash -c "source '$LIB'; sable_resolve_integration_branch '$repo'")
+  if [ "$got" = "$expect" ]; then
+    pass "$label"
+  else
+    fail "$label" "expected [$expect] got [$got]"
+  fi
+}
+
+resolve_int_test "sable_resolve_integration_branch: no config anywhere defaults to main" \
+  "$INT_REPO" "" "main"
+
+resolve_int_test "sable_resolve_integration_branch: falls back to SABLE_INTEGRATION_BRANCH env" \
+  "$INT_REPO" "SABLE_INTEGRATION_BRANCH=llm-integration" "llm-integration"
+
+resolve_int_test "sable_resolve_integration_branch: falls back to SABLE_BASE_BRANCH minus origin/" \
+  "$INT_REPO" "SABLE_BASE_BRANCH=origin/dev" "dev"
+
+git -C "$INT_REPO" config sable.integrationBranch tmux-only
+resolve_int_test "sable_resolve_integration_branch: repo-local git config wins over session env" \
+  "$INT_REPO" "SABLE_INTEGRATION_BRANCH=llm-integration SABLE_BASE_BRANCH=origin/llm-integration" "tmux-only"
+git -C "$INT_REPO" config --unset sable.integrationBranch
+
+echo "integrationBranch=file-branch" > "$INT_REPO/.sable"
+resolve_int_test "sable_resolve_integration_branch: .sable file wins over session env" \
+  "$INT_REPO" "SABLE_INTEGRATION_BRANCH=llm-integration" "file-branch"
+
+git -C "$INT_REPO" config sable.integrationBranch config-branch
+resolve_int_test "sable_resolve_integration_branch: repo-local git config wins over .sable file" \
+  "$INT_REPO" "" "config-branch"
+git -C "$INT_REPO" config --unset sable.integrationBranch
+rm -f "$INT_REPO/.sable"
+
+resolve_int_test "sable_resolve_integration_branch: empty repo path falls back to env" \
+  "" "SABLE_INTEGRATION_BRANCH=foo" "foo"
+
+# --------------------------------------------------------------------------
 # sable_resolve_push_repo_dir unit tests (SABLE-041)
 # Resolves the effective git dir from a push command's `git -C <path>`,
 # applied to the shell cwd with git semantics; falls back to cwd when absent.

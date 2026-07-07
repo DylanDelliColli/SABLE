@@ -123,6 +123,44 @@ CF="$(claim_file "$SCRATCH")"
 if [ -f "$CF" ]; then pass "first git add: claim file created"; else fail "first git add: claim file created" "path: $CF"; fi
 if [ "$(claim_session "$SCRATCH")" = "sess-A" ]; then pass "first git add: claim session is sess-A"; else fail "first git add: claim session is sess-A" "got: $(claim_session "$SCRATCH")"; fi
 
+echo "--- Unit: market-brief-package-q6yu — taking a claim names the path + release hint ---"
+
+# First claim (previously silent exit 0) must now emit additionalContext
+# naming the claim file, so the holder can find and release it later without
+# reading hook source (the LIVE EVIDENCE incident this bead was filed for).
+if has_additional_context "$OUT"; then pass "first git add: additionalContext present (claim-taken message)"; else fail "first git add: additionalContext present (claim-taken message)" "output: $OUT"; fi
+if printf '%s' "$OUT" | grep -qF "$CF"; then pass "first git add: additionalContext names the claim file path"; else fail "first git add: additionalContext names the claim file path" "output: $OUT"; fi
+if printf '%s' "$OUT" | grep -q "sable-claim release"; then pass "first git add: additionalContext mentions the release command"; else fail "first git add: additionalContext mentions the release command" "output: $OUT"; fi
+
+echo "--- Unit: market-brief-package-q6yu — claim record carries an attributable agent name ---"
+
+clear_claim "$SCRATCH"
+JSON=$(python3 -c "
+import json
+print(json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'git add .'}, 'cwd': '$SCRATCH', 'session_id': 'sess-named', 'agent_type': 'tarzan'}))
+")
+OUT=$(run_hook "$JSON")
+if is_allow "$OUT"; then pass "named claim: allow"; else fail "named claim: allow" "got deny"; fi
+CF="$(claim_file "$SCRATCH")"
+CLAIM_AGENT="$(awk '{print $3}' "$CF" 2>/dev/null)"
+if [ "$CLAIM_AGENT" = "tarzan" ]; then pass "named claim: third field is the agent name (tarzan)"; else fail "named claim: third field is the agent name (tarzan)" "got: '$CLAIM_AGENT' (file: $(cat "$CF" 2>/dev/null))"; fi
+if printf '%s' "$OUT" | grep -qF "$CF"; then pass "named claim: additionalContext names the claim file path"; else fail "named claim: additionalContext names the claim file path" "output: $OUT"; fi
+
+# Unnamed session: third field falls back to '-' (unresolved), never blank.
+# Explicitly unset CLAUDE_AGENT_NAME (this test suite may itself run inside a
+# named agent's session, e.g. CLAUDE_AGENT_NAME=optimus — the exact env-leak
+# shape this bead's own AGENT_NAME fallback is designed to resolve, so the
+# "unnamed" case must force it absent to test the true no-signal path).
+clear_claim "$SCRATCH"
+JSON=$(make_json "git add ." "sess-anon" "$SCRATCH")
+OUT=$(
+  unset CLAUDE_AGENT_NAME
+  printf '%s' "$JSON" | bash "$HOOK" 2>/dev/null
+)
+CF="$(claim_file "$SCRATCH")"
+CLAIM_AGENT="$(awk '{print $3}' "$CF" 2>/dev/null)"
+if [ "$CLAIM_AGENT" = "-" ]; then pass "unnamed claim: third field falls back to '-'"; else fail "unnamed claim: third field falls back to '-'" "got: '$CLAIM_AGENT' (file: $(cat "$CF" 2>/dev/null))"; fi
+
 echo "--- Unit: same session refresh ---"
 
 CF="$(claim_file "$SCRATCH")"
@@ -145,6 +183,7 @@ OUT=$(run_hook "$JSON")
 if is_deny "$OUT"; then pass "foreign fresh: deny"; else fail "foreign fresh: deny" "got allow: ${OUT:-<empty>}"; fi
 if printf '%s' "$OUT" | grep -q "sess-A"; then pass "foreign fresh: names holder"; else fail "foreign fresh: names holder" "output: $OUT"; fi
 if printf '%s' "$OUT" | grep -qE "SABLE_TREE_CLAIM_OVERRIDE|delete"; then pass "foreign fresh: escape hatch mentioned"; else fail "foreign fresh: escape hatch mentioned" "output: $OUT"; fi
+if printf '%s' "$OUT" | grep -q "sable-claim release"; then pass "foreign fresh: deny names the sable-claim release escape hatch (market-brief-package-q6yu)"; else fail "foreign fresh: deny names the sable-claim release escape hatch" "output: $OUT"; fi
 
 echo "--- Unit: stale claim -> takeover + allow ---"
 
@@ -156,6 +195,7 @@ OUT=$(SABLE_TREE_CLAIM_TTL=3600 run_hook "$JSON")
 if is_allow "$OUT"; then pass "stale takeover: allow"; else fail "stale takeover: allow" "got deny"; fi
 if [ "$(claim_session "$SCRATCH")" = "sess-B" ]; then pass "stale takeover: claim now sess-B"; else fail "stale takeover: claim now sess-B" "got: $(claim_session "$SCRATCH")"; fi
 if has_additional_context "$OUT"; then pass "stale takeover: additionalContext present"; else fail "stale takeover: additionalContext present" "output: $OUT"; fi
+if printf '%s' "$OUT" | grep -qF "$CF"; then pass "stale takeover: additionalContext names the claim file path (market-brief-package-q6yu)"; else fail "stale takeover: additionalContext names the claim file path" "output: $OUT"; fi
 
 echo "--- Unit: SABLE_TREE_CLAIM_OVERRIDE ---"
 
