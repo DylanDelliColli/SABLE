@@ -73,6 +73,16 @@ BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 [ -z "$BRANCH" ] && exit 0
 [ "$BRANCH" = "HEAD" ] && exit 0
 
+# market-brief-package-2u25: pushing the repo's OWN integration branch is not
+# "PR ready for review" — it already IS the integration line (a topology
+# promotion decided elsewhere, not routine merge-queue work; chuck triaged an
+# earlier misfire of this exact shape as a false-positive). Resolved PER REPO
+# (repo-local git config / .sable file wins over session env, shared with
+# pre-push-rebase-test.sh via lib-identity.sh) so a foreign SABLE_BASE_BRANCH
+# inherited from another repo's session cannot misfire this.
+INTEGRATION_BRANCH=$(sable_resolve_integration_branch "$CWD")
+[ "$BRANCH" = "$INTEGRATION_BRANCH" ] && exit 0
+
 FILES=$(git -C "$CWD" diff "$BASE_BRANCH"...HEAD --name-only 2>/dev/null | head -50)
 [ -z "$FILES" ] && exit 0
 

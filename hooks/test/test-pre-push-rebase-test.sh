@@ -498,6 +498,50 @@ assert_context "fofc: pushing integration branch retargets rebase to origin/<bra
 rm -rf "$FOFC_BARE" "$FOFC_REPO"
 
 # ===================================================================
+# market-brief-package-2u25: per-repo integration-branch resolution.
+# Repo-local git config (sable.integrationBranch) must win over a foreign
+# SABLE_BASE_BRANCH env value inherited from a DIFFERENT repo's session (the
+# session-global-vs-per-repo bug). Fixture: this repo's own integration
+# branch is 'tmux-only' (repo-local config), while env says
+# SABLE_BASE_BRANCH=origin/llm-integration — a ref that does not exist in
+# THIS repo, simulating the cross-repo env leak. main has a commit that
+# CONFLICTS with the integration stack, so a misrouted rebase onto it is
+# observable.
+#   RED  (pre-fix): INTEGRATION_BRANCH derives from env → "llm-integration"
+#                   != CURRENT_BRANCH "tmux-only" → fofc case never matches →
+#                   BASE_BRANCH falls back to origin/main → conflicting
+#                   rebase → DENY "phase 1 (rebase)".
+#   GREEN(post-fix): INTEGRATION_BRANCH resolves via repo-local config →
+#                   "tmux-only" == CURRENT_BRANCH → retarget to
+#                   origin/tmux-only (fast-forward-safe no-op) → "phase skipped".
+# ===================================================================
+R2U25_BARE="/tmp/sable-test-2u25-bare.git"
+R2U25_REPO="/tmp/sable-test-2u25-repo"
+rm -rf "$R2U25_BARE" "$R2U25_REPO"
+git init -q --bare "$R2U25_BARE"
+git clone -q "$R2U25_BARE" "$R2U25_REPO" 2>/dev/null
+(
+  cd "$R2U25_REPO" || exit 1
+  git config user.email t@t; git config user.name t
+  git checkout -q -B main
+  echo base > shared.txt; git add shared.txt; git commit -q -m base
+  git push -q origin main
+  git checkout -q -b tmux-only
+  echo I1 > stack.txt; git add stack.txt; git commit -q -m I1
+  echo I2 >> stack.txt; git add stack.txt; git commit -q -m I2
+  git push -q origin tmux-only
+  git checkout -q main
+  echo mainX > stack.txt; git add stack.txt; git commit -q -m mainConflict
+  git push -q origin main
+  git checkout -q tmux-only
+  git config sable.integrationBranch tmux-only
+)
+R2U25_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/llm-integration SABLE_PRE_PUSH_TYPECHECK_COMMAND=true SABLE_PRE_PUSH_TEST_PHASE=skip"
+assert_context "market-brief-package-2u25: repo-local sable.integrationBranch wins over foreign SABLE_BASE_BRANCH env (retarget, no conflicting rebase)" \
+  "$R2U25_ENV" "git push origin tmux-only" "$R2U25_REPO" "phase skipped"
+rm -rf "$R2U25_BARE" "$R2U25_REPO"
+
+# ===================================================================
 # market-brief-package-yz5y: re-parent guard for a LOCAL-ONLY integration
 # branch. A branch cut from integration HEAD passes; a re-parented branch
 # (integration HEAD is NOT its ancestor) is DENIED. Guard is dormant once

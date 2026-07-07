@@ -416,6 +416,51 @@ fi
 assert_bd_called "disabled: for-chuck bead filed when messaging disabled"
 
 # --------------------------------------------------------------------------
+# market-brief-package-2u25: integration-branch self-push must NOT file a
+# for-chuck handoff. Repo-local git config resolves the integration branch
+# PER REPO, winning over a foreign SABLE_BASE_BRANCH env value (the
+# session-global-vs-per-repo bug: env says origin/llm-integration, a ref that
+# does not exist in this fixture repo at all).
+# --------------------------------------------------------------------------
+
+INTNOTIFY_REPO=$(mktemp -d)
+INTNOTIFY_BARE=$(mktemp -d)
+trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE"' EXIT
+git init -q --bare "$INTNOTIFY_BARE"
+git clone -q "$INTNOTIFY_BARE" "$INTNOTIFY_REPO"
+cd "$INTNOTIFY_REPO"
+git config user.email "t@t"; git config user.name "t"
+echo base > base.txt; git add base.txt; git commit -q -m base
+git push -q origin HEAD:refs/heads/main 2>/dev/null
+git checkout -q -b tmux-only
+echo i1 > i1.txt; git add i1.txt; git commit -q -m i1
+git config sable.integrationBranch tmux-only
+cd - >/dev/null
+
+# (a) pushing the repo's own integration branch (resolved via repo-local
+# config, NOT the foreign env) does NOT file for-chuck, and does not even
+# attempt the message-first handoff.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+INT_INPUT_A=$(make_post_input "git push origin tmux-only" "$INTNOTIFY_REPO")
+run_hook "$MGR_ENV SABLE_BASE_BRANCH=origin/llm-integration" "$INT_INPUT_A" >/dev/null
+assert_bd_not_called "market-brief-package-2u25: integration-branch self-push does NOT file for-chuck"
+if [ -s "$SABLE_MSG_LOG" ]; then
+  fail "market-brief-package-2u25: integration-branch self-push does not attempt sable-msg either" "MSG_LOG: $(cat "$SABLE_MSG_LOG")"
+else
+  pass "market-brief-package-2u25: integration-branch self-push does not attempt sable-msg either"
+fi
+rm -f "$SABLE_MSG_LOG"
+
+# (b) a worker/feature branch pushed in the SAME repo still notifies.
+cd "$INTNOTIFY_REPO"
+git checkout -q -b wk-other tmux-only
+echo w1 > w1.txt; git add w1.txt; git commit -q -m w1
+cd - >/dev/null
+INT_INPUT_B=$(make_post_input "git push origin wk-other" "$INTNOTIFY_REPO")
+run_hook "$MGR_ENV SABLE_BASE_BRANCH=origin/llm-integration" "$INT_INPUT_B" >/dev/null
+assert_bd_called "market-brief-package-2u25: non-integration branch push in same repo still notifies"
+
+# --------------------------------------------------------------------------
 # Summary
 # --------------------------------------------------------------------------
 

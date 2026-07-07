@@ -219,8 +219,12 @@ detect_test_cmd() {
 # from $SABLE_BASE_BRANCH by stripping a leading origin/ (matches
 # tripwire-watcher's detect_integration_branch convention).
 CURRENT_BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-_INT_REF="${SABLE_INTEGRATION_BRANCH:-${SABLE_BASE_BRANCH:-origin/main}}"
-INTEGRATION_BRANCH="${_INT_REF#origin/}"
+# market-brief-package-2u25: resolved PER REPO (repo-local git config /
+# .sable file wins over session env) — a session's SABLE_BASE_BRANCH is
+# configured once per project and otherwise leaks unchanged into every other
+# repo that session's manager ever pushes (e.g. a companion SABLE-repo
+# worktree pushed from a market-brief-package session).
+INTEGRATION_BRANCH=$(sable_resolve_integration_branch "$CWD")
 
 # --- yz5y (market-brief-package-yz5y): re-parent guard. Runs BEFORE any fetch/
 # rebase and is active ONLY for a LOCAL-ONLY integration branch (a local

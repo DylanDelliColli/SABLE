@@ -361,6 +361,49 @@ sable_validate_base_ref() {
   return 0
 }
 
+# sable_resolve_integration_branch <repo-path>
+#
+# Resolves the BARE name of <repo-path>'s own integration branch
+# (market-brief-package-2u25). Integration-branch identity is a property of
+# the TARGET REPO, not the session that happens to be pushing — a session's
+# $SABLE_BASE_BRANCH / $SABLE_INTEGRATION_BRANCH env is configured once per
+# project and leaks unchanged into every repo that session ever touches
+# (e.g. a manager pushing a companion SABLE-repo worktree from a
+# market-brief-package session). Consulted in order, first match wins:
+#   1. `git -C <repo-path> config --get sable.integrationBranch` (repo-local,
+#      unshared — the machine's own override for this checkout)
+#   2. `<repo-path>/.sable` file, a line `integrationBranch=<name>` (checked
+#      into the repo, shared across clones)
+#   3. $SABLE_INTEGRATION_BRANCH (explicit env override, bare name)
+#   4. $SABLE_BASE_BRANCH with a leading `origin/` stripped (matches the
+#      pre-existing derivation this function replaces)
+#   5. "main"
+# Always prints a bare branch name and returns 0.
+sable_resolve_integration_branch() {
+  local repo_path="${1:-}"
+  local val
+
+  if [ -n "$repo_path" ]; then
+    val=$(git -C "$repo_path" config --get sable.integrationBranch 2>/dev/null || true)
+    if [ -n "$val" ]; then
+      printf '%s' "$val"
+      return 0
+    fi
+
+    if [ -f "$repo_path/.sable" ]; then
+      val=$(sed -n 's/^integrationBranch=//p' "$repo_path/.sable" 2>/dev/null | head -1)
+      if [ -n "$val" ]; then
+        printf '%s' "$val"
+        return 0
+      fi
+    fi
+  fi
+
+  val="${SABLE_INTEGRATION_BRANCH:-${SABLE_BASE_BRANCH:-origin/main}}"
+  printf '%s' "${val#origin/}"
+  return 0
+}
+
 # sable_resolve_dispatch_lane <hook-input-json>
 #
 # For PreToolUse:Agent / PostToolUse:Agent hooks. Decides whether pre-dispatch
