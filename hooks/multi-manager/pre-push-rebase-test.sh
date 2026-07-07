@@ -17,6 +17,12 @@
 #
 # Configuration:
 #   $SABLE_BASE_BRANCH                  — branch to rebase against (default: origin/main)
+#   $SABLE_INTEGRATION_BRANCH           — bare name of the integration branch
+#                                         (default: $SABLE_BASE_BRANCH minus origin/).
+#                                         Pushing this branch retargets Phase-1
+#                                         rebase to origin/<branch>, or skips it when
+#                                         unpublished (fofc); while it is local-only
+#                                         a re-parent guard also arms (yz5y).
 #   $SABLE_PRE_PUSH_TYPECHECK_COMMAND   — typecheck invocation (override auto-detect)
 #   $SABLE_PRE_PUSH_LINT_COMMAND        — lint invocation (no auto-detect; opt-in)
 #   $SABLE_PRE_PUSH_STATIC_TIMEOUT      — seconds for static phase (default: 90)
@@ -200,6 +206,33 @@ detect_test_cmd() {
 # Phase 1: REBASE (never skippable)
 # ---------------------------------------------------------------------------
 
+# The branch being pushed and the configured integration branch (bare names).
+# INTEGRATION_BRANCH: explicit $SABLE_INTEGRATION_BRANCH override, else derived
+# from $SABLE_BASE_BRANCH by stripping a leading origin/ (matches
+# tripwire-watcher's detect_integration_branch convention).
+CURRENT_BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+_INT_REF="${SABLE_INTEGRATION_BRANCH:-${SABLE_BASE_BRANCH:-origin/main}}"
+INTEGRATION_BRANCH="${_INT_REF#origin/}"
+
+# --- yz5y (market-brief-package-yz5y): re-parent guard. Runs BEFORE any fetch/
+# rebase and is active ONLY for a LOCAL-ONLY integration branch (a local
+# refs/heads/<INT> with NO published origin/<INT>) — the exact window in which a
+# worker that ran 'git pull --rebase origin master' would silently re-parent its
+# branch off the integration lineage onto origin/master, stranding the local-only
+# stack and splicing base-branch-only commits into the lineage. A correctly-based
+# branch contains the integration HEAD as an ancestor; a re-parented one does not.
+# Once origin/<INT> is published the structural fix (workers rebase against
+# origin/<INT>) applies and this guard goes dormant.
+if [ -n "$INTEGRATION_BRANCH" ] && [ -n "$CURRENT_BRANCH" ] \
+   && [ "$CURRENT_BRANCH" != "$INTEGRATION_BRANCH" ] \
+   && git -C "$CWD" rev-parse --verify --quiet "refs/heads/$INTEGRATION_BRANCH" >/dev/null 2>&1 \
+   && ! git -C "$CWD" rev-parse --verify --quiet "origin/$INTEGRATION_BRANCH" >/dev/null 2>&1; then
+  if ! git -C "$CWD" merge-base --is-ancestor "refs/heads/$INTEGRATION_BRANCH" HEAD 2>/dev/null; then
+    emit_deny "Pre-push denied (re-parent guard): branch '$CURRENT_BRANCH' does not contain the local integration branch '$INTEGRATION_BRANCH' HEAD as an ancestor — it looks re-parented (e.g. a 'git pull --rebase origin master' replayed it onto a different base, stranding the local-only integration stack and risking out-of-scope commits in the lineage). Re-cut from '$INTEGRATION_BRANCH' and cherry-pick your work, then push. (Active only while '$INTEGRATION_BRANCH' is unpublished; publishing origin/$INTEGRATION_BRANCH retires this guard.)"
+    exit 0
+  fi
+fi
+
 FETCH_OUT=$(git -C "$CWD" fetch origin 2>&1) || {
   emit_deny "Pre-push phase 1 (rebase): git fetch failed:
 ${FETCH_OUT:0:300}
@@ -207,15 +240,34 @@ Resolve network/auth and retry. This phase cannot be skipped — rebase is manda
   exit 0
 }
 
-BEHIND=$(git -C "$CWD" rev-list --count "HEAD..$BASE_BRANCH" 2>/dev/null || echo "0")
+# --- fofc (market-brief-package-fofc): integration-branch self-push special
+# case. Pushing the branch that IS the integration branch must NEVER rebase it
+# onto a DIFFERENT base (e.g. origin/dev) — that replays the whole local-only
+# integration stack onto the base and can silently rewrite history (or abort on
+# conflict and block the push). Retarget the mandatory rebase to the branch's OWN
+# published tip origin/<branch> (a fast-forward-safe no-op that still catches a
+# teammate's push to the same branch); if origin/<branch> does not exist yet,
+# skip Phase 1 (nothing fast-forward-safe to rebase onto).
+SKIP_REBASE=0
+if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" = "$INTEGRATION_BRANCH" ]; then
+  if git -C "$CWD" rev-parse --verify --quiet "origin/$CURRENT_BRANCH" >/dev/null 2>&1; then
+    BASE_BRANCH="origin/$CURRENT_BRANCH"
+  else
+    SKIP_REBASE=1
+  fi
+fi
 
-if [ "$BEHIND" -gt 0 ]; then
-  REBASE_OUT=$(git -C "$CWD" rebase "$BASE_BRANCH" 2>&1) || {
-    git -C "$CWD" rebase --abort 2>/dev/null || true
-    emit_deny "Pre-push phase 1 (rebase): rebase on $BASE_BRANCH failed (and was aborted). Resolve conflicts manually, then retry push.
+if [ "$SKIP_REBASE" -eq 0 ]; then
+  BEHIND=$(git -C "$CWD" rev-list --count "HEAD..$BASE_BRANCH" 2>/dev/null || echo "0")
+
+  if [ "$BEHIND" -gt 0 ]; then
+    REBASE_OUT=$(git -C "$CWD" rebase "$BASE_BRANCH" 2>&1) || {
+      git -C "$CWD" rebase --abort 2>/dev/null || true
+      emit_deny "Pre-push phase 1 (rebase): rebase on $BASE_BRANCH failed (and was aborted). Resolve conflicts manually, then retry push.
 ${REBASE_OUT:0:500}"
-    exit 0
-  }
+      exit 0
+    }
+  fi
 fi
 
 # ---------------------------------------------------------------------------

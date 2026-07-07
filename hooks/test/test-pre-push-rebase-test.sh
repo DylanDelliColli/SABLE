@@ -411,6 +411,77 @@ C041_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAN
 assert_deny "SABLE-041: 'git -C <repo> push' from a non-repo cwd resolves the -C dir (static gate runs)" \
   "$C041_ENV" "git -C $REPO_DIR push" "/tmp/sable-041-nonrepo-cwd" "phase 2 (static)"
 
+# ===================================================================
+# market-brief-package-fofc: integration-branch self-push must NOT rebase onto
+# a DIFFERENT base. Fixture: base branch 'dev' advances with a commit that
+# CONFLICTS with the local-only integration stack; pushing the integration
+# branch itself must retarget Phase-1 rebase to its own published tip
+# (origin/llm-integration, a fast-forward-safe no-op) instead of origin/dev.
+#   RED  (pre-fix): hook rebases llm-integration onto origin/dev → conflict →
+#                   DENY "phase 1 (rebase)".
+#   GREEN(post-fix): retarget → BEHIND=0 → no rebase → "phase skipped".
+# ===================================================================
+FOFC_BARE="/tmp/sable-test-fofc-bare.git"
+FOFC_REPO="/tmp/sable-test-fofc-repo"
+rm -rf "$FOFC_BARE" "$FOFC_REPO"
+git init -q --bare "$FOFC_BARE"
+git clone -q "$FOFC_BARE" "$FOFC_REPO" 2>/dev/null
+(
+  cd "$FOFC_REPO" || exit 1
+  git config user.email t@t; git config user.name t
+  git checkout -q -B dev
+  echo base > shared.txt; git add shared.txt; git commit -q -m d1
+  git push -q origin dev
+  git checkout -q -b llm-integration
+  echo L1 > stack.txt; git add stack.txt; git commit -q -m L1
+  echo L2 >> stack.txt; git add stack.txt; git commit -q -m L2
+  git push -q origin llm-integration
+  git checkout -q dev
+  echo devX > stack.txt; git add stack.txt; git commit -q -m devConflict
+  git push -q origin dev
+  git checkout -q llm-integration
+)
+FOFC_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/dev SABLE_INTEGRATION_BRANCH=llm-integration SABLE_PRE_PUSH_TYPECHECK_COMMAND=true SABLE_PRE_PUSH_TEST_PHASE=skip"
+assert_context "fofc: pushing integration branch retargets rebase to origin/<branch> (no rebase onto origin/dev)" \
+  "$FOFC_ENV" "git push origin llm-integration" "$FOFC_REPO" "phase skipped"
+rm -rf "$FOFC_BARE" "$FOFC_REPO"
+
+# ===================================================================
+# market-brief-package-yz5y: re-parent guard for a LOCAL-ONLY integration
+# branch. A branch cut from integration HEAD passes; a re-parented branch
+# (integration HEAD is NOT its ancestor) is DENIED. Guard is dormant once
+# origin/<INT> is published (checked here by leaving llm-integration unpushed).
+#   RED  (pre-fix): no guard → re-parented push is allowed ("phase skipped").
+#   GREEN(post-fix): re-parented push is DENIED "re-parent guard".
+# The good-branch case is a false-positive guard: it must pass before AND after.
+# ===================================================================
+YZ_BARE="/tmp/sable-test-yz5y-bare.git"
+YZ_REPO="/tmp/sable-test-yz5y-repo"
+rm -rf "$YZ_BARE" "$YZ_REPO"
+git init -q --bare "$YZ_BARE"
+git clone -q "$YZ_BARE" "$YZ_REPO" 2>/dev/null
+(
+  cd "$YZ_REPO" || exit 1
+  git config user.email t@t; git config user.name t
+  git checkout -q -B main
+  echo r0 > root.txt; git add root.txt; git commit -q -m root
+  git checkout -q -b llm-integration
+  echo i2 > int.txt; git add int.txt; git commit -q -m i2
+  git checkout -q -b wk-good llm-integration
+  echo w1 > w1.txt; git add w1.txt; git commit -q -m w1
+  git checkout -q -b wk-reparented main
+  echo w2 > w2.txt; git add w2.txt; git commit -q -m w2
+)
+# llm-integration is LOCAL-ONLY here (never pushed) → guard armed.
+YZ_ENV="$MGR_ENV SABLE_INTEGRATION_BRANCH=llm-integration SABLE_BASE_BRANCH=origin/llm-integration SABLE_PRE_PUSH_TYPECHECK_COMMAND=true SABLE_PRE_PUSH_TEST_PHASE=skip"
+( cd "$YZ_REPO" && git checkout -q wk-reparented )
+assert_deny "yz5y: re-parented branch (missing integration HEAD) is DENIED by the guard" \
+  "$YZ_ENV" "git push origin wk-reparented" "$YZ_REPO" "re-parent guard"
+( cd "$YZ_REPO" && git checkout -q wk-good )
+assert_context "yz5y: branch cut from integration HEAD passes the guard (not blocked)" \
+  "$YZ_ENV" "git push origin wk-good" "$YZ_REPO" "phase skipped"
+rm -rf "$YZ_BARE" "$YZ_REPO"
+
 # Cleanup
 rm -rf "$REPO_DIR" "$BARE_DIR" "$V3_YAML"
 
