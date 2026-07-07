@@ -105,6 +105,38 @@ print(d.get('agent_type', '') or '')
   return 0
 }
 
+# sable_instance_base_manager <name>
+#
+# DIAGNOSTIC ONLY (market-brief-package-73t4, Lincoln ruling 2026-07-07,
+# mechanism b). If <name> is a spawn-assigned instance name (<base>-<N>) AND
+# <base> is a REGISTERED MANAGER in agents.yaml, print <base> and return 0;
+# otherwise print nothing and return 1.
+#
+# This exists purely to enrich the pre-push worker-deny message for an
+# UNREGISTERED instance whose base IS registered ("respawn tooling should have
+# registered this instance"). It NEVER grants privilege and is NOT consulted by
+# any gate decision — sable_resolve_identity above keeps its exact-match registry
+# lookup unchanged, so an instance is a manager ONLY once its own agents.yaml
+# entry exists (written by the spawn tooling). Privilege never derives from the
+# name pattern; this only makes the denial legible.
+sable_instance_base_manager() {
+  local name="${1:-}"
+  [[ "$name" =~ ^(.+)-[0-9]+$ ]] || return 1
+  local base="${BASH_REMATCH[1]}"
+  local yaml="${SABLE_AGENTS_YAML:-${HOME:-}/.claude/sable/agents.yaml}"
+  [ -f "$yaml" ] || return 1
+  local type
+  type=$(awk -v name="$base" '
+    $0 == "  " name ":" { found = 1; next }
+    found && /^    type:/ { sub(/^    type:[ ]*/, ""); sub(/[ \t#].*$/, ""); print; exit }
+    found && /^  [a-zA-Z0-9_-]+:/ { exit }
+  ' "$yaml" 2>/dev/null)
+  case " epic_manager one_off_manager integrator strategist cockpit " in
+    *" $type "*) printf '%s' "$base"; return 0 ;;
+  esac
+  return 1
+}
+
 # sable_is_git_push <command-string>
 #
 # Returns 0 (true) when <command-string> is a real `git push` invocation;

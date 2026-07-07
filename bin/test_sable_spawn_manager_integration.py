@@ -92,6 +92,63 @@ def test_no_session_points_at_launch(sock):
     assert "sable-launch" in r.stderr
 
 
+# --- 73t4: instance registry CLI (register / self-reg refusal / prune) ------
+
+def _reg_env(sock, yaml, **extra):
+    return {**os.environ, "SABLE_TMUX_SOCKET": sock, "SABLE_TMUX_SESSION": SESSION,
+            "SABLE_AGENTS_YAML": str(yaml), **extra}
+
+
+def _spawn_manager(sock, *args, env):
+    return subprocess.run(["python3", str(BIN), *args], capture_output=True, text=True, env=env)
+
+
+def test_register_instance_cli_writes_entry(sock, tmp_path):
+    yaml = tmp_path / "agents.yaml"
+    yaml.write_text("agents:\n  optimus:\n    type: epic_manager\n"
+                    "  tarzan:\n    type: one_off_manager\n")
+    r = _spawn_manager(sock, "--register-instance", "tarzan-2", env=_reg_env(sock, yaml))
+    assert r.returncode == 0, r.stderr
+    txt = yaml.read_text()
+    assert "  tarzan-2:" in txt and "instance_of: tarzan" in txt
+    # idempotent second call
+    r2 = _spawn_manager(sock, "--register-instance", "tarzan-2", env=_reg_env(sock, yaml))
+    assert r2.returncode == 0 and "exists" in r2.stderr
+    assert yaml.read_text().count("  tarzan-2:") == 1
+
+
+def test_register_instance_cli_refuses_self(sock, tmp_path):
+    """A session whose own identity == the name it tries to register is refused
+    (constraint 2: no self-elevation)."""
+    yaml = tmp_path / "agents.yaml"
+    yaml.write_text("agents:\n  tarzan:\n    type: one_off_manager\n")
+    r = _spawn_manager(sock, "--register-instance", "tarzan-2",
+                       env=_reg_env(sock, yaml, SABLE_REGISTER_ACTOR="tarzan-2"))
+    assert r.returncode == 3
+    assert "refused-self" in r.stderr
+    assert "tarzan-2" not in yaml.read_text()
+
+
+def test_prune_instances_cli_keeps_live_prunes_dead(sock, tmp_path):
+    yaml = tmp_path / "agents.yaml"
+    yaml.write_text("agents:\n  optimus:\n    type: epic_manager\n"
+                    "  tarzan:\n    type: one_off_manager\n")
+    env = _reg_env(sock, yaml)
+    _spawn_manager(sock, "--register-instance", "tarzan-2", env=env)
+    _spawn_manager(sock, "--register-instance", "optimus-3", env=env)
+    # a live tarzan-2 pane; optimus-3 has none
+    _seed_lincoln(sock)
+    pane = _tmux(sock, "new-window", "-d", "-P", "-F", "#{pane_id}",
+                 "-t", SESSION, "bash").stdout.strip()
+    _tmux(sock, "set-option", "-p", "-t", pane, "@sable_role", "tarzan-2")
+    r = _spawn_manager(sock, "--prune-instances", env=env)
+    assert r.returncode == 0, r.stderr
+    txt = yaml.read_text()
+    assert "  tarzan-2:" in txt        # live instance kept
+    assert "  optimus-3:" not in txt   # dead instance pruned
+    assert "  tarzan:" in txt and "  optimus:" in txt   # base entries untouched
+
+
 if __name__ == "__main__":
     import sys
     import pytest as _p

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 
@@ -30,6 +31,155 @@ from sable_pane_lib import (  # noqa: E402
 )
 
 VALID_ROLES = ("optimus", "tarzan", "chuck")
+
+# --- Instance-entry registry writer (market-brief-package-73t4, Lincoln ruling
+# 2026-07-07, mechanism (b) EXPLICIT INSTANCE REGISTRATION). When a manager role
+# is spawned/respawned as a SECOND live instance, the harness may assign an
+# instance-suffixed identity (tarzan-2, optimus-3). lib-identity.sh resolves a
+# manager ONLY via an exact agents.yaml key match (privilege NEVER derives from a
+# name pattern), so an unregistered 'tarzan-2' resolves as a worker and the
+# pre-push gate denies its push. The FIX is here, in the spawn tooling: at spawn
+# time we WRITE the instance's own agents.yaml entry (mirroring its base
+# manager's type), so the UNCHANGED exact-match lookup resolves it. The running
+# session never registers itself (constraint 2); this writer is spawn-tooling
+# only and is wired into no hook.
+MANAGER_TYPES = {"epic_manager", "one_off_manager", "integrator", "strategist",
+                 "cockpit"}
+
+# A trailing -<digits> is a spawn-assigned instance suffix. Used ONLY at WRITE
+# time (to find the base entry to mirror) and for diagnostics — NEVER to grant
+# privilege at resolution time.
+_INSTANCE_RE = re.compile(r"^(?P<base>.+)-(?P<n>\d+)$")
+
+
+def agents_yaml_path() -> str:
+    """Runtime registry path (SABLE_AGENTS_YAML override honored, as in
+    lib-identity.sh + the test suites)."""
+    return (os.environ.get("SABLE_AGENTS_YAML")
+            or os.path.join(os.path.expanduser("~"), ".claude", "sable", "agents.yaml"))
+
+
+def strip_instance_suffix(name: str) -> str:
+    """Base registry name of a spawn-assigned instance (tarzan-2 -> tarzan).
+    Diagnostic + write-time base lookup ONLY. Returns name unchanged when it
+    carries no -<digits> suffix (tarzan, tarzan-abc, general-purpose)."""
+    m = _INSTANCE_RE.match(name or "")
+    return m.group("base") if m else (name or "")
+
+
+def parse_registry(text: str) -> dict:
+    """Minimal agents.yaml reader mirroring lib-identity's awk shape: a 2-space
+    '<name>:' key under 'agents:', with 4-space 'type:' / 'instance_of:' beneath.
+    No PyYAML dependency (matches the awk parser the hooks use)."""
+    agents: dict = {}
+    cur = None
+    for raw in text.splitlines():
+        m = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", raw)
+        if m:
+            cur = m.group(1)
+            agents[cur] = {}
+            continue
+        if cur is not None:
+            mt = re.match(r"^    type:\s*([^\s#]+)", raw)
+            if mt:
+                agents[cur]["type"] = mt.group(1)
+                continue
+            mi = re.match(r"^    instance_of:\s*([^\s#]+)", raw)
+            if mi:
+                agents[cur]["instance_of"] = mi.group(1)
+    return agents
+
+
+def base_manager_type(text: str, name: str):
+    """The registry type of <name>'s base entry, but only when <name> is an
+    instance (<base>-<N>) AND <base> is a registered MANAGER. Else None."""
+    base = strip_instance_suffix(name)
+    if base == name:
+        return None
+    entry = parse_registry(text).get(base)
+    if entry and entry.get("type") in MANAGER_TYPES:
+        return entry["type"]
+    return None
+
+
+def register_instance(name: str, *, actor: str | None = None,
+                      yaml_path: str | None = None) -> str:
+    """Spawn-time writer (mechanism b): register instance <name> with its base
+    manager's type, tagged instance_of:<base>, so lib-identity's UNCHANGED
+    exact-match lookup resolves it as a manager. Idempotent. Returns a status:
+
+      refused-self         actor == name — a session may not register ITSELF
+                           (privilege comes from the operator/tooling-owned
+                           registry; self-registration is self-elevation).
+      noop-not-instance    <name> has no -<digits> suffix (not an instance)
+      noop-no-registry     agents.yaml unreadable
+      noop-base-not-manager  base is absent or not a manager type
+      exists               <name> already registered (no change)
+      registered           entry written
+    """
+    if actor is not None and actor == name:
+        return "refused-self"
+    base = strip_instance_suffix(name)
+    if base == name:
+        return "noop-not-instance"
+    path = yaml_path or agents_yaml_path()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return "noop-no-registry"
+    if name in parse_registry(text):
+        return "exists"
+    btype = base_manager_type(text, name)
+    if not btype:
+        return "noop-base-not-manager"
+    entry = f"  {name}:\n    type: {btype}\n    instance_of: {base}\n"
+    lines = text.splitlines(keepends=True)
+    out, inserted = [], False
+    for line in lines:
+        out.append(line)
+        if not inserted and re.match(r"^agents:\s*$", line):
+            out.append(entry)          # first child of the agents: mapping
+            inserted = True
+    if not inserted:                    # no agents: root (unexpected) — seed one
+        if out and not out[-1].endswith("\n"):
+            out.append("\n")
+        out.append("agents:\n" + entry)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("".join(out))
+    return "registered"
+
+
+def prune_stale_instances(live_names, *, yaml_path: str | None = None) -> list:
+    """Remove instance entries (those carrying instance_of) whose key is NOT in
+    live_names. Base / hand-authored entries (no instance_of) are never touched.
+    Returns the pruned names. The prune path for reap / respawn."""
+    path = yaml_path or agents_yaml_path()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return []
+    live = set(live_names or [])
+    reg = parse_registry(text)
+    doomed = {n for n, e in reg.items() if "instance_of" in e and n not in live}
+    if not doomed:
+        return []
+    lines = text.splitlines(keepends=True)
+    out, pruned, i, n = [], [], 0, len(lines)
+    while i < n:
+        m = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", lines[i])
+        if m and m.group(1) in doomed:
+            pruned.append(m.group(1))
+            i += 1
+            while i < n and re.match(r"^    \S", lines[i]):   # its type/instance_of body
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("".join(out))
+    return pruned
 
 
 def tmux_base(socket: str | None) -> list[str]:
@@ -81,7 +231,38 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sable-spawn-manager")
     p.add_argument("roles", nargs="*", help=f"roles to spawn ({' | '.join(VALID_ROLES)})")
     p.add_argument("--all", action="store_true", help="spawn all three managers")
+    p.add_argument("--register-instance", metavar="NAME",
+                   help="register a spawn-assigned manager instance (e.g. tarzan-2) "
+                        "into agents.yaml so lib-identity resolves it as a manager "
+                        "(mechanism b; a running session may not register itself)")
+    p.add_argument("--prune-instances", action="store_true",
+                   help="prune stale instance entries whose panes are no longer live")
     ns = p.parse_args(sys.argv[1:] if argv is None else argv)
+
+    # --- Instance registry maintenance (73t4). These are the spawn/respawn
+    # tooling entry points into the writer; they never spawn a pane.
+    if ns.register_instance:
+        actor = (os.environ.get("SABLE_REGISTER_ACTOR")
+                 or os.environ.get("CLAUDE_AGENT_NAME") or "") or None
+        status = register_instance(ns.register_instance, actor=actor)
+        sys.stderr.write(
+            f"sable-spawn-manager: register-instance {ns.register_instance}: {status}\n")
+        return 3 if status == "refused-self" else 0
+
+    socket = os.environ.get("SABLE_TMUX_SOCKET") or None
+    session = os.environ.get("SABLE_TMUX_SESSION") or "sable"
+    base = tmux_base(socket)
+
+    if ns.prune_instances:
+        listing = subprocess.run(base + ["list-panes", "-a", "-F", "#{@sable_role}"],
+                                 capture_output=True, text=True)
+        live = {r for r in listing.stdout.split() if r} if listing.returncode == 0 else set()
+        pruned = prune_stale_instances(live)
+        sys.stderr.write(
+            f"sable-spawn-manager: pruned {len(pruned)} stale instance "
+            f"entr{'y' if len(pruned) == 1 else 'ies'}"
+            f"{': ' + ', '.join(pruned) if pruned else ''}\n")
+        return 0
 
     requested = list(VALID_ROLES) if ns.all else ns.roles
     if not requested:
@@ -92,10 +273,6 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         sys.stderr.write(f"sable-spawn-manager: {e}\n")
         return 2
-
-    socket = os.environ.get("SABLE_TMUX_SOCKET") or None
-    session = os.environ.get("SABLE_TMUX_SESSION") or "sable"
-    base = tmux_base(socket)
 
     if subprocess.run(base + ["has-session", "-t", session],
                       capture_output=True).returncode != 0:
@@ -120,6 +297,14 @@ def main(argv: list[str] | None = None) -> int:
                               capture_output=True, text=True, check=True).stdout.strip()
         subprocess.run(base + ["set-option", "-p", "-t", pane, "@sable_role", role],
                        check=True)
+        # Constraint 3 (73t4): read the pane's ACTUAL assigned name post-spawn and
+        # register it when the harness suffixed it into an instance. For a bare
+        # role this is a no-op (base == name), so the default single-instance flow
+        # writes nothing to the registry.
+        assigned = subprocess.run(
+            base + ["display-message", "-p", "-t", pane, "#{@sable_role}"],
+            capture_output=True, text=True).stdout.strip() or role
+        register_instance(assigned, actor=os.environ.get("CLAUDE_AGENT_NAME"))
         if ready_timeout > 0:
             wait_for_ready(base, pane, ready_timeout, interval=poll_interval)
         if deliver_text(base, pane, kick_message(role), KICK_TAG,

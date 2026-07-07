@@ -112,7 +112,15 @@ if [ "$SABLE_ID_IS_SUBAGENT" -eq 1 ] && [ "$SABLE_ID_IS_MANAGER" -eq 0 ]; then
       emit_context "Pre-push: worker-identity push (${SABLE_ID_NAME:-unnamed}) ALLOWED via SABLE_WORKER_PUSH_OVERRIDE=1. Workers normally return results to their manager, who reviews and pushes the lane; this explicit override was recorded."
       exit 0
     fi
-    emit_deny "Pre-push denied: worker subagents do not push. This identity (${SABLE_ID_NAME:-unnamed agent}) is a worker, not a registered manager. Return your results to the manager that dispatched you; the manager reviews your stopped-before-push result and pushes the lane itself (git -C <worktree> push). If you genuinely must push from this worker, set SABLE_WORKER_PUSH_OVERRIDE=1 in the hook environment."
+    # 73t4: if this is an UNREGISTERED instance (tarzan-2) whose base IS a
+    # registered manager, the real fault is a missing spawn-time registration —
+    # say so, instead of implying the manager is a worker. Diagnostic only: the
+    # deny stands (privilege comes from the registry, never the name pattern).
+    INSTANCE_HINT=""
+    if _BASE=$(sable_instance_base_manager "$SABLE_ID_NAME" 2>/dev/null); then
+      INSTANCE_HINT=" NOTE: '${SABLE_ID_NAME}' looks like an unregistered instance of the registered manager '${_BASE}'. Privilege is not granted by the name — the spawn/respawn tooling must register this instance in agents.yaml ('sable-spawn-manager --register-instance ${SABLE_ID_NAME}'); once its entry exists it resolves as a manager and this push is allowed without an override."
+    fi
+    emit_deny "Pre-push denied: worker subagents do not push. This identity (${SABLE_ID_NAME:-unnamed agent}) is a worker, not a registered manager. Return your results to the manager that dispatched you; the manager reviews your stopped-before-push result and pushes the lane itself (git -C <worktree> push). If you genuinely must push from this worker, set SABLE_WORKER_PUSH_OVERRIDE=1 in the hook environment.${INSTANCE_HINT}"
     exit 0
   fi
   # Worker identity, but not a git push — leave untouched.

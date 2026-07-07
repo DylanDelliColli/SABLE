@@ -402,6 +402,57 @@ else
 fi
 
 # ===================================================================
+# market-brief-package-73t4: instance-suffixed manager identity at the gate
+# (Lincoln ruling mechanism b: EXPLICIT INSTANCE REGISTRATION).
+#   (b1) An UNREGISTERED instance (tarzan-2; base tarzan IS a registered manager)
+#        is still worker-DENIED, but the message now names the missing spawn-time
+#        registration instead of implying the manager is a worker.
+#   (b2) Once the instance is REGISTERED, the SAME tarzan-2 push is GATED as a
+#        manager (reaches the static phase) — the acceptance, end-to-end, with
+#        NO SABLE_WORKER_PUSH_OVERRIDE.
+#   (b3) The gate never auto-registers: a denied instance's push attempt must not
+#        write a registry entry (privilege comes from the registry, not the name).
+# ===================================================================
+
+# (b1) uses V3_YAML (has tarzan, NOT tarzan-2) → worker-deny + registration hint.
+OUT=$(run_typed "" "git push" "/tmp" "inst-1" "tarzan-2")
+if echo "$OUT" | grep -q '"permissionDecision": "deny"' \
+   && echo "$OUT" | grep -qF "$WORKER_MSG" \
+   && echo "$OUT" | grep -qF "unregistered instance" \
+   && echo "$OUT" | grep -qF "register-instance tarzan-2"; then
+  v3pass "(73t4-b1) unregistered instance tarzan-2 is DENIED with a registration hint"
+else
+  v3fail "(73t4-b1) unregistered instance tarzan-2 is DENIED with a registration hint" "got: ${OUT:0:400}"
+fi
+
+# (b2) a registry WITH the instance registered → tarzan-2 is a manager → GATED.
+T73_YAML="/tmp/sable-test-73t4-agents.yaml"
+cat > "$T73_YAML" <<'YAML'
+agents:
+  tarzan:
+    type: one_off_manager
+  tarzan-2:
+    type: one_off_manager
+    instance_of: tarzan
+YAML
+OUT=$(make_typed_input "git push" "$REPO_DIR" "inst-2" "tarzan-2" | \
+  env -i PATH="$PATH" SABLE_AGENTS_YAML="$T73_YAML" $GATE_ENV bash "$HOOK" 2>/dev/null || echo "RUN_ERR:$?")
+if echo "$OUT" | grep -q '"permissionDecision": "deny"' && echo "$OUT" | grep -qF "phase 2 (static)"; then
+  v3pass "(73t4-b2) REGISTERED instance tarzan-2 push is GATED as a manager (reaches static phase)"
+else
+  v3fail "(73t4-b2) REGISTERED instance tarzan-2 push is GATED as a manager (reaches static phase)" "got: ${OUT:0:400}"
+fi
+
+# (b3) the DENY path (b1 fixture) must not have written a tarzan-2 entry.
+run_typed "" "git push" "/tmp" "inst-3" "tarzan-2" >/dev/null 2>&1
+if grep -qF "tarzan-2" "$V3_YAML"; then
+  v3fail "(73t4-b3) gate must NOT auto-register a denied instance" "V3_YAML gained a tarzan-2 entry"
+else
+  v3pass "(73t4-b3) gate does not auto-register a denied instance (registry unchanged)"
+fi
+rm -f "$T73_YAML"
+
+# ===================================================================
 # SABLE-041: the gate must act on the `git -C <repo>` target, not the
 # shell cwd. cwd is a NON-repo; -C points at the real fixture repo. The
 # buggy hook checks cwd/.git (absent) and no-ops (allow); the fixed hook

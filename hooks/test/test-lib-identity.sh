@@ -150,62 +150,91 @@ run_case "teams member with non-registry name (optimus-probe) stands down" \
 # --------------------------------------------------------------------------
 # market-brief-package-73t4 — instance-suffixed manager identity resolution.
 #
-# A respawned manager instance arrives with an instance-suffixed agent_type
-# (e.g. 'tarzan-2') while only the bare name ('tarzan') is registered in
-# agents.yaml. The exact-match registry lookup (line ~88, `$0 == "  " name ":"`)
-# misses, so a genuine one_off_manager resolves as an unregistered worker and
-# the pre-push gate denies its push with "worker subagents do not push".
+# A respawned manager arrives with an instance-suffixed agent_type (e.g.
+# 'tarzan-2'). Lincoln ruling (2026-07-07, binding): mechanism (b) EXPLICIT
+# INSTANCE REGISTRATION. sable_resolve_identity's registry lookup stays an
+# EXACT match on the literal key (line ~88, `$0 == "  " name ":"`) — privilege
+# NEVER derives from a name pattern. A blanket -[0-9]+ strip before the lookup
+# was REJECTED (it would let ANY '<registered>-<n>' self-elevate — a push-gate
+# escalation). Instead the spawn/respawn tooling WRITES the instance's own
+# agents.yaml entry at spawn time (sable-spawn-manager.register_instance,
+# tagged instance_of), so an instance is a manager IFF its key is registered —
+# exactly like any other agent. lib-identity itself is UNCHANGED.
 #
-# STATUS: RED tests only. The FIX (how a -N instance maps to its base registry
-# entry) is DEFERRED pending a Lincoln ruling on the approach: a BLANKET strip
-# of a trailing -[0-9]+ before the lookup would let ANY '<registered>-<n>'
-# self-elevate to manager — a push-gate escalation — so the mechanism is not
-# settled. The desired-behavior assertions are gated behind SABLE_PENDING_73T4=1
-# and are RED today by design. Capture the red with:
-#     SABLE_PENDING_73T4=1 bash hooks/test/test-lib-identity.sh
-#
-# The three cases that run in the default suite pin TODAY's behavior (so the
-# fix is DETECTED when it lands) and lock the security boundary that every
-# candidate fix must preserve (a non-numeric suffix is not an instance suffix
-# and must never elevate).
+# Consequences, all pinned below and default-on:
+#   - tarzan-2 with NO registry entry  -> unregistered worker (registration is
+#     required; correct under (b), not a bug).
+#   - tarzan-2 WITH a registered entry -> its base manager type (the fix).
+#   - a non-numeric suffix (tarzan-abc) is not an instance and never elevates.
+#   - the bare registered name is unchanged.
 # --------------------------------------------------------------------------
 
-# Characterization (passes today): tarzan-2 currently resolves as an
-# unregistered, non-manager worker — this IS the bug. Flip this expectation to
-# the PENDING one when the approved fix lands.
-run_case "73t4 characterization: tarzan-2 currently resolves unregistered/non-manager (the bug)" \
+# Like run_case but pins SABLE_AGENTS_YAML to <yaml> for this case only.
+run_case_yaml() {
+  local label="$1" json="$2" yaml="$3" expect="$4" got
+  got=$(
+    unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE
+    export SABLE_AGENTS_YAML="$yaml"
+    # shellcheck disable=SC1090
+    source "$LIB"
+    sable_resolve_identity "$json"
+    printf '%s|%s|%s|%s|%s|%s' "$SABLE_ID_NAME" "$SABLE_ID_TYPE" "$SABLE_ID_SOURCE" \
+      "$SABLE_ID_IS_SUBAGENT" "$SABLE_ID_IS_MANAGER" "$SABLE_ID_IS_REGISTERED"
+  )
+  if [ "$got" = "$expect" ]; then pass "$label"; else fail "$label" "expected [$expect] got [$got]"; fi
+}
+
+# A registry AFTER the spawn tooling has registered two instances — mirrors what
+# sable-spawn-manager.register_instance writes (the instance's own key + base
+# type, tagged instance_of). This is the mechanism-(b) fixture acceptance needs.
+cat > "$FIXTURE_DIR/agents-with-instances.yaml" <<'YAML'
+agents:
+  optimus:
+    type: epic_manager
+  optimus-3:
+    type: epic_manager
+    instance_of: optimus
+  tarzan:
+    type: one_off_manager
+  tarzan-2:
+    type: one_off_manager
+    instance_of: tarzan
+YAML
+
+# Registration-required guard (default fixture has NO instance entry): tarzan-2
+# resolves as an unregistered, non-manager worker. Under (b) this is CORRECT (an
+# instance is privileged only once its key is registered) and it locks the
+# security boundary — a bare name pattern grants nothing.
+run_case "73t4: unregistered instance tarzan-2 (no registry entry) resolves non-manager" \
   '{"agent_id":"t73-char","agent_type":"tarzan-2"}' \
   "" "" \
   "tarzan-2||agent_type|1|0|0"
 
-# Security boundary (must hold before AND after any fix): a non-numeric suffix
-# is NOT an instance suffix — it must never resolve to the base manager entry.
+# Security boundary (must hold before AND after the fix): a non-numeric suffix is
+# NOT an instance suffix — it must never resolve to the base manager entry.
 run_case "73t4 boundary: tarzan-abc (non-numeric suffix) must NOT elevate to manager" \
   '{"agent_id":"t73-bound","agent_type":"tarzan-abc"}' \
   "" "" \
   "tarzan-abc||agent_type|1|0|0"
 
-# Regression guard: the bare registered name is unchanged by any fix.
+# Regression guard: the bare registered name is unchanged.
 run_case "73t4 regression: bare tarzan subagent still resolves one_off_manager" \
   '{"agent_id":"t73-reg","agent_type":"tarzan"}' \
   "" "" \
   "tarzan|one_off_manager|agent_type|1|1|1"
 
-# PENDING (RED by design, gated): the acceptance — a respawned manager instance
-# resolves as its base registry type/manager while keeping the full suffixed
-# name for display. Mechanism-agnostic: it asserts the resolved outputs, not HOW
-# the mapping is done (holds for a suffix-strip lookup OR for registering the
-# instance). RED until the Lincoln-approved fix lands.
-if [ "${SABLE_PENDING_73T4:-}" = "1" ]; then
-  run_case "73t4 PENDING(RED): tarzan-2 resolves one_off_manager via base registry entry" \
-    '{"agent_id":"t73-p1","agent_type":"tarzan-2"}' \
-    "" "" \
-    "tarzan-2|one_off_manager|agent_type|1|1|1"
-  run_case "73t4 PENDING(RED): optimus-3 resolves epic_manager via base registry entry" \
-    '{"agent_id":"t73-p2","agent_type":"optimus-3"}' \
-    "" "" \
-    "optimus-3|epic_manager|agent_type|1|1|1"
-fi
+# ACCEPTANCE (mechanism b, default-on): with the instance REGISTERED, a suffixed
+# manager instance resolves as its base registry type/manager while keeping the
+# full suffixed name for display. Was RED under SABLE_PENDING_73T4 until the
+# approved fix (spawn-time registration) landed.
+run_case_yaml "73t4: registered tarzan-2 resolves one_off_manager via its instance entry" \
+  '{"agent_id":"t73-p1","agent_type":"tarzan-2"}' \
+  "$FIXTURE_DIR/agents-with-instances.yaml" \
+  "tarzan-2|one_off_manager|agent_type|1|1|1"
+run_case_yaml "73t4: registered optimus-3 resolves epic_manager via its instance entry" \
+  '{"agent_id":"t73-p2","agent_type":"optimus-3"}' \
+  "$FIXTURE_DIR/agents-with-instances.yaml" \
+  "optimus-3|epic_manager|agent_type|1|1|1"
 
 # --------------------------------------------------------------------------
 # sable_resolve_dispatch_lane unit tests (SABLE-uz9.9)
