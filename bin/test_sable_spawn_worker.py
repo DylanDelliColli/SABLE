@@ -181,6 +181,26 @@ def test_worker_env_args_empty_when_no_lane():
     assert ssw.worker_env_args("") == []
 
 
+# --- worker window spawn argv (SABLE-zgbt) -----------------------------------
+
+def test_new_window_args_spawns_detached_in_background():
+    # SABLE-zgbt: without -d tmux makes every fresh worker window the session's
+    # CURRENT window, yanking each attached client's view on every dispatch.
+    args = ssw.new_window_args("sable", "worker-sable-x", "/wt/wk-x",
+                               ["-e", "CLAUDE_AGENT_NAME=optimus",
+                                "-e", "CLAUDE_AGENT_ROLE=manager"],
+                               "claude --model haiku")
+    assert args[0] == "new-window"
+    assert "-d" in args
+    # the detached spawn must not disturb pane-id capture, targeting, or delivery
+    assert args[args.index("-t") + 1] == "sable"
+    assert args[args.index("-n") + 1] == "worker-sable-x"
+    assert args[args.index("-c") + 1] == "/wt/wk-x"
+    assert "-P" in args and "#{pane_id}" in args
+    assert "CLAUDE_AGENT_NAME=optimus" in args
+    assert args[-1] == "claude --model haiku"
+
+
 # --- dispatch readiness + submission (SABLE-91m3) ---------------------------
 
 def test_pane_ready_true_on_empty_prompt():

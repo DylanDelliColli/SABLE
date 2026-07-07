@@ -149,6 +149,17 @@ def worker_env_args(lane: str) -> list[str]:
     return ["-e", f"CLAUDE_AGENT_NAME={lane}", "-e", "CLAUDE_AGENT_ROLE=manager"]
 
 
+def new_window_args(session: str, win: str, worktree: str,
+                    env_args: list[str], wcmd: str) -> list[str]:
+    """tmux argv for the worker window. -d spawns it in the BACKGROUND: without
+    it tmux makes each fresh worker window the session's current window, yanking
+    every attached client's view on every dispatch (SABLE-zgbt). Delivery is
+    unaffected — the -P -F pane-id capture works for detached windows, and
+    wait_for_ready / send-keys target that pane id, never the current window."""
+    return ["new-window", "-d", "-t", session, "-n", win, "-c", worktree,
+            *env_args, "-P", "-F", "#{pane_id}", wcmd]
+
+
 # pane_ready / accept_startup_gate / dispatch_landed / wait_for_ready /
 # deliver_dispatch (= deliver_text) now live in sable_pane_lib (imported above),
 # shared with sable-tmux --autostart (SABLE-bldh.14).
@@ -256,9 +267,8 @@ def main(argv: list[str] | None = None) -> int:
     lane = resolve_lane(ns.lane)
     win = window_name(bid)
     wcmd = worker_command(model, os.environ.get("SABLE_WORKER_CMD"))
-    pane_id = _run(base + ["new-window", "-t", ns.session, "-n", win,
-                           "-c", worktree, *worker_env_args(lane),
-                           "-P", "-F", "#{pane_id}", wcmd]).strip()
+    pane_id = _run(base + new_window_args(ns.session, win, worktree,
+                                          worker_env_args(lane), wcmd)).strip()
 
     # --- tag the pane for the registry + reaper ---
     for key, val in (("@sable_role", "worker"), ("@sable_bead", bid),

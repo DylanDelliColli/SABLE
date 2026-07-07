@@ -128,6 +128,40 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock):
                            capture_output=True, text=True)
 
 
+def test_spawn_leaves_session_current_window_unchanged(sock):
+    """SABLE-zgbt regression: the worker window must open DETACHED (-d). Without
+    it every dispatch makes the new window the session's current window, yanking
+    every attached client (the operator on the lincoln window) to the worker —
+    repeatedly, during a drain wave. tmux tracks the current window even with no
+    client attached, so this asserts directly on the session."""
+    with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
+        before = _tmux(sock, "display-message", "-t", "sable", "-p",
+                       "#{window_index}").stdout.strip()
+        env = {
+            **os.environ,
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+        r = subprocess.run(
+            ["python3", str(BIN), BEAD, "--worktree", wt,
+             "--model", "haiku", "--skip-governance"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        after = _tmux(sock, "display-message", "-t", "sable", "-p",
+                      "#{window_index}").stdout.strip()
+        assert after == before, f"current window yanked {before} -> {after}"
+        # the worker window still exists in the background
+        wins = _tmux(sock, "list-windows", "-t", "sable",
+                     "-F", "#{window_name}").stdout
+        assert "worker-sable-bldh-2" in wins
+
+
 def test_worker_window_inherits_lane_manager_identity(sock):
     """SABLE-bldh.13 regression: the worker window must carry the invoking lane
     manager's CLAUDE_AGENT_NAME (+ manager role) so its push's for-chuck handoff
