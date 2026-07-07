@@ -119,6 +119,106 @@ def test_focus_outside_tmux_uses_grouped_session_independent_focus(sock):
     assert len(groups) == 1
 
 
+# --- SABLE-d8tl: destroy-unattached vs the still-detached grouped session ----
+#
+# A stub tmux that models the REAL server behavior which crashed the deep-dive:
+# a DETACHED session dies the instant destroy-unattached turns on. It logs every
+# invocation (command sequences split on ';') and keeps session state in a JSON
+# file across invocations.
+STUB_TMUX = """#!/usr/bin/env python3
+import json, os, sys
+
+state_path = os.environ["SV_STUB_STATE"]
+log_path = os.environ["SV_STUB_LOG"]
+args = sys.argv[1:]
+with open(log_path, "a") as f:
+    f.write(json.dumps(args) + "\\n")
+with open(state_path) as f:
+    state = json.load(f)
+
+def save():
+    with open(state_path, "w") as f:
+        json.dump(state, f)
+
+cmds, cur = [], []
+for a in args:
+    if a == ";":
+        cmds.append(cur); cur = []
+    else:
+        cur.append(a)
+cmds.append(cur)
+
+for cmd in cmds:
+    if not cmd:
+        continue
+    name = cmd[0]
+    if name == "has-session":
+        continue
+    if name == "list-panes":
+        sys.stdout.write("0 %0 lincoln  \\n1 %4 worker SABLE-int1 running\\n")
+        continue
+    if name == "new-session":
+        state["view"] = {"attached": False, "alive": True}
+        save()
+        continue
+    if name == "set-option" and "destroy-unattached" in cmd:
+        if state.get("view", {}).get("alive") and not state["view"]["attached"]:
+            state["view"]["alive"] = False   # tmux reaps a detached session NOW
+            save()
+        continue
+    if name in ("select-window", "select-pane", "attach", "switch-client"):
+        if not state.get("view", {}).get("alive"):
+            sys.stderr.write("cannot find session\\n")
+            sys.exit(1)
+        if name in ("attach", "switch-client"):
+            state["view"]["attached"] = True
+            save()
+        continue
+sys.exit(0)
+"""
+
+
+def test_attach_path_survives_destroy_unattached_race(tmp_path):
+    """SABLE-d8tl regression: with a tmux that destroys a detached session the
+    moment destroy-unattached is set, the second-terminal deep-dive must still
+    complete — the option may only be enabled AFTER attach, chained onto the
+    attach exec, never as a pre-attach command."""
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    stub = stub_dir / "tmux"
+    stub.write_text(STUB_TMUX)
+    stub.chmod(0o755)
+    state = tmp_path / "state.json"
+    state.write_text("{}")
+    log = tmp_path / "log.jsonl"
+    log.write_text("")
+    env = {**os.environ,
+           "PATH": f"{stub_dir}:{os.environ['PATH']}",
+           "SV_STUB_STATE": str(state),
+           "SV_STUB_LOG": str(log),
+           "SABLE_TMUX_SESSION": SESSION}
+    env.pop("TMUX", None)               # outside-tmux deep-dive: the attach path
+    env.pop("SABLE_TMUX_SOCKET", None)  # bare `tmux` resolves to the stub
+    r = subprocess.run(["python3", str(BIN), "worker"],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
+    assert "CalledProcessError" not in r.stderr
+
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    # never issued as its own pre-attach invocation...
+    solo = [c for c in calls if c and c[0] == "set-option" and "destroy-unattached" in c]
+    assert not solo, f"pre-attach destroy-unattached: {solo}"
+    # ...it rides the attach invocation, after the attach command
+    attach_calls = [c for c in calls if c and c[0] in ("attach", "switch-client")]
+    assert attach_calls, f"no attach exec recorded: {calls}"
+    seq = attach_calls[-1]
+    assert "destroy-unattached" in seq
+    assert seq.index("destroy-unattached") > seq.index(";")
+    # the stub's lifecycle model agrees: the view session survived to attach
+    final = json.loads(state.read_text())
+    assert final["view"]["alive"] and final["view"]["attached"]
+
+
 def test_unknown_role_exits_2_listing_known(sock):
     _seed_session(sock)
     r = _run(sock, "bogus")

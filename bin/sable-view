@@ -84,17 +84,35 @@ def view_session_name(session: str, pid: int) -> str:
 
 
 def grouped_view_commands(base: list[str], session: str, vname: str,
-                          target: dict, destroy_on_detach: bool) -> list[list[str]]:
+                          target: dict) -> list[list[str]]:
     """The second-terminal deep-dive (SABLE-dqhn.3): tmux clients attached to
     the SAME session share the active window, so a plain second attach would
     yank the operator's Lincoln view. A GROUPED session (new-session -t) shares
-    the window list but keeps an INDEPENDENT current window."""
-    cmds = [base + ["new-session", "-d", "-t", session, "-s", vname]]
+    the window list but keeps an INDEPENDENT current window.
+
+    destroy-unattached is deliberately NOT set here: the grouped session is
+    still DETACHED, and tmux reaps a detached session the moment that option
+    turns on — before select-window ever runs (SABLE-d8tl). The option rides
+    the attach exec instead (attach_argv)."""
+    return [
+        base + ["new-session", "-d", "-t", session, "-s", vname],
+        base + ["select-window", "-t", f"{vname}:{target['window']}"],
+        base + ["select-pane", "-t", target["pane"]],
+    ]
+
+
+def attach_argv(base: list[str], vname: str, destroy_on_detach: bool,
+                switch_client: bool) -> list[str]:
+    """argv for the final exec into the view session. With destroy_on_detach,
+    destroy-unattached is chained onto the attach in the SAME tmux command
+    sequence, so it runs only once the client is attached — the one moment it
+    is safe (SABLE-d8tl) — while still guaranteeing the viewer's detach
+    destroys the grouped session."""
+    verb = ["switch-client", "-t", vname] if switch_client else ["attach", "-t", vname]
+    argv = base + verb
     if destroy_on_detach:
-        cmds.append(base + ["set-option", "-t", vname, "destroy-unattached", "on"])
-    cmds.append(base + ["select-window", "-t", f"{vname}:{target['window']}"])
-    cmds.append(base + ["select-pane", "-t", target["pane"]])
-    return cmds
+        argv += [";", "set-option", "-t", vname, "destroy-unattached", "on"]
+    return argv
 
 
 def _run(args: list[str]) -> str:
@@ -163,15 +181,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     vname = view_session_name(session, os.getpid())
-    for cmd in grouped_view_commands(base, session, vname, target,
-                                     destroy_on_detach=not ns.no_attach):
+    for cmd in grouped_view_commands(base, session, vname, target):
         subprocess.run(cmd, check=True)
     if ns.no_attach:
         print(vname)          # caller owns cleanup (tests/scripts)
         return 0
-    if os.environ.get("TMUX"):
-        os.execvp("tmux", base + ["switch-client", "-t", vname])
-    os.execvp("tmux", base + ["attach", "-t", vname])
+    os.execvp("tmux", attach_argv(base, vname, destroy_on_detach=True,
+                                  switch_client=bool(os.environ.get("TMUX"))))
 
 
 if __name__ == "__main__":

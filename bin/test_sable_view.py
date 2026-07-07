@@ -74,19 +74,43 @@ def test_view_session_name_is_grouped_and_unique():
 
 
 def test_grouped_view_commands_shape():
-    """The attach path creates a grouped session, self-destructs on detach,
-    and selects the target window/pane in the VIEW session only."""
+    """The pre-attach sequence creates a grouped session and selects the target
+    window/pane in the VIEW session only. destroy-unattached must NOT appear
+    here: the grouped session is still DETACHED, and tmux reaps a detached
+    session the moment that option turns on — before select-window ever runs
+    (SABLE-d8tl). The option rides the attach exec instead (attach_argv)."""
     target = {"window": "1", "pane": "%4", "role": "worker", "bead": "", "status": ""}
-    cmds = sv.grouped_view_commands(["tmux"], "sable", "sable-view-9", target,
-                                    destroy_on_detach=True)
+    cmds = sv.grouped_view_commands(["tmux"], "sable", "sable-view-9", target)
     flat = [" ".join(c) for c in cmds]
     assert any("new-session" in c and "-t sable" in c and "-s sable-view-9" in c
                for c in flat)
-    assert any("destroy-unattached" in c for c in flat)
     assert any("select-window" in c and "sable-view-9:1" in c for c in flat)
-    cmds_na = sv.grouped_view_commands(["tmux"], "sable", "sable-view-9", target,
-                                       destroy_on_detach=False)
-    assert not any("destroy-unattached" in " ".join(c) for c in cmds_na)
+    assert any("select-pane" in c and "%4" in c for c in flat)
+    assert not any("destroy-unattached" in c for c in flat)
+
+
+def test_attach_argv_enables_destroy_unattached_only_after_attach():
+    """SABLE-d8tl: self-destruct-on-detach is enabled in the SAME tmux command
+    sequence as the attach, AFTER the attach command — the only safe moment."""
+    argv = sv.attach_argv(["tmux"], "sable-view-9",
+                          destroy_on_detach=True, switch_client=False)
+    assert argv[:4] == ["tmux", "attach", "-t", "sable-view-9"]
+    tail = argv[argv.index(";") + 1:]
+    assert "set-option" in tail and "destroy-unattached" in tail and "on" in tail
+
+
+def test_attach_argv_switch_client_inside_tmux():
+    argv = sv.attach_argv(["tmux"], "sable-view-9",
+                          destroy_on_detach=True, switch_client=True)
+    assert argv[:4] == ["tmux", "switch-client", "-t", "sable-view-9"]
+    assert "destroy-unattached" in argv[argv.index(";"):]
+
+
+def test_attach_argv_without_destroy_has_no_chained_command():
+    argv = sv.attach_argv(["tmux"], "sable-view-9",
+                          destroy_on_detach=False, switch_client=False)
+    assert ";" not in argv
+    assert "destroy-unattached" not in argv
 
 
 if __name__ == "__main__":
