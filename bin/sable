@@ -36,6 +36,20 @@ START HERE
                               sable-view <role>          focus that pane
                               sable-view <role> --tail   read it without switching
 
+TMUX KEYS (inside a sable-view deep-dive)
+  Ctrl-b d                  LEAVE: detach the viewer. Only the throwaway view
+                            session dies — the agent pane and its claude
+                            process keep running. Never type Ctrl-c / Ctrl-d /
+                            exit instead: those go to the REAL pane and kill
+                            the agent you are watching.
+  Ctrl-b w                  switch agents: window tree with live previews
+                            (each agent lives in its OWN window, so pane
+                            rotation Ctrl-b o does nothing here)
+  Ctrl-b n / p / l          next / previous / last window
+  see several at once       one terminal pane per role, each running
+                            `sable-view <role>` — or read-only:
+                            `watch -n 2 -t "sable-view <role> --tail"`
+
 WORK DOORS (type these to Lincoln, in its pane)
   /sable-discover           decide WHAT to build — triage candidates, emit charters
   /sable-plan               fill the backlog — Quick or Full (five gated substages)

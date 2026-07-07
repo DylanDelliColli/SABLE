@@ -21,7 +21,7 @@ pass "bin/sable exists and is executable"
 
 # --- the operator map ---
 HELP="$(bash "$SABLE" --help 2>&1)"
-for marker in sable-launch sable-view sable-spawn-manager /sable-discover /sable-plan /sable-execute sable-msg QUICKSTART.md TMUX-AGENTS-DESIGN.md; do
+for marker in sable-launch sable-view sable-spawn-manager /sable-discover /sable-plan /sable-execute sable-msg QUICKSTART.md TMUX-AGENTS-DESIGN.md "Ctrl-b d" "Ctrl-b w" "Ctrl-b n" "REAL pane" "watch -n 2"; do
   if printf '%s' "$HELP" | grep -qF -- "$marker"; then
     pass "--help mentions $marker"
   else
