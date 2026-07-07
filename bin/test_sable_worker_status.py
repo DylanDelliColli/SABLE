@@ -7,6 +7,7 @@ tmux user-options set at spawn / completion: @sable_role=worker, @sable_bead=<id
 tmux); the manager separately watches the bead pool for the actual result.
 """
 import importlib.util
+import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -67,6 +68,82 @@ def test_reaping_decision_empty_when_none_done():
 def test_tmux_base_socket():
     assert sws.tmux_base("sk") == ["tmux", "-L", "sk"]
     assert sws.tmux_base(None) == ["tmux"]
+
+
+# --- market-brief-package-c0k5: grouped-session duplicate rows crash --reap ---
+
+def test_dedupe_panes_collapses_duplicate_rows():
+    """A grouped-session topology (`tmux new-session -t <sess> -s <alias>`)
+    makes `tmux list-panes -a` enumerate the SAME physical pane once per
+    session alias sharing its window. Dedupe by pane id before reaping."""
+    workers = [
+        {"pane": "%2", "bead": "b", "status": "done"},
+        {"pane": "%3", "bead": "c", "status": "running"},
+        {"pane": "%2", "bead": "b", "status": "done"},
+        {"pane": "%3", "bead": "c", "status": "running"},
+    ]
+    assert sws.dedupe_panes(workers) == [
+        {"pane": "%2", "bead": "b", "status": "done"},
+        {"pane": "%3", "bead": "c", "status": "running"},
+    ]
+
+
+def test_dedupe_panes_empty():
+    assert sws.dedupe_panes([]) == []
+
+
+def test_reap_tolerates_already_dead_pane():
+    """The second kill-pane on a duplicate-listed (now-dead) pane must not
+    abort the whole reap sweep — it should be skipped, not raised."""
+    calls = []
+
+    def fake_run(args):
+        calls.append(args)
+        if len(calls) == 2:  # second kill-pane call: pane already dead
+            raise subprocess.CalledProcessError(1, args)
+        return ""
+
+    # explicit no-op capture: this test is about kill-pane tolerance, not
+    # pending-input handling, and must not fall through to a REAL tmux
+    # capture-pane call against the default socket.
+    sws.reap(["%2", "%2", "%3"], None, run=fake_run, capture=lambda pane: "")
+    assert len(calls) == 3  # all three attempted despite the middle failure
+
+
+# --- market-brief-package-0h8k: don't silently kill a done pane holding
+# unsubmitted composer input (a misrouted/queued instruction) ---
+
+def test_has_pending_input_true_when_box_nonempty():
+    cap = "some scrollback\n❯ check the pool for next work"
+    assert sws.has_pending_input(cap) is True
+
+
+def test_has_pending_input_false_when_box_empty():
+    assert sws.has_pending_input("some scrollback\n❯") is False
+    assert sws.has_pending_input("some scrollback\n>") is False
+
+
+def test_has_pending_input_false_when_no_prompt_box_found():
+    assert sws.has_pending_input("just scrollback\nno prompt line here") is False
+
+
+def test_reap_clears_and_flags_pending_input_before_killing():
+    calls = []
+
+    def fake_run(args):
+        calls.append(args)
+        return ""
+
+    def fake_capture(pane):
+        return "❯ check the pool for next work" if pane == "%2" else "❯"
+
+    flagged = sws.reap(["%2", "%3"], None, run=fake_run, capture=fake_capture)
+    assert flagged == ["%2"]
+    assert calls == [
+        ["tmux", "send-keys", "-t", "%2", "C-u"],
+        ["tmux", "kill-pane", "-t", "%2"],
+        ["tmux", "kill-pane", "-t", "%3"],
+    ]
 
 
 if __name__ == "__main__":

@@ -62,18 +62,76 @@ def reaping_decision(workers: list[dict]) -> list[str]:
     return [w["pane"] for w in workers if is_done(w["status"])]
 
 
+def dedupe_panes(workers: list[dict]) -> list[dict]:
+    """A grouped-session topology (`tmux new-session -t <sess> -s <alias>`
+    shares one window list under two session names) makes `tmux list-panes -a`
+    enumerate the SAME physical pane once per session alias. Collapse to one
+    record per pane id, keeping the first occurrence, before anything reaps."""
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for w in workers:
+        if w["pane"] in seen:
+            continue
+        seen.add(w["pane"])
+        deduped.append(w)
+    return deduped
+
+
 def _runner(args: list[str]) -> str:
     return subprocess.run(args, capture_output=True, text=True, check=True).stdout
 
 
+def _capture_pane(base: list[str], pane: str) -> str:
+    return subprocess.run(base + ["capture-pane", "-p", "-t", pane],
+                          capture_output=True, text=True).stdout
+
+
+def has_pending_input(capture: str) -> bool:
+    """True if the pane's input box currently holds unsubmitted text — the
+    composer line (prefixed by the tmux-native `>` or claude's `❯` prompt
+    glyph) has content beyond the glyph itself. A done worker pane must never
+    be silently killed while this is true (market-brief-package-0h8k): the
+    text may be a misrouted/queued instruction nobody in the lane sent, and
+    destroying the pane destroys the only evidence of it."""
+    box = None
+    for line in capture.splitlines():
+        s = line.strip()
+        if s.startswith("❯") or s.startswith(">"):
+            box = s
+    if box is None:
+        return False
+    return box not in ("❯", ">")
+
+
 def list_workers(socket: str | None, run=_runner) -> list[dict]:
     out = run(tmux_base(socket) + ["list-panes", "-a", "-F", _FORMAT])
-    return parse_worker_panes(out)
+    return dedupe_panes(parse_worker_panes(out))
 
 
-def reap(panes: list[str], socket: str | None, run=_runner) -> None:
+def reap(panes: list[str], socket: str | None, run=_runner, capture=None) -> list[str]:
+    """Kill each done pane. One holding unsubmitted composer input is NOT
+    silently killed over: clear it first (so no pane ever survives reap still
+    holding pending input) and flag it loudly, then proceed with the kill —
+    the worker is done regardless, but the anomaly must be visible to a human
+    or manager, not swallowed. Returns the pane ids that were flagged."""
+    base = tmux_base(socket)
+    cap = capture or (lambda pane: _capture_pane(base, pane))
+    flagged: list[str] = []
     for pane in panes:
-        run(tmux_base(socket) + ["kill-pane", "-t", pane])
+        if has_pending_input(cap(pane)):
+            flagged.append(pane)
+            sys.stderr.write(
+                f"sable-worker-status: pane {pane} is done but holds unsubmitted "
+                f"composer input — clearing + flagging before reap "
+                f"(market-brief-package-0h8k)\n")
+            run(base + ["send-keys", "-t", pane, "C-u"])
+        try:
+            run(base + ["kill-pane", "-t", pane])
+        except subprocess.CalledProcessError:
+            # Already dead (e.g. a race between listing and this sweep, or a
+            # concurrent reaper) — not a reason to abort the rest of the sweep.
+            continue
+    return flagged
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -96,8 +154,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if ns.reap:
         doomed = reaping_decision(workers)
-        reap(doomed, socket)
-        sys.stderr.write(f"sable-worker-status: reaped {len(doomed)} done pane(s)\n")
+        flagged = reap(doomed, socket)
+        note = f", {len(flagged)} had pending input cleared+flagged" if flagged else ""
+        sys.stderr.write(f"sable-worker-status: reaped {len(doomed)} done pane(s){note}\n")
     return 0
 
 

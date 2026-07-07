@@ -11,7 +11,10 @@ Per bead, a manager (Optimus/Tarzan) calls this to:
   6. send a single-line "read your dispatch file and execute it" instruction.
 
 The worker then runs the warm-pane self-push lifecycle (worker-dispatch.md):
-self-push its branch, bd close, then `tmux set-option -p @sable_status done`.
+self-push its branch, bd close, then flag itself done with an EXPLICIT target
+(`tmux set-option -p -t "$TMUX_PANE" @sable_status done`) — omitting `-t`
+resolves the target from the operator's active pane, not the worker's own
+(market-brief-package-uj22 / SABLE-5v9n).
 Results flow back via the bead pool; `sable-worker-status --reap` cleans up.
 
 Governance (claim) runs before the spawn unless --skip-governance; the full
@@ -189,7 +192,10 @@ Worker model: {model}
   worktree (this deletes the SABLE-041 wrong-tree bug). Do NOT bypass pre-push.
 - The post-push hook files the for-chuck handoff; Chuck merges. You do NOT open PRs.
 - `bd close {bead_id}` with the test evidence.
-- Finally, flag done for the reaper: `tmux set-option -p @sable_status done`.
+- Finally, flag done for the reaper. First verify your own pane identity
+  (`echo $TMUX_PANE`), then target it explicitly — do NOT omit `-t`, or the
+  flag lands on whichever pane has operator focus instead of your own:
+  `tmux set-option -p -t "$TMUX_PANE" @sable_status done`.
 """
 
 

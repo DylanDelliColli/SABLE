@@ -123,6 +123,19 @@ def test_assemble_dispatch_prompt_has_load_bearing_slots():
     assert "@sable_status" in p  # done-signal instruction
 
 
+def test_dispatch_prompt_done_flag_targets_own_pane():
+    """market-brief-package-uj22: without -t, tmux resolves the target pane from
+    the client's active pane (the operator's focus), not the invoking worker's
+    own pane, so the bare '-p' form silently flags a manager pane done instead
+    and starves the worker's own reap."""
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="haiku",
+    )
+    assert 'tmux set-option -p -t "$TMUX_PANE" @sable_status done' in p
+    assert "tmux set-option -p @sable_status done" not in p
+
+
 def test_read_instruction_is_single_line():
     instr = ssw.read_instruction("/abs/dispatch/X-1.md")
     assert "/abs/dispatch/X-1.md" in instr

@@ -31,6 +31,8 @@ hasre "gate mode returns the parked commit (SHA)"        "\bSHA\b|commit hash|pa
 hasre "gate mode returns test evidence not a PR URL"     "test (output|evidence)"
 hasre "retains the self-push form for low-stakes lanes"  "self-push|PR URL"
 hasre "says the manager performs the push on approval"   "manager (pushes|reviews|performs)|git -C"
+has  "a done worker refuses post-completion scope expansion"  "done worker takes no new work"
+has  "instructs refusing unsolicited/misrouted instructions"  "REFUSE"
 
 echo
 echo "=========================================="
