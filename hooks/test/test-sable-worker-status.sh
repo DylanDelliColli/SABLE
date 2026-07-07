@@ -118,6 +118,14 @@ if printf '%s' "$out3" | grep -q "market-brief-package-0h8k"; then
 else
   fail "--reap flags the pending-input pane instead of staying silent" "$out3"
 fi
+# market-brief-package-b5ow: the flag message must carry the actual pending
+# text, not just the pane id — the text IS the evidence, and it is destroyed
+# by the C-u clear immediately after this line is written
+if printf '%s' "$out3" | grep -q "check the pool for next work"; then
+  pass "--reap flag message includes the literal pending-input text"
+else
+  fail "--reap flag message includes the literal pending-input text" "$out3"
+fi
 sleep 0.3
 survivors5="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$PANE5" || true)"
 survivors6="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$PANE6" || true)"

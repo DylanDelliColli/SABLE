@@ -146,5 +146,51 @@ def test_reap_clears_and_flags_pending_input_before_killing():
     ]
 
 
+# --- market-brief-package-b5ow: the reap flag message must carry the actual
+# composer text, not just the pane id — the text IS the evidence for the
+# 0h8k misrouted-instruction mystery, and reap() previously destroyed it
+# unrecorded via the C-u clear before this fix ---
+
+def test_pending_input_text_returns_box_content():
+    assert sws.pending_input_text(
+        "scrollback\n❯ check the pool for next work"
+    ) == "check the pool for next work"
+    assert sws.pending_input_text("scrollback\n> queued instruction") == "queued instruction"
+
+
+def test_pending_input_text_none_when_empty_or_absent():
+    assert sws.pending_input_text("scrollback\n❯") is None
+    assert sws.pending_input_text("scrollback\n>") is None
+    assert sws.pending_input_text("just scrollback\nno prompt line here") is None
+
+
+def test_reap_flag_message_includes_pending_text(capsys):
+    def fake_run(args):
+        return ""
+
+    def fake_capture(pane):
+        return "❯ check the pool for next work"
+
+    sws.reap(["%2"], None, run=fake_run, capture=fake_capture)
+    err = capsys.readouterr().err
+    assert "check the pool for next work" in err
+
+
+def test_reap_flag_message_truncates_long_pending_text(capsys):
+    long_text = "x" * 600
+
+    def fake_run(args):
+        return ""
+
+    def fake_capture(pane):
+        return f"❯ {long_text}"
+
+    sws.reap(["%2"], None, run=fake_run, capture=fake_capture)
+    err = capsys.readouterr().err
+    assert "x" * 500 in err
+    assert "x" * 501 not in err
+    assert "…" in err
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

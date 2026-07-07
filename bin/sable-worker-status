@@ -86,6 +86,19 @@ def _capture_pane(base: list[str], pane: str) -> str:
                           capture_output=True, text=True).stdout
 
 
+def _composer_box(capture: str) -> str | None:
+    """Return the last line in the capture that looks like the composer box
+    (prefixed by the tmux-native `>` or claude's `❯` prompt glyph), or None
+    if no such line is present. Shared by has_pending_input and
+    pending_input_text so both agree on what counts as "the box"."""
+    box = None
+    for line in capture.splitlines():
+        s = line.strip()
+        if s.startswith("❯") or s.startswith(">"):
+            box = s
+    return box
+
+
 def has_pending_input(capture: str) -> bool:
     """True if the pane's input box currently holds unsubmitted text — the
     composer line (prefixed by the tmux-native `>` or claude's `❯` prompt
@@ -93,14 +106,25 @@ def has_pending_input(capture: str) -> bool:
     be silently killed while this is true (market-brief-package-0h8k): the
     text may be a misrouted/queued instruction nobody in the lane sent, and
     destroying the pane destroys the only evidence of it."""
-    box = None
-    for line in capture.splitlines():
-        s = line.strip()
-        if s.startswith("❯") or s.startswith(">"):
-            box = s
+    box = _composer_box(capture)
     if box is None:
         return False
     return box not in ("❯", ">")
+
+
+def pending_input_text(capture: str) -> str | None:
+    """Return the composer box's actual content (the text after the prompt
+    glyph), or None if there is no pending input. Sibling to
+    has_pending_input: where that answers "is there pending input", this
+    answers "what does it say" — the text itself is the evidence reap() must
+    log before it is destroyed (market-brief-package-b5ow / 0h8k)."""
+    box = _composer_box(capture)
+    if box is None or box in ("❯", ">"):
+        return None
+    for glyph in ("❯", ">"):
+        if box.startswith(glyph):
+            return box[len(glyph):].strip()
+    return box
 
 
 def list_workers(socket: str | None, run=_runner) -> list[dict]:
@@ -108,22 +132,32 @@ def list_workers(socket: str | None, run=_runner) -> list[dict]:
     return dedupe_panes(parse_worker_panes(out))
 
 
+_PENDING_TEXT_LOG_LIMIT = 500
+
+
 def reap(panes: list[str], socket: str | None, run=_runner, capture=None) -> list[str]:
     """Kill each done pane. One holding unsubmitted composer input is NOT
     silently killed over: clear it first (so no pane ever survives reap still
-    holding pending input) and flag it loudly, then proceed with the kill —
-    the worker is done regardless, but the anomaly must be visible to a human
-    or manager, not swallowed. Returns the pane ids that were flagged."""
+    holding pending input) and flag it loudly — including the pending text
+    itself, since the text IS the evidence (market-brief-package-b5ow; a
+    prior version logged only the pane id and destroyed the text unrecorded)
+    — then proceed with the kill. The worker is done regardless, but the
+    anomaly must be visible to a human or manager, not swallowed. Returns the
+    pane ids that were flagged."""
     base = tmux_base(socket)
     cap = capture or (lambda pane: _capture_pane(base, pane))
     flagged: list[str] = []
     for pane in panes:
-        if has_pending_input(cap(pane)):
+        cap_text = cap(pane)
+        if has_pending_input(cap_text):
             flagged.append(pane)
+            text = pending_input_text(cap_text) or ""
+            if len(text) > _PENDING_TEXT_LOG_LIMIT:
+                text = text[:_PENDING_TEXT_LOG_LIMIT] + "…[truncated]"
             sys.stderr.write(
                 f"sable-worker-status: pane {pane} is done but holds unsubmitted "
                 f"composer input — clearing + flagging before reap "
-                f"(market-brief-package-0h8k)\n")
+                f"(market-brief-package-0h8k): pending text={text!r}\n")
             run(base + ["send-keys", "-t", pane, "C-u"])
         try:
             run(base + ["kill-pane", "-t", pane])
