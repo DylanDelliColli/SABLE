@@ -148,6 +148,66 @@ run_case "teams member with non-registry name (optimus-probe) stands down" \
   "optimus-probe||agent_type|1|0|0"
 
 # --------------------------------------------------------------------------
+# market-brief-package-73t4 — instance-suffixed manager identity resolution.
+#
+# A respawned manager instance arrives with an instance-suffixed agent_type
+# (e.g. 'tarzan-2') while only the bare name ('tarzan') is registered in
+# agents.yaml. The exact-match registry lookup (line ~88, `$0 == "  " name ":"`)
+# misses, so a genuine one_off_manager resolves as an unregistered worker and
+# the pre-push gate denies its push with "worker subagents do not push".
+#
+# STATUS: RED tests only. The FIX (how a -N instance maps to its base registry
+# entry) is DEFERRED pending a Lincoln ruling on the approach: a BLANKET strip
+# of a trailing -[0-9]+ before the lookup would let ANY '<registered>-<n>'
+# self-elevate to manager — a push-gate escalation — so the mechanism is not
+# settled. The desired-behavior assertions are gated behind SABLE_PENDING_73T4=1
+# and are RED today by design. Capture the red with:
+#     SABLE_PENDING_73T4=1 bash hooks/test/test-lib-identity.sh
+#
+# The three cases that run in the default suite pin TODAY's behavior (so the
+# fix is DETECTED when it lands) and lock the security boundary that every
+# candidate fix must preserve (a non-numeric suffix is not an instance suffix
+# and must never elevate).
+# --------------------------------------------------------------------------
+
+# Characterization (passes today): tarzan-2 currently resolves as an
+# unregistered, non-manager worker — this IS the bug. Flip this expectation to
+# the PENDING one when the approved fix lands.
+run_case "73t4 characterization: tarzan-2 currently resolves unregistered/non-manager (the bug)" \
+  '{"agent_id":"t73-char","agent_type":"tarzan-2"}' \
+  "" "" \
+  "tarzan-2||agent_type|1|0|0"
+
+# Security boundary (must hold before AND after any fix): a non-numeric suffix
+# is NOT an instance suffix — it must never resolve to the base manager entry.
+run_case "73t4 boundary: tarzan-abc (non-numeric suffix) must NOT elevate to manager" \
+  '{"agent_id":"t73-bound","agent_type":"tarzan-abc"}' \
+  "" "" \
+  "tarzan-abc||agent_type|1|0|0"
+
+# Regression guard: the bare registered name is unchanged by any fix.
+run_case "73t4 regression: bare tarzan subagent still resolves one_off_manager" \
+  '{"agent_id":"t73-reg","agent_type":"tarzan"}' \
+  "" "" \
+  "tarzan|one_off_manager|agent_type|1|1|1"
+
+# PENDING (RED by design, gated): the acceptance — a respawned manager instance
+# resolves as its base registry type/manager while keeping the full suffixed
+# name for display. Mechanism-agnostic: it asserts the resolved outputs, not HOW
+# the mapping is done (holds for a suffix-strip lookup OR for registering the
+# instance). RED until the Lincoln-approved fix lands.
+if [ "${SABLE_PENDING_73T4:-}" = "1" ]; then
+  run_case "73t4 PENDING(RED): tarzan-2 resolves one_off_manager via base registry entry" \
+    '{"agent_id":"t73-p1","agent_type":"tarzan-2"}' \
+    "" "" \
+    "tarzan-2|one_off_manager|agent_type|1|1|1"
+  run_case "73t4 PENDING(RED): optimus-3 resolves epic_manager via base registry entry" \
+    '{"agent_id":"t73-p2","agent_type":"optimus-3"}' \
+    "" "" \
+    "optimus-3|epic_manager|agent_type|1|1|1"
+fi
+
+# --------------------------------------------------------------------------
 # sable_resolve_dispatch_lane unit tests (SABLE-uz9.9)
 # Manager-subagents now dispatch workers natively (nested Agent, CC 2.1.177,
 # SABLE-uz9.8) — governance must ACTIVATE for them where it previously stood
