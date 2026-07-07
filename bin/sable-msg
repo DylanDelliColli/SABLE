@@ -1,25 +1,51 @@
 #!/usr/bin/env python3
 """sable-msg — inter-agent messaging over tmux send-keys (SABLE-bldh.1).
 
-Scoped to the LEAD<->MANAGER conversation (Lincoln <-> Optimus/Tarzan). Workers
-are never messaged — they are spawned per-bead with their instructions and report
-via the bead pool. The message IS the turn: we type a single line into the
-recipient's claude prompt and submit it. No inbox, no injection hook.
+Scoped to the LEAD<->MANAGER conversation (Lincoln <-> Optimus/Tarzan), plus
+bead-addressed delivery to a specific WORKER pane (SABLE-6izz, via --bead).
+Workers are otherwise never messaged directly — they are spawned per-bead with
+their instructions and report via the bead pool. The message IS the turn: we
+type a single line into the recipient's claude prompt and submit it. No inbox,
+no injection hook.
 
-The recipient pane is found via the role->pane registry, which is just tmux's own
-per-pane user-option `@sable_role` (self-cleaning: dead panes vanish from tmux).
-`sable-tmux` and `sable-spawn-worker` set `@sable_role` when they create panes.
+The recipient pane is found via the role->pane registry, which is just tmux's
+own per-pane user-option `@sable_role` (self-cleaning: dead panes vanish from
+tmux). `sable-tmux` and `sable-spawn-worker` set `@sable_role` when they create
+panes. Workers all share the generic `@sable_role=worker`, so a specific
+worker is instead addressed by its `@sable_bead` tag via --bead (SABLE-6izz):
+`sable-msg <bead-id> "..." --bead`. That lookup is restricted to panes already
+tagged @sable_role=worker — the default role-only lookup used for manager
+names never consults @sable_bead, so a manager send can never accidentally
+land on a worker pane even if some tag is stale.
+
+Delivery is VERIFIED, not assumed (SABLE-bq93): tmux send-keys exiting 0 only
+proves the keystrokes were injected, not that the recipient's TUI actually
+accepted them as a submitted turn — a booting pane or an Escape hitting a
+blocking gate can silently swallow them (the same boot / dropped-Enter race
+documented as SABLE-91m3 and guarded against in sable-spawn-worker). We reuse
+its ready-wait + submit-retry helpers (sable_pane_lib) here: --interrupt sends
+Escape then waits for the pane's input prompt to be ready before typing;
+submission is retried until the framed message is visible in the pane and no
+longer sitting in the input box. Only then do we print `delivered`; on
+genuine failure we print `undelivered` with a durable-fallback hint (file an
+inbox bead) and exit non-zero.
 
 Usage:
-  sable-msg <to-role> "<text>" [--from <role>] [--interrupt]
+  sable-msg <to-role> "<text>" [--from <role>] [--interrupt] [--bead]
     --from <role>   sender label for the framing header (default: $CLAUDE_AGENT_NAME
                     or "operator")
     --interrupt     send Escape first so the message lands NOW instead of queueing
                     behind the recipient's current turn
+    --bead          resolve <to-role> as a bead id against a WORKER pane's
+                    @sable_bead tag (SABLE-6izz) instead of a manager @sable_role
 
 Env:
-  SABLE_TMUX_SOCKET   tmux socket name (-L); for session isolation / tests
-  CLAUDE_AGENT_NAME   default --from value
+  SABLE_TMUX_SOCKET      tmux socket name (-L); for session isolation / tests
+  CLAUDE_AGENT_NAME      default --from value
+  SABLE_MSG_READY_TIMEOUT   seconds to wait for --interrupt's post-Escape ready
+                            state (default 25; sable-spawn-worker uses the same)
+  SABLE_MSG_SUBMIT_TRIES    submit-retry attempts (default 8)
+  SABLE_MSG_POLL_INTERVAL   seconds between retry polls (default 1.0)
 
 Sender-framing protocol: every message is prefixed with a fixed header line
   ⟦SABLE-MSG⟧ from=<from> to=<to> :: <body>
@@ -34,7 +60,17 @@ import os
 import subprocess
 import sys
 
+# Shared pane-readiness/dispatch helpers (SABLE-bldh.14), same module
+# sable-spawn-worker uses. Resolve next to THIS script even via a PATH symlink.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_pane_lib import deliver_text, wait_for_ready  # noqa: E402
+from sable_pane_lib import capture_pane as _capture_pane  # noqa: E402
+
 HEADER = "⟦SABLE-MSG⟧"
+
+DEFAULT_READY_TIMEOUT = 25.0
+DEFAULT_SUBMIT_TRIES = 8
+DEFAULT_POLL_INTERVAL = 1.0
 
 
 def format_message(frm: str, to: str, body: str) -> str:
@@ -64,8 +100,21 @@ def parse_panes(output: str) -> dict[str, str]:
     return mapping
 
 
-def run_tmux(args: list[str]) -> None:
-    subprocess.run(args, check=True)
+def parse_worker_bead_tags(output: str) -> dict[str, str]:
+    """Parse `tmux list-panes -F '#{pane_id} #{@sable_role} #{@sable_bead}'`
+    output into bead -> pane_id, restricted to panes tagged @sable_role=worker
+    (SABLE-6izz). A manager pane's @sable_bead field is never consulted here —
+    bead-addressed lookup is a WORKER-only namespace, so a manager-name lookup
+    (parse_panes, above) can never collide with it even if some tag is stale."""
+    mapping: dict[str, str] = {}
+    for line in output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pane_id, role, bead = parts[0], parts[1].strip(), parts[2].strip()
+        if role == "worker" and bead:
+            mapping.setdefault(bead, pane_id)
+    return mapping
 
 
 def _default_runner(args: list[str]) -> str:
@@ -78,29 +127,56 @@ def lookup_pane(role: str, run=None, socket: str | None = None) -> str | None:
     return parse_panes(out).get(role)
 
 
-def build_sendkeys_commands(pane: str, message: str, interrupt: bool,
-                            socket: str | None = None) -> list[list[str]]:
+def lookup_worker_by_bead(bead_id: str, run=None, socket: str | None = None) -> str | None:
+    run = run or _default_runner
+    out = run(tmux_base(socket) + ["list-panes", "-a", "-F",
+                                    "#{pane_id} #{@sable_role} #{@sable_bead}"])
+    return parse_worker_bead_tags(out).get(bead_id)
+
+
+def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None = None,
+                    run=None, capture=None, sleep=None,
+                    ready_timeout: float = DEFAULT_READY_TIMEOUT,
+                    tries: int = DEFAULT_SUBMIT_TRIES,
+                    interval: float = DEFAULT_POLL_INTERVAL) -> bool:
+    """Deliver `message` to `pane`, VERIFIED (SABLE-bq93). --interrupt sends
+    Escape then waits for the pane's input prompt to be ready (the same boot /
+    blocking-gate race sable-spawn-worker guards against, SABLE-91m3) before
+    typing — typing into a not-yet-ready pane right after Escape is exactly how
+    the interrupt path silently dropped turns. Submission is then retried
+    (deliver_text) until `message` is visible in the pane and no longer sitting
+    in the input box. Returns False (never raises) on genuine non-delivery."""
     base = tmux_base(socket)
-    cmds: list[list[str]] = []
+    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True).returncode == 0)
+    capture = capture or (lambda: _capture_pane(base, pane))
+
     if interrupt:
-        cmds.append(base + ["send-keys", "-t", pane, "Escape"])
-    cmds.append(base + ["send-keys", "-t", pane, "-l", message])  # -l = literal
-    cmds.append(base + ["send-keys", "-t", pane, "Enter"])        # submit the turn
-    return cmds
+        run(base + ["send-keys", "-t", pane, "Escape"])
+        if ready_timeout > 0:
+            wait_for_ready(base, pane, ready_timeout, interval=interval,
+                          capture=capture, sleep=sleep, run=run)
+
+    return deliver_text(base, pane, message, message, tries=tries, interval=interval,
+                        run=run, capture=capture, sleep=sleep)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="sable-msg",
-        description="Message a SABLE agent pane over tmux (lead<->manager).",
+        description="Message a SABLE agent pane over tmux (lead<->manager, or a bead-addressed worker).",
     )
-    p.add_argument("to_role", help="recipient role (e.g. optimus, tarzan, lincoln)")
+    p.add_argument("to_role", help="recipient role (e.g. optimus, tarzan, lincoln), "
+                                   "or a bead id when --bead is passed")
     p.add_argument("body", help="message text (collapsed to a single line)")
     p.add_argument("--from", dest="frm",
                    default=os.environ.get("CLAUDE_AGENT_NAME") or "operator",
                    help="sender label for the framing header")
     p.add_argument("--interrupt", action="store_true",
                    help="send Escape first so the message lands immediately")
+    p.add_argument("--bead", action="store_true",
+                   help="resolve <to_role> as a bead id against a WORKER pane's "
+                        "@sable_bead tag instead of a manager @sable_role "
+                        "(SABLE-6izz: workers share the generic role 'worker')")
     return p.parse_args(argv)
 
 
@@ -108,18 +184,40 @@ def main(argv: list[str] | None = None) -> int:
     ns = parse_args(sys.argv[1:] if argv is None else argv)
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
 
-    pane = lookup_pane(ns.to_role, socket=socket)
-    if pane is None:
+    if ns.bead:
+        pane = lookup_worker_by_bead(ns.to_role, socket=socket)
+        if pane is None:
+            sys.stderr.write(
+                f"sable-msg: no worker pane registered for bead '{ns.to_role}' "
+                f"(no @sable_role=worker pane has @sable_bead={ns.to_role}). "
+                f"Is the worker still running (sable-worker-status)?\n"
+            )
+            return 1
+    else:
+        pane = lookup_pane(ns.to_role, socket=socket)
+        if pane is None:
+            sys.stderr.write(
+                f"sable-msg: no pane registered for role '{ns.to_role}' "
+                f"(no tmux pane has @sable_role={ns.to_role}). "
+                f"Is the SABLE session up (sable-tmux)? To address a worker, pass --bead <bead-id>.\n"
+            )
+            return 1
+
+    message = format_message(ns.frm, ns.to_role, ns.body)
+    ready_timeout = float(os.environ.get("SABLE_MSG_READY_TIMEOUT", DEFAULT_READY_TIMEOUT))
+    submit_tries = int(os.environ.get("SABLE_MSG_SUBMIT_TRIES", DEFAULT_SUBMIT_TRIES))
+    poll_interval = float(os.environ.get("SABLE_MSG_POLL_INTERVAL", DEFAULT_POLL_INTERVAL))
+    landed = deliver_message(pane, message, ns.interrupt, socket=socket,
+                             ready_timeout=ready_timeout, tries=submit_tries,
+                             interval=poll_interval)
+    if not landed:
         sys.stderr.write(
-            f"sable-msg: no pane registered for role '{ns.to_role}' "
-            f"(no tmux pane has @sable_role={ns.to_role}). "
-            f"Is the SABLE session up (sable-tmux)?\n"
+            f"sable-msg: undelivered {ns.frm} -> {ns.to_role} ({pane}); the message did not "
+            f"land as a submitted turn after {submit_tries} attempt(s). Fall back to a durable "
+            f"inbox bead: bd create --title=\"<summary>\" --label=for-{ns.to_role} --type=task\n"
         )
         return 1
 
-    message = format_message(ns.frm, ns.to_role, ns.body)
-    for cmd in build_sendkeys_commands(pane, message, ns.interrupt, socket=socket):
-        run_tmux(cmd)
     sys.stderr.write(f"sable-msg: delivered {ns.frm} -> {ns.to_role} ({pane})\n")
     return 0
 
