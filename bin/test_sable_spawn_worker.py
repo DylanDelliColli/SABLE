@@ -245,6 +245,48 @@ def test_dispatch_landed_false_when_absent():
     assert ssw.dispatch_landed(cap, "SABLE-2cao.1") is False
 
 
+# --- wrapped-composer + control-char box detection (SABLE-1umr / SABLE-zaum) -
+
+def test_dispatch_landed_false_when_wrapped_across_composer_lines():
+    # SABLE-1umr root cause: a framed message longer than the pane width WRAPS;
+    # continuation lines carry no prompt glyph, so a last-glyph-line-only box
+    # check sees just the first segment and false-positives "landed" while the
+    # full message is still sitting unsubmitted in the composer.
+    snippet = ("⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap all lanes at 4 "
+               "workers and hold pushes until chuck drains the merge queue")
+    cap = ("● earlier turn output\n"
+           "❯ ⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap all lanes at 4\n"
+           "workers and hold pushes until chuck drains the merge queue\n"
+           "  ddc@host:~/wt")
+    assert ssw.dispatch_landed(cap, snippet) is False
+
+
+def test_dispatch_landed_true_when_submitted_message_wrapped_midword():
+    # Inverse false NEGATIVE: after a real submit, a transcript wrap that
+    # splits mid-word must still match (whitespace-insensitive comparison),
+    # or a landed message is reported undelivered.
+    snippet = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: enforce workercaps now"
+    cap = ("⟦SABLE-MSG⟧ from=lincoln to=optimus :: enforce workerca\n"
+           "ps now\n"
+           "● thinking…\n"
+           "❯ \n  ddc@host:~/wt")
+    assert ssw.dispatch_landed(cap, snippet) is True
+
+
+def test_dispatch_landed_false_on_control_char_prefixed_box_line():
+    # SABLE-zaum: a leading control byte on the prompt line (e.g. an echoed
+    # Escape) must not make box-detection conclude "no box -> already
+    # submitted" while the text sits unsubmitted.
+    cap = "\x1b❯ Read /x/SABLE-2cao.1.md in full and execute it."
+    assert ssw.dispatch_landed(cap, "SABLE-2cao.1") is False
+
+
+def test_pane_ready_true_with_control_char_prefix():
+    # Same corruption on an EMPTY prompt line must not stall readiness forever.
+    cap = "splash\n\x1b❯ \n  ddc@host:~/wt"
+    assert ssw.pane_ready(cap) is True
+
+
 # --- startup gate clearing (SABLE-91m3 / bldh.12) ---------------------------
 
 BYPASS_WARNING = (

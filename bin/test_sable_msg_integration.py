@@ -77,6 +77,24 @@ def test_message_to_unknown_role_fails(tmux_socket):
     assert "ghost" in (r.stderr + r.stdout)
 
 
+def test_wrapped_message_in_narrow_pane_is_actually_submitted(tmux_socket):
+    # SABLE-1umr: in a narrow pane the framed message wraps across composer
+    # lines; the old box check false-positived "landed" and could return
+    # delivered without the line ever being submitted. $((40+2)) only expands
+    # if the REPL actually EXECUTED the line — the echoed input shows it
+    # unexpanded, so the assertion cannot pass on a stuck composer.
+    _tmux(tmux_socket, "new-session", "-d", "-s", "w", "-x", "60", "-y", "20",
+          "PS1='> ' bash --noprofile --norc")
+    time.sleep(0.5)
+    _tmux(tmux_socket, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
+    body = "; echo WRAP-$((40+2))-VERIFIED end of a long directive body padding"
+    r = _run_msg(tmux_socket, "optimus", body, "--from", "lincoln")
+    assert r.returncode == 0, r.stderr
+    time.sleep(1.0)
+    pane = _capture(tmux_socket, "w")
+    assert "WRAP-42-VERIFIED" in pane
+
+
 def test_message_queues_while_target_busy(tmux_socket):
     _start_pane(tmux_socket)
     # make the pane busy for 3s

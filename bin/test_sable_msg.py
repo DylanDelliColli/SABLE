@@ -131,15 +131,77 @@ def test_main_happy_path_reports_delivered(monkeypatch, capsys):
 def test_main_reports_undelivered_and_exits_nonzero(monkeypatch, capsys):
     # This is the exact SABLE-bq93 false-positive: send-keys "succeeding" must
     # no longer be enough to print `delivered` — verification failing must
-    # surface as a hard, non-zero-exit failure with a durable-fallback hint.
+    # surface as a hard, non-zero-exit failure with a durable-fallback hint
+    # (bd unavailable here, so the manual hint is the fallback's fallback).
     monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None: "%2")
     monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: False)
+    monkeypatch.setattr(sable_msg, "file_fallback_bead", lambda *a, **k: None)
     rc = sable_msg.main(["optimus", "cap in force", "--from", "lincoln", "--interrupt"])
     assert rc != 0
     err = capsys.readouterr().err
     assert "undelivered" in err
     assert "optimus" in err
     assert "for-optimus" in err  # durable inbox-bead fallback hint
+
+
+def test_main_undelivered_auto_files_durable_fallback_bead(monkeypatch, capsys):
+    # SABLE-1umr acceptance: failed verification FILES the durable inbox bead
+    # (not just advice) and reports its id — delivery degrades to the bead
+    # substrate instead of silently degrading to nothing.
+    monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None: "%2")
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: False)
+    calls = []
+    monkeypatch.setattr(sable_msg, "file_fallback_bead",
+                        lambda frm, to, msg, runner=None: calls.append((frm, to, msg)) or "SABLE-fb42")
+    rc = sable_msg.main(["optimus", "cap in force", "--from", "lincoln"])
+    assert rc != 0
+    assert calls and calls[0][0] == "lincoln" and calls[0][1] == "optimus"
+    err = capsys.readouterr().err
+    assert "SABLE-fb42" in err
+
+
+def test_main_undelivered_bead_addressed_does_not_auto_file(monkeypatch, capsys):
+    # Worker lanes are owned by their dispatching manager (who sees the nonzero
+    # exit live); a for-<bead-id> inbox label would be meaningless. No auto-file.
+    monkeypatch.setattr(sable_msg, "lookup_worker_by_bead",
+                        lambda bead, run=None, socket=None: "%9")
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: False)
+    monkeypatch.setattr(sable_msg, "file_fallback_bead",
+                        lambda *a, **k: pytest.fail("must not auto-file for --bead"))
+    rc = sable_msg.main(["market-brief-package-73t4", "hold", "--from", "optimus", "--bead"])
+    assert rc != 0
+
+
+def test_file_fallback_bead_creates_for_role_inbox_bead():
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-ab12\n"
+        stderr = ""
+
+    def runner(args):
+        seen.append(args)
+        return R()
+
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    bead_id = sable_msg.file_fallback_bead("lincoln", "optimus", message, runner=runner)
+    assert bead_id == "SABLE-ab12"
+    argv = seen[0]
+    assert argv[:2] == ["bd", "create"]
+    joined = " ".join(argv)
+    assert "for-optimus" in joined
+    assert message in joined
+
+
+def test_file_fallback_bead_returns_none_when_bd_unavailable():
+    class R:
+        returncode = 1
+        stdout = ""
+        stderr = "bd: not a beads workspace"
+
+    assert sable_msg.file_fallback_bead("lincoln", "optimus", "msg",
+                                        runner=lambda a: R()) is None
 
 
 # --- deliver_message: stub-tmux retry + verification (SABLE-bq93) -----------
@@ -191,6 +253,59 @@ def test_deliver_message_gives_up_when_never_confirmed_landed():
         sleep=lambda s: None, tries=3, interval=0.01,
     )
     assert landed is False
+
+
+# --- wrapped-composer delivery (SABLE-1umr) ---------------------------------
+
+def test_deliver_message_wrapped_composer_requires_a_real_enter():
+    # SABLE-1umr: the wrapped-composer false positive meant deliver_message
+    # could report delivered WITHOUT EVER SENDING ENTER (the first Enter used
+    # to be sent only after a failed landed-check). Stateful fake: the message
+    # sits wrapped in the composer until an Enter arrives, then shows as a
+    # submitted turn.
+    message = ("⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap all lanes at 4 "
+               "workers and hold pushes until chuck drains the merge queue")
+    state = {"entered": False}
+
+    def run(cmd):
+        if cmd[-1] == "Enter":
+            state["entered"] = True
+        return True
+
+    def capture():
+        if state["entered"]:
+            return f"{message}\n● thinking…\n❯ \n  ddc@host:~/wt"
+        return ("❯ ⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap all lanes at 4\n"
+                "workers and hold pushes until chuck drains the merge queue\n"
+                "  ddc@host:~/wt")
+
+    landed = sable_msg.deliver_message(
+        "%2", message, interrupt=False, run=run, capture=capture,
+        sleep=lambda s: None, tries=4, interval=0.01,
+    )
+    assert landed is True
+    assert state["entered"] is True  # delivered must imply a submitted turn
+
+
+def test_deliver_message_sends_enter_immediately_not_only_after_failed_poll():
+    # Submission must not depend on the verifier failing once: the Enter is
+    # part of typing the message, the retry loop only covers dropped Enters.
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: status?"
+    sent = []
+
+    def run(cmd):
+        sent.append(cmd)
+        return True
+
+    landed = sable_msg.deliver_message(
+        "%2", message, interrupt=False, run=run,
+        capture=lambda: f"{message}\n● thinking…\n❯ \n  ddc@host:~/wt",
+        sleep=lambda s: None, tries=3, interval=0.01,
+    )
+    assert landed is True
+    li = next(i for i, c in enumerate(sent) if "-l" in c)
+    assert li + 1 < len(sent), "no keystroke followed the typed text"
+    assert sent[li + 1][-1] == "Enter"
 
 
 # --- bead-addressed worker delivery (SABLE-6izz) ----------------------------

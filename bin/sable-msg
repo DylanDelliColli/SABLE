@@ -27,8 +27,12 @@ its ready-wait + submit-retry helpers (sable_pane_lib) here: --interrupt sends
 Escape then waits for the pane's input prompt to be ready before typing;
 submission is retried until the framed message is visible in the pane and no
 longer sitting in the input box. Only then do we print `delivered`; on
-genuine failure we print `undelivered` with a durable-fallback hint (file an
-inbox bead) and exit non-zero.
+genuine failure we print `undelivered`, AUTO-FILE the durable for-<role>
+inbox bead (SABLE-1umr — delivery degrades to the bead substrate, not to
+nothing; set SABLE_MSG_AUTO_FALLBACK=0 to disable, and bead-addressed worker
+sends never auto-file since the dispatching manager sees the failure live),
+and exit non-zero. If bd itself is unavailable we fall back to printing the
+manual bead-filing hint.
 
 Usage:
   sable-msg <to-role> "<text>" [--from <role>] [--interrupt] [--bead]
@@ -57,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 
@@ -160,6 +165,29 @@ def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None
                         run=run, capture=capture, sleep=sleep)
 
 
+def file_fallback_bead(frm: str, to_role: str, message: str, runner=None) -> str | None:
+    """File the durable for-<role> inbox bead when live delivery could not be
+    verified (SABLE-1umr). Returns the new bead id, or None when bd is
+    unavailable/errored (the caller then prints the manual hint instead).
+    Runs in the sender's cwd, which for manager/lead panes is the repo whose
+    beads db owns the coordination inbox."""
+    runner = runner or (lambda args: subprocess.run(args, capture_output=True, text=True))
+    title = f"SABLE-MSG undelivered to {to_role}: {message[:80]}"
+    desc = (f"Auto-filed by sable-msg after verified-delivery failure (SABLE-1umr). "
+            f"Deliver this message to {to_role} and act on it: {message} "
+            f"[no-test] coordination inbox bead, no code change.")
+    try:
+        r = runner(["bd", "create", f"--title={title}", f"--description={desc}",
+                    "--type=task", "--priority=1", f"--labels=for-{to_role},coord"])
+    except Exception:
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    out = (getattr(r, "stdout", "") or "") + (getattr(r, "stderr", "") or "")
+    m = re.search(r"Created issue:\s*(\S+)", out) or re.search(r"([A-Za-z0-9_-]+-[a-z0-9.]+)", out)
+    return m.group(1) if m else None
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="sable-msg",
@@ -211,11 +239,21 @@ def main(argv: list[str] | None = None) -> int:
                              ready_timeout=ready_timeout, tries=submit_tries,
                              interval=poll_interval)
     if not landed:
-        sys.stderr.write(
-            f"sable-msg: undelivered {ns.frm} -> {ns.to_role} ({pane}); the message did not "
-            f"land as a submitted turn after {submit_tries} attempt(s). Fall back to a durable "
-            f"inbox bead: bd create --title=\"<summary>\" --label=for-{ns.to_role} --type=task\n"
-        )
+        bead_id = None
+        if not ns.bead and os.environ.get("SABLE_MSG_AUTO_FALLBACK", "1") != "0":
+            bead_id = file_fallback_bead(ns.frm, ns.to_role, message)
+        if bead_id:
+            sys.stderr.write(
+                f"sable-msg: undelivered {ns.frm} -> {ns.to_role} ({pane}); the message did not "
+                f"land as a submitted turn after {submit_tries} attempt(s). Filed durable inbox "
+                f"bead {bead_id} (label for-{ns.to_role}) so it survives.\n"
+            )
+        else:
+            sys.stderr.write(
+                f"sable-msg: undelivered {ns.frm} -> {ns.to_role} ({pane}); the message did not "
+                f"land as a submitted turn after {submit_tries} attempt(s). Fall back to a durable "
+                f"inbox bead: bd create --title=\"<summary>\" --label=for-{ns.to_role} --type=task\n"
+            )
         return 1
 
     sys.stderr.write(f"sable-msg: delivered {ns.frm} -> {ns.to_role} ({pane})\n")

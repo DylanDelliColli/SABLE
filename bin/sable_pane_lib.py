@@ -10,8 +10,27 @@ Both importers are symlinks on PATH, so they resolve this module via
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import time
+
+# Non-printable control bytes (except \t\n which are whitespace-handled). A
+# stray echoed Escape on the prompt line must not defeat glyph detection
+# (SABLE-zaum).
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _clean(line: str) -> str:
+    """A pane line with control bytes stripped and whitespace trimmed."""
+    return _CTRL_RE.sub("", line).strip()
+
+
+def _canon(text: str) -> str:
+    """Canonical form for presence checks: control bytes stripped, ALL
+    whitespace removed. Pane wraps can split a message MID-WORD (capture-pane
+    without -J emits the segments as separate lines), so any comparison that
+    preserves spaces mismatches across a wrap boundary (SABLE-1umr)."""
+    return "".join(_CTRL_RE.sub("", text).split())
 
 
 def pane_ready(capture: str) -> bool:
@@ -19,8 +38,7 @@ def pane_ready(capture: str) -> bool:
     line (just the prompt glyph). While booting (splash) or on a blocking gate
     screen there is no such empty line."""
     for line in reversed(capture.splitlines()):
-        s = line.strip()
-        if s in ("❯", ">"):
+        if _clean(line) in ("❯", ">"):
             return True
     return False
 
@@ -40,22 +58,31 @@ def accept_startup_gate(capture: str) -> str | None:
 
 def dispatch_landed(capture: str, snippet: str) -> bool:
     """True once the instruction has been SUBMITTED: the snippet appears in the
-    pane but no longer sits in the (last) input-box prompt line. If it is still in
-    the input box, the Enter was dropped and must be resent."""
-    if snippet not in " ".join(capture.split()):
+    pane but no longer sits in the input box. The box is the LAST prompt-glyph
+    line plus every line after it — the composer sits at the bottom of the
+    pane, and a message wider than the pane WRAPS onto glyph-less continuation
+    lines (SABLE-1umr: judging only the glyph line itself false-positived
+    "landed" for any wrapped message, so no Enter was ever resent and the text
+    sat unsubmitted while the sender reported delivered). All comparisons are
+    control-char/whitespace-insensitive (_canon): wraps may split mid-word, and
+    a stray control byte must not hide the box entirely (SABLE-zaum)."""
+    want = _canon(snippet)
+    if not want or want not in _canon(capture):
         return False
-    box = None
-    for line in capture.splitlines():
-        s = line.strip()
-        if s.startswith("❯") or s.startswith(">"):
-            box = s
-    if box is None:
+    lines = capture.splitlines()
+    box_start = None
+    for i, line in enumerate(lines):
+        if _clean(line).startswith(("❯", ">")):
+            box_start = i
+    if box_start is None:
         return True
-    return snippet not in box
+    return want not in _canon("\n".join(lines[box_start:]))
 
 
 def capture_pane(base: list[str], pane: str) -> str:
-    return subprocess.run(base + ["capture-pane", "-p", "-t", pane],
+    # -J joins wrapped lines, so a message wider than the pane comes back as
+    # the one line it really is — box detection then sees the whole composer.
+    return subprocess.run(base + ["capture-pane", "-p", "-J", "-t", pane],
                           capture_output=True, text=True).stdout
 
 
@@ -84,13 +111,17 @@ def wait_for_ready(base, pane, timeout, interval=0.5, capture=None, sleep=None,
 
 def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
                  run=None, capture=None, sleep=None) -> bool:
-    """Type `text` into the pane, then submit — resending Enter until the text
-    leaves the input box (the dropped-Enter race). A resent Enter on an already-
-    empty box is a harmless no-op. Returns False (clean) if the pane vanishes."""
+    """Type `text` into the pane and submit it — Enter is sent IMMEDIATELY after
+    the text (submission must not depend on the landed-check failing first,
+    SABLE-1umr), then resent until the text leaves the input box (the
+    dropped-Enter race). A resent Enter on an already-empty box is a harmless
+    no-op. Returns False (clean) if the pane vanishes."""
     run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True).returncode == 0)
     capture = capture or (lambda: capture_pane(base, pane))
     sleep = sleep or time.sleep
     if run(base + ["send-keys", "-t", pane, "-l", text]) is False:
+        return False
+    if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
         return False
     for _ in range(max(1, tries)):
         sleep(interval)
