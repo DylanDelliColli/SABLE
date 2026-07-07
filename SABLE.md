@@ -182,6 +182,12 @@ Required sections by type:
 **Tasks and features** must include:
 - `## Acceptance Criteria` — How to verify completion
 
+**Privilege-gated steps must name their actor.** A gated command written into a
+description or acceptance section without an owner (`supabase db push`,
+`vercel env`, prod deploys) reads as the agent's own todo — a worker will run
+it. Name the actor explicitly: "OPERATOR runs: `supabase db push`". A command
+with no named owner is an instruction to whoever reads it.
+
 Use separate fields for separate concerns:
 ```bash
 bd update <id> --description "What's wrong and where"
@@ -190,7 +196,7 @@ bd update <id> --design "Architectural approach decided on"
 bd update <id> --acceptance "How to verify it's done"
 ```
 
-**Warning:** `bd update --notes` **overwrites** the field — it does not append. Fetch the existing notes (`bd show <id>`) and include them in the new value, or you clobber the audit trail.
+**Warning:** `bd update --notes` **overwrites** the field — it does not append. Fetch the existing notes (`bd show <id>`) and include them in the new value, or you clobber the audit trail. And after delegating a field edit to another agent, treat that field as claimed — don't write it yourself until the producer reports back or is stood down, or the two writes clobber each other.
 
 #### Anchors and the verify command
 
@@ -415,6 +421,8 @@ The bd CLI has a handful of surprising behaviors that have cost real agent cycle
 | **"Test" in a title trips the test-data heuristic** | Filing a legitimate bug *about* tests (e.g. "test-isolation UniqueViolation") triggers "appears to be test data / creating test issue in production" | Rephrase the title to describe the symptom ("fixture-isolation …"), or proceed past the warning — it's a false positive on real test-infra beads |
 | **Probing a gitignored `.env` trips the read-guard** | `ls .env` is blocked as a sensitive-file access even when you only need existence, not contents | `test -f .env && echo present` checks existence without tripping the guard |
 | **No native "symptom-of" edge** | A bead filed on-sight often turns out to be a downstream symptom of another (cascade); nothing links them, so triage is manual | At file time, note "suspected symptom of `<bead>`" in the description and add a `bd dep` relation, so closing the root surfaces the symptom for re-validation |
+| **`bd search` matches open beads only and ignores labels** | Closed beads and label-only matches (e.g. `for-chuck`) are invisible during recovery sweeps — forces show-by-guessed-ID | `bd list --status=closed`, `bd list -l <label>`, or `bd show <id>` directly; never trust an empty `bd search` during triage |
+| **bd CLI upgrade can leave a half-applied Dolt schema migration** | First `bd create` after the upgrade fails with "pending schema migrations alter pre-existing dirty tables" | Commit the dirty working set via the running dolt server (`DOLT_COMMIT`), then retry — the migration completes cleanly on a committed working set |
 
 ---
 
@@ -505,9 +513,10 @@ The reasoning: agents are excellent at writing unit tests that pass while still 
 **Concrete rules:**
 
 1. **Every bead description must specify both a unit test file/assertion AND an integration test file/assertion.** If only one is specified, the bead fails the Fresh Agent Test — the next worker won't know whether integration coverage was waived deliberately or forgotten.
-2. **If a change cannot be integration-tested, the bead must explicitly say why** in the description (e.g. "no integration test — pure type-level refactor with no runtime effect"). This is treated like the `[no-test]` escape hatch: an explicit, audited opt-out, not a default.
+2. **If a change cannot be integration-tested, the bead must explicitly say why** in the description (e.g. "no integration test — pure type-level refactor with no runtime effect"). This is treated like the `[no-test]` escape hatch: an explicit, audited opt-out, not a default. The same applies for genuinely trivial static changes (e.g. a hardcoded external link) in repos with no test runner for that surface: state the waiver and reason in the bead rather than standing up infrastructure the change can't exercise.
 3. **Mocking the database in integration tests defeats the purpose.** Use a real local database (Docker, sqlite, ephemeral postgres). Mocks belong in unit tests; integration tests must hit real systems or they are unit tests with a misleading label.
 4. **Smoke tests are encouraged for any service with a startup path** (web server, CLI, worker). They catch the entire class of bugs where "the code is correct but the service won't boot." But they are not blocked by the gate hook — missing smoke tests are a code review issue, not a close-time block.
+5. **When a feature depends on data populated by a sync script or external process, acceptance criteria must include a deployed-surface smoke check.** Seeded integration tests pass by construction — they assert on rows they inserted — while the deployed feature silently no-ops on tables the sync never populated. The check names the live surface and the expectation ("the deployed briefing page renders non-empty rows from `<table>`").
 
 **Updated bead-description template:**
 
@@ -1040,6 +1049,14 @@ What to ALWAYS include:
 - Any **known acceptable failures** the worker shouldn't re-litigate
   (named bead IDs + status). Workers reliably refile duplicate beads for
   in-flight issues unless the dispatch explicitly names them.
+- **For worktree-scoped work: prefix every git command with
+  `-C <absolute-worktree-path>` on every single invocation.** A `cd` in one
+  bash call does not persist to the next — a later bare `git add`/`git commit`
+  silently operates on the main checkout's currently-checked-out branch.
+- **Any hold/gate instruction must name WHO clears it** ("do not implement
+  until OPTIMUS confirms" — not "until the gate condition is met"). A
+  well-reasoned worker whose own analysis satisfies the gate's condition will
+  otherwise treat condition-met as clearance and proceed.
 
 The prompt should answer three questions: **Which beads? What files? What commands?**
 
@@ -1086,6 +1103,8 @@ bd worktree remove <name>  # Remove (with safety checks)
 - Adds the worktree path to `.gitignore` if inside the repo root
 
 **The pattern for swarms:** before dispatching N parallel workers, the orchestrator creates N worktrees (one per worker), and each worker's dispatch prompt specifies its worktree path. Workers can edit overlapping areas without stepping on each other; the orchestrator merges their branches sequentially after they close.
+
+**Publish the integration branch before dispatching against it.** When the integration base exists only locally, workers' session-close habits (`git pull --rebase`) silently re-parent their branches onto the remote default branch — replaying the whole local-only stack as fresh SHAs and dragging in out-of-scope commits. Push the integration branch to origin first so workers rebase against it, not the default branch.
 
 **Anti-pattern:** dispatching multiple workers into the same working tree because "they're touching different files." This breaks the moment one worker imports from a file another is editing, when shared config changes, or when test runners cache state. Use a worktree per worker; the cost is one bash call.
 
@@ -1354,6 +1373,8 @@ These are battle-tested lessons from real swarm development.
 | Dispatching without test spec | Agent writes code but not tests, gets blocked by gate | Include test file path and assertions in every dispatch prompt (hook 5 enforces this) |
 | Dispatching agents without TDD instructions | Agent writes code-first, TDD gate catches too late | Hook 5 (agent-tdd-enforce) injects TDD reminder at dispatch time |
 | Creating beads without file paths or test specs | Agent wastes cycle re-exploring codebase | Hook 6 (bead-description-gate) nudges at creation time |
+| Citing bare bead IDs in reports | An ID alone is meaningless to the operator and forces a manual lookup | Cite as `<id> ("short title")` in every status, what's-next, or arbitration report |
+| Trusting whole-suite lint exit codes when the suite is already red | Linters exit on the first file's errors — pre-existing failures mask new errors introduced by the very PR under review | Workers lint scoped to their changed files; the merge queue signature-matches the FULL lint output, not exit codes or first error |
 
 ### 9.2 Recovery Patterns
 
