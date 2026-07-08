@@ -35,6 +35,26 @@ else — read-only, beads-are-the-only-output, self-review + addressing passes �
 is unchanged. **Fallback:** if no Sherlock session is spun up, the orchestrator runs
 `/deep-research` itself for this substage.
 
+**Dossier deliverable (`research.json`).** When the spawn prompt supplies a
+planning state dir and epic id (a `/sable-plan` run), additionally write
+`research.json` to that dir — the RESEARCH gate renders it into the signoff
+dossier (schema is canonical in `bin/sable_dossier_lib.py`'s docstring):
+
+```json
+{
+  "findings": [
+    { "title": "<one-line>", "kind": "prior_art | pitfall | unknown",
+      "summary": "<2-3 sentences>", "sources": ["<url>"],
+      "derisk_status": "open | resolved" }
+  ],
+  "recommendation": "<one-paragraph direction for ARCHITECTURE>"
+}
+```
+
+The finding beads are unchanged and remain the primary output — the JSON is a
+gate-presentation extra, one entry per finding bead. Standalone runs (no state
+dir in the spawn prompt) skip the file entirely.
+
 ## Scope
 
 Findings you should produce:

@@ -442,6 +442,29 @@ The execution agent (Tarzan / Optimus / the user dispatching workers
 manually) sees this when reviewing the epic before dispatch — gives them
 the full architecture picture without re-deriving it.
 
+**Dossier deliverable (`architecture.json`).** You run inline in the
+orchestrator's conversation, so check the path directly: if
+`<repo>/.claude/sable/state/planning/<epic-id>/` exists (a `/sable-plan` run),
+also write `architecture.json` there — the ARCHITECTURE gate renders it into
+the signoff dossier (schema is canonical in `bin/sable_dossier_lib.py`'s
+docstring):
+
+```json
+{
+  "decisions": [
+    { "title": "<decision>", "contract": "<signature/invariant>",
+      "rationale": "<one-line reason>",
+      "alternatives_rejected": ["<alternative>"] }
+  ],
+  "smell_risks": ["<named smell risk>"],
+  "deferred": [{"finding": "<one-line>", "why": "<user's rationale>"}],
+  "status": "ready | needs-follow-up"
+}
+```
+
+One `decisions` entry per locked tradeoff/contract from the summary above.
+Standalone `/gaudi` runs (no planning state dir) skip the file silently.
+
 ### Epic-mode exit criteria
 
 You exit when ALL of:

@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""sable-dossier — render the planning dossier for a /sable-plan run (SABLE-lykc.1).
+
+Thin CLI over sable_dossier_lib (schemas + rendering documented there; logic in
+the importable lib, shared with pytest; resolved via realpath so PATH symlinks
+work). Assembles whatever substage deliverables exist under
+<repo>/.claude/sable/state/planning/<epic-id>/ into one self-contained HTML
+page and prints its path — Lincoln publishes that file via the Artifact tool at
+each gate before asking for signoff.
+
+Usage:
+  sable-dossier <epic-id> [--state-dir DIR] [--out PATH] [--highlight SUBSTAGE]
+
+--highlight marks the section awaiting signoff (one of: framing, research,
+architecture, test-strategy, decomposition). Missing deliverables render as
+"not yet produced"; malformed ones as a per-section error box.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import sable_dossier_lib as lib  # noqa: E402
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="sable-dossier")
+    ap.add_argument("epic_id")
+    ap.add_argument("--state-dir", dest="state_dir")
+    ap.add_argument("--out")
+    ap.add_argument("--highlight", choices=lib.SUBSTAGES)
+    args = ap.parse_args(argv)
+
+    out = lib.write_dossier(
+        args.epic_id,
+        state_dir=args.state_dir,
+        out=args.out,
+        highlight=args.highlight,
+    )
+    print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

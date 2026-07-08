@@ -184,6 +184,43 @@ startup-mode design doc with engineering sections stripped:
 
 ---
 
+## The planning dossier (Full-tier gate deliverable, 2026-07-08)
+
+**Why.** A substage gate is only as good as what the human reviews at it. The
+old signoff was a scrollback of per-finding prompts plus a text summary buried
+in epic notes — origin `sable-note` 2026-07-08: the TEST-STRATEGY gate should
+present a visual story×test matrix, and every gate should offer a consolidated,
+reviewable deliverable rather than a text-only approval.
+
+**Convention.** Each Full-tier substage producer drops a JSON deliverable into
+the per-repo planning state dir
+`<repo>/.claude/sable/state/planning/<epic-id>/` (git-common-dir resolution,
+same as the mode-state file; gitignored):
+
+| File | Producer | Gate |
+|---|---|---|
+| `framing.json` | Lincoln (or charter ingest) | FRAMING |
+| `research.json` | sherlock | RESEARCH |
+| `architecture.json` | gaudi | ARCHITECTURE |
+| `test-strategy.json` | columbo — the story×test matrix | TEST-STRATEGY |
+| `decomposition.json` | Lincoln + victor + `bd swarm validate` | DECOMPOSITION |
+
+`bin/sable-dossier <epic-id> --highlight <substage>` assembles whatever exists
+into one self-contained HTML page (missing substages render as "not yet
+produced"; malformed JSON degrades to a per-section error box). The canonical
+schemas live in the `bin/sable_dossier_lib.py` docstring — producers reference
+them there rather than duplicating them in role files.
+
+**Publishing.** At every gate, Lincoln publishes the dossier with the Artifact
+tool using the same file path for the whole run — one stable URL that grows
+section-by-section, the pending section marked *awaiting signoff* — then asks
+for approval and only then advances the substage. The framing stories' ids
+(`S1..Sn`) are the traceability spine: columbo traces every test case back to
+one, and beads that trace to none surface as `unmapped_beads`.
+
+Quick tier is out of scope for now (SABLE-lykc.7 tracks syncing the standalone
+columbo skill variant).
+
 ## OPEN — remaining build-design seams
 
 Discovery's design is locked; these are the cross-mode build details to settle

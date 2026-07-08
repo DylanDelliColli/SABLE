@@ -18,6 +18,7 @@ allowed-tools:
   - AskUserQuestion
   - Agent
   - Skill
+  - Artifact
 ---
 
 # /sable-plan — enter PLANNING mode (self-sizing, human-in-the-loop)
@@ -103,6 +104,28 @@ producers attach their review to.
 Check position with `sable-mode substage get`. Advance ONLY after the human signs
 off on the current deliverable: `sable-mode substage advance`.
 
+### Gate protocol — the planning dossier (every substage)
+
+Each substage's producer drops a JSON deliverable into the per-repo planning
+state dir `<repo>/.claude/sable/state/planning/<epic-id>/` (same git-common-dir
+resolution as the mode-state file; gitignored): `framing.json` (you),
+`research.json` (sherlock), `architecture.json` (gaudi), `test-strategy.json`
+(columbo — the story×test matrix), `decomposition.json` (you + victor).
+Canonical schemas live in the `bin/sable_dossier_lib.py` docstring.
+
+**Before requesting signoff at ANY gate:**
+
+1. `sable-dossier <epic-id> --highlight <substage>` — assembles every
+   deliverable produced so far into one self-contained HTML page and prints
+   its path. Missing substages render as "not yet produced"; the highlighted
+   section is marked *awaiting signoff*.
+2. Publish that file with the **Artifact tool** — use the SAME file path at
+   every gate of the run (the dossier redeploys to one stable URL that grows
+   section-by-section; keep the favicon constant across gates).
+3. Give the user the URL, then ask for signoff via `AskUserQuestion`.
+4. On approval: `sable-mode substage advance`. Never advance on a text-only
+   summary — the dossier IS the signoff deliverable.
+
 ### FRAMING — owner: you, strategist hat (live with the user)
 Most human-intensive, not parallelizable. Run it as a conversation via
 `/office-hours` or `/plan-ceo-review`. Produce: user stories, non-goals, success
@@ -110,11 +133,16 @@ metric, the narrowest valuable wedge. Stand up the bare epic shell and record th
 framing artifact on it. (This is the strategist identity expressed in planning —
 same essence that does status/arbitration in execution.)
 
+**Deliverable:** write `framing.json` to the planning state dir — stories with
+stable ids (`S1..Sn`, later substages trace back to these), `non_goals`,
+`success_metric`, `wedge` — then run the gate protocol.
+
 **Charter ingestion (Discovery composition).** Before generating framing cold,
 check whether this epic came from a Discovery charter: run
 `sable-charter ingest <epic-id>`. If it returns framing fields (a charter whose
 `epic_intention` matches this epic exists), FRAMING is already done — record those
-fields as the framing artifact on the epic and skip straight ahead with
+fields as the framing artifact on the epic, map them into `framing.json` in the
+planning state dir (same schema as the cold path), and skip straight ahead with
 `sable-mode substage set research`. Only generate framing as above when ingest
 returns nothing (exits nonzero). See PLANNING-MODES-DESIGN.md for the
 Discovery→Full seam.
@@ -127,15 +155,28 @@ background so the conversation stays free while they work; you are notified on
 completion. The interlock allows producer subagents in planning mode. Surface
 findings to the user.
 
+**Deliverable:** include the planning state dir + epic id in the spawn prompt
+and instruct sherlock to write `research.json` there alongside its usual
+output; then run the gate protocol.
+
 ### ARCHITECTURE — owner: the /gaudi skill, run inline (`/gaudi --epic <id>`)
 Lock interface contracts, system-design tradeoffs, smell risks. Gaudi is a
 SKILL, not a subagent — it runs in your own conversation. It appends the locked
 decisions to the epic's notes.
 
+**Deliverable:** gaudi's epic mode also writes `architecture.json` to the
+planning state dir (it detects the dir itself); then run the gate protocol.
+
 ### TEST-STRATEGY — owner: columbo subagent (`--epic` in the spawn prompt)
 Lock the test contract: boundary cases, failure modes, the unit+integration
 matrix per story. Spawn the **columbo** named subagent; it appends the locked
 test architecture to the epic.
+
+**Deliverable:** include the planning state dir in the spawn prompt and
+instruct columbo to read `framing.json` (story ids — the traceability spine)
+and write `test-strategy.json`: the story×test matrix with per-case layer tags
+and gap flags. This section is the centerpiece of the dossier the user reviews
+at this gate; then run the gate protocol.
 
 ### DECOMPOSITION — owner: you + a victor subagent
 The interlock now unblocks backlog population. Author the implementation children
@@ -144,6 +185,10 @@ Agent Test (file paths, unit+integration test spec, fingerprint + verify
 command). Spawn **victor** for a freshness pass, then run the post-batch-create
 verification: `bd dep tree <epic-id>` (edges match intent), `bd ready` (children
 that should be blocked are NOT ready), and `bd swarm validate <epic-id>`.
+
+**Deliverable:** write `decomposition.json` to the planning state dir — the
+children (id/title/type/deps/ready-state), the `bd swarm validate` verdict, and
+victor's summary line — then run the gate protocol for the final signoff.
 
 ## Open-questions ledger
 
