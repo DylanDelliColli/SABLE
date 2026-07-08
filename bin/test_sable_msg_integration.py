@@ -46,10 +46,12 @@ def _start_pane(sock):
 
 
 def _run_msg(sock, *cli_args):
+    # SABLE_TMUX_SESSION pinned: these single-fleet cases use the operator
+    # override; per-repo resolution is covered by the two-fleet tests below.
     return subprocess.run(
         ["python3", str(BIN), *cli_args],
         capture_output=True, text=True,
-        env={**_env(), "SABLE_TMUX_SOCKET": sock},
+        env={**_env(), "SABLE_TMUX_SOCKET": sock, "SABLE_TMUX_SESSION": "w"},
     )
 
 
@@ -110,6 +112,56 @@ def test_message_queues_while_target_busy(tmux_socket):
     assert "QUEUED-RAN" in pane
     # ordering: the queued echo ran only after the busy block finished
     assert pane.index("BUSY-END") < pane.rindex("QUEUED-RAN")
+
+
+# --- per-repo scoping (SABLE-e1e3.3): a fleet is addressed only by its repo ---
+
+def _make_fleet(sock, tmp_path, name, role="tarzan"):
+    """A repo + its derived-session fleet: one bash REPL pane tagged with the
+    role, the session stamped @sable_repo — exactly what sable-tmux creates."""
+    repo = tmp_path / name
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    root = str(repo.resolve())
+    sess = f"sable-{name}"
+    _tmux(sock, "new-session", "-d", "-s", sess, "-x", "200", "-y", "50",
+          "PS1='> ' bash --noprofile --norc")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-t", sess, "@sable_repo", root)
+    _tmux(sock, "set-option", "-p", "-t", sess, "@sable_role", role)
+    _tmux(sock, "set-option", "-p", "-t", sess, "@sable_repo", root)
+    return repo, sess
+
+
+def _run_msg_from(sock, repo, *cli_args):
+    env = {**_env(), "SABLE_TMUX_SOCKET": sock}
+    env.pop("SABLE_TMUX_SESSION", None)  # per-repo resolution path
+    return subprocess.run(["python3", str(BIN), *cli_args],
+                          capture_output=True, text=True, env=env, cwd=repo)
+
+
+def test_two_fleets_role_delivery_is_repo_scoped(tmux_socket, tmp_path):
+    alpha, sess_a = _make_fleet(tmux_socket, tmp_path, "alpha")
+    beta, sess_b = _make_fleet(tmux_socket, tmp_path, "beta")
+    r = _run_msg_from(tmux_socket, alpha, "tarzan",
+                      "echo ALPHA-ONLY", "--from", "lincoln")
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.8)
+    assert "ALPHA-ONLY" in _capture(tmux_socket, sess_a)
+    assert "ALPHA-ONLY" not in _capture(tmux_socket, sess_b)
+
+
+def test_own_fleet_down_never_falls_through_to_another_repo(tmux_socket, tmp_path):
+    # only beta's fleet is up; a send from alpha must FAIL, not cross over
+    _make_fleet(tmux_socket, tmp_path, "beta")
+    alpha = tmp_path / "alpha"
+    alpha.mkdir()
+    subprocess.run(["git", "init", "-q", str(alpha)], check=True)
+    r = _run_msg_from(tmux_socket, alpha, "tarzan", "echo LEAKED", "--from", "lincoln")
+    assert r.returncode != 0
+    assert "sable-alpha" in (r.stderr + r.stdout)
+    time.sleep(0.5)
+    assert "LEAKED" not in _capture(tmux_socket, "sable-beta")
 
 
 if __name__ == "__main__":

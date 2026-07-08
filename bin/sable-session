@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""sable-session — print this repo's tmux session name (SABLE-e1e3.1).
+
+Thin CLI over sable_pane_lib.resolve_session (logic + precedence documented
+there; resolved via realpath so PATH symlinks work). Used by the bash tools
+(sable-launch) and handy for operators:
+
+  tmux attach -t "$(sable-session)"
+
+Usage:
+  sable-session [--base DIR]
+
+Env: SABLE_TMUX_SESSION (explicit override, returned verbatim),
+     SABLE_TMUX_SOCKET (tmux -L). Exits 4 on a session-name collision
+(the derived name is held by a different repo's fleet).
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_pane_lib import SessionCollision, resolve_session  # noqa: E402
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="sable-session")
+    ap.add_argument("--base", help="resolve as if run from this directory")
+    args = ap.parse_args(argv)
+    try:
+        print(resolve_session(socket=os.environ.get("SABLE_TMUX_SOCKET"),
+                              base=args.base))
+    except SessionCollision as e:
+        sys.stderr.write(f"sable-session: {e}\n")
+        return 4
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -9,6 +9,7 @@ in the pane, not just assumed from a zero exit code), and SABLE-6izz
 manager-name lookups never fall through to a worker pane's bead tag).
 """
 import importlib.util
+import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -63,11 +64,43 @@ def test_parse_panes_first_wins_on_duplicate_role():
     assert sable_msg.parse_panes(out)["optimus"] == "%1"
 
 
+@pytest.fixture(autouse=True)
+def _pin_session(monkeypatch):
+    """Keep every test hermetic: main() resolves the target session per-repo
+    (SABLE-e1e3.3), which would consult the real tmux server — the env
+    override short-circuits that."""
+    monkeypatch.setenv("SABLE_TMUX_SESSION", "s")
+
+
 def test_lookup_pane_found_and_missing():
     fake_out = "%1 lincoln\n%2 optimus\n"
     runner = lambda args: fake_out
     assert sable_msg.lookup_pane("optimus", runner) == "%2"
     assert sable_msg.lookup_pane("ghost", runner) is None
+
+
+def test_lookup_pane_scopes_to_session_when_given():
+    seen = []
+    runner = lambda args: seen.append(args) or "%1 optimus\n"
+    assert sable_msg.lookup_pane("optimus", runner, session="sable-alpha") == "%1"
+    cmd = seen[0]
+    assert ["-s", "-t", "sable-alpha"] == cmd[cmd.index("-s"):cmd.index("-s") + 3]
+    assert "-a" not in cmd
+
+
+def test_lookup_worker_by_bead_scopes_to_session_when_given():
+    seen = []
+    runner = lambda args: seen.append(args) or "%7 worker SABLE-x1\n"
+    assert sable_msg.lookup_worker_by_bead("SABLE-x1", runner,
+                                           session="sable-alpha") == "%7"
+    cmd = seen[0]
+    assert "-a" not in cmd and "sable-alpha" in cmd
+
+
+def test_lookup_pane_missing_session_returns_none():
+    def runner(args):
+        raise subprocess.CalledProcessError(1, args)
+    assert sable_msg.lookup_pane("optimus", runner, session="sable-gone") is None
 
 
 # --- tmux base / socket isolation -------------------------------------------
@@ -109,7 +142,7 @@ def test_parse_args_bead_flag():
 # --- main: missing role is a hard error -------------------------------------
 
 def test_main_missing_role_errors(monkeypatch, capsys):
-    monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None: None)
+    monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None, session=None: None)
     rc = sable_msg.main(["ghost", "hello", "--from", "lincoln"])
     assert rc != 0
     err = capsys.readouterr().err
@@ -119,7 +152,7 @@ def test_main_missing_role_errors(monkeypatch, capsys):
 # --- main: delivery is verified, not assumed (SABLE-bq93) -------------------
 
 def test_main_happy_path_reports_delivered(monkeypatch, capsys):
-    monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None: "%2")
+    monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None, session=None: "%2")
     monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
     rc = sable_msg.main(["optimus", "ship it", "--from", "lincoln"])
     assert rc == 0
@@ -133,7 +166,7 @@ def test_main_reports_undelivered_and_exits_nonzero(monkeypatch, capsys):
     # no longer be enough to print `delivered` — verification failing must
     # surface as a hard, non-zero-exit failure with a durable-fallback hint
     # (bd unavailable here, so the manual hint is the fallback's fallback).
-    monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None: "%2")
+    monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None, session=None: "%2")
     monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: False)
     monkeypatch.setattr(sable_msg, "file_fallback_bead", lambda *a, **k: None)
     rc = sable_msg.main(["optimus", "cap in force", "--from", "lincoln", "--interrupt"])
@@ -148,7 +181,7 @@ def test_main_undelivered_auto_files_durable_fallback_bead(monkeypatch, capsys):
     # SABLE-1umr acceptance: failed verification FILES the durable inbox bead
     # (not just advice) and reports its id — delivery degrades to the bead
     # substrate instead of silently degrading to nothing.
-    monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None: "%2")
+    monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None, session=None: "%2")
     monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: False)
     calls = []
     monkeypatch.setattr(sable_msg, "file_fallback_bead",
@@ -164,7 +197,7 @@ def test_main_undelivered_bead_addressed_does_not_auto_file(monkeypatch, capsys)
     # Worker lanes are owned by their dispatching manager (who sees the nonzero
     # exit live); a for-<bead-id> inbox label would be meaningless. No auto-file.
     monkeypatch.setattr(sable_msg, "lookup_worker_by_bead",
-                        lambda bead, run=None, socket=None: "%9")
+                        lambda bead, run=None, socket=None, session=None: "%9")
     monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: False)
     monkeypatch.setattr(sable_msg, "file_fallback_bead",
                         lambda *a, **k: pytest.fail("must not auto-file for --bead"))
@@ -349,7 +382,7 @@ def test_manager_name_lookup_never_resolves_via_worker_bead_tag_even_when_stale(
 
 def test_main_bead_addressed_delivery(monkeypatch, capsys):
     monkeypatch.setattr(sable_msg, "lookup_worker_by_bead",
-                        lambda bead, run=None, socket=None: "%9")
+                        lambda bead, run=None, socket=None, session=None: "%9")
     monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
     rc = sable_msg.main(["market-brief-package-73t4", "hold the tree claim",
                         "--from", "optimus", "--bead"])
@@ -360,7 +393,7 @@ def test_main_bead_addressed_delivery(monkeypatch, capsys):
 
 def test_main_bead_addressed_unknown_bead_errors_cleanly(monkeypatch, capsys):
     monkeypatch.setattr(sable_msg, "lookup_worker_by_bead",
-                        lambda bead, run=None, socket=None: None)
+                        lambda bead, run=None, socket=None, session=None: None)
     rc = sable_msg.main(["ghost-bead", "hello", "--from", "optimus", "--bead"])
     assert rc != 0
     err = capsys.readouterr().err

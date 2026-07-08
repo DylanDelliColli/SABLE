@@ -46,7 +46,8 @@ from pathlib import Path
 # THIS script even when invoked via a PATH symlink.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    accept_startup_gate, dispatch_landed, pane_ready, wait_for_ready,
+    SessionCollision, accept_startup_gate, dispatch_landed, pane_ready,
+    repo_root, resolve_session, wait_for_ready,
 )
 from sable_pane_lib import capture_pane as _capture_pane  # noqa: E402
 from sable_pane_lib import deliver_text as deliver_dispatch  # noqa: E402
@@ -225,12 +226,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--scope", help="short name for the worktree (else derived from bead)")
     p.add_argument("--lane", help="lane manager identity stamped on the worker "
                                   "(default: $CLAUDE_AGENT_NAME of the invoking pane)")
-    p.add_argument("--session", default=os.environ.get("SABLE_TMUX_SESSION") or DEFAULT_SESSION)
+    p.add_argument("--session", help="target session (default: SABLE_TMUX_SESSION, "
+                                     "else derived per-repo — see sable-session)")
     p.add_argument("--skip-governance", action="store_true")
     ns = p.parse_args(sys.argv[1:] if argv is None else argv)
 
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
     base = tmux_base(socket)
+    if not ns.session:
+        try:
+            ns.session = resolve_session(socket=socket)
+        except SessionCollision as e:
+            sys.stderr.write(f"sable-spawn-worker: {e}\n")
+            return 4
     bid = ns.bead_id
 
     # --- fetch bead for the prompt + label-based model resolution ---
@@ -277,8 +285,12 @@ def main(argv: list[str] | None = None) -> int:
                                           worker_env_args(lane), wcmd)).strip()
 
     # --- tag the pane for the registry + reaper ---
-    for key, val in (("@sable_role", "worker"), ("@sable_bead", bid),
-                     ("@sable_status", "running")):
+    tags = [("@sable_role", "worker"), ("@sable_bead", bid),
+            ("@sable_status", "running")]
+    root = repo_root()
+    if root:
+        tags.append(("@sable_repo", root))
+    for key, val in tags:
         subprocess.run(base + ["set-option", "-p", "-t", pane_id, key, val], check=True)
 
     # --- deliver the read-instruction, beating the boot + dropped-Enter race

@@ -20,7 +20,9 @@
 #     role   lincoln | chuck
 #   sable-launch --help
 #
-# Env: SABLE_TMUX_SESSION (default: sable), SABLE_TMUX_SOCKET (tmux -L),
+# Env: SABLE_TMUX_SESSION (explicit override; default derives per-repo via
+#      sable-session — sable-<repo-basename>, so different repos get different
+#      fleets, SABLE-e1e3), SABLE_TMUX_SOCKET (tmux -L),
 #      SABLE_TMUX_BIN (override the sable-tmux helper; tests).
 
 set -u
@@ -78,7 +80,21 @@ command -v tmux >/dev/null 2>&1 || {
   exit 127
 }
 
-SESSION="${SABLE_TMUX_SESSION:-sable}"
+# Session name: explicit env wins; otherwise derive per-repo via the
+# sable-session resolver (sable-<repo-basename> + collision guard, SABLE-e1e3).
+# Resolver lookup mirrors the sable-tmux lookup below: sibling first, then PATH.
+if [ -n "${SABLE_TMUX_SESSION:-}" ]; then
+  SESSION="$SABLE_TMUX_SESSION"
+else
+  SS="${BASH_SOURCE[0]%/*}/sable-session"
+  if [ -x "$SS" ]; then
+    SESSION="$("$SS")" || exit $?
+  elif command -v sable-session >/dev/null 2>&1; then
+    SESSION="$(sable-session)" || exit $?
+  else
+    SESSION="sable"
+  fi
+fi
 TMUX_CMD=(tmux)
 [ -n "${SABLE_TMUX_SOCKET:-}" ] && TMUX_CMD=(tmux -L "$SABLE_TMUX_SOCKET")
 

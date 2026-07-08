@@ -10,6 +10,7 @@ Both importers are symlinks on PATH, so they resolve this module via
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import time
@@ -130,6 +131,118 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
         if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
             return False
     return dispatch_landed(capture(), snippet)
+
+
+# --- Per-repo session resolution (SABLE-e1e3.1). One tmux server can host one
+# fleet PER REPO: the session name derives from the repo root
+# (sable-<basename>), the session records its root in the @sable_repo session
+# option (the collision guard), and every tool resolves its target session
+# through resolve_session below instead of assuming the literal 'sable'.
+
+LEGACY_SESSION = "sable"
+
+
+class SessionCollision(RuntimeError):
+    """A derived session name is held by a DIFFERENT repo's fleet."""
+
+
+def _tmux_run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def tmux_base(socket: str | None = None) -> list[str]:
+    return ["tmux", "-L", socket] if socket else ["tmux"]
+
+
+def repo_root(base: str | None = None) -> str | None:
+    """The MAIN-worktree root of the repo containing `base` (git common dir's
+    parent — same resolution as sable-mode's state path), or None outside a
+    repo."""
+    base = base or os.getcwd()
+    try:
+        r = subprocess.run(["git", "-C", base, "rev-parse", "--git-common-dir"],
+                           capture_output=True, text=True)
+        common = r.stdout.strip()
+        if r.returncode == 0 and common:
+            cpath = common if os.path.isabs(common) else os.path.join(base, common)
+            return os.path.realpath(os.path.dirname(os.path.realpath(cpath)) or "/")
+    except Exception:
+        pass
+    return None
+
+
+def sanitize_session_name(name: str) -> str:
+    """tmux-safe session fragment: '.' and ':' are meaningful in tmux targets,
+    so they (and other hostile chars) become dashes; runs collapse; leading/
+    trailing dashes strip; empty falls back to 'repo'."""
+    out = re.sub(r"[^A-Za-z0-9_-]", "-", name)
+    out = re.sub(r"-{2,}", "-", out).strip("-")
+    return out or "repo"
+
+
+def derived_session(root: str) -> str:
+    return f"sable-{sanitize_session_name(os.path.basename(root.rstrip('/')))}"
+
+
+def session_exists(base: list[str], name: str, run=None) -> bool:
+    run = run or _tmux_run
+    return run(base + ["has-session", "-t", name]).returncode == 0
+
+
+def session_repo(base: list[str], name: str, run=None) -> str | None:
+    """The repo root recorded on the session (@sable_repo session option), or
+    None when unset (pre-e1e3 sessions / hand-made ones)."""
+    run = run or _tmux_run
+    r = run(base + ["show-options", "-v", "-t", name, "@sable_repo"])
+    val = (r.stdout or "").strip()
+    return val if r.returncode == 0 and val else None
+
+
+def _panes_under_root(base: list[str], name: str, root: str, run=None) -> bool:
+    """True when any pane of the session has its cwd inside `root` — the
+    transitional heuristic that lets a pre-e1e3 fleet named 'sable' keep being
+    addressed by ITS repo (its lincoln pane sits at the root) while never
+    matching a different repo's tools."""
+    run = run or _tmux_run
+    r = run(base + ["list-panes", "-s", "-t", name, "-F", "#{pane_current_path}"])
+    if r.returncode != 0:
+        return False
+    prefix = root.rstrip("/") + "/"
+    for line in (r.stdout or "").splitlines():
+        path = line.strip()
+        if path == root or path.startswith(prefix):
+            return True
+    return False
+
+
+def resolve_session(socket: str | None = None, base: str | None = None,
+                    run=None, _root: str | None | object = "auto") -> str:
+    """The tmux session this repo's fleet lives in (or should be created as).
+
+    Precedence: SABLE_TMUX_SESSION env verbatim -> derived sable-<basename>
+    when that session exists and is not owned by another repo (SessionCollision
+    when it is) -> the legacy 'sable' session when it exists and its panes live
+    in this repo -> the derived name (creation target). Outside a git repo the
+    legacy name is returned unchanged. `_root` is a test seam."""
+    env = os.environ.get("SABLE_TMUX_SESSION")
+    if env:
+        return env
+    root = repo_root(base) if _root == "auto" else _root
+    if root is None:
+        return LEGACY_SESSION
+    tb = tmux_base(socket)
+    name = derived_session(root)
+    if session_exists(tb, name, run=run):
+        owner = session_repo(tb, name, run=run)
+        if owner and owner != root:
+            raise SessionCollision(
+                f"tmux session '{name}' belongs to repo {owner}, not {root} — "
+                f"set SABLE_TMUX_SESSION to a unique name for one of the two repos.")
+        return name
+    if session_exists(tb, LEGACY_SESSION, run=run) and \
+            _panes_under_root(tb, LEGACY_SESSION, root, run=run):
+        return LEGACY_SESSION
+    return name
 
 
 # --- Autonomous-role operating-loop kicks (SABLE-bldh.14, moved here for

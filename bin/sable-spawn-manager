@@ -27,7 +27,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    AUTONOMOUS_ROLES, KICK_TAG, deliver_text, kick_message, wait_for_ready,
+    AUTONOMOUS_ROLES, KICK_TAG, SessionCollision, deliver_text, kick_message,
+    repo_root, resolve_session, wait_for_ready,
 )
 
 VALID_ROLES = ("optimus", "tarzan", "chuck")
@@ -250,11 +251,18 @@ def main(argv: list[str] | None = None) -> int:
         return 3 if status == "refused-self" else 0
 
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
-    session = os.environ.get("SABLE_TMUX_SESSION") or "sable"
     base = tmux_base(socket)
+    try:
+        session = resolve_session(socket=socket)
+    except SessionCollision as e:
+        sys.stderr.write(f"sable-spawn-manager: {e}\n")
+        return 4
 
     if ns.prune_instances:
-        listing = subprocess.run(base + ["list-panes", "-a", "-F", "#{@sable_role}"],
+        # session-scoped (SABLE-e1e3): another repo's live roles must not keep
+        # THIS repo's stale registry entries alive
+        listing = subprocess.run(base + ["list-panes", "-s", "-t", session,
+                                         "-F", "#{@sable_role}"],
                                  capture_output=True, text=True)
         live = {r for r in listing.stdout.split() if r} if listing.returncode == 0 else set()
         pruned = prune_stale_instances(live)
@@ -292,11 +300,15 @@ def main(argv: list[str] | None = None) -> int:
     poll_interval = float(os.environ.get("SABLE_DISPATCH_POLL_INTERVAL", "1.0"))
     cmd = manager_command()
 
+    root = repo_root()
     for role in to_spawn:
         pane = subprocess.run(base + window_args(session, role, cmd),
                               capture_output=True, text=True, check=True).stdout.strip()
         subprocess.run(base + ["set-option", "-p", "-t", pane, "@sable_role", role],
                        check=True)
+        if root:
+            subprocess.run(base + ["set-option", "-p", "-t", pane, "@sable_repo", root],
+                           check=True)
         # Constraint 3 (73t4): read the pane's ACTUAL assigned name post-spawn and
         # register it when the harness suffixed it into an instance. For a bare
         # role this is a no-op (base == name), so the default single-instance flow

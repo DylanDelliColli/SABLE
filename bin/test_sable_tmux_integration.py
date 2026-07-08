@@ -103,6 +103,32 @@ def test_autostart_kicks_autonomous_roles_only(sock, tmp_path):
         "lincoln should not be auto-kicked"
 
 
+def test_default_session_derives_from_repo(sock, tmp_path):
+    """SABLE-e1e3.2: without --session (and without SABLE_TMUX_SESSION), the
+    session name derives from the repo the tool runs in; the session records
+    its repo root (@sable_repo session option — the collision guard) and every
+    pane carries the @sable_repo tag."""
+    repo = tmp_path / "alpha"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    root = str(repo.resolve())
+    env = {**os.environ, "SABLE_TMUX_SOCKET": sock,
+           "SABLE_TMUX_PANE_CMD": "bash --noprofile --norc"}
+    env.pop("SABLE_TMUX_SESSION", None)
+    r = subprocess.run(["python3", str(BIN), "--roles", "lincoln"],
+                       capture_output=True, text=True, env=env, cwd=root)
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.4)
+
+    assert subprocess.run(["tmux", "-L", sock, "has-session", "-t", "sable-alpha"],
+                          capture_output=True).returncode == 0
+    opt = _tmux(sock, "show-options", "-v", "-t", "sable-alpha", "@sable_repo").stdout.strip()
+    assert opt == root
+    tags = _tmux(sock, "list-panes", "-s", "-t", "sable-alpha",
+                 "-F", "#{@sable_repo}").stdout.split()
+    assert tags and all(t == root for t in tags), tags
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

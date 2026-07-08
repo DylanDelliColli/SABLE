@@ -231,8 +231,11 @@ sable --help                # the full operator map, any time
 ```
 
 (`sable-launch` wraps the lower-level `sable-tmux` layout tool and attaches
-with `tmux attach -t sable`; `sable-launch lincoln` still launches a single
-identity session by hand.)
+with `tmux attach -t "$(sable-session)"`; `sable-launch lincoln` still launches
+a single identity session by hand. The session name derives from the repo —
+`sable-<repo-basename>` — so **each repo gets its own concurrent fleet** and
+every tool run inside a repo addresses only that repo's panes; set
+`SABLE_TMUX_SESSION` to override the name explicitly.)
 
 Managers dispatch one worker pane per bead (worktree = pane CWD, model pinned
 from the bead's `model:` label); workers do TDD, pass the gates, self-push, and

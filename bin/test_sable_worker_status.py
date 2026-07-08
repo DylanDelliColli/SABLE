@@ -192,5 +192,23 @@ def test_reap_flag_message_truncates_long_pending_text(capsys):
     assert "…" in err
 
 
+def test_list_workers_scopes_to_session_when_given():
+    # SABLE-e1e3.3: discovery is per-repo — a session target replaces the
+    # server-wide -a listing, so another repo's fleet is never enumerated.
+    seen = []
+    runner = lambda args: seen.append(args) or "%1 worker bead-a running\n"
+    out = sws.list_workers(None, run=runner, session="sable-alpha")
+    assert out and out[0]["bead"] == "bead-a"
+    cmd = seen[0]
+    assert ["-s", "-t", "sable-alpha"] == cmd[cmd.index("-s"):cmd.index("-s") + 3]
+    assert "-a" not in cmd
+
+
+def test_list_workers_missing_session_is_empty():
+    def runner(args):
+        raise subprocess.CalledProcessError(1, args)
+    assert sws.list_workers(None, run=runner, session="sable-gone") == []
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

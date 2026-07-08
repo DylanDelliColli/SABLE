@@ -15,7 +15,8 @@ This is the peek tool:
 Roles come from the @sable_role pane option written by sable-tmux and the
 worker-spawn helper; worker panes also carry @sable_bead / @sable_status.
 
-Env: SABLE_TMUX_SESSION (default: sable), SABLE_TMUX_SOCKET (tmux -L).
+Env: SABLE_TMUX_SESSION (explicit override; default derives per-repo via
+sable-session — SABLE-e1e3), SABLE_TMUX_SOCKET (tmux -L).
 """
 from __future__ import annotations
 
@@ -24,6 +25,9 @@ import json
 import os
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_pane_lib import SessionCollision, resolve_session  # noqa: E402
 
 _FORMAT = "#{window_index} #{pane_id} #{@sable_role} #{@sable_bead} #{@sable_status}"
 ACTIVITY_WIDTH = 60
@@ -131,7 +135,11 @@ def main(argv: list[str] | None = None) -> int:
     ns = p.parse_args(sys.argv[1:] if argv is None else argv)
 
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
-    session = os.environ.get("SABLE_TMUX_SESSION") or "sable"
+    try:
+        session = resolve_session(socket=socket)
+    except SessionCollision as e:
+        sys.stderr.write(f"sable-view: {e}\n")
+        return 4
     base = tmux_base(socket)
 
     if subprocess.run(base + ["has-session", "-t", session],

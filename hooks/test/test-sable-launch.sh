@@ -107,6 +107,21 @@ else
   fail "--no-attach brings up the session without attaching" "out=[$OUT] err=[$ERR] code=$CODE"
 fi
 
+# 3b. per-repo derivation (SABLE-e1e3.2): from a repo named 'alpha' with no
+#     SABLE_TMUX_SESSION, the derived session sable-alpha reaches sable-tmux
+TREPO="$(mktemp -d)/alpha"
+mkdir -p "$TREPO"
+git init -q "$TREPO" 2>/dev/null
+( cd "$TREPO" && env -i PATH="$STUB_BIN:$PATH" HOME="$HOME_FLAG" \
+    TMUX_LOG="$WORK/t3b.log" ST_LOG="$WORK/s3b.log" STUB_HAS_SESSION=1 \
+    SABLE_TMUX_BIN="$STUB_BIN/sable-tmux-rec" bash "$LAUNCH" --no-attach ) >/dev/null 2>&1
+if grep -q -- "--session sable-alpha" "$WORK/s3b.log" 2>/dev/null; then
+  pass "no SABLE_TMUX_SESSION -> session name derives from the repo (sable-alpha)"
+else
+  fail "no SABLE_TMUX_SESSION -> session name derives from the repo (sable-alpha)" "s3b=[$(cat "$WORK/s3b.log" 2>/dev/null)] t3b=[$(cat "$WORK/t3b.log" 2>/dev/null)]"
+fi
+rm -rf "${TREPO%/alpha}"
+
 # 4. tmux missing -> clear error naming tmux, non-zero exit
 EMPTY_BIN="$(mktemp -d)"
 ln -s "$(command -v bash)" "$EMPTY_BIN/bash"

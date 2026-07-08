@@ -79,6 +79,17 @@ def test_spawn_creates_tagged_worker_window(sock):
             for line in listing.splitlines()
         ), listing
 
+        # the worker pane carries the repo tag (SABLE-e1e3.2)
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import sable_pane_lib as _lib
+        root = _lib.repo_root()
+        repo_tags = _tmux(sock, "list-panes", "-a",
+                          "-F", "#{@sable_role} #{@sable_repo}").stdout
+        assert any(
+            line == f"worker {root}" for line in repo_tags.splitlines()
+        ), repo_tags
+
         # the read-instruction (single-line) was delivered into the worker pane
         win = _tmux(sock, "list-windows", "-F", "#{window_name}").stdout
         assert "worker-sable-bldh-2" in win
