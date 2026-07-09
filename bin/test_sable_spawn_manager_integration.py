@@ -56,6 +56,20 @@ def _roles(s):
     return sorted(r for r in out.split() if r)
 
 
+def _pane_for_role(s, role):
+    out = _tmux(s, "list-panes", "-s", "-t", SESSION,
+               "-F", "#{pane_id} #{@sable_role}").stdout
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == role:
+            return parts[0]
+    return None
+
+
+def _pane_option(s, pane, name):
+    return _tmux(s, "show-options", "-p", "-v", "-t", pane, name, check=False).stdout.strip()
+
+
 def test_spawn_creates_detached_role_window(sock):
     _seed_lincoln(sock)
     r = _run(sock, "optimus")
@@ -84,6 +98,44 @@ def test_all_spawns_three_roles(sock):
     r = _run(sock, "--all")
     assert r.returncode == 0, r.stderr
     assert {"chuck", "optimus", "tarzan"} <= set(_roles(sock))
+
+
+# --- SABLE-tz7h.1: producer spawn contract -------------------------------
+
+def test_producer_spawn_tags_class_and_deliverable(sock, tmp_path):
+    _seed_lincoln(sock)
+    deliverable = tmp_path / "victor-report.md"
+    r = _run(sock, "victor", "--deliverable", str(deliverable))
+    assert r.returncode == 0, r.stderr
+    assert "victor" in _roles(sock)
+
+    pane = _pane_for_role(sock, "victor")
+    assert pane is not None
+    assert _pane_option(sock, pane, "@sable_class") == "producer"
+    assert _pane_option(sock, pane, "@sable_deliverable") == str(deliverable)
+
+    # window 0 (Lincoln) is never disturbed by a producer spawn either
+    active = _tmux(sock, "display-message", "-t", SESSION, "-p",
+                   "#{window_index}").stdout.strip()
+    assert active == "0"
+
+
+def test_producer_spawn_requires_deliverable(sock):
+    _seed_lincoln(sock)
+    r = _run(sock, "victor")
+    assert r.returncode == 2
+    assert "--deliverable" in r.stderr
+    assert "victor" not in _roles(sock)
+
+
+def test_all_spawns_tag_manager_class(sock):
+    _seed_lincoln(sock)
+    r = _run(sock, "--all")
+    assert r.returncode == 0, r.stderr
+    for role in ("optimus", "tarzan", "chuck"):
+        pane = _pane_for_role(sock, role)
+        assert pane is not None
+        assert _pane_option(sock, pane, "@sable_class") == "manager"
 
 
 def test_no_session_points_at_launch(sock):

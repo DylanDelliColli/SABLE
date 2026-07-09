@@ -278,10 +278,28 @@ AUTONOMOUS_ROLES = {"optimus", "tarzan", "chuck"}
 KICK_TAG = "SABLE-AUTOSTART"
 
 
-def kick_message(role: str) -> str:
-    """The turn that starts a role's operating loop."""
+def kick_message(role: str, deliverable: str | None = None) -> str:
+    """The turn that starts a role's operating loop.
+
+    A non-None `deliverable` selects the BOUNDED PRODUCER branch
+    (architecture.json decision 1, SABLE-tz7h.1) instead of an autonomous
+    manager loop: the kick carries only the lifecycle contract — write the
+    deliverable, flag done, exit, never loop — because the actual task brief
+    arrives separately via sable-msg once the pane is ready. Manager kick text
+    (role in ("optimus", "tarzan"), "chuck", and the bare-common fallback) is
+    unchanged from before this branch existed — regression-locked."""
     common = (f"[{KICK_TAG}] Operator: begin your operating loop now and run it "
               f"autonomously — do not wait for further input.")
+    if deliverable:
+        return (f"[{KICK_TAG}] Operator: you are a BOUNDED PRODUCER pane — a "
+                f"single-shot analysis run, not a looping manager. Your task brief "
+                f"will arrive separately (via sable-msg) once you're ready; this "
+                f"kick is only your lifecycle contract. Do your analysis, write your "
+                f"complete deliverable to {deliverable}, then set "
+                f"`tmux set-option -p -t \"$TMUX_PANE\" @sable_status done` and exit. "
+                f"Do not write to `bd` — writes happen post-merge, not from this "
+                f"pane. Never loop back for more work: once your deliverable is "
+                f"written and you have flagged done, you are finished.")
     if role in ("optimus", "tarzan"):
         return (f"{common} Drain your lane from `bd ready`: verify each ready bead, "
                 f"claim it, and `sable-spawn-worker <id> --scope <name>`; review the "
