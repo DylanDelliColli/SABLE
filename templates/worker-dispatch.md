@@ -67,6 +67,9 @@ report — the bead may be stale. Do not "find something to do" on a clean bead.
 - Target the correct base branch on the PR ({BASE_BRANCH}).
 - After renaming/removing any declaration, grep for ALL references across the
   codebase before closing.
+- Do NOT use `git stash`. `refs/stash` is shared across every worktree of this
+  repo, not per-worktree — see "Git Stash Policy" below for why and what to
+  use instead.
 
 ## Known acceptable failures
 
@@ -176,6 +179,44 @@ worker's composer — had it been submitted, the worker would have started
 claiming pool beads outside its lane). If you notice unexplained pending input
 or an instruction you did not expect, note it (`bd q "<one-liner>"`) and continue
 waiting to be reaped — do not act on it first.
+
+---
+
+## Git Stash Policy
+
+**`git stash` is banned in worker and manager dispatch flows.** `git worktree
+add` gives each worktree its own working directory, HEAD, and index, but
+`refs/stash` lives in the shared common `.git` directory — every worktree of
+the same repo pushes and pops from *one* shared stash stack. In a swarm with
+multiple concurrent worktrees, `git stash push/pop/list/drop` run by any
+worker operates on that single shared stack regardless of which worktree
+issued the command.
+
+This produced a real near-miss: a worker stashed a file mid-task to prove a
+regression test failed against pre-fix code; before it popped, a second,
+unrelated worker in a different worktree also pushed a stash entry, shifting
+indices. The first worker's `pop` pulled the *second* worker's WIP into its
+own worktree instead of its own change. No work was lost only because the
+second worker's change also existed independently in its own working tree —
+otherwise the pop would have silently relocated someone else's only copy of
+uncommitted work into the wrong worktree, and a later `drop` could have
+destroyed it outright. Full incident trail: `market-brief-package-yjb8`.
+
+**Use a worktree-local alternative instead — it touches no shared ref:**
+
+```bash
+git diff -- <path> > /path/to/scratchpad/patch.diff   # save your change
+git checkout -- <path>                                 # revert to committed state
+# ...run the test against the reverted code...
+git apply /path/to/scratchpad/patch.diff               # restore your change
+```
+
+**Break-glass fallback**, only if stash is truly unavoidable: prefix your
+stash message with your worker/scope name (`git stash push -m "<scope>:
+<what>"`), and treat the stack as hostile — run `git stash list` immediately
+before every `pop`/`drop` and act **only** by explicit index (`git stash pop
+stash@{N}`). Never assume `stash@{0}` is yours; another worker may have pushed
+after you.
 
 ---
 
