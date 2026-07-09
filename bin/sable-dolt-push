@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""sable-dolt-push — the single blessed path for `bd dolt push` (SABLE-ipcf).
+
+Standing convention (lincoln, 2026-07-09, after the cross-fleet corruption
+incident): dolt push is CHUCK-ONLY, and concurrent pushes to the shared beads
+remote corrupt it (dangling chunk refs). This wrapper is DEFENSE-IN-DEPTH: the
+lock is one layer, not the only mechanism — the other fleet's `mywu` proved
+unintentional push paths exist, so this wrapper is ALSO the home of their `u51i`
+bounce-on-dangling stopgap. Both fleets adopt this one helper.
+
+Three layers, one helper:
+
+  1. FILESYSTEM LOCK at ~/.claude/sable/dolt-push.lock carrying fleet-id + pid +
+     timestamp. Acquired before the push, deleted after. A second acquirer waits
+     (default up to the TTL) and then fails cleanly rather than interleaving. A
+     lock older than the TTL (default 10 min) is treated as stale and broken —
+     the previous holder crashed without releasing.
+
+  2. PULL-BEFORE-PUSH. The shared remote advances from the other fleet's side;
+     chuck always pulls immediately before pushing. A failed pull aborts before
+     any push (never push onto a stale/broken base).
+
+  3. BOUNCE-ON-DANGLING stopgap. If the push fails with a dangling-chunk error,
+     bounce the dolt sql-server (`bd dolt stop`; beads auto-restarts it on the
+     next call), retry the push exactly ONCE, then fail loudly. Any other push
+     failure fails loudly with no retry.
+
+Chuck-only by convention, but SAFE if invoked elsewhere: the lock still
+serializes, so a stray invocation cannot interleave with chuck's push.
+
+Usage:
+  sable-dolt-push [--wait SECS] [--ttl SECS] [--lock PATH] [--fleet ID]
+                  [--poll SECS]
+  sable-dolt-push --print-lock-path      # resolve + print the lock path, exit
+  sable-dolt-push --help
+
+Environment seams (all overridable; the defaults are the production commands):
+  SABLE_DOLT_PUSH_LOCK   lock file path (default ~/.claude/sable/dolt-push.lock)
+  SABLE_FLEET_ID         fleet id recorded in the lock (default: hostname)
+  SABLE_DOLT_LOCK_TTL    stale-break TTL, seconds (default 600)
+  SABLE_DOLT_LOCK_WAIT   max wait for a held lock, seconds (default 600)
+  SABLE_DOLT_LOCK_POLL   poll interval while waiting, seconds (default 0.5)
+  SABLE_DOLT_PULL_CMD    pull command   (default "bd dolt pull")
+  SABLE_DOLT_PUSH_CMD    push command   (default "bd dolt push")
+  SABLE_DOLT_BOUNCE_CMD  server-bounce command (default "bd dolt stop")
+
+Exit codes: 0 ok · 2 usage · 11 lock contention · 12 pull failed · 13 push failed.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import time
+import uuid
+
+# --- exit codes --------------------------------------------------------------
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_CONTENTION = 11
+EXIT_PULL_FAIL = 12
+EXIT_PUSH_FAIL = 13
+
+# --- defaults ----------------------------------------------------------------
+LOCK_TTL_DEFAULT = 600.0      # 10 minutes — a held lock older than this is stale
+LOCK_WAIT_DEFAULT = 600.0     # wait this long for a held lock, then fail cleanly
+LOCK_POLL_DEFAULT = 0.5       # poll interval while waiting
+
+# Substrings that mark dolt's dangling-chunk corruption on push. Matched
+# case-insensitively against combined stdout+stderr. Kept broad on purpose:
+# the stopgap is cheap (one bounce + one retry) and a false positive costs only
+# a server bounce, while a miss lets the corrupting error through.
+DANGLING_SIGNATURES = (
+    "dangling chunk",
+    "dangling ref",
+    "dangling reference",
+    "dangling chunks",
+)
+
+
+class LockContention(Exception):
+    """Raised when the push lock is held by a live (non-stale) holder and the
+    wait window elapsed without it being released."""
+
+    def __init__(self, holder):
+        self.holder = holder or {}
+        who = self.holder.get("fleet", "?")
+        pid = self.holder.get("pid", "?")
+        super().__init__(f"dolt push lock held by fleet={who} pid={pid}")
+
+
+# --- lock path / fleet-id resolution ----------------------------------------
+
+def default_lock_path(env=None) -> str:
+    env = os.environ if env is None else env
+    override = env.get("SABLE_DOLT_PUSH_LOCK")
+    if override:
+        return override
+    home = env.get("HOME", "")
+    return os.path.join(home, ".claude", "sable", "dolt-push.lock")
+
+
+def resolve_fleet_id(env=None) -> str:
+    env = os.environ if env is None else env
+    fid = (env.get("SABLE_FLEET_ID") or "").strip()
+    return fid if fid else socket.gethostname()
+
+
+# --- lock file read / staleness ---------------------------------------------
+
+def read_lock(path):
+    """Return the lock's recorded dict, or None if absent/unreadable/corrupt."""
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def lock_is_stale(info, now, ttl) -> bool:
+    """A lock is stale once it is older than the TTL. A lock with no usable
+    timestamp is treated as stale (better to break an unparseable lock than to
+    wedge every push forever behind it)."""
+    if not info:
+        return True
+    ts = info.get("timestamp")
+    if not isinstance(ts, (int, float)):
+        return True
+    return (now - ts) > ttl
+
+
+def _break_lock(path, expected):
+    """Unlink the lock only if it still matches `expected` (same nonce) — so a
+    fresh, valid lock that raced in between our read and break is not clobbered.
+    expected=None means the file was unreadable/corrupt: remove unconditionally."""
+    if expected is None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return
+    current = read_lock(path)
+    if current is None or current.get("nonce") == expected.get("nonce"):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def acquire_lock(path, fleet, pid=None, *, ttl=LOCK_TTL_DEFAULT,
+                 wait=0.0, poll=LOCK_POLL_DEFAULT,
+                 now_fn=time.time, sleep_fn=time.sleep) -> str:
+    """Atomically acquire the push lock. Returns an opaque token for release.
+
+    Contention: waits up to `wait` seconds (polling every `poll`) for the lock
+    to free, breaking it if the holder's timestamp is older than `ttl`. Raises
+    LockContention if a live holder never releases within the window.
+    """
+    if pid is None:
+        pid = os.getpid()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    deadline = now_fn() + wait
+    while True:
+        now = now_fn()
+        nonce = uuid.uuid4().hex
+        payload = {
+            "fleet": fleet,
+            "pid": pid,
+            "timestamp": now,
+            "iso": _iso(now),
+            "nonce": nonce,
+        }
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            info = read_lock(path)
+            if lock_is_stale(info, now_fn(), ttl):
+                _break_lock(path, info)
+                continue                      # retry acquire immediately
+            if now_fn() >= deadline:
+                raise LockContention(info)
+            sleep_fn(poll)
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(payload) + "\n")
+        return nonce
+
+
+def release_lock(path, token) -> bool:
+    """Delete the lock iff we still hold it (nonce matches `token`). Returns
+    True if we released our own lock, False otherwise (foreign/stale token,
+    or the lock is already gone)."""
+    info = read_lock(path)
+    if info is not None and info.get("nonce") == token:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return True
+    return False
+
+
+def _iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(epoch))
+
+
+# --- push flow: pull-before-push + bounce-on-dangling ------------------------
+
+def is_dangling_error(text) -> bool:
+    low = (text or "").lower()
+    return any(sig in low for sig in DANGLING_SIGNATURES)
+
+
+def _default_run(cmd):
+    """Run a command, capturing output while also echoing it to our stderr so
+    the operator sees dolt's real output live."""
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.stdout:
+        sys.stderr.write(proc.stdout)
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    return proc
+
+
+def _log(msg):
+    sys.stderr.write(f"sable-dolt-push: {msg}\n")
+
+
+def do_push(*, pull_cmd, push_cmd, bounce_cmd, run=_default_run, log=_log) -> int:
+    """Pull, then push; on a dangling-chunk failure bounce the server and retry
+    once. Returns an EXIT_* code. Assumes the caller already holds the lock."""
+    # 1. pull-before-push — never push onto a stale/broken base.
+    pull = run(pull_cmd)
+    if pull.returncode != 0:
+        log("pull failed; aborting before push (never push on a failed pull)")
+        return EXIT_PULL_FAIL
+
+    # 2. push.
+    push = run(push_cmd)
+    if push.returncode == 0:
+        return EXIT_OK
+
+    combined = (push.stdout or "") + (push.stderr or "")
+    if not is_dangling_error(combined):
+        log("push failed (non-dangling error); failing loudly, no retry")
+        return EXIT_PUSH_FAIL
+
+    # 3. bounce-on-dangling stopgap: bounce the dolt sql-server, retry ONCE.
+    log("dangling-chunk error on push — bouncing dolt sql-server and retrying once")
+    run(bounce_cmd)
+    retry = run(push_cmd)
+    if retry.returncode == 0:
+        log("retry after bounce succeeded")
+        return EXIT_OK
+    log("push still failing after bounce + one retry; failing loudly")
+    return EXIT_PUSH_FAIL
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def _cmd_from_env(env, key, default):
+    raw = env.get(key)
+    return shlex.split(raw) if raw else list(default)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="sable-dolt-push",
+        description="Serialized, pull-first, bounce-on-dangling wrapper for bd dolt push.",
+    )
+    ap.add_argument("--wait", type=float, default=None,
+                    help="max seconds to wait for a held lock (default 600 / env)")
+    ap.add_argument("--ttl", type=float, default=None,
+                    help="stale-break TTL in seconds (default 600 / env)")
+    ap.add_argument("--poll", type=float, default=None,
+                    help="poll interval while waiting (default 0.5 / env)")
+    ap.add_argument("--lock", default=None, help="lock file path override")
+    ap.add_argument("--fleet", default=None, help="fleet id override")
+    ap.add_argument("--print-lock-path", action="store_true",
+                    help="print the resolved lock path and exit")
+    args = ap.parse_args(argv)
+
+    env = os.environ
+    lock_path = args.lock or default_lock_path(env)
+    if args.print_lock_path:
+        print(lock_path)
+        return EXIT_OK
+
+    fleet = args.fleet or resolve_fleet_id(env)
+    ttl = args.ttl if args.ttl is not None else float(
+        env.get("SABLE_DOLT_LOCK_TTL", LOCK_TTL_DEFAULT))
+    wait = args.wait if args.wait is not None else float(
+        env.get("SABLE_DOLT_LOCK_WAIT", LOCK_WAIT_DEFAULT))
+    poll = args.poll if args.poll is not None else float(
+        env.get("SABLE_DOLT_LOCK_POLL", LOCK_POLL_DEFAULT))
+
+    pull_cmd = _cmd_from_env(env, "SABLE_DOLT_PULL_CMD", ["bd", "dolt", "pull"])
+    push_cmd = _cmd_from_env(env, "SABLE_DOLT_PUSH_CMD", ["bd", "dolt", "push"])
+    bounce_cmd = _cmd_from_env(env, "SABLE_DOLT_BOUNCE_CMD", ["bd", "dolt", "stop"])
+
+    try:
+        token = acquire_lock(lock_path, fleet, ttl=ttl, wait=wait, poll=poll)
+    except LockContention as e:
+        _log(f"could not acquire push lock: {e}. Another push is in progress; "
+             f"try again shortly (lock: {lock_path}).")
+        return EXIT_CONTENTION
+
+    _log(f"acquired push lock (fleet={fleet} pid={os.getpid()} lock={lock_path})")
+    try:
+        return do_push(pull_cmd=pull_cmd, push_cmd=push_cmd, bounce_cmd=bounce_cmd)
+    finally:
+        if release_lock(lock_path, token):
+            _log("released push lock")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

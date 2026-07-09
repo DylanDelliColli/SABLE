@@ -1366,10 +1366,35 @@ git commit -m "descriptive message"
 
 # 4. Push everything
 git pull --rebase
-bd dolt push        # Push beads to Dolt remote
+sable-dolt-push     # Push beads to Dolt remote — the blessed wrapper, NEVER bare `bd dolt push`
 git push            # Push code to Git remote
 git status          # MUST show "up to date with origin"
 ```
+
+#### The `sable-dolt-push` wrapper (the single blessed dolt-push path)
+
+**Never run bare `bd dolt push`.** All dolt pushes go through `bin/sable-dolt-push`
+— the one helper both fleets adopt. It is defense-in-depth against the
+cross-fleet corruption incident (concurrent pushes to the shared beads remote
+left dangling chunk refs), and it folds three layers into one command:
+
+1. **Filesystem lock** at `~/.claude/sable/dolt-push.lock` (fleet-id + pid +
+   timestamp), acquired before the push and deleted after. A second pusher waits
+   (up to the TTL) and then fails cleanly rather than interleaving; a lock older
+   than the TTL (default 10 min) is treated as stale and broken. Safe even if
+   invoked outside convention — the lock still serializes.
+2. **Pull-before-push** — always `bd dolt pull` first; a failed pull aborts
+   before any push (never push onto a stale/broken base).
+3. **Bounce-on-dangling stopgap** — on a dangling-chunk error it bounces the dolt
+   sql-server (`bd dolt stop`; beads auto-restarts it), retries exactly once,
+   then fails loudly. Any other push failure fails loudly with no retry.
+
+**Convention: dolt push is CHUCK-ONLY.** In a multi-manager swarm only Chuck runs
+`sable-dolt-push` (batching the whole fleet's pull+push); managers and workers
+never push dolt, even at session close. Solo/non-swarm SABLE sessions run it
+themselves at close. Env seams (`SABLE_DOLT_PUSH_LOCK`, `SABLE_FLEET_ID`,
+`SABLE_DOLT_LOCK_TTL`, `SABLE_DOLT_{PULL,PUSH,BOUNCE}_CMD`) are documented in the
+script header — used by tests and for operator overrides.
 
 **Why this is non-negotiable:** An agent that does great work but doesn't push has accomplished nothing. The next session starts fresh. If the work isn't in the remote, it doesn't exist. Treat unpushed work as lost work.
 
@@ -1391,7 +1416,8 @@ These are battle-tested lessons from real swarm development.
 | Markdown TODO lists | Splits tracking between docs and beads | `bd create` for everything |
 | Temporal dep language ("A before B") | Inverts `bd dep add` arguments | Requirement language: "B needs A" |
 | Not closing blockers promptly | Freezes all downstream beads | `bd close <id>` immediately when done |
-| Stopping without pushing | Strands work locally — next session can't see it | `bd dolt push` + `git push` always |
+| Stopping without pushing | Strands work locally — next session can't see it | `sable-dolt-push` + `git push` always |
+| Bare `bd dolt push` | Concurrent cross-fleet pushes corrupt the shared remote (dangling chunks) | Always `sable-dolt-push` (serialized, pull-first, bounce-on-dangling); chuck-only in a swarm |
 | Code without tests | Hook blocks `bd close`, wastes agent time | Write failing test first; `[no-test]` for docs-only |
 | Vague bead descriptions | Agent wastes a full cycle re-exploring the codebase | Pass the Fresh Agent Test: file paths, function names, approach |
 | Over-bundling beads per agent | Single failure blocks all bundled beads | 2-3 related beads max per worker |
@@ -1649,7 +1675,7 @@ The cost of one extra Bash call is small. The cost of breaking flow on every per
 2. Create beads for remaining work (use `bd q` for quick capture; `bd defer` for "real but not now")
 3. Run `bd preflight` for the PR readiness checklist
 4. git commit + git push
-5. bd dolt push
+5. `sable-dolt-push` (blessed wrapper, never bare `bd dolt push`; chuck-only in a swarm)
 6. git status must show "up to date with origin"
 7. If worktrees were used: `bd worktree remove <name>` for any completed ones
 ```
@@ -1735,7 +1761,7 @@ bd ready              bd close <ids>         Agent prompt:
 bd list --status=     bd create (remaining)  - Which beads
   in_progress         git add + commit       - What files
                       git pull --rebase      - What commands
-                      bd dolt push           - bd close <ids>
+                      sable-dolt-push        - bd close <ids>
                       git push
                       git status → clean
 

@@ -70,6 +70,17 @@ The delegation bead must include:
 
 The author closes the for-chuck bead when they've resolved the conflict on their end.
 
+## Dolt sync — you are the fleet's ONLY dolt-push actor
+Standing convention (after the cross-fleet corruption incident): **dolt push is CHUCK-ONLY.** No other lane — manager or worker — ever pushes dolt, including at session close. You batch the whole fleet's pull+push.
+
+**Always push dolt through `sable-dolt-push` — never bare `bd dolt push`.** The wrapper is the single blessed path both fleets adopt (defense-in-depth against the concurrent-push corruption that left dangling chunk refs on the shared remote):
+
+- It takes a **filesystem lock** (`~/.claude/sable/dolt-push.lock`, carrying fleet-id + pid + timestamp), so two pushers can never interleave — a second push waits, then fails cleanly; a lock older than the TTL (10 min) is broken as stale.
+- It **pulls before pushing** (the shared remote advances from the other fleet's side; a failed pull aborts before any push).
+- It folds in the **bounce-on-dangling stopgap**: on a dangling-chunk error it bounces the dolt sql-server (`bd dolt stop`; beads auto-restarts it), retries once, then fails loudly.
+
+So your close-out sync is just `sable-dolt-push` — the pull, the serialization, and the corruption stopgap are all inside it. Re-verify dolt-push airtightness whenever a merge touches `hooks/` (grep installed hooks for any bare `dolt push` path — an unintended push path is exactly how the other fleet's hold leaked).
+
 ## Boundaries
 - You do not dispatch workers. You operate solo.
 - You may modify the active branch directly (no worktree required for in-place fixes).
