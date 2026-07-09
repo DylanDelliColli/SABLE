@@ -178,6 +178,35 @@ for o in overlaps:
 print('\n'.join(lines))
 " 2>/dev/null)
 
+# Brief basename list, shared by the message-based notifications below (the
+# worker-landing wake and the Chuck handoff).
+FILES_BRIEF=$(echo "$FILES" | sed 's#.*/##' | head -8 | tr '\n' ' ')
+
+# --- Wake the dispatching manager on a worker landing (SABLE-nmmh) ---------
+# Managers now run an EVENT-DRIVEN loop: they END their turn when nothing is
+# actionable (optimus.md / tarzan.md), so a worker landing must ACTIVELY wake
+# the dispatching manager to review the outcome — otherwise the review waits
+# behind the manager's next unrelated wake (the poll-driven latency this bead
+# removes). The worker pane carries the lane manager's name in CLAUDE_AGENT_NAME
+# (set by worker_env_args at spawn) and this hook runs in that env, so
+# SABLE_ID_NAME already resolves to the dispatching manager — message it
+# directly; no spawn-helper change needed. Fire ONLY for a real worker landing:
+# gate on this pane's @sable_role=worker tag so a manager's OWN emergency push
+# (@sable_role=<role>) does not self-notify. Message-only (no durable bead): a
+# missed wake degrades to the manager's residual background safety-net sweep, and
+# Chuck merges regardless. Disable with SABLE_WORKER_LAND_NOTIFY=0.
+if [ "${SABLE_WORKER_LAND_NOTIFY:-1}" = "1" ] \
+   && [ -n "${TMUX_PANE:-}" ] && [ -n "${SABLE_ID_NAME:-}" ] \
+   && command -v tmux >/dev/null 2>&1 \
+   && command -v sable-msg >/dev/null 2>&1; then
+  PANE_ROLE=$(tmux display-message -p -t "$TMUX_PANE" '#{@sable_role}' 2>/dev/null || echo "")
+  if [ "$PANE_ROLE" = "worker" ]; then
+    LAND_MSG="Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed & bead closed. Review the outcome — closed bead + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
+    [ -n "$OVERLAPS" ] && LAND_MSG="${LAND_MSG} OVERLAP-WARNING: shares files with in-flight work."
+    sable-msg "$SABLE_ID_NAME" "$LAND_MSG" --from worker >/dev/null 2>&1 || true
+  fi
+fi
+
 # --- Message-first handoff (SABLE-bldh.15) --------------------------------
 # In the tmux warm-pane topology the worker->merge handoff is a direct message
 # to Chuck: event-driven, no polled bead. If a Chuck pane is reachable, that IS
@@ -186,7 +215,6 @@ print('\n'.join(lines))
 # stranded-recovery covers the crash case. Disable with
 # SABLE_MERGE_NOTIFY_VIA_MSG=0.
 if [ "${SABLE_MERGE_NOTIFY_VIA_MSG:-1}" = "1" ] && command -v sable-msg >/dev/null 2>&1; then
-  FILES_BRIEF=$(echo "$FILES" | sed 's#.*/##' | head -8 | tr '\n' ' ')
   MSG="PR ready from ${SABLE_ID_NAME}: branch ${BRANCH} (${FILES_BRIEF}). Review and merge into the integration branch, then report."
   [ -n "$OVERLAPS" ] && MSG="${MSG} OVERLAP-WARNING: shares files with in-flight work — sequence carefully."
   if sable-msg chuck "$MSG" --from "$SABLE_ID_NAME" >/dev/null 2>&1; then

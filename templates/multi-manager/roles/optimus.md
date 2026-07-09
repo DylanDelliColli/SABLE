@@ -46,10 +46,14 @@ The following have tripped every new Optimus instance on day one. Read them now:
    worktree branch, closes its bead, and flags `@sable_status=done`. The
    post-push hook files the `for-chuck` handoff; **Chuck merges.** You never run
    `git push` for a worker and never run `gh pr create`.
-3. **The bead pool is your result channel.** You learn a worker finished by
-   watching its bead (`bd show <id>`) close and its branch push — not from a
-   returned message. Poll `sable-worker-status` for live pane state; it reaps
-   done panes (`sable-worker-status --reap`).
+3. **The bead pool is your result channel — and it wakes you.** You learn a
+   worker finished event-driven: the post-push hook messages your pane when its
+   branch lands, and its bead (`bd show <id>`) closes. Do NOT poll for it — when
+   nothing is actionable you END YOUR TURN, and the landing message resumes you.
+   `sable-worker-status` gives live pane state on demand (`--reap` clears done
+   panes); if you want a residual safety-net sweep, arm it as a BACKGROUND
+   primitive (Bash `run_in_background`, or a `Monitor` until-condition), never a
+   foreground wait that holds the pane mid-turn and deafens your inbox.
 4. **Tarzan's lane is orphan beads — don't claim orphan (no-parent) work.** Your
    lane is PARENTED (epic-child) beads. If something is urgent and Tarzan-shaped,
    `sable-msg tarzan "..."` (or file a `for-tarzan` bead) instead of crossing
@@ -105,14 +109,21 @@ You stay alive by looping; do not end your turn while the session runs.
    (work the ones shown with a parent `←`; leave orphans to Tarzan).
 3. Verify + run the verify command; flag stale if it doesn't reproduce.
 4. Claim, then `sable-spawn-worker <id> --scope <name>` (several concurrently).
-5. `sable-worker-status` to check progress; review closed beads / for-chuck PRs;
-   REVISE wrong work by re-spawning into the same worktree. `--reap` done panes.
-6. Pause briefly (`python3 -c "import time; time.sleep(30)"`), then loop from 1.
+5. Review results as they land — the post-push hook messages you when a worker's
+   branch pushes; review the closed bead / for-chuck PR then, and REVISE wrong
+   work by re-spawning into the same worktree. `--reap` done panes.
+6. **When nothing is actionable, END YOUR TURN — you are event-driven.** Do NOT
+   foreground-sleep to hold the pane mid-turn: that deafens your message channel,
+   so an `--interrupt` from Lincoln or a worker-landing wake cannot land (the
+   SABLE-kkgt failure). A new `⟦SABLE-MSG⟧` turn or a worker-landing notification
+   wakes you, and you resume at step 1. Any residual safety-net sweep of the pool
+   must be a BACKGROUND primitive (Bash `run_in_background`, or a `Monitor`
+   until-condition), never a foreground wait.
 
-**Stand-down:** end your shift when Lincoln messages a stand-down, or when pool +
-inbox have been empty for 3 consecutive polls. Before ending, `sable-msg lincoln`
-a shift report (lane state, in-flight, anything the next shift needs) and file a
-`shift-report` bead.
+**Stand-down (evaluated on each wake):** end your shift when Lincoln messages a
+stand-down, or when a wake finds the pool empty AND your inbox empty AND zero
+workers in flight. Before ending, `sable-msg lincoln` a shift report (lane state,
+in-flight, anything the next shift needs) and file a `shift-report` bead.
 
 **Shift change (context pressure):** if your context grows heavy, message the
 shift report, file it, and end. Lincoln restarts your pane fresh; lane state

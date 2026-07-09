@@ -285,9 +285,17 @@ def kick_message(role: str, deliverable: str | None = None) -> str:
     (architecture.json decision 1, SABLE-tz7h.1) instead of an autonomous
     manager loop: the kick carries only the lifecycle contract — write the
     deliverable, flag done, exit, never loop — because the actual task brief
-    arrives separately via sable-msg once the pane is ready. Manager kick text
-    (role in ("optimus", "tarzan"), "chuck", and the bare-common fallback) is
-    unchanged from before this branch existed — regression-locked."""
+    arrives separately via sable-msg once the pane is ready.
+
+    The lane-manager kick (role in ("optimus", "tarzan")) was reworded in
+    SABLE-nmmh to EVENT-DRIVEN 'end your turn when idle' phrasing: the previous
+    'pause briefly and loop' text taught the pane to occupy its own turn while
+    waiting, which deafened its inbound message channel (queued/--interrupt
+    sable-msgs couldn't land mid-turn — the SABLE-kkgt urgent-delivery failure).
+    Chuck's kick and the bare-common fallback are unchanged. Both the manager
+    and chuck strings are byte-locked by
+    test_sable_spawn_manager.test_manager_kick_text_byte_identical_regression —
+    any reword there must update that assertion deliberately."""
     common = (f"[{KICK_TAG}] Operator: begin your operating loop now and run it "
               f"autonomously — do not wait for further input.")
     if deliverable:
@@ -303,8 +311,11 @@ def kick_message(role: str, deliverable: str | None = None) -> str:
     if role in ("optimus", "tarzan"):
         return (f"{common} Drain your lane from `bd ready`: verify each ready bead, "
                 f"claim it, and `sable-spawn-worker <id> --scope <name>`; review the "
-                f"results, reap done panes, then pause briefly and loop. Stand down "
-                f"when the pool and your inbox are empty.")
+                f"results and reap done panes. You are EVENT-DRIVEN: when nothing is "
+                f"actionable, end your turn — a new ⟦SABLE-MSG⟧ turn or a "
+                f"worker-landing notification wakes you; never foreground-sleep to "
+                f"hold the pane. Stand down when a wake finds the pool and your inbox "
+                f"empty with no workers in flight.")
     if role == "chuck":
         return (f"{common} You are event-driven: each ⟦SABLE-MSG⟧ PR-ready "
                 f"message from a manager is a merge request — review and merge it, then "

@@ -125,15 +125,22 @@ def test_bounded_producer_kick_contains_deliverable_and_never_loop():
 
 
 def test_manager_kick_text_byte_identical_regression():
-    """kick_message(role) with no deliverable is UNCHANGED from before the
-    producer branch was added — a real regex/regression snapshot, not a
-    paraphrase, so any accidental rewording of the manager kick trips this."""
+    """kick_message(role) with no deliverable is a byte-exact snapshot, not a
+    paraphrase, so any accidental rewording of the manager kick trips this.
+    SABLE-nmmh deliberately reworded the lane-manager kick to event-driven
+    'end your turn when idle' phrasing (dropping the 'pause briefly and loop'
+    foreground-wait mandate that deafened the msg channel, SABLE-kkgt); this
+    assertion was consciously updated to the new wording as part of that change.
+    Chuck's kick is untouched."""
     expected_lane_managers = (
         "[SABLE-AUTOSTART] Operator: begin your operating loop now and run it "
         "autonomously — do not wait for further input. Drain your lane from "
         "`bd ready`: verify each ready bead, claim it, and `sable-spawn-worker "
-        "<id> --scope <name>`; review the results, reap done panes, then pause "
-        "briefly and loop. Stand down when the pool and your inbox are empty."
+        "<id> --scope <name>`; review the results and reap done panes. You are "
+        "EVENT-DRIVEN: when nothing is actionable, end your turn — a new "
+        "⟦SABLE-MSG⟧ turn or a worker-landing notification wakes you; never "
+        "foreground-sleep to hold the pane. Stand down when a wake finds the "
+        "pool and your inbox empty with no workers in flight."
     )
     expected_chuck = (
         "[SABLE-AUTOSTART] Operator: begin your operating loop now and run it "
