@@ -32,7 +32,19 @@ tag() { # tag <pane> <role> <bead> <status>
   tmux -L "$SOCK" set-option -p -t "$1" @sable_status "$4"
 }
 
-run_status() { SABLE_TMUX_SOCKET="$SOCK" python3 "$BIN" "$@"; }
+tag_full() { # tag_full <pane> <role> <bead> <status> <class> <deliverable>
+  tmux -L "$SOCK" set-option -p -t "$1" @sable_role "$2"
+  tmux -L "$SOCK" set-option -p -t "$1" @sable_bead "$3"
+  tmux -L "$SOCK" set-option -p -t "$1" @sable_status "$4"
+  tmux -L "$SOCK" set-option -p -t "$1" @sable_class "$5"
+  tmux -L "$SOCK" set-option -p -t "$1" @sable_deliverable "$6"
+}
+
+# SABLE-v4e5: resolve_session() (bin/sable_pane_lib.py) now scopes list-panes
+# to a derived-per-repo or calling-pane session (SABLE-e1e3) rather than -a
+# across the whole socket, so the fixture's literal 'w' session must be named
+# explicitly or every listing/reap call here silently sees zero panes.
+run_status() { SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION="w" python3 "$BIN" "$@"; }
 
 # --- fixture: two worker panes, plus a SECOND session name grouped with the
 #     first — the exact mechanism that duplicates list-panes -a rows ---
@@ -134,6 +146,77 @@ if [ "$survivors5" -eq 0 ] && [ "$survivors6" -eq 0 ]; then
 else
   fail "no pane is left behind holding pending input after reap" "PANE5 alive=$survivors5 PANE6 alive=$survivors6"
 fi
+
+
+# --- SABLE-tz7h.2: @sable_class filter — a done producer pane (e.g. victor)
+#     with a valid deliverable is reaped; a manager pane's warm loop is never
+#     touched, even if (erroneously) flagged done ---
+DELIVERABLE="$(mktemp)"
+echo '{"ok": true}' > "$DELIVERABLE"
+
+tmux -L "$SOCK" new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
+sleep 0.3
+tmux -L "$SOCK" split-window -t w 'bash --noprofile --norc'
+sleep 0.3
+PANE7="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"   # producer, done, valid deliverable
+PANE8="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 2p)"   # manager warm loop
+tag_full "$PANE7" victor bead-victor done producer "$DELIVERABLE"
+tag_full "$PANE8" optimus "" done manager ""
+
+out4="$(run_status --reap 2>&1)"
+rc4=$?
+if [ "$rc4" -eq 0 ]; then
+  pass "--reap exits 0 with a done producer + a manager pane present"
+else
+  fail "--reap exits 0 with a done producer + a manager pane present" "exit $rc4: $out4"
+fi
+sleep 0.3
+p7_alive="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$PANE7" || true)"
+p8_alive="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$PANE8" || true)"
+if [ "$p7_alive" -eq 0 ]; then
+  pass "--reap kills a done producer pane with a valid deliverable"
+else
+  fail "--reap kills a done producer pane with a valid deliverable" "producer pane still alive"
+fi
+if [ "$p8_alive" -eq 1 ]; then
+  pass "--reap never touches a manager-class pane, even flagged done"
+else
+  fail "--reap never touches a manager-class pane, even flagged done" "manager pane alive=$p8_alive"
+fi
+rm -f "$DELIVERABLE"
+# the manager pane survives by design -- tear its session down explicitly so
+# the next fixture block gets a clean 'w' session, not a collision
+tmux -L "$SOCK" kill-session -t w >/dev/null 2>&1 || true
+sleep 0.2
+
+# --- composer-safety regression (SABLE-1umr) must also fire for producer
+#     panes: unsubmitted input is cleared + flagged before the kill, not
+#     silently destroyed, and the pane is still reaped afterward ---
+DELIVERABLE2="$(mktemp)"
+echo '{"ok": true}' > "$DELIVERABLE2"
+tmux -L "$SOCK" new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
+sleep 0.3
+PANE9="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"
+tag_full "$PANE9" victor bead-victor2 done producer "$DELIVERABLE2"
+tmux -L "$SOCK" send-keys -t "$PANE9" "PS1='> '" Enter
+sleep 0.3
+tmux -L "$SOCK" send-keys -t "$PANE9" -l "check the pool for next work"
+sleep 0.2
+
+out5="$(run_status --reap 2>&1)"
+if printf '%s' "$out5" | grep -q "market-brief-package-0h8k"; then
+  pass "--reap flags a producer pane's pending composer input instead of staying silent"
+else
+  fail "--reap flags a producer pane's pending composer input instead of staying silent" "$out5"
+fi
+sleep 0.3
+p9_alive="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$PANE9" || true)"
+if [ "$p9_alive" -eq 0 ]; then
+  pass "producer pane is still reaped after its pending input is cleared+flagged"
+else
+  fail "producer pane is still reaped after its pending input is cleared+flagged" "pane alive=$p9_alive"
+fi
+rm -f "$DELIVERABLE2"
 
 echo
 echo "=========================================="

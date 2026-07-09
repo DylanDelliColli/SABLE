@@ -1,19 +1,36 @@
 #!/usr/bin/env python3
-"""sable-worker-status — list SABLE worker panes and (optionally) reap done ones.
+"""sable-worker-status — list SABLE worker/producer panes and (optionally)
+reap done ones.
 
-Part of the warm-pane worker lifecycle (SABLE-bldh.4). A worker pane carries
-three tmux per-pane user-options:
-  @sable_role=worker     set by sable-spawn-worker at spawn
-  @sable_bead=<id>       the bead the worker is executing
-  @sable_status=running  flipped to "done" by the worker as its final act
-                         (after it pushes its worktree branch + closes its bead)
+Part of the warm-pane lifecycle (SABLE-bldh.4, extended by SABLE-tz7h.2 for
+bounded producer panes like victor). A dispatched pane carries tmux per-pane
+user-options:
+  @sable_class=worker|producer|manager   pane lifecycle classification
+                                         (architecture.json decision 2)
+  @sable_role=<role>     e.g. worker, victor, optimus
+  @sable_bead=<id>       the bead the worker/producer is executing
+  @sable_status=running  flipped to "done" by the pane as its final act
+  @sable_deliverable=<path>  producer only: the JSON file it must write
+
+Classification is driven by @sable_class: worker/producer panes are tracked;
+manager panes (the always-on Optimus/Tarzan/Chuck loops) are never surfaced
+or reaped. A pane with an EMPTY/missing @sable_class falls back to the legacy
+WORKER_ROLE_PREFIX role-name check — back-compat for worker panes spawned by
+sable-spawn-worker, which does not yet stamp @sable_class. A pane whose class
+is some other, unrecognized value is still listed (so a human notices it) but
+is never reap-eligible — a fail-safe for a tag this tool doesn't understand.
+
+A done producer whose @sable_deliverable is missing or not valid JSON is NOT
+killed; it is flagged "done-no-deliverable" in the report instead (the
+SABLE-e6m6 pull-authoritative detection surface — the resume/respawn ACTION
+stays with Lincoln in v1).
 
 The bead pool is the manager's RESULT channel (the manager reviews the closed
-bead). This tool is the janitor: it surfaces worker liveness and reaps panes
-whose worker has flagged itself done — pure tmux, no bd coupling.
+bead). This tool is the janitor: it surfaces pane liveness and reaps panes
+whose occupant has flagged itself done — pure tmux, no bd coupling.
 
 Usage:
-  sable-worker-status            # table of worker panes (pane / bead / status)
+  sable-worker-status            # table of worker/producer panes
   sable-worker-status --reap     # also kill panes whose @sable_status=done
   sable-worker-status --json
 
@@ -35,7 +52,8 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import SessionCollision, resolve_session  # noqa: E402
 
 WORKER_ROLE_PREFIX = "worker"
-_FORMAT = "#{pane_id} #{@sable_role} #{@sable_bead} #{@sable_status}"
+_FORMAT = ("#{pane_id} #{@sable_role} #{@sable_bead} #{@sable_status} "
+           "#{@sable_class} #{@sable_deliverable}")
 
 
 def tmux_base(socket: str | None) -> list[str]:
@@ -43,20 +61,41 @@ def tmux_base(socket: str | None) -> list[str]:
 
 
 def parse_worker_panes(output: str) -> list[dict]:
-    """Parse `tmux list-panes -F '<pane> <role> <bead> <status>'` into worker
-    records. Non-worker / role-less panes are skipped. Missing status defaults to
-    'running' (a just-spawned worker may not have set it yet)."""
+    """Parse `tmux list-panes -F _FORMAT` into worker/producer records.
+
+    Worker records stay a bare {pane, bead, status} dict — the exact shape
+    this function has always returned, since existing callers/tests key off
+    it. Producer records (and the unrecognized-class fail-safe below)
+    additionally carry "class" (and, for producers, "deliverable"), since
+    reaping_decision needs them to gate the kill decision. Missing status
+    defaults to 'running' (a just-spawned pane may not have set it yet)."""
     workers: list[dict] = []
     for line in output.splitlines():
-        parts = line.split()
+        parts = line.split(maxsplit=5)
         if len(parts) < 2:
             continue
         pane, role = parts[0], parts[1]
-        if not role.startswith(WORKER_ROLE_PREFIX):
-            continue
         bead = parts[2] if len(parts) >= 3 else ""
         status = parts[3] if len(parts) >= 4 and parts[3] else "running"
-        workers.append({"pane": pane, "bead": bead, "status": status})
+        cls = parts[4] if len(parts) >= 5 and parts[4] else ""
+        deliverable = parts[5] if len(parts) >= 6 and parts[5] else ""
+
+        if cls == "manager":
+            continue  # always-on manager loops are never surfaced/reaped
+        if cls == "":
+            if not role.startswith(WORKER_ROLE_PREFIX):
+                continue  # legacy rule: role-less / non-worker panes skipped
+            workers.append({"pane": pane, "bead": bead, "status": status})
+        elif cls == "worker":
+            workers.append({"pane": pane, "bead": bead, "status": status})
+        elif cls == "producer":
+            workers.append({"pane": pane, "bead": bead, "status": status,
+                            "class": "producer", "deliverable": deliverable})
+        else:
+            # unrecognized non-empty class: list it (a human should notice),
+            # but never reap it -- see reaping_decision's fail-safe.
+            workers.append({"pane": pane, "bead": bead, "status": status,
+                            "class": cls, "deliverable": deliverable})
     return workers
 
 
@@ -64,8 +103,47 @@ def is_done(status: str) -> bool:
     return status == "done"
 
 
+def deliverable_ok(path: str) -> bool:
+    """True when a producer's @sable_deliverable file exists and parses as
+    valid JSON — the SABLE-e6m6 pull-authoritative detection signal (a
+    written, parseable file is the one completion signal that survives a
+    producer idling without ever sending a final message)."""
+    if not path:
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            json.load(fh)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def done_no_deliverable(workers: list[dict]) -> list[dict]:
+    """Done producer panes whose deliverable is missing or not valid JSON.
+    Not reaped (see reaping_decision) but surfaced so a human or manager
+    notices the stall instead of the pane silently sitting there forever."""
+    return [w for w in workers
+            if w.get("class") == "producer" and is_done(w["status"])
+            and not deliverable_ok(w.get("deliverable", ""))]
+
+
 def reaping_decision(workers: list[dict]) -> list[str]:
-    return [w["pane"] for w in workers if is_done(w["status"])]
+    """Panes to kill: any done worker/producer pane, EXCEPT (a) a done
+    producer whose @sable_deliverable is missing or invalid — flagged via
+    done_no_deliverable instead of killed — and (b) any pane carrying an
+    unrecognized @sable_class — fail-safe, never reaped since this tool
+    doesn't understand its lifecycle contract."""
+    doomed = []
+    for w in workers:
+        if not is_done(w["status"]):
+            continue
+        cls = w.get("class")
+        if cls is not None and cls != "producer":
+            continue  # unrecognized class tag -- fail-safe, never reap
+        if cls == "producer" and not deliverable_ok(w.get("deliverable", "")):
+            continue  # done-no-deliverable -- flagged, not killed
+        doomed.append(w["pane"])
+    return doomed
 
 
 def dedupe_panes(workers: list[dict]) -> list[dict]:
@@ -196,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
         return 4
 
     workers = list_workers(socket, session=session)
+    dnd_panes = {w["pane"] for w in done_no_deliverable(workers)}
 
     if ns.json:
         print(json.dumps(workers, indent=2))
@@ -203,13 +282,17 @@ def main(argv: list[str] | None = None) -> int:
         if not workers:
             print("no worker panes")
         for w in workers:
-            print(f"{w['pane']:<8} {w['bead']:<16} {w['status']}")
+            flag = " [done-no-deliverable]" if w["pane"] in dnd_panes else ""
+            print(f"{w['pane']:<8} {w['bead']:<16} {w['status']}{flag}")
 
     if ns.reap:
         doomed = reaping_decision(workers)
         flagged = reap(doomed, socket)
         note = f", {len(flagged)} had pending input cleared+flagged" if flagged else ""
-        sys.stderr.write(f"sable-worker-status: reaped {len(doomed)} done pane(s){note}\n")
+        dnd_note = (f", {len(dnd_panes)} producer(s) done-no-deliverable (not reaped)"
+                    if dnd_panes else "")
+        sys.stderr.write(
+            f"sable-worker-status: reaped {len(doomed)} done pane(s){note}{dnd_note}\n")
     return 0
 
 

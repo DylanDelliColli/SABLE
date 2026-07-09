@@ -210,5 +210,146 @@ def test_list_workers_missing_session_is_empty():
     assert sws.list_workers(None, run=runner, session="sable-gone") == []
 
 
+# --- SABLE-tz7h.2: @sable_class filter — worker-name-prefix classification
+# replaced by the pane's own @sable_class tag (architecture.json decision 2),
+# with a legacy fallback so already-running untagged worker panes (e.g. from
+# a not-yet-updated sable-spawn-worker) are never silently dropped ---
+
+def test_parse_worker_panes_includes_producer_tagged_panes():
+    out = "%7 victor bead-v done producer /tmp/deliverable.json\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{
+        "pane": "%7", "bead": "bead-v", "status": "done",
+        "class": "producer", "deliverable": "/tmp/deliverable.json",
+    }]
+
+
+def test_parse_worker_panes_still_includes_explicit_worker_class():
+    out = "%9 worker bead-w running worker\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%9", "bead": "bead-w", "status": "running"}]
+
+
+def test_parse_worker_panes_excludes_manager_class():
+    # a manager (e.g. optimus) always-on loop, explicitly tagged -- must
+    # never be surfaced by this tool, regardless of its @sable_status
+    out = "%8 optimus - done manager\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == []
+
+
+def test_parse_worker_panes_missing_class_falls_back_to_legacy_worker_rule():
+    # @sable_class unset (empty placeholder) -- back-compat: still classified
+    # as a worker via the WORKER_ROLE_PREFIX role-name check
+    out = "%10 worker bead-legacy running\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%10", "bead": "bead-legacy", "status": "running"}]
+
+
+def test_parse_worker_panes_missing_class_non_worker_role_still_skipped():
+    # the legacy fallback only rescues worker-prefixed roles; a non-worker
+    # role with no class tag is skipped exactly as before this bead
+    out = "%11 sherlock bead-s done\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == []
+
+
+def test_parse_worker_panes_lists_unrecognized_class_but_flags_it():
+    out = "%12 sherlock bead-x done gremlin\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{
+        "pane": "%12", "bead": "bead-x", "status": "done",
+        "class": "gremlin", "deliverable": "",
+    }]
+
+
+def test_reaping_decision_never_reaps_unrecognized_class():
+    workers = [{"pane": "%12", "bead": "bead-x", "status": "done", "class": "gremlin"}]
+    assert sws.reaping_decision(workers) == []
+
+
+# --- reap decision + detection surface for the SABLE-e6m6 done-no-deliverable
+# fail-safe: a done producer with a written, valid-JSON deliverable is reaped
+# normally; one without is flagged and left alive ---
+
+def test_deliverable_ok_true_for_valid_json(tmp_path):
+    path = tmp_path / "d.json"
+    path.write_text('{"ok": true}')
+    assert sws.deliverable_ok(str(path)) is True
+
+
+def test_deliverable_ok_false_for_missing_file(tmp_path):
+    assert sws.deliverable_ok(str(tmp_path / "missing.json")) is False
+
+
+def test_deliverable_ok_false_for_malformed_json(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text("not json{{{")
+    assert sws.deliverable_ok(str(path)) is False
+
+
+def test_deliverable_ok_false_for_empty_path():
+    assert sws.deliverable_ok("") is False
+
+
+def test_reaping_decision_reaps_done_producer_with_valid_deliverable(tmp_path):
+    deliverable = tmp_path / "d.json"
+    deliverable.write_text('{"ok": true}')
+    workers = [{"pane": "%1", "bead": "b", "status": "done",
+                "class": "producer", "deliverable": str(deliverable)}]
+    assert sws.reaping_decision(workers) == ["%1"]
+
+
+def test_reaping_decision_excludes_done_producer_missing_deliverable(tmp_path):
+    workers = [{"pane": "%1", "bead": "b", "status": "done", "class": "producer",
+                "deliverable": str(tmp_path / "missing.json")}]
+    assert sws.reaping_decision(workers) == []
+
+
+def test_reaping_decision_excludes_done_producer_malformed_deliverable(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text("not json")
+    workers = [{"pane": "%1", "bead": "b", "status": "done", "class": "producer",
+                "deliverable": str(bad)}]
+    assert sws.reaping_decision(workers) == []
+
+
+def test_reaping_decision_still_reaps_plain_worker_panes():
+    # regression guard: bare worker dicts (no "class" key at all) must keep
+    # reaping exactly as before this bead
+    workers = [{"pane": "%1", "bead": "a", "status": "done"}]
+    assert sws.reaping_decision(workers) == ["%1"]
+
+
+def test_done_no_deliverable_flags_missing_and_malformed(tmp_path):
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("not json")
+    workers = [
+        {"pane": "%1", "bead": "a", "status": "done", "class": "producer",
+         "deliverable": str(tmp_path / "missing.json")},
+        {"pane": "%2", "bead": "b", "status": "done", "class": "producer",
+         "deliverable": str(bad_json)},
+    ]
+    flagged = {w["pane"] for w in sws.done_no_deliverable(workers)}
+    assert flagged == {"%1", "%2"}
+
+
+def test_done_no_deliverable_empty_when_deliverable_valid(tmp_path):
+    good = tmp_path / "good.json"
+    good.write_text("{}")
+    workers = [{"pane": "%1", "bead": "a", "status": "done", "class": "producer",
+                "deliverable": str(good)}]
+    assert sws.done_no_deliverable(workers) == []
+
+
+def test_done_no_deliverable_ignores_non_producer_and_not_done():
+    workers = [
+        {"pane": "%1", "bead": "a", "status": "done"},  # plain worker, no class
+        {"pane": "%2", "bead": "b", "status": "running", "class": "producer",
+         "deliverable": "/nonexistent.json"},  # not done yet
+    ]
+    assert sws.done_no_deliverable(workers) == []
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
