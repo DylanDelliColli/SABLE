@@ -57,9 +57,16 @@ sable_is_git_push "$COMMAND" || exit 0
 CWD=$(sable_resolve_push_repo_dir "$CWD" "$COMMAND")
 [ -z "$CWD" ] && exit 0
 
-# Quick success heuristic: rejected/error/fatal in stderr means failure
+# SABLE-b06t: no-op push guard. 'Everything up-to-date' (exit 0, nothing new
+# landed) doesn't match any failure keyword, so a keyword-only heuristic
+# notifies chuck for content that was never actually pushed by THIS command
+# (observed live: tarzan's tmux-only push, origin/tmux-only unchanged at
+# 95ce920). The positive ls-remote confirmation below (after BRANCH is known)
+# can't catch this case on its own — remote tip == local HEAD looks identical
+# whether this push is the one that landed it or a resend of already-landed
+# content — so this text check stays as the no-op-specific leg.
 STDOUT_STDERR=$(echo "$PARSED" | sed -n '/---STDOUT---/,$p')
-if echo "$STDOUT_STDERR" | grep -qiE '(rejected|! \[remote rejected\]|error: failed to push|fatal:)'; then
+if echo "$STDOUT_STDERR" | grep -qiE 'everything[[:space:]]+up-to-date'; then
   exit 0
 fi
 
@@ -101,6 +108,24 @@ BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 # promotion decided elsewhere, not routine merge-queue work; chuck triaged an
 # earlier misfire of this exact shape as a false-positive).
 [ "$BRANCH" = "$INTEGRATION_BRANCH" ] && exit 0
+
+# SABLE-b06t: positive push confirmation, replacing the vacuous failure-phrase
+# grep for the exact scenario it was blind to. That heuristic only caught
+# failures matching its exact phrase list; it missed the wk-prodspawn
+# incident (chuck reviewed a PR-ready message for a branch that never reached
+# origin — verified absent after two `git fetch --prune` runs — because the
+# worker's push had failed in some way whose captured output didn't trip any
+# of the four tracked phrases). Require the branch's remote tip to match
+# local HEAD: if the push never actually landed (rejected, auth/network
+# failure, no upstream, or any other failure text this heuristic doesn't
+# know about), ls-remote either returns nothing for the ref or returns a tip
+# that doesn't match — either way, skip instead of notifying chuck to review
+# work that isn't there.
+REMOTE_TIP=$(git -C "$CWD" ls-remote --exit-code origin "refs/heads/$BRANCH" 2>/dev/null | cut -f1 || echo "")
+LOCAL_HEAD=$(git -C "$CWD" rev-parse HEAD 2>/dev/null || echo "")
+[ -z "$REMOTE_TIP" ] && exit 0
+[ -z "$LOCAL_HEAD" ] && exit 0
+[ "$REMOTE_TIP" != "$LOCAL_HEAD" ] && exit 0
 
 FILES=$(git -C "$CWD" diff "$BASE_BRANCH"...HEAD --name-only 2>/dev/null | head -50)
 [ -z "$FILES" ] && exit 0

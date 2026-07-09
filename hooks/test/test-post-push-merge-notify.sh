@@ -61,6 +61,21 @@ git push -q origin HEAD:refs/heads/main 2>/dev/null
 echo "y" > feature.txt
 git add feature.txt
 git commit -q -m "feature"
+# SABLE-b06t: push the "feature" commit for real too, under the ACTUAL local
+# branch name ONLY (not 'main' again) — the hook now positively confirms via
+# ls-remote that refs/heads/<local branch> matches local HEAD before
+# notifying, so a fixture that only commits locally (never landing on the
+# bare origin) no longer represents "this push succeeded". origin/main stays
+# pinned at the earlier "initial" commit so `git diff origin/main...HEAD`
+# still yields feature.txt — re-pushing "feature" onto refs/heads/main here
+# would make origin/main == HEAD and erase the diff FILES depends on. Not
+# renaming the local branch to 'main' either: this environment's
+# init.defaultBranch is NOT 'main' (confirmed 'master'), and renaming it TO
+# 'main' would collide with sable_resolve_integration_branch's OWN
+# unconfigured-repo default of 'main', false-triggering the
+# integration-branch self-push guard.
+FIXTURE_CUR_BRANCH=$(git symbolic-ref --short HEAD)
+git push -q origin "HEAD:refs/heads/$FIXTURE_CUR_BRANCH" 2>/dev/null
 cd - >/dev/null
 
 # Create stub bd binary that counts calls and logs for-chuck label usage
@@ -251,6 +266,14 @@ git push -q origin HEAD:refs/heads/main 2>/dev/null
 echo "b" > feature2.txt
 git add feature2.txt
 git commit -q -m "feature2"
+# SABLE-b06t: push the "feature2" commit under the actual local branch name
+# ONLY, leaving origin/main pinned at "base" — see the FIXTURE_REPO comment
+# above for why (re-pushing onto refs/heads/main here would make origin/main
+# == HEAD and erase the diff FILES depends on; the local branch isn't
+# renamed to 'main' either, to avoid colliding with
+# sable_resolve_integration_branch's unconfigured-repo default).
+INT_CUR_BRANCH=$(git symbolic-ref --short HEAD)
+git push -q origin "HEAD:refs/heads/$INT_CUR_BRANCH" 2>/dev/null
 cd - >/dev/null
 # Note: origin/dev intentionally NOT created
 
@@ -369,6 +392,7 @@ cd "$WT_041"
 echo "z" > wt_change.txt
 git add wt_change.txt
 git commit -q -m "wt change on wk-041"
+git push -q origin HEAD:refs/heads/wk-041 2>/dev/null
 cd - >/dev/null
 
 INPUT=$(make_post_input "git -C $WT_041 push" "$FIXTURE_REPO")
@@ -455,6 +479,7 @@ rm -f "$SABLE_MSG_LOG"
 cd "$INTNOTIFY_REPO"
 git checkout -q -b wk-other tmux-only
 echo w1 > w1.txt; git add w1.txt; git commit -q -m w1
+git push -q origin HEAD:refs/heads/wk-other 2>/dev/null
 cd - >/dev/null
 INT_INPUT_B=$(make_post_input "git push origin wk-other" "$INTNOTIFY_REPO")
 run_hook "$MGR_ENV SABLE_BASE_BRANCH=origin/llm-integration" "$INT_INPUT_B" >/dev/null
@@ -545,6 +570,79 @@ echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
 exit 0
 EOF
 chmod +x "$STUB_DIR/bd"
+
+# --------------------------------------------------------------------------
+# SABLE-b06t: replace the vacuous failure-phrase grep with positive push
+# confirmation (git ls-remote tip vs local HEAD). The old heuristic only
+# caught failures matching its exact phrase list; live incidents slipped
+# through it both when the failure text didn't match (wk-prodspawn: chuck
+# reviewed a PR-ready message for a branch that never reached origin) and
+# when there was no failure at all, just nothing NEW to push ("Everything
+# up-to-date" on tmux-only, chuck received a self-referential merge request
+# for unchanged content).
+# --------------------------------------------------------------------------
+
+B06T_BARE=$(mktemp -d)
+B06T_REPO=$(mktemp -d)
+trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO"' EXIT
+
+git init -q --bare "$B06T_BARE"
+git clone -q "$B06T_BARE" "$B06T_REPO"
+cd "$B06T_REPO"
+git config user.email "b@b"; git config user.name "b"
+echo base > base.txt; git add base.txt; git commit -q -m base
+B06T_MAIN=$(git symbolic-ref --short HEAD)
+git push -q origin "HEAD:refs/heads/$B06T_MAIN" 2>/dev/null
+# Also publish origin/main so BASE_BRANCH resolution (default/fallback) has
+# a real diff target — mirrors the FIXTURE_REPO/INT_REPO fixtures above.
+git push -q origin HEAD:refs/heads/main 2>/dev/null
+
+# A branch with a real local commit that is NOT (yet) on origin — models a
+# push that never actually landed, whatever the reason (rejected, network/
+# auth failure, or any failure text the old grep didn't know about).
+git checkout -q -b wk-b06t
+echo change > b06t_change.txt; git add b06t_change.txt; git commit -q -m "worker change"
+cd - >/dev/null
+
+# (1) Realistic rejected-push stderr text — the old heuristic WOULD catch
+# this one (it matches 'rejected'/'failed to push'), but confirm the new
+# positive check also agrees: no notify, since the branch tip really isn't
+# on origin.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+B06T_INPUT_1=$(make_post_input "git push" "$B06T_REPO" "" "! [rejected]        wk-b06t -> wk-b06t (non-fast-forward)
+error: failed to push some refs to 'origin'")
+run_hook "$MGR_ENV" "$B06T_INPUT_1" >/dev/null
+assert_bd_not_called "SABLE-b06t: rejected push (branch not really on origin) does NOT file for-chuck"
+
+# (2) The exact schema-drift hypothesis this bead investigated: EMPTY
+# stdout/stderr (as if output capture were unavailable), same unpushed
+# branch. The old grep-only heuristic has nothing to match here and would
+# notify anyway; the positive ls-remote check doesn't depend on the text at
+# all and must still refuse.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+B06T_INPUT_2=$(make_post_input "git push" "$B06T_REPO" "" "")
+run_hook "$MGR_ENV" "$B06T_INPUT_2" >/dev/null
+assert_bd_not_called "SABLE-b06t: empty stdout/stderr + unpushed branch does NOT file for-chuck"
+
+# (3) Now actually push wk-b06t for real — the branch tip IS confirmable on
+# origin — and confirm notify fires.
+cd "$B06T_REPO"
+git push -q origin HEAD:refs/heads/wk-b06t 2>/dev/null
+cd - >/dev/null
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+B06T_INPUT_3=$(make_post_input "git push" "$B06T_REPO")
+run_hook "$MGR_ENV" "$B06T_INPUT_3" >/dev/null
+assert_bd_called "SABLE-b06t: confirmable push (branch tip matches origin) files for-chuck"
+
+# (4) No-op push guard: 'Everything up-to-date' in the captured output must
+# not notify even though the branch tip trivially matches origin (it's the
+# same content as an earlier, already-notified push) — ls-remote tip
+# comparison alone can't distinguish a fresh landing from a resend of
+# already-landed content.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+B06T_INPUT_4=$(make_post_input "git push" "$B06T_REPO" "" "Everything up-to-date")
+run_hook "$MGR_ENV" "$B06T_INPUT_4" >/dev/null
+assert_bd_not_called "SABLE-b06t: 'Everything up-to-date' no-op push does NOT file for-chuck"
 
 # --------------------------------------------------------------------------
 # Summary
