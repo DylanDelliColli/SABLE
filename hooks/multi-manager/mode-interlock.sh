@@ -33,9 +33,17 @@
 #
 # Soft override: a Bash command carrying `--force`, or env
 # SABLE_ORCHESTRATION_FORCE=1, is always allowed. The interlock is a guardrail,
-# not a wall. No mode set → inert. SABLE_ORCHESTRATION=off → inert. Mode is read
-# from the mode-state file that bin/sable-mode owns (SABLE_MODE_STATE or
-# ~/.claude/sable/state/mode-state.json), preferring the helper when resolvable.
+# not a wall. On the Bash leg the env form is honored both ways: set in the
+# hook process's own environment, AND as an inline `SABLE_ORCHESTRATION_FORCE=1
+# <command>` prefix on the command text itself — the latter is parsed out of
+# the command string because the hook runs as a separate process from whatever
+# the Bash tool eventually execs, so it can't inherit an env assignment inline
+# to a command it hasn't run yet. No mode set → inert. SABLE_ORCHESTRATION=off
+# → inert. Mode is read from the mode-state file that bin/sable-mode owns
+# (SABLE_MODE_STATE or ~/.claude/sable/state/mode-state.json), preferring the
+# helper when resolvable. sable-mode invocations are exempt from the
+# manager/producer launch classifier entirely — its own flags legitimately
+# carry agent names (e.g. `--fleet victor`) that aren't a spawn attempt.
 
 set -uo pipefail
 
@@ -245,6 +253,22 @@ except Exception:
 
 # Soft override: explicit --force flag on the command.
 printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exit 0
+
+# Soft override: SABLE_ORCHESTRATION_FORCE=1 as an inline prefix on the command
+# text itself (e.g. `SABLE_ORCHESTRATION_FORCE=1 sable-mode set planning ...`).
+# The top-of-script check only sees this hook process's OWN env, which does not
+# inherit an assignment inline to a command the tool hasn't run yet — that
+# assignment only ever applies to the subprocess the Bash tool later execs, so
+# the process-env check alone can never observe it. Parse it out of the command
+# text directly, mirroring the --force handling above.
+printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])SABLE_ORCHESTRATION_FORCE=1([[:space:]]|$)' && exit 0
+
+# sable-mode is the sanctioned mode-transition command run by /sable-plan and
+# /sable-execute; its own flags legitimately carry agent/producer names (e.g.
+# `--fleet victor`) that would otherwise false-positive the launch classifier
+# below, which only wants the token in COMMAND position, not anywhere in the
+# argument list. sable-mode itself never spawns anything, so exempt it outright.
+printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])sable-mode([[:space:]]|$)' && exit 0
 
 # Detect an attempt to launch a given set of named agents — either by setting
 # CLAUDE_AGENT_NAME=<name> on a claude invocation, or by invoking the bare
