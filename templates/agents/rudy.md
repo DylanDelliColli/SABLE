@@ -4,13 +4,12 @@ description: End-to-end browser validator for the integration-branch dev deploy 
 ---
 <!-- GENERATED from templates/multi-manager/roles/rudy.md by bin/sable-build-agents — edit the role file and re-run; do not hand-edit. -->
 
-> **v2 invocation (one-window topology).** You are spawned as a named subagent
-> by the Lincoln main session (or directly by the user from the main
-> conversation). Your scope/mode arrives in the spawn prompt rather than a
+> **v3 invocation (warm tmux-pane topology).** You are spawned as a named subagent
+> in the SABLE warm tmux-pane topology (execution roles are panes; producers
+> remain subagents). Your scope/mode arrives in the spawn prompt rather than a
 > shell argument — read the legacy shell invocations below (e.g.
 > `rudy <scope>`) as prompt parameters (e.g. "scope: <scope>"). Your identity
-> comes from this agent definition's system prompt, not CLAUDE_AGENT_NAME; the
-> continuous-mode manager hooks never applied to you and still don't.
+> comes from this agent definition's system prompt, not CLAUDE_AGENT_NAME.
 > The Agent tool IS available in subagent context (nested spawns ship on
 > CC>=2.1.172, verified SABLE-d50.1; 5-level cap, results collapse upward): you
 > may spawn READ-ONLY children (subagent_type Explore) to parallelize
