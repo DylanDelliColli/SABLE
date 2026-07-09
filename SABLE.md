@@ -1108,6 +1108,27 @@ bd worktree remove <name>  # Remove (with safety checks)
 
 **Anti-pattern:** dispatching multiple workers into the same working tree because "they're touching different files." This breaks the moment one worker imports from a file another is editing, when shared config changes, or when test runners cache state. Use a worktree per worker; the cost is one bash call.
 
+### 6.4a Git Stash Policy
+
+**`git stash` is banned in worker and manager dispatch flows.** `refs/stash` lives in the shared common `.git` directory, not per-worktree — `git worktree add` gives each worktree its own working directory, HEAD, and index, but every worktree of the same repo still pushes and pops from *one* shared stash stack. In a swarm with N concurrent worktrees, `git stash push/pop/list/drop` run by any worker operate on that single shared stack regardless of which worktree issued the command.
+
+This is not theoretical: a worker mid-task stashed a file to prove a regression test failed against pre-fix code; between its `push` and `pop`, a second, unrelated worker in a different worktree also pushed a stash entry, shifting indices. The first worker's `pop` pulled the *second* worker's WIP into its own worktree instead of its own change. No work was lost only because the second worker's change also existed independently in its own working tree — if it hadn't, the pop would have silently relocated someone else's only copy of uncommitted work into the wrong worktree, and a later `drop` by either worker could have destroyed it outright. See `market-brief-package-yjb8` for the full incident trail.
+
+**Instead, use worktree-local alternatives that touch no shared ref:**
+
+For a temporary revert-and-restore (e.g., proving a test fails against old code before your fix):
+
+```bash
+git diff -- <path> > /path/to/scratchpad/patch.diff   # save your change
+git checkout -- <path>                                 # revert to committed state
+# ...run the test against the reverted code...
+git apply /path/to/scratchpad/patch.diff               # restore your change
+```
+
+This uses only your own worktree's working directory and a scratch file — no shared ref, no race with any other worker.
+
+**Break-glass fallback**, only if stash is truly unavoidable: prefix your stash message with your worker/scope name (`git stash push -m "<scope>: <what>"`), and treat the stack as hostile — run `git stash list` immediately before every `pop`/`drop` and act **only** by explicit index (`git stash pop stash@{N}`). Never assume `stash@{0}` is yours; another worker may have pushed after you.
+
 ### 6.5 Formal Swarms with `bd swarm`
 
 Section 6.2 covered the dispatch pattern. `bd swarm` formalizes it: an epic + its children become a registered "swarm molecule" with structure-aware tooling.
