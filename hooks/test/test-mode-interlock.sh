@@ -442,6 +442,62 @@ assert_allow "pi5m: execution allows bd create naming sable-spawn-worker" \
   'bd create --type=task --title="x" --description="names sable-spawn-worker in prose"'
 set_mode planning
 
+# ---------- SABLE-pi5m REVISE: name-leg prose FPs + assignment-prefixed spawn slip ----------
+# The launches() name legs (manager/producer aliases) had the SAME plain-space
+# boundary defect the spawn legs did: a manager/producer NAME appearing mid-prose
+# in a message/note/description false-matched as a launch. And is_spawn_call's
+# command-position regex could not see past a leading VAR=val assignment, so an
+# assignment-prefixed REAL spawn invocation slipped the deny. Fixes: launches()
+# now anchors to command-word position + allow-lists prose carriers (bd /
+# sable-note / sable-msg via is_prose_carrier); is_spawn_call also treats
+# lead==helper as an invocation.
+
+# --- EXECUTION: message/note prose naming each producer must be ALLOWED ---
+set_mode execution
+assert_allow "pi5m: execution allows sable-msg prose naming sherlock (mid-sentence)" \
+  'sable-msg lincoln "shipped the sherlock findings today"'
+assert_allow "pi5m: execution allows sable-msg prose naming victor" \
+  'sable-msg lincoln "the victor run cleared the pool"'
+assert_allow "pi5m: execution allows sable-msg prose naming columbo" \
+  'sable-msg lincoln "columbo planned the test coverage"'
+assert_allow "pi5m: execution allows sable-msg prose naming gaudi" \
+  'sable-msg lincoln "gaudi flagged an arch smell"'
+assert_allow "pi5m: execution allows sable-msg prose naming several producers" \
+  'sable-msg lincoln "sherlock, victor and columbo all reported in"'
+assert_allow "pi5m: execution allows sable-note naming a producer" \
+  'sable-note "sherlock over-matched producer names the same way"'
+assert_allow "pi5m: execution allows bd create prose naming a producer" \
+  'bd create --type=task --title="x" --description="follow-up from the sherlock audit"'
+# real producer launches still DENIED in execution (command-word position preserved)
+assert_deny  "pi5m: execution still blocks bare sherlock alias with args" 'sherlock src/auth'
+assert_deny  "pi5m: execution still blocks CLAUDE_AGENT_NAME=victor launch" 'CLAUDE_AGENT_NAME=victor claude'
+assert_deny  "pi5m: execution still blocks chained real gaudi launch" 'echo hi && gaudi --audit src'
+
+# --- PLANNING: prose naming a manager must be ALLOWED ---
+set_mode planning
+assert_allow "pi5m: planning allows sable-msg prose naming optimus (mid-sentence)" \
+  'sable-msg tarzan "ask optimus to take the epic"'
+assert_allow "pi5m: planning allows sable-msg prose naming tarzan and chuck" \
+  'sable-msg lincoln "tarzan and chuck are both idle"'
+assert_allow "pi5m: planning allows sable-note naming a manager" \
+  'sable-note "optimus lane is backed up on SABLE-qa4d"'
+assert_allow "pi5m: planning allows bd create prose naming a manager" \
+  'bd create --type=task --title="x" --description="hand the review to optimus"'
+assert_allow "pi5m: planning allows bd create prose with CLAUDE_AGENT_NAME= assignment (not a launch)" \
+  'bd create --type=task --title="x" --description="repro: CLAUDE_AGENT_NAME=optimus claude was blocked"'
+# real manager launches still DENIED in planning
+assert_deny  "pi5m: planning still blocks bare optimus alias" 'optimus'
+assert_deny  "pi5m: planning still blocks CLAUDE_AGENT_NAME=tarzan launch" 'CLAUDE_AGENT_NAME=tarzan claude'
+
+# --- assignment-prefixed REAL spawn-helper invocation still DENIED in planning ---
+# leading_cmd strips the VAR=val prefix, so is_spawn_call's lead==helper guard
+# catches these even though the position regex cannot see past the assignment.
+assert_deny  "pi5m: planning blocks assignment-prefixed sable-spawn-worker" \
+  'CLAUDE_AGENT_NAME=x sable-spawn-worker SABLE-y --worktree /wt'
+assert_deny  "pi5m: planning blocks assignment-prefixed sable-spawn-manager" \
+  'FOO=bar sable-spawn-manager --all'
+set_mode planning
+
 # ---------- settings-snippet registration ----------
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 if jq -e . "$SNIPPET" >/dev/null 2>&1; then pass "settings-snippet.json is valid JSON"; else fail "settings-snippet.json is valid JSON"; fi

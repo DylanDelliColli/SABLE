@@ -232,23 +232,39 @@ leading_cmd() {
   printf '%s' "$1" | awk '{ for (i=1;i<=NF;i++){ if ($i ~ /=/) continue; print $i; break } }' | tr '[:upper:]' '[:lower:]'
 }
 
+# is_prose_carrier <command> → true iff the leading command word legitimately
+# carries agent / producer / spawn-helper NAMES inside its arguments as prose
+# rather than as a launch (SABLE-pi5m). A bd --description, a sable-note body, a
+# sable-msg message, and a sable-mode --fleet flag all routinely name agents and
+# the spawn helpers (often with shell punctuation), and none of these commands
+# ever stands up an agent — so a name appearing in their args is never a spawn or
+# a launch. Shared by is_spawn_call (helper legs) and launches (name legs).
+is_prose_carrier() {
+  case "$(leading_cmd "$1")" in
+    bd|sable-note|sable-mode|sable-msg) return 0 ;;
+  esac
+  return 1
+}
+
 # is_spawn_call <helper> <command> → true iff <command> genuinely invokes
 # <helper> as a command, NOT merely names it inside a quoted argument (SABLE-pi5m
-# defect 1). Two guards:
-#   (a) leading-command allow-list — a bd / sable-note / sable-mode command's
-#       args legitimately carry the helper name in prose (a --description, a note
-#       body), often with shell punctuation; those are never a spawn.
-#   (b) command-word position — the helper must sit at the start of the command
+# defect 1). Three guards:
+#   (a) prose-carrier allow-list (is_prose_carrier) — a bd / sable-note /
+#       sable-msg / sable-mode command's args legitimately name the helper in
+#       prose, often with shell punctuation; those are never a spawn.
+#   (b) leading-word identity — if the first real command word (after any VAR=val
+#       assignment prefix, which leading_cmd strips) IS the helper, it is a spawn
+#       even though the position regex below cannot see past the assignment
+#       (e.g. `CLAUDE_AGENT_NAME=x sable-spawn-worker …`) — SABLE-pi5m follow-up.
+#   (c) command-word position — the helper must sit at the start of the command
 #       or immediately after a real shell separator (; & | ( or a newline, which
 #       grep's per-line ^ already covers). A plain space does NOT qualify: an
 #       argument-separating space is indistinguishable from a space inside a
 #       quoted string, and matching on it was the original false-positive.
 is_spawn_call() {
-  local helper="$1" cmd="$2" lead
-  lead="$(leading_cmd "$cmd")"
-  case "$lead" in
-    bd|sable-note|sable-mode) return 1 ;;
-  esac
+  local helper="$1" cmd="$2"
+  is_prose_carrier "$cmd" && return 1
+  [ "$(leading_cmd "$cmd")" = "$helper" ] && return 0
   printf '%s' "$cmd" | grep -qE "(^|[;&|(])[[:space:]]*${helper}([[:space:]]|\$)"
 }
 
@@ -300,13 +316,26 @@ printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exi
 # argument list. sable-mode itself never spawns anything, so exempt it outright.
 printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])sable-mode([[:space:]]|$)' && exit 0
 
-# Detect an attempt to launch a given set of named agents — either by setting
-# CLAUDE_AGENT_NAME=<name> on a claude invocation, or by invoking the bare
-# launch alias as the first word of the command.
+# Detect an attempt to launch a given set of named agents — either by invoking
+# the bare launch alias in command-word position, or by setting
+# CLAUDE_AGENT_NAME=<name> as a launch env prefix. Mirrors is_spawn_call's
+# command-position discipline (SABLE-pi5m): a manager/producer NAME appearing
+# inside a prose-carrying command's args — a bd --description, a sable-note body,
+# a sable-msg message — is NOT a launch. The pre-fix regex let a plain space
+# count as a boundary, so any name mid-sentence in quoted prose false-matched
+# (e.g. `sable-msg lincoln "shipped the sherlock findings"` denied in execution;
+# `sable-msg tarzan "ask optimus to take it"` denied in planning).
 launches() {
   # $1 = alternation like 'optimus|tarzan|chuck'
-  printf '%s' "$COMMAND" | grep -qE "CLAUDE_AGENT_NAME=($1)([[:space:]]|$)" && return 0
-  printf '%s' "$COMMAND" | grep -qE "(^|[[:space:];&|])($1)([[:space:]]|$)" && return 0
+  is_prose_carrier "$COMMAND" && return 1
+  # (a) bare launch alias as the leading command word (leading_cmd strips any
+  #     VAR=val assignment prefix, so `FOO=bar optimus` still resolves to optimus).
+  printf '%s' "$(leading_cmd "$COMMAND")" | grep -qE "^($1)\$" && return 0
+  # (b) bare launch alias in command-word position after a real shell separator.
+  printf '%s' "$COMMAND" | grep -qE "(^|[;&|(])[[:space:]]*($1)([[:space:]]|\$)" && return 0
+  # (c) CLAUDE_AGENT_NAME=<name> launch env prefix in command-word position (not
+  #     merely a name assignment quoted inside another command's prose).
+  printf '%s' "$COMMAND" | grep -qE "(^|[;&|(])[[:space:]]*CLAUDE_AGENT_NAME=($1)([[:space:]]|\$)" && return 0
   return 1
 }
 
