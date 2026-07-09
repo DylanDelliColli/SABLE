@@ -456,5 +456,203 @@ def test_resolve_base_ref_falls_back_to_desired_when_nothing_resolves(tmp_path):
     assert ssw.resolve_base_ref(str(lone), "origin/main") == "origin/main"
 
 
+# --- refresh: per-repo integration-branch base resolution (SABLE-ybdm) -------
+#
+# resolve_base_ref hardcoded an origin/main fallback and never consulted the
+# repo's OWN integration branch, so a reused worktree on a non-main integration
+# repo (tmux-only here) was silently rebased onto DIVERGED origin/main at spawn
+# time (same corruption class as SABLE-4amz at push time). The fix ports a Python
+# mirror of lib-identity.sh's sable_resolve_integration_branch + defaults the
+# refresh base to origin/<INT> when published.
+
+def _rev(cwd, ref="HEAD"):
+    return subprocess.run(["git", "-C", str(cwd), "rev-parse", ref],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _bare_repo(tmp_path, name="r"):
+    repo = tmp_path / name
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "T")
+    (repo / "seed.txt").write_text("seed")
+    _git(repo, "add", "seed.txt")
+    _git(repo, "commit", "-m", "seed")
+    return repo
+
+
+def test_resolve_integration_branch_prefers_git_config(worktree_with_origin):
+    _git(worktree_with_origin, "config", "sable.integrationBranch", "tmux-only")
+    assert ssw.resolve_integration_branch(str(worktree_with_origin)) == "tmux-only"
+
+
+def test_resolve_integration_branch_reads_dot_sable_file(tmp_path):
+    repo = _bare_repo(tmp_path)
+    (repo / ".sable").write_text("# comment\nintegrationBranch=dev\n")
+    assert ssw.resolve_integration_branch(str(repo)) == "dev"
+
+
+def test_resolve_integration_branch_git_config_wins_over_dot_sable(tmp_path):
+    repo = _bare_repo(tmp_path)
+    (repo / ".sable").write_text("integrationBranch=from-file\n")
+    _git(repo, "config", "sable.integrationBranch", "from-config")
+    assert ssw.resolve_integration_branch(str(repo)) == "from-config"
+
+
+def test_resolve_integration_branch_env_fallback_strips_origin(monkeypatch, tmp_path):
+    repo = _bare_repo(tmp_path)
+    monkeypatch.delenv("SABLE_INTEGRATION_BRANCH", raising=False)
+    monkeypatch.setenv("SABLE_BASE_BRANCH", "origin/tmux-only")
+    assert ssw.resolve_integration_branch(str(repo)) == "tmux-only"
+
+
+def test_resolve_integration_branch_defaults_to_main(monkeypatch, tmp_path):
+    repo = _bare_repo(tmp_path)
+    monkeypatch.delenv("SABLE_INTEGRATION_BRANCH", raising=False)
+    monkeypatch.delenv("SABLE_BASE_BRANCH", raising=False)
+    assert ssw.resolve_integration_branch(str(repo)) == "main"
+
+
+@pytest.fixture()
+def worktree_with_published_integration(tmp_path):
+    """Repo whose integration branch 'tmux-only' is PUBLISHED at origin/tmux-only,
+    with origin/main DIVERGED from it (each carries commits the other does not) —
+    the exact SABLE-ybdm shape. Returns the primary checkout path."""
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    _git(origin, "init", "--bare", "-b", "main")
+
+    work = tmp_path / "work"
+    work.mkdir()
+    _git(work, "init", "-b", "main")
+    _git(work, "config", "user.email", "t@example.com")
+    _git(work, "config", "user.name", "T")
+    _git(work, "config", "sable.integrationBranch", "tmux-only")
+    (work / "root.txt").write_text("root")
+    _git(work, "add", "root.txt")
+    _git(work, "commit", "-m", "root")
+    _git(work, "remote", "add", "origin", str(origin))
+    _git(work, "push", "origin", "main")
+    # integration branch diverges from main
+    _git(work, "checkout", "-b", "tmux-only")
+    (work / "int.txt").write_text("integration-only")
+    _git(work, "add", "int.txt")
+    _git(work, "commit", "-m", "integration lineage commit")
+    _git(work, "push", "origin", "tmux-only")
+    # advance origin/main independently so it is DIVERGED from tmux-only
+    _git(work, "checkout", "main")
+    (work / "main.txt").write_text("main-only")
+    _git(work, "add", "main.txt")
+    _git(work, "commit", "-m", "main-only commit")
+    _git(work, "push", "origin", "main")
+    _git(work, "fetch", "origin")
+    return work
+
+
+def test_resolve_refresh_base_defaults_to_published_integration_branch(
+        monkeypatch, worktree_with_published_integration):
+    # SABLE-ybdm: SABLE_BASE_BRANCH unset -> a reused worktree on a non-main
+    # integration repo must resolve origin/<INT>, NOT the diverged origin/main.
+    monkeypatch.delenv("SABLE_BASE_BRANCH", raising=False)
+    monkeypatch.delenv("SABLE_INTEGRATION_BRANCH", raising=False)
+    assert (ssw.resolve_refresh_base(
+        str(worktree_with_published_integration), None) == "origin/tmux-only")
+
+
+def test_resolve_refresh_base_explicit_base_still_wins(
+        worktree_with_published_integration):
+    # An explicit base (SABLE_BASE_BRANCH) still wins over the default (4amz shape).
+    assert (ssw.resolve_refresh_base(
+        str(worktree_with_published_integration), "origin/main") == "origin/main")
+
+
+def test_resolve_refresh_base_falls_back_to_origin_main_without_integration(
+        monkeypatch, worktree_with_origin):
+    # No sable.integrationBranch, no origin/<INT> published -> origin/main.
+    monkeypatch.delenv("SABLE_BASE_BRANCH", raising=False)
+    monkeypatch.delenv("SABLE_INTEGRATION_BRANCH", raising=False)
+    assert ssw.resolve_refresh_base(str(worktree_with_origin), None) == "origin/main"
+
+
+def test_refresh_worktree_rebases_onto_integration_not_diverged_main(
+        monkeypatch, worktree_with_published_integration):
+    # SABLE-ybdm integration test: a reused LINKED worktree cut from
+    # origin/tmux-only must NOT be re-parented onto diverged origin/main — its
+    # HEAD must be unchanged (rebase onto its own integration base is a no-op).
+    work = worktree_with_published_integration
+    _git(work, "branch", "wk-x", "origin/tmux-only")
+    wt = work.parent / "wk-x"
+    _git(work, "worktree", "add", str(wt), "wk-x")
+    head_before = _rev(wt)
+    monkeypatch.delenv("SABLE_BASE_BRANCH", raising=False)
+    monkeypatch.delenv("SABLE_INTEGRATION_BRANCH", raising=False)
+    warning = ssw.refresh_worktree(str(wt), None)
+    assert warning is None, warning
+    assert _rev(wt) == head_before  # no lineage rewrite
+    # still an descendant of the integration branch, never re-parented onto main
+    assert subprocess.run(
+        ["git", "-C", str(wt), "merge-base", "--is-ancestor",
+         "origin/tmux-only", "HEAD"], capture_output=True).returncode == 0
+    assert subprocess.run(
+        ["git", "-C", str(wt), "merge-base", "--is-ancestor",
+         "origin/main", "HEAD"], capture_output=True).returncode != 0
+
+
+# --- refresh: primary-checkout + invalid-path stand-down (SABLE-4byx) ---------
+#
+# refresh_worktree must STAND DOWN (warn, no fetch/rebase) when the target is the
+# primary checkout (git-dir == git-common-dir) — the market-brief-package-o45j
+# shared-tree rebase race — and refuse an empty/nonexistent worktree path rather
+# than operate on a cwd fallback.
+
+def test_refresh_worktree_stands_down_on_primary_checkout(
+        monkeypatch, worktree_with_origin):
+    work = worktree_with_origin  # a primary checkout (git init)
+    # make origin/main AHEAD of local main so a rebase WOULD move HEAD
+    _git(work, "commit", "--allow-empty", "-m", "c2")
+    _git(work, "push", "origin", "main")
+    _git(work, "reset", "--hard", "HEAD~1")
+    _git(work, "fetch", "origin")
+    head_before = _rev(work)
+    behind = subprocess.run(
+        ["git", "-C", str(work), "rev-list", "--count", "HEAD..origin/main"],
+        capture_output=True, text=True).stdout.strip()
+    assert behind == "1"  # sanity: a rebase would advance HEAD
+    monkeypatch.delenv("SABLE_BASE_BRANCH", raising=False)
+    warning = ssw.refresh_worktree(str(work), None)
+    assert warning is not None and "primary" in warning.lower()
+    assert _rev(work) == head_before  # NO rebase ran
+
+
+def test_refresh_worktree_still_refreshes_linked_worktree(
+        monkeypatch, worktree_with_origin):
+    work = worktree_with_origin
+    _git(work, "commit", "--allow-empty", "-m", "c2")
+    _git(work, "push", "origin", "main")
+    _git(work, "reset", "--hard", "HEAD~1")
+    _git(work, "fetch", "origin")
+    _git(work, "branch", "wk-y", "HEAD")
+    wt = work.parent / "wk-y"
+    _git(work, "worktree", "add", str(wt), "wk-y")
+    head_before = _rev(wt)
+    monkeypatch.delenv("SABLE_BASE_BRANCH", raising=False)
+    monkeypatch.delenv("SABLE_INTEGRATION_BRANCH", raising=False)
+    warning = ssw.refresh_worktree(str(wt), None)
+    assert warning is None, warning
+    assert _rev(wt) != head_before               # a real rebase ran
+    assert _rev(wt) == _rev(wt, "origin/main")   # advanced onto origin/main
+
+
+def test_refresh_worktree_refuses_missing_worktree_path(tmp_path):
+    warning = ssw.refresh_worktree(str(tmp_path / "does-not-exist"), None)
+    assert warning is not None and "no valid worktree" in warning.lower()
+
+
+def test_refresh_worktree_refuses_empty_worktree_path():
+    warning = ssw.refresh_worktree("", None)
+    assert warning is not None and "no valid worktree" in warning.lower()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

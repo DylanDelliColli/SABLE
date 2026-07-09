@@ -209,18 +209,19 @@ def preempt_check(lane: str, inbox: list[dict]) -> str | None:
             "\"deferred: <reason>\" then bd defer <id>.")
 
 
+def _ref_exists(worktree: str, ref: str) -> bool:
+    return subprocess.run(
+        ["git", "-C", worktree, "rev-parse", "--verify", "--quiet", ref],
+        capture_output=True).returncode == 0
+
+
 def resolve_base_ref(worktree: str, desired: str) -> str:
     """Mirrors lib-identity.sh's sable_validate_base_ref: if `desired` doesn't
     exist in `worktree`, fall back to origin/main, then @{upstream}, so a stale
     SABLE_BASE_BRANCH never hard-fails the refresh below (SABLE-61n)."""
-    def ref_exists(ref: str) -> bool:
-        return subprocess.run(
-            ["git", "-C", worktree, "rev-parse", "--verify", "--quiet", ref],
-            capture_output=True).returncode == 0
-
-    if ref_exists(desired):
+    if _ref_exists(worktree, desired):
         return desired
-    if desired != "origin/main" and ref_exists("origin/main"):
+    if desired != "origin/main" and _ref_exists(worktree, "origin/main"):
         return "origin/main"
     up = subprocess.run(
         ["git", "-C", worktree, "rev-parse", "--abbrev-ref", "--symbolic-full-name",
@@ -230,18 +231,99 @@ def resolve_base_ref(worktree: str, desired: str) -> str:
     return desired
 
 
-def refresh_worktree(worktree: str, base_branch: str) -> str | None:
+def resolve_integration_branch(repo_path: str) -> str:
+    """Python mirror of lib-identity.sh's sable_resolve_integration_branch
+    (market-brief-package-2u25 / SABLE-ybdm): the BARE name of `repo_path`'s OWN
+    integration branch. Integration-branch identity is a property of the TARGET
+    REPO, not the session that happens to spawn into it — a session's
+    $SABLE_BASE_BRANCH is configured once per project and leaks unchanged into
+    every other repo that session touches. Consulted in order, first match wins:
+      1. `git -C <repo> config --get sable.integrationBranch` (repo-local, unshared)
+      2. `<repo>/.sable` file, a line `integrationBranch=<name>` (checked in, shared)
+      3. $SABLE_INTEGRATION_BRANCH (explicit env override, bare name)
+      4. $SABLE_BASE_BRANCH with a leading `origin/` stripped
+      5. "main"
+    Always returns a bare branch name."""
+    if repo_path:
+        cfg = subprocess.run(
+            ["git", "-C", repo_path, "config", "--get", "sable.integrationBranch"],
+            capture_output=True, text=True)
+        val = cfg.stdout.strip() if cfg.returncode == 0 else ""
+        if val:
+            return val
+        sable_file = Path(repo_path) / ".sable"
+        if sable_file.is_file():
+            for line in sable_file.read_text().splitlines():
+                if line.startswith("integrationBranch="):
+                    val = line[len("integrationBranch="):].strip()
+                    if val:
+                        return val
+    val = (os.environ.get("SABLE_INTEGRATION_BRANCH")
+           or os.environ.get("SABLE_BASE_BRANCH") or "origin/main")
+    return val[len("origin/"):] if val.startswith("origin/") else val
+
+
+def resolve_refresh_base(worktree: str, base_branch: str | None) -> str:
+    """Resolve the ref refresh_worktree rebases a reused worktree onto. Ports the
+    SABLE-4amz shape from pre-push-rebase-test.sh: the base DEFAULTS to this
+    repo's OWN published integration branch (origin/<INT>) rather than an
+    unconditional origin/main — the old default silently re-parented a reused
+    worker branch on a non-main integration repo (tmux-only here) onto DIVERGED
+    origin/main lineage at spawn time (SABLE-ybdm). An explicit base_branch
+    (SABLE_BASE_BRANCH) still wins; validation falls back gracefully when the
+    chosen ref doesn't exist (SABLE-61n). Assumes refs are already fetched, so
+    the origin/<INT> existence check sees fresh remote refs."""
+    integration = resolve_integration_branch(worktree)
+    default_base = "origin/main"
+    if integration and _ref_exists(worktree, f"origin/{integration}"):
+        default_base = f"origin/{integration}"
+    return resolve_base_ref(worktree, base_branch or default_base)
+
+
+def refresh_worktree(worktree: str, base_branch: str | None) -> str | None:
     """Re-homed pre-dispatch-refresh (SABLE-bldh.8) — lowest priority per the
     bead: only relevant when REUSING an existing worktree via --worktree, since
     a freshly `bd worktree create`d tree is already at the base HEAD, and the
     worker itself rebases again before its final commit (worker-dispatch.md).
     Non-blocking: on fetch/rebase failure, aborts the half-done rebase and
-    returns a warning instead of failing the spawn."""
-    base = resolve_base_ref(worktree, base_branch)
+    returns a warning instead of failing the spawn.
+
+    Stands down (warns, no fetch/rebase) rather than operating on a fallback in
+    two cases ported from wip-hook-fixes-d038, SABLE-4byx:
+      * invalid/missing worktree path — never rebase a fallback (e.g. cwd);
+      * primary-checkout target — a linked worktree has git-dir != git-common-dir;
+        the PRIMARY checkout resolves them identically. Rebasing the shared main
+        tree races concurrent dispatches and rewrites the session branch
+        (market-brief-package-o45j)."""
+    # --- SABLE-4byx: invalid/missing worktree path — refuse a fallback.
+    if not worktree or not os.path.isdir(worktree):
+        return (f"refresh: no valid worktree path ({worktree!r}); standing down "
+                "(no fetch/rebase). Name an absolute existing worktree to refresh.")
+    # --- SABLE-4byx: primary-checkout guard (market-brief-package-o45j). Only a
+    # LINKED worktree is a refresh target, never the primary checkout — even when
+    # named explicitly. In a linked worktree git-dir differs from git-common-dir;
+    # in the primary checkout they resolve identically. Fail-safe: if resolution
+    # fails (empty git-dir), stand down.
+    git_dir = subprocess.run(
+        ["git", "-C", worktree, "rev-parse", "--absolute-git-dir"],
+        capture_output=True, text=True)
+    common_dir = subprocess.run(
+        ["git", "-C", worktree, "rev-parse", "--path-format=absolute",
+         "--git-common-dir"], capture_output=True, text=True)
+    gd = git_dir.stdout.strip() if git_dir.returncode == 0 else ""
+    cd = common_dir.stdout.strip() if common_dir.returncode == 0 else ""
+    if not gd or gd == cd:
+        return (f"refresh: {worktree} is the primary checkout (git-dir == "
+                "git-common-dir), not a linked worktree; standing down (no "
+                "fetch/rebase) to avoid the shared-tree rebase race (o45j).")
+
     fetch = subprocess.run(["git", "-C", worktree, "fetch", "origin"],
                            capture_output=True, text=True)
     if fetch.returncode != 0:
         return f"refresh: fetch failed for {worktree}: {fetch.stderr.strip()[:300]}"
+    # SABLE-ybdm: resolve the base AFTER the fetch so the origin/<INT> existence
+    # check sees fresh remote refs (mirrors the 4amz post-fetch resolution).
+    base = resolve_refresh_base(worktree, base_branch)
     rebase = subprocess.run(["git", "-C", worktree, "rebase", base],
                             capture_output=True, text=True)
     if rebase.returncode != 0:
@@ -413,8 +495,11 @@ def main(argv: list[str] | None = None) -> int:
         # worktree needs a rebase — a freshly `bd worktree create`d tree below
         # is already at the base HEAD.
         if not ns.skip_governance:
+            # Pass the raw SABLE_BASE_BRANCH (None when unset) — refresh_worktree
+            # resolves the per-repo integration base itself (SABLE-ybdm); an
+            # explicit env value still wins inside resolve_refresh_base.
             refresh_warning = refresh_worktree(
-                worktree, os.environ.get("SABLE_BASE_BRANCH", "origin/main"))
+                worktree, os.environ.get("SABLE_BASE_BRANCH"))
             if refresh_warning:
                 sys.stderr.write(f"sable-spawn-worker: {refresh_warning}\n")
     else:
