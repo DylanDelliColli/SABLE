@@ -391,6 +391,113 @@ set_mode execution
 assert_allow "execution allows sable-spawn-manager" 'sable-spawn-manager --all'
 set_mode planning
 
+# ---------- SABLE-pi5m: spawn-helper false positives + FORCE override ----------
+# Two defects fixed here:
+#  (1) The spawn legs matched the helper's name ANYWHERE on the command line —
+#      including inside a quoted `bd create --description` or a `sable-note` body —
+#      because the old regex let a plain space count as a command boundary, so the
+#      name-in-prose was indistinguishable from an invocation. Now the helper must
+#      sit in command-word position, and bd / sable-note / sable-mode leading
+#      commands are allow-listed (their args legitimately name the helper in prose,
+#      often with shell punctuation).
+#  (2) The documented inline `SABLE_ORCHESTRATION_FORCE=1 <cmd>` prefix did NOT
+#      override a spawn deny — it was parsed only in the main Bash leg, which the
+#      spawn legs short-circuit past. It is now honored before the spawn legs.
+set_mode planning
+
+# (1) quoted-prose false positives — planning must ALLOW these
+assert_allow "pi5m: planning allows bd create naming sable-spawn-worker in --description" \
+  'bd create --type=task --title="x" --description="dispatch a worker via sable-spawn-worker in execution"'
+assert_allow "pi5m: planning allows bd create naming helper with ; in --description" \
+  'bd create --type=task --title="x" --description="repro: bd create; sable-spawn-worker fails"'
+assert_allow "pi5m: planning allows sable-note naming sable-spawn-worker" \
+  'sable-note "mode-interlock false positive on sable-spawn-worker prose"'
+assert_allow "pi5m: planning allows sable-note naming sable-spawn-manager" \
+  'sable-note "the sable-spawn-manager helper over-matched the same way"'
+# decomposition: a --parent child (backlog gate open) naming the helper in prose
+# — the real 2026-07-06 scenario (authoring epic children) — is ALLOWED.
+set_substage decomposition
+assert_allow "pi5m: decomposition allows --parent child naming sable-spawn-worker" \
+  'bd create --type=task --parent=SABLE-qa4d --title="x" --description="child dispatched by sable-spawn-worker helper"'
+set_mode planning   # back to framing
+
+# (1) real invocations still DENIED in planning (command-word position preserved)
+assert_deny  "pi5m: planning still blocks real sable-spawn-worker" 'sable-spawn-worker SABLE-x --worktree /wt'
+assert_deny  "pi5m: planning still blocks a chained real sable-spawn-worker" 'echo hi && sable-spawn-worker SABLE-x'
+assert_deny  "pi5m: planning still blocks real sable-spawn-manager" 'sable-spawn-manager --all'
+
+# (2) inline SABLE_ORCHESTRATION_FORCE=1 prefix overrides a spawn deny
+assert_allow "pi5m: inline FORCE prefix allows real sable-spawn-worker" \
+  'SABLE_ORCHESTRATION_FORCE=1 sable-spawn-worker SABLE-x --worktree /wt'
+assert_allow "pi5m: inline FORCE prefix allows real sable-spawn-manager" \
+  'SABLE_ORCHESTRATION_FORCE=1 sable-spawn-manager --all'
+# process-env FORCE form also overrides a spawn deny (top-of-script check)
+out_pi5m_env="$(printf '%s' '{"tool_input":{"command":"sable-spawn-worker SABLE-x --worktree /wt"}}' | SABLE_ORCHESTRATION_FORCE=1 bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_pi5m_env"; then fail "pi5m: env SABLE_ORCHESTRATION_FORCE=1 allows real sable-spawn-worker" "got deny: $out_pi5m_env"; else pass "pi5m: env SABLE_ORCHESTRATION_FORCE=1 allows real sable-spawn-worker"; fi
+
+# execution mode unaffected — real spawn still allowed; prose still allowed
+set_mode execution
+assert_allow "pi5m: execution still allows real sable-spawn-worker" 'sable-spawn-worker SABLE-x --worktree /wt'
+assert_allow "pi5m: execution allows bd create naming sable-spawn-worker" \
+  'bd create --type=task --title="x" --description="names sable-spawn-worker in prose"'
+set_mode planning
+
+# ---------- SABLE-pi5m REVISE: name-leg prose FPs + assignment-prefixed spawn slip ----------
+# The launches() name legs (manager/producer aliases) had the SAME plain-space
+# boundary defect the spawn legs did: a manager/producer NAME appearing mid-prose
+# in a message/note/description false-matched as a launch. And is_spawn_call's
+# command-position regex could not see past a leading VAR=val assignment, so an
+# assignment-prefixed REAL spawn invocation slipped the deny. Fixes: launches()
+# now anchors to command-word position + allow-lists prose carriers (bd /
+# sable-note / sable-msg via is_prose_carrier); is_spawn_call also treats
+# lead==helper as an invocation.
+
+# --- EXECUTION: message/note prose naming each producer must be ALLOWED ---
+set_mode execution
+assert_allow "pi5m: execution allows sable-msg prose naming sherlock (mid-sentence)" \
+  'sable-msg lincoln "shipped the sherlock findings today"'
+assert_allow "pi5m: execution allows sable-msg prose naming victor" \
+  'sable-msg lincoln "the victor run cleared the pool"'
+assert_allow "pi5m: execution allows sable-msg prose naming columbo" \
+  'sable-msg lincoln "columbo planned the test coverage"'
+assert_allow "pi5m: execution allows sable-msg prose naming gaudi" \
+  'sable-msg lincoln "gaudi flagged an arch smell"'
+assert_allow "pi5m: execution allows sable-msg prose naming several producers" \
+  'sable-msg lincoln "sherlock, victor and columbo all reported in"'
+assert_allow "pi5m: execution allows sable-note naming a producer" \
+  'sable-note "sherlock over-matched producer names the same way"'
+assert_allow "pi5m: execution allows bd create prose naming a producer" \
+  'bd create --type=task --title="x" --description="follow-up from the sherlock audit"'
+# real producer launches still DENIED in execution (command-word position preserved)
+assert_deny  "pi5m: execution still blocks bare sherlock alias with args" 'sherlock src/auth'
+assert_deny  "pi5m: execution still blocks CLAUDE_AGENT_NAME=victor launch" 'CLAUDE_AGENT_NAME=victor claude'
+assert_deny  "pi5m: execution still blocks chained real gaudi launch" 'echo hi && gaudi --audit src'
+
+# --- PLANNING: prose naming a manager must be ALLOWED ---
+set_mode planning
+assert_allow "pi5m: planning allows sable-msg prose naming optimus (mid-sentence)" \
+  'sable-msg tarzan "ask optimus to take the epic"'
+assert_allow "pi5m: planning allows sable-msg prose naming tarzan and chuck" \
+  'sable-msg lincoln "tarzan and chuck are both idle"'
+assert_allow "pi5m: planning allows sable-note naming a manager" \
+  'sable-note "optimus lane is backed up on SABLE-qa4d"'
+assert_allow "pi5m: planning allows bd create prose naming a manager" \
+  'bd create --type=task --title="x" --description="hand the review to optimus"'
+assert_allow "pi5m: planning allows bd create prose with CLAUDE_AGENT_NAME= assignment (not a launch)" \
+  'bd create --type=task --title="x" --description="repro: CLAUDE_AGENT_NAME=optimus claude was blocked"'
+# real manager launches still DENIED in planning
+assert_deny  "pi5m: planning still blocks bare optimus alias" 'optimus'
+assert_deny  "pi5m: planning still blocks CLAUDE_AGENT_NAME=tarzan launch" 'CLAUDE_AGENT_NAME=tarzan claude'
+
+# --- assignment-prefixed REAL spawn-helper invocation still DENIED in planning ---
+# leading_cmd strips the VAR=val prefix, so is_spawn_call's lead==helper guard
+# catches these even though the position regex cannot see past the assignment.
+assert_deny  "pi5m: planning blocks assignment-prefixed sable-spawn-worker" \
+  'CLAUDE_AGENT_NAME=x sable-spawn-worker SABLE-y --worktree /wt'
+assert_deny  "pi5m: planning blocks assignment-prefixed sable-spawn-manager" \
+  'FOO=bar sable-spawn-manager --all'
+set_mode planning
+
 # ---------- settings-snippet registration ----------
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 if jq -e . "$SNIPPET" >/dev/null 2>&1; then pass "settings-snippet.json is valid JSON"; else fail "settings-snippet.json is valid JSON"; fi

@@ -205,15 +205,71 @@ fi
 # override (SABLE_ORCHESTRATION_FORCE=1) is already handled above; a `--force`
 # flag on the command also overrides.
 # ---------------------------------------------------------------------------
-SPAWN_CMD="$(printf '%s' "$INPUT" | python3 -c "
+# Extract the Bash command once — reused by both spawn legs and the main Bash
+# leg below (one python3 field read instead of three).
+CMD_TEXT="$(printf '%s' "$INPUT" | python3 -c "
 import json, sys
 try:
     print(json.load(sys.stdin).get('tool_input', {}).get('command', '') or '')
 except Exception:
     print('')
 " 2>/dev/null)"
-if printf '%s' "$SPAWN_CMD" | grep -qE '(^|[[:space:];&|])sable-spawn-worker([[:space:]]|$)'; then
-  printf '%s' "$SPAWN_CMD" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exit 0
+
+# Soft override: SABLE_ORCHESTRATION_FORCE=1 as an inline prefix on the command
+# text applies to EVERY Bash leg, the spawn legs included (SABLE-pi5m defect 2).
+# The top-of-script env check only sees this hook process's OWN env, which cannot
+# inherit an assignment inline to a command the Bash tool has not exec'd yet, so
+# parse it out of the command string here — BEFORE the spawn legs, so the
+# documented override actually reaches sable-spawn-worker / sable-spawn-manager
+# (previously it was parsed only in the main Bash leg, which the spawn legs
+# short-circuit past, so the prefix never overrode a spawn deny).
+printf '%s' "$CMD_TEXT" | grep -qE '(^|[[:space:];&|])SABLE_ORCHESTRATION_FORCE=1([[:space:]]|$)' && exit 0
+
+# leading_cmd <command> → the first real command word (skipping any leading
+# VAR=val assignment prefix), lowercased. Empty if the command is only
+# assignments.
+leading_cmd() {
+  printf '%s' "$1" | awk '{ for (i=1;i<=NF;i++){ if ($i ~ /=/) continue; print $i; break } }' | tr '[:upper:]' '[:lower:]'
+}
+
+# is_prose_carrier <command> → true iff the leading command word legitimately
+# carries agent / producer / spawn-helper NAMES inside its arguments as prose
+# rather than as a launch (SABLE-pi5m). A bd --description, a sable-note body, a
+# sable-msg message, and a sable-mode --fleet flag all routinely name agents and
+# the spawn helpers (often with shell punctuation), and none of these commands
+# ever stands up an agent — so a name appearing in their args is never a spawn or
+# a launch. Shared by is_spawn_call (helper legs) and launches (name legs).
+is_prose_carrier() {
+  case "$(leading_cmd "$1")" in
+    bd|sable-note|sable-mode|sable-msg) return 0 ;;
+  esac
+  return 1
+}
+
+# is_spawn_call <helper> <command> → true iff <command> genuinely invokes
+# <helper> as a command, NOT merely names it inside a quoted argument (SABLE-pi5m
+# defect 1). Three guards:
+#   (a) prose-carrier allow-list (is_prose_carrier) — a bd / sable-note /
+#       sable-msg / sable-mode command's args legitimately name the helper in
+#       prose, often with shell punctuation; those are never a spawn.
+#   (b) leading-word identity — if the first real command word (after any VAR=val
+#       assignment prefix, which leading_cmd strips) IS the helper, it is a spawn
+#       even though the position regex below cannot see past the assignment
+#       (e.g. `CLAUDE_AGENT_NAME=x sable-spawn-worker …`) — SABLE-pi5m follow-up.
+#   (c) command-word position — the helper must sit at the start of the command
+#       or immediately after a real shell separator (; & | ( or a newline, which
+#       grep's per-line ^ already covers). A plain space does NOT qualify: an
+#       argument-separating space is indistinguishable from a space inside a
+#       quoted string, and matching on it was the original false-positive.
+is_spawn_call() {
+  local helper="$1" cmd="$2"
+  is_prose_carrier "$cmd" && return 1
+  [ "$(leading_cmd "$cmd")" = "$helper" ] && return 0
+  printf '%s' "$cmd" | grep -qE "(^|[;&|(])[[:space:]]*${helper}([[:space:]]|\$)"
+}
+
+if is_spawn_call 'sable-spawn-worker' "$CMD_TEXT"; then
+  printf '%s' "$CMD_TEXT" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exit 0
   if [ "$MODE" != "execution" ]; then
     deny "Orchestration is in ${MODE} mode — sable-spawn-worker dispatches an execution worker and is blocked outside EXECUTION mode. Run /sable-execute, or append --force to override."
   fi
@@ -223,8 +279,8 @@ fi
 # sable-spawn-manager stands up the execution fleet (manager windows) — gated
 # to EXECUTION mode the same way (SABLE-dqhn.2). Launching a session is
 # mode-neutral (lincoln only); spawning managers is not.
-if printf '%s' "$SPAWN_CMD" | grep -qE '(^|[[:space:];&|])sable-spawn-manager([[:space:]]|$)'; then
-  printf '%s' "$SPAWN_CMD" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exit 0
+if is_spawn_call 'sable-spawn-manager' "$CMD_TEXT"; then
+  printf '%s' "$CMD_TEXT" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exit 0
   if [ "$MODE" != "execution" ]; then
     deny "Orchestration is in ${MODE} mode — sable-spawn-manager stands up the execution fleet and is blocked outside EXECUTION mode. Run /sable-execute, or append --force to override."
   fi
@@ -242,26 +298,16 @@ case "${CLAUDE_AGENT_NAME:-}" in
 esac
 [ -n "$AGENT_ID" ] && exit 0
 
-COMMAND="$(printf '%s' "$INPUT" | python3 -c "
-import json, sys
-try:
-    print(json.load(sys.stdin).get('tool_input', {}).get('command', '') or '')
-except Exception:
-    print('')
-" 2>/dev/null)"
+COMMAND="$CMD_TEXT"   # extracted once above (shared with the spawn legs)
 [ -z "$COMMAND" ] && exit 0
 
 # Soft override: explicit --force flag on the command.
 printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exit 0
 
-# Soft override: SABLE_ORCHESTRATION_FORCE=1 as an inline prefix on the command
-# text itself (e.g. `SABLE_ORCHESTRATION_FORCE=1 sable-mode set planning ...`).
-# The top-of-script check only sees this hook process's OWN env, which does not
-# inherit an assignment inline to a command the tool hasn't run yet — that
-# assignment only ever applies to the subprocess the Bash tool later execs, so
-# the process-env check alone can never observe it. Parse it out of the command
-# text directly, mirroring the --force handling above.
-printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])SABLE_ORCHESTRATION_FORCE=1([[:space:]]|$)' && exit 0
+# NOTE: the inline SABLE_ORCHESTRATION_FORCE=1 prefix override is handled once,
+# up above the spawn legs (SABLE-pi5m), so it covers every Bash leg — this main
+# leg included. Any command reaching here carrying that prefix has already
+# exited 0, so no second check is needed.
 
 # sable-mode is the sanctioned mode-transition command run by /sable-plan and
 # /sable-execute; its own flags legitimately carry agent/producer names (e.g.
@@ -270,13 +316,26 @@ printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])SABLE_ORCHESTRATION_FORCE=1
 # argument list. sable-mode itself never spawns anything, so exempt it outright.
 printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])sable-mode([[:space:]]|$)' && exit 0
 
-# Detect an attempt to launch a given set of named agents — either by setting
-# CLAUDE_AGENT_NAME=<name> on a claude invocation, or by invoking the bare
-# launch alias as the first word of the command.
+# Detect an attempt to launch a given set of named agents — either by invoking
+# the bare launch alias in command-word position, or by setting
+# CLAUDE_AGENT_NAME=<name> as a launch env prefix. Mirrors is_spawn_call's
+# command-position discipline (SABLE-pi5m): a manager/producer NAME appearing
+# inside a prose-carrying command's args — a bd --description, a sable-note body,
+# a sable-msg message — is NOT a launch. The pre-fix regex let a plain space
+# count as a boundary, so any name mid-sentence in quoted prose false-matched
+# (e.g. `sable-msg lincoln "shipped the sherlock findings"` denied in execution;
+# `sable-msg tarzan "ask optimus to take it"` denied in planning).
 launches() {
   # $1 = alternation like 'optimus|tarzan|chuck'
-  printf '%s' "$COMMAND" | grep -qE "CLAUDE_AGENT_NAME=($1)([[:space:]]|$)" && return 0
-  printf '%s' "$COMMAND" | grep -qE "(^|[[:space:];&|])($1)([[:space:]]|$)" && return 0
+  is_prose_carrier "$COMMAND" && return 1
+  # (a) bare launch alias as the leading command word (leading_cmd strips any
+  #     VAR=val assignment prefix, so `FOO=bar optimus` still resolves to optimus).
+  printf '%s' "$(leading_cmd "$COMMAND")" | grep -qE "^($1)\$" && return 0
+  # (b) bare launch alias in command-word position after a real shell separator.
+  printf '%s' "$COMMAND" | grep -qE "(^|[;&|(])[[:space:]]*($1)([[:space:]]|\$)" && return 0
+  # (c) CLAUDE_AGENT_NAME=<name> launch env prefix in command-word position (not
+  #     merely a name assignment quoted inside another command's prose).
+  printf '%s' "$COMMAND" | grep -qE "(^|[;&|(])[[:space:]]*CLAUDE_AGENT_NAME=($1)([[:space:]]|\$)" && return 0
   return 1
 }
 
