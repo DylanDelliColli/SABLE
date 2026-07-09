@@ -164,6 +164,30 @@ assert_allow "execution allows manager spawn"  'CLAUDE_AGENT_NAME=optimus CLAUDE
 assert_allow "execution allows git push"       'git push origin personal-tooling'
 assert_allow "execution --force allows producer" 'CLAUDE_AGENT_NAME=sherlock claude --force'
 
+# ---------- sable-mode exemption (SABLE-rsvu) ----------
+# sable-mode is the sanctioned mode-transition command itself; its own flags
+# legitimately carry agent/producer names (e.g. --fleet victor) that must NOT
+# trip the launch classifier — a false-positive on this command would block
+# the exact command /sable-plan and /sable-execute instruct callers to run.
+assert_allow "execution allows sable-mode --fleet victor" 'sable-mode set planning --tier quick --fleet victor'
+assert_allow "execution allows sable-mode --fleet columbo" 'sable-mode set planning --tier quick --fleet columbo'
+# A genuine producer launch (not wrapped in sable-mode) is still denied.
+assert_deny  "execution still blocks bare victor alias" 'victor'
+set_mode planning
+assert_allow "planning allows sable-mode --fleet optimus" 'sable-mode set execution --fleet optimus'
+assert_deny  "planning still blocks bare optimus alias" 'optimus'
+set_mode execution
+
+# ---------- SABLE_ORCHESTRATION_FORCE=1 inline command-prefix override (SABLE-rsvu) ----------
+# The top-of-script check only reads the hook process's OWN env; an assignment
+# prefixed inline to the command text (as a user would type in a Bash tool
+# call) only applies to the subprocess the command later execs, so it must be
+# parsed out of the command string on the Bash leg too — mirroring --force.
+out_inline="$(printf '%s' '{"tool_input":{"command":"SABLE_ORCHESTRATION_FORCE=1 victor"}}' | bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_inline"; then fail "execution SABLE_ORCHESTRATION_FORCE=1 inline prefix allows producer" "got deny: $out_inline"; else pass "execution SABLE_ORCHESTRATION_FORCE=1 inline prefix allows producer"; fi
+out_inline2="$(printf '%s' '{"tool_input":{"command":"SABLE_ORCHESTRATION_FORCE=1 sable-mode set planning --fleet victor"}}' | bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_inline2"; then fail "execution SABLE_ORCHESTRATION_FORCE=1 inline prefix allows sable-mode" "got deny: $out_inline2"; else pass "execution SABLE_ORCHESTRATION_FORCE=1 inline prefix allows sable-mode"; fi
+
 # ---------- No-op contexts ----------
 set_mode planning
 
