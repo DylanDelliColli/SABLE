@@ -10,6 +10,7 @@ Proves: a worker WINDOW is created, its pane is tagged
 (@sable_role=worker/@sable_bead/@sable_status=running), the dispatch prompt file
 is written, and the read-instruction is delivered into the pane.
 """
+import json
 import os
 import shutil
 import subprocess
@@ -239,6 +240,110 @@ def test_worker_bypass_gate_is_accepted(sock):
         time.sleep(0.5)
         assert rec.exists(), "stand-in never received a key (gate not accepted)"
         assert rec.read_text().strip() == "2", rec.read_text()
+
+
+# --- re-homed pre-dispatch governance (SABLE-bldh.8) -------------------------
+
+def _write_fake_bd(stub_dir: Path, db_path: Path) -> None:
+    """A stand-in `bd` CLI backed by a JSON file, NOT the real beads database —
+    lets the duplicate-dispatch integration test flip a bead's status between
+    two subprocess calls (exactly like a real --claim would) without mutating
+    project state. Placed first on PATH for the child process."""
+    script = stub_dir / "bd"
+    script.write_text(f'''#!/usr/bin/env python3
+import json, sys
+
+DB = {str(db_path)!r}
+
+def load():
+    with open(DB) as f:
+        return json.load(f)
+
+def save(data):
+    with open(DB, "w") as f:
+        json.dump(data, f)
+
+args = sys.argv[1:]
+
+if args[:1] == ["show"] and len(args) >= 2:
+    data = load()
+    print(json.dumps([b for b in data if b.get("id") == args[1]]))
+elif args[:1] == ["update"] and "--claim" in args:
+    bid = args[1]
+    data = load()
+    for b in data:
+        if b.get("id") == bid:
+            b["status"] = "in_progress"
+            b["assignee"] = "test-worker"
+    save(data)
+    print("claimed")
+elif args[:1] == ["list"]:
+    data = load()
+    if "--status=in_progress" in args:
+        data = [b for b in data if b.get("status") == "in_progress"]
+    print(json.dumps(data))
+else:
+    print("[]")
+''')
+    script.chmod(0o755)
+
+
+def test_second_spawn_for_in_progress_bead_is_refused(sock):
+    """SABLE-bldh.8: sable-spawn-worker refuses a SECOND spawn for a bead that
+    is already IN_PROGRESS — the bead trivially 'overlaps' with itself, and a
+    second worker racing the first worker's push is a real duplicate-work
+    hazard the old prompt-parsing overlap hook never caught (it only ever
+    compared DIFFERENT bead IDs against each other, and only warned). Proves
+    the end-to-end wiring: the first spawn succeeds and claims the bead (via
+    the fake bd's --claim), the second spawn for the SAME bead is refused
+    (nonzero exit, no second worker window/pane created)."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt1, \
+         tempfile.TemporaryDirectory() as wt2:
+        bead_id = "FAKE-dup-1"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "open", "assignee": None}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+        env.pop("CLAUDE_AGENT_NAME", None)  # keep lane empty -> preempt is a no-op here
+
+        r1 = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt1, "--model", "haiku"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r1.returncode == 0, r1.stderr
+        time.sleep(0.5)
+
+        r2 = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt2, "--model", "haiku"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r2.returncode == 5, f"stdout={r2.stdout!r} stderr={r2.stderr!r}"
+        assert "duplicate-dispatch" in r2.stderr
+        assert "IN_PROGRESS" in r2.stderr
+
+        # only ONE worker pane exists for this bead — the refused second call
+        # never reached the spawn step
+        listing = _tmux(sock, "list-panes", "-a", "-F",
+                        "#{@sable_role} #{@sable_bead}").stdout
+        matches = [line for line in listing.splitlines()
+                  if line.startswith("worker") and bead_id in line]
+        assert len(matches) == 1, listing
 
 
 if __name__ == "__main__":

@@ -106,6 +106,91 @@ def test_model_check_allows_when_no_label_or_no_override():
     assert ssw.model_check(["model:sonnet"], None) is None
 
 
+# --- duplicate-dispatch / overlap / preempt (re-homed governance, SABLE-bldh.8) --
+
+def test_parse_bead_list_valid_array():
+    assert ssw.parse_bead_list('[{"id":"X-1"}]') == [{"id": "X-1"}]
+
+
+def test_parse_bead_list_fails_open_on_malformed():
+    assert ssw.parse_bead_list("not json") == []
+    assert ssw.parse_bead_list('{"id":"X-1"}') == []  # object, not array
+
+
+def test_already_in_progress_check_blocks_second_spawn():
+    err = ssw.already_in_progress_check(
+        {"id": "X-1", "status": "in_progress", "assignee": "tarzan"})
+    assert err is not None and "X-1" in err and "IN_PROGRESS" in err and "tarzan" in err
+
+
+def test_already_in_progress_check_allows_open_bead():
+    assert ssw.already_in_progress_check({"id": "X-1", "status": "open"}) is None
+
+
+def test_already_in_progress_check_handles_missing_assignee():
+    err = ssw.already_in_progress_check({"id": "X-1", "status": "in_progress"})
+    assert err is not None and "unassigned" in err
+
+
+def test_extract_wip_claims_parses_comma_list():
+    text = "some notes\nWIP-CLAIMS: a/b.py, c/d.py\nmore text"
+    assert ssw.extract_wip_claims(text) == {"a/b.py", "c/d.py"}
+
+
+def test_extract_wip_claims_empty_when_absent():
+    assert ssw.extract_wip_claims("no claims here") == set()
+
+
+def test_bead_claimed_files_reads_notes_and_description():
+    bead = {"notes": "WIP-CLAIMS: x.py", "description": "WIP-CLAIMS: y.py"}
+    assert ssw.bead_claimed_files(bead) == {"x.py", "y.py"}
+
+
+def test_overlap_check_warns_on_shared_file_with_other_bead():
+    bead = {"id": "X-1", "notes": "WIP-CLAIMS: shared.py"}
+    other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
+    warning = ssw.overlap_check("X-1", bead, [other])
+    assert warning is not None
+    assert "Y-1" in warning and "shared.py" in warning and "tarzan" in warning
+
+
+def test_overlap_check_ignores_self_in_progress_list():
+    # already_in_progress_check owns the same-bead case; overlap_check must not
+    # double-flag itself if it happens to appear in the in-progress list.
+    bead = {"id": "X-1", "notes": "WIP-CLAIMS: shared.py"}
+    assert ssw.overlap_check("X-1", bead, [bead]) is None
+
+
+def test_overlap_check_none_when_no_shared_files():
+    bead = {"id": "X-1", "notes": "WIP-CLAIMS: a.py"}
+    other = {"id": "Y-1", "notes": "WIP-CLAIMS: b.py"}
+    assert ssw.overlap_check("X-1", bead, [other]) is None
+
+
+def test_overlap_check_none_when_bead_has_no_claims():
+    assert ssw.overlap_check("X-1", {"id": "X-1"}, [{"id": "Y-1", "notes": "WIP-CLAIMS: a.py"}]) is None
+
+
+def test_preempt_check_blocks_on_p0_in_inbox():
+    inbox = [{"id": "C-1", "title": "urgent coord", "priority": 0}]
+    err = ssw.preempt_check("optimus", inbox)
+    assert err is not None and "optimus" in err and "C-1" in err
+
+
+def test_preempt_check_allows_when_no_p0():
+    inbox = [{"id": "C-1", "title": "low pri", "priority": 2}]
+    assert ssw.preempt_check("optimus", inbox) is None
+
+
+def test_preempt_check_allows_when_empty_inbox():
+    assert ssw.preempt_check("optimus", []) is None
+
+
+def test_preempt_check_allows_when_no_lane():
+    inbox = [{"id": "C-1", "title": "urgent coord", "priority": 0}]
+    assert ssw.preempt_check("", inbox) is None
+
+
 # --- dispatch prompt assembly -----------------------------------------------
 
 def test_assemble_dispatch_prompt_has_load_bearing_slots():
@@ -315,6 +400,60 @@ def test_accept_startup_gate_none_when_ready():
 def test_pane_ready_false_on_bypass_warning():
     # the warning's prompt line is '❯ 1. No, exit', not an empty box -> not ready
     assert ssw.pane_ready(BYPASS_WARNING) is False
+
+
+# --- refresh: base-ref fallback (re-homed pre-dispatch-refresh, SABLE-bldh.8) -
+
+import subprocess  # noqa: E402
+
+
+def _git(cwd, *args):
+    subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                   capture_output=True, text=True)
+
+
+@pytest.fixture()
+def worktree_with_origin(tmp_path):
+    """A tiny local repo with a remote named 'origin' (also local), so
+    resolve_base_ref's rev-parse checks resolve without any network access."""
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    _git(origin, "init", "--bare", "-b", "main")
+
+    work = tmp_path / "work"
+    work.mkdir()
+    _git(work, "init", "-b", "main")
+    _git(work, "config", "user.email", "t@example.com")
+    _git(work, "config", "user.name", "T")
+    (work / "f.txt").write_text("1")
+    _git(work, "add", "f.txt")
+    _git(work, "commit", "-m", "init")
+    _git(work, "remote", "add", "origin", str(origin))
+    _git(work, "push", "origin", "main")
+    _git(work, "fetch", "origin")
+    return work
+
+
+def test_resolve_base_ref_returns_desired_when_it_exists(worktree_with_origin):
+    assert ssw.resolve_base_ref(str(worktree_with_origin), "origin/main") == "origin/main"
+
+
+def test_resolve_base_ref_falls_back_to_origin_main_when_desired_missing(worktree_with_origin):
+    assert (ssw.resolve_base_ref(str(worktree_with_origin), "origin/no-such-branch")
+            == "origin/main")
+
+
+def test_resolve_base_ref_falls_back_to_desired_when_nothing_resolves(tmp_path):
+    lone = tmp_path / "lone"
+    lone.mkdir()
+    _git(lone, "init", "-b", "main")
+    _git(lone, "config", "user.email", "t@example.com")
+    _git(lone, "config", "user.name", "T")
+    (lone / "f.txt").write_text("1")
+    _git(lone, "add", "f.txt")
+    _git(lone, "commit", "-m", "init")
+    # no origin remote, no upstream configured -> nothing resolves
+    assert ssw.resolve_base_ref(str(lone), "origin/main") == "origin/main"
 
 
 if __name__ == "__main__":

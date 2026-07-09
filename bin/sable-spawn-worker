@@ -17,8 +17,12 @@ resolves the target from the operator's active pane, not the worker's own
 (market-brief-package-uj22 / SABLE-5v9n).
 Results flow back via the bead pool; `sable-worker-status --reap` cleans up.
 
-Governance (claim) runs before the spawn unless --skip-governance; the full
-pre-dispatch interlock/overlap re-home lands in SABLE-bldh.6.
+Governance runs before the spawn unless --skip-governance: model-check + claim
+(SABLE-bldh.6), plus duplicate-dispatch / overlap-advisory / P0-preempt /
+worktree-refresh (SABLE-bldh.8) — the full set of what used to be separate
+PreToolUse:Agent hooks (hooks/multi-manager/pre-dispatch-{overlap,preempt,
+refresh}.sh), now re-homed as pre-spawn steps here since those hooks only ever
+fired on the (now-unused) Agent dispatch path.
 
 Usage:
   sable-spawn-worker <bead-id> [--worktree PATH] [--model M|--model M:reason]
@@ -118,6 +122,133 @@ def model_check(labels: list[str], override: str | None) -> str | None:
         return (f"--model override '{om.strip()}' disagrees with bead label "
                 f"'model:{lm}' and gives no reason. Use --model {om.strip()}:<reason> "
                 f"to override deliberately.")
+    return None
+
+
+def parse_bead_list(raw: str) -> list[dict]:
+    """Best-effort parse of a `bd ... --json` array response. Empty list on any
+    malformed/non-array payload — governance below fails OPEN, never blocks a
+    spawn because a `bd` query hiccuped."""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def already_in_progress_check(bead: dict) -> str | None:
+    """Re-homed + sharpened pre-dispatch-overlap (SABLE-bldh.8): refuse a
+    SECOND spawn for a bead that is already IN_PROGRESS — the bead trivially
+    'overlaps' with itself, and a second worker racing the first is a real
+    duplicate-work/double-push hazard the old prompt-parsing hook never
+    caught (it only ever compared DIFFERENT bead IDs against each other).
+    Returns an error string to block, or None to allow."""
+    if bead.get("status") != "in_progress":
+        return None
+    assignee = bead.get("assignee") or "unassigned"
+    return (f"{bead.get('id', '?')} is already IN_PROGRESS (assignee: {assignee}) — "
+            "refusing a second spawn for the same bead. If the prior worker died "
+            "or stalled, close/reset its worktree first.")
+
+
+def extract_wip_claims(text: str) -> set[str]:
+    """File paths from `WIP-CLAIMS: a, b, c` lines in bead notes/description."""
+    claims: set[str] = set()
+    for m in re.finditer(r"WIP-CLAIMS:\s*([^\n]+)", text or ""):
+        for p in m.group(1).split(","):
+            p = p.strip()
+            if p:
+                claims.add(p)
+    return claims
+
+
+def bead_claimed_files(bead: dict) -> set[str]:
+    text = (bead.get("notes") or "") + "\n" + (bead.get("description") or "")
+    return extract_wip_claims(text)
+
+
+def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> str | None:
+    """Re-homed pre-dispatch-overlap (SABLE-bldh.8): ADVISORY ONLY, matching the
+    original hook — does not block. Warns when this bead's WIP-CLAIMS files
+    overlap a DIFFERENT in-progress bead's claims, so a coord bead can be filed
+    if needed. Same-bead duplication is handled separately (blocking) by
+    already_in_progress_check(). Returns a warning string to print, or None."""
+    my_files = bead_claimed_files(bead)
+    if not my_files:
+        return None
+    hits = []
+    for other in in_progress:
+        oid = other.get("id", "")
+        if not oid or oid == bead_id:
+            continue
+        shared = my_files & bead_claimed_files(other)
+        if shared:
+            assignee = other.get("assignee") or "unassigned"
+            hits.append(f"  - {oid} ({assignee}, in-progress): {', '.join(sorted(shared))}")
+    if not hits:
+        return None
+    return ("OVERLAP DETECTED — this dispatch shares files with active in-progress "
+            "work:\n" + "\n".join(hits) + "\n\nProceeding. File a coord bead if "
+            "collaboration/sequencing is needed.")
+
+
+def preempt_check(lane: str, inbox: list[dict]) -> str | None:
+    """Re-homed pre-dispatch-preempt (SABLE-bldh.8): block dispatch when a
+    priority-0 coord bead sits in the lane's inbox (`for-<lane>`). Existing
+    dispatched workers are unaffected — only the NEXT dispatch. Empty lane =>
+    allow (no identity to gate on). Returns an error string to block, or None."""
+    if not lane:
+        return None
+    p0 = [f"{b.get('id', '')}: {b.get('title', '')}" for b in inbox
+          if b.get("priority") == 0 and b.get("id")]
+    if not p0:
+        return None
+    return (f"PREEMPTION ({lane}): priority-0 coord bead(s) in the lane inbox "
+            "blocking next dispatch:\n" + "\n".join(p0) +
+            "\n\nResolve with bd close, or set aside with: bd update <id> --notes "
+            "\"deferred: <reason>\" then bd defer <id>.")
+
+
+def resolve_base_ref(worktree: str, desired: str) -> str:
+    """Mirrors lib-identity.sh's sable_validate_base_ref: if `desired` doesn't
+    exist in `worktree`, fall back to origin/main, then @{upstream}, so a stale
+    SABLE_BASE_BRANCH never hard-fails the refresh below (SABLE-61n)."""
+    def ref_exists(ref: str) -> bool:
+        return subprocess.run(
+            ["git", "-C", worktree, "rev-parse", "--verify", "--quiet", ref],
+            capture_output=True).returncode == 0
+
+    if ref_exists(desired):
+        return desired
+    if desired != "origin/main" and ref_exists("origin/main"):
+        return "origin/main"
+    up = subprocess.run(
+        ["git", "-C", worktree, "rev-parse", "--abbrev-ref", "--symbolic-full-name",
+         "@{upstream}"], capture_output=True, text=True)
+    if up.returncode == 0 and up.stdout.strip():
+        return up.stdout.strip()
+    return desired
+
+
+def refresh_worktree(worktree: str, base_branch: str) -> str | None:
+    """Re-homed pre-dispatch-refresh (SABLE-bldh.8) — lowest priority per the
+    bead: only relevant when REUSING an existing worktree via --worktree, since
+    a freshly `bd worktree create`d tree is already at the base HEAD, and the
+    worker itself rebases again before its final commit (worker-dispatch.md).
+    Non-blocking: on fetch/rebase failure, aborts the half-done rebase and
+    returns a warning instead of failing the spawn."""
+    base = resolve_base_ref(worktree, base_branch)
+    fetch = subprocess.run(["git", "-C", worktree, "fetch", "origin"],
+                           capture_output=True, text=True)
+    if fetch.returncode != 0:
+        return f"refresh: fetch failed for {worktree}: {fetch.stderr.strip()[:300]}"
+    rebase = subprocess.run(["git", "-C", worktree, "rebase", base],
+                            capture_output=True, text=True)
+    if rebase.returncode != 0:
+        subprocess.run(["git", "-C", worktree, "rebase", "--abort"],
+                       capture_output=True, text=True)
+        return (f"refresh: rebase of {worktree} on {base} failed and was aborted: "
+                f"{(rebase.stdout + rebase.stderr).strip()[:300]}")
     return None
 
 
@@ -244,20 +375,48 @@ def main(argv: list[str] | None = None) -> int:
     # --- fetch bead for the prompt + label-based model resolution ---
     bead = parse_bead(_run(["bd", "show", bid, "--json"]))
     model, reason = resolve_model(bead_labels(bead), ns.model)
+    lane = resolve_lane(ns.lane)
 
-    # --- governance: model-check + claim (SABLE-bldh.6). The execution-mode
-    # interlock gates this command upstream; overlap/preempt/refresh re-home is a
-    # tracked follow-up. ---
+    # --- governance: model-check + duplicate-dispatch + preempt + claim +
+    # overlap advisory (SABLE-bldh.6 re-homed model-check/claim; SABLE-bldh.8
+    # re-homes the remaining PreToolUse:Agent hooks as pre-spawn steps here).
+    # The execution-mode interlock gates this whole command upstream. ---
     if not ns.skip_governance:
         err = model_check(bead_labels(bead), ns.model)
         if err:
             sys.stderr.write(f"sable-spawn-worker: model-check blocked — {err}\n")
             return 3
+
+        dup_err = already_in_progress_check(bead)
+        if dup_err:
+            sys.stderr.write(f"sable-spawn-worker: duplicate-dispatch blocked — {dup_err}\n")
+            return 5
+
+        if lane:
+            inbox = parse_bead_list(_run(["bd", "ready", "-l", f"for-{lane}", "--json"]))
+            preempt_err = preempt_check(lane, inbox)
+            if preempt_err:
+                sys.stderr.write(f"sable-spawn-worker: preempt blocked — {preempt_err}\n")
+                return 6
+
         subprocess.run(["bd", "update", bid, "--claim"], check=True)
+
+        in_progress = parse_bead_list(_run(["bd", "list", "--status=in_progress", "--json"]))
+        overlap_warning = overlap_check(bid, bead, in_progress)
+        if overlap_warning:
+            sys.stderr.write(f"sable-spawn-worker: {overlap_warning}\n")
 
     # --- worktree ---
     if ns.worktree:
         worktree = ns.worktree
+        # Refresh (SABLE-bldh.8), lowest priority: only reusing an EXISTING
+        # worktree needs a rebase — a freshly `bd worktree create`d tree below
+        # is already at the base HEAD.
+        if not ns.skip_governance:
+            refresh_warning = refresh_worktree(
+                worktree, os.environ.get("SABLE_BASE_BRANCH", "origin/main"))
+            if refresh_warning:
+                sys.stderr.write(f"sable-spawn-worker: {refresh_warning}\n")
     else:
         wt_name = worktree_name(bid, ns.scope)
         toplevel = _run(["git", "rev-parse", "--show-toplevel"]).strip()
@@ -278,7 +437,6 @@ def main(argv: list[str] | None = None) -> int:
         worktree, branch, model))
 
     # --- open the worker window (stamped with the lane identity) + capture pane ---
-    lane = resolve_lane(ns.lane)
     win = window_name(bid)
     wcmd = worker_command(model, os.environ.get("SABLE_WORKER_CMD"))
     pane_id = _run(base + new_window_args(ns.session, win, worktree,
