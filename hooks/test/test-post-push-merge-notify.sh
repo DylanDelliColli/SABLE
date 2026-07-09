@@ -461,6 +461,92 @@ run_hook "$MGR_ENV SABLE_BASE_BRANCH=origin/llm-integration" "$INT_INPUT_B" >/de
 assert_bd_called "market-brief-package-2u25: non-integration branch push in same repo still notifies"
 
 # --------------------------------------------------------------------------
+# SABLE-pzfk: default BASE_BRANCH must resolve to the repo's PUBLISHED
+# integration branch, not a hardcoded origin/main, when SABLE_BASE_BRANCH is
+# unset. Fixture: integration branch (tmux-only) diverges from main by 9 doc
+# files; a worker branch off tmux-only adds exactly 1 real file. Pre-fix,
+# diffing against origin/main reports all 10 files (the alphabetical-docs-
+# prefix symptom chuck actually saw); fixed, diffing against
+# origin/tmux-only reports exactly the 1 real file — and the overlap
+# analysis (fed from FILES) must derive from that corrected set: no phantom
+# overlap against a doc file nobody actually touched on this push.
+# --------------------------------------------------------------------------
+
+PZFK_BARE=$(mktemp -d)
+PZFK_REPO=$(mktemp -d)
+trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO"' EXIT
+
+git init -q --bare "$PZFK_BARE"
+git clone -q "$PZFK_BARE" "$PZFK_REPO"
+cd "$PZFK_REPO"
+git config user.email "p@p"; git config user.name "p"
+echo base > base.txt; git add base.txt; git commit -q -m base
+git push -q origin HEAD:refs/heads/main 2>/dev/null
+
+git checkout -q -b tmux-only
+for i in 1 2 3 4 5 6 7 8 9; do echo "d$i" > "doc$i.txt"; done
+git add doc*.txt
+git commit -q -m "integration branch doc history"
+git push -q origin HEAD:refs/heads/tmux-only 2>/dev/null
+git config sable.integrationBranch tmux-only
+
+git checkout -q -b wk-worker
+echo real > real_change.txt
+git add real_change.txt
+git commit -q -m "worker: real change"
+git push -q origin HEAD:refs/heads/wk-worker 2>/dev/null
+cd - >/dev/null
+
+# Section-local bd stub: `list --status=in_progress --json` returns a real
+# in-progress bead claiming doc1.txt via WIP-CLAIMS — a file that's part of
+# the PHANTOM origin/main diff but NOT the worker's real diff. Overlap must
+# NOT fire on it once the base ref is fixed. `create` still logs to BD_LOG.
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "list" ]; then
+  cat <<'JSON'
+[{"id": "SABLE-fakein", "title": "unrelated in-progress work", "assignee": "someone", "notes": "WIP-CLAIMS: doc1.txt"}]
+JSON
+  exit 0
+fi
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+PZFK_INPUT=$(make_post_input "git push" "$PZFK_REPO")
+run_hook "$MGR_ENV" "$PZFK_INPUT" >/dev/null
+
+if grep -q 'real_change.txt' "$BD_LOG" 2>/dev/null; then
+  pass "SABLE-pzfk: default base resolves to published integration branch — real file listed"
+else
+  fail "SABLE-pzfk: default base resolves to published integration branch — real file listed" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null)"
+fi
+
+if grep -qE 'doc[19]\.txt' "$BD_LOG" 2>/dev/null; then
+  fail "SABLE-pzfk: doc-history files from origin/main are NOT in the file list" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null)"
+else
+  pass "SABLE-pzfk: doc-history files from origin/main are NOT in the file list"
+fi
+
+if grep -q 'OVERLAP-WARNING' "$BD_LOG" 2>/dev/null; then
+  fail "SABLE-pzfk: no spurious overlap warning against doc1.txt (not really touched by this push)" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null)"
+else
+  pass "SABLE-pzfk: no spurious overlap warning against doc1.txt (not really touched by this push)"
+fi
+
+rm -f "$BD_LOG"
+
+# Restore the plain bd stub for hermeticity if more tests are appended later.
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+# --------------------------------------------------------------------------
 # Summary
 # --------------------------------------------------------------------------
 

@@ -63,10 +63,33 @@ if echo "$STDOUT_STDERR" | grep -qiE '(rejected|! \[remote rejected\]|error: fai
   exit 0
 fi
 
+# market-brief-package-2u25: resolve PER REPO (repo-local git config / .sable
+# file wins over session env, shared with pre-push-rebase-test.sh via
+# lib-identity.sh) so a foreign SABLE_BASE_BRANCH/SABLE_INTEGRATION_BRANCH
+# inherited from another repo's session cannot misfire the guards below.
+# Resolved BEFORE BASE_BRANCH (SABLE-pzfk) since the diff-base default now
+# depends on it.
+INTEGRATION_BRANCH=$(sable_resolve_integration_branch "$CWD")
+
 # Validate the base ref and fall back gracefully (SABLE-61n: an invalid
 # SABLE_BASE_BRANCH caused git to exit 128 under set -euo pipefail, silently
-# killing the hook before the bd create was reached)
-BASE_BRANCH=$(sable_validate_base_ref "$CWD" "${SABLE_BASE_BRANCH:-origin/main}")
+# killing the hook before the bd create was reached). Default to the resolved
+# integration branch when it is published, not a hardcoded origin/main
+# (SABLE-pzfk): on a repo whose integration branch isn't main (tmux-only
+# today), the old unconditional origin/main default reported the ENTIRE
+# integration-branch-vs-main history as the pushed diff — inflating the file
+# list (chuck's PR-ready messages showed an alphabetical docs prefix
+# regardless of the real diff) and feeding the wrong file set into the
+# overlap analysis below (spurious OVERLAP-WARNINGs against files nobody
+# actually touched). Mirrors the SABLE-4amz fix in pre-push-rebase-test.sh
+# (commit b77034e): only switch the default when origin/<INT> actually
+# exists, else fall back to origin/main as before.
+DEFAULT_BASE_BRANCH="origin/main"
+if [ -n "$INTEGRATION_BRANCH" ] \
+   && git -C "$CWD" rev-parse --verify --quiet "origin/$INTEGRATION_BRANCH" >/dev/null 2>&1; then
+  DEFAULT_BASE_BRANCH="origin/$INTEGRATION_BRANCH"
+fi
+BASE_BRANCH=$(sable_validate_base_ref "$CWD" "${SABLE_BASE_BRANCH:-$DEFAULT_BASE_BRANCH}")
 
 # Determine current branch and modified files
 BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
@@ -76,11 +99,7 @@ BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 # market-brief-package-2u25: pushing the repo's OWN integration branch is not
 # "PR ready for review" — it already IS the integration line (a topology
 # promotion decided elsewhere, not routine merge-queue work; chuck triaged an
-# earlier misfire of this exact shape as a false-positive). Resolved PER REPO
-# (repo-local git config / .sable file wins over session env, shared with
-# pre-push-rebase-test.sh via lib-identity.sh) so a foreign SABLE_BASE_BRANCH
-# inherited from another repo's session cannot misfire this.
-INTEGRATION_BRANCH=$(sable_resolve_integration_branch "$CWD")
+# earlier misfire of this exact shape as a false-positive).
 [ "$BRANCH" = "$INTEGRATION_BRANCH" ] && exit 0
 
 FILES=$(git -C "$CWD" diff "$BASE_BRANCH"...HEAD --name-only 2>/dev/null | head -50)
