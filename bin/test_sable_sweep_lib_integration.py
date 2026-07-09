@@ -9,7 +9,12 @@ write_plan(), with the PATH-shim call log proving two properties end to end:
 shards make ZERO bd invocations, and every `bd update` call happens strictly
 AFTER merge (post-merge-only writes). A second test proves snapshot
 consistency: a bead that lands in the fixture after export() has already run
-is invisible to anything working from that snapshot.
+is invisible to anything working from that snapshot. A third test proves
+merge()'s count-reconciliation cross-check (SABLE-5s97) end to end: a real
+slice()->stub-shards->merge() pipeline where one shard silently drops its
+slice's boundary bead raises ShardUnderReportError, and — critically — no
+`bd update` call ever reaches the shim, because the parent never gets a
+merged report to build a write plan from.
 """
 import json
 import os
@@ -103,7 +108,9 @@ def test_mini_sweep_shards_make_zero_bd_calls_and_writes_are_post_merge(tmp_path
         "shard context made a bd call — shards must never touch bd")
 
     # 3. merge preserves every shard finding; merge/write_plan add no bd calls.
-    merged = lib.merge(shard_reports)
+    # Passing slices= exercises the count-reconciliation cross-check too — a
+    # correct set of shard reports merges clean (SABLE-5s97).
+    merged = lib.merge(shard_reports, slices=[s for s in slices if s])
     assert merged["stats"]["candidates"] == len(beads)
     assert {f["bead_id"] for f in merged["findings"]} == {b["id"] for b in beads}
 
@@ -150,3 +157,42 @@ def test_snapshot_invisible_to_beads_added_after_export(tmp_path):
     # itself changed and the first export's isolation wasn't a fixture bug.
     reexported = lib.export_snapshot(run=lambda cmd: _run_real_bd(cmd, env))
     assert "SWEEP-3-LATE" in {b["id"] for b in reexported}
+
+
+def test_mini_sweep_deficient_shard_raises_before_any_bd_write(tmp_path):
+    """End-to-end reproduction of the live SABLE-tz7h.5 failure: a shard that
+    silently drops the boundary (last) bead of its own correctly-sized slice.
+    merge() must raise instead of producing a mergeable report — and because
+    it raises, write_plan() is never reached and zero `bd update` calls ever
+    happen, proving the deficient shard's short report never reaches bd."""
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    _install_fake_bd(bin_dir)
+
+    fixture = tmp_path / "export.json"
+    beads = [{"id": f"SWEEP-{i}"} for i in range(6)]
+    fixture.write_text(json.dumps(beads))
+
+    call_log = tmp_path / "bd-calls.log"
+    env = _env_with_fake_bd(bin_dir, fixture, call_log)
+
+    exported = lib.export_snapshot(run=lambda cmd: _run_real_bd(cmd, env))
+    slices = lib.slice(exported, 2)
+
+    # shard 0 behaves correctly; shard 1 silently drops the LAST bead of its
+    # own slice — the exact boundary miss observed live.
+    shard_reports = [
+        stub_shard(slices[0]),
+        stub_shard(slices[1][:-1]),
+    ]
+
+    try:
+        lib.merge(shard_reports, slices=slices)
+        raise AssertionError("expected ShardUnderReportError, merge() returned normally")
+    except lib.ShardUnderReportError as exc:
+        assert exc.shard_index == 1
+        assert slices[1][-1]["id"] in exc.missing_ids
+
+    # the deficient report never became a write plan, so bd saw only the
+    # original export call — no `update` calls at all.
+    assert _call_log_lines(call_log) == ["list --json"]
