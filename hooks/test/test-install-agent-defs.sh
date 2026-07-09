@@ -98,14 +98,14 @@ for name in $SABLE_AGENTS; do
     if [ -f "$f" ]; then pass "integration: $name.md present"; else fail "integration: $name.md present" "missing: $f"; fi
 done
 
-# Verify agent files are non-empty and carry the expected v2 marker
+# Verify agent files are non-empty and carry the expected v3 marker
 for name in $SABLE_AGENTS; do
     f="$T2/.claude/agents/$name.md"
     [ -f "$f" ] || continue
-    if grep -q "v2 invocation" "$f" 2>/dev/null; then
-        pass "integration: $name.md carries v2 invocation marker"
+    if grep -q "v3 invocation" "$f" 2>/dev/null; then
+        pass "integration: $name.md carries v3 invocation marker"
     else
-        fail "integration: $name.md carries v2 invocation marker" "pattern not found in: $f"
+        fail "integration: $name.md carries v3 invocation marker" "pattern not found in: $f"
     fi
 done
 

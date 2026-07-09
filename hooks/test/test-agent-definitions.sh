@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test-agent-definitions.sh — Verifies the generated custom agent definitions
-# under templates/agents/ (SABLE-uz9.2, one-window topology).
+# under templates/agents/ (SABLE-uz9.2, warm tmux-pane topology).
 #
 # Two layers:
 #   1. Drift check: bin/sable-build-agents regenerated into a temp dir must be
@@ -70,9 +70,9 @@ for name in $AGENTS; do
     fail "$name.md has a non-empty description"
   fi
   assert_grep "$DEF" "GENERATED from templates/multi-manager/roles/$name.md" "$name.md carries the generated-file marker"
-  # Producers carry the v2 one-window subagent preamble (they remain Agent-tool
+  # Producers carry the v3 warm tmux-pane subagent preamble (they remain Agent-tool
   # planning subagents; managers are panes and have no defs).
-  assert_grep "$DEF" "v2 invocation (one-window topology)" "$name.md (producer) carries the v2 invocation preamble"
+  assert_grep "$DEF" "v3 invocation (warm tmux-pane topology)" "$name.md (producer) carries the v3 invocation preamble"
 done
 
 # load-bearing contract markers per role (the conversion must not lose these)
