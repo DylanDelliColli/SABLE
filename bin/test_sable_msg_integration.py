@@ -57,7 +57,14 @@ def _run_msg(sock, *cli_args):
 
 def _env():
     import os
-    return dict(os.environ)
+    env = dict(os.environ)
+    # These subprocess-driven sends must exercise CWD-derivation deterministically,
+    # not whichever real pane happens to be running pytest (SABLE-ssd8: pytest's
+    # ambient $TMUX_PANE could coincidentally collide with a pane id on the
+    # freshly created isolated socket below, since ids restart from %0 per server).
+    env.pop("TMUX_PANE", None)
+    env.pop("TMUX", None)
+    return env
 
 
 def test_message_delivered_to_registered_pane(tmux_socket):
@@ -162,6 +169,48 @@ def test_own_fleet_down_never_falls_through_to_another_repo(tmux_socket, tmp_pat
     assert "sable-alpha" in (r.stderr + r.stdout)
     time.sleep(0.5)
     assert "LEAKED" not in _capture(tmux_socket, "sable-beta")
+
+
+# --- cross-repo CWD vs actual pane session (SABLE-ssd8) ---------------------
+# The live bug: a worker's ACTUAL tmux session (where tarzan lives) can differ
+# from whatever session CWD-derivation would compute for its worktree repo,
+# e.g. a worker dispatched by a manager tracking repo alpha but working in an
+# unrelated repo beta's worktree as CWD. beta must be a REAL, concurrently
+# running fleet (not a nonexistent guessed name) to reproduce the reported
+# failure faithfully -- with no real "sable-beta" session, the legacy 'sable'
+# fallback's tmux target prefix-matching ("-t sable" uniquely resolves to
+# whichever single "sable-*" session exists) plus the worker pane's own cwd
+# satisfying _panes_under_root would accidentally paper over the bug. With
+# beta genuinely running (its own real fleet, no tarzan pane in it),
+# CWD-derivation confidently and WRONGLY resolves "sable-beta" and never
+# reaches the legacy fallback at all -- exactly SABLE-ssd8's live failure.
+
+def test_pane_session_wins_over_mismatched_cwd_repo(tmux_socket, tmp_path):
+    alpha, sess_a = _make_fleet(tmux_socket, tmp_path, "alpha")  # tarzan lives here
+    beta, sess_b = _make_fleet(tmux_socket, tmp_path, "beta", role="chuck")  # real, no tarzan
+    tarzan_pane = _tmux(tmux_socket, "list-panes", "-t", sess_a,
+                        "-F", "#{pane_id}").stdout.split()[0]
+
+    # a second pane in alpha's OWN session, but shelled into beta's worktree —
+    # exactly the mismatched-CWD shape a cross-repo worker dispatch produces.
+    _tmux(tmux_socket, "split-window", "-t", sess_a, "-d", "-c", str(beta),
+          "PS1='> ' bash --noprofile --norc")
+    time.sleep(0.4)
+    all_panes = _tmux(tmux_socket, "list-panes", "-t", sess_a,
+                      "-F", "#{pane_id}").stdout.split()
+    worker_pane = next(p for p in all_panes if p != tarzan_pane)
+    _tmux(tmux_socket, "set-option", "-p", "-t", worker_pane, "@sable_role", "worker")
+
+    # send FROM the worker pane itself via send-keys, so $TMUX_PANE is real
+    # (set by tmux for that pane's own bash, not injected by the test) even
+    # though the shell's CWD is beta, not alpha.
+    body = "; echo CROSS-REPO-DELIVERED"
+    cmd = (f'unset SABLE_TMUX_SESSION; SABLE_TMUX_SOCKET={tmux_socket} '
+          f'python3 {BIN} tarzan "{body}" --from worker')
+    _tmux(tmux_socket, "send-keys", "-t", worker_pane, cmd, "Enter")
+    time.sleep(1.5)
+    assert "CROSS-REPO-DELIVERED" in _capture(tmux_socket, sess_a)
+    assert "CROSS-REPO-DELIVERED" not in _capture(tmux_socket, sess_b)
 
 
 if __name__ == "__main__":

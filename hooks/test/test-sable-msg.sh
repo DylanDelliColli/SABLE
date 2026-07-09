@@ -122,6 +122,56 @@ else
   fail "manager-role resolution unchanged"
 fi
 
+# --- 5) cross-repo CWD vs actual pane session (market-brief-package-ssd8) ---
+# The live bug this bead fixes: a worker's shell CWD can be a DIFFERENT
+# repo's worktree than the tmux session it actually lives in (e.g. dispatched
+# by a manager tracking repo A but working in repo B's worktree as CWD).
+# Plain sable-msg from that worker -- NO SABLE_TMUX_SESSION override -- must
+# still reach the manager in its OWN actual session, not whatever session
+# CWD-derivation would compute for repo B. Repo B is a REAL, concurrently
+# running fleet (not a nonexistent guessed name): CWD-derivation confidently
+# resolves a WRONG-but-real session and never falls through to any rescuing
+# heuristic, matching the live failure exactly.
+REPO_A="$REC/repo-alpha"; REPO_B="$REC/repo-beta"
+mkdir -p "$REPO_A" "$REPO_B"
+git init -q "$REPO_A"; git init -q "$REPO_B"
+SESS_A="sable-$(basename "$REPO_A")"
+SESS_B="sable-$(basename "$REPO_B")"
+
+tmux_ new-session -d -s "$SESS_A" -x 200 -y 50 -c "$REPO_A" "PS1='> ' bash --noprofile --norc"
+tmux_ set-option -t "$SESS_A" @sable_repo "$REPO_A"
+tmux_ set-option -p -t "$SESS_A" @sable_role tarzan
+tmux_ new-session -d -s "$SESS_B" -x 200 -y 50 -c "$REPO_B" "PS1='> ' bash --noprofile --norc"
+tmux_ set-option -t "$SESS_B" @sable_repo "$REPO_B"
+sleep 0.3
+
+tarzan_pane="$(tmux_ list-panes -t "$SESS_A" -F '#{pane_id}')"
+# a second pane in alpha's OWN session, shelled into beta's worktree — exactly
+# the mismatched-CWD shape a cross-repo worker dispatch produces.
+tmux_ split-window -t "$SESS_A" -d -c "$REPO_B" "PS1='> ' bash --noprofile --norc"
+sleep 0.3
+worker_pane="$(tmux_ list-panes -t "$SESS_A" -F '#{pane_id}' | grep -v "^$tarzan_pane$")"
+tmux_ set-option -p -t "$worker_pane" @sable_role worker
+
+# sent FROM the worker pane itself via send-keys, so $TMUX_PANE is real (set
+# by tmux for that pane's own bash, not injected) even though CWD is beta.
+tmux_ send-keys -t "$worker_pane" \
+  "unset SABLE_TMUX_SESSION; SABLE_TMUX_SOCKET=$SOCK python3 $BIN/sable-msg tarzan 'cross-repo-ssd8-check' --from worker" Enter
+sleep 1.5
+
+acap="$(tmux_ capture-pane -t "$SESS_A" -p)"
+bcap="$(tmux_ capture-pane -t "$SESS_B" -p)"
+if printf '%s' "$acap" | grep -q '⟦SABLE-MSG⟧ from=worker to=tarzan :: cross-repo-ssd8-check'; then
+  pass "sable-msg from a worker whose CWD is a different repo's worktree still reaches its own session's manager (market-brief-package-ssd8)"
+else
+  fail "sable-msg from a worker whose CWD is a different repo's worktree still reaches its own session's manager (market-brief-package-ssd8)" "$acap"
+fi
+if printf '%s' "$bcap" | grep -q 'cross-repo-ssd8-check'; then
+  fail "message did NOT leak into the CWD-derived (wrong) repo's session" "$bcap"
+else
+  pass "message did NOT leak into the CWD-derived (wrong) repo's session"
+fi
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

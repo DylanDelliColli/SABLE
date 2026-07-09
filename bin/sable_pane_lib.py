@@ -215,22 +215,48 @@ def _panes_under_root(base: list[str], name: str, root: str, run=None) -> bool:
     return False
 
 
+def calling_pane_session(base: list[str], run=None) -> str | None:
+    """The tmux session that actually hosts the CALLING pane, when running
+    inside tmux ($TMUX_PANE set) -- the ground truth for "which fleet am I
+    in", independent of whatever repo the caller's CWD happens to sit in
+    (SABLE-ssd8: a worker's shell CWD may be a DIFFERENT repo's worktree than
+    the session that actually spawned it, e.g. a worker dispatched by
+    tarzan's session but working in a cross-repo worktree -- CWD-derivation
+    resolved the wrong session and couldn't find tarzan at all). None outside
+    tmux, or if the pane has already vanished."""
+    run = run or _tmux_run
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return None
+    r = run(base + ["display-message", "-p", "-t", pane, "#{session_name}"])
+    out = (getattr(r, "stdout", "") or "").strip()
+    return out if getattr(r, "returncode", 1) == 0 and out else None
+
+
 def resolve_session(socket: str | None = None, base: str | None = None,
-                    run=None, _root: str | None | object = "auto") -> str:
+                    run=None, _root: str | None | object = "auto",
+                    _pane_session: str | None | object = "auto") -> str:
     """The tmux session this repo's fleet lives in (or should be created as).
 
-    Precedence: SABLE_TMUX_SESSION env verbatim -> derived sable-<basename>
+    Precedence: SABLE_TMUX_SESSION env verbatim -> the CALLING PANE's actual
+    tmux session when running inside tmux (SABLE-ssd8 -- ground truth for
+    "which fleet am I in", independent of CWD) -> derived sable-<basename>
     when that session exists and is not owned by another repo (SessionCollision
     when it is) -> the legacy 'sable' session when it exists and its panes live
-    in this repo -> the derived name (creation target). Outside a git repo the
-    legacy name is returned unchanged. `_root` is a test seam."""
+    in this repo -> the derived name (creation target). Outside a git repo AND
+    outside tmux, the legacy name is returned unchanged. `_root`/`_pane_session`
+    are test seams."""
     env = os.environ.get("SABLE_TMUX_SESSION")
     if env:
         return env
+    tb = tmux_base(socket)
+    pane_session = (calling_pane_session(tb, run=run) if _pane_session == "auto"
+                    else _pane_session)
+    if pane_session:
+        return pane_session
     root = repo_root(base) if _root == "auto" else _root
     if root is None:
         return LEGACY_SESSION
-    tb = tmux_base(socket)
     name = derived_session(root)
     if session_exists(tb, name, run=run):
         owner = session_repo(tb, name, run=run)
