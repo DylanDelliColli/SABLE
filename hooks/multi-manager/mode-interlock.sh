@@ -31,6 +31,16 @@
 # SABLE-kwr.3 quick-tier substage telescope) governs only the main
 # session — in v3 subagents spawn via the Agent tool, not via bash claude aliases.
 #
+# sable-spawn-manager target classification (SABLE-dzjq): unlike the rest of the
+# Bash leg, the sable-spawn-manager spawn-helper leg is NOT scoped to the main
+# session (managers dispatch it from their own Bash too) and is target-aware
+# like the Agent leg above — it reuses classify_target on the helper's role
+# argument(s) so a planning-mode producer-role spawn (e.g. `sable-spawn-manager
+# victor --deliverable PATH`) is allowed while a manager-role spawn stays
+# denied. See its leg below for the matrix; sable-spawn-worker has no role
+# argument (it always spawns an execution worker) and stays blanket
+# execution-only.
+#
 # Producer identity leg (SABLE-tz7h.3): CLAUDE_AGENT_ROLE=producer marks a
 # fan-out analysis role (sherlock/victor/columbo/gaudi/rudy) as read-only by
 # construction — it may never dispatch a worker, stand up the fleet, or push
@@ -317,14 +327,93 @@ if is_spawn_call 'sable-spawn-worker' "$CMD_TEXT"; then
   exit 0
 fi
 
-# sable-spawn-manager stands up the execution fleet (manager windows) — gated
-# to EXECUTION mode the same way (SABLE-dqhn.2). Launching a session is
-# mode-neutral (lincoln only); spawning managers is not.
+# sable-spawn-manager stands up EITHER a manager pane (optimus/tarzan/chuck) OR
+# a bounded producer pane (victor, spawned with --deliverable) through the same
+# helper (see its usage docstring). Blanket-denying the helper by NAME outside
+# EXECUTION mode (the pre-SABLE-dzjq behavior) wrongly blocked the sanctioned
+# planning-mode producer spawn (Lincoln standing up a producer pane to fan out
+# analysis while the backlog is still being filled) with a message that claimed
+# the call "stands up the execution fleet" even when the target was a producer.
+# Fixed by reusing classify_target on the helper's role argument(s) and applying
+# the SAME mode matrix the Agent leg uses (SABLE-4k7): manager target — planning
+# deny / execution allow; producer target — planning allow / execution deny;
+# unregistered — free in either mode. --all always classifies as manager (it
+# spawns optimus/tarzan/chuck). There is no spawner (main vs subagent) axis
+# here — every Bash-tool call reaching this leg is an already-warm pane, never
+# an Agent-tool subagent — so only the mode + target cells apply.
+#
+# spawn_manager_roles <cmd> → newline-separated positional role tokens passed
+# to sable-spawn-manager, honoring its value-taking flags (--deliverable,
+# --model, --register-instance) so their values are never mistaken for a role.
+spawn_manager_roles() {
+  python3 -c "
+import shlex, sys
+cmd = sys.argv[1]
+try:
+    tokens = shlex.split(cmd)
+except ValueError:
+    tokens = cmd.split()
+try:
+    i = tokens.index('sable-spawn-manager')
+except ValueError:
+    sys.exit(0)
+value_flags = {'--deliverable', '--model', '--register-instance'}
+skip = False
+roles = []
+for t in tokens[i+1:]:
+    if t in (';', '&&', '||', '|'):
+        break
+    if skip:
+        skip = False
+        continue
+    if t in value_flags:
+        skip = True
+        continue
+    if t.startswith('-'):
+        continue
+    roles.append(t)
+print('\n'.join(roles))
+" "$1" 2>/dev/null
+}
+
+# spawn_manager_classify <cmd> → "manager" | "producer" | "free": the
+# mode-matrix target for a sable-spawn-manager invocation. The strictest
+# classify_target verdict across the requested role(s) wins (manager beats
+# producer beats free), so a call naming any manager role is treated as a
+# manager-target spawn even if another role on the same line is a producer.
+spawn_manager_classify() {
+  if printf '%s' "$1" | grep -qE '(^|[[:space:]])--all([[:space:]]|$)'; then
+    echo "manager"
+    return
+  fi
+  local role verdict="free" t
+  while IFS= read -r role; do
+    [ -z "$role" ] && continue
+    t="$(classify_target "$role")"
+    if [ "$t" = "manager" ]; then
+      echo "manager"
+      return
+    fi
+    [ "$t" = "producer" ] && verdict="producer"
+  done <<< "$(spawn_manager_roles "$1")"
+  echo "$verdict"
+}
+
 if is_spawn_call 'sable-spawn-manager' "$CMD_TEXT"; then
   printf '%s' "$CMD_TEXT" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exit 0
-  if [ "$MODE" != "execution" ]; then
-    deny "Orchestration is in ${MODE} mode — sable-spawn-manager stands up the execution fleet and is blocked outside EXECUTION mode. Run /sable-execute, or append --force to override."
-  fi
+  TARGET="$(spawn_manager_classify "$CMD_TEXT")"
+  case "$MODE" in
+    planning)
+      if [ "$TARGET" = "manager" ]; then
+        deny "Orchestration is in PLANNING mode — this sable-spawn-manager invocation targets a manager pane and is blocked; you fill the pool here, you do not stand up the fleet. Run /sable-execute to drain it, or append --force to override."
+      fi
+      ;;
+    execution)
+      if [ "$TARGET" = "producer" ]; then
+        deny "Orchestration is in EXECUTION mode — this sable-spawn-manager invocation targets a planning producer pane and is blocked; you drain the pool here, you do not fill it. Run /sable-plan for a planning session, or append --force to override."
+      fi
+      ;;
+  esac
   exit 0
 fi
 

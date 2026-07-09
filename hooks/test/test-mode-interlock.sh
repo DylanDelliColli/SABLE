@@ -395,6 +395,39 @@ set_mode execution
 assert_allow "execution allows sable-spawn-manager" 'sable-spawn-manager --all'
 set_mode planning
 
+# ---------- SABLE-dzjq: Bash-leg target classification for sable-spawn-manager ----------
+# The blanket execution-only deny wrongly blocked the sanctioned planning-mode
+# procedure of standing up a bounded producer pane (e.g. victor) via the same
+# helper. The Bash leg now reuses classify_target on the helper's role
+# argument(s) and applies the same matrix the Agent leg uses.
+set_mode planning
+assert_allow "dzjq: planning allows sable-spawn-manager producer role (victor)" \
+  'sable-spawn-manager victor --deliverable /tmp/out.md'
+assert_deny  "dzjq: planning denies sable-spawn-manager manager role (tarzan)" \
+  'sable-spawn-manager tarzan'
+assert_deny  "dzjq: planning denies sable-spawn-manager --all" 'sable-spawn-manager --all'
+assert_allow "dzjq: planning allows sable-spawn-manager unregistered role" \
+  'sable-spawn-manager nobody-registered'
+out_dzjq_p="$(run_hook 'sable-spawn-manager tarzan')"
+if printf '%s' "$out_dzjq_p" | grep -q 'manager pane'; then pass "dzjq: planning deny message names the manager classification"; else fail "dzjq: planning deny message names the manager classification" "got: $out_dzjq_p"; fi
+
+set_mode execution
+assert_allow "dzjq: execution allows sable-spawn-manager manager role (chuck)" \
+  'sable-spawn-manager chuck'
+assert_allow "dzjq: execution allows sable-spawn-manager --all" 'sable-spawn-manager --all'
+assert_deny  "dzjq: execution denies sable-spawn-manager producer role (victor)" \
+  'sable-spawn-manager victor --deliverable /tmp/out.md'
+assert_allow "dzjq: execution allows sable-spawn-manager unregistered role" \
+  'sable-spawn-manager nobody-registered'
+out_dzjq_e="$(run_hook 'sable-spawn-manager victor --deliverable /tmp/out.md')"
+if printf '%s' "$out_dzjq_e" | grep -q 'producer pane'; then pass "dzjq: execution deny message names the producer classification"; else fail "dzjq: execution deny message names the producer classification" "got: $out_dzjq_e"; fi
+
+# sable-spawn-manager --force still overrides the classification (unaffected by dzjq)
+set_mode planning
+assert_allow "dzjq: planning sable-spawn-manager producer --force overrides" \
+  'sable-spawn-manager victor --deliverable /tmp/out.md --force'
+set_mode planning
+
 # ---------- SABLE-pi5m: spawn-helper false positives + FORCE override ----------
 # Two defects fixed here:
 #  (1) The spawn legs matched the helper's name ANYWHERE on the command line —
