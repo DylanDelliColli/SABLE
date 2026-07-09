@@ -248,17 +248,23 @@ def plan_spawns(requested: list[str], existing: set[str]) -> tuple[list[str], li
 
 
 def manager_command() -> str:
+    """The command used to launch a manager pane. Managers ALWAYS run on Opus
+    (SABLE-gbd) — the per-bead model ladder (SABLE.md 6.9) governs the workers
+    a manager dispatches, never the manager's own model. SABLE_TMUX_PANE_CMD is
+    a full override for tests only and is exempt from the pin."""
     override = os.environ.get("SABLE_TMUX_PANE_CMD")
     if override:
         return override
     perm = os.environ.get("SABLE_WORKER_PERMISSION", "--permission-mode bypassPermissions")
-    return f"claude {perm}"
+    return f"claude --model opus {perm}"
 
 
 def producer_command(model: str) -> str:
-    """A producer's command line pins its model tier explicitly (architecture.json
-    decision 1) — unlike manager_command, which launches the ambient claude
-    default for the always-on manager fleet."""
+    """A producer's command line pins its CALLER-CHOSEN model tier
+    (architecture.json decision 1) — unlike manager_command, which always
+    pins Opus regardless of any tier argument (SABLE-gbd: the model ladder
+    is for bounded producers and workers, never for the always-on manager
+    fleet)."""
     override = os.environ.get("SABLE_TMUX_PANE_CMD")
     if override:
         return override

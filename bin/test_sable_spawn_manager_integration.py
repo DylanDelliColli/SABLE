@@ -10,6 +10,7 @@ at sable-launch.
 import os
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -142,6 +143,63 @@ def test_no_session_points_at_launch(sock):
     r = _run(sock, "optimus")
     assert r.returncode == 1
     assert "sable-launch" in r.stderr
+
+
+def test_manager_spawn_pins_real_claude_command_to_opus(sock, tmp_path):
+    """SABLE-gbd: a real spawn (no SABLE_TMUX_PANE_CMD override) must launch
+    the pane's `claude` process with --model opus. A real `claude` binary
+    would actually start a live, autonomous session and burn API calls the
+    moment deliver_text() types the autostart kick into it (proven the hard
+    way: an earlier draft of this test genuinely launched one). So PATH is
+    pointed at a harmless stub for JUST this test — everything else (the
+    tmux server, sable-spawn-manager's own subprocess call, the argv
+    construction, the real `new-window`) is real.
+
+    The stub must be resolvable at the point `new-window` is actually
+    invoked: tmux resolves that command using the environment of the CLIENT
+    process making the `new-window` call — here, sable-spawn-manager's own
+    `subprocess.run`, which inherits from the sable-spawn-manager process
+    itself — NOT the environment the target session was originally created
+    with. So the PATH override goes on the `python3 sable-spawn-manager`
+    subprocess env, not the tmux server's.
+    """
+    stub_dir = tmp_path / "stubbin"
+    stub_dir.mkdir()
+    log_path = tmp_path / "claude-args.log"
+    stub = stub_dir / "claude"
+    # The log path is baked into the script text (not passed via env/-e):
+    # a new-window env var wouldn't reliably reach the spawned process even
+    # though PATH-based command resolution does (see class docstring).
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> "{log_path}"\n'
+        "sleep 5\n"
+    )
+    stub.chmod(0o755)
+
+    _seed_lincoln(sock)
+
+    r = subprocess.run(["python3", str(BIN), "optimus"], capture_output=True, text=True,
+                       env={**os.environ, "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                          "SABLE_TMUX_SOCKET": sock,
+                          "SABLE_TMUX_SESSION": SESSION,
+                          "SABLE_DISPATCH_READY_TIMEOUT": "0",
+                          "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+                          "SABLE_DISPATCH_POLL_INTERVAL": "0.1"})
+    assert r.returncode == 0, r.stderr
+    assert "optimus" in _roles(sock)
+    # The stub's interpreter (sh), not the real claude binary, must be what
+    # actually ran — the strongest confirmation the stub was really hit.
+    assert "sh" in _tmux(sock, "list-panes", "-a", "-F",
+                         "#{@sable_role} #{pane_current_command}").stdout
+
+    for _ in range(20):
+        if log_path.exists() and log_path.read_text().strip():
+            break
+        time.sleep(0.1)
+    assert log_path.exists(), "stub claude binary was never invoked"
+    logged = log_path.read_text().strip()
+    assert "--model opus" in logged, logged
 
 
 # --- 73t4: instance registry CLI (register / self-reg refusal / prune) ------

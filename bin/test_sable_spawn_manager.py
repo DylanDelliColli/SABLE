@@ -148,6 +148,32 @@ def test_manager_kick_text_byte_identical_regression():
     assert spl.kick_message("chuck") == expected_chuck
 
 
+# --- SABLE-gbd: managers are ALWAYS Opus, the ladder is workers-only -------
+
+def test_manager_command_always_pins_opus(monkeypatch):
+    monkeypatch.delenv("SABLE_TMUX_PANE_CMD", raising=False)
+    monkeypatch.delenv("SABLE_WORKER_PERMISSION", raising=False)
+    assert sm.manager_command() == "claude --model opus --permission-mode bypassPermissions"
+
+
+def test_manager_command_pins_opus_regardless_of_permission_override(monkeypatch):
+    # SABLE-gbd: managers are ALWAYS Opus — no env or bead-style model label
+    # can steer the manager's own model. Only SABLE_TMUX_PANE_CMD (a full
+    # command override reserved for tests) is exempt.
+    monkeypatch.delenv("SABLE_TMUX_PANE_CMD", raising=False)
+    monkeypatch.setenv("SABLE_WORKER_PERMISSION", "--permission-mode acceptEdits")
+    monkeypatch.setenv("SABLE_WORKER_MODEL", "haiku")   # decoy: not a real knob, must be ignored
+    cmd = sm.manager_command()
+    assert cmd.startswith("claude --model opus ")
+    assert "haiku" not in cmd
+
+
+def test_manager_command_pane_cmd_override_bypasses_opus_pin(monkeypatch):
+    # The one intentional exemption: tests stand in a fake pane command.
+    monkeypatch.setenv("SABLE_TMUX_PANE_CMD", "bash")
+    assert sm.manager_command() == "bash"
+
+
 if __name__ == "__main__":
     import sys
     import pytest as _p

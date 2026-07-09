@@ -1210,6 +1210,13 @@ causes runtime errors.
 
 ### 6.9 Model Selection for Workers
 
+**Managers are exempt — this whole section is workers-only.** Optimus,
+Tarzan, and Chuck always run on Opus, full stop, regardless of how routine or
+mechanical the work in front of them looks; `sable-spawn-manager`'s
+`manager_command()` pins `--model opus` unconditionally when it launches a
+manager pane. The ladder below never applies to a manager's own model — only
+to the workers a manager dispatches via `sable-spawn-worker`.
+
 Different tasks need different models. Picking by bead structure (epic/feature/task) is wrong — bead structure is orthogonal to actual complexity. A 12-file rename is mechanical regardless of count; a single-file auth change is still security-sensitive. Apply the **model ladder** instead:
 
 **Default: Sonnet** (claude-sonnet-4-6). All work starts here.
@@ -1243,7 +1250,7 @@ Different tasks need different models. Picking by bead structure (epic/feature/t
 
 **Why this matters.** A swarm of all-Sonnet workers runs ~3-4× cheaper than all-Opus. Adding Haiku for mechanical work cuts another ~3× on those dispatches. Across 20+ dispatches per session, the difference compounds — and Sonnet handles 80%+ of standard implementation work without quality loss.
 
-The orchestrator (manager session) still runs on the most capable model available. Workers run on the fastest model that can handle the task. This optimizes for total throughput — many right-sized workers executing well-specified beads is faster AND cheaper than one powerful agent doing everything.
+The orchestrator (manager session — Optimus, Tarzan, Chuck) always runs on Opus; that's a hard pin, not a "most capable available" heuristic, and the ladder never overrides it. Workers run on the fastest model that can handle the task. This optimizes for total throughput — many right-sized workers executing well-specified beads is faster AND cheaper than one powerful agent doing everything.
 
 ---
 
