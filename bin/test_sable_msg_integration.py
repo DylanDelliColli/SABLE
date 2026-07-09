@@ -104,6 +104,44 @@ def test_wrapped_message_in_narrow_pane_is_actually_submitted(tmux_socket):
     assert "WRAP-42-VERIFIED" in pane
 
 
+def test_idle_pane_receives_interrupt_first_attempt(tmux_socket, tmp_path):
+    # SABLE-nmmh — the SABLE-kkgt repro, INVERTED. Before the event-driven loop
+    # fix, a manager pane sat mid-turn inside a foreground `time.sleep(30)`, so an
+    # --interrupt message was swallowed (the urgent channel was deaf). An
+    # event-driven manager ENDS its turn and idles at its prompt; an --interrupt
+    # message must then land on the FIRST submit attempt.
+    #
+    # SABLE_MSG_SUBMIT_TRIES=1 makes "first-attempt" load-bearing: a single
+    # failed submit fails the send. SABLE_MSG_AUTO_FALLBACK=0 keeps a failed send
+    # from filing a real inbox bead into the operator's bd db.
+    #
+    # The bash REPL stands in for the manager's claude TUI. In the real TUI,
+    # --interrupt's Escape CLEARS the composer non-destructively; bash readline
+    # instead treats a bare Escape as the Meta prefix and would eat the first byte
+    # of the framed header (a REPL-only artifact, not a delivery bug). The pane is
+    # launched with an inputrc binding Escape to a standalone no-op, modeling the
+    # TUI's non-destructive Escape so the interrupt path is exercised faithfully.
+    inputrc = tmp_path / "inputrc"
+    inputrc.write_text('"\\e": redraw-current-line\n')
+    _tmux(tmux_socket, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+          f"INPUTRC={inputrc} PS1='> ' bash --noprofile --norc")
+    time.sleep(0.5)
+    _tmux(tmux_socket, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
+
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus", "; echo INTERRUPT-LANDED",
+         "--from", "lincoln", "--interrupt"],
+        capture_output=True, text=True,
+        env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
+             "SABLE_MSG_SUBMIT_TRIES": "1", "SABLE_MSG_AUTO_FALLBACK": "0"},
+    )
+    assert r.returncode == 0, r.stderr          # delivered, verified, first attempt
+    time.sleep(0.8)
+    pane = _capture(tmux_socket, "w")
+    assert "⟦SABLE-MSG⟧ from=lincoln to=optimus" in pane   # framed turn landed intact
+    assert "INTERRUPT-LANDED" in pane                        # and executed (turn submitted)
+
+
 def test_message_queues_while_target_busy(tmux_socket):
     _start_pane(tmux_socket)
     # make the pane busy for 3s

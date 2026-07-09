@@ -645,6 +645,99 @@ run_hook "$MGR_ENV" "$B06T_INPUT_4" >/dev/null
 assert_bd_not_called "SABLE-b06t: 'Everything up-to-date' no-op push does NOT file for-chuck"
 
 # --------------------------------------------------------------------------
+# SABLE-nmmh: a worker landing wakes the DISPATCHING MANAGER (event-driven loop)
+# In the warm-pane topology the worker self-pushes; the post-push hook runs in
+# the worker's env, whose CLAUDE_AGENT_NAME IS the lane manager (worker_env_args),
+# so SABLE_ID_NAME already resolves to the dispatching manager. The hook must
+# ALSO message that manager to wake it (managers now END their turn when idle).
+# The worker-vs-manager discriminant is the pane's @sable_role tag: only a real
+# worker landing (@sable_role=worker) notifies; a manager's OWN emergency push
+# (@sable_role=<role>) must not self-notify. Chuck handoff stays regression-intact.
+# --------------------------------------------------------------------------
+
+# Stub tmux: the worker-landing gate reads the pane role via
+# `tmux display-message -p -t <pane> '#{@sable_role}'`. Echo SABLE_STUB_PANE_ROLE
+# for that call; no-op for anything else. Added here (after all earlier tests
+# have run) so it cannot perturb them — and the gate only shells out to tmux
+# when TMUX_PANE is set, which earlier tests never do.
+cat > "$STUB_DIR/tmux" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  if [ "$a" = "display-message" ]; then
+    echo "${SABLE_STUB_PANE_ROLE:-}"
+    exit 0
+  fi
+done
+exit 0
+EOF
+chmod +x "$STUB_DIR/tmux"
+
+# (a) worker landing (@sable_role=worker), Chuck reachable: the dispatching
+# manager (optimus) is messaged with a "Worker landed" wake, --from worker; the
+# Chuck merge handoff still fires alongside it.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -qE '^optimus .*Worker landed' "$SABLE_MSG_LOG" 2>/dev/null \
+   && grep -q 'from worker' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "SABLE-nmmh: worker landing wakes the dispatching manager (optimus, from worker)"
+else
+  fail "SABLE-nmmh: worker landing wakes the dispatching manager (optimus, from worker)" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+if grep -qE '^chuck .*PR ready from optimus' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "SABLE-nmmh: chuck merge handoff still fires alongside the manager wake"
+else
+  fail "SABLE-nmmh: chuck merge handoff still fires alongside the manager wake" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+
+# (b) worker landing, Chuck UNREACHABLE (rc=1): the manager wake still fires, and
+# the durable for-chuck fallback bead is still filed (chuck path regression-intact).
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+SABLE_MSG_STUB_RC=1 run_hook "$MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -q 'Worker landed' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "SABLE-nmmh: manager wake fires even when Chuck is unreachable"
+else
+  fail "SABLE-nmmh: manager wake fires even when Chuck is unreachable" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+assert_bd_called "SABLE-nmmh: for-chuck fallback bead still filed on landing when Chuck unreachable"
+
+# (c) manager's OWN emergency push (@sable_role=optimus, NOT worker): no
+# self-notify, but the Chuck handoff still fires.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV TMUX_PANE=%mgr SABLE_STUB_PANE_ROLE=optimus" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -q 'Worker landed' "$SABLE_MSG_LOG" 2>/dev/null; then
+  fail "SABLE-nmmh: manager emergency push does NOT self-notify" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+else
+  pass "SABLE-nmmh: manager emergency push does NOT self-notify (no Worker-landed msg)"
+fi
+if grep -qE '^chuck ' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "SABLE-nmmh: emergency push still hands off to chuck"
+else
+  fail "SABLE-nmmh: emergency push still hands off to chuck" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+
+# (d) disable knob SABLE_WORKER_LAND_NOTIFY=0: no manager wake even in a worker
+# pane; the Chuck handoff is unaffected.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker SABLE_WORKER_LAND_NOTIFY=0" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -q 'Worker landed' "$SABLE_MSG_LOG" 2>/dev/null; then
+  fail "SABLE-nmmh: SABLE_WORKER_LAND_NOTIFY=0 suppresses the manager wake" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+else
+  pass "SABLE-nmmh: SABLE_WORKER_LAND_NOTIFY=0 suppresses the manager wake"
+fi
+if grep -qE '^chuck ' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "SABLE-nmmh: chuck handoff unaffected by SABLE_WORKER_LAND_NOTIFY=0"
+else
+  fail "SABLE-nmmh: chuck handoff unaffected by SABLE_WORKER_LAND_NOTIFY=0" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+
+# Remove the tmux stub so any later-appended tests are unaffected.
+rm -f "$STUB_DIR/tmux"
+
+# --------------------------------------------------------------------------
 # Summary
 # --------------------------------------------------------------------------
 
