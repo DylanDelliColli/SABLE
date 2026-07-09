@@ -43,6 +43,13 @@ def make_repo(tmp_path, name):
 def run_cli(cwd, sock, extra_env=None):
     env = {**os.environ, "SABLE_TMUX_SOCKET": sock}
     env.pop("SABLE_TMUX_SESSION", None)
+    # These tests exercise CWD-derivation and must not depend on whichever
+    # real pane happens to be running pytest (SABLE-ssd8: resolve_session now
+    # prefers the calling pane's actual session, and pytest's own ambient
+    # $TMUX_PANE could coincidentally collide with a pane id on this freshly
+    # created isolated socket, since ids restart from %0 per server).
+    env.pop("TMUX_PANE", None)
+    env.pop("TMUX", None)
     env.update(extra_env or {})
     return subprocess.run([sys.executable, str(BIN)], cwd=cwd,
                           capture_output=True, text=True, env=env)
