@@ -85,6 +85,26 @@ assert_grep "$AGENTS_DIR/rudy.md"     "SABLE_RUDY_BASE_URL"    "rudy keeps the t
 assert_grep "$AGENTS_DIR/columbo.md"  "columbo-test-spec"      "columbo keeps the test-spec bead label"
 assert_grep "$AGENTS_DIR/columbo.md"  "it.todo"                "columbo keeps the skeleton-file contract"
 
+# --- Producers must not go idle after filing their end-of-session report bead
+# without ever replying to their spawner. victor is the confirmed repeat
+# offender (observed repeatedly in practice); assert the template carries an
+# unambiguous mandatory-send step. ---
+assert_grep "$AGENTS_DIR/victor.md" "MANDATORY" "victor.md carries a mandatory (not optional) final-step marker"
+assert_grep "$AGENTS_DIR/victor.md" "before you end your turn" "victor.md ties the final send to turn-end, not just bead-filing"
+assert_grep "$AGENTS_DIR/victor.md" "incomplete run" "victor.md states that skipping the final send makes the run incomplete"
+
+# Installed-copy parity is a SKIP, not a FAIL, when the installed copy simply
+# predates this change (install.sh refresh deferred to the merge window) — a
+# real drift check belongs to install.sh's own test, not this one.
+INSTALLED_VICTOR="$HOME/.claude/agents/victor.md"
+if [ ! -f "$INSTALLED_VICTOR" ]; then
+  echo "SKIP: installed victor.md matches template (no installed copy at $INSTALLED_VICTOR)"
+elif diff -q "$INSTALLED_VICTOR" "$AGENTS_DIR/victor.md" >/dev/null 2>&1; then
+  pass "installed victor.md matches template (install.sh in sync)"
+else
+  echo "SKIP: installed victor.md matches template (installed copy predates this change -- re-run install.sh to refresh $INSTALLED_VICTOR)"
+fi
+
 # --- SABLE-qa4d.5: managers and the teams build are GONE ---
 # Managers are warm panes (role files under templates/multi-manager/roles/ are
 # their identity source); the agent-teams topology was removed entirely.
