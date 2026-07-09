@@ -59,14 +59,36 @@ bead. When you are instead spawned as a **bounded producer pane**
    **ZERO bd invocations**. A shard classifies purely from the bead text you
    hand it plus what it can grep in the repo; it never runs `bd` itself
    (single-writer discipline, SABLE-eozl sidestep — only you, the parent,
-   ever touch bd, and only in step 8).
+   ever touch bd, and only in step 8). Every shard's prompt MUST also include
+   this rule: **a bead carrying a `reference` or `runbook` label short-circuits
+   straight to the `reference` classification** (FRESH-class, see Phase 3
+   below) — the shard skips fingerprint/staleness checks entirely for that
+   bead rather than evaluating it against current HEAD. This was added after
+   a live sweep flagged the just-delivered cross-fleet runbook SABLE-ptkn as
+   stale purely because nothing told shards that runbooks/charters/
+   standing-convention beads don't rot on code-drift timescales the way
+   ordinary bug/feature beads do (SABLE-5s97).
 6. **Collect** each shard's per-bead findings
    (`{"bead_id", "classification", "evidence", ...}`, using the same
-   classification vocabulary as Phase 3 below).
-7. **Merge.** Call `sable_sweep_lib.merge(shard_reports)`. Every shard finding
-   survives — no dedup, no dropping — and the result is shaped identically to
-   what a single non-sharded Victor run would produce, regardless of how many
-   shards actually ran.
+   classification vocabulary as Phase 3 below) — **one finding per bead in the
+   shard's slice, including the first and last elements.** A shard that
+   silently omits a boundary bead from its own findings is exactly the SABLE-
+   tz7h.5 failure mode step 7's reconciliation catches; it is not something
+   Collect can fix after the fact, only detect.
+7. **Merge.** Call `sable_sweep_lib.merge(shard_reports, slices=slices)` —
+   passing the same `slices` list from step 4 lets `merge()` reconcile each
+   shard's reported bead_ids against what it was actually handed, and raise
+   `ShardUnderReportError` instead of silently merging a deficient shard's
+   report short (SABLE-5s97: the live failure was 3 of 10 shards each
+   omitting exactly one bead despite a correctly-sized slice file — shard
+   self-report alone was not sufficient evidence of coverage). On
+   `ShardUnderReportError`, do not paper over it: re-dispatch a fresh shard
+   for exactly the deficient slice (`slices[e.shard_index]`, available on the
+   exception as `e.missing_ids`) and re-merge, rather than manually patching
+   the report or dropping the reconciliation check. Once reconciled, every
+   shard finding survives in the merged output — no dedup, no dropping — and
+   the result is shaped identically to what a single non-sharded Victor run
+   would produce, regardless of how many shards actually ran.
 8. **Write your deliverable, then write beads — in that order.** Write the
    merged report as JSON to your `@sable_deliverable` path. Verify it with
    `sable_sweep_lib.completion_check(path)` before moving on — `False` means
@@ -160,10 +182,22 @@ For beads with NO prior marker, skip directly to Phase 3.
 
 This is the load-bearing optimization. Most beads won't have their cited code changed between Victor runs; differential validation lets large bead pools be re-scanned cheaply.
 
+**Reference short-circuit (checked before the diff, SABLE-5s97).** A bead
+carrying a `reference` or `runbook` label skips differential validation
+entirely — don't bother diffing its cited paths, jump straight to classifying
+it `reference` in Phase 3. Its freshness isn't a function of code drift, so
+there is nothing for the diff to usefully answer.
+
 ### Phase 3: Per-bead validation
 
 Dispatch read-only Explore subagents in parallel, 1-3 beads per worker. Each worker:
 
+0. **Reference short-circuit first.** If the bead carries a `reference` or
+   `runbook` label, classify it `reference` immediately and skip steps 1-3 —
+   do not run the fingerprint grep or a verify command against it. This is
+   the same short-circuit sharded shards apply (pane-mode step 5 above); it
+   exists here too so a non-sharded, interactive Victor session behaves
+   identically.
 1. Read the bead's Evidence section
 2. Run the fingerprint grep against current HEAD
 3. Validate against one of these paths (in order):
@@ -173,6 +207,14 @@ Dispatch read-only Explore subagents in parallel, 1-3 beads per worker. Each wor
 
 Worker classifications (one per bead, can stack with `model-stale`):
 - `valid` — issue still reproduces / fingerprint matches / verification passes
+- `reference` — bead carries a `reference` or `runbook` label (or is
+  self-evidently a charter / standing-convention record). FRESH-class,
+  short-circuit verdict: skip fingerprint/staleness evaluation entirely — do
+  NOT classify as `stale-fixed`/`stale-moved` regardless of how far the
+  cited code has drifted. Runbooks and standing-convention beads document a
+  decision or procedure, not a code state, so they don't rot on code-drift
+  timescales the way `valid`/`stale-*` beads do (added after a live sweep
+  incorrectly flagged the cross-fleet runbook SABLE-ptkn as stale, SABLE-5s97).
 - `stale-fixed` — issue no longer reproduces; code at the cited site has been changed
 - `stale-moved` — fingerprint no longer matches; code may have been refactored elsewhere
 - `description-rotted` — paths no longer exist or symbols renamed; bead needs description update
@@ -195,6 +237,7 @@ For each bead, take ONE action based on classification:
 | Classification | Action | Auditability |
 |----------------|--------|--------------|
 | `valid` | Append `victor-validated-at` marker to notes | Standard |
+| `reference` | Append `victor-validated-at` marker to notes (FRESH-class, same as `valid`), plus a `victor-reference: exempt from stale semantics` note. Never label `victor-suspects-stale` or close as stale-fixed. | Standard |
 | `stale-fixed` | **First N runs:** label `victor-suspects-stale`, append evidence note, leave open for user batch-confirm. **After ramp-up:** close with auto-closed-by-victor label, append verification command + output to notes, append SHA at which validation ran | Closure note must include literal command output and SHA |
 | `stale-moved` | Update Evidence section with new fingerprint+symbol if the worker found the moved code; append `victor-changelog` note explaining what moved | Diff of description change in notes |
 | `description-rotted` | Add `needs-rewrite` label, append note describing what's wrong, leave open for human/Sherlock to re-author | No silent rewrites |

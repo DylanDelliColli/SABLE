@@ -6,10 +6,18 @@ boundaries, the 10-cap enforced in code (shard_count), completion_check's
 three failure shapes, and merge's finding-preservation + shape-match
 guarantees. All dependency-injected (`run=`) — no real `bd` or filesystem
 beyond pytest's own tmp_path.
+
+Also covers merge()'s count-reconciliation cross-check (SABLE-5s97): a
+correct set of shard reports merges clean, and a shard that silently drops
+its first or last bead (the exact live failure mode — 3 of 10 shards each
+omitted exactly one boundary bead despite a correctly-sized slice file)
+raises ShardUnderReportError rather than merging short.
 """
 import json
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sable_sweep_lib as lib  # noqa: E402
@@ -203,9 +211,9 @@ def test_merge_tolerates_shard_with_no_findings_key():
 def test_merge_empty_shard_list():
     merged = lib.merge([])
     assert merged == {"findings": [], "stats": {
-        "candidates": 0, "valid": 0, "stale-fixed": 0, "stale-moved": 0,
-        "description-rotted": 0, "ambiguous": 0, "needs-verification-spec": 0,
-        "model_stale": 0,
+        "candidates": 0, "valid": 0, "reference": 0, "stale-fixed": 0,
+        "stale-moved": 0, "description-rotted": 0, "ambiguous": 0,
+        "needs-verification-spec": 0, "model_stale": 0,
     }}
 
 
@@ -225,6 +233,88 @@ def test_merge_shape_identical_single_shard_vs_many_shards():
     assert single_agent["stats"] == sharded["stats"]
     assert {f["bead_id"] for f in single_agent["findings"]} == \
         {f["bead_id"] for f in sharded["findings"]}
+
+
+# --- merge: count-reconciliation cross-check (SABLE-5s97) ------------------
+
+def test_merge_reconciles_clean_when_every_shard_covers_its_slice():
+    beads = _beads(7)
+    slices = lib.slice(beads, 3)
+    shard_reports = [
+        {"findings": [{"bead_id": b["id"], "classification": "valid"} for b in s]}
+        for s in slices
+    ]
+    merged = lib.merge(shard_reports, slices=slices)
+    assert merged["stats"]["candidates"] == 7
+    assert {f["bead_id"] for f in merged["findings"]} == {b["id"] for b in beads}
+
+
+def test_merge_raises_when_shard_drops_first_element_of_its_slice():
+    beads = _beads(4)
+    slices = lib.slice(beads, 2)
+    shard0_slice = slices[0]
+    assert len(shard0_slice) >= 2, "fixture needs >=2 beads in shard 0 to drop the first"
+    short_findings = [
+        {"bead_id": b["id"], "classification": "valid"} for b in shard0_slice[1:]
+    ]
+    shard_reports = [
+        {"findings": short_findings},
+        {"findings": [{"bead_id": b["id"], "classification": "valid"} for b in slices[1]]},
+    ]
+    with pytest.raises(lib.ShardUnderReportError) as excinfo:
+        lib.merge(shard_reports, slices=slices)
+    assert excinfo.value.shard_index == 0
+    assert shard0_slice[0]["id"] in excinfo.value.missing_ids
+
+
+def test_merge_raises_when_shard_drops_last_element_of_its_slice():
+    beads = _beads(4)
+    slices = lib.slice(beads, 2)
+    shard0_slice = slices[0]
+    assert len(shard0_slice) >= 2, "fixture needs >=2 beads in shard 0 to drop the last"
+    short_findings = [
+        {"bead_id": b["id"], "classification": "valid"} for b in shard0_slice[:-1]
+    ]
+    shard_reports = [
+        {"findings": short_findings},
+        {"findings": [{"bead_id": b["id"], "classification": "valid"} for b in slices[1]]},
+    ]
+    with pytest.raises(lib.ShardUnderReportError) as excinfo:
+        lib.merge(shard_reports, slices=slices)
+    assert excinfo.value.shard_index == 0
+    assert shard0_slice[-1]["id"] in excinfo.value.missing_ids
+
+
+def test_merge_raises_when_a_shard_report_is_entirely_missing():
+    beads = _beads(3)
+    slices = lib.slice(beads, 2)
+    shard_reports = [{"findings": [{"bead_id": b["id"], "classification": "valid"} for b in slices[0]]}]
+    with pytest.raises(lib.ShardUnderReportError) as excinfo:
+        lib.merge(shard_reports, slices=slices)
+    assert excinfo.value.shard_index == 1
+
+
+def test_merge_skips_reconciliation_when_slices_not_passed():
+    # backward-compat: existing callers that don't pass slices are unaffected,
+    # even for a report that would otherwise fail reconciliation.
+    merged = lib.merge([{"findings": [{"bead_id": "B-1", "classification": "valid"}]}])
+    assert merged["stats"]["candidates"] == 1
+
+
+def test_merge_reconciliation_skips_empty_slices():
+    # an empty slice (fewer beads than shards) has nothing to reconcile
+    slices = lib.slice(_beads(1), 3)
+    shard_reports = [{"findings": [{"bead_id": "B-0", "classification": "valid"}]}, {}, {}]
+    merged = lib.merge(shard_reports, slices=slices)
+    assert merged["stats"]["candidates"] == 1
+
+
+def test_reconcile_shard_counts_raises_directly_as_pre_merge_validate_step():
+    beads = _beads(2)
+    slices = lib.slice(beads, 2)
+    shard_reports = [{"findings": []}, {"findings": [{"bead_id": beads[1]["id"], "classification": "valid"}]}]
+    with pytest.raises(lib.ShardUnderReportError):
+        lib.reconcile_shard_counts(shard_reports, slices)
 
 
 # --- write_plan: append-notes-only, skips findings with no bead_id --------
