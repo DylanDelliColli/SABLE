@@ -44,7 +44,11 @@ tag_full() { # tag_full <pane> <role> <bead> <status> <class> <deliverable>
 # to a derived-per-repo or calling-pane session (SABLE-e1e3) rather than -a
 # across the whole socket, so the fixture's literal 'w' session must be named
 # explicitly or every listing/reap call here silently sees zero panes.
-run_status() { SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION="w" python3 "$BIN" "$@"; }
+# SABLE-1kbo: windowed sampling adds a real sleep between two internal
+# listing reads (default 1.5s); shrink it here since none of this suite's
+# cases are timing-sensitive -- they just need the fix to not regress them.
+run_status() { SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION="w" \
+  SABLE_STATUS_SAMPLE_INTERVAL="0.1" python3 "$BIN" "$@"; }
 
 # --- fixture: two worker panes, plus a SECOND session name grouped with the
 #     first — the exact mechanism that duplicates list-panes -a rows ---
@@ -217,6 +221,33 @@ else
   fail "producer pane is still reaped after its pending input is cleared+flagged" "pane alive=$p9_alive"
 fi
 rm -f "$DELIVERABLE2"
+
+# --- SABLE-exab: a producer pane spawned WITHOUT a bead tag (e.g. victor in
+#     the tz7h.5 acceptance run, which passes no bead) renders an EMPTY
+#     @sable_bead placeholder; the parser must not let that shift every
+#     later column left and starve the kill decision ---
+DELIVERABLE3="$(mktemp)"
+echo '{"ok": true}' > "$DELIVERABLE3"
+tmux -L "$SOCK" new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
+sleep 0.3
+PANE10="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"
+tag_full "$PANE10" victor "" done producer "$DELIVERABLE3"
+
+out6="$(run_status --reap 2>&1)"
+rc6=$?
+if [ "$rc6" -eq 0 ]; then
+  pass "--reap exits 0 with a beadless done producer present"
+else
+  fail "--reap exits 0 with a beadless done producer present" "exit $rc6: $out6"
+fi
+sleep 0.3
+p10_alive="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$PANE10" || true)"
+if [ "$p10_alive" -eq 0 ]; then
+  pass "--reap kills a beadless done producer pane with a valid deliverable"
+else
+  fail "--reap kills a beadless done producer pane with a valid deliverable" "producer pane still alive"
+fi
+rm -f "$DELIVERABLE3"
 
 echo
 echo "=========================================="

@@ -39,6 +39,8 @@ Env:
   SABLE_TMUX_SESSION  explicit session override (default derives per-repo via
                       sable-session, SABLE-e1e3 — listing and reaping are
                       scoped to THIS repo's fleet only)
+  SABLE_STATUS_SAMPLE_INTERVAL  seconds between the two windowed-sampling
+                      reads (SABLE-1kbo, default 1.5); lower for fast tests
 """
 from __future__ import annotations
 
@@ -47,13 +49,18 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import SessionCollision, resolve_session  # noqa: E402
 
 WORKER_ROLE_PREFIX = "worker"
-_FORMAT = ("#{pane_id} #{@sable_role} #{@sable_bead} #{@sable_status} "
-           "#{@sable_class} #{@sable_deliverable}")
+# Tab-delimited (SABLE-exab): a space-joined format collapses an EMPTY field
+# (e.g. a producer pane spawned without a bead tag) into its neighboring
+# whitespace, shifting every later column left by one. Tabs never collapse,
+# so an empty @sable_bead placeholder still occupies its own field.
+_FORMAT = ("#{pane_id}\t#{@sable_role}\t#{@sable_bead}\t#{@sable_status}\t"
+           "#{@sable_class}\t#{@sable_deliverable}")
 
 
 def tmux_base(socket: str | None) -> list[str]:
@@ -71,7 +78,7 @@ def parse_worker_panes(output: str) -> list[dict]:
     defaults to 'running' (a just-spawned pane may not have set it yet)."""
     workers: list[dict] = []
     for line in output.splitlines():
-        parts = line.split(maxsplit=5)
+        parts = line.split("\t")
         if len(parts) < 2:
             continue
         pane, role = parts[0], parts[1]
@@ -224,6 +231,91 @@ def list_workers(socket: str | None, run=_runner, session: str | None = None) ->
     return dedupe_panes(parse_worker_panes(out))
 
 
+_DEFAULT_SAMPLE_INTERVAL = 1.5
+
+
+def bead_closed(bead: str, run=_runner) -> bool | None:
+    """SABLE-1kbo real-done crosscheck: a worker pane's @sable_status=done
+    tag is self-reported and can be stale (a reused pane still carrying a
+    prior occupant's tag before the fresh worker's init overwrites it) or
+    simply premature. Returns True only when `bd show <bead>` confirms the
+    bead is actually closed, False when bd resolves it but it is NOT closed
+    (a genuine mismatch worth flagging), and None when the bead can't be
+    resolved at all (bd missing, bead not found, malformed output) — an
+    unresolvable bead fails OPEN (trust the tag) rather than punishing a
+    pane over a lookup that says nothing either way. Producers are exempt
+    from this check entirely (see confirm_done_status): they signal
+    completion via their deliverable file (SABLE-e6m6), not a bead, and
+    SABLE-exab established that a producer may have no bead at all."""
+    if not bead:
+        return None
+    try:
+        out = run(["bd", "show", bead, "--json"])
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict) or "status" not in data:
+        return None
+    return data["status"] == "closed"
+
+
+def reconcile_samples(first: list[dict], second: list[dict]) -> list[dict]:
+    """Merge two done-status samples of the same pane pool, taken a short
+    window apart (SABLE-1kbo windowed sampling). Fixes two live-observed
+    defects: (a) mid-turn-labeled-done — a pane that read done in the FIRST
+    sample only (a stale tag from a reused pane's prior occupant, about to
+    be overwritten by the fresh worker's init) is reported using the
+    SECOND, fresher sample instead of the stale one; (b) omitted-live-pane —
+    a pane missing from one sample (a listing race, not an actual lifecycle
+    change) is still surfaced, using whichever sample saw it, instead of
+    silently vanishing from the table."""
+    by_pane_second = {w["pane"]: w for w in second}
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for w in first:
+        seen.add(w["pane"])
+        merged.append(by_pane_second.get(w["pane"], w))
+    for w in second:
+        if w["pane"] not in seen:
+            merged.append(w)
+    return merged
+
+
+def confirm_done_status(worker: dict, run=_runner) -> dict:
+    """Second, independent crosscheck (SABLE-1kbo) applied AFTER windowed
+    sampling has already settled a pane's status: a worker/legacy pane (not
+    a producer — see bead_closed) reporting done is only trusted once
+    `bd show` confirms its bead is actually closed. An uncorroborated done
+    is downgraded to "done-unconfirmed" — excluded from reaping_decision
+    (which only kills status == "done") and visible in the CLI table for a
+    human, the same idiom as the existing done-no-deliverable flag, rather
+    than silently trusted off the tag alone."""
+    if is_done(worker["status"]) and worker.get("class") != "producer":
+        if bead_closed(worker.get("bead", ""), run=run) is False:
+            return {**worker, "status": "done-unconfirmed"}
+    return worker
+
+
+def list_workers_confirmed(socket: str | None, run=_runner, session: str | None = None,
+                            sleep=time.sleep, interval: float = _DEFAULT_SAMPLE_INTERVAL,
+                            samples: int = 2) -> list[dict]:
+    """The reliability layer main() uses in place of a single list_workers()
+    snapshot (SABLE-1kbo) before reporting or reaping anything as done:
+    samples the pane pool `samples` times, `interval` seconds apart, and
+    reconciles them (see reconcile_samples), then crosschecks every settled
+    done worker pane against the bead pool (see confirm_done_status)."""
+    batch = list_workers(socket, run=run, session=session)
+    for _ in range(samples - 1):
+        sleep(interval)
+        batch = reconcile_samples(batch, list_workers(socket, run=run, session=session))
+    return [confirm_done_status(w, run=run) for w in batch]
+
+
 _PENDING_TEXT_LOG_LIMIT = 500
 
 
@@ -260,6 +352,68 @@ def reap(panes: list[str], socket: str | None, run=_runner, capture=None) -> lis
     return flagged
 
 
+def parse_client_sessions(list_clients_output: str) -> list[str]:
+    """Pure parse of `tmux list-clients -F #{client_session}` output into
+    the session names any client is currently attached to (SABLE-yfdn). May
+    contain duplicates (multiple clients on the same session) — harmless,
+    protected_windows collapses into a set."""
+    return [line.strip() for line in list_clients_output.splitlines() if line.strip()]
+
+
+def protected_windows(socket: str | None, run=_runner) -> set[tuple[str, str]]:
+    """The (session, window_index) pairs any attached tmux client is
+    currently viewing (SABLE-yfdn) — reap() must never kill a pane whose
+    window is in this set; see filter_protected. A grouped-session topology
+    (`tmux new-session -t <sess> -s <alias>`) gives each session alias its
+    OWN current-window pointer even though the aliases share one underlying
+    window list, so window_index alone isn't a safe key — it's paired with
+    the client's session name."""
+    base = tmux_base(socket)
+    try:
+        raw = run(base + ["list-clients", "-F", "#{client_session}"])
+    except subprocess.CalledProcessError:
+        return set()
+    protected: set[tuple[str, str]] = set()
+    for sess in parse_client_sessions(raw):
+        try:
+            idx = run(base + ["display-message", "-p", "-t", sess, "#{window_index}"]).strip()
+        except subprocess.CalledProcessError:
+            continue
+        protected.add((sess, idx))
+    return protected
+
+
+def pane_location(pane: str, socket: str | None, run=_runner) -> tuple[str, str] | None:
+    """(session, window_index) for a pane id, or None if it can't be
+    resolved (e.g. the pane already died in a race with a concurrent
+    reaper) — treated as unprotected by filter_protected, since a vanished
+    pane can't be in anyone's current window."""
+    base = tmux_base(socket)
+    try:
+        out = run(base + ["display-message", "-p", "-t", pane,
+                           "#{session_name}\t#{window_index}"])
+    except subprocess.CalledProcessError:
+        return None
+    out = out.strip()
+    if "\t" not in out:
+        return None
+    sess, idx = out.split("\t", 1)
+    return (sess, idx)
+
+
+def filter_protected(panes: list[str], socket: str | None, run=_runner) -> list[str]:
+    """Reap candidates with any pane currently in an attached client's
+    current window removed (SABLE-yfdn). Worker windows are single-pane, so
+    kill-pane destroys the whole window; if an attached client (the
+    operator watching a worker finish) is on it, tmux would forcibly
+    switch that client's view mid-observation. A protected pane is left
+    alive for the next sweep instead of being reaped now."""
+    protected = protected_windows(socket, run=run)
+    if not protected:
+        return panes
+    return [p for p in panes if pane_location(p, socket, run=run) not in protected]
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sable-worker-status")
     p.add_argument("--reap", action="store_true",
@@ -273,7 +427,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"sable-worker-status: {e}\n")
         return 4
 
-    workers = list_workers(socket, session=session)
+    interval = float(os.environ.get("SABLE_STATUS_SAMPLE_INTERVAL", _DEFAULT_SAMPLE_INTERVAL))
+    workers = list_workers_confirmed(socket, session=session, interval=interval)
     dnd_panes = {w["pane"] for w in done_no_deliverable(workers)}
 
     if ns.json:
@@ -287,12 +442,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if ns.reap:
         doomed = reaping_decision(workers)
+        protected_count = len(doomed)
+        doomed = filter_protected(doomed, socket)
+        protected_count -= len(doomed)
         flagged = reap(doomed, socket)
         note = f", {len(flagged)} had pending input cleared+flagged" if flagged else ""
         dnd_note = (f", {len(dnd_panes)} producer(s) done-no-deliverable (not reaped)"
                     if dnd_panes else "")
+        protected_note = (f", {protected_count} pane(s) left for next sweep "
+                           "(attached client's current window)" if protected_count else "")
         sys.stderr.write(
-            f"sable-worker-status: reaped {len(doomed)} done pane(s){note}{dnd_note}\n")
+            f"sable-worker-status: reaped {len(doomed)} done pane(s)"
+            f"{note}{dnd_note}{protected_note}\n")
     return 0
 
 
