@@ -93,8 +93,12 @@ assert_allow() {
   if is_deny "$out"; then fail "$1" "expected allow, got deny: $out"; else pass "$1"; fi
 }
 
-# Default identity: the cockpit.
+# Default identity: the cockpit. Hermetic against CLAUDE_AGENT_ROLE too — the
+# invoking shell may export CLAUDE_AGENT_ROLE=manager/producer for its own pane
+# identity (SABLE-tz7h.3's producer leg reads this var), and that ambient value
+# must not leak into the baseline cockpit-identity assertions below.
 export CLAUDE_AGENT_NAME=cockpit
+unset CLAUDE_AGENT_ROLE 2>/dev/null || true
 unset SABLE_ORCHESTRATION_FORCE 2>/dev/null || true
 
 # ---------- PLANNING mode ----------
@@ -496,6 +500,76 @@ assert_deny  "pi5m: planning blocks assignment-prefixed sable-spawn-worker" \
   'CLAUDE_AGENT_NAME=x sable-spawn-worker SABLE-y --worktree /wt'
 assert_deny  "pi5m: planning blocks assignment-prefixed sable-spawn-manager" \
   'FOO=bar sable-spawn-manager --all'
+set_mode planning
+
+# ---------- SABLE-tz7h.3: producer identity deny-leg ----------
+# CLAUDE_AGENT_ROLE=producer (sherlock/victor/columbo/gaudi/rudy) is a
+# read-only analysis identity: denied from dispatching workers, standing up
+# the fleet, or pushing code, regardless of MODE. Read-only ops (bead JSON
+# export, repo greps, file reads) and non-producer identities running the
+# identical commands stay unaffected — a regression check, not just a new
+# feature check.
+run_hook_role() {
+  # $1=command $2=role(CLAUDE_AGENT_ROLE) $3=name(CLAUDE_AGENT_NAME, optional)
+  python3 -c "
+import json, sys
+print(json.dumps({'tool_input': {'command': sys.argv[1]}}))
+" "$1" | CLAUDE_AGENT_ROLE="$2" CLAUDE_AGENT_NAME="${3:-sherlock}" bash "$HOOK" 2>/dev/null
+}
+assert_deny_role() {
+  local out; out="$(run_hook_role "$2" "${3:-producer}" "${4:-}")"
+  if is_deny "$out"; then pass "$1"; else fail "$1" "expected deny, got: ${out:-<empty>}"; fi
+}
+assert_allow_role() {
+  local out; out="$(run_hook_role "$2" "${3:-producer}" "${4:-}")"
+  if is_deny "$out"; then fail "$1" "expected allow, got deny: $out"; else pass "$1"; fi
+}
+
+# (a) spawn-helper deny — both mode values (execution would otherwise ALLOW
+# these for any other identity; the producer leg must still deny)
+set_mode planning
+assert_deny_role "producer denied sable-spawn-worker (planning)"  'sable-spawn-worker SABLE-x --worktree /wt'
+assert_deny_role "producer denied sable-spawn-manager (planning)" 'sable-spawn-manager --all'
+set_mode execution
+assert_deny_role "producer denied sable-spawn-worker (execution, mode would otherwise allow)"  'sable-spawn-worker SABLE-x --worktree /wt'
+assert_deny_role "producer denied sable-spawn-manager (execution, mode would otherwise allow)" 'sable-spawn-manager --all'
+
+# (b) git push deny — both mode values, including execution where a
+# non-producer's git push is allowed (see "execution allows git push" above)
+assert_deny_role "producer denied git push (execution, lincoln's push is allowed here)" 'git push origin wk-prodlock'
+set_mode planning
+assert_deny_role "producer denied git push (planning)" 'git push'
+
+# contract: --force does NOT override the producer leg (env-prefix only)
+assert_deny_role "producer sable-spawn-worker --force still denied (no flag override)" \
+  'sable-spawn-worker SABLE-x --worktree /wt --force'
+assert_deny_role "producer git push --force still denied (no flag override)" \
+  'git push --force origin wk-prodlock'
+
+# (c) read-only ops explicitly allowed
+assert_allow_role "producer allowed bd ready (read-only)"          'bd ready'
+assert_allow_role "producer allowed bead JSON export"              'bd show SABLE-tz7h.3 --json'
+assert_allow_role "producer allowed repo grep"                     'grep -rn TODO src/'
+assert_allow_role "producer allowed file read"                     'cat hooks/multi-manager/mode-interlock.sh'
+assert_allow_role "producer allowed git status (read-only git)"    'git status'
+
+# override: SABLE_ORCHESTRATION_FORCE=1, env form and inline command-prefix form
+out_prod_env="$(printf '%s' '{"tool_input":{"command":"sable-spawn-worker SABLE-x --worktree /wt"}}' | SABLE_ORCHESTRATION_FORCE=1 CLAUDE_AGENT_ROLE=producer CLAUDE_AGENT_NAME=sherlock bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_prod_env"; then fail "producer SABLE_ORCHESTRATION_FORCE=1 env overrides spawn deny" "got deny: $out_prod_env"; else pass "producer SABLE_ORCHESTRATION_FORCE=1 env overrides spawn deny"; fi
+out_prod_env_push="$(printf '%s' '{"tool_input":{"command":"git push"}}' | SABLE_ORCHESTRATION_FORCE=1 CLAUDE_AGENT_ROLE=producer CLAUDE_AGENT_NAME=sherlock bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_prod_env_push"; then fail "producer SABLE_ORCHESTRATION_FORCE=1 env overrides git push deny" "got deny: $out_prod_env_push"; else pass "producer SABLE_ORCHESTRATION_FORCE=1 env overrides git push deny"; fi
+out_prod_inline="$(printf '%s' '{"tool_input":{"command":"SABLE_ORCHESTRATION_FORCE=1 sable-spawn-worker SABLE-x --worktree /wt"}}' | CLAUDE_AGENT_ROLE=producer CLAUDE_AGENT_NAME=sherlock bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_prod_inline"; then fail "producer inline SABLE_ORCHESTRATION_FORCE=1 prefix overrides spawn deny" "got deny: $out_prod_inline"; else pass "producer inline SABLE_ORCHESTRATION_FORCE=1 prefix overrides spawn deny"; fi
+
+# regression: non-producer identities (lincoln, manager) running the identical
+# commands are UNAFFECTED by the new leg
+set_mode execution
+assert_allow "non-producer (lincoln) sable-spawn-worker unaffected (execution)" 'sable-spawn-worker SABLE-x --worktree /wt'
+out_mgr_push="$(printf '%s' '{"tool_input":{"command":"git push origin wk-prodlock"}}' | CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_mgr_push"; then fail "non-producer (manager) git push unaffected (execution)" "got deny: $out_mgr_push"; else pass "non-producer (manager) git push unaffected (execution)"; fi
+set_mode planning
+out_mgr_spawn="$(printf '%s' '{"tool_input":{"command":"sable-spawn-worker SABLE-x --worktree /wt --force"}}' | CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
+if is_deny "$out_mgr_spawn"; then fail "non-producer (manager) sable-spawn-worker --force still honored (unaffected)" "got deny: $out_mgr_spawn"; else pass "non-producer (manager) sable-spawn-worker --force still honored (unaffected)"; fi
 set_mode planning
 
 # ---------- settings-snippet registration ----------

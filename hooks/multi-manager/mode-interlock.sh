@@ -31,6 +31,17 @@
 # SABLE-kwr.3 quick-tier substage telescope) governs only the main
 # session — in v3 subagents spawn via the Agent tool, not via bash claude aliases.
 #
+# Producer identity leg (SABLE-tz7h.3): CLAUDE_AGENT_ROLE=producer marks a
+# fan-out analysis role (sherlock/victor/columbo/gaudi/rudy) as read-only by
+# construction — it may never dispatch a worker, stand up the fleet, or push
+# code, in EITHER mode. This is an identity invariant, not a mode boundary, so
+# it runs ahead of the mode-gated spawn-helper legs and is independent of the
+# main Bash leg's lincoln/cockpit identity gate (a producer's own
+# CLAUDE_AGENT_NAME is its role name, not lincoln/cockpit). Read-only commands
+# are unaffected. Override is SABLE_ORCHESTRATION_FORCE=1 only (env or inline
+# prefix) — deliberately not a trailing --force flag, which would leak into
+# the wrapped command and would change git push semantics if appended.
+#
 # Soft override: a Bash command carrying `--force`, or env
 # SABLE_ORCHESTRATION_FORCE=1, is always allowed. The interlock is a guardrail,
 # not a wall. On the Bash leg the env form is honored both ways: set in the
@@ -267,6 +278,36 @@ is_spawn_call() {
   [ "$(leading_cmd "$cmd")" = "$helper" ] && return 0
   printf '%s' "$cmd" | grep -qE "(^|[;&|(])[[:space:]]*${helper}([[:space:]]|\$)"
 }
+
+# ---------------------------------------------------------------------------
+# Producer deny-leg (SABLE-tz7h.3): CLAUDE_AGENT_ROLE=producer identifies a
+# fan-out analysis role (sherlock/victor/columbo/gaudi/rudy) — read-only by
+# construction, never a fleet/worker spawner or a pusher of code. Unlike the
+# spawn-helper legs below (mode-gated, any identity), a producer is denied
+# regardless of MODE; unlike the main Bash leg further down (scoped to
+# CLAUDE_AGENT_NAME=lincoln/cockpit), a producer's own CLAUDE_AGENT_NAME is its
+# role name (sherlock, victor, ...), so it would otherwise fall straight
+# through that identity gate's `exit 0`. Placed ahead of the spawn-helper legs
+# so a producer is denied even when MODE=execution would otherwise allow the
+# call. Read-only work (bead JSON export, repo greps, file reads) is
+# unaffected — only the two shapes below are matched.
+#
+# Override: SABLE_ORCHESTRATION_FORCE=1 only — the top-of-script env-var form
+# and the inline command-prefix form (both already parsed above) apply here
+# for free. Deliberately NOT a trailing --force flag: that pattern leaks the
+# flag into the wrapped command (flag-validating tools reject an unrecognized
+# --force) and, appended to git push, would change push semantics
+# catastrophically rather than merely overriding the interlock — so this leg
+# does not check for --force at all.
+# ---------------------------------------------------------------------------
+if [ "${CLAUDE_AGENT_ROLE:-}" = "producer" ]; then
+  if is_spawn_call 'sable-spawn-worker' "$CMD_TEXT" || is_spawn_call 'sable-spawn-manager' "$CMD_TEXT"; then
+    deny "Producer identity (CLAUDE_AGENT_ROLE=producer) may not dispatch workers or stand up the fleet — producers are read-only analysis agents, not spawners. Set SABLE_ORCHESTRATION_FORCE=1 to override."
+  fi
+  if printf '%s' "$CMD_TEXT" | grep -qE '(^|[[:space:];&|])git[[:space:]]+push([[:space:]]|$)'; then
+    deny "Producer identity (CLAUDE_AGENT_ROLE=producer) may not push code — producers are read-only analysis agents; findings go through beads, not commits. Set SABLE_ORCHESTRATION_FORCE=1 to override."
+  fi
+fi
 
 if is_spawn_call 'sable-spawn-worker' "$CMD_TEXT"; then
   printf '%s' "$CMD_TEXT" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exit 0
