@@ -577,6 +577,55 @@ assert_context "yz5y: branch cut from integration HEAD passes the guard (not blo
   "$YZ_ENV" "git push origin wk-good" "$YZ_REPO" "phase skipped"
 rm -rf "$YZ_BARE" "$YZ_REPO"
 
+# ===================================================================
+# SABLE-4amz: phase-1 rebase base must default to the RESOLVED integration
+# branch when SABLE_BASE_BRANCH is unset — the old unconditional origin/main
+# default re-parented worker branches on repos whose PUBLISHED integration
+# branch is not main, rewriting every carried SHA at push time (manufactured
+# the wk-tripwire-pytest corruption, 2026-07-09). Fixture: published non-main
+# integration branch 'tmux-only' (repo-local sable.integrationBranch), a
+# worker branch cut from it, and origin/main advanced with a CONFLICTING
+# commit so a misrouted rebase onto main is observable.
+#   Case 1 RED (pre-fix): env unset → BASE=origin/main → conflicting rebase
+#                → deny "phase 1"; GREEN: BASE=origin/tmux-only → clean
+#                rebase over i3 → "phase skipped".
+#   Case 2 RED (pre-fix): leaked SABLE_BASE_BRANCH=origin/main → conflicting
+#                rebase deny (wrong message); GREEN: wrong-base guard DENIES
+#                before any rewrite.
+# ===================================================================
+AMZ_BARE="/tmp/sable-test-4amz-bare.git"
+AMZ_REPO="/tmp/sable-test-4amz-repo"
+rm -rf "$AMZ_BARE" "$AMZ_REPO"
+git init -q --bare "$AMZ_BARE"
+git clone -q "$AMZ_BARE" "$AMZ_REPO" 2>/dev/null
+(
+  cd "$AMZ_REPO" || exit 1
+  git config user.email t@t; git config user.name t
+  git checkout -q -B main
+  echo base > stack.txt; git add stack.txt; git commit -q -m base
+  git push -q origin main
+  git checkout -q -b tmux-only
+  echo I1 >> stack.txt; git add stack.txt; git commit -q -m I1
+  git push -q origin tmux-only
+  git checkout -q -b wk-4amz-w
+  echo w1 > w.txt; git add w.txt; git commit -q -m w1
+  git checkout -q tmux-only
+  echo i3 > i3.txt; git add i3.txt; git commit -q -m i3
+  git push -q origin tmux-only
+  git checkout -q main
+  echo mainX > stack.txt; git add stack.txt; git commit -q -m mainConflict
+  git push -q origin main
+  git checkout -q wk-4amz-w
+  git config sable.integrationBranch tmux-only
+)
+AMZ_ENV="$MGR_ENV SABLE_PRE_PUSH_TYPECHECK_COMMAND=true SABLE_PRE_PUSH_TEST_PHASE=skip"
+assert_context "4amz: unset SABLE_BASE_BRANCH → phase-1 rebases onto origin/<INT>, not origin/main (clean pass)" \
+  "$AMZ_ENV" "git push origin wk-4amz-w" "$AMZ_REPO" "phase skipped"
+AMZ_LEAK_ENV="$AMZ_ENV SABLE_BASE_BRANCH=origin/main"
+assert_deny "4amz: leaked SABLE_BASE_BRANCH=origin/main on a worker branch → wrong-base guard denies (no silent rewrite)" \
+  "$AMZ_LEAK_ENV" "git push origin wk-4amz-w" "$AMZ_REPO" "wrong-base guard"
+rm -rf "$AMZ_BARE" "$AMZ_REPO"
+
 # Cleanup
 rm -rf "$REPO_DIR" "$BARE_DIR" "$V3_YAML"
 

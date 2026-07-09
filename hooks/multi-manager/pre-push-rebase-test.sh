@@ -146,9 +146,9 @@ CWD=$(sable_resolve_push_repo_dir "$CWD" "$COMMAND")
 [ -z "$CWD" ] && exit 0
 [ ! -d "$CWD/.git" ] && [ ! -f "$CWD/.git" ] && exit 0
 
-# Validate base ref and fall back gracefully when SABLE_BASE_BRANCH points to
-# a ref that doesn't exist in this repo (SABLE-61n)
-BASE_BRANCH=$(sable_validate_base_ref "$CWD" "${SABLE_BASE_BRANCH:-origin/main}")
+# BASE_BRANCH is resolved below, AFTER the integration branch is known
+# (SABLE-4amz) — the old unconditional origin/main default here re-parented
+# worker branches on non-main integration repos.
 
 # ---------------------------------------------------------------------------
 # Helpers  (emit_deny / emit_context are defined above, before the worker-deny
@@ -234,7 +234,8 @@ INTEGRATION_BRANCH=$(sable_resolve_integration_branch "$CWD")
 # stack and splicing base-branch-only commits into the lineage. A correctly-based
 # branch contains the integration HEAD as an ancestor; a re-parented one does not.
 # Once origin/<INT> is published the structural fix (workers rebase against
-# origin/<INT>) applies and this guard goes dormant.
+# origin/<INT>) applies and this guard goes dormant — the published case is
+# covered by the SABLE-4amz wrong-base guard below.
 if [ -n "$INTEGRATION_BRANCH" ] && [ -n "$CURRENT_BRANCH" ] \
    && [ "$CURRENT_BRANCH" != "$INTEGRATION_BRANCH" ] \
    && git -C "$CWD" rev-parse --verify --quiet "refs/heads/$INTEGRATION_BRANCH" >/dev/null 2>&1 \
@@ -252,6 +253,22 @@ Resolve network/auth and retry. This phase cannot be skipped — rebase is manda
   exit 0
 }
 
+# --- SABLE-4amz: the phase-1 rebase base DEFAULTS to the resolved integration
+# branch when it is published — the old unconditional origin/main default
+# silently re-parented every worker branch on a non-main integration repo at
+# push time, rewriting all carried SHAs (manufactured the wk-tripwire-pytest
+# corruption, 2026-07-09). Resolved after the fetch so the origin/<INT>
+# existence check sees fresh remote refs. An explicit SABLE_BASE_BRANCH still
+# wins here; the wrong-base guard below refuses it when it would re-parent a
+# worker branch. Validation falls back gracefully when the desired ref does
+# not exist in this repo (SABLE-61n).
+DEFAULT_BASE_BRANCH="origin/main"
+if [ -n "$INTEGRATION_BRANCH" ] \
+   && git -C "$CWD" rev-parse --verify --quiet "origin/$INTEGRATION_BRANCH" >/dev/null 2>&1; then
+  DEFAULT_BASE_BRANCH="origin/$INTEGRATION_BRANCH"
+fi
+BASE_BRANCH=$(sable_validate_base_ref "$CWD" "${SABLE_BASE_BRANCH:-$DEFAULT_BASE_BRANCH}")
+
 # --- fofc (market-brief-package-fofc): integration-branch self-push special
 # case. Pushing the branch that IS the integration branch must NEVER rebase it
 # onto a DIFFERENT base (e.g. origin/dev) — that replays the whole local-only
@@ -267,6 +284,20 @@ if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" = "$INTEGRATION_BRANCH" ]; th
   else
     SKIP_REBASE=1
   fi
+fi
+
+# --- SABLE-4amz: published-case wrong-base guard. The yz5y guard above covers
+# only a LOCAL-ONLY integration branch; once origin/<INT> is published, the
+# hook ITSELF was the re-parenting vector — phase 1 rebasing a worker branch
+# onto any base other than origin/<INT> (a leaked cross-repo SABLE_BASE_BRANCH,
+# a validation fallback) replays it onto foreign lineage and rewrites every
+# carried SHA. Deny instead of silently rewriting.
+if [ -n "$INTEGRATION_BRANCH" ] && [ -n "$CURRENT_BRANCH" ] \
+   && [ "$CURRENT_BRANCH" != "$INTEGRATION_BRANCH" ] \
+   && git -C "$CWD" rev-parse --verify --quiet "origin/$INTEGRATION_BRANCH" >/dev/null 2>&1 \
+   && [ "$BASE_BRANCH" != "origin/$INTEGRATION_BRANCH" ]; then
+  emit_deny "Pre-push denied (wrong-base guard): phase 1 would rebase worker branch '$CURRENT_BRANCH' onto '$BASE_BRANCH', but this repo's integration branch is published at origin/$INTEGRATION_BRANCH. Rebasing onto a foreign base re-parents the branch and rewrites its carried SHAs (this corrupted wk-tripwire-pytest — SABLE-4amz). Unset the leaked SABLE_BASE_BRANCH (or set it to origin/$INTEGRATION_BRANCH) and retry."
+  exit 0
 fi
 
 if [ "$SKIP_REBASE" -eq 0 ]; then
