@@ -128,3 +128,38 @@ def test_wait_for_ci_success(monkeypatch):
     conclusion, url = smg.wait_for_ci("/repo", "ci-verify/bead-abcdef1", "PREVIEWSHA")
     assert conclusion == "success"
     assert url == "http://run/1"
+
+
+# --- F1: tip moved during gate -> non-ff promote -> retryable exit 23 ---------
+# post-flip this is a COMMON case (serial merges advance the tip during the CI
+# wait), so the non-ff promote push must map to a clean retryable exit, never an
+# uncaught CalledProcessError traceback, and cleanup must still run.
+
+def test_promote_tip_moved_non_ff_is_retryable_23(monkeypatch):
+    seen = []
+
+    def fake_git(repo, *args, check=True):
+        seen.append(args)
+        head = args[0] if args else ""
+        if head == "merge-tree":
+            return subprocess.CompletedProcess(args, 0, stdout="TREEOID\n", stderr="")
+        if head == "commit-tree":
+            return subprocess.CompletedProcess(args, 0, stdout="PREVIEWSHA\n", stderr="")
+        if head == "rev-parse":
+            return subprocess.CompletedProcess(args, 0, stdout="SOMESHA\n", stderr="")
+        if head == "push" and len(args) >= 3 and args[2].endswith(":refs/heads/trunk"):
+            # the promote push: simulate the base having advanced (non-ff reject)
+            return subprocess.CompletedProcess(args, 1, stdout="! [rejected] (non-fast-forward)", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(smg, "_git", fake_git)
+    monkeypatch.setattr(smg, "wait_for_ci", lambda *a, **k: ("success", "http://run/1"))
+    monkeypatch.setattr(smg, "_notify", lambda *a, **k: None)
+    monkeypatch.setattr(smg, "_append_evidence", lambda *a, **k: None)
+
+    with pytest.raises(smg.GateError) as ei:
+        smg.promote("BEAD", "wk-x", "trunk", "/repo", "origin", "mgr", None)
+    assert ei.value.code == 23
+    # cleanup still ran despite the non-ff exit: a push --delete of the ci-verify ref
+    assert any("--delete" in a for a in seen), "ci-verify ref not cleaned up on tip-moved exit"
+

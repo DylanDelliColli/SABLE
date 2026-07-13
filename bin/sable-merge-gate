@@ -38,7 +38,8 @@ Prior art: the throwaway-branch pattern from the 754r verification (ci-verify-75
 Usage:
   sable-merge-gate promote --bead <id> --branch <worker-branch> [--base <branch>]
                            [--repo <path>] [--remote <name>] [--manager <name>]
-                           [--override <url>]
+                           [--override <reason>]   # actions-down human bypass ONLY,
+                                                    # reason recorded; never for a known-red
   sable-merge-gate sweep   [--max-age-hours N] [--repo <path>] [--remote <name>]
   sable-merge-gate --help
 
@@ -55,6 +56,7 @@ Exit codes:
   0 promoted / sweep ok     2 usage        3 precondition failed
   20 ci red, not promoted   21 actions-down / blocked (needs --override)
   22 merge-preview conflict (delegate to author)
+  23 tip moved during gate (non-ff promote) — rebuild preview + re-gate (retry-safe)
   4 integrity abort (base tip != preview SHA after promote)
 """
 from __future__ import annotations
@@ -217,15 +219,44 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             conclusion, url = wait_for_ci(repo, ref, preview_sha)
 
         if conclusion == "success" or override:
-            _git(repo, "push", remote, f"{preview_sha}:refs/heads/{base}")
+            push_cp = _git(repo, "push", remote, f"{preview_sha}:refs/heads/{base}", check=False)
+            if push_cp.returncode != 0:
+                # F1 (tarzan review): the base advanced during the CI wait, so the
+                # promote is non-fast-forward. Nothing wrong was shipped — the push
+                # was REJECTED — the tested-green ref is simply stale against a base
+                # that moved. Exit cleanly and retryably (rebuild the preview on the
+                # new base and re-gate) instead of letting CalledProcessError escape
+                # as an uncaught traceback. Cleanup still runs via the finally below.
+                _notify(manager,
+                    f"merge-preview ci-verify gate for {bead} ({branch}): base {base} moved during the CI "
+                    f"wait — promote is non-fast-forward, NOT promoted. Rebuild preview + re-gate (ref {ref} was green).")
+                _append_evidence(repo, bead,
+                    f"merge-preview ci-verify gate BASE-MOVED (retryable): ref {ref}, preview {preview_sha}, "
+                    f"non-ff on promote, not promoted: {push_cp.stdout.strip()}")
+                raise GateError(23, f"base {base} advanced during CI; preview {preview_sha} is non-ff — rebuild and re-gate")
             _git(repo, "fetch", remote, base)
             landed = resolve_commit(repo, base_ref)
             if landed != preview_sha:
+                # F3 (tarzan review): defensive integrity guard. Under chuck's
+                # serialized push discipline (single writer to the integration
+                # branch) this cannot fire — the fast-forward above is the last write
+                # before this read. It is NOT rollback-capable (the object is already
+                # pushed); it exists to fail LOUD rather than silently ship a base
+                # whose tip is not the exact tested object. If it fires, serialization
+                # was violated and a human must reconcile.
                 raise GateError(4, f"integrity abort: base {base} tip {landed} != tested preview {preview_sha}")
-            tag = "OVERRIDE" if override else "GREEN"
-            _append_evidence(repo, bead,
-                f"merge-preview ci-verify gate ({tag}): ref {ref}, run {url or 'n/a'}, "
-                f"preview {preview_sha}, promoted byte-identical to {base}.")
+            if override:
+                # F2 (tarzan review + lincoln ruling): --override is an
+                # actions-down human bypass ONLY, and must carry a reason (enforced
+                # by argparse requiring the value). Using it to bypass a KNOWN-RED is
+                # out of contract — documented, recorded, human-owned.
+                _append_evidence(repo, bead,
+                    f"merge-preview ci-verify gate OVERRIDE (actions-down human bypass): ref {ref}, "
+                    f"reason={override!r}, preview {preview_sha}, promoted byte-identical to {base}.")
+            else:
+                _append_evidence(repo, bead,
+                    f"merge-preview ci-verify gate GREEN: ref {ref}, run {url or 'n/a'}, "
+                    f"preview {preview_sha}, promoted byte-identical to {base}.")
             return 0
 
         if conclusion in ("actions_down", "timeout"):
@@ -282,7 +313,9 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
     pp.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
     pp.add_argument("--manager", default="lincoln")
-    pp.add_argument("--override", default=None)
+    pp.add_argument("--override", default=None, metavar="REASON",
+                    help="actions-down human bypass ONLY; the reason is required and recorded on the bead. "
+                         "Not for bypassing a known-red run.")
 
     ps = sub.add_parser("sweep")
     ps.add_argument("--max-age-hours", type=float,
