@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""sable-merge-gate — the merge-preview ci-verify gate (SABLE-o9aa / h853 option b).
+
+The chuck-side half of the SABLE-h853 test-protocol flip. Once h853 lands,
+workers push scoped evidence only and stop running the full suite locally, so
+the AUTHORITATIVE full-suite run moves to merge time. This gate is that run.
+
+The load-bearing property is BYTE-IDENTICAL PROMOTION: what CI validates must be
+exactly what lands on the integration branch, so the flow NEVER re-merges after
+green — it promotes the same commit object it tested.
+
+  1. rev-parse the pushed worker ref            (chuck's standing verification)
+  2. build the MERGE-PREVIEW commit with no working tree:
+       git merge-tree --write-tree <base> <branch>   -> merged tree (exit 1 = conflict -> exit 22, delegate)
+       git commit-tree <tree> -p <base> -p <branch>   -> preview commit
+  3. push the preview commit to  ci-verify/<bead>-<previewsha7>
+  4. wait for the Actions run keyed to the preview commit SHA
+  5. GREEN  -> push the SAME object to the integration branch (fast-forward),
+     then assert remote base tip SHA == preview SHA (integrity; exit 4 if not).
+     Delete the ci-verify ref, append evidence to the bead.
+  6. RED    -> NO promotion. Capture run URL, delete ci-verify ref, notify the
+     lane manager, append evidence. Exit 20.
+  7. ACTIONS-DOWN (no run appears within grace / API error) -> BLOCK: no
+     promotion, notify lincoln. Only bypass is --override <url> (recorded on the
+     bead). NEVER fall back to a local suite run (ayzv-class env brittleness).
+     Exit 21.
+
+Base resolution is ALWAYS fully qualified (refs/remotes/<remote>/<branch> via
+`git rev-parse --verify`); bare `origin/<branch>` is refused because a stray
+local branch named `origin` makes it ambiguous (SABLE-92kc-adjacent).
+
+Cleanup: the ci-verify ref is deleted on BOTH green and red paths. `sable-merge-
+gate sweep` deletes orphaned ci-verify/* refs older than a threshold in HOURS
+(default 6) for the crash-between-push-and-cleanup case.
+
+Prior art: the throwaway-branch pattern from the 754r verification (ci-verify-754r).
+
+Usage:
+  sable-merge-gate promote --bead <id> --branch <worker-branch> [--base <branch>]
+                           [--repo <path>] [--remote <name>] [--manager <name>]
+                           [--override <url>]
+  sable-merge-gate sweep   [--max-age-hours N] [--repo <path>] [--remote <name>]
+  sable-merge-gate --help
+
+Environment seams (overridable; defaults are the production commands so the flow
+is unit-testable without real git / gh / bd):
+  SABLE_MG_BASE  default base (default llm-integration)   SABLE_MG_REMOTE (origin)
+  SABLE_MG_REPO  repo path (default $PWD)                 SABLE_MG_GIT    (git)
+  SABLE_MG_GH    gh command (gh)                          SABLE_MG_BD     (bd)
+  SABLE_MG_NOTIFY notify command (sable-msg)              SABLE_MG_POLL   (20)
+  SABLE_MG_TIMEOUT Actions wait secs (1800)               SABLE_MG_GRACE  first-run grace secs (300)
+  SABLE_MG_SWEEP_HOURS orphan age hours (6)
+
+Exit codes:
+  0 promoted / sweep ok     2 usage        3 precondition failed
+  20 ci red, not promoted   21 actions-down / blocked (needs --override)
+  22 merge-preview conflict (delegate to author)
+  4 integrity abort (base tip != preview SHA after promote)
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+
+# --------------------------------------------------------------------------
+# Pure helpers (unit-tested directly — no git/gh/bd required)
+# --------------------------------------------------------------------------
+
+def preview_ref_name(bead: str, preview_sha: str) -> str:
+    """Throwaway ci-verify ref for a merge-preview commit. The 7-char preview
+    SHA makes it unique per attempt (a re-push after red never collides). The
+    bead id is sanitized to the ref-safe charset so a stray slash cannot create
+    a nested ref the flat sweep listing would miss."""
+    if not preview_sha or len(preview_sha) < 7:
+        raise ValueError(f"preview_sha must be >= 7 chars, got {preview_sha!r}")
+    safe_bead = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in bead)
+    if not safe_bead.strip("-"):
+        raise ValueError(f"bead id sanitizes to empty: {bead!r}")
+    return f"ci-verify/{safe_bead}-{preview_sha[:7]}"
+
+
+def is_orphan(ref_age_seconds: float, max_age_hours: float) -> bool:
+    """True iff a ci-verify ref is old enough to sweep. Pure so the threshold
+    logic is testable without real refs or wall-clock."""
+    return ref_age_seconds > max_age_hours * 3600.0
+
+
+def qualify_remote_ref(remote: str, branch: str) -> str:
+    """Fully-qualified remote-tracking ref. Refuse anything that would resolve
+    ambiguously — callers pass a bare branch name, never 'origin/foo'."""
+    if "/" in remote:
+        raise ValueError(f"remote must be a bare name, got {remote!r}")
+    if branch.startswith("refs/") or branch.startswith(f"{remote}/"):
+        raise ValueError(f"branch must be a bare name (no refs/ or {remote}/ prefix): {branch!r}")
+    return f"refs/remotes/{remote}/{branch}"
+
+
+# --------------------------------------------------------------------------
+# Command plumbing (env-seam overridable)
+# --------------------------------------------------------------------------
+
+class GateError(Exception):
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _tool(env_name: str, default: str) -> list[str]:
+    return os.environ.get(env_name, default).split()
+
+
+def _run(argv: list[str], *, cwd: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        argv, cwd=cwd, text=True, check=check,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+
+
+def _git(repo: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return _run(_tool("SABLE_MG_GIT", "git") + list(args), cwd=repo, check=check)
+
+
+def resolve_commit(repo: str, ref: str) -> str:
+    """Resolve a fully-qualified ref (or raw SHA) to a commit SHA via
+    `git rev-parse --verify <ref>^{commit}`. Raises on ambiguity/absence."""
+    cp = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False)
+    if cp.returncode != 0:
+        raise GateError(3, f"cannot resolve ref {ref!r}: {cp.stdout.strip()}")
+    return cp.stdout.strip()
+
+
+def build_preview(repo: str, base_sha: str, branch_sha: str, message: str) -> str:
+    """Build the merge-preview commit with NO working tree. Conflict -> exit 22."""
+    mt = _git(repo, "merge-tree", "--write-tree", base_sha, branch_sha, check=False)
+    if mt.returncode == 1:
+        raise GateError(22, f"merge-preview conflict between base and branch:\n{mt.stdout.strip()}")
+    if mt.returncode != 0:
+        raise GateError(3, f"merge-tree failed: {mt.stdout.strip()}")
+    tree = mt.stdout.splitlines()[0].strip()
+    ct = _git(repo, "commit-tree", tree, "-p", base_sha, "-p", branch_sha, "-m", message)
+    return ct.stdout.strip()
+
+
+# --------------------------------------------------------------------------
+# Actions polling
+# --------------------------------------------------------------------------
+
+def wait_for_ci(repo: str, ref_branch: str, preview_sha: str) -> tuple[str, str]:
+    """Poll the Actions run keyed to preview_sha on ref_branch until it completes.
+    Returns (conclusion, run_url). conclusion == 'actions_down' if no run appears
+    within SABLE_MG_GRACE. Blocks up to SABLE_MG_TIMEOUT for completion."""
+    import json
+    gh = _tool("SABLE_MG_GH", "gh")
+    poll = float(os.environ.get("SABLE_MG_POLL", "20"))
+    timeout = float(os.environ.get("SABLE_MG_TIMEOUT", "1800"))
+    grace = float(os.environ.get("SABLE_MG_GRACE", "300"))
+    waited = 0.0
+    seen_run = False
+    while True:
+        cp = _run(gh + ["run", "list", "--branch", ref_branch, "--limit", "10",
+                        "--json", "databaseId,headSha,status,conclusion,url"],
+                  cwd=repo, check=False)
+        run = None
+        if cp.returncode == 0:
+            try:
+                for r in json.loads(cp.stdout or "[]"):
+                    if r.get("headSha") == preview_sha:
+                        run = r
+                        break
+            except json.JSONDecodeError:
+                run = None
+        if run is not None:
+            seen_run = True
+            if run.get("status") == "completed":
+                return (run.get("conclusion") or "unknown", run.get("url") or "")
+        elif not seen_run and waited >= grace:
+            return ("actions_down", "")
+        if waited >= timeout:
+            return ("actions_down" if not seen_run else "timeout", "")
+        time.sleep(poll)
+        waited += poll
+
+
+# --------------------------------------------------------------------------
+# Orchestration
+# --------------------------------------------------------------------------
+
+def _notify(target: str, message: str) -> None:
+    _run(_tool("SABLE_MG_NOTIFY", "sable-msg") + [target, message], cwd=".", check=False)
+
+
+def _append_evidence(repo: str, bead: str, note: str) -> None:
+    _run(_tool("SABLE_MG_BD", "bd") + ["update", bead, "--append-notes", note], cwd=repo, check=False)
+
+
+def promote(bead: str, branch: str, base: str, repo: str, remote: str,
+            manager: str, override: str | None) -> int:
+    base_ref = qualify_remote_ref(remote, base)
+    branch_ref = qualify_remote_ref(remote, branch)
+    _git(repo, "fetch", remote, base, branch)
+    base_sha = resolve_commit(repo, base_ref)
+    branch_sha = resolve_commit(repo, branch_ref)
+
+    msg = f"ci-verify merge-preview: {branch} onto {base} ({bead})"
+    preview_sha = build_preview(repo, base_sha, branch_sha, msg)
+    ref = preview_ref_name(bead, preview_sha)
+
+    _git(repo, "push", remote, f"{preview_sha}:refs/heads/{ref}")
+    try:
+        if override:
+            conclusion, url = "override", override
+        else:
+            conclusion, url = wait_for_ci(repo, ref, preview_sha)
+
+        if conclusion == "success" or override:
+            _git(repo, "push", remote, f"{preview_sha}:refs/heads/{base}")
+            _git(repo, "fetch", remote, base)
+            landed = resolve_commit(repo, base_ref)
+            if landed != preview_sha:
+                raise GateError(4, f"integrity abort: base {base} tip {landed} != tested preview {preview_sha}")
+            tag = "OVERRIDE" if override else "GREEN"
+            _append_evidence(repo, bead,
+                f"merge-preview ci-verify gate ({tag}): ref {ref}, run {url or 'n/a'}, "
+                f"preview {preview_sha}, promoted byte-identical to {base}.")
+            return 0
+
+        if conclusion in ("actions_down", "timeout"):
+            _notify("lincoln",
+                f"merge-preview ci-verify gate BLOCKED for {bead} ({branch}): Actions {conclusion}, "
+                f"no green result on ref {ref}/{preview_sha[:7]}. No promotion. Needs --override <url> or a recovered Actions.")
+            _append_evidence(repo, bead,
+                f"merge-preview ci-verify gate BLOCKED: ref {ref}, preview {preview_sha}, Actions {conclusion}, no promotion.")
+            return 21
+
+        _notify(manager,
+            f"merge-preview ci-verify gate RED for {bead} ({branch}): run {url}, no promotion. Fix + re-push.")
+        _append_evidence(repo, bead,
+            f"merge-preview ci-verify gate RED: ref {ref}, run {url}, preview {preview_sha}, NOT promoted.")
+        return 20
+    finally:
+        # Both-path cleanup: delete the throwaway ref (best-effort).
+        _git(repo, "push", remote, "--delete", ref, check=False)
+
+
+def sweep(repo: str, remote: str, max_age_hours: float) -> int:
+    """Delete orphaned ci-verify/* refs older than the threshold."""
+    _git(repo, "fetch", remote, "--prune")
+    listing = _git(repo, "for-each-ref", "--format=%(refname:short) %(committerdate:unix)",
+                   f"refs/remotes/{remote}/ci-verify/", check=False)
+    now = time.time()
+    deleted = 0
+    for line in listing.stdout.splitlines():
+        parts = line.rsplit(" ", 1)
+        if len(parts) != 2:
+            continue
+        short, ts = parts
+        try:
+            age = now - float(ts)
+        except ValueError:
+            continue
+        if not is_orphan(age, max_age_hours):
+            continue
+        branch = short.split("/", 1)[1] if "/" in short else short  # strip remote/ prefix
+        _git(repo, "push", remote, "--delete", branch, check=False)
+        deleted += 1
+    print(f"sable-merge-gate sweep: deleted {deleted} orphaned ci-verify ref(s) older than {max_age_hours}h")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="sable-merge-gate")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    pp = sub.add_parser("promote")
+    pp.add_argument("--bead", required=True)
+    pp.add_argument("--branch", required=True)
+    pp.add_argument("--base", default=os.environ.get("SABLE_MG_BASE", "llm-integration"))
+    pp.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+    pp.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
+    pp.add_argument("--manager", default="lincoln")
+    pp.add_argument("--override", default=None)
+
+    ps = sub.add_parser("sweep")
+    ps.add_argument("--max-age-hours", type=float,
+                    default=float(os.environ.get("SABLE_MG_SWEEP_HOURS", "6")))
+    ps.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+    ps.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
+
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "promote":
+            return promote(args.bead, args.branch, args.base, args.repo,
+                           args.remote, args.manager, args.override)
+        if args.command == "sweep":
+            return sweep(args.repo, args.remote, args.max_age_hours)
+    except GateError as e:
+        print(f"sable-merge-gate: {e}", file=sys.stderr)
+        return e.code
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
