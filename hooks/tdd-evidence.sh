@@ -38,6 +38,10 @@ if not cmd or not sid:
 SEPS = {';', '&&', '||', '|'}
 SCRIPT_RE = re.compile(r'test-[A-Za-z0-9_-]+\.sh\$')
 PYTEST_FILE_RE = re.compile(r'test_[A-Za-z0-9_-]+\.py')
+# A redirect operator as its own shlex token (2>&1, >, >>, 2>, <, 1>&2, ...).
+# SEPS only splits on command separators, not redirects, so a trailing
+# 'script.sh 2>&1' leaves '2>&1' — not the script path — as seg[-1].
+REDIRECT_RE = re.compile(r'^\d*(>>?|<)&?\d*\$')
 
 try:
     tokens = shlex.split(cmd)
@@ -88,7 +92,15 @@ for seg in segments:
     elif re.match(r'^python3?\$', head) and PYTEST_FILE_RE.search(joined):
         matched = True
     else:
-        last = seg[-1]
+        # Drop a trailing redirect operator and everything after it (its
+        # target file, fd, etc.) so the script path is still found as the
+        # segment's true last token — 'test.sh 2>&1' must match like 'test.sh'.
+        core = seg
+        for i, t in enumerate(seg):
+            if REDIRECT_RE.match(t):
+                core = seg[:i]
+                break
+        last = core[-1] if core else seg[-1]
         # 'bash x' / 'sh x' / 'source x' style, OR direct execution
         # (./test-x.sh, /abs/path/test-x.sh — no interpreter token at all).
         interpreted = head in ('bash', 'sh', 'source', '.') and SCRIPT_RE.search(last)
