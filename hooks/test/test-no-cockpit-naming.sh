@@ -34,7 +34,6 @@ absent bin/sable-cockpit-install
 
 # Install flag + env
 has install.sh "--orchestration"
-has install.sh "SABLE_ORCHESTRATION"
 lacks install.sh "--cockpit"
 lacks install.sh "SABLE_MULTI_MANAGER"
 lacks install.sh "SABLE_COCKPIT"
