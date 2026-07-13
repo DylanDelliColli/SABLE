@@ -84,8 +84,17 @@ Per bead bundle (bundle 2-3 related beads max):
    (add `--model <m>[:reason]` to override the bead's `model:` label). The helper
    creates `wk-<scope>`, opens the worker window, pins the model, and delivers
    the canonical worker-dispatch prompt (warm-pane self-push mode).
-4. **Keep planning** while workers run — spawn several concurrently; each is its
-   own warm pane.
+4. **Keep planning** while workers run — spawn several concurrently (up to the
+   worker cap, below); each is its own warm pane.
+
+**Dispatch up to the cap, never past it (SABLE-mmdt).** `sable-spawn-worker`
+mechanically refuses a spawn once `SABLE_MAX_WORKERS` live worker panes exist
+fleet-wide (default 4 — the 2026-07-07 full-fleet dispatch froze the WSL host),
+and when host load is critical (`SABLE_MAX_LOAD_PER_CORE`). On a refusal
+(exit 7 at-cap / exit 8 host-load; the message names cap and live count), do
+NOT retry-loop or raise the cap — leave the bead claimed-or-ready and dispatch
+one-in-one-out as workers flip done (`sable-worker-status --reap` frees slots;
+`sable-view` shows live count vs cap).
 
 **Reviewing results:** you do not gate the push (the gates do — pre-push,
 tdd-gate, scope-creep). You review the *outcome*: the closed bead, the pushed

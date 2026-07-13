@@ -271,6 +271,27 @@ def resolve_session(socket: str | None = None, base: str | None = None,
     return name
 
 
+# --- Dispatch throttle knob (SABLE-mmdt), shared by sable-spawn-worker (the
+# refusal) and sable-view (the cockpit count-vs-cap line) so the default can
+# never drift between the gate and its observability surface.
+WORKER_CAP_DEFAULT = 4
+
+
+def worker_cap(env=None) -> int:
+    """Max live worker panes per session (SABLE_MAX_WORKERS). Default 4 — the
+    2026-07-07 full-fleet dispatch (~15 workers + Docker) froze the WSL host.
+    0 is an explicit emergency stop (every spawn refused). Unparseable or
+    negative values keep the DEFAULT throttle rather than lifting it."""
+    raw = ((env if env is not None else os.environ).get("SABLE_MAX_WORKERS") or "").strip()
+    if not raw:
+        return WORKER_CAP_DEFAULT
+    try:
+        cap = int(raw)
+    except ValueError:
+        return WORKER_CAP_DEFAULT
+    return cap if cap >= 0 else WORKER_CAP_DEFAULT
+
+
 # --- Autonomous-role operating-loop kicks (SABLE-bldh.14, moved here for
 # SABLE-dqhn.2 so sable-tmux --autostart and sable-spawn-manager share ONE
 # source). Lincoln is the operator's pane — never kicked.

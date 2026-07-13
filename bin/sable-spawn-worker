@@ -34,6 +34,12 @@ Env:
   SABLE_WORKER_CMD     override the worker command (default: 'claude --model <model>')
   SABLE_DISPATCH_DIR   where dispatch prompt files are written
                        (default: ~/.claude/sable/dispatch)
+  SABLE_MAX_WORKERS    dispatch throttle (SABLE-mmdt): max live worker panes in
+                       the session (default 4; 0 pauses spawning; invalid keeps
+                       the default). Refusal = exit 7, names cap + live count.
+  SABLE_MAX_LOAD_PER_CORE  host-resource guard (SABLE-mmdt): refuse spawning
+                       when 1-min load average / cpu cores >= this threshold
+                       (default 2.0; <=0 disables). Refusal = exit 8.
 """
 from __future__ import annotations
 
@@ -50,8 +56,8 @@ from pathlib import Path
 # THIS script even when invoked via a PATH symlink.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    SessionCollision, accept_startup_gate, dispatch_landed, pane_ready,
-    repo_root, resolve_session, wait_for_ready,
+    SessionCollision, WORKER_CAP_DEFAULT, accept_startup_gate, dispatch_landed,
+    pane_ready, repo_root, resolve_session, wait_for_ready, worker_cap,
 )
 from sable_pane_lib import capture_pane as _capture_pane  # noqa: E402
 from sable_pane_lib import deliver_text as deliver_dispatch  # noqa: E402
@@ -207,6 +213,82 @@ def preempt_check(lane: str, inbox: list[dict]) -> str | None:
             "blocking next dispatch:\n" + "\n".join(p0) +
             "\n\nResolve with bd close, or set aside with: bd update <id> --notes "
             "\"deferred: <reason>\" then bd defer <id>.")
+
+
+# --- dispatch throttle + host-resource guard (SABLE-mmdt) ---------------------
+#
+# 3 managers x ~15 concurrent worker panes + the Docker stack froze the WSL host
+# (2026-07-07, hard shutdown; load ~46 on 14 cores re-confirmed it 2026-07-13).
+# Nothing bounded spawn concurrency: managers dispatched every ready bead at
+# once. These checks run BEFORE any bead mutation and are NOT gated by
+# --skip-governance — they protect the HOST, not bead hygiene.
+
+# Tab-delimited like sable-worker-status's _FORMAT (SABLE-exab: empty fields
+# collapse under space-joining, shifting columns).
+_CAP_FORMAT = "#{@sable_role}\t#{@sable_status}\t#{@sable_class}"
+
+
+def count_live_workers(listing: str) -> int:
+    """Live worker panes in a `list-panes -F _CAP_FORMAT` listing: class-stamped
+    workers plus legacy classless panes whose role starts with 'worker' (the
+    same recognition rule as sable-worker-status), excluding done panes — a
+    done-but-unreaped worker has released its claude process and must not hold
+    a dispatch slot. Managers and bounded producers never count. An EMPTY
+    status counts as live: a just-spawned pane may not carry its tag yet."""
+    n = 0
+    for line in listing.splitlines():
+        parts = line.split("\t")
+        role = parts[0] if parts else ""
+        status = parts[1] if len(parts) >= 2 else ""
+        cls = parts[2] if len(parts) >= 3 else ""
+        is_worker = cls == "worker" or (not cls and role.startswith("worker"))
+        if is_worker and status != "done":
+            n += 1
+    return n
+
+
+def capacity_check(live: int, cap: int) -> str | None:
+    """Refuse a spawn at/over the cap. The message names BOTH the cap and the
+    live count — operator observability is part of the SABLE-mmdt acceptance.
+    Returns an error string to block, or None to allow."""
+    if live < cap:
+        return None
+    return (f"{live} live worker pane(s) >= cap {cap} (SABLE_MAX_WORKERS, "
+            f"default {WORKER_CAP_DEFAULT}). One-in-one-out: respawn after a "
+            "worker flips done (`sable-worker-status --reap` frees slots; "
+            "`sable-view` shows live count vs cap). Raise the cap only "
+            "deliberately — the 2026-07-07 full-fleet dispatch froze the host.")
+
+
+LOAD_PER_CORE_DEFAULT = 2.0
+
+
+def load_threshold() -> float:
+    """SABLE_MAX_LOAD_PER_CORE (default 2.0; unparseable keeps the default,
+    <=0 disables the guard — see host_guard)."""
+    raw = (os.environ.get("SABLE_MAX_LOAD_PER_CORE") or "").strip()
+    if not raw:
+        return LOAD_PER_CORE_DEFAULT
+    try:
+        return float(raw)
+    except ValueError:
+        return LOAD_PER_CORE_DEFAULT
+
+
+def host_guard(load1: float, cores: int, threshold: float) -> str | None:
+    """Refuse to ADD a worker when the host is already saturated: 1-min load
+    average per core at/over `threshold`. A non-positive threshold disables the
+    guard. Returns an error string to block, or None to allow."""
+    if threshold <= 0:
+        return None
+    cores = max(cores or 1, 1)
+    per_core = load1 / cores
+    if per_core < threshold:
+        return None
+    return (f"host overloaded — 1-min load {load1:.1f} on {cores} core(s) = "
+            f"{per_core:.2f}/core, >= threshold {threshold:.2f} "
+            "(SABLE_MAX_LOAD_PER_CORE). Refusing to add a worker; retry when "
+            "load drops.")
 
 
 def _ref_exists(worktree: str, ref: str) -> bool:
@@ -453,6 +535,27 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"sable-spawn-worker: {e}\n")
             return 4
     bid = ns.bead_id
+
+    # --- dispatch throttle + host-resource guard (SABLE-mmdt). Deliberately
+    # NOT behind --skip-governance (host protection, not bead hygiene) and
+    # BEFORE the bead fetch/claim, so a refused spawn leaves nothing claimed. ---
+    try:
+        pane_listing = _run(base + ["list-panes", "-s", "-t", ns.session,
+                                    "-F", _CAP_FORMAT])
+    except subprocess.CalledProcessError:
+        pane_listing = ""  # no session yet -> zero live workers; fail open
+    cap_err = capacity_check(count_live_workers(pane_listing), worker_cap())
+    if cap_err:
+        sys.stderr.write(f"sable-spawn-worker: throttle refused — {cap_err}\n")
+        return 7
+    try:
+        load1 = os.getloadavg()[0]
+    except OSError:
+        load1 = 0.0  # platform without loadavg: guard has nothing to read
+    guard_err = host_guard(load1, os.cpu_count() or 1, load_threshold())
+    if guard_err:
+        sys.stderr.write(f"sable-spawn-worker: host-guard refused — {guard_err}\n")
+        return 8
 
     # --- fetch bead for the prompt + label-based model resolution ---
     bead = parse_bead(_run(["bd", "show", bid, "--json"]))

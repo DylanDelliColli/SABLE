@@ -191,6 +191,97 @@ def test_preempt_check_allows_when_no_lane():
     assert ssw.preempt_check("", inbox) is None
 
 
+# --- dispatch throttle: worker cap + live count (SABLE-mmdt) ------------------
+#
+# 3 managers x ~5 concurrent workers + Docker froze the WSL host (2026-07-07);
+# nothing anywhere bounded spawn concurrency. sable-spawn-worker must refuse a
+# spawn once SABLE_MAX_WORKERS live worker panes exist, with a message naming
+# BOTH the cap and the live count (operator observability is part of acceptance).
+
+def test_worker_cap_default_is_4(monkeypatch):
+    monkeypatch.delenv("SABLE_MAX_WORKERS", raising=False)
+    assert ssw.worker_cap() == 4
+
+
+def test_worker_cap_env_override(monkeypatch):
+    monkeypatch.setenv("SABLE_MAX_WORKERS", "2")
+    assert ssw.worker_cap() == 2
+
+
+def test_worker_cap_zero_pauses_spawning(monkeypatch):
+    # explicit emergency stop: cap 0 refuses every spawn
+    monkeypatch.setenv("SABLE_MAX_WORKERS", "0")
+    assert ssw.worker_cap() == 0
+    assert ssw.capacity_check(0, 0) is not None
+
+
+def test_worker_cap_invalid_falls_back_to_default(monkeypatch):
+    # a garbled knob must keep the throttle at its default, never lift it
+    for bad in ("many", "", "  ", "-3", "2.5"):
+        monkeypatch.setenv("SABLE_MAX_WORKERS", bad)
+        assert ssw.worker_cap() == 4, bad
+
+
+def test_count_live_workers_counts_running_workers_only():
+    listing = ("worker\trunning\tworker\n"     # class-stamped worker: live
+               "worker\tdone\tworker\n"        # done: not live (reap frees the slot)
+               "worker\t\t\n"                  # legacy classless worker, no status yet: live
+               "optimus\trunning\tmanager\n"   # manager loop: never counted
+               "victor\trunning\tproducer\n"   # bounded producer: not a worker
+               "\t\t\n")                       # role-less pane: skipped
+    assert ssw.count_live_workers(listing) == 2
+
+
+def test_count_live_workers_empty_listing():
+    assert ssw.count_live_workers("") == 0
+
+
+def test_capacity_check_allows_under_cap():
+    assert ssw.capacity_check(3, 4) is None
+
+
+def test_capacity_check_refuses_at_cap_naming_cap_and_count():
+    err = ssw.capacity_check(5, 4)
+    assert err is not None
+    assert "5" in err and "4" in err          # live count AND cap are both named
+    assert "SABLE_MAX_WORKERS" in err          # the knob is named for the operator
+
+
+# --- host-resource guard (SABLE-mmdt) -----------------------------------------
+#
+# The 2026-07-13 occurrence: load ~46 on 14 cores flaked the analytics container.
+# Refuse to ADD a worker when 1-min load/core is already at/over the threshold.
+
+def test_host_guard_allows_under_threshold():
+    assert ssw.host_guard(3.0, 14, 2.0) is None
+
+
+def test_host_guard_refuses_when_load_per_core_at_threshold():
+    err = ssw.host_guard(46.0, 14, 2.0)       # the observed freeze shape
+    assert err is not None
+    assert "46.0" in err and "14" in err       # load and cores are named
+    assert "SABLE_MAX_LOAD_PER_CORE" in err
+
+
+def test_host_guard_disabled_by_nonpositive_threshold():
+    assert ssw.host_guard(999.0, 1, 0.0) is None
+    assert ssw.host_guard(999.0, 1, -1.0) is None
+
+
+def test_host_guard_survives_zero_cores():
+    # os.cpu_count() can return None/0 in odd containers; never ZeroDivisionError
+    assert ssw.host_guard(10.0, 0, 2.0) is not None
+
+
+def test_load_threshold_default_env_and_invalid(monkeypatch):
+    monkeypatch.delenv("SABLE_MAX_LOAD_PER_CORE", raising=False)
+    assert ssw.load_threshold() == 2.0
+    monkeypatch.setenv("SABLE_MAX_LOAD_PER_CORE", "1.5")
+    assert ssw.load_threshold() == 1.5
+    monkeypatch.setenv("SABLE_MAX_LOAD_PER_CORE", "junk")
+    assert ssw.load_threshold() == 2.0
+
+
 # --- dispatch prompt assembly -----------------------------------------------
 
 def test_assemble_dispatch_prompt_has_load_bearing_slots():

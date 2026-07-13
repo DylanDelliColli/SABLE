@@ -55,6 +55,7 @@ def test_spawn_creates_tagged_worker_window(sock):
             "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
             "SABLE_DISPATCH_DIR": dd,
             "SABLE_DISPATCH_READY_TIMEOUT": "0",   # skip TUI readiness wait (stand-in pane)
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test (SABLE-mmdt)
             "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
             "SABLE_DISPATCH_SUBMIT_TRIES": "2",
         }
@@ -115,6 +116,7 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock):
             "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
             "SABLE_DISPATCH_DIR": dd,
             "SABLE_DISPATCH_READY_TIMEOUT": "0",   # skip TUI readiness wait (stand-in pane)
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test (SABLE-mmdt)
             "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
             "SABLE_DISPATCH_SUBMIT_TRIES": "2",
         }
@@ -158,6 +160,7 @@ def test_spawn_leaves_session_current_window_unchanged(sock):
             "SABLE_DISPATCH_READY_TIMEOUT": "0",
             "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
             "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test (SABLE-mmdt)
         }
         r = subprocess.run(
             ["python3", str(BIN), BEAD, "--worktree", wt,
@@ -187,6 +190,7 @@ def test_worker_window_inherits_lane_manager_identity(sock):
             "SABLE_TMUX_SOCKET": sock,
             "SABLE_TMUX_SESSION": "sable",
             "CLAUDE_AGENT_NAME": "optimus",   # the invoking manager (lane)
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test (SABLE-mmdt)
             # worker dumps its OWN env, proving the -e propagation reached it
             "SABLE_WORKER_CMD": f"bash --noprofile --norc -c 'env > {dump}; sleep 2'",
             "SABLE_DISPATCH_DIR": dd,
@@ -230,6 +234,7 @@ def test_worker_bypass_gate_is_accepted(sock):
             "SABLE_DISPATCH_READY_TIMEOUT": "2",   # poll long enough to see + clear the gate
             "SABLE_DISPATCH_POLL_INTERVAL": "0.2",
             "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test (SABLE-mmdt)
         }
         r = subprocess.run(
             ["python3", str(BIN), BEAD, "--worktree", wt, "--model", "haiku",
@@ -240,6 +245,98 @@ def test_worker_bypass_gate_is_accepted(sock):
         time.sleep(0.5)
         assert rec.exists(), "stand-in never received a key (gate not accepted)"
         assert rec.read_text().strip() == "2", rec.read_text()
+
+
+# --- dispatch throttle + host-resource guard (SABLE-mmdt) ---------------------
+
+def _dummy_worker(sock, bead, status="running"):
+    """A stand-in live worker pane: a bash window tagged exactly the way
+    sable-spawn-worker tags a real one."""
+    pane = _tmux(sock, "new-window", "-d", "-t", "sable", "-P", "-F", "#{pane_id}",
+                 "bash --noprofile --norc").stdout.strip()
+    _tmux(sock, "set-option", "-p", "-t", pane, "@sable_role", "worker")
+    _tmux(sock, "set-option", "-p", "-t", pane, "@sable_bead", bead)
+    _tmux(sock, "set-option", "-p", "-t", pane, "@sable_status", status)
+    return pane
+
+
+def test_spawn_at_cap_refused_then_allowed_after_one_flips_done(sock):
+    """SABLE-mmdt acceptance: with SABLE_MAX_WORKERS=2 and 2 live dummy worker
+    panes, the next spawn is mechanically refused (exit 7, message naming cap
+    AND live count, no window/worktree/dispatch-file side effects); after one
+    pane flips @sable_status=done, the same spawn succeeds — one-in-one-out."""
+    with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
+        d1 = _dummy_worker(sock, "FAKE-cap-1")
+        _dummy_worker(sock, "FAKE-cap-2")
+        env = {
+            **os.environ,
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+            "SABLE_MAX_WORKERS": "2",
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # isolate the cap from real host load
+        }
+        argv = ["python3", str(BIN), BEAD, "--worktree", wt,
+                "--model", "haiku", "--skip-governance"]
+
+        r = subprocess.run(argv, capture_output=True, text=True, env=env)
+        assert r.returncode == 7, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "SABLE_MAX_WORKERS" in r.stderr
+        assert "2" in r.stderr                      # cap AND live count both = 2
+        # refused BEFORE any side effect: no worker window, no dispatch file
+        wins = _tmux(sock, "list-windows", "-t", "sable",
+                     "-F", "#{window_name}").stdout
+        assert "worker-sable-bldh-2" not in wins
+        assert not (Path(dd) / f"{BEAD}.md").exists()
+
+        # one-out: a worker flips done -> one-in: the next spawn goes through
+        _tmux(sock, "set-option", "-p", "-t", d1, "@sable_status", "done")
+        r2 = subprocess.run(argv, capture_output=True, text=True, env=env)
+        assert r2.returncode == 0, f"stdout={r2.stdout!r} stderr={r2.stderr!r}"
+        wins = _tmux(sock, "list-windows", "-t", "sable",
+                     "-F", "#{window_name}").stdout
+        assert "worker-sable-bldh-2" in wins
+
+
+def test_spawn_refused_when_host_load_exceeds_guard(sock):
+    """SABLE-mmdt host-resource guard wiring: with the per-core threshold set
+    WELL below the host's current 1-min load, the spawn is refused (exit 8)
+    naming the live load. Skipped on an idle host — the guard is exercised
+    against REAL load, not a mock (unit tests cover the pure thresholds)."""
+    load1 = os.getloadavg()[0]
+    if load1 < 0.05:
+        pytest.skip("host idle — no real load to trip the guard against")
+    cores = os.cpu_count() or 1
+    threshold = (load1 / cores) / 2  # half the current per-core load: must trip
+    with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
+        env = {
+            **os.environ,
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+            "SABLE_MAX_WORKERS": "99",  # isolate the guard from the cap
+            "SABLE_MAX_LOAD_PER_CORE": str(threshold),
+        }
+        r = subprocess.run(
+            ["python3", str(BIN), BEAD, "--worktree", wt,
+             "--model", "haiku", "--skip-governance"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 8, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "load" in r.stderr.lower()
+        assert "SABLE_MAX_LOAD_PER_CORE" in r.stderr
+        # no worker window was opened
+        wins = _tmux(sock, "list-windows", "-t", "sable",
+                     "-F", "#{window_name}").stdout
+        assert "worker-sable-bldh-2" not in wins
 
 
 # --- re-homed pre-dispatch governance (SABLE-bldh.8) -------------------------
@@ -312,6 +409,7 @@ def test_second_spawn_for_in_progress_bead_is_refused(sock):
         env = {
             **os.environ,
             "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test (SABLE-mmdt)
             "SABLE_TMUX_SOCKET": sock,
             "SABLE_TMUX_SESSION": "sable",
             "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude

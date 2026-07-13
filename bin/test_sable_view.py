@@ -69,6 +69,21 @@ def test_render_table_contains_roles_and_status():
     assert "npm test ok" in table
 
 
+def test_live_worker_count_excludes_done_and_nonworkers():
+    # SABLE-mmdt: the count backing the cockpit's count-vs-cap line — running
+    # (or not-yet-tagged) worker panes only; done panes and role panes excluded.
+    listing = LISTING + "1 %6 worker SABLE-def done\n"
+    panes = sv.parse_panes(listing)
+    assert sv.live_worker_count(panes) == 1
+
+
+def test_cap_summary_shows_count_vs_cap_and_names_the_knob():
+    panes = sv.parse_panes(LISTING)
+    line = sv.cap_summary(panes, 4)
+    assert "1/4" in line
+    assert "SABLE_MAX_WORKERS" in line
+
+
 def test_view_session_name_is_grouped_and_unique():
     assert sv.view_session_name("sable", 123) == "sable-view-123"
 
