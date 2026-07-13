@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Integration rehearsals for bin/sable-merge-gate (SABLE-o9aa acceptance).
+
+Real git end-to-end against scratch repos (a bare "origin" + a working clone);
+only the GitHub Actions verdict is injected, via a fake `gh` wired through the
+SABLE_MG_GH seam that reports a run whose headSha is the real pushed preview SHA.
+This exercises the load-bearing paths for real: merge-tree/commit-tree preview,
+ci-verify push, byte-identical fast-forward promotion + SHA-equality assertion,
+red/actions-down blocking, conflict delegation, and orphan sweep.
+
+The three o9aa rehearsals:
+  * real-green   -> promotion, base tip == tested preview SHA, ci-verify deleted
+  * deliberate-red -> NO promotion, base unchanged, ci-verify deleted
+  * actions-down -> BLOCK (exit 21), base unchanged; --override promotes
+"""
+import json
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+BIN = Path(__file__).resolve().parent / "sable-merge-gate"
+BASE = "trunk"
+WORKER = "wk-x"
+
+
+def _run(argv, cwd=None, env=None):
+    return subprocess.run(argv, cwd=cwd, env=env, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
+def _git(cwd, *args, check=True):
+    cp = _run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=cwd)
+    if check and cp.returncode != 0:
+        raise AssertionError(f"git {args} failed: {cp.stdout}")
+    return cp.stdout.strip()
+
+
+def _write_fake_gh(tmp_path, origin_gitdir, conclusion):
+    """A fake `gh` that answers `run list --branch <ref>` with a run whose
+    headSha is the REAL tip of that ci-verify ref (so wait_for_ci's SHA match is
+    faithful). conclusion=='empty' -> no runs (actions-down)."""
+    gh = tmp_path / "fake-gh"
+    gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os,sys,json,subprocess\n"
+        "a=sys.argv[1:]\n"
+        f"c={conclusion!r}\n"
+        "if c=='empty':\n"
+        "    print('[]'); sys.exit(0)\n"
+        "ref=a[a.index('--branch')+1]\n"
+        f"od={str(origin_gitdir)!r}\n"
+        "sha=subprocess.run(['git','--git-dir='+od,'rev-parse','refs/heads/'+ref],"
+        "text=True,capture_output=True).stdout.strip()\n"
+        "print(json.dumps([{'databaseId':1,'headSha':sha,'status':'completed',"
+        "'conclusion':c,'url':'http://fake/run/1'}]))\n"
+    )
+    gh.chmod(gh.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return gh
+
+
+def _setup(tmp_path, *, conflict=False):
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    _run(["git", "init", "--bare", "-b", BASE, str(origin)])
+    _run(["git", "clone", str(origin), str(work)])
+    (work / "shared.txt").write_text("l1\nl2\nl3\n")
+    (work / "README.md").write_text("base\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "init")
+    _git(work, "push", "origin", BASE)
+
+    _git(work, "checkout", "-b", WORKER)
+    if conflict:
+        (work / "shared.txt").write_text("WORKER\nl2\nl3\n")
+    else:
+        (work / "feature.txt").write_text("feature\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "feature")
+    _git(work, "push", "origin", WORKER)
+
+    if conflict:
+        _git(work, "checkout", BASE)
+        (work / "shared.txt").write_text("BASE\nl2\nl3\n")
+        _git(work, "add", "-A")
+        _git(work, "commit", "-m", "base change")
+        _git(work, "push", "origin", BASE)
+
+    _git(work, "checkout", BASE)
+    _git(work, "fetch", "origin")
+    return origin, work
+
+
+def _env(gh_path):
+    e = dict(os.environ)
+    e.update({
+        "SABLE_MG_GH": str(gh_path),
+        "SABLE_MG_BD": "true",       # no-op evidence recorder
+        "SABLE_MG_NOTIFY": "true",   # no-op notifier
+        "SABLE_MG_POLL": "0",
+        "SABLE_MG_GRACE": "0",
+        "SABLE_MG_TIMEOUT": "0",
+    })
+    return e
+
+
+def _promote(work, gh_path, *, extra=()):
+    return _run([sys.executable, str(BIN), "promote", "--bead", "TEST-1",
+                 "--branch", WORKER, "--base", BASE, "--repo", str(work),
+                 "--remote", "origin", *extra], cwd=str(work), env=_env(gh_path))
+
+
+def _origin_base_sha(origin):
+    return _git(None, "--git-dir=" + str(origin), "rev-parse", "refs/heads/" + BASE)
+
+
+def _ci_verify_refs(origin):
+    out = _git(None, "--git-dir=" + str(origin), "for-each-ref",
+               "--format=%(refname)", "refs/heads/ci-verify/", check=False)
+    return [r for r in out.splitlines() if r.strip()]
+
+
+# --- Rehearsal 1: real-green -> byte-identical promotion ----------------------
+
+def test_rehearsal_green_promotes_byte_identical(tmp_path):
+    origin, work = _setup(tmp_path)
+    gh = _write_fake_gh(tmp_path, origin, "success")
+    before = _origin_base_sha(origin)
+
+    cp = _promote(work, gh)
+    assert cp.returncode == 0, cp.stdout
+
+    after = _origin_base_sha(origin)
+    assert after != before, "base did not advance"
+    # the promoted commit is a real merge (two parents) — the tested object itself
+    parents = _git(None, "--git-dir=" + str(origin), "rev-list", "--parents", "-n", "1", after).split()
+    assert len(parents) == 3, "promoted commit is not the two-parent merge preview"
+    assert _ci_verify_refs(origin) == [], "ci-verify ref not cleaned up on green"
+
+
+# --- Rehearsal 2: deliberate-red -> no promotion ------------------------------
+
+def test_rehearsal_red_no_promotion(tmp_path):
+    origin, work = _setup(tmp_path)
+    gh = _write_fake_gh(tmp_path, origin, "failure")
+    before = _origin_base_sha(origin)
+
+    cp = _promote(work, gh)
+    assert cp.returncode == 20, cp.stdout
+    assert _origin_base_sha(origin) == before, "base advanced on a red run"
+    assert _ci_verify_refs(origin) == [], "ci-verify ref not cleaned up on red"
+
+
+# --- Rehearsal 3: actions-down -> block; override -> promote -------------------
+
+def test_rehearsal_actions_down_blocks(tmp_path):
+    origin, work = _setup(tmp_path)
+    gh = _write_fake_gh(tmp_path, origin, "empty")
+    before = _origin_base_sha(origin)
+
+    cp = _promote(work, gh)
+    assert cp.returncode == 21, cp.stdout
+    assert _origin_base_sha(origin) == before, "base advanced while Actions down"
+    assert _ci_verify_refs(origin) == [], "ci-verify ref not cleaned up on block"
+
+
+def test_rehearsal_override_promotes_without_ci(tmp_path):
+    origin, work = _setup(tmp_path)
+    gh = _write_fake_gh(tmp_path, origin, "empty")  # CI down, but override supplied
+    before = _origin_base_sha(origin)
+
+    cp = _promote(work, gh, extra=("--override", "http://human/approval"))
+    assert cp.returncode == 0, cp.stdout
+    assert _origin_base_sha(origin) != before, "override did not promote"
+    assert _ci_verify_refs(origin) == []
+
+
+# --- Conflict delegation + sweep ---------------------------------------------
+
+def test_conflict_delegates_exit_22_no_ref(tmp_path):
+    origin, work = _setup(tmp_path, conflict=True)
+    gh = _write_fake_gh(tmp_path, origin, "success")
+    before = _origin_base_sha(origin)
+
+    cp = _promote(work, gh)
+    assert cp.returncode == 22, cp.stdout
+    assert _origin_base_sha(origin) == before, "base advanced despite a preview conflict"
+    assert _ci_verify_refs(origin) == [], "conflict must not leave a ci-verify ref"
+
+
+def test_sweep_deletes_only_aged_orphans(tmp_path):
+    origin, work = _setup(tmp_path)
+    base_sha = _origin_base_sha(origin)
+    base_tree = _git(work, "rev-parse", base_sha + "^{tree}")
+    # a genuinely backdated preview commit (year 2000) for the "old" ref — the
+    # sweep keys on committerdate, so the ref must point at an old COMMIT, not
+    # merely be pushed with a stale env (which does not re-date an existing commit).
+    old_env = dict(os.environ,
+                   GIT_COMMITTER_DATE="2000-01-01T00:00:00 +0000",
+                   GIT_AUTHOR_DATE="2000-01-01T00:00:00 +0000")
+    old_sha = _run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit-tree", base_tree, "-m", "old-preview"], cwd=str(work), env=old_env).stdout.strip()
+    _git(work, "push", "origin", f"{old_sha}:refs/heads/ci-verify/old-aaaaaaa")
+    _git(work, "push", "origin", f"{base_sha}:refs/heads/ci-verify/new-bbbbbbb")
+
+    cp = _run([sys.executable, str(BIN), "sweep", "--max-age-hours", "6",
+               "--repo", str(work), "--remote", "origin"], cwd=str(work), env=_env(_write_fake_gh(tmp_path, origin, "empty")))
+    assert cp.returncode == 0, cp.stdout
+    remaining = _ci_verify_refs(origin)
+    assert "refs/heads/ci-verify/old-aaaaaaa" not in remaining, "aged orphan not swept"
+    assert "refs/heads/ci-verify/new-bbbbbbb" in remaining, "fresh ref wrongly swept"
