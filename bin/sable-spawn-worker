@@ -49,7 +49,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 # Shared pane-readiness/dispatch helpers (SABLE-bldh.14). Resolve the lib next to
@@ -59,7 +58,6 @@ from sable_pane_lib import (  # noqa: E402
     SessionCollision, WORKER_CAP_DEFAULT, accept_startup_gate, dispatch_landed,
     pane_ready, repo_root, resolve_session, wait_for_ready, worker_cap,
 )
-from sable_pane_lib import capture_pane as _capture_pane  # noqa: E402
 from sable_pane_lib import deliver_text as deliver_dispatch  # noqa: E402
 
 DEFAULT_SESSION = "sable"
