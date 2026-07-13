@@ -99,6 +99,38 @@ Return:
 
 ---
 
+## Test scope protocol (SABLE-h853)
+
+Operator-approved protocol change (2026-07-13): workers no longer run the full
+suite pre-push — that convention predated working CI on the integration
+branch. The full suite now runs exactly once, PRE-merge, as the merge-preview
+ci-verify gate (SABLE-o9aa) (below), not per worker.
+
+1. **TDD red-green loop** runs ONLY the bead's own named test files —
+   unchanged, cheap. Keep iterating here until red → green.
+2. **Pre-push verification is a SCOPED run**, not the full suite: the bead's
+   test files plus tests importing the modules the diff touched, with
+   coverage off and fail-fast on. This is what you report as your test
+   evidence in every mode below (Gate mode step 2, Warm-pane self-push step 2,
+   and the Report back rubric) — capture the exact scoped command + output,
+   not a full-suite invocation.
+3. **The full suite is the merge-preview ci-verify gate (SABLE-o9aa)'s job,
+   not yours.** Your worker branch gets pre-merged onto the current
+   integration-branch tip and pushed to a throwaway ci-verify branch; that
+   per-branch GitHub Actions run — the merge-preview ci-verify gate
+   (SABLE-o9aa) — is the SOLE full-suite authority (chuck-owned). Chuck
+   fast-forwards the integration branch only on green. Workers do not run
+   the full suite at any point — not pre-push, not after merge.
+4. **Contention discipline:** if a bead genuinely needs a broader-than-scoped
+   run, keep at most one such run in flight per host at a time — some suites
+   (e.g. frontend vitest) are documented flaky under concurrent CPU load.
+
+If your dispatch prompt still says "run the full suite" and predates this
+protocol, the scoped-run protocol above wins — flag the stale prompt language
+back to your manager rather than burning wall-clock on a full run.
+
+---
+
 ## Gate mode (manager-reviewed) vs self-push
 
 SABLE has two dispatch modes. **Which one applies is set by who dispatched you
@@ -110,16 +142,20 @@ The manager reviews your work *before* anything is pushed (the APPROVE-PUSH
 gate). You do everything up to the push, then **STOP**:
 
 1. Implement the bead(s) in the worktree named by the `Worktree:` line.
-2. Run the unit AND integration tests; capture the output.
+2. Run the SCOPED pre-push test set (see "Test scope protocol" above — the
+   bead's test files plus tests importing the touched modules, coverage off,
+   fail-fast on; NOT the full suite); capture the output.
 3. Rebase on the base branch (`{BASE_BRANCH}`).
 4. Commit. **Do NOT push, and do NOT open a PR.**
 5. Return — as your final message, not a bead — a STOP-BEFORE-PUSH report:
    - **Worktree** path and **branch** name
    - **Parked commit SHA** (`git -C <worktree> rev-parse HEAD`) — the exact
      state you are handing over for review
-   - **Test output** — the EXACT copy-pasteable command(s) you ran AND output
-     proving unit + integration gates ran green (report the real command, not a
-     reconstructed path — a wrong path re-runs as `collect 0 items` and false-greens)
+   - **Test output** — the EXACT copy-pasteable scoped command(s) you ran AND
+     output proving the scoped run went green (report the real command, not a
+     reconstructed path — a wrong path re-runs as `collect 0 items` and
+     false-greens). The full suite is the merge-preview ci-verify gate's job,
+     not yours — do not report a full-suite invocation here.
    - Bead IDs ready to close, and any constraint you bent and why
 
 The manager reviews this, and on APPROVE pushes it itself
@@ -146,7 +182,9 @@ pool: the manager watches your bead's status, not a returned message. Lifecycle:
 1. Implement the bead(s). Your CWD already *is* the worktree — there is **no
    `git -C`** anywhere in your flow (the old in-process model's `git -C <tree>`
    validated the wrong tree, SABLE-041; warm panes delete that bug).
-2. Run the unit AND integration tests; capture the exact command + output.
+2. Run the SCOPED pre-push test set (see "Test scope protocol" above — the
+   bead's test files plus tests importing the touched modules, coverage off,
+   fail-fast on; NOT the full suite); capture the exact command + output.
 3. Rebase on the base branch, commit, and **push your own worktree branch**:
    plain `git push` from your CWD. The `pre-push-rebase-test` gate runs; on
    failure STOP and report — do not bypass. The post-push hook files the

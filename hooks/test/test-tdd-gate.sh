@@ -366,6 +366,55 @@ else
 fi
 rm -rf "$CR_STUB_DIR"
 
+# ---------- SABLE-h853: scoped-run protocol acceptance ----------
+# Operator-approved protocol change (2026-07-13): the full suite no longer
+# runs pre-push per worker; workers submit SCOPED evidence (the bead's test
+# files plus tests importing the touched modules, coverage off, fail-fast
+# on) and the gate must accept it — it must NOT require or imply full-suite
+# execution. The full suite becomes the merge-preview ci-verify GitHub
+# Actions run's job (chuck-owned), named here so a future reader does not
+# reintroduce a full-suite requirement into this hook.
+#
+# The hatch/evidence CHECK itself is scope-agnostic already (it only checks
+# whether an evidence file exists, never what ran) — these assertions lock
+# that in as an explicit, documented contract on the hook source itself
+# (doc-content regression guard, same pattern as
+# test-worker-dispatch-template.sh), plus a behavioral regression guard that
+# a real scoped-run evidence line (explicit file args, coverage off,
+# fail-fast on) is accepted end-to-end.
+
+hasre_hook() {
+  # $1 = name, $2 = ERE pattern to find in the hook's own source
+  local name="$1" pattern="$2"
+  if grep -qiE -- "$pattern" "$HOOK" 2>/dev/null; then
+    pa_pass "$name"
+  else
+    pa_fail "$name" "missing pattern in $HOOK: $pattern"
+  fi
+}
+
+hasre_hook "hook documents scoped-run acceptance (not full-suite)" \
+  "scoped( pre-push)? (test )?run"
+hasre_hook "hook names the merge-preview ci-verify gate as full-suite authority" \
+  "merge-preview|ci-verify"
+hasre_hook "hook states it does not require full-suite evidence" \
+  "not require|never require|scope-agnostic|does not (check|require)"
+
+# Behavioral regression guard: a scoped-run evidence line (explicit test
+# file args + coverage-off + fail-fast flags, not a bare full-suite
+# invocation) must still satisfy the gate.
+SCOPED_SID="tdd-gate-scoped-$$-$RANDOM"
+SCOPED_EV="/tmp/tdd-evidence-${SCOPED_SID}"
+rm -f "$SCOPED_EV"
+echo "$(date -Iseconds) REPO=$(pwd) CMD=pytest hooks/test/test_foo.py tests/test_related.py -x --no-cov" > "$SCOPED_EV"
+SCOPED_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$SCOPED_SID" | env PATH="$STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null)
+if [ -z "$SCOPED_OUT" ]; then
+  pa_pass "scoped-run evidence (file args + --no-cov -x) is accepted"
+else
+  pa_fail "scoped-run evidence (file args + --no-cov -x) is accepted" "got: ${SCOPED_OUT:-<empty>}"
+fi
+rm -f "$SCOPED_EV"
+
 # ---------- Summary ----------
 
 echo
