@@ -23,7 +23,14 @@ FAIL_NAMES=""
 
 # Make a temp dir to stage a fake `bd` shim.
 TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
+
+# Set SABLE_MODE_STATE to an isolated path (SABLE-ierm) so the test doesn't read
+# the ambient repo's mode-state.json. This ensures tests run consistently regardless
+# of the repo's execution mode. Mirrors test-mode-interlock.sh's pattern.
+SABLE_MODE_STATE="$(mktemp -u)"
+export SABLE_MODE_STATE
+
+trap 'rm -rf "$TMP_DIR" "$SABLE_MODE_STATE" 2>/dev/null || true' EXIT
 
 # We'll write a small bd stub that returns canned JSON based on the bead ID
 # in argv. The fixture data is keyed by bead-id in $TMP_DIR/fixtures.
@@ -77,8 +84,9 @@ run_hook() {
   local input
   input=$(make_input "$prompt" "$subtype" "$model")
   # Inject our bd stub onto PATH and pass TMP_DIR through so the stub can find fixtures.
+  # Also pass SABLE_MODE_STATE so the test doesn't read the ambient repo's mode file.
   local out
-  out=$(env -i PATH="$TMP_DIR:$PATH" TMP_DIR="$TMP_DIR" $env_prefix bash "$HOOK" <<< "$input" 2>/dev/null || echo "RUN_ERR:$?")
+  out=$(env -i PATH="$TMP_DIR:$PATH" TMP_DIR="$TMP_DIR" SABLE_MODE_STATE="$SABLE_MODE_STATE" $env_prefix bash "$HOOK" <<< "$input" 2>/dev/null || echo "RUN_ERR:$?")
   echo -n "$out"
 }
 
@@ -249,7 +257,7 @@ print(json.dumps({
 # run_hook_subagent <prompt> <model> — no env identity; registry resolves optimus
 run_hook_subagent() {
   make_subagent_input "$1" "$2" | \
-    env -i PATH="$TMP_DIR:$PATH" TMP_DIR="$TMP_DIR" SABLE_AGENTS_YAML="$AGENTS_YAML" \
+    env -i PATH="$TMP_DIR:$PATH" TMP_DIR="$TMP_DIR" SABLE_AGENTS_YAML="$AGENTS_YAML" SABLE_MODE_STATE="$SABLE_MODE_STATE" \
         bash "$HOOK" 2>/dev/null || echo "RUN_ERR:$?"
 }
 
