@@ -168,6 +168,22 @@ run_hook_writes "direct execution with absolute path recognized" \
 run_hook_silent "direct execution of a non-test script not recognized" \
   "./hooks/setup.sh"
 
+# ---------- SABLE-f6aw: trailing redirect must not break the last-token check ----------
+# 'script.sh 2>&1 | tail -N' puts '2>&1' — not the script path — as the pipe
+# segment's last shlex token. The matcher must still find the script path.
+
+run_hook_writes "bash script with trailing 2>&1 before a pipe recognized" \
+  "bash hooks/test/test-foo.sh 2>&1 | tail -8"
+
+run_hook_writes "direct execution with trailing 2>&1 before a pipe recognized" \
+  "./hooks/test/test-foo.sh 2>&1 | tail -8"
+
+run_hook_writes "bash script with trailing '> out.log' redirect recognized" \
+  "bash hooks/test/test-foo.sh > out.log"
+
+run_hook_writes "bash script with trailing '2>&1' and no pipe recognized" \
+  "bash hooks/test/test-foo.sh 2>&1"
+
 # repo-tagging: a cd-compound into a companion repo must tag the evidence
 # line with that repo, not the hook's own cwd.
 CROSSREPO_SID="tdd-ev-crossrepo-$$-$RANDOM"
