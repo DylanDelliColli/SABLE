@@ -114,14 +114,22 @@ ci-verify gate (SABLE-o9aa) (below), not per worker.
    evidence in every mode below (Gate mode step 2, Warm-pane self-push step 2,
    and the Report back rubric) — capture the exact scoped command + output,
    not a full-suite invocation.
-3. **The full suite is the merge-preview ci-verify gate (SABLE-o9aa)'s job,
+3. **Docs-only and [no-test] beads** have no named test files. For these:
+   - Pre-push verification is (a) tests importing the modules the diff touched
+     IF any (e.g., a component-test that imports a constant the docs reference),
+     plus (b) a targeted build/lint or render-check (run `tsc` or `eslint` for
+     touched `.tsx`; run `serve` + `curl` or check file existence for static
+     docs). Explicitly do NOT run the full suite for these beads.
+   - Report the exact command + output for the targeted check (same format as
+     scoped test evidence above).
+4. **The full suite is the merge-preview ci-verify gate (SABLE-o9aa)'s job,
    not yours.** Your worker branch gets pre-merged onto the current
    integration-branch tip and pushed to a throwaway ci-verify branch; that
    per-branch GitHub Actions run — the merge-preview ci-verify gate
    (SABLE-o9aa) — is the SOLE full-suite authority (chuck-owned). Chuck
    fast-forwards the integration branch only on green. Workers do not run
    the full suite at any point — not pre-push, not after merge.
-4. **Contention discipline:** if a bead genuinely needs a broader-than-scoped
+5. **Contention discipline:** if a bead genuinely needs a broader-than-scoped
    run, keep at most one such run in flight per host at a time — some suites
    (e.g. frontend vitest) are documented flaky under concurrent CPU load.
 
