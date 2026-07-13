@@ -2,6 +2,17 @@
 # tdd-gate.sh — Block bd close without test evidence
 # Checks the evidence file written by tdd-evidence.sh.
 # Escape hatch: add [no-test] to bead notes (single-close only).
+#
+# SABLE-h853 (2026-07-13): a worker's pre-push test run is a SCOPED run — the
+# bead's own test files plus tests importing the modules the diff touched,
+# coverage off, fail-fast on — not the full suite. This gate accepts that
+# evidence as-is: the check below is scope-agnostic by design (it verifies a
+# test run happened this session, never what ran), so it does not require or
+# check for full-suite execution. The full suite runs exactly once, PRE-merge,
+# as a merge-preview ci-verify GitHub Actions run (the worker branch
+# pre-merged onto the integration-branch tip on a throwaway ci-verify branch,
+# gated before the fast-forward) — that is the SOLE full-suite authority,
+# owned by chuck's merge gate, never a worker or this hook.
 
 set -euo pipefail
 
