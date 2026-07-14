@@ -962,6 +962,82 @@ fi
 assert_bd_not_called "SABLE-5hcg: empty-diff push files no for-chuck bead (nothing to review)"
 
 # --------------------------------------------------------------------------
+# SABLE-rq9k: the hook's durable for-chuck bead-filing path must perform NO
+# Dolt remote sync. bd auto-pushes to the shared Dolt remote on every mutating
+# write (create/update/close) unless auto-push is disabled — the global
+# --sandbox flag ("Sandbox mode: disables Dolt auto-push", verified present in
+# bd 1.0.5). Without it, the fallback `bd create` pushed its for-chuck bead to
+# the remote as a pure hook SIDE EFFECT during a fleet-wide push hold (bead
+# market-brief-package-1x8v, 2026-07-09) — chuck-only dolt pushing is
+# unenforceable by convention alone while any auto-pushing write lives in a hook.
+#
+# We model bd's push-on-write with a stub that advances a simulated remote tip
+# on a mutating `create` UNLESS --sandbox is present, then assert the tip is
+# UNCHANGED after the hook files its durable fallback bead. A live dolt
+# sql-server + file remote would be the gold-standard fixture, but this whole
+# suite is deliberately hermetic (stubbed bd/gh/tmux/sable-msg); modeling the
+# documented --sandbox contract keeps the case fast and CI-safe while still
+# asserting the observable property: NO remote advance. Red pre-fix (create
+# lacks --sandbox → tip advances), green post-fix.
+# --------------------------------------------------------------------------
+
+# bd stub modeling Dolt auto-push-on-write: a mutating `create` advances the
+# simulated remote tip (append a marker to $DOLT_REMOTE_TIP) UNLESS --sandbox
+# disables it. `list` is a read → never pushes, returns an empty in-progress set.
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+[ "${1:-}" = "list" ] && { echo '[]'; exit 0; }
+if [ "${1:-}" = "create" ]; then
+  sandbox=0
+  for a in "$@"; do [ "$a" = "--sandbox" ] && sandbox=1; done
+  [ "$sandbox" -eq 0 ] && printf 'remote-advanced\n' >> "${DOLT_REMOTE_TIP:-/dev/null}"
+fi
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+RQ9K_TIP="$STUB_DIR/dolt-remote-tip"
+rm -f "$BD_LOG" "$SABLE_MSG_LOG" "$RQ9K_TIP"
+: > "$RQ9K_TIP"   # empty remote tip; a push would append to it
+# Chuck pane absent → the hook skips the message handoff and takes the durable
+# for-chuck `bd create` fallback (the exact leak path). DOLT_REMOTE_TIP is
+# exported into the hook env so its `bd create` subprocess reaches the stub.
+run_hook "$MGR_ENV SABLE_STUB_CHUCK_PRESENT=0 DOLT_REMOTE_TIP=$RQ9K_TIP" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+
+# Precondition: the fallback bead really was filed (so a pass below is not vacuous
+# from the hook exiting before bd create).
+if grep -q 'for-chuck' "$BD_LOG" 2>/dev/null; then
+  pass "SABLE-rq9k: durable for-chuck fallback bead is filed (precondition)"
+else
+  fail "SABLE-rq9k: durable for-chuck fallback bead is filed (precondition)" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null | head -3)"
+fi
+
+# The property that matters: the bead-filing path did NOT advance the Dolt remote.
+if [ ! -s "$RQ9K_TIP" ]; then
+  pass "SABLE-rq9k: hook bead-filing performs NO dolt remote sync (remote tip unchanged)"
+else
+  fail "SABLE-rq9k: hook bead-filing performs NO dolt remote sync (remote tip unchanged)" "remote tip advanced — bd create auto-pushed (missing --sandbox): $(cat "$RQ9K_TIP" 2>/dev/null)"
+fi
+
+# And the mechanism: the for-chuck create carried the auto-push-disabling flag.
+if grep -q -- '--sandbox' "$BD_LOG" 2>/dev/null; then
+  pass "SABLE-rq9k: for-chuck bd create invoked with --sandbox (Dolt auto-push disabled)"
+else
+  fail "SABLE-rq9k: for-chuck bd create invoked with --sandbox (Dolt auto-push disabled)" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null | head -3)"
+fi
+rm -f "$BD_LOG" "$SABLE_MSG_LOG" "$RQ9K_TIP"
+
+# Restore the plain bd stub for hermeticity if more tests are appended later.
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+# --------------------------------------------------------------------------
 # Summary
 # --------------------------------------------------------------------------
 

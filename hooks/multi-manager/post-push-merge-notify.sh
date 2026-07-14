@@ -311,8 +311,20 @@ TITLE="Review PR from ${SABLE_ID_NAME}: ${BRANCH}"
 # branch and a stranded merge. Capture the exit code and output, retry once
 # (transient errors are common under fleet load), and if it still fails, say
 # so loudly instead of swallowing it.
+#
+# SABLE-rq9k: --sandbox disables bd's Dolt auto-push. bd pushes to the shared
+# Dolt remote on EVERY mutating write (create/update/close) by default; without
+# this flag the for-chuck fallback bead was pushed to the remote as a pure hook
+# side effect DURING a fleet-wide push hold (bead market-brief-package-1x8v,
+# 2026-07-09). Dolt pushing is chuck-only by fleet convention, and a convention
+# cannot bind a hook — so the hook must file this bead LOCAL-ONLY (still created
+# and dolt-committed, never pushed); Chuck's batched pull+push carries it to the
+# remote. --sandbox disables the push WITHOUT blocking the write (unlike
+# --readonly, which would drop the handoff entirely). Applied to BOTH the initial
+# create and the SABLE-5hcg retry below.
 BD_CREATE_RC=0
 BD_CREATE_OUT=$(bd create \
+  --sandbox \
   --title "$TITLE" \
   --type=task \
   --priority=2 \
@@ -322,6 +334,7 @@ BD_CREATE_OUT=$(bd create \
 if [ "$BD_CREATE_RC" -ne 0 ]; then
   BD_CREATE_RC=0
   BD_CREATE_OUT=$(bd create \
+    --sandbox \
     --title "$TITLE" \
     --type=task \
     --priority=2 \
