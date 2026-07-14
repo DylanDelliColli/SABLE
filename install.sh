@@ -281,7 +281,8 @@ cat <<EOF
       }
     ],
     "SessionStart": [
-      {"matcher": "", "hooks": [{"type": "command", "command": "bd prime"}]}
+      {"matcher": "", "hooks": [{"type": "command", "command": "bd prime"}]},
+      {"matcher": "", "hooks": [{"type": "command", "command": "sable-doctor --quiet 2>&1 || true"}]}
     ],
     "PreCompact": [
       {"matcher": "", "hooks": [{"type": "command", "command": "bd prime"}]}
@@ -289,6 +290,9 @@ cat <<EOF
   }
 }
 EOF
+echo
+echo "The SessionStart sable-doctor entry above warns (non-fatal) at session start"
+echo "when your installed ~/.claude drifts from this repo — see SABLE-1i6m / bin/sable-doctor."
 echo
 
 bold "Orchestration hooks"
