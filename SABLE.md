@@ -1402,6 +1402,70 @@ script header — used by tests and for operator overrides.
 
 When context is compacted (long sessions) or a new session starts, the `bd prime` command re-injects critical workflow context. SABLE configures this as a SessionStart and PreCompact hook so it happens automatically.
 
+### 8.5 GitHub SSH Port-22 Flap (Runbook)
+
+Cross-fleet operational runbook for a recurring host-local symptom, following the
+[[SABLE-ptkn]] dolt-runbook precedent (§8.3) of documenting the procedure inline
+rather than only in the bead.
+
+**SYMPTOM:** `git push` / `git fetch` / `git ls-remote` hang and exit 124, or an
+`ssh -T` probe to `git@github.com` times out on connect. `bd dolt push` and other
+local `bd` writes are unaffected — this is a Git-over-SSH-specific path, not a
+Dolt or beads outage.
+
+**OBSERVED OCCURRENCES:** 2026-07-09 (tz7h window, self-resolved) and 2026-07-13
+~19:00Z (chuck escalation, self-resolved by ~19:19Z). Both times githubstatus.com
+showed all-operational and a same-minute probe on port 443 was green while port
+22 timed out — so treat the cause as local/path (WSL2 NAT or upstream port-22
+filtering on this host), never as a GitHub-side outage. Do not spend time
+checking GitHub status first; probe both ports instead.
+
+**PROBE COMMANDS (diagnose first, mutate nothing):**
+
+```bash
+ssh -T git@github.com                    # port 22 — may hang/timeout when flapping
+timeout 15 ssh -p 443 -T git@ssh.github.com   # port 443 fallback — expect it to authenticate
+git ls-remote origin HEAD                 # real transport check once a port is confirmed live
+```
+
+A successful `ssh -T` prints `Hi <user>! You've successfully authenticated...`
+and exits 1 — that exit code is expected (GitHub refuses shell access by
+design), not a failure signal.
+
+**FIX — PERMANENT 443 ROUTING (operator-authorized 2026-07-14, durable not
+incident-scoped):** `~/.ssh/config` routes both the work and personal GitHub
+identities over port 443, which is strictly more firewall/NAT-tolerant than 22
+with no known downside:
+
+```
+Host github.com
+  HostName ssh.github.com
+  Port 443
+  IdentityFile ~/.ssh/id_ed25519
+
+Host github-personal
+  HostName ssh.github.com
+  Port 443
+  IdentityFile ~/.ssh/id_ed25519_personal
+```
+
+Keys and remote URLs (`git@github.com:...`, `git@github-personal:...`) are
+unchanged — only the transport routes differently. Trivially reversible (delete
+the `HostName`/`Port` lines to fall back to direct port-22).
+
+**SHARED HOST STATE:** `~/.ssh/config` is host-local, not per-repo — it is
+shared across both fleets. Treat further edits to it as governed by the
+[[SABLE-ht22]] brokered-window convention; do not edit it unilaterally mid-swarm.
+
+**VERIFY:** `ssh -T` over the affected alias authenticates AND a real
+`git ls-remote`/`fetch` through a remote using that alias succeeds. Trusting the
+probe alone is not sufficient — confirm with a real transport call, mirroring
+the evidence standard in [[SABLE-ptkn]].
+
+**REFERENCES:** [[SABLE-yw7q]] (this bead, delivered the 443 fallback + this
+runbook), [[SABLE-72kh]] (first occurrence), [[SABLE-ht22]] (shared-host-state
+coordination convention).
+
 ---
 
 ## 9. Anti-Patterns & Failure Modes
