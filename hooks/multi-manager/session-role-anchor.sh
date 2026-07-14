@@ -10,6 +10,15 @@
 
 set -euo pipefail
 
+# SABLE-38zi: a WORKER pane carries the lane manager's CLAUDE_AGENT_NAME +
+# manager role so its push fires the manager-gated for-chuck handoff — but it
+# must NEVER load that manager's role-card. A worker that boots as its manager
+# runs the manager operating loop and re-dispatches its own bead (duplicate
+# pane, defeats SABLE_MAX_WORKERS). sable-spawn-worker stamps SABLE_WORKER_PANE=1
+# on every worker pane precisely to distinguish it from a real manager pane that
+# shares the same identity env; stand down unconditionally when it is set.
+[ -n "${SABLE_WORKER_PANE:-}" ] && exit 0
+
 # Manager identity must be set explicitly via launch alias
 [ -z "${CLAUDE_AGENT_NAME:-}" ] && exit 0
 [ "${CLAUDE_AGENT_ROLE:-}" != "manager" ] && exit 0

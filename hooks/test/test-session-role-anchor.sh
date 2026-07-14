@@ -48,6 +48,14 @@ if [ -z "$out" ]; then pass "unset CLAUDE_AGENT_NAME no-ops"; else fail "unset C
 out="$(cd "$PROJ" && printf '%s' "$SS" | CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=auditor bash "$HOOK" 2>/dev/null)"   # non-manager
 if [ -z "$out" ]; then pass "non-manager role no-ops"; else fail "non-manager role no-ops" "got: $out"; fi
 
+# ---------- SABLE-38zi: worker pane never loads a manager role-card ----------
+# A worker pane carries the lane manager's CLAUDE_AGENT_NAME + manager role (so
+# its push fires the manager-gated for-chuck handoff), but SABLE_WORKER_PANE=1
+# marks it as a worker: the role-anchor MUST stand down, or the worker boots as
+# its manager and re-dispatches its own bead (duplicate pane, defeats the cap).
+out="$(cd "$PROJ" && printf '%s' "$SS" | SABLE_WORKER_PANE=1 CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
+if [ -z "$out" ]; then pass "worker pane (SABLE_WORKER_PANE) no-ops"; else fail "worker pane (SABLE_WORKER_PANE) no-ops" "got: ${out:0:120}"; fi
+
 rm -rf "$PROJ" "$HOMETMP" "$NOPROJ"
 echo
 echo "=========================================="

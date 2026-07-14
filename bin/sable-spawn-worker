@@ -514,13 +514,50 @@ def resolve_lane(override: str | None) -> str:
 
 
 def worker_env_args(lane: str) -> list[str]:
-    """tmux `-e` args giving the worker the lane manager's identity. Without this
-    the worker inherits the tmux SESSION env (CLAUDE_AGENT_NAME=lincoln, set by
-    sable-tmux's `new-session -e`), so its push is mis-attributed to lincoln
-    (SABLE-bldh.13). Empty when no lane is resolvable."""
-    if not lane:
-        return []
-    return ["-e", f"CLAUDE_AGENT_NAME={lane}", "-e", "CLAUDE_AGENT_ROLE=manager"]
+    """tmux `-e` args for the worker pane.
+
+    Two purposes, deliberately separated:
+      * Lane identity (CLAUDE_AGENT_NAME=<lane> + manager role): stamped so the
+        worker's push fires the manager-gated for-chuck handoff attributed to the
+        lane, not the session-default lincoln (SABLE-bldh.13). Without it the
+        worker inherits the tmux SESSION env (CLAUDE_AGENT_NAME=lincoln, set by
+        sable-tmux's `new-session -e`). Omitted when no lane is resolvable.
+      * SABLE_WORKER_PANE=1 (ALWAYS stamped): marks the pane as a WORKER. That
+        manager identity is exactly what let a worker BOOT as its manager and
+        re-dispatch its own bead (SABLE-38zi: identity bleed -> the SessionStart
+        role-anchor loaded the tarzan role-card, the pane ran the manager loop
+        and spawned a SECOND worker for the same bead, defeating the
+        SABLE_MAX_WORKERS cap). This marker is the disambiguator: the role-anchor
+        stands down on it (never loads a manager role-card into a worker), and
+        sable-spawn-worker itself refuses to re-dispatch from a pane carrying it
+        (worker_pane_guard). It is independent of lane so even a lane-less worker
+        pane is recognizable."""
+    args: list[str] = []
+    if lane:
+        args += ["-e", f"CLAUDE_AGENT_NAME={lane}", "-e", "CLAUDE_AGENT_ROLE=manager"]
+    args += ["-e", "SABLE_WORKER_PANE=1"]
+    return args
+
+
+def worker_pane_guard() -> str | None:
+    """SABLE-38zi hard guard: refuse to dispatch a worker FROM a worker pane.
+
+    A worker pane carries SABLE_WORKER_PANE=1 (worker_env_args), inherited by any
+    command it runs. A worker's job is to execute its ONE dispatched bead and
+    self-push; it never spawns workers. If a worker ever (mis)invokes
+    sable-spawn-worker — the observed failure was a worker that booted as its lane
+    MANAGER via identity bleed and re-dispatched its own bead — this guard stops
+    it dead, so one dispatch can never silently become two live panes / two
+    worktrees and defeat the SABLE_MAX_WORKERS host-oversubscription cap.
+    Returns an error string to block, or None to allow (not a worker pane)."""
+    if not os.environ.get("SABLE_WORKER_PANE"):
+        return None
+    return ("refusing to dispatch from a WORKER pane (SABLE_WORKER_PANE set). A "
+            "worker runs its single dispatched bead and self-pushes; it never "
+            "spawns workers. This guard stops the SABLE-38zi re-dispatch — one "
+            "dispatch silently becoming two live panes/worktrees, defeating the "
+            "SABLE_MAX_WORKERS cap. If you are a MANAGER, dispatch from your own "
+            "manager pane, not from inside a worker's.")
 
 
 def new_window_args(session: str, win: str, worktree: str,
@@ -610,6 +647,15 @@ def main(argv: list[str] | None = None) -> int:
                                      "else derived per-repo — see sable-session)")
     p.add_argument("--skip-governance", action="store_true")
     ns = p.parse_args(sys.argv[1:] if argv is None else argv)
+
+    # --- SABLE-38zi re-dispatch guard. FIRST, before any bead fetch / tmux /
+    # worktree side effect, so a refused re-dispatch from a worker pane leaves
+    # nothing claimed and spawns no grandchild pane. Distinct exit 9 (throttle/
+    # governance use 3-8). ---
+    guard_err = worker_pane_guard()
+    if guard_err:
+        sys.stderr.write(f"sable-spawn-worker: {guard_err}\n")
+        return 9
 
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
     base = tmux_base(socket)
