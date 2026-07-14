@@ -289,6 +289,52 @@ is_spawn_call() {
   printf '%s' "$cmd" | grep -qE "(^|[;&|(])[[:space:]]*${helper}([[:space:]]|\$)"
 }
 
+# is_git_push <command> → true iff <command> genuinely runs `git … push` in
+# command-word position, NOT merely names the phrase inside a quoted argument
+# (SABLE-qfvn / SABLE-ykij). The pre-fix regex `git[[:space:]]+push` let a space
+# inside a quoted string count as a word boundary, so a bd --description body, a
+# sable-note, or a sable-msg message that merely NAMED "git push" false-matched
+# and was denied — the same plain-space defect SABLE-pi5m removed from the name /
+# helper legs. shlex tokenization collapses each quoted span into ONE token, so
+# the phrase inside prose never yields a bare `push` token; only a real
+# invocation does. Every ;/&&/||/| segment (and each newline-separated line) is
+# walked, so a chained `bd create && git push` is still caught, and a
+# `git -C DIR push` (git in command position, push a later word — which the old
+# adjacent-only regex MISSED, so wrong-tree pushes slipped) is now correctly
+# denied. Leading VAR=val assignment prefixes are skipped so `ENV=x git push`
+# still matches. Unbalanced-quote input fails toward deny (naive split).
+is_git_push() {
+  printf '%s' "$1" | python3 -c "
+import shlex, sys, re
+ASSIGN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+PUNCT = re.compile(r'^[;()|&<>]+\$')
+def seg_is_push(seg):
+    i = 0
+    while i < len(seg) and ASSIGN.match(seg[i]):
+        i += 1
+    return i < len(seg) and seg[i] == 'git' and 'push' in seg[i+1:]
+def tokenize(line):
+    try:
+        lex = shlex.shlex(line, posix=True, punctuation_chars=';()|&<>')
+        lex.whitespace_split = True
+        return list(lex)
+    except ValueError:
+        return line.split()
+for line in sys.stdin.read().splitlines():
+    seg = []
+    for t in tokenize(line):
+        if PUNCT.match(t):
+            if seg_is_push(seg):
+                sys.exit(0)
+            seg = []
+        else:
+            seg.append(t)
+    if seg_is_push(seg):
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # Producer deny-leg (SABLE-tz7h.3): CLAUDE_AGENT_ROLE=producer identifies a
 # fan-out analysis role (sherlock/victor/columbo/gaudi/rudy) — read-only by
@@ -314,7 +360,7 @@ if [ "${CLAUDE_AGENT_ROLE:-}" = "producer" ]; then
   if is_spawn_call 'sable-spawn-worker' "$CMD_TEXT" || is_spawn_call 'sable-spawn-manager' "$CMD_TEXT"; then
     deny "Producer identity (CLAUDE_AGENT_ROLE=producer) may not dispatch workers or stand up the fleet — producers are read-only analysis agents, not spawners. Set SABLE_ORCHESTRATION_FORCE=1 to override."
   fi
-  if printf '%s' "$CMD_TEXT" | grep -qE '(^|[[:space:];&|])git[[:space:]]+push([[:space:]]|$)'; then
+  if is_git_push "$CMD_TEXT"; then
     deny "Producer identity (CLAUDE_AGENT_ROLE=producer) may not push code — producers are read-only analysis agents; findings go through beads, not commits. Set SABLE_ORCHESTRATION_FORCE=1 to override."
   fi
 fi
@@ -443,8 +489,15 @@ printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exi
 # /sable-execute; its own flags legitimately carry agent/producer names (e.g.
 # `--fleet victor`) that would otherwise false-positive the launch classifier
 # below, which only wants the token in COMMAND position, not anywhere in the
-# argument list. sable-mode itself never spawns anything, so exempt it outright.
-printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])sable-mode([[:space:]]|$)' && exit 0
+# argument list. sable-mode itself never spawns anything, so exempt it — but ONLY
+# when it is the ACTUAL command being run (the leading command word, after any
+# VAR=val prefix, which leading_cmd strips), NOT when the token merely appears
+# inside a quoted argument of some OTHER command. The pre-fix substring match let
+# a `bd create --parent … --description "… sable-mode set execution …"` short-
+# circuit the ENTIRE main leg and BYPASS the backlog-population gate (SABLE-ykij
+# defect 2); leading-word anchoring closes that bypass while a chained
+# `git push && sable-mode …` no longer wins exemption for its push either.
+[ "$(leading_cmd "$COMMAND")" = "sable-mode" ] && exit 0
 
 # Detect an attempt to launch a given set of named agents — either by invoking
 # the bare launch alias in command-word position, or by setting
@@ -511,7 +564,7 @@ case "$MODE" in
     if launches 'optimus|tarzan|chuck'; then
       deny "Orchestration is in PLANNING mode — launching execution managers (optimus/tarzan/chuck) is blocked. Run /sable-execute to drain the pool, or append --force to override."
     fi
-    if printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])git[[:space:]]+push([[:space:]]|$)'; then
+    if is_git_push "$COMMAND"; then
       deny "Orchestration is in PLANNING mode — code 'git push' is blocked so you don't ship from a half-formed backlog. Run /sable-execute first, or append --force to override."
     fi
     TIER="$(get_tier)"
