@@ -42,6 +42,18 @@ fail() {
 # Fixtures
 # --------------------------------------------------------------------------
 
+# SABLE-yn5t: guard every `cd` into a mktemp fixture repo. A bare `cd "$dir"`
+# that fails (the busy-/tmp race where the dir was reaped or never created)
+# silently leaves CWD in the REAL worktree, and the following bare git ops then
+# run there — the CONFIRMED SABLE-a5a5 identity-pollution mechanism (bare
+# `git config user.name Test` writing into the real .git/config). Abort instead
+# so a misrouted invocation can never mutate the real repo. Paired with the
+# `git -C "$REPO" config` scoping below, which can never touch the real repo
+# regardless of CWD (z776 pattern, wk-fixture-isolation 55ae0ba4).
+cd_fixture() {
+  cd "$1" || { echo "FATAL: cd to fixture repo $1 failed — aborting so fixture git ops never touch the real worktree"; exit 2; }
+}
+
 # Create a real scratch git repo with one commit and a 'main' branch so
 # git -C <path> diff origin/main...HEAD works.
 FIXTURE_REPO=$(mktemp -d)
@@ -50,9 +62,9 @@ trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR"' EXIT
 
 git init -q --bare "$BARE_ORIGIN"
 git clone -q "$BARE_ORIGIN" "$FIXTURE_REPO"
-cd "$FIXTURE_REPO"
-git config user.email "test@test"
-git config user.name "Test"
+cd_fixture "$FIXTURE_REPO"
+git -C "$FIXTURE_REPO" config user.email "test@test"
+git -C "$FIXTURE_REPO" config user.name "Test"
 echo "x" > initial.txt
 git add initial.txt
 git commit -q -m "initial"
@@ -284,9 +296,9 @@ trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO"'
 
 git init -q --bare "$INT_BARE"
 git clone -q "$INT_BARE" "$INT_REPO"
-cd "$INT_REPO"
-git config user.email "int@test"
-git config user.name "Integration"
+cd_fixture "$INT_REPO"
+git -C "$INT_REPO" config user.email "int@test"
+git -C "$INT_REPO" config user.name "Integration"
 echo "a" > base.txt
 git add base.txt
 git commit -q -m "base"
@@ -416,7 +428,7 @@ rm -f "$BD_LOG"
 # --------------------------------------------------------------------------
 WT_041="$STUB_DIR/wt-041"
 git -C "$FIXTURE_REPO" worktree add -q -b wk-041 "$WT_041" >/dev/null 2>&1
-cd "$WT_041"
+cd_fixture "$WT_041"
 echo "z" > wt_change.txt
 git add wt_change.txt
 git commit -q -m "wt change on wk-041"
@@ -515,13 +527,13 @@ INTNOTIFY_BARE=$(mktemp -d)
 trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE"' EXIT
 git init -q --bare "$INTNOTIFY_BARE"
 git clone -q "$INTNOTIFY_BARE" "$INTNOTIFY_REPO"
-cd "$INTNOTIFY_REPO"
-git config user.email "t@t"; git config user.name "t"
+cd_fixture "$INTNOTIFY_REPO"
+git -C "$INTNOTIFY_REPO" config user.email "t@t"; git -C "$INTNOTIFY_REPO" config user.name "t"
 echo base > base.txt; git add base.txt; git commit -q -m base
 git push -q origin HEAD:refs/heads/main 2>/dev/null
 git checkout -q -b tmux-only
 echo i1 > i1.txt; git add i1.txt; git commit -q -m i1
-git config sable.integrationBranch tmux-only
+git -C "$INTNOTIFY_REPO" config sable.integrationBranch tmux-only
 cd - >/dev/null
 
 # (a) pushing the repo's own integration branch (resolved via repo-local
@@ -539,7 +551,7 @@ fi
 rm -f "$SABLE_MSG_LOG"
 
 # (b) a worker/feature branch pushed in the SAME repo still notifies.
-cd "$INTNOTIFY_REPO"
+cd_fixture "$INTNOTIFY_REPO"
 git checkout -q -b wk-other tmux-only
 echo w1 > w1.txt; git add w1.txt; git commit -q -m w1
 git push -q origin HEAD:refs/heads/wk-other 2>/dev/null
@@ -566,8 +578,8 @@ trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" 
 
 git init -q --bare "$PZFK_BARE"
 git clone -q "$PZFK_BARE" "$PZFK_REPO"
-cd "$PZFK_REPO"
-git config user.email "p@p"; git config user.name "p"
+cd_fixture "$PZFK_REPO"
+git -C "$PZFK_REPO" config user.email "p@p"; git -C "$PZFK_REPO" config user.name "p"
 echo base > base.txt; git add base.txt; git commit -q -m base
 git push -q origin HEAD:refs/heads/main 2>/dev/null
 
@@ -576,7 +588,7 @@ for i in 1 2 3 4 5 6 7 8 9; do echo "d$i" > "doc$i.txt"; done
 git add doc*.txt
 git commit -q -m "integration branch doc history"
 git push -q origin HEAD:refs/heads/tmux-only 2>/dev/null
-git config sable.integrationBranch tmux-only
+git -C "$PZFK_REPO" config sable.integrationBranch tmux-only
 
 git checkout -q -b wk-worker
 echo real > real_change.txt
@@ -651,8 +663,8 @@ trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" 
 
 git init -q --bare "$B06T_BARE"
 git clone -q "$B06T_BARE" "$B06T_REPO"
-cd "$B06T_REPO"
-git config user.email "b@b"; git config user.name "b"
+cd_fixture "$B06T_REPO"
+git -C "$B06T_REPO" config user.email "b@b"; git -C "$B06T_REPO" config user.name "b"
 echo base > base.txt; git add base.txt; git commit -q -m base
 B06T_MAIN=$(git symbolic-ref --short HEAD)
 git push -q origin "HEAD:refs/heads/$B06T_MAIN" 2>/dev/null
@@ -689,7 +701,7 @@ assert_bd_not_called "SABLE-b06t: empty stdout/stderr + unpushed branch does NOT
 
 # (3) Now actually push wk-b06t for real — the branch tip IS confirmable on
 # origin — and confirm notify fires.
-cd "$B06T_REPO"
+cd_fixture "$B06T_REPO"
 git push -q origin HEAD:refs/heads/wk-b06t 2>/dev/null
 cd - >/dev/null
 rm -f "$BD_LOG" "$SABLE_MSG_LOG"
