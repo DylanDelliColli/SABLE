@@ -19,8 +19,12 @@ d=json.load(open(sys.argv[1])); m=sys.argv[2]
 print(sum(1 for bl in d.get('hooks',{}).values() if isinstance(bl,list) for b in bl if isinstance(b,dict) for h in b.get('hooks',[]) if m in (h.get('command','') or '')))" "$1" "$2" 2>/dev/null || echo ERR; }
 
 # ---------- delegation: the plain install lands the full layer (no tiers) ----------
+# --from-here: this suite runs $INSTALL from whatever checkout it lives in,
+# which is routinely a linked worktree in this fleet — bypass the SABLE-s6qk
+# canonical-checkout guard here since these tests exercise install.sh's
+# delegation wiring, not the guard itself (see test-install-guard.sh for that).
 TS="$(mktemp -d)"
-HOME="$TS" bash "$INSTALL" >/tmp/ti-orch.log 2>&1
+HOME="$TS" bash "$INSTALL" --from-here >/tmp/ti-orch.log 2>&1
 SS="$TS/.claude/settings.json"
 present "$TS/.claude/hooks/multi-manager/mode-interlock.sh" "orchestration: delegate installed multi-manager hooks"
 present "$TS/.claude/sable/agents.yaml"                     "orchestration: registry installed"
@@ -40,13 +44,13 @@ printf '%s' '{"tool_name":"Bash","tool_input":{"command":"echo hi"}}' | bash "$T
 present "$TS/.claude/agents/sherlock.md" "plain install lands base agent defs"
 
 # idempotent re-run: interlock count stable
-HOME="$TS" bash "$INSTALL" >/dev/null 2>&1
+HOME="$TS" bash "$INSTALL" --from-here >/dev/null 2>&1
 [ "$(count_marker "$SS" mode-interlock.sh)" = "2" ] && pass "re-run idempotent (interlock still 2)" || fail "re-run idempotent" "count=$(count_marker "$SS" mode-interlock.sh)"
 
 # non-clobber: a pre-existing user hook survives the merge
 TN="$(mktemp -d)"; mkdir -p "$TN/.claude"
 printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash /tmp/user-own.sh"}]}]}}' > "$TN/.claude/settings.json"
-HOME="$TN" bash "$INSTALL" >/dev/null 2>&1
+HOME="$TN" bash "$INSTALL" --from-here >/dev/null 2>&1
 grep -q 'user-own.sh' "$TN/.claude/settings.json" && pass "non-clobber: pre-existing user hook survives" || fail "non-clobber: pre-existing user hook survives"
 
 # ---------- retired flags are rejected (one topology, one tier) ----------
