@@ -23,8 +23,10 @@ proves the keystrokes were injected, not that the recipient's TUI actually
 accepted them as a submitted turn — a booting pane or an Escape hitting a
 blocking gate can silently swallow them (the same boot / dropped-Enter race
 documented as SABLE-91m3 and guarded against in sable-spawn-worker). We reuse
-its ready-wait + submit-retry helpers (sable_pane_lib) here: --interrupt sends
-Escape then waits for the pane's input prompt to be ready before typing;
+its idle-wait + submit-retry helpers (sable_pane_lib) here: --interrupt sends
+Escape ONCE then waits for the pane to go IDLE (empty composer prompt AND no
+turn still running) before typing — waiting only for the prompt to reappear
+raced the interrupted turn's redraw and dropped the message (SABLE-m6is);
 submission is retried until the framed message is visible in the pane and no
 longer sitting in the input box. Only then do we print `delivered`; on
 genuine failure we print `undelivered`, AUTO-FILE the durable for-<role>
@@ -46,8 +48,8 @@ Usage:
 Env:
   SABLE_TMUX_SOCKET      tmux socket name (-L); for session isolation / tests
   CLAUDE_AGENT_NAME      default --from value
-  SABLE_MSG_READY_TIMEOUT   seconds to wait for --interrupt's post-Escape ready
-                            state (default 25; sable-spawn-worker uses the same)
+  SABLE_MSG_READY_TIMEOUT   seconds to wait for --interrupt's post-Escape IDLE
+                            state — empty prompt AND no running turn (default 25)
   SABLE_MSG_SUBMIT_TRIES    submit-retry attempts (default 8)
   SABLE_MSG_POLL_INTERVAL   seconds between retry polls (default 1.0)
 
@@ -69,9 +71,15 @@ import sys
 # sable-spawn-worker uses. Resolve next to THIS script even via a PATH symlink.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    SessionCollision, deliver_text, resolve_session, wait_for_ready,
+    SessionCollision, deliver_text, pane_busy, pane_idle, pane_ready,
+    resolve_session, wait_for_idle,
 )
 from sable_pane_lib import capture_pane as _capture_pane  # noqa: E402
+
+# pane_ready / pane_busy / pane_idle are re-exported (not called here directly —
+# wait_for_idle uses pane_idle internally) so the unit suite can assert the
+# predicates via the sable_msg module, mirroring sable-spawn-worker's re-export
+# of the pane helpers. Do not strip them as "unused" (SABLE-m6is).
 
 HEADER = "⟦SABLE-MSG⟧"
 
@@ -163,12 +171,19 @@ def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None
                     tries: int = DEFAULT_SUBMIT_TRIES,
                     interval: float = DEFAULT_POLL_INTERVAL) -> bool:
     """Deliver `message` to `pane`, VERIFIED (SABLE-bq93). --interrupt sends
-    Escape then waits for the pane's input prompt to be ready (the same boot /
-    blocking-gate race sable-spawn-worker guards against, SABLE-91m3) before
-    typing — typing into a not-yet-ready pane right after Escape is exactly how
-    the interrupt path silently dropped turns. Submission is then retried
-    (deliver_text) until `message` is visible in the pane and no longer sitting
-    in the input box. Returns False (never raises) on genuine non-delivery."""
+    Escape ONCE then waits for the pane to go IDLE — an empty composer prompt
+    AND no turn still running (wait_for_idle) — before reusing the default-mode
+    delivery path (deliver_text). Waiting only for pane_ready was the SABLE-m6is
+    bug: a busy pane shows the empty composer prompt too, so the interrupt path
+    typed WHILE the interrupted turn was still redrawing / clearing the composer
+    (spinner redraw, in-flight tool output), and the message was swallowed — two
+    consecutive live sends failed all 8 submit attempts. Deferring injection
+    until the turn actually settles matches the manual workaround that always
+    landed first try (send Escape, let the pane fall idle, then a default-mode
+    send). Submission is then retried (deliver_text) until `message` is visible
+    in the pane and no longer sitting in the input box. The Escape is sent once
+    and the submit-retry counter is unchanged. Returns False (never raises) on
+    genuine non-delivery."""
     base = tmux_base(socket)
     run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True).returncode == 0)
     capture = capture or (lambda: _capture_pane(base, pane))
@@ -176,7 +191,7 @@ def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None
     if interrupt:
         run(base + ["send-keys", "-t", pane, "Escape"])
         if ready_timeout > 0:
-            wait_for_ready(base, pane, ready_timeout, interval=interval,
+            wait_for_idle(base, pane, ready_timeout, interval=interval,
                           capture=capture, sleep=sleep, run=run)
 
     return deliver_text(base, pane, message, message, tries=tries, interval=interval,

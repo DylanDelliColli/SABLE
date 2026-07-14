@@ -37,11 +37,44 @@ def _canon(text: str) -> str:
 def pane_ready(capture: str) -> bool:
     """The TUI is ready to accept input once its input box shows an EMPTY prompt
     line (just the prompt glyph). While booting (splash) or on a blocking gate
-    screen there is no such empty line."""
+    screen there is no such empty line.
+
+    NOTE: readiness is NOT idleness. A pane running a turn ALSO shows the empty
+    composer prompt at the bottom, so pane_ready returns True mid-turn — see
+    pane_idle for the stronger "ready AND not mid-turn" predicate the interrupt
+    path needs (SABLE-m6is)."""
     for line in reversed(capture.splitlines()):
         if _clean(line) in ("❯", ">"):
             return True
     return False
+
+
+# The status line a running Claude turn renders (whatever the spinner glyph /
+# elapsed-time / token-count prefix, it always carries the "esc to interrupt"
+# affordance); an idle pane never shows it. This is the busy signal pane_ready
+# is blind to (SABLE-m6is).
+_BUSY_MARKERS = ("esc to interrupt",)
+
+
+def pane_busy(capture: str) -> bool:
+    """True while the pane is MID-TURN. Control bytes are stripped and all
+    whitespace collapsed to single spaces before matching, so a status line
+    padded/reflowed by box-drawing or a variable-width spinner prefix still
+    matches (SABLE-m6is). The composer prompt is shown DURING a turn too, which
+    is exactly why pane_ready alone reported a busy pane 'ready' and the
+    interrupt path typed into a pane still redrawing."""
+    hay = " ".join(_CTRL_RE.sub(" ", capture).split()).lower()
+    return any(marker in hay for marker in _BUSY_MARKERS)
+
+
+def pane_idle(capture: str) -> bool:
+    """The pane is ready for a NEW submitted turn: its composer shows the empty
+    prompt (pane_ready) AND no turn is currently running (not pane_busy).
+    --interrupt defers typing until THIS holds, not merely until pane_ready:
+    a busy pane shows the empty composer prompt too, so typing on pane_ready
+    alone raced the spinner redraw / composer-clear of the interrupted turn and
+    silently dropped the message (SABLE-m6is)."""
+    return pane_ready(capture) and not pane_busy(capture)
 
 
 def accept_startup_gate(capture: str) -> str | None:
@@ -100,6 +133,35 @@ def wait_for_ready(base, pane, timeout, interval=0.5, capture=None, sleep=None,
     while waited < timeout:
         cap = capture()
         if pane_ready(cap):
+            return True
+        key = accept_startup_gate(cap)
+        if key is not None:
+            run(base + ["send-keys", "-t", pane, key])
+            run(base + ["send-keys", "-t", pane, "Enter"])
+        sleep(interval)
+        waited += interval
+    return False
+
+
+def wait_for_idle(base, pane, timeout, interval=0.5, capture=None, sleep=None,
+                  run=None) -> bool:
+    """Poll until the pane is IDLE (empty prompt AND no running turn), accepting
+    any blocking startup gate (bypass warning / trust dialog) on the way exactly
+    as wait_for_ready does — a freshly spawned pane may be mid-kick-turn or
+    sitting on a gate (SABLE-m6is noted the fresh-spawn window as a second busy
+    state). sable-msg --interrupt calls this AFTER sending a single Escape:
+    injection is deferred until the interrupted turn has actually settled, so
+    the message is not swallowed by a still-busy pane's redraw. Returns True once
+    idle; False if the timeout elapses first (the caller then attempts delivery
+    anyway and degrades to the verified-failure fallback — never worse than the
+    pre-idle-wait behavior)."""
+    capture = capture or (lambda: capture_pane(base, pane))
+    sleep = sleep or time.sleep
+    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True).returncode == 0)
+    waited = 0.0
+    while waited < timeout:
+        cap = capture()
+        if pane_idle(cap):
             return True
         key = accept_startup_gate(cap)
         if key is not None:
