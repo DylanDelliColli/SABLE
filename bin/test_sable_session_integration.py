@@ -101,3 +101,22 @@ def test_legacy_session_claimed_by_its_own_repo_only(tmp_path, sock):
     ra, rb = run_cli(a, sock), run_cli(b, sock)
     assert ra.stdout.strip() == "sable"        # a's fleet stays addressable
     assert rb.stdout.strip() == "sable-beta"   # b never touches a's fleet
+
+
+def test_unrelated_prefix_session_does_not_spuriously_claim_legacy_name(tmp_path, sock):
+    # SABLE-hvwk: tmux resolves a bare has-session -t target with prefix/
+    # fnmatch semantics when no exact match exists, and LEGACY_SESSION
+    # ('sable') is a prefix of every per-repo derived name (sable-<repo>).
+    # Reproduce the exact hazard the bead describes: a DIFFERENT repo's
+    # derived fleet session exists (no session literally named 'sable'), and
+    # -- the coincidence that masked this in practice -- its pane cwd happens
+    # to sit inside THIS repo's root too. Before the fix, has-session -t sable
+    # prefix-matches 'sable-somefleet', _panes_under_root then also passes on
+    # the coincidental cwd match, and resolve_session wrongly returns the
+    # legacy name instead of gamma's own derived session.
+    g = make_repo(tmp_path, "gamma")
+    _tmux(sock, "new-session", "-d", "-s", "sable-somefleet", "-x", "80", "-y", "24",
+          "-c", str(g), "bash", "--noprofile", "--norc")
+    r = run_cli(g, sock)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "sable-gamma"
