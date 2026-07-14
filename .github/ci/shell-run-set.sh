@@ -30,6 +30,7 @@ ALLOW=(
   test-columbo-quick-mode.sh
   test-concurrent-sessions.sh
   test-full-ingestion.sh
+  test-lib-git-sandbox.sh
   test-lib-identity.sh
   test-lib-identity-isolation.sh
   test-lib-mode-path.sh
