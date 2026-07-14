@@ -444,6 +444,115 @@ def test_second_spawn_for_in_progress_bead_is_refused(sock):
         assert len(matches) == 1, listing
 
 
+# --- SABLE-676c: claim-then-hold first dispatch must succeed ------------------
+
+
+def test_claim_then_hold_first_dispatch_succeeds(sock):
+    """SABLE-676c: a bead a manager CLAIMED earlier (already IN_PROGRESS) to mark
+    lane ownership during a coordination hold — with NO worker pane and NO
+    worktree for it — is this bead's OWN first dispatch, not a duplicate. The old
+    already_in_progress_check refused it (any in_progress -> exit 5); the fix lets
+    it spawn end-to-end: governance passes, worker window is created + tagged, and
+    the dispatch file is written. Governance is ON (no --skip-governance) so the
+    claim-then-hold guard is actually exercised."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-hold-1"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "in_progress", "assignee": "optimus"}  # claimed during the hold
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+        env.pop("CLAUDE_AGENT_NAME", None)  # empty lane -> preempt is a no-op
+
+        # --worktree override => worktree-evidence does not fire (intentional
+        # reuse), and no pane is tagged for the bead => no pane-evidence: the
+        # bare in_progress claim must PASS.
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        time.sleep(0.5)
+
+        # the dispatch prompt file was written for the bead
+        assert (Path(dd) / f"{bead_id}.md").exists()
+
+        # a worker pane exists, tagged for the bead and running
+        listing = _tmux(sock, "list-panes", "-a", "-F",
+                        "#{@sable_role} #{@sable_bead} #{@sable_status}").stdout
+        assert any(
+            line.startswith("worker") and bead_id in line and "running" in line
+            for line in listing.splitlines()
+        ), listing
+
+
+def test_claim_then_hold_blocks_when_derived_worktree_exists(sock):
+    """SABLE-676c inverse: an IN_PROGRESS bead whose DERIVED wk-<scope> worktree
+    already exists (a prior dispatch cut it) IS a duplicate and stays refused
+    (exit 5), even with no live pane — worktree-evidence alone blocks. Pre-creates
+    the sibling wk-<scope> dir the dispatch would use, then dispatches WITHOUT
+    --worktree; the block fires in governance before any worktree creation, so no
+    real git worktree is made."""
+    repo = Path(__file__).resolve().parent.parent  # the SABLE repo root
+    scope = f"sw-hold-{uuid.uuid4().hex[:8]}"
+    derived = repo.parent / f"wk-{scope}"  # sibling of the repo (SABLE-bldh.11)
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd:
+        bead_id = "FAKE-hold-2"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "in_progress", "assignee": "optimus"}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "SABLE_MAX_LOAD_PER_CORE": "0",
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+        env.pop("CLAUDE_AGENT_NAME", None)
+        try:
+            derived.mkdir()  # a prior dispatch's leftover worktree dir
+            r = subprocess.run(
+                ["python3", str(BIN), bead_id, "--scope", scope, "--model", "haiku"],
+                capture_output=True, text=True, env=env, cwd=str(repo),
+            )
+            assert r.returncode == 5, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+            assert "duplicate-dispatch" in r.stderr
+            assert "worktree" in r.stderr
+            # blocked before any spawn: no worker window, no dispatch file
+            wins = _tmux(sock, "list-windows", "-t", "sable",
+                         "-F", "#{window_name}").stdout
+            assert "worker-fake-hold-2" not in wins
+            assert not (Path(dd) / f"{bead_id}.md").exists()
+        finally:
+            if derived.exists():
+                shutil.rmtree(derived, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

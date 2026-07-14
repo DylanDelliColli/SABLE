@@ -140,19 +140,81 @@ def parse_bead_list(raw: str) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
-def already_in_progress_check(bead: dict) -> str | None:
-    """Re-homed + sharpened pre-dispatch-overlap (SABLE-bldh.8): refuse a
-    SECOND spawn for a bead that is already IN_PROGRESS — the bead trivially
-    'overlaps' with itself, and a second worker racing the first is a real
-    duplicate-work/double-push hazard the old prompt-parsing hook never
-    caught (it only ever compared DIFFERENT bead IDs against each other).
-    Returns an error string to block, or None to allow."""
+# Tab-delimited @sable_bead + @sable_status dump for dispatch-evidence detection
+# (SABLE-676c) — same delimiter rationale as _CAP_FORMAT (SABLE-exab: empty
+# fields collapse under space-joining, shifting columns).
+_BEAD_FORMAT = "#{@sable_bead}\t#{@sable_status}"
+
+
+def bead_pane_tagged(listing: str, bead_id: str) -> bool:
+    """True if a RUNNING pane in `listing` is tagged @sable_bead == bead_id —
+    hard evidence a worker is already dispatched for this bead. `listing` is a
+    `list-panes -F _BEAD_FORMAT` dump. Only a RUNNING pane counts: a done/stale
+    pane (SABLE-qq6r) has released its worker, and when the bead is still
+    in_progress the durable duplicate signal is the leftover worktree, not the
+    reaped pane. A blank/transient status is likewise NOT evidence — being strict
+    here is what stops a bare claim-then-hold claim from false-positiving. Panes
+    duplicated across grouped sessions (SABLE-b574) are harmless: any match ->
+    True."""
+    for line in listing.splitlines():
+        parts = line.split("\t")
+        pane_bead = parts[0] if parts else ""
+        status = parts[1] if len(parts) >= 2 else ""
+        if pane_bead == bead_id and status == "running":
+            return True
+    return False
+
+
+def prospective_worktree_path(bead_id: str, scope: str | None,
+                              worktree_override: str | None, toplevel: str) -> str:
+    """The DERIVED worktree path a FRESH dispatch would create for this bead
+    (`bd worktree create wk-<scope|bead>`, sibling of the repo — SABLE-bldh.11).
+    Empty when the caller passed an explicit --worktree (an intentional reuse /
+    revision re-spawn, NOT a duplicate — worktree-evidence must not fire on it)
+    or when the repo toplevel can't be resolved."""
+    if worktree_override or not toplevel:
+        return ""
+    return resolve_worktree_path(toplevel, worktree_name(bead_id, scope))
+
+
+def worktree_dispatch_exists(path: str) -> bool:
+    """True if the derived worktree a fresh dispatch would create already exists
+    on disk — evidence a prior dispatch already cut it. Empty path => no
+    evidence."""
+    return bool(path) and os.path.isdir(path)
+
+
+def already_in_progress_check(bead: dict, pane_evidence: bool,
+                              worktree_evidence: bool) -> str | None:
+    """Refuse a SECOND spawn for a bead already IN_PROGRESS — but ONLY when
+    DISPATCH EVIDENCE exists (SABLE-676c). Evidence is a running worker pane
+    tagged with the bead id (`bead_pane_tagged`) or an existing derived worktree
+    (`worktree_dispatch_exists`).
+
+    A bare IN_PROGRESS claim with NEITHER is the manager claim-then-hold pattern:
+    a manager claims a bead to mark lane ownership during a coordination hold,
+    then spawns when the hold lifts (the documented claim-THEN-spawn protocol).
+    The old check (re-homed pre-dispatch-overlap, SABLE-bldh.8) refused that first
+    dispatch as a duplicate purely because the bead was in_progress with no worker
+    anywhere — the SABLE-676c false positive that forced the racy
+    `bd update --status=open` workaround. Racing a live worker (or a leftover
+    worktree from a died/stalled one) is still a real duplicate-work/double-push
+    hazard and stays blocked. Returns an error string to block, or None to allow."""
     if bead.get("status") != "in_progress":
         return None
+    if not (pane_evidence or worktree_evidence):
+        return None
     assignee = bead.get("assignee") or "unassigned"
-    return (f"{bead.get('id', '?')} is already IN_PROGRESS (assignee: {assignee}) — "
-            "refusing a second spawn for the same bead. If the prior worker died "
-            "or stalled, close/reset its worktree first.")
+    signals = []
+    if pane_evidence:
+        signals.append("a running worker pane tagged with this bead")
+    if worktree_evidence:
+        signals.append("an existing worktree for this bead")
+    return (f"{bead.get('id', '?')} is already IN_PROGRESS (assignee: {assignee}) "
+            f"with dispatch evidence — {'; '.join(signals)} — refusing a second "
+            "spawn for the same bead. If the prior worker died or stalled, "
+            "close/reset its worktree first. (A bare claim with no worker pane and "
+            "no worktree is the claim-then-hold pattern and is allowed.)")
 
 
 def extract_wip_claims(text: str) -> set[str]:
@@ -511,6 +573,16 @@ def _run(args: list[str]) -> str:
     return subprocess.run(args, capture_output=True, text=True, check=True).stdout
 
 
+def _repo_toplevel() -> str:
+    """The invoking CWD's git worktree root, or "" if not resolvable — used to
+    derive the prospective wk-<scope> worktree path for dispatch-evidence
+    detection (SABLE-676c). Non-raising, unlike _run: absence of a toplevel just
+    means no worktree-evidence."""
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sable-spawn-worker")
     p.add_argument("bead_id")
@@ -570,7 +642,21 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"sable-spawn-worker: model-check blocked — {err}\n")
             return 3
 
-        dup_err = already_in_progress_check(bead)
+        # SABLE-676c: an IN_PROGRESS bead is a duplicate ONLY when dispatch
+        # evidence exists — a RUNNING worker pane tagged with the bead, or the
+        # derived wk-<scope> worktree already on disk. A bare claim with neither
+        # is the manager claim-then-hold pattern (this bead's OWN first dispatch)
+        # and must pass, not be refused as a duplicate.
+        try:
+            evidence_listing = _run(base + ["list-panes", "-s", "-t", ns.session,
+                                            "-F", _BEAD_FORMAT])
+        except subprocess.CalledProcessError:
+            evidence_listing = ""  # no session yet -> no pane evidence; fail open
+        pane_ev = bead_pane_tagged(evidence_listing, bid)
+        tl = "" if ns.worktree else _repo_toplevel()
+        wt_ev = worktree_dispatch_exists(
+            prospective_worktree_path(bid, ns.scope, ns.worktree, tl))
+        dup_err = already_in_progress_check(bead, pane_ev, wt_ev)
         if dup_err:
             sys.stderr.write(f"sable-spawn-worker: duplicate-dispatch blocked — {dup_err}\n")
             return 5
