@@ -43,6 +43,34 @@ lock** — nothing stops you, but skipping it means execution surfaces questions
 the human should have answered during planning, which is exactly what staged
 planning exists to prevent.
 
+## 0.5 Docker Supabase preflight (hard gate, SABLE-n5rb)
+
+Before any lane touches Docker Supabase, run:
+
+```bash
+sable-docker-preflight
+```
+
+This detects the dockerd/containerd ghost-container desync class that
+corrupted a shared pgdata volume after the 2026-07-07 WSL hard reboot
+(forensics + recovery runbook: market-brief-package-9scm) — containerd can
+revive pre-crash containers as tasks dockerd no longer tracks while dockerd
+separately starts its own visible generation, and both postgres processes end
+up writing the SAME volume. This recurs on every hard reboot/freeze, so it
+must be caught here, before `sable-spawn-manager --all` lets any worker near
+the db.
+
+- **Exit 0 — clean.** Proceed to step 1.
+- **Nonzero because docker/Supabase isn't part of this project** (stderr/JSON
+  errors say `docker not found` or `no supabase_db_* container found`) — not
+  applicable here, proceed to step 1.
+- **Any other nonzero — HARD STOP.** Do not flip the mode-state, do not spawn
+  managers. Paste the diagnosis to the operator (which of phantom
+  containers / ghost cgroup tasks / dual postmaster fired, and the specific
+  IDs/timestamps reported) and point at the runbook the tool prints
+  (market-brief-package-9scm). Wait for the operator to run recovery before
+  retrying this step.
+
 ## 1. Flip the mode-state
 
 Run exactly one command:
