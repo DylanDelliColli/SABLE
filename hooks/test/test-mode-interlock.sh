@@ -110,6 +110,12 @@ assert_deny  "planning blocks chuck spawn"    'CLAUDE_AGENT_NAME=chuck CLAUDE_AG
 assert_deny  "planning blocks alias optimus"  'optimus'
 assert_deny  "planning blocks git push"       'git push'
 assert_deny  "planning blocks git push origin" 'git push origin personal-tooling'
+# SABLE-sxhx: a real push chained via an UNSPACED separator must not slip the
+# planning-mode deny leg (the old bespoke tokenizer split these; the delegated
+# sable_is_git_push regressed until punctuation_chars tokenization).
+assert_deny  "planning blocks unspaced 'git push;ls'"  'git push;ls'
+assert_deny  "planning blocks unspaced 'git push&&ls'" 'git push&&ls'
+assert_deny  "planning blocks unspaced 'ls;git push'"  'ls;git push'
 assert_allow "planning allows producer spawn" 'CLAUDE_AGENT_NAME=sherlock CLAUDE_AGENT_ROLE=auditor claude src/auth'
 assert_allow "planning allows benign command" 'ls -la'
 assert_allow "planning allows bd commands"    'bd ready'
@@ -587,6 +593,21 @@ assert_deny  "f5m0: planning still blocks git -C DIR push"              'git -C 
 assert_deny  "f5m0: planning still blocks env-prefixed git push"        'GIT_SSH_COMMAND=x git push origin wk-y'
 assert_deny  "f5m0: planning still blocks chained git push after bd create" \
   'bd create --type=task --title="x" && git push'
+
+# ---------- SABLE-qs3r: git push on its OWN LINE of a multi-line command ----------
+# f5m0's delegation to sable_is_git_push regressed newline handling: shlex.split
+# treats a newline as plain whitespace, so a push on line 2+ was walked as if
+# mid-command and MISSED — a real push slipped the planning-mode gate. The gate
+# must now DENY a push on its own line while still ALLOWING multi-line prose /
+# non-push subcommands that merely name push.
+assert_deny  "qs3r: planning blocks git push on line 2 of a multi-line command" \
+  "$(printf 'echo preparing the remote\ngit push origin main')"
+assert_deny  "qs3r: planning blocks git -C DIR push on its own line" \
+  "$(printf 'bd update x --claim\ngit -C /home/ddc/dev-environment/wk-x push')"
+assert_allow "qs3r: planning allows multi-line command with no real push" \
+  "$(printf 'echo one\ngit status\ngit log --grep push')"
+assert_allow "qs3r: planning allows multi-line prose that only names git push" \
+  "$(printf 'bd create --type=task --title=x\nsable-note "remember to git push after execute"')"
 
 # ykij def2: sable-mode exemption anchored to a real LEADING sable-mode command.
 # A bd create whose description NAMES sable-mode must NOT bypass the backlog gate.
