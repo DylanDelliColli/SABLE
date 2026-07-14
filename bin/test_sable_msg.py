@@ -718,6 +718,129 @@ def test_main_busy_delayed_land_files_no_fallback_bead_h0jw(monkeypatch):
     assert filed == [], "a busy-at-t0 send that eventually lands must not file a noise bead"
 
 
+# --- queued-composer footer + idempotent retry (SABLE-msxj) -----------------
+# Recurrence of the h0jw class AFTER h0jw merged: a busy-at-t0 send that
+# ACTUALLY queued (visible in the composer with the real Claude-TUI's 'Press up
+# to edit queued messages' footer) was still scored as failure. h0jw's signals
+# (submitted_own_turn branches 1-2) assumed a queued line gets hoisted ABOVE the
+# composer with the box cleared — this TUI posture instead leaves the line IN
+# the composer/box, so neither branch fires and the poll budget timed out on a
+# send that had, in fact, already succeeded (SABLE-l8a5: closed false-fail,
+# evidence the queued line was live in the pane the whole time). Worse, the
+# caller then retried the call, and retyping into a still-busy pane whose
+# earlier attempt's line was STILL queued produced a literal duplicate turn.
+
+
+def test_pane_has_queued_message_true_with_footer_false_without():
+    msg = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    with_footer = f"❯ {msg}\n  Press up to edit queued messages\n  ddc@host:~/wt"
+    assert sable_pane_lib.pane_has_queued_message(with_footer, msg) is True
+    # same text, no footer -> not proof of a queued-delivered send
+    no_footer = f"❯ {msg}\n  ddc@host:~/wt"
+    assert sable_pane_lib.pane_has_queued_message(no_footer, msg) is False
+    # footer present but OUR text absent -> some OTHER queued line, not ours
+    other_queued = "❯ some other line\n  Press up to edit queued messages\n  ddc@host:~/wt"
+    assert sable_pane_lib.pane_has_queued_message(other_queued, msg) is False
+
+
+def test_submitted_own_turn_accepts_queued_footer_even_when_box_scan_fails_closed_msxj():
+    # THE bead's exact posture: the message sits IN the composer/box (never
+    # "leaves" it, so dispatch_landed's box-based branches inside
+    # submitted_own_turn fail closed here) but the queued-messages footer is
+    # independent proof that it landed as a delivered-queued send.
+    msg = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    queued_in_box = f"❯ {msg}\n  Press up to edit queued messages\n  ddc@host:~/wt"
+    # proof the box-scan alone would fail closed here (the exact SABLE-l8a5 trap)
+    assert sable_pane_lib.dispatch_landed(queued_in_box, msg) is False
+    assert sable_pane_lib.submitted_own_turn(queued_in_box, msg) is True
+
+
+def test_deliver_message_busy_at_t0_queued_footer_confirms_without_waiting_out_budget_msxj():
+    # End-to-end through deliver_message: busy at t0, and the FIRST poll after
+    # typing already shows the queued footer -> must confirm right away, not
+    # exhaust the tries budget the way SABLE-l8a5 did (the running turn here
+    # never ends, so ANY confirmation must come from the footer signal alone).
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    other_turn = "● Running the auth refactor…\n✻ Thinking… (12s · esc to interrupt)"
+    state = {"type_calls": 0}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["type_calls"] += 1
+        return True
+
+    def capture():
+        if state["type_calls"] == 0:
+            return f"{other_turn}\n❯ \n  ddc@host:~/wt"          # busy at t0
+        # queued in the composer, footer shown, the OTHER turn never ends
+        return (f"❯ {message}\n  Press up to edit queued messages\n"
+                f"{other_turn}\n  ddc@host:~/wt")
+
+    landed = sable_msg.deliver_message(
+        "%47", message, interrupt=False, run=run, capture=capture,
+        sleep=lambda s: None, tries=8, interval=0.01,
+    )
+    assert landed is True
+    assert state["type_calls"] == 1, "must type exactly once, not double-queue"
+
+
+def test_deliver_text_busy_at_t0_skips_retype_when_message_already_pending_msxj():
+    # THE double-queue repro: deliver_text is invoked while the pane is BUSY and
+    # a PRIOR attempt's line is already sitting queued in the composer (e.g. a
+    # caller retrying after an earlier call reported false failure). The retry
+    # must recognize the pre-existing text and skip typing it again -- a single
+    # queued copy, not two.
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    other_turn = "● Running the auth refactor…\n✻ Thinking… (12s · esc to interrupt)"
+    # t0: busy, AND our line from a prior attempt is already visible, queued.
+    pending = f"{message}\n{other_turn}\n❯ \n  ddc@host:~/wt"
+    state = {"type_calls": 0, "polls": 0}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["type_calls"] += 1
+        return True
+
+    def capture():
+        state["polls"] += 1
+        if state["polls"] < 3:
+            return pending
+        # the running turn ends and our (already-queued) line submits as its own
+        return f"● done\n❯ {message}\n✻ Thinking… (2s · esc to interrupt)"
+
+    landed = sable_pane_lib.deliver_text(
+        ["tmux"], "%47", message, message,
+        tries=8, interval=0.01, run=run, capture=capture, sleep=lambda s: None,
+    )
+    assert landed is True
+    assert state["type_calls"] == 0, "prior attempt's text already queued -- must not retype"
+
+
+def test_deliver_text_idle_at_t0_always_types_even_if_snippet_coincidentally_visible_msxj():
+    # The idempotent-retry guard is scoped to the BUSY-at-t0 path only (the
+    # scenario the bead actually reports). An IDLE pane must always type
+    # normally -- this is the common send path and must not regress.
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: status?"
+    state = {"type_calls": 0}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["type_calls"] += 1
+        return True
+
+    def capture():
+        if state["type_calls"] == 0:
+            return "● earlier turn output\n● done\n❯ \n  ddc@host:~/wt"  # idle at t0
+        return f"{message}\n✻ Thinking… (2s · esc to interrupt)\n❯ \n  ddc@host:~/wt"
+
+    landed = sable_pane_lib.deliver_text(
+        ["tmux"], "%47", message, message,
+        tries=4, interval=0.01, run=run, capture=capture, sleep=lambda s: None,
+    )
+    assert landed is True
+    assert state["type_calls"] == 1
+
+
 # --- interrupt idle-wait state machine (SABLE-m6is) -------------------------
 # A busy Claude turn STILL shows the empty composer prompt at the bottom, so
 # pane_ready fired mid-turn and --interrupt typed into a pane still redrawing the
