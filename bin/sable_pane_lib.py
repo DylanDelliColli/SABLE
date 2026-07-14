@@ -99,7 +99,18 @@ def dispatch_landed(capture: str, snippet: str) -> bool:
     "landed" for any wrapped message, so no Enter was ever resent and the text
     sat unsubmitted while the sender reported delivered). All comparisons are
     control-char/whitespace-insensitive (_canon): wraps may split mid-word, and
-    a stray control byte must not hide the box entirely (SABLE-zaum)."""
+    a stray control byte must not hide the box entirely (SABLE-zaum).
+
+    When NO composer glyph is locatable at all (box_start is None) we CANNOT
+    prove the snippet left the input box, so we do NOT claim it landed
+    (SABLE-wvk9). The prior `return True` here was the visible-versus-submitted
+    conflation optimus flagged: a booting/gated pane, or a busy pane whose
+    prompt line was momentarily obscured by a spinner/reflow at capture time,
+    can show the typed text while it sits UNSUBMITTED as pending input — the
+    exact silent-swallow signature behind two stranded handoffs (text left in
+    worker composers, delivery assumed successful). Failing closed here makes
+    deliver_text keep retrying and ultimately report non-delivery, which routes
+    to the durable inbox-bead fallback instead of a phantom 'delivered'."""
     want = _canon(snippet)
     if not want or want not in _canon(capture):
         return False
@@ -109,7 +120,7 @@ def dispatch_landed(capture: str, snippet: str) -> bool:
         if _clean(line).startswith(("❯", ">")):
             box_start = i
     if box_start is None:
-        return True
+        return False
     return want not in _canon("\n".join(lines[box_start:]))
 
 
