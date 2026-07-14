@@ -840,6 +840,128 @@ else
 fi
 
 # --------------------------------------------------------------------------
+# SABLE-5hcg (ADDENDUM / HEAD-VERIFY 2026-07-14): the durable fallback path
+# must not go dark two ways it used to: (1) 'bd create ... || true' swallowed
+# a failed bd invocation on the ONE path that's supposed to be the safety net,
+# and (2) an empty diff vs BASE_BRANCH silent-exited before either handoff
+# path ran at all. Both must now be loud instead of silent.
+# --------------------------------------------------------------------------
+
+# Fault-injectable bd stub for this section only, restored to the plain stub
+# at the end. `bd create` behavior is driven by BD_STUB_FAIL_MODE:
+#   always_fail — every call exits 1 (models a persistent bd/dolt outage)
+#   fail_once   — first call exits 1, second (the retry) succeeds (models a
+#                 transient lock/hiccup) — tracked via BD_STUB_COUNT_FILE
+#                 since each invocation is a fresh process.
+# Any other bd subcommand (e.g. the `list` OVERLAPS query) falls through to
+# the same log-and-succeed behavior as the plain stub.
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "create" ]; then
+  case "${BD_STUB_FAIL_MODE:-}" in
+    always_fail)
+      echo "bd: stub simulated persistent failure" >&2
+      exit 1
+      ;;
+    fail_once)
+      COUNT_FILE="${BD_STUB_COUNT_FILE:?}"
+      N=$(( $(cat "$COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
+      echo "$N" > "$COUNT_FILE"
+      if [ "$N" -eq 1 ]; then
+        echo "bd: stub simulated transient failure (attempt $N)" >&2
+        exit 1
+      fi
+      ;;
+  esac
+fi
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+# (a) bd create fails on every attempt — retry doesn't help. The hook must
+# surface a loud, non-swallowed diagnostic (not a bare '|| true' silence) and
+# still exit 0, since a PostToolUse hook must not fail the triggering push.
+# SABLE_MERGE_NOTIFY_VIA_MSG=0 routes straight to the fallback bd create path
+# deterministically (same knob exercised in the (c) case above).
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+FIVEHCG_A_OUT=$(run_hook "$MGR_ENV SABLE_MERGE_NOTIFY_VIA_MSG=0 BD_STUB_FAIL_MODE=always_fail" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")"); FIVEHCG_A_RC=$?
+if [ "$FIVEHCG_A_RC" -eq 0 ]; then
+  pass "SABLE-5hcg: hook still exits 0 when bd create fails persistently"
+else
+  fail "SABLE-5hcg: hook still exits 0 when bd create fails persistently" "exit=$FIVEHCG_A_RC"
+fi
+if printf '%s' "$FIVEHCG_A_OUT" | grep -qi 'FAILED to file durable for-chuck bead'; then
+  pass "SABLE-5hcg: persistent bd create failure is surfaced loudly, not swallowed by '|| true'"
+else
+  fail "SABLE-5hcg: persistent bd create failure is surfaced loudly, not swallowed by '|| true'" "STDOUT: $FIVEHCG_A_OUT"
+fi
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+
+# (b) bd create fails once (transient) then succeeds on retry: the retry
+# recovers — for-chuck bead ends up filed, and no FAILED diagnostic prints.
+BD_STUB_COUNT_FILE="$STUB_DIR/bd-count-$$"
+rm -f "$BD_STUB_COUNT_FILE"
+FIVEHCG_B_OUT=$(run_hook "$MGR_ENV SABLE_MERGE_NOTIFY_VIA_MSG=0 BD_STUB_FAIL_MODE=fail_once BD_STUB_COUNT_FILE=$BD_STUB_COUNT_FILE" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")")
+assert_bd_called "SABLE-5hcg: transient bd create failure recovers via retry — for-chuck bead filed"
+if printf '%s' "$FIVEHCG_B_OUT" | grep -qi 'FAILED to file durable'; then
+  fail "SABLE-5hcg: retry success does not print a FAILED diagnostic" "STDOUT: $FIVEHCG_B_OUT"
+else
+  pass "SABLE-5hcg: retry success does not print a FAILED diagnostic"
+fi
+rm -f "$BD_STUB_COUNT_FILE" "$SABLE_MSG_LOG"
+
+# Restore the plain bd stub for hermeticity for any tests appended later.
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+# (c) Empty diff vs BASE_BRANCH: a branch pushed with zero commits ahead of
+# its base (confirmable on origin, so it clears the SABLE-b06t ls-remote
+# check, but 'git diff BASE...HEAD' comes up empty). Must emit a loud skip
+# line instead of the old bare '[ -z "$FILES" ] && exit 0' silent exit, and
+# must not file a for-chuck bead (there is genuinely nothing to review).
+EMPTYDIFF_BARE=$(mktemp -d)
+EMPTYDIFF_REPO=$(mktemp -d)
+trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO"' EXIT
+
+git init -q --bare "$EMPTYDIFF_BARE"
+git clone -q "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO"
+cd_fixture "$EMPTYDIFF_REPO"
+git -C "$EMPTYDIFF_REPO" config user.email "ed@ed"; git -C "$EMPTYDIFF_REPO" config user.name "ed"
+echo base > base.txt; git add base.txt; git commit -q -m base
+EMPTYDIFF_MAIN=$(git symbolic-ref --short HEAD)
+git push -q "$EMPTYDIFF_BARE" "HEAD:refs/heads/$EMPTYDIFF_MAIN" 2>/dev/null
+git update-ref "refs/remotes/origin/$EMPTYDIFF_MAIN" HEAD
+# Also publish under 'main' explicitly so default BASE_BRANCH resolution has
+# a real diff target even when the repo's default branch isn't named 'main'
+# (mirrors the FIXTURE_REPO/INT_REPO/B06T_REPO fixtures above).
+git push -q "$EMPTYDIFF_BARE" HEAD:refs/heads/main 2>/dev/null
+git update-ref refs/remotes/origin/main HEAD
+# A branch cut from the same commit, with no new commits of its own — the
+# diff vs BASE_BRANCH is empty, but the branch itself IS confirmably on
+# origin (ls-remote tip matches local HEAD), so it clears every earlier guard.
+git checkout -q -b wk-emptydiff
+git push -q "$EMPTYDIFF_BARE" HEAD:refs/heads/wk-emptydiff 2>/dev/null
+git update-ref refs/remotes/origin/wk-emptydiff HEAD
+cd - >/dev/null
+
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+EMPTYDIFF_INPUT=$(make_post_input "git push" "$EMPTYDIFF_REPO")
+CTX_EMPTYDIFF=$(run_hook "$MGR_ENV" "$EMPTYDIFF_INPUT")
+if printf '%s' "$CTX_EMPTYDIFF" | grep -qi 'skipping — no file diff'; then
+  pass "SABLE-5hcg: empty-diff push emits a loud skip line instead of a silent exit"
+else
+  fail "SABLE-5hcg: empty-diff push emits a loud skip line instead of a silent exit" "STDOUT: $CTX_EMPTYDIFF"
+fi
+assert_bd_not_called "SABLE-5hcg: empty-diff push files no for-chuck bead (nothing to review)"
+
+# --------------------------------------------------------------------------
 # Summary
 # --------------------------------------------------------------------------
 

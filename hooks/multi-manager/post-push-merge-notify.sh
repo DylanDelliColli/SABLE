@@ -143,7 +143,14 @@ LOCAL_HEAD=$(git -C "$CWD" rev-parse HEAD 2>/dev/null || echo "")
 [ "$REMOTE_TIP" != "$LOCAL_HEAD" ] && exit 0
 
 FILES=$(git -C "$CWD" diff "$BASE_BRANCH"...HEAD --name-only 2>/dev/null | head -50)
-[ -z "$FILES" ] && exit 0
+# SABLE-5hcg addendum: an empty diff used to silent-exit here, so a push whose
+# diff vs the integration base came up empty (e.g. a misresolved BASE_BRANCH)
+# left no trace anywhere. Loud skip line instead — nothing to hand off to
+# chuck, but the reason is now visible to the pushing agent, not swallowed.
+if [ -z "$FILES" ]; then
+  echo "post-push-merge-notify: skipping — no file diff between ${BASE_BRANCH} and HEAD on branch ${BRANCH}; nothing to hand off to chuck. If unexpected, check SABLE_BASE_BRANCH / integration-branch resolution."
+  exit 0
+fi
 
 # Try to detect PR URL via gh (best-effort, optional)
 PR_URL=$(gh pr view --json url -q .url 2>/dev/null || echo "")
@@ -298,17 +305,38 @@ DESC_LINES="${DESC_LINES}
 
 TITLE="Review PR from ${SABLE_ID_NAME}: ${BRANCH}"
 
-bd create \
+# SABLE-5hcg addendum: bd create used to end in a bare '|| true', so a failed
+# bd invocation (dolt hiccup, transient lock, etc.) left the for-chuck channel
+# dark even on THIS fallback path — the one thing standing between a pushed
+# branch and a stranded merge. Capture the exit code and output, retry once
+# (transient errors are common under fleet load), and if it still fails, say
+# so loudly instead of swallowing it.
+BD_CREATE_RC=0
+BD_CREATE_OUT=$(bd create \
   --title "$TITLE" \
   --type=task \
   --priority=2 \
   --labels=for-chuck,coord \
-  --description "$DESC_LINES" >/dev/null 2>&1 || true
+  --description "$DESC_LINES" 2>&1) || BD_CREATE_RC=$?
 
-# Context line so the durable fallback is never silent again (SABLE-wvk9). A
-# PostToolUse hook's stdout surfaces to the agent whose Bash push triggered it,
-# so this records — for the worker and any log — WHY the message path did not
-# carry the handoff and that the durable for-chuck bead now covers the merge.
-echo "post-push-merge-notify: ${FALLBACK_REASON:-message delivery not confirmed} — filed durable for-chuck fallback bead (label for-chuck) for branch ${BRANCH}; chuck merges it from the pool."
+if [ "$BD_CREATE_RC" -ne 0 ]; then
+  BD_CREATE_RC=0
+  BD_CREATE_OUT=$(bd create \
+    --title "$TITLE" \
+    --type=task \
+    --priority=2 \
+    --labels=for-chuck,coord \
+    --description "$DESC_LINES" 2>&1) || BD_CREATE_RC=$?
+fi
+
+if [ "$BD_CREATE_RC" -ne 0 ]; then
+  echo "post-push-merge-notify: FAILED to file durable for-chuck bead after retry (bd exit ${BD_CREATE_RC}) for branch ${BRANCH} — merge request may be stranded; file it manually with label for-chuck. bd output: ${BD_CREATE_OUT}"
+else
+  # Context line so the durable fallback is never silent again (SABLE-wvk9). A
+  # PostToolUse hook's stdout surfaces to the agent whose Bash push triggered it,
+  # so this records — for the worker and any log — WHY the message path did not
+  # carry the handoff and that the durable for-chuck bead now covers the merge.
+  echo "post-push-merge-notify: ${FALLBACK_REASON:-message delivery not confirmed} — filed durable for-chuck fallback bead (label for-chuck) for branch ${BRANCH}; chuck merges it from the pool."
+fi
 
 exit 0
