@@ -404,6 +404,56 @@ sable_resolve_integration_branch() {
   return 0
 }
 
+# sable_resolve_test_command <repo-path>
+#
+# Resolves the pre-push TEST-phase command for <repo-path> (SABLE-hml).
+# detect_test_cmd in pre-push-rebase-test.sh previously only checked
+# $SABLE_TEST_COMMAND then a fixed set of manifest files (package.json,
+# pyproject.toml, Cargo.toml, go.mod) — a bash/hook repo like SABLE itself
+# matches none of those, so pushes silently skipped the test gate entirely
+# (live incident: chuck, 2026-07-07, the TDD-enforcement hooks batch itself
+# shipped untested). Mirrors sable_resolve_integration_branch's precedence —
+# repo-local config wins over checked-in config wins over the legacy env
+# override, same rationale as market-brief-package-2u25 / SABLE-92kc: a
+# session's $SABLE_TEST_COMMAND is set once per project and otherwise leaks
+# unchanged into every other repo that session's manager ever pushes.
+# Consulted in order, first match wins:
+#   1. `git -C <repo-path> config --get sable.testCommand` (repo-local,
+#      unshared — the machine's own override for this checkout)
+#   2. `<repo-path>/.sable` file, a line `testCommand=<cmd>` (checked into
+#      the repo, shared across clones)
+#   3. $SABLE_TEST_COMMAND (explicit env override, legacy)
+#   4. "" (empty — caller falls back to manifest auto-detection)
+# Always prints (possibly empty) and returns 0.
+sable_resolve_test_command() {
+  local repo_path="${1:-}"
+  local val
+
+  if [ -n "$repo_path" ]; then
+    val=$(git -C "$repo_path" config --get sable.testCommand 2>/dev/null || true)
+    if [ -n "$val" ]; then
+      printf '%s' "$val"
+      return 0
+    fi
+
+    if [ -f "$repo_path/.sable" ]; then
+      val=$(sed -n 's/^testCommand=//p' "$repo_path/.sable" 2>/dev/null | head -1)
+      if [ -n "$val" ]; then
+        printf '%s' "$val"
+        return 0
+      fi
+    fi
+  fi
+
+  if [ -n "${SABLE_TEST_COMMAND:-}" ]; then
+    printf '%s' "$SABLE_TEST_COMMAND"
+    return 0
+  fi
+
+  printf ''
+  return 0
+}
+
 # sable_resolve_dispatch_lane <hook-input-json>
 #
 # For PreToolUse:Agent / PostToolUse:Agent hooks. Decides whether pre-dispatch

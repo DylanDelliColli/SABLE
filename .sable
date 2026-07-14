@@ -1,0 +1,1 @@
+testCommand=for f in hooks/test/test-pre-push-rebase-test.sh hooks/test/test-lib-identity.sh hooks/test/test-tdd-gate.sh; do bash "$f" || exit 1; done

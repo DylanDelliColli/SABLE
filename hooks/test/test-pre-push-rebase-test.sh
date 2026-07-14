@@ -214,6 +214,40 @@ assert_deny "failing lint command → static phase denies" "$FAIL_LINT" "git pus
 NO_STATIC="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TEST_PHASE=skip"
 assert_context "no typecheck detected → static no-ops" "$NO_STATIC" "git push" "$REPO_DIR" "phase skipped"
 
+# ---------- .sable testCommand resolution tests (SABLE-hml) ----------
+# detect_test_cmd previously only checked $SABLE_TEST_COMMAND then a fixed
+# manifest list (package.json/pyproject.toml/Cargo.toml/go.mod); a bash/hook
+# repo like SABLE itself matches none of those, so the TEST phase silently
+# no-op'd (live incident: chuck, 2026-07-07 — the TDD-enforcement hooks
+# batch itself shipped untested). sable_resolve_test_command (lib-identity.sh)
+# now also honors a checked-in .sable file / repo-local git config — these
+# tests prove the HOOK actually wires that resolution into phase 3 end to
+# end, not just that the lib function works in isolation (covered separately
+# in test-lib-identity.sh).
+SABLE_TESTCMD_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true"
+
+# Test 11b: .sable testCommand that fails → phase 3 denies, message names the
+# RESOLVED command (proves detect_test_cmd read .sable, not env/manifest)
+echo "testCommand=exit 42" > "$REPO_DIR/.sable"
+assert_deny "«.sable» testCommand resolved and enforced → failing command denies phase 3" \
+  "$SABLE_TESTCMD_ENV" "git push" "$REPO_DIR" "exit 42"
+
+# Test 11c: .sable testCommand that passes → phase 3 runs clean, no deny and
+# no "no test command detected" fallback (proves manifest auto-detect was
+# bypassed in favor of the resolved .sable value)
+echo "testCommand=true" > "$REPO_DIR/.sable"
+assert_allow "«.sable» testCommand resolved and enforced → passing command allows push" \
+  "$SABLE_TESTCMD_ENV" "git push" "$REPO_DIR"
+
+# Test 11d: repo-local git config wins over the .sable file (precedence
+# mirrors sable_resolve_integration_branch's config > .sable ordering)
+git -C "$REPO_DIR" config sable.testCommand "exit 43"
+assert_deny "repo-local git config testCommand wins over .sable file" \
+  "$SABLE_TESTCMD_ENV" "git push" "$REPO_DIR" "exit 43"
+git -C "$REPO_DIR" config --unset sable.testCommand
+
+rm -f "$REPO_DIR/.sable"
+
 # ---------- Shared matcher tests (SABLE-jpr / SABLE-0u1) ----------
 # The pre-push gate must fire for real git push variants (positives) and
 # must NOT fire for commands where "git push" only appears as a quoted string

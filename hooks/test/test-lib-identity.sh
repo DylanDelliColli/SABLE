@@ -582,6 +582,45 @@ resolve_int_test "sable_resolve_integration_branch: empty repo path falls back t
   "" "SABLE_INTEGRATION_BRANCH=foo" "foo"
 
 # --------------------------------------------------------------------------
+# sable_resolve_test_command unit tests (SABLE-hml)
+# Mirrors sable_resolve_integration_branch's precedence: repo-local git
+# config wins over the checked-in .sable file wins over the legacy env
+# override; empty everywhere falls back to "" (caller does manifest
+# auto-detection).
+# --------------------------------------------------------------------------
+resolve_testcmd_test() {
+  local label="$1" repo="$2" env_assignments="$3" expect="$4" got
+  got=$(env -u SABLE_TEST_COMMAND $env_assignments bash -c "source '$LIB'; sable_resolve_test_command '$repo'")
+  if [ "$got" = "$expect" ]; then
+    pass "$label"
+  else
+    fail "$label" "expected [$expect] got [$got]"
+  fi
+}
+
+resolve_testcmd_test "sable_resolve_test_command: no config anywhere returns empty" \
+  "$INT_REPO" "" ""
+
+resolve_testcmd_test "sable_resolve_test_command: falls back to SABLE_TEST_COMMAND env" \
+  "$INT_REPO" "SABLE_TEST_COMMAND=pytest" "pytest"
+
+echo "testCommand=for f in hooks/test/test-*.sh; do bash \$f; done" > "$INT_REPO/.sable"
+resolve_testcmd_test "sable_resolve_test_command: .sable file wins over session env" \
+  "$INT_REPO" "SABLE_TEST_COMMAND=pytest" 'for f in hooks/test/test-*.sh; do bash $f; done'
+
+git -C "$INT_REPO" config sable.testCommand "make test"
+resolve_testcmd_test "sable_resolve_test_command: repo-local git config wins over .sable file" \
+  "$INT_REPO" "" "make test"
+git -C "$INT_REPO" config --unset sable.testCommand
+rm -f "$INT_REPO/.sable"
+
+resolve_testcmd_test "sable_resolve_test_command: empty repo path falls back to env" \
+  "" "SABLE_TEST_COMMAND=pytest" "pytest"
+
+resolve_testcmd_test "sable_resolve_test_command: empty repo path with no env returns empty" \
+  "" "" ""
+
+# --------------------------------------------------------------------------
 # sable_resolve_push_repo_dir unit tests (SABLE-041)
 # Resolves the effective git dir from a push command's `git -C <path>`,
 # applied to the shell cwd with git semantics; falls back to cwd when absent.
