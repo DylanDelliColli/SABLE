@@ -103,6 +103,12 @@ scope-creep); you review the *outcome* — the closed bead, the pushed branch, t
 `for-chuck` PR. REVISE wrong work by re-spawning into the same worktree
 (`sable-spawn-worker <id> --worktree <path> ...`).
 
+**Output discipline (SABLE-myns):** when writing dispatch addenda beyond the
+template, reject any instruction that would have the worker ingest raw
+suite output or an unbounded diff into its own context — point back to
+worker-dispatch.md § Output discipline (run-to-file, then read back the
+summary) instead.
+
 ## Inbox
 Your inbox is `for-tarzan` (durable fallback); live direction arrives over tmux
 via `sable-msg` (framing rule above). Sources: Lincoln, Chuck flagging trivial

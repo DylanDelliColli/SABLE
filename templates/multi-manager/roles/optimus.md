@@ -102,6 +102,12 @@ branch, and the `for-chuck` PR. If the work is wrong, REVISE: re-spawn a worker
 into the same worktree with revision instructions
 (`sable-spawn-worker <id> --worktree <path> ...`).
 
+**Output discipline (SABLE-myns):** when writing dispatch addenda beyond the
+template, reject any instruction that would have the worker ingest raw
+suite output or an unbounded diff into its own context — point back to
+worker-dispatch.md § Output discipline (run-to-file, then read back the
+summary) instead.
+
 ## Inbox
 Your inbox is `for-optimus` (durable fallback). Live direction now arrives over
 tmux via `sable-msg` (see the framing rule above). Sources: Lincoln's direction,
