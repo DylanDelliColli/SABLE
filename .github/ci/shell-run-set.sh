@@ -31,6 +31,7 @@ ALLOW=(
   test-concurrent-sessions.sh
   test-full-ingestion.sh
   test-lib-identity.sh
+  test-lib-identity-isolation.sh
   test-lib-mode-path.sh
   test-mode-interlock.sh
   test-mode-tier.sh
@@ -38,6 +39,7 @@ ALLOW=(
   test-no-cockpit-naming.sh
   test-orchestration-install.sh
   test-post-push-merge-notify.sh
+  test-post-push-merge-notify-isolation.sh
   test-pre-dispatch-claim.sh
   test-pre-dispatch-model-check.sh
   test-pre-dispatch-overlap.sh
