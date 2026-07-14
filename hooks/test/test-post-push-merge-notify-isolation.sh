@@ -3,7 +3,9 @@
 # harness for SABLE-yn5t (config-escape class; root SABLE-a5a5, template z776).
 #
 # Proves test-post-push-merge-notify.sh can NEVER pollute the REAL repo's git
-# identity, even when a fixture `cd` fails under a busy-/tmp race. Three layers:
+# identity or reach the REAL origin remote, even when a fixture `cd` fails
+# under a busy-/tmp race or a push targets a CWD-dependent remote NAME. Four
+# layers:
 #
 #   1. Deterministic sabotage (the RED/GREEN gate): shim `mktemp` so the FIRST
 #      `mktemp -d` hands back a non-cd-able path (a regular file), reproducing
@@ -19,7 +21,19 @@
 #      matching the bead's test spec ("run the fixture N times in parallel
 #      under a busy /tmp, assert the real repo identity UNCHANGED").
 #
-#   3. Structural: every `git config` in the suite is `git -C`-scoped (no bare
+#   3. Bare-origin escape simulation (SABLE-ck05, defense-in-depth for the
+#      z776 pattern applied to this suite): a `git` shim intercepts any `push`
+#      invocation naming the remote by the LITERAL string 'origin' and
+#      redirects it to a REAL_ORIGIN_BARE repo standing in for the operator's
+#      real upstream — the worst case of what a CWD escape would mean for a
+#      push that addresses its remote by name instead of by explicit bare-repo
+#      path. Asserts `git ls-remote` on that stand-in gains NO refs after the
+#      run. RED on a suite with bare `git push -q origin ...` lines (all 13
+#      redirect and land); GREEN once every push addresses its fixture's bare
+#      origin by explicit path (the shim's literal-'origin' match never fires,
+#      since the pushed argument is a path, not the string 'origin').
+#
+#   4. Structural: every `git config` in the suite is `git -C`-scoped (no bare
 #      form that follows CWD) and every fixture `cd` is guarded.
 #
 # Standalone — deliberately NOT wired into the .sable pre-push testCommand (the
@@ -156,7 +170,58 @@ assert_sentinel_clean "$S2" \
   "concurrency: $N parallel suite runs under a busy /tmp never mutate the real repo git identity"
 
 # ==========================================================================
-# Layer 3 — structural guards on the suite source
+# Layer 3 — bare-origin escape simulation (SABLE-ck05)
+# ==========================================================================
+# Stand-in for the operator's real upstream. Starts empty; any ref appearing
+# here after the run means a fixture push escaped via the bare remote NAME
+# 'origin' rather than an explicit bare-repo path.
+REAL_ORIGIN_BARE="$WORKROOT/real-origin.git"
+git init -q --bare "$REAL_ORIGIN_BARE"
+
+REAL_GIT="$(command -v git)"
+GITSHIMDIR="$WORKROOT/gitshim"; mkdir -p "$GITSHIMDIR"
+cat > "$GITSHIMDIR/git" <<EOF
+#!/usr/bin/env bash
+# Intercept ONLY 'push' invocations whose remote arg is the LITERAL string
+# 'origin' (never a path) and redirect to REAL_ORIGIN_BARE — modeling the
+# worst case of a CWD escape, where a name-based remote reference resolves to
+# the real upstream. A push that addresses its bare origin by explicit path
+# (the ck05/z776 fix) never matches this and can never land here, regardless
+# of what directory it actually runs from.
+if [ "\$1" = "push" ]; then
+  shift
+  args=()
+  matched=0
+  for a in "\$@"; do
+    if [ "\$matched" = "0" ] && [ "\$a" = "origin" ]; then
+      args+=("$REAL_ORIGIN_BARE")
+      matched=1
+    else
+      args+=("\$a")
+    fi
+  done
+  exec "$REAL_GIT" push "\${args[@]}"
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$GITSHIMDIR/git"
+
+S3="$WORKROOT/sentinel3"; mkdir -p "$S3"
+mkdir -p "$WORKROOT/t3"
+(
+  cd "$WORKROOT" && cd "$S3" && exec env PATH="$GITSHIMDIR:$PATH" TMPDIR="$WORKROOT/t3" bash "$SUITE"
+) >/dev/null 2>&1 || true
+
+REAL_ORIGIN_REFS="$(git ls-remote "$REAL_ORIGIN_BARE" 2>/dev/null | wc -l)"
+if [ "$REAL_ORIGIN_REFS" -eq 0 ]; then
+  pass "SABLE-ck05: bare-origin escape sim — real-origin stand-in gains NO refs (explicit bare-path pushes never resolve to 'origin')"
+else
+  fail "SABLE-ck05: bare-origin escape sim — real-origin stand-in gains NO refs" \
+    "ls-remote shows $REAL_ORIGIN_REFS ref(s): $(git ls-remote "$REAL_ORIGIN_BARE" 2>/dev/null)"
+fi
+
+# ==========================================================================
+# Layer 4 — structural guards on the suite source
 # ==========================================================================
 # Scoped `git -C "$X" config` does NOT contain the substring "git config";
 # only the bare form does. Comment mentions of "git config" are excluded.
