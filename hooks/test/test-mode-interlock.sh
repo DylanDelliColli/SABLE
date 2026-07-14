@@ -565,6 +565,29 @@ assert_deny  "qfvn: planning still blocks git -C dir push"       'git -C /home/d
 assert_deny  "qfvn: planning still blocks chained git push"      'bd create --type=task --title="x" && git push'
 assert_deny  "qfvn: planning still blocks env-prefixed git push" 'GIT_SSH_COMMAND=x git push origin wk-y'
 
+# ---------- SABLE-f5m0: git-SUBCOMMAND false positives on a bare 'push' token ----------
+# The qfvn/ykij tokenizer checked `seg[i]=='git' and 'push' in seg[i+1:]` — push
+# as ANY later token in the segment, not the git SUBCOMMAND. So a git subcommand
+# that merely carries a bare "push" argument (a --grep value, a commit message,
+# a branch name) was wrongly DENIED in planning. is_git_push now delegates to
+# sable_is_git_push (lib-identity.sh), which only matches when the first
+# non-flag token after git's global flags is exactly the subcommand `push`.
+assert_allow "f5m0: planning allows git log --grep push (push is a --grep value, not the subcommand)" \
+  'git log --grep push'
+assert_allow "f5m0: planning allows git commit -m push (push is the commit message, not the subcommand)" \
+  'git commit -m push'
+assert_allow "f5m0: planning allows git checkout push (a branch literally named push)" \
+  'git checkout push'
+assert_allow "f5m0: planning allows git branch push (naming, not pushing, a branch)" \
+  'git branch push'
+
+# f5m0: real pushes stay DENIED — subcommand precision must not soften the gate
+assert_deny  "f5m0: planning still blocks bare git push"                'git push'
+assert_deny  "f5m0: planning still blocks git -C DIR push"              'git -C /home/ddc/dev-environment/wk-x push'
+assert_deny  "f5m0: planning still blocks env-prefixed git push"        'GIT_SSH_COMMAND=x git push origin wk-y'
+assert_deny  "f5m0: planning still blocks chained git push after bd create" \
+  'bd create --type=task --title="x" && git push'
+
 # ykij def2: sable-mode exemption anchored to a real LEADING sable-mode command.
 # A bd create whose description NAMES sable-mode must NOT bypass the backlog gate.
 set_mode planning   # substage=framing
@@ -670,6 +693,13 @@ assert_deny_role  "producer denied git -C dir push (old adjacent-regex MISS)" \
   'git -C /home/ddc/dev-environment/wk-x push'
 assert_deny_role  "producer denied chained git push after bd create" \
   'bd create --type=task --title="x" && git push'
+
+# SABLE-f5m0: the producer leg shares is_git_push too — a git subcommand
+# carrying a bare "push" token (not the subcommand itself) must not be denied.
+assert_allow_role "f5m0: producer allowed git log --grep push (push is a --grep value)" \
+  'git log --grep push'
+assert_allow_role "f5m0: producer allowed git commit -m push (push is the commit message)" \
+  'git commit -m push'
 
 # ---------- settings-snippet registration ----------
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
