@@ -61,6 +61,7 @@ TOOLBOX (each also runs as `sable <name> ...`, e.g. `sable msg ...`)
   sable-msg <role> "<text>"      message a pane (--interrupt to land mid-turn)
   sable-worker-status [--reap]   list / reap worker panes
   sable-mode                     read or flip the planning|execution mode state
+  sable-contract add|set|clear   write live protocol contracts surfaced at boot
   sable-note "<text>"            capture a SABLE methodology observation
   sable-agents [name]            who does what (roster reminder)
   sable-charter                  charter/decision artifacts (Discovery outputs)

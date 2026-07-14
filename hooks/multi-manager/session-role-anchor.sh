@@ -34,10 +34,70 @@ done
 
 ROLE_CONTENT=$(cat "$ROLE_FILE")
 
-ROLE_CONTENT="$ROLE_CONTENT" python3 -c "
+# --- Live protocol state surface (SABLE-9ozz) -------------------------------
+# A pane restart (/clear, crash, session limit) silently reverts this session to
+# the STATIC role card above and loses every conversation-state convention — the
+# merge-gate sole-path contract, interim fleet caps, the manual-relay rule while
+# a hook is dark. Those lived only in the previous conversation's context, which
+# the restart destroyed (the 2026-07-13 gah9 bypass: chuck's static identity
+# still described the OLD manual-merge flow). Surface the LIVE protocol state
+# from disk — the orchestration mode-state + an active-contracts file colocated
+# with it — so a fresh boot reconciles against the current contract, not the
+# historical identity. Empty surfaces => byte-identical to the legacy identity-
+# only injection (nothing extra emitted). This is ALSO how fix-direction-2's
+# boot reconciliation instruction reaches every manager at once, without editing
+# each role card.
+LIVE_MODE=""
+LIVE_CONTRACTS=""
+_lmp="$(dirname "${BASH_SOURCE[0]:-$0}")/lib-mode-path.sh"
+if [ -f "$_lmp" ]; then
+    # shellcheck source=lib-mode-path.sh
+    . "$_lmp" 2>/dev/null || true
+fi
+if command -v sable_mode_state_path >/dev/null 2>&1; then
+    _mode_state="$(sable_mode_state_path "$PWD" 2>/dev/null || true)"
+else
+    _mode_state="${SABLE_MODE_STATE:-}"
+fi
+if [ -n "${_mode_state:-}" ] && [ -f "$_mode_state" ]; then
+    LIVE_MODE="$(STATE="$_mode_state" python3 -c '
+import json, os
+try:
+    d = json.load(open(os.environ["STATE"]))
+except Exception:
+    raise SystemExit(0)
+m = d.get("mode", "")
+if not m:
+    raise SystemExit(0)
+line = m
+sub = d.get("substage")
+if sub:
+    line += " / " + sub
+since = d.get("since")
+if since:
+    line += " (since " + since + ")"
+print(line)
+' 2>/dev/null || true)"
+fi
+# The contracts surface is colocated with the mode-state file; SABLE_ACTIVE_CONTRACTS
+# overrides the file directly (parallel to SABLE_MODE_STATE for mode-state).
+if [ -n "${SABLE_ACTIVE_CONTRACTS:-}" ]; then
+    _contracts_file="$SABLE_ACTIVE_CONTRACTS"
+elif [ -n "${_mode_state:-}" ]; then
+    _contracts_file="$(dirname "$_mode_state")/active-contracts.md"
+else
+    _contracts_file=""
+fi
+if [ -n "${_contracts_file:-}" ] && [ -s "$_contracts_file" ]; then
+    LIVE_CONTRACTS="$(cat "$_contracts_file" 2>/dev/null || true)"
+fi
+
+ROLE_CONTENT="$ROLE_CONTENT" LIVE_MODE="$LIVE_MODE" LIVE_CONTRACTS="$LIVE_CONTRACTS" python3 -c "
 import json, os, sys
 content = os.environ.get('ROLE_CONTENT', '')
 name = os.environ.get('CLAUDE_AGENT_NAME', '').upper()
+live_mode = os.environ.get('LIVE_MODE', '').strip()
+live_contracts = os.environ.get('LIVE_CONTRACTS', '').strip()
 
 # Detect which event fired us (SessionStart or PreCompact) so we emit the
 # correct hookEventName in hookSpecificOutput. Claude Code silently drops
@@ -48,10 +108,43 @@ try:
 except Exception:
     event = 'SessionStart'
 
+identity = (
+    f'=== AGENT IDENTITY: {name} ===\n\n{content}\n\n=== END IDENTITY ===\n\n'
+    f'You are {name}. Operate within this role. Do not act as another manager.'
+)
+
+# Only append the live-protocol block when there IS live state on disk, so a
+# non-orchestration manager session stays byte-identical to the legacy injection.
+if live_mode or live_contracts:
+    parts = [
+        '',
+        '',
+        '=== LIVE PROTOCOL STATE (SABLE-9ozz — read from disk at SessionStart) ===',
+        '',
+        'This block reflects the CURRENT fleet protocol. A pane restart (/clear,',
+        'crash, session limit) silently reverted you to the STATIC identity above,',
+        'which is only a HISTORICAL baseline. Where this live state conflicts with',
+        'that identity, THIS WINS.',
+        '',
+    ]
+    if live_mode:
+        parts.append('Orchestration mode: ' + live_mode)
+        parts.append('')
+    if live_contracts:
+        parts.append('Active contracts:')
+        parts.append(live_contracts)
+        parts.append('')
+    parts.append('Boot reconciliation (do this BEFORE your first action): reconcile the')
+    parts.append('above against your static identity, then run  bd memories  and read your')
+    parts.append('for-<role> inbox. Only then act.')
+    parts.append('')
+    parts.append('=== END LIVE PROTOCOL STATE ===')
+    identity += '\n'.join(parts)
+
 print(json.dumps({
     'hookSpecificOutput': {
         'hookEventName': event,
-        'additionalContext': f'=== AGENT IDENTITY: {name} ===\n\n{content}\n\n=== END IDENTITY ===\n\nYou are {name}. Operate within this role. Do not act as another manager.'
+        'additionalContext': identity,
     }
 }))
 "

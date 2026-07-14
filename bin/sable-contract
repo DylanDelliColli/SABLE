@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# sable-contract — read/write the SABLE active-contracts surface (SABLE-9ozz).
+#
+# The active-contracts file is the DISK surface for live, conversation-state
+# protocol conventions a manager pane must honor but that its STATIC role card
+# does not describe — e.g. "sable-merge-gate is the sole merge path", an interim
+# fleet worker cap, the manual-relay rule while a hook is dark. It is read at
+# SessionStart/PreCompact by session-role-anchor.sh and injected into the manager
+# identity, so a restarted pane (/clear, crash, session limit) reconciles against
+# the LIVE contract instead of silently reverting to the historical identity —
+# the failure the 2026-07-13 gah9 merge-gate bypass exposed.
+#
+# Flips (/sable-execute, /sable-plan) and managers WRITE contracts here as part
+# of the flip choreography; the reader SURFACES them. The file is COLOCATED with
+# the mode-state file (bin/sable-mode) in <repo>/.claude/sable/state/ so both
+# protocol surfaces travel together and share one gitignore.
+#
+# State file — resolved PER-REPO (mirrors sable-mode's resolve_state_path): inside
+# a git repo it is the repo's main-worktree .claude/sable/state/active-contracts.md
+# (shared across the repo's worktrees); outside a git repo it falls back to
+# ~/.claude/sable/state/active-contracts.md. Override the file directly with
+# SABLE_ACTIVE_CONTRACTS, or implicitly (colocated) via SABLE_MODE_STATE's dir.
+#
+# Contracts are ADVISORY surface (read by the identity hook), not a gate — no
+# interlock blocks work on them — so writing carries no SABLE_ORCHESTRATION gate.
+#
+# Usage:
+#   sable-contract add "<text>"    Append a contract line (timestamped).
+#   sable-contract set "<text>"    Replace the surface with a single contract.
+#   sable-contract clear           Remove the surface file.
+#   sable-contract show            Print the surface; nonzero if empty/absent.
+#   sable-contract path            Print the resolved surface path (no state needed).
+#   sable-contract --help
+
+set -eu
+
+# resolve_contracts_path [base_dir] — mirror of sable-mode's resolve_state_path
+# (kept as a copy for the same post-install-path reason: this binary is symlinked
+# to ~/.local/bin with no stable path back to the hooks dir), pointed at
+# active-contracts.md instead of mode-state.json. SABLE_ACTIVE_CONTRACTS overrides
+# the file directly; SABLE_MODE_STATE colocates the contracts file in the same dir
+# so a test/override that relocates mode-state relocates contracts with it.
+resolve_contracts_path() {
+    if [ -n "${SABLE_ACTIVE_CONTRACTS:-}" ]; then
+        printf '%s\n' "$SABLE_ACTIVE_CONTRACTS"
+        return 0
+    fi
+    if [ -n "${SABLE_MODE_STATE:-}" ]; then
+        printf '%s\n' "$(dirname "$SABLE_MODE_STATE")/active-contracts.md"
+        return 0
+    fi
+    local base="${1:-$PWD}"
+    local common root
+    if common="$(git -C "$base" rev-parse --git-common-dir 2>/dev/null)" && [ -n "$common" ]; then
+        case "$common" in
+            /*) ;;
+            *)  common="$base/$common" ;;
+        esac
+        if root="$(cd "$(dirname "$common")" 2>/dev/null && pwd)" && [ -n "$root" ]; then
+            printf '%s\n' "$root/.claude/sable/state/active-contracts.md"
+            return 0
+        fi
+    fi
+    printf '%s\n' "${HOME:-}/.claude/sable/state/active-contracts.md"
+}
+
+# ensure_state_gitignored <path> — mirror of sable-mode's helper: keep the
+# ephemeral state dir out of an adopter's git status. Idempotent; respects a
+# pre-existing broader '.claude/sable/' ignore; silent on failure; skips
+# override / non-canonical paths.
+ensure_state_gitignored() {
+    local state="$1" root gi pattern=".claude/sable/state/"
+    case "$state" in
+        */.claude/sable/state/active-contracts.md)
+            root="${state%/.claude/sable/state/active-contracts.md}" ;;
+        *) return 0 ;;
+    esac
+    git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+    gi="$root/.gitignore"
+    if [ -f "$gi" ] && grep -q '\.claude/sable/' "$gi" 2>/dev/null; then
+        return 0
+    fi
+    printf '%s\n' "$pattern" >> "$gi" 2>/dev/null || true
+}
+
+STATE="$(resolve_contracts_path)"
+
+usage() {
+    cat <<EOF
+sable-contract — read/write the SABLE active-contracts surface.
+
+Usage:
+  sable-contract add "<text>"    Append a contract line (timestamped).
+  sable-contract set "<text>"    Replace the surface with a single contract.
+  sable-contract clear           Remove the surface file.
+  sable-contract show            Print the surface; nonzero exit if empty/absent.
+  sable-contract path            Print the resolved surface path (no state needed).
+  sable-contract --help
+
+The surface is read at SessionStart by session-role-anchor.sh and injected into
+a manager's identity as LIVE PROTOCOL STATE, so a restarted pane boots with the
+current contract, not its historical role card.
+
+State file (resolved per-repo): ${STATE}
+  Inside a git repo this is <repo>/.claude/sable/state/active-contracts.md
+  (colocated with the mode-state file, shared across the repo's worktrees);
+  otherwise ~/.claude/sable/state/active-contracts.md. Override the file with
+  SABLE_ACTIVE_CONTRACTS.
+EOF
+}
+
+cmd="${1:-}"
+case "$cmd" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    path)
+        printf '%s\n' "$STATE"
+        ;;
+    show)
+        if [ ! -s "$STATE" ]; then
+            printf 'sable-contract: no active contracts (%s)\n' "$STATE" >&2
+            exit 1
+        fi
+        cat "$STATE"
+        ;;
+    add|set)
+        text="${2:-}"
+        if [ -z "$text" ]; then
+            printf 'sable-contract: %s requires <text>\n' "$cmd" >&2
+            exit 2
+        fi
+        mkdir -p "$(dirname "$STATE")"
+        ts="$(date +%Y-%m-%dT%H:%M:%S%z)"
+        if [ "$cmd" = "add" ]; then
+            printf -- '- [%s] %s\n' "$ts" "$text" >> "$STATE"
+        else
+            printf -- '- [%s] %s\n' "$ts" "$text" > "$STATE"
+        fi
+        ensure_state_gitignored "$STATE"
+        ;;
+    clear)
+        rm -f "$STATE"
+        ;;
+    ""|*)
+        usage
+        exit 1
+        ;;
+esac
