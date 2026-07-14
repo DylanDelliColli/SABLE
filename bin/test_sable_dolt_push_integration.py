@@ -11,10 +11,13 @@ push/pull/bounce the wrapper drives is redirected via the SABLE_DOLT_*_CMD
 seams to scratch scripts or a throwaway scratch dolt repo whose remote is a
 local directory created per-test.
 """
+import ast
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -63,6 +66,86 @@ def assert_no_interleave(log_path: Path):
             assert stack and stack[-1] == pid, f"bad END for {pid}, stack={stack}"
             stack.pop()
     assert not stack, f"unterminated push: {stack}"
+
+
+def _flatten_string_node(node):
+    """Reconstruct the literal text of a write_script `body` argument (a plain
+    string or an f-string). Interpolated parts (paths, pids, branch names)
+    never contain a newline or `cd`, so flattening them to a placeholder
+    preserves everything the cd-guard check cares about: line structure."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for value in node.values:
+            if isinstance(value, ast.Constant):
+                parts.append(str(value.value))
+            else:
+                parts.append("X")
+        return "".join(parts)
+    raise AssertionError(f"unsupported write_script body expression: {ast.dump(node)}")
+
+
+def _write_script_bodies(source_path: Path):
+    """Statically extract (lineno, literal body text) for every write_script(
+    path, body) call in `source_path`, without executing the file."""
+    tree = ast.parse(source_path.read_text())
+    bodies = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "write_script"
+                and len(node.args) >= 2):
+            bodies.append((node.lineno, _flatten_string_node(node.args[1])))
+    return bodies
+
+
+def _dolt_state_fingerprint(path: Path):
+    """A cheap proof-of-no-escape fingerprint for whatever dolt state (if any)
+    is reachable from `path`. None means "not a dolt repo" — the expected case
+    for the wrapper's inherited CWD. If it IS a dolt repo, snapshot HEAD log +
+    branch list so any stray push (new branch, new commit) is detectable."""
+    if not (path / ".dolt").exists():
+        return None
+    log = subprocess.run(["dolt", "log", "--oneline", "-n", "20"],
+                         cwd=str(path), capture_output=True, text=True)
+    branches = subprocess.run(["dolt", "branch", "-a"],
+                              cwd=str(path), capture_output=True, text=True)
+    return (log.stdout, branches.stdout)
+
+
+# --- static guard: every generated cd is fail-closed (SABLE-0ssz.3) ----------
+
+def test_all_write_script_cd_lines_are_guarded():
+    """Every `cd` line inside a write_script(...) body in this file must be
+    guarded — either preceded by `set -e` or followed on the same line by an
+    OR-exit token — so a failed cd can never leave a later real `dolt push`
+    running in the wrong directory (SABLE-0ssz Check-1). Static, not just a
+    property of today's two real-dolt tests: catches a future write_script
+    call that reintroduces the gap."""
+    bodies = _write_script_bodies(Path(__file__))
+    assert bodies, "expected at least one write_script(...) call to check"
+    checked_cd_lines = 0
+    for call_lineno, body in bodies:
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not re.match(r"^cd\b", stripped):
+                continue
+            checked_cd_lines += 1
+            same_line_guard = "|| exit" in line
+            prev_nonblank = next(
+                (l.strip() for l in reversed(lines[:i]) if l.strip()), "")
+            preceded_by_set_e = prev_nonblank == "set -e"
+            assert same_line_guard or preceded_by_set_e, (
+                f"write_script(...) body at line {call_lineno}: unguarded cd "
+                f"— {line!r} must be preceded by `set -e` or followed by "
+                f"`|| exit <code>` on the same line"
+            )
+    assert checked_cd_lines >= 2, (
+        "expected to find the two real-dolt push scripts' cd lines; "
+        f"found {checked_cd_lines} — did the fixture bodies move?"
+    )
 
 
 # --- serialization: two concurrent wrappers never interleave -----------------
@@ -201,15 +284,16 @@ def test_pull_failure_aborts_before_push(tmp_path):
 
 # --- REAL dolt: scratch file:// remote round-trip ---------------------------
 
-@pytest.fixture()
-def dolt_scratch(tmp_path):
+def _make_dolt_scratch(base: Path, name: str = ""):
     """A throwaway dolt repo wired to a local file:// remote, fully isolated
-    from the user's real dolt config via DOLT_ROOT_PATH."""
-    root = tmp_path / "doltcfg"
+    from the user's real dolt config via DOLT_ROOT_PATH. `name` disambiguates
+    multiple independent scratch repos created under the same base dir."""
+    suffix = f"-{name}" if name else ""
+    root = base / f"doltcfg{suffix}"
     root.mkdir()
-    src = tmp_path / "src"
+    src = base / f"src{suffix}"
     src.mkdir()
-    remote = tmp_path / "remote"
+    remote = base / f"remote{suffix}"
     remote.mkdir()
     denv = {**os.environ, "DOLT_ROOT_PATH": str(root)}
 
@@ -224,6 +308,11 @@ def dolt_scratch(tmp_path):
     return {"src": src, "remote": remote, "denv": denv, "d": d}
 
 
+@pytest.fixture()
+def dolt_scratch(tmp_path):
+    return _make_dolt_scratch(tmp_path)
+
+
 @pytest.mark.skipif(not HAVE_DOLT, reason="dolt not installed")
 def test_real_dolt_push_to_scratch_remote(tmp_path, dolt_scratch):
     d = dolt_scratch["d"]
@@ -234,7 +323,7 @@ def test_real_dolt_push_to_scratch_remote(tmp_path, dolt_scratch):
 
     lock = tmp_path / "dolt-push.lock"
     push = write_script(tmp_path / "push.sh",
-                        f'cd "{src}"\nexec dolt push origin main\n')
+                        f'cd "{src}" || exit 97\nexec dolt push origin main\n')
     env = base_env(tmp_path, lock, pull="true", bounce="true")
     env["DOLT_ROOT_PATH"] = str(dolt_scratch["src"].parent / "doltcfg")
     env["SABLE_DOLT_PUSH_CMD"] = f"sh {push}"
@@ -271,7 +360,7 @@ def test_two_concurrent_real_dolt_pushes_serialize(tmp_path, dolt_scratch):
     def make_env(branch):
         push = write_script(tmp_path / f"push-{branch}.sh", f"""
 echo "START $$" >> "{log}"
-cd "{src}"
+cd "{src}" || exit 97
 dolt push origin {branch}
 rc=$?
 echo "END $$" >> "{log}"
@@ -297,3 +386,90 @@ exit $rc
                         env=dolt_scratch["denv"], capture_output=True, text=True)
     assert "origin/b1" in ls.stdout and "origin/b2" in ls.stdout, ls.stdout + ls.stderr
     assert not lock.exists()
+
+
+# --- concurrency harness: cd-guard proven to stop a real escape (SABLE-0ssz.3) -
+
+@pytest.mark.skipif(not HAVE_DOLT, reason="dolt not installed")
+def test_cd_guard_trips_before_push_can_escape_to_cwd(tmp_path):
+    """Fault-inject: point the push script's cd at a directory that does not
+    exist. If the guard is doing its job, the script aborts at the cd and the
+    line after it — the real dolt push — never runs. A marker written
+    immediately after cd (before dolt push) proves execution reached past the
+    cd, independent of whatever exit code a stray `dolt push` would itself
+    produce (it also returns 13, non-dangling failure, so the wrapper's exit
+    code alone can't distinguish "guard tripped" from "push ran and failed
+    for its own reason" — the marker can). Remove the `|| exit 97` guard and
+    this test goes RED: the marker appears because the script falls through
+    to `dolt push` from the wrapper's inherited CWD instead of aborting."""
+    lock = tmp_path / "dolt-push.lock"
+    missing_src = tmp_path / "does-not-exist"
+    reached_push = tmp_path / "reached-push"
+    cwd = Path.cwd()
+    before = _dolt_state_fingerprint(cwd)
+
+    push = write_script(tmp_path / "push.sh",
+                        f'cd "{missing_src}" || exit 97\n'
+                        f': > "{reached_push}"\n'
+                        f'exec dolt push origin main\n')
+    env = base_env(tmp_path, lock, pull="true", bounce="true")
+    env["SABLE_DOLT_PUSH_CMD"] = f"sh {push}"
+
+    r = run_wrapper(env)
+    assert r.returncode == 13, r.stdout + r.stderr   # EXIT_PUSH_FAIL: guard tripped
+    assert not reached_push.exists(), (
+        "cd failed but the script still reached the dolt push line — the "
+        "guard did not stop the escape"
+    )
+    assert _dolt_state_fingerprint(cwd) == before, (
+        "a cd-guard failure must never leave dolt state behind at the "
+        "wrapper's inherited CWD"
+    )
+
+
+@pytest.mark.skipif(not HAVE_DOLT, reason="dolt not installed")
+def test_two_concurrent_real_dolt_pushes_isolated_from_shared_state(tmp_path):
+    """Run two REAL dolt pushes to two INDEPENDENT scratch remotes at once
+    (thread-concurrent — no pytest-xdist dependency needed) and prove neither
+    one ever touches ambient dolt state reachable from the pytest CWD: no
+    push escapes to shared/real state, matching the dolt-push-is-chuck-only
+    shared-remote-corruption history this guard exists to prevent."""
+    cwd = Path.cwd()
+    before = _dolt_state_fingerprint(cwd)
+    results = {}
+
+    def run_one(name):
+        scratch = _make_dolt_scratch(tmp_path, name)
+        d, src = scratch["d"], scratch["src"]
+        assert d("sql", "-q", "create table t (id int primary key)").returncode == 0
+        assert d("add", ".").returncode == 0
+        assert d("commit", "-m", "init").returncode == 0
+
+        lock = tmp_path / f"dolt-push-{name}.lock"
+        push = write_script(tmp_path / f"push-{name}.sh",
+                            f'cd "{src}" || exit 97\nexec dolt push origin main\n')
+        env = base_env(tmp_path, lock, pull="true", bounce="true", fleet=f"fleet-{name}")
+        env["DOLT_ROOT_PATH"] = scratch["denv"]["DOLT_ROOT_PATH"]
+        env["SABLE_DOLT_PUSH_CMD"] = f"sh {push}"
+        results[name] = (run_wrapper(env), scratch)
+
+    t1 = threading.Thread(target=run_one, args=("a",))
+    t2 = threading.Thread(target=run_one, args=("b",))
+    t1.start()
+    t2.start()
+    t1.join(timeout=120)
+    t2.join(timeout=120)
+
+    for name in ("a", "b"):
+        r, scratch = results[name]
+        assert r.returncode == 0, r.stdout + r.stderr
+        subprocess.run(["dolt", "fetch", "origin"], cwd=str(scratch["src"]),
+                       env=scratch["denv"], capture_output=True, text=True)
+        ls = subprocess.run(["dolt", "branch", "-r"], cwd=str(scratch["src"]),
+                            env=scratch["denv"], capture_output=True, text=True)
+        assert "origin/main" in ls.stdout, ls.stdout + ls.stderr
+
+    assert _dolt_state_fingerprint(cwd) == before, (
+        "concurrent real-dolt pushes must never touch ambient dolt state "
+        "reachable from the pytest CWD"
+    )

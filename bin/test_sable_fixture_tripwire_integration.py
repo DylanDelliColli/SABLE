@@ -86,6 +86,9 @@ def test_manifest_lists_tracked_exceptions():
     )
     assert r.returncode == 0
     assert "excused (tracked)" in r.stdout
-    # the two 0ssz tracked debts are named
-    assert "0ssz.3" in r.stdout or "test_sable_dolt_push_integration.py" in r.stdout
+    # the surviving 0ssz.4 tracked debt is named
     assert "test_sable_spawn_worker_integration.py" in r.stdout
+    # SABLE-0ssz.3 landed (both real-dolt push scripts guard their cd) — its
+    # KNOWN_VIOLATIONS entry was removed, so its debt must not still be listed.
+    assert "0ssz.3" not in r.stdout
+    assert "test_sable_dolt_push_integration.py" not in r.stdout

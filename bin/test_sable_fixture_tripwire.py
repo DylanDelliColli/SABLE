@@ -134,7 +134,8 @@ def test_embedded_shell_cd_in_python_flagged():
 # --- excusal -----------------------------------------------------------------
 
 def test_known_violation_excused():
-    v = tw.Violation("bin/test_sable_dolt_push_integration.py", 274, "cd-unguarded", 'cd "{src}"')
+    v = tw.Violation("bin/test_sable_spawn_worker_integration.py", 138,
+                     "real-repo-git", 'subprocess.run(["git", "-C", str(repo), "worktree", "remove"')
     assert v.excused() is True
 
 def test_unknown_violation_not_excused():
