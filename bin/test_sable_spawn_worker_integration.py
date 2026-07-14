@@ -271,7 +271,11 @@ def test_worker_bypass_gate_is_accepted(sock):
     """SABLE-91m3 regression: sable-spawn-worker must accept the bypass-permissions
     warning (whose default is 'No, exit') before delivering, or the worker dies.
     A stand-in pane prints the warning, reads the key the helper sends, and records
-    it; we assert it received '2' (Yes, I accept)."""
+    it; we assert it received '2' (Yes, I accept). After accepting, it prints the
+    empty composer prompt (SABLE-m94k: wait_for_ready's return is now CHECKED, so
+    the stand-in must simulate the real gate-dismissed -> composer-ready transition,
+    or the new guard refuses to type — matching what a real worker pane does once
+    the gate clears into the Claude Code TUI)."""
     with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
         rec = Path(dd) / "gate-key.txt"
         script = Path(dd) / "fake-worker.sh"
@@ -280,6 +284,7 @@ def test_worker_bypass_gate_is_accepted(sock):
             "echo '  2. Yes, I accept'\n"
             "read k\n"
             f"printf '%s' \"$k\" > {rec}\n"
+            "echo '❯ '\n"
             "sleep 1\n"
         )
         env = {
@@ -302,6 +307,52 @@ def test_worker_bypass_gate_is_accepted(sock):
         time.sleep(0.5)
         assert rec.exists(), "stand-in never received a key (gate not accepted)"
         assert rec.read_text().strip() == "2", rec.read_text()
+
+
+def test_worker_stuck_on_unrecognized_dialog_refuses_to_type(sock):
+    """SABLE-m94k: a pane primed with a read-prompt style dialog accept_startup_gate
+    does NOT recognize (only the bypass/trust gates are dismissable) must never have
+    the dispatch text typed into it. A stand-in pane prints an Enter-to-select menu
+    and blocks on `read`, recording whatever line it receives (if any). The old
+    behavior discarded wait_for_ready's False return and typed anyway; the fix
+    checks it, refuses (exit 10, naming the pane), and leaves the bead claim intact
+    (proved here by --skip-governance never even attempting a claim, and by nothing
+    ever landing in the stand-in's `read`)."""
+    with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
+        rec = Path(dd) / "typed-into-dialog.txt"
+        script = Path(dd) / "fake-dialog.sh"
+        script.write_text(
+            "echo '  ? Which package manager would you like to use?'\n"
+            "echo '  > 1. npm'\n"
+            "echo '    2. yarn'\n"
+            "echo '    3. pnpm'\n"
+            "echo '  (Use arrow keys, Enter to select)'\n"
+            "read line\n"
+            f"printf '%s' \"$line\" > {rec}\n"
+            "sleep 2\n"
+        )
+        env = {
+            **os.environ,
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": f"bash --noprofile --norc {script}",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0.6",  # short: the dialog never clears
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.1",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test (SABLE-mmdt)
+        }
+        r = subprocess.run(
+            ["python3", str(BIN), BEAD, "--worktree", wt, "--model", "haiku",
+             "--skip-governance"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 10, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "dialog" in r.stderr.lower()
+        assert BEAD in r.stderr
+        time.sleep(0.5)
+        # nothing was ever typed+submitted into the stuck dialog's `read`
+        assert not rec.exists(), f"dispatch text landed in the dialog: {rec.read_text()!r}"
 
 
 # --- dispatch throttle + host-resource guard (SABLE-mmdt) ---------------------
