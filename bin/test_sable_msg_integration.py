@@ -302,6 +302,125 @@ def test_default_send_to_busy_pane_that_frees_reports_delivered_h0jw(tmux_socket
     assert end.read_text().strip() == "NATURAL"        # default mode never interrupted it
 
 
+# --- queued-composer footer + idempotent retry (SABLE-msxj) -----------------
+# Recurrence of the h0jw class AFTER h0jw merged (LINCOLN 2026-07-15, optimus
+# pane %47): the real Claude-TUI does NOT hoist a queued line above the
+# composer and clear the box the way h0jw's stand-in above models — it leaves
+# the line VISIBLE in the composer and appends a 'Press up to edit queued
+# messages' footer. h0jw's box-based signals never recognized that footer, so
+# a genuinely delivered-queued send timed out the poll budget and was scored
+# undelivered (SABLE-l8a5: closed false-fail). Worse, retrying the send typed
+# the same text into the pane a SECOND time, producing a duplicate turn.
+
+# A busy-TUI stand-in identical to _BUSY_TUI except it renders the real TUI's
+# queued-messages footer once a line is queued — modeling the exact posture
+# SABLE-msxj reports. ARRIVALS_FILE records every distinct line the script
+# actually reads off the pty (append, not overwrite) — the ground truth for
+# "how many times was this text really typed into the pane", independent of
+# `queued`'s final value (which a second identical send would not visibly
+# change). REC_FILE keeps recording the line that ultimately submits once the
+# turn ends, exactly as _BUSY_TUI does.
+_QUEUED_FOOTER_TUI = r'''#!/usr/bin/env bash
+queued=""
+busy=1
+END_AT=$((SECONDS + ${BUSY_SECS:-3}))
+while [ "$busy" = 1 ]; do
+  printf '\033[H\033[2J  Running the turn (esc to interrupt)\n'
+  printf '\xe2\x9d\xaf %s\n' "$queued"
+  if [ -n "$queued" ]; then
+    printf '  Press up to edit queued messages\n'
+  fi
+  if IFS= read -rsN1 -t 0.2 ch; then
+    case "$ch" in
+      $'\x1b') printf 'INTERRUPTED' > "$END_FILE"; busy=0 ;;
+      $'\n'|$'\r'|'') : ;;
+      *) IFS= read -r rest; queued="$ch$rest"; printf '%s\n' "$queued" >> "$ARRIVALS_FILE" ;;
+    esac
+  fi
+  if [ "$busy" = 1 ] && [ "$SECONDS" -ge "$END_AT" ]; then
+    printf 'NATURAL' > "$END_FILE"; busy=0
+  fi
+done
+printf '\033[H\033[2J'
+printf '%.0s\n' $(seq 1 60)
+if [ -n "$queued" ]; then
+  printf '\xe2\x9d\xaf %s\n' "$queued"
+  printf '%s\n' "$queued" >> "$REC_FILE"
+fi
+while true; do
+  printf '\xe2\x9d\xaf '
+  IFS= read -r line || break
+  printf '%s\n' "$line" >> "$REC_FILE"
+done
+'''
+
+
+def _start_queued_footer_pane(sock, tmp_path, busy_secs):
+    """Same shape as _start_busy_pane, plus an arrivals_file: every distinct
+    line the stand-in actually read off the pty, in order."""
+    rec = tmp_path / "rec.txt"
+    end = tmp_path / "end.txt"
+    arrivals = tmp_path / "arrivals.txt"
+    script = tmp_path / "queued_footer_tui.sh"
+    script.write_text(_QUEUED_FOOTER_TUI)
+    script.chmod(0o755)
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+          f"REC_FILE={rec} END_FILE={end} ARRIVALS_FILE={arrivals} "
+          f"BUSY_SECS={busy_secs} bash {script}")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
+    return rec, end, arrivals
+
+
+def test_default_send_to_busy_pane_with_queued_footer_confirms_delivered_msxj(tmux_socket, tmp_path):
+    # SABLE-msxj: busy_secs is huge so the running turn CANNOT end within the
+    # (tiny) poll budget below — any confirmation must come from recognizing
+    # the queued-messages footer itself, not from h0jw's turn-boundary signals
+    # (which require the turn to actually end or our line to echo as its own
+    # prompt). Pre-fix this exhausted the budget and reported undelivered even
+    # though the line was genuinely queued (SABLE-l8a5).
+    rec, end, arrivals = _start_queued_footer_pane(tmux_socket, tmp_path, busy_secs=60)
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"],
+        capture_output=True, text=True,
+        env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
+             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "5",
+             "SABLE_MSG_POLL_INTERVAL": "0.2"},
+    )
+    assert r.returncode == 0, r.stderr           # footer alone must confirm -> delivered
+    assert "delivered" in r.stderr
+    assert not end.exists(), "the turn must still be running (never reached NATURAL end)"
+    assert arrivals.read_text().count("cap in force") == 1
+
+
+def test_second_send_on_still_busy_pane_does_not_double_queue_msxj(tmux_socket, tmp_path):
+    # THE bead's double-queue repro, end-to-end: two independent sable-msg
+    # invocations target the SAME still-busy pane while the first message is
+    # still sitting queued (footer showing). The second call's t0 capture
+    # already contains the message, so it must skip retyping and just
+    # re-confirm the existing queued line -- a single arrival, not two.
+    rec, end, arrivals = _start_queued_footer_pane(tmux_socket, tmp_path, busy_secs=3)
+    kwargs = dict(
+        capture_output=True, text=True,
+        env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
+             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "5",
+             "SABLE_MSG_POLL_INTERVAL": "0.2"},
+    )
+    r1 = subprocess.run(
+        ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"], **kwargs)
+    assert r1.returncode == 0, r1.stderr
+    r2 = subprocess.run(
+        ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"], **kwargs)
+    assert r2.returncode == 0, r2.stderr
+
+    time.sleep(3.5)  # let the busy turn end naturally so REC_FILE flushes
+    assert end.read_text().strip() == "NATURAL"
+    assert arrivals.read_text().count("cap in force") == 1, \
+        "the second send must not have retyped an already-queued message"
+    assert rec.read_text().count("cap in force") == 1, \
+        "only a single copy of the message must ultimately submit"
+
+
 # --- idle-pane redraw race: report-NOT-landed-when-it-DID (SABLE-uh4b) --------
 # The INVERSE of the m6is/d21h swallow. A message sent to an IDLE standing-by
 # pane really SUBMITS, but the capture taken in the redraw window right after

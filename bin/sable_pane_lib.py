@@ -34,6 +34,17 @@ def _canon(text: str) -> str:
     return "".join(_CTRL_RE.sub("", text).split())
 
 
+def _already_pending(capture_text: str, snippet: str) -> bool:
+    """True when `snippet` already sits somewhere in `capture_text` — evidence a
+    PRIOR deliver_text attempt already typed it into this pane (SABLE-msxj: a
+    caller retrying a busy-at-t0 send whose earlier attempt's line is still
+    queued would otherwise retype it, producing a literal second queued copy and
+    a duplicate turn once both submit). Reuses the same canonical, whitespace/
+    control-byte-insensitive comparison as dispatch_landed."""
+    want = _canon(snippet)
+    return bool(want) and want in _canon(capture_text)
+
+
 def pane_ready(capture: str) -> bool:
     """The TUI is ready to accept input once its input box shows an EMPTY prompt
     line (just the prompt glyph). While booting (splash) or on a blocking gate
@@ -140,6 +151,32 @@ def dispatch_landed(capture: str, snippet: str) -> bool:
     return want not in _canon("\n".join(lines[box_start:]))
 
 
+# The composer's queued-message footer hint (SABLE-msxj). h0jw's box-based
+# delayed-confirm signals assumed a busy-at-t0 line gets hoisted ABOVE the
+# composer with the input box cleared — but the real Claude-TUI instead leaves
+# a queued line visible IN the composer/queued area and marks it with this
+# footer. dispatch_landed's box scan never recognizes that posture (the text
+# never "leaves the box" the way the hoist model expects), so a genuinely
+# delivered-queued send timed out h0jw's poll budget and scored as failure
+# (SABLE-l8a5: closed false-fail, evidence the queued line was live in the pane
+# the whole time).
+_QUEUED_FOOTER_MARKERS = ("press up to edit queued messages",)
+
+
+def pane_has_queued_message(capture: str, snippet: str) -> bool:
+    """True when `snippet` sits in the pane ALONGSIDE the queued-messages footer
+    hint — the real Claude-TUI posture for a line that queued behind a busy turn
+    (SABLE-msxj). Unlike dispatch_landed, this does NOT require the snippet to
+    have left the input box: the footer itself is the delivered-queued proof,
+    independent of exactly where the text renders. Whitespace/control-byte
+    insensitive, matching every other marker check in this module."""
+    want = _canon(snippet)
+    if not want or want not in _canon(capture):
+        return False
+    hay = " ".join(_CTRL_RE.sub(" ", capture).split()).lower()
+    return any(marker in hay for marker in _QUEUED_FOOTER_MARKERS)
+
+
 def submitted_own_turn(capture: str, snippet: str) -> bool:
     """Positive proof that `snippet` is its OWN submitted turn — the signal the
     DELAYED-confirmation path (SABLE-h0jw) polls for after a BUSY-at-t0 send,
@@ -152,9 +189,11 @@ def submitted_own_turn(capture: str, snippet: str) -> bool:
     for one genuinely submitted. d21h could not tell them apart in a single
     capture and so failed CLOSED at t0 — which filed a durable noise bead EVEN
     WHEN the queued line later submitted and landed (LINCOLN 2026-07-14: two
-    instances into chuck's busy pane). This predicate keys on two signals a
-    still-queued capture can NEVER present, so watching it across the turn
-    boundary confirms a real landing without resurrecting the phantom-confirm:
+    instances into chuck's busy pane). This predicate keys on three signals a
+    still-queued capture can NEVER present (the first two watch across the turn
+    boundary; the third recognizes the queued posture itself as already
+    sufficient), so any one of them confirms a real delivered send without
+    resurrecting the phantom-confirm:
 
       1. the pane is IDLE and dispatch_landed — a queued line always sits behind a
          RUNNING turn, so an idle capture proves that turn ended AND our line
@@ -163,7 +202,17 @@ def submitted_own_turn(capture: str, snippet: str) -> bool:
          last prompt-glyph line — our OWN turn has started and echoed our line as
          its prompt (the SABLE-uh4b redraw race). A queued line's busy marker sits
          ABOVE the empty composer that anchors the bottom of the frame, never
-         below our echo, so this branch cannot fire for a merely-queued line."""
+         below our echo, so this branch cannot fire for a merely-queued line; or
+      3. pane_has_queued_message — the real Claude-TUI's queued-messages footer
+         (SABLE-msxj) rendered alongside our snippet. h0jw's assumption above (a
+         queued line gets hoisted above the composer and the box cleared) does not
+         hold for this TUI posture: the line stays visible IN the composer/queued
+         area, so dispatch_landed's box scan never proves it left the box and
+         branches 1-2 above can time out the poll budget on a send that in fact
+         already succeeded — the exact false-fail SABLE-l8a5 evidenced (closed
+         false-fail after the queued line was confirmed live in the pane)."""
+    if pane_has_queued_message(capture, snippet):
+        return True
     if not dispatch_landed(capture, snippet):
         return False
     if pane_idle(capture):
@@ -268,15 +317,27 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
 
     The fresh-pane dispatch (sable-spawn-worker) and manager kicks (sable-tmux /
     -spawn-manager) all wait_for_ready first, so their pane is idle at t0 and takes
-    the idle path below — neither guard false-negatives them."""
+    the idle path below — neither guard false-negatives them.
+
+    A caller may invoke deliver_text again after a busy-at-t0 attempt exhausted
+    its poll budget and reported False (SABLE-msxj) — but if that PRIOR attempt's
+    line is still sitting queued behind the (possibly still-running) turn, typing
+    unconditionally produces a literal SECOND queued copy, and the recipient gets
+    a duplicate turn once both submit. So when the pane is busy at t0 AND
+    `snippet` already sits somewhere in that t0 capture, we skip the type+Enter
+    entirely and fall straight into the same delayed-confirmation poll below for
+    the ALREADY-queued line — idempotent re-verification, not a second send."""
     run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True).returncode == 0)
     capture = capture or (lambda: capture_pane(base, pane))
     sleep = sleep or time.sleep
-    idle_at_send = pane_idle(capture())
-    if run(base + ["send-keys", "-t", pane, "-l", text]) is False:
-        return False
-    if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
-        return False
+    cap0 = capture()
+    idle_at_send = pane_idle(cap0)
+    already_pending = (not idle_at_send) and _already_pending(cap0, snippet)
+    if not already_pending:
+        if run(base + ["send-keys", "-t", pane, "-l", text]) is False:
+            return False
+        if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
+            return False
     if not idle_at_send:
         # Busy at t0: the line queued behind the running turn. Rather than fail
         # closed now (SABLE-d21h) — which filed a noise bead even when the queue
