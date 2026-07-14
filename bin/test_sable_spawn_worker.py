@@ -312,6 +312,24 @@ def test_dispatch_prompt_done_flag_targets_own_pane():
     assert "tmux set-option -p @sable_status done" not in p
 
 
+def test_dispatch_prompt_has_no_unresolvable_templates_reference():
+    """SABLE-zlu8: the worker's CWD is a project worktree, not the SABLE repo,
+    so a relative 'templates/worker-dispatch.md' citation resolves nowhere —
+    every fresh worker burned 1-3min on a `find /` hunting it. The inline
+    contract is self-sufficient; the prompt must cite either an absolute
+    existing path or no path at all."""
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="haiku",
+    )
+    for line in p.splitlines():
+        if "templates/" not in line:
+            continue
+        for token in line.split():
+            if "templates/" in token and not token.startswith("/"):
+                pytest.fail(f"unresolvable relative templates/ reference: {line!r}")
+
+
 def test_read_instruction_is_single_line():
     instr = ssw.read_instruction("/abs/dispatch/X-1.md")
     assert "/abs/dispatch/X-1.md" in instr

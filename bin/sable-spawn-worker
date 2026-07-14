@@ -466,8 +466,8 @@ def assemble_dispatch_prompt(bead_id, title, description, worktree, branch, mode
     return f"""# SABLE worker dispatch — warm-pane self-push
 
 You are a SABLE worker. You are a warm `claude` session in your own tmux pane,
-and your shell CWD already IS your worktree. Run the warm-pane self-push
-lifecycle from templates/worker-dispatch.md.
+and your shell CWD already IS your worktree. Follow the warm-pane self-push
+contract below.
 
 Worktree: {worktree}
 Branch: {branch}
