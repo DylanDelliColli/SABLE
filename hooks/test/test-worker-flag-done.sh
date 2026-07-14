@@ -114,10 +114,14 @@ if command -v bd >/dev/null 2>&1; then
   fi
 fi
 
+# CLAUDE_AGENT_NAME forced empty (SABLE-dcw2): this reap asserts the fleet-wide
+# view over a manually-tagged, lane-less worker pane, so it must not inherit an
+# ambient lane from the runner (a manager pane sets CLAUDE_AGENT_NAME) that the
+# new own-lane default filter would use to scope the lane-less pane out.
 if [ -n "$SCRATCH_BEADS_DIR" ] && [ -n "${REAP_BEAD:-}" ]; then
-  SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION=w BEADS_DB="$SCRATCH_BEADS_DIR/.beads" python3 "$BIN" --reap >/dev/null 2>&1
+  SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION=w CLAUDE_AGENT_NAME="" BEADS_DB="$SCRATCH_BEADS_DIR/.beads" python3 "$BIN" --reap >/dev/null 2>&1
 else
-  SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION=w python3 "$BIN" --reap >/dev/null 2>&1
+  SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION=w CLAUDE_AGENT_NAME="" python3 "$BIN" --reap >/dev/null 2>&1
 fi
 sleep 0.3
 alive_worker="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$WORKER_PANE" || true)"

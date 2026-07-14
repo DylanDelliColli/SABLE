@@ -47,7 +47,11 @@ tag_full() { # tag_full <pane> <role> <bead> <status> <class> <deliverable>
 # SABLE-1kbo: windowed sampling adds a real sleep between two internal
 # listing reads (default 1.5s); shrink it here since none of this suite's
 # cases are timing-sensitive -- they just need the fix to not regress them.
-run_status() { SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION="w" \
+# CLAUDE_AGENT_NAME forced empty (SABLE-dcw2): these cases assert the fleet-wide
+# view over lane-less panes, so the reap/dedup/pending-input mechanics must not
+# depend on an ambient lane leaking in from the runner (a manager pane sets it),
+# which the new own-lane default filter would otherwise scope every pane out of.
+run_status() { SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION="w" CLAUDE_AGENT_NAME="" \
   SABLE_STATUS_SAMPLE_INTERVAL="0.1" python3 "$BIN" "$@"; }
 
 # --- fixture: two worker panes, plus a SECOND session name grouped with the
