@@ -770,6 +770,56 @@ def test_pane_ready_false_on_bypass_warning():
     assert ssw.pane_ready(BYPASS_WARNING) is False
 
 
+# --- dialog/selector posture classifier (SABLE-m94k) -------------------------
+#
+# 73t4 dispatch (2026-07-07): a worker pane came up on an Enter-to-select
+# dialog accept_startup_gate does NOT recognize (only the two known startup
+# gates above), so wait_for_ready polled to timeout and its False return was
+# discarded — the dispatch text got typed straight into the dialog. This
+# classifier lets the caller tell "unrecognized dialog, never type into it"
+# apart from "still booting, keep waiting".
+
+UNKNOWN_SELECT_DIALOG = (
+    "  ? Which package manager would you like to use?\n"
+    "  > 1. npm\n"
+    "    2. yarn\n"
+    "    3. pnpm\n"
+    "  (Use arrow keys, Enter to select)")
+
+
+def test_dialog_posture_true_for_unrecognized_select_menu():
+    assert ssw.dialog_posture(UNKNOWN_SELECT_DIALOG) is True
+
+
+def test_dialog_posture_true_for_known_bypass_gate():
+    # the classifier is deliberately broader than accept_startup_gate: it also
+    # flags gates that DO happen to be recognized/dismissable.
+    assert ssw.dialog_posture(BYPASS_WARNING) is True
+
+
+def test_dialog_posture_true_for_known_trust_gate():
+    assert ssw.dialog_posture(TRUST_DIALOG) is True
+
+
+def test_dialog_posture_false_on_empty_composer_prompt():
+    cap = "splash\n\n❯ \n  ddc@host:~/wt\n  bypass permissions on"
+    assert ssw.dialog_posture(cap) is False
+
+
+def test_dialog_posture_false_while_booting():
+    # not-ready (no empty prompt yet) is NOT the same as a stuck dialog — a
+    # splash screen has neither a numbered menu nor a keypress affordance.
+    cap = "╭─ Claude Code ─╮\n│ Welcome back │\n╰──────────────╯"
+    assert ssw.dialog_posture(cap) is False
+
+
+def test_dialog_posture_false_on_single_incidental_numbered_line():
+    # conservative: ONE numbered-looking line (e.g. scrollback content) must
+    # not false-positive a legit spawn — a real menu always has 2+ options.
+    cap = "❯ \n  1. only one line here, not a menu\n  ddc@host:~/wt"
+    assert ssw.dialog_posture(cap) is False
+
+
 # --- refresh: base-ref fallback (re-homed pre-dispatch-refresh, SABLE-bldh.8) -
 
 import subprocess  # noqa: E402

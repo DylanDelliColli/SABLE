@@ -63,6 +63,12 @@ Env:
   SABLE_MAX_LOAD_PER_CORE  host-resource guard (SABLE-mmdt): refuse spawning
                        when 1-min load average / cpu cores >= this threshold
                        (default 2.0; <=0 disables). Refusal = exit 8.
+  SABLE_DISPATCH_READY_TIMEOUT  seconds to wait for composer posture before
+                       giving up (default 25; 0 skips the wait entirely). A
+                       pane that never reaches composer posture (still
+                       booting, or stuck on an unrecognized dialog/selector,
+                       SABLE-m94k) is never typed into — refusal = exit 10,
+                       naming the pane; the bead stays claimed for retry.
 """
 from __future__ import annotations
 
@@ -78,8 +84,9 @@ from pathlib import Path
 # THIS script even when invoked via a PATH symlink.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    SessionCollision, WORKER_CAP_DEFAULT, accept_startup_gate, dispatch_landed,
-    pane_ready, repo_root, resolve_session, wait_for_ready, worker_cap,
+    SessionCollision, WORKER_CAP_DEFAULT, accept_startup_gate, capture_pane,
+    dialog_posture, dispatch_landed, pane_ready, repo_root, resolve_session,
+    wait_for_ready, worker_cap,
 )
 from sable_pane_lib import deliver_text as deliver_dispatch  # noqa: E402
 
@@ -717,9 +724,11 @@ def new_window_args(session: str, win: str, worktree: str,
             *env_args, "-P", "-F", "#{pane_id}", wcmd]
 
 
-# pane_ready / accept_startup_gate / dispatch_landed / wait_for_ready /
-# deliver_dispatch (= deliver_text) now live in sable_pane_lib (imported above),
-# shared with sable-tmux --autostart (SABLE-bldh.14).
+# pane_ready / accept_startup_gate / dialog_posture / dispatch_landed /
+# wait_for_ready / deliver_dispatch (= deliver_text) / capture_pane now live in
+# sable_pane_lib (imported above), shared with sable-tmux --autostart
+# (SABLE-bldh.14) and, for dialog_posture, the fleet-wide liveness probe
+# (SABLE-axp0).
 
 
 def assemble_dispatch_prompt(bead_id, title, description, worktree, branch, model) -> str:
@@ -1015,7 +1024,24 @@ def main(argv: list[str] | None = None) -> int:
     submit_tries = int(os.environ.get("SABLE_DISPATCH_SUBMIT_TRIES", "8"))
     poll_interval = float(os.environ.get("SABLE_DISPATCH_POLL_INTERVAL", "1.0"))
     if ready_timeout > 0:
-        wait_for_ready(base, pane_id, ready_timeout, interval=poll_interval)
+        # SABLE-m94k: the boolean return was previously DISCARDED here, so a
+        # pane stuck on an unrecognized dialog/selector (accept_startup_gate
+        # only clears the two KNOWN startup gates) fell through to
+        # deliver_dispatch unconditionally — typing the dispatch text INTO
+        # the dialog while the worker sat idle, indistinguishable from a
+        # working lane until a manual capture-pane. Refuse to type instead:
+        # fail LOUD (nonzero exit naming the pane), leave the bead claim
+        # intact for the dispatching manager to retry.
+        if not wait_for_ready(base, pane_id, ready_timeout, interval=poll_interval):
+            cap = capture_pane(base, pane_id)
+            posture = ("an interactive dialog/selector" if dialog_posture(cap)
+                       else "not in composer posture (still booting or stuck)")
+            sys.stderr.write(
+                f"sable-spawn-worker: REFUSING to type into {pane_id} for {bid} — "
+                f"pane shows {posture}, not the composer. Dispatch prompt was NOT "
+                f"typed; {bid} is left claimed for retry. Investigate with "
+                f"`tmux capture-pane -p -t {pane_id}` and re-spawn once clear.\n")
+            return 10
     delivered = deliver_dispatch(base, pane_id, read_instruction(str(dispatch_path)),
                                  bid, tries=submit_tries, interval=poll_interval)
     if not delivered:

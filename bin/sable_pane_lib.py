@@ -101,6 +101,39 @@ def accept_startup_gate(capture: str) -> str | None:
     return None
 
 
+# A numbered menu option line ("1. No, exit", optionally cursor-marked "❯ 2.
+# Yes, I accept"), and the explicit keypress affordances interactive
+# selectors print ("Enter to confirm/select", "(Use arrow keys)", "(y/n)").
+_DIALOG_OPTION_RE = re.compile(r"^[❯>]?\s*\d+[.)]\s+\S")
+_DIALOG_AFFORDANCE_RE = re.compile(
+    r"enter to (confirm|select)|use arrow keys|\(y/n\)", re.IGNORECASE)
+
+
+def dialog_posture(capture: str) -> bool:
+    """True when the pane shows an interactive selector/dialog demanding a
+    keypress — a numbered-choice menu or an explicit 'Enter to confirm/select'
+    /'Use arrow keys' affordance — rather than the normal composer (SABLE-m94k).
+
+    accept_startup_gate only recognizes the two KNOWN blocking gates (the
+    bypass-permissions warning, the trust-folder dialog) well enough to
+    auto-clear them; this predicate instead flags ANY unrecognized dialog so a
+    caller can REFUSE to type into it rather than blindly submit — the 73t4
+    incident that motivated this bead was exactly an Enter-to-select dialog
+    accept_startup_gate did not recognize, so wait_for_ready's False return
+    was silently discarded and the dispatch text was typed into the dialog.
+
+    Deliberately conservative: a booting/splash screen is also not pane_ready,
+    but has neither signature below, so it is correctly NOT flagged as a
+    dialog (still-booting and stuck-on-a-dialog need different handling —
+    the caller retries the former's wait but must never type into the
+    latter). Requires TWO menu-option lines (not one) so a single incidental
+    numbered line in scrollback can't false-positive a legit spawn."""
+    lines = [_clean(line) for line in capture.splitlines()]
+    if any(_DIALOG_AFFORDANCE_RE.search(line) for line in lines):
+        return True
+    return sum(1 for line in lines if line and _DIALOG_OPTION_RE.match(line)) >= 2
+
+
 def dispatch_landed(capture: str, snippet: str) -> bool:
     """True once the instruction has been SUBMITTED: the snippet appears in the
     pane but no longer sits in the input box. The box is the LAST prompt-glyph
