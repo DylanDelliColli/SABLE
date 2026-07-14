@@ -17,8 +17,12 @@ set -uo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="$REPO/bin/sable-worker-status"
 SOCK="wfd-test-$$"
+SCRATCH_BEADS_DIR=""
 
-cleanup() { tmux -L "$SOCK" kill-server >/dev/null 2>&1 || true; }
+cleanup() {
+  tmux -L "$SOCK" kill-server >/dev/null 2>&1 || true
+  [ -n "$SCRATCH_BEADS_DIR" ] && rm -rf "$SCRATCH_BEADS_DIR" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 PASS=0; FAIL=0
@@ -79,7 +83,42 @@ fi
 
 # --- reap then collects the correctly-tagged worker pane, leaving the
 #     manager pane (role != worker) untouched ---
-SABLE_TMUX_SOCKET="$SOCK" python3 "$BIN" --reap >/dev/null 2>&1
+# SABLE-0kj2: two independent gaps in this fixture, both fixed here.
+#
+# (1) SABLE-e1e3 per-repo session scoping (bin/sable_pane_lib.resolve_session):
+# without SABLE_TMUX_SESSION set, --reap derives a session name from the
+# calling process's real repo root (sable-SABLE) instead of using this
+# fixture's actual session "w" (created above via `tmux -L "$SOCK" new-session
+# -d -s w ...`) — list_workers() then scopes to a session that doesn't exist
+# on the isolated socket and silently sees zero panes. Pin SABLE_TMUX_SESSION=w
+# so the reap subprocess looks at the fixture's own session.
+#
+# (2) SABLE-1kbo real-done crosscheck (bead_closed() in bin/sable-worker-status)
+# resolves @sable_bead against the beads tracker before trusting
+# @sable_status=done. Make the fixture bead genuinely resolve as closed by
+# creating + closing a REAL bead in an ISOLATED SCRATCH tracker (never the
+# shared repo DB — SABLE-0ssz fixture-isolation class), then pointing both
+# the create/close and the reap subprocess's `bd show` at that same scratch
+# DB via BEADS_DB — so the assertion actually exercises the confirmed-done
+# path rather than happening to pass via the crosscheck's fails-open-when
+# -unresolvable fallback.
+if command -v bd >/dev/null 2>&1; then
+  SCRATCH_BEADS_DIR=$(mktemp -d)
+  ( cd "$SCRATCH_BEADS_DIR" && BD_NON_INTERACTIVE=1 bd init --prefix=wfd \
+      --non-interactive --skip-agents --skip-hooks --quiet >/dev/null 2>&1 )
+  REAP_BEAD=$(cd "$SCRATCH_BEADS_DIR" && bd create --title="wfd reap-fixture bead" \
+      --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+  if [ -n "$REAP_BEAD" ]; then
+    ( cd "$SCRATCH_BEADS_DIR" && bd close "$REAP_BEAD" >/dev/null 2>&1 )
+    tmux -L "$SOCK" set-option -p -t "$WORKER_PANE" @sable_bead "$REAP_BEAD"
+  fi
+fi
+
+if [ -n "$SCRATCH_BEADS_DIR" ] && [ -n "${REAP_BEAD:-}" ]; then
+  SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION=w BEADS_DB="$SCRATCH_BEADS_DIR/.beads" python3 "$BIN" --reap >/dev/null 2>&1
+else
+  SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION=w python3 "$BIN" --reap >/dev/null 2>&1
+fi
 sleep 0.3
 alive_worker="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$WORKER_PANE" || true)"
 alive_manager="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$MANAGER_PANE" || true)"

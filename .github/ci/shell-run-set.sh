@@ -69,6 +69,7 @@ ALLOW=(
   test-thesis-docs.sh
   test-tree-claim.sh
   test-worker-dispatch-template.sh
+  test-worker-flag-done.sh
 )
 
 # --- Excluded from the run-set, each WITH reason + tracking bead. --------------
@@ -82,7 +83,6 @@ declare -A EXCLUDE=(
   [test-sable-msg.sh]="known-red: legacy fixed-name tmux sessions vs per-repo naming (SABLE-cncs)"
   [test-sable-worker-status.sh]="tracked-red under ambient tmux; green in clean-room but excluded pending confirmation (SABLE-b574)"
   [test-tmux-roles.sh]="known false-positive (SABLE-p9ih)"
-  [test-worker-flag-done.sh]="known-red: reap under grouped-session pane duplication (SABLE-0kj2)"
 )
 
 in_array() { local n="$1"; shift; local e; for e in "$@"; do [ "$e" = "$n" ] && return 0; done; return 1; }
