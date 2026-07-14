@@ -543,6 +543,8 @@ git push -q "$INTNOTIFY_BARE" HEAD:refs/heads/main 2>/dev/null
 git update-ref refs/remotes/origin/main HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 git checkout -q -b tmux-only
 echo i1 > i1.txt; git add i1.txt; git commit -q -m i1
+git push -q "$INTNOTIFY_BARE" HEAD:refs/heads/tmux-only 2>/dev/null
+git update-ref refs/remotes/origin/tmux-only HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically; SABLE-cstk: also required so DEFAULT_BASE_BRANCH resolves to origin/tmux-only instead of silently staying origin/main
 git -C "$INTNOTIFY_REPO" config sable.integrationBranch tmux-only
 cd - >/dev/null
 
@@ -570,6 +572,30 @@ cd - >/dev/null
 INT_INPUT_B=$(make_post_input "git push origin wk-other" "$INTNOTIFY_REPO")
 run_hook "$MGR_ENV SABLE_BASE_BRANCH=origin/llm-integration" "$INT_INPUT_B" >/dev/null
 assert_bd_called "market-brief-package-2u25: non-integration branch push in same repo still notifies"
+
+# --------------------------------------------------------------------------
+# SABLE-cstk: the FILES list itself must diff against origin/<integrationBranch>
+# (tmux-only, adds i1.txt) not the foreign, non-existent SABLE_BASE_BRANCH's
+# internal origin/main fallback (base.txt only, missing i1.txt). Pre-fix,
+# sable_validate_base_ref's OWN hardcoded origin/main fallback wins once
+# origin/llm-integration fails to verify, so the diff also picks up i1.txt
+# (present on tmux-only, absent from origin/main) alongside the real w1.txt
+# change — reproducing the false file list chuck saw live.
+# --------------------------------------------------------------------------
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+INT_INPUT_C=$(make_post_input "git push origin wk-other" "$INTNOTIFY_REPO")
+run_hook "$MGR_ENV SABLE_BASE_BRANCH=origin/llm-integration SABLE_MERGE_NOTIFY_VIA_MSG=0" "$INT_INPUT_C" >/dev/null
+if grep -q 'w1.txt' "$BD_LOG" 2>/dev/null; then
+  pass "SABLE-cstk: FILES list includes the real change (w1.txt) vs origin/tmux-only"
+else
+  fail "SABLE-cstk: FILES list includes the real change (w1.txt) vs origin/tmux-only" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null)"
+fi
+if grep -q 'i1.txt' "$BD_LOG" 2>/dev/null; then
+  fail "SABLE-cstk: FILES list does NOT leak i1.txt from a phantom diff vs origin/main" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null)"
+else
+  pass "SABLE-cstk: FILES list does NOT leak i1.txt from a phantom diff vs origin/main"
+fi
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
 
 # --------------------------------------------------------------------------
 # SABLE-pzfk: default BASE_BRANCH must resolve to the repo's PUBLISHED
