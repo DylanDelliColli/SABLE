@@ -797,6 +797,101 @@ def test_claim_still_runs_when_bead_assigned_to_different_lane(sock):
         assert data[0]["assignee"] == "test-worker", data
 
 
+# --- deterministic done-flag on process exit (SABLE-5v9n) --------------------
+
+STATUS_BIN = Path(__file__).resolve().parent / "sable-worker-status"
+
+
+def test_worker_pane_flips_done_on_process_exit_without_worker_action(sock):
+    """SABLE-5v9n: surfaced by SABLE-2cao.1 live acceptance — a worker that
+    completed its task (self-push + bd close) but never itself ran
+    `tmux set-option ... @sable_status done` left its pane stuck at `running`
+    forever, so `sable-worker-status --reap` never reclaimed it. The done-flag
+    must be DETERMINISTIC on worker process exit, not the worker's own
+    discretionary final act.
+
+    The stub worker below writes a sentinel and exits WITHOUT ever running the
+    tmux command itself (simulating exactly that failure). Proves: (1) the
+    pane's @sable_status still flips to done once the stub process exits, and
+    (2) a subsequent `sable-worker-status --reap` then kills the pane — it
+    survives long enough to be reaped (remain-on-exit) instead of tmux
+    silently destroying it the instant the process exits."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-doneflag-1"
+        db_path = Path(stub_dir) / "beads.json"
+        # status=closed: sable-worker-status's bead_closed() crosscheck
+        # (SABLE-1kbo) only trusts a done tag as-is when the bead resolves
+        # closed (or doesn't resolve at all) -- an open bead would downgrade
+        # the pane to "done-unconfirmed" and reap() would correctly refuse to
+        # kill it, which would defeat this test's own setup, not the fix.
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "closed", "assignee": "test-worker"}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+
+        sentinel = Path(dd) / "sentinel.txt"
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_STATUS_SAMPLE_INTERVAL": "0.1",
+            # stand-in worker: does its "work" then exits -- deliberately
+            # never flags done itself.
+            "SABLE_WORKER_CMD": f"bash --noprofile --norc -c 'echo done > {sentinel}'",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+        env.pop("CLAUDE_AGENT_NAME", None)  # keep lane empty -> preempt is a no-op
+
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt,
+             "--model", "haiku", "--skip-governance"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+
+        # the stub actually ran and exited
+        deadline = time.time() + 5
+        while time.time() < deadline and not sentinel.exists():
+            time.sleep(0.1)
+        assert sentinel.exists(), "stub worker never ran"
+
+        # the pane's @sable_status flips to done on its own, with NO worker
+        # action ever running the tmux command
+        pane, status = None, ""
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            listing = _tmux(sock, "list-panes", "-a", "-F",
+                            "#{pane_id}\t#{@sable_role}\t#{@sable_bead}\t"
+                            "#{@sable_status}").stdout
+            for line in listing.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 4 and parts[1] == "worker" and parts[2] == bead_id:
+                    pane, status = parts[0], parts[3]
+            if status == "done":
+                break
+            time.sleep(0.1)
+        assert status == "done", f"pane never flipped done on process exit (last={status!r})"
+        assert pane
+
+        # sable-worker-status --reap then kills the (now dead) pane
+        rr = subprocess.run(
+            ["python3", str(STATUS_BIN), "--reap"],
+            capture_output=True, text=True, env=env,
+        )
+        assert rr.returncode == 0, rr.stderr
+        time.sleep(0.4)
+        remaining = _tmux(sock, "list-panes", "-a", "-F", "#{pane_id}").stdout
+        assert pane not in remaining.splitlines(), remaining
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
