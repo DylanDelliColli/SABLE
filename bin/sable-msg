@@ -72,14 +72,15 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
     SessionCollision, deliver_text, pane_busy, pane_idle, pane_ready,
-    resolve_session, wait_for_idle,
+    resolve_session, submitted_own_turn, wait_for_idle,
 )
 from sable_pane_lib import capture_pane as _capture_pane  # noqa: E402
 
-# pane_ready / pane_busy / pane_idle are re-exported (not called here directly —
-# wait_for_idle uses pane_idle internally) so the unit suite can assert the
-# predicates via the sable_msg module, mirroring sable-spawn-worker's re-export
-# of the pane helpers. Do not strip them as "unused" (SABLE-m6is).
+# pane_ready / pane_busy / pane_idle / submitted_own_turn are re-exported (not
+# called here directly — wait_for_idle uses pane_idle internally, deliver_text
+# uses submitted_own_turn) so the unit suite can assert the predicates via the
+# sable_msg module, mirroring sable-spawn-worker's re-export of the pane helpers.
+# Do not strip them as "unused" (SABLE-m6is / SABLE-h0jw).
 
 HEADER = "⟦SABLE-MSG⟧"
 

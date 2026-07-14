@@ -140,6 +140,42 @@ def dispatch_landed(capture: str, snippet: str) -> bool:
     return want not in _canon("\n".join(lines[box_start:]))
 
 
+def submitted_own_turn(capture: str, snippet: str) -> bool:
+    """Positive proof that `snippet` is its OWN submitted turn — the signal the
+    DELAYED-confirmation path (SABLE-h0jw) polls for after a BUSY-at-t0 send,
+    instead of failing closed the instant the pane is busy at t0 (SABLE-d21h).
+
+    On a pane that was busy at send time our line first QUEUES behind the running
+    turn: Claude Code hoists it above the composer and clears the input box, so
+    dispatch_landed's visible-and-not-in-box signal holds IDENTICALLY for a line
+    that merely queued (droppable on the running turn's compaction/redraw/reap) as
+    for one genuinely submitted. d21h could not tell them apart in a single
+    capture and so failed CLOSED at t0 — which filed a durable noise bead EVEN
+    WHEN the queued line later submitted and landed (LINCOLN 2026-07-14: two
+    instances into chuck's busy pane). This predicate keys on two signals a
+    still-queued capture can NEVER present, so watching it across the turn
+    boundary confirms a real landing without resurrecting the phantom-confirm:
+
+      1. the pane is IDLE and dispatch_landed — a queued line always sits behind a
+         RUNNING turn, so an idle capture proves that turn ended AND our line
+         persisted in the transcript (a dropped queue-line would be gone); or
+      2. dispatch_landed holds via a running-turn busy marker directly BELOW the
+         last prompt-glyph line — our OWN turn has started and echoed our line as
+         its prompt (the SABLE-uh4b redraw race). A queued line's busy marker sits
+         ABOVE the empty composer that anchors the bottom of the frame, never
+         below our echo, so this branch cannot fire for a merely-queued line."""
+    if not dispatch_landed(capture, snippet):
+        return False
+    if pane_idle(capture):
+        return True
+    lines = capture.splitlines()
+    box_start = None
+    for i, line in enumerate(lines):
+        if _clean(line).startswith(("❯", ">")):
+            box_start = i
+    return box_start is not None and pane_busy("\n".join(lines[box_start + 1:]))
+
+
 def capture_pane(base: list[str], pane: str) -> str:
     # -J joins wrapped lines, so a message wider than the pane comes back as
     # the one line it really is — box detection then sees the whole composer.
@@ -215,13 +251,24 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
     behind the running turn — and a queued line can be dropped on that turn's
     compaction/redraw or a pane reap (the queued-while-busy swallow that stranded
     two handoffs). Only an idle->our-turn transition (idle at t0, then our text
-    visible outside the box) is a genuine submitted turn. When the pane is NOT
-    idle at t0 we still type + submit ONCE (best-effort queue, never worse than
-    the pre-guard behavior) but report False, so the caller degrades to the
-    durable fallback bead instead of a phantom 'delivered'. The fresh-pane
-    dispatch (sable-spawn-worker) and manager kicks (sable-tmux / -spawn-manager)
-    all wait_for_ready first, so their pane is idle at t0 and still lands — this
-    guard does not false-negative them."""
+    visible outside the box) is a genuine submitted turn.
+
+    When the pane is BUSY at t0 we type + submit ONCE (best-effort queue) and then
+    DELAY confirmation (SABLE-h0jw) instead of failing closed immediately (the
+    SABLE-d21h behavior, which filed a durable noise bead EVEN WHEN the queued
+    line later submitted and landed — LINCOLN 2026-07-14, two instances into
+    chuck's busy pane). We watch the queued line across the turn boundary and
+    confirm the moment it PROVABLY became its own submitted turn (submitted_own_turn
+    — a signal a still-queued capture can never present). Only if the poll budget
+    elapses with the line still queued (or dropped) do we report False and let the
+    caller degrade to the durable fallback — never worse than d21h, strictly
+    better whenever the running turn ends within the budget. No Enter is resent on
+    this leg: a queued line auto-submits when the turn ends, and a stray Enter
+    would risk a spurious blank turn.
+
+    The fresh-pane dispatch (sable-spawn-worker) and manager kicks (sable-tmux /
+    -spawn-manager) all wait_for_ready first, so their pane is idle at t0 and takes
+    the idle path below — neither guard false-negatives them."""
     run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True).returncode == 0)
     capture = capture or (lambda: capture_pane(base, pane))
     sleep = sleep or time.sleep
@@ -231,9 +278,17 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
     if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
         return False
     if not idle_at_send:
-        # Busy at t0: the line just queued behind the running turn; we cannot
-        # prove it started its own turn, so fail closed to the durable fallback.
-        return False
+        # Busy at t0: the line queued behind the running turn. Rather than fail
+        # closed now (SABLE-d21h) — which filed a noise bead even when the queue
+        # later submitted+landed — DELAY confirmation (SABLE-h0jw): poll until the
+        # line PROVABLY became its own submitted turn, failing closed only on a
+        # budget timeout. No Enter is resent (a queued line auto-submits on
+        # turn-end; a stray Enter risks a spurious blank turn).
+        for _ in range(max(1, tries)):
+            sleep(interval)
+            if submitted_own_turn(capture(), snippet):
+                return True
+        return submitted_own_turn(capture(), snippet)
     for _ in range(max(1, tries)):
         sleep(interval)
         if dispatch_landed(capture(), snippet):

@@ -277,6 +277,31 @@ def test_default_send_to_busy_turn_does_not_interrupt_and_reports_undelivered(tm
     assert "queued directive" in rec.read_text()      # line still physically queued + ran
 
 
+def test_default_send_to_busy_pane_that_frees_reports_delivered_h0jw(tmux_socket, tmp_path):
+    # SABLE-h0jw: the delayed-confirmation happy path, end-to-end against a REAL
+    # tmux server + real sable-msg subprocess. The pane is BUSY at t0 (mid-turn,
+    # 'esc to interrupt'); our line queues behind that turn. The turn ends WITHIN
+    # the poll budget (busy_secs=1, budget ~=SUBMIT_TRIES*POLL_INTERVAL) and the
+    # queued line submits as its own turn (recorded to REC_FILE). sable-msg must
+    # then report DELIVERED — NOT the d21h fail-close-at-t0 that would have filed a
+    # redundant noise bead for a message that actually landed. AUTO_FALLBACK=0 so a
+    # (pre-fix) failure can't write a real inbox bead; a generous budget clears the
+    # 1s turn. end.txt == NATURAL proves the turn was never interrupted.
+    rec, end = _start_busy_pane(tmux_socket, tmp_path, busy_secs=1)
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"],
+        capture_output=True, text=True,
+        env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
+             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "20",
+             "SABLE_MSG_POLL_INTERVAL": "0.25"},
+    )
+    assert "cap in force" in rec.read_text(), \
+        "precondition: the queued line must have really submitted as a turn"
+    assert r.returncode == 0, r.stderr                 # delayed confirmation -> delivered
+    assert "delivered" in r.stderr
+    assert end.read_text().strip() == "NATURAL"        # default mode never interrupted it
+
+
 # --- idle-pane redraw race: report-NOT-landed-when-it-DID (SABLE-uh4b) --------
 # The INVERSE of the m6is/d21h swallow. A message sent to an IDLE standing-by
 # pane really SUBMITS, but the capture taken in the redraw window right after
