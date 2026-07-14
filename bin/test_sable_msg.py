@@ -23,6 +23,10 @@ _SPEC = importlib.util.spec_from_loader("sable_msg", _LOADER)
 sable_msg = importlib.util.module_from_spec(_SPEC)
 _LOADER.exec_module(sable_msg)
 
+# sable-msg inserts its own dir on sys.path at import, so the shared helper
+# module it imports from is now importable directly for predicate-level tests.
+import sable_pane_lib  # noqa: E402
+
 
 # --- header / message formatting -------------------------------------------
 
@@ -283,6 +287,43 @@ def test_deliver_message_gives_up_when_never_confirmed_landed():
         "%2", message, interrupt=False,
         run=lambda cmd: True,
         capture=lambda: f"❯ {message}\n  ddc@host:~/wt",  # always still in the box
+        sleep=lambda s: None, tries=3, interval=0.01,
+    )
+    assert landed is False
+
+
+# --- visible-versus-submitted: no composer box => not landed (SABLE-wvk9) ----
+
+def test_dispatch_landed_false_when_no_composer_box_even_if_text_visible():
+    # The silent-swallow signature: the typed text is VISIBLE in the capture but
+    # no composer glyph (❯/>) is locatable — a busy pane whose prompt line was
+    # obscured by a spinner/reflow, or a booting/gated pane. We cannot prove the
+    # text left the input box, so it must NOT count as a submitted turn. The old
+    # `box_start is None -> return True` reported these as delivered while the
+    # message sat unsubmitted as pending input (two stranded handoffs).
+    snippet = "⟦SABLE-MSG⟧ from=optimus to=chuck :: PR ready from optimus"
+    # Uses the two REAL swallow fixtures from the bead design field as the
+    # visible-but-boxless payloads.
+    for boxless in (
+        f"● merging PR…\n✻ Thinking… (8s · esc to interrupt)\n{snippet}",
+        "some transcript\n⟦SABLE-MSG⟧ from=lincoln to=worker :: fix SABLE-poka now",
+        "prior output\n⟦SABLE-MSG⟧ from=lincoln to=worker :: stand down",
+    ):
+        # snippet for the fixture rows is the tail after '::'
+        want = boxless.split("::", 1)[-1].strip() if "::" in boxless else snippet
+        assert sable_pane_lib.dispatch_landed(boxless, want) is False
+
+
+def test_deliver_message_boxless_visible_text_degrades_to_failure():
+    # End-to-end through deliver_message: the pane only ever shows the text with
+    # no composer box (never a submitted turn) -> report non-delivery so the
+    # caller routes to the durable fallback bead, not a phantom 'delivered'.
+    message = "⟦SABLE-MSG⟧ from=optimus to=chuck :: PR ready from optimus"
+    landed = sable_msg.deliver_message(
+        "%2", message, interrupt=False,
+        run=lambda cmd: True,
+        # visible in a busy pane, but no ❯/> composer line anywhere
+        capture=lambda: f"✻ Thinking… (esc to interrupt)\n{message}",
         sleep=lambda s: None, tries=3, interval=0.01,
     )
     assert landed is False

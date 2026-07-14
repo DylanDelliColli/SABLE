@@ -207,19 +207,51 @@ if [ "${SABLE_WORKER_LAND_NOTIFY:-1}" = "1" ] \
   fi
 fi
 
-# --- Message-first handoff (SABLE-bldh.15) --------------------------------
-# In the tmux warm-pane topology the worker->merge handoff is a direct message
-# to Chuck: event-driven, no polled bead. If a Chuck pane is reachable, that IS
-# the handoff and we stop here. Fall through to the durable for-chuck bead only
-# when Chuck is unreachable (pane not launched, or Chuck is down) — Chuck's
-# stranded-recovery covers the crash case. Disable with
-# SABLE_MERGE_NOTIFY_VIA_MSG=0.
-if [ "${SABLE_MERGE_NOTIFY_VIA_MSG:-1}" = "1" ] && command -v sable-msg >/dev/null 2>&1; then
+# Is a Chuck pane live on the tmux server (SABLE-wvk9)? A necessary-condition
+# probe that decides whether the message-first handoff is even worth attempting:
+# an absent pane means Chuck was never launched (or is down), so the durable
+# for-chuck bead is the only handoff that survives. Server-wide (-a) is
+# deliberate — this is only a gate; sable-msg itself does the authoritative
+# session-scoped delivery and will still fail-to-bead if the sole chuck pane
+# belongs to another repo's fleet. Fail-OPEN (treat as present) when tmux is
+# unavailable or the listing errors, so a probe hiccup never suppresses a send
+# that would otherwise land.
+sable_chuck_pane_present() {
+  command -v tmux >/dev/null 2>&1 || return 0
+  local roles
+  roles=$(tmux list-panes -a -F '#{@sable_role}' 2>/dev/null) || return 0
+  printf '%s\n' "$roles" | grep -qx chuck
+}
+
+# --- Message-first handoff with durable fallback (SABLE-bldh.15 / SABLE-wvk9) --
+# In the tmux warm-pane topology the worker->merge handoff is a direct message to
+# Chuck: event-driven, no polled bead. But the message send is the handoff ONLY
+# when Chuck actually receives it — it must never suppress the durable for-chuck
+# bead unless delivery is POSITIVELY confirmed to a reachable Chuck pane.
+# SABLE-wvk9: a wk-desc-gate-paths push left BOTH paths silent (no message
+# reached Chuck AND no fallback bead was filed), so the merge stranded until a
+# manual stranded-recovery sweep. Two independent hardenings:
+#   1. Probe for a live Chuck pane (@sable_role=chuck) BEFORE trusting the
+#      message path. No pane => Chuck was never spawned at push time (the exact
+#      incident) or is down: skip the futile send and go straight to the bead.
+#   2. Only `exit 0` on a CONFIRMED send (sable-msg exit 0). Every other outcome
+#      (unreachable / undelivered / messaging disabled) falls through to the
+#      durable for-chuck bead and prints a context line, so the fallback is never
+#      silent again. Disable the message leg with SABLE_MERGE_NOTIFY_VIA_MSG=0.
+FALLBACK_REASON=""
+if [ "${SABLE_MERGE_NOTIFY_VIA_MSG:-1}" != "1" ]; then
+  FALLBACK_REASON="message handoff disabled (SABLE_MERGE_NOTIFY_VIA_MSG=0)"
+elif ! command -v sable-msg >/dev/null 2>&1; then
+  FALLBACK_REASON="sable-msg not on PATH"
+elif ! sable_chuck_pane_present; then
+  FALLBACK_REASON="no reachable chuck pane (not spawned yet, or down)"
+else
   MSG="PR ready from ${SABLE_ID_NAME}: branch ${BRANCH} (${FILES_BRIEF}). Review and merge into the integration branch, then report."
   [ -n "$OVERLAPS" ] && MSG="${MSG} OVERLAP-WARNING: shares files with in-flight work — sequence carefully."
   if sable-msg chuck "$MSG" --from "$SABLE_ID_NAME" >/dev/null 2>&1; then
     exit 0
   fi
+  FALLBACK_REASON="sable-msg could not confirm delivery to chuck"
 fi
 
 # Build description (durable for-chuck bead — fallback path)
@@ -257,5 +289,11 @@ bd create \
   --priority=2 \
   --labels=for-chuck,coord \
   --description "$DESC_LINES" >/dev/null 2>&1 || true
+
+# Context line so the durable fallback is never silent again (SABLE-wvk9). A
+# PostToolUse hook's stdout surfaces to the agent whose Bash push triggered it,
+# so this records — for the worker and any log — WHY the message path did not
+# carry the handoff and that the durable for-chuck bead now covers the merge.
+echo "post-push-merge-notify: ${FALLBACK_REASON:-message delivery not confirmed} — filed durable for-chuck fallback bead (label for-chuck) for branch ${BRANCH}; chuck merges it from the pool."
 
 exit 0

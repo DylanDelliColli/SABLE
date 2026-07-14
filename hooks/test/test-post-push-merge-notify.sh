@@ -109,6 +109,34 @@ EOF
 chmod +x "$STUB_DIR/sable-msg"
 export SABLE_MSG_LOG
 
+# Unified tmux stub. Two probes shell out to tmux and both are stubbed here so
+# every hook invocation is hermetic (never touches the operator's real tmux
+# server):
+#   - list-panes  (SABLE-wvk9 chuck-presence probe): emit a `chuck` role line so
+#     the hook treats Chuck as reachable, UNLESS the test models Chuck absent via
+#     SABLE_STUB_CHUCK_PRESENT=0.
+#   - display-message (SABLE-nmmh worker-landing role gate): echo the pane role
+#     the test pins via SABLE_STUB_PANE_ROLE.
+# Installed with the other fixtures (not late) because the chuck probe runs on
+# EVERY message-block invocation, not only when TMUX_PANE is set. Default =
+# Chuck present, so pre-existing fall-through cases behave as a normal live fleet.
+cat > "$STUB_DIR/tmux" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  if [ "$a" = "list-panes" ]; then
+    [ "${SABLE_STUB_CHUCK_PRESENT:-1}" != "0" ] && echo "chuck"
+    echo "optimus"
+    exit 0
+  fi
+  if [ "$a" = "display-message" ]; then
+    echo "${SABLE_STUB_PANE_ROLE:-}"
+    exit 0
+  fi
+done
+exit 0
+EOF
+chmod +x "$STUB_DIR/tmux"
+
 # Manager identity env
 MGR_ENV="CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager"
 
@@ -406,20 +434,30 @@ rm -f "$BD_LOG"
 git -C "$FIXTURE_REPO" worktree remove --force "$WT_041" 2>/dev/null
 
 # --------------------------------------------------------------------------
-# SABLE-bldh.15: message-first handoff (event-driven Chuck) vs bead fallback
+# SABLE-bldh.15 / SABLE-wvk9: message-first handoff vs durable bead fallback.
+# Reachability is now modeled the way the hook actually decides it: a live
+# @sable_role=chuck pane (tmux stub, SABLE_STUB_CHUCK_PRESENT) gates the send,
+# and only a CONFIRMED sable-msg (rc=0) suppresses the durable bead.
 # --------------------------------------------------------------------------
 
-# (a) Chuck reachable (sable-msg rc=0): the message IS the handoff; NO for-chuck bead.
+# (a) Chuck reachable (pane present + sable-msg rc=0): the message IS the handoff;
+# NO for-chuck bead AND no fallback context line.
 rm -f "$BD_LOG" "$SABLE_MSG_LOG"
-SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV" "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+CTX_A=$(SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV" "$(make_post_input "git push" "$FIXTURE_REPO")")
 if grep -q 'chuck' "$SABLE_MSG_LOG" 2>/dev/null && grep -q 'from optimus' "$SABLE_MSG_LOG" 2>/dev/null; then
   pass "message-first: sable-msg chuck sent (from optimus) when Chuck reachable"
 else
   fail "message-first: sable-msg chuck sent (from optimus)" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null | head -3)"
 fi
+if printf '%s' "$CTX_A" | grep -qi 'fallback bead'; then
+  fail "message-first: NO fallback context line when Chuck reachable+delivered" "STDOUT: $CTX_A"
+else
+  pass "message-first: NO fallback context line when Chuck reachable+delivered"
+fi
 assert_bd_not_called "message-first: NO for-chuck bead when Chuck reachable"
 
-# (b) Chuck unreachable (sable-msg rc=1): message attempted, bead filed (fallback).
+# (b) Chuck pane present but delivery NOT confirmed (sable-msg rc=1): message
+# attempted, then falls through to the durable bead.
 rm -f "$BD_LOG" "$SABLE_MSG_LOG"
 SABLE_MSG_STUB_RC=1 run_hook "$MGR_ENV" "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
 if grep -q 'chuck' "$SABLE_MSG_LOG" 2>/dev/null; then
@@ -427,7 +465,7 @@ if grep -q 'chuck' "$SABLE_MSG_LOG" 2>/dev/null; then
 else
   fail "fallback: sable-msg chuck attempted" "MSG_LOG empty: $(cat "$SABLE_MSG_LOG" 2>/dev/null | head -3)"
 fi
-assert_bd_called "fallback: for-chuck bead filed when Chuck unreachable"
+assert_bd_called "fallback: for-chuck bead filed when delivery not confirmed"
 
 # (c) Messaging disabled (SABLE_MERGE_NOTIFY_VIA_MSG=0): no message attempt; bead filed.
 rm -f "$BD_LOG" "$SABLE_MSG_LOG"
@@ -438,6 +476,31 @@ else
   pass "disabled: sable-msg NOT attempted when SABLE_MERGE_NOTIFY_VIA_MSG=0"
 fi
 assert_bd_called "disabled: for-chuck bead filed when messaging disabled"
+
+# (d) Chuck pane ABSENT (no @sable_role=chuck pane — Chuck not spawned at push
+# time, the exact SABLE-wvk9 incident). The hook must NOT make the futile send,
+# MUST file the durable for-chuck fallback bead, MUST exit 0, and MUST print a
+# context line naming the fallback so it is never silent. Regression guard for
+# the stranded wk-desc-gate-paths merge.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+CTX_D=$(SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV SABLE_STUB_CHUCK_PRESENT=0" "$(make_post_input "git push" "$FIXTURE_REPO")"); WVK9_EXIT=$?
+if [ "$WVK9_EXIT" -eq 0 ]; then
+  pass "SABLE-wvk9: hook exits 0 when Chuck pane absent"
+else
+  fail "SABLE-wvk9: hook exits 0 when Chuck pane absent" "exit=$WVK9_EXIT"
+fi
+if [ -s "$SABLE_MSG_LOG" ]; then
+  fail "SABLE-wvk9: no futile sable-msg attempt when Chuck pane absent" "MSG_LOG: $(cat "$SABLE_MSG_LOG")"
+else
+  pass "SABLE-wvk9: no futile sable-msg attempt when Chuck pane absent"
+fi
+if printf '%s' "$CTX_D" | grep -qi 'durable for-chuck fallback bead' \
+   && printf '%s' "$CTX_D" | grep -qi 'no reachable chuck pane'; then
+  pass "SABLE-wvk9: context line notes the durable for-chuck fallback (Chuck absent)"
+else
+  fail "SABLE-wvk9: context line notes the durable for-chuck fallback (Chuck absent)" "STDOUT: $CTX_D"
+fi
+assert_bd_called "SABLE-wvk9: durable for-chuck bead filed when Chuck pane absent"
 
 # --------------------------------------------------------------------------
 # market-brief-package-2u25: integration-branch self-push must NOT file a
@@ -655,22 +718,9 @@ assert_bd_not_called "SABLE-b06t: 'Everything up-to-date' no-op push does NOT fi
 # (@sable_role=<role>) must not self-notify. Chuck handoff stays regression-intact.
 # --------------------------------------------------------------------------
 
-# Stub tmux: the worker-landing gate reads the pane role via
-# `tmux display-message -p -t <pane> '#{@sable_role}'`. Echo SABLE_STUB_PANE_ROLE
-# for that call; no-op for anything else. Added here (after all earlier tests
-# have run) so it cannot perturb them — and the gate only shells out to tmux
-# when TMUX_PANE is set, which earlier tests never do.
-cat > "$STUB_DIR/tmux" <<'EOF'
-#!/usr/bin/env bash
-for a in "$@"; do
-  if [ "$a" = "display-message" ]; then
-    echo "${SABLE_STUB_PANE_ROLE:-}"
-    exit 0
-  fi
-done
-exit 0
-EOF
-chmod +x "$STUB_DIR/tmux"
+# The tmux stub (display-message role gate + chuck-presence probe) is installed
+# with the fixtures at the top of this file, so the worker-landing cases below
+# read SABLE_STUB_PANE_ROLE through it directly.
 
 # (a) worker landing (@sable_role=worker), Chuck reachable: the dispatching
 # manager (optimus) is messaged with a "Worker landed" wake, --from worker; the
@@ -733,9 +783,6 @@ if grep -qE '^chuck ' "$SABLE_MSG_LOG" 2>/dev/null; then
 else
   fail "SABLE-nmmh: chuck handoff unaffected by SABLE_WORKER_LAND_NOTIFY=0" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
 fi
-
-# Remove the tmux stub so any later-appended tests are unaffected.
-rm -f "$STUB_DIR/tmux"
 
 # --------------------------------------------------------------------------
 # Summary
