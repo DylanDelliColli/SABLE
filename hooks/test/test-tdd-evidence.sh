@@ -114,6 +114,22 @@ run_hook_silent "bash setup.sh not recognized"       "bash setup.sh"
 run_hook_silent "bash deploy-script.sh not recognized" "bash deploy-script.sh"
 run_hook_silent "bd close not recognized as test"    "bd close SABLE-xxx"
 
+# ---------- SABLE-dhfj: runner keyword must be a real invocation token ----------
+# A blind substring match over the whole joined segment text fires on any
+# command that merely MENTIONS a runner keyword — grepping for it, echoing
+# it, or passing it inside an unrelated flag value — without ever running a
+# test. Live repro: a grep whose PATTERN argument contained
+# 'pytest|npm test|vitest' registered as test evidence.
+
+run_hook_silent "grep for 'vitest' in a pattern arg not recognized" \
+  "grep vitest f"
+
+run_hook_silent "echo of the words 'npm test' not recognized" \
+  "echo npm test"
+
+run_hook_silent "bd create --description mentioning pytest not recognized" \
+  "bd create --title=x --description mentions-pytest-but-does-not-run-it"
+
 # ---------- SABLE-d72/lcs: per-agent evidence keying ----------
 # When agent_id is present (a nested subagent), evidence is keyed by
 # session_id + agent_id so one worker's test run cannot satisfy another worker's
