@@ -101,19 +101,17 @@ jobs:
 
       - name: pytest — full bin/ suite (unit + integration; bd/dolt suites self-skip)
         run: |
-          # One bin/ integration test is excluded here (not silently — echoed
-          # below and tracked by bead) because it is attached-client sensitive
-          # and flakes on the shared 2-core runner, which would red the gate
-          # on arrival. It PASSES locally; the gap is the CI runner, not the
-          # code. Widen by dropping a --deselect when its bead lands. Everything
-          # else in bin/ runs (auto-discovery — no silent-green, SABLE-7v3z).
-          # test_sable_dolt_push_integration.py::test_two_concurrent_wrappers_serialize
-          # (SABLE-l7gd) was deselected here for the same reason; the lock's
-          # TOCTOU race (create-then-write, and an unconditional stale-lock
-          # unlink) is now fixed and the test re-enabled.
-          echo "::notice::deselected (CI-flaky, tracked): test_sable_worker_status_integration.py::test_reap_protects_done_pane_in_attached_clients_current_window (SABLE-7dva)"
-          python -m pytest bin/ -q -p no:cacheprovider \
-            --deselect "bin/test_sable_worker_status_integration.py::test_reap_protects_done_pane_in_attached_clients_current_window"
+          # The full bin/ suite runs with NOTHING deselected — auto-discovery,
+          # no testpaths/--ignore, so no bin/ test can exist-but-not-run
+          # (silent-green guard, SABLE-7v3z). The two tests once deselected here
+          # for shared-runner flakiness are both fixed and re-enabled:
+          #   - test_two_concurrent_wrappers_serialize (SABLE-l7gd): lock TOCTOU
+          #     race (create-then-write + unconditional stale-lock unlink) fixed.
+          #   - test_reap_protects_done_pane_in_attached_clients_current_window
+          #     (SABLE-7dva): the pty-attached tmux client now registers
+          #     headlessly (TERM set, own session, drained master fd) instead of
+          #     never attaching on the CI clean-room.
+          python -m pytest bin/ -q -p no:cacheprovider
 
       - name: Fixture isolation tripwire (SABLE-0ssz.2 — ban unsandboxed real-repo git ops)
         run: |
