@@ -173,6 +173,24 @@ sable_instance_base_manager() {
 #       --no-optional-locks, --exec-path=*, --html-path, --man-path, --info-path,
 #       --version, --help.
 #     - If the next non-flag token is exactly `push`, return 0.
+#
+# Multi-line handling (SABLE-qs3r):
+#   shlex.split treats a newline as ordinary whitespace, not a command separator,
+#   so a `git push` sitting on its OWN LINE of a multi-line command (line 1 =
+#   `echo preparing`, line 2 = `git push origin main`) would otherwise be walked
+#   as if it were mid-command and MISSED. To close that gate false-negative we run
+#   the walk over two token sources and match if EITHER sees a push at command
+#   position:
+#     Pass 1 — the whole command tokenized once (catches ; && || | separators and
+#       a push that follows a quote spanning physical lines, e.g.
+#       `bd create --description="a\nb" ; git push`).
+#     Pass 2 — each physical line tokenized independently (an unquoted newline is
+#       a command boundary, so a push on its own line is caught). A line whose
+#       quotes don't balance on their own raises ValueError and is skipped — a
+#       push genuinely buried inside a multi-line quoted string is not a command,
+#       and any real push on a later line is still caught by its own line.
+#   For single-line commands (every real post-push / pre-push caller) both passes
+#   are identical, so behaviour there is unchanged.
 sable_is_git_push() {
   local cmd="${1:-}"
   [ -z "$cmd" ] && return 1
@@ -180,10 +198,6 @@ sable_is_git_push() {
 import os, re, shlex, sys
 
 cmd = os.environ.get('CMD_STR', '')
-try:
-    tokens = shlex.split(cmd)
-except ValueError:
-    sys.exit(1)
 
 SHELL_SEPS = {';', '&&', '||', '|'}
 # git global flags that consume the next token as an argument
@@ -200,51 +214,74 @@ STANDALONE_PREFIXES = ('--exec-path=', '--git-dir=', '--work-tree=', '--namespac
 
 ENV_ASSIGN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
-i = 0
-n = len(tokens)
-# Track whether we are at a command-position (start or after separator)
-at_cmd_pos = True
-while i < n:
-    tok = tokens[i]
-    if tok in SHELL_SEPS:
-        at_cmd_pos = True
+
+def walk(tokens):
+    # Walk a token list; return True iff it contains a git push at command position.
+    i = 0
+    n = len(tokens)
+    # Track whether we are at a command-position (start or after separator)
+    at_cmd_pos = True
+    while i < n:
+        tok = tokens[i]
+        if tok in SHELL_SEPS:
+            at_cmd_pos = True
+            i += 1
+            continue
+        # At command position: transparent env-assignment prefix (NAME=VALUE)
+        if at_cmd_pos and ENV_ASSIGN_RE.match(tok):
+            i += 1  # consume assignment, stay at command position
+            continue
+        # At command position: env(1) prefix — consume it and its own options
+        if at_cmd_pos and tok == 'env':
+            i += 1
+            while i < n:
+                t = tokens[i]
+                if ENV_ASSIGN_RE.match(t):
+                    i += 1   # env NAME=VALUE — consume, stay in env-option walk
+                    continue
+                if t == '-u' and i + 1 < n:
+                    i += 2   # env -u NAME — consume both, stay in env-option walk
+                    continue
+                break        # next token is the real command — fall through to outer loop
+            continue         # re-evaluate tokens[i] at command position (at_cmd_pos still True)
+        if at_cmd_pos and tok == 'git':
+            # Found git at command position — now walk flags
+            i += 1
+            while i < n:
+                t = tokens[i]
+                if t in CONSUME_NEXT:
+                    i += 2  # skip flag + its argument
+                    continue
+                if t in STANDALONE or any(t.startswith(p) for p in STANDALONE_PREFIXES):
+                    i += 1
+                    continue
+                # Not a known flag — this must be the subcommand
+                return t == 'push'
+            # Ran out of tokens after git — no subcommand found
+            return False
+        # Not at command position or not git/env/assignment
+        at_cmd_pos = False
         i += 1
-        continue
-    # At command position: transparent env-assignment prefix (NAME=VALUE)
-    if at_cmd_pos and ENV_ASSIGN_RE.match(tok):
-        i += 1  # consume assignment, stay at command position
-        continue
-    # At command position: env(1) prefix — consume it and its own options
-    if at_cmd_pos and tok == 'env':
-        i += 1
-        while i < n:
-            t = tokens[i]
-            if ENV_ASSIGN_RE.match(t):
-                i += 1   # env NAME=VALUE — consume, stay in env-option walk
-                continue
-            if t == '-u' and i + 1 < n:
-                i += 2   # env -u NAME — consume both, stay in env-option walk
-                continue
-            break        # next token is the real command — fall through to outer loop
-        continue         # re-evaluate tokens[i] at command position (at_cmd_pos still True)
-    if at_cmd_pos and tok == 'git':
-        # Found git at command position — now walk flags
-        i += 1
-        while i < n:
-            t = tokens[i]
-            if t in CONSUME_NEXT:
-                i += 2  # skip flag + its argument
-                continue
-            if t in STANDALONE or any(t.startswith(p) for p in STANDALONE_PREFIXES):
-                i += 1
-                continue
-            # Not a known flag — this must be the subcommand
-            sys.exit(0 if t == 'push' else 1)
-        # Ran out of tokens after git — no subcommand found
-        sys.exit(1)
-    # Not at command position or not git/env/assignment
-    at_cmd_pos = False
-    i += 1
+    return False
+
+
+def tokenize(s):
+    try:
+        return shlex.split(s)
+    except ValueError:
+        return None
+
+
+# Pass 1: whole command as one token stream (; && || | separators; newlines
+# inside quotes preserved). Pass 2: each physical line independently so an
+# unquoted newline acts as a command boundary. Match if EITHER sees a push.
+whole = tokenize(cmd)
+if whole is not None and walk(whole):
+    sys.exit(0)
+for line in cmd.split('\n'):
+    toks = tokenize(line)
+    if toks is not None and walk(toks):
+        sys.exit(0)
 sys.exit(1)
 " 2>/dev/null
 }

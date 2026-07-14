@@ -488,6 +488,21 @@ is_push_test "sable_is_git_push: 'env FOO=bar git push'" "env FOO=bar git push" 
 is_push_test "sable_is_git_push: 'env -u GIT_DIR git push'" "env -u GIT_DIR git push" 0
 is_push_test "sable_is_git_push: 'echo SABLE_SKIP_PRE_PUSH=1 git push' is NOT push" "echo SABLE_SKIP_PRE_PUSH=1 git push" 1
 is_push_test "sable_is_git_push: 'bd create --description=FOO=1 git push' is NOT push" 'bd create --description="FOO=1 git push"' 1
+# multi-line command cases (SABLE-qs3r) — a newline is a command-position
+# boundary; shlex.split alone treats it as plain whitespace and MISSED a push on
+# its own line. f5m0's delegation regressed this vs the qfvn/ykij tokenizer.
+is_push_test "sable_is_git_push: push on line 2 of a multi-line command is push" \
+  "$(printf 'echo preparing\ngit push origin main')" 0
+is_push_test "sable_is_git_push: push on line 3 after two setup lines is push" \
+  "$(printf 'bd update x --claim\necho ready\ngit push')" 0
+is_push_test "sable_is_git_push: 'git -C /x push' on its own line is push" \
+  "$(printf 'echo prep\ngit -C /x push')" 0
+is_push_test "sable_is_git_push: multi-line with NO push stays not-push" \
+  "$(printf 'echo one\ngit status\ngit log --grep push')" 1
+is_push_test "sable_is_git_push: multi-line mention only (echo git push) is NOT push" \
+  "$(printf 'echo starting\necho git push\ndone')" 1
+is_push_test "sable_is_git_push: multi-line quoted description mention is NOT push" \
+  "$(printf 'bd create --title=x\nbd note --description="git push in prose"')" 1
 
 # --------------------------------------------------------------------------
 # sable_validate_base_ref unit tests (SABLE-61n)
