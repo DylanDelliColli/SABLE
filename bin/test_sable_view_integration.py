@@ -39,9 +39,12 @@ def _tmux(s, *args, check=True):
 
 
 def _run(s, *args):
+    env = {**os.environ, "SABLE_TMUX_SOCKET": s,
+           "SABLE_TMUX_SESSION": SESSION}
+    env.pop("TMUX", None)
+    env.pop("TMUX_PANE", None)
     return subprocess.run(["python3", str(BIN), *args], capture_output=True, text=True,
-                          env={**os.environ, "SABLE_TMUX_SOCKET": s,
-                             "SABLE_TMUX_SESSION": SESSION})
+                          env=env)
 
 
 def _seed_session(s):
