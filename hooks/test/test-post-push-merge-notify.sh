@@ -68,7 +68,8 @@ git -C "$FIXTURE_REPO" config user.name "Test"
 echo "x" > initial.txt
 git add initial.txt
 git commit -q -m "initial"
-git push -q origin HEAD:refs/heads/main 2>/dev/null
+git push -q "$BARE_ORIGIN" HEAD:refs/heads/main 2>/dev/null
+git update-ref refs/remotes/origin/main HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 # Add a second commit so diff yields a file name
 echo "y" > feature.txt
 git add feature.txt
@@ -87,7 +88,8 @@ git commit -q -m "feature"
 # unconfigured-repo default of 'main', false-triggering the
 # integration-branch self-push guard.
 FIXTURE_CUR_BRANCH=$(git symbolic-ref --short HEAD)
-git push -q origin "HEAD:refs/heads/$FIXTURE_CUR_BRANCH" 2>/dev/null
+git push -q "$BARE_ORIGIN" "HEAD:refs/heads/$FIXTURE_CUR_BRANCH" 2>/dev/null
+git update-ref "refs/remotes/origin/$FIXTURE_CUR_BRANCH" HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 cd - >/dev/null
 
 # Create stub bd binary that counts calls and logs for-chuck label usage
@@ -302,7 +304,8 @@ git -C "$INT_REPO" config user.name "Integration"
 echo "a" > base.txt
 git add base.txt
 git commit -q -m "base"
-git push -q origin HEAD:refs/heads/main 2>/dev/null
+git push -q "$INT_BARE" HEAD:refs/heads/main 2>/dev/null
+git update-ref refs/remotes/origin/main HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 echo "b" > feature2.txt
 git add feature2.txt
 git commit -q -m "feature2"
@@ -313,7 +316,8 @@ git commit -q -m "feature2"
 # renamed to 'main' either, to avoid colliding with
 # sable_resolve_integration_branch's unconfigured-repo default).
 INT_CUR_BRANCH=$(git symbolic-ref --short HEAD)
-git push -q origin "HEAD:refs/heads/$INT_CUR_BRANCH" 2>/dev/null
+git push -q "$INT_BARE" "HEAD:refs/heads/$INT_CUR_BRANCH" 2>/dev/null
+git update-ref "refs/remotes/origin/$INT_CUR_BRANCH" HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 cd - >/dev/null
 # Note: origin/dev intentionally NOT created
 
@@ -432,7 +436,8 @@ cd_fixture "$WT_041"
 echo "z" > wt_change.txt
 git add wt_change.txt
 git commit -q -m "wt change on wk-041"
-git push -q origin HEAD:refs/heads/wk-041 2>/dev/null
+git push -q "$BARE_ORIGIN" HEAD:refs/heads/wk-041 2>/dev/null
+git update-ref refs/remotes/origin/wk-041 HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 cd - >/dev/null
 
 INPUT=$(make_post_input "git -C $WT_041 push" "$FIXTURE_REPO")
@@ -530,7 +535,8 @@ git clone -q "$INTNOTIFY_BARE" "$INTNOTIFY_REPO"
 cd_fixture "$INTNOTIFY_REPO"
 git -C "$INTNOTIFY_REPO" config user.email "t@t"; git -C "$INTNOTIFY_REPO" config user.name "t"
 echo base > base.txt; git add base.txt; git commit -q -m base
-git push -q origin HEAD:refs/heads/main 2>/dev/null
+git push -q "$INTNOTIFY_BARE" HEAD:refs/heads/main 2>/dev/null
+git update-ref refs/remotes/origin/main HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 git checkout -q -b tmux-only
 echo i1 > i1.txt; git add i1.txt; git commit -q -m i1
 git -C "$INTNOTIFY_REPO" config sable.integrationBranch tmux-only
@@ -554,7 +560,8 @@ rm -f "$SABLE_MSG_LOG"
 cd_fixture "$INTNOTIFY_REPO"
 git checkout -q -b wk-other tmux-only
 echo w1 > w1.txt; git add w1.txt; git commit -q -m w1
-git push -q origin HEAD:refs/heads/wk-other 2>/dev/null
+git push -q "$INTNOTIFY_BARE" HEAD:refs/heads/wk-other 2>/dev/null
+git update-ref refs/remotes/origin/wk-other HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 cd - >/dev/null
 INT_INPUT_B=$(make_post_input "git push origin wk-other" "$INTNOTIFY_REPO")
 run_hook "$MGR_ENV SABLE_BASE_BRANCH=origin/llm-integration" "$INT_INPUT_B" >/dev/null
@@ -581,20 +588,23 @@ git clone -q "$PZFK_BARE" "$PZFK_REPO"
 cd_fixture "$PZFK_REPO"
 git -C "$PZFK_REPO" config user.email "p@p"; git -C "$PZFK_REPO" config user.name "p"
 echo base > base.txt; git add base.txt; git commit -q -m base
-git push -q origin HEAD:refs/heads/main 2>/dev/null
+git push -q "$PZFK_BARE" HEAD:refs/heads/main 2>/dev/null
+git update-ref refs/remotes/origin/main HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 
 git checkout -q -b tmux-only
 for i in 1 2 3 4 5 6 7 8 9; do echo "d$i" > "doc$i.txt"; done
 git add doc*.txt
 git commit -q -m "integration branch doc history"
-git push -q origin HEAD:refs/heads/tmux-only 2>/dev/null
+git push -q "$PZFK_BARE" HEAD:refs/heads/tmux-only 2>/dev/null
+git update-ref refs/remotes/origin/tmux-only HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 git -C "$PZFK_REPO" config sable.integrationBranch tmux-only
 
 git checkout -q -b wk-worker
 echo real > real_change.txt
 git add real_change.txt
 git commit -q -m "worker: real change"
-git push -q origin HEAD:refs/heads/wk-worker 2>/dev/null
+git push -q "$PZFK_BARE" HEAD:refs/heads/wk-worker 2>/dev/null
+git update-ref refs/remotes/origin/wk-worker HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 cd - >/dev/null
 
 # Section-local bd stub: `list --status=in_progress --json` returns a real
@@ -667,10 +677,12 @@ cd_fixture "$B06T_REPO"
 git -C "$B06T_REPO" config user.email "b@b"; git -C "$B06T_REPO" config user.name "b"
 echo base > base.txt; git add base.txt; git commit -q -m base
 B06T_MAIN=$(git symbolic-ref --short HEAD)
-git push -q origin "HEAD:refs/heads/$B06T_MAIN" 2>/dev/null
+git push -q "$B06T_BARE" "HEAD:refs/heads/$B06T_MAIN" 2>/dev/null
+git update-ref "refs/remotes/origin/$B06T_MAIN" HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 # Also publish origin/main so BASE_BRANCH resolution (default/fallback) has
 # a real diff target — mirrors the FIXTURE_REPO/INT_REPO fixtures above.
-git push -q origin HEAD:refs/heads/main 2>/dev/null
+git push -q "$B06T_BARE" HEAD:refs/heads/main 2>/dev/null
+git update-ref refs/remotes/origin/main HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 
 # A branch with a real local commit that is NOT (yet) on origin — models a
 # push that never actually landed, whatever the reason (rejected, network/
@@ -702,7 +714,8 @@ assert_bd_not_called "SABLE-b06t: empty stdout/stderr + unpushed branch does NOT
 # (3) Now actually push wk-b06t for real — the branch tip IS confirmable on
 # origin — and confirm notify fires.
 cd_fixture "$B06T_REPO"
-git push -q origin HEAD:refs/heads/wk-b06t 2>/dev/null
+git push -q "$B06T_BARE" HEAD:refs/heads/wk-b06t 2>/dev/null
+git update-ref refs/remotes/origin/wk-b06t HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
 cd - >/dev/null
 rm -f "$BD_LOG" "$SABLE_MSG_LOG"
 B06T_INPUT_3=$(make_post_input "git push" "$B06T_REPO")
