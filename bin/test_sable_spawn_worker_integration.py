@@ -341,16 +341,26 @@ def test_spawn_refused_when_host_load_exceeds_guard(sock):
 
 # --- re-homed pre-dispatch governance (SABLE-bldh.8) -------------------------
 
-def _write_fake_bd(stub_dir: Path, db_path: Path) -> None:
+def _write_fake_bd(stub_dir: Path, db_path: Path, strict_claim: bool = False) -> None:
     """A stand-in `bd` CLI backed by a JSON file, NOT the real beads database —
     lets the duplicate-dispatch integration test flip a bead's status between
     two subprocess calls (exactly like a real --claim would) without mutating
-    project state. Placed first on PATH for the child process."""
+    project state. Placed first on PATH for the child process.
+
+    strict_claim=True (SABLE-m40k) makes --claim faithfully reproduce the real
+    `bd` behavior this bead fixes: it ERRORS "already claimed by <assignee>"
+    whenever the bead already has a truthy assignee, regardless of what
+    identity is attempting the claim — real bd's built-in claim-idempotency
+    keys off its OWN --actor identity (git user.name/$USER), which never
+    equals a SABLE lane name, so it never treats "assignee == lane" as a
+    no-op. Default False keeps the lenient stand-in pre-existing tests rely on
+    (claim always succeeds, assignee flips to "test-worker")."""
     script = stub_dir / "bd"
     script.write_text(f'''#!/usr/bin/env python3
 import json, sys
 
 DB = {str(db_path)!r}
+STRICT_CLAIM = {strict_claim!r}
 
 def load():
     with open(DB) as f:
@@ -370,6 +380,9 @@ elif args[:1] == ["update"] and "--claim" in args:
     data = load()
     for b in data:
         if b.get("id") == bid:
+            if STRICT_CLAIM and b.get("assignee"):
+                sys.stderr.write("Error: issue already claimed by " + str(b.get("assignee")) + chr(10))
+                sys.exit(1)
             b["status"] = "in_progress"
             b["assignee"] = "test-worker"
     save(data)
@@ -551,6 +564,113 @@ def test_claim_then_hold_blocks_when_derived_worktree_exists(sock):
         finally:
             if derived.exists():
                 shutil.rmtree(derived, ignore_errors=True)
+
+
+# --- SABLE-m40k: idempotent claim skip ---------------------------------------
+
+
+def test_claim_skipped_when_bead_already_assigned_to_dispatching_lane(sock):
+    """SABLE-m40k: SABLE-676c let a claim-then-hold bead (bare in_progress, no
+    pane/worktree evidence) pass the duplicate-dispatch GUARD, but the spawn
+    helper still ran an unconditional `bd update --claim` afterward — and real
+    `bd --claim` is only idempotent against ITS OWN actor identity (git
+    user.name/$USER), which never equals a SABLE lane name, so it errored
+    "already claimed by <lane>" and aborted the whole spawn. Proves: when the
+    bead's assignee IS the dispatching lane (self-claim-then-hold, OR a
+    different manager's REASSIGNMENT to this lane — SABLE-m40k design note),
+    the helper skips the redundant claim call instead of erroring.
+    strict_claim=True makes the fake bd raise exactly that real-world error if
+    the unconditional claim call is ever (re)made, so a regression here fails
+    loudly instead of silently passing."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-selfclaim-1"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "in_progress", "assignee": "optimus"}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path, strict_claim=True)
+
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "CLAUDE_AGENT_NAME": "optimus",
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+
+        # --worktree override => worktree-evidence does not fire, and no pane
+        # is tagged for the bead yet => no pane-evidence: the bare in_progress
+        # claim-then-hold must PASS, and the claim call must be SKIPPED.
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "skipping redundant bd update --claim" in r.stderr
+        time.sleep(0.5)
+
+        assert (Path(dd) / f"{bead_id}.md").exists()
+        listing = _tmux(sock, "list-panes", "-a", "-F",
+                        "#{@sable_role} #{@sable_bead} #{@sable_status}").stdout
+        assert any(
+            line.startswith("worker") and bead_id in line and "running" in line
+            for line in listing.splitlines()
+        ), listing
+
+
+def test_claim_still_runs_when_bead_assigned_to_different_lane(sock):
+    """SABLE-m40k design note: the idempotent-claim skip must key on the
+    bead's assignee matching the DISPATCHING lane specifically. A bead
+    assigned to a DIFFERENT lane (no dispatch evidence, so the duplicate guard
+    still allows a bare in_progress claim through) must still go through the
+    normal `bd update --claim` call rather than being silently skipped. Uses
+    the lenient fake bd (assignee flips to "test-worker" on a successful
+    claim) and asserts that flip actually happened, proving the claim call
+    fired."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-otherlane-1"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "in_progress", "assignee": "tarzan"}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "CLAUDE_AGENT_NAME": "optimus",
+            "SABLE_MAX_LOAD_PER_CORE": "0",
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "skipping redundant bd update --claim" not in r.stderr
+        time.sleep(0.3)
+
+        data = json.loads(db_path.read_text())
+        assert data[0]["assignee"] == "test-worker", data
 
 
 if __name__ == "__main__":
