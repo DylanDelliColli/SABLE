@@ -36,7 +36,18 @@ class FakeTmux:
         verb = args[0]
         target = args[args.index("-t") + 1] if "-t" in args else None
         if verb == "has-session":
-            rc = 0 if target in self.sessions else 1
+            # Mirrors real tmux target resolution (confirmed live, SABLE-hvwk):
+            # a '=' prefix forces exact match; a bare name matches exactly if
+            # possible, else falls back to a prefix/fnmatch scan -- which is
+            # the hazard this bead exists to close (has-session -t sable
+            # exiting 0 just because 'sable-alpha' exists).
+            if target is not None and target.startswith("="):
+                rc = 0 if target[1:] in self.sessions else 1
+            elif target in self.sessions:
+                rc = 0
+            else:
+                prefix_matches = [s for s in self.sessions if s.startswith(target)]
+                rc = 0 if len(prefix_matches) == 1 else 1
             return subprocess.CompletedProcess(cmd, rc, "", "")
         if verb == "show-options":
             val = self.repos.get(target)
@@ -70,6 +81,32 @@ def test_sanitize_empty_falls_back():
 
 def test_derived_session_uses_basename():
     assert lib.derived_session("/home/x/dev/SABLE") == "sable-SABLE"
+
+
+# --- session_exists (SABLE-hvwk) ---------------------------------------------
+# tmux resolves a bare -t target with prefix/fnmatch semantics when there's no
+# exact match, so has-session -t sable would spuriously report success just
+# because some unrelated session 'sable-alpha' exists. session_exists() must
+# anchor the target with '=' to force an exact match.
+
+def test_session_exists_true_for_exact_match():
+    fake = FakeTmux(sessions={"sable-repoA"})
+    assert lib.session_exists(["tmux"], "sable-repoA", run=fake) is True
+
+
+def test_session_exists_does_not_prefix_match_other_sessions():
+    # Only 'sable-alpha' exists; a bare has-session -t sable would prefix-
+    # match it in real tmux (proven by FakeTmux modeling that fallback) --
+    # session_exists() must NOT report 'sable' as existing.
+    fake = FakeTmux(sessions={"sable-alpha"})
+    assert lib.session_exists(["tmux"], "sable", run=fake) is False
+
+
+def test_session_exists_sends_exact_match_anchor():
+    fake = FakeTmux(sessions={"sable-alpha"})
+    lib.session_exists(["tmux"], "sable", run=fake)
+    [call] = fake.calls
+    assert call[-1] == "=sable"
 
 
 # --- resolve_session precedence ---------------------------------------------

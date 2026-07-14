@@ -350,8 +350,15 @@ def derived_session(root: str) -> str:
 
 
 def session_exists(base: list[str], name: str, run=None) -> bool:
+    """True iff a session literally named `name` exists. The '=' anchor forces
+    tmux's exact-match target syntax -- a bare name falls back to fnmatch/
+    prefix resolution when there's no exact match, so has-session -t sable
+    would spuriously succeed whenever some OTHER session merely starts with
+    'sable' (e.g. a per-repo sable-<repo> fleet), which is exactly the
+    collision LEGACY_SESSION ('sable') is a prefix of every derived name for
+    (SABLE-hvwk)."""
     run = run or _tmux_run
-    return run(base + ["has-session", "-t", name]).returncode == 0
+    return run(base + ["has-session", "-t", f"={name}"]).returncode == 0
 
 
 def session_repo(base: list[str], name: str, run=None) -> str | None:
