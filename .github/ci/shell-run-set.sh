@@ -45,6 +45,7 @@ ALLOW=(
   test-pre-dispatch-overlap.sh
   test-pre-dispatch-preempt.sh
   test-pre-dispatch-refresh.sh
+  test-pre-push-rebase-concurrency.sh
   test-pre-push-rebase-test.sh
   test-quickstart-orchestration.sh
   test-read-guard.sh
