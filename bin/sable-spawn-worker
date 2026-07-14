@@ -37,9 +37,18 @@ PreToolUse:Agent hooks (hooks/multi-manager/pre-dispatch-{overlap,preempt,
 refresh}.sh), now re-homed as pre-spawn steps here since those hooks only ever
 fired on the (now-unused) Agent dispatch path.
 
+Respawn (SABLE-3eax): the manager REVISE / push-only close-out pattern
+re-spawns a worker into the SAME worktree to finish a bead's landing. --respawn
+(requires --worktree) makes that a first-class flow rather than needing the
+blunt --skip-governance: it reopens a CLOSED bead to in_progress (so the claim
+never traceback-crashes), releases a stranded tree-claim whose holder no longer
+has a live pane, and passes the duplicate-dispatch guard when no LIVE pane
+carries the bead tag — while KEEPING model-check active.
+
 Usage:
   sable-spawn-worker <bead-id> [--worktree PATH] [--model M|--model M:reason]
                      [--scope NAME] [--session NAME] [--skip-governance]
+                     [--respawn]
 
 Env:
   SABLE_TMUX_SOCKET    tmux socket (-L) for isolation/tests
@@ -198,7 +207,8 @@ def worktree_dispatch_exists(path: str) -> bool:
 
 
 def already_in_progress_check(bead: dict, pane_evidence: bool,
-                              worktree_evidence: bool) -> str | None:
+                              worktree_evidence: bool,
+                              respawn: bool = False) -> str | None:
     """Refuse a SECOND spawn for a bead already IN_PROGRESS — but ONLY when
     DISPATCH EVIDENCE exists (SABLE-676c). Evidence is a running worker pane
     tagged with the bead id (`bead_pane_tagged`) or an existing derived worktree
@@ -212,9 +222,18 @@ def already_in_progress_check(bead: dict, pane_evidence: bool,
     anywhere — the SABLE-676c false positive that forced the racy
     `bd update --status=open` workaround. Racing a live worker (or a leftover
     worktree from a died/stalled one) is still a real duplicate-work/double-push
-    hazard and stays blocked. Returns an error string to block, or None to allow."""
+    hazard and stays blocked. Returns an error string to block, or None to allow.
+
+    respawn=True is the SABLE-3eax REVISE / push-only close-out: the worktree is
+    being DELIBERATELY reused, so worktree-evidence is EXPECTED and never a
+    duplicate signal — only a LIVE worker pane still carrying the bead tag blocks
+    (two workers racing the same push). The reused tree is reconciled separately
+    by releasing any stranded tree-claim (release_stale_tree_claim), not by
+    refusing the dispatch."""
     if bead.get("status") != "in_progress":
         return None
+    if respawn:
+        worktree_evidence = False
     if not (pane_evidence or worktree_evidence):
         return None
     assignee = bead.get("assignee") or "unassigned"
@@ -504,6 +523,61 @@ def refresh_worktree(worktree: str, base_branch: str | None) -> str | None:
     return None
 
 
+# --- respawn (REVISE / push-only close-out) support (SABLE-3eax) --------------
+
+
+def needs_reopen(bead: dict) -> bool:
+    """(a) SABLE-3eax: a respawn targets a bead that was CLOSED (its landing is
+    being finished / revised). It must be reopened to in_progress BEFORE the
+    claim/close flow, or the unconditional `bd update --claim` traceback-crashes
+    (a closed bead is not claimable — the actual blocker observed 2026-07-14)."""
+    return bead.get("status") == "closed"
+
+
+def tree_claim_file(worktree: str) -> str | None:
+    """The tree-claim lockfile path for `worktree`, or None outside a git repo.
+    Mirrors tree-claim.sh / sable-claim: `$(git -C <wt> rev-parse --git-dir)`
+    then `/sable-tree-claim`. For a LINKED worktree the git-dir is the
+    per-worktree `.git/worktrees/<name>`, so each worktree has its OWN claim file
+    (a relative git-dir on older git is resolved against the worktree)."""
+    r = subprocess.run(["git", "-C", worktree, "rev-parse", "--git-dir"],
+                       capture_output=True, text=True)
+    gd = r.stdout.strip() if r.returncode == 0 else ""
+    if not gd:
+        return None
+    if not os.path.isabs(gd):
+        gd = os.path.join(worktree, gd)
+    return os.path.join(gd, "sable-tree-claim")
+
+
+def release_stale_tree_claim(worktree: str, holder_pane_live: bool) -> str | None:
+    """(b) SABLE-3eax: a reaped worker session strands its worktree tree-claim
+    (`<worktree-gitdir>/sable-tree-claim`); until it TTL-expires (default 3600s),
+    tree-claim.sh DENIES the respawned worker's index-mutating git ops, so the
+    spawn was blocked until a manual `sable-claim release --force`. When
+    respawning into a worktree whose claim holder no longer has a live pane,
+    release the claim so the fresh worker isn't blocked.
+
+    holder_pane_live is the liveness signal: a worktree's tree-claim is, by
+    construction, held by the worker session working IN that worktree, and that
+    worker's pane is the bead-tagged pane — so "no live pane carries the bead
+    tag" (holder_pane_live=False) means the holder session is gone. A LIVE holder
+    is never disturbed (and a live pane also refuses the respawn upstream via the
+    duplicate guard). No-op when there is no claim file or the path is not a git
+    repo. Returns a status message when it releases, else None."""
+    if holder_pane_live:
+        return None
+    cf = tree_claim_file(worktree)
+    if not cf or not os.path.isfile(cf):
+        return None
+    try:
+        os.remove(cf)
+    except OSError as e:
+        return f"respawn: could not release stale tree-claim {cf}: {e}"
+    return (f"respawn: released stale tree-claim {cf} (holder session has no live "
+            "pane) so the fresh worker's git ops are not denied until TTL")
+
+
 def worker_command(model: str, override: str | None) -> str:
     """Default worker command pins the model AND an auto-approving permission
     posture — a hands-off worker must run writes AND bash (mkdir/pytest/git/tmux)
@@ -682,6 +756,18 @@ def _repo_toplevel() -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def _live_bead_pane(base: list[str], session: str, bead_id: str) -> bool:
+    """True when a LIVE running pane in `session` is tagged @sable_bead ==
+    bead_id (dispatch evidence). Fails open (False) when the session doesn't
+    exist yet. Shared by the duplicate-dispatch guard and the respawn tree-claim
+    release, so both read the SAME liveness signal (SABLE-3eax)."""
+    try:
+        listing = _run(base + ["list-panes", "-s", "-t", session, "-F", _BEAD_FORMAT])
+    except subprocess.CalledProcessError:
+        listing = ""
+    return bead_pane_tagged(listing, bead_id)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sable-spawn-worker")
     p.add_argument("bead_id")
@@ -693,7 +779,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--session", help="target session (default: SABLE_TMUX_SESSION, "
                                      "else derived per-repo — see sable-session)")
     p.add_argument("--skip-governance", action="store_true")
+    p.add_argument("--respawn", action="store_true",
+                   help="REVISE / push-only close-out into an existing worktree "
+                        "(SABLE-3eax): reopen a closed bead, release a stranded "
+                        "stale tree-claim, and pass the duplicate guard when no "
+                        "live pane carries the tag — model-check stays active. "
+                        "Requires --worktree.")
     ns = p.parse_args(sys.argv[1:] if argv is None else argv)
+
+    # --respawn re-enters a SPECIFIC existing worktree — it has no meaning without
+    # one (a fresh `bd worktree create` tree has nothing to revise). Require it
+    # explicitly rather than silently deriving/creating a tree.
+    if ns.respawn and not ns.worktree:
+        p.error("--respawn requires --worktree PATH (the existing worktree to "
+                "re-enter for the REVISE / push-only close-out)")
 
     # --- SABLE-38zi re-dispatch guard. FIRST, before any bead fetch / tmux /
     # worktree side effect, so a refused re-dispatch from a worker pane leaves
@@ -740,6 +839,13 @@ def main(argv: list[str] | None = None) -> int:
     model, reason = resolve_model(bead_labels(bead), ns.model)
     lane = resolve_lane(ns.lane)
 
+    # Dispatch evidence: a LIVE running pane tagged with this bead. Computed once
+    # here so the duplicate-dispatch guard AND the respawn tree-claim release
+    # (SABLE-3eax) read the SAME liveness signal. Skipped only for a plain
+    # --skip-governance spawn that isn't a respawn (nothing consumes it there).
+    pane_ev = (_live_bead_pane(base, ns.session, bid)
+               if (not ns.skip_governance or ns.respawn) else False)
+
     # --- governance: model-check + duplicate-dispatch + preempt + claim +
     # overlap advisory (SABLE-bldh.6 re-homed model-check/claim; SABLE-bldh.8
     # re-homes the remaining PreToolUse:Agent hooks as pre-spawn steps here).
@@ -750,21 +856,33 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"sable-spawn-worker: model-check blocked — {err}\n")
             return 3
 
+        # SABLE-3eax (a): a respawn (REVISE / push-only close-out) may target a
+        # CLOSED bead — reopen it to in_progress FIRST, or the `bd update --claim`
+        # that follows a non-respawn path traceback-crashes on it AND the worker's
+        # own `bd close` has nothing to close. model-check above already ran, so
+        # keeping it active is preserved.
+        if ns.respawn and needs_reopen(bead):
+            reopen = subprocess.run(["bd", "update", bid, "--status", "in_progress"],
+                                    capture_output=True, text=True)
+            if reopen.returncode != 0:
+                sys.stderr.write(f"sable-spawn-worker: respawn could not reopen closed "
+                                 f"bead {bid}: {reopen.stderr.strip()}\n")
+                return 5
+            bead["status"] = "in_progress"
+            sys.stderr.write(f"sable-spawn-worker: respawn reopened closed bead {bid} "
+                             "-> in_progress\n")
+
         # SABLE-676c: an IN_PROGRESS bead is a duplicate ONLY when dispatch
         # evidence exists — a RUNNING worker pane tagged with the bead, or the
         # derived wk-<scope> worktree already on disk. A bare claim with neither
         # is the manager claim-then-hold pattern (this bead's OWN first dispatch)
-        # and must pass, not be refused as a duplicate.
-        try:
-            evidence_listing = _run(base + ["list-panes", "-s", "-t", ns.session,
-                                            "-F", _BEAD_FORMAT])
-        except subprocess.CalledProcessError:
-            evidence_listing = ""  # no session yet -> no pane evidence; fail open
-        pane_ev = bead_pane_tagged(evidence_listing, bid)
+        # and must pass, not be refused as a duplicate. SABLE-3eax: a respawn
+        # deliberately REUSES the worktree, so worktree-evidence is expected and
+        # never blocks it — only a LIVE pane still carrying the tag does.
         tl = "" if ns.worktree else _repo_toplevel()
         wt_ev = worktree_dispatch_exists(
             prospective_worktree_path(bid, ns.scope, ns.worktree, tl))
-        dup_err = already_in_progress_check(bead, pane_ev, wt_ev)
+        dup_err = already_in_progress_check(bead, pane_ev, wt_ev, respawn=ns.respawn)
         if dup_err:
             sys.stderr.write(f"sable-spawn-worker: duplicate-dispatch blocked — {dup_err}\n")
             return 5
@@ -776,7 +894,17 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stderr.write(f"sable-spawn-worker: preempt blocked — {preempt_err}\n")
                 return 6
 
-        if bead_already_claimed_by_lane(bead, lane):
+        if ns.respawn:
+            # SABLE-3eax (c): a respawn is a REVISE / push-only close-out of work
+            # THIS lane already owns — never re-run `bd update --claim`. The bead
+            # is (re)opened above and already assigned; real `bd --claim` errors
+            # 'already claimed' against any assignee that isn't bd's own actor
+            # identity (SABLE-m40k) — which for a respawn is the norm. Ownership
+            # stands from the original dispatch.
+            sys.stderr.write(
+                f"sable-spawn-worker: respawn — not re-claiming {bid} "
+                "(REVISE / push-only close-out of owned work)\n")
+        elif bead_already_claimed_by_lane(bead, lane):
             sys.stderr.write(
                 f"sable-spawn-worker: {bid} already assigned to lane '{lane}' — "
                 "skipping redundant bd update --claim (SABLE-m40k)\n")
@@ -791,6 +919,16 @@ def main(argv: list[str] | None = None) -> int:
     # --- worktree ---
     if ns.worktree:
         worktree = ns.worktree
+        # SABLE-3eax (b): before the fresh worker runs any git, release a
+        # tree-claim stranded by a reaped predecessor — tree-claim.sh would
+        # otherwise DENY the respawned worker's index-mutating git ops until the
+        # claim TTL-expires (the manual `sable-claim release --force` wall). Only
+        # when the holder has no live pane (pane_ev False); a live pane already
+        # refused the respawn in the duplicate guard above.
+        if ns.respawn:
+            release_msg = release_stale_tree_claim(worktree, holder_pane_live=pane_ev)
+            if release_msg:
+                sys.stderr.write(f"sable-spawn-worker: {release_msg}\n")
         # Refresh (SABLE-bldh.8), lowest priority: only reusing an EXISTING
         # worktree needs a rebase — a freshly `bd worktree create`d tree below
         # is already at the base HEAD.
