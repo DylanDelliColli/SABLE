@@ -489,6 +489,48 @@ def test_worker_command_override_used_verbatim():
     assert ssw.worker_command("haiku", "bash --norc") == "bash --norc"
 
 
+# --- deterministic done-flag (SABLE-5v9n) ------------------------------------
+
+def test_with_lifecycle_flags_sets_running_before_and_done_after():
+    wrapped = ssw.with_lifecycle_flags("claude --model haiku")
+    assert wrapped == (
+        'tmux set-option -p -t "$TMUX_PANE" @sable_status running; '
+        'claude --model haiku; '
+        'tmux set-option -p -t "$TMUX_PANE" @sable_status done'
+    )
+
+
+def test_with_lifecycle_flags_uses_semicolon_not_and_and():
+    """The done flip must fire even when the worker command exits non-zero or
+    crashes -- `&&` would skip it exactly when a worker dies mid-task, which
+    is precisely the case a deterministic reaper signal must cover."""
+    wrapped = ssw.with_lifecycle_flags("bash -c 'exit 1'")
+    assert "&&" not in wrapped
+    assert wrapped.endswith('; tmux set-option -p -t "$TMUX_PANE" @sable_status done')
+
+
+def test_with_lifecycle_flags_running_is_the_first_command():
+    """Setting `running` from INSIDE the pane's own script (as the very first
+    action, before the worker command even starts) instead of via a separate
+    manager-side set-option call after window creation is what makes the
+    done-flip race-free: a fast-exiting worker can't have its done write
+    clobbered by a slower, external 'running' write racing in afterward."""
+    wrapped = ssw.with_lifecycle_flags("claude --model haiku")
+    assert wrapped.startswith('tmux set-option -p -t "$TMUX_PANE" @sable_status running;')
+
+
+def test_with_lifecycle_flags_wraps_override_too():
+    """SABLE_WORKER_CMD overrides (the test stand-in mechanism) must also be
+    wrapped -- the whole point is a lifecycle flag that no longer depends on
+    which command is actually running in the pane."""
+    wrapped = ssw.with_lifecycle_flags(ssw.worker_command("haiku", "bash --noprofile --norc"))
+    assert wrapped == (
+        'tmux set-option -p -t "$TMUX_PANE" @sable_status running; '
+        'bash --noprofile --norc; '
+        'tmux set-option -p -t "$TMUX_PANE" @sable_status done'
+    )
+
+
 # --- lane identity (SABLE-bldh.13) ------------------------------------------
 
 def test_resolve_lane_prefers_explicit_override(monkeypatch):

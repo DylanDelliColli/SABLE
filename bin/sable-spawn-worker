@@ -11,10 +11,23 @@ Per bead, a manager (Optimus/Tarzan) calls this to:
   6. send a single-line "read your dispatch file and execute it" instruction.
 
 The worker then runs the warm-pane self-push lifecycle (worker-dispatch.md):
-self-push its branch, bd close, then flag itself done with an EXPLICIT target
-(`tmux set-option -p -t "$TMUX_PANE" @sable_status done`) — omitting `-t`
-resolves the target from the operator's active pane, not the worker's own
-(market-brief-package-uj22 / SABLE-5v9n).
+self-push its branch and bd close. The done-flag itself is DETERMINISTIC
+(SABLE-5v9n), not the worker's own discretionary final act: the spawned pane
+command is wrapped (with_lifecycle_flags) so `tmux set-option -p -t
+"$TMUX_PANE" @sable_status` flips running -> done from INSIDE the pane's own
+script, unconditionally, when the worker's process exits — regardless of
+whether the worker itself remembers to run it. The dispatch
+prompt still also tells the worker to flag done as a belt-and-suspenders act
+with an EXPLICIT target (omitting `-t` resolves the target from the
+operator's active pane, not the worker's own — market-brief-package-uj22);
+harmless if both fire, since the tmux command is idempotent. A worker that
+treats `bd close` as the end of its job (the observed SABLE-2cao.1 failure,
+where the LLM never ran the tmux command itself) no longer leaves its pane
+stuck at `running` forever. `remain-on-exit` is also set globally (before the
+window is created, so every pane inherits it from the start with no
+post-creation race) so an exited pane survives long enough for
+`sable-worker-status --reap` to observe the done tag and kill it, instead of
+tmux silently destroying it the instant the wrapped command finishes.
 Results flow back via the bead pool; `sable-worker-status --reap` cleans up.
 
 Governance runs before the spawn unless --skip-governance: model-check + claim
@@ -502,6 +515,40 @@ def worker_command(model: str, override: str | None) -> str:
     return f"claude --model {model} {perm}".strip()
 
 
+def with_lifecycle_flags(cmd: str) -> str:
+    """Wrap `cmd` so its OWN pane process flips @sable_status running -> done
+    itself, at both ends (SABLE-5v9n). `running` is set as the FIRST action,
+    before `cmd` starts; `done` is set LAST, unconditionally, once `cmd` exits
+    — `;` (not `&&`) is deliberate: the flag must flip even when `cmd` exits
+    non-zero or crashes, since whether the worker succeeded is irrelevant to
+    whether the pane is DONE running.
+
+    Both flips happen INSIDE the pane's own shell, sequentially in the SAME
+    script as `cmd` — the manager does NOT separately set @sable_status via
+    its own post-creation `set-option` call (see main(): only @sable_role/
+    @sable_bead/@sable_repo are set that way). A manager-side 'running' write
+    races a fast-exiting worker (a test stand-in, or a `claude` boot that
+    dies immediately): if the worker's own done-flip lands before the
+    manager's post-creation call fires, that call CLOBBERS done back to
+    running — observed while writing this fix's own integration test, whose
+    stub worker exits in milliseconds. Doing both flips from inside the pane
+    removes the two-actor race entirely: @sable_status is written by exactly
+    one process, in one deterministic order, regardless of how fast `cmd`
+    runs. $TMUX_PANE is set by tmux for any process running inside a pane
+    from the moment it starts, so no pane id needs to be known up front and
+    no readiness wait is needed before the leading `running` write.
+
+    Previously the done-flag was the worker LLM's own DISCRETIONARY final
+    act — a worker that treated `bd close` as the end of its job (the
+    observed SABLE-2cao.1 failure) left its pane stuck at `running` forever,
+    so `sable-worker-status --reap` never reclaimed it. Applied to the
+    resolved command AFTER any SABLE_WORKER_CMD override, deliberately: the
+    wrapping must be unconditional across every worker command shape,
+    including test stand-ins, not just the default `claude` invocation."""
+    tag = 'tmux set-option -p -t "$TMUX_PANE" @sable_status'
+    return f'{tag} running; {cmd}; {tag} done'
+
+
 def resolve_lane(override: str | None) -> str:
     """The identity to stamp on the worker = the invoking LANE MANAGER. Explicit
     --lane wins; else this process's CLAUDE_AGENT_NAME (the manager pane that ran
@@ -775,14 +822,27 @@ def main(argv: list[str] | None = None) -> int:
         worktree, branch, model))
 
     # --- open the worker window (stamped with the lane identity) + capture pane ---
+    # SABLE-5v9n: set remain-on-exit GLOBALLY, BEFORE the window is created,
+    # so it is already in effect the instant the pane's process starts. A
+    # very fast-exiting command (or a claude boot that dies immediately) can
+    # exit before any POST-creation per-pane `set-option` call would land —
+    # setting it after new-window races the pane's own destruction and every
+    # subsequent tag-set call fails with "no such pane". A global default set
+    # first has no such window: every pane on this server inherits it from
+    # creation.
+    subprocess.run(base + ["set-option", "-g", "remain-on-exit", "on"], check=True)
     win = window_name(bid)
-    wcmd = worker_command(model, os.environ.get("SABLE_WORKER_CMD"))
+    wcmd = with_lifecycle_flags(worker_command(model, os.environ.get("SABLE_WORKER_CMD")))
     pane_id = _run(base + new_window_args(ns.session, win, worktree,
                                           worker_env_args(lane), wcmd)).strip()
 
-    # --- tag the pane for the registry + reaper ---
-    tags = [("@sable_role", "worker"), ("@sable_bead", bid),
-            ("@sable_status", "running")]
+    # --- tag the pane for the registry + reaper. @sable_status is NOT set
+    # here (SABLE-5v9n): with_lifecycle_flags already sets it running/done
+    # from INSIDE the pane's own script — a manager-side write here would
+    # race a fast-exiting worker and could clobber a done flip that already
+    # landed. @sable_role/@sable_bead/@sable_repo have no such writer on the
+    # pane side, so setting them post-creation is race-free. ---
+    tags = [("@sable_role", "worker"), ("@sable_bead", bid)]
     root = repo_root()
     if root:
         tags.append(("@sable_repo", root))
