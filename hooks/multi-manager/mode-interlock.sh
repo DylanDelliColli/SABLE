@@ -111,6 +111,8 @@ MODE_BIN="$HOOK_DIR/../../bin/sable-mode"
 # SABLE_MODE_STATE unchanged, so a test/operator override is preserved.
 # shellcheck source=lib-mode-path.sh
 . "$HOOK_DIR/lib-mode-path.sh"
+# shellcheck source=lib-identity.sh
+. "$HOOK_DIR/lib-identity.sh"
 HOOK_CWD="$(printf '%s' "$INPUT" | python3 -c "
 import json, sys
 try:
@@ -291,48 +293,24 @@ is_spawn_call() {
 
 # is_git_push <command> → true iff <command> genuinely runs `git … push` in
 # command-word position, NOT merely names the phrase inside a quoted argument
-# (SABLE-qfvn / SABLE-ykij). The pre-fix regex `git[[:space:]]+push` let a space
-# inside a quoted string count as a word boundary, so a bd --description body, a
-# sable-note, or a sable-msg message that merely NAMED "git push" false-matched
-# and was denied — the same plain-space defect SABLE-pi5m removed from the name /
-# helper legs. shlex tokenization collapses each quoted span into ONE token, so
-# the phrase inside prose never yields a bare `push` token; only a real
-# invocation does. Every ;/&&/||/| segment (and each newline-separated line) is
-# walked, so a chained `bd create && git push` is still caught, and a
-# `git -C DIR push` (git in command position, push a later word — which the old
-# adjacent-only regex MISSED, so wrong-tree pushes slipped) is now correctly
-# denied. Leading VAR=val assignment prefixes are skipped so `ENV=x git push`
-# still matches. Unbalanced-quote input fails toward deny (naive split).
+# (SABLE-qfvn / SABLE-ykij), AND only when `push` is the git SUBCOMMAND itself
+# rather than some later, unrelated token (SABLE-f5m0). The qfvn/ykij tokenizer
+# checked `seg[i] == 'git' and 'push' in seg[i+1:]` — "push" as ANY later token —
+# so a git subcommand that merely carries a bare "push" argument false-matched:
+# `git log --grep push`, `git commit -m push`, `git checkout push` (a branch
+# literally named push), `git branch push`. That is the same over-broad
+# "phrase appears somewhere in the segment" class the parent beads fixed for
+# quoted prose, now shifted onto real git-subcommand arguments.
+#
+# Delegates to sable_is_git_push (lib-identity.sh), the canonical implementation
+# already used by the push-repo-dir resolver (SABLE-041): it walks git's global
+# flags (-C DIR, -c x=y, --no-pager, --git-dir=VALUE, env/env-assignment
+# prefixes, …) and only matches when the first non-flag token AFTER those is
+# exactly `push` — i.e. push must be the subcommand, not merely present
+# somewhere in the argument list. One source of truth for both call sites
+# instead of two independently-drifting tokenizers.
 is_git_push() {
-  printf '%s' "$1" | python3 -c "
-import shlex, sys, re
-ASSIGN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
-PUNCT = re.compile(r'^[;()|&<>]+\$')
-def seg_is_push(seg):
-    i = 0
-    while i < len(seg) and ASSIGN.match(seg[i]):
-        i += 1
-    return i < len(seg) and seg[i] == 'git' and 'push' in seg[i+1:]
-def tokenize(line):
-    try:
-        lex = shlex.shlex(line, posix=True, punctuation_chars=';()|&<>')
-        lex.whitespace_split = True
-        return list(lex)
-    except ValueError:
-        return line.split()
-for line in sys.stdin.read().splitlines():
-    seg = []
-    for t in tokenize(line):
-        if PUNCT.match(t):
-            if seg_is_push(seg):
-                sys.exit(0)
-            seg = []
-        else:
-            seg.append(t)
-    if seg_is_push(seg):
-        sys.exit(0)
-sys.exit(1)
-" 2>/dev/null
+  sable_is_git_push "$1"
 }
 
 # ---------------------------------------------------------------------------
