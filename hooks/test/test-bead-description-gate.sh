@@ -367,6 +367,28 @@ assert_nudge "docs: pathless description still flagged (default)" "" \
   "bd create --title=foo --description=\"Fix the thing. Test in the test file.\"" \
   "file paths"
 
+# ---------- bin/ + .yml + dot-dir path tests (SABLE-fupt) ----------
+
+# Test 44b: description citing only bin/<executable> (extensionless) → passes
+BIN_PATH_DESC="Fix bin/sable-view to handle the new flag. TDD red-green confirms fix."
+assert_allow "docs: bin/ extensionless executable passes file-path check (default)" "" \
+  "bd create --title=foo --description=\"$BIN_PATH_DESC\""
+
+# Test 44c: description citing only a .github/workflows/*.yml path → passes
+YML_PATH_DESC="Fix .github/workflows/test.yml to run on push. TDD red-green confirms fix."
+assert_allow "docs: .github/*.yml path passes file-path check (default)" "" \
+  "bd create --title=foo --description=\"$YML_PATH_DESC\""
+
+# Test 44d: description citing only a dot-dir path with no recognized extension → passes
+DOTDIR_PATH_DESC="Add .github/CODEOWNERS entry for the hooks directory. TDD red-green confirms fix."
+assert_allow "docs: dot-dir extensionless path passes file-path check (default)" "" \
+  "bd create --title=foo --description=\"$DOTDIR_PATH_DESC\""
+
+# Test 44e: a genuinely pathless description still trips the gate (regression guard)
+assert_nudge "docs: pathless description still flagged after bin//.yml/dot-dir fix (default)" "" \
+  "bd create --title=foo --description=\"Fix the thing properly. TDD red-green confirms fix.\"" \
+  "file paths"
+
 # ---------- Short-flag alias tests (-d / -f) (SABLE-iyv) ----------
 
 GOOD_SHORT_DESC="hooks/bead-description-gate.sh line 98: extend HAS_FILE_FLAG regex. Test in hooks/test/test-bead-description-gate.sh — assert_nudge for -f."
