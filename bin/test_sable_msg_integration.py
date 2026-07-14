@@ -458,6 +458,63 @@ def test_pane_session_wins_over_mismatched_cwd_repo(tmux_socket, tmp_path):
     assert "CROSS-REPO-DELIVERED" not in _capture(tmux_socket, sess_b)
 
 
+# --- duplicate bead tags after REVISE re-spawn (SABLE-qq6r) ------------------
+# The live repro: a manager re-spawns a worker into the SAME worktree (REVISE
+# protocol), creating a fresh pane before the old one is reaped. Both panes end
+# up tagged with the same @sable_bead — sable-msg --bead must route to the
+# LIVE one, not whichever the done-unaware lookup happened to pick.
+
+def _start_worker_pane(sock, session, window_name, bead, status):
+    """A bash REPL stand-in for a worker pane in its own window (so it
+    coexists with other worker panes under one @sable_role=worker registry,
+    matching a real fleet where duplicate-bead panes live in the same tmux
+    session), tagged @sable_role=worker, @sable_bead=<bead>,
+    @sable_status=<status>."""
+    _tmux(sock, "new-window", "-t", session, "-n", window_name,
+          "PS1='> ' bash --noprofile --norc")
+    time.sleep(0.3)
+    target = f"{session}:{window_name}"
+    pane_id = _tmux(sock, "list-panes", "-t", target, "-F", "#{pane_id}").stdout.strip()
+    _tmux(sock, "set-option", "-p", "-t", pane_id, "@sable_role", "worker")
+    _tmux(sock, "set-option", "-p", "-t", pane_id, "@sable_bead", bead)
+    _tmux(sock, "set-option", "-p", "-t", pane_id, "@sable_status", status)
+    return pane_id
+
+
+def test_bead_message_routes_to_running_pane_not_stale_done_duplicate(tmux_socket):
+    # THE bead repro, live: old done-but-unreaped pane and fresh running pane
+    # both tagged SABLE-pi5m. --bead delivery must land in the running one.
+    _tmux(tmux_socket, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+          "PS1='> ' bash --noprofile --norc")
+    time.sleep(0.3)
+    done_pane = _start_worker_pane(tmux_socket, "w", "old", "SABLE-pi5m", "done")
+    running_pane = _start_worker_pane(tmux_socket, "w", "new", "SABLE-pi5m", "running")
+
+    r = _run_msg(tmux_socket, "SABLE-pi5m", "echo BEAD-MSG-LANDED",
+                 "--from", "optimus", "--bead")
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.8)
+    assert "BEAD-MSG-LANDED" in _capture(tmux_socket, running_pane)
+    assert "BEAD-MSG-LANDED" not in _capture(tmux_socket, done_pane)
+
+
+def test_bead_message_only_done_pane_reports_undelivered_with_reap_hint(tmux_socket):
+    # Only a done-but-unreaped pane matches — must fail loudly with a reap
+    # hint, never silently deliver into the dead composer and report success.
+    _tmux(tmux_socket, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+          "PS1='> ' bash --noprofile --norc")
+    time.sleep(0.3)
+    done_pane = _start_worker_pane(tmux_socket, "w", "old", "SABLE-ghost", "done")
+
+    r = _run_msg(tmux_socket, "SABLE-ghost", "echo SHOULD-NOT-LAND",
+                 "--from", "optimus", "--bead")
+    assert r.returncode != 0
+    assert "done" in r.stderr
+    assert "reap" in r.stderr.lower()
+    time.sleep(0.5)
+    assert "SHOULD-NOT-LAND" not in _capture(tmux_socket, done_pane)
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
