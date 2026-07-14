@@ -251,7 +251,8 @@ def test_deliver_message_retries_until_header_lands_outside_input_box():
     screens = iter([
         "╭─ Claude Code ─╮\n│ booting… │\n╰──────────╯",             # not ready
         "╭─ Claude Code ─╮\n│ booting… │\n╰──────────╯",             # not ready
-        "❯ \n  ddc@host:~/wt",                                       # ready, empty box
+        "❯ \n  ddc@host:~/wt",                                       # ready+idle (wait_for_idle returns)
+        "❯ \n  ddc@host:~/wt",                                       # idle at send (deliver_text t0, SABLE-d21h)
         "❯ ⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force\n  ddc@host:~/wt",  # still in box
         "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force\n"
         "● thinking…\n❯ \n  ddc@host:~/wt",                          # landed
@@ -280,13 +281,27 @@ def test_deliver_message_retries_until_header_lands_outside_input_box():
 
 
 def test_deliver_message_gives_up_when_never_confirmed_landed():
-    # The message NEVER leaves the input box (e.g. the recipient pane died
-    # mid-turn) -> deliver_message must report failure, not delivery.
+    # Idle at send time, but the message NEVER leaves the input box (the
+    # dropped-Enter race that never wins, or the pane dies mid-turn) ->
+    # deliver_message must report failure, not delivery. Stateful fake: an empty
+    # idle composer BEFORE we type (so idle_at_send is True and it is NOT the
+    # SABLE-d21h guard that fails this), then the message stuck in the box
+    # forever thereafter.
     message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    state = {"typed": False}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
+        return True
+
+    def capture():
+        if not state["typed"]:
+            return "❯ \n  ddc@host:~/wt"             # idle at t0
+        return f"❯ {message}\n  ddc@host:~/wt"        # stuck in the box thereafter
+
     landed = sable_msg.deliver_message(
-        "%2", message, interrupt=False,
-        run=lambda cmd: True,
-        capture=lambda: f"❯ {message}\n  ddc@host:~/wt",  # always still in the box
+        "%2", message, interrupt=False, run=run, capture=capture,
         sleep=lambda s: None, tries=3, interval=0.01,
     )
     assert landed is False
@@ -329,6 +344,105 @@ def test_deliver_message_boxless_visible_text_degrades_to_failure():
     assert landed is False
 
 
+# --- queued-while-busy: pre-send idle tracking (SABLE-d21h) ------------------
+# dispatch_landed alone (visible AND not-in-box) cannot tell "our message
+# started this turn" from "our message QUEUED behind a DIFFERENT running turn":
+# Claude Code hoists a queued line ABOVE the composer and clears the input box,
+# so both look identical in a single capture. A queued line can then be dropped
+# on the running turn's compaction/redraw or a pane reap — the swallow that
+# stranded two handoffs. The fix captures pane_idle at t0 (before the send) and
+# only counts an idle->our-turn transition; busy-at-t0 fails closed so the
+# caller routes to the durable fallback bead.
+
+def test_deliver_message_queued_while_busy_is_not_landed():
+    # THE bead repro: the pane is BUSY running a DIFFERENT turn at send time
+    # (its status line shows 'esc to interrupt'). After we type+Enter, our line
+    # is hoisted ABOVE an empty composer while the OTHER turn keeps running —
+    # visible AND not-in-box — yet it was only QUEUED, never accepted as its own
+    # submitted turn. Pre-send state was busy, so deliver_message must report NOT
+    # landed (sable-msg then files the durable fallback).
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    other_turn = "● Running the auth refactor…\n✻ Thinking… (12s · esc to interrupt)"
+    state = {"typed": False}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
+        return True
+
+    def capture():
+        if not state["typed"]:
+            # t0: someone else's turn is running (busy) — no empty composer.
+            return f"{other_turn}\n❯ \n  ddc@host:~/wt"
+        # after we type+Enter: our line hoisted above the (still-empty) composer
+        # while the OTHER turn keeps running -> visible + not-in-box, but queued.
+        return f"{message}\n{other_turn}\n❯ \n  ddc@host:~/wt"
+
+    landed = sable_msg.deliver_message(
+        "%2", message, interrupt=False, run=run, capture=capture,
+        sleep=lambda s: None, tries=4, interval=0.01,
+    )
+    assert landed is False
+
+    # Proof the pre-send idle guard is load-bearing: on the hoisted capture, the
+    # old visible-vs-submitted signal (dispatch_landed) would have FALSE-POSITIVED.
+    hoisted = f"{message}\n{other_turn}\n❯ \n  ddc@host:~/wt"
+    assert sable_pane_lib.dispatch_landed(hoisted, message) is True
+
+
+def test_deliver_message_idle_recipient_transitions_to_our_turn_and_lands():
+    # The PRESERVED happy path: the recipient is IDLE at send time (empty
+    # composer, no running turn). After we type+Enter it goes busy processing
+    # OUR message, which is visible above the composer -> a genuine idle->our-turn
+    # transition -> landed. The guard must not regress this normal case.
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: status?"
+    state = {"typed": False}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
+        return True
+
+    def capture():
+        if not state["typed"]:
+            return "● earlier turn output\n● done\n❯ \n  ddc@host:~/wt"  # idle at t0
+        # now busy processing OUR message, which sits above the composer:
+        return f"{message}\n✻ Thinking… (2s · esc to interrupt)\n❯ \n  ddc@host:~/wt"
+
+    landed = sable_msg.deliver_message(
+        "%2", message, interrupt=False, run=run, capture=capture,
+        sleep=lambda s: None, tries=4, interval=0.01,
+    )
+    assert landed is True
+
+
+def test_deliver_text_fresh_pane_dispatch_still_lands():
+    # The sable-spawn-worker path, at the shared helper it actually calls
+    # (deliver_text). A FRESH worker pane is idle at the empty composer
+    # (wait_for_ready already confirmed the prompt), then LEGITIMATELY goes busy
+    # after we submit the dispatch. Idle at t0 -> the dispatch must still land;
+    # SABLE-d21h must NOT false-negative worker dispatch.
+    dispatch = "Read /home/ddc/.claude/sable/dispatch/SABLE-xyz.md in full"
+    snippet = "SABLE-xyz"
+    state = {"typed": False}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
+        return True
+
+    def capture():
+        if not state["typed"]:
+            return "❯ \n  ddc@host:~/wk-xyz"           # fresh + idle, empty composer
+        return f"{dispatch}\n✻ Working… (esc to interrupt)\n❯ \n  ddc@host:~/wk-xyz"
+
+    landed = sable_pane_lib.deliver_text(
+        ["tmux"], "%9", dispatch, snippet,
+        tries=4, interval=0.01, run=run, capture=capture, sleep=lambda s: None,
+    )
+    assert landed is True
+
+
 # --- interrupt idle-wait state machine (SABLE-m6is) -------------------------
 # A busy Claude turn STILL shows the empty composer prompt at the bottom, so
 # pane_ready fired mid-turn and --interrupt typed into a pane still redrawing the
@@ -365,12 +479,15 @@ def test_interrupt_sends_escape_once_and_defers_injection_until_idle():
     # The pane is busy for the first two readiness polls, then settles to idle,
     # then the typed message lands. --interrupt must (a) send Escape exactly
     # once, (b) NOT type the message while the pane is still busy — injection is
-    # deferred until the idle poll, three captures in (2 busy + 1 idle). Under
-    # the old pane_ready wait it would have typed at the FIRST capture (busy
-    # panes are 'ready'), so `typed_at_capture[0] > 1` is the regression guard.
+    # deferred until the pane is idle. wait_for_idle consumes 2 busy + 1 idle
+    # capture, then deliver_text takes its OWN pre-send idle capture (the
+    # SABLE-d21h t0 check) before typing, so injection lands at the 4th capture.
+    # Under the old pane_ready wait it would have typed at the FIRST capture
+    # (busy panes are 'ready'), so `typed_at_capture[0] > 1` is the regression
+    # guard.
     landed_screen = ("⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force\n"
                      "● thinking…\n❯ \n  ddc@host:~/wt")
-    screens = iter([_BUSY_SCREEN, _BUSY_SCREEN, _IDLE_SCREEN, landed_screen])
+    screens = iter([_BUSY_SCREEN, _BUSY_SCREEN, _IDLE_SCREEN, _IDLE_SCREEN, landed_screen])
     captures = {"n": 0}
     sent = []
     typed_at_capture = []
@@ -393,7 +510,7 @@ def test_interrupt_sends_escape_once_and_defers_injection_until_idle():
     assert landed is True
     escapes = [c for c in sent if c[-1] == "Escape"]
     assert len(escapes) == 1                       # Escape sent exactly ONCE
-    assert typed_at_capture == [3]                 # typed only after the idle poll
+    assert typed_at_capture == [4]                 # typed only after the idle polls (t0 check is #4)
     assert typed_at_capture[0] > 1                 # NOT at the first (busy) poll
     # ordering: Escape precedes the first keystroke injection
     assert sent.index(escapes[0]) < next(i for i, c in enumerate(sent) if "-l" in c)
@@ -426,14 +543,17 @@ def test_interrupt_never_types_while_pane_stays_busy_then_degrades():
 def test_deliver_message_wrapped_composer_requires_a_real_enter():
     # SABLE-1umr: the wrapped-composer false positive meant deliver_message
     # could report delivered WITHOUT EVER SENDING ENTER (the first Enter used
-    # to be sent only after a failed landed-check). Stateful fake: the message
+    # to be sent only after a failed landed-check). Stateful fake: an empty idle
+    # composer BEFORE we type (idle_at_send True, SABLE-d21h), then the message
     # sits wrapped in the composer until an Enter arrives, then shows as a
     # submitted turn.
     message = ("⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap all lanes at 4 "
                "workers and hold pushes until chuck drains the merge queue")
-    state = {"entered": False}
+    state = {"typed": False, "entered": False}
 
     def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
         if cmd[-1] == "Enter":
             state["entered"] = True
         return True
@@ -441,9 +561,11 @@ def test_deliver_message_wrapped_composer_requires_a_real_enter():
     def capture():
         if state["entered"]:
             return f"{message}\n● thinking…\n❯ \n  ddc@host:~/wt"
-        return ("❯ ⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap all lanes at 4\n"
-                "workers and hold pushes until chuck drains the merge queue\n"
-                "  ddc@host:~/wt")
+        if state["typed"]:
+            return ("❯ ⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap all lanes at 4\n"
+                    "workers and hold pushes until chuck drains the merge queue\n"
+                    "  ddc@host:~/wt")
+        return "❯ \n  ddc@host:~/wt"                  # idle at t0, empty composer
 
     landed = sable_msg.deliver_message(
         "%2", message, interrupt=False, run=run, capture=capture,

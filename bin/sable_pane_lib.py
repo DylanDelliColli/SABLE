@@ -189,13 +189,34 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
     the text (submission must not depend on the landed-check failing first,
     SABLE-1umr), then resent until the text leaves the input box (the
     dropped-Enter race). A resent Enter on an already-empty box is a harmless
-    no-op. Returns False (clean) if the pane vanishes."""
+    no-op. Returns False (clean) if the pane vanishes.
+
+    A landing is only counted when the pane was IDLE at send time — pane_idle at
+    t0, captured BEFORE typing (SABLE-d21h). A message typed into a BUSY pane
+    cannot be verified as its own submitted turn: Claude Code hoists a queued
+    line ABOVE the composer and clears the input box, so dispatch_landed's
+    visible-and-not-in-box signal holds IDENTICALLY for a message merely QUEUED
+    behind the running turn — and a queued line can be dropped on that turn's
+    compaction/redraw or a pane reap (the queued-while-busy swallow that stranded
+    two handoffs). Only an idle->our-turn transition (idle at t0, then our text
+    visible outside the box) is a genuine submitted turn. When the pane is NOT
+    idle at t0 we still type + submit ONCE (best-effort queue, never worse than
+    the pre-guard behavior) but report False, so the caller degrades to the
+    durable fallback bead instead of a phantom 'delivered'. The fresh-pane
+    dispatch (sable-spawn-worker) and manager kicks (sable-tmux / -spawn-manager)
+    all wait_for_ready first, so their pane is idle at t0 and still lands — this
+    guard does not false-negative them."""
     run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True).returncode == 0)
     capture = capture or (lambda: capture_pane(base, pane))
     sleep = sleep or time.sleep
+    idle_at_send = pane_idle(capture())
     if run(base + ["send-keys", "-t", pane, "-l", text]) is False:
         return False
     if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
+        return False
+    if not idle_at_send:
+        # Busy at t0: the line just queued behind the running turn; we cannot
+        # prove it started its own turn, so fail closed to the durable fallback.
         return False
     for _ in range(max(1, tries)):
         sleep(interval)
