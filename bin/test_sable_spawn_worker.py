@@ -284,6 +284,44 @@ def test_preempt_check_allows_when_no_lane():
     assert ssw.preempt_check("", inbox) is None
 
 
+# --- SABLE-m40k: idempotent claim skip ---------------------------------------
+#
+# SABLE-676c's already_in_progress_check GUARD lets a claim-then-hold bead
+# (in_progress, no pane/worktree evidence) through to dispatch. But the claim
+# CALL right after it was still unconditional, and real `bd --claim` is only
+# idempotent against ITS OWN actor identity, never a SABLE lane name, so it
+# errored "already claimed by <lane>" and aborted the spawn. The fix skips the
+# redundant claim call when the bead's assignee already IS the dispatching
+# lane — however it got there.
+
+def test_bead_already_claimed_by_lane_true_on_self_claim_or_reassignment():
+    # covers both the lane's own prior claim-then-hold AND a manager
+    # REASSIGNMENT by a different actor (SABLE-m40k design note) — the check
+    # only looks at the resulting assignee, not who set it.
+    assert ssw.bead_already_claimed_by_lane(
+        {"id": "X-1", "assignee": "optimus"}, "optimus") is True
+
+
+def test_bead_already_claimed_by_lane_false_for_different_lane():
+    assert ssw.bead_already_claimed_by_lane(
+        {"id": "X-1", "assignee": "tarzan"}, "optimus") is False
+
+
+def test_bead_already_claimed_by_lane_false_when_unassigned():
+    assert ssw.bead_already_claimed_by_lane(
+        {"id": "X-1", "assignee": None}, "optimus") is False
+    assert ssw.bead_already_claimed_by_lane({"id": "X-1"}, "optimus") is False
+
+
+def test_bead_already_claimed_by_lane_false_when_lane_empty():
+    # an empty/unresolvable lane never matches, even if assignee is also falsy
+    # -- guards against treating an unassigned bead as "already mine".
+    assert ssw.bead_already_claimed_by_lane(
+        {"id": "X-1", "assignee": None}, "") is False
+    assert ssw.bead_already_claimed_by_lane(
+        {"id": "X-1", "assignee": "optimus"}, "") is False
+
+
 # --- dispatch throttle: worker cap + live count (SABLE-mmdt) ------------------
 #
 # 3 managers x ~5 concurrent workers + Docker froze the WSL host (2026-07-07);

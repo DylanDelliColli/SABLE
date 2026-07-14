@@ -258,6 +258,21 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> str | No
             "collaboration/sequencing is needed.")
 
 
+def bead_already_claimed_by_lane(bead: dict, lane: str) -> bool:
+    """True when `bead`'s assignee IS the dispatching lane already — regardless
+    of who set it (a prior self-claim, the lane's own claim-then-hold, or a
+    manager REASSIGNMENT by a different actor, e.g. lincoln reassigning a bead
+    to optimus — SABLE-m40k design note). Real `bd update --claim` is only
+    idempotent against bd's OWN actor identity (--actor/BEADS_ACTOR/git
+    user.name/$USER), which never equals a SABLE lane name, so calling it here
+    unconditionally errors 'already claimed by <lane>' and aborts the whole
+    spawn (SABLE-m40k — the residual SABLE-676c left behind: the GUARD lets the
+    claim-then-hold bead's dispatch through, but the claim CALL right after it
+    still blows up). Empty lane never matches — an unassigned/lane-less bead is
+    not "already mine"."""
+    return bool(lane) and bead.get("assignee") == lane
+
+
 def preempt_check(lane: str, inbox: list[dict]) -> str | None:
     """Re-homed pre-dispatch-preempt (SABLE-bldh.8): block dispatch when a
     priority-0 coord bead sits in the lane's inbox (`for-<lane>`). Existing
@@ -668,7 +683,12 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stderr.write(f"sable-spawn-worker: preempt blocked — {preempt_err}\n")
                 return 6
 
-        subprocess.run(["bd", "update", bid, "--claim"], check=True)
+        if bead_already_claimed_by_lane(bead, lane):
+            sys.stderr.write(
+                f"sable-spawn-worker: {bid} already assigned to lane '{lane}' — "
+                "skipping redundant bd update --claim (SABLE-m40k)\n")
+        else:
+            subprocess.run(["bd", "update", bid, "--claim"], check=True)
 
         in_progress = parse_bead_list(_run(["bd", "list", "--status=in_progress", "--json"]))
         overlap_warning = overlap_check(bid, bead, in_progress)
