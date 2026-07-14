@@ -134,18 +134,48 @@ def lock_is_stale(info, now, ttl) -> bool:
     return (now - ts) > ttl
 
 
-def _break_lock(path, expected):
-    """Unlink the lock only if it still matches `expected` (same nonce) — so a
-    fresh, valid lock that raced in between our read and break is not clobbered.
-    expected=None means the file was unreadable/corrupt: remove unconditionally."""
-    if expected is None:
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
+def _read_lock_with_inode(path):
+    """Read the lock's parsed content together with the inode of the exact
+    file we read. Returns (info, inode); both are None if no file is there.
+    `info` is None (inode still set) if the file exists but doesn't parse.
+
+    The inode comes from fstat() on the SAME open fd used to read the
+    content, so it always identifies the file we actually inspected — never a
+    file that replaced it moments later.
+    """
+    try:
+        with open(path, "r") as f:
+            inode = os.fstat(f.fileno()).st_ino
+            try:
+                data = json.load(f)
+            except ValueError:
+                data = None
+    except (FileNotFoundError, OSError):
+        return None, None
+    return (data if isinstance(data, dict) else None), inode
+
+
+def _break_lock(path, inode):
+    """Unlink the lock only if the file at `path` right now is still the SAME
+    on-disk file (matched by inode) we inspected before deciding it was stale.
+
+    A nonce-based check here is not enough: when the lock is unreadable
+    (corrupt, or — under the old create-then-write implementation — simply
+    not yet written), there is no nonce to compare against, so a naive
+    "unreadable means remove unconditionally" rule ends up deleting whatever
+    is at `path` at unlink time — including a fresh, valid lock a racing
+    acquirer created in the gap between our read and this break (SABLE-l7gd:
+    under CI CPU contention this let two wrappers both believe they held the
+    lock and interleave). Matching on inode instead makes the check exact
+    regardless of whether the original content parsed.
+    """
+    if inode is None:
+        return                             # we saw nothing there; no-op
+    try:
+        current_inode = os.stat(path).st_ino
+    except FileNotFoundError:
         return
-    current = read_lock(path)
-    if current is None or current.get("nonce") == expected.get("nonce"):
+    if current_inode == inode:
         try:
             os.unlink(path)
         except FileNotFoundError:
@@ -175,20 +205,31 @@ def acquire_lock(path, fleet, pid=None, *, ttl=LOCK_TTL_DEFAULT,
             "iso": _iso(now),
             "nonce": nonce,
         }
+        # Write the full payload to a private temp file FIRST, then atomically
+        # hard-link it into place. os.link() is exclusive (fails if the target
+        # already exists) just like O_CREAT|O_EXCL — but unlike create-then-
+        # write, there is no window where a concurrent acquirer can observe a
+        # just-created, still-empty lock file. That window is what let a
+        # second acquirer under CI CPU contention (SABLE-l7gd) misread a live
+        # holder's brand-new lock as corrupt/stale, break it, and interleave.
+        tmp_path = f"{path}.tmp.{pid}.{nonce}"
+        with open(tmp_path, "w") as f:
+            f.write(json.dumps(payload) + "\n")
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.link(tmp_path, path)
         except FileExistsError:
-            info = read_lock(path)
+            os.unlink(tmp_path)
+            info, inode = _read_lock_with_inode(path)
             if lock_is_stale(info, now_fn(), ttl):
-                _break_lock(path, info)
+                _break_lock(path, inode)
                 continue                      # retry acquire immediately
             if now_fn() >= deadline:
                 raise LockContention(info)
             sleep_fn(poll)
             continue
-        with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(payload) + "\n")
-        return nonce
+        else:
+            os.unlink(tmp_path)
+            return nonce
 
 
 def release_lock(path, token) -> bool:

@@ -101,17 +101,19 @@ jobs:
 
       - name: pytest — full bin/ suite (unit + integration; bd/dolt suites self-skip)
         run: |
-          # Two bin/ integration tests are excluded here (not silently — echoed
-          # below and tracked by bead) because they are timing/attached-client
-          # sensitive and flake on the shared 2-core runner, which would red the
-          # gate on arrival. They PASS locally; the gap is the CI runner, not the
+          # One bin/ integration test is excluded here (not silently — echoed
+          # below and tracked by bead) because it is attached-client sensitive
+          # and flakes on the shared 2-core runner, which would red the gate
+          # on arrival. It PASSES locally; the gap is the CI runner, not the
           # code. Widen by dropping a --deselect when its bead lands. Everything
           # else in bin/ runs (auto-discovery — no silent-green, SABLE-7v3z).
+          # test_sable_dolt_push_integration.py::test_two_concurrent_wrappers_serialize
+          # (SABLE-l7gd) was deselected here for the same reason; the lock's
+          # TOCTOU race (create-then-write, and an unconditional stale-lock
+          # unlink) is now fixed and the test re-enabled.
           echo "::notice::deselected (CI-flaky, tracked): test_sable_worker_status_integration.py::test_reap_protects_done_pane_in_attached_clients_current_window (SABLE-7dva)"
-          echo "::notice::deselected (CI-flaky, tracked): test_sable_dolt_push_integration.py::test_two_concurrent_wrappers_serialize (SABLE-l7gd)"
           python -m pytest bin/ -q -p no:cacheprovider \
-            --deselect "bin/test_sable_worker_status_integration.py::test_reap_protects_done_pane_in_attached_clients_current_window" \
-            --deselect "bin/test_sable_dolt_push_integration.py::test_two_concurrent_wrappers_serialize"
+            --deselect "bin/test_sable_worker_status_integration.py::test_reap_protects_done_pane_in_attached_clients_current_window"
 
       - name: Fixture isolation tripwire (SABLE-0ssz.2 — ban unsandboxed real-repo git ops)
         run: |
