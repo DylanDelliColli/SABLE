@@ -56,9 +56,6 @@ from typing import Iterable, List
 # Match is (basename, rule, needle-substring-in-snippet).
 # ---------------------------------------------------------------------------
 KNOWN_VIOLATIONS = [
-    # SABLE-0ssz.3: generated push script cd's unguarded into a scratch dolt
-    # repo (isolated via DOLT_ROOT_PATH + file:// remote, so latent P2).
-    ("test_sable_dolt_push_integration.py", "cd-unguarded", 'cd "{src}"'),
     # SABLE-0ssz.4: real-repo `git -C str(repo) worktree remove` / `branch -D`
     # against parent.parent; runs in the o9aa ephemeral clean-room from the gate.
     ("test_sable_spawn_worker_integration.py", "real-repo-git", "worktree"),
