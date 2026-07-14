@@ -874,20 +874,31 @@ def test_deliver_message_sends_enter_immediately_not_only_after_failed_poll():
 # --- bead-addressed worker delivery (SABLE-6izz) ----------------------------
 
 def test_parse_worker_bead_tags_matches_only_worker_role():
-    out = ("%1 worker market-brief-package-73t4\n"
+    out = ("%1 worker market-brief-package-73t4 running\n"
            "%2 optimus \n"
-           "%3 worker market-brief-package-6izz\n")
+           "%3 worker market-brief-package-6izz running\n")
     assert sable_msg.parse_worker_bead_tags(out) == {
-        "market-brief-package-73t4": "%1",
-        "market-brief-package-6izz": "%3",
+        "market-brief-package-73t4": [("%1", "running")],
+        "market-brief-package-6izz": [("%3", "running")],
     }
 
 
 def test_parse_worker_bead_tags_skips_non_worker_roles():
     # a manager pane happening to carry a stray @sable_bead-shaped 3rd field
     # must never be treated as a bead-addressable pane.
-    out = "%1 optimus market-brief-package-73t4\n"
+    out = "%1 optimus market-brief-package-73t4 running\n"
     assert sable_msg.parse_worker_bead_tags(out) == {}
+
+
+def test_parse_worker_bead_tags_preserves_duplicate_bead_tags_qq6r():
+    # SABLE-qq6r: a REVISE re-spawn into the same worktree creates a fresh
+    # pane before the old one is reaped, so two panes legitimately share one
+    # @sable_bead tag. Both must survive parsing (not last-wins) so
+    # lookup_worker_by_bead can filter by status.
+    out = "%26 worker SABLE-pi5m done\n%37 worker SABLE-pi5m running\n"
+    assert sable_msg.parse_worker_bead_tags(out) == {
+        "SABLE-pi5m": [("%26", "done"), ("%37", "running")],
+    }
 
 
 def test_lookup_worker_by_bead_found_and_missing():
@@ -895,6 +906,31 @@ def test_lookup_worker_by_bead_found_and_missing():
     runner = lambda args: fake_out
     assert sable_msg.lookup_worker_by_bead("market-brief-package-73t4", runner) == "%1"
     assert sable_msg.lookup_worker_by_bead("ghost-bead", runner) is None
+
+
+def test_lookup_worker_by_bead_prefers_running_pane_over_done_duplicate_qq6r():
+    # THE bead repro: old done-but-unreaped pane %26 and fresh running pane
+    # %37 both tagged SABLE-pi5m. Resolution must pick the LIVE one, not
+    # whichever the map happened to keep last.
+    fake_out = "%26 worker SABLE-pi5m done\n%37 worker SABLE-pi5m running\n"
+    runner = lambda args: fake_out
+    assert sable_msg.lookup_worker_by_bead("SABLE-pi5m", runner) == "%37"
+    # order-independence: the done pane listed second must not win either.
+    fake_out_reordered = "%37 worker SABLE-pi5m running\n%26 worker SABLE-pi5m done\n"
+    runner2 = lambda args: fake_out_reordered
+    assert sable_msg.lookup_worker_by_bead("SABLE-pi5m", runner2) == "%37"
+
+
+def test_lookup_worker_by_bead_only_done_pane_raises_hint_qq6r():
+    # If ONLY a done pane matches, resolving to it would deliver into a dead
+    # composer and (from the caller's perspective) silently report success.
+    # Fail loudly instead with a reap hint.
+    fake_out = "%26 worker SABLE-pi5m done\n"
+    runner = lambda args: fake_out
+    with pytest.raises(sable_msg.OnlyDonePane) as exc_info:
+        sable_msg.lookup_worker_by_bead("SABLE-pi5m", runner)
+    assert exc_info.value.bead_id == "SABLE-pi5m"
+    assert exc_info.value.pane_id == "%26"
 
 
 def test_manager_name_lookup_never_resolves_via_worker_bead_tag_even_when_stale():
@@ -928,6 +964,21 @@ def test_main_bead_addressed_unknown_bead_errors_cleanly(monkeypatch, capsys):
     assert rc != 0
     err = capsys.readouterr().err
     assert "ghost-bead" in err
+
+
+def test_main_bead_addressed_only_done_pane_errors_with_reap_hint_qq6r(monkeypatch, capsys):
+    # SABLE-qq6r: resolving to a done-but-unreaped duplicate must never report
+    # "delivered" — it must fail loudly with a reap hint instead.
+    def raise_only_done(bead, run=None, socket=None, session=None):
+        raise sable_msg.OnlyDonePane(bead, "%26")
+
+    monkeypatch.setattr(sable_msg, "lookup_worker_by_bead", raise_only_done)
+    rc = sable_msg.main(["SABLE-pi5m", "hold", "--from", "optimus", "--bead"])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "SABLE-pi5m" in err
+    assert "done" in err
+    assert "reap" in err.lower()
 
 
 if __name__ == "__main__":

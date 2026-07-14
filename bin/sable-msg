@@ -116,21 +116,50 @@ def parse_panes(output: str) -> dict[str, str]:
     return mapping
 
 
-def parse_worker_bead_tags(output: str) -> dict[str, str]:
-    """Parse `tmux list-panes -F '#{pane_id} #{@sable_role} #{@sable_bead}'`
-    output into bead -> pane_id, restricted to panes tagged @sable_role=worker
-    (SABLE-6izz). A manager pane's @sable_bead field is never consulted here —
-    bead-addressed lookup is a WORKER-only namespace, so a manager-name lookup
-    (parse_panes, above) can never collide with it even if some tag is stale."""
-    mapping: dict[str, str] = {}
+def parse_worker_bead_tags(output: str) -> dict[str, list[tuple[str, str]]]:
+    """Parse `tmux list-panes -F '#{pane_id} #{@sable_role} #{@sable_bead}
+    #{@sable_status}'` output into bead -> [(pane_id, status), ...], restricted
+    to panes tagged @sable_role=worker (SABLE-6izz). A manager pane's
+    @sable_bead field is never consulted here — bead-addressed lookup is a
+    WORKER-only namespace, so a manager-name lookup (parse_panes, above) can
+    never collide with it even if some tag is stale. ALL panes sharing a bead
+    tag are kept, not last-wins: a REVISE re-spawn into the same worktree
+    creates a fresh pane before the old one is reaped, so a done-but-unreaped
+    pane and a running pane can legitimately carry the same @sable_bead
+    (SABLE-qq6r) — status-aware selection happens in lookup_worker_by_bead."""
+    mapping: dict[str, list[tuple[str, str]]] = {}
     for line in output.splitlines():
-        parts = line.split(None, 2)
+        parts = line.split(None, 3)
         if len(parts) < 3:
             continue
         pane_id, role, bead = parts[0], parts[1].strip(), parts[2].strip()
+        status = parts[3].strip() if len(parts) > 3 else ""
         if role == "worker" and bead:
-            mapping.setdefault(bead, pane_id)
+            mapping.setdefault(bead, []).append((pane_id, status))
     return mapping
+
+
+def _pane_id_num(pane_id: str) -> int:
+    """tmux pane ids (%N) are assigned monotonically increasing server-wide,
+    so the numerically largest id among candidates is the newest pane."""
+    try:
+        return int(pane_id.lstrip("%"))
+    except ValueError:
+        return -1
+
+
+class OnlyDonePane(Exception):
+    """Raised by lookup_worker_by_bead when every pane tagged with the bead is
+    done-but-unreaped (SABLE-qq6r). A REVISE re-spawn into the same worktree
+    creates a fresh pane before the old one is reaped, so two panes can share
+    one @sable_bead tag; resolving to the done one silently delivers into a
+    dead composer while reporting success — a false delivery confirmation,
+    worse than an outright failure."""
+
+    def __init__(self, bead_id: str, pane_id: str):
+        self.bead_id = bead_id
+        self.pane_id = pane_id
+        super().__init__(f"bead {bead_id!r} only matches done pane {pane_id}")
 
 
 def _default_runner(args: list[str]) -> str:
@@ -157,13 +186,26 @@ def lookup_pane(role: str, run=None, socket: str | None = None,
 
 def lookup_worker_by_bead(bead_id: str, run=None, socket: str | None = None,
                           session: str | None = None) -> str | None:
+    """Resolve a bead id to its live worker pane (SABLE-qq6r). When a REVISE
+    re-spawn leaves a done-but-unreaped pane and a fresh running pane sharing
+    one @sable_bead tag, prefer the non-done pane (newest by pane id if more
+    than one is somehow live); if every matching pane is done, raise
+    OnlyDonePane instead of silently resolving to a dead composer."""
     run = run or _default_runner
     try:
-        out = run(tmux_base(socket) + ["list-panes", *_scope_args(session),
-                                       "-F", "#{pane_id} #{@sable_role} #{@sable_bead}"])
+        out = run(tmux_base(socket) + [
+            "list-panes", *_scope_args(session),
+            "-F", "#{pane_id} #{@sable_role} #{@sable_bead} #{@sable_status}",
+        ])
     except subprocess.CalledProcessError:
         return None  # session not up
-    return parse_worker_bead_tags(out).get(bead_id)
+    candidates = parse_worker_bead_tags(out).get(bead_id)
+    if not candidates:
+        return None
+    live = [pane for pane, status in candidates if status != "done"]
+    if live:
+        return max(live, key=_pane_id_num)
+    raise OnlyDonePane(bead_id, max((p for p, _ in candidates), key=_pane_id_num))
 
 
 def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None = None,
@@ -252,7 +294,16 @@ def main(argv: list[str] | None = None) -> int:
         return 4
 
     if ns.bead:
-        pane = lookup_worker_by_bead(ns.to_role, socket=socket, session=session)
+        try:
+            pane = lookup_worker_by_bead(ns.to_role, socket=socket, session=session)
+        except OnlyDonePane as e:
+            sys.stderr.write(
+                f"sable-msg: worker pane for bead '{e.bead_id}' is done "
+                f"({e.pane_id}), awaiting reap — not a live worker to deliver "
+                f"into. Reap it (sable-worker-status --reap) once the fresh "
+                f"pane is the only match, then retry.\n"
+            )
+            return 1
         if pane is None:
             sys.stderr.write(
                 f"sable-msg: no worker pane registered for bead '{ns.to_role}' "
