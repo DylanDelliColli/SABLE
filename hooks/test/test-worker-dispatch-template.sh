@@ -65,6 +65,16 @@ else
        "found $DEFAULT_COUNT DEFAULT labels, expected 1"
 fi
 
+# ---------- SABLE-myns: worker output discipline (run-to-file, bd-show field limits) ----------
+# Operator-approved from the 2026-07-09 token-efficiency review: large tool
+# outputs are recurring ballast (re-read every subsequent turn at cache-read
+# rates), not a one-time cost. Workers repeatedly ingested full 313-test suite
+# outputs raw that session. The template must direct output to a file and
+# read back only the summary, and must limit bd show field dumps.
+
+has  "documents the run-to-file test-output directive"      "run test suites to a file"
+has  "documents the bd-show field-limit rule"                "bd show calls use field limits, not full dumps"
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

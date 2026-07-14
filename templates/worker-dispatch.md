@@ -139,6 +139,40 @@ back to your manager rather than burning wall-clock on a full run.
 
 ---
 
+## Output discipline (SABLE-myns)
+
+Every token a session ingests is re-read on every subsequent turn of that
+session at cache-read rates — large tool outputs are recurring ballast, not a
+one-time cost. On 2026-07-09 workers repeatedly ingested full 313-test suite
+outputs raw, multiple times per worker. Summarize at the source instead:
+
+- **Run test suites to a file; read back only the summary.** Never let a full
+  suite run print raw into your context. Redirect to a file, then read back
+  only the tail and any failure lines:
+
+  ```
+  {TEST_COMMAND} > /tmp/test-run.log 2>&1; tail -n 40 /tmp/test-run.log
+  grep -iE 'fail|error' /tmp/test-run.log
+  ```
+
+  This run-to-file-then-grep-summarize pattern applies to the scoped pre-push
+  run above and to any ad-hoc suite run during debugging — never `cat` a raw
+  suite log into your own context.
+- **bd show calls use field limits, not full dumps.** Use default `bd show
+  <id>` output, not `--long` (which prints extended metadata, agent identity,
+  and gate fields you don't need). If you only need one field — description,
+  notes — extract it with `--json` piped through `jq`/`python3` rather than
+  reading the whole record.
+- **Large diffs are read in ranges, not whole.** Use `git diff -- <path> |
+  head -n 200` or a scoped `git diff <base>..HEAD -- <path>` rather than an
+  unbounded `git diff` across the full worktree; page through line ranges if a
+  single file's diff is large.
+
+Reject any dispatch addendum that would have you ingest a full test-suite log
+or an unbounded diff raw — point back to this section instead.
+
+---
+
 ## Gate mode (legacy) vs self-push
 
 SABLE has one live dispatch mode: **warm-pane self-push** (below), the only
