@@ -55,7 +55,16 @@ else
 fi
 SKILLS="$BASE/skills"
 HOOKS_DIR="$BASE/hooks/multi-manager"
+AGENTS_DIR="$BASE/agents"
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
+
+# Retired-artifact list (SABLE-gsqj): names this repo used to ship into a scope
+# but no longer does. Upgrading over a pre-existing scope is purely additive
+# otherwise — these must be actively retired on every plain install, not just
+# --uninstall, or they stay live (e.g. a deleted poll hook still registered
+# in settings, or a retired manager def the Agent tool still offers).
+RETIRED_HOOK_FILES="inbox-injection.sh inbox-injection-precompact.sh"
+RETIRED_AGENT_DEFS="optimus.md tarzan.md chuck.md"
 
 # Merge a settings snippet's hooks into the target settings file, idempotently.
 # Rewrites the snippet's ~/.claude paths to the install BASE. Idempotency keys on
@@ -129,6 +138,80 @@ with open(path, 'w') as f: f.write(out + '\n')
 PY
 }
 
+# Remove settings rows whose command basename is in the (space-separated)
+# retired-name list. Backs up first. Prints the count of rows removed so the
+# caller can decide whether there's anything to report.
+remove_retired_hook_rows() {
+    SETTINGS_PATH="$1" RETIRED_NAMES="$2" python3 - <<'PY'
+import json, os, shutil
+path = os.environ['SETTINGS_PATH']
+retired = set(os.environ['RETIRED_NAMES'].split())
+if not os.path.exists(path):
+    print(0); raise SystemExit
+shutil.copy(path, path + '.bak')
+try:
+    with open(path) as f: data = json.load(f)
+except Exception:
+    print(0); raise SystemExit
+removed = 0
+for blocks in data.get('hooks', {}).values():
+    if not isinstance(blocks, list): continue
+    for b in blocks:
+        if not isinstance(b, dict) or not isinstance(b.get('hooks'), list): continue
+        kept = []
+        for h in b['hooks']:
+            marker = (h.get('command', '') or '').rsplit('/', 1)[-1] if isinstance(h, dict) else ''
+            if isinstance(h, dict) and marker in retired:
+                removed += 1
+            else:
+                kept.append(h)
+        b['hooks'] = kept
+out = json.dumps(data, indent=2); json.loads(out)
+with open(path, 'w') as f: f.write(out + '\n')
+print(removed)
+PY
+}
+
+# Retire dead machinery left behind by a purely additive install over a
+# pre-existing scope (SABLE-gsqj): retired hook files, their settings rows,
+# the pre-tmux-only agents-teams dir, and retired manager agent defs in the
+# scope's agents/ dir. Runs on every plain install (not just --uninstall) —
+# a no-op when the scope is already clean. Prints only what it actually removed.
+cleanup_retired_artifacts() {
+    local -a cleaned=()
+
+    for f in $RETIRED_HOOK_FILES; do
+        if [ -e "$HOOKS_DIR/$f" ]; then
+            rm -f "$HOOKS_DIR/$f"
+            cleaned+=("retired hook file: $HOOKS_DIR/$f")
+        fi
+    done
+
+    if [ -e "$SETTINGS" ]; then
+        removed_rows="$(remove_retired_hook_rows "$SETTINGS" "$RETIRED_HOOK_FILES")"
+        if [ "${removed_rows:-0}" -gt 0 ] 2>/dev/null; then
+            cleaned+=("$removed_rows retired settings hook row(s) in $SETTINGS")
+        fi
+    fi
+
+    if [ -e "$BASE/agents-teams" ]; then
+        rm -rf "$BASE/agents-teams"
+        cleaned+=("retired dir: $BASE/agents-teams")
+    fi
+
+    for f in $RETIRED_AGENT_DEFS; do
+        if [ -e "$AGENTS_DIR/$f" ]; then
+            rm -f "$AGENTS_DIR/$f"
+            cleaned+=("retired agent def: $AGENTS_DIR/$f")
+        fi
+    done
+
+    if [ "${#cleaned[@]}" -gt 0 ]; then
+        echo "Retired artifacts cleaned from a prior install:"
+        printf '  - %s\n' "${cleaned[@]}"
+    fi
+}
+
 # Resolve the SABLE skill names the repo ships (by frontmatter 'name:').
 skill_names() {
     for skdir in "$REPO"/skills/*/; do
@@ -157,6 +240,8 @@ fi
 
 # --- Install the complete layer ---
 mkdir -p "$HOOKS_DIR" "$BASE/sable/roles" "$SKILLS"
+
+cleanup_retired_artifacts
 
 # All multi-manager hooks (lib-identity.sh included — sourced by the others).
 for hook in "$REPO"/hooks/multi-manager/*.sh; do

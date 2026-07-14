@@ -184,6 +184,10 @@ if [ "${OS_NAME}" = "Windows (Git Bash / MSYS)" ]; then
 fi
 
 # 5. Copy agent definitions to ~/.claude/agents/ (idempotent; preserves non-SABLE agent files)
+# Retired manager defs (optimus/tarzan/chuck.md) left behind by an older install
+# are NOT cleaned here — this step only ever adds. bin/sable-orchestration-install
+# (delegated below at step 6) is the single owner of that cleanup for the scope's
+# agents/ dir, so a plain re-run of this script still retires them (SABLE-gsqj).
 bold "Step 5/8: Copy agent definitions to ${CLAUDE_DIR}/agents/"
 AGENTS_SRC="${TEMPLATE_DIR}/agents"
 AGENTS_DST="${CLAUDE_DIR}/agents"
