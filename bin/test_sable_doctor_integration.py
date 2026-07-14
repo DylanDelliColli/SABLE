@@ -10,6 +10,7 @@ two real drift incidents this bead was filed from (SABLE-4ba stale hook,
 missing tarzan worker-cap block).
 """
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,8 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 DOCTOR = REPO / "bin" / "sable-doctor"
 INSTALLER = REPO / "install.sh"
+HAVE_BD = shutil.which("bd") is not None
+pytestmark = pytest.mark.skipif(not HAVE_BD, reason="install.sh requires bd; not installed in this clean-room")
 
 
 def run_install(home_dir: Path):
