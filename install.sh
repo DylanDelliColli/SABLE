@@ -23,9 +23,11 @@ SKILLS_DST="${CLAUDE_DIR}/skills"
 # --- CLI flags (SABLE-106, front door SABLE-ppy; tmux-only SABLE-qa4d;
 # single-path install SABLE-ssws.1 — there are no tiers and no topologies) ---
 DRY_RUN=0
+FROM_HERE=0
 for arg in "$@"; do
     case "$arg" in
         --dry-run)       DRY_RUN=1 ;;
+        --from-here)     FROM_HERE=1 ;;
         --subagent|--nested|--teams)
             echo "install.sh: '$arg' was retired — SABLE runs on the tmux warm-pane layout only (see TMUX-AGENTS-DESIGN.md)" >&2
             exit 1 ;;
@@ -33,10 +35,12 @@ for arg in "$@"; do
             echo "install.sh: '$arg' was retired — there is one install: the full workflow including the orchestration layer (see QUICKSTART.md)" >&2
             exit 1 ;;
         -h|--help)
-            echo "Usage: install.sh [--dry-run]"
+            echo "Usage: install.sh [--dry-run] [--from-here]"
             echo "  Installs the complete SABLE workflow: beads discipline + hooks,"
             echo "  producer agent defs, and the tmux warm-pane orchestration layer."
             echo "  --dry-run              report what would be done; write nothing"
+            echo "  --from-here            install from this checkout even if it's a linked"
+            echo "                         git worktree (default: refuse — see SABLE-s6qk)"
             exit 0 ;;
     esac
 done
@@ -66,6 +70,66 @@ bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
 green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 red()    { printf '\033[31m%s\033[0m\n' "$*"; }
+
+# --- Canonical-checkout guard (SABLE-s6qk) ---
+# Running the installer from a linked git worktree re-derives every hook copy
+# source and every ~/.local/bin/sable-* symlink target from that (ephemeral)
+# path. Incident market-brief-package-1y6d (2026-07-09): a worker ran
+# install.sh from its per-bead worktree, which silently hot-swapped the LIVE
+# ~/.claude hook copies with an unmerged branch's code and re-pointed all 19
+# sable-* symlinks at the worktree — one routine `git worktree prune` away
+# from dangling the whole fleet toolchain. Refuse by default from any
+# checkout that isn't the main one; --from-here overrides for deliberate use.
+
+# canonical_checkout_root <dir> — prints the MAIN worktree root (the parent of
+# the shared git common-dir; every linked worktree of a project resolves to
+# the same one) so the refusal can name the real target without hardcoding a
+# path. Fails silently if <dir> isn't a git work tree at all.
+canonical_checkout_root() {
+    local base="$1" common root
+    common="$(git -C "${base}" rev-parse --git-common-dir 2>/dev/null)" || return 1
+    [ -n "${common}" ] || return 1
+    case "${common}" in
+        /*) ;;
+        *)  common="${base}/${common}" ;;
+    esac
+    root="$(cd "$(dirname "${common}")" 2>/dev/null && pwd)" || return 1
+    printf '%s\n' "${root}"
+}
+
+# is_linked_worktree <dir> — true if <dir> is a LINKED git worktree (not the
+# main checkout): its .git is a plain file (the git 2.5+ linked-worktree
+# marker), or its git-dir disagrees with the shared git-common-dir. False
+# (proceeds) if <dir> isn't a git work tree at all, or git isn't on PATH —
+# nothing to guard against. A plain fresh clone (.git is a directory, git-dir
+# == git-common-dir) IS canonical by this same test, so a first-time
+# bootstrap on a new machine never needs --from-here — canonical-ness is
+# derived, never hardcoded to a path.
+is_linked_worktree() {
+    local dir="$1" git_dir common_dir
+    [ -f "${dir}/.git" ] && return 0
+    [ -d "${dir}/.git" ] || return 1
+    command -v git >/dev/null 2>&1 || return 1
+    git_dir="$(git -C "${dir}" rev-parse --git-dir 2>/dev/null)" || return 1
+    common_dir="$(git -C "${dir}" rev-parse --git-common-dir 2>/dev/null)" || return 1
+    [ "${git_dir}" != "${common_dir}" ]
+}
+
+if [ "${FROM_HERE}" != "1" ] && is_linked_worktree "${REPO_DIR}"; then
+    red   "install.sh: refusing to run from a linked git worktree:"
+    red   "  ${REPO_DIR}"
+    echo
+    if CANONICAL="$(canonical_checkout_root "${REPO_DIR}")"; then
+        yellow "  Run install.sh from the canonical checkout instead:"
+        yellow "    ${CANONICAL}/install.sh"
+    fi
+    yellow "  Installing from a worktree re-derives every ~/.claude hook copy and every"
+    yellow "  ~/.local/bin/sable-* symlink from THIS path. The next 'git worktree prune'"
+    yellow "  (or the branch merging/deleting) dangles the live toolchain."
+    yellow "  If this really is the checkout you mean to install from, re-run with:"
+    yellow "    install.sh --from-here"
+    exit 1
+fi
 
 bold "SABLE installer"
 printf 'OS:         %s\n' "${OS_NAME}"

@@ -76,6 +76,7 @@ ALLOW=(
 # Widen ALLOW (move an entry here into ALLOW) as each of these lands.
 declare -A EXCLUDE=(
   [test-install.sh]="needs the ~/.claude SABLE install; clean-room has none (SABLE-59zu)"
+  [test-install-guard.sh]="needs the ~/.claude SABLE install (real bd on PATH) for its --from-here/main-checkout proceed cases; clean-room has none (SABLE-59zu)"
   [test-install-agent-defs.sh]="needs the ~/.claude SABLE install (SABLE-59zu)"
   [test-install-version-floor.sh]="needs the ~/.claude SABLE install (SABLE-59zu)"
   [test-install-multi-manager.sh]="vacuous without bd — prints 'SKIP: bd not on PATH' and exits 0 (SABLE-59zu/SABLE-7v3z)"
