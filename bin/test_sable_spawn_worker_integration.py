@@ -46,6 +46,16 @@ def _tmux(s, *args):
                           capture_output=True, text=True, check=True)
 
 
+def _refs_snapshot(repo: Path) -> set[str]:
+    """Full refs/heads snapshot of `repo` — used to assert a fixture that
+    mutates branches (worktree add/remove, branch -D) leaves the real repo's
+    tracked-branch set byte-identical before vs after (SABLE-0ssz.4)."""
+    r = subprocess.run(["git", "-C", str(repo), "for-each-ref", "refs/heads",
+                        "--format=%(refname)"],
+                       capture_output=True, text=True, check=True)
+    return set(r.stdout.split())
+
+
 def test_spawn_creates_tagged_worker_window(sock):
     with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
         env = {
@@ -108,6 +118,10 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock):
     scope = f"sw-it-{uuid.uuid4().hex[:8]}"
     wt_name = f"wk-{scope}"
     expected = repo.parent / wt_name  # sibling of the repo, NOT inside it
+    # SABLE-0ssz.4: fail fast on an orphan left by a prior hard-killed run
+    # instead of silently colliding with `bd worktree create`'s own error.
+    assert not expected.exists(), f"orphan worktree from a prior run at {expected}"
+    before_refs = _refs_snapshot(repo)
     with tempfile.TemporaryDirectory() as dd:
         env = {
             **os.environ,
@@ -140,6 +154,10 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock):
                            capture_output=True, text=True)
             subprocess.run(["git", "-C", str(repo), "branch", "-D", wt_name],
                            capture_output=True, text=True)
+            # SABLE-0ssz.4: the real repo's branch set must be byte-identical
+            # before vs after — proves cleanup removed everything this run
+            # created and nothing else leaked.
+            assert _refs_snapshot(repo) == before_refs
 
 
 def test_spawn_leaves_session_current_window_unchanged(sock):
@@ -603,6 +621,73 @@ def test_claim_then_hold_blocks_when_derived_worktree_exists(sock):
         finally:
             if derived.exists():
                 shutil.rmtree(derived, ignore_errors=True)
+
+
+def test_crash_leak_orphan_worktree_dispatch_refused_and_refs_unchanged(sock):
+    """SABLE-0ssz.4 crash-leak harness: simulate a PRIOR dispatch that was
+    hard-killed after `git worktree add` + branch creation but before its own
+    cleanup ran, leaving a REAL orphaned worktree + branch at the derived
+    sibling path (not just a placeholder dir, unlike
+    test_claim_then_hold_blocks_when_derived_worktree_exists above). A
+    follow-up dispatch for the same bead/scope must refuse via the existing
+    worktree-evidence governance path (duplicate-dispatch, exit 5) rather than
+    colliding with `bd worktree create` or mutating the orphan further, and the
+    real repo's refs/heads set must be byte-identical before vs after this
+    test's own cleanup — proving the crash artifact does not survive as a
+    permanent leak once noticed."""
+    repo = Path(__file__).resolve().parent.parent  # the SABLE repo root
+    scope = f"sw-crash-{uuid.uuid4().hex[:8]}"
+    wt_name = f"wk-{scope}"
+    orphan = repo.parent / wt_name  # sibling of the repo (SABLE-bldh.11)
+    before_refs = _refs_snapshot(repo)
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd:
+        bead_id = "FAKE-crash-1"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "in_progress", "assignee": "optimus"}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "SABLE_MAX_LOAD_PER_CORE": "0",
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+        env.pop("CLAUDE_AGENT_NAME", None)
+        try:
+            # the crash artifact: a REAL worktree + branch, exactly what a
+            # hard-killed `bd worktree create` leaves behind
+            subprocess.run(["git", "-C", str(repo), "worktree", "add", "-b",
+                            wt_name, str(orphan), "HEAD"],
+                           check=True, capture_output=True, text=True)
+
+            r = subprocess.run(
+                ["python3", str(BIN), bead_id, "--scope", scope, "--model", "haiku"],
+                capture_output=True, text=True, env=env, cwd=str(repo),
+            )
+            assert r.returncode == 5, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+            assert "duplicate-dispatch" in r.stderr
+            assert "worktree" in r.stderr
+            # refused before any further mutation: no second window/dispatch file
+            wins = _tmux(sock, "list-windows", "-t", "sable",
+                         "-F", "#{window_name}").stdout
+            assert "worker-fake-crash-1" not in wins
+            assert not (Path(dd) / f"{bead_id}.md").exists()
+        finally:
+            subprocess.run(["git", "-C", str(repo), "worktree", "remove",
+                            "--force", str(orphan)],
+                           capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(repo), "branch", "-D", wt_name],
+                           capture_output=True, text=True)
+            assert _refs_snapshot(repo) == before_refs
 
 
 # --- SABLE-m40k: idempotent claim skip ---------------------------------------
