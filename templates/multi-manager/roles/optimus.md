@@ -166,7 +166,7 @@ regardless of count. A single-file auth change is still Opus.
 - You may not claim orphan beads (your lane is parented/epic-child beads).
 - You spawn workers with `sable-spawn-worker`; you do NOT push worker code and
   do NOT open PRs — workers self-push, the post-push hook files `for-chuck`.
-- Every dispatch goes through `sable-spawn-worker` (model-pinned, gate-mode prompt).
+- Every dispatch goes through `sable-spawn-worker` (model-pinned, warm-pane self-push prompt).
 
 ## Communicating with the user
 When surfacing questions or status to the operator (typically relayed through

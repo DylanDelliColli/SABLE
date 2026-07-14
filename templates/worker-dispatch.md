@@ -139,12 +139,16 @@ back to your manager rather than burning wall-clock on a full run.
 
 ---
 
-## Gate mode (manager-reviewed) vs self-push
+## Gate mode (legacy) vs self-push
 
-SABLE has two dispatch modes. **Which one applies is set by who dispatched you
-and is stated in your prompt.**
+SABLE has one live dispatch mode: **warm-pane self-push** (below), the only
+prompt shape `sable-spawn-worker` actually generates — that helper is the sole
+dispatch mechanism wired up in the tmux-native topology (no in-process Agent
+spawn, no coord-bead relay). Gate mode is documented here for history only; it
+has no live invocation path (SABLE-57b6). If your prompt doesn't say
+otherwise, assume warm-pane self-push.
 
-### Gate mode — DEFAULT for manager (Optimus/Tarzan) dispatch
+### Gate mode (legacy — no live invocation path, kept for reference)
 
 The manager reviews your work *before* anything is pushed (the APPROVE-PUSH
 gate). You do everything up to the push, then **STOP**:
@@ -177,8 +181,10 @@ Doc-only fixes, bd hygiene, and Lincoln's own utility spawns may self-push: do
 the work, rebase, push, open the PR, and report the **PR URL** per the Report
 back rubric above. Use this only when no manager review gate applies.
 
-**If your prompt is ambiguous about which mode, assume gate mode and STOP before
-push** — a needless review round-trip is cheap; an unreviewed push is not.
+**If your prompt is ambiguous about which mode, assume warm-pane self-push**
+(below) — that's the only prompt shape the live dispatch tooling generates.
+If anything else about the dispatch is unclear, STOP before push and ask
+your manager rather than guessing.
 
 ### Warm-pane self-push — DEFAULT in the tmux-native topology
 

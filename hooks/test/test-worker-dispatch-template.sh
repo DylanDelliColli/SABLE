@@ -51,6 +51,20 @@ hasre "states workers do not run the full suite pre-push"            "workers? (
 has  "cites SABLE-o9aa as the merge-preview ci-verify gate's tracking bead" "SABLE-o9aa"
 has  "uses the exact-locked phrase 'the merge-preview ci-verify gate (SABLE-o9aa)'" "the merge-preview ci-verify gate (SABLE-o9aa)"
 
+# ---------- SABLE-57b6: exactly one dispatch mode may be labeled DEFAULT ----------
+# Two section headers were both self-labeled DEFAULT (Gate mode + Warm-pane
+# self-push), leaving a reader unable to tell which contract actually governs
+# a dispatch. sable-spawn-worker (the only live dispatch mechanism) generates
+# self-push exclusively, so only that section may carry the DEFAULT label.
+
+DEFAULT_COUNT="$(grep -c 'DEFAULT' "$DOC" 2>/dev/null || true)"
+if [ "${DEFAULT_COUNT:-0}" -eq 1 ]; then
+  pass "exactly one DEFAULT-labeled dispatch mode in worker-dispatch.md"
+else
+  fail "exactly one DEFAULT-labeled dispatch mode in worker-dispatch.md" \
+       "found $DEFAULT_COUNT DEFAULT labels, expected 1"
+fi
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
