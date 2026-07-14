@@ -96,7 +96,22 @@ if [ -n "$INTEGRATION_BRANCH" ] \
    && git -C "$CWD" rev-parse --verify --quiet "origin/$INTEGRATION_BRANCH" >/dev/null 2>&1; then
   DEFAULT_BASE_BRANCH="origin/$INTEGRATION_BRANCH"
 fi
-BASE_BRANCH=$(sable_validate_base_ref "$CWD" "${SABLE_BASE_BRANCH:-$DEFAULT_BASE_BRANCH}")
+
+# SABLE-cstk: only honor a session-supplied SABLE_BASE_BRANCH when it actually
+# exists in THIS repo. Routing a non-existent foreign value (e.g.
+# origin/llm-integration leaked from another repo's session) straight into
+# sable_validate_base_ref let THAT function's own hardcoded origin/main
+# fallback win over the repo's real integration branch — reproducing the
+# false all-docs file list chuck saw on wk-reaper-doneflag / wk-hooks-claims
+# even after DEFAULT_BASE_BRANCH above was fixed to prefer the integration
+# branch. Falling through to DEFAULT_BASE_BRANCH directly (instead of via
+# sable_validate_base_ref's own fallback chain) keeps that preference intact.
+if [ -n "${SABLE_BASE_BRANCH:-}" ] \
+   && git -C "$CWD" rev-parse --verify --quiet "$SABLE_BASE_BRANCH" >/dev/null 2>&1; then
+  BASE_BRANCH=$(sable_validate_base_ref "$CWD" "$SABLE_BASE_BRANCH")
+else
+  BASE_BRANCH=$(sable_validate_base_ref "$CWD" "$DEFAULT_BASE_BRANCH")
+fi
 
 # Determine current branch and modified files
 BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
