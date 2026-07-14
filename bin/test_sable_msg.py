@@ -288,6 +288,98 @@ def test_deliver_message_gives_up_when_never_confirmed_landed():
     assert landed is False
 
 
+# --- interrupt idle-wait state machine (SABLE-m6is) -------------------------
+# A busy Claude turn STILL shows the empty composer prompt at the bottom, so
+# pane_ready fired mid-turn and --interrupt typed into a pane still redrawing the
+# interrupted turn — the message was swallowed (two consecutive live sends failed
+# all 8 submit attempts). The fix: send Escape ONCE, then defer injection until
+# the pane is genuinely IDLE (empty prompt AND no 'esc to interrupt' status).
+
+# A pane mid-turn: composer prompt present (pane_ready True) AND the running
+# turn's interrupt affordance visible.
+_BUSY_SCREEN = ("● Running the auth refactor…\n"
+                "✻ Thinking… (12s · ↓ 1.2k tokens · esc to interrupt)\n"
+                "❯ \n  ddc@host:~/wt")
+# Same pane after the turn settles: prompt present, no busy status line.
+_IDLE_SCREEN = "● earlier turn output\n● done\n❯ \n  ddc@host:~/wt"
+
+
+def test_pane_busy_true_only_while_turn_running():
+    assert sable_msg.pane_busy(_BUSY_SCREEN) is True
+    assert sable_msg.pane_busy(_IDLE_SCREEN) is False
+    # whitespace/padding in the status line must not defeat the match
+    assert sable_msg.pane_busy("│   esc   to   interrupt   │") is True
+
+
+def test_pane_idle_requires_ready_and_not_busy():
+    # the crux: a busy pane is READY (has the empty prompt) but NOT idle
+    assert sable_msg.pane_ready(_BUSY_SCREEN) is True
+    assert sable_msg.pane_idle(_BUSY_SCREEN) is False
+    assert sable_msg.pane_idle(_IDLE_SCREEN) is True
+    # a booting pane (no prompt yet) is neither ready nor idle
+    assert sable_msg.pane_idle("╭─ Claude Code ─╮\n│ booting… │") is False
+
+
+def test_interrupt_sends_escape_once_and_defers_injection_until_idle():
+    # The pane is busy for the first two readiness polls, then settles to idle,
+    # then the typed message lands. --interrupt must (a) send Escape exactly
+    # once, (b) NOT type the message while the pane is still busy — injection is
+    # deferred until the idle poll, three captures in (2 busy + 1 idle). Under
+    # the old pane_ready wait it would have typed at the FIRST capture (busy
+    # panes are 'ready'), so `typed_at_capture[0] > 1` is the regression guard.
+    landed_screen = ("⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force\n"
+                     "● thinking…\n❯ \n  ddc@host:~/wt")
+    screens = iter([_BUSY_SCREEN, _BUSY_SCREEN, _IDLE_SCREEN, landed_screen])
+    captures = {"n": 0}
+    sent = []
+    typed_at_capture = []
+
+    def run(cmd):
+        sent.append(cmd)
+        if "-l" in cmd:
+            typed_at_capture.append(captures["n"])
+        return True
+
+    def capture():
+        captures["n"] += 1
+        return next(screens)
+
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    landed = sable_msg.deliver_message(
+        "%2", message, interrupt=True, run=run, capture=capture,
+        sleep=lambda s: None, ready_timeout=10, interval=0.01, tries=5,
+    )
+    assert landed is True
+    escapes = [c for c in sent if c[-1] == "Escape"]
+    assert len(escapes) == 1                       # Escape sent exactly ONCE
+    assert typed_at_capture == [3]                 # typed only after the idle poll
+    assert typed_at_capture[0] > 1                 # NOT at the first (busy) poll
+    # ordering: Escape precedes the first keystroke injection
+    assert sent.index(escapes[0]) < next(i for i, c in enumerate(sent) if "-l" in c)
+
+
+def test_interrupt_never_types_while_pane_stays_busy_then_degrades():
+    # A pane that never leaves the busy state (Escape did not settle it in time):
+    # wait_for_idle times out, delivery is ATTEMPTED anyway (never worse than the
+    # pre-idle-wait behavior) but the message is never confirmed out of the box,
+    # so it degrades to a verified-delivery failure. Escape is still sent once and
+    # the message text never appears, so no phantom "landed".
+    sent = []
+
+    def run(cmd):
+        sent.append(cmd)
+        return True
+
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: urgent"
+    landed = sable_msg.deliver_message(
+        "%2", message, interrupt=True, run=run,
+        capture=lambda: _BUSY_SCREEN,                # never goes idle
+        sleep=lambda s: None, ready_timeout=0.05, interval=0.01, tries=3,
+    )
+    assert landed is False
+    assert len([c for c in sent if c[-1] == "Escape"]) == 1
+
+
 # --- wrapped-composer delivery (SABLE-1umr) ---------------------------------
 
 def test_deliver_message_wrapped_composer_requires_a_real_enter():

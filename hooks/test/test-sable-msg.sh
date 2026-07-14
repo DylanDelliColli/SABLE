@@ -34,6 +34,11 @@ export SABLE_TMUX_SOCKET="$SOCK"
 export SABLE_MSG_POLL_INTERVAL="0.1"
 export SABLE_MSG_SUBMIT_TRIES="30"
 export SABLE_MSG_READY_TIMEOUT="5"
+# Single-fleet cases (1-4, 6) target the isolated session "w"; pin it so
+# per-repo resolution (SABLE-e1e3 / c066ded) does not derive sable-<repo> and
+# miss the pane (SABLE-r0m9). The per-repo case (5) unsets this inline for its
+# own CWD-derivation path.
+export SABLE_TMUX_SESSION="w"
 
 # A stand-in "TUI" pane: shows nothing (not ready) for BOOT_DELAY seconds, then
 # a bare `❯ ` prompt line -- exactly the shape sable_pane_lib.pane_ready looks
@@ -170,6 +175,53 @@ if printf '%s' "$bcap" | grep -q 'cross-repo-ssd8-check'; then
   fail "message did NOT leak into the CWD-derived (wrong) repo's session" "$bcap"
 else
   pass "message did NOT leak into the CWD-derived (wrong) repo's session"
+fi
+
+# --- 6) fresh-spawn window: --interrupt into a mid-turn pane (SABLE-m6is) -----
+# The live failure: --interrupt into a manager pane actively mid-turn (seconds
+# after sable-spawn-manager) dropped the message on all 8 submit attempts — the
+# pane STILL shows the empty composer prompt during a turn, so pane_ready fired
+# early and the message was typed into a pane still redrawing. This stand-in
+# paints that exact shape (composer prompt + 'esc to interrupt'); a bare Escape
+# settles it to an idle REPL that records submitted turns. The message is sent
+# within ~2s of pane creation (the fresh-spawn window the failure hit).
+BUSY_TUI="$REC/busy-tui.sh"
+cat > "$BUSY_TUI" <<'SCRIPT'
+#!/usr/bin/env bash
+busy=1
+END_AT=$((SECONDS + 60))   # only the interrupt can end the turn, never a timeout
+while [ "$busy" = 1 ]; do
+  printf '\033[H\033[2J  Running the turn (esc to interrupt)\n'
+  printf '\xe2\x9d\xaf \n'
+  if IFS= read -rsN1 -t 0.2 ch; then
+    [ "$ch" = $'\x1b' ] && busy=0
+  fi
+  [ "$SECONDS" -ge "$END_AT" ] && busy=0
+done
+printf '\033[H\033[2J'
+printf '%.0s\n' $(seq 1 60)
+while true; do
+  printf '\xe2\x9d\xaf '
+  IFS= read -r line || break
+  echo "$line" >> "$REC_FILE"
+done
+SCRIPT
+chmod +x "$BUSY_TUI"
+
+tmux_ new-window -d -t w: -n mgr2 "REC_FILE=$REC/tarzan.txt $BUSY_TUI"
+mpane="$(tmux_ list-panes -a -F '#{pane_id} #{window_name}' | awk '$2=="mgr2"{print $1; exit}')"
+tmux_ set-option -p -t "$mpane" @sable_role tarzan
+sleep 0.3   # send within the fresh-spawn window, while the turn is busy
+
+if CLAUDE_AGENT_NAME=lincoln python3 "$BIN/sable-msg" tarzan "fresh spawn wake" --interrupt >/dev/null 2>&1; then
+  pass "sable-msg --interrupt lands on a freshly spawned mid-turn pane (SABLE-m6is)"
+else
+  fail "sable-msg --interrupt lands on a freshly spawned mid-turn pane (SABLE-m6is)" "$(tmux_ capture-pane -t "$mpane" -p)"
+fi
+if [ -f "$REC/tarzan.txt" ] && grep -q 'fresh spawn wake' "$REC/tarzan.txt"; then
+  pass "fresh-spawn interrupt was SUBMITTED as a turn, not swallowed"
+else
+  fail "fresh-spawn interrupt was SUBMITTED as a turn, not swallowed" "$(tmux_ capture-pane -t "$mpane" -p)"
 fi
 
 echo
