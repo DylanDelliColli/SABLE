@@ -219,6 +219,29 @@ assert_deny "no bead + no dispatch model → deny" "$MGR_ENV" "Just do this gene
 # Test 15: no bead in prompt + explicit dispatch model → allow
 assert_allow "no bead + explicit model → allow" "$MGR_ENV" "Just do this generic thing" "" "sonnet"
 
+# ---- SABLE-gga: sable-<word> filenames/skills must NOT be extracted as bead IDs ----
+
+# Test 15b: prompt mentions sable-* filenames alongside a real unlabeled bead →
+# deny must name only the real bead, never the filenames (regression for the
+# false 'unlabeled bead' deny caused by over-matching the ID regex).
+assert_deny "sable-execute/sable-teams-preflight filenames not treated as beads" "$MGR_ENV" \
+  "Dispatching for SABLE-ddd: run sable-execute, sable-orchestration-install, and sable-teams-preflight against the epic." \
+  "" "" "have no model: label"
+OUT=$(run_hook "$MGR_ENV" "Dispatching for SABLE-ddd: run sable-execute, sable-orchestration-install, and sable-teams-preflight against the epic." "" "")
+if echo "$OUT" | grep -qF "sable-execute" || echo "$OUT" | grep -qF "sable-orchestration-install" || echo "$OUT" | grep -qF "sable-teams-preflight"; then
+  FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  sable-* filenames absent from deny reason"
+  echo "FAIL: sable-* filenames absent from deny reason"
+  echo "  Got: ${OUT:0:400}"
+else
+  PASS=$((PASS+1)); echo "PASS: sable-* filenames absent from deny reason"
+fi
+
+# Test 15c: prompt mentions ONLY sable-* filenames (no real bead) + no dispatch
+# model → treated as bead-free (ad-hoc ladder-enforcement deny), not a
+# false 'unlabeled bead' deny naming the filenames.
+assert_deny "sable-* filenames alone → no-bead path, not false unlabeled-bead deny" "$MGR_ENV" \
+  "Run sable-execute and sable-teams-preflight to check drift." "" "" "no model specified on Agent call"
+
 # ---- Native manager-subagent path (SABLE-6zt cases 5 & 6) ----
 # In v3 a manager dispatches workers natively: identity is the subagent
 # agent_type (agent_id present, NO env), resolved against the registry by
