@@ -173,6 +173,81 @@ def test_reports_stale_done_tag_as_running_after_sampling_window(sock):
     assert "running" in lines[0]
 
 
+def _attach_pty_client(sock, session, deadline=10):
+    """Attach a REAL tmux client to `session` over a pty and return its Popen
+    once tmux's list-clients genuinely reports it (SABLE-7dva). Unlike a bare
+    `tmux attach`, this registers HEADLESSLY -- no controlling tty, TERM unset,
+    the CI clean-room -- by fixing the three things that made the naive spawn
+    exit without ever attaching: (1) a real TERM so tmux finds a terminfo
+    entry; (2) start_new_session so the pty is a clean controlling terminal;
+    (3) a drained master fd so tmux's initial screen redraw can't block once
+    the ~64K pty buffer fills and stall the attach.
+
+    Raises AssertionError -- carrying the client's exit code and captured pty
+    output -- if the client dies or fails to register within `deadline`
+    seconds, so failures name the cause instead of a blank 'assert in ""'.
+    The caller owns the returned client: `client.terminate()` lets the child
+    exit, which tears down the drain thread (EOF) and closes the master fd.
+    Shared by the attached-client tests (SABLE-dcw2, SABLE-b574)."""
+    import os
+    import pty as pty_module
+    import threading
+
+    master, slave = pty_module.openpty()
+    client = subprocess.Popen(
+        ["tmux", "-L", sock, "attach-session", "-t", session],
+        stdin=slave, stdout=slave, stderr=slave, close_fds=True,
+        start_new_session=True, env={**os.environ, "TERM": "screen"})
+    os.close(slave)
+    # Drain (and retain) the master side so redraw writes never block; the
+    # captured bytes double as diagnostics if the attach dies early. The
+    # thread owns master's lifetime: it closes it on EOF (i.e. once the client
+    # exits), so terminate() alone fully cleans up.
+    drained = bytearray()
+
+    def _drain():
+        try:
+            while True:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                drained.extend(chunk)
+        finally:
+            try:
+                os.close(master)
+            except OSError:
+                pass
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+
+    def _fail(msg):
+        client.terminate()
+        try:
+            client.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            client.kill()
+        raise AssertionError(msg)
+
+    end = time.monotonic() + deadline
+    while time.monotonic() < end:
+        clients = _tmux(sock, "list-clients", "-F", "#{client_session}").stdout
+        if session in clients.split():
+            return client
+        if client.poll() is not None:
+            _fail(f"tmux attach exited early (code={client.returncode}) before "
+                  f"registering as a client for session {session!r}; pty output="
+                  f"{bytes(drained).decode(errors='replace')!r}")
+        time.sleep(0.1)
+    clients = _tmux(sock, "list-clients", "-F", "#{client_session}").stdout
+    _fail(f"no attached client for session {session!r} after {deadline}s "
+          f"(client_alive={client.poll() is None}); list-clients={clients!r} "
+          f"pty output={bytes(drained).decode(errors='replace')!r}")
+
+
 def test_reap_protects_done_pane_in_attached_clients_current_window(sock):
     """SABLE-yfdn: a done worker pane in the window an attached client is
     CURRENTLY viewing must survive --reap -- kill-pane on a single-pane
@@ -181,9 +256,6 @@ def test_reap_protects_done_pane_in_attached_clients_current_window(sock):
     client is simulated via a pty so tmux's list-clients genuinely reports
     one (a detached -d session, used everywhere else in this suite, has
     zero clients by definition and can't exercise this path)."""
-    import os
-    import pty as pty_module
-
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
     time.sleep(0.4)
@@ -193,14 +265,8 @@ def test_reap_protects_done_pane_in_attached_clients_current_window(sock):
     _tag(sock, "w:1.0", "worker", "bead-other", "done")
     _tmux(sock, "select-window", "-t", "w:0")
 
-    master, slave = pty_module.openpty()
-    client = subprocess.Popen(["tmux", "-L", sock, "attach-session", "-t", "w"],
-                               stdin=slave, stdout=slave, stderr=slave, close_fds=True)
-    os.close(slave)
+    client = _attach_pty_client(sock, "w")
     try:
-        time.sleep(0.5)
-        assert "w" in _tmux(sock, "list-clients", "-F", "#{client_session}").stdout
-
         r = _run(sock, "--reap")
         assert r.returncode == 0, r.stderr
         time.sleep(0.4)
@@ -208,7 +274,6 @@ def test_reap_protects_done_pane_in_attached_clients_current_window(sock):
         assert "bead-watched" in survivors  # protected: client's current window
         assert "bead-other" not in survivors  # different window: reaped normally
     finally:
-        os.close(master)
         client.terminate()
         client.wait(timeout=2)
 
