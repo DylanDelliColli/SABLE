@@ -142,21 +142,31 @@ def test_idle_pane_receives_interrupt_first_attempt(tmux_socket, tmp_path):
     assert "INTERRUPT-LANDED" in pane                        # and executed (turn submitted)
 
 
-def test_message_queues_while_target_busy(tmux_socket):
+def test_default_send_to_busy_pane_reports_undelivered(tmux_socket):
+    # SABLE-d21h (was test_message_queues_while_target_busy): a DEFAULT-mode send
+    # to a pane that is BUSY at t0 must report UNDELIVERED, not a phantom
+    # 'delivered'. In the real Claude TUI a queued line is hoisted above the
+    # composer with the box cleared, so the old visible-vs-submitted check
+    # false-positived for a message merely QUEUED behind the running turn (which
+    # is droppable on the turn's compaction/redraw/reap). The pre-send idle guard
+    # fails closed so sable-msg routes to the durable fallback. (Here the pane is
+    # busy mid-`sleep`, showing no prompt line -> not idle at t0.)
+    #
+    # AUTO_FALLBACK=0 keeps a failed send from filing a real inbox bead into the
+    # operator's bd db; the manual-hint 'undelivered' line is asserted instead.
     _start_pane(tmux_socket)
-    # make the pane busy for 3s
     _tmux(tmux_socket, "send-keys", "-t", "w",
           "echo BUSY-START; sleep 3; echo BUSY-END", "Enter")
-    time.sleep(0.3)  # now mid-command
-    r = _run_msg(tmux_socket, "optimus",
-                 "echo QUEUED-RAN", "--from", "lincoln")
-    assert r.returncode == 0, r.stderr
-    time.sleep(4)
-    pane = _capture(tmux_socket, "w")
-    assert "BUSY-END" in pane
-    assert "QUEUED-RAN" in pane
-    # ordering: the queued echo ran only after the busy block finished
-    assert pane.index("BUSY-END") < pane.rindex("QUEUED-RAN")
+    time.sleep(0.3)  # now mid-command -> busy (no prompt line) at t0
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus", "echo QUEUED-RAN", "--from", "lincoln"],
+        capture_output=True, text=True,
+        env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
+             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "2",
+             "SABLE_MSG_POLL_INTERVAL": "0.2"},
+    )
+    assert r.returncode != 0, "busy-at-t0 default send must not report delivered"
+    assert "undelivered" in r.stderr
 
 
 # --- mid-turn busy pane: interrupt lands, default-mode queues (SABLE-m6is) ---
@@ -245,22 +255,26 @@ def test_interrupt_lands_on_busy_midturn_pane_first_attempt(tmux_socket, tmp_pat
     assert "cap in force" in rec.read_text()         # and was SUBMITTED as a turn
 
 
-def test_default_send_queues_behind_busy_turn_without_interrupting(tmux_socket, tmp_path):
+def test_default_send_to_busy_turn_does_not_interrupt_and_reports_undelivered(tmux_socket, tmp_path):
     # The companion guard: on the SAME kind of busy pane, a DEFAULT-mode send
     # (no --interrupt) must NOT interrupt the turn — the idle-wait + Escape logic
-    # is confined to the --interrupt leg. end.txt == NATURAL proves the turn ran
-    # to its own end; the message queued and landed only afterward.
+    # is confined to the --interrupt leg (SABLE-m6is). end.txt == NATURAL proves
+    # the turn ran to its own end. SABLE-d21h: because the pane is BUSY at t0, the
+    # send is not verified-landed, so sable-msg reports undelivered (routes to the
+    # durable fallback) even though the stand-in still physically queues the line.
     rec, end = _start_busy_pane(tmux_socket, tmp_path, busy_secs=2)
     r = subprocess.run(
         ["python3", str(BIN), "optimus", "queued directive", "--from", "lincoln"],
         capture_output=True, text=True,
         env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
-             "SABLE_MSG_SUBMIT_TRIES": "40", "SABLE_MSG_AUTO_FALLBACK": "0",
+             "SABLE_MSG_SUBMIT_TRIES": "2", "SABLE_MSG_AUTO_FALLBACK": "0",
              "SABLE_MSG_POLL_INTERVAL": "0.2"},
     )
-    assert r.returncode == 0, r.stderr
-    assert end.read_text().strip() == "NATURAL"      # turn ended on its own, NOT interrupted
-    assert "queued directive" in rec.read_text()     # queued, then submitted as a turn
+    assert r.returncode != 0                          # busy at t0 -> not verified-landed
+    assert "undelivered" in r.stderr
+    time.sleep(2.5)                                   # let the busy turn end on its own
+    assert end.read_text().strip() == "NATURAL"      # default mode never interrupted it
+    assert "queued directive" in rec.read_text()      # line still physically queued + ran
 
 
 # --- per-repo scoping (SABLE-e1e3.3): a fleet is addressed only by its repo ---
