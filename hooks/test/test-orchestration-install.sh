@@ -182,6 +182,66 @@ if printf '%s' "$TM_OUT" | grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"; then 
 if printf '%s' "$TM_OUT" | grep -qi "topology"; then fail "install output does not speak of topologies" "topology wording still printed"; else pass "install output does not speak of topologies"; fi
 rm -rf "$TMONLY"
 
+# ---------- SABLE-gsqj: upgrade over a stale scope retires dead machinery ----------
+# Seed a scope as if from the multi-topology era: retired inbox-poll hook files +
+# their settings rows, a legacy agents-teams/ dir, and retired manager agent defs
+# in agents/ — then run a PLAIN (non --uninstall) install and assert the retired
+# stuff is gone while unrelated settings rows and genuinely custom agent files survive.
+seed_retired_settings(){ python3 - "$1" <<'PY'
+import json, sys
+seed = {
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "", "hooks": [
+        {"type": "command", "command": "bash ~/.claude/hooks/multi-manager/inbox-injection.sh", "timeout": 3000},
+        {"type": "command", "command": "bd prime"}
+      ]}
+    ],
+    "PreCompact": [
+      {"matcher": "", "hooks": [
+        {"type": "command", "command": "bash ~/.claude/hooks/multi-manager/inbox-injection-precompact.sh", "timeout": 3000}
+      ]}
+    ],
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "bash /tmp/other-hook.sh", "timeout": 1000}
+      ]}
+    ]
+  }
+}
+open(sys.argv[1], 'w').write(json.dumps(seed, indent=2))
+PY
+}
+
+RA="$(mktemp -d)"
+mkdir -p "$RA/.claude/hooks/multi-manager" "$RA/.claude/agents-teams" "$RA/.claude/agents"
+touch "$RA/.claude/agents-teams/chuck.md"
+touch "$RA/.claude/agents/optimus.md" "$RA/.claude/agents/tarzan.md" "$RA/.claude/agents/chuck.md"
+touch "$RA/.claude/agents/my-custom-agent.md"
+printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/inbox-injection.sh"
+printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/inbox-injection-precompact.sh"
+seed_retired_settings "$RA/.claude/settings.local.json"
+
+RA_OUT="$(SABLE_PROJECT_DIR="$RA" bash "$INSTALLER" --project 2>&1)"
+RASET="$RA/.claude/settings.local.json"
+
+if [ ! -e "$RA/.claude/hooks/multi-manager/inbox-injection.sh" ]; then pass "gsqj: retired inbox-injection.sh removed on plain (upgrade) install"; else fail "gsqj: retired inbox-injection.sh removed on plain install"; fi
+if [ ! -e "$RA/.claude/hooks/multi-manager/inbox-injection-precompact.sh" ]; then pass "gsqj: retired inbox-injection-precompact.sh removed"; else fail "gsqj: retired inbox-injection-precompact.sh removed"; fi
+if [ "$(count_marker "$RASET" inbox-injection)" = "0" ]; then pass "gsqj: retired settings rows removed"; else fail "gsqj: retired settings rows removed" "count=$(count_marker "$RASET" inbox-injection)"; fi
+if [ ! -e "$RA/.claude/agents-teams" ]; then pass "gsqj: retired agents-teams dir removed on plain install (not just --uninstall)"; else fail "gsqj: retired agents-teams dir removed on plain install"; fi
+if [ ! -e "$RA/.claude/agents/optimus.md" ] && [ ! -e "$RA/.claude/agents/tarzan.md" ] && [ ! -e "$RA/.claude/agents/chuck.md" ]; then pass "gsqj: retired manager agent defs removed from scope's agents/ dir"; else fail "gsqj: retired manager agent defs removed from scope's agents/ dir"; fi
+if [ -e "$RA/.claude/agents/my-custom-agent.md" ]; then pass "gsqj: genuinely custom agent def survives"; else fail "gsqj: genuinely custom agent def survives"; fi
+if grep -q 'other-hook.sh' "$RASET"; then pass "gsqj: unrelated settings row survives"; else fail "gsqj: unrelated settings row survives"; fi
+if grep -q 'bd prime' "$RASET"; then pass "gsqj: unrelated bd prime row survives"; else fail "gsqj: unrelated bd prime row survives"; fi
+if valid_json "$RASET"; then pass "gsqj: settings valid JSON after retired-artifact cleanup"; else fail "gsqj: settings valid JSON after retired-artifact cleanup"; fi
+if printf '%s' "$RA_OUT" | grep -qi "retired artifacts cleaned"; then pass "gsqj: install output reports what was cleaned"; else fail "gsqj: install output reports what was cleaned"; fi
+
+# a second (already-clean) run is silent about retired artifacts and stays idempotent
+RA_OUT2="$(SABLE_PROJECT_DIR="$RA" bash "$INSTALLER" --project 2>&1)"
+if printf '%s' "$RA_OUT2" | grep -qi "retired artifacts cleaned"; then fail "gsqj: re-run on clean scope reports nothing to clean" "still printed cleanup banner"; else pass "gsqj: re-run on clean scope reports nothing to clean"; fi
+if valid_json "$RASET"; then pass "gsqj: settings still valid JSON after second run"; else fail "gsqj: settings still valid JSON after second run"; fi
+rm -rf "$RA"
+
 rm -rf "$P" "$P2" "$U" "$PU" "$M"
 echo
 echo "=========================================="
