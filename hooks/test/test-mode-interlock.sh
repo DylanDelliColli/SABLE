@@ -110,6 +110,12 @@ assert_deny  "planning blocks chuck spawn"    'CLAUDE_AGENT_NAME=chuck CLAUDE_AG
 assert_deny  "planning blocks alias optimus"  'optimus'
 assert_deny  "planning blocks git push"       'git push'
 assert_deny  "planning blocks git push origin" 'git push origin personal-tooling'
+# SABLE-sxhx: a real push chained via an UNSPACED separator must not slip the
+# planning-mode deny leg (the old bespoke tokenizer split these; the delegated
+# sable_is_git_push regressed until punctuation_chars tokenization).
+assert_deny  "planning blocks unspaced 'git push;ls'"  'git push;ls'
+assert_deny  "planning blocks unspaced 'git push&&ls'" 'git push&&ls'
+assert_deny  "planning blocks unspaced 'ls;git push'"  'ls;git push'
 assert_allow "planning allows producer spawn" 'CLAUDE_AGENT_NAME=sherlock CLAUDE_AGENT_ROLE=auditor claude src/auth'
 assert_allow "planning allows benign command" 'ls -la'
 assert_allow "planning allows bd commands"    'bd ready'

@@ -266,8 +266,19 @@ def walk(tokens):
 
 
 def tokenize(s):
+    # SABLE-sxhx: plain shlex.split only treats ; && || | as separators when
+    # they are whitespace-delimited from adjacent tokens
+    # (shlex.split('git push;ls') -> ['git', 'push;ls']), so a real push chained
+    # via an UNSPACED separator was walked as mid-command and MISSED. shlex.shlex
+    # with punctuation_chars=';&|' + whitespace_split=True returns each run of
+    # separator chars as its own token (';', '&&', '||', '|') even when unspaced,
+    # while leaving separators inside quotes untouched and producing output
+    # identical to shlex.split for every non-separator case. The separator tokens
+    # land in SHELL_SEPS, so the walk (below) resets command position correctly.
     try:
-        return shlex.split(s)
+        lexer = shlex.shlex(s, posix=True, punctuation_chars=';&|')
+        lexer.whitespace_split = True
+        return list(lexer)
     except ValueError:
         return None
 

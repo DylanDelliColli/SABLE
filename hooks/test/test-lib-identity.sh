@@ -503,6 +503,29 @@ is_push_test "sable_is_git_push: multi-line mention only (echo git push) is NOT 
   "$(printf 'echo starting\necho git push\ndone')" 1
 is_push_test "sable_is_git_push: multi-line quoted description mention is NOT push" \
   "$(printf 'bd create --title=x\nbd note --description="git push in prose"')" 1
+# unspaced-separator command boundaries (SABLE-sxhx) — plain shlex.split only
+# splits ; && || | when whitespace-delimited (shlex.split('git push;ls') ->
+# ['git', 'push;ls']), so a real push chained with NO surrounding space silently
+# bypassed the walk. tokenize() now uses shlex.shlex(punctuation_chars=';&|') so
+# the separators split even when unspaced.
+is_push_test "sable_is_git_push: 'git push;ls' (unspaced ;) is push" "git push;ls" 0
+is_push_test "sable_is_git_push: 'ls;git push' (unspaced ;) is push" "ls;git push" 0
+is_push_test "sable_is_git_push: 'git push&&ls' (unspaced &&) is push" "git push&&ls" 0
+is_push_test "sable_is_git_push: 'ls||git push' (unspaced ||) is push" "ls||git push" 0
+is_push_test "sable_is_git_push: 'git push|cat' (unspaced |) is push" "git push|cat" 0
+is_push_test "sable_is_git_push: 'mkdir x&&git push' (unspaced &&) is push" "mkdir x&&git push" 0
+# unspaced separator must NOT defeat subcommand precision
+is_push_test "sable_is_git_push: 'git status;ls' is NOT push" "git status;ls" 1
+is_push_test "sable_is_git_push: 'git pushd;ls' is NOT push" "git pushd;ls" 1
+is_push_test "sable_is_git_push: 'ls;git pushd' is NOT push" "ls;git pushd" 1
+# a separator char INSIDE a quoted arg must NOT split (no false positive)
+is_push_test "sable_is_git_push: separator inside quoted prose is NOT push" \
+  'bd note --description="fix; git push"' 1
+is_push_test "sable_is_git_push: pipe inside quoted prose is NOT push" \
+  'bd create --description="git push | tee"' 1
+# env-assignment prefix after an unspaced separator is still transparent
+is_push_test "sable_is_git_push: 'ls;SABLE_SKIP_PRE_PUSH=1 git push' is push" \
+  "ls;SABLE_SKIP_PRE_PUSH=1 git push" 0
 
 # --------------------------------------------------------------------------
 # sable_validate_base_ref unit tests (SABLE-61n)
