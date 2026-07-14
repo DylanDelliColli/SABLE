@@ -277,6 +277,70 @@ def test_default_send_to_busy_turn_does_not_interrupt_and_reports_undelivered(tm
     assert "queued directive" in rec.read_text()      # line still physically queued + ran
 
 
+# --- idle-pane redraw race: report-NOT-landed-when-it-DID (SABLE-uh4b) --------
+# The INVERSE of the m6is/d21h swallow. A message sent to an IDLE standing-by
+# pane really SUBMITS, but the capture taken in the redraw window right after
+# Enter shows the just-submitted message echoed into the transcript as its own
+# prompt-glyph line ("❯ <msg>") with the turn already running BELOW it (esc to
+# interrupt) and the empty composer not yet repainted. The old box_start scan
+# mistook that echo for the still-unsubmitted composer and reported UNDELIVERED
+# on all 8 attempts — filing a duplicate durable fallback bead for a message
+# that had actually landed, blocking a P0 worker release.
+
+# An idle-pane TUI stand-in that PERMANENTLY holds the post-Enter redraw frame.
+# At t0 it shows an empty composer prompt and no busy status (so the pane is
+# idle at send time). Once it reads a submitted line it appends it to REC_FILE
+# (proof the line was truly submitted as a turn, not a phantom) and then forever
+# repaints ONLY the redraw-race frame: the submitted echo "❯ <msg>" as the last
+# prompt-glyph line, with a running-turn "esc to interrupt" status BELOW it and
+# NO empty composer repainted. Every sable-msg capture therefore lands in the
+# redraw window — which the fix must read as LANDED.
+_REDRAW_TUI = r'''#!/usr/bin/env bash
+printf '\033[H\033[2J'
+printf '\xe2\x9d\xaf '                 # empty idle composer (❯ + space), no busy line
+line=""
+while IFS= read -r line; do
+  [ -n "$line" ] && break             # ignore stray blank Enters until the msg arrives
+done
+printf '%s\n' "$line" >> "$REC_FILE"   # proof: the line was submitted as a turn
+while true; do
+  printf '\033[H\033[2J'
+  printf '\xe2\x9d\xaf '; printf '%s\n' "$line"          # submitted echo = last glyph line
+  printf '  Running the turn (esc to interrupt)\n'       # running turn BELOW the echo
+  sleep 0.2
+done
+'''
+
+
+def test_idle_pane_redraw_race_reports_landed_not_undelivered(tmux_socket, tmp_path):
+    # Real tmux + real sable-msg: the message truly submits (REC_FILE records it),
+    # and sable-msg must report DELIVERED via the redraw-race capture. Pre-fix this
+    # reported undelivered (rc != 0) despite REC_FILE holding the line — the exact
+    # z776 false-negative. AUTO_FALLBACK=0 keeps a (pre-fix) failure from writing a
+    # real inbox bead; SUBMIT_TRIES>1 lets the loop resend Enter as it would live.
+    rec = tmp_path / "rec.txt"
+    script = tmp_path / "redraw_tui.sh"
+    script.write_text(_REDRAW_TUI)
+    script.chmod(0o755)
+    _tmux(tmux_socket, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+          f"REC_FILE={rec} bash {script}")
+    time.sleep(0.5)
+    _tmux(tmux_socket, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
+
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus", "GO push your worktree branch now",
+         "--from", "lincoln"],
+        capture_output=True, text=True,
+        env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
+             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "5",
+             "SABLE_MSG_POLL_INTERVAL": "0.2"},
+    )
+    assert "GO push your worktree branch now" in rec.read_text(), \
+        "precondition: the message must have really submitted as a turn"
+    assert r.returncode == 0, r.stderr          # and sable-msg must report it LANDED
+    assert "delivered" in r.stderr
+
+
 # --- per-repo scoping (SABLE-e1e3.3): a fleet is addressed only by its repo ---
 
 def _make_fleet(sock, tmp_path, name, role="tarzan"):
