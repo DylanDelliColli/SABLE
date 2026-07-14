@@ -20,14 +20,16 @@
 # Env (mainly for tests):
 #   SABLE_PROJECT_DIR   project root for --project scope (default: $PWD)
 #   CLAUDE_USER_DIR     user config dir for --user scope (default: ~/.claude)
+#   SABLE_REPO_DIR      repo root to install artifacts from (default: derived
+#                       from this script's location) — test-only override
 
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO="${SABLE_REPO_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
 usage() {
-    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 SCOPE="project"
@@ -212,6 +214,41 @@ cleanup_retired_artifacts() {
     fi
 }
 
+# Per-file change manifest + snapshot (SABLE-6lfz): every artifact below is
+# copied unconditionally by design (repo source always wins), but cross-fleet
+# consumers of a --user refresh (SABLE-ht22 brokered-window accounting) need
+# an exact record of what actually changed. install_file diffs SRC against
+# DEST before copying, records NEW/CHANGED/IDENTICAL in MANIFEST, and on
+# CHANGED snapshots the prior DEST into a timestamped .bak dir under BASE.
+MANIFEST=()
+BAK_DIR=""
+
+manifest_bak_dir() {
+    if [ -z "$BAK_DIR" ]; then
+        BAK_DIR="$BASE/.install-bak-$(date +%Y%m%d-%H%M%S)"
+        mkdir -p "$BAK_DIR"
+    fi
+    printf '%s' "$BAK_DIR"
+}
+
+# install_file SRC DEST REL — copy SRC to DEST; REL is the path used in the
+# printed manifest (relative to BASE, for readability).
+install_file() {
+    _src="$1" _dest="$2" _rel="$3"
+    if [ ! -e "$_dest" ]; then
+        cp "$_src" "$_dest"
+        MANIFEST+=("NEW $_rel")
+    elif cmp -s "$_src" "$_dest"; then
+        MANIFEST+=("IDENTICAL $_rel")
+    else
+        _bak="$(manifest_bak_dir)/$_rel"
+        mkdir -p "$(dirname "$_bak")"
+        cp "$_dest" "$_bak"
+        cp "$_src" "$_dest"
+        MANIFEST+=("CHANGED $_rel")
+    fi
+}
+
 # Resolve the SABLE skill names the repo ships (by frontmatter 'name:').
 skill_names() {
     for skdir in "$REPO"/skills/*/; do
@@ -246,18 +283,19 @@ cleanup_retired_artifacts
 # All multi-manager hooks (lib-identity.sh included — sourced by the others).
 for hook in "$REPO"/hooks/multi-manager/*.sh; do
     [ -f "$hook" ] || continue
-    cp "$hook" "$HOOKS_DIR/$(basename "$hook")"
-    chmod +x "$HOOKS_DIR/$(basename "$hook")" 2>/dev/null || true
+    _name="$(basename "$hook")"
+    install_file "$hook" "$HOOKS_DIR/$_name" "hooks/multi-manager/$_name"
+    chmod +x "$HOOKS_DIR/$_name" 2>/dev/null || true
 done
 
 # Registry + lincoln role + identity. Remove a stale installed cockpit role
 # (v2: the agent is lincoln; SABLE-uz9.5).
-cp "$REPO/templates/multi-manager/agents.yaml"      "$BASE/sable/agents.yaml"
+install_file "$REPO/templates/multi-manager/agents.yaml" "$BASE/sable/agents.yaml" "sable/agents.yaml"
 # tmux warm-pane topology (SABLE-bldh): lincoln + optimus/tarzan/chuck all run as
 # panes whose role session-role-anchor.sh injects from BASE/sable/roles/<name>.md
 # (CLAUDE_AGENT_ROLE=manager set by sable-tmux). Install all four, not just lincoln.
 for _role in lincoln optimus tarzan chuck; do
-    cp "$REPO/templates/multi-manager/roles/$_role.md" "$BASE/sable/roles/$_role.md"
+    install_file "$REPO/templates/multi-manager/roles/$_role.md" "$BASE/sable/roles/$_role.md" "sable/roles/$_role.md"
 done
 rm -f "$BASE/sable/roles/cockpit.md"
 
@@ -267,7 +305,11 @@ for skdir in "$REPO"/skills/*/; do
     skname="$(grep -m1 '^name:' "${skdir}SKILL.md" | sed 's/^name:[[:space:]]*//' | tr -d '[:space:]\r')"
     [ -n "$skname" ] || skname="$(basename "$skdir")"
     mkdir -p "$SKILLS/$skname"
-    for f in "${skdir}"*; do [ -f "$f" ] && cp "$f" "$SKILLS/$skname/$(basename "$f")"; done
+    for f in "${skdir}"*; do
+        [ -f "$f" ] || continue
+        _fname="$(basename "$f")"
+        install_file "$f" "$SKILLS/$skname/$_fname" "skills/$skname/$_fname"
+    done
 done
 
 # Merge the settings snippet.
@@ -280,3 +322,17 @@ echo "  • /sable-plan and /sable-execute become available after you restart th
 echo "  • Start your session:  sable-launch   (Lincoln only, wraps sable-tmux; managers spawn on demand)"
 echo "  • Disable anytime without uninstalling:  export SABLE_ORCHESTRATION=off"
 echo "  • Uninstall:  sable-orchestration-install --$SCOPE --uninstall"
+echo
+echo "Change manifest ($BASE):"
+_changed=0
+for _entry in "${MANIFEST[@]}"; do
+    _status="${_entry%% *}"
+    _rel="${_entry#* }"
+    printf '  %-9s %s\n' "$_status" "$_rel"
+    [ "$_status" = "CHANGED" ] && _changed=$((_changed + 1))
+done
+if [ "$_changed" -gt 0 ]; then
+    echo "  ($_changed file(s) changed; prior copies snapshotted to $BAK_DIR)"
+else
+    echo "  (all files identical to source; nothing changed)"
+fi

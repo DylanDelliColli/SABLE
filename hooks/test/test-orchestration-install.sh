@@ -242,6 +242,40 @@ if printf '%s' "$RA_OUT2" | grep -qi "retired artifacts cleaned"; then fail "gsq
 if valid_json "$RASET"; then pass "gsqj: settings still valid JSON after second run"; else fail "gsqj: settings still valid JSON after second run"; fi
 rm -rf "$RA"
 
+# ---------- SABLE-6lfz: per-file change manifest + snapshot ----------
+# Point the installer at a throwaway source tree (SABLE_REPO_DIR) so "modify one
+# source file" never touches this repo's own tracked files; it's a copy of the
+# real hooks/templates/skills subset the installer actually reads from.
+RS="$(mktemp -d)"
+mkdir -p "$RS/hooks/multi-manager" "$RS/templates/multi-manager/roles" "$RS/skills/sample-skill"
+cp "$REPO"/hooks/multi-manager/*.sh "$RS/hooks/multi-manager/"
+cp "$REPO/templates/multi-manager/agents.yaml" "$RS/templates/multi-manager/agents.yaml"
+cp "$REPO/templates/multi-manager/settings-snippet.json" "$RS/templates/multi-manager/settings-snippet.json"
+cp "$REPO"/templates/multi-manager/roles/*.md "$RS/templates/multi-manager/roles/"
+printf -- '---\nname: sample-skill\n---\nplaceholder\n' > "$RS/skills/sample-skill/SKILL.md"
+
+MF="$(mktemp -d)"
+out_first="$(SABLE_REPO_DIR="$RS" SABLE_PROJECT_DIR="$MF" bash "$INSTALLER" --project 2>&1)"
+if printf '%s' "$out_first" | grep -q "Change manifest"; then pass "manifest: first install prints a change manifest"; else fail "manifest: first install prints a change manifest"; fi
+if printf '%s' "$out_first" | grep -q "NEW "; then pass "manifest: first install reports NEW entries"; else fail "manifest: first install reports NEW entries"; fi
+
+out_second="$(SABLE_REPO_DIR="$RS" SABLE_PROJECT_DIR="$MF" bash "$INSTALLER" --project 2>&1)"
+if printf '%s' "$out_second" | grep -q "all files identical"; then pass "manifest: second run reports all-identical"; else fail "manifest: second run reports all-identical" "$out_second"; fi
+if printf '%s' "$out_second" | grep -q "CHANGED"; then fail "manifest: second run has no CHANGED entries"; else pass "manifest: second run has no CHANGED entries"; fi
+
+# modify one source file (in the throwaway RS tree, never the real repo)
+echo "# test-touch" >> "$RS/hooks/multi-manager/mode-interlock.sh"
+out_third="$(SABLE_REPO_DIR="$RS" SABLE_PROJECT_DIR="$MF" bash "$INSTALLER" --project 2>&1)"
+if printf '%s' "$out_third" | grep -q "CHANGED.*mode-interlock.sh"; then pass "manifest: third run reports the modified file as CHANGED"; else fail "manifest: third run reports the modified file as CHANGED" "$out_third"; fi
+changed_count="$(printf '%s' "$out_third" | grep -c '^  CHANGED')"
+if [ "$changed_count" = "1" ]; then pass "manifest: third run reports exactly one changed file"; else fail "manifest: third run reports exactly one changed file" "count=$changed_count"; fi
+
+bak_dir="$(find "$MF/.claude" -maxdepth 1 -name '.install-bak-*' | sort | tail -1)"
+if [ -n "$bak_dir" ] && [ -f "$bak_dir/hooks/multi-manager/mode-interlock.sh" ]; then pass "manifest: snapshot dir captures the prior copy"; else fail "manifest: snapshot dir captures the prior copy" "bak_dir=$bak_dir"; fi
+if [ -n "$bak_dir" ] && ! grep -q "test-touch" "$bak_dir/hooks/multi-manager/mode-interlock.sh"; then pass "manifest: snapshot holds the pre-change content"; else fail "manifest: snapshot holds the pre-change content"; fi
+if grep -q "test-touch" "$MF/.claude/hooks/multi-manager/mode-interlock.sh"; then pass "manifest: installed copy now matches the new source"; else fail "manifest: installed copy now matches the new source"; fi
+rm -rf "$RS" "$MF"
+
 rm -rf "$P" "$P2" "$U" "$PU" "$M"
 echo
 echo "=========================================="
