@@ -6,6 +6,7 @@ tmux user-options set at spawn / completion: @sable_role=worker, @sable_bead=<id
 @sable_status=running|done. Reaping is driven by the pane's own done-flag (pure
 tmux); the manager separately watches the bead pool for the actual result.
 """
+import argparse
 import importlib.util
 import json
 import subprocess
@@ -602,6 +603,88 @@ def test_filter_protected_excludes_pane_in_attached_clients_window():
         raise AssertionError(f"unexpected call {args}")
 
     assert sws.filter_protected(["%1", "%2"], None, run=fake_run) == ["%2"]
+
+
+# --- SABLE-dcw2: panes carried no owner attribution, so any manager's sweep
+# saw (and --reap'd) every manager's workers. parse_worker_panes now surfaces
+# the @sable_lane tag as "lane", and filter_by_lane scopes a listing to the
+# caller's own lane. The lane key is added ONLY when stamped, so every bare-shape
+# assertion above (and the reap/sampling logic) is untouched. ---
+
+def test_parse_worker_panes_surfaces_lane_when_stamped():
+    # a worker pane spawned by the updated sable-spawn-worker carries a 7th
+    # field, @sable_lane -- surfaced as "lane" on the record
+    out = "%1\tworker\tbead-a\trunning\t\t\toptimus\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%1", "bead": "bead-a", "status": "running",
+                      "lane": "optimus"}]
+
+
+def test_parse_worker_panes_omits_lane_key_when_unstamped():
+    # a pane spawned before the @sable_lane column (only 4 fields) keeps the
+    # exact bare {pane, bead, status} shape -- no "lane" key -- so it stays
+    # unattributed and is surfaced only under --all, never silently swept
+    out = "%2\tworker\tbead-b\trunning\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%2", "bead": "bead-b", "status": "running"}]
+    assert "lane" not in panes[0]
+
+
+def test_parse_worker_panes_producer_carries_lane():
+    # the lane rides alongside a producer's class/deliverable, added last
+    out = "%3\tvictor\tbead-v\tdone\tproducer\t/tmp/d.json\ttarzan\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%3", "bead": "bead-v", "status": "done",
+                      "class": "producer", "deliverable": "/tmp/d.json",
+                      "lane": "tarzan"}]
+
+
+def test_filter_by_lane_keeps_only_matching_lane():
+    workers = [
+        {"pane": "%1", "bead": "a", "status": "running", "lane": "optimus"},
+        {"pane": "%2", "bead": "b", "status": "done", "lane": "tarzan"},
+        {"pane": "%3", "bead": "c", "status": "running", "lane": "optimus"},
+    ]
+    assert sws.filter_by_lane(workers, "optimus") == [workers[0], workers[2]]
+    assert sws.filter_by_lane(workers, "tarzan") == [workers[1]]
+
+
+def test_filter_by_lane_excludes_unattributed_pane():
+    # an ownerless pane (no "lane" key) matches NO manager -- it belongs to
+    # --all only, never to a lane that can't positively claim it
+    workers = [
+        {"pane": "%1", "bead": "a", "status": "done"},              # unstamped
+        {"pane": "%2", "bead": "b", "status": "done", "lane": "optimus"},
+    ]
+    assert sws.filter_by_lane(workers, "optimus") == [workers[1]]
+    assert sws.filter_by_lane(workers, "tarzan") == []
+
+
+def test_resolve_view_lane_all_returns_none():
+    ns = argparse.Namespace(all=True, mine=False, lane=None)
+    assert sws.resolve_view_lane(ns) is None
+
+
+def test_resolve_view_lane_explicit_lane_wins():
+    ns = argparse.Namespace(all=False, mine=False, lane="tarzan")
+    assert sws.resolve_view_lane(ns) == "tarzan"
+
+
+def test_resolve_view_lane_defaults_to_caller_agent_name(monkeypatch):
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "optimus")
+    ns = argparse.Namespace(all=False, mine=False, lane=None)
+    assert sws.resolve_view_lane(ns) == "optimus"
+    # --mine is the explicit spelling of that same default
+    ns_mine = argparse.Namespace(all=False, mine=True, lane=None)
+    assert sws.resolve_view_lane(ns_mine) == "optimus"
+
+
+def test_resolve_view_lane_unlaned_caller_falls_back_to_global(monkeypatch):
+    # no CLAUDE_AGENT_NAME (the operator by hand) -> global view, not an empty
+    # own-lane one
+    monkeypatch.delenv("CLAUDE_AGENT_NAME", raising=False)
+    ns = argparse.Namespace(all=False, mine=False, lane=None)
+    assert sws.resolve_view_lane(ns) is None
 
 
 if __name__ == "__main__":

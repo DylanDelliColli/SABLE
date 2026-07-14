@@ -1094,6 +1094,39 @@ def test_respawn_keeps_model_check_active(sock):
         assert not (Path(dd) / f"{bead_id}.md").exists()
 
 
+def test_spawn_stamps_owning_lane_on_worker_pane(sock):
+    """SABLE-dcw2: a worker spawned by manager optimus (CLAUDE_AGENT_NAME=optimus)
+    must carry @sable_lane=optimus on its pane — the owner tag sable-worker-status
+    scopes its own-lane listing/reap by. Before this, the lane lived only in the
+    pane's ENV (invisible to that tool), so every manager's sweep saw every pane."""
+    with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
+        env = {
+            **os.environ,
+            "CLAUDE_AGENT_NAME": "optimus",   # the invoking manager (the lane)
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+        r = subprocess.run(
+            ["python3", str(BIN), BEAD, "--worktree", wt,
+             "--model", "haiku", "--skip-governance"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        time.sleep(0.6)
+
+        lane_tags = _tmux(sock, "list-panes", "-a",
+                          "-F", "#{@sable_role} #{@sable_lane}").stdout
+        assert any(
+            line == "worker optimus" for line in lane_tags.splitlines()
+        ), lane_tags
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

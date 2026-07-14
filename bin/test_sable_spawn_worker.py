@@ -573,6 +573,41 @@ def test_worker_env_args_always_contains_worker_marker():
         assert "SABLE_WORKER_PANE=1" in ssw.worker_env_args(lane)
 
 
+# --- SABLE-dcw2: the worker pane must ALSO be stamped @sable_lane=<owning
+# manager> so sable-worker-status can attribute it to one lane instead of every
+# manager's sweep seeing every pane. worker_pane_tags is the pure tag list. ---
+
+def test_worker_pane_tags_stamps_lane_when_resolvable():
+    assert ssw.worker_pane_tags("SABLE-x", "/repo", "optimus") == [
+        ("@sable_role", "worker"), ("@sable_bead", "SABLE-x"),
+        ("@sable_repo", "/repo"), ("@sable_lane", "optimus"),
+    ]
+
+
+def test_worker_pane_tags_omits_lane_when_empty():
+    # a lane-less dispatch leaves the pane unattributed (no @sable_lane), exactly
+    # as an empty @sable_repo is omitted — sable-worker-status then shows it only
+    # under --all, never silently folding it into some manager's lane
+    assert ssw.worker_pane_tags("SABLE-x", "/repo", "") == [
+        ("@sable_role", "worker"), ("@sable_bead", "SABLE-x"),
+        ("@sable_repo", "/repo"),
+    ]
+
+
+def test_worker_pane_tags_omits_repo_when_empty_but_keeps_lane():
+    assert ssw.worker_pane_tags("SABLE-x", "", "tarzan") == [
+        ("@sable_role", "worker"), ("@sable_bead", "SABLE-x"),
+        ("@sable_lane", "tarzan"),
+    ]
+
+
+def test_worker_pane_tags_never_stamps_status():
+    # @sable_status is owned by the pane's own with_lifecycle_flags script
+    # (SABLE-5v9n); a manager-side stamp here would race the done-flip
+    keys = [k for k, _ in ssw.worker_pane_tags("SABLE-x", "/repo", "optimus")]
+    assert "@sable_status" not in keys
+
+
 # --- SABLE-38zi: a worker pane can NOT re-dispatch --------------------------
 #
 # OBSERVED 2026-07-14: a spawned worker booted as its lane MANAGER (tarzan

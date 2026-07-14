@@ -29,9 +29,21 @@ The bead pool is the manager's RESULT channel (the manager reviews the closed
 bead). This tool is the janitor: it surfaces pane liveness and reaps panes
 whose occupant has flagged itself done — pure tmux, no bd coupling.
 
+By default the listing is scoped to the CALLER'S OWN lane — the panes stamped
+@sable_lane == $CLAUDE_AGENT_NAME (SABLE-dcw2). Without this scoping any
+manager's sweep saw — and --reap KILLED — every manager's worker panes: a
+stranded-recovery sweep adopted another lane's just-spawned workers as orphans,
+and a reap consumed DONE panes the owning manager was still event-waiting on.
+--all restores the fleet-wide view; --lane <name> targets a specific lane. A
+caller with no $CLAUDE_AGENT_NAME (e.g. the operator running it by hand) is
+un-laned, so the default is the global view for them.
+
 Usage:
-  sable-worker-status            # table of worker/producer panes
-  sable-worker-status --reap     # also kill panes whose @sable_status=done
+  sable-worker-status            # own-lane table (default: @sable_lane==$CLAUDE_AGENT_NAME)
+  sable-worker-status --mine     # explicit form of the default own-lane filter
+  sable-worker-status --lane opt # panes owned by lane "opt"
+  sable-worker-status --all      # every lane (the pre-dcw2 fleet-wide view)
+  sable-worker-status --reap     # also kill OWN-lane panes whose @sable_status=done
   sable-worker-status --json
 
 Env:
@@ -59,8 +71,12 @@ WORKER_ROLE_PREFIX = "worker"
 # (e.g. a producer pane spawned without a bead tag) into its neighboring
 # whitespace, shifting every later column left by one. Tabs never collapse,
 # so an empty @sable_bead placeholder still occupies its own field.
+# @sable_lane (SABLE-dcw2) is the LAST field: appended so a pane spawned before
+# this column existed (no @sable_lane) simply renders a trailing empty field
+# rather than shifting @sable_class/@sable_deliverable — the same tab-delimited
+# discipline the fields above rely on.
 _FORMAT = ("#{pane_id}\t#{@sable_role}\t#{@sable_bead}\t#{@sable_status}\t"
-           "#{@sable_class}\t#{@sable_deliverable}")
+           "#{@sable_class}\t#{@sable_deliverable}\t#{@sable_lane}")
 
 
 def tmux_base(socket: str | None) -> list[str]:
@@ -75,7 +91,14 @@ def parse_worker_panes(output: str) -> list[dict]:
     it. Producer records (and the unrecognized-class fail-safe below)
     additionally carry "class" (and, for producers, "deliverable"), since
     reaping_decision needs them to gate the kill decision. Missing status
-    defaults to 'running' (a just-spawned pane may not have set it yet)."""
+    defaults to 'running' (a just-spawned pane may not have set it yet).
+
+    A pane's @sable_lane (SABLE-dcw2), when stamped, is added as "lane" — the
+    key filter_by_lane keys off for the own-lane default view. It is added
+    ONLY when non-empty, exactly like "class"/"deliverable": a pane spawned
+    before this column (or without a resolvable lane) keeps the bare shape, so
+    every pre-existing exact-shape assertion stays valid and an unattributed
+    pane is surfaced only under --all."""
     workers: list[dict] = []
     for line in output.splitlines():
         parts = line.split("\t")
@@ -86,23 +109,27 @@ def parse_worker_panes(output: str) -> list[dict]:
         status = parts[3] if len(parts) >= 4 and parts[3] else "running"
         cls = parts[4] if len(parts) >= 5 and parts[4] else ""
         deliverable = parts[5] if len(parts) >= 6 and parts[5] else ""
+        lane = parts[6] if len(parts) >= 7 and parts[6] else ""
 
         if cls == "manager":
             continue  # always-on manager loops are never surfaced/reaped
         if cls == "":
             if not role.startswith(WORKER_ROLE_PREFIX):
                 continue  # legacy rule: role-less / non-worker panes skipped
-            workers.append({"pane": pane, "bead": bead, "status": status})
+            rec = {"pane": pane, "bead": bead, "status": status}
         elif cls == "worker":
-            workers.append({"pane": pane, "bead": bead, "status": status})
+            rec = {"pane": pane, "bead": bead, "status": status}
         elif cls == "producer":
-            workers.append({"pane": pane, "bead": bead, "status": status,
-                            "class": "producer", "deliverable": deliverable})
+            rec = {"pane": pane, "bead": bead, "status": status,
+                   "class": "producer", "deliverable": deliverable}
         else:
             # unrecognized non-empty class: list it (a human should notice),
             # but never reap it -- see reaping_decision's fail-safe.
-            workers.append({"pane": pane, "bead": bead, "status": status,
-                            "class": cls, "deliverable": deliverable})
+            rec = {"pane": pane, "bead": bead, "status": status,
+                   "class": cls, "deliverable": deliverable}
+        if lane:
+            rec["lane"] = lane
+        workers.append(rec)
     return workers
 
 
@@ -166,6 +193,20 @@ def dedupe_panes(workers: list[dict]) -> list[dict]:
         seen.add(w["pane"])
         deduped.append(w)
     return deduped
+
+
+def filter_by_lane(workers: list[dict], lane: str) -> list[dict]:
+    """Restrict to panes stamped @sable_lane == `lane` — the SABLE-dcw2
+    own-lane view. A manager's DEFAULT sweep must see (and --reap) ONLY its
+    own dispatched workers: the ownerless listing let any manager's
+    sable-worker-status surface every manager's panes, so a stranded-recovery
+    sweep adopted another lane's just-spawned workers as orphans, and a reap
+    consumed DONE panes the OWNING manager was still event-waiting on (stall +
+    who-relays-to-chuck ambiguity). A pane with no @sable_lane (empty/unstamped,
+    e.g. spawned before this column) carries no "lane" key, matches no manager,
+    and is therefore surfaced only under --all — never silently swept by a lane
+    it can't be attributed to."""
+    return [w for w in workers if w.get("lane", "") == lane]
 
 
 def _runner(args: list[str]) -> str:
@@ -414,11 +455,31 @@ def filter_protected(panes: list[str], socket: str | None, run=_runner) -> list[
     return [p for p in panes if pane_location(p, socket, run=run) not in protected]
 
 
+def resolve_view_lane(ns) -> str | None:
+    """The lane to scope the listing/reap to (SABLE-dcw2), or None for the
+    fleet-wide view. --all => None; --lane <name> => that name; otherwise (the
+    default, == --mine) the caller's own $CLAUDE_AGENT_NAME. An un-laned caller
+    (no CLAUDE_AGENT_NAME — e.g. the operator running it by hand) also resolves
+    to None: they get the global view rather than an empty own-lane one."""
+    if ns.all:
+        return None
+    if ns.lane:
+        return ns.lane
+    return (os.environ.get("CLAUDE_AGENT_NAME") or "").strip() or None
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sable-worker-status")
     p.add_argument("--reap", action="store_true",
                    help="kill panes whose @sable_status=done")
     p.add_argument("--json", action="store_true", help="machine-readable output")
+    scope = p.add_mutually_exclusive_group()
+    scope.add_argument("--all", action="store_true",
+                       help="list every lane's panes (default: only the caller's own lane)")
+    scope.add_argument("--mine", action="store_true",
+                       help="list only the caller's own lane ($CLAUDE_AGENT_NAME) — the default")
+    scope.add_argument("--lane", metavar="NAME",
+                       help="list only panes owned by lane NAME")
     ns = p.parse_args(sys.argv[1:] if argv is None else argv)
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
     try:
@@ -429,6 +490,13 @@ def main(argv: list[str] | None = None) -> int:
 
     interval = float(os.environ.get("SABLE_STATUS_SAMPLE_INTERVAL", _DEFAULT_SAMPLE_INTERVAL))
     workers = list_workers_confirmed(socket, session=session, interval=interval)
+    # SABLE-dcw2: scope to the caller's own lane BEFORE anything reads or reaps,
+    # so the display, the done-no-deliverable flags AND reaping_decision all
+    # operate on the owned subset — a manager's --reap can never touch (and so
+    # can never consume the completion signal of) another lane's pane.
+    view_lane = resolve_view_lane(ns)
+    if view_lane is not None:
+        workers = filter_by_lane(workers, view_lane)
     dnd_panes = {w["pane"] for w in done_no_deliverable(workers)}
 
     if ns.json:
@@ -438,7 +506,8 @@ def main(argv: list[str] | None = None) -> int:
             print("no worker panes")
         for w in workers:
             flag = " [done-no-deliverable]" if w["pane"] in dnd_panes else ""
-            print(f"{w['pane']:<8} {w['bead']:<16} {w['status']}{flag}")
+            lane = w.get("lane", "-")  # SABLE-dcw2 owner column; "-" if unstamped
+            print(f"{w['pane']:<8} {lane:<10} {w['bead']:<16} {w['status']}{flag}")
 
     if ns.reap:
         doomed = reaping_decision(workers)

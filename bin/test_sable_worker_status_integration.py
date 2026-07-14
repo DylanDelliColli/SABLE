@@ -44,10 +44,32 @@ def _run(s, *args):
     # SABLE_STATUS_SAMPLE_INTERVAL shrunk: SABLE-1kbo windowed sampling adds a
     # real sleep between two internal listing reads (default 1.5s); none of
     # these cases are timing-sensitive themselves, so keep them fast.
+    # CLAUDE_AGENT_NAME forced empty (SABLE-dcw2): these legacy cases assert the
+    # FLEET-WIDE view over lane-less panes, so they must not inherit an ambient
+    # lane from the test runner (a manager pane sets CLAUDE_AGENT_NAME) and
+    # silently filter every pane out. The own-lane filter is covered by the
+    # two-manager case below, which sets CLAUDE_AGENT_NAME explicitly.
     return subprocess.run(["python3", str(BIN), *args], capture_output=True, text=True,
                           env={**os.environ, "SABLE_TMUX_SOCKET": s,
                                "SABLE_TMUX_SESSION": "w",
-                               "SABLE_STATUS_SAMPLE_INTERVAL": "0.1"})
+                               "SABLE_STATUS_SAMPLE_INTERVAL": "0.1",
+                               "CLAUDE_AGENT_NAME": ""})
+
+
+def _run_as(s, lane, *args):
+    """Run sable-worker-status as manager `lane` (SABLE-dcw2): CLAUDE_AGENT_NAME
+    is set so the default view scopes to that lane. `lane=""` (or passing --all
+    in args) yields the fleet-wide view."""
+    import os
+    return subprocess.run(["python3", str(BIN), *args], capture_output=True, text=True,
+                          env={**os.environ, "SABLE_TMUX_SOCKET": s,
+                               "SABLE_TMUX_SESSION": "w",
+                               "SABLE_STATUS_SAMPLE_INTERVAL": "0.1",
+                               "CLAUDE_AGENT_NAME": lane})
+
+
+def _tag_lane(s, target, lane):
+    _tmux(s, "set-option", "-p", "-t", target, "@sable_lane", lane)
 
 
 def _pane_count(s):
@@ -135,6 +157,7 @@ def test_reap_scoped_to_caller_repo(sock, tmp_path):
 
     env = {**os.environ, "SABLE_TMUX_SOCKET": sock, "SABLE_STATUS_SAMPLE_INTERVAL": "0.1"}
     env.pop("SABLE_TMUX_SESSION", None)
+    env.pop("CLAUDE_AGENT_NAME", None)  # SABLE-dcw2: fleet-wide over lane-less panes
     r = subprocess.run(["python3", str(BIN), "--reap"], capture_output=True,
                        text=True, env=env, cwd=sessions["alpha"][0])
     assert r.returncode == 0, r.stderr
@@ -165,6 +188,7 @@ def test_reports_stale_done_tag_as_running_after_sampling_window(sock):
 
     env = {**os.environ, "SABLE_TMUX_SOCKET": sock, "SABLE_TMUX_SESSION": "w",
            "SABLE_STATUS_SAMPLE_INTERVAL": "1.5"}
+    env.pop("CLAUDE_AGENT_NAME", None)  # SABLE-dcw2: fleet-wide over lane-less pane
     r = subprocess.run(["python3", str(BIN)], capture_output=True, text=True, env=env)
     assert r.returncode == 0, r.stderr
     lines = [ln for ln in r.stdout.splitlines() if "bead-flip" in ln]
@@ -276,6 +300,69 @@ def test_reap_protects_done_pane_in_attached_clients_current_window(sock):
     finally:
         client.terminate()
         client.wait(timeout=2)
+
+
+# --- SABLE-dcw2: two-manager attribution. Optimus and Tarzan each own a worker
+# pane in the SAME repo fleet. Before this fix the panes carried no owner tag, so
+# either manager's sable-worker-status saw BOTH — a sweep adopted the other
+# lane's workers as orphans, and a --reap consumed DONE panes the owning manager
+# was still event-waiting on. Now each pane is stamped @sable_lane and the
+# default listing/reap is scoped to the caller's own lane. ---
+
+def _two_manager_session(sock):
+    """Session 'w' with pane 0 = optimus's DONE worker (@sable_lane=optimus) and
+    pane 1 = tarzan's DONE worker (@sable_lane=tarzan). Optimus owns pane 0 (the
+    session's original pane) so reaping tarzan's split never destroys the
+    session out from under the assertions."""
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.0", "worker", "bead-optimus", "done")
+    _tag_lane(sock, "w.0", "optimus")
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.1", "worker", "bead-tarzan", "done")
+    _tag_lane(sock, "w.1", "tarzan")
+
+
+def test_default_listing_scoped_to_owning_lane(sock):
+    """Manager B (tarzan) default listing must show ONLY tarzan's worker, not
+    optimus's; --all restores the fleet-wide view showing both."""
+    _two_manager_session(sock)
+
+    mine = _run_as(sock, "tarzan")
+    assert mine.returncode == 0, mine.stderr
+    assert "bead-tarzan" in mine.stdout, mine.stdout
+    assert "bead-optimus" not in mine.stdout, mine.stdout  # optimus's pane hidden
+
+    everything = _run_as(sock, "tarzan", "--all")
+    assert everything.returncode == 0, everything.stderr
+    assert "bead-tarzan" in everything.stdout and "bead-optimus" in everything.stdout, \
+        everything.stdout
+
+
+def test_reap_under_other_manager_spares_owning_lane_done_pane(sock):
+    """Manager B (tarzan) --reap must kill ONLY tarzan's DONE pane and LEAVE
+    optimus's DONE pane alive — routing that completion signal to its owner
+    (optimus), who was event-waiting on it, instead of consuming it. Optimus's
+    own --reap then collects it."""
+    _two_manager_session(sock)
+    assert _pane_count(sock) == 2
+
+    # tarzan sweeps: only his own done pane is reaped
+    r = _run_as(sock, "tarzan", "--reap")
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.4)
+    survivors = _tmux(sock, "list-panes", "-a", "-F", "#{@sable_bead}").stdout
+    assert "bead-optimus" in survivors, survivors  # owner's signal preserved
+    assert "bead-tarzan" not in survivors, survivors  # tarzan reaped his own
+
+    # optimus now collects his own done pane
+    r2 = _run_as(sock, "optimus", "--reap")
+    assert r2.returncode == 0, r2.stderr
+    time.sleep(0.4)
+    # optimus's pane was the session's only remaining one -> the session exits
+    assert _tmux(sock, "has-session", "-t", "w", check=False).returncode != 0
 
 
 if __name__ == "__main__":

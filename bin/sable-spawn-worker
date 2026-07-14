@@ -7,7 +7,8 @@ Per bead, a manager (Optimus/Tarzan) calls this to:
   2. (re)use a worktree (--worktree) or create one (`bd worktree create wk-<name>`),
   3. write the full dispatch prompt to a dispatch file (keeps the worktree clean),
   4. open a new tmux WINDOW running `claude --model <model>` with CWD = the worktree,
-  5. tag the worker pane (@sable_role=worker / @sable_bead / @sable_status=running),
+  5. tag the worker pane (@sable_role=worker / @sable_bead / @sable_status=running
+     / @sable_lane=<owning manager>, SABLE-dcw2),
   6. send a single-line "read your dispatch file and execute it" instruction.
 
 The worker then runs the warm-pane self-push lifecycle (worker-dispatch.md):
@@ -634,6 +635,30 @@ def resolve_lane(override: str | None) -> str:
     return (os.environ.get("CLAUDE_AGENT_NAME") or "").strip()
 
 
+def worker_pane_tags(bid: str, root: str, lane: str) -> list[tuple[str, str]]:
+    """The per-pane @options sable-spawn-worker stamps POST-creation. NOT
+    @sable_status — with_lifecycle_flags owns that from inside the pane's own
+    script (SABLE-5v9n), so a manager-side write here would race a fast-exiting
+    worker's done-flip. @sable_repo (SABLE-e1e3.2) and @sable_lane (SABLE-dcw2)
+    are each stamped ONLY when resolvable — matching how an unset value renders
+    as an absent tag rather than an empty one, so a downstream consumer can tell
+    "no value" from "empty value".
+
+    @sable_lane is the OWNING manager (== the resolved lane). Without it a
+    worker carried its lane only in ENV (CLAUDE_AGENT_NAME via tmux -e),
+    invisible to sable-worker-status, so any manager's sweep saw — and --reap'd
+    — every manager's panes: a sweep adopted another lane's just-spawned workers
+    as orphans, and a reap consumed DONE panes the owning manager was still
+    event-waiting on. As a pane @option it drives that tool's own-lane default
+    filter (filter_by_lane)."""
+    tags = [("@sable_role", "worker"), ("@sable_bead", bid)]
+    if root:
+        tags.append(("@sable_repo", root))
+    if lane:
+        tags.append(("@sable_lane", lane))
+    return tags
+
+
 def worker_env_args(lane: str) -> list[str]:
     """tmux `-e` args for the worker pane.
 
@@ -978,13 +1003,10 @@ def main(argv: list[str] | None = None) -> int:
     # here (SABLE-5v9n): with_lifecycle_flags already sets it running/done
     # from INSIDE the pane's own script — a manager-side write here would
     # race a fast-exiting worker and could clobber a done flip that already
-    # landed. @sable_role/@sable_bead/@sable_repo have no such writer on the
-    # pane side, so setting them post-creation is race-free. ---
-    tags = [("@sable_role", "worker"), ("@sable_bead", bid)]
-    root = repo_root()
-    if root:
-        tags.append(("@sable_repo", root))
-    for key, val in tags:
+    # landed. @sable_role/@sable_bead/@sable_repo/@sable_lane have no such
+    # writer on the pane side, so setting them post-creation is race-free. See
+    # worker_pane_tags for the per-tag rationale (incl. the SABLE-dcw2 lane). ---
+    for key, val in worker_pane_tags(bid, repo_root(), lane):
         subprocess.run(base + ["set-option", "-p", "-t", pane_id, key, val], check=True)
 
     # --- deliver the read-instruction, beating the boot + dropped-Enter race
