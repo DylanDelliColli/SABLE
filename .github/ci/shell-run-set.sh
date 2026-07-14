@@ -39,6 +39,7 @@ ALLOW=(
   test-mode-tier.sh
   test-multi-manager-pattern.sh
   test-no-cockpit-naming.sh
+  test-no-hook-autopush.sh
   test-orchestration-install.sh
   test-post-push-merge-notify.sh
   test-post-push-merge-notify-isolation.sh
