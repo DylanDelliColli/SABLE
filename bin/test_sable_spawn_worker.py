@@ -117,19 +117,112 @@ def test_parse_bead_list_fails_open_on_malformed():
     assert ssw.parse_bead_list('{"id":"X-1"}') == []  # object, not array
 
 
-def test_already_in_progress_check_blocks_second_spawn():
+def test_already_in_progress_check_blocks_second_spawn_with_pane_evidence():
     err = ssw.already_in_progress_check(
-        {"id": "X-1", "status": "in_progress", "assignee": "tarzan"})
+        {"id": "X-1", "status": "in_progress", "assignee": "tarzan"},
+        pane_evidence=True, worktree_evidence=False)
     assert err is not None and "X-1" in err and "IN_PROGRESS" in err and "tarzan" in err
 
 
 def test_already_in_progress_check_allows_open_bead():
-    assert ssw.already_in_progress_check({"id": "X-1", "status": "open"}) is None
+    assert ssw.already_in_progress_check(
+        {"id": "X-1", "status": "open"}, True, True) is None
 
 
 def test_already_in_progress_check_handles_missing_assignee():
-    err = ssw.already_in_progress_check({"id": "X-1", "status": "in_progress"})
+    err = ssw.already_in_progress_check(
+        {"id": "X-1", "status": "in_progress"},
+        pane_evidence=False, worktree_evidence=True)
     assert err is not None and "unassigned" in err
+
+
+# --- SABLE-676c: claim-then-hold must NOT false-positive as a duplicate -------
+#
+# A manager claims a bead (-> IN_PROGRESS) to mark lane ownership during a
+# coordination hold, then spawns the FIRST worker when the hold lifts (the
+# documented claim-THEN-spawn protocol). With NO worker pane and NO worktree yet,
+# the old any-in_progress guard wrongly refused that first dispatch as a
+# duplicate. IN_PROGRESS is a duplicate ONLY when dispatch evidence exists.
+
+def test_already_in_progress_check_allows_bare_claim_no_evidence():
+    # the core fix: in_progress + no pane + no worktree = claim-then-hold -> PASS
+    assert ssw.already_in_progress_check(
+        {"id": "X-1", "status": "in_progress", "assignee": "optimus"},
+        pane_evidence=False, worktree_evidence=False) is None
+
+
+def test_already_in_progress_check_blocks_on_worktree_evidence_alone():
+    err = ssw.already_in_progress_check(
+        {"id": "X-1", "status": "in_progress"},
+        pane_evidence=False, worktree_evidence=True)
+    assert err is not None and "IN_PROGRESS" in err and "worktree" in err
+
+
+def test_already_in_progress_check_names_both_evidence_signals():
+    err = ssw.already_in_progress_check(
+        {"id": "X-1", "status": "in_progress"},
+        pane_evidence=True, worktree_evidence=True)
+    assert err is not None and "pane" in err and "worktree" in err
+
+
+# --- dispatch-evidence detection (SABLE-676c) --------------------------------
+
+def test_bead_pane_tagged_true_on_running_pane_for_bead():
+    listing = "SABLE-1\trunning\nSABLE-676c\trunning\n"
+    assert ssw.bead_pane_tagged(listing, "SABLE-676c") is True
+
+
+def test_bead_pane_tagged_false_on_done_pane():
+    # SABLE-qq6r: a stale/done pane is not live dispatch evidence.
+    assert ssw.bead_pane_tagged("SABLE-676c\tdone\n", "SABLE-676c") is False
+
+
+def test_bead_pane_tagged_false_on_non_running_status():
+    # design: match a RUNNING pane — a blank/transient status is NOT evidence, so
+    # a bare claim never false-positives on an untagged pane.
+    assert ssw.bead_pane_tagged("SABLE-676c\t\n", "SABLE-676c") is False
+
+
+def test_bead_pane_tagged_false_when_bead_absent():
+    assert ssw.bead_pane_tagged("SABLE-1\trunning\n", "SABLE-676c") is False
+
+
+def test_bead_pane_tagged_empty_listing():
+    assert ssw.bead_pane_tagged("", "SABLE-676c") is False
+
+
+def test_prospective_worktree_path_derives_sibling_when_no_override():
+    p = ssw.prospective_worktree_path(
+        "SABLE-676c", "claim-guard", None, "/home/u/dev/SABLE")
+    assert p == "/home/u/dev/wk-claim-guard"
+
+
+def test_prospective_worktree_path_derives_from_bead_when_no_scope():
+    p = ssw.prospective_worktree_path("SABLE-676c", None, None, "/home/u/dev/SABLE")
+    assert p == "/home/u/dev/wk-sable-676c"
+
+
+def test_prospective_worktree_path_empty_on_explicit_override():
+    # an explicit --worktree is an intentional reuse / revision re-spawn, never a
+    # duplicate — worktree-evidence must not fire on it.
+    assert ssw.prospective_worktree_path(
+        "SABLE-676c", None, "/some/existing/wt", "/home/u/dev/SABLE") == ""
+
+
+def test_prospective_worktree_path_empty_without_toplevel():
+    assert ssw.prospective_worktree_path("SABLE-676c", "x", None, "") == ""
+
+
+def test_worktree_dispatch_exists_true_for_real_dir(tmp_path):
+    assert ssw.worktree_dispatch_exists(str(tmp_path)) is True
+
+
+def test_worktree_dispatch_exists_false_for_missing(tmp_path):
+    assert ssw.worktree_dispatch_exists(str(tmp_path / "nope")) is False
+
+
+def test_worktree_dispatch_exists_false_for_empty_path():
+    assert ssw.worktree_dispatch_exists("") is False
 
 
 def test_extract_wip_claims_parses_comma_list():
