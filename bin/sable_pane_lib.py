@@ -110,7 +110,21 @@ def dispatch_landed(capture: str, snippet: str) -> bool:
     exact silent-swallow signature behind two stranded handoffs (text left in
     worker composers, delivery assumed successful). Failing closed here makes
     deliver_text keep retrying and ultimately report non-delivery, which routes
-    to the durable inbox-bead fallback instead of a phantom 'delivered'."""
+    to the durable inbox-bead fallback instead of a phantom 'delivered'.
+
+    A running-turn (busy) marker BELOW the last prompt glyph is the INVERSE
+    trap (SABLE-uh4b, the mirror of SABLE-wvk9): once a message SUBMITS, Claude
+    Code echoes it into the transcript as its own prompt-glyph line ("❯ <msg>",
+    glyph + a REGULAR space) and starts the turn — but in the brief redraw
+    window right after Enter the empty composer has not repainted yet, so that
+    echo is momentarily the LAST prompt-glyph line while the turn already runs
+    beneath it. The live composer always sits at the very BOTTOM with only frame
+    chrome (border / cwd / mode lines) below it, never a busy status line — so a
+    busy marker below the last glyph proves that glyph is a submitted echo, not
+    the editable box, and the snippet has LANDED. Without this, that redraw-race
+    capture false-negatived the landing (report-NOT-landed-when-it-DID), filing
+    a duplicate durable fallback bead for a message that actually submitted and
+    blocking a P0 worker release."""
     want = _canon(snippet)
     if not want or want not in _canon(capture):
         return False
@@ -121,6 +135,8 @@ def dispatch_landed(capture: str, snippet: str) -> bool:
             box_start = i
     if box_start is None:
         return False
+    if pane_busy("\n".join(lines[box_start + 1:])):
+        return True
     return want not in _canon("\n".join(lines[box_start:]))
 
 

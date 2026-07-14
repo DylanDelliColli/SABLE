@@ -329,6 +329,133 @@ def test_dispatch_landed_false_when_no_composer_box_even_if_text_visible():
         assert sable_pane_lib.dispatch_landed(boxless, want) is False
 
 
+# --- submitted-echo redraw race: report-NOT-landed-when-it-DID (SABLE-uh4b) ---
+# The INVERSE of wvk9. Once a message SUBMITS, Claude Code echoes it into the
+# transcript as its own prompt-glyph line ("❯ <msg>", glyph + REGULAR space) and
+# starts the turn; in the brief redraw window right after Enter the empty
+# composer has not repainted yet, so that echo is momentarily the LAST glyph
+# line while the turn already runs beneath it (busy marker below). box_start
+# alone mistook the echo for the still-unsubmitted composer and false-negatived
+# the landing — filing a duplicate durable fallback bead for a message that
+# actually submitted, which blocked a P0 worker release.
+
+def test_dispatch_landed_true_for_submitted_echo_above_busy_marker_uh4b():
+    msg = ("⟦SABLE-MSG⟧ from=lincoln to=SABLE-z776 :: GO push your worktree "
+           "branch now recovery landed and chuck drained the merge queue")
+    # redraw window: submitted echo (regular space) is the last glyph line, the
+    # turn is already running BELOW it, composer not yet repainted.
+    redraw = ("● prior turn output\n"
+              f"❯ {msg}\n"
+              "✻ Thinking… (1s · ↓ 8 tokens · esc to interrupt)")
+    assert sable_pane_lib.dispatch_landed(redraw, msg) is True
+    # steady state a moment later (empty composer repainted at the bottom of the
+    # box-drawing frame) must stay landed too — the busy marker now sits ABOVE
+    # the composer, so the normal box_start path returns True.
+    border = "─" * 120
+    steady = ("● prior turn output\n"
+              f"❯ {msg}\n✻ Thinking… (esc to interrupt)\n"
+              f"{border}\n❯\xa0\n{border}\n  ddc@host:~/wk-idle")
+    assert sable_pane_lib.dispatch_landed(steady, msg) is True
+
+
+def test_dispatch_landed_false_for_idle_message_in_box_frame_uh4b_guard():
+    # The false-POSITIVE guard on the uh4b allowance: a message sitting UNSENT in
+    # the box-drawing composer while the pane is IDLE (no busy marker anywhere
+    # below the prompt) must still count as NOT landed. The redraw-race allowance
+    # keys strictly on a running turn beneath the echo, so it can never resurrect
+    # the wvk9/d21h silent-swallow (report-landed-when-it-did-not).
+    msg = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    border = "─" * 120
+    stuck = f"● prior turn output\n{border}\n❯\xa0{msg}\n{border}\n  ddc@host:~/wk-idle"
+    assert sable_pane_lib.dispatch_landed(stuck, msg) is False
+
+
+def test_deliver_message_idle_box_frame_lands_via_redraw_race_uh4b():
+    # SABLE-uh4b end-to-end at deliver_message, against a REAL-shaped pane: an
+    # empty composer inside a box-drawing frame (── borders, "❯\xa0" prompt), a
+    # WIDE message, IDLE at send. After type+Enter the message submits and every
+    # post-send capture lands in the redraw window (echo "❯ <msg>" + running turn,
+    # composer not repainted). deliver_message must report LANDED. Before the fix
+    # this false-negatived on every one of the 8 polls (the exact z776 symptom:
+    # 'undelivered after 8 attempts' while the message had actually submitted).
+    border = "─" * 128
+    nbsp = "\xa0"
+    cwd = "  ddc@KW-LPT-050:~/dev-environment/wk-idle-pane-landed"
+    mode = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+    msg = ("⟦SABLE-MSG⟧ from=lincoln to=SABLE-z776 :: GO push your worktree "
+           "branch now that recovery has landed and chuck has drained the merge "
+           "queue so your self-push applies cleanly")
+    state = {"typed": False}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
+        return True
+
+    def capture():
+        if not state["typed"]:
+            # idle: empty composer inside the box-drawing frame
+            return "\n".join(["● prior turn output", "● done", border,
+                              "❯" + nbsp + " " * 40, border, cwd, mode])
+        # after submit: redraw window persists — transcript echo (regular space)
+        # + running turn, the empty composer has NOT repainted yet.
+        return "\n".join(["● prior turn output",
+                          "❯ " + msg,
+                          "✢ Sautéing… (3s · ↓ 40 tokens · esc to interrupt)"])
+
+    landed = sable_msg.deliver_message(
+        "%2", msg, interrupt=True, run=run, capture=capture,
+        sleep=lambda s: None, ready_timeout=5, interval=0.001, tries=8,
+    )
+    assert landed is True
+
+
+def test_main_landed_box_frame_send_does_not_double_file_fallback_bead_uh4b(monkeypatch):
+    # SABLE-uh4b second half: a send the pane ACCEPTS must NOT be double-counted
+    # into a durable fallback bead (message delivered + a redundant for-<role>
+    # bead — the mirror of the not-delivered-but-reported-success loss). Drive the
+    # REAL main -> deliver_message -> deliver_text -> dispatch_landed composition
+    # against a box-drawing-frame fake that lands via the redraw race; assert rc 0,
+    # "delivered", and that file_fallback_bead was NEVER called.
+    monkeypatch.setenv("SABLE_MSG_POLL_INTERVAL", "0")
+    monkeypatch.setenv("SABLE_MSG_READY_TIMEOUT", "1")
+    monkeypatch.setenv("SABLE_MSG_SUBMIT_TRIES", "4")
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+
+    border = "─" * 128
+    cwd = "  ddc@KW-LPT-050:~/dev-environment/wk-idle-pane-landed"
+    mode = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+    framed = sable_msg.format_message("lincoln", "optimus",
+                                      "GO push your worktree branch now recovery landed")
+    state = {"typed": False}
+
+    class FakeProc:
+        returncode = 0
+
+    def fake_run(cmd, **kw):
+        if "-l" in cmd:
+            state["typed"] = True
+        return FakeProc()
+
+    def fake_capture(base, pane):
+        if not state["typed"]:
+            return "\n".join(["● prior", border, "❯\xa0" + " " * 20, border, cwd, mode])
+        return "\n".join(["● prior", "❯ " + framed,
+                          "✻ Thinking… (0s · esc to interrupt)"])
+
+    monkeypatch.setattr(sable_msg.subprocess, "run", fake_run)
+    monkeypatch.setattr(sable_msg, "_capture_pane", fake_capture)
+    filed = []
+    monkeypatch.setattr(sable_msg, "file_fallback_bead",
+                        lambda *a, **k: filed.append(a) or "SABLE-should-not-file")
+
+    rc = sable_msg.main(["optimus", "GO push your worktree branch now recovery landed",
+                         "--from", "lincoln"])
+    assert rc == 0
+    assert filed == [], "a landed send must not also file a durable fallback bead"
+
+
 def test_deliver_message_boxless_visible_text_degrades_to_failure():
     # End-to-end through deliver_message: the pane only ever shows the text with
     # no composer box (never a submitted turn) -> report non-delivery so the
