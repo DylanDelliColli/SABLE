@@ -570,6 +570,154 @@ def test_deliver_text_fresh_pane_dispatch_still_lands():
     assert landed is True
 
 
+# --- delayed confirmation of a busy-at-t0 queued send (SABLE-h0jw) -----------
+# SABLE-d21h fixed the queued-while-busy phantom-confirm by failing CLOSED the
+# instant the pane was busy at t0 — but that filed a durable noise bead EVEN
+# WHEN the queued line genuinely submitted+landed once the running turn ended
+# (LINCOLN evidence 2026-07-14: chuck's pane, two instances). h0jw replaces
+# fail-close-at-t0 with DELAYED confirmation: keep watching the queued line and
+# only confirm once it PROVABLY became its own submitted turn (a signal a still-
+# queued capture can never present), failing closed only on timeout.
+
+
+def test_submitted_own_turn_rejects_queued_accepts_submitted_h0jw():
+    # The load-bearing predicate. A line QUEUED behind a DIFFERENT running turn
+    # (hoisted above the empty composer, the other turn's busy marker ABOVE that
+    # composer) must be REJECTED — even though plain dispatch_landed false-
+    # positives it (the d21h trap). The same line, once it SUBMITS as its own
+    # turn (echoed on a prompt-glyph line with OUR running turn's busy marker
+    # BELOW it, or the pane fallen idle with the line in the transcript), must be
+    # ACCEPTED.
+    msg = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    other = "● Running the auth refactor…\n✻ Thinking… (12s · esc to interrupt)"
+
+    queued = f"{msg}\n{other}\n❯ \n  ddc@host:~/wt"
+    # dispatch_landed alone is fooled (this is exactly why d21h needed the t0 guard)
+    assert sable_pane_lib.dispatch_landed(queued, msg) is True
+    # but submitted_own_turn is NOT — the busy marker sits above the composer
+    assert sable_pane_lib.submitted_own_turn(queued, msg) is False
+
+    # submitted as OUR turn: echo + running-turn busy marker directly below it
+    running = f"● auth refactor done\n❯ {msg}\n✻ Thinking… (2s · esc to interrupt)"
+    assert sable_pane_lib.submitted_own_turn(running, msg) is True
+
+    # or the pane fell fully idle with the line persisted in the transcript
+    border = "─" * 80
+    idle_done = f"❯ {msg}\n● reply…\n{border}\n❯\xa0\n{border}\n  ddc@host:~/wt"
+    assert sable_pane_lib.submitted_own_turn(idle_done, msg) is True
+
+    # a line NEVER present is never landed
+    assert sable_pane_lib.submitted_own_turn(f"{other}\n❯ \n  ddc@host:~/wt", msg) is False
+
+
+def test_deliver_message_busy_at_t0_then_submits_lands_via_delayed_confirmation_h0jw():
+    # THE bead repro's happy path: the pane is BUSY running a DIFFERENT turn at
+    # send time; our line queues for a few polls (hoisted above the composer,
+    # visible-and-not-in-box — the d21h false-positive shape), then the running
+    # turn ENDS and our queued line SUBMITS as its own turn. deliver_message must
+    # report LANDED via delayed confirmation — NOT fail closed at t0 and file a
+    # redundant noise bead.
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    other_turn = "● Running the auth refactor…\n✻ Thinking… (12s · esc to interrupt)"
+    state = {"typed": False, "polls": 0}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
+        return True
+
+    def capture():
+        if not state["typed"]:
+            # t0: someone else's turn is running (busy) — no empty composer.
+            return f"{other_turn}\n❯ \n  ddc@host:~/wt"
+        state["polls"] += 1
+        if state["polls"] < 3:
+            # queued behind the other turn: hoisted above the empty composer,
+            # the OTHER turn's busy marker still ABOVE it. Looks landed to plain
+            # dispatch_landed (d21h) but is only QUEUED.
+            return f"{message}\n{other_turn}\n❯ \n  ddc@host:~/wt"
+        # the other turn ENDED and our queued line SUBMITTED as its own turn:
+        # echoed as a prompt-glyph line with OUR running turn's busy marker below.
+        return f"● auth refactor done\n❯ {message}\n✻ Thinking… (2s · esc to interrupt)"
+
+    landed = sable_msg.deliver_message(
+        "%2", message, interrupt=False, run=run, capture=capture,
+        sleep=lambda s: None, tries=8, interval=0.01,
+    )
+    assert landed is True
+
+
+def test_deliver_message_busy_at_t0_turn_never_ends_times_out_and_fails_h0jw():
+    # The other half of the bead spec: a busy pane whose running turn NEVER ends
+    # within the poll budget (and our line never becomes its own submitted turn)
+    # must still report NOT landed, so sable-msg files the durable fallback. The
+    # delayed confirmation degrades to fail-closed on timeout — never worse than
+    # d21h.
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: urgent"
+    other_turn = "● Running the auth refactor…\n✻ Thinking… (99s · esc to interrupt)"
+    state = {"typed": False}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
+        return True
+
+    def capture():
+        if not state["typed"]:
+            return f"{other_turn}\n❯ \n  ddc@host:~/wt"
+        # our line stays queued behind the never-ending turn, forever.
+        return f"{message}\n{other_turn}\n❯ \n  ddc@host:~/wt"
+
+    landed = sable_msg.deliver_message(
+        "%2", message, interrupt=False, run=run, capture=capture,
+        sleep=lambda s: None, tries=4, interval=0.01,
+    )
+    assert landed is False
+
+
+def test_main_busy_delayed_land_files_no_fallback_bead_h0jw(monkeypatch):
+    # End-to-end through the REAL main -> deliver_message -> deliver_text ->
+    # submitted_own_turn composition: a busy-at-t0 send whose queued line later
+    # submits+lands must report rc 0 AND must NOT file a durable fallback bead.
+    # This is the exact regression the bead is about — every busy-pane send under
+    # d21h permanently cost a noise bead even when the message landed.
+    monkeypatch.setenv("SABLE_MSG_POLL_INTERVAL", "0")
+    monkeypatch.setenv("SABLE_MSG_SUBMIT_TRIES", "8")
+    monkeypatch.setenv("SABLE_MSG_READY_TIMEOUT", "1")
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+
+    framed = sable_msg.format_message("lincoln", "optimus", "cap in force")
+    other_turn = "● Running the auth refactor…\n✻ Thinking… (12s · esc to interrupt)"
+    state = {"typed": False, "polls": 0}
+
+    class FakeProc:
+        returncode = 0
+
+    def fake_run(cmd, **kw):
+        if "-l" in cmd:
+            state["typed"] = True
+        return FakeProc()
+
+    def fake_capture(base, pane):
+        if not state["typed"]:
+            return f"{other_turn}\n❯ \n  ddc@host:~/wt"       # busy at t0
+        state["polls"] += 1
+        if state["polls"] < 3:
+            return f"{framed}\n{other_turn}\n❯ \n  ddc@host:~/wt"  # queued
+        return f"● done\n❯ {framed}\n✻ Thinking… (2s · esc to interrupt)"  # submitted
+
+    monkeypatch.setattr(sable_msg.subprocess, "run", fake_run)
+    monkeypatch.setattr(sable_msg, "_capture_pane", fake_capture)
+    filed = []
+    monkeypatch.setattr(sable_msg, "file_fallback_bead",
+                        lambda *a, **k: filed.append(a) or "SABLE-should-not-file")
+
+    rc = sable_msg.main(["optimus", "cap in force", "--from", "lincoln"])
+    assert rc == 0
+    assert filed == [], "a busy-at-t0 send that eventually lands must not file a noise bead"
+
+
 # --- interrupt idle-wait state machine (SABLE-m6is) -------------------------
 # A busy Claude turn STILL shows the empty composer prompt at the bottom, so
 # pane_ready fired mid-turn and --interrupt typed into a pane still redrawing the
