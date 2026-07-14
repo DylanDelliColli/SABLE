@@ -6,7 +6,7 @@
 # (ENTRY-POINTS-DESIGN.md intentionally records the old->new mapping).
 set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)"
-cd "$REPO"
+cd "$REPO" || { echo "FATAL: cd to repo root $REPO failed"; exit 2; }
 fails=0
 pass() { printf '  ok  %s\n' "$1"; }
 fail() { printf '  FAIL %s — %s\n' "$1" "${2:-}"; fails=$((fails+1)); }

@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""sable-fixture-tripwire — static check that BANS unsandboxed real-repo git ops
+in test fixtures (SABLE-0ssz.2).
+
+Three P0s on 2026-07-14 (SABLE-xydb push-to-real-main, SABLE-a5a5
+config-to-shared-.git/config, SABLE-l1jf) all shared one mechanism: a test
+fixture ran a real git operation that escaped its sandbox and hit the real repo
+or shared git state. This check fails the build the moment a fixture reintroduces
+the pattern, so a regression is caught at commit/CI time — not by the next P0.
+
+WHAT IT FLAGS
+-------------
+RULE cd-unguarded (hooks/test/*.sh + shell embedded in bin/test_*.py):
+    A command-position `cd <target>` with NO failure guard. This is the ROOT
+    enabler of xydb/a5a5: a bare `cd "$fixture"` that fails (a busy-/tmp race)
+    silently leaves CWD in the real worktree, and the following bare git ops run
+    THERE. z776's fix — `cd ... || exit/return`, or a guarded subshell — is what
+    a clean fixture uses, so guarding every cd makes the escape impossible while
+    leaving the bare `git config`/`git push origin` that legitimately sit behind
+    a guarded cd untouched. (That is why this check targets the cd, not the git
+    op: a line-level "require git -C" rule would false-positive on the z776
+    reference-clean fixtures, which push to a fixture origin from inside a
+    guarded cd.)
+
+RULE real-repo-git (bin/test_*.py):
+    A subprocess git/dolt invocation whose `-C`/cwd target is bound to the REAL
+    repo root (a `Path(__file__)...parent.parent` marker) performing a MUTATING
+    op (push, config, commit, branch -D, worktree remove/add, reset, checkout -B,
+    clean, rm, tag -d). The env preamble (hooks/test/lib-git-sandbox.sh) cannot
+    neutralize an EXPLICIT `git -C <real-repo>` op — only this static ban can.
+
+Known, tracked violations are excused via KNOWN_VIOLATIONS (each WITH its bead),
+exactly like .github/ci/shell-run-set.sh's EXCLUDE map — the debt stays visible,
+and the exception is removed when the bead lands.
+
+USAGE
+    sable-fixture-tripwire            # scan the repo's fixtures; exit 1 on any
+                                      # un-excused violation
+    sable-fixture-tripwire --manifest # list scanned files + excused violations
+    sable-fixture-tripwire PATH ...   # scan explicit files/dirs (used by tests)
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List
+
+
+# ---------------------------------------------------------------------------
+# Known, tracked violations — excused so the check passes on the audited-clean
+# suite while the debt stays visible. Remove an entry when its bead lands.
+# Match is (basename, rule, needle-substring-in-snippet).
+# ---------------------------------------------------------------------------
+KNOWN_VIOLATIONS = [
+    # SABLE-0ssz.3: generated push script cd's unguarded into a scratch dolt
+    # repo (isolated via DOLT_ROOT_PATH + file:// remote, so latent P2).
+    ("test_sable_dolt_push_integration.py", "cd-unguarded", 'cd "{src}"'),
+    # SABLE-0ssz.4: real-repo `git -C str(repo) worktree remove` / `branch -D`
+    # against parent.parent; runs in the o9aa ephemeral clean-room from the gate.
+    ("test_sable_spawn_worker_integration.py", "real-repo-git", "worktree"),
+    ("test_sable_spawn_worker_integration.py", "real-repo-git", "branch"),
+]
+
+# cd targets that are pure navigation (never a fixture escape risk).
+_NAV_TARGETS = {"-", "..", "../..", "../../..", "$OLDPWD", '"$OLDPWD"', "~", "$HOME", '"$HOME"'}
+
+# A git/dolt subcommand that MUTATES repo/ref/config state.
+_MUTATING = {
+    "push", "config", "commit", "commit-tree", "merge", "rebase", "reset",
+    "clean", "rm", "mv", "tag", "fetch", "pull", "remote", "worktree",
+    "branch", "checkout", "switch", "update-ref", "symbolic-ref", "gc", "prune",
+}
+
+# Command-position markers: git/cd is a real command when it follows one of these.
+_CMD_START = r"(?:^|[;&|(){}]|\bthen\b|\bdo\b|\belse\b)\s*"
+# Optional env-assignment / env / command / builtin prefixes before the command.
+_PREFIX = r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+|env\s+(?:-\S+\s+|[A-Za-z_]\S*=\S*\s+)*|command\s+|builtin\s+|exec\s+)*"
+
+_CD_RE = re.compile(_CMD_START + _PREFIX + r"cd\s+(?P<target>\S+)")
+
+# A line carrying this marker is an intentional, reviewed exception (e.g. a test
+# that DELIBERATELY reproduces the unguarded-cd escape). Self-documenting and
+# travels with the line, unlike the file-level KNOWN_VIOLATIONS list.
+_ALLOW_MARKER = re.compile(r"(?:sable-)?tripwire-allow")
+
+
+@dataclass(frozen=True)
+class Violation:
+    file: str          # repo-relative path
+    line: int          # 1-indexed
+    rule: str
+    snippet: str
+
+    def excused(self) -> bool:
+        base = os.path.basename(self.file)
+        for b, rule, needle in KNOWN_VIOLATIONS:
+            if base == b and rule == self.rule and needle in self.snippet:
+                return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Shell lexing helpers
+# ---------------------------------------------------------------------------
+def mask_quotes(line: str) -> str:
+    """Replace the CONTENTS of single/double-quoted spans with 'X', preserving
+    length and the delimiters, so separators / keywords inside string literals
+    cannot be mistaken for shell syntax. Unterminated quotes mask to EOL."""
+    out = list(line)
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if c in ("'", '"'):
+            j = i + 1
+            while j < n and line[j] != c:
+                out[j] = "X"
+                j += 1
+            i = j + 1  # skip the closing quote (or run off the end)
+        else:
+            i += 1
+    return "".join(out)
+
+
+def strip_comment(line: str, masked: str) -> tuple[str, str]:
+    """Drop a trailing shell comment (a '#' at line start or preceded by
+    whitespace, outside quotes). Operates on the masked line to stay
+    quote-aware; returns the truncated (original, masked) pair."""
+    for m in re.finditer(r"#", masked):
+        idx = m.start()
+        if idx == 0 or masked[idx - 1].isspace():
+            return line[:idx], masked[:idx]
+    return line, masked
+
+
+def _guarded_after(masked: str, end: int) -> bool:
+    """Is the cd at position `end` (index just past its target) guarded by a
+    `||` or `&&` that follows it on the same logical line?"""
+    rest = masked[end:]
+    return "||" in rest or "&&" in rest
+
+
+def find_unguarded_cd(line: str) -> list[str]:
+    """Return the offending snippet(s) for every command-position, unguarded,
+    non-navigation `cd` on this line. Empty when the line is clean."""
+    masked = mask_quotes(line)
+    line, masked = strip_comment(line, masked)
+    hits: list[str] = []
+    for m in _CD_RE.finditer(masked):
+        target = m.group("target")
+        if target in _NAV_TARGETS:
+            continue
+        if _guarded_after(masked, m.end()):
+            continue
+        hits.append(line.strip())
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# Scanners
+# ---------------------------------------------------------------------------
+def join_continuations(text: str) -> list[tuple[int, str]]:
+    """Fold backslash-continued shell lines into one logical line, keeping the
+    START line number. A `cd` guarded by `&&`/`||` on a continuation line must
+    read as guarded."""
+    out: list[tuple[int, str]] = []
+    buf = ""
+    start = 0
+    for i, raw in enumerate(text.splitlines(), start=1):
+        if start == 0:
+            start = i
+        if raw.rstrip().endswith("\\"):
+            buf += raw.rstrip()[:-1] + " "
+            continue
+        out.append((start, buf + raw))
+        buf = ""
+        start = 0
+    if buf:
+        out.append((start or 1, buf))
+    return out
+
+
+def scan_shell_text(text: str, path: str) -> list[Violation]:
+    out: list[Violation] = []
+    for lineno, logical in join_continuations(text):
+        if _ALLOW_MARKER.search(logical):
+            continue
+        for snip in find_unguarded_cd(logical):
+            out.append(Violation(path, lineno, "cd-unguarded", snip))
+    return out
+
+
+def _py_real_repo_vars(text: str) -> set[str]:
+    """Names bound to the real repo root, e.g. `repo = Path(__file__)....parent.parent`."""
+    names = set()
+    for m in re.finditer(r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*Path\(__file__\)[^\n]*parent\.parent", text):
+        names.add(m.group(1))
+    return names
+
+
+def scan_python_text(text: str, path: str) -> list[Violation]:
+    out: list[Violation] = []
+    repo_vars = _py_real_repo_vars(text)
+    # A `-C <target>` / cwd=<target> reference is "real-repo" when it names one
+    # of those vars or an inline parent.parent.
+    real_ref = r"(?:parent\.parent"
+    if repo_vars:
+        real_ref += "|" + "|".join(rf"\b{re.escape(v)}\b" for v in repo_vars)
+    real_ref += r")"
+    mut = r"(?:" + "|".join(sorted(_MUTATING)) + r")"
+
+    for i, raw in enumerate(text.splitlines(), start=1):
+        if _ALLOW_MARKER.search(raw):
+            continue
+        # RULE real-repo-git: a git/dolt call whose -C/cwd is the real repo AND
+        # a mutating subcommand appears on the same line.
+        looks_git = re.search(r'["\'](?:git|dolt)["\']', raw) or re.search(r"\b(?:git|dolt)\s+-C\b", raw)
+        if looks_git:
+            has_real_dir = re.search(r'-C["\']?\s*,?\s*[^,\n]*' + real_ref, raw) or \
+                           re.search(r"cwd\s*=\s*[^,\n]*" + real_ref, raw)
+            has_mut = re.search(r'["\']' + mut + r'["\']', raw) or re.search(r"\b" + mut + r"\b", raw)
+            if has_real_dir and has_mut:
+                out.append(Violation(path, i, "real-repo-git", raw.strip()))
+        # RULE cd-unguarded also applies to shell embedded in python strings
+        # (generated push/helper scripts). Only lines that clearly START a shell
+        # cd command qualify — python source never begins a line with `cd `.
+        if re.match(r'^\s*cd\s+["\'{$]', raw):
+            for snip in find_unguarded_cd(raw):
+                out.append(Violation(path, i, "cd-unguarded", snip))
+    return out
+
+
+def scan_file(path: Path, repo_root: Path) -> list[Violation]:
+    rel = str(path.relative_to(repo_root)) if _within(path, repo_root) else str(path)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix == ".sh":
+        return scan_shell_text(text, rel)
+    if path.name.startswith("test_") and path.suffix == ".py":
+        return scan_python_text(text, rel)
+    return []
+
+
+def _within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def default_targets(repo_root: Path) -> list[Path]:
+    targets: list[Path] = []
+    td = repo_root / "hooks" / "test"
+    if td.is_dir():
+        targets += sorted(td.glob("*.sh"))
+    bd = repo_root / "bin"
+    if bd.is_dir():
+        targets += sorted(bd.glob("test_*.py"))
+    return targets
+
+
+def collect(paths: Iterable[Path], repo_root: Path) -> list[Violation]:
+    files: list[Path] = []
+    for p in paths:
+        if p.is_dir():
+            files += sorted(p.glob("*.sh")) + sorted(p.glob("test_*.py"))
+        elif p.is_file():
+            files.append(p)
+    out: list[Violation] = []
+    for f in files:
+        out += scan_file(f, repo_root)
+    return out
+
+
+def repo_root_of(start: Path) -> Path:
+    cur = start.resolve()
+    for cand in [cur] + list(cur.parents):
+        if (cand / ".git").exists() or (cand / "hooks" / "test").is_dir():
+            return cand
+    return cur
+
+
+def main(argv: List[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Ban unsandboxed real-repo git ops in test fixtures.")
+    ap.add_argument("paths", nargs="*", help="files/dirs to scan (default: repo fixtures)")
+    ap.add_argument("--manifest", action="store_true", help="list scanned files + excused violations")
+    args = ap.parse_args(argv)
+
+    here = Path(__file__).resolve()
+    repo_root = repo_root_of(here.parent)
+
+    if args.paths:
+        targets = [Path(p) for p in args.paths]
+        violations = collect(targets, repo_root)
+    else:
+        targets = default_targets(repo_root)
+        violations = []
+        for f in targets:
+            violations += scan_file(f, repo_root)
+
+    active = [v for v in violations if not v.excused()]
+    excused = [v for v in violations if v.excused()]
+
+    if args.manifest:
+        print(f"sable-fixture-tripwire manifest — {len(targets)} fixture files scanned")
+        print(f"  active violations : {len(active)}")
+        print(f"  excused (tracked) : {len(excused)}")
+        for v in excused:
+            print(f"    EXCUSED {v.file}:{v.line} [{v.rule}]  {v.snippet}")
+        for b, rule, needle in KNOWN_VIOLATIONS:
+            print(f"    KNOWN   {b} [{rule}] needle={needle!r}")
+        return 0
+
+    if not active:
+        n = len(excused)
+        note = f" ({n} tracked violation{'s' if n != 1 else ''} excused)" if n else ""
+        print(f"sable-fixture-tripwire: CLEAN — {len(targets)} fixtures, no unsandboxed real-repo git ops{note}")
+        return 0
+
+    print("sable-fixture-tripwire: FAIL — unsandboxed real-repo git op(s) in test fixtures:")
+    for v in active:
+        print(f"  {v.file}:{v.line} [{v.rule}]")
+        print(f"      {v.snippet}")
+    print()
+    print("Fix: guard the cd (`cd ... || exit/return`, or a guarded subshell), or")
+    print("scope the git op to a fixture dir (`git -C <fixture>` / `--file`). If this")
+    print("is a known, tracked exception, add it to KNOWN_VIOLATIONS with its bead id.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

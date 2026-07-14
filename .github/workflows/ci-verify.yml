@@ -113,6 +113,15 @@ jobs:
             --deselect "bin/test_sable_worker_status_integration.py::test_reap_protects_done_pane_in_attached_clients_current_window" \
             --deselect "bin/test_sable_dolt_push_integration.py::test_two_concurrent_wrappers_serialize"
 
+      - name: Fixture isolation tripwire (SABLE-0ssz.2 — ban unsandboxed real-repo git ops)
+        run: |
+          # Static ban on the escape class behind the 2026-07-14 P0s (SABLE-xydb
+          # push-to-real-main, SABLE-a5a5 config-to-shared-.git/config): any
+          # test fixture that runs an unguarded-cd or an explicit git -C
+          # <real-repo> mutation reds the gate here, at CI time, not by the next
+          # P0. Known/tracked violations are excused via KNOWN_VIOLATIONS.
+          python bin/sable-fixture-tripwire
+
       - name: Shell run-set coverage manifest (SABLE-7v3z — exclusions are visible)
         run: bash .github/ci/shell-run-set.sh --manifest
 
