@@ -25,6 +25,7 @@ TESTDIR="$REPO/hooks/test"
 
 # --- Known-green in the clean-room, verified at authoring (SABLE-oeci). --------
 ALLOW=(
+  test-active-contracts-integration.sh
   test-agent-definitions.sh
   test-bead-description-gate.sh
   test-columbo-quick-mode.sh
@@ -55,6 +56,7 @@ ALLOW=(
   test-sable-bin-install.sh
   test-sable-claim.sh
   test-sable-cli.sh
+  test-sable-contract.sh
   test-sable-discover.sh
   test-sable-launch.sh
   test-sable-mode.sh

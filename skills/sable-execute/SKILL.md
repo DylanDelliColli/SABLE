@@ -90,6 +90,30 @@ producers (sherlock / victor / columbo) is blocked on both the Agent and Bash
 legs (soft — `SABLE_ORCHESTRATION_FORCE=1` / `--force` overrides). Mode flips are
 mid-conversation; no restart.
 
+## 1.5 Seed the active-contracts surface (SABLE-9ozz)
+
+The mode flip alone is invisible to a manager pane that **restarts** mid-drain
+(`/clear`, crash, session limit): the pane re-boots on its STATIC role card and
+loses every conversation-state convention this fleet is running under — the
+merge-gate sole-path contract, any interim worker cap, the manual-relay rule
+while a hook is dark. That was the 2026-07-13 gah9 bypass: a restarted chuck
+merged with bare `git merge --no-ff` because his static identity still described
+the old manual flow. Persist the live contracts to disk so `session-role-anchor.sh`
+surfaces them into every fresh boot's identity:
+
+```bash
+sable-contract set  "Merges go ONLY through sable-merge-gate. NO bare git merge/push on any integration branch."
+sable-contract add  "Workers self-push their worktree branch; the post-push hook files for-chuck; Chuck merges via the gate."
+# add any interim fleet rule live this shift, e.g.:
+# sable-contract add "Interim worker cap: 2 per manager until SABLE-p8rf lands."
+```
+
+`sable-contract` writes `<repo>/.claude/sable/state/active-contracts.md`, colocated
+with the mode-state (same per-repo resolution). Update it the moment a protocol
+flips — a contract change that lives only in this conversation dies with the next
+restart. Clear a rule with `sable-contract clear` / re-`set` when it no longer
+applies.
+
 ## 2. Bring up the warm-pane session
 
 Execution runs on the **tmux warm-pane topology** — the only execution topology
