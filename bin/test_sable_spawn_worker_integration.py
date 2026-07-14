@@ -208,6 +208,45 @@ def test_worker_window_inherits_lane_manager_identity(sock):
         content = dump.read_text() if dump.exists() else ""
         assert "CLAUDE_AGENT_NAME=optimus" in content, content
         assert "CLAUDE_AGENT_ROLE=manager" in content, content
+        # SABLE-38zi: the worker pane is ALSO marked SABLE_WORKER_PANE=1 so the
+        # SessionStart role-anchor refuses to load the optimus manager role-card
+        # into it (identity bleed -> the worker booting as its manager and
+        # re-dispatching its own bead) — while the manager identity above is
+        # still present for the post-push for-chuck handoff.
+        assert "SABLE_WORKER_PANE=1" in content, content
+
+
+def test_dispatch_from_worker_pane_is_refused(sock):
+    """SABLE-38zi: sable-spawn-worker HARD-REFUSES a dispatch invoked from a
+    worker pane (SABLE_WORKER_PANE=1 in its env) — the guard that stops a worker
+    that misread its role from re-dispatching its own bead (one dispatch silently
+    becoming two live panes, defeating the SABLE_MAX_WORKERS cap). Exit 9, and no
+    side effects: no worker window and no dispatch file are created."""
+    with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
+        env = {
+            **os.environ,
+            "SABLE_WORKER_PANE": "1",   # this invoking process IS a worker pane
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test
+        }
+        r = subprocess.run(
+            ["python3", str(BIN), BEAD, "--worktree", wt,
+             "--model", "haiku", "--skip-governance"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 9, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "worker pane" in r.stderr.lower()
+        # refused BEFORE any side effect: no worker window, no dispatch file
+        wins = _tmux(sock, "list-windows", "-t", "sable",
+                     "-F", "#{window_name}").stdout
+        assert "worker-sable-bldh-2" not in wins
+        assert not (Path(dd) / f"{BEAD}.md").exists()
 
 
 def test_worker_bypass_gate_is_accepted(sock):

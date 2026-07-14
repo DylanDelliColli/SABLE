@@ -509,14 +509,65 @@ def test_resolve_lane_empty_when_no_identity(monkeypatch):
 def test_worker_env_args_stamps_manager_identity():
     # post-push-merge-notify fires only for MANAGER identities, so the worker must
     # carry the lane manager's name + manager role for the for-chuck handoff to
-    # fire AND be attributed correctly.
+    # fire AND be attributed correctly. SABLE-38zi: it ALSO carries the
+    # SABLE_WORKER_PANE marker so the SessionStart role-anchor refuses to load
+    # that manager's role-card into the worker (identity bleed -> re-dispatch).
     assert ssw.worker_env_args("optimus") == [
         "-e", "CLAUDE_AGENT_NAME=optimus", "-e", "CLAUDE_AGENT_ROLE=manager",
+        "-e", "SABLE_WORKER_PANE=1",
     ]
 
 
-def test_worker_env_args_empty_when_no_lane():
-    assert ssw.worker_env_args("") == []
+def test_worker_env_args_marks_worker_pane_even_without_lane():
+    # SABLE-38zi: the worker marker is ALWAYS stamped, independent of whether a
+    # lane manager identity is resolvable — a lane-less worker pane must still be
+    # recognizable as a worker (role-anchor stand-down + re-dispatch guard).
+    assert ssw.worker_env_args("") == ["-e", "SABLE_WORKER_PANE=1"]
+
+
+def test_worker_env_args_always_contains_worker_marker():
+    for lane in ("", "optimus", "tarzan"):
+        assert "-e" in ssw.worker_env_args(lane)
+        assert "SABLE_WORKER_PANE=1" in ssw.worker_env_args(lane)
+
+
+# --- SABLE-38zi: a worker pane can NOT re-dispatch --------------------------
+#
+# OBSERVED 2026-07-14: a spawned worker booted as its lane MANAGER (tarzan
+# identity bled in via CLAUDE_AGENT_NAME) and ran sable-spawn-worker ITSELF,
+# spawning a SECOND worker pane for the SAME bead — one dispatch silently became
+# two live panes, defeating the SABLE_MAX_WORKERS cap. The pane carries
+# SABLE_WORKER_PANE=1 (worker_env_args); sable-spawn-worker hard-refuses when it
+# sees that marker in its own env, so a worker can never re-dispatch even if a
+# manager role-card somehow bled in.
+
+def test_worker_pane_guard_blocks_when_marker_set(monkeypatch):
+    monkeypatch.setenv("SABLE_WORKER_PANE", "1")
+    err = ssw.worker_pane_guard()
+    assert err is not None
+    assert "worker" in err.lower()
+    assert "SABLE_MAX_WORKERS" in err  # names the cap the re-dispatch defeats
+
+
+def test_worker_pane_guard_allows_when_marker_absent(monkeypatch):
+    monkeypatch.delenv("SABLE_WORKER_PANE", raising=False)
+    assert ssw.worker_pane_guard() is None
+
+
+def test_worker_pane_guard_allows_when_marker_empty(monkeypatch):
+    # an empty marker is not a worker pane (only a truthy value marks one)
+    monkeypatch.setenv("SABLE_WORKER_PANE", "")
+    assert ssw.worker_pane_guard() is None
+
+
+def test_main_refuses_dispatch_from_worker_pane(monkeypatch):
+    # end-to-end: the guard fires FIRST in main() — before any bead fetch / tmux
+    # / worktree side effect — so a refused re-dispatch leaves nothing claimed
+    # and no grandchild pane. A distinct exit code (9) separates it from the
+    # throttle/governance refusals (5-8). Robust regardless of tmux/bd state
+    # because the guard short-circuits before touching either.
+    monkeypatch.setenv("SABLE_WORKER_PANE", "1")
+    assert ssw.main(["SABLE-anything", "--skip-governance"]) == 9
 
 
 # --- worker window spawn argv (SABLE-zgbt) -----------------------------------
