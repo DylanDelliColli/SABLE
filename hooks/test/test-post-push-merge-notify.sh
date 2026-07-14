@@ -65,6 +65,15 @@ git clone -q "$BARE_ORIGIN" "$FIXTURE_REPO"
 cd_fixture "$FIXTURE_REPO"
 git -C "$FIXTURE_REPO" config user.email "test@test"
 git -C "$FIXTURE_REPO" config user.name "Test"
+# SABLE-r1zs: pin the fixture's own working branch explicitly, never the
+# ambient `git init.defaultBranch` (a clone of an empty bare repo checks out
+# whatever the LOCAL client's default resolves to, which drifts between
+# 'master' and 'main' across environments — confirmed the suite's 22-24/45-50
+# red count under init.defaultBranch=main). Must differ from 'main' (pushed to
+# origin/main explicitly below) so it never collides with
+# sable_resolve_integration_branch's OWN unconfigured-repo default of 'main',
+# which would false-trigger the hook's integration-branch self-push guard.
+git checkout -q -b sable-test-trunk
 echo "x" > initial.txt
 git add initial.txt
 git commit -q -m "initial"
@@ -81,12 +90,7 @@ git commit -q -m "feature"
 # bare origin) no longer represents "this push succeeded". origin/main stays
 # pinned at the earlier "initial" commit so `git diff origin/main...HEAD`
 # still yields feature.txt — re-pushing "feature" onto refs/heads/main here
-# would make origin/main == HEAD and erase the diff FILES depends on. Not
-# renaming the local branch to 'main' either: this environment's
-# init.defaultBranch is NOT 'main' (confirmed 'master'), and renaming it TO
-# 'main' would collide with sable_resolve_integration_branch's OWN
-# unconfigured-repo default of 'main', false-triggering the
-# integration-branch self-push guard.
+# would make origin/main == HEAD and erase the diff FILES depends on.
 FIXTURE_CUR_BRANCH=$(git symbolic-ref --short HEAD)
 git push -q "$BARE_ORIGIN" "HEAD:refs/heads/$FIXTURE_CUR_BRANCH" 2>/dev/null
 git update-ref "refs/remotes/origin/$FIXTURE_CUR_BRANCH" HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
@@ -301,6 +305,8 @@ git clone -q "$INT_BARE" "$INT_REPO"
 cd_fixture "$INT_REPO"
 git -C "$INT_REPO" config user.email "int@test"
 git -C "$INT_REPO" config user.name "Integration"
+# SABLE-r1zs: pin explicitly — see the FIXTURE_REPO comment above.
+git checkout -q -b sable-test-trunk
 echo "a" > base.txt
 git add base.txt
 git commit -q -m "base"
@@ -312,9 +318,7 @@ git commit -q -m "feature2"
 # SABLE-b06t: push the "feature2" commit under the actual local branch name
 # ONLY, leaving origin/main pinned at "base" — see the FIXTURE_REPO comment
 # above for why (re-pushing onto refs/heads/main here would make origin/main
-# == HEAD and erase the diff FILES depends on; the local branch isn't
-# renamed to 'main' either, to avoid colliding with
-# sable_resolve_integration_branch's unconfigured-repo default).
+# == HEAD and erase the diff FILES depends on).
 INT_CUR_BRANCH=$(git symbolic-ref --short HEAD)
 git push -q "$INT_BARE" "HEAD:refs/heads/$INT_CUR_BRANCH" 2>/dev/null
 git update-ref "refs/remotes/origin/$INT_CUR_BRANCH" HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
