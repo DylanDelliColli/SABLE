@@ -499,13 +499,24 @@ VAL_BARE=$(mktemp -d)
 trap 'rm -rf "$VAL_REPO" "$VAL_BARE"' EXIT
 git init -q --bare "$VAL_BARE"
 git clone -q "$VAL_BARE" "$VAL_REPO"
-cd "$VAL_REPO"
-git config user.email "v@test"
-git config user.name "Validator"
+# SABLE-di86 (z776 pattern, 55ae0ba4): guard the cd AND scope every git op to
+# `git -C "$VAL_REPO"`. Formerly a bare `cd "$VAL_REPO"` (unguarded) ran ahead of
+# bare `git config` + a SILENCED `git push -q origin HEAD:refs/heads/main`. Under
+# a busy-/tmp race where the cd failed, CWD stayed in the REAL worktree and those
+# ops escaped: the config wrote Validator/v@test into the real .git/config
+# (a5a5 class) and the push shipped the real HEAD to the real origin/main with
+# 2>/dev/null hiding the corruption (xydb class). The guard aborts before any op
+# if the cd fails; `git -C "$VAL_REPO" push origin` resolves "origin" from
+# VAL_REPO's OWN config (= VAL_BARE), so it can never reach the real origin
+# regardless of CWD, while still updating VAL_REPO's origin/main tracking ref
+# that the sable_validate_base_ref tests below rely on.
+cd "$VAL_REPO" || { echo "FATAL: cd to fixture repo $VAL_REPO failed — aborting so fixture git ops never touch the real worktree/origin"; exit 1; }
+git -C "$VAL_REPO" config user.email "v@test"
+git -C "$VAL_REPO" config user.name "Validator"
 echo "x" > f.txt
 git add f.txt
 git commit -q -m "init"
-git push -q origin HEAD:refs/heads/main 2>/dev/null
+git -C "$VAL_REPO" push -q origin HEAD:refs/heads/main 2>/dev/null
 cd - >/dev/null
 
 validate_ref_test() {
