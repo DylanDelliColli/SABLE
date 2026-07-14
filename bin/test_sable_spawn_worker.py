@@ -987,5 +987,138 @@ def test_refresh_worktree_refuses_empty_worktree_path():
     assert warning is not None and "no valid worktree" in warning.lower()
 
 
+# --- SABLE-3eax: --respawn (REVISE / push-only close-out into an existing
+# worktree) -------------------------------------------------------------------
+#
+# The manager REVISE pattern re-spawns a worker into the SAME worktree to finish
+# a closed bead's landing. Three walls hit the governance the bldh.8 re-home
+# moved into this helper: (1) an unconditional `bd update --claim` traceback-
+# crashes on a CLOSED bead; (2) a reaped worker strands its worktree tree-claim,
+# blocking the next spawn until TTL/force-release; (3) the duplicate-dispatch
+# guard refused a reused worktree outright, with only the far-too-blunt
+# --skip-governance to bypass it. --respawn is the first-class path: reopen a
+# closed bead, release a stranded stale claim, and pass the duplicate guard when
+# no LIVE pane carries the tag — while keeping model-check active.
+
+# (a) reopen: a respawn targets a bead that was CLOSED and must be reopened to
+# in_progress before the claim/close flow, or the claim traceback-crashes.
+
+def test_needs_reopen_true_for_closed_bead():
+    assert ssw.needs_reopen({"id": "X-1", "status": "closed"}) is True
+
+
+def test_needs_reopen_false_for_in_progress_or_open():
+    assert ssw.needs_reopen({"id": "X-1", "status": "in_progress"}) is False
+    assert ssw.needs_reopen({"id": "X-1", "status": "open"}) is False
+    assert ssw.needs_reopen({"id": "X-1"}) is False
+
+
+# (c) duplicate guard under respawn: a reused worktree is EXPECTED (never a
+# duplicate signal), but a LIVE worker pane still carrying the bead tag must
+# STILL block (two workers racing the same push).
+
+def test_respawn_ignores_worktree_evidence():
+    # worktree-evidence alone (a prior dispatch's tree, deliberately reused) must
+    # NOT block a respawn — the whole point is to re-enter that same worktree.
+    assert ssw.already_in_progress_check(
+        {"id": "X-1", "status": "in_progress", "assignee": "tarzan"},
+        pane_evidence=False, worktree_evidence=True, respawn=True) is None
+
+
+def test_respawn_still_blocks_on_live_pane_evidence():
+    # the safety-critical case: a LIVE worker pane tagged with the bead means a
+    # worker is already running it — refuse a second respawn even in respawn mode.
+    err = ssw.already_in_progress_check(
+        {"id": "X-1", "status": "in_progress", "assignee": "tarzan"},
+        pane_evidence=True, worktree_evidence=False, respawn=True)
+    assert err is not None and "X-1" in err and "IN_PROGRESS" in err
+
+
+def test_respawn_default_off_preserves_worktree_evidence_block():
+    # regression guard: without respawn=True the worktree-evidence block still
+    # fires exactly as before (SABLE-676c behavior is unchanged for fresh spawns).
+    err = ssw.already_in_progress_check(
+        {"id": "X-1", "status": "in_progress"},
+        pane_evidence=False, worktree_evidence=True)
+    assert err is not None and "worktree" in err
+
+
+# (b) stale tree-claim release: a reaped worker's claim (holder has no live pane)
+# must be released before the fresh worker runs git, or tree-claim.sh denies its
+# index-mutating git ops until the claim TTL-expires.
+
+def _linked_worktree(tmp_path):
+    """A real repo + a linked worktree, so tree_claim_file resolves the
+    per-worktree git-dir (`.git/worktrees/<name>`) exactly like tree-claim.sh."""
+    work = tmp_path / "work"
+    work.mkdir()
+    _git(work, "init", "-b", "main")
+    _git(work, "config", "user.email", "t@example.com")
+    _git(work, "config", "user.name", "T")
+    (work / "f.txt").write_text("1")
+    _git(work, "add", "f.txt")
+    _git(work, "commit", "-m", "init")
+    _git(work, "branch", "wk-x", "HEAD")
+    wt = tmp_path / "wk-x"
+    _git(work, "worktree", "add", str(wt), "wk-x")
+    return work, wt
+
+
+def test_tree_claim_file_resolves_per_worktree_gitdir(tmp_path):
+    _work, wt = _linked_worktree(tmp_path)
+    cf = ssw.tree_claim_file(str(wt))
+    assert cf is not None
+    assert cf.endswith("/sable-tree-claim")
+    # the linked worktree's git-dir is under .git/worktrees/<name>, NOT the
+    # shared common dir — each worktree gets its OWN claim file.
+    assert "/worktrees/wk-x/" in cf
+
+
+def test_tree_claim_file_none_outside_git_repo(tmp_path):
+    d = tmp_path / "plain"
+    d.mkdir()
+    assert ssw.tree_claim_file(str(d)) is None
+
+
+def test_release_stale_tree_claim_removes_when_holder_dead(tmp_path):
+    _work, wt = _linked_worktree(tmp_path)
+    cf = ssw.tree_claim_file(str(wt))
+    Path(cf).write_text("dead-session-uuid 1600000000 tarzan\n")
+    msg = ssw.release_stale_tree_claim(str(wt), holder_pane_live=False)
+    assert msg is not None and "released" in msg.lower()
+    assert not Path(cf).exists()
+
+
+def test_release_stale_tree_claim_preserves_when_holder_live(tmp_path):
+    # a LIVE holder's claim must NEVER be released (respawn is refused elsewhere
+    # when a live pane exists; this is the belt-and-suspenders guard).
+    _work, wt = _linked_worktree(tmp_path)
+    cf = ssw.tree_claim_file(str(wt))
+    Path(cf).write_text("live-session-uuid 1600000000 tarzan\n")
+    assert ssw.release_stale_tree_claim(str(wt), holder_pane_live=True) is None
+    assert Path(cf).exists()
+
+
+def test_release_stale_tree_claim_noop_without_claim_file(tmp_path):
+    _work, wt = _linked_worktree(tmp_path)
+    assert ssw.release_stale_tree_claim(str(wt), holder_pane_live=False) is None
+
+
+def test_release_stale_tree_claim_noop_outside_git_repo(tmp_path):
+    d = tmp_path / "plain"
+    d.mkdir()
+    assert ssw.release_stale_tree_claim(str(d), holder_pane_live=False) is None
+
+
+def test_main_respawn_requires_worktree():
+    # --respawn re-enters a SPECIFIC existing worktree; without --worktree it is a
+    # usage error (argparse exits 2) — refused before any bead fetch / tmux side
+    # effect. This is the guard that keeps respawn from silently creating a fresh
+    # tree that has nothing to revise.
+    with pytest.raises(SystemExit) as exc:
+        ssw.main(["SABLE-x", "--respawn"])
+    assert exc.value.code == 2
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -444,6 +444,16 @@ elif args[:1] == ["update"] and "--claim" in args:
             b["assignee"] = "test-worker"
     save(data)
     print("claimed")
+elif args[:1] == ["update"] and "--status" in args:
+    bid = args[1]
+    idx = args.index("--status")
+    new_status = args[idx + 1] if idx + 1 < len(args) else ""
+    data = load()
+    for b in data:
+        if b.get("id") == bid:
+            b["status"] = new_status
+    save(data)
+    print("updated")
 elif args[:1] == ["list"]:
     data = load()
     if "--status=in_progress" in args:
@@ -890,6 +900,198 @@ def test_worker_pane_flips_done_on_process_exit_without_worker_action(sock):
         time.sleep(0.4)
         remaining = _tmux(sock, "list-panes", "-a", "-F", "#{pane_id}").stdout
         assert pane not in remaining.splitlines(), remaining
+
+
+# --- SABLE-3eax: --respawn (REVISE / push-only close-out) end-to-end ----------
+#
+# The manager REVISE pattern re-spawns a worker into the SAME worktree to finish
+# a bead's landing. --respawn makes that first-class (no blunt --skip-governance):
+# reopen a CLOSED bead, release a stranded stale tree-claim whose holder has no
+# live pane, and pass the duplicate guard when no LIVE pane carries the tag —
+# with model-check STILL active.
+
+
+def _git(cwd, *args):
+    subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                   capture_output=True, text=True)
+
+
+def _repo_with_linked_worktree(tmp):
+    """A real repo + a linked worktree so tree-claim resolution hits the
+    per-worktree git-dir (`.git/worktrees/<name>`) exactly like tree-claim.sh."""
+    work = Path(tmp) / "work"
+    work.mkdir()
+    _git(work, "init", "-b", "main")
+    _git(work, "config", "user.email", "t@example.com")
+    _git(work, "config", "user.name", "T")
+    (work / "f.txt").write_text("1")
+    _git(work, "add", "f.txt")
+    _git(work, "commit", "-m", "init")
+    _git(work, "branch", "wk-r", "HEAD")
+    wt = Path(tmp) / "wk-r"
+    _git(work, "worktree", "add", str(wt), "wk-r")
+    return work, wt
+
+
+def _claim_file(worktree):
+    gd = subprocess.run(["git", "-C", str(worktree), "rev-parse", "--git-dir"],
+                        capture_output=True, text=True, check=True).stdout.strip()
+    if not os.path.isabs(gd):
+        gd = os.path.join(str(worktree), gd)
+    return Path(gd) / "sable-tree-claim"
+
+
+def test_respawn_reopens_closed_bead_and_releases_stale_tree_claim(sock):
+    """SABLE-3eax end-to-end (walls 1 + 2, governance ON): respawn into an
+    EXISTING worktree for a CLOSED bead with a tree-claim stranded by a reaped
+    (dead) worker session. The helper reopens the bead to in_progress (so the
+    flow never traceback-crashes on the unclaimable closed bead), releases the
+    stale claim (so tree-claim.sh won't deny the fresh worker's git ops), and
+    spawns the worker — all WITHOUT --skip-governance."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as gitdir:
+        _work, wt = _repo_with_linked_worktree(gitdir)
+        claim = _claim_file(wt)
+        claim.write_text("dead-session-uuid 1600000000 tarzan\n")  # reaped holder
+
+        bead_id = "FAKE-respawn-closed"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "closed", "assignee": "tarzan"}  # was closed on first pass
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "CLAUDE_AGENT_NAME": "tarzan",
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--respawn", "--worktree", str(wt),
+             "--model", "haiku"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        time.sleep(0.5)
+
+        # (a) the closed bead was reopened to in_progress — no reclaim crash
+        assert "reopened closed bead" in r.stderr, r.stderr
+        assert "not re-claiming" in r.stderr, r.stderr  # respawn skips the claim
+        data = json.loads(db_path.read_text())
+        assert data[0]["status"] == "in_progress", data
+
+        # (b) the stranded stale tree-claim was released
+        assert "released stale tree-claim" in r.stderr, r.stderr
+        assert not claim.exists(), "stale tree-claim was not released"
+
+        # the worker window was spawned + tagged running for the bead
+        assert (Path(dd) / f"{bead_id}.md").exists()
+        listing = _tmux(sock, "list-panes", "-a", "-F",
+                        "#{@sable_role} #{@sable_bead} #{@sable_status}").stdout
+        assert any(
+            line.startswith("worker") and bead_id in line and "running" in line
+            for line in listing.splitlines()
+        ), listing
+
+
+def test_respawn_refused_when_live_pane_carries_bead_tag(sock):
+    """SABLE-3eax (wall 3 inverse): a respawn must STILL be refused when a LIVE
+    worker pane already carries the bead tag — two workers racing the same push.
+    Worktree-evidence is waived for a respawn, but live-pane evidence is not.
+    Exit 5, no second worker window."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-respawn-live"
+        _dummy_worker(sock, bead_id, status="running")  # a LIVE worker for the bead
+
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "in_progress", "assignee": "tarzan"}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "CLAUDE_AGENT_NAME": "tarzan",
+            "SABLE_MAX_LOAD_PER_CORE": "0",
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--respawn", "--worktree", wt,
+             "--model", "haiku"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 5, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "duplicate-dispatch blocked" in r.stderr
+        assert "IN_PROGRESS" in r.stderr
+        # no second worker window, no dispatch file
+        wins = _tmux(sock, "list-windows", "-t", "sable",
+                     "-F", "#{window_name}").stdout
+        assert "worker-fake-respawn-live" not in wins
+        assert not (Path(dd) / f"{bead_id}.md").exists()
+
+
+def test_respawn_keeps_model_check_active(sock):
+    """SABLE-3eax: --respawn must NOT weaken the model-check (unlike
+    --skip-governance, which disables everything). A --model override that
+    silently disagrees with the bead's model: label and gives no reason is still
+    blocked (exit 3) under respawn."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-respawn-modelcheck"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D",
+             "labels": ["model:sonnet"], "status": "in_progress",
+             "assignee": "tarzan"}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+
+        env = {
+            **os.environ,
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "CLAUDE_AGENT_NAME": "tarzan",
+            "SABLE_MAX_LOAD_PER_CORE": "0",
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+
+        # opus disagrees with model:sonnet and gives NO reason -> blocked.
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--respawn", "--worktree", wt,
+             "--model", "opus"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 3, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "model-check blocked" in r.stderr
+        assert not (Path(dd) / f"{bead_id}.md").exists()
 
 
 if __name__ == "__main__":
