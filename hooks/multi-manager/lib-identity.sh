@@ -35,8 +35,9 @@
 #   Unregistered subagent types (Explore, general-purpose, code-reviewer, ...)
 #   are workers: never managers, hooks stand down for them.
 #
-# Registry path: ~/.claude/sable/agents.yaml (override with SABLE_AGENTS_YAML,
-# used by tests). Parsed with awk — no python-yaml dependency.
+# Registry path: project-first via sable_registry_path (SABLE_AGENTS_YAML
+# override, else the repo's own agents.yaml, else ~/.claude/sable/agents.yaml —
+# see lib-registry-path.sh). Parsed with awk — no python-yaml dependency.
 
 # Per-repo mode-state resolver (SABLE-5hck), used by sable_resolve_dispatch_lane.
 # Sourced as a sibling; guard keeps re-sourcing lib-identity idempotent and won't
@@ -44,6 +45,13 @@
 if ! declare -f sable_mode_state_path >/dev/null 2>&1; then
   # shellcheck source=lib-mode-path.sh
   . "$(dirname "${BASH_SOURCE[0]:-$0}")/lib-mode-path.sh"
+fi
+
+# Project-first agent-registry resolver (SABLE-59t6.1), used by the registry
+# lookups below. Sourced as a sibling under the same idempotency guard.
+if ! declare -f sable_registry_path >/dev/null 2>&1; then
+  # shellcheck source=lib-registry-path.sh
+  . "$(dirname "${BASH_SOURCE[0]:-$0}")/lib-registry-path.sh"
 fi
 
 sable_resolve_identity() {
@@ -82,7 +90,7 @@ print(d.get('agent_type', '') or '')
 
   [ -z "$SABLE_ID_NAME" ] && return 0
 
-  local yaml="${SABLE_AGENTS_YAML:-${HOME:-}/.claude/sable/agents.yaml}"
+  local yaml; yaml="$(sable_registry_path)"
   if [ -f "$yaml" ]; then
     SABLE_ID_TYPE=$(awk -v name="$SABLE_ID_NAME" '
       $0 == "  " name ":" { found = 1; next }
@@ -123,7 +131,7 @@ sable_instance_base_manager() {
   local name="${1:-}"
   [[ "$name" =~ ^(.+)-[0-9]+$ ]] || return 1
   local base="${BASH_REMATCH[1]}"
-  local yaml="${SABLE_AGENTS_YAML:-${HOME:-}/.claude/sable/agents.yaml}"
+  local yaml; yaml="$(sable_registry_path)"
   [ -f "$yaml" ] || return 1
   local type
   type=$(awk -v name="$base" '

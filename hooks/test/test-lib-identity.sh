@@ -237,6 +237,60 @@ run_case_yaml "73t4: registered optimus-3 resolves epic_manager via its instance
   "optimus-3|epic_manager|agent_type|1|1|1"
 
 # --------------------------------------------------------------------------
+# SABLE-59t6.1 — project-first registry resolution (lib-registry-path.sh).
+# A repo that ships its OWN .claude/sable/agents.yaml must drive identity even
+# when HOME has no registry (a project-only install). Pins the fail-open pitfall:
+# if the resolver ignored the project registry and read ONLY $HOME (empty here),
+# optimus would resolve UNregistered — fail open — and the manager gate would
+# stand down. This runs with SABLE_AGENTS_YAML UNSET so the git-common-dir /
+# project-first path is exercised (every other case pins the override).
+# --------------------------------------------------------------------------
+PROJ_REPO="$(mktemp -d)"
+git -C "$PROJ_REPO" init -q
+git -C "$PROJ_REPO" -c user.email=t@t -c user.name=t commit --allow-empty -m init -q
+mkdir -p "$PROJ_REPO/.claude/sable"
+cat > "$PROJ_REPO/.claude/sable/agents.yaml" <<'YAML'
+agents:
+  optimus:
+    type: epic_manager
+YAML
+PROJ_EMPTY_HOME="$(mktemp -d)"
+proj_got=$(
+  unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_AGENTS_YAML
+  export HOME="$PROJ_EMPTY_HOME"
+  cd "$PROJ_REPO" || exit 1
+  # shellcheck disable=SC1090
+  source "$LIB"
+  sable_resolve_identity '{"agent_id":"proj1","agent_type":"optimus"}'
+  printf '%s|%s|%s|%s' "$SABLE_ID_NAME" "$SABLE_ID_TYPE" "$SABLE_ID_IS_MANAGER" "$SABLE_ID_IS_REGISTERED"
+)
+if [ "$proj_got" = "optimus|epic_manager|1|1" ]; then
+  pass "59t6.1: project registry drives identity with empty HOME (project-only install)"
+else
+  fail "59t6.1: project registry drives identity with empty HOME (project-only install)" \
+    "expected [optimus|epic_manager|1|1] got [$proj_got]"
+fi
+# Fail-open control: SAME empty HOME, but a NON-git dir (no project registry
+# anywhere) — optimus must resolve UNregistered, confirming the pass above is the
+# project registry talking, not a stray global one.
+proj_fo=$(
+  unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_AGENTS_YAML
+  export HOME="$PROJ_EMPTY_HOME"
+  cd "$PROJ_EMPTY_HOME" || exit 1
+  # shellcheck disable=SC1090
+  source "$LIB"
+  sable_resolve_identity '{"agent_id":"proj2","agent_type":"optimus"}'
+  printf '%s|%s|%s|%s' "$SABLE_ID_NAME" "$SABLE_ID_TYPE" "$SABLE_ID_IS_MANAGER" "$SABLE_ID_IS_REGISTERED"
+)
+if [ "$proj_fo" = "optimus||0|0" ]; then
+  pass "59t6.1: no registry anywhere + empty HOME → optimus unregistered (dormant fail-open)"
+else
+  fail "59t6.1: no registry anywhere + empty HOME → optimus unregistered (dormant fail-open)" \
+    "expected [optimus||0|0] got [$proj_fo]"
+fi
+rm -rf "$PROJ_REPO" "$PROJ_EMPTY_HOME"
+
+# --------------------------------------------------------------------------
 # sable_resolve_dispatch_lane unit tests (SABLE-uz9.9)
 # Manager-subagents now dispatch workers natively (nested Agent, CC 2.1.177,
 # SABLE-uz9.8) — governance must ACTIVATE for them where it previously stood
