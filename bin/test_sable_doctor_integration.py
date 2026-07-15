@@ -40,6 +40,39 @@ def run_doctor(claude_dir: Path, *extra_args):
     )
 
 
+def run_project_install(project_dir: Path):
+    # --from-here: this suite itself commonly runs from a linked SABLE worker
+    # worktree (SABLE-5r3i/xu1s track install.sh's canonical-checkout refusal
+    # for the pre-existing --claude-dir fixture); scoped here only, since the
+    # HOME being installed into is a throwaway tmp_path project either way.
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--from-here"],
+        env={**os.environ, "HOME": str(project_dir)},
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, f"install.sh failed:\n{result.stdout}\n{result.stderr}"
+
+
+def run_doctor_project(cwd: Path, *extra_args):
+    return subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(REPO), "--project", *extra_args],
+        cwd=str(cwd),
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+@pytest.fixture()
+def project_install(tmp_path):
+    # the project IS its own git root, and HOME=project makes install.sh's
+    # ${HOME}/.claude land exactly at <project-root>/.claude — the same path
+    # --project resolves via git-common-dir.
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    run_project_install(project)
+    return project
+
+
 @pytest.fixture()
 def installed_claude_dir(tmp_path):
     home = tmp_path / "home"
@@ -126,6 +159,39 @@ def test_quiet_mode_one_line_on_drift(installed_claude_dir):
     assert result.stdout == ""
     assert "drifted" in result.stderr
     assert "bash install.sh" in result.stderr
+
+
+# --- --project flag: targets the current git project's own install ----------
+
+def test_doctor_project_against_fresh_project_install_exits_clean_zero(project_install):
+    result = run_doctor_project(project_install)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "clean" in result.stdout
+
+
+def test_doctor_project_detects_drifted_project_hook_copy_reports_drift_exit_one(project_install):
+    # mirrors test_stale_hook_missing_a_fix_is_detected, but targeting the
+    # project's OWN .claude via --project instead of an explicit --claude-dir.
+    hook = project_install / ".claude" / "hooks" / "tdd-evidence.sh"
+    original = hook.read_text()
+    hook.write_text(original.replace("\n", "", 1))
+
+    result = run_doctor_project(project_install)
+    assert result.returncode == 1
+    assert "DRIFT DETECTED" in result.stdout
+    assert "tdd-evidence.sh" in result.stdout
+
+
+def test_doctor_project_errors_clearly_when_no_project_install_present_not_false_clean(tmp_path):
+    project = tmp_path / "empty-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+
+    result = run_doctor_project(project)
+    assert result.returncode != 0
+    assert "clean" not in result.stdout           # must never false-clean
+    combined = (result.stdout + result.stderr).lower()
+    assert "no project install" in combined
 
 
 # --- re-running install.sh heals the drift it flagged -------------------------
