@@ -143,6 +143,46 @@ If `bd close` succeeded the first time without asking for tests, the hooks aren'
 
 ---
 
+## Installing SABLE into one project (project scope)
+
+The three-step install above is **global** — it writes hooks, skills, and the Prime Directives into your `~/.claude`, so every project on the machine inherits SABLE. If instead you want SABLE **committed into a single repository** — so teammates get the exact same hooks and skills the moment they clone, with nothing to install into their home directory — use the project scope:
+
+```bash
+bash install.sh --project=/path/to/your/project
+```
+
+Run it from inside the repo and you can drop the path: `install.sh --project` defaults to the current repo's root, resolved through the shared git dir so it works from any linked worktree.
+
+Project scope is **hybrid**, by design:
+
+- The whole `.claude` layer (hooks, producer agent defs, `agents.yaml`, the pane roles, the SABLE skills, and a committed `settings.json`) is written **into `<project>/.claude`**, and the Prime Directives are prepended to **`<project>/CLAUDE.md`** — never the global ones. The committed `settings.json` references `${CLAUDE_PROJECT_DIR}` (not a machine-specific absolute path), so it stays portable across every clone.
+- The `sable-*` **CLI tools still link globally** into `~/.local/bin` — a symlink can't be committed to a repo, and the tools resolve back to your SABLE checkout. This is the single piece each machine installs once; everything else rides in with the clone.
+
+`install.sh --project` **refuses** if your global `~/.claude/settings.json` already carries SABLE hooks — running both scopes would fire every hook twice per event. The refusal names the remedy: remove one scope's wiring, or re-run with `--force` to accept the double-fire. `--dry-run` reports the project destinations and writes nothing.
+
+### Bootstrapping a fresh clone (teammates)
+
+Once the `.claude` layer is committed, a teammate who clones the repo already has every hook and skill. They bootstrap just three things — the CLI tools on PATH, the beads database, and a drift check. Run these from inside the freshly-cloned repo:
+
+<!-- sable-e2e: teammate-bootstrap -->
+```bash
+command -v sable-doctor   # the sable-* CLI tools must be on PATH (installed once, globally, into ~/.local/bin)
+bd init                   # initialize the beads database in this clone
+sable-doctor --project    # confirm the committed .claude matches the SABLE repo — prints "clean"
+```
+
+If `sable-doctor` isn't found, the teammate hasn't linked the CLI tools yet: run `bash install.sh` once from any SABLE checkout to put `sable-*` on their PATH (or add `~/.local/bin` to PATH if the tools are already linked there). `sable-doctor --project` resolves the clone's own `.claude` (via the shared git dir) and reports `clean` when it matches the SABLE repo — and names exactly which files drifted when it doesn't, so a stale clone never silently validates old code.
+
+### The v1 fleet boundary
+
+A project-scoped install runs the **single-agent** SABLE workflow — beads, the TDD gates, the skills — completely. The multi-manager **fleet** (the Lincoln / Optimus / Tarzan / Chuck warm panes, `sable-launch`'s session door, `sable-spawn-manager`) is **not** available under a project-only install in v1: those tools stand up managers that rely on the global registry and dispatch dir, which a committed project `.claude` does not provide. The fleet entry points do not fail silently — they refuse with the exact remedy:
+
+> fleet requires the global install in v1, or export SABLE_AGENTS_YAML and SABLE_DISPATCH_DIR in the shell that creates the tmux session
+
+So: install SABLE globally (`bash install.sh`) when you want the fleet, or export those two variables to point the fleet at an explicit registry. The project scope is the right tool for committing the single-agent discipline into a shared repo; the fleet stays a global-install capability in v1.
+
+---
+
 ## Climbing to orchestration (advanced)
 
 The orchestration layer is **installed by default** — climbing is about
