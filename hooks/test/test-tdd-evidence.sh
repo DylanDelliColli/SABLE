@@ -114,6 +114,22 @@ run_hook_silent "bash setup.sh not recognized"       "bash setup.sh"
 run_hook_silent "bash deploy-script.sh not recognized" "bash deploy-script.sh"
 run_hook_silent "bd close not recognized as test"    "bd close SABLE-xxx"
 
+# ---------- SABLE-dhfj: runner keyword must be a real invocation token ----------
+# A blind substring match over the whole joined segment text fires on any
+# command that merely MENTIONS a runner keyword — grepping for it, echoing
+# it, or passing it inside an unrelated flag value — without ever running a
+# test. Live repro: a grep whose PATTERN argument contained
+# 'pytest|npm test|vitest' registered as test evidence.
+
+run_hook_silent "grep for 'vitest' in a pattern arg not recognized" \
+  "grep vitest f"
+
+run_hook_silent "echo of the words 'npm test' not recognized" \
+  "echo npm test"
+
+run_hook_silent "bd create --description mentioning pytest not recognized" \
+  "bd create --title=x --description mentions-pytest-but-does-not-run-it"
+
 # ---------- SABLE-d72/lcs: per-agent evidence keying ----------
 # When agent_id is present (a nested subagent), evidence is keyed by
 # session_id + agent_id so one worker's test run cannot satisfy another worker's
@@ -167,6 +183,22 @@ run_hook_writes "direct execution with absolute path recognized" \
 
 run_hook_silent "direct execution of a non-test script not recognized" \
   "./hooks/setup.sh"
+
+# ---------- SABLE-f6aw: trailing redirect must not break the last-token check ----------
+# 'script.sh 2>&1 | tail -N' puts '2>&1' — not the script path — as the pipe
+# segment's last shlex token. The matcher must still find the script path.
+
+run_hook_writes "bash script with trailing 2>&1 before a pipe recognized" \
+  "bash hooks/test/test-foo.sh 2>&1 | tail -8"
+
+run_hook_writes "direct execution with trailing 2>&1 before a pipe recognized" \
+  "./hooks/test/test-foo.sh 2>&1 | tail -8"
+
+run_hook_writes "bash script with trailing '> out.log' redirect recognized" \
+  "bash hooks/test/test-foo.sh > out.log"
+
+run_hook_writes "bash script with trailing '2>&1' and no pipe recognized" \
+  "bash hooks/test/test-foo.sh 2>&1"
 
 # repo-tagging: a cd-compound into a companion repo must tag the evidence
 # line with that repo, not the hook's own cwd.

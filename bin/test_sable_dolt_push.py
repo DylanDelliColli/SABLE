@@ -19,6 +19,8 @@ import importlib.util
 import json
 import subprocess
 import sys
+import threading
+import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -169,6 +171,84 @@ def test_stale_lock_broken_and_reacquired(tmp_path):
     info = json.loads(lock.read_text())
     assert info["fleet"] == "live-fleet"       # stale holder was displaced
     assert info["pid"] == 7
+
+
+def test_acquire_lock_no_leftover_temp_files(tmp_path):
+    """Regression guard for SABLE-l7gd: acquire_lock now writes the payload to
+    a `path.tmp.<pid>.<nonce>` file before hard-linking it into place. Every
+    branch (immediate success, contention-then-wait, stale-break-then-retry)
+    must clean the temp file up — none should be left behind."""
+    lock1 = tmp_path / "immediate.lock"
+    clk = FakeClock(start=9000.0)
+    token = sdp.acquire_lock(str(lock1), "f1", pid=1, now_fn=clk.now, sleep_fn=clk.sleep)
+    sdp.release_lock(str(lock1), token)
+
+    lock2 = tmp_path / "contended.lock"
+    holder_clk = FakeClock(start=9000.0)
+    holder_token = sdp.acquire_lock(str(lock2), "holder", pid=2,
+                                    now_fn=holder_clk.now, sleep_fn=holder_clk.sleep)
+
+    def release_on_sleep(clock):
+        sdp.release_lock(str(lock2), holder_token)
+
+    waiter_clk = FakeClock(start=9000.0, on_sleep=release_on_sleep)
+    sdp.acquire_lock(str(lock2), "waiter", pid=3, wait=600.0, poll=0.5,
+                     now_fn=waiter_clk.now, sleep_fn=waiter_clk.sleep)
+
+    lock3 = tmp_path / "stale.lock"
+    old = FakeClock(start=9000.0)
+    sdp.acquire_lock(str(lock3), "dead-fleet", pid=99, now_fn=old.now, sleep_fn=old.sleep)
+    now_clk = FakeClock(start=9000.0 + 700)
+    sdp.acquire_lock(str(lock3), "live-fleet", pid=7, ttl=600, wait=0.0,
+                     now_fn=now_clk.now, sleep_fn=now_clk.sleep)
+
+    leftovers = list(tmp_path.rglob("*.tmp.*"))
+    assert not leftovers, f"leftover lock temp files: {leftovers}"
+
+
+def test_acquire_lock_concurrent_threads_never_double_hold(tmp_path):
+    """SABLE-l7gd regression: under the old os.open(O_CREAT|O_EXCL)-then-write
+    implementation, a lock file could briefly exist with no content, so a
+    racing acquirer could misread it as corrupt/stale, break it, and both
+    sides would believe they held the lock (the CI interleave failure). Real
+    concurrent threads hammering the same lock file must never both be
+    'holding' it at once."""
+    lock = tmp_path / "dolt-push.lock"
+    n = 20
+    events = []
+    guard = threading.Lock()
+    errors = []
+
+    def worker(i):
+        try:
+            token = sdp.acquire_lock(str(lock), f"fleet-{i}", pid=i, wait=10, poll=0.005)
+            with guard:
+                events.append(("start", i))
+            time.sleep(0.01)
+            with guard:
+                events.append(("end", i))
+            assert sdp.release_lock(str(lock), token) is True
+        except Exception as e:  # noqa: BLE001 - surfaced via `errors` below
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, errors
+    assert len(events) == 2 * n
+    stack = []
+    for kind, i in events:
+        if kind == "start":
+            assert not stack, f"interleave: {i} started while {stack} in flight"
+            stack.append(i)
+        else:
+            assert stack and stack[-1] == i, f"bad end for {i}, stack={stack}"
+            stack.pop()
+    assert not stack
+    assert not lock.exists()
 
 
 def test_fresh_lock_not_broken_even_with_wait_zero(tmp_path):

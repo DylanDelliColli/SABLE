@@ -84,14 +84,29 @@ Per bead bundle (bundle 2-3 related beads max):
    (add `--model <m>[:reason]` to override the bead's `model:` label). The helper
    creates `wk-<scope>`, opens the worker window, pins the model, and delivers
    the canonical worker-dispatch prompt (warm-pane self-push mode).
-4. **Keep planning** while workers run — spawn several concurrently; each is its
-   own warm pane.
+4. **Keep planning** while workers run — spawn several concurrently (up to the
+   worker cap, below); each is its own warm pane.
+
+**Dispatch up to the cap, never past it (SABLE-mmdt).** `sable-spawn-worker`
+mechanically refuses a spawn once `SABLE_MAX_WORKERS` live worker panes exist
+fleet-wide (default 4 — the 2026-07-07 full-fleet dispatch froze the WSL host),
+and when host load is critical (`SABLE_MAX_LOAD_PER_CORE`). On a refusal
+(exit 7 at-cap / exit 8 host-load; the message names cap and live count), do
+NOT retry-loop or raise the cap — leave the bead claimed-or-ready and dispatch
+one-in-one-out as workers flip done (`sable-worker-status --reap` frees slots;
+`sable-view` shows live count vs cap).
 
 **Reviewing results:** you do not gate the push (the gates do — pre-push,
 tdd-gate, scope-creep). You review the *outcome*: the closed bead, the pushed
 branch, and the `for-chuck` PR. If the work is wrong, REVISE: re-spawn a worker
 into the same worktree with revision instructions
 (`sable-spawn-worker <id> --worktree <path> ...`).
+
+**Output discipline (SABLE-myns):** when writing dispatch addenda beyond the
+template, reject any instruction that would have the worker ingest raw
+suite output or an unbounded diff into its own context — point back to
+worker-dispatch.md § Output discipline (run-to-file, then read back the
+summary) instead.
 
 ## Inbox
 Your inbox is `for-optimus` (durable fallback). Live direction now arrives over
@@ -157,7 +172,7 @@ regardless of count. A single-file auth change is still Opus.
 - You may not claim orphan beads (your lane is parented/epic-child beads).
 - You spawn workers with `sable-spawn-worker`; you do NOT push worker code and
   do NOT open PRs — workers self-push, the post-push hook files `for-chuck`.
-- Every dispatch goes through `sable-spawn-worker` (model-pinned, gate-mode prompt).
+- Every dispatch goes through `sable-spawn-worker` (model-pinned, warm-pane self-push prompt).
 
 ## Communicating with the user
 When surfacing questions or status to the operator (typically relayed through

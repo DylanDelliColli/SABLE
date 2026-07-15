@@ -415,6 +415,32 @@ else
 fi
 rm -f "$SCOPED_EV"
 
+# ---------- SABLE-f6aw: end-to-end — trailing-redirect evidence unblocks close ----------
+# Real composition, not a fabricated evidence line: pipe a redirect-suffixed
+# test command through the ACTUAL tdd-evidence.sh writer hook, then confirm
+# the ACTUAL tdd-gate.sh reader hook allows the close on that evidence.
+# Regression guard for the SABLE-f6aw last-token bug: pre-fix, tdd-evidence.sh
+# silently dropped 'script.sh 2>&1 | tail -N' commands (the trailing redirect
+# token displaced the script path from seg[-1]), so this same sequence denied.
+
+EVIDENCE_HOOK="$(cd "$(dirname "$0")/.." && pwd)/tdd-evidence.sh"
+F6AW_SID="tdd-f6aw-e2e-$$-$RANDOM"
+F6AW_EV="/tmp/tdd-evidence-${F6AW_SID}"
+rm -f "$F6AW_EV"
+
+# Real writer: the actual redirect-suffixed test invocation, through tdd-evidence.sh.
+make_input "bash hooks/test/test-foo.sh 2>&1 | tail -8" "$F6AW_SID" | bash "$EVIDENCE_HOOK" >/dev/null 2>&1 || true
+
+# Real reader: a two-bead close routes past the [no-test] hatch to the evidence check.
+F6AW_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$F6AW_SID" | env PATH="$STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null)
+if [ -z "$F6AW_OUT" ]; then
+  pa_pass "SABLE-f6aw e2e: redirect-suffixed test command recorded by the real writer hook unblocks the real gate hook"
+else
+  F6AW_EV_CONTENT=$(cat "$F6AW_EV" 2>/dev/null || echo '<missing>')
+  pa_fail "SABLE-f6aw e2e: redirect-suffixed test command unblocks the gate" "got: ${F6AW_OUT:-<empty>}; evidence file: $F6AW_EV_CONTENT"
+fi
+rm -f "$F6AW_EV"
+
 # ---------- Summary ----------
 
 echo

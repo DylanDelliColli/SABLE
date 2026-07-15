@@ -7,11 +7,14 @@ must never be disturbed: new-window with -d). tmux behavior is covered by
 test_sable_spawn_manager_integration.py.
 """
 import importlib.util
+import os
+import subprocess
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
 
+BIN = Path(__file__).resolve().parent / "sable-spawn-manager"
 _LOADER = SourceFileLoader(
     "sable_spawn_manager", str(Path(__file__).resolve().parent / "sable-spawn-manager")
 )
@@ -179,6 +182,92 @@ def test_manager_command_pane_cmd_override_bypasses_opus_pin(monkeypatch):
     # The one intentional exemption: tests stand in a fake pane command.
     monkeypatch.setenv("SABLE_TMUX_PANE_CMD", "bash")
     assert sm.manager_command() == "bash"
+
+
+# --- SABLE-59t6.4: v1 fleet boundary — project-only install refuses ---------
+# The whole tool is fleet tooling: under a project-only install (registry
+# resolves to a PROJECT agents.yaml, no global install, no SABLE_AGENTS_YAML
+# override) every operation refuses with the exact remedy. The decision lives in
+# the 59t6.1 resolver (fleet_project_only); the tests here pin both the decision
+# function and its wiring into the CLI. Fixture is a real git repo shipping its
+# own project registry + an isolated HOME with no global registry.
+
+def _git_repo_with_project_registry(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    reg = repo / ".claude" / "sable" / "agents.yaml"
+    reg.parent.mkdir(parents=True)
+    reg.write_text("agents:\n  optimus:\n    type: epic_manager\n")
+    return repo
+
+
+def test_fleet_boundary_remedy_is_the_exact_contract_string():
+    assert sm.FLEET_PROJECT_ONLY_REMEDY == (
+        "fleet requires the global install in v1, or export SABLE_AGENTS_YAML "
+        "and SABLE_DISPATCH_DIR in the shell that creates the tmux session"
+    )
+
+
+def test_fleet_boundary_refuses_under_project_only_resolution(tmp_path, monkeypatch):
+    repo = _git_repo_with_project_registry(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()                                     # no ~/.claude/sable/agents.yaml
+    monkeypatch.delenv("SABLE_AGENTS_YAML", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    assert sm.fleet_boundary_refusal(str(repo)) == sm.FLEET_PROJECT_ONLY_REMEDY
+
+
+def test_fleet_boundary_allows_when_global_install_present(tmp_path, monkeypatch):
+    """A global install (its registry present at ~/.claude/sable/agents.yaml)
+    lifts the boundary even when a project registry is ALSO present."""
+    repo = _git_repo_with_project_registry(tmp_path)
+    home = tmp_path / "home"
+    (home / ".claude" / "sable").mkdir(parents=True)
+    (home / ".claude" / "sable" / "agents.yaml").write_text("agents: {}\n")
+    monkeypatch.delenv("SABLE_AGENTS_YAML", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    assert sm.fleet_boundary_refusal(str(repo)) is None
+
+
+def test_fleet_boundary_allows_with_agents_yaml_override(tmp_path, monkeypatch):
+    """Exporting SABLE_AGENTS_YAML (the escape hatch named in the remedy) flips
+    the scope to 'override' and lifts the boundary, global install or not."""
+    repo = _git_repo_with_project_registry(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("SABLE_AGENTS_YAML", str(tmp_path / "explicit.yaml"))
+    monkeypatch.setenv("HOME", str(home))
+    assert sm.fleet_boundary_refusal(str(repo)) is None
+
+
+def test_fleet_boundary_allows_when_no_project_registry(tmp_path, monkeypatch):
+    """A git repo that ships NO project registry resolves to 'global' scope, so
+    the boundary never fires — it is scoped strictly to project-only installs."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.delenv("SABLE_AGENTS_YAML", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    assert sm.fleet_boundary_refusal(str(repo)) is None
+
+
+def test_cli_refuses_every_op_under_project_only(tmp_path):
+    """Integration: the actual CLI refuses a manager spawn under project-only,
+    on stderr with the verbatim remedy and a non-zero (fleet-boundary) exit,
+    BEFORE any tmux/session interaction."""
+    repo = _git_repo_with_project_registry(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SABLE_AGENTS_YAML", "SABLE_REGISTRY")}
+    env["HOME"] = str(home)
+    r = subprocess.run(["python3", str(BIN), "optimus"], cwd=str(repo),
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == sm.FLEET_BOUNDARY_EXIT
+    assert sm.FLEET_PROJECT_ONLY_REMEDY in r.stderr
 
 
 if __name__ == "__main__":

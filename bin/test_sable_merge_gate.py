@@ -163,3 +163,166 @@ def test_promote_tip_moved_non_ff_is_retryable_23(monkeypatch):
     # cleanup still ran despite the non-ff exit: a push --delete of the ci-verify ref
     assert any("--delete" in a for a in seen), "ci-verify ref not cleaned up on tip-moved exit"
 
+
+# --- SABLE-dn7r: post-merge worktree/branch cleanup (GREEN path only) ----------
+# At fleet pace worker worktrees + branches re-accumulate (58 in one day) unless
+# a green promote reaps them. These drive cleanup_after_merge as a unit via a
+# recording fake _git; the destructive-call ORDER is load-bearing (worktree must
+# come off before the branch, or git refuses to delete a checked-out branch).
+
+def _cleanup_fake_git(monkeypatch, *, has_worktree=True, dirty=False, branch_exists=True,
+                      worktree_remove_rc=0, branch_d_rc=0, cherry_out="", cherry_rc=0,
+                      branch_big_d_rc=0, push_delete_rc=0):
+    calls = []
+
+    def fake_git(repo, *args, check=True):
+        calls.append(args)
+        head = args[0] if args else ""
+        if head == "worktree" and len(args) >= 2 and args[1] == "list":
+            block = ("worktree /main\nHEAD aaa\nbranch refs/heads/other\n\n")
+            if has_worktree:
+                block += "worktree /wt/wk-x\nHEAD bbb\nbranch refs/heads/wk-x\n"
+            return subprocess.CompletedProcess(args, 0, stdout=block, stderr="")
+        if head == "status":
+            return subprocess.CompletedProcess(args, 0, stdout=("M f.py\n" if dirty else ""), stderr="")
+        if head == "worktree" and len(args) >= 2 and args[1] == "remove":
+            return subprocess.CompletedProcess(args, worktree_remove_rc, stdout="", stderr="")
+        if head == "show-ref":
+            return subprocess.CompletedProcess(args, 0 if branch_exists else 1, stdout="", stderr="")
+        if head == "branch" and len(args) >= 2 and args[1] == "-d":
+            return subprocess.CompletedProcess(args, branch_d_rc,
+                                               stdout=("not fully merged" if branch_d_rc else ""), stderr="")
+        if head == "cherry":
+            return subprocess.CompletedProcess(args, cherry_rc, stdout=cherry_out, stderr="")
+        if head == "branch" and len(args) >= 2 and args[1] == "-D":
+            return subprocess.CompletedProcess(args, branch_big_d_rc, stdout="", stderr="")
+        if head == "push":
+            return subprocess.CompletedProcess(args, push_delete_rc, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(smg, "_git", fake_git)
+    return calls
+
+
+def _destructive(calls):
+    """The gate-mutating verbs, in call order, ignoring read-only probes."""
+    out = []
+    for a in calls:
+        if a[:2] == ("worktree", "remove"):
+            out.append("worktree-remove")
+        elif a[:2] == ("branch", "-d"):
+            out.append("branch-d")
+        elif a[:2] == ("branch", "-D"):
+            out.append("branch-D")
+        elif a and a[0] == "push" and "--delete" in a:
+            out.append("push-delete")
+    return out
+
+
+def test_cleanup_removes_worktree_and_branches(monkeypatch):
+    # happy path: registered clean worktree, branch -d succeeds -> worktree
+    # removed, local branch deleted, remote branch deleted, in that order.
+    calls = _cleanup_fake_git(monkeypatch)
+    smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
+    assert _destructive(calls) == ["worktree-remove", "branch-d", "push-delete"]
+
+
+def test_cleanup_refuses_dirty_worktree(monkeypatch, capsys):
+    # a dirty worktree aborts the WHOLE cleanup: zero destructive calls, warning,
+    # and (in promote) exit stays 0 — uncommitted work is never destroyed.
+    calls = _cleanup_fake_git(monkeypatch, dirty=True)
+    smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
+    assert _destructive(calls) == []
+    assert "DIRTY" in capsys.readouterr().err
+
+
+def test_cleanup_refuses_unmerged_branch(monkeypatch):
+    # branch -d fails AND git cherry shows a genuinely absent commit ('+') -> no
+    # -D escalation, and neither the local nor the remote branch is deleted.
+    calls = _cleanup_fake_git(monkeypatch, branch_d_rc=1, cherry_out="+ deadbeef\n")
+    smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
+    assert _destructive(calls) == ["worktree-remove", "branch-d"]
+
+
+def test_cleanup_patch_equivalent_branch_deleted(monkeypatch):
+    # branch -d fails ancestry but every unique commit is patch-equivalent ('-')
+    # -> guarded -D proceeds, then the remote is deleted (wk-git-autopush-hunt).
+    calls = _cleanup_fake_git(monkeypatch, branch_d_rc=1, cherry_out="- cca59c2\n")
+    smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
+    # the refused -d is a real attempt before the guarded -D escalation
+    assert _destructive(calls) == ["worktree-remove", "branch-d", "branch-D", "push-delete"]
+
+
+def test_cleanup_missing_worktree_is_noop(monkeypatch):
+    # no registered worktree -> skip (a) entirely, still delete both branches.
+    calls = _cleanup_fake_git(monkeypatch, has_worktree=False)
+    smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
+    assert _destructive(calls) == ["branch-d", "push-delete"]
+
+
+# --- SABLE-dtp1: resolve_integration_branch / resolve_base --------------------
+# The pre-push hook resolves a repo's integration branch via git config >
+# .sable file > env > "main" (hooks/multi-manager/lib-identity.sh's
+# sable_resolve_integration_branch). promote() must agree, instead of
+# defaulting to the literal 'llm-integration'.
+
+def _fake_git_config(monkeypatch, *, config_val=None, config_rc=1):
+    """Fake _git that answers `config --get sable.integrationBranch` and is a
+    no-op for anything else (resolve_integration_branch only calls config)."""
+    def fake_git(repo, *args, check=True):
+        if args[:2] == ("config", "--get"):
+            rc = 0 if config_val is not None else config_rc
+            return subprocess.CompletedProcess(args, rc, stdout=(config_val or "") + ("\n" if config_val else ""), stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(smg, "_git", fake_git)
+
+
+def test_resolve_integration_branch_git_config_wins(monkeypatch, tmp_path):
+    _fake_git_config(monkeypatch, config_val="release-line")
+    (tmp_path / ".sable").write_text("integrationBranch=sable-file-branch\n")
+    assert smg.resolve_integration_branch(str(tmp_path)) == "release-line"
+
+
+def test_resolve_integration_branch_sable_file_when_no_git_config(monkeypatch, tmp_path):
+    _fake_git_config(monkeypatch, config_val=None)
+    (tmp_path / ".sable").write_text("integrationBranch=sable-file-branch\n")
+    assert smg.resolve_integration_branch(str(tmp_path)) == "sable-file-branch"
+
+
+def test_resolve_integration_branch_env_when_no_config_or_file(monkeypatch, tmp_path):
+    _fake_git_config(monkeypatch, config_val=None)
+    monkeypatch.setenv("SABLE_INTEGRATION_BRANCH", "env-branch")
+    assert smg.resolve_integration_branch(str(tmp_path)) == "env-branch"
+
+
+def test_resolve_integration_branch_strips_origin_prefix_from_base_branch_env(monkeypatch, tmp_path):
+    _fake_git_config(monkeypatch, config_val=None)
+    monkeypatch.delenv("SABLE_INTEGRATION_BRANCH", raising=False)
+    monkeypatch.setenv("SABLE_BASE_BRANCH", "origin/legacy-main")
+    assert smg.resolve_integration_branch(str(tmp_path)) == "legacy-main"
+
+
+def test_resolve_integration_branch_defaults_to_main(monkeypatch, tmp_path):
+    _fake_git_config(monkeypatch, config_val=None)
+    monkeypatch.delenv("SABLE_INTEGRATION_BRANCH", raising=False)
+    monkeypatch.delenv("SABLE_BASE_BRANCH", raising=False)
+    assert smg.resolve_integration_branch(str(tmp_path)) == "main"
+
+
+def test_resolve_base_explicit_flag_wins_over_everything(monkeypatch, tmp_path):
+    monkeypatch.setenv("SABLE_MG_BASE", "env-base")
+    monkeypatch.setattr(smg, "resolve_integration_branch", lambda repo: "resolved-base")
+    assert smg.resolve_base("flag-base", str(tmp_path)) == "flag-base"
+
+
+def test_resolve_base_env_wins_when_flag_unset(monkeypatch, tmp_path):
+    monkeypatch.setenv("SABLE_MG_BASE", "env-base")
+    monkeypatch.setattr(smg, "resolve_integration_branch", lambda repo: "resolved-base")
+    assert smg.resolve_base(None, str(tmp_path)) == "env-base"
+
+
+def test_resolve_base_falls_back_to_resolved_integration_branch(monkeypatch, tmp_path):
+    monkeypatch.delenv("SABLE_MG_BASE", raising=False)
+    monkeypatch.setattr(smg, "resolve_integration_branch", lambda repo: "resolved-base")
+    assert smg.resolve_base(None, str(tmp_path)) == "resolved-base"
+

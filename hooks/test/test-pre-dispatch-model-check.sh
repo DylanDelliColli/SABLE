@@ -23,7 +23,14 @@ FAIL_NAMES=""
 
 # Make a temp dir to stage a fake `bd` shim.
 TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
+
+# Set SABLE_MODE_STATE to an isolated path (SABLE-ierm) so the test doesn't read
+# the ambient repo's mode-state.json. This ensures tests run consistently regardless
+# of the repo's execution mode. Mirrors test-mode-interlock.sh's pattern.
+SABLE_MODE_STATE="$(mktemp -u)"
+export SABLE_MODE_STATE
+
+trap 'rm -rf "$TMP_DIR" "$SABLE_MODE_STATE" 2>/dev/null || true' EXIT
 
 # We'll write a small bd stub that returns canned JSON based on the bead ID
 # in argv. The fixture data is keyed by bead-id in $TMP_DIR/fixtures.
@@ -77,8 +84,9 @@ run_hook() {
   local input
   input=$(make_input "$prompt" "$subtype" "$model")
   # Inject our bd stub onto PATH and pass TMP_DIR through so the stub can find fixtures.
+  # Also pass SABLE_MODE_STATE so the test doesn't read the ambient repo's mode file.
   local out
-  out=$(env -i PATH="$TMP_DIR:$PATH" TMP_DIR="$TMP_DIR" $env_prefix bash "$HOOK" <<< "$input" 2>/dev/null || echo "RUN_ERR:$?")
+  out=$(env -i PATH="$TMP_DIR:$PATH" TMP_DIR="$TMP_DIR" SABLE_MODE_STATE="$SABLE_MODE_STATE" $env_prefix bash "$HOOK" <<< "$input" 2>/dev/null || echo "RUN_ERR:$?")
   echo -n "$out"
 }
 
@@ -211,6 +219,68 @@ assert_deny "no bead + no dispatch model → deny" "$MGR_ENV" "Just do this gene
 # Test 15: no bead in prompt + explicit dispatch model → allow
 assert_allow "no bead + explicit model → allow" "$MGR_ENV" "Just do this generic thing" "" "sonnet"
 
+# ---- SABLE-gga: sable-<word> filenames/skills must NOT be extracted as bead IDs ----
+
+# Test 15b: prompt mentions sable-* filenames alongside a real unlabeled bead →
+# deny must name only the real bead, never the filenames (regression for the
+# false 'unlabeled bead' deny caused by over-matching the ID regex).
+assert_deny "sable-execute/sable-teams-preflight filenames not treated as beads" "$MGR_ENV" \
+  "Dispatching for SABLE-ddd: run sable-execute, sable-orchestration-install, and sable-teams-preflight against the epic." \
+  "" "" "have no model: label"
+OUT=$(run_hook "$MGR_ENV" "Dispatching for SABLE-ddd: run sable-execute, sable-orchestration-install, and sable-teams-preflight against the epic." "" "")
+if echo "$OUT" | grep -qF "sable-execute" || echo "$OUT" | grep -qF "sable-orchestration-install" || echo "$OUT" | grep -qF "sable-teams-preflight"; then
+  FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  sable-* filenames absent from deny reason"
+  echo "FAIL: sable-* filenames absent from deny reason"
+  echo "  Got: ${OUT:0:400}"
+else
+  PASS=$((PASS+1)); echo "PASS: sable-* filenames absent from deny reason"
+fi
+
+# Test 15c: prompt mentions ONLY sable-* filenames (no real bead) + no dispatch
+# model → treated as bead-free (ad-hoc ladder-enforcement deny), not a
+# false 'unlabeled bead' deny naming the filenames.
+assert_deny "sable-* filenames alone → no-bead path, not false unlabeled-bead deny" "$MGR_ENV" \
+  "Run sable-execute and sable-teams-preflight to check drift." "" "" "no model specified on Agent call"
+
+# ---- SABLE-fxv3: lowercase sable-* TOOL names (single-segment, <=6 chars —
+# sable-plan, sable-doctor, sable-agents, sable-launch, sable-msg, sable-mode,
+# sable-note, sable-view, sable-tmux) must not be parsed as bead IDs. These
+# escape the SABLE-gga multi-segment lookahead because they have no second
+# hyphen. Fix is a case-sensitive prefix match (bd issues SABLE-xxxx uppercase;
+# tool names are lowercase by convention) — no re.IGNORECASE. ----
+
+# Test 18 (fxv3 unit case 1): prompt mentions lowercase tool names sable-doctor/
+# sable-plan alongside the real labeled bead SABLE-aaa (model:opus). Only the
+# real bead should be extracted; since its label matches the dispatch model,
+# this must be a silent allow — no spurious no-label list, no deny for the
+# tool-name "beads".
+assert_allow "fxv3: sable-doctor/sable-plan tool names ignored, real labeled bead extracted" \
+  "$MGR_ENV" "Working on SABLE-aaa: run sable-doctor and sable-plan to check drift." "" "opus"
+
+# Test 19 (fxv3 unit case 2): ad-hoc prompt mentioning ONLY tool names (no real
+# bead ID) with an explicit dispatch model → must take the no-bead/ad-hoc path
+# (silent allow), never the no-label-bead deny naming the tool names.
+assert_allow "fxv3: tool-name-only prompt with explicit model takes ad-hoc no-bead path" \
+  "$MGR_ENV" "Run sable-plan and sable-doctor to check drift before dispatch." "" "sonnet"
+
+# Test 20 (fxv3 integration case, live-observed shape): prompt mentions the
+# unlabeled bead SABLE-ddd alongside sable-launch/sable-plan — the exact tokens
+# from the 2026-07-15 live false denial ('bead(s) [ SABLE-59t6 sable-launch
+# sable-plan ] have no model: label'). End-to-end hook invocation must deny
+# naming ONLY SABLE-ddd; sable-launch/sable-plan must never appear in the
+# no-label-beads list or anywhere in the emitted JSON.
+assert_deny "fxv3: sable-launch/sable-plan not counted as no-label beads (live-observed shape)" \
+  "$MGR_ENV" "Dispatching for SABLE-ddd: run sable-launch and sable-plan for the rollout." "" "" \
+  "have no model: label"
+OUT=$(run_hook "$MGR_ENV" "Dispatching for SABLE-ddd: run sable-launch and sable-plan for the rollout." "" "")
+if echo "$OUT" | grep -qF "sable-launch" || echo "$OUT" | grep -qF "sable-plan"; then
+  FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  fxv3: sable-launch/sable-plan absent from deny reason"
+  echo "FAIL: fxv3: sable-launch/sable-plan absent from deny reason"
+  echo "  Got: ${OUT:0:400}"
+else
+  PASS=$((PASS+1)); echo "PASS: fxv3: sable-launch/sable-plan absent from deny reason"
+fi
+
 # ---- Native manager-subagent path (SABLE-6zt cases 5 & 6) ----
 # In v3 a manager dispatches workers natively: identity is the subagent
 # agent_type (agent_id present, NO env), resolved against the registry by
@@ -249,7 +319,7 @@ print(json.dumps({
 # run_hook_subagent <prompt> <model> — no env identity; registry resolves optimus
 run_hook_subagent() {
   make_subagent_input "$1" "$2" | \
-    env -i PATH="$TMP_DIR:$PATH" TMP_DIR="$TMP_DIR" SABLE_AGENTS_YAML="$AGENTS_YAML" \
+    env -i PATH="$TMP_DIR:$PATH" TMP_DIR="$TMP_DIR" SABLE_AGENTS_YAML="$AGENTS_YAML" SABLE_MODE_STATE="$SABLE_MODE_STATE" \
         bash "$HOOK" 2>/dev/null || echo "RUN_ERR:$?"
 }
 

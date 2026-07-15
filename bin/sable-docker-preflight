@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""sable-docker-preflight — post-reboot dockerd/containerd desync detector
+(SABLE-n5rb, prevention follow-up to market-brief-package-9scm).
+
+WHY: after the 2026-07-07 WSL hard reboot, dockerd came up holding TWO
+generations of on-disk container records. containerd revived the pre-crash
+`restart=always` containers as tasks dockerd no longer tracked (a GHOST set —
+alive, holding real cgroups and real host ports, invisible to `docker ps`),
+while dockerd separately started its OWN visible generation. Both postgres
+processes mounted the SAME pgdata volume: the visible one bypassed the
+postmaster.pid stale-lock check (PID-namespace blindness) and ran crash
+recovery OVER the ghost's live cluster — active dual-writer corruption. This
+recurs on every hard reboot/freeze until caught before a lane touches Docker
+Supabase. Full forensics + recovery runbook: market-brief-package-9scm.
+
+THREE UNPRIVILEGED CHECKS:
+  (a) PHANTOM containers — dockerd's own record claims Running, but neither
+      the process nor a live cgroup for that container ID actually exists.
+  (b) GHOST TASKS — a live cgroup exists for a container-shaped ID `docker ps`
+      does not list — containerd kept it running behind dockerd's back.
+  (c) DUAL POSTMASTER — the Supabase db's postmaster start time seen via
+      `docker exec` (whichever process dockerd's record points at) must equal,
+      to the microsecond, the start time seen over a raw TCP connection to the
+      published port (whichever process the OS actually has that port bound
+      to). Any mismatch means two postgres instances on one pgdata volume.
+
+NAMESPACE NOTE: on a Docker Desktop backend (WSL2, macOS) dockerd runs inside
+its own VM/distro — this process's own /proc and /sys/fs/cgroup do NOT see it
+at all, so checks (a)/(b) probe dockerd's REAL host namespace via a throwaway
+`docker run --rm --pid=host --cgroupns=host <image>` container instead of
+reading the local filesystem directly. This also works unchanged when dockerd
+runs natively alongside this process.
+
+NOISE ON THE PROBE ITSELF (found live while building this): a shared Docker
+Desktop kernel hosts cgroups this process's own dockerd does not own —
+another daemon context's containers (their PIDs are NOT resolvable from our
+--pid=host attachment; the kernel reports pid=0 for a foreign, unrelated PID
+namespace) and short-lived buildkit/snapshotter internal cgroups that appear
+and vanish within a few seconds. Both would false-positive a naive one-shot
+"docker ps` vs `ls cgroup dir`" comparison on every single run. Two
+mitigations, both load-bearing: (1) a cgroup only counts as "live" when its
+first process resolves to a real (>0) PID in OUR namespace — this alone
+eliminates the foreign-daemon noise entirely; (2) a candidate ghost must
+resolve to a live PID in TWO samples taken --ghost-debounce-seconds apart
+(default 2s) — a real ghost (the 9scm postgres ran for hours) trivially
+survives this, transient build/snapshot churn does not; (3) the probe
+container is itself a running container for the duration of both samples, so
+its OWN id (captured via `docker run --cidfile`) is always excluded — without
+this the tool would flag itself as a ghost on every single run.
+
+Usage:
+  sable-docker-preflight [--db-container NAME] [--helper-image IMAGE]
+                          [--ghost-debounce-seconds N] [--skip-pg-check] [--json]
+
+Exit status is a bitmask — sum of every check that failed, so a caller can
+tell exactly which ones fired:
+  0   healthy: no phantoms, no ghost tasks, single postmaster
+  1   phantom container(s) detected            (check a)
+  2   ghost cgroup task(s) detected             (check b)
+  4   dual-postmaster / desync detected         (check c)
+  8   a check could not run to completion (docker unavailable, no db
+      container found, etc.) — treated as blocking, not as "clean"
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+RUNBOOK = (
+    "Forensics + recovery runbook: market-brief-package-9scm. Recovery: purge "
+    "with dockerd STOPPED (clean, zero respawn), start dockerd, `docker rm -f` "
+    "the resurrected records, delete the db volume if analytics fails to boot "
+    "on it, then `supabase start` + `supabase db reset` + replay documented "
+    "seeds."
+)
+
+EXIT_PHANTOM = 1
+EXIT_GHOST = 2
+EXIT_DUAL_PG = 4
+EXIT_ERROR = 8
+
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_SPLIT = "__SABLE_DOCKER_PREFLIGHT_SPLIT__"
+_DEFAULT_GHOST_DEBOUNCE_SECONDS = 2
+
+
+class PreflightError(RuntimeError):
+    """A check could not run to completion (tool/environment failure, not a
+    docker/containerd desync finding)."""
+
+
+# ---------------------------------------------------------------------------
+# Pure parsing / detection core — unit-testable, no subprocess, no filesystem.
+# ---------------------------------------------------------------------------
+
+def parse_docker_inspect(raw_json):
+    """Parse `docker inspect <ids...>` JSON-array output into a list of records."""
+    return json.loads(raw_json)
+
+
+def parse_proc_pid_listing(raw_listing):
+    """Parse a newline-separated `ls /proc` listing into the set of live PIDs
+    (non-numeric entries — self, cpuinfo, etc. — are ignored)."""
+    pids = set()
+    for line in raw_listing.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.add(int(line))
+    return pids
+
+
+def parse_cgroup_pid_listing(raw_listing):
+    """Parse lines of `<full_container_id> <first_pid_or_0>` (as emitted by
+    gather_host_namespace's snapshot, covering both the cgroupfs driver's
+    /sys/fs/cgroup/docker/<id> layout and the systemd driver's
+    system.slice/docker-<id>.scope layout — the gather layer normalizes both
+    to bare IDs before this parses them) into {container_id: pid}. Lines whose
+    first token is not a 64-hex ID (e.g. "buildx", the buildkit builder's own
+    non-container cgroup) are ignored. pid is 0 when the cgroup has no
+    process resolvable in our own PID namespace — see module docstring."""
+    result = {}
+    for line in raw_listing.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        cid, pid_s = parts
+        if not _HEX64_RE.match(cid) or not pid_s.lstrip("-").isdigit():
+            continue
+        result[cid] = int(pid_s)
+    return result
+
+
+def find_phantom_containers(inspect_records, live_pids, cgroup_pids):
+    """(a) A docker-tracked container is a PHANTOM when it claims to be
+    Running but neither its State.Pid is a live process nor does a live
+    (resolvable, pid>0) cgroup exist for its full ID — dockerd's own record
+    is stale."""
+    phantoms = []
+    for rec in inspect_records:
+        state = rec.get("State") or {}
+        if not state.get("Running"):
+            continue
+        full_id = rec.get("Id", "")
+        pid = state.get("Pid")
+        pid_alive = pid in live_pids
+        has_live_cgroup = cgroup_pids.get(full_id, 0) > 0
+        if not pid_alive and not has_live_cgroup:
+            phantoms.append({
+                "id": full_id,
+                "name": (rec.get("Name") or "").lstrip("/"),
+                "pid": pid,
+                "reason": "State.Pid is not a live process and no live cgroup exists for this container ID",
+            })
+    return phantoms
+
+
+def find_ghost_tasks(cgroup_pids_sample1, cgroup_pids_sample2, docker_ps_ids):
+    """(b) A container-shaped ID is a GHOST TASK when it resolves to a live
+    (pid>0) process in OUR namespace in BOTH samples (debounced against the
+    transient buildkit/snapshotter cgroup churn documented in the module
+    docstring) and `docker ps` does not list it — containerd revived/kept it
+    running as a restart-policy task dockerd lost track of."""
+    tracked = set(docker_ps_ids)
+    ghosts = []
+    for cid, pid1 in cgroup_pids_sample1.items():
+        if pid1 <= 0 or cid in tracked:
+            continue
+        pid2 = cgroup_pids_sample2.get(cid, 0)
+        if pid2 > 0:
+            ghosts.append({"id": cid, "pid": pid2})
+    return sorted(ghosts, key=lambda g: g["id"])
+
+
+def check_dual_postmaster(exec_start_time, tcp_start_time):
+    """(c) True (STOP THE FLEET) iff the two non-empty readings disagree, to
+    the microsecond. Both readings are required — an empty reading is a tool
+    error for the caller to handle separately, not a "clean" result."""
+    a = (exec_start_time or "").strip()
+    b = (tcp_start_time or "").strip()
+    if not a or not b:
+        raise PreflightError("cannot compare postmaster start times: at least one reading is empty")
+    return a != b
+
+
+# ---------------------------------------------------------------------------
+# Gather layer — real subprocess calls against the real docker engine.
+# ---------------------------------------------------------------------------
+
+def _sh(cmd, timeout=15):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise PreflightError(f"timed out running: {' '.join(cmd)}") from e
+    except OSError as e:
+        raise PreflightError(f"failed to run {' '.join(cmd)}: {e}") from e
+
+
+def docker_ps_ids():
+    r = _sh(["docker", "ps", "-q", "--no-trunc"])
+    if r.returncode != 0:
+        raise PreflightError(f"docker ps failed: {r.stderr.strip()}")
+    return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+
+
+def docker_inspect_running():
+    ids = docker_ps_ids()
+    if not ids:
+        return []
+    r = _sh(["docker", "inspect", *ids])
+    if r.returncode != 0:
+        raise PreflightError(f"docker inspect failed: {r.stderr.strip()}")
+    return parse_docker_inspect(r.stdout)
+
+
+_SNAPSHOT_SNIPPET = (
+    "for f in /sys/fs/cgroup/docker/*/ /sys/fs/cgroup/system.slice/docker-*.scope/; do "
+    '  [ -d "$f" ] || continue; '
+    '  id=$(basename "$f" .scope); id=${id#docker-}; '
+    '  p=$(head -1 "$f/cgroup.procs" 2>/dev/null); '
+    '  echo "$id ${p:-0}"; '
+    "done"
+)
+
+
+def gather_host_namespace(helper_image="alpine", debounce_seconds=_DEFAULT_GHOST_DEBOUNCE_SECONDS):
+    """Peek into dockerd's REAL host PID + cgroup namespace via a throwaway
+    --pid=host --cgroupns=host container. Needed even when dockerd runs
+    natively alongside this process (harmless there too): on a Docker
+    Desktop backend this process's own /proc + /sys/fs/cgroup do not see
+    dockerd's host at all — every container would misreport as phantom
+    without this. Takes two cgroup snapshots debounce_seconds apart (see
+    module docstring — filters transient cgroup churn unrelated to actual
+    container lifecycle) plus one /proc listing taken after the second
+    snapshot. Returns (proc_listing, cgroup_sample1_raw, cgroup_sample2_raw,
+    self_container_id) — self_container_id (captured via --cidfile, since the
+    probe itself is a live container for the full duration of both samples
+    and would otherwise flag itself as a ghost) MUST be excluded by the
+    caller before calling find_ghost_tasks.
+    """
+    script = (
+        f"{_SNAPSHOT_SNIPPET}\n"
+        f"echo {_SPLIT}\n"
+        f"sleep {debounce_seconds}\n"
+        f"{_SNAPSHOT_SNIPPET}\n"
+        f"echo {_SPLIT}\n"
+        # Not `ls /proc`: busybox/coreutils ls stats each entry to classify it,
+        # which races a process exiting between readdir and stat ("No such
+        # file or directory" — found live while building this). A bare glob
+        # only needs readdir, so it can't lose that race.
+        "for p in /proc/[0-9]*; do basename \"$p\"; done\n"
+    )
+    fd, cidfile = tempfile.mkstemp(prefix="sable-docker-preflight-cid-")
+    os.close(fd)
+    os.remove(cidfile)  # docker refuses to write a --cidfile that already exists
+    try:
+        r = _sh(["docker", "run", "--rm", "--pid=host", "--cgroupns=host", f"--cidfile={cidfile}",
+                 helper_image, "sh", "-c", script],
+                timeout=max(30, debounce_seconds + 20))
+        if r.returncode != 0:
+            raise PreflightError(f"host-namespace probe failed: {r.stderr.strip()}")
+        self_id = ""
+        if os.path.exists(cidfile):
+            self_id = open(cidfile).read().strip()
+    finally:
+        if os.path.exists(cidfile):
+            os.remove(cidfile)
+    parts = (r.stdout.split(_SPLIT + "\n") + ["", "", ""])[:3]
+    cgroup_sample1_raw, cgroup_sample2_raw, proc_listing = parts
+    return proc_listing, cgroup_sample1_raw, cgroup_sample2_raw, self_id
+
+
+def find_db_container(name_prefix="supabase_db_"):
+    r = _sh(["docker", "ps", "--filter", f"name={name_prefix}", "--format", "{{.Names}}"])
+    if r.returncode != 0:
+        raise PreflightError(f"docker ps --filter failed: {r.stderr.strip()}")
+    names = [n.strip() for n in r.stdout.splitlines() if n.strip()]
+    return names[0] if names else None
+
+
+def docker_exec_postmaster_start_time(container):
+    r = _sh(["docker", "exec", container, "psql", "-U", "postgres", "-tAc",
+             "select pg_postmaster_start_time()"])
+    if r.returncode != 0:
+        raise PreflightError(f"docker exec psql failed on {container}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def find_host_port(container, container_port="5432/tcp"):
+    r = _sh(["docker", "port", container, container_port])
+    if r.returncode != 0 or not r.stdout.strip():
+        raise PreflightError(f"could not resolve published host port for {container}:{container_port}")
+    line = r.stdout.splitlines()[0].strip()
+    return line.rsplit(":", 1)[-1]
+
+
+def _container_env(container):
+    r = _sh(["docker", "inspect", container, "--format", "{{range .Config.Env}}{{println .}}{{end}}"])
+    if r.returncode != 0:
+        raise PreflightError(f"docker inspect (env) failed on {container}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def _container_image(container):
+    r = _sh(["docker", "inspect", container, "--format", "{{.Config.Image}}"])
+    if r.returncode != 0 or not r.stdout.strip():
+        raise PreflightError(f"docker inspect (image) failed on {container}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def tcp_postmaster_start_time(container, host_port):
+    """Reads pg_postmaster_start_time() over a raw TCP connection to the
+    published host port, from a --network host container so the reading
+    reflects whichever process the OS actually has that port bound to (not
+    whatever `docker exec` happens to attach to). Reuses the db container's
+    own image so no extra image pull is needed."""
+    image = _container_image(container)
+    pg_password = os.environ.get("SABLE_DOCKER_PREFLIGHT_PGPASSWORD")
+    if not pg_password:
+        for line in _container_env(container).splitlines():
+            if line.startswith("POSTGRES_PASSWORD="):
+                pg_password = line.split("=", 1)[1]
+                break
+    pg_password = pg_password or "postgres"
+    r = _sh([
+        "docker", "run", "--rm", "--network", "host",
+        "-e", f"PGPASSWORD={pg_password}", image,
+        "psql", "-h", "127.0.0.1", "-p", str(host_port), "-U", "postgres", "-tAc",
+        "select pg_postmaster_start_time()",
+    ], timeout=30)
+    if r.returncode != 0:
+        raise PreflightError(f"TCP psql check failed against 127.0.0.1:{host_port}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+def run_checks(db_container_arg, helper_image, debounce_seconds, skip_pg_check):
+    diagnosis = {"phantoms": [], "ghosts": [], "dual_postmaster": None, "errors": []}
+    exit_code = 0
+
+    try:
+        inspect_records = docker_inspect_running()
+        ps_ids = docker_ps_ids()
+        proc_listing, cgroup_raw1, cgroup_raw2, self_id = gather_host_namespace(helper_image, debounce_seconds)
+        live_pids = parse_proc_pid_listing(proc_listing)
+        cgroup_pids1 = parse_cgroup_pid_listing(cgroup_raw1)
+        cgroup_pids2 = parse_cgroup_pid_listing(cgroup_raw2)
+
+        # The probe container is itself alive for the whole gather, in both
+        # samples — exclude it explicitly rather than relying on docker_ps_ids
+        # (captured before the probe started, so it never lists it).
+        known_ids = ps_ids + ([self_id] if self_id else [])
+
+        diagnosis["phantoms"] = find_phantom_containers(inspect_records, live_pids, cgroup_pids2)
+        diagnosis["ghosts"] = find_ghost_tasks(cgroup_pids1, cgroup_pids2, known_ids)
+        if diagnosis["phantoms"]:
+            exit_code |= EXIT_PHANTOM
+        if diagnosis["ghosts"]:
+            exit_code |= EXIT_GHOST
+    except PreflightError as e:
+        diagnosis["errors"].append(str(e))
+        exit_code |= EXIT_ERROR
+
+    if not skip_pg_check:
+        try:
+            container = db_container_arg or find_db_container()
+            if not container:
+                raise PreflightError("no supabase_db_* container found — is the Supabase stack up?")
+            exec_time = docker_exec_postmaster_start_time(container)
+            host_port = find_host_port(container)
+            tcp_time = tcp_postmaster_start_time(container, host_port)
+            mismatch = check_dual_postmaster(exec_time, tcp_time)
+            diagnosis["dual_postmaster"] = {
+                "container": container,
+                "exec_start_time": exec_time,
+                "tcp_start_time": tcp_time,
+                "mismatch": mismatch,
+            }
+            if mismatch:
+                exit_code |= EXIT_DUAL_PG
+        except PreflightError as e:
+            diagnosis["errors"].append(str(e))
+            exit_code |= EXIT_ERROR
+
+    return diagnosis, exit_code
+
+
+def render_text(diagnosis, exit_code):
+    if exit_code == 0:
+        print("sable-docker-preflight: clean — no phantom containers, no ghost cgroup tasks, single postmaster.")
+        return
+
+    print("sable-docker-preflight: DESYNC DETECTED — STOP THE FLEET.\n")
+    if diagnosis["phantoms"]:
+        print(f"[phantom containers] {len(diagnosis['phantoms'])} dockerd record(s) with no live process or cgroup:")
+        for p in diagnosis["phantoms"]:
+            print(f"  {p['name'] or p['id'][:12]}  id={p['id']}  pid={p['pid']}  — {p['reason']}")
+        print()
+    if diagnosis["ghosts"]:
+        print(f"[ghost cgroup tasks] {len(diagnosis['ghosts'])} live cgroup(s), persisted across two samples, with no `docker ps` entry:")
+        for g in diagnosis["ghosts"]:
+            print(f"  id={g['id']}  pid={g['pid']}")
+        print()
+    dp = diagnosis["dual_postmaster"]
+    if dp and dp["mismatch"]:
+        print(f"[dual postmaster] {dp['container']}: docker-exec reading != TCP reading:")
+        print(f"  docker exec  : {dp['exec_start_time']}")
+        print(f"  TCP 127.0.0.1: {dp['tcp_start_time']}")
+        print()
+    if diagnosis["errors"]:
+        print("[errors] one or more checks could not run to completion (treated as blocking):")
+        for e in diagnosis["errors"]:
+            print(f"  {e}")
+        print()
+    print(RUNBOOK)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="sable-docker-preflight",
+        description="Detect dockerd/containerd ghost-container desync before a fleet touches Docker Supabase.",
+    )
+    parser.add_argument("--db-container", default=None,
+                         help="Supabase db container name (default: autodetect supabase_db_*)")
+    parser.add_argument("--helper-image", default="alpine",
+                         help="image used for the --pid=host/--cgroupns=host host-namespace probe (default: alpine)")
+    parser.add_argument("--ghost-debounce-seconds", type=int, default=_DEFAULT_GHOST_DEBOUNCE_SECONDS,
+                         help=f"gap between the two cgroup samples checks (a)/(b) debounce against (default: {_DEFAULT_GHOST_DEBOUNCE_SECONDS})")
+    parser.add_argument("--skip-pg-check", action="store_true",
+                         help="skip the dual-postmaster check (checks a/b only)")
+    parser.add_argument("--json", action="store_true", help="emit a machine-readable report")
+    args = parser.parse_args(argv)
+
+    if shutil.which("docker") is None:
+        msg = "sable-docker-preflight: docker not found on PATH."
+        if args.json:
+            print(json.dumps({"clean": False, "errors": [msg]}))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+
+    diagnosis, exit_code = run_checks(args.db_container, args.helper_image, args.ghost_debounce_seconds, args.skip_pg_check)
+
+    if args.json:
+        print(json.dumps({"clean": exit_code == 0, "exit_code": exit_code, **diagnosis}, indent=2))
+    else:
+        render_text(diagnosis, exit_code)
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

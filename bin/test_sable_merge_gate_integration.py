@@ -191,6 +191,142 @@ def test_conflict_delegates_exit_22_no_ref(tmp_path):
     assert _ci_verify_refs(origin) == [], "conflict must not leave a ci-verify ref"
 
 
+# --- SABLE-dn7r: post-merge worktree/branch cleanup on the real green path -----
+
+def _add_worktree(work, tmp_path, *, dirty=False):
+    """Register a real linked worktree checked out on WORKER, mirroring the fleet
+    layout (worktree lives outside the --repo main checkout)."""
+    wt = tmp_path / "wt-wk-x"
+    _git(work, "worktree", "add", str(wt), WORKER)
+    if dirty:
+        (wt / "uncommitted.txt").write_text("work in progress\n")
+    return wt
+
+
+def _worktree_paths(work):
+    out = _git(work, "worktree", "list", "--porcelain", check=False)
+    return [ln[len("worktree "):] for ln in out.splitlines() if ln.startswith("worktree ")]
+
+
+def _local_branch_exists(work, branch):
+    cp = _run(["git", "-C", str(work), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"])
+    return cp.returncode == 0
+
+
+def _origin_branch_exists(origin, branch):
+    out = _git(None, "--git-dir=" + str(origin), "for-each-ref", "--format=%(refname)",
+               f"refs/heads/{branch}", check=False)
+    return bool(out.strip())
+
+
+def test_green_promote_cleans_up_worktree_and_branches(tmp_path):
+    origin, work = _setup(tmp_path)
+    wt = _add_worktree(work, tmp_path)
+    gh = _write_fake_gh(tmp_path, origin, "success")
+
+    cp = _promote(work, gh)
+    assert cp.returncode == 0, cp.stdout
+
+    assert str(wt) not in _worktree_paths(work), "merged worktree not unregistered"
+    assert not _local_branch_exists(work, WORKER), "merged local branch not deleted"
+    assert not _origin_branch_exists(origin, WORKER), "merged remote branch not deleted"
+
+
+def test_green_promote_dirty_worktree_left_intact(tmp_path):
+    origin, work = _setup(tmp_path)
+    wt = _add_worktree(work, tmp_path, dirty=True)
+    gh = _write_fake_gh(tmp_path, origin, "success")
+    before = _origin_base_sha(origin)
+
+    cp = _promote(work, gh)
+    assert cp.returncode == 0, cp.stdout
+    assert _origin_base_sha(origin) != before, "dirty worktree must not block the merge itself"
+
+    assert str(wt) in _worktree_paths(work), "dirty worktree wrongly removed"
+    assert _local_branch_exists(work, WORKER), "branch of dirty worktree wrongly deleted"
+    assert _origin_branch_exists(origin, WORKER), "remote branch wrongly deleted for dirty worktree"
+    assert "DIRTY" in cp.stdout, "refusal not surfaced on stderr"
+
+
+def test_red_gate_no_cleanup(tmp_path):
+    # REGRESSION iron rule: a red gate leaves the worktree and both branches
+    # untouched — the branch is still needed for the fix + re-push.
+    origin, work = _setup(tmp_path)
+    wt = _add_worktree(work, tmp_path)
+    gh = _write_fake_gh(tmp_path, origin, "failure")
+
+    cp = _promote(work, gh)
+    assert cp.returncode == 20, cp.stdout
+
+    assert str(wt) in _worktree_paths(work), "red gate removed the worktree"
+    assert _local_branch_exists(work, WORKER), "red gate deleted the local branch"
+    assert _origin_branch_exists(origin, WORKER), "red gate deleted the remote branch"
+
+
+# --- SABLE-dtp1: unset --base/SABLE_MG_BASE resolves from the SAME source the
+# pre-push hook uses (git config sable.integrationBranch > .sable file), not
+# the hardcoded 'llm-integration' literal, which doesn't exist in these
+# fixture repos — pre-fix this would fail with exit 3 (cannot resolve ref).
+
+def _env_no_base(gh_path):
+    """_env(), but with SABLE_MG_BASE/SABLE_INTEGRATION_BRANCH/SABLE_BASE_BRANCH
+    stripped so resolution is driven purely by repo config, never by
+    dev-machine env leakage."""
+    e = _env(gh_path)
+    for k in ("SABLE_MG_BASE", "SABLE_INTEGRATION_BRANCH", "SABLE_BASE_BRANCH"):
+        e.pop(k, None)
+    return e
+
+
+def _promote_no_base(work, gh_path):
+    return _run([sys.executable, str(BIN), "promote", "--bead", "TEST-1",
+                 "--branch", WORKER, "--repo", str(work),
+                 "--remote", "origin"], cwd=str(work), env=_env_no_base(gh_path))
+
+
+def test_promote_resolves_base_from_git_config_when_unset(tmp_path):
+    origin, work = _setup(tmp_path)
+    _git(work, "config", "sable.integrationBranch", BASE)
+    gh = _write_fake_gh(tmp_path, origin, "success")
+    before = _origin_base_sha(origin)
+
+    cp = _promote_no_base(work, gh)
+    assert cp.returncode == 0, cp.stdout
+    assert _origin_base_sha(origin) != before, "git-config-resolved base did not advance"
+
+
+def test_promote_resolves_base_from_sable_file_when_unset(tmp_path):
+    origin, work = _setup(tmp_path)
+    (work / ".sable").write_text(f"integrationBranch={BASE}\n")
+    gh = _write_fake_gh(tmp_path, origin, "success")
+    before = _origin_base_sha(origin)
+
+    cp = _promote_no_base(work, gh)
+    assert cp.returncode == 0, cp.stdout
+    assert _origin_base_sha(origin) != before, ".sable-file-resolved base did not advance"
+
+
+def test_promote_with_neither_base_nor_config_fails_closed_not_llm_integration(tmp_path):
+    # regression guard for the bug itself: with no --base, no SABLE_MG_BASE, and
+    # no repo config, resolution falls through to "main" (SABLE-dtp1) — which
+    # does not exist in this fixture (its integration branch is BASE="trunk") —
+    # so the gate fails (git can't fetch a nonexistent ref) rather than
+    # silently targeting a stale hardcoded 'llm-integration' literal that
+    # ALSO doesn't exist here (pre-fix this failed the exact same way, just
+    # against 'llm-integration' instead of 'main' — this pins the resolved
+    # name, not just failure).
+    origin, work = _setup(tmp_path)
+    gh = _write_fake_gh(tmp_path, origin, "success")
+    before = _origin_base_sha(origin)
+
+    cp = _promote_no_base(work, gh)
+    assert cp.returncode != 0, cp.stdout
+    assert "'main'" in cp.stdout or "main'" in cp.stdout, \
+        f"expected the resolved default 'main' (not 'llm-integration') in the failure output: {cp.stdout}"
+    assert "llm-integration" not in cp.stdout
+    assert _origin_base_sha(origin) == before, "base must not advance when resolution has no configured source"
+
+
 def test_sweep_deletes_only_aged_orphans(tmp_path):
     origin, work = _setup(tmp_path)
     base_sha = _origin_base_sha(origin)

@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""sable-doctor — installed-vs-repo drift check (SABLE-1i6m).
+
+Nothing verifies that the hooks/agents/roles/skills installed at ~/.claude
+still match the SABLE repo they were copied from (install.sh / dorchestration
+-install run once, then the repo keeps moving). A stale install silently
+validates OLD code — hit live in SABLE-4ba, where 11 installed hooks were
+stale (missing the SABLE-aok attribution fix) for a full run before anyone
+noticed.
+
+This walks the same install manifest install.sh / sable-orchestration-install
+copy (top-level hooks, multi-manager hooks, producer agent defs, the manager
+registry + role files, and the SABLE skills), sha256-compares each installed
+file against its repo source, and reports MISSING / DRIFT / clean with the
+exact refresh command.
+
+Usage:
+  sable-doctor [--repo DIR] [--claude-dir DIR | --project] [--json] [--quiet]
+
+  --repo DIR         SABLE repo root (default: this script's own repo)
+  --claude-dir DIR   installed ~/.claude to check (default: $CLAUDE_USER_DIR
+                      or ~/.claude)
+  --project          check the CURRENT git project's OWN install instead:
+                      resolves <main-worktree-root>/.claude via the shared
+                      git-common-dir (same project-first resolution as
+                      bin/sable_registry_lib.py, SABLE-59t6.1) — sugar for
+                      --claude-dir. Errors clearly if the current directory
+                      isn't a git work tree, or no project install exists at
+                      the resolved dir (never reports a false "clean").
+  --json             emit a machine-readable report instead of text
+  --quiet            print nothing when clean; a one-line warning when
+                      drifted (SessionStart-hook friendly)
+
+Exit status: 0 when every checked file matches the repo, 1 when any file is
+missing or drifted.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_registry_lib import _main_worktree_root as main_worktree_root  # noqa: E402
+
+REPO = Path(__file__).resolve().parent.parent
+REFRESH_CMD = "bash install.sh"
+
+
+class NoProjectInstallError(Exception):
+    """--project could not resolve a project .claude install to check."""
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def skill_install_name(skill_dir: Path) -> str:
+    """The name a skill installs under — its SKILL.md frontmatter `name:`,
+    falling back to the directory name (mirrors sable-orchestration-install's
+    skill_names())."""
+    skill_md = skill_dir / "SKILL.md"
+    if skill_md.is_file():
+        for line in skill_md.read_text(errors="replace").splitlines():
+            m = re.match(r"^name:\s*(.+?)\s*$", line)
+            if m:
+                name = m.group(1).strip()
+                if name:
+                    return name
+    return skill_dir.name
+
+
+def build_manifest(repo: Path, claude_dir: Path):
+    """Return [(category, repo_path, installed_path), ...] mirroring exactly
+    what install.sh + sable-orchestration-install copy."""
+    entries = []
+
+    # Step 4: top-level hooks (hooks/*.sh -> ~/.claude/hooks/*.sh)
+    for f in sorted((repo / "hooks").glob("*.sh")):
+        entries.append(("hooks", f, claude_dir / "hooks" / f.name))
+
+    # Step 5: producer agent definitions (templates/agents/*.md -> ~/.claude/agents/*.md)
+    for f in sorted((repo / "templates" / "agents").glob("*.md")):
+        entries.append(("agent definitions", f, claude_dir / "agents" / f.name))
+
+    # Step 6 (delegated to sable-orchestration-install): multi-manager hooks
+    for f in sorted((repo / "hooks" / "multi-manager").glob("*.sh")):
+        entries.append(("multi-manager hooks", f, claude_dir / "hooks" / "multi-manager" / f.name))
+
+    # registry
+    agents_yaml = repo / "templates" / "multi-manager" / "agents.yaml"
+    if agents_yaml.is_file():
+        entries.append(("registry", agents_yaml, claude_dir / "sable" / "agents.yaml"))
+
+    # manager role files — only the four warm-pane roles are installed
+    # (producer role fragments feed templates/agents/*.md instead; see
+    # sable-build-agents)
+    for role in ("lincoln", "optimus", "tarzan", "chuck"):
+        f = repo / "templates" / "multi-manager" / "roles" / f"{role}.md"
+        if f.is_file():
+            entries.append(("manager roles", f, claude_dir / "sable" / "roles" / f"{role}.md"))
+
+    # SABLE skills, matched by frontmatter name (repo dir name may differ)
+    skills_root = repo / "skills"
+    if skills_root.is_dir():
+        for skill_dir in sorted(p for p in skills_root.iterdir() if p.is_dir()):
+            if not (skill_dir / "SKILL.md").is_file():
+                continue
+            name = skill_install_name(skill_dir)
+            dst_dir = claude_dir / "skills" / name
+            for f in sorted(p for p in skill_dir.iterdir() if p.is_file()):
+                entries.append((f"skill:{name}", f, dst_dir / f.name))
+
+    return entries
+
+
+def check_manifest(entries):
+    results = []
+    for category, src, dst in entries:
+        if not dst.exists():
+            status = "missing"
+        elif sha256(src) != sha256(dst):
+            status = "drift"
+        else:
+            status = "clean"
+        results.append({
+            "category": category,
+            "repo_path": str(src),
+            "installed_path": str(dst),
+            "status": status,
+        })
+    return results
+
+
+def resolve_claude_dir(arg_value, env):
+    if arg_value:
+        return Path(arg_value)
+    override = env.get("CLAUDE_USER_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / ".claude"
+
+
+def resolve_project_claude_dir(base=None):
+    """--project's target: <main-worktree-root>/.claude, resolved via the
+    shared git-common-dir (mirrors sable_registry_lib's project-first
+    resolution) so a linked worktree targets its main checkout's install.
+
+    Raises NoProjectInstallError — never returns a path that would make the
+    caller silently report a false "clean" — when <base> isn't inside a git
+    work tree, or the resolved .claude dir doesn't exist (no project install
+    to check)."""
+    root = main_worktree_root(base if base else os.getcwd())
+    if root is None:
+        raise NoProjectInstallError(
+            f"--project: {base or os.getcwd()} is not inside a git work tree "
+            "(no git-common-dir to resolve a project .claude from)"
+        )
+    claude_dir = Path(root) / ".claude"
+    if not claude_dir.is_dir():
+        raise NoProjectInstallError(
+            f"--project: no project install found at {claude_dir} "
+            "(resolved via git-common-dir from the current worktree)"
+        )
+    return claude_dir
+
+
+def render_text_report(results):
+    bad = [r for r in results if r["status"] != "clean"]
+    if not bad:
+        print(f"sable-doctor: clean — {len(results)} installed files match repo HEAD.")
+        return
+    print(f"sable-doctor: DRIFT DETECTED — {len(bad)}/{len(results)} installed files "
+          "do not match repo HEAD.\n")
+    last_category = None
+    for r in bad:
+        if r["category"] != last_category:
+            print(f"[{r['category']}]")
+            last_category = r["category"]
+        label = "MISSING" if r["status"] == "missing" else "DRIFT  "
+        print(f"  {label} {r['installed_path']}")
+        print(f"          repo: {r['repo_path']}")
+    print(f"\nRefresh with: {REFRESH_CMD}")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="sable-doctor",
+        description="Compare installed ~/.claude hooks/agents/roles/skills against the SABLE repo copy.",
+    )
+    parser.add_argument("--repo", default=None, help="SABLE repo root (default: this script's own repo)")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--claude-dir", default=None, help="installed ~/.claude to check (default: $CLAUDE_USER_DIR or ~/.claude)")
+    target.add_argument("--project", action="store_true", help="check the current git project's own install (sugar for --claude-dir <repo-root>/.claude via git-common-dir)")
+    parser.add_argument("--json", action="store_true", help="emit a machine-readable report")
+    parser.add_argument("--quiet", action="store_true", help="print nothing when clean; one line when drifted")
+    args = parser.parse_args(argv)
+
+    repo = Path(args.repo).resolve() if args.repo else REPO
+    if args.project:
+        try:
+            claude_dir = resolve_project_claude_dir()
+        except NoProjectInstallError as exc:
+            print(f"sable-doctor: {exc}", file=sys.stderr)
+            return 1
+    else:
+        claude_dir = resolve_claude_dir(args.claude_dir, os.environ)
+
+    entries = build_manifest(repo, claude_dir)
+    results = check_manifest(entries)
+    bad = [r for r in results if r["status"] != "clean"]
+
+    if args.json:
+        print(json.dumps({"clean": not bad, "results": results}, indent=2))
+    elif args.quiet:
+        if bad:
+            print(
+                f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD "
+                f"— run `{REFRESH_CMD}` to refresh (run `sable-doctor` for detail)",
+                file=sys.stderr,
+            )
+    else:
+        render_text_report(results)
+
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

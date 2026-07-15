@@ -111,6 +111,10 @@ MODE_BIN="$HOOK_DIR/../../bin/sable-mode"
 # SABLE_MODE_STATE unchanged, so a test/operator override is preserved.
 # shellcheck source=lib-mode-path.sh
 . "$HOOK_DIR/lib-mode-path.sh"
+# shellcheck source=lib-registry-path.sh
+. "$HOOK_DIR/lib-registry-path.sh"
+# shellcheck source=lib-identity.sh
+. "$HOOK_DIR/lib-identity.sh"
 HOOK_CWD="$(printf '%s' "$INPUT" | python3 -c "
 import json, sys
 try:
@@ -151,7 +155,12 @@ print(json.dumps({
 classify_target() {
   local name; name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   [ -z "$name" ] && { echo "free"; return; }
-  local yaml="${SABLE_AGENTS_YAML:-${HOME:-}/.claude/sable/agents.yaml}"
+  # Project-first registry resolution from the repo the tool call runs in
+  # (HOOK_CWD, resolved above) — a repo can ship its own agents.yaml, and every
+  # linked worktree resolves to the main checkout (SABLE-59t6.1). Registry absent
+  # everywhere → the HOME fallback path, whose missing file yields "free" below
+  # (byte-identical dormant fail-open).
+  local yaml; yaml="$(sable_registry_path "$HOOK_CWD")"
   [ -f "$yaml" ] || { echo "free"; return; }
   local t
   t="$(awk -v n="$name" '
@@ -289,6 +298,28 @@ is_spawn_call() {
   printf '%s' "$cmd" | grep -qE "(^|[;&|(])[[:space:]]*${helper}([[:space:]]|\$)"
 }
 
+# is_git_push <command> → true iff <command> genuinely runs `git … push` in
+# command-word position, NOT merely names the phrase inside a quoted argument
+# (SABLE-qfvn / SABLE-ykij), AND only when `push` is the git SUBCOMMAND itself
+# rather than some later, unrelated token (SABLE-f5m0). The qfvn/ykij tokenizer
+# checked `seg[i] == 'git' and 'push' in seg[i+1:]` — "push" as ANY later token —
+# so a git subcommand that merely carries a bare "push" argument false-matched:
+# `git log --grep push`, `git commit -m push`, `git checkout push` (a branch
+# literally named push), `git branch push`. That is the same over-broad
+# "phrase appears somewhere in the segment" class the parent beads fixed for
+# quoted prose, now shifted onto real git-subcommand arguments.
+#
+# Delegates to sable_is_git_push (lib-identity.sh), the canonical implementation
+# already used by the push-repo-dir resolver (SABLE-041): it walks git's global
+# flags (-C DIR, -c x=y, --no-pager, --git-dir=VALUE, env/env-assignment
+# prefixes, …) and only matches when the first non-flag token AFTER those is
+# exactly `push` — i.e. push must be the subcommand, not merely present
+# somewhere in the argument list. One source of truth for both call sites
+# instead of two independently-drifting tokenizers.
+is_git_push() {
+  sable_is_git_push "$1"
+}
+
 # ---------------------------------------------------------------------------
 # Producer deny-leg (SABLE-tz7h.3): CLAUDE_AGENT_ROLE=producer identifies a
 # fan-out analysis role (sherlock/victor/columbo/gaudi/rudy) — read-only by
@@ -314,7 +345,7 @@ if [ "${CLAUDE_AGENT_ROLE:-}" = "producer" ]; then
   if is_spawn_call 'sable-spawn-worker' "$CMD_TEXT" || is_spawn_call 'sable-spawn-manager' "$CMD_TEXT"; then
     deny "Producer identity (CLAUDE_AGENT_ROLE=producer) may not dispatch workers or stand up the fleet — producers are read-only analysis agents, not spawners. Set SABLE_ORCHESTRATION_FORCE=1 to override."
   fi
-  if printf '%s' "$CMD_TEXT" | grep -qE '(^|[[:space:];&|])git[[:space:]]+push([[:space:]]|$)'; then
+  if is_git_push "$CMD_TEXT"; then
     deny "Producer identity (CLAUDE_AGENT_ROLE=producer) may not push code — producers are read-only analysis agents; findings go through beads, not commits. Set SABLE_ORCHESTRATION_FORCE=1 to override."
   fi
 fi
@@ -443,8 +474,15 @@ printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])--force([[:space:]]|$)' && exi
 # /sable-execute; its own flags legitimately carry agent/producer names (e.g.
 # `--fleet victor`) that would otherwise false-positive the launch classifier
 # below, which only wants the token in COMMAND position, not anywhere in the
-# argument list. sable-mode itself never spawns anything, so exempt it outright.
-printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])sable-mode([[:space:]]|$)' && exit 0
+# argument list. sable-mode itself never spawns anything, so exempt it — but ONLY
+# when it is the ACTUAL command being run (the leading command word, after any
+# VAR=val prefix, which leading_cmd strips), NOT when the token merely appears
+# inside a quoted argument of some OTHER command. The pre-fix substring match let
+# a `bd create --parent … --description "… sable-mode set execution …"` short-
+# circuit the ENTIRE main leg and BYPASS the backlog-population gate (SABLE-ykij
+# defect 2); leading-word anchoring closes that bypass while a chained
+# `git push && sable-mode …` no longer wins exemption for its push either.
+[ "$(leading_cmd "$COMMAND")" = "sable-mode" ] && exit 0
 
 # Detect an attempt to launch a given set of named agents — either by invoking
 # the bare launch alias in command-word position, or by setting
@@ -511,7 +549,7 @@ case "$MODE" in
     if launches 'optimus|tarzan|chuck'; then
       deny "Orchestration is in PLANNING mode — launching execution managers (optimus/tarzan/chuck) is blocked. Run /sable-execute to drain the pool, or append --force to override."
     fi
-    if printf '%s' "$COMMAND" | grep -qE '(^|[[:space:];&|])git[[:space:]]+push([[:space:]]|$)'; then
+    if is_git_push "$COMMAND"; then
       deny "Orchestration is in PLANNING mode — code 'git push' is blocked so you don't ship from a half-formed backlog. Run /sable-execute first, or append --force to override."
     fi
     TIER="$(get_tier)"

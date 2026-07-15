@@ -38,6 +38,10 @@ if not cmd or not sid:
 SEPS = {';', '&&', '||', '|'}
 SCRIPT_RE = re.compile(r'test-[A-Za-z0-9_-]+\.sh\$')
 PYTEST_FILE_RE = re.compile(r'test_[A-Za-z0-9_-]+\.py')
+# A redirect operator as its own shlex token (2>&1, >, >>, 2>, <, 1>&2, ...).
+# SEPS only splits on command separators, not redirects, so a trailing
+# 'script.sh 2>&1' leaves '2>&1' — not the script path — as seg[-1].
+REDIRECT_RE = re.compile(r'^\d*(>>?|<)&?\d*\$')
 
 try:
     tokens = shlex.split(cmd)
@@ -79,16 +83,41 @@ for seg in segments:
 
     joined = ' '.join(seg)
     matched = False
-    if 'vitest' in joined:
+
+    # SABLE-dhfj: the runner keyword must be a real invocation token — the
+    # segment's own command, or the subcommand of a known wrapper like
+    # 'npx' — not merely a substring anywhere in the segment's text. A
+    # blind substring match over the joined segment text fires on
+    # 'grep vitest f', 'echo npm test', or a --description value that
+    # happens to mention 'pytest', none of which run a test.
+    eff_head, rest = head, seg
+    if head == 'npx' and len(seg) > 1:
+        eff_head, rest = seg[1], seg[1:]
+
+    if eff_head == 'vitest':
         matched = True
-    elif 'pytest' in joined:
+    elif eff_head == 'pytest':
         matched = True
-    elif 'npm test' in joined:
+    elif eff_head == 'npm' and len(rest) > 1 and rest[1] == 'test':
         matched = True
-    elif re.match(r'^python3?\$', head) and PYTEST_FILE_RE.search(joined):
-        matched = True
-    else:
-        last = seg[-1]
+    elif eff_head in ('python', 'python3'):
+        for i in range(len(rest) - 1):
+            if rest[i] == '-m' and rest[i + 1] == 'pytest':
+                matched = True
+                break
+        if not matched and PYTEST_FILE_RE.search(joined):
+            matched = True
+
+    if not matched:
+        # Drop a trailing redirect operator and everything after it (its
+        # target file, fd, etc.) so the script path is still found as the
+        # segment's true last token — 'test.sh 2>&1' must match like 'test.sh'.
+        core = seg
+        for i, t in enumerate(seg):
+            if REDIRECT_RE.match(t):
+                core = seg[:i]
+                break
+        last = core[-1] if core else seg[-1]
         # 'bash x' / 'sh x' / 'source x' style, OR direct execution
         # (./test-x.sh, /abs/path/test-x.sh — no interpreter token at all).
         interpreted = head in ('bash', 'sh', 'source', '.') and SCRIPT_RE.search(last)

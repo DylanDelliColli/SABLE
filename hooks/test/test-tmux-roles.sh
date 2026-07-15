@@ -4,8 +4,10 @@
 # Asserts the four role files express the tmux-native contract and dropped the
 # stale in-process Agent-tool worker-dispatch language:
 #   - managers (optimus/tarzan) dispatch via sable-spawn-worker, talk via sable-msg,
-#     carry the sender-framing glyph, and NO LONGER carry `run_in_background`
-#     (the Agent-tool background-spawn flag) for worker dispatch.
+#     carry the sender-framing glyph, and NO LONGER carry `run_in_background: true`
+#     (the Agent-tool background-spawn flag used for worker dispatch). Bare
+#     `run_in_background` mentions of the Bash tool's background-sweep flag
+#     (SABLE-nmmh's event-driven safety-net sweeps) are legitimate and allowed.
 #   - lincoln directs managers via sable-msg + the framing rule and references
 #     sable-tmux (run_in_background is allowed — its PLANNING producers are still
 #     Agent-tool subagents).
@@ -32,7 +34,8 @@ for mgr in optimus tarzan; do
   has   "$mgr" "sable-msg"           "talks to Lincoln via sable-msg"
   has   "$mgr" "$GLYPH"              "carries the sender-framing rule"
   has   "$mgr" "self-push\|SELF-PUSH" "states workers self-push"
-  lacks "$mgr" "run_in_background"   "dropped the Agent-tool background-spawn flag"
+  lacks "$mgr" "run_in_background: true" "dropped the Agent-tool background-spawn flag"
+  has   "$mgr" "Bash \`run_in_background\`" "keeps the legitimate Bash-tool background-sweep mention (SABLE-p9ih)"
   lacks "$mgr" "[-][-]has-parent"    "no invalid --has-parent bd flag (SABLE-bldh.17)"
   lacks "$mgr" "[-][-]no-parent"     "no invalid --no-parent bd flag (SABLE-bldh.17)"
   lacks "$mgr" "[-][-]no-label"      "no invalid --no-label bd flag (SABLE-bldh.17)"

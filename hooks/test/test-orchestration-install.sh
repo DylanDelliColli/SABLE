@@ -48,10 +48,13 @@ exists "$P/.claude/sable/roles/chuck.md"    "project: chuck pane role installed 
 if [ ! -e "$P/.claude/agents-teams" ]; then pass "project: agents-teams defs NOT installed (tmux-only)"; else fail "project: agents-teams defs NOT installed (tmux-only)" "unexpected $P/.claude/agents-teams/"; fi
 if printf '%s' "$out1" | grep -q "sable-tmux"; then pass "project: install output points at the sable-tmux bring-up"; else fail "project: install output points at the sable-tmux bring-up" "no sable-tmux mention"; fi
 if [ -x "$P/.claude/hooks/multi-manager/mode-interlock.sh" ]; then pass "project: interlock hook installed+exec"; else fail "project: interlock hook installed+exec"; fi
-SET="$P/.claude/settings.local.json"
-exists "$SET" "project: settings.local.json created"
+SET="$P/.claude/settings.json"
+exists "$SET" "project: COMMITTED settings.json created"
+if [ ! -e "$P/.claude/settings.local.json" ]; then pass "project: settings.local.json ABSENT (gitignored-wiring pitfall guard)"; else fail "project: settings.local.json ABSENT" "unexpected $P/.claude/settings.local.json"; fi
 if valid_json "$SET"; then pass "project: settings is valid JSON"; else fail "project: settings is valid JSON"; fi
 if [ "$(count_interlock "$SET")" = "2" ]; then pass "project: interlock registered on both legs (Bash+Agent)"; else fail "project: interlock registered on both legs (Bash+Agent)" "count=$(count_interlock "$SET")"; fi
+if grep -qF '${CLAUDE_PROJECT_DIR}/.claude/hooks/' "$SET"; then pass "project: hook commands rooted at \${CLAUDE_PROJECT_DIR} placeholder"; else fail "project: hook commands rooted at \${CLAUDE_PROJECT_DIR} placeholder"; fi
+if grep -q "$P/.claude/hooks/" "$SET"; then fail "project: no absolute machine path in hook commands" "found absolute path in $SET"; else pass "project: no absolute machine path in hook commands"; fi
 exists "$P/.claude/sable/agents.yaml" "project: registry (agents.yaml) installed"
 if [ -x "$P/.claude/hooks/multi-manager/session-role-anchor.sh" ]; then pass "project: identity hook installed+exec"; else fail "project: identity hook installed+exec"; fi
 if [ "$(count_in_event "$SET" SessionStart session-role-anchor.sh)" = "1" ]; then pass "project: identity hook registered SessionStart"; else fail "project: identity hook registered SessionStart" "count=$(count_in_event "$SET" SessionStart session-role-anchor.sh)"; fi
@@ -77,7 +80,7 @@ P2="$(mktemp -d)"
 SABLE_PROJECT_DIR="$P2" bash "$INSTALLER" >/dev/null 2>&1
 exists "$P2/.claude/skills/sable-plan/SKILL.md" "default (no flag) installs into project ./.claude"
 if [ ! -e "$P2/.claude/agents-teams" ]; then pass "default install: no agents-teams defs (tmux-only)"; else fail "default install: no agents-teams defs (tmux-only)" "unexpected agents-teams/"; fi
-SET2="$P2/.claude/settings.local.json"
+SET2="$P2/.claude/settings.json"
 if [ "$(count_marker "$SET2" pre-push-rebase-test)" -ge 1 ]; then pass "default install: governance hooks in settings"; else fail "default install: governance hooks in settings" "count=$(count_marker "$SET2" pre-push-rebase-test)"; fi
 
 # retired topology flags are rejected with a clear error (tmux is the only topology)
@@ -169,7 +172,7 @@ if valid_json "$MSET"; then pass "md7: settings valid after multi-manager re-ins
 # ---------- SABLE-qa4d.6: poll-based inbox hooks are gone ----------
 PIH="$(mktemp -d)"
 SABLE_PROJECT_DIR="$PIH" bash "$INSTALLER" --project >/dev/null 2>&1
-PIHSET="$PIH/.claude/settings.local.json"
+PIHSET="$PIH/.claude/settings.json"
 if [ "$(count_marker "$PIHSET" inbox-injection)" = "0" ]; then pass "settings register no inbox-injection hooks (sable-msg replaces the poll)"; else fail "settings register no inbox-injection hooks" "count=$(count_marker "$PIHSET" inbox-injection)"; fi
 if [ ! -e "$PIH/.claude/hooks/multi-manager/inbox-injection.sh" ] && [ ! -e "$PIH/.claude/hooks/multi-manager/inbox-injection-precompact.sh" ]; then pass "no inbox-injection hook files installed"; else fail "no inbox-injection hook files installed"; fi
 if [ -e "$PIH/.claude/hooks/multi-manager/read-guard.sh" ]; then pass "read-guard survives (durable-inbox guard stays)"; else fail "read-guard survives (durable-inbox guard stays)"; fi
@@ -181,6 +184,100 @@ TM_OUT="$(SABLE_PROJECT_DIR="$TMONLY" bash "$INSTALLER" --project 2>&1)"
 if printf '%s' "$TM_OUT" | grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"; then fail "install output has no experimental-teams-flag instruction" "flag instruction still printed"; else pass "install output has no experimental-teams-flag instruction"; fi
 if printf '%s' "$TM_OUT" | grep -qi "topology"; then fail "install output does not speak of topologies" "topology wording still printed"; else pass "install output does not speak of topologies"; fi
 rm -rf "$TMONLY"
+
+# ---------- SABLE-gsqj: upgrade over a stale scope retires dead machinery ----------
+# Seed a scope as if from the multi-topology era: retired inbox-poll hook files +
+# their settings rows, a legacy agents-teams/ dir, and retired manager agent defs
+# in agents/ — then run a PLAIN (non --uninstall) install and assert the retired
+# stuff is gone while unrelated settings rows and genuinely custom agent files survive.
+seed_retired_settings(){ python3 - "$1" <<'PY'
+import json, sys
+seed = {
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "", "hooks": [
+        {"type": "command", "command": "bash ~/.claude/hooks/multi-manager/inbox-injection.sh", "timeout": 3000},
+        {"type": "command", "command": "bd prime"}
+      ]}
+    ],
+    "PreCompact": [
+      {"matcher": "", "hooks": [
+        {"type": "command", "command": "bash ~/.claude/hooks/multi-manager/inbox-injection-precompact.sh", "timeout": 3000}
+      ]}
+    ],
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "bash /tmp/other-hook.sh", "timeout": 1000}
+      ]}
+    ]
+  }
+}
+open(sys.argv[1], 'w').write(json.dumps(seed, indent=2))
+PY
+}
+
+RA="$(mktemp -d)"
+mkdir -p "$RA/.claude/hooks/multi-manager" "$RA/.claude/agents-teams" "$RA/.claude/agents"
+touch "$RA/.claude/agents-teams/chuck.md"
+touch "$RA/.claude/agents/optimus.md" "$RA/.claude/agents/tarzan.md" "$RA/.claude/agents/chuck.md"
+touch "$RA/.claude/agents/my-custom-agent.md"
+printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/inbox-injection.sh"
+printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/inbox-injection-precompact.sh"
+seed_retired_settings "$RA/.claude/settings.json"
+
+RA_OUT="$(SABLE_PROJECT_DIR="$RA" bash "$INSTALLER" --project 2>&1)"
+RASET="$RA/.claude/settings.json"
+
+if [ ! -e "$RA/.claude/hooks/multi-manager/inbox-injection.sh" ]; then pass "gsqj: retired inbox-injection.sh removed on plain (upgrade) install"; else fail "gsqj: retired inbox-injection.sh removed on plain install"; fi
+if [ ! -e "$RA/.claude/hooks/multi-manager/inbox-injection-precompact.sh" ]; then pass "gsqj: retired inbox-injection-precompact.sh removed"; else fail "gsqj: retired inbox-injection-precompact.sh removed"; fi
+if [ "$(count_marker "$RASET" inbox-injection)" = "0" ]; then pass "gsqj: retired settings rows removed"; else fail "gsqj: retired settings rows removed" "count=$(count_marker "$RASET" inbox-injection)"; fi
+if [ ! -e "$RA/.claude/agents-teams" ]; then pass "gsqj: retired agents-teams dir removed on plain install (not just --uninstall)"; else fail "gsqj: retired agents-teams dir removed on plain install"; fi
+if [ ! -e "$RA/.claude/agents/optimus.md" ] && [ ! -e "$RA/.claude/agents/tarzan.md" ] && [ ! -e "$RA/.claude/agents/chuck.md" ]; then pass "gsqj: retired manager agent defs removed from scope's agents/ dir"; else fail "gsqj: retired manager agent defs removed from scope's agents/ dir"; fi
+if [ -e "$RA/.claude/agents/my-custom-agent.md" ]; then pass "gsqj: genuinely custom agent def survives"; else fail "gsqj: genuinely custom agent def survives"; fi
+if grep -q 'other-hook.sh' "$RASET"; then pass "gsqj: unrelated settings row survives"; else fail "gsqj: unrelated settings row survives"; fi
+if grep -q 'bd prime' "$RASET"; then pass "gsqj: unrelated bd prime row survives"; else fail "gsqj: unrelated bd prime row survives"; fi
+if valid_json "$RASET"; then pass "gsqj: settings valid JSON after retired-artifact cleanup"; else fail "gsqj: settings valid JSON after retired-artifact cleanup"; fi
+if printf '%s' "$RA_OUT" | grep -qi "retired artifacts cleaned"; then pass "gsqj: install output reports what was cleaned"; else fail "gsqj: install output reports what was cleaned"; fi
+
+# a second (already-clean) run is silent about retired artifacts and stays idempotent
+RA_OUT2="$(SABLE_PROJECT_DIR="$RA" bash "$INSTALLER" --project 2>&1)"
+if printf '%s' "$RA_OUT2" | grep -qi "retired artifacts cleaned"; then fail "gsqj: re-run on clean scope reports nothing to clean" "still printed cleanup banner"; else pass "gsqj: re-run on clean scope reports nothing to clean"; fi
+if valid_json "$RASET"; then pass "gsqj: settings still valid JSON after second run"; else fail "gsqj: settings still valid JSON after second run"; fi
+rm -rf "$RA"
+
+# ---------- SABLE-6lfz: per-file change manifest + snapshot ----------
+# Point the installer at a throwaway source tree (SABLE_REPO_DIR) so "modify one
+# source file" never touches this repo's own tracked files; it's a copy of the
+# real hooks/templates/skills subset the installer actually reads from.
+RS="$(mktemp -d)"
+mkdir -p "$RS/hooks/multi-manager" "$RS/templates/multi-manager/roles" "$RS/skills/sample-skill"
+cp "$REPO"/hooks/multi-manager/*.sh "$RS/hooks/multi-manager/"
+cp "$REPO/templates/multi-manager/agents.yaml" "$RS/templates/multi-manager/agents.yaml"
+cp "$REPO/templates/multi-manager/settings-snippet.json" "$RS/templates/multi-manager/settings-snippet.json"
+cp "$REPO"/templates/multi-manager/roles/*.md "$RS/templates/multi-manager/roles/"
+printf -- '---\nname: sample-skill\n---\nplaceholder\n' > "$RS/skills/sample-skill/SKILL.md"
+
+MF="$(mktemp -d)"
+out_first="$(SABLE_REPO_DIR="$RS" SABLE_PROJECT_DIR="$MF" bash "$INSTALLER" --project 2>&1)"
+if printf '%s' "$out_first" | grep -q "Change manifest"; then pass "manifest: first install prints a change manifest"; else fail "manifest: first install prints a change manifest"; fi
+if printf '%s' "$out_first" | grep -q "NEW "; then pass "manifest: first install reports NEW entries"; else fail "manifest: first install reports NEW entries"; fi
+
+out_second="$(SABLE_REPO_DIR="$RS" SABLE_PROJECT_DIR="$MF" bash "$INSTALLER" --project 2>&1)"
+if printf '%s' "$out_second" | grep -q "all files identical"; then pass "manifest: second run reports all-identical"; else fail "manifest: second run reports all-identical" "$out_second"; fi
+if printf '%s' "$out_second" | grep -q "CHANGED"; then fail "manifest: second run has no CHANGED entries"; else pass "manifest: second run has no CHANGED entries"; fi
+
+# modify one source file (in the throwaway RS tree, never the real repo)
+echo "# test-touch" >> "$RS/hooks/multi-manager/mode-interlock.sh"
+out_third="$(SABLE_REPO_DIR="$RS" SABLE_PROJECT_DIR="$MF" bash "$INSTALLER" --project 2>&1)"
+if printf '%s' "$out_third" | grep -q "CHANGED.*mode-interlock.sh"; then pass "manifest: third run reports the modified file as CHANGED"; else fail "manifest: third run reports the modified file as CHANGED" "$out_third"; fi
+changed_count="$(printf '%s' "$out_third" | grep -c '^  CHANGED')"
+if [ "$changed_count" = "1" ]; then pass "manifest: third run reports exactly one changed file"; else fail "manifest: third run reports exactly one changed file" "count=$changed_count"; fi
+
+bak_dir="$(find "$MF/.claude" -maxdepth 1 -name '.install-bak-*' | sort | tail -1)"
+if [ -n "$bak_dir" ] && [ -f "$bak_dir/hooks/multi-manager/mode-interlock.sh" ]; then pass "manifest: snapshot dir captures the prior copy"; else fail "manifest: snapshot dir captures the prior copy" "bak_dir=$bak_dir"; fi
+if [ -n "$bak_dir" ] && ! grep -q "test-touch" "$bak_dir/hooks/multi-manager/mode-interlock.sh"; then pass "manifest: snapshot holds the pre-change content"; else fail "manifest: snapshot holds the pre-change content"; fi
+if grep -q "test-touch" "$MF/.claude/hooks/multi-manager/mode-interlock.sh"; then pass "manifest: installed copy now matches the new source"; else fail "manifest: installed copy now matches the new source"; fi
+rm -rf "$RS" "$MF"
 
 rm -rf "$P" "$P2" "$U" "$PU" "$M"
 echo

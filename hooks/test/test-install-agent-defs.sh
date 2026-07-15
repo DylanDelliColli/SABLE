@@ -28,7 +28,7 @@ fail(){ FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n 
 # Helper: run install.sh in a temp HOME, suppressing interactive output
 run_install() {
     local home_dir="$1"
-    HOME="$home_dir" bash "$INSTALLER" >/dev/null 2>&1
+    HOME="$home_dir" bash "$INSTALLER" --from-here >/dev/null 2>&1
 }
 
 # ──────────────────────────────────────────────────────────────────────────────

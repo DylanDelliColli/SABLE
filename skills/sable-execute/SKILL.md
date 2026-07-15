@@ -43,6 +43,34 @@ lock** — nothing stops you, but skipping it means execution surfaces questions
 the human should have answered during planning, which is exactly what staged
 planning exists to prevent.
 
+## 0.5 Docker Supabase preflight (hard gate, SABLE-n5rb)
+
+Before any lane touches Docker Supabase, run:
+
+```bash
+sable-docker-preflight
+```
+
+This detects the dockerd/containerd ghost-container desync class that
+corrupted a shared pgdata volume after the 2026-07-07 WSL hard reboot
+(forensics + recovery runbook: market-brief-package-9scm) — containerd can
+revive pre-crash containers as tasks dockerd no longer tracks while dockerd
+separately starts its own visible generation, and both postgres processes end
+up writing the SAME volume. This recurs on every hard reboot/freeze, so it
+must be caught here, before `sable-spawn-manager --all` lets any worker near
+the db.
+
+- **Exit 0 — clean.** Proceed to step 1.
+- **Nonzero because docker/Supabase isn't part of this project** (stderr/JSON
+  errors say `docker not found` or `no supabase_db_* container found`) — not
+  applicable here, proceed to step 1.
+- **Any other nonzero — HARD STOP.** Do not flip the mode-state, do not spawn
+  managers. Paste the diagnosis to the operator (which of phantom
+  containers / ghost cgroup tasks / dual postmaster fired, and the specific
+  IDs/timestamps reported) and point at the runbook the tool prints
+  (market-brief-package-9scm). Wait for the operator to run recovery before
+  retrying this step.
+
 ## 1. Flip the mode-state
 
 Run exactly one command:
@@ -61,6 +89,30 @@ A executes — without the two clobbering each other's mode. From this point the
 producers (sherlock / victor / columbo) is blocked on both the Agent and Bash
 legs (soft — `SABLE_ORCHESTRATION_FORCE=1` / `--force` overrides). Mode flips are
 mid-conversation; no restart.
+
+## 1.5 Seed the active-contracts surface (SABLE-9ozz)
+
+The mode flip alone is invisible to a manager pane that **restarts** mid-drain
+(`/clear`, crash, session limit): the pane re-boots on its STATIC role card and
+loses every conversation-state convention this fleet is running under — the
+merge-gate sole-path contract, any interim worker cap, the manual-relay rule
+while a hook is dark. That was the 2026-07-13 gah9 bypass: a restarted chuck
+merged with bare `git merge --no-ff` because his static identity still described
+the old manual flow. Persist the live contracts to disk so `session-role-anchor.sh`
+surfaces them into every fresh boot's identity:
+
+```bash
+sable-contract set  "Merges go ONLY through sable-merge-gate. NO bare git merge/push on any integration branch."
+sable-contract add  "Workers self-push their worktree branch; the post-push hook files for-chuck; Chuck merges via the gate."
+# add any interim fleet rule live this shift, e.g.:
+# sable-contract add "Interim worker cap: 2 per manager until SABLE-p8rf lands."
+```
+
+`sable-contract` writes `<repo>/.claude/sable/state/active-contracts.md`, colocated
+with the mode-state (same per-repo resolution). Update it the moment a protocol
+flips — a contract change that lives only in this conversation dies with the next
+restart. Clear a rule with `sable-contract clear` / re-`set` when it no longer
+applies.
 
 ## 2. Bring up the warm-pane session
 

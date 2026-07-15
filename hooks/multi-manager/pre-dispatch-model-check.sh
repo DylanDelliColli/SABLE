@@ -75,11 +75,19 @@ echo "$SUBTYPE" | grep -qiE '^(Explore|Plan|claude-code-guide|feature-dev:code-e
 # Skip if dispatch prompt indicates investigation/exploration (manager judgment)
 echo "$PROMPT" | grep -qiE '^Task: (explore|investigate|research|audit|read-only)' && exit 0
 
-# Extract bead IDs from prompt
+# Extract bead IDs from prompt.
+#
+# SABLE-fxv3: bd issues IDs with an UPPERCASE prefix (SABLE-fxv3, BD-123) while
+# SABLE tool names are lowercase by convention (sable-plan, sable-doctor,
+# sable-agents, ...) and share the same prefix words. Matching case-insensitively
+# extracted those tool names as phantom bead IDs, producing false 'no model:
+# label' denials on any dispatch prompt that merely mentioned a tool. Matching
+# the prefix case-sensitively (uppercase only) keeps real bead IDs while
+# excluding lowercase tool-name mentions — no re.IGNORECASE.
 BEAD_IDS=$(echo "$PROMPT" | python3 -c "
 import sys, re
 text = sys.stdin.read()
-ids = set(re.findall(r'\b((?:bd|sable|twine|epic|task|bug|feat)-[a-zA-Z0-9_-]+)\b', text, re.IGNORECASE))
+ids = set(re.findall(r'\b((?:BD|SABLE|TWINE|EPIC|TASK|BUG|FEAT)-[a-zA-Z0-9]{2,6}(?:\.[0-9]+)*)\b(?!-[A-Za-z0-9])', text))
 for i in sorted(ids):
     print(i)
 " 2>/dev/null)

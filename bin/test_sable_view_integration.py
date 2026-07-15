@@ -39,9 +39,12 @@ def _tmux(s, *args, check=True):
 
 
 def _run(s, *args):
+    env = {**os.environ, "SABLE_TMUX_SOCKET": s,
+           "SABLE_TMUX_SESSION": SESSION}
+    env.pop("TMUX", None)
+    env.pop("TMUX_PANE", None)
     return subprocess.run(["python3", str(BIN), *args], capture_output=True, text=True,
-                          env={**os.environ, "SABLE_TMUX_SOCKET": s,
-                             "SABLE_TMUX_SESSION": SESSION})
+                          env=env)
 
 
 def _seed_session(s):
@@ -71,6 +74,19 @@ def test_table_lists_all_roles(sock):
     for role in ("lincoln", "optimus", "tarzan", "chuck", "worker"):
         assert role in r.stdout
     assert "SABLE-int1" in r.stdout
+
+
+def test_table_shows_worker_count_vs_cap(sock):
+    """SABLE-mmdt acceptance: the operator must see live worker count vs cap
+    without leaving the cockpit — the status table carries a count/cap line."""
+    _seed_session(sock)  # seeds exactly one running worker pane
+    r = subprocess.run(["python3", str(BIN)], capture_output=True, text=True,
+                       env={**os.environ, "SABLE_TMUX_SOCKET": sock,
+                            "SABLE_TMUX_SESSION": SESSION,
+                            "SABLE_MAX_WORKERS": "4"})
+    assert r.returncode == 0, r.stderr
+    assert "1/4" in r.stdout
+    assert "SABLE_MAX_WORKERS" in r.stdout
 
 
 def test_json_output(sock):

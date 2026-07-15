@@ -6,6 +6,7 @@ tmux user-options set at spawn / completion: @sable_role=worker, @sable_bead=<id
 @sable_status=running|done. Reaping is driven by the pane's own done-flag (pure
 tmux); the manager separately watches the bead pool for the actual result.
 """
+import argparse
 import importlib.util
 import json
 import subprocess
@@ -602,6 +603,288 @@ def test_filter_protected_excludes_pane_in_attached_clients_window():
         raise AssertionError(f"unexpected call {args}")
 
     assert sws.filter_protected(["%1", "%2"], None, run=fake_run) == ["%2"]
+
+
+# --- SABLE-dcw2: panes carried no owner attribution, so any manager's sweep
+# saw (and --reap'd) every manager's workers. parse_worker_panes now surfaces
+# the @sable_lane tag as "lane", and filter_by_lane scopes a listing to the
+# caller's own lane. The lane key is added ONLY when stamped, so every bare-shape
+# assertion above (and the reap/sampling logic) is untouched. ---
+
+def test_parse_worker_panes_surfaces_lane_when_stamped():
+    # a worker pane spawned by the updated sable-spawn-worker carries a 7th
+    # field, @sable_lane -- surfaced as "lane" on the record
+    out = "%1\tworker\tbead-a\trunning\t\t\toptimus\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%1", "bead": "bead-a", "status": "running",
+                      "lane": "optimus"}]
+
+
+def test_parse_worker_panes_omits_lane_key_when_unstamped():
+    # a pane spawned before the @sable_lane column (only 4 fields) keeps the
+    # exact bare {pane, bead, status} shape -- no "lane" key -- so it stays
+    # unattributed and is surfaced only under --all, never silently swept
+    out = "%2\tworker\tbead-b\trunning\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%2", "bead": "bead-b", "status": "running"}]
+    assert "lane" not in panes[0]
+
+
+def test_parse_worker_panes_producer_carries_lane():
+    # the lane rides alongside a producer's class/deliverable, added last
+    out = "%3\tvictor\tbead-v\tdone\tproducer\t/tmp/d.json\ttarzan\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%3", "bead": "bead-v", "status": "done",
+                      "class": "producer", "deliverable": "/tmp/d.json",
+                      "lane": "tarzan"}]
+
+
+def test_filter_by_lane_keeps_only_matching_lane():
+    workers = [
+        {"pane": "%1", "bead": "a", "status": "running", "lane": "optimus"},
+        {"pane": "%2", "bead": "b", "status": "done", "lane": "tarzan"},
+        {"pane": "%3", "bead": "c", "status": "running", "lane": "optimus"},
+    ]
+    assert sws.filter_by_lane(workers, "optimus") == [workers[0], workers[2]]
+    assert sws.filter_by_lane(workers, "tarzan") == [workers[1]]
+
+
+def test_filter_by_lane_excludes_unattributed_pane():
+    # an ownerless pane (no "lane" key) matches NO manager -- it belongs to
+    # --all only, never to a lane that can't positively claim it
+    workers = [
+        {"pane": "%1", "bead": "a", "status": "done"},              # unstamped
+        {"pane": "%2", "bead": "b", "status": "done", "lane": "optimus"},
+    ]
+    assert sws.filter_by_lane(workers, "optimus") == [workers[1]]
+    assert sws.filter_by_lane(workers, "tarzan") == []
+
+
+def test_resolve_view_lane_all_returns_none():
+    ns = argparse.Namespace(all=True, mine=False, lane=None)
+    assert sws.resolve_view_lane(ns) is None
+
+
+def test_resolve_view_lane_explicit_lane_wins():
+    ns = argparse.Namespace(all=False, mine=False, lane="tarzan")
+    assert sws.resolve_view_lane(ns) == "tarzan"
+
+
+def test_resolve_view_lane_defaults_to_caller_agent_name(monkeypatch):
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "optimus")
+    ns = argparse.Namespace(all=False, mine=False, lane=None)
+    assert sws.resolve_view_lane(ns) == "optimus"
+    # --mine is the explicit spelling of that same default
+    ns_mine = argparse.Namespace(all=False, mine=True, lane=None)
+    assert sws.resolve_view_lane(ns_mine) == "optimus"
+
+
+def test_resolve_view_lane_unlaned_caller_falls_back_to_global(monkeypatch):
+    # no CLAUDE_AGENT_NAME (the operator by hand) -> global view, not an empty
+    # own-lane one
+    monkeypatch.delenv("CLAUDE_AGENT_NAME", raising=False)
+    ns = argparse.Namespace(all=False, mine=False, lane=None)
+    assert sws.resolve_view_lane(ns) is None
+
+
+# --- SABLE-ita7: a worker pane whose turn was cut off by the Claude Code
+# session-rate-limit banner ("hit your session limit ... resets ...") reads
+# identically to a busy pane by tag alone (@sable_status=running never
+# changes) -- the SABLE-tz7h.4 worker pane sat "running" for ~5 hours after
+# hitting the limit, invisible to sable-worker-status the whole time.
+# rate_limit_stall/flag_rate_limit_stalls close that gap: capture-pane every
+# running pane and flag one showing the banner AND an idle composer
+# (pane_ready) as "stalled-rate-limit" -- a banner still sitting in
+# scrollback while the composer is NOT ready means the turn is still
+# processing, so it stays "running" (detection surface only -- never reaped,
+# never auto-nudged). ---
+
+def test_session_limit_reset_extracts_reset_time():
+    assert sws.session_limit_reset("You have hit your session limit - resets 2pm") == "2pm"
+
+
+def test_session_limit_reset_none_when_absent():
+    assert sws.session_limit_reset("just ordinary scrollback") is None
+
+
+def test_rate_limit_stall_returns_reset_when_banner_present_and_composer_ready():
+    cap = "turn output\nYou have hit your session limit - resets 2pm\n\n❯"
+    assert sws.rate_limit_stall(cap) == "2pm"
+
+
+def test_rate_limit_stall_none_when_no_banner():
+    # busy capture, no banner at all -- stays running
+    cap = "turn output\n⠋ Thinking… (esc to interrupt)"
+    assert sws.rate_limit_stall(cap) is None
+
+
+def test_rate_limit_stall_none_when_banner_present_but_composer_not_ready():
+    # the banner sits mid-scrollback (an earlier hit that has since resumed),
+    # but the composer isn't idle -- a turn is still processing, not stalled
+    cap = ("You have hit your session limit - resets 2pm\n"
+           "more scrollback since then\n"
+           "⠋ Thinking… (esc to interrupt)")
+    assert sws.rate_limit_stall(cap) is None
+
+
+def test_flag_rate_limit_stalls_flags_running_pane_on_banner_and_ready_composer():
+    workers = [{"pane": "%1", "bead": "a", "status": "running"}]
+
+    def fake_capture(pane):
+        return "turn output\nYou have hit your session limit - resets 2pm\n\n❯"
+
+    result = sws.flag_rate_limit_stalls(workers, None, capture=fake_capture)
+    assert result == [{"pane": "%1", "bead": "a", "status": "stalled-rate-limit", "reset": "2pm"}]
+
+
+def test_flag_rate_limit_stalls_leaves_busy_no_banner_pane_running():
+    workers = [{"pane": "%1", "bead": "a", "status": "running"}]
+
+    def fake_capture(pane):
+        return "turn output\n⠋ Thinking… (esc to interrupt)"
+
+    assert sws.flag_rate_limit_stalls(workers, None, capture=fake_capture) == workers
+
+
+def test_flag_rate_limit_stalls_leaves_still_processing_pane_running():
+    workers = [{"pane": "%1", "bead": "a", "status": "running"}]
+
+    def fake_capture(pane):
+        return ("You have hit your session limit - resets 2pm\n"
+                "more scrollback since then\n"
+                "⠋ Thinking… (esc to interrupt)")
+
+    assert sws.flag_rate_limit_stalls(workers, None, capture=fake_capture) == workers
+
+
+def test_flag_rate_limit_stalls_never_captures_done_panes():
+    def fake_capture(pane):
+        raise AssertionError("must never capture-pane a done pane")
+
+    workers = [{"pane": "%1", "bead": "a", "status": "done"}]
+    assert sws.flag_rate_limit_stalls(workers, None, capture=fake_capture) == workers
+
+
+# --- SABLE-axp0: fleet-wide dialog/overlay liveness probe. A pane parked on an
+# interactive dialog or a modal overlay (a numbered selector, a startup gate, or
+# a /usage-style panel dismissed with Esc) silently swallows every message sent
+# to it — the live incident was chuck's warm MANAGER pane parked ~30min on a
+# /usage overlay, absorbing 3 sable-msg attempts, detected only by manual
+# capture-pane. The probe reuses the shared overlay_posture classifier
+# (dialog_posture + the modal-overlay case), gates it with not-busy so a working
+# pane is never flagged, and covers MANAGER panes too (parse_fleet_panes keeps
+# them where parse_worker_panes drops them). Detection surface only in v1 —
+# reported "dialog-stalled" and alerted loudly, never auto-dismissed or reaped. ---
+
+DIALOG_MENU = (
+    "  ? Which option?\n"
+    "  > 1. alpha\n"
+    "    2. beta\n"
+    "  (Use arrow keys, Enter to select)")
+USAGE_OVERLAY = (
+    "  Current usage\n"
+    "  Session:  45%\n"
+    "  Weekly:   12%\n"
+    "\n"
+    "  Esc to close")
+EMPTY_COMPOSER = "some prior output\n\n❯"
+DIALOG_WHILE_BUSY = (
+    # a menu-looking pair of lines WHILE a turn is actively running — the
+    # not-busy guard must keep this from flagging as a stall
+    "  > 1. alpha\n"
+    "    2. beta\n"
+    "⠋ Thinking… (esc to interrupt)")
+
+
+def test_overlay_posture_true_for_numbered_menu():
+    assert sws.overlay_posture(DIALOG_MENU) is True
+
+
+def test_overlay_posture_true_for_usage_style_esc_to_close_overlay():
+    # the case dialog_posture MISSES: no numbered menu, no Enter-to-select —
+    # only an 'Esc to close' dismiss hint (the chuck /usage repro).
+    assert sws.overlay_posture(USAGE_OVERLAY) is True
+
+
+def test_overlay_posture_false_on_empty_composer():
+    assert sws.overlay_posture(EMPTY_COMPOSER) is False
+
+
+def test_overlay_posture_false_for_busy_esc_to_interrupt_hint():
+    # 'esc to interrupt' is the busy-turn marker, NOT an overlay dismiss verb —
+    # it must never be mistaken for an overlay.
+    assert sws.overlay_posture("⠋ Thinking… (esc to interrupt)\n\n❯") is False
+
+
+def test_dialog_stall_true_for_idle_dialog():
+    assert sws.dialog_stall(DIALOG_MENU) is True
+
+
+def test_dialog_stall_true_for_idle_usage_overlay():
+    assert sws.dialog_stall(USAGE_OVERLAY) is True
+
+
+def test_dialog_stall_false_on_empty_composer():
+    assert sws.dialog_stall(EMPTY_COMPOSER) is False
+
+
+def test_dialog_stall_false_when_dialog_line_but_pane_is_busy():
+    # the not-busy guard: a running turn momentarily painting a dialog-like line
+    # is not a stall.
+    assert sws.dialog_stall(DIALOG_WHILE_BUSY) is False
+
+
+def test_parse_fleet_panes_keeps_manager_pane():
+    # tab-delimited _FORMAT: pane, role, bead, status, class, deliverable, lane.
+    # parse_worker_panes DROPS this row (class=manager); the fleet probe keeps it.
+    line = "%3\toptimus\t\t\tmanager\t\toptimus"
+    assert sws.parse_fleet_panes(line) == [
+        {"pane": "%3", "role": "optimus", "bead": "", "status": "running",
+         "class": "manager", "lane": "optimus"}]
+
+
+def test_parse_fleet_panes_keeps_worker_and_producer():
+    lines = ("%1\tworker\tbead-a\trunning\tworker\t\toptimus\n"
+             "%2\tvictor\t\tdone\tproducer\t/tmp/d.json\ttarzan")
+    panes = sws.parse_fleet_panes(lines)
+    assert {p["pane"] for p in panes} == {"%1", "%2"}
+    assert panes[1]["class"] == "producer" and panes[1]["role"] == "victor"
+
+
+def test_parse_fleet_panes_skips_untagged_shell():
+    # no @sable_role AND no @sable_class -> a plain terminal, not a fleet pane
+    assert sws.parse_fleet_panes("%7\t\t\t\t\t\t") == []
+
+
+def test_flag_dialog_stalls_flags_stalled_manager_pane():
+    # the key fleet-wide extension: a MANAGER pane on an overlay is flagged
+    # (parse_worker_panes would never have surfaced it).
+    panes = [{"pane": "%9", "role": "chuck", "bead": "", "status": "running",
+              "class": "manager", "lane": "chuck"}]
+    result = sws.flag_dialog_stalls(panes, None, capture=lambda pane: USAGE_OVERLAY)
+    assert result == [{"pane": "%9", "role": "chuck", "bead": "",
+                       "status": "dialog-stalled", "class": "manager", "lane": "chuck"}]
+
+
+def test_flag_dialog_stalls_leaves_normal_composer_pane():
+    panes = [{"pane": "%1", "role": "worker", "bead": "a", "status": "running",
+              "class": "worker", "lane": "optimus"}]
+    assert sws.flag_dialog_stalls(panes, None, capture=lambda pane: EMPTY_COMPOSER) == []
+
+
+def test_flag_dialog_stalls_leaves_busy_pane_unflagged():
+    panes = [{"pane": "%1", "role": "worker", "bead": "a", "status": "running",
+              "class": "worker", "lane": "optimus"}]
+    assert sws.flag_dialog_stalls(panes, None, capture=lambda pane: DIALOG_WHILE_BUSY) == []
+
+
+def test_flag_dialog_stalls_never_captures_done_panes():
+    def fake_capture(pane):
+        raise AssertionError("must never capture-pane a done pane")
+
+    panes = [{"pane": "%1", "role": "worker", "bead": "a", "status": "done",
+              "class": "worker", "lane": "optimus"}]
+    assert sws.flag_dialog_stalls(panes, None, capture=fake_capture) == []
 
 
 if __name__ == "__main__":

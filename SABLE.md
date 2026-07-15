@@ -1129,6 +1129,22 @@ This uses only your own worktree's working directory and a scratch file — no s
 
 **Break-glass fallback**, only if stash is truly unavoidable: prefix your stash message with your worker/scope name (`git stash push -m "<scope>: <what>"`), and treat the stack as hostile — run `git stash list` immediately before every `pop`/`drop` and act **only** by explicit index (`git stash pop stash@{N}`). Never assume `stash@{0}` is yours; another worker may have pushed after you.
 
+### 6.4b Clean-Room Verification Before Push
+
+A dev box carries `bd` and `dolt` on `PATH` ambiently; the CI merge-preview gate (`.github/workflows/ci-verify.yml`) deliberately does not — it is a fresh runner with only `python`+`pytest`+`tmux`+`git`, no `bd`, no `dolt`, no installed `~/.claude`. A suite that touches `install.sh` and silently assumes `bd`/`dolt` are present passes on every local run and only reds once it lands on that runner — after push, after the gate already ran.
+
+`bin/sable-clean-room-verify` closes that gap: it runs a given command with every `PATH` entry that provides `bd` or `dolt` **removed** (not merely shadowed by something earlier on `PATH`), reproducing the one dimension of the CI clean-room that silently passes locally and reds in CI.
+
+```bash
+# Run the canonical gate locally, exactly as ci-verify.yml will see it
+bin/sable-clean-room-verify
+
+# Isolate a single install.sh-touching suite before push
+bin/sable-clean-room-verify bash hooks/test/test-sable-bin-install.sh
+```
+
+**Any suite added to `.github/ci/shell-run-set.sh`'s `ALLOW` list must be clean-room-safe**: it must self-skip when `bd`/`dolt` are absent (exit 0 with a clear `SKIP:` message — never a bare pass-through that ran nothing) or stub them in and genuinely exercise itself (see `hooks/test/test-sable-bin-install.sh`'s `S2_STUB` pattern). A suite that only "passes" because it never noticed `bd` was missing is a false-pass, not clean-room-safe — verify it with `sable-clean-room-verify` before widening `ALLOW`.
+
 ### 6.5 Formal Swarms with `bd swarm`
 
 Section 6.2 covered the dispatch pattern. `bd swarm` formalizes it: an epic + its children become a registered "swarm molecule" with structure-aware tooling.
@@ -1401,6 +1417,70 @@ script header — used by tests and for operator overrides.
 ### 8.4 Context Recovery
 
 When context is compacted (long sessions) or a new session starts, the `bd prime` command re-injects critical workflow context. SABLE configures this as a SessionStart and PreCompact hook so it happens automatically.
+
+### 8.5 GitHub SSH Port-22 Flap (Runbook)
+
+Cross-fleet operational runbook for a recurring host-local symptom, following the
+[[SABLE-ptkn]] dolt-runbook precedent (§8.3) of documenting the procedure inline
+rather than only in the bead.
+
+**SYMPTOM:** `git push` / `git fetch` / `git ls-remote` hang and exit 124, or an
+`ssh -T` probe to `git@github.com` times out on connect. `bd dolt push` and other
+local `bd` writes are unaffected — this is a Git-over-SSH-specific path, not a
+Dolt or beads outage.
+
+**OBSERVED OCCURRENCES:** 2026-07-09 (tz7h window, self-resolved) and 2026-07-13
+~19:00Z (chuck escalation, self-resolved by ~19:19Z). Both times githubstatus.com
+showed all-operational and a same-minute probe on port 443 was green while port
+22 timed out — so treat the cause as local/path (WSL2 NAT or upstream port-22
+filtering on this host), never as a GitHub-side outage. Do not spend time
+checking GitHub status first; probe both ports instead.
+
+**PROBE COMMANDS (diagnose first, mutate nothing):**
+
+```bash
+ssh -T git@github.com                    # port 22 — may hang/timeout when flapping
+timeout 15 ssh -p 443 -T git@ssh.github.com   # port 443 fallback — expect it to authenticate
+git ls-remote origin HEAD                 # real transport check once a port is confirmed live
+```
+
+A successful `ssh -T` prints `Hi <user>! You've successfully authenticated...`
+and exits 1 — that exit code is expected (GitHub refuses shell access by
+design), not a failure signal.
+
+**FIX — PERMANENT 443 ROUTING (operator-authorized 2026-07-14, durable not
+incident-scoped):** `~/.ssh/config` routes both the work and personal GitHub
+identities over port 443, which is strictly more firewall/NAT-tolerant than 22
+with no known downside:
+
+```
+Host github.com
+  HostName ssh.github.com
+  Port 443
+  IdentityFile ~/.ssh/id_ed25519
+
+Host github-personal
+  HostName ssh.github.com
+  Port 443
+  IdentityFile ~/.ssh/id_ed25519_personal
+```
+
+Keys and remote URLs (`git@github.com:...`, `git@github-personal:...`) are
+unchanged — only the transport routes differently. Trivially reversible (delete
+the `HostName`/`Port` lines to fall back to direct port-22).
+
+**SHARED HOST STATE:** `~/.ssh/config` is host-local, not per-repo — it is
+shared across both fleets. Treat further edits to it as governed by the
+[[SABLE-ht22]] brokered-window convention; do not edit it unilaterally mid-swarm.
+
+**VERIFY:** `ssh -T` over the affected alias authenticates AND a real
+`git ls-remote`/`fetch` through a remote using that alias succeeds. Trusting the
+probe alone is not sufficient — confirm with a real transport call, mirroring
+the evidence standard in [[SABLE-ptkn]].
+
+**REFERENCES:** [[SABLE-yw7q]] (this bead, delivered the 443 fallback + this
+runbook), [[SABLE-72kh]] (first occurrence), [[SABLE-ht22]] (shared-host-state
+coordination convention).
 
 ---
 

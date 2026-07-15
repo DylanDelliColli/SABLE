@@ -27,7 +27,8 @@
 #   $SABLE_PRE_PUSH_LINT_COMMAND        — lint invocation (no auto-detect; opt-in)
 #   $SABLE_PRE_PUSH_STATIC_TIMEOUT      — seconds for static phase (default: 90)
 #   $SABLE_PRE_PUSH_TEST_PHASE          — "auto" (default) | "skip" (delegate to repo's git hooks)
-#   $SABLE_TEST_COMMAND                 — test invocation (used when PHASE=auto)
+#   $SABLE_TEST_COMMAND                 — test invocation (used when PHASE=auto; lowest-priority
+#                                         source — see sable_resolve_test_command below)
 #   $SABLE_PRE_PUSH_TEST_TIMEOUT        — seconds for test phase (default: 60)
 #   $SABLE_SKIP_PRE_PUSH                — "1" to skip TESTS only (rebase+static still run)
 #
@@ -184,11 +185,15 @@ detect_typecheck_cmd() {
   echo ""
 }
 
-# Auto-detect test command from project markers.
+# Resolve the test command: repo-local config / checked-in .sable / env
+# (sable_resolve_test_command, SABLE-hml), else auto-detect from project
+# markers, else empty (no test command — phase 3 no-ops with a message).
 detect_test_cmd() {
   local cwd="$1"
-  if [ -n "${SABLE_TEST_COMMAND:-}" ]; then
-    echo "$SABLE_TEST_COMMAND"
+  local resolved
+  resolved=$(sable_resolve_test_command "$cwd")
+  if [ -n "$resolved" ]; then
+    echo "$resolved"
     return
   fi
   if [ -f "$cwd/package.json" ]; then
@@ -379,7 +384,7 @@ fi
 TEST_CMD=$(detect_test_cmd "$CWD")
 
 if [ -z "$TEST_CMD" ]; then
-  emit_context "Pre-push: rebase + static phases passed; no test command detected (no package.json/pyproject.toml/Cargo.toml/go.mod). Set SABLE_TEST_COMMAND to enforce tests before push."
+  emit_context "Pre-push: rebase + static phases passed; no test command detected (no package.json/pyproject.toml/Cargo.toml/go.mod). Add a testCommand= line to .sable (checked in), or set sable.testCommand via git config, or set SABLE_TEST_COMMAND, to enforce tests before push."
   exit 0
 fi
 

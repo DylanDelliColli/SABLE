@@ -47,7 +47,11 @@ tag_full() { # tag_full <pane> <role> <bead> <status> <class> <deliverable>
 # SABLE-1kbo: windowed sampling adds a real sleep between two internal
 # listing reads (default 1.5s); shrink it here since none of this suite's
 # cases are timing-sensitive -- they just need the fix to not regress them.
-run_status() { SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION="w" \
+# CLAUDE_AGENT_NAME forced empty (SABLE-dcw2): these cases assert the fleet-wide
+# view over lane-less panes, so the reap/dedup/pending-input mechanics must not
+# depend on an ambient lane leaking in from the runner (a manager pane sets it),
+# which the new own-lane default filter would otherwise scope every pane out of.
+run_status() { SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION="w" CLAUDE_AGENT_NAME="" \
   SABLE_STATUS_SAMPLE_INTERVAL="0.1" python3 "$BIN" "$@"; }
 
 # --- fixture: two worker panes, plus a SECOND session name grouped with the
@@ -248,6 +252,30 @@ else
   fail "--reap kills a beadless done producer pane with a valid deliverable" "producer pane still alive"
 fi
 rm -f "$DELIVERABLE3"
+
+# --- SABLE-ita7: a "running" pane whose turn was cut off by the Claude Code
+#     session-rate-limit banner must be flagged stalled-rate-limit (with the
+#     reset time) instead of reading "running" forever ---
+tmux -L "$SOCK" new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
+sleep 0.3
+PANE11="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"
+tag "$PANE11" worker bead-eleven running
+tmux -L "$SOCK" send-keys -t "$PANE11" "echo 'You have hit your session limit - resets 2pm'" Enter
+sleep 0.2
+tmux -L "$SOCK" send-keys -t "$PANE11" "PS1='❯ '" Enter
+sleep 0.3
+
+out7="$(run_status)"
+if printf '%s' "$out7" | grep -q "bead-eleven" && printf '%s' "$out7" | grep -q "stalled-rate-limit"; then
+  pass "a running pane stalled on the session-limit banner is flagged stalled-rate-limit"
+else
+  fail "a running pane stalled on the session-limit banner is flagged stalled-rate-limit" "$out7"
+fi
+if printf '%s' "$out7" | grep -q "resets=2pm"; then
+  pass "the flagged row reports the reset time"
+else
+  fail "the flagged row reports the reset time" "$out7"
+fi
 
 echo
 echo "=========================================="

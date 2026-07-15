@@ -237,6 +237,60 @@ run_case_yaml "73t4: registered optimus-3 resolves epic_manager via its instance
   "optimus-3|epic_manager|agent_type|1|1|1"
 
 # --------------------------------------------------------------------------
+# SABLE-59t6.1 — project-first registry resolution (lib-registry-path.sh).
+# A repo that ships its OWN .claude/sable/agents.yaml must drive identity even
+# when HOME has no registry (a project-only install). Pins the fail-open pitfall:
+# if the resolver ignored the project registry and read ONLY $HOME (empty here),
+# optimus would resolve UNregistered — fail open — and the manager gate would
+# stand down. This runs with SABLE_AGENTS_YAML UNSET so the git-common-dir /
+# project-first path is exercised (every other case pins the override).
+# --------------------------------------------------------------------------
+PROJ_REPO="$(mktemp -d)"
+git -C "$PROJ_REPO" init -q
+git -C "$PROJ_REPO" -c user.email=t@t -c user.name=t commit --allow-empty -m init -q
+mkdir -p "$PROJ_REPO/.claude/sable"
+cat > "$PROJ_REPO/.claude/sable/agents.yaml" <<'YAML'
+agents:
+  optimus:
+    type: epic_manager
+YAML
+PROJ_EMPTY_HOME="$(mktemp -d)"
+proj_got=$(
+  unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_AGENTS_YAML
+  export HOME="$PROJ_EMPTY_HOME"
+  cd "$PROJ_REPO" || exit 1
+  # shellcheck disable=SC1090
+  source "$LIB"
+  sable_resolve_identity '{"agent_id":"proj1","agent_type":"optimus"}'
+  printf '%s|%s|%s|%s' "$SABLE_ID_NAME" "$SABLE_ID_TYPE" "$SABLE_ID_IS_MANAGER" "$SABLE_ID_IS_REGISTERED"
+)
+if [ "$proj_got" = "optimus|epic_manager|1|1" ]; then
+  pass "59t6.1: project registry drives identity with empty HOME (project-only install)"
+else
+  fail "59t6.1: project registry drives identity with empty HOME (project-only install)" \
+    "expected [optimus|epic_manager|1|1] got [$proj_got]"
+fi
+# Fail-open control: SAME empty HOME, but a NON-git dir (no project registry
+# anywhere) — optimus must resolve UNregistered, confirming the pass above is the
+# project registry talking, not a stray global one.
+proj_fo=$(
+  unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_AGENTS_YAML
+  export HOME="$PROJ_EMPTY_HOME"
+  cd "$PROJ_EMPTY_HOME" || exit 1
+  # shellcheck disable=SC1090
+  source "$LIB"
+  sable_resolve_identity '{"agent_id":"proj2","agent_type":"optimus"}'
+  printf '%s|%s|%s|%s' "$SABLE_ID_NAME" "$SABLE_ID_TYPE" "$SABLE_ID_IS_MANAGER" "$SABLE_ID_IS_REGISTERED"
+)
+if [ "$proj_fo" = "optimus||0|0" ]; then
+  pass "59t6.1: no registry anywhere + empty HOME → optimus unregistered (dormant fail-open)"
+else
+  fail "59t6.1: no registry anywhere + empty HOME → optimus unregistered (dormant fail-open)" \
+    "expected [optimus||0|0] got [$proj_fo]"
+fi
+rm -rf "$PROJ_REPO" "$PROJ_EMPTY_HOME"
+
+# --------------------------------------------------------------------------
 # sable_resolve_dispatch_lane unit tests (SABLE-uz9.9)
 # Manager-subagents now dispatch workers natively (nested Agent, CC 2.1.177,
 # SABLE-uz9.8) — governance must ACTIVATE for them where it previously stood
@@ -488,6 +542,44 @@ is_push_test "sable_is_git_push: 'env FOO=bar git push'" "env FOO=bar git push" 
 is_push_test "sable_is_git_push: 'env -u GIT_DIR git push'" "env -u GIT_DIR git push" 0
 is_push_test "sable_is_git_push: 'echo SABLE_SKIP_PRE_PUSH=1 git push' is NOT push" "echo SABLE_SKIP_PRE_PUSH=1 git push" 1
 is_push_test "sable_is_git_push: 'bd create --description=FOO=1 git push' is NOT push" 'bd create --description="FOO=1 git push"' 1
+# multi-line command cases (SABLE-qs3r) — a newline is a command-position
+# boundary; shlex.split alone treats it as plain whitespace and MISSED a push on
+# its own line. f5m0's delegation regressed this vs the qfvn/ykij tokenizer.
+is_push_test "sable_is_git_push: push on line 2 of a multi-line command is push" \
+  "$(printf 'echo preparing\ngit push origin main')" 0
+is_push_test "sable_is_git_push: push on line 3 after two setup lines is push" \
+  "$(printf 'bd update x --claim\necho ready\ngit push')" 0
+is_push_test "sable_is_git_push: 'git -C /x push' on its own line is push" \
+  "$(printf 'echo prep\ngit -C /x push')" 0
+is_push_test "sable_is_git_push: multi-line with NO push stays not-push" \
+  "$(printf 'echo one\ngit status\ngit log --grep push')" 1
+is_push_test "sable_is_git_push: multi-line mention only (echo git push) is NOT push" \
+  "$(printf 'echo starting\necho git push\ndone')" 1
+is_push_test "sable_is_git_push: multi-line quoted description mention is NOT push" \
+  "$(printf 'bd create --title=x\nbd note --description="git push in prose"')" 1
+# unspaced-separator command boundaries (SABLE-sxhx) — plain shlex.split only
+# splits ; && || | when whitespace-delimited (shlex.split('git push;ls') ->
+# ['git', 'push;ls']), so a real push chained with NO surrounding space silently
+# bypassed the walk. tokenize() now uses shlex.shlex(punctuation_chars=';&|') so
+# the separators split even when unspaced.
+is_push_test "sable_is_git_push: 'git push;ls' (unspaced ;) is push" "git push;ls" 0
+is_push_test "sable_is_git_push: 'ls;git push' (unspaced ;) is push" "ls;git push" 0
+is_push_test "sable_is_git_push: 'git push&&ls' (unspaced &&) is push" "git push&&ls" 0
+is_push_test "sable_is_git_push: 'ls||git push' (unspaced ||) is push" "ls||git push" 0
+is_push_test "sable_is_git_push: 'git push|cat' (unspaced |) is push" "git push|cat" 0
+is_push_test "sable_is_git_push: 'mkdir x&&git push' (unspaced &&) is push" "mkdir x&&git push" 0
+# unspaced separator must NOT defeat subcommand precision
+is_push_test "sable_is_git_push: 'git status;ls' is NOT push" "git status;ls" 1
+is_push_test "sable_is_git_push: 'git pushd;ls' is NOT push" "git pushd;ls" 1
+is_push_test "sable_is_git_push: 'ls;git pushd' is NOT push" "ls;git pushd" 1
+# a separator char INSIDE a quoted arg must NOT split (no false positive)
+is_push_test "sable_is_git_push: separator inside quoted prose is NOT push" \
+  'bd note --description="fix; git push"' 1
+is_push_test "sable_is_git_push: pipe inside quoted prose is NOT push" \
+  'bd create --description="git push | tee"' 1
+# env-assignment prefix after an unspaced separator is still transparent
+is_push_test "sable_is_git_push: 'ls;SABLE_SKIP_PRE_PUSH=1 git push' is push" \
+  "ls;SABLE_SKIP_PRE_PUSH=1 git push" 0
 
 # --------------------------------------------------------------------------
 # sable_validate_base_ref unit tests (SABLE-61n)
@@ -499,13 +591,24 @@ VAL_BARE=$(mktemp -d)
 trap 'rm -rf "$VAL_REPO" "$VAL_BARE"' EXIT
 git init -q --bare "$VAL_BARE"
 git clone -q "$VAL_BARE" "$VAL_REPO"
-cd "$VAL_REPO"
-git config user.email "v@test"
-git config user.name "Validator"
+# SABLE-di86 (z776 pattern, 55ae0ba4): guard the cd AND scope every git op to
+# `git -C "$VAL_REPO"`. Formerly a bare `cd "$VAL_REPO"` (unguarded) ran ahead of
+# bare `git config` + a SILENCED `git push -q origin HEAD:refs/heads/main`. Under
+# a busy-/tmp race where the cd failed, CWD stayed in the REAL worktree and those
+# ops escaped: the config wrote Validator/v@test into the real .git/config
+# (a5a5 class) and the push shipped the real HEAD to the real origin/main with
+# 2>/dev/null hiding the corruption (xydb class). The guard aborts before any op
+# if the cd fails; `git -C "$VAL_REPO" push origin` resolves "origin" from
+# VAL_REPO's OWN config (= VAL_BARE), so it can never reach the real origin
+# regardless of CWD, while still updating VAL_REPO's origin/main tracking ref
+# that the sable_validate_base_ref tests below rely on.
+cd "$VAL_REPO" || { echo "FATAL: cd to fixture repo $VAL_REPO failed — aborting so fixture git ops never touch the real worktree/origin"; exit 1; }
+git -C "$VAL_REPO" config user.email "v@test"
+git -C "$VAL_REPO" config user.name "Validator"
 echo "x" > f.txt
 git add f.txt
 git commit -q -m "init"
-git push -q origin HEAD:refs/heads/main 2>/dev/null
+git -C "$VAL_REPO" push -q origin HEAD:refs/heads/main 2>/dev/null
 cd - >/dev/null
 
 validate_ref_test() {
@@ -580,6 +683,45 @@ rm -f "$INT_REPO/.sable"
 
 resolve_int_test "sable_resolve_integration_branch: empty repo path falls back to env" \
   "" "SABLE_INTEGRATION_BRANCH=foo" "foo"
+
+# --------------------------------------------------------------------------
+# sable_resolve_test_command unit tests (SABLE-hml)
+# Mirrors sable_resolve_integration_branch's precedence: repo-local git
+# config wins over the checked-in .sable file wins over the legacy env
+# override; empty everywhere falls back to "" (caller does manifest
+# auto-detection).
+# --------------------------------------------------------------------------
+resolve_testcmd_test() {
+  local label="$1" repo="$2" env_assignments="$3" expect="$4" got
+  got=$(env -u SABLE_TEST_COMMAND $env_assignments bash -c "source '$LIB'; sable_resolve_test_command '$repo'")
+  if [ "$got" = "$expect" ]; then
+    pass "$label"
+  else
+    fail "$label" "expected [$expect] got [$got]"
+  fi
+}
+
+resolve_testcmd_test "sable_resolve_test_command: no config anywhere returns empty" \
+  "$INT_REPO" "" ""
+
+resolve_testcmd_test "sable_resolve_test_command: falls back to SABLE_TEST_COMMAND env" \
+  "$INT_REPO" "SABLE_TEST_COMMAND=pytest" "pytest"
+
+echo "testCommand=for f in hooks/test/test-*.sh; do bash \$f; done" > "$INT_REPO/.sable"
+resolve_testcmd_test "sable_resolve_test_command: .sable file wins over session env" \
+  "$INT_REPO" "SABLE_TEST_COMMAND=pytest" 'for f in hooks/test/test-*.sh; do bash $f; done'
+
+git -C "$INT_REPO" config sable.testCommand "make test"
+resolve_testcmd_test "sable_resolve_test_command: repo-local git config wins over .sable file" \
+  "$INT_REPO" "" "make test"
+git -C "$INT_REPO" config --unset sable.testCommand
+rm -f "$INT_REPO/.sable"
+
+resolve_testcmd_test "sable_resolve_test_command: empty repo path falls back to env" \
+  "" "SABLE_TEST_COMMAND=pytest" "pytest"
+
+resolve_testcmd_test "sable_resolve_test_command: empty repo path with no env returns empty" \
+  "" "" ""
 
 # --------------------------------------------------------------------------
 # sable_resolve_push_repo_dir unit tests (SABLE-041)

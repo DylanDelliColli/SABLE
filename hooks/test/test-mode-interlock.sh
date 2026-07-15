@@ -110,6 +110,12 @@ assert_deny  "planning blocks chuck spawn"    'CLAUDE_AGENT_NAME=chuck CLAUDE_AG
 assert_deny  "planning blocks alias optimus"  'optimus'
 assert_deny  "planning blocks git push"       'git push'
 assert_deny  "planning blocks git push origin" 'git push origin personal-tooling'
+# SABLE-sxhx: a real push chained via an UNSPACED separator must not slip the
+# planning-mode deny leg (the old bespoke tokenizer split these; the delegated
+# sable_is_git_push regressed until punctuation_chars tokenization).
+assert_deny  "planning blocks unspaced 'git push;ls'"  'git push;ls'
+assert_deny  "planning blocks unspaced 'git push&&ls'" 'git push&&ls'
+assert_deny  "planning blocks unspaced 'ls;git push'"  'ls;git push'
 assert_allow "planning allows producer spawn" 'CLAUDE_AGENT_NAME=sherlock CLAUDE_AGENT_ROLE=auditor claude src/auth'
 assert_allow "planning allows benign command" 'ls -la'
 assert_allow "planning allows bd commands"    'bd ready'
@@ -535,6 +541,96 @@ assert_deny  "pi5m: planning blocks assignment-prefixed sable-spawn-manager" \
   'FOO=bar sable-spawn-manager --all'
 set_mode planning
 
+# ---------- SABLE-qfvn / SABLE-ykij: git-push & sable-mode prose false-positives ----------
+# The git-push deny legs and the sable-mode exemption used the SAME plain-space
+# [[:space:]] boundary that pi5m removed from the name/helper legs, so quoted
+# prose false-matched. Three fixes, verified here:
+#  (qfvn/ykij def1) planning ALLOWS bd create / sable-note / sable-msg whose PROSE
+#     merely names "git push" — is_git_push tokenizes and only a real git-push
+#     invocation in command-word position is denied.
+#  (qfvn) a bare `git push` and a `git -C DIR push` stay DENIED (the latter was a
+#     MISS in the old adjacent-only `git[[:space:]]+push` regex — a wrong-tree push).
+#  (ykij def2) the sable-mode exemption is anchored to a real LEADING sable-mode
+#     command, so a bd create whose description names sable-mode no longer
+#     short-circuits the main leg and bypasses the backlog-population gate.
+set_mode planning
+
+# def1: prose naming "git push" is ALLOWED in planning
+assert_allow "qfvn: planning allows bd create naming git push in --description" \
+  'bd create --type=task --title="x" --description="then run git push after the remote-branch cleanup"'
+assert_allow "ykij: planning allows sable-note naming git push" \
+  'sable-note "mode-interlock false positive: git push blocked in prose"'
+assert_allow "ykij: planning allows sable-msg prose naming git push (mid-sentence)" \
+  'sable-msg optimus "remember to git push after execute"'
+assert_allow "qfvn: planning allows plain bd create naming git push in prose" \
+  'bd create --type=task --title="note" --description="repro: git push was denied here"'
+
+# qfvn: real pushes still DENIED in planning, including git -C DIR push (old MISS)
+assert_deny  "qfvn: planning still blocks bare git push"         'git push'
+assert_deny  "qfvn: planning still blocks git -C dir push"       'git -C /home/ddc/dev-environment/wk-x push'
+assert_deny  "qfvn: planning still blocks chained git push"      'bd create --type=task --title="x" && git push'
+assert_deny  "qfvn: planning still blocks env-prefixed git push" 'GIT_SSH_COMMAND=x git push origin wk-y'
+
+# ---------- SABLE-f5m0: git-SUBCOMMAND false positives on a bare 'push' token ----------
+# The qfvn/ykij tokenizer checked `seg[i]=='git' and 'push' in seg[i+1:]` — push
+# as ANY later token in the segment, not the git SUBCOMMAND. So a git subcommand
+# that merely carries a bare "push" argument (a --grep value, a commit message,
+# a branch name) was wrongly DENIED in planning. is_git_push now delegates to
+# sable_is_git_push (lib-identity.sh), which only matches when the first
+# non-flag token after git's global flags is exactly the subcommand `push`.
+assert_allow "f5m0: planning allows git log --grep push (push is a --grep value, not the subcommand)" \
+  'git log --grep push'
+assert_allow "f5m0: planning allows git commit -m push (push is the commit message, not the subcommand)" \
+  'git commit -m push'
+assert_allow "f5m0: planning allows git checkout push (a branch literally named push)" \
+  'git checkout push'
+assert_allow "f5m0: planning allows git branch push (naming, not pushing, a branch)" \
+  'git branch push'
+
+# f5m0: real pushes stay DENIED — subcommand precision must not soften the gate
+assert_deny  "f5m0: planning still blocks bare git push"                'git push'
+assert_deny  "f5m0: planning still blocks git -C DIR push"              'git -C /home/ddc/dev-environment/wk-x push'
+assert_deny  "f5m0: planning still blocks env-prefixed git push"        'GIT_SSH_COMMAND=x git push origin wk-y'
+assert_deny  "f5m0: planning still blocks chained git push after bd create" \
+  'bd create --type=task --title="x" && git push'
+
+# ---------- SABLE-qs3r: git push on its OWN LINE of a multi-line command ----------
+# f5m0's delegation to sable_is_git_push regressed newline handling: shlex.split
+# treats a newline as plain whitespace, so a push on line 2+ was walked as if
+# mid-command and MISSED — a real push slipped the planning-mode gate. The gate
+# must now DENY a push on its own line while still ALLOWING multi-line prose /
+# non-push subcommands that merely name push.
+assert_deny  "qs3r: planning blocks git push on line 2 of a multi-line command" \
+  "$(printf 'echo preparing the remote\ngit push origin main')"
+assert_deny  "qs3r: planning blocks git -C DIR push on its own line" \
+  "$(printf 'bd update x --claim\ngit -C /home/ddc/dev-environment/wk-x push')"
+assert_allow "qs3r: planning allows multi-line command with no real push" \
+  "$(printf 'echo one\ngit status\ngit log --grep push')"
+assert_allow "qs3r: planning allows multi-line prose that only names git push" \
+  "$(printf 'bd create --type=task --title=x\nsable-note "remember to git push after execute"')"
+
+# ykij def2: sable-mode exemption anchored to a real LEADING sable-mode command.
+# A bd create whose description NAMES sable-mode must NOT bypass the backlog gate.
+set_mode planning   # substage=framing
+assert_deny  "ykij: framing blocks --parent child whose --description names sable-mode" \
+  'bd create --type=task --parent=SABLE-ni8 --title="x" --description="then run sable-mode set execution"'
+assert_deny  "ykij: framing blocks graph create whose --description names sable-mode" \
+  'bd create --graph /tmp/plan.json --description="advance via sable-mode substage advance"'
+# a REAL sable-mode invocation stays exempt (and does not trip the backlog gate)
+assert_allow "ykij: framing allows a real sable-mode set command"      'sable-mode set execution'
+assert_allow "ykij: framing allows a real sable-mode substage advance" 'sable-mode substage advance'
+# ykij def2 corollary: a chained `git push && sable-mode …` must NOT win exemption
+# for its push (leading_cmd is git, not sable-mode)
+assert_deny  "ykij: planning blocks git push chained before a real sable-mode" \
+  'git push && sable-mode set execution'
+
+# execution mode: prose still allowed, real push still allowed (regression)
+set_mode execution
+assert_allow "qfvn: execution allows sable-msg prose naming git push" \
+  'sable-msg lincoln "worker will git push its branch"'
+assert_allow "qfvn: execution still allows real git push"            'git push origin wk-y'
+set_mode planning
+
 # ---------- SABLE-tz7h.3: producer identity deny-leg ----------
 # CLAUDE_AGENT_ROLE=producer (sherlock/victor/columbo/gaudi/rudy) is a
 # read-only analysis identity: denied from dispatching workers, standing up
@@ -604,6 +700,27 @@ set_mode planning
 out_mgr_spawn="$(printf '%s' '{"tool_input":{"command":"sable-spawn-worker SABLE-x --worktree /wt --force"}}' | CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
 if is_deny "$out_mgr_spawn"; then fail "non-producer (manager) sable-spawn-worker --force still honored (unaffected)" "got deny: $out_mgr_spawn"; else pass "non-producer (manager) sable-spawn-worker --force still honored (unaffected)"; fi
 set_mode planning
+
+# ---------- SABLE-qfvn / SABLE-ykij: producer leg git-push via is_git_push ----------
+# The producer git-push deny leg now uses is_git_push too: prose merely NAMING
+# "git push" in a read-only sable-note / sable-msg is ALLOWED, while a real push
+# — including a git -C DIR push (an old adjacent-regex MISS) and a chained push —
+# stays DENIED for the producer identity regardless of mode.
+assert_allow_role "producer allowed sable-note naming git push (prose, read-only)" \
+  'sable-note "a producer cannot git push; findings go through beads"'
+assert_allow_role "producer allowed sable-msg prose naming git push" \
+  'sable-msg lincoln "the worker will git push its own branch"'
+assert_deny_role  "producer denied git -C dir push (old adjacent-regex MISS)" \
+  'git -C /home/ddc/dev-environment/wk-x push'
+assert_deny_role  "producer denied chained git push after bd create" \
+  'bd create --type=task --title="x" && git push'
+
+# SABLE-f5m0: the producer leg shares is_git_push too — a git subcommand
+# carrying a bare "push" token (not the subcommand itself) must not be denied.
+assert_allow_role "f5m0: producer allowed git log --grep push (push is a --grep value)" \
+  'git log --grep push'
+assert_allow_role "f5m0: producer allowed git commit -m push (push is the commit message)" \
+  'git commit -m push'
 
 # ---------- settings-snippet registration ----------
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
@@ -676,6 +793,51 @@ assert_deny_cwd  "plan repo (by cwd) blocks git push"        'git push' "$REPO_P
 assert_allow_cwd "exec repo (by cwd) allows git push"        'git push' "$REPO_EXEC"
 
 rm -rf "$REPO_EXEC" "$REPO_PLAN"
+
+# ---------- SABLE-59t6.1: classify_target via the PROJECT registry ----------
+# With NO SABLE_AGENTS_YAML override and an EMPTY $HOME, classify_target must
+# resolve the spawn target's type from the REPO's own .claude/sable/agents.yaml
+# (project-first, per-repo). Without project-first resolution it would fail open
+# (target=free) and a producer spawn in execution mode would be wrongly ALLOWED.
+# The repo also carries its own execution mode-state (per-repo mode, SABLE-5hck.3).
+PROJ_EXEC="$(mk_modes_repo)"
+mkdir -p "$PROJ_EXEC/.claude/sable"
+cat > "$PROJ_EXEC/.claude/sable/agents.yaml" <<'YAML'
+agents:
+  optimus:
+    type: epic_manager
+  columbo:
+    type: test_planner
+YAML
+( cd "$PROJ_EXEC" && env -u SABLE_MODE_STATE "$MODE_BIN" set execution >/dev/null 2>&1 )
+PROJ_EMPTY_HOME="$(mktemp -d)"
+
+# Producer (columbo, test_planner) spawned in execution → DENY only if the
+# project registry is consulted; fail-open would classify it "free" and ALLOW.
+proj_prod="$(python3 -c "
+import json, sys
+print(json.dumps({'tool_name':'Agent','tool_input':{'subagent_type':'columbo','prompt':'x','description':'y'},'cwd':sys.argv[1]}))
+" "$PROJ_EXEC" | env -u SABLE_MODE_STATE -u SABLE_AGENTS_YAML HOME="$PROJ_EMPTY_HOME" CLAUDE_AGENT_NAME=cockpit bash "$HOOK" 2>/dev/null)"
+if is_deny "$proj_prod"; then
+  pass "59t6.1: classify_target resolves producer via project registry (deny), not fail-open"
+else
+  fail "59t6.1: classify_target resolves producer via project registry (deny), not fail-open" \
+    "got: ${proj_prod:-<empty>}"
+fi
+
+# Control: an UNREGISTERED target in the same project registry is still free
+# (ALLOW) — proves the deny above is the registry classifying columbo, not a
+# blanket execution-mode block on every Agent spawn.
+proj_free="$(python3 -c "
+import json, sys
+print(json.dumps({'tool_name':'Agent','tool_input':{'subagent_type':'general-purpose','prompt':'x','description':'y'},'cwd':sys.argv[1]}))
+" "$PROJ_EXEC" | env -u SABLE_MODE_STATE -u SABLE_AGENTS_YAML HOME="$PROJ_EMPTY_HOME" CLAUDE_AGENT_NAME=cockpit bash "$HOOK" 2>/dev/null)"
+if is_deny "$proj_free"; then
+  fail "59t6.1: unregistered target stays free under project registry (allow)" "got deny: $proj_free"
+else
+  pass "59t6.1: unregistered target stays free under project registry (allow)"
+fi
+rm -rf "$PROJ_EXEC" "$PROJ_EMPTY_HOME"
 
 echo
 echo "=========================================="

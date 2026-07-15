@@ -228,6 +228,31 @@ else
   fi
 fi
 
+# --- Test 6b (SABLE-gga): sable-<word> filenames/skills are NOT treated as
+# bead IDs — regression for the over-broad BEAD_IDS regex matching hyphenated
+# filenames like sable-execute, sable-orchestration-install, sable-teams-preflight
+# as if they were bead IDs (false 'unlabeled bead' friction on SABLE-on-SABLE
+# dispatches). Prompt has NO real bead ID, so no bd show/update should fire.
+: > "$BD_CALL_LOG"
+run_hook_as_manager "Dispatching Optimus: run sable-execute, sable-orchestration-install, and sable-teams-preflight to check drift."
+if grep -q 'BD_CALLED: show\|BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+  fail "sable-execute/sable-orchestration-install/sable-teams-preflight not treated as bead IDs" \
+       "bd calls: $(cat "$BD_CALL_LOG")"
+else
+  pass "sable-execute/sable-orchestration-install/sable-teams-preflight not treated as bead IDs"
+fi
+
+# --- Test 6c (SABLE-gga): a real bead ID alongside sable-* filenames is still
+# extracted and claimed — the fix must not over-correct into missing real IDs.
+: > "$BD_CALL_LOG"
+run_hook_as_manager "SABLE-xyz: run sable-execute and sable-teams-preflight — hooks/foo.sh needs updating"
+if grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+  pass "real bead ID alongside sable-* filenames still claimed"
+else
+  fail "real bead ID alongside sable-* filenames still claimed" \
+       "bd call log: $(cat "$BD_CALL_LOG" 2>/dev/null || echo '(empty)')"
+fi
+
 # --- Test 7 (SABLE-uz9.9): MANAGER-subagent dispatch → governance RUNS ---
 # A subagent whose agent_type is a registered manager (optimus) now dispatches
 # workers natively. The hook must NOT stand down — it claims like a manager,
@@ -264,6 +289,88 @@ else
   pass "worker-subagent (agent_type=general-purpose) → stands down"
 fi
 
+# --- Test 9 (SABLE-lfql): the bd update --notes call carries --sandbox ---
+# bd auto-pushes to the shared Dolt remote on every mutating write
+# (create/update/close) by default (SABLE-rq9k); without --sandbox this hook
+# pushed WIP-CLAIMS bookkeeping to the remote as a pure hook side effect on
+# EVERY dispatch — the exact chuck-only-convention violation behind the
+# 2026-07-09 cross-fleet corruption incident.
+: > "$BD_CALL_LOG"
+run_hook_as_manager "SABLE-xyz: implement hooks/foo.sh"
+UPDATE_LINE_LFQL=$(grep 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null | head -1)
+if echo "$UPDATE_LINE_LFQL" | grep -q -- '--sandbox'; then
+  pass "SABLE-lfql: bd update --notes call carries --sandbox (Dolt auto-push disabled)"
+else
+  fail "SABLE-lfql: bd update --notes call carries --sandbox (Dolt auto-push disabled)" \
+       "update line: ${UPDATE_LINE_LFQL:-<none>}"
+fi
+
+# ---------------------------------------------------------------------------
+# SABLE-lfql / SABLE-rq9k: hermetic push-prevention regression guard.
+# Same modeling technique as the sibling test in test-post-push-merge-notify.sh
+# (search "SABLE-rq9k" there for the full rationale): a live dolt sql-server +
+# file remote is the gold-standard fixture, but this suite stays hermetic. A
+# bd stub advances a simulated remote tip on a mutating `update` UNLESS
+# --sandbox is present; the property that matters is the tip staying
+# unchanged after the hook writes WIP-CLAIMS.
+# ---------------------------------------------------------------------------
+cat > "$STUB_DIR/bd" <<'STUB'
+#!/usr/bin/env bash
+echo "BD_CALLED: $*" >> "$BD_CALL_LOG"
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  echo '[{"id":"SABLE-stub","description":"hooks/foo.sh is the implementation","notes":""}]'
+  exit 0
+fi
+if [ "$1" = "update" ]; then
+  sandbox=0
+  for a in "$@"; do [ "$a" = "--sandbox" ] && sandbox=1; done
+  [ "$sandbox" -eq 0 ] && printf 'remote-advanced\n' >> "${DOLT_REMOTE_TIP:-/dev/null}"
+fi
+exit 0
+STUB
+chmod +x "$STUB_DIR/bd"
+
+LFQL_TIP="$FIXTURE_DIR/dolt-remote-tip"
+: > "$LFQL_TIP"
+: > "$BD_CALL_LOG"
+make_dispatch_input "SABLE-xyz: implement hooks/foo.sh" | \
+  env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
+      SABLE_AGENTS_YAML="$AGENTS_YAML" \
+      SABLE_MODE_STATE="$EXEC_MODE_FILE" \
+      BD_CALL_LOG="$BD_CALL_LOG" \
+      DOLT_REMOTE_TIP="$LFQL_TIP" \
+      PATH="$STUB_DIR:$PATH" \
+      bash "$HOOK" 2>/dev/null
+
+# Precondition: the WIP-CLAIMS update really was attempted (so a pass below is
+# not vacuous from the hook exiting before bd update).
+if grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+  pass "SABLE-lfql: WIP-CLAIMS update is attempted (precondition)"
+else
+  fail "SABLE-lfql: WIP-CLAIMS update is attempted (precondition)" "BD_CALL_LOG: $(cat "$BD_CALL_LOG" 2>/dev/null)"
+fi
+
+if [ ! -s "$LFQL_TIP" ]; then
+  pass "SABLE-lfql: hook's WIP-CLAIMS write performs NO dolt remote sync (remote tip unchanged)"
+else
+  fail "SABLE-lfql: hook's WIP-CLAIMS write performs NO dolt remote sync (remote tip unchanged)" \
+       "remote tip advanced — bd update auto-pushed (missing --sandbox): $(cat "$LFQL_TIP" 2>/dev/null)"
+fi
+rm -f "$LFQL_TIP"
+
+# Restore the plain stub for hermeticity (the real-bd integration section below
+# does not use $STUB_DIR, but keep PATH state predictable for future tests).
+cat > "$STUB_DIR/bd" <<'STUB'
+#!/usr/bin/env bash
+echo "BD_CALLED: $*" >> "$BD_CALL_LOG"
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  echo '[{"id":"SABLE-stub","description":"hooks/foo.sh is the implementation","notes":""}]'
+  exit 0
+fi
+exit 0
+STUB
+chmod +x "$STUB_DIR/bd"
+
 # ---------------------------------------------------------------------------
 # INTEGRATION TEST — real bd in the project repo
 # ---------------------------------------------------------------------------
@@ -275,7 +382,7 @@ if ! command -v bd >/dev/null 2>&1; then
   echo "SKIP (integration): bd not found on PATH"
 else
   # Create a scratch bead with a description mentioning hooks/foo.sh
-  SCRATCH_ID=$(bd create \
+  SCRATCH_ID=$(bd create --sandbox \
     --title="[int-test] pre-dispatch-claim scratch bead" \
     --description="hooks/foo.sh is the implementation file for this scratch bead" \
     --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
@@ -285,7 +392,7 @@ else
   else
     echo "Integration: created scratch bead $SCRATCH_ID"
     # Add [no-test] immediately so tdd-gate won't block the close at the end
-    bd update "$SCRATCH_ID" --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
+    bd update "$SCRATCH_ID" --sandbox --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
 
     # Run real hook with scratch bead ID in the dispatch prompt.
     # Do NOT use stub bd — use real bd so WIP-CLAIMS is written to the real DB.
@@ -314,14 +421,14 @@ except Exception:
     fi
 
     # Clean up: close the scratch bead
-    bd close "$SCRATCH_ID" 2>/dev/null || true
+    bd close "$SCRATCH_ID" --sandbox 2>/dev/null || true
   fi
 
   # --- Integration (SABLE-uz9.9): MANAGER-SUBAGENT native dispatch, real bd ---
   # The new path with NO env identity: identity is purely the subagent
   # agent_type=optimus. Proves the real hook + real lib-identity + real bd DB
   # compose to land WIP-CLAIMS for a manager-subagent dispatch.
-  SCRATCH_ID2=$(bd create \
+  SCRATCH_ID2=$(bd create --sandbox \
     --title="[int-test] pre-dispatch-claim manager-subagent scratch" \
     --description="hooks/foo.sh is the implementation file for this scratch bead" \
     --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
@@ -330,7 +437,7 @@ except Exception:
     echo "SKIP (integration): could not create manager-subagent scratch bead"
   else
     echo "Integration: created manager-subagent scratch bead $SCRATCH_ID2"
-    bd update "$SCRATCH_ID2" --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
+    bd update "$SCRATCH_ID2" --sandbox --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
 
     make_manager_subagent_input "${SCRATCH_ID2}: implement the feature — hooks/foo.sh needs updating" "optimus" | \
       env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE \
@@ -355,7 +462,7 @@ except Exception:
            "notes: '$NOTES2'"
     fi
 
-    bd close "$SCRATCH_ID2" 2>/dev/null || true
+    bd close "$SCRATCH_ID2" --sandbox 2>/dev/null || true
   fi
 fi
 

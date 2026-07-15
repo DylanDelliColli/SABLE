@@ -23,7 +23,7 @@ trap cleanup EXIT
 TH="$(mktemp -d)"; TH2="$(mktemp -d)"; TH3="$(mktemp -d)"
 
 # --- INTEGRATION: the plain install lands the multi-manager layer (no tiers) ---
-HOME="$TH" bash "$INSTALL" >/dev/null 2>&1 || true
+HOME="$TH" bash "$INSTALL" --from-here >/dev/null 2>&1 || true
 if [ -f "$TH/.claude/hooks/multi-manager/lib-identity.sh" ] && \
    [ -f "$TH/.claude/hooks/multi-manager/pre-dispatch-refresh.sh" ] && \
    [ -f "$TH/.claude/hooks/multi-manager/mode-interlock.sh" ]; then
@@ -48,14 +48,14 @@ else
 fi
 
 # --- DRY-RUN: copies nothing ---
-out="$(HOME="$TH2" bash "$INSTALL" --dry-run 2>&1 || true)"
+out="$(HOME="$TH2" bash "$INSTALL" --dry-run --from-here 2>&1 || true)"
 if [ ! -e "$TH2/.claude/hooks/multi-manager" ]; then pass "--dry-run copies no multi-manager hooks"; else fail "--dry-run copies no multi-manager hooks" "dir was created"; fi
 if [ ! -e "$TH2/.claude/skills/sable-plan" ]; then pass "--dry-run installs no skills"; else fail "--dry-run installs no skills" "skills dir created"; fi
 if echo "$out" | grep -qiE "dry.run|would (copy|install)"; then pass "--dry-run output marks it as a dry run"; else fail "--dry-run output marks it as a dry run" "got: $(echo "$out" | head -3)"; fi
 
 # --- RETIRED TIER FLAGS: rejected, install nothing (SABLE-ssws.1) ---
 for _flag in --orchestration --foundation; do
-  if HOME="$TH3" bash "$INSTALL" "$_flag" >/dev/null 2>&1; then
+  if HOME="$TH3" bash "$INSTALL" "$_flag" --from-here >/dev/null 2>&1; then
     fail "retired tier flag $_flag is rejected" "install.sh exited 0"
   else
     pass "retired tier flag $_flag is rejected"

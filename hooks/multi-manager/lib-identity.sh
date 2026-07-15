@@ -35,8 +35,9 @@
 #   Unregistered subagent types (Explore, general-purpose, code-reviewer, ...)
 #   are workers: never managers, hooks stand down for them.
 #
-# Registry path: ~/.claude/sable/agents.yaml (override with SABLE_AGENTS_YAML,
-# used by tests). Parsed with awk — no python-yaml dependency.
+# Registry path: project-first via sable_registry_path (SABLE_AGENTS_YAML
+# override, else the repo's own agents.yaml, else ~/.claude/sable/agents.yaml —
+# see lib-registry-path.sh). Parsed with awk — no python-yaml dependency.
 
 # Per-repo mode-state resolver (SABLE-5hck), used by sable_resolve_dispatch_lane.
 # Sourced as a sibling; guard keeps re-sourcing lib-identity idempotent and won't
@@ -44,6 +45,13 @@
 if ! declare -f sable_mode_state_path >/dev/null 2>&1; then
   # shellcheck source=lib-mode-path.sh
   . "$(dirname "${BASH_SOURCE[0]:-$0}")/lib-mode-path.sh"
+fi
+
+# Project-first agent-registry resolver (SABLE-59t6.1), used by the registry
+# lookups below. Sourced as a sibling under the same idempotency guard.
+if ! declare -f sable_registry_path >/dev/null 2>&1; then
+  # shellcheck source=lib-registry-path.sh
+  . "$(dirname "${BASH_SOURCE[0]:-$0}")/lib-registry-path.sh"
 fi
 
 sable_resolve_identity() {
@@ -82,7 +90,7 @@ print(d.get('agent_type', '') or '')
 
   [ -z "$SABLE_ID_NAME" ] && return 0
 
-  local yaml="${SABLE_AGENTS_YAML:-${HOME:-}/.claude/sable/agents.yaml}"
+  local yaml; yaml="$(sable_registry_path)"
   if [ -f "$yaml" ]; then
     SABLE_ID_TYPE=$(awk -v name="$SABLE_ID_NAME" '
       $0 == "  " name ":" { found = 1; next }
@@ -123,7 +131,7 @@ sable_instance_base_manager() {
   local name="${1:-}"
   [[ "$name" =~ ^(.+)-[0-9]+$ ]] || return 1
   local base="${BASH_REMATCH[1]}"
-  local yaml="${SABLE_AGENTS_YAML:-${HOME:-}/.claude/sable/agents.yaml}"
+  local yaml; yaml="$(sable_registry_path)"
   [ -f "$yaml" ] || return 1
   local type
   type=$(awk -v name="$base" '
@@ -173,6 +181,24 @@ sable_instance_base_manager() {
 #       --no-optional-locks, --exec-path=*, --html-path, --man-path, --info-path,
 #       --version, --help.
 #     - If the next non-flag token is exactly `push`, return 0.
+#
+# Multi-line handling (SABLE-qs3r):
+#   shlex.split treats a newline as ordinary whitespace, not a command separator,
+#   so a `git push` sitting on its OWN LINE of a multi-line command (line 1 =
+#   `echo preparing`, line 2 = `git push origin main`) would otherwise be walked
+#   as if it were mid-command and MISSED. To close that gate false-negative we run
+#   the walk over two token sources and match if EITHER sees a push at command
+#   position:
+#     Pass 1 — the whole command tokenized once (catches ; && || | separators and
+#       a push that follows a quote spanning physical lines, e.g.
+#       `bd create --description="a\nb" ; git push`).
+#     Pass 2 — each physical line tokenized independently (an unquoted newline is
+#       a command boundary, so a push on its own line is caught). A line whose
+#       quotes don't balance on their own raises ValueError and is skipped — a
+#       push genuinely buried inside a multi-line quoted string is not a command,
+#       and any real push on a later line is still caught by its own line.
+#   For single-line commands (every real post-push / pre-push caller) both passes
+#   are identical, so behaviour there is unchanged.
 sable_is_git_push() {
   local cmd="${1:-}"
   [ -z "$cmd" ] && return 1
@@ -180,10 +206,6 @@ sable_is_git_push() {
 import os, re, shlex, sys
 
 cmd = os.environ.get('CMD_STR', '')
-try:
-    tokens = shlex.split(cmd)
-except ValueError:
-    sys.exit(1)
 
 SHELL_SEPS = {';', '&&', '||', '|'}
 # git global flags that consume the next token as an argument
@@ -200,51 +222,85 @@ STANDALONE_PREFIXES = ('--exec-path=', '--git-dir=', '--work-tree=', '--namespac
 
 ENV_ASSIGN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
-i = 0
-n = len(tokens)
-# Track whether we are at a command-position (start or after separator)
-at_cmd_pos = True
-while i < n:
-    tok = tokens[i]
-    if tok in SHELL_SEPS:
-        at_cmd_pos = True
+
+def walk(tokens):
+    # Walk a token list; return True iff it contains a git push at command position.
+    i = 0
+    n = len(tokens)
+    # Track whether we are at a command-position (start or after separator)
+    at_cmd_pos = True
+    while i < n:
+        tok = tokens[i]
+        if tok in SHELL_SEPS:
+            at_cmd_pos = True
+            i += 1
+            continue
+        # At command position: transparent env-assignment prefix (NAME=VALUE)
+        if at_cmd_pos and ENV_ASSIGN_RE.match(tok):
+            i += 1  # consume assignment, stay at command position
+            continue
+        # At command position: env(1) prefix — consume it and its own options
+        if at_cmd_pos and tok == 'env':
+            i += 1
+            while i < n:
+                t = tokens[i]
+                if ENV_ASSIGN_RE.match(t):
+                    i += 1   # env NAME=VALUE — consume, stay in env-option walk
+                    continue
+                if t == '-u' and i + 1 < n:
+                    i += 2   # env -u NAME — consume both, stay in env-option walk
+                    continue
+                break        # next token is the real command — fall through to outer loop
+            continue         # re-evaluate tokens[i] at command position (at_cmd_pos still True)
+        if at_cmd_pos and tok == 'git':
+            # Found git at command position — now walk flags
+            i += 1
+            while i < n:
+                t = tokens[i]
+                if t in CONSUME_NEXT:
+                    i += 2  # skip flag + its argument
+                    continue
+                if t in STANDALONE or any(t.startswith(p) for p in STANDALONE_PREFIXES):
+                    i += 1
+                    continue
+                # Not a known flag — this must be the subcommand
+                return t == 'push'
+            # Ran out of tokens after git — no subcommand found
+            return False
+        # Not at command position or not git/env/assignment
+        at_cmd_pos = False
         i += 1
-        continue
-    # At command position: transparent env-assignment prefix (NAME=VALUE)
-    if at_cmd_pos and ENV_ASSIGN_RE.match(tok):
-        i += 1  # consume assignment, stay at command position
-        continue
-    # At command position: env(1) prefix — consume it and its own options
-    if at_cmd_pos and tok == 'env':
-        i += 1
-        while i < n:
-            t = tokens[i]
-            if ENV_ASSIGN_RE.match(t):
-                i += 1   # env NAME=VALUE — consume, stay in env-option walk
-                continue
-            if t == '-u' and i + 1 < n:
-                i += 2   # env -u NAME — consume both, stay in env-option walk
-                continue
-            break        # next token is the real command — fall through to outer loop
-        continue         # re-evaluate tokens[i] at command position (at_cmd_pos still True)
-    if at_cmd_pos and tok == 'git':
-        # Found git at command position — now walk flags
-        i += 1
-        while i < n:
-            t = tokens[i]
-            if t in CONSUME_NEXT:
-                i += 2  # skip flag + its argument
-                continue
-            if t in STANDALONE or any(t.startswith(p) for p in STANDALONE_PREFIXES):
-                i += 1
-                continue
-            # Not a known flag — this must be the subcommand
-            sys.exit(0 if t == 'push' else 1)
-        # Ran out of tokens after git — no subcommand found
-        sys.exit(1)
-    # Not at command position or not git/env/assignment
-    at_cmd_pos = False
-    i += 1
+    return False
+
+
+def tokenize(s):
+    # SABLE-sxhx: plain shlex.split only treats ; && || | as separators when
+    # they are whitespace-delimited from adjacent tokens
+    # (shlex.split('git push;ls') -> ['git', 'push;ls']), so a real push chained
+    # via an UNSPACED separator was walked as mid-command and MISSED. shlex.shlex
+    # with punctuation_chars=';&|' + whitespace_split=True returns each run of
+    # separator chars as its own token (';', '&&', '||', '|') even when unspaced,
+    # while leaving separators inside quotes untouched and producing output
+    # identical to shlex.split for every non-separator case. The separator tokens
+    # land in SHELL_SEPS, so the walk (below) resets command position correctly.
+    try:
+        lexer = shlex.shlex(s, posix=True, punctuation_chars=';&|')
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+# Pass 1: whole command as one token stream (; && || | separators; newlines
+# inside quotes preserved). Pass 2: each physical line independently so an
+# unquoted newline acts as a command boundary. Match if EITHER sees a push.
+whole = tokenize(cmd)
+if whole is not None and walk(whole):
+    sys.exit(0)
+for line in cmd.split('\n'):
+    toks = tokenize(line)
+    if toks is not None and walk(toks):
+        sys.exit(0)
 sys.exit(1)
 " 2>/dev/null
 }
@@ -401,6 +457,56 @@ sable_resolve_integration_branch() {
 
   val="${SABLE_INTEGRATION_BRANCH:-${SABLE_BASE_BRANCH:-origin/main}}"
   printf '%s' "${val#origin/}"
+  return 0
+}
+
+# sable_resolve_test_command <repo-path>
+#
+# Resolves the pre-push TEST-phase command for <repo-path> (SABLE-hml).
+# detect_test_cmd in pre-push-rebase-test.sh previously only checked
+# $SABLE_TEST_COMMAND then a fixed set of manifest files (package.json,
+# pyproject.toml, Cargo.toml, go.mod) — a bash/hook repo like SABLE itself
+# matches none of those, so pushes silently skipped the test gate entirely
+# (live incident: chuck, 2026-07-07, the TDD-enforcement hooks batch itself
+# shipped untested). Mirrors sable_resolve_integration_branch's precedence —
+# repo-local config wins over checked-in config wins over the legacy env
+# override, same rationale as market-brief-package-2u25 / SABLE-92kc: a
+# session's $SABLE_TEST_COMMAND is set once per project and otherwise leaks
+# unchanged into every other repo that session's manager ever pushes.
+# Consulted in order, first match wins:
+#   1. `git -C <repo-path> config --get sable.testCommand` (repo-local,
+#      unshared — the machine's own override for this checkout)
+#   2. `<repo-path>/.sable` file, a line `testCommand=<cmd>` (checked into
+#      the repo, shared across clones)
+#   3. $SABLE_TEST_COMMAND (explicit env override, legacy)
+#   4. "" (empty — caller falls back to manifest auto-detection)
+# Always prints (possibly empty) and returns 0.
+sable_resolve_test_command() {
+  local repo_path="${1:-}"
+  local val
+
+  if [ -n "$repo_path" ]; then
+    val=$(git -C "$repo_path" config --get sable.testCommand 2>/dev/null || true)
+    if [ -n "$val" ]; then
+      printf '%s' "$val"
+      return 0
+    fi
+
+    if [ -f "$repo_path/.sable" ]; then
+      val=$(sed -n 's/^testCommand=//p' "$repo_path/.sable" 2>/dev/null | head -1)
+      if [ -n "$val" ]; then
+        printf '%s' "$val"
+        return 0
+      fi
+    fi
+  fi
+
+  if [ -n "${SABLE_TEST_COMMAND:-}" ]; then
+    printf '%s' "$SABLE_TEST_COMMAND"
+    return 0
+  fi
+
+  printf ''
   return 0
 }
 

@@ -1,0 +1,129 @@
+# ci-verify — the full-suite authority for the merge-preview ci-verify gate
+# (bin/sable-merge-gate, SABLE-o9aa). Until this workflow existed the repo had
+# NO .github/workflows at all, so sable-merge-gate's wait_for_ci found no run
+# keyed to its merge-preview SHA and returned actions_down on every call
+# (exit 21) — the gate was dead code, usable only via --override. This workflow
+# is what makes the gate live (SABLE-oeci).
+#
+# ── Trigger (load-bearing) ───────────────────────────────────────────────────
+# sable-merge-gate pushes a merge-preview commit to a throwaway ref
+# ci-verify/<bead>-<sha7> and polls `gh run list --branch <that ref>` for a run
+# whose headSha equals the preview SHA. So this MUST fire on push to
+# ci-verify/**. (The mbp analogue first shipped without it and every drain got
+# actions_down — SABLE-ad21. Do not remove ci-verify/** from the branch list.)
+#
+# ── Clean-environment verification contract (SABLE-59zu) ─────────────────────
+# This job IS the canonical SABLE clean-room. A run starts from a fresh checkout
+# with ONLY python+pytest (pip) and tmux (apt) — deliberately NO bd, NO dolt, NO
+# installed ~/.claude runtime. Contract: every test in the run-set must PASS or
+# self-SKIP here — never false-fail (missing dep read as a bug) nor false-pass
+# (skip-and-exit-0 counted as green). pytest integration suites that need bd/dolt
+# self-skip via shutil.which guards; shell suites that need bd/dolt or the
+# ~/.claude install are excluded in .github/ci/shell-run-set.sh, each WITH its
+# tracking bead, and widened as those land.
+#
+# ── Silent-green guard (SABLE-7v3z) ──────────────────────────────────────────
+# pytest runs the WHOLE bin/ directory (auto-discovery, no testpaths/--ignore),
+# so no bin/ test can exist-but-not-run. The shell run-set's --manifest step
+# prints every hooks/test/test-*.sh as RUN / EXCLUDED(reason) / UNCLASSIFIED, so
+# a newly-added suite cannot silently escape the gate.
+#
+# ── Cost (SABLE-oeci gotcha 5) ───────────────────────────────────────────────
+# Single job, no matrix. (Repo is public, so Actions minutes are free; kept lean
+# regardless — do NOT add a matrix.)
+
+name: ci-verify
+
+on:
+  push:
+    branches:
+      - 'ci-verify/**'   # merge-preview gate refs — the SHA sable-merge-gate polls
+      - 'tmux-only'      # integration branch baseline
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout (fresh — SABLE-59zu clean-room)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install clean-room deps (tmux + pytest only — no bd/dolt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Configure git identity (SABLE-59zu — clean-room needs one)
+        run: |
+          # A fresh runner has no user.name/user.email, so any test that creates
+          # a commit (e.g. sable-merge-gate's `git commit-tree` in the o9aa
+          # rehearsals) dies with exit 128. Local dev machines mask this because
+          # they carry a global identity — part of the SABLE-59zu contract that
+          # the clean-room must supply one explicitly.
+          git config --global user.email "ci-verify@sable.local"
+          git config --global user.name  "SABLE ci-verify"
+          # Pin git's traditional 'master' default: several shell suites build
+          # throwaway fixture repos and their base-branch resolution assumes it
+          # (test-post-push-merge-notify.sh reds 22/45 under init.defaultBranch=main
+          # — tracked SABLE-r1zs). This keeps the clean-room deterministic
+          # regardless of the runner's ambient git default.
+          git config --global init.defaultBranch master
+
+      - name: Clean-room contract check (fail loud if the environment drifts)
+        run: |
+          set -e
+          command -v tmux >/dev/null || { echo "::error::tmux missing"; exit 1; }
+          command -v jq   >/dev/null || { echo "::error::jq missing";   exit 1; }
+          command -v git  >/dev/null || { echo "::error::git missing";  exit 1; }
+          git config --get user.email >/dev/null || { echo "::error::git identity unset"; exit 1; }
+          python --version
+          # bd/dolt MUST be absent — their presence changes which suites are green,
+          # so it would silently invalidate the SABLE-59zu contract this run pins.
+          command -v bd   >/dev/null 2>&1 && echo "::warning::bd unexpectedly present in clean-room (SABLE-59zu)"   || true
+          command -v dolt >/dev/null 2>&1 && echo "::warning::dolt unexpectedly present in clean-room (SABLE-59zu)" || true
+
+      - name: pytest — full bin/ suite (unit + integration; bd/dolt suites self-skip)
+        run: |
+          # The full bin/ suite runs with NOTHING deselected — auto-discovery,
+          # no testpaths/--ignore, so no bin/ test can exist-but-not-run
+          # (silent-green guard, SABLE-7v3z). The two tests once deselected here
+          # for shared-runner flakiness are both fixed and re-enabled:
+          #   - test_two_concurrent_wrappers_serialize (SABLE-l7gd): lock TOCTOU
+          #     race (create-then-write + unconditional stale-lock unlink) fixed.
+          #   - test_reap_protects_done_pane_in_attached_clients_current_window
+          #     (SABLE-7dva): the pty-attached tmux client now registers
+          #     headlessly (TERM set, own session, drained master fd) instead of
+          #     never attaching on the CI clean-room.
+          python -m pytest bin/ -q -p no:cacheprovider
+
+      - name: Fixture isolation tripwire (SABLE-0ssz.2 — ban unsandboxed real-repo git ops)
+        run: |
+          # Static ban on the escape class behind the 2026-07-14 P0s (SABLE-xydb
+          # push-to-real-main, SABLE-a5a5 config-to-shared-.git/config): any
+          # test fixture that runs an unguarded-cd or an explicit git -C
+          # <real-repo> mutation reds the gate here, at CI time, not by the next
+          # P0. Known/tracked violations are excused via KNOWN_VIOLATIONS.
+          python bin/sable-fixture-tripwire
+
+      - name: Shell run-set coverage manifest (SABLE-7v3z — exclusions are visible)
+        run: bash .github/ci/shell-run-set.sh --manifest
+
+      - name: hooks/test shell suites (known-green allowlist)
+        run: bash .github/ci/shell-run-set.sh --run

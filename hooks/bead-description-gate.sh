@@ -257,7 +257,7 @@ if ! echo "$DESC" | grep -qiE '(test|\.test\.|\.spec\.|__tests__|pytest|vitest|T
   append_missing "test spec (which test file, what assertions)"
 fi
 
-if ! echo "$DESC" | grep -qiE '(\.(ts|tsx|py|js|jsx|sh|go|rs|rb|md|json|yaml|toml|kdl)|frontend/|src/|lib/|components/|hooks/|templates/|docs/|feedback/)'; then
+if ! echo "$DESC" | grep -qiE '(\.(ts|tsx|py|js|jsx|sh|go|rs|rb|md|json|yaml|yml|toml|kdl|cfg|ini|txt)|frontend/|src/|lib/|components/|hooks/|templates/|docs/|feedback/|bin/|\.[a-zA-Z][a-zA-Z0-9_-]*/)'; then
   append_missing "file paths (exact files to create/modify)"
 fi
 

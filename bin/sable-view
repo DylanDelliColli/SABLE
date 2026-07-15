@@ -27,7 +27,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from sable_pane_lib import SessionCollision, resolve_session  # noqa: E402
+from sable_pane_lib import SessionCollision, resolve_session, worker_cap  # noqa: E402
 
 _FORMAT = "#{window_index} #{pane_id} #{@sable_role} #{@sable_bead} #{@sable_status}"
 ACTIVITY_WIDTH = 60
@@ -81,6 +81,21 @@ def render_table(panes: list[dict], activity: dict[str, str]) -> str:
         rows.append(f"{p['role']:<10} {p['pane']:<7} {p['window']:<4} "
                     f"{p['bead']:<16} {p['status']:<8} {activity.get(p['pane'], '')}")
     return "\n".join(rows)
+
+
+def live_worker_count(panes: list[dict]) -> int:
+    """Live worker panes: role prefix 'worker' (the sable-worker-status
+    recognition rule) and not done — the same panes sable-spawn-worker counts
+    against SABLE_MAX_WORKERS (SABLE-mmdt)."""
+    return sum(1 for p in panes
+               if p["role"].startswith("worker") and p["status"] != "done")
+
+
+def cap_summary(panes: list[dict], cap: int) -> str:
+    """The cockpit's count-vs-cap line (SABLE-mmdt acceptance: the operator
+    sees live worker count vs cap without leaving the cockpit)."""
+    return (f"workers: {live_worker_count(panes)}/{cap} live "
+            "(cap: SABLE_MAX_WORKERS; spawns beyond it are refused)")
 
 
 def view_session_name(session: str, pid: int) -> str:
@@ -160,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
                                  capture_output=True, text=True).stdout
             activity[pane["pane"]] = last_line(cap)
         print(render_table(panes, activity))
+        print(cap_summary(panes, worker_cap()))
         if not os.environ.get("TMUX"):
             sys.stderr.write("deep-dive into a pane: sable-view <role>\n")
         return 0

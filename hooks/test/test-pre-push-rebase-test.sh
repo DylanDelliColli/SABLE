@@ -26,6 +26,19 @@ if [ ! -x "$HOOK" ]; then
   exit 2
 fi
 
+# Per-invocation unique fixture root (SABLE-z776). Every fixture repo, bare
+# origin, and agents.yaml this suite creates lives under TMPROOT — an mktemp -d
+# dir unique to THIS process. The suite formerly hardcoded shared /tmp paths
+# (/tmp/sable-test-pre-push-repo, /tmp/sable-test-4amz-repo, …); once the .sable
+# testCommand went live (SABLE-hml) every SABLE-repo push runs this suite in the
+# pre-push gate, so concurrent fleet pushes — and the nested case where the gate
+# runs the suite while the suite invokes the gate — raced on those shared paths,
+# clobbering each other's fixtures and flaking the gate nondeterministically.
+# Scoping everything under a unique root, and tearing down ONLY TMPROOT, makes
+# concurrent and nested runs collision-free. See test-pre-push-rebase-concurrency.sh.
+TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/sable-test-pre-push.XXXXXX")"
+trap 'rm -rf "$TMPROOT"' EXIT
+
 PASS=0
 FAIL=0
 FAIL_NAMES=""
@@ -110,7 +123,7 @@ make_ts_fixture() {
   local dir="$1"
   rm -rf "$dir"
   mkdir -p "$dir"
-  cd "$dir"
+  cd "$dir" || return 1
   git init -q
   git config user.email "test@test"
   git config user.name "Test"
@@ -130,7 +143,7 @@ make_clean_ts_fixture() {
   local dir="$1"
   rm -rf "$dir"
   mkdir -p "$dir"
-  cd "$dir"
+  cd "$dir" || return 1
   git init -q
   git config user.email "test@test"
   git config user.name "Test"
@@ -172,8 +185,8 @@ assert_allow "skips non-repo CWD" "$MGR_ENV" "git push" "/tmp/nonexistent-non-re
 # tests is to verify the hook's decision tree (does it deny on static failure?
 # does SABLE_SKIP_PRE_PUSH=1 still enforce static?), not the typechecker itself.
 
-REPO_DIR="/tmp/sable-test-pre-push-repo"
-BARE_DIR="/tmp/sable-test-pre-push-bare.git"
+REPO_DIR="$TMPROOT/pre-push-repo"
+BARE_DIR="$TMPROOT/pre-push-bare.git"
 rm -rf "$REPO_DIR" "$BARE_DIR"
 
 # Create a bare repo to serve as `origin` so `git fetch origin` succeeds.
@@ -181,13 +194,19 @@ git init -q --bare "$BARE_DIR"
 
 # Clone from bare → working repo with origin remote configured.
 git clone -q "$BARE_DIR" "$REPO_DIR"
-cd "$REPO_DIR"
+# Guard the cd (SABLE-xydb): if it ever fails, ABORT before the destructive
+# echo>README / git add -A / commit / push run — otherwise those side-effects
+# execute in whatever CWD we landed in (the real worktree), which under the old
+# shared-/tmp race truncated the real README and pushed it to the real origin.
+cd "$REPO_DIR" || { echo "FATAL: cd to fixture repo $REPO_DIR failed — aborting so fixture git ops never touch the real worktree"; exit 2; }
 git config user.email "test@test"
 git config user.name "Test"
 echo "x" > README.md
 git add -A
 git commit -q -m "init"
-git push -q origin HEAD:refs/heads/main 2>/dev/null
+# Push by EXPLICIT bare path, never the remote name 'origin', so a misrouted
+# invocation can never reach a real upstream (defense-in-depth for SABLE-xydb).
+git push -q "$BARE_DIR" HEAD:refs/heads/main 2>/dev/null
 cd - >/dev/null
 
 # Test 6: typecheck override that fails → DENY in static phase
@@ -213,6 +232,40 @@ assert_deny "failing lint command → static phase denies" "$FAIL_LINT" "git pus
 # Test 11: no typecheck/lint configured + no project markers → static no-ops, PHASE=skip → context
 NO_STATIC="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TEST_PHASE=skip"
 assert_context "no typecheck detected → static no-ops" "$NO_STATIC" "git push" "$REPO_DIR" "phase skipped"
+
+# ---------- .sable testCommand resolution tests (SABLE-hml) ----------
+# detect_test_cmd previously only checked $SABLE_TEST_COMMAND then a fixed
+# manifest list (package.json/pyproject.toml/Cargo.toml/go.mod); a bash/hook
+# repo like SABLE itself matches none of those, so the TEST phase silently
+# no-op'd (live incident: chuck, 2026-07-07 — the TDD-enforcement hooks
+# batch itself shipped untested). sable_resolve_test_command (lib-identity.sh)
+# now also honors a checked-in .sable file / repo-local git config — these
+# tests prove the HOOK actually wires that resolution into phase 3 end to
+# end, not just that the lib function works in isolation (covered separately
+# in test-lib-identity.sh).
+SABLE_TESTCMD_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true"
+
+# Test 11b: .sable testCommand that fails → phase 3 denies, message names the
+# RESOLVED command (proves detect_test_cmd read .sable, not env/manifest)
+echo "testCommand=exit 42" > "$REPO_DIR/.sable"
+assert_deny "«.sable» testCommand resolved and enforced → failing command denies phase 3" \
+  "$SABLE_TESTCMD_ENV" "git push" "$REPO_DIR" "exit 42"
+
+# Test 11c: .sable testCommand that passes → phase 3 runs clean, no deny and
+# no "no test command detected" fallback (proves manifest auto-detect was
+# bypassed in favor of the resolved .sable value)
+echo "testCommand=true" > "$REPO_DIR/.sable"
+assert_allow "«.sable» testCommand resolved and enforced → passing command allows push" \
+  "$SABLE_TESTCMD_ENV" "git push" "$REPO_DIR"
+
+# Test 11d: repo-local git config wins over the .sable file (precedence
+# mirrors sable_resolve_integration_branch's config > .sable ordering)
+git -C "$REPO_DIR" config sable.testCommand "exit 43"
+assert_deny "repo-local git config testCommand wins over .sable file" \
+  "$SABLE_TESTCMD_ENV" "git push" "$REPO_DIR" "exit 43"
+git -C "$REPO_DIR" config --unset sable.testCommand
+
+rm -f "$REPO_DIR/.sable"
 
 # ---------- Shared matcher tests (SABLE-jpr / SABLE-0u1) ----------
 # The pre-push gate must fire for real git push variants (positives) and
@@ -270,7 +323,7 @@ v3fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ 
 
 # Hermetic registry so tarzan/sherlock resolve deterministically; Explore is
 # intentionally absent → resolves as an unregistered worker type.
-V3_YAML="/tmp/sable-test-pre-push-agents.yaml"
+V3_YAML="$TMPROOT/pre-push-agents.yaml"
 cat > "$V3_YAML" <<'YAML'
 agents:
   optimus:
@@ -426,7 +479,7 @@ else
 fi
 
 # (b2) a registry WITH the instance registered → tarzan-2 is a manager → GATED.
-T73_YAML="/tmp/sable-test-73t4-agents.yaml"
+T73_YAML="$TMPROOT/73t4-agents.yaml"
 cat > "$T73_YAML" <<'YAML'
 agents:
   tarzan:
@@ -460,7 +513,7 @@ rm -f "$T73_YAML"
 # ===================================================================
 C041_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=false SABLE_PRE_PUSH_TEST_PHASE=skip"
 assert_deny "SABLE-041: 'git -C <repo> push' from a non-repo cwd resolves the -C dir (static gate runs)" \
-  "$C041_ENV" "git -C $REPO_DIR push" "/tmp/sable-041-nonrepo-cwd" "phase 2 (static)"
+  "$C041_ENV" "git -C $REPO_DIR push" "$TMPROOT/sable-041-nonrepo-cwd" "phase 2 (static)"
 
 # ===================================================================
 # market-brief-package-fofc: integration-branch self-push must NOT rebase onto
@@ -472,8 +525,8 @@ assert_deny "SABLE-041: 'git -C <repo> push' from a non-repo cwd resolves the -C
 #                   DENY "phase 1 (rebase)".
 #   GREEN(post-fix): retarget → BEHIND=0 → no rebase → "phase skipped".
 # ===================================================================
-FOFC_BARE="/tmp/sable-test-fofc-bare.git"
-FOFC_REPO="/tmp/sable-test-fofc-repo"
+FOFC_BARE="$TMPROOT/fofc-bare.git"
+FOFC_REPO="$TMPROOT/fofc-repo"
 rm -rf "$FOFC_BARE" "$FOFC_REPO"
 git init -q --bare "$FOFC_BARE"
 git clone -q "$FOFC_BARE" "$FOFC_REPO" 2>/dev/null
@@ -515,8 +568,8 @@ rm -rf "$FOFC_BARE" "$FOFC_REPO"
 #                   "tmux-only" == CURRENT_BRANCH → retarget to
 #                   origin/tmux-only (fast-forward-safe no-op) → "phase skipped".
 # ===================================================================
-R2U25_BARE="/tmp/sable-test-2u25-bare.git"
-R2U25_REPO="/tmp/sable-test-2u25-repo"
+R2U25_BARE="$TMPROOT/2u25-bare.git"
+R2U25_REPO="$TMPROOT/2u25-repo"
 rm -rf "$R2U25_BARE" "$R2U25_REPO"
 git init -q --bare "$R2U25_BARE"
 git clone -q "$R2U25_BARE" "$R2U25_REPO" 2>/dev/null
@@ -550,8 +603,8 @@ rm -rf "$R2U25_BARE" "$R2U25_REPO"
 #   GREEN(post-fix): re-parented push is DENIED "re-parent guard".
 # The good-branch case is a false-positive guard: it must pass before AND after.
 # ===================================================================
-YZ_BARE="/tmp/sable-test-yz5y-bare.git"
-YZ_REPO="/tmp/sable-test-yz5y-repo"
+YZ_BARE="$TMPROOT/yz5y-bare.git"
+YZ_REPO="$TMPROOT/yz5y-repo"
 rm -rf "$YZ_BARE" "$YZ_REPO"
 git init -q --bare "$YZ_BARE"
 git clone -q "$YZ_BARE" "$YZ_REPO" 2>/dev/null
@@ -593,8 +646,8 @@ rm -rf "$YZ_BARE" "$YZ_REPO"
 #                rebase deny (wrong message); GREEN: wrong-base guard DENIES
 #                before any rewrite.
 # ===================================================================
-AMZ_BARE="/tmp/sable-test-4amz-bare.git"
-AMZ_REPO="/tmp/sable-test-4amz-repo"
+AMZ_BARE="$TMPROOT/4amz-bare.git"
+AMZ_REPO="$TMPROOT/4amz-repo"
 rm -rf "$AMZ_BARE" "$AMZ_REPO"
 git init -q --bare "$AMZ_BARE"
 git clone -q "$AMZ_BARE" "$AMZ_REPO" 2>/dev/null

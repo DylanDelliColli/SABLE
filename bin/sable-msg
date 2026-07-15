@@ -23,8 +23,10 @@ proves the keystrokes were injected, not that the recipient's TUI actually
 accepted them as a submitted turn — a booting pane or an Escape hitting a
 blocking gate can silently swallow them (the same boot / dropped-Enter race
 documented as SABLE-91m3 and guarded against in sable-spawn-worker). We reuse
-its ready-wait + submit-retry helpers (sable_pane_lib) here: --interrupt sends
-Escape then waits for the pane's input prompt to be ready before typing;
+its idle-wait + submit-retry helpers (sable_pane_lib) here: --interrupt sends
+Escape ONCE then waits for the pane to go IDLE (empty composer prompt AND no
+turn still running) before typing — waiting only for the prompt to reappear
+raced the interrupted turn's redraw and dropped the message (SABLE-m6is);
 submission is retried until the framed message is visible in the pane and no
 longer sitting in the input box. Only then do we print `delivered`; on
 genuine failure we print `undelivered`, AUTO-FILE the durable for-<role>
@@ -46,8 +48,8 @@ Usage:
 Env:
   SABLE_TMUX_SOCKET      tmux socket name (-L); for session isolation / tests
   CLAUDE_AGENT_NAME      default --from value
-  SABLE_MSG_READY_TIMEOUT   seconds to wait for --interrupt's post-Escape ready
-                            state (default 25; sable-spawn-worker uses the same)
+  SABLE_MSG_READY_TIMEOUT   seconds to wait for --interrupt's post-Escape IDLE
+                            state — empty prompt AND no running turn (default 25)
   SABLE_MSG_SUBMIT_TRIES    submit-retry attempts (default 8)
   SABLE_MSG_POLL_INTERVAL   seconds between retry polls (default 1.0)
 
@@ -69,9 +71,16 @@ import sys
 # sable-spawn-worker uses. Resolve next to THIS script even via a PATH symlink.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    SessionCollision, deliver_text, resolve_session, wait_for_ready,
+    SessionCollision, deliver_text, pane_busy, pane_idle, pane_ready,
+    resolve_session, submitted_own_turn, wait_for_idle,
 )
 from sable_pane_lib import capture_pane as _capture_pane  # noqa: E402
+
+# pane_ready / pane_busy / pane_idle / submitted_own_turn are re-exported (not
+# called here directly — wait_for_idle uses pane_idle internally, deliver_text
+# uses submitted_own_turn) so the unit suite can assert the predicates via the
+# sable_msg module, mirroring sable-spawn-worker's re-export of the pane helpers.
+# Do not strip them as "unused" (SABLE-m6is / SABLE-h0jw).
 
 HEADER = "⟦SABLE-MSG⟧"
 
@@ -107,21 +116,50 @@ def parse_panes(output: str) -> dict[str, str]:
     return mapping
 
 
-def parse_worker_bead_tags(output: str) -> dict[str, str]:
-    """Parse `tmux list-panes -F '#{pane_id} #{@sable_role} #{@sable_bead}'`
-    output into bead -> pane_id, restricted to panes tagged @sable_role=worker
-    (SABLE-6izz). A manager pane's @sable_bead field is never consulted here —
-    bead-addressed lookup is a WORKER-only namespace, so a manager-name lookup
-    (parse_panes, above) can never collide with it even if some tag is stale."""
-    mapping: dict[str, str] = {}
+def parse_worker_bead_tags(output: str) -> dict[str, list[tuple[str, str]]]:
+    """Parse `tmux list-panes -F '#{pane_id} #{@sable_role} #{@sable_bead}
+    #{@sable_status}'` output into bead -> [(pane_id, status), ...], restricted
+    to panes tagged @sable_role=worker (SABLE-6izz). A manager pane's
+    @sable_bead field is never consulted here — bead-addressed lookup is a
+    WORKER-only namespace, so a manager-name lookup (parse_panes, above) can
+    never collide with it even if some tag is stale. ALL panes sharing a bead
+    tag are kept, not last-wins: a REVISE re-spawn into the same worktree
+    creates a fresh pane before the old one is reaped, so a done-but-unreaped
+    pane and a running pane can legitimately carry the same @sable_bead
+    (SABLE-qq6r) — status-aware selection happens in lookup_worker_by_bead."""
+    mapping: dict[str, list[tuple[str, str]]] = {}
     for line in output.splitlines():
-        parts = line.split(None, 2)
+        parts = line.split(None, 3)
         if len(parts) < 3:
             continue
         pane_id, role, bead = parts[0], parts[1].strip(), parts[2].strip()
+        status = parts[3].strip() if len(parts) > 3 else ""
         if role == "worker" and bead:
-            mapping.setdefault(bead, pane_id)
+            mapping.setdefault(bead, []).append((pane_id, status))
     return mapping
+
+
+def _pane_id_num(pane_id: str) -> int:
+    """tmux pane ids (%N) are assigned monotonically increasing server-wide,
+    so the numerically largest id among candidates is the newest pane."""
+    try:
+        return int(pane_id.lstrip("%"))
+    except ValueError:
+        return -1
+
+
+class OnlyDonePane(Exception):
+    """Raised by lookup_worker_by_bead when every pane tagged with the bead is
+    done-but-unreaped (SABLE-qq6r). A REVISE re-spawn into the same worktree
+    creates a fresh pane before the old one is reaped, so two panes can share
+    one @sable_bead tag; resolving to the done one silently delivers into a
+    dead composer while reporting success — a false delivery confirmation,
+    worse than an outright failure."""
+
+    def __init__(self, bead_id: str, pane_id: str):
+        self.bead_id = bead_id
+        self.pane_id = pane_id
+        super().__init__(f"bead {bead_id!r} only matches done pane {pane_id}")
 
 
 def _default_runner(args: list[str]) -> str:
@@ -148,13 +186,26 @@ def lookup_pane(role: str, run=None, socket: str | None = None,
 
 def lookup_worker_by_bead(bead_id: str, run=None, socket: str | None = None,
                           session: str | None = None) -> str | None:
+    """Resolve a bead id to its live worker pane (SABLE-qq6r). When a REVISE
+    re-spawn leaves a done-but-unreaped pane and a fresh running pane sharing
+    one @sable_bead tag, prefer the non-done pane (newest by pane id if more
+    than one is somehow live); if every matching pane is done, raise
+    OnlyDonePane instead of silently resolving to a dead composer."""
     run = run or _default_runner
     try:
-        out = run(tmux_base(socket) + ["list-panes", *_scope_args(session),
-                                       "-F", "#{pane_id} #{@sable_role} #{@sable_bead}"])
+        out = run(tmux_base(socket) + [
+            "list-panes", *_scope_args(session),
+            "-F", "#{pane_id} #{@sable_role} #{@sable_bead} #{@sable_status}",
+        ])
     except subprocess.CalledProcessError:
         return None  # session not up
-    return parse_worker_bead_tags(out).get(bead_id)
+    candidates = parse_worker_bead_tags(out).get(bead_id)
+    if not candidates:
+        return None
+    live = [pane for pane, status in candidates if status != "done"]
+    if live:
+        return max(live, key=_pane_id_num)
+    raise OnlyDonePane(bead_id, max((p for p, _ in candidates), key=_pane_id_num))
 
 
 def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None = None,
@@ -163,12 +214,19 @@ def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None
                     tries: int = DEFAULT_SUBMIT_TRIES,
                     interval: float = DEFAULT_POLL_INTERVAL) -> bool:
     """Deliver `message` to `pane`, VERIFIED (SABLE-bq93). --interrupt sends
-    Escape then waits for the pane's input prompt to be ready (the same boot /
-    blocking-gate race sable-spawn-worker guards against, SABLE-91m3) before
-    typing — typing into a not-yet-ready pane right after Escape is exactly how
-    the interrupt path silently dropped turns. Submission is then retried
-    (deliver_text) until `message` is visible in the pane and no longer sitting
-    in the input box. Returns False (never raises) on genuine non-delivery."""
+    Escape ONCE then waits for the pane to go IDLE — an empty composer prompt
+    AND no turn still running (wait_for_idle) — before reusing the default-mode
+    delivery path (deliver_text). Waiting only for pane_ready was the SABLE-m6is
+    bug: a busy pane shows the empty composer prompt too, so the interrupt path
+    typed WHILE the interrupted turn was still redrawing / clearing the composer
+    (spinner redraw, in-flight tool output), and the message was swallowed — two
+    consecutive live sends failed all 8 submit attempts. Deferring injection
+    until the turn actually settles matches the manual workaround that always
+    landed first try (send Escape, let the pane fall idle, then a default-mode
+    send). Submission is then retried (deliver_text) until `message` is visible
+    in the pane and no longer sitting in the input box. The Escape is sent once
+    and the submit-retry counter is unchanged. Returns False (never raises) on
+    genuine non-delivery."""
     base = tmux_base(socket)
     run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True).returncode == 0)
     capture = capture or (lambda: _capture_pane(base, pane))
@@ -176,7 +234,7 @@ def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None
     if interrupt:
         run(base + ["send-keys", "-t", pane, "Escape"])
         if ready_timeout > 0:
-            wait_for_ready(base, pane, ready_timeout, interval=interval,
+            wait_for_idle(base, pane, ready_timeout, interval=interval,
                           capture=capture, sleep=sleep, run=run)
 
     return deliver_text(base, pane, message, message, tries=tries, interval=interval,
@@ -236,7 +294,16 @@ def main(argv: list[str] | None = None) -> int:
         return 4
 
     if ns.bead:
-        pane = lookup_worker_by_bead(ns.to_role, socket=socket, session=session)
+        try:
+            pane = lookup_worker_by_bead(ns.to_role, socket=socket, session=session)
+        except OnlyDonePane as e:
+            sys.stderr.write(
+                f"sable-msg: worker pane for bead '{e.bead_id}' is done "
+                f"({e.pane_id}), awaiting reap — not a live worker to deliver "
+                f"into. Reap it (sable-worker-status --reap) once the fresh "
+                f"pane is the only match, then retry.\n"
+            )
+            return 1
         if pane is None:
             sys.stderr.write(
                 f"sable-msg: no worker pane registered for bead '{ns.to_role}' "

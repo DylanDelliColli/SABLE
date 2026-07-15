@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# sable-clean-room-verify — locally reproduce the ci-verify clean-room's PATH
+# (no bd, no dolt) before push (SABLE-59zu).
+#
+# .github/workflows/ci-verify.yml IS the canonical SABLE clean-room: a fresh
+# runner with only python+pytest+tmux+git — deliberately NO bd, NO dolt, NO
+# installed ~/.claude. Every dev box carries both ambient, so an
+# install.sh-touching suite that silently assumes bd/dolt are on PATH passes
+# on every local run and only reds once it lands on that runner — after
+# push, after the merge-preview gate already ran (SABLE-59zu). This tool
+# closes that gap: it removes every PATH entry that provides `bd` or `dolt`
+# (not merely shadows them with something earlier on PATH) and runs the
+# given command inside that scrubbed PATH, so the behavior the real
+# clean-room will see is observable locally, before push.
+#
+# It reproduces ONE dimension of the clean-room (PATH), not the whole
+# environment (fresh checkout, absent ~/.claude, reset git identity) — PATH
+# is the dimension that silently passes locally and reds in CI.
+#
+# Usage:
+#   sable-clean-room-verify [<command> [args...]]
+#   sable-clean-room-verify --help
+#
+#   With no command: runs the canonical gate, `.github/ci/shell-run-set.sh --run`.
+#   With a command: runs THAT command (e.g. a single suite) under the same
+#   scrubbed PATH — useful to isolate one install.sh-touching suite before push.
+#
+# Exit status: whatever the scrubbed command exits with (2 on usage error).
+
+set -eu
+
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+sable-clean-room-verify — run a command with bd and dolt stripped from PATH,
+reproducing the ci-verify clean-room gate's PATH before you push.
+
+Usage:
+  sable-clean-room-verify [<command> [args...]]
+  sable-clean-room-verify --help
+
+  With no command, runs the canonical gate:
+    .github/ci/shell-run-set.sh --run
+  With a command, runs THAT command under the same scrubbed PATH — e.g.:
+    sable-clean-room-verify bash hooks/test/test-sable-bin-install.sh
+
+A suite that only passes because your dev box has bd/dolt ambient on PATH
+will misbehave here exactly as it will in ci-verify.yml. Suites that touch
+install.sh must handle bd/dolt absence explicitly (self-skip, or stub it in,
+as hooks/test/test-sable-bin-install.sh does) — see SABLE.md.
+EOF
+}
+
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+# scrub_path — sets SCRUBBED_PATH to $PATH with every entry that provides an
+# executable `bd` or `dolt` removed, and REMOVED_COUNT to how many entries
+# that was. Removal, not front-shadowing: a stub prepended in FRONT of an
+# ambient real bd still leaves that real bd reachable by anything that
+# resolves PATH differently (a subshell, a cached hash, a different search
+# order); actually dropping the directory is the only way to guarantee real
+# bd/dolt are unreachable, matching a runner where they were never installed.
+scrub_path() {
+    local dir out=""
+    REMOVED_COUNT=0
+    local saved_ifs="$IFS"
+    IFS=':'
+    for dir in $PATH; do
+        IFS="$saved_ifs"
+        [ -n "$dir" ] || continue
+        if [ -x "$dir/bd" ] || [ -x "$dir/dolt" ]; then
+            REMOVED_COUNT=$((REMOVED_COUNT + 1))
+            continue
+        fi
+        if [ -z "$out" ]; then out="$dir"; else out="$out:$dir"; fi
+        IFS=':'
+    done
+    IFS="$saved_ifs"
+    SCRUBBED_PATH="$out"
+}
+
+scrub_path
+
+if [ "$REMOVED_COUNT" -eq 0 ]; then
+    echo "sable-clean-room-verify: bd/dolt were not on PATH to begin with — this run adds no clean-room signal beyond a normal run" >&2
+else
+    plural="ies"; [ "$REMOVED_COUNT" -eq 1 ] && plural="y"
+    echo "sable-clean-room-verify: removed $REMOVED_COUNT PATH entr$plural providing bd/dolt" >&2
+fi
+
+if [ $# -eq 0 ]; then
+    set -- bash "$REPO/.github/ci/shell-run-set.sh" --run
+fi
+
+echo "sable-clean-room-verify: running under scrubbed PATH: $*" >&2
+PATH="$SCRUBBED_PATH" "$@"

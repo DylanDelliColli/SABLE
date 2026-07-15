@@ -5,7 +5,12 @@
 # Before the worker starts, refresh its working tree against the integration branch.
 # Eliminates "30-min-old base" conflicts at the source.
 #
-# $SABLE_BASE_BRANCH defaults to origin/main; export per-repo to override (e.g. origin/dev).
+# $SABLE_BASE_BRANCH, if set, wins outright. Otherwise the rebase target
+# defaults to the repo's resolved integration branch (sable_resolve_integration_branch:
+# git config sable.integrationBranch, then .sable, then $SABLE_INTEGRATION_BRANCH,
+# then $SABLE_BASE_BRANCH minus origin/) when published at origin/<branch>, else
+# origin/main. Same per-repo resolution as post-push-merge-notify.sh and
+# pre-push-rebase-test.sh (SABLE-wf6e).
 #
 # Skips if dispatch is for an exploration agent (Explore/Plan/research subagents
 # don't modify code) or if no worktree path can be inferred from the prompt.
@@ -115,12 +120,27 @@ if [ -z "$WORKTREE" ] || [ ! -d "$WORKTREE" ] || { [ ! -d "$WORKTREE/.git" ] && 
   exit 0
 fi
 
-# Validate base ref and fall back gracefully when SABLE_BASE_BRANCH points to
-# a ref that doesn't exist in this repo (SABLE-61n)
-BASE_BRANCH=$(sable_validate_base_ref "$WORKTREE" "${SABLE_BASE_BRANCH:-origin/main}")
-
-# Fetch and rebase. Capture output for reporting.
+# Fetch first so the origin/<INT> existence check below sees fresh remote refs
+# (mirrors pre-push-rebase-test.sh's ordering).
 FETCH_OUT=$(git -C "$WORKTREE" fetch origin 2>&1 || echo "FETCH_FAILED: $?")
+
+# Resolve the per-repo integration branch (sable_resolve_integration_branch,
+# lib-identity.sh / market-brief-package-2u25) and default the rebase target to
+# it when published, instead of unconditionally origin/main — SABLE-wf6e: this
+# was the one named consumer still hardcoding origin/main, so a dispatch refresh
+# in a repo whose integration branch is e.g. origin/tmux-only silently rebased
+# worktrees onto the wrong base. Mirrors post-push-merge-notify.sh and
+# pre-push-rebase-test.sh's DEFAULT_BASE_BRANCH derivation; an explicit
+# SABLE_BASE_BRANCH still wins. Falls back gracefully when the resolved ref
+# doesn't exist in this repo (SABLE-61n).
+INTEGRATION_BRANCH=$(sable_resolve_integration_branch "$WORKTREE")
+DEFAULT_BASE_BRANCH="origin/main"
+if [ -n "$INTEGRATION_BRANCH" ] \
+   && git -C "$WORKTREE" rev-parse --verify --quiet "origin/$INTEGRATION_BRANCH" >/dev/null 2>&1; then
+  DEFAULT_BASE_BRANCH="origin/$INTEGRATION_BRANCH"
+fi
+BASE_BRANCH=$(sable_validate_base_ref "$WORKTREE" "${SABLE_BASE_BRANCH:-$DEFAULT_BASE_BRANCH}")
+
 REBASE_OUT=$(git -C "$WORKTREE" rebase "$BASE_BRANCH" 2>&1 || echo "REBASE_FAILED")
 
 if echo "$REBASE_OUT" | grep -q "REBASE_FAILED"; then

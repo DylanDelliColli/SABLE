@@ -114,14 +114,22 @@ ci-verify gate (SABLE-o9aa) (below), not per worker.
    evidence in every mode below (Gate mode step 2, Warm-pane self-push step 2,
    and the Report back rubric) — capture the exact scoped command + output,
    not a full-suite invocation.
-3. **The full suite is the merge-preview ci-verify gate (SABLE-o9aa)'s job,
+3. **Docs-only and [no-test] beads** have no named test files. For these:
+   - Pre-push verification is (a) tests importing the modules the diff touched
+     IF any (e.g., a component-test that imports a constant the docs reference),
+     plus (b) a targeted build/lint or render-check (run `tsc` or `eslint` for
+     touched `.tsx`; run `serve` + `curl` or check file existence for static
+     docs). Explicitly do NOT run the full suite for these beads.
+   - Report the exact command + output for the targeted check (same format as
+     scoped test evidence above).
+4. **The full suite is the merge-preview ci-verify gate (SABLE-o9aa)'s job,
    not yours.** Your worker branch gets pre-merged onto the current
    integration-branch tip and pushed to a throwaway ci-verify branch; that
    per-branch GitHub Actions run — the merge-preview ci-verify gate
    (SABLE-o9aa) — is the SOLE full-suite authority (chuck-owned). Chuck
    fast-forwards the integration branch only on green. Workers do not run
    the full suite at any point — not pre-push, not after merge.
-4. **Contention discipline:** if a bead genuinely needs a broader-than-scoped
+5. **Contention discipline:** if a bead genuinely needs a broader-than-scoped
    run, keep at most one such run in flight per host at a time — some suites
    (e.g. frontend vitest) are documented flaky under concurrent CPU load.
 
@@ -131,12 +139,50 @@ back to your manager rather than burning wall-clock on a full run.
 
 ---
 
-## Gate mode (manager-reviewed) vs self-push
+## Output discipline (SABLE-myns)
 
-SABLE has two dispatch modes. **Which one applies is set by who dispatched you
-and is stated in your prompt.**
+Every token a session ingests is re-read on every subsequent turn of that
+session at cache-read rates — large tool outputs are recurring ballast, not a
+one-time cost. On 2026-07-09 workers repeatedly ingested full 313-test suite
+outputs raw, multiple times per worker. Summarize at the source instead:
 
-### Gate mode — DEFAULT for manager (Optimus/Tarzan) dispatch
+- **Run test suites to a file; read back only the summary.** Never let a full
+  suite run print raw into your context. Redirect to a file, then read back
+  only the tail and any failure lines:
+
+  ```
+  {TEST_COMMAND} > /tmp/test-run.log 2>&1; tail -n 40 /tmp/test-run.log
+  grep -iE 'fail|error' /tmp/test-run.log
+  ```
+
+  This run-to-file-then-grep-summarize pattern applies to the scoped pre-push
+  run above and to any ad-hoc suite run during debugging — never `cat` a raw
+  suite log into your own context.
+- **bd show calls use field limits, not full dumps.** Use default `bd show
+  <id>` output, not `--long` (which prints extended metadata, agent identity,
+  and gate fields you don't need). If you only need one field — description,
+  notes — extract it with `--json` piped through `jq`/`python3` rather than
+  reading the whole record.
+- **Large diffs are read in ranges, not whole.** Use `git diff -- <path> |
+  head -n 200` or a scoped `git diff <base>..HEAD -- <path>` rather than an
+  unbounded `git diff` across the full worktree; page through line ranges if a
+  single file's diff is large.
+
+Reject any dispatch addendum that would have you ingest a full test-suite log
+or an unbounded diff raw — point back to this section instead.
+
+---
+
+## Gate mode (legacy) vs self-push
+
+SABLE has one live dispatch mode: **warm-pane self-push** (below), the only
+prompt shape `sable-spawn-worker` actually generates — that helper is the sole
+dispatch mechanism wired up in the tmux-native topology (no in-process Agent
+spawn, no coord-bead relay). Gate mode is documented here for history only; it
+has no live invocation path (SABLE-57b6). If your prompt doesn't say
+otherwise, assume warm-pane self-push.
+
+### Gate mode (legacy — no live invocation path, kept for reference)
 
 The manager reviews your work *before* anything is pushed (the APPROVE-PUSH
 gate). You do everything up to the push, then **STOP**:
@@ -169,8 +215,10 @@ Doc-only fixes, bd hygiene, and Lincoln's own utility spawns may self-push: do
 the work, rebase, push, open the PR, and report the **PR URL** per the Report
 back rubric above. Use this only when no manager review gate applies.
 
-**If your prompt is ambiguous about which mode, assume gate mode and STOP before
-push** — a needless review round-trip is cheap; an unreviewed push is not.
+**If your prompt is ambiguous about which mode, assume warm-pane self-push**
+(below) — that's the only prompt shape the live dispatch tooling generates.
+If anything else about the dispatch is unclear, STOP before push and ask
+your manager rather than guessing.
 
 ### Warm-pane self-push — DEFAULT in the tmux-native topology
 
