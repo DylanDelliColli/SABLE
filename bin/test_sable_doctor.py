@@ -187,6 +187,56 @@ def test_resolve_claude_dir_default_is_home_claude():
     assert result == Path.home() / ".claude"
 
 
+# --- resolve_project_claude_dir (--project sugar, git-common-dir) ------------
+
+def _git(*args, cwd):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def test_doctor_project_flag_resolves_claude_dir_to_repo_root_via_git_common_dir(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _git("init", "-q", cwd=project)
+    (project / ".claude").mkdir()
+
+    resolved = doctor.resolve_project_claude_dir(str(project))
+    assert resolved == (project / ".claude").resolve()
+
+
+def test_doctor_project_flag_from_linked_worktree_targets_main_checkout_claude_dir(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _git("init", "-q", cwd=project)
+    (project / ".claude").mkdir()
+    (project / "README.md").write_text("hi\n")
+    _git("add", "README.md", cwd=project)
+    _git("-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "init", cwd=project)
+
+    linked = tmp_path / "linked-worktree"
+    _git("worktree", "add", "-q", "-b", "feature", str(linked), cwd=project)
+
+    # the linked worktree has NO .claude of its own — resolution must still
+    # land on the MAIN checkout's install, not the linked worktree's (missing) one.
+    resolved = doctor.resolve_project_claude_dir(str(linked))
+    assert resolved == (project / ".claude").resolve()
+
+
+def test_doctor_project_raises_named_error_when_not_a_git_worktree(tmp_path):
+    plain_dir = tmp_path / "not-a-repo"
+    plain_dir.mkdir()
+    with pytest.raises(doctor.NoProjectInstallError):
+        doctor.resolve_project_claude_dir(str(plain_dir))
+
+
+def test_doctor_project_raises_named_error_when_claude_dir_absent(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _git("init", "-q", cwd=project)
+    # no .claude directory created — no project install to check
+    with pytest.raises(doctor.NoProjectInstallError):
+        doctor.resolve_project_claude_dir(str(project))
+
+
 # --- main(): exit codes + json shape (still pure-python, no subprocess) -------
 
 def test_main_returns_zero_and_prints_clean_when_matching(tmp_path, capsys):

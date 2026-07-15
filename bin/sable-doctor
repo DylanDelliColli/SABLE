@@ -15,11 +15,18 @@ file against its repo source, and reports MISSING / DRIFT / clean with the
 exact refresh command.
 
 Usage:
-  sable-doctor [--repo DIR] [--claude-dir DIR] [--json] [--quiet]
+  sable-doctor [--repo DIR] [--claude-dir DIR | --project] [--json] [--quiet]
 
   --repo DIR         SABLE repo root (default: this script's own repo)
   --claude-dir DIR   installed ~/.claude to check (default: $CLAUDE_USER_DIR
                       or ~/.claude)
+  --project          check the CURRENT git project's OWN install instead:
+                      resolves <main-worktree-root>/.claude via the shared
+                      git-common-dir (same project-first resolution as
+                      bin/sable_registry_lib.py, SABLE-59t6.1) — sugar for
+                      --claude-dir. Errors clearly if the current directory
+                      isn't a git work tree, or no project install exists at
+                      the resolved dir (never reports a false "clean").
   --json             emit a machine-readable report instead of text
   --quiet            print nothing when clean; a one-line warning when
                       drifted (SessionStart-hook friendly)
@@ -30,12 +37,20 @@ missing or drifted.
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_registry_lib import _main_worktree_root as main_worktree_root  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 REFRESH_CMD = "bash install.sh"
+
+
+class NoProjectInstallError(Exception):
+    """--project could not resolve a project .claude install to check."""
 
 
 def sha256(path: Path) -> str:
@@ -130,6 +145,30 @@ def resolve_claude_dir(arg_value, env):
     return Path.home() / ".claude"
 
 
+def resolve_project_claude_dir(base=None):
+    """--project's target: <main-worktree-root>/.claude, resolved via the
+    shared git-common-dir (mirrors sable_registry_lib's project-first
+    resolution) so a linked worktree targets its main checkout's install.
+
+    Raises NoProjectInstallError — never returns a path that would make the
+    caller silently report a false "clean" — when <base> isn't inside a git
+    work tree, or the resolved .claude dir doesn't exist (no project install
+    to check)."""
+    root = main_worktree_root(base if base else os.getcwd())
+    if root is None:
+        raise NoProjectInstallError(
+            f"--project: {base or os.getcwd()} is not inside a git work tree "
+            "(no git-common-dir to resolve a project .claude from)"
+        )
+    claude_dir = Path(root) / ".claude"
+    if not claude_dir.is_dir():
+        raise NoProjectInstallError(
+            f"--project: no project install found at {claude_dir} "
+            "(resolved via git-common-dir from the current worktree)"
+        )
+    return claude_dir
+
+
 def render_text_report(results):
     bad = [r for r in results if r["status"] != "clean"]
     if not bad:
@@ -154,14 +193,22 @@ def main(argv=None):
         description="Compare installed ~/.claude hooks/agents/roles/skills against the SABLE repo copy.",
     )
     parser.add_argument("--repo", default=None, help="SABLE repo root (default: this script's own repo)")
-    parser.add_argument("--claude-dir", default=None, help="installed ~/.claude to check (default: $CLAUDE_USER_DIR or ~/.claude)")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--claude-dir", default=None, help="installed ~/.claude to check (default: $CLAUDE_USER_DIR or ~/.claude)")
+    target.add_argument("--project", action="store_true", help="check the current git project's own install (sugar for --claude-dir <repo-root>/.claude via git-common-dir)")
     parser.add_argument("--json", action="store_true", help="emit a machine-readable report")
     parser.add_argument("--quiet", action="store_true", help="print nothing when clean; one line when drifted")
     args = parser.parse_args(argv)
 
-    import os
     repo = Path(args.repo).resolve() if args.repo else REPO
-    claude_dir = resolve_claude_dir(args.claude_dir, os.environ)
+    if args.project:
+        try:
+            claude_dir = resolve_project_claude_dir()
+        except NoProjectInstallError as exc:
+            print(f"sable-doctor: {exc}", file=sys.stderr)
+            return 1
+    else:
+        claude_dir = resolve_claude_dir(args.claude_dir, os.environ)
 
     entries = build_manifest(repo, claude_dir)
     results = check_manifest(entries)
