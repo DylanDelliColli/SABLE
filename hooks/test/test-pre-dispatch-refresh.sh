@@ -64,6 +64,43 @@ run() { # <json> ; echoes hook stdout
 }
 
 has_Y() { git -C "$1" log --format=%s 2>/dev/null | grep -qx Y; }
+has_commit() { git -C "$1" log --format=%s 2>/dev/null | grep -qx "$2"; }
+
+# setup_repo_int <root> — SABLE-wf6e fixture: default branch is "main", but the
+# repo's CONFIGURED integration branch is "tmux-only" (a diverging branch, repo
+# default still main). worktree "wt" branches off tmux-only BEFORE tmux-only
+# gains its own later-only commit T-only; main separately gains a later-only
+# commit M-only. A correct rebase (resolving the configured integration branch)
+# pulls in T-only and never M-only; the old origin/main-hardcoded default would
+# pull in M-only instead.
+setup_repo_int() {
+  local root="$1"
+  BARE="$root/bare.git"; MAIN="$root/main"; WT="$root/wt"
+  git init -q --bare "$BARE"
+  git clone -q "$BARE" "$MAIN" 2>/dev/null
+  git -C "$MAIN" config user.email t@t; git -C "$MAIN" config user.name t
+  echo base > "$MAIN/f.txt"; git -C "$MAIN" add f.txt; git -C "$MAIN" commit -qm X
+  git -C "$MAIN" push -q origin HEAD:refs/heads/main 2>/dev/null
+  git -C "$MAIN" checkout -qb tmux-only
+  git -C "$MAIN" push -q origin HEAD:refs/heads/tmux-only 2>/dev/null
+  git -C "$MAIN" config sable.integrationBranch tmux-only
+  git -C "$MAIN" worktree add -q -b feat "$WT" tmux-only 2>/dev/null
+  git -C "$WT" config user.email t@t; git -C "$WT" config user.name t
+  echo work > "$WT/w.txt"; git -C "$WT" add w.txt; git -C "$WT" commit -qm W
+  echo tint >> "$MAIN/f.txt"; git -C "$MAIN" commit -qam T-only
+  git -C "$MAIN" push -q origin HEAD:refs/heads/tmux-only 2>/dev/null
+  git -C "$MAIN" checkout -q main
+  echo mint >> "$MAIN/f.txt"; git -C "$MAIN" commit -qam M-only
+  git -C "$MAIN" push -q origin HEAD:refs/heads/main 2>/dev/null
+}
+
+run_int() { # <json> ; echoes hook stdout — SABLE_BASE_BRANCH unset, integration
+            # branch resolved from repo-local git config (falls back through
+            # $SABLE_INTEGRATION_BRANCH too, exercised here via env for belt-and-braces)
+  printf '%s' "$1" | env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE -u SABLE_BASE_BRANCH \
+    SABLE_AGENTS_YAML="$AGENTS_YAML" SABLE_MODE_STATE="$NONEXISTENT_MODE" \
+    SABLE_INTEGRATION_BRANCH=tmux-only bash "$HOOK" 2>/dev/null
+}
 
 # --- Case A: structured Worktree line targets that checkout ---
 R="$FIX/A"; mkdir -p "$R"; setup_repo "$R"
@@ -125,6 +162,20 @@ Worktree: $WT
 go.")" >/dev/null
 if has_Y "$WT"; then fail "non-manager dispatch stands down (no rebase)" "worktree was rebased despite non-manager dispatcher"
 else pass "non-manager dispatch stands down regardless of Worktree line"; fi
+
+# --- SABLE-wf6e: rebase target resolves to the CONFIGURED integration branch
+# (tmux-only), not the hardcoded origin/main default, in a repo whose default
+# branch is main ---
+R="$FIX/INT"; mkdir -p "$R"; setup_repo_int "$R"
+run_int "$(hook_input optimus "$MAIN" "Work SABLE-x.
+Worktree: $WT
+Run the tests.")" >/dev/null
+if has_commit "$WT" "T-only" && ! has_commit "$WT" "M-only"; then
+  pass "SABLE-wf6e: rebase target resolves to the configured integration branch (tmux-only), not origin/main"
+else
+  fail "SABLE-wf6e: rebase target resolves to the configured integration branch (tmux-only), not origin/main" \
+    "wt hasT-only=$(has_commit "$WT" "T-only" && echo y || echo n) hasM-only=$(has_commit "$WT" "M-only" && echo y || echo n)"
+fi
 
 echo
 echo "=========================================="
