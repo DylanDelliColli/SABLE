@@ -50,10 +50,18 @@ done
 if [ "$SCOPE" = "user" ]; then
     BASE="${CLAUDE_USER_DIR:-$HOME/.claude}"
     SETTINGS="$BASE/settings.json"
+    # --user hook commands are rewritten to the absolute BASE (byte-identical
+    # to pre-SABLE-59t6.2 behavior — there's no portable placeholder for ~/.claude).
+    SNIPPET_BASE="$BASE"
 else
     PROJECT="${SABLE_PROJECT_DIR:-$PWD}"
     BASE="$PROJECT/.claude"
-    SETTINGS="$BASE/settings.local.json"
+    # Project scope writes the COMMITTED settings.json (SABLE-59t6.2), so hook
+    # commands must be portable across clones/machines: root them at the
+    # literal ${CLAUDE_PROJECT_DIR} placeholder Claude Code expands at runtime,
+    # never this machine's absolute path.
+    SETTINGS="$BASE/settings.json"
+    SNIPPET_BASE='${CLAUDE_PROJECT_DIR}/.claude'
 fi
 SKILLS="$BASE/skills"
 HOOKS_DIR="$BASE/hooks/multi-manager"
@@ -69,7 +77,9 @@ RETIRED_HOOK_FILES="inbox-injection.sh inbox-injection-precompact.sh"
 RETIRED_AGENT_DEFS="optimus.md tarzan.md chuck.md"
 
 # Merge a settings snippet's hooks into the target settings file, idempotently.
-# Rewrites the snippet's ~/.claude paths to the install BASE. Idempotency keys on
+# Rewrites the snippet's ~/.claude paths to BASE_DIR (the absolute BASE for
+# --user scope; the literal ${CLAUDE_PROJECT_DIR}/.claude placeholder for
+# --project scope, so the committed settings.json stays portable). Idempotency keys on
 # (event, matcher, command-basename) so a hook registered under two matchers (e.g.
 # mode-interlock.sh under both Bash and Agent) is preserved, while a re-run adds
 # nothing. Backs up, validates JSON, never clobbers existing entries.
@@ -313,7 +323,7 @@ for skdir in "$REPO"/skills/*/; do
 done
 
 # Merge the settings snippet.
-merge_snippet "$SETTINGS" "$SNIPPET" "$BASE"
+merge_snippet "$SETTINGS" "$SNIPPET" "$SNIPPET_BASE"
 
 echo "Orchestration layer installed to $BASE (scope: $SCOPE)."
 echo "  • All multi-manager hooks + agents.yaml + SABLE skills + the four pane roles installed."

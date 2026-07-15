@@ -50,6 +50,7 @@ ALLOW=(
   test-pre-dispatch-refresh.sh
   test-pre-push-rebase-concurrency.sh
   test-pre-push-rebase-test.sh
+  test-project-clone-portability.sh
   test-quickstart-orchestration.sh
   test-read-guard.sh
   test-registry.sh
