@@ -765,5 +765,127 @@ def test_flag_rate_limit_stalls_never_captures_done_panes():
     assert sws.flag_rate_limit_stalls(workers, None, capture=fake_capture) == workers
 
 
+# --- SABLE-axp0: fleet-wide dialog/overlay liveness probe. A pane parked on an
+# interactive dialog or a modal overlay (a numbered selector, a startup gate, or
+# a /usage-style panel dismissed with Esc) silently swallows every message sent
+# to it — the live incident was chuck's warm MANAGER pane parked ~30min on a
+# /usage overlay, absorbing 3 sable-msg attempts, detected only by manual
+# capture-pane. The probe reuses the shared overlay_posture classifier
+# (dialog_posture + the modal-overlay case), gates it with not-busy so a working
+# pane is never flagged, and covers MANAGER panes too (parse_fleet_panes keeps
+# them where parse_worker_panes drops them). Detection surface only in v1 —
+# reported "dialog-stalled" and alerted loudly, never auto-dismissed or reaped. ---
+
+DIALOG_MENU = (
+    "  ? Which option?\n"
+    "  > 1. alpha\n"
+    "    2. beta\n"
+    "  (Use arrow keys, Enter to select)")
+USAGE_OVERLAY = (
+    "  Current usage\n"
+    "  Session:  45%\n"
+    "  Weekly:   12%\n"
+    "\n"
+    "  Esc to close")
+EMPTY_COMPOSER = "some prior output\n\n❯"
+DIALOG_WHILE_BUSY = (
+    # a menu-looking pair of lines WHILE a turn is actively running — the
+    # not-busy guard must keep this from flagging as a stall
+    "  > 1. alpha\n"
+    "    2. beta\n"
+    "⠋ Thinking… (esc to interrupt)")
+
+
+def test_overlay_posture_true_for_numbered_menu():
+    assert sws.overlay_posture(DIALOG_MENU) is True
+
+
+def test_overlay_posture_true_for_usage_style_esc_to_close_overlay():
+    # the case dialog_posture MISSES: no numbered menu, no Enter-to-select —
+    # only an 'Esc to close' dismiss hint (the chuck /usage repro).
+    assert sws.overlay_posture(USAGE_OVERLAY) is True
+
+
+def test_overlay_posture_false_on_empty_composer():
+    assert sws.overlay_posture(EMPTY_COMPOSER) is False
+
+
+def test_overlay_posture_false_for_busy_esc_to_interrupt_hint():
+    # 'esc to interrupt' is the busy-turn marker, NOT an overlay dismiss verb —
+    # it must never be mistaken for an overlay.
+    assert sws.overlay_posture("⠋ Thinking… (esc to interrupt)\n\n❯") is False
+
+
+def test_dialog_stall_true_for_idle_dialog():
+    assert sws.dialog_stall(DIALOG_MENU) is True
+
+
+def test_dialog_stall_true_for_idle_usage_overlay():
+    assert sws.dialog_stall(USAGE_OVERLAY) is True
+
+
+def test_dialog_stall_false_on_empty_composer():
+    assert sws.dialog_stall(EMPTY_COMPOSER) is False
+
+
+def test_dialog_stall_false_when_dialog_line_but_pane_is_busy():
+    # the not-busy guard: a running turn momentarily painting a dialog-like line
+    # is not a stall.
+    assert sws.dialog_stall(DIALOG_WHILE_BUSY) is False
+
+
+def test_parse_fleet_panes_keeps_manager_pane():
+    # tab-delimited _FORMAT: pane, role, bead, status, class, deliverable, lane.
+    # parse_worker_panes DROPS this row (class=manager); the fleet probe keeps it.
+    line = "%3\toptimus\t\t\tmanager\t\toptimus"
+    assert sws.parse_fleet_panes(line) == [
+        {"pane": "%3", "role": "optimus", "bead": "", "status": "running",
+         "class": "manager", "lane": "optimus"}]
+
+
+def test_parse_fleet_panes_keeps_worker_and_producer():
+    lines = ("%1\tworker\tbead-a\trunning\tworker\t\toptimus\n"
+             "%2\tvictor\t\tdone\tproducer\t/tmp/d.json\ttarzan")
+    panes = sws.parse_fleet_panes(lines)
+    assert {p["pane"] for p in panes} == {"%1", "%2"}
+    assert panes[1]["class"] == "producer" and panes[1]["role"] == "victor"
+
+
+def test_parse_fleet_panes_skips_untagged_shell():
+    # no @sable_role AND no @sable_class -> a plain terminal, not a fleet pane
+    assert sws.parse_fleet_panes("%7\t\t\t\t\t\t") == []
+
+
+def test_flag_dialog_stalls_flags_stalled_manager_pane():
+    # the key fleet-wide extension: a MANAGER pane on an overlay is flagged
+    # (parse_worker_panes would never have surfaced it).
+    panes = [{"pane": "%9", "role": "chuck", "bead": "", "status": "running",
+              "class": "manager", "lane": "chuck"}]
+    result = sws.flag_dialog_stalls(panes, None, capture=lambda pane: USAGE_OVERLAY)
+    assert result == [{"pane": "%9", "role": "chuck", "bead": "",
+                       "status": "dialog-stalled", "class": "manager", "lane": "chuck"}]
+
+
+def test_flag_dialog_stalls_leaves_normal_composer_pane():
+    panes = [{"pane": "%1", "role": "worker", "bead": "a", "status": "running",
+              "class": "worker", "lane": "optimus"}]
+    assert sws.flag_dialog_stalls(panes, None, capture=lambda pane: EMPTY_COMPOSER) == []
+
+
+def test_flag_dialog_stalls_leaves_busy_pane_unflagged():
+    panes = [{"pane": "%1", "role": "worker", "bead": "a", "status": "running",
+              "class": "worker", "lane": "optimus"}]
+    assert sws.flag_dialog_stalls(panes, None, capture=lambda pane: DIALOG_WHILE_BUSY) == []
+
+
+def test_flag_dialog_stalls_never_captures_done_panes():
+    def fake_capture(pane):
+        raise AssertionError("must never capture-pane a done pane")
+
+    panes = [{"pane": "%1", "role": "worker", "bead": "a", "status": "done",
+              "class": "worker", "lane": "optimus"}]
+    assert sws.flag_dialog_stalls(panes, None, capture=fake_capture) == []
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

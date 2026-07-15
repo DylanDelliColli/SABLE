@@ -365,6 +365,92 @@ def test_reap_under_other_manager_spares_owning_lane_done_pane(sock):
     assert _tmux(sock, "has-session", "-t", "w", check=False).returncode != 0
 
 
+# --- SABLE-axp0: fleet-wide dialog/overlay liveness probe against REAL panes.
+# A warm pane parked on a dialog/overlay silently swallows every message sent to
+# it (the chuck /usage stall). The probe capture-panes each fleet pane, flags one
+# in an overlay posture "dialog-stalled", and alerts loudly BY NAME — covering
+# MANAGER panes too, which the worker table drops. ---
+
+def _prime_dialog(s, target):
+    """Paint an interactive selector menu into `target`'s live screen, so a real
+    capture-pane shows the overlay posture the probe classifies."""
+    _tmux(s, "send-keys", "-t", target,
+          "printf '  ? pick one\\n  > 1. alpha\\n    2. beta\\n"
+          "  (Use arrow keys, Enter to select)\\n'", "Enter")
+    time.sleep(0.4)
+
+
+def test_dialog_probe_flags_stalled_manager_and_spares_normal_pane(sock):
+    """The motivating repro: a warm MANAGER pane parked on a dialog/overlay is
+    detected + surfaced by name (parse_worker_panes never lists a manager, so
+    the fleet probe is the only thing that can catch it), while a normal worker
+    pane showing no overlay is NOT flagged."""
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    # pane 0: a MANAGER pane (chuck) parked on a dialog/overlay
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_role", "chuck")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_lane", "chuck")
+    _prime_dialog(sock, "w.0")
+    # pane 1: a normal worker pane, plain prompt, no overlay
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.1", "worker", "bead-ok", "running")
+    _tag_lane(sock, "w.1", "optimus")
+    time.sleep(0.3)
+
+    p0 = _tmux(sock, "display-message", "-p", "-t", "w.0", "#{pane_id}").stdout.strip()
+    p1 = _tmux(sock, "display-message", "-p", "-t", "w.1", "#{pane_id}").stdout.strip()
+
+    r = _run(sock, "--all")
+    assert r.returncode == 0, r.stderr
+    combined = r.stdout + r.stderr
+    # the stalled MANAGER pane is detected and named (in the table AND the alert)
+    assert "DIALOG-STALLED" in r.stdout, r.stdout
+    assert p0 in combined, combined
+    assert "STALLED on a dialog/overlay" in r.stderr, r.stderr
+    # the normal worker pane is present as a running worker but NOT flagged
+    assert "bead-ok" in r.stdout, r.stdout
+    assert p1 not in r.stderr, r.stderr
+    assert r.stdout.count("DIALOG-STALLED") == 1, r.stdout
+
+
+def test_dialog_probe_silent_when_no_pane_is_stalled(sock):
+    """A fleet of normal panes produces NO stall alert — the probe must not
+    false-positive a legitimately-working lane."""
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.0", "worker", "bead-run", "running")
+    r = _run(sock, "--all")
+    assert r.returncode == 0, r.stderr
+    assert "DIALOG-STALLED" not in r.stdout, r.stdout
+    assert "STALLED on a dialog/overlay" not in r.stderr, r.stderr
+
+
+def test_dialog_probe_json_carries_stalls_and_workers(sock):
+    """--json emits both the worker table and the dialog-stall list, so a
+    machine caller can consume the probe result (SABLE-axp0)."""
+    import json as _json
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_role", "chuck")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_lane", "chuck")
+    _prime_dialog(sock, "w.0")
+    time.sleep(0.3)
+
+    r = _run(sock, "--all", "--json")
+    assert r.returncode == 0, r.stderr
+    payload = _json.loads(r.stdout)
+    assert "workers" in payload and "dialog_stalls" in payload
+    assert len(payload["dialog_stalls"]) == 1
+    assert payload["dialog_stalls"][0]["status"] == "dialog-stalled"
+    assert payload["dialog_stalls"][0]["class"] == "manager"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
