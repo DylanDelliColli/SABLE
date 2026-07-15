@@ -259,3 +259,70 @@ def test_cleanup_missing_worktree_is_noop(monkeypatch):
     smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
     assert _destructive(calls) == ["branch-d", "push-delete"]
 
+
+# --- SABLE-dtp1: resolve_integration_branch / resolve_base --------------------
+# The pre-push hook resolves a repo's integration branch via git config >
+# .sable file > env > "main" (hooks/multi-manager/lib-identity.sh's
+# sable_resolve_integration_branch). promote() must agree, instead of
+# defaulting to the literal 'llm-integration'.
+
+def _fake_git_config(monkeypatch, *, config_val=None, config_rc=1):
+    """Fake _git that answers `config --get sable.integrationBranch` and is a
+    no-op for anything else (resolve_integration_branch only calls config)."""
+    def fake_git(repo, *args, check=True):
+        if args[:2] == ("config", "--get"):
+            rc = 0 if config_val is not None else config_rc
+            return subprocess.CompletedProcess(args, rc, stdout=(config_val or "") + ("\n" if config_val else ""), stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(smg, "_git", fake_git)
+
+
+def test_resolve_integration_branch_git_config_wins(monkeypatch, tmp_path):
+    _fake_git_config(monkeypatch, config_val="release-line")
+    (tmp_path / ".sable").write_text("integrationBranch=sable-file-branch\n")
+    assert smg.resolve_integration_branch(str(tmp_path)) == "release-line"
+
+
+def test_resolve_integration_branch_sable_file_when_no_git_config(monkeypatch, tmp_path):
+    _fake_git_config(monkeypatch, config_val=None)
+    (tmp_path / ".sable").write_text("integrationBranch=sable-file-branch\n")
+    assert smg.resolve_integration_branch(str(tmp_path)) == "sable-file-branch"
+
+
+def test_resolve_integration_branch_env_when_no_config_or_file(monkeypatch, tmp_path):
+    _fake_git_config(monkeypatch, config_val=None)
+    monkeypatch.setenv("SABLE_INTEGRATION_BRANCH", "env-branch")
+    assert smg.resolve_integration_branch(str(tmp_path)) == "env-branch"
+
+
+def test_resolve_integration_branch_strips_origin_prefix_from_base_branch_env(monkeypatch, tmp_path):
+    _fake_git_config(monkeypatch, config_val=None)
+    monkeypatch.delenv("SABLE_INTEGRATION_BRANCH", raising=False)
+    monkeypatch.setenv("SABLE_BASE_BRANCH", "origin/legacy-main")
+    assert smg.resolve_integration_branch(str(tmp_path)) == "legacy-main"
+
+
+def test_resolve_integration_branch_defaults_to_main(monkeypatch, tmp_path):
+    _fake_git_config(monkeypatch, config_val=None)
+    monkeypatch.delenv("SABLE_INTEGRATION_BRANCH", raising=False)
+    monkeypatch.delenv("SABLE_BASE_BRANCH", raising=False)
+    assert smg.resolve_integration_branch(str(tmp_path)) == "main"
+
+
+def test_resolve_base_explicit_flag_wins_over_everything(monkeypatch, tmp_path):
+    monkeypatch.setenv("SABLE_MG_BASE", "env-base")
+    monkeypatch.setattr(smg, "resolve_integration_branch", lambda repo: "resolved-base")
+    assert smg.resolve_base("flag-base", str(tmp_path)) == "flag-base"
+
+
+def test_resolve_base_env_wins_when_flag_unset(monkeypatch, tmp_path):
+    monkeypatch.setenv("SABLE_MG_BASE", "env-base")
+    monkeypatch.setattr(smg, "resolve_integration_branch", lambda repo: "resolved-base")
+    assert smg.resolve_base(None, str(tmp_path)) == "env-base"
+
+
+def test_resolve_base_falls_back_to_resolved_integration_branch(monkeypatch, tmp_path):
+    monkeypatch.delenv("SABLE_MG_BASE", raising=False)
+    monkeypatch.setattr(smg, "resolve_integration_branch", lambda repo: "resolved-base")
+    assert smg.resolve_base(None, str(tmp_path)) == "resolved-base"
+
