@@ -199,6 +199,110 @@ def _append_evidence(repo: str, bead: str, note: str) -> None:
     _run(_tool("SABLE_MG_BD", "bd") + ["update", bead, "--append-notes", note], cwd=repo, check=False)
 
 
+# --------------------------------------------------------------------------
+# Post-merge cleanup (SABLE-dn7r) — GREEN path only
+# --------------------------------------------------------------------------
+
+def worktree_for_branch(repo: str, branch: str) -> str | None:
+    """Path of the registered worktree checked out on refs/heads/<branch>, or
+    None if no worktree holds it. Parsed from `git worktree list --porcelain`,
+    NEVER inferred from a naming convention: promote() runs against the main
+    checkout while worker worktrees live elsewhere, and acting on a
+    convention-guessed path was a real bug class here (SABLE-041)."""
+    cp = _git(repo, "worktree", "list", "--porcelain", check=False)
+    if cp.returncode != 0:
+        return None
+    target = f"refs/heads/{branch}"
+    path: str | None = None
+    for line in cp.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):].strip()
+        elif line.startswith("branch ") and line[len("branch "):].strip() == target:
+            return path
+        elif not line.strip():
+            path = None
+    return None
+
+
+def worktree_is_dirty(worktree_path: str) -> bool:
+    """True iff the worktree has uncommitted changes. Runs `git status
+    --porcelain` INSIDE the worktree (its own CWD) — the one place this flow is
+    meant to read the shell CWD, because that dir IS the tree being cleaned. On
+    any error, assume dirty (fail-closed: never destroy under uncertainty)."""
+    cp = _git(worktree_path, "status", "--porcelain", check=False)
+    if cp.returncode != 0:
+        return True
+    return bool(cp.stdout.strip())
+
+
+def branch_exists_locally(repo: str, branch: str) -> bool:
+    cp = _git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
+    return cp.returncode == 0
+
+
+def all_commits_patch_equivalent(repo: str, base_ref: str, branch: str) -> bool:
+    """True iff every commit unique to <branch> is already patch-present in
+    <base_ref>. `git cherry` marks each such commit '-' (an equivalent exists in
+    upstream) or '+' (genuinely absent); empty output means the branch is a pure
+    ancestor. This is the ONLY justification for escalating a refused `branch -d`
+    to `-D` — the wk-git-autopush-hunt case (rebased-and-landed: unmerged by
+    ancestry yet patch-identical). Any '+' line, or a cherry error, refuses."""
+    cp = _git(repo, "cherry", base_ref, branch, check=False)
+    if cp.returncode != 0:
+        return False
+    lines = [ln for ln in cp.stdout.splitlines() if ln.strip()]
+    return all(ln.startswith("-") for ln in lines)
+
+
+def cleanup_after_merge(repo: str, remote: str, base_ref: str, branch: str) -> None:
+    """Reap a merged worker's worktree + local branch + remote branch. GREEN
+    PATH ONLY (SABLE-dn7r): once a preview has been promoted byte-identical to
+    the integration branch, these are dead weight and re-accumulate at fleet pace
+    (58 in one day) without this. Order is load-bearing — the worktree comes off
+    FIRST (git refuses to delete a branch checked out in a worktree), then the
+    local branch, then the remote.
+
+    Every step is best-effort: failures warn on stderr and the caller swallows
+    them so a green merge stays green. A DIRTY worktree aborts the WHOLE cleanup
+    (uncommitted work is never destroyed). The remote delete is legal here
+    because this runs inside chuck's merge path — the fleet's only push lane — so
+    the chuck-only-push convention holds."""
+    # (a) worktree — resolved from porcelain, refused if dirty
+    worktree = worktree_for_branch(repo, branch)
+    if worktree is not None:
+        if worktree_is_dirty(worktree):
+            print(f"sable-merge-gate cleanup: worktree {worktree} for {branch} is DIRTY — "
+                  f"leaving worktree, local branch, and remote branch intact for the operator",
+                  file=sys.stderr)
+            return
+        rm = _git(repo, "worktree", "remove", worktree, check=False)
+        if rm.returncode != 0:
+            print(f"sable-merge-gate cleanup: could not remove worktree {worktree} for {branch} "
+                  f"({rm.stdout.strip()}) — leaving branches intact", file=sys.stderr)
+            return
+
+    # (b) local branch — -d, escalating to -D only on proven patch-equivalence
+    if branch_exists_locally(repo, branch):
+        d = _git(repo, "branch", "-d", branch, check=False)
+        if d.returncode != 0:
+            if all_commits_patch_equivalent(repo, base_ref, branch):
+                dd = _git(repo, "branch", "-D", branch, check=False)
+                if dd.returncode != 0:
+                    print(f"sable-merge-gate cleanup: guarded -D of {branch} failed: "
+                          f"{dd.stdout.strip()}", file=sys.stderr)
+            else:
+                print(f"sable-merge-gate cleanup: local branch {branch} is neither fully merged "
+                      f"nor patch-equivalent to base — NOT deleting local or remote branch "
+                      f"(operator ruling needed): {d.stdout.strip()}", file=sys.stderr)
+                return
+
+    # (c) remote branch — chuck's merge path is the fleet's only push lane
+    push = _git(repo, "push", remote, "--delete", branch, check=False)
+    if push.returncode != 0:
+        print(f"sable-merge-gate cleanup: could not delete remote branch {remote}/{branch}: "
+              f"{push.stdout.strip()}", file=sys.stderr)
+
+
 def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             manager: str, override: str | None) -> int:
     base_ref = qualify_remote_ref(remote, base)
@@ -257,6 +361,14 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
                 _append_evidence(repo, bead,
                     f"merge-preview ci-verify gate GREEN: ref {ref}, run {url or 'n/a'}, "
                     f"preview {preview_sha}, promoted byte-identical to {base}.")
+            # SABLE-dn7r: the promotion landed byte-identical, so the worker's
+            # worktree + local branch + remote branch are dead weight — reap them.
+            # Wrapped so a cleanup fault can never flip a green merge to non-zero.
+            try:
+                cleanup_after_merge(repo, remote, base_ref, branch)
+            except Exception as exc:  # noqa: BLE001 — a green merge must stay green
+                print(f"sable-merge-gate cleanup: skipped after unexpected error: {exc}",
+                      file=sys.stderr)
             return 0
 
         if conclusion in ("actions_down", "timeout"):

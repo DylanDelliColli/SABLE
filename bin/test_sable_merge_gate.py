@@ -163,3 +163,99 @@ def test_promote_tip_moved_non_ff_is_retryable_23(monkeypatch):
     # cleanup still ran despite the non-ff exit: a push --delete of the ci-verify ref
     assert any("--delete" in a for a in seen), "ci-verify ref not cleaned up on tip-moved exit"
 
+
+# --- SABLE-dn7r: post-merge worktree/branch cleanup (GREEN path only) ----------
+# At fleet pace worker worktrees + branches re-accumulate (58 in one day) unless
+# a green promote reaps them. These drive cleanup_after_merge as a unit via a
+# recording fake _git; the destructive-call ORDER is load-bearing (worktree must
+# come off before the branch, or git refuses to delete a checked-out branch).
+
+def _cleanup_fake_git(monkeypatch, *, has_worktree=True, dirty=False, branch_exists=True,
+                      worktree_remove_rc=0, branch_d_rc=0, cherry_out="", cherry_rc=0,
+                      branch_big_d_rc=0, push_delete_rc=0):
+    calls = []
+
+    def fake_git(repo, *args, check=True):
+        calls.append(args)
+        head = args[0] if args else ""
+        if head == "worktree" and len(args) >= 2 and args[1] == "list":
+            block = ("worktree /main\nHEAD aaa\nbranch refs/heads/other\n\n")
+            if has_worktree:
+                block += "worktree /wt/wk-x\nHEAD bbb\nbranch refs/heads/wk-x\n"
+            return subprocess.CompletedProcess(args, 0, stdout=block, stderr="")
+        if head == "status":
+            return subprocess.CompletedProcess(args, 0, stdout=("M f.py\n" if dirty else ""), stderr="")
+        if head == "worktree" and len(args) >= 2 and args[1] == "remove":
+            return subprocess.CompletedProcess(args, worktree_remove_rc, stdout="", stderr="")
+        if head == "show-ref":
+            return subprocess.CompletedProcess(args, 0 if branch_exists else 1, stdout="", stderr="")
+        if head == "branch" and len(args) >= 2 and args[1] == "-d":
+            return subprocess.CompletedProcess(args, branch_d_rc,
+                                               stdout=("not fully merged" if branch_d_rc else ""), stderr="")
+        if head == "cherry":
+            return subprocess.CompletedProcess(args, cherry_rc, stdout=cherry_out, stderr="")
+        if head == "branch" and len(args) >= 2 and args[1] == "-D":
+            return subprocess.CompletedProcess(args, branch_big_d_rc, stdout="", stderr="")
+        if head == "push":
+            return subprocess.CompletedProcess(args, push_delete_rc, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(smg, "_git", fake_git)
+    return calls
+
+
+def _destructive(calls):
+    """The gate-mutating verbs, in call order, ignoring read-only probes."""
+    out = []
+    for a in calls:
+        if a[:2] == ("worktree", "remove"):
+            out.append("worktree-remove")
+        elif a[:2] == ("branch", "-d"):
+            out.append("branch-d")
+        elif a[:2] == ("branch", "-D"):
+            out.append("branch-D")
+        elif a and a[0] == "push" and "--delete" in a:
+            out.append("push-delete")
+    return out
+
+
+def test_cleanup_removes_worktree_and_branches(monkeypatch):
+    # happy path: registered clean worktree, branch -d succeeds -> worktree
+    # removed, local branch deleted, remote branch deleted, in that order.
+    calls = _cleanup_fake_git(monkeypatch)
+    smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
+    assert _destructive(calls) == ["worktree-remove", "branch-d", "push-delete"]
+
+
+def test_cleanup_refuses_dirty_worktree(monkeypatch, capsys):
+    # a dirty worktree aborts the WHOLE cleanup: zero destructive calls, warning,
+    # and (in promote) exit stays 0 — uncommitted work is never destroyed.
+    calls = _cleanup_fake_git(monkeypatch, dirty=True)
+    smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
+    assert _destructive(calls) == []
+    assert "DIRTY" in capsys.readouterr().err
+
+
+def test_cleanup_refuses_unmerged_branch(monkeypatch):
+    # branch -d fails AND git cherry shows a genuinely absent commit ('+') -> no
+    # -D escalation, and neither the local nor the remote branch is deleted.
+    calls = _cleanup_fake_git(monkeypatch, branch_d_rc=1, cherry_out="+ deadbeef\n")
+    smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
+    assert _destructive(calls) == ["worktree-remove", "branch-d"]
+
+
+def test_cleanup_patch_equivalent_branch_deleted(monkeypatch):
+    # branch -d fails ancestry but every unique commit is patch-equivalent ('-')
+    # -> guarded -D proceeds, then the remote is deleted (wk-git-autopush-hunt).
+    calls = _cleanup_fake_git(monkeypatch, branch_d_rc=1, cherry_out="- cca59c2\n")
+    smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
+    # the refused -d is a real attempt before the guarded -D escalation
+    assert _destructive(calls) == ["worktree-remove", "branch-d", "branch-D", "push-delete"]
+
+
+def test_cleanup_missing_worktree_is_noop(monkeypatch):
+    # no registered worktree -> skip (a) entirely, still delete both branches.
+    calls = _cleanup_fake_git(monkeypatch, has_worktree=False)
+    smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
+    assert _destructive(calls) == ["branch-d", "push-delete"]
+
