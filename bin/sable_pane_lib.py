@@ -134,6 +134,37 @@ def dialog_posture(capture: str) -> bool:
     return sum(1 for line in lines if line and _DIALOG_OPTION_RE.match(line)) >= 2
 
 
+# A modal INFO overlay (the /usage panel, /help, /model preamble, ...) blocks
+# the composer exactly as a selector dialog does, but its tell is an
+# "Esc to close/exit/go back/dismiss" DISMISS affordance, not a numbered menu or
+# an Enter-to-select prompt — so dialog_posture (tuned conservative for m94k's
+# SPAWN gate) does not catch it. The alternation lists dismiss verbs ONLY: it
+# must never collide with the busy-turn "esc to interrupt" hint (_BUSY_MARKERS),
+# which marks a working pane, not a stall.
+_OVERLAY_DISMISS_RE = re.compile(
+    r"esc(ape)?\s+to\s+(close|exit|go back|dismiss)", re.IGNORECASE)
+
+
+def overlay_posture(capture: str) -> bool:
+    """True when the pane is blocked on a modal overlay/dialog demanding a
+    keypress to dismiss — a SUPERSET of dialog_posture (SABLE-axp0). Reuses
+    dialog_posture for the selector/gate case (numbered menu, Enter-to-select,
+    known startup gates) and ADDS the info-overlay case it misses: a /usage-style
+    panel shows no numbered menu and no 'Enter to select' affordance, only an
+    'Esc to close' dismiss hint — yet it blocks the composer and silently
+    swallows every sent keystroke into itself, the ~30min chuck /usage stall
+    that motivated this bead. Building on dialog_posture rather than editing it
+    keeps m94k's spawn gate (which calls dialog_posture directly) untouched.
+
+    Like dialog_posture, deliberately conservative: matching only dialog/overlay
+    signatures (never the empty composer or a plain shell prompt) so a caller can
+    combine it with a not-busy check to flag a genuinely idle-blocked pane
+    without false-positiving a working one."""
+    if dialog_posture(capture):
+        return True
+    return any(_OVERLAY_DISMISS_RE.search(_clean(line)) for line in capture.splitlines())
+
+
 # The session-limit banner Claude Code prints when a message/session rate
 # limit cuts a turn short ("You have hit your session limit - resets 2pm").
 # The turn dies but the composer goes right back to its normal empty prompt,

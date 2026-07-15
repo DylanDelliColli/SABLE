@@ -33,6 +33,23 @@ capture-paned each pass; one showing the banner AND an idle composer is
 reported as "stalled-rate-limit" with the reset time attached, instead of
 "running". Detection surface only in v1 — never reaped, never auto-nudged.
 
+A FLEET-WIDE dialog/overlay liveness probe (SABLE-axp0) runs on every pass, a
+sibling to the rate-limit stall check but broader in reach: a pane parked on an
+interactive dialog or a modal overlay (a numbered selector, a startup gate, or a
+/usage-style panel dismissed with Esc) silently absorbs every message sent to it
+into the overlay — the live incident was chuck's warm MANAGER pane parked ~30min
+on a /usage overlay, swallowing 3 undelivered sable-msg attempts and stalling an
+epic-gating merge, detected only by manual capture-pane. Unlike the worker table
+(lane-scoped, reap-capable), this probe spans EVERY lane AND includes manager
+panes (which parse_worker_panes deliberately drops) — a lane-scoped worker sweep
+would never see a stalled manager in another lane. It is DETECTION-ONLY: each
+non-done fleet pane is capture-paned and classified via the shared
+overlay_posture classifier (dialog_posture + the modal-overlay case) combined
+with not-busy; a match is reported "dialog-stalled" and alerted loudly by pane
+name to stdout AND stderr. Nothing is auto-dismissed or reaped in v1 — auto-Esc
+of a known-benign overlay is deferred so the probe never clears a legitimate
+mid-dialog pane (see SABLE-kkgt for the delivery failures a silent stall causes).
+
 The bead pool is the manager's RESULT channel (the manager reviews the closed
 bead). This tool is the janitor: it surfaces pane liveness and reaps panes
 whose occupant has flagged itself done — pure tmux, no bd coupling.
@@ -73,7 +90,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    SessionCollision, capture_pane, pane_ready, resolve_session, session_limit_reset)
+    SessionCollision, capture_pane, overlay_posture, pane_busy, pane_ready,
+    resolve_session, session_limit_reset)
 
 WORKER_ROLE_PREFIX = "worker"
 # Tab-delimited (SABLE-exab): a space-joined format collapses an EMPTY field
@@ -142,6 +160,36 @@ def parse_worker_panes(output: str) -> list[dict]:
     return workers
 
 
+def parse_fleet_panes(output: str) -> list[dict]:
+    """Every sable-tagged pane — INCLUDING manager panes — for the fleet-wide
+    dialog/overlay liveness probe (SABLE-axp0). parse_worker_panes deliberately
+    drops @sable_class=manager (managers are never listed or reaped there), but
+    the stall that motivated this probe was chuck's warm MANAGER pane parked
+    ~30min on a /usage overlay, so the probe must see managers too. This path is
+    DETECTION-ONLY — it never feeds reaping_decision — so including managers is
+    safe: reaping still flows exclusively through parse_worker_panes. Returns
+    {pane, role, bead, status, class, lane} per pane; an untagged shell (no
+    @sable_role AND no @sable_class) is skipped so a plain terminal isn't probed."""
+    panes: list[dict] = []
+    for line in output.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        pane, role = parts[0], parts[1]
+        cls = parts[4] if len(parts) >= 5 and parts[4] else ""
+        if not role and not cls:
+            continue  # untagged shell -- not a fleet pane, don't probe it
+        panes.append({
+            "pane": pane,
+            "role": role,
+            "bead": parts[2] if len(parts) >= 3 else "",
+            "status": parts[3] if len(parts) >= 4 and parts[3] else "running",
+            "class": cls,
+            "lane": parts[6] if len(parts) >= 7 and parts[6] else "",
+        })
+    return dedupe_panes(panes)
+
+
 def is_done(status: str) -> bool:
     return status == "done"
 
@@ -205,6 +253,18 @@ def flag_rate_limit_stalls(workers: list[dict], socket: str | None, capture=None
         reset = rate_limit_stall(cap(w["pane"]))
         flagged.append({**w, "status": "stalled-rate-limit", "reset": reset} if reset else w)
     return flagged
+
+
+def dialog_stall(capture: str) -> bool:
+    """True when `capture` shows a pane STALLED on an interactive dialog/overlay
+    AND not mid-turn — the warm-pane analogue of rate_limit_stall (SABLE-axp0).
+    Combines the shared overlay_posture classifier (m94k's dialog_posture plus
+    the /usage-style modal-overlay case) with `not pane_busy` so the flag means
+    genuinely idle-blocked: a pane actively running a turn that momentarily
+    paints a dialog-like line (a spinner over transcript text) is NOT a stall.
+    A pane in this posture swallows every keystroke sent to it into the overlay
+    — the silent-absorption signature behind the chuck /usage incident."""
+    return overlay_posture(capture) and not pane_busy(capture)
 
 
 def reaping_decision(workers: list[dict]) -> list[str]:
@@ -316,6 +376,44 @@ def list_workers(socket: str | None, run=_runner, session: str | None = None) ->
     except subprocess.CalledProcessError:
         return []
     return dedupe_panes(parse_worker_panes(out))
+
+
+def list_fleet_panes(socket: str | None, run=_runner, session: str | None = None) -> list[dict]:
+    """Every sable-tagged pane in THIS repo's fleet, managers included — the
+    enumeration the dialog probe runs over (SABLE-axp0). Session-scoped exactly
+    like list_workers (a server-wide -a listing would probe another repo's
+    fleet); a missing session is simply zero panes. Distinct from list_workers
+    only in that it KEEPS manager panes (parse_fleet_panes vs parse_worker_panes)
+    and skips the done-status windowed sampling — the probe needs a live snapshot
+    of who is blocked right now, not a reaping decision."""
+    scope = ["-s", "-t", session] if session else ["-a"]
+    try:
+        out = run(tmux_base(socket) + ["list-panes", *scope, "-F", _FORMAT])
+    except subprocess.CalledProcessError:
+        return []
+    return parse_fleet_panes(out)
+
+
+def flag_dialog_stalls(panes: list[dict], socket: str | None, capture=None) -> list[dict]:
+    """Capture-pane every non-done fleet pane and return those STALLED on a
+    dialog/overlay (dialog_stall) — the fleet-wide liveness probe (SABLE-axp0).
+    Covers manager AND worker/producer panes, because the motivating stall was
+    chuck's warm MANAGER pane on a /usage overlay silently absorbing 3 sable-msg
+    attempts for ~30min. Done panes are skipped (a finished pane isn't stalled).
+    Each returned record is the pane's fleet dict with status set to
+    "dialog-stalled". Detection surface only in v1: the caller alerts loudly by
+    pane name; nothing is auto-dismissed (Esc) or reaped, so the probe can never
+    clear a legitimate mid-dialog pane. One capture-pane per pane is cheap at the
+    fleet's handful of panes (SABLE_MAX_WORKERS caps it)."""
+    base = tmux_base(socket)
+    cap = capture or (lambda pane: capture_pane(base, pane))
+    stalled: list[dict] = []
+    for p in panes:
+        if is_done(p["status"]):
+            continue
+        if dialog_stall(cap(p["pane"])):
+            stalled.append({**p, "status": "dialog-stalled"})
+    return stalled
 
 
 _DEFAULT_SAMPLE_INTERVAL = 1.5
@@ -546,8 +644,17 @@ def main(argv: list[str] | None = None) -> int:
     workers = flag_rate_limit_stalls(workers, socket)
     dnd_panes = {w["pane"] for w in done_no_deliverable(workers)}
 
+    # SABLE-axp0: the fleet-wide dialog/overlay liveness probe. It is INTENTIONALLY
+    # NOT scoped to view_lane and INTENTIONALLY spans managers: the motivating
+    # stall was chuck's warm MANAGER pane in its own lane, which no lane-scoped
+    # worker sweep would ever surface. Surfacing another lane's stalled pane is
+    # safe because this pass only reports — nothing here reaps. So a manager
+    # running its periodic status now NOTICES a fleet stall instead of it sitting
+    # silent for ~30min while it absorbs undelivered messages (SABLE-kkgt).
+    dialog_stalls = flag_dialog_stalls(list_fleet_panes(socket, session=session), socket)
+
     if ns.json:
-        print(json.dumps(workers, indent=2))
+        print(json.dumps({"workers": workers, "dialog_stalls": dialog_stalls}, indent=2))
     else:
         if not workers:
             print("no worker panes")
@@ -557,6 +664,22 @@ def main(argv: list[str] | None = None) -> int:
                 flag += f" [resets={w.get('reset', '?')}]"
             lane = w.get("lane", "-")  # SABLE-dcw2 owner column; "-" if unstamped
             print(f"{w['pane']:<8} {lane:<10} {w['bead']:<16} {w['status']}{flag}")
+        for s in dialog_stalls:
+            who = s.get("lane") or s.get("role") or "?"
+            print(f"⚠ DIALOG-STALLED {s['pane']:<8} {who:<10} "
+                  f"{s.get('bead') or '-':<16} blocked on a dialog/overlay "
+                  f"— dismiss it (Esc) or nudge the pane")
+
+    # Loud alert to stderr too (SABLE-axp0): the table can scroll past unread, but
+    # a stalled pane silently swallowing messages must be impossible to miss. Name
+    # every stalled pane so the operator/fleet can act; nothing was auto-cleared.
+    if dialog_stalls:
+        names = ", ".join(
+            f"{s['pane']}({s.get('lane') or s.get('role') or '?'})" for s in dialog_stalls)
+        sys.stderr.write(
+            f"sable-worker-status: ⚠ {len(dialog_stalls)} pane(s) STALLED on a "
+            f"dialog/overlay, silently absorbing messages — {names}. Dismiss (Esc) "
+            f"or nudge each; nothing was auto-cleared (SABLE-axp0 v1 is detect-only).\n")
 
     if ns.reap:
         doomed = reaping_decision(workers)
