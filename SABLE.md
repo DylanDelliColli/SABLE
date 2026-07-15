@@ -1129,6 +1129,22 @@ This uses only your own worktree's working directory and a scratch file — no s
 
 **Break-glass fallback**, only if stash is truly unavoidable: prefix your stash message with your worker/scope name (`git stash push -m "<scope>: <what>"`), and treat the stack as hostile — run `git stash list` immediately before every `pop`/`drop` and act **only** by explicit index (`git stash pop stash@{N}`). Never assume `stash@{0}` is yours; another worker may have pushed after you.
 
+### 6.4b Clean-Room Verification Before Push
+
+A dev box carries `bd` and `dolt` on `PATH` ambiently; the CI merge-preview gate (`.github/workflows/ci-verify.yml`) deliberately does not — it is a fresh runner with only `python`+`pytest`+`tmux`+`git`, no `bd`, no `dolt`, no installed `~/.claude`. A suite that touches `install.sh` and silently assumes `bd`/`dolt` are present passes on every local run and only reds once it lands on that runner — after push, after the gate already ran.
+
+`bin/sable-clean-room-verify` closes that gap: it runs a given command with every `PATH` entry that provides `bd` or `dolt` **removed** (not merely shadowed by something earlier on `PATH`), reproducing the one dimension of the CI clean-room that silently passes locally and reds in CI.
+
+```bash
+# Run the canonical gate locally, exactly as ci-verify.yml will see it
+bin/sable-clean-room-verify
+
+# Isolate a single install.sh-touching suite before push
+bin/sable-clean-room-verify bash hooks/test/test-sable-bin-install.sh
+```
+
+**Any suite added to `.github/ci/shell-run-set.sh`'s `ALLOW` list must be clean-room-safe**: it must self-skip when `bd`/`dolt` are absent (exit 0 with a clear `SKIP:` message — never a bare pass-through that ran nothing) or stub them in and genuinely exercise itself (see `hooks/test/test-sable-bin-install.sh`'s `S2_STUB` pattern). A suite that only "passes" because it never noticed `bd` was missing is a false-pass, not clean-room-safe — verify it with `sable-clean-room-verify` before widening `ALLOW`.
+
 ### 6.5 Formal Swarms with `bd swarm`
 
 Section 6.2 covered the dispatch pattern. `bd swarm` formalizes it: an epic + its children become a registered "swarm molecule" with structure-aware tooling.

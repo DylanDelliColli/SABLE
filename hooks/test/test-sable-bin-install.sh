@@ -14,8 +14,10 @@
 # PATH (exits 1 otherwise, even under --dry-run). The CI clean-room has no bd, so
 # those blocks prepend a NO-OP bd stub to PATH for the install.sh runs — see the
 # S2_STUB comment below. This whole suite must exit 0 with real bd ABSENT and
-# only the stub present; reproduce that before pushing (README: run it with bd
-# scrubbed from PATH).
+# only the stub present; reproduce that before pushing with:
+#   bin/sable-clean-room-verify bash hooks/test/test-sable-bin-install.sh
+# (SABLE.md §6.4b — this removes bd/dolt from PATH rather than merely
+# shadowing an ambient install, so it matches ci-verify.yml exactly.)
 
 set -uo pipefail
 unset SABLE_FEEDBACK_DIR 2>/dev/null || true
