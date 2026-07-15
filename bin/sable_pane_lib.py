@@ -134,6 +134,31 @@ def dialog_posture(capture: str) -> bool:
     return sum(1 for line in lines if line and _DIALOG_OPTION_RE.match(line)) >= 2
 
 
+# The session-limit banner Claude Code prints when a message/session rate
+# limit cuts a turn short ("You have hit your session limit - resets 2pm").
+# The turn dies but the composer goes right back to its normal empty prompt,
+# so nothing else distinguishes that pane from one simply between turns — an
+# alive pane with a CUT turn (SABLE-ita7: the SABLE-tz7h.4 worker pane sat
+# "running" for ~5 hours after hitting this, invisible to sable-worker-status
+# the whole time).
+_SESSION_LIMIT_RE = re.compile(r"hit your session limit.*?resets?\s+(.+)", re.IGNORECASE)
+
+
+def session_limit_reset(capture: str) -> str | None:
+    """The reset-time text ('2pm', 'tomorrow at 9am', ...) when a line of
+    `capture` carries the Claude Code session-rate-limit banner, or None if
+    the banner isn't present anywhere in the pane. Only tests for the
+    banner's TEXT — whether the pane is actually STALLED on it (an idle
+    composer, turn cut off) versus the banner merely sitting in older
+    scrollback while a later turn keeps processing is the caller's call,
+    combining this with pane_ready (SABLE-ita7)."""
+    for line in capture.splitlines():
+        m = _SESSION_LIMIT_RE.search(_clean(line))
+        if m:
+            return m.group(1).strip()
+    return None
+
+
 def dispatch_landed(capture: str, snippet: str) -> bool:
     """True once the instruction has been SUBMITTED: the snippet appears in the
     pane but no longer sits in the input box. The box is the LAST prompt-glyph
