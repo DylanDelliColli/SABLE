@@ -20,6 +20,7 @@ _REPO_ROOT = _BIN.parent
 sys.path.insert(0, str(_BIN))
 
 import sable_stack_detect as ssd  # noqa: E402
+import sable_ci_template as sct  # noqa: E402
 
 
 # ===========================================================================
@@ -297,3 +298,252 @@ def test_scan_contract_matches_lib_identity_resolvers(
             assert module_val is None, "%s: module should reject" % label
             # Rejected line -> resolver falls through to its fallback.
             assert shell_val == fallback, "%s: resolver should fall back" % label
+
+
+# ===========================================================================
+# sable_ci_template — render + provider detection (SABLE-gn7a.2)
+#
+# Integration character: the render tests exercise the REAL checked-in template
+# at templates/ci-verify-project.yml (not a fixture copy), and the provider
+# tests run against REAL git repos + real filesystem CI-config layouts. A
+# yaml-guarded test loads the rendered output through a REAL YAML parser so any
+# indentation error in the substituted runtime block reds the gate.
+# ===========================================================================
+
+_TEMPLATE = _REPO_ROOT / "templates" / "ci-verify-project.yml"
+
+# SABLE-specific suite steps that a portable, rendered workflow must NEVER carry
+# — they belong only to THIS repo's own .github/workflows/ci-verify.yml. These
+# are the exact step-command fragments the bead names; the template's header
+# comment may still *describe* the gate (e.g. name sable-merge-gate) — what must
+# never appear is an actual step running one of these SABLE-only suites.
+_SABLE_ONLY_STEPS = (
+    "shell-run-set",
+    "pytest bin/",
+    "fixture-tripwire",
+)
+
+
+def _git(repo, *args):
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+# --- render -----------------------------------------------------------------
+
+def test_generated_workflow_triggers_on_ci_verify_glob():
+    """The rendered trigger keeps the load-bearing ci-verify/** glob (SABLE-ad21)
+    and the workflow_dispatch escape hatch, and substitutes the confirmed
+    integration branch — with no render placeholders left behind."""
+    out = sct.render_workflow(
+        integration_branch="main", test_command="pytest -q", kind="python")
+
+    assert "- 'ci-verify/**'" in out
+    assert "- 'main'" in out            # integration branch substituted
+    assert "workflow_dispatch" in out
+    # every render placeholder is resolved (GitHub's own ${{ github.ref }} stays)
+    assert "{{INTEGRATION_BRANCH}}" not in out
+    assert "{{RUNTIME_SETUP}}" not in out
+    assert "{{TEST_COMMAND}}" not in out
+
+
+def test_generated_workflow_runs_confirmed_testcommand():
+    """The confirmed testCommand is run verbatim, and the rendered output carries
+    NONE of this repo's SABLE-specific suite steps."""
+    cmd = "python3 -m pytest -q && npm run lint"
+    out = sct.render_workflow(
+        integration_branch="tmux-only", test_command=cmd, kind="python")
+
+    assert cmd in out
+    assert "{{TEST_COMMAND}}" not in out
+    for banned in _SABLE_ONLY_STEPS:
+        assert banned not in out, "rendered workflow leaked SABLE-only step: %s" % banned
+
+
+def test_generated_workflow_optional_blocks_present_but_commented():
+    """The git-identity and default-branch-pin optional blocks (SABLE-59zu/r1zs)
+    survive rendering, and every one of their content lines stays commented — a
+    portable repo opts in, it does not inherit them live."""
+    out = sct.render_workflow(
+        integration_branch="main", test_command="pytest", kind="python")
+    lines = out.splitlines()
+
+    content = [l for l in lines
+               if "user.email" in l or "user.name" in l or "init.defaultBranch" in l]
+    assert content, "optional git-identity / default-branch blocks missing"
+    for l in content:
+        assert l.lstrip().startswith("#"), "optional block line not commented: %r" % l
+
+    assert any("Configure git identity" in l and l.lstrip().startswith("#") for l in lines)
+    assert any("Pin default branch" in l and l.lstrip().startswith("#") for l in lines)
+
+
+def test_template_static_shape_has_required_contract():
+    """The CHECKED-IN template itself carries the non-negotiable contract:
+    name, ci-verify/** trigger, workflow_dispatch, concurrency+cancel,
+    contents:read permission, checkout fetch-depth 0, both render anchors, and
+    the commented optional blocks — and no SABLE-only suite steps."""
+    text = _TEMPLATE.read_text(encoding="utf-8")
+
+    assert "name: ci-verify" in text
+    assert "- 'ci-verify/**'" in text
+    assert "{{INTEGRATION_BRANCH}}" in text
+    assert "workflow_dispatch" in text
+
+    assert "concurrency:" in text
+    assert "cancel-in-progress: true" in text
+
+    assert "permissions:" in text
+    assert "contents: read" in text
+
+    assert "actions/checkout@v4" in text
+    assert "fetch-depth: 0" in text
+
+    assert "{{RUNTIME_SETUP}}" in text
+    assert "{{TEST_COMMAND}}" in text
+
+    lines = text.splitlines()
+    assert any("init.defaultBranch" in l and l.lstrip().startswith("#") for l in lines)
+    assert any("user.email" in l and l.lstrip().startswith("#") for l in lines)
+
+    for banned in _SABLE_ONLY_STEPS:
+        assert banned not in text, "template carries a SABLE-only step: %s" % banned
+
+
+def test_runtime_setup_keyed_to_detected_stack():
+    """Runtime setup is keyed to the stack: python -> setup-python, each JS
+    manager -> its own install, go -> setup-go, rust -> rustup; an unknown /
+    none kind renders a commented placeholder, never a broken step."""
+    assert "actions/setup-python@v5" in sct.render_workflow(
+        integration_branch="main", test_command="t", kind="python")
+
+    pnpm = sct.render_workflow(integration_branch="main", test_command="t", kind="js/pnpm")
+    assert "pnpm install --frozen-lockfile" in pnpm and "actions/setup-node@v4" in pnpm
+
+    assert "npm ci" in sct.render_workflow(
+        integration_branch="main", test_command="t", kind="js/npm")
+    assert "actions/setup-go@v5" in sct.render_workflow(
+        integration_branch="main", test_command="t", kind="go")
+    assert "rustup toolchain install" in sct.render_workflow(
+        integration_branch="main", test_command="t", kind="rust")
+
+    none_out = sct.render_workflow(integration_branch="main", test_command="t", kind=None)
+    assert "No language runtime detected" in none_out
+
+
+def test_kind_for_command_selects_matching_candidate():
+    """kind_for_command picks the kind of the candidate whose command the human
+    confirmed, and returns None for a hand-typed command with no match."""
+    det = ssd.Detection((
+        ssd.Candidate("pnpm test", "pnpm-lock.yaml", "js/pnpm"),
+        ssd.Candidate("go test ./...", "go.mod", "go"),
+    ))
+    assert sct.kind_for_command(det, "go test ./...") == "go"
+    assert sct.kind_for_command(det, "pnpm test") == "js/pnpm"
+    assert sct.kind_for_command(det, "make bespoke") is None
+
+
+@pytest.mark.parametrize("kind", ["python", "js/pnpm", "js/yarn", "js/npm", "go", "rust", None])
+def test_rendered_workflow_is_valid_yaml(kind):
+    """Every runtime block indents to valid YAML: parse the rendered output and
+    assert the whole contract survives (trigger, dispatch, concurrency,
+    permissions, checkout fetch-depth 0, and a step running the confirmed
+    command). Guarded on PyYAML — the clean-room installs only pytest."""
+    yaml = pytest.importorskip("yaml")
+    cmd = "pytest -q && echo done"
+    out = sct.render_workflow(
+        integration_branch="release", test_command=cmd, kind=kind)
+    doc = yaml.safe_load(out)
+
+    assert doc["name"] == "ci-verify"
+    # YAML 1.1 parses the bare key `on:` as boolean True — accept either.
+    on = doc.get("on", doc.get(True))
+    assert "ci-verify/**" in on["push"]["branches"]
+    assert "release" in on["push"]["branches"]
+    assert "workflow_dispatch" in on
+
+    assert doc["concurrency"]["cancel-in-progress"] is True
+    assert doc["permissions"]["contents"] == "read"
+
+    steps = doc["jobs"]["verify"]["steps"]
+    assert any(
+        str(s.get("uses", "")).startswith("actions/checkout")
+        and s.get("with", {}).get("fetch-depth") == 0
+        for s in steps
+    )
+    assert any(cmd in (s.get("run") or "") for s in steps)
+
+
+# --- provider detection -----------------------------------------------------
+
+def test_non_github_provider_reports_line_not_file(tmp_path):
+    """A repo already carrying non-GitHub CI (GitLab here) is report-only: a
+    named manual remedy line, apply_ok False, and NO workflow path to write."""
+    _touch(tmp_path, ".gitlab-ci.yml", "stages: [test]\n")
+
+    prov = sct.detect_provider(str(tmp_path))
+
+    assert prov.kind == sct.NON_GITHUB_CI
+    assert prov.apply_ok is False
+    assert prov.workflow_path is None            # a line, not a file
+    assert "GitLab" in prov.detail
+    assert "manually" in prov.detail             # named manual remedy
+
+
+def test_existing_ci_detected_and_reported_not_overwritten(tmp_path):
+    """An existing .github/workflows/ci-verify.yml is reported present and is
+    NEVER overwritten — detect_provider only classifies; the file is byte-for-
+    byte untouched afterward."""
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    sentinel = "name: ci-verify\n# hand-authored — do not touch\n"
+    (wf / "ci-verify.yml").write_text(sentinel, encoding="utf-8")
+
+    prov = sct.detect_provider(str(tmp_path))
+
+    assert prov.kind == sct.EXISTING_CI_VERIFY
+    assert prov.apply_ok is False
+    assert prov.workflow_path == str(wf / "ci-verify.yml")
+    assert (wf / "ci-verify.yml").read_text(encoding="utf-8") == sentinel
+
+
+def test_no_remote_ci_goes_report_only(tmp_path):
+    """A real git repo with NO remote classifies as no-ci: report-only,
+    apply_ok False, nothing to write."""
+    _git(tmp_path, "init", "-q")
+
+    prov = sct.detect_provider(str(tmp_path))
+
+    assert prov.kind == sct.NO_CI
+    assert prov.apply_ok is False
+    assert prov.workflow_path is None
+
+
+def test_github_remote_is_apply_ok(tmp_path):
+    """A git repo whose remote URL matches github.com is the one apply_ok
+    outcome, and it names the target workflow path."""
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "remote", "add", "origin", "https://github.com/acme/widget.git")
+
+    prov = sct.detect_provider(str(tmp_path))
+
+    assert prov.kind == sct.GITHUB_REMOTE
+    assert prov.apply_ok is True
+    assert prov.workflow_path == os.path.join(str(tmp_path), sct.CI_VERIFY_WORKFLOW_REL)
+
+
+def test_existing_ci_verify_wins_over_github_remote(tmp_path):
+    """Precedence: an existing ci-verify.yml is reported (never overwrite) even
+    when a github.com remote is also present — never-overwrite trumps apply."""
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "remote", "add", "origin", "https://github.com/acme/widget.git")
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "ci-verify.yml").write_text("name: ci-verify\n", encoding="utf-8")
+
+    prov = sct.detect_provider(str(tmp_path))
+
+    assert prov.kind == sct.EXISTING_CI_VERIFY
+    assert prov.apply_ok is False

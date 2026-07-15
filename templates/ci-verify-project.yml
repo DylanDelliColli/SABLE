@@ -1,0 +1,55 @@
+# ci-verify — portable CI gate rendered by /sable-onboarding into a target repo's
+# .github/workflows/ci-verify.yml (bin/sable_ci_template.py, SABLE-gn7a.2).
+#
+# LOAD-BEARING TRIGGER (do NOT edit out ci-verify/**): bin/sable-merge-gate's
+# wait_for_ci polls `gh run list --branch ci-verify/<bead>-<sha7>` for a run whose
+# headSha equals its merge-preview SHA, so this workflow MUST fire on push to
+# ci-verify/** or the merge gate silently goes dead (the SABLE-ad21 lesson).
+#
+# This is the CHECKED-IN skeleton. The onboarding skill substitutes three
+# placeholders at render time — the integration branch, the runtime setup keyed
+# to the detected stack, and the confirmed test command — and never emits
+# SABLE-specific suite steps.
+name: ci-verify
+
+on:
+  push:
+    branches:
+      - 'ci-verify/**'             # merge-preview gate refs — MUST stay (SABLE-ad21)
+      - '{{INTEGRATION_BRANCH}}'   # this project's integration branch
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+{{RUNTIME_SETUP}}
+
+      # ── Optional (SABLE-59zu): a fresh runner has no git identity, so any test
+      # that creates a commit dies with exit 128. Uncomment if your suite commits.
+      # - name: Configure git identity
+      #   run: |
+      #     git config --global user.email "ci-verify@example.local"
+      #     git config --global user.name  "ci-verify"
+
+      # ── Optional (SABLE-r1zs): pin git's traditional default branch when suites
+      # build throwaway fixture repos whose base-branch resolution assumes it.
+      # - name: Pin default branch
+      #   run: git config --global init.defaultBranch master
+
+      - name: Run tests
+        run: |
+          {{TEST_COMMAND}}
