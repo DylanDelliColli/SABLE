@@ -25,6 +25,14 @@ killed; it is flagged "done-no-deliverable" in the report instead (the
 SABLE-e6m6 pull-authoritative detection surface — the resume/respawn ACTION
 stays with Lincoln in v1).
 
+A "running" pane whose turn was cut off by the Claude Code session-rate-limit
+banner ("hit your session limit ... resets ...") reads identically to a busy
+pane by tag alone — an alive pane, status=running — and can sit stalled
+indefinitely with nobody noticing (SABLE-ita7). Every running pane is
+capture-paned each pass; one showing the banner AND an idle composer is
+reported as "stalled-rate-limit" with the reset time attached, instead of
+"running". Detection surface only in v1 — never reaped, never auto-nudged.
+
 The bead pool is the manager's RESULT channel (the manager reviews the closed
 bead). This tool is the janitor: it surfaces pane liveness and reaps panes
 whose occupant has flagged itself done — pure tmux, no bd coupling.
@@ -64,7 +72,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from sable_pane_lib import SessionCollision, resolve_session  # noqa: E402
+from sable_pane_lib import (  # noqa: E402
+    SessionCollision, capture_pane, pane_ready, resolve_session, session_limit_reset)
 
 WORKER_ROLE_PREFIX = "worker"
 # Tab-delimited (SABLE-exab): a space-joined format collapses an EMPTY field
@@ -159,6 +168,43 @@ def done_no_deliverable(workers: list[dict]) -> list[dict]:
     return [w for w in workers
             if w.get("class") == "producer" and is_done(w["status"])
             and not deliverable_ok(w.get("deliverable", ""))]
+
+
+def rate_limit_stall(capture: str) -> str | None:
+    """The reset-time text when `capture` shows a pane STALLED on the Claude
+    Code session-rate-limit banner: the banner text is present AND the
+    composer is back to its idle empty prompt (pane_ready) — proof the turn
+    was cut off, not merely a banner sitting mid-scrollback while a later
+    turn keeps processing (SABLE-ita7). Returns None when the banner isn't
+    present, or when it IS present but the composer isn't ready yet (still
+    processing — not yet stalled; v1 is a detection surface only, no
+    auto-nudge)."""
+    reset = session_limit_reset(capture)
+    if reset is None or not pane_ready(capture):
+        return None
+    return reset
+
+
+def flag_rate_limit_stalls(workers: list[dict], socket: str | None, capture=None) -> list[dict]:
+    """Capture-pane every RUNNING worker/producer and flag one whose turn was
+    cut off by the Claude Code session-rate-limit banner: its status becomes
+    "stalled-rate-limit" with a "reset" field carrying the reset-time text
+    (SABLE-ita7 — the SABLE-tz7h.4 worker pane read "running" for ~5 hours
+    after hitting the limit, with no distinguishing signal). Done/
+    done-unconfirmed panes are left untouched — a finished pane isn't
+    "stalled". One capture-pane call per running pane is cheap at the pane
+    counts this tool manages (SABLE_MAX_WORKERS caps the fleet at a
+    handful)."""
+    base = tmux_base(socket)
+    cap = capture or (lambda pane: capture_pane(base, pane))
+    flagged: list[dict] = []
+    for w in workers:
+        if w["status"] != "running":
+            flagged.append(w)
+            continue
+        reset = rate_limit_stall(cap(w["pane"]))
+        flagged.append({**w, "status": "stalled-rate-limit", "reset": reset} if reset else w)
+    return flagged
 
 
 def reaping_decision(workers: list[dict]) -> list[str]:
@@ -497,6 +543,7 @@ def main(argv: list[str] | None = None) -> int:
     view_lane = resolve_view_lane(ns)
     if view_lane is not None:
         workers = filter_by_lane(workers, view_lane)
+    workers = flag_rate_limit_stalls(workers, socket)
     dnd_panes = {w["pane"] for w in done_no_deliverable(workers)}
 
     if ns.json:
@@ -506,6 +553,8 @@ def main(argv: list[str] | None = None) -> int:
             print("no worker panes")
         for w in workers:
             flag = " [done-no-deliverable]" if w["pane"] in dnd_panes else ""
+            if w["status"] == "stalled-rate-limit":
+                flag += f" [resets={w.get('reset', '?')}]"
             lane = w.get("lane", "-")  # SABLE-dcw2 owner column; "-" if unstamped
             print(f"{w['pane']:<8} {lane:<10} {w['bead']:<16} {w['status']}{flag}")
 

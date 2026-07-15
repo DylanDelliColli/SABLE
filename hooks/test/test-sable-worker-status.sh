@@ -253,6 +253,30 @@ else
 fi
 rm -f "$DELIVERABLE3"
 
+# --- SABLE-ita7: a "running" pane whose turn was cut off by the Claude Code
+#     session-rate-limit banner must be flagged stalled-rate-limit (with the
+#     reset time) instead of reading "running" forever ---
+tmux -L "$SOCK" new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
+sleep 0.3
+PANE11="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"
+tag "$PANE11" worker bead-eleven running
+tmux -L "$SOCK" send-keys -t "$PANE11" "echo 'You have hit your session limit - resets 2pm'" Enter
+sleep 0.2
+tmux -L "$SOCK" send-keys -t "$PANE11" "PS1='❯ '" Enter
+sleep 0.3
+
+out7="$(run_status)"
+if printf '%s' "$out7" | grep -q "bead-eleven" && printf '%s' "$out7" | grep -q "stalled-rate-limit"; then
+  pass "a running pane stalled on the session-limit banner is flagged stalled-rate-limit"
+else
+  fail "a running pane stalled on the session-limit banner is flagged stalled-rate-limit" "$out7"
+fi
+if printf '%s' "$out7" | grep -q "resets=2pm"; then
+  pass "the flagged row reports the reset time"
+else
+  fail "the flagged row reports the reset time" "$out7"
+fi
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

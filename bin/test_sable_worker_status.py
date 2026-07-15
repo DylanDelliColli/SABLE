@@ -687,5 +687,83 @@ def test_resolve_view_lane_unlaned_caller_falls_back_to_global(monkeypatch):
     assert sws.resolve_view_lane(ns) is None
 
 
+# --- SABLE-ita7: a worker pane whose turn was cut off by the Claude Code
+# session-rate-limit banner ("hit your session limit ... resets ...") reads
+# identically to a busy pane by tag alone (@sable_status=running never
+# changes) -- the SABLE-tz7h.4 worker pane sat "running" for ~5 hours after
+# hitting the limit, invisible to sable-worker-status the whole time.
+# rate_limit_stall/flag_rate_limit_stalls close that gap: capture-pane every
+# running pane and flag one showing the banner AND an idle composer
+# (pane_ready) as "stalled-rate-limit" -- a banner still sitting in
+# scrollback while the composer is NOT ready means the turn is still
+# processing, so it stays "running" (detection surface only -- never reaped,
+# never auto-nudged). ---
+
+def test_session_limit_reset_extracts_reset_time():
+    assert sws.session_limit_reset("You have hit your session limit - resets 2pm") == "2pm"
+
+
+def test_session_limit_reset_none_when_absent():
+    assert sws.session_limit_reset("just ordinary scrollback") is None
+
+
+def test_rate_limit_stall_returns_reset_when_banner_present_and_composer_ready():
+    cap = "turn output\nYou have hit your session limit - resets 2pm\n\n❯"
+    assert sws.rate_limit_stall(cap) == "2pm"
+
+
+def test_rate_limit_stall_none_when_no_banner():
+    # busy capture, no banner at all -- stays running
+    cap = "turn output\n⠋ Thinking… (esc to interrupt)"
+    assert sws.rate_limit_stall(cap) is None
+
+
+def test_rate_limit_stall_none_when_banner_present_but_composer_not_ready():
+    # the banner sits mid-scrollback (an earlier hit that has since resumed),
+    # but the composer isn't idle -- a turn is still processing, not stalled
+    cap = ("You have hit your session limit - resets 2pm\n"
+           "more scrollback since then\n"
+           "⠋ Thinking… (esc to interrupt)")
+    assert sws.rate_limit_stall(cap) is None
+
+
+def test_flag_rate_limit_stalls_flags_running_pane_on_banner_and_ready_composer():
+    workers = [{"pane": "%1", "bead": "a", "status": "running"}]
+
+    def fake_capture(pane):
+        return "turn output\nYou have hit your session limit - resets 2pm\n\n❯"
+
+    result = sws.flag_rate_limit_stalls(workers, None, capture=fake_capture)
+    assert result == [{"pane": "%1", "bead": "a", "status": "stalled-rate-limit", "reset": "2pm"}]
+
+
+def test_flag_rate_limit_stalls_leaves_busy_no_banner_pane_running():
+    workers = [{"pane": "%1", "bead": "a", "status": "running"}]
+
+    def fake_capture(pane):
+        return "turn output\n⠋ Thinking… (esc to interrupt)"
+
+    assert sws.flag_rate_limit_stalls(workers, None, capture=fake_capture) == workers
+
+
+def test_flag_rate_limit_stalls_leaves_still_processing_pane_running():
+    workers = [{"pane": "%1", "bead": "a", "status": "running"}]
+
+    def fake_capture(pane):
+        return ("You have hit your session limit - resets 2pm\n"
+                "more scrollback since then\n"
+                "⠋ Thinking… (esc to interrupt)")
+
+    assert sws.flag_rate_limit_stalls(workers, None, capture=fake_capture) == workers
+
+
+def test_flag_rate_limit_stalls_never_captures_done_panes():
+    def fake_capture(pane):
+        raise AssertionError("must never capture-pane a done pane")
+
+    workers = [{"pane": "%1", "bead": "a", "status": "done"}]
+    assert sws.flag_rate_limit_stalls(workers, None, capture=fake_capture) == workers
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
