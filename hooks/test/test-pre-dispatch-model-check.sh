@@ -242,6 +242,45 @@ fi
 assert_deny "sable-* filenames alone → no-bead path, not false unlabeled-bead deny" "$MGR_ENV" \
   "Run sable-execute and sable-teams-preflight to check drift." "" "" "no model specified on Agent call"
 
+# ---- SABLE-fxv3: lowercase sable-* TOOL names (single-segment, <=6 chars —
+# sable-plan, sable-doctor, sable-agents, sable-launch, sable-msg, sable-mode,
+# sable-note, sable-view, sable-tmux) must not be parsed as bead IDs. These
+# escape the SABLE-gga multi-segment lookahead because they have no second
+# hyphen. Fix is a case-sensitive prefix match (bd issues SABLE-xxxx uppercase;
+# tool names are lowercase by convention) — no re.IGNORECASE. ----
+
+# Test 18 (fxv3 unit case 1): prompt mentions lowercase tool names sable-doctor/
+# sable-plan alongside the real labeled bead SABLE-aaa (model:opus). Only the
+# real bead should be extracted; since its label matches the dispatch model,
+# this must be a silent allow — no spurious no-label list, no deny for the
+# tool-name "beads".
+assert_allow "fxv3: sable-doctor/sable-plan tool names ignored, real labeled bead extracted" \
+  "$MGR_ENV" "Working on SABLE-aaa: run sable-doctor and sable-plan to check drift." "" "opus"
+
+# Test 19 (fxv3 unit case 2): ad-hoc prompt mentioning ONLY tool names (no real
+# bead ID) with an explicit dispatch model → must take the no-bead/ad-hoc path
+# (silent allow), never the no-label-bead deny naming the tool names.
+assert_allow "fxv3: tool-name-only prompt with explicit model takes ad-hoc no-bead path" \
+  "$MGR_ENV" "Run sable-plan and sable-doctor to check drift before dispatch." "" "sonnet"
+
+# Test 20 (fxv3 integration case, live-observed shape): prompt mentions the
+# unlabeled bead SABLE-ddd alongside sable-launch/sable-plan — the exact tokens
+# from the 2026-07-15 live false denial ('bead(s) [ SABLE-59t6 sable-launch
+# sable-plan ] have no model: label'). End-to-end hook invocation must deny
+# naming ONLY SABLE-ddd; sable-launch/sable-plan must never appear in the
+# no-label-beads list or anywhere in the emitted JSON.
+assert_deny "fxv3: sable-launch/sable-plan not counted as no-label beads (live-observed shape)" \
+  "$MGR_ENV" "Dispatching for SABLE-ddd: run sable-launch and sable-plan for the rollout." "" "" \
+  "have no model: label"
+OUT=$(run_hook "$MGR_ENV" "Dispatching for SABLE-ddd: run sable-launch and sable-plan for the rollout." "" "")
+if echo "$OUT" | grep -qF "sable-launch" || echo "$OUT" | grep -qF "sable-plan"; then
+  FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  fxv3: sable-launch/sable-plan absent from deny reason"
+  echo "FAIL: fxv3: sable-launch/sable-plan absent from deny reason"
+  echo "  Got: ${OUT:0:400}"
+else
+  PASS=$((PASS+1)); echo "PASS: fxv3: sable-launch/sable-plan absent from deny reason"
+fi
+
 # ---- Native manager-subagent path (SABLE-6zt cases 5 & 6) ----
 # In v3 a manager dispatches workers natively: identity is the subagent
 # agent_type (agent_id present, NO env), resolved against the registry by
