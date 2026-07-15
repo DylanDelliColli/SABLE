@@ -326,6 +326,18 @@ sable_chuck_pane_present() {
   printf '%s\n' "$roles" | grep -qx chuck
 }
 
+# SABLE-f916: both landing artifacts below (the live chuck message AND the
+# durable for-chuck bead fallback) were byte-identical in framing to what a
+# manager's deliberate, reviewed PR-ready sign-off would look like — Chuck had
+# no mechanical way to tell "hook auto-detected a push" apart from "a manager
+# actually reviewed this and accepts it." Incident 2026-07-15: an auto-notify
+# for wk-bin-symlink-parity (SABLE-59t6.6) was queued+inspected as if
+# PR-ready, but optimus had NOT accepted it (later rejected for false-green
+# tests). This tag self-labels every auto-notify so it's grep-distinguishable
+# from a real sign-off (which carries no such tag) — it does not change
+# firing/registration behavior.
+AUTO_NOTIFY_TAG="[AUTO-NOTIFY: push detected by hook, NOT a manager sign-off]"
+
 # --- Message-first handoff with durable fallback (SABLE-bldh.15 / SABLE-wvk9) --
 # In the tmux warm-pane topology the worker->merge handoff is a direct message to
 # Chuck: event-driven, no polled bead. But the message send is the handoff ONLY
@@ -349,7 +361,7 @@ elif ! command -v sable-msg >/dev/null 2>&1; then
 elif ! sable_chuck_pane_present; then
   FALLBACK_REASON="no reachable chuck pane (not spawned yet, or down)"
 else
-  MSG="PR ready from ${SABLE_ID_NAME}: branch ${BRANCH} (${FILES_BRIEF}). Review and merge into the integration branch, then report."
+  MSG="${AUTO_NOTIFY_TAG} PR ready from ${SABLE_ID_NAME}: branch ${BRANCH} (${FILES_BRIEF}). Review and merge into the integration branch, then report."
   [ -n "$OVERLAPS" ] && MSG="${MSG} OVERLAP-WARNING: shares files with in-flight work — sequence carefully."
   if sable-msg chuck "$MSG" --from "$SABLE_ID_NAME" >/dev/null 2>&1; then
     sable_pp_trace "HANDOFF chuck-msg confirmed"
@@ -360,7 +372,7 @@ fi
 
 # Build description (durable for-chuck bead — fallback path)
 DESC_LINES=""
-DESC_LINES="${DESC_LINES}PR ready for review."
+DESC_LINES="${DESC_LINES}${AUTO_NOTIFY_TAG} PR ready for review."
 [ -n "$PR_URL" ] && DESC_LINES="${DESC_LINES}
 PR URL: $PR_URL"
 DESC_LINES="${DESC_LINES}
@@ -385,7 +397,7 @@ DESC_LINES="${DESC_LINES}
 - Conflict resolution applied (mechanical fixes inline; semantic conflicts deferred to author via for-${SABLE_ID_NAME} bead)
 - PR merged or held with reason"
 
-TITLE="Review PR from ${SABLE_ID_NAME}: ${BRANCH}"
+TITLE="[AUTO-NOTIFY] Review PR from ${SABLE_ID_NAME}: ${BRANCH}"
 
 # SABLE-5hcg addendum: bd create used to end in a bare '|| true', so a failed
 # bd invocation (dolt hiccup, transient lock, etc.) left the for-chuck channel
