@@ -146,9 +146,12 @@ The installer copies the skills, role, layout, **registry (`agents.yaml`)**, the
 interlock hook, and the **identity hook (`session-role-anchor`)** into the chosen
 scope, and registers the hooks idempotently — the interlock on `PreToolUse:Bash`
 and identity injection on `SessionStart`+`PreCompact` (project scope writes the
-uncommitted `.claude/settings.local.json`; `--user` writes `~/.claude/settings.json`,
-backed up first and JSON-validated, never clobbering existing hooks). It warns
-only if `textual` is missing.
+COMMITTED `.claude/settings.json`, with every hook command rooted at the
+portable `${CLAUDE_PROJECT_DIR}` placeholder so the wiring survives a clone to
+a different machine/path; `--user` writes `~/.claude/settings.json` with hook
+commands rooted at the absolute `~/.claude` path — both backed up first and
+JSON-validated, never clobbering existing hooks). It warns only if `textual`
+is missing.
 
 **The warm-pane session.** Execution runs as one tmux session with a persistent
 `claude` pane per role (lincoln, optimus, tarzan, chuck) — no experimental

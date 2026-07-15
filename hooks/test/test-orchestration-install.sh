@@ -48,10 +48,13 @@ exists "$P/.claude/sable/roles/chuck.md"    "project: chuck pane role installed 
 if [ ! -e "$P/.claude/agents-teams" ]; then pass "project: agents-teams defs NOT installed (tmux-only)"; else fail "project: agents-teams defs NOT installed (tmux-only)" "unexpected $P/.claude/agents-teams/"; fi
 if printf '%s' "$out1" | grep -q "sable-tmux"; then pass "project: install output points at the sable-tmux bring-up"; else fail "project: install output points at the sable-tmux bring-up" "no sable-tmux mention"; fi
 if [ -x "$P/.claude/hooks/multi-manager/mode-interlock.sh" ]; then pass "project: interlock hook installed+exec"; else fail "project: interlock hook installed+exec"; fi
-SET="$P/.claude/settings.local.json"
-exists "$SET" "project: settings.local.json created"
+SET="$P/.claude/settings.json"
+exists "$SET" "project: COMMITTED settings.json created"
+if [ ! -e "$P/.claude/settings.local.json" ]; then pass "project: settings.local.json ABSENT (gitignored-wiring pitfall guard)"; else fail "project: settings.local.json ABSENT" "unexpected $P/.claude/settings.local.json"; fi
 if valid_json "$SET"; then pass "project: settings is valid JSON"; else fail "project: settings is valid JSON"; fi
 if [ "$(count_interlock "$SET")" = "2" ]; then pass "project: interlock registered on both legs (Bash+Agent)"; else fail "project: interlock registered on both legs (Bash+Agent)" "count=$(count_interlock "$SET")"; fi
+if grep -qF '${CLAUDE_PROJECT_DIR}/.claude/hooks/' "$SET"; then pass "project: hook commands rooted at \${CLAUDE_PROJECT_DIR} placeholder"; else fail "project: hook commands rooted at \${CLAUDE_PROJECT_DIR} placeholder"; fi
+if grep -q "$P/.claude/hooks/" "$SET"; then fail "project: no absolute machine path in hook commands" "found absolute path in $SET"; else pass "project: no absolute machine path in hook commands"; fi
 exists "$P/.claude/sable/agents.yaml" "project: registry (agents.yaml) installed"
 if [ -x "$P/.claude/hooks/multi-manager/session-role-anchor.sh" ]; then pass "project: identity hook installed+exec"; else fail "project: identity hook installed+exec"; fi
 if [ "$(count_in_event "$SET" SessionStart session-role-anchor.sh)" = "1" ]; then pass "project: identity hook registered SessionStart"; else fail "project: identity hook registered SessionStart" "count=$(count_in_event "$SET" SessionStart session-role-anchor.sh)"; fi
@@ -77,7 +80,7 @@ P2="$(mktemp -d)"
 SABLE_PROJECT_DIR="$P2" bash "$INSTALLER" >/dev/null 2>&1
 exists "$P2/.claude/skills/sable-plan/SKILL.md" "default (no flag) installs into project ./.claude"
 if [ ! -e "$P2/.claude/agents-teams" ]; then pass "default install: no agents-teams defs (tmux-only)"; else fail "default install: no agents-teams defs (tmux-only)" "unexpected agents-teams/"; fi
-SET2="$P2/.claude/settings.local.json"
+SET2="$P2/.claude/settings.json"
 if [ "$(count_marker "$SET2" pre-push-rebase-test)" -ge 1 ]; then pass "default install: governance hooks in settings"; else fail "default install: governance hooks in settings" "count=$(count_marker "$SET2" pre-push-rebase-test)"; fi
 
 # retired topology flags are rejected with a clear error (tmux is the only topology)
@@ -169,7 +172,7 @@ if valid_json "$MSET"; then pass "md7: settings valid after multi-manager re-ins
 # ---------- SABLE-qa4d.6: poll-based inbox hooks are gone ----------
 PIH="$(mktemp -d)"
 SABLE_PROJECT_DIR="$PIH" bash "$INSTALLER" --project >/dev/null 2>&1
-PIHSET="$PIH/.claude/settings.local.json"
+PIHSET="$PIH/.claude/settings.json"
 if [ "$(count_marker "$PIHSET" inbox-injection)" = "0" ]; then pass "settings register no inbox-injection hooks (sable-msg replaces the poll)"; else fail "settings register no inbox-injection hooks" "count=$(count_marker "$PIHSET" inbox-injection)"; fi
 if [ ! -e "$PIH/.claude/hooks/multi-manager/inbox-injection.sh" ] && [ ! -e "$PIH/.claude/hooks/multi-manager/inbox-injection-precompact.sh" ]; then pass "no inbox-injection hook files installed"; else fail "no inbox-injection hook files installed"; fi
 if [ -e "$PIH/.claude/hooks/multi-manager/read-guard.sh" ]; then pass "read-guard survives (durable-inbox guard stays)"; else fail "read-guard survives (durable-inbox guard stays)"; fi
@@ -220,10 +223,10 @@ touch "$RA/.claude/agents/optimus.md" "$RA/.claude/agents/tarzan.md" "$RA/.claud
 touch "$RA/.claude/agents/my-custom-agent.md"
 printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/inbox-injection.sh"
 printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/inbox-injection-precompact.sh"
-seed_retired_settings "$RA/.claude/settings.local.json"
+seed_retired_settings "$RA/.claude/settings.json"
 
 RA_OUT="$(SABLE_PROJECT_DIR="$RA" bash "$INSTALLER" --project 2>&1)"
-RASET="$RA/.claude/settings.local.json"
+RASET="$RA/.claude/settings.json"
 
 if [ ! -e "$RA/.claude/hooks/multi-manager/inbox-injection.sh" ]; then pass "gsqj: retired inbox-injection.sh removed on plain (upgrade) install"; else fail "gsqj: retired inbox-injection.sh removed on plain install"; fi
 if [ ! -e "$RA/.claude/hooks/multi-manager/inbox-injection-precompact.sh" ]; then pass "gsqj: retired inbox-injection-precompact.sh removed"; else fail "gsqj: retired inbox-injection-precompact.sh removed"; fi
