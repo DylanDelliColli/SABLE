@@ -58,6 +58,8 @@ ALLOW=(
   test-role.sh
   test-sable-bin-install.sh
   test-sable-claim.sh
+  test-sable-clean-room-verify.sh
+  test-sable-clean-room-verify-integration.sh
   test-sable-cli.sh
   test-sable-contract.sh
   test-sable-discover.sh
