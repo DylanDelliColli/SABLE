@@ -191,6 +191,78 @@ def test_conflict_delegates_exit_22_no_ref(tmp_path):
     assert _ci_verify_refs(origin) == [], "conflict must not leave a ci-verify ref"
 
 
+# --- SABLE-dn7r: post-merge worktree/branch cleanup on the real green path -----
+
+def _add_worktree(work, tmp_path, *, dirty=False):
+    """Register a real linked worktree checked out on WORKER, mirroring the fleet
+    layout (worktree lives outside the --repo main checkout)."""
+    wt = tmp_path / "wt-wk-x"
+    _git(work, "worktree", "add", str(wt), WORKER)
+    if dirty:
+        (wt / "uncommitted.txt").write_text("work in progress\n")
+    return wt
+
+
+def _worktree_paths(work):
+    out = _git(work, "worktree", "list", "--porcelain", check=False)
+    return [ln[len("worktree "):] for ln in out.splitlines() if ln.startswith("worktree ")]
+
+
+def _local_branch_exists(work, branch):
+    cp = _run(["git", "-C", str(work), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"])
+    return cp.returncode == 0
+
+
+def _origin_branch_exists(origin, branch):
+    out = _git(None, "--git-dir=" + str(origin), "for-each-ref", "--format=%(refname)",
+               f"refs/heads/{branch}", check=False)
+    return bool(out.strip())
+
+
+def test_green_promote_cleans_up_worktree_and_branches(tmp_path):
+    origin, work = _setup(tmp_path)
+    wt = _add_worktree(work, tmp_path)
+    gh = _write_fake_gh(tmp_path, origin, "success")
+
+    cp = _promote(work, gh)
+    assert cp.returncode == 0, cp.stdout
+
+    assert str(wt) not in _worktree_paths(work), "merged worktree not unregistered"
+    assert not _local_branch_exists(work, WORKER), "merged local branch not deleted"
+    assert not _origin_branch_exists(origin, WORKER), "merged remote branch not deleted"
+
+
+def test_green_promote_dirty_worktree_left_intact(tmp_path):
+    origin, work = _setup(tmp_path)
+    wt = _add_worktree(work, tmp_path, dirty=True)
+    gh = _write_fake_gh(tmp_path, origin, "success")
+    before = _origin_base_sha(origin)
+
+    cp = _promote(work, gh)
+    assert cp.returncode == 0, cp.stdout
+    assert _origin_base_sha(origin) != before, "dirty worktree must not block the merge itself"
+
+    assert str(wt) in _worktree_paths(work), "dirty worktree wrongly removed"
+    assert _local_branch_exists(work, WORKER), "branch of dirty worktree wrongly deleted"
+    assert _origin_branch_exists(origin, WORKER), "remote branch wrongly deleted for dirty worktree"
+    assert "DIRTY" in cp.stdout, "refusal not surfaced on stderr"
+
+
+def test_red_gate_no_cleanup(tmp_path):
+    # REGRESSION iron rule: a red gate leaves the worktree and both branches
+    # untouched — the branch is still needed for the fix + re-push.
+    origin, work = _setup(tmp_path)
+    wt = _add_worktree(work, tmp_path)
+    gh = _write_fake_gh(tmp_path, origin, "failure")
+
+    cp = _promote(work, gh)
+    assert cp.returncode == 20, cp.stdout
+
+    assert str(wt) in _worktree_paths(work), "red gate removed the worktree"
+    assert _local_branch_exists(work, WORKER), "red gate deleted the local branch"
+    assert _origin_branch_exists(origin, WORKER), "red gate deleted the remote branch"
+
+
 def test_sweep_deletes_only_aged_orphans(tmp_path):
     origin, work = _setup(tmp_path)
     base_sha = _origin_base_sha(origin)
