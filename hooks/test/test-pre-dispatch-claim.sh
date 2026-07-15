@@ -289,6 +289,88 @@ else
   pass "worker-subagent (agent_type=general-purpose) → stands down"
 fi
 
+# --- Test 9 (SABLE-lfql): the bd update --notes call carries --sandbox ---
+# bd auto-pushes to the shared Dolt remote on every mutating write
+# (create/update/close) by default (SABLE-rq9k); without --sandbox this hook
+# pushed WIP-CLAIMS bookkeeping to the remote as a pure hook side effect on
+# EVERY dispatch — the exact chuck-only-convention violation behind the
+# 2026-07-09 cross-fleet corruption incident.
+: > "$BD_CALL_LOG"
+run_hook_as_manager "SABLE-xyz: implement hooks/foo.sh"
+UPDATE_LINE_LFQL=$(grep 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null | head -1)
+if echo "$UPDATE_LINE_LFQL" | grep -q -- '--sandbox'; then
+  pass "SABLE-lfql: bd update --notes call carries --sandbox (Dolt auto-push disabled)"
+else
+  fail "SABLE-lfql: bd update --notes call carries --sandbox (Dolt auto-push disabled)" \
+       "update line: ${UPDATE_LINE_LFQL:-<none>}"
+fi
+
+# ---------------------------------------------------------------------------
+# SABLE-lfql / SABLE-rq9k: hermetic push-prevention regression guard.
+# Same modeling technique as the sibling test in test-post-push-merge-notify.sh
+# (search "SABLE-rq9k" there for the full rationale): a live dolt sql-server +
+# file remote is the gold-standard fixture, but this suite stays hermetic. A
+# bd stub advances a simulated remote tip on a mutating `update` UNLESS
+# --sandbox is present; the property that matters is the tip staying
+# unchanged after the hook writes WIP-CLAIMS.
+# ---------------------------------------------------------------------------
+cat > "$STUB_DIR/bd" <<'STUB'
+#!/usr/bin/env bash
+echo "BD_CALLED: $*" >> "$BD_CALL_LOG"
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  echo '[{"id":"SABLE-stub","description":"hooks/foo.sh is the implementation","notes":""}]'
+  exit 0
+fi
+if [ "$1" = "update" ]; then
+  sandbox=0
+  for a in "$@"; do [ "$a" = "--sandbox" ] && sandbox=1; done
+  [ "$sandbox" -eq 0 ] && printf 'remote-advanced\n' >> "${DOLT_REMOTE_TIP:-/dev/null}"
+fi
+exit 0
+STUB
+chmod +x "$STUB_DIR/bd"
+
+LFQL_TIP="$FIXTURE_DIR/dolt-remote-tip"
+: > "$LFQL_TIP"
+: > "$BD_CALL_LOG"
+make_dispatch_input "SABLE-xyz: implement hooks/foo.sh" | \
+  env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
+      SABLE_AGENTS_YAML="$AGENTS_YAML" \
+      SABLE_MODE_STATE="$EXEC_MODE_FILE" \
+      BD_CALL_LOG="$BD_CALL_LOG" \
+      DOLT_REMOTE_TIP="$LFQL_TIP" \
+      PATH="$STUB_DIR:$PATH" \
+      bash "$HOOK" 2>/dev/null
+
+# Precondition: the WIP-CLAIMS update really was attempted (so a pass below is
+# not vacuous from the hook exiting before bd update).
+if grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+  pass "SABLE-lfql: WIP-CLAIMS update is attempted (precondition)"
+else
+  fail "SABLE-lfql: WIP-CLAIMS update is attempted (precondition)" "BD_CALL_LOG: $(cat "$BD_CALL_LOG" 2>/dev/null)"
+fi
+
+if [ ! -s "$LFQL_TIP" ]; then
+  pass "SABLE-lfql: hook's WIP-CLAIMS write performs NO dolt remote sync (remote tip unchanged)"
+else
+  fail "SABLE-lfql: hook's WIP-CLAIMS write performs NO dolt remote sync (remote tip unchanged)" \
+       "remote tip advanced — bd update auto-pushed (missing --sandbox): $(cat "$LFQL_TIP" 2>/dev/null)"
+fi
+rm -f "$LFQL_TIP"
+
+# Restore the plain stub for hermeticity (the real-bd integration section below
+# does not use $STUB_DIR, but keep PATH state predictable for future tests).
+cat > "$STUB_DIR/bd" <<'STUB'
+#!/usr/bin/env bash
+echo "BD_CALLED: $*" >> "$BD_CALL_LOG"
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  echo '[{"id":"SABLE-stub","description":"hooks/foo.sh is the implementation","notes":""}]'
+  exit 0
+fi
+exit 0
+STUB
+chmod +x "$STUB_DIR/bd"
+
 # ---------------------------------------------------------------------------
 # INTEGRATION TEST — real bd in the project repo
 # ---------------------------------------------------------------------------

@@ -100,6 +100,13 @@ WIP-CLAIMS: ${FILE_PATH}"
   fi
 fi
 
-bd update "$BEAD_ID" --notes "$NEW_NOTES" >/dev/null 2>&1 || true
+# SABLE-lfql: --sandbox disables bd's Dolt auto-push (SABLE-rq9k). bd pushes to
+# the shared Dolt remote on EVERY mutating write (create/update/close) by
+# default; without this flag, every Edit/Write while a bead is claimed pushed
+# WIP-CLAIMS bookkeeping to the remote as a pure hook side effect — the exact
+# chuck-only-convention violation behind the 2026-07-09 cross-fleet corruption
+# incident. --sandbox disables the push WITHOUT blocking the write (unlike
+# --readonly, which would drop it); Chuck's batched pull+push carries it later.
+bd update "$BEAD_ID" --sandbox --notes "$NEW_NOTES" >/dev/null 2>&1 || true
 
 exit 0

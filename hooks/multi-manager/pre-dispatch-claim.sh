@@ -99,7 +99,14 @@ ${CLAIM_LINE}"
     NEW_NOTES="$CLAIM_LINE"
   fi
 
-  bd update "$BEAD_ID" --notes "$NEW_NOTES" >/dev/null 2>&1 || true
+  # SABLE-lfql: --sandbox disables bd's Dolt auto-push (SABLE-rq9k). bd pushes
+  # to the shared Dolt remote on EVERY mutating write (create/update/close) by
+  # default; without this flag, every dispatch pushed WIP-CLAIMS bookkeeping
+  # to the remote as a pure hook side effect — the exact chuck-only-convention
+  # violation behind the 2026-07-09 cross-fleet corruption incident.
+  # --sandbox disables the push WITHOUT blocking the write (unlike --readonly,
+  # which would drop it); Chuck's batched pull+push carries it later.
+  bd update "$BEAD_ID" --sandbox --notes "$NEW_NOTES" >/dev/null 2>&1 || true
 done
 
 exit 0
