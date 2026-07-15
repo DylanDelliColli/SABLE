@@ -4,7 +4,9 @@
 #
 # Reads $CLAUDE_AGENT_NAME, locates the role file at ~/.claude/sable/roles/<name>.md,
 # and injects its contents as additionalContext. Anchors identity at session start
-# and re-anchors after compaction (identity erodes silently otherwise).
+# and re-anchors after compaction via the SessionStart:compact leg (identity
+# erodes silently otherwise). The PreCompact trigger itself is a no-op — its
+# hookSpecificOutput schema doesn't support additionalContext (SABLE-jiqm).
 #
 # Fast-exits if env var is unset (non-manager sessions unaffected).
 
@@ -107,6 +109,16 @@ try:
     event = hook_input.get('hook_event_name', 'SessionStart')
 except Exception:
     event = 'SessionStart'
+
+# SABLE-jiqm: PreCompact's hookSpecificOutput schema does not support
+# additionalContext (only UserPromptSubmit/PostToolUse/PostToolBatch/Stop do) —
+# emitting it here fails Claude Code's hook JSON validation on every /compact,
+# silently losing the re-anchor. Re-anchoring already happens via the
+# SessionStart:compact leg (this same script, fired again post-compaction with
+# hook_event_name still 'SessionStart'), so no-op here instead of emitting an
+# invalid shape.
+if event == 'PreCompact':
+    sys.exit(0)
 
 identity = (
     f'=== AGENT IDENTITY: {name} ===\n\n{content}\n\n=== END IDENTITY ===\n\n'
