@@ -111,6 +111,22 @@ if printf '%s' "$out" | grep -q 'LIVE PROTOCOL STATE'; then fail "9ozz: no live 
 out="$(cd "$LS" && printf '%s' "$SS" | SABLE_MODE_STATE="$LS_MODE" SABLE_WORKER_PANE=1 CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
 if [ -z "$out" ]; then pass "9ozz: worker pane no-ops even with live contract"; else fail "9ozz: worker pane no-ops even with live contract" "got: ${out:0:120}"; fi
 
+# ---------- SABLE-jiqm: PreCompact leg must never emit additionalContext ----------
+# PreCompact's hookSpecificOutput schema does not support additionalContext
+# (only UserPromptSubmit/PostToolUse/PostToolBatch/Stop do) — Claude Code's hook
+# JSON validation rejects it, silently losing the re-anchor on every /compact.
+# The hook must no-op on this leg (empty stdout is always schema-valid) and rely
+# on the SessionStart:compact leg, which already re-anchors identity correctly.
+PC='{"hook_event_name":"PreCompact"}'
+out="$(cd "$PROJ" && printf '%s' "$PC" | CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
+if [ -z "$out" ]; then pass "jiqm: PreCompact leg no-ops (no invalid additionalContext)"; else fail "jiqm: PreCompact leg no-ops (no invalid additionalContext)" "got: ${out:0:200}"; fi
+if ! printf '%s' "$out" | grep -q 'additionalContext'; then pass "jiqm: PreCompact stdout never contains additionalContext key"; else fail "jiqm: PreCompact stdout never contains additionalContext key" "got: ${out:0:200}"; fi
+
+# SessionStart (including the post-compaction resume, which still reports
+# hook_event_name=SessionStart) must be unaffected by the PreCompact no-op.
+out="$(cd "$PROJ" && printf '%s' "$SS" | CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
+if printf '%s' "$out" | grep -q '"hookEventName": "SessionStart"'; then pass "jiqm: SessionStart leg still emits valid hookEventName+additionalContext"; else fail "jiqm: SessionStart leg still emits valid hookEventName+additionalContext" "got: ${out:0:200}"; fi
+
 rm -rf "$PROJ" "$HOMETMP" "$NOPROJ" "$LS" "$LS2" "$LS3"
 echo
 echo "=========================================="
