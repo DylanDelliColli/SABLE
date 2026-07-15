@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""Tests for bin/sable_stack_detect.py — the /sable-onboarding stack + .sable
-library (SABLE-gn7a.1). Columbo S4 detection matrix plus the grammar CRITICALs.
+"""Tests for the /sable-onboarding trio: the stack + .sable library
+(bin/sable_stack_detect.py, SABLE-gn7a.1), the ci-verify render + provider
+detection (bin/sable_ci_template.py, SABLE-gn7a.2), and the read-only SCANNER
+(bin/sable-onboard, SABLE-gn7a.3). Columbo S4 detection matrix, the grammar
+CRITICALs, and the scanner's S1/S2/S6 matrix (registry consistency, per-prereq
+report, git-state + default-branch detection, zero-writes).
 
 Integration character (per CLAUDE.md unit+integration requirement): detection
 runs against a REAL temp filesystem; execute_once runs REAL `sh -c` subprocesses;
-and test_scan_contract_matches_lib_identity_resolvers sources and calls the REAL
-bash resolvers in hooks/multi-manager/lib-identity.sh, so the module's accept/
-reject is proven against the actual one-parser grammar rather than a copy of it.
+test_scan_contract_matches_lib_identity_resolvers sources and calls the REAL
+bash resolvers in hooks/multi-manager/lib-identity.sh; and the scanner's
+git-state / default-branch / ci-provider tests run against REAL temp git repos
+(real `git` subprocesses), so accept/reject and detection are proven against the
+actual tools rather than copies of them.
 """
+import hashlib
+import importlib.util
+import json
 import os
 import subprocess
 import sys
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
@@ -21,6 +31,12 @@ sys.path.insert(0, str(_BIN))
 
 import sable_stack_detect as ssd  # noqa: E402
 import sable_ci_template as sct  # noqa: E402
+
+# bin/sable-onboard has a hyphen and no .py extension — load it by path.
+_ONB_LOADER = SourceFileLoader("sable_onboard", str(_BIN / "sable-onboard"))
+_ONB_SPEC = importlib.util.spec_from_loader("sable_onboard", _ONB_LOADER)
+onb = importlib.util.module_from_spec(_ONB_SPEC)
+_ONB_LOADER.exec_module(onb)
 
 
 # ===========================================================================
@@ -547,3 +563,375 @@ def test_existing_ci_verify_wins_over_github_remote(tmp_path):
 
     assert prov.kind == sct.EXISTING_CI_VERIFY
     assert prov.apply_ok is False
+
+
+# ===========================================================================
+# sable-onboard — the read-only scanner (SABLE-gn7a.3)
+#
+# Columbo S1 (zero-writes) / S2 (registry + report/json/exit unit matrix) /
+# S6 (git-state + default-branch detection). Fixtures build REAL temp git repos
+# so git-state, default-branch, and ci-provider detection run against the real
+# `git` binary; the binary-presence and install-scope probes are exercised
+# through the injected Env so they stay hermetic (no dependency on what happens
+# to be on PATH, nor on a real ~/.claude install).
+# ===========================================================================
+
+def _commit(repo, *, email="t@t.com", name="t", msg="init"):
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=" + email, "-c", "user.name=" + name,
+         "commit", "-q", "-m", msg)
+
+
+def make_onboard_repo(tmp_path, *, name="proj", branch="work"):
+    """A fully-onboarded fixture repo — every filesystem-observable prerequisite
+    satisfied (CLAUDE.md prime block, .beads workspace, valid .sable, portable
+    committed settings wiring, an existing ci-verify.yml). A REAL git repo so
+    git-state and ci-provider probes run against real git. Mirrors the shape of
+    bin/test_sable_doctor.py's make_repo. Binary presence and install-scope are
+    satisfied via the injected Env (see _green_env), not this tree."""
+    repo = tmp_path / name
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", branch)
+
+    (repo / "CLAUDE.md").write_text(
+        "# Project\n\n## Prime Directive\nAll work flows through beads.\n",
+        encoding="utf-8",
+    )
+
+    beads = repo / ".beads"
+    beads.mkdir()
+    (beads / "config.yaml").write_text("db: proj.db\n", encoding="utf-8")
+    (beads / "metadata.json").write_text("{}\n", encoding="utf-8")
+
+    (repo / ".sable").write_text(
+        "testCommand=pytest -q\nintegrationBranch=%s\n" % branch, encoding="utf-8")
+
+    claude = repo / ".claude"
+    claude.mkdir()
+    (claude / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [
+                    {"type": "command",
+                     "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/multi-manager/mode-interlock.sh"},
+                ]},
+            ],
+        },
+    }), encoding="utf-8")
+
+    wf = repo / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "ci-verify.yml").write_text("name: ci-verify\n", encoding="utf-8")
+
+    (repo / "README.md").write_text("hi\n", encoding="utf-8")
+    _commit(repo)
+    return repo
+
+
+def _green_env():
+    """An Env where every binary resolves and sable-doctor reports clean — so a
+    make_onboard_repo scan is all-green without touching the host PATH or a real
+    install."""
+    return onb.Env(
+        which=lambda name: "/usr/bin/" + name,
+        run_doctor=lambda repo: (True, "sable-doctor --project: install matches repo HEAD."),
+    )
+
+
+# --- D2: the single CHECKS registry drives all four outputs -----------------
+
+def test_checks_registry_every_id_in_all_four_outputs(tmp_path):
+    """Shotgun-Surgery guard: every id in the ONE registry must surface in the
+    human report, the --json payload, the exit-code derivation list, AND be
+    addressable via --check — no second enumeration drops or renames one."""
+    repo = make_onboard_repo(tmp_path)
+    env = _green_env()
+
+    results = onb.run_checks(str(repo), env=env)
+    report = onb.render_text(str(repo), results, onb.git_state(str(repo)))
+    payload = onb.build_payload(str(repo), results, onb.git_state(str(repo)))
+    json_ids = {c["id"] for c in payload["checks"]}
+    # exit-derivation consumes the SAME result list every id is in
+    exit_ids = {r.id for r in results}
+
+    for check in onb.CHECKS:
+        assert check.id in report, "%s missing from text report" % check.id
+        assert check.id in json_ids, "%s missing from json payload" % check.id
+        assert check.id in exit_ids, "%s missing from exit-derivation list" % check.id
+        scoped = onb.run_checks(str(repo), only=check.id, env=env)
+        assert [r.id for r in scoped] == [check.id], "%s not --check-addressable" % check.id
+
+    # the four outputs enumerate EXACTLY the registry — no extras, none dropped
+    assert exit_ids == {c.id for c in onb.CHECKS}
+    assert json_ids == {c.id for c in onb.CHECKS}
+
+
+def test_report_names_present_missing_remedy_per_prereq(tmp_path):
+    """For each prereq the report names present-vs-missing and, when missing,
+    prints the registry remedy verbatim."""
+    repo = make_onboard_repo(tmp_path)
+    (repo / ".sable").unlink()  # break exactly one prereq -> a named gap
+    env = _green_env()
+
+    results = onb.run_checks(str(repo), env=env)
+    report = onb.render_text(str(repo), results, onb.git_state(str(repo)))
+
+    sable = next(r for r in results if r.id == "sable-contract")
+    assert sable.status == onb.STATUS_GAP
+    assert "sable-contract" in report
+    assert sable.remedy in report            # remedy shown for the missing prereq
+    assert "GAP" in report                   # missing is labelled
+
+    # a satisfied prereq is named present, and its remedy is NOT dangled
+    beads = next(r for r in results if r.id == "beads-workspace")
+    assert beads.status == onb.STATUS_OK
+    assert "OK" in report
+    assert beads.remedy not in report
+
+
+def test_json_exit0_all_green_exit1_any_gap(tmp_path):
+    """exit 0 / ok:true when all-green; a single required gap flips exit to 1
+    and ok:false — both derived from the same result list."""
+    repo = make_onboard_repo(tmp_path)
+    env = _green_env()
+
+    green = onb.run_checks(str(repo), env=env)
+    assert onb.exit_code_for(green) == 0
+    assert onb.build_payload(str(repo), green, None)["ok"] is True
+    assert all(r.status != onb.STATUS_GAP for r in green)
+
+    (repo / "CLAUDE.md").write_text("# no marker here\n", encoding="utf-8")
+    gapped = onb.run_checks(str(repo), env=env)
+    assert onb.exit_code_for(gapped) == 1
+    payload = onb.build_payload(str(repo), gapped, None)
+    assert payload["ok"] is False
+    assert payload["exit_code"] == 1
+
+
+def test_already_onboarded_repo_reports_all_green_proposes_nothing(tmp_path):
+    """A repo that is already fully set up scans all-green and proposes no
+    remedy — every check OK, zero gaps, and the report says so."""
+    repo = make_onboard_repo(tmp_path)
+    env = _green_env()
+
+    results = onb.run_checks(str(repo), env=env)
+    assert all(r.status == onb.STATUS_OK for r in results)
+    assert onb.exit_code_for(results) == 0
+
+    report = onb.render_text(str(repo), results, onb.git_state(str(repo)))
+    assert "all green" in report
+    assert "GAP" not in report               # nothing proposed
+
+
+# --- .sable line-shape (shape, not presence) --------------------------------
+
+@pytest.mark.parametrize("line,accepts", [
+    ("testCommand=pytest -q", True),
+    ("integrationBranch=main", True),
+    (" testCommand=pytest", False),          # leading space
+    ("testCommand = pytest", False),         # space around '='
+    ("# testCommand=pytest", False),         # comment
+    ("TestCommand=pytest", False),           # wrong case
+])
+def test_sable_line_shape_accept_reject_matrix(tmp_path, line, accepts):
+    """The sable-contract check validates line SHAPE via sable_stack_detect:
+    a grammar-valid line is OK, a malformed one is a GAP even though .sable
+    exists."""
+    repo = make_onboard_repo(tmp_path)
+    (repo / ".sable").write_text(line + "\n", encoding="utf-8")
+    env = _green_env()
+
+    result = onb.run_checks(str(repo), only="sable-contract", env=env)[0]
+    if accepts:
+        assert result.status == onb.STATUS_OK
+    else:
+        assert result.status == onb.STATUS_GAP
+        assert "malformed" in result.detail
+
+
+def test_prime_block_and_settings_wiring_checked_independently_of_doctor(tmp_path):
+    """The two doctor-blind checks: even with sable-doctor reporting CLEAN, an
+    absent prime block and non-portable settings wiring each still report a GAP
+    — they are not masked by a green install-scope."""
+    repo = make_onboard_repo(tmp_path)
+    # doctor stays clean...
+    env = _green_env()
+    # ...but the prime block is gone and the hook wiring leaks an absolute path
+    (repo / "CLAUDE.md").write_text("# just a heading, no directive\n", encoding="utf-8")
+    (repo / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command",
+             "command": "bash /home/someone/.claude/hooks/multi-manager/mode-interlock.sh"},
+        ]}]},
+    }), encoding="utf-8")
+
+    results = {r.id: r for r in onb.run_checks(str(repo), env=env)}
+
+    assert results["install-scope"].status == onb.STATUS_OK          # doctor clean
+    assert results["claude-md-prime-block"].status == onb.STATUS_GAP  # still caught
+    assert results["settings-wiring"].status == onb.STATUS_GAP        # still caught
+    assert "CLAUDE_PROJECT_DIR" in results["settings-wiring"].detail
+
+
+# --- --check scoping --------------------------------------------------------
+
+def test_check_flag_scopes_to_single_check_id(tmp_path):
+    """--check runs (and exit-derives from) exactly one check id."""
+    repo = make_onboard_repo(tmp_path)
+    env = _green_env()
+
+    scoped = onb.run_checks(str(repo), only="bin:bd", env=env)
+    assert len(scoped) == 1
+    assert scoped[0].id == "bin:bd"
+
+    rc = onb.main(["--repo", str(repo), "--check", "beads-workspace"])
+    assert rc == 0  # beads workspace present in the fixture
+
+
+def test_check_unknown_id_errors_nonzero_no_crash(tmp_path):
+    """An unknown --check id errors non-zero cleanly (no traceback); the
+    library raises KeyError for a caller to handle."""
+    repo = make_onboard_repo(tmp_path)
+
+    rc = onb.main(["--repo", str(repo), "--check", "no-such-check"])
+    assert rc != 0
+    assert rc == 2
+
+    with pytest.raises(KeyError):
+        onb.run_checks(str(repo), only="no-such-check", env=_green_env())
+
+
+# --- D7: default-branch resolution ------------------------------------------
+
+def test_default_branch_from_origin_head_ref(tmp_path):
+    """origin/HEAD's symbolic-ref is authoritative: it names the default branch
+    directly."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "f").write_text("x\n", encoding="utf-8")
+    _commit(repo)
+    _git(repo, "remote", "add", "origin", "https://github.com/acme/w.git")
+    _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+
+    assert onb.default_branch(str(repo)) == "main"
+
+
+def test_default_branch_origin_head_unset_falls_back_to_membership(tmp_path):
+    """With origin present but its HEAD unset, resolution falls back to the
+    conservative {main, master} membership signal."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "master")
+    (repo / "f").write_text("x\n", encoding="utf-8")
+    _commit(repo)
+    _git(repo, "remote", "add", "origin", "https://github.com/acme/w.git")
+    # origin/HEAD deliberately never set
+
+    assert onb.default_branch(str(repo)) == "master"
+
+
+def test_default_branch_never_consults_init_defaultbranch(tmp_path):
+    """init.defaultBranch is a decoy — it describes what a FRESH git init would
+    name a branch, never what THIS repo's default is (SABLE-r1zs). It must be
+    ignored entirely."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "init.defaultBranch", "decoy-not-used")
+    (repo / "f").write_text("x\n", encoding="utf-8")
+    _commit(repo)
+    # no remote -> membership; the decoy branch does not exist
+
+    resolved = onb.default_branch(str(repo))
+    assert resolved == "main"
+    assert resolved != "decoy-not-used"
+
+
+# --- D7: HEAD-state detection -----------------------------------------------
+
+def test_detached_head_named_remedy_not_head_string(tmp_path):
+    """A detached HEAD yields a named remedy and NEVER reports the literal
+    string 'HEAD' as the current branch."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "f").write_text("x\n", encoding="utf-8")
+    _commit(repo)
+    sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        stdout=subprocess.PIPE, text=True, check=True).stdout.strip()
+    _git(repo, "checkout", "-q", sha)  # detach
+
+    state = onb.git_state(str(repo))
+    assert state.head_state == onb.HEAD_DETACHED
+    assert state.current_branch is None
+    assert state.current_branch != "HEAD"
+    assert state.branch_remedy and state.branch_remedy.strip()
+
+
+def test_unborn_branch_named_remedy(tmp_path):
+    """An unborn branch (git init, no commit yet) is detected with a named
+    remedy — rev-parse HEAD fails though symbolic-ref succeeds."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+
+    state = onb.git_state(str(repo))
+    assert state.head_state == onb.HEAD_UNBORN
+    assert state.current_branch == "main"
+    assert state.branch_remedy and state.branch_remedy.strip()
+
+
+def test_no_remote_confirms_local_ci_report_only(tmp_path):
+    """Detection output side: a real git repo with NO remote and no ci-verify.yml
+    makes the ci-verify check report-only (not a gap) — nothing to apply
+    locally."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+
+    result = onb.run_checks(str(repo), only="ci-verify", env=_green_env())[0]
+    assert result.status == onb.STATUS_REPORT_ONLY
+    assert onb.exit_code_for([result]) == 0    # report-only never flips exit
+
+
+def test_multiple_remotes_asks(tmp_path):
+    """Multiple remotes raise the 'ask' signal — the scanner detects, the skill
+    asks which remote is canonical."""
+    repo = make_onboard_repo(tmp_path)
+    _git(repo, "remote", "add", "origin", "https://github.com/acme/w.git")
+    _git(repo, "remote", "add", "upstream", "https://github.com/other/w.git")
+
+    state = onb.git_state(str(repo))
+    assert state.remote_state == onb.MULTIPLE_REMOTES
+    assert state.asks is True
+
+
+# --- S1: zero-writes ---------------------------------------------------------
+
+def _tree_snapshot(root: Path):
+    """sha256 of every file under root except .git internals — the scanner must
+    not create, modify, or delete any working-tree file (S1 zero-writes)."""
+    snap = {}
+    for p in sorted(root.rglob("*")):
+        if p.is_file() and ".git" not in p.relative_to(root).parts:
+            snap[str(p.relative_to(root))] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return snap
+
+
+def test_scan_performs_zero_writes(tmp_path):
+    """A full scan (checks + git-state + both renderers) mutates nothing in the
+    target tree — the read-only S1 contract, asserted by a before/after
+    snapshot."""
+    repo = make_onboard_repo(tmp_path)
+    env = _green_env()
+
+    before = _tree_snapshot(repo)
+    results = onb.run_checks(str(repo), env=env)
+    state = onb.git_state(str(repo))
+    onb.render_text(str(repo), results, state)
+    onb.build_payload(str(repo), results, state)
+    after = _tree_snapshot(repo)
+
+    assert before == after

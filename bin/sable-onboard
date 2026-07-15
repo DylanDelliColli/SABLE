@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""sable-onboard — the read-only /sable-onboarding SCANNER (SABLE-gn7a.3).
+
+Takes an arbitrary target repo from unknown to a findings report: for every
+SABLE prerequisite it probes present / missing and, when missing, names the
+remedy. It NEVER mutates anything (S1 zero-writes) — every probe reads the
+filesystem, runs a read-only git query, or subprocesses another read-only
+tool. The gated APPLY of each remedy is the skill's job (SABLE-gn7a.4); this
+binary only tells the truth about the current state.
+
+Two design pillars:
+
+  D2 — SINGLE CHECKS REGISTRY. `CHECKS` is one table of Check
+  {id, tier, remedy, apply_delegate, probe}. The human report, the --json
+  payload, the process exit code, AND --check <id> addressability ALL derive
+  from that one list — no second enumeration anywhere (the Shotgun-Surgery
+  guard, proven by test_checks_registry_every_id_in_all_four_outputs). Adding a
+  prerequisite means adding ONE registry row; all four outputs pick it up.
+
+  D7 — GIT-STATE PROBES (detection side only). git_state() classifies HEAD
+  (normal / detached / unborn), enumerates remotes, and resolves the default
+  branch via origin/HEAD with a conservative {main, master} membership fallback
+  — NEVER consulting init.defaultBranch (the SABLE-r1zs lesson). A detached HEAD
+  yields a named remedy, never the literal string "HEAD" reported as a branch.
+  The scanner only DETECTS this state; the skill owns the branch-confirmation
+  conversation (S6).
+
+Tiers gate how a failed probe scores:
+  required-hard   bd / git / python3 / claude, the install, the beads workspace,
+                  the .sable contract, the CLAUDE.md prime block, the committed
+                  settings wiring — a miss is a GAP (flips exit to 1).
+  ci-required     gh, and ci-verify presence — a miss is a GAP.
+  fleet-optional  tmux / dolt — a miss is reported with a named remedy but is
+                  OPTIONAL (never a hard fail; exit stays 0). The solo external
+                  adopter needs neither.
+CI provider outcomes that are neither present nor apply-able (a non-GitHub CI,
+or no remote at all) report REPORT-ONLY: surfaced with a manual remedy, exit
+unaffected.
+
+Usage:
+  sable-onboard [--repo PATH] [--json] [--check ID]
+
+  --repo PATH   target repo to scan (default: current directory)
+  --json        emit the machine-readable payload instead of the text report
+  --check ID    scan (and exit-derive from) only the single check ID; an
+                unknown ID errors non-zero without scanning
+
+Exit status: 0 when every non-optional check is green, 1 when any check is a
+GAP. Optional and report-only outcomes never flip the exit code.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from typing import Callable, NamedTuple, Optional, Tuple
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import sable_stack_detect as ssd  # noqa: E402
+import sable_ci_template as sct  # noqa: E402
+
+_BIN_DIR = os.path.dirname(os.path.realpath(__file__))
+
+# --- status + tier vocabulary ------------------------------------------------
+
+STATUS_OK = "ok"                    # green
+STATUS_GAP = "gap"                  # red — flips exit to 1
+STATUS_REPORT_ONLY = "report-only"  # advisory (manual remedy) — exit unaffected
+STATUS_OPTIONAL = "optional-missing"  # fleet-optional tool absent — exit unaffected
+
+REQUIRED_HARD = "required-hard"
+CI_REQUIRED = "ci-required"
+FLEET_OPTIONAL = "fleet-optional"
+
+# The portable placeholder every committed hook command must be rooted at so the
+# wiring survives a clone to another machine/path (the sable-orchestration-install
+# project-scope contract; one of the two doctor-blind checks).
+PROJECT_DIR_PLACEHOLDER = "${CLAUDE_PROJECT_DIR}"
+
+# git-state constants (D7).
+HEAD_NORMAL = "normal"
+HEAD_DETACHED = "detached"
+HEAD_UNBORN = "unborn"
+
+NO_REMOTE = "none"
+SINGLE_REMOTE = "single"
+MULTIPLE_REMOTES = "multiple"
+
+
+# ---------------------------------------------------------------------------
+# read-only shell helpers (never mutate — S1)
+# ---------------------------------------------------------------------------
+
+def _git_out(repo: str, *args: str) -> Optional[str]:
+    """Run a read-only `git -C repo ...` and return its stripped stdout, or None
+    when git is unavailable, the command failed, or the output was empty."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, *args],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _git_ok(repo: str, *args: str) -> bool:
+    """True iff a read-only `git -C repo ...` exits 0."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, *args],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0
+
+
+def _read(path: str) -> str:
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _run_doctor(repo: str) -> Tuple[bool, str]:
+    """Delegate the install-scope verdict verbatim to `sable-doctor --project`
+    (D3 — the scanner carries ZERO install-manifest logic of its own). Returns
+    (clean, detail). A non-zero exit (drift, missing files, or no project
+    install resolvable) is a gap; an unrunnable doctor is also a gap, never a
+    false clean."""
+    doctor = os.path.join(_BIN_DIR, "sable-doctor")
+    try:
+        proc = subprocess.run(
+            [sys.executable, doctor, "--project", "--quiet"],
+            cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+    except OSError as exc:
+        return False, "sable-doctor could not be run (%s)." % exc
+    if proc.returncode == 0:
+        return True, "sable-doctor --project: install matches repo HEAD."
+    detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    tail = detail[-1] if detail else "drift or no project install"
+    return False, "sable-doctor --project reports a problem: %s" % tail
+
+
+# ---------------------------------------------------------------------------
+# probe environment — dependency injection so probes stay hermetically testable
+# ---------------------------------------------------------------------------
+
+class Env(NamedTuple):
+    """The external-world handles a probe may reach through. Injected so tests
+    can substitute a fake `which` / `run_doctor` without monkeypatching or
+    shelling out to the real binaries."""
+    which: Callable[[str], Optional[str]]
+    run_doctor: Callable[[str], Tuple[bool, str]]
+
+
+DEFAULT_ENV = Env(which=shutil.which, run_doctor=_run_doctor)
+
+
+# ---------------------------------------------------------------------------
+# D2 — the single CHECKS registry.
+# ---------------------------------------------------------------------------
+
+class Check(NamedTuple):
+    """One prerequisite the scanner probes. `probe(repo, env)` returns
+    (status, detail); `remedy` is the static named remediation shown when the
+    status is not OK; `apply_delegate` names the machinery the skill would drive
+    to close the gap (None when there is nothing to auto-apply)."""
+    id: str
+    tier: str
+    remedy: str
+    apply_delegate: Optional[str]
+    probe: Callable[[str, Env], Tuple[str, str]]
+
+
+class CheckResult(NamedTuple):
+    """A Check joined with the outcome of running its probe."""
+    id: str
+    tier: str
+    status: str
+    detail: str
+    remedy: str
+    apply_delegate: Optional[str]
+
+    @property
+    def ok(self) -> bool:
+        return self.status == STATUS_OK
+
+    @property
+    def is_gap(self) -> bool:
+        return self.status == STATUS_GAP
+
+
+# --- probe factories + probe functions --------------------------------------
+
+def _probe_binary(name: str, tier: str):
+    """A presence probe for an executable on PATH. A fleet-optional tool that is
+    absent reports OPTIONAL (advisory); any other tier reports a GAP."""
+    fail = STATUS_OPTIONAL if tier == FLEET_OPTIONAL else STATUS_GAP
+
+    def probe(repo: str, env: Env) -> Tuple[str, str]:
+        found = env.which(name)
+        if found:
+            return STATUS_OK, "%s found (%s)" % (name, found)
+        return fail, "%s not found on PATH" % name
+
+    return probe
+
+
+def _probe_install_scope(repo: str, env: Env) -> Tuple[str, str]:
+    ok, detail = env.run_doctor(repo)
+    return (STATUS_OK if ok else STATUS_GAP), detail
+
+
+def _probe_beads_workspace(repo: str, env: Env) -> Tuple[str, str]:
+    """`bd init` leaves a .beads/ workspace (config.yaml + metadata.json). Their
+    presence — not any particular bead content — is the signal."""
+    beads = os.path.join(repo, ".beads")
+    if not os.path.isdir(beads):
+        return STATUS_GAP, "no .beads/ workspace (bd init has not run)."
+    if not os.path.isfile(os.path.join(beads, "config.yaml")):
+        return STATUS_GAP, ".beads/ exists but config.yaml is missing (incomplete bd init)."
+    return STATUS_OK, ".beads/ workspace present (config.yaml)."
+
+
+def _probe_sable_contract(repo: str, env: Env) -> Tuple[str, str]:
+    """The .sable contract is checked for SHAPE, not mere presence: every line
+    must be a valid testCommand= / integrationBranch= line under the one-parser
+    grammar (sable_stack_detect.validate). A malformed line is a GAP even though
+    the file exists; an absent or empty file is a GAP (no contract established)."""
+    path = os.path.join(repo, ".sable")
+    if not os.path.isfile(path):
+        return STATUS_GAP, "no .sable contract (onboarding proposes testCommand=/integrationBranch=)."
+    verdicts = ssd.validate(_read(path))
+    if not verdicts:
+        return STATUS_GAP, ".sable is empty — no testCommand=/integrationBranch= line."
+    rejects = [lc for lc in verdicts if lc.verdict == "reject"]
+    if rejects:
+        where = ", ".join(str(lc.lineno) for lc in rejects)
+        return STATUS_GAP, (
+            ".sable has malformed line(s) at %s — each must be exactly "
+            "testCommand=<cmd> or integrationBranch=<branch>." % where
+        )
+    return STATUS_OK, ".sable line-shape valid (%d line(s))." % len(verdicts)
+
+
+def _probe_prime_block(repo: str, env: Env) -> Tuple[str, str]:
+    """The CLAUDE.md Prime Directive block — the install.sh:298 marker. A
+    doctor-blind check: sha-comparing installed files never notices whether the
+    governing CLAUDE.md actually carries the block."""
+    path = os.path.join(repo, "CLAUDE.md")
+    if not os.path.isfile(path):
+        return STATUS_GAP, "no CLAUDE.md — the Prime Directive block is absent."
+    if "Prime Directive" in _read(path):
+        return STATUS_OK, "CLAUDE.md carries the Prime Directive block."
+    return STATUS_GAP, "CLAUDE.md present but missing the Prime Directive block."
+
+
+def _hook_commands(settings: dict):
+    """Yield every hooks[event][*].hooks[*].command string from a parsed
+    settings.json, defensively skipping any malformed node."""
+    hooks = settings.get("hooks") if isinstance(settings, dict) else None
+    if not isinstance(hooks, dict):
+        return
+    for blocks in hooks.values():
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            for hook in block.get("hooks", []) or []:
+                if isinstance(hook, dict) and isinstance(hook.get("command"), str):
+                    yield hook["command"]
+
+
+def _probe_settings_wiring(repo: str, env: Env) -> Tuple[str, str]:
+    """The committed .claude/settings.json hook wiring — the second doctor-blind
+    check. Every command that references a hook SCRIPT (.claude/hooks/...) must
+    be rooted at ${CLAUDE_PROJECT_DIR} so the wiring survives a clone; an
+    absolute / home-rooted leak is a GAP. No settings.json, or one that wires no
+    SABLE hooks at all, is also a GAP."""
+    path = os.path.join(repo, ".claude", "settings.json")
+    if not os.path.isfile(path):
+        return STATUS_GAP, "no committed .claude/settings.json (portable hook wiring absent)."
+    try:
+        data = json.loads(_read(path))
+    except ValueError:
+        return STATUS_GAP, ".claude/settings.json is not valid JSON."
+    hook_cmds = [c for c in _hook_commands(data) if ".claude/hooks/" in c]
+    if not hook_cmds:
+        return STATUS_GAP, ".claude/settings.json wires no SABLE hooks (.claude/hooks/…)."
+    leaks = [c for c in hook_cmds if PROJECT_DIR_PLACEHOLDER not in c]
+    if leaks:
+        return STATUS_GAP, (
+            "%d hook command(s) not ${CLAUDE_PROJECT_DIR}-rooted — won't survive "
+            "a clone (e.g. %r)." % (len(leaks), leaks[0])
+        )
+    return STATUS_OK, (
+        "%d hook command(s) wired, all ${CLAUDE_PROJECT_DIR}-rooted." % len(hook_cmds)
+    )
+
+
+def _probe_ci_verify(repo: str, env: Env) -> Tuple[str, str]:
+    """CI presence, via sable_ci_template.detect_provider. An existing
+    ci-verify.yml is OK; a github.com remote without one is an applyable GAP; a
+    non-GitHub CI or no remote at all is REPORT-ONLY (manual / not-applicable)."""
+    prov = sct.detect_provider(repo)
+    if prov.kind == sct.EXISTING_CI_VERIFY:
+        return STATUS_OK, prov.detail
+    if prov.kind == sct.GITHUB_REMOTE:
+        return STATUS_GAP, prov.detail
+    return STATUS_REPORT_ONLY, prov.detail
+
+
+CHECKS = (
+    Check("bin:bd", REQUIRED_HARD,
+          "Install beads (bd) — the issue tracker every SABLE workflow runs through.",
+          None, _probe_binary("bd", REQUIRED_HARD)),
+    Check("bin:git", REQUIRED_HARD,
+          "Install git.", None, _probe_binary("git", REQUIRED_HARD)),
+    Check("bin:python3", REQUIRED_HARD,
+          "Install Python 3 (the scanner, doctor, and detectors are Python).",
+          None, _probe_binary("python3", REQUIRED_HARD)),
+    Check("bin:claude", REQUIRED_HARD,
+          "Install the Claude Code CLI.", None, _probe_binary("claude", REQUIRED_HARD)),
+    Check("bin:gh", CI_REQUIRED,
+          "Install the GitHub CLI (gh) to apply and verify the ci-verify workflow.",
+          None, _probe_binary("gh", CI_REQUIRED)),
+    Check("bin:tmux", FLEET_OPTIONAL,
+          "Install tmux only for the warm-pane fleet — the solo onboarding loop does not need it.",
+          None, _probe_binary("tmux", FLEET_OPTIONAL)),
+    Check("bin:dolt", FLEET_OPTIONAL,
+          "Install dolt only if you share a beads remote — the solo onboarding loop does not need it.",
+          None, _probe_binary("dolt", FLEET_OPTIONAL)),
+    Check("install-scope", REQUIRED_HARD,
+          "Run `bash install.sh` (project scope) to install/refresh the SABLE machinery.",
+          "install.sh --project", _probe_install_scope),
+    Check("beads-workspace", REQUIRED_HARD,
+          "Run `bd init` in the repo to create the beads workspace.",
+          "bd init", _probe_beads_workspace),
+    Check("sable-contract", REQUIRED_HARD,
+          "Establish a valid .sable (testCommand=/integrationBranch=) — onboarding proposes one after an execute-once check.",
+          "sable_stack_detect.write", _probe_sable_contract),
+    Check("claude-md-prime-block", REQUIRED_HARD,
+          "Prepend the Prime Directive block to CLAUDE.md (install.sh Step 7 does this).",
+          "install.sh", _probe_prime_block),
+    Check("settings-wiring", REQUIRED_HARD,
+          "Wire committed .claude/settings.json hooks rooted at ${CLAUDE_PROJECT_DIR} (sable-orchestration-install project scope).",
+          "sable-orchestration-install", _probe_settings_wiring),
+    Check("ci-verify", CI_REQUIRED,
+          "Generate .github/workflows/ci-verify.yml from templates/ci-verify-project.yml (GitHub remotes only; other providers are manual).",
+          "sable_ci_template.render_workflow", _probe_ci_verify),
+)
+
+# id -> Check, the single source both --check addressability and lookups use.
+CHECKS_BY_ID = {c.id: c for c in CHECKS}
+
+
+def run_checks(repo: str, *, only: Optional[str] = None,
+               env: Env = DEFAULT_ENV):
+    """Run the registry against `repo` and return a list of CheckResult, one per
+    Check (or just the single Check named by `only`). Raises KeyError when
+    `only` names an id not in the registry (the CLI turns that into a clean
+    non-zero error). Read-only: no probe writes anything."""
+    if only is not None:
+        checks = [CHECKS_BY_ID[only]]  # KeyError -> unknown id
+    else:
+        checks = list(CHECKS)
+    results = []
+    for check in checks:
+        status, detail = check.probe(repo, env)
+        results.append(CheckResult(
+            id=check.id, tier=check.tier, status=status, detail=detail,
+            remedy=check.remedy, apply_delegate=check.apply_delegate,
+        ))
+    return results
+
+
+def exit_code_for(results) -> int:
+    """The process exit code, derived from the SAME result list the report and
+    json render — 1 when any check is a GAP, else 0. Optional and report-only
+    outcomes never flip it."""
+    return 1 if any(r.status == STATUS_GAP for r in results) else 0
+
+
+# ---------------------------------------------------------------------------
+# D7 — git-state detection (detection side only; the skill owns the talk).
+# ---------------------------------------------------------------------------
+
+class GitState(NamedTuple):
+    head_state: str               # normal | detached | unborn
+    current_branch: Optional[str]  # None when detached (never the "HEAD" string)
+    branch_remedy: Optional[str]   # named remedy for detached / unborn, else None
+    remotes: tuple                 # remote names, in git's order
+    remote_state: str              # none | single | multiple
+    default_branch: Optional[str]  # from origin/HEAD, else {main,master} membership
+    on_default_branch: bool        # True only when on a normal branch == default
+    asks: bool                     # True when >1 remote — the skill must ask which
+
+
+def _remotes(repo: str):
+    out = _git_out(repo, "remote")
+    return out.splitlines() if out else []
+
+
+def _preferred_remote(repo: str) -> Optional[str]:
+    """origin when present (the near-universal convention), else the first
+    configured remote, else None."""
+    remotes = _remotes(repo)
+    if "origin" in remotes:
+        return "origin"
+    return remotes[0] if remotes else None
+
+
+def _ref_exists(repo: str, name: str) -> bool:
+    """True when `name` names a local branch or any remote-tracking branch —
+    the conservative membership signal for the default-branch fallback."""
+    if _git_ok(repo, "show-ref", "--verify", "--quiet", "refs/heads/%s" % name):
+        return True
+    for remote in _remotes(repo):
+        if _git_ok(repo, "show-ref", "--verify", "--quiet",
+                   "refs/remotes/%s/%s" % (remote, name)):
+            return True
+    return False
+
+
+def default_branch(repo: str) -> Optional[str]:
+    """Resolve the repo's default branch WITHOUT ever consulting
+    init.defaultBranch (the SABLE-r1zs lesson — that setting describes what a
+    fresh `git init` would name a branch, not what THIS repo's default is).
+
+    First the authoritative signal: the preferred remote's HEAD symbolic-ref
+    (`refs/remotes/<remote>/HEAD` -> `refs/remotes/<remote>/main`). When that is
+    unset, fall back conservatively to {main, master} membership — whichever of
+    those two actually exists as a branch. None when neither is resolvable."""
+    remote = _preferred_remote(repo)
+    if remote:
+        ref = _git_out(repo, "symbolic-ref", "--quiet",
+                       "refs/remotes/%s/HEAD" % remote)
+        if ref:
+            return ref.rsplit("/", 1)[-1]
+    for name in ("main", "master"):
+        if _ref_exists(repo, name):
+            return name
+    return None
+
+
+def git_state(repo: str) -> GitState:
+    """Classify HEAD, remotes, and the default branch for `repo` (read-only).
+
+    HEAD: `git symbolic-ref -q HEAD` failing means DETACHED — current_branch is
+    None and a named remedy is set (the literal "HEAD" is NEVER reported as a
+    branch). Symbolic-ref succeeding but `git rev-parse --verify HEAD` failing
+    means UNBORN (a branch pointer with no commits yet). Otherwise NORMAL."""
+    symref = _git_out(repo, "symbolic-ref", "-q", "HEAD")
+    if symref is None:
+        head_state = HEAD_DETACHED
+        current_branch = None
+        remedy = (
+            "Detached HEAD — check out a branch (e.g. `git switch -c work`) "
+            "before onboarding; 'HEAD' is not a branch name."
+        )
+    else:
+        branch = symref[len("refs/heads/"):] if symref.startswith("refs/heads/") else symref
+        if _git_out(repo, "rev-parse", "--verify", "-q", "HEAD") is None:
+            head_state = HEAD_UNBORN
+            current_branch = branch
+            remedy = (
+                "Unborn branch %r (no commits yet) — make an initial commit "
+                "before onboarding." % branch
+            )
+        else:
+            head_state = HEAD_NORMAL
+            current_branch = branch
+            remedy = None
+
+    remotes = tuple(_remotes(repo))
+    if not remotes:
+        remote_state = NO_REMOTE
+    elif len(remotes) == 1:
+        remote_state = SINGLE_REMOTE
+    else:
+        remote_state = MULTIPLE_REMOTES
+
+    default = default_branch(repo)
+    on_default = (
+        head_state == HEAD_NORMAL and current_branch is not None
+        and default is not None and current_branch == default
+    )
+    return GitState(
+        head_state=head_state,
+        current_branch=current_branch,
+        branch_remedy=remedy,
+        remotes=remotes,
+        remote_state=remote_state,
+        default_branch=default,
+        on_default_branch=on_default,
+        asks=remote_state == MULTIPLE_REMOTES,
+    )
+
+
+# ---------------------------------------------------------------------------
+# rendering — text report and json payload, both derived from the result list.
+# ---------------------------------------------------------------------------
+
+_STATUS_LABEL = {
+    STATUS_OK: "OK  ",
+    STATUS_GAP: "GAP ",
+    STATUS_REPORT_ONLY: "note",
+    STATUS_OPTIONAL: "opt ",
+}
+
+
+def _branch_display(state: GitState) -> str:
+    if state.head_state == HEAD_DETACHED:
+        return "(detached HEAD)"
+    if state.head_state == HEAD_UNBORN:
+        return "(unborn: %s)" % state.current_branch
+    return state.current_branch or "(unknown)"
+
+
+def render_text(repo: str, results, state: Optional[GitState]) -> str:
+    lines = ["sable-onboard: scan of %s" % repo, ""]
+
+    if state is not None:
+        lines.append("Git state:")
+        lines.append("  branch:         %s" % _branch_display(state))
+        lines.append("  default branch: %s" % (state.default_branch or "(unresolved)"))
+        lines.append("  remotes:        %s"
+                     % (", ".join(state.remotes) if state.remotes else "(none)"))
+        if state.branch_remedy:
+            lines.append("  remedy: %s" % state.branch_remedy)
+        if state.on_default_branch:
+            lines.append("  note: currently on the default branch — onboarding will "
+                         "recommend a working branch before any apply.")
+        if state.asks:
+            lines.append("  ask: multiple remotes — onboarding will ask which is canonical.")
+        lines.append("")
+
+    lines.append("Checks:")
+    for r in results:
+        lines.append("  [%s] %-22s %s" % (_STATUS_LABEL.get(r.status, r.status), r.id, r.detail))
+        if r.status != STATUS_OK:
+            lines.append("        remedy: %s" % r.remedy)
+
+    n_ok = sum(1 for r in results if r.status == STATUS_OK)
+    n_gap = sum(1 for r in results if r.status == STATUS_GAP)
+    n_other = len(results) - n_ok - n_gap
+    lines.append("")
+    lines.append("Summary: %d ok, %d gap(s), %d optional/report-only."
+                 % (n_ok, n_gap, n_other))
+    lines.append("all green — SABLE prerequisites satisfied." if n_gap == 0
+                 else "gaps found — see remedies above.")
+    return "\n".join(lines)
+
+
+def build_payload(repo: str, results, state: Optional[GitState]) -> dict:
+    payload = {
+        "repo": repo,
+        "ok": exit_code_for(results) == 0,
+        "exit_code": exit_code_for(results),
+        "checks": [
+            {
+                "id": r.id,
+                "tier": r.tier,
+                "status": r.status,
+                "detail": r.detail,
+                "remedy": r.remedy,
+                "apply_delegate": r.apply_delegate,
+            }
+            for r in results
+        ],
+    }
+    if state is not None:
+        payload["git_state"] = {
+            "head_state": state.head_state,
+            "current_branch": state.current_branch,
+            "branch_remedy": state.branch_remedy,
+            "remotes": list(state.remotes),
+            "remote_state": state.remote_state,
+            "default_branch": state.default_branch,
+            "on_default_branch": state.on_default_branch,
+            "asks": state.asks,
+        }
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="sable-onboard",
+        description="Read-only scan of a target repo for SABLE prerequisites "
+                    "(present / missing / named remedy per check).",
+    )
+    parser.add_argument("--repo", default=None,
+                        help="target repo to scan (default: current directory)")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the machine-readable payload instead of the text report")
+    parser.add_argument("--check", default=None, metavar="ID",
+                        help="scan only this single check id (see the registry)")
+    args = parser.parse_args(argv)
+
+    repo = os.path.abspath(args.repo) if args.repo else os.getcwd()
+
+    if args.check is not None and args.check not in CHECKS_BY_ID:
+        print("sable-onboard: unknown check id %r; known ids: %s"
+              % (args.check, ", ".join(c.id for c in CHECKS)), file=sys.stderr)
+        return 2
+
+    results = run_checks(repo, only=args.check)
+    # git-state is whole-repo context, shown for a full scan only (a scoped
+    # --check answers one prerequisite, not the branch conversation).
+    state = git_state(repo) if args.check is None else None
+
+    if args.json:
+        print(json.dumps(build_payload(repo, results, state), indent=2))
+    else:
+        print(render_text(repo, results, state))
+
+    return exit_code_for(results)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
