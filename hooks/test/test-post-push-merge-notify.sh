@@ -1161,6 +1161,56 @@ fi
 rm -f "$STUB_DIR/git" "$TB1Y_COUNT" "$TB1Y_TRACE"
 
 # --------------------------------------------------------------------------
+# SABLE-f916: the auto-notify landing artifacts (live chuck message AND the
+# durable for-chuck bead fallback) must self-label as auto-detected so Chuck
+# can mechanically tell them apart from a manager's deliberate, reviewed
+# PR-ready sign-off — which carries no such label. Incident 2026-07-15: an
+# auto-notify for wk-bin-symlink-parity (SABLE-59t6.6) was queued+inspected
+# as if PR-ready, but optimus had never accepted it (later rejected for
+# false-green tests), because the two framings were byte-identical.
+# --------------------------------------------------------------------------
+
+AUTO_NOTIFY_MARKER="AUTO-NOTIFY"
+
+# (a) Live chuck message (message-first handoff, Chuck reachable): carries
+# the auto-notify marker.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -qE "^chuck .*${AUTO_NOTIFY_MARKER}.*PR ready from optimus" "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "SABLE-f916: live chuck handoff message self-labels as auto-notify"
+else
+  fail "SABLE-f916: live chuck handoff message self-labels as auto-notify" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+
+# (b) Durable for-chuck bead fallback (Chuck unreachable): both the bead
+# title and description carry the same auto-notify marker, so the fallback
+# path is just as distinguishable as the live-message path.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+run_hook "$MGR_ENV SABLE_STUB_CHUCK_PRESENT=0" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -q "for-chuck" "$BD_LOG" 2>/dev/null \
+   && grep -qF -- "--title [${AUTO_NOTIFY_MARKER}]" "$BD_LOG" 2>/dev/null \
+   && grep -q "NOT a manager sign-off" "$BD_LOG" 2>/dev/null; then
+  pass "SABLE-f916: durable for-chuck bead fallback self-labels as auto-notify (title + description)"
+else
+  fail "SABLE-f916: durable for-chuck bead fallback self-labels as auto-notify (title + description)" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null)"
+fi
+
+# (c) The two framings are MECHANICALLY distinguishable: a manager's
+# deliberate, reviewed sign-off (typed directly, never routed through this
+# hook) carries no auto-notify marker — so a downstream consumer (Chuck) can
+# grep for the marker's ABSENCE to recognize a real sign-off, and its
+# PRESENCE to recognize an unreviewed auto-detected push.
+MANUAL_SIGNOFF="PR ready from optimus: branch wk-foo (a.py b.py). Reviewed and accepted — merge into the integration branch."
+if printf '%s' "$MANUAL_SIGNOFF" | grep -q "${AUTO_NOTIFY_MARKER}"; then
+  fail "SABLE-f916: a manager's manual sign-off carries no auto-notify marker (framings distinguishable)" "unexpectedly matched: $MANUAL_SIGNOFF"
+else
+  pass "SABLE-f916: a manager's manual sign-off carries no auto-notify marker (framings distinguishable)"
+fi
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+
+# --------------------------------------------------------------------------
 # Summary
 # --------------------------------------------------------------------------
 
