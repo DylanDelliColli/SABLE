@@ -13,7 +13,12 @@ Usage:
   sable-agents --help
 
 Env:
-  SABLE_REGISTRY                Override registry path (default: ~/.claude/sable/agents.yaml)
+  SABLE_AGENTS_YAML             Registry path override (unified across SABLE).
+                                Falls back to the repo's own agents.yaml, else
+                                ~/.claude/sable/agents.yaml.
+  SABLE_REGISTRY                DEPRECATED alias for SABLE_AGENTS_YAML — still
+                                honored (with a stderr warning); SABLE_AGENTS_YAML
+                                wins when both are set (SABLE-k7mx).
 """
 
 from __future__ import annotations
@@ -26,7 +31,35 @@ import sys
 from pathlib import Path
 from typing import Any
 
-DEFAULT_REGISTRY = Path.home() / ".claude" / "sable" / "agents.yaml"
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_registry_lib import home_registry_path, sable_registry_path  # noqa: E402
+
+# Legacy global path, sourced from the shared resolver (SABLE-59t6.1). Used only
+# for the --help default display; actual resolution goes through
+# _default_registry() below (project-first + deprecated-alias handling).
+DEFAULT_REGISTRY = Path(home_registry_path())
+
+
+def _default_registry() -> str:
+    """Resolve the registry path for the --registry default, honoring the
+    deprecated SABLE_REGISTRY alias (SABLE-k7mx, superseded by SABLE-59t6.1):
+
+      - SABLE_REGISTRY set  → emit a one-line stderr deprecation warning.
+      - SABLE_AGENTS_YAML wins when both are set (via sable_registry_path, which
+        returns it verbatim); otherwise the deprecated SABLE_REGISTRY value is
+        honored; otherwise fall through to the project-first / HOME resolution.
+    """
+    legacy = os.environ.get("SABLE_REGISTRY")
+    if legacy:
+        sys.stderr.write(
+            "sable-agents: SABLE_REGISTRY is deprecated and will be removed; "
+            "use SABLE_AGENTS_YAML instead.\n"
+        )
+    if os.environ.get("SABLE_AGENTS_YAML"):
+        return sable_registry_path()
+    if legacy:
+        return legacy
+    return sable_registry_path()
 
 # ANSI styling (skipped when not a TTY).
 def _supports_color() -> bool:
@@ -229,8 +262,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("name", nargs="?", help="Filter to a single agent")
     parser.add_argument("--list", action="store_true", help="One-line-each compact mode")
     parser.add_argument("--json", action="store_true", help="Machine-readable JSON")
-    parser.add_argument("--registry", default=os.environ.get("SABLE_REGISTRY", str(DEFAULT_REGISTRY)),
-                        help="Path to agents.yaml (default: ~/.claude/sable/agents.yaml)")
+    parser.add_argument("--registry", default=_default_registry(),
+                        help="Path to agents.yaml (default: SABLE_AGENTS_YAML, else "
+                             "the repo's own agents.yaml, else ~/.claude/sable/agents.yaml)")
     args = parser.parse_args(argv)
 
     registry = _load_registry(Path(args.registry))

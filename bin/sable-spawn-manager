@@ -38,6 +38,7 @@ from sable_pane_lib import (  # noqa: E402
     AUTONOMOUS_ROLES, KICK_TAG, SessionCollision, deliver_text, kick_message,
     repo_root, resolve_session, wait_for_ready,
 )
+from sable_registry_lib import sable_registry_path  # noqa: E402
 
 VALID_ROLES = ("optimus", "tarzan", "chuck")
 
@@ -72,10 +73,11 @@ _INSTANCE_RE = re.compile(r"^(?P<base>.+)-(?P<n>\d+)$")
 
 
 def agents_yaml_path() -> str:
-    """Runtime registry path (SABLE_AGENTS_YAML override honored, as in
-    lib-identity.sh + the test suites)."""
-    return (os.environ.get("SABLE_AGENTS_YAML")
-            or os.path.join(os.path.expanduser("~"), ".claude", "sable", "agents.yaml"))
+    """Runtime registry path — project-first resolver shared with the hooks
+    (SABLE_AGENTS_YAML override honored, else the repo's own agents.yaml, else
+    ~/.claude/sable/agents.yaml). See bin/sable_registry_lib.py, the python
+    mirror of hooks/multi-manager/lib-registry-path.sh (SABLE-59t6.1)."""
+    return sable_registry_path()
 
 
 def strip_instance_suffix(name: str) -> str:

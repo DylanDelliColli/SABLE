@@ -77,6 +77,67 @@ else
   fail "sable-agents prints the repo source path for a role (SABLE-2l4)" "got: ${DETAIL:-<empty>}"
 fi
 
+# ==========================================================================
+# SABLE-59t6.1 — SABLE_AGENTS_YAML unifies sable-agents and the hook resolver;
+# SABLE_REGISTRY becomes a deprecated alias (honored, warns; SABLE_AGENTS_YAML
+# wins when both are set). Resolves SABLE-k7mx.
+# ==========================================================================
+TMP59="$(mktemp -d)"
+trap 'rm -rf "$TMP59"' EXIT
+UNIFIED="$TMP59/unified.yaml"
+cat > "$UNIFIED" <<'YAML'
+agents:
+  optimus:
+    type: epic_manager
+  lincoln:
+    type: cockpit
+YAML
+LEGACY="$TMP59/legacy.yaml"
+cat > "$LEGACY" <<'YAML'
+agents:
+  tarzan:
+    type: one_off_manager
+YAML
+
+# (a) SABLE_AGENTS_YAML steers sable-agents (no --registry arg) to the file.
+AOUT="$(env -u SABLE_REGISTRY SABLE_AGENTS_YAML="$UNIFIED" python3 "$AGENTS_BIN" --json 2>/dev/null)"
+if printf '%s' "$AOUT" | jq -e '.optimus.type == "epic_manager"' >/dev/null 2>&1; then
+  pass "59t6.1: SABLE_AGENTS_YAML steers sable-agents to the registry"
+else
+  fail "59t6.1: SABLE_AGENTS_YAML steers sable-agents to the registry" "got: ${AOUT:-<empty>}"
+fi
+
+# (a) the shell hook resolver returns the SAME file for the same env — one path.
+RPATH="$(SABLE_AGENTS_YAML="$UNIFIED" bash -c 'source "'"$REPO"'/hooks/multi-manager/lib-registry-path.sh"; sable_registry_path')"
+if [ "$RPATH" = "$UNIFIED" ]; then
+  pass "59t6.1: lib-registry-path resolves the same SABLE_AGENTS_YAML file as sable-agents"
+else
+  fail "59t6.1: lib-registry-path resolves the same SABLE_AGENTS_YAML file as sable-agents" \
+    "expected $UNIFIED got $RPATH"
+fi
+
+# (b) SABLE_REGISTRY (deprecated) is still honored AND warns on stderr.
+DEP_ERR="$(env -u SABLE_AGENTS_YAML SABLE_REGISTRY="$LEGACY" python3 "$AGENTS_BIN" --json 2>&1 1>/dev/null)"
+if printf '%s' "$DEP_ERR" | grep -qi 'SABLE_REGISTRY.*deprecat'; then
+  pass "59t6.1: SABLE_REGISTRY emits a deprecation warning on stderr"
+else
+  fail "59t6.1: SABLE_REGISTRY emits a deprecation warning on stderr" "got stderr: ${DEP_ERR:-<empty>}"
+fi
+DEP_OUT="$(env -u SABLE_AGENTS_YAML SABLE_REGISTRY="$LEGACY" python3 "$AGENTS_BIN" --json 2>/dev/null)"
+if printf '%s' "$DEP_OUT" | jq -e '.tarzan.type == "one_off_manager"' >/dev/null 2>&1; then
+  pass "59t6.1: SABLE_REGISTRY (deprecated) is still honored"
+else
+  fail "59t6.1: SABLE_REGISTRY (deprecated) is still honored" "got: ${DEP_OUT:-<empty>}"
+fi
+
+# (b) both set → SABLE_AGENTS_YAML wins (reads UNIFIED's optimus, not LEGACY's tarzan).
+BOTH_OUT="$(SABLE_AGENTS_YAML="$UNIFIED" SABLE_REGISTRY="$LEGACY" python3 "$AGENTS_BIN" --json 2>/dev/null)"
+if printf '%s' "$BOTH_OUT" | jq -e '.optimus and (.tarzan | not)' >/dev/null 2>&1; then
+  pass "59t6.1: SABLE_AGENTS_YAML wins over SABLE_REGISTRY when both set"
+else
+  fail "59t6.1: SABLE_AGENTS_YAML wins over SABLE_REGISTRY when both set" "got: ${BOTH_OUT:-<empty>}"
+fi
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

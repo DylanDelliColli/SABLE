@@ -111,6 +111,8 @@ MODE_BIN="$HOOK_DIR/../../bin/sable-mode"
 # SABLE_MODE_STATE unchanged, so a test/operator override is preserved.
 # shellcheck source=lib-mode-path.sh
 . "$HOOK_DIR/lib-mode-path.sh"
+# shellcheck source=lib-registry-path.sh
+. "$HOOK_DIR/lib-registry-path.sh"
 # shellcheck source=lib-identity.sh
 . "$HOOK_DIR/lib-identity.sh"
 HOOK_CWD="$(printf '%s' "$INPUT" | python3 -c "
@@ -153,7 +155,12 @@ print(json.dumps({
 classify_target() {
   local name; name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   [ -z "$name" ] && { echo "free"; return; }
-  local yaml="${SABLE_AGENTS_YAML:-${HOME:-}/.claude/sable/agents.yaml}"
+  # Project-first registry resolution from the repo the tool call runs in
+  # (HOOK_CWD, resolved above) — a repo can ship its own agents.yaml, and every
+  # linked worktree resolves to the main checkout (SABLE-59t6.1). Registry absent
+  # everywhere → the HOME fallback path, whose missing file yields "free" below
+  # (byte-identical dormant fail-open).
+  local yaml; yaml="$(sable_registry_path "$HOOK_CWD")"
   [ -f "$yaml" ] || { echo "free"; return; }
   local t
   t="$(awk -v n="$name" '

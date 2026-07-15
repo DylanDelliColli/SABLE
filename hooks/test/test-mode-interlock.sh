@@ -794,6 +794,51 @@ assert_allow_cwd "exec repo (by cwd) allows git push"        'git push' "$REPO_E
 
 rm -rf "$REPO_EXEC" "$REPO_PLAN"
 
+# ---------- SABLE-59t6.1: classify_target via the PROJECT registry ----------
+# With NO SABLE_AGENTS_YAML override and an EMPTY $HOME, classify_target must
+# resolve the spawn target's type from the REPO's own .claude/sable/agents.yaml
+# (project-first, per-repo). Without project-first resolution it would fail open
+# (target=free) and a producer spawn in execution mode would be wrongly ALLOWED.
+# The repo also carries its own execution mode-state (per-repo mode, SABLE-5hck.3).
+PROJ_EXEC="$(mk_modes_repo)"
+mkdir -p "$PROJ_EXEC/.claude/sable"
+cat > "$PROJ_EXEC/.claude/sable/agents.yaml" <<'YAML'
+agents:
+  optimus:
+    type: epic_manager
+  columbo:
+    type: test_planner
+YAML
+( cd "$PROJ_EXEC" && env -u SABLE_MODE_STATE "$MODE_BIN" set execution >/dev/null 2>&1 )
+PROJ_EMPTY_HOME="$(mktemp -d)"
+
+# Producer (columbo, test_planner) spawned in execution → DENY only if the
+# project registry is consulted; fail-open would classify it "free" and ALLOW.
+proj_prod="$(python3 -c "
+import json, sys
+print(json.dumps({'tool_name':'Agent','tool_input':{'subagent_type':'columbo','prompt':'x','description':'y'},'cwd':sys.argv[1]}))
+" "$PROJ_EXEC" | env -u SABLE_MODE_STATE -u SABLE_AGENTS_YAML HOME="$PROJ_EMPTY_HOME" CLAUDE_AGENT_NAME=cockpit bash "$HOOK" 2>/dev/null)"
+if is_deny "$proj_prod"; then
+  pass "59t6.1: classify_target resolves producer via project registry (deny), not fail-open"
+else
+  fail "59t6.1: classify_target resolves producer via project registry (deny), not fail-open" \
+    "got: ${proj_prod:-<empty>}"
+fi
+
+# Control: an UNREGISTERED target in the same project registry is still free
+# (ALLOW) — proves the deny above is the registry classifying columbo, not a
+# blanket execution-mode block on every Agent spawn.
+proj_free="$(python3 -c "
+import json, sys
+print(json.dumps({'tool_name':'Agent','tool_input':{'subagent_type':'general-purpose','prompt':'x','description':'y'},'cwd':sys.argv[1]}))
+" "$PROJ_EXEC" | env -u SABLE_MODE_STATE -u SABLE_AGENTS_YAML HOME="$PROJ_EMPTY_HOME" CLAUDE_AGENT_NAME=cockpit bash "$HOOK" 2>/dev/null)"
+if is_deny "$proj_free"; then
+  fail "59t6.1: unregistered target stays free under project registry (allow)" "got deny: $proj_free"
+else
+  pass "59t6.1: unregistered target stays free under project registry (allow)"
+fi
+rm -rf "$PROJ_EXEC" "$PROJ_EMPTY_HOME"
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
