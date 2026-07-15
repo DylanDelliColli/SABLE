@@ -382,7 +382,7 @@ if ! command -v bd >/dev/null 2>&1; then
   echo "SKIP (integration): bd not found on PATH"
 else
   # Create a scratch bead with a description mentioning hooks/foo.sh
-  SCRATCH_ID=$(bd create \
+  SCRATCH_ID=$(bd create --sandbox \
     --title="[int-test] pre-dispatch-claim scratch bead" \
     --description="hooks/foo.sh is the implementation file for this scratch bead" \
     --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
@@ -392,7 +392,7 @@ else
   else
     echo "Integration: created scratch bead $SCRATCH_ID"
     # Add [no-test] immediately so tdd-gate won't block the close at the end
-    bd update "$SCRATCH_ID" --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
+    bd update "$SCRATCH_ID" --sandbox --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
 
     # Run real hook with scratch bead ID in the dispatch prompt.
     # Do NOT use stub bd — use real bd so WIP-CLAIMS is written to the real DB.
@@ -421,14 +421,14 @@ except Exception:
     fi
 
     # Clean up: close the scratch bead
-    bd close "$SCRATCH_ID" 2>/dev/null || true
+    bd close "$SCRATCH_ID" --sandbox 2>/dev/null || true
   fi
 
   # --- Integration (SABLE-uz9.9): MANAGER-SUBAGENT native dispatch, real bd ---
   # The new path with NO env identity: identity is purely the subagent
   # agent_type=optimus. Proves the real hook + real lib-identity + real bd DB
   # compose to land WIP-CLAIMS for a manager-subagent dispatch.
-  SCRATCH_ID2=$(bd create \
+  SCRATCH_ID2=$(bd create --sandbox \
     --title="[int-test] pre-dispatch-claim manager-subagent scratch" \
     --description="hooks/foo.sh is the implementation file for this scratch bead" \
     --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
@@ -437,7 +437,7 @@ except Exception:
     echo "SKIP (integration): could not create manager-subagent scratch bead"
   else
     echo "Integration: created manager-subagent scratch bead $SCRATCH_ID2"
-    bd update "$SCRATCH_ID2" --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
+    bd update "$SCRATCH_ID2" --sandbox --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
 
     make_manager_subagent_input "${SCRATCH_ID2}: implement the feature — hooks/foo.sh needs updating" "optimus" | \
       env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE \
@@ -462,7 +462,7 @@ except Exception:
            "notes: '$NOTES2'"
     fi
 
-    bd close "$SCRATCH_ID2" 2>/dev/null || true
+    bd close "$SCRATCH_ID2" --sandbox 2>/dev/null || true
   fi
 fi
 
