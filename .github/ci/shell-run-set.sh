@@ -30,6 +30,7 @@ ALLOW=(
   test-bead-description-gate.sh
   test-columbo-quick-mode.sh
   test-concurrent-sessions.sh
+  test-edit-write-claim-reconciler.sh
   test-full-ingestion.sh
   test-lib-git-sandbox.sh
   test-lib-identity.sh
