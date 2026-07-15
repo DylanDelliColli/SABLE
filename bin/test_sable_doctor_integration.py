@@ -25,8 +25,12 @@ pytestmark = pytest.mark.skipif(not HAVE_BD, reason="install.sh requires bd; not
 
 
 def run_install(home_dir: Path):
+    # --from-here: this suite commonly runs from a linked SABLE worker worktree
+    # (SABLE-3ydb, subsuming SABLE-5r3i/xu1s) which install.sh otherwise refuses
+    # to install from; scoped here only, since the HOME being installed into is
+    # a throwaway tmp_path either way.
     result = subprocess.run(
-        ["bash", str(INSTALLER)],
+        ["bash", str(INSTALLER), "--from-here"],
         env={**os.environ, "HOME": str(home_dir)},
         capture_output=True, text=True, timeout=60,
     )

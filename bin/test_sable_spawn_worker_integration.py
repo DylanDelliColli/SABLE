@@ -46,6 +46,20 @@ def _tmux(s, *args):
                           capture_output=True, text=True, check=True)
 
 
+# SABLE-3ydb: this suite commonly runs from inside a live SABLE worker pane,
+# whose ambient env carries SABLE_WORKER_PANE=1 (+ SABLE_LANE/SABLE_ROLE).
+# Spreading os.environ as-is leaks that into every dispatched subprocess,
+# tripping sable-spawn-worker's own SABLE-38zi worker-pane guard (exit 9) on
+# every test. Scrub it here; test_dispatch_from_worker_pane_is_refused
+# re-adds SABLE_WORKER_PANE deliberately via its own literal key, which wins
+# over this spread.
+def _clean_env(**overrides):
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SABLE_WORKER_PANE", "SABLE_LANE", "SABLE_ROLE")}
+    env.update(overrides)
+    return env
+
+
 def _refs_snapshot(repo: Path) -> set[str]:
     """Full refs/heads snapshot of `repo` — used to assert a fixture that
     mutates branches (worktree add/remove, branch -D) leaves the real repo's
@@ -59,7 +73,7 @@ def _refs_snapshot(repo: Path) -> set[str]:
 def test_spawn_creates_tagged_worker_window(sock):
     with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
         env = {
-            **os.environ,
+            **_clean_env(),
             "SABLE_TMUX_SOCKET": sock,
             "SABLE_TMUX_SESSION": "sable",
             "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
@@ -124,7 +138,7 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock):
     before_refs = _refs_snapshot(repo)
     with tempfile.TemporaryDirectory() as dd:
         env = {
-            **os.environ,
+            **_clean_env(),
             "SABLE_TMUX_SOCKET": sock,
             "SABLE_TMUX_SESSION": "sable",
             "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
@@ -170,7 +184,7 @@ def test_spawn_leaves_session_current_window_unchanged(sock):
         before = _tmux(sock, "display-message", "-t", "sable", "-p",
                        "#{window_index}").stdout.strip()
         env = {
-            **os.environ,
+            **_clean_env(),
             "SABLE_TMUX_SOCKET": sock,
             "SABLE_TMUX_SESSION": "sable",
             "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
@@ -204,7 +218,7 @@ def test_worker_window_inherits_lane_manager_identity(sock):
     with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
         dump = Path(dd) / "worker-env.txt"
         env = {
-            **os.environ,
+            **_clean_env(),
             "SABLE_TMUX_SOCKET": sock,
             "SABLE_TMUX_SESSION": "sable",
             "CLAUDE_AGENT_NAME": "optimus",   # the invoking manager (lane)
@@ -242,7 +256,7 @@ def test_dispatch_from_worker_pane_is_refused(sock):
     side effects: no worker window and no dispatch file are created."""
     with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
         env = {
-            **os.environ,
+            **_clean_env(),
             "SABLE_WORKER_PANE": "1",   # this invoking process IS a worker pane
             "SABLE_TMUX_SOCKET": sock,
             "SABLE_TMUX_SESSION": "sable",
@@ -288,7 +302,7 @@ def test_worker_bypass_gate_is_accepted(sock):
             "sleep 1\n"
         )
         env = {
-            **os.environ,
+            **_clean_env(),
             "SABLE_TMUX_SOCKET": sock,
             "SABLE_TMUX_SESSION": "sable",
             "SABLE_WORKER_CMD": f"bash --noprofile --norc {script}",
@@ -332,7 +346,7 @@ def test_worker_stuck_on_unrecognized_dialog_refuses_to_type(sock):
             "sleep 2\n"
         )
         env = {
-            **os.environ,
+            **_clean_env(),
             "SABLE_TMUX_SOCKET": sock,
             "SABLE_TMUX_SESSION": "sable",
             "SABLE_WORKER_CMD": f"bash --noprofile --norc {script}",
@@ -377,7 +391,7 @@ def test_spawn_at_cap_refused_then_allowed_after_one_flips_done(sock):
         d1 = _dummy_worker(sock, "FAKE-cap-1")
         _dummy_worker(sock, "FAKE-cap-2")
         env = {
-            **os.environ,
+            **_clean_env(),
             "SABLE_TMUX_SOCKET": sock,
             "SABLE_TMUX_SESSION": "sable",
             "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
@@ -422,7 +436,7 @@ def test_spawn_refused_when_host_load_exceeds_guard(sock):
     threshold = (load1 / cores) / 2  # half the current per-core load: must trip
     with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
         env = {
-            **os.environ,
+            **_clean_env(),
             "SABLE_TMUX_SOCKET": sock,
             "SABLE_TMUX_SESSION": "sable",
             "SABLE_WORKER_CMD": "bash --noprofile --norc",
@@ -538,7 +552,7 @@ def test_second_spawn_for_in_progress_bead_is_refused(sock):
         _write_fake_bd(Path(stub_dir), db_path)
 
         env = {
-            **os.environ,
+            **_clean_env(),
             "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
             "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test (SABLE-mmdt)
             "SABLE_TMUX_SOCKET": sock,
@@ -598,7 +612,7 @@ def test_claim_then_hold_first_dispatch_succeeds(sock):
         _write_fake_bd(Path(stub_dir), db_path)
 
         env = {
-            **os.environ,
+            **_clean_env(),
             "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
             "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test
             "SABLE_TMUX_SOCKET": sock,
@@ -653,7 +667,7 @@ def test_claim_then_hold_blocks_when_derived_worktree_exists(sock):
         ]))
         _write_fake_bd(Path(stub_dir), db_path)
         env = {
-            **os.environ,
+            **_clean_env(),
             "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
             "SABLE_MAX_LOAD_PER_CORE": "0",
             "SABLE_TMUX_SOCKET": sock,
@@ -711,7 +725,7 @@ def test_crash_leak_orphan_worktree_dispatch_refused_and_refs_unchanged(sock):
         ]))
         _write_fake_bd(Path(stub_dir), db_path)
         env = {
-            **os.environ,
+            **_clean_env(),
             "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
             "SABLE_MAX_LOAD_PER_CORE": "0",
             "SABLE_TMUX_SOCKET": sock,
@@ -779,7 +793,7 @@ def test_claim_skipped_when_bead_already_assigned_to_dispatching_lane(sock):
         _write_fake_bd(Path(stub_dir), db_path, strict_claim=True)
 
         env = {
-            **os.environ,
+            **_clean_env(),
             "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
             "CLAUDE_AGENT_NAME": "optimus",
             "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test
@@ -833,7 +847,7 @@ def test_claim_still_runs_when_bead_assigned_to_different_lane(sock):
         _write_fake_bd(Path(stub_dir), db_path)
 
         env = {
-            **os.environ,
+            **_clean_env(),
             "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
             "CLAUDE_AGENT_NAME": "optimus",
             "SABLE_MAX_LOAD_PER_CORE": "0",
@@ -895,7 +909,7 @@ def test_worker_pane_flips_done_on_process_exit_without_worker_action(sock):
 
         sentinel = Path(dd) / "sentinel.txt"
         env = {
-            **os.environ,
+            **_clean_env(),
             "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
             "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic: not a load-guard test
             "SABLE_TMUX_SOCKET": sock,
@@ -1015,7 +1029,7 @@ def test_respawn_reopens_closed_bead_and_releases_stale_tree_claim(sock):
         _write_fake_bd(Path(stub_dir), db_path)
 
         env = {
-            **os.environ,
+            **_clean_env(),
             "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
             "CLAUDE_AGENT_NAME": "tarzan",
             "SABLE_MAX_LOAD_PER_CORE": "0",  # hermetic
@@ -1075,7 +1089,7 @@ def test_respawn_refused_when_live_pane_carries_bead_tag(sock):
         _write_fake_bd(Path(stub_dir), db_path)
 
         env = {
-            **os.environ,
+            **_clean_env(),
             "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
             "CLAUDE_AGENT_NAME": "tarzan",
             "SABLE_MAX_LOAD_PER_CORE": "0",
@@ -1121,7 +1135,7 @@ def test_respawn_keeps_model_check_active(sock):
         _write_fake_bd(Path(stub_dir), db_path)
 
         env = {
-            **os.environ,
+            **_clean_env(),
             "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
             "CLAUDE_AGENT_NAME": "tarzan",
             "SABLE_MAX_LOAD_PER_CORE": "0",
@@ -1152,7 +1166,7 @@ def test_spawn_stamps_owning_lane_on_worker_pane(sock):
     pane's ENV (invisible to that tool), so every manager's sweep saw every pane."""
     with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
         env = {
-            **os.environ,
+            **_clean_env(),
             "CLAUDE_AGENT_NAME": "optimus",   # the invoking manager (the lane)
             "SABLE_TMUX_SOCKET": sock,
             "SABLE_TMUX_SESSION": "sable",
