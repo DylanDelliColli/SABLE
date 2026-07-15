@@ -75,6 +75,29 @@ if [ "$MODE" = "role" ]; then
 fi
 
 # --- Session form ---
+# v1 fleet boundary (SABLE-59t6.4): the session door is a FLEET entry point —
+# managers spawn into this session and rely on the global registry + dispatch
+# dir. Under a PROJECT-only install (registry resolves to a project agents.yaml
+# and no global install exists), refuse with the shared remedy: the fleet cannot
+# resolve its global machinery here. Solo work never reaches this point — the
+# role form (`sable-launch <role>`) returned above, and planning / producer
+# subagents never invoke sable-launch. Scope detection is delegated to the
+# 59t6.1 resolver's python mirror (its `fleet-preflight` CLI), reached as a
+# sibling of this script (realpath-resolved so the ~/.local/bin symlink still
+# finds the non-symlinked lib, mirroring the python tools' realpath(__file__)).
+# Only the explicit refuse code (3) blocks; any other failure fails OPEN so a
+# missing interpreter never wedges the launcher.
+SELF="${BASH_SOURCE[0]}"
+command -v realpath >/dev/null 2>&1 && SELF="$(realpath "$SELF" 2>/dev/null || printf '%s' "$SELF")"
+REG_LIB="${SELF%/*}/sable_registry_lib.py"
+if command -v python3 >/dev/null 2>&1 && [ -f "$REG_LIB" ]; then
+  REMEDY="$(python3 "$REG_LIB" fleet-preflight 2>/dev/null)"; PF=$?
+  if [ "$PF" -eq 3 ]; then
+    printf 'sable-launch: %s\n' "$REMEDY" >&2
+    exit 3
+  fi
+fi
+
 command -v tmux >/dev/null 2>&1 || {
   printf 'sable-launch: tmux not found on PATH — the warm-pane session needs it (e.g. apt install tmux / brew install tmux).\n' >&2
   exit 127
