@@ -17,7 +17,7 @@ run_with_claude() { # $1 = version string (empty => unparseable shim)
     printf '#!/bin/sh\necho "no parseable version"\n' > "$d/claude"
   fi
   chmod +x "$d/claude"
-  HOME="$h" PATH="$d:$PATH" bash "$REPO/install.sh" --dry-run 2>&1
+  HOME="$h" PATH="$d:$PATH" bash "$REPO/install.sh" --dry-run --from-here 2>&1
   rm -rf "$d" "$h"
 }
 warns(){ printf '%s' "$1" | grep -q 'below 2.1.172'; }
