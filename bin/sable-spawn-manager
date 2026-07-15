@@ -38,7 +38,9 @@ from sable_pane_lib import (  # noqa: E402
     AUTONOMOUS_ROLES, KICK_TAG, SessionCollision, deliver_text, kick_message,
     repo_root, resolve_session, wait_for_ready,
 )
-from sable_registry_lib import sable_registry_path  # noqa: E402
+from sable_registry_lib import (  # noqa: E402
+    FLEET_PROJECT_ONLY_REMEDY, fleet_project_only, sable_registry_path,
+)
 
 VALID_ROLES = ("optimus", "tarzan", "chuck")
 
@@ -78,6 +80,24 @@ def agents_yaml_path() -> str:
     ~/.claude/sable/agents.yaml). See bin/sable_registry_lib.py, the python
     mirror of hooks/multi-manager/lib-registry-path.sh (SABLE-59t6.1)."""
     return sable_registry_path()
+
+
+# Exit code for the v1 fleet-boundary refusal (SABLE-59t6.4); distinct from the
+# tool's other codes (1 no-session, 2 usage, 3 register-self, 4 collision).
+FLEET_BOUNDARY_EXIT = 6
+
+
+def fleet_boundary_refusal(base: str | None = None) -> str | None:
+    """The v1 fleet-boundary remedy (FLEET_PROJECT_ONLY_REMEDY) when EVERY
+    operation of this tool must refuse — the registry resolves to a PROJECT
+    registry and no global install exists (SABLE-59t6.4) — else None. The whole
+    tool is fleet tooling: it stands managers/producers up into the shared tmux
+    session, which needs the global registry + dispatch dir a project-only
+    install lacks. Scope detection is the 59t6.1 resolver's (fleet_project_only);
+    bin/sable-launch enforces the identical boundary on its session door via the
+    resolver's fleet-preflight CLI. The escape hatch (export SABLE_AGENTS_YAML)
+    flips the scope to 'override' and lifts this."""
+    return FLEET_PROJECT_ONLY_REMEDY if fleet_project_only(base) else None
 
 
 def strip_instance_suffix(name: str) -> str:
@@ -303,6 +323,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--prune-instances", action="store_true",
                    help="prune stale instance entries whose panes are no longer live")
     ns = p.parse_args(sys.argv[1:] if argv is None else argv)
+
+    # --- v1 fleet boundary (SABLE-59t6.4): refuse EVERY sable-spawn-manager
+    # operation under a project-only install (project registry, no global
+    # install, no SABLE_AGENTS_YAML override). This tool only ever stands panes
+    # up into the shared fleet session; none of it works without the global
+    # machinery. Solo-loop paths (Lincoln, producer SUBAGENTS, planning) never
+    # reach this tool, so no non-fleet path is gated here.
+    remedy = fleet_boundary_refusal()
+    if remedy:
+        sys.stderr.write(f"sable-spawn-manager: {remedy}\n")
+        return FLEET_BOUNDARY_EXIT
 
     # --- Instance registry maintenance (73t4). These are the spawn/respawn
     # tooling entry points into the writer; they never spawn a pane.

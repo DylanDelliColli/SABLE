@@ -179,6 +179,53 @@ else
   fail "leading flag passthrough with default role" "out=[$OUT] err=[$ERR] code=$CODE"
 fi
 
+# ---- SABLE-59t6.4: v1 fleet boundary under a PROJECT-only install ----
+# When the registry resolves to a PROJECT registry and no global install exists,
+# the FLEET session door refuses with the exact remedy; the SOLO role door does
+# not (Lincoln + producer subagents + planning never depend on the global fleet
+# machinery). Fixture: a git repo shipping its own .claude/sable/agents.yaml,
+# entered as CWD, with an isolated HOME that has NO ~/.claude/sable/agents.yaml
+# and no SABLE_AGENTS_YAML override (env -i drops it) — exactly project-only.
+FB_REMEDY="fleet requires the global install in v1, or export SABLE_AGENTS_YAML and SABLE_DISPATCH_DIR in the shell that creates the tmux session"
+FB_HOME="$(mktemp -d)"                       # isolated HOME — no global install
+FB_TOP="$(mktemp -d)"; FB_REPO="$FB_TOP/proj"
+mkdir -p "$FB_REPO/.claude/sable"
+git init -q "$FB_REPO" 2>/dev/null
+cat > "$FB_REPO/.claude/sable/agents.yaml" <<'YAML'
+agents:
+  optimus:
+    type: epic_manager
+YAML
+
+# test_fleet_launch_refuses_project_only_install_with_exact_remedy_text
+FB_OUT="$(mktemp)"; FB_ERR="$(mktemp)"
+( cd "$FB_REPO" && env -i PATH="$STUB_BIN:$PATH" HOME="$FB_HOME" bash "$LAUNCH" --no-attach ) >"$FB_OUT" 2>"$FB_ERR"
+FB_CODE=$?
+FB_ERRTXT="$(cat "$FB_ERR")"
+if [ "$FB_CODE" -ne 0 ] && printf '%s' "$FB_ERRTXT" | grep -qF "$FB_REMEDY"; then
+  pass "fleet launch refuses project-only install with exact remedy text"
+else
+  fail "fleet launch refuses project-only install with exact remedy text" "code=$FB_CODE err=[$FB_ERRTXT]"
+fi
+rm -f "$FB_OUT" "$FB_ERR"
+
+# test_solo_lincoln_plus_producers_loop_not_refused_under_project_scope
+# The SAME project-only scope: the solo role door must exec claude, never refuse.
+FB_OUT="$(mktemp)"; FB_ERR="$(mktemp)"
+( cd "$FB_REPO" && env -i PATH="$STUB_BIN:$PATH" HOME="$FB_HOME" bash "$LAUNCH" lincoln ) >"$FB_OUT" 2>"$FB_ERR"
+SOLO_CODE=$?
+SOLO_OUT="$(cat "$FB_OUT")"; SOLO_ERR="$(cat "$FB_ERR")"
+if [ "$SOLO_CODE" -eq 0 ] \
+   && printf '%s' "$SOLO_OUT" | grep -q "STUB_EXEC=1" \
+   && printf '%s' "$SOLO_OUT" | grep -q "NAME=lincoln" \
+   && ! printf '%s' "$SOLO_ERR" | grep -qF "$FB_REMEDY"; then
+  pass "solo lincoln + producers loop not refused under project scope"
+else
+  fail "solo lincoln + producers loop not refused under project scope" "code=$SOLO_CODE out=[$SOLO_OUT] err=[$SOLO_ERR]"
+fi
+rm -f "$FB_OUT" "$FB_ERR"
+rm -rf "$FB_HOME" "$FB_TOP"
+
 # ---- INTEGRATION: no teams-flag machinery remains (tmux-only, SABLE-qa4d) ----
 
 run_launch "$HOME_NOFLAG" "" lincoln
