@@ -196,10 +196,14 @@ print(json.dumps({
 }
 
 # run_hook <env_prefix> <json> → prints hook stdout+stderr
+# SABLE-tb1y: default the invocation-trace log into STUB_DIR (trap-cleaned) so
+# tracing is hermetic; a test may override SABLE_HOOK_TRACE_LOG / SABLE_HOOK_TRACE
+# in env_prefix (later `env` assignment wins).
 run_hook() {
   local env_prefix="$1" json="$2"
   env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" \
     SABLE_MSG_LOG="$SABLE_MSG_LOG" SABLE_MSG_STUB_RC="${SABLE_MSG_STUB_RC:-1}" \
+    SABLE_HOOK_TRACE_LOG="$STUB_DIR/hook-trace.log" \
     $env_prefix bash "$HOOK" <<< "$json" 2>/dev/null
 }
 
@@ -1036,6 +1040,125 @@ echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
 exit 0
 EOF
 chmod +x "$STUB_DIR/bd"
+
+# --------------------------------------------------------------------------
+# SABLE-tb1y: the post-push ls-remote confirmation is a TIMING RACE under load.
+# After a real push, the hook read origin's tip ONCE (SABLE-b06t) and silently
+# `exit 0`'d if REMOTE_TIP != LOCAL_HEAD — correct for an unlanded push, but it
+# ALSO fired for a LANDED push whose tip origin had not yet reflected at read
+# time. That raced miss was a DOUBLE silent failure: no for-chuck bead AND no
+# manager-wake msg (both live below the guard). The fix settles the read with a
+# bounded retry loop, and never silent-exits a manager push (loud + traced).
+#
+# A passthrough `git` stub injects ls-remote lag: for the first
+# SABLE_TEST_LSREMOTE_LAG reads it reports the ref absent (exit 2, empty tip —
+# models origin not yet reflecting the just-pushed tip), then delegates to real
+# git (which returns the matching tip). Everything else execs real git.
+# Fast timings via SABLE_PUSH_CONFIRM_SLEEP.
+# --------------------------------------------------------------------------
+
+REAL_GIT=$(command -v git)
+cat > "$STUB_DIR/git" <<EOF
+#!/usr/bin/env bash
+# Passthrough git stub with injectable ls-remote lag (SABLE-tb1y).
+if { [ "\$1" = "ls-remote" ]; } || { [ "\$1" = "-C" ] && [ "\$3" = "ls-remote" ]; }; then
+  if [ -n "\${SABLE_TEST_LSREMOTE_LAG:-}" ] && [ -n "\${SABLE_TEST_LSREMOTE_COUNT_FILE:-}" ]; then
+    n=\$(( \$(cat "\$SABLE_TEST_LSREMOTE_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
+    echo "\$n" > "\$SABLE_TEST_LSREMOTE_COUNT_FILE"
+    if [ "\$n" -le "\$SABLE_TEST_LSREMOTE_LAG" ]; then
+      exit 2   # ref "not yet visible" → hook sees an empty REMOTE_TIP
+    fi
+  fi
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$STUB_DIR/git"
+
+TB1Y_COUNT="$STUB_DIR/lsremote-count"
+
+# (a) A LANDED push whose origin tip lags the first 2 reads, then settles. With
+# the retry budget (default 4 extra tries) the 3rd read matches → the handoff
+# fires. Worker pane + Chuck reachable: BOTH the manager-wake msg AND the chuck
+# merge msg must fire — the two channels that both went dark in the incident.
+# RED on the single-shot guard (first empty read → silent exit, nothing sent).
+rm -f "$BD_LOG" "$SABLE_MSG_LOG" "$TB1Y_COUNT"
+SABLE_MSG_STUB_RC=0 run_hook \
+  "$MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker SABLE_TEST_LSREMOTE_LAG=2 SABLE_TEST_LSREMOTE_COUNT_FILE=$TB1Y_COUNT SABLE_PUSH_CONFIRM_SLEEP=0.02" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -q 'Worker landed' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "SABLE-tb1y: ls-remote lag then settle — manager wake still fires (not stranded)"
+else
+  fail "SABLE-tb1y: ls-remote lag then settle — manager wake still fires (not stranded)" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+if grep -qE '^chuck .*PR ready from optimus' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "SABLE-tb1y: ls-remote lag then settle — chuck merge handoff still fires (not stranded)"
+else
+  fail "SABLE-tb1y: ls-remote lag then settle — chuck merge handoff still fires (not stranded)" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+
+# (b) Same lag, but Chuck pane ABSENT → the durable for-chuck bead is the
+# handoff. The settle must let the hook REACH that bd create instead of silently
+# exiting at the confirmation guard (the exact double-silent strand).
+rm -f "$BD_LOG" "$SABLE_MSG_LOG" "$TB1Y_COUNT"
+run_hook \
+  "$MGR_ENV SABLE_STUB_CHUCK_PRESENT=0 SABLE_TEST_LSREMOTE_LAG=2 SABLE_TEST_LSREMOTE_COUNT_FILE=$TB1Y_COUNT SABLE_PUSH_CONFIRM_SLEEP=0.02" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+assert_bd_called "SABLE-tb1y: ls-remote lag then settle — durable for-chuck bead still filed (Chuck absent)"
+
+# (c) A genuinely UNLANDED push (tip never confirmable within the budget). The
+# SABLE-b06t guarantee must hold: NO for-chuck bead (chuck must not review
+# absent work) — but the skip is now LOUD (deliverable 3), never a silent exit.
+# Low retry budget so the "never settles" path is fast.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG" "$TB1Y_COUNT"
+TB1Y_C_OUT=$(run_hook \
+  "$MGR_ENV SABLE_STUB_CHUCK_PRESENT=0 SABLE_TEST_LSREMOTE_LAG=99 SABLE_TEST_LSREMOTE_COUNT_FILE=$TB1Y_COUNT SABLE_PUSH_CONFIRM_RETRIES=2 SABLE_PUSH_CONFIRM_SLEEP=0.02" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")")
+assert_bd_not_called "SABLE-tb1y: unconfirmed push files NO for-chuck bead (b06t guarantee preserved)"
+if printf '%s' "$TB1Y_C_OUT" | grep -qi 'NOT confirmed on origin'; then
+  pass "SABLE-tb1y: unconfirmed push emits a LOUD skip line, not a silent exit"
+else
+  fail "SABLE-tb1y: unconfirmed push emits a LOUD skip line, not a silent exit" "STDOUT: $TB1Y_C_OUT"
+fi
+
+# (d) Invocation tracing: a normal confirmed push records INVOKED + CONFIRMED +
+# the terminal handoff disposition to the trace log, so a future strand is
+# diagnosable even after the pane is reaped.
+TB1Y_TRACE="$STUB_DIR/tb1y-trace.log"
+rm -f "$BD_LOG" "$SABLE_MSG_LOG" "$TB1Y_COUNT" "$TB1Y_TRACE"
+SABLE_MSG_STUB_RC=0 run_hook \
+  "$MGR_ENV SABLE_HOOK_TRACE_LOG=$TB1Y_TRACE" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if [ -s "$TB1Y_TRACE" ] && grep -q 'INVOKED' "$TB1Y_TRACE" 2>/dev/null \
+   && grep -q 'CONFIRMED' "$TB1Y_TRACE" 2>/dev/null \
+   && grep -q 'HANDOFF chuck-msg confirmed' "$TB1Y_TRACE" 2>/dev/null; then
+  pass "SABLE-tb1y: invocation trace records INVOKED + CONFIRMED + terminal disposition"
+else
+  fail "SABLE-tb1y: invocation trace records INVOKED + CONFIRMED + terminal disposition" "TRACE: $(cat "$TB1Y_TRACE" 2>/dev/null)"
+fi
+
+# (e) The unconfirmed disposition is also traced (diagnosable strand), and
+# SABLE_HOOK_TRACE=0 disables tracing entirely.
+rm -f "$TB1Y_TRACE" "$TB1Y_COUNT"
+run_hook \
+  "$MGR_ENV SABLE_STUB_CHUCK_PRESENT=0 SABLE_TEST_LSREMOTE_LAG=99 SABLE_TEST_LSREMOTE_COUNT_FILE=$TB1Y_COUNT SABLE_PUSH_CONFIRM_RETRIES=1 SABLE_PUSH_CONFIRM_SLEEP=0.02 SABLE_HOOK_TRACE_LOG=$TB1Y_TRACE" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -q 'EXIT unconfirmed' "$TB1Y_TRACE" 2>/dev/null; then
+  pass "SABLE-tb1y: unconfirmed disposition is traced (EXIT unconfirmed)"
+else
+  fail "SABLE-tb1y: unconfirmed disposition is traced (EXIT unconfirmed)" "TRACE: $(cat "$TB1Y_TRACE" 2>/dev/null)"
+fi
+rm -f "$TB1Y_TRACE"
+run_hook \
+  "$MGR_ENV SABLE_HOOK_TRACE=0 SABLE_HOOK_TRACE_LOG=$TB1Y_TRACE" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if [ -f "$TB1Y_TRACE" ]; then
+  fail "SABLE-tb1y: SABLE_HOOK_TRACE=0 disables tracing" "trace file written despite disable: $(cat "$TB1Y_TRACE" 2>/dev/null)"
+else
+  pass "SABLE-tb1y: SABLE_HOOK_TRACE=0 disables tracing (no trace file)"
+fi
+
+# Remove the passthrough git stub so later fixtures/tests use real git directly.
+rm -f "$STUB_DIR/git" "$TB1Y_COUNT" "$TB1Y_TRACE"
 
 # --------------------------------------------------------------------------
 # Summary

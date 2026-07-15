@@ -57,6 +57,29 @@ sable_is_git_push "$COMMAND" || exit 0
 CWD=$(sable_resolve_push_repo_dir "$CWD" "$COMMAND")
 [ -z "$CWD" ] && exit 0
 
+# --- Invocation trace (SABLE-tb1y) -----------------------------------------
+# The 2026-07-14 silent-strand class (a completed worker push that filed NEITHER
+# a for-chuck bead NOR a manager-wake msg) was undiagnosable post-hoc: the only
+# signal was the worker pane's stdout, and the pane was reaped before anyone
+# looked. This append-only, pane-reap-surviving log records that the hook fired
+# for this push AND the disposition it exited on, so the next occurrence is
+# diagnosable instead of dark. Low-volume (one line per manager/worker push).
+# Failsafe by construction: every tracing error is swallowed so it can never
+# affect the handoff. Disable with SABLE_HOOK_TRACE=0; redirect with
+# SABLE_HOOK_TRACE_LOG.
+SABLE_HOOK_TRACE_LOG="${SABLE_HOOK_TRACE_LOG:-${HOME:-/tmp}/.claude/sable/logs/post-push-merge-notify.log}"
+sable_pp_trace() {
+  [ "${SABLE_HOOK_TRACE:-1}" = "0" ] && return 0
+  local dir
+  dir=$(dirname "$SABLE_HOOK_TRACE_LOG" 2>/dev/null) || return 0
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || return 0
+  printf '%s pid=%s name=%s branch=%s | %s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '?')" \
+    "$$" "${SABLE_ID_NAME:-?}" "${BRANCH:-?}" "$*" \
+    >> "$SABLE_HOOK_TRACE_LOG" 2>/dev/null || true
+}
+sable_pp_trace "INVOKED cwd=${CWD} cmd=[${COMMAND}]"
+
 # SABLE-b06t: no-op push guard. 'Everything up-to-date' (exit 0, nothing new
 # landed) doesn't match any failure keyword, so a keyword-only heuristic
 # notifies chuck for content that was never actually pushed by THIS command
@@ -67,6 +90,7 @@ CWD=$(sable_resolve_push_repo_dir "$CWD" "$COMMAND")
 # content — so this text check stays as the no-op-specific leg.
 STDOUT_STDERR=$(echo "$PARSED" | sed -n '/---STDOUT---/,$p')
 if echo "$STDOUT_STDERR" | grep -qiE 'everything[[:space:]]+up-to-date'; then
+  sable_pp_trace "EXIT no-op-push (everything up-to-date)"
   exit 0
 fi
 
@@ -115,14 +139,23 @@ fi
 
 # Determine current branch and modified files
 BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-[ -z "$BRANCH" ] && exit 0
-[ "$BRANCH" = "HEAD" ] && exit 0
+if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
+  # A manager-authored push we cannot attribute to a branch (empty or detached
+  # HEAD). Not the strand class this bead fixes, but SABLE-tb1y deliverable 3
+  # says never silent-exit a manager push — say why and trace it.
+  echo "post-push-merge-notify: skipping — cannot resolve a branch name in ${CWD} (rev-parse gave '${BRANCH:-<empty>}'); no PR handoff possible."
+  sable_pp_trace "EXIT no-branch (rev-parse=${BRANCH:-empty})"
+  exit 0
+fi
 
 # market-brief-package-2u25: pushing the repo's OWN integration branch is not
 # "PR ready for review" — it already IS the integration line (a topology
 # promotion decided elsewhere, not routine merge-queue work; chuck triaged an
 # earlier misfire of this exact shape as a false-positive).
-[ "$BRANCH" = "$INTEGRATION_BRANCH" ] && exit 0
+if [ "$BRANCH" = "$INTEGRATION_BRANCH" ]; then
+  sable_pp_trace "EXIT integration-branch self-push (${BRANCH})"
+  exit 0
+fi
 
 # SABLE-b06t: positive push confirmation, replacing the vacuous failure-phrase
 # grep for the exact scenario it was blind to. That heuristic only caught
@@ -136,11 +169,54 @@ BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 # know about), ls-remote either returns nothing for the ref or returns a tip
 # that doesn't match — either way, skip instead of notifying chuck to review
 # work that isn't there.
-REMOTE_TIP=$(git -C "$CWD" ls-remote --exit-code origin "refs/heads/$BRANCH" 2>/dev/null | cut -f1 || echo "")
 LOCAL_HEAD=$(git -C "$CWD" rev-parse HEAD 2>/dev/null || echo "")
-[ -z "$REMOTE_TIP" ] && exit 0
-[ -z "$LOCAL_HEAD" ] && exit 0
-[ "$REMOTE_TIP" != "$LOCAL_HEAD" ] && exit 0
+if [ -z "$LOCAL_HEAD" ]; then
+  echo "post-push-merge-notify: skipping — cannot resolve local HEAD in ${CWD} on branch ${BRANCH}; no handoff possible."
+  sable_pp_trace "EXIT no-local-head"
+  exit 0
+fi
+
+# SABLE-tb1y: settle the ls-remote confirmation under load. The single-shot
+# check above (SABLE-b06t) silently `exit 0`'d whenever REMOTE_TIP != LOCAL_HEAD.
+# That is correct for a push that never landed — but it ALSO fired for a push
+# that DID land whose new tip origin had not yet reflected at the instant the
+# hook read it. Under concurrent-push load that read raced the remote's ref
+# update: on the 2026-07-14 optimus shift strandings clustered HARD in the late,
+# high-load half of the shift (6/7 workers CLEAN early vs 4/4 STRANDED late) —
+# the timing-race signature. A raced miss meant a DOUBLE silent failure: no
+# for-chuck bead AND no manager-wake msg (both live BELOW this guard), so a
+# completed merge went dark until a manual stranded-recovery sweep.
+#
+# Fix: poll ls-remote a bounded number of times, breaking the instant the remote
+# tip matches local HEAD — giving origin a moment to settle. A genuinely
+# unlanded push (rejected / auth / network) never matches and still skips, so the
+# SABLE-b06t "don't notify chuck about work that isn't on origin" guarantee holds
+# — but the skip is now LOUD (SABLE-tb1y deliverable 3: never silent-exit a
+# manager-authored push). Tunable via SABLE_PUSH_CONFIRM_RETRIES (default 4 extra
+# tries = 5 reads) and SABLE_PUSH_CONFIRM_SLEEP (default 0.3s; worst-case added
+# latency ~1.2s, well under the 10s hook timeout).
+CONFIRM_TRIES=${SABLE_PUSH_CONFIRM_RETRIES:-4}
+CONFIRM_SLEEP=${SABLE_PUSH_CONFIRM_SLEEP:-0.3}
+REMOTE_TIP=""
+CONFIRM_ATTEMPT=0
+while : ; do
+  REMOTE_TIP=$(git -C "$CWD" ls-remote --exit-code origin "refs/heads/$BRANCH" 2>/dev/null | cut -f1 || echo "")
+  [ -n "$REMOTE_TIP" ] && [ "$REMOTE_TIP" = "$LOCAL_HEAD" ] && break
+  [ "$CONFIRM_ATTEMPT" -ge "$CONFIRM_TRIES" ] && break
+  CONFIRM_ATTEMPT=$((CONFIRM_ATTEMPT + 1))
+  sleep "$CONFIRM_SLEEP" 2>/dev/null || true
+done
+
+if [ -z "$REMOTE_TIP" ] || [ "$REMOTE_TIP" != "$LOCAL_HEAD" ]; then
+  # Unconfirmed after the settle budget: either the push genuinely did not land
+  # (skipping is correct — chuck must not review absent work) or origin lag
+  # exceeded the retries. Either way, say so loudly + trace it so a stranded
+  # merge is diagnosable instead of silent.
+  echo "post-push-merge-notify: skipping — branch ${BRANCH} local HEAD ${LOCAL_HEAD} NOT confirmed on origin after $((CONFIRM_ATTEMPT + 1)) ls-remote attempt(s) (remote tip: ${REMOTE_TIP:-<none>}). If the push DID land, this was origin lag beyond the retry budget — file the for-chuck handoff manually or raise SABLE_PUSH_CONFIRM_RETRIES; if it did NOT land, no handoff is correct."
+  sable_pp_trace "EXIT unconfirmed local=${LOCAL_HEAD} remote=${REMOTE_TIP:-none} attempts=$((CONFIRM_ATTEMPT + 1))"
+  exit 0
+fi
+sable_pp_trace "CONFIRMED local=${LOCAL_HEAD} remote=${REMOTE_TIP} attempts=$((CONFIRM_ATTEMPT + 1))"
 
 FILES=$(git -C "$CWD" diff "$BASE_BRANCH"...HEAD --name-only 2>/dev/null | head -50)
 # SABLE-5hcg addendum: an empty diff used to silent-exit here, so a push whose
@@ -149,6 +225,7 @@ FILES=$(git -C "$CWD" diff "$BASE_BRANCH"...HEAD --name-only 2>/dev/null | head 
 # chuck, but the reason is now visible to the pushing agent, not swallowed.
 if [ -z "$FILES" ]; then
   echo "post-push-merge-notify: skipping — no file diff between ${BASE_BRANCH} and HEAD on branch ${BRANCH}; nothing to hand off to chuck. If unexpected, check SABLE_BASE_BRANCH / integration-branch resolution."
+  sable_pp_trace "EXIT empty-diff base=${BASE_BRANCH}"
   exit 0
 fi
 
@@ -225,7 +302,11 @@ if [ "${SABLE_WORKER_LAND_NOTIFY:-1}" = "1" ] \
   if [ "$PANE_ROLE" = "worker" ]; then
     LAND_MSG="Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed & bead closed. Review the outcome — closed bead + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
     [ -n "$OVERLAPS" ] && LAND_MSG="${LAND_MSG} OVERLAP-WARNING: shares files with in-flight work."
-    sable-msg "$SABLE_ID_NAME" "$LAND_MSG" --from worker >/dev/null 2>&1 || true
+    if sable-msg "$SABLE_ID_NAME" "$LAND_MSG" --from worker >/dev/null 2>&1; then
+      sable_pp_trace "WORKER-LAND-MSG sent -> ${SABLE_ID_NAME}"
+    else
+      sable_pp_trace "WORKER-LAND-MSG send FAILED -> ${SABLE_ID_NAME}"
+    fi
   fi
 fi
 
@@ -271,6 +352,7 @@ else
   MSG="PR ready from ${SABLE_ID_NAME}: branch ${BRANCH} (${FILES_BRIEF}). Review and merge into the integration branch, then report."
   [ -n "$OVERLAPS" ] && MSG="${MSG} OVERLAP-WARNING: shares files with in-flight work — sequence carefully."
   if sable-msg chuck "$MSG" --from "$SABLE_ID_NAME" >/dev/null 2>&1; then
+    sable_pp_trace "HANDOFF chuck-msg confirmed"
     exit 0
   fi
   FALLBACK_REASON="sable-msg could not confirm delivery to chuck"
@@ -344,12 +426,14 @@ fi
 
 if [ "$BD_CREATE_RC" -ne 0 ]; then
   echo "post-push-merge-notify: FAILED to file durable for-chuck bead after retry (bd exit ${BD_CREATE_RC}) for branch ${BRANCH} — merge request may be stranded; file it manually with label for-chuck. bd output: ${BD_CREATE_OUT}"
+  sable_pp_trace "HANDOFF for-chuck-bead FAILED rc=${BD_CREATE_RC} reason=${FALLBACK_REASON:-unconfirmed}"
 else
   # Context line so the durable fallback is never silent again (SABLE-wvk9). A
   # PostToolUse hook's stdout surfaces to the agent whose Bash push triggered it,
   # so this records — for the worker and any log — WHY the message path did not
   # carry the handoff and that the durable for-chuck bead now covers the merge.
   echo "post-push-merge-notify: ${FALLBACK_REASON:-message delivery not confirmed} — filed durable for-chuck fallback bead (label for-chuck) for branch ${BRANCH}; chuck merges it from the pool."
+  sable_pp_trace "HANDOFF for-chuck-bead filed reason=${FALLBACK_REASON:-unconfirmed}"
 fi
 
 exit 0
