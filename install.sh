@@ -443,6 +443,10 @@ echo
 bold "Orchestration hooks"
 echo "The orchestration settings snippet was merged into the scope's settings file"
 echo "automatically by sable-orchestration-install (backed up; existing entries kept)."
+echo "sable-orchestration-install also STAGES (never activates) the reconciliation"
+echo "floor's host timer artifacts (systemd --user unit + cron fallback line) under"
+echo "${CLAUDE_DIR}/sable/reconcile-timer/ — see its own output above for the"
+echo "activation commands (SABLE-jfg6.5 / D3 TIMER LEG)."
 echo
 
 bold "Install complete."

@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 
 BIN = Path(__file__).resolve().parent / "sable-reconcile-handoffs"
+TIMER_BIN = Path(__file__).resolve().parent / "sable-reconcile-timer"
 BASE = "trunk"
 
 # The ci-verify clean-room is tmux+pytest only — no bd/dolt by design. These
@@ -51,6 +52,7 @@ _ENV_LEAKS = (
     "SABLE_RC_REPO", "SABLE_RC_REMOTE", "SABLE_RC_GIT", "SABLE_RC_BD",
     "SABLE_RECONCILE_AGE_MIN", "SABLE_INTEGRATION_BRANCH", "SABLE_BASE_BRANCH",
     "CLAUDE_AGENT_NAME", "TMUX_PANE",
+    "SABLE_RECONCILE_REPO", "SABLE_RECONCILE_INTERVAL_MIN",
 )
 
 # a committer date old enough that push-age >> the 10-minute settle threshold
@@ -197,6 +199,26 @@ def _reconcile(work, home, *, dry_run=False):
     return _run(argv, work, home)
 
 
+def _reconcile_via_timer(work, home, *, repo_via="cli", dry_run=False, extra_env=None):
+    """Drive the SABLE-jfg6.5 timer entrypoint's --once mode instead of calling
+    sable-reconcile-handoffs directly — the S5 walk-away path. `repo_via`
+    selects which of the timer's repo-resolution legs supplies the repo
+    ('cli' -> --repo, 'env' -> $SABLE_RECONCILE_REPO); either way the process
+    runs with NO tmux server and NO live pane (the whole _env() helper already
+    strips TMUX_PANE / CLAUDE_AGENT_NAME for every subprocess in this module)."""
+    argv = [sys.executable, str(TIMER_BIN), "--once", "--remote", "origin"]
+    env = dict(extra_env or {})
+    if repo_via == "cli":
+        argv += ["--repo", str(work)]
+    elif repo_via == "env":
+        env["SABLE_RECONCILE_REPO"] = str(work)
+    else:
+        raise ValueError(repo_via)
+    if dry_run:
+        argv.append("--dry-run")
+    return _run(argv, work, home, extra_env=env)
+
+
 def _for_chuck_beads(work, home):
     cp = _bd(work, home, "list", "--status", "open,in_progress",
              "--label", "for-chuck", "--json", check=False)
@@ -295,3 +317,76 @@ def test_open_work_bead_not_reconciled(tmp_path):
     assert r.returncode == 0, r.stdout
     assert _for_chuck_beads(work, home) == [], \
         "an open (unfinished) work bead must not trigger a merge handoff"
+
+
+# ===========================================================================
+# S5-U1: the timer entrypoint (sable-reconcile-timer --once), invoked with NO
+# tmux server and NO live panes, still scans and files a notify-miss handoff.
+# SABLE-jfg6.5 / D3 TIMER LEG.
+# ===========================================================================
+
+def test_S5_U1_timer_once_catches_notify_miss_without_tmux_or_pane_context(tmp_path):
+    origin, work, home = _setup(tmp_path)
+    bead_id = _make_work_bead(work, home, status="closed")
+    branch = _push_worker_branch(work, bead_id)
+    assert _for_chuck_beads(work, home) == []
+
+    # --repo leg of the resolution chain
+    r = _reconcile_via_timer(work, home, repo_via="cli")
+    assert r.returncode == 0, r.stdout
+    beads = _for_chuck_beads(work, home)
+    assert len(beads) == 1, f"expected exactly one for-chuck bead, got {beads}\n{r.stdout}"
+    assert branch in beads[0]["title"], beads[0]["title"]
+
+
+def test_S5_U1b_timer_once_resolves_repo_via_env_not_pane_context(tmp_path):
+    # $SABLE_RECONCILE_REPO leg of the resolution chain — still no --repo flag,
+    # no TMUX_PANE, no pane-shaped fallback to the caller's cwd.
+    origin, work, home = _setup(tmp_path)
+    bead_id = _make_work_bead(work, home, status="closed")
+    branch = _push_worker_branch(work, bead_id)
+
+    r = _reconcile_via_timer(work, home, repo_via="env")
+    assert r.returncode == 0, r.stdout
+    beads = _for_chuck_beads(work, home)
+    assert len(beads) == 1, f"expected exactly one for-chuck bead via env resolution, got {beads}\n{r.stdout}"
+    assert branch in beads[0]["title"], beads[0]["title"]
+
+
+# ===========================================================================
+# S5-E1: walk-away simulation. The push-based notify hook is never wired (it
+# never runs anywhere in this fixture — modeling the operator having walked
+# away with every manager/worker pane asleep). MULTIPLE stranded branches
+# accumulate; the timer entrypoint ALONE, in a SINGLE cadence firing (one
+# --once invocation), catches every one of them — the automated stand-in that
+# clears bldh.7's walk-away blocker.
+# ===========================================================================
+
+def test_S5_E1_walkaway_simulation_timer_alone_catches_all_strands_in_one_cadence(tmp_path):
+    origin, work, home = _setup(tmp_path)
+
+    bead_a = _make_work_bead(work, home, status="closed")
+    branch_a = _push_worker_branch(work, bead_a)
+    bead_b = _make_work_bead(work, home, status="closed")
+    branch_b = _push_worker_branch(work, bead_b)
+    # a third branch that must NOT be caught: work still open (worker not done)
+    bead_open = _make_work_bead(work, home, status="open")
+    branch_open = _push_worker_branch(work, bead_open)
+
+    # notify unwired the whole way through this fixture: no hook process ever
+    # ran, so there is NOTHING on record before the timer's single sweep.
+    assert _for_chuck_beads(work, home) == []
+
+    r = _reconcile_via_timer(work, home, repo_via="cli")
+    assert r.returncode == 0, r.stdout
+
+    beads = _for_chuck_beads(work, home)
+    titles = [b["title"] for b in beads]
+    assert len(beads) == 2, f"expected exactly the two closed-work strands, got {beads}\n{r.stdout}"
+    assert any(branch_a in t for t in titles), titles
+    assert any(branch_b in t for t in titles), titles
+    assert not any(branch_open in t for t in titles), \
+        "the open-work branch must not be swept up by the walk-away catch-all"
+
+    # BOUNDARIES hold even through the timer wrapper: files beads only.
+    assert _origin_has_branch(origin, branch_a) and _origin_has_branch(origin, branch_b)

@@ -28,6 +28,7 @@ ALLOW=(
   test-active-contracts-integration.sh
   test-agent-definitions.sh
   test-bead-description-gate.sh
+  test-chuck-role-contract.sh
   test-columbo-quick-mode.sh
   test-concurrent-sessions.sh
   test-control-trace.sh
