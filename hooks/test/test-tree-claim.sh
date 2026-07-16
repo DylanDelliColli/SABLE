@@ -161,6 +161,29 @@ CF="$(claim_file "$SCRATCH")"
 CLAIM_AGENT="$(awk '{print $3}' "$CF" 2>/dev/null)"
 if [ "$CLAIM_AGENT" = "-" ]; then pass "unnamed claim: third field falls back to '-'"; else fail "unnamed claim: third field falls back to '-'" "got: '$CLAIM_AGENT' (file: $(cat "$CF" 2>/dev/null))"; fi
 
+echo "--- Unit: SABLE-hccq — session_id falls back to CLAUDE_CODE_SESSION_ID when JSON omits it ---"
+
+# The hook-input JSON almost always carries session_id, but the fallback
+# order matters: CLAUDE_CODE_SESSION_ID is the env var Claude Code actually
+# exports (CLAUDE_SESSION_ID is checked first for any environment that does
+# set it, but is unset in practice). If a hook invocation ever lacks
+# session_id in its JSON, it must still resolve the SAME identity a later
+# 'sable-claim release' call (env-only, no JSON) would see.
+clear_claim "$SCRATCH"
+JSON_NO_SID=$(python3 -c "
+import json
+print(json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'git add .'}, 'cwd': '$SCRATCH'}))
+")
+OUT=$(
+  unset CLAUDE_SESSION_ID
+  CLAUDE_CODE_SESSION_ID="sess-from-code-env" bash "$HOOK" <<< "$JSON_NO_SID" 2>/dev/null
+)
+if [ "$(claim_session "$SCRATCH")" = "sess-from-code-env" ]; then
+  pass "session_id falls back to CLAUDE_CODE_SESSION_ID when JSON omits it"
+else
+  fail "session_id falls back to CLAUDE_CODE_SESSION_ID when JSON omits it" "got: $(claim_session "$SCRATCH")"
+fi
+
 echo "--- Unit: same session refresh ---"
 
 CF="$(claim_file "$SCRATCH")"
@@ -218,14 +241,18 @@ rm -rf "$NONGIT"
 echo "--- Unit: missing session identity ---"
 
 clear_claim "$SCRATCH"
-# JSON with no session_id; unset CLAUDE_SESSION_ID so identity is truly unknown
+# JSON with no session_id; unset CLAUDE_SESSION_ID/CLAUDE_CODE_SESSION_ID so
+# identity is truly unknown (SABLE-hccq: this harness's own real session sets
+# CLAUDE_CODE_SESSION_ID ambiently, which the hook now also consults as a
+# fallback — it must be scrubbed too or this "truly unknown" scenario
+# silently resolves to a KNOWN identity).
 JSON=$(python3 -c "
 import json
 print(json.dumps({'tool_name':'Bash','tool_input':{'command':'git add .'},'cwd':'$SCRATCH'}))
 ")
 # env -u cannot call shell functions; use a subshell to unset the variable
 OUT=$(
-  unset CLAUDE_SESSION_ID
+  unset CLAUDE_SESSION_ID CLAUDE_CODE_SESSION_ID
   printf '%s' "$JSON" | bash "$HOOK" 2>/dev/null
 )
 if is_allow "$OUT"; then pass "missing identity: allow"; else fail "missing identity: allow" "got deny"; fi
@@ -330,6 +357,51 @@ if git -C "$SCRATCH" worktree add "$WT" -b wt-branch -q 2>/dev/null; then
 else
   fail "integration setup: git worktree add failed"
 fi
+
+echo "--- Integration: SABLE-hccq — sable-claim release succeeds via CLAUDE_CODE_SESSION_ID after the real hook records that same session_id ---"
+
+# Reproduces the live bug end-to-end: the hook receives a real harness-issued
+# session_id via hook-input JSON (as it always does for a genuine
+# PreToolUse:Bash call) and writes it to the claim file. In production the
+# SAME session_id is also what the harness exports as CLAUDE_CODE_SESSION_ID
+# into a later plain Bash tool call's env — but sable-claim previously
+# checked only CLAUDE_SESSION_ID (which the harness never sets), so a
+# self-release always fell through to needing --force. Setting
+# CLAUDE_CODE_SESSION_ID here to the SAME id the hook wrote reproduces that
+# production pairing exactly.
+clear_claim "$SCRATCH"
+SABLE_CLAIM_BIN="$REPO/bin/sable-claim"
+REAL_SID="ea22e248-simulated-harness-session-uuid"
+JSON_REAL=$(python3 -c "
+import json
+print(json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'git add .'}, 'cwd': '$SCRATCH', 'session_id': '$REAL_SID'}))
+")
+printf '%s' "$JSON_REAL" | bash "$HOOK" >/dev/null 2>&1
+OUT=$(env -u CLAUDE_SESSION_ID -u CLAUDE_AGENT_NAME CLAUDE_CODE_SESSION_ID="$REAL_SID" "$SABLE_CLAIM_BIN" release "$SCRATCH" 2>&1)
+RC=$?
+CF="$(claim_file "$SCRATCH")"
+if [ "$RC" -eq 0 ] && [ ! -f "$CF" ]; then
+  pass "integration: sable-claim release succeeds without --force via CLAUDE_CODE_SESSION_ID (repro fix verification)"
+else
+  fail "integration: sable-claim release succeeds without --force via CLAUDE_CODE_SESSION_ID (repro fix verification)" "rc=$RC file_exists=$([ -f "$CF" ] && echo yes || echo no) out=$OUT"
+fi
+
+echo "--- Integration: SABLE-hccq — a genuinely foreign holder is still refused without --force ---"
+
+# Same shape (CLAUDE_CODE_SESSION_ID set, CLAUDE_SESSION_ID/CLAUDE_AGENT_NAME
+# not), but it belongs to a DIFFERENT session than the one the hook
+# recorded — the deny leg must survive.
+clear_claim "$SCRATCH"
+CF="$(claim_file "$SCRATCH")"
+printf 'ea22e248-foreign-session %s -\n' "$(date +%s)" > "$CF"
+OUT=$(env -u CLAUDE_SESSION_ID -u CLAUDE_AGENT_NAME CLAUDE_CODE_SESSION_ID="ea22e248-different-session" "$SABLE_CLAIM_BIN" release "$SCRATCH" 2>&1)
+RC=$?
+if [ "$RC" -ne 0 ] && [ -f "$CF" ]; then
+  pass "integration: foreign holder (non-matching CLAUDE_CODE_SESSION_ID) still refused without --force"
+else
+  fail "integration: foreign holder (non-matching CLAUDE_CODE_SESSION_ID) still refused without --force" "rc=$RC file_exists=$([ -f "$CF" ] && echo yes || echo no) out=$OUT"
+fi
+rm -f "$CF"
 
 echo "--- Integration: SABLE-5pci — 'git -C <wt>' and 'cd <wt> && git' resolve the SAME claim file ---"
 
@@ -457,13 +529,17 @@ CF="$(claim_file "$SCRATCH")"
 printf 'sess-HOLDER %s\n' "$(date +%s)" > "$CF"
 ORIGINAL_CONTENT="$(cat "$CF")"
 
-# identity-unknown invocation (no session_id, CLAUDE_SESSION_ID unset)
+# identity-unknown invocation (no session_id, CLAUDE_SESSION_ID and
+# CLAUDE_CODE_SESSION_ID both unset — SABLE-hccq: this harness's own real
+# session sets CLAUDE_CODE_SESSION_ID ambiently, which the hook now also
+# consults as a fallback, so it must be scrubbed too for this to be truly
+# identity-unknown rather than silently resolving to a KNOWN identity)
 JSON_UNK=$(python3 -c "
 import json
 print(json.dumps({'tool_name':'Bash','tool_input':{'command':'git add .'},'cwd':'$SCRATCH'}))
 ")
 OUT_UNK=$(
-  unset CLAUDE_SESSION_ID
+  unset CLAUDE_SESSION_ID CLAUDE_CODE_SESSION_ID
   printf '%s' "$JSON_UNK" | bash "$HOOK" 2>/dev/null
 )
 if is_allow "$OUT_UNK"; then
