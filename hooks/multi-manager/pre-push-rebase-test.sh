@@ -29,7 +29,10 @@
 #   $SABLE_PRE_PUSH_TEST_PHASE          — "auto" (default) | "skip" (delegate to repo's git hooks)
 #   $SABLE_TEST_COMMAND                 — test invocation (used when PHASE=auto; lowest-priority
 #                                         source — see sable_resolve_test_command below)
-#   $SABLE_PRE_PUSH_TEST_TIMEOUT        — seconds for test phase (default: 60)
+#   $SABLE_PRE_PUSH_TEST_TIMEOUT        — seconds for test phase (default: 60; lowest-priority
+#                                         source — see sable_resolve_test_timeout below. Repo-local
+#                                         override: `git config sable.testTimeout <seconds>`, or a
+#                                         checked-in `testTimeout=<seconds>` line in .sable)
 #   $SABLE_SKIP_PRE_PUSH                — "1" to skip TESTS only (rebase+static still run)
 #
 # Auto-detect typechecker by project markers:
@@ -388,13 +391,13 @@ if [ -z "$TEST_CMD" ]; then
   exit 0
 fi
 
-TEST_TIMEOUT="${SABLE_PRE_PUSH_TEST_TIMEOUT:-60}"
+TEST_TIMEOUT=$(sable_resolve_test_timeout "$CWD")
 TEST_EXIT=0
 TEST_OUT=$(cd "$CWD" && timeout "$TEST_TIMEOUT" sh -c "$TEST_CMD" 2>&1) || TEST_EXIT=$?
 
 if [ "$TEST_EXIT" -ne 0 ]; then
   if [ "$TEST_EXIT" -eq 124 ]; then
-    SUFFIX="Tests exceeded SABLE_PRE_PUSH_TEST_TIMEOUT=${TEST_TIMEOUT}s. Either scope SABLE_TEST_COMMAND to a faster subset (recommended: smoke + changed units, <60s), or raise both SABLE_PRE_PUSH_TEST_TIMEOUT and the settings.json hook timeout together."
+    SUFFIX="Tests exceeded the ${TEST_TIMEOUT}s test-phase timeout. Either scope the test command to a faster subset (recommended: smoke + changed units, <60s), or raise the timeout for this repo: \`git config sable.testTimeout <seconds>\` (repo-local), a \`testTimeout=<seconds>\` line in .sable (checked in), or \$SABLE_PRE_PUSH_TEST_TIMEOUT (legacy env, and raise the settings.json hook timeout together with it)."
   else
     SUFFIX="Tests failed. Fix before pushing, or set SABLE_SKIP_PRE_PUSH=1 with explicit intent (rebase + static still run)."
   fi

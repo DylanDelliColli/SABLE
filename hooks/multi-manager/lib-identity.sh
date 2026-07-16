@@ -510,6 +510,53 @@ sable_resolve_test_command() {
   return 0
 }
 
+# sable_resolve_test_timeout <repo-path>
+#
+# Resolves the pre-push TEST-phase timeout (seconds) for <repo-path>
+# (SABLE-pf0g). pre-push-rebase-test.sh previously read TEST_TIMEOUT only
+# from $SABLE_PRE_PUSH_TEST_TIMEOUT (default 60s) with no per-repo override —
+# under real fleet contention (observed load average 11.65 on a 14-core box,
+# 13 concurrent claude processes) a genuinely passing test suite can run
+# 80s+ against a ~52s-in-isolation baseline and get killed by the 60s
+# default, denying an otherwise-good push. Mirrors sable_resolve_test_command's
+# precedence exactly — repo-local config wins over checked-in config wins
+# over the legacy env override wins over the hardcoded default:
+#   1. `git -C <repo-path> config --get sable.testTimeout` (repo-local,
+#      unshared — the machine's own override for this checkout)
+#   2. `<repo-path>/.sable` file, a line `testTimeout=<seconds>` (checked
+#      into the repo, shared across clones)
+#   3. $SABLE_PRE_PUSH_TEST_TIMEOUT (explicit env override, legacy)
+#   4. "60" (hardcoded default)
+# Always prints a positive integer (as text) and returns 0.
+sable_resolve_test_timeout() {
+  local repo_path="${1:-}"
+  local val
+
+  if [ -n "$repo_path" ]; then
+    val=$(git -C "$repo_path" config --get sable.testTimeout 2>/dev/null || true)
+    if [ -n "$val" ]; then
+      printf '%s' "$val"
+      return 0
+    fi
+
+    if [ -f "$repo_path/.sable" ]; then
+      val=$(sed -n 's/^testTimeout=//p' "$repo_path/.sable" 2>/dev/null | head -1)
+      if [ -n "$val" ]; then
+        printf '%s' "$val"
+        return 0
+      fi
+    fi
+  fi
+
+  if [ -n "${SABLE_PRE_PUSH_TEST_TIMEOUT:-}" ]; then
+    printf '%s' "$SABLE_PRE_PUSH_TEST_TIMEOUT"
+    return 0
+  fi
+
+  printf '60'
+  return 0
+}
+
 # sable_resolve_dispatch_lane <hook-input-json>
 #
 # For PreToolUse:Agent / PostToolUse:Agent hooks. Decides whether pre-dispatch
