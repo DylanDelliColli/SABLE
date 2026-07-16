@@ -16,8 +16,18 @@
 
 set -euo pipefail
 
+# SABLE-jfg6.1 (contract D1): durable entry trace at TRUE line 1, before any
+# stdin read, so absence-of-line == hook-never-fired (separable from
+# fired-with-empty-stdin, which additionally logs STDIN_BYTES=0). Additive
+# instrumentation only — the bd-close gate logic below is unchanged.
+# shellcheck source=multi-manager/lib-hook-trace.sh
+. "$(dirname "${BASH_SOURCE[0]}")/multi-manager/lib-hook-trace.sh"
+sable_trace_entry tdd-gate
+
+HOOK_INPUT=$(sable_trace_read_stdin) || exit 0
+
 # Read stdin and parse with python3 (jq not available)
-PARSED=$(python3 -c "
+PARSED=$(printf '%s' "$HOOK_INPUT" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 cmd = d.get('tool_input', {}).get('command', '')

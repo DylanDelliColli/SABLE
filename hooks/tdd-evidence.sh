@@ -5,7 +5,15 @@
 
 set -euo pipefail
 
-HOOK_INPUT=$(cat 2>/dev/null) || exit 0
+# SABLE-jfg6.1 (contract D1): durable entry trace at TRUE line 1, before any
+# stdin read, so absence-of-line == hook-never-fired (separable from
+# fired-with-empty-stdin, which additionally logs STDIN_BYTES=0). Additive
+# instrumentation only — the test-command detection below is unchanged.
+# shellcheck source=multi-manager/lib-hook-trace.sh
+. "$(dirname "${BASH_SOURCE[0]}")/multi-manager/lib-hook-trace.sh"
+sable_trace_entry tdd-evidence
+
+HOOK_INPUT=$(sable_trace_read_stdin) || exit 0
 
 # market-brief-package-sqcr: detect test-runner commands even when wrapped in
 # a compound command (cd/git -C prefix, &&/;/| chains) or invoked directly

@@ -11,7 +11,17 @@
 
 set -euo pipefail
 
-HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
+# SABLE-jfg6.1 (contract D1): durable entry trace at TRUE line 1, before the
+# stdin read AND before the git-push matcher / identity gate below. The legacy
+# SABLE-tb1y "INVOKED" line (further down) sits AFTER the matcher, so its
+# absence could not distinguish never-dispatched from dispatched-with-empty-
+# stdin (research F1); this ENTRY line closes that gap. Additive only — the
+# matcher, identity gate, and pp_trace disposition logging are all unchanged.
+# shellcheck source=lib-hook-trace.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib-hook-trace.sh"
+sable_trace_entry post-push-merge-notify
+
+HOOK_INPUT=$(sable_trace_read_stdin) || HOOK_INPUT=""
 
 # Identity via lib-identity.sh (SABLE-uz9.3 / SABLE-aok): fires for any manager
 # identity (legacy env terminals, the Lincoln main session in execution mode,
