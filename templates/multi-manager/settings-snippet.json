@@ -36,6 +36,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/control-trace.sh",
+            "timeout": 3000
+          },
+          {
+            "type": "command",
             "command": "bash ~/.claude/hooks/multi-manager/mode-interlock.sh",
             "timeout": 3000
           },
