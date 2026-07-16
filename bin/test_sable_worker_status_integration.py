@@ -5,6 +5,7 @@ Isolated socket (-L). Proves: worker panes are discovered by their @sable_role/
 @sable_bead/@sable_status user-options, a done worker is reported done, and
 --reap kills ONLY the done worker pane (the running one survives).
 """
+import os
 import shutil
 import subprocess
 import time
@@ -17,6 +18,27 @@ BIN = Path(__file__).resolve().parent / "sable-worker-status"
 HAVE_TMUX = shutil.which("tmux") is not None
 pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="tmux not installed")
 
+# SABLE-517s: a tmux session's panes inherit the tmux SERVER's global
+# environment, captured from the env of whichever client call first starts
+# the server on this socket (typically this test file's first _tmux() call).
+# When the test runner ITSELF is a live SABLE pane (CLAUDE_AGENT_NAME set,
+# e.g. a manager running its own test suite), that identity leaks into every
+# plain bash pane these tests spawn -- and pane_is_live_nonworker_agent (see
+# sable_pane_lib.py) then reads it back via /proc/<pid>/environ and spares
+# the pane from --reap, since it looks like a live non-worker agent. Scrub
+# the ambient SABLE identity vars from every tmux client call's env so panes
+# start clean regardless of what agent is running the test; tests that need
+# a pane to carry a specific identity stamp it explicitly via per-pane -e
+# (see _split_pane below), which always wins over this scrubbed baseline.
+_AMBIENT_SABLE_VARS = ("CLAUDE_AGENT_NAME", "SABLE_WORKER_PANE", "SABLE_TMUX_SESSION")
+
+
+def _scrubbed_env():
+    env = dict(os.environ)
+    for var in _AMBIENT_SABLE_VARS:
+        env.pop(var, None)
+    return env
+
 
 @pytest.fixture()
 def sock():
@@ -28,7 +50,8 @@ def sock():
 
 def _tmux(s, *args, check=True):
     return subprocess.run(["tmux", "-L", s, *args],
-                          capture_output=True, text=True, check=check)
+                          capture_output=True, text=True, check=check,
+                          env=_scrubbed_env())
 
 
 def _tag(s, target, role, bead, status):
