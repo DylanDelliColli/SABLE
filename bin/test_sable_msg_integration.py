@@ -513,24 +513,32 @@ def test_idle_pane_redraw_race_reports_landed_not_undelivered(tmux_socket, tmp_p
 
 # A TUI stand-in that models exactly that posture. BUSY phase: a prior turn runs
 # ('esc to interrupt'); our typed line is read (its terminating Enter absorbed
-# here), stored, but NOT submitted, and the phase ends after BUSY_SECS. IDLE
-# phase: no turn running, the line sits in the EDITABLE composer ('❯ <line>') with
-# NO busy status and NO footer — it will NEVER submit on its own. Only a bare
-# Enter (the l7uv self-heal resend) submits it, recording it to REC_FILE once.
+# here), stored, but NOT submitted. IDLE phase: no turn running, the line sits in
+# the EDITABLE composer ('❯ <line>') with NO busy status and NO footer — it will
+# NEVER submit on its own. Only a bare Enter (the l7uv self-heal resend) submits
+# it, recording it to REC_FILE once.
+#
+# The busy->idle transition is TEST-CONTROLLED via markers, not a wall-clock
+# BUSY_SECS window (which raced sable-msg's t0 capture and made the busy-at-t0
+# path selection nondeterministic under load). The stand-in signals when it is
+# busy (BUSY_READY, first thing in the loop) and when it has captured our typed
+# line (STUCK_READ), and it stays busy until the test releases it (GO_IDLE). The
+# test uses those markers to guarantee sable-msg captures during the busy phase
+# and that the line is present in the editable box before the pane falls idle.
 _STUCK_BOX_TUI = r'''#!/usr/bin/env bash
 stuck=""
+: > "$BUSY_READY"                                  # signal busy-entry BEFORE first read
 busy=1
-END_AT=$((SECONDS + ${BUSY_SECS:-1}))
 while [ "$busy" = 1 ]; do
   printf '\033[H\033[2J  Baking the prior turn (esc to interrupt)\n'
   printf '\xe2\x9d\xaf %s\n' "$stuck"
   if IFS= read -rsN1 -t 0.2 ch; then
     case "$ch" in
       $'\n'|$'\r'|'') : ;;                         # absorbed Enter — does nothing
-      *) IFS= read -r rest; stuck="$ch$rest" ;;     # our line + its (absorbed) Enter
+      *) IFS= read -r rest; stuck="$ch$rest"; : > "$STUCK_READ" ;;  # our line + (absorbed) Enter
     esac
   fi
-  if [ "$SECONDS" -ge "$END_AT" ]; then busy=0; fi
+  [ -e "$GO_IDLE" ] && busy=0                       # stay busy until the test releases us
 done
 submitted=0
 while true; do
@@ -552,41 +560,79 @@ done
 '''
 
 
-def _start_stuck_box_pane(sock, tmp_path, busy_secs):
+def _wait_until(pred, timeout=10.0, interval=0.1):
+    """Poll pred() until it is truthy or the timeout elapses. Returns pred()'s
+    final value so callers can assert on it. Deterministic replacement for the
+    fixed sleeps that raced the stand-in under host load (SABLE-l7uv revise)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(interval)
+    return bool(pred())
+
+
+def _start_stuck_box_pane(sock, tmp_path):
     """A pane running the stuck-editable-composer stand-in, tagged
-    @sable_role=optimus. Returns rec_file: the line submitted once the self-heal
-    Enter fires (empty pre-fix)."""
+    @sable_role=optimus. Returns (rec, busy_ready, stuck_read, go_idle) marker
+    paths: rec collects the line submitted once the self-heal Enter fires (empty
+    pre-fix); busy_ready/stuck_read are stand-in->test signals; go_idle is the
+    test->stand-in release that ends the busy phase."""
     rec = tmp_path / "rec.txt"
+    busy_ready = tmp_path / "busy_ready"
+    stuck_read = tmp_path / "stuck_read"
+    go_idle = tmp_path / "go_idle"
     script = tmp_path / "stuck_box_tui.sh"
     script.write_text(_STUCK_BOX_TUI)
     script.chmod(0o755)
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
-          f"REC_FILE={rec} BUSY_SECS={busy_secs} bash {script}")
+          f"REC_FILE={rec} BUSY_READY={busy_ready} STUCK_READ={stuck_read} "
+          f"GO_IDLE={go_idle} bash {script}")
     time.sleep(0.4)
     _tmux(sock, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
-    return rec
+    return rec, busy_ready, stuck_read, go_idle
 
 
 def test_busy_at_t0_text_stuck_in_editable_box_self_heals_and_delivers_l7uv(tmux_socket, tmp_path):
     # THE SABLE-l7uv repro, end-to-end against a REAL tmux server + real sable-msg.
-    # Busy at t0 (BUSY_SECS clears within the poll budget), the single busy-leg
-    # Enter is absorbed, then the line sits stuck in the editable composer. The fix
-    # must resend Enter once the pane is no longer working, submitting the line
-    # (REC_FILE) and reporting DELIVERED. Pre-fix: rc != 0, REC_FILE empty, a
-    # durable fallback bead would be filed for a message left visibly stuck.
-    # AUTO_FALLBACK=0 keeps a (pre-fix) failure from writing a real inbox bead.
-    rec = _start_stuck_box_pane(tmux_socket, tmp_path, busy_secs=1)
-    r = subprocess.run(
+    # The pane is BUSY at t0; the single busy-leg Enter is absorbed, then the line
+    # sits stuck in the editable composer. The fix must resend Enter once the pane
+    # is no longer working, submitting the line (REC_FILE) and reporting DELIVERED.
+    # Pre-fix: rc != 0, REC_FILE empty, a durable fallback bead would be filed for a
+    # message left visibly stuck. AUTO_FALLBACK=0 keeps a (pre-fix) failure from
+    # writing a real inbox bead.
+    #
+    # Fully marker-driven (SABLE-l7uv revise — the wall-clock BUSY_SECS form flaked
+    # ~2/3 under load): (A) wait for BUSY_READY so sable-msg's t0 capture lands
+    # DURING the busy phase (deterministic busy-at-t0 self-heal path); (B) release
+    # GO_IDLE only after STUCK_READ proves sable-msg has typed the line into the
+    # busy composer, so it is guaranteed present in the editable box when the pane
+    # falls idle; (C) poll REC_FILE with a budget instead of a single racing read.
+    # sable-msg runs via Popen so the test can drive GO_IDLE while it polls.
+    rec, busy_ready, stuck_read, go_idle = _start_stuck_box_pane(tmux_socket, tmp_path)
+    assert _wait_until(busy_ready.exists, timeout=10), \
+        "stand-in never signalled busy-entry"
+    proc = subprocess.Popen(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"],
-        capture_output=True, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
-             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "20",
+             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "60",
              "SABLE_MSG_POLL_INTERVAL": "0.25"},
     )
-    assert "cap in force" in rec.read_text(), \
+    try:
+        assert _wait_until(stuck_read.exists, timeout=15), \
+            "sable-msg never typed the line into the busy composer"
+        go_idle.touch()                              # release busy->idle; line now stuck
+        out, err = proc.communicate(timeout=45)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    assert _wait_until(lambda: rec.exists() and "cap in force" in rec.read_text(),
+                       timeout=10), \
         "the stuck line must have been submitted by the self-heal Enter"
-    assert r.returncode == 0, r.stderr           # self-heal -> delivered, no fallback
-    assert "delivered" in r.stderr
+    assert proc.returncode == 0, err             # self-heal -> delivered, no fallback
+    assert "delivered" in err
 
 
 # --- per-repo scoping (SABLE-e1e3.3): a fleet is addressed only by its repo ---
