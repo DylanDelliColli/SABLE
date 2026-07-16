@@ -241,7 +241,7 @@ The reason field becomes searchable history — make it informative.
 ### 10. Push to Dolt
 
 ```bash
-bd dolt push
+sable-dolt-push  # blessed wrapper, never bare `bd dolt push`; chuck-only in a swarm
 ```
 
 Beads live in `.beads/` via Dolt. Auto-commit is local; `dolt push` makes
