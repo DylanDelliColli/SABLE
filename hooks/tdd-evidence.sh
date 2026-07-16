@@ -62,8 +62,18 @@ PYTEST_FILE_RE = re.compile(r'test_[A-Za-z0-9_-]+\.py')
 # 'script.sh 2>&1' leaves '2>&1' — not the script path — as seg[-1].
 REDIRECT_RE = re.compile(r'^\d*(>>?|<)&?\d*\$')
 
+# SABLE-2nak (same class as SABLE-sxhx in lib-identity.sh): plain shlex.split
+# only treats ; && || | as separators when they are whitespace-delimited from
+# adjacent tokens (shlex.split('a.sh&&b.sh') -> ['a.sh&&b.sh'], not split), so
+# an UNSPACED separator fused two commands into one token and the segmenter
+# below never split them. shlex.shlex with punctuation_chars=';&|' +
+# whitespace_split=True returns each run of separator chars as its own token
+# even when unspaced, while leaving separators inside quotes untouched and
+# producing output identical to shlex.split for every non-separator case.
 try:
-    tokens = shlex.split(cmd)
+    lexer = shlex.shlex(cmd, posix=True, punctuation_chars=';&|')
+    lexer.whitespace_split = True
+    tokens = list(lexer)
 except ValueError:
     sys.exit(0)
 
