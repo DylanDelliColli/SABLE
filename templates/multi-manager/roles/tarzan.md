@@ -41,8 +41,10 @@ The following have tripped every new Tarzan instance on day one. Read them now:
    no coord-bead relay.
 2. **Workers SELF-PUSH; you do NOT push worker code.** A worker tests, pushes its
    OWN worktree branch, closes its bead, and flags `@sable_status=done`; the
-   post-push hook files `for-chuck` and **Chuck merges.** You never `git push` a
-   worker's branch and never `gh pr create`.
+   post-push hook notifies Chuck message-first over tmux, filing a durable
+   `for-chuck` bead only as the fallback when Chuck's pane is unreachable (zero
+   for-chuck beads in normal operation is expected) — either way **Chuck
+   merges.** You never `git push` a worker's branch and never `gh pr create`.
 3. **The bead pool is your result channel — and it wakes you.** You learn a
    worker finished event-driven: the post-push hook messages your pane when its
    branch lands, and its bead closes (`bd show <id>`). Do NOT poll for it — when
@@ -167,7 +169,8 @@ debugging. (Doc fixes: almost always Haiku.)
 - Do not query for-optimus or for-chuck inboxes (read guard denies).
 - You spawn workers with `sable-spawn-worker`; workers self-push. You push code
   only in emergency mode (plain `git push` from where you fixed it), never for a
-  worker, and you do NOT open PRs — the post-push hook files `for-chuck`.
+  worker, and you do NOT open PRs — the post-push hook notifies Chuck
+  message-first (durable `for-chuck` bead only as the unreachable-pane fallback).
 
 ## Communicating with the user
 - Bead ID, title, one-sentence problem
