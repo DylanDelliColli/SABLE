@@ -30,7 +30,20 @@ pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="tmux not installed")
 # start clean regardless of what agent is running the test; tests that need
 # a pane to carry a specific identity stamp it explicitly via per-pane -e
 # (see _split_pane below), which always wins over this scrubbed baseline.
-_AMBIENT_SABLE_VARS = ("CLAUDE_AGENT_NAME", "SABLE_WORKER_PANE", "SABLE_TMUX_SESSION")
+#
+# TMUX/TMUX_PANE leak the same way into --reap SUBPROCESS envs (not just
+# panes): resolve_session()'s calling_pane_session() (sable_pane_lib.py)
+# reads TMUX_PANE from the CLI process's own env and looks that pane id up
+# ON THE TEST'S ISOLATED SOCKET. When the outer test runner is itself inside
+# tmux and a --reap subprocess inherits its TMUX_PANE, that id can coincide
+# with an unrelated pane on the fresh test socket (pane ids are small and
+# sequential per-server), hijacking session resolution to the wrong repo's
+# fleet. Only scrub these where a test deliberately exercises cwd/pane-derived
+# resolution by omitting SABLE_TMUX_SESSION -- when SABLE_TMUX_SESSION is
+# pinned it wins first in resolve_session()'s precedence and TMUX_PANE is
+# never consulted, so leaving it be there is harmless and documents that.
+_AMBIENT_SABLE_VARS = ("CLAUDE_AGENT_NAME", "SABLE_WORKER_PANE", "SABLE_TMUX_SESSION",
+                        "TMUX", "TMUX_PANE")
 
 
 def _scrubbed_env():
@@ -178,9 +191,12 @@ def test_reap_scoped_to_caller_repo(sock, tmp_path):
         _tag(sock, f"{sess}:0.0", "worker", f"bead-{name}", "done")
         sessions[name] = (repo, sess)
 
-    env = {**os.environ, "SABLE_TMUX_SOCKET": sock, "SABLE_STATUS_SAMPLE_INTERVAL": "0.1"}
-    env.pop("SABLE_TMUX_SESSION", None)
-    env.pop("CLAUDE_AGENT_NAME", None)  # SABLE-dcw2: fleet-wide over lane-less panes
+    # _scrubbed_env(), not raw os.environ: this subprocess deliberately omits
+    # SABLE_TMUX_SESSION to exercise cwd/pane-derived resolution, so ambient
+    # TMUX/TMUX_PANE must not leak in either -- see the SABLE-517s note above
+    # _AMBIENT_SABLE_VARS for why a leaked TMUX_PANE can hijack resolution to
+    # the wrong repo's session on the test's isolated socket.
+    env = {**_scrubbed_env(), "SABLE_TMUX_SOCKET": sock, "SABLE_STATUS_SAMPLE_INTERVAL": "0.1"}
     r = subprocess.run(["python3", str(BIN), "--reap"], capture_output=True,
                        text=True, env=env, cwd=sessions["alpha"][0])
     assert r.returncode == 0, r.stderr
