@@ -1278,6 +1278,183 @@ fi
 rm -f "$BD_LOG" "$SABLE_MSG_LOG"
 
 # --------------------------------------------------------------------------
+# SABLE-riu: fallback-path idempotency. A repeated push of the SAME branch
+# during a chuck-down/unreachable window (message-first handoff never
+# confirms) must file ONLY ONE for-chuck bead, not a new near-identical bead
+# per push. Mirrors bin/sable-reconcile-handoffs's title_names_branch
+# predicate. clean-room: this section only shells out to the STUB bd (never
+# the real bd binary), so it needs no HAVE_BD/command-v self-skip.
+# --------------------------------------------------------------------------
+
+RIU_FIXTURE_BRANCH=""
+
+# (a) An existing open for-chuck bead already names this exact branch (title
+# 'wk-riu-dup') — the fallback create must be SKIPPED and the hook must still
+# exit 0.
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "list" ]; then
+  cat <<'JSON'
+[{"id": "SABLE-existing", "title": "[AUTO-NOTIFY] Review PR from optimus: wk-riu-dup", "status": "open"}]
+JSON
+  exit 0
+fi
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+RIU_BARE=$(mktemp -d)
+RIU_REPO=$(mktemp -d)
+trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$RIU_BARE" "$RIU_REPO"' EXIT
+
+git init -q --bare "$RIU_BARE"
+git clone -q "$RIU_BARE" "$RIU_REPO"
+cd_fixture "$RIU_REPO"
+git -C "$RIU_REPO" config user.email "riu@riu"; git -C "$RIU_REPO" config user.name "riu"
+echo base > base.txt; git add base.txt; git commit -q -m base
+git push -q "$RIU_BARE" HEAD:refs/heads/main 2>/dev/null
+git update-ref refs/remotes/origin/main HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
+git checkout -q -b wk-riu-dup
+echo change > riu_change.txt; git add riu_change.txt; git commit -q -m "worker: riu change"
+git push -q "$RIU_BARE" HEAD:refs/heads/wk-riu-dup 2>/dev/null
+git update-ref refs/remotes/origin/wk-riu-dup HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
+cd - >/dev/null
+
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+RIU_INPUT_A=$(make_post_input "git push" "$RIU_REPO")
+RIU_OUT_A=$(run_hook "$MGR_ENV" "$RIU_INPUT_A")
+assert_bd_not_called "SABLE-riu: existing open for-chuck bead naming the branch → no duplicate bd create"
+if printf '%s' "$RIU_OUT_A" | grep -qi 'not filing a duplicate'; then
+  pass "SABLE-riu: skip is reported with a loud context line, not silent"
+else
+  fail "SABLE-riu: skip is reported with a loud context line, not silent" "OUTPUT: $RIU_OUT_A"
+fi
+
+# (b) Token-boundary match, not substring: pushing 'wk-riu-short' while the
+# only existing for-chuck bead names the LONGER branch 'wk-riu-short-extra'
+# (which contains 'wk-riu-short' as a bare prefix, no delimiter after it)
+# must NOT be treated as already-named — mirrors the fix spec's own example
+# ('wk-foo' must not match a title naming 'wk-foobar'). bd create must fire.
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "list" ]; then
+  cat <<'JSON'
+[{"id": "SABLE-existing", "title": "[AUTO-NOTIFY] Review PR from optimus: wk-riu-short-extra", "status": "open"}]
+JSON
+  exit 0
+fi
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+cd_fixture "$RIU_REPO"
+git checkout -q -b wk-riu-short origin/main
+echo change2 > riu_change2.txt; git add riu_change2.txt; git commit -q -m "worker: riu change short"
+git push -q "$RIU_BARE" HEAD:refs/heads/wk-riu-short 2>/dev/null
+git update-ref refs/remotes/origin/wk-riu-short HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
+cd - >/dev/null
+
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+RIU_INPUT_B=$(make_post_input "git push" "$RIU_REPO")
+run_hook "$MGR_ENV" "$RIU_INPUT_B" >/dev/null
+assert_bd_called "SABLE-riu: a shorter branch is NOT treated as a duplicate of a longer branch's title (token-boundary, not substring)"
+
+# (c) No existing for-chuck bead names the branch → files exactly one.
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "list" ]; then
+  echo "[]"
+  exit 0
+fi
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+RIU_INPUT_C=$(make_post_input "git push" "$RIU_REPO")
+run_hook "$MGR_ENV" "$RIU_INPUT_C" >/dev/null
+RIU_CREATE_COUNT=$(grep -c 'for-chuck' "$BD_LOG" 2>/dev/null || echo 0)
+if [ "$RIU_CREATE_COUNT" -eq 1 ]; then
+  pass "SABLE-riu: no existing for-chuck bead names the branch → exactly one bd create"
+else
+  fail "SABLE-riu: no existing for-chuck bead names the branch → exactly one bd create" "count=$RIU_CREATE_COUNT BD_LOG: $(cat "$BD_LOG" 2>/dev/null)"
+fi
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+
+# (d) Integration: a STATEFUL bd stub that behaves like a real bead store —
+# 'create' appends a bead whose title embeds the branch; 'list' returns
+# whatever is currently stored. Two consecutive fallback-path invocations for
+# the SAME branch must result in exactly ONE for-chuck bead on record.
+RIU_STATE="$STUB_DIR/riu-bead-state.json"
+echo "[]" > "$RIU_STATE"
+RIU_STATE_PY="$STUB_DIR/riu_bd_stub.py"
+cat > "$RIU_STATE_PY" <<'PYEOF'
+import json, os, sys
+
+state_path = os.environ["RIU_STATE"]
+try:
+    with open(state_path) as f:
+        beads = json.load(f)
+except Exception:
+    beads = []
+
+args = sys.argv[1:]
+if args and args[0] == "list":
+    print(json.dumps(beads))
+    sys.exit(0)
+if args and args[0] == "create":
+    title = ""
+    for i, a in enumerate(args):
+        if a == "--title" and i + 1 < len(args):
+            title = args[i + 1]
+    beads.append({"id": f"SABLE-riu{len(beads)}", "title": title, "status": "open"})
+    with open(state_path, "w") as f:
+        json.dump(beads, f)
+    print(f"created SABLE-riu{len(beads) - 1}")
+    sys.exit(0)
+sys.exit(0)
+PYEOF
+cat > "$STUB_DIR/bd" <<EOF
+#!/usr/bin/env bash
+# RIU_STATE is baked in at stub-creation time (not passed through run_hook's
+# env -i) so the state file path survives the hermetic env wipe.
+RIU_STATE="$RIU_STATE" exec python3 "$RIU_STATE_PY" "\$@"
+EOF
+chmod +x "$STUB_DIR/bd"
+
+cd_fixture "$RIU_REPO"
+git checkout -q wk-riu-dup
+echo change3 >> riu_change.txt; git add riu_change.txt; git commit -q -m "worker: riu change v2"
+git push -q "$RIU_BARE" HEAD:refs/heads/wk-riu-dup 2>/dev/null
+git update-ref refs/remotes/origin/wk-riu-dup HEAD  # SABLE-ck05: mirror the tracking-ref update a named-remote push does automatically
+cd - >/dev/null
+
+RIU_INPUT_D1=$(make_post_input "git push" "$RIU_REPO")
+run_hook "$MGR_ENV" "$RIU_INPUT_D1" >/dev/null
+RIU_INPUT_D2=$(make_post_input "git push" "$RIU_REPO")
+run_hook "$MGR_ENV" "$RIU_INPUT_D2" >/dev/null
+
+RIU_FINAL_COUNT=$(python3 -c "import json; print(len(json.load(open('$RIU_STATE'))))")
+if [ "$RIU_FINAL_COUNT" -eq 1 ]; then
+  pass "SABLE-riu integration: two consecutive fallback-path invocations for one branch → exactly ONE for-chuck bead"
+else
+  fail "SABLE-riu integration: two consecutive fallback-path invocations for one branch → exactly ONE for-chuck bead" "count=$RIU_FINAL_COUNT STATE: $(cat "$RIU_STATE" 2>/dev/null)"
+fi
+
+rm -f "$BD_LOG" "$SABLE_MSG_LOG" "$RIU_STATE" "$RIU_STATE_PY"
+
+# Restore the plain bd stub for hermeticity if more tests are appended later.
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+# --------------------------------------------------------------------------
 # Summary
 # --------------------------------------------------------------------------
 
