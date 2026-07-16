@@ -887,5 +887,66 @@ def test_flag_dialog_stalls_never_captures_done_panes():
     assert sws.flag_dialog_stalls(panes, None, capture=fake_capture) == []
 
 
+# --- reaper liveness guard: never reap a resumed cockpit (SABLE-to8m) ---------
+# filter_live_cockpit drops any reap candidate whose LIVE process identity is the
+# operator cockpit ('lincoln'), even though its @sable_status=done tag (a stale
+# leftover from the worker that previously owned the window) makes it look
+# reap-eligible. Driven with an injected tmux runner + fake /proc root.
+
+class _CP:
+    def __init__(self, stdout="", returncode=0):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+def _fake_pid_runner(pane_to_pid):
+    """A run(cmd)->_CP that answers #{pane_pid} per pane from `pane_to_pid`."""
+    def run(cmd):
+        if "#{pane_pid}" in cmd:
+            pane = cmd[cmd.index("-t") + 1]
+            pid = pane_to_pid.get(pane)
+            return _CP(stdout=f"{pid}\n" if pid is not None else "", returncode=0)
+        return _CP(returncode=1)
+    return run
+
+
+def _proc_root(tmp_path, pid_to_identity):
+    for pid, identity in pid_to_identity.items():
+        d = tmp_path / str(pid)
+        d.mkdir()
+        entries = [b"PATH=/usr/bin"]
+        if identity is not None:
+            entries.insert(0, b"CLAUDE_AGENT_NAME=" + identity.encode())
+        (d / "environ").write_bytes(b"\x00".join(entries) + b"\x00")
+    return str(tmp_path)
+
+
+def test_filter_live_cockpit_drops_resumed_cockpit_pane(tmp_path):
+    # %1 is a genuinely-done worker (process identity = its lane 'optimus');
+    # %2 is a finished worker window the cockpit was resumed into (identity
+    # 'lincoln') that still carries a stale @sable_status=done. Only %1 survives
+    # as reap-eligible; the cockpit is protected.
+    run = _fake_pid_runner({"%1": 100, "%2": 200})
+    proc = _proc_root(tmp_path, {100: "optimus", 200: "lincoln"})
+    kept = sws.filter_live_cockpit(["%1", "%2"], None, run=run, proc_root=proc)
+    assert kept == ["%1"]
+
+
+def test_filter_live_cockpit_keeps_normal_workers(tmp_path):
+    # No cockpit among the candidates -> nothing filtered (never blocks a
+    # legitimate reap; a done worker's identity is its lane, never lincoln).
+    run = _fake_pid_runner({"%1": 100, "%2": 101})
+    proc = _proc_root(tmp_path, {100: "optimus", 101: "tarzan"})
+    assert sws.filter_live_cockpit(["%1", "%2"], None, run=run, proc_root=proc) == ["%1", "%2"]
+
+
+def test_filter_live_cockpit_keeps_pane_with_no_process_identity(tmp_path):
+    # A pane whose process carries no CLAUDE_AGENT_NAME has no authority to be
+    # treated as the cockpit -> reap proceeds as before (fail-open).
+    run = _fake_pid_runner({"%1": 100})
+    proc = _proc_root(tmp_path, {100: None})
+    assert sws.filter_live_cockpit(["%1"], None, run=run, proc_root=proc) == ["%1"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

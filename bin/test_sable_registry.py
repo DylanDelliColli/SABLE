@@ -167,6 +167,83 @@ def test_registration_writer_confined_to_spawn_tooling():
     assert callers == [], f"registration writer called outside spawn tooling: {callers}"
 
 
+# --- authoritative pane identity: env WINS over the mutable @sable_role tag ---
+# (SABLE-to8m). The @sable_role / @sable_bead pane options are mutable global
+# tmux state with no owner; the AUTHORITY is the CLAUDE_AGENT_NAME env of the
+# process actually running in the pane (tmux #{pane_pid} -> /proc/PID/environ).
+# These drive the functions with an injected tmux runner + a fake /proc root so
+# they need no real tmux server.
+import sable_pane_lib as spl  # noqa: E402
+
+
+class _CP:
+    """A subprocess.CompletedProcess stand-in for the injected tmux runner."""
+    def __init__(self, stdout="", returncode=0):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+def _fake_tmux(pid, role_tag):
+    """A run(cmd)->_CP that answers #{pane_pid} with `pid` and the @sable_role
+    show-options with `role_tag` (None => unset). Mirrors the two tmux calls the
+    identity helpers make."""
+    def run(cmd):
+        if "#{pane_pid}" in cmd:
+            return _CP(stdout=f"{pid}\n" if pid is not None else "", returncode=0)
+        if "@sable_role" in cmd:
+            return _CP(stdout=f"{role_tag}\n" if role_tag else "",
+                       returncode=0 if role_tag else 1)
+        return _CP(returncode=1)
+    return run
+
+
+def _proc_with_identity(tmp_path, pid, identity):
+    """A fake /proc root whose <pid>/environ carries CLAUDE_AGENT_NAME=identity
+    (or no such var when identity is None)."""
+    d = tmp_path / str(pid)
+    d.mkdir()
+    entries = [b"PATH=/usr/bin"]
+    if identity is not None:
+        entries.insert(0, b"CLAUDE_AGENT_NAME=" + identity.encode())
+    (d / "environ").write_bytes(b"\x00".join(entries) + b"\x00")
+    return str(tmp_path)
+
+
+def test_env_identity_wins_over_poisoned_role_tag(tmp_path):
+    # The bead's core: @sable_role=lincoln is poisoned onto a pane whose process
+    # is really optimus. Authority resolves to the ENV, not the tag.
+    proc = _proc_with_identity(tmp_path, 4242, "optimus")
+    run = _fake_tmux(4242, role_tag="lincoln")
+    assert spl.pane_process_identity(["tmux"], "%1", run=run, proc_root=proc) == "optimus"
+    assert spl.resolve_pane_identity(["tmux"], "%1", run=run, proc_root=proc) == "optimus"
+    # ...and the disagreement is flagged as a poisoned tag for the claimed role
+    assert spl.tag_is_poisoned(["tmux"], "%1", "lincoln", run=run, proc_root=proc) is True
+
+
+def test_agreeing_tag_is_not_poisoned(tmp_path):
+    proc = _proc_with_identity(tmp_path, 7, "optimus")
+    run = _fake_tmux(7, role_tag="optimus")
+    assert spl.tag_is_poisoned(["tmux"], "%2", "optimus", run=run, proc_root=proc) is False
+
+
+def test_no_process_identity_falls_back_to_tag(tmp_path):
+    # A pane SABLE did not spawn (no CLAUDE_AGENT_NAME in its environ): the tag
+    # is the only signal, so resolution falls back to it and nothing is treated
+    # as poisoned (fail-open — delivery/reaping unchanged for such panes).
+    proc = _proc_with_identity(tmp_path, 99, identity=None)
+    run = _fake_tmux(99, role_tag="optimus")
+    assert spl.pane_process_identity(["tmux"], "%3", run=run, proc_root=proc) is None
+    assert spl.resolve_pane_identity(["tmux"], "%3", run=run, proc_root=proc) == "optimus"
+    assert spl.tag_is_poisoned(["tmux"], "%3", "lincoln", run=run, proc_root=proc) is False
+
+
+def test_pane_pid_fails_open_when_tmux_errors():
+    def boom(cmd):
+        raise FileNotFoundError("tmux not installed")
+    assert spl.pane_pid(["tmux"], "%9", run=boom) is None
+    assert spl.pane_process_identity(["tmux"], "%9", run=boom) is None
+
+
 if __name__ == "__main__":
     import sys
     import pytest as _p
