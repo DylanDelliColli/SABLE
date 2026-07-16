@@ -331,6 +331,7 @@ echo "  • Settings snippet ($(basename "$SNIPPET")) merged into $SETTINGS (exi
 echo "  • /sable-plan and /sable-execute become available after you restart the session."
 echo "  • Start your session:  sable-launch   (Lincoln only, wraps sable-tmux; managers spawn on demand)"
 echo "  • Disable anytime without uninstalling:  export SABLE_ORCHESTRATION=off"
+echo "  • Max concurrent workers (default 8):  export SABLE_MAX_WORKERS=<n>"
 echo "  • Uninstall:  sable-orchestration-install --$SCOPE --uninstall"
 echo
 echo "Change manifest ($BASE):"
