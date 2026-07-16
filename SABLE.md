@@ -958,6 +958,10 @@ print(json.dumps({
 
 **Why this hook matters:** Vague beads are the second most common source of wasted agent cycles. An agent dispatched with a bead that says "fix the comparison table" will spend 5+ minutes reading files to understand the problem. A bead that says "modify ComparisonDataTable.tsx:127 — the React.Fragment needs a key prop" lets the agent start immediately.
 
+#### Beyond the catalog: sable-doctor (installed-vs-repo drift)
+
+The six hooks above all run from whatever is installed at `~/.claude` — but none of them verify that the installed copy still matches the SABLE repo it was copied from. `install.sh` / `sable-orchestration-install` copy hooks, agent definitions, manager roles, the registry, and skills once; the repo keeps moving after that, and a stale install silently validates OLD code (hit live in SABLE-4ba, where 11 installed hooks were stale for a full run before anyone noticed). `bin/sable-doctor` (SABLE-1i6m) closes that gap: it sha256-compares every installed file against its repo source and reports `clean` / `MISSING` / `DRIFT`, naming the exact file and the `bash install.sh` refresh command. It's wired into `SessionStart` with `--quiet` (see `install.sh`'s hooks block), so drift surfaces as a one-line, non-fatal warning at the start of every session; run `sable-doctor` with no flags for the full report, or `sable-doctor --project` to check a project-scoped install instead of the global one.
+
 ### 5.4 Writing Your Own Hooks
 
 When adding behaviors to SABLE, ask:
@@ -1526,6 +1530,9 @@ Normal in swarm execution. The orchestrator resolves conflicts, or dispatches a 
 
 **Circular dependencies:**
 `bd blocked` will surface beads that are blocked by each other. Break the cycle by removing one dependency: re-read the beads and determine which one can actually proceed independently.
+
+**Stranded push (merge never notified):**
+The push-based `post-push-merge-notify` hook fires ON the push itself, so a push whose hook is unwired, races the remote's ref-update, or dies mid-flight leaves the branch merge-ready on origin with no `for-chuck` handoff bead ever filed — Chuck has no way to learn the work exists. `bin/sable-reconcile-handoffs` (SABLE-jfg6.3) is the mechanical backstop: it never sits on the push path, instead querying origin + beads directly and filing exactly one `for-chuck` bead per branch that is genuinely unmerged, whose work bead is closed or in-progress, has no handoff bead already naming it, and is past a settle window (default 10min, override via `$SABLE_RECONCILE_AGE_MIN`). Re-running it is safe — the filed bead itself is the idempotency key. `sable-orchestration-install` stages (never activates) a host timer — a systemd `--user` unit plus a cron fallback line — under `~/.claude/sable/reconcile-timer/` (SABLE-jfg6.5) so this sweep runs on a schedule instead of depending on someone remembering to invoke it by hand.
 
 ---
 
