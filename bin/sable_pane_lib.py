@@ -458,9 +458,14 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
     — a signal a still-queued capture can never present). Only if the poll budget
     elapses with the line still queued (or dropped) do we report False and let the
     caller degrade to the durable fallback — never worse than d21h, strictly
-    better whenever the running turn ends within the budget. No Enter is resent on
-    this leg: a queued line auto-submits when the turn ends, and a stray Enter
-    would risk a spurious blank turn.
+    better whenever the running turn ends within the budget. Enter is resent on
+    this leg ONLY when the pane has fallen IDLE with our line still sitting
+    UN-submitted in the editable composer (SABLE-l7uv): that line never became a
+    real queued line (its single Enter was absorbed in the busy->idle redraw) and
+    would never auto-submit, so it needs an Enter — safe because pane_idle proves
+    no turn is running. A genuinely-queued line sits behind a still-busy turn and
+    auto-submits on turn-end, so no Enter is sent for it (a stray Enter into a busy
+    pane risks a spurious blank turn).
 
     The fresh-pane dispatch (sable-spawn-worker) and manager kicks (sable-tmux /
     -spawn-manager) all wait_for_ready first, so their pane is idle at t0 and takes
@@ -490,12 +495,37 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
         # closed now (SABLE-d21h) — which filed a noise bead even when the queue
         # later submitted+landed — DELAY confirmation (SABLE-h0jw): poll until the
         # line PROVABLY became its own submitted turn, failing closed only on a
-        # budget timeout. No Enter is resent (a queued line auto-submits on
-        # turn-end; a stray Enter risks a spurious blank turn).
+        # budget timeout.
         for _ in range(max(1, tries)):
             sleep(interval)
-            if submitted_own_turn(capture(), snippet):
+            cap = capture()
+            if submitted_own_turn(cap, snippet):
                 return True
+            # SABLE-l7uv self-heal (the false-undelivered class msxj's footer path
+            # did NOT retire): the prior turn we were busy behind has ENDED (NO
+            # turn is running now — not pane_working) but our line is sitting
+            # UN-submitted in the now-EDITABLE composer (present, still in the box
+            # — dispatch_landed False). Its single busy-leg Enter was absorbed in
+            # the busy->idle redraw, so it never became a real queued line that
+            # auto-submits on turn-end and will NEVER submit on its own now (the
+            # SABLE-mgyh repro: full text stuck in lincoln's composer, no
+            # queued-messages footer). (Re)send Enter to submit it as its OWN turn.
+            #
+            # Note this must gate on `not pane_working` (a turn is running), NOT on
+            # pane_idle: pane_idle/pane_ready require an EMPTY prompt glyph line,
+            # which a composer HOLDING our text does not have — so pane_idle is
+            # False precisely when the text is stuck in the box. pane_working is the
+            # authoritative not-busy guard (SABLE-tz9f: catches an off-frame busy
+            # marker too), so a genuinely-queued line — which always sits behind a
+            # still-running turn — is excluded and keeps d21h's fail-closed-on-
+            # timeout. Provable-safe against the d21h phantom-confirm: no turn is
+            # running, so there is nothing to drop a queued line, and the Enter
+            # submits OUR non-empty box, not a blank turn. The next poll confirms
+            # via submitted_own_turn once the composer clears and the line lands.
+            if (not pane_working(cap) and _already_pending(cap, snippet)
+                    and not dispatch_landed(cap, snippet)):
+                if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
+                    return False
         return submitted_own_turn(capture(), snippet)
     for _ in range(max(1, tries)):
         sleep(interval)

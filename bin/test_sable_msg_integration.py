@@ -501,6 +501,94 @@ def test_idle_pane_redraw_race_reports_landed_not_undelivered(tmux_socket, tmp_p
     assert "delivered" in r.stderr
 
 
+# --- busy-at-t0 submit-race: text stuck in the editable composer (SABLE-l7uv) -
+# The false-undelivered class msxj's footer path did NOT retire. Repro (SABLE-
+# mgyh, explicitly "NOT the queued-behind-a-turn state"): the pane is BUSY at t0
+# (finishing the prior turn), so deliver_text takes the busy leg and sends Enter
+# exactly ONCE — that Enter is absorbed in the busy->idle redraw. The prior turn
+# then ends and our line is left sitting UN-submitted in the now-EDITABLE composer
+# with NO queued-messages footer, so it never auto-submits and submitted_own_turn
+# can never confirm it. Pre-fix the busy leg never resent Enter -> the poll budget
+# timed out -> false 'undelivered' while the full message sat visibly stuck.
+
+# A TUI stand-in that models exactly that posture. BUSY phase: a prior turn runs
+# ('esc to interrupt'); our typed line is read (its terminating Enter absorbed
+# here), stored, but NOT submitted, and the phase ends after BUSY_SECS. IDLE
+# phase: no turn running, the line sits in the EDITABLE composer ('❯ <line>') with
+# NO busy status and NO footer — it will NEVER submit on its own. Only a bare
+# Enter (the l7uv self-heal resend) submits it, recording it to REC_FILE once.
+_STUCK_BOX_TUI = r'''#!/usr/bin/env bash
+stuck=""
+busy=1
+END_AT=$((SECONDS + ${BUSY_SECS:-1}))
+while [ "$busy" = 1 ]; do
+  printf '\033[H\033[2J  Baking the prior turn (esc to interrupt)\n'
+  printf '\xe2\x9d\xaf %s\n' "$stuck"
+  if IFS= read -rsN1 -t 0.2 ch; then
+    case "$ch" in
+      $'\n'|$'\r'|'') : ;;                         # absorbed Enter — does nothing
+      *) IFS= read -r rest; stuck="$ch$rest" ;;     # our line + its (absorbed) Enter
+    esac
+  fi
+  if [ "$SECONDS" -ge "$END_AT" ]; then busy=0; fi
+done
+submitted=0
+while true; do
+  if [ "$submitted" = 0 ]; then
+    printf '\033[H\033[2J'
+    printf '\xe2\x9d\xaf %s\n' "$stuck"            # editable composer holding our text
+    printf '  ddc@host:~/wt\n'
+  fi
+  IFS= read -r line || break
+  if [ "$submitted" = 0 ] && [ -n "$stuck" ]; then
+    printf '%s\n' "$stuck" >> "$REC_FILE"          # bare Enter submitted the stuck line
+    submitted=1
+    printf '\033[H\033[2J'
+    printf '\xe2\x97\x8f %s\n' "$stuck"            # transcript echo (● <line>)
+    printf '\xe2\x9d\xaf \n'                        # empty composer prompt
+    printf '  ddc@host:~/wt\n'
+  fi
+done
+'''
+
+
+def _start_stuck_box_pane(sock, tmp_path, busy_secs):
+    """A pane running the stuck-editable-composer stand-in, tagged
+    @sable_role=optimus. Returns rec_file: the line submitted once the self-heal
+    Enter fires (empty pre-fix)."""
+    rec = tmp_path / "rec.txt"
+    script = tmp_path / "stuck_box_tui.sh"
+    script.write_text(_STUCK_BOX_TUI)
+    script.chmod(0o755)
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+          f"REC_FILE={rec} BUSY_SECS={busy_secs} bash {script}")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
+    return rec
+
+
+def test_busy_at_t0_text_stuck_in_editable_box_self_heals_and_delivers_l7uv(tmux_socket, tmp_path):
+    # THE SABLE-l7uv repro, end-to-end against a REAL tmux server + real sable-msg.
+    # Busy at t0 (BUSY_SECS clears within the poll budget), the single busy-leg
+    # Enter is absorbed, then the line sits stuck in the editable composer. The fix
+    # must resend Enter once the pane is no longer working, submitting the line
+    # (REC_FILE) and reporting DELIVERED. Pre-fix: rc != 0, REC_FILE empty, a
+    # durable fallback bead would be filed for a message left visibly stuck.
+    # AUTO_FALLBACK=0 keeps a (pre-fix) failure from writing a real inbox bead.
+    rec = _start_stuck_box_pane(tmux_socket, tmp_path, busy_secs=1)
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"],
+        capture_output=True, text=True,
+        env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
+             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "20",
+             "SABLE_MSG_POLL_INTERVAL": "0.25"},
+    )
+    assert "cap in force" in rec.read_text(), \
+        "the stuck line must have been submitted by the self-heal Enter"
+    assert r.returncode == 0, r.stderr           # self-heal -> delivered, no fallback
+    assert "delivered" in r.stderr
+
+
 # --- per-repo scoping (SABLE-e1e3.3): a fleet is addressed only by its repo ---
 
 def _make_fleet(sock, tmp_path, name, role="tarzan"):
