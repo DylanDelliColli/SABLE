@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# sable-test — run a test command and, ONLY on a green (exit 0) result, record
+# TDD evidence at the shared evidence key (SABLE-jfg6.4 / contract D4).
+#
+# This is the evidence seam SABLE owns for session types that fire NO hooks
+# (Agent-subagent / gc-managed; research F3, Claude Code #34692 WONTFIX). In
+# those envs tdd-evidence.sh never fires, so a genuine green run leaves no
+# evidence and tdd-gate.sh false-blocks the close. The worker runs its suite
+# THROUGH this wrapper instead, so the evidence exists regardless. The key is
+# derived by lib-evidence-key.sh — the SAME derivation tdd-gate.sh reads — so
+# the writer and reader can never drift (the tfkv mismatch class).
+#
+# Contract:
+#   * runs the given command verbatim, streaming its stdout/stderr through;
+#   * propagates the command's EXACT exit code;
+#   * writes the evidence file ONLY on exit 0. A red run writes NOTHING —
+#     false-permissive (green evidence for a failed suite) is the catastrophic
+#     failure mode, so the write is strictly gated on success.
+#
+# Usage:
+#   sable-test <test-command> [args...]
+#   sable-test bash hooks/test/test-foo.sh
+#   sable-test pytest tests/ -x
+
+set -uo pipefail
+
+usage() {
+  cat <<'EOF'
+sable-test — run a test command; on a green (exit 0) result, record TDD
+evidence at the shared evidence key so tdd-gate.sh allows the close.
+
+Usage:
+  sable-test <test-command> [args...]
+
+A red run propagates the command's exit code and writes NO evidence.
+EOF
+}
+
+if [ $# -lt 1 ]; then
+  usage >&2
+  exit 2
+fi
+
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# Resolve this script's PHYSICAL dir (follow the symlink chain) so we source the
+# repo's lib even when invoked through an installed ~/.local/bin symlink
+# (sable-bin-install links it) — same pattern as sable-bin-install (SABLE-5p2).
+SOURCE="${BASH_SOURCE[0]:-$0}"
+while [ -h "$SOURCE" ]; do
+  _dir="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  case "$SOURCE" in /*) ;; *) SOURCE="$_dir/$SOURCE" ;; esac
+done
+BIN_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+LIB="$BIN_DIR/../hooks/multi-manager/lib-evidence-key.sh"
+
+if [ -r "$LIB" ]; then
+  # shellcheck source=../hooks/multi-manager/lib-evidence-key.sh
+  . "$LIB"
+fi
+
+# Run the test command, propagating its exit code (no `set -e`, so a red run is
+# captured, not aborted, and its code flows to the final `exit`).
+"$@"
+rc=$?
+
+if [ "$rc" -eq 0 ]; then
+  if command -v sable_evidence_key >/dev/null 2>&1; then
+    # sid/aid from the environment (the hccq trap: CLAUDE_SESSION_ID may be
+    # absent — the lib then derives a deterministic ppid fallback key). We never
+    # substitute CLAUDE_CODE_SESSION_ID for a missing CLAUDE_SESSION_ID: that is
+    # the mismatch source the shared lib exists to avoid.
+    SID="${CLAUDE_SESSION_ID:-}"
+    AID="${CLAUDE_AGENT_ID:-}"
+    EVIDENCE_FILE=$(sable_evidence_key "$SID" "$AID")
+    REPO_TAG=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    TS="$(date -Iseconds 2>/dev/null || date 2>/dev/null || echo '?')"
+    printf '%s REPO=%s CMD=%s\n' "$TS" "$REPO_TAG" "$*" >> "$EVIDENCE_FILE" 2>/dev/null || true
+  else
+    printf 'sable-test: WARNING — lib-evidence-key.sh not found at %s; wrote NO evidence (close may be blocked)\n' "$LIB" >&2
+  fi
+fi
+
+exit "$rc"

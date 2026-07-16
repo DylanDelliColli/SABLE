@@ -441,6 +441,56 @@ else
 fi
 rm -f "$F6AW_EV"
 
+# ---------- SABLE-jfg6.4 (D4): key-agreement invariant across BOTH consumers ----------
+# tdd-gate.sh (reader) and tdd-evidence.sh (writer) now derive the evidence path
+# from ONE shared function (lib-evidence-key.sh). Same input => identical path,
+# so a real green run recorded by the writer always unblocks the reader, and an
+# empty session id can never split them onto different paths. Present AND absent
+# session; the absent case exercises the ppid fallback. All writer/reader
+# invocations here are bare STATEMENTS (reader output captured via a temp file,
+# NOT a $(...)-wrapped pipeline — that forks an extra subshell and shifts the
+# hook's $PPID), so writer and reader share this shell's $PPID: the real-world
+# sibling-of-one-session-controller invariant, hence the same absent-session key.
+D4_LIB="$(cd "$(dirname "$0")/.." && pwd)/multi-manager/lib-evidence-key.sh"
+D4_EVHOOK="$(cd "$(dirname "$0")/.." && pwd)/tdd-evidence.sh"
+d4_key() { bash -c '. "$0"; sable_evidence_key "$1" "$2"' "$D4_LIB" "$1" "$2"; }
+
+# Lib-level forms (this file's verify target must stand alone).
+K1=$(d4_key "s1" "a1"); if [ "$K1" = "/tmp/tdd-evidence-s1-a1" ]; then pa_pass "D4 gate-lib: (sid,aid) form"; else pa_fail "D4 gate-lib: (sid,aid) form" "got [$K1]"; fi
+K2=$(d4_key "s1" "");   if [ "$K2" = "/tmp/tdd-evidence-s1" ];     then pa_pass "D4 gate-lib: (sid only) form"; else pa_fail "D4 gate-lib: (sid only) form" "got [$K2]"; fi
+K3=$(d4_key "" "");     case "$K3" in /tmp/tdd-evidence-ppid-*) pa_pass "D4 gate-lib: absent sid -> ppid fallback" ;; *) pa_fail "D4 gate-lib: absent sid -> ppid fallback" "got [$K3]" ;; esac
+
+# Cross-consumer PRESENT session: writer records, reader allows the close.
+D4P_SID="tdd-d4present-$$-$RANDOM"
+rm -f "/tmp/tdd-evidence-${D4P_SID}"
+make_input "pytest tests/" "$D4P_SID" | bash "$D4_EVHOOK" >/dev/null 2>&1 || true
+D4P_TMP=$(mktemp)
+make_input 'bd close SABLE-stub SABLE-other' "$D4P_SID" | env PATH="$STUB_DIR:$PATH" bash "$HOOK" > "$D4P_TMP" 2>/dev/null
+D4P_OUT=$(cat "$D4P_TMP"); rm -f "$D4P_TMP"
+if [ -z "$D4P_OUT" ]; then pa_pass "D4 agreement (present): writer evidence unblocks the reader for the same session"; else pa_fail "D4 agreement (present)" "gate denied: $D4P_OUT"; fi
+rm -f "/tmp/tdd-evidence-${D4P_SID}"
+
+# Cross-consumer ABSENT session: writer + reader share $PPID, so the reader
+# allows on the writer's ppid-key evidence — the tfkv fix in the hccq trap.
+D4A_KEY=$(d4_key "" "")
+rm -f "$D4A_KEY"
+make_input "pytest tests/" "" | bash "$D4_EVHOOK" >/dev/null 2>&1 || true
+D4A_TMP=$(mktemp)
+make_input 'bd close SABLE-stub SABLE-other' "" | env PATH="$STUB_DIR:$PATH" bash "$HOOK" > "$D4A_TMP" 2>/dev/null
+D4A_OUT=$(cat "$D4A_TMP"); rm -f "$D4A_TMP"
+if [ -z "$D4A_OUT" ]; then pa_pass "D4 agreement (absent): writer + reader agree on the ppid key -> close allowed"; else pa_fail "D4 agreement (absent)" "gate denied: $D4A_OUT; key=[$D4A_KEY] exists=$([ -s "$D4A_KEY" ] && echo yes || echo no)"; fi
+rm -f "$D4A_KEY"
+
+# Absent-session NEGATIVE space: no writer run -> reader still DENIES (the gate
+# does not go permissive just because the session id is absent).
+D4N_KEY=$(d4_key "" "")
+rm -f "$D4N_KEY"
+D4N_TMP=$(mktemp)
+make_input 'bd close SABLE-stub SABLE-other' "" | env PATH="$STUB_DIR:$PATH" bash "$HOOK" > "$D4N_TMP" 2>/dev/null
+D4N_OUT=$(cat "$D4N_TMP"); rm -f "$D4N_TMP"
+if echo "$D4N_OUT" | grep -q '"permissionDecision": "deny"'; then pa_pass "D4 negative (absent): no evidence at the derived key -> reader DENIES"; else pa_fail "D4 negative (absent)" "got: ${D4N_OUT:-<empty>}"; fi
+rm -f "$D4N_KEY"
+
 # ---------- Summary ----------
 
 echo
