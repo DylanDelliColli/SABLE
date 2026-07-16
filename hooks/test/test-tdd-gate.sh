@@ -366,6 +366,72 @@ else
 fi
 rm -rf "$CR_STUB_DIR"
 
+# ---------- SABLE-yh1o: companion-repo glob must not leak across sessions
+# when SESSION_ID is empty ----------
+# The companion-repo block used to interpolate the raw (possibly-empty)
+# SESSION_ID straight into a glob: /tmp/tdd-evidence-"${SESSION_ID}"*. With
+# SESSION_ID empty (the hccq absent-session trap jfg6.4 hardened the
+# exact-key path against) that glob expanded to /tmp/tdd-evidence-* — EVERY
+# session's evidence on the box — so an absent-session close of a
+# companion-declared bead could be satisfied by an unrelated session's
+# REPO= line. Fix: derive the glob base via sable_evidence_key (the same
+# helper the exact-key check uses) so an absent session gets its own
+# deterministic ppid-scoped base instead of the empty-string wildcard.
+
+CY_STUB_DIR=$(mktemp -d)
+cat > "$CY_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"market-brief-package-companion","notes":"Companion repo: /home/ddc/dev-environment/SABLE"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$CY_STUB_DIR/bd"
+CY_CLOSE='bd close market-brief-package-companion market-brief-package-other'
+
+# (a) regression guard: REPO=-tagged evidence lives under a DIFFERENT,
+# non-empty session id. An empty-SESSION_ID close of the companion bead
+# must NOT be satisfied by it (pre-fix, the raw glob matched it).
+CY_OTHER_SID="tdd-gate-unrelated-$$-$RANDOM"
+CY_OTHER_EV="/tmp/tdd-evidence-${CY_OTHER_SID}"
+rm -f "$CY_OTHER_EV"
+echo "$(date -Iseconds) REPO=/home/ddc/dev-environment/SABLE CMD=pytest" > "$CY_OTHER_EV"
+CY_OUT=$(make_input "$CY_CLOSE" "" | env PATH="$CY_STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null)
+if echo "$CY_OUT" | grep -q '"permissionDecision": "deny"'; then
+  pa_pass "companion-repo glob (SABLE-yh1o): empty SESSION_ID does NOT match an unrelated session's REPO= evidence"
+else
+  pa_fail "companion-repo glob (SABLE-yh1o): empty SESSION_ID must not match unrelated session evidence" "got: ${CY_OUT:-<empty>}"
+fi
+rm -f "$CY_OTHER_EV"
+
+# (b) positive control: evidence recorded at THIS absent-session's own
+# ppid-derived key still satisfies the close — the fix must scope the
+# glob, not blanket-deny every absent-session companion close. Use the
+# REAL writer (tdd-evidence.sh) and invoke both writer and reader as bare
+# pipes directly in this script (not $(...)-wrapped) so they compute
+# $PPID the same way — the SABLE-jfg6.4 D4 agreement pattern below.
+CY_LIB="$(cd "$(dirname "$0")/.." && pwd)/multi-manager/lib-evidence-key.sh"
+CY_EVHOOK="$(cd "$(dirname "$0")/.." && pwd)/tdd-evidence.sh"
+cy_key() { bash -c '. "$0"; sable_evidence_key "$1" "$2"' "$CY_LIB" "$1" "$2"; }
+CY_PPID_KEY=$(cy_key "" "")
+rm -f "$CY_PPID_KEY"
+
+make_input "cd /home/ddc/dev-environment/SABLE && pytest tests/" "" | bash "$CY_EVHOOK" >/dev/null 2>&1 || true
+
+CY_TMP=$(mktemp)
+make_input "$CY_CLOSE" "" | env PATH="$CY_STUB_DIR:$PATH" bash "$HOOK" > "$CY_TMP" 2>/dev/null
+CY_OUT2=$(cat "$CY_TMP"); rm -f "$CY_TMP"
+if [ -z "$CY_OUT2" ]; then
+  pa_pass "companion-repo glob (SABLE-yh1o): empty SESSION_ID still matches THIS session's own ppid-scoped REPO= evidence"
+else
+  pa_fail "companion-repo glob (SABLE-yh1o): empty SESSION_ID matches own ppid-scoped evidence" "got: ${CY_OUT2:-<empty>}; key=[$CY_PPID_KEY] exists=$([ -s "$CY_PPID_KEY" ] && echo yes || echo no)"
+fi
+rm -f "$CY_PPID_KEY"
+rm -rf "$CY_STUB_DIR"
+
 # ---------- SABLE-h853: scoped-run protocol acceptance ----------
 # Operator-approved protocol change (2026-07-13): the full suite no longer
 # runs pre-push per worker; workers submit SCOPED evidence (the bead's test
