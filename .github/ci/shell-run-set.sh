@@ -73,6 +73,7 @@ ALLOW=(
   test-sable-onboarding-skill.sh
   test-sable-plan-tiers.sh
   test-sable-skills.sh
+  test-sable-test.sh
   test-script-dir-symlink.sh
   test-session-role-anchor.sh
   test-sherlock-research.sh
