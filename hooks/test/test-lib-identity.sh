@@ -724,6 +724,44 @@ resolve_testcmd_test "sable_resolve_test_command: empty repo path with no env re
   "" "" ""
 
 # --------------------------------------------------------------------------
+# sable_resolve_test_timeout unit tests (SABLE-pf0g)
+# Mirrors sable_resolve_test_command's precedence: repo-local git config wins
+# over the checked-in .sable file wins over the legacy env override wins over
+# the hardcoded "60" default.
+# --------------------------------------------------------------------------
+resolve_timeout_test() {
+  local label="$1" repo="$2" env_assignments="$3" expect="$4" got
+  got=$(env -u SABLE_PRE_PUSH_TEST_TIMEOUT $env_assignments bash -c "source '$LIB'; sable_resolve_test_timeout '$repo'")
+  if [ "$got" = "$expect" ]; then
+    pass "$label"
+  else
+    fail "$label" "expected [$expect] got [$got]"
+  fi
+}
+
+resolve_timeout_test "sable_resolve_test_timeout: no config anywhere returns default 60" \
+  "$INT_REPO" "" "60"
+
+resolve_timeout_test "sable_resolve_test_timeout: falls back to SABLE_PRE_PUSH_TEST_TIMEOUT env" \
+  "$INT_REPO" "SABLE_PRE_PUSH_TEST_TIMEOUT=90" "90"
+
+echo "testTimeout=150" > "$INT_REPO/.sable"
+resolve_timeout_test "sable_resolve_test_timeout: .sable file wins over session env" \
+  "$INT_REPO" "SABLE_PRE_PUSH_TEST_TIMEOUT=90" "150"
+
+git -C "$INT_REPO" config sable.testTimeout 200
+resolve_timeout_test "sable_resolve_test_timeout: repo-local git config wins over .sable file" \
+  "$INT_REPO" "" "200"
+git -C "$INT_REPO" config --unset sable.testTimeout
+rm -f "$INT_REPO/.sable"
+
+resolve_timeout_test "sable_resolve_test_timeout: empty repo path falls back to env" \
+  "" "SABLE_PRE_PUSH_TEST_TIMEOUT=90" "90"
+
+resolve_timeout_test "sable_resolve_test_timeout: empty repo path with no env returns default 60" \
+  "" "" "60"
+
+# --------------------------------------------------------------------------
 # sable_resolve_push_repo_dir unit tests (SABLE-041)
 # Resolves the effective git dir from a push command's `git -C <path>`,
 # applied to the shell cwd with git semantics; falls back to cwd when absent.

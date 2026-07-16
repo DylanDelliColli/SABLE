@@ -267,6 +267,34 @@ git -C "$REPO_DIR" config --unset sable.testCommand
 
 rm -f "$REPO_DIR/.sable"
 
+# ---------- testTimeout resolution tests (SABLE-pf0g) ----------
+# pre-push-rebase-test.sh previously read TEST_TIMEOUT only from
+# $SABLE_PRE_PUSH_TEST_TIMEOUT with no per-repo override — a genuinely
+# passing test suite that legitimately needs more than the 60s default
+# (e.g. under fleet contention) had no way to raise it for a single repo.
+# sable_resolve_test_timeout (lib-identity.sh) now also honors a repo-local
+# git config / checked-in .sable file; these tests prove the HOOK wires that
+# resolution into phase 3 end to end (the lib function itself is covered
+# separately in test-lib-identity.sh).
+SABLE_TIMEOUT_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true SABLE_PRE_PUSH_TEST_TIMEOUT=1"
+echo "testCommand=sleep 2 && exit 0" > "$REPO_DIR/.sable"
+
+# Test 11e: with only the 1s env default in effect, a test command that takes
+# 2s is killed by `timeout` → phase 3 denies citing the exceeded timeout.
+assert_deny "no per-repo override → 1s env default kills a 2s test command" \
+  "$SABLE_TIMEOUT_ENV" "git push" "$REPO_DIR" "exceeded the"
+
+# Test 11f: repo-local git config sable.testTimeout=5 overrides the 1s env
+# default → the same 2s test command now completes inside the window and the
+# push is allowed (proves the config override reaches the hook's `timeout`
+# call, not just the resolver function in isolation).
+git -C "$REPO_DIR" config sable.testTimeout 5
+assert_allow "repo-local git config testTimeout overrides 1s env default → 2s test command completes" \
+  "$SABLE_TIMEOUT_ENV" "git push" "$REPO_DIR"
+git -C "$REPO_DIR" config --unset sable.testTimeout
+
+rm -f "$REPO_DIR/.sable"
+
 # ---------- Shared matcher tests (SABLE-jpr / SABLE-0u1) ----------
 # The pre-push gate must fire for real git push variants (positives) and
 # must NOT fire for commands where "git push" only appears as a quoted string
