@@ -120,6 +120,31 @@ else
 fi
 rm -rf "$HS" "$HP"
 
+# ---------- SABLE-7oj5: generated units carry a resolved bd env, not bare PATH lookup ----------
+SVC="$P/.claude/sable/reconcile-timer/sable-reconcile-timer.service"
+CRON="$P/.claude/sable/reconcile-timer/sable-reconcile-timer.cron"
+bd_env_val="$(grep -o 'Environment=SABLE_RC_BD=.*' "$SVC" | cut -d= -f3-)"
+if [ -n "$bd_env_val" ]; then
+  pass "project: .service carries Environment=SABLE_RC_BD=<path>"
+else
+  fail "project: .service carries Environment=SABLE_RC_BD=<path>"
+fi
+if [ -n "$bd_env_val" ] && [ -x "$bd_env_val" ]; then
+  pass "project: .service's SABLE_RC_BD points at a real executable at generation time"
+else
+  fail "project: .service's SABLE_RC_BD points at a real executable at generation time" "path=$bd_env_val"
+fi
+if grep -q '^Environment=PATH=' "$SVC"; then
+  pass "project: .service carries a fallback Environment=PATH= line"
+else
+  fail "project: .service carries a fallback Environment=PATH= line"
+fi
+if grep -q "SABLE_RC_BD=\"$bd_env_val\"" "$CRON"; then
+  pass "project: .cron line sets SABLE_RC_BD consistently with the .service"
+else
+  fail "project: .cron line sets SABLE_RC_BD consistently with the .service"
+fi
+
 # env override of the cadence
 P_CADENCE="$(mktemp -d)"
 SABLE_PROJECT_DIR="$P_CADENCE" SABLE_RECONCILE_INTERVAL_MIN=5 bash "$INSTALLER" --project >/dev/null 2>&1

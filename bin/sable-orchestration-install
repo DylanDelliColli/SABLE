@@ -281,12 +281,39 @@ install_reconcile_timer() {
     local tmp
     tmp="$(mktemp -d)"
 
+    # SABLE-7oj5: systemd --user and cron both run with a bare default PATH
+    # (no shell rc, no nvm) — resolve bd's absolute path from the INSTALLING
+    # shell (which has the real PATH) and bake it into the generated units so
+    # sable-reconcile-handoffs's bare 'bd' call (bin/sable-reconcile-handoffs's
+    # _tool("SABLE_RC_BD", "bd")) resolves regardless of the execution env.
+    # Re-run install after an nvm/node version change to refresh this path.
+    local bd_path bd_dir
+    bd_path="$(command -v bd 2>/dev/null || true)"
+    bd_dir=""
+    local bd_env_line="" cron_bd_env=""
+    if [ -n "$bd_path" ]; then
+        bd_dir="$(dirname "$bd_path")"
+        bd_env_line="Environment=SABLE_RC_BD=${bd_path}"
+        cron_bd_env="SABLE_RC_BD=\"${bd_path}\" "
+    else
+        echo "WARNING: 'bd' not found on PATH at install time — generated" \
+             "reconcile-timer units will NOT set SABLE_RC_BD and may fail" \
+             "with FileNotFoundError under systemd/cron's minimal PATH." >&2
+    fi
+    # Fallback PATH: standard system dirs plus bd's own dir, NOT the full
+    # installing shell's PATH (which drags in dev-machine cruft — plugin
+    # caches, Windows /mnt/c mounts — that has no place in a service unit).
+    local fallback_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    [ -n "$bd_dir" ] && fallback_path="${bd_dir}:${fallback_path}"
+
     cat > "$tmp/sable-reconcile-timer.service" <<EOF
 [Unit]
 Description=SABLE reconciliation floor sweep (SABLE-jfg6.5 / D3 TIMER LEG)
 
 [Service]
 Type=oneshot
+${bd_env_line}
+Environment=PATH=${fallback_path}
 ExecStart=%h/.local/bin/sable-reconcile-timer --once --repo ${target_repo}
 EOF
 
@@ -308,7 +335,7 @@ EOF
 # SABLE reconciliation floor sweep (SABLE-jfg6.5 / D3 TIMER LEG) — cron
 # fallback for hosts without systemd --user (e.g. macOS). Append to your
 # crontab with: (crontab -l 2>/dev/null; cat this-file) | crontab -
-*/${cadence} * * * * PATH="\$PATH:\$HOME/.local/bin" sable-reconcile-timer --once --repo ${target_repo} >> "\$HOME/.cache/sable/reconcile-timer.log" 2>&1
+*/${cadence} * * * * PATH="\$PATH:\$HOME/.local/bin:${bd_dir}" ${cron_bd_env}sable-reconcile-timer --once --repo ${target_repo} >> "\$HOME/.cache/sable/reconcile-timer.log" 2>&1
 EOF
 
     install_file "$tmp/sable-reconcile-timer.service" "$dir/sable-reconcile-timer.service" "sable/reconcile-timer/sable-reconcile-timer.service"
