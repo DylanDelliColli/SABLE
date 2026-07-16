@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""sable-reconcile-handoffs — the pull-based reconciliation floor (SABLE-jfg6.3 / D3).
+
+The push-based `post-push-merge-notify` hook fires ON the push, so any push whose
+hook is unwired, races the remote's ref-update, or dies mid-flight leaves a merge
+STRANDED: the branch is on origin, the work is done, but no `for-chuck` handoff
+ever reached Chuck (research F4 — push-based notify provably misses). This tool is
+the backstop for exactly that class: it does NOT sit on the push path, it QUERIES
+the systems of record (origin + beads) and reconciles what it finds
+(Anthropic's own "query systems of record and reconcile" pattern; TRADEOFFS #2).
+It promotes chuck.md's prose stranded-recovery sweep (chuck.md §Boundaries) to code.
+
+STRANDED PREDICATE (a branch is stranded iff ALL FOUR hold):
+  1. origin's `wk-*` branch tip is NOT an ancestor of the integration branch
+     (i.e. genuinely unmerged — `git merge-base --is-ancestor` exit 1).
+  2. its work bead (id parsed from the branch name, else `bd search`) is
+     closed or in_progress (real, done-or-in-flight work — never an experiment).
+  3. NO open/in-progress `for-chuck` bead already NAMES the branch (the handoff
+     was filed — by the hook OR a prior run of this tool). This is the
+     idempotency key: our own filed bead names the branch, so a re-run finds it
+     here and skips.
+  4. the branch tip's push-age exceeds a threshold (default 10min, override via
+     $SABLE_RECONCILE_AGE_MIN) — a settle window so a just-pushed branch whose
+     hook handoff is still in flight is not raced.
+
+Integration-branch identity is resolved through the SAME resolver the pre-push
+hook and sable-merge-gate use post-SABLE-dtp1 (imported from bin/sable-merge-gate:
+resolve_integration_branch) — never a hardcoded main/tmux-only, so ancestry is
+judged against the branch this repo actually integrates onto.
+
+ACTION: for each stranded branch, file ONE `for-chuck,coord` bead whose title
+names the branch. Chuck merges it from the pool exactly as he would a
+hook-filed handoff.
+
+BOUNDARIES (hard):
+  * Files beads ONLY. NEVER merges, NEVER pushes code, NEVER deletes branches —
+    the chuck-only push/merge lanes are preserved untouched.
+  * Every `bd` WRITE is `--sandbox` (disables bd's Dolt auto-push, exactly as the
+    hook does — SABLE-rq9k; Chuck's batched pull+push carries the bead to the
+    shared remote, keeping dolt-push chuck-only).
+  * `--dry-run` classifies + prints + files NOTHING + exits 0.
+
+Environment seams (overridable; defaults are the production commands so the flow
+is unit-testable without real git / bd):
+  SABLE_RC_REPO   repo path (default $PWD)         SABLE_RC_GIT     (git)
+  SABLE_RC_REMOTE remote name (origin)             SABLE_RC_BD      (bd)
+  SABLE_RECONCILE_AGE_MIN  push-age threshold, minutes (10)
+
+Usage:
+  sable-reconcile-handoffs [--repo PATH] [--remote NAME] [--age-min N] [--dry-run]
+  sable-reconcile-handoffs --help
+
+Exit codes:
+  0  swept (beads filed, or dry-run, or nothing stranded)
+  2  usage error
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+# --------------------------------------------------------------------------
+# Reuse the merge-gate resolver + ref-qualifier — SINGLE SOURCE OF TRUTH.
+# resolve_integration_branch is the SABLE-dtp1 resolver the pre-push hook and
+# sable-merge-gate already agree on (git config sable.integrationBranch > .sable
+# file > env > "main"); importing it (never re-implementing) guarantees this
+# floor judges ancestry against the SAME integration branch the rest of the
+# fleet targets. qualify_remote_ref carries the SABLE-92kc anti-ambiguity guard.
+# --------------------------------------------------------------------------
+_MG_PATH = Path(__file__).resolve().parent / "sable-merge-gate"
+_MG_LOADER = SourceFileLoader("sable_merge_gate", str(_MG_PATH))
+_MG_SPEC = importlib.util.spec_from_loader("sable_merge_gate", _MG_LOADER)
+_smg = importlib.util.module_from_spec(_MG_SPEC)
+_MG_LOADER.exec_module(_smg)
+
+resolve_integration_branch = _smg.resolve_integration_branch
+qualify_remote_ref = _smg.qualify_remote_ref
+
+
+# --------------------------------------------------------------------------
+# Pure predicates (unit-tested directly — no git/bd required)
+# --------------------------------------------------------------------------
+
+def is_wk_branch(branch: str) -> bool:
+    """Worker branches are `wk-*`. Only these are candidates — a manager's own
+    push or the integration branch itself is never reconciled here."""
+    return branch.startswith("wk-")
+
+
+def ancestor_rc_is_unmerged(rc: int) -> bool:
+    """Predicate 1. `git merge-base --is-ancestor <branch> <base>` exits 0 when
+    the branch IS an ancestor (already merged) and 1 when it is NOT (unmerged).
+    Only a clean rc==1 counts as unmerged — any other code (128 on a bad ref,
+    etc.) is an UNRESOLVED classification, so we conservatively treat the branch
+    as not-stranded rather than invent merge work off a git error."""
+    return rc == 1
+
+
+def work_bead_qualifies(status: str | None) -> bool:
+    """Predicate 2. The branch's work bead must be closed (work finished) or
+    in_progress (a landed-mid-flight worker) to count as real merge work. An
+    absent bead (None), an open/blocked/deferred bead, or anything else does not
+    qualify — the branch may be an abandoned experiment, and this floor never
+    invents merge work no worker actually completed."""
+    return status in ("closed", "in_progress")
+
+
+def title_names_branch(title: str | None, branch: str) -> bool:
+    """Predicate 3's core: does a `for-chuck` bead TITLE name this exact branch?
+    Matched on a delimited-token boundary so `wk-foo` in a title does NOT match a
+    bead about `wk-foobar` (branch chars are alnum plus - . / _). This is the
+    idempotency key — our own filed title carries the branch, so a re-run sees it
+    here and skips a duplicate."""
+    if not title:
+        return False
+    pat = r"(?:^|[^\w./-])" + re.escape(branch) + r"(?:$|[^\w./-])"
+    return re.search(pat, title) is not None
+
+
+def branch_named_by_open_for_chuck(open_beads: list[dict], branch: str) -> bool:
+    """Predicate 3. True iff any open/in-progress `for-chuck` bead's title names
+    the branch (a hook-filed handoff OR a prior reconciliation)."""
+    return any(title_names_branch(b.get("title"), branch) for b in open_beads)
+
+
+def age_exceeds_threshold(age_seconds: float, threshold_minutes: float) -> bool:
+    """Predicate 4. Strict `>`: a branch AT the threshold is still inside the
+    settle window and is left for the next sweep (mirrors is_orphan's strict-`>`
+    in sable-merge-gate so the boundary is unambiguous)."""
+    return age_seconds > threshold_minutes * 60.0
+
+
+_BEAD_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]+(?:\.[0-9]+)*")
+
+
+def parse_bead_id(branch: str) -> str | None:
+    """Best-effort bead id embedded in a branch name. Strips a leading `wk-`
+    worktree prefix, then returns the first bead-id-shaped token (e.g.
+    `wk-SABLE-jfg6.3` -> `SABLE-jfg6.3`). Returns None when nothing id-shaped
+    remains. A token that isn't a real bead id just makes the downstream
+    `bd show` miss and fall through to `bd search` — harmless."""
+    core = branch
+    for pfx in ("wk-", "worktree-"):
+        if core.startswith(pfx):
+            core = core[len(pfx):]
+            break
+    m = _BEAD_ID_RE.search(core)
+    return m.group(0) if m else None
+
+
+def status_from_show_json(text: str) -> str | None:
+    """Status out of a `bd show <id> --json` payload — accepts either a bare
+    object or a single-element list (bd returns a list), None on any parse
+    failure or empty result."""
+    try:
+        d = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(d, list):
+        d = d[0] if d else None
+    return d.get("status") if isinstance(d, dict) else None
+
+
+def first_status_from_search_json(text: str) -> str | None:
+    """Status of the first hit in a `bd search --json` payload (a list), None if
+    empty/unparseable."""
+    try:
+        d = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(d, dict):
+        d = [d]
+    if isinstance(d, list) and d and isinstance(d[0], dict):
+        return d[0].get("status")
+    return None
+
+
+def reconcile_bead_title(branch: str) -> str:
+    """The filed bead's title. The branch name is the idempotency key
+    (predicate 3 / title_names_branch), so it MUST appear here, delimited."""
+    return f"[RECONCILE] stranded merge: {branch} — no for-chuck handoff on record"
+
+
+def reconcile_bead_description(branch: str, work_status: str | None) -> str:
+    return (
+        "Filed by sable-reconcile-handoffs (SABLE-jfg6.3 / D3), the pull-based "
+        "reconciliation floor: this branch is pushed to origin and UNMERGED, its "
+        f"work bead is {work_status}, and NO for-chuck bead named it — the "
+        "push-based post-push-merge-notify handoff never reached Chuck (research "
+        "F4 notify-miss). Treat exactly as a hook-filed handoff.\n"
+        f"\nBranch: {branch}\n"
+        "\n## Acceptance Criteria\n"
+        "- Inspect the branch on origin and merge into the integration branch "
+        "(or hold with reason)\n"
+        "- Close this bead on merge\n"
+    )
+
+
+# --------------------------------------------------------------------------
+# Command plumbing (env-seam overridable — mirrors sable-merge-gate)
+# --------------------------------------------------------------------------
+
+def _tool(env_name: str, default: str) -> list[str]:
+    return os.environ.get(env_name, default).split()
+
+
+def _run(argv: list[str], *, cwd: str, check: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        argv, cwd=cwd, text=True, check=check,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+
+
+def _git(repo: str, *args: str, check: bool = False) -> subprocess.CompletedProcess:
+    return _run(_tool("SABLE_RC_GIT", "git") + list(args), cwd=repo, check=check)
+
+
+def _bd(repo: str, *args: str, check: bool = False) -> subprocess.CompletedProcess:
+    return _run(_tool("SABLE_RC_BD", "bd") + list(args), cwd=repo, check=check)
+
+
+# --------------------------------------------------------------------------
+# Systems-of-record queries (git + beads, behind the pure predicates)
+# --------------------------------------------------------------------------
+
+def list_origin_wk_branches(repo: str, remote: str) -> list[str]:
+    """Bare `wk-*` branch names published on <remote>, from the local
+    remote-tracking refs (caller fetch --prune's first). The remote/ prefix is
+    stripped so downstream qualify_remote_ref sees a bare name."""
+    cp = _git(repo, "for-each-ref", "--format=%(refname:short)",
+              f"refs/remotes/{remote}/wk-*", check=False)
+    if cp.returncode != 0:
+        return []
+    out: list[str] = []
+    prefix = f"{remote}/"
+    for line in cp.stdout.splitlines():
+        short = line.strip()
+        if not short:
+            continue
+        name = short[len(prefix):] if short.startswith(prefix) else short
+        if is_wk_branch(name):
+            out.append(name)
+    return out
+
+
+def branch_ancestor_rc(repo: str, remote: str, branch: str, integration_branch: str) -> int:
+    """`git merge-base --is-ancestor origin/<branch> origin/<integration>` return
+    code (0 merged, 1 unmerged, other error). Both refs fully qualified via the
+    reused qualify_remote_ref anti-ambiguity guard."""
+    branch_ref = qualify_remote_ref(remote, branch)
+    base_ref = qualify_remote_ref(remote, integration_branch)
+    cp = _git(repo, "merge-base", "--is-ancestor", branch_ref, base_ref, check=False)
+    return cp.returncode
+
+
+def branch_tip_age_seconds(repo: str, remote: str, branch: str, now: float) -> float | None:
+    """Push-age proxy: (now - committer date of origin/<branch> tip). The commit
+    time is the only push-age signal cheaply available from a fetched
+    remote-tracking ref (mirrors sable-merge-gate sweep's committerdate keying).
+    None on any resolution failure — an unresolvable age fails predicate 4."""
+    ref = qualify_remote_ref(remote, branch)
+    cp = _git(repo, "log", "-1", "--format=%ct", ref, check=False)
+    if cp.returncode != 0:
+        return None
+    try:
+        return now - float(cp.stdout.strip())
+    except ValueError:
+        return None
+
+
+def find_work_bead_status(repo: str, branch: str) -> str | None:
+    """The branch's work-bead status (predicate 2). Try an embedded bead id
+    (`bd show`), else `bd search` the branch text across all statuses; None when
+    neither resolves a bead. All reads (no --sandbox needed for reads)."""
+    bead_id = parse_bead_id(branch)
+    if bead_id:
+        cp = _bd(repo, "show", bead_id, "--json", check=False)
+        if cp.returncode == 0:
+            st = status_from_show_json(cp.stdout)
+            if st is not None:
+                return st
+    cp = _bd(repo, "search", branch, "--status", "all", "--json", check=False)
+    if cp.returncode == 0:
+        return first_status_from_search_json(cp.stdout)
+    return None
+
+
+def open_for_chuck_beads(repo: str) -> list[dict]:
+    """Open + in-progress `for-chuck` beads (predicate 3's corpus). in_progress
+    included so a handoff Chuck has already STARTED still suppresses a duplicate."""
+    cp = _bd(repo, "list", "--status", "open,in_progress",
+             "--label", "for-chuck", "--json", check=False)
+    if cp.returncode != 0:
+        return []
+    try:
+        d = json.loads(cp.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    return [b for b in d if isinstance(b, dict)] if isinstance(d, list) else []
+
+
+def file_for_chuck_bead(repo: str, branch: str, work_status: str | None) -> subprocess.CompletedProcess:
+    """File ONE for-chuck,coord bead naming the branch. ALWAYS --sandbox
+    (SABLE-rq9k: local-only write, no Dolt auto-push — the chuck-only push lane
+    stays intact)."""
+    return _bd(
+        repo, "create", "--sandbox",
+        "--title", reconcile_bead_title(branch),
+        "--type=task", "--priority=2",
+        "--labels=for-chuck,coord",
+        "--description", reconcile_bead_description(branch, work_status),
+        check=False,
+    )
+
+
+# --------------------------------------------------------------------------
+# Classification + orchestration
+# --------------------------------------------------------------------------
+
+def classify_branch(repo: str, remote: str, branch: str, integration_branch: str,
+                    open_beads: list[dict], threshold_minutes: float,
+                    now: float) -> tuple[bool, str, str | None]:
+    """Apply the four-part stranded predicate to ONE branch. Returns
+    (is_stranded, reason, work_status). Cheap/pure checks first; the bead-status
+    lookup (a subprocess) runs only after ancestry + for-chuck rule the branch
+    in as a live candidate."""
+    rc = branch_ancestor_rc(repo, remote, branch, integration_branch)
+    if not ancestor_rc_is_unmerged(rc):
+        return (False, f"merged-or-unresolvable(is-ancestor rc={rc})", None)
+
+    if branch_named_by_open_for_chuck(open_beads, branch):
+        return (False, "handoff-already-on-record", None)
+
+    status = find_work_bead_status(repo, branch)
+    if not work_bead_qualifies(status):
+        return (False, f"no-qualifying-work-bead(status={status})", status)
+
+    age = branch_tip_age_seconds(repo, remote, branch, now)
+    if age is None:
+        return (False, "age-unresolvable", status)
+    if not age_exceeds_threshold(age, threshold_minutes):
+        return (False, f"too-fresh({age:.0f}s <= {threshold_minutes}min settle)", status)
+
+    return (True, "STRANDED", status)
+
+
+def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -> int:
+    integration_branch = resolve_integration_branch(repo)
+    # Refresh remote-tracking refs so ancestry + age read origin's current truth.
+    _git(repo, "fetch", remote, "--prune", check=False)
+
+    branches = list_origin_wk_branches(repo, remote)
+    open_beads = open_for_chuck_beads(repo)
+    now = time.time()
+
+    mode = "DRY-RUN" if dry_run else "reconcile"
+    print(f"sable-reconcile-handoffs [{mode}]: integration branch '{integration_branch}', "
+          f"{len(branches)} origin wk-* branch(es), age threshold {threshold_minutes}min")
+
+    stranded: list[tuple[str, str | None]] = []
+    for br in branches:
+        if br == integration_branch:
+            continue
+        is_stranded, reason, status = classify_branch(
+            repo, remote, br, integration_branch, open_beads, threshold_minutes, now)
+        print(f"  {br}: {reason}")
+        if is_stranded:
+            stranded.append((br, status))
+
+    filed = 0
+    for br, status in stranded:
+        if dry_run:
+            print(f"  [dry-run] would file for-chuck bead for {br} (work bead {status})")
+            continue
+        cp = file_for_chuck_bead(repo, br, status)
+        if cp.returncode == 0:
+            filed += 1
+            print(f"  filed for-chuck bead for stranded branch {br}")
+        else:
+            print(f"  WARNING: could not file for-chuck bead for {br} "
+                  f"(bd exit {cp.returncode}): {cp.stdout.strip()}")
+
+    if dry_run:
+        print(f"sable-reconcile-handoffs [DRY-RUN]: {len(stranded)} stranded branch(es) "
+              f"classified, 0 filed (dry-run).")
+    else:
+        print(f"sable-reconcile-handoffs: {len(stranded)} stranded branch(es), "
+              f"{filed} for-chuck bead(s) filed.")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="sable-reconcile-handoffs")
+    parser.add_argument("--repo", default=os.environ.get("SABLE_RC_REPO", os.getcwd()))
+    parser.add_argument("--remote", default=os.environ.get("SABLE_RC_REMOTE", "origin"))
+    parser.add_argument("--age-min", type=float,
+                        default=float(os.environ.get("SABLE_RECONCILE_AGE_MIN", "10")),
+                        help="push-age threshold in minutes before a branch is "
+                             "eligible for reconciliation (default 10; "
+                             "SABLE_RECONCILE_AGE_MIN)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="classify + print only; file no beads; exit 0")
+    args = parser.parse_args(argv)
+    return reconcile(args.repo, args.remote, args.age_min, args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
