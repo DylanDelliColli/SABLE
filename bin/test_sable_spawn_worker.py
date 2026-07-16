@@ -53,6 +53,17 @@ def test_worktree_name_from_scope():
     assert ssw.worktree_name("SABLE-bldh.3", "msg-helper") == "wk-msg-helper"
 
 
+def test_worktree_name_idempotent_on_already_prefixed_scope():
+    """SABLE-v2k3: a scope that already starts with wk- must NOT be
+    double-prefixed into wk-wk-*."""
+    assert ssw.worktree_name("SABLE-jxcg", "wk-claim-hook-sandbox") == "wk-claim-hook-sandbox"
+    assert ssw.worktree_name("SABLE-jxcg", "claim-hook-sandbox") == "wk-claim-hook-sandbox"
+
+
+def test_worktree_name_idempotent_on_already_prefixed_bead_id():
+    assert ssw.worktree_name("wk-foo", None) == "wk-foo"
+
+
 def test_window_name():
     assert ssw.window_name("SABLE-bldh.3") == "worker-sable-bldh-3"
 

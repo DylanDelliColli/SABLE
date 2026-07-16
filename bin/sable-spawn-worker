@@ -99,7 +99,13 @@ def _sanitize(s: str) -> str:
 
 
 def worktree_name(bead_id: str, scope: str | None) -> str:
-    return f"wk-{_sanitize(scope) if scope else _sanitize(bead_id)}"
+    """wk-<scope|bead>, idempotent: a scope/bead_id that already sanitizes to a
+    wk- prefix (e.g. 'wk-claim-hook-sandbox') is NOT double-prefixed into
+    wk-wk-claim-hook-sandbox (SABLE-v2k3)."""
+    base = _sanitize(scope) if scope else _sanitize(bead_id)
+    if base.startswith("wk-"):
+        base = base[len("wk-"):]
+    return f"wk-{base}"
 
 
 def window_name(bead_id: str) -> str:

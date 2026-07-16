@@ -174,6 +174,51 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock):
             assert _refs_snapshot(repo) == before_refs
 
 
+def test_spawn_scope_already_prefixed_is_idempotent(sock):
+    """SABLE-v2k3 regression: a --scope that already starts with wk- (as happens
+    when a caller passes an existing worktree-style name, e.g. wk-claim-hook-
+    sandbox) must NOT be double-prefixed into wk-wk-*. Runs against real bd +
+    git worktree create in THIS repo; removes the worktree + branch afterward."""
+    repo = Path(__file__).resolve().parent.parent  # the SABLE repo root
+    scope = f"wk-sw-it-{uuid.uuid4().hex[:8]}"
+    wt_name = scope  # idempotent: already wk-prefixed, so name == scope
+    expected = repo.parent / wt_name
+    double_prefixed = repo.parent / f"wk-{scope}"
+    assert not expected.exists(), f"orphan worktree from a prior run at {expected}"
+    before_refs = _refs_snapshot(repo)
+    with tempfile.TemporaryDirectory() as dd:
+        env = {
+            **_clean_env(),
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_MAX_LOAD_PER_CORE": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+        try:
+            r = subprocess.run(
+                ["python3", str(BIN), BEAD, "--scope", scope,
+                 "--model", "haiku", "--skip-governance"],
+                capture_output=True, text=True, env=env, cwd=str(repo),
+            )
+            assert r.returncode == 0, r.stderr
+            assert expected.is_dir(), f"no worktree at {expected}; stderr={r.stderr}"
+            assert not double_prefixed.exists(), (
+                f"double-prefixed worktree created at {double_prefixed}")
+            body = (Path(dd) / f"{BEAD}.md").read_text()
+            assert f"Worktree: {expected}" in body, body
+        finally:
+            subprocess.run(["git", "-C", str(repo), "worktree", "remove",
+                            "--force", str(expected)],
+                           capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(repo), "branch", "-D", wt_name],
+                           capture_output=True, text=True)
+            assert _refs_snapshot(repo) == before_refs
+
+
 def test_spawn_leaves_session_current_window_unchanged(sock):
     """SABLE-zgbt regression: the worker window must open DETACHED (-d). Without
     it every dispatch makes the new window the session's current window, yanking
