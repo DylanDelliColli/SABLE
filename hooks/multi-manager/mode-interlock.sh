@@ -82,23 +82,62 @@ esac
 # Env soft override applies to every leg (Agent matrix + Bash).
 [ "${SABLE_ORCHESTRATION_FORCE:-}" = "1" ] && exit 0
 
-TOOL_NAME="$(printf '%s' "$INPUT" | python3 -c "
+# Single JSON parse for every field any leg might need (SABLE-s8x9): the hook
+# used to re-parse $INPUT with a SEPARATE cold python3 process per field
+# (tool_name, agent_id, cwd, subagent_type, command) — up to 5 python3 starts
+# per invocation. This hook fires on every governed Bash/Agent tool call, so
+# that cost is paid constantly in real sessions; hooks/test/test-mode-interlock.sh
+# alone drives 250+ invocations, and the stacked python3 cold-starts were long
+# enough to run the suite past a 30-40s test-harness timeout (read as "hangs
+# indefinitely" — it doesn't deadlock, it's just needlessly slow). One parse,
+# five printed lines (command LAST since it's the only field that can
+# legitimately contain embedded newlines — a multi-line command payload — so
+# it's captured as "line 5 to end" rather than a single sed line).
+PARSED="$(printf '%s' "$INPUT" | python3 -c "
 import json, sys
 try:
-    print(json.load(sys.stdin).get('tool_name', '') or '')
+    d = json.load(sys.stdin)
+    if not isinstance(d, dict):
+        d = {}
+    ti = d.get('tool_input')
+    if not isinstance(ti, dict):
+        ti = {}
+    tool_name = d.get('tool_name', '') or ''
+    agent_id = d.get('agent_id', '') or ''
+    cwd = d.get('cwd', '') or ''
+    subtype = ti.get('subagent_type', '') or ''
+    command = ti.get('command', '') or ''
 except Exception:
-    print('')
+    tool_name = agent_id = cwd = subtype = command = ''
+print(tool_name)
+print(agent_id)
+print(cwd)
+print(subtype)
+print(command)
 " 2>/dev/null)"
+# Split PARSED with pure parameter expansion (no sed/awk fork per field —
+# bash 3.2-safe: #/%% pattern trimming, no readarray/mapfile). ${v%%$'\n'*}
+# is the text before the first newline; ${v#*$'\n'} is everything after it.
+_REST="${PARSED#*$'\n'}"
+TOOL_NAME="${PARSED%%$'\n'*}"
+AGENT_ID="${_REST%%$'\n'*}"
+_REST="${_REST#*$'\n'}"
+HOOK_CWD="${_REST%%$'\n'*}"
+_REST="${_REST#*$'\n'}"
+SUBTYPE_RAW="${_REST%%$'\n'*}"
+CMD_TEXT="${_REST#*$'\n'}"
+unset _REST
 
-AGENT_ID="$(printf '%s' "$INPUT" | python3 -c "
-import json, sys
-try:
-    print(json.load(sys.stdin).get('agent_id', '') or '')
-except Exception:
-    print('')
-" 2>/dev/null)"
-
-# Resolve current mode. Prefer the helper; fall back to reading the file.
+# Resolve current mode. Read the state file directly when it exists — this
+# hook already exported SABLE_MODE_STATE=$STATE above, and $MODE_BIN's own
+# resolve_state_path (bin/sable-mode) shortcuts on that same env var, so its
+# `get` subcommand would read this exact file with the identical
+# json.load(...).get('mode','') logic below. Shelling out to it costs a bash
+# process PLUS a python3 process per hook call — paid on every governed tool
+# call in real sessions, and 250+ times in hooks/test/test-mode-interlock.sh
+# alone (SABLE-s8x9: this stacked latency, not a deadlock, was what looked
+# like an indefinite hang). Fall back to the helper only when the file isn't
+# there yet — same empty-MODE result either way.
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 MODE_BIN="$HOOK_DIR/../../bin/sable-mode"
 
@@ -115,21 +154,14 @@ MODE_BIN="$HOOK_DIR/../../bin/sable-mode"
 . "$HOOK_DIR/lib-registry-path.sh"
 # shellcheck source=lib-identity.sh
 . "$HOOK_DIR/lib-identity.sh"
-HOOK_CWD="$(printf '%s' "$INPUT" | python3 -c "
-import json, sys
-try:
-    print(json.load(sys.stdin).get('cwd', '') or '')
-except Exception:
-    print('')
-" 2>/dev/null)"
 STATE="$(sable_mode_state_path "$HOOK_CWD")"
 export SABLE_MODE_STATE="$STATE"
 
 MODE=""
-if [ -x "$MODE_BIN" ]; then
-  MODE="$("$MODE_BIN" get 2>/dev/null || true)"
-elif [ -f "$STATE" ]; then
+if [ -f "$STATE" ]; then
   MODE="$(STATE="$STATE" python3 -c "import json,os; print(json.load(open(os.environ['STATE'])).get('mode','') or '')" 2>/dev/null || true)"
+elif [ -x "$MODE_BIN" ]; then
+  MODE="$("$MODE_BIN" get 2>/dev/null || true)"
 fi
 [ -z "$MODE" ] && exit 0
 
@@ -179,14 +211,7 @@ classify_target() {
 # Agent leg (v3): identity-aware mode-boundary matrix — governs main + subagents.
 # ---------------------------------------------------------------------------
 if [ "$TOOL_NAME" = "Agent" ]; then
-  SUBTYPE="$(printf '%s' "$INPUT" | python3 -c "
-import json, sys
-try:
-    d = json.load(sys.stdin)
-    print((d.get('tool_input') or {}).get('subagent_type', '') or '')
-except Exception:
-    print('')
-" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  SUBTYPE="$(printf '%s' "$SUBTYPE_RAW" | tr '[:upper:]' '[:lower:]')"
   [ -z "$SUBTYPE" ] && exit 0
 
   # Spawner dimension: subagent (agent_id present) vs main session.
@@ -235,15 +260,8 @@ fi
 # override (SABLE_ORCHESTRATION_FORCE=1) is already handled above; a `--force`
 # flag on the command also overrides.
 # ---------------------------------------------------------------------------
-# Extract the Bash command once — reused by both spawn legs and the main Bash
-# leg below (one python3 field read instead of three).
-CMD_TEXT="$(printf '%s' "$INPUT" | python3 -c "
-import json, sys
-try:
-    print(json.load(sys.stdin).get('tool_input', {}).get('command', '') or '')
-except Exception:
-    print('')
-" 2>/dev/null)"
+# CMD_TEXT was extracted once, up front, in the combined JSON parse above —
+# reused here by both spawn legs and the main Bash leg below.
 
 # Soft override: SABLE_ORCHESTRATION_FORCE=1 as an inline prefix on the command
 # text applies to EVERY Bash leg, the spawn legs included (SABLE-pi5m defect 2).
