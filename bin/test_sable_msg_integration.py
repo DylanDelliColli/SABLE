@@ -406,6 +406,13 @@ def test_default_send_to_busy_pane_with_queued_footer_confirms_delivered_msxj(tm
     assert r.returncode == 0, r.stderr           # footer alone must confirm -> delivered
     assert "delivered" in r.stderr
     assert not end.exists(), "the turn must still be running (never reached NATURAL end)"
+    # SABLE-du3w: under full bin/ suite load the busy-pane stand-in subprocess
+    # can be slow to start, so an immediate read here can race ahead of it
+    # creating arrivals.txt -> FileNotFoundError. Poll for readiness first.
+    assert _wait_until(
+        lambda: arrivals.exists() and arrivals.read_text().count("cap in force") >= 1,
+        timeout=10,
+    ), "arrivals.txt never received the queued line"
     assert arrivals.read_text().count("cap in force") == 1
 
 
@@ -431,6 +438,12 @@ def test_second_send_on_still_busy_pane_does_not_double_queue_msxj(tmux_socket, 
 
     time.sleep(3.5)  # let the busy turn end naturally so REC_FILE flushes
     assert end.read_text().strip() == "NATURAL"
+    # SABLE-du3w: same slow-subprocess-start race as above -- poll before
+    # reading arrivals.txt instead of asserting on an immediate read.
+    assert _wait_until(
+        lambda: arrivals.exists() and arrivals.read_text().count("cap in force") >= 1,
+        timeout=10,
+    ), "arrivals.txt never received the queued line"
     assert arrivals.read_text().count("cap in force") == 1, \
         "the second send must not have retyped an already-queued message"
     assert rec.read_text().count("cap in force") == 1, \
