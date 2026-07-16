@@ -870,6 +870,99 @@ def test_deliver_text_idle_at_t0_always_types_even_if_snippet_coincidentally_vis
     assert state["type_calls"] == 1
 
 
+# --- busy-at-t0 submit-race self-heal (SABLE-l7uv) --------------------------
+# The false-undelivered class the msxj footer path did NOT retire. The original
+# repro (SABLE-mgyh) is explicitly "NOT the queued-behind-a-turn state": our line
+# sits UN-submitted in the recipient's EDITABLE composer (prompt-glyph line, NO
+# 'Press up to edit queued messages' footer). The mechanism: the pane was BUSY at
+# t0 (finishing the PRIOR turn — 'Baked for 8s' rendering), so deliver_text took
+# the busy leg and sent Enter exactly ONCE; that Enter was absorbed in the
+# busy->idle redraw, the prior turn then ended, and our text was left sitting in
+# the now-EDITABLE composer. Because the busy leg never resent Enter, the line
+# would NEVER auto-submit (it was never a real queued line) and submitted_own_turn
+# could never confirm it -> the poll budget timed out -> false 'undelivered' +
+# durable fallback bead, while the message sat visibly stuck. The fix: on the busy
+# leg, once the pane has fallen IDLE with our snippet still un-submitted in the
+# editable box, (re)send Enter to submit it as its own turn.
+
+
+def test_deliver_text_busy_at_t0_then_idle_with_text_stuck_in_box_resends_enter_l7uv():
+    # THE SABLE-l7uv repro, at the helper it lives in. Busy at t0; our Enter is
+    # absorbed in the redraw so the first poll shows the pane fallen IDLE with the
+    # snippet sitting UN-submitted in the editable composer (no footer, no busy
+    # line). submitted_own_turn cannot confirm this (dispatch_landed False on an
+    # idle pane == text still in box; no queued-footer). The busy leg must
+    # self-heal by RE-SENDING Enter; the stand-in then submits it, and the next
+    # poll confirms LANDED. Pre-fix: no Enter is ever resent -> times out -> False.
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    other_turn = "● Baking the prior turn…\n✻ Thinking… (8s · esc to interrupt)"
+    state = {"typed": False, "submitted": False, "enter_after_type": 0}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
+        elif cmd[-1] == "Enter" and state["typed"]:
+            state["enter_after_type"] += 1
+            # The FIRST post-type Enter is the absorbed one (busy->idle redraw);
+            # the SECOND (the self-heal resend on the idle editable box) submits.
+            if state["enter_after_type"] >= 2:
+                state["submitted"] = True
+        return True
+
+    def capture():
+        if not state["typed"]:
+            return f"{other_turn}\n❯ \n  ddc@host:~/wt"          # busy at t0
+        if not state["submitted"]:
+            # prior turn ended; our line sits in the EDITABLE composer, no footer,
+            # no busy status -> pane_idle True, dispatch_landed False (still in box)
+            return f"❯ {message}\n  ddc@host:~/wt"
+        # the self-heal Enter submitted it as its own turn
+        return f"● prior done\n❯ {message}\n✻ Thinking… (1s · esc to interrupt)"
+
+    landed = sable_pane_lib.deliver_text(
+        ["tmux"], "%5", message, message,
+        tries=8, interval=0.01, run=run, capture=capture, sleep=lambda s: None,
+    )
+    assert landed is True
+    assert state["enter_after_type"] >= 2, "the busy leg must resend Enter to submit the stuck line"
+
+
+def test_deliver_text_busy_at_t0_genuinely_queued_no_selfheal_double_submit_l7uv():
+    # The guard against the d21h phantom-confirm regression: a line GENUINELY
+    # queued behind a still-running turn (pane stays BUSY, line hoisted above the
+    # composer) must NOT trigger the self-heal Enter — pane_idle is False the whole
+    # time, so no stray Enter is sent, and when the turn ends the line auto-submits
+    # and is confirmed by submitted_own_turn. Exactly one submission, never two.
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    other_turn = "● Running the merge gate…\n✻ Thinking… (12s · esc to interrupt)"
+    state = {"typed": False, "polls": 0, "enter_after_type": 0}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
+        elif cmd[-1] == "Enter" and state["typed"]:
+            state["enter_after_type"] += 1
+        return True
+
+    def capture():
+        if not state["typed"]:
+            return f"{other_turn}\n❯ \n  ddc@host:~/wt"          # busy at t0
+        state["polls"] += 1
+        if state["polls"] < 3:
+            # genuinely queued: hoisted above the composer, the OTHER turn still
+            # running (busy) -> pane_idle False, self-heal must NOT fire.
+            return f"{message}\n{other_turn}\n❯ \n  ddc@host:~/wt"
+        # turn ended, our queued line auto-submitted as its own turn
+        return f"● gate done\n❯ {message}\n✻ Thinking… (1s · esc to interrupt)"
+
+    landed = sable_pane_lib.deliver_text(
+        ["tmux"], "%21", message, message,
+        tries=8, interval=0.01, run=run, capture=capture, sleep=lambda s: None,
+    )
+    assert landed is True
+    assert state["enter_after_type"] == 1, "a genuinely-queued busy line must get NO self-heal Enter"
+
+
 # --- interrupt idle-wait state machine (SABLE-m6is) -------------------------
 # A busy Claude turn STILL shows the empty composer prompt at the bottom, so
 # pane_ready fired mid-turn and --interrupt typed into a pane still redrawing the
