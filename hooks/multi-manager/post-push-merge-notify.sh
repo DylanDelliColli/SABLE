@@ -375,6 +375,38 @@ else
   FALLBACK_REASON="sable-msg could not confirm delivery to chuck"
 fi
 
+# SABLE-riu: idempotency guard, mirroring bin/sable-reconcile-handoffs's
+# predicate 3 / title_names_branch (SABLE-jfg6.3) so the push-based filer
+# matches the pull-based floor. The message-first handoff above only
+# `exit 0`s on a CONFIRMED send; a repeated fallback-path push of the SAME
+# branch during a chuck-down/unreachable window (e.g. a worker re-pushing a
+# fix) would otherwise file a new '[AUTO-NOTIFY] ... <branch>' bead every
+# time, per SABLE-tb1y's optimus disposition (6 near-identical beads for one
+# branch observed 2026-07-16). Skip the create if any open/in_progress
+# for-chuck bead's title already names $BRANCH on a delimited-token boundary
+# (so wk-foo does not false-match wk-foobar) — that earlier bead already
+# covers this branch's handoff; update it by hand if the file list changed.
+EXISTING_FOR_CHUCK=$(bd list --status open,in_progress --label for-chuck --json 2>/dev/null || echo "")
+if printf '%s' "$EXISTING_FOR_CHUCK" | BRANCH="$BRANCH" python3 -c "
+import json, os, re, sys
+branch = os.environ.get('BRANCH', '')
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(data, list):
+    sys.exit(1)
+pat = r'(?:^|[^\w./-])' + re.escape(branch) + r'(?:\$|[^\w./-])'
+for item in data:
+    if isinstance(item, dict) and re.search(pat, item.get('title') or ''):
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null; then
+  echo "post-push-merge-notify: skipping — an open/in_progress for-chuck bead already names branch ${BRANCH}; not filing a duplicate (${FALLBACK_REASON:-message delivery not confirmed})."
+  sable_pp_trace "EXIT dup-for-chuck-bead branch=${BRANCH} reason=${FALLBACK_REASON:-unconfirmed}"
+  exit 0
+fi
+
 # Build description (durable for-chuck bead — fallback path)
 DESC_LINES=""
 DESC_LINES="${DESC_LINES}${AUTO_NOTIFY_TAG} PR ready for review."
