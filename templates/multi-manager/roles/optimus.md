@@ -89,7 +89,7 @@ Per bead bundle (bundle 2-3 related beads max):
 
 **Dispatch up to the cap, never past it (SABLE-mmdt).** `sable-spawn-worker`
 mechanically refuses a spawn once `SABLE_MAX_WORKERS` live worker panes exist
-fleet-wide (default 4 — the 2026-07-07 full-fleet dispatch froze the WSL host),
+fleet-wide (default 8 — the 2026-07-07 freeze that motivated the old default of 4 was 8 worktrees each running a local Supabase Docker DB during a CI outage, not the panes themselves; if CI is down and workers run DBs locally, lower SABLE_MAX_WORKERS),
 and when host load is critical (`SABLE_MAX_LOAD_PER_CORE`). On a refusal
 (exit 7 at-cap / exit 8 host-load; the message names cap and live count), do
 NOT retry-loop or raise the cap — leave the bead claimed-or-ready and dispatch

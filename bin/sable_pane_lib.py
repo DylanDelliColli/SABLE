@@ -596,14 +596,16 @@ def resolve_session(socket: str | None = None, base: str | None = None,
 # --- Dispatch throttle knob (SABLE-mmdt), shared by sable-spawn-worker (the
 # refusal) and sable-view (the cockpit count-vs-cap line) so the default can
 # never drift between the gate and its observability surface.
-WORKER_CAP_DEFAULT = 4
+WORKER_CAP_DEFAULT = 8
 
 
 def worker_cap(env=None) -> int:
-    """Max live worker panes per session (SABLE_MAX_WORKERS). Default 4 — the
-    2026-07-07 full-fleet dispatch (~15 workers + Docker) froze the WSL host.
-    0 is an explicit emergency stop (every spawn refused). Unparseable or
-    negative values keep the DEFAULT throttle rather than lifting it."""
+    """Max live worker panes per session (SABLE_MAX_WORKERS). Default 8 — the
+    2026-07-07 freeze that motivated the old default of 4 was 8 worktrees each
+    running a local Supabase Docker DB during a CI outage, not the panes
+    themselves. 0 is an explicit emergency stop (every spawn refused).
+    Unparseable or negative values keep the DEFAULT throttle rather than
+    lifting it."""
     raw = ((env if env is not None else os.environ).get("SABLE_MAX_WORKERS") or "").strip()
     if not raw:
         return WORKER_CAP_DEFAULT
