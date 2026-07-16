@@ -124,22 +124,16 @@ fi
 # (mirrors pre-push-rebase-test.sh's ordering).
 FETCH_OUT=$(git -C "$WORKTREE" fetch origin 2>&1 || echo "FETCH_FAILED: $?")
 
-# Resolve the per-repo integration branch (sable_resolve_integration_branch,
-# lib-identity.sh / market-brief-package-2u25) and default the rebase target to
-# it when published, instead of unconditionally origin/main — SABLE-wf6e: this
-# was the one named consumer still hardcoding origin/main, so a dispatch refresh
-# in a repo whose integration branch is e.g. origin/tmux-only silently rebased
-# worktrees onto the wrong base. Mirrors post-push-merge-notify.sh and
-# pre-push-rebase-test.sh's DEFAULT_BASE_BRANCH derivation; an explicit
-# SABLE_BASE_BRANCH still wins. Falls back gracefully when the resolved ref
-# doesn't exist in this repo (SABLE-61n).
-INTEGRATION_BRANCH=$(sable_resolve_integration_branch "$WORKTREE")
-DEFAULT_BASE_BRANCH="origin/main"
-if [ -n "$INTEGRATION_BRANCH" ] \
-   && git -C "$WORKTREE" rev-parse --verify --quiet "origin/$INTEGRATION_BRANCH" >/dev/null 2>&1; then
-  DEFAULT_BASE_BRANCH="origin/$INTEGRATION_BRANCH"
-fi
-BASE_BRANCH=$(sable_validate_base_ref "$WORKTREE" "${SABLE_BASE_BRANCH:-$DEFAULT_BASE_BRANCH}")
+# Resolve the rebase target AUTHORITATIVELY from the target repo's own
+# integration branch (sable_resolve_base_branch, lib-identity.sh / SABLE-1238),
+# instead of the old `${SABLE_BASE_BRANCH:-$DEFAULT_BASE_BRANCH}` derivation
+# that let a leaked session SABLE_BASE_BRANCH override the correct base and, in
+# a repo whose integration branch is e.g. origin/tmux-only, silently rebased
+# worktrees onto origin/main (SABLE-wf6e, SABLE-4amz). When origin/<INT> is
+# published that ref IS the base; SABLE_BASE_BRANCH applies only when it is
+# unpublished. Mirrors pre-push-rebase-test.sh; requires the fetch above so the
+# origin/<INT> existence check sees fresh remote refs.
+BASE_BRANCH=$(sable_resolve_base_branch "$WORKTREE")
 
 REBASE_OUT=$(git -C "$WORKTREE" rebase "$BASE_BRANCH" 2>&1 || echo "REBASE_FAILED")
 
