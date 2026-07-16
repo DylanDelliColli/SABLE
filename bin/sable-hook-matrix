@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+"""sable-hook-matrix — D6 repro-matrix harness + S4 classification (SABLE-jfg6.6).
+
+Turns hook-firing folklore into a decidable record. The t7fm family
+("tdd-evidence doesn't fire in warm panes", "gate false-blocks", "post-push
+notify loss") was argued for weeks on anecdote because a single failure signal —
+"the trace line is missing" — could mean three unrelated things. D1
+(hooks/multi-manager/lib-hook-trace.sh) and D2 (control-trace.sh) gave us the
+two independent observers needed to tell them apart. D6 is the harness that
+drives real hook invocations across a {session-type x hook-surface x load x
+permission-mode} matrix, diffs each cell's observers against ground truth (the
+session-transcript tool_use count), and classifies every cell as **in-our-control
+or upstream** with a named GitHub issue — no cell left unclassified (totality).
+
+Two independent observers per driven tool call:
+  * control-trace.sh (D2)   -> neutral fire count C. It NEVER reads stdin, so a
+                               control line means "the platform dispatched a
+                               hook here", full stop.
+  * lib-hook-trace.sh (D1)  -> ENTRY line + STDIN_BYTES per instrumented-hook
+                               fire. STDIN_BYTES=0 means "dispatched, but the
+                               payload was empty" — the #16047 signature.
+
+Ground truth = transcript tool_use count T (filtered to the cell's hook surface).
+Diffing C and the STDIN_BYTES records against T is what separates:
+  * C == T, STDIN_BYTES=0  -> empty-stdin degradation (#16047)          [upstream]
+  * C  < T                 -> a real non-dispatch, sub-classified by shape:
+        - only in Agent-subagent sessions   -> #34692 WONTFIX           [upstream]
+        - miss scales with concurrency       -> parallel-batch #64237    [upstream]
+        - otherwise                          -> genuine non-dispatch
+                                                #6305/#15441             [upstream]
+  * C == T, STDIN_BYTES>0  -> healthy dispatch                          [in-our-control]
+
+The classifier `classify()` is a PURE function and the core of the deliverable;
+the harness only feeds it measured ground truth. The session-age>2h cell is
+recorded DETECTION-ONLY (matrix gap S4-E3 / the D5 boundary): it is not
+hermetically reproducible in CI, so it is attributed from live trace-log data
+rather than asserted green — acknowledged, not hidden.
+
+CLI:
+  sable-hook-matrix --emit-doc docs/HOOK-FIRING-CLASSIFICATION.md
+  sable-hook-matrix --print          # render the doc to stdout, drive nothing new
+  sable-hook-matrix --transcript X   # count ground truth from a real transcript
+
+Fixture isolation (SABLE-6cf9 lesson): every log path is redirectable via
+SABLE_HOOK_TRACE_LOG / SABLE_CONTROL_TRACE_LOG / SABLE_HOOK_TRACE_SESSION_MARKER,
+and the harness drives each cell inside its own scratch directory.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+# --- control-vs-upstream buckets (the two totality targets) ------------------
+
+IN_OUR_CONTROL = "in-our-control"
+UPSTREAM = "upstream"
+
+# --- session-age degradation threshold (D5 boundary) -------------------------
+
+AGE_2H_SECONDS = 2 * 60 * 60  # session-age>2h cell (S4-E3), matches #16047 onset
+
+
+# --- named F6 classifications ------------------------------------------------
+# (label, issue, bucket). issue "" == no upstream issue (an in-our-control state).
+
+@dataclass(frozen=True)
+class Verdict:
+    label: str
+    issue: str
+    bucket: str  # IN_OUR_CONTROL | UPSTREAM
+
+
+EMPTY_STDIN = Verdict("empty-stdin degradation", "#16047", UPSTREAM)
+NON_DISPATCH = Verdict("genuine non-dispatch", "#6305/#15441", UPSTREAM)
+SUBAGENT_WONTFIX = Verdict("Agent-subagent non-dispatch (WONTFIX)", "#34692", UPSTREAM)
+PARALLEL_BATCH = Verdict("parallel-batch drop", "#64237", UPSTREAM)
+HEALTHY = Verdict("healthy dispatch", "", IN_OUR_CONTROL)
+OVERFIRE = Verdict("over-fire anomaly", "", IN_OUR_CONTROL)
+AGE_UNSAMPLED = Verdict("age-degradation (unsampled)", "#16047", UPSTREAM)
+
+# Every verdict the classifier can return; the totality invariant is that each
+# maps to exactly one of the two buckets.
+ALL_VERDICTS = (
+    EMPTY_STDIN, NON_DISPATCH, SUBAGENT_WONTFIX, PARALLEL_BATCH,
+    HEALTHY, OVERFIRE, AGE_UNSAMPLED,
+)
+
+SUBAGENT_TYPE = "Agent-subagent"
+
+
+# --- the cell model ----------------------------------------------------------
+
+@dataclass
+class Cell:
+    """One matrix cell: its four dimensions plus the measured ground truth the
+    classifier decides on. Measured fields are populated by the harness (real
+    invocation) or set directly (synthetic/modeled cells, always labelled)."""
+
+    # --- the four matrix dimensions ---
+    session_type: str            # 'warm-worker' | 'Agent-subagent' | ...
+    hook_surface: str            # 'control' | 'tdd-evidence'
+    load: int = 1                # concurrent tool-call count for this cell
+    permission_mode: str = "default"
+
+    # --- measured ground truth (the classifier reads ONLY these) ---
+    transcript_tool_uses: int = 0        # T: transcript tool_use count for surface
+    control_fires: int = 0               # C: neutral control-hook fire count
+    stdin_bytes: tuple = ()              # per instrumented-hook fire; () if N/A
+    miss_scales_with_concurrency: bool = False
+
+    # --- provenance / honesty labels (rendered, never classified on) ---
+    provenance: str = "real"             # 'real' | 'modeled' | 'detection-only'
+    transcript_source: str = "real"      # 'real' | 'synthetic'
+    detection_only: bool = False
+    evidence: str = ""
+    note: str = ""
+
+    def dims(self) -> str:
+        return (f"{self.session_type} x {self.hook_surface} x "
+                f"load={self.load} x {self.permission_mode}")
+
+
+@dataclass
+class Result:
+    cell: Cell
+    outcome: str
+    verdict: Verdict
+
+
+# ============================================================================
+# THE CLASSIFIER — pure function, the core deliverable (research F6 rules)
+# ============================================================================
+
+def classify(cell: Cell) -> Result:
+    """Decide a cell from its measured ground truth. PURE: no I/O, no clock,
+    deterministic. Total: every cell yields a Result whose verdict bucket is
+    IN_OUR_CONTROL or UPSTREAM — there is no unclassified cell.
+
+    Rule order is load-bearing:
+      0. detection-only cells (session-age>2h, S4-E3) short-circuit BEFORE any
+         green verdict — they are attributed from live trace, never asserted
+         healthy (the bead forbids asserting green on the unreproducible cell).
+      1. C < T  -> a real miss. Sub-classify by the most specific signature:
+         scaling-with-concurrency (#64237) > subagent-only (#34692) > generic
+         non-dispatch (#6305/#15441).
+      2. C == T -> dispatch reached every call. STDIN_BYTES=0 across the fires is
+         empty-stdin degradation (#16047); otherwise healthy.
+      3. C > T  -> over-fire anomaly: more control fires than transcript calls
+         for this surface. In-our-control (our wiring/harness over-counts) — a
+         totality-completeness bucket, not an F6 rule.
+    """
+    T = cell.transcript_tool_uses
+    C = cell.control_fires
+
+    # Rule 0 — DETECTION-ONLY (matrix gap S4-E3 / D5 boundary). Not hermetically
+    # reproducible; attribute from whatever the live trace log actually shows.
+    if cell.detection_only:
+        stdin_zero = bool(cell.stdin_bytes) and all(b == 0 for b in cell.stdin_bytes)
+        if C > 0 and stdin_zero:
+            # A live >2h fire really shows the empty-stdin signature.
+            return Result(cell,
+                          "DETECTION-ONLY: live trace shows empty-stdin at session-age>2h",
+                          EMPTY_STDIN)
+        # No qualifying live sample. Record the gap honestly and attribute the
+        # age-degradation to its known upstream issue — do NOT call it green.
+        return Result(cell,
+                      "DETECTION-ONLY: no live session-age>2h sample yet",
+                      AGE_UNSAMPLED)
+
+    # Rule 1 — a real miss: the neutral observer fired fewer times than there
+    # were tool calls, so the platform genuinely did not dispatch every hook.
+    if C < T:
+        if cell.miss_scales_with_concurrency:
+            return Result(cell,
+                          f"control missed {T - C} of {T} calls; miss scales with load={cell.load}",
+                          PARALLEL_BATCH)
+        if cell.session_type == SUBAGENT_TYPE:
+            return Result(cell,
+                          f"control missed {T - C} of {T} calls; non-fire confined to {SUBAGENT_TYPE}",
+                          SUBAGENT_WONTFIX)
+        return Result(cell,
+                      f"control missed {T - C} of {T} calls",
+                      NON_DISPATCH)
+
+    # Rule 2 — 1:1 dispatch. Split on the instrumented hook's stdin.
+    if C == T:
+        if cell.stdin_bytes and all(b == 0 for b in cell.stdin_bytes):
+            return Result(cell,
+                          f"control fired 1:1 with {T} calls; STDIN_BYTES=0 on all fires",
+                          EMPTY_STDIN)
+        return Result(cell,
+                      f"control fired 1:1 with {T} calls; payload present",
+                      HEALTHY)
+
+    # Rule 3 — over-fire (C > T): more fires than surface tool calls.
+    return Result(cell,
+                  f"control fired {C} times for {T} surface calls (over-fire)",
+                  OVERFIRE)
+
+
+# ============================================================================
+# GROUND-TRUTH PARSERS
+# ============================================================================
+
+def count_transcript_tool_uses(transcript_path: str,
+                               tool_name: Optional[str] = None) -> int:
+    """Count tool_use blocks in a Claude Code session transcript (jsonl).
+
+    Ground truth for the matrix. Each `assistant` record carries a
+    message.content list; tool_use blocks are the tool calls. When `tool_name`
+    is given (e.g. 'Bash' for the tdd-evidence PreToolUse:Bash surface), count
+    only matching blocks so C and T compare like-for-like. Malformed lines are
+    skipped — a partial transcript still yields a best-effort count.
+    """
+    n = 0
+    with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            msg = rec.get("message") or {}
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") != "tool_use":
+                    continue
+                if tool_name is None or block.get("name") == tool_name:
+                    n += 1
+    return n
+
+
+def parse_control_log(path: str) -> int:
+    """Count control-trace.sh fire lines (each line == one dispatch)."""
+    p = Path(path)
+    if not p.exists():
+        return 0
+    n = 0
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.strip():
+            n += 1
+    return n
+
+
+def parse_trace_log(path: str):
+    """Parse lib-hook-trace.sh output -> (entry_count, [STDIN_BYTES...],
+    [session_age_seconds...]). ENTRY and STDIN_BYTES are emitted as a pair per
+    fire; session-age is scraped from the ENTRY lines (D5 detection field)."""
+    p = Path(path)
+    if not p.exists():
+        return 0, [], []
+    entries = 0
+    stdin_bytes = []
+    ages = []
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if line.startswith("ENTRY "):
+            entries += 1
+            for tok in line.split():
+                if tok.startswith("session-age="):
+                    val = tok[len("session-age="):].rstrip("s")
+                    try:
+                        ages.append(int(val))
+                    except ValueError:
+                        pass
+        elif line.startswith("STDIN_BYTES="):
+            try:
+                stdin_bytes.append(int(line[len("STDIN_BYTES="):]))
+            except ValueError:
+                pass
+    return entries, stdin_bytes, ages
+
+
+# ============================================================================
+# THE HARNESS — real hook invocations
+# ============================================================================
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _control_hook() -> Path:
+    return _repo_root() / "hooks" / "multi-manager" / "control-trace.sh"
+
+
+def _tdd_hook() -> Path:
+    return _repo_root() / "hooks" / "tdd-evidence.sh"
+
+
+def _payload(session_id: str, agent_id: str = "") -> str:
+    """A PreToolUse:Bash payload shaped like Claude Code's, carrying a pytest
+    command so tdd-evidence matches it (STDIN_BYTES>0, the healthy path)."""
+    d = {
+        "session_id": session_id,
+        "cwd": str(_repo_root()),
+        "tool_name": "Bash",
+        "tool_input": {"command": "python3 -m pytest bin/test_sable_hook_matrix.py -q"},
+    }
+    if agent_id:
+        d["agent_id"] = agent_id
+    return json.dumps(d)
+
+
+def _fire_once(hook: Path, env: dict, stdin_data: str) -> None:
+    """Invoke one hook exactly as PreToolUse would: piped stdin, argv tool-hint.
+    Failsafe — a hook that errors must not abort the matrix run."""
+    try:
+        subprocess.run(
+            ["bash", str(hook), "Bash"],
+            input=stdin_data.encode("utf-8"),
+            env=env,
+            cwd=str(_repo_root()),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def drive_real_cell(cell: Cell, workdir: Path, transcript: Optional[str] = None,
+                    empty_stdin: bool = False) -> Cell:
+    """Really invoke this cell's hook(s) `load` times inside an isolated
+    scratch dir, then read the two observer logs back into the cell's measured
+    fields. Ground truth T is counted from `transcript` when given, else the
+    synthetic count we know we issued (labelled transcript_source='synthetic').
+    """
+    control_log = workdir / "control-trace.log"
+    trace_log = workdir / "hook-trace.log"
+    marker = workdir / "session.start"
+    session_id = f"matrix-{cell.session_type}-{cell.hook_surface}-{cell.load}"
+
+    env = dict(os.environ)
+    env["SABLE_CONTROL_TRACE_LOG"] = str(control_log)
+    env["SABLE_HOOK_TRACE_LOG"] = str(trace_log)
+    env["SABLE_HOOK_TRACE_SESSION_MARKER"] = str(marker)
+    env["CLAUDE_SESSION_ID"] = session_id
+
+    agent_id = "sub-agent-1" if cell.session_type == SUBAGENT_TYPE else ""
+    stdin_data = "" if empty_stdin else _payload(session_id, agent_id)
+
+    def one_call():
+        # The neutral observer always fires on a real dispatch.
+        _fire_once(_control_hook(), env, "")
+        # The instrumented surface fires only when it is the cell under test.
+        if cell.hook_surface == "tdd-evidence":
+            _fire_once(_tdd_hook(), env, stdin_data)
+
+    if cell.load > 1:
+        with ThreadPoolExecutor(max_workers=cell.load) as pool:
+            list(pool.map(lambda _: one_call(), range(cell.load)))
+    else:
+        for _ in range(cell.load):
+            one_call()
+
+    control_fires = parse_control_log(str(control_log))
+    entries, stdin_list, ages = parse_trace_log(str(trace_log))
+
+    if transcript:
+        surface = "Bash"  # both instrumented surfaces here are PreToolUse:Bash
+        cell.transcript_tool_uses = count_transcript_tool_uses(transcript, surface)
+        cell.transcript_source = "real"
+    else:
+        cell.transcript_tool_uses = cell.load
+        cell.transcript_source = "synthetic"
+
+    cell.control_fires = control_fires
+    cell.stdin_bytes = tuple(stdin_list)
+    cell.provenance = "real"
+    cell.evidence = (f"control={control_log.name}:{control_fires} "
+                     f"trace={trace_log.name}:entries={entries},"
+                     f"stdin_bytes={list(stdin_list)}")
+    return cell
+
+
+def attribute_detection_only(cell: Cell) -> Cell:
+    """Populate the session-age>2h cell from LIVE trace-log data (D5 boundary /
+    S4-E3). Reads the real hook-trace log (SABLE_HOOK_TRACE_LOG or default) and,
+    if any ENTRY shows session-age>2h, carries that fire's signals forward.
+    Never fabricates a green result — absence of a >2h sample is recorded as
+    such (see classify() rule 0)."""
+    live_log = os.environ.get(
+        "SABLE_HOOK_TRACE_LOG",
+        str(Path(os.environ.get("HOME", "/tmp")) / ".claude" / "sable" / "logs" / "hook-trace.log"),
+    )
+    entries, stdin_list, ages = parse_trace_log(live_log)
+    max_age = max(ages) if ages else 0
+    over_2h = [i for i, a in enumerate(ages) if a > AGE_2H_SECONDS]
+    cell.detection_only = True
+    cell.provenance = "detection-only"
+    cell.transcript_source = "live-trace"
+    if over_2h:
+        # Carry the STDIN_BYTES for the aged fires when the pairing is available.
+        aged_stdin = [stdin_list[i] for i in over_2h if i < len(stdin_list)]
+        cell.control_fires = len(over_2h)
+        cell.transcript_tool_uses = len(over_2h)
+        cell.stdin_bytes = tuple(aged_stdin)
+        cell.evidence = (f"live {live_log}: {len(over_2h)} fire(s) at session-age>2h "
+                         f"(max age {max_age}s), STDIN_BYTES={aged_stdin}")
+    else:
+        cell.control_fires = 0
+        cell.transcript_tool_uses = 0
+        cell.stdin_bytes = ()
+        cell.evidence = (f"live {live_log}: no fire at session-age>2h yet "
+                         f"(max observed age {max_age}s); rotation delegated to SABLE-ke3l")
+    return cell
+
+
+# ============================================================================
+# THE MATRIX
+# ============================================================================
+
+def build_matrix(workdir: Path, transcript: Optional[str] = None) -> list:
+    """Drive the canonical matrix and return classified Results. Covers the
+    required {warm-worker, Agent-subagent} x {tdd-evidence, control} minimum,
+    plus the load, permission-mode, empty-stdin, parallel-batch and
+    session-age>2h dimensions. Real cells are really invoked; modeled cells
+    encode a known upstream signature not reproducible hermetically and say so.
+    """
+    results = []
+
+    def real(session_type, surface, load=1, perm="default", empty=False, note=""):
+        cell = Cell(session_type=session_type, hook_surface=surface, load=load,
+                    permission_mode=perm, note=note)
+        sub = workdir / f"{session_type}-{surface}-{load}-{perm}-{'e' if empty else 'f'}"
+        sub.mkdir(parents=True, exist_ok=True)
+        drive_real_cell(cell, sub, transcript=transcript, empty_stdin=empty)
+        return cell
+
+    # 1-2. warm-worker x {control, tdd-evidence} x load=1 x default — REAL healthy.
+    results.append(classify(real("warm-worker", "control")))
+    results.append(classify(real("warm-worker", "tdd-evidence")))
+
+    # 3. warm-worker x tdd-evidence, empty stdin injected — REAL #16047 repro.
+    results.append(classify(real("warm-worker", "tdd-evidence", empty=True,
+                                 note="empty-stdin injected: real #16047 signature")))
+
+    # 4-5. Agent-subagent x {control, tdd-evidence} — MODELED #34692 non-dispatch.
+    #      The platform does not dispatch hooks in Agent-subagents; not
+    #      reproducible in a shell harness, so ground truth is synthetic.
+    for surface in ("control", "tdd-evidence"):
+        cell = Cell(session_type=SUBAGENT_TYPE, hook_surface=surface,
+                    transcript_tool_uses=3, control_fires=0, stdin_bytes=(),
+                    provenance="modeled", transcript_source="synthetic",
+                    note="modeled: platform #34692 non-dispatch in subagents; hooks not invoked",
+                    evidence="synthetic transcript T=3, control C=0 (no dispatch)")
+        results.append(classify(cell))
+
+    # 6. warm-worker x tdd-evidence x load=5 concurrent — REAL per-fire STDIN_BYTES
+    #    recorded and diffed against transcript count (the concurrency integration
+    #    requirement); with no platform to drop dispatches this is healthy.
+    results.append(classify(real("warm-worker", "tdd-evidence", load=5,
+                                 note="concurrency: 5 per-fire STDIN_BYTES recorded, diffed vs T")))
+
+    # 7. warm-worker x tdd-evidence x load=8 concurrent — MODELED #64237 batch drop.
+    cell = Cell(session_type="warm-worker", hook_surface="tdd-evidence", load=8,
+                transcript_tool_uses=8, control_fires=5, stdin_bytes=(200, 200, 200, 200, 200),
+                miss_scales_with_concurrency=True,
+                provenance="modeled", transcript_source="synthetic",
+                note="modeled: parallel-batch drop scaling with concurrency (#64237)",
+                evidence="synthetic transcript T=8, control C=5, drop scales with load")
+    results.append(classify(cell))
+
+    # 8. warm-worker x control x load=1 x bypassPermissions — REAL (permission axis).
+    results.append(classify(real("warm-worker", "control", perm="bypassPermissions",
+                                 note="permission-mode axis: control fires regardless of mode")))
+
+    # 9. warm-worker x tdd-evidence, session-age>2h — DETECTION-ONLY (S4-E3 / D5).
+    aged = Cell(session_type="warm-worker", hook_surface="tdd-evidence",
+                note="session-age>2h: not hermetically reproducible; D5 boundary, S4-E3 gap")
+    attribute_detection_only(aged)
+    results.append(classify(aged))
+
+    return results
+
+
+# ============================================================================
+# DOC RENDERING
+# ============================================================================
+
+def _md_escape(s: str) -> str:
+    return s.replace("|", "\\|")
+
+
+def render_doc(results: list) -> str:
+    """Render the committed S4 classification doc: one row per cell, with the
+    F6 rules, the provenance legend, and the enforced totality statement."""
+    lines = []
+    lines.append("# Hook-firing classification (S4 / contract D6)")
+    lines.append("")
+    lines.append("<!-- GENERATED by bin/sable-hook-matrix. Regenerate with: "
+                 "`bin/sable-hook-matrix --emit-doc docs/HOOK-FIRING-CLASSIFICATION.md`. "
+                 "Do not hand-edit the table. -->")
+    lines.append("")
+    lines.append("The decidable record that retires t7fm-family folklore. Every "
+                 "hook-firing outcome below is classified as **in-our-control** or "
+                 "**upstream** from two independent observers — the neutral control "
+                 "hook (D2, fire count `C`) and the instrumented trace lib (D1, "
+                 "`STDIN_BYTES` per fire) — diffed against the session-transcript "
+                 "`tool_use` count `T` (ground truth). No cell is left unclassified "
+                 "(totality).")
+    lines.append("")
+    lines.append("## Decision rules (research F6)")
+    lines.append("")
+    lines.append("| Signature | Classification | Bucket |")
+    lines.append("|---|---|---|")
+    lines.append("| `C == T` and `STDIN_BYTES=0` on all fires | empty-stdin degradation (#16047) | upstream |")
+    lines.append("| `C < T` (control misses transcript calls) | genuine non-dispatch (#6305/#15441) | upstream |")
+    lines.append("| `C < T`, non-fire confined to Agent-subagent | Agent-subagent non-dispatch WONTFIX (#34692) | upstream |")
+    lines.append("| `C < T`, miss scales with concurrent-call count | parallel-batch drop (#64237) | upstream |")
+    lines.append("| `C == T` and `STDIN_BYTES>0` | healthy dispatch | in-our-control |")
+    lines.append("| `C > T` (control over-fires the surface) | over-fire anomaly | in-our-control |")
+    lines.append("")
+    lines.append("## Matrix cells")
+    lines.append("")
+    lines.append("Dimensions: **session-type x hook-surface x load x permission-mode**. "
+                 "`prov` = provenance: `real` (hooks really invoked in an isolated "
+                 "scratch dir), `modeled` (a known upstream signature not "
+                 "hermetically reproducible in CI — ground truth synthetic, said so "
+                 "here), `detection-only` (attributed from live trace, not asserted "
+                 "green).")
+    lines.append("")
+    header = ("| Cell (session x surface x load x perm) | Outcome | "
+              "Classification | Control-vs-upstream | prov / transcript | Evidence |")
+    lines.append(header)
+    lines.append("|---|---|---|---|---|---|")
+    for r in results:
+        c = r.cell
+        issue = f" {r.verdict.issue}" if r.verdict.issue else ""
+        classification = _md_escape(f"{r.verdict.label}{issue}")
+        prov = f"{c.provenance} / {c.transcript_source}"
+        row = (f"| {_md_escape(c.dims())} "
+               f"| {_md_escape(r.outcome)} "
+               f"| {classification} "
+               f"| **{r.verdict.bucket}** "
+               f"| {_md_escape(prov)} "
+               f"| {_md_escape(c.evidence or c.note)} |")
+        lines.append(row)
+    lines.append("")
+
+    # Totality + accounting summary.
+    total = len(results)
+    upstream = sum(1 for r in results if r.verdict.bucket == UPSTREAM)
+    ours = sum(1 for r in results if r.verdict.bucket == IN_OUR_CONTROL)
+    lines.append("## Totality")
+    lines.append("")
+    lines.append(f"All **{total}** cells classified: **{ours} in-our-control**, "
+                 f"**{upstream} upstream**. Every verdict maps to exactly one bucket; "
+                 f"no unclassified cell. Enforced by "
+                 f"`bin/test_sable_hook_matrix.py::test_totality_over_synthetic_grid`.")
+    lines.append("")
+    lines.append("## Acknowledged gap (S4-E3 / D5 boundary)")
+    lines.append("")
+    lines.append("The **session-age>2h** cell is **DETECTION-ONLY**: the #16047 "
+                 "empty-stdin degradation manifests only after a long-lived session "
+                 "ages, which is not hermetically reproducible in CI. Per the D5 "
+                 "boundary it is *detected* here (session-age is in the D1 trace "
+                 "schema) and attributed from live trace-log data rather than "
+                 "asserted green; session rotation is delegated to SABLE-ke3l. This "
+                 "gap is recorded, not hidden.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="D6 repro-matrix harness + S4 classification doc")
+    ap.add_argument("--emit-doc", metavar="PATH",
+                    help="drive the matrix and write the classification doc to PATH")
+    ap.add_argument("--print", action="store_true",
+                    help="render the doc to stdout")
+    ap.add_argument("--transcript", metavar="PATH",
+                    help="count ground-truth tool_use from a real session transcript jsonl")
+    ap.add_argument("--workdir", metavar="DIR",
+                    help="scratch dir for real hook invocations (default: a tempdir)")
+    args = ap.parse_args(argv)
+
+    if not args.emit_doc and not args.print:
+        ap.error("nothing to do: pass --emit-doc PATH and/or --print")
+
+    if args.workdir:
+        wd = Path(args.workdir)
+        wd.mkdir(parents=True, exist_ok=True)
+        results = build_matrix(wd, transcript=args.transcript)
+    else:
+        with tempfile.TemporaryDirectory(prefix="sable-hook-matrix-") as tmp:
+            results = build_matrix(Path(tmp), transcript=args.transcript)
+
+    doc = render_doc(results)
+
+    if args.emit_doc:
+        out = Path(args.emit_doc)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(doc + "\n", encoding="utf-8")
+        sys.stderr.write(f"wrote {out} ({len(results)} cells)\n")
+    if args.print:
+        sys.stdout.write(doc + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
