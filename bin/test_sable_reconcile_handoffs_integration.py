@@ -25,6 +25,7 @@ leaks stripped, BD_NON_INTERACTIVE), all git ops on tmp_path scratch repos
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -33,6 +34,17 @@ import pytest
 
 BIN = Path(__file__).resolve().parent / "sable-reconcile-handoffs"
 BASE = "trunk"
+
+# The ci-verify clean-room is tmux+pytest only — no bd/dolt by design. These
+# rehearsals drive a REAL sandbox beads DB (`bd init` under a throwaway HOME),
+# so the whole module self-skips when bd is absent, matching the
+# bd/dolt-suites-self-skip contract stated in ci-verify.yml. (Passed reviewer-run
+# because the dev env HAS bd; this guard is what keeps the clean-room gate green.)
+HAVE_BD = shutil.which("bd") is not None
+pytestmark = pytest.mark.skipif(
+    not HAVE_BD,
+    reason="ci-verify clean-room has no bd/dolt by design; real-bd integration self-skips",
+)
 
 # env this test's HOME/bd must not inherit from the developer session
 _ENV_LEAKS = (
