@@ -244,6 +244,60 @@ def test_pane_pid_fails_open_when_tmux_errors():
     assert spl.pane_process_identity(["tmux"], "%9", run=boom) is None
 
 
+# --- pane_is_live_nonworker_agent (SABLE-k8o5): spare a live agent we did not
+# spawn as a worker, keyed on the SABLE_WORKER_PANE spawn marker rather than the
+# CLAUDE_AGENT_NAME (a worker inherits its OWNING MANAGER's lane name) ----------
+
+def _proc_with_env(tmp_path, pid, env):
+    """A fake /proc root whose <pid>/environ carries the given env dict."""
+    d = tmp_path / str(pid)
+    d.mkdir()
+    entries = [f"{k}={v}".encode() for k, v in {"PATH": "/usr/bin", **env}.items()]
+    (d / "environ").write_bytes(b"\x00".join(entries) + b"\x00")
+    return str(tmp_path)
+
+
+def test_live_nonworker_agent_true_for_resumed_manager(tmp_path):
+    # An interactive claude (CLAUDE_AGENT_NAME set) with NO worker marker: a
+    # resumed manager/cockpit occupying a stale-done window -> spare it.
+    proc = _proc_with_env(tmp_path, 100, {"CLAUDE_AGENT_NAME": "optimus"})
+    run = _fake_tmux(100, role_tag=None)
+    assert spl.pane_is_live_nonworker_agent(["tmux"], "%1", run=run, proc_root=proc) is True
+
+
+def test_live_nonworker_agent_false_for_spawned_worker(tmp_path):
+    # A genuine done worker: SAME lane identity as its manager, but carries the
+    # SABLE_WORKER_PANE=1 spawn marker -> NOT spared (reaped).
+    proc = _proc_with_env(tmp_path, 101,
+                          {"CLAUDE_AGENT_NAME": "optimus", "SABLE_WORKER_PANE": "1"})
+    run = _fake_tmux(101, role_tag=None)
+    assert spl.pane_is_live_nonworker_agent(["tmux"], "%1", run=run, proc_root=proc) is False
+
+
+def test_live_nonworker_agent_false_for_bare_shell(tmp_path):
+    # No CLAUDE_AGENT_NAME at all (a pane SABLE did not spawn) -> no authority to
+    # spare, fail-open (reaped on the tag as before).
+    proc = _proc_with_env(tmp_path, 102, {})
+    run = _fake_tmux(102, role_tag=None)
+    assert spl.pane_is_live_nonworker_agent(["tmux"], "%1", run=run, proc_root=proc) is False
+
+
+def test_live_nonworker_agent_false_when_pane_gone(tmp_path):
+    # tmux can't resolve the pid (vanished pane) -> fail-open (not spared).
+    def boom(cmd):
+        raise FileNotFoundError("tmux not installed")
+    assert spl.pane_is_live_nonworker_agent(["tmux"], "%9", run=boom) is False
+
+
+def test_live_nonworker_agent_false_for_empty_worker_marker(tmp_path):
+    # Belt-and-braces: an EMPTY SABLE_WORKER_PANE (tmux `-e VAR=` override used in
+    # the hermetic integration tests) is falsy -> still counts as a non-worker.
+    proc = _proc_with_env(tmp_path, 103,
+                          {"CLAUDE_AGENT_NAME": "optimus", "SABLE_WORKER_PANE": ""})
+    run = _fake_tmux(103, role_tag=None)
+    assert spl.pane_is_live_nonworker_agent(["tmux"], "%1", run=run, proc_root=proc) is True
+
+
 if __name__ == "__main__":
     import sys
     import pytest as _p
