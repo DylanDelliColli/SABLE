@@ -178,6 +178,23 @@ def test_rehearsal_override_promotes_without_ci(tmp_path):
     assert _ci_verify_refs(origin) == []
 
 
+# --- SABLE-sc24: a cancelled preview run re-gates (retryable), never RED --------
+
+def test_rehearsal_cancelled_run_is_retryable_not_red(tmp_path):
+    # A run cancelled mid-flight (conclusion=='cancelled') is not a test failure.
+    # The gate must exit RETRYABLE (24, rebuild preview + re-gate), NOT the red
+    # path's exit 20 with a fix-and-re-push instruction — and must not promote.
+    origin, work = _setup(tmp_path)
+    gh = _write_fake_gh(tmp_path, origin, "cancelled")
+    before = _origin_base_sha(origin)
+
+    cp = _promote(work, gh)
+    assert cp.returncode == 24, cp.stdout
+    assert cp.returncode != 20, "cancellation must not take the RED path"
+    assert _origin_base_sha(origin) == before, "base advanced on a cancelled run"
+    assert _ci_verify_refs(origin) == [], "ci-verify ref not cleaned up on cancelled"
+
+
 # --- Conflict delegation + sweep ---------------------------------------------
 
 def test_conflict_delegates_exit_22_no_ref(tmp_path):
@@ -348,3 +365,38 @@ def test_sweep_deletes_only_aged_orphans(tmp_path):
     remaining = _ci_verify_refs(origin)
     assert "refs/heads/ci-verify/old-aaaaaaa" not in remaining, "aged orphan not swept"
     assert "refs/heads/ci-verify/new-bbbbbbb" in remaining, "fresh ref wrongly swept"
+
+
+def _write_fake_gh_status(tmp_path, status):
+    """A fake gh whose `run list` reports one run with the given status (and null
+    conclusion) for ANY --branch — exercises the sweep in-flight guard (SABLE-sc24)."""
+    gh = tmp_path / "fake-gh-status"
+    gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys,json\n"
+        f"s={status!r}\n"
+        "print(json.dumps([{'databaseId':1,'status':s,'conclusion':None,'url':'http://fake/run/1'}]))\n"
+    )
+    gh.chmod(gh.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return gh
+
+
+def test_sweep_spares_aged_ref_with_inflight_run(tmp_path):
+    # SABLE-sc24: an aged ci-verify ref whose Actions run is still in-flight must
+    # NOT be reaped — deleting it cancels the run (the spurious-RED failure).
+    origin, work = _setup(tmp_path)
+    base_sha = _origin_base_sha(origin)
+    base_tree = _git(work, "rev-parse", base_sha + "^{tree}")
+    old_env = dict(os.environ,
+                   GIT_COMMITTER_DATE="2000-01-01T00:00:00 +0000",
+                   GIT_AUTHOR_DATE="2000-01-01T00:00:00 +0000")
+    old_sha = _run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit-tree", base_tree, "-m", "old-preview"], cwd=str(work), env=old_env).stdout.strip()
+    _git(work, "push", "origin", f"{old_sha}:refs/heads/ci-verify/inflight-aaaaaaa")
+
+    gh = _write_fake_gh_status(tmp_path, "in_progress")
+    cp = _run([sys.executable, str(BIN), "sweep", "--max-age-hours", "6",
+               "--repo", str(work), "--remote", "origin"], cwd=str(work), env=_env(gh))
+    assert cp.returncode == 0, cp.stdout
+    assert "refs/heads/ci-verify/inflight-aaaaaaa" in _ci_verify_refs(origin), \
+        "aged ref with an in-flight run was wrongly swept (would cancel the run)"

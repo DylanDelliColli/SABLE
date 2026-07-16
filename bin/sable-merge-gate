@@ -20,6 +20,12 @@ green — it promotes the same commit object it tested.
      Delete the ci-verify ref, append evidence to the bead.
   6. RED    -> NO promotion. Capture run URL, delete ci-verify ref, notify the
      lane manager, append evidence. Exit 20.
+  6b. CANCELLED (run conclusion=='cancelled', not a test failure) -> RETRYABLE,
+     never RED: a mid-flight cancellation (a concurrent sweep deleting the
+     in-flight ref, a manual cancel, or the per-ref concurrency group pre-empting
+     it) is not a content defect, so the author is told NOTHING to fix. Delete
+     the ci-verify ref, notify the manager to rebuild preview + re-gate, append
+     evidence. Exit 24 (like BASE-MOVED/23 — retry-safe). SABLE-sc24.
   7. ACTIONS-DOWN (no run appears within grace / API error) -> BLOCK: no
      promotion, notify lincoln. Only bypass is --override <url> (recorded on the
      bead). NEVER fall back to a local suite run (ayzv-class env brittleness).
@@ -31,7 +37,10 @@ local branch named `origin` makes it ambiguous (SABLE-92kc-adjacent).
 
 Cleanup: the ci-verify ref is deleted on BOTH green and red paths. `sable-merge-
 gate sweep` deletes orphaned ci-verify/* refs older than a threshold in HOURS
-(default 6) for the crash-between-push-and-cleanup case.
+(default 6) for the crash-between-push-and-cleanup case. The sweep NEVER reaps a
+ref whose Actions run is still in-flight, however old the ref's commit date —
+deleting the ref cancels the run, which is exactly the spurious-RED failure
+SABLE-sc24 exists to prevent.
 
 Prior art: the throwaway-branch pattern from the 754r verification (ci-verify-754r).
 
@@ -65,6 +74,7 @@ Exit codes:
   20 ci red, not promoted   21 actions-down / blocked (needs --override)
   22 merge-preview conflict (delegate to author)
   23 tip moved during gate (non-ff promote) — rebuild preview + re-gate (retry-safe)
+  24 ci-verify run cancelled mid-flight — rebuild preview + re-gate (retry-safe, SABLE-sc24)
   4 integrity abort (base tip != preview SHA after promote)
 """
 from __future__ import annotations
@@ -233,6 +243,30 @@ def wait_for_ci(repo: str, ref_branch: str, preview_sha: str) -> tuple[str, str]
             return ("actions_down" if not seen_run else "timeout", "")
         time.sleep(poll)
         waited += poll
+
+
+def ref_has_inflight_run(repo: str, ref_branch: str) -> bool:
+    """True iff Actions shows a not-yet-completed run on ref_branch. Deleting a
+    ci-verify ref cancels its in-progress GitHub run — the SABLE-sc24 root cause —
+    so `sweep` must never reap a ref whose run is still live, no matter how old the
+    ref's commit date is. A run is live unless its status is 'completed'
+    (queued/in_progress/waiting/requested all count as in-flight).
+
+    Best-effort and FAIL-OPEN: a gh error, unparseable output, or an absent run
+    all return False. An undiscoverable run cannot be protected, and the ref is
+    only a sweep candidate because it is already past the age threshold — so a
+    non-answer must not wedge the orphan cleanup permanently."""
+    import json
+    gh = _tool("SABLE_MG_GH", "gh")
+    cp = _run(gh + ["run", "list", "--branch", ref_branch, "--limit", "10",
+                    "--json", "status"], cwd=repo, check=False)
+    if cp.returncode != 0:
+        return False
+    try:
+        runs = json.loads(cp.stdout or "[]")
+    except json.JSONDecodeError:
+        return False
+    return any((r.get("status") or "completed") != "completed" for r in runs)
 
 
 # --------------------------------------------------------------------------
@@ -427,6 +461,23 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
                 f"merge-preview ci-verify gate BLOCKED: ref {ref}, preview {preview_sha}, Actions {conclusion}, no promotion.")
             return 21
 
+        if conclusion == "cancelled":
+            # SABLE-sc24: the run was CANCELLED mid-flight, not failed. A
+            # cancellation is not a content defect — it happens when a concurrent
+            # sweep deletes the in-flight ci-verify ref, a human cancels, or the
+            # per-ref concurrency group pre-empts the run. Treating it as RED
+            # (exit 20) mis-instructs the author to "fix + re-push" when there is
+            # nothing to fix. Instead map it to the SAME retryable contract as
+            # BASE-MOVED: no promotion, rebuild the preview + re-gate. The finally
+            # below deletes the (possibly already-gone) throwaway ref.
+            _notify(manager,
+                f"merge-preview ci-verify gate CANCELLED (retryable) for {bead} ({branch}): run {url or 'n/a'} "
+                f"was cancelled mid-flight, NOT a test failure — nothing to fix. Rebuild preview + re-gate.")
+            _append_evidence(repo, bead,
+                f"merge-preview ci-verify gate CANCELLED (retryable): ref {ref}, run {url or 'n/a'}, "
+                f"preview {preview_sha}, run cancelled mid-flight, not promoted, no content fix needed.")
+            raise GateError(24, f"ci-verify run for {bead} was cancelled mid-flight (not a failure) — rebuild preview + re-gate")
+
         _notify(manager,
             f"merge-preview ci-verify gate RED for {bead} ({branch}): run {url}, no promotion. Fix + re-push.")
         _append_evidence(repo, bead,
@@ -444,6 +495,7 @@ def sweep(repo: str, remote: str, max_age_hours: float) -> int:
                    f"refs/remotes/{remote}/ci-verify/", check=False)
     now = time.time()
     deleted = 0
+    spared = 0
     for line in listing.stdout.splitlines():
         parts = line.rsplit(" ", 1)
         if len(parts) != 2:
@@ -456,9 +508,19 @@ def sweep(repo: str, remote: str, max_age_hours: float) -> int:
         if not is_orphan(age, max_age_hours):
             continue
         branch = short.split("/", 1)[1] if "/" in short else short  # strip remote/ prefix
+        # SABLE-sc24: age alone does not make a ref an orphan. A ref whose Actions
+        # run is still in-flight is LIVE — deleting it cancels the run and REDs the
+        # gate spuriously. Never reap it, regardless of the ref's commit date.
+        if ref_has_inflight_run(repo, branch):
+            print(f"sable-merge-gate sweep: {branch} is past the {max_age_hours}h age threshold but its "
+                  f"Actions run is still in-flight — NOT reaping (deleting it would cancel the run)",
+                  file=sys.stderr)
+            spared += 1
+            continue
         _git(repo, "push", remote, "--delete", branch, check=False)
         deleted += 1
-    print(f"sable-merge-gate sweep: deleted {deleted} orphaned ci-verify ref(s) older than {max_age_hours}h")
+    spared_note = f" (spared {spared} with an in-flight run)" if spared else ""
+    print(f"sable-merge-gate sweep: deleted {deleted} orphaned ci-verify ref(s) older than {max_age_hours}h{spared_note}")
     return 0
 
 
