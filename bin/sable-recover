@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""sable-recover — post-crash forensics sweep (SABLE-wwxd).
+
+After the 2026-07-07 WSL hard shutdown, recovery worked only because worktrees
+and the bead DB are disk-durable — every worker's branch, dirty tree, and claim
+survived the power loss on disk even though every tmux pane died. The sweep that
+turned that durable state back into a resume plan was done BY HAND. This codifies
+it: one command reproduces the manual post-crash forensics and orders the resume
+steps.
+
+It answers four questions, read-only by default:
+
+  1. For every git worktree: is its branch pushed / ahead / unpushed vs origin,
+     is the tree dirty, and which bead owns it (a live pane's @sable_bead tag,
+     else the `wk-<bead>` branch name)?
+  2. Which in_progress beads have NO live worker pane? (stranded claims — the
+     crash killed the pane but left the claim standing).
+  3. Which wk-* branches are pushed to origin but not yet merged into the base
+     branch? (the hand-off list Chuck still owes a merge).
+  4. Given all of the above, what is the ORDERED resume plan — push the clean
+     unpushed branches, re-dispatch the stranded claims, hand the merge list to
+     Chuck?
+
+`--fix` applies only the SAFE step: pushing clean (non-dirty) unpushed/ahead
+branches. Re-dispatch and merge are never auto-applied — they need a manager and
+Chuck respectively, and a dirty tree is never auto-pushed (a human must look at
+uncommitted work first).
+
+Usage:
+  sable-recover [--json] [--fix] [--base BRANCH] [--repo DIR]
+                [--beads-file PATH] [--panes-file PATH]
+
+  --json         emit a machine-readable report instead of text
+  --fix          apply the safe resume step (push clean unpushed branches)
+  --base BRANCH  base branch merges land on (default: the main worktree's
+                 branch, e.g. tmux-only / main)
+  --repo DIR     run the worktree sweep from DIR (default: current directory)
+  --beads-file   read `bd list --status in_progress --json` output from a file
+                 instead of shelling out to bd (test seam / offline recovery)
+  --panes-file   read the tmux pane listing (path<TAB>bead<TAB>status per line)
+                 from a file instead of shelling out to tmux (test seam / a
+                 crash where tmux itself is gone — then EVERY claim is stranded)
+
+Exit status: 0 always in report mode; 1 if --fix hit a push that failed.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+# --- push-state vocabulary ---------------------------------------------------
+# The three states the bead description names, plus "detached" for a worktree
+# with no branch (a HEAD checkout) — never a push candidate, surfaced so a human
+# notices it rather than the tool silently skipping it.
+PUSHED = "pushed"        # local branch == origin counterpart, nothing to push
+AHEAD = "ahead"          # origin has the branch but local has newer commits
+UNPUSHED = "unpushed"    # origin has NO counterpart — the branch never left disk
+DETACHED = "detached"    # no branch (detached HEAD) — not a push candidate
+
+
+# ============================================================================
+# Pure classification layer — no git/tmux/bd; every function here is exercised
+# directly by the unit test's fixture matrix (bin/test_sable_recover.py).
+# ============================================================================
+
+def classify_push_state(has_origin: bool, ahead: int, detached: bool = False) -> str:
+    """Branch-vs-origin state from three primitives the I/O layer measures.
+
+    A detached worktree short-circuits to DETACHED regardless of the counts.
+    Otherwise: no origin counterpart -> UNPUSHED (the branch has never been
+    pushed, so all of its history is stranded on disk); an origin counterpart
+    plus local commits it lacks -> AHEAD; even with origin -> PUSHED. `ahead`
+    is a count so 0 is falsy on purpose (in-sync)."""
+    if detached:
+        return DETACHED
+    if not has_origin:
+        return UNPUSHED
+    return AHEAD if ahead > 0 else PUSHED
+
+
+def strip_wk(branch: str) -> str:
+    """The slug after the `wk-` prefix a SABLE worktree branch carries
+    (sable-spawn-worker.worktree_name -> `wk-<sanitized scope|bead>`). Returns
+    the branch unchanged when it isn't a wk- branch, so a non-worker branch
+    (main, tmux-only) never spuriously resolves to a bead."""
+    return branch[len("wk-"):] if branch.startswith("wk-") else branch
+
+
+def owning_bead(branch: str | None, pane_bead: str | None,
+                known_ids) -> tuple[str | None, str | None]:
+    """(bead_id, source) that owns a worktree.
+
+    A LIVE pane's @sable_bead tag wins — it is authoritative and survives the
+    scoped-branch case where the bead id isn't in the branch name at all
+    (`wk-sable-recover` owns SABLE-wwxd). With no pane, fall back to the branch:
+    the slug after `wk-` is matched case-insensitively against `known_ids`
+    (sable-spawn-worker lowercases the id into the branch, so `wk-sable-wwxd`
+    resolves back to the canonical `SABLE-wwxd`). No pane and no id match ->
+    (None, None): the tool reports the branch and leaves the bead unknown rather
+    than guessing."""
+    if pane_bead:
+        return pane_bead, "pane"
+    if branch:
+        slug = strip_wk(branch).lower()
+        for bid in known_ids:
+            if bid.lower() == slug:
+                return bid, "branch"
+    return None, None
+
+
+def live_pane_beads(panes) -> set:
+    """Bead ids with a RUNNING pane — the crash-survivor set. A pane whose
+    @sable_status flipped to `done` has already released its worker and does NOT
+    keep a claim live; an empty bead tag (an untagged shell) contributes
+    nothing. Everything an in_progress bead is checked against for strandedness
+    comes from here."""
+    return {p["bead"] for p in panes
+            if p.get("bead") and p.get("status") == "running"}
+
+
+def pane_bead_for_path(panes, wt_path: str) -> str | None:
+    """The @sable_bead of the running pane rooted at (or inside) `wt_path`, or
+    None. A worker's shell CWD IS its worktree, so a running pane whose
+    pane_current_path is the worktree root — or a subdir of it — identifies the
+    bead that worktree is executing. Done panes are ignored (their worktree is
+    finished work, not a live claim)."""
+    norm = wt_path.rstrip("/")
+    for p in panes:
+        if p.get("status") != "running" or not p.get("bead"):
+            continue
+        path = (p.get("path") or "").rstrip("/")
+        if path == norm or path.startswith(norm + "/"):
+            return p["bead"]
+    return None
+
+
+def stranded_claims(in_progress_beads, panes) -> list:
+    """in_progress beads with NO live pane — a claim the crash orphaned. Each
+    surviving entry keeps its {id, title} so the resume plan can name it. Order
+    follows the bead snapshot (stable, caller-controlled)."""
+    live = live_pane_beads(panes)
+    return [b for b in in_progress_beads if b.get("id") not in live]
+
+
+def unmerged_branches(origin_wk_branches, merged_wk_branches) -> list:
+    """Pushed wk-* branches on origin NOT yet merged into the base — the set
+    Chuck still owes a merge. `merged_wk_branches` is what git reports as already
+    reachable from the base tip; the difference (order-preserving over the origin
+    list) is the outstanding hand-off."""
+    merged = set(merged_wk_branches)
+    return [b for b in origin_wk_branches if b not in merged]
+
+
+def enrich_worktree(wt: dict, panes, known_ids) -> dict:
+    """One worktree record -> its full forensic row: push_state + owning bead
+    (+ source). `wt` carries the primitives the I/O layer measured
+    (branch/detached/dirty/has_origin/ahead); this adds the derived, testable
+    classification without touching git."""
+    branch = wt.get("branch")
+    push_state = classify_push_state(
+        wt.get("has_origin", False), wt.get("ahead", 0), wt.get("detached", False)
+    )
+    pane_bead = pane_bead_for_path(panes, wt["path"])
+    bead, source = owning_bead(branch, pane_bead, known_ids)
+    return {
+        "path": wt["path"],
+        "branch": branch,
+        "detached": wt.get("detached", False),
+        "dirty": wt.get("dirty", False),
+        "push_state": push_state,
+        "bead": bead,
+        "bead_source": source,
+    }
+
+
+def is_wk_branch(branch: str | None) -> bool:
+    return bool(branch) and branch.startswith("wk-")
+
+
+def build_plan(rows, stranded, unmerged) -> list:
+    """The ordered resume plan the manual sweep produced, as structured steps.
+
+    Order is the recovery order from the bead description, and it is causal, not
+    cosmetic: push first so freshly-pushed branches JOIN the merge list; then
+    re-dispatch stranded claims (their worker died, the work must resume); then
+    hand Chuck the full merge list last, once nothing new will land on origin.
+
+    - push:      a wk-* worktree that is clean (not dirty) and has commits not on
+                 origin (unpushed OR ahead). The one step --fix will apply.
+    - review:    a worktree with unpushed/ahead commits but a DIRTY tree — never
+                 auto-pushed; a human must resolve the uncommitted work first.
+    - redispatch: a stranded in_progress claim — re-spawn a worker for it.
+    - merge:     a single step handing the unmerged-branch list to Chuck.
+
+    Each step is {order, action, target, detail}. `order` is the group rank so a
+    caller can render or execute groups in sequence."""
+    steps: list[dict] = []
+
+    # 1) push clean unpushed/ahead wk-* branches
+    for r in rows:
+        if not is_wk_branch(r["branch"]):
+            continue
+        if r["push_state"] not in (UNPUSHED, AHEAD):
+            continue
+        if r["dirty"]:
+            steps.append({
+                "order": 1, "action": "review", "target": r["branch"],
+                "detail": f"{r['push_state']} commits in a DIRTY tree at "
+                          f"{r['path']} — resolve uncommitted work, then push",
+            })
+        else:
+            steps.append({
+                "order": 1, "action": "push", "target": r["branch"],
+                "detail": f"push {r['push_state']} branch from {r['path']}",
+            })
+
+    # 2) re-dispatch stranded claims
+    for b in stranded:
+        title = b.get("title", "")
+        steps.append({
+            "order": 2, "action": "redispatch", "target": b.get("id"),
+            "detail": f"re-dispatch stranded claim {b.get('id')}"
+                      + (f": {title}" if title else ""),
+        })
+
+    # 3) hand the merge list to Chuck (one step)
+    if unmerged:
+        steps.append({
+            "order": 3, "action": "merge", "target": "chuck",
+            "detail": "hand Chuck the merge list: " + ", ".join(unmerged),
+        })
+
+    return steps
+
+
+def build_report(worktrees, in_progress_beads, panes, origin_wk_branches,
+                 merged_wk_branches, known_ids=None, base_branch=None) -> dict:
+    """Assemble the whole forensic report from already-collected primitives.
+    Pure — the unit test drives this with synthetic fixtures; main() drives it
+    with real git/tmux/bd output. `known_ids` defaults to the in_progress bead
+    ids (the set a worktree branch could resolve against)."""
+    if known_ids is None:
+        known_ids = [b.get("id") for b in in_progress_beads if b.get("id")]
+    rows = [enrich_worktree(wt, panes, known_ids) for wt in worktrees]
+    stranded = stranded_claims(in_progress_beads, panes)
+    unmerged = unmerged_branches(origin_wk_branches, merged_wk_branches)
+    plan = build_plan(rows, stranded, unmerged)
+    return {
+        "base_branch": base_branch,
+        "worktrees": rows,
+        "stranded_claims": stranded,
+        "unmerged_branches": unmerged,
+        "plan": plan,
+    }
+
+
+# ============================================================================
+# Parsers — text in, structured data out. Also pure; also unit-tested.
+# ============================================================================
+
+def parse_worktrees(porcelain: str) -> list:
+    """`git worktree list --porcelain` -> [{path, head, branch, detached, bare}].
+    `branch` is the short name (refs/heads/wk-foo -> wk-foo) or None when the
+    worktree is detached or bare. Blank-line-separated stanzas, one per
+    worktree; the first stanza is always the main worktree."""
+    trees: list[dict] = []
+    cur: dict = {}
+    for line in porcelain.splitlines():
+        if not line.strip():
+            if cur:
+                trees.append(cur)
+                cur = {}
+            continue
+        if line.startswith("worktree "):
+            cur = {"path": line[len("worktree "):].strip(),
+                   "branch": None, "detached": False, "bare": False, "head": None}
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):].strip()
+        elif line.startswith("branch "):
+            ref = line[len("branch "):].strip()
+            cur["branch"] = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+        elif line.strip() == "detached":
+            cur["detached"] = True
+        elif line.strip() == "bare":
+            cur["bare"] = True
+    if cur:
+        trees.append(cur)
+    return trees
+
+
+def parse_panes(text: str) -> list:
+    """Tab-delimited `path<TAB>bead<TAB>status` pane dump -> [{path, bead,
+    status}]. Tab-delimited (not space) so an EMPTY bead field on an untagged
+    shell keeps its column instead of collapsing and shifting status left —
+    the same discipline sable-worker-status._FORMAT relies on. A line with
+    fewer than three fields is tolerated (missing tail fields default empty)."""
+    panes: list[dict] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        panes.append({
+            "path": parts[0] if len(parts) >= 1 else "",
+            "bead": parts[1] if len(parts) >= 2 else "",
+            "status": parts[2] if len(parts) >= 3 and parts[2] else "running",
+        })
+    return panes
+
+
+# ============================================================================
+# I/O layer — the only code that touches git/tmux/bd. Thin by design so the
+# logic above stays testable without a live environment.
+# ============================================================================
+
+def _run(cmd, cwd=None):
+    return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+
+
+def git_worktrees(repo: str) -> list:
+    r = _run(["git", "-C", repo, "worktree", "list", "--porcelain"])
+    if r.returncode != 0:
+        raise RuntimeError(f"git worktree list failed: {r.stderr.strip()}")
+    return parse_worktrees(r.stdout)
+
+
+def worktree_dirty(path: str) -> bool:
+    r = _run(["git", "-C", path, "status", "--porcelain"])
+    if r.returncode != 0:
+        return False
+    return bool(r.stdout.strip())
+
+
+def origin_state(path: str, branch: str | None) -> tuple[bool, int]:
+    """(has_origin_counterpart, commits_ahead) for `branch` in worktree `path`.
+    has_origin is a real ref check; ahead counts commits in the local branch not
+    on origin/<branch> (0 when origin lacks it — meaningless there, and the
+    UNPUSHED classification ignores it anyway)."""
+    if not branch:
+        return False, 0
+    ref = f"refs/remotes/origin/{branch}"
+    has = _run(["git", "-C", path, "rev-parse", "--verify", "--quiet", ref]).returncode == 0
+    if not has:
+        return False, 0
+    r = _run(["git", "-C", path, "rev-list", "--count", f"{ref}..HEAD"])
+    ahead = int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 0
+    return True, ahead
+
+
+def collect_worktrees(repo: str) -> list:
+    """git_worktrees + per-tree dirty/origin measurement -> the primitive
+    records enrich_worktree/build_report consume."""
+    out = []
+    for wt in git_worktrees(repo):
+        if wt.get("bare"):
+            continue
+        has_origin, ahead = origin_state(wt["path"], wt.get("branch"))
+        out.append({
+            "path": wt["path"],
+            "branch": wt.get("branch"),
+            "detached": wt.get("detached", False),
+            "dirty": worktree_dirty(wt["path"]),
+            "has_origin": has_origin,
+            "ahead": ahead,
+        })
+    return out
+
+
+def detect_base_branch(repo: str, override: str | None) -> str:
+    """The branch merges land on: --base wins; else the MAIN worktree's branch
+    (first stanza of `git worktree list`, e.g. tmux-only); else `main`."""
+    if override:
+        return override
+    try:
+        trees = git_worktrees(repo)
+    except RuntimeError:
+        return "main"
+    if trees and trees[0].get("branch"):
+        return trees[0]["branch"]
+    return "main"
+
+
+def load_in_progress(beads_file: str | None) -> list:
+    raw = None
+    if beads_file:
+        with open(beads_file, encoding="utf-8") as fh:
+            raw = fh.read()
+    else:
+        r = _run(["bd", "list", "--status", "in_progress", "--json"])
+        raw = r.stdout if r.returncode == 0 else ""
+    if not raw or not raw.strip():
+        return []
+    data = json.loads(raw)
+    return data if isinstance(data, list) else [data]
+
+
+def load_panes(panes_file: str | None) -> list:
+    if panes_file:
+        with open(panes_file, encoding="utf-8") as fh:
+            return parse_panes(fh.read())
+    fmt = "#{pane_current_path}\t#{@sable_bead}\t#{@sable_status}"
+    r = _run(["tmux", "list-panes", "-a", "-F", fmt])
+    # No tmux server / no panes -> zero live panes: post-crash, that is exactly
+    # right and means every in_progress bead reads as stranded.
+    return parse_panes(r.stdout) if r.returncode == 0 else []
+
+
+def origin_wk_branch_state(repo: str, base_branch: str) -> tuple[list, list]:
+    """(all origin/wk-* short names, those merged into origin/<base>)."""
+    r = _run(["git", "-C", repo, "for-each-ref", "--format=%(refname:short)",
+              "refs/remotes/origin/wk-*"])
+    all_wk = [b.strip() for b in r.stdout.splitlines() if b.strip()] if r.returncode == 0 else []
+    base_ref = f"origin/{base_branch}"
+    m = _run(["git", "-C", repo, "branch", "-r", "--merged", base_ref,
+              "--list", "origin/wk-*"])
+    merged = []
+    if m.returncode == 0:
+        merged = [ln.strip().lstrip("* ").strip() for ln in m.stdout.splitlines() if ln.strip()]
+    return all_wk, merged
+
+
+# ============================================================================
+# --fix — apply only the safe step (push clean unpushed/ahead branches).
+# ============================================================================
+
+def apply_fix(report: dict) -> tuple[list, list]:
+    """Execute the `push` steps; return (pushed_ok, push_failed) branch lists.
+    Only push steps run — review/redispatch/merge are printed as manual
+    follow-ups by the caller. Each push runs from that worktree's own path
+    (`git -C <worktree> push`), never against the current tree."""
+    by_branch = {r["branch"]: r for r in report["worktrees"]}
+    ok, failed = [], []
+    for step in report["plan"]:
+        if step["action"] != "push":
+            continue
+        branch = step["target"]
+        row = by_branch.get(branch)
+        if not row:
+            failed.append(branch)
+            continue
+        r = _run(["git", "-C", row["path"], "push", "origin", branch])
+        (ok if r.returncode == 0 else failed).append(branch)
+    return ok, failed
+
+
+# ============================================================================
+# Rendering
+# ============================================================================
+
+def render_text(report: dict) -> str:
+    lines = []
+    base = report.get("base_branch") or "?"
+    lines.append(f"sable-recover — post-crash forensics sweep (base: {base})")
+    lines.append("")
+
+    lines.append("WORKTREES")
+    if not report["worktrees"]:
+        lines.append("  (none)")
+    for r in report["worktrees"]:
+        bead = r["bead"] or "unknown"
+        src = f" [{r['bead_source']}]" if r["bead_source"] else ""
+        dirty = "DIRTY" if r["dirty"] else "clean"
+        lines.append(f"  {r['push_state']:<8} {dirty:<5} {r['branch'] or '(detached)'}"
+                     f"  →  {bead}{src}")
+        lines.append(f"           {r['path']}")
+
+    lines.append("")
+    lines.append(f"STRANDED CLAIMS ({len(report['stranded_claims'])})")
+    if not report["stranded_claims"]:
+        lines.append("  (none — every in_progress bead has a live pane)")
+    for b in report["stranded_claims"]:
+        lines.append(f"  {b.get('id')}  {b.get('title', '')}".rstrip())
+
+    lines.append("")
+    lines.append(f"PUSHED-BUT-UNMERGED wk-* BRANCHES ({len(report['unmerged_branches'])})")
+    if not report["unmerged_branches"]:
+        lines.append("  (none — origin has nothing waiting on a merge)")
+    for b in report["unmerged_branches"]:
+        lines.append(f"  {b}")
+
+    lines.append("")
+    lines.append("RESUME PLAN")
+    if not report["plan"]:
+        lines.append("  (nothing to do — state is clean)")
+    for i, step in enumerate(report["plan"], 1):
+        lines.append(f"  {i}. [{step['action']}] {step['detail']}")
+
+    return "\n".join(lines)
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+def collect_report(args) -> dict:
+    repo = os.path.abspath(args.repo)
+    base_branch = detect_base_branch(repo, args.base)
+    worktrees = collect_worktrees(repo)
+    in_progress = load_in_progress(args.beads_file)
+    panes = load_panes(args.panes_file)
+    origin_wk, merged_wk = origin_wk_branch_state(repo, base_branch)
+    return build_report(worktrees, in_progress, panes, origin_wk, merged_wk,
+                        base_branch=base_branch)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="sable-recover",
+        description="Post-crash forensics sweep: worktree push state, dirty "
+                    "trees, stranded claims, unmerged branches, ordered resume plan.",
+    )
+    parser.add_argument("--json", action="store_true", help="machine-readable report")
+    parser.add_argument("--fix", action="store_true",
+                        help="apply the safe step (push clean unpushed branches)")
+    parser.add_argument("--base", default=None, help="base branch merges land on")
+    parser.add_argument("--repo", default=".", help="repo dir to sweep (default: cwd)")
+    parser.add_argument("--beads-file", default=None,
+                        help="read `bd list --status in_progress --json` from a file")
+    parser.add_argument("--panes-file", default=None,
+                        help="read the tmux pane dump (path<TAB>bead<TAB>status) from a file")
+    args = parser.parse_args(argv)
+
+    report = collect_report(args)
+
+    rc = 0
+    if args.fix:
+        pushed, failed = apply_fix(report)
+        report["fix"] = {"pushed": pushed, "failed": failed}
+        if failed:
+            rc = 1
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(render_text(report))
+        if args.fix:
+            f = report["fix"]
+            print("")
+            print("FIX APPLIED")
+            print(f"  pushed: {', '.join(f['pushed']) or '(none)'}")
+            if f["failed"]:
+                print(f"  FAILED: {', '.join(f['failed'])}")
+            manual = [s for s in report["plan"] if s["action"] != "push"]
+            if manual:
+                print("  remaining (manual): "
+                      + "; ".join(f"[{s['action']}] {s['target']}" for s in manual))
+
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
