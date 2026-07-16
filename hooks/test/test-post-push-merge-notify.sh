@@ -602,6 +602,34 @@ fi
 rm -f "$BD_LOG" "$SABLE_MSG_LOG"
 
 # --------------------------------------------------------------------------
+# SABLE-xuxx: a LEAKED SABLE_BASE_BRANCH that actually EXISTS in this repo
+# (origin/main — present in nearly every repo) must NOT override a PUBLISHED
+# integration branch (origin/tmux-only). The SABLE-cstk test above only
+# covers a leaked value that does NOT exist (origin/llm-integration), so the
+# old exists-check (`git rev-parse --verify --quiet "$SABLE_BASE_BRANCH"`)
+# never got exercised on its true-branch: honoring SABLE_BASE_BRANCH whenever
+# it resolves, even over a published origin/<INT>. Reusing INTNOTIFY_REPO
+# (origin/main has base.txt only; tmux-only adds i1.txt; wk-other branches off
+# tmux-only adding w1.txt) — pre-fix, SABLE_BASE_BRANCH=origin/main EXISTS so
+# it wins, diffing origin/main...wk-other and leaking i1.txt (tmux-only's own
+# history) into the file list alongside the real w1.txt change.
+# --------------------------------------------------------------------------
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+XUXX_INPUT=$(make_post_input "git push origin wk-other" "$INTNOTIFY_REPO")
+run_hook "$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_MERGE_NOTIFY_VIA_MSG=0" "$XUXX_INPUT" >/dev/null
+if grep -q 'w1.txt' "$BD_LOG" 2>/dev/null; then
+  pass "SABLE-xuxx: leaked-but-existing SABLE_BASE_BRANCH=origin/main — FILES list still includes the real change (w1.txt)"
+else
+  fail "SABLE-xuxx: leaked-but-existing SABLE_BASE_BRANCH=origin/main — FILES list still includes the real change (w1.txt)" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null)"
+fi
+if grep -q 'i1.txt' "$BD_LOG" 2>/dev/null; then
+  fail "SABLE-xuxx: leaked-but-existing SABLE_BASE_BRANCH=origin/main does NOT override published origin/tmux-only (no i1.txt leak)" "BD_LOG: $(cat "$BD_LOG" 2>/dev/null)"
+else
+  pass "SABLE-xuxx: leaked-but-existing SABLE_BASE_BRANCH=origin/main does NOT override published origin/tmux-only (no i1.txt leak)"
+fi
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+
+# --------------------------------------------------------------------------
 # SABLE-pzfk: default BASE_BRANCH must resolve to the repo's PUBLISHED
 # integration branch, not a hardcoded origin/main, when SABLE_BASE_BRANCH is
 # unset. Fixture: integration branch (tmux-only) diverges from main by 9 doc
@@ -1060,8 +1088,19 @@ chmod +x "$STUB_DIR/bd"
 REAL_GIT=$(command -v git)
 cat > "$STUB_DIR/git" <<EOF
 #!/usr/bin/env bash
-# Passthrough git stub with injectable ls-remote lag (SABLE-tb1y).
+# Passthrough git stub with injectable ls-remote lag (SABLE-tb1y) and an
+# injectable ls-remote HANG (SABLE-27r3: a stalled GitHub SSH connection
+# never returns at all, as opposed to the lag case above which returns late
+# but promptly). SABLE_TEST_LSREMOTE_SLEEP sleeps far longer than any
+# per-attempt timeout under test, so the assertion is on the hook's \`timeout\`
+# wrapper actually cutting the hang short — not on this stub ever completing.
 if { [ "\$1" = "ls-remote" ]; } || { [ "\$1" = "-C" ] && [ "\$3" = "ls-remote" ]; }; then
+  if [ -n "\${SABLE_TEST_LSREMOTE_SLEEP:-}" ]; then
+    # exec (not a forked child) so the process `timeout` signals IS the sleep
+    # itself — no orphaned grandchild that could outlive the signal and keep
+    # this call's output pipe open past the timeout bound.
+    exec sleep "\$SABLE_TEST_LSREMOTE_SLEEP"
+  fi
   if [ -n "\${SABLE_TEST_LSREMOTE_LAG:-}" ] && [ -n "\${SABLE_TEST_LSREMOTE_COUNT_FILE:-}" ]; then
     n=\$(( \$(cat "\$SABLE_TEST_LSREMOTE_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
     echo "\$n" > "\$SABLE_TEST_LSREMOTE_COUNT_FILE"
@@ -1155,6 +1194,34 @@ if [ -f "$TB1Y_TRACE" ]; then
   fail "SABLE-tb1y: SABLE_HOOK_TRACE=0 disables tracing" "trace file written despite disable: $(cat "$TB1Y_TRACE" 2>/dev/null)"
 else
   pass "SABLE-tb1y: SABLE_HOOK_TRACE=0 disables tracing (no trace file)"
+fi
+
+# --------------------------------------------------------------------------
+# SABLE-27r3: a HUNG ls-remote (stalled GitHub SSH, as opposed to the
+# lag-then-settle case above) must not block the hook for the whole retry
+# budget. Each ls-remote read is now wrapped in `timeout`, tunable via
+# SABLE_LSREMOTE_TIMEOUT. The stub's ls-remote sleeps far longer (30s) than
+# the 1s per-attempt timeout under test, across both of the 2 allowed
+# attempts (SABLE_PUSH_CONFIRM_RETRIES=1) — if the timeout wrapper is
+# missing/ineffective this test would hang for ~30s+ instead of finishing in
+# ~2s, and the wall-clock assertion below catches that regression directly.
+# --------------------------------------------------------------------------
+rm -f "$BD_LOG" "$SABLE_MSG_LOG" "$TB1Y_COUNT"
+SECONDS=0
+TIMEOUT_OUT=$(run_hook \
+  "$MGR_ENV SABLE_STUB_CHUCK_PRESENT=0 SABLE_TEST_LSREMOTE_SLEEP=30 SABLE_LSREMOTE_TIMEOUT=1 SABLE_PUSH_CONFIRM_RETRIES=1 SABLE_PUSH_CONFIRM_SLEEP=0.01" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")")
+TIMEOUT_ELAPSED=$SECONDS
+if [ "$TIMEOUT_ELAPSED" -le 10 ]; then
+  pass "SABLE-27r3: hung ls-remote is bounded by timeout — hook returns in ${TIMEOUT_ELAPSED}s, not the ~30s hang"
+else
+  fail "SABLE-27r3: hung ls-remote is bounded by timeout — hook returns in ${TIMEOUT_ELAPSED}s, not the ~30s hang" "OUTPUT: $TIMEOUT_OUT"
+fi
+assert_bd_not_called "SABLE-27r3: hung ls-remote skips (no notify) rather than reviewing unconfirmed work"
+if printf '%s' "$TIMEOUT_OUT" | grep -qi 'NOT confirmed on origin'; then
+  pass "SABLE-27r3: hung ls-remote skip is LOUD, not silent"
+else
+  fail "SABLE-27r3: hung ls-remote skip is LOUD, not silent" "OUTPUT: $TIMEOUT_OUT"
 fi
 
 # Remove the passthrough git stub so later fixtures/tests use real git directly.
