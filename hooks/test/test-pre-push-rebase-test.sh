@@ -642,9 +642,13 @@ rm -rf "$YZ_BARE" "$YZ_REPO"
 #   Case 1 RED (pre-fix): env unset → BASE=origin/main → conflicting rebase
 #                → deny "phase 1"; GREEN: BASE=origin/tmux-only → clean
 #                rebase over i3 → "phase skipped".
-#   Case 2 RED (pre-fix): leaked SABLE_BASE_BRANCH=origin/main → conflicting
-#                rebase deny (wrong message); GREEN: wrong-base guard DENIES
-#                before any rewrite.
+#   Case 2 (SABLE-1238): a leaked SABLE_BASE_BRANCH=origin/main must NOT force
+#                the base or block the push — the repo's authoritative config
+#                (sable.integrationBranch=tmux-only, published) wins, so phase 1
+#                rebases cleanly onto origin/tmux-only and the push proceeds
+#                ("phase skipped"). Pre-SABLE-1238 this DENIED via the wrong-base
+#                guard, whose remediation ("unset SABLE_BASE_BRANCH and retry")
+#                was unreachable: a PreToolUse hook can't read the push's env.
 # ===================================================================
 AMZ_BARE="$TMPROOT/4amz-bare.git"
 AMZ_REPO="$TMPROOT/4amz-repo"
@@ -675,8 +679,8 @@ AMZ_ENV="$MGR_ENV SABLE_PRE_PUSH_TYPECHECK_COMMAND=true SABLE_PRE_PUSH_TEST_PHAS
 assert_context "4amz: unset SABLE_BASE_BRANCH → phase-1 rebases onto origin/<INT>, not origin/main (clean pass)" \
   "$AMZ_ENV" "git push origin wk-4amz-w" "$AMZ_REPO" "phase skipped"
 AMZ_LEAK_ENV="$AMZ_ENV SABLE_BASE_BRANCH=origin/main"
-assert_deny "4amz: leaked SABLE_BASE_BRANCH=origin/main on a worker branch → wrong-base guard denies (no silent rewrite)" \
-  "$AMZ_LEAK_ENV" "git push origin wk-4amz-w" "$AMZ_REPO" "wrong-base guard"
+assert_context "SABLE-1238: leaked SABLE_BASE_BRANCH=origin/main is IGNORED — authoritative config rebases onto origin/tmux-only (clean pass, no deny)" \
+  "$AMZ_LEAK_ENV" "git push origin wk-4amz-w" "$AMZ_REPO" "phase skipped"
 rm -rf "$AMZ_BARE" "$AMZ_REPO"
 
 # Cleanup

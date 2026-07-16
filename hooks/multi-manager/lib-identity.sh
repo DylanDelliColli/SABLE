@@ -460,6 +460,51 @@ sable_resolve_integration_branch() {
   return 0
 }
 
+# sable_resolve_base_branch <repo-path>
+#
+# Resolves the AUTHORITATIVE Phase-1 rebase base for <repo-path> (SABLE-1238).
+# Base identity is a property of the TARGET REPO's configured integration
+# branch, NOT the pushing session's environment. When that integration branch
+# (sable_resolve_integration_branch — git config sable.integrationBranch, then
+# the checked-in .sable file, then env) is PUBLISHED at origin/<INT>, THAT ref
+# IS the base and nothing overrides it: not a leaked session
+# $SABLE_BASE_BRANCH, not refs/remotes/origin/HEAD, not origin/main.
+#
+# This is the fix for the wrong-base guard that resolved worker branches onto
+# origin/main and then denied with a remediation ("unset the leaked
+# SABLE_BASE_BRANCH, or set it to origin/<INT>, and retry") that could never
+# work: the pre-push gate is a Claude Code PreToolUse hook, so it runs in the
+# SESSION's environment, not the environment of the `git push` command the
+# operator typed. An env override prefixed onto the push invocation
+# (`SABLE_BASE_BRANCH=origin/<INT> git push`, `env -u SABLE_BASE_BRANCH git
+# push`) is therefore NEVER visible to this code — the only authoritative,
+# reachable source is the target repo's own config. Reading the base from
+# repo config instead of the session env removes both the wrong rebase and the
+# impossible-to-satisfy deny.
+#
+# Only when the integration branch is UNPUBLISHED (a legacy origin/main repo,
+# or an integration branch not yet pushed) does $SABLE_BASE_BRANCH apply — it
+# then falls through sable_validate_base_ref (origin/main → @{upstream}).
+#
+# The caller MUST have fetched origin first so the origin/<INT> existence check
+# sees fresh remote refs. Always prints a ref and returns 0.
+sable_resolve_base_branch() {
+  local repo_path="${1:-}"
+  local int_branch
+  int_branch=$(sable_resolve_integration_branch "$repo_path")
+
+  if [ -n "$repo_path" ] && [ -n "$int_branch" ] \
+     && git -C "$repo_path" rev-parse --verify --quiet "origin/$int_branch" >/dev/null 2>&1; then
+    printf '%s' "origin/$int_branch"
+    return 0
+  fi
+
+  # Integration branch unpublished — legacy path. Honor an explicit
+  # SABLE_BASE_BRANCH, else default to origin/main, validated so a
+  # nonexistent ref can't abort the caller under set -euo pipefail.
+  sable_validate_base_ref "$repo_path" "${SABLE_BASE_BRANCH:-origin/main}"
+}
+
 # sable_resolve_test_command <repo-path>
 #
 # Resolves the pre-push TEST-phase command for <repo-path> (SABLE-hml).
