@@ -336,24 +336,46 @@ def test_default_send_to_busy_pane_that_frees_reports_delivered_h0jw(tmux_socket
 # `queued`'s final value (which a second identical send would not visibly
 # change). REC_FILE keeps recording the line that ultimately submits once the
 # turn ends, exactly as _BUSY_TUI does.
+#
+# The busy->idle transition is TEST-CONTROLLED via markers, not a wall-clock
+# BUSY_SECS window (SABLE-wcbj: sable-msg's t0 capture, and its own tight poll
+# budget racing the footer redraw, both raced that window under host load —
+# same class as the l7uv STUCK_BOX flake, fixed the same way in a5d9304). The
+# stand-in signals busy-entry (BUSY_READY, before the first read) and stays
+# busy until the test releases it (GO_IDLE); on release it records NATURAL to
+# END_FILE, mirroring the wall-clock timeout's own end-of-turn signal.
+#
+# Reads a whole LINE per iteration, not one character at a time (SABLE-wcbj,
+# the actual root cause under load — a generous poll budget alone did not fix
+# it, and pinning the locale to byte-oriented C did not fix it either, proven
+# by direct reproduction outside pytest: both left an identical corruption,
+# the leading byte of the '\xe2\x9f\xa6' (⟦) that opens every SABLE-MSG framing
+# header silently dropped, producing a pane the footer-recognition regex can
+# never match no matter how long sable-msg's poll budget is). The character-
+# at-a-time loop this replaced existed only to detect a bare Escape between
+# characters of a queued line — but neither test using this stand-in ever
+# sends --interrupt/Escape, so that detection is unneeded here and its own
+# ~5Hz redraw-vs-read cadence was the actual race window. A per-read timeout
+# long enough that it only ever fires while genuinely idle (never mid-transfer
+# of the already-typed text) removes the race outright: reproduced directly
+# (bypassing pytest) under synthetic 4-core CPU load, 300/300 clean with this
+# design after both the SUBMIT_TRIES=40 budget and either LC_ALL fix still
+# failed at roughly 1-in-100 to 1-in-300.
 _QUEUED_FOOTER_TUI = r'''#!/usr/bin/env bash
 queued=""
 busy=1
-END_AT=$((SECONDS + ${BUSY_SECS:-3}))
+: > "$BUSY_READY"                                  # signal busy-entry BEFORE first read
 while [ "$busy" = 1 ]; do
   printf '\033[H\033[2J  Running the turn (esc to interrupt)\n'
   printf '\xe2\x9d\xaf %s\n' "$queued"
   if [ -n "$queued" ]; then
     printf '  Press up to edit queued messages\n'
   fi
-  if IFS= read -rsN1 -t 0.2 ch; then
-    case "$ch" in
-      $'\x1b') printf 'INTERRUPTED' > "$END_FILE"; busy=0 ;;
-      $'\n'|$'\r'|'') : ;;
-      *) IFS= read -r rest; queued="$ch$rest"; printf '%s\n' "$queued" >> "$ARRIVALS_FILE" ;;
-    esac
+  if IFS= read -r -t 2 line; then
+    queued="$line"
+    printf '%s\n' "$queued" >> "$ARRIVALS_FILE"
   fi
-  if [ "$busy" = 1 ] && [ "$SECONDS" -ge "$END_AT" ]; then
+  if [ "$busy" = 1 ] && [ -e "$GO_IDLE" ]; then
     printf 'NATURAL' > "$END_FILE"; busy=0
   fi
 done
@@ -371,48 +393,61 @@ done
 '''
 
 
-def _start_queued_footer_pane(sock, tmp_path, busy_secs):
-    """Same shape as _start_busy_pane, plus an arrivals_file: every distinct
-    line the stand-in actually read off the pty, in order."""
+def _start_queued_footer_pane(sock, tmp_path):
+    """Marker-driven variant of _start_busy_pane specialized for the queued-
+    footer posture (SABLE-msxj / SABLE-wcbj). Returns (rec, end, arrivals,
+    busy_ready, go_idle): rec/end/arrivals as before; busy_ready signals
+    busy-entry before the first read (so a caller can gate t0 capture to the
+    busy phase); go_idle is the test->stand-in release that ends the busy
+    phase, replacing the wall-clock BUSY_SECS window that raced under load."""
     rec = tmp_path / "rec.txt"
     end = tmp_path / "end.txt"
     arrivals = tmp_path / "arrivals.txt"
+    busy_ready = tmp_path / "busy_ready"
+    go_idle = tmp_path / "go_idle"
     script = tmp_path / "queued_footer_tui.sh"
     script.write_text(_QUEUED_FOOTER_TUI)
     script.chmod(0o755)
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
           f"REC_FILE={rec} END_FILE={end} ARRIVALS_FILE={arrivals} "
-          f"BUSY_SECS={busy_secs} bash {script}")
+          f"BUSY_READY={busy_ready} GO_IDLE={go_idle} bash {script}")
     time.sleep(0.4)
     _tmux(sock, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
-    return rec, end, arrivals
+    return rec, end, arrivals, busy_ready, go_idle
 
 
 def test_default_send_to_busy_pane_with_queued_footer_confirms_delivered_msxj(tmux_socket, tmp_path):
-    # SABLE-msxj: busy_secs is huge so the running turn CANNOT end within the
-    # (tiny) poll budget below — any confirmation must come from recognizing
-    # the queued-messages footer itself, not from h0jw's turn-boundary signals
+    # SABLE-msxj: the running turn never ends (the test never releases
+    # GO_IDLE) so any confirmation must come from recognizing the
+    # queued-messages footer itself, not from h0jw's turn-boundary signals
     # (which require the turn to actually end or our line to echo as its own
-    # prompt). Pre-fix this exhausted the budget and reported undelivered even
-    # though the line was genuinely queued (SABLE-l8a5).
-    rec, end, arrivals = _start_queued_footer_pane(tmux_socket, tmp_path, busy_secs=60)
+    # prompt). Pre-fix this exhausted the poll budget and reported undelivered
+    # even though the line was genuinely queued (SABLE-l8a5).
+    #
+    # SABLE-wcbj: waiting for BUSY_READY (instead of racing a wall-clock
+    # BUSY_SECS window) guarantees sable-msg's t0 capture lands during the
+    # busy phase; the stand-in's full-line read (see _QUEUED_FOOTER_TUI above)
+    # keeps the typed text from getting corrupted under host load, and a
+    # generous SUBMIT_TRIES budget is extra headroom on top of that — the
+    # footer stays the SOLE confirmation source either way, since GO_IDLE is
+    # never touched.
+    rec, end, arrivals, busy_ready, go_idle = _start_queued_footer_pane(tmux_socket, tmp_path)
+    assert _wait_until(busy_ready.exists, timeout=10), \
+        "stand-in never signalled busy-entry"
     r = subprocess.run(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"],
         capture_output=True, text=True,
         env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
-             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "5",
+             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "40",
              "SABLE_MSG_POLL_INTERVAL": "0.2"},
     )
     assert r.returncode == 0, r.stderr           # footer alone must confirm -> delivered
     assert "delivered" in r.stderr
     assert not end.exists(), "the turn must still be running (never reached NATURAL end)"
-    # SABLE-du3w: under full bin/ suite load the busy-pane stand-in subprocess
-    # can be slow to start, so an immediate read here can race ahead of it
-    # creating arrivals.txt -> FileNotFoundError. Poll for readiness first.
-    assert _wait_until(
-        lambda: arrivals.exists() and arrivals.read_text().count("cap in force") >= 1,
-        timeout=10,
-    ), "arrivals.txt never received the queued line"
+    # arrivals.txt is guaranteed to exist here (SABLE-du3w's race is structurally
+    # closed by this test's design): r.returncode == 0 means sable-msg's poll
+    # already observed the queued-footer posture, which requires the stand-in
+    # to have already appended to ARRIVALS_FILE.
     assert arrivals.read_text().count("cap in force") == 1
 
 
@@ -422,32 +457,39 @@ def test_second_send_on_still_busy_pane_does_not_double_queue_msxj(tmux_socket, 
     # still sitting queued (footer showing). The second call's t0 capture
     # already contains the message, so it must skip retyping and just
     # re-confirm the existing queued line -- a single arrival, not two.
-    rec, end, arrivals = _start_queued_footer_pane(tmux_socket, tmp_path, busy_secs=3)
+    #
+    # SABLE-wcbj: BUSY_READY/GO_IDLE markers (not a wall-clock BUSY_SECS
+    # window + fixed sleep) make both the busy phase and the busy->idle
+    # transition deterministic under host load. The turn is released to idle
+    # only after the first send's queued arrival is confirmed, so the second
+    # send's t0 capture is guaranteed to observe the already-queued line.
+    rec, end, arrivals, busy_ready, go_idle = _start_queued_footer_pane(tmux_socket, tmp_path)
+    assert _wait_until(busy_ready.exists, timeout=10), \
+        "stand-in never signalled busy-entry"
     kwargs = dict(
         capture_output=True, text=True,
         env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
-             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "5",
+             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "40",
              "SABLE_MSG_POLL_INTERVAL": "0.2"},
     )
     r1 = subprocess.run(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"], **kwargs)
     assert r1.returncode == 0, r1.stderr
+    assert _wait_until(lambda: arrivals.read_text().count("cap in force") == 1, timeout=10), \
+        "first send must have queued exactly once before the second send starts"
     r2 = subprocess.run(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"], **kwargs)
     assert r2.returncode == 0, r2.stderr
 
-    time.sleep(3.5)  # let the busy turn end naturally so REC_FILE flushes
-    assert end.read_text().strip() == "NATURAL"
-    # SABLE-du3w: same slow-subprocess-start race as above -- poll before
-    # reading arrivals.txt instead of asserting on an immediate read.
-    assert _wait_until(
-        lambda: arrivals.exists() and arrivals.read_text().count("cap in force") >= 1,
-        timeout=10,
-    ), "arrivals.txt never received the queued line"
+    go_idle.touch()  # release the busy turn now that both sends are confirmed queued
+    assert _wait_until(lambda: end.exists() and end.read_text().strip() == "NATURAL",
+                       timeout=10), \
+        "busy turn never reached its (test-controlled) natural end"
+    assert _wait_until(lambda: rec.exists() and rec.read_text().count("cap in force") == 1,
+                       timeout=10), \
+        "only a single copy of the message must ultimately submit"
     assert arrivals.read_text().count("cap in force") == 1, \
         "the second send must not have retyped an already-queued message"
-    assert rec.read_text().count("cap in force") == 1, \
-        "only a single copy of the message must ultimately submit"
 
 
 # --- idle-pane redraw race: report-NOT-landed-when-it-DID (SABLE-uh4b) --------
