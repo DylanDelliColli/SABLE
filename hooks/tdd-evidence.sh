@@ -13,6 +13,13 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/multi-manager/lib-hook-trace.sh"
 sable_trace_entry tdd-evidence
 
+# SABLE-jfg6.4 (contract D4): derive the evidence-file path via the shared
+# lib-evidence-key.sh so this WRITER can never drift from the tdd-gate.sh READER
+# (the tfkv mismatch class). The Python below emits the parsed session_id and
+# agent_id; the single derivation lives in the lib, called once from bash.
+# shellcheck source=multi-manager/lib-evidence-key.sh
+. "$(dirname "${BASH_SOURCE[0]}")/multi-manager/lib-evidence-key.sh"
+
 HOOK_INPUT=$(sable_trace_read_stdin) || exit 0
 
 # market-brief-package-sqcr: detect test-runner commands even when wrapped in
@@ -40,7 +47,11 @@ cmd = d.get('tool_input', {}).get('command', '') or ''
 cwd = d.get('cwd', '') or ''
 sid = d.get('session_id', '') or ''
 aid = d.get('agent_id', '') or ''
-if not cmd or not sid:
+# SABLE-jfg6.4: an ABSENT session id no longer short-circuits — the shared lib
+# derives a deterministic ppid fallback key downstream, so hccq-trap runs
+# (Agent-subagent / gc-managed, no CLAUDE_SESSION_ID) still record evidence at
+# the same key tdd-gate derives. A missing command still has nothing to detect.
+if not cmd:
     sys.exit(0)
 
 SEPS = {';', '&&', '||', '|'}
@@ -143,17 +154,21 @@ for seg in segments:
 if not hits:
     sys.exit(0)
 
-evidence_file = ('/tmp/tdd-evidence-%s-%s' % (sid, aid)) if aid else ('/tmp/tdd-evidence-%s' % sid)
-print(evidence_file)
+# Emit the parsed identity (session id, agent id) for bash to feed the shared
+# key lib — the path itself is derived in exactly ONE place (SABLE-jfg6.4).
+print(sid)
+print(aid)
 for repo, seg_text in hits:
     print('REPO=%s CMD=%s' % (repo, seg_text))
 " 2>/dev/null) || exit 0
 
 [ -z "$RESULT" ] && exit 0
 
-EVIDENCE_FILE=$(printf '%s\n' "$RESULT" | head -1)
+SID=$(printf '%s\n' "$RESULT" | sed -n '1p')
+AID=$(printf '%s\n' "$RESULT" | sed -n '2p')
+EVIDENCE_FILE=$(sable_evidence_key "$SID" "$AID")
 TS="$(date -Iseconds)"
-printf '%s\n' "$RESULT" | tail -n +2 | while IFS= read -r line; do
+printf '%s\n' "$RESULT" | tail -n +3 | while IFS= read -r line; do
   printf '%s %s\n' "$TS" "$line" >> "$EVIDENCE_FILE"
 done
 

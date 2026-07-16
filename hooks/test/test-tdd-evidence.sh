@@ -254,6 +254,36 @@ else
 fi
 rm -f "$SAMEREPO_EV"
 
+# ---------- SABLE-jfg6.4 (D4): shared evidence-key lib — forms + absent-session ----------
+# This WRITER now derives its path via hooks/multi-manager/lib-evidence-key.sh,
+# the SAME function tdd-gate.sh (the reader) calls — so the two can never drift
+# (the tfkv mismatch class). Lock in the derivation forms and the absent-session
+# ppid fallback (never the empty-session garbage path), plus proof the writer
+# actually records at that fallback (the old code early-exited on an empty sid).
+D4LIB="$(cd "$(dirname "$0")/.." && pwd)/multi-manager/lib-evidence-key.sh"
+# Resolve the key in a single-command subprocess (exec-in-place), so its $PPID is
+# this shell — the SAME frame the hook resolves when run as a bare statement.
+d4_key() { bash -c '. "$0"; sable_evidence_key "$1" "$2"' "$D4LIB" "$1" "$2"; }
+
+K_BOTH=$(d4_key "sidX" "aidY")
+if [ "$K_BOTH" = "/tmp/tdd-evidence-sidX-aidY" ]; then pass "D4 lib: (sid,aid) -> /tmp/tdd-evidence-<sid>-<aid>"; else fail "D4 lib: (sid,aid) form" "got [$K_BOTH]"; fi
+K_SID=$(d4_key "sidX" "")
+if [ "$K_SID" = "/tmp/tdd-evidence-sidX" ]; then pass "D4 lib: (sid, empty aid) -> /tmp/tdd-evidence-<sid>"; else fail "D4 lib: (sid only) form" "got [$K_SID]"; fi
+K_ABS=$(d4_key "" "")
+case "$K_ABS" in /tmp/tdd-evidence-ppid-*) pass "D4 lib: absent sid -> ppid fallback (not the empty-session garbage path)" ;; *) fail "D4 lib: absent sid -> ppid fallback" "got [$K_ABS]" ;; esac
+if [ "$K_ABS" != "/tmp/tdd-evidence-" ] && [ -n "${K_ABS#/tmp/tdd-evidence-}" ]; then pass "D4 lib: absent-sid key is non-empty (never /tmp/tdd-evidence-)"; else fail "D4 lib: absent-sid key non-empty" "got [$K_ABS]"; fi
+K_ABS_AID=$(d4_key "" "aidZ")
+case "$K_ABS_AID" in /tmp/tdd-evidence-ppid-*-aidZ) pass "D4 lib: absent sid keeps the agent suffix (ppid-<n>-<aid>)" ;; *) fail "D4 lib: absent sid keeps agent suffix" "got [$K_ABS_AID]" ;; esac
+
+# Writer at the fallback: an absent-session (empty session_id) test command must
+# now RECORD evidence at the ppid key. Bare-statement frame so the hook's $PPID
+# == this shell == the frame d4_key resolves in.
+D4_ABS_KEY=$(d4_key "" "")
+rm -f "$D4_ABS_KEY"
+make_input "pytest tests/" "" | bash "$HOOK" >/dev/null 2>&1 || true
+if [ -s "$D4_ABS_KEY" ]; then pass "D4 writer: absent-session test command records evidence at the ppid fallback key"; else fail "D4 writer: absent-session records at ppid key" "no $D4_ABS_KEY"; fi
+rm -f "$D4_ABS_KEY"
+
 # ---------- Summary ----------
 
 echo

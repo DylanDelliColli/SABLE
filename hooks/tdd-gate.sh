@@ -24,6 +24,13 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/multi-manager/lib-hook-trace.sh"
 sable_trace_entry tdd-gate
 
+# SABLE-jfg6.4 (contract D4): derive the evidence-file path via the shared
+# lib-evidence-key.sh so this READER can never drift from the tdd-evidence.sh
+# WRITER (the tfkv mismatch class), and absent-session envs get a deterministic
+# non-empty key instead of the empty-session garbage path.
+# shellcheck source=multi-manager/lib-evidence-key.sh
+. "$(dirname "${BASH_SOURCE[0]}")/multi-manager/lib-evidence-key.sh"
+
 HOOK_INPUT=$(sable_trace_read_stdin) || exit 0
 
 # Read stdin and parse with python3 (jq not available)
@@ -102,11 +109,7 @@ fi
 # test run can't satisfy worker B's close in a shared session), session-global
 # for main sessions. Companion convention: workers close their OWN beads after
 # green, so the test run and the bd close share one agent context.
-if [ -n "$AGENT_ID" ]; then
-  EVIDENCE_FILE="/tmp/tdd-evidence-${SESSION_ID}-${AGENT_ID}"
-else
-  EVIDENCE_FILE="/tmp/tdd-evidence-${SESSION_ID}"
-fi
+EVIDENCE_FILE=$(sable_evidence_key "$SESSION_ID" "$AGENT_ID")
 if [ -s "$EVIDENCE_FILE" ]; then
   exit 0  # Tests were run by this agent this session — allow close
 fi
