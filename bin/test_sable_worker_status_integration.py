@@ -451,6 +451,41 @@ def test_dialog_probe_json_carries_stalls_and_workers(sock):
     assert payload["dialog_stalls"][0]["class"] == "manager"
 
 
+# --- reaper liveness guard: a resumed cockpit survives --reap (SABLE-to8m) ----
+# Resuming the lincoln conversation inside a finished worker window left the
+# cockpit carrying the worker's stale @sable_status=done and thus reap-eligible.
+# The @sable_* tags are mutable and lie; the pane's live process env
+# (CLAUDE_AGENT_NAME, stamped via -e like the real spawn tooling) does not. The
+# reaper now consults that authority and refuses to kill a pane whose live
+# process is the operator cockpit.
+
+def test_reap_spares_pane_whose_live_process_is_the_cockpit(sock):
+    # %0: a genuinely done worker (no cockpit identity) -> reaped. %1: a resumed
+    # cockpit — its PANE PROCESS identity is 'lincoln' (per-pane tmux -e), but it
+    # still wears a stale @sable_role=worker / @sable_status=done from the worker
+    # that previously owned the window. --reap must kill ONLY the real worker and
+    # spare the cockpit. (-e goes on split-window, NOT new-session: a session-wide
+    # -e would leak lincoln into BOTH panes and protect the real worker too.)
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.0", "worker", "bead-real", "done")
+    _tmux(sock, "split-window", "-t", "w", "-e", "CLAUDE_AGENT_NAME=lincoln",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.1", "worker", "bead-stale", "done")   # poisoned/leftover tags
+    assert _pane_count(sock) == 2
+
+    r = _run(sock, "--reap")
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.4)
+    assert _pane_count(sock) == 1  # the cockpit survives; the real worker is reaped
+    survivors = _tmux(sock, "list-panes", "-a", "-F", "#{@sable_bead}").stdout
+    assert "bead-stale" in survivors      # cockpit pane spared
+    assert "bead-real" not in survivors   # genuine done worker reaped
+    assert "NOT reaping" in r.stderr and "cockpit" in r.stderr
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

@@ -593,6 +593,97 @@ def resolve_session(socket: str | None = None, base: str | None = None,
     return name
 
 
+# --- Authoritative pane identity (SABLE-to8m). The @sable_role / @sable_bead
+# pane options are mutable global tmux state ANY process can overwrite with no
+# owner — a stale/poisoned @sable_role once routed two manager escalations into
+# an unrelated worker, and a resumed cockpit was left reap-eligible. The
+# AUTHORITY is instead the CLAUDE_AGENT_NAME env of the process actually running
+# in the pane: it is stamped once at spawn (tmux -e, see sable-tmux /
+# sable-spawn-*) into the pane process's own environment and cannot be forged by
+# re-tagging. The pane option is demoted to a cache/hint that only decides the
+# outcome when the process carries no identity of its own (a pane SABLE did not
+# spawn, or one predating this authority).
+
+def pane_pid(base: list[str], pane: str, run=None) -> str | None:
+    """The PID of the process running in `pane` (tmux #{pane_pid}), or None when
+    the pane has vanished / tmux is unavailable. Fails open (None) on any error:
+    identity resolution degrades to the tag rather than crashing a send/reap."""
+    run = run or _tmux_run
+    try:
+        r = run(base + ["display-message", "-p", "-t", pane, "#{pane_pid}"])
+    except Exception:
+        return None
+    out = (getattr(r, "stdout", "") or "").strip()
+    return out if getattr(r, "returncode", 1) == 0 and out.isdigit() else None
+
+
+def _read_environ(pid: str, proc_root: str = "/proc") -> dict[str, str]:
+    """Parse /proc/<pid>/environ (NUL-delimited KEY=VALUE) into a dict. Empty on
+    any error (no such pid, permission, non-Linux) — the caller then has no
+    authoritative identity and falls back to the tag."""
+    try:
+        with open(f"{proc_root}/{pid}/environ", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return {}
+    env: dict[str, str] = {}
+    for entry in raw.split(b"\x00"):
+        if not entry or b"=" not in entry:
+            continue
+        k, _, v = entry.partition(b"=")
+        env[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+    return env
+
+
+def pane_process_identity(base: list[str], pane: str, run=None,
+                          proc_root: str = "/proc") -> str | None:
+    """The AUTHORITATIVE agent identity of `pane`: the CLAUDE_AGENT_NAME of the
+    process actually running in it (tmux #{pane_pid} -> /proc/PID/environ), or
+    None when unresolvable — a pane SABLE did not spawn, a plain shell, or a
+    vanished pane (SABLE-to8m). This is the authority the mutable @sable_role
+    pane option is only a cache for."""
+    pid = pane_pid(base, pane, run=run)
+    if not pid:
+        return None
+    return _read_environ(pid, proc_root=proc_root).get("CLAUDE_AGENT_NAME") or None
+
+
+def pane_role_tag(base: list[str], pane: str, run=None) -> str | None:
+    """The CACHED @sable_role pane option (mutable — a hint only, never the
+    authority; see pane_process_identity). None when unset/unresolvable."""
+    run = run or _tmux_run
+    try:
+        r = run(base + ["show-options", "-p", "-v", "-t", pane, "@sable_role"])
+    except Exception:
+        return None
+    val = (getattr(r, "stdout", "") or "").strip()
+    return val if getattr(r, "returncode", 1) == 0 and val else None
+
+
+def resolve_pane_identity(base: list[str], pane: str, run=None,
+                          proc_root: str = "/proc") -> str | None:
+    """Authoritative identity for a pane: the process env identity WINS over the
+    mutable @sable_role tag whenever the two disagree (SABLE-to8m). Falls back to
+    the tag ONLY when the process carries no CLAUDE_AGENT_NAME, so panes SABLE did
+    not spawn (or ones predating this authority) still resolve by their tag."""
+    env_id = pane_process_identity(base, pane, run=run, proc_root=proc_root)
+    if env_id:
+        return env_id
+    return pane_role_tag(base, pane, run=run)
+
+
+def tag_is_poisoned(base: list[str], pane: str, claimed_role: str, run=None,
+                    proc_root: str = "/proc") -> bool:
+    """True when `pane`'s @sable_role tag claims `claimed_role` but the pane's
+    authoritative process identity says otherwise — a poisoned/stale tag
+    (SABLE-to8m). Fails OPEN (False) when the process carries no identity: a pane
+    SABLE did not spawn (e.g. a bare shell in an integration test) has no
+    authority to contradict, so it keeps the pre-authority tag-only behavior and
+    delivery/reaping is unchanged for it."""
+    env_id = pane_process_identity(base, pane, run=run, proc_root=proc_root)
+    return env_id is not None and env_id != claimed_role
+
+
 # --- Dispatch throttle knob (SABLE-mmdt), shared by sable-spawn-worker (the
 # refusal) and sable-view (the cockpit count-vs-cap line) so the default can
 # never drift between the gate and its observability surface.

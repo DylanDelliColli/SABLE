@@ -72,8 +72,11 @@ def test_parse_panes_first_wins_on_duplicate_role():
 def _pin_session(monkeypatch):
     """Keep every test hermetic: main() resolves the target session per-repo
     (SABLE-e1e3.3), which would consult the real tmux server — the env
-    override short-circuits that."""
+    override short-circuits that. The recipient identity cross-check (SABLE-to8m)
+    would likewise shell to the real tmux server + /proc, so it is stubbed to
+    None (no poisoning) by default; the cross-check's own test overrides it."""
     monkeypatch.setenv("SABLE_TMUX_SESSION", "s")
+    monkeypatch.setattr(sable_msg, "recipient_identity", lambda pane, socket=None: None)
 
 
 def test_lookup_pane_found_and_missing():
@@ -163,6 +166,32 @@ def test_main_happy_path_reports_delivered(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "delivered" in err
     assert "optimus" in err
+
+
+def test_main_refuses_poisoned_role_tag(monkeypatch, capsys):
+    # SABLE-to8m: the pane resolved for role 'lincoln' has an authoritative
+    # process identity of 'optimus' — a poisoned/stale @sable_role tag. Delivery
+    # must be REFUSED (never routed into the wrong pane), before deliver_message
+    # is ever called.
+    monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None, session=None: "%9")
+    monkeypatch.setattr(sable_msg, "recipient_identity", lambda pane, socket=None: "optimus")
+    monkeypatch.setattr(sable_msg, "deliver_message",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not deliver")))
+    rc = sable_msg.main(["lincoln", "escalation", "--from", "optimus"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "poisoned" in err.lower()
+    assert "optimus" in err          # names the real identity
+    assert "sable-relink" in err     # points at the recovery path
+
+
+def test_main_delivers_when_identity_agrees(monkeypatch, capsys):
+    # The cross-check must not block a legitimate send: identity == requested role.
+    monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None, session=None: "%2")
+    monkeypatch.setattr(sable_msg, "recipient_identity", lambda pane, socket=None: "optimus")
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
+    assert sable_msg.main(["optimus", "ship it", "--from", "lincoln"]) == 0
+    assert "delivered" in capsys.readouterr().err
 
 
 def test_main_reports_undelivered_and_exits_nonzero(monkeypatch, capsys):
