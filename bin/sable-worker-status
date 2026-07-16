@@ -90,8 +90,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    SessionCollision, capture_pane, overlay_posture, pane_busy,
-    pane_process_identity, pane_ready, resolve_session, session_limit_reset)
+    SessionCollision, capture_pane, overlay_evidence, overlay_posture,
+    pane_process_identity, pane_ready, pane_working, resolve_session,
+    session_limit_reset)
 
 WORKER_ROLE_PREFIX = "worker"
 # Tab-delimited (SABLE-exab): a space-joined format collapses an EMPTY field
@@ -256,15 +257,18 @@ def flag_rate_limit_stalls(workers: list[dict], socket: str | None, capture=None
 
 
 def dialog_stall(capture: str) -> bool:
-    """True when `capture` shows a pane STALLED on an interactive dialog/overlay
-    AND not mid-turn — the warm-pane analogue of rate_limit_stall (SABLE-axp0).
-    Combines the shared overlay_posture classifier (m94k's dialog_posture plus
-    the /usage-style modal-overlay case) with `not pane_busy` so the flag means
-    genuinely idle-blocked: a pane actively running a turn that momentarily
-    paints a dialog-like line (a spinner over transcript text) is NOT a stall.
-    A pane in this posture swallows every keystroke sent to it into the overlay
-    — the silent-absorption signature behind the chuck /usage incident."""
-    return overlay_posture(capture) and not pane_busy(capture)
+    """True when `capture` shows a pane STALLED on a dialog/overlay AND not
+    mid-turn — the warm-pane analogue of rate_limit_stall (SABLE-axp0, hardened
+    in SABLE-tz9f). overlay_posture now requires a POSITIVE selector/dismiss
+    affordance (no longer a bare numbered-line superset), and the not-mid-turn
+    guard is pane_working — a superset of pane_busy that also recognizes a
+    spinner+elapsed-time status row. So neither ordinary composer chrome / a
+    queued ⟦SABLE-MSG⟧ block NOR a busy mid-turn pane whose interrupt hint
+    scrolled out of frame is mistaken for a stall (the six false positives that
+    told the operator to Esc a healthy pane, interrupting live work). A genuinely
+    stalled pane swallows every keystroke into the overlay — the chuck /usage
+    incident."""
+    return overlay_posture(capture) and not pane_working(capture)
 
 
 def reaping_decision(workers: list[dict]) -> list[str]:
@@ -411,8 +415,13 @@ def flag_dialog_stalls(panes: list[dict], socket: str | None, capture=None) -> l
     for p in panes:
         if is_done(p["status"]):
             continue
-        if dialog_stall(cap(p["pane"])):
-            stalled.append({**p, "status": "dialog-stalled"})
+        cap_text = cap(p["pane"])
+        if dialog_stall(cap_text):
+            # SABLE-ccxc: carry the matched pane-text line so the alert can show
+            # the evidence — an operator judges true-vs-false from the alert
+            # itself, without a manual capture-pane.
+            stalled.append({**p, "status": "dialog-stalled",
+                            "evidence": overlay_evidence(cap_text) or ""})
     return stalled
 
 
@@ -645,6 +654,25 @@ def resolve_view_lane(ns) -> str | None:
     return (os.environ.get("CLAUDE_AGENT_NAME") or "").strip() or None
 
 
+def empty_worker_message(view_lane: str | None, all_workers: list[dict]) -> str:
+    """The message printed when the (possibly lane-scoped) worker view is empty
+    (SABLE-1g8i). A bare 'no worker panes' FALSE-EMPTIES the whole fleet when the
+    caller is a manager whose OWN lane happens to have none but other lanes are
+    busy: the live repro was a tarzan pane's own-lane default printing 'no worker
+    panes' while sable-view (which never lane-filters) simultaneously listed
+    another lane's running + done workers. When the fleet does hold worker panes
+    OUTSIDE this lane, say so and point at --all — preserving the SABLE-dcw2
+    own-lane scoping (those panes are still neither listed nor reaped here) while
+    telling the truth instead of implying the fleet is idle. A truly empty fleet,
+    or the un-laned global view (view_lane is None), still reads 'no worker
+    panes'."""
+    if view_lane is None or not all_workers:
+        return "no worker panes"
+    n = len(all_workers)
+    return (f"no worker panes in lane {view_lane!r} "
+            f"({n} worker pane(s) in other lane(s) — use --all to see the fleet)")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sable-worker-status")
     p.add_argument("--reap", action="store_true",
@@ -666,14 +694,16 @@ def main(argv: list[str] | None = None) -> int:
         return 4
 
     interval = float(os.environ.get("SABLE_STATUS_SAMPLE_INTERVAL", _DEFAULT_SAMPLE_INTERVAL))
-    workers = list_workers_confirmed(socket, session=session, interval=interval)
+    all_workers = list_workers_confirmed(socket, session=session, interval=interval)
     # SABLE-dcw2: scope to the caller's own lane BEFORE anything reads or reaps,
     # so the display, the done-no-deliverable flags AND reaping_decision all
     # operate on the owned subset — a manager's --reap can never touch (and so
-    # can never consume the completion signal of) another lane's pane.
+    # can never consume the completion signal of) another lane's pane. The
+    # unfiltered all_workers is retained only to make the empty-view message
+    # honest (SABLE-1g8i): 'no worker panes' when THIS lane has none but others
+    # are busy false-empties the fleet.
     view_lane = resolve_view_lane(ns)
-    if view_lane is not None:
-        workers = filter_by_lane(workers, view_lane)
+    workers = filter_by_lane(all_workers, view_lane) if view_lane is not None else all_workers
     workers = flag_rate_limit_stalls(workers, socket)
     dnd_panes = {w["pane"] for w in done_no_deliverable(workers)}
 
@@ -690,7 +720,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"workers": workers, "dialog_stalls": dialog_stalls}, indent=2))
     else:
         if not workers:
-            print("no worker panes")
+            print(empty_worker_message(view_lane, all_workers))
         for w in workers:
             flag = " [done-no-deliverable]" if w["pane"] in dnd_panes else ""
             if w["status"] == "stalled-rate-limit":
@@ -699,8 +729,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{w['pane']:<8} {lane:<10} {w['bead']:<16} {w['status']}{flag}")
         for s in dialog_stalls:
             who = s.get("lane") or s.get("role") or "?"
+            ev = s.get("evidence") or ""
+            snip = f" [matched: {ev!r}]" if ev else ""
             print(f"⚠ DIALOG-STALLED {s['pane']:<8} {who:<10} "
-                  f"{s.get('bead') or '-':<16} blocked on a dialog/overlay "
+                  f"{s.get('bead') or '-':<16} blocked on a dialog/overlay{snip} "
                   f"— dismiss it (Esc) or nudge the pane")
 
     # Loud alert to stderr too (SABLE-axp0): the table can scroll past unread, but
@@ -708,7 +740,9 @@ def main(argv: list[str] | None = None) -> int:
     # every stalled pane so the operator/fleet can act; nothing was auto-cleared.
     if dialog_stalls:
         names = ", ".join(
-            f"{s['pane']}({s.get('lane') or s.get('role') or '?'})" for s in dialog_stalls)
+            f"{s['pane']}({s.get('lane') or s.get('role') or '?'}"
+            + (f": {s['evidence']!r}" if s.get("evidence") else "") + ")"
+            for s in dialog_stalls)
         sys.stderr.write(
             f"sable-worker-status: ⚠ {len(dialog_stalls)} pane(s) STALLED on a "
             f"dialog/overlay, silently absorbing messages — {names}. Dismiss (Esc) "
