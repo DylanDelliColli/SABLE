@@ -37,10 +37,11 @@ def run_install(home_dir: Path):
     assert result.returncode == 0, f"install.sh failed:\n{result.stdout}\n{result.stderr}"
 
 
-def run_doctor(claude_dir: Path, *extra_args):
+def run_doctor(claude_dir: Path, *extra_args, env=None):
     return subprocess.run(
         [sys.executable, str(DOCTOR), "--repo", str(REPO), "--claude-dir", str(claude_dir), *extra_args],
         capture_output=True, text=True, timeout=30,
+        env=env if env is not None else os.environ,
     )
 
 
@@ -209,3 +210,17 @@ def test_rerunning_installer_heals_flagged_drift(installed_claude_dir, tmp_path)
 
     result = run_doctor(installed_claude_dir)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- worker cap line (SABLE-61dy): real subprocess, real sable_pane_lib import -
+
+def test_doctor_run_shows_cap_line(installed_claude_dir):
+    env_unset = {k: v for k, v in os.environ.items() if k != "SABLE_MAX_WORKERS"}
+    result = run_doctor(installed_claude_dir, env=env_unset)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "worker cap: 8 (default)" in result.stdout
+
+    env_set = {**os.environ, "SABLE_MAX_WORKERS": "2"}
+    result = run_doctor(installed_claude_dir, env=env_set)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "worker cap: 2 (env SABLE_MAX_WORKERS)" in result.stdout

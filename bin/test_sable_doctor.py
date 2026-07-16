@@ -295,3 +295,44 @@ def test_main_quiet_prints_one_line_to_stderr_when_drifted(tmp_path, capsys):
     assert captured.out == ""
     assert "drifted" in captured.err
     assert "bash install.sh" in captured.err
+
+
+# --- worker cap line (SABLE-61dy) ----------------------------------------------
+# SABLE_MAX_WORKERS is invisible to operators until sable-spawn-worker refuses
+# a spawn at cap. This adds an additive informational line — sourced from the
+# same sable_pane_lib.worker_cap()/WORKER_CAP_DEFAULT that gates spawns
+# (sable-view, sable-spawn-worker) — so the reported value can never drift
+# from the gate. Must NOT change the clean/drift verdict or exit code.
+
+def test_doctor_reports_worker_cap_default(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("SABLE_MAX_WORKERS", raising=False)
+    repo, claude_dir = make_repo(tmp_path)
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "worker cap: 8 (default)" in out
+
+
+def test_doctor_reports_worker_cap_env(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SABLE_MAX_WORKERS", "3")
+    repo, claude_dir = make_repo(tmp_path)
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "worker cap: 3 (env SABLE_MAX_WORKERS)" in out
+
+
+def test_doctor_reports_worker_cap_line_even_when_drifted(tmp_path, monkeypatch, capsys):
+    # additive-only: the cap line must appear alongside DRIFT DETECTED without
+    # altering the verdict or exit code.
+    monkeypatch.delenv("SABLE_MAX_WORKERS", raising=False)
+
+    def mutate(repo, claude_dir):
+        (claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
+
+    repo, claude_dir = make_repo(tmp_path, mutate=mutate)
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "DRIFT DETECTED" in out
+    assert "worker cap: 8 (default)" in out
