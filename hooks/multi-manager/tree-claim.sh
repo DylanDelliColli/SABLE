@@ -85,7 +85,13 @@ print(d.get('session_id', '') or '')
 " 2>/dev/null) || SESSION_ID=""
 
 # Fall back to env, then to unknown-PPID (fail open — don't deny on missing identity)
-[ -z "$SESSION_ID" ] && SESSION_ID="${CLAUDE_SESSION_ID:-}"
+# SABLE-hccq: CLAUDE_CODE_SESSION_ID is the actual env var Claude Code
+# exports into a shell's environment (CLAUDE_SESSION_ID is checked too in
+# case some environment sets it, but is unset in practice) — checked here so
+# the rare case of a hook invocation with no session_id in its JSON still
+# resolves the SAME identity that a later 'sable-claim release' call (which
+# only has env, never the JSON) would see.
+[ -z "$SESSION_ID" ] && SESSION_ID="${CLAUDE_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
 IDENTITY_KNOWN=1
 if [ -z "$SESSION_ID" ]; then
   SESSION_ID="unknown-${PPID:-0}"
