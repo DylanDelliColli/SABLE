@@ -88,6 +88,37 @@ def pane_idle(capture: str) -> bool:
     return pane_ready(capture) and not pane_busy(capture)
 
 
+# A running turn's status row carries a spinner glyph AND an elapsed-time timer
+# ("4m 36s", "8s") even in the rare capture where the "esc to interrupt"
+# affordance pane_busy keys on has been pushed out of frame by a queued-message
+# block or a reflow — the miss that let a busy mid-turn pane flag DIALOG-STALLED
+# (SABLE-tz9f, optimus %19 was 4m36s into a turn when the probe said to Esc it).
+# The claude working spinner is one of these asterisk-flower / braille glyphs;
+# ordinary transcript bullets (●, ◦) are deliberately excluded so an idle dialog
+# with a stray elapsed-looking token isn't misread as working.
+_SPINNER_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷✻✽✳✢✴✶✷✺]")
+_ELAPSED_RE = re.compile(r"\b\d+m\s*\d+s\b|\b\d+s\b")
+
+
+def pane_working(capture: str) -> bool:
+    """True while the pane is MID-TURN — a SUPERSET of pane_busy for the
+    dialog-stall probe's authoritative not-busy guard (SABLE-tz9f). Returns True
+    when pane_busy does (the "esc to interrupt" hint) OR when any line bears BOTH
+    a spinner glyph and an elapsed-time timer — a working pane whose interrupt
+    hint isn't in the captured frame. A real idle dialog shows neither a spinner
+    nor a running timer, so this never suppresses a genuine stall; and because it
+    only ever ADDS busy detections, sending Esc into a working pane (which
+    interrupts its turn) is strictly harder to trigger. pane_busy itself is left
+    byte-for-byte unchanged — the sable-msg delivery flow (dispatch_landed /
+    submitted_own_turn) depends on its exact contract."""
+    if pane_busy(capture):
+        return True
+    for line in capture.splitlines():
+        if _SPINNER_RE.search(line) and _ELAPSED_RE.search(line):
+            return True
+    return False
+
+
 def accept_startup_gate(capture: str) -> str | None:
     """The menu key that ACCEPTS a known blocking startup gate, or None. The
     bypass-permissions warning defaults to '1. No, exit' (so a blind Enter kills
@@ -137,32 +168,59 @@ def dialog_posture(capture: str) -> bool:
 # A modal INFO overlay (the /usage panel, /help, /model preamble, ...) blocks
 # the composer exactly as a selector dialog does, but its tell is an
 # "Esc to close/exit/go back/dismiss" DISMISS affordance, not a numbered menu or
-# an Enter-to-select prompt — so dialog_posture (tuned conservative for m94k's
-# SPAWN gate) does not catch it. The alternation lists dismiss verbs ONLY: it
-# must never collide with the busy-turn "esc to interrupt" hint (_BUSY_MARKERS),
-# which marks a working pane, not a stall.
+# an Enter-to-select prompt. The alternation lists dismiss verbs ONLY: it must
+# never collide with the busy-turn "esc to interrupt" hint (_BUSY_MARKERS), which
+# marks a working pane, not a stall.
 _OVERLAY_DISMISS_RE = re.compile(
     r"esc(ape)?\s+to\s+(close|exit|go back|dismiss)", re.IGNORECASE)
 
 
-def overlay_posture(capture: str) -> bool:
-    """True when the pane is blocked on a modal overlay/dialog demanding a
-    keypress to dismiss — a SUPERSET of dialog_posture (SABLE-axp0). Reuses
-    dialog_posture for the selector/gate case (numbered menu, Enter-to-select,
-    known startup gates) and ADDS the info-overlay case it misses: a /usage-style
-    panel shows no numbered menu and no 'Enter to select' affordance, only an
-    'Esc to close' dismiss hint — yet it blocks the composer and silently
-    swallows every sent keystroke into itself, the ~30min chuck /usage stall
-    that motivated this bead. Building on dialog_posture rather than editing it
-    keeps m94k's spawn gate (which calls dialog_posture directly) untouched.
+def overlay_evidence(capture: str) -> str | None:
+    """The pane-text line proving `capture` is parked on a modal dialog/overlay
+    demanding a keypress, or None. A POSITIVE-signature classifier (SABLE-tz9f):
+    it keys on the explicit keypress AFFORDANCE a live selector or modal always
+    prints — an 'Enter to confirm/select' / 'Use arrow keys' / '(y/n)' selector
+    affordance, or an 'Esc to close/exit/…' dismiss hint — plus the two
+    recognized blocking startup gates (bypass warning / trust folder).
 
-    Like dialog_posture, deliberately conservative: matching only dialog/overlay
-    signatures (never the empty composer or a plain shell prompt) so a caller can
-    combine it with a not-busy check to flag a genuinely idle-blocked pane
-    without false-positiving a working one."""
-    if dialog_posture(capture):
-        return True
-    return any(_OVERLAY_DISMISS_RE.search(_clean(line)) for line in capture.splitlines())
+    It deliberately does NOT flag on a bare run of numbered lines the way the
+    original superset (dialog_posture — "2+ numbered option rows anywhere") did:
+    that misread ordinary composer chrome (separator rows) and a queued
+    ⟦SABLE-MSG⟧ block containing a numbered list as a dialog box, false-flagging
+    healthy panes as DIALOG-STALLED six times across three days — and the remedy
+    text tells the operator to send Esc, which INTERRUPTS a busy pane mid-turn
+    (a real near-miss: optimus was 4m36s into a turn). A message/transcript
+    rarely carries a selector affordance verbatim, so requiring it is both far
+    more specific and the actual signal a keypress is being awaited. The returned
+    line is the evidence snippet the DIALOG-STALLED alert surfaces (SABLE-ccxc)
+    so an operator can judge true-vs-false from the alert itself.
+
+    dialog_posture (m94k's spawn gate) is intentionally left untouched: this is
+    the probe-only classifier, and the spawn gate's looser numbered-menu match is
+    fine in its own context (a freshly spawned, not-yet-ready pane)."""
+    for raw in capture.splitlines():
+        line = _clean(raw)
+        if line and (_DIALOG_AFFORDANCE_RE.search(line)
+                     or _OVERLAY_DISMISS_RE.search(line)):
+            return line
+    if accept_startup_gate(capture) is not None:
+        for raw in capture.splitlines():
+            line = _clean(raw)
+            low = line.lower()
+            if "trust" in low or "bypass permissions" in low:
+                return line
+        return "blocking startup gate"
+    return None
+
+
+def overlay_posture(capture: str) -> bool:
+    """True when the pane is parked on a modal dialog/overlay demanding a keypress
+    — see overlay_evidence for the positive signature (selector/dismiss affordance
+    or a known startup gate) and the SABLE-tz9f false-positive history the bare
+    numbered-line superset it replaced caused. The caller (sable-worker-status
+    dialog_stall) combines it with a not-working guard to mean genuinely
+    idle-blocked, never a working pane."""
+    return overlay_evidence(capture) is not None
 
 
 # The session-limit banner Claude Code prints when a message/session rate
