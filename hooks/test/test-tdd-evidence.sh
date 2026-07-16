@@ -284,6 +284,34 @@ make_input "pytest tests/" "" | bash "$HOOK" >/dev/null 2>&1 || true
 if [ -s "$D4_ABS_KEY" ]; then pass "D4 writer: absent-session test command records evidence at the ppid fallback key"; else fail "D4 writer: absent-session records at ppid key" "no $D4_ABS_KEY"; fi
 rm -f "$D4_ABS_KEY"
 
+# ---------- SABLE-2nak: unspaced separator (same class as SABLE-sxhx) ----------
+# Plain shlex.split only splits ;/&&/||/| when they are whitespace-delimited
+# from adjacent tokens, so an UNSPACED separator fused two commands into one
+# token and the segmenter never split them, silently dropping the first
+# script's evidence. Both scripts in the compound command must be recorded.
+
+UNSPACED_AND_SID="tdd-ev-unspaced-and-$$-$RANDOM"
+UNSPACED_AND_EV="/tmp/tdd-evidence-${UNSPACED_AND_SID}"
+rm -f "$UNSPACED_AND_EV"
+make_input "bash test-a.sh&&bash test-b.sh" "$UNSPACED_AND_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if grep -q 'CMD=bash test-a.sh$' "$UNSPACED_AND_EV" 2>/dev/null && grep -q 'CMD=bash test-b.sh$' "$UNSPACED_AND_EV" 2>/dev/null; then
+  pass "unspaced && separator: both test-a.sh and test-b.sh recorded"
+else
+  fail "unspaced && separator: both test-a.sh and test-b.sh recorded" "got: $(cat "$UNSPACED_AND_EV" 2>/dev/null)"
+fi
+rm -f "$UNSPACED_AND_EV"
+
+UNSPACED_SEMI_SID="tdd-ev-unspaced-semi-$$-$RANDOM"
+UNSPACED_SEMI_EV="/tmp/tdd-evidence-${UNSPACED_SEMI_SID}"
+rm -f "$UNSPACED_SEMI_EV"
+make_input "bash test-a.sh;bash test-b.sh" "$UNSPACED_SEMI_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if grep -q 'CMD=bash test-a.sh$' "$UNSPACED_SEMI_EV" 2>/dev/null && grep -q 'CMD=bash test-b.sh$' "$UNSPACED_SEMI_EV" 2>/dev/null; then
+  pass "unspaced ; separator: both test-a.sh and test-b.sh recorded"
+else
+  fail "unspaced ; separator: both test-a.sh and test-b.sh recorded" "got: $(cat "$UNSPACED_SEMI_EV" 2>/dev/null)"
+fi
+rm -f "$UNSPACED_SEMI_EV"
+
 # ---------- Summary ----------
 
 echo
