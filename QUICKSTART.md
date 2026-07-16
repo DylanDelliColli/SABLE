@@ -73,7 +73,8 @@ There is **one install** — no tiers, no topology choices. It:
    registry, the four pane role files, the SABLE skills) and auto-merges its
    settings snippet (backed up; existing entries preserved)
 6. Prepends the SABLE Prime Directives to `~/.claude/CLAUDE.md` (with a timestamped backup if one already exists)
-7. Prints the base-hook JSON snippet you paste into `~/.claude/settings.json` (does NOT auto-edit that block — you review and paste)
+7. Prints the base-hook JSON snippet you paste into `~/.claude/settings.json` (does NOT auto-edit that block — you review and paste). The snippet includes the `sable-doctor --quiet` SessionStart drift-warn.
+8. Stages (never activates) the reconciliation-floor host timer artifacts under `~/.claude/sable/reconcile-timer/` — activation is a deliberate operator step, commands in the install output.
 
 Idempotent and safe to re-run. `bash install.sh --dry-run` reports exactly what
 would be copied and writes nothing. On native Windows, `pwsh ./install.ps1`
@@ -132,6 +133,7 @@ You only need this prompt **once per project**. After the first session, the met
 Open a new agent session in your project and run these as a smoke test:
 
 ```bash
+sable-doctor                       # Should print "clean — N installed files match repo HEAD" + the worker cap
 bd ready                           # Should run cleanly, return open work or "no ready issues"
 bd q "test bead — delete me"       # Should print a new bead ID
 bd close <id-from-above>           # Should be BLOCKED by tdd-gate.sh asking for tests
@@ -267,8 +269,26 @@ sable-view optimus          # deep-dive into a manager (second terminal)
 sable-view worker --tail    # read a hidden worker window without switching
 sable-msg optimus "status?" # message a pane (--interrupt to land mid-turn)
 sable-worker-status --reap  # clear finished worker panes
+sable-recover               # post-crash forensics: branch push state, dirty
+                            # worktrees, stranded claims (read-only by default)
 sable --help                # the full operator map, any time
 ```
+
+**Worker cap.** `sable-spawn-worker` refuses to spawn once `SABLE_MAX_WORKERS`
+live worker panes exist fleet-wide (default **8**; `sable-doctor` prints the
+effective cap and its source). Export `SABLE_MAX_WORKERS=<n>` to change it, `0`
+to pause spawning. A per-core load guard (`SABLE_MAX_LOAD_PER_CORE`) separately
+refuses spawns when the host is under critical CPU load. If CI is down and
+workers run local Docker databases, lower the cap — concurrent DB stacks, not
+pane count, are what exhaust a host.
+
+**Stranded-push recovery is mechanical.** If a worker pushes and the notify
+hook loses the handoff, `sable-reconcile-handoffs` (pull-based, idempotent,
+beads-only) files the missing merge-queue bead. It runs on Chuck's wake, and
+the installer also stages a host-level 15-minute timer (systemd --user unit +
+cron fallback under `~/.claude/sable/reconcile-timer/` — activation commands in
+the install output; activating it is a deliberate operator step). Nobody
+manually sweeps for stranded branches.
 
 (`sable-launch` wraps the lower-level `sable-tmux` layout tool and attaches
 with `tmux attach -t "$(sable-session)"`; `sable-launch lincoln` still launches
@@ -371,7 +391,8 @@ Merge this `hooks` block into your existing `settings.json` (preserving any othe
       }
     ],
     "SessionStart": [
-      {"matcher": "", "hooks": [{"type": "command", "command": "bd prime"}]}
+      {"matcher": "", "hooks": [{"type": "command", "command": "bd prime"}]},
+      {"matcher": "", "hooks": [{"type": "command", "command": "sable-doctor --quiet 2>&1 || true"}]}
     ],
     "PreCompact": [
       {"matcher": "", "hooks": [{"type": "command", "command": "bd prime"}]}
@@ -380,7 +401,11 @@ Merge this `hooks` block into your existing `settings.json` (preserving any othe
 }
 ```
 
-Replace `USER` with your username.
+Replace `USER` with your username. The `sable-doctor --quiet` SessionStart entry
+is the drift-warn: every session start checks your installed `~/.claude` against
+the SABLE repo and warns (non-fatally) when an installed hook or role file is
+stale — the failure mode where a merged fix is presumed live but the installed
+copy never picked it up.
 
 ### Add Prime Directives to `~/.claude/CLAUDE.md`
 
