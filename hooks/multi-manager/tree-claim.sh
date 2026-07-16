@@ -20,6 +20,11 @@
 #      For a `git worktree add` worktree, .git is a file pointing to the
 #      per-worktree gitdir; rev-parse resolves it correctly, giving each
 #      worktree its own independent claim file.
+#      A leading `cd <dir> &&` in the same command line shifts the shell's
+#      working directory before the git invocation runs; the effective-dir
+#      walk tracks that (SABLE-5pci) so `cd <worktree> && git add` and
+#      `git -C <worktree> add` resolve to the SAME claim file instead of the
+#      cd-form silently falling back to the hook's original cwd.
 #
 #   3. Claim lifecycle (TTL default: 3600s, override SABLE_TREE_CLAIM_TTL):
 #        No claim      → write this session's claim, allow.
@@ -214,6 +219,14 @@ def resolve_effective_dir(c_paths, base_cwd):
             cur = os.path.join(cur, p)
     return cur
 
+# Tracks the shell's working directory as command-position 'cd' segments are
+# walked, so a preceding 'cd <dir> &&' shifts the base a later 'git ...'
+# segment resolves -C paths (or lack thereof) against — same namespace a
+# 'git -C <dir> ...' invocation of the same physical op would land in
+# (SABLE-5pci: without this, 'cd <wt> && git add' fell back to the hook's
+# original cwd instead of <wt>, landing in the wrong repo's claim file).
+shell_cwd = cwd
+
 i = 0
 n = len(tokens)
 at_cmd_pos = True
@@ -241,6 +254,30 @@ while i < n:
                 continue
             break
         continue  # re-evaluate tokens[i] still at command position
+    # At command position: 'cd' — shifts shell_cwd for subsequent segments
+    # in this same command line.
+    if at_cmd_pos and tok == 'cd':
+        i += 1
+        # Skip cd's own flags (-L, -P, ...) but not a lone '-' (previous dir).
+        while i < n and tokens[i] not in SHELL_SEPS and tokens[i].startswith('-') and tokens[i] != '-':
+            i += 1
+        target = None
+        if i < n and tokens[i] not in SHELL_SEPS:
+            target = tokens[i]
+            i += 1
+        if target is None:
+            shell_cwd = os.environ.get('HOME', shell_cwd)
+        elif target == '-':
+            pass  # previous dir is unknowable here; leave shell_cwd as-is
+        elif os.path.isabs(target):
+            shell_cwd = target
+        else:
+            shell_cwd = os.path.join(shell_cwd, target)
+        # Skip any further args on this cd invocation until the next separator
+        while i < n and tokens[i] not in SHELL_SEPS:
+            i += 1
+        at_cmd_pos = False
+        continue
     # At command position: found 'git' — walk flags and identify subcommand
     if at_cmd_pos and tok == 'git':
         i += 1
@@ -277,7 +314,7 @@ while i < n:
                         is_mutating = True
                         break
             if is_mutating:
-                eff = resolve_effective_dir(c_paths, cwd)
+                eff = resolve_effective_dir(c_paths, shell_cwd)
                 print(eff)
                 sys.exit(0)
             # Not mutating — this segment is done, continue outer loop
