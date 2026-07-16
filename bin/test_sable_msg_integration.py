@@ -27,9 +27,25 @@ def tmux_socket():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _server_env():
+    """The env the tmux SERVER (and thus every pane without an explicit -e) is
+    started under. CLAUDE_AGENT_NAME is stripped (SABLE-to8m): pane identity must
+    be set explicitly per pane (tmux -e / _start_pane_as), never inherited from
+    whoever runs pytest — otherwise a runner that is itself a SABLE agent (a
+    manager pane exports CLAUDE_AGENT_NAME) would leak its identity into every
+    stand-in pane and the recipient identity cross-check would (correctly, but
+    unhelpfully for these fixtures) refuse role sends whose tag != that leaked
+    identity."""
+    import os
+    env = dict(os.environ)
+    env.pop("CLAUDE_AGENT_NAME", None)
+    return env
+
+
 def _tmux(sock, *args, check=True):
     return subprocess.run(["tmux", "-L", sock, *args],
-                          capture_output=True, text=True, check=check)
+                          capture_output=True, text=True, check=check,
+                          env=_server_env())
 
 
 def _capture(sock, target):
@@ -632,6 +648,76 @@ def test_bead_message_only_done_pane_reports_undelivered_with_reap_hint(tmux_soc
     assert "reap" in r.stderr.lower()
     time.sleep(0.5)
     assert "SHOULD-NOT-LAND" not in _capture(tmux_socket, done_pane)
+
+
+# --- poisoned identity tag: env is the authority, not @sable_role (SABLE-to8m) -
+# The 2026-07-07 incident: a stale/corrupted @sable_role=lincoln tag on an
+# unrelated WORKER pane sank two manager escalations into it (a fake-lincoln
+# sink). @sable_role is mutable global tmux state any process can overwrite; the
+# authority is the CLAUDE_AGENT_NAME of the process actually running in the pane.
+# sable-msg now cross-checks the recipient's process identity before delivering,
+# so a poisoned tag can no longer receive traffic addressed to the role it forges.
+
+def _start_pane_with_identity(sock, identity, role_tag):
+    """A bash REPL stand-in whose PANE PROCESS carries CLAUDE_AGENT_NAME=identity
+    (the authority, stamped via tmux -e exactly as the real spawn tooling does),
+    then tagged @sable_role=role_tag — which may DISAGREE with identity to model
+    a poisoned tag."""
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+          "-e", f"CLAUDE_AGENT_NAME={identity}",
+          "PS1='> ' bash --noprofile --norc")
+    time.sleep(0.5)
+    _tmux(sock, "set-option", "-p", "-t", "w", "@sable_role", role_tag)
+    return "w"
+
+
+def test_poisoned_lincoln_tag_on_worker_pane_refuses_delivery(tmux_socket):
+    # THE bead repro, live: a worker pane (its real process identity is its
+    # manager lane, 'optimus') is poisoned with @sable_role=lincoln. A
+    # lincoln-addressed message must NOT deliver into it — the process-identity
+    # cross-check catches env('optimus') != role('lincoln') and refuses.
+    # AUTO_FALLBACK=0 keeps the refusal from filing a real inbox bead (and keeps
+    # the case bd/dolt-free for the ci-verify clean room).
+    _start_pane_with_identity(tmux_socket, identity="optimus", role_tag="lincoln")
+    r = subprocess.run(
+        ["python3", str(BIN), "lincoln", "echo POISON-SHOULD-NOT-LAND",
+         "--from", "optimus"],
+        capture_output=True, text=True,
+        env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
+             "SABLE_MSG_AUTO_FALLBACK": "0"},
+    )
+    assert r.returncode != 0, "a poisoned lincoln tag must not receive lincoln traffic"
+    assert "poisoned" in r.stderr.lower()
+    assert "optimus" in r.stderr          # names the pane's real identity
+    time.sleep(0.5)
+    pane = _capture(tmux_socket, "w")
+    assert "POISON-SHOULD-NOT-LAND" not in pane
+
+
+def test_agreeing_identity_still_delivers(tmux_socket):
+    # The cross-check must not break legitimate sends: a pane whose process
+    # identity AGREES with its role tag (both 'optimus') delivers normally.
+    _start_pane_with_identity(tmux_socket, identity="optimus", role_tag="optimus")
+    r = _run_msg(tmux_socket, "optimus",
+                 "echo IDENTITY-AGREES-DELIVERED", "--from", "lincoln")
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.8)
+    pane = _capture(tmux_socket, "w")
+    assert "⟦SABLE-MSG⟧ from=lincoln to=optimus" in pane
+    assert "IDENTITY-AGREES-DELIVERED" in pane
+
+
+def test_untagged_process_identity_falls_open_to_tag(tmux_socket):
+    # A pane SABLE did not spawn (no CLAUDE_AGENT_NAME in its process env) has no
+    # authority to contradict its tag, so the pre-authority tag-only behavior is
+    # preserved: a tarzan-tagged bare shell still receives tarzan traffic.
+    _start_pane(tmux_socket)  # bash, no -e identity
+    _tmux(tmux_socket, "set-option", "-p", "-t", "w", "@sable_role", "tarzan")
+    r = _run_msg(tmux_socket, "tarzan",
+                 "echo NO-IDENTITY-FALLS-OPEN", "--from", "lincoln")
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.8)
+    assert "NO-IDENTITY-FALLS-OPEN" in _capture(tmux_socket, "w")
 
 
 if __name__ == "__main__":

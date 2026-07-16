@@ -44,6 +44,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_registry_lib import _main_worktree_root as main_worktree_root  # noqa: E402
+from sable_pane_lib import WORKER_CAP_DEFAULT, worker_cap  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 REFRESH_CMD = "bash install.sh"
@@ -169,10 +170,27 @@ def resolve_project_claude_dir(base=None):
     return claude_dir
 
 
+def worker_cap_line():
+    """Effective SABLE_MAX_WORKERS cap + its source, via sable_pane_lib's
+    worker_cap()/WORKER_CAP_DEFAULT so this can never drift from the
+    sable-spawn-worker gate it reports on (SABLE-61dy)."""
+    raw = (os.environ.get("SABLE_MAX_WORKERS") or "").strip()
+    env_sourced = False
+    if raw:
+        try:
+            env_sourced = int(raw) >= 0
+        except ValueError:
+            env_sourced = False
+    if env_sourced:
+        return f"worker cap: {worker_cap()} (env SABLE_MAX_WORKERS)"
+    return f"worker cap: {WORKER_CAP_DEFAULT} (default)"
+
+
 def render_text_report(results):
     bad = [r for r in results if r["status"] != "clean"]
     if not bad:
         print(f"sable-doctor: clean — {len(results)} installed files match repo HEAD.")
+        print(worker_cap_line())
         return
     print(f"sable-doctor: DRIFT DETECTED — {len(bad)}/{len(results)} installed files "
           "do not match repo HEAD.\n")
@@ -185,6 +203,7 @@ def render_text_report(results):
         print(f"  {label} {r['installed_path']}")
         print(f"          repo: {r['repo_path']}")
     print(f"\nRefresh with: {REFRESH_CMD}")
+    print(worker_cap_line())
 
 
 def main(argv=None):

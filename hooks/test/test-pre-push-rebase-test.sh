@@ -267,6 +267,34 @@ git -C "$REPO_DIR" config --unset sable.testCommand
 
 rm -f "$REPO_DIR/.sable"
 
+# ---------- testTimeout resolution tests (SABLE-pf0g) ----------
+# pre-push-rebase-test.sh previously read TEST_TIMEOUT only from
+# $SABLE_PRE_PUSH_TEST_TIMEOUT with no per-repo override — a genuinely
+# passing test suite that legitimately needs more than the 60s default
+# (e.g. under fleet contention) had no way to raise it for a single repo.
+# sable_resolve_test_timeout (lib-identity.sh) now also honors a repo-local
+# git config / checked-in .sable file; these tests prove the HOOK wires that
+# resolution into phase 3 end to end (the lib function itself is covered
+# separately in test-lib-identity.sh).
+SABLE_TIMEOUT_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true SABLE_PRE_PUSH_TEST_TIMEOUT=1"
+echo "testCommand=sleep 2 && exit 0" > "$REPO_DIR/.sable"
+
+# Test 11e: with only the 1s env default in effect, a test command that takes
+# 2s is killed by `timeout` → phase 3 denies citing the exceeded timeout.
+assert_deny "no per-repo override → 1s env default kills a 2s test command" \
+  "$SABLE_TIMEOUT_ENV" "git push" "$REPO_DIR" "exceeded the"
+
+# Test 11f: repo-local git config sable.testTimeout=5 overrides the 1s env
+# default → the same 2s test command now completes inside the window and the
+# push is allowed (proves the config override reaches the hook's `timeout`
+# call, not just the resolver function in isolation).
+git -C "$REPO_DIR" config sable.testTimeout 5
+assert_allow "repo-local git config testTimeout overrides 1s env default → 2s test command completes" \
+  "$SABLE_TIMEOUT_ENV" "git push" "$REPO_DIR"
+git -C "$REPO_DIR" config --unset sable.testTimeout
+
+rm -f "$REPO_DIR/.sable"
+
 # ---------- Shared matcher tests (SABLE-jpr / SABLE-0u1) ----------
 # The pre-push gate must fire for real git push variants (positives) and
 # must NOT fire for commands where "git push" only appears as a quoted string
@@ -642,9 +670,13 @@ rm -rf "$YZ_BARE" "$YZ_REPO"
 #   Case 1 RED (pre-fix): env unset → BASE=origin/main → conflicting rebase
 #                → deny "phase 1"; GREEN: BASE=origin/tmux-only → clean
 #                rebase over i3 → "phase skipped".
-#   Case 2 RED (pre-fix): leaked SABLE_BASE_BRANCH=origin/main → conflicting
-#                rebase deny (wrong message); GREEN: wrong-base guard DENIES
-#                before any rewrite.
+#   Case 2 (SABLE-1238): a leaked SABLE_BASE_BRANCH=origin/main must NOT force
+#                the base or block the push — the repo's authoritative config
+#                (sable.integrationBranch=tmux-only, published) wins, so phase 1
+#                rebases cleanly onto origin/tmux-only and the push proceeds
+#                ("phase skipped"). Pre-SABLE-1238 this DENIED via the wrong-base
+#                guard, whose remediation ("unset SABLE_BASE_BRANCH and retry")
+#                was unreachable: a PreToolUse hook can't read the push's env.
 # ===================================================================
 AMZ_BARE="$TMPROOT/4amz-bare.git"
 AMZ_REPO="$TMPROOT/4amz-repo"
@@ -675,8 +707,8 @@ AMZ_ENV="$MGR_ENV SABLE_PRE_PUSH_TYPECHECK_COMMAND=true SABLE_PRE_PUSH_TEST_PHAS
 assert_context "4amz: unset SABLE_BASE_BRANCH → phase-1 rebases onto origin/<INT>, not origin/main (clean pass)" \
   "$AMZ_ENV" "git push origin wk-4amz-w" "$AMZ_REPO" "phase skipped"
 AMZ_LEAK_ENV="$AMZ_ENV SABLE_BASE_BRANCH=origin/main"
-assert_deny "4amz: leaked SABLE_BASE_BRANCH=origin/main on a worker branch → wrong-base guard denies (no silent rewrite)" \
-  "$AMZ_LEAK_ENV" "git push origin wk-4amz-w" "$AMZ_REPO" "wrong-base guard"
+assert_context "SABLE-1238: leaked SABLE_BASE_BRANCH=origin/main is IGNORED — authoritative config rebases onto origin/tmux-only (clean pass, no deny)" \
+  "$AMZ_LEAK_ENV" "git push origin wk-4amz-w" "$AMZ_REPO" "phase skipped"
 rm -rf "$AMZ_BARE" "$AMZ_REPO"
 
 # Cleanup

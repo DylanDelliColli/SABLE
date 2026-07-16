@@ -88,6 +88,37 @@ def pane_idle(capture: str) -> bool:
     return pane_ready(capture) and not pane_busy(capture)
 
 
+# A running turn's status row carries a spinner glyph AND an elapsed-time timer
+# ("4m 36s", "8s") even in the rare capture where the "esc to interrupt"
+# affordance pane_busy keys on has been pushed out of frame by a queued-message
+# block or a reflow — the miss that let a busy mid-turn pane flag DIALOG-STALLED
+# (SABLE-tz9f, optimus %19 was 4m36s into a turn when the probe said to Esc it).
+# The claude working spinner is one of these asterisk-flower / braille glyphs;
+# ordinary transcript bullets (●, ◦) are deliberately excluded so an idle dialog
+# with a stray elapsed-looking token isn't misread as working.
+_SPINNER_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷✻✽✳✢✴✶✷✺]")
+_ELAPSED_RE = re.compile(r"\b\d+m\s*\d+s\b|\b\d+s\b")
+
+
+def pane_working(capture: str) -> bool:
+    """True while the pane is MID-TURN — a SUPERSET of pane_busy for the
+    dialog-stall probe's authoritative not-busy guard (SABLE-tz9f). Returns True
+    when pane_busy does (the "esc to interrupt" hint) OR when any line bears BOTH
+    a spinner glyph and an elapsed-time timer — a working pane whose interrupt
+    hint isn't in the captured frame. A real idle dialog shows neither a spinner
+    nor a running timer, so this never suppresses a genuine stall; and because it
+    only ever ADDS busy detections, sending Esc into a working pane (which
+    interrupts its turn) is strictly harder to trigger. pane_busy itself is left
+    byte-for-byte unchanged — the sable-msg delivery flow (dispatch_landed /
+    submitted_own_turn) depends on its exact contract."""
+    if pane_busy(capture):
+        return True
+    for line in capture.splitlines():
+        if _SPINNER_RE.search(line) and _ELAPSED_RE.search(line):
+            return True
+    return False
+
+
 def accept_startup_gate(capture: str) -> str | None:
     """The menu key that ACCEPTS a known blocking startup gate, or None. The
     bypass-permissions warning defaults to '1. No, exit' (so a blind Enter kills
@@ -137,32 +168,59 @@ def dialog_posture(capture: str) -> bool:
 # A modal INFO overlay (the /usage panel, /help, /model preamble, ...) blocks
 # the composer exactly as a selector dialog does, but its tell is an
 # "Esc to close/exit/go back/dismiss" DISMISS affordance, not a numbered menu or
-# an Enter-to-select prompt — so dialog_posture (tuned conservative for m94k's
-# SPAWN gate) does not catch it. The alternation lists dismiss verbs ONLY: it
-# must never collide with the busy-turn "esc to interrupt" hint (_BUSY_MARKERS),
-# which marks a working pane, not a stall.
+# an Enter-to-select prompt. The alternation lists dismiss verbs ONLY: it must
+# never collide with the busy-turn "esc to interrupt" hint (_BUSY_MARKERS), which
+# marks a working pane, not a stall.
 _OVERLAY_DISMISS_RE = re.compile(
     r"esc(ape)?\s+to\s+(close|exit|go back|dismiss)", re.IGNORECASE)
 
 
-def overlay_posture(capture: str) -> bool:
-    """True when the pane is blocked on a modal overlay/dialog demanding a
-    keypress to dismiss — a SUPERSET of dialog_posture (SABLE-axp0). Reuses
-    dialog_posture for the selector/gate case (numbered menu, Enter-to-select,
-    known startup gates) and ADDS the info-overlay case it misses: a /usage-style
-    panel shows no numbered menu and no 'Enter to select' affordance, only an
-    'Esc to close' dismiss hint — yet it blocks the composer and silently
-    swallows every sent keystroke into itself, the ~30min chuck /usage stall
-    that motivated this bead. Building on dialog_posture rather than editing it
-    keeps m94k's spawn gate (which calls dialog_posture directly) untouched.
+def overlay_evidence(capture: str) -> str | None:
+    """The pane-text line proving `capture` is parked on a modal dialog/overlay
+    demanding a keypress, or None. A POSITIVE-signature classifier (SABLE-tz9f):
+    it keys on the explicit keypress AFFORDANCE a live selector or modal always
+    prints — an 'Enter to confirm/select' / 'Use arrow keys' / '(y/n)' selector
+    affordance, or an 'Esc to close/exit/…' dismiss hint — plus the two
+    recognized blocking startup gates (bypass warning / trust folder).
 
-    Like dialog_posture, deliberately conservative: matching only dialog/overlay
-    signatures (never the empty composer or a plain shell prompt) so a caller can
-    combine it with a not-busy check to flag a genuinely idle-blocked pane
-    without false-positiving a working one."""
-    if dialog_posture(capture):
-        return True
-    return any(_OVERLAY_DISMISS_RE.search(_clean(line)) for line in capture.splitlines())
+    It deliberately does NOT flag on a bare run of numbered lines the way the
+    original superset (dialog_posture — "2+ numbered option rows anywhere") did:
+    that misread ordinary composer chrome (separator rows) and a queued
+    ⟦SABLE-MSG⟧ block containing a numbered list as a dialog box, false-flagging
+    healthy panes as DIALOG-STALLED six times across three days — and the remedy
+    text tells the operator to send Esc, which INTERRUPTS a busy pane mid-turn
+    (a real near-miss: optimus was 4m36s into a turn). A message/transcript
+    rarely carries a selector affordance verbatim, so requiring it is both far
+    more specific and the actual signal a keypress is being awaited. The returned
+    line is the evidence snippet the DIALOG-STALLED alert surfaces (SABLE-ccxc)
+    so an operator can judge true-vs-false from the alert itself.
+
+    dialog_posture (m94k's spawn gate) is intentionally left untouched: this is
+    the probe-only classifier, and the spawn gate's looser numbered-menu match is
+    fine in its own context (a freshly spawned, not-yet-ready pane)."""
+    for raw in capture.splitlines():
+        line = _clean(raw)
+        if line and (_DIALOG_AFFORDANCE_RE.search(line)
+                     or _OVERLAY_DISMISS_RE.search(line)):
+            return line
+    if accept_startup_gate(capture) is not None:
+        for raw in capture.splitlines():
+            line = _clean(raw)
+            low = line.lower()
+            if "trust" in low or "bypass permissions" in low:
+                return line
+        return "blocking startup gate"
+    return None
+
+
+def overlay_posture(capture: str) -> bool:
+    """True when the pane is parked on a modal dialog/overlay demanding a keypress
+    — see overlay_evidence for the positive signature (selector/dismiss affordance
+    or a known startup gate) and the SABLE-tz9f false-positive history the bare
+    numbered-line superset it replaced caused. The caller (sable-worker-status
+    dialog_stall) combines it with a not-working guard to mean genuinely
+    idle-blocked, never a working pane."""
+    return overlay_evidence(capture) is not None
 
 
 # The session-limit banner Claude Code prints when a message/session rate
@@ -593,17 +651,110 @@ def resolve_session(socket: str | None = None, base: str | None = None,
     return name
 
 
+# --- Authoritative pane identity (SABLE-to8m). The @sable_role / @sable_bead
+# pane options are mutable global tmux state ANY process can overwrite with no
+# owner — a stale/poisoned @sable_role once routed two manager escalations into
+# an unrelated worker, and a resumed cockpit was left reap-eligible. The
+# AUTHORITY is instead the CLAUDE_AGENT_NAME env of the process actually running
+# in the pane: it is stamped once at spawn (tmux -e, see sable-tmux /
+# sable-spawn-*) into the pane process's own environment and cannot be forged by
+# re-tagging. The pane option is demoted to a cache/hint that only decides the
+# outcome when the process carries no identity of its own (a pane SABLE did not
+# spawn, or one predating this authority).
+
+def pane_pid(base: list[str], pane: str, run=None) -> str | None:
+    """The PID of the process running in `pane` (tmux #{pane_pid}), or None when
+    the pane has vanished / tmux is unavailable. Fails open (None) on any error:
+    identity resolution degrades to the tag rather than crashing a send/reap."""
+    run = run or _tmux_run
+    try:
+        r = run(base + ["display-message", "-p", "-t", pane, "#{pane_pid}"])
+    except Exception:
+        return None
+    out = (getattr(r, "stdout", "") or "").strip()
+    return out if getattr(r, "returncode", 1) == 0 and out.isdigit() else None
+
+
+def _read_environ(pid: str, proc_root: str = "/proc") -> dict[str, str]:
+    """Parse /proc/<pid>/environ (NUL-delimited KEY=VALUE) into a dict. Empty on
+    any error (no such pid, permission, non-Linux) — the caller then has no
+    authoritative identity and falls back to the tag."""
+    try:
+        with open(f"{proc_root}/{pid}/environ", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return {}
+    env: dict[str, str] = {}
+    for entry in raw.split(b"\x00"):
+        if not entry or b"=" not in entry:
+            continue
+        k, _, v = entry.partition(b"=")
+        env[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+    return env
+
+
+def pane_process_identity(base: list[str], pane: str, run=None,
+                          proc_root: str = "/proc") -> str | None:
+    """The AUTHORITATIVE agent identity of `pane`: the CLAUDE_AGENT_NAME of the
+    process actually running in it (tmux #{pane_pid} -> /proc/PID/environ), or
+    None when unresolvable — a pane SABLE did not spawn, a plain shell, or a
+    vanished pane (SABLE-to8m). This is the authority the mutable @sable_role
+    pane option is only a cache for."""
+    pid = pane_pid(base, pane, run=run)
+    if not pid:
+        return None
+    return _read_environ(pid, proc_root=proc_root).get("CLAUDE_AGENT_NAME") or None
+
+
+def pane_role_tag(base: list[str], pane: str, run=None) -> str | None:
+    """The CACHED @sable_role pane option (mutable — a hint only, never the
+    authority; see pane_process_identity). None when unset/unresolvable."""
+    run = run or _tmux_run
+    try:
+        r = run(base + ["show-options", "-p", "-v", "-t", pane, "@sable_role"])
+    except Exception:
+        return None
+    val = (getattr(r, "stdout", "") or "").strip()
+    return val if getattr(r, "returncode", 1) == 0 and val else None
+
+
+def resolve_pane_identity(base: list[str], pane: str, run=None,
+                          proc_root: str = "/proc") -> str | None:
+    """Authoritative identity for a pane: the process env identity WINS over the
+    mutable @sable_role tag whenever the two disagree (SABLE-to8m). Falls back to
+    the tag ONLY when the process carries no CLAUDE_AGENT_NAME, so panes SABLE did
+    not spawn (or ones predating this authority) still resolve by their tag."""
+    env_id = pane_process_identity(base, pane, run=run, proc_root=proc_root)
+    if env_id:
+        return env_id
+    return pane_role_tag(base, pane, run=run)
+
+
+def tag_is_poisoned(base: list[str], pane: str, claimed_role: str, run=None,
+                    proc_root: str = "/proc") -> bool:
+    """True when `pane`'s @sable_role tag claims `claimed_role` but the pane's
+    authoritative process identity says otherwise — a poisoned/stale tag
+    (SABLE-to8m). Fails OPEN (False) when the process carries no identity: a pane
+    SABLE did not spawn (e.g. a bare shell in an integration test) has no
+    authority to contradict, so it keeps the pre-authority tag-only behavior and
+    delivery/reaping is unchanged for it."""
+    env_id = pane_process_identity(base, pane, run=run, proc_root=proc_root)
+    return env_id is not None and env_id != claimed_role
+
+
 # --- Dispatch throttle knob (SABLE-mmdt), shared by sable-spawn-worker (the
 # refusal) and sable-view (the cockpit count-vs-cap line) so the default can
 # never drift between the gate and its observability surface.
-WORKER_CAP_DEFAULT = 4
+WORKER_CAP_DEFAULT = 8
 
 
 def worker_cap(env=None) -> int:
-    """Max live worker panes per session (SABLE_MAX_WORKERS). Default 4 — the
-    2026-07-07 full-fleet dispatch (~15 workers + Docker) froze the WSL host.
-    0 is an explicit emergency stop (every spawn refused). Unparseable or
-    negative values keep the DEFAULT throttle rather than lifting it."""
+    """Max live worker panes per session (SABLE_MAX_WORKERS). Default 8 — the
+    2026-07-07 freeze that motivated the old default of 4 was 8 worktrees each
+    running a local Supabase Docker DB during a CI outage, not the panes
+    themselves. 0 is an explicit emergency stop (every spawn refused).
+    Unparseable or negative values keep the DEFAULT throttle rather than
+    lifting it."""
     raw = ((env if env is not None else os.environ).get("SABLE_MAX_WORKERS") or "").strip()
     if not raw:
         return WORKER_CAP_DEFAULT

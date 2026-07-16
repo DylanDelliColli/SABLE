@@ -164,6 +164,126 @@ def test_promote_tip_moved_non_ff_is_retryable_23(monkeypatch):
     assert any("--delete" in a for a in seen), "ci-verify ref not cleaned up on tip-moved exit"
 
 
+# --- SABLE-sc24: a CANCELLED run is retryable, never RED ----------------------
+# A ci-verify run cancelled mid-flight (concurrent sweep deleting the ref, manual
+# cancel, or concurrency-group pre-emption) is not a content defect. promote()
+# must map it to the retryable exit 24 (rebuild preview + re-gate), NOT the red
+# path's exit 20 with a "fix + re-push" message — there is nothing to fix.
+
+def test_cancelled_conclusion_is_retryable(monkeypatch):
+    seen = []
+
+    def fake_git(repo, *args, check=True):
+        seen.append(args)
+        head = args[0] if args else ""
+        if head == "merge-tree":
+            return subprocess.CompletedProcess(args, 0, stdout="TREEOID\n", stderr="")
+        if head == "commit-tree":
+            return subprocess.CompletedProcess(args, 0, stdout="PREVIEWSHA\n", stderr="")
+        if head == "rev-parse":
+            return subprocess.CompletedProcess(args, 0, stdout="SOMESHA\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(smg, "_git", fake_git)
+    monkeypatch.setattr(smg, "wait_for_ci", lambda *a, **k: ("cancelled", "http://run/cancelled"))
+    notes = []
+    monkeypatch.setattr(smg, "_notify", lambda *a, **k: None)
+    monkeypatch.setattr(smg, "_append_evidence", lambda repo, bead, note: notes.append(note))
+
+    with pytest.raises(smg.GateError) as ei:
+        smg.promote("BEAD", "wk-x", "trunk", "/repo", "origin", "mgr", None)
+    # retryable (24), NOT the red path (20)
+    assert ei.value.code == 24
+    # cleanup still ran: the (possibly already-gone) ci-verify ref is deleted
+    assert any("--delete" in a for a in seen), "ci-verify ref not cleaned up on cancelled exit"
+    # evidence records a retryable cancellation, not a red-with-fix instruction
+    assert notes and "CANCELLED" in notes[0] and "retryable" in notes[0]
+    assert not any("RED" in n for n in notes), "cancelled must not record a RED verdict"
+
+
+# --- SABLE-sc24: sweep must not reap a ref whose Actions run is still in-flight -
+# Deleting a live ci-verify ref cancels its GitHub run — the very failure this
+# bead fixes. Age alone does not make a ref an orphan.
+
+def _sweep_fake_git(monkeypatch, listing):
+    calls = []
+
+    def fake_git(repo, *args, check=True):
+        calls.append(args)
+        if args and args[0] == "for-each-ref":
+            return subprocess.CompletedProcess(args, 0, stdout=listing, stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(smg, "_git", fake_git)
+    return calls
+
+
+def _sweep_deletes(calls):
+    return [a for a in calls if a and a[0] == "push" and "--delete" in a]
+
+
+def test_sweep_spares_ref_with_inflight_run(monkeypatch):
+    # an aged ref (committerdate 0 = 1970) whose run is still in-flight is NOT reaped
+    calls = _sweep_fake_git(monkeypatch, "origin/ci-verify/bead-abcdef1 0\n")
+    monkeypatch.setattr(smg, "ref_has_inflight_run", lambda repo, ref: True)
+    assert smg.sweep("/repo", "origin", 6) == 0
+    assert _sweep_deletes(calls) == [], "in-flight ref was wrongly reaped"
+
+
+def test_sweep_reaps_aged_ref_without_inflight_run(monkeypatch):
+    calls = _sweep_fake_git(monkeypatch, "origin/ci-verify/bead-abcdef1 0\n")
+    monkeypatch.setattr(smg, "ref_has_inflight_run", lambda repo, ref: False)
+    assert smg.sweep("/repo", "origin", 6) == 0
+    assert _sweep_deletes(calls) == [("push", "origin", "--delete", "ci-verify/bead-abcdef1")]
+
+
+def test_sweep_keeps_fresh_ref_regardless_of_run(monkeypatch):
+    # a ref younger than the threshold is never even queried for its run status
+    import time as _time
+    fresh_ts = str(int(_time.time()))
+    calls = _sweep_fake_git(monkeypatch, f"origin/ci-verify/bead-abcdef1 {fresh_ts}\n")
+    probed = []
+    monkeypatch.setattr(smg, "ref_has_inflight_run", lambda repo, ref: probed.append(ref) or False)
+    assert smg.sweep("/repo", "origin", 6) == 0
+    assert _sweep_deletes(calls) == [], "fresh ref wrongly reaped"
+    assert probed == [], "fresh ref should not incur a gh run-status probe"
+
+
+# --- SABLE-sc24: ref_has_inflight_run — the sweep's live-run probe -------------
+
+def _ref_status_run(monkeypatch, *, rc, stdout):
+    monkeypatch.setattr(smg, "_run",
+                        lambda argv, cwd=None, check=True: subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr=""))
+
+
+def test_ref_has_inflight_run_true_when_not_completed(monkeypatch):
+    import json
+    _ref_status_run(monkeypatch, rc=0, stdout=json.dumps([{"status": "in_progress"}]))
+    assert smg.ref_has_inflight_run("/repo", "ci-verify/bead-abcdef1") is True
+
+
+def test_ref_has_inflight_run_false_when_completed(monkeypatch):
+    import json
+    _ref_status_run(monkeypatch, rc=0, stdout=json.dumps([{"status": "completed"}]))
+    assert smg.ref_has_inflight_run("/repo", "ci-verify/bead-abcdef1") is False
+
+
+def test_ref_has_inflight_run_false_when_no_runs(monkeypatch):
+    _ref_status_run(monkeypatch, rc=0, stdout="[]")
+    assert smg.ref_has_inflight_run("/repo", "ci-verify/bead-abcdef1") is False
+
+
+def test_ref_has_inflight_run_fail_open_on_gh_error(monkeypatch):
+    # gh error -> False (fail-open): an undiscoverable run cannot wedge the sweep
+    _ref_status_run(monkeypatch, rc=1, stdout="gh: could not connect")
+    assert smg.ref_has_inflight_run("/repo", "ci-verify/bead-abcdef1") is False
+
+
+def test_ref_has_inflight_run_fail_open_on_bad_json(monkeypatch):
+    _ref_status_run(monkeypatch, rc=0, stdout="not json")
+    assert smg.ref_has_inflight_run("/repo", "ci-verify/bead-abcdef1") is False
+
+
 # --- SABLE-dn7r: post-merge worktree/branch cleanup (GREEN path only) ----------
 # At fleet pace worker worktrees + branches re-accumulate (58 in one day) unless
 # a green promote reaps them. These drive cleanup_after_merge as a unit via a

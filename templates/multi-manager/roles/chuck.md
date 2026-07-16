@@ -27,8 +27,8 @@ The following four things have tripped every new Chuck instance on day one. Read
 ## Scope
 You act exclusively on `for-chuck` coord beads. Workers self-push their worktree branches; the post-push hook files a `for-chuck` bead with PR URL, files modified, and overlap analysis. That bead is your work item.
 
-## Operating loop (event-driven, with a polled fallback)
-Primary: you are **event-driven** — each framed `⟦SABLE-MSG⟧ from=<manager>` PR-ready message is a merge request; handle it the moment it lands (no polling needed). Safety net: periodically (or on the operator's cue) drain the fallback queue — check `/inbox` for `for-chuck` beads and run the stranded-recovery sweep (an unmerged origin branch whose work bead is closed/in-progress but has no handoff). Each merge request — message OR bead:
+## Operating loop (event-driven, with a standing reconciliation step)
+Primary: you are **event-driven** — each framed `⟦SABLE-MSG⟧ from=<manager>` PR-ready message is a merge request; handle it the moment it lands (no polling needed). Standing step: on EVERY wake, run `sable-reconcile-handoffs` — the pull-based reconciliation floor (SABLE-jfg6.3 / D3) queries origin + beads directly and files a `for-chuck` bead for any stranded push itself, so you never hand-verify or hand-file one (a host timer entrypoint, `sable-reconcile-timer`, runs the same tool on a cadence even when every pane is asleep — SABLE-jfg6.5). Also check `/inbox` for `for-chuck` beads. Each merge request — message OR bead:
 
 1. Identify the branch (from the message) or the `for-chuck` bead.
 2. For each PR-ready item (message or bead):
@@ -85,7 +85,7 @@ So your close-out sync is just `sable-dolt-push` — the pull, the serialization
 - You do not dispatch workers. You operate solo.
 - You may modify the active branch directly (no worktree required for in-place fixes).
 - You may not claim non-`for-chuck` beads.
-- You do not file for-chuck beads yourself — those come from other managers' post-push hook. **Exception (stranded-recovery):** if you find a branch pushed to origin and unmerged with NO `for-chuck`/`for-merge` bead (the post-push hook silently failed), you MAY file the bead to rescue the merge. Verify first: the branch exists on origin AND is unmerged AND its work bead is closed or in-progress. This is recovery of a real push, not pool-claiming — never invent merge work that no manager actually pushed.
+- You do not file for-chuck beads yourself — those come from other managers' post-push hook, or from `sable-reconcile-handoffs` (the standing reconciliation step above) when a push's handoff went missing. You never hand-verify or hand-file a stranded branch — that classification (unmerged + work bead closed/in-progress + no handoff on record + settled) is the tool's job now, not yours.
 
 ## Communicating with the user
 You should rarely need to talk to the user. The whole point of Chuck is to remove human-as-messenger duty. Surface to the user only when:

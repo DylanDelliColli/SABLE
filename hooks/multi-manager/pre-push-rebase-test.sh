@@ -29,7 +29,10 @@
 #   $SABLE_PRE_PUSH_TEST_PHASE          — "auto" (default) | "skip" (delegate to repo's git hooks)
 #   $SABLE_TEST_COMMAND                 — test invocation (used when PHASE=auto; lowest-priority
 #                                         source — see sable_resolve_test_command below)
-#   $SABLE_PRE_PUSH_TEST_TIMEOUT        — seconds for test phase (default: 60)
+#   $SABLE_PRE_PUSH_TEST_TIMEOUT        — seconds for test phase (default: 60; lowest-priority
+#                                         source — see sable_resolve_test_timeout below. Repo-local
+#                                         override: `git config sable.testTimeout <seconds>`, or a
+#                                         checked-in `testTimeout=<seconds>` line in .sable)
 #   $SABLE_SKIP_PRE_PUSH                — "1" to skip TESTS only (rebase+static still run)
 #
 # Auto-detect typechecker by project markers:
@@ -258,21 +261,17 @@ Resolve network/auth and retry. This phase cannot be skipped — rebase is manda
   exit 0
 }
 
-# --- SABLE-4amz: the phase-1 rebase base DEFAULTS to the resolved integration
-# branch when it is published — the old unconditional origin/main default
-# silently re-parented every worker branch on a non-main integration repo at
-# push time, rewriting all carried SHAs (manufactured the wk-tripwire-pytest
-# corruption, 2026-07-09). Resolved after the fetch so the origin/<INT>
-# existence check sees fresh remote refs. An explicit SABLE_BASE_BRANCH still
-# wins here; the wrong-base guard below refuses it when it would re-parent a
-# worker branch. Validation falls back gracefully when the desired ref does
-# not exist in this repo (SABLE-61n).
-DEFAULT_BASE_BRANCH="origin/main"
-if [ -n "$INTEGRATION_BRANCH" ] \
-   && git -C "$CWD" rev-parse --verify --quiet "origin/$INTEGRATION_BRANCH" >/dev/null 2>&1; then
-  DEFAULT_BASE_BRANCH="origin/$INTEGRATION_BRANCH"
-fi
-BASE_BRANCH=$(sable_validate_base_ref "$CWD" "${SABLE_BASE_BRANCH:-$DEFAULT_BASE_BRANCH}")
+# --- SABLE-1238 (supersedes SABLE-4amz's inline derivation): resolve the
+# phase-1 rebase base AUTHORITATIVELY from the target repo's own integration
+# branch, never from the session env. When origin/<INT> is published that ref
+# IS the base and a leaked session SABLE_BASE_BRANCH (or an origin/main
+# fallback) cannot override it — sable_resolve_base_branch encodes the full
+# rationale, including why a PreToolUse hook can never read SABLE_BASE_BRANCH
+# from the push invocation. Resolved after the fetch so the origin/<INT>
+# existence check sees fresh remote refs. The old inline
+# `${SABLE_BASE_BRANCH:-$DEFAULT_BASE_BRANCH}` let the leaked env win, forcing
+# origin/main and a wrong-base deny whose remediation was unreachable.
+BASE_BRANCH=$(sable_resolve_base_branch "$CWD")
 
 # --- fofc (market-brief-package-fofc): integration-branch self-push special
 # case. Pushing the branch that IS the integration branch must NEVER rebase it
@@ -291,17 +290,23 @@ if [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" = "$INTEGRATION_BRANCH" ]; th
   fi
 fi
 
-# --- SABLE-4amz: published-case wrong-base guard. The yz5y guard above covers
-# only a LOCAL-ONLY integration branch; once origin/<INT> is published, the
-# hook ITSELF was the re-parenting vector — phase 1 rebasing a worker branch
-# onto any base other than origin/<INT> (a leaked cross-repo SABLE_BASE_BRANCH,
-# a validation fallback) replays it onto foreign lineage and rewrites every
-# carried SHA. Deny instead of silently rewriting.
+# --- SABLE-4amz / SABLE-1238: published-case wrong-base guard. The yz5y guard
+# above covers only a LOCAL-ONLY integration branch; once origin/<INT> is
+# published, phase 1 rebasing a worker branch onto any base other than
+# origin/<INT> replays it onto foreign lineage and rewrites every carried SHA.
+# With SABLE-1238 the base is now resolved authoritatively from repo config
+# (sable_resolve_base_branch), so in the published case BASE_BRANCH already IS
+# origin/<INT> and this guard is a defensive assertion that should not fire.
+# Its remediation intentionally does NOT tell the operator to change
+# SABLE_BASE_BRANCH: this is a PreToolUse hook running in the session env, so a
+# SABLE_BASE_BRANCH prefixed onto the `git push` invocation is never read here
+# (the exact dead end that made SABLE-4amz's deny impossible to satisfy). The
+# only authoritative fix is the target repo's integration-branch config.
 if [ -n "$INTEGRATION_BRANCH" ] && [ -n "$CURRENT_BRANCH" ] \
    && [ "$CURRENT_BRANCH" != "$INTEGRATION_BRANCH" ] \
    && git -C "$CWD" rev-parse --verify --quiet "origin/$INTEGRATION_BRANCH" >/dev/null 2>&1 \
    && [ "$BASE_BRANCH" != "origin/$INTEGRATION_BRANCH" ]; then
-  emit_deny "Pre-push denied (wrong-base guard): phase 1 would rebase worker branch '$CURRENT_BRANCH' onto '$BASE_BRANCH', but this repo's integration branch is published at origin/$INTEGRATION_BRANCH. Rebasing onto a foreign base re-parents the branch and rewrites its carried SHAs (this corrupted wk-tripwire-pytest — SABLE-4amz). Unset the leaked SABLE_BASE_BRANCH (or set it to origin/$INTEGRATION_BRANCH) and retry."
+  emit_deny "Pre-push denied (wrong-base guard): phase 1 would rebase worker branch '$CURRENT_BRANCH' onto '$BASE_BRANCH', but this repo's integration branch is published at origin/$INTEGRATION_BRANCH. Rebasing onto a foreign base re-parents the branch and rewrites its carried SHAs (this corrupted wk-tripwire-pytest — SABLE-4amz). The authoritative base is this repo's integration branch, set via 'git config sable.integrationBranch <name>' or an 'integrationBranch=<name>' line in the repo's .sable file — correct that in the TARGET repo. NOTE: this pre-push gate is a PreToolUse hook and runs in the session environment, NOT the environment of your 'git push' command, so prefixing SABLE_BASE_BRANCH onto the push (or 'env -u SABLE_BASE_BRANCH git push') has no effect here."
   exit 0
 fi
 
@@ -388,13 +393,13 @@ if [ -z "$TEST_CMD" ]; then
   exit 0
 fi
 
-TEST_TIMEOUT="${SABLE_PRE_PUSH_TEST_TIMEOUT:-60}"
+TEST_TIMEOUT=$(sable_resolve_test_timeout "$CWD")
 TEST_EXIT=0
 TEST_OUT=$(cd "$CWD" && timeout "$TEST_TIMEOUT" sh -c "$TEST_CMD" 2>&1) || TEST_EXIT=$?
 
 if [ "$TEST_EXIT" -ne 0 ]; then
   if [ "$TEST_EXIT" -eq 124 ]; then
-    SUFFIX="Tests exceeded SABLE_PRE_PUSH_TEST_TIMEOUT=${TEST_TIMEOUT}s. Either scope SABLE_TEST_COMMAND to a faster subset (recommended: smoke + changed units, <60s), or raise both SABLE_PRE_PUSH_TEST_TIMEOUT and the settings.json hook timeout together."
+    SUFFIX="Tests exceeded the ${TEST_TIMEOUT}s test-phase timeout. Either scope the test command to a faster subset (recommended: smoke + changed units, <60s), or raise the timeout for this repo: \`git config sable.testTimeout <seconds>\` (repo-local), a \`testTimeout=<seconds>\` line in .sable (checked in), or \$SABLE_PRE_PUSH_TEST_TIMEOUT (legacy env, and raise the settings.json hook timeout together with it)."
   else
     SUFFIX="Tests failed. Fix before pushing, or set SABLE_SKIP_PRE_PUSH=1 with explicit intent (rebase + static still run)."
   fi

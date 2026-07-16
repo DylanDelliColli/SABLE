@@ -28,14 +28,18 @@ ALLOW=(
   test-active-contracts-integration.sh
   test-agent-definitions.sh
   test-bead-description-gate.sh
+  test-chuck-role-contract.sh
   test-columbo-quick-mode.sh
   test-concurrent-sessions.sh
+  test-control-trace.sh
   test-edit-write-claim-reconciler.sh
   test-full-ingestion.sh
   test-lib-git-sandbox.sh
+  test-lib-hook-trace.sh
   test-lib-identity.sh
   test-lib-identity-isolation.sh
   test-lib-mode-path.sh
+  test-lib-registry-path.sh
   test-mode-interlock.sh
   test-mode-tier.sh
   test-multi-manager-pattern.sh
@@ -51,6 +55,7 @@ ALLOW=(
   test-pre-dispatch-refresh.sh
   test-pre-push-rebase-concurrency.sh
   test-pre-push-rebase-test.sh
+  test-preview-already-verified.sh
   test-project-clone-portability.sh
   test-quickstart-orchestration.sh
   test-read-guard.sh
@@ -65,6 +70,7 @@ ALLOW=(
   test-sable-discover.sh
   test-sable-launch.sh
   test-sable-mode.sh
+  test-sable-onboarding-skill.sh
   test-sable-plan-tiers.sh
   test-sable-skills.sh
   test-script-dir-symlink.sh
@@ -87,6 +93,7 @@ declare -A EXCLUDE=(
   [test-install-agent-defs.sh]="needs the ~/.claude SABLE install (SABLE-59zu)"
   [test-install-version-floor.sh]="needs the ~/.claude SABLE install (SABLE-59zu)"
   [test-install-multi-manager.sh]="vacuous without bd — prints 'SKIP: bd not on PATH' and exits 0 (SABLE-59zu/SABLE-7v3z)"
+  [test-quickstart-project.sh]="needs the ~/.claude SABLE install (bd, sable-doctor) for its E2E bootstrap-flow cases; clean-room has none (SABLE-59zu, SABLE-vivm)"
   [test-tmux-e2e.sh]="vacuous without bd — prints 'SKIP: bd not installed' and exits 0 (SABLE-59zu)"
   [test-sable-msg.sh]="known-red: legacy fixed-name tmux sessions vs per-repo naming (SABLE-cncs)"
   [test-sable-worker-status.sh]="tracked-red under ambient tmux; green in clean-room but excluded pending confirmation (SABLE-b574)"

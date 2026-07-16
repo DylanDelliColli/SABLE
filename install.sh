@@ -251,15 +251,15 @@ elif command -v bd.exe >/dev/null 2>&1; then
 else
     print_dep_hint "bd (beads)" "https://github.com/steveyegge/beads#installation"
     echo
-    yellow "  Note: bd uses Dolt as its storage backend. \`bd dolt push\` will fail without dolt installed."
+    yellow "  Note: bd uses Dolt as its storage backend. \`sable-dolt-push\` will fail without dolt installed."
     yellow "  Dolt install: https://docs.dolthub.com/introduction/installation"
     exit 1
 fi
 green "  $(${BD_CMD} version 2>/dev/null | head -1 || echo "${BD_CMD} (version check failed but binary found)")"
 
-# Dolt check — non-fatal warning since not every workflow uses bd dolt push
+# Dolt check — non-fatal warning since not every workflow uses sable-dolt-push
 if ! command -v dolt >/dev/null 2>&1 && ! command -v dolt.exe >/dev/null 2>&1; then
-    yellow "  Note: dolt not found on PATH. \`bd dolt push\` (used in session-close protocol) will fail."
+    yellow "  Note: dolt not found on PATH. \`sable-dolt-push\` (used in session-close protocol) will fail."
     yellow "  Install: https://docs.dolthub.com/introduction/installation (not required to finish this install)"
 fi
 
@@ -443,6 +443,10 @@ echo
 bold "Orchestration hooks"
 echo "The orchestration settings snippet was merged into the scope's settings file"
 echo "automatically by sable-orchestration-install (backed up; existing entries kept)."
+echo "sable-orchestration-install also STAGES (never activates) the reconciliation"
+echo "floor's host timer artifacts (systemd --user unit + cron fallback line) under"
+echo "${CLAUDE_DIR}/sable/reconcile-timer/ — see its own output above for the"
+echo "activation commands (SABLE-jfg6.5 / D3 TIMER LEG)."
 echo
 
 bold "Install complete."

@@ -862,8 +862,11 @@ def test_flag_dialog_stalls_flags_stalled_manager_pane():
     panes = [{"pane": "%9", "role": "chuck", "bead": "", "status": "running",
               "class": "manager", "lane": "chuck"}]
     result = sws.flag_dialog_stalls(panes, None, capture=lambda pane: USAGE_OVERLAY)
+    # SABLE-ccxc: the record now carries the matched evidence line so the alert
+    # can surface it (the /usage overlay's 'Esc to close' dismiss hint).
     assert result == [{"pane": "%9", "role": "chuck", "bead": "",
-                       "status": "dialog-stalled", "class": "manager", "lane": "chuck"}]
+                       "status": "dialog-stalled", "class": "manager",
+                       "lane": "chuck", "evidence": "Esc to close"}]
 
 
 def test_flag_dialog_stalls_leaves_normal_composer_pane():
@@ -885,6 +888,223 @@ def test_flag_dialog_stalls_never_captures_done_panes():
     panes = [{"pane": "%1", "role": "worker", "bead": "a", "status": "done",
               "class": "worker", "lane": "optimus"}]
     assert sws.flag_dialog_stalls(panes, None, capture=fake_capture) == []
+
+
+# --- reaper liveness guard: never reap a resumed cockpit (SABLE-to8m) ---------
+# filter_live_cockpit drops any reap candidate whose LIVE process identity is the
+# operator cockpit ('lincoln'), even though its @sable_status=done tag (a stale
+# leftover from the worker that previously owned the window) makes it look
+# reap-eligible. Driven with an injected tmux runner + fake /proc root.
+
+class _CP:
+    def __init__(self, stdout="", returncode=0):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+def _fake_pid_runner(pane_to_pid):
+    """A run(cmd)->_CP that answers #{pane_pid} per pane from `pane_to_pid`."""
+    def run(cmd):
+        if "#{pane_pid}" in cmd:
+            pane = cmd[cmd.index("-t") + 1]
+            pid = pane_to_pid.get(pane)
+            return _CP(stdout=f"{pid}\n" if pid is not None else "", returncode=0)
+        return _CP(returncode=1)
+    return run
+
+
+def _proc_root(tmp_path, pid_to_identity):
+    for pid, identity in pid_to_identity.items():
+        d = tmp_path / str(pid)
+        d.mkdir()
+        entries = [b"PATH=/usr/bin"]
+        if identity is not None:
+            entries.insert(0, b"CLAUDE_AGENT_NAME=" + identity.encode())
+        (d / "environ").write_bytes(b"\x00".join(entries) + b"\x00")
+    return str(tmp_path)
+
+
+def test_filter_live_cockpit_drops_resumed_cockpit_pane(tmp_path):
+    # %1 is a genuinely-done worker (process identity = its lane 'optimus');
+    # %2 is a finished worker window the cockpit was resumed into (identity
+    # 'lincoln') that still carries a stale @sable_status=done. Only %1 survives
+    # as reap-eligible; the cockpit is protected.
+    run = _fake_pid_runner({"%1": 100, "%2": 200})
+    proc = _proc_root(tmp_path, {100: "optimus", 200: "lincoln"})
+    kept = sws.filter_live_cockpit(["%1", "%2"], None, run=run, proc_root=proc)
+    assert kept == ["%1"]
+
+
+def test_filter_live_cockpit_keeps_normal_workers(tmp_path):
+    # No cockpit among the candidates -> nothing filtered (never blocks a
+    # legitimate reap; a done worker's identity is its lane, never lincoln).
+    run = _fake_pid_runner({"%1": 100, "%2": 101})
+    proc = _proc_root(tmp_path, {100: "optimus", 101: "tarzan"})
+    assert sws.filter_live_cockpit(["%1", "%2"], None, run=run, proc_root=proc) == ["%1", "%2"]
+
+
+def test_filter_live_cockpit_keeps_pane_with_no_process_identity(tmp_path):
+    # A pane whose process carries no CLAUDE_AGENT_NAME has no authority to be
+    # treated as the cockpit -> reap proceeds as before (fail-open).
+    run = _fake_pid_runner({"%1": 100})
+    proc = _proc_root(tmp_path, {100: None})
+    assert sws.filter_live_cockpit(["%1"], None, run=run, proc_root=proc) == ["%1"]
+
+
+# --- SABLE-tz9f: the SABLE-axp0 dialog/overlay probe false-positived HEALTHY
+# manager/worker panes as DIALOG-STALLED — a busy mid-turn pane and idle
+# composer panes — because overlay_posture was a SUPERSET classifier that read
+# any 2+ numbered lines (ordinary composer chrome / a queued ⟦SABLE-MSG⟧ block)
+# as a dialog box, and the not-busy guard missed a working pane whose 'esc to
+# interrupt' hint had scrolled out of frame. The remedy text told the operator
+# to Esc the pane — which interrupts a live turn (a real near-miss: optimus was
+# 4m36s into a turn). The fix requires a POSITIVE selector/dismiss affordance and
+# an authoritative busy guard (pane_working). Only a REAL dialog flags. ---
+
+# (a) an idle composer whose transcript/queued area holds a numbered list AND a
+# horizontal separator row — the exact chrome the superset misread as a dialog.
+IDLE_COMPOSER_WITH_NUMBERED_BLOCK = (
+    "⟦SABLE-MSG⟧ from optimus: here is the plan\n"
+    "  1. rebase onto tmux-only\n"
+    "  2. run the unit + integration tests\n"
+    "  3. push your own branch\n"
+    "────────────────────────────────────────\n"
+    "  ddc@host:~/wk-foo\n"
+    "❯")
+# (b) a BUSY pane mid-turn ('Crafting… 4m 36s') with a queued numbered SABLE-MSG
+# block AND no 'esc to interrupt' in frame — the authoritative busy guard
+# (spinner + elapsed timer) must keep it from ever flagging.
+BUSY_CRAFTING_WITH_QUEUED_BLOCK = (
+    "  ⟦SABLE-MSG⟧ queued: do these steps\n"
+    "  1. first\n"
+    "  2. second\n"
+    "✳ Crafting… (4m 36s · ↑ 2.1k tokens)\n"
+    "❯")
+# (c) a genuine permission/trust dialog: a bordered selector with a caret option
+# row AND an explicit 'Enter to confirm' affordance — the ONE case that flags.
+REAL_PERMISSION_DIALOG = (
+    "╭─────────────────────────────────────────────╮\n"
+    "│ Allow this tool call?                        │\n"
+    "│                                              │\n"
+    "│ ❯ 1. Yes                                     │\n"
+    "│   2. No, and tell Claude what to do          │\n"
+    "│                                              │\n"
+    "│ Enter to confirm · Esc to reject             │\n"
+    "╰─────────────────────────────────────────────╯")
+
+
+def test_dialog_stall_false_on_idle_composer_with_numbered_block():
+    # regression: the superset classifier flagged this (2+ numbered lines).
+    assert sws.overlay_posture(IDLE_COMPOSER_WITH_NUMBERED_BLOCK) is False
+    assert sws.dialog_stall(IDLE_COMPOSER_WITH_NUMBERED_BLOCK) is False
+
+
+def test_dialog_stall_false_on_busy_crafting_pane_with_queued_block():
+    # the busy-guard near-miss: 'esc to interrupt' is NOT in frame, but the
+    # spinner+elapsed status row proves the pane is working — never flag it.
+    assert sws.pane_working(BUSY_CRAFTING_WITH_QUEUED_BLOCK) is True
+    assert sws.dialog_stall(BUSY_CRAFTING_WITH_QUEUED_BLOCK) is False
+
+
+def test_dialog_stall_true_only_on_real_permission_dialog():
+    assert sws.overlay_posture(REAL_PERMISSION_DIALOG) is True
+    assert sws.dialog_stall(REAL_PERMISSION_DIALOG) is True
+
+
+def test_only_the_real_dialog_flags_across_all_three_fixtures():
+    # the bead's core assertion: of (a) idle-composer, (b) busy-crafting,
+    # (c) real-dialog, ONLY (c) is a DIALOG-STALL.
+    flags = {
+        "a": sws.dialog_stall(IDLE_COMPOSER_WITH_NUMBERED_BLOCK),
+        "b": sws.dialog_stall(BUSY_CRAFTING_WITH_QUEUED_BLOCK),
+        "c": sws.dialog_stall(REAL_PERMISSION_DIALOG),
+    }
+    assert flags == {"a": False, "b": False, "c": True}
+
+
+def test_overlay_evidence_returns_matched_snippet():
+    # ccxc: the alert must surface the matched line so an operator judges
+    # true-vs-false without a manual capture-pane.
+    ev = sws.overlay_evidence(REAL_PERMISSION_DIALOG)
+    assert ev is not None and "Enter to confirm" in ev
+    assert sws.overlay_evidence(IDLE_COMPOSER_WITH_NUMBERED_BLOCK) is None
+
+
+def test_flag_dialog_stalls_carries_evidence_snippet():
+    panes = [{"pane": "%1", "role": "chuck", "bead": "", "status": "running",
+              "class": "manager", "lane": "chuck"}]
+    result = sws.flag_dialog_stalls(
+        panes, None, capture=lambda pane: REAL_PERMISSION_DIALOG)
+    assert len(result) == 1
+    assert result[0]["status"] == "dialog-stalled"
+    assert "Enter to confirm" in result[0]["evidence"]
+
+
+def test_flag_dialog_stalls_ignores_busy_and_idle_false_positives():
+    # a fleet of the two healthy false-positive panes yields ZERO stalls.
+    panes = [
+        {"pane": "%1", "role": "optimus", "bead": "", "status": "running",
+         "class": "manager", "lane": "optimus"},
+        {"pane": "%2", "role": "chuck", "bead": "", "status": "running",
+         "class": "manager", "lane": "chuck"},
+    ]
+    caps = {"%1": BUSY_CRAFTING_WITH_QUEUED_BLOCK,
+            "%2": IDLE_COMPOSER_WITH_NUMBERED_BLOCK}
+    assert sws.flag_dialog_stalls(panes, None, capture=lambda p: caps[p]) == []
+
+
+def test_pane_working_still_true_for_plain_esc_to_interrupt():
+    # pane_working is a SUPERSET of pane_busy: the classic interrupt hint still
+    # marks a working pane even without a visible elapsed timer.
+    assert sws.pane_working("● doing work\n✻ Thinking… (esc to interrupt)\n❯") is True
+
+
+def test_pane_working_false_for_idle_dialog():
+    # a real idle dialog has neither a spinner nor a running timer.
+    assert sws.pane_working(REAL_PERMISSION_DIALOG) is False
+
+
+# --- SABLE-1g8i: sable-worker-status printed 'no worker panes' (a false-empty)
+# while sable-view simultaneously listed a running + a done worker. Root cause
+# (reproduced): the SABLE-dcw2 own-lane filter — a manager (tarzan) default view
+# whose OWN lane has no panes but ANOTHER lane's are busy. parse_worker_panes
+# keeps both worker rows; the divergence is purely the lane scope. Rather than
+# undo dcw2 (own-lane scoping is intentional and reap-safe), make the empty-view
+# message HONEST: report that the fleet holds worker panes in other lanes and
+# point at --all, instead of implying the fleet is idle. ---
+
+def test_parse_worker_panes_keeps_running_and_done_worker():
+    # 1g8i unit spec: the parse path is NOT the culprit — a running + a done
+    # worker both survive parse (proving the false-empty is downstream, in the
+    # lane filter, not here).
+    out = "%10\tworker\tSABLE-jfg6.3\trunning\n%9\tworker\tSABLE-done9\tdone\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [
+        {"pane": "%10", "bead": "SABLE-jfg6.3", "status": "running"},
+        {"pane": "%9", "bead": "SABLE-done9", "status": "done"},
+    ]
+
+
+def test_empty_worker_message_bare_for_global_view():
+    # the un-laned/--all view (view_lane is None) keeps the plain message.
+    assert sws.empty_worker_message(None, []) == "no worker panes"
+
+
+def test_empty_worker_message_bare_when_fleet_truly_empty():
+    assert sws.empty_worker_message("tarzan", []) == "no worker panes"
+
+
+def test_empty_worker_message_names_other_lanes_when_fleet_nonempty():
+    # the false-empty fix: own lane empty, but other lanes hold worker panes.
+    other = [
+        {"pane": "%10", "bead": "SABLE-jfg6.3", "status": "running", "lane": "optimus"},
+        {"pane": "%9", "bead": "SABLE-done9", "status": "done", "lane": "optimus"},
+    ]
+    msg = sws.empty_worker_message("tarzan", other)
+    assert "no worker panes" != msg
+    assert "tarzan" in msg
+    assert "--all" in msg
+    assert "2" in msg  # count of panes in other lanes
 
 
 if __name__ == "__main__":

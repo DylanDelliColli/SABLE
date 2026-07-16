@@ -71,8 +71,8 @@ import sys
 # sable-spawn-worker uses. Resolve next to THIS script even via a PATH symlink.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    SessionCollision, deliver_text, pane_busy, pane_idle, pane_ready,
-    resolve_session, submitted_own_turn, wait_for_idle,
+    SessionCollision, deliver_text, pane_busy, pane_idle, pane_process_identity,
+    pane_ready, resolve_session, submitted_own_turn, wait_for_idle,
 )
 from sable_pane_lib import capture_pane as _capture_pane  # noqa: E402
 
@@ -208,6 +208,13 @@ def lookup_worker_by_bead(bead_id: str, run=None, socket: str | None = None,
     raise OnlyDonePane(bead_id, max((p for p, _ in candidates), key=_pane_id_num))
 
 
+def recipient_identity(pane: str, socket: str | None = None) -> str | None:
+    """The authoritative process identity of a role-resolved recipient pane, or
+    None (SABLE-to8m). Isolated in one function so the role-lookup cross-check in
+    main() is a single call and unit tests can stub it hermetically."""
+    return pane_process_identity(tmux_base(socket), pane)
+
+
 def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None = None,
                     run=None, capture=None, sleep=None,
                     ready_timeout: float = DEFAULT_READY_TIMEOUT,
@@ -320,6 +327,24 @@ def main(argv: list[str] | None = None) -> int:
                 f"in session '{session}' (no pane there has @sable_role={ns.to_role}). "
                 f"Is this repo's SABLE session up (sable-launch)? To address a worker, "
                 f"pass --bead <bead-id>.\n"
+            )
+            return 1
+        # SABLE-to8m: the @sable_role tag that resolved this pane is mutable
+        # global state a stale/poisoned tag can forge (the 2026-07-07 incident:
+        # a corrupt lincoln tag on a worker pane sank two manager escalations
+        # into it). Cross-check the RECIPIENT's AUTHORITATIVE process identity
+        # (CLAUDE_AGENT_NAME) before delivering: when it disagrees with the
+        # requested role the tag is poisoned, so refuse rather than route the
+        # traffic into the wrong pane. Unresolvable identity (a pane SABLE did
+        # not spawn) fails open — delivery is unchanged for it.
+        actual = recipient_identity(pane, socket)
+        if actual is not None and actual != ns.to_role:
+            sys.stderr.write(
+                f"sable-msg: refusing to deliver to role '{ns.to_role}' ({pane}): "
+                f"its @sable_role tag is poisoned — the pane's live process "
+                f"identity is '{actual}', not '{ns.to_role}' (SABLE-to8m). If this "
+                f"pane was moved/resumed, re-register it from inside with "
+                f"'sable-relink {ns.to_role}'.\n"
             )
             return 1
 

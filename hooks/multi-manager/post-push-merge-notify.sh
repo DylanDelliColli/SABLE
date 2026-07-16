@@ -11,7 +11,17 @@
 
 set -euo pipefail
 
-HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
+# SABLE-jfg6.1 (contract D1): durable entry trace at TRUE line 1, before the
+# stdin read AND before the git-push matcher / identity gate below. The legacy
+# SABLE-tb1y "INVOKED" line (further down) sits AFTER the matcher, so its
+# absence could not distinguish never-dispatched from dispatched-with-empty-
+# stdin (research F1); this ENTRY line closes that gap. Additive only — the
+# matcher, identity gate, and pp_trace disposition logging are all unchanged.
+# shellcheck source=lib-hook-trace.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib-hook-trace.sh"
+sable_trace_entry post-push-merge-notify
+
+HOOK_INPUT=$(sable_trace_read_stdin) || HOOK_INPUT=""
 
 # Identity via lib-identity.sh (SABLE-uz9.3 / SABLE-aok): fires for any manager
 # identity (legacy env terminals, the Lincoln main session in execution mode,
@@ -102,40 +112,19 @@ fi
 # depends on it.
 INTEGRATION_BRANCH=$(sable_resolve_integration_branch "$CWD")
 
-# Validate the base ref and fall back gracefully (SABLE-61n: an invalid
-# SABLE_BASE_BRANCH caused git to exit 128 under set -euo pipefail, silently
-# killing the hook before the bd create was reached). Default to the resolved
-# integration branch when it is published, not a hardcoded origin/main
-# (SABLE-pzfk): on a repo whose integration branch isn't main (tmux-only
-# today), the old unconditional origin/main default reported the ENTIRE
-# integration-branch-vs-main history as the pushed diff — inflating the file
-# list (chuck's PR-ready messages showed an alphabetical docs prefix
-# regardless of the real diff) and feeding the wrong file set into the
-# overlap analysis below (spurious OVERLAP-WARNINGs against files nobody
-# actually touched). Mirrors the SABLE-4amz fix in pre-push-rebase-test.sh
-# (commit b77034e): only switch the default when origin/<INT> actually
-# exists, else fall back to origin/main as before.
-DEFAULT_BASE_BRANCH="origin/main"
-if [ -n "$INTEGRATION_BRANCH" ] \
-   && git -C "$CWD" rev-parse --verify --quiet "origin/$INTEGRATION_BRANCH" >/dev/null 2>&1; then
-  DEFAULT_BASE_BRANCH="origin/$INTEGRATION_BRANCH"
-fi
-
-# SABLE-cstk: only honor a session-supplied SABLE_BASE_BRANCH when it actually
-# exists in THIS repo. Routing a non-existent foreign value (e.g.
-# origin/llm-integration leaked from another repo's session) straight into
-# sable_validate_base_ref let THAT function's own hardcoded origin/main
-# fallback win over the repo's real integration branch — reproducing the
-# false all-docs file list chuck saw on wk-reaper-doneflag / wk-hooks-claims
-# even after DEFAULT_BASE_BRANCH above was fixed to prefer the integration
-# branch. Falling through to DEFAULT_BASE_BRANCH directly (instead of via
-# sable_validate_base_ref's own fallback chain) keeps that preference intact.
-if [ -n "${SABLE_BASE_BRANCH:-}" ] \
-   && git -C "$CWD" rev-parse --verify --quiet "$SABLE_BASE_BRANCH" >/dev/null 2>&1; then
-  BASE_BRANCH=$(sable_validate_base_ref "$CWD" "$SABLE_BASE_BRANCH")
-else
-  BASE_BRANCH=$(sable_validate_base_ref "$CWD" "$DEFAULT_BASE_BRANCH")
-fi
+# SABLE-xuxx: use the SABLE-1238 authoritative resolver instead of
+# re-deriving the same precedence by hand. The prior inline logic (SABLE-61n
+# fallback + SABLE-pzfk integration-branch default + SABLE-cstk exists-check)
+# still honored a LEAKED SABLE_BASE_BRANCH whenever it happened to exist in
+# this repo (e.g. origin/main, which exists in nearly every repo) even when
+# the repo's own published integration branch (origin/tmux-only) should be
+# authoritative — inflating the diff/file list and OVERLAP-WARNING analysis
+# below with the integration branch's own history vs main. sable_resolve_base_branch
+# never lets a leaked SABLE_BASE_BRANCH override a PUBLISHED origin/<INT>; it
+# only falls through to SABLE_BASE_BRANCH (then origin/main, then @{upstream})
+# when the integration branch itself is unpublished. Same graceful-fallback
+# guarantee as before: never aborts under set -euo pipefail.
+BASE_BRANCH=$(sable_resolve_base_branch "$CWD")
 
 # Determine current branch and modified files
 BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
@@ -195,12 +184,28 @@ fi
 # manager-authored push). Tunable via SABLE_PUSH_CONFIRM_RETRIES (default 4 extra
 # tries = 5 reads) and SABLE_PUSH_CONFIRM_SLEEP (default 0.3s; worst-case added
 # latency ~1.2s, well under the 10s hook timeout).
+#
+# SABLE-27r3: each read is wrapped in `timeout` (default 3s, SABLE_LSREMOTE_TIMEOUT)
+# because a stalled GitHub SSH connection (port 22) HANGS ls-remote rather than
+# failing fast — confirmed three times on 2026-07-09, including one 2-minute
+# ls-remote stall that blocked the whole PostToolUse hook (and therefore the
+# pushing agent's tool call) for its entire duration. The `2>/dev/null || echo`
+# fallback only ever caught FAILURES, never hangs. On a timeout, `timeout` kills
+# git and returns 124; the pipeline (under set -euo pipefail) then fails and
+# falls to the `|| echo ""` branch, so REMOTE_TIP stays empty and this attempt
+# is treated exactly like an unreachable/unconfirmed remote — the existing
+# skip-instead-of-notify degradation below is the correct behavior (worst case
+# a real push goes un-notified and lands via chuck's stranded-recovery sweep).
+# `-k 2` backstops with SIGKILL 2s after the initial SIGTERM: a process blocked
+# in a network syscall (ssh) does not always die promptly on SIGTERM, and a
+# hung child that outlives the timeout would keep this read's pipe open.
+LSREMOTE_TIMEOUT=${SABLE_LSREMOTE_TIMEOUT:-3}
 CONFIRM_TRIES=${SABLE_PUSH_CONFIRM_RETRIES:-4}
 CONFIRM_SLEEP=${SABLE_PUSH_CONFIRM_SLEEP:-0.3}
 REMOTE_TIP=""
 CONFIRM_ATTEMPT=0
 while : ; do
-  REMOTE_TIP=$(git -C "$CWD" ls-remote --exit-code origin "refs/heads/$BRANCH" 2>/dev/null | cut -f1 || echo "")
+  REMOTE_TIP=$(timeout -k 2 "$LSREMOTE_TIMEOUT" git -C "$CWD" ls-remote --exit-code origin "refs/heads/$BRANCH" 2>/dev/null | cut -f1 || echo "")
   [ -n "$REMOTE_TIP" ] && [ "$REMOTE_TIP" = "$LOCAL_HEAD" ] && break
   [ "$CONFIRM_ATTEMPT" -ge "$CONFIRM_TRIES" ] && break
   CONFIRM_ATTEMPT=$((CONFIRM_ATTEMPT + 1))
@@ -368,6 +373,38 @@ else
     exit 0
   fi
   FALLBACK_REASON="sable-msg could not confirm delivery to chuck"
+fi
+
+# SABLE-riu: idempotency guard, mirroring bin/sable-reconcile-handoffs's
+# predicate 3 / title_names_branch (SABLE-jfg6.3) so the push-based filer
+# matches the pull-based floor. The message-first handoff above only
+# `exit 0`s on a CONFIRMED send; a repeated fallback-path push of the SAME
+# branch during a chuck-down/unreachable window (e.g. a worker re-pushing a
+# fix) would otherwise file a new '[AUTO-NOTIFY] ... <branch>' bead every
+# time, per SABLE-tb1y's optimus disposition (6 near-identical beads for one
+# branch observed 2026-07-16). Skip the create if any open/in_progress
+# for-chuck bead's title already names $BRANCH on a delimited-token boundary
+# (so wk-foo does not false-match wk-foobar) — that earlier bead already
+# covers this branch's handoff; update it by hand if the file list changed.
+EXISTING_FOR_CHUCK=$(bd list --status open,in_progress --label for-chuck --json 2>/dev/null || echo "")
+if printf '%s' "$EXISTING_FOR_CHUCK" | BRANCH="$BRANCH" python3 -c "
+import json, os, re, sys
+branch = os.environ.get('BRANCH', '')
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(data, list):
+    sys.exit(1)
+pat = r'(?:^|[^\w./-])' + re.escape(branch) + r'(?:\$|[^\w./-])'
+for item in data:
+    if isinstance(item, dict) and re.search(pat, item.get('title') or ''):
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null; then
+  echo "post-push-merge-notify: skipping — an open/in_progress for-chuck bead already names branch ${BRANCH}; not filing a duplicate (${FALLBACK_REASON:-message delivery not confirmed})."
+  sable_pp_trace "EXIT dup-for-chuck-bead branch=${BRANCH} reason=${FALLBACK_REASON:-unconfirmed}"
+  exit 0
 fi
 
 # Build description (durable for-chuck bead — fallback path)

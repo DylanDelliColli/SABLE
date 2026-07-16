@@ -685,6 +685,72 @@ resolve_int_test "sable_resolve_integration_branch: empty repo path falls back t
   "" "SABLE_INTEGRATION_BRANCH=foo" "foo"
 
 # --------------------------------------------------------------------------
+# sable_resolve_base_branch unit tests (SABLE-1238)
+# The authoritative Phase-1 rebase base MUST come from the target repo's own
+# integration-branch config, never the pushing session's env. When origin/<INT>
+# is published, that ref wins over a leaked SABLE_BASE_BRANCH and over
+# origin/HEAD/main. Fixture: a repo with BOTH origin/main and origin/tmux-only
+# published, and refs/remotes/origin/HEAD → origin/main (so a wrong resolver
+# that consulted origin/HEAD would return origin/main — the bug).
+# --------------------------------------------------------------------------
+BASE_BARE=$(mktemp -d)
+BASE_REPO=$(mktemp -d)
+trap 'rm -rf "$VAL_REPO" "$VAL_BARE" "$INT_REPO" "$BASE_BARE" "$BASE_REPO"' EXIT
+git init -q --bare "$BASE_BARE"
+git clone -q "$BASE_BARE" "$BASE_REPO"
+git -C "$BASE_REPO" config user.email "b@test"
+git -C "$BASE_REPO" config user.name "Base"
+( cd "$BASE_REPO" || exit 1; echo base > f.txt; git add f.txt; git commit -q -m base )
+git -C "$BASE_REPO" push -q origin HEAD:refs/heads/main 2>/dev/null
+( cd "$BASE_REPO" || exit 1; git checkout -q -b tmux-only; echo i1 >> f.txt; git add f.txt; git commit -q -m i1 )
+git -C "$BASE_REPO" push -q origin tmux-only 2>/dev/null
+git -C "$BASE_REPO" fetch -q origin 2>/dev/null
+# refs/remotes/origin/HEAD → origin/main, so a resolver that (wrongly) fell back
+# to origin/HEAD would answer origin/main; the tests below assert it never does.
+git -C "$BASE_REPO" remote set-head origin main 2>/dev/null || \
+  git -C "$BASE_REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main 2>/dev/null || true
+
+resolve_base_test() {
+  local label="$1" repo="$2" env_assignments="$3" expect="$4" got
+  got=$(env -u SABLE_BASE_BRANCH -u SABLE_INTEGRATION_BRANCH $env_assignments \
+    bash -c "source '$LIB'; sable_resolve_base_branch '$repo'")
+  if [ "$got" = "$expect" ]; then
+    pass "$label"
+  else
+    fail "$label" "expected [$expect] got [$got]"
+  fi
+}
+
+# KEY (SABLE-1238): repo config sable.integrationBranch is authoritative and
+# a leaked session SABLE_BASE_BRANCH=origin/main can NOT override it — the base
+# is origin/tmux-only, never origin/HEAD/main.
+git -C "$BASE_REPO" config sable.integrationBranch tmux-only
+resolve_base_test "sable_resolve_base_branch: published config-integration wins over leaked SABLE_BASE_BRANCH (never origin/HEAD/main)" \
+  "$BASE_REPO" "SABLE_BASE_BRANCH=origin/main" "origin/tmux-only"
+resolve_base_test "sable_resolve_base_branch: published config-integration, no env → origin/<INT>" \
+  "$BASE_REPO" "" "origin/tmux-only"
+
+# .sable checked-in config is likewise authoritative over a leaked env.
+git -C "$BASE_REPO" config --unset sable.integrationBranch
+echo "integrationBranch=tmux-only" > "$BASE_REPO/.sable"
+resolve_base_test "sable_resolve_base_branch: published .sable-integration wins over leaked SABLE_BASE_BRANCH" \
+  "$BASE_REPO" "SABLE_BASE_BRANCH=origin/main" "origin/tmux-only"
+rm -f "$BASE_REPO/.sable"
+
+# No integration config anywhere → resolves to 'main'; origin/main published →
+# origin/main (legacy default preserved, no regression).
+resolve_base_test "sable_resolve_base_branch: no integration config → published origin/main default" \
+  "$BASE_REPO" "" "origin/main"
+
+# UNPUBLISHED integration branch → SABLE_BASE_BRANCH applies (legacy path).
+git -C "$BASE_REPO" config sable.integrationBranch not-pushed
+resolve_base_test "sable_resolve_base_branch: unpublished integration → honors SABLE_BASE_BRANCH" \
+  "$BASE_REPO" "SABLE_BASE_BRANCH=origin/main" "origin/main"
+resolve_base_test "sable_resolve_base_branch: unpublished integration, no env → origin/main fallback" \
+  "$BASE_REPO" "" "origin/main"
+git -C "$BASE_REPO" config --unset sable.integrationBranch
+
+# --------------------------------------------------------------------------
 # sable_resolve_test_command unit tests (SABLE-hml)
 # Mirrors sable_resolve_integration_branch's precedence: repo-local git
 # config wins over the checked-in .sable file wins over the legacy env
@@ -722,6 +788,50 @@ resolve_testcmd_test "sable_resolve_test_command: empty repo path falls back to 
 
 resolve_testcmd_test "sable_resolve_test_command: empty repo path with no env returns empty" \
   "" "" ""
+
+# --------------------------------------------------------------------------
+# sable_resolve_test_timeout unit tests (SABLE-pf0g)
+# Mirrors sable_resolve_test_command's precedence: repo-local git config wins
+# over the checked-in .sable file wins over the legacy env override wins over
+# the hardcoded "60" default.
+# --------------------------------------------------------------------------
+resolve_timeout_test() {
+  local label="$1" repo="$2" env_assignments="$3" expect="$4" got
+  got=$(env -u SABLE_PRE_PUSH_TEST_TIMEOUT $env_assignments bash -c "source '$LIB'; sable_resolve_test_timeout '$repo'")
+  if [ "$got" = "$expect" ]; then
+    pass "$label"
+  else
+    fail "$label" "expected [$expect] got [$got]"
+  fi
+}
+
+resolve_timeout_test "sable_resolve_test_timeout: no config anywhere returns default 60" \
+  "$INT_REPO" "" "60"
+
+resolve_timeout_test "sable_resolve_test_timeout: falls back to SABLE_PRE_PUSH_TEST_TIMEOUT env" \
+  "$INT_REPO" "SABLE_PRE_PUSH_TEST_TIMEOUT=90" "90"
+
+echo "testTimeout=150" > "$INT_REPO/.sable"
+resolve_timeout_test "sable_resolve_test_timeout: .sable file wins over session env" \
+  "$INT_REPO" "SABLE_PRE_PUSH_TEST_TIMEOUT=90" "150"
+
+git -C "$INT_REPO" config sable.testTimeout 200
+resolve_timeout_test "sable_resolve_test_timeout: repo-local git config wins over .sable file" \
+  "$INT_REPO" "" "200"
+git -C "$INT_REPO" config --unset sable.testTimeout
+rm -f "$INT_REPO/.sable"
+
+resolve_timeout_test "sable_resolve_test_timeout: empty repo path falls back to env" \
+  "" "SABLE_PRE_PUSH_TEST_TIMEOUT=90" "90"
+
+resolve_timeout_test "sable_resolve_test_timeout: empty repo path with no env returns default 60" \
+  "" "" "60"
+
+# This repo's own checked-in .sable pins testTimeout=180 (SABLE-lp4n/dnfv
+# timeout-margin fix): the 3-file .sable testCommand suite runs ~53s and
+# was flaking against the old 60s default under fleet load.
+resolve_timeout_test "sable_resolve_test_timeout: this repo's checked-in .sable resolves to 180" \
+  "$REPO" "" "180"
 
 # --------------------------------------------------------------------------
 # sable_resolve_push_repo_dir unit tests (SABLE-041)
