@@ -948,6 +948,26 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(
                 f"sable-spawn-worker: {bid} already assigned to lane '{lane}' — "
                 "skipping redundant bd update --claim (SABLE-m40k)\n")
+            # SABLE-ixps: `bd update --claim` sets BOTH assignee AND status to
+            # in_progress — skipping it above (correctly, to avoid the
+            # already-claimed error) leaves a MANAGER-REASSIGNED bead (assignee
+            # already the lane, status still OPEN) stuck OPEN while its worker
+            # runs. Flip status directly, with no --claim, so it can't re-trigger
+            # the assignee-already-claimed error. Only when still OPEN — a
+            # self-claimed bead is already in_progress and must not be churned.
+            if bead.get("status") == "open":
+                status_fix = subprocess.run(
+                    ["bd", "update", bid, "--status", "in_progress"],
+                    capture_output=True, text=True)
+                if status_fix.returncode != 0:
+                    sys.stderr.write(
+                        f"sable-spawn-worker: could not flip {bid} to in_progress "
+                        f"after skipped claim: {status_fix.stderr.strip()}\n")
+                    return 5
+                bead["status"] = "in_progress"
+                sys.stderr.write(
+                    f"sable-spawn-worker: {bid} status open -> in_progress "
+                    "(assignee already lane; SABLE-ixps)\n")
         else:
             subprocess.run(["bd", "update", bid, "--claim"], check=True)
 

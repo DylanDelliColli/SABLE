@@ -908,6 +908,103 @@ def test_claim_skipped_when_bead_already_assigned_to_dispatching_lane(sock):
         ), listing
 
 
+def test_claim_skip_still_flips_open_bead_to_in_progress(sock):
+    """SABLE-ixps: a MANAGER-REASSIGNED bead (assignee already set to the
+    dispatching lane by a DIFFERENT actor, e.g. lincoln reassigning to
+    optimus — the exact SABLE-m40k trigger — while status is still OPEN)
+    must not be left OPEN just because the redundant `bd update --claim` is
+    skipped. `--claim` normally flips BOTH assignee AND status; skipping it
+    entirely (the m40k fix) left status untouched. Proves: the skip path
+    still issues a plain `bd update <bid> --status in_progress` (no --claim,
+    so it cannot re-trigger the assignee-already-claimed error) and the
+    bead's on-disk status ends up in_progress, not open."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-reassigned-open-1"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "open", "assignee": "optimus"}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path, strict_claim=True)
+
+        env = {
+            **_clean_env(),
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "CLAUDE_AGENT_NAME": "optimus",
+            "SABLE_MAX_LOAD_PER_CORE": "0",
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "skipping redundant bd update --claim" in r.stderr
+        assert "open -> in_progress" in r.stderr
+        time.sleep(0.3)
+
+        data = json.loads(db_path.read_text())
+        assert data[0]["status"] == "in_progress", data
+        # assignee is untouched by the plain --status call (still optimus,
+        # never flipped to the fake bd's "test-worker" --claim marker) —
+        # proves no --claim call was made, only the plain status flip.
+        assert data[0]["assignee"] == "optimus", data
+
+
+def test_claim_skip_does_not_churn_already_in_progress_bead(sock):
+    """SABLE-ixps regression guard: a bead that was ALREADY in_progress before
+    dispatch (a normal self-claimed bead, the pre-existing m40k case) must not
+    have its status touched by the new open->in_progress flip — the fix must
+    key on status=='open' specifically, not fire unconditionally inside the
+    already-claimed-by-lane branch."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-selfclaim-noop-1"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "in_progress", "assignee": "optimus"}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path, strict_claim=True)
+
+        env = {
+            **_clean_env(),
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "CLAUDE_AGENT_NAME": "optimus",
+            "SABLE_MAX_LOAD_PER_CORE": "0",
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "skipping redundant bd update --claim" in r.stderr
+        assert "open -> in_progress" not in r.stderr
+        time.sleep(0.3)
+
+        data = json.loads(db_path.read_text())
+        assert data[0]["status"] == "in_progress", data
+        assert data[0]["assignee"] == "optimus", data
+
+
 def test_claim_still_runs_when_bead_assigned_to_different_lane(sock):
     """SABLE-m40k design note: the idempotent-claim skip must key on the
     bead's assignee matching the DISPATCHING lane specifically. A bead
