@@ -541,6 +541,42 @@ assert_deny  "pi5m: planning blocks assignment-prefixed sable-spawn-manager" \
   'FOO=bar sable-spawn-manager --all'
 set_mode planning
 
+# ---------- SABLE-qo55: sable-contract prose false-positive ----------
+# sable-contract set/add writes the advisory active-contracts state file; it
+# never spawns anything. But its <text> argument is free-form contract prose
+# that routinely documents fleet/mode protocol using clause-separating
+# punctuation (";", "(", "&", "|") this codebase's own comment style favors —
+# and sable-contract was missing from is_prose_carrier's allow-list, so
+# launches()'s command-position regex ["(^|[;&|(])[[:space:]]*($1)([[:space:]]|$)"]
+# matched a manager name immediately after one of those separators inside the
+# quoted text. Reproduced exactly as observed 2026-07-15: a semicolon-joined
+# clause naming "optimus" mid-sentence was DENIED with "launching execution
+# managers (optimus/tarzan/chuck) is blocked" even though no manager was
+# actually spawned — a slash-joined "(optimus/tarzan/chuck)" list (the deny
+# message's own wording) does NOT trigger it, since '/' isn't a boundary
+# separator and breaks the required trailing whitespace/end-of-string match;
+# it takes a real separator char directly before the bare name. Fixed by
+# adding sable-contract to is_prose_carrier alongside bd / sable-note /
+# sable-mode / sable-msg.
+set_mode planning
+assert_allow "qo55: planning allows sable-contract set with ';'-anchored manager name" \
+  'sable-contract set "manual relay retired; optimus resumes normal cadence, tell chuck via /sable-execute"'
+assert_allow "qo55: planning allows sable-contract add naming a manager mid-sentence" \
+  'sable-contract add "optimus picks this up once execution starts"'
+assert_allow "qo55: planning allows sable-contract set naming sable-spawn-manager" \
+  'sable-contract set "the flip runs sable-spawn-manager --all next"'
+set_mode execution
+assert_allow "qo55: execution allows sable-contract set with '('-anchored producer name" \
+  'sable-contract set "read-only fan-out active (sherlock findings attach to the epic)"'
+set_mode planning
+
+# REGRESSION: a real sable-spawn-manager --all invocation must still be denied
+# in planning mode — sable-contract's allow-listing must not weaken the
+# spawn-helper legs for actual invocations.
+assert_deny  "qo55: planning still blocks real sable-spawn-manager --all" \
+  'sable-spawn-manager --all'
+assert_deny  "qo55: planning still blocks bare optimus alias" 'optimus'
+
 # ---------- SABLE-qfvn / SABLE-ykij: git-push & sable-mode prose false-positives ----------
 # The git-push deny legs and the sable-mode exemption used the SAME plain-space
 # [[:space:]] boundary that pi5m removed from the name/helper legs, so quoted
