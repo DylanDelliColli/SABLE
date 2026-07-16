@@ -268,10 +268,15 @@ leading_cmd() {
 # sable-msg message, and a sable-mode --fleet flag all routinely name agents and
 # the spawn helpers (often with shell punctuation), and none of these commands
 # ever stands up an agent — so a name appearing in their args is never a spawn or
-# a launch. Shared by is_spawn_call (helper legs) and launches (name legs).
+# a launch. sable-contract set/add joins the list (SABLE-qo55): its <text>
+# argument is a free-form contract line that routinely documents fleet/mode
+# protocol (e.g. "hands off to the execution managers (optimus/tarzan/chuck)"),
+# and the command only ever writes the advisory active-contracts state file — it
+# never spawns anything, so it is allowlisted outright rather than pattern-matched.
+# Shared by is_spawn_call (helper legs) and launches (name legs).
 is_prose_carrier() {
   case "$(leading_cmd "$1")" in
-    bd|sable-note|sable-mode|sable-msg) return 0 ;;
+    bd|sable-note|sable-mode|sable-msg|sable-contract) return 0 ;;
   esac
   return 1
 }
@@ -280,8 +285,8 @@ is_prose_carrier() {
 # <helper> as a command, NOT merely names it inside a quoted argument (SABLE-pi5m
 # defect 1). Three guards:
 #   (a) prose-carrier allow-list (is_prose_carrier) — a bd / sable-note /
-#       sable-msg / sable-mode command's args legitimately name the helper in
-#       prose, often with shell punctuation; those are never a spawn.
+#       sable-msg / sable-mode / sable-contract command's args legitimately name
+#       the helper in prose, often with shell punctuation; those are never a spawn.
 #   (b) leading-word identity — if the first real command word (after any VAR=val
 #       assignment prefix, which leading_cmd strips) IS the helper, it is a spawn
 #       even though the position regex below cannot see past the assignment
