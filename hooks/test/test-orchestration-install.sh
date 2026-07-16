@@ -60,6 +60,52 @@ if [ -x "$P/.claude/hooks/multi-manager/session-role-anchor.sh" ]; then pass "pr
 if [ "$(count_in_event "$SET" SessionStart session-role-anchor.sh)" = "1" ]; then pass "project: identity hook registered SessionStart"; else fail "project: identity hook registered SessionStart" "count=$(count_in_event "$SET" SessionStart session-role-anchor.sh)"; fi
 if [ "$(count_in_event "$SET" PreCompact session-role-anchor.sh)" = "1" ]; then pass "project: identity hook registered PreCompact"; else fail "project: identity hook registered PreCompact"; fi
 
+# ---------- SABLE-jfg6.5: reconcile-timer artifacts staged, never activated ----------
+exists "$P/.claude/sable/reconcile-timer/sable-reconcile-timer.service" "project: reconcile-timer systemd .service staged"
+exists "$P/.claude/sable/reconcile-timer/sable-reconcile-timer.timer"   "project: reconcile-timer systemd .timer staged"
+exists "$P/.claude/sable/reconcile-timer/sable-reconcile-timer.cron"    "project: reconcile-timer cron fallback line staged"
+if grep -q -- "--once --repo $REPO" "$P/.claude/sable/reconcile-timer/sable-reconcile-timer.service"; then
+  pass "project: .service ExecStart carries --once and the target repo"
+else
+  fail "project: .service ExecStart carries --once and the target repo"
+fi
+if grep -q "OnUnitActiveSec=15min" "$P/.claude/sable/reconcile-timer/sable-reconcile-timer.timer"; then
+  pass "project: .timer defaults to the 15min cadence"
+else
+  fail "project: .timer defaults to the 15min cadence"
+fi
+if grep -q "^\*/15 " "$P/.claude/sable/reconcile-timer/sable-reconcile-timer.cron"; then
+  pass "project: .cron line defaults to the 15min cadence"
+else
+  fail "project: .cron line defaults to the 15min cadence"
+fi
+if printf '%s' "$out1" | grep -qi "NOT activated"; then
+  pass "project: install output says the timer is staged, not activated"
+else
+  fail "project: install output says the timer is staged, not activated"
+fi
+if printf '%s' "$out1" | grep -q "systemctl --user enable"; then
+  pass "project: install output prints the systemd activation command (for the operator, not run here)"
+else
+  fail "project: install output prints the systemd activation command"
+fi
+# the install itself must never actually touch a live systemd/cron surface
+if [ -e "$HOME/.config/systemd/user/sable-reconcile-timer.timer" ]; then
+  fail "project: install does not copy the unit into the real ~/.config/systemd/user" "found $HOME/.config/systemd/user/sable-reconcile-timer.timer"
+else
+  pass "project: install does not copy the unit into the real ~/.config/systemd/user"
+fi
+
+# env override of the cadence
+P_CADENCE="$(mktemp -d)"
+SABLE_PROJECT_DIR="$P_CADENCE" SABLE_RECONCILE_INTERVAL_MIN=5 bash "$INSTALLER" --project >/dev/null 2>&1
+if grep -q "OnUnitActiveSec=5min" "$P_CADENCE/.claude/sable/reconcile-timer/sable-reconcile-timer.timer"; then
+  pass "project: SABLE_RECONCILE_INTERVAL_MIN overrides the staged cadence"
+else
+  fail "project: SABLE_RECONCILE_INTERVAL_MIN overrides the staged cadence"
+fi
+rm -rf "$P_CADENCE"
+
 # idempotent re-run
 SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project >/dev/null 2>&1
 if [ "$(count_interlock "$SET")" = "2" ]; then pass "project: re-run stays idempotent"; else fail "project: re-run idempotent" "count=$(count_interlock "$SET")"; fi
@@ -110,6 +156,7 @@ if [ ! -e "$P/.claude/skills/sable-plan/SKILL.md" ]; then pass "uninstall remove
 if [ ! -e "$P/.claude/sable/agents.yaml" ]; then pass "uninstall removes registry"; else fail "uninstall removes registry"; fi
 if [ ! -e "$P/.claude/sable/roles/optimus.md" ] && [ ! -e "$P/.claude/sable/roles/chuck.md" ]; then pass "uninstall removes tmux-native pane roles"; else fail "uninstall removes tmux-native pane roles"; fi
 if [ ! -e "$P/.claude/agents-teams" ]; then pass "uninstall cleans up legacy agents-teams defs"; else fail "uninstall cleans up legacy agents-teams defs"; fi
+if [ ! -e "$P/.claude/sable/reconcile-timer" ]; then pass "uninstall removes staged reconcile-timer artifacts"; else fail "uninstall removes staged reconcile-timer artifacts"; fi
 if [ "$(count_interlock "$SET")" = "0" ]; then pass "uninstall de-registers interlock"; else fail "uninstall de-registers interlock" "count=$(count_interlock "$SET")"; fi
 if [ "$(count_marker "$SET" session-role-anchor.sh)" = "0" ]; then pass "uninstall de-registers identity hook"; else fail "uninstall de-registers identity hook" "count=$(count_marker "$SET" session-role-anchor.sh)"; fi
 if grep -q 'other-hook.sh' "$SET"; then pass "uninstall keeps unrelated hooks"; else fail "uninstall keeps unrelated hooks"; fi

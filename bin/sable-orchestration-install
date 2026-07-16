@@ -263,6 +263,73 @@ install_file() {
     fi
 }
 
+# Stage (never activate) the host timer entrypoint's systemd/cron artifacts
+# (SABLE-jfg6.5 / D3 TIMER LEG): sable-reconcile-timer needs NO tmux server and
+# NO live panes, so it's the catch for a stranded push when the operator has
+# walked away entirely (S5, the bldh.7 walk-away condition). This writes the
+# unit/cron FILES into the scope's own tree via install_file (repo-source-wins,
+# manifest-tracked, same as every other artifact above) but never copies them
+# into ~/.config/systemd/user, never calls systemctl, and never touches a real
+# crontab — live activation rides the next operator-brokered install-refresh
+# window (8vlp convention). This install is repo-side only.
+install_reconcile_timer() {
+    local dir="$BASE/sable/reconcile-timer"
+    local target_repo="${SABLE_RECONCILE_TARGET_REPO:-$REPO}"
+    local cadence="${SABLE_RECONCILE_INTERVAL_MIN:-15}"
+    mkdir -p "$dir"
+
+    local tmp
+    tmp="$(mktemp -d)"
+
+    cat > "$tmp/sable-reconcile-timer.service" <<EOF
+[Unit]
+Description=SABLE reconciliation floor sweep (SABLE-jfg6.5 / D3 TIMER LEG)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/sable-reconcile-timer --once --repo ${target_repo}
+EOF
+
+    cat > "$tmp/sable-reconcile-timer.timer" <<EOF
+[Unit]
+Description=Run sable-reconcile-timer on a cadence (SABLE-jfg6.5 / D3 TIMER LEG)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=${cadence}min
+Persistent=true
+Unit=sable-reconcile-timer.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    cat > "$tmp/sable-reconcile-timer.cron" <<EOF
+# SABLE reconciliation floor sweep (SABLE-jfg6.5 / D3 TIMER LEG) — cron
+# fallback for hosts without systemd --user (e.g. macOS). Append to your
+# crontab with: (crontab -l 2>/dev/null; cat this-file) | crontab -
+*/${cadence} * * * * PATH="\$PATH:\$HOME/.local/bin" sable-reconcile-timer --once --repo ${target_repo} >> "\$HOME/.cache/sable/reconcile-timer.log" 2>&1
+EOF
+
+    install_file "$tmp/sable-reconcile-timer.service" "$dir/sable-reconcile-timer.service" "sable/reconcile-timer/sable-reconcile-timer.service"
+    install_file "$tmp/sable-reconcile-timer.timer"   "$dir/sable-reconcile-timer.timer"   "sable/reconcile-timer/sable-reconcile-timer.timer"
+    install_file "$tmp/sable-reconcile-timer.cron"    "$dir/sable-reconcile-timer.cron"    "sable/reconcile-timer/sable-reconcile-timer.cron"
+    rm -rf "$tmp"
+
+    echo "Reconciliation timer (host-level, no tmux required) — staged, NOT activated:"
+    echo "  Cadence: ${cadence}min (override next install with SABLE_RECONCILE_INTERVAL_MIN=<n>)"
+    echo "  Artifacts written under $dir/:"
+    echo "    sable-reconcile-timer.service / .timer  (systemd --user; Linux)"
+    echo "    sable-reconcile-timer.cron               (cron fallback line; any platform)"
+    echo "  To activate (systemd --user, Linux):"
+    echo "    cp $dir/sable-reconcile-timer.{service,timer} ~/.config/systemd/user/ && \\"
+    echo "      systemctl --user daemon-reload && systemctl --user enable --now sable-reconcile-timer.timer"
+    echo "  To activate (cron fallback, any platform):"
+    echo "    (crontab -l 2>/dev/null; cat $dir/sable-reconcile-timer.cron) | crontab -"
+    echo "  Live activation rides the next operator-brokered install-refresh window —"
+    echo "  this install only stages the artifacts (SABLE-jfg6.5 / D3, 8vlp convention)."
+}
+
 # Resolve the SABLE skill names the repo ships (by frontmatter 'name:').
 skill_names() {
     for skdir in "$REPO"/skills/*/; do
@@ -282,10 +349,12 @@ EOF
           "$BASE/sable/roles/cockpit.md" "$BASE/sable/agents.yaml"
     # agents-teams/ is no longer installed; the rm below cleans up installs
     # that predate the tmux-only layer.
-    rm -rf "$HOOKS_DIR" "$BASE/agents-teams"
+    rm -rf "$HOOKS_DIR" "$BASE/agents-teams" "$BASE/sable/reconcile-timer"
     remove_layer_hooks "$SETTINGS"
     echo "Orchestration layer uninstalled from $BASE (scope: $SCOPE)."
     echo "  (left other hooks and the settings file intact)"
+    echo "  (systemd/cron activation, if any, is NOT touched here — it lives outside"
+    echo "   $BASE; disable it yourself: systemctl --user disable --now sable-reconcile-timer.timer)"
     exit 0
 fi
 
@@ -328,6 +397,9 @@ done
 
 # Merge the settings snippet.
 merge_snippet "$SETTINGS" "$SNIPPET" "$SNIPPET_BASE"
+
+# Stage the host timer entrypoint's systemd/cron artifacts (never activates them).
+install_reconcile_timer
 
 echo "Orchestration layer installed to $BASE (scope: $SCOPE)."
 echo "  • All multi-manager hooks + agents.yaml + SABLE skills + the four pane roles installed."
