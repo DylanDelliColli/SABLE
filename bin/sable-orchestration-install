@@ -233,12 +233,15 @@ cleanup_retired_artifacts() {
 MANIFEST=()
 BAK_DIR=""
 
-manifest_bak_dir() {
+# ensure_bak_dir — assign BAK_DIR (creating the dir) in the CURRENT shell.
+# Must be called directly, never via `$(...)`: command substitution runs in a
+# subshell, so an assignment to BAK_DIR made there is lost once it exits,
+# leaving the parent's BAK_DIR empty even though the dir was created on disk.
+ensure_bak_dir() {
     if [ -z "$BAK_DIR" ]; then
         BAK_DIR="$BASE/.install-bak-$(date +%Y%m%d-%H%M%S)"
         mkdir -p "$BAK_DIR"
     fi
-    printf '%s' "$BAK_DIR"
 }
 
 # install_file SRC DEST REL — copy SRC to DEST; REL is the path used in the
@@ -251,7 +254,8 @@ install_file() {
     elif cmp -s "$_src" "$_dest"; then
         MANIFEST+=("IDENTICAL $_rel")
     else
-        _bak="$(manifest_bak_dir)/$_rel"
+        ensure_bak_dir
+        _bak="$BAK_DIR/$_rel"
         mkdir -p "$(dirname "$_bak")"
         cp "$_dest" "$_bak"
         cp "$_src" "$_dest"
@@ -342,8 +346,10 @@ for _entry in "${MANIFEST[@]}"; do
     printf '  %-9s %s\n' "$_status" "$_rel"
     [ "$_status" = "CHANGED" ] && _changed=$((_changed + 1))
 done
-if [ "$_changed" -gt 0 ]; then
+if [ "$_changed" -gt 0 ] && [ -n "$BAK_DIR" ]; then
     echo "  ($_changed file(s) changed; prior copies snapshotted to $BAK_DIR)"
+elif [ "$_changed" -gt 0 ]; then
+    echo "  ($_changed file(s) changed)"
 else
     echo "  (all files identical to source; nothing changed)"
 fi
