@@ -58,7 +58,7 @@ Env:
   SABLE_DISPATCH_DIR   where dispatch prompt files are written
                        (default: ~/.claude/sable/dispatch)
   SABLE_MAX_WORKERS    dispatch throttle (SABLE-mmdt): max live worker panes in
-                       the session (default 4; 0 pauses spawning; invalid keeps
+                       the session (default 8; 0 pauses spawning; invalid keeps
                        the default). Refusal = exit 7, names cap + live count.
   SABLE_MAX_LOAD_PER_CORE  host-resource guard (SABLE-mmdt): refuse spawning
                        when 1-min load average / cpu cores >= this threshold

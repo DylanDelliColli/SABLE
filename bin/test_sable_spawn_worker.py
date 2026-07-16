@@ -329,9 +329,9 @@ def test_bead_already_claimed_by_lane_false_when_lane_empty():
 # spawn once SABLE_MAX_WORKERS live worker panes exist, with a message naming
 # BOTH the cap and the live count (operator observability is part of acceptance).
 
-def test_worker_cap_default_is_4(monkeypatch):
+def test_worker_cap_default_is_8(monkeypatch):
     monkeypatch.delenv("SABLE_MAX_WORKERS", raising=False)
-    assert ssw.worker_cap() == 4
+    assert ssw.worker_cap() == 8
 
 
 def test_worker_cap_env_override(monkeypatch):
@@ -350,7 +350,7 @@ def test_worker_cap_invalid_falls_back_to_default(monkeypatch):
     # a garbled knob must keep the throttle at its default, never lift it
     for bad in ("many", "", "  ", "-3", "2.5"):
         monkeypatch.setenv("SABLE_MAX_WORKERS", bad)
-        assert ssw.worker_cap() == 4, bad
+        assert ssw.worker_cap() == 8, bad
 
 
 def test_count_live_workers_counts_running_workers_only():

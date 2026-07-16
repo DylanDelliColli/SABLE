@@ -424,6 +424,43 @@ def test_spawn_at_cap_refused_then_allowed_after_one_flips_done(sock):
         assert "worker-sable-bldh-2" in wins
 
 
+def test_spawn_refused_only_after_8_live_panes_with_default_cap(sock):
+    """SABLE-l0or acceptance: with SABLE_MAX_WORKERS unset (the WORKER_CAP_DEFAULT
+    knob, now 8) and 8 live dummy worker panes, the next spawn is mechanically
+    refused (exit 7, message naming cap AND live count) — proving the raised
+    default is actually enforced against real tmux panes, not just returned by
+    worker_cap() in isolation."""
+    with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
+        for i in range(8):
+            _dummy_worker(sock, f"FAKE-defcap-{i}")
+        env = {
+            **_clean_env(),
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",  # stand-in for claude
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+            "SABLE_MAX_LOAD_PER_CORE": "0",  # isolate the cap from real host load
+        }
+        # exercise the default cap: this suite may itself run inside a SABLE
+        # worker pane whose ambient env sets SABLE_MAX_WORKERS — scrub it so
+        # the subprocess actually falls through to WORKER_CAP_DEFAULT.
+        env.pop("SABLE_MAX_WORKERS", None)
+        argv = ["python3", str(BIN), BEAD, "--worktree", wt,
+                "--model", "haiku", "--skip-governance"]
+
+        r = subprocess.run(argv, capture_output=True, text=True, env=env)
+        assert r.returncode == 7, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "SABLE_MAX_WORKERS" in r.stderr
+        assert "8" in r.stderr                       # cap AND live count both = 8
+        wins = _tmux(sock, "list-windows", "-t", "sable",
+                     "-F", "#{window_name}").stdout
+        assert "worker-sable-bldh-2" not in wins
+        assert not (Path(dd) / f"{BEAD}.md").exists()
+
+
 def test_spawn_refused_when_host_load_exceeds_guard(sock):
     """SABLE-mmdt host-resource guard wiring: with the per-core threshold set
     WELL below the host's current 1-min load, the spawn is refused (exit 8)
