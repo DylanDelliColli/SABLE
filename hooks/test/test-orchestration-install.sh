@@ -277,6 +277,18 @@ bak_dir="$(find "$MF/.claude" -maxdepth 1 -name '.install-bak-*' | sort | tail -
 if [ -n "$bak_dir" ] && [ -f "$bak_dir/hooks/multi-manager/mode-interlock.sh" ]; then pass "manifest: snapshot dir captures the prior copy"; else fail "manifest: snapshot dir captures the prior copy" "bak_dir=$bak_dir"; fi
 if [ -n "$bak_dir" ] && ! grep -q "test-touch" "$bak_dir/hooks/multi-manager/mode-interlock.sh"; then pass "manifest: snapshot holds the pre-change content"; else fail "manifest: snapshot holds the pre-change content"; fi
 if grep -q "test-touch" "$MF/.claude/hooks/multi-manager/mode-interlock.sh"; then pass "manifest: installed copy now matches the new source"; else fail "manifest: installed copy now matches the new source"; fi
+
+# SABLE-0pn: the summary line must interpolate the REAL (non-empty, existing)
+# snapshot dir, not print 'snapshotted to )' with BAK_DIR unset.
+summary_line="$(printf '%s\n' "$out_third" | grep 'file(s) changed')"
+if printf '%s' "$summary_line" | grep -qE 'snapshotted to \)$|snapshotted to $'; then
+    fail "0pn: summary line does not print an empty snapshot path" "$summary_line"
+else
+    pass "0pn: summary line does not print an empty snapshot path"
+fi
+summary_dir="$(printf '%s' "$summary_line" | sed -n 's/.*snapshotted to \(.*\))$/\1/p')"
+if [ -n "$summary_dir" ] && [ -d "$summary_dir" ]; then pass "0pn: summary line's snapshot dir exists on disk"; else fail "0pn: summary line's snapshot dir exists on disk" "summary_dir=$summary_dir"; fi
+if [ -n "$bak_dir" ] && [ "$summary_dir" = "$bak_dir" ]; then pass "0pn: summary line's dir matches the actual .install-bak-* dir"; else fail "0pn: summary line's dir matches the actual .install-bak-* dir" "summary_dir=$summary_dir bak_dir=$bak_dir"; fi
 rm -rf "$RS" "$MF"
 
 rm -rf "$P" "$P2" "$U" "$PU" "$M"
