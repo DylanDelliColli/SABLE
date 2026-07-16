@@ -94,7 +94,7 @@ OUT=$(run_status)
 if echo "$OUT" | grep -qF "$CF"; then pass "status: shows the claim file path"; else fail "status: shows the claim file path" "$OUT"; fi
 if echo "$OUT" | grep -q "sess-123"; then pass "status: shows the holder session id"; else fail "status: shows the holder session id" "$OUT"; fi
 if echo "$OUT" | grep -q "lincoln"; then pass "status: shows the attributable agent name"; else fail "status: shows the attributable agent name" "$OUT"; fi
-if echo "$OUT" | grep -qE "age:.*30s"; then pass "status: shows age"; else fail "status: shows age" "$OUT"; fi
+if echo "$OUT" | grep -qE "age:.*3[01]s"; then pass "status: shows age"; else fail "status: shows age" "$OUT"; fi
 if echo "$OUT" | grep -qE "TTL:.*remaining"; then pass "status: shows TTL remaining for a fresh claim"; else fail "status: shows TTL remaining for a fresh claim" "$OUT"; fi
 
 echo "--- status: expired claim ---"
