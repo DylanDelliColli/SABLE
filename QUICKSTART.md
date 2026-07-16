@@ -34,7 +34,7 @@ The install in this QUICKSTART is the same regardless of stage — all hooks, al
 
 1. **A coding agent** that loads `~/.claude/CLAUDE.md` on session start. Confirmed working: Claude Code (CLI, desktop, IDE extensions), Codex CLI. Other agents work if they support a global instructions file.
 2. **bd (beads) installed.** Install from https://github.com/steveyegge/beads#installation. Verify with `bd version`.
-3. **Dolt (bd's storage backend).** Install from https://docs.dolthub.com/introduction/installation. Required for `bd dolt push` (session-close protocol). The installer will warn if dolt is missing but won't block on it.
+3. **Dolt (bd's storage backend).** Install from https://docs.dolthub.com/introduction/installation. Required for `sable-dolt-push` (session-close protocol). The installer will warn if dolt is missing but won't block on it.
 4. **git ≥ 2.5** (worktrees are used by swarm execution).
 5. **bash + tmux** — the hooks are bash scripts and the execution layer runs
    every agent as a persistent `claude` session in a tmux pane:
@@ -293,7 +293,7 @@ Your first task on SABLE — at any stage — starts with the Foundation pattern
 2. **Create the bead**: `bd create --title="..." --description="..." --type=bug|task|feature --priority=2`. The description must pass the Fresh Agent Test (file paths, function names, what's wrong, suggested approach, AND a test spec listing both unit and integration tests).
 3. **Claim and work**: `bd update <id> --claim`. Write the failing tests first (red), then the implementation (green), then run both unit and integration tests.
 4. **Close**: `bd close <id>`. The TDD gate hook fires here — if no tests ran this session, the close is blocked.
-5. **Session close**: `bd preflight`, then `git push`, `bd dolt push`. Work is not done until pushed.
+5. **Session close**: `bd preflight`, then `git push`, `sable-dolt-push` (blessed wrapper, never bare `bd dolt push`; chuck-only in a swarm). Work is not done until pushed.
 
 **Hierarchy stage** — add when features need 3+ beads with ordering:
 - Create an epic: `bd create --type=epic --title="..." --description="..."`

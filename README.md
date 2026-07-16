@@ -778,7 +778,7 @@ git commit -m "descriptive message"
 
 # 4. Push everything
 git pull --rebase
-bd dolt push        # Push beads to Dolt remote
+sable-dolt-push     # Push beads to Dolt remote — blessed wrapper, never bare `bd dolt push`; chuck-only in a swarm
 git push            # Push code to Git remote
 git status          # MUST show "up to date with origin"
 ```
@@ -803,7 +803,7 @@ These are battle-tested lessons from real swarm development.
 | Markdown TODO lists | Splits tracking between docs and beads | `bd create` for everything |
 | Temporal dep language ("A before B") | Inverts `bd dep add` arguments | Requirement language: "B needs A" |
 | Not closing blockers promptly | Freezes all downstream beads | `bd close <id>` immediately when done |
-| Stopping without pushing | Strands work locally — next session can't see it | `bd dolt push` + `git push` always |
+| Stopping without pushing | Strands work locally — next session can't see it | `sable-dolt-push` + `git push` always |
 | Code without tests | Hook blocks `bd close`, wastes agent time | Write failing test first; `[no-test]` for docs-only |
 | Vague bead descriptions | Agent wastes a full cycle re-exploring the codebase | Pass the Fresh Agent Test: file paths, function names, approach |
 | Over-bundling beads per agent | Single failure blocks all bundled beads | 2-3 related beads max per worker |
@@ -994,7 +994,7 @@ suggested approach, test spec (which test file, what assertions).
 1. Close finished beads
 2. Create beads for remaining work
 3. git commit + git push
-4. bd dolt push
+4. sable-dolt-push  # blessed wrapper, never bare `bd dolt push`; chuck-only in a swarm
 5. git status must show "up to date with origin"
 ```
 
@@ -1079,7 +1079,7 @@ bd ready              bd close <ids>         Agent prompt:
 bd list --status=     bd create (remaining)  - Which beads
   in_progress         git add + commit       - What files
                       git pull --rebase      - What commands
-                      bd dolt push           - bd close <ids>
+                      sable-dolt-push        - bd close <ids>
                       git push
                       git status → clean
 

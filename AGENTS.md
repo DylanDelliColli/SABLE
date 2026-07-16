@@ -9,7 +9,7 @@ bd ready              # Find available work
 bd show <id>          # View issue details
 bd update <id> --claim  # Claim work atomically
 bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
+sable-dolt-push       # Push beads data to remote — blessed wrapper, never bare `bd dolt push`; chuck-only in a swarm
 ```
 
 ## Non-Interactive Shell Commands
@@ -68,7 +68,7 @@ bd close <id>         # Complete work
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd dolt push
+   sable-dolt-push  # blessed wrapper, never bare `bd dolt push`; chuck-only in a swarm
    git push
    git status  # MUST show "up to date with origin"
    ```
