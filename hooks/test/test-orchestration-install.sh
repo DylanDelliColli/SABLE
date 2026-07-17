@@ -94,22 +94,29 @@ fi
 # on a host where the real D5 reconcile-timer is legitimately installed (e.g.
 # o9ru), checking the unsandboxed $HOME conflates "install wrote here" with
 # "this developer happens to run the timer" and fails for the right answer.
+# SABLE-f00o: shared predicate so the guard below exercises the SAME detection
+# code path as the real assertion, instead of tautologically re-checking the
+# file it just touched itself.
+home_has_timer_unit(){ [ -e "$1/.config/systemd/user/sable-reconcile-timer.timer" ]; }
+
 HS="$(mktemp -d)"; mkdir -p "$HS/.config/systemd/user"
 HP="$(mktemp -d)"
 HOME="$HS" SABLE_PROJECT_DIR="$HP" bash "$INSTALLER" --project >/dev/null 2>&1
-if [ -e "$HS/.config/systemd/user/sable-reconcile-timer.timer" ]; then
+if home_has_timer_unit "$HS"; then
   fail "project: install does not copy the unit into the real ~/.config/systemd/user" "found $HS/.config/systemd/user/sable-reconcile-timer.timer"
 else
   pass "project: install does not copy the unit into the real ~/.config/systemd/user"
 fi
 
-# guard: plant a unit inside the SANDBOXED HOME and confirm the assertion still
-# bites — proving the sandbox did not neuter the check into a vacuous pass.
+# guard: plant a unit inside the SANDBOXED HOME and re-invoke home_has_timer_unit
+# (the SAME predicate the assertion above calls) — proving detection actually
+# works. If home_has_timer_unit is ever neutered (e.g. hardcoded to report
+# "not found"), this guard must go red; that is the acceptance invariant.
 touch "$HS/.config/systemd/user/sable-reconcile-timer.timer"
-if [ -e "$HS/.config/systemd/user/sable-reconcile-timer.timer" ]; then
+if home_has_timer_unit "$HS"; then
   pass "project: assertion still bites when a unit IS present under sandboxed HOME (guard)"
 else
-  fail "project: assertion still bites when a unit IS present under sandboxed HOME (guard)"
+  fail "project: assertion still bites when a unit IS present under sandboxed HOME (guard)" "home_has_timer_unit reported absent after planting $HS/.config/systemd/user/sable-reconcile-timer.timer"
 fi
 rm -rf "$HS" "$HP"
 
