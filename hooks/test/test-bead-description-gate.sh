@@ -411,6 +411,23 @@ assert_nudge "docs: pathless description still flagged after extensionless fix (
   "bd create --title=foo --description=\"Fix the thing properly. TDD red-green confirms fix.\"" \
   "file paths"
 
+# ---------- Justfile/Rakefile extensionless build-file tests (SABLE-i0db) ----------
+
+# Test 44j: description citing only Justfile (extensionless build file) → passes
+JUSTFILE_DESC="Fix the build in Justfile to add a new recipe. TDD red-green confirms fix."
+assert_allow "docs: Justfile-only path passes file-path check (default)" "" \
+  "bd create --title=foo --description=\"$JUSTFILE_DESC\""
+
+# Test 44k: description citing only Rakefile (extensionless build file) → passes
+RAKEFILE_DESC="Fix the build in Rakefile to add a new task. TDD red-green confirms fix."
+assert_allow "docs: Rakefile-only path passes file-path check (default)" "" \
+  "bd create --title=foo --description=\"$RAKEFILE_DESC\""
+
+# Test 44l: regression — pathless description still flagged after Justfile/Rakefile fix
+assert_nudge "docs: pathless description still flagged after Justfile/Rakefile fix (default)" "" \
+  "bd create --title=foo --description=\"Fix the thing properly. TDD red-green confirms fix.\"" \
+  "file paths"
+
 # ---------- Short-flag alias tests (-d / -f) (SABLE-iyv) ----------
 
 GOOD_SHORT_DESC="hooks/bead-description-gate.sh line 98: extend HAS_FILE_FLAG regex. Test in hooks/test/test-bead-description-gate.sh — assert_nudge for -f."

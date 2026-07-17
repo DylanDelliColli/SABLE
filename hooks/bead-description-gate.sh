@@ -257,7 +257,12 @@ if ! echo "$DESC" | grep -qiE '(test|\.test\.|\.spec\.|__tests__|pytest|vitest|T
   append_missing "test spec (which test file, what assertions)"
 fi
 
-if ! echo "$DESC" | grep -qiE '(\.(ts|tsx|py|js|jsx|sh|go|rs|rb|md|json|yaml|yml|toml|kdl|cfg|ini|txt)|frontend/|src/|lib/|components/|hooks/|templates/|docs/|feedback/|bin/|location-briefing/|\.[a-zA-Z][a-zA-Z0-9_-]*/|\b(Makefile|Dockerfile)\b)'; then
+# Extensionless build files (Makefile/Dockerfile/Justfile/Rakefile) are matched by name since
+# they have no extension to catch on. Bare extensionless BIN NAMES (e.g. sable-msg) are
+# deliberately NOT matched here (SABLE-i0db) — cite them via their bin/ prefix (bin/sable-msg),
+# which already passes on the bin/ alternation above. Widening this to bare bin names would trade
+# away the gate's real quality property (paths, not bare names) for convenience; do not "fix" this.
+if ! echo "$DESC" | grep -qiE '(\.(ts|tsx|py|js|jsx|sh|go|rs|rb|md|json|yaml|yml|toml|kdl|cfg|ini|txt)|frontend/|src/|lib/|components/|hooks/|templates/|docs/|feedback/|bin/|location-briefing/|\.[a-zA-Z][a-zA-Z0-9_-]*/|\b(Makefile|Dockerfile|Justfile|Rakefile)\b)'; then
   append_missing "file paths (exact files to create/modify)"
 fi
 
