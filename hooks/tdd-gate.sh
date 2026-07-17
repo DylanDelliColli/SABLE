@@ -141,6 +141,16 @@ if [ -n "$BEAD_ARGS" ]; then
   # by an unrelated session's REPO= line. Routing through sable_evidence_key
   # gives an absent session its own deterministic ppid-scoped base, matching
   # only this session's (and its agent variants') evidence files.
+  #
+  # SABLE-bo10: the base alone is still prefix-collidable — a bare
+  # "${base}"* glob matches any OTHER session whose key happens to start
+  # with this base (ppid-123* matches ppid-1234's evidence file, a
+  # different, concurrently-live process), narrowing but not eliminating
+  # the yh1o failure shape. Agent variants are always base + "-" + agent_id
+  # (see lib-evidence-key.sh), so the only legitimate matches are the exact
+  # base itself or base followed by a literal "-" separator. Checking those
+  # two forms explicitly — instead of one open-ended glob — closes the
+  # prefix collision without narrowing the legitimate agent-variant match.
   _companion_evidence_base=$(sable_evidence_key "$SESSION_ID" "")
   for _bid in $BEAD_ARGS; do
     _companion=$(bd show "$_bid" --json 2>/dev/null | python3 -c "
@@ -155,8 +165,12 @@ notes = data[0].get('notes', '') or ''
 m = re.search(r'Companion repo:\s*(\S+)', notes)
 print(m.group(1) if m else '')
 " 2>/dev/null) || _companion=""
-    if [ -n "$_companion" ] && grep -qF "REPO=${_companion}" "${_companion_evidence_base}"* 2>/dev/null; then
-      exit 0
+    if [ -n "$_companion" ]; then
+      for _f in "${_companion_evidence_base}" "${_companion_evidence_base}"-*; do
+        if [ -f "$_f" ] && grep -qF "REPO=${_companion}" "$_f" 2>/dev/null; then
+          exit 0
+        fi
+      done
     fi
   done
 fi
