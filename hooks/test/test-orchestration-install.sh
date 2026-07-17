@@ -89,12 +89,36 @@ if printf '%s' "$out1" | grep -q "systemctl --user enable"; then
 else
   fail "project: install output prints the systemd activation command"
 fi
-# the install itself must never actually touch a live systemd/cron surface
-if [ -e "$HOME/.config/systemd/user/sable-reconcile-timer.timer" ]; then
-  fail "project: install does not copy the unit into the real ~/.config/systemd/user" "found $HOME/.config/systemd/user/sable-reconcile-timer.timer"
+# the install itself must never actually touch a live systemd/cron surface.
+# SABLE-i8kv: run this against a SANDBOXED HOME, not the developer's real one —
+# on a host where the real D5 reconcile-timer is legitimately installed (e.g.
+# o9ru), checking the unsandboxed $HOME conflates "install wrote here" with
+# "this developer happens to run the timer" and fails for the right answer.
+# SABLE-f00o: shared predicate so the guard below exercises the SAME detection
+# code path as the real assertion, instead of tautologically re-checking the
+# file it just touched itself.
+home_has_timer_unit(){ [ -e "$1/.config/systemd/user/sable-reconcile-timer.timer" ]; }
+
+HS="$(mktemp -d)"; mkdir -p "$HS/.config/systemd/user"
+HP="$(mktemp -d)"
+HOME="$HS" SABLE_PROJECT_DIR="$HP" bash "$INSTALLER" --project >/dev/null 2>&1
+if home_has_timer_unit "$HS"; then
+  fail "project: install does not copy the unit into the real ~/.config/systemd/user" "found $HS/.config/systemd/user/sable-reconcile-timer.timer"
 else
   pass "project: install does not copy the unit into the real ~/.config/systemd/user"
 fi
+
+# guard: plant a unit inside the SANDBOXED HOME and re-invoke home_has_timer_unit
+# (the SAME predicate the assertion above calls) — proving detection actually
+# works. If home_has_timer_unit is ever neutered (e.g. hardcoded to report
+# "not found"), this guard must go red; that is the acceptance invariant.
+touch "$HS/.config/systemd/user/sable-reconcile-timer.timer"
+if home_has_timer_unit "$HS"; then
+  pass "project: assertion still bites when a unit IS present under sandboxed HOME (guard)"
+else
+  fail "project: assertion still bites when a unit IS present under sandboxed HOME (guard)" "home_has_timer_unit reported absent after planting $HS/.config/systemd/user/sable-reconcile-timer.timer"
+fi
+rm -rf "$HS" "$HP"
 
 # env override of the cadence
 P_CADENCE="$(mktemp -d)"
