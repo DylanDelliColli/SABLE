@@ -499,6 +499,121 @@ def test_read_instruction_is_single_line():
     assert "\n" not in instr
 
 
+# --- bundle dispatch (SABLE-q13h) --------------------------------------------
+
+def test_parse_bundle_ids_splits_dedupes_and_drops_lead():
+    assert ssw.parse_bundle_ids("Y-2, Z-3,Y-2", "X-1") == ["Y-2", "Z-3"]
+    assert ssw.parse_bundle_ids("X-1, Y-2", "X-1") == ["Y-2"]
+    assert ssw.parse_bundle_ids("  ,  ", "X-1") == []
+
+
+def test_parse_bundle_ids_empty_or_none():
+    assert ssw.parse_bundle_ids(None, "X-1") == []
+    assert ssw.parse_bundle_ids("", "X-1") == []
+
+
+def test_bundle_ready_for_done_all_closed():
+    assert ssw.bundle_ready_for_done(
+        ["Y-2", "Z-3"], {"Y-2": "closed", "Z-3": "closed"}) is None
+
+
+def test_bundle_ready_for_done_refuses_when_sibling_open():
+    """TEST SPEC (SABLE-q13h): the done-flag helper refuses when a listed
+    bead is still open."""
+    err = ssw.bundle_ready_for_done(
+        ["Y-2", "Z-3"], {"Y-2": "in_progress", "Z-3": "closed"})
+    assert err is not None
+    assert "Y-2" in err
+    assert "Z-3" not in err
+
+
+def test_bundle_ready_for_done_treats_unknown_status_as_not_closed():
+    """Fail-safe: a bead missing from the status map (e.g. a lookup that
+    failed) must not silently pass the gate."""
+    err = ssw.bundle_ready_for_done(["Y-2"], {})
+    assert err is not None
+    assert "Y-2" in err
+
+
+def test_assemble_dispatch_prompt_renders_all_bundled_bead_descriptions():
+    """TEST SPEC (SABLE-q13h): the dispatch prompt for a bundle must contain
+    every bundled bead id + description, not just the lead's."""
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Lead thing", description="lead desc",
+        worktree="/wt/wk-x", branch="wk-x", model="sonnet",
+        bundle=[
+            {"id": "Y-2", "title": "Sibling one", "description": "sibling one desc"},
+            {"id": "Z-3", "title": "Sibling two", "description": "sibling two desc"},
+        ],
+    )
+    assert "X-1" in p and "lead desc" in p
+    assert "Y-2" in p and "sibling one desc" in p
+    assert "Z-3" in p and "sibling two desc" in p
+    # bundle-ownership contract present and names every bead
+    assert "Bundle contract" in p
+    assert "regardless of who claimed" in p or "regardless of claim state" in p
+    # done-flag gate line and close line both enumerate the full bundle
+    assert "bd close X-1" in p
+    assert "every other bundled bead listed above" in p
+
+
+def test_assemble_dispatch_prompt_without_bundle_has_no_bundle_section():
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="haiku",
+    )
+    assert "Bundle contract" not in p
+    assert "Bundled bead" not in p
+    assert "bd close X-1" in p
+    assert "every other bundled bead" not in p
+
+
+def test_claim_bundle_beads_claims_each_unclaimed_sibling(monkeypatch):
+    """Claim-all-up-front (SABLE-q13h DESIGN): every bundled sibling gets the
+    same `bd update --claim` the lead bead does, so none of them looks
+    separately-owned."""
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ssw.subprocess, "run", fake_run)
+    bundle = [
+        {"id": "Y-2", "assignee": None},
+        {"id": "Z-3", "assignee": None},
+    ]
+    ssw.claim_bundle_beads(bundle, lane="optimus")
+    assert calls == [
+        ["bd", "update", "Y-2", "--claim"],
+        ["bd", "update", "Z-3", "--claim"],
+    ]
+
+
+def test_claim_bundle_beads_skips_sibling_already_claimed_by_lane(monkeypatch):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ssw.subprocess, "run", fake_run)
+    bundle = [{"id": "Y-2", "assignee": "optimus"}]
+    ssw.claim_bundle_beads(bundle, lane="optimus")
+    assert calls == []
+
+
+def test_claim_bundle_beads_warns_but_does_not_raise_on_failure(monkeypatch, capsys):
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="already claimed")
+
+    monkeypatch.setattr(ssw.subprocess, "run", fake_run)
+    bundle = [{"id": "Y-2", "assignee": None}]
+    ssw.claim_bundle_beads(bundle, lane="optimus")  # must not raise
+    err = capsys.readouterr().err
+    assert "Y-2" in err and "already claimed" in err
+
+
 # --- worker command ---------------------------------------------------------
 
 def test_worker_command_default_pins_model_and_auto_approves(monkeypatch):

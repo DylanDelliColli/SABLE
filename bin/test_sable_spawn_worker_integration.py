@@ -25,6 +25,7 @@ BIN = Path(__file__).resolve().parent / "sable-spawn-worker"
 HAVE_TMUX = shutil.which("tmux") is not None
 HAVE_BD = shutil.which("bd") is not None
 BEAD = "SABLE-bldh.2"  # an open bead in this repo (read-only here)
+BUNDLE_SIBLING = "SABLE-06dr"  # a second open bead, used only as --bundle sibling (read-only here)
 pytestmark = pytest.mark.skipif(not (HAVE_TMUX and HAVE_BD),
                                 reason="needs tmux + bd")
 
@@ -119,6 +120,52 @@ def test_spawn_creates_tagged_worker_window(sock):
         # the read-instruction (single-line) was delivered into the worker pane
         win = _tmux(sock, "list-windows", "-F", "#{window_name}").stdout
         assert "worker-sable-bldh-2" in win
+
+
+def test_spawn_bundle_renders_all_bead_descriptions_into_prompt(sock):
+    """SABLE-q13h TEST SPEC: the dispatch prompt for a bundle must contain all
+    bundled bead ids + descriptions, not just the lead's — end to end through
+    the real CLI (--bundle), a real `bd show` fetch, and a real dispatch-file
+    write. --skip-governance keeps this read-only against bd (no claim)."""
+    with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
+        env = {
+            **_clean_env(),
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_MAX_LOAD_PER_CORE": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+        r = subprocess.run(
+            ["python3", str(BIN), BEAD, "--bundle", BUNDLE_SIBLING,
+             "--worktree", wt, "--model", "haiku", "--skip-governance"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        time.sleep(0.6)
+
+        dispatch = Path(dd) / f"{BEAD}.md"
+        assert dispatch.exists()
+        body = dispatch.read_text()
+
+        lead = json.loads(subprocess.run(
+            ["bd", "show", BEAD, "--json"], capture_output=True, text=True,
+            check=True).stdout)
+        lead = lead[0] if isinstance(lead, list) else lead
+        sibling = json.loads(subprocess.run(
+            ["bd", "show", BUNDLE_SIBLING, "--json"], capture_output=True, text=True,
+            check=True).stdout)
+        sibling = sibling[0] if isinstance(sibling, list) else sibling
+
+        assert BEAD in body and (lead.get("description") or "")[:40] in body
+        assert BUNDLE_SIBLING in body
+        assert (sibling.get("description") or "")[:40] in body
+        assert "Bundle contract" in body
+        assert f"bd close {BEAD}" in body
+        assert "every other bundled bead listed above" in body
 
 
 def test_spawn_without_worktree_lands_where_dispatch_points(sock):

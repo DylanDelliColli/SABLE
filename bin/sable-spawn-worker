@@ -49,7 +49,15 @@ carries the bead tag — while KEEPING model-check active.
 Usage:
   sable-spawn-worker <bead-id> [--worktree PATH] [--model M|--model M:reason]
                      [--scope NAME] [--session NAME] [--skip-governance]
-                     [--respawn]
+                     [--respawn] [--bundle id1,id2,...]
+
+  --bundle (SABLE-q13h): sibling bead ids dispatched alongside <bead-id> into
+    the SAME worktree/branch. Every bundled bead is claimed up front (same as
+    the lead) and its full title/description is rendered into the dispatch
+    prompt itself, under a "Bundle contract" section binding the worker to
+    ALL listed beads regardless of claim state — replacing the prior prose
+    convention (a bundle spec left in the lead bead's notes/description) that
+    lost non-lead beads in 6+ documented dispatches.
 
 Env:
   SABLE_TMUX_SOCKET    tmux socket (-L) for isolation/tests
@@ -719,6 +727,28 @@ def worker_pane_guard() -> str | None:
             "manager pane, not from inside a worker's.")
 
 
+def claim_bundle_beads(bundle: list[dict], lane: str) -> None:
+    """Claim-all-up-front (SABLE-q13h DESIGN, third leg alongside prompt
+    injection + the done-flag gate): claim every bundled sibling bead the same
+    way the lead bead is claimed, so none of them LOOKS separately-owned to
+    the dispatched worker — directly closing the 7a6h+np7c failure mechanism
+    (a worker declined a bundled bead because a manager's pre-claim made it
+    look like someone else's work). Non-fatal: a claim failure on a sibling is
+    warned to stderr, not raised — the in-prompt bundle contract is the
+    primary mechanism (assemble_dispatch_prompt), this is belt-and-suspenders,
+    and a sibling that's already claimed by someone else must not abort the
+    whole dispatch of the lead bead."""
+    for b in bundle:
+        if bead_already_claimed_by_lane(b, lane):
+            continue
+        r = subprocess.run(["bd", "update", b.get("id", ""), "--claim"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.stderr.write(
+                f"sable-spawn-worker: could not claim bundled bead "
+                f"{b.get('id', '?')}: {r.stderr.strip()}\n")
+
+
 def new_window_args(session: str, win: str, worktree: str,
                     env_args: list[str], wcmd: str) -> list[str]:
     """tmux argv for the worker window. -d spawns it in the BACKGROUND: without
@@ -737,7 +767,84 @@ def new_window_args(session: str, win: str, worktree: str,
 # (SABLE-axp0).
 
 
-def assemble_dispatch_prompt(bead_id, title, description, worktree, branch, model) -> str:
+def parse_bundle_ids(raw: str | None, lead_id: str) -> list[str]:
+    """Parse `--bundle "id1, id2"` into a deduped, order-preserving list of
+    sibling bead ids (SABLE-q13h). Blank entries and the lead id itself
+    (listing the lead again in --bundle is a no-op, not an error) are
+    dropped. None/empty `raw` => no bundle."""
+    if not raw:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok or tok == lead_id or tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
+def bundle_ready_for_done(bundle_ids: list[str], bead_statuses: dict[str, str]) -> str | None:
+    """The done-flag gate for a bundled dispatch (SABLE-q13h): returns None
+    when every id in `bundle_ids` is closed per `bead_statuses`, else an error
+    string naming the still-open sibling(s). A worker (or a manager auditing a
+    'done' pane) uses this to refuse flagging done while a bundled bead
+    remains open — the recurring failure mode this bead documents is the lead
+    bead's own completion silently ending the worker's turn while siblings sit
+    untouched. `bead_statuses` maps bead id -> its `bd show --json` status
+    string; a bead absent from the map is treated as not-closed (fail safe,
+    not fail open — an unknown status must not pass the gate)."""
+    open_ids = [b for b in bundle_ids if bead_statuses.get(b) != "closed"]
+    if not open_ids:
+        return None
+    return (f"bundle incomplete — still open: {', '.join(open_ids)}. Do not flag "
+            "done until every bundled bead is closed or explicitly handed back "
+            "(bd q \"<one-liner>\" explaining why).")
+
+
+def assemble_dispatch_prompt(bead_id, title, description, worktree, branch, model,
+                             bundle: list[dict] | None = None) -> str:
+    """`bundle` (SABLE-q13h), when non-empty, is a list of {id, title,
+    description} dicts for sibling beads dispatched alongside `bead_id` in the
+    SAME worktree/branch. Every bundled bead's FULL description is rendered
+    inline here — not left for the worker to go find in a lead bead's notes
+    (the fybj+vyhn failure: a worker never read past the dispatch prompt into
+    notes where a bundle addendum lived) — and the bundle contract below binds
+    the worker to every listed bead regardless of claim state (the 7a6h+np7c
+    failure: a worker declined a bundled bead because a manager pre-claim made
+    it look separately-owned)."""
+    bundle = bundle or []
+    all_ids = [bead_id] + [b["id"] for b in bundle]
+
+    bundled_sections = "".join(
+        f"\n## Bundled bead — {b['id']}: {b['title']}\n\n{b['description']}\n"
+        for b in bundle
+    )
+
+    bundle_contract = ""
+    if bundle:
+        ids_line = ", ".join(all_ids)
+        status_checks = "\n".join(f"  bd show {i} --json" for i in all_ids)
+        bundle_contract = f"""
+## Bundle contract (SABLE-q13h) — READ THIS
+This dispatch bundles {len(all_ids)} beads into ONE worktree/branch: {ids_line}.
+ALL of them are yours to finish, regardless of who claimed what or whether a
+bundled bead looks separately-owned — a pre-claim on a bundled bead does NOT
+mean it isn't yours. The lead bead ({bead_id}) closing is NOT the end of your
+task while any bundled sibling remains open. Before flagging done, verify
+every bead in the bundle is closed:
+{status_checks}
+If any bead is not closed, finish it or hand it back explicitly with
+`bd q "<one-liner>"` before flagging done — do not flag done with a bundled
+bead still open.
+"""
+
+    close_line = (f"`bd close {bead_id}` and every other bundled bead listed above"
+                 if bundle else f"`bd close {bead_id}`")
+    verify_line = (f"`bd show <id> --json` for {ids_line if bundle else ''}"
+                  if bundle else f"`bd show {bead_id} --json`")
+
     return f"""# SABLE worker dispatch — warm-pane self-push
 
 You are a SABLE worker. You are a warm `claude` session in your own tmux pane,
@@ -752,7 +859,7 @@ Worker model: {model}
 {bead_id}: {title}
 
 {description}
-
+{bundled_sections}{bundle_contract}
 ## Contract
 - Verify current state first; if the work is already done / clean, STOP and report.
 - Implement, then run the UNIT and INTEGRATION tests; capture the exact command + output.
@@ -760,12 +867,12 @@ Worker model: {model}
   `git push` from this CWD. NEVER use `git -C <other-tree>` — your CWD is the
   worktree (this deletes the SABLE-041 wrong-tree bug). Do NOT bypass pre-push.
 - The post-push hook files the for-chuck handoff; Chuck merges. You do NOT open PRs.
-- `bd close {bead_id}` with the test evidence. Check the exit code — a
-  non-zero exit (e.g. the TDD gate denying the close) means it did NOT
+- {close_line} with the test evidence. Check the exit code for each close —
+  a non-zero exit (e.g. the TDD gate denying the close) means it did NOT
   close. Do not report success on a failed close; read the gate's stderr
   reason, fix the real cause (missing test evidence, or add [no-test] to
   the bead's notes if it is genuinely non-code), and retry.
-- Verify the close actually landed: `bd show {bead_id} --json` and confirm
+- Verify every close actually landed: {verify_line} and confirm each
   `status` is `closed` BEFORE reporting success or flagging done
   (SABLE-u0c6 — claiming "closed" without this check is how a denied close
   gets mis-reported as success, stranding the bead in_progress with a
@@ -821,6 +928,10 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sable-spawn-worker")
     p.add_argument("bead_id")
     p.add_argument("--worktree", help="existing worktree path (else bd worktree create)")
+    p.add_argument("--bundle", help="comma-separated sibling bead ids bundled with "
+                                    "bead_id into the SAME worktree/branch (SABLE-q13h): "
+                                    "claimed up front and rendered in full into the "
+                                    "dispatch prompt, so the worker cannot skip them")
     p.add_argument("--model", help="model or 'model:reason' override")
     p.add_argument("--scope", help="short name for the worktree (else derived from bead)")
     p.add_argument("--lane", help="lane manager identity stamped on the worker "
@@ -887,6 +998,13 @@ def main(argv: list[str] | None = None) -> int:
     bead = parse_bead(_run(["bd", "show", bid, "--json"]))
     model, reason = resolve_model(bead_labels(bead), ns.model)
     lane = resolve_lane(ns.lane)
+
+    # --- SABLE-q13h: fetch bundled sibling beads (if any) for the prompt.
+    # Fetched unconditionally (even under --skip-governance) since prompt
+    # assembly always needs their titles/descriptions; only the up-front
+    # claim below is gated on governance. ---
+    bundle_ids = parse_bundle_ids(ns.bundle, bid)
+    bundle_beads = [parse_bead(_run(["bd", "show", b, "--json"])) for b in bundle_ids]
 
     # Dispatch evidence: a LIVE running pane tagged with this bead. Computed once
     # here so the duplicate-dispatch guard AND the respawn tree-claim release
@@ -980,6 +1098,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             subprocess.run(["bd", "update", bid, "--claim"], check=True)
 
+        # SABLE-q13h: claim-all-up-front — every bundled sibling bead is
+        # claimed here too, so none of them looks separately-owned to the
+        # dispatched worker (see claim_bundle_beads docstring).
+        if bundle_beads:
+            claim_bundle_beads(bundle_beads, lane)
+
         in_progress = parse_bead_list(_run(["bd", "list", "--status=in_progress", "--json"]))
         overlap_warning = overlap_check(bid, bead, in_progress)
         if overlap_warning:
@@ -1024,9 +1148,12 @@ def main(argv: list[str] | None = None) -> int:
     ddir = dispatch_dir()
     ddir.mkdir(parents=True, exist_ok=True)
     dispatch_path = ddir / f"{bid}.md"
+    bundle_arg = [{"id": b.get("id", i), "title": b.get("title", ""),
+                  "description": b.get("description", "")}
+                 for i, b in zip(bundle_ids, bundle_beads)]
     dispatch_path.write_text(assemble_dispatch_prompt(
         bid, bead.get("title", ""), bead.get("description", ""),
-        worktree, branch, model))
+        worktree, branch, model, bundle=bundle_arg))
 
     # --- open the worker window (stamped with the lane identity) + capture pane ---
     # SABLE-5v9n: set remain-on-exit GLOBALLY, BEFORE the window is created,

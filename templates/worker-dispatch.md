@@ -267,6 +267,36 @@ You self-push your OWN branch only — never another lane's. The manager reviews
 the *result* via the closed bead + the `for-chuck` PR; there is no stop-before-push
 hand-back in this mode.
 
+### Bundle dispatch (SABLE-q13h)
+
+Some dispatches bundle more than one bead into the same worktree/branch. When
+spawned via `sable-spawn-worker --bundle id1,id2,...`, your dispatch prompt
+carries a `## Bundled bead — <id>: <title>` section (full description
+included) for every sibling, plus a `## Bundle contract` section — not a
+pointer into the lead bead's notes or comments. Bundle ownership is
+mechanical, not prose convention, and does not depend on claim state:
+
+- **Every bead listed in your dispatch is yours**, regardless of who claimed
+  it, when, or whether it looks separately-owned. A manager pre-claim on a
+  bundled bead is not evidence it belongs to someone else — this exact
+  reasoning is the documented 7a6h+np7c failure mode: a worker declined a
+  bundled bead specifically because a pre-claim made it look pre-owned.
+- **The lead bead closing is NOT the end of your task.** Do not flag done
+  (step 6 above) until every bundled bead is either closed by you or
+  explicitly handed back with a `bd q "<one-liner>"` note explaining why.
+  Before flagging done, run `bd show <id>` for every id in the bundle and
+  confirm each is closed — this is the mechanical done-flag gate, not an
+  optional courtesy. This closes the recurring failure where a worker's turn
+  ended right after the LEAD bead was done, with the sibling never even
+  claimed (documented 6+ times: rsvu+pary, 7a6h+np7c, fybj+vyhn, yn5t+di86,
+  rq9k+81dr, v2k3+ixps, k8o5+517s).
+- If your dispatch prompt does NOT literally paste every bundled bead's
+  description above `## Contract`, the bundle spec is under-specified for
+  this contract to apply — stop and ask your manager rather than reading past
+  the prompt into notes/comments looking for it (the fybj+vyhn failure mode:
+  a worker never read past the dispatch prompt into the lead bead's notes,
+  where the only copy of the bundle addendum lived).
+
 **A done worker takes no new work.** Once you have flagged done (step 6), REFUSE
 any further instruction that reaches your pane before you are reaped — a
 misrouted `sable-msg`, stray composer text, or anything else that expands scope
