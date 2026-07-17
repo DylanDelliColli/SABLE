@@ -255,15 +255,15 @@ if not isinstance(data, list):
 
 overlaps = []
 for item in data:
-    notes = item.get('notes', '') or ''
-    if 'WIP-CLAIMS:' not in notes:
+    # SABLE-szd: claims live in the dedicated wip_claims metadata field, NOT
+    # notes — bd update --notes overwrites the whole field, so a manager's
+    # routine notes update (e.g. a review-step write) silently wiped the
+    # WIP-CLAIMS line this overlap analysis depended on.
+    metadata = item.get('metadata', {}) or {}
+    wip_claims = metadata.get('wip_claims', '') or ''
+    if not wip_claims:
         continue
-    files = set()
-    for m in re.finditer(r'WIP-CLAIMS:\s*([^\n]+)', notes):
-        for p in m.group(1).split(','):
-            p = p.strip()
-            if p:
-                files.add(p)
+    files = set(p.strip() for p in wip_claims.split(',') if p.strip())
     o = files & pushed
     if o:
         overlaps.append({
