@@ -510,6 +510,91 @@ fi
 rm -f "$CY_PPID_KEY"
 rm -rf "$CY_STUB_DIR"
 
+# ---------- SABLE-bo10: companion-repo glob must not prefix-collide across
+# sessions whose ppid-derived key is a STRING PREFIX of another's ----------
+# yh1o scoped the companion glob from "every session on the box" down to
+# "sessions whose key is a string-prefix of mine" by routing the glob base
+# through sable_evidence_key instead of interpolating $SESSION_ID directly.
+# But the glob itself, "${base}"*, is still open-ended: it matches any OTHER
+# live session whose key happens to start with this base, e.g. an
+# absent-session base /tmp/tdd-evidence-ppid-123 also matches
+# /tmp/tdd-evidence-ppid-1234's evidence file — a DIFFERENT, concurrently-live
+# process, not an agent-variant of this one (real agent variants are always
+# base + "-" + agent_id). Fix: check the exact base and the base-followed-
+# by-"-" form as two separate checks instead of one open-ended glob.
+
+CB_STUB_DIR=$(mktemp -d)
+cat > "$CB_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"market-brief-package-companion","notes":"Companion repo: /home/ddc/dev-environment/SABLE"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$CB_STUB_DIR/bd"
+CB_CLOSE='bd close market-brief-package-companion market-brief-package-other'
+
+CB_LIB="$(cd "$(dirname "$0")/.." && pwd)/multi-manager/lib-evidence-key.sh"
+cb_key() { bash -c '. "$0"; sable_evidence_key "$1" "$2"' "$CB_LIB" "$1" "$2"; }
+CB_BASE=$(cb_key "" "")
+# Prefix-collision file: base with an extra digit appended DIRECTLY (no "-"
+# separator) — simulates a different, concurrently-live ppid-keyed session
+# whose key is base+"4" (e.g. base=ppid-123, collider=ppid-1234).
+CB_COLLIDE="${CB_BASE}4"
+CB_AGENT_VARIANT="${CB_BASE}-agentXYZ"
+rm -f "$CB_BASE" "$CB_COLLIDE" "$CB_AGENT_VARIANT"
+
+# NOTE: the reader (bash "$HOOK") must be invoked as a BARE pipe redirected
+# to a temp file, never wrapped in $(...) — a pipe inside $(...) forces bash
+# to fork an extra subshell for the pipeline, which becomes the hook's
+# actual parent process, so the hook's own $PPID (and thus its companion
+# glob base) would silently diverge from $CB_BASE computed above via
+# $(cb_key ...) (a no-pipe substitution bash execs in place, preserving this
+# script's PID as the parent). Same SABLE-yh1o D4 agreement pattern as the CY
+# block above.
+
+# (a) regression guard: REPO=-tagged evidence lives ONLY at the prefix-
+# colliding path, never at this session's own base. Must DENY.
+echo "$(date -Iseconds) REPO=/home/ddc/dev-environment/SABLE CMD=pytest" > "$CB_COLLIDE"
+CB_TMP=$(mktemp)
+make_input "$CB_CLOSE" "" | env PATH="$CB_STUB_DIR:$PATH" bash "$HOOK" > "$CB_TMP" 2>/dev/null
+CB_OUT=$(cat "$CB_TMP"); rm -f "$CB_TMP"
+if echo "$CB_OUT" | grep -q '"permissionDecision": "deny"'; then
+  pa_pass "companion-repo glob (SABLE-bo10): prefix-colliding session's REPO= evidence does NOT satisfy the close"
+else
+  pa_fail "companion-repo glob (SABLE-bo10): prefix-colliding session's REPO= evidence must not satisfy the close" "got: ${CB_OUT:-<empty>}"
+fi
+rm -f "$CB_COLLIDE"
+
+# (b) positive control: evidence at the exact base still satisfies the close.
+echo "$(date -Iseconds) REPO=/home/ddc/dev-environment/SABLE CMD=pytest" > "$CB_BASE"
+CB_TMP2=$(mktemp)
+make_input "$CB_CLOSE" "" | env PATH="$CB_STUB_DIR:$PATH" bash "$HOOK" > "$CB_TMP2" 2>/dev/null
+CB_OUT2=$(cat "$CB_TMP2"); rm -f "$CB_TMP2"
+if [ -z "$CB_OUT2" ]; then
+  pa_pass "companion-repo glob (SABLE-bo10): evidence at the exact base still satisfies the close"
+else
+  pa_fail "companion-repo glob (SABLE-bo10): evidence at the exact base must still satisfy the close" "got: ${CB_OUT2:-<empty>}; key=[$CB_BASE] exists=$([ -s "$CB_BASE" ] && echo yes || echo no)"
+fi
+rm -f "$CB_BASE"
+
+# (c) positive control: evidence at a real agent-variant (base-<aid>) still
+# satisfies the close.
+echo "$(date -Iseconds) REPO=/home/ddc/dev-environment/SABLE CMD=pytest" > "$CB_AGENT_VARIANT"
+CB_TMP3=$(mktemp)
+make_input "$CB_CLOSE" "" | env PATH="$CB_STUB_DIR:$PATH" bash "$HOOK" > "$CB_TMP3" 2>/dev/null
+CB_OUT3=$(cat "$CB_TMP3"); rm -f "$CB_TMP3"
+if [ -z "$CB_OUT3" ]; then
+  pa_pass "companion-repo glob (SABLE-bo10): evidence at an agent variant (base-<aid>) still satisfies the close"
+else
+  pa_fail "companion-repo glob (SABLE-bo10): evidence at an agent variant must still satisfy the close" "got: ${CB_OUT3:-<empty>}; key=[$CB_AGENT_VARIANT] exists=$([ -s "$CB_AGENT_VARIANT" ] && echo yes || echo no)"
+fi
+rm -f "$CB_AGENT_VARIANT"
+rm -rf "$CB_STUB_DIR"
+
 # ---------- SABLE-h853: scoped-run protocol acceptance ----------
 # Operator-approved protocol change (2026-07-13): the full suite no longer
 # runs pre-push per worker; workers submit SCOPED evidence (the bead's test
