@@ -146,6 +146,83 @@ def test_parse_args_bead_flag():
     assert ns.bead is True
 
 
+# --- default sender label: worker sends must not wear the lane manager's name
+# (SABLE-qqcd) -----------------------------------------------------------------
+# sable-spawn-worker:696 stamps a worker pane's CLAUDE_AGENT_NAME with the
+# owning LANE MANAGER's name (deliberately, for push-attribution, SABLE-bldh.13)
+# and SABLE_WORKER_PANE=1 ALWAYS (sable-spawn-worker:697, the SABLE-38zi
+# disambiguator). Before this fix sable-msg's --from default consulted only
+# CLAUDE_AGENT_NAME, so a worker's own send was framed from=<manager> —
+# indistinguishable from a real directive from that manager.
+
+def test_resolve_from_worker_pane_labels_as_worker_bead(monkeypatch):
+    monkeypatch.setenv("SABLE_WORKER_PANE", "1")
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "tarzan")
+    monkeypatch.setenv("SABLE_BEAD", "SABLE-x1")
+    assert sable_msg.resolve_from() == "worker:SABLE-x1"
+
+
+def test_resolve_from_worker_pane_without_sable_bead_env_uses_own_pane_tag(monkeypatch):
+    # No $SABLE_BEAD -> falls back to the sending pane's own @sable_bead tag
+    # (the tag sable-spawn-worker's worker_pane_tags stamps on every worker pane).
+    monkeypatch.setenv("SABLE_WORKER_PANE", "1")
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "tarzan")
+    monkeypatch.delenv("SABLE_BEAD", raising=False)
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    monkeypatch.setattr(
+        sable_msg, "pane_bead_tag",
+        lambda base, pane, run=None: "SABLE-y2" if pane == "%7" else None,
+    )
+    assert sable_msg.resolve_from() == "worker:SABLE-y2"
+
+
+def test_resolve_from_worker_pane_unresolvable_bead_falls_back_to_plain_worker(monkeypatch):
+    monkeypatch.setenv("SABLE_WORKER_PANE", "1")
+    monkeypatch.delenv("SABLE_BEAD", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    assert sable_msg.resolve_from() == "worker"
+
+
+def test_resolve_from_manager_pane_keeps_lane_name_regression_guard(monkeypatch):
+    # Without SABLE_WORKER_PANE (a real manager pane), CLAUDE_AGENT_NAME must
+    # still resolve to the lane name -- this fix must not relabel managers.
+    monkeypatch.delenv("SABLE_WORKER_PANE", raising=False)
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "tarzan")
+    assert sable_msg.resolve_from() == "tarzan"
+
+
+def test_resolve_from_operator_default_when_nothing_set(monkeypatch):
+    monkeypatch.delenv("SABLE_WORKER_PANE", raising=False)
+    monkeypatch.delenv("CLAUDE_AGENT_NAME", raising=False)
+    assert sable_msg.resolve_from() == "operator"
+
+
+def test_main_worker_pane_default_from_labels_as_worker(monkeypatch, capsys):
+    monkeypatch.setenv("SABLE_WORKER_PANE", "1")
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "tarzan")
+    monkeypatch.setenv("SABLE_BEAD", "SABLE-i8kv")
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
+    rc = sable_msg.main(["tarzan", "status update"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "worker:SABLE-i8kv -> tarzan" in err
+
+
+def test_main_explicit_from_overrides_worker_default(monkeypatch, capsys):
+    # An explicit --from must still win over the worker-pane default.
+    monkeypatch.setenv("SABLE_WORKER_PANE", "1")
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "tarzan")
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
+    rc = sable_msg.main(["optimus", "status update", "--from", "lincoln"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "lincoln -> optimus" in err
+
+
 # --- main: missing role is a hard error -------------------------------------
 
 def test_main_missing_role_errors(monkeypatch, capsys):
