@@ -167,6 +167,41 @@ def test_rehearsal_actions_down_blocks(tmp_path):
     assert _ci_verify_refs(origin) == [], "ci-verify ref not cleaned up on block"
 
 
+# --- SABLE-7wyl: sustained-503-class outage where `gh` itself hangs -----------
+
+def _write_hanging_gh(tmp_path):
+    """A fake `gh` that never returns — the 2026-07-16 muw0 incident shape: the
+    Actions API was down hard enough that the `gh` CLI's own retry/connect
+    behavior blocked indefinitely, not just erroring fast. Proves
+    SABLE_MG_GH_TIMEOUT bounds each poll call so the gate still parks cleanly
+    instead of needing a manual kill+requeue."""
+    gh = tmp_path / "hanging-gh"
+    gh.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(600)\n")
+    gh.chmod(gh.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return gh
+
+
+def test_rehearsal_actions_api_hang_bounded_by_gh_timeout(tmp_path):
+    origin, work = _setup(tmp_path)
+    gh = _write_hanging_gh(tmp_path)
+    before = _origin_base_sha(origin)
+
+    env = _env(gh)
+    env["SABLE_MG_GH_TIMEOUT"] = "1"
+    env["SABLE_MG_TIMEOUT"] = "2"
+    env["SABLE_MG_GRACE"] = "0"
+
+    cp = subprocess.run(
+        [sys.executable, str(BIN), "promote", "--bead", "TEST-1",
+         "--branch", WORKER, "--base", BASE, "--repo", str(work), "--remote", "origin"],
+        cwd=str(work), env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        timeout=30,  # safety net: fail loud rather than hang pytest if the fix regresses
+    )
+    assert cp.returncode == 21, cp.stdout
+    assert _origin_base_sha(origin) == before, "base advanced while Actions API was hung"
+    assert _ci_verify_refs(origin) == [], "ci-verify ref not cleaned up after hang-bounded block"
+
+
 def test_rehearsal_override_promotes_without_ci(tmp_path):
     origin, work = _setup(tmp_path)
     gh = _write_fake_gh(tmp_path, origin, "empty")  # CI down, but override supplied
