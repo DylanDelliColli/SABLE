@@ -85,7 +85,9 @@ say so and recommend the caller bump to full planning rather than guessing.
 
 Produces:
 - **Skeleton test files** in the project's test directory, with one `it.todo`
-  / `pytest.mark.skip` per case (filename pattern `*.skel.test.<ext>`).
+  / `pytest.mark.skip` per case (filename pattern `*.skel.test.<ext>` — for
+  Python/pytest projects, `skel_<feature-name>.py` instead; see
+  "Skeleton-test file convention" below for why).
 - **`columbo-test-spec` beads** filed via `bd create`, one per skeleton file
   or coherent cluster, fully populated per the template below.
 
@@ -439,27 +441,41 @@ tags. Lock the diagram before Phase 5.
 
 1. Write skeleton test file(s) — one per cohesive feature surface. Each
    case is `it.todo("<case name>")` (vitest/jest), `pytest.mark.skip(reason="<why>")`
-   (pytest), `t.Skip("<why>")` (Go), or framework equivalent. Filename
-   `<feature-name>.skel.test.<ext>` — the `.skel` infix is load-bearing.
+   (pytest), `t.Skip("<why>")` (Go), or framework equivalent. Filename:
+   - **pytest (Python):** `skel_<feature-name>.py` — no `test_` prefix, no
+     `.test.py` suffix. **Never `<feature-name>.skel.test.py`** — pytest
+     discovers the double-extension pattern but its dotted module name
+     (`foo.skel.test`) is not importable, and collection CRASHES the whole
+     suite rather than skipping cleanly.
+   - **Every other framework:** `<feature-name>.skel.test.<ext>` — the
+     `.skel` infix is load-bearing.
    Header comment at the top of each skeleton file:
    ```
    // Columbo skeleton — see <bead-id>
    // Worker: fill in each it.todo body, remove .skel from filename when complete
    // (or merge cases into an existing test file with same coverage shape).
    ```
-2. **Place each skeleton in the directory matching its test-layer tag**
+2. **pytest projects only — validate collection before moving on:** run
+   `pytest --collect-only <path-to-skeleton-or-its-directory>`. It must
+   exit cleanly (no `ModuleNotFoundError` / collection error) and must NOT
+   list the skeleton file's cases as collected — the naming rule above only
+   works if you confirm it. If collection fails or the skeleton is picked
+   up anyway, rename the file and re-run before continuing. Do not skip
+   this check and do not end the session with an unvalidated skeleton file
+   on disk.
+3. **Place each skeleton in the directory matching its test-layer tag**
    (from Phase 4): `[→UNIT]` cases land in the unit-test dir; `[→E2E]`
    cases land in `e2e/` / `cypress/` / `playwright/` per detected config;
    `[→EVAL]` cases land in `evals/` or wherever the project keeps
    prompt-eval suites.
-3. File `columbo-test-spec` beads via `bd create` per the template below.
+4. File `columbo-test-spec` beads via `bd create` per the template below.
    Each bead's `## Cases` section names the same case strings that appear
    in the skeleton file's `it.todo` calls — the worker maps bead ↔ skeleton
    1:1.
-4. **Regression beads (IRON RULE):** if the feature touched existing
+5. **Regression beads (IRON RULE):** if the feature touched existing
    code, at least one filed bead must be a regression-test bead, marked
    CRITICAL (priority ≤ 1). Do not exit without it.
-5. In `--bead` mode: file each new bead as a child or dependent of the
+6. In `--bead` mode: file each new bead as a child or dependent of the
    feature bead (`bd dep add <new> <feature>` so the new bead "needs"
    the feature OR `bd update <new> --parent <feature-epic>` if the feature
    is an epic). Address `for-tarzan` if small; otherwise leave unaddressed
@@ -481,8 +497,22 @@ tags. Lock the diagram before Phase 5.
 
 - **Location:** match the project layout. Look for the dominant pattern.
   Do not invent a new directory.
-- **Filename:** `<feature-name>.skel.test.<ext>` — the `.skel` infix is the
-  contract marker.
+- **Filename:**
+  - **pytest (Python):** `skel_<feature-name>.py` — no `test_` prefix, no
+    `.test.py` suffix, so pytest does not attempt to collect it at all.
+    **The double-extension pattern `<feature-name>.skel.test.py` is
+    forbidden.** pytest *does* discover it (it matches `*.py` under a test
+    directory once any `test_*`/`*_test.py` glob is broadened, or via
+    explicit `python_files` config), but the dotted module name
+    (`foo.skel.test`) is not importable as a package path, so collection
+    raises `ModuleNotFoundError` and crashes the entire suite — it does not
+    degrade to a clean per-file skip. Validate with `pytest --collect-only`
+    per Phase 5 step 2 before ending the session; do not rely on the naming
+    convention alone.
+  - **Every other framework (vitest/jest/Go/etc.):** `<feature-name>.skel.test.<ext>`
+    — the `.skel` infix is the contract marker. These frameworks resolve
+    test files by path, not by importable dotted module name, so the
+    double-extension pattern is safe there.
 - **Body:** one `it.todo(...)` / `pytest.mark.skip(...)` / `t.Skip(...)`
   per case. Each todo's string is the case name. A short comment above each
   todo states the *why* (1 line). No setup, no fixtures, no mocking — the
@@ -629,6 +659,10 @@ Before sending the summary message, re-read each filed bead and confirm:
       (run a grep to confirm)
 - [ ] Forward mode: each skeleton file lives in the directory matching
       its test-layer tag
+- [ ] Forward mode, pytest projects: every Python skeleton file is named
+      `skel_<feature-name>.py` (no `test_` prefix, no `.test.py` suffix —
+      the double-extension pattern is forbidden) AND `pytest --collect-only`
+      has been run against it and exits clean
 - [ ] Audit mode: every existing test in the cited scope has a recorded
       quality grade (★/★★/★★★)
 - [ ] Audit mode: every fingerprint greps to ≤3 matches in the cited file
@@ -661,6 +695,9 @@ You exit when ALL of:
   extensions
 - Every case in the coverage diagram carries a test-layer tag
   (`[→UNIT]` / `[→E2E]` / `[→EVAL]`)
+- **pytest projects:** every Python skeleton file is named to avoid
+  collection (`skel_<feature-name>.py`, never `<feature-name>.skel.test.py`)
+  and has been validated with `pytest --collect-only` before exit
 - **Regression rule honored:** if the feature touched existing code (any
   modification — not pure greenfield), at least one regression-test bead
   has been filed at priority ≤ 1
@@ -718,7 +755,10 @@ crossed scope. File a bead and let the user (or their managers) execute.
 
 ## Out of scope
 
-- Running tests yourself — out of scope; this skill plans coverage
+- Running tests yourself — out of scope; this skill plans coverage.
+  Exception: `pytest --collect-only` on a just-written Python skeleton
+  file, required per "Skeleton-test file convention" — it discovers
+  and imports test modules but executes no test bodies.
 - Writing test bodies — workers fill in skeletons
 - Writing or modifying source code — read-only with respect to implementation
 - Fixing tests in place — audit mode files gap beads only
@@ -775,3 +815,11 @@ That's it. No prose explanation — the beads + skeletons are the explanation.
 - You may not dispatch code-writing or test-running agents.
 - You may not exit forward mode without skeleton files on disk that map
   1:1 to filed beads.
+- You may not leave a Python skeleton file on disk without running
+  `pytest --collect-only` against it — naming it `skel_<feature-name>.py`
+  is necessary but not sufficient; verify collection doesn't crash the
+  suite before ending the session. `--collect-only` is a discovery dry run,
+  not test execution — it does not conflict with "no test-running" above.
+- You may never name a Python skeleton file `<feature-name>.skel.test.py`
+  (or any other double-extension `.skel.test.py` variant) — the dotted
+  module name is not importable and pytest collection crashes the suite.
