@@ -121,28 +121,57 @@ fi
 rm -rf "$HS" "$HP"
 
 # ---------- SABLE-7oj5: generated units carry a resolved bd env, not bare PATH lookup ----------
-SVC="$P/.claude/sable/reconcile-timer/sable-reconcile-timer.service"
-CRON="$P/.claude/sable/reconcile-timer/sable-reconcile-timer.cron"
-bd_env_val="$(grep -o 'Environment=SABLE_RC_BD=.*' "$SVC" | cut -d= -f3-)"
-if [ -n "$bd_env_val" ]; then
-  pass "project: .service carries Environment=SABLE_RC_BD=<path>"
+# Hermetic against the host: do NOT rely on ambient PATH having (dev host, via
+# nvm) or lacking (CI clean room) a real bd. Force both cases explicitly so
+# this suite proves the contract on every host, not just this one.
+
+# POSITIVE CASE: a resolvable bd on PATH must be baked in verbatim.
+FAKEBIN="$(mktemp -d)"
+cat > "$FAKEBIN/bd" <<'FAKEBD'
+#!/usr/bin/env bash
+exit 0
+FAKEBD
+chmod +x "$FAKEBIN/bd"
+P_BD="$(mktemp -d)"
+SABLE_PROJECT_DIR="$P_BD" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --project >/dev/null 2>&1
+SVC_BD="$P_BD/.claude/sable/reconcile-timer/sable-reconcile-timer.service"
+CRON_BD="$P_BD/.claude/sable/reconcile-timer/sable-reconcile-timer.cron"
+bd_env_val="$(grep -o 'Environment=SABLE_RC_BD=.*' "$SVC_BD" | cut -d= -f3-)"
+if [ "$bd_env_val" = "$FAKEBIN/bd" ]; then
+  pass "project: .service carries Environment=SABLE_RC_BD=<path> (hermetic bd present)"
 else
-  fail "project: .service carries Environment=SABLE_RC_BD=<path>"
+  fail "project: .service carries Environment=SABLE_RC_BD=<path> (hermetic bd present)" "expected $FAKEBIN/bd got '$bd_env_val'"
 fi
 if [ -n "$bd_env_val" ] && [ -x "$bd_env_val" ]; then
   pass "project: .service's SABLE_RC_BD points at a real executable at generation time"
 else
   fail "project: .service's SABLE_RC_BD points at a real executable at generation time" "path=$bd_env_val"
 fi
-if grep -q '^Environment=PATH=' "$SVC"; then
-  pass "project: .service carries a fallback Environment=PATH= line"
-else
-  fail "project: .service carries a fallback Environment=PATH= line"
-fi
-if grep -q "SABLE_RC_BD=\"$bd_env_val\"" "$CRON"; then
+if grep -q "SABLE_RC_BD=\"$bd_env_val\"" "$CRON_BD"; then
   pass "project: .cron line sets SABLE_RC_BD consistently with the .service"
 else
   fail "project: .cron line sets SABLE_RC_BD consistently with the .service"
+fi
+
+# NEGATIVE CASE: no bd anywhere on PATH — the installer must not fabricate a
+# path, must warn, and must still emit the fallback Environment=PATH= line.
+P_NOBD="$(mktemp -d)"
+nobd_err="$(SABLE_PROJECT_DIR="$P_NOBD" PATH="/usr/bin:/bin" bash "$INSTALLER" --project 2>&1 >/dev/null)"
+SVC_NOBD="$P_NOBD/.claude/sable/reconcile-timer/sable-reconcile-timer.service"
+if ! grep -q '^Environment=SABLE_RC_BD=' "$SVC_NOBD"; then
+  pass "project: .service omits Environment=SABLE_RC_BD when bd is absent from PATH"
+else
+  fail "project: .service omits Environment=SABLE_RC_BD when bd is absent from PATH" "found: $(grep '^Environment=SABLE_RC_BD=' "$SVC_NOBD")"
+fi
+if printf '%s' "$nobd_err" | grep -qi "WARNING.*bd.*not found"; then
+  pass "project: install warns on stderr when bd is absent from PATH"
+else
+  fail "project: install warns on stderr when bd is absent from PATH" "stderr=$nobd_err"
+fi
+if grep -q '^Environment=PATH=' "$SVC_NOBD"; then
+  pass "project: .service carries a fallback Environment=PATH= line even when bd is absent"
+else
+  fail "project: .service carries a fallback Environment=PATH= line even when bd is absent"
 fi
 
 # env override of the cadence
