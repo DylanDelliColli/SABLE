@@ -472,6 +472,27 @@ def test_dispatch_prompt_has_no_unresolvable_templates_reference():
                 pytest.fail(f"unresolvable relative templates/ reference: {line!r}")
 
 
+def test_dispatch_prompt_verifies_close_landed_before_flagging_done():
+    """SABLE-u0c6: a worker that reports 'bead closed' without checking bd
+    close's exit code or the bead's real status can mis-report a
+    TDD-gate-denied close as success, stranding the bead in_progress with a
+    pushed branch (observed live: m2tv). The contract must tell the worker to
+    (a) check the close's exit code and (b) re-verify via `bd show --json`
+    that status is closed BEFORE flagging done — and that guard must appear
+    between the close instruction and the done-flag instruction, not after."""
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="haiku",
+    )
+    assert "exit code" in p
+    assert "bd show" in p
+    assert "closed" in p
+    close_idx = p.index("bd close X-1")
+    show_idx = p.index("bd show")
+    done_idx = p.index('@sable_status done')
+    assert close_idx < show_idx < done_idx
+
+
 def test_read_instruction_is_single_line():
     instr = ssw.read_instruction("/abs/dispatch/X-1.md")
     assert "/abs/dispatch/X-1.md" in instr

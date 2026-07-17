@@ -760,7 +760,16 @@ Worker model: {model}
   `git push` from this CWD. NEVER use `git -C <other-tree>` — your CWD is the
   worktree (this deletes the SABLE-041 wrong-tree bug). Do NOT bypass pre-push.
 - The post-push hook files the for-chuck handoff; Chuck merges. You do NOT open PRs.
-- `bd close {bead_id}` with the test evidence.
+- `bd close {bead_id}` with the test evidence. Check the exit code — a
+  non-zero exit (e.g. the TDD gate denying the close) means it did NOT
+  close. Do not report success on a failed close; read the gate's stderr
+  reason, fix the real cause (missing test evidence, or add [no-test] to
+  the bead's notes if it is genuinely non-code), and retry.
+- Verify the close actually landed: `bd show {bead_id} --json` and confirm
+  `status` is `closed` BEFORE reporting success or flagging done
+  (SABLE-u0c6 — claiming "closed" without this check is how a denied close
+  gets mis-reported as success, stranding the bead in_progress with a
+  pushed branch).
 - Finally, flag done for the reaper. First verify your own pane identity
   (`echo $TMUX_PANE`), then target it explicitly — do NOT omit `-t`, or the
   flag lands on whichever pane has operator focus instead of your own:

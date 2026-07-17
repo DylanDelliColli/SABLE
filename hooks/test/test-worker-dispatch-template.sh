@@ -75,6 +75,17 @@ fi
 has  "documents the run-to-file test-output directive"      "run test suites to a file"
 has  "documents the bd-show field-limit rule"                "bd show calls use field limits, not full dumps"
 
+# ---------- SABLE-u0c6: worker-lifecycle guard — verify the close landed ----------
+# A worker that reports "bead closed" without checking bd close's exit code or
+# re-verifying the bead's real status can mis-report a TDD-gate-denied close as
+# success, stranding the bead in_progress with a pushed branch (observed live:
+# m2tv). The warm-pane self-push lifecycle must instruct the worker to check
+# the exit code and re-verify via `bd show --json` BEFORE flagging done.
+
+has  "cites SABLE-u0c6 as the tracking bead for the close-verification guard" "SABLE-u0c6"
+hasre "instructs checking bd close's exit code"                 "check the exit code|exit code"
+hasre "instructs re-verifying status via bd show before flagging done"  "bd show.*--json.*status|verify the close"
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
