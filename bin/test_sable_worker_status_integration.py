@@ -655,6 +655,87 @@ def test_reap_spares_pane_whose_live_process_is_a_resumed_manager(sock):
     assert "NOT reaping" in r.stderr and "optimus" in r.stderr and "manager" in r.stderr
 
 
+# --- SABLE-c008: --reap refused to kill a done-unconfirmed pane superseded
+# by a live revise-successor pane for the SAME bead. Incident (2026-07-16,
+# i8kv): pane %4 (i8kv v1) stayed done-unconfirmed after its revise-successor
+# %5 was spawned into the SAME worktree; --reap left %4 alive, so tarzan had
+# to manually kill it to prevent a stray wake into the worktree %5 was
+# actively editing (the SABLE-nhrb cross-worktree isolation class). ---
+
+def _write_open_bd_stub(stub_dir: Path) -> None:
+    """A stand-in `bd` CLI that reports EVERY bead as open (status
+    in_progress, never closed) — drives confirm_done_status to downgrade a
+    done-tagged pane to 'done-unconfirmed' before reaping_decision ever sees
+    it, exercising the FULL pipeline (not just reaping_decision in
+    isolation). Placed first on PATH for the --reap subprocess."""
+    script = stub_dir / "bd"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        'if sys.argv[1:2] == ["show"]:\n'
+        '    print(\'[{"status": "in_progress"}]\')\n'
+        "else:\n"
+        '    print("[]")\n'
+    )
+    script.chmod(0o755)
+
+
+def test_reap_kills_done_unconfirmed_pane_superseded_by_live_successor(sock, tmp_path):
+    """P1 is done but its bead is OPEN in the stubbed bd, so
+    confirm_done_status downgrades it to done-unconfirmed. P2 is a LIVE
+    pane tagged for the SAME bead -- the revise-successor signal. --reap
+    must kill P1 (superseded) and leave P2 (the live successor) alive."""
+    stub_dir = tmp_path / "stub"
+    stub_dir.mkdir()
+    _write_open_bd_stub(stub_dir)
+
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.0", "worker", "SABLE-c008-x1", "done")
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.1", "worker", "SABLE-c008-x1", "running")
+    assert _pane_count(sock) == 2
+    survivor_pane = _tmux(sock, "display-message", "-p", "-t", "w.1",
+                          "#{pane_id}").stdout.strip()
+
+    env = {**_scrubbed_env(), "SABLE_TMUX_SOCKET": sock, "SABLE_TMUX_SESSION": "w",
+           "SABLE_STATUS_SAMPLE_INTERVAL": "0.1",
+           "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}"}
+    r = subprocess.run(["python3", str(BIN), "--reap"], capture_output=True,
+                       text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.4)
+    assert _pane_count(sock) == 1  # only the live successor survives
+    remaining = _tmux(sock, "list-panes", "-a", "-F", "#{pane_id}").stdout.strip()
+    assert remaining == survivor_pane, remaining
+
+
+def test_reap_spares_lone_done_unconfirmed_pane(sock, tmp_path):
+    """Regression: a done-unconfirmed pane with NO live sibling for its bead
+    must NOT be reaped -- its work may still matter (the pre-c008 safeguard
+    this fix must not erode)."""
+    stub_dir = tmp_path / "stub"
+    stub_dir.mkdir()
+    _write_open_bd_stub(stub_dir)
+
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.0", "worker", "SABLE-c008-x2", "done")
+    assert _pane_count(sock) == 1
+
+    env = {**_scrubbed_env(), "SABLE_TMUX_SOCKET": sock, "SABLE_TMUX_SESSION": "w",
+           "SABLE_STATUS_SAMPLE_INTERVAL": "0.1",
+           "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}"}
+    r = subprocess.run(["python3", str(BIN), "--reap"], capture_output=True,
+                       text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.4)
+    assert _pane_count(sock) == 1  # lone done-unconfirmed pane survives
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

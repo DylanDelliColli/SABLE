@@ -99,6 +99,78 @@ def test_reaping_decision_empty_when_none_done():
     assert sws.reaping_decision(workers) == []
 
 
+# --- SABLE-c008: pane %4 (i8kv v1) stayed alive done-unconfirmed after its
+# revise-successor %5 was spawned into the SAME worktree -- tarzan had to
+# manually kill it to prevent a stray wake into the tree %5 was actively
+# editing (the SABLE-nhrb cross-worktree isolation class). A live successor
+# pane tagged for the same bead proves the done-unconfirmed pane is stale,
+# so reaping_decision must kill it too -- but a LONE done-unconfirmed pane
+# (no live sibling) must stay untouched, since its work may still matter. ---
+
+def test_reaping_decision_reaps_done_unconfirmed_superseded_by_live_successor():
+    workers = [
+        {"pane": "%4", "bead": "SABLE-x", "status": "done-unconfirmed"},
+        {"pane": "%5", "bead": "SABLE-x", "status": "running"},
+    ]
+    assert sws.reaping_decision(workers) == ["%4"]
+
+
+def test_reaping_decision_spares_lone_done_unconfirmed_pane():
+    # regression: no live sibling for the bead -- must NOT be reaped
+    workers = [{"pane": "%4", "bead": "SABLE-x", "status": "done-unconfirmed"}]
+    assert sws.reaping_decision(workers) == []
+
+
+def test_reaping_decision_spares_done_unconfirmed_with_unrelated_live_pane():
+    # a live pane for a DIFFERENT bead is not a successor -- must not supersede
+    workers = [
+        {"pane": "%4", "bead": "SABLE-x", "status": "done-unconfirmed"},
+        {"pane": "%5", "bead": "SABLE-y", "status": "running"},
+    ]
+    assert sws.reaping_decision(workers) == []
+
+
+def test_reaping_decision_still_reaps_confirmed_done_pane():
+    # regression: status == "done" (confirmed) reaps exactly as before,
+    # independent of the new superseded path
+    workers = [{"pane": "%2", "bead": "SABLE-x", "status": "done"}]
+    assert sws.reaping_decision(workers) == ["%2"]
+
+
+def test_reaping_decision_superseded_kill_runs_the_real_path():
+    # SABLE-f00o bite-proof: neutering the successor-detection (no live
+    # sibling recognized) must turn this RED, not silently pass
+    workers = [
+        {"pane": "%4", "bead": "SABLE-x", "status": "done-unconfirmed"},
+        {"pane": "%5", "bead": "SABLE-x", "status": "running"},
+    ]
+    live = sws.live_beads(workers)
+    assert "SABLE-x" in live
+    assert sws.is_superseded(workers[0], live) is True
+    assert sws.reaping_decision(workers) == ["%4"]
+
+
+def test_reaping_decision_never_reaps_superseded_pane_with_unrecognized_class():
+    # fail-safe applies to the superseded path too -- an unrecognized class
+    # tag must never be reaped, even when superseded
+    workers = [
+        {"pane": "%4", "bead": "SABLE-x", "status": "done-unconfirmed",
+         "class": "mystery"},
+        {"pane": "%5", "bead": "SABLE-x", "status": "running"},
+    ]
+    assert sws.reaping_decision(workers) == []
+
+
+def test_live_beads_excludes_done_and_done_unconfirmed():
+    workers = [
+        {"pane": "%1", "bead": "a", "status": "done"},
+        {"pane": "%2", "bead": "b", "status": "done-unconfirmed"},
+        {"pane": "%3", "bead": "c", "status": "running"},
+        {"pane": "%4", "bead": "", "status": "running"},  # beadless: excluded
+    ]
+    assert sws.live_beads(workers) == {"c"}
+
+
 def test_tmux_base_socket():
     assert sws.tmux_base("sk") == ["tmux", "-L", "sk"]
     assert sws.tmux_base(None) == ["tmux"]

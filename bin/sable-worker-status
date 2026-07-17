@@ -271,22 +271,56 @@ def dialog_stall(capture: str) -> bool:
     return overlay_posture(capture) and not pane_working(capture)
 
 
+def live_beads(workers: list[dict]) -> set[str]:
+    """Bead ids with a currently-LIVE pane attached — anything NOT done and
+    NOT done-unconfirmed. This is the successor signal reaping_decision uses
+    to detect a superseded done-unconfirmed pane (SABLE-c008): a live pane
+    tagged for the same bead can only exist because a revise-successor was
+    spawned into that bead's worktree after the done-unconfirmed pane
+    finished."""
+    return {w["bead"] for w in workers
+            if w.get("bead") and w["status"] not in ("done", "done-unconfirmed")}
+
+
+def is_superseded(worker: dict, live: set[str]) -> bool:
+    """True when `worker` is a done-unconfirmed pane whose bead has a live
+    revise-successor pane elsewhere in the pool (SABLE-c008 incident: pane
+    %4 stayed alive after its revise-successor %5 was spawned into the SAME
+    worktree, risking a stray wake into the tree %5 was actively editing —
+    the SABLE-nhrb cross-worktree isolation class). The successor's mere
+    existence proves this pane's finished-but-unconfirmed work is stale, so
+    leaving it alive is the hazard, not the safeguard. A LONE
+    done-unconfirmed pane (no live sibling for its bead) is untouched — its
+    work may still matter and confirm_done_status already flagged it for a
+    human."""
+    return (worker["status"] == "done-unconfirmed"
+            and bool(worker.get("bead"))
+            and worker["bead"] in live)
+
+
 def reaping_decision(workers: list[dict]) -> list[str]:
     """Panes to kill: any done worker/producer pane, EXCEPT (a) a done
     producer whose @sable_deliverable is missing or invalid — flagged via
     done_no_deliverable instead of killed — and (b) any pane carrying an
     unrecognized @sable_class — fail-safe, never reaped since this tool
-    doesn't understand its lifecycle contract."""
+    doesn't understand its lifecycle contract. ALSO reaped: a
+    done-unconfirmed pane superseded by a live revise-successor pane for the
+    same bead (SABLE-c008, see is_superseded) — subject to the same
+    unrecognized-class fail-safe."""
+    live = live_beads(workers)
     doomed = []
     for w in workers:
-        if not is_done(w["status"]):
-            continue
         cls = w.get("class")
-        if cls is not None and cls != "producer":
-            continue  # unrecognized class tag -- fail-safe, never reap
-        if cls == "producer" and not deliverable_ok(w.get("deliverable", "")):
-            continue  # done-no-deliverable -- flagged, not killed
-        doomed.append(w["pane"])
+        if is_done(w["status"]):
+            if cls is not None and cls != "producer":
+                continue  # unrecognized class tag -- fail-safe, never reap
+            if cls == "producer" and not deliverable_ok(w.get("deliverable", "")):
+                continue  # done-no-deliverable -- flagged, not killed
+            doomed.append(w["pane"])
+        elif is_superseded(w, live):
+            if cls is not None and cls != "producer":
+                continue  # unrecognized class tag -- fail-safe, never reap
+            doomed.append(w["pane"])
     return doomed
 
 
@@ -485,10 +519,12 @@ def confirm_done_status(worker: dict, run=_runner) -> dict:
     sampling has already settled a pane's status: a worker/legacy pane (not
     a producer — see bead_closed) reporting done is only trusted once
     `bd show` confirms its bead is actually closed. An uncorroborated done
-    is downgraded to "done-unconfirmed" — excluded from reaping_decision
-    (which only kills status == "done") and visible in the CLI table for a
-    human, the same idiom as the existing done-no-deliverable flag, rather
-    than silently trusted off the tag alone."""
+    is downgraded to "done-unconfirmed" — excluded from reaping_decision's
+    plain done-kill path and visible in the CLI table for a human, the same
+    idiom as the existing done-no-deliverable flag, rather than silently
+    trusted off the tag alone. It is STILL reap-eligible if a live
+    revise-successor pane for the same bead supersedes it (SABLE-c008, see
+    is_superseded) — a lone done-unconfirmed pane stays untouched."""
     if is_done(worker["status"]) and worker.get("class") != "producer":
         if bead_closed(worker.get("bead", ""), run=run) is False:
             return {**worker, "status": "done-unconfirmed"}
