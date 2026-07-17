@@ -271,6 +271,71 @@ def test_interrupt_lands_on_busy_midturn_pane_first_attempt(tmux_socket, tmp_pat
     assert "cap in force" in rec.read_text()         # and was SUBMITTED as a turn
 
 
+# A marker-driven variant of _BUSY_TUI, identical except the busy->idle
+# transition is TEST-CONTROLLED via markers instead of a wall-clock BUSY_SECS
+# window (SABLE-um6i: the wall-clock window raced under host load exactly like
+# the l7uv/msxj/wcbj class — stand-in startup + tmux setup could eat the whole
+# window before sable-msg's first probe, making the pane read IDLE and the
+# send verify as landed, when the test's premise requires it be BUSY at t0).
+# Signals busy-entry (BUSY_READY, before the first read) so the test can gate
+# t0 capture to the busy phase, and stays busy until the test releases it
+# (GO_IDLE), recording NATURAL exactly as the wall-clock timeout did. The
+# per-character read loop (and its bare-Escape interrupt detection) is left
+# untouched — this stand-in is a separate script from _BUSY_TUI, so L211's
+# loop in _BUSY_TUI itself still stands, unmodified, for SABLE-qby7 to convert.
+_BUSY_MARKER_TUI = r'''#!/usr/bin/env bash
+queued=""
+busy=1
+: > "$BUSY_READY"                                  # signal busy-entry BEFORE first read
+while [ "$busy" = 1 ]; do
+  printf '\033[H\033[2J  Running the turn (esc to interrupt)\n'
+  printf '\xe2\x9d\xaf %s\n' "$queued"
+  if IFS= read -rsN1 -t 0.2 ch; then
+    case "$ch" in
+      $'\x1b') printf 'INTERRUPTED' > "$END_FILE"; busy=0 ;;
+      $'\n'|$'\r'|'') : ;;
+      *) IFS= read -r rest; queued="$ch$rest" ;;
+    esac
+  fi
+  if [ "$busy" = 1 ] && [ -e "$GO_IDLE" ]; then
+    printf 'NATURAL' > "$END_FILE"; busy=0
+  fi
+done
+printf '\033[H\033[2J'
+printf '%.0s\n' $(seq 1 60)
+if [ -n "$queued" ]; then
+  printf '\xe2\x9d\xaf %s\n' "$queued"
+  printf '%s\n' "$queued" >> "$REC_FILE"
+fi
+while true; do
+  printf '\xe2\x9d\xaf '
+  IFS= read -r line || break
+  printf '%s\n' "$line" >> "$REC_FILE"
+done
+'''
+
+
+def _start_busy_pane_markers(sock, tmp_path):
+    """Marker-driven variant of _start_busy_pane (SABLE-um6i). Returns
+    (rec, end, busy_ready, go_idle): rec/end as before; busy_ready signals
+    busy-entry before the first read (so a caller can gate t0 capture to the
+    busy phase); go_idle is the test->stand-in release that ends the busy
+    phase, replacing the wall-clock BUSY_SECS window that raced under load."""
+    rec = tmp_path / "rec.txt"
+    end = tmp_path / "end.txt"
+    busy_ready = tmp_path / "busy_ready"
+    go_idle = tmp_path / "go_idle"
+    script = tmp_path / "busy_marker_tui.sh"
+    script.write_text(_BUSY_MARKER_TUI)
+    script.chmod(0o755)
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+          f"REC_FILE={rec} END_FILE={end} BUSY_READY={busy_ready} "
+          f"GO_IDLE={go_idle} bash {script}")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
+    return rec, end, busy_ready, go_idle
+
+
 def test_default_send_to_busy_turn_does_not_interrupt_and_reports_undelivered(tmux_socket, tmp_path):
     # The companion guard: on the SAME kind of busy pane, a DEFAULT-mode send
     # (no --interrupt) must NOT interrupt the turn — the idle-wait + Escape logic
@@ -278,7 +343,13 @@ def test_default_send_to_busy_turn_does_not_interrupt_and_reports_undelivered(tm
     # the turn ran to its own end. SABLE-d21h: because the pane is BUSY at t0, the
     # send is not verified-landed, so sable-msg reports undelivered (routes to the
     # durable fallback) even though the stand-in still physically queues the line.
-    rec, end = _start_busy_pane(tmux_socket, tmp_path, busy_secs=2)
+    #
+    # SABLE-um6i: BUSY_READY/GO_IDLE markers (not a wall-clock busy_secs window
+    # + fixed sleep) make both the busy phase and the busy->idle transition
+    # deterministic under host load — see _BUSY_MARKER_TUI above.
+    rec, end, busy_ready, go_idle = _start_busy_pane_markers(tmux_socket, tmp_path)
+    assert _wait_until(busy_ready.exists, timeout=10), \
+        "stand-in never signalled busy-entry"
     r = subprocess.run(
         ["python3", str(BIN), "optimus", "queued directive", "--from", "lincoln"],
         capture_output=True, text=True,
@@ -288,9 +359,13 @@ def test_default_send_to_busy_turn_does_not_interrupt_and_reports_undelivered(tm
     )
     assert r.returncode != 0                          # busy at t0 -> not verified-landed
     assert "undelivered" in r.stderr
-    time.sleep(2.5)                                   # let the busy turn end on its own
-    assert end.read_text().strip() == "NATURAL"      # default mode never interrupted it
-    assert "queued directive" in rec.read_text()      # line still physically queued + ran
+    go_idle.touch()  # release the busy turn now that undelivered is confirmed
+    assert _wait_until(lambda: end.exists() and end.read_text().strip() == "NATURAL",
+                       timeout=10), \
+        "busy turn never reached its (test-controlled) natural end"
+    assert _wait_until(lambda: rec.exists() and "queued directive" in rec.read_text(),
+                       timeout=10), \
+        "line must still have been physically queued and run"
 
 
 def test_default_send_to_busy_pane_that_frees_reports_delivered_h0jw(tmux_socket, tmp_path):
