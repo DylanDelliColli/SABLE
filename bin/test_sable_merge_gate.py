@@ -106,7 +106,7 @@ def test_build_preview_clean_returns_commit(monkeypatch):
 
 def test_wait_for_ci_actions_down(monkeypatch):
     # gh returns an empty run list; with grace=0 the first poll reports actions_down
-    def fake_run(argv, cwd=None, check=True):
+    def fake_run(argv, cwd=None, check=True, timeout=None):
         return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
     monkeypatch.setattr(smg, "_run", fake_run)
     monkeypatch.setenv("SABLE_MG_GRACE", "0")
@@ -116,12 +116,52 @@ def test_wait_for_ci_actions_down(monkeypatch):
     assert conclusion == "actions_down"
 
 
+def test_wait_for_ci_survives_gh_hang(monkeypatch):
+    # SABLE-7wyl: sustained-503-class outage where the `gh` subprocess itself
+    # hangs (never returns) rather than erroring fast. Must not propagate
+    # subprocess.TimeoutExpired and must still converge to a clean park.
+    def fake_run(argv, cwd=None, check=True, timeout=None):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+    monkeypatch.setattr(smg, "_run", fake_run)
+    monkeypatch.setenv("SABLE_MG_GRACE", "0")
+    monkeypatch.setenv("SABLE_MG_TIMEOUT", "0")
+    monkeypatch.setenv("SABLE_MG_GH_TIMEOUT", "5")
+    conclusion, url = smg.wait_for_ci("/repo", "ci-verify/bead-abcdef1", "PREVIEWSHA")
+    assert conclusion == "actions_down"
+
+
+def test_wait_for_ci_mid_flight_hang_times_out_not_hangs(monkeypatch):
+    # A run is seen once (mid-verify), then every subsequent gh call hangs —
+    # the muw0 incident shape. Must resolve to 'timeout' (not crash, not spin
+    # past SABLE_MG_TIMEOUT) using only the per-call SABLE_MG_GH_TIMEOUT budget,
+    # never the real wall clock.
+    import json
+    calls = {"n": 0}
+
+    def fake_run(argv, cwd=None, check=True, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            payload = json.dumps([{"headSha": "PREVIEWSHA", "status": "in_progress",
+                                   "conclusion": None, "url": ""}])
+            return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+
+    monkeypatch.setattr(smg, "_run", fake_run)
+    monkeypatch.setenv("SABLE_MG_POLL", "0")
+    monkeypatch.setenv("SABLE_MG_GRACE", "0")
+    monkeypatch.setenv("SABLE_MG_TIMEOUT", "1")
+    monkeypatch.setenv("SABLE_MG_GH_TIMEOUT", "5")
+    conclusion, url = smg.wait_for_ci("/repo", "ci-verify/bead-abcdef1", "PREVIEWSHA")
+    assert conclusion == "timeout"
+    assert calls["n"] <= 3, "should converge in a couple of hung calls, not spin"
+
+
 def test_wait_for_ci_success(monkeypatch):
     import json
     payload = json.dumps([{"headSha": "PREVIEWSHA", "status": "completed",
                            "conclusion": "success", "url": "http://run/1"}])
 
-    def fake_run(argv, cwd=None, check=True):
+    def fake_run(argv, cwd=None, check=True, timeout=None):
         return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
     monkeypatch.setattr(smg, "_run", fake_run)
     monkeypatch.setenv("SABLE_MG_POLL", "0")
@@ -253,7 +293,7 @@ def test_sweep_keeps_fresh_ref_regardless_of_run(monkeypatch):
 
 def _ref_status_run(monkeypatch, *, rc, stdout):
     monkeypatch.setattr(smg, "_run",
-                        lambda argv, cwd=None, check=True: subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr=""))
+                        lambda argv, cwd=None, check=True, timeout=None: subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr=""))
 
 
 def test_ref_has_inflight_run_true_when_not_completed(monkeypatch):
@@ -276,6 +316,15 @@ def test_ref_has_inflight_run_false_when_no_runs(monkeypatch):
 def test_ref_has_inflight_run_fail_open_on_gh_error(monkeypatch):
     # gh error -> False (fail-open): an undiscoverable run cannot wedge the sweep
     _ref_status_run(monkeypatch, rc=1, stdout="gh: could not connect")
+    assert smg.ref_has_inflight_run("/repo", "ci-verify/bead-abcdef1") is False
+
+
+def test_ref_has_inflight_run_fail_open_on_gh_hang(monkeypatch):
+    # SABLE-7wyl: a hung gh call (same class as wait_for_ci's) must fail open,
+    # not propagate subprocess.TimeoutExpired and wedge the sweep.
+    def fake_run(argv, cwd=None, check=True, timeout=None):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+    monkeypatch.setattr(smg, "_run", fake_run)
     assert smg.ref_has_inflight_run("/repo", "ci-verify/bead-abcdef1") is False
 
 
