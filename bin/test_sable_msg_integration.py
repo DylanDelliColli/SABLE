@@ -80,6 +80,13 @@ def _env():
     # freshly created isolated socket below, since ids restart from %0 per server).
     env.pop("TMUX_PANE", None)
     env.pop("TMUX", None)
+    # SABLE-qqcd: this suite may itself run inside a real SABLE worker pane
+    # (SABLE_WORKER_PANE=1, CLAUDE_AGENT_NAME=<lane>) -- exactly the ambient
+    # state resolve_from()'s default now keys on. Leaking it in here would make
+    # every --from-less send in this file silently resolve as a worker instead
+    # of hermetically testing what each fixture sets up.
+    env.pop("SABLE_WORKER_PANE", None)
+    env.pop("SABLE_BEAD", None)
     return env
 
 
@@ -982,6 +989,64 @@ def test_untagged_process_identity_falls_open_to_tag(tmux_socket):
     assert r.returncode == 0, r.stderr
     time.sleep(0.8)
     assert "NO-IDENTITY-FALLS-OPEN" in _capture(tmux_socket, "w")
+
+
+# --- worker sends must not wear the lane manager's identity (SABLE-qqcd) ----
+# sable-spawn-worker:696-697 stamps EVERY worker pane with CLAUDE_AGENT_NAME=
+# <lane manager> (deliberate, for push-attribution, SABLE-bldh.13) AND
+# SABLE_WORKER_PANE=1 (always, the SABLE-38zi disambiguator). Before this fix,
+# sable-msg's --from default consulted only CLAUDE_AGENT_NAME, so a worker's own
+# report was framed 'from=<manager>' -- indistinguishable from a real directive
+# from that manager. This drives the REAL resolve_from() path end-to-end
+# against a real tmux pane carrying the real @sable_bead tag (not a
+# reimplementation, per SABLE-f00o).
+
+def test_worker_pane_send_frames_as_worker_not_manager_lane_qqcd(tmux_socket):
+    # Manager pane (recipient), tagged @sable_role=tarzan -- a bash REPL
+    # stand-in with no CLAUDE_AGENT_NAME of its own, so the SABLE-to8m identity
+    # cross-check falls open and does not interfere with this test.
+    _tmux(tmux_socket, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+          "PS1='> ' bash --noprofile --norc")
+    time.sleep(0.3)
+    _tmux(tmux_socket, "set-option", "-p", "-t", "w", "@sable_role", "tarzan")
+    # Pin the manager pane's own id NOW -- _start_worker_pane below creates a
+    # second window that becomes the session's active one, so capturing by the
+    # bare session name "w" afterwards would capture the WRONG (worker) pane.
+    tarzan_pane = _tmux(tmux_socket, "list-panes", "-t", "w", "-F", "#{pane_id}").stdout.strip()
+
+    # A worker pane exactly as sable-spawn-worker tags it: @sable_role=worker,
+    # @sable_bead=<the dispatched bead>.
+    worker_pane = _start_worker_pane(tmux_socket, "w", "worker1", "SABLE-i8kv", "running")
+
+    # Simulate the worker's OWN sable-msg send: it runs inside worker_pane, so
+    # in real life TMUX_PANE is that pane's id in its process environment
+    # (ambient tmux behavior) alongside the CLAUDE_AGENT_NAME=tarzan +
+    # SABLE_WORKER_PANE=1 sable-spawn-worker:696-697 actually stamps there.
+    r = subprocess.run(
+        ["python3", str(BIN), "tarzan", "status: pushed and green"],
+        capture_output=True, text=True,
+        env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
+             "CLAUDE_AGENT_NAME": "tarzan", "SABLE_WORKER_PANE": "1",
+             "TMUX_PANE": worker_pane},
+    )
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.8)
+    pane = _capture(tmux_socket, tarzan_pane)
+    assert "⟦SABLE-MSG⟧ from=worker:SABLE-i8kv to=tarzan" in pane
+    assert "from=tarzan to=tarzan" not in pane
+
+    # Same run, a REAL manager pane's own send (CLAUDE_AGENT_NAME=tarzan, no
+    # SABLE_WORKER_PANE) must still read from=<manager> -- the regression guard.
+    r2 = subprocess.run(
+        ["python3", str(BIN), "tarzan", "manager directive: hold pushes"],
+        capture_output=True, text=True,
+        env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
+             "CLAUDE_AGENT_NAME": "tarzan"},
+    )
+    assert r2.returncode == 0, r2.stderr
+    time.sleep(0.8)
+    pane2 = _capture(tmux_socket, tarzan_pane)
+    assert "⟦SABLE-MSG⟧ from=tarzan to=tarzan" in pane2
 
 
 if __name__ == "__main__":

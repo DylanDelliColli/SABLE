@@ -748,6 +748,24 @@ def pane_role_tag(base: list[str], pane: str, run=None) -> str | None:
     return val if getattr(r, "returncode", 1) == 0 and val else None
 
 
+def pane_bead_tag(base: list[str], pane: str, run=None) -> str | None:
+    """The CACHED @sable_bead pane option stamped on a worker pane
+    (sable-spawn-worker's worker_pane_tags), or None when unset/unresolvable/no
+    pane given. Used by sable-msg (SABLE-qqcd) to label a WORKER's own sends as
+    'worker:<bead>' instead of the manager lane CLAUDE_AGENT_NAME carries for
+    push-attribution (SABLE-bldh.13) — same cache-not-authority caveat as
+    pane_role_tag applies."""
+    if not pane:
+        return None
+    run = run or _tmux_run
+    try:
+        r = run(base + ["show-options", "-p", "-v", "-t", pane, "@sable_bead"])
+    except Exception:
+        return None
+    val = (getattr(r, "stdout", "") or "").strip()
+    return val if getattr(r, "returncode", 1) == 0 and val else None
+
+
 def resolve_pane_identity(base: list[str], pane: str, run=None,
                           proc_root: str = "/proc") -> str | None:
     """Authoritative identity for a pane: the process env identity WINS over the
