@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tdd-gate.sh — Block bd close without test evidence
 # Checks the evidence file written by tdd-evidence.sh.
-# Escape hatch: add [no-test] to bead notes (single-close only).
+# Escape hatch: add [no-test] to bead notes OR description (single-close only).
 #
 # SABLE-h853 (2026-07-13): a worker's pre-push test run is a SCOPED run — the
 # bead's own test files plus tests importing the modules the diff touched,
@@ -92,14 +92,21 @@ ID_COUNT=$(echo "$BEAD_ARGS" | wc -w)
 # Single-bead close: check [no-test] escape hatch
 if [ "$ID_COUNT" -eq 1 ]; then
   BEAD_ID="$BEAD_ARGS"
-  # Check notes field for [no-test] marker via bd show --json
-  NOTES=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
+  # Check for the [no-test] marker in BOTH the notes AND the description field
+  # via bd show --json. SABLE-p84b: the marker is a natural fit for the
+  # description (where sable-spawn-worker's auto-prompt surfaces bead text), so
+  # a notes-only scan stranded docs/config beads whose worker put [no-test] in
+  # the description — the close was denied, then mis-reported as success
+  # (SABLE-u0c6), leaving the bead in_progress with a pushed branch. Scanning
+  # both fields is the cheapest, most forgiving fix.
+  MARKER_FIELDS=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 if isinstance(data, list) and len(data) > 0:
     print(data[0].get('notes', '') or '')
+    print(data[0].get('description', '') or '')
 " 2>/dev/null || echo "")
-  if echo "$NOTES" | grep -q '\[no-test\]'; then
+  if echo "$MARKER_FIELDS" | grep -q '\[no-test\]'; then
     exit 0  # Escape hatch: allow close without test evidence
   fi
 fi

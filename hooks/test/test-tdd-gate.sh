@@ -256,13 +256,91 @@ assert_hatch_used "single bead, multiple flags with flag-value IDs" \
 assert_hatch_skipped "two beads + flag value still routes to evidence check" \
   'bd close SABLE-stub SABLE-other --reason docs-only'
 
+# ---------- SABLE-p84b: [no-test] in DESCRIPTION (not notes) fires the hatch ----------
+# The escape hatch must scan BOTH the notes and the description field for the
+# [no-test] marker. A docs/config bead whose worker put [no-test] in the
+# DESCRIPTION (a natural place, and where sable-spawn-worker's auto-prompt
+# surfaces bead text) was stranded pre-fix: notes-only scan missed it, the
+# close was denied, then mis-reported as success (SABLE-u0c6). These tests use
+# dedicated stubs so `bd show --json` returns the marker in only one field.
+
+# Compact pass/fail helpers (also used by the sections below).
+pa_pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
+pa_fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
+
+P84B_DIR=$(mktemp -d)
+
+# Stub: [no-test] in DESCRIPTION only, notes empty.
+cat > "$P84B_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-desconly","notes":"","description":"Update the docs config. [no-test] pure docs change."}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$P84B_DIR/bd"
+
+run_gate_stub() { # <command> <stub_dir>
+  local command="$1" stub_dir="$2" sid
+  sid=$(fake_session)
+  rm -f "/tmp/tdd-evidence-${sid}"  # ensure no-evidence path
+  make_input "$command" "$sid" | env PATH="$stub_dir:$PATH" bash "$HOOK" 2>/dev/null
+}
+
+out=$(run_gate_stub 'bd close SABLE-desconly' "$P84B_DIR")
+if [ -z "$out" ]; then
+  pa_pass "p84b: [no-test] in DESCRIPTION only (no notes, no evidence) → hatch fires, close allowed"
+else
+  pa_fail "p84b: [no-test] in DESCRIPTION only → hatch fires" "expected silent allow; got: ${out:-<empty>}"
+fi
+
+# Stub: [no-test] in NOTES only, description empty — the pre-existing path must
+# keep working after the change.
+cat > "$P84B_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-notesonly","notes":"[no-test] docs bead","description":"Update the docs."}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+out=$(run_gate_stub 'bd close SABLE-notesonly' "$P84B_DIR")
+if [ -z "$out" ]; then
+  pa_pass "p84b: [no-test] in NOTES only still fires the hatch (no regression)"
+else
+  pa_fail "p84b: [no-test] in NOTES only still fires the hatch" "expected silent allow; got: ${out:-<empty>}"
+fi
+
+# Stub: NO marker in EITHER field, no evidence → must still DENY.
+cat > "$P84B_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-nomarker","notes":"a normal code bead","description":"Implement the feature; needs tests."}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+out=$(run_gate_stub 'bd close SABLE-nomarker' "$P84B_DIR")
+if echo "$out" | grep -q '"permissionDecision": "deny"'; then
+  pa_pass "p84b: no [no-test] marker in either field + no evidence → still DENIED"
+else
+  pa_fail "p84b: no marker in either field → still DENIED" "expected deny JSON; got: ${out:-<empty>}"
+fi
+rm -rf "$P84B_DIR"
+
 # ---------- SABLE-d72/lcs: per-agent evidence keying ----------
 # The gate must read the SAME per-agent key tdd-evidence.sh writes: with agent_id
 # present, /tmp/tdd-evidence-<sid>-<agent_id>; without, the session-global file.
 # A two-bead close routes past the [no-test] hatch to the evidence check, so we
 # exercise the keying directly. Worker A's evidence must NOT let worker B close.
-pa_pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
-pa_fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
+# (pa_pass/pa_fail are defined in the SABLE-p84b section above.)
 
 make_input_agent() {
   # $1 = command, $2 = session_id, $3 = agent_id
@@ -490,6 +568,60 @@ make_input 'bd close SABLE-stub SABLE-other' "" | env PATH="$STUB_DIR:$PATH" bas
 D4N_OUT=$(cat "$D4N_TMP"); rm -f "$D4N_TMP"
 if echo "$D4N_OUT" | grep -q '"permissionDecision": "deny"'; then pa_pass "D4 negative (absent): no evidence at the derived key -> reader DENIES"; else pa_fail "D4 negative (absent)" "got: ${D4N_OUT:-<empty>}"; fi
 rm -f "$D4N_KEY"
+
+# ---------- SABLE-p84b INTEGRATION: real bd, [no-test] in description ----------
+# Exercises the REAL bd --json read (notes + description) through the REAL gate
+# hook — no stub bd on PATH. Creates a scratch bead in the shared project Dolt
+# db with [no-test] in the DESCRIPTION and empty notes (--sandbox on every write
+# so this test never pushes to the shared remote), then closes it. With NO
+# session evidence file, the gate must ALLOW the single-bead close because the
+# description carries the marker. Keeps a deny leg: a scratch bead with NEITHER
+# marker NOR evidence must still be DENIED.
+
+if ! command -v bd >/dev/null 2>&1; then
+  echo "SKIP (integration): bd not found on PATH"
+else
+  # (a) allow leg — [no-test] lives in the DESCRIPTION only, notes empty.
+  P84B_INT_ID=$(bd create --sandbox \
+    --title="[int-test] tdd-gate p84b no-test-in-description scratch" \
+    --description="Update hooks/tdd-gate.sh docs. [no-test] pure docs/config change, no runtime surface." \
+    --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+
+  if [ -z "$P84B_INT_ID" ]; then
+    echo "SKIP (integration): could not create scratch bead — bd create output did not match ID pattern"
+  else
+    echo "Integration: created scratch bead $P84B_INT_ID"
+    P84B_INT_SID="tdd-gate-p84b-int-$$-$RANDOM"
+    rm -f "/tmp/tdd-evidence-${P84B_INT_SID}"  # ensure the no-evidence path
+    # Real gate, real bd (no stub on PATH): marker is only in the description.
+    P84B_INT_OUT=$(make_input "bd close $P84B_INT_ID" "$P84B_INT_SID" | bash "$HOOK" 2>/dev/null)
+    if [ -z "$P84B_INT_OUT" ]; then
+      pa_pass "p84b integration: real bd, [no-test] in description only, no evidence → gate ALLOWS close"
+    else
+      pa_fail "p84b integration: real bd, [no-test] in description only → gate ALLOWS close" "got: ${P84B_INT_OUT:-<empty>}"
+    fi
+    bd close "$P84B_INT_ID" --sandbox 2>/dev/null || true
+  fi
+
+  # (b) deny leg — real bead with NO marker in either field, no evidence.
+  P84B_DENY_ID=$(bd create --sandbox \
+    --title="[int-test] tdd-gate p84b no-marker scratch" \
+    --description="Implement a real code change in hooks/foo.sh; this needs tests." \
+    --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+  if [ -z "$P84B_DENY_ID" ]; then
+    echo "SKIP (integration): could not create deny-leg scratch bead"
+  else
+    P84B_DENY_SID="tdd-gate-p84b-deny-$$-$RANDOM"
+    rm -f "/tmp/tdd-evidence-${P84B_DENY_SID}"
+    P84B_DENY_OUT=$(make_input "bd close $P84B_DENY_ID" "$P84B_DENY_SID" | bash "$HOOK" 2>/dev/null)
+    if echo "$P84B_DENY_OUT" | grep -q '"permissionDecision": "deny"'; then
+      pa_pass "p84b integration: real bd, no marker in either field, no evidence → gate DENIES close"
+    else
+      pa_fail "p84b integration: real bd, no marker + no evidence → gate DENIES close" "got: ${P84B_DENY_OUT:-<empty>}"
+    fi
+    bd close "$P84B_DENY_ID" --sandbox 2>/dev/null || true
+  fi
+fi
 
 # ---------- Summary ----------
 
