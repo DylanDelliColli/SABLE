@@ -670,14 +670,15 @@ git update-ref refs/remotes/origin/wk-worker HEAD  # SABLE-ck05: mirror the trac
 cd - >/dev/null
 
 # Section-local bd stub: `list --status=in_progress --json` returns a real
-# in-progress bead claiming doc1.txt via WIP-CLAIMS — a file that's part of
-# the PHANTOM origin/main diff but NOT the worker's real diff. Overlap must
-# NOT fire on it once the base ref is fixed. `create` still logs to BD_LOG.
+# in-progress bead claiming doc1.txt via wip_claims metadata (SABLE-szd: NOT
+# notes) — a file that's part of the PHANTOM origin/main diff but NOT the
+# worker's real diff. Overlap must NOT fire on it once the base ref is fixed.
+# `create` still logs to BD_LOG.
 cat > "$STUB_DIR/bd" <<'EOF'
 #!/usr/bin/env bash
 if [ "$1" = "list" ]; then
   cat <<'JSON'
-[{"id": "SABLE-fakein", "title": "unrelated in-progress work", "assignee": "someone", "notes": "WIP-CLAIMS: doc1.txt"}]
+[{"id": "SABLE-fakein", "title": "unrelated in-progress work", "assignee": "someone", "metadata": {"wip_claims": "doc1.txt"}}]
 JSON
   exit 0
 fi

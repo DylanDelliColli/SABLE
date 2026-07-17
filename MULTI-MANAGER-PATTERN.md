@@ -424,13 +424,15 @@ git -C <worktree> rebase $SABLE_BASE_BRANCH
 
 ### 2. WIP file claims
 
-When a manager dispatches a worker for bead-X, a `PreToolUse:Agent` hook reads the bead's description, extracts file paths (which the Fresh Agent Test requires), and pre-writes them to bead-X's notes:
+When a manager dispatches a worker for bead-X, a `PreToolUse:Agent` hook reads the bead's description, extracts file paths (which the Fresh Agent Test requires), and pre-writes them to bead-X's `wip_claims` **metadata field** (a dedicated column, not notes — see below):
 
 ```
-WIP-CLAIMS: src/auth/foo.ts, tests/auth/foo.test.ts
+wip_claims: src/auth/foo.ts, tests/auth/foo.test.ts
 ```
 
 Claims exist *before* the worker starts editing, closing the dispatch-time race condition.
+
+**SABLE-szd:** claims live in metadata, not notes, deliberately. `bd update --notes` **overwrites** the whole notes field rather than appending, so any later notes write on the same bead — a manager's review-step note, a `[no-test]` annotation, anything — used to silently wipe the `WIP-CLAIMS:` line the dispatch hook had written, breaking overlap detection for that bead for the rest of its life. Metadata is a separate column `bd update --notes` never touches, so a claim survives regardless of what else updates notes afterward.
 
 A `PreToolUse:Edit|Write` hook reconciles emergent claims — if the worker modifies a file not declared in the bead description (legitimate scope creep), the file is appended to claims automatically.
 

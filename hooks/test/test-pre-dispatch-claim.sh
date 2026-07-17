@@ -3,7 +3,8 @@
 #
 # Verifies that:
 #   - Uppercase bead IDs (SABLE-xyz) in a dispatch prompt are extracted and
-#     produce WIP-CLAIMS notes on the bead. (SABLE-2ff: case-insensitive fix)
+#     produce a wip_claims metadata write on the bead. (SABLE-2ff:
+#     case-insensitive fix)
 #   - Lowercase bead IDs (bd-xyz legacy form) are also extracted.
 #   - When no bead ID is found, the hook exits silently (no bd show/update).
 #   - Worker/bare subagent context (agent_id present, non-manager or no
@@ -13,11 +14,17 @@
 #     own workers (SABLE-uz9.9 / SABLE-6zt). The relay "Dispatching-for:" parse
 #     is deleted: lane comes from identity, never from prompt text (SABLE-4it).
 #
+# SABLE-szd: claims live in the bead's `wip_claims` metadata field, NOT notes
+# — `bd update --notes` overwrites the whole field, so a later, unrelated
+# notes write (e.g. a manager's review-step note) used to clobber the claim
+# silently. Metadata is a dedicated column bd never touches on a --notes
+# write.
+#
 # Unit tests stub `bd` on PATH and point SABLE_MODE_STATE to an
 # execution-mode fixture so governance is always active for the manager path.
 #
 # Integration tests use a real bd sandbox (bd init in a temp dir) to verify
-# end-to-end behavior including the actual WIP-CLAIMS note landing.
+# end-to-end behavior including the actual wip_claims metadata landing.
 #
 # Run with:
 #   bash hooks/test/test-pre-dispatch-claim.sh
@@ -402,22 +409,22 @@ else
           SABLE_MODE_STATE="$EXEC_MODE_FILE" \
           bash "$HOOK" 2>/dev/null
 
-    # Check that WIP-CLAIMS landed in the bead notes
-    NOTES=$(bd show "$SCRATCH_ID" --json 2>/dev/null | python3 -c "
+    # Check that wip_claims landed in the bead's metadata (SABLE-szd)
+    CLAIMS=$(bd show "$SCRATCH_ID" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
     if isinstance(d, list) and d:
-        print(d[0].get('notes', '') or '')
+        print((d[0].get('metadata', {}) or {}).get('wip_claims', '') or '')
 except Exception:
     pass
 " 2>/dev/null || echo "")
 
-    if echo "$NOTES" | grep -q 'WIP-CLAIMS'; then
-      pass "integration: bead $SCRATCH_ID has WIP-CLAIMS in notes after hook run"
+    if [ -n "$CLAIMS" ]; then
+      pass "integration: bead $SCRATCH_ID has wip_claims metadata after hook run"
     else
-      fail "integration: bead $SCRATCH_ID has WIP-CLAIMS in notes after hook run" \
-           "notes: '$NOTES'"
+      fail "integration: bead $SCRATCH_ID has wip_claims metadata after hook run" \
+           "metadata: '$CLAIMS'"
     fi
 
     # Clean up: close the scratch bead
@@ -445,21 +452,21 @@ except Exception:
           SABLE_MODE_STATE="$EXEC_MODE_FILE" \
           bash "$HOOK" 2>/dev/null
 
-    NOTES2=$(bd show "$SCRATCH_ID2" --json 2>/dev/null | python3 -c "
+    CLAIMS2=$(bd show "$SCRATCH_ID2" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
     if isinstance(d, list) and d:
-        print(d[0].get('notes', '') or '')
+        print((d[0].get('metadata', {}) or {}).get('wip_claims', '') or '')
 except Exception:
     pass
 " 2>/dev/null || echo "")
 
-    if echo "$NOTES2" | grep -q 'WIP-CLAIMS'; then
-      pass "integration: manager-subagent dispatch lands WIP-CLAIMS on $SCRATCH_ID2 (real bd)"
+    if [ -n "$CLAIMS2" ]; then
+      pass "integration: manager-subagent dispatch lands wip_claims metadata on $SCRATCH_ID2 (real bd)"
     else
-      fail "integration: manager-subagent dispatch lands WIP-CLAIMS on $SCRATCH_ID2 (real bd)" \
-           "notes: '$NOTES2'"
+      fail "integration: manager-subagent dispatch lands wip_claims metadata on $SCRATCH_ID2 (real bd)" \
+           "metadata: '$CLAIMS2'"
     fi
 
     bd close "$SCRATCH_ID2" --sandbox 2>/dev/null || true
