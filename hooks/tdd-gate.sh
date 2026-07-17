@@ -132,6 +132,16 @@ fi
 # additive: it only fires when the exact-key evidence file above was empty,
 # so it cannot weaken the existing per-agent gate.
 if [ -n "$BEAD_ARGS" ]; then
+  # SABLE-yh1o: derive the glob base via the SAME lib-evidence-key.sh helper
+  # the exact-key check above uses, instead of interpolating $SESSION_ID
+  # directly. An empty SESSION_ID (the absent-session case jfg6.4 hardened
+  # the exact-key path against) previously expanded the raw glob to
+  # /tmp/tdd-evidence-* — every session's evidence on the box — so a
+  # companion-declared bead in an absent-session close could be satisfied
+  # by an unrelated session's REPO= line. Routing through sable_evidence_key
+  # gives an absent session its own deterministic ppid-scoped base, matching
+  # only this session's (and its agent variants') evidence files.
+  _companion_evidence_base=$(sable_evidence_key "$SESSION_ID" "")
   for _bid in $BEAD_ARGS; do
     _companion=$(bd show "$_bid" --json 2>/dev/null | python3 -c "
 import json, re, sys
@@ -145,7 +155,7 @@ notes = data[0].get('notes', '') or ''
 m = re.search(r'Companion repo:\s*(\S+)', notes)
 print(m.group(1) if m else '')
 " 2>/dev/null) || _companion=""
-    if [ -n "$_companion" ] && grep -qF "REPO=${_companion}" /tmp/tdd-evidence-"${SESSION_ID}"* 2>/dev/null; then
+    if [ -n "$_companion" ] && grep -qF "REPO=${_companion}" "${_companion_evidence_base}"* 2>/dev/null; then
       exit 0
     fi
   done
