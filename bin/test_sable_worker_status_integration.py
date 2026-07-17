@@ -5,6 +5,7 @@ Isolated socket (-L). Proves: worker panes are discovered by their @sable_role/
 @sable_bead/@sable_status user-options, a done worker is reported done, and
 --reap kills ONLY the done worker pane (the running one survives).
 """
+import os
 import shutil
 import subprocess
 import time
@@ -17,6 +18,40 @@ BIN = Path(__file__).resolve().parent / "sable-worker-status"
 HAVE_TMUX = shutil.which("tmux") is not None
 pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="tmux not installed")
 
+# SABLE-517s: a tmux session's panes inherit the tmux SERVER's global
+# environment, captured from the env of whichever client call first starts
+# the server on this socket (typically this test file's first _tmux() call).
+# When the test runner ITSELF is a live SABLE pane (CLAUDE_AGENT_NAME set,
+# e.g. a manager running its own test suite), that identity leaks into every
+# plain bash pane these tests spawn -- and pane_is_live_nonworker_agent (see
+# sable_pane_lib.py) then reads it back via /proc/<pid>/environ and spares
+# the pane from --reap, since it looks like a live non-worker agent. Scrub
+# the ambient SABLE identity vars from every tmux client call's env so panes
+# start clean regardless of what agent is running the test; tests that need
+# a pane to carry a specific identity stamp it explicitly via per-pane -e
+# (see _split_pane below), which always wins over this scrubbed baseline.
+#
+# TMUX/TMUX_PANE leak the same way into --reap SUBPROCESS envs (not just
+# panes): resolve_session()'s calling_pane_session() (sable_pane_lib.py)
+# reads TMUX_PANE from the CLI process's own env and looks that pane id up
+# ON THE TEST'S ISOLATED SOCKET. When the outer test runner is itself inside
+# tmux and a --reap subprocess inherits its TMUX_PANE, that id can coincide
+# with an unrelated pane on the fresh test socket (pane ids are small and
+# sequential per-server), hijacking session resolution to the wrong repo's
+# fleet. Only scrub these where a test deliberately exercises cwd/pane-derived
+# resolution by omitting SABLE_TMUX_SESSION -- when SABLE_TMUX_SESSION is
+# pinned it wins first in resolve_session()'s precedence and TMUX_PANE is
+# never consulted, so leaving it be there is harmless and documents that.
+_AMBIENT_SABLE_VARS = ("CLAUDE_AGENT_NAME", "SABLE_WORKER_PANE", "SABLE_TMUX_SESSION",
+                        "TMUX", "TMUX_PANE")
+
+
+def _scrubbed_env():
+    env = dict(os.environ)
+    for var in _AMBIENT_SABLE_VARS:
+        env.pop(var, None)
+    return env
+
 
 @pytest.fixture()
 def sock():
@@ -28,7 +63,8 @@ def sock():
 
 def _tmux(s, *args, check=True):
     return subprocess.run(["tmux", "-L", s, *args],
-                          capture_output=True, text=True, check=check)
+                          capture_output=True, text=True, check=check,
+                          env=_scrubbed_env())
 
 
 def _tag(s, target, role, bead, status):
@@ -155,9 +191,12 @@ def test_reap_scoped_to_caller_repo(sock, tmp_path):
         _tag(sock, f"{sess}:0.0", "worker", f"bead-{name}", "done")
         sessions[name] = (repo, sess)
 
-    env = {**os.environ, "SABLE_TMUX_SOCKET": sock, "SABLE_STATUS_SAMPLE_INTERVAL": "0.1"}
-    env.pop("SABLE_TMUX_SESSION", None)
-    env.pop("CLAUDE_AGENT_NAME", None)  # SABLE-dcw2: fleet-wide over lane-less panes
+    # _scrubbed_env(), not raw os.environ: this subprocess deliberately omits
+    # SABLE_TMUX_SESSION to exercise cwd/pane-derived resolution, so ambient
+    # TMUX/TMUX_PANE must not leak in either -- see the SABLE-517s note above
+    # _AMBIENT_SABLE_VARS for why a leaked TMUX_PANE can hijack resolution to
+    # the wrong repo's session on the test's isolated socket.
+    env = {**_scrubbed_env(), "SABLE_TMUX_SOCKET": sock, "SABLE_STATUS_SAMPLE_INTERVAL": "0.1"}
     r = subprocess.run(["python3", str(BIN), "--reap"], capture_output=True,
                        text=True, env=env, cwd=sessions["alpha"][0])
     assert r.returncode == 0, r.stderr
@@ -534,29 +573,44 @@ def test_dialog_probe_json_carries_stalls_and_workers(sock):
     assert payload["dialog_stalls"][0]["class"] == "manager"
 
 
-# --- reaper liveness guard: a resumed cockpit survives --reap (SABLE-to8m) ----
-# Resuming the lincoln conversation inside a finished worker window left the
-# cockpit carrying the worker's stale @sable_status=done and thus reap-eligible.
-# The @sable_* tags are mutable and lie; the pane's live process env
-# (CLAUDE_AGENT_NAME, stamped via -e like the real spawn tooling) does not. The
-# reaper now consults that authority and refuses to kill a pane whose live
-# process is the operator cockpit.
+# --- reaper liveness guard: a live agent we didn't spawn as a worker survives
+# --reap (SABLE-to8m, generalized by SABLE-k8o5) ------------------------------
+# Resuming an interactive claude inside a finished worker window left it carrying
+# the worker's stale @sable_status=done and thus reap-eligible. The @sable_* tags
+# are mutable and lie; the pane's live process env does not. The reaper consults
+# that authority: it refuses to kill a pane whose live process is a SABLE agent it
+# did not spawn as a worker (no SABLE_WORKER_PANE marker) — the operator cockpit
+# OR a resumed manager. Both env vars are stamped per-pane via tmux -e so the
+# result is hermetic regardless of the ambient SABLE_WORKER_PANE/CLAUDE_AGENT_NAME
+# of the pane running the test (SABLE-k8o5; -e VAR= overrides an inherited value).
+
+def _split_pane(sock, *env_pairs):
+    """Split window `w`, stamping each 'K=V' pair as a per-pane tmux -e, and
+    return the new pane's id. Per-pane -e (never session-wide new-session -e,
+    which would leak into every pane) keeps each pane's identity isolated."""
+    e_args = []
+    for pair in env_pairs:
+        e_args += ["-e", pair]
+    return _tmux(sock, "split-window", "-t", "w", "-P", "-F", "#{pane_id}",
+                 *e_args, "bash --noprofile --norc").stdout.strip()
+
 
 def test_reap_spares_pane_whose_live_process_is_the_cockpit(sock):
-    # %0: a genuinely done worker (no cockpit identity) -> reaped. %1: a resumed
-    # cockpit — its PANE PROCESS identity is 'lincoln' (per-pane tmux -e), but it
-    # still wears a stale @sable_role=worker / @sable_status=done from the worker
-    # that previously owned the window. --reap must kill ONLY the real worker and
-    # spare the cockpit. (-e goes on split-window, NOT new-session: a session-wide
-    # -e would leak lincoln into BOTH panes and protect the real worker too.)
-    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+    # A real done worker (lane identity + worker marker) -> reaped. A resumed
+    # cockpit — process identity 'lincoln', worker marker explicitly emptied so an
+    # ambient SABLE_WORKER_PANE can't leak in — still wears a stale
+    # @sable_role=worker / @sable_status=done. --reap kills ONLY the real worker.
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
           "bash --noprofile --norc")
-    time.sleep(0.4)
-    _tag(sock, "w.0", "worker", "bead-real", "done")
-    _tmux(sock, "split-window", "-t", "w", "-e", "CLAUDE_AGENT_NAME=lincoln",
-          "bash --noprofile --norc")
-    time.sleep(0.4)
-    _tag(sock, "w.1", "worker", "bead-stale", "done")   # poisoned/leftover tags
+    time.sleep(0.3)
+    placeholder = _tmux(sock, "list-panes", "-t", "w", "-F", "#{pane_id}").stdout.strip()
+    worker = _split_pane(sock, "CLAUDE_AGENT_NAME=optimus", "SABLE_WORKER_PANE=1")
+    cockpit = _split_pane(sock, "CLAUDE_AGENT_NAME=lincoln", "SABLE_WORKER_PANE=")
+    time.sleep(0.3)
+    _tag(sock, worker, "worker", "bead-real", "done")
+    _tag(sock, cockpit, "worker", "bead-stale", "done")   # poisoned/leftover tags
+    _tmux(sock, "kill-pane", "-t", placeholder)           # drop the ambient-env placeholder
+    time.sleep(0.3)
     assert _pane_count(sock) == 2
 
     r = _run(sock, "--reap")
@@ -567,6 +621,38 @@ def test_reap_spares_pane_whose_live_process_is_the_cockpit(sock):
     assert "bead-stale" in survivors      # cockpit pane spared
     assert "bead-real" not in survivors   # genuine done worker reaped
     assert "NOT reaping" in r.stderr and "cockpit" in r.stderr
+
+
+def test_reap_spares_pane_whose_live_process_is_a_resumed_manager(sock):
+    # SABLE-k8o5: the generalization. `worker` is a genuine done worker OWNED by
+    # optimus (CLAUDE_AGENT_NAME=optimus AND the SABLE_WORKER_PANE=1 spawn marker).
+    # `manager` is the optimus MANAGER resumed into a sibling finished window: the
+    # IDENTICAL CLAUDE_AGENT_NAME=optimus, but NO worker marker (emptied via -e).
+    # Their identities match exactly; only the worker marker differs. --reap must
+    # kill the worker and spare the live manager — proving the guard keys on the
+    # marker, not a hardcoded 'lincoln'/agent-name list, and never over-blocks a
+    # real done worker that shares its manager's lane name.
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+          "bash --noprofile --norc")
+    time.sleep(0.3)
+    placeholder = _tmux(sock, "list-panes", "-t", "w", "-F", "#{pane_id}").stdout.strip()
+    worker = _split_pane(sock, "CLAUDE_AGENT_NAME=optimus", "SABLE_WORKER_PANE=1")
+    manager = _split_pane(sock, "CLAUDE_AGENT_NAME=optimus", "SABLE_WORKER_PANE=")
+    time.sleep(0.3)
+    _tag(sock, worker, "worker", "bead-real", "done")
+    _tag(sock, manager, "worker", "bead-stale", "done")   # stale/leftover worker tags
+    _tmux(sock, "kill-pane", "-t", placeholder)
+    time.sleep(0.3)
+    assert _pane_count(sock) == 2
+
+    r = _run(sock, "--reap")
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.4)
+    assert _pane_count(sock) == 1  # the manager survives; the real worker is reaped
+    survivors = _tmux(sock, "list-panes", "-a", "-F", "#{@sable_bead}").stdout
+    assert "bead-stale" in survivors      # resumed manager spared
+    assert "bead-real" not in survivors   # genuine done worker (same lane) reaped
+    assert "NOT reaping" in r.stderr and "optimus" in r.stderr and "manager" in r.stderr
 
 
 if __name__ == "__main__":

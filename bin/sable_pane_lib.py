@@ -772,6 +772,34 @@ def tag_is_poisoned(base: list[str], pane: str, claimed_role: str, run=None,
     return env_id is not None and env_id != claimed_role
 
 
+def pane_is_live_nonworker_agent(base: list[str], pane: str, run=None,
+                                 proc_root: str = "/proc") -> bool:
+    """True when the pane's LIVE process is an interactive SABLE agent the reaper
+    did NOT spawn as a worker — a resumed operator cockpit ('lincoln') or a
+    resumed manager ('optimus'/'tarzan'/'chuck') now occupying a window whose
+    @sable_* tags are a stale leftover from the worker that finished there
+    (SABLE-to8m, generalized by SABLE-k8o5). Such a pane must never be reaped:
+    killing it destroys a live operator or manager session.
+
+    The authority is the process env, never the mutable tags:
+      * CLAUDE_AGENT_NAME present  -> an interactive agent is running in the pane
+      * SABLE_WORKER_PANE unset    -> it is NOT a worker
+
+    SABLE_WORKER_PANE is the disambiguator, not the name: sable-spawn-worker
+    stamps a worker's CLAUDE_AGENT_NAME to its OWNING MANAGER's lane
+    (worker_env_args), so a genuine done worker and a resumed manager can carry
+    the IDENTICAL CLAUDE_AGENT_NAME (e.g. 'optimus') — only the worker marker
+    tells them apart (the same SABLE_WORKER_PANE marker SABLE-38zi relies on).
+    Returns False (reap proceeds) for a genuine done worker (SABLE_WORKER_PANE=1)
+    and for a bare shell / pane SABLE did not spawn (no CLAUDE_AGENT_NAME) — the
+    latter fails OPEN to the pre-authority tag-only reaping behavior."""
+    pid = pane_pid(base, pane, run=run)
+    if not pid:
+        return False
+    env = _read_environ(pid, proc_root=proc_root)
+    return bool(env.get("CLAUDE_AGENT_NAME")) and not env.get("SABLE_WORKER_PANE")
+
+
 # --- Dispatch throttle knob (SABLE-mmdt), shared by sable-spawn-worker (the
 # refusal) and sable-view (the cockpit count-vs-cap line) so the default can
 # never drift between the gate and its observability surface.

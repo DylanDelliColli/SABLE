@@ -91,8 +91,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
     SessionCollision, capture_pane, overlay_evidence, overlay_posture,
-    pane_process_identity, pane_ready, pane_working, resolve_session,
-    session_limit_reset)
+    pane_is_live_nonworker_agent, pane_process_identity, pane_ready,
+    pane_working, resolve_session, session_limit_reset)
 
 WORKER_ROLE_PREFIX = "worker"
 # Tab-delimited (SABLE-exab): a space-joined format collapses an EMPTY field
@@ -608,34 +608,44 @@ def filter_protected(panes: list[str], socket: str | None, run=_runner) -> list[
     return [p for p in panes if pane_location(p, socket, run=run) not in protected]
 
 
-# SABLE-to8m: the operator/cockpit identity that must NEVER be reaped, even when
-# the pane it now occupies still carries a stale @sable_status=done from the
-# worker that previously lived in that window. Resuming the lincoln conversation
-# inside a finished worker window left the cockpit reap-eligible; the @sable_*
-# tags are mutable and lied, but the pane's live process env (CLAUDE_AGENT_NAME)
-# does not. A finished worker's process identity is its manager LANE
-# (optimus/tarzan/chuck), never lincoln, so this guard never blocks a legitimate
-# reap — it only refuses to kill an interactive claude the reaper did not spawn.
+# SABLE-to8m/SABLE-k8o5: the live-agent identity that must NEVER be reaped, even
+# when the pane it now occupies still carries a stale @sable_status=done from the
+# worker that previously lived in that window. Resuming an interactive claude —
+# the operator cockpit ('lincoln') OR a manager (optimus/tarzan/chuck) — inside a
+# finished worker window left it reap-eligible; the @sable_* tags are mutable and
+# lied, but the pane's live process env does not. A genuine done worker carries
+# SABLE_WORKER_PANE=1 (stamped at spawn) and its CLAUDE_AGENT_NAME is its OWNING
+# MANAGER's lane, so the lane name ALONE cannot tell a done worker from a resumed
+# manager (both read e.g. 'optimus'); the worker marker is the disambiguator. So
+# this guard never blocks a legitimate reap — it only refuses to kill an
+# interactive claude the reaper did not spawn as a worker.
 COCKPIT_IDENTITY = "lincoln"
 
 
-def filter_live_cockpit(panes: list[str], socket: str | None, run=None,
-                        proc_root: str = "/proc") -> list[str]:
-    """Drop any reap candidate whose LIVE process identity is the operator
-    cockpit (SABLE-to8m). The @sable_status=done tag driving the kill is mutable
-    and can be a leftover from a prior worker; the authoritative process env
-    proves an interactive cockpit claude is running in the pane NOW, and killing
-    it would destroy the operator's session. Flags each skipped pane loudly."""
+def filter_live_agents(panes: list[str], socket: str | None, run=None,
+                       proc_root: str = "/proc") -> list[str]:
+    """Drop any reap candidate whose LIVE process is an interactive SABLE agent
+    the reaper did not spawn as a worker — a resumed operator cockpit OR a resumed
+    manager (SABLE-to8m, generalized by SABLE-k8o5). The @sable_status=done tag
+    driving the kill is mutable and can be a leftover from a prior worker; the
+    authoritative process env (see pane_is_live_nonworker_agent) proves an
+    interactive claude the reaper did not spawn is running in the pane NOW, and
+    killing it would destroy a live operator/manager session. A genuine done
+    worker (SABLE_WORKER_PANE=1) and a pane SABLE did not spawn (no
+    CLAUDE_AGENT_NAME -> fail-open) are still reaped. Flags each spared pane
+    loudly by its live identity."""
     base = tmux_base(socket)
     kept: list[str] = []
     for pane in panes:
-        ident = pane_process_identity(base, pane, run=run, proc_root=proc_root)
-        if ident == COCKPIT_IDENTITY:
+        if pane_is_live_nonworker_agent(base, pane, run=run, proc_root=proc_root):
+            ident = pane_process_identity(base, pane, run=run, proc_root=proc_root)
+            kind = ("the operator cockpit" if ident == COCKPIT_IDENTITY
+                    else "a resumed manager/agent session")
             sys.stderr.write(
                 f"sable-worker-status: NOT reaping {pane} — its live process "
-                f"identity is '{ident}' (the operator cockpit), not the worker "
-                f"its stale @sable_status=done tag claims. A moved/resumed session "
-                f"must be re-registered (sable-relink), never reaped (SABLE-to8m).\n")
+                f"identity is '{ident}' ({kind}), not the worker its stale "
+                f"@sable_status=done tag claims. A moved/resumed session must be "
+                f"re-registered (sable-relink), never reaped (SABLE-to8m/k8o5).\n")
             continue
         kept.append(pane)
     return kept
@@ -752,9 +762,11 @@ def main(argv: list[str] | None = None) -> int:
         doomed = reaping_decision(workers)
         protected_count = len(doomed)
         doomed = filter_protected(doomed, socket)
-        # SABLE-to8m: after the attached-client guard, drop any candidate whose
-        # live process is the operator cockpit resumed into a stale-done window.
-        doomed = filter_live_cockpit(doomed, socket)
+        # SABLE-to8m/k8o5: after the attached-client guard, drop any candidate
+        # whose live process is an interactive agent (cockpit OR manager) resumed
+        # into a stale-done window — never kill a live claude we didn't spawn as a
+        # worker.
+        doomed = filter_live_agents(doomed, socket)
         protected_count -= len(doomed)
         flagged = reap(doomed, socket)
         note = f", {len(flagged)} had pending input cleared+flagged" if flagged else ""

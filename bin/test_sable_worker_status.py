@@ -890,11 +890,16 @@ def test_flag_dialog_stalls_never_captures_done_panes():
     assert sws.flag_dialog_stalls(panes, None, capture=fake_capture) == []
 
 
-# --- reaper liveness guard: never reap a resumed cockpit (SABLE-to8m) ---------
-# filter_live_cockpit drops any reap candidate whose LIVE process identity is the
-# operator cockpit ('lincoln'), even though its @sable_status=done tag (a stale
-# leftover from the worker that previously owned the window) makes it look
-# reap-eligible. Driven with an injected tmux runner + fake /proc root.
+# --- reaper liveness guard: never reap a live agent we didn't spawn as a worker
+# (SABLE-to8m, generalized by SABLE-k8o5) -------------------------------------
+# filter_live_agents drops any reap candidate whose LIVE process is an interactive
+# claude the reaper did not spawn as a worker — the operator cockpit ('lincoln')
+# OR a resumed manager (optimus/tarzan/chuck) — even though its @sable_status=done
+# tag (a stale leftover from the worker that previously owned the window) makes it
+# look reap-eligible. A genuine done worker carries SABLE_WORKER_PANE=1 and its
+# CLAUDE_AGENT_NAME is its owning-manager lane, so the name alone can't tell a done
+# worker from a resumed manager — the worker marker is the disambiguator. Driven
+# with an injected tmux runner + fake /proc root.
 
 class _CP:
     def __init__(self, stdout="", returncode=0):
@@ -913,42 +918,67 @@ def _fake_pid_runner(pane_to_pid):
     return run
 
 
-def _proc_root(tmp_path, pid_to_identity):
-    for pid, identity in pid_to_identity.items():
+def _proc_root(tmp_path, pid_to_env):
+    """Build a fake /proc. Each value is either an env dict, a bare string
+    (shorthand for CLAUDE_AGENT_NAME=<that> with NO worker marker — i.e. a
+    resumed cockpit/manager), or None (no agent env at all — a bare shell)."""
+    for pid, spec in pid_to_env.items():
         d = tmp_path / str(pid)
         d.mkdir()
-        entries = [b"PATH=/usr/bin"]
-        if identity is not None:
-            entries.insert(0, b"CLAUDE_AGENT_NAME=" + identity.encode())
+        env = {"PATH": "/usr/bin"}
+        if isinstance(spec, str):
+            env["CLAUDE_AGENT_NAME"] = spec
+        elif isinstance(spec, dict):
+            env.update(spec)
+        entries = [f"{k}={v}".encode() for k, v in env.items()]
         (d / "environ").write_bytes(b"\x00".join(entries) + b"\x00")
     return str(tmp_path)
 
 
-def test_filter_live_cockpit_drops_resumed_cockpit_pane(tmp_path):
-    # %1 is a genuinely-done worker (process identity = its lane 'optimus');
-    # %2 is a finished worker window the cockpit was resumed into (identity
-    # 'lincoln') that still carries a stale @sable_status=done. Only %1 survives
-    # as reap-eligible; the cockpit is protected.
+def _worker(lane):
+    """A genuinely-spawned worker's env: its OWNING MANAGER's lane as identity
+    plus the SABLE_WORKER_PANE=1 spawn marker (sable-spawn-worker worker_env_args)."""
+    return {"CLAUDE_AGENT_NAME": lane, "SABLE_WORKER_PANE": "1"}
+
+
+def test_filter_live_agents_drops_resumed_cockpit_pane(tmp_path):
+    # %1 is a genuinely-done worker owned by optimus (lane identity + worker
+    # marker); %2 is a finished worker window the cockpit was resumed into
+    # (identity 'lincoln', NO worker marker) still carrying a stale
+    # @sable_status=done. Only %1 survives as reap-eligible; the cockpit is spared.
     run = _fake_pid_runner({"%1": 100, "%2": 200})
-    proc = _proc_root(tmp_path, {100: "optimus", 200: "lincoln"})
-    kept = sws.filter_live_cockpit(["%1", "%2"], None, run=run, proc_root=proc)
+    proc = _proc_root(tmp_path, {100: _worker("optimus"), 200: "lincoln"})
+    kept = sws.filter_live_agents(["%1", "%2"], None, run=run, proc_root=proc)
     assert kept == ["%1"]
 
 
-def test_filter_live_cockpit_keeps_normal_workers(tmp_path):
-    # No cockpit among the candidates -> nothing filtered (never blocks a
-    # legitimate reap; a done worker's identity is its lane, never lincoln).
+def test_filter_live_agents_drops_resumed_manager_pane(tmp_path):
+    # SABLE-k8o5: %1 is a genuine done worker OWNED by optimus (CLAUDE_AGENT_NAME
+    # 'optimus' + worker marker); %2 is the optimus MANAGER resumed into a sibling
+    # finished worker window — the SAME CLAUDE_AGENT_NAME 'optimus', but NO worker
+    # marker. Identity alone can't separate them; the worker marker does. The
+    # manager must be spared while the real worker stays reap-eligible.
+    run = _fake_pid_runner({"%1": 100, "%2": 200})
+    proc = _proc_root(tmp_path, {100: _worker("optimus"), 200: "optimus"})
+    kept = sws.filter_live_agents(["%1", "%2"], None, run=run, proc_root=proc)
+    assert kept == ["%1"]
+
+
+def test_filter_live_agents_keeps_normal_workers(tmp_path):
+    # All candidates are genuine done workers (lane identity + worker marker) ->
+    # nothing filtered; a legitimate reap is never blocked.
     run = _fake_pid_runner({"%1": 100, "%2": 101})
-    proc = _proc_root(tmp_path, {100: "optimus", 101: "tarzan"})
-    assert sws.filter_live_cockpit(["%1", "%2"], None, run=run, proc_root=proc) == ["%1", "%2"]
+    proc = _proc_root(tmp_path, {100: _worker("optimus"), 101: _worker("tarzan")})
+    assert sws.filter_live_agents(["%1", "%2"], None, run=run, proc_root=proc) == ["%1", "%2"]
 
 
-def test_filter_live_cockpit_keeps_pane_with_no_process_identity(tmp_path):
-    # A pane whose process carries no CLAUDE_AGENT_NAME has no authority to be
-    # treated as the cockpit -> reap proceeds as before (fail-open).
+def test_filter_live_agents_keeps_pane_with_no_process_identity(tmp_path):
+    # A pane whose process carries no CLAUDE_AGENT_NAME (a bare shell / a pane
+    # SABLE did not spawn) has no authority to be spared -> reap proceeds as
+    # before (fail-open).
     run = _fake_pid_runner({"%1": 100})
     proc = _proc_root(tmp_path, {100: None})
-    assert sws.filter_live_cockpit(["%1"], None, run=run, proc_root=proc) == ["%1"]
+    assert sws.filter_live_agents(["%1"], None, run=run, proc_root=proc) == ["%1"]
 
 
 # --- SABLE-tz9f: the SABLE-axp0 dialog/overlay probe false-positived HEALTHY
