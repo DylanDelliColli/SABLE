@@ -3,7 +3,8 @@
 # Trigger: PreToolUse:Agent | Timeout: 5000ms
 #
 # Reads the bead description (extracts bead ID from dispatch prompt), parses
-# referenced file paths, and writes them to bead notes as WIP-CLAIMS:<paths>.
+# referenced file paths, and writes them to the bead's `wip_claims` metadata
+# field as a comma-separated list (SABLE-szd: NOT notes — see below).
 #
 # Closes the dispatch-time race condition where worker B dispatches before
 # worker A has started editing — claims now exist at dispatch.
@@ -76,28 +77,25 @@ print(','.join(sorted(paths)))
 
   [ -z "$FILES" ] && continue
 
-  # Read current notes; only append claim if not already present
-  CURRENT_NOTES=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
+  # SABLE-szd: claims live in the dedicated `wip_claims` metadata field, NOT
+  # bead notes. `bd update --notes` OVERWRITES the whole notes field rather
+  # than appending — any later notes update from anywhere in a bead's life
+  # (e.g. a manager's routine review-notes write) silently wiped this claim
+  # line, breaking the overlap detection in pre-dispatch-overlap.sh and
+  # post-push-merge-notify.sh for that bead. Metadata is a separate column
+  # bd never touches on a --notes write, so it survives regardless of what
+  # else updates notes afterward.
+  CURRENT_CLAIMS=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     data = json.load(sys.stdin)
     if isinstance(data, list) and data:
-        print(data[0].get('notes', '') or '')
+        print((data[0].get('metadata', {}) or {}).get('wip_claims', '') or '')
 except Exception:
     pass
 " 2>/dev/null || echo "")
 
-  if echo "$CURRENT_NOTES" | grep -q "^WIP-CLAIMS:"; then
-    continue  # claims already established
-  fi
-
-  CLAIM_LINE="WIP-CLAIMS: $FILES"
-  if [ -n "$CURRENT_NOTES" ]; then
-    NEW_NOTES="${CURRENT_NOTES}
-${CLAIM_LINE}"
-  else
-    NEW_NOTES="$CLAIM_LINE"
-  fi
+  [ -n "$CURRENT_CLAIMS" ] && continue  # claims already established
 
   # SABLE-lfql: --sandbox disables bd's Dolt auto-push (SABLE-rq9k). bd pushes
   # to the shared Dolt remote on EVERY mutating write (create/update/close) by
@@ -106,7 +104,7 @@ ${CLAIM_LINE}"
   # violation behind the 2026-07-09 cross-fleet corruption incident.
   # --sandbox disables the push WITHOUT blocking the write (unlike --readonly,
   # which would drop it); Chuck's batched pull+push carries it later.
-  bd update "$BEAD_ID" --sandbox --notes "$NEW_NOTES" >/dev/null 2>&1 || true
+  bd update "$BEAD_ID" --sandbox --set-metadata "wip_claims=$FILES" >/dev/null 2>&1 || true
 done
 
 exit 0

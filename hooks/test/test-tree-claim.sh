@@ -161,6 +161,29 @@ CF="$(claim_file "$SCRATCH")"
 CLAIM_AGENT="$(awk '{print $3}' "$CF" 2>/dev/null)"
 if [ "$CLAIM_AGENT" = "-" ]; then pass "unnamed claim: third field falls back to '-'"; else fail "unnamed claim: third field falls back to '-'" "got: '$CLAIM_AGENT' (file: $(cat "$CF" 2>/dev/null))"; fi
 
+echo "--- Unit: SABLE-hccq — session_id falls back to CLAUDE_CODE_SESSION_ID when JSON omits it ---"
+
+# The hook-input JSON almost always carries session_id, but the fallback
+# order matters: CLAUDE_CODE_SESSION_ID is the env var Claude Code actually
+# exports (CLAUDE_SESSION_ID is checked first for any environment that does
+# set it, but is unset in practice). If a hook invocation ever lacks
+# session_id in its JSON, it must still resolve the SAME identity a later
+# 'sable-claim release' call (env-only, no JSON) would see.
+clear_claim "$SCRATCH"
+JSON_NO_SID=$(python3 -c "
+import json
+print(json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'git add .'}, 'cwd': '$SCRATCH'}))
+")
+OUT=$(
+  unset CLAUDE_SESSION_ID
+  CLAUDE_CODE_SESSION_ID="sess-from-code-env" bash "$HOOK" <<< "$JSON_NO_SID" 2>/dev/null
+)
+if [ "$(claim_session "$SCRATCH")" = "sess-from-code-env" ]; then
+  pass "session_id falls back to CLAUDE_CODE_SESSION_ID when JSON omits it"
+else
+  fail "session_id falls back to CLAUDE_CODE_SESSION_ID when JSON omits it" "got: $(claim_session "$SCRATCH")"
+fi
+
 echo "--- Unit: same session refresh ---"
 
 CF="$(claim_file "$SCRATCH")"
@@ -218,14 +241,18 @@ rm -rf "$NONGIT"
 echo "--- Unit: missing session identity ---"
 
 clear_claim "$SCRATCH"
-# JSON with no session_id; unset CLAUDE_SESSION_ID so identity is truly unknown
+# JSON with no session_id; unset CLAUDE_SESSION_ID/CLAUDE_CODE_SESSION_ID so
+# identity is truly unknown (SABLE-hccq: this harness's own real session sets
+# CLAUDE_CODE_SESSION_ID ambiently, which the hook now also consults as a
+# fallback — it must be scrubbed too or this "truly unknown" scenario
+# silently resolves to a KNOWN identity).
 JSON=$(python3 -c "
 import json
 print(json.dumps({'tool_name':'Bash','tool_input':{'command':'git add .'},'cwd':'$SCRATCH'}))
 ")
 # env -u cannot call shell functions; use a subshell to unset the variable
 OUT=$(
-  unset CLAUDE_SESSION_ID
+  unset CLAUDE_SESSION_ID CLAUDE_CODE_SESSION_ID
   printf '%s' "$JSON" | bash "$HOOK" 2>/dev/null
 )
 if is_allow "$OUT"; then pass "missing identity: allow"; else fail "missing identity: allow" "got deny"; fi
@@ -331,6 +358,119 @@ else
   fail "integration setup: git worktree add failed"
 fi
 
+echo "--- Integration: SABLE-hccq — sable-claim release succeeds via CLAUDE_CODE_SESSION_ID after the real hook records that same session_id ---"
+
+# Reproduces the live bug end-to-end: the hook receives a real harness-issued
+# session_id via hook-input JSON (as it always does for a genuine
+# PreToolUse:Bash call) and writes it to the claim file. In production the
+# SAME session_id is also what the harness exports as CLAUDE_CODE_SESSION_ID
+# into a later plain Bash tool call's env — but sable-claim previously
+# checked only CLAUDE_SESSION_ID (which the harness never sets), so a
+# self-release always fell through to needing --force. Setting
+# CLAUDE_CODE_SESSION_ID here to the SAME id the hook wrote reproduces that
+# production pairing exactly.
+clear_claim "$SCRATCH"
+SABLE_CLAIM_BIN="$REPO/bin/sable-claim"
+REAL_SID="ea22e248-simulated-harness-session-uuid"
+JSON_REAL=$(python3 -c "
+import json
+print(json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'git add .'}, 'cwd': '$SCRATCH', 'session_id': '$REAL_SID'}))
+")
+printf '%s' "$JSON_REAL" | bash "$HOOK" >/dev/null 2>&1
+OUT=$(env -u CLAUDE_SESSION_ID -u CLAUDE_AGENT_NAME CLAUDE_CODE_SESSION_ID="$REAL_SID" "$SABLE_CLAIM_BIN" release "$SCRATCH" 2>&1)
+RC=$?
+CF="$(claim_file "$SCRATCH")"
+if [ "$RC" -eq 0 ] && [ ! -f "$CF" ]; then
+  pass "integration: sable-claim release succeeds without --force via CLAUDE_CODE_SESSION_ID (repro fix verification)"
+else
+  fail "integration: sable-claim release succeeds without --force via CLAUDE_CODE_SESSION_ID (repro fix verification)" "rc=$RC file_exists=$([ -f "$CF" ] && echo yes || echo no) out=$OUT"
+fi
+
+echo "--- Integration: SABLE-hccq — a genuinely foreign holder is still refused without --force ---"
+
+# Same shape (CLAUDE_CODE_SESSION_ID set, CLAUDE_SESSION_ID/CLAUDE_AGENT_NAME
+# not), but it belongs to a DIFFERENT session than the one the hook
+# recorded — the deny leg must survive.
+clear_claim "$SCRATCH"
+CF="$(claim_file "$SCRATCH")"
+printf 'ea22e248-foreign-session %s -\n' "$(date +%s)" > "$CF"
+OUT=$(env -u CLAUDE_SESSION_ID -u CLAUDE_AGENT_NAME CLAUDE_CODE_SESSION_ID="ea22e248-different-session" "$SABLE_CLAIM_BIN" release "$SCRATCH" 2>&1)
+RC=$?
+if [ "$RC" -ne 0 ] && [ -f "$CF" ]; then
+  pass "integration: foreign holder (non-matching CLAUDE_CODE_SESSION_ID) still refused without --force"
+else
+  fail "integration: foreign holder (non-matching CLAUDE_CODE_SESSION_ID) still refused without --force" "rc=$RC file_exists=$([ -f "$CF" ] && echo yes || echo no) out=$OUT"
+fi
+rm -f "$CF"
+
+echo "--- Integration: SABLE-5pci — 'git -C <wt>' and 'cd <wt> && git' resolve the SAME claim file ---"
+
+if git -C "$SCRATCH" worktree add "$WT" -b wt-branch-5pci -q 2>/dev/null; then
+  clear_claim "$SCRATCH"
+  clear_claim "$WT"
+
+  # Invocation form 1: 'git -C <wt> add .', hook cwd is the MAIN checkout.
+  JSON=$(make_json "git -C $WT add ." "sess-form1" "$SCRATCH")
+  OUT=$(run_hook "$JSON")
+  if is_allow "$OUT"; then pass "5pci: 'git -C <wt>' from main cwd: allow"; else fail "5pci: 'git -C <wt>' from main cwd: allow" "got deny: $OUT"; fi
+  CF_FORM1="$(claim_file "$WT")"
+  if [ "$(claim_session "$WT")" = "sess-form1" ]; then
+    pass "5pci: 'git -C <wt>' claims the worktree's own claim file"
+  else
+    fail "5pci: 'git -C <wt>' claims the worktree's own claim file" "got: $(claim_session "$WT")"
+  fi
+
+  # Invocation form 2: 'cd <wt> && git add .', hook cwd is STILL the MAIN
+  # checkout (this is the exact defect: cwd != cd target). A different
+  # session must land in the SAME claim file as form 1, and — since form 1's
+  # claim (sess-form1) is fresh — must be DENIED, not silently allowed
+  # against a different (main-checkout) claim file.
+  clear_claim_leave=""  # no-op marker; keep worktree claim from form 1 intact
+  JSON=$(make_json "cd $WT && git add ." "sess-form2" "$SCRATCH")
+  OUT=$(run_hook "$JSON")
+  if is_deny "$OUT"; then
+    pass "5pci: 'cd <wt> && git add' from main cwd resolves to the SAME (worktree) claim file and is denied by sess-form1's fresh claim"
+  else
+    fail "5pci: 'cd <wt> && git add' from main cwd resolves to the SAME (worktree) claim file and is denied by sess-form1's fresh claim" "got allow: ${OUT:-<empty>}"
+  fi
+  if printf '%s' "$OUT" | grep -q "sess-form1"; then
+    pass "5pci: denial names sess-form1 (proves same claim file as -C form)"
+  else
+    fail "5pci: denial names sess-form1 (proves same claim file as -C form)" "output: $OUT"
+  fi
+
+  # Main checkout's own claim file must be untouched by either worktree
+  # invocation form (proves the main checkout and worktree stay in
+  # independent namespaces — the reverse-hole half of the bug).
+  CF_MAIN="$(claim_file "$SCRATCH")"
+  if [ ! -f "$CF_MAIN" ]; then
+    pass "5pci: main-checkout claim file untouched by worktree invocations (independent namespace)"
+  else
+    fail "5pci: main-checkout claim file untouched by worktree invocations (independent namespace)" "unexpected claim at $CF_MAIN: $(cat "$CF_MAIN" 2>/dev/null)"
+  fi
+
+  # And the converse: a fresh MAIN-checkout claim must not block a
+  # 'cd <wt> && git add' mutation in the worktree.
+  printf 'sess-main-holder %s\n' "$(date +%s)" > "$CF_MAIN"
+  clear_claim "$WT"
+  JSON=$(make_json "cd $WT && git add ." "sess-form3" "$SCRATCH")
+  OUT=$(run_hook "$JSON")
+  if is_allow "$OUT"; then
+    pass "5pci: fresh main-checkout claim does not block 'cd <wt> && git add' in the worktree"
+  else
+    fail "5pci: fresh main-checkout claim does not block 'cd <wt> && git add' in the worktree" "got deny: $OUT"
+  fi
+  if [ "$(claim_session "$WT")" = "sess-form3" ]; then
+    pass "5pci: worktree claim taken by sess-form3, independent of main-checkout holder"
+  else
+    fail "5pci: worktree claim taken by sess-form3, independent of main-checkout holder" "got: $(claim_session "$WT")"
+  fi
+
+  git -C "$SCRATCH" worktree remove "$WT" --force 2>/dev/null || true
+else
+  fail "5pci integration setup: git worktree add failed"
+fi
+
 # ============================================================
 # Defect-regression tests (SABLE-ct8 verdict)
 # ============================================================
@@ -389,13 +529,17 @@ CF="$(claim_file "$SCRATCH")"
 printf 'sess-HOLDER %s\n' "$(date +%s)" > "$CF"
 ORIGINAL_CONTENT="$(cat "$CF")"
 
-# identity-unknown invocation (no session_id, CLAUDE_SESSION_ID unset)
+# identity-unknown invocation (no session_id, CLAUDE_SESSION_ID and
+# CLAUDE_CODE_SESSION_ID both unset — SABLE-hccq: this harness's own real
+# session sets CLAUDE_CODE_SESSION_ID ambiently, which the hook now also
+# consults as a fallback, so it must be scrubbed too for this to be truly
+# identity-unknown rather than silently resolving to a KNOWN identity)
 JSON_UNK=$(python3 -c "
 import json
 print(json.dumps({'tool_name':'Bash','tool_input':{'command':'git add .'},'cwd':'$SCRATCH'}))
 ")
 OUT_UNK=$(
-  unset CLAUDE_SESSION_ID
+  unset CLAUDE_SESSION_ID CLAUDE_CODE_SESSION_ID
   printf '%s' "$JSON_UNK" | bash "$HOOK" 2>/dev/null
 )
 if is_allow "$OUT_UNK"; then

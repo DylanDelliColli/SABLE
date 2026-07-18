@@ -44,8 +44,11 @@ The following have tripped every new Optimus instance on day one. Read them now:
 2. **Workers SELF-PUSH; you do NOT push worker code.** A worker runs the
    warm-pane self-push lifecycle (worker-dispatch.md): it tests, pushes its OWN
    worktree branch, closes its bead, and flags `@sable_status=done`. The
-   post-push hook files the `for-chuck` handoff; **Chuck merges.** You never run
-   `git push` for a worker and never run `gh pr create`.
+   post-push hook notifies Chuck message-first over tmux; a durable `for-chuck`
+   bead is filed only as the fallback when Chuck's pane is unreachable (zero
+   for-chuck beads in normal operation is expected). Either way, **Chuck
+   merges.** You never run `git push` for a worker and never run
+   `gh pr create`.
 3. **The bead pool is your result channel — and it wakes you.** You learn a
    worker finished event-driven: the post-push hook messages your pane when its
    branch lands, and its bead (`bd show <id>`) closes. Do NOT poll for it — when
@@ -171,7 +174,8 @@ regardless of count. A single-file auth change is still Opus.
 - You may not query other managers' inboxes (read guard denies).
 - You may not claim orphan beads (your lane is parented/epic-child beads).
 - You spawn workers with `sable-spawn-worker`; you do NOT push worker code and
-  do NOT open PRs — workers self-push, the post-push hook files `for-chuck`.
+  do NOT open PRs — workers self-push, and the post-push hook notifies Chuck
+  message-first (durable `for-chuck` bead only as the unreachable-pane fallback).
 - Every dispatch goes through `sable-spawn-worker` (model-pinned, warm-pane self-push prompt).
 
 ## Communicating with the user

@@ -89,11 +89,89 @@ if printf '%s' "$out1" | grep -q "systemctl --user enable"; then
 else
   fail "project: install output prints the systemd activation command"
 fi
-# the install itself must never actually touch a live systemd/cron surface
-if [ -e "$HOME/.config/systemd/user/sable-reconcile-timer.timer" ]; then
-  fail "project: install does not copy the unit into the real ~/.config/systemd/user" "found $HOME/.config/systemd/user/sable-reconcile-timer.timer"
+# the install itself must never actually touch a live systemd/cron surface.
+# SABLE-i8kv: run this against a SANDBOXED HOME, not the developer's real one —
+# on a host where the real D5 reconcile-timer is legitimately installed (e.g.
+# o9ru), checking the unsandboxed $HOME conflates "install wrote here" with
+# "this developer happens to run the timer" and fails for the right answer.
+# SABLE-f00o: shared predicate so the guard below exercises the SAME detection
+# code path as the real assertion, instead of tautologically re-checking the
+# file it just touched itself.
+home_has_timer_unit(){ [ -e "$1/.config/systemd/user/sable-reconcile-timer.timer" ]; }
+
+HS="$(mktemp -d)"; mkdir -p "$HS/.config/systemd/user"
+HP="$(mktemp -d)"
+HOME="$HS" SABLE_PROJECT_DIR="$HP" bash "$INSTALLER" --project >/dev/null 2>&1
+if home_has_timer_unit "$HS"; then
+  fail "project: install does not copy the unit into the real ~/.config/systemd/user" "found $HS/.config/systemd/user/sable-reconcile-timer.timer"
 else
   pass "project: install does not copy the unit into the real ~/.config/systemd/user"
+fi
+
+# guard: plant a unit inside the SANDBOXED HOME and re-invoke home_has_timer_unit
+# (the SAME predicate the assertion above calls) — proving detection actually
+# works. If home_has_timer_unit is ever neutered (e.g. hardcoded to report
+# "not found"), this guard must go red; that is the acceptance invariant.
+touch "$HS/.config/systemd/user/sable-reconcile-timer.timer"
+if home_has_timer_unit "$HS"; then
+  pass "project: assertion still bites when a unit IS present under sandboxed HOME (guard)"
+else
+  fail "project: assertion still bites when a unit IS present under sandboxed HOME (guard)" "home_has_timer_unit reported absent after planting $HS/.config/systemd/user/sable-reconcile-timer.timer"
+fi
+rm -rf "$HS" "$HP"
+
+# ---------- SABLE-7oj5: generated units carry a resolved bd env, not bare PATH lookup ----------
+# Hermetic against the host: do NOT rely on ambient PATH having (dev host, via
+# nvm) or lacking (CI clean room) a real bd. Force both cases explicitly so
+# this suite proves the contract on every host, not just this one.
+
+# POSITIVE CASE: a resolvable bd on PATH must be baked in verbatim.
+FAKEBIN="$(mktemp -d)"
+cat > "$FAKEBIN/bd" <<'FAKEBD'
+#!/usr/bin/env bash
+exit 0
+FAKEBD
+chmod +x "$FAKEBIN/bd"
+P_BD="$(mktemp -d)"
+SABLE_PROJECT_DIR="$P_BD" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --project >/dev/null 2>&1
+SVC_BD="$P_BD/.claude/sable/reconcile-timer/sable-reconcile-timer.service"
+CRON_BD="$P_BD/.claude/sable/reconcile-timer/sable-reconcile-timer.cron"
+bd_env_val="$(grep -o 'Environment=SABLE_RC_BD=.*' "$SVC_BD" | cut -d= -f3-)"
+if [ "$bd_env_val" = "$FAKEBIN/bd" ]; then
+  pass "project: .service carries Environment=SABLE_RC_BD=<path> (hermetic bd present)"
+else
+  fail "project: .service carries Environment=SABLE_RC_BD=<path> (hermetic bd present)" "expected $FAKEBIN/bd got '$bd_env_val'"
+fi
+if [ -n "$bd_env_val" ] && [ -x "$bd_env_val" ]; then
+  pass "project: .service's SABLE_RC_BD points at a real executable at generation time"
+else
+  fail "project: .service's SABLE_RC_BD points at a real executable at generation time" "path=$bd_env_val"
+fi
+if grep -q "SABLE_RC_BD=\"$bd_env_val\"" "$CRON_BD"; then
+  pass "project: .cron line sets SABLE_RC_BD consistently with the .service"
+else
+  fail "project: .cron line sets SABLE_RC_BD consistently with the .service"
+fi
+
+# NEGATIVE CASE: no bd anywhere on PATH — the installer must not fabricate a
+# path, must warn, and must still emit the fallback Environment=PATH= line.
+P_NOBD="$(mktemp -d)"
+nobd_err="$(SABLE_PROJECT_DIR="$P_NOBD" PATH="/usr/bin:/bin" bash "$INSTALLER" --project 2>&1 >/dev/null)"
+SVC_NOBD="$P_NOBD/.claude/sable/reconcile-timer/sable-reconcile-timer.service"
+if ! grep -q '^Environment=SABLE_RC_BD=' "$SVC_NOBD"; then
+  pass "project: .service omits Environment=SABLE_RC_BD when bd is absent from PATH"
+else
+  fail "project: .service omits Environment=SABLE_RC_BD when bd is absent from PATH" "found: $(grep '^Environment=SABLE_RC_BD=' "$SVC_NOBD")"
+fi
+if printf '%s' "$nobd_err" | grep -qi "WARNING.*bd.*not found"; then
+  pass "project: install warns on stderr when bd is absent from PATH"
+else
+  fail "project: install warns on stderr when bd is absent from PATH" "stderr=$nobd_err"
+fi
+if grep -q '^Environment=PATH=' "$SVC_NOBD"; then
+  pass "project: .service carries a fallback Environment=PATH= line even when bd is absent"
+else
+  fail "project: .service carries a fallback Environment=PATH= line even when bd is absent"
 fi
 
 # env override of the cadence

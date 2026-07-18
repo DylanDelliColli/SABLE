@@ -54,17 +54,20 @@ try:
     data = json.load(sys.stdin)
     if not (isinstance(data, list) and data):
         sys.exit(0)
-    notes = data[0].get('notes', '') or ''
+    # Claims already established for this bead (SABLE-szd: dedicated
+    # metadata field, NOT notes — bd update --notes overwrites the whole
+    # field, so notes can no longer be trusted as a claims source).
+    metadata = data[0].get('metadata', {}) or {}
+    wip_claims = metadata.get('wip_claims', '') or ''
+    for p in wip_claims.split(','):
+        p = p.strip()
+        if p:
+            print(p)
+    # Files mentioned in description (claims may not exist yet at
+    # pre-dispatch time — this hook and pre-dispatch-claim.sh fire on the
+    # same trigger with no ordering guarantee).
     desc = data[0].get('description', '') or ''
-    text = notes + '\n' + desc
-    # Files from WIP-CLAIMS line
-    for m in re.finditer(r'WIP-CLAIMS:\s*([^\n]+)', text):
-        for p in m.group(1).split(','):
-            p = p.strip()
-            if p:
-                print(p)
-    # Files mentioned in description
-    for m in re.finditer(r'(?:^|[\s\(\[\"\\'])((?:[\w\-./]+/)?[\w\-./]+\.(?:ts|tsx|js|jsx|py|rs|go|java|rb|md|yaml|yml|toml|json|sh|sql|css|scss|html))(?=[\s\)\]\"\\',:;]|$)', text, re.MULTILINE):
+    for m in re.finditer(r'(?:^|[\s\(\[\"\\'])((?:[\w\-./]+/)?[\w\-./]+\.(?:ts|tsx|js|jsx|py|rs|go|java|rb|md|yaml|yml|toml|json|sh|sql|css|scss|html))(?=[\s\)\]\"\\',:;]|$)', desc, re.MULTILINE):
         print(m.group(1))
 except Exception:
     pass
@@ -96,15 +99,9 @@ for item in data:
     bid = item.get('id', '')
     if bid in dispatch_ids:
         continue
-    notes = item.get('notes', '') or ''
-    desc = item.get('description', '') or ''
-    text = notes + '\n' + desc
-    files = set()
-    for m in re.finditer(r'WIP-CLAIMS:\s*([^\n]+)', text):
-        for p in m.group(1).split(','):
-            p = p.strip()
-            if p:
-                files.add(p)
+    metadata = item.get('metadata', {}) or {}
+    wip_claims = metadata.get('wip_claims', '') or ''
+    files = set(p.strip() for p in wip_claims.split(',') if p.strip())
     overlap = files & dispatch_files
     if overlap:
         title = item.get('title', '')

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tdd-gate.sh — Block bd close without test evidence
 # Checks the evidence file written by tdd-evidence.sh.
-# Escape hatch: add [no-test] to bead notes (single-close only).
+# Escape hatch: add [no-test] to bead notes OR description (single-close only).
 #
 # SABLE-h853 (2026-07-13): a worker's pre-push test run is a SCOPED run — the
 # bead's own test files plus tests importing the modules the diff touched,
@@ -92,14 +92,21 @@ ID_COUNT=$(echo "$BEAD_ARGS" | wc -w)
 # Single-bead close: check [no-test] escape hatch
 if [ "$ID_COUNT" -eq 1 ]; then
   BEAD_ID="$BEAD_ARGS"
-  # Check notes field for [no-test] marker via bd show --json
-  NOTES=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
+  # Check for the [no-test] marker in BOTH the notes AND the description field
+  # via bd show --json. SABLE-p84b: the marker is a natural fit for the
+  # description (where sable-spawn-worker's auto-prompt surfaces bead text), so
+  # a notes-only scan stranded docs/config beads whose worker put [no-test] in
+  # the description — the close was denied, then mis-reported as success
+  # (SABLE-u0c6), leaving the bead in_progress with a pushed branch. Scanning
+  # both fields is the cheapest, most forgiving fix.
+  MARKER_FIELDS=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 if isinstance(data, list) and len(data) > 0:
     print(data[0].get('notes', '') or '')
+    print(data[0].get('description', '') or '')
 " 2>/dev/null || echo "")
-  if echo "$NOTES" | grep -q '\[no-test\]'; then
+  if echo "$MARKER_FIELDS" | grep -q '\[no-test\]'; then
     exit 0  # Escape hatch: allow close without test evidence
   fi
 fi
@@ -125,6 +132,26 @@ fi
 # additive: it only fires when the exact-key evidence file above was empty,
 # so it cannot weaken the existing per-agent gate.
 if [ -n "$BEAD_ARGS" ]; then
+  # SABLE-yh1o: derive the glob base via the SAME lib-evidence-key.sh helper
+  # the exact-key check above uses, instead of interpolating $SESSION_ID
+  # directly. An empty SESSION_ID (the absent-session case jfg6.4 hardened
+  # the exact-key path against) previously expanded the raw glob to
+  # /tmp/tdd-evidence-* — every session's evidence on the box — so a
+  # companion-declared bead in an absent-session close could be satisfied
+  # by an unrelated session's REPO= line. Routing through sable_evidence_key
+  # gives an absent session its own deterministic ppid-scoped base, matching
+  # only this session's (and its agent variants') evidence files.
+  #
+  # SABLE-bo10: the base alone is still prefix-collidable — a bare
+  # "${base}"* glob matches any OTHER session whose key happens to start
+  # with this base (ppid-123* matches ppid-1234's evidence file, a
+  # different, concurrently-live process), narrowing but not eliminating
+  # the yh1o failure shape. Agent variants are always base + "-" + agent_id
+  # (see lib-evidence-key.sh), so the only legitimate matches are the exact
+  # base itself or base followed by a literal "-" separator. Checking those
+  # two forms explicitly — instead of one open-ended glob — closes the
+  # prefix collision without narrowing the legitimate agent-variant match.
+  _companion_evidence_base=$(sable_evidence_key "$SESSION_ID" "")
   for _bid in $BEAD_ARGS; do
     _companion=$(bd show "$_bid" --json 2>/dev/null | python3 -c "
 import json, re, sys
@@ -138,8 +165,12 @@ notes = data[0].get('notes', '') or ''
 m = re.search(r'Companion repo:\s*(\S+)', notes)
 print(m.group(1) if m else '')
 " 2>/dev/null) || _companion=""
-    if [ -n "$_companion" ] && grep -qF "REPO=${_companion}" /tmp/tdd-evidence-"${SESSION_ID}"* 2>/dev/null; then
-      exit 0
+    if [ -n "$_companion" ]; then
+      for _f in "${_companion_evidence_base}" "${_companion_evidence_base}"-*; do
+        if [ -f "$_f" ] && grep -qF "REPO=${_companion}" "$_f" 2>/dev/null; then
+          exit 0
+        fi
+      done
     fi
   done
 fi

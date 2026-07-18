@@ -34,6 +34,7 @@ import pytest
 
 BIN = Path(__file__).resolve().parent / "sable-reconcile-handoffs"
 TIMER_BIN = Path(__file__).resolve().parent / "sable-reconcile-timer"
+INSTALLER = Path(__file__).resolve().parent / "sable-orchestration-install"
 BASE = "trunk"
 
 # The ci-verify clean-room is tmux+pytest only — no bd/dolt by design. These
@@ -390,3 +391,78 @@ def test_S5_E1_walkaway_simulation_timer_alone_catches_all_strands_in_one_cadenc
 
     # BOUNDARIES hold even through the timer wrapper: files beads only.
     assert _origin_has_branch(origin, branch_a) and _origin_has_branch(origin, branch_b)
+
+
+# ===========================================================================
+# SABLE-7oj5: systemd --user (and cron) run with NO shell PATH — bare 'bd' is
+# a FileNotFoundError since this host's bd is nvm-managed, off the default
+# PATH. The installer bakes an absolute SABLE_RC_BD into the generated unit;
+# these pin that the REAL generated env line is what survives a
+# systemd-shaped stripped PATH, and that the bug reproduces without it.
+# ===========================================================================
+
+def _generated_service_env(tmp_path, target_repo):
+    """Run the real installer against a throwaway scope + this fixture's repo,
+    and return the (SABLE_RC_BD, PATH) values it baked into the generated
+    .service's Environment= lines."""
+    scope = tmp_path / "install-scope"
+    env = dict(os.environ)
+    env["SABLE_PROJECT_DIR"] = str(scope)
+    env["SABLE_RECONCILE_TARGET_REPO"] = str(target_repo)
+    cp = subprocess.run([str(INSTALLER), "--project"], cwd=str(tmp_path), env=env,
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    assert cp.returncode == 0, cp.stdout
+    svc = scope / ".claude" / "sable" / "reconcile-timer" / "sable-reconcile-timer.service"
+    text = svc.read_text()
+    bd_path = svc_path = None
+    for line in text.splitlines():
+        if line.startswith("Environment=SABLE_RC_BD="):
+            bd_path = line.split("=", 2)[2]
+        elif line.startswith("Environment=PATH="):
+            svc_path = line[len("Environment=PATH="):]
+    assert bd_path, f"generated .service has no SABLE_RC_BD env line:\n{text}"
+    assert os.access(bd_path, os.X_OK), f"SABLE_RC_BD is not a real executable: {bd_path}"
+    assert svc_path, f"generated .service has no fallback PATH env line:\n{text}"
+    return bd_path, svc_path
+
+
+def test_S7oj5_generated_unit_env_survives_systemd_shaped_stripped_path(tmp_path):
+    origin, work, home = _setup(tmp_path)
+    bead_id = _make_work_bead(work, home, status="closed")
+    branch = _push_worker_branch(work, bead_id)
+    assert _for_chuck_beads(work, home) == []
+
+    bd_path, svc_path = _generated_service_env(tmp_path, work)
+
+    # simulate the systemd --user (and cron) execution env this bead is about
+    # — no shell rc, no nvm, no developer PATH — using EXACTLY the two
+    # Environment= lines the real installer baked into the generated unit
+    # (bd itself is a `#!/usr/bin/env node` script, so its own dir must be on
+    # PATH too, not just resolvable via SABLE_RC_BD's absolute path).
+    env = _env(home)
+    env["PATH"] = svc_path
+    env["SABLE_RC_BD"] = bd_path
+    argv = [sys.executable, str(TIMER_BIN), "--once", "--repo", str(work), "--remote", "origin"]
+    r = subprocess.run(argv, cwd=str(work), env=env, text=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+    assert r.returncode == 0, r.stdout
+    assert "FileNotFoundError" not in r.stdout, r.stdout
+    beads = _for_chuck_beads(work, home)
+    assert len(beads) == 1, f"expected exactly one for-chuck bead, got {beads}\n{r.stdout}"
+    assert branch in beads[0]["title"], beads[0]["title"]
+
+
+def test_S7oj5_without_sable_rc_bd_the_original_bug_reproduces(tmp_path):
+    # Pins the FAILURE this bead fixes: bare 'bd' + a stripped systemd-shaped
+    # PATH really does FileNotFoundError — proof the fix above (not some
+    # unrelated PATH tweak) is what makes the sweep survive.
+    origin, work, home = _setup(tmp_path)
+    _make_work_bead(work, home, status="closed")
+
+    env = _env(home)  # _ENV_LEAKS already strips any inherited SABLE_RC_BD
+    env["PATH"] = "/usr/bin:/bin"
+    argv = [sys.executable, str(TIMER_BIN), "--once", "--repo", str(work), "--remote", "origin"]
+    r = subprocess.run(argv, cwd=str(work), env=env, text=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+    assert r.returncode != 0, r.stdout
+    assert "FileNotFoundError" in r.stdout, r.stdout

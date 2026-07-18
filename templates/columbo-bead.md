@@ -67,8 +67,17 @@ gaps or the area is debugging-heavy. Watch the mis-classifications: a
 
 ## Test file
 `<path-relative-to-repo-root>` — the skeleton file Columbo wrote. Worker
-fills in the it.todo bodies and renames `.skel.test.<ext>` → `.test.<ext>`,
-or merges the cases into an existing test file with the same coverage shape.
+fills in the it.todo bodies and renames the skeleton to a collectable test
+file, or merges the cases into an existing test file with the same coverage
+shape.
+
+- **pytest (Python):** skeleton is `skel_<feature-name>.py`; worker renames
+  to `test_<feature-name>.py` when filling in bodies. Columbo must never
+  hand off `<feature-name>.skel.test.py` — that double-extension name is
+  not importable as a pytest module and crashes suite collection rather
+  than skipping cleanly.
+- **Every other framework:** skeleton is `<feature-name>.skel.test.<ext>`;
+  worker renames `.skel.test.<ext>` → `.test.<ext>`.
 
 ## Test layer
 {{ One of: UNIT | E2E | EVAL. Drives skeleton-file placement and tells
@@ -210,6 +219,7 @@ Before `bd create`, re-read the draft and confirm:
 - [ ] Forward only: is `## Test layer` set to one of UNIT / E2E / EVAL, with the cases all matching that layer (no mixed-layer beads)?
 - [ ] Forward only: do the case names exactly match `it.todo` strings in the cited skeleton file? (Run a grep.)
 - [ ] Forward only: does the skeleton file's directory match the test layer (unit-test dir / e2e dir / evals dir)?
+- [ ] Forward only, pytest projects: is the skeleton named `skel_<feature-name>.py` (never `<feature-name>.skel.test.py`), and has `pytest --collect-only` been run against it and exited clean?
 - [ ] Audit only: is `## Existing test quality` filled with a grade (★/★★/★★★) or `none — net-new test required`?
 - [ ] Audit only: if grade is ★★★, this should NOT be a gap bead — drop it. (★★★ tests are covered, not gaps.)
 - [ ] Audit only: does the fingerprint grep to ≤3 matches in the cited file? (Run the grep.)

@@ -256,13 +256,91 @@ assert_hatch_used "single bead, multiple flags with flag-value IDs" \
 assert_hatch_skipped "two beads + flag value still routes to evidence check" \
   'bd close SABLE-stub SABLE-other --reason docs-only'
 
+# ---------- SABLE-p84b: [no-test] in DESCRIPTION (not notes) fires the hatch ----------
+# The escape hatch must scan BOTH the notes and the description field for the
+# [no-test] marker. A docs/config bead whose worker put [no-test] in the
+# DESCRIPTION (a natural place, and where sable-spawn-worker's auto-prompt
+# surfaces bead text) was stranded pre-fix: notes-only scan missed it, the
+# close was denied, then mis-reported as success (SABLE-u0c6). These tests use
+# dedicated stubs so `bd show --json` returns the marker in only one field.
+
+# Compact pass/fail helpers (also used by the sections below).
+pa_pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
+pa_fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
+
+P84B_DIR=$(mktemp -d)
+
+# Stub: [no-test] in DESCRIPTION only, notes empty.
+cat > "$P84B_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-desconly","notes":"","description":"Update the docs config. [no-test] pure docs change."}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$P84B_DIR/bd"
+
+run_gate_stub() { # <command> <stub_dir>
+  local command="$1" stub_dir="$2" sid
+  sid=$(fake_session)
+  rm -f "/tmp/tdd-evidence-${sid}"  # ensure no-evidence path
+  make_input "$command" "$sid" | env PATH="$stub_dir:$PATH" bash "$HOOK" 2>/dev/null
+}
+
+out=$(run_gate_stub 'bd close SABLE-desconly' "$P84B_DIR")
+if [ -z "$out" ]; then
+  pa_pass "p84b: [no-test] in DESCRIPTION only (no notes, no evidence) → hatch fires, close allowed"
+else
+  pa_fail "p84b: [no-test] in DESCRIPTION only → hatch fires" "expected silent allow; got: ${out:-<empty>}"
+fi
+
+# Stub: [no-test] in NOTES only, description empty — the pre-existing path must
+# keep working after the change.
+cat > "$P84B_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-notesonly","notes":"[no-test] docs bead","description":"Update the docs."}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+out=$(run_gate_stub 'bd close SABLE-notesonly' "$P84B_DIR")
+if [ -z "$out" ]; then
+  pa_pass "p84b: [no-test] in NOTES only still fires the hatch (no regression)"
+else
+  pa_fail "p84b: [no-test] in NOTES only still fires the hatch" "expected silent allow; got: ${out:-<empty>}"
+fi
+
+# Stub: NO marker in EITHER field, no evidence → must still DENY.
+cat > "$P84B_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-nomarker","notes":"a normal code bead","description":"Implement the feature; needs tests."}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+out=$(run_gate_stub 'bd close SABLE-nomarker' "$P84B_DIR")
+if echo "$out" | grep -q '"permissionDecision": "deny"'; then
+  pa_pass "p84b: no [no-test] marker in either field + no evidence → still DENIED"
+else
+  pa_fail "p84b: no marker in either field → still DENIED" "expected deny JSON; got: ${out:-<empty>}"
+fi
+rm -rf "$P84B_DIR"
+
 # ---------- SABLE-d72/lcs: per-agent evidence keying ----------
 # The gate must read the SAME per-agent key tdd-evidence.sh writes: with agent_id
 # present, /tmp/tdd-evidence-<sid>-<agent_id>; without, the session-global file.
 # A two-bead close routes past the [no-test] hatch to the evidence check, so we
 # exercise the keying directly. Worker A's evidence must NOT let worker B close.
-pa_pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
-pa_fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
+# (pa_pass/pa_fail are defined in the SABLE-p84b section above.)
 
 make_input_agent() {
   # $1 = command, $2 = session_id, $3 = agent_id
@@ -365,6 +443,157 @@ else
   pa_fail "companion-repo: bead without a declaration gets no special treatment" "got: ${CR_OUT3:-<empty>}"
 fi
 rm -rf "$CR_STUB_DIR"
+
+# ---------- SABLE-yh1o: companion-repo glob must not leak across sessions
+# when SESSION_ID is empty ----------
+# The companion-repo block used to interpolate the raw (possibly-empty)
+# SESSION_ID straight into a glob: /tmp/tdd-evidence-"${SESSION_ID}"*. With
+# SESSION_ID empty (the hccq absent-session trap jfg6.4 hardened the
+# exact-key path against) that glob expanded to /tmp/tdd-evidence-* — EVERY
+# session's evidence on the box — so an absent-session close of a
+# companion-declared bead could be satisfied by an unrelated session's
+# REPO= line. Fix: derive the glob base via sable_evidence_key (the same
+# helper the exact-key check uses) so an absent session gets its own
+# deterministic ppid-scoped base instead of the empty-string wildcard.
+
+CY_STUB_DIR=$(mktemp -d)
+cat > "$CY_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"market-brief-package-companion","notes":"Companion repo: /home/ddc/dev-environment/SABLE"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$CY_STUB_DIR/bd"
+CY_CLOSE='bd close market-brief-package-companion market-brief-package-other'
+
+# (a) regression guard: REPO=-tagged evidence lives under a DIFFERENT,
+# non-empty session id. An empty-SESSION_ID close of the companion bead
+# must NOT be satisfied by it (pre-fix, the raw glob matched it).
+CY_OTHER_SID="tdd-gate-unrelated-$$-$RANDOM"
+CY_OTHER_EV="/tmp/tdd-evidence-${CY_OTHER_SID}"
+rm -f "$CY_OTHER_EV"
+echo "$(date -Iseconds) REPO=/home/ddc/dev-environment/SABLE CMD=pytest" > "$CY_OTHER_EV"
+CY_OUT=$(make_input "$CY_CLOSE" "" | env PATH="$CY_STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null)
+if echo "$CY_OUT" | grep -q '"permissionDecision": "deny"'; then
+  pa_pass "companion-repo glob (SABLE-yh1o): empty SESSION_ID does NOT match an unrelated session's REPO= evidence"
+else
+  pa_fail "companion-repo glob (SABLE-yh1o): empty SESSION_ID must not match unrelated session evidence" "got: ${CY_OUT:-<empty>}"
+fi
+rm -f "$CY_OTHER_EV"
+
+# (b) positive control: evidence recorded at THIS absent-session's own
+# ppid-derived key still satisfies the close — the fix must scope the
+# glob, not blanket-deny every absent-session companion close. Use the
+# REAL writer (tdd-evidence.sh) and invoke both writer and reader as bare
+# pipes directly in this script (not $(...)-wrapped) so they compute
+# $PPID the same way — the SABLE-jfg6.4 D4 agreement pattern below.
+CY_LIB="$(cd "$(dirname "$0")/.." && pwd)/multi-manager/lib-evidence-key.sh"
+CY_EVHOOK="$(cd "$(dirname "$0")/.." && pwd)/tdd-evidence.sh"
+cy_key() { bash -c '. "$0"; sable_evidence_key "$1" "$2"' "$CY_LIB" "$1" "$2"; }
+CY_PPID_KEY=$(cy_key "" "")
+rm -f "$CY_PPID_KEY"
+
+make_input "cd /home/ddc/dev-environment/SABLE && pytest tests/" "" | bash "$CY_EVHOOK" >/dev/null 2>&1 || true
+
+CY_TMP=$(mktemp)
+make_input "$CY_CLOSE" "" | env PATH="$CY_STUB_DIR:$PATH" bash "$HOOK" > "$CY_TMP" 2>/dev/null
+CY_OUT2=$(cat "$CY_TMP"); rm -f "$CY_TMP"
+if [ -z "$CY_OUT2" ]; then
+  pa_pass "companion-repo glob (SABLE-yh1o): empty SESSION_ID still matches THIS session's own ppid-scoped REPO= evidence"
+else
+  pa_fail "companion-repo glob (SABLE-yh1o): empty SESSION_ID matches own ppid-scoped evidence" "got: ${CY_OUT2:-<empty>}; key=[$CY_PPID_KEY] exists=$([ -s "$CY_PPID_KEY" ] && echo yes || echo no)"
+fi
+rm -f "$CY_PPID_KEY"
+rm -rf "$CY_STUB_DIR"
+
+# ---------- SABLE-bo10: companion-repo glob must not prefix-collide across
+# sessions whose ppid-derived key is a STRING PREFIX of another's ----------
+# yh1o scoped the companion glob from "every session on the box" down to
+# "sessions whose key is a string-prefix of mine" by routing the glob base
+# through sable_evidence_key instead of interpolating $SESSION_ID directly.
+# But the glob itself, "${base}"*, is still open-ended: it matches any OTHER
+# live session whose key happens to start with this base, e.g. an
+# absent-session base /tmp/tdd-evidence-ppid-123 also matches
+# /tmp/tdd-evidence-ppid-1234's evidence file — a DIFFERENT, concurrently-live
+# process, not an agent-variant of this one (real agent variants are always
+# base + "-" + agent_id). Fix: check the exact base and the base-followed-
+# by-"-" form as two separate checks instead of one open-ended glob.
+
+CB_STUB_DIR=$(mktemp -d)
+cat > "$CB_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"market-brief-package-companion","notes":"Companion repo: /home/ddc/dev-environment/SABLE"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$CB_STUB_DIR/bd"
+CB_CLOSE='bd close market-brief-package-companion market-brief-package-other'
+
+CB_LIB="$(cd "$(dirname "$0")/.." && pwd)/multi-manager/lib-evidence-key.sh"
+cb_key() { bash -c '. "$0"; sable_evidence_key "$1" "$2"' "$CB_LIB" "$1" "$2"; }
+CB_BASE=$(cb_key "" "")
+# Prefix-collision file: base with an extra digit appended DIRECTLY (no "-"
+# separator) — simulates a different, concurrently-live ppid-keyed session
+# whose key is base+"4" (e.g. base=ppid-123, collider=ppid-1234).
+CB_COLLIDE="${CB_BASE}4"
+CB_AGENT_VARIANT="${CB_BASE}-agentXYZ"
+rm -f "$CB_BASE" "$CB_COLLIDE" "$CB_AGENT_VARIANT"
+
+# NOTE: the reader (bash "$HOOK") must be invoked as a BARE pipe redirected
+# to a temp file, never wrapped in $(...) — a pipe inside $(...) forces bash
+# to fork an extra subshell for the pipeline, which becomes the hook's
+# actual parent process, so the hook's own $PPID (and thus its companion
+# glob base) would silently diverge from $CB_BASE computed above via
+# $(cb_key ...) (a no-pipe substitution bash execs in place, preserving this
+# script's PID as the parent). Same SABLE-yh1o D4 agreement pattern as the CY
+# block above.
+
+# (a) regression guard: REPO=-tagged evidence lives ONLY at the prefix-
+# colliding path, never at this session's own base. Must DENY.
+echo "$(date -Iseconds) REPO=/home/ddc/dev-environment/SABLE CMD=pytest" > "$CB_COLLIDE"
+CB_TMP=$(mktemp)
+make_input "$CB_CLOSE" "" | env PATH="$CB_STUB_DIR:$PATH" bash "$HOOK" > "$CB_TMP" 2>/dev/null
+CB_OUT=$(cat "$CB_TMP"); rm -f "$CB_TMP"
+if echo "$CB_OUT" | grep -q '"permissionDecision": "deny"'; then
+  pa_pass "companion-repo glob (SABLE-bo10): prefix-colliding session's REPO= evidence does NOT satisfy the close"
+else
+  pa_fail "companion-repo glob (SABLE-bo10): prefix-colliding session's REPO= evidence must not satisfy the close" "got: ${CB_OUT:-<empty>}"
+fi
+rm -f "$CB_COLLIDE"
+
+# (b) positive control: evidence at the exact base still satisfies the close.
+echo "$(date -Iseconds) REPO=/home/ddc/dev-environment/SABLE CMD=pytest" > "$CB_BASE"
+CB_TMP2=$(mktemp)
+make_input "$CB_CLOSE" "" | env PATH="$CB_STUB_DIR:$PATH" bash "$HOOK" > "$CB_TMP2" 2>/dev/null
+CB_OUT2=$(cat "$CB_TMP2"); rm -f "$CB_TMP2"
+if [ -z "$CB_OUT2" ]; then
+  pa_pass "companion-repo glob (SABLE-bo10): evidence at the exact base still satisfies the close"
+else
+  pa_fail "companion-repo glob (SABLE-bo10): evidence at the exact base must still satisfy the close" "got: ${CB_OUT2:-<empty>}; key=[$CB_BASE] exists=$([ -s "$CB_BASE" ] && echo yes || echo no)"
+fi
+rm -f "$CB_BASE"
+
+# (c) positive control: evidence at a real agent-variant (base-<aid>) still
+# satisfies the close.
+echo "$(date -Iseconds) REPO=/home/ddc/dev-environment/SABLE CMD=pytest" > "$CB_AGENT_VARIANT"
+CB_TMP3=$(mktemp)
+make_input "$CB_CLOSE" "" | env PATH="$CB_STUB_DIR:$PATH" bash "$HOOK" > "$CB_TMP3" 2>/dev/null
+CB_OUT3=$(cat "$CB_TMP3"); rm -f "$CB_TMP3"
+if [ -z "$CB_OUT3" ]; then
+  pa_pass "companion-repo glob (SABLE-bo10): evidence at an agent variant (base-<aid>) still satisfies the close"
+else
+  pa_fail "companion-repo glob (SABLE-bo10): evidence at an agent variant must still satisfy the close" "got: ${CB_OUT3:-<empty>}; key=[$CB_AGENT_VARIANT] exists=$([ -s "$CB_AGENT_VARIANT" ] && echo yes || echo no)"
+fi
+rm -f "$CB_AGENT_VARIANT"
+rm -rf "$CB_STUB_DIR"
 
 # ---------- SABLE-h853: scoped-run protocol acceptance ----------
 # Operator-approved protocol change (2026-07-13): the full suite no longer
@@ -490,6 +719,60 @@ make_input 'bd close SABLE-stub SABLE-other' "" | env PATH="$STUB_DIR:$PATH" bas
 D4N_OUT=$(cat "$D4N_TMP"); rm -f "$D4N_TMP"
 if echo "$D4N_OUT" | grep -q '"permissionDecision": "deny"'; then pa_pass "D4 negative (absent): no evidence at the derived key -> reader DENIES"; else pa_fail "D4 negative (absent)" "got: ${D4N_OUT:-<empty>}"; fi
 rm -f "$D4N_KEY"
+
+# ---------- SABLE-p84b INTEGRATION: real bd, [no-test] in description ----------
+# Exercises the REAL bd --json read (notes + description) through the REAL gate
+# hook — no stub bd on PATH. Creates a scratch bead in the shared project Dolt
+# db with [no-test] in the DESCRIPTION and empty notes (--sandbox on every write
+# so this test never pushes to the shared remote), then closes it. With NO
+# session evidence file, the gate must ALLOW the single-bead close because the
+# description carries the marker. Keeps a deny leg: a scratch bead with NEITHER
+# marker NOR evidence must still be DENIED.
+
+if ! command -v bd >/dev/null 2>&1; then
+  echo "SKIP (integration): bd not found on PATH"
+else
+  # (a) allow leg — [no-test] lives in the DESCRIPTION only, notes empty.
+  P84B_INT_ID=$(bd create --sandbox \
+    --title="[int-test] tdd-gate p84b no-test-in-description scratch" \
+    --description="Update hooks/tdd-gate.sh docs. [no-test] pure docs/config change, no runtime surface." \
+    --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+
+  if [ -z "$P84B_INT_ID" ]; then
+    echo "SKIP (integration): could not create scratch bead — bd create output did not match ID pattern"
+  else
+    echo "Integration: created scratch bead $P84B_INT_ID"
+    P84B_INT_SID="tdd-gate-p84b-int-$$-$RANDOM"
+    rm -f "/tmp/tdd-evidence-${P84B_INT_SID}"  # ensure the no-evidence path
+    # Real gate, real bd (no stub on PATH): marker is only in the description.
+    P84B_INT_OUT=$(make_input "bd close $P84B_INT_ID" "$P84B_INT_SID" | bash "$HOOK" 2>/dev/null)
+    if [ -z "$P84B_INT_OUT" ]; then
+      pa_pass "p84b integration: real bd, [no-test] in description only, no evidence → gate ALLOWS close"
+    else
+      pa_fail "p84b integration: real bd, [no-test] in description only → gate ALLOWS close" "got: ${P84B_INT_OUT:-<empty>}"
+    fi
+    bd close "$P84B_INT_ID" --sandbox 2>/dev/null || true
+  fi
+
+  # (b) deny leg — real bead with NO marker in either field, no evidence.
+  P84B_DENY_ID=$(bd create --sandbox \
+    --title="[int-test] tdd-gate p84b no-marker scratch" \
+    --description="Implement a real code change in hooks/foo.sh; this needs tests." \
+    --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+  if [ -z "$P84B_DENY_ID" ]; then
+    echo "SKIP (integration): could not create deny-leg scratch bead"
+  else
+    P84B_DENY_SID="tdd-gate-p84b-deny-$$-$RANDOM"
+    rm -f "/tmp/tdd-evidence-${P84B_DENY_SID}"
+    P84B_DENY_OUT=$(make_input "bd close $P84B_DENY_ID" "$P84B_DENY_SID" | bash "$HOOK" 2>/dev/null)
+    if echo "$P84B_DENY_OUT" | grep -q '"permissionDecision": "deny"'; then
+      pa_pass "p84b integration: real bd, no marker in either field, no evidence → gate DENIES close"
+    else
+      pa_fail "p84b integration: real bd, no marker + no evidence → gate DENIES close" "got: ${P84B_DENY_OUT:-<empty>}"
+    fi
+    bd close "$P84B_DENY_ID" --sandbox 2>/dev/null || true
+  fi
+fi
 
 # ---------- Summary ----------
 

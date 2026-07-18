@@ -52,18 +52,21 @@ NONEXISTENT_MODE="$FIXTURE_DIR/mode-absent.json"
 
 # Stub bd:
 #   show <DISP_BEAD> --json     -> a dispatch bead whose description names a file
-#   list --status=in_progress   -> an in-progress bead with a WIP-CLAIMS file
+#   list --status=in_progress   -> an in-progress bead with a wip_claims
+#                                  metadata claim (SABLE-szd: NOT notes —
+#                                  bd update --notes overwrites the whole
+#                                  field, so claims live in metadata instead)
 # The OVERLAP_FILE env var controls whether the in-progress claim collides.
 STUB_DIR="$FIXTURE_DIR/bin"
 mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/bd" <<'STUB'
 #!/usr/bin/env bash
 if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
-  echo '[{"id":"SABLE-disp","description":"implement hooks/foo.sh for the feature","notes":""}]'
+  echo '[{"id":"SABLE-disp","description":"implement hooks/foo.sh for the feature","metadata":{}}]'
   exit 0
 fi
 if [ "$1" = "list" ] && [[ "$*" == *"in_progress"* ]]; then
-  echo "[{\"id\":\"SABLE-wip\",\"title\":\"active work\",\"assignee\":\"tarzan\",\"notes\":\"WIP-CLAIMS: ${OVERLAP_FILE:-}\",\"description\":\"\"}]"
+  echo "[{\"id\":\"SABLE-wip\",\"title\":\"active work\",\"assignee\":\"tarzan\",\"metadata\":{\"wip_claims\":\"${OVERLAP_FILE:-}\"},\"description\":\"\"}]"
   exit 0
 fi
 echo '[]'

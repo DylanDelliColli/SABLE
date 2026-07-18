@@ -73,7 +73,7 @@ _sable_trace_marker_path() {
   local log dir sid
   log=$(_sable_trace_log_path)
   dir=$(dirname "$log" 2>/dev/null) || dir="${HOME:-/tmp}"
-  sid="${CLAUDE_SESSION_ID:-${SABLE_SESSION_ID:-default}}"
+  sid="${CLAUDE_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-${SABLE_SESSION_ID:-default}}}"
   sid=$(printf '%s' "$sid" | tr -c 'A-Za-z0-9._-' '_' 2>/dev/null || echo default)
   printf '%s/.hook-trace-session-%s.start' "$dir" "$sid"
 }

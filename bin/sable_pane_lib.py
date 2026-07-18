@@ -458,9 +458,14 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
     — a signal a still-queued capture can never present). Only if the poll budget
     elapses with the line still queued (or dropped) do we report False and let the
     caller degrade to the durable fallback — never worse than d21h, strictly
-    better whenever the running turn ends within the budget. No Enter is resent on
-    this leg: a queued line auto-submits when the turn ends, and a stray Enter
-    would risk a spurious blank turn.
+    better whenever the running turn ends within the budget. Enter is resent on
+    this leg ONLY when the pane has fallen IDLE with our line still sitting
+    UN-submitted in the editable composer (SABLE-l7uv): that line never became a
+    real queued line (its single Enter was absorbed in the busy->idle redraw) and
+    would never auto-submit, so it needs an Enter — safe because pane_idle proves
+    no turn is running. A genuinely-queued line sits behind a still-busy turn and
+    auto-submits on turn-end, so no Enter is sent for it (a stray Enter into a busy
+    pane risks a spurious blank turn).
 
     The fresh-pane dispatch (sable-spawn-worker) and manager kicks (sable-tmux /
     -spawn-manager) all wait_for_ready first, so their pane is idle at t0 and takes
@@ -490,12 +495,37 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
         # closed now (SABLE-d21h) — which filed a noise bead even when the queue
         # later submitted+landed — DELAY confirmation (SABLE-h0jw): poll until the
         # line PROVABLY became its own submitted turn, failing closed only on a
-        # budget timeout. No Enter is resent (a queued line auto-submits on
-        # turn-end; a stray Enter risks a spurious blank turn).
+        # budget timeout.
         for _ in range(max(1, tries)):
             sleep(interval)
-            if submitted_own_turn(capture(), snippet):
+            cap = capture()
+            if submitted_own_turn(cap, snippet):
                 return True
+            # SABLE-l7uv self-heal (the false-undelivered class msxj's footer path
+            # did NOT retire): the prior turn we were busy behind has ENDED (NO
+            # turn is running now — not pane_working) but our line is sitting
+            # UN-submitted in the now-EDITABLE composer (present, still in the box
+            # — dispatch_landed False). Its single busy-leg Enter was absorbed in
+            # the busy->idle redraw, so it never became a real queued line that
+            # auto-submits on turn-end and will NEVER submit on its own now (the
+            # SABLE-mgyh repro: full text stuck in lincoln's composer, no
+            # queued-messages footer). (Re)send Enter to submit it as its OWN turn.
+            #
+            # Note this must gate on `not pane_working` (a turn is running), NOT on
+            # pane_idle: pane_idle/pane_ready require an EMPTY prompt glyph line,
+            # which a composer HOLDING our text does not have — so pane_idle is
+            # False precisely when the text is stuck in the box. pane_working is the
+            # authoritative not-busy guard (SABLE-tz9f: catches an off-frame busy
+            # marker too), so a genuinely-queued line — which always sits behind a
+            # still-running turn — is excluded and keeps d21h's fail-closed-on-
+            # timeout. Provable-safe against the d21h phantom-confirm: no turn is
+            # running, so there is nothing to drop a queued line, and the Enter
+            # submits OUR non-empty box, not a blank turn. The next poll confirms
+            # via submitted_own_turn once the composer clears and the line lands.
+            if (not pane_working(cap) and _already_pending(cap, snippet)
+                    and not dispatch_landed(cap, snippet)):
+                if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
+                    return False
         return submitted_own_turn(capture(), snippet)
     for _ in range(max(1, tries)):
         sleep(interval)
@@ -718,6 +748,24 @@ def pane_role_tag(base: list[str], pane: str, run=None) -> str | None:
     return val if getattr(r, "returncode", 1) == 0 and val else None
 
 
+def pane_bead_tag(base: list[str], pane: str, run=None) -> str | None:
+    """The CACHED @sable_bead pane option stamped on a worker pane
+    (sable-spawn-worker's worker_pane_tags), or None when unset/unresolvable/no
+    pane given. Used by sable-msg (SABLE-qqcd) to label a WORKER's own sends as
+    'worker:<bead>' instead of the manager lane CLAUDE_AGENT_NAME carries for
+    push-attribution (SABLE-bldh.13) — same cache-not-authority caveat as
+    pane_role_tag applies."""
+    if not pane:
+        return None
+    run = run or _tmux_run
+    try:
+        r = run(base + ["show-options", "-p", "-v", "-t", pane, "@sable_bead"])
+    except Exception:
+        return None
+    val = (getattr(r, "stdout", "") or "").strip()
+    return val if getattr(r, "returncode", 1) == 0 and val else None
+
+
 def resolve_pane_identity(base: list[str], pane: str, run=None,
                           proc_root: str = "/proc") -> str | None:
     """Authoritative identity for a pane: the process env identity WINS over the
@@ -740,6 +788,34 @@ def tag_is_poisoned(base: list[str], pane: str, claimed_role: str, run=None,
     delivery/reaping is unchanged for it."""
     env_id = pane_process_identity(base, pane, run=run, proc_root=proc_root)
     return env_id is not None and env_id != claimed_role
+
+
+def pane_is_live_nonworker_agent(base: list[str], pane: str, run=None,
+                                 proc_root: str = "/proc") -> bool:
+    """True when the pane's LIVE process is an interactive SABLE agent the reaper
+    did NOT spawn as a worker — a resumed operator cockpit ('lincoln') or a
+    resumed manager ('optimus'/'tarzan'/'chuck') now occupying a window whose
+    @sable_* tags are a stale leftover from the worker that finished there
+    (SABLE-to8m, generalized by SABLE-k8o5). Such a pane must never be reaped:
+    killing it destroys a live operator or manager session.
+
+    The authority is the process env, never the mutable tags:
+      * CLAUDE_AGENT_NAME present  -> an interactive agent is running in the pane
+      * SABLE_WORKER_PANE unset    -> it is NOT a worker
+
+    SABLE_WORKER_PANE is the disambiguator, not the name: sable-spawn-worker
+    stamps a worker's CLAUDE_AGENT_NAME to its OWNING MANAGER's lane
+    (worker_env_args), so a genuine done worker and a resumed manager can carry
+    the IDENTICAL CLAUDE_AGENT_NAME (e.g. 'optimus') — only the worker marker
+    tells them apart (the same SABLE_WORKER_PANE marker SABLE-38zi relies on).
+    Returns False (reap proceeds) for a genuine done worker (SABLE_WORKER_PANE=1)
+    and for a bare shell / pane SABLE did not spawn (no CLAUDE_AGENT_NAME) — the
+    latter fails OPEN to the pre-authority tag-only reaping behavior."""
+    pid = pane_pid(base, pane, run=run)
+    if not pid:
+        return False
+    env = _read_environ(pid, proc_root=proc_root)
+    return bool(env.get("CLAUDE_AGENT_NAME")) and not env.get("SABLE_WORKER_PANE")
 
 
 # --- Dispatch throttle knob (SABLE-mmdt), shared by sable-spawn-worker (the

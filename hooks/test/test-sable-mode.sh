@@ -287,6 +287,70 @@ COUNT="$(grep -c '\.claude/sable/' "$GIR/.gitignore" 2>/dev/null)"
 assert_eq "gitignore entry not duplicated on repeat set" "1" "$COUNT"
 rm -rf "$GIR"
 
+# ---------- staleness warning on 'get' (SABLE-rucp) ----------
+# A mode-state whose 'since' predates the threshold should print a stderr
+# warning on `get` (mentioning 'sable-mode clear') without affecting stdout
+# or exit code. A fresh state must stay silent.
+
+fresh_state
+"$MODE_BIN" set planning >/dev/null 2>&1
+# Backdate 'since' well past the default 72h threshold.
+python3 -c "
+import json, os
+p = os.environ['SABLE_MODE_STATE']
+d = json.load(open(p))
+d['since'] = '2020-01-01T00:00:00+0000'
+with open(p, 'w') as f:
+    json.dump(d, f)
+"
+STALE_ERR="$("$MODE_BIN" get 2>&1 >/dev/null)"
+case "$STALE_ERR" in
+  *"sable-mode clear"*) pass "stale get warns on stderr, mentions 'sable-mode clear'" ;;
+  *) fail "stale get warns on stderr, mentions 'sable-mode clear'" "got: $STALE_ERR" ;;
+esac
+assert_eq "stale get still prints bare mode on stdout" "planning" "$("$MODE_BIN" get 2>/dev/null)"
+
+fresh_state
+"$MODE_BIN" set planning >/dev/null 2>&1
+FRESH_ERR="$("$MODE_BIN" get 2>&1 >/dev/null)"
+assert_eq "fresh get emits no staleness warning" "" "$FRESH_ERR"
+
+# SABLE_MODE_STALE_HOURS override lowers/raises the threshold.
+fresh_state
+"$MODE_BIN" set planning >/dev/null 2>&1
+python3 -c "
+import json, os
+from datetime import datetime, timezone, timedelta
+p = os.environ['SABLE_MODE_STATE']
+d = json.load(open(p))
+d['since'] = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%S%z')
+with open(p, 'w') as f:
+    json.dump(d, f)
+"
+OVERRIDE_ERR="$(SABLE_MODE_STALE_HOURS=1 "$MODE_BIN" get 2>&1 >/dev/null)"
+case "$OVERRIDE_ERR" in
+  *"sable-mode clear"*) pass "SABLE_MODE_STALE_HOURS override triggers warning early" ;;
+  *) fail "SABLE_MODE_STALE_HOURS override triggers warning early" "got: $OVERRIDE_ERR" ;;
+esac
+
+# ---------- clear subcommand (SABLE-rucp) ----------
+
+fresh_state
+"$MODE_BIN" set planning >/dev/null 2>&1
+"$MODE_BIN" clear >/dev/null 2>&1
+assert_zero "clear exits zero when state existed" "$?"
+if [ ! -f "$SABLE_MODE_STATE" ]; then
+  pass "clear removes the state file"
+else
+  fail "clear removes the state file" "file still present"
+fi
+"$MODE_BIN" get >/dev/null 2>&1
+assert_nonzero "get after clear exits nonzero" "$?"
+
+fresh_state
+"$MODE_BIN" clear >/dev/null 2>&1
+assert_nonzero "clear with no state exits nonzero" "$?"
+
 # ---------- Summary ----------
 
 echo

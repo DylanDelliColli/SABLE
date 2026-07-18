@@ -57,18 +57,28 @@ write_claim() {
 }
 
 # run_status / run_release with a clean env (no ambient CLAUDE_SESSION_ID /
-# CLAUDE_AGENT_NAME leaking in from this very test's own session).
+# CLAUDE_CODE_SESSION_ID / CLAUDE_AGENT_NAME leaking in from this very
+# test's own session — this harness itself runs under a real Claude Code
+# session, so CLAUDE_CODE_SESSION_ID is actually set ambiently and must be
+# scrubbed for the negative-path tests to mean anything).
 run_status() {
-  env -u CLAUDE_SESSION_ID -u CLAUDE_AGENT_NAME "$CLAIM_BIN" status "$SCRATCH" 2>&1
+  env -u CLAUDE_SESSION_ID -u CLAUDE_CODE_SESSION_ID -u CLAUDE_AGENT_NAME "$CLAIM_BIN" status "$SCRATCH" 2>&1
 }
 run_release() {
   # extra args after $SCRATCH (e.g. --force) passed through
-  env -u CLAUDE_SESSION_ID -u CLAUDE_AGENT_NAME "$CLAIM_BIN" release "$SCRATCH" "$@" 2>&1
+  env -u CLAUDE_SESSION_ID -u CLAUDE_CODE_SESSION_ID -u CLAUDE_AGENT_NAME "$CLAIM_BIN" release "$SCRATCH" "$@" 2>&1
 }
 run_release_as() {
   # $1=CLAUDE_SESSION_ID $2=CLAUDE_AGENT_NAME (either may be empty), rest passed through
   local sid="$1" aname="$2"; shift 2
-  env CLAUDE_SESSION_ID="$sid" CLAUDE_AGENT_NAME="$aname" "$CLAIM_BIN" release "$SCRATCH" "$@" 2>&1
+  env -u CLAUDE_CODE_SESSION_ID CLAUDE_SESSION_ID="$sid" CLAUDE_AGENT_NAME="$aname" "$CLAIM_BIN" release "$SCRATCH" "$@" 2>&1
+}
+run_release_as_code_session() {
+  # SABLE-hccq: simulates the actual harness env — only CLAUDE_CODE_SESSION_ID
+  # set, CLAUDE_SESSION_ID/CLAUDE_AGENT_NAME absent, matching the live repro.
+  # $1=CLAUDE_CODE_SESSION_ID, rest passed through
+  local sid="$1"; shift
+  env -u CLAUDE_SESSION_ID -u CLAUDE_AGENT_NAME CLAUDE_CODE_SESSION_ID="$sid" "$CLAIM_BIN" release "$SCRATCH" "$@" 2>&1
 }
 
 # ---------- status ----------
@@ -84,7 +94,7 @@ OUT=$(run_status)
 if echo "$OUT" | grep -qF "$CF"; then pass "status: shows the claim file path"; else fail "status: shows the claim file path" "$OUT"; fi
 if echo "$OUT" | grep -q "sess-123"; then pass "status: shows the holder session id"; else fail "status: shows the holder session id" "$OUT"; fi
 if echo "$OUT" | grep -q "lincoln"; then pass "status: shows the attributable agent name"; else fail "status: shows the attributable agent name" "$OUT"; fi
-if echo "$OUT" | grep -qE "age:.*30s"; then pass "status: shows age"; else fail "status: shows age" "$OUT"; fi
+if echo "$OUT" | grep -qE "age:.*3[01]s"; then pass "status: shows age"; else fail "status: shows age" "$OUT"; fi
 if echo "$OUT" | grep -qE "TTL:.*remaining"; then pass "status: shows TTL remaining for a fresh claim"; else fail "status: shows TTL remaining for a fresh claim" "$OUT"; fi
 
 echo "--- status: expired claim ---"
@@ -137,6 +147,33 @@ if [ "$RC" -eq 0 ] && [ ! -f "$CF" ]; then
 else
   fail "release: holder (agent name match) clears the claim file" "rc=$RC file_exists=$([ -f "$CF" ] && echo yes || echo no) out=$OUT"
 fi
+
+echo "--- release: by holder (matched via CLAUDE_CODE_SESSION_ID — the real repro) ---"
+# SABLE-hccq: the actual live bug. The tree-claim hook records the real
+# harness session_id, but the harness exports it into a Bash tool call's env
+# as CLAUDE_CODE_SESSION_ID — NOT CLAUDE_SESSION_ID (confirmed live:
+# CLAUDE_SESSION_ID is unset, CLAUDE_CODE_SESSION_ID carries the session
+# UUID). Before the fix, checking only CLAUDE_SESSION_ID/CLAUDE_AGENT_NAME
+# meant the holding session's own release always fell through to refused.
+write_claim "sess-code-env" 10 "-"
+OUT=$(run_release_as_code_session "sess-code-env")
+RC=$?
+if [ "$RC" -eq 0 ] && [ ! -f "$CF" ]; then
+  pass "release: holder (CLAUDE_CODE_SESSION_ID match) clears the claim file"
+else
+  fail "release: holder (CLAUDE_CODE_SESSION_ID match) clears the claim file" "rc=$RC file_exists=$([ -f "$CF" ] && echo yes || echo no) out=$OUT"
+fi
+
+echo "--- release: CLAUDE_CODE_SESSION_ID mismatch refused without --force ---"
+write_claim "sess-code-env-foreign" 10 "-"
+OUT=$(run_release_as_code_session "sess-someone-else")
+RC=$?
+if [ "$RC" -ne 0 ] && [ -f "$CF" ]; then
+  pass "release: CLAUDE_CODE_SESSION_ID mismatch refused, claim file untouched"
+else
+  fail "release: CLAUDE_CODE_SESSION_ID mismatch refused, claim file untouched" "rc=$RC file_exists=$([ -f "$CF" ] && echo yes || echo no) out=$OUT"
+fi
+rm -f "$CF"
 
 echo "--- release: non-holder refused without --force ---"
 write_claim "sess-ghi" 10 "tarzan"

@@ -22,10 +22,18 @@
 # Claude-Code-issued session_id to compare directly. It proves holder-ness
 # via whichever of these the caller's environment actually carries:
 #   1. $CLAUDE_SESSION_ID matches the claim's session_id field, OR
-#   2. $CLAUDE_AGENT_NAME matches the claim's agent_name field
-# Neither set (the common case for an unnamed session) => release requires
-# --force — the operator/manager override, mirroring
-# SABLE_TREE_CLAIM_OVERRIDE=1 in the hook itself.
+#   2. $CLAUDE_CODE_SESSION_ID matches the claim's session_id field (SABLE-hccq)
+#      — the actual env var Claude Code exports into a Bash tool call's
+#      environment is CLAUDE_CODE_SESSION_ID, not CLAUDE_SESSION_ID (confirmed
+#      live: CLAUDE_SESSION_ID is unset while CLAUDE_CODE_SESSION_ID carries
+#      the session UUID). Checking only the wrong name is why the holding
+#      session's own release always fell through to the refusal below and
+#      needed --force. CLAUDE_SESSION_ID is kept for any environment that
+#      does set it (a legacy/alternate launcher).
+#   3. $CLAUDE_AGENT_NAME matches the claim's agent_name field
+# None set/matching (the common case for an unnamed session — a genuinely
+# foreign holder) => release requires --force — the operator/manager
+# override, mirroring SABLE_TREE_CLAIM_OVERRIDE=1 in the hook itself.
 
 set -eu
 
@@ -115,6 +123,13 @@ cmd_release() {
   if [ -n "${CLAUDE_SESSION_ID:-}" ] && [ "${CLAUDE_SESSION_ID:-}" = "$session" ]; then
     is_holder=1
   fi
+  # SABLE-hccq: the env var Claude Code actually exports into a Bash tool
+  # call's environment is CLAUDE_CODE_SESSION_ID, not CLAUDE_SESSION_ID — see
+  # the holder-identity note above. This is the check that was missing and
+  # made every self-release fall through to --force.
+  if [ "$is_holder" -eq 0 ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] && [ "${CLAUDE_CODE_SESSION_ID:-}" = "$session" ]; then
+    is_holder=1
+  fi
   if [ "$is_holder" -eq 0 ] && [ -n "${CLAUDE_AGENT_NAME:-}" ] && [ "${CLAUDE_AGENT_NAME:-}" = "$agent" ]; then
     is_holder=1
   fi
@@ -125,7 +140,7 @@ cmd_release() {
     return 0
   fi
 
-  echo "sable-claim: refused — claim on '$repo' is held by '$session' (agent '$agent'), which does not match this session (CLAUDE_SESSION_ID=${CLAUDE_SESSION_ID:-<unset>}, CLAUDE_AGENT_NAME=${CLAUDE_AGENT_NAME:-<unset>}). Use --force to override (operator/manager escape hatch)." >&2
+  echo "sable-claim: refused — claim on '$repo' is held by '$session' (agent '$agent'), which does not match this session (CLAUDE_SESSION_ID=${CLAUDE_SESSION_ID:-<unset>}, CLAUDE_CODE_SESSION_ID=${CLAUDE_CODE_SESSION_ID:-<unset>}, CLAUDE_AGENT_NAME=${CLAUDE_AGENT_NAME:-<unset>}). Use --force to override (operator/manager escape hatch)." >&2
   return 1
 }
 

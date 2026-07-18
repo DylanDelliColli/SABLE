@@ -4,13 +4,14 @@
 #
 # Verifies that:
 #   - PreToolUse:Edit/Write with agent_id + file_path + a transcript mentioning
-#     a bead ID → the hook appends WIP-CLAIMS via `bd update --notes`.
+#     a bead ID → the hook appends to wip_claims via `bd update --set-metadata`
+#     (SABLE-szd: NOT `--notes`, which overwrites the whole field).
 #   - No agent_id (manager/main-session context, not a subagent) → hook stands
 #     down (no bd calls).
 #   - No file_path / no transcript_path → hook stands down.
 #   - Test/generated file paths (.test., .spec., __tests__, __pycache__,
 #     .next/, node_modules/) are skipped — not claim-worthy overlap surface.
-#   - A file already present in WIP-CLAIMS is not re-appended.
+#   - A file already present in wip_claims is not re-appended.
 #
 # SABLE-lfql: the hook's bd update call must carry --sandbox — bd auto-pushes
 # to the shared Dolt remote on every mutating write (create/update/close) by
@@ -187,12 +188,12 @@ else
   pass "test file path (.test.) is skipped (no bd calls)"
 fi
 
-# --- Test 8: file already present in WIP-CLAIMS is not re-appended ---
+# --- Test 8: file already present in wip_claims metadata is not re-appended ---
 cat > "$STUB_DIR/bd" <<'STUB'
 #!/usr/bin/env bash
 echo "BD_CALLED: $*" >> "$BD_CALL_LOG"
 if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
-  echo '[{"id":"SABLE-stub","description":"hooks/foo.sh is the implementation","notes":"WIP-CLAIMS: hooks/foo.sh"}]'
+  echo '[{"id":"SABLE-stub","description":"hooks/foo.sh is the implementation","metadata":{"wip_claims":"hooks/foo.sh"}}]'
   exit 0
 fi
 exit 0
@@ -200,9 +201,9 @@ STUB
 chmod +x "$STUB_DIR/bd"
 run_hook "$(make_edit_input "hooks/foo.sh" "agent-abc-123" "$TRANSCRIPT")" >/dev/null
 if grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
-  fail "file already in WIP-CLAIMS → not re-appended (no bd update)" "bd calls: $(cat "$BD_CALL_LOG")"
+  fail "file already in wip_claims → not re-appended (no bd update)" "bd calls: $(cat "$BD_CALL_LOG")"
 else
-  pass "file already in WIP-CLAIMS → not re-appended (no bd update)"
+  pass "file already in wip_claims → not re-appended (no bd update)"
 fi
 restore_plain_stub
 
@@ -287,20 +288,20 @@ else
     INT_INPUT=$(make_edit_input "hooks/foo.sh" "agent-int-001" "$INT_TRANSCRIPT")
     printf '%s' "$INT_INPUT" | bash "$HOOK" 2>/dev/null
 
-    NOTES=$(bd show "$SCRATCH_ID" --json 2>/dev/null | python3 -c "
+    CLAIMS=$(bd show "$SCRATCH_ID" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
     if isinstance(d, list) and d:
-        print(d[0].get('notes', '') or '')
+        print((d[0].get('metadata', {}) or {}).get('wip_claims', '') or '')
 except Exception:
     pass
 " 2>/dev/null || echo "")
 
-    if echo "$NOTES" | grep -q 'WIP-CLAIMS'; then
-      pass "integration: bead $SCRATCH_ID has WIP-CLAIMS in notes after hook run"
+    if [ -n "$CLAIMS" ]; then
+      pass "integration: bead $SCRATCH_ID has wip_claims metadata after hook run"
     else
-      fail "integration: bead $SCRATCH_ID has WIP-CLAIMS in notes after hook run" "notes: '$NOTES'"
+      fail "integration: bead $SCRATCH_ID has wip_claims metadata after hook run" "metadata: '$CLAIMS'"
     fi
 
     bd close "$SCRATCH_ID" --sandbox 2>/dev/null || true

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# edit-write-claim-reconciler.sh — Append emergent file claims to bead notes
+# edit-write-claim-reconciler.sh — Append emergent file claims to bead metadata
 # Trigger: PreToolUse:Edit|Write | Timeout: 3000ms
 #
 # When a worker (subagent) modifies a file not declared in the bead description,
-# append the file path to the bead's WIP-CLAIMS so other dispatches see it.
+# append the file path to the bead's `wip_claims` metadata field (SABLE-szd:
+# NOT notes — see pre-dispatch-claim.sh for why) so other dispatches see it.
 #
 # Only fires inside subagent contexts (managers don't typically edit files directly
 # in this pattern — they dispatch workers). Fast-exit if no agent_id.
@@ -59,45 +60,27 @@ if ids:
 
 [ -z "$BEAD_ID" ] && exit 0
 
-# Read current notes
-CURRENT=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
+# Read current claims from the dedicated metadata field (SABLE-szd: NOT
+# notes — bd update --notes overwrites the whole field, and this hook fires
+# on every Edit/Write, so a notes-overwrite from anywhere else in the bead's
+# life would otherwise clobber this claim on the very next reconcile).
+CURRENT_CLAIMS=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     data = json.load(sys.stdin)
     if isinstance(data, list) and data:
-        print(data[0].get('notes', '') or '')
+        print((data[0].get('metadata', {}) or {}).get('wip_claims', '') or '')
 except Exception:
     pass
 " 2>/dev/null || echo "")
 
 # If file already in claims, skip
-echo "$CURRENT" | grep -qF "$FILE_PATH" && exit 0
+echo "$CURRENT_CLAIMS" | grep -qF "$FILE_PATH" && exit 0
 
-# Append to claims
-if echo "$CURRENT" | grep -q "^WIP-CLAIMS:"; then
-  # Existing claim line — append file
-  NEW_NOTES=$(echo "$CURRENT" | FILE_PATH="$FILE_PATH" python3 -c "
-import sys, os
-file_path = os.environ.get('FILE_PATH', '')
-text = sys.stdin.read()
-lines = text.split('\n')
-out = []
-for line in lines:
-    if line.startswith('WIP-CLAIMS:'):
-        existing = line[len('WIP-CLAIMS:'):].strip()
-        out.append(f'WIP-CLAIMS: {existing}, {file_path}')
-    else:
-        out.append(line)
-print('\n'.join(out))
-")
+if [ -n "$CURRENT_CLAIMS" ]; then
+  NEW_CLAIMS="${CURRENT_CLAIMS}, ${FILE_PATH}"
 else
-  # No claim line yet — add one
-  if [ -n "$CURRENT" ]; then
-    NEW_NOTES="${CURRENT}
-WIP-CLAIMS: ${FILE_PATH}"
-  else
-    NEW_NOTES="WIP-CLAIMS: ${FILE_PATH}"
-  fi
+  NEW_CLAIMS="$FILE_PATH"
 fi
 
 # SABLE-lfql: --sandbox disables bd's Dolt auto-push (SABLE-rq9k). bd pushes to
@@ -107,6 +90,6 @@ fi
 # chuck-only-convention violation behind the 2026-07-09 cross-fleet corruption
 # incident. --sandbox disables the push WITHOUT blocking the write (unlike
 # --readonly, which would drop it); Chuck's batched pull+push carries it later.
-bd update "$BEAD_ID" --sandbox --notes "$NEW_NOTES" >/dev/null 2>&1 || true
+bd update "$BEAD_ID" --sandbox --set-metadata "wip_claims=$NEW_CLAIMS" >/dev/null 2>&1 || true
 
 exit 0

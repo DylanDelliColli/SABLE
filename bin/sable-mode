@@ -27,8 +27,10 @@
 #
 # Usage:
 #   sable-mode set <planning|execution> [--fleet a,b,c]
-#   sable-mode get                 # print the bare mode word (nonzero if unset)
+#   sable-mode get                 # print the bare mode word (nonzero if unset);
+#                                  # warns on stderr if the state is stale
 #   sable-mode show                # print the full JSON (nonzero if unset)
+#   sable-mode clear                # delete the mode-state file
 #   sable-mode substage get        # print the planning substage (nonzero if none)
 #   sable-mode substage set <name> # set substage to a named stage
 #   sable-mode substage advance    # move to the next substage (nonzero past end)
@@ -84,6 +86,37 @@ ensure_state_gitignored() {
 
 STATE="$(resolve_state_path)"
 
+# Staleness threshold (hours) for the 'get' warning below — overridable for
+# tests. A mode-state older than this almost certainly outlived the session
+# that wrote it (SABLE-rucp: a discovery-tier state from 2026-06-26 was still
+# being read as live 12 days later with a clean tree and no active run).
+STALE_HOURS="${SABLE_MODE_STALE_HOURS:-72}"
+
+# warn_if_stale <state-path> — best-effort stderr warning when the state's
+# 'since' timestamp is older than STALE_HOURS. Advisory only: never affects
+# exit code or stdout, silent on any parse error.
+warn_if_stale() {
+    STATE="$1" STALE_HOURS="$STALE_HOURS" python3 -c "
+import json, os, sys
+from datetime import datetime, timezone
+try:
+    d = json.load(open(os.environ['STATE']))
+    since = d.get('since') or ''
+    if not since:
+        sys.exit(0)
+    ts = datetime.strptime(since, '%Y-%m-%dT%H:%M:%S%z')
+    age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
+    if age_hours > float(os.environ['STALE_HOURS']):
+        print(
+            \"sable-mode: WARNING - mode-state is stale (%.1fd old, mode=%s, since %s) - if this session has ended, run 'sable-mode clear'\"
+            % (age_hours / 24.0, d.get('mode', '') or '?', since),
+            file=sys.stderr,
+        )
+except Exception:
+    pass
+"
+}
+
 usage() {
     cat <<EOF
 sable-mode — read/write the orchestration mode-state file.
@@ -95,9 +128,12 @@ Usage:
       the planning tier (default full); quick telescopes the backlog gate, and
       discovery (Mode 1) is the lightest sub-mode — no backlog gate, since
       Discovery authors no implementation beads (it writes charters).
-  sable-mode get      Print the current mode word; nonzero exit if unset.
+  sable-mode get      Print the current mode word; nonzero exit if unset. Warns
+                      on stderr (SABLE_MODE_STALE_HOURS, default 72) when the
+                      state is older than that and suggests 'sable-mode clear'.
   sable-mode show     Print the full mode-state JSON; nonzero exit if unset.
   sable-mode path     Print the resolved mode-state file path (no state needed).
+  sable-mode clear    Delete the mode-state file; nonzero exit if none exists.
   sable-mode substage get        Print the current planning substage; nonzero
                                  if unset or not in planning mode.
   sable-mode substage set <name> Set the substage to one of:
@@ -140,6 +176,7 @@ case "$cmd" in
         ;;
     get)
         require_state
+        warn_if_stale "$STATE"
         STATE="$STATE" python3 -c "import json,os; print(json.load(open(os.environ['STATE'])).get('mode','') or '')"
         ;;
     show)
@@ -150,6 +187,18 @@ case "$cmd" in
         # Print the resolved state-file path. No state required — answers
         # "where would the mode-state for this repo live?" even when unset.
         printf '%s\n' "$STATE"
+        ;;
+    clear)
+        # Remove the mode-state file — the remedy the 'get' staleness warning
+        # suggests (SABLE-rucp). Idempotent-ish: nonzero + stderr message if
+        # there was nothing to clear, mirroring require_state's own message.
+        if [ -f "$STATE" ]; then
+            rm -f "$STATE"
+            printf 'sable-mode: cleared mode-state at %s\n' "$STATE"
+        else
+            printf 'sable-mode: no mode set (no state file at %s)\n' "$STATE" >&2
+            exit 1
+        fi
         ;;
     set)
         if ! orchestration_enabled; then

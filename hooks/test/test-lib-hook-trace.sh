@@ -199,6 +199,59 @@ else
 fi
 
 # ==========================================================================
+# SABLE-kqff — session-marker sid fallback chain includes CLAUDE_CODE_SESSION_ID
+# ==========================================================================
+# No SABLE_HOOK_TRACE_SESSION_MARKER override here: exercise the REAL
+# _sable_trace_marker_path sid resolution (CLAUDE_SESSION_ID ->
+# CLAUDE_CODE_SESSION_ID -> SABLE_SESSION_ID -> default).
+
+sanitize_sid() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# (a) CLAUDE_SESSION_ID unset, CLAUDE_CODE_SESSION_ID set: the harness var must
+# be picked up rather than falling back to 'default'.
+KQFF_LOG="$WORK/kqff-a.log"; KQFF_CAP="$WORK/kqff-a.cap"
+KQFF_UUID="cc-session-11111111-2222"
+rm -f "$KQFF_LOG"
+printf '%s' '{}' | $HEADLESS env -u TERM -u SABLE_HOOK_TRACE_SESSION_MARKER -u CLAUDE_SESSION_ID -u SABLE_SESSION_ID \
+  SABLE_WORKER_PANE=zzz CLAUDE_AGENT_NAME=zzz \
+  SABLE_HOOK_TRACE_LOG="$KQFF_LOG" \
+  CLAUDE_CODE_SESSION_ID="$KQFF_UUID" \
+  CAPTURE="$KQFF_CAP" \
+  bash "$DRIVER" "$LIB" kqffhook >/dev/null 2>&1
+KQFF_EXPECT_SID=$(sanitize_sid "$KQFF_UUID")
+KQFF_MARKER="$WORK/.hook-trace-session-${KQFF_EXPECT_SID}.start"
+if [ -f "$KQFF_MARKER" ]; then
+  pass "SABLE-kqff: CLAUDE_CODE_SESSION_ID is used in the sid fallback (marker: $KQFF_MARKER)"
+else
+  fail "SABLE-kqff: CLAUDE_CODE_SESSION_ID is used in the sid fallback" "expected marker $KQFF_MARKER not found; dir listing: $(ls "$WORK" 2>/dev/null)"
+fi
+if ls "$WORK"/.hook-trace-session-default.start >/dev/null 2>&1; then
+  fail "SABLE-kqff: sid must not fall back to 'default' when CLAUDE_CODE_SESSION_ID is set" "found default marker in $WORK"
+else
+  pass "SABLE-kqff: sid does not fall back to 'default' when CLAUDE_CODE_SESSION_ID is set"
+fi
+
+# (b) CLAUDE_SESSION_ID still wins over CLAUDE_CODE_SESSION_ID when both are set
+# (precedence unchanged from before this fix).
+KQFF_LOG_B="$WORK/kqff-b.log"; KQFF_CAP_B="$WORK/kqff-b.cap"
+KQFF_LEGACY_ID="legacy-session-99"
+rm -f "$KQFF_LOG_B"
+printf '%s' '{}' | $HEADLESS env -u TERM -u SABLE_HOOK_TRACE_SESSION_MARKER -u SABLE_SESSION_ID \
+  SABLE_WORKER_PANE=zzz CLAUDE_AGENT_NAME=zzz \
+  SABLE_HOOK_TRACE_LOG="$KQFF_LOG_B" \
+  CLAUDE_SESSION_ID="$KQFF_LEGACY_ID" \
+  CLAUDE_CODE_SESSION_ID="should-not-be-used" \
+  CAPTURE="$KQFF_CAP_B" \
+  bash "$DRIVER" "$LIB" kqffhookb >/dev/null 2>&1
+KQFF_EXPECT_SID_B=$(sanitize_sid "$KQFF_LEGACY_ID")
+KQFF_MARKER_B="$WORK/.hook-trace-session-${KQFF_EXPECT_SID_B}.start"
+if [ -f "$KQFF_MARKER_B" ]; then
+  pass "SABLE-kqff: CLAUDE_SESSION_ID still takes precedence over CLAUDE_CODE_SESSION_ID"
+else
+  fail "SABLE-kqff: CLAUDE_SESSION_ID still takes precedence over CLAUDE_CODE_SESSION_ID" "expected marker $KQFF_MARKER_B not found; dir listing: $(ls "$WORK" 2>/dev/null)"
+fi
+
+# ==========================================================================
 # S1-E4 — KILLED writer (SIGKILL mid-payload) still leaves the ENTRY line on disk
 # ==========================================================================
 # A writer opens a FIFO, emits a PARTIAL payload, and is SIGKILLed while the

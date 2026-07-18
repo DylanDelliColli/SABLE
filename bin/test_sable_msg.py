@@ -146,6 +146,83 @@ def test_parse_args_bead_flag():
     assert ns.bead is True
 
 
+# --- default sender label: worker sends must not wear the lane manager's name
+# (SABLE-qqcd) -----------------------------------------------------------------
+# sable-spawn-worker:696 stamps a worker pane's CLAUDE_AGENT_NAME with the
+# owning LANE MANAGER's name (deliberately, for push-attribution, SABLE-bldh.13)
+# and SABLE_WORKER_PANE=1 ALWAYS (sable-spawn-worker:697, the SABLE-38zi
+# disambiguator). Before this fix sable-msg's --from default consulted only
+# CLAUDE_AGENT_NAME, so a worker's own send was framed from=<manager> —
+# indistinguishable from a real directive from that manager.
+
+def test_resolve_from_worker_pane_labels_as_worker_bead(monkeypatch):
+    monkeypatch.setenv("SABLE_WORKER_PANE", "1")
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "tarzan")
+    monkeypatch.setenv("SABLE_BEAD", "SABLE-x1")
+    assert sable_msg.resolve_from() == "worker:SABLE-x1"
+
+
+def test_resolve_from_worker_pane_without_sable_bead_env_uses_own_pane_tag(monkeypatch):
+    # No $SABLE_BEAD -> falls back to the sending pane's own @sable_bead tag
+    # (the tag sable-spawn-worker's worker_pane_tags stamps on every worker pane).
+    monkeypatch.setenv("SABLE_WORKER_PANE", "1")
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "tarzan")
+    monkeypatch.delenv("SABLE_BEAD", raising=False)
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    monkeypatch.setattr(
+        sable_msg, "pane_bead_tag",
+        lambda base, pane, run=None: "SABLE-y2" if pane == "%7" else None,
+    )
+    assert sable_msg.resolve_from() == "worker:SABLE-y2"
+
+
+def test_resolve_from_worker_pane_unresolvable_bead_falls_back_to_plain_worker(monkeypatch):
+    monkeypatch.setenv("SABLE_WORKER_PANE", "1")
+    monkeypatch.delenv("SABLE_BEAD", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    assert sable_msg.resolve_from() == "worker"
+
+
+def test_resolve_from_manager_pane_keeps_lane_name_regression_guard(monkeypatch):
+    # Without SABLE_WORKER_PANE (a real manager pane), CLAUDE_AGENT_NAME must
+    # still resolve to the lane name -- this fix must not relabel managers.
+    monkeypatch.delenv("SABLE_WORKER_PANE", raising=False)
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "tarzan")
+    assert sable_msg.resolve_from() == "tarzan"
+
+
+def test_resolve_from_operator_default_when_nothing_set(monkeypatch):
+    monkeypatch.delenv("SABLE_WORKER_PANE", raising=False)
+    monkeypatch.delenv("CLAUDE_AGENT_NAME", raising=False)
+    assert sable_msg.resolve_from() == "operator"
+
+
+def test_main_worker_pane_default_from_labels_as_worker(monkeypatch, capsys):
+    monkeypatch.setenv("SABLE_WORKER_PANE", "1")
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "tarzan")
+    monkeypatch.setenv("SABLE_BEAD", "SABLE-i8kv")
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
+    rc = sable_msg.main(["tarzan", "status update"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "worker:SABLE-i8kv -> tarzan" in err
+
+
+def test_main_explicit_from_overrides_worker_default(monkeypatch, capsys):
+    # An explicit --from must still win over the worker-pane default.
+    monkeypatch.setenv("SABLE_WORKER_PANE", "1")
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "tarzan")
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
+    rc = sable_msg.main(["optimus", "status update", "--from", "lincoln"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "lincoln -> optimus" in err
+
+
 # --- main: missing role is a hard error -------------------------------------
 
 def test_main_missing_role_errors(monkeypatch, capsys):
@@ -868,6 +945,99 @@ def test_deliver_text_idle_at_t0_always_types_even_if_snippet_coincidentally_vis
     )
     assert landed is True
     assert state["type_calls"] == 1
+
+
+# --- busy-at-t0 submit-race self-heal (SABLE-l7uv) --------------------------
+# The false-undelivered class the msxj footer path did NOT retire. The original
+# repro (SABLE-mgyh) is explicitly "NOT the queued-behind-a-turn state": our line
+# sits UN-submitted in the recipient's EDITABLE composer (prompt-glyph line, NO
+# 'Press up to edit queued messages' footer). The mechanism: the pane was BUSY at
+# t0 (finishing the PRIOR turn — 'Baked for 8s' rendering), so deliver_text took
+# the busy leg and sent Enter exactly ONCE; that Enter was absorbed in the
+# busy->idle redraw, the prior turn then ended, and our text was left sitting in
+# the now-EDITABLE composer. Because the busy leg never resent Enter, the line
+# would NEVER auto-submit (it was never a real queued line) and submitted_own_turn
+# could never confirm it -> the poll budget timed out -> false 'undelivered' +
+# durable fallback bead, while the message sat visibly stuck. The fix: on the busy
+# leg, once the pane has fallen IDLE with our snippet still un-submitted in the
+# editable box, (re)send Enter to submit it as its own turn.
+
+
+def test_deliver_text_busy_at_t0_then_idle_with_text_stuck_in_box_resends_enter_l7uv():
+    # THE SABLE-l7uv repro, at the helper it lives in. Busy at t0; our Enter is
+    # absorbed in the redraw so the first poll shows the pane fallen IDLE with the
+    # snippet sitting UN-submitted in the editable composer (no footer, no busy
+    # line). submitted_own_turn cannot confirm this (dispatch_landed False on an
+    # idle pane == text still in box; no queued-footer). The busy leg must
+    # self-heal by RE-SENDING Enter; the stand-in then submits it, and the next
+    # poll confirms LANDED. Pre-fix: no Enter is ever resent -> times out -> False.
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    other_turn = "● Baking the prior turn…\n✻ Thinking… (8s · esc to interrupt)"
+    state = {"typed": False, "submitted": False, "enter_after_type": 0}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
+        elif cmd[-1] == "Enter" and state["typed"]:
+            state["enter_after_type"] += 1
+            # The FIRST post-type Enter is the absorbed one (busy->idle redraw);
+            # the SECOND (the self-heal resend on the idle editable box) submits.
+            if state["enter_after_type"] >= 2:
+                state["submitted"] = True
+        return True
+
+    def capture():
+        if not state["typed"]:
+            return f"{other_turn}\n❯ \n  ddc@host:~/wt"          # busy at t0
+        if not state["submitted"]:
+            # prior turn ended; our line sits in the EDITABLE composer, no footer,
+            # no busy status -> pane_idle True, dispatch_landed False (still in box)
+            return f"❯ {message}\n  ddc@host:~/wt"
+        # the self-heal Enter submitted it as its own turn
+        return f"● prior done\n❯ {message}\n✻ Thinking… (1s · esc to interrupt)"
+
+    landed = sable_pane_lib.deliver_text(
+        ["tmux"], "%5", message, message,
+        tries=8, interval=0.01, run=run, capture=capture, sleep=lambda s: None,
+    )
+    assert landed is True
+    assert state["enter_after_type"] >= 2, "the busy leg must resend Enter to submit the stuck line"
+
+
+def test_deliver_text_busy_at_t0_genuinely_queued_no_selfheal_double_submit_l7uv():
+    # The guard against the d21h phantom-confirm regression: a line GENUINELY
+    # queued behind a still-running turn (pane stays BUSY, line hoisted above the
+    # composer) must NOT trigger the self-heal Enter — pane_idle is False the whole
+    # time, so no stray Enter is sent, and when the turn ends the line auto-submits
+    # and is confirmed by submitted_own_turn. Exactly one submission, never two.
+    message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    other_turn = "● Running the merge gate…\n✻ Thinking… (12s · esc to interrupt)"
+    state = {"typed": False, "polls": 0, "enter_after_type": 0}
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
+        elif cmd[-1] == "Enter" and state["typed"]:
+            state["enter_after_type"] += 1
+        return True
+
+    def capture():
+        if not state["typed"]:
+            return f"{other_turn}\n❯ \n  ddc@host:~/wt"          # busy at t0
+        state["polls"] += 1
+        if state["polls"] < 3:
+            # genuinely queued: hoisted above the composer, the OTHER turn still
+            # running (busy) -> pane_idle False, self-heal must NOT fire.
+            return f"{message}\n{other_turn}\n❯ \n  ddc@host:~/wt"
+        # turn ended, our queued line auto-submitted as its own turn
+        return f"● gate done\n❯ {message}\n✻ Thinking… (1s · esc to interrupt)"
+
+    landed = sable_pane_lib.deliver_text(
+        ["tmux"], "%21", message, message,
+        tries=8, interval=0.01, run=run, capture=capture, sleep=lambda s: None,
+    )
+    assert landed is True
+    assert state["enter_after_type"] == 1, "a genuinely-queued busy line must get NO self-heal Enter"
 
 
 # --- interrupt idle-wait state machine (SABLE-m6is) -------------------------

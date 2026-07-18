@@ -38,8 +38,14 @@ manual bead-filing hint.
 
 Usage:
   sable-msg <to-role> "<text>" [--from <role>] [--interrupt] [--bead]
-    --from <role>   sender label for the framing header (default: $CLAUDE_AGENT_NAME
-                    or "operator")
+    --from <role>   sender label for the framing header. Default: on a WORKER
+                    pane (SABLE_WORKER_PANE=1) this is ALWAYS 'worker:<bead>'
+                    (or plain 'worker' if the bead can't be resolved) — NEVER
+                    $CLAUDE_AGENT_NAME, which on a worker pane is stamped with
+                    the owning LANE MANAGER's name for push-attribution
+                    (SABLE-bldh.13), not the worker's own identity (SABLE-qqcd:
+                    a worker's self-report must not be framed as its manager's
+                    directive). Elsewhere: $CLAUDE_AGENT_NAME, or "operator".
     --interrupt     send Escape first so the message lands NOW instead of queueing
                     behind the recipient's current turn
     --bead          resolve <to-role> as a bead id against a WORKER pane's
@@ -47,7 +53,11 @@ Usage:
 
 Env:
   SABLE_TMUX_SOCKET      tmux socket name (-L); for session isolation / tests
-  CLAUDE_AGENT_NAME      default --from value
+  CLAUDE_AGENT_NAME      default --from value (non-worker panes only; see above)
+  SABLE_WORKER_PANE      when set, forces the default --from to 'worker:<bead>'
+                         (SABLE-qqcd), reusing the SABLE-38zi identity marker
+  SABLE_BEAD             bead id for the worker default-from label; falls back
+                         to the sending pane's own @sable_bead tag ($TMUX_PANE)
   SABLE_MSG_READY_TIMEOUT   seconds to wait for --interrupt's post-Escape IDLE
                             state — empty prompt AND no running turn (default 25)
   SABLE_MSG_SUBMIT_TRIES    submit-retry attempts (default 8)
@@ -71,8 +81,9 @@ import sys
 # sable-spawn-worker uses. Resolve next to THIS script even via a PATH symlink.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    SessionCollision, deliver_text, pane_busy, pane_idle, pane_process_identity,
-    pane_ready, resolve_session, submitted_own_turn, wait_for_idle,
+    SessionCollision, deliver_text, pane_bead_tag, pane_busy, pane_idle,
+    pane_process_identity, pane_ready, resolve_session, submitted_own_turn,
+    wait_for_idle,
 )
 from sable_pane_lib import capture_pane as _capture_pane  # noqa: E402
 
@@ -99,6 +110,30 @@ def format_message(frm: str, to: str, body: str) -> str:
 
 def tmux_base(socket: str | None) -> list[str]:
     return ["tmux", "-L", socket] if socket else ["tmux"]
+
+
+def resolve_from(socket: str | None = None, run=None) -> str:
+    """Default sender label when --from is not given (SABLE-qqcd).
+
+    A worker pane (SABLE_WORKER_PANE=1, stamped ALWAYS by
+    sable-spawn-worker:697) is labeled 'worker:<bead>' — or plain 'worker' if
+    the bead can't be resolved — regardless of CLAUDE_AGENT_NAME. That env var
+    is deliberately stamped with the owning LANE MANAGER's name on a worker
+    pane (sable-spawn-worker:696, SABLE-bldh.13: the worker's push must fire
+    the manager-gated for-chuck handoff attributed to the lane). Defaulting
+    --from to it would make a worker's own status report indistinguishable
+    from a real directive from that manager — exactly the trust-boundary bleed
+    SABLE-qqcd reported. The bead id comes from $SABLE_BEAD, else the sending
+    pane's own @sable_bead tag (its $TMUX_PANE, the tag sable-spawn-worker's
+    worker_pane_tags stamps on every worker pane).
+
+    Non-worker panes (managers, the operator) are unaffected: they keep
+    $CLAUDE_AGENT_NAME, or "operator" if unset."""
+    if os.environ.get("SABLE_WORKER_PANE"):
+        bead = os.environ.get("SABLE_BEAD") or pane_bead_tag(
+            tmux_base(socket), os.environ.get("TMUX_PANE", ""), run=run)
+        return f"worker:{bead}" if bead else "worker"
+    return os.environ.get("CLAUDE_AGENT_NAME") or "operator"
 
 
 def parse_panes(output: str) -> dict[str, str]:
@@ -279,9 +314,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("to_role", help="recipient role (e.g. optimus, tarzan, lincoln), "
                                    "or a bead id when --bead is passed")
     p.add_argument("body", help="message text (collapsed to a single line)")
-    p.add_argument("--from", dest="frm",
-                   default=os.environ.get("CLAUDE_AGENT_NAME") or "operator",
-                   help="sender label for the framing header")
+    p.add_argument("--from", dest="frm", default=None,
+                   help="sender label for the framing header (default: "
+                        "'worker:<bead>' on a worker pane, else "
+                        "$CLAUDE_AGENT_NAME or \"operator\"; see resolve_from)")
     p.add_argument("--interrupt", action="store_true",
                    help="send Escape first so the message lands immediately")
     p.add_argument("--bead", action="store_true",
@@ -294,6 +330,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     ns = parse_args(sys.argv[1:] if argv is None else argv)
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
+    if ns.frm is None:
+        ns.frm = resolve_from(socket)
     try:
         session = resolve_session(socket=socket)
     except SessionCollision as e:
