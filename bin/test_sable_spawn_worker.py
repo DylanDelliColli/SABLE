@@ -1354,3 +1354,95 @@ def test_main_respawn_requires_worktree():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --- fixture linking into worktrees (SABLE-ji4h) ----------------------------
+# A git worktree materialises TRACKED files only, so gitignored integration
+# fixtures vanish from every worker tree and the suite silently all-skips.
+# These cover the PLANNER, which holds every decision; link_fixture_paths only
+# executes the plan.
+
+def _plan(tmp_path, rels, make_src=True, make_dst=False):
+    top = tmp_path / "repo"
+    wt = tmp_path / "wk-thing"
+    (top / "sub").mkdir(parents=True)
+    wt.mkdir()
+    if make_src:
+        for r in rels:
+            (top / r).mkdir(parents=True, exist_ok=True)
+    if make_dst:
+        for r in rels:
+            (wt / r).mkdir(parents=True, exist_ok=True)
+    return ssw.plan_fixture_links(str(top), str(wt), rels), top, wt
+
+
+def test_plan_links_existing_source_absent_destination(tmp_path):
+    plan, top, wt = _plan(tmp_path, ["fixtures"])
+    assert [p[1] for p in plan] == ["link"]
+    assert plan[0][2] == str(top / "fixtures")
+    assert plan[0][3] == str(wt / "fixtures")
+
+
+def test_plan_skips_when_source_absent(tmp_path):
+    plan, _, _ = _plan(tmp_path, ["nope"], make_src=False)
+    assert [p[1] for p in plan] == ["skip-missing-source"]
+
+
+def test_plan_skips_when_destination_already_present(tmp_path):
+    plan, _, _ = _plan(tmp_path, ["fixtures"], make_dst=True)
+    assert [p[1] for p in plan] == ["skip-exists"]
+
+
+def test_plan_rejects_path_escaping_the_repo(tmp_path):
+    plan, _, _ = _plan(tmp_path, ["../outside"], make_src=False)
+    assert [p[1] for p in plan] == ["skip-escapes-repo"], (
+        "a traversal must be reported as an escape, not as a missing source"
+    )
+
+
+def test_plan_handles_multiple_paths_independently(tmp_path):
+    top = tmp_path / "repo"
+    wt = tmp_path / "wk-thing"
+    top.mkdir()
+    wt.mkdir()
+    (top / "have").mkdir()
+    plan = ssw.plan_fixture_links(str(top), str(wt), ["have", "missing"])
+    assert [p[1] for p in plan] == ["link", "skip-missing-source"]
+
+
+def test_plan_is_empty_for_repos_that_opted_out(tmp_path):
+    top = tmp_path / "repo"
+    wt = tmp_path / "wk-thing"
+    top.mkdir()
+    wt.mkdir()
+    assert ssw.plan_fixture_links(str(top), str(wt), []) == []
+
+
+def test_link_creates_a_symlink_not_a_copy(tmp_path):
+    top = tmp_path / "repo"
+    wt = tmp_path / "wk-thing"
+    (top / "fixtures").mkdir(parents=True)
+    (top / "fixtures" / "book.xlsx").write_text("payload")
+    wt.mkdir()
+    plan = ssw.plan_fixture_links(str(top), str(wt), ["fixtures"])
+    assert plan[0][1] == "link"
+    import os as _os
+    _os.symlink(plan[0][2], plan[0][3])
+    dst = wt / "fixtures"
+    assert dst.is_symlink(), "must be a link; copying gitignored customer data is not permitted"
+    assert (dst / "book.xlsx").read_text() == "payload"
+
+
+def test_configured_fixture_paths_empty_when_key_unset(tmp_path):
+    import subprocess as _sp
+    _sp.run(["git", "init", "-q", str(tmp_path)], check=True)
+    assert ssw.configured_fixture_paths(str(tmp_path)) == []
+
+
+def test_configured_fixture_paths_reads_all_values(tmp_path):
+    import subprocess as _sp
+    _sp.run(["git", "init", "-q", str(tmp_path)], check=True)
+    for v in ("fixtures", "data/samples"):
+        _sp.run(["git", "-C", str(tmp_path), "config", "--add",
+                 ssw.FIXTURE_PATH_CONFIG_KEY, v], check=True)
+    assert ssw.configured_fixture_paths(str(tmp_path)) == ["fixtures", "data/samples"]

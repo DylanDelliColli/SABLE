@@ -130,6 +130,87 @@ def resolve_worktree_path(toplevel: str, wt_name: str) -> str:
     return str(Path(toplevel).parent / wt_name)
 
 
+# --- fixture linking (SABLE-ji4h) -------------------------------------------
+# A git worktree materialises TRACKED files only. Gitignored integration
+# fixtures therefore exist ONLY in the primary checkout, so every worker
+# worktree silently loses them: costing-comparison's 22 integration tests
+# skipped in every worker tree, and pytest exits 0 on an all-skipped run, so no
+# gate caught it. Workers reported integration tests "passing" on runs where
+# nothing executed. Proven both directions: 24 passed with the directory
+# symlinked in, 24 skipped in the identical tree without it.
+#
+# GENERIC BY CONSTRAINT: no repo's directory names appear here. A repo opts in
+# via `git config --add sable.fixturePath <relpath>` (repeatable). Worktrees
+# share the primary checkout's config, so one setting covers every future tree.
+#
+# SYMLINK rather than copy: the source is gitignored customer material. A link
+# commits nothing, copies nothing, exposes no byte not already on the machine
+# under the same user, and the ignore rules stay in force inside the worktree,
+# so a worker cannot `git add` the linked files even deliberately.
+
+FIXTURE_PATH_CONFIG_KEY = "sable.fixturePath"
+
+
+def configured_fixture_paths(toplevel: str) -> list[str]:
+    """Repo-relative fixture paths opted in via sable.fixturePath. Empty (never
+    an error) when the key is unset — repos that need nothing pay nothing."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", toplevel, "config", "--get-all", FIXTURE_PATH_CONFIG_KEY],
+            capture_output=True, text=True, check=False,
+        ).stdout
+    except OSError:
+        return []
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def plan_fixture_links(toplevel: str, worktree: str, rels: list[str]) -> list[tuple]:
+    """Pure planner: -> [(rel, action, src, dst)] with action one of
+    link | skip-missing-source | skip-exists | skip-escapes-repo.
+
+    Split from the doer so the decision logic is unit-testable without a real
+    worktree, and so a dry run can be inspected. Ordering of checks matters:
+    containment is validated BEFORE existence so a traversal attempt is
+    reported as such rather than as a missing source."""
+    top, wt = Path(toplevel).resolve(), Path(worktree).resolve()
+    plan = []
+    for rel in rels:
+        src, dst = (top / rel), (wt / rel)
+        try:
+            inside = src.resolve().is_relative_to(top) and dst.resolve().is_relative_to(wt)
+        except (OSError, ValueError):
+            inside = False
+        if not inside:
+            plan.append((rel, "skip-escapes-repo", str(src), str(dst)))
+        elif not src.exists():
+            plan.append((rel, "skip-missing-source", str(src), str(dst)))
+        elif dst.exists() or dst.is_symlink():
+            plan.append((rel, "skip-exists", str(src), str(dst)))
+        else:
+            plan.append((rel, "link", str(src), str(dst)))
+    return plan
+
+
+def link_fixture_paths(toplevel: str, worktree: str) -> list[tuple]:
+    """Materialise the plan. Never raises: a fixture-link failure must not take
+    down a dispatch that would otherwise succeed — the worker then runs without
+    fixtures, which is exactly today's behaviour, and the strict-fixture guard
+    (costing-comparison-0cp) is what turns that into a loud failure rather than
+    a silent skip. Returns the plan with failures recorded as link-failed."""
+    results = []
+    for rel, action, src, dst in plan_fixture_links(toplevel, worktree, configured_fixture_paths(toplevel)):
+        if action != "link":
+            results.append((rel, action, src, dst))
+            continue
+        try:
+            Path(dst).parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(src, dst)
+            results.append((rel, "link", src, dst))
+        except OSError as e:
+            results.append((rel, f"link-failed: {e}", src, dst))
+    return results
+
+
 def resolve_model(labels: list[str], override: str | None):
     """Return (model, reason). Override syntax: 'opus' or 'opus:why'. Label
     'model:<m>' is the primary signal; default sonnet."""
@@ -1143,6 +1224,17 @@ def main(argv: list[str] | None = None) -> int:
         worktree = resolve_worktree_path(toplevel, wt_name)
         _run(["bd", "worktree", "create", worktree, "--branch", wt_name])
     branch = Path(worktree).name
+
+    # SABLE-ji4h: link opted-in gitignored fixtures into the worktree. Placed
+    # AFTER both arms above so a --respawn into an existing tree is repaired
+    # too, not just a freshly created one. Idempotent (skip-exists) and silent
+    # for repos that have not opted in.
+    for rel, action, _src, dst in link_fixture_paths(
+            _run(["git", "rev-parse", "--show-toplevel"]).strip(), worktree):
+        if action == "link":
+            sys.stderr.write(f"sable-spawn-worker: linked fixtures {rel} -> {dst}\n")
+        elif action.startswith("link-failed") or action == "skip-escapes-repo":
+            sys.stderr.write(f"sable-spawn-worker: fixture {rel}: {action}\n")
 
     # --- write the dispatch prompt file (keeps the worktree clean) ---
     ddir = dispatch_dir()
