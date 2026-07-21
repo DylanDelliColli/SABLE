@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -54,6 +55,101 @@ REFRESH_CMD = "bash install.sh"
 # refuses to silently re-symlink one of these once pinned and records the
 # current pin set in DEST/.sable-pinned — see _read_pin_marker() below.
 PINNED_BIN_NAMES = ("sable-merge-gate", "sable-reconcile-handoffs", "sable-dolt-push")
+
+_SIBLING_IMPORT_RE = re.compile(r"^(?:from|import)\s+(sable_[a-zA-Z0-9_]+)", re.MULTILINE)
+
+
+def python_sibling_importing_bins(repo: Path):
+    """Every bin/sable-* python script that imports a sibling module
+    physically present in bin/ — e.g. sable-spawn-worker/sable-msg importing
+    sable_pane_lib.py (SABLE-9boz4). A plain regular-file pin (PINNED_BIN_NAMES
+    style) severs that import; these need --pin-snapshot instead.
+
+    Mirrors bin/sable-bin-install's is_python_importing() classifier exactly,
+    and is computed dynamically (not a fixed name tuple) for the same reason
+    --pin-snapshot auto-detects rather than hardcoding: a bin gaining, losing,
+    or being renamed with a sibling import must not silently drop out of
+    doctor's coverage the way an enumerated list would."""
+    bin_dir = repo / "bin"
+    names = []
+    if not bin_dir.is_dir():
+        return names
+    for f in sorted(bin_dir.glob("sable-*")):
+        if not f.is_file() or f.suffix in (".py", ".bak") or f.name.endswith("~"):
+            continue
+        try:
+            with f.open(errors="replace") as fh:
+                first_line = fh.readline()
+        except OSError:
+            continue
+        if "python" not in first_line:
+            continue
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        for m in _SIBLING_IMPORT_RE.finditer(text):
+            if (bin_dir / f"{m.group(1)}.py").is_file():
+                names.append(f.name)
+                break
+    return names
+
+
+_SNAPSHOT_DIR_RE = re.compile(r"sable-([0-9a-f]{4,40})$")
+
+
+def _snapshot_sha_from_target(target: Path):
+    """The pinned sha baked into a snapshot symlink's resolved containing
+    directory name (~/.local/lib/sable-<sha>/<name>), or None if the target
+    doesn't look like a sable-bin-install snapshot path at all."""
+    m = _SNAPSHOT_DIR_RE.search(str(target.parent))
+    return m.group(1) if m else None
+
+
+def _git_show_bytes(repo_root: Path, sha: str, relpath: str):
+    """bytes of <relpath> at <sha> in the repo at repo_root, or None if git
+    can't resolve it (unknown sha, missing path, no git, ...) — treated as
+    drift rather than a crash, since the whole point is to never let a
+    resolution failure silently read as 'clean'."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{sha}:{relpath}"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    return proc.stdout
+
+
+def _check_snapshot_pin(src: Path, dst: Path) -> str:
+    """Status for a python-sibling-importing bin (SABLE-9boz4). The pin unit
+    here is a whole versioned snapshot directory, not a single file, so this
+    compares the SAME unit the pin uses — the resolved symlink target's bytes
+    against the repo at the sha baked into ITS snapshot dir name — never a
+    plain sha256-vs-current-HEAD compare, which would agree-while-wrong for a
+    deliberately-pinned-to-an-older-sha snapshot (the exact failure class this
+    bead exists to prevent: a drift check narrower than the thing that moved).
+    """
+    if not dst.exists():
+        return "missing"
+    if not dst.is_symlink():
+        # A python-importing bin as a bare regular file has no sibling libs
+        # beside it — the exact ImportError hazard this bead exists to
+        # prevent (naive copy-pinning severs the import).
+        return "broken-copy-pin"
+    target = Path(os.path.realpath(dst))
+    if target == src.resolve():
+        return "clean"  # ordinary un-pinned managed symlink into the live repo
+    sha = _snapshot_sha_from_target(target)
+    repo_root = src.parent.parent
+    pinned_bytes = _git_show_bytes(repo_root, sha, f"bin/{dst.name}") if sha else None
+    if pinned_bytes is None:
+        return "drift"  # unrecognized target, or its pinned sha can't be resolved
+    try:
+        current_bytes = target.read_bytes()
+    except OSError:
+        return "drift"
+    return "clean" if current_bytes == pinned_bytes else "snapshot-drift"
 
 # SABLE-mkj6k INTERIM GUARD — remove this set (and every branch that reads it
 # below, in check_manifest/render_text_report/main's --quiet path) once the
@@ -97,9 +193,11 @@ def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
     what install.sh + sable-orchestration-install copy.
 
     bin_dir, when given, adds the "pinned bins" category (PINNED_BIN_NAMES)
-    sourced from repo/bin and checked against bin_dir — the ~/.local/bin (or
-    scope-equivalent) sable-bin-install targets. Omitted by default so pure
-    unit fixtures that never populate repo/bin/ stay unaffected."""
+    and the "pinned snapshot bins" category (python_sibling_importing_bins,
+    SABLE-9boz4), both sourced from repo/bin and checked against bin_dir — the
+    ~/.local/bin (or scope-equivalent) sable-bin-install targets. Omitted by
+    default so pure unit fixtures that never populate repo/bin/ stay
+    unaffected."""
     entries = []
 
     # Step 4: top-level hooks (hooks/*.sh -> ~/.claude/hooks/*.sh)
@@ -147,6 +245,10 @@ def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
             if src.is_file():
                 entries.append(("pinned bins", src, bin_dir / name))
 
+        for name in python_sibling_importing_bins(repo):
+            src = repo / "bin" / name
+            entries.append(("pinned snapshot bins", src, bin_dir / name))
+
     return entries
 
 
@@ -165,7 +267,9 @@ def check_manifest(entries):
     results = []
     pin_marker_cache = {}
     for category, src, dst in entries:
-        if category in GUARDED_CATEGORIES:
+        if category == "pinned snapshot bins":
+            status = _check_snapshot_pin(src, dst)
+        elif category in GUARDED_CATEGORIES:
             bin_dir = dst.parent
             if bin_dir not in pin_marker_cache:
                 pin_marker_cache[bin_dir] = _read_pin_marker(bin_dir)
@@ -256,7 +360,22 @@ def worker_cap_line():
     return f"worker cap: {WORKER_CAP_DEFAULT} (default)"
 
 
-_STATUS_LABELS = {"missing": "MISSING", "drift": "DRIFT  ", "unpinned": "UNPINNED"}
+_STATUS_LABELS = {
+    "missing": "MISSING",
+    "drift": "DRIFT  ",
+    "unpinned": "UNPINNED",
+    "snapshot-drift": "SNAPSHOT-DRIFT",
+    "broken-copy-pin": "BROKEN-COPY-PIN",
+}
+
+# Statuses on a "pinned snapshot bins" entry where the ordinary `bash
+# install.sh` remedy is actively WRONG (SABLE-9boz4): both mean the entry is
+# already pinned (a bare regular file, or a symlink into a snapshot dir), so
+# sable-bin-install's pin protection makes the ordinary installer skip it —
+# the pin itself needs repair, not a re-run of the thing that can't touch it.
+# ("missing" is excluded: nothing is pinned yet there, so the ordinary
+# installer's plain first-time symlink is the correct and safe remedy.)
+_SNAPSHOT_REMEDY_STATUSES = ("broken-copy-pin", "snapshot-drift")
 
 
 def _guarded_remedy_lines(guarded_bad):
@@ -273,6 +392,34 @@ def _guarded_remedy_lines(guarded_bad):
     ]
     for r in guarded_bad:
         lines.append(f"  cp {r['repo_path']} {r['installed_path']} && chmod +x {r['installed_path']}")
+    return lines
+
+
+def _snapshot_remedy_lines(snapshot_bad):
+    """The safe remedy for a drifted "pinned snapshot bins" entry (SABLE-9boz4)
+    — never the ordinary installer refresh, which sable-bin-install's pin
+    protection makes a no-op against these anyway."""
+    lines = [
+        "Do not use the ordinary installer refresh for the snapshot-pinned bin(s)",
+        "above — sable-bin-install's pin protection makes it skip them. Re-pin",
+        "instead:",
+    ]
+    for r in snapshot_bad:
+        name = Path(r["installed_path"]).name
+        if r["status"] == "broken-copy-pin":
+            lines.append(
+                f"  {r['installed_path']} is a bare regular-file copy with no sibling"
+            )
+            lines.append(
+                "  libs beside it (severs the python import). Remove it and re-pin properly:"
+            )
+            lines.append(f"    rm {r['installed_path']} && sable-bin-install --pin-snapshot {name}")
+        else:
+            lines.append(
+                f"  {r['installed_path']} points into a snapshot whose content no longer"
+            )
+            lines.append("  matches its pinned sha (hand-tampered). Roll back and re-pin fresh:")
+            lines.append(f"    sable-bin-install --repin && sable-bin-install --pin-snapshot {name}")
     return lines
 
 
@@ -293,10 +440,21 @@ def render_text_report(results):
         print(f"  {label} {r['installed_path']}")
         print(f"          repo: {r['repo_path']}")
     guarded_bad = [r for r in bad if r["category"] in GUARDED_CATEGORIES]
-    unguarded_bad = [r for r in bad if r["category"] not in GUARDED_CATEGORIES]
+    snapshot_bad = [
+        r for r in bad
+        if r["category"] == "pinned snapshot bins" and r["status"] in _SNAPSHOT_REMEDY_STATUSES
+    ]
+    unguarded_bad = [
+        r for r in bad
+        if r["category"] not in GUARDED_CATEGORIES and r not in snapshot_bad
+    ]
     if guarded_bad:
         print()
         for line in _guarded_remedy_lines(guarded_bad):
+            print(line)
+    if snapshot_bad:
+        print()
+        for line in _snapshot_remedy_lines(snapshot_bad):
             print(line)
     if unguarded_bad:
         print(f"\nRefresh with: {REFRESH_CMD}")
@@ -337,6 +495,10 @@ def main(argv=None):
     elif args.quiet:
         if bad:
             guarded_bad = [r for r in bad if r["category"] in GUARDED_CATEGORIES]
+            snapshot_bad = [
+                r for r in bad
+                if r["category"] == "pinned snapshot bins" and r["status"] in _SNAPSHOT_REMEDY_STATUSES
+            ]
             if guarded_bad:
                 # SABLE-mkj6k interim guard — see GUARDED_CATEGORIES comment.
                 # This is the SessionStart-hook path (`sable-doctor --quiet`),
@@ -348,6 +510,17 @@ def main(argv=None):
                     f"including {len(guarded_bad)} pinned bin(s) — do not use the ordinary "
                     "installer refresh for those (SABLE-mkj6k interim guard); run "
                     "`sable-doctor` for the safe per-file refresh commands",
+                    file=sys.stderr,
+                )
+            elif snapshot_bad:
+                # SABLE-9boz4 — same principle as the mkj6k guard above: a
+                # broken/drifted snapshot pin needs `--pin-snapshot` repair,
+                # not the ordinary installer refresh (which skips it anyway).
+                print(
+                    f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD, "
+                    f"including {len(snapshot_bad)} snapshot-pinned bin(s) — do not use the "
+                    "ordinary installer refresh for those; run `sable-doctor` for the safe "
+                    "re-pin commands",
                     file=sys.stderr,
                 )
             else:
