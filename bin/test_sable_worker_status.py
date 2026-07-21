@@ -298,6 +298,46 @@ def test_reap_flag_message_truncates_long_pending_text(capsys):
     assert "…" in err
 
 
+# --- SABLE-jb3o: the pending-input reap flag previously cited a cross-tracker
+# provenance id (market-brief-package-0h8k) in OPERATOR-FACING stderr. `bd show
+# market-brief-package-0h8k` cannot resolve it against the SABLE beads DB, so an
+# agent reading the reap line chases a dangling ref (optimus did exactly this,
+# 2026-07-17). Provenance cites belong in comments (the ones in this module's
+# docstrings stay); runtime output must never contain a bare non-SABLE
+# bead-id-shaped token a reader would try to `bd show`. ---
+
+def _dangling_bead_ids(text: str) -> list[str]:
+    """Bead-id-shaped tokens (>=2 hyphens, final segment mixing letters+digits
+    like a real bead suffix -- '0h8k', 'b5ow') that are NOT a SABLE-* id. A
+    plain English hyphenated phrase (e.g. this tool's own 'sable-worker-status'
+    name) never has a digit-bearing final segment, so it is never mistaken for
+    a dangling cross-tracker reference."""
+    hits = []
+    for token in text.replace("'", " ").replace('"', " ").split():
+        token = token.strip(".,:;()[]{}")
+        parts = token.split("-")
+        if len(parts) < 3:
+            continue
+        last = parts[-1]
+        if any(c.isdigit() for c in last) and any(c.isalpha() for c in last):
+            if token.upper() != token or not token.startswith("SABLE-"):
+                hits.append(token)
+    return hits
+
+
+def test_reap_pending_input_message_has_no_dangling_cross_tracker_id(capsys):
+    def fake_run(args):
+        return ""
+
+    def fake_capture(pane):
+        return "❯ check the pool for next work"
+
+    sws.reap(["%2"], None, run=fake_run, capture=fake_capture)
+    err = capsys.readouterr().err
+    assert _dangling_bead_ids(err) == [], (
+        f"reap stderr contains a dangling cross-tracker bead id: {err!r}")
+
+
 def test_list_workers_scopes_to_session_when_given():
     # SABLE-e1e3.3: discovery is per-repo — a session target replaces the
     # server-wide -a listing, so another repo's fleet is never enumerated.
@@ -1194,6 +1234,63 @@ def test_empty_worker_message_bare_for_global_view():
 
 def test_empty_worker_message_bare_when_fleet_truly_empty():
     assert sws.empty_worker_message("tarzan", []) == "no worker panes"
+
+
+# --- SABLE-6xtx: tmux held 5 windows (worker-market-brief-package-{129o,268o,
+# wfab0,m7xs9,pjfll}) whose claude process had exited back to zsh; yet
+# sable-worker-status printed 'no worker panes' and --reap could not clean
+# them. parse_worker_panes classified purely by @sable_role/@sable_class pane
+# OPTIONS, so a pane whose tags were never stamped (or were lost) vanished
+# from every listing even though the window itself still carried its
+# worker-<bead> name (sable-spawn-worker's window_name(), stamped at creation,
+# independent of the mutable @sable_role/@sable_class options). The fallback
+# below recognizes such a pane as a worker from its window name alone.
+#
+# An earlier version of this fix ALSO forced status="done" whenever the
+# pane's live #{pane_current_command} was a bare shell (reasoning:
+# with_lifecycle_flags/SABLE-5v9n has no tag-writer for an untagged pane).
+# That broke this suite's own integration fixtures, which simulate a
+# "running" worker with a plain `bash --noprofile --norc` pane and never
+# launch a real claude process — pane_current_command reads "bash" for the
+# pane's entire life, indistinguishable from "claude exited" by that
+# heuristic, and the override reaped live-simulated workers wholesale. So
+# @sable_status remains the SOLE source of truth for a worker's status; only
+# the CLASSIFICATION (is this pane a worker at all) gets the window-name
+# fallback. ---
+
+def test_parse_worker_panes_window_name_fallback_when_tags_absent():
+    # no @sable_role, no @sable_class -- only the window-name prefix identifies
+    # this as a worker pane; its @sable_status tag still drives the status
+    out = "%20\t\t\trunning\t\t\t\tworker-market-brief-package-129o\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%20", "bead": "", "status": "running"}]
+
+
+def test_parse_worker_panes_window_name_fallback_recognizes_done_zombie():
+    # the core incident repro: tags absent (or lost), but the window name
+    # alone is enough to surface the pane -- and once its @sable_status tag
+    # reads "done" (set by with_lifecycle_flags before the pane returned to
+    # its idle shell), --reap can finally collect it
+    out = "%21\t\t\tdone\t\t\t\tworker-market-brief-package-268o\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%21", "bead": "", "status": "done"}]
+    assert sws.reaping_decision(panes) == ["%21"]
+
+
+def test_parse_worker_panes_window_name_fallback_ignores_non_worker_window():
+    # empty tags AND a non-worker-prefixed window name -- still skipped, exactly
+    # as the pre-existing legacy rule already required
+    out = "%22\t\t\trunning\t\t\t\tlincoln\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == []
+
+
+def test_parse_worker_panes_window_name_fallback_defaults_missing_status_running():
+    # a just-spawned fallback-classified pane with no @sable_status tag yet
+    # still defaults to "running", exactly like the tag-classified path
+    out = "%23\t\t\t\t\t\t\tworker-sable-x\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%23", "bead": "", "status": "running"}]
 
 
 def test_empty_worker_message_names_other_lanes_when_fleet_nonempty():

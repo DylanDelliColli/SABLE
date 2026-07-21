@@ -418,6 +418,38 @@ def test_count_live_workers_empty_listing():
     assert ssw.count_live_workers("") == 0
 
 
+# --- SABLE-6xtx: the capacity counter has the SAME tag-only blindness
+# sable-worker-status's classifier had -- a pane whose @sable_role/@sable_class
+# tags are absent/lost is invisible to count_live_workers too (cls == "" and
+# role doesn't start with "worker" -> is_worker is False). The window-name
+# fallback (worker-<bead>, sable-spawn-worker's own window_name()) recognizes
+# it as a worker pane, exactly like sable-worker-status's classifier fallback;
+# its @sable_status tag (or the "not done" default) still decides whether it
+# occupies a capacity slot -- see sable-worker-status's
+# WINDOW_NAME_WORKER_PREFIX comment for why a live-process-based (pane_current_
+# command) done override was tried here too and reverted (it broke this
+# module's own bash-fixture-based integration tests). ---
+
+def test_count_live_workers_window_name_fallback_recognizes_untagged_worker():
+    # tags absent entirely, but window name alone is enough to count this as
+    # a live worker -- consistent with the pre-existing legacy role-prefix path
+    listing = "\trunning\t\tworker-sable-x\n"
+    assert ssw.count_live_workers(listing) == 1
+
+
+def test_count_live_workers_window_name_fallback_excludes_done_pane():
+    # the fallback path still respects @sable_status=done exactly like the
+    # tag-classified path -- a done fallback-classified pane frees its slot
+    listing = "\tdone\t\tworker-sable-y\n"
+    assert ssw.count_live_workers(listing) == 0
+
+
+def test_count_live_workers_still_ignores_non_worker_window_names():
+    # empty tags AND a non-worker-prefixed window name -- still skipped
+    listing = "\trunning\t\tlincoln\n"
+    assert ssw.count_live_workers(listing) == 0
+
+
 def test_capacity_check_allows_under_cap():
     assert ssw.capacity_check(3, 4) is None
 
