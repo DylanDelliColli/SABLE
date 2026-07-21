@@ -574,3 +574,66 @@ def test_SABLE_i5739_branch_resolves_via_metadata_when_bead_text_never_names_it(
         "re-run resolved to a DIFFERENT bead after an unrelated bead "
         f"mentioning the branch appeared — drift (mode c) is not closed: "
         f"{beads1} vs {beads2}")
+
+
+# ===========================================================================
+# SABLE-vif5e: open_for_chuck_beads' query-failure fallback previously folded
+# a genuine bd failure into the SAME [] value as "no open handoffs yet" —
+# predicate 3's suppression corpus — so a transient bd break during a sweep
+# cadence would DUPLICATE a for-chuck bead that already exists. Real bd, real
+# git, no mocks: break the REAL beads database out from under the reconciler
+# subprocess (rename `.beads` away so bd's real workspace-discovery fails for
+# real, matching bd's actual "no beads database found" exit), with a for-chuck
+# bead ALREADY open for the branch, and assert the sweep does NOT create a
+# duplicate — then restore bd and assert the sweep still correctly suppresses.
+# ===========================================================================
+
+def test_SABLE_vif5e_for_chuck_query_failure_does_not_duplicate_handoff(tmp_path):
+    origin, work, home = _setup(tmp_path)
+    bead_id = _make_work_bead(work, home, status="closed")
+    branch = _push_worker_branch(work, bead_id)
+
+    # establish the ALREADY-OPEN for-chuck handoff this sweep must not duplicate
+    assert _for_chuck_beads(work, home) == []
+    r0 = _reconcile(work, home)
+    assert r0.returncode == 0, r0.stdout
+    beads0 = _for_chuck_beads(work, home)
+    assert len(beads0) == 1, f"fixture invariant broken: expected one pre-existing handoff, got {beads0}\n{r0.stdout}"
+    original_id = beads0[0]["id"]
+
+    # break the REAL beads database out from under the reconciler: rename
+    # .beads away so `bd list --label for-chuck` genuinely cannot find a
+    # workspace and exits nonzero — no stubbing, the real bd binary fails.
+    beads_dir = work / ".beads"
+    disabled_dir = work / ".beads.disabled"
+    beads_dir.rename(disabled_dir)
+    try:
+        r1 = _reconcile(work, home)
+    finally:
+        disabled_dir.rename(beads_dir)
+
+    assert r1.returncode == 0, (
+        f"a for-chuck query failure must not crash the sweep — best-effort "
+        f"continue is the conservative fallback:\n{r1.stdout}")
+    assert "WARNING" in r1.stdout, (
+        f"a real for-chuck query failure must be loud, never silent:\n{r1.stdout}")
+
+    # the acceptance criterion: bd is restored now — assert NO duplicate was
+    # created while it was broken.
+    beads_after_break = _for_chuck_beads(work, home)
+    assert len(beads_after_break) == 1, (
+        f"a transient for-chuck query failure duplicated the handoff: "
+        f"{beads_after_break}\n{r1.stdout}")
+    assert beads_after_break[0]["id"] == original_id, (
+        f"the surviving bead changed identity across the broken run: "
+        f"{beads0} vs {beads_after_break}")
+
+    # restore-and-recheck: with bd healthy again, the sweep still correctly
+    # suppresses the already-on-record handoff (not just during breakage).
+    r2 = _reconcile(work, home)
+    assert r2.returncode == 0, r2.stdout
+    beads_final = _for_chuck_beads(work, home)
+    assert len(beads_final) == 1, (
+        f"sweep failed to keep suppressing after bd was restored: "
+        f"{beads_final}\n{r2.stdout}")
+    assert beads_final[0]["id"] == original_id, beads_final
