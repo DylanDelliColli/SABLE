@@ -6,6 +6,11 @@
 # referenced file paths, and writes them to the bead's `wip_claims` metadata
 # field as a comma-separated list (SABLE-szd: NOT notes — see below).
 #
+# SABLE-jd5fj.6: a planner-authored '## File footprint' description section
+# (DECOMPOSITION-authored, dedicated wip_claims-metadata-pattern extension) is
+# the authoritative claim source when present — see below — since it is the
+# declared footprint pre-dispatch-overlap.sh's scheduling constraint enforces.
+#
 # Closes the dispatch-time race condition where worker B dispatches before
 # worker A has started editing — claims now exist at dispatch.
 #
@@ -64,14 +69,29 @@ except Exception:
 
   [ -z "$DESC" ] && continue
 
-  # Extract file paths — match common code file patterns
+  # SABLE-jd5fj.6: footprint->wip_claims wiring. A planner-authored '## File
+  # footprint' description section (authored at DECOMPOSITION — see this
+  # bead's own description for the format) is the AUTHORITATIVE declared
+  # footprint: parse it in preference to the generic file-extension regex,
+  # since it may name extension-less scripts (e.g. bin/sable-spawn-worker)
+  # the regex would miss, and it is the exact list pre-dispatch-overlap.sh's
+  # scheduling constraint compares against. Falls back to the generic regex
+  # for beads authored before the footprint-section convention.
   FILES=$(echo "$DESC" | python3 -c "
 import sys, re
 text = sys.stdin.read()
-# Match file paths with code extensions
 paths = set()
-for m in re.finditer(r'(?:^|[\s\(\[\"\\'])((?:[\w\-./]+/)?[\w\-./]+\.(?:ts|tsx|js|jsx|py|rs|go|java|rb|md|yaml|yml|toml|json|sh|sql|css|scss|html))(?=[\s\)\]\"\\',:;]|$)', text, re.MULTILINE):
-    paths.add(m.group(1))
+section = re.search(r'^##\s*File footprint\s*\n(.+?)(?=\n##\s|\Z)', text,
+                     re.MULTILINE | re.DOTALL)
+if section:
+    for part in section.group(1).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        paths.add(part.split()[0])
+else:
+    for m in re.finditer(r'(?:^|[\s\(\[\"\\'])((?:[\w\-./]+/)?[\w\-./]+\.(?:ts|tsx|js|jsx|py|rs|go|java|rb|md|yaml|yml|toml|json|sh|sql|css|scss|html))(?=[\s\)\]\"\\',:;]|$)', text, re.MULTILINE):
+        paths.add(m.group(1))
 print(','.join(sorted(paths)))
 " 2>/dev/null || echo "")
 

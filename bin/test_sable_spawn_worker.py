@@ -250,29 +250,69 @@ def test_bead_claimed_files_reads_notes_and_description():
     assert ssw.bead_claimed_files(bead) == {"x.py", "y.py"}
 
 
-def test_overlap_check_warns_on_shared_file_with_other_bead():
+def test_bead_claimed_files_reads_wip_claims_metadata():
+    bead = {"metadata": {"wip_claims": "a.py, b.py"}}
+    assert ssw.bead_claimed_files(bead) == {"a.py", "b.py"}
+
+
+def test_bead_claimed_files_reads_file_footprint_section():
+    # SABLE-jd5fj.6: declared footprint section, including an extension-less
+    # entry with a trailing parenthetical annotation stripped to its path token.
+    bead = {"description": "Story text.\n\n## File footprint\n"
+                           "hooks/foo.sh, bin/sable-spawn-worker (constraint surfacing)"}
+    assert ssw.bead_claimed_files(bead) == {"hooks/foo.sh", "bin/sable-spawn-worker"}
+
+
+def test_extract_serialize_with_parses_comma_list():
+    text = "notes\nSerialize-with: SABLE-a, SABLE-b\nmore"
+    assert ssw.extract_serialize_with(text) == {"SABLE-a", "SABLE-b"}
+
+
+def test_extract_serialize_with_empty_when_absent():
+    assert ssw.extract_serialize_with("no serialize line here") == set()
+
+
+def test_overlap_check_denies_on_shared_file_with_other_bead():
+    # SABLE-jd5fj.6: overlap is now a SCHEDULING CONSTRAINT, not advisory.
     bead = {"id": "X-1", "notes": "WIP-CLAIMS: shared.py"}
     other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
-    warning = ssw.overlap_check("X-1", bead, [other])
-    assert warning is not None
-    assert "Y-1" in warning and "shared.py" in warning and "tarzan" in warning
+    verdict = ssw.overlap_check("X-1", bead, [other])
+    assert verdict.decision == "deny"
+    assert "Y-1" in verdict.message and "shared.py" in verdict.message and "tarzan" in verdict.message
 
 
 def test_overlap_check_ignores_self_in_progress_list():
     # already_in_progress_check owns the same-bead case; overlap_check must not
     # double-flag itself if it happens to appear in the in-progress list.
     bead = {"id": "X-1", "notes": "WIP-CLAIMS: shared.py"}
-    assert ssw.overlap_check("X-1", bead, [bead]) is None
+    assert ssw.overlap_check("X-1", bead, [bead]).decision == "none"
 
 
 def test_overlap_check_none_when_no_shared_files():
     bead = {"id": "X-1", "notes": "WIP-CLAIMS: a.py"}
     other = {"id": "Y-1", "notes": "WIP-CLAIMS: b.py"}
-    assert ssw.overlap_check("X-1", bead, [other]) is None
+    assert ssw.overlap_check("X-1", bead, [other]).decision == "none"
 
 
 def test_overlap_check_none_when_bead_has_no_claims():
-    assert ssw.overlap_check("X-1", {"id": "X-1"}, [{"id": "Y-1", "notes": "WIP-CLAIMS: a.py"}]) is None
+    verdict = ssw.overlap_check("X-1", {"id": "X-1"}, [{"id": "Y-1", "notes": "WIP-CLAIMS: a.py"}])
+    assert verdict.decision == "none"
+
+
+def test_overlap_check_allows_with_matching_serialize_with():
+    bead = {"id": "X-1", "notes": "WIP-CLAIMS: shared.py\nSerialize-with: Y-1"}
+    other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
+    verdict = ssw.overlap_check("X-1", bead, [other])
+    assert verdict.decision == "allow"
+    assert verdict.tagged_ids == ("Y-1",)
+
+
+def test_overlap_check_denies_when_serialize_with_names_unrelated_bead():
+    # Naming a DIFFERENT bead does not launder the actual overlap.
+    bead = {"id": "X-1", "notes": "WIP-CLAIMS: shared.py\nSerialize-with: Z-9"}
+    other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
+    verdict = ssw.overlap_check("X-1", bead, [other])
+    assert verdict.decision == "deny"
 
 
 def test_preempt_check_blocks_on_p0_in_inbox():

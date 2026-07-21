@@ -77,6 +77,14 @@ Env:
                        booting, or stuck on an unrecognized dialog/selector,
                        SABLE-m94k) is never typed into — refusal = exit 10,
                        naming the pane; the bead stays claimed for retry.
+
+Overlap scheduling constraint (SABLE-jd5fj.6): a bead whose declared file
+footprint (wip_claims metadata / '## File footprint' description section /
+WIP-CLAIMS text) overlaps a DIFFERENT in-progress bead's footprint refuses the
+spawn — exit 11, naming the overlapping bead(s) and files. Two outs: wait for
+the overlapping bead to clear, or add an explicit 'Serialize-with: <bead-id>'
+line (bead notes/description) naming it — the spawn then proceeds and both
+beads' `serialize_with` metadata is tagged for Chuck's for-chuck handoff.
 """
 from __future__ import annotations
 
@@ -87,6 +95,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 # Shared pane-readiness/dispatch helpers (SABLE-bldh.14). Resolve the lib next to
 # THIS script even when invoked via a PATH symlink.
@@ -363,34 +372,134 @@ def extract_wip_claims(text: str) -> set[str]:
     return claims
 
 
+def extract_footprint_section(text: str) -> set[str]:
+    """Files from a planner-authored '## File footprint' description section
+    (SABLE-jd5fj.6: DECOMPOSITION-authored declared footprint — see this bead's
+    own description for the format). Entries are comma-separated; a trailing
+    parenthetical annotation (e.g. 'bin/sable-spawn-worker (constraint
+    surfacing)') is stripped to the leading path token so extension-less
+    scripts are captured — the WIP-CLAIMS/metadata sources below don't need an
+    extension either, but the OLD generic-regex fallback in the hook-based
+    claim writer did, which is exactly the gap this section format closes."""
+    m = re.search(r"^##\s*File footprint\s*\n(.+?)(?=\n##\s|\Z)", text or "",
+                  re.MULTILINE | re.DOTALL)
+    if not m:
+        return set()
+    files: set[str] = set()
+    for part in m.group(1).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        files.add(part.split()[0])
+    return files
+
+
 def bead_claimed_files(bead: dict) -> set[str]:
+    """Union of every declared-footprint source for `bead`: WIP-CLAIMS text
+    lines (notes/description), the wip_claims metadata field (SABLE-szd
+    dedicated column — pre-dispatch-claim.sh's write target), and a planner-
+    authored '## File footprint' description section (SABLE-jd5fj.6)."""
     text = (bead.get("notes") or "") + "\n" + (bead.get("description") or "")
-    return extract_wip_claims(text)
+    claims = extract_wip_claims(text) | extract_footprint_section(bead.get("description") or "")
+    metadata = bead.get("metadata", {}) or {}
+    wip_claims = metadata.get("wip_claims", "") or ""
+    claims |= {p.strip() for p in wip_claims.split(",") if p.strip()}
+    return claims
 
 
-def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> str | None:
-    """Re-homed pre-dispatch-overlap (SABLE-bldh.8): ADVISORY ONLY, matching the
-    original hook — does not block. Warns when this bead's WIP-CLAIMS files
-    overlap a DIFFERENT in-progress bead's claims, so a coord bead can be filed
-    if needed. Same-bead duplication is handled separately (blocking) by
-    already_in_progress_check(). Returns a warning string to print, or None."""
+def extract_serialize_with(text: str) -> set[str]:
+    """Bead ids named in a `Serialize-with: <id>[, <id>...]` line — the
+    explicit out (SABLE-jd5fj.6) that permits dispatch despite an overlapping
+    declared footprint. See overlap_check."""
+    ids: set[str] = set()
+    for m in re.finditer(r"Serialize-with:\s*([^\n]+)", text or "", re.IGNORECASE):
+        for tok in re.split(r"[,\s]+", m.group(1).strip()):
+            if tok:
+                ids.add(tok)
+    return ids
+
+
+def bead_serialize_with(bead: dict) -> set[str]:
+    text = (bead.get("notes") or "") + "\n" + (bead.get("description") or "")
+    return extract_serialize_with(text)
+
+
+class OverlapVerdict(NamedTuple):
+    """decision: 'none' (no overlap, nothing to do) | 'deny' (SCHEDULING
+    CONSTRAINT — the spawn must be refused) | 'allow' (overlap permitted via a
+    matching Serialize-with line; tagged_ids names the partner bead(s) to tag
+    serialize_with on both sides)."""
+    decision: str
+    message: str = ""
+    tagged_ids: tuple[str, ...] = ()
+
+
+def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> OverlapVerdict:
+    """SABLE-jd5fj.6: overlap flips from ADVISORY (re-homed pre-dispatch-overlap,
+    SABLE-bldh.8) to a SCHEDULING CONSTRAINT. A declared footprint overlapping a
+    DIFFERENT in-progress bead's footprint DENIES the dispatch. Two named outs:
+    wait for the in-progress bead to clear, or name the overlapping bead(s) in
+    an explicit 'Serialize-with: <bead-id>' line (bead notes/description) — that
+    ALLOWS the dispatch, and the caller tags both beads' `serialize_with`
+    metadata so Chuck's for-chuck handoff sequences the merges together. Naming
+    an unrelated bead in Serialize-with does not launder an uncovered overlap:
+    every overlap hit must be covered, or the whole dispatch still denies.
+    Same-bead duplication is handled separately (blocking) by
+    already_in_progress_check()."""
     my_files = bead_claimed_files(bead)
     if not my_files:
-        return None
-    hits = []
+        return OverlapVerdict("none")
+    hits: list[tuple[str, str, list[str]]] = []
     for other in in_progress:
         oid = other.get("id", "")
         if not oid or oid == bead_id:
             continue
         shared = my_files & bead_claimed_files(other)
         if shared:
-            assignee = other.get("assignee") or "unassigned"
-            hits.append(f"  - {oid} ({assignee}, in-progress): {', '.join(sorted(shared))}")
+            hits.append((oid, other.get("assignee") or "unassigned", sorted(shared)))
     if not hits:
-        return None
-    return ("OVERLAP DETECTED — this dispatch shares files with active in-progress "
-            "work:\n" + "\n".join(hits) + "\n\nProceeding. File a coord bead if "
-            "collaboration/sequencing is needed.")
+        return OverlapVerdict("none")
+
+    serialize_with = bead_serialize_with(bead)
+    uncovered = [h for h in hits if h[0] not in serialize_with]
+    if uncovered:
+        lines = "\n".join(
+            f"  - {oid} ({assignee}, in-progress): {', '.join(files)}"
+            for oid, assignee, files in uncovered
+        )
+        return OverlapVerdict(
+            "deny",
+            "OVERLAP DETECTED — this dispatch shares declared footprint with "
+            f"active in-progress work:\n{lines}\n\nSCHEDULING CONSTRAINT: "
+            "dispatch denied. Wait for the overlapping bead to clear, or add "
+            "an explicit 'Serialize-with: <bead-id>' line naming it to proceed "
+            "— both merges will be tagged serialize-together for Chuck.",
+        )
+    tagged = tuple(sorted({h[0] for h in hits}))
+    return OverlapVerdict(
+        "allow",
+        f"SERIALIZE-WITH ACCEPTED — overlap with {', '.join(tagged)} permitted; "
+        "tagging serialize-together for Chuck's handoff.",
+        tagged,
+    )
+
+
+def tag_serialize_with(bead_id: str, partner_id: str) -> None:
+    """Append `partner_id` to `bead_id`'s serialize_with metadata (dedup,
+    sorted csv) — mirrors the wip_claims append convention
+    (edit-write-claim-reconciler.sh) so a later metadata write from elsewhere
+    never clobbers it. Best-effort: swallows bd errors, matching the rest of
+    this module's fail-open governance writes."""
+    try:
+        current = parse_bead(_run(["bd", "show", bead_id, "--json"])) \
+            .get("metadata", {}).get("serialize_with", "") or ""
+    except Exception:
+        current = ""
+    existing = {p.strip() for p in current.split(",") if p.strip()}
+    existing.add(partner_id)
+    new_value = ",".join(sorted(existing))
+    subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata",
+                    f"serialize_with={new_value}"], capture_output=True, text=True)
 
 
 def bead_already_claimed_by_lane(bead: dict, lane: str) -> bool:
@@ -1186,9 +1295,16 @@ def main(argv: list[str] | None = None) -> int:
             claim_bundle_beads(bundle_beads, lane)
 
         in_progress = parse_bead_list(_run(["bd", "list", "--status=in_progress", "--json"]))
-        overlap_warning = overlap_check(bid, bead, in_progress)
-        if overlap_warning:
-            sys.stderr.write(f"sable-spawn-worker: {overlap_warning}\n")
+        overlap_verdict = overlap_check(bid, bead, in_progress)
+        if overlap_verdict.decision == "deny":
+            sys.stderr.write(
+                f"sable-spawn-worker: overlap-constraint blocked — {overlap_verdict.message}\n")
+            return 11
+        if overlap_verdict.decision == "allow":
+            for partner in overlap_verdict.tagged_ids:
+                tag_serialize_with(bid, partner)
+                tag_serialize_with(partner, bid)
+            sys.stderr.write(f"sable-spawn-worker: {overlap_verdict.message}\n")
 
     # --- worktree ---
     if ns.worktree:
