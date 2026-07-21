@@ -19,11 +19,51 @@ IRON RULES this module carries and the split did not touch:
   * the exit-code taxonomy 0/20/21/22/23/24/4, unchanged;
   * the fast-forward integrity assertion (remote base tip == preview SHA, else
     exit 4), preserved verbatim — moved intact, not restructured.
+
+OPTIMISTIC DISJOINT PROMOTION (SABLE-jd5fj.4) adds ONE path to the decision
+table and relaxes none of the existing ones. Before jd5fj.4, a base that moved
+between the preview and the promote always meant exit 23: rebuild the preview
+and re-gate through a full CI cycle. Now a stale base whose change-set is
+DISJOINT from the branch's (sable_footprint_lib) earns a cheaper re-verification
+— the cmar4 impact tier, run on the REAL COMBINED TREE — instead of a full
+re-preview. Green promotes that same combined object; red ejects on the existing
+exit-20 path; anything else falls back to exit 23.
+
+  This is the one change in the epic that makes the system LESS safe by design.
+  Everything else added verification; this removes some. What it removes is the
+  structural guarantee that the exact object CI tested is the object that lands
+  — so the replacement guarantee has to be carried explicitly, and it is:
+
+  PROPERTY INVARIANT I1  No reachable promote path where the base moved and the
+                         footprints are not proven disjoint and no
+                         re-verification ran. decide_promotion() is total over
+                         its input space and bin/test_promote_decision.py
+                         enumerates that space exhaustively rather than by
+                         example.
+  PROPERTY INVARIANT I2  Every promotion pushes exactly the object that was
+                         verified — the CI-green preview when the base held
+                         still, the impact-tier-green combined commit when it
+                         did not. Byte-identical promotion survives; what
+                         changed is WHICH verifier attests the object, never
+                         whether one did.
+
+Do not read SABLE-nueh3's 0/126 semantic-break rate as support for this: that
+number was measured under the regime this bead removes, where the failure class
+was structurally impossible rather than rare. The usable prior is the
+rule-of-three bound, <=2.4%, which is why the impact tier is mandatory on every
+optimistic path and why an unavailable tier degrades to exit 23.
 """
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 
+import sable_footprint_lib as footprint_lib
 import sable_gate_classify_lib as classify
 import sable_gate_git_lib as git_lib
 import sable_gate_preview_lib as preview
@@ -145,8 +185,311 @@ def cleanup_after_merge(repo: str, remote: str, base_ref: str, branch: str) -> N
 
 
 # --------------------------------------------------------------------------
+# Optimistic disjoint promotion (SABLE-jd5fj.4)
+# --------------------------------------------------------------------------
+
+# What the impact tier concluded about the real combined tree.
+IMPACT_GREEN = "green"    # the tier ran and every selected suite passed
+IMPACT_RED = "red"        # the tier ran and something failed — a real defect
+IMPACT_ERROR = "error"    # the tier could NOT run (absent, broke, timed out)
+
+# Actions the decision table can produce.
+ACTION_PROMOTE = "promote"        # push `verified_sha` to the integration branch
+ACTION_REVERIFY = "reverify"      # run the impact tier on the combined tree, then re-decide
+ACTION_REPREVIEW = "repreview"    # exit 23 — rebuild the preview and re-gate (status quo ante)
+ACTION_REFUSE = "refuse"          # do not promote; exit per the taxonomy
+
+
+@dataclass(frozen=True)
+class PromoteDecision:
+    action: str
+    exit_code: int | None       # None for ACTION_REVERIFY: not a terminal state
+    verified_sha: str | None    # the object attested by a verifier AND pushed (I2)
+    reverified: bool            # True iff a re-verification ran on the combined tree
+    reason: str
+
+
+def decide_promotion(outcome: str, base_moved: bool, disjoint: bool | None,
+                     impact: str | None, preview_sha: str = "",
+                     combined_sha: str = "") -> PromoteDecision:
+    """THE DECISION TABLE. Pure, total, and the sole authority on whether an
+    object may be promoted — so that invariants I1 and I2 can be proven by
+    ENUMERATION over its inputs rather than argued from the call sites.
+
+    Inputs, and why each is tri- or bi-valued:
+      outcome       the Actions verdict on the ORIGINAL preview (classify's
+                    GREEN/RED/BLOCKED/RETRY). Anything but GREEN refuses here
+                    exactly as it always did; the rows exist so the enumeration
+                    covers the whole space, not just the interesting corner.
+      base_moved    the integration branch tip is no longer the commit the green
+                    preview was built on.
+      disjoint      True / False / None, where None is UNDETERMINED (a footprint
+                    could not be computed). None and False are treated
+                    IDENTICALLY — the tri-state exists so the evidence can say
+                    which one happened, never so they can act differently.
+      impact        None = the tier has not run yet; else IMPACT_GREEN/RED/ERROR.
+
+    Note the deliberate redundancy: an impact result is only honoured when
+    disjoint is True. A caller that somehow arrives with impact=IMPACT_GREEN and
+    disjoint=False still gets a refusal. Combinations that look unreachable are
+    the ones that turn out reachable after a refactor, and a silent bad merge
+    does not announce itself."""
+    if outcome != classify.GREEN:
+        return PromoteDecision(ACTION_REFUSE, classify.OUTCOME_EXIT[outcome], None, False,
+                               f"verdict is {outcome}, not green")
+
+    if not base_moved:
+        # The pre-jd5fj.4 happy path, untouched: CI tested this exact object
+        # against this exact base, and this exact object fast-forwards.
+        return PromoteDecision(ACTION_PROMOTE, classify.EXIT_OK, preview_sha or None, False,
+                               "base held still — promoting the CI-verified preview byte-identical")
+
+    if disjoint is not True:
+        # I1's load-bearing row. Not-disjoint AND undetermined both land here.
+        return PromoteDecision(ACTION_REPREVIEW, classify.EXIT_BASE_MOVED, None, False,
+                               "base moved and footprints are not proven disjoint — full re-preview")
+
+    if impact is None:
+        return PromoteDecision(ACTION_REVERIFY, None, None, False,
+                               "base moved but footprints are disjoint — re-verify the combined tree")
+
+    if impact == IMPACT_GREEN:
+        if not combined_sha:
+            # A green tier with nothing to point at cannot satisfy I2: there is
+            # no attested object to push. Refuse rather than invent one.
+            return PromoteDecision(ACTION_REPREVIEW, classify.EXIT_BASE_MOVED, None, False,
+                                   "impact tier is green but no combined object was built — full re-preview")
+        return PromoteDecision(ACTION_PROMOTE, classify.EXIT_OK, combined_sha, True,
+                               "impact tier green on the real combined tree — promoting that same object")
+
+    if impact == IMPACT_RED:
+        return PromoteDecision(ACTION_REFUSE, classify.EXIT_RED, None, False,
+                               "impact tier RED on the real combined tree — the merge is broken, not promoted")
+
+    # IMPACT_ERROR and anything unrecognized: the tier did not answer, so the
+    # optimism is unfunded. Fall back to the behaviour that needs no optimism.
+    return PromoteDecision(ACTION_REPREVIEW, classify.EXIT_BASE_MOVED, None, False,
+                           "impact tier could not answer — full re-preview")
+
+
+def optimistic_promotion_enabled() -> bool:
+    """SABLE_MG_OPTIMISTIC=0 restores the pre-jd5fj.4 behaviour exactly (every
+    base-move is a full re-preview). An operator kill switch for the one
+    relaxation in this epic, deliberately checked at the top of the stale-base
+    path so turning it off cannot leave a half-taken decision behind."""
+    return os.environ.get("SABLE_MG_OPTIMISTIC", "1") not in ("0", "false", "no")
+
+
+def _impact_timeout() -> float:
+    return float(os.environ.get("SABLE_MG_IMPACT_TIMEOUT", "900"))
+
+
+def _selected_suites(worktree: str, paths: list[str]) -> list[str]:
+    """Suites the shell impact manifest selects for these changed paths
+    (SABLE-cmar4.2). Its own contract already handles the dangerous direction:
+    a path it cannot map selects the FULL allow-list rather than nothing."""
+    sel = git_lib._run(["bash", ".github/ci/impact-manifest.sh", "--select", *paths],
+                       cwd=worktree, check=False, timeout=_impact_timeout())
+    if sel.returncode != 0:
+        raise RuntimeError(f"impact selection failed: {sel.stdout.strip()[:400]}")
+    return [ln.strip() for ln in sel.stdout.splitlines()
+            if ln.strip() and not ln.startswith("::")]
+
+
+def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, str]:
+    """Run the cmar4 impact tier against the REAL COMBINED TREE and report
+    (IMPACT_GREEN|IMPACT_RED|IMPACT_ERROR, detail).
+
+    "Real" is the whole point, and it is why this checks the combined commit out
+    into a throwaway detached worktree instead of reasoning about trees: the
+    thing that has to be exercised is the code as it will exist AFTER the merge,
+    with both changes present at once. A semantic break between two file-disjoint
+    changes exists only in that combined state — no diff of either side can show
+    it, which is exactly why disjointness alone was ruled unsound (SABLE-djopw).
+
+    Scoped, not full: the shell half runs only the suites .github/ci/impact-
+    manifest.sh selects for the union footprint, and the pytest half defers to
+    bin/tier_selection.py (which itself falls back to a full bin/ run on a cold
+    testmon cache). Both halves inherit their conservative-default behaviour from
+    cmar4 rather than re-deriving a narrower one here.
+
+    ERROR, not RED, whenever the tier could not RUN — an absent manifest, a
+    missing suite file, a timeout, a broken worktree. That distinction is
+    load-bearing: RED tells an author to fix a real defect and ejects on exit 20,
+    while ERROR means we learned nothing and must fall back to exit 23. Reporting
+    a non-answer as either green or red would be the silent-green class this epic
+    exists to eliminate."""
+    override = os.environ.get("SABLE_MG_IMPACT", "").split()
+    parent = tempfile.mkdtemp(prefix="sable-impact-")
+    worktree = str(Path(parent) / "tree")
+    try:
+        add = git_lib._git(repo, "worktree", "add", "--detach", worktree, tree_sha, check=False)
+        if add.returncode != 0:
+            return (IMPACT_ERROR, f"could not check out the combined tree: {add.stdout.strip()[:400]}")
+        try:
+            if override:
+                cp = git_lib._run(override + list(paths), cwd=worktree, check=False,
+                                  timeout=_impact_timeout())
+                return ((IMPACT_GREEN, "impact tier override reported green") if cp.returncode == 0
+                        else (IMPACT_RED, f"impact tier override failed (rc={cp.returncode}): "
+                                          f"{cp.stdout.strip()[:400]}"))
+
+            if not (Path(worktree) / ".github" / "ci" / "impact-manifest.sh").is_file():
+                return (IMPACT_ERROR, "this repo has no .github/ci/impact-manifest.sh — "
+                                      "no impact tier to run on the combined tree")
+            suites = _selected_suites(worktree, list(paths))
+            ran: list[str] = []
+            for suite in suites:
+                suite_path = Path(worktree) / "hooks" / "test" / suite
+                if not suite_path.is_file():
+                    return (IMPACT_ERROR, f"impact tier selected {suite} but it is missing "
+                                          f"from the combined tree")
+                cp = git_lib._run(["bash", str(suite_path)], cwd=worktree, check=False,
+                                  timeout=_impact_timeout())
+                ran.append(suite)
+                if cp.returncode != 0:
+                    return (IMPACT_RED, f"{suite} FAILED on the combined tree (rc={cp.returncode}): "
+                                        f"{cp.stdout.strip()[-800:]}")
+
+            # The pytest half, only when the footprint reaches bin/ at all.
+            selector = Path(worktree) / "bin" / "tier_selection.py"
+            if selector.is_file() and any(p.startswith("bin/") for p in paths):
+                warm = Path(repo) / ".testmondata"
+                if warm.is_file():
+                    shutil.copy2(warm, Path(worktree) / ".testmondata")
+                cp = git_lib._run([sys.executable, str(selector)], cwd=worktree, check=False,
+                                  timeout=_impact_timeout())
+                ran.append("bin/ pytest impact tier")
+                if cp.returncode != 0:
+                    return (IMPACT_RED, f"bin/ pytest impact tier FAILED on the combined tree "
+                                        f"(rc={cp.returncode}): {cp.stdout.strip()[-800:]}")
+
+            if not ran:
+                # Nothing selected and nothing to select from is not a pass —
+                # it is a tier that told us nothing about the combined tree.
+                return (IMPACT_ERROR, "impact tier selected no suites at all — no evidence about "
+                                      "the combined tree")
+            return (IMPACT_GREEN, f"impact tier GREEN on the combined tree: {', '.join(ran)}")
+        finally:
+            git_lib._git(repo, "worktree", "remove", "--force", worktree, check=False)
+            git_lib._git(repo, "worktree", "prune", check=False)
+    except subprocess.TimeoutExpired as exc:
+        return (IMPACT_ERROR, f"impact tier timed out after {_impact_timeout()}s: {exc}")
+    except (OSError, RuntimeError) as exc:
+        return (IMPACT_ERROR, f"impact tier could not run: {exc}")
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
 # promote — the only writer to the integration branch
 # --------------------------------------------------------------------------
+
+def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
+                manager: str, base_ref: str, ref: str, preview_sha: str,
+                base_sha: str, branch_sha: str, current_base: str) -> int:
+    """The base moved out from under a GREEN preview. Decide what that costs.
+
+    Reached from two places that mean the same thing: the pre-push check (the
+    common case — the base moved during the CI wait, and we notice before
+    pushing) and the non-fast-forward push rejection (the narrow race where it
+    moved between that check and the push). Both funnel here so there is ONE
+    stale-base decision path to reason about, which is what makes invariant I1
+    checkable at all.
+
+    Returns an exit code, or raises GateError(23) for the full-re-preview
+    outcome — the pre-jd5fj.4 contract, byte for byte, including the notify and
+    the evidence line."""
+    if not optimistic_promotion_enabled():
+        assessment = footprint_lib.Assessment(
+            None, "optimistic disjoint promotion is disabled (SABLE_MG_OPTIMISTIC=0)")
+    else:
+        assessment = footprint_lib.assess(repo, bead, base_sha, branch_sha, current_base)
+
+    decision = decide_promotion(classify.GREEN, base_moved=True, disjoint=assessment.disjoint,
+                                impact=None, preview_sha=preview_sha)
+    combined_sha, impact, impact_detail = "", None, ""
+    if decision.action == ACTION_REVERIFY:
+        print(f"sable-merge-gate: base {base} moved to {current_base[:7]} but the footprints are "
+              f"disjoint — re-verifying the REAL combined tree with the impact tier "
+              f"({len(assessment.paths)} changed path(s))")
+        combined_sha = preview.build_preview(
+            repo, current_base, branch_sha,
+            f"ci-verify merge-preview: {branch} onto {base} ({bead}, disjoint re-verify)")
+        impact, impact_detail = run_impact_tier(repo, combined_sha, list(assessment.paths))
+        print(f"sable-merge-gate: impact tier on combined tree {combined_sha[:7]}: "
+              f"{impact} — {impact_detail}")
+        decision = decide_promotion(classify.GREEN, base_moved=True, disjoint=assessment.disjoint,
+                                    impact=impact, preview_sha=preview_sha,
+                                    combined_sha=combined_sha)
+
+    if decision.action == ACTION_PROMOTE:
+        # I2, asserted rather than assumed: the object pushed here must be the
+        # object the impact tier just attested, not the stale CI-green preview.
+        if not decision.reverified or decision.verified_sha != combined_sha:
+            raise GateError(4, f"integrity abort: stale-base promotion would push "
+                               f"{decision.verified_sha} which is not the re-verified "
+                               f"combined object {combined_sha}")
+        push_cp = git_lib._git(repo, "push", remote, f"{combined_sha}:refs/heads/{base}", check=False)
+        if push_cp.returncode != 0:
+            # The base moved AGAIN, during the re-verification. One optimistic
+            # attempt per promote, by construction — no loop, no second window.
+            _notify(manager,
+                f"merge-preview ci-verify gate for {bead} ({branch}): base {base} moved a second time "
+                f"during the disjoint re-verification — NOT promoted. Rebuild preview + re-gate.")
+            _append_evidence(repo, bead,
+                f"merge-preview ci-verify gate BASE-MOVED-TWICE (retryable): combined {combined_sha}, "
+                f"non-ff on promote: {push_cp.stdout.strip()}")
+            raise GateError(23, f"base {base} advanced again during the disjoint re-verification — "
+                                f"rebuild and re-gate")
+        git_lib._git(repo, "fetch", remote, base)
+        landed = git_lib.resolve_commit(repo, base_ref)
+        if landed != combined_sha:
+            raise GateError(4, f"integrity abort: base {base} tip {landed} != re-verified combined "
+                               f"tree {combined_sha}")
+        _append_evidence(repo, bead,
+            f"merge-preview ci-verify gate GREEN via OPTIMISTIC DISJOINT PROMOTION (SABLE-jd5fj.4): "
+            f"ref {ref}, CI-green preview {preview_sha} was built on base {base_sha[:7]}, which moved "
+            f"to {current_base[:7]}. Footprints disjoint ({assessment.reason}). The combined tree "
+            f"{combined_sha} was RE-VERIFIED on the real merge: {impact_detail}. Promoted that same "
+            f"combined object byte-identical to {base} — NOT the stale preview.")
+        try:
+            cleanup_after_merge(repo, remote, base_ref, branch)
+        except Exception as exc:  # noqa: BLE001 — a green merge must stay green
+            print(f"sable-merge-gate cleanup: skipped after unexpected error: {exc}",
+                  file=sys.stderr)
+        return classify.EXIT_OK
+
+    if decision.action == ACTION_REFUSE:
+        # Impact-tier RED on the real combined tree: two changes that were each
+        # green alone break together. Ejects on the SAME exit-20 path a red CI
+        # run takes, because it is the same kind of fact — a real defect with a
+        # named author to fix it.
+        _notify(manager,
+            f"merge-preview ci-verify gate RED for {bead} ({branch}) on the COMBINED TREE: the branch "
+            f"was CI-green on base {base_sha[:7]}, but base {base} has moved to {current_base[:7]} and "
+            f"the impact tier FAILS on the real merge. No promotion. {impact_detail}")
+        _append_evidence(repo, bead,
+            f"merge-preview ci-verify gate RED on the combined tree (optimistic disjoint re-verify, "
+            f"SABLE-jd5fj.4): preview {preview_sha} was green on {base_sha[:7]}; combined "
+            f"{combined_sha} with base {current_base[:7]} is RED: {impact_detail}. NOT promoted.")
+        return decision.exit_code or classify.EXIT_RED
+
+    # ACTION_REPREVIEW — the pre-jd5fj.4 contract, unchanged.
+    detail = assessment.reason if impact is None else f"{assessment.reason}; {impact_detail}"
+    _notify(manager,
+        f"merge-preview ci-verify gate for {bead} ({branch}): base {base} moved during the CI "
+        f"wait — promote is non-fast-forward, NOT promoted. Rebuild preview + re-gate (ref {ref} was green). "
+        f"[{decision.reason}: {detail}]")
+    _append_evidence(repo, bead,
+        f"merge-preview ci-verify gate BASE-MOVED (retryable): ref {ref}, preview {preview_sha}, "
+        f"base moved {base_sha[:7]} -> {current_base[:7]}, not promoted. {decision.reason}: {detail}")
+    # The reason travels on the EXCEPTION, not only into the notify/evidence
+    # seams: a refusal a reader cannot audit from the gate's own output is a
+    # bare exit code, and this is the path an operator investigates most.
+    raise GateError(23, f"base {base} advanced during CI; preview {preview_sha} is non-ff — "
+                        f"{decision.reason} [{detail}] — rebuild and re-gate")
+
 
 def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             manager: str, override: str | None) -> int:
@@ -177,17 +520,38 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
         conclusion, url = verdict.conclusion, verdict.run_url
 
         if verdict.outcome == classify.GREEN:
+            # SABLE-jd5fj.4: is the base still the commit this preview was built
+            # on? Asked BEFORE the push, so the stale-base decision is made from
+            # an observation rather than inferred from a rejection — the
+            # optimistic path needs the new base SHA to compute a footprint
+            # against, and a rejection message does not carry one.
+            git_lib._git(repo, "fetch", remote, base, check=False)
+            current_base = git_lib.resolve_commit(repo, base_ref)
+            if current_base != base_sha:
+                return _stale_base(bead, branch, base, repo, remote, manager, base_ref,
+                                   ref, preview_sha, base_sha, branch_sha, current_base)
             push_cp = git_lib._git(repo, "push", remote, f"{preview_sha}:refs/heads/{base}", check=False)
             if push_cp.returncode != 0:
                 # F1 (tarzan review): the base advanced during the CI wait, so the
                 # promote is non-fast-forward. Nothing wrong was shipped — the push
                 # was REJECTED — the tested-green ref is simply stale against a base
-                # that moved. Exit cleanly and retryably (rebuild the preview on the
-                # new base and re-gate) instead of letting CalledProcessError escape
-                # as an uncaught traceback. Cleanup still runs via the finally below.
+                # that moved. Exit cleanly and retryably instead of letting
+                # CalledProcessError escape as an uncaught traceback. Cleanup still
+                # runs via the finally below.
+                #
+                # jd5fj.4 narrowed this to the RACE it always described: the base
+                # moved between the check above and this push. It funnels into the
+                # same stale-base decision, so there is no second, divergent
+                # base-moved path (which is how invariant I1 stays checkable).
+                git_lib._git(repo, "fetch", remote, base, check=False)
+                current_base = git_lib.resolve_commit(repo, base_ref)
+                if current_base != base_sha:
+                    return _stale_base(bead, branch, base, repo, remote, manager, base_ref,
+                                       ref, preview_sha, base_sha, branch_sha, current_base)
                 _notify(manager,
-                    f"merge-preview ci-verify gate for {bead} ({branch}): base {base} moved during the CI "
-                    f"wait — promote is non-fast-forward, NOT promoted. Rebuild preview + re-gate (ref {ref} was green).")
+                    f"merge-preview ci-verify gate for {bead} ({branch}): promote to {base} was rejected "
+                    f"though the base tip still reads {base_sha[:7]} — NOT promoted. Rebuild preview + re-gate "
+                    f"(ref {ref} was green).")
                 _append_evidence(repo, bead,
                     f"merge-preview ci-verify gate BASE-MOVED (retryable): ref {ref}, preview {preview_sha}, "
                     f"non-ff on promote, not promoted: {push_cp.stdout.strip()}")
