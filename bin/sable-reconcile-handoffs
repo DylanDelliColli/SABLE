@@ -241,6 +241,16 @@ def reconcile_bead_description(branch: str, work_status: str | None) -> str:
 
 # --------------------------------------------------------------------------
 # Command plumbing (env-seam overridable — mirrors sable-merge-gate)
+#
+# SABLE-6sdpx AUDIT: every _git/_bd call in this file runs with check=False.
+# All but one already inspect .returncode right at (or immediately after) the
+# call site and fall through to the CONSERVATIVE branch on failure — merged-
+# or-unresolvable stays not-stranded (branch_ancestor_rc / ancestor_rc_is_
+# unmerged), an unresolvable age/status returns None and the branch is left
+# for the next sweep (branch_tip_age_seconds, find_work_bead_status), and a
+# failed bead write is a loud caller-side WARNING (file_for_chuck_bead, see
+# reconcile()). The one exception — the reconcile()-level `git fetch --prune`
+# refresh, which discarded its CompletedProcess outright — is fixed below.
 # --------------------------------------------------------------------------
 
 def _tool(env_name: str, default: str) -> list[str]:
@@ -409,8 +419,20 @@ def classify_branch(repo: str, remote: str, branch: str, integration_branch: str
 
 def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -> int:
     integration_branch = resolve_integration_branch(repo)
-    # Refresh remote-tracking refs so ancestry + age read origin's current truth.
-    _git(repo, "fetch", remote, "--prune", check=False)
+    # Refresh remote-tracking refs so ancestry + age read origin's current
+    # truth. SABLE-6sdpx: git exits nonzero here on a real network/auth
+    # failure and NOT on "nothing new to fetch" (that is still exit 0), so a
+    # nonzero rc always means the refresh did not happen — never a
+    # legitimate no-op. A failed refresh is not fatal (the sweep can still
+    # run stale-but-real local refs and will fetch again next cadence), but
+    # it must be LOUD: silently classifying against stale refs looks
+    # identical to a healthy sweep otherwise.
+    fetch_cp = _git(repo, "fetch", remote, "--prune", check=False)
+    if fetch_cp.returncode != 0:
+        print(f"sable-reconcile-handoffs: WARNING git fetch {remote} --prune "
+              f"failed (exit {fetch_cp.returncode}) — classifying against "
+              f"POSSIBLY STALE remote-tracking refs: {fetch_cp.stdout.strip()}",
+              file=sys.stderr)
 
     branches = list_origin_wk_branches(repo, remote)
     open_beads = open_for_chuck_beads(repo)

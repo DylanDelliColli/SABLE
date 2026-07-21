@@ -1518,3 +1518,37 @@ def test_configured_fixture_paths_reads_all_values(tmp_path):
         _sp.run(["git", "-C", str(tmp_path), "config", "--add",
                  ssw.FIXTURE_PATH_CONFIG_KEY, v], check=True)
     assert ssw.configured_fixture_paths(str(tmp_path)) == ["fixtures", "data/samples"]
+
+
+# SABLE-6sdpx: `git config --get-all` exits 1 SPECIFICALLY for "key not
+# found" (the legitimate-empty case pinned above) — every OTHER nonzero exit
+# is a real failure (git could not even evaluate the key) that must not be
+# folded into the same silent-empty return. Both directions covered: a
+# genuinely broken config warns loudly on stderr; an unset key (already
+# proven above) stays silent.
+
+def test_configured_fixture_paths_warns_loudly_on_real_git_failure(tmp_path, capsys):
+    import subprocess as _sp
+    _sp.run(["git", "init", "-q", str(tmp_path)], check=True)
+    # a malformed local config makes `git config --get-all` fail with a git
+    # error (exit 128), NOT the "key unset" exit 1 — this is the real-failure
+    # case, distinct from the legitimate-empty case above.
+    cfg = tmp_path / ".git" / "config"
+    with cfg.open("a") as f:
+        f.write("[bad syntax here no equals\n")
+
+    result = ssw.configured_fixture_paths(str(tmp_path))
+    assert result == [], "a broken config must fail safe (no fixtures), never raise"
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "git config" in err, (
+        "a real git failure (not just an unset key) must warn loudly, or a "
+        "repo that DID opt in via sable.fixturePath silently runs workers "
+        "without their fixtures with zero signal anywhere"
+    )
+
+
+def test_configured_fixture_paths_unset_key_stays_silent(tmp_path, capsys):
+    import subprocess as _sp
+    _sp.run(["git", "init", "-q", str(tmp_path)], check=True)
+    assert ssw.configured_fixture_paths(str(tmp_path)) == []
+    assert capsys.readouterr().err == "", "an unset key is not a failure, must not warn"

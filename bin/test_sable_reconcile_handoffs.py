@@ -324,3 +324,41 @@ def test_non_dry_run_files_one(monkeypatch, capsys):
     assert "--sandbox" in creates[0]
     assert "--labels=for-chuck,coord" in creates[0]
     assert "filed for-chuck bead" in capsys.readouterr().out
+
+
+# ===========================================================================
+# SABLE-6sdpx: reconcile()'s `git fetch --prune` refresh is check=False and
+# was never inspected — a failed refresh silently classified against stale
+# remote-tracking refs with no signal anywhere. Both directions: a genuine
+# fetch failure must warn loudly (not crash — the sweep is still best-effort
+# useful on stale refs), and a healthy fetch must stay silent.
+# ===========================================================================
+
+def test_reconcile_fetch_failure_warns_but_continues(monkeypatch, capsys):
+    def fake_git(repo, *args, check=False):
+        if args and args[0] == "fetch":
+            return _cp(args, 128, "fatal: unable to access origin")
+        return _cp(args, 0, "")
+
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: [])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+    monkeypatch.setattr(smrh, "_git", fake_git)
+    monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 0, ""))
+
+    rc = smrh.reconcile("/repo", "origin", 10.0, dry_run=True)
+    assert rc == 0, "a failed refresh must not crash the sweep"
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "fetch" in err, err
+
+
+def test_reconcile_fetch_success_no_warning(monkeypatch, capsys):
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: [])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+    monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 0, ""))
+
+    rc = smrh.reconcile("/repo", "origin", 10.0, dry_run=True)
+    assert rc == 0
+    assert capsys.readouterr().err == "", "a healthy fetch must not warn"
