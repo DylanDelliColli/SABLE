@@ -116,7 +116,7 @@ assert_nudge "default: missing description nudges" "" "bd create --title=foo" "n
 assert_nudge "default: vague description nudges" "" "bd create --title=foo --description=\"do the thing\"" "missing"
 
 # Test 5: full description (file path + test) in default mode → allow
-assert_allow "default: complete description allowed" "" "bd create --title=foo --description=\"Update src/foo.ts. Test in src/foo.test.ts.\""
+assert_allow "default: complete description allowed" "" "bd create --title=foo --labels=origin:planned --description=\"Update src/foo.ts. Test in src/foo.test.ts.\""
 
 # ---------- Manager mode (CLAUDE_AGENT_NAME set) ----------
 
@@ -129,7 +129,7 @@ assert_deny "manager: missing description denied" "$MANAGER_ENV" "bd create --ti
 assert_deny "manager: vague description denied" "$MANAGER_ENV" "bd create --title=foo --description=\"do the thing\"" "missing"
 
 # Test 8: full description in manager mode → allow
-assert_allow "manager: complete description allowed" "$MANAGER_ENV" "bd create --title=foo --description=\"Update src/foo.ts. Test in src/foo.test.ts.\""
+assert_allow "manager: complete description allowed" "$MANAGER_ENV" "bd create --title=foo --labels=origin:planned --description=\"Update src/foo.ts. Test in src/foo.test.ts.\""
 
 # Test 9: epic creation skipped in manager mode
 assert_allow "manager: epic exempt" "$MANAGER_ENV" "bd create --type=epic --title=foo --description=\"bar\""
@@ -143,7 +143,7 @@ assert_deny "manager: sherlock-finding incomplete denied" "$MANAGER_ENV" \
 
 # Test 11: sherlock-finding label with all required sections → allow
 assert_allow "manager: sherlock-finding complete allowed" "$MANAGER_ENV" \
-  "bd create --title=foo --labels=sherlock-finding --description=\"$COMPLETE_SHERLOCK_DESC\""
+  "bd create --title=foo --labels=sherlock-finding,origin:planned --description=\"$COMPLETE_SHERLOCK_DESC\""
 
 # Test 12: sherlock-finding label with everything except Fingerprint → DENY mentioning Fingerprint
 PARTIAL_NO_FP=$'## Rationale\nFoo\n\n## Evidence\n### File: src/auth.ts\n- Symbol: foo\n\n## Proposed approach\nBar\n\n## Scope estimate\nS\n\n## Risk if not addressed\nBaz\n\nTest spec: src/auth.test.ts'
@@ -153,7 +153,7 @@ assert_deny "manager: sherlock-finding without fingerprint denied" "$MANAGER_ENV
 
 # Test 13: non-sherlock-finding label, complete description → allow even in manager mode
 assert_allow "manager: non-sherlock label allowed when complete" "$MANAGER_ENV" \
-  "bd create --title=foo --labels=bug,for-tarzan --description=\"Update src/foo.ts. Test in src/foo.test.ts.\""
+  "bd create --title=foo --labels=bug,for-tarzan,origin:planned --description=\"Update src/foo.ts. Test in src/foo.test.ts.\""
 
 # ---------- Columbo-test-spec label checks ----------
 
@@ -176,11 +176,11 @@ assert_deny "manager: columbo-test-spec without Why denied" "$MANAGER_ENV" \
 
 # Test 16: complete columbo-test-spec → allow (manager mode)
 assert_allow "manager: columbo-test-spec complete allowed" "$MANAGER_ENV" \
-  "bd create --title=foo --labels=columbo-test-spec --description=\"$COMPLETE_COLUMBO_SPEC\""
+  "bd create --title=foo --labels=columbo-test-spec,origin:planned --description=\"$COMPLETE_COLUMBO_SPEC\""
 
 # Test 17: complete columbo-test-spec in default mode → allow (no agent identity)
 assert_allow "default: columbo-test-spec complete allowed" "" \
-  "bd create --title=foo --labels=columbo-test-spec --description=\"$COMPLETE_COLUMBO_SPEC\""
+  "bd create --title=foo --labels=columbo-test-spec,origin:planned --description=\"$COMPLETE_COLUMBO_SPEC\""
 
 # Test 18: incomplete columbo-test-spec in default mode → nudge (not deny)
 assert_nudge "default: columbo-test-spec incomplete nudges" "" \
@@ -189,7 +189,7 @@ assert_nudge "default: columbo-test-spec incomplete nudges" "" \
 
 # Test 19: columbo-test-spec coexists with model + for-tarzan labels — complete → allow
 assert_allow "manager: columbo-test-spec with sibling labels allowed" "$MANAGER_ENV" \
-  "bd create --title=foo --labels=columbo-test-spec,model:sonnet,for-tarzan --description=\"$COMPLETE_COLUMBO_SPEC\""
+  "bd create --title=foo --labels=columbo-test-spec,model:sonnet,for-tarzan,origin:planned --description=\"$COMPLETE_COLUMBO_SPEC\""
 
 # ---------- Columbo-test-gap label checks ----------
 
@@ -209,11 +209,11 @@ assert_deny "manager: columbo-test-gap without Risk denied" "$MANAGER_ENV" \
 
 # Test 22: complete columbo-test-gap → allow (manager mode)
 assert_allow "manager: columbo-test-gap complete allowed" "$MANAGER_ENV" \
-  "bd create --title=foo --labels=columbo-test-gap --description=\"$COMPLETE_COLUMBO_GAP\""
+  "bd create --title=foo --labels=columbo-test-gap,origin:planned --description=\"$COMPLETE_COLUMBO_GAP\""
 
 # Test 23: complete columbo-test-gap in default mode → allow
 assert_allow "default: columbo-test-gap complete allowed" "" \
-  "bd create --title=foo --labels=columbo-test-gap --description=\"$COMPLETE_COLUMBO_GAP\""
+  "bd create --title=foo --labels=columbo-test-gap,origin:planned --description=\"$COMPLETE_COLUMBO_GAP\""
 
 # Test 24: columbo-test-gap incomplete in default mode → nudge (not deny)
 assert_nudge "default: columbo-test-gap incomplete nudges" "" \
@@ -222,11 +222,11 @@ assert_nudge "default: columbo-test-gap incomplete nudges" "" \
 
 # Test 25: columbo-test-gap coexists with sibling labels — complete → allow
 assert_allow "manager: columbo-test-gap with sibling labels allowed" "$MANAGER_ENV" \
-  "bd create --title=foo --labels=columbo-test-gap,model:opus,for-optimus --description=\"$COMPLETE_COLUMBO_GAP\""
+  "bd create --title=foo --labels=columbo-test-gap,model:opus,for-optimus,origin:planned --description=\"$COMPLETE_COLUMBO_GAP\""
 
 # Test 26: existing sherlock-finding behavior unchanged when columbo gate is also active
 assert_allow "regression: sherlock-finding still allowed after columbo gate added" "$MANAGER_ENV" \
-  "bd create --title=foo --labels=sherlock-finding --description=\"$COMPLETE_SHERLOCK_DESC\""
+  "bd create --title=foo --labels=sherlock-finding,origin:planned --description=\"$COMPLETE_SHERLOCK_DESC\""
 
 # Test 27: cross-label — bead carries BOTH columbo-test-spec and sherlock-finding.
 # Both gates fire; description must satisfy both contracts. Composing the
@@ -235,7 +235,7 @@ assert_allow "regression: sherlock-finding still allowed after columbo gate adde
 # silently picking one and ignoring the other.
 DUAL_DESC=$'## Rationale\nFoo\n\n## Evidence\n### File: src/auth.ts\n- Symbol: foo\n- Fingerprint: const foo = [\n\n## Proposed approach\nBar\n\n## Scope estimate\nS\n\n## Risk if not addressed\nBaz\n\n## Feature under test\nAuth middleware.\n\n## Test file\ntests/auth.skel.test.ts\n\n## Test layer\nUNIT\n\n## Cases\n- Case name: rejects unsigned token\n  - Why: catches signature-bypass regression\n  - Inputs: token with empty signature\n  - Expected: 401 with reason invalid_signature\n\n## Categories\n3, 10\n\n## Fixtures / setup\nFixtures: none.\n\n## Out of scope\nRefresh-token rotation.'
 assert_allow "manager: dual-label spec + sherlock-finding allowed when both contracts satisfied" "$MANAGER_ENV" \
-  "bd create --title=foo --labels=columbo-test-spec,sherlock-finding --description=\"$DUAL_DESC\""
+  "bd create --title=foo --labels=columbo-test-spec,sherlock-finding,origin:planned --description=\"$DUAL_DESC\""
 
 # Test 28: cross-label — same dual-label bead but missing columbo's Cases →
 # DENY mentioning Cases (proves columbo gate fires even when sherlock gate
@@ -299,7 +299,7 @@ MANAGER_ENV="CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager"
 
 # Test 31: --body-file good content (manager mode) → allow
 assert_allow "body-file: good content allowed (manager)" "$MANAGER_ENV" \
-  "bd create --title=foo --body-file $GOOD_BODY"
+  "bd create --title=foo --labels=origin:planned --body-file $GOOD_BODY"
 
 # Test 32: --body-file bad content (manager mode) → deny (same verdict as inline bad desc)
 assert_deny "body-file: bad content denied (manager)" "$MANAGER_ENV" \
@@ -308,7 +308,7 @@ assert_deny "body-file: bad content denied (manager)" "$MANAGER_ENV" \
 
 # Test 33: --body-file good content (default mode) → allow
 assert_allow "body-file: good content allowed (default)" "" \
-  "bd create --title=foo --body-file $GOOD_BODY"
+  "bd create --title=foo --labels=origin:planned --body-file $GOOD_BODY"
 
 # Test 34: --body-file bad content (default mode) → nudge
 assert_nudge "body-file: bad content nudges (default)" "" \
@@ -345,22 +345,22 @@ assert_deny "regression: plain create no desc still denied (manager)" "$MANAGER_
 # Test 40: docs-only description citing feedback/foo.md + [no-test] → passes file-path check
 DOCS_DESC="Update feedback/bead-quality.md to clarify the Fresh Agent Test. [no-test] — docs-only edit, no code changed."
 assert_allow "docs: feedback/ path passes file-path check (default)" "" \
-  "bd create --title=foo --description=\"$DOCS_DESC\""
+  "bd create --title=foo --labels=origin:planned --description=\"$DOCS_DESC\""
 
 # Test 41: docs-only description citing docs/ path → passes
 DOCS2_DESC="Revise docs/architecture.md section on dispatch protocol. [no-test] — documentation only."
 assert_allow "docs: docs/ path passes file-path check (default)" "" \
-  "bd create --title=foo --description=\"$DOCS2_DESC\""
+  "bd create --title=foo --labels=origin:planned --description=\"$DOCS2_DESC\""
 
 # Test 42: description citing a .md file path → passes
 MD_PATH_DESC="Rewrite CLAUDE.md workflow section for clarity. [no-test] — docs only, no source changes."
 assert_allow "docs: .md extension passes file-path check (default)" "" \
-  "bd create --title=foo --description=\"$MD_PATH_DESC\""
+  "bd create --title=foo --labels=origin:planned --description=\"$MD_PATH_DESC\""
 
 # Test 43: description citing a .json file path → passes
 JSON_PATH_DESC="Update hooks/test/fixtures/sample.json to add new test vectors. Test in hooks/test/test-bead-description-gate.sh."
 assert_allow "docs: .json extension passes file-path check (default)" "" \
-  "bd create --title=foo --description=\"$JSON_PATH_DESC\""
+  "bd create --title=foo --labels=origin:planned --description=\"$JSON_PATH_DESC\""
 
 # Test 44: description with NO path of any kind → still flagged (regression guard)
 assert_nudge "docs: pathless description still flagged (default)" "" \
@@ -372,17 +372,17 @@ assert_nudge "docs: pathless description still flagged (default)" "" \
 # Test 44b: description citing only bin/<executable> (extensionless) → passes
 BIN_PATH_DESC="Fix bin/sable-view to handle the new flag. TDD red-green confirms fix."
 assert_allow "docs: bin/ extensionless executable passes file-path check (default)" "" \
-  "bd create --title=foo --description=\"$BIN_PATH_DESC\""
+  "bd create --title=foo --labels=origin:planned --description=\"$BIN_PATH_DESC\""
 
 # Test 44c: description citing only a .github/workflows/*.yml path → passes
 YML_PATH_DESC="Fix .github/workflows/test.yml to run on push. TDD red-green confirms fix."
 assert_allow "docs: .github/*.yml path passes file-path check (default)" "" \
-  "bd create --title=foo --description=\"$YML_PATH_DESC\""
+  "bd create --title=foo --labels=origin:planned --description=\"$YML_PATH_DESC\""
 
 # Test 44d: description citing only a dot-dir path with no recognized extension → passes
 DOTDIR_PATH_DESC="Add .github/CODEOWNERS entry for the hooks directory. TDD red-green confirms fix."
 assert_allow "docs: dot-dir extensionless path passes file-path check (default)" "" \
-  "bd create --title=foo --description=\"$DOTDIR_PATH_DESC\""
+  "bd create --title=foo --labels=origin:planned --description=\"$DOTDIR_PATH_DESC\""
 
 # Test 44e: a genuinely pathless description still trips the gate (regression guard)
 assert_nudge "docs: pathless description still flagged after bin//.yml/dot-dir fix (default)" "" \
@@ -394,17 +394,17 @@ assert_nudge "docs: pathless description still flagged after bin//.yml/dot-dir f
 # Test 44f: description citing only Makefile (extensionless build file) → passes
 MAKEFILE_DESC="Fix the build in Makefile to add a new target. TDD red-green confirms fix."
 assert_allow "docs: Makefile-only path passes file-path check (default)" "" \
-  "bd create --title=foo --description=\"$MAKEFILE_DESC\""
+  "bd create --title=foo --labels=origin:planned --description=\"$MAKEFILE_DESC\""
 
 # Test 44g: description citing only Dockerfile (extensionless build file) → passes
 DOCKERFILE_DESC="Fix the build in Dockerfile to add a new stage. TDD red-green confirms fix."
 assert_allow "docs: Dockerfile-only path passes file-path check (default)" "" \
-  "bd create --title=foo --description=\"$DOCKERFILE_DESC\""
+  "bd create --title=foo --labels=origin:planned --description=\"$DOCKERFILE_DESC\""
 
 # Test 44h: description citing only location-briefing/foo.md → passes
 LOCATION_BRIEFING_DESC="Update location-briefing/foo.md with new context. TDD red-green confirms fix."
 assert_allow "docs: location-briefing/ path passes file-path check (default)" "" \
-  "bd create --title=foo --description=\"$LOCATION_BRIEFING_DESC\""
+  "bd create --title=foo --labels=origin:planned --description=\"$LOCATION_BRIEFING_DESC\""
 
 # Test 44i: regression — pathless description still flagged after Makefile/Dockerfile/location-briefing fix
 assert_nudge "docs: pathless description still flagged after extensionless fix (default)" "" \
@@ -416,12 +416,12 @@ assert_nudge "docs: pathless description still flagged after extensionless fix (
 # Test 44j: description citing only Justfile (extensionless build file) → passes
 JUSTFILE_DESC="Fix the build in Justfile to add a new recipe. TDD red-green confirms fix."
 assert_allow "docs: Justfile-only path passes file-path check (default)" "" \
-  "bd create --title=foo --description=\"$JUSTFILE_DESC\""
+  "bd create --title=foo --labels=origin:planned --description=\"$JUSTFILE_DESC\""
 
 # Test 44k: description citing only Rakefile (extensionless build file) → passes
 RAKEFILE_DESC="Fix the build in Rakefile to add a new task. TDD red-green confirms fix."
 assert_allow "docs: Rakefile-only path passes file-path check (default)" "" \
-  "bd create --title=foo --description=\"$RAKEFILE_DESC\""
+  "bd create --title=foo --labels=origin:planned --description=\"$RAKEFILE_DESC\""
 
 # Test 44l: regression — pathless description still flagged after Justfile/Rakefile fix
 assert_nudge "docs: pathless description still flagged after Justfile/Rakefile fix (default)" "" \
@@ -434,11 +434,11 @@ GOOD_SHORT_DESC="hooks/bead-description-gate.sh line 98: extend HAS_FILE_FLAG re
 
 # Test 45: bd create -d "<good desc>" → allow in manager mode
 assert_allow "short-alias: -d good desc allowed (manager)" "$MANAGER_ENV" \
-  "bd create --title=foo -d \"$GOOD_SHORT_DESC\""
+  "bd create --title=foo --labels=origin:planned -d \"$GOOD_SHORT_DESC\""
 
 # Test 46: bd create -d "<good desc>" → allow in default mode
 assert_allow "short-alias: -d good desc allowed (default)" "" \
-  "bd create --title=foo -d \"$GOOD_SHORT_DESC\""
+  "bd create --title=foo --labels=origin:planned -d \"$GOOD_SHORT_DESC\""
 
 # Test 47: bd create -d "<vague desc>" → deny in manager mode (same verdict as --description vague)
 assert_deny "short-alias: -d vague desc denied (manager)" "$MANAGER_ENV" \
@@ -469,7 +469,115 @@ assert_deny "short-alias regression: no desc still denied (manager)" "$MANAGER_E
 # The desc has a literal "-d " inside the value; extraction must pull the full content.
 TRICKY_DESC="hooks/bead-description-gate.sh: check that -d inside a quoted value does not break flag parsing. Test in hooks/test/test-bead-description-gate.sh."
 assert_allow "short-alias: -d inside desc content not confused (manager)" "$MANAGER_ENV" \
-  "bd create --title=foo --description=\"$TRICKY_DESC\""
+  "bd create --title=foo --labels=origin:planned --description=\"$TRICKY_DESC\""
+
+# ---------- origin: soft-nudge tests (SABLE-8b41.7) ----------
+# test_missing_origin_label_warns_not_blocks_in_nonmanager_mode
+# (test-strategy.json S3) — missing origin: -> warn; present -> silent;
+# and manager/block mode must ALSO warn rather than deny (never blocks,
+# in any mode — the architecture decision this bead implements).
+
+COMPLETE_DESC="Update src/foo.ts. Test in src/foo.test.ts."
+
+# Test 53: complete description, no origin: label, default mode → nudge
+# mentioning origin: (soft nudge fires even though nothing else is missing)
+assert_nudge "origin: missing label nudges (default)" "" \
+  "bd create --title=foo --description=\"$COMPLETE_DESC\"" \
+  "origin:"
+
+# Test 54: complete description, no origin: label, MANAGER mode → nudge,
+# NOT deny — proves the soft nudge never joins the block-mode deny path.
+assert_nudge "origin: missing label nudges not denies (manager)" "$MANAGER_ENV" \
+  "bd create --title=foo --description=\"$COMPLETE_DESC\"" \
+  "origin:"
+
+# Test 55: complete description WITH origin: label, default mode → allow,
+# silent (present -> silent).
+assert_allow "origin: present label silent (default)" "" \
+  "bd create --title=foo --labels=origin:planned --description=\"$COMPLETE_DESC\""
+
+# Test 56: complete description WITH origin: label, manager mode → allow,
+# silent.
+assert_allow "origin: present label silent (manager)" "$MANAGER_ENV" \
+  "bd create --title=foo --labels=origin:planned --description=\"$COMPLETE_DESC\""
+
+# Test 57: origin: label coexists with sibling labels (model:, columbo, etc)
+# — still resolved correctly out of the comma-separated list.
+assert_allow "origin: present among sibling labels silent (default)" "" \
+  "bd create --title=foo --labels=model:sonnet,origin:dogfood,for-tarzan --description=\"$COMPLETE_DESC\""
+
+# Test 58: regression — a bead with OTHER real problems (no test spec, no
+# file paths) AND no origin: label is still denied in manager mode for the
+# real reasons, not silently downgraded by the origin nudge coexisting.
+assert_deny "origin: coexisting with real problems still denies for those problems (manager)" "$MANAGER_ENV" \
+  "bd create --title=foo --description=\"do the thing\"" \
+  "missing"
+
+# ---------- integration: real-bd origin nudge never blocks (SABLE-8b41.7) ----------
+# test_bd_q_stays_instant_without_origin_label (test-strategy.json S3,
+# INTEG case): real hook decision against a REAL `bd create` command in a
+# sandboxed temp DB — the deny-leg must not fire (checked even under
+# manager/block mode, the strictest enforcement), and the bd create must
+# actually succeed and create the bead. Self-skips (not fail) when bd is
+# absent or sandbox init fails, matching the real-bd suite contract used
+# by hooks/test/test-tier-budget-bead.sh.
+
+if ! command -v bd >/dev/null 2>&1; then
+  echo "SKIP: origin integration — no bd on PATH"
+else
+  ORIGIN_TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/sable-test-origin-nudge.XXXXXX")"
+  ORIGIN_REPO_DIR="$ORIGIN_TMPROOT/fixture-repo"
+  ORIGIN_BD_HOME="$ORIGIN_TMPROOT/bd-home"
+  mkdir -p "$ORIGIN_REPO_DIR" "$ORIGIN_BD_HOME"
+
+  ORIGIN_BD_INIT_OK=0
+  for _ in 1 2 3 4; do
+    rm -rf "$ORIGIN_REPO_DIR/.beads"
+    ( cd "$ORIGIN_REPO_DIR" && env HOME="$ORIGIN_BD_HOME" BD_NON_INTERACTIVE=1 CI=true bd init --non-interactive >/dev/null 2>&1 )
+    if [ -f "$ORIGIN_REPO_DIR/.beads/config.yaml" ]; then ORIGIN_BD_INIT_OK=1; break; fi
+  done
+
+  if [ "$ORIGIN_BD_INIT_OK" -ne 1 ]; then
+    echo "SKIP: origin integration — bd init never produced a clean sandbox DB"
+  else
+    ORIGIN_BD_CREATE_CMD='bd create --title=integration-origin-nudge --description="Update src/foo.ts. Test in src/foo.test.ts."'
+
+    # 1) Real hook, real command string, MANAGER mode (the strictest —
+    #    proves the deny-leg does NOT fire even under block enforcement).
+    ORIGIN_HOOK_OUT=$(run_hook "$MANAGER_ENV" "$ORIGIN_BD_CREATE_CMD")
+    if ! echo "$ORIGIN_HOOK_OUT" | grep -q '"permissionDecision": "deny"'; then
+      PASS=$((PASS+1))
+      echo "PASS: origin integration — hook does not deny a real bd create missing origin: (manager mode)"
+    else
+      FAIL=$((FAIL+1))
+      FAIL_NAMES="$FAIL_NAMES\n  origin integration — hook denies (should never deny for origin)"
+      echo "FAIL: origin integration — hook does not deny a real bd create missing origin: (manager mode)"
+      echo "  Got: $ORIGIN_HOOK_OUT"
+    fi
+
+    # 2) The real bd create actually succeeds and creates the bead in the
+    #    sandboxed DB — proving the soft nudge never blocks real quick-capture.
+    ORIGIN_CREATE_OUT=$(cd "$ORIGIN_REPO_DIR" && env HOME="$ORIGIN_BD_HOME" BD_NON_INTERACTIVE=1 CI=true \
+      bd create --title=integration-origin-nudge --description="Update src/foo.ts. Test in src/foo.test.ts." 2>&1)
+    ORIGIN_CREATE_RC=$?
+    ORIGIN_OPEN_COUNT=$(cd "$ORIGIN_REPO_DIR" && env HOME="$ORIGIN_BD_HOME" BD_NON_INTERACTIVE=1 CI=true \
+      bd list --status=open --json 2>/dev/null | python3 -c 'import json,sys
+try: print(len(json.load(sys.stdin)))
+except Exception: print(0)')
+
+    if [ "$ORIGIN_CREATE_RC" -eq 0 ] && [ "$ORIGIN_OPEN_COUNT" = "1" ]; then
+      PASS=$((PASS+1))
+      echo "PASS: origin integration — real bd create without origin: label succeeds and creates the bead"
+    else
+      FAIL=$((FAIL+1))
+      FAIL_NAMES="$FAIL_NAMES\n  origin integration — real bd create without origin: label did not succeed cleanly"
+      echo "FAIL: origin integration — real bd create without origin: label succeeds and creates the bead"
+      echo "  rc=$ORIGIN_CREATE_RC open_count=$ORIGIN_OPEN_COUNT out=$ORIGIN_CREATE_OUT"
+    fi
+  fi
+
+  rm -rf "$ORIGIN_TMPROOT"
+fi
 
 # ---------- Summary ----------
 
