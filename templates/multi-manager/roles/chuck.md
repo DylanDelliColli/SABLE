@@ -139,6 +139,24 @@ So your close-out sync is just `sable-dolt-push` — the pull, the serialization
 - You may not claim non-`for-chuck` beads.
 - You do not file for-chuck beads yourself — those come from other managers' post-push hook, or from `sable-reconcile-handoffs` (the standing reconciliation step above) when a push's handoff went missing. You never hand-verify or hand-file a stranded branch — that classification (unmerged + work bead closed/in-progress + no handoff on record + settled) is the tool's job now, not yours.
 
+## Holds: a branch that must NOT merge (SABLE-jejx3)
+A hold is a first-class state the reconciliation floor reads, NOT a message and NOT a bead you leave open in the inbox. Message traffic and an outgoing manager's memory do not survive a pane restart — yours or theirs — which is exactly how a held branch once got an auto-filed "merge me" handoff pointing the opposite way from the standing instruction.
+
+The hold lives as metadata on the branch's WORK BEAD, so it survives a pane recycle AND a branch rename (re-point the bead's `branch` metadata and the hold travels with the work):
+
+```bash
+bd update <work-bead> --sandbox \
+  --set-metadata hold="<why this must not merge>" \
+  --set-metadata hold_by="<who placed it>" \
+  --set-metadata hold_since="<ISO8601>" \
+  --set-metadata hold_until="<what lifts it — an event, not a date>"
+# lift:
+bd update <work-bead> --sandbox --unset-metadata hold --unset-metadata hold_by \
+  --unset-metadata hold_since --unset-metadata hold_until
+```
+
+What you will see on every sweep: held branches are NAMED, never silently skipped — `HELD <branch>: ... by=... since=... until=... reason=...` plus the exact lift command. A hold that is stale (older than `SABLE_HOLD_STALE_DAYS`, default 3), unowned, undated, or has no release condition is flagged `NEEDS REVIEW` and counted in the summary. Treat that flag as work: a forgotten hold is self-silencing (it suppresses the report that would surface its branch), so it decays into a permanent quiet veto unless someone acts. If a branch reports `HOLD-STATE UNREADABLE`, its work bead could not be read at all — nothing was filed for it that cadence, and neither held nor stranded was established; fix the bead lookup, do not merge on the assumption that no hold means no hold.
+
 ## Communicating with the user
 You should rarely need to talk to the user. The whole point of Chuck is to remove human-as-messenger duty. Surface to the user only when:
 - A conflict requires a strategic decision (e.g., "two epics implementing the same feature differently — which wins?")

@@ -88,6 +88,19 @@ if sub == "search":
     print(json.dumps([{"id": "X", "status": status}] if status else []))
     sys.exit(0)
 if sub == "list":
+    # Two DIFFERENT `bd list` call shapes reach this stub:
+    #   --metadata-field branch=<b>  -> the work-bead resolver (status + HOLD
+    #                                   metadata, SABLE-i5739 / SABLE-jejx3)
+    #   --label for-chuck            -> predicate 3's suppression corpus
+    # Before SABLE-jejx3 only the second existed here, so a single response
+    # sufficed; conflating them now would feed the hold reader the for-chuck
+    # corpus and silently make every branch read as unheld.
+    if any(a.startswith("--metadata-field") or a.startswith("branch=") for a in args):
+        rc = os.environ.get("STUB_BD_WORKBEAD_RC", "0")
+        if rc != "0":
+            print("simulated bd failure"); sys.exit(int(rc))
+        print(os.environ.get("STUB_BD_WORKBEAD_JSON", "[]"))
+        sys.exit(0)
     print(os.environ.get("STUB_BD_FORCHUCK_JSON", "[]"))
     sys.exit(0)
 if sub == "create":
@@ -207,6 +220,9 @@ run_reconcile() {
       STUB_BD_SHOW_STATUS="${STUB_BD_SHOW_STATUS:-}" \
       STUB_BD_SEARCH_STATUS="${STUB_BD_SEARCH_STATUS:-}" \
       STUB_BD_FORCHUCK_JSON="${STUB_BD_FORCHUCK_JSON:-[]}" \
+      STUB_BD_WORKBEAD_JSON="${STUB_BD_WORKBEAD_JSON:-[]}" \
+      STUB_BD_WORKBEAD_RC="${STUB_BD_WORKBEAD_RC:-0}" \
+      SABLE_HOLD_STALE_DAYS="${SABLE_HOLD_STALE_DAYS:-3}" \
       python3 "$RECONCILE" --repo "$WORK" --remote origin --age-min "$age_min"
 }
 
@@ -424,6 +440,119 @@ if printf '%s' "$SUMMARY" | grep -q "0 stranded branch(es), 0 for-chuck bead(s) 
   pass "C6 SABLE-2az2x: the summary flags CORPUS UNREADABLE rather than reading as an ordinary clean sweep"
 else
   fail "C6 SABLE-2az2x: summary must distinguish could-not-assess from nothing-stranded" "summary=[$SUMMARY]"
+fi
+
+# ==========================================================================
+# PART D — SABLE-jejx3: HELD is a third outcome, not a suppression.
+#
+# A branch under an explicit do-not-merge hold satisfies all four stranded
+# predicates identically to an accidentally-unmerged one, so the floor filed a
+# handoff meaning "nobody merged this — merge it", the EXACT INVERSE of the
+# standing instruction, and re-filed it every cadence once Chuck closed it.
+#
+# Real git, the real reconciler, the real preview-kick leg alongside it. The
+# hold lives in the WORK BEAD's metadata (this suite's bd stub serves it, per
+# the file's clean-room contract — the real-bd, no-mocks rehearsal of the same
+# contract, including the branch-rename case, lives in
+# bin/test_sable_reconcile_handoffs_integration.py::test_jejx3_*).
+#
+# Every case below is paired with its POSITIVE CONTROL: the same sweep without
+# the hold marker DOES file, so no assertion here can pass vacuously.
+# ==========================================================================
+
+# (D1) held branch: no bead filed, but the sweep still NAMES it with all four
+# fields (held / by whom / since when / until what).
+fresh_pair d-held
+HOLD_JSON="[{\"id\": \"SABLE-work\", \"status\": \"closed\", \"metadata\": {\"branch\": \"$BRANCH\", \"hold\": \"false-negative security regression\", \"hold_by\": \"tarzan\", \"hold_since\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"hold_until\": \"tarzan green-lights a revised tip\"}}]"
+CALLLOG="$TMPROOT/d-held-bdcalls.log"
+OUT="$(BD_CALL_LOG="$CALLLOG" STUB_BD_WORKBEAD_JSON="$HOLD_JSON" run_reconcile)"; RC=$?
+if [ "$RC" -eq 0 ] && ! grep -q "^create " "$CALLLOG" 2>/dev/null; then
+  pass "D1 SABLE-jejx3: a HELD branch files NO 'merge me' handoff (the inverted bead is never manufactured)"
+else
+  fail "D1 SABLE-jejx3: held branch must not file a handoff" "rc=$RC out=$OUT"
+fi
+if printf '%s' "$OUT" | grep -q "HELD $BRANCH" \
+   && printf '%s' "$OUT" | grep -q "by=tarzan" \
+   && printf '%s' "$OUT" | grep -q "until=tarzan green-lights a revised tip" \
+   && printf '%s' "$OUT" | grep -q "false-negative security regression"; then
+  pass "D1 SABLE-jejx3: the held branch is still NAMED every cadence, with by/since/until/reason"
+else
+  fail "D1 SABLE-jejx3: a held branch must never be silently invisible" "out=$OUT"
+fi
+SUMMARY="$(printf '%s\n' "$OUT" | grep '^sable-reconcile-handoffs:')"
+if printf '%s' "$SUMMARY" | grep -q "1 held branch(es)" \
+   && printf '%s' "$SUMMARY" | grep -q "$BRANCH"; then
+  pass "D1 SABLE-jejx3: the SUMMARY names the held branch (three outcomes reported, not two)"
+else
+  fail "D1 SABLE-jejx3: summary must name held branches" "summary=[$SUMMARY]"
+fi
+
+# (D1-control) POSITIVE CONTROL — the identical branch and sweep with the hold
+# marker REMOVED does file, proving the sweep was capable of filing in this
+# configuration and the marker is what stopped it.
+UNHELD_JSON="[{\"id\": \"SABLE-work\", \"status\": \"closed\", \"metadata\": {\"branch\": \"$BRANCH\"}}]"
+CALLLOG="$TMPROOT/d-control-bdcalls.log"
+OUT="$(BD_CALL_LOG="$CALLLOG" STUB_BD_WORKBEAD_JSON="$UNHELD_JSON" run_reconcile)"; RC=$?
+if [ "$RC" -eq 0 ] && grep -q "^create " "$CALLLOG" 2>/dev/null; then
+  pass "D1 POSITIVE CONTROL: the same branch WITHOUT the hold marker still files (marker does the work)"
+else
+  fail "D1 POSITIVE CONTROL: unheld branch must still file" "rc=$RC out=$OUT"
+fi
+
+# (D2) a STALE / unowned / open-ended hold escalates into the summary — a
+# forgotten hold is self-silencing by construction (it suppresses the report
+# that would surface it), so it must decay LOUDLY, not quietly.
+fresh_pair d-stale
+STALE_JSON="[{\"id\": \"SABLE-work\", \"status\": \"closed\", \"metadata\": {\"branch\": \"$BRANCH\", \"hold\": \"reason lost to a pane restart\", \"hold_since\": \"2001-01-01T00:00:00Z\"}}]"
+CALLLOG="$TMPROOT/d-stale-bdcalls.log"
+OUT="$(BD_CALL_LOG="$CALLLOG" STUB_BD_WORKBEAD_JSON="$STALE_JSON" run_reconcile)"; RC=$?
+SUMMARY="$(printf '%s\n' "$OUT" | grep '^sable-reconcile-handoffs:')"
+if [ "$RC" -eq 0 ] && ! grep -q "^create " "$CALLLOG" 2>/dev/null \
+   && printf '%s' "$OUT" | grep -q "STALE(" \
+   && printf '%s' "$OUT" | grep -q "UNOWNED" \
+   && printf '%s' "$OUT" | grep -q "NO-RELEASE-CONDITION" \
+   && printf '%s' "$SUMMARY" | grep -q "1 NEEDING REVIEW"; then
+  pass "D2 SABLE-jejx3: a stale/unowned/open-ended hold is flagged NEEDING REVIEW in the summary"
+else
+  fail "D2 SABLE-jejx3: an aging hold must escalate, never quietly persist" "rc=$RC summary=[$SUMMARY] out=$OUT"
+fi
+
+# (D2-control) a well-formed, fresh hold adds NO review noise, so the flag
+# means something when it does appear.
+FRESH_HOLD_JSON="[{\"id\": \"SABLE-work\", \"status\": \"closed\", \"metadata\": {\"branch\": \"$BRANCH\", \"hold\": \"rejected tip, revision inbound\", \"hold_by\": \"tarzan\", \"hold_since\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"hold_until\": \"revised tip green\"}}]"
+OUT="$(STUB_BD_WORKBEAD_JSON="$FRESH_HOLD_JSON" run_reconcile)"
+SUMMARY="$(printf '%s\n' "$OUT" | grep '^sable-reconcile-handoffs:')"
+if printf '%s' "$SUMMARY" | grep -q "1 held branch(es)" \
+   && ! printf '%s' "$SUMMARY" | grep -q "NEEDING REVIEW"; then
+  pass "D2 CONTROL: a fresh, owned, bounded hold adds no review noise"
+else
+  fail "D2 CONTROL: a healthy hold must not be flagged" "summary=[$SUMMARY]"
+fi
+
+# (D3) UNREADABLE hold state is its own reported outcome: the work-bead query
+# fails outright, so 'held' can be neither confirmed nor ruled out. The floor
+# must NOT file (an inverted handoff against a genuinely held branch is the
+# unrecoverable direction) and must NOT look like a clean sweep either
+# (SABLE-2az2x's lesson, one surface over).
+fresh_pair d-unreadable
+CALLLOG="$TMPROOT/d-unreadable-bdcalls.log"
+OUT="$(BD_CALL_LOG="$CALLLOG" STUB_BD_WORKBEAD_RC=1 STUB_BD_SEARCH_STATUS="" run_reconcile)"; RC=$?
+SUMMARY="$(printf '%s\n' "$OUT" | grep '^sable-reconcile-handoffs:')"
+if [ "$RC" -eq 0 ] && ! grep -q "^create " "$CALLLOG" 2>/dev/null \
+   && printf '%s' "$OUT" | grep -q "HOLD-STATE UNREADABLE $BRANCH" \
+   && printf '%s' "$SUMMARY" | grep -q "UNREADABLE hold state"; then
+  pass "D3 SABLE-jejx3: an unreadable hold state suppresses filing AND says so (never a clean-looking sweep)"
+else
+  fail "D3 SABLE-jejx3: unreadable hold state must be its own reported outcome" "rc=$RC summary=[$SUMMARY] out=$OUT"
+fi
+
+# (D4) the preview-kick leg is unchanged by all of the above — it reads P1/P4
+# only, so a hold must not silently disable CI warm-up as an unannounced side
+# effect (the same structural-independence check as i5739's AC5).
+if [ "$(ci_ref_count)" -eq 1 ]; then
+  pass "D4 SABLE-jejx3: the preview-kick leg still fires for a branch whose hold state is unreadable"
+else
+  fail "D4 SABLE-jejx3: preview-kick must stay structurally independent of hold state" "refs=[$(ci_refs)]"
 fi
 
 echo "----------------------------------------------------------------------"

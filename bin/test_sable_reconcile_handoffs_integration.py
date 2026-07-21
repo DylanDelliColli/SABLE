@@ -637,3 +637,185 @@ def test_SABLE_vif5e_for_chuck_query_failure_does_not_duplicate_handoff(tmp_path
         f"sweep failed to keep suppressing after bd was restored: "
         f"{beads_final}\n{r2.stdout}")
     assert beads_final[0]["id"] == original_id, beads_final
+
+
+# ===========================================================================
+# SABLE-jejx3: HELD is a first-class third outcome — real bd, real git, no mocks.
+#
+# The defect (OBSERVED at the merge seat, not theorised): a branch under an
+# explicit do-not-merge hold satisfies all four stranded predicates identically
+# to an accidentally-unmerged one, so the floor filed a handoff saying "nobody
+# merged this — merge it", the EXACT INVERSE of the standing instruction, and
+# re-filed it every cadence once Chuck closed it.
+#
+# The hold is now durable metadata on the WORK BEAD (never the branch name,
+# never tmux traffic), so it outlives a pane restart AND a branch rename.
+# Every rehearsal below carries its POSITIVE CONTROL: the same sweep, in the
+# same run or immediately after, DOES file for an unheld branch — proving the
+# sweep was capable of filing and the hold marker is what stopped it.
+# ===========================================================================
+
+def _now_iso():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _place_hold(work, home, bead_id, *, reason, by="tarzan",
+                since="2026-07-21T00:00:00Z", until="tarzan green-lights a revised tip"):
+    """Place a first-class hold on a REAL work bead via real `bd update
+    --set-metadata` — the same command the module docstring documents for a
+    manager at the merge seat."""
+    args = ["update", bead_id, "--sandbox", "--set-metadata", f"hold={reason}"]
+    if by is not None:
+        args += ["--set-metadata", f"hold_by={by}"]
+    if since is not None:
+        args += ["--set-metadata", f"hold_since={since}"]
+    if until is not None:
+        args += ["--set-metadata", f"hold_until={until}"]
+    _bd(work, home, *args)
+
+
+def _lift_hold(work, home, bead_id):
+    _bd(work, home, "update", bead_id, "--sandbox",
+        "--unset-metadata", "hold", "--unset-metadata", "hold_by",
+        "--unset-metadata", "hold_since", "--unset-metadata", "hold_until")
+
+
+def test_jejx3_held_branch_files_no_handoff_and_is_still_named(tmp_path):
+    """(i) NO for-chuck 'merge me' bead is filed for a held branch, and (ii) the
+    sweep still NAMES it — a held branch is never silently invisible. Positive
+    control at the end: lifting the hold makes the SAME sweep file, so the
+    marker is doing the work and this cannot pass vacuously."""
+    origin, work, home = _setup(tmp_path)
+    branch = "wk-held-target"
+    bead_id = _make_work_bead_with_branch_metadata(work, home, branch, status="closed")
+    _push_named_branch(work, branch, tag="held")
+
+    # BEFORE the hold: this is a textbook stranded branch (the inverted-handoff
+    # case as it fired in production) — assert the sweep would file, in dry-run
+    # so the corpus stays clean for the real assertion below.
+    pre = _reconcile(work, home, dry_run=True)
+    assert pre.returncode == 0, pre.stdout
+    assert "STRANDED" in pre.stdout, (
+        f"fixture invariant broken: the unheld branch must classify STRANDED "
+        f"or the hold assertion below proves nothing:\n{pre.stdout}")
+
+    _place_hold(work, home, bead_id,
+                reason="false-negative security regression in the tree-claim gate")
+
+    r1 = _reconcile(work, home)
+    assert r1.returncode == 0, r1.stdout
+
+    # (i) NOTHING filed — the inverted 'merge me' handoff is not manufactured
+    assert _for_chuck_beads(work, home) == [], (
+        f"a HELD branch must never produce a 'merge me' handoff:\n{r1.stdout}")
+
+    # (ii) it is still NAMED, with all four fields, every cadence
+    assert branch in r1.stdout, f"held branch went invisible:\n{r1.stdout}"
+    assert "HELD" in r1.stdout, r1.stdout
+    assert "by=tarzan" in r1.stdout, r1.stdout
+    assert "until=tarzan green-lights a revised tip" in r1.stdout, r1.stdout
+    assert "false-negative security regression" in r1.stdout, r1.stdout
+    summary = [l for l in r1.stdout.splitlines()
+               if l.startswith("sable-reconcile-handoffs:")][-1]
+    assert "1 held branch(es)" in summary and branch in summary, summary
+
+    # re-running does NOT accumulate anything either (the re-file loop that made
+    # the original defect recurring rather than one-shot)
+    r2 = _reconcile(work, home)
+    assert r2.returncode == 0, r2.stdout
+    assert _for_chuck_beads(work, home) == [], (
+        f"a second cadence re-filed against a held branch:\n{r2.stdout}")
+
+    # POSITIVE CONTROL: lift the hold; the SAME sweep now files exactly one
+    # handoff for the SAME branch — proving the sweep could file all along.
+    _lift_hold(work, home, bead_id)
+    r3 = _reconcile(work, home)
+    assert r3.returncode == 0, r3.stdout
+    filed = _for_chuck_beads(work, home)
+    assert len(filed) == 1, (
+        f"positive control failed — an UNHELD stranded branch must still file: "
+        f"{filed}\n{r3.stdout}")
+    assert branch in filed[0]["title"], filed[0]["title"]
+
+
+def test_jejx3_hold_survives_a_branch_rename(tmp_path):
+    """The fourth destroyer of the gz3v2 bandage: it keyed suppression on the
+    BRANCH NAME appearing in a bead title, so a rename or re-push under a new
+    name silently dropped the protection with nothing logged. A hold keyed on
+    the WORK BEAD travels with the work: re-point the bead's `branch` metadata
+    and the hold still applies under the new name."""
+    origin, work, home = _setup(tmp_path)
+    old_branch = "wk-renamed-before"
+    bead_id = _make_work_bead_with_branch_metadata(work, home, old_branch, status="closed")
+    _push_named_branch(work, old_branch, tag="rename")
+    _place_hold(work, home, bead_id, reason="rejected tip, revision inbound")
+
+    r0 = _reconcile(work, home)
+    assert r0.returncode == 0, r0.stdout
+    assert _for_chuck_beads(work, home) == [], r0.stdout
+
+    # RENAME: the work reappears on origin under a brand-new name, the old ref
+    # is gone, and the work bead is re-pointed at it (the SABLE-i5739 join).
+    new_branch = "wk-renamed-after"
+    _git(work, "checkout", old_branch)
+    _git(work, "branch", "-m", new_branch)
+    _git(work, "push", "origin", new_branch)
+    _git(work, "push", "origin", "--delete", old_branch)
+    _git(work, "checkout", BASE)
+    _bd(work, home, "update", bead_id, "--sandbox",
+        "--set-metadata", f"branch={new_branch}")
+
+    r1 = _reconcile(work, home)
+    assert r1.returncode == 0, r1.stdout
+    assert _for_chuck_beads(work, home) == [], (
+        f"the hold did not survive the rename — the floor resumed filing the "
+        f"inverted handoff against {new_branch}:\n{r1.stdout}")
+    assert new_branch in r1.stdout and "HELD" in r1.stdout, r1.stdout
+
+    # POSITIVE CONTROL, same run shape: a second, UNHELD branch in the same
+    # sweep DOES file — the sweep was capable of filing while the renamed held
+    # branch was correctly skipped.
+    other = "wk-unheld-control"
+    _make_work_bead_with_branch_metadata(work, home, other, status="closed")
+    _push_named_branch(work, other, tag="control")
+    r2 = _reconcile(work, home)
+    assert r2.returncode == 0, r2.stdout
+    filed = _for_chuck_beads(work, home)
+    assert len(filed) == 1, f"positive control failed: {filed}\n{r2.stdout}"
+    assert other in filed[0]["title"], filed[0]["title"]
+    assert new_branch not in filed[0]["title"], filed[0]["title"]
+
+
+def test_jejx3_stale_and_incomplete_holds_are_flagged_for_review(tmp_path):
+    """A forgotten hold is SELF-SILENCING BY CONSTRUCTION — it suppresses the
+    very report that would surface its branch — so age and missing fields must
+    escalate into the summary, or 'held' decays into a permanent quiet veto."""
+    origin, work, home = _setup(tmp_path)
+    branch = "wk-stale-hold"
+    bead_id = _make_work_bead_with_branch_metadata(work, home, branch, status="closed")
+    _push_named_branch(work, branch, tag="stale")
+    # placed long ago, by nobody, with no release condition
+    _place_hold(work, home, bead_id, reason="reason lost to a pane restart",
+                by=None, since="2001-01-01T00:00:00Z", until=None)
+
+    r = _reconcile(work, home)
+    assert r.returncode == 0, r.stdout
+    assert _for_chuck_beads(work, home) == [], r.stdout
+    assert "STALE(" in r.stdout, r.stdout
+    assert "UNOWNED" in r.stdout, r.stdout
+    assert "NO-RELEASE-CONDITION" in r.stdout, r.stdout
+    summary = [l for l in r.stdout.splitlines()
+               if l.startswith("sable-reconcile-handoffs:")][-1]
+    assert "1 NEEDING REVIEW" in summary, summary
+
+    # counterpart: a well-formed, fresh hold adds no review noise — so the
+    # flag means something when it appears.
+    _place_hold(work, home, bead_id, reason="rejected tip, revision inbound",
+                since=_now_iso())
+    r2 = _reconcile(work, home)
+    assert r2.returncode == 0, r2.stdout
+    summary2 = [l for l in r2.stdout.splitlines()
+                if l.startswith("sable-reconcile-handoffs:")][-1]
+    assert "NEEDING REVIEW" not in summary2, summary2
+    assert "1 held branch(es)" in summary2, summary2

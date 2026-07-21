@@ -626,3 +626,417 @@ def test_2az2x_dry_run_summary_flags_corpus_unreadable(monkeypatch, capsys):
     assert "DRY-RUN" in summary
     assert "CORPUS UNREADABLE" in summary, summary
     assert "1 branch(es) unassessed" in summary, summary
+
+
+# ===========================================================================
+# SABLE-jejx3: HELD is a first-class THIRD outcome, not a suppression.
+#
+# The defect: a branch unmerged BY DELIBERATE DECISION satisfies all four
+# stranded predicates identically to one unmerged BY ACCIDENT, so the floor
+# filed a handoff whose content ("merge it") was the EXACT INVERSE of the
+# standing instruction — and re-filed it every cadence once Chuck closed it.
+#
+# Every test below carries its NEGATIVE direction, because a hold check that
+# passes vacuously (e.g. by never filing at all) would look identical to a
+# working one. The hold marker must be what does the work.
+# ===========================================================================
+
+NOW_HOLD = 1_800_000_000.0  # fixed clock; all hold ages below are derived from it
+
+
+def _bead(hold=None, by=None, since=None, until=None, status="in_progress",
+          bead_id="SABLE-work"):
+    """A work-bead record as bd emits it, optionally carrying a hold."""
+    meta = {"branch": "wk-x"}
+    if hold is not None:
+        meta[smrh.HOLD_REASON_KEY] = hold
+    if by is not None:
+        meta[smrh.HOLD_BY_KEY] = by
+    if since is not None:
+        meta[smrh.HOLD_SINCE_KEY] = since
+    if until is not None:
+        meta[smrh.HOLD_UNTIL_KEY] = until
+    return {"id": bead_id, "status": status, "metadata": meta}
+
+
+def _iso_days_ago(days, now=NOW_HOLD):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(now - days * 86400.0,
+                                  tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _iso_days_ago_wallclock(days):
+    """Relative to the REAL clock — reconcile() takes its own time.time(), so
+    reconcile-level tests cannot use the fixed NOW_HOLD the pure-function tests
+    use (a NOW_HOLD-relative date is simply in the future from the real clock's
+    point of view, and every hold would read as age 0)."""
+    import time as _time
+    return _iso_days_ago(days, now=_time.time())
+
+
+# --- hold_from_bead: presence keyed on a non-empty reason -------------------
+
+def test_hold_from_bead_present():
+    h = smrh.hold_from_bead(_bead(hold="security regression", by="tarzan",
+                                  since="2026-07-21T00:00:00Z",
+                                  until="tarzan green-lights a revised tip"))
+    assert h["reason"] == "security regression"
+    assert h["by"] == "tarzan"
+    assert h["until"] == "tarzan green-lights a revised tip"
+    assert h["bead"] == "SABLE-work"
+
+
+@pytest.mark.parametrize("bead", [
+    None,                                   # no bead at all
+    {"id": "X", "status": "closed"},        # bead with no metadata
+    {"id": "X", "metadata": {}},            # metadata with no hold key
+    {"id": "X", "metadata": {"hold": ""}},  # empty reason is NOT a hold
+    {"id": "X", "metadata": {"hold": "   "}},
+])
+def test_hold_from_bead_absent(bead):
+    assert smrh.hold_from_bead(bead) is None
+
+
+def test_hold_from_bead_reason_only_is_still_a_hold():
+    # a sloppily-placed hold (reason only) must still PROTECT the branch; the
+    # missing fields are review flags, never a reason to ignore the hold.
+    h = smrh.hold_from_bead(_bead(hold="do not merge"))
+    assert h is not None and h["by"] is None and h["until"] is None
+
+
+# --- classify_branch: the headline pair (marker on / marker off) ------------
+
+def test_held_branch_classifies_as_held_not_stranded(monkeypatch):
+    """THE test named in the bead's spec, both directions in one place.
+
+    POSITIVE: a branch whose work bead carries a hold marker classifies HELD
+    and NOT stranded. NEGATIVE: the byte-for-byte IDENTICAL branch WITHOUT the
+    marker still classifies STRANDED — so the marker is what does the work and
+    this cannot pass vacuously (e.g. by the floor having stopped filing at all).
+    """
+    _fake_git(monkeypatch, ancestor_rc=1, tip_ct=CT_OLD)
+    _fake_bd(monkeypatch, search_status="closed")
+
+    hold = smrh.hold_from_bead(_bead(hold="false-negative security regression",
+                                     by="tarzan", since=_iso_days_ago(0.5),
+                                     until="tarzan green-lights a revised tip"))
+    is_stranded, reason, _ = smrh.classify_branch(
+        "/repo", "origin", "wk-x", "trunk", [], 10.0, NOW_HOLD, hold)
+    assert is_stranded is False, reason
+    assert reason.startswith("HELD"), reason
+    # the four fields chuck required: held, by whom, since when, until what
+    assert "by=tarzan" in reason
+    assert "since=" in reason and "until=tarzan green-lights a revised tip" in reason
+    assert "false-negative security regression" in reason
+
+    # NEGATIVE direction — identical branch, no marker
+    is_stranded, reason, status = smrh.classify_branch(
+        "/repo", "origin", "wk-x", "trunk", [], 10.0, NOW_HOLD, None)
+    assert is_stranded is True, reason
+    assert reason == "STRANDED"
+    assert status == "closed"
+
+
+def test_held_wins_over_every_other_stranded_predicate(monkeypatch):
+    # the hold is checked immediately after ancestry, so a held branch is
+    # reported HELD (not "no-qualifying-work-bead", not "too-fresh") whatever
+    # the other predicates say — the operator must see the REASON it is not
+    # merging, and that reason is the hold.
+    _fake_git(monkeypatch, ancestor_rc=1, tip_ct=CT_FRESH)
+    _fake_bd(monkeypatch, search_status="open")
+    hold = smrh.hold_from_bead(_bead(hold="held"))
+    is_stranded, reason, _ = smrh.classify_branch(
+        "/repo", "origin", "wk-x", "trunk", [], 10.0, NOW_HOLD, hold)
+    assert is_stranded is False
+    assert reason.startswith("HELD"), reason
+
+
+def test_merged_branch_is_still_merged_even_if_held(monkeypatch):
+    # P1 stays first: an already-merged branch is not interesting, held or not.
+    _fake_git(monkeypatch, ancestor_rc=0, tip_ct=CT_OLD)
+    _fake_bd(monkeypatch, search_status="closed")
+    hold = smrh.hold_from_bead(_bead(hold="held"))
+    is_stranded, reason, _ = smrh.classify_branch(
+        "/repo", "origin", "wk-x", "trunk", [], 10.0, NOW_HOLD, hold)
+    assert is_stranded is False
+    assert "merged-or-unresolvable" in reason
+
+
+def test_hold_unknown_suppresses_filing_and_says_so(monkeypatch):
+    # third outcome: the work bead could not be READ. Neither held nor
+    # not-held can be established, so the floor must NOT file (an inverted
+    # 'merge me' against a genuinely held branch is the unrecoverable
+    # direction) — and must say which one it is, never a clean skip.
+    _fake_git(monkeypatch, ancestor_rc=1, tip_ct=CT_OLD)
+    _fake_bd(monkeypatch, search_status="closed")
+    is_stranded, reason, _ = smrh.classify_branch(
+        "/repo", "origin", "wk-x", "trunk", [], 10.0, NOW_HOLD, smrh.HOLD_UNKNOWN)
+    assert is_stranded is False
+    assert "hold-state-unknown" in reason, reason
+    assert "NOT filing" in reason, reason
+
+
+# --- the hold must survive a BRANCH RENAME (the fourth destroyer) -----------
+
+def _fake_bd_meta_record(monkeypatch, record_by_branch):
+    """bd list --metadata-field branch=<b> resolves record_by_branch[b]."""
+    def fake_bd(repo, *args, check=False):
+        if args and args[0] == "list":
+            field = next((a for a in args if a.startswith("branch=")), "")
+            br = field.split("=", 1)[1] if "=" in field else ""
+            rec = record_by_branch.get(br)
+            return _cp(args, 0, json.dumps([rec] if rec else []))
+        if args and args[0] == "show":
+            return _cp(args, 1, "not found")
+        if args and args[0] == "search":
+            return _cp(args, 0, "[]")
+        return _cp(args, 0, "")
+    monkeypatch.setattr(smrh, "_bd", fake_bd)
+
+
+def test_hold_survives_a_branch_rename(monkeypatch):
+    # The gz3v2 bandage keyed the hold on the BRANCH NAME appearing in a bead
+    # TITLE, so a rename / re-push under a new name silently dropped the
+    # protection with nothing logged. The first-class hold is keyed on the WORK
+    # BEAD: re-point its `branch` metadata and the hold travels with the work.
+    bead = _bead(hold="regression", by="tarzan", since=_iso_days_ago(1),
+                 until="revised tip")
+    _fake_bd_meta_record(monkeypatch, {"wk-old-name": bead})
+    assert smrh.find_work_bead_hold("/repo", "wk-old-name")["reason"] == "regression"
+
+    # the branch is renamed; the SAME bead now points at the new name
+    _fake_bd_meta_record(monkeypatch, {"wk-brand-new-name": bead})
+    held = smrh.find_work_bead_hold("/repo", "wk-brand-new-name")
+    assert held is not None and held["reason"] == "regression", \
+        "a hold keyed on the work bead must survive a branch rename"
+    # ...and the OLD name, which no longer has a work bead, is not held
+    assert smrh.find_work_bead_hold("/repo", "wk-old-name") is None
+
+
+def test_hold_found_even_when_another_bead_joins_the_branch_first(monkeypatch):
+    """FOUND ON THE LIVE CORPUS while migrating the wk-dep-merge-guard hold:
+    TWO beads carried `branch=wk-dep-merge-guard` — a scratch observation bead
+    and the real work bead — and the scratch bead sorted FIRST. A resolver that
+    reads only the first joined record silently misses the hold and resumes
+    filing the inverted 'merge me' handoff, with nothing logged. Ordering must
+    never decide whether a hold is honoured: if ANY joined bead is held, the
+    branch is held."""
+    def fake_bd(repo, *args, check=False):
+        if args and args[0] == "list":
+            return _cp(args, 0, json.dumps([
+                {"id": "SCRATCH", "status": "closed",
+                 "metadata": {"branch": "wk-x"}},                     # sorts first, unheld
+                _bead(hold="rejected tip", by="tarzan",
+                      since=_iso_days_ago(1), until="revised tip"),   # the real hold
+            ]))
+        return _cp(args, 0, "[]")
+    monkeypatch.setattr(smrh, "_bd", fake_bd)
+
+    hold = smrh.find_work_bead_hold("/repo", "wk-x")
+    assert hold is not None and hold["reason"] == "rejected tip", \
+        "a hold on a non-first joined bead must still hold the branch"
+    # ...and predicate 2 keeps reading the FIRST record, exactly as before
+    assert smrh.find_work_bead_status("/repo", "wk-x") == "closed"
+
+
+def test_no_hold_when_no_joined_bead_is_held(monkeypatch):
+    # counterpart to the above: scanning all joined beads must not manufacture
+    # a hold out of unheld ones.
+    def fake_bd(repo, *args, check=False):
+        if args and args[0] == "list":
+            return _cp(args, 0, json.dumps([
+                {"id": "A", "status": "closed", "metadata": {"branch": "wk-x"}},
+                {"id": "B", "status": "in_progress", "metadata": {"branch": "wk-x"}},
+            ]))
+        return _cp(args, 0, "[]")
+    monkeypatch.setattr(smrh, "_bd", fake_bd)
+    assert smrh.find_work_bead_hold("/repo", "wk-x") is None
+
+
+def test_find_work_bead_hold_unreadable_when_query_fails(monkeypatch):
+    # every resolver path fails -> HOLD_UNKNOWN, never None (not-held)
+    monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 1, "boom"))
+    assert smrh.find_work_bead_hold("/repo", "wk-x") == smrh.HOLD_UNKNOWN
+
+
+def test_find_work_bead_hold_none_when_bead_reads_clean_and_unheld(monkeypatch):
+    # counterpart: a clean read of an UNHELD bead is None, not HOLD_UNKNOWN —
+    # otherwise every ordinary branch would be treated as maybe-held and the
+    # floor would stop filing entirely.
+    _fake_bd_meta_record(monkeypatch, {"wk-x": _bead()})
+    assert smrh.find_work_bead_hold("/repo", "wk-x") is None
+
+
+def test_find_work_bead_status_still_resolves_through_the_shared_resolver(monkeypatch):
+    # find_work_bead_status is now a thin accessor over find_work_bead; pin
+    # that the refactor did not change what it returns.
+    _fake_bd_meta_record(monkeypatch, {"wk-x": _bead(status="closed")})
+    assert smrh.find_work_bead_status("/repo", "wk-x") == "closed"
+
+
+# --- a hold must decay LOUDLY, never silently ------------------------------
+
+def test_hold_review_flags_clean_hold_has_none():
+    hold = smrh.hold_from_bead(_bead(hold="r", by="tarzan",
+                                     since=_iso_days_ago(0.5), until="revised tip"))
+    assert smrh.hold_review_flags(hold, NOW_HOLD, 3.0) == []
+
+
+def test_hold_review_flags_stale():
+    hold = smrh.hold_from_bead(_bead(hold="r", by="tarzan",
+                                     since=_iso_days_ago(9), until="revised tip"))
+    flags = smrh.hold_review_flags(hold, NOW_HOLD, 3.0)
+    assert any(f.startswith("STALE(") for f in flags), flags
+
+
+def test_hold_review_flags_unowned_and_no_release_condition():
+    hold = smrh.hold_from_bead(_bead(hold="r", since=_iso_days_ago(0.1)))
+    flags = smrh.hold_review_flags(hold, NOW_HOLD, 3.0)
+    assert any("UNOWNED" in f for f in flags), flags
+    assert any("NO-RELEASE-CONDITION" in f for f in flags), flags
+
+
+def test_hold_review_flags_unparseable_since_is_age_unknown_not_fresh():
+    # an unparseable date must never read as a fresh hold — that would let a
+    # hold with a typo'd timestamp sit forever without ever going stale.
+    hold = smrh.hold_from_bead(_bead(hold="r", by="t", since="last tuesday",
+                                     until="x"))
+    assert smrh.hold_age_days(hold, NOW_HOLD) is None
+    assert any("AGE-UNKNOWN" in f for f in smrh.hold_review_flags(hold, NOW_HOLD, 3.0))
+
+
+@pytest.mark.parametrize("since,expect_days", [
+    ("2026-07-21T00:00:00Z", True),
+    ("2026-07-21T00:00:00+00:00", True),
+    ("2026-07-21T00:00:00", True),   # naive -> assumed UTC
+    ("not-a-date", False),
+    (None, False),
+])
+def test_parse_hold_since(since, expect_days):
+    assert (smrh.parse_hold_since(since) is not None) is expect_days
+
+
+def test_describe_hold_carries_all_four_fields_and_flags():
+    hold = smrh.hold_from_bead(_bead(hold="regression", since=_iso_days_ago(9)))
+    text = smrh.describe_hold(hold, NOW_HOLD, 3.0)
+    assert text.startswith("HELD")
+    assert "by=UNKNOWN" in text and "until=UNSTATED" in text
+    assert "reason=regression" in text
+    assert "NEEDS REVIEW" in text and "STALE(" in text
+
+
+def test_hold_lift_hint_names_the_work_bead():
+    hold = smrh.hold_from_bead(_bead(hold="r", bead_id="SABLE-vx4aj"))
+    assert "SABLE-vx4aj" in smrh.hold_lift_hint(hold)
+    assert "--unset-metadata hold" in smrh.hold_lift_hint(hold)
+
+
+# --- reconcile(): held branches file nothing but are NAMED every cadence ----
+
+def _spy_reconcile_hold(monkeypatch, *, hold, stranded_branch="wk-x", dry_run=False):
+    """Drive reconcile() with one unmerged branch whose hold state is `hold`
+    (a record, None, or HOLD_UNKNOWN). Returns (rc, bd argv list)."""
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: [stranded_branch])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+    monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)
+    monkeypatch.setattr(smrh, "find_work_bead_status", lambda repo, branch: "closed")
+    monkeypatch.setattr(smrh, "find_work_bead_hold", lambda repo, branch: hold)
+    monkeypatch.setattr(smrh, "branch_tip_age_seconds", lambda *a, **k: 9999.0)
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+
+    bd_calls = []
+
+    def fake_bd(repo, *args, check=False):
+        bd_calls.append(args)
+        return _cp(args, 0, "created bd-xyz")
+
+    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+    monkeypatch.setattr(smrh, "_bd", fake_bd)
+    rc = smrh.reconcile("/repo", "origin", 10.0, dry_run)
+    return rc, bd_calls
+
+
+def test_reconcile_held_branch_files_nothing_but_is_named(monkeypatch, capsys):
+    hold = smrh.hold_from_bead(_bead(hold="security regression", by="tarzan",
+                                     since=_iso_days_ago_wallclock(0.2), until="revised tip"))
+    rc, bd_calls = _spy_reconcile_hold(monkeypatch, hold=hold)
+    assert rc == 0
+    assert not any(a and a[0] == "create" for a in bd_calls), \
+        "a HELD branch must never produce an inverted 'merge me' handoff"
+    out = capsys.readouterr().out
+    assert "HELD BRANCHES (1)" in out, out
+    assert "HELD wk-x:" in out, out
+    assert "to lift: bd update" in out, out
+    summary = _last_summary_line(out)
+    assert "1 held branch(es)" in summary, summary
+    assert "wk-x" in summary, "the summary must NAME the held branch, never merely count it"
+
+
+def test_reconcile_unheld_branch_still_files_positive_control(monkeypatch, capsys):
+    # POSITIVE CONTROL for the test above: the same sweep, hold removed, DOES
+    # file — proving the sweep was capable of filing in that configuration and
+    # the hold marker is what stopped it.
+    rc, bd_calls = _spy_reconcile_hold(monkeypatch, hold=None)
+    assert rc == 0
+    creates = [a for a in bd_calls if a and a[0] == "create"]
+    assert len(creates) == 1, creates
+    out = capsys.readouterr().out
+    assert "HELD BRANCHES" not in out, out
+    assert "0 held branch(es)" in _last_summary_line(out)
+
+
+def test_reconcile_stale_hold_is_flagged_in_the_summary(monkeypatch, capsys):
+    # a forgotten hold is self-silencing by construction — it suppresses the
+    # report that would surface it — so age must escalate INTO the summary.
+    hold = smrh.hold_from_bead(_bead(hold="r", by="tarzan",
+                                     since=_iso_days_ago_wallclock(30), until="x"))
+    rc, _ = _spy_reconcile_hold(monkeypatch, hold=hold)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "STALE(" in out, out
+    assert "1 NEEDING REVIEW" in _last_summary_line(out)
+
+
+def test_reconcile_fresh_hold_is_not_flagged(monkeypatch, capsys):
+    # counterpart: a well-formed, fresh hold adds no review noise.
+    hold = smrh.hold_from_bead(_bead(hold="r", by="tarzan",
+                                     since=_iso_days_ago_wallclock(0.1), until="x"))
+    _spy_reconcile_hold(monkeypatch, hold=hold)
+    summary = _last_summary_line(capsys.readouterr().out)
+    assert "NEEDING REVIEW" not in summary, summary
+    assert "1 held branch(es)" in summary
+
+
+def test_reconcile_hold_unreadable_files_nothing_and_says_so(monkeypatch, capsys):
+    rc, bd_calls = _spy_reconcile_hold(monkeypatch, hold=smrh.HOLD_UNKNOWN)
+    assert rc == 0
+    assert not any(a and a[0] == "create" for a in bd_calls)
+    out = capsys.readouterr().out
+    assert "HOLD-STATE UNREADABLE wk-x" in out, out
+    summary = _last_summary_line(out)
+    assert "UNREADABLE hold state" in summary, summary
+    assert "wk-x" in summary, summary
+
+
+def test_reconcile_dry_run_summary_also_reports_holds(monkeypatch, capsys):
+    # the --dry-run summary is a distinct f-string from the real-run one; cover
+    # it separately so a future edit cannot silently miss one branch.
+    hold = smrh.hold_from_bead(_bead(hold="r", by="tarzan",
+                                     since=_iso_days_ago_wallclock(0.1), until="x"))
+    rc, _ = _spy_reconcile_hold(monkeypatch, hold=hold, dry_run=True)
+    assert rc == 0
+    summary = _last_summary_line(capsys.readouterr().out)
+    assert "DRY-RUN" in summary
+    assert "1 held branch(es)" in summary and "wk-x" in summary, summary
+
+
+def test_reconcile_held_branch_is_still_preview_kicked(monkeypatch, capsys):
+    # the preview-kick leg is structurally independent of the stranded/hold
+    # predicates (it reads P1/P4 only) — a hold must not silently disable CI
+    # warm-up, which would be a second, unannounced behavior change.
+    hold = smrh.hold_from_bead(_bead(hold="r", by="t", since=_iso_days_ago_wallclock(0.1), until="x"))
+    _spy_reconcile_hold(monkeypatch, hold=hold)
+    out = capsys.readouterr().out
+    assert "preview-kick" in out
+    assert "1 preview-kick candidate(s)" in _last_summary_line(out)
