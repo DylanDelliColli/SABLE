@@ -366,6 +366,103 @@ run_hook_silent "bare 'sable-test' with no command not recognized" \
 run_hook_writes "sable-test env -u A -u B <suite> (combined wrapper shape) recognized" \
   "sable-test env -u CLAUDE_AGENT_NAME -u SABLE_WORKER_PANE bash hooks/test/test-foo.sh"
 
+# ---------- SABLE-x8mx7: bare inline VAR=value prefix must be unwrapped ----------
+# A bare 'NAME=value ... <cmd>' assignment prefix is the shell's own
+# env-for-one-command form (e.g. the fleet's sandbox-pinning contract:
+# 'SABLE_LIB_DIR=/scratch python3 -m pytest ...'). Previously only the
+# explicit 'env VAR=val cmd' wrapper was unwrapped, so a bare prefix left the
+# head as the VAR=value token, matched no runner, and silently produced NO
+# evidence -- a scoped test run was invisible and tdd-gate denied the close.
+# Strip leading NAME=value tokens the same way the env-wrapper branch does.
+
+run_hook_writes "bare VAR=val python3 -m pytest recognized" \
+  "SABLE_LIB_DIR=/scratch python3 -m pytest tests/"
+
+run_hook_writes "bare VAR=val pytest recognized" \
+  "FOO=1 pytest tests/"
+
+run_hook_writes "bare VAR=val bash <suite> recognized" \
+  "SABLE_LIB_DIR=/scratch bash hooks/test/test-foo.sh"
+
+run_hook_writes "multiple bare VAR=val assignments before the command recognized" \
+  "FOO=1 BAR=2 python3 bin/test_foo.py"
+
+run_hook_writes "bare VAR=val npx vitest recognized (composes with the npx unwrap)" \
+  "FOO=1 npx vitest run"
+
+# Combined shape: a bare assignment prefix in front of an env-wrapped hermetic
+# run must still resolve through both (assignment strip runs BEFORE the env
+# grammar strip / sable-test unwrap).
+run_hook_writes "bare VAR=val env -u A bash <suite> (assignment + env wrapper) recognized" \
+  "SABLE_LIB_DIR=/scratch env -u CLAUDE_AGENT_NAME bash hooks/test/test-foo.sh"
+
+run_hook_writes "bare VAR=val sable-test <suite> (assignment + sable-test wrapper) recognized" \
+  "SABLE_LIB_DIR=/scratch sable-test bash hooks/test/test-foo.sh"
+
+# Negative: a bare assignment in front of a NON-test command still records
+# nothing (the strip exposes the real command, which is correctly ignored).
+run_hook_silent "bare VAR=val in front of a non-test command not recognized" \
+  "SABLE_LIB_DIR=/scratch python3 deploy.py"
+
+# Negative: an assignment-only segment (no command at all) records nothing --
+# the shell would set the var and run nothing.
+run_hook_silent "assignment-only segment (no command) not recognized" \
+  "SABLE_LIB_DIR=/scratch"
+
+# repo-tagging must survive the strip: a bare-prefixed same-repo run is still
+# tagged with the hook's own cwd, and the recorded CMD is the REAL command
+# (the VAR=value token stripped), not the assignment.
+VARPREFIX_SID="tdd-ev-varprefix-$$-$RANDOM"
+VARPREFIX_EV="/tmp/tdd-evidence-${VARPREFIX_SID}"
+rm -f "$VARPREFIX_EV"
+python3 -c "
+import json, sys
+print(json.dumps({'tool_input': {'command': 'SABLE_LIB_DIR=/scratch pytest tests/'}, 'session_id': sys.argv[1], 'cwd': '/home/ddc/dev-environment/market-brief-package'}))
+" "$VARPREFIX_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if grep -q 'REPO=/home/ddc/dev-environment/market-brief-package CMD=pytest tests/$' "$VARPREFIX_EV" 2>/dev/null; then
+  pass "bare VAR=val prefix: evidence tags cwd and records the stripped real command"
+else
+  fail "bare VAR=val prefix: evidence tags cwd and records the stripped real command" "got: $(cat "$VARPREFIX_EV" 2>/dev/null)"
+fi
+rm -f "$VARPREFIX_EV"
+
+# ---------- INTEGRATION: bare VAR=val hermetic run + real tdd-gate.sh close ----------
+# The acceptance criterion for SABLE-x8mx7: a worker who scopes a test run with
+# the mandated sandbox-pinning form ('SABLE_LIB_DIR=<scratch> python3 -m pytest')
+# must be able to close its bead afterward. Real writer hook + real gate hook,
+# same session, no mocks -- the exact composition the unit tests cannot prove.
+VP_STUB_DIR=$(mktemp -d)
+cat > "$VP_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-stub","notes":"integration stub"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$VP_STUB_DIR/bd"
+VP_GATE_HOOK_FILE="$(cd "$(dirname "$0")/.." && pwd)/tdd-gate.sh"
+
+VP_SID="tdd-ev-varprefix-gate-$$-$RANDOM"
+VP_EV="/tmp/tdd-evidence-${VP_SID}"
+rm -f "$VP_EV"
+make_input "SABLE_LIB_DIR=/scratch python3 -m pytest tests/test_foo.py" "$VP_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if [ -s "$VP_EV" ]; then
+  pass "bare VAR=val hermetic run: real writer hook records evidence"
+else
+  fail "bare VAR=val hermetic run: real writer hook records evidence" "no $VP_EV"
+fi
+VP_GATE_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$VP_SID" | env PATH="$VP_STUB_DIR:$PATH" bash "$VP_GATE_HOOK_FILE" 2>/dev/null)
+if [ -z "$VP_GATE_OUT" ]; then
+  pass "bare VAR=val hermetic run: real gate ALLOWS the close (SABLE-x8mx7 acceptance criterion)"
+else
+  fail "bare VAR=val hermetic run: real gate ALLOWS the close" "gate denied: $VP_GATE_OUT"
+fi
+rm -f "$VP_EV"
+rm -rf "$VP_STUB_DIR"
+
 # ---------- INTEGRATION: env-u hermetic run + real tdd-gate.sh close ----------
 # The acceptance criterion for SABLE-j10xa/rzsb.5: a worker that follows the
 # fleet's mandated hermetic-run contract exactly must be able to close its
