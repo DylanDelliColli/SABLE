@@ -143,9 +143,21 @@ def title_names_branch(title: str | None, branch: str) -> bool:
     return re.search(pat, title) is not None
 
 
-def branch_named_by_open_for_chuck(open_beads: list[dict], branch: str) -> bool:
+def branch_named_by_open_for_chuck(open_beads: list[dict] | None, branch: str) -> bool:
     """Predicate 3. True iff any open/in-progress `for-chuck` bead's title names
-    the branch (a hook-filed handoff OR a prior reconciliation)."""
+    the branch (a hook-filed handoff OR a prior reconciliation).
+
+    open_beads is None when open_for_chuck_beads' query FAILED (corpus
+    unknown, not legitimately empty) — treated as True (assume-named) so a
+    transient bd failure suppresses filing rather than risking a duplicate.
+    The conservative direction is deliberately the OPPOSITE of
+    find_work_bead_status's metadata-query failure elsewhere in this file:
+    there, an empty result would wrongly leave a branch un-strandable, so the
+    safe fallback is to warn and keep going; here, an empty result IS the
+    suppression signal reconcile() acts on, so the safe fallback is to
+    assume-suppressed and skip this cadence."""
+    if open_beads is None:
+        return True
     return any(title_names_branch(b.get("title"), branch) for b in open_beads)
 
 
@@ -386,17 +398,35 @@ def find_work_bead_status(repo: str, branch: str) -> str | None:
     return None
 
 
-def open_for_chuck_beads(repo: str) -> list[dict]:
+def open_for_chuck_beads(repo: str) -> list[dict] | None:
     """Open + in-progress `for-chuck` beads (predicate 3's corpus). in_progress
-    included so a handoff Chuck has already STARTED still suppresses a duplicate."""
+    included so a handoff Chuck has already STARTED still suppresses a duplicate.
+
+    Returns None — NOT [] — when the query itself failed (nonzero bd exit or
+    unparseable JSON), so a transient bd failure is never indistinguishable
+    from 'genuinely zero open handoffs'. Unlike find_work_bead_status's
+    metadata query (SABLE-i5739), where a silent 'no bead' makes a branch
+    un-strandable and the safe fallback is to WARN-AND-CONTINUE, an empty
+    result HERE is predicate 3's suppression signal: reconcile() files a
+    for-chuck bead only when this corpus does NOT already name the branch.
+    Folding query-failure into empty would make the sweep FILE A DUPLICATE
+    into chuck's queue — not self-correcting, unlike skipping one cadence."""
     cp = _bd(repo, "list", "--status", "open,in_progress",
              "--label", "for-chuck", "--json", check=False)
     if cp.returncode != 0:
-        return []
+        print(f"sable-reconcile-handoffs: WARNING for-chuck bead query failed "
+              f"(bd list exit {cp.returncode}) — treating the corpus as "
+              f"UNKNOWN, not empty, so this cadence skips filing rather than "
+              f"risk a duplicate handoff: {cp.stdout.strip()}", file=sys.stderr)
+        return None
     try:
         d = json.loads(cp.stdout)
     except (json.JSONDecodeError, ValueError):
-        return []
+        print(f"sable-reconcile-handoffs: WARNING for-chuck bead query "
+              f"returned unparseable JSON — treating the corpus as UNKNOWN, "
+              f"not empty, so this cadence skips filing rather than risk a "
+              f"duplicate handoff", file=sys.stderr)
+        return None
     return [b for b in d if isinstance(b, dict)] if isinstance(d, list) else []
 
 
@@ -439,7 +469,7 @@ def attempt_preview_kick(repo: str, remote: str, branch: str,
 # --------------------------------------------------------------------------
 
 def classify_branch(repo: str, remote: str, branch: str, integration_branch: str,
-                    open_beads: list[dict], threshold_minutes: float,
+                    open_beads: list[dict] | None, threshold_minutes: float,
                     now: float) -> tuple[bool, str, str | None]:
     """Apply the four-part stranded predicate to ONE branch. Returns
     (is_stranded, reason, work_status). Cheap/pure checks first; the bead-status

@@ -112,6 +112,24 @@ exit 0
 EOF
 chmod +x "$STUB_DIR/bd" "$STUB_DIR/gh" "$STUB_DIR/sable-msg" "$STUB_DIR/tmux"
 
+# Fixture self-check (chuck/tarzan root-cause, SABLE-vif5e): the `bd` stub's
+# `list` subcommand MUST emit valid JSON even when STUB_BD_FORCHUCK_JSON is
+# left UNSET (the C5 true-positive case below does exactly this) — bash's
+# "${VAR:-}" forwarding in run_reconcile sets the var to an EMPTY STRING
+# rather than leaving it unset, so the stub's own `os.environ.get(...,
+# "[]")` default never applies and it prints a blank line instead. This
+# fixture fed the reconciler that garbage for as long as this line existed;
+# nothing caught it until sable-reconcile-handoffs' vif5e fix started
+# warning on unparseable JSON instead of silently swallowing it. Guard the
+# fixture's own contract here so a future regression fails loud in THIS
+# suite, not by way of a product change happening to notice.
+STUB_LIST_JSON="$(env -i PATH="$STUB_DIR:$PATH" HOME="$HOME" \
+    "$STUB_DIR/bd" list --status open,in_progress --label for-chuck --json)"
+if ! python3 -c "import json,sys; json.loads(sys.argv[1])" "$STUB_LIST_JSON" 2>/dev/null; then
+  echo "FATAL: bd stub's 'list' output is not valid JSON with STUB_BD_FORCHUCK_JSON unset: '$STUB_LIST_JSON'"
+  exit 2
+fi
+
 # Real sable-merge-gate on PATH — the hook resolves it via `command -v`, and
 # the whole point of this suite is exercising the REAL preview_kick_ref
 # derivation, not a recorder stand-in (that coverage already lives in
@@ -188,7 +206,7 @@ run_reconcile() {
       BD_CALL_LOG="${BD_CALL_LOG:-}" \
       STUB_BD_SHOW_STATUS="${STUB_BD_SHOW_STATUS:-}" \
       STUB_BD_SEARCH_STATUS="${STUB_BD_SEARCH_STATUS:-}" \
-      STUB_BD_FORCHUCK_JSON="${STUB_BD_FORCHUCK_JSON:-}" \
+      STUB_BD_FORCHUCK_JSON="${STUB_BD_FORCHUCK_JSON:-[]}" \
       python3 "$RECONCILE" --repo "$WORK" --remote origin --age-min "$age_min"
 }
 
