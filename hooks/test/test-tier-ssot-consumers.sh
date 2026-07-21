@@ -157,18 +157,20 @@ set_pre_push test-fixture-alpha.sh test-fixture-gamma.sh
 OUT2=$(run_hook "$PP_ENV" "$REPO_DIR")
 
 # Assert on the DENY behavior change (ALLOW -> DENY, same repo, only the SSOT
-# changed) and that phase 3 (not 1/2) is what fired — not on the deny
-# message's captured-output text: SABLE-29o5y (filed above) is a pre-existing,
-# unrelated truncation bug (`${TEST_OUT: -1500}` yields EMPTY, not the whole
-# string, whenever the failing command's output is under 1500 chars — true
-# for this tiny fixture suite but essentially never true for a real pytest/
-# shell-suite failure, which is why it was never noticed before) that would
-# make a text-content assertion here flaky for the wrong reason.
+# changed), that phase 4 (not 1/2/3 — SABLE-rzsb S4 inserted a new BUILD
+# phase 3 ahead of TESTS, renumbering it) is what fired, AND on the deny
+# message's captured-output text: SABLE-29o5y (filed above, fixed under
+# SABLE-rzsb.2) was a truncation bug where `${TEST_OUT: -1500}` yielded
+# EMPTY — not the whole string — whenever the failing command's output was
+# under 1500 chars, exactly this tiny fixture suite's case. Now fixed
+# (sable_tail_chars, a length-safe `tail -c`), so the fixture's own failure
+# marker is expected to survive into the deny message.
 if printf '%s' "$OUT2" | grep -q '"permissionDecision": "deny"' \
-   && printf '%s' "$OUT2" | grep -q 'phase 3 (tests)'; then
-  pass "consumer 1 (pre-push hook): after mutating pre_push in the SAME file (drop passing beta, add failing gamma), the hook re-resolves it and phase 3 now DENIES"
+   && printf '%s' "$OUT2" | grep -q 'phase 4 (tests)' \
+   && printf '%s' "$OUT2" | grep -q 'GAMMA-RAN-AND-FAILED'; then
+  pass "consumer 1 (pre-push hook): after mutating pre_push in the SAME file (drop passing beta, add failing gamma), the hook re-resolves it and phase 4 now DENIES with the fixture's own output in the message"
 else
-  fail "consumer 1 (pre-push hook): after mutating pre_push in the SAME file (drop passing beta, add failing gamma), the hook re-resolves it and phase 3 now DENIES" "got: ${OUT2:0:600}"
+  fail "consumer 1 (pre-push hook): after mutating pre_push in the SAME file (drop passing beta, add failing gamma), the hook re-resolves it and phase 4 now DENIES with the fixture's own output in the message" "got: ${OUT2:0:600}"
 fi
 
 # Confirm directly (bypassing the hook's deny-message truncation entirely)
