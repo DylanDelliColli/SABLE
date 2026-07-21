@@ -335,6 +335,37 @@ def test_file_fallback_bead_creates_for_role_inbox_bead():
     joined = " ".join(argv)
     assert "for-optimus" in joined
     assert message in joined
+    assert "coord" in joined
+
+
+def test_file_fallback_bead_is_not_filed_p1():
+    """costing-comparison-573: an undelivered-message bead is an INBOX item, not
+    a work item. Filing it P1 sorted it ABOVE genuine P1 engineering work in
+    `bd ready` — one measured pool held 26 items of which 11 were these, all
+    outranking the real work. The fallback itself is correct and must keep
+    existing: it is what made this session's tmux delivery failures lossless.
+    Only its priority is wrong."""
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-ab12\n"
+        stderr = ""
+
+    def runner(args):
+        seen.append(args)
+        return R()
+
+    sable_msg.file_fallback_bead("lincoln", "optimus", "body", runner=runner)
+    argv = seen[0]
+    assert "--priority=1" not in argv, (
+        "fallback inbox beads must not be P1 — they bury real engineering work "
+        "in bd ready (costing-comparison-573)"
+    )
+    assert "--priority=3" in argv
+    # The for-ROLE label is how the recipient actually reads their inbox, so it
+    # must survive any change to pool membership.
+    assert "--labels=for-optimus,coord" in argv
 
 
 def test_file_fallback_bead_returns_none_when_bd_unavailable():
