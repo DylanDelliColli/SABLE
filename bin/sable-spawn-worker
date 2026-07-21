@@ -162,15 +162,32 @@ FIXTURE_PATH_CONFIG_KEY = "sable.fixturePath"
 
 def configured_fixture_paths(toplevel: str) -> list[str]:
     """Repo-relative fixture paths opted in via sable.fixturePath. Empty (never
-    an error) when the key is unset — repos that need nothing pay nothing."""
+    an error) when the key is unset — repos that need nothing pay nothing.
+
+    SABLE-6sdpx: `git config --get-all` documents exit 1 SPECIFICALLY for "the
+    section or key is invalid" (i.e. legitimately unset) — that is the one
+    nonzero code meaning empty-by-design, exactly like pytest's exit 5. Every
+    OTHER nonzero code (2 bad params, 3 malformed config file, 128 not-a-repo,
+    ...) is a real failure git could not even evaluate the key for, and must
+    not be silently folded into "unconfigured", or a repo that genuinely opted
+    in via sable.fixturePath would silently run every worker without its
+    fixtures with no signal anywhere."""
     try:
-        out = subprocess.run(
+        cp = subprocess.run(
             ["git", "-C", toplevel, "config", "--get-all", FIXTURE_PATH_CONFIG_KEY],
             capture_output=True, text=True, check=False,
-        ).stdout
+        )
     except OSError:
         return []
-    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+    if cp.returncode == 1:
+        return []  # key/section not found — legitimately unconfigured
+    if cp.returncode != 0:
+        print(f"sable-spawn-worker: WARNING git config --get-all "
+              f"{FIXTURE_PATH_CONFIG_KEY} failed (exit {cp.returncode}) — "
+              f"treating as unconfigured, fixtures may be silently skipped: "
+              f"{cp.stderr.strip() or cp.stdout.strip()}", file=sys.stderr)
+        return []
+    return [ln.strip() for ln in cp.stdout.splitlines() if ln.strip()]
 
 
 def plan_fixture_links(toplevel: str, worktree: str, rels: list[str]) -> list[tuple]:

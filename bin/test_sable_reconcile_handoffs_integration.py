@@ -452,6 +452,31 @@ def test_S7oj5_generated_unit_env_survives_systemd_shaped_stripped_path(tmp_path
     assert branch in beads[0]["title"], beads[0]["title"]
 
 
+# ===========================================================================
+# SABLE-6sdpx: reconcile()'s `git fetch --prune` refresh was check=False and
+# never inspected — a real fetch failure (unreachable/misconfigured remote)
+# was previously silent, classifying against stale refs with zero signal.
+# Real subprocess, real (broken) remote, no mocks: assert the observable
+# outcome is a loud warning plus a still-successful, non-crashing sweep — the
+# conservative direction (best-effort continue + noise) rather than a swallow.
+# ===========================================================================
+
+def test_fetch_failure_against_unconfigured_remote_warns_but_still_sweeps(tmp_path):
+    origin, work, home = _setup(tmp_path)
+    bead_id = _make_work_bead(work, home, status="closed")
+    _push_worker_branch(work, bead_id)
+
+    # a remote name with nothing configured for it -> `git fetch garbage-remote
+    # --prune` fails for real (unlike origin, which the fixture wires up).
+    argv = [sys.executable, str(BIN), "--repo", str(work), "--remote", "garbage-remote"]
+    r = _run(argv, work, home)
+    assert r.returncode == 0, ("a failed refresh must not crash the sweep — "
+                               f"best-effort continue is the conservative fallback:\n{r.stdout}")
+    assert "WARNING" in r.stdout and "fetch" in r.stdout, (
+        f"a real fetch failure must be loud, never silent:\n{r.stdout}"
+    )
+
+
 def test_S7oj5_without_sable_rc_bd_the_original_bug_reproduces(tmp_path):
     # Pins the FAILURE this bead fixes: bare 'bd' + a stripped systemd-shaped
     # PATH really does FileNotFoundError — proof the fix above (not some
