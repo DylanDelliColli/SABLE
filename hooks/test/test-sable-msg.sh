@@ -27,6 +27,9 @@ PASS=0; FAIL=0; FAIL_NAMES=""
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 tmux_() { tmux -L "$SOCK" "$@"; }
+# Pane-spawning calls (new-session/new-window/split-window/respawn-pane) route
+# through the guarded sable_tmux_spawn instead of plain tmux -- see below.
+tmux_spawn_() { sable_tmux_spawn -L "$SOCK" "$@"; }
 cleanup() { tmux_ kill-server >/dev/null 2>&1; rm -rf "$REC"; }
 trap cleanup EXIT
 
@@ -39,9 +42,14 @@ trap cleanup EXIT
 # CLAUDE_AGENT_NAME=tarzan -- and sable-msg's SABLE-to8m poisoned-identity
 # check (pane_process_identity reads /proc/PID/environ) then correctly
 # refuses delivery, since the "recipient" pane's real identity doesn't match
-# the role under test. Unset here so every pane this suite spawns starts
-# from a clean identity regardless of the invoking shell (SABLE-4nr0q).
-unset CLAUDE_AGENT_NAME SABLE_WORKER_PANE SABLE_BEAD
+# the role under test. Scrub here (SABLE-4nr0q) so every pane this suite
+# spawns starts from a clean identity regardless of the invoking shell.
+# Central scrub lives in lib-identity-isolation.sh (SABLE-j3bi/SABLE-a9453)
+# so every suite shares one definition of "identity vars" instead of
+# drifting copies of an unset list; sable_tmux_spawn is the guard that fails
+# loudly if a future spawn call site ever bypasses this scrub.
+source "$REPO/hooks/test/lib-identity-isolation.sh"
+sable_scrub_identity_env
 
 export SABLE_TMUX_SOCKET="$SOCK"
 export SABLE_MSG_POLL_INTERVAL="0.1"
@@ -78,8 +86,8 @@ SCRIPT
 chmod +x "$STAND_IN"
 
 # --- 1) manager pane, booting for 2s: --interrupt must not drop the turn ----
-tmux_ new-session -d -s w -x 200 -y 50
-tmux_ respawn-pane -k -t w "REC_FILE=$REC/optimus.txt BOOT_DELAY=2 $STAND_IN"
+tmux_spawn_ new-session -d -s w -x 200 -y 50
+tmux_spawn_ respawn-pane -k -t w "REC_FILE=$REC/optimus.txt BOOT_DELAY=2 $STAND_IN"
 tmux_ set-option -p -t w @sable_role optimus
 sleep 0.2   # still booting at this point
 
@@ -102,7 +110,7 @@ fi
 
 # --- 2) worker pane, tagged like sable-spawn-worker tags it -----------------
 BEAD="market-brief-package-73t4"
-tmux_ new-window -d -t w: -n worker -c /tmp "PS1='> ' bash --noprofile --norc"
+tmux_spawn_ new-window -d -t w: -n worker -c /tmp "PS1='> ' bash --noprofile --norc"
 wpane="$(tmux_ list-panes -a -F '#{pane_id} #{window_name}' | awk '$2=="worker"{print $1; exit}')"
 tmux_ set-option -p -t "$wpane" @sable_role worker
 tmux_ set-option -p -t "$wpane" @sable_bead "$BEAD"
@@ -156,17 +164,17 @@ git init -q "$REPO_A"; git init -q "$REPO_B"
 SESS_A="sable-$(basename "$REPO_A")"
 SESS_B="sable-$(basename "$REPO_B")"
 
-tmux_ new-session -d -s "$SESS_A" -x 200 -y 50 -c "$REPO_A" "PS1='> ' bash --noprofile --norc"
+tmux_spawn_ new-session -d -s "$SESS_A" -x 200 -y 50 -c "$REPO_A" "PS1='> ' bash --noprofile --norc"
 tmux_ set-option -t "$SESS_A" @sable_repo "$REPO_A"
 tmux_ set-option -p -t "$SESS_A" @sable_role tarzan
-tmux_ new-session -d -s "$SESS_B" -x 200 -y 50 -c "$REPO_B" "PS1='> ' bash --noprofile --norc"
+tmux_spawn_ new-session -d -s "$SESS_B" -x 200 -y 50 -c "$REPO_B" "PS1='> ' bash --noprofile --norc"
 tmux_ set-option -t "$SESS_B" @sable_repo "$REPO_B"
 sleep 0.3
 
 tarzan_pane="$(tmux_ list-panes -t "$SESS_A" -F '#{pane_id}')"
 # a second pane in alpha's OWN session, shelled into beta's worktree — exactly
 # the mismatched-CWD shape a cross-repo worker dispatch produces.
-tmux_ split-window -t "$SESS_A" -d -c "$REPO_B" "PS1='> ' bash --noprofile --norc"
+tmux_spawn_ split-window -t "$SESS_A" -d -c "$REPO_B" "PS1='> ' bash --noprofile --norc"
 sleep 0.3
 worker_pane="$(tmux_ list-panes -t "$SESS_A" -F '#{pane_id}' | grep -v "^$tarzan_pane$")"
 tmux_ set-option -p -t "$worker_pane" @sable_role worker
@@ -221,7 +229,7 @@ done
 SCRIPT
 chmod +x "$BUSY_TUI"
 
-tmux_ new-window -d -t w: -n mgr2 "REC_FILE=$REC/tarzan.txt $BUSY_TUI"
+tmux_spawn_ new-window -d -t w: -n mgr2 "REC_FILE=$REC/tarzan.txt $BUSY_TUI"
 mpane="$(tmux_ list-panes -a -F '#{pane_id} #{window_name}' | awk '$2=="mgr2"{print $1; exit}')"
 tmux_ set-option -p -t "$mpane" @sable_role tarzan
 sleep 0.3   # send within the fresh-spawn window, while the turn is busy
