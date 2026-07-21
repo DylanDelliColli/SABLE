@@ -143,7 +143,18 @@ if [ "$rc3" -eq 0 ]; then
 else
   fail "--reap exits 0 when a done pane holds pending input" "exit $rc3: $out3"
 fi
-if printf '%s' "$out3" | grep -q "market-brief-package-0h8k"; then
+# SABLE-o05cv RULING: this used to grep for the literal cross-tracker id
+# "market-brief-package-0h8k" in the flag line. SABLE-jb3o (commit f70a0f9,
+# 2026-07-21) deliberately dropped that id from reap()'s stderr — it is a
+# cross-tracker id `bd` cannot resolve against this DB, so it was noise to an
+# operator — but never updated this assertion, leaving it pinned to text the
+# tool no longer emits. Confirmed via `git log -S` that this assertion
+# predates f70a0f9 (added in 63cebbe) — TEST-EXPECTATION DRIFT, not a
+# regression: the flagging behavior itself is intact (see the two nearby
+# assertions on the literal pending text and on zero survivors), only the
+# unresolvable id was removed on purpose. Assert on the operator-facing
+# phrase the tool actually still emits instead.
+if printf '%s' "$out3" | grep -q "holds unsubmitted composer input"; then
   pass "--reap flags the pending-input pane instead of staying silent"
 else
   fail "--reap flags the pending-input pane instead of staying silent" "$out3"
@@ -222,7 +233,10 @@ tmux -L "$SOCK" send-keys -t "$PANE9" -l "check the pool for next work"
 sleep 0.2
 
 out5="$(run_status --reap 2>&1)"
-if printf '%s' "$out5" | grep -q "market-brief-package-0h8k"; then
+# SABLE-o05cv: same ruling as the worker-pane case above — assert on the
+# still-live "holds unsubmitted composer input" phrase, not the cross-tracker
+# id SABLE-jb3o intentionally dropped from reap()'s stderr.
+if printf '%s' "$out5" | grep -q "holds unsubmitted composer input"; then
   pass "--reap flags a producer pane's pending composer input instead of staying silent"
 else
   fail "--reap flags a producer pane's pending composer input instead of staying silent" "$out5"
