@@ -30,9 +30,14 @@
 #      '&&', '||', '|', '&', newline, subshell parens and brace groups, so a
 #      multi-line or grouped command cannot hide either the `cd` prefix (which
 #      would gate an unrelated repo) or the git write itself (which would
-#      evade the claim outright). Where the target cannot be resolved from the
-#      command text — `cd "$VAR"`, `cd -`, `popd`, unparseable quoting — the
-#      command is gated against the session cwd rather than allowed through.
+#      evade the claim outright). Subshell parens additionally SCOPE the
+#      directory: bash unwinds a `cd` at the closing paren, so
+#      `( cd /tmp ) ; git commit` writes HERE, while a brace group runs in the
+#      current shell and its `cd` DOES persist — the two must not be treated
+#      alike. Where the target cannot be resolved from the command text —
+#      `cd "$VAR"`, `cd -`, `popd`, unparseable quoting — the command is gated
+#      against the best directory the hook can infer rather than allowed
+#      through.
 #
 #   3. Claim lifecycle (TTL default: 3600s, override SABLE_TREE_CLAIM_TTL):
 #        No claim      → write this session's claim, allow.
@@ -233,6 +238,20 @@ cwd = os.environ.get('CWD_VAL', '')
 # command. A backslash-newline line continuation is preserved as whitespace
 # (the backslash branch consumes the newline verbatim), which is correct:
 # it does not start a new command.
+#
+# SUBSHELL PARENS ARE EMITTED AS THEIR OWN TOKENS, NOT AS ';'. Collapsing
+# '(' and ')' into a plain separator resets command position but DISCARDS
+# SCOPE, and scope is load-bearing for a gate that attributes writes to
+# directories. bash unwinds a subshell's 'cd' at the closing paren, so
+# '( cd /tmp && true ) ; git commit' writes to the ORIGINAL directory; a walk
+# that keeps the shifted cwd attributes the commit to /tmp and lets a write
+# into the claimed repo through. The walk therefore pushes shell_cwd on '('
+# and pops it on ')'.
+#
+# BRACE GROUPS ARE DELIBERATELY NOT SYMMETRIC with parens: '{ ...; }' runs in
+# the CURRENT shell, so its 'cd' DOES persist past the closing brace. They
+# stay plain separators. Treating the two alike is wrong by construction in
+# one direction or the other.
 def normalize_operators(s):
     out = []
     i, n = 0, len(s)
@@ -263,7 +282,9 @@ def normalize_operators(s):
             if ch == '|':
                 out.append(' | '); i += 1; continue
             out.append(' ; '); i += 1; continue   # background '&'
-        if ch in ';\n(){}':
+        if ch in '()':                            # subshell: scoped, see above
+            out.append(' ' + ch + ' '); i += 1; continue
+        if ch in ';\n{}':
             out.append(' ; '); i += 1; continue
         out.append(ch)
         i += 1
@@ -283,7 +304,15 @@ except ValueError:
         sys.exit(0)
     sys.exit(1)
 
-SHELL_SEPS = {';', '&&', '||', '|'}
+# '(' and ')' are members so that every existing 'skip to end of this segment'
+# and 'break out of the git-flag walk' loop treats them as boundaries; the
+# main loop then gives them their scoping behaviour (push/pop) on top.
+SHELL_SEPS = {';', '&&', '||', '|', '(', ')'}
+# NOTE: reserved words ('then', 'do', 'else', ...) are NOT treated as command
+# positions here, so 'if true; then git commit; fi' still evades the walk.
+# That is a live false negative tracked separately as SABLE-hfkdd — it is
+# pre-existing on the base branch, not introduced or fixed here, and is
+# deliberately left out of this change's scope.
 # git global flags that consume the next token as an argument
 CONSUME_NEXT = {'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path'}
 STANDALONE = {
@@ -313,6 +342,9 @@ def resolve_effective_dir(c_paths, base_cwd):
 # (SABLE-5pci: without this, 'cd <wt> && git add' fell back to the hook's
 # original cwd instead of <wt>, landing in the wrong repo's claim file).
 shell_cwd = cwd
+# Saved shell_cwd per open subshell. bash restores the caller's directory at
+# the closing paren, so the walk must too (see normalize_operators).
+cwd_stack = []
 # SABLE-vx4aj: set when a cd target could not be resolved to a real path
 # (variable/command substitution, glob, 'cd -', popd). shell_cwd then stays
 # at the session cwd and the decision is reported as a fail-safe fallback.
@@ -328,8 +360,26 @@ n = len(tokens)
 at_cmd_pos = True
 while i < n:
     tok = tokens[i]
-    # Shell separator -> next token is a new command position
+    # Shell separator -> next token is a new command position.
+    # Parens additionally save/restore the shell cwd (subshell scope).
     if tok in SHELL_SEPS:
+        if tok == '(':
+            cwd_stack.append(shell_cwd)
+        elif tok == ')':
+            if cwd_stack:
+                shell_cwd = cwd_stack.pop()
+            else:
+                # Unbalanced ')' — in practice a 'case' pattern terminator
+                # ('case x in pat) ...'), since '(' is always emitted too.
+                # A case body runs in the CURRENT shell, so the running
+                # shell_cwd is the right answer and must be KEPT: resetting to
+                # the session cwd here re-opened the false negative outright —
+                # 'cd <claimed>; case x in x) git commit;; esac' from another
+                # repo's cwd really lands in <claimed> (verified against real
+                # bash), and a reset attributed it to the session cwd and
+                # allowed it. Flag it ambiguous so the deny explains the guess,
+                # but do not move the directory.
+                target_ambiguous = True
         at_cmd_pos = True
         i += 1
         continue
@@ -468,7 +518,7 @@ TARGET_RESOLUTION=$(printf '%s\n' "$DETECTION" | sed -n '2p')
 # way to tell why.
 AMBIGUITY_NOTE=""
 if [ "$TARGET_RESOLUTION" = "ambiguous" ]; then
-  AMBIGUITY_NOTE=" NOTE: the command's target repo could not be resolved from its text (an unexpanded variable, glob, 'cd -' or 'popd'), so it was gated against this session's cwd ($CWD) rather than allowed through unchecked. Re-run with a literal path to be gated against the repo you actually mean."
+  AMBIGUITY_NOTE=" NOTE: the command's target repo could not be resolved from its text with confidence (an unexpanded variable, glob, 'cd -', 'popd', or an unmatched ')'), so it was gated against the best directory the hook could infer ($EFFECTIVE_DIR) rather than allowed through unchecked. Re-run with a literal path to be gated against the repo you actually mean."
 fi
 
 # ---------------------------------------------------------------------------

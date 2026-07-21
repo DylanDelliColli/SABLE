@@ -863,6 +863,186 @@ fi
 rm -rf "$VX_ROOT"
 
 # ============================================================
+# SABLE-vx4aj / SABLE-hfkdd — REAL-BASH ORACLE
+# ============================================================
+#
+# Everything above asserts hand-written expected values. That is exactly how
+# the previous 102-assertion revision of this suite passed while shipping a
+# live evasion: it enumerated the constructs the fix had ADDED handling for,
+# and asserted the case where the 'cd' and the write are BOTH inside a
+# subshell — the complement of the failing case. Coverage read complete while
+# the load-bearing invariant went unasserted.
+#
+# THE INVARIANT, asserted directly and in both directions:
+#   the claim gates a command IF AND ONLY IF that command's write really
+#   lands in the claimed repo.
+#
+# Expected values below are NOT hand-written. For each probe, bash itself
+# executes the command against a fresh pair of real repos and we observe which
+# repo actually gained a commit; the hook's decision must agree with what bash
+# really did. Bash's own scoping is the ground truth.
+#
+# Every probe additionally carries a POSITIVE CONTROL in its own fixture (see
+# oracle_check): an allow is an absence-assertion, and a rig that has stopped
+# gating anything returns allow for everything and looks green. The control
+# proves the fixture denies when it must before any allow from it is believed.
+#
+# Cases are derived from what the tokenizer's normalisation DISCARDS. It
+# rewrites shell operators into separators, which resets command position but
+# throws away SCOPE — and scope is load-bearing for a gate that attributes
+# writes to directories. Hence the central pair:
+#   '( cd X ) ; git commit'    -> bash unwinds the cd at ')': writes HERE
+#   '{ cd X ; } ; git commit'  -> brace group runs in THIS shell: writes in X
+# Subshell and brace group MUST differ; any implementation treating them alike
+# is wrong by construction in one direction or the other.
+
+echo "--- SABLE-vx4aj/hfkdd: real-bash oracle (hook decision vs. where bash actually writes) ---"
+
+ORC_ROOT=""
+ORC_CLAIMED=""
+ORC_UNRELATED=""
+
+# Fresh pair of real repos, both dirty so 'git commit -am' can succeed in
+# EITHER one — otherwise a probe could "land nowhere" for an uninteresting
+# reason and vacuously agree with an allow.
+orc_setup() {
+  ORC_ROOT="$(mktemp -d)"
+  ORC_CLAIMED="$ORC_ROOT/claimed"
+  ORC_UNRELATED="$ORC_ROOT/unrelated"
+  local r
+  for r in "$ORC_CLAIMED" "$ORC_UNRELATED"; do
+    git init -q "$r"
+    git -C "$r" config user.email oracle@test
+    git -C "$r" config user.name oracle
+    echo base > "$r/f.txt"
+    git -C "$r" add f.txt
+    git -C "$r" commit -qm init
+    echo change >> "$r/f.txt"
+  done
+}
+orc_teardown() { [ -n "$ORC_ROOT" ] && rm -rf "$ORC_ROOT"; ORC_ROOT=""; }
+
+orc_expand() {
+  # $1 = template using @CLAIMED@ / @UNRELATED@ placeholders
+  local t="$1"
+  t="${t//@CLAIMED@/$ORC_CLAIMED}"
+  t="${t//@UNRELATED@/$ORC_UNRELATED}"
+  printf '%s' "$t"
+}
+
+# oracle_check <label> <cwd: claimed|unrelated> <command template>
+oracle_check() {
+  local label="$1" cwdsel="$2" tmpl="$3"
+  local cmd cwd truth c_before c_after u_before u_after
+
+  # --- Phase 1: ORACLE. Real bash, real repos, hook not involved at all.
+  orc_setup
+  cmd="$(orc_expand "$tmpl")"
+  if [ "$cwdsel" = "claimed" ]; then cwd="$ORC_CLAIMED"; else cwd="$ORC_UNRELATED"; fi
+  c_before=$(git -C "$ORC_CLAIMED" rev-list --count HEAD)
+  u_before=$(git -C "$ORC_UNRELATED" rev-list --count HEAD)
+  ( cd "$cwd" && bash -c "$cmd" ) >/dev/null 2>&1
+  c_after=$(git -C "$ORC_CLAIMED" rev-list --count HEAD)
+  u_after=$(git -C "$ORC_UNRELATED" rev-list --count HEAD)
+  orc_teardown
+
+  if [ "$c_after" -gt "$c_before" ]; then
+    truth="claimed"
+  elif [ "$u_after" -gt "$u_before" ]; then
+    truth="unrelated"
+  else
+    # The probe committed nowhere — a broken probe command, not a result.
+    # Fail loudly rather than let it agree with 'allow' by accident.
+    fail "oracle: $label" "PROBE BROKEN — bash committed to neither repo; cmd: $cmd"
+    return
+  fi
+
+  # --- Phase 2: the hook, identical fresh sandbox, foreign fresh claim on
+  #     the claimed repo.
+  orc_setup
+  cmd="$(orc_expand "$tmpl")"
+  if [ "$cwdsel" = "claimed" ]; then cwd="$ORC_CLAIMED"; else cwd="$ORC_UNRELATED"; fi
+  printf 'sess-HOLDER %s chuck\n' "$(date +%s)" > "$ORC_CLAIMED/.git/sable-tree-claim"
+  local out decision want
+  out=$(run_hook "$(make_json "$cmd" "sess-ME" "$cwd")")
+  if is_deny "$out"; then decision="deny"; else decision="allow"; fi
+
+  # --- POSITIVE CONTROL, in this same fixture, before teardown.
+  # An ALLOW is an ABSENCE-assertion: a rig that has silently stopped gating
+  # anything at all returns ALLOW for every probe and reads as a clean pass.
+  # So prove the fixture still DENIES when it must, every time — a plain
+  # 'git commit' into the claimed repo from its own cwd, which is
+  # unconditionally gated. Without this pairing an allow-shaped assertion is
+  # worthless: it cannot distinguish working from broken.
+  local ctl ctl_ok
+  printf 'sess-HOLDER %s chuck\n' "$(date +%s)" > "$ORC_CLAIMED/.git/sable-tree-claim"
+  ctl=$(run_hook "$(make_json "git commit -qam control" "sess-ME" "$ORC_CLAIMED")")
+  if is_deny "$ctl"; then ctl_ok="yes"; else ctl_ok="no"; fi
+  orc_teardown
+
+  if [ "$truth" = "claimed" ]; then want="deny"; else want="allow"; fi
+  if [ "$ctl_ok" != "yes" ]; then
+    fail "oracle: $label" "POSITIVE CONTROL FAILED — a plain 'git commit' into the claimed repo from its own cwd was NOT denied in this fixture, so the rig is not gating and no allow/deny result from it can be believed. control output: ${ctl:-<empty>}"
+  elif [ "$decision" = "$want" ]; then
+    pass "oracle: $label [bash wrote to $truth -> hook $decision; control denies]"
+  else
+    fail "oracle: $label" "bash wrote to $truth, so the hook must $want, but it returned $decision. cmd: $cmd"
+  fi
+}
+
+# --- The scoping invariant: subshell unwinds, brace group persists ---------
+# These four are the whole bead. The first is the regression that shipped:
+# the write really lands in the claimed repo and the hook allowed it.
+oracle_check "subshell cd is unwound at ')': '( cd <unrel> ) ; git commit' from claimed cwd" \
+  claimed '( cd @UNRELATED@ && true ) ; git commit -qam probe'
+oracle_check "brace-group cd PERSISTS past '}': '{ cd <unrel>; } ; git commit' from claimed cwd" \
+  claimed '{ cd @UNRELATED@ ; true ; } ; git commit -qam probe'
+oracle_check "subshell cd is unwound (mirror): '( cd <claimed> ) ; git commit' from unrelated cwd" \
+  unrelated '( cd @CLAIMED@ && true ) ; git commit -qam probe'
+oracle_check "brace-group cd PERSISTS (mirror): '{ cd <claimed>; } ; git commit' from unrelated cwd" \
+  unrelated '{ cd @CLAIMED@ ; true ; } ; git commit -qam probe'
+
+# --- The complement the old suite covered: cd and write both inside --------
+oracle_check "both inside subshell: '( cd <unrel> && git commit )' from claimed cwd" \
+  claimed '( cd @UNRELATED@ && git commit -qam probe )'
+oracle_check "both inside subshell: '( cd <claimed> && git commit )' from unrelated cwd" \
+  unrelated '( cd @CLAIMED@ && git commit -qam probe )'
+
+# --- Nesting and ordering: scope must stack, not merely toggle -------------
+oracle_check "nested subshell: '( ( cd <unrel> ) ; git commit )' from claimed cwd" \
+  claimed '( ( cd @UNRELATED@ ) ; git commit -qam probe )'
+oracle_check "persistent cd then subshell cd: only the persistent one survives" \
+  claimed 'cd @UNRELATED@ ; ( cd @CLAIMED@ ) ; git commit -qam probe'
+oracle_check "subshell cd then persistent cd: the persistent one wins" \
+  unrelated '( cd @UNRELATED@ ) ; cd @CLAIMED@ ; git commit -qam probe'
+oracle_check "backgrounded subshell: '( cd <unrel> ) & wait ; git commit' from claimed cwd" \
+  claimed '( cd @UNRELATED@ ) & wait ; git commit -qam probe'
+
+# --- Unmatched ')' — a case-pattern terminator, not a subshell close -------
+# These belong to the paren work: ')' resets command position, and popping an
+# empty scope stack must NOT relocate the shell cwd, because a case body runs
+# in the CURRENT shell. Getting this wrong reopens the false negative.
+#
+# (Reserved words — 'if true; then git commit; fi' and friends — are a
+# SEPARATE live false negative tracked as SABLE-hfkdd. Pre-existing on the
+# base branch, deliberately not addressed or asserted here.)
+oracle_check "case body: 'case x in x) git commit ;; esac' from claimed cwd" \
+  claimed 'case x in x) git commit -qam probe ;; esac'
+oracle_check "cd then case body: 'cd <claimed>; case x in x) git commit;; esac' from unrelated cwd" \
+  unrelated 'cd @CLAIMED@ ; case x in x) git commit -qam probe ;; esac'
+
+# --- Baselines: the shapes that already worked must still agree -----------
+oracle_check "plain 'git commit' from claimed cwd" \
+  claimed 'git commit -qam probe'
+oracle_check "'cd <unrel> && git commit' from claimed cwd" \
+  claimed 'cd @UNRELATED@ && git commit -qam probe'
+oracle_check "'git -C <claimed> commit' from unrelated cwd" \
+  unrelated 'git -C @CLAIMED@ commit -qam probe'
+oracle_check "newline separator: 'cd <claimed>' NEWLINE 'git commit' from unrelated cwd" \
+  unrelated 'cd @CLAIMED@
+git commit -qam probe'
+
+# ============================================================
 # settings-snippet registration
 # ============================================================
 
