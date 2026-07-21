@@ -811,6 +811,38 @@ A pinned bin — regular-file or snapshot — is protected from an ordinary `sab
 8. Repeat; stand down when the pool and the inbox are empty
 ```
 
+**`bd ready` is not a merge signal (SABLE-d5iku).** Step 4's verification has a
+blind spot the tool cannot see past: bd releases a dependent when its blocker's
+STATUS becomes `closed`, but a bead sequenced behind another with `bd dep add`
+almost always needs the blocker's CODE on the branch the worker will fork from.
+Those two events are separated by the entire merge queue — minutes to hours —
+and the false release is indistinguishable from a correct one, so a manager
+following the tool correctly dispatches into a tree missing the prerequisite.
+The work then tests green against the old layout and mis-integrates later.
+
+`bin/sable-dep-check` closes the visibility gap: for each bead it walks the
+`blocks` edges, resolves each CLOSED blocker's branch (structured `branch`
+metadata first — what the worker-spawn helper stamps at dispatch — then `wk-*`
+names in the bead's own prose, filtered against live remote refs), and reports
+any whose branch is not an ancestor of the integration branch.
+
+```bash
+sable-dep-check SABLE-abc     # exit 3 + a named branch = closed-but-unmerged blocker
+sable-dep-check --ready       # sweep the whole ready pool
+```
+
+`hooks/multi-manager/pre-dispatch-claim.sh` runs the same check on every worker
+dispatch and emits the warning as `additionalContext`. It is ADVISORY, never a
+deny: merge state has genuine unresolvable cases (pruned branches, stale
+remote-tracking refs, blockers that never produced code), and a withhold would
+trade the false-go for a false-block. A branch ABSENT from the remote is
+deliberately silent — this fleet deletes worker branches once they land, so
+absence overwhelmingly means merged-and-pruned. Disable with
+`SABLE_DEP_MERGE_GUARD=0`.
+
+Merge-aware readiness at the source — `bd ready` withholding a dependent whose
+blocker's branch is unmerged — lives in bd core, which is upstream of this repo.
+
 **The dispatch prompt is load-bearing.** Ad-hoc prompts drift mid-session
 (early dispatches say one thing, later ones say another), and workers absorb
 the inconsistency. The worker-spawn helper delivers the canonical template at
