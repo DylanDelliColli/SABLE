@@ -142,6 +142,36 @@ is_python_importing() {
   return 1
 }
 
+# Sibling-loader classifier (SABLE-bdskx): is $1 a python script that loads a
+# sibling module DYNAMICALLY (importlib.machinery.SourceFileLoader or
+# importlib.util.spec_from_file_location against a __file__-relative path),
+# rather than via a static `import`/`from` statement? is_python_importing
+# above is blind to this shape entirely -- there is no `import sable_*` line
+# to grep for, just a runtime path join (e.g. bin/sable-reconcile-handoffs's
+# `Path(__file__).resolve().parent / "sable-merge-gate"` load of
+# sable-merge-gate). Such a bin classifies "plain" today by realpath luck; a
+# true per-file copy severs the sibling load at runtime. Requires BOTH a
+# loader call and a __file__ reference (not just either alone) so an ordinary
+# bin that happens to mention __file__ for unrelated reasons doesn't
+# false-positive into "snapshot". Prints nothing; return 0 = sibling-loading,
+# 1 = not.
+is_sibling_loading() {
+  f="$1"
+  [ -f "$f" ] || return 1
+  head -n1 "$f" 2>/dev/null | grep -q 'python' || return 1
+  grep -qE '(SourceFileLoader|spec_from_file_location) *\(' "$f" 2>/dev/null || return 1
+  grep -q '__file__' "$f" 2>/dev/null || return 1
+  return 0
+}
+
+# Combined "does this bin need --pin-snapshot rather than a plain per-file
+# pin" check -- either detector below is sufficient on its own (SABLE-bdskx:
+# a bin can need snapshot pinning via a static sibling import OR a dynamic
+# sibling loader; the two are independent, not mutually exclusive).
+needs_snapshot_pin() {
+  is_python_importing "$1" || is_sibling_loading "$1"
+}
+
 # Collect the tools to install: the bare `sable` umbrella + sable-* shell
 # entrypoints (excludes *.py / *.bak / *~).
 TOOLS=""
@@ -155,7 +185,7 @@ done
 if [ "$ACTION" = "classify" ]; then
   target="$CLASSIFY_TARGET"
   case "$target" in /*) : ;; *) target="$BIN_DIR/$target" ;; esac
-  if is_python_importing "$target"; then echo snapshot; else echo plain; fi
+  if needs_snapshot_pin "$target"; then echo snapshot; else echo plain; fi
   exit 0
 fi
 
@@ -170,7 +200,7 @@ if [ "$ACTION" = "pin-snapshot" ]; then
   targets="$PIN_TARGETS"
   if [ -z "$targets" ]; then
     for t in $TOOLS; do
-      is_python_importing "$BIN_DIR/$t" && targets="$targets $t"
+      needs_snapshot_pin "$BIN_DIR/$t" && targets="$targets $t"
     done
   fi
   if [ -z "$targets" ]; then
