@@ -32,6 +32,20 @@ ACTION: for each stranded branch, file ONE `for-chuck,coord` bead whose title
 names the branch. Chuck merges it from the pool exactly as he would a
 hook-filed handoff.
 
+PREVIEW-KICK LEG (SABLE-jd5fj.2 / S5 poll leg): independently of the stranded
+predicate above, any origin `wk-*` branch that is genuinely unmerged (P1) and
+past the settle window (P4) is a candidate for a MISSED push-time preview kick
+(SABLE-jd5fj.1) — the hook may be unwired, may have raced the ref update, or
+may have died mid-flight. This leg deliberately does NOT consult the work-bead
+status (P2) or the for-chuck corpus (P3): a preview kick is a speculative CI
+warm-up, not a merge handoff, so it fires regardless of whether a handoff bead
+exists yet. Double-kick safety (hook vs. poll racing, or poll vs. poll) is
+NEVER decided here — it is the SHARED IDEMPOTENCY KEY inside sable-merge-gate's
+own `kick_preview` (preview_kick_ref, keyed on the (base_sha, branch_sha) pair),
+which no-ops when a ref already exists for that exact pair. This leg is an
+ADDITIONAL classification pass over the same branch list; it reads the four-
+part stranded predicate below not at all and changes none of its outcomes.
+
 BOUNDARIES (hard):
   * Files beads ONLY. NEVER merges, NEVER pushes code, NEVER deletes branches —
     the chuck-only push/merge lanes are preserved untouched.
@@ -83,6 +97,7 @@ _MG_LOADER.exec_module(_smg)
 
 resolve_integration_branch = _smg.resolve_integration_branch
 qualify_remote_ref = _smg.qualify_remote_ref
+kick_preview = _smg.kick_preview
 
 
 # --------------------------------------------------------------------------
@@ -136,6 +151,26 @@ def age_exceeds_threshold(age_seconds: float, threshold_minutes: float) -> bool:
     settle window and is left for the next sweep (mirrors is_orphan's strict-`>`
     in sable-merge-gate so the boundary is unambiguous)."""
     return age_seconds > threshold_minutes * 60.0
+
+
+def preview_kick_eligible(rc: int, age_seconds: float | None,
+                          threshold_minutes: float) -> tuple[bool, str]:
+    """S5 poll-leg kick decision (SABLE-jd5fj.2): is this branch a candidate for
+    a MISSED preview kick? Reuses predicate 1 (`ancestor_rc_is_unmerged`) and
+    predicate 4 (`age_exceeds_threshold`) — the SAME pure checks the stranded
+    predicate uses — but deliberately skips predicates 2/3 (work-bead status,
+    for-chuck handoff already filed): a preview kick is a speculative CI
+    warm-up, not a merge handoff, so it is eligible even for a branch with no
+    work bead yet or one whose handoff bead already exists. Double-kick safety
+    is NOT decided here — see `attempt_preview_kick`. Returns (eligible, reason)
+    for the print trail, mirroring `classify_branch`'s shape."""
+    if not ancestor_rc_is_unmerged(rc):
+        return (False, f"merged-or-unresolvable(is-ancestor rc={rc})")
+    if age_seconds is None:
+        return (False, "age-unresolvable")
+    if not age_exceeds_threshold(age_seconds, threshold_minutes):
+        return (False, f"too-fresh({age_seconds:.0f}s <= {threshold_minutes}min settle)")
+    return (True, "eligible-for-preview-kick")
 
 
 _BEAD_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]+(?:\.[0-9]+)*")
@@ -321,6 +356,26 @@ def file_for_chuck_bead(repo: str, branch: str, work_status: str | None) -> subp
     )
 
 
+def attempt_preview_kick(repo: str, remote: str, branch: str,
+                         integration_branch: str) -> tuple[bool, str]:
+    """Kick the SABLE-jd5fj.1 preview entrypoint for a branch whose push-time
+    kick may have been missed (hook unwired, race, mid-flight crash). Delegates
+    entirely to sable-merge-gate's `kick_preview`, which is ALREADY idempotent
+    on the shared `preview_kick_ref` key (base_sha, branch_sha) — a ref that
+    exists because the hook (or a prior poll run) already kicked it is a no-op
+    read inside `kick_preview`, never a rebuild or a second CI trigger. That
+    single shared key — not any dedup logic here — is what makes a hook-kicked
+    and a poll-kicked preview mutually suppressing in EITHER race order (the
+    columbo IDEMPOTENCY OVERLAP boundary case). Never raises: a missed or
+    failed kick is a lost optimization, not a reconcile failure, so promote
+    still builds its own preview later if this attempt never landed one."""
+    try:
+        rc = kick_preview(branch, integration_branch, repo, remote)
+        return (rc == 0, "kick-ok(kicked-or-already-kicked)" if rc == 0 else f"kick-exit-{rc}")
+    except Exception as exc:  # noqa: BLE001 — a kick failure must never abort the sweep
+        return (False, f"kick-error:{exc}")
+
+
 # --------------------------------------------------------------------------
 # Classification + orchestration
 # --------------------------------------------------------------------------
@@ -366,9 +421,29 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -
           f"{len(branches)} origin wk-* branch(es), age threshold {threshold_minutes}min")
 
     stranded: list[tuple[str, str | None]] = []
+    kick_candidates = 0
+    kicked = 0
     for br in branches:
         if br == integration_branch:
             continue
+
+        # Preview-kick leg (SABLE-jd5fj.2 / S5 poll leg): an ADDITIONAL,
+        # independent classification pass — reuses P1/P4 only (see
+        # preview_kick_eligible), never touches the stranded predicate below.
+        rc = branch_ancestor_rc(repo, remote, br, integration_branch)
+        kick_age = (branch_tip_age_seconds(repo, remote, br, now)
+                    if ancestor_rc_is_unmerged(rc) else None)
+        kick_eligible, kick_reason = preview_kick_eligible(rc, kick_age, threshold_minutes)
+        if kick_eligible:
+            kick_candidates += 1
+            if dry_run:
+                print(f"  {br}: [dry-run] would attempt preview-kick ({kick_reason})")
+            else:
+                ok, detail = attempt_preview_kick(repo, remote, br, integration_branch)
+                if ok:
+                    kicked += 1
+                print(f"  {br}: preview-kick {detail}")
+
         is_stranded, reason, status = classify_branch(
             repo, remote, br, integration_branch, open_beads, threshold_minutes, now)
         print(f"  {br}: {reason}")
@@ -390,10 +465,12 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -
 
     if dry_run:
         print(f"sable-reconcile-handoffs [DRY-RUN]: {len(stranded)} stranded branch(es) "
-              f"classified, 0 filed (dry-run).")
+              f"classified, 0 filed (dry-run); {kick_candidates} preview-kick candidate(s), "
+              f"0 kicked (dry-run).")
     else:
         print(f"sable-reconcile-handoffs: {len(stranded)} stranded branch(es), "
-              f"{filed} for-chuck bead(s) filed.")
+              f"{filed} for-chuck bead(s) filed; {kick_candidates} preview-kick candidate(s), "
+              f"{kicked} kicked.")
     return 0
 
 

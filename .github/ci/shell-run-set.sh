@@ -33,6 +33,7 @@ ALLOW=(
   test-concurrent-sessions.sh
   test-control-trace.sh
   test-edit-write-claim-reconciler.sh
+  test-event-pair.sh
   test-full-ingestion.sh
   test-identity-hermeticity.sh
   test-lib-git-sandbox.sh

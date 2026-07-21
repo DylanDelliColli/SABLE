@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+# test-event-pair.sh — the S5 locked event-pair contract, hook leg + poll leg
+# (SABLE-jd5fj.1 / SABLE-jd5fj.2)
+#
+# WHAT IS UNDER TEST
+# ------------------
+# Two independent producers of the SAME `sable-merge-gate preview` kick:
+#
+#   HOOK leg (jd5fj.1) — post-push-merge-notify.sh fires the kick on a
+#   confirmed worker push, in the background, immediately.
+#
+#   POLL leg (jd5fj.2) — sable-reconcile-handoffs' preview-kick pass fires the
+#   SAME kick for any origin `wk-*` branch that is genuinely unmerged and past
+#   the settle window, REGARDLESS of whether the hook ever fired (unwired,
+#   raced, or crashed mid-flight).
+#
+# Both legs call the identical `sable-merge-gate preview` entrypoint, which is
+# idempotent on the SHARED preview_kick_ref key (a pure function of the
+# (base_sha, branch_sha) pair) — this suite proves that sharing holds with REAL
+# git and the REAL gate, not a stub, in both race orders AND under a genuine
+# concurrent race (PART B's adversarial case), because right now — mid pull
+# freeze, hook leg dark in the field — the poll leg is the SOLE kick path and a
+# key-derivation bug would stay invisible until both legs fire together.
+#
+# PART A — hook wiring dark (the exact production condition right now): NO
+#          hook ever fires; the poll leg alone kicks the missed preview within
+#          one reconcile invocation.
+# PART B — both legs fire for the SAME push: hook-then-poll, poll-then-hook,
+#          and a genuine unsynchronized concurrent race. Every case: EXACTLY
+#          ONE ci-verify ref lands, whichever leg wins.
+# PART C — REGRESSION: the pre-existing 4-part stranded-handoff predicate
+#          (P1..P4, classify_branch) is unchanged by the new preview-kick pass
+#          living in the SAME reconcile() loop — merged / open-work-bead /
+#          handoff-already-filed / too-fresh / true-positive cases still
+#          classify identically, using a real sandboxed `bd` stub (predicates
+#          2/3 need bead data; the preview-kick leg never touches bd at all).
+#
+# Run with:
+#   bash hooks/test/test-event-pair.sh
+#
+# Clean-room safe (SABLE-59zu): needs only bash + git + python3. bd / gh /
+# sable-msg / tmux are stubbed; nothing here touches a real remote.
+
+set -uo pipefail
+
+TESTDIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$TESTDIR/../.." && pwd)"
+HOOK="$REPO_ROOT/hooks/multi-manager/post-push-merge-notify.sh"
+GATE="$REPO_ROOT/bin/sable-merge-gate"
+RECONCILE="$REPO_ROOT/bin/sable-reconcile-handoffs"
+
+# shellcheck source=lib-git-sandbox.sh
+source "$TESTDIR/lib-git-sandbox.sh"
+
+PASS=0
+FAIL=0
+pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL+1)); echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
+
+for f in "$HOOK" "$GATE" "$RECONCILE"; do
+  [ -f "$f" ] || { echo "FATAL: missing $f"; exit 2; }
+done
+
+TMPROOT="$(mktemp -d)"
+trap 'rm -rf "$TMPROOT"; sable_test_git_sandbox_cleanup' EXIT
+
+STUB_DIR="$TMPROOT/stubs"
+mkdir -p "$STUB_DIR"
+
+# Configurable `bd` stub (PART C drives its responses via env vars; PARTS A/B
+# never inspect bd's output — the preview-kick leg never calls bd at all).
+cat > "$STUB_DIR/bd" <<'PYEOF'
+#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+log = os.environ.get("BD_CALL_LOG")
+if log:
+    with open(log, "a") as f:
+        f.write(" ".join(args) + "\n")
+sub = args[0] if args else ""
+if sub == "show":
+    status = os.environ.get("STUB_BD_SHOW_STATUS", "")
+    if status:
+        print(json.dumps([{"id": "X", "status": status}])); sys.exit(0)
+    sys.exit(1)
+if sub == "search":
+    status = os.environ.get("STUB_BD_SEARCH_STATUS", "")
+    print(json.dumps([{"id": "X", "status": status}] if status else []))
+    sys.exit(0)
+if sub == "list":
+    print(os.environ.get("STUB_BD_FORCHUCK_JSON", "[]"))
+    sys.exit(0)
+if sub == "create":
+    sys.exit(0)
+sys.exit(0)
+PYEOF
+cat > "$STUB_DIR/gh" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+cat > "$STUB_DIR/sable-msg" <<'EOF'
+#!/usr/bin/env bash
+exit "${SABLE_MSG_STUB_RC:-1}"
+EOF
+cat > "$STUB_DIR/tmux" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  [ "$a" = "list-panes" ] && { echo "chuck"; exit 0; }
+  [ "$a" = "display-message" ] && { echo "${SABLE_STUB_PANE_ROLE:-}"; exit 0; }
+done
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd" "$STUB_DIR/gh" "$STUB_DIR/sable-msg" "$STUB_DIR/tmux"
+
+# Real sable-merge-gate on PATH — the hook resolves it via `command -v`, and
+# the whole point of this suite is exercising the REAL preview_kick_ref
+# derivation, not a recorder stand-in (that coverage already lives in
+# test-preview-kick.sh PART A).
+BIN_SHIM="$TMPROOT/bin-shim"
+mkdir -p "$BIN_SHIM"
+ln -s "$GATE" "$BIN_SHIM/sable-merge-gate"
+
+# An old-enough committer date that any reasonable --age-min is already past.
+OLD_DATE="2001-01-01T00:00:00 +0000"
+
+make_post_input() {
+  python3 -c "
+import json, sys
+cmd, cwd = sys.argv[1:3]
+print(json.dumps({'tool_input': {'command': cmd}, 'cwd': cwd,
+                  'tool_response': {'stdout': '', 'stderr': ''}}))
+" "$1" "$2"
+}
+
+# fresh_pair <label> → ORIGIN/WORK: bare origin (tmux-only) + a work clone with
+# one worker branch `wk-<label>` carrying a backdated commit (already past any
+# settle window).
+fresh_pair() {
+  local label="$1"
+  ORIGIN="$TMPROOT/$label-origin.git"
+  WORK="$TMPROOT/$label-work"
+  git init -q --bare -b tmux-only "$ORIGIN"
+  git clone -q "$ORIGIN" "$WORK" 2>/dev/null
+  git -C "$WORK" config user.email "t@sable.invalid"
+  git -C "$WORK" config user.name  "SABLE Test"
+  git -C "$WORK" config sable.integrationBranch tmux-only
+  echo base > "$WORK/base.txt"
+  git -C "$WORK" add base.txt
+  git -C "$WORK" commit -q -m base
+  git -C "$WORK" push -q origin tmux-only
+
+  BRANCH="wk-$label"
+  git -C "$WORK" checkout -q -b "$BRANCH" tmux-only
+  echo work > "$WORK/work.txt"
+  git -C "$WORK" add work.txt
+  GIT_COMMITTER_DATE="$OLD_DATE" GIT_AUTHOR_DATE="$OLD_DATE" \
+    git -C "$WORK" commit -q -m "worker change"
+  git -C "$WORK" push -q origin "$BRANCH"
+  git -C "$WORK" checkout -q tmux-only
+}
+
+ci_refs() { git --git-dir="$ORIGIN" for-each-ref --format='%(refname:short)' refs/heads/ci-verify/; }
+ci_ref_count() { ci_refs | grep -c .; }
+
+# run_hook <branch> → fires the REAL hook on a confirmed push of <branch>; the
+# preview kick it starts is detached (setsid/nohup), so this returns almost
+# immediately, before the kick necessarily lands.
+run_hook() {
+  local branch="$1"
+  git -C "$WORK" checkout -q "$branch"
+  local json
+  json="$(make_post_input "git push" "$WORK")"
+  env -i PATH="$BIN_SHIM:$STUB_DIR:$PATH" HOME="$HOME" \
+      SABLE_HOOK_TRACE_LOG="$TMPROOT/$branch-hook-trace.log" \
+      SABLE_PREVIEW_KICK_LOG="$TMPROOT/$branch-kick.log" \
+      CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
+      timeout 30 bash "$HOOK" <<< "$json" >"$TMPROOT/$branch-hook.out" 2>&1
+  git -C "$WORK" checkout -q tmux-only
+}
+
+# run_reconcile → runs the REAL poll leg once against $WORK. Stub-control vars
+# (BD_CALL_LOG, STUB_BD_*, RECONCILE_AGE_MIN), when set as a prefix on the
+# CALL to this function, are read from the calling shell and explicitly
+# forwarded into the `env -i` child below (which otherwise wipes them).
+run_reconcile() {
+  local age_min="${RECONCILE_AGE_MIN:-0}"
+  env -i PATH="$STUB_DIR:$PATH" HOME="$HOME" SABLE_RC_BD="$STUB_DIR/bd" \
+      BD_CALL_LOG="${BD_CALL_LOG:-}" \
+      STUB_BD_SHOW_STATUS="${STUB_BD_SHOW_STATUS:-}" \
+      STUB_BD_SEARCH_STATUS="${STUB_BD_SEARCH_STATUS:-}" \
+      STUB_BD_FORCHUCK_JSON="${STUB_BD_FORCHUCK_JSON:-}" \
+      python3 "$RECONCILE" --repo "$WORK" --remote origin --age-min "$age_min"
+}
+
+await_ref_count() {
+  local want="$1" i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    [ "$(ci_ref_count)" -ge "$want" ] && break
+    sleep 0.2
+  done
+  sleep 0.4
+  ci_ref_count
+}
+
+# ==========================================================================
+# PART A — hook wiring dark; the poll leg alone kicks the missed preview
+# ==========================================================================
+
+fresh_pair a-dark
+
+if [ "$(ci_ref_count)" -eq 0 ]; then
+  pass "A0: no ci-verify ref exists before either leg runs"
+else
+  fail "A0: no ci-verify ref exists before either leg runs" "refs=[$(ci_refs)]"
+fi
+
+OUT="$(run_reconcile)"; RC=$?
+N="$(ci_ref_count)"
+if [ "$RC" -eq 0 ] && [ "$N" -eq 1 ]; then
+  pass "A1: poll leg kicks a missed preview within ONE invocation (hook never ran)"
+else
+  fail "A1: poll leg kicks a missed preview within ONE invocation" "rc=$RC refs=[$(ci_refs)] out=$OUT"
+fi
+if printf '%s\n' "$(ci_refs)" | grep -q "^ci-verify/wk-a-dark-"; then
+  pass "A1: the kicked ref names the branch (ci-verify/<branch>-<key>)"
+else
+  fail "A1: the kicked ref names the branch" "refs=[$(ci_refs)]"
+fi
+
+# ==========================================================================
+# PART B — both legs fire for the same push: exactly one preview, every order
+# ==========================================================================
+
+# (B1) hook first, poll second (sequential, deterministic ordering)
+fresh_pair b-hook-first
+run_hook "$BRANCH" >/dev/null
+N_HOOK="$(await_ref_count 1)"
+if [ "$N_HOOK" -eq 1 ]; then
+  pass "B1: hook leg kicks (precondition for the ordering test)"
+else
+  fail "B1: hook leg kicks (precondition)" "refs=[$(ci_refs)]"
+fi
+BEFORE="$(ci_refs)"
+OUT="$(run_reconcile)"; RC=$?
+if [ "$RC" -eq 0 ] && [ "$(ci_refs)" = "$BEFORE" ] && [ "$(ci_ref_count)" -eq 1 ]; then
+  pass "B1: poll leg, arriving AFTER the hook, does not double-kick"
+else
+  fail "B1: poll leg does not double-kick after the hook" "before=[$BEFORE] after=[$(ci_refs)] out=$OUT"
+fi
+
+# (B2) poll first, hook second (the reverse order)
+fresh_pair b-poll-first
+OUT1="$(run_reconcile)"; RC1=$?
+N_POLL="$(ci_ref_count)"
+if [ "$RC1" -eq 0 ] && [ "$N_POLL" -eq 1 ]; then
+  pass "B2: poll leg kicks (precondition for the reverse-ordering test)"
+else
+  fail "B2: poll leg kicks (precondition)" "refs=[$(ci_refs)] out=$OUT1"
+fi
+BEFORE="$(ci_refs)"
+run_hook "$BRANCH" >/dev/null
+N_AFTER="$(await_ref_count 1)"
+if [ "$N_AFTER" -eq 1 ] && [ "$(ci_refs)" = "$BEFORE" ]; then
+  pass "B2: hook leg, arriving AFTER the poll, does not double-kick"
+else
+  fail "B2: hook leg does not double-kick after the poll" "before=[$BEFORE] after=[$(ci_refs)]"
+fi
+
+# (B3) THE ADVERSARIAL CASE — genuinely unsynchronized: both legs fired for the
+# same push with NO ordering guarantee between them (this is the shape that
+# matters most right now: the hook leg is dark in the field under the pull
+# freeze, so whenever it DOES fire again it will race an already-running poll
+# leg with zero coordination). Exactly one ci-verify ref must land regardless
+# of which leg's fetch/build/push interleaves first.
+fresh_pair b-race
+(
+  run_hook "$BRANCH" >/dev/null
+) &
+HOOK_BG=$!
+(
+  run_reconcile >/dev/null
+) &
+POLL_BG=$!
+wait "$HOOK_BG"
+wait "$POLL_BG"
+N_RACE="$(await_ref_count 1)"
+if [ "$N_RACE" -eq 1 ]; then
+  pass "B3 ADVERSARIAL: hook and poll firing concurrently for the same push land EXACTLY ONE preview"
+else
+  fail "B3 ADVERSARIAL: exactly one preview under a genuine concurrent race" "refs=[$(ci_refs)] count=$N_RACE"
+fi
+
+# ==========================================================================
+# PART C — REGRESSION: the 4-part stranded predicate is unchanged by the new
+# preview-kick pass sharing its reconcile() loop. Real git; a configurable bd
+# stub stands in for predicates 2/3 (bead status, for-chuck corpus) — the
+# preview-kick leg never touches bd, so these are pure classify_branch checks
+# run alongside a kick attempt, proving the two legs don't interfere.
+# ==========================================================================
+
+# (C1) already-merged branch: not stranded, and NOT a preview-kick candidate
+# either (P1 gates both legs identically).
+fresh_pair c-merged
+git -C "$WORK" checkout -q tmux-only
+git -C "$WORK" merge -q --ff-only "$BRANCH" 2>/dev/null || git -C "$WORK" merge -q "$BRANCH" -m merge
+git -C "$WORK" push -q origin tmux-only
+CALLLOG="$TMPROOT/c-merged-bdcalls.log"
+OUT="$(BD_CALL_LOG="$CALLLOG" STUB_BD_SEARCH_STATUS=closed run_reconcile)"; RC=$?
+if [ "$RC" -eq 0 ] && [ "$(ci_ref_count)" -eq 0 ] && ! grep -q "^create " "$CALLLOG" 2>/dev/null; then
+  pass "C1 REGRESSION: an already-merged branch is neither stranded nor preview-kicked"
+else
+  fail "C1 REGRESSION: merged branch skipped by both legs" "refs=[$(ci_refs)] out=$OUT"
+fi
+
+# (C2) unmerged + OPEN work bead (P2 fails) → NOT stranded (no for-chuck bead
+# filed), but the preview-kick leg fires anyway — it does not consult P2/P3.
+fresh_pair c-open-bead
+CALLLOG="$TMPROOT/c-open-bdcalls.log"
+OUT="$(BD_CALL_LOG="$CALLLOG" STUB_BD_SEARCH_STATUS=open run_reconcile)"; RC=$?
+if [ "$RC" -eq 0 ] && ! grep -q "^create " "$CALLLOG" 2>/dev/null; then
+  pass "C2 REGRESSION: an open (not-yet-done) work bead still blocks the stranded-handoff bead"
+else
+  fail "C2 REGRESSION: open work bead blocks stranded-handoff filing" "out=$OUT"
+fi
+if [ "$(ci_ref_count)" -eq 1 ]; then
+  pass "C2: preview-kick STILL fires for that same branch (P2 is not part of its predicate)"
+else
+  fail "C2: preview-kick fires despite the open work bead" "refs=[$(ci_refs)]"
+fi
+
+# (C3) unmerged + closed work bead + a for-chuck handoff ALREADY on record
+# (P3 fails) → not stranded (no duplicate bead), but STILL preview-kicked.
+fresh_pair c-handoff-filed
+FORCHUCK_JSON="[{\"title\": \"[AUTO-NOTIFY] Review PR from optimus: $BRANCH\", \"labels\": [\"for-chuck\"]}]"
+CALLLOG="$TMPROOT/c-handoff-bdcalls.log"
+OUT="$(BD_CALL_LOG="$CALLLOG" STUB_BD_SEARCH_STATUS=closed STUB_BD_FORCHUCK_JSON="$FORCHUCK_JSON" run_reconcile)"; RC=$?
+if [ "$RC" -eq 0 ] && ! grep -q "^create " "$CALLLOG" 2>/dev/null; then
+  pass "C3 REGRESSION: an already-filed for-chuck handoff still suppresses a duplicate bead"
+else
+  fail "C3 REGRESSION: existing handoff suppresses duplicate filing" "out=$OUT"
+fi
+if [ "$(ci_ref_count)" -eq 1 ]; then
+  pass "C3: preview-kick STILL fires despite the handoff already being on record"
+else
+  fail "C3: preview-kick fires despite the existing handoff" "refs=[$(ci_refs)]"
+fi
+
+# (C4) too-fresh push (P4 fails on BOTH legs — they share the age check):
+# neither stranded nor preview-kicked.
+ORIGIN="$TMPROOT/c-fresh-origin.git"
+WORK="$TMPROOT/c-fresh-work"
+git init -q --bare -b tmux-only "$ORIGIN"
+git clone -q "$ORIGIN" "$WORK" 2>/dev/null
+git -C "$WORK" config user.email "t@sable.invalid"
+git -C "$WORK" config user.name  "SABLE Test"
+git -C "$WORK" config sable.integrationBranch tmux-only
+echo base > "$WORK/base.txt"; git -C "$WORK" add base.txt; git -C "$WORK" commit -q -m base
+git -C "$WORK" push -q origin tmux-only
+git -C "$WORK" checkout -q -b wk-c-fresh tmux-only
+echo work > "$WORK/work.txt"; git -C "$WORK" add work.txt
+git -C "$WORK" commit -q -m "worker change"   # NO backdate -> just pushed, age ~0
+git -C "$WORK" push -q origin wk-c-fresh
+git -C "$WORK" checkout -q tmux-only
+CALLLOG="$TMPROOT/c-fresh-bdcalls.log"
+OUT="$(BD_CALL_LOG="$CALLLOG" STUB_BD_SEARCH_STATUS=closed RECONCILE_AGE_MIN=10 run_reconcile)"; RC=$?
+if [ "$RC" -eq 0 ] && [ "$(ci_ref_count)" -eq 0 ] && ! grep -q "^create " "$CALLLOG" 2>/dev/null; then
+  pass "C4 REGRESSION: a just-pushed (too-fresh) branch is skipped by BOTH legs"
+else
+  fail "C4 REGRESSION: too-fresh branch skipped by both legs" "refs=[$(ci_refs)] out=$OUT"
+fi
+
+# (C5) the true-positive stranded case, WITH the preview-kick leg active: a
+# for-chuck bead is filed AND a preview is kicked for the same branch.
+fresh_pair c-stranded
+CALLLOG="$TMPROOT/c-stranded-bdcalls.log"
+OUT="$(BD_CALL_LOG="$CALLLOG" STUB_BD_SEARCH_STATUS=closed run_reconcile)"; RC=$?
+if [ "$RC" -eq 0 ] && grep -q "^create " "$CALLLOG" 2>/dev/null; then
+  pass "C5 REGRESSION: the true-positive stranded case still files its for-chuck bead"
+else
+  fail "C5 REGRESSION: true-positive stranded case files a bead" "out=$OUT"
+fi
+if [ "$(ci_ref_count)" -eq 1 ]; then
+  pass "C5: the stranded branch is ALSO preview-kicked (both legs fire together, no conflict)"
+else
+  fail "C5: stranded branch is also preview-kicked" "refs=[$(ci_refs)]"
+fi
+
+echo "----------------------------------------------------------------------"
+echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
+[ "$FAIL" -eq 0 ]
