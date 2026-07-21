@@ -13,8 +13,11 @@ It promotes chuck.md's prose stranded-recovery sweep (chuck.md §Boundaries) to 
 STRANDED PREDICATE (a branch is stranded iff ALL FOUR hold):
   1. origin's `wk-*` branch tip is NOT an ancestor of the integration branch
      (i.e. genuinely unmerged — `git merge-base --is-ancestor` exit 1).
-  2. its work bead (id parsed from the branch name, else `bd search`) is
-     closed or in_progress (real, done-or-in-flight work — never an experiment).
+  2. its work bead — resolved via STRUCTURED `branch` metadata first
+     (SABLE-i5739; see find_work_bead_status), else an id parsed from the
+     branch name, else a legacy prose `bd search` for pre-metadata branches
+     — is closed or in_progress (real, done-or-in-flight work — never an
+     experiment).
   3. NO open/in-progress `for-chuck` bead already NAMES the branch (the handoff
      was filed — by the hook OR a prior run of this tool). This is the
      idempotency key: our own filed bead names the branch, so a re-run finds it
@@ -322,16 +325,61 @@ def branch_tip_age_seconds(repo: str, remote: str, branch: str, now: float) -> f
 
 
 def find_work_bead_status(repo: str, branch: str) -> str | None:
-    """The branch's work-bead status (predicate 2). Try an embedded bead id
-    (`bd show`), else `bd search` the branch text across all statuses; None when
-    neither resolves a bead. All reads (no --sandbox needed for reads)."""
+    """The branch's work-bead status (predicate 2). Resolution order
+    (SABLE-i5739 — prose-search closed as the primary resolver):
+
+      1. STRUCTURED metadata: `bd list --metadata-field branch=<branch>
+         --status all --json` — an EXACT key/value match against the
+         `branch` metadata field sable-spawn-worker now writes on every
+         bead at dispatch time (see tag_branch_metadata there). This is the
+         PRIMARY path and, once a bead carries the field, the ONLY path
+         consulted: an unrelated bead whose title/description merely
+         mentions the branch text can never win here (closes mode b — WRONG
+         SUCCESS), and the answer cannot drift as such beads accumulate
+         later (closes mode c — DRIFT), because bead-carried metadata
+         identity, not prose content, is what is being matched. A branch
+         whose bead text never names it at all still resolves correctly
+         (closes mode a — SILENT FAILURE), since this path never reads
+         title/description.
+      2. Embedded bead id in the branch name (`bd show`) — a pure
+         convenience for a branch that happens to carry a bead id token;
+         unaffected by this change.
+      3. LEGACY prose `bd search` fallback — reached ONLY when neither of
+         the above resolves anything, i.e. a branch dispatched BEFORE the
+         metadata field existed. Prose-fragile by construction (the exact
+         defect this bead closes), but every branch dispatched going
+         forward always carries the metadata field, so this path retires
+         naturally as old branches merge or expire; it is kept only so
+         already-pushed pre-fix branches are not made WORSE (silently
+         un-strandable) than they were before.
+
+    A failed metadata query (nonzero bd exit) is NEVER silently folded into
+    "no bead" — falling through unresolved-but-loud would leave the branch
+    un-strandable with zero operator signal, one of the exact modes this
+    bead fixes for the metadata path itself. It's printed as a loud WARNING
+    (mirroring reconcile()'s git-fetch-failure WARNING) so 'nothing
+    stranded' (query ran clean, found nothing) is never confused with
+    'resolution failed' (the query itself is broken) — dispatch note #8."""
+    cp = _bd(repo, "list", "--status", "all",
+             "--metadata-field", f"branch={branch}", "--json", check=False)
+    if cp.returncode != 0:
+        print(f"sable-reconcile-handoffs: WARNING branch-metadata resolution "
+              f"failed for {branch} (bd list exit {cp.returncode}) — falling "
+              f"back to legacy resolution, NOT treating this as "
+              f"no-qualifying-bead: {cp.stdout.strip()}", file=sys.stderr)
+    else:
+        status = first_status_from_search_json(cp.stdout)
+        if status is not None:
+            return status
+
     bead_id = parse_bead_id(branch)
     if bead_id:
         cp = _bd(repo, "show", bead_id, "--json", check=False)
         if cp.returncode == 0:
-            st = status_from_show_json(cp.stdout)
-            if st is not None:
-                return st
+            status = status_from_show_json(cp.stdout)
+            if status is not None:
+                return status
+
     cp = _bd(repo, "search", branch, "--status", "all", "--json", check=False)
     if cp.returncode == 0:
         return first_status_from_search_json(cp.stdout)

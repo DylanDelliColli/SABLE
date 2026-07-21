@@ -686,6 +686,34 @@ def test_claim_bundle_beads_warns_but_does_not_raise_on_failure(monkeypatch, cap
     assert "Y-2" in err and "already claimed" in err
 
 
+# --- tag_branch_metadata (SABLE-i5739) --------------------------------------
+
+def test_tag_branch_metadata_writes_sandboxed_set_metadata(monkeypatch):
+    """Dispatch-time write the reconciliation floor's structured resolution
+    depends on: `bd update <id> --sandbox --set-metadata branch=<branch>`."""
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ssw.subprocess, "run", fake_run)
+    ssw.tag_branch_metadata("SABLE-x1", "wk-my-slug")
+    assert calls == [
+        ["bd", "update", "SABLE-x1", "--sandbox", "--set-metadata", "branch=wk-my-slug"],
+    ]
+
+
+def test_tag_branch_metadata_swallows_bd_failure(monkeypatch):
+    # a missed tag degrades resolution to the legacy prose fallback — it must
+    # never raise and block dispatch.
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="db locked")
+
+    monkeypatch.setattr(ssw.subprocess, "run", fake_run)
+    ssw.tag_branch_metadata("SABLE-x1", "wk-my-slug")  # must not raise
+
+
 # --- worker command ---------------------------------------------------------
 
 def test_worker_command_default_pins_model_and_auto_approves(monkeypatch):
