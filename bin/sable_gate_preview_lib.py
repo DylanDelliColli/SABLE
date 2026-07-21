@@ -35,6 +35,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 
 import sable_gate_classify_lib as classify
 import sable_gate_git_lib as git_lib
@@ -83,6 +84,101 @@ def adopt_kicked_preview(repo: str, remote: str, branch: str,
             return None
         return (remote_sha, ref)
     except Exception:  # noqa: BLE001 — adoption must never break the promote flow
+        return None
+
+
+@dataclass(frozen=True)
+class StalePreview:
+    """A completed-GREEN preview of the CURRENT branch tip onto an OLDER base."""
+    preview_sha: str
+    ref: str
+    base_sha: str        # the base it was built on — NOT the current one
+    run_url: str = ""
+
+
+def _stale_candidates(repo: str, remote: str, branch: str,
+                      base_sha: str, branch_sha: str) -> list[StalePreview]:
+    """Kicked previews of THIS branch tip onto a base the integration branch has
+    since advanced PAST. Verified by parents, never by ref name: the kick ref is
+    keyed on a hash of the parent pair, so the name says nothing about which base
+    a preview was built on and only the commit itself can be believed."""
+    listing = git_lib._git(repo, "ls-remote", "--heads", remote,
+                           f"refs/heads/{classify.preview_ref_prefix(branch)}*", check=False)
+    if listing.returncode != 0:
+        return []
+    found: list[StalePreview] = []
+    for line in listing.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2 or not parts[1].strip().startswith("refs/heads/"):
+            continue
+        sha, ref = parts[0].strip(), parts[1].strip()[len("refs/heads/"):]
+        if git_lib._git(repo, "fetch", remote, f"refs/heads/{ref}", check=False).returncode != 0:
+            continue
+        parents = git_lib.commit_parents(repo, sha)
+        if len(parents) != 2 or parents[1] != branch_sha:
+            # Either not a merge preview at all, or a preview of a branch tip
+            # that has since been re-pushed. A verdict about an object no longer
+            # on the branch is not evidence about this promote.
+            continue
+        if parents[0] == base_sha:
+            continue        # not stale — that is adopt_kicked_preview's case
+        # The base must have moved FORWARD from this preview's base. Anything
+        # else (a reset, a force-push, an unrelated history) is not the
+        # queued-branch case this exists for, and gets the pre-kzi1a treatment.
+        if git_lib._git(repo, "merge-base", "--is-ancestor", parents[0], base_sha,
+                        check=False).returncode != 0:
+            continue
+        found.append(StalePreview(sha, ref, parents[0]))
+    return found
+
+
+def find_stale_green_preview(repo: str, remote: str, branch: str,
+                             base_sha: str, branch_sha: str) -> StalePreview | None:
+    """The completed-GREEN preview a QUEUED branch already paid for, built on a
+    base that has since moved (SABLE-kzi1a). None when there is none, or when
+    ordinary adoption already has an answer.
+
+    THE PROBLEM THIS READS FOR. adopt_kicked_preview asks "is there a preview for
+    this EXACT (base, branch) pair?", and under a serial merge lane the answer is
+    no for every branch after the first: each merge advances the base and
+    invalidates the push-time preview of everything still queued behind it. The
+    green run those previews already completed was then discarded and a fresh one
+    started — so the push-time kick's payoff INVERTED exactly under the burst it
+    was built for (measured: 0 optimistic promotions in 157, and 0 across a
+    15-worker burst that queued 11 branches).
+
+    Only a COMPLETED GREEN counts. A red preview says nothing about the new base;
+    a PENDING one is a wait, and paying a wait on a stale object is the opposite
+    of the point. Reads only — whether a stale green may be promoted is the
+    promote module's question, and the answer there still runs the impact tier on
+    the real combined tree.
+
+    A strict optimization with the same fail-safe contract as
+    adopt_kicked_preview: every absence, error, or drift returns None and the
+    caller does what it did before, so no outcome and no exit code depends on a
+    queued preview having been found."""
+    try:
+        if adopt_kicked_preview(repo, remote, branch, base_sha, branch_sha) is not None:
+            return None
+        greens = []
+        for cand in _stale_candidates(repo, remote, branch, base_sha, branch_sha):
+            verdict = read_verdict(repo, cand.ref, cand.preview_sha)
+            if verdict.complete and verdict.outcome == classify.GREEN:
+                greens.append(StalePreview(cand.preview_sha, cand.ref, cand.base_sha,
+                                           verdict.run_url))
+        if not greens:
+            return None
+        # Prefer the preview built on the LATEST base: its base-move footprint is
+        # the smallest of the candidates', and a narrower footprint is the one
+        # more likely to be provably disjoint. Ancestry, not ref order — the
+        # listing is alphabetical by a hash and says nothing about time.
+        best = greens[0]
+        for cand in greens[1:]:
+            if git_lib._git(repo, "merge-base", "--is-ancestor", best.base_sha,
+                            cand.base_sha, check=False).returncode == 0:
+                best = cand
+        return best
+    except Exception:  # noqa: BLE001 — discovery must never break the promote flow
         return None
 
 

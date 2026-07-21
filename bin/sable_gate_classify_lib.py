@@ -143,10 +143,25 @@ def preview_ref_name(bead: str, preview_sha: str) -> str:
     shape, fleet-wide."""
     if not preview_sha or len(preview_sha) < 7:
         raise ValueError(f"preview_sha must be >= 7 chars, got {preview_sha!r}")
-    safe_bead = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in bead)
-    if not safe_bead.strip("-"):
-        raise ValueError(f"bead id sanitizes to empty: {bead!r}")
-    return f"ci-verify/{safe_bead}-{preview_sha[:7]}"
+    return f"{preview_ref_prefix(bead)}{preview_sha[:7]}"
+
+
+def preview_ref_prefix(name: str) -> str:
+    """Everything preview_ref_name can produce for <name>, up to the per-attempt
+    suffix — i.e. the ci-verify ref NAMESPACE of one bead (promote-built refs) or
+    one branch (kicked refs).
+
+    Exists so a caller can LIST a branch's kicked previews without knowing their
+    parent-pair keys (SABLE-kzi1a): the kick ref is keyed on a HASH of the two
+    parent SHAs, so the only way to find the preview a branch was kicked with
+    against a base that has since moved is to enumerate the namespace and read
+    each candidate's actual parents. Sanitization is shared with preview_ref_name
+    rather than re-derived, because a prefix that sanitized differently from the
+    names it is meant to match would silently list nothing."""
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in name)
+    if not safe.strip("-"):
+        raise ValueError(f"ref name sanitizes to empty: {name!r}")
+    return f"ci-verify/{safe}-"
 
 
 def preview_kick_key(base_sha: str, branch_sha: str) -> str:

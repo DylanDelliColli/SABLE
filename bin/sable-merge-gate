@@ -69,6 +69,19 @@ re-verifies the REAL COMBINED TREE with the cmar4 impact tier instead of a full
 re-preview. Green promotes that combined object; red ejects on exit 20; an
 impact tier that cannot answer falls back to exit 23.
 
+That path is entered from an ADOPTION MISS too (SABLE-kzi1a), not only from a
+base that moved mid-gate. Chuck promotes SERIALLY and is the only writer to the
+integration branch, so the base cannot move DURING a promote — the mid-gate entry
+is unreachable in the real operating model (measured: 0 optimistic promotions in
+157, and 0 across a 15-worker burst that queued 11 branches). What the queue does
+produce is the same situation one step earlier: each merge moves the base and
+invalidates the push-time preview of every branch still queued, so the next
+promote finds a COMPLETED GREEN run for a preview whose base has moved. It now
+takes that to the same decision — same footprint computation, same mandatory
+impact tier on the real combined tree — instead of discarding the green run and
+paying for a fresh one. When the assessment does not license the cheap path, the
+promote simply builds a preview the pre-kick way, which is what it did before.
+
 Disjointness is NECESSARY, NEVER SUFFICIENT (locked contract SABLE-djopw):
 file-disjoint changes break each other semantically all the time, so a disjoint
 verdict buys a CHEAPER re-test, never a skipped one. Footprints follow renames,

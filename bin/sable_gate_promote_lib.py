@@ -31,6 +31,18 @@ DISJOINT from the branch's (sable_footprint_lib) earns a cheaper re-verification
 re-preview. Green promotes that same combined object; red ejects on the existing
 exit-20 path; anything else falls back to exit 23.
 
+SABLE-kzi1a WIDENS THE ENTRY to that path and changes nothing else about it.
+jd5fj.4 reached the table only when the base moved during the gate's own CI wait
+— which, under a serial merge lane with a single writer to the integration
+branch, cannot happen: nothing else can move the base while chuck is inside a
+promote. The situation the lane DOES produce is the queued branch whose push-time
+preview went green against a base an earlier merge has since moved past. Same
+facts, one step earlier, so it reaches the same _stale_base and the same table.
+The one behavioural difference is what a non-disjoint answer costs: on that entry
+nothing has been pushed, so instead of exit 23 the promote just builds a preview
+the pre-kick way — the status quo ante, and the only thing that keeps a queued
+branch from refusing forever on every retry.
+
   This is the one change in the epic that makes the system LESS safe by design.
   Everything else added verification; this removes some. What it removes is the
   structural guarantee that the exact object CI tested is the object that lands
@@ -460,21 +472,41 @@ def assert_not_frozen(repo: str) -> None:
 # promote — the only writer to the integration branch
 # --------------------------------------------------------------------------
 
+class _OptimisticNotApplicable(Exception):
+    """The WIDENED (adoption-miss) entry looked at a queued green preview and the
+    optimistic path did not apply to it. Internal to this module and never an
+    exit code: on that entry there is nothing in flight to be non-fast-forward,
+    so "rebuild and re-gate" is not a terminal state — it is simply the flow the
+    caller runs next. See _adoption_miss_optimistic."""
+
+
 def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
                 manager: str, base_ref: str, ref: str, preview_sha: str,
-                base_sha: str, branch_sha: str, current_base: str) -> int:
+                base_sha: str, branch_sha: str, current_base: str,
+                *, on_adoption_miss: bool = False) -> int:
     """The base moved out from under a GREEN preview. Decide what that costs.
 
-    Reached from two places that mean the same thing: the pre-push check (the
-    common case — the base moved during the CI wait, and we notice before
-    pushing) and the non-fast-forward push rejection (the narrow race where it
-    moved between that check and the push). Both funnel here so there is ONE
-    stale-base decision path to reason about, which is what makes invariant I1
-    checkable at all.
+    Reached from three places that mean the same thing — a green verdict for a
+    preview whose base is no longer the base that would be merged onto:
+      * the pre-push check (the base moved during the gate's own CI wait, and we
+        notice before pushing);
+      * the non-fast-forward push rejection (the narrow race where it moved
+        between that check and the push);
+      * the ADOPTION MISS (SABLE-kzi1a): the branch sat in the serial merge queue
+        and an EARLIER promote moved the base past the one its push-time preview
+        was kicked against. Structurally identical, and the only one of the three
+        that can actually happen under a single-writer serial merge lane.
+    All three funnel here so there is ONE stale-base decision path to reason
+    about, which is what makes invariant I1 checkable at all — and so the
+    widening cannot acquire its own, weaker, notion of what re-verification is.
 
     Returns an exit code, or raises GateError(23) for the full-re-preview
     outcome — the pre-jd5fj.4 contract, byte for byte, including the notify and
-    the evidence line."""
+    the evidence line. `on_adoption_miss` changes exactly one thing: that
+    re-preview outcome is raised as _OptimisticNotApplicable instead, because on
+    that entry nothing has been pushed and the caller simply continues into the
+    ordinary build-and-gate flow. Every other row — the tier, the invariants, the
+    integrity assertion, the RED eject — is the same code."""
     if not optimistic_promotion_enabled():
         assessment = footprint_lib.Assessment(
             None, "optimistic disjoint promotion is disabled (SABLE_MG_OPTIMISTIC=0)")
@@ -552,6 +584,14 @@ def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
 
     # ACTION_REPREVIEW — the pre-jd5fj.4 contract, unchanged.
     detail = assessment.reason if impact is None else f"{assessment.reason}; {impact_detail}"
+    if on_adoption_miss:
+        # SABLE-kzi1a: nothing is in flight on this entry, so there is no
+        # non-fast-forward promote to report and nothing to rebuild — the caller
+        # has simply learned that the queued preview is not usable and goes on to
+        # build one the pre-kick way, which is what it would have done anyway.
+        # Exiting 23 here instead would STRAND the branch: every retry finds the
+        # same queued preview and refuses again, forever.
+        raise _OptimisticNotApplicable(f"{decision.reason}: {detail}")
     _notify(manager,
         f"merge-preview ci-verify gate for {bead} ({branch}): base {base} moved during the CI "
         f"wait — promote is non-fast-forward, NOT promoted. Rebuild preview + re-gate (ref {ref} was green). "
@@ -566,6 +606,66 @@ def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
                         f"{decision.reason} [{detail}] — rebuild and re-gate")
 
 
+def _adoption_miss_optimistic(bead: str, branch: str, base: str, repo: str, remote: str,
+                              manager: str, base_ref: str, base_sha: str,
+                              branch_sha: str) -> int | None:
+    """THE WIDENED ENTRY to the optimistic disjoint path (SABLE-kzi1a). An exit
+    code if this promote was decided here, or None to run the ordinary flow.
+
+    WHY IT EXISTS. jd5fj.4 wired the optimistic path to one caller: the base
+    moving during the gate's OWN CI wait. Chuck promotes SERIALLY and is the only
+    writer to the integration branch, so while he is inside a promote nothing can
+    move the base under it — that caller is unreachable by construction in the
+    operating model, and the telemetry agreed: 0 optimistic promotions in 157,
+    and 0 across the 15-worker burst that queued 11 branches and was supposed to
+    be its first real test. Meanwhile the branches WAITING in that queue were in
+    the exact situation the path was built for. Each merge invalidated their
+    push-time previews, and each subsequent promote threw away a COMPLETED GREEN
+    CI run and paid for a fresh one — the optimization degrading precisely when
+    it was needed most.
+
+    WHAT IT DOES NOT CHANGE. It reaches decide_promotion with the same inputs the
+    mid-gate caller does, by calling the same _stale_base: the footprint
+    assessment is the same computation, and the IMPACT TIER STILL RE-VERIFIES THE
+    REAL COMBINED TREE before anything is promoted. A wider entry to a path whose
+    verification was weakened would be worse than no fix at all, so the entry is
+    the only thing that widens.
+
+    Not taken when the operator has closed the optimistic path
+    (SABLE_MG_OPTIMISTIC=0) — the kill switch must restore the pre-jd5fj.4
+    behaviour exactly, and that includes never going looking.
+
+    No cmar4.4 budget check here, deliberately: that measurement IS the gate's
+    wall-clock for the merge_preview tier, and this path spends none of it — the
+    verdict was already stored. Recording a near-zero sample would deflate the
+    tier's own statistics with time it did not spend. What this path DOES cost is
+    the impact tier, which is a different tier with a different budget. The cost
+    that stays unmeasured either way is push->LANDED, which is SABLE-q4rn4."""
+    if not optimistic_promotion_enabled():
+        return None
+    stale = preview.find_stale_green_preview(repo, remote, branch, base_sha, branch_sha)
+    if stale is None:
+        return None
+    print(f"sable-merge-gate: {branch} already has a GREEN preview ({stale.preview_sha[:7]} "
+          f"on ref {stale.ref}) built on base {stale.base_sha[:7]}, which the queue has moved "
+          f"past to {base_sha[:7]} — assessing it instead of discarding it (SABLE-kzi1a)")
+    try:
+        code = _stale_base(bead, branch, base, repo, remote, manager, base_ref,
+                           stale.ref, stale.preview_sha, stale.base_sha, branch_sha,
+                           base_sha, on_adoption_miss=True)
+    except _OptimisticNotApplicable as exc:
+        print(f"sable-merge-gate: the queued preview for {branch} is not usable against the "
+              f"current base ({exc}) — building a fresh preview the pre-kick way")
+        return None
+    # Consumed: this ref's run is complete and its object has been decided on, so
+    # the throwaway ref is now what the ordinary flow's finally-block would make
+    # it. Best-effort, exactly like that one. NOT reached when _stale_base raises
+    # (a second base move, an integrity abort, a conflict) — there the preview is
+    # still the best evidence the next attempt has.
+    preview.delete_ci_ref(repo, remote, stale.ref)
+    return code
+
+
 def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             manager: str, override: str | None) -> int:
     # FIRST, before any git work: is the fleet frozen? (SABLE-jd5fj.5)
@@ -575,6 +675,18 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
     git_lib._git(repo, "fetch", remote, base, branch)
     base_sha = git_lib.resolve_commit(repo, base_ref)
     branch_sha = git_lib.resolve_commit(repo, branch_ref)
+
+    # SABLE-kzi1a: before building anything, is this an ADOPTION MISS with a
+    # green preview already sitting behind it — the queued-branch case a serial
+    # merge lane manufactures on every promote after the first? Asked HERE,
+    # before materialize_preview, because that call is what would push a second
+    # ci-verify ref and start the redundant CI run this bead exists to stop.
+    # Skipped under --override: that bypass consults no run at all by contract,
+    # and this entry is entirely about consuming a run that already exists.
+    widened = None if override else _adoption_miss_optimistic(
+        bead, branch, base, repo, remote, manager, base_ref, base_sha, branch_sha)
+    if widened is not None:
+        return widened
 
     # SABLE-jd5fj.1/.3: adopt the push-time kick for this exact (base, branch)
     # pair if one exists, else build and push a preview the pre-kick way. Raises
