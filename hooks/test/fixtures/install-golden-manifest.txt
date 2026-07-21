@@ -1,4 +1,4 @@
-cd2f143ad51e9b78e13d5ead6d3036e3f98b21bb31b11050c3d5bf9f9c639639  ./.sable-install-provenance
+d3b815d72f3b1141138dfb5852881d10a34dbe77912183ba3368f6a132fe090f  ./.sable-install-provenance
 6ad9a8c7c088f4750326a7dac7c751951860cc9dff127f23987115672d7a8351  ./CLAUDE.md
 a9c25af0b3d95ff3092c3b7cb45c5c19cfad8f1ce0cee85ba3780923cbc7de36  ./agents/columbo.md
 e387f009b65f099f301679ff31b802c7606f4f6ef825f65e35f67b4504abafbd  ./agents/rudy.md
@@ -25,7 +25,7 @@ cbdea65644eff16c2c462ee855ba11106185927b7d2d0f2fe899740337973f4d  ./hooks/multi-
 f3cbdd63ee02a6de238cd889dc4c7eff228036fa5a3b9db9aa229c606021c429  ./hooks/multi-manager/read-guard.sh
 37e174b95cc1c9a72682c16cde50c197e5fa6cffbf73b6168f8a1fcb5254c411  ./hooks/multi-manager/session-role-anchor.sh
 535053bdd57c1a682596259043ff3fbdb37032f1dd956c59599fca5387d0f99a  ./hooks/multi-manager/stash-worktree-guard.sh
-af8e728a9ad02317f441ac4ecdcaaec6cef97384387fe14cac3a3d6e97df9b0c  ./hooks/multi-manager/tree-claim.sh
+7e1d9a3e50f9a05b198adbe26adf4e01309c0ead8ddfa0c83959efcec7817b0a  ./hooks/multi-manager/tree-claim.sh
 20442e2d5038563d51bf7c3f84480266175897d51e2135b59d6d68af963869ac  ./hooks/tdd-evidence.sh
 620cf3e92b7d96515223a73ea1da3096597000231762b6653eaf817c1b887918  ./hooks/tdd-gate.sh
 a0bb62e5e73b4af901891463cff80a0754c56bc2c3b7b3ebe2f2b54f7381f19f  ./hooks/tdd-remind.sh
