@@ -514,6 +514,7 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -
 
     branches = list_origin_wk_branches(repo, remote)
     open_beads = open_for_chuck_beads(repo)
+    corpus_unknown = open_beads is None
     now = time.time()
 
     mode = "DRY-RUN" if dry_run else "reconcile"
@@ -521,6 +522,7 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -
           f"{len(branches)} origin wk-* branch(es), age threshold {threshold_minutes}min")
 
     stranded: list[tuple[str, str | None]] = []
+    unassessed = 0
     kick_candidates = 0
     kicked = 0
     for br in branches:
@@ -549,6 +551,13 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -
         print(f"  {br}: {reason}")
         if is_stranded:
             stranded.append((br, status))
+        elif corpus_unknown and reason == "handoff-already-on-record":
+            # predicate 3 assumed-named this branch only because the for-chuck
+            # corpus query failed (branch_named_by_open_for_chuck(None, ...) is
+            # unconditionally True) — its real strandedness was never actually
+            # checked. Count it so the summary can say so instead of reading
+            # identical to a fleet where nothing is stranded.
+            unassessed += 1
 
     filed = 0
     for br, status in stranded:
@@ -563,14 +572,27 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -
             print(f"  WARNING: could not file for-chuck bead for {br} "
                   f"(bd exit {cp.returncode}): {cp.stdout.strip()}")
 
+    # SABLE-2az2x: an UNKNOWN for-chuck corpus makes the reconciler assume-named
+    # (skip-filing) for every unmerged branch it sees, cadence after cadence, if
+    # the underlying query failure is PERSISTENT rather than transient — and the
+    # summary below would otherwise print the exact same "0 stranded, 0 filed"
+    # a genuinely healthy fleet prints. That is indistinguishable-from-healthy,
+    # which is worse than the duplicate handoff the suppression prevents (a
+    # duplicate is visible and reconcilable; a silently-stopped floor is not).
+    # Suppression itself stays unbounded here (per-cadence WARNING already
+    # covers the transient case) — this only makes the SUMMARY say so.
+    corpus_note = (
+        f" (CORPUS UNREADABLE — suppression active, {unassessed} branch(es) unassessed)"
+        if corpus_unknown else ""
+    )
     if dry_run:
         print(f"sable-reconcile-handoffs [DRY-RUN]: {len(stranded)} stranded branch(es) "
-              f"classified, 0 filed (dry-run); {kick_candidates} preview-kick candidate(s), "
-              f"0 kicked (dry-run).")
+              f"classified, 0 filed (dry-run){corpus_note}; {kick_candidates} "
+              f"preview-kick candidate(s), 0 kicked (dry-run).")
     else:
         print(f"sable-reconcile-handoffs: {len(stranded)} stranded branch(es), "
-              f"{filed} for-chuck bead(s) filed; {kick_candidates} preview-kick candidate(s), "
-              f"{kicked} kicked.")
+              f"{filed} for-chuck bead(s) filed{corpus_note}; {kick_candidates} "
+              f"preview-kick candidate(s), {kicked} kicked.")
     return 0
 
 
