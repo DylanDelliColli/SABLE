@@ -17,6 +17,19 @@
 # the moment ANY Bash-matched hook reintroduces a `git push` side effect —
 # whether on a non-push command (the reproducer shape) or during a real push.
 #
+# SCOPE NOTE — the SABLE-jd5fj.1 preview kick
+# -------------------------------------------
+# post-push-merge-notify.sh now fires `sable-merge-gate preview` on a CONFIRMED
+# push, and that tool does push a throwaway ci-verify/** ref (the CI trigger).
+# The invariant above is unchanged and still holds literally: the HOOK itself
+# executes no push — it delegates to a separate, individually gated tool, which
+# is why the ZERO assertions below still pass on a real push. The dimension that
+# matters for THIS bead's failure class is that the delegation obeys the same
+# rule as the hook's own git ops, so the kick is now asserted here too: it must
+# fire ZERO times on a non-push Bash command (the SABLE-81dr reproducer shape).
+# Whether it fires correctly ON a push, and that every no-kick guard holds, is
+# hooks/test/test-preview-kick.sh's job.
+#
 # MECHANISM
 # ---------
 # A `git` shim on PATH forwards every call to real git but RECORDS each
@@ -94,6 +107,18 @@ exit 0
 EOF
   chmod +x "$STUB_DIR/$tool"
 done
+# sable-merge-gate recorder (SABLE-jd5fj.1): the preview kick delegates its ref
+# push to this tool, so a stub that RECORDS invocations (and pushes nothing) is
+# what makes "no kick on a non-push command" assertable at all — without it the
+# clean-room simply lacks the binary and the assertion would be vacuous.
+KICK_LOG="$STUB_DIR/preview-kick-calls.log"
+cat > "$STUB_DIR/sable-merge-gate" <<EOF
+#!/usr/bin/env bash
+echo "KICK|\$*" >> "$KICK_LOG"
+exit 0
+EOF
+chmod +x "$STUB_DIR/sable-merge-gate"
+
 # tmux stub: emit a chuck/optimus role line for the presence probes; never push.
 cat > "$STUB_DIR/tmux" <<'EOF'
 #!/usr/bin/env bash
@@ -221,6 +246,28 @@ for entry in "${BASH_HOOKS[@]}"; do
   assert_no_push "no-push on 'bd update' — $base"  "$hook" "$event" "$CMD_BD"
   assert_no_push "no-push on 'sable-msg' — $base"  "$hook" "$event" "$CMD_MSG"
 done
+
+# SABLE-jd5fj.1: the preview kick — the hook's one delegated push path — must
+# likewise stay dormant on a non-push Bash command. The kick is fired detached,
+# so settle briefly before reading, or a zero here would be a race, not a fact.
+assert_no_kick() {
+  local name="$1" cmd="$2" json n
+  json="$(make_input "post" "$cmd" "$FIXTURE_REPO")"
+  : > "$KICK_LOG"
+  env -i PATH="$STUB_DIR:$PATH" HOME="$HOME" \
+      GIT_CONFIG_GLOBAL="${GIT_CONFIG_GLOBAL:-}" GIT_CONFIG_SYSTEM="${GIT_CONFIG_SYSTEM:-/dev/null}" \
+      "${MGR_ENV[@]}" \
+      timeout 60 bash "$MM_DIR/post-push-merge-notify.sh" <<< "$json" >/dev/null 2>&1 || true
+  sleep 1
+  n="$(grep -c '^KICK|' "$KICK_LOG" 2>/dev/null)"
+  if [ "${n:-0}" -eq 0 ]; then
+    pass "$name"
+  else
+    fail "$name" "hook fired $n preview kick(s): $(head -3 "$KICK_LOG")"
+  fi
+}
+assert_no_kick "no preview kick on 'bd update' — post-push-merge-notify.sh" "$CMD_BD"
+assert_no_kick "no preview kick on 'sable-msg' — post-push-merge-notify.sh" "$CMD_MSG"
 
 # The push-capable hooks (they legitimately fetch/rebase/ls-remote on a REAL
 # push) must ALSO never issue a push of their own during that push.

@@ -234,6 +234,54 @@ if [ -z "$FILES" ]; then
   exit 0
 fi
 
+# --- Push-time preview kick (SABLE-jd5fj.1) ---------------------------------
+# The merge-preview ci-verify run is the slowest link in the worker->merge path,
+# and until now it only STARTED once Chuck picked the handoff up — so its whole
+# duration sat between the push and the merge. Fire `sable-merge-gate preview`
+# here instead — it builds the merge-preview commit, pushes the ci-verify ref
+# (the CI trigger) and returns WITHOUT waiting — so the verdict is already
+# computing before Chuck wakes. Chuck's later `promote` adopts that same ref via
+# the shared (base_sha, branch_sha) key, so this starts the run he waits on
+# rather than a second one.
+#
+# Placement is the contract: every no-kick guard already stands above this line
+# and stays authoritative — integration-branch self-push, 'Everything
+# up-to-date' no-op, unconfirmed-on-origin push, and empty diff vs the base all
+# exit before reaching here. So a kick happens exactly once per confirmed,
+# non-empty, non-self push, which is exactly the set of pushes that become a
+# Chuck merge.
+#
+# Fire-and-forget by construction: detached (setsid/nohup, own stdio) because the
+# kick's fetch+push outlives this hook's 10s timeout and must not be reaped with
+# the hook, and NON-BLOCKING because the handoff below must never wait on it. The
+# kick is pure warm-up — it writes no bead evidence and reports no verdict, so
+# losing one costs latency only (jd5fj.2's poll leg re-kicks a missed preview,
+# and promote still builds its own preview when none was kicked). Disable with
+# SABLE_PREVIEW_KICK=0; output lands in SABLE_PREVIEW_KICK_LOG.
+if [ "${SABLE_PREVIEW_KICK:-1}" = "1" ]; then
+  if command -v sable-merge-gate >/dev/null 2>&1; then
+    PREVIEW_KICK_LOG="${SABLE_PREVIEW_KICK_LOG:-$(dirname "$SABLE_HOOK_TRACE_LOG")/preview-kick.log}"
+    mkdir -p "$(dirname "$PREVIEW_KICK_LOG")" 2>/dev/null || true
+    if command -v setsid >/dev/null 2>&1; then
+      setsid sable-merge-gate preview --branch "$BRANCH" --repo "$CWD" \
+        >> "$PREVIEW_KICK_LOG" 2>&1 < /dev/null &
+    else
+      nohup sable-merge-gate preview --branch "$BRANCH" --repo "$CWD" \
+        >> "$PREVIEW_KICK_LOG" 2>&1 < /dev/null &
+    fi
+    PREVIEW_KICK_PID=$!
+    disown "$PREVIEW_KICK_PID" 2>/dev/null || true
+    sable_pp_trace "PREVIEW-KICK fired branch=${BRANCH} pid=${PREVIEW_KICK_PID}"
+  else
+    # Loud skip (SABLE-tb1y deliverable 3): never swallow a disposition on a
+    # confirmed push. Costs latency only — Chuck's promote builds its own preview.
+    echo "post-push-merge-notify: not kicking the merge preview — sable-merge-gate is not on PATH; Chuck's promote will build the preview at merge time (slower, not broken)."
+    sable_pp_trace "PREVIEW-KICK skipped no-binary branch=${BRANCH}"
+  fi
+else
+  sable_pp_trace "PREVIEW-KICK disabled (SABLE_PREVIEW_KICK=0) branch=${BRANCH}"
+fi
+
 # Try to detect PR URL via gh (best-effort, optional)
 PR_URL=$(gh pr view --json url -q .url 2>/dev/null || echo "")
 
