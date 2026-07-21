@@ -451,20 +451,44 @@ if [ "$DRY_RUN" = "1" ]; then
     yellow "  would write: ${CLAUDE_DIR}/.sable-install-provenance"
 elif command -v git >/dev/null 2>&1 && PROV_SHA="$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null)"; then
     PROV_BRANCH="$(git -C "${REPO_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")"
-    if [ -n "$(git -C "${REPO_DIR}" status --porcelain 2>/dev/null)" ]; then
+    # "dirty" is a reproducibility claim: can the recorded SHA reconstruct the
+    # INSTALLED SET? install.sh installs TRACKED content, so only tracked
+    # modifications break that (-uno excludes untracked entries). Untracked
+    # presence is a different fact — it does not affect reproducibility from
+    # the recorded SHA — so it gets its own field rather than being folded
+    # into "dirty" (SABLE-dt92b: an untracked-only tree was stamping DIRTY /
+    # "not reproducible", which is false).
+    if [ -n "$(git -C "${REPO_DIR}" status --porcelain -uno 2>/dev/null)" ]; then
         PROV_DIRTY="true"
     else
         PROV_DIRTY="false"
+    fi
+    if git -C "${REPO_DIR}" status --porcelain 2>/dev/null | grep -q '^??'; then
+        PROV_UNTRACKED="true"
+    else
+        PROV_UNTRACKED="false"
     fi
     PROV_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     {
         printf 'commit=%s\n' "${PROV_SHA}"
         printf 'branch=%s\n' "${PROV_BRANCH}"
         printf 'dirty=%s\n' "${PROV_DIRTY}"
+        printf 'untracked=%s\n' "${PROV_UNTRACKED}"
         printf 'timestamp=%s\n' "${PROV_TIMESTAMP}"
     } > "${CLAUDE_DIR}/.sable-install-provenance"
+    PROV_NOTE=""
     if [ "${PROV_DIRTY}" = "true" ]; then
-        green "  installed from ${PROV_SHA} (${PROV_BRANCH}), DIRTY tree — not reproducible"
+        PROV_NOTE="DIRTY tree — not reproducible"
+    fi
+    if [ "${PROV_UNTRACKED}" = "true" ]; then
+        if [ -n "${PROV_NOTE}" ]; then
+            PROV_NOTE="${PROV_NOTE}; untracked files present"
+        else
+            PROV_NOTE="untracked files present"
+        fi
+    fi
+    if [ -n "${PROV_NOTE}" ]; then
+        green "  installed from ${PROV_SHA} (${PROV_BRANCH}) — ${PROV_NOTE}"
     else
         green "  installed from ${PROV_SHA} (${PROV_BRANCH})"
     fi
