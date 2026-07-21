@@ -758,4 +758,216 @@ def test_quiet_mode_snapshot_drift_never_recommends_install_sh(tmp_path, capsys)
     captured = capsys.readouterr()
     assert rc == 1
     assert "bash install.sh" not in captured.err
+
+
+# --- install provenance (SABLE-78kxu) -------------------------------------
+# WHICH COMMIT did the installed set come from? build_manifest's clean/drift
+# compare only proves installed files match the repo TREE as it exists
+# today; a file the tree doesn't have yet is invisible to it, so "clean" is
+# compatible with a not-yet-merged guard being entirely absent (the incident
+# this bead was filed from). read_provenance / current_repo_head /
+# provenance_ancestor_of_head answer the separate, narrower question of
+# which commit the CURRENTLY INSTALLED files were copied from — a fact about
+# files, never a claim that any feature in that commit is wired active.
+
+def write_provenance(claude_dir, *, commit="a" * 40, branch="main", dirty="false", timestamp="2026-07-21T00:00:00Z"):
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    stamp = claude_dir / doctor.PROVENANCE_FILENAME
+    stamp.write_text(
+        f"commit={commit}\nbranch={branch}\ndirty={dirty}\ntimestamp={timestamp}\n"
+    )
+    return stamp
+
+
+def test_read_provenance_returns_none_without_a_stamp(tmp_path):
+    # the ordinary case for every install that predates this bead — must
+    # read as UNKNOWN, never as an error and never as "clean".
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir()
+    assert doctor.read_provenance(claude_dir) is None
+
+
+def test_read_provenance_parses_all_fields(tmp_path):
+    claude_dir = tmp_path / "claude"
+    write_provenance(claude_dir, commit="b" * 40, branch="wk-feature", dirty="true", timestamp="2026-07-21T12:34:56Z")
+    data = doctor.read_provenance(claude_dir)
+    assert data["commit"] == "b" * 40
+    assert data["branch"] == "wk-feature"
+    assert data["dirty"] == "true"
+    assert data["timestamp"] == "2026-07-21T12:34:56Z"
+
+
+def test_read_provenance_dirty_flag_round_trips_false(tmp_path):
+    claude_dir = tmp_path / "claude"
+    write_provenance(claude_dir, dirty="false")
+    assert doctor.read_provenance(claude_dir)["dirty"] == "false"
+
+
+def test_read_provenance_missing_commit_line_is_treated_as_no_stamp(tmp_path):
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir()
+    (claude_dir / doctor.PROVENANCE_FILENAME).write_text("branch=main\ndirty=false\n")
+    assert doctor.read_provenance(claude_dir) is None
+
+
+def test_current_repo_head_returns_none_for_non_git_dir(tmp_path):
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    assert doctor.current_repo_head(not_a_repo) is None
+
+
+def test_current_repo_head_returns_sha_for_real_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    (repo / "f.txt").write_text("hi\n")
+    _git("add", "f.txt", cwd=repo)
+    _git("-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "init", cwd=repo)
+    head = doctor.current_repo_head(repo)
+    expected = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert head == expected
+
+
+def test_provenance_ancestor_of_head_true_when_sha_is_an_ancestor(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    (repo / "f.txt").write_text("v1\n")
+    _git("add", "f.txt", cwd=repo)
+    _git("-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "v1", cwd=repo)
+    first_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    (repo / "f.txt").write_text("v2\n")
+    _git("add", "f.txt", cwd=repo)
+    _git("-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "v2", cwd=repo)
+    assert doctor.provenance_ancestor_of_head(repo, first_sha) is True
+
+
+def test_provenance_ancestor_of_head_false_for_unresolvable_sha(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    (repo / "f.txt").write_text("v1\n")
+    _git("add", "f.txt", cwd=repo)
+    _git("-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "v1", cwd=repo)
+    # a syntactically plausible but unresolvable sha must resolve to None,
+    # never True — an unresolvable probe is not evidence of ancestry.
+    assert doctor.provenance_ancestor_of_head(repo, "f" * 40) is None
+
+
+def test_render_text_report_clean_includes_provenance_sha(tmp_path, capsys):
+    repo, claude_dir = make_repo(tmp_path)
+    write_provenance(claude_dir, commit="c" * 40, branch="main")
+    results = doctor.check_manifest(doctor.build_manifest(repo, claude_dir))
+    provenance = doctor.read_provenance(claude_dir)
+    doctor.render_text_report(results, provenance=provenance)
+    out = capsys.readouterr().out
+    assert "installed from" in out
+    assert "c" * 40 in out
+    assert "main" in out
+
+
+def test_render_text_report_no_stamp_says_unknown_not_clean(tmp_path, capsys):
+    # the manifest itself is clean (files match), but provenance is a
+    # SEPARATE claim — it must read as UNKNOWN, not be swallowed into the
+    # overall "clean" verdict.
+    repo, claude_dir = make_repo(tmp_path)
+    results = doctor.check_manifest(doctor.build_manifest(repo, claude_dir))
+    doctor.render_text_report(results, provenance=None)
+    out = capsys.readouterr().out
+    assert "UNKNOWN" in out
+    assert "sable-doctor: clean" in out  # file-match verdict is unaffected
+
+
+def test_render_text_report_drift_includes_both_provenance_and_current_head(tmp_path, capsys):
+    def mutate(repo, claude_dir):
+        (claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
+
+    repo, claude_dir = make_repo(tmp_path, mutate=mutate)
+    write_provenance(claude_dir, commit="d" * 40, branch="main")
+    results = doctor.check_manifest(doctor.build_manifest(repo, claude_dir))
+    provenance = doctor.read_provenance(claude_dir)
+    doctor.render_text_report(results, provenance=provenance, current_head="e" * 40)
+    out = capsys.readouterr().out
+    assert "installed from" in out
+    assert "d" * 40 in out
+    assert "repo now at" in out
+    assert "e" * 40 in out
+
+
+def test_render_text_report_dirty_flag_shown_in_report(tmp_path, capsys):
+    repo, claude_dir = make_repo(tmp_path)
+    write_provenance(claude_dir, commit="1" * 40, dirty="true")
+    provenance = doctor.read_provenance(claude_dir)
+    doctor.render_text_report(
+        doctor.check_manifest(doctor.build_manifest(repo, claude_dir)), provenance=provenance,
+    )
+    out = capsys.readouterr().out
+    assert "DIRTY" in out
+
+
+def test_render_text_report_ancestor_false_adds_a_note_not_an_error(tmp_path, capsys):
+    repo, claude_dir = make_repo(tmp_path)
+    write_provenance(claude_dir, commit="2" * 40)
+    provenance = doctor.read_provenance(claude_dir)
+    doctor.render_text_report(
+        doctor.check_manifest(doctor.build_manifest(repo, claude_dir)),
+        provenance=provenance, ancestor_ok=False,
+    )
+    out = capsys.readouterr().out
+    assert "not an ancestor" in out
+    assert "sable-doctor: clean" in out  # advisory note, never changes the verdict
+
+
+def test_main_json_includes_provenance_block(tmp_path, capsys):
+    repo, claude_dir = make_repo(tmp_path)
+    write_provenance(claude_dir, commit="3" * 40, branch="main", dirty="false")
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["provenance"]["commit"] == "3" * 40
+    assert payload["provenance"]["branch"] == "main"
+
+
+def test_main_json_provenance_is_null_without_a_stamp(tmp_path, capsys):
+    repo, claude_dir = make_repo(tmp_path)
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["provenance"] is None
+
+
+def test_main_installed_from_prints_bare_sha_and_exits_zero(tmp_path, capsys):
+    repo, claude_dir = make_repo(tmp_path)
+    write_provenance(claude_dir, commit="4" * 40)
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir), "--installed-from"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out.strip() == "4" * 40
+
+
+def test_main_installed_from_exits_one_without_a_stamp(tmp_path, capsys):
+    repo, claude_dir = make_repo(tmp_path)
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir), "--installed-from"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert "no provenance stamp" in captured.err
+
+
+def test_quiet_mode_clean_stays_silent_with_a_provenance_stamp_present(tmp_path, capsys):
+    # SABLE-78kxu must not make the SessionStart-hook path (`sable-doctor
+    # --quiet`) start speaking on a healthy run just because provenance now
+    # exists — that hook fires on every fresh pane and staying silent when
+    # clean is the whole point of --quiet.
+    repo, claude_dir = make_repo(tmp_path)
+    write_provenance(claude_dir, commit="5" * 40)
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir), "--quiet"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out == ""
+    assert captured.err == ""
     assert captured.out == ""
