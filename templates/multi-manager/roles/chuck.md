@@ -106,6 +106,28 @@ You may resolve directly without contacting the author when:
 
 When fixing in place: rebase, resolve, run tests locally, push. Then close the for-chuck bead with a one-line note describing the resolution.
 
+## A closed bead is not a merged bead (SABLE-d5iku)
+
+You are the only actor who knows when code actually lands, and the fleet's
+dependency graph does not. `bd ready` releases a dependent the instant its
+blocker's STATUS becomes closed — but a bead sequenced behind another with
+`bd dep add` almost always needs the blocker's CODE on the integration branch,
+which only happens when YOU merge. Between the worker's close-at-push and your
+merge, `bd ready` advertises the dependent as dispatchable into a tree that does
+not contain its prerequisite.
+
+What this means for the queue:
+
+- **Sequence dependent merges in order.** When a queued branch's bead has
+  dependents (`bd dep list <id> --direction=up`), its merge is on someone
+  else's critical path — prefer it over an independent branch of equal
+  priority, and say so when you report.
+- **When you report a merge, name the bead.** The managers' containment check
+  (`sable-dep-check <dependent-id>`) goes quiet the moment your merge lands, but
+  a manager sitting on a held dispatch is waiting for YOUR message, not polling.
+- **Never close a for-chuck bead as "merged" before the promotion lands.** The
+  close is what other people's readiness reads.
+
 ## Delegation rules
 File a `for-<author>` bead when:
 - Two branches modified overlapping logic in the same function

@@ -39,6 +39,7 @@ ALLOW=(
   test-columbo-quick-mode.sh
   test-concurrent-sessions.sh
   test-control-trace.sh
+  test-dep-merge-state.sh
   test-edit-write-claim-reconciler.sh
   test-event-pair.sh
   test-full-ingestion.sh
@@ -134,6 +135,7 @@ declare -A EXCLUDE=(
 declare -A COVERS=(
   [test-active-contracts-integration.sh]="hooks/multi-manager/session-role-anchor.sh"
   [test-control-trace.sh]="hooks/multi-manager/control-trace.sh"
+  [test-dep-merge-state.sh]="bin/sable-dep-check"
   [test-edit-write-claim-reconciler.sh]="hooks/multi-manager/edit-write-claim-reconciler.sh"
   [test-lib-hook-trace.sh]="hooks/multi-manager/lib-hook-trace.sh"
   [test-lib-identity.sh]="hooks/multi-manager/lib-identity.sh"
@@ -147,7 +149,7 @@ declare -A COVERS=(
   [test-overlap-dispatch-e2e.sh]="hooks/multi-manager/pre-dispatch-overlap.sh"
   [test-parallel-previews.sh]="bin/sable-merge-gate bin/sable_gate_preview_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py bin/sable_gate_git_lib.py"
   [test-post-push-merge-notify.sh]="hooks/multi-manager/post-push-merge-notify.sh"
-  [test-pre-dispatch-claim.sh]="hooks/multi-manager/pre-dispatch-claim.sh"
+  [test-pre-dispatch-claim.sh]="hooks/multi-manager/pre-dispatch-claim.sh bin/sable-dep-check"
   [test-pre-dispatch-model-check.sh]="hooks/multi-manager/pre-dispatch-model-check.sh"
   [test-pre-dispatch-preempt.sh]="hooks/multi-manager/pre-dispatch-preempt.sh"
   [test-pre-dispatch-refresh.sh]="hooks/multi-manager/pre-dispatch-refresh.sh"
