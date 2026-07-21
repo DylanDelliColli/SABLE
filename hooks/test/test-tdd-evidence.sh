@@ -402,6 +402,93 @@ fi
 rm -f "$EU_EV"
 rm -rf "$EU_STUB_DIR"
 
+# ---------- SABLE-5lli.1: S2 prerequisite -- PASS/FAIL exit-status field ----------
+# tdd-evidence.sh fires PreToolUse (before the command runs), so it has no
+# result to report on that path -- STATUS stays omitted, preserving today's
+# CMD=-only evidence-registration behavior exactly. When the incoming payload
+# DOES carry a completed result (a PostToolUse-shaped event, or here a
+# synthetic fixture standing in for one), the same command must be recorded
+# as either STATUS=PASS or STATUS=FAIL depending on its real exit status --
+# never inferred from the command text, only from the result data.
+
+make_input_result() {
+  # $1 = command, $2 = session_id, $3 = python dict literal for the result
+  # payload (e.g. "{'exit_code': 1}"), $4 = result key name
+  # ('tool_response' or 'tool_result')
+  python3 -c "
+import json, sys
+result = eval(sys.argv[3])
+d = {'tool_input': {'command': sys.argv[1]}, 'session_id': sys.argv[2], sys.argv[4]: result}
+print(json.dumps(d))
+" "$1" "$2" "$3" "$4"
+}
+
+# run_hook_status <name> <command> <result-dict-literal> <result-key> <expected STATUS|none>
+run_hook_status() {
+  local name="$1" command="$2" result_literal="$3" result_key="$4" expected="$5"
+  local sid evidence
+  sid=$(fake_session)
+  evidence="/tmp/tdd-evidence-${sid}"
+  rm -f "$evidence"
+  make_input_result "$command" "$sid" "$result_literal" "$result_key" | bash "$HOOK" >/dev/null 2>&1 || true
+  if [ "$expected" = "none" ]; then
+    if [ -s "$evidence" ] && ! grep -q 'STATUS=' "$evidence"; then
+      pass "$name"
+    else
+      fail "$name" "got: $(cat "$evidence" 2>/dev/null || echo '(missing)')"
+    fi
+  else
+    if grep -qF "STATUS=$expected" "$evidence" 2>/dev/null; then
+      pass "$name"
+    else
+      fail "$name" "expected STATUS=$expected, got: $(cat "$evidence" 2>/dev/null || echo '(missing)')"
+    fi
+  fi
+  rm -f "$evidence"
+}
+
+run_hook_status "failing test command (tool_response.exit_code=1) records FAIL" \
+  "pytest tests/" "{'exit_code': 1}" "tool_response" "FAIL"
+
+run_hook_status "passing test command (tool_response.exit_code=0) records PASS" \
+  "pytest tests/" "{'exit_code': 0}" "tool_response" "PASS"
+
+run_hook_status "failing test command via tool_result.exit_code=1 records FAIL" \
+  "npm test" "{'exit_code': 1}" "tool_result" "FAIL"
+
+run_hook_status "passing test command via tool_result.exit_code=0 records PASS" \
+  "npm test" "{'exit_code': 0}" "tool_result" "PASS"
+
+run_hook_status "alt key exitCode=1 records FAIL" \
+  "bash hooks/test/test-foo.sh" "{'exitCode': 1}" "tool_response" "FAIL"
+
+run_hook_status "boolean success=False records FAIL" \
+  "pytest tests/" "{'success': False}" "tool_response" "FAIL"
+
+run_hook_status "boolean success=True records PASS" \
+  "pytest tests/" "{'success': True}" "tool_response" "PASS"
+
+# non-test command: still records NOTHING regardless of a present, failing
+# result -- STATUS is only ever attached to a command that already matched
+# the existing evidence-registration rules; it never becomes a NEW way for
+# an unrelated command to register.
+FAILNONTEST_SID="tdd-ev-failnontest-$$-$RANDOM"
+FAILNONTEST_EV="/tmp/tdd-evidence-${FAILNONTEST_SID}"
+rm -f "$FAILNONTEST_EV"
+make_input_result "git status" "$FAILNONTEST_SID" "{'exit_code': 1}" "tool_response" | bash "$HOOK" >/dev/null 2>&1 || true
+if [ ! -s "$FAILNONTEST_EV" ]; then
+  pass "non-test command with a failing result present still records neither"
+else
+  fail "non-test command with a failing result present still records neither" "unexpected evidence: $(cat "$FAILNONTEST_EV")"
+fi
+rm -f "$FAILNONTEST_EV"
+
+# IRON-RULE regression: a PreToolUse-shaped payload (no result field at all,
+# today's exact production shape) still records the plain CMD= line with NO
+# STATUS= suffix -- the pass/fail field is additive, not a replacement.
+run_hook_status "PreToolUse-shaped payload (no result yet) omits STATUS entirely" \
+  "pytest tests/" "{}" "__no_such_key__" "none"
+
 # ---------- Summary ----------
 
 echo

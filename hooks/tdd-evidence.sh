@@ -47,6 +47,48 @@ cmd = d.get('tool_input', {}).get('command', '') or ''
 cwd = d.get('cwd', '') or ''
 sid = d.get('session_id', '') or ''
 aid = d.get('agent_id', '') or ''
+
+# SABLE-5lli.1 (S2 prerequisite): a CMD= line today proves a test command
+# RAN, not that it passed -- the S2 close-gate needs a target test to
+# 'appear GREEN in evidence', which has no mechanical backing without a
+# pass/fail signal. This hook still fires PreToolUse (before the command
+# executes) with no result to report, so on that path STATUS stays
+# unknown/omitted -- existing evidence-registration behavior is unchanged.
+# When invoked with a completed tool result (a PostToolUse-shaped payload,
+# or a synthetic test fixture standing in for one), read the exit status
+# independently of any worker self-report. Field names are defensive
+# because the platform's tool-result key has been observed under more than
+# one name (tool_response vs tool_result) -- checking both, plus a couple
+# of plausible shapes inside, means whichever the running platform emits
+# is picked up without a schema guess breaking the other.
+def _bool(v):
+    return v if isinstance(v, bool) else None
+
+tool_result = d.get('tool_response')
+if not isinstance(tool_result, dict) or not tool_result:
+    tool_result = d.get('tool_result')
+if not isinstance(tool_result, dict):
+    tool_result = {}
+
+STATUS = None
+_exit_code = None
+for _key in ('exit_code', 'exitCode', 'code'):
+    _v = tool_result.get(_key)
+    if isinstance(_v, int) and not isinstance(_v, bool):
+        _exit_code = _v
+        break
+if _exit_code is not None:
+    STATUS = 'PASS' if _exit_code == 0 else 'FAIL'
+else:
+    _success = _bool(tool_result.get('success'))
+    if _success is not None:
+        STATUS = 'PASS' if _success else 'FAIL'
+    else:
+        _is_error = _bool(d.get('is_error'))
+        if _is_error is None:
+            _is_error = _bool(tool_result.get('is_error'))
+        if _is_error is not None:
+            STATUS = 'FAIL' if _is_error else 'PASS'
 # SABLE-jfg6.4: an ABSENT session id no longer short-circuits — the shared lib
 # derives a deterministic ppid fallback key downstream, so hccq-trap runs
 # (Agent-subagent / gc-managed, no CLAUDE_SESSION_ID) still record evidence at
@@ -219,7 +261,10 @@ if not hits:
 print(sid)
 print(aid)
 for repo, seg_text in hits:
-    print('REPO=%s CMD=%s' % (repo, seg_text))
+    if STATUS is not None:
+        print('REPO=%s CMD=%s STATUS=%s' % (repo, seg_text, STATUS))
+    else:
+        print('REPO=%s CMD=%s' % (repo, seg_text))
 " 2>/dev/null) || exit 0
 
 [ -z "$RESULT" ] && exit 0
