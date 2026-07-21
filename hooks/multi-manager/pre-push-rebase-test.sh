@@ -189,14 +189,23 @@ detect_typecheck_cmd() {
 }
 
 # Resolve the test command: repo-local config / checked-in .sable / env
-# (sable_resolve_test_command, SABLE-hml), else auto-detect from project
-# markers, else empty (no test command — phase 3 no-ops with a message).
+# (sable_resolve_test_command, SABLE-hml), else the repo's CI-tier SSOT
+# pre_push tier if it declares one (SABLE-cmar4.1 — .github/ci/test-tiers.sh,
+# consumption seam only: this repo's own testCommand= now reads THAT tier
+# rather than hardcoding the suite list, and any other repo that adopts the
+# tier SSOT gets this fallback for free without configuring testCommand at
+# all), else auto-detect from project markers, else empty (no test command —
+# phase 3 no-ops with a message).
 detect_test_cmd() {
   local cwd="$1"
   local resolved
   resolved=$(sable_resolve_test_command "$cwd")
   if [ -n "$resolved" ]; then
     echo "$resolved"
+    return
+  fi
+  if [ -f "$cwd/.github/ci/test-tiers.sh" ]; then
+    echo "bash .github/ci/test-tiers.sh --run pre_push"
     return
   fi
   if [ -f "$cwd/package.json" ]; then

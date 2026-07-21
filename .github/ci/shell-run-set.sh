@@ -82,9 +82,12 @@ ALLOW=(
   test-tdd-evidence.sh
   test-tdd-gate.sh
   test-thesis-docs.sh
+  test-tier-ssot.sh
+  test-tier-ssot-consumers.sh
   test-tree-claim.sh
   test-worker-dispatch-template.sh
   test-worker-flag-done.sh
+  test-worktree-isolation.sh
 )
 
 # --- Excluded from the run-set, each WITH reason + tracking bead. --------------
@@ -147,8 +150,17 @@ run_set() {
   return 1
 }
 
-case "${1:-}" in
-  --manifest) manifest ;;
-  --run)      run_set ;;
-  *) echo "usage: $0 --run | --manifest" >&2; exit 2 ;;
-esac
+# SABLE-cmar4.1: guard the CLI dispatch behind a sourced-vs-executed check so
+# .github/ci/test-tiers.sh (the tier SSOT loader) can `. shell-run-set.sh` to
+# reuse ALLOW/EXCLUDE as the merge_preview/full_snapshot tier membership
+# (SABLE-7v3z's UNCLASSIFIED trap and the stale-drift guard stay defined right
+# here, unduplicated) without triggering this dispatch on the SOURCING
+# script's own argv. Direct execution (`bash shell-run-set.sh --run|--manifest`,
+# as ci-verify.yml does) is unaffected — ${BASH_SOURCE[0]} == $0 only then.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  case "${1:-}" in
+    --manifest) manifest ;;
+    --run)      run_set ;;
+    *) echo "usage: $0 --run | --manifest" >&2; exit 2 ;;
+  esac
+fi
