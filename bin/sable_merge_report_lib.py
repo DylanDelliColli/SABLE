@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""sable_merge_report_lib — derive-at-read merge telemetry (SABLE-jd5fj.7).
+"""sable_merge_report_lib — derive-at-read merge telemetry (SABLE-jd5fj.7,
+corrected by SABLE-jd5fj.11).
 
 Produces the per-phase comparison the jd5fj S6 test-strategy story calls for:
-median/p90 push-to-integrated latency, textual conflict / red rate, a
-repeat-preview proxy, and — the flagship metric — a DIRECT measurement of the
-textually-clean-but-semantically-broken disjoint-promotion rate (the class
-SABLE-nueh3's baseline could only bound at 0/126, rule-of-three <=2.4%,
-because the pre-S2 design structurally prevented it from occurring at all).
+median/p90 push-to-LANDED latency (PRIMARY, SABLE-jd5fj.11) with push-to-
+CI-done retained as a labelled secondary, textual conflict / red rate, a
+repeat-preview proxy, discarded-preview cost and queue depth at promote
+(SABLE-kzi1a's confound), and — the flagship metric — a DIRECT measurement of
+the textually-clean-but-semantically-broken disjoint-promotion rate (the
+class SABLE-nueh3's baseline could only bound at 0/126, rule-of-three
+<=2.4%, because the pre-S2 design structurally prevented it from occurring
+at all).
 
 Consistent with the SABLE-8b41 telemetry direction: this is a derive-at-read
 reporting tool, not a new capture mechanism (relate, do not block). Three
@@ -26,21 +30,34 @@ adapters, same split as sable-merge-gate's own git/gh/bd seams:
             so a disjoint promotion that landed was impact-green at promote
             time; the only way to observe the class directly, post-landing,
             is a subsequent run against that same landed object going red.
+            The SAME base-branch run list also supplies the PRIMARY bar's
+            anchor (SABLE-jd5fj.11): the EARLIEST run recorded against a
+            landed sha is a real, independently timestamped observation that
+            the object exists on the base branch -- see
+            promotion_landed_epochs.
   log   -- ~/.claude/sable/logs/post-push-merge-notify.log. Real push
-            timestamps (CONFIRMED lines), joined to the nearest subsequent
-            preview run by TIME PROXIMITY (nueh3's doc does not define a
-            mechanical join key for its manual cross-reference, so this
-            module names its own: nearest preview run created within
-            max_gap_seconds after a CONFIRMED push). Documented as a
-            heuristic, not represented as nueh3's exact method.
+            timestamps (CONFIRMED lines). The SECONDARY push-to-CI-done join
+            uses TIME PROXIMITY (nueh3's doc does not define a mechanical
+            join key for its manual cross-reference, so this module names
+            its own: nearest preview run created within max_gap_seconds
+            after a CONFIRMED push). The PRIMARY push-to-landed join instead
+            matches on the exact branch name (compute_landed_metrics) --
+            both the promotion commit subject and the CONFIRMED log line
+            carry the real branch name, so no proximity heuristic is needed
+            there.
 
-CORRECTNESS NOTE carried forward from SABLE-jxgm4 (found reviewing nueh3):
-git commit-tree stamps a merge commit's author AND committer dates at
-PREVIEW-BUILD time, not at land time -- the whole CI wait (the dominant term)
-is invisible to any latency computed from commit dates alone. This module
-therefore NEVER uses commit dates as a push-to-landed latency proxy; git is
-used only to detect and count promotions (including which are disjoint), and
-push-to-CI-done latency comes exclusively from the log x gh join.
+CORRECTNESS NOTE carried forward from SABLE-jxgm4 (found reviewing nueh3),
+and the reason SABLE-jd5fj.11 exists: git commit-tree stamps a merge
+commit's author AND committer dates at PREVIEW-BUILD time, not at land time
+-- the whole CI wait (the dominant term) is invisible to any latency
+computed from commit dates alone, and for a REBUILT preview (SABLE-kzi1a: an
+earlier merge invalidated the push-time preview, so promote discards it and
+builds a fresh one) even the rebuilt commit's own dates only cover the LAST
+wait, not the discarded one before it. This module therefore NEVER uses
+commit dates as a push-to-landed latency proxy for either metric; git is
+used only to detect and count promotions (including which are disjoint).
+push-to-CI-done comes from the log x gh (preview runs) join; push-to-landed
+comes from the log x git (promotions) x gh (base-branch runs) join.
 """
 from __future__ import annotations
 
@@ -276,25 +293,28 @@ class PreviewRun:
     created_at: float
     completed_at: float | None
     conclusion: str | None
+    head_sha: str | None = None  # the object THIS run tested -- may or may not be what lands
 
 
-def join_push_to_ci(pushes: list[PushEvent], runs: list[PreviewRun],
-                    max_gap_seconds: float = 120.0) -> list[float]:
-    """Push -> CI-done latency in seconds, one per matched push. A push is
-    matched to the EARLIEST preview run (head_branch starting "ci-verify/")
-    created no more than max_gap_seconds after the push's CONFIRMED instant
-    and not yet consumed by an earlier push -- the push-time kick fires the
-    preview essentially immediately (SABLE-jd5fj.1), so a close-in-time
-    subsequent run is the one it kicked. Runs still pending (no
-    completed_at) are skipped -- they contribute no latency observation yet.
-    Unmatched pushes are simply absent from the result; callers report
-    coverage (n matched / n total) rather than pretending completeness."""
+def _match_pushes_to_first_preview(pushes: list[PushEvent], runs: list[PreviewRun],
+                                   max_gap_seconds: float) -> list[tuple[PushEvent, PreviewRun]]:
+    """The push->CI join's matching rule, factored out so both the (secondary)
+    push-to-CI-done latency and the (primary) discarded-preview detection use
+    the exact same "nearest completed preview run within max_gap_seconds"
+    rule -- one definition of "the preview a push kicked", not two that could
+    drift apart. A push is matched to the EARLIEST preview run (head_branch
+    starting "ci-verify/") created no more than max_gap_seconds after the
+    push's CONFIRMED instant and not yet consumed by an earlier push -- the
+    push-time kick fires the preview essentially immediately (SABLE-jd5fj.1),
+    so a close-in-time subsequent run is the one it kicked. Runs still
+    pending (no completed_at) are skipped -- they contribute no observation
+    yet. Unmatched pushes are simply absent from the result."""
     candidates = sorted(
         (r for r in runs if r.head_branch.startswith("ci-verify/") and r.completed_at is not None),
         key=lambda r: r.created_at,
     )
     used = [False] * len(candidates)
-    latencies: list[float] = []
+    matches: list[tuple[PushEvent, PreviewRun]] = []
     for push in sorted(pushes, key=lambda p: p.confirmed_at):
         best_i, best_gap = None, None
         for i, run in enumerate(candidates):
@@ -305,8 +325,113 @@ def join_push_to_ci(pushes: list[PushEvent], runs: list[PreviewRun],
                 best_i, best_gap = i, gap
         if best_i is not None:
             used[best_i] = True
-            latencies.append(candidates[best_i].completed_at - push.confirmed_at)
-    return latencies
+            matches.append((push, candidates[best_i]))
+    return matches
+
+
+def join_push_to_ci(pushes: list[PushEvent], runs: list[PreviewRun],
+                    max_gap_seconds: float = 120.0) -> list[float]:
+    """Push -> CI-done latency in seconds, one per matched push (SECONDARY
+    metric, SABLE-jd5fj.11): the push-time preview's own completion, which is
+    exactly what makes it blind to a later discarded/rebuilt preview -- see
+    join_push_to_landed for the PRIMARY bar. Callers report coverage
+    (n matched / n total) rather than pretending completeness."""
+    return [run.completed_at - push.confirmed_at
+           for push, run in _match_pushes_to_first_preview(pushes, runs, max_gap_seconds)]
+
+
+def promotion_landed_epochs(promotions: list[PromotionCommit], base_runs: list[BaseRun]) -> dict[str, float]:
+    """The real FAST-FORWARD instant for each promotion, in epoch seconds --
+    the PRIMARY bar's anchor (SABLE-jd5fj.11). NEVER the promotion commit's
+    own author/committer date (SABLE-jxgm4: git commit-tree stamps those at
+    PREVIEW-BUILD time, before the CI wait -- and, for a rebuilt preview,
+    before any further wait too -- the metric exists to measure). Instead:
+    the EARLIEST run `gh run list` records against the base branch for that
+    EXACT landed sha -- a real, independently timestamped observation that
+    the object exists on the base branch, which can only happen at or after
+    the fast-forward that put it there. The same join key
+    count_semantic_breaks already uses for a different purpose (a LATER red
+    run on a landed sha), reused here for its EARLIEST run instead."""
+    epochs: dict[str, float] = {}
+    for run in base_runs:
+        current = epochs.get(run.head_sha)
+        if current is None or run.created_at < current:
+            epochs[run.head_sha] = run.created_at
+    return {p.sha: epochs[p.sha] for p in promotions if p.sha in epochs}
+
+
+@dataclass(frozen=True)
+class LandedRecord:
+    branch: str
+    bead: str | None
+    sha: str
+    push_confirmed_at: float
+    landed_at: float
+    push_to_landed_seconds: float
+    push_to_ci_done_seconds: float | None
+    discarded_preview: bool
+    queue_depth_at_promote: int
+
+
+def compute_landed_metrics(pushes: list[PushEvent], promotions: list[PromotionCommit],
+                           preview_runs: list[PreviewRun], base_runs: list[BaseRun],
+                           max_gap_seconds: float = 120.0) -> list[LandedRecord]:
+    """THE primary-bar computation (SABLE-jd5fj.11): one LandedRecord per
+    promotion that can be matched to both a push (by exact branch name -- the
+    promotion commit subject and the CONFIRMED log line both carry the real
+    branch name, so this join needs no time-proximity heuristic) and an
+    observed fast-forward instant (promotion_landed_epochs).
+
+    `discarded_preview` is True iff the FIRST preview run a push's own
+    CONFIRMED instant matched (the push-time kick) tested a DIFFERENT object
+    than the one that ultimately landed -- exactly the SABLE-kzi1a shape: the
+    push-time preview went green, the base moved before promote, and the
+    queued branch paid for a second, later preview it then waited on.
+    push_to_ci_done_seconds (when available) is that FIRST preview's own
+    latency -- kept alongside push_to_landed_seconds so the report can show,
+    per branch, exactly how much the discarded preview cost.
+
+    `queue_depth_at_promote` counts OTHER promotions in this same result set
+    whose landed_at falls strictly after this branch's push and at or before
+    its own landing -- the number of merges that landed while this branch was
+    waiting, kzi1a's confound made a first-class, per-measurement field."""
+    landed_epochs = promotion_landed_epochs(promotions, base_runs)
+    ci_done_matches = {
+        push.branch: run for push, run in _match_pushes_to_first_preview(pushes, preview_runs, max_gap_seconds)
+    }
+    pushes_by_branch: dict[str, PushEvent] = {}
+    for p in sorted(pushes, key=lambda x: x.confirmed_at):
+        pushes_by_branch[p.branch] = p  # last CONFIRMED push wins if a branch pushed more than once
+
+    staged = []
+    for promo in promotions:
+        if not promo.branch:
+            continue
+        landed_at = landed_epochs.get(promo.sha)
+        push = pushes_by_branch.get(promo.branch)
+        if landed_at is None or push is None:
+            continue
+        ci_run = ci_done_matches.get(promo.branch)
+        push_to_ci_done = (ci_run.completed_at - push.confirmed_at
+                          if ci_run is not None and ci_run.completed_at is not None else None)
+        discarded = bool(ci_run is not None and ci_run.head_sha is not None and ci_run.head_sha != promo.sha)
+        staged.append((promo, push, landed_at, push_to_ci_done, discarded))
+
+    records: list[LandedRecord] = []
+    for idx, (promo, push, landed_at, push_to_ci_done, discarded) in enumerate(staged):
+        depth = sum(
+            1 for j, (_, _, other_landed, _, _) in enumerate(staged)
+            if j != idx and push.confirmed_at < other_landed <= landed_at
+        )
+        records.append(LandedRecord(
+            branch=promo.branch, bead=promo.bead, sha=promo.sha,
+            push_confirmed_at=push.confirmed_at, landed_at=landed_at,
+            push_to_landed_seconds=landed_at - push.confirmed_at,
+            push_to_ci_done_seconds=push_to_ci_done,
+            discarded_preview=discarded,
+            queue_depth_at_promote=depth,
+        ))
+    return records
 
 
 def evaluate_success(current_median: float | None, baseline_median: float | None,
@@ -410,7 +535,7 @@ def collect_base_runs(base_branch: str, since: str | None = None, limit: int = 5
 
 def collect_preview_runs(limit: int = 500, since: str | None = None) -> list[PreviewRun]:
     cp = _gh("run", "list", "--workflow=ci-verify", f"--limit={limit}",
-             "--json=headBranch,createdAt,updatedAt,conclusion,status")
+             "--json=headBranch,headSha,createdAt,updatedAt,conclusion,status")
     if cp.returncode != 0:
         return []
     try:
@@ -422,7 +547,7 @@ def collect_preview_runs(limit: int = 500, since: str | None = None) -> list[Pre
         completed = (_iso_to_epoch(r["updatedAt"])
                     if r.get("status") == "completed" and r.get("updatedAt") else None)
         out.append(PreviewRun(r.get("headBranch", ""), _iso_to_epoch(r["createdAt"]),
-                              completed, r.get("conclusion")))
+                              completed, r.get("conclusion"), r.get("headSha") or None))
     since_epoch = _since_epoch(since)
     if since_epoch is not None:
         out = [r for r in out if r.created_at >= since_epoch]
@@ -500,15 +625,37 @@ def build_report(repo: str, git_base_ref: str, bare_base_branch: str, since: str
     preview_runs = collect_preview_runs(since=since)
     pushes = parse_notify_log(read_notify_log(), _since_epoch(since))
 
+    # SECONDARY (SABLE-jd5fj.11): push -> the push-time preview's own
+    # completion. Kept, explicitly labelled, because it isolates raw CI
+    # duration from queue effects -- but it is blind to any later discarded
+    # or rebuilt preview, which is exactly why it is no longer the bar the
+    # epic is graded on.
     latencies = join_push_to_ci(pushes, preview_runs, max_join_gap_seconds)
     latency = latency_stats(latencies)
     latency["coverage"] = f"{len(latencies)}/{len(pushes)} pushes matched to a completed preview run"
+
+    # PRIMARY (SABLE-jd5fj.11): push -> the FAST-FORWARD instant, anchored on
+    # the sha that actually landed rather than the first preview a push
+    # happened to kick -- so a discarded/rebuilt preview (SABLE-kzi1a) shows
+    # up here even though push-to-CI-done cannot see it.
+    landed_records = compute_landed_metrics(pushes, promotions, preview_runs, base_runs, max_join_gap_seconds)
+    landed_latencies = [r.push_to_landed_seconds for r in landed_records]
+    landed = latency_stats(landed_latencies)
+    landed["coverage"] = f"{len(landed_records)}/{len(pushes)} pushes matched to an observed fast-forward"
+    discarded_preview_count = sum(1 for r in landed_records if r.discarded_preview)
 
     reds = red_rate([r.conclusion for r in preview_runs if r.conclusion])
     semantic = count_semantic_breaks(promotions, base_runs, epochs, window_hours * 3600.0)
 
     disjoint_n = sum(1 for p in promotions if p.disjoint)
-    success = evaluate_success(latency["median"], NUEH3_BASELINE["push_to_ci_done"]["median"],
+    # The success bar is now evaluated against push-to-LANDED. The baseline
+    # column stays push-to-CI-done (nueh3 never measured push-to-landed; the
+    # jxgm4/jd5fj.7 constraint against the COARSE commit-date column still
+    # applies and is unaffected by this change) -- so the comparison is
+    # honestly conservative: push-to-landed is never smaller than push-to-CI-
+    # done, so the reported speedup can only shrink relative to the old bar,
+    # never inflate it.
+    success = evaluate_success(landed["median"], NUEH3_BASELINE["push_to_ci_done"]["median"],
                               reds["rate"], NUEH3_BASELINE["red_rate"]["rate"])
 
     return {
@@ -517,7 +664,20 @@ def build_report(repo: str, git_base_ref: str, bare_base_branch: str, since: str
         "window_hours": window_hours,
         "promotions_total": len(promotions),
         "promotions_disjoint": disjoint_n,
+        "push_to_landed": landed,
         "push_to_ci_done": latency,
+        "discarded_preview_count": discarded_preview_count,
+        "landed_records": [
+            {
+                "branch": r.branch, "bead": r.bead, "sha": r.sha,
+                "push_confirmed_at": r.push_confirmed_at, "landed_at": r.landed_at,
+                "push_to_landed_seconds": r.push_to_landed_seconds,
+                "push_to_ci_done_seconds": r.push_to_ci_done_seconds,
+                "discarded_preview": r.discarded_preview,
+                "queue_depth_at_promote": r.queue_depth_at_promote,
+            }
+            for r in landed_records
+        ],
         "red_rate": reds,
         "semantic_break": semantic,
         "baseline": NUEH3_BASELINE,
@@ -533,10 +693,15 @@ def format_report_text(report: dict) -> str:
         lines.append(f"  window: since {report['since']}")
     lines.append(f"  promotions observed: {report['promotions_total']} "
                  f"({report['promotions_disjoint']} via optimistic disjoint promotion)")
+    landed = report["push_to_landed"]
+    lines.append(f"  push->LANDED latency [PRIMARY, SABLE-jd5fj.11]: n={landed['n']} "
+                 f"median={landed['median']} p90={landed['p90']} ({landed['coverage']})")
+    lines.append(f"    discarded-preview cost: {report['discarded_preview_count']}/{landed['n']} landed "
+                 f"branch(es) paid for a rebuilt preview after their push-time preview was discarded")
     lat = report["push_to_ci_done"]
     base_lat = report["baseline"]["push_to_ci_done"]
-    lines.append(f"  push->CI-done latency: n={lat['n']} median={lat['median']} p90={lat['p90']} "
-                 f"({lat['coverage']})")
+    lines.append(f"  push->CI-done latency [secondary -- push-time preview only, blind to discarded "
+                 f"previews]: n={lat['n']} median={lat['median']} p90={lat['p90']} ({lat['coverage']})")
     lines.append(f"    baseline (nueh3): n={base_lat['n']} median={base_lat['median']} p90={base_lat['p90']}")
     rr = report["red_rate"]
     lines.append(f"  CI red rate: n={rr['n']} red={rr['red']} rate={rr['rate']}")
@@ -549,7 +714,7 @@ def format_report_text(report: dict) -> str:
                  f"{report['baseline']['semantic_break']['breaks']}/{report['baseline']['semantic_break']['n']}")
     lines.append(f"  snapshot backstop (SABLE-jd5fj.5): {report['snapshot_backstop']}")
     sm = report["success_metric"]
-    lines.append(f"  success metric (>=5x median latency, equal-or-lower red rate): "
+    lines.append(f"  success metric (>=5x median PUSH-TO-LANDED latency, equal-or-lower red rate): "
                  f"speedup={sm['speedup']} meets_bar={sm['meets_bar']}"
                  + (f" ({sm.get('reason')})" if sm.get("reason") else ""))
     return "\n".join(lines)
