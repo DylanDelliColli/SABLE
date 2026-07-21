@@ -138,6 +138,25 @@ for seg in segments:
         continue
     head = seg[0]
 
+    # SABLE-x8mx7: a bare inline 'NAME=value ... <cmd>' assignment prefix is the
+    # shell's own env-for-one-command form (the fleet's sandbox-pinning contract
+    # is exactly this shape: 'SABLE_LIB_DIR=/scratch python3 -m pytest ...').
+    # Previously ONLY the explicit 'env VAR=val cmd' wrapper (below) was
+    # unwrapped, so a bare prefix left the head as the VAR=value token, matched
+    # no runner, and silently produced NO evidence -- a scoped test run was
+    # invisible and tdd-gate denied the close. Strip leading NAME=value tokens
+    # here, mirroring the env-branch's assignment regex. Leading assignments are
+    # always at the segment head in real shell grammar, so this runs FIRST --
+    # before the sable-test / env / cd / git unwraps -- and a segment that is
+    # ONLY assignments (no command) correctly falls through to match nothing.
+    while re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', head) and len(seg) > 1:
+        seg = seg[1:]
+        head = seg[0]
+    # An assignment-only segment ('FOO=1' with no command): the shell would set
+    # the var and run nothing, so there is nothing to classify.
+    if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', head):
+        continue
+
     # SABLE-0w0ou: 'sable-test <cmd...>' runs <cmd...> and propagates its
     # exit code -- the REAL command is what must be classified, exactly like
     # npx's subcommand below. Unwrap it FIRST (before cd/git -C/env-strip/
