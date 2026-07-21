@@ -1580,3 +1580,136 @@ def test_configured_fixture_paths_unset_key_stays_silent(tmp_path, capsys):
     _sp.run(["git", "init", "-q", str(tmp_path)], check=True)
     assert ssw.configured_fixture_paths(str(tmp_path)) == []
     assert capsys.readouterr().err == "", "an unset key is not a failure, must not warn"
+
+
+# --- unmerged-blocker advisory (SABLE-d5iku) --------------------------------
+# The check that `bd ready` cannot make: a blocker's STATUS closing releases its
+# dependent, but a BASE-PREMISE bead needs the blocker's CODE on the branch it
+# forks from. These cover the two helpers standing between the governance chain
+# and bin/sable-dep-check. Every case is paired with its complement — a guard
+# that only ever fires has traded a false-go for a false-block.
+
+def _fake_dep_check(tmp_path, stdout="", exit_code=0, sleep=0.0):
+    """A stand-in for bin/sable-dep-check. The CHECKER's own behaviour is
+    covered by bin/test_sable_dep_check.py and, against real git + real bd, by
+    hooks/test/test-dep-merge-state.sh; what is under test here is the wiring
+    around it — resolution, arguments, and the fail-open contract."""
+    script = tmp_path / "sable-dep-check"
+    body = "#!/usr/bin/env bash\n"
+    if sleep:
+        body += f"sleep {sleep}\n"
+    body += f'printf "%s" "$*" > "{tmp_path}/argv"\n'
+    if stdout:
+        body += f"printf '%s\\n' {stdout!r}\n"
+    body += f"exit {exit_code}\n"
+    script.write_text(body)
+    script.chmod(0o755)
+    return script
+
+
+def test_resolve_dep_check_bin_prefers_explicit_override(tmp_path, monkeypatch):
+    script = _fake_dep_check(tmp_path)
+    monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(script))
+    assert ssw.resolve_dep_check_bin() == str(script)
+
+
+def test_resolve_dep_check_bin_override_that_is_not_executable_is_not_used(
+        tmp_path, monkeypatch):
+    """A typo'd override must degrade to None (advisory skipped), never to a
+    path that will fail to exec on every dispatch."""
+    dud = tmp_path / "not-there"
+    monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(dud))
+    assert ssw.resolve_dep_check_bin() is None
+
+
+def test_resolve_dep_check_bin_falls_back_to_path(tmp_path, monkeypatch):
+    _fake_dep_check(tmp_path)
+    monkeypatch.delenv("SABLE_DEP_CHECK_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert ssw.resolve_dep_check_bin() == str(tmp_path / "sable-dep-check")
+
+
+def test_resolve_dep_check_bin_falls_back_to_repo_sibling(monkeypatch):
+    """A dev checkout whose bins are not installed still gets the guard: the
+    sibling of this very program is the last resort."""
+    monkeypatch.delenv("SABLE_DEP_CHECK_BIN", raising=False)
+    monkeypatch.setenv("PATH", "/nonexistent-dir-for-this-test")
+    resolved = ssw.resolve_dep_check_bin()
+    assert resolved is not None
+    assert resolved.endswith("/sable-dep-check")
+
+
+def test_dep_merge_advisory_returns_the_warning_text(tmp_path, monkeypatch):
+    _fake_dep_check(tmp_path, stdout="UNMERGED-BLOCKER WARNING: SABLE-dep", exit_code=3)
+    monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(tmp_path / "sable-dep-check"))
+    out = ssw.dep_merge_advisory(["SABLE-dep"], str(tmp_path))
+    assert out is not None and "UNMERGED-BLOCKER WARNING" in out
+
+
+def test_dep_merge_advisory_silent_when_checker_prints_nothing(tmp_path, monkeypatch):
+    """--format=hook prints NOTHING when clean, so emptiness is the whole
+    decision — a clean dispatch must produce no line at all."""
+    _fake_dep_check(tmp_path, stdout="", exit_code=0)
+    monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(tmp_path / "sable-dep-check"))
+    assert ssw.dep_merge_advisory(["SABLE-dep"], str(tmp_path)) is None
+
+
+def test_dep_merge_advisory_reads_text_not_exit_code(tmp_path, monkeypatch):
+    """Deliberately decoupled: text present with a 0 exit still warns, and a
+    nonzero exit with no text stays silent. The exit code is not the signal, so
+    a future change to it cannot silently invert this."""
+    monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(tmp_path / "sable-dep-check"))
+    _fake_dep_check(tmp_path, stdout="UNMERGED-BLOCKER WARNING: x", exit_code=0)
+    assert ssw.dep_merge_advisory(["SABLE-a"], str(tmp_path)) is not None
+    _fake_dep_check(tmp_path, stdout="", exit_code=3)
+    assert ssw.dep_merge_advisory(["SABLE-a"], str(tmp_path)) is None
+
+
+def test_dep_merge_advisory_passes_hook_format_repo_and_every_bead(tmp_path, monkeypatch):
+    """The bundle siblings travel too: a --bundle sibling can be the
+    base-premise bead just as easily as the lead."""
+    _fake_dep_check(tmp_path, stdout="warn")
+    monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(tmp_path / "sable-dep-check"))
+    ssw.dep_merge_advisory(["SABLE-lead", "SABLE-sib"], "/some/repo")
+    argv = (tmp_path / "argv").read_text()
+    assert "--format=hook" in argv
+    assert "--repo /some/repo" in argv
+    assert "SABLE-lead" in argv and "SABLE-sib" in argv
+
+
+def test_dep_merge_advisory_disabled_by_env(tmp_path, monkeypatch):
+    _fake_dep_check(tmp_path, stdout="UNMERGED-BLOCKER WARNING: x")
+    monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(tmp_path / "sable-dep-check"))
+    monkeypatch.setenv("SABLE_DEP_MERGE_GUARD", "0")
+    assert ssw.dep_merge_advisory(["SABLE-dep"], str(tmp_path)) is None
+    # ...and the complement: the default (unset) is ON. A guard that ships
+    # off-by-default protects nothing.
+    monkeypatch.delenv("SABLE_DEP_MERGE_GUARD")
+    assert ssw.dep_merge_advisory(["SABLE-dep"], str(tmp_path)) is not None
+
+
+def test_dep_merge_advisory_fails_open_when_checker_is_absent(monkeypatch):
+    monkeypatch.setenv("SABLE_DEP_CHECK_BIN", "/nonexistent/sable-dep-check")
+    assert ssw.dep_merge_advisory(["SABLE-dep"], "/tmp") is None
+
+
+def test_dep_merge_advisory_fails_open_on_no_beads(tmp_path, monkeypatch):
+    _fake_dep_check(tmp_path, stdout="warn")
+    monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(tmp_path / "sable-dep-check"))
+    assert ssw.dep_merge_advisory([], str(tmp_path)) is None
+    assert ssw.dep_merge_advisory(["", None], str(tmp_path)) is None
+
+
+def test_dep_merge_advisory_fails_open_on_timeout(tmp_path, monkeypatch):
+    """A slow bd must cost the WARNING, never the dispatch."""
+    _fake_dep_check(tmp_path, stdout="UNMERGED-BLOCKER WARNING: x", sleep=3)
+    monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(tmp_path / "sable-dep-check"))
+    monkeypatch.setenv("SABLE_DEP_CHECK_TIMEOUT", "0.3")
+    assert ssw.dep_merge_advisory(["SABLE-dep"], str(tmp_path)) is None
+
+
+def test_dep_merge_advisory_unparseable_timeout_keeps_the_default(tmp_path, monkeypatch):
+    _fake_dep_check(tmp_path, stdout="warn")
+    monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(tmp_path / "sable-dep-check"))
+    monkeypatch.setenv("SABLE_DEP_CHECK_TIMEOUT", "not-a-number")
+    assert ssw.dep_merge_advisory(["SABLE-dep"], str(tmp_path)) is not None
