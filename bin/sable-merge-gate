@@ -45,6 +45,11 @@ dependency order (a DAG — nothing imports "upward"):
                                verdicts, sweeps orphans. Never promotes.
   sable_gate_promote_lib.py    Consumes a verdict and promotes (or refuses).
                                The only writer to the integration branch.
+  sable_gate_budget_lib.py     Per-tier duration budget breach detection +
+                               idempotent bead filing (SABLE-cmar4.4). Called
+                               by promote, wrapped around the acquire_verdict
+                               call — the one place the gate's own wall-clock
+                               for the merge_preview tier is observable.
   sable_footprint_lib.py       Changed-path footprints and the disjointness
                                test (SABLE-jd5fj.4). Evidence only — it decides
                                nothing about a promotion.
@@ -88,6 +93,19 @@ PATCHING NOTE for tests: the seams live in the module that DEFINES them. Patch
 module-qualified precisely so one patch reaches the whole gate. The private
 seams are deliberately NOT re-exported below, so that a patch aimed at the wrong
 object fails loudly (AttributeError) instead of silently doing nothing.
+
+── PER-TIER DURATION BUDGET (SABLE-cmar4.4) ─────────────────────────────────
+promote measures its own wall-clock spent reading/waiting for the verdict
+(sable_gate_preview_lib.acquire_verdict) and checks it against the
+merge_preview tier's budget declared in .github/ci/test-tiers.sh (the cmar4.1
+SSOT). This is a per-TIER-TOTAL measurement, never per-test (locked,
+split-invariant): splitting a slow suite into faster pieces cannot evade a
+breach, only reducing the tier's real total can. A breach WARNs on stderr and
+auto-files exactly ONE suite-optimization bead via sable_gate_budget_lib,
+idempotent on (tier, budget_sec) — the budget value doubles as its own
+version, so bumping the SSOT's number for a tier is what a "version bump"
+IS, and re-runs against an unedited, still-open breach file nothing new. Never
+blocks or fails a promotion; an unresolvable budget silently skips the check.
 
 ── PARALLEL PREVIEWS ────────────────────────────────────────────────────────
 N previews on N distinct ci-verify/<bead>-<sha7> refs run CONCURRENTLY:

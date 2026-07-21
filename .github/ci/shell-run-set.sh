@@ -102,6 +102,7 @@ ALLOW=(
   test-tdd-evidence.sh
   test-tdd-gate.sh
   test-thesis-docs.sh
+  test-tier-budget-bead.sh
   test-tier-ssot.sh
   test-tier-ssot-consumers.sh
   test-tree-claim.sh
@@ -164,6 +165,7 @@ declare -A COVERS=(
   [test-snapshot-freeze.sh]="bin/sable-snapshot bin/sable_snapshot_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py"
   [test-tdd-evidence.sh]="hooks/tdd-evidence.sh"
   [test-tdd-gate.sh]="hooks/tdd-gate.sh"
+  [test-tier-budget-bead.sh]="bin/sable_gate_budget_lib.py bin/sable_gate_promote_lib.py bin/sable-merge-gate"
   [test-tier-ssot-consumers.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
   [test-tree-claim.sh]="hooks/multi-manager/tree-claim.sh"
 )
