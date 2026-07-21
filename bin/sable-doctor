@@ -121,35 +121,92 @@ def _git_show_bytes(repo_root: Path, sha: str, relpath: str):
     return proc.stdout
 
 
-def _check_snapshot_pin(src: Path, dst: Path) -> str:
-    """Status for a python-sibling-importing bin (SABLE-9boz4). The pin unit
-    here is a whole versioned snapshot directory, not a single file, so this
-    compares the SAME unit the pin uses — the resolved symlink target's bytes
-    against the repo at the sha baked into ITS snapshot dir name — never a
-    plain sha256-vs-current-HEAD compare, which would agree-while-wrong for a
-    deliberately-pinned-to-an-older-sha snapshot (the exact failure class this
-    bead exists to prevent: a drift check narrower than the thing that moved).
+def _git_ls_tree_names(repo_root: Path, sha: str, subdir: str):
+    """Basenames of every file git tracked under <subdir>/ at <sha>, or None
+    if git can't resolve it. Non-recursive (bin/ is flat) — mirrors what
+    sable-bin-install's `cp -a` actually snapshots."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-tree", "--name-only", sha, f"{subdir}/"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, text=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    return {Path(line).name for line in proc.stdout.splitlines() if line.strip()}
+
+
+def _diff_snapshot_dir(repo_root: Path, snapshot_dir: Path, sha: str):
+    """Names of every file that differs between snapshot_dir (a pinned
+    ~/.local/lib/sable-<sha>/, SABLE-9boz4) and the repo's bin/ AT THAT SHA —
+    added (present in the snapshot, absent from the pinned repo state),
+    removed (the pinned repo state had it, the snapshot dropped it — the
+    exact shape a future bin/ module split takes), or content-changed
+    (hand-tampered). Empty set means the snapshot is byte-for-byte, file-for-
+    file identical to bin/ at its own pinned sha. None if git can't resolve
+    the comparison at all (treated as drift by the caller, never 'clean')."""
+    repo_names = _git_ls_tree_names(repo_root, sha, "bin")
+    if repo_names is None:
+        return None
+    try:
+        snapshot_names = {p.name for p in snapshot_dir.iterdir() if p.is_file()}
+    except OSError:
+        return None
+    drifted = snapshot_names ^ repo_names  # gained or lost, relative to the pinned sha
+    for name in snapshot_names & repo_names:
+        pinned_bytes = _git_show_bytes(repo_root, sha, f"bin/{name}")
+        try:
+            current_bytes = (snapshot_dir / name).read_bytes()
+        except OSError:
+            current_bytes = None
+        if pinned_bytes is None or current_bytes != pinned_bytes:
+            drifted.add(name)
+    return drifted
+
+
+def _check_snapshot_pin(src: Path, dst: Path, cache: dict = None):
+    """(status, detail) for a python-sibling-importing bin's snapshot pin
+    (SABLE-9boz4).
+
+    The pin UNIT is the whole versioned snapshot directory — every bin plus
+    every sibling lib, copied together by `sable-bin-install --pin-snapshot`
+    — not the single entry-point file dst happens to resolve to. So this
+    walks every file physically present in that directory (plus every file
+    the repo had under bin/ at the pinned sha, to catch one going missing)
+    and compares each against the repo AT THE SHA BAKED INTO the snapshot's
+    own directory name — never current HEAD (that would call a legitimately
+    older pin "drifted" the moment the repo moves on) and never just the
+    entry point (that would miss a hand-tampered, added, or removed SIBLING
+    file inside the snapshot — a drift check narrower than the thing that
+    moved, which is the exact failure class this bead exists to prevent).
+    `detail` names the drifted file(s) for "snapshot-drift"; None otherwise.
     """
     if not dst.exists():
-        return "missing"
+        return "missing", None
     if not dst.is_symlink():
         # A python-importing bin as a bare regular file has no sibling libs
         # beside it — the exact ImportError hazard this bead exists to
         # prevent (naive copy-pinning severs the import).
-        return "broken-copy-pin"
+        return "broken-copy-pin", None
     target = Path(os.path.realpath(dst))
     if target == src.resolve():
-        return "clean"  # ordinary un-pinned managed symlink into the live repo
+        return "clean", None  # ordinary un-pinned managed symlink into the live repo
+    snapshot_dir = target.parent
     sha = _snapshot_sha_from_target(target)
+    if sha is None:
+        return "drift", None  # unrecognized target — its pinned sha can't be resolved
     repo_root = src.parent.parent
-    pinned_bytes = _git_show_bytes(repo_root, sha, f"bin/{dst.name}") if sha else None
-    if pinned_bytes is None:
-        return "drift"  # unrecognized target, or its pinned sha can't be resolved
-    try:
-        current_bytes = target.read_bytes()
-    except OSError:
-        return "drift"
-    return "clean" if current_bytes == pinned_bytes else "snapshot-drift"
+    cache_key = (str(snapshot_dir), sha)
+    if cache is not None and cache_key in cache:
+        drifted = cache[cache_key]
+    else:
+        drifted = _diff_snapshot_dir(repo_root, snapshot_dir, sha)
+        if cache is not None:
+            cache[cache_key] = drifted
+    if drifted is None:
+        return "drift", None
+    if drifted:
+        return "snapshot-drift", ", ".join(sorted(drifted))
+    return "clean", None
 
 # SABLE-mkj6k INTERIM GUARD — remove this set (and every branch that reads it
 # below, in check_manifest/render_text_report/main's --quiet path) once the
@@ -266,9 +323,11 @@ def _read_pin_marker(bin_dir: Path) -> set:
 def check_manifest(entries):
     results = []
     pin_marker_cache = {}
+    snapshot_cache = {}
     for category, src, dst in entries:
+        detail = None
         if category == "pinned snapshot bins":
-            status = _check_snapshot_pin(src, dst)
+            status, detail = _check_snapshot_pin(src, dst, cache=snapshot_cache)
         elif category in GUARDED_CATEGORIES:
             bin_dir = dst.parent
             if bin_dir not in pin_marker_cache:
@@ -298,6 +357,7 @@ def check_manifest(entries):
             "repo_path": str(src),
             "installed_path": str(dst),
             "status": status,
+            "detail": detail,
         })
     return results
 
@@ -439,6 +499,8 @@ def render_text_report(results):
         label = _STATUS_LABELS.get(r["status"], r["status"].upper())
         print(f"  {label} {r['installed_path']}")
         print(f"          repo: {r['repo_path']}")
+        if r.get("detail"):
+            print(f"          drifted file(s): {r['detail']}")
     guarded_bad = [r for r in bad if r["category"] in GUARDED_CATEGORIES]
     snapshot_bad = [
         r for r in bad

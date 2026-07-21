@@ -638,6 +638,80 @@ def test_check_manifest_snapshot_pin_drift_when_snapshot_hand_tampered(tmp_path)
     results = doctor.check_manifest(entries)
     r = next(x for x in results if x["category"] == "pinned snapshot bins")
     assert r["status"] == "snapshot-drift"
+    assert r["detail"] == "sable-importer"
+
+
+# --- REVISE: doctor must compare the WHOLE snapshot unit, not just the entry
+# point (optimus review, 2026-07-21) -----------------------------------------
+# _check_snapshot_pin used to read ONLY the resolved entry-point file's bytes
+# -- dst.read_bytes() -- and never looked at any other file inside the
+# snapshot directory. So hand-tampering, adding, or removing a SIBLING module
+# (e.g. sable_helper_lib.py, the very file that justifies a directory-shaped
+# pin unit in the first place) reported "clean": a false green in the drift
+# detector whose entire job is to not have one. These pair with the
+# entry-point tamper case above -- an instrument that catches one and not the
+# other is the bug the pair exists to prove is fixed.
+
+def test_check_manifest_snapshot_pin_drift_when_sibling_lib_tampered(tmp_path):
+    # sibling_module_tamper_is_detected (unit-level pair to the integration
+    # test of the same name in hooks/test/test-spine-pinning.sh): tamper
+    # sable_helper_lib.py -- a sibling module, NEVER the entry point
+    # sable-importer -- and assert it is still caught, naming the file.
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    snapshot_dir = pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest)
+    (snapshot_dir / "sable_helper_lib.py").write_text("MARK = 'tampered'\n")
+
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if x["category"] == "pinned snapshot bins")
+    assert r["status"] == "snapshot-drift"
+    assert r["detail"] == "sable_helper_lib.py"
+
+
+def test_check_manifest_snapshot_pin_drift_when_snapshot_gains_a_file(tmp_path):
+    # a file physically present in the snapshot that the pinned sha never
+    # shipped is drift too -- an untracked addition inside the pin unit.
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    snapshot_dir = pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest)
+    (snapshot_dir / "sable_extra_lib.py").write_text("# not part of the pinned sha\n")
+
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if x["category"] == "pinned snapshot bins")
+    assert r["status"] == "snapshot-drift"
+    assert r["detail"] == "sable_extra_lib.py"
+
+
+def test_check_manifest_snapshot_pin_drift_when_snapshot_loses_a_file(tmp_path):
+    # a file the pinned sha shipped with that the snapshot has since lost --
+    # the shape a future bin/ module split takes (SABLE-jd5fj.3): the pin
+    # unit and the implementation unit stop being coextensive, and that must
+    # read as drift, not agreement.
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    snapshot_dir = pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest)
+    (snapshot_dir / "sable_helper_lib.py").unlink()
+
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if x["category"] == "pinned snapshot bins")
+    assert r["status"] == "snapshot-drift"
+    assert r["detail"] == "sable_helper_lib.py"
+
+
+def test_render_text_report_snapshot_drift_names_the_drifted_sibling_file(tmp_path, capsys):
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    snapshot_dir = pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest)
+    (snapshot_dir / "sable_helper_lib.py").write_text("MARK = 'tampered'\n")
+
+    results = doctor.check_manifest(doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest))
+    doctor.render_text_report(results)
+    out = capsys.readouterr().out
+    assert "SNAPSHOT-DRIFT" in out
+    assert "sable_helper_lib.py" in out
 
 
 def test_check_manifest_snapshot_pin_clean_even_when_pinned_sha_predates_head(tmp_path):

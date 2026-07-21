@@ -196,6 +196,48 @@ else
   fail "after --repin, sable-msg's entry is clean" "json=$CLEAN_JSON"
 fi
 
+# ============================================================================
+# sibling_module_tamper_is_detected (SABLE-9boz4 REVISE, optimus review) --
+# _check_snapshot_pin used to read ONLY the resolved entry-point file, never
+# any other file inside the snapshot directory, so hand-tampering a SIBLING
+# module (e.g. sable_pane_lib.py, the very file that justifies a
+# directory-shaped pin unit) reported "clean" -- a false green in the drift
+# detector whose entire job is to not have one. This pairs with (4) above,
+# which tampers the ENTRY POINT: an instrument that catches one and not the
+# other is the bug the pair exists to prove is fixed. Re-pin fresh first,
+# since (5) just rolled the previous pin back to the live repo.
+# ============================================================================
+bash "$INSTALL" --dir "$BIN_DEST" --pin-snapshot sable-msg sable-spawn-worker >/dev/null 2>&1
+SIBLING_RESOLVED="$(readlink -f "$BIN_DEST/sable-msg" 2>/dev/null || true)"
+SIBLING_SNAPSHOT_DIR="$(dirname "$SIBLING_RESOLVED")"
+
+printf '\n# hand-tampered SIBLING module (not the entry point) — SABLE-9boz4 REVISE probe\n' \
+  >> "$SIBLING_SNAPSHOT_DIR/sable_pane_lib.py"
+
+SIBLING_DOCTOR_OUT="$(python3 "$DOCTOR" --repo "$REPO" --claude-dir "$CLAUDE_DEST" --bin-dir "$BIN_DEST" 2>&1)"
+SIBLING_DOCTOR_RC=$?
+
+if [ "$SIBLING_DOCTOR_RC" -ne 0 ]; then
+  pass "sibling_module_tamper_is_detected: sable-doctor exits non-zero when a SIBLING module (not the entry point) is tampered"
+else
+  fail "sibling_module_tamper_is_detected: sable-doctor must exit non-zero" "rc=$SIBLING_DOCTOR_RC out=$SIBLING_DOCTOR_OUT"
+fi
+
+if printf '%s' "$SIBLING_DOCTOR_OUT" | grep -qi "SNAPSHOT-DRIFT"; then
+  pass "sibling_module_tamper_is_detected: sable-doctor reports SNAPSHOT-DRIFT"
+else
+  fail "sibling_module_tamper_is_detected: sable-doctor reports SNAPSHOT-DRIFT" "out=$SIBLING_DOCTOR_OUT"
+fi
+
+if printf '%s' "$SIBLING_DOCTOR_OUT" | grep -q "sable_pane_lib.py"; then
+  pass "sibling_module_tamper_is_detected: sable-doctor NAMES the drifted sibling file (sable_pane_lib.py), not just the entry point"
+else
+  fail "sibling_module_tamper_is_detected: sable-doctor names the drifted sibling file" "out=$SIBLING_DOCTOR_OUT"
+fi
+
+# roll back to the live repo again so cleanup below finds no stray pins
+bash "$INSTALL" --dir "$BIN_DEST" --repin >/dev/null 2>&1
+
 rm -rf "$SCRATCH_HOME"
 
 echo
