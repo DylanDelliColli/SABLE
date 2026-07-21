@@ -615,6 +615,7 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | `session-role-anchor.sh` | SessionStart, PreCompact | Inject role identity from `~/.claude/sable/roles/<name>.md` | Inject context |
 | `tree-claim.sh` | PreToolUse:Bash | Lockfile: one main session per checkout — deny index-mutating git commands when another session holds a fresh claim (TTL 3600s; `SABLE_TREE_CLAIM_OVERRIDE=1` or manual delete to escape) | Hard deny |
 | `read-guard.sh` | PreToolUse:Bash | Deny `bd ready -l for-<foreign>` queries (Lincoln bypassed via `cross_inbox_read: true`) | Hard deny |
+| `notes-clobber-guard.sh` | PreToolUse:Bash | Deny `bd update <id> --notes` when the bead's notes are non-empty — `--notes` REPLACES the field and the loss is silent (SABLE-sm269). Empty notes and `--append-notes` pass silently; an unparseable command or unreadable bead fails OPEN but says so | Hard deny |
 | `pre-dispatch-refresh.sh` | PreToolUse:Agent | Rebase target worktree on `$SABLE_BASE_BRANCH` | Side effect (rebase) |
 | `pre-dispatch-claim.sh` | PreToolUse:Agent | Read bead description, write file claims to bead notes | Side effect (bd update) |
 | `pre-dispatch-overlap.sh` | PreToolUse:Agent | Annotate overlap with other in-progress beads | Inject context |
@@ -624,7 +625,7 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | `pre-push-rebase-test.sh` | PreToolUse:Bash matching `git push` | Force rebase + tests before push | Hard deny |
 | `post-push-merge-notify.sh` | PostToolUse:Bash matching `git push` | File `for-chuck` bead with overlap analysis (Chuck's own pushes are skipped) | Side effect (bd create) |
 
-Every continuous-mode hook (everything except `session-role-anchor.sh` and `read-guard.sh`) hard-exits when `CLAUDE_AGENT_ROLE != "manager"`, so they no-op in Sherlock / Victor / Rudy / Columbo sessions. (The former poll-based `inbox-injection` hooks were deleted with the tmux-only cutover — live messaging is `sable-msg`; the durable `for-X` labels remain the fallback channel.)
+Every continuous-mode hook (everything except `session-role-anchor.sh`, `read-guard.sh`, and `notes-clobber-guard.sh`) hard-exits when `CLAUDE_AGENT_ROLE != "manager"`, so they no-op in Sherlock / Victor / Rudy / Columbo sessions. (The former poll-based `inbox-injection` hooks were deleted with the tmux-only cutover — live messaging is `sable-msg`; the durable `for-X` labels remain the fallback channel.)
 
 **Bead quality hook**: `bead-description-gate.sh` (existing SABLE hook) is now mode-aware. When `CLAUDE_AGENT_NAME` is set or `CLAUDE_AGENT_ROLE=manager` (i.e. a multi-manager session), the hook hard-blocks (denies) `bd create` if the description is missing required content. Outside that context (single-agent SABLE), it nudges via `additionalContext`. Rolling execution depends on bead descriptions reliably naming files; the manager-context hard-block is the structural answer to bead-quality drift.
 
