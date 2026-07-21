@@ -400,6 +400,196 @@ def test_an_unmoved_base_never_touches_the_footprint_machinery(monkeypatch):
         [f"{PREVIEW_SHA}:refs/heads/{BASE}"]
 
 
+# --------------------------------------------------------------------------
+# The WIDENED entry: an ADOPTION MISS reaches the same decision (SABLE-kzi1a)
+# --------------------------------------------------------------------------
+#
+# jd5fj.4 wired the table to ONE caller: the base moved during the gate's own CI
+# wait. Under chuck's SERIAL merge lane that caller is unreachable by
+# construction — chuck is the only writer to the integration branch, so while he
+# is inside a promote nothing can move the base under it. Measured: 157
+# promotions, 0 optimistic, and 0 across a 15-worker burst that queued 11
+# branches. Meanwhile the branches WAITING in that queue are in the identical
+# situation the optimistic path was built for — a green verdict for a preview
+# whose base has since moved — and each was paying a full fresh CI run for it.
+#
+# So the entry widens to that case and the decision does not change: same table,
+# same footprint computation, same mandatory impact tier on the REAL COMBINED
+# TREE. What these cases pin is that the widening reaches the table WITHOUT
+# reaching the promote rows the table refuses, and that the overlapping case
+# still costs exactly what it cost before.
+
+STALE_BASE_SHA = "9" * 40      # the base the queued branch's preview was built on
+FRESH_PREVIEW_SHA = "7" * 40   # what the pre-kzi1a flow would build instead
+STALE_REF = "ci-verify/wk-x-9999999"
+
+
+@pytest.fixture
+def queued(monkeypatch):
+    """promote() for a branch that sat in the serial merge queue: its push-time
+    preview is GREEN but was built on a base a previous merge has since moved
+    past, so adoption MISSES. The base does NOT move during this promote — that
+    is the whole point, and it is why the jd5fj.4 entry cannot fire here."""
+    state = {"pushes": [], "impact_calls": [], "built": [], "notices": [], "evidence": [],
+             "materialized": 0, "deleted": [], "waited": 0}
+
+    def fake_git(repo, *args, check=True):
+        if args and args[0] == "push":
+            state["pushes"].append(list(args))
+        return subprocess.CompletedProcess(args, 0, stdout="")
+
+    def fake_resolve(repo, ref):
+        if not ref.endswith(BASE):
+            return BRANCH_SHA
+        # The current base, steady throughout this promote — nothing else writes
+        # to the integration branch while chuck is inside one, which is exactly
+        # why the jd5fj.4 entry cannot fire — until whatever promote pushes lands.
+        landed = _promoted_to_base(state)
+        return landed[-1].split(":", 1)[0] if landed else NEW_BASE_SHA
+
+    def fake_materialize(*a, **kw):
+        state["materialized"] += 1
+        return (FRESH_PREVIEW_SHA, "ci-verify/wk-x-7777777", False)
+
+    def fake_acquire(*a, **kw):
+        state["waited"] += 1
+        return classify.Verdict("success", "u", FRESH_PREVIEW_SHA,
+                                "ci-verify/wk-x-7777777", source="waited")
+
+    monkeypatch.setattr(git_lib, "_git", fake_git)
+    monkeypatch.setattr(git_lib, "resolve_commit", fake_resolve)
+    monkeypatch.setattr(preview_lib, "find_stale_green_preview",
+                        lambda *a, **kw: preview_lib.StalePreview(
+                            PREVIEW_SHA, STALE_REF, STALE_BASE_SHA, "http://run/9"))
+    monkeypatch.setattr(preview_lib, "materialize_preview", fake_materialize)
+    monkeypatch.setattr(preview_lib, "acquire_verdict", fake_acquire)
+    monkeypatch.setattr(preview_lib, "build_preview",
+                        lambda *a, **kw: state["built"].append(a) or COMBINED_SHA)
+    monkeypatch.setattr(preview_lib, "delete_ci_ref",
+                        lambda repo, remote, ref: state["deleted"].append(ref))
+    monkeypatch.setattr(promote_lib, "cleanup_after_merge", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "_notify",
+                        lambda target, msg: state["notices"].append(msg))
+    monkeypatch.setattr(promote_lib, "_append_evidence",
+                        lambda repo, bead, note: state["evidence"].append(note))
+    state["_monkeypatch"] = monkeypatch
+    return state
+
+
+def test_adoption_miss_reaches_the_disjoint_decision(queued):
+    """THE bead. A green verdict, a preview whose base_sha != the current base,
+    and disjoint footprints must reach the optimistic re-verify — not a blind
+    from-scratch preview and a second full CI run for a merge that already has a
+    green one."""
+    _arm(queued, disjoint=True, impact=promote_lib.IMPACT_GREEN)
+    assert _run() == 0
+
+    assert queued["materialized"] == 0, \
+        "a green push-time preview was discarded and a fresh one built anyway"
+    assert queued["waited"] == 0, "the widened path paid for a second CI run"
+    assert queued["impact_calls"] == [(COMBINED_SHA, ("left.py", "right.py"))], \
+        "the impact tier must re-verify the REAL combined tree, scoped to the union footprint"
+    assert _promoted_to_base(queued) == [f"{COMBINED_SHA}:refs/heads/{BASE}"], \
+        "the object that lands must be the re-verified combined tree, never the stale preview"
+    assert any("OPTIMISTIC DISJOINT PROMOTION" in e for e in queued["evidence"])
+    assert STALE_REF in queued["deleted"], "the consumed ci-verify ref was left behind"
+
+
+def test_the_widened_entry_re_verifies_the_combined_tree_against_the_CURRENT_base(queued):
+    """I2 on the widened path, stated where it can fail: the tree handed to the
+    impact tier is built from the CURRENT base and the branch — not from the base
+    the stale preview was built on, which is what made it stale."""
+    _arm(queued, disjoint=True, impact=promote_lib.IMPACT_GREEN)
+    assert _run() == 0
+    assert queued["built"], "no combined tree was built"
+    built_base, built_branch = queued["built"][0][1], queued["built"][0][2]
+    assert (built_base, built_branch) == (NEW_BASE_SHA, BRANCH_SHA)
+
+
+def test_adoption_miss_with_overlapping_footprints_still_full_re_previews(queued):
+    """THE NEGATIVE DIRECTION, and the reason the widening is allowed at all: a
+    non-disjoint pair reaches the SAME table row it always did (ACTION_REPREVIEW
+    / exit 23), the impact tier never runs, and the promote falls back to the
+    pre-kzi1a flow — build a fresh preview and gate it on a fresh CI run."""
+    assert decide(classify.GREEN, base_moved=True, disjoint=False, impact=None,
+                  preview_sha=PREVIEW_SHA).action == promote_lib.ACTION_REPREVIEW
+    assert decide(classify.GREEN, base_moved=True, disjoint=False, impact=None,
+                  preview_sha=PREVIEW_SHA).exit_code == classify.EXIT_BASE_MOVED
+
+    _arm(queued, disjoint=False, impact=promote_lib.IMPACT_GREEN)
+    assert _run() == 0
+    assert queued["impact_calls"] == [], "an overlapping pair must never reach the tier"
+    assert queued["materialized"] == 1, "the overlapping case must pay the full re-preview"
+    assert _promoted_to_base(queued) == [f"{FRESH_PREVIEW_SHA}:refs/heads/{BASE}"], \
+        "the overlapping case must promote the freshly CI-verified preview, nothing else"
+
+
+def test_adoption_miss_with_an_undetermined_footprint_behaves_exactly_like_overlap(queued):
+    _arm(queued, disjoint=None, impact=promote_lib.IMPACT_GREEN)
+    assert _run() == 0
+    assert queued["impact_calls"] == []
+    assert queued["materialized"] == 1
+    assert _promoted_to_base(queued) == [f"{FRESH_PREVIEW_SHA}:refs/heads/{BASE}"]
+
+
+def test_the_widened_entry_falls_back_when_the_impact_tier_cannot_answer(queued):
+    """An unanswerable tier funds no optimism. Because nothing is in flight yet
+    on this path, the fallback is the ordinary flow rather than exit 23 — exiting
+    would strand the branch, since every retry finds the same stale preview."""
+    _arm(queued, disjoint=True, impact=promote_lib.IMPACT_ERROR)
+    assert _run() == 0
+    assert queued["materialized"] == 1
+    assert _promoted_to_base(queued) == [f"{FRESH_PREVIEW_SHA}:refs/heads/{BASE}"]
+
+
+def test_the_widened_entry_ejects_on_exit_20_when_the_combined_tree_is_red(queued):
+    """Two changes that were each green alone break together. That is a real
+    defect with a named author, so it takes the SAME exit-20 eject a red run
+    takes — it is not a reason to go and buy a second opinion from a full
+    re-preview."""
+    _arm(queued, disjoint=True, impact=promote_lib.IMPACT_RED)
+    assert _run() == classify.EXIT_RED
+    assert _promoted_to_base(queued) == []
+    assert queued["materialized"] == 0
+    assert any("COMBINED TREE" in n for n in queued["notices"])
+
+
+def test_the_kill_switch_closes_the_widened_entry_too(queued, monkeypatch):
+    """SABLE_MG_OPTIMISTIC=0 must restore the pre-jd5fj.4 behaviour EXACTLY, and
+    that now includes never going looking for a stale preview in the first
+    place."""
+    monkeypatch.setenv("SABLE_MG_OPTIMISTIC", "0")
+    _arm(queued, disjoint=True, impact=promote_lib.IMPACT_GREEN)
+    monkeypatch.setattr(preview_lib, "find_stale_green_preview", lambda *a, **kw: pytest.fail(
+        "the kill switch must close the widened entry before any discovery"))
+    assert _run() == 0
+    assert queued["materialized"] == 1
+    assert queued["impact_calls"] == []
+
+
+def test_no_stale_preview_leaves_the_ordinary_flow_untouched(queued, monkeypatch):
+    """Non-vacuity: with nothing queued to find, promote does exactly what it did
+    before this bead — build, gate, promote the CI-verified preview."""
+    monkeypatch.setattr(preview_lib, "find_stale_green_preview", lambda *a, **kw: None)
+    monkeypatch.setattr(footprint_lib, "assess",
+                        lambda *a, **kw: pytest.fail("footprint work with nothing stale to assess"))
+    assert _run() == 0
+    assert queued["materialized"] == 1
+    assert _promoted_to_base(queued) == [f"{FRESH_PREVIEW_SHA}:refs/heads/{BASE}"]
+
+
+def test_a_human_override_does_not_take_the_widened_entry(queued, monkeypatch):
+    """--override is an actions-down bypass that consults no run at all. The
+    widened entry exists to consume a STORED verdict, so the two must not meet:
+    an operator bypassing CI gets the documented bypass, not an optimistic path
+    keyed on a verdict they were overriding."""
+    monkeypatch.setattr(preview_lib, "find_stale_green_preview", lambda *a, **kw: pytest.fail(
+        "an override promote went looking for a stored verdict"))
+    assert promote_lib.promote("SABLE-x", BRANCH, BASE, REPO, REMOTE, MANAGER,
+                               "http://human/approval") == 0
+    assert queued["materialized"] == 1
+
+
 def test_the_module_has_exactly_two_writers_to_the_integration_branch():
     """The bridge between 'the table is safe' and 'no path bypasses the table'.
 

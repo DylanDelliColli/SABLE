@@ -402,6 +402,190 @@ def test_sweep_deletes_only_aged_orphans(tmp_path):
     assert "refs/heads/ci-verify/new-bbbbbbb" in remaining, "fresh ref wrongly swept"
 
 
+# --- SABLE-kzi1a: a SERIAL merge queue must not discard green previews --------
+#
+# The failure this pins is not a bug in a function; it is what the serial merge
+# lane does to the push-time kick. N workers push, N previews are kicked against
+# the base as it is then, N CI runs go green. Chuck promotes them one at a time —
+# and the FIRST merge moves the base, invalidating the other N-1 previews. Before
+# this bead each subsequent promote threw its branch's completed green run away
+# and paid for a fresh one, so the optimization degraded exactly as the queue got
+# deeper. Real git, real refs, real worktrees; only the Actions verdict is
+# injected, and the impact tier is a probe that REFUSES unless both changes are
+# present in its worktree at once — so a green promote is itself proof that the
+# real combined tree was re-verified, not merely claimed to be.
+
+QUEUED_A, QUEUED_B = "wk-a", "wk-b"
+
+
+def _write_impact_probe(tmp_path, marker, required):
+    """An impact tier that proves where it ran: it records its worktree and its
+    contents, and FAILS unless every required path exists there. Only the merged
+    tree has both — neither branch's own tree does, and neither does the base."""
+    probe = tmp_path / "impact-probe.sh"
+    probe.write_text("#!/bin/sh\n"
+                     f"pwd > {marker}\n"
+                     f"ls >> {marker}\n"
+                     + "".join(f"test -f {p} || exit 1\n" for p in required))
+    probe.chmod(probe.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return probe
+
+
+def _setup_queue(tmp_path, *, overlapping=False):
+    """Two workers queued behind one base, plus a post-receive log on the bare
+    origin so every ref push (including a transient ci-verify ref that a later
+    cleanup deletes) is OBSERVABLE after the fact."""
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    _run(["git", "init", "--bare", "-b", BASE, str(origin)])
+    pushlog = tmp_path / "pushlog"
+    hook = origin / "hooks" / "post-receive"
+    hook.write_text("#!/bin/sh\n"
+                    "while read old new ref; do\n"
+                    f'  echo "$new $ref" >> {pushlog}\n'
+                    "done\n")
+    hook.chmod(hook.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    _run(["git", "clone", str(origin), str(work)])
+    (work / "shared.txt").write_text("".join(f"line {i}\n" for i in range(1, 21)))
+    (work / "README.md").write_text("base\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "init")
+    _git(work, "push", "origin", BASE)
+
+    # Disjoint: each worker adds its own file. Overlapping: both edit the SAME
+    # file, far enough apart that the merge is still textually CLEAN — which is
+    # the whole point, since a conflict would be caught by merge-tree and never
+    # reach the disjointness question at all.
+    for branch, own, line in ((QUEUED_A, "a.txt", 1), (QUEUED_B, "b.txt", 17)):
+        _git(work, "checkout", "-q", "-B", branch, BASE)
+        if overlapping:
+            body = (work / "shared.txt").read_text().splitlines()
+            body[line] = f"{branch} touched this"
+            (work / "shared.txt").write_text("\n".join(body) + "\n")
+        else:
+            (work / own).write_text(f"{branch}\n")
+        _git(work, "add", "-A")
+        _git(work, "commit", "-m", f"{branch} change")
+        _git(work, "push", "origin", branch)
+
+    _git(work, "checkout", BASE)
+    _git(work, "fetch", "origin")
+    return origin, work, pushlog
+
+
+def _kick(work, gh_path, branch):
+    return _run([sys.executable, str(BIN), "preview", "--branch", branch, "--base", BASE,
+                 "--repo", str(work), "--remote", "origin"], cwd=str(work), env=_env(gh_path))
+
+
+def _promote_branch(work, gh_path, branch, env=None):
+    return _run([sys.executable, str(BIN), "promote", "--bead", "TEST-1",
+                 "--branch", branch, "--base", BASE, "--repo", str(work),
+                 "--remote", "origin"], cwd=str(work), env=env or _env(gh_path))
+
+
+def _fresh_ci_pushes(pushlog, since):
+    """ci-verify refs CREATED (not deleted) since a mark in the push log. A
+    created ref is a new CI run; the zero-sha lines are the gate cleaning up."""
+    return [ln for ln in pushlog.read_text().splitlines()[since:]
+            if "refs/heads/ci-verify/" in ln and not ln.startswith("0" * 40)]
+
+
+def test_serial_queue_does_not_discard_green_previews(tmp_path):
+    origin, work, pushlog = _setup_queue(tmp_path)
+    gh = _write_fake_gh(tmp_path, origin, "success")
+    marker = tmp_path / "impact-ran"
+    probe = _write_impact_probe(tmp_path, marker, ["a.txt", "b.txt"])
+
+    # Both workers push; both previews are kicked against the SAME base.
+    assert _kick(work, gh, QUEUED_A).returncode == 0
+    assert _kick(work, gh, QUEUED_B).returncode == 0
+    assert len(_ci_verify_refs(origin)) == 2, "both queued previews should be kicked"
+    b_sha = _git(None, "--git-dir=" + str(origin), "rev-parse", f"refs/heads/{QUEUED_B}")
+
+    # The first promote moves the base — and with it invalidates B's preview.
+    assert _promote_branch(work, gh, QUEUED_A).returncode == 0
+    moved_base = _origin_base_sha(origin)
+
+    env = _env(gh)
+    env["SABLE_MG_IMPACT"] = f"bash {probe}"
+    mark = len(pushlog.read_text().splitlines())
+    cp = _promote_branch(work, gh, QUEUED_B, env=env)
+    assert cp.returncode == 0, cp.stdout
+
+    assert _fresh_ci_pushes(pushlog, mark) == [], (
+        "the second promote pushed a NEW ci-verify ref — B's already-green preview was "
+        f"discarded and a second full CI run paid for:\n{cp.stdout}")
+    assert marker.is_file(), "nothing re-verified the combined tree"
+    ran_in = marker.read_text()
+    assert "a.txt" in ran_in and "b.txt" in ran_in, \
+        f"the impact tier did not see the REAL combined tree: {ran_in}"
+
+    landed = _origin_base_sha(origin)
+    parents = _git(None, "--git-dir=" + str(origin), "rev-list", "--parents", "-n", "1",
+                   landed).split()
+    assert parents[1:] == [moved_base, b_sha], \
+        "what landed is not the merge of the CURRENT base and the branch"
+    tree = _git(None, "--git-dir=" + str(origin), "ls-tree", "--name-only", landed)
+    assert "a.txt" in tree and "b.txt" in tree, "the promoted object is not the combined tree"
+
+
+def test_overlapping_footprints_in_the_queue_still_pay_the_full_re_preview(tmp_path):
+    """THE POSITIVE CONTROL, without which the case above proves nothing: the
+    same queue shape with OVERLAPPING footprints must still build a fresh preview
+    and gate it on a fresh CI run. If this promoted the cheap way too, the
+    widening would have swallowed the case disjointness exists to exclude."""
+    origin, work, pushlog = _setup_queue(tmp_path, overlapping=True)
+    gh = _write_fake_gh(tmp_path, origin, "success")
+    marker = tmp_path / "impact-ran"
+    probe = _write_impact_probe(tmp_path, marker, ["a.txt", "b.txt"])
+
+    assert _kick(work, gh, QUEUED_A).returncode == 0
+    assert _kick(work, gh, QUEUED_B).returncode == 0
+    b_sha = _git(None, "--git-dir=" + str(origin), "rev-parse", f"refs/heads/{QUEUED_B}")
+    assert _promote_branch(work, gh, QUEUED_A).returncode == 0
+    moved_base = _origin_base_sha(origin)
+
+    env = _env(gh)
+    env["SABLE_MG_IMPACT"] = f"bash {probe}"
+    mark = len(pushlog.read_text().splitlines())
+    cp = _promote_branch(work, gh, QUEUED_B, env=env)
+    assert cp.returncode == 0, cp.stdout
+
+    assert _fresh_ci_pushes(pushlog, mark), \
+        "an overlapping base-move promoted without a fresh preview + fresh CI run"
+    assert not marker.is_file(), \
+        "the impact tier ran for an overlapping pair — the cheap path must be unreachable there"
+    landed = _origin_base_sha(origin)
+    parents = _git(None, "--git-dir=" + str(origin), "rev-list", "--parents", "-n", "1",
+                   landed).split()
+    assert parents[1:] == [moved_base, b_sha]
+
+
+def test_the_kill_switch_restores_the_discarding_behaviour(tmp_path):
+    """SABLE_MG_OPTIMISTIC=0 must be a true restoration of the pre-optimistic
+    gate, including this widened entry: the queued green preview is discarded and
+    a fresh one built, exactly as before."""
+    origin, work, pushlog = _setup_queue(tmp_path)
+    gh = _write_fake_gh(tmp_path, origin, "success")
+    marker = tmp_path / "impact-ran"
+    probe = _write_impact_probe(tmp_path, marker, ["a.txt", "b.txt"])
+
+    assert _kick(work, gh, QUEUED_A).returncode == 0
+    assert _kick(work, gh, QUEUED_B).returncode == 0
+    assert _promote_branch(work, gh, QUEUED_A).returncode == 0
+
+    env = _env(gh)
+    env["SABLE_MG_IMPACT"] = f"bash {probe}"
+    env["SABLE_MG_OPTIMISTIC"] = "0"
+    mark = len(pushlog.read_text().splitlines())
+    cp = _promote_branch(work, gh, QUEUED_B, env=env)
+    assert cp.returncode == 0, cp.stdout
+    assert _fresh_ci_pushes(pushlog, mark), "the kill switch did not restore the full re-preview"
+    assert not marker.is_file()
+
+
 def _write_fake_gh_status(tmp_path, status):
     """A fake gh whose `run list` reports one run with the given status (and null
     conclusion) for ANY --branch — exercises the sweep in-flight guard (SABLE-sc24)."""
