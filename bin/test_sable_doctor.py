@@ -27,6 +27,21 @@ doctor = importlib.util.module_from_spec(_SPEC)
 _LOADER.exec_module(doctor)
 
 BIN = Path(__file__).resolve().parent / "sable-doctor"
+REAL_BIN_INSTALL = Path(__file__).resolve().parent / "sable-bin-install"
+
+
+def _install_real_classifier(repo: Path):
+    """Copy the REAL sable-bin-install into a synthetic repo/bin fixture so
+    doctor.classify_bin_shape's subprocess call (SABLE-rucuh: doctor now
+    defers to bin-install's own --classify instead of re-implementing the
+    detection) has something authoritative to consult, exactly as it would
+    in the real repo. Without this, every fixture's shape is "undetermined"
+    (no script present), which is a real, distinct code path but not the one
+    most of these tests are about."""
+    dest = repo / "bin" / "sable-bin-install"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(REAL_BIN_INSTALL.read_bytes())
+    dest.chmod(0o755)
 
 
 # --- fixture builder ----------------------------------------------------------
@@ -190,6 +205,7 @@ def make_pinned_repo(tmp_path, *, bin_mutate=None):
     bin_dir = tmp_path / "local-bin"
     (repo / "bin").mkdir(parents=True)
     bin_dir.mkdir()
+    _install_real_classifier(repo)
     for name in doctor.PINNED_BIN_NAMES:
         (repo / "bin" / name).write_text(f"#!/bin/sh\necho {name}\n")
         (bin_dir / name).write_bytes((repo / "bin" / name).read_bytes())
@@ -536,6 +552,7 @@ def make_snapshot_repo(tmp_path):
         "#!/usr/bin/env python3\nfrom sable_helper_lib import MARK\nprint(MARK)\n"
     )
     (bin_dir / "sable-plain").write_text("#!/usr/bin/env bash\necho plain\n")
+    _install_real_classifier(repo)
 
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
@@ -758,6 +775,176 @@ def test_quiet_mode_snapshot_drift_never_recommends_install_sh(tmp_path, capsys)
     captured = capsys.readouterr()
     assert rc == 1
     assert "bash install.sh" not in captured.err
+
+
+# --- shared classifier: a PINNED_BIN_NAMES entry that becomes snapshot-shaped
+# (SABLE-rucuh) ---------------------------------------------------------------
+# sable-merge-gate started life as a plain PINNED_BIN_NAMES entry, then grew
+# repo-local python imports (SABLE-jd5fj.3's module split) and became
+# snapshot-shaped. bin-install's --classify correctly says "snapshot" for it;
+# doctor's OLD "pinned bins" check had no concept of that and called a
+# properly snapshot-pinned instance "unpinned", then recommended a bare `cp`
+# that severs the sibling imports it now needs. These prove: doctor's own
+# classification agrees with bin-install's for both shapes (structurally --
+# it is the same subprocess call, so they cannot re-diverge); a name in
+# PINNED_BIN_NAMES that is snapshot-shaped is routed to -- and ONLY to -- the
+# "pinned snapshot bins" category; a genuinely clean snapshot pin of such a
+# name is never reported "unpinned"; and the remedy for it never reduces to
+# a bare cp, including the render-time defense-in-depth check.
+
+def make_snapshot_shaped_pinned_bin_repo(tmp_path):
+    """repo/bin/<PINNED_BIN_NAMES[0]> reshaped to import a sibling module --
+    modeling sable-merge-gate after SABLE-jd5fj.3 -- plus the real
+    sable-bin-install so classify_bin_shape has something authoritative to
+    ask. The other two PINNED_BIN_NAMES stay plain shell scripts. Returns
+    (repo, bin_dir, target_name)."""
+    target_name = doctor.PINNED_BIN_NAMES[0]
+    repo = tmp_path / "repo"
+    bin_dir = tmp_path / "local-bin"
+    (repo / "bin").mkdir(parents=True)
+    bin_dir.mkdir()
+    _install_real_classifier(repo)
+    (repo / "bin" / "sable_gate_helper_lib.py").write_text("MARK = 'v1'\n")
+    (repo / "bin" / target_name).write_text(
+        "#!/usr/bin/env python3\nfrom sable_gate_helper_lib import MARK\nprint(MARK)\n"
+    )
+    for name in doctor.PINNED_BIN_NAMES:
+        if name != target_name:
+            (repo / "bin" / name).write_text(f"#!/bin/sh\necho {name}\n")
+    return repo, bin_dir, target_name
+
+
+def test_classify_bin_shape_agrees_with_sable_bin_install_for_plain(tmp_path):
+    repo, _bin_dir, target_name = make_snapshot_shaped_pinned_bin_repo(tmp_path)
+    other_name = next(n for n in doctor.PINNED_BIN_NAMES if n != target_name)
+    expected = subprocess.run(
+        ["bash", str(repo / "bin" / "sable-bin-install"), "--classify", other_name],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert expected == "plain"
+    assert doctor.classify_bin_shape(repo, other_name) == expected
+
+
+def test_classify_bin_shape_agrees_with_sable_bin_install_for_snapshot(tmp_path):
+    repo, _bin_dir, target_name = make_snapshot_shaped_pinned_bin_repo(tmp_path)
+    expected = subprocess.run(
+        ["bash", str(repo / "bin" / "sable-bin-install"), "--classify", target_name],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert expected == "snapshot"
+    assert doctor.classify_bin_shape(repo, target_name) == expected
+
+
+def test_classify_bin_shape_returns_none_when_bin_install_is_missing(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "bin").mkdir(parents=True)
+    (repo / "bin" / "sable-plain").write_text("#!/bin/sh\necho hi\n")
+    assert doctor.classify_bin_shape(repo, "sable-plain") is None
+
+
+def test_build_manifest_routes_snapshot_shaped_pinned_bin_name_to_snapshot_category_only(tmp_path):
+    repo, bin_dir, target_name = make_snapshot_shaped_pinned_bin_repo(tmp_path)
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir)
+    pinned_bins_names = {src.name for c, src, _ in entries if c == "pinned bins"}
+    snapshot_bins_names = {src.name for c, src, _ in entries if c == "pinned snapshot bins"}
+    assert target_name not in pinned_bins_names
+    assert target_name in snapshot_bins_names
+    assert pinned_bins_names == set(doctor.PINNED_BIN_NAMES) - {target_name}
+
+
+def test_check_manifest_snapshot_shaped_pinned_bin_never_reported_unpinned_when_genuinely_pinned(tmp_path):
+    # THE regression: reproduces the live incident this bead was filed from
+    # -- a PINNED_BIN_NAMES entry (sable-merge-gate) that became
+    # snapshot-shaped and IS correctly snapshot-pinned must never be reported
+    # "unpinned".
+    repo, bin_dir, target_name = make_snapshot_shaped_pinned_bin_repo(tmp_path)
+
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    sha = subprocess.run(
+        ["git", "rev-parse", "--short=12", "HEAD"], cwd=repo,
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    snapshot_dir = tmp_path / "lib" / f"sable-{sha}"
+    snapshot_dir.mkdir(parents=True)
+    for f in (repo / "bin").iterdir():
+        if f.is_file():
+            (snapshot_dir / f.name).write_bytes(f.read_bytes())
+    (bin_dir / target_name).symlink_to(snapshot_dir / target_name)
+
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if Path(x["repo_path"]).name == target_name)
+    assert r["status"] == "clean"
+    assert r["category"] == "pinned snapshot bins"
+
+
+def test_render_text_report_never_prints_cp_for_a_snapshot_shaped_pinned_bin_name(tmp_path, capsys):
+    # even in a BROKEN state (bare regular-file pin, severing the import),
+    # the report for a snapshot-shaped PINNED_BIN_NAMES name must recommend
+    # --pin-snapshot, never the bare cp that plain-shaped pins get.
+    repo, bin_dir, target_name = make_snapshot_shaped_pinned_bin_repo(tmp_path)
+    (bin_dir / target_name).write_bytes((repo / "bin" / target_name).read_bytes())
+
+    results = doctor.check_manifest(doctor.build_manifest(repo, tmp_path / "claude", bin_dir))
+    doctor.render_text_report(results)
+    out = capsys.readouterr().out
+    assert f"cp {repo / 'bin' / target_name}" not in out
+    assert "--pin-snapshot" in out
+    assert target_name in out
+
+
+# --- _guarded_remedy_lines: shape-aware, defense in depth (SABLE-rucuh) ------
+# These call the remedy renderer directly with a hand-built "pinned bins"
+# result, bypassing build_manifest's routing -- proving the remedy generator
+# ITSELF refuses to guess "plain" for a snapshot-shaped or undetermined name,
+# independent of whether the routing fix above also holds. optimus (dispatch
+# note, 2026-07-21): "for every pin shape the classifier can return, assert
+# doctor's emitted remedy is non-destructive for that shape, and assert an
+# undetermined shape emits no remedy."
+
+def _fake_guarded_result(repo_path, installed_path):
+    return {"category": "pinned bins", "repo_path": str(repo_path),
+            "installed_path": str(installed_path), "status": "unpinned", "detail": None}
+
+
+def test_guarded_remedy_lines_plain_shape_gets_the_cp_remedy(tmp_path):
+    repo, bin_dir, target_name = make_snapshot_shaped_pinned_bin_repo(tmp_path)
+    plain_name = next(n for n in doctor.PINNED_BIN_NAMES if n != target_name)
+    r = _fake_guarded_result(repo / "bin" / plain_name, bin_dir / plain_name)
+    text = "\n".join(doctor._guarded_remedy_lines([r]))
+    assert f"cp {repo / 'bin' / plain_name}" in text
+    assert "--pin-snapshot" not in text
+
+
+def test_guarded_remedy_lines_snapshot_shape_never_prints_a_bare_cp(tmp_path):
+    repo, bin_dir, target_name = make_snapshot_shaped_pinned_bin_repo(tmp_path)
+    r = _fake_guarded_result(repo / "bin" / target_name, bin_dir / target_name)
+    text = "\n".join(doctor._guarded_remedy_lines([r]))
+    destructive_cmd = f"cp {r['repo_path']} {r['installed_path']} && chmod +x {r['installed_path']}"
+    assert destructive_cmd not in text
+    assert f"--pin-snapshot {target_name}" in text
+
+
+def test_guarded_remedy_lines_undetermined_shape_prints_no_remedy(tmp_path):
+    # no sable-bin-install script at all in this repo -> classify_bin_shape
+    # returns None for every name -> "no remedy printed", not a guess.
+    repo = tmp_path / "repo"
+    bin_dir = tmp_path / "local-bin"
+    (repo / "bin").mkdir(parents=True)
+    bin_dir.mkdir()
+    name = doctor.PINNED_BIN_NAMES[0]
+    (repo / "bin" / name).write_text(f"#!/bin/sh\necho {name}\n")
+    r = _fake_guarded_result(repo / "bin" / name, bin_dir / name)
+    text = "\n".join(doctor._guarded_remedy_lines([r]))
+    destructive_cmd = f"cp {r['repo_path']} {r['installed_path']} && chmod +x {r['installed_path']}"
+    assert destructive_cmd not in text
+    assert "--pin-snapshot" not in text
+    assert "could not be determined" in text
 
 
 # --- install provenance (SABLE-78kxu) -------------------------------------
