@@ -146,6 +146,40 @@ def test_no_changes_selects_nothing(fixture_repo):
     assert plan.argv == []
 
 
+def test_missing_plugin_falls_back_to_full_run(fixture_repo):
+    # Real pytest subprocess, no mocking: an unrecognized selector flag
+    # reproduces exactly what a missing/incompatible pytest-testmon or
+    # pytest-impact plugin looks like on an ephemeral CI runner -- a usage
+    # error (exit 4) with empty stdout, indistinguishable from "nothing
+    # impacted" unless the returncode is checked (SABLE-cmar4.3 revise).
+    def broken_collector(repo_root, extra_args):
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "pytest", "bin/", "--collect-only", "-q",
+                "--impact-nonexistent-flag", *extra_args,
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 4, result.stdout + result.stderr
+        return ts.CollectResult(ids=ts.parse_collect_only_nodeids(result.stdout), returncode=result.returncode)
+
+    plan = ts.build_impact_tier_plan(fixture_repo, collector=broken_collector)
+
+    assert plan.mode == "full"
+    assert "exit 4" in plan.reason
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", *plan.argv],
+        cwd=fixture_repo,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout
+
+
 def test_missing_testmondata_falls_back_to_full_run_for_real_repo(fixture_repo):
     ts.testmondata_path(fixture_repo).unlink()
 

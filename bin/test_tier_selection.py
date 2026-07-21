@@ -65,9 +65,9 @@ def test_cache_hit_unions_testmon_and_impact_changed_file_selections(tmp_path):
 
     def fake_collector(repo_root, extra_args):
         if "--testmon" in extra_args:
-            return ["bin/test_mod.py::test_touches_changed_file"]
+            return ts.CollectResult(ids=["bin/test_mod.py::test_touches_changed_file"], returncode=0)
         assert any(a.startswith("--impact") for a in extra_args)
-        return ["bin/test_conftest_dependent.py::test_uses_fixture"]
+        return ts.CollectResult(ids=["bin/test_conftest_dependent.py::test_uses_fixture"], returncode=0)
 
     plan = ts.build_impact_tier_plan(tmp_path, collector=fake_collector)
 
@@ -85,7 +85,7 @@ def test_cache_hit_overlapping_selections_deduplicate(tmp_path):
     ts.testmondata_path(tmp_path).write_text("{}")
 
     def fake_collector(repo_root, extra_args):
-        return ["bin/test_mod.py::test_shared"]
+        return ts.CollectResult(ids=["bin/test_mod.py::test_shared"], returncode=0)
 
     plan = ts.build_impact_tier_plan(tmp_path, collector=fake_collector)
 
@@ -97,7 +97,39 @@ def test_cache_hit_both_selectors_empty_returns_none_mode(tmp_path):
     ts.testmondata_path(tmp_path).write_text("{}")
 
     def empty_collector(repo_root, extra_args):
-        return []
+        return ts.CollectResult(ids=[], returncode=0)
+
+    plan = ts.build_impact_tier_plan(tmp_path, collector=empty_collector)
+
+    assert plan.mode == "none"
+    assert plan.argv == []
+
+
+# --- collector failure must fall back to FULL, never "none" (SABLE-cmar4.3 revise) --
+
+def test_collector_usage_error_falls_back_to_full_run(tmp_path):
+    # A missing/incompatible plugin looks like a pytest usage error (exit 4):
+    # empty stdout, same as a legitimately-empty selection. Must NOT be read
+    # as "nothing impacted" -- that would run zero tests and report success.
+    ts.testmondata_path(tmp_path).write_text("{}")
+
+    def failing_collector(repo_root, extra_args):
+        return ts.CollectResult(ids=[], returncode=4)
+
+    plan = ts.build_impact_tier_plan(tmp_path, collector=failing_collector)
+
+    assert plan.mode == "full"
+    assert plan.argv == ["bin/", "-q", "-p", "no:cacheprovider"]
+    assert "exit 4" in plan.reason
+
+
+def test_collector_exit5_still_means_none(tmp_path):
+    # Regression guard against overcorrecting: pytest's own "no tests
+    # collected" code (5) is a LEGITIMATE empty selection, not a failure.
+    ts.testmondata_path(tmp_path).write_text("{}")
+
+    def empty_collector(repo_root, extra_args):
+        return ts.CollectResult(ids=[], returncode=5)
 
     plan = ts.build_impact_tier_plan(tmp_path, collector=empty_collector)
 
