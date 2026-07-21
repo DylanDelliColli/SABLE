@@ -474,6 +474,191 @@ except Exception:
 fi
 
 # ---------------------------------------------------------------------------
+# SABLE-d5iku — UNMERGED-BLOCKER WARNING path
+# ---------------------------------------------------------------------------
+# `bd ready` releases a dependent when its blocker's STATUS goes closed, but a
+# structurally-sequenced dependent needs the blocker's CODE on the branch it
+# forks from. These cases prove the hook surfaces that gap at dispatch time.
+#
+# The bd side is stubbed (dep graph shape is the input, not the thing under
+# test), but the MERGE STATE is REAL: a real git repo with real refs and a real
+# `git merge-base --is-ancestor`, driven through the real bin/sable-dep-check.
+# Stubbing the ancestry would test nothing — it is the whole question.
+#
+# BOTH DIRECTIONS, deliberately (the bead's own words: "or the check trades a
+# false-go for a false-block"). Four silence cases sit against the one warn
+# case: merged blocker, still-open blocker, pruned branch, non-blocking edge.
+
+DEP_DIR="$FIXTURE_DIR/dep"
+DEP_REPO="$DEP_DIR/repo"
+DEP_STUB="$DEP_DIR/bin"
+mkdir -p "$DEP_REPO" "$DEP_STUB"
+
+git -C "$DEP_REPO" init -q 2>/dev/null
+git -C "$DEP_REPO" config user.email "test@example.invalid"
+git -C "$DEP_REPO" config user.name "SABLE Test"
+git -C "$DEP_REPO" config sable.integrationBranch tmux-only
+echo base > "$DEP_REPO/base.txt"
+git -C "$DEP_REPO" add base.txt
+git -C "$DEP_REPO" commit -qm "base"
+DEP_BASE_SHA=$(git -C "$DEP_REPO" rev-parse HEAD)
+echo blocker > "$DEP_REPO/blocker.txt"
+git -C "$DEP_REPO" add blocker.txt
+git -C "$DEP_REPO" commit -qm "blocker work"
+DEP_TIP_SHA=$(git -C "$DEP_REPO" rev-parse HEAD)
+
+# Remote-tracking refs written directly — the ancestry check reads
+# refs/remotes/origin/*, and a real bare remote adds nothing to what is being
+# proven here.
+set_dep_refs() {
+  git -C "$DEP_REPO" update-ref refs/remotes/origin/tmux-only "$1"
+  if [ -n "${2:-}" ]; then
+    git -C "$DEP_REPO" update-ref refs/remotes/origin/wk-blocker "$2"
+  else
+    git -C "$DEP_REPO" update-ref -d refs/remotes/origin/wk-blocker 2>/dev/null || true
+  fi
+}
+
+# Stub bd: dep graph + blocker bead. DEP_BLOCKER_STATUS / DEP_DEP_TYPE let each
+# case reshape the graph without rewriting the stub.
+cat > "$DEP_STUB/bd" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" = "dep" ] && [ "$2" = "list" ]; then
+  printf '[{"id":"SABLE-blk","dependency_type":"%s","status":"%s"}]\n' \
+    "${DEP_DEP_TYPE:-blocks}" "${DEP_BLOCKER_STATUS:-closed}"
+  exit 0
+fi
+if [ "$1" = "show" ] && [ "$2" = "SABLE-blk" ]; then
+  echo '[{"id":"SABLE-blk","metadata":{"branch":"wk-blocker"},"description":"","notes":"","close_reason":""}]'
+  exit 0
+fi
+if [ "$1" = "show" ]; then
+  echo '[{"id":"SABLE-dep","description":"hooks/foo.sh is the implementation","notes":"","metadata":{}}]'
+  exit 0
+fi
+exit 0
+STUB
+chmod +x "$DEP_STUB/bd"
+
+# make_dispatch_input_cwd <prompt> <cwd> — dispatch payload carrying the repo
+# whose merge state should be judged.
+make_dispatch_input_cwd() {
+  python3 -c "
+import json, sys
+print(json.dumps({
+    'tool_name': 'Agent',
+    'cwd': sys.argv[2],
+    'tool_input': {'prompt': sys.argv[1], 'subagent_type': 'general-purpose'},
+    'hook_event_name': 'PreToolUse'
+}))
+" "$1" "$2"
+}
+
+run_hook_dep() {
+  make_dispatch_input_cwd "SABLE-dep: implement hooks/foo.sh" "$DEP_REPO" | \
+    env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
+        SABLE_AGENTS_YAML="$AGENTS_YAML" \
+        SABLE_MODE_STATE="$EXEC_MODE_FILE" \
+        SABLE_DEP_CHECK_BIN="$REPO/bin/sable-dep-check" \
+        DEP_BLOCKER_STATUS="${1:-closed}" \
+        DEP_DEP_TYPE="${2:-blocks}" \
+        PATH="$DEP_STUB:$PATH" \
+        bash "$HOOK" 2>/dev/null
+}
+
+# --- d5iku-1: closed blocker, branch NOT an ancestor → hook WARNS -----------
+set_dep_refs "$DEP_BASE_SHA" "$DEP_TIP_SHA"
+DEP_OUT=$(run_hook_dep closed blocks)
+if echo "$DEP_OUT" | grep -q 'UNMERGED-BLOCKER WARNING' \
+   && echo "$DEP_OUT" | grep -q 'wk-blocker' \
+   && echo "$DEP_OUT" | grep -q 'additionalContext'; then
+  pass "SABLE-d5iku: closed blocker with UNMERGED branch → additionalContext warning naming the branch"
+else
+  fail "SABLE-d5iku: closed blocker with UNMERGED branch → additionalContext warning naming the branch" \
+       "hook output: ${DEP_OUT:-<empty>}"
+fi
+
+# --- d5iku-2: same graph, branch MERGED → release is clean, NO warning ------
+set_dep_refs "$DEP_TIP_SHA" "$DEP_TIP_SHA"
+DEP_OUT=$(run_hook_dep closed blocks)
+if [ -z "$DEP_OUT" ]; then
+  pass "SABLE-d5iku: closed blocker whose branch IS merged → no warning (clean release)"
+else
+  fail "SABLE-d5iku: closed blocker whose branch IS merged → no warning (clean release)" \
+       "expected silence, got: $DEP_OUT"
+fi
+
+# --- d5iku-3: blocker still OPEN → nothing released yet, NO warning ---------
+set_dep_refs "$DEP_BASE_SHA" "$DEP_TIP_SHA"
+DEP_OUT=$(run_hook_dep open blocks)
+if [ -z "$DEP_OUT" ]; then
+  pass "SABLE-d5iku: OPEN blocker (dependency still holding) → no warning"
+else
+  fail "SABLE-d5iku: OPEN blocker (dependency still holding) → no warning" \
+       "expected silence, got: $DEP_OUT"
+fi
+
+# --- d5iku-4: closed blocker, branch PRUNED from origin → NO warning --------
+# Worker branches are deleted once merged, so an absent ref is the normal
+# post-merge state; warning on it would fire on nearly every closed blocker.
+set_dep_refs "$DEP_BASE_SHA" ""
+DEP_OUT=$(run_hook_dep closed blocks)
+if [ -z "$DEP_OUT" ]; then
+  pass "SABLE-d5iku: closed blocker whose branch is pruned from origin → no warning"
+else
+  fail "SABLE-d5iku: closed blocker whose branch is pruned from origin → no warning" \
+       "expected silence, got: $DEP_OUT"
+fi
+
+# --- d5iku-5: closed RELATES-TO partner, unmerged branch → NO warning -------
+# A non-blocking edge never gated readiness, so it cannot falsely release.
+set_dep_refs "$DEP_BASE_SHA" "$DEP_TIP_SHA"
+DEP_OUT=$(run_hook_dep closed relates-to)
+if [ -z "$DEP_OUT" ]; then
+  pass "SABLE-d5iku: closed relates-to partner with unmerged branch → no warning (non-blocking edge)"
+else
+  fail "SABLE-d5iku: closed relates-to partner with unmerged branch → no warning (non-blocking edge)" \
+       "expected silence, got: $DEP_OUT"
+fi
+
+# --- d5iku-6: SABLE_DEP_MERGE_GUARD=0 disables the warning ------------------
+set_dep_refs "$DEP_BASE_SHA" "$DEP_TIP_SHA"
+DEP_OUT=$(make_dispatch_input_cwd "SABLE-dep: implement hooks/foo.sh" "$DEP_REPO" | \
+  env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
+      SABLE_AGENTS_YAML="$AGENTS_YAML" \
+      SABLE_MODE_STATE="$EXEC_MODE_FILE" \
+      SABLE_DEP_CHECK_BIN="$REPO/bin/sable-dep-check" \
+      SABLE_DEP_MERGE_GUARD=0 \
+      PATH="$DEP_STUB:$PATH" \
+      bash "$HOOK" 2>/dev/null)
+if [ -z "$DEP_OUT" ]; then
+  pass "SABLE-d5iku: SABLE_DEP_MERGE_GUARD=0 suppresses the warning"
+else
+  fail "SABLE-d5iku: SABLE_DEP_MERGE_GUARD=0 suppresses the warning" \
+       "expected silence, got: $DEP_OUT"
+fi
+
+# --- d5iku-7: checker absent → dispatch is unaffected (failsafe) ------------
+# The warning is advisory; a missing tool must cost the warning, never the
+# dispatch. Points SABLE_DEP_CHECK_BIN at a nonexistent path AND keeps
+# sable-dep-check off PATH.
+set_dep_refs "$DEP_BASE_SHA" "$DEP_TIP_SHA"
+DEP_RC=0
+DEP_OUT=$(make_dispatch_input_cwd "SABLE-dep: implement hooks/foo.sh" "$DEP_REPO" | \
+  env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
+      SABLE_AGENTS_YAML="$AGENTS_YAML" \
+      SABLE_MODE_STATE="$EXEC_MODE_FILE" \
+      SABLE_DEP_CHECK_BIN="$DEP_DIR/does-not-exist" \
+      PATH="$DEP_STUB:/usr/bin:/bin" \
+      bash "$HOOK" 2>/dev/null) || DEP_RC=$?
+if [ "$DEP_RC" -eq 0 ] && [ -z "$DEP_OUT" ]; then
+  pass "SABLE-d5iku: checker absent → hook still exits 0 with no output (dispatch unaffected)"
+else
+  fail "SABLE-d5iku: checker absent → hook still exits 0 with no output (dispatch unaffected)" \
+       "rc=$DEP_RC output: ${DEP_OUT:-<empty>}"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
