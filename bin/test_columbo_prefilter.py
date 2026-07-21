@@ -994,6 +994,167 @@ def test_h1_ts_regex_in_ballpark():
         )
 
 
+# ---------------------------------------------------------------------------
+# SABLE-5lli.3 — Heuristic 7 (vacuous-guard: create-then-assert-exists)
+# ---------------------------------------------------------------------------
+
+
+def test_h7_fires_on_create_then_assert_exists_py():
+    """Python test writes a file directly, then asserts raw existence, with
+    no local import at all -- textbook tautology (assertion cannot fail)."""
+    h7 = _h("vacuous-guard")
+    assert_true("h7 registered", h7 is not None)
+    if h7 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "config_test.py"
+        test.write_text(
+            "def test_creates_config():\n"
+            "    path = Path('config.json')\n"
+            "    path.write_text('{}')\n"
+            "    assert path.exists()\n"
+        )
+        result = h7["fire"](test, None)
+        assert_true(
+            "h7: create-then-assert-exists fires",
+            bool(result),
+            f"got: {result!r}",
+        )
+        assert_in("h7: detail names the shape", "create-then-assert-exists", str(result))
+
+
+def test_h7_does_not_fire_on_shared_helper_guard_py():
+    """Python test calls an imported LOCAL function (the code under test)
+    between the setup and the exists() assertion -- the assertion's truth
+    depends on that call actually running, so it is not vacuous."""
+    h7 = _h("vacuous-guard")
+    if h7 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        source = tmp / "install.py"
+        test = tmp / "install_test.py"
+        source.write_text("def install(dest):\n    dest.write_text('{}')\n")
+        test.write_text(
+            "from .install import install\n\n"
+            "def test_install_creates_file():\n"
+            "    dest = Path('config.json')\n"
+            "    dest.touch()\n"
+            "    install(dest)\n"
+            "    assert dest.exists()\n"
+        )
+        assert_eq(
+            "h7: shared-helper guard (calls local install() before assert) does not fire",
+            bool(h7["fire"](test, source)),
+            False,
+        )
+
+
+def test_h7_does_not_fire_without_create_statement():
+    """Assertion on existence with no preceding write/touch in the test at
+    all (e.g. checking a fixture file laid down by a different mechanism)
+    -- nothing to flag, since there's no local tautology to catch."""
+    h7 = _h("vacuous-guard")
+    if h7 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "fixture_test.py"
+        test.write_text(
+            "def test_fixture_present():\n"
+            "    assert Path('fixture.json').exists()\n"
+        )
+        assert_eq("h7: no create statement, no fire", bool(h7["fire"](test, None)), False)
+
+
+def test_h7_fires_on_create_then_assert_exists_ts():
+    """TS test writes a file via writeFileSync then asserts existsSync,
+    no local import -- same tautology shape in the TS surface."""
+    h7 = _h("vacuous-guard")
+    if h7 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        test = tmp / "config.test.ts"
+        test.write_text(
+            "it('writes config', () => {\n"
+            "  fs.writeFileSync('config.json', '{}');\n"
+            "  expect(fs.existsSync('config.json')).toBe(true);\n"
+            "});\n"
+        )
+        result = h7["fire"](test, None)
+        assert_true("h7: TS create-then-assert-exists fires", bool(result), f"got: {result!r}")
+
+
+def test_h7_does_not_fire_on_shared_helper_guard_ts():
+    """TS test calls an imported local function before the existsSync
+    assertion -- guarded via a real call into the code under test."""
+    h7 = _h("vacuous-guard")
+    if h7 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        source = tmp / "install.ts"
+        test = tmp / "install.test.ts"
+        source.write_text("export function install(dest) { fs.writeFileSync(dest, '{}'); }\n")
+        test.write_text(
+            "import { install } from './install';\n\n"
+            "it('installs config', () => {\n"
+            "  install('config.json');\n"
+            "  expect(fs.existsSync('config.json')).toBe(true);\n"
+            "});\n"
+        )
+        assert_eq(
+            "h7: TS shared-helper guard does not fire",
+            bool(h7["fire"](test, source)),
+            False,
+        )
+
+
+def test_h7_bite_proof_neutering_symbol_detection_turns_guard_red():
+    """Mutation test (SABLE-f00o corrected invariant): monkeypatch the
+    intervening-call lookup to always report no local imports, simulating
+    a neutered/hardcoded detector. The shared-helper guard fixture -- which
+    must NOT fire under real detection -- must start firing once neutered.
+    Proves the spared case is decided by the real intervening-call check,
+    not a lucky pattern miss; else h7 would itself be a vacuous guard."""
+    h7 = _h("vacuous-guard")
+    if h7 is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        source = tmp / "install.py"
+        test = tmp / "install_test.py"
+        source.write_text("def install(dest):\n    dest.write_text('{}')\n")
+        test.write_text(
+            "from .install import install\n\n"
+            "def test_install_creates_file():\n"
+            "    dest = Path('config.json')\n"
+            "    dest.touch()\n"
+            "    install(dest)\n"
+            "    assert dest.exists()\n"
+        )
+        assert_eq(
+            "h7 bite-proof: real detection spares the guard (precondition)",
+            bool(h7["fire"](test, source)),
+            False,
+        )
+
+        original = cp._h7_imported_local_symbols
+        cp._h7_imported_local_symbols = lambda *a, **k: set()
+        try:
+            mutated = bool(h7["fire"](test, source))
+        finally:
+            cp._h7_imported_local_symbols = original
+
+        assert_true(
+            "h7 bite-proof: neutering the intervening-call check flips the guard to fire (must go RED)",
+            mutated is True,
+            f"expected neutered detector to fire (mutated={mutated}) — else h7 IS the vacuous guard it hunts",
+        )
+
+
 # ---- Epic integration: full prefilter against synthesized fixtures ----
 
 
@@ -1215,6 +1376,13 @@ TESTS = [
     test_epic_full_prefilter_surfaces_correctly,
     test_epic_threshold_filtering_via_cli,
     test_epic_json_output_well_formed,
+    # SABLE-5lli.3 — heuristic 7 (vacuous-guard: create-then-assert-exists)
+    test_h7_fires_on_create_then_assert_exists_py,
+    test_h7_does_not_fire_on_shared_helper_guard_py,
+    test_h7_does_not_fire_without_create_statement,
+    test_h7_fires_on_create_then_assert_exists_ts,
+    test_h7_does_not_fire_on_shared_helper_guard_ts,
+    test_h7_bite_proof_neutering_symbol_detection_turns_guard_red,
 ]
 
 

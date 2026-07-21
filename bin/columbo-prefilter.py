@@ -831,6 +831,107 @@ HEURISTICS.append({"name": "assertion-density", "score": 6, "fire": _h1_fire})
 
 
 # ---------------------------------------------------------------------------
+# Heuristic 7 — vacuous guard: create-then-assert-exists (score 8)
+# ---------------------------------------------------------------------------
+#
+# SABLE-5lli.3 (S1 STRUCTURE / f00o): fires when a test writes/touches a
+# file or directory and then asserts its existence with a RAW filesystem
+# primitive (.exists(), os.path.exists(), fs.existsSync(), ...) and NO
+# intervening call to a symbol the test imports from a local (relative)
+# module. Without such a call, the assertion can only ever confirm the
+# test's OWN write landed on disk -- it structurally cannot fail from a
+# bug in the code under test, because the code under test was never
+# invoked between create and assert.
+#
+# Corrected invariant (SABLE-f00o): "a guard must invoke the SAME code
+# path as the assertion it guards." A test that instead routes its
+# existence-producing step through an imported local function (e.g.
+# `install(dest); assert dest.exists()`) is spared -- that call IS the
+# intervening code-under-test invocation, so neutering `install` would
+# turn the assertion red, same as the real bug the heuristic hunts for.
+# Mirrors the shared-predicate pattern already fixed for bash guards in
+# hooks/test/test-orchestration-install.sh (home_has_timer_unit).
+#
+# Language coverage: .py/.ts/.tsx/.js/.jsx (regex-approximate, like
+# heuristics 1/3/5 -- no AST for TS). Reuses heuristic 6's import parsers
+# to find the test's local (relative-import) symbols.
+
+_PY_CREATE_STATE = re.compile(
+    r"\.touch\(\)"
+    r"|\.write_text\("
+    r"|\.write_bytes\("
+    r"|open\([^)]*['\"]w"
+    r"|os\.makedirs\("
+    r"|\.mkdir\("
+)
+_PY_ASSERT_EXISTS = re.compile(
+    r"assert\s.*\.exists\(\)"
+    r"|assert\s.*os\.path\.exists\("
+    r"|assert\s.*\.is_file\(\)"
+    r"|assert\s.*os\.path\.isfile\("
+)
+
+_TS_CREATE_STATE = re.compile(
+    r"writeFileSync\("
+    r"|mkdirSync\("
+    r"|fs\.writeFile\("
+    r"|fs\.mkdir\("
+)
+_TS_ASSERT_EXISTS = re.compile(
+    r"existsSync\("
+)
+
+
+def _h7_imported_local_symbols(test_path: Path, lang: str) -> set:
+    """Symbol names the test imports from a LOCAL (relative) module --
+    external/library imports (e.g. 'react', 'pytest') can't be "the code
+    under test" so they're excluded, matching heuristic 6's convention."""
+    text = _read(test_path)
+    if lang == "ts":
+        imports = _parse_imports_ts(text)
+    else:
+        imports = _parse_imports_py(text)
+    symbols: set = set()
+    for names, module in imports:
+        if not module.startswith("."):
+            continue
+        for n in names:
+            if n != "__default__":
+                symbols.add(n)
+    return symbols
+
+
+def _h7_fire(test_path: Path, source_path: Optional[Path]):
+    lang = _lang(test_path)
+    if lang not in ("ts", "py"):
+        return False
+    text = _read(test_path)
+    lines = text.splitlines()
+    if lang == "py":
+        create_re, assert_re = _PY_CREATE_STATE, _PY_ASSERT_EXISTS
+    else:
+        create_re, assert_re = _TS_CREATE_STATE, _TS_ASSERT_EXISTS
+
+    assert_idxs = [i for i, ln in enumerate(lines) if assert_re.search(ln)]
+    if not assert_idxs:
+        return False
+
+    local_symbols = _h7_imported_local_symbols(test_path, lang)
+    call_res = [re.compile(rf"\b{re.escape(s)}\s*\(") for s in local_symbols]
+
+    for a_idx in assert_idxs:
+        preceding = "\n".join(lines[:a_idx])
+        if any(p.search(preceding) for p in call_res):
+            continue  # guarded: an intervening call into the code under test
+        if create_re.search(preceding):
+            return "create-then-assert-exists"
+    return False
+
+
+HEURISTICS.append({"name": "vacuous-guard", "score": 8, "fire": _h7_fire})
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
