@@ -137,6 +137,107 @@ def test_first_status_from_search_json():
 
 
 # ===========================================================================
+# find_work_bead_status — SABLE-i5739: structured `branch` metadata is the
+# PRIMARY resolver; embedded-id `bd show` and prose `bd search` are fallbacks
+# only, and metadata (once present) always wins over both — this is what
+# closes modes (a) silent-failure, (b) wrong-success, and (c) drift.
+# ===========================================================================
+
+def _fake_bd_i5739(monkeypatch, *, metadata_status=None, metadata_rc=0,
+                    show_status=None, search_status=None):
+    """bd list --metadata-field branch=... -> metadata_status (miss when
+    None); bd show -> show_status; bd search -> search_status. metadata_rc
+    lets a test simulate the metadata QUERY ITSELF failing (nonzero exit),
+    distinct from a clean empty-list miss."""
+    def fake_bd(repo, *args, check=False):
+        head = args[0] if args else ""
+        if head == "list":
+            if metadata_rc != 0:
+                return _cp(args, metadata_rc, "boom")
+            payload = [] if metadata_status is None else [{"id": "META", "status": metadata_status}]
+            return _cp(args, 0, json.dumps(payload))
+        if head == "show":
+            if show_status is None:
+                return _cp(args, 1, "not found")
+            return _cp(args, 0, json.dumps([{"id": "X", "status": show_status}]))
+        if head == "search":
+            payload = [] if search_status is None else [{"id": "X", "status": search_status}]
+            return _cp(args, 0, json.dumps(payload))
+        return _cp(args, 0, "")
+    monkeypatch.setattr(smrh, "_bd", fake_bd)
+
+
+def test_i5739_a_structured_metadata_resolves(monkeypatch):
+    # (a) a branch with a structured bead reference (metadata) resolves
+    _fake_bd_i5739(monkeypatch, metadata_status="closed")
+    assert smrh.find_work_bead_status("/repo", "wk-anything") == "closed"
+
+
+def test_i5739_b_resolves_via_metadata_when_bead_text_never_mentions_it(monkeypatch):
+    # (b) prose search would find NOTHING (search_status=None, mode a in the
+    # OLD resolver) but the structured field still resolves it — this is
+    # exactly the case that "currently returns None" before the fix.
+    _fake_bd_i5739(monkeypatch, metadata_status="in_progress", search_status=None)
+    assert smrh.find_work_bead_status("/repo", "wk-anything") == "in_progress"
+
+
+def test_i5739_c_metadata_wins_over_unrelated_bead_prose_hit(monkeypatch):
+    # (c) an UNRELATED bead's text happens to mention the branch (the OLD
+    # resolver would latch onto it via bd search and return its status,
+    # "open" here) — the structured field resolves the REAL bead ("closed")
+    # first, so the unrelated hit is never even considered.
+    _fake_bd_i5739(monkeypatch, metadata_status="closed", search_status="open")
+    assert smrh.find_work_bead_status("/repo", "wk-anything") == "closed"
+
+
+def test_i5739_d_resolution_stable_as_unrelated_beads_accumulate(monkeypatch):
+    # (d) resolve once with no unrelated mentions on record, then again after
+    # an unrelated bead mentioning the branch appears (search_status flips
+    # from a miss to a hit) — the metadata-backed answer must not move.
+    _fake_bd_i5739(monkeypatch, metadata_status="closed", search_status=None)
+    first = smrh.find_work_bead_status("/repo", "wk-anything")
+    _fake_bd_i5739(monkeypatch, metadata_status="closed", search_status="open")
+    second = smrh.find_work_bead_status("/repo", "wk-anything")
+    assert first == second == "closed"
+
+
+def test_i5739_legacy_fallback_to_embedded_id_when_no_metadata(monkeypatch):
+    # no bead carries the metadata field (a branch dispatched before this
+    # field existed) -> falls back to the embedded-id `bd show` path, unchanged.
+    _fake_bd_i5739(monkeypatch, metadata_status=None, show_status="closed")
+    assert smrh.find_work_bead_status("/repo", "wk-SABLE-jfg6.3") == "closed"
+
+
+def test_i5739_legacy_fallback_to_prose_search_when_nothing_else_resolves(monkeypatch):
+    # no metadata, no embedded id -> legacy prose search, exactly the
+    # pre-existing (prose-fragile) behavior, kept ONLY for already-pushed
+    # pre-fix branches.
+    _fake_bd_i5739(monkeypatch, metadata_status=None, search_status="closed")
+    assert smrh.find_work_bead_status("/repo", "wk-anything") == "closed"
+
+
+def test_i5739_metadata_query_failure_warns_and_falls_back(monkeypatch, capsys):
+    # a failed metadata QUERY (nonzero bd exit) must be a LOUD, distinguishable
+    # WARNING — never silently folded into "no bead" (dispatch note #8) — and
+    # must still fall back to the legacy paths rather than give up.
+    _fake_bd_i5739(monkeypatch, metadata_rc=1, search_status="closed")
+    status = smrh.find_work_bead_status("/repo", "wk-anything")
+    assert status == "closed"
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "wk-anything" in err
+
+
+def test_i5739_e_preview_kick_eligible_unaffected(monkeypatch):
+    # (e) preview_kick_eligible takes no bd/bead argument at all — it is
+    # STRUCTURALLY independent of find_work_bead_status and every change
+    # above; pin its existing behavior unchanged as the explicit acceptance
+    # check for AC5 (preview-kick must never couple to this predicate).
+    assert smrh.preview_kick_eligible(1, 601.0, 10.0) == (True, "eligible-for-preview-kick")
+    assert smrh.preview_kick_eligible(0, 601.0, 10.0) == (
+        False, "merged-or-unresolvable(is-ancestor rc=0)")
+
+
+# ===========================================================================
 # classify_branch — the four-part predicate through injected _git / _bd
 # ===========================================================================
 

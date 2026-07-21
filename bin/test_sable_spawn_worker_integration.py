@@ -648,6 +648,17 @@ elif args[:1] == ["update"] and "--status" in args:
             b["status"] = new_status
     save(data)
     print("updated")
+elif args[:1] == ["update"] and "--set-metadata" in args:
+    bid = args[1]
+    idx = args.index("--set-metadata")
+    kv = args[idx + 1] if idx + 1 < len(args) else ""
+    key, _, val = kv.partition("=")
+    data = load()
+    for b in data:
+        if b.get("id") == bid:
+            b.setdefault("metadata", {{}})[key] = val
+    save(data)
+    print("updated")
 elif args[:1] == ["list"]:
     data = load()
     if "--status=in_progress" in args:
@@ -1416,6 +1427,96 @@ def test_spawn_stamps_owning_lane_on_worker_pane(sock):
         assert any(
             line == "worker optimus" for line in lane_tags.splitlines()
         ), lane_tags
+
+
+# --- SABLE-i5739: dispatch-time branch metadata --------------------------
+
+def test_dispatch_tags_bead_with_branch_metadata(sock):
+    """SABLE-i5739: a real (governance-ON, no --skip-governance) dispatch must
+    write `branch=<worktree-name>` as STRUCTURED metadata on the dispatched
+    bead — this is what lets bin/sable-reconcile-handoffs resolve branch->bead
+    without a prose search. Uses the fake-bd stub (not the real project DB)
+    so this stays a hermetic, throwaway-bead test; end-to-end wiring is what's
+    under test here, not bd's own --set-metadata storage."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-meta-1"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "open", "assignee": None}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+
+        env = {
+            **_clean_env(),
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "SABLE_MAX_LOAD_PER_CORE": "0",
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+        env.pop("CLAUDE_AGENT_NAME", None)
+
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        time.sleep(0.3)
+
+        show = subprocess.run(["bd", "show", bead_id, "--json"], env=env,
+                              capture_output=True, text=True)
+        beads = json.loads(show.stdout)
+        assert beads[0].get("metadata", {}).get("branch") == Path(wt).name, beads
+
+
+def test_skip_governance_dispatch_does_not_write_branch_metadata(sock):
+    """The counterpart: a --skip-governance stand-in dispatch against a bead
+    this caller does not own writing to must NOT write branch metadata,
+    exactly as it must not claim or flip status (existing invariant this
+    module's other --skip-governance tests already rely on)."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-meta-2"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "open", "assignee": None}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+
+        env = {
+            **_clean_env(),
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "SABLE_MAX_LOAD_PER_CORE": "0",
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt,
+             "--model", "haiku", "--skip-governance"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        time.sleep(0.3)
+
+        show = subprocess.run(["bd", "show", bead_id, "--json"], env=env,
+                              capture_output=True, text=True)
+        beads = json.loads(show.stdout)
+        assert "metadata" not in beads[0] or "branch" not in beads[0].get("metadata", {}), beads
 
 
 if __name__ == "__main__":
