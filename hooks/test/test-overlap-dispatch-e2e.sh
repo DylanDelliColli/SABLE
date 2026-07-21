@@ -149,6 +149,32 @@ else
        "B.serialize_with='$SERIALIZE_B' A.serialize_with='$SERIALIZE_A'"
 fi
 
+# --- Case 3 (SABLE-86bsl): grant survives an unrelated notes rewrite ------
+# The grant above already landed in BOTH beads' serialize_with METADATA (Case
+# 2/verified above). Now perform a routine, UNRELATED notes write on B (the
+# SABLE-sm269-class clobber: bd update --notes REPLACES the whole notes field)
+# and re-dispatch B with NO Serialize-with line in the prompt at all. The
+# earlier grant must still be honored from metadata alone, and the metadata
+# must still agree on both sides afterward.
+bd update "$BEAD_B" --sandbox --notes "unrelated bookkeeping update, nothing to do with serialization" >/dev/null 2>&1
+
+OUT=$(run_hook "Work $BEAD_B")
+if printf '%s' "$OUT" | grep -q 'SERIALIZE-WITH ACCEPTED' && ! printf '%s' "$OUT" | grep -q '"permissionDecision": "deny"'; then
+  pass "real bd: serialize_grant_survives_notes_rewrite — grant still PERMITTED after an unrelated notes rewrite, with no Serialize-with in the prompt"
+else
+  fail "real bd: serialize_grant_survives_notes_rewrite — grant still PERMITTED after an unrelated notes rewrite, with no Serialize-with in the prompt" \
+       "got: ${OUT:-<empty>}"
+fi
+
+SERIALIZE_B_AFTER=$(metadata_field "$BEAD_B" "serialize_with")
+SERIALIZE_A_AFTER=$(metadata_field "$BEAD_A" "serialize_with")
+if printf '%s' "$SERIALIZE_B_AFTER" | grep -q "$BEAD_A" && printf '%s' "$SERIALIZE_A_AFTER" | grep -q "$BEAD_B"; then
+  pass "real bd: metadata still agrees on both beads after the notes rewrite"
+else
+  fail "real bd: metadata still agrees on both beads after the notes rewrite" \
+       "B.serialize_with='$SERIALIZE_B_AFTER' A.serialize_with='$SERIALIZE_A_AFTER'"
+fi
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
