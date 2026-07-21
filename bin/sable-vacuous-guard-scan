@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""sable-vacuous-guard-scan — bash-regex vacuous-guard detector (SABLE-5lli.4, S1 STRUCTURE).
+
+71/119 of this repo's test files are bash, including the proven SABLE-i8kv
+instance (hooks/test/test-orchestration-install.sh @94d2557): a "guard" block
+that `touch`es a file and then re-checks the SAME path with a raw
+`[ -e ... ]`/`test -e ...` — an assertion that cannot fail, because it is only
+re-observing state the test itself just wrote. No bash AST exists in the
+Python stdlib, so this is a regex-based detector, not an addition to
+bin/columbo-prefilter.py's Python/TS heuristic registry (that is the sibling
+S1 surface).
+
+WHAT IT FLAGS
+-------------
+A `touch $X` / `echo ... > $X` / `printf ... > $X` line whose very next
+non-blank, non-comment line is a raw `[ -e $X ]` / `test -e $X` check on the
+SAME target — i.e. nothing runs between the write and the read. That
+adjacency (mod blank lines and comments) is what makes the assertion
+tautological: nothing exercised the code under test in between, so the check
+can only ever observe what the test itself just wrote.
+
+The repo's own fix for the i8kv instance (SABLE-f00o, still in the same file
+at current HEAD) shows the escape: route the check through a named predicate
+function (`home_has_timer_unit "$HS"`) instead of a bare `[ -e ]`. A predicate
+call doesn't match the raw-check pattern at all, so it never enters the
+candidate pool — the guard now exercises the SAME code path as the real
+assertion, which is the invariant this detector exists to enforce. Likewise,
+any other real code between a touch and a later `[ -e ]` on the same target
+(another write, a call into the installer under test, an unrelated
+assertion, ...) breaks the adjacency and the check is left unflagged, since
+something now sits between the write and the read.
+
+USAGE
+    sable-vacuous-guard-scan              # scan the repo's bash test corpus
+    sable-vacuous-guard-scan PATH ...      # scan explicit files (or `-` for stdin)
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
+
+
+# ---------------------------------------------------------------------------
+# Shell lexing helpers (quote-masking keeps message strings like
+# `pass "does not touch real home"` from being mistaken for real commands;
+# offsets are preserved so a match on the masked line can be re-sliced out of
+# the original to recover the real target text).
+# ---------------------------------------------------------------------------
+def mask_quotes(line: str) -> str:
+    out = list(line)
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if c in ("'", '"'):
+            j = i + 1
+            while j < n and line[j] != c:
+                out[j] = "X"
+                j += 1
+            i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def strip_comment(line: str, masked: str) -> tuple[str, str]:
+    for m in re.finditer(r"#", masked):
+        idx = m.start()
+        if idx == 0 or masked[idx - 1].isspace():
+            return line[:idx], masked[:idx]
+    return line, masked
+
+
+# ---------------------------------------------------------------------------
+# Line classification
+# ---------------------------------------------------------------------------
+_FUNC_DEF_RE = re.compile(r"^\s*(?:function\s+)?[A-Za-z_]\w*\s*\(\)\s*\{")
+_FUNC_DEF_RE2 = re.compile(r"^\s*function\s+[A-Za-z_]\w*\b")
+
+_TARGET = r'(?:"[^"]*"|\'[^\']*\'|\S+)'
+_TOUCH_RE = re.compile(r"\btouch\s+(?P<t>" + _TARGET + r")")
+_REDIR_RE = re.compile(r"\b(?:echo|printf)\b.*?>>?\s*(?P<t>" + _TARGET + r")")
+_ASSERT_RE = re.compile(
+    r"\[\[?\s+-e\s+(?P<t1>" + _TARGET + r")\s+\]\]?"
+    r"|\btest\s+-e\s+(?P<t2>" + _TARGET + r")"
+)
+
+
+def _norm(target: str) -> str:
+    t = target.strip()
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in ("'", '"'):
+        return t[1:-1]
+    return t.rstrip(";)}]")
+
+
+def _match_creation(masked: str, original: str) -> Optional[str]:
+    m = _TOUCH_RE.search(masked) or _REDIR_RE.search(masked)
+    if not m:
+        return None
+    return _norm(original[m.start("t"):m.end("t")])
+
+
+def _match_assertion(masked: str, original: str) -> Optional[str]:
+    m = _ASSERT_RE.search(masked)
+    if not m:
+        return None
+    span = ("t1", "t2")
+    grp = next(g for g in span if m.group(g) is not None)
+    return _norm(original[m.start(grp):m.end(grp)])
+
+
+# ---------------------------------------------------------------------------
+# Scanner
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Violation:
+    file: str
+    line: int
+    snippet: str
+
+
+def scan_bash_text(text: str, path: str) -> List[Violation]:
+    out: List[Violation] = []
+    last_create_target: Optional[str] = None
+
+    for i, raw in enumerate(text.splitlines(), start=1):
+        masked = mask_quotes(raw)
+        code, masked = strip_comment(raw, masked)
+
+        stripped = code.strip()
+        if not stripped:
+            continue  # blank (or comment-only) line: transparent, chain survives
+        if _FUNC_DEF_RE.match(masked) or _FUNC_DEF_RE2.match(masked):
+            continue  # a definition doesn't execute anything: transparent
+
+        created = _match_creation(masked, code)
+        if created is not None:
+            last_create_target = created
+            continue
+
+        asserted = _match_assertion(masked, code)
+        if asserted is not None:
+            if last_create_target is not None and asserted == last_create_target:
+                out.append(Violation(path, i, stripped))
+            last_create_target = None
+            continue
+
+        last_create_target = None  # any other real code breaks the adjacency
+
+    return out
+
+
+def scan_file(path: Path, repo_root: Path) -> List[Violation]:
+    try:
+        rel = str(path.relative_to(repo_root))
+    except ValueError:
+        rel = str(path)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return scan_bash_text(text, rel)
+
+
+def default_targets(repo_root: Path) -> List[Path]:
+    targets: List[Path] = []
+    td = repo_root / "hooks" / "test"
+    if td.is_dir():
+        targets += sorted(td.glob("*.sh"))
+    return targets
+
+
+def repo_root_of(start: Path) -> Path:
+    cur = start.resolve()
+    for cand in [cur] + list(cur.parents):
+        if (cand / ".git").exists() or (cand / "hooks" / "test").is_dir():
+            return cand
+    return cur
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Flag bash create-then-assert-exists vacuous guards (SABLE-5lli.4)."
+    )
+    ap.add_argument("paths", nargs="*", help="files to scan, or '-' for stdin (default: repo bash test corpus)")
+    args = ap.parse_args(argv)
+
+    here = Path(__file__).resolve()
+    repo_root = repo_root_of(here.parent)
+
+    violations: List[Violation] = []
+    if args.paths:
+        for p in args.paths:
+            if p == "-":
+                violations += scan_bash_text(sys.stdin.read(), "<stdin>")
+            else:
+                violations += scan_file(Path(p), repo_root)
+        scanned = len(args.paths)
+    else:
+        targets = default_targets(repo_root)
+        for f in targets:
+            violations += scan_file(f, repo_root)
+        scanned = len(targets)
+
+    if not violations:
+        print(f"sable-vacuous-guard-scan: CLEAN — {scanned} file(s) scanned, no vacuous guards found")
+        return 0
+
+    print("sable-vacuous-guard-scan: FOUND vacuous guard(s):")
+    for v in violations:
+        print(f"  {v.file}:{v.line}")
+        print(f"      {v.snippet}")
+    print()
+    print("Fix: route the check through a named predicate function that the real")
+    print("assertion ALSO calls (shared code path), instead of re-reading the raw")
+    print("filesystem state the guard just wrote itself.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
