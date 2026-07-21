@@ -731,25 +731,163 @@ def test_render_text_report_snapshot_drift_names_the_drifted_sibling_file(tmp_pa
     assert "sable_helper_lib.py" in out
 
 
-def test_check_manifest_snapshot_pin_clean_even_when_pinned_sha_predates_head(tmp_path):
-    # the pin is deliberately frozen at an OLD sha while the repo moves on --
-    # that must NOT be reported as drift (drift means the SNAPSHOT no longer
-    # matches what it claims to be pinned to, not "repo has since changed").
+def test_check_manifest_snapshot_pin_clean_when_pinned_sha_predates_head_but_closure_is_unchanged(tmp_path):
+    # The pin is frozen at an OLD sha while the repo moves on -- but the commit
+    # since touched NOTHING inside the pin unit, so the pinned content is still
+    # byte-identical to HEAD. That must stay clean: the staleness check added
+    # by SABLE-0jplo is a check on the CLOSURE, not on the sha, precisely so it
+    # does not cry wolf every time any commit lands anywhere in the repo. This
+    # is the half of SABLE-9boz4's original intent that survives that bead --
+    # "repo has since changed" is still not, by itself, a defect.
     repo, bin_dir, sha = make_snapshot_repo(tmp_path)
     bin_dir_dest = tmp_path / "local-bin"
     pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest)
 
-    # repo moves on after the pin was taken
-    (bin_dir / "sable-importer").write_text(
-        "#!/usr/bin/env python3\nfrom sable_helper_lib import MARK\nprint(MARK, 'v2')\n"
-    )
+    # repo moves on after the pin was taken, OUTSIDE bin/
+    (repo / "README.md").write_text("unrelated to the pin unit\n")
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "v2"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "docs"], cwd=repo, check=True)
 
+    assert doctor.current_repo_head(repo)[:12] != sha  # HEAD really did move
     entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
     results = doctor.check_manifest(entries)
     r = next(x for x in results if x["category"] == "pinned snapshot bins")
     assert r["status"] == "clean"
+
+
+# --- SABLE-0jplo: an honestly-named STALE pin is not "clean" -----------------
+# The live incident: ~/.local/bin/sable-merge-gate resolved into
+# ~/.local/lib/sable-5e47cc4/, that directory held exactly 5e47cc4's content,
+# and the repo was three files further on -- SABLE-jd5fj.4's module was absent
+# from the pin entirely, so optimistic promotion was merged-but-dark. Doctor
+# said "clean -- 63 installed files match repo HEAD."
+#
+# Doctor was only ever asking "is this snapshot still what it CLAIMS to be?"
+# Nobody asked "is what it claims to be still CURRENT?" -- so the one state
+# where the answer matters most (an honest pin, quietly behind) was the one
+# state that reported agreement. These pin down the invariant: doctor reporting
+# clean for a pinned bin IMPLIES the pinned content is byte-identical to repo
+# HEAD for every file in the snapshot closure.
+
+def advance_repo_past_the_pin(repo, bin_dir):
+    """Move HEAD so the pinned closure differs from it in all three ways a
+    closure can differ -- a file MODIFIED, a file ADDED, and a file REMOVED.
+    One-way-only detection is how a drift check ends up narrower than the
+    thing that moved, which is the failure class this whole area exists to
+    prevent (a bin/ module split, SABLE-jd5fj.3, is literally the 'removed'
+    shape). Returns the three basenames."""
+    (bin_dir / "sable_helper_lib.py").write_text("MARK = 'v2'\n")          # modified
+    (bin_dir / "sable_added_lib.py").write_text("MARK = 'new in HEAD'\n")  # added
+    (bin_dir / "sable-plain").unlink()                                     # removed
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "advance the closure"], cwd=repo, check=True)
+    return {"sable_helper_lib.py", "sable_added_lib.py", "sable-plain"}
+
+
+def test_check_manifest_snapshot_pin_stale_when_honestly_named_but_behind_head(tmp_path):
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest)
+    expected = advance_repo_past_the_pin(repo, bin_dir)
+
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if x["category"] == "pinned snapshot bins")
+    assert r["status"] == "snapshot-stale"
+    # all THREE categories named, not just the modified one
+    assert set(r["detail"].split(", ")) == expected
+
+
+def test_check_manifest_snapshot_pin_verdict_unchanged_across_the_install_path(tmp_path):
+    # THE REGRESSION GUARD (red before SABLE-0jplo: both verdicts were "clean").
+    # Chuck observed doctor go quiet about a stale pin around a `bash install.sh`
+    # run. Reproducing it showed the install path suppresses nothing -- the
+    # verdict was ALREADY a false green on both sides. So this asserts the
+    # transition rather than either state: whatever the install path does (run
+    # the real sable-bin-install in ordinary mode, which regenerates the
+    # .sable-pinned marker; write the provenance stamp, which is the other
+    # plausible short-circuit) the verdict must be identical before and after.
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest)
+    advance_repo_past_the_pin(repo, bin_dir)
+
+    def verdict():
+        entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+        results = doctor.check_manifest(entries)
+        r = next(x for x in results if x["category"] == "pinned snapshot bins")
+        return r["status"], r["detail"]
+
+    before = verdict()
+    assert before[0] == "snapshot-stale"
+
+    # what install.sh actually does to this scope
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / doctor.PROVENANCE_FILENAME).write_text(
+        f"commit={doctor.current_repo_head(repo)}\nbranch=main\ndirty=false\n"
+    )
+    subprocess.run(
+        ["bash", str(repo / "bin" / "sable-bin-install"), "--dir", str(bin_dir_dest)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    assert (bin_dir_dest / "sable-importer").is_symlink()
+    assert verdict() == before
+
+
+def test_check_manifest_snapshot_pin_tamper_wins_over_staleness(tmp_path):
+    # Both conditions true at once. Tamper is the louder fact (something wrote
+    # into a frozen pin) and its remedy is a rollback, not an advance -- so it
+    # must not be masked by the staleness verdict that now shares the code path.
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    snapshot_dir = pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest)
+    advance_repo_past_the_pin(repo, bin_dir)
+    (snapshot_dir / "sable-importer").write_text("# hand-tampered\n")
+
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if x["category"] == "pinned snapshot bins")
+    assert r["status"] == "snapshot-drift"
+    assert r["detail"] == "sable-importer"
+
+
+def test_render_text_report_snapshot_stale_names_files_and_never_recommends_install_sh(tmp_path, capsys):
+    # install.sh CORRECTLY refuses to touch a pin (SABLE-mkj6k), so pointing a
+    # reader at it for a stale pin sends them to a command guaranteed to leave
+    # the staleness in place -- and then report nothing.
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest)
+    expected = advance_repo_past_the_pin(repo, bin_dir)
+
+    results = doctor.check_manifest(doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest))
+    doctor.render_text_report(results)
+    out = capsys.readouterr().out
+    assert "SNAPSHOT-STALE" in out
+    assert "bash install.sh" not in out
+    assert "--pin-snapshot sable-importer" in out
+    for name in expected:
+        assert name in out
+
+
+def test_quiet_mode_reports_a_stale_snapshot_pin(tmp_path, capsys):
+    # the SessionStart-hook path -- the highest-traffic message in the system,
+    # and the one that said nothing at all while the gate ran pre-jd5fj.4 code.
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest)
+    advance_repo_past_the_pin(repo, bin_dir)
+
+    rc = doctor.main([
+        "--repo", str(repo), "--claude-dir", str(tmp_path / "claude"),
+        "--bin-dir", str(bin_dir_dest), "--quiet",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "drifted from repo HEAD" in captured.err
+    assert "bash install.sh" not in captured.err
 
 
 def test_render_text_report_snapshot_drift_never_recommends_install_sh(tmp_path, capsys):

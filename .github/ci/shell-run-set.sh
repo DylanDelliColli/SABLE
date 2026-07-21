@@ -40,6 +40,7 @@ ALLOW=(
   test-concurrent-sessions.sh
   test-control-trace.sh
   test-dep-merge-state.sh
+  test-doctor-snapshot-staleness.sh
   test-edit-write-claim-reconciler.sh
   test-event-pair.sh
   test-full-ingestion.sh
@@ -139,6 +140,7 @@ declare -A COVERS=(
   [test-active-contracts-integration.sh]="hooks/multi-manager/session-role-anchor.sh"
   [test-control-trace.sh]="hooks/multi-manager/control-trace.sh"
   [test-dep-merge-state.sh]="bin/sable-dep-check bin/sable-spawn-worker"
+  [test-doctor-snapshot-staleness.sh]="bin/sable-doctor bin/sable-bin-install install.sh"
   [test-edit-write-claim-reconciler.sh]="hooks/multi-manager/edit-write-claim-reconciler.sh"
   [test-lib-hook-trace.sh]="hooks/multi-manager/lib-hook-trace.sh"
   [test-lib-identity.sh]="hooks/multi-manager/lib-identity.sh"
