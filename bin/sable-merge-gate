@@ -49,8 +49,30 @@ Usage:
                            [--repo <path>] [--remote <name>] [--manager <name>]
                            [--override <reason>]   # actions-down human bypass ONLY,
                                                     # reason recorded; never for a known-red
+  sable-merge-gate preview --branch <worker-branch> [--base <branch>]
+                           [--repo <path>] [--remote <name>]
   sable-merge-gate sweep   [--max-age-hours N] [--repo <path>] [--remote <name>]
   sable-merge-gate --help
+
+The `preview` entrypoint (SABLE-jd5fj.1) is the KICK half of promote: it builds
+the merge-preview commit and pushes the ci-verify ref — and then RETURNS, at
+once, without waiting for the Actions run. hooks/multi-manager/post-push-merge-
+notify.sh fires it in the background on a confirmed worker push, so the verdict
+is already computing by the time Chuck wakes to merge. Nothing else about the
+promote flow moves: promote still builds/pushes/waits exactly as before, and the
+whole exit-code taxonomy below belongs to promote unchanged.
+
+The two halves meet at a SHARED IDEMPOTENCY KEY (preview_kick_ref): the kicked
+ref is named from the (base_sha, branch_sha) pair, NOT from the nondeterministic
+preview commit's own SHA (commit-tree stamps a committer date, so rebuilding the
+same merge twice yields two different SHAs — and two different refs, i.e. two CI
+runs). Because the key is a pure function of the two parents, promote can look
+for an already-kicked ref and ADOPT it (adopt_kicked_preview) instead of building
+a second preview: same parents => same merge result, and the object it promotes
+is still byte-identical to the object CI tested. Adoption is a pure
+optimization — it verifies the kicked commit's parents against the freshly
+resolved base/branch SHAs and falls through to the normal build on ANY mismatch,
+error, or absence, so a stale or missing kick can never change an outcome.
 
 Base resolution (SABLE-dtp1): an explicit --base flag wins outright; else
 SABLE_MG_BASE wins; else the base is resolved via resolve_integration_branch()
@@ -70,7 +92,7 @@ is unit-testable without real git / gh / bd):
   SABLE_MG_SWEEP_HOURS orphan age hours (6)               SABLE_MG_GH_TIMEOUT per-gh-call secs (30, SABLE-7wyl)
 
 Exit codes:
-  0 promoted / sweep ok     2 usage        3 precondition failed
+  0 promoted / preview kicked / sweep ok    2 usage        3 precondition failed
   20 ci red, not promoted   21 actions-down / blocked (needs --override)
   22 merge-preview conflict (delegate to author)
   23 tip moved during gate (non-ff promote) — rebuild preview + re-gate (retry-safe)
@@ -102,6 +124,28 @@ def preview_ref_name(bead: str, preview_sha: str) -> str:
     if not safe_bead.strip("-"):
         raise ValueError(f"bead id sanitizes to empty: {bead!r}")
     return f"ci-verify/{safe_bead}-{preview_sha[:7]}"
+
+
+def preview_kick_key(base_sha: str, branch_sha: str) -> str:
+    """The SHARED IDEMPOTENCY KEY for a push-time preview kick (SABLE-jd5fj.1):
+    a pure function of the two commits being merged. A preview is fully
+    determined by (base, branch), but the preview COMMIT's own SHA is not —
+    git commit-tree stamps a committer date, so building the same merge twice
+    yields two distinct SHAs. Keying the ref on the parents instead means the
+    push-time kick, the poll-leg reconciler (jd5fj.2) and promote's adoption
+    check all name the SAME ref for the same merge, so the work happens once."""
+    if not base_sha or not branch_sha:
+        raise ValueError(f"both parent SHAs are required, got {base_sha!r}, {branch_sha!r}")
+    import hashlib
+    return hashlib.sha1(f"{base_sha}\n{branch_sha}\n".encode()).hexdigest()
+
+
+def preview_kick_ref(branch: str, base_sha: str, branch_sha: str) -> str:
+    """ci-verify ref for a kicked preview: keyed on the BRANCH (the hook knows
+    the branch, not the bead) plus the parent-pair key above. Shares the
+    ci-verify/ prefix — and therefore the sweep's orphan cleanup — with the
+    promote-built refs."""
+    return preview_ref_name(branch, preview_kick_key(base_sha, branch_sha))
 
 
 def is_orphan(ref_age_seconds: float, max_age_hours: float) -> bool:
@@ -204,6 +248,55 @@ def build_preview(repo: str, base_sha: str, branch_sha: str, message: str) -> st
     tree = mt.stdout.splitlines()[0].strip()
     ct = _git(repo, "commit-tree", tree, "-p", base_sha, "-p", branch_sha, "-m", message)
     return ct.stdout.strip()
+
+
+def remote_ref_commit(repo: str, remote: str, ref: str) -> str | None:
+    """Commit at refs/heads/<ref> ON THE REMOTE, or None if the ref is absent /
+    unreadable. Read via ls-remote rather than a remote-tracking ref because a
+    kick fired seconds ago by ANOTHER process (the post-push hook) has no local
+    tracking ref in this repo at all."""
+    cp = _git(repo, "ls-remote", "--exit-code", remote, f"refs/heads/{ref}", check=False)
+    if cp.returncode != 0:
+        return None
+    first = cp.stdout.split("\n", 1)[0].split("\t", 1)[0].strip()
+    return first or None
+
+
+def commit_parents(repo: str, sha: str) -> list[str]:
+    """Parent SHAs of a commit, or [] if it cannot be read."""
+    cp = _git(repo, "rev-list", "--parents", "-n", "1", sha, check=False)
+    if cp.returncode != 0:
+        return []
+    return cp.stdout.split()[1:]
+
+
+def adopt_kicked_preview(repo: str, remote: str, branch: str,
+                         base_sha: str, branch_sha: str) -> tuple[str, str] | None:
+    """(preview_sha, ref) of an ALREADY-KICKED preview for exactly this
+    (base, branch) pair, or None to build a fresh one (SABLE-jd5fj.1).
+
+    Adoption is what makes the push-time kick pay off: the CI run it started is
+    the run promote then waits on, instead of a second run on a second ref. It
+    is a strict optimization and FAILS SAFE in every direction — the kicked
+    commit is adopted ONLY if it is fetchable and its parents are exactly the
+    base/branch SHAs promote just resolved. Any absence, error, or drift (the
+    base moved after the kick) returns None and the caller builds the preview
+    the pre-kick way, so no outcome and no exit code depends on a kick having
+    happened."""
+    try:
+        ref = preview_kick_ref(branch, base_sha, branch_sha)
+        remote_sha = remote_ref_commit(repo, remote, ref)
+        if not remote_sha:
+            return None
+        # Fetch the object itself — the kick ran in another process (and often
+        # another worktree), so this repo may not have the commit locally.
+        if _git(repo, "fetch", remote, f"refs/heads/{ref}", check=False).returncode != 0:
+            return None
+        if commit_parents(repo, remote_sha) != [base_sha, branch_sha]:
+            return None
+        return (remote_sha, ref)
+    except Exception:  # noqa: BLE001 — adoption must never break the promote flow
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -408,6 +501,46 @@ def cleanup_after_merge(repo: str, remote: str, base_ref: str, branch: str) -> N
               f"{push.stdout.strip()}", file=sys.stderr)
 
 
+def kick_preview(branch: str, base: str, repo: str, remote: str) -> int:
+    """Build the merge-preview for <branch> onto <base> and push its ci-verify
+    ref — then RETURN, without waiting for CI (SABLE-jd5fj.1).
+
+    This is the push-time half of the gate. The ref push is the CI trigger
+    (.github/workflows/ci-verify.yml fires on ci-verify/**), so returning here
+    leaves a run computing in the background; promote picks that run up later via
+    adopt_kicked_preview. Deliberately does NOT poll, notify, or write bead
+    evidence — a kick is a speculative warm-up with no verdict to report, and it
+    runs in a hook's shadow where those side effects would be unattributable.
+
+    Idempotent by the shared key: a ref that already exists for this exact
+    (base, branch) pair means the merge is already building or built, so the kick
+    is a no-op instead of a re-push (which would re-trigger CI and, under the
+    workflow's cancel-in-progress concurrency group, CANCEL the run already
+    underway — the SABLE-sc24 spurious-cancel shape).
+
+    Exit codes: 0 kicked or already-kicked, 22 merge conflict (nothing to
+    verify — the author must resolve it), 3 precondition failed."""
+    base_ref = qualify_remote_ref(remote, base)
+    branch_ref = qualify_remote_ref(remote, branch)
+    _git(repo, "fetch", remote, base, branch)
+    base_sha = resolve_commit(repo, base_ref)
+    branch_sha = resolve_commit(repo, branch_ref)
+
+    ref = preview_kick_ref(branch, base_sha, branch_sha)
+    existing = remote_ref_commit(repo, remote, ref)
+    if existing:
+        print(f"sable-merge-gate preview: {ref} already exists ({existing[:7]}) — "
+              f"CI is already running for {branch} onto {base}; not re-pushing")
+        return 0
+
+    msg = f"ci-verify merge-preview: {branch} onto {base} (push-time kick)"
+    preview_sha = build_preview(repo, base_sha, branch_sha, msg)
+    _git(repo, "push", remote, f"{preview_sha}:refs/heads/{ref}")
+    print(f"sable-merge-gate preview: kicked {ref} (preview {preview_sha}) for {branch} "
+          f"onto {base} — NOT waiting for CI")
+    return 0
+
+
 def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             manager: str, override: str | None) -> int:
     base_ref = qualify_remote_ref(remote, base)
@@ -416,9 +549,20 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
     base_sha = resolve_commit(repo, base_ref)
     branch_sha = resolve_commit(repo, branch_ref)
 
-    msg = f"ci-verify merge-preview: {branch} onto {base} ({bead})"
-    preview_sha = build_preview(repo, base_sha, branch_sha, msg)
-    ref = preview_ref_name(bead, preview_sha)
+    # SABLE-jd5fj.1: if the post-push hook already kicked a preview for exactly
+    # this (base, branch) pair, its CI run is already computing (often already
+    # done) — adopt that ref instead of building a second preview and starting a
+    # second run. Falls through to the original build on any absence or drift, so
+    # every path below (and every exit code) is identical to the pre-kick flow.
+    adopted = adopt_kicked_preview(repo, remote, branch, base_sha, branch_sha)
+    if adopted is not None:
+        preview_sha, ref = adopted
+        print(f"sable-merge-gate: adopting push-time preview {ref} ({preview_sha[:7]}) "
+              f"— its ci-verify run is already underway")
+    else:
+        msg = f"ci-verify merge-preview: {branch} onto {base} ({bead})"
+        preview_sha = build_preview(repo, base_sha, branch_sha, msg)
+        ref = preview_ref_name(bead, preview_sha)
 
     _git(repo, "push", remote, f"{preview_sha}:refs/heads/{ref}")
     try:
@@ -569,6 +713,16 @@ def main(argv: list[str] | None = None) -> int:
                     help="actions-down human bypass ONLY; the reason is required and recorded on the bead. "
                          "Not for bypassing a known-red run.")
 
+    # SABLE-jd5fj.1 kick entrypoint. No --bead: the post-push hook that fires
+    # this knows the branch it just confirmed, not the bead behind it, and a kick
+    # writes no bead evidence anyway.
+    pv = sub.add_parser("preview")
+    pv.add_argument("--branch", required=True)
+    pv.add_argument("--base", default=None,
+                    help="integration branch to preview onto; same resolution as promote")
+    pv.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+    pv.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
+
     ps = sub.add_parser("sweep")
     ps.add_argument("--max-age-hours", type=float,
                     default=float(os.environ.get("SABLE_MG_SWEEP_HOURS", "6")))
@@ -581,6 +735,9 @@ def main(argv: list[str] | None = None) -> int:
             base = resolve_base(args.base, args.repo)
             return promote(args.bead, args.branch, base, args.repo,
                            args.remote, args.manager, args.override)
+        if args.command == "preview":
+            base = resolve_base(args.base, args.repo)
+            return kick_preview(args.branch, base, args.repo, args.remote)
         if args.command == "sweep":
             return sweep(args.repo, args.remote, args.max_age_hours)
     except GateError as e:

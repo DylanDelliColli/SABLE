@@ -56,6 +56,7 @@ ALLOW=(
   test-pre-push-rebase-concurrency.sh
   test-pre-push-rebase-test.sh
   test-preview-already-verified.sh
+  test-preview-kick.sh
   test-project-clone-portability.sh
   test-quickstart-orchestration.sh
   test-read-guard.sh
