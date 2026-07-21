@@ -12,8 +12,10 @@ classify.Verdict and acts on it. That is the whole point of the split — with t
 verdict arriving as a value, promote's body is a decision table over the exit-code
 taxonomy rather than a construct-and-wait procedure, and the two beads queued
 behind this one land in obvious places: per-tier duration recording
-(SABLE-cmar4.4) wraps the acquire_verdict call, and per-promotion implementation
-hashing (SABLE-w5ni5) joins the evidence writes below.
+(SABLE-cmar4.4, landed — see the acquire_verdict call below and
+sable_gate_budget_lib.check_and_file) wraps the acquire_verdict call, and
+per-promotion implementation hashing (SABLE-w5ni5) joins the evidence writes
+below.
 
 IRON RULES this module carries and the split did not touch:
   * the exit-code taxonomy 0/20/21/22/23/24/4, unchanged;
@@ -60,10 +62,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import sable_footprint_lib as footprint_lib
+import sable_gate_budget_lib as budget_lib
 import sable_gate_classify_lib as classify
 import sable_gate_git_lib as git_lib
 import sable_gate_preview_lib as preview
@@ -559,9 +563,21 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             # SABLE-jd5fj.3: read the STORED verdict first and wait only if there
             # isn't one. With previews kicked at push time and running
             # concurrently, the common case here is a completed run and a
-            # seconds-long read. (SABLE-cmar4.4's per-tier duration recording
-            # belongs around this call — it is where the gate's wall-clock goes.)
+            # seconds-long read.
+            #
+            # SABLE-cmar4.4: this call IS the gate's own wall-clock for the
+            # merge_preview tier — whatever acquire_verdict spends (a fast
+            # precomputed read, or a fall-through wait_for_ci poll) is exactly
+            # what a human waiting on this promote experiences. Measured here,
+            # never inside acquire_verdict/wait_for_ci themselves, so the
+            # budget check stays a promote-only concern the preview module
+            # never has to know about. check_and_file never raises and never
+            # changes the promotion outcome — a breach only WARNs + auto-files
+            # (idempotently) a suite-optimization bead.
+            t0 = time.monotonic()
             verdict = preview.acquire_verdict(repo, ref, preview_sha)
+            budget_lib.check_and_file(repo, "merge_preview", time.monotonic() - t0,
+                                      context=f"bead={bead} branch={branch} ref={ref}")
         conclusion, url = verdict.conclusion, verdict.run_url
 
         if verdict.outcome == classify.GREEN:
