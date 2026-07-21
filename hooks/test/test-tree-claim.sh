@@ -1022,10 +1022,6 @@ oracle_check "backgrounded subshell: '( cd <unrel> ) & wait ; git commit' from c
 # These belong to the paren work: ')' resets command position, and popping an
 # empty scope stack must NOT relocate the shell cwd, because a case body runs
 # in the CURRENT shell. Getting this wrong reopens the false negative.
-#
-# (Reserved words — 'if true; then git commit; fi' and friends — are a
-# SEPARATE live false negative tracked as SABLE-hfkdd. Pre-existing on the
-# base branch, deliberately not addressed or asserted here.)
 oracle_check "case body: 'case x in x) git commit ;; esac' from claimed cwd" \
   claimed 'case x in x) git commit -qam probe ;; esac'
 oracle_check "cd then case body: 'cd <claimed>; case x in x) git commit;; esac' from unrelated cwd" \
@@ -1043,10 +1039,157 @@ oracle_check "newline separator: 'cd <claimed>' NEWLINE 'git commit' from unrela
 git commit -qam probe'
 
 # ============================================================
+# SABLE-hfkdd: reserved words are command positions
+# ============================================================
+#
+# Same oracle, same positive control on every probe. The defect: the walk
+# only restored command position on OPERATORS, so after 'if true;' the ';'
+# reset correctly but the token 'then' — not cd/env/git — knocked the walk
+# OFF command position, and the 'git commit' behind it was never evaluated as
+# a command at all. Every compound construct in bash puts a reserved word
+# exactly where a command name is expected, so 'if', 'for' and 'while'
+# wrappers made writes invisible to the gate. These are ordinary shapes in
+# agent-composed bash, not adversarial ones.
+#
+# The fix is stated as a PROPERTY, not an enumeration of constructs: a
+# reserved word sitting at command position is TRANSPARENT — skip it and stay
+# at command position — exactly as the walk already treats NAME=VALUE
+# prefixes and env(1). The probes below are therefore chosen to cover the
+# distinct POSITIONS a reserved word can occupy (compound head, body opener,
+# branch, loop, prefix), not a checklist of statement types.
+#
+# BOTH DIRECTIONS ARE MANDATORY. Making 'git' visible behind a keyword is
+# worthless if it is bought by denying every keyword-wrapped command: that
+# trades a false negative for a blanket deny-on-keyword, which is the failure
+# the paired unrelated-cwd probes exist to catch. Each denies-in-claimed probe
+# has an allows-in-unrelated mirror.
+
+echo "--- SABLE-hfkdd: reserved words at command position (real-bash oracle) ---"
+
+# --- The three shapes confirmed live-evading on the base branch ------------
+oracle_check "if/then body: 'if true; then git commit; fi' from claimed cwd" \
+  claimed 'if true; then git commit -qam probe; fi'
+oracle_check "for/do body: 'for f in 1; do git commit; done' from claimed cwd" \
+  claimed 'for f in 1; do git commit -qam probe; done'
+oracle_check "while/do body: 'while true; do git commit; break; done' from claimed cwd" \
+  claimed 'while true; do git commit -qam probe; break; done'
+oracle_check "until/do body: 'until false; do git commit; break; done' from claimed cwd" \
+  claimed 'until false; do git commit -qam probe; break; done'
+
+# --- Multi-line forms: the keyword arrives on its own line -----------------
+# normalize_operators turns the newline into ';', so the keyword is then the
+# FIRST token of its own segment — the purest form of the defect.
+oracle_check "multi-line if: 'if true' NL 'then' NL 'git commit' NL 'fi' from claimed cwd" \
+  claimed 'if true
+then
+git commit -qam probe
+fi'
+oracle_check "multi-line for: 'for f in 1' NL 'do' NL 'git commit' NL 'done' from claimed cwd" \
+  claimed 'for f in 1
+do
+git commit -qam probe
+done'
+
+# --- Branch keywords: else / elif are command positions too ----------------
+oracle_check "else branch: 'if false; then :; else git commit; fi' from claimed cwd" \
+  claimed 'if false; then :; else git commit -qam probe; fi'
+oracle_check "elif branch: 'if false; then :; elif true; then git commit; fi' from claimed cwd" \
+  claimed 'if false; then :; elif true; then git commit -qam probe; fi'
+
+# --- Keyword as a PREFIX of a simple command -------------------------------
+oracle_check "'time git commit' from claimed cwd" \
+  claimed 'time git commit -qam probe'
+oracle_check "'! git commit' (negation prefix) from claimed cwd" \
+  claimed '! git commit -qam probe'
+
+# --- The other direction: keyword-wrapped writes elsewhere still ALLOW -----
+# If these flip to deny, the fix has become a blanket deny-on-keyword and has
+# traded a false negative for a false positive.
+oracle_check "if/then body from UNRELATED cwd must still be allowed" \
+  unrelated 'if true; then git commit -qam probe; fi'
+oracle_check "for/do body from UNRELATED cwd must still be allowed" \
+  unrelated 'for f in 1; do git commit -qam probe; done'
+oracle_check "cd inside an if body PERSISTS: 'if true; then cd <unrel>; git commit; fi' from claimed cwd" \
+  claimed 'if true; then cd @UNRELATED@; git commit -qam probe; fi'
+
+# --- Keywords must compose with the cd tracking, in both directions --------
+oracle_check "until/do with persistent cd: 'until false; do cd <claimed>; git commit; break; done' from unrelated cwd" \
+  unrelated 'until false; do cd @CLAIMED@; git commit -qam probe; break; done'
+oracle_check "cd then if body: 'cd <claimed>; if true; then git commit; fi' from unrelated cwd" \
+  unrelated 'cd @CLAIMED@; if true; then git commit -qam probe; fi'
+
+# --- Keywords must not disturb the vx4aj subshell/brace-group scoping ------
+oracle_check "subshell inside an if body is still unwound at ')' (claimed cwd)" \
+  claimed 'if true; then ( cd @UNRELATED@ ) ; git commit -qam probe; fi'
+oracle_check "brace group inside an if body still persists past '}' (claimed cwd)" \
+  claimed 'if true; then { cd @UNRELATED@ ; } ; git commit -qam probe; fi'
+
+# --- Quoted text is DATA, never a command ---------------------------------
+# Not oracle-able (it commits nowhere by design, which the oracle correctly
+# rejects as a broken probe), so asserted directly — with the same positive
+# control discipline: the fixture must deny a real write before its allow is
+# believed.
+orc_setup
+printf 'sess-HOLDER %s chuck\n' "$(date +%s)" > "$ORC_CLAIMED/.git/sable-tree-claim"
+kw_ctl=$(run_hook "$(make_json "git commit -qam control" "sess-ME" "$ORC_CLAIMED")")
+kw_out=$(run_hook "$(make_json 'echo "if true; then git commit -am x; fi"' "sess-ME" "$ORC_CLAIMED")")
+orc_teardown
+if ! is_deny "$kw_ctl"; then
+  fail "quoted keyword+git text is data, not a command" \
+    "POSITIVE CONTROL FAILED — the fixture did not deny a plain 'git commit' into the claimed repo, so its allow proves nothing"
+elif is_allow "$kw_out"; then
+  pass "quoted keyword+git text is data, not a command [control denies]"
+else
+  fail "quoted keyword+git text is data, not a command" \
+    "echo of a quoted 'if ... git commit ... fi' string was DENIED; quoted text must never be treated as a command"
+fi
+
+# --- The unparseable-command fallback must see keywords too ----------------
+# A command shlex cannot tokenise (unbalanced quote) never reaches the walk at
+# all; it is matched by UNPARSEABLE_RE and gated against the session cwd. That
+# regex anchored 'git' to a separator or a NAME=VALUE prefix, so the very same
+# keyword blindness lived on the second path to a decision and fell through to
+# fail OPEN. Not oracle-able — bash cannot execute an unbalanced quote, so
+# there is no ground truth to observe — hence a direct assertion, with the
+# positive control kept.
+orc_setup
+printf 'sess-HOLDER %s chuck\n' "$(date +%s)" > "$ORC_CLAIMED/.git/sable-tree-claim"
+kw_ctl=$(run_hook "$(make_json "git commit -qam control" "sess-ME" "$ORC_CLAIMED")")
+kw_unp=$(run_hook "$(make_json 'if true; then git commit -am "x; fi' "sess-ME" "$ORC_CLAIMED")")
+kw_unp_far=$(run_hook "$(make_json 'if true; then git commit -am "x; fi' "sess-ME" "$ORC_UNRELATED")")
+orc_teardown
+if ! is_deny "$kw_ctl"; then
+  fail "unparseable keyword-wrapped git write is gated" \
+    "POSITIVE CONTROL FAILED — the fixture did not deny a plain 'git commit' into the claimed repo"
+elif ! is_deny "$kw_unp"; then
+  fail "unparseable keyword-wrapped git write is gated" \
+    "an untokenisable 'if true; then git commit -am \"x; fi' from the claimed repo's cwd was ALLOWED — the fallback regex failed open behind the keyword"
+elif is_allow "$kw_unp_far"; then
+  pass "unparseable keyword-wrapped git write is gated (and only in the claimed repo) [control denies]"
+else
+  fail "unparseable keyword-wrapped git write is gated" \
+    "the same unparseable command from an UNRELATED repo's cwd was denied — the fallback has become a blanket deny"
+fi
+
+# ============================================================
 # settings-snippet registration
 # ============================================================
 
 echo "--- Registration check ---"
+
+# The hook's detector is a python program embedded in a single double-quoted
+# bash string, so one stray double quote anywhere in it — including in a
+# comment — terminates that string and breaks the whole hook. When that
+# happens the hook exits non-zero and every write is ALLOWED, so the failure
+# presents as a silently disarmed gate rather than an error (SABLE-k2h0m).
+# Cheap tripwire, since every assertion above would otherwise go quietly green
+# in the allow direction.
+if bash -n "$HOOK" 2>/dev/null; then
+  pass "tree-claim.sh parses (guards the embedded-python quoting hazard)"
+else
+  fail "tree-claim.sh parses (guards the embedded-python quoting hazard)" \
+    "$(bash -n "$HOOK" 2>&1)"
+fi
 
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 if python3 -c "import json; json.load(open('$SNIPPET'))" 2>/dev/null; then

@@ -293,7 +293,20 @@ def normalize_operators(s):
 # Coarse fallback detector for commands shlex cannot tokenise (unbalanced
 # quoting). Rather than fail open on a command that plainly contains an
 # index-mutating git invocation, gate it against the session cwd.
-UNPARSEABLE_RE = re.compile(r'(^|[;&|(){}\n])\s*(\w+=\S*\s+)*git\b[^;&|(){}\n]*\b(add|commit|rm|mv|reset)\b')
+#
+# The reserved-word alternation mirrors RESERVED_WORDS below for the same
+# reason (SABLE-hfkdd): without it a keyword-wrapped write that also carries
+# an unbalanced quote (if true; then git commit -am ...) matched nothing here
+# and fell through to fail OPEN, which is the one direction this fallback
+# exists to prevent. Both paths to a decision must see a keyword-prefixed git.
+# (No literal double quote in this comment: the whole program is embedded in a
+# double-quoted bash string, so one would terminate it — same reason the code
+# below spells quote characters as chr(34)/chr(39).)
+UNPARSEABLE_RE = re.compile(
+    r'(^|[;&|(){}\n])\s*'
+    r'(?:(?:if|then|elif|else|while|until|do|for|select|case|in|function|time|!)\s+)*'
+    r'(\w+=\S*\s+)*'
+    r'git\b[^;&|(){}\n]*\b(add|commit|rm|mv|reset)\b')
 
 try:
     tokens = shlex.split(normalize_operators(cmd))
@@ -308,11 +321,37 @@ except ValueError:
 # and 'break out of the git-flag walk' loop treats them as boundaries; the
 # main loop then gives them their scoping behaviour (push/pop) on top.
 SHELL_SEPS = {';', '&&', '||', '|', '(', ')'}
-# NOTE: reserved words ('then', 'do', 'else', ...) are NOT treated as command
-# positions here, so 'if true; then git commit; fi' still evades the walk.
-# That is a live false negative tracked separately as SABLE-hfkdd — it is
-# pre-existing on the base branch, not introduced or fixed here, and is
-# deliberately left out of this change's scope.
+# SABLE-hfkdd: bash reserved words are TRANSPARENT at command position — skip
+# the token and STAY at command position, exactly as this walk already does
+# for NAME=VALUE prefixes and env(1).
+#
+# Operators alone are not enough to track command position. Every compound
+# construct puts a reserved word precisely where a command name is expected,
+# so without this the walk fell OFF command position on 'then'/'do' and the
+# write behind it was never evaluated as a command at all:
+#   'if true; then git commit -am x; fi'      -> the ';' reset correctly, but
+#   'for f in 1; do git commit -am x; done'      'then'/'do' knocked the walk
+#   'while false; do git commit -am x; done'     off and the git was invisible
+# Those are ordinary shapes in agent-composed bash, not adversarial ones, and
+# they evaded the claim entirely. The same blindness also mis-ATTRIBUTED
+# writes: a 'cd' behind 'then' went unseen, so 'if true; then cd <other>;
+# git commit; fi' was gated against the wrong directory.
+#
+# Stated as a property rather than an enumeration of constructs, because the
+# failure mode is always the same one thing: a keyword sat where a command
+# name was expected. None of these words can name a real command, so skipping
+# them at command position cannot hide one.
+#
+# This is orthogonal to the paren scoping above and must stay so: keywords
+# change only WHERE the walk looks for a command, never the cwd stack. Loop
+# and if bodies run in the CURRENT shell, so a 'cd' inside one persists — the
+# same reason brace groups are not popped and subshells are.
+RESERVED_WORDS = {
+    'if', 'then', 'elif', 'else', 'fi',
+    'for', 'select', 'while', 'until', 'do', 'done',
+    'case', 'esac', 'in',
+    'function', 'time', '!', 'coproc',
+}
 # git global flags that consume the next token as an argument
 CONSUME_NEXT = {'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path'}
 STANDALONE = {
@@ -381,6 +420,11 @@ while i < n:
                 # but do not move the directory.
                 target_ambiguous = True
         at_cmd_pos = True
+        i += 1
+        continue
+    # At command position: a reserved word is transparent — stay at command
+    # position and keep looking (SABLE-hfkdd, see RESERVED_WORDS).
+    if at_cmd_pos and tok in RESERVED_WORDS:
         i += 1
         continue
     # At command position: transparent NAME=VALUE env-assignment prefix
