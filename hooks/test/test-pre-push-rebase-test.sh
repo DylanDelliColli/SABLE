@@ -711,6 +711,186 @@ assert_context "SABLE-1238: leaked SABLE_BASE_BRANCH=origin/main is IGNORED — 
   "$AMZ_LEAK_ENV" "git push origin wk-4amz-w" "$AMZ_REPO" "phase skipped"
 rm -rf "$AMZ_BARE" "$AMZ_REPO"
 
+# ===================================================================
+# SABLE-rzsb S4 / SABLE-h07t: manifest search widened to UPWARD +
+# SUBDIR (not cwd-only), plus a new never-skippable BUILD phase.
+# ===================================================================
+
+# call_hook_fn <function-name> [args...]
+# Sources the hook in a subshell (functions only — the
+# `[ "${BASH_SOURCE[0]}" = "${0}" ]` guard keeps main() from auto-running on
+# source) and invokes <function-name>, so the manifest-search helpers and
+# detect_* auto-detectors can be unit-tested directly against fixture
+# directories, without going through the full JSON-stdin hook harness.
+call_hook_fn() {
+  local fn="$1"; shift
+  ( . "$HOOK"; "$fn" "$@" )
+}
+
+# ---------- UNIT: sable_find_manifest_dir ----------
+
+# Test U1: upward search — cwd is nested BELOW the manifest (repo root).
+U1_ROOT="$TMPROOT/unit-upward"
+rm -rf "$U1_ROOT"
+mkdir -p "$U1_ROOT/nested/deep"
+git init -q "$U1_ROOT"
+git -C "$U1_ROOT" config user.email t@t
+git -C "$U1_ROOT" config user.name t
+echo '{}' > "$U1_ROOT/package.json"
+GOT=$(call_hook_fn sable_find_manifest_dir "$U1_ROOT/nested/deep" "" package.json)
+if [ -n "$GOT" ] && [ -f "$GOT/package.json" ]; then
+  PASS=$((PASS+1)); echo "PASS: sable_find_manifest_dir resolves UPWARD from a nested cwd to a parent-dir manifest"
+else
+  FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  sable_find_manifest_dir upward search"
+  echo "FAIL: sable_find_manifest_dir resolves UPWARD from a nested cwd to a parent-dir manifest (got: [$GOT])"
+fi
+rm -rf "$U1_ROOT"
+
+# Test U2: subdir search — repo root has NO manifest, but a file changed on
+# this push (relative to base_branch) lives under a subdir that does.
+U2_ROOT="$TMPROOT/unit-subdir"
+rm -rf "$U2_ROOT"
+git init -q "$U2_ROOT"
+git -C "$U2_ROOT" config user.email t@t
+git -C "$U2_ROOT" config user.name t
+(
+  cd "$U2_ROOT" || exit 1
+  echo root > README.md
+  git add -A; git commit -q -m base
+  BASE_REF=$(git rev-parse --abbrev-ref HEAD)
+  git checkout -q -b feature
+  mkdir -p sub/src
+  echo '{"scripts":{"test":"exit 0"}}' > sub/package.json
+  echo x > sub/src/foo.js
+  git add -A; git commit -q -m "add subdir manifest"
+  echo "$BASE_REF" > "$TMPROOT/u2-base-ref"
+)
+U2_BASE=$(cat "$TMPROOT/u2-base-ref")
+GOT=$(call_hook_fn sable_find_manifest_dir "$U2_ROOT" "$U2_BASE" package.json)
+if [ "$GOT" = "$U2_ROOT/sub" ] || { [ -n "$GOT" ] && [ -f "$GOT/package.json" ] && [ "$GOT" != "$U2_ROOT" ]; }; then
+  PASS=$((PASS+1)); echo "PASS: sable_find_manifest_dir resolves INTO a subdir via a changed file when repo root has no manifest"
+else
+  FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  sable_find_manifest_dir subdir search"
+  echo "FAIL: sable_find_manifest_dir resolves INTO a subdir via a changed file when repo root has no manifest (got: [$GOT])"
+fi
+rm -rf "$U2_ROOT" "$TMPROOT/u2-base-ref"
+
+# Test U3: no manifest anywhere (upward or subdir) — resolves cleanly to
+# empty, does not crash the caller under `set -e`.
+U3_ROOT="$TMPROOT/unit-none"
+rm -rf "$U3_ROOT"
+git init -q "$U3_ROOT"
+git -C "$U3_ROOT" config user.email t@t
+git -C "$U3_ROOT" config user.name t
+(
+  cd "$U3_ROOT" || exit 1
+  echo root > README.md
+  git add -A; git commit -q -m base
+)
+GOT="unset"
+RC=0
+GOT=$(call_hook_fn sable_find_manifest_dir "$U3_ROOT" "master" package.json pyproject.toml Cargo.toml go.mod) || RC=$?
+TESTCMD_GOT=$(call_hook_fn detect_test_cmd "$U3_ROOT" "master") || RC=$?
+if [ "$RC" -eq 0 ] && [ -z "$GOT" ] && [ -z "$TESTCMD_GOT" ]; then
+  PASS=$((PASS+1)); echo "PASS: no manifest found anywhere (upward or subdir) — resolves empty, does not crash"
+else
+  FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  sable_find_manifest_dir no-manifest-found"
+  echo "FAIL: no manifest found anywhere (upward or subdir) — resolves empty, does not crash (rc=$RC got=[$GOT] testcmd=[$TESTCMD_GOT])"
+fi
+rm -rf "$U3_ROOT"
+
+# ---------- E2E: monorepo/subdir-manifest gate + build phase ----------
+
+# Test E1: monorepo-shaped worktree (manifest in a subdir, not repo root) —
+# the pre-push gate DETECTS and RUNS the real suite, not a no-op. The
+# subdir test script exits 7 (a distinctive, non-npm-internal code) so the
+# denial can only come from that script actually having been executed.
+MONO_BARE="$TMPROOT/mono-bare.git"
+MONO_REPO="$TMPROOT/mono-repo"
+rm -rf "$MONO_BARE" "$MONO_REPO"
+git init -q --bare "$MONO_BARE"
+git clone -q "$MONO_BARE" "$MONO_REPO" 2>/dev/null
+(
+  cd "$MONO_REPO" || exit 1
+  git config user.email t@t; git config user.name t
+  git checkout -q -B main
+  echo root > README.md
+  git add -A; git commit -q -m base
+  git push -q origin main
+  mkdir -p sub
+  cat > sub/package.json <<'EOF'
+{"scripts": {"test": "exit 7"}}
+EOF
+  git add -A; git commit -q -m "add subdir manifest + failing suite"
+)
+MONO_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true"
+assert_deny "SABLE-rzsb S4: monorepo subdir-manifest worktree — gate DETECTS+RUNS the real suite (not a no-op)" \
+  "$MONO_ENV" "git push" "$MONO_REPO" "exit 7"
+rm -rf "$MONO_BARE" "$MONO_REPO"
+
+# Test E2: regression — a manifest AT the worktree root (the pre-widening
+# case) is still detected and its real suite still runs.
+ROOTMAN_BARE="$TMPROOT/rootman-bare.git"
+ROOTMAN_REPO="$TMPROOT/rootman-repo"
+rm -rf "$ROOTMAN_BARE" "$ROOTMAN_REPO"
+git init -q --bare "$ROOTMAN_BARE"
+git clone -q "$ROOTMAN_BARE" "$ROOTMAN_REPO" 2>/dev/null
+(
+  cd "$ROOTMAN_REPO" || exit 1
+  git config user.email t@t; git config user.name t
+  git checkout -q -B main
+  echo root > README.md
+  git add -A; git commit -q -m base
+  git push -q origin main
+  cat > package.json <<'EOF'
+{"scripts": {"test": "exit 9"}}
+EOF
+  git add -A; git commit -q -m "add root manifest + failing suite"
+)
+ROOTMAN_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true"
+assert_deny "SABLE-rzsb S4 regression: root-manifest worktree is still detected (upward+subdir widening doesn't break the base case)" \
+  "$ROOTMAN_ENV" "git push" "$ROOTMAN_REPO" "exit 9"
+rm -rf "$ROOTMAN_BARE" "$ROOTMAN_REPO"
+
+# Test E3: build-phase fixture — a stand-in "page-export error" (a failing
+# build script) that a passing typecheck+test would NOT catch trips the new
+# BUILD phase. Mirrors the existing typecheck-override style (Test 6/7):
+# real npm auto-detection of the build script from package.json, not an
+# override, is what's under test here.
+BUILD_BARE="$TMPROOT/build-bare.git"
+BUILD_REPO="$TMPROOT/build-repo"
+rm -rf "$BUILD_BARE" "$BUILD_REPO"
+git init -q --bare "$BUILD_BARE"
+git clone -q "$BUILD_BARE" "$BUILD_REPO" 2>/dev/null
+(
+  cd "$BUILD_REPO" || exit 1
+  git config user.email t@t; git config user.name t
+  git checkout -q -B main
+  echo root > README.md
+  git add -A; git commit -q -m base
+  git push -q origin main
+  cat > package.json <<'EOF'
+{"scripts": {"build": "exit 42", "test": "exit 0"}}
+EOF
+  git add -A; git commit -q -m "add failing build script (page-export-error stand-in)"
+)
+BUILD_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true SABLE_PRE_PUSH_TEST_PHASE=skip"
+assert_deny "SABLE-rzsb S4: build-phase fixture (page-export-error stand-in passing typecheck) trips the new BUILD phase" \
+  "$BUILD_ENV" "git push" "$BUILD_REPO" "phase 3 (build)"
+
+# Test E4: a passing build (script exits 0) does not block the push — the
+# new phase isn't a false-positive gate.
+(
+  cd "$BUILD_REPO" || exit 1
+  cat > package.json <<'EOF'
+{"scripts": {"build": "exit 0", "test": "exit 0"}}
+EOF
+  git add -A; git commit -q -m "fix build script"
+)
+assert_context "SABLE-rzsb S4: passing build script does not block the push (build phase is not a false-positive gate)" \
+  "$BUILD_ENV" "git push" "$BUILD_REPO" "phase skipped"
+rm -rf "$BUILD_BARE" "$BUILD_REPO"
+
 # Cleanup
 rm -rf "$REPO_DIR" "$BARE_DIR" "$V3_YAML"
 

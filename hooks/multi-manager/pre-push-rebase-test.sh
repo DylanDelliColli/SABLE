@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-# pre-push-rebase-test.sh — Three-phase pre-push gate
+# pre-push-rebase-test.sh — Four-phase pre-push gate
 # Trigger: PreToolUse:Bash matching `git push`
 #
 # Phases (in order):
 #   1. REBASE   — always runs, never skippable. Fetch + rebase on $SABLE_BASE_BRANCH.
 #   2. STATIC   — typecheck (and lint, if configured). Always runs, NEVER skippable.
 #                 Auto-detected per project; if no typechecker found, phase no-ops.
-#   3. TESTS    — runs if SABLE_PRE_PUSH_TEST_PHASE != "skip" and
+#   3. BUILD    — the project's build command, if one auto-detects (or is
+#                 configured). Always runs, NEVER skippable. Catches build-only
+#                 failures (e.g. Next.js page-export errors) that pass both
+#                 typecheck and the test suite (SABLE-rzsb S4 / SABLE-h07t).
+#   4. TESTS    — runs if SABLE_PRE_PUSH_TEST_PHASE != "skip" and
 #                 SABLE_SKIP_PRE_PUSH != "1". Bounded by SABLE_PRE_PUSH_TEST_TIMEOUT.
 #
-# **SABLE_SKIP_PRE_PUSH=1 only skips TESTS.** Rebase and static analysis still run.
-# This is a deliberate weakening of the bypass to prevent typecheck regressions
-# from sneaking through to CI. If you genuinely need to bypass everything (true
-# emergency, e.g. CI infra outage), disable the hook entry in settings.json
-# explicitly, or use `git push --force` which short-circuits this hook entirely.
+# **SABLE_SKIP_PRE_PUSH=1 only skips TESTS.** Rebase, static analysis, and the
+# build phase still run. This is a deliberate weakening of the bypass to
+# prevent typecheck/build regressions from sneaking through to CI. If you
+# genuinely need to bypass everything (true emergency, e.g. CI infra outage),
+# disable the hook entry in settings.json explicitly, or use `git push --force`
+# which short-circuits this hook entirely.
 #
 # Configuration:
 #   $SABLE_BASE_BRANCH                  — branch to rebase against (default: origin/main)
@@ -26,6 +31,8 @@
 #   $SABLE_PRE_PUSH_TYPECHECK_COMMAND   — typecheck invocation (override auto-detect)
 #   $SABLE_PRE_PUSH_LINT_COMMAND        — lint invocation (no auto-detect; opt-in)
 #   $SABLE_PRE_PUSH_STATIC_TIMEOUT      — seconds for static phase (default: 90)
+#   $SABLE_PRE_PUSH_BUILD_COMMAND       — build invocation (override auto-detect)
+#   $SABLE_PRE_PUSH_BUILD_TIMEOUT       — seconds for build phase (default: 120)
 #   $SABLE_PRE_PUSH_TEST_PHASE          — "auto" (default) | "skip" (delegate to repo's git hooks)
 #   $SABLE_TEST_COMMAND                 — test invocation (used when PHASE=auto; lowest-priority
 #                                         source — see sable_resolve_test_command below)
@@ -33,30 +40,27 @@
 #                                         source — see sable_resolve_test_timeout below. Repo-local
 #                                         override: `git config sable.testTimeout <seconds>`, or a
 #                                         checked-in `testTimeout=<seconds>` line in .sable)
-#   $SABLE_SKIP_PRE_PUSH                — "1" to skip TESTS only (rebase+static still run)
+#   $SABLE_SKIP_PRE_PUSH                — "1" to skip TESTS only (rebase+static+build still run)
 #
-# Auto-detect typechecker by project markers:
+# Auto-detect typechecker/build by project markers. Manifest search (SABLE-rzsb
+# S4) is not cwd-only: it walks UPWARD from $CWD to the repo root, and — if
+# nothing is found upward — INTO the subdirs of the files this push actually
+# changed (walking upward from each changed file's directory), so a
+# monorepo/subdir-manifest worktree (e.g. a manifest at location-briefing/
+# rather than the worktree root) is still detected (SABLE-h07t). See
+# sable_find_manifest_dir below.
 #   tsconfig.json    → npx tsc --noEmit
 #   pyproject.toml   → mypy . (only if [tool.mypy] section present)
 #   Cargo.toml       → cargo check
 #   go.mod           → go vet ./...
+#   package.json with a "build" script → npm run build
 #
 # Lint is opt-in (no reliable auto-detect across linter ecosystems).
 
 set -euo pipefail
 
-HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
-
-# Identity via lib-identity.sh (SABLE-uz9.3 / SABLE-404): the gated phases fire
-# for ANY manager identity — legacy env terminals (Chuck holdout), the Lincoln
-# main session in execution mode, and manager-typed subagents (Optimus/Tarzan
-# pushing their OWN lane from a nested subagent context; v3 moved push authority
-# to the managers). Worker subagents are mechanically DENIED below (they return
-# their stopped-before-push results to the manager, who reviews and pushes the
-# lane); anonymous main sessions stand down.
 # shellcheck source=lib-identity.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib-identity.sh"
-sable_resolve_identity "$HOOK_INPUT"
 
 emit_deny() {
   # $1 = reason text
@@ -84,6 +88,223 @@ print(json.dumps({
 }))
 "
 }
+
+# ---------------------------------------------------------------------------
+# Manifest search + auto-detect helpers (SABLE-rzsb S4 / SABLE-h07t).
+#
+# These are pure functions (no stdin/global-state reads beyond their
+# arguments) so they can be unit-tested directly: source this file (the
+# `[ "${BASH_SOURCE[0]}" = "${0}" ]` guard at the bottom keeps `main` from
+# auto-running on source) and call them with fixture directories.
+# ---------------------------------------------------------------------------
+
+# sable_find_manifest_dir <cwd> <base_branch> <manifest1> [manifest2 ...]
+#
+# Locates the nearest project manifest. The old check was `[ -f
+# "$cwd/<manifest>" ]` only — a no-op in any monorepo/subdir-manifest
+# worktree (h07t: a worktree root with no manifest but a subdir like
+# location-briefing/ holding pyproject.toml). Search order:
+#   1. UPWARD from <cwd> to the repo root (inclusive) — covers a cwd nested
+#      below the manifest.
+#   2. INTO SUBDIRS reachable from the files this push changed
+#      (`git diff --name-only <base_branch>...HEAD`), walking upward from
+#      each changed file's directory to the repo root — covers the monorepo
+#      case where <cwd> IS the repo root but the manifest lives under a
+#      package subdir the push actually touched. Skipped when <base_branch>
+#      is empty (nothing to diff against).
+# Prints the absolute directory containing the nearest manifest (nothing if
+# not found either way). Always returns 0 — never fails the caller under
+# `set -e`; callers test `[ -n "$dir" ]`.
+sable_find_manifest_dir() {
+  local cwd="$1" base_branch="$2"
+  shift 2
+  local manifests=("$@")
+  local repo_root
+  repo_root=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null) || repo_root="$cwd"
+
+  local dir="$cwd" m
+  while :; do
+    for m in "${manifests[@]}"; do
+      if [ -f "$dir/$m" ]; then
+        printf '%s' "$dir"
+        return 0
+      fi
+    done
+    if [ "$dir" = "$repo_root" ] || [ "$dir" = "/" ] || [ -z "$dir" ]; then
+      break
+    fi
+    dir=$(dirname "$dir")
+  done
+
+  if [ -n "$base_branch" ]; then
+    local changed_file
+    while IFS= read -r changed_file; do
+      [ -z "$changed_file" ] && continue
+      dir="$repo_root/$(dirname "$changed_file")"
+      while :; do
+        for m in "${manifests[@]}"; do
+          if [ -f "$dir/$m" ]; then
+            printf '%s' "$dir"
+            return 0
+          fi
+        done
+        if [ "$dir" = "$repo_root" ] || [ "$dir" = "/" ] || [ -z "$dir" ]; then
+          break
+        fi
+        dir=$(dirname "$dir")
+      done
+    done < <(git -C "$cwd" diff --name-only "${base_branch}...HEAD" 2>/dev/null || true)
+  fi
+
+  return 0
+}
+
+# sable_cmd_in_dir <cwd> <resolved-dir> <cmd>
+#
+# Wraps <cmd> to `cd` into <resolved-dir> first when it differs from <cwd> —
+# sable_find_manifest_dir can resolve a manifest upward or into a
+# changed-file's subdir, and the command must run there, not at the phase's
+# own $CWD.
+sable_cmd_in_dir() {
+  local cwd="$1" dir="$2" cmd="$3"
+  if [ "$dir" = "$cwd" ]; then
+    printf '%s\n' "$cmd"
+  else
+    printf 'cd %q && %s\n' "$dir" "$cmd"
+  fi
+}
+
+# sable_tail_chars <text> <n>
+#
+# Prints the last <n> characters of <text>. Bash's own negative-offset
+# substring expansion (`${VAR: -N}`) returns EMPTY — not the full value —
+# whenever <text> is SHORTER than N (confirmed bash 5.2.21: `X=short; echo
+# ${X: -1500}` prints nothing), which silently dropped the actual command
+# output from every deny message whose failure was under 1500 chars, the
+# common case (SABLE-5y1en). `tail -c` has no such short-input special case.
+sable_tail_chars() {
+  printf '%s' "$1" | tail -c "$2"
+}
+
+# Auto-detect typecheck command from project markers.
+# Echoes the command (or empty if no typechecker found).
+detect_typecheck_cmd() {
+  local cwd="$1" base_branch="${2:-}"
+  if [ -n "${SABLE_PRE_PUSH_TYPECHECK_COMMAND:-}" ]; then
+    echo "$SABLE_PRE_PUSH_TYPECHECK_COMMAND"
+    return
+  fi
+
+  local dir
+  dir=$(sable_find_manifest_dir "$cwd" "$base_branch" tsconfig.json)
+  if [ -n "$dir" ]; then
+    sable_cmd_in_dir "$cwd" "$dir" "npx --no-install tsc --noEmit"
+    return
+  fi
+
+  dir=$(sable_find_manifest_dir "$cwd" "$base_branch" pyproject.toml)
+  if [ -n "$dir" ] && grep -q '\[tool.mypy\]' "$dir/pyproject.toml" 2>/dev/null; then
+    sable_cmd_in_dir "$cwd" "$dir" "mypy ."
+    return
+  fi
+
+  dir=$(sable_find_manifest_dir "$cwd" "$base_branch" Cargo.toml)
+  if [ -n "$dir" ]; then
+    sable_cmd_in_dir "$cwd" "$dir" "cargo check --all-targets"
+    return
+  fi
+
+  dir=$(sable_find_manifest_dir "$cwd" "$base_branch" go.mod)
+  if [ -n "$dir" ]; then
+    sable_cmd_in_dir "$cwd" "$dir" "go vet ./..."
+    return
+  fi
+
+  echo ""
+}
+
+# Resolve the test command: repo-local config / checked-in .sable / env
+# (sable_resolve_test_command, SABLE-hml), else the repo's CI-tier SSOT
+# pre_push tier if it declares one (SABLE-cmar4.1 — .github/ci/test-tiers.sh,
+# consumption seam only: this repo's own testCommand= now reads THAT tier
+# rather than hardcoding the suite list, and any other repo that adopts the
+# tier SSOT gets this fallback for free without configuring testCommand at
+# all), else auto-detect from project markers (manifest search widened to
+# upward+subdir, SABLE-rzsb S4), else empty (no test command — phase 4
+# no-ops with a message).
+detect_test_cmd() {
+  local cwd="$1" base_branch="${2:-}"
+  local resolved
+  resolved=$(sable_resolve_test_command "$cwd")
+  if [ -n "$resolved" ]; then
+    echo "$resolved"
+    return
+  fi
+  if [ -f "$cwd/.github/ci/test-tiers.sh" ]; then
+    echo "bash .github/ci/test-tiers.sh --run pre_push"
+    return
+  fi
+
+  local dir
+  dir=$(sable_find_manifest_dir "$cwd" "$base_branch" package.json)
+  if [ -n "$dir" ]; then
+    sable_cmd_in_dir "$cwd" "$dir" "npm test"
+    return
+  fi
+
+  dir=$(sable_find_manifest_dir "$cwd" "$base_branch" pyproject.toml setup.py)
+  if [ -n "$dir" ]; then
+    sable_cmd_in_dir "$cwd" "$dir" "pytest"
+    return
+  fi
+
+  dir=$(sable_find_manifest_dir "$cwd" "$base_branch" Cargo.toml)
+  if [ -n "$dir" ]; then
+    sable_cmd_in_dir "$cwd" "$dir" "cargo test"
+    return
+  fi
+
+  dir=$(sable_find_manifest_dir "$cwd" "$base_branch" go.mod)
+  if [ -n "$dir" ]; then
+    sable_cmd_in_dir "$cwd" "$dir" "go test ./..."
+    return
+  fi
+
+  echo ""
+}
+
+# Auto-detect build command from project markers (SABLE-rzsb S4 / h07t
+# addendum: Next.js App Router page-export errors pass tsc+vitest but fail
+# the real build, and land red on the integration branch). Echoes the
+# command (or empty if no build command found — the phase no-ops).
+detect_build_cmd() {
+  local cwd="$1" base_branch="${2:-}"
+  if [ -n "${SABLE_PRE_PUSH_BUILD_COMMAND:-}" ]; then
+    echo "$SABLE_PRE_PUSH_BUILD_COMMAND"
+    return
+  fi
+
+  local dir
+  dir=$(sable_find_manifest_dir "$cwd" "$base_branch" package.json)
+  if [ -n "$dir" ] && grep -qE '"build"[[:space:]]*:' "$dir/package.json" 2>/dev/null; then
+    sable_cmd_in_dir "$cwd" "$dir" "npm run build"
+    return
+  fi
+
+  echo ""
+}
+
+main() {
+HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
+
+# Identity via lib-identity.sh (SABLE-uz9.3 / SABLE-404): the gated phases fire
+# for ANY manager identity — legacy env terminals (Chuck holdout), the Lincoln
+# main session in execution mode, and manager-typed subagents (Optimus/Tarzan
+# pushing their OWN lane from a nested subagent context; v3 moved push authority
+# to the managers). Worker subagents are mechanically DENIED below (they return
+# their stopped-before-push results to the manager, who reviews and pushes the
+# lane); anonymous main sessions stand down.
+sable_resolve_identity "$HOOK_INPUT"
 
 PARSED=$(printf '%s' "$HOOK_INPUT" | python3 -c "
 import json, sys
@@ -153,79 +374,6 @@ CWD=$(sable_resolve_push_repo_dir "$CWD" "$COMMAND")
 # BASE_BRANCH is resolved below, AFTER the integration branch is known
 # (SABLE-4amz) — the old unconditional origin/main default here re-parented
 # worker branches on non-main integration repos.
-
-# ---------------------------------------------------------------------------
-# Helpers  (emit_deny / emit_context are defined above, before the worker-deny
-# leg that needs them)
-# ---------------------------------------------------------------------------
-
-# Auto-detect typecheck command from project markers.
-# Echoes the command (or empty if no typechecker found).
-detect_typecheck_cmd() {
-  local cwd="$1"
-  if [ -n "${SABLE_PRE_PUSH_TYPECHECK_COMMAND:-}" ]; then
-    echo "$SABLE_PRE_PUSH_TYPECHECK_COMMAND"
-    return
-  fi
-  if [ -f "$cwd/tsconfig.json" ]; then
-    echo "npx --no-install tsc --noEmit"
-    return
-  fi
-  if [ -f "$cwd/pyproject.toml" ]; then
-    if grep -q '\[tool.mypy\]' "$cwd/pyproject.toml" 2>/dev/null; then
-      echo "mypy ."
-      return
-    fi
-  fi
-  if [ -f "$cwd/Cargo.toml" ]; then
-    echo "cargo check --all-targets"
-    return
-  fi
-  if [ -f "$cwd/go.mod" ]; then
-    echo "go vet ./..."
-    return
-  fi
-  echo ""
-}
-
-# Resolve the test command: repo-local config / checked-in .sable / env
-# (sable_resolve_test_command, SABLE-hml), else the repo's CI-tier SSOT
-# pre_push tier if it declares one (SABLE-cmar4.1 — .github/ci/test-tiers.sh,
-# consumption seam only: this repo's own testCommand= now reads THAT tier
-# rather than hardcoding the suite list, and any other repo that adopts the
-# tier SSOT gets this fallback for free without configuring testCommand at
-# all), else auto-detect from project markers, else empty (no test command —
-# phase 3 no-ops with a message).
-detect_test_cmd() {
-  local cwd="$1"
-  local resolved
-  resolved=$(sable_resolve_test_command "$cwd")
-  if [ -n "$resolved" ]; then
-    echo "$resolved"
-    return
-  fi
-  if [ -f "$cwd/.github/ci/test-tiers.sh" ]; then
-    echo "bash .github/ci/test-tiers.sh --run pre_push"
-    return
-  fi
-  if [ -f "$cwd/package.json" ]; then
-    echo "npm test"
-    return
-  fi
-  if [ -f "$cwd/pyproject.toml" ] || [ -f "$cwd/setup.py" ]; then
-    echo "pytest"
-    return
-  fi
-  if [ -f "$cwd/Cargo.toml" ]; then
-    echo "cargo test"
-    return
-  fi
-  if [ -f "$cwd/go.mod" ]; then
-    echo "go test ./..."
-    return
-  fi
-  echo ""
-}
 
 # ---------------------------------------------------------------------------
 # Phase 1: REBASE (never skippable)
@@ -338,7 +486,7 @@ fi
 
 STATIC_TIMEOUT="${SABLE_PRE_PUSH_STATIC_TIMEOUT:-90}"
 
-TYPECHECK_CMD=$(detect_typecheck_cmd "$CWD")
+TYPECHECK_CMD=$(detect_typecheck_cmd "$CWD" "$BASE_BRANCH")
 
 if [ -n "$TYPECHECK_CMD" ]; then
   TC_EXIT=0
@@ -353,7 +501,7 @@ if [ -n "$TYPECHECK_CMD" ]; then
     emit_deny "Pre-push phase 2 (static): typecheck failed (\`$TYPECHECK_CMD\`).
 ${SUFFIX}
 
-${TC_OUT: -1500}"
+$(sable_tail_chars "$TC_OUT" 1500)"
     exit 0
   fi
 fi
@@ -374,31 +522,60 @@ if [ -n "$LINT_CMD" ]; then
     emit_deny "Pre-push phase 2 (static): lint failed (\`$LINT_CMD\`).
 ${SUFFIX}
 
-${LINT_OUT: -1500}"
+$(sable_tail_chars "$LINT_OUT" 1500)"
     exit 0
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 3: TESTS (skippable via SABLE_SKIP_PRE_PUSH=1 or PHASE=skip)
+# Phase 3: BUILD (never skippable) — SABLE-rzsb S4 / SABLE-h07t addendum.
+# Catches build-only failures (e.g. Next.js page-export errors) that pass
+# both typecheck and the test suite, and otherwise land red on the
+# integration branch.
+# ---------------------------------------------------------------------------
+
+BUILD_TIMEOUT="${SABLE_PRE_PUSH_BUILD_TIMEOUT:-120}"
+
+BUILD_CMD=$(detect_build_cmd "$CWD" "$BASE_BRANCH")
+
+if [ -n "$BUILD_CMD" ]; then
+  BUILD_EXIT=0
+  BUILD_OUT=$(cd "$CWD" && timeout "$BUILD_TIMEOUT" sh -c "$BUILD_CMD" 2>&1) || BUILD_EXIT=$?
+
+  if [ "$BUILD_EXIT" -ne 0 ]; then
+    if [ "$BUILD_EXIT" -eq 124 ]; then
+      SUFFIX="Build exceeded SABLE_PRE_PUSH_BUILD_TIMEOUT=${BUILD_TIMEOUT}s. Either narrow the build scope or raise the timeout."
+    else
+      SUFFIX="Build failed. This phase CANNOT be skipped via SABLE_SKIP_PRE_PUSH — it is structurally required (build-only errors, e.g. Next.js page-export errors, pass typecheck and the test suite but fail the real build)."
+    fi
+    emit_deny "Pre-push phase 3 (build): build failed (\`$BUILD_CMD\`).
+${SUFFIX}
+
+$(sable_tail_chars "$BUILD_OUT" 1500)"
+    exit 0
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 4: TESTS (skippable via SABLE_SKIP_PRE_PUSH=1 or PHASE=skip)
 # ---------------------------------------------------------------------------
 
 TEST_PHASE="${SABLE_PRE_PUSH_TEST_PHASE:-auto}"
 
 if [ "$TEST_PHASE" = "skip" ]; then
-  emit_context "Pre-push: rebase + static phases passed; test phase skipped (SABLE_PRE_PUSH_TEST_PHASE=skip). Repo git hooks handle test gating on the rebased state."
+  emit_context "Pre-push: rebase + static + build phases passed; test phase skipped (SABLE_PRE_PUSH_TEST_PHASE=skip). Repo git hooks handle test gating on the rebased state."
   exit 0
 fi
 
 if [ "${SABLE_SKIP_PRE_PUSH:-}" = "1" ]; then
-  emit_context "Pre-push: rebase + static phases passed; test phase bypassed (SABLE_SKIP_PRE_PUSH=1). Note: typecheck/lint were still enforced — bypass is now scoped to the test phase only."
+  emit_context "Pre-push: rebase + static + build phases passed; test phase bypassed (SABLE_SKIP_PRE_PUSH=1). Note: typecheck/lint/build were still enforced — bypass is now scoped to the test phase only."
   exit 0
 fi
 
-TEST_CMD=$(detect_test_cmd "$CWD")
+TEST_CMD=$(detect_test_cmd "$CWD" "$BASE_BRANCH")
 
 if [ -z "$TEST_CMD" ]; then
-  emit_context "Pre-push: rebase + static phases passed; no test command detected (no package.json/pyproject.toml/Cargo.toml/go.mod). Add a testCommand= line to .sable (checked in), or set sable.testCommand via git config, or set SABLE_TEST_COMMAND, to enforce tests before push."
+  emit_context "Pre-push: rebase + static + build phases passed; no test command detected (no package.json/pyproject.toml/Cargo.toml/go.mod found upward or in any changed-file subdir). Add a testCommand= line to .sable (checked in), or set sable.testCommand via git config, or set SABLE_TEST_COMMAND, to enforce tests before push."
   exit 0
 fi
 
@@ -410,13 +587,18 @@ if [ "$TEST_EXIT" -ne 0 ]; then
   if [ "$TEST_EXIT" -eq 124 ]; then
     SUFFIX="Tests exceeded the ${TEST_TIMEOUT}s test-phase timeout. Either scope the test command to a faster subset (recommended: smoke + changed units, <60s), or raise the timeout for this repo: \`git config sable.testTimeout <seconds>\` (repo-local), a \`testTimeout=<seconds>\` line in .sable (checked in), or \$SABLE_PRE_PUSH_TEST_TIMEOUT (legacy env, and raise the settings.json hook timeout together with it)."
   else
-    SUFFIX="Tests failed. Fix before pushing, or set SABLE_SKIP_PRE_PUSH=1 with explicit intent (rebase + static still run)."
+    SUFFIX="Tests failed. Fix before pushing, or set SABLE_SKIP_PRE_PUSH=1 with explicit intent (rebase + static + build still run)."
   fi
-  emit_deny "Pre-push phase 3 (tests): \`$TEST_CMD\` failed.
+  emit_deny "Pre-push phase 4 (tests): \`$TEST_CMD\` failed.
 ${SUFFIX}
 
-${TEST_OUT: -1500}"
+$(sable_tail_chars "$TEST_OUT" 1500)"
   exit 0
 fi
 
 exit 0
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main
+fi
