@@ -22,6 +22,7 @@ command -v tmux >/dev/null 2>&1 || { echo "SKIP: tmux not installed"; exit 0; }
 
 SOCK="sable-msg-e2e-$$"
 REC="$(mktemp -d)"
+SCRATCH_BEADS_DIR=""
 
 PASS=0; FAIL=0; FAIL_NAMES=""
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -30,7 +31,7 @@ tmux_() { tmux -L "$SOCK" "$@"; }
 # Pane-spawning calls (new-session/new-window/split-window/respawn-pane) route
 # through the guarded sable_tmux_spawn instead of plain tmux -- see below.
 tmux_spawn_() { sable_tmux_spawn -L "$SOCK" "$@"; }
-cleanup() { tmux_ kill-server >/dev/null 2>&1; rm -rf "$REC"; }
+cleanup() { tmux_ kill-server >/dev/null 2>&1; rm -rf "$REC"; [ -n "$SCRATCH_BEADS_DIR" ] && rm -rf "$SCRATCH_BEADS_DIR" 2>/dev/null || true; }
 trap cleanup EXIT
 
 # This suite is itself commonly run FROM a real SABLE pane (a worker or
@@ -243,6 +244,62 @@ if [ -f "$REC/tarzan.txt" ] && grep -q 'fresh spawn wake' "$REC/tarzan.txt"; the
   pass "fresh-spawn interrupt was SUBMITTED as a turn, not swallowed"
 else
   fail "fresh-spawn interrupt was SUBMITTED as a turn, not swallowed" "$(tmux_ capture-pane -t "$mpane" -p)"
+fi
+
+# --- 7) unverifiable delivery files the SABLE-1umr fallback bead IN A SANDBOX,
+#     never the live DB (SABLE-j0vr / SABLE-f3zp) -----------------------------
+# A pane that never renders the composer prompt can never be confirmed IDLE,
+# so deliver_text exhausts its retries and sable-msg falls back to
+# file_fallback_bead. This is the exact shape test-tmux-e2e.sh's stand-in
+# hits in isolated/CI runs (SABLE-gcmu) -- reproduced here directly against a
+# pane that is provably never ready, so the fallback is guaranteed to fire
+# rather than depending on timing. BEADS_DB scopes bd create to a throwaway
+# sandbox DB; the assertions below prove the live repo DB never gained a bead.
+if command -v bd >/dev/null 2>&1; then
+  SCRATCH_BEADS_DIR="$(mktemp -d)"
+  ( cd "$SCRATCH_BEADS_DIR" && BD_NON_INTERACTIVE=1 bd init --prefix=sbx \
+      --non-interactive --skip-agents --skip-hooks --quiet >/dev/null 2>&1 )
+
+  tmux_spawn_ new-window -d -t w: -n stuck 'sleep 60'
+  stuckpane="$(tmux_ list-panes -a -F '#{pane_id} #{window_name}' | awk '$2=="stuck"{print $1; exit}')"
+  tmux_ set-option -p -t "$stuckpane" @sable_role chuck
+  sleep 0.2
+
+  live_count_before="$(cd "$REPO" && bd count 2>/dev/null)"
+  ERRFILE2="$REC/fallback-err.txt"
+  if CLAUDE_AGENT_NAME=lincoln SABLE_MSG_SUBMIT_TRIES=3 SABLE_MSG_POLL_INTERVAL=0.1 \
+      BEADS_DB="$SCRATCH_BEADS_DIR/.beads" \
+      python3 "$BIN/sable-msg" chuck "sandbox fallback probe" >/dev/null 2>"$ERRFILE2"; then
+    fail "unverifiable delivery to a never-ready pane reports undelivered (unexpectedly returned 0)" "$(cat "$ERRFILE2")"
+  else
+    pass "unverifiable delivery to a never-ready pane reports undelivered"
+  fi
+  live_count_after="$(cd "$REPO" && bd count 2>/dev/null)"
+
+  if grep -q "Filed durable inbox bead" "$ERRFILE2"; then
+    pass "sable-msg's SABLE-1umr fallback fired"
+  else
+    fail "sable-msg's SABLE-1umr fallback fired" "$(cat "$ERRFILE2")"
+  fi
+
+  sandbox_count="$(BEADS_DB="$SCRATCH_BEADS_DIR/.beads" bd count 2>/dev/null)"
+  if [ "$sandbox_count" = "1" ]; then
+    pass "fallback bead was created IN THE SANDBOX"
+  else
+    fail "fallback bead was created IN THE SANDBOX" "sandbox bd count=$sandbox_count"
+  fi
+  sandbox_labeled="$(BEADS_DB="$SCRATCH_BEADS_DIR/.beads" bd count --by-label 2>/dev/null | grep -c 'for-chuck')"
+  if [ "$sandbox_labeled" -ge 1 ]; then
+    pass "sandboxed fallback bead carries the for-chuck inbox label"
+  else
+    fail "sandboxed fallback bead carries the for-chuck inbox label" "$(BEADS_DB="$SCRATCH_BEADS_DIR/.beads" bd list --all --json 2>/dev/null)"
+  fi
+
+  if [ -n "$live_count_before" ] && [ "$live_count_before" = "$live_count_after" ]; then
+    pass "live bd DB gained ZERO beads from the fallback"
+  else
+    fail "live bd DB gained ZERO beads from the fallback" "before=$live_count_before after=$live_count_after"
+  fi
 fi
 
 echo
