@@ -99,6 +99,7 @@ ALLOW=(
   test-spine-pinning.sh
   test-staged-planning-docs.sh
   test-stash-worktree-guard.sh
+  test-tarzan-optimus-accept-contract.sh
   test-tdd-evidence.sh
   test-tdd-gate.sh
   test-thesis-docs.sh
@@ -164,6 +165,7 @@ declare -A COVERS=(
   [test-sable-test.sh]="bin/sable-test"
   [test-session-role-anchor.sh]="hooks/multi-manager/session-role-anchor.sh"
   [test-snapshot-freeze.sh]="bin/sable-snapshot bin/sable_snapshot_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py"
+  [test-tarzan-optimus-accept-contract.sh]="templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/optimus.md"
   [test-tdd-evidence.sh]="hooks/tdd-evidence.sh"
   [test-tdd-gate.sh]="hooks/tdd-gate.sh"
   [test-tier-budget-bead.sh]="bin/sable_gate_budget_lib.py bin/sable_gate_promote_lib.py bin/sable-merge-gate"
