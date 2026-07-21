@@ -655,6 +655,214 @@ else
 fi
 
 # ============================================================
+# SABLE-vx4aj — the claim must gate the command's ACTUAL TARGET repo,
+# never the ambient session cwd
+# ============================================================
+#
+# Observed (tarzan, 2026-07-21): a git write in an unrelated throwaway repo
+# was refused citing the SABLE checkout's claim. The hypothesis was
+# "attribution is session-cwd based". Investigation narrowed it: cd tracking
+# (SABLE-5pci) only fires when 'cd' sits at a command position the tokenizer
+# RECOGNISES. Any shell construct it does not model — a newline separator,
+# a subshell '(...)', a brace group, a background '&' — knocks the walk out
+# of command position, and then BOTH failure directions appear:
+#   FALSE POSITIVE: the 'cd <elsewhere>' prefix is invisible, so the git
+#     write is attributed to the ambient session cwd and gated by a claim on
+#     a repo it never touches (the observed symptom).
+#   FALSE NEGATIVE (the incident class, SABLE-041/936y/nsmc): the git write
+#     itself is invisible, so a write TARGETING the claimed repo sails past
+#     the claim entirely. A two-line Bash command is enough.
+#
+# Both directions are tested here. Ambiguous targets (an unexpandable 'cd
+# "$VAR"', an unparseable command) must GATE against the session cwd rather
+# than allow — a false positive is recoverable, a missed claim is not.
+
+echo "--- SABLE-vx4aj: target-repo attribution (two real repos) ---"
+
+VX_ROOT="$(mktemp -d)"
+VX_CLAIMED="$VX_ROOT/claimed"
+VX_UNRELATED="$VX_ROOT/unrelated"
+git init "$VX_CLAIMED" -q
+git -C "$VX_CLAIMED" commit --allow-empty -m init -q
+git init "$VX_UNRELATED" -q
+git -C "$VX_UNRELATED" commit --allow-empty -m init -q
+
+CF_CLAIMED="$(claim_file "$VX_CLAIMED")"
+CF_UNRELATED="$(claim_file "$VX_UNRELATED")"
+
+# Re-arm the foreign fresh claim on the claimed repo, clear the other side.
+vx_arm() {
+  printf 'sess-HOLDER %s chuck\n' "$(date +%s)" > "$CF_CLAIMED"
+  rm -f "$CF_UNRELATED"
+}
+
+# vx_check <label> <cwd> <command> <expect: deny|allow>
+vx_check() {
+  local label="$1" cwd="$2" cmd="$3" expect="$4"
+  vx_arm
+  local json out
+  json=$(make_json "$cmd" "sess-ME" "$cwd")
+  out=$(run_hook "$json")
+  if [ "$expect" = "deny" ]; then
+    if is_deny "$out"; then pass "vx4aj: $label"; else fail "vx4aj: $label" "expected deny, got allow: ${out:-<empty>}"; fi
+  else
+    if is_allow "$out"; then pass "vx4aj: $label"; else fail "vx4aj: $label" "expected allow, got deny: $out"; fi
+  fi
+}
+
+# --- Regression: the three forms the bead's test spec names explicitly ---
+vx_check "cd <unrelated> && git commit (cwd=claimed) is NOT gated by the claimed repo" \
+  "$VX_CLAIMED" "cd $VX_UNRELATED && git commit -m x" allow
+vx_check "git -C <claimed> commit (cwd=unrelated) IS gated" \
+  "$VX_UNRELATED" "git -C $VX_CLAIMED commit -m x" deny
+vx_check "plain git commit (cwd=claimed) IS gated" \
+  "$VX_CLAIMED" "git commit -m x" deny
+
+# --- FALSE NEGATIVE class: newline as a command separator ---
+# A multi-line Bash command is the single most common shape an agent sends.
+# Every one of these targets the claimed repo and must be refused.
+vx_check "newline separator: 'cd <claimed>' NEWLINE 'git commit' (cwd=unrelated) IS gated" \
+  "$VX_UNRELATED" "cd $VX_CLAIMED
+git commit -m x" deny
+vx_check "newline separator: non-git first line then 'git commit' (cwd=claimed) IS gated" \
+  "$VX_CLAIMED" "echo hi
+git commit -m x" deny
+vx_check "background '&' separator: 'sleep 1 & git commit' (cwd=claimed) IS gated" \
+  "$VX_CLAIMED" "sleep 1 & git commit -m x" deny
+vx_check "subshell: '( cd <claimed> && git commit )' (cwd=unrelated) IS gated" \
+  "$VX_UNRELATED" "( cd $VX_CLAIMED && git commit -m x )" deny
+vx_check "brace group: '{ cd <claimed>; git commit; }' (cwd=unrelated) IS gated" \
+  "$VX_UNRELATED" "{ cd $VX_CLAIMED; git commit -m x; }" deny
+
+# --- FALSE POSITIVE class: unrelated targets must proceed ---
+vx_check "newline separator: 'cd <unrelated>' NEWLINE 'git commit' (cwd=claimed) is NOT gated" \
+  "$VX_CLAIMED" "cd $VX_UNRELATED
+git commit -m x" allow
+vx_check "subshell: '( cd <unrelated> && git commit )' (cwd=claimed) is NOT gated" \
+  "$VX_CLAIMED" "( cd $VX_UNRELATED && git commit -m x )" allow
+vx_check "brace group: '{ cd <unrelated>; git commit; }' (cwd=claimed) is NOT gated" \
+  "$VX_CLAIMED" "{ cd $VX_UNRELATED; git commit -m x; }" allow
+vx_check "observed repro: 'cd <scratch> && git init && git add && git commit' (cwd=claimed) is NOT gated" \
+  "$VX_CLAIMED" "cd $VX_UNRELATED && git init -q . && git config user.email a@b && git add -A && git commit -m init" allow
+
+# The allowed unrelated write must claim the UNRELATED repo, and must leave
+# the claimed repo's foreign holder untouched.
+vx_arm
+JSON=$(make_json "cd $VX_UNRELATED
+git commit -m x" "sess-ME" "$VX_CLAIMED")
+OUT=$(run_hook "$JSON")
+if [ "$(awk '{print $1}' "$CF_UNRELATED" 2>/dev/null)" = "sess-ME" ]; then
+  pass "vx4aj: allowed unrelated write claims the UNRELATED repo"
+else
+  fail "vx4aj: allowed unrelated write claims the UNRELATED repo" "got: $(awk '{print $1}' "$CF_UNRELATED" 2>/dev/null)"
+fi
+if [ "$(awk '{print $1}' "$CF_CLAIMED" 2>/dev/null)" = "sess-HOLDER" ]; then
+  pass "vx4aj: claimed repo's foreign holder untouched by the unrelated write"
+else
+  fail "vx4aj: claimed repo's foreign holder untouched by the unrelated write" "got: $(awk '{print $1}' "$CF_CLAIMED" 2>/dev/null)"
+fi
+
+# --- Quoted text is NOT a command: no spurious gate ---
+vx_check "quoted 'cd /x && git commit' inside an echo argument is not read as a command" \
+  "$VX_UNRELATED" "echo \"cd $VX_CLAIMED && git commit -m x\"" allow
+
+# --- Fail-safe on ambiguity: gate rather than allow ---
+vx_check "unexpandable cd target ('cd \$VAR && git commit') falls back to the session cwd and IS gated" \
+  "$VX_CLAIMED" "cd \$SOMEWHERE && git commit -m x" deny
+vx_check "unparseable command (unbalanced quote) containing a git write IS gated" \
+  "$VX_CLAIMED" "echo \"unterminated && git commit -m x" deny
+
+vx_arm
+JSON=$(make_json "cd \$SOMEWHERE && git commit -m x" "sess-ME" "$VX_CLAIMED")
+OUT=$(run_hook "$JSON")
+if printf '%s' "$OUT" | grep -q "could not be resolved"; then
+  pass "vx4aj: ambiguous-target deny explains that the target was unresolvable"
+else
+  fail "vx4aj: ambiguous-target deny explains that the target was unresolvable" "output: $OUT"
+fi
+
+# ============================================================
+# SABLE-vx4aj INTEGRATION — real git writes, real claim files, no mocks
+# ============================================================
+#
+# The unit block above asserts the hook's decision JSON. This block closes
+# the loop: when the hook ALLOWS, the command is actually executed against
+# real repos and the resulting git state is asserted; when it DENIES, the
+# command is not executed and the target repo is proven unchanged. That is
+# the property that matters operationally — "the write landed / did not
+# land" — not just the shape of the decision.
+
+echo "--- SABLE-vx4aj Integration: gate decision drives real git state ---"
+
+# gate_and_run <cwd> <command> — run the hook; execute for real iff allowed.
+# Echoes "allow" or "deny".
+gate_and_run() {
+  local cwd="$1" cmd="$2" json out
+  json=$(make_json "$cmd" "sess-ME" "$cwd")
+  out=$(run_hook "$json")
+  if is_deny "$out"; then
+    echo "deny"
+  else
+    ( cd "$cwd" && eval "$cmd" ) >/dev/null 2>&1
+    echo "allow"
+  fi
+}
+
+count_commits() { git -C "$1" rev-list --count HEAD 2>/dev/null || echo 0; }
+
+# Real content to commit in each repo.
+echo unrelated-work > "$VX_UNRELATED/u.txt"
+echo claimed-work   > "$VX_CLAIMED/c.txt"
+
+# (1) Real write in the UNRELATED repo, issued from the CLAIMED repo's cwd
+#     while a foreign session holds the CLAIMED repo's claim: must proceed
+#     and must actually produce a commit in the unrelated repo.
+vx_arm
+BEFORE_U=$(count_commits "$VX_UNRELATED")
+DECISION=$(gate_and_run "$VX_CLAIMED" "cd $VX_UNRELATED && git add -A && git commit -q -m 'unrelated real write'")
+AFTER_U=$(count_commits "$VX_UNRELATED")
+if [ "$DECISION" = "allow" ] && [ "$AFTER_U" -eq $((BEFORE_U + 1)) ]; then
+  pass "vx4aj integration: real write in unrelated repo proceeds under a foreign claim on the SABLE-like checkout"
+else
+  fail "vx4aj integration: real write in unrelated repo proceeds under a foreign claim on the SABLE-like checkout" "decision=$DECISION commits $BEFORE_U -> $AFTER_U"
+fi
+# ...and the claimed repo must have gained nothing.
+if [ -z "$(git -C "$VX_CLAIMED" log --oneline --all --grep='unrelated real write' 2>/dev/null)" ]; then
+  pass "vx4aj integration: claimed repo received no commit from the unrelated write"
+else
+  fail "vx4aj integration: claimed repo received no commit from the unrelated write"
+fi
+
+# (2) Real 'git -C <claimed>' write issued from the UNRELATED repo's cwd:
+#     must be refused, and the claimed repo must be provably unchanged.
+vx_arm
+BEFORE_C=$(count_commits "$VX_CLAIMED")
+DECISION=$(gate_and_run "$VX_UNRELATED" "git -C $VX_CLAIMED add -A && git -C $VX_CLAIMED commit -q -m 'cross-repo write'")
+AFTER_C=$(count_commits "$VX_CLAIMED")
+if [ "$DECISION" = "deny" ] && [ "$AFTER_C" -eq "$BEFORE_C" ]; then
+  pass "vx4aj integration: real 'git -C <claimed>' write from another repo's cwd is refused and lands nothing"
+else
+  fail "vx4aj integration: real 'git -C <claimed>' write from another repo's cwd is refused and lands nothing" "decision=$DECISION commits $BEFORE_C -> $AFTER_C"
+fi
+
+# (3) The false-negative class, end to end: a newline-separated
+#     'cd <claimed>' + 'git commit' issued from the unrelated repo must be
+#     refused and must leave the claimed repo untouched.
+vx_arm
+BEFORE_C=$(count_commits "$VX_CLAIMED")
+DECISION=$(gate_and_run "$VX_UNRELATED" "cd $VX_CLAIMED
+git add -A
+git commit -q -m 'newline evasion'")
+AFTER_C=$(count_commits "$VX_CLAIMED")
+if [ "$DECISION" = "deny" ] && [ "$AFTER_C" -eq "$BEFORE_C" ]; then
+  pass "vx4aj integration: newline-separated write into the claimed repo is refused and lands nothing"
+else
+  fail "vx4aj integration: newline-separated write into the claimed repo is refused and lands nothing" "decision=$DECISION commits $BEFORE_C -> $AFTER_C"
+fi
+
+rm -rf "$VX_ROOT"
+
+# ============================================================
 # settings-snippet registration
 # ============================================================
 
