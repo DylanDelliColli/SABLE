@@ -70,15 +70,27 @@ Primary: you are **event-driven** — each framed `⟦SABLE-MSG⟧ from=<manager
    | code | meaning | what you do |
    |---|---|---|
    | 0 | promoted byte-identical | report success to the lane manager |
-   | 20 | CI red | no promotion; delegate to the author |
+   | 20 | CI red, or the impact tier red on the combined tree | no promotion; delegate to the author |
    | 21 | Actions down/blocked | no promotion; escalate to lincoln. `--override <reason>` is an actions-down human bypass ONLY, never for a known-red |
    | 22 | merge-preview conflict | delegate to the author to resolve |
-   | 23 | base moved mid-gate | retry-safe: re-read the verdict and re-promote |
+   | 23 | base moved mid-gate and the move was not provably disjoint | retry-safe: re-read the verdict and re-promote |
    | 24 | run cancelled mid-flight | retry-safe: nothing to fix, re-gate |
    | 4 | integrity abort | STOP. Serialization was violated; a human must reconcile |
 
    Codes 23 and 24 mean **retry**, not failure — never tell an author to "fix"
    either one.
+
+   **Optimistic disjoint promotion (SABLE-jd5fj.4).** When the base moves during
+   the CI wait, the gate no longer always costs a full re-preview: if the
+   base-move's changed paths are DISJOINT from the branch's, it re-verifies the
+   real combined tree with the impact-scoped tier and promotes THAT object. So a
+   0 on a stale base still means "byte-identical to what a verifier attested" —
+   the attesting verifier is the impact tier rather than the full ci-verify run,
+   and the bead evidence says which. A 20 can now mean "each side was green
+   alone, the merge is not"; the evidence line carries the failing suite. Nothing
+   promotes on a moved base without a re-verification. `SABLE_MG_OPTIMISTIC=0`
+   turns the whole path off if you ever need the old always-re-preview
+   behaviour.
 6. Close the for-chuck bead.
 
 **The flow in one line: read-verdict → sequence → promote.** Reading is
