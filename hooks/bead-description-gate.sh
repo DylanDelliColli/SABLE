@@ -21,6 +21,26 @@
 
 set -euo pipefail
 
+# origin: taxonomy read path (SABLE-8b41.1 foundation; consumed by the
+# soft-nudge check landing in SABLE-8b41.7). Single source of truth is
+# bin/sable_telemetry_lib.py's ORIGIN_LABELS constant — this hook never
+# hardcodes a second copy (the Shotgun Surgery risk flagged in
+# .claude/sable/state/planning/SABLE-8b41/architecture.json); it shells out
+# to the CLI's --print-origin-labels accessor instead. Checked first, before
+# anything below reads stdin, so it never blocks waiting on a pipe. Prefers
+# the in-repo bin/sable-telemetry (dev checkout / this repo's own worktrees)
+# and falls back to the installed CLI on PATH (~/.local/bin, post
+# sable-bin-install) since an installed hook lives under ~/.claude/hooks,
+# separate from the installed bin/ directory.
+if [ "${1:-}" = "--print-origin-labels" ]; then
+  REPO_BIN="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)/bin/sable-telemetry"
+  if [ -x "$REPO_BIN" ]; then
+    exec "$REPO_BIN" --print-origin-labels
+  else
+    exec sable-telemetry --print-origin-labels
+  fi
+fi
+
 PARSED=$(python3 -c "
 import json, sys
 d = json.load(sys.stdin)
