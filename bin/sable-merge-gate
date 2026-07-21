@@ -45,6 +45,29 @@ dependency order (a DAG — nothing imports "upward"):
                                verdicts, sweeps orphans. Never promotes.
   sable_gate_promote_lib.py    Consumes a verdict and promotes (or refuses).
                                The only writer to the integration branch.
+  sable_footprint_lib.py       Changed-path footprints and the disjointness
+                               test (SABLE-jd5fj.4). Evidence only — it decides
+                               nothing about a promotion.
+
+── OPTIMISTIC DISJOINT PROMOTION (SABLE-jd5fj.4) ────────────────────────────
+When the base moves between a preview and its promote, the CI-green object is
+no longer what would land. Before jd5fj.4 that was always exit 23: rebuild and
+re-gate through a full CI cycle. Now the gate asks a second question first — are
+the base-move's changed paths DISJOINT from the branch's? — and if they are, it
+re-verifies the REAL COMBINED TREE with the cmar4 impact tier instead of a full
+re-preview. Green promotes that combined object; red ejects on exit 20; an
+impact tier that cannot answer falls back to exit 23.
+
+Disjointness is NECESSARY, NEVER SUFFICIENT (locked contract SABLE-djopw):
+file-disjoint changes break each other semantically all the time, so a disjoint
+verdict buys a CHEAPER re-test, never a skipped one. Footprints follow renames,
+INCLUDE deletions, treat lockfiles and committed generated artifacts as
+non-disjoint sentinels, and are widened (never narrowed) by the bead's declared
+footprint. Two invariants are enumerated exhaustively in
+bin/test_promote_decision.py: no promote path where the base moved and the
+footprints are not proven disjoint and nothing re-verified; and every promotion
+pushes exactly the object some verifier attested. SABLE_MG_OPTIMISTIC=0 restores
+the pre-jd5fj.4 behaviour exactly.
 
 The split was made because this file had grown into a god-module carrying a
 safety-critical write path (locked smell risk, relates SABLE-hhw7t), and because
@@ -136,12 +159,17 @@ is unit-testable without real git / gh / bd):
                    tier budget from .github/ci/test-tiers.sh if present,
                    else 1800 — SABLE-cmar4.1)                SABLE_MG_GRACE  first-run grace secs (300)
   SABLE_MG_SWEEP_HOURS orphan age hours (6)               SABLE_MG_GH_TIMEOUT per-gh-call secs (30, SABLE-7wyl)
+  SABLE_MG_OPTIMISTIC  1 (SABLE-jd5fj.4; 0 = every base-move is a full re-preview)
+  SABLE_MG_IMPACT_TIMEOUT per-command secs for the combined-tree impact tier (900)
+  SABLE_MG_IMPACT      impact-tier command override (testing seam; run in the
+                       combined-tree worktree with the changed paths appended)
 
 Exit codes:
   0 promoted / preview kicked / verdict read / sweep ok    2 usage   3 precondition failed
   20 ci red, not promoted   21 actions-down / blocked (needs --override)
   22 merge-preview conflict (delegate to author)
-  23 tip moved during gate (non-ff promote) — rebuild preview + re-gate (retry-safe)
+  23 tip moved during gate and the move was not provably disjoint (or the impact
+     tier could not answer) — rebuild preview + re-gate (retry-safe)
   24 ci-verify run cancelled mid-flight — rebuild preview + re-gate (retry-safe, SABLE-sc24)
   4 integrity abort (base tip != preview SHA after promote)
 """
@@ -153,6 +181,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
+import sable_footprint_lib as footprint_lib          # noqa: E402
 import sable_gate_classify_lib as classify           # noqa: E402
 import sable_gate_git_lib as git_lib                 # noqa: E402
 import sable_gate_preview_lib as preview_lib         # noqa: E402
@@ -185,6 +214,9 @@ ref_has_inflight_run = preview_lib.ref_has_inflight_run
 sweep = preview_lib.sweep
 promote = promote_lib.promote
 cleanup_after_merge = promote_lib.cleanup_after_merge
+decide_promotion = promote_lib.decide_promotion
+run_impact_tier = promote_lib.run_impact_tier
+assess_footprints = footprint_lib.assess
 
 
 def main(argv: list[str] | None = None) -> int:
