@@ -291,6 +291,64 @@ def test_repin_reverts_a_snapshot_pin_to_the_live_repo(tmp_path):
     assert os.path.realpath(dest / "sable-importer") == str((bin_dir / "sable-importer").resolve())
 
 
+# --- self-scoping SABLE_LIB_DIR (SABLE-rkc3o) ------------------------------------
+#
+# bin/test_sable_bin_install.py's OWN run_install() helper above never sets
+# SABLE_LIB_DIR -- it merges only os.environ. Before this fix, every
+# --pin-snapshot test above (test_pin_snapshot_auto_detects_python_importing_tools
+# et al.) therefore wrote real snapshot dirs into the REAL $HOME/.local/lib on
+# whatever machine ran this suite -- exactly the SABLE-33hw3 / SABLE-k0nvp
+# pollution mechanism, from this very file. The fix lives in the script
+# itself (bin/sable-bin-install's resolve_lib_dir): when SABLE_LIB_DIR is
+# unset and a test/suite context is detected (PYTEST_CURRENT_TEST, which
+# pytest sets in os.environ for the whole test process and therefore in every
+# subprocess spawned during a test), it self-scopes to a throwaway mktemp
+# dir instead of falling through to $HOME/.local/lib.
+
+def test_suite_run_cannot_write_to_real_home_lib(tmp_path):
+    """SABLE_LIB_DIR unset, in a simulated suite context (PYTEST_CURRENT_TEST
+    set, exactly as pytest sets it for real): --pin-snapshot must not write
+    into $HOME/.local/lib. HOME is pointed at a throwaway fake-home for this
+    one process (never the operator's real $HOME) so an assertion failure
+    here can't itself pollute the real machine; the point under test is
+    whether the script *chooses* the real-HOME/.local/lib path, not whether
+    the real HOME literally has that string burned in. We assert on the REAL
+    resolved symlink target on disk -- not a mock -- so a change to
+    resolve_lib_dir's actual runtime behavior is what makes this pass or fail."""
+    repo, bin_dir = make_fixture_repo(tmp_path)
+    dest = tmp_path / "dest"
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    fake_home_lib = fake_home / ".local" / "lib"
+
+    env = dict(os.environ)
+    env.pop("SABLE_LIB_DIR", None)
+    env["HOME"] = str(fake_home)
+    env["PYTEST_CURRENT_TEST"] = "test_suite_run_cannot_write_to_real_home_lib (call)"
+
+    result = subprocess.run(
+        ["bash", str(bin_dir / "sable-bin-install"), "--dir", str(dest), "--pin-snapshot"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+
+    # It self-scoped (didn't refuse) -- confirm the install actually worked...
+    assert (dest / "sable-importer").is_symlink()
+    resolved_target = Path(os.path.realpath(dest / "sable-importer"))
+
+    # ...and that the REAL resolved target lives outside fake-home/.local/lib
+    # entirely (self-scoped to a mktemp dir instead).
+    assert fake_home_lib not in resolved_target.parents, (
+        f"snapshot pin resolved into {resolved_target}, under the simulated "
+        f"HOME's .local/lib ({fake_home_lib}) -- the suite-context self-scope "
+        f"guard did not redirect this unscoped invocation"
+    )
+    assert not fake_home_lib.exists(), (
+        f"{fake_home_lib} was created even though SABLE_LIB_DIR was unset in "
+        f"a detected suite context -- self-scoping must avoid touching it entirely"
+    )
+
+
 def test_copy_mode_does_not_refuse_on_an_existing_snapshot_pin(tmp_path):
     """--copy is deliberately unaffected by pin protection (mkj6k design: an
     explicit --copy request is itself pin-like intent) -- confirm it neither

@@ -126,6 +126,34 @@ done
 
 note() { printf '%s\n' "$*" >&2; }
 
+# Resolve the snapshot LIB_DIR (SABLE-rkc3o): SABLE_LIB_DIR always wins when
+# set. Otherwise, if a test/suite context is detected (PYTEST_CURRENT_TEST is
+# set by pytest for the whole process tree of a running test, including this
+# subprocess; SABLE_TEST is an explicit escape hatch for non-pytest suites),
+# self-scope to a throwaway mktemp dir instead of falling through to the real
+# ~/.local/lib. This is a mechanism, not advice: guidance to "remember to
+# export SABLE_LIB_DIR" already let an unscoped pinning-suite run pollute the
+# live lib three times in one shift, including once after a targeted warning
+# (SABLE-33hw3, SABLE-k0nvp) -- an unscoped invocation must be IMPOSSIBLE to
+# land in the real lib, not merely discouraged from it.
+resolve_lib_dir() {
+  if [ -n "${SABLE_LIB_DIR:-}" ]; then
+    printf '%s\n' "$SABLE_LIB_DIR"
+    return 0
+  fi
+  if [ -n "${PYTEST_CURRENT_TEST:-}" ] || [ -n "${SABLE_TEST:-}" ]; then
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/sable-lib-test.XXXXXX" 2>/dev/null || true)"
+    if [ -z "$scratch" ]; then
+      note "sable-bin-install: refusing --pin-snapshot -- test/suite context detected (SABLE_LIB_DIR unset) and mktemp failed to create a scratch dir"
+      exit 1
+    fi
+    note "sable-bin-install: test/suite context detected (SABLE_LIB_DIR unset) -- self-scoping snapshot lib to $scratch instead of the real ~/.local/lib"
+    printf '%s\n' "$scratch"
+    return 0
+  fi
+  printf '%s\n' "${HOME:-}/.local/lib"
+}
+
 # Import-check classifier (SABLE-9boz4): is $1 (a path) a python script that
 # imports a sibling module physically present in $BIN_DIR? Those need
 # --pin-snapshot; everything else (shell scripts, or python with zero
@@ -208,7 +236,10 @@ if [ "$ACTION" = "pin-snapshot" ]; then
     exit 1
   fi
 
-  LIB_DIR="${SABLE_LIB_DIR:-${HOME:-}/.local/lib}"
+  # resolve_lib_dir runs in the $() subshell, so its own `exit 1` only ends
+  # that subshell -- bash propagates a command substitution's exit status to
+  # the assignment, so the `|| exit 1` here is what actually stops the script.
+  LIB_DIR="$(resolve_lib_dir)" || exit 1
   SNAPSHOT_DIR="$LIB_DIR/sable-$SHA"
 
   if [ "$DRY_RUN" = "1" ]; then

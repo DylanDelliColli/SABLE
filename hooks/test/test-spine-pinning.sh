@@ -47,6 +47,15 @@ BIN_DEST="$SCRATCH_HOME/.local/bin"
 CLAUDE_DEST="$SCRATCH_HOME/.claude"
 mkdir -p "$BIN_DEST" "$CLAUDE_DEST"
 
+# SABLE-rkc3o: --dir above scopes ONLY the bin symlink destination.
+# sable-bin-install's --pin-snapshot writes its versioned snapshot dir under a
+# SEPARATE variable, SABLE_LIB_DIR (bin/sable-bin-install's resolve_lib_dir),
+# which without this export falls through to the real $HOME/.local/lib —
+# exactly the mechanism that polluted the live lib on 2026-07-21 (SABLE-33hw3,
+# SABLE-k0nvp). Export it explicitly, scoped to this run's own SCRATCH_HOME,
+# so every `bash "$INSTALL" --pin-snapshot` call below inherits it.
+export SABLE_LIB_DIR="$SCRATCH_HOME/.local/lib"
+
 # ============================================================================
 # (1)+(2) pin BOTH sable-msg and sable-spawn-worker — the two real
 # python-importing spine bins the bead names — via --pin-snapshot, and

@@ -124,6 +124,89 @@ def test_snapshot_verdict_predicts_out_of_tree_copy_failure(tmp_path):
     assert "loader ok: sibling-v1" in run_result_together.stdout
 
 
+# --- self-scoping SABLE_LIB_DIR guard (SABLE-rkc3o) -------------------------------
+#
+# The classify() helper above already scopes SABLE_LIB_DIR for every call in
+# this file, but --classify never writes to LIB_DIR at all -- only
+# --pin-snapshot does (bin/sable-bin-install:~243). This suite never actually
+# exercised the write path this bead is about. These two tests do, with a
+# sandboxed $HOME (never the real machine's), and directly prove causation:
+# the same fixture, run the same way, WITHOUT the guard's redirect (simulated
+# by pointing SABLE_LIB_DIR at exactly the path the guard would otherwise
+# have avoided) DOES write, and WITH the guard active (SABLE_LIB_DIR left
+# unset, suite context detected via PYTEST_CURRENT_TEST) does NOT -- so the
+# absence of pollution in the positive case is the guard's doing, not the
+# suite simply never reaching that code path.
+
+def _count_snapshot_dirs(lib_dir):
+    if not lib_dir.exists():
+        return 0
+    return len([p for p in lib_dir.iterdir() if p.is_dir() and p.name.startswith("sable-")])
+
+
+def test_unscoped_pin_snapshot_leaves_sandboxed_home_lib_unchanged(tmp_path):
+    repo, bin_dir = make_fixture_repo(tmp_path)
+    dest = tmp_path / "dest"
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    fake_home_lib = fake_home / ".local" / "lib"
+
+    before = _count_snapshot_dirs(fake_home_lib)
+    assert before == 0
+
+    env = dict(os.environ)
+    env.pop("SABLE_LIB_DIR", None)
+    env["HOME"] = str(fake_home)
+    env["PYTEST_CURRENT_TEST"] = "test_unscoped_pin_snapshot_leaves_sandboxed_home_lib_unchanged (call)"
+
+    result = subprocess.run(
+        ["bash", str(bin_dir / "sable-bin-install"), "--dir", str(dest),
+         "--pin-snapshot", "sable-loader-main"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+
+    after = _count_snapshot_dirs(fake_home_lib)
+    assert after == before == 0, (
+        "an unscoped --pin-snapshot run wrote into the sandboxed HOME's "
+        "/.local/lib -- the self-scoping guard failed to redirect it"
+    )
+
+
+def test_negative_control_same_run_does_write_when_pointed_at_the_would_be_default(tmp_path):
+    """Proves the guard above is load-bearing, not coincidental: point
+    SABLE_LIB_DIR explicitly at fake-home/.local/lib -- the exact path
+    resolve_lib_dir's fallback branch would have picked had the suite-context
+    self-scope not intervened -- and confirm the identical fixture/args DOES
+    write a snapshot there. This is the "disable the guard" negative control:
+    same code, same inputs, only the env differs, and the outcome flips."""
+    repo, bin_dir = make_fixture_repo(tmp_path)
+    dest = tmp_path / "dest"
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    fake_home_lib = fake_home / ".local" / "lib"
+
+    before = _count_snapshot_dirs(fake_home_lib)
+    assert before == 0
+
+    env = dict(os.environ)
+    env["HOME"] = str(fake_home)
+    env["SABLE_LIB_DIR"] = str(fake_home_lib)  # explicit -- simulates "no guard"
+
+    result = subprocess.run(
+        ["bash", str(bin_dir / "sable-bin-install"), "--dir", str(dest),
+         "--pin-snapshot", "sable-loader-main"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+
+    after = _count_snapshot_dirs(fake_home_lib)
+    assert after == before + 1, (
+        "negative control did not write a snapshot -- if this fails, the "
+        "positive test above proves nothing about the guard specifically"
+    )
+
+
 def test_plain_verdict_predicts_out_of_tree_copy_success(tmp_path):
     """Negative-direction control: a bin the classifier calls "plain" really
     is safe to copy alone with no sibling present -- confirms the widened
