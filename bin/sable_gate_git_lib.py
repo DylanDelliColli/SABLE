@@ -67,6 +67,30 @@ def resolve_commit(repo: str, ref: str) -> str:
     return cp.stdout.strip()
 
 
+def resolve_remote_url(repo: str, remote: str) -> str:
+    """Resolve a remote NAME to its configured fetch URL/path, or return it
+    unchanged if it is not a configured remote (SABLE-ck05 / z776).
+
+    Every PUSH in the gate must address its upstream by an EXPLICIT path, never by
+    a CWD-sensitive name. A name like `origin` re-resolves against whatever repo
+    the process's working directory happens to point at, so under a working-dir
+    escape a name-based push can follow the escape and land on the operator's real
+    upstream instead of the fixture/worktree it meant to reach (the ck05
+    bare-origin escape — every optimistic-disjoint preview kick was leaking its
+    ci-verify ref this way). Resolving the name to its URL first pins the push to
+    one specific upstream regardless of CWD.
+
+    Fetch / ls-remote stay name-based on purpose: they only READ (a mis-resolved
+    read cannot corrupt an upstream) and the ck05 harness intercepts push alone.
+    FAIL-SAFE: when `remote` is already a path, or is not a configured remote,
+    `git remote get-url` errors and we return `remote` unchanged — so the caller
+    behaves exactly as it did before this resolution existed."""
+    cp = _git(repo, "remote", "get-url", remote, check=False)
+    if cp.returncode != 0:
+        return remote
+    return cp.stdout.strip() or remote
+
+
 def remote_ref_commit(repo: str, remote: str, ref: str) -> str | None:
     """Commit at refs/heads/<ref> ON THE REMOTE, or None if the ref is absent /
     unreadable. Read via ls-remote rather than a remote-tracking ref because a
