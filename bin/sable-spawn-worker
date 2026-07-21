@@ -434,14 +434,29 @@ def preempt_check(lane: str, inbox: list[dict]) -> str | None:
 # --skip-governance — they protect the HOST, not bead hygiene.
 
 # Tab-delimited like sable-worker-status's _FORMAT (SABLE-exab: empty fields
-# collapse under space-joining, shifting columns).
-_CAP_FORMAT = "#{@sable_role}\t#{@sable_status}\t#{@sable_class}"
+# collapse under space-joining, shifting columns). #{window_name} (SABLE-6xtx)
+# mirrors the same fallback field sable-worker-status's classifier added — this
+# counter had the identical tag-only blindness (a pane whose
+# @sable_role/@sable_class tags are absent/lost was invisible here too). A
+# live-process-based (#{pane_current_command}) done override was ALSO tried
+# here and reverted: this project's integration-test fixtures simulate a
+# "running" worker with a plain `bash --noprofile --norc` pane and never
+# launch a real claude process, so the live foreground command is indistinguishable
+# from "claude exited" by that heuristic — see sable-worker-status's
+# WINDOW_NAME_WORKER_PREFIX comment for the full incident.
+_CAP_FORMAT = "#{@sable_role}\t#{@sable_status}\t#{@sable_class}\t#{window_name}"
+
+# SABLE-6xtx: sable-spawn-worker's own window_name() always stamps this prefix
+# at creation, independent of the @sable_role/@sable_class pane options — the
+# same fallback classification signal sable-worker-status uses.
+_WINDOW_NAME_WORKER_PREFIX = "worker-"
 
 
 def count_live_workers(listing: str) -> int:
     """Live worker panes in a `list-panes -F _CAP_FORMAT` listing: class-stamped
-    workers plus legacy classless panes whose role starts with 'worker' (the
-    same recognition rule as sable-worker-status), excluding done panes — a
+    workers plus legacy classless panes whose role starts with 'worker' OR
+    whose window name carries the worker-<bead> prefix (SABLE-6xtx fallback —
+    the same recognition rule as sable-worker-status), excluding done panes — a
     done-but-unreaped worker has released its claude process and must not hold
     a dispatch slot. Managers and bounded producers never count. An EMPTY
     status counts as live: a just-spawned pane may not carry its tag yet."""
@@ -451,7 +466,9 @@ def count_live_workers(listing: str) -> int:
         role = parts[0] if parts else ""
         status = parts[1] if len(parts) >= 2 else ""
         cls = parts[2] if len(parts) >= 3 else ""
-        is_worker = cls == "worker" or (not cls and role.startswith("worker"))
+        window = parts[3] if len(parts) >= 4 else ""
+        is_worker = cls == "worker" or (
+            not cls and (role.startswith("worker") or window.startswith(_WINDOW_NAME_WORKER_PREFIX)))
         if is_worker and status != "done":
             n += 1
     return n

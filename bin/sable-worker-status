@@ -95,16 +95,40 @@ from sable_pane_lib import (  # noqa: E402
     pane_working, resolve_session, session_limit_reset)
 
 WORKER_ROLE_PREFIX = "worker"
+# SABLE-6xtx: a worker window is always named worker-<sanitized-bead-id>
+# (sable-spawn-worker's window_name()) at creation time, independent of the
+# @sable_role/@sable_class pane OPTIONS -- so a pane whose tags are absent or
+# lost still carries this signal. Used as the classification fallback below
+# when the @sable_role/@sable_class check finds nothing.
+#
+# NOTE: an earlier version of this fix also forced status="done" whenever a
+# worker/producer pane's LIVE #{pane_current_command} was a bare shell
+# (claude exited to zsh/bash) on the theory that with_lifecycle_flags
+# (SABLE-5v9n) has no tag-writer for an untagged pane. That broke every
+# integration-test fixture in this suite: they simulate a "running" worker
+# with a plain `bash --noprofile --norc` pane and NEVER launch a real
+# claude process, so pane_current_command reads "bash" for the pane's ENTIRE
+# lifetime — indistinguishable, by that heuristic, from "claude exited". The
+# override reaped live-simulated workers wholesale (one run killed the whole
+# tmux session). Process identity IS still authoritative for a NARROWER
+# question elsewhere (filter_live_agents: is a live resumed cockpit/manager
+# occupying this window), but it is not a safe DONE signal here — @sable_status
+# stays the sole source of truth for worker liveness; only the classification
+# (is this pane a worker at all) gets the window-name fallback.
+WINDOW_NAME_WORKER_PREFIX = "worker-"
 # Tab-delimited (SABLE-exab): a space-joined format collapses an EMPTY field
 # (e.g. a producer pane spawned without a bead tag) into its neighboring
 # whitespace, shifting every later column left by one. Tabs never collapse,
 # so an empty @sable_bead placeholder still occupies its own field.
-# @sable_lane (SABLE-dcw2) is the LAST field: appended so a pane spawned before
-# this column existed (no @sable_lane) simply renders a trailing empty field
-# rather than shifting @sable_class/@sable_deliverable — the same tab-delimited
-# discipline the fields above rely on.
+# @sable_lane (SABLE-dcw2) is the LAST TAG field: appended so a pane spawned
+# before this column existed (no @sable_lane) simply renders a trailing empty
+# field rather than shifting @sable_class/@sable_deliverable — the same
+# tab-delimited discipline the fields above rely on. #{window_name}
+# (SABLE-6xtx) is pure tmux window state, never unset, so it is appended last
+# of all without disturbing any tag column.
 _FORMAT = ("#{pane_id}\t#{@sable_role}\t#{@sable_bead}\t#{@sable_status}\t"
-           "#{@sable_class}\t#{@sable_deliverable}\t#{@sable_lane}")
+           "#{@sable_class}\t#{@sable_deliverable}\t#{@sable_lane}\t"
+           "#{window_name}")
 
 
 def tmux_base(socket: str | None) -> list[str]:
@@ -126,7 +150,17 @@ def parse_worker_panes(output: str) -> list[dict]:
     ONLY when non-empty, exactly like "class"/"deliverable": a pane spawned
     before this column (or without a resolvable lane) keeps the bare shape, so
     every pre-existing exact-shape assertion stays valid and an unattributed
-    pane is surfaced only under --all."""
+    pane is surfaced only under --all.
+
+    SABLE-6xtx: when @sable_role/@sable_class are BOTH absent (the classless
+    branch below), the window name is checked for the worker-<bead> prefix
+    sable-spawn-worker always stamps at creation (window_name()) as a
+    fallback classification signal — a pane whose tags were never stamped or
+    were lost is still recognized as a worker instead of silently vanishing
+    from every listing. This is classification ONLY: the pane's @sable_status
+    tag (or the 'running' default) still decides its reported status exactly
+    as before — see the WINDOW_NAME_WORKER_PREFIX comment above for why a
+    live-process-based done override was tried and reverted."""
     workers: list[dict] = []
     for line in output.splitlines():
         parts = line.split("\t")
@@ -138,11 +172,13 @@ def parse_worker_panes(output: str) -> list[dict]:
         cls = parts[4] if len(parts) >= 5 and parts[4] else ""
         deliverable = parts[5] if len(parts) >= 6 and parts[5] else ""
         lane = parts[6] if len(parts) >= 7 and parts[6] else ""
+        window = parts[7] if len(parts) >= 8 and parts[7] else ""
 
         if cls == "manager":
             continue  # always-on manager loops are never surfaced/reaped
         if cls == "":
-            if not role.startswith(WORKER_ROLE_PREFIX):
+            if not (role.startswith(WORKER_ROLE_PREFIX)
+                    or window.startswith(WINDOW_NAME_WORKER_PREFIX)):
                 continue  # legacy rule: role-less / non-worker panes skipped
             rec = {"pane": pane, "bead": bead, "status": status}
         elif cls == "worker":
@@ -570,8 +606,8 @@ def reap(panes: list[str], socket: str | None, run=_runner, capture=None) -> lis
                 text = text[:_PENDING_TEXT_LOG_LIMIT] + "…[truncated]"
             sys.stderr.write(
                 f"sable-worker-status: pane {pane} is done but holds unsubmitted "
-                f"composer input — clearing + flagging before reap "
-                f"(market-brief-package-0h8k): pending text={text!r}\n")
+                f"composer input — clearing + flagging before reap: "
+                f"pending text={text!r}\n")
             run(base + ["send-keys", "-t", pane, "C-u"])
         try:
             run(base + ["kill-pane", "-t", pane])

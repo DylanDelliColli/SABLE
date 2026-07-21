@@ -5,6 +5,7 @@ Isolated socket (-L). Proves: worker panes are discovered by their @sable_role/
 @sable_bead/@sable_status user-options, a done worker is reported done, and
 --reap kills ONLY the done worker pane (the running one survives).
 """
+import json
 import os
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ from pathlib import Path
 import pytest
 
 BIN = Path(__file__).resolve().parent / "sable-worker-status"
+VIEW_BIN = Path(__file__).resolve().parent / "sable-view"
 HAVE_TMUX = shutil.which("tmux") is not None
 pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="tmux not installed")
 
@@ -734,6 +736,54 @@ def test_reap_spares_lone_done_unconfirmed_pane(sock, tmp_path):
     assert r.returncode == 0, r.stderr
     time.sleep(0.4)
     assert _pane_count(sock) == 1  # lone done-unconfirmed pane survives
+
+
+# --- SABLE-1tzv: sable-view listed a done-tagged worker pane correctly while
+# sable-worker-status --reap, run moments later, printed 'no worker panes' and
+# reaped nothing -- read live as "reap vs view detection disagree". The
+# REVISED hypothesis (confirmed here): sable-view (parse_panes/_FORMAT above)
+# has NO lane concept at all -- it always lists the whole fleet -- while
+# sable-worker-status's DEFAULT view is scoped to the caller's own lane
+# (SABLE-dcw2, landed after this incident). The two tools were being compared
+# under DIFFERENT scopes, not disagreeing about the SAME scope. The honest
+# fleet-wide equivalent is `sable-worker-status --all` (also already
+# implicit in --reap: main() reaps exactly the `workers` list it prints, so
+# view and reap can never diverge for a given scope by construction). This
+# locks that parity in: under the SAME (fleet-wide) scope, sable-view and
+# `sable-worker-status --all` agree on a done worker pane, and --reap --all
+# actually collects what both list. ---
+
+def _run_view(s, *args):
+    return subprocess.run(["python3", str(VIEW_BIN), *args], capture_output=True,
+                          text=True, env={**_scrubbed_env(), "SABLE_TMUX_SOCKET": s,
+                                          "SABLE_TMUX_SESSION": "w"})
+
+
+def test_view_and_reap_all_scope_agree_on_done_worker_pane(sock):
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    pane = _tmux(sock, "display-message", "-p", "-t", "w.0", "#{pane_id}").stdout.strip()
+    _tag(sock, pane, "worker", "SABLE-1tzv-x", "done")
+
+    view = _run_view(sock, "--json")
+    assert view.returncode == 0, view.stderr
+    view_hit = [p for p in json.loads(view.stdout) if p["pane"] == pane]
+    assert view_hit and view_hit[0]["status"] == "done", view.stdout
+
+    status = _run_as(sock, "", "--all", "--json")
+    assert status.returncode == 0, status.stderr
+    status_hit = [w for w in json.loads(status.stdout)["workers"] if w["pane"] == pane]
+    assert status_hit and status_hit[0]["status"] == "done", status.stdout
+
+    reap = _run_as(sock, "", "--all", "--reap")
+    assert reap.returncode == 0, reap.stderr
+    time.sleep(0.3)
+    # the lone pane was killed -- the server itself may have exited with it
+    # (no clients attached, no panes left), so tolerate a failed list-panes
+    # exactly like that: zero panes.
+    remaining = _tmux(sock, "list-panes", "-a", "-F", "#{pane_id}", check=False)
+    assert remaining.returncode != 0 or not remaining.stdout.strip()
 
 
 if __name__ == "__main__":
