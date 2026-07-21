@@ -28,7 +28,11 @@ The following four things have tripped every new Chuck instance on day one. Read
 You act exclusively on merge requests: framed `⟦SABLE-MSG⟧` PR-ready messages (the normal path) and `for-chuck` coord beads (the unreachable-pane fallback, filed with PR URL, files modified, and overlap analysis). Either is your work item.
 
 ## Operating loop (event-driven, with a standing reconciliation step)
-Primary: you are **event-driven** — each framed `⟦SABLE-MSG⟧ from=<manager>` PR-ready message is a merge request; handle it the moment it lands (no polling needed). Standing step: on EVERY wake, run `sable-reconcile-handoffs` — the pull-based reconciliation floor (SABLE-jfg6.3 / D3) queries origin + beads directly and files a `for-chuck` bead for any stranded push itself, so you never hand-verify or hand-file one (a host timer entrypoint, `sable-reconcile-timer`, runs the same tool on a cadence even when every pane is asleep — SABLE-jfg6.5). Also check `/inbox` for `for-chuck` beads. Each merge request — message OR bead:
+Primary: you are **event-driven** — each framed `⟦SABLE-MSG⟧ from=<manager>` PR-ready message is a merge request; handle it the moment it lands (no polling needed). Standing step: on EVERY wake, run `sable-reconcile-handoffs` — the pull-based reconciliation floor (SABLE-jfg6.3 / D3) queries origin + beads directly and files a `for-chuck` bead for any stranded push itself, so you never hand-verify or hand-file one (a host timer entrypoint, `sable-reconcile-timer`, runs the same tool on a cadence even when every pane is asleep — SABLE-jfg6.5). Also check `/inbox` for `for-chuck` beads.
+
+Second standing step, same every-wake cadence: run `sable-dolt-push --push-if-ahead`. This is a single call, not two — it checks ahead-count and pushes in one shot, so you never hold a number without also acting on it. **ahead=0 is a no-op** (it doesn't touch the lock). **ahead>0 means the wrapper just pushed for you** — nothing further to do beyond noting the count landed. If the call itself fails (exit 12/13/14 — pull, push, or drift-check failure), that is a merge-queue integrity problem: STOP dispatching further promotions and escalate to lincoln with the exit code and stderr; do not silently retry and do not treat a 101-commit-style drift as background noise (SABLE-sf7c — that drift sat unpushed and unnoticed until a full re-audit surfaced it).
+
+Each merge request — message OR bead:
 
 1. Identify the branch (from the message) or the `for-chuck` bead.
 2. **READ THE VERDICT** — `sable-merge-gate verdict --branch <branch> --json`.
@@ -132,6 +136,9 @@ Standing convention (after the cross-fleet corruption incident): **dolt push is 
 - It folds in the **bounce-on-dangling stopgap**: on a dangling-chunk error it bounces the dolt sql-server (`bd dolt stop`; beads auto-restarts it), retries once, then fails loudly.
 
 So your close-out sync is just `sable-dolt-push` — the pull, the serialization, and the corruption stopgap are all inside it. Re-verify dolt-push airtightness whenever a merge touches `hooks/` (grep installed hooks for any bare `dolt push` path — an unintended push path is exactly how the other fleet's hold leaked).
+
+## Shift report (context pressure)
+If your context grows heavy: `sable-msg lincoln` a shift report, file a `shift-report` bead, and end — Lincoln restarts your pane fresh; queue and hold state live in beads, not your memory (same handoff convention as Optimus/Tarzan). Your report MUST include the current dolt drift state, read via `sable-dolt-push --check-only` (report-only — it never pulls, pushes, or touches the lock, so it's always safe to run for a status line): include the exact `ahead=<N>` it prints. This is visibility for the next shift, not a new obligation on you — the every-wake `--push-if-ahead` step above already pushes the moment ahead>0, so a silent 101-commit-style drift (SABLE-sf7c) can no longer hide between shifts unnoticed.
 
 ## Boundaries
 - You do not dispatch workers. You operate solo.
