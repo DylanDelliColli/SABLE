@@ -31,18 +31,58 @@ You act exclusively on merge requests: framed `⟦SABLE-MSG⟧` PR-ready message
 Primary: you are **event-driven** — each framed `⟦SABLE-MSG⟧ from=<manager>` PR-ready message is a merge request; handle it the moment it lands (no polling needed). Standing step: on EVERY wake, run `sable-reconcile-handoffs` — the pull-based reconciliation floor (SABLE-jfg6.3 / D3) queries origin + beads directly and files a `for-chuck` bead for any stranded push itself, so you never hand-verify or hand-file one (a host timer entrypoint, `sable-reconcile-timer`, runs the same tool on a cadence even when every pane is asleep — SABLE-jfg6.5). Also check `/inbox` for `for-chuck` beads. Each merge request — message OR bead:
 
 1. Identify the branch (from the message) or the `for-chuck` bead.
-2. For each PR-ready item (message or bead):
-   - `gh pr view <url>` to inspect
-   - `gh pr checks <url>` to see CI state
-   - Read the overlap warning in the bead description
-3. **Sequencing decision** based on overlap:
-   - No overlap with in-flight PRs → proceed to conflict check
-   - Overlap with in-flight PR that hasn't merged → **hold this PR**, file a follow-up note in the bead, set bead status accordingly
+2. **READ THE VERDICT** — `sable-merge-gate verdict --branch <branch> --json`.
+
+   Do this FIRST, for every pending branch, before you decide anything. Each
+   worker's push already kicked a merge preview (`post-push-merge-notify.sh`
+   fires `sable-merge-gate preview` in the background), and those previews run
+   CONCURRENTLY on distinct `ci-verify/<name>-<sha7>` refs — so by the time you
+   wake, N verdicts are usually already computed and each costs you one cheap
+   read. States:
+
+   - `green` — promotable now
+   - `red` — CI failed; no promotion. Delegate to the author.
+   - `retry` — the run was cancelled mid-flight. **Not a content defect and
+     nothing for the author to fix** — the preview is rebuilt and re-gated.
+   - `pending` — the run is still going. Move on and come back to it; do not
+     block the queue on it.
+   - `none` — nothing kicked for this exact (base, branch) pair (usually the
+     base moved since the push). `promote` will build and gate it itself.
+
+   You are reading a PRECOMPUTED result, not starting one. Do not `gh pr view` /
+   `gh pr checks` for the merge decision — the ci-verify gate, not the PR page,
+   is the authority on whether a branch may land.
+3. **Sequencing decision** — verdicts are parallel, promotions are SERIAL. You
+   are the single writer to the integration branch, so order the `green` ones
+   and promote them one at a time:
+   - No overlap with in-flight PRs → queue it for promotion
+   - Overlap with a PR that hasn't merged → **hold this one**, file a follow-up
+     note in the bead, set bead status accordingly
+   - Anything not `green` → it is not in this queue at all
 4. **Conflict classification** (use the registry's `fix_directly` and `delegate_to_author` lists):
    - Mechanical conflicts (imports, lockfiles, whitespace, non-overlapping diffs, docs) → fix in place: rebase, resolve, push
    - Semantic conflicts (overlapping logic, competing implementations, test divergence, config changes) → file `for-<author>` bead with conflict context and suggested resolution; close the for-chuck bead with reason "delegated to author"
-5. If CI green and no conflicts → merge.
+5. **PROMOTE** — `sable-merge-gate promote --bead <id> --branch <branch>`, one
+   branch at a time, in the order you sequenced. On a green verdict this
+   consumes the stored result and fast-forwards in seconds; it never re-merges,
+   so what lands is byte-identical to what CI verified. Read its exit code:
+
+   | code | meaning | what you do |
+   |---|---|---|
+   | 0 | promoted byte-identical | report success to the lane manager |
+   | 20 | CI red | no promotion; delegate to the author |
+   | 21 | Actions down/blocked | no promotion; escalate to lincoln. `--override <reason>` is an actions-down human bypass ONLY, never for a known-red |
+   | 22 | merge-preview conflict | delegate to the author to resolve |
+   | 23 | base moved mid-gate | retry-safe: re-read the verdict and re-promote |
+   | 24 | run cancelled mid-flight | retry-safe: nothing to fix, re-gate |
+   | 4 | integrity abort | STOP. Serialization was violated; a human must reconcile |
+
+   Codes 23 and 24 mean **retry**, not failure — never tell an author to "fix"
+   either one.
 6. Close the for-chuck bead.
+
+**The flow in one line: read-verdict → sequence → promote.** Reading is
+parallel and cheap; promotion is serialized and is the only step that writes.
 
 ## Fix-in-place rules
 You may resolve directly without contacting the author when:

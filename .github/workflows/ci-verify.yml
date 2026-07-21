@@ -84,6 +84,25 @@ on:
       - 'tmux-only'      # integration branch baseline
   workflow_dispatch: {}
 
+# ── Concurrency: PER-REF, and that is load-bearing (SABLE-jd5fj.3) ───────────
+# The group is keyed on github.ref, so N merge previews on N distinct
+# ci-verify/<bead>-<sha7> refs land in N DISTINCT groups and run CONCURRENTLY —
+# none of them cancels another. cancel-in-progress: true is safe only under that
+# keying: what it supersedes is a re-push to the SAME ref (a stale run for a
+# merge state that has been replaced), which is exactly what should be dropped.
+#
+# DO NOT coarsen this key. A constant, or github.workflow alone, would collapse
+# every in-flight preview into one group, and each new worker's kick would
+# cancel the run before it — SABLE-sc24's spurious-cancel shape, fleet-wide,
+# with authors told to "fix + re-push" work that has nothing wrong with it.
+# hooks/test/test-parallel-previews.sh (P1a) and bin/test_merge_gate_modules.py
+# both red the gate if this stops naming github.ref.
+#
+# CEILING: GitHub Actions runs at most 20 concurrent jobs per account on the
+# free tier. Previews past that QUEUE — they do not fail — so exceeding it costs
+# merge latency, not correctness. A fleet wider than ~20 simultaneous in-flight
+# previews is running against that queue; SABLE-jd5fj.7's merge-latency
+# telemetry is where it would show up.
 concurrency:
   group: ci-verify-${{ github.ref }}
   cancel-in-progress: true

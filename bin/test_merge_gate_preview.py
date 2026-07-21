@@ -32,6 +32,15 @@ _SPEC = importlib.util.spec_from_loader("sable_merge_gate", _LOADER)
 smg = importlib.util.module_from_spec(_SPEC)
 _LOADER.exec_module(smg)
 
+# SABLE-jd5fj.3 split: the gate now lives in three modules beside the CLI, and
+# each seam is patched on the module that DEFINES it (every caller invokes them
+# module-qualified, so one patch reaches the whole gate). These aliases are the
+# only plumbing change the split required here — no assertion below moved.
+classify = smg.classify
+git_lib = smg.git_lib
+preview_lib = smg.preview_lib
+promote_lib = smg.promote_lib
+
 REPO = "/repo"
 REMOTE = "origin"
 BASE = "trunk"
@@ -111,8 +120,8 @@ def no_waiting(monkeypatch):
     not a slow test."""
     def _boom(*a, **kw):
         raise AssertionError("preview kick must not wait for CI / shell out")
-    monkeypatch.setattr(smg, "wait_for_ci", _boom)
-    monkeypatch.setattr(smg, "_run", _boom)
+    monkeypatch.setattr(preview_lib, "wait_for_ci", _boom)
+    monkeypatch.setattr(git_lib, "_run", _boom)
 
 
 # --- shared idempotency key --------------------------------------------------
@@ -144,7 +153,7 @@ def test_kick_ref_sanitizes_a_slashed_branch_name():
 
 def test_kick_pushes_the_ref_and_returns_without_waiting(monkeypatch, no_waiting):
     fake = FakeGit()
-    monkeypatch.setattr(smg, "_git", fake)
+    monkeypatch.setattr(git_lib, "_git", fake)
     assert smg.kick_preview(BRANCH, BASE, REPO, REMOTE) == 0
     ref = smg.preview_kick_ref(BRANCH, BASE_SHA, BRANCH_SHA)
     assert fake.pushes == [f"{PREVIEW_SHA}:refs/heads/{ref}"]
@@ -155,7 +164,7 @@ def test_kick_is_exactly_once_per_merge_state(monkeypatch, no_waiting):
     nothing — re-pushing would re-trigger CI and cancel the run already underway
     (ci-verify.yml is cancel-in-progress)."""
     fake = FakeGit()
-    monkeypatch.setattr(smg, "_git", fake)
+    monkeypatch.setattr(git_lib, "_git", fake)
     smg.kick_preview(BRANCH, BASE, REPO, REMOTE)
     assert smg.kick_preview(BRANCH, BASE, REPO, REMOTE) == 0
     assert len(fake.pushes) == 1
@@ -164,7 +173,7 @@ def test_kick_is_exactly_once_per_merge_state(monkeypatch, no_waiting):
 
 def test_kick_after_the_branch_moves_kicks_again(monkeypatch, no_waiting):
     fake = FakeGit()
-    monkeypatch.setattr(smg, "_git", fake)
+    monkeypatch.setattr(git_lib, "_git", fake)
     smg.kick_preview(BRANCH, BASE, REPO, REMOTE)
     fake.branch_sha = "e" * 40  # worker pushed a follow-up commit
     smg.kick_preview(BRANCH, BASE, REPO, REMOTE)
@@ -174,7 +183,7 @@ def test_kick_after_the_branch_moves_kicks_again(monkeypatch, no_waiting):
 
 def test_kick_on_conflict_exits_22_and_pushes_nothing(monkeypatch, no_waiting):
     fake = FakeGit(conflict=True)
-    monkeypatch.setattr(smg, "_git", fake)
+    monkeypatch.setattr(git_lib, "_git", fake)
     with pytest.raises(smg.GateError) as exc:
         smg.kick_preview(BRANCH, BASE, REPO, REMOTE)
     assert exc.value.code == 22
@@ -184,15 +193,15 @@ def test_kick_on_conflict_exits_22_and_pushes_nothing(monkeypatch, no_waiting):
 def test_kick_writes_no_bead_evidence_and_notifies_nobody(monkeypatch, no_waiting):
     def _boom(*a, **kw):
         raise AssertionError("a kick has no verdict to report")
-    monkeypatch.setattr(smg, "_git", FakeGit())
-    monkeypatch.setattr(smg, "_append_evidence", _boom)
-    monkeypatch.setattr(smg, "_notify", _boom)
+    monkeypatch.setattr(git_lib, "_git", FakeGit())
+    monkeypatch.setattr(promote_lib, "_append_evidence", _boom)
+    monkeypatch.setattr(promote_lib, "_notify", _boom)
     assert smg.kick_preview(BRANCH, BASE, REPO, REMOTE) == 0
 
 
 def test_main_preview_subcommand_routes_to_the_kick(monkeypatch, no_waiting):
     fake = FakeGit()
-    monkeypatch.setattr(smg, "_git", fake)
+    monkeypatch.setattr(git_lib, "_git", fake)
     monkeypatch.setenv("SABLE_MG_BASE", BASE)
     rc = smg.main(["preview", "--branch", BRANCH, "--repo", REPO, "--remote", REMOTE])
     assert rc == 0
@@ -208,18 +217,18 @@ def _kicked_fake(parents=(BASE_SHA, BRANCH_SHA)):
 
 def test_adopt_returns_the_kicked_preview_when_parents_match(monkeypatch):
     fake, ref = _kicked_fake()
-    monkeypatch.setattr(smg, "_git", fake)
+    monkeypatch.setattr(git_lib, "_git", fake)
     assert smg.adopt_kicked_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) == (PREVIEW_SHA, ref)
 
 
 def test_adopt_declines_when_no_kick_happened(monkeypatch):
-    monkeypatch.setattr(smg, "_git", FakeGit())
+    monkeypatch.setattr(git_lib, "_git", FakeGit())
     assert smg.adopt_kicked_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) is None
 
 
 def test_adopt_declines_when_the_kicked_commit_has_drifted_parents(monkeypatch):
     fake, _ = _kicked_fake(parents=("f" * 40, BRANCH_SHA))
-    monkeypatch.setattr(smg, "_git", fake)
+    monkeypatch.setattr(git_lib, "_git", fake)
     assert smg.adopt_kicked_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) is None
 
 
@@ -231,14 +240,14 @@ def test_adopt_declines_when_the_object_is_unfetchable(monkeypatch):
             return _cp(1, "couldn't find remote ref")
         return fake(repo, *args, check=check)
 
-    monkeypatch.setattr(smg, "_git", _no_fetch)
+    monkeypatch.setattr(git_lib, "_git", _no_fetch)
     assert smg.adopt_kicked_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) is None
 
 
 def test_adopt_never_raises_into_the_promote_flow(monkeypatch):
     def _explode(*a, **kw):
         raise RuntimeError("git blew up")
-    monkeypatch.setattr(smg, "_git", _explode)
+    monkeypatch.setattr(git_lib, "_git", _explode)
     assert smg.adopt_kicked_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) is None
 
 
@@ -246,9 +255,15 @@ def test_adopt_never_raises_into_the_promote_flow(monkeypatch):
 
 @pytest.fixture
 def quiet_promote(monkeypatch):
-    monkeypatch.setattr(smg, "_append_evidence", lambda *a, **kw: None)
-    monkeypatch.setattr(smg, "_notify", lambda *a, **kw: None)
-    monkeypatch.setattr(smg, "cleanup_after_merge", lambda *a, **kw: None)
+    # No verdict is stored yet, so these cases exercise promote's wait_for_ci
+    # fall-through — the pre-split path, unchanged by the SABLE-jd5fj.3 split.
+    # Stated explicitly so the case says which verdict source it is testing.
+    monkeypatch.setattr(preview_lib, "read_verdict",
+                        lambda repo, ref, sha: classify.Verdict(
+                            "pending", "", sha, ref, source="precomputed", complete=False))
+    monkeypatch.setattr(promote_lib, "_append_evidence", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "_notify", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "cleanup_after_merge", lambda *a, **kw: None)
 
 
 def test_promote_adopts_the_kicked_preview_and_never_builds_a_second(monkeypatch, quiet_promote):
@@ -262,11 +277,11 @@ def test_promote_adopts_the_kicked_preview_and_never_builds_a_second(monkeypatch
             return PREVIEW_SHA
         return BASE_SHA if r.endswith(BASE) else BRANCH_SHA
 
-    monkeypatch.setattr(smg, "_git", fake)
-    monkeypatch.setattr(smg, "resolve_commit", _resolve)
-    monkeypatch.setattr(smg, "build_preview",
+    monkeypatch.setattr(git_lib, "_git", fake)
+    monkeypatch.setattr(git_lib, "resolve_commit", _resolve)
+    monkeypatch.setattr(preview_lib, "build_preview",
                         lambda *a, **kw: pytest.fail("promote rebuilt an already-kicked preview"))
-    monkeypatch.setattr(smg, "wait_for_ci", lambda *a, **kw: ("success", "http://run/1"))
+    monkeypatch.setattr(preview_lib, "wait_for_ci", lambda *a, **kw: ("success", "http://run/1"))
 
     assert smg.promote("SABLE-x", BRANCH, BASE, REPO, REMOTE, "optimus", None) == 0
     assert f"{PREVIEW_SHA}:refs/heads/{BASE}" in fake.pushes
@@ -276,10 +291,10 @@ def test_promote_adopts_the_kicked_preview_and_never_builds_a_second(monkeypatch
 
 def test_promote_still_builds_its_own_preview_when_nothing_was_kicked(monkeypatch, quiet_promote):
     fake = FakeGit()
-    monkeypatch.setattr(smg, "_git", fake)
-    monkeypatch.setattr(smg, "resolve_commit",
+    monkeypatch.setattr(git_lib, "_git", fake)
+    monkeypatch.setattr(git_lib, "resolve_commit",
                         lambda repo, r: BASE_SHA if r.endswith(BASE) else BRANCH_SHA)
-    monkeypatch.setattr(smg, "wait_for_ci", lambda *a, **kw: ("failure", "http://run/2"))
+    monkeypatch.setattr(preview_lib, "wait_for_ci", lambda *a, **kw: ("failure", "http://run/2"))
     assert smg.promote("SABLE-x", BRANCH, BASE, REPO, REMOTE, "optimus", None) == 20
     assert fake.previews_built == 1
 
@@ -288,9 +303,9 @@ def test_promote_taxonomy_is_untouched_by_an_adopted_preview(monkeypatch, quiet_
     """RED stays 20 whether the preview was kicked or built — adoption changes
     which object is verified, never what a verdict means."""
     fake, _ = _kicked_fake()
-    monkeypatch.setattr(smg, "_git", fake)
-    monkeypatch.setattr(smg, "resolve_commit",
+    monkeypatch.setattr(git_lib, "_git", fake)
+    monkeypatch.setattr(git_lib, "resolve_commit",
                         lambda repo, r: BASE_SHA if r.endswith(BASE) else BRANCH_SHA)
-    monkeypatch.setattr(smg, "wait_for_ci", lambda *a, **kw: ("failure", "http://run/3"))
+    monkeypatch.setattr(preview_lib, "wait_for_ci", lambda *a, **kw: ("failure", "http://run/3"))
     assert smg.promote("SABLE-x", BRANCH, BASE, REPO, REMOTE, "optimus", None) == 20
     assert fake.previews_built == 0
