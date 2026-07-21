@@ -34,7 +34,21 @@ from typing import Callable, List, NamedTuple, Optional
 
 TESTMON_DATAFILE = ".testmondata"
 
-Collector = Callable[[Path, List[str]], List[str]]
+# Exit codes `pytest --collect-only` itself treats as a successful collection
+# outcome: 0 (ids collected) and 5 (collection ran, legitimately selected
+# nothing -- pytest's own "no tests ran" code). Anything else (4 usage error,
+# 3 internal error, 2 interrupted, ...) means the collector process itself is
+# broken -- e.g. a missing/incompatible pytest-testmon or pytest-impact plugin
+# on an ephemeral CI runner -- and must NOT be read as "nothing impacted".
+_COLLECTOR_OK_EXIT_CODES = frozenset({0, 5})
+
+
+class CollectResult(NamedTuple):
+    ids: List[str]
+    returncode: int
+
+
+Collector = Callable[[Path, List[str]], CollectResult]
 
 
 def testmondata_path(repo_root: Path) -> Path:
@@ -56,9 +70,15 @@ def parse_collect_only_nodeids(output: str) -> List[str]:
     return ids
 
 
-def _pytest_collect_only(repo_root: Path, extra_args: List[str]) -> List[str]:
+def _pytest_collect_only(repo_root: Path, extra_args: List[str]) -> CollectResult:
     """Real collector: shells out to `pytest bin/ --collect-only -q <extra_args>`
-    and parses the selected node ids. Never executes any test body."""
+    and parses the selected node ids. Never executes any test body.
+
+    Surfaces the subprocess returncode alongside the parsed ids -- a failed
+    collector (missing plugin, usage error, internal error) prints an empty
+    node-id list just like a legitimately-empty selection, and the two are
+    indistinguishable without the returncode. See build_impact_tier_plan.
+    """
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "bin/", "--collect-only", "-q", *extra_args],
         cwd=repo_root,
@@ -66,7 +86,7 @@ def _pytest_collect_only(repo_root: Path, extra_args: List[str]) -> List[str]:
         text=True,
         check=False,
     )
-    return parse_collect_only_nodeids(result.stdout)
+    return CollectResult(ids=parse_collect_only_nodeids(result.stdout), returncode=result.returncode)
 
 
 class ImpactTierPlan(NamedTuple):
@@ -85,7 +105,10 @@ def build_impact_tier_plan(
     cache miss -> ("full", full-suite argv) -- see module docstring.
     cache hit  -> union pytest-testmon's and pytest-impact's collect-only
                   selections; ("selected", explicit node ids), or
-                  ("none", []) if both independently agree nothing changed.
+                  ("none", []) if both independently agree nothing changed,
+                  or ("full", ...) if either collector process itself failed
+                  (see _COLLECTOR_OK_EXIT_CODES) -- a broken collector must
+                  never be mistaken for a legitimately-empty selection.
     """
     if not testmondata_path(repo_root).exists():
         return ImpactTierPlan(
@@ -94,8 +117,26 @@ def build_impact_tier_plan(
             reason="testmon cache miss (.testmondata absent) -- conservative full run",
         )
 
-    testmon_ids = set(collector(repo_root, ["--testmon"]))
-    impact_ids = set(collector(repo_root, ["--impact", f"--impact-base={base_ref}"]))
+    testmon_result = collector(repo_root, ["--testmon"])
+    impact_result = collector(repo_root, ["--impact", f"--impact-base={base_ref}"])
+
+    failures = []
+    if testmon_result.returncode not in _COLLECTOR_OK_EXIT_CODES:
+        failures.append(f"pytest-testmon collector exit {testmon_result.returncode}")
+    if impact_result.returncode not in _COLLECTOR_OK_EXIT_CODES:
+        failures.append(f"pytest-impact collector exit {impact_result.returncode}")
+
+    if failures:
+        reason = "; ".join(failures) + " -- conservative full run"
+        print(f"tier_selection: COLLECTOR FAILURE, falling back to full run: {reason}", file=sys.stderr)
+        return ImpactTierPlan(
+            mode="full",
+            argv=["bin/", "-q", "-p", "no:cacheprovider"],
+            reason=reason,
+        )
+
+    testmon_ids = set(testmon_result.ids)
+    impact_ids = set(impact_result.ids)
     union_ids = sorted(testmon_ids | impact_ids)
 
     if not union_ids:
