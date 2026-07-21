@@ -314,6 +314,14 @@ waiting to be reaped — do not act on it first.
 
 ## Git Stash Policy
 
+**Enforced, not just documented (SABLE-5dmh):** installs that carry
+`hooks/multi-manager/stash-worktree-guard.sh` (wired via
+`templates/multi-manager/settings-snippet.json`) DENY a bare `git stash` /
+`push` / `pop` / `apply` / `drop` / `clear` in every checkout, primary
+included, and only allow the break-glass form below (with a warning, never
+silently). This section still applies in full — it's what the guard's deny
+message points you back to.
+
 **`git stash` is banned in worker and manager dispatch flows.** `git worktree
 add` gives each worktree its own working directory, HEAD, and index, but
 `refs/stash` lives in the shared common `.git` directory — every worktree of
