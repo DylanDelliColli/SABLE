@@ -172,6 +172,182 @@ def test_check_manifest_unrelated_files_stay_clean_when_one_drifts(tmp_path):
     assert statuses["agent definitions"] == "clean"
 
 
+# --- pinned bins (SABLE-mkj6k) --------------------------------------------------
+# Defect 2 was that install.sh silently re-symlinked a deliberately pinned
+# (regular-file) spine bin, restoring the y6ik3 hot-swap hazard the pin was
+# authorized to remove — with nothing warning. These cover the "pinned bins"
+# manifest category: opt-in only when bin_dir is given, "unpinned" detected
+# via the .sable-pinned marker (a symlink whose CONTENT matches repo HEAD
+# would otherwise sha256-compare "clean", hiding exactly this defect), and
+# that a drifted pinned bin's report never recommends `bash install.sh`
+# (SABLE-mkj6k's guarded-remedy acceptance criterion).
+
+def make_pinned_repo(tmp_path, *, bin_mutate=None):
+    """A repo/bin fixture for the three pinned spine bins, plus a bin_dir that
+    starts as an exact regular-file mirror — the pinned state an
+    operator-approved de-hazard window leaves behind."""
+    repo = tmp_path / "repo"
+    bin_dir = tmp_path / "local-bin"
+    (repo / "bin").mkdir(parents=True)
+    bin_dir.mkdir()
+    for name in doctor.PINNED_BIN_NAMES:
+        (repo / "bin" / name).write_text(f"#!/bin/sh\necho {name}\n")
+        (bin_dir / name).write_bytes((repo / "bin" / name).read_bytes())
+    (bin_dir / ".sable-pinned").write_text("\n".join(doctor.PINNED_BIN_NAMES) + "\n")
+    if bin_mutate:
+        bin_mutate(repo, bin_dir)
+    return repo, bin_dir
+
+
+def test_build_manifest_includes_pinned_bins_category_when_bin_dir_given(tmp_path):
+    repo, bin_dir = make_pinned_repo(tmp_path)
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir)
+    pinned = {src.name for c, src, _ in entries if c == "pinned bins"}
+    assert pinned == set(doctor.PINNED_BIN_NAMES)
+
+
+def test_build_manifest_omits_pinned_bins_without_bin_dir(tmp_path):
+    repo, _ = make_pinned_repo(tmp_path)
+    entries = doctor.build_manifest(repo, tmp_path / "claude")
+    assert not any(c == "pinned bins" for c, _, _ in entries)
+
+
+def test_check_manifest_pinned_bin_clean_when_regular_file_matches(tmp_path):
+    repo, bin_dir = make_pinned_repo(tmp_path)
+    results = doctor.check_manifest(doctor.build_manifest(repo, tmp_path / "claude", bin_dir))
+    pinned_results = [r for r in results if r["category"] == "pinned bins"]
+    assert len(pinned_results) == len(doctor.PINNED_BIN_NAMES)
+    assert all(r["status"] == "clean" for r in pinned_results)
+
+
+def test_check_manifest_pinned_bin_symlink_is_unpinned_even_with_matching_content(tmp_path):
+    # The exact DEFECT 2 failure mode: install re-symlinks a pinned bin. The
+    # symlink's RESOLVED content is byte-identical to repo HEAD (a symlink
+    # always resolves live), so a naive sha256 compare would call this
+    # "clean" — the violation is the file TYPE reverting, caught via the
+    # .sable-pinned marker independent of content.
+    target_name = doctor.PINNED_BIN_NAMES[0]
+
+    def mutate(repo, bin_dir):
+        target = bin_dir / target_name
+        target.unlink()
+        target.symlink_to(repo / "bin" / target_name)
+
+    repo, bin_dir = make_pinned_repo(tmp_path, bin_mutate=mutate)
+    results = doctor.check_manifest(doctor.build_manifest(repo, tmp_path / "claude", bin_dir))
+    r = next(x for x in results if x["category"] == "pinned bins" and Path(x["repo_path"]).name == target_name)
+    assert r["status"] == "unpinned"
+
+
+def test_check_manifest_pinned_bin_drift_when_content_differs(tmp_path):
+    target_name = doctor.PINNED_BIN_NAMES[0]
+
+    def mutate(repo, bin_dir):
+        (bin_dir / target_name).write_text("tampered\n")
+
+    repo, bin_dir = make_pinned_repo(tmp_path, bin_mutate=mutate)
+    results = doctor.check_manifest(doctor.build_manifest(repo, tmp_path / "claude", bin_dir))
+    r = next(x for x in results if x["category"] == "pinned bins" and Path(x["repo_path"]).name == target_name)
+    assert r["status"] == "drift"
+
+
+def test_check_manifest_symlink_without_pin_marker_stays_clean(tmp_path):
+    # A symlink is the ORDINARY default state for a never-pinned bin — only a
+    # symlink where the marker says pinned is a violation.
+    target_name = doctor.PINNED_BIN_NAMES[0]
+
+    def mutate(repo, bin_dir):
+        (bin_dir / ".sable-pinned").unlink()
+        target = bin_dir / target_name
+        target.unlink()
+        target.symlink_to(repo / "bin" / target_name)
+
+    repo, bin_dir = make_pinned_repo(tmp_path, bin_mutate=mutate)
+    results = doctor.check_manifest(doctor.build_manifest(repo, tmp_path / "claude", bin_dir))
+    r = next(x for x in results if x["category"] == "pinned bins" and Path(x["repo_path"]).name == target_name)
+    assert r["status"] == "clean"
+
+
+def test_check_manifest_pinned_bin_missing_entirely(tmp_path):
+    target_name = doctor.PINNED_BIN_NAMES[0]
+
+    def mutate(repo, bin_dir):
+        (bin_dir / target_name).unlink()
+
+    repo, bin_dir = make_pinned_repo(tmp_path, bin_mutate=mutate)
+    results = doctor.check_manifest(doctor.build_manifest(repo, tmp_path / "claude", bin_dir))
+    r = next(x for x in results if x["category"] == "pinned bins" and Path(x["repo_path"]).name == target_name)
+    assert r["status"] == "missing"
+
+
+# --- guarded remedy (SABLE-mkj6k acceptance criterion) --------------------------
+# A drifted GUARDED file's report must NOT tell an agent to run `bash
+# install.sh`, and must name the safe per-file path instead; a drifted
+# UNGUARDED file must still get the normal remedy (over-suppression would
+# hide real drift, which is its own regression).
+
+def test_render_text_report_guarded_pinned_bin_does_not_recommend_install_sh(tmp_path, capsys):
+    target_name = doctor.PINNED_BIN_NAMES[0]
+
+    def mutate(repo, bin_dir):
+        target = bin_dir / target_name
+        target.unlink()
+        target.symlink_to(repo / "bin" / target_name)
+
+    repo, bin_dir = make_pinned_repo(tmp_path, bin_mutate=mutate)
+    results = doctor.check_manifest(doctor.build_manifest(repo, tmp_path / "claude", bin_dir))
+    doctor.render_text_report(results)
+    out = capsys.readouterr().out
+    assert "bash install.sh" not in out
+    assert "cp " in out
+    assert target_name in out
+
+
+def test_render_text_report_unguarded_drift_still_recommends_install_sh(tmp_path, capsys):
+    def mutate(repo, claude_dir):
+        (claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
+
+    repo, claude_dir = make_repo(tmp_path, mutate=mutate)
+    results = doctor.check_manifest(doctor.build_manifest(repo, claude_dir))
+    doctor.render_text_report(results)
+    out = capsys.readouterr().out
+    assert "bash install.sh" in out
+
+
+def test_quiet_mode_guarded_pinned_bin_does_not_recommend_install_sh(tmp_path, capsys):
+    target_name = doctor.PINNED_BIN_NAMES[0]
+
+    def mutate(repo, bin_dir):
+        target = bin_dir / target_name
+        target.unlink()
+        target.symlink_to(repo / "bin" / target_name)
+
+    repo, bin_dir = make_pinned_repo(tmp_path, bin_mutate=mutate)
+    rc = doctor.main([
+        "--repo", str(repo), "--claude-dir", str(tmp_path / "claude"),
+        "--bin-dir", str(bin_dir), "--quiet",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "bash install.sh" not in captured.err
+    assert captured.out == ""
+
+
+def test_quiet_mode_unguarded_drift_still_recommends_install_sh(tmp_path, capsys):
+    def mutate(repo, claude_dir):
+        (claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
+
+    repo, claude_dir = make_repo(tmp_path, mutate=mutate)
+    rc = doctor.main([
+        "--repo", str(repo), "--claude-dir", str(claude_dir),
+        "--bin-dir", str(tmp_path / "empty-bin-dir"), "--quiet",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert "bash install.sh" in captured.err
+
+
 # --- resolve_claude_dir ---------------------------------------------------------
 
 def test_resolve_claude_dir_explicit_arg_wins():
