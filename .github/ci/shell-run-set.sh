@@ -58,6 +58,7 @@ ALLOW=(
   test-multi-manager-pattern.sh
   test-no-cockpit-naming.sh
   test-no-hook-autopush.sh
+  test-notes-clobber-guard.sh
   test-optimistic-promotion.sh
   test-orchestration-install.sh
   test-overlap-constraint.sh
@@ -119,6 +120,7 @@ declare -A EXCLUDE=(
   [test-install-version-floor.sh]="needs the ~/.claude SABLE install (SABLE-59zu)"
   [test-install-multi-manager.sh]="vacuous without bd — prints 'SKIP: bd not on PATH' and exits 0 (SABLE-59zu/SABLE-7v3z)"
   [test-quickstart-project.sh]="needs the ~/.claude SABLE install (bd, sable-doctor) for its E2E bootstrap-flow cases; clean-room has none (SABLE-59zu, SABLE-vivm)"
+  [test-notes-clobber-guard-e2e.sh]="real-bd-only by construction — its whole claim is that CONTENT survives in a real bead store, and its negative control needs a real destructive bd write; in the clean room it would SKIP and count green (SABLE-sm269, SABLE-59zu). Run it locally against real bd; the decision logic is covered fail-closed by test-notes-clobber-guard.sh, which IS in the run-set."
   [test-tmux-e2e.sh]="vacuous without bd — prints 'SKIP: bd not installed' and exits 0 (SABLE-59zu)"
   [test-sable-msg.sh]="known-red: legacy fixed-name tmux sessions vs per-repo naming (SABLE-cncs)"
   [test-sable-worker-status.sh]="tracked-red under ambient tmux; green in clean-room but excluded pending confirmation (SABLE-b574)"
@@ -144,6 +146,8 @@ declare -A COVERS=(
   [test-lib-registry-path.sh]="hooks/multi-manager/lib-registry-path.sh"
   [test-mode-interlock.sh]="hooks/multi-manager/mode-interlock.sh"
   [test-mode-tier.sh]="hooks/multi-manager/mode-interlock.sh"
+  [test-notes-clobber-guard.sh]="hooks/multi-manager/notes-clobber-guard.sh"
+  [test-notes-clobber-guard-e2e.sh]="hooks/multi-manager/notes-clobber-guard.sh"
   [test-orchestration-install.sh]="hooks/multi-manager/inbox-injection-precompact.sh hooks/multi-manager/inbox-injection.sh hooks/multi-manager/mode-interlock.sh hooks/multi-manager/read-guard.sh hooks/multi-manager/session-role-anchor.sh"
   [test-optimistic-promotion.sh]="bin/sable-merge-gate bin/sable_footprint_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_preview_lib.py bin/sable_gate_classify_lib.py bin/sable_gate_git_lib.py"
   [test-overlap-constraint.sh]="hooks/multi-manager/pre-dispatch-overlap.sh"
