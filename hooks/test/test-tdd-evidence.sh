@@ -312,6 +312,96 @@ else
 fi
 rm -f "$UNSPACED_SEMI_EV"
 
+# ---------- SABLE-rzsb.5 / SABLE-j10xa: 'env' prefix must not blind the detector ----------
+# The fleet's hermetic-run contract wraps test commands as
+# 'env -u VAR1 -u VAR2 ... <suite>' to scrub identity env vars before running.
+# Every real 'env' option-arity form must be stripped so the REAL interpreter
+# underneath is what gets classified — not merely the '-i VAR=x' shape the
+# bead was originally filed under.
+
+run_hook_writes "env -i VAR=x bash <suite> recognized"        "env -i FOO=1 bash hooks/test/test-foo.sh"
+run_hook_writes "env VAR=x python3 <suite>.py recognized"     "env FOO=1 python3 bin/test_foo.py"
+run_hook_writes "env -u NAME bash <suite> (single -u) recognized" \
+  "env -u CLAUDE_AGENT_NAME bash hooks/test/test-foo.sh"
+run_hook_writes "env -u A -u B -u C bash <suite> (the mandated multi -u contract shape) recognized" \
+  "env -u CLAUDE_AGENT_NAME -u SABLE_WORKER_PANE -u SABLE_BEAD bash hooks/test/test-foo.sh"
+run_hook_writes "env -uNAME (attached form) bash <suite> recognized" \
+  "env -uCLAUDE_AGENT_NAME bash hooks/test/test-foo.sh"
+run_hook_writes "env --unset=NAME (attached form) python -m pytest recognized" \
+  "env --unset=CLAUDE_AGENT_NAME python -m pytest tests/"
+run_hook_writes "env --unset NAME (two-token form) bash <suite> recognized" \
+  "env --unset CLAUDE_AGENT_NAME bash hooks/test/test-foo.sh"
+run_hook_writes "env -- bash <suite> (terminator) recognized" \
+  "env -- bash hooks/test/test-foo.sh"
+run_hook_writes "env -u NAME npx vitest run recognized (composes with the npx unwrap)" \
+  "env -u CLAUDE_AGENT_NAME npx vitest run"
+
+run_hook_silent "bare 'env' with no command not recognized"    "env"
+run_hook_silent "'env' with only a VAR=val assignment, no command, not recognized" "env FOO=1"
+
+# ---------- Regression: plain (unwrapped) invocations classify unchanged ----------
+run_hook_writes "regression: plain bash <suite> still recognized"   "bash hooks/test/test-foo.sh"
+run_hook_writes "regression: plain source <suite> still recognized" "source hooks/test/test-foo.sh"
+run_hook_writes "regression: plain npx vitest still recognized"     "npx vitest run"
+
+# ---------- SABLE-0w0ou: 'sable-test <cmd>' unwrapped like npx ----------
+# bin/sable-test wraps a test command and propagates its exit code; the real
+# command underneath must be what this hook classifies, so a sable-test-
+# wrapped run is never invisible to it (previously: no case for 'sable-test'
+# at all — it fell through every matcher, same failure shape as the
+# unrecognized 'env' prefix above).
+
+run_hook_writes "sable-test <suite> unwrapped and recognized" \
+  "sable-test bash hooks/test/test-foo.sh"
+
+run_hook_silent "sable-test wrapping a non-test script still not recognized" \
+  "sable-test bash setup.sh"
+
+run_hook_silent "bare 'sable-test' with no command not recognized" \
+  "sable-test"
+
+# Combined shape: sable-test wrapping an env-prefixed hermetic run — the case
+# that silently rots if the two unwraps aren't composed in the right order
+# (sable-test unwrap MUST run before the env-grammar strip).
+run_hook_writes "sable-test env -u A -u B <suite> (combined wrapper shape) recognized" \
+  "sable-test env -u CLAUDE_AGENT_NAME -u SABLE_WORKER_PANE bash hooks/test/test-foo.sh"
+
+# ---------- INTEGRATION: env-u hermetic run + real tdd-gate.sh close ----------
+# The acceptance criterion for SABLE-j10xa/rzsb.5: a worker that follows the
+# fleet's mandated hermetic-run contract exactly must be able to close its
+# bead afterward. Real writer hook + real gate hook, same session, no mocks.
+EU_STUB_DIR=$(mktemp -d)
+cat > "$EU_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-stub","notes":"integration stub"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$EU_STUB_DIR/bd"
+GATE_HOOK_FILE="$(cd "$(dirname "$0")/.." && pwd)/tdd-gate.sh"
+
+EU_SID="tdd-ev-envu-gate-$$-$RANDOM"
+EU_EV="/tmp/tdd-evidence-${EU_SID}"
+rm -f "$EU_EV"
+make_input "env -u CLAUDE_AGENT_NAME -u SABLE_WORKER_PANE -u SABLE_BEAD bash hooks/test/test-foo.sh" "$EU_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if [ -s "$EU_EV" ]; then
+  pass "env-u hermetic run: real writer hook records evidence"
+else
+  fail "env-u hermetic run: real writer hook records evidence" "no $EU_EV"
+fi
+EU_GATE_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$EU_SID" | env PATH="$EU_STUB_DIR:$PATH" bash "$GATE_HOOK_FILE" 2>/dev/null)
+if [ -z "$EU_GATE_OUT" ]; then
+  pass "env-u hermetic run: real gate ALLOWS the close (SABLE-j10xa acceptance criterion)"
+else
+  fail "env-u hermetic run: real gate ALLOWS the close" "gate denied: $EU_GATE_OUT"
+fi
+rm -f "$EU_EV"
+rm -rf "$EU_STUB_DIR"
+
 # ---------- Summary ----------
 
 echo

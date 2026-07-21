@@ -69,11 +69,21 @@ rc=$?
 
 if [ "$rc" -eq 0 ]; then
   if command -v sable_evidence_key >/dev/null 2>&1; then
-    # sid/aid from the environment (the hccq trap: CLAUDE_SESSION_ID may be
-    # absent — the lib then derives a deterministic ppid fallback key). We never
-    # substitute CLAUDE_CODE_SESSION_ID for a missing CLAUDE_SESSION_ID: that is
-    # the mismatch source the shared lib exists to avoid.
-    SID="${CLAUDE_SESSION_ID:-}"
+    # SABLE-0w0ou: this used to read ONLY CLAUDE_SESSION_ID (empty in every
+    # warm-pane worker session), so it silently fell to the lib's ppid
+    # fallback while tdd-gate.sh's reader picked up the real, POPULATED
+    # session id from the PreToolUse hook JSON — two different non-empty
+    # keys, permanent false-deny on bd close. The in-file comment that used
+    # to sit here declined to ever substitute CLAUDE_CODE_SESSION_ID "to
+    # avoid a mismatch" — that premise is false and disproved empirically:
+    # in a hooks-fire session the PreToolUse JSON's session_id IS
+    # CLAUDE_CODE_SESSION_ID, byte-for-byte (the evidence file the hook
+    # writes is literally named /tmp/tdd-evidence-<CLAUDE_CODE_SESSION_ID>).
+    # sable_resolve_session_id() (owned by the shared lib, not re-derived
+    # here) walks CLAUDE_SESSION_ID -> CLAUDE_CODE_SESSION_ID before giving
+    # up to the ppid fallback, which stays reserved for the genuinely
+    # no-identity-available case (no hook ever ran, neither var is set).
+    SID=$(sable_resolve_session_id)
     AID="${CLAUDE_AGENT_ID:-}"
     EVIDENCE_FILE=$(sable_evidence_key "$SID" "$AID")
     REPO_TAG=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
