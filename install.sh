@@ -502,8 +502,11 @@ echo "The orchestration settings snippet was merged into the scope's settings fi
 echo "automatically by sable-orchestration-install (backed up; existing entries kept)."
 echo "sable-orchestration-install also STAGES (never activates) the reconciliation"
 echo "floor's host timer artifacts (systemd --user unit + cron fallback line) under"
-echo "${CLAUDE_DIR}/sable/reconcile-timer/ — see its own output above for the"
-echo "activation commands (SABLE-jfg6.5 / D3 TIMER LEG)."
+echo "${CLAUDE_DIR}/sable/reconcile-timer/. Activate with the ONE self-verifying"
+echo "command it prints above — 'sable-reconcile-timer --install-schedule' — and"
+echo "re-check any time with 'sable-reconcile-timer --check-schedule --repo <repo>',"
+echo "which fails loudly when nothing is scheduled OR when what is scheduled sweeps"
+echo "a different repo (SABLE-jfg6.5 / D3 TIMER LEG; SABLE-5xz68)."
 echo
 
 bold "Install complete."

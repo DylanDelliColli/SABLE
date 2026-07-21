@@ -10,16 +10,22 @@ This wraps it with a repo-resolution chain that NEVER touches pane context
 catches a stranded push even when every operator pane and manager pane is
 asleep — the bldh.7 walk-away condition itself (S5).
 
-Repo resolution (first hit wins; this entrypoint NEVER falls back to PWD or
-any pane/tmux context — guessing there would silently reconcile the wrong
-repo, or none, from an unattended invocation):
-  1. --repo PATH               (explicit, highest priority)
+Repo resolution (first SOURCE hit wins, and that source may name MORE THAN ONE
+repo — this host runs more than one fleet, and a timer that sweeps one repo
+leaves every other fleet unprotected (SABLE-5xz68). This entrypoint NEVER falls
+back to PWD or any pane/tmux context — guessing there would silently reconcile
+the wrong repo, or none, from an unattended invocation):
+  1. --repo PATH               (explicit, highest priority; REPEATABLE)
   2. $SABLE_RECONCILE_REPO     (env override — e.g. a systemd unit's Environment=
-                                 or a cron line's leading VAR=val)
+                                 or a cron line's leading VAR=val; may carry
+                                 several repos separated by ':')
   3. --config PATH (default ~/.config/sable/reconcile-timer.conf, or
      $XDG_CONFIG_HOME/sable/reconcile-timer.conf when XDG_CONFIG_HOME is set):
-     the first non-blank, non-'#' line, either a bare path or `repo=<path>`.
+     EVERY non-blank, non-'#' line, each a bare path or `repo=<path>`.
   none of the above -> usage error (exit 2).
+
+Every resolved repo is swept, and a failure on one does NOT skip the rest — an
+unswept fleet is an unprotected fleet. The exit code is the first non-zero.
 
 Two invocation shapes:
   --once           run exactly one sweep and exit with sable-reconcile-handoffs's
@@ -30,9 +36,25 @@ Two invocation shapes:
    --once)          host with no systemd/cron wiring (e.g. `nohup sable-reconcile-timer &`).
                      Exits 0 on SIGINT/SIGTERM.
 
+Schedule leg (SABLE-5xz68 — GENERATING A UNIT FILE IS NOT INSTALLING IT):
+  --check-schedule    ask the RUNNING SYSTEM whether a schedule actually fires
+                       this entrypoint, and whether it covers the repos resolved
+                       above. Exit 3 (loudly) when nothing is scheduled, and
+                       also when something IS scheduled but targets other repos
+                       — 'installed but protecting nothing' must never read as
+                       clean, it is more dangerous than a known gap.
+  --install-schedule  the single copy-pasteable operator command: copy the
+                       staged units (--units-dir, default
+                       ~/.claude/sable/reconcile-timer) into the systemd --user
+                       directory, daemon-reload, enable --now, THEN run
+                       --check-schedule and propagate its verdict. Never reports
+                       success on an unverified install.
+
 Usage:
-  sable-reconcile-timer [--repo PATH] [--config PATH] [--remote NAME]
+  sable-reconcile-timer [--repo PATH]... [--config PATH] [--remote NAME]
                          [--age-min N] [--interval-min N] [--once] [--dry-run]
+  sable-reconcile-timer --check-schedule [--repo PATH]...
+  sable-reconcile-timer --install-schedule [--units-dir PATH]
   sable-reconcile-timer --help
 
 Env:
@@ -42,14 +64,21 @@ Env:
                                   when the matching --remote / --age-min flag is unset
 
 Exit codes:
-  0  --once: one sweep ran to completion; loop mode: interrupted cleanly (SIGINT/SIGTERM)
-  2  usage error (no repo resolvable, or bad args)
-  <n> --once: sable-reconcile-handoffs's own exit code, propagated
+  0  --once: every sweep ran to completion; loop mode: interrupted cleanly
+      (SIGINT/SIGTERM); --check-schedule/--install-schedule: a schedule exists
+      and covers every expected repo
+  2  usage error (no repo resolvable, or bad args), or staged units missing
+  3  --check-schedule/--install-schedule: no schedule, or it does not cover the
+      expected repos
+  <n> --once: sable-reconcile-handoffs's own exit code, propagated (first
+      non-zero across the swept repos)
 """
 from __future__ import annotations
 
 import argparse
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -60,6 +89,10 @@ _HANDOFFS_BIN = Path(__file__).resolve().parent / "sable-reconcile-handoffs"
 
 DEFAULT_INTERVAL_MIN = 15.0
 
+TIMER_UNIT = "sable-reconcile-timer.timer"
+SERVICE_UNIT = "sable-reconcile-timer.service"
+DEFAULT_UNITS_DIR = Path.home() / ".claude" / "sable" / "reconcile-timer"
+
 
 def default_config_path() -> Path:
     """~/.config/sable/reconcile-timer.conf, honoring $XDG_CONFIG_HOME."""
@@ -67,36 +100,58 @@ def default_config_path() -> Path:
     return Path(base) / "sable" / "reconcile-timer.conf"
 
 
-def repo_from_config(config_path: Path) -> str | None:
-    """First non-blank, non-'#' line of the config file is the repo path —
-    either a bare path or a `repo=<path>` line (mirrors sable-merge-gate's
-    .sable `key=value` convention). None when the file is absent or every
-    line is blank/commented."""
+def repos_from_config(config_path: Path) -> list[str]:
+    """EVERY non-blank, non-'#' line of the config file is a repo path — each
+    a bare path or a `repo=<path>` line (mirrors sable-merge-gate's .sable
+    `key=value` convention). Empty list when the file is absent or every line
+    is blank/commented.
+
+    Multi-line because this host runs more than one fleet (SABLE-5xz68): a
+    config that could only name one repo made every other fleet's stranded
+    pushes invisible to the floor."""
     if not config_path.is_file():
-        return None
+        return []
+    out: list[str] = []
     for line in config_path.read_text().splitlines():
         s = line.strip()
         if not s or s.startswith("#"):
             continue
         if s.startswith("repo="):
             s = s[len("repo="):].strip()
-        return s or None
-    return None
+        if s:
+            out.append(s)
+    return out
+
+
+def repo_from_config(config_path: Path) -> str | None:
+    """The first configured repo, or None. Single-repo accessor over
+    repos_from_config()."""
+    repos = repos_from_config(config_path)
+    return repos[0] if repos else None
+
+
+def resolve_repos(cli_repos: list[str] | None, config_path: Path,
+                   env: dict[str, str] | None = None) -> list[str]:
+    """Repo resolution — CLI > env > config file; the FIRST SOURCE that names
+    anything wins entirely, and it may name several repos. NEVER falls back to
+    the caller's PWD or any pane/tmux context (SABLE-jfg6.5): a systemd/cron
+    invocation has no meaningful cwd and no pane, so guessing there would
+    silently reconcile the wrong repo (or none)."""
+    if cli_repos:
+        return [r for r in cli_repos if r]
+    env = os.environ if env is None else env
+    env_repo = env.get("SABLE_RECONCILE_REPO")
+    if env_repo:
+        return [r for r in env_repo.split(os.pathsep) if r]
+    return repos_from_config(config_path)
 
 
 def resolve_repo(cli_repo: str | None, config_path: Path,
                   env: dict[str, str] | None = None) -> str | None:
-    """Repo resolution — CLI > env > config file. NEVER falls back to the
-    caller's PWD or any pane/tmux context (SABLE-jfg6.5): a systemd/cron
-    invocation has no meaningful cwd and no pane, so guessing there would
-    silently reconcile the wrong repo (or none)."""
-    if cli_repo:
-        return cli_repo
-    env = os.environ if env is None else env
-    env_repo = env.get("SABLE_RECONCILE_REPO")
-    if env_repo:
-        return env_repo
-    return repo_from_config(config_path)
+    """The first resolved repo, or None. Single-repo accessor over
+    resolve_repos()."""
+    repos = resolve_repos([cli_repo] if cli_repo else None, config_path, env)
+    return repos[0] if repos else None
 
 
 def build_handoffs_argv(repo: str, *, remote: str, age_min: float | None,
@@ -114,10 +169,178 @@ def run_once(repo: str, *, remote: str, age_min: float | None, dry_run: bool) ->
                                               dry_run=dry_run)).returncode
 
 
+def sweep_all(repos: list[str], *, remote: str, age_min: float | None,
+               dry_run: bool) -> int:
+    """Sweep every repo; a failure on one does NOT skip the rest (an unswept
+    fleet is an unprotected fleet). Returns the first non-zero rc, else 0."""
+    worst = 0
+    for repo in repos:
+        rc = run_once(repo, remote=remote, age_min=age_min, dry_run=dry_run)
+        if rc != 0 and worst == 0:
+            worst = rc
+    return worst
+
+
+# ===========================================================================
+# Schedule verification (SABLE-5xz68) — generating a unit file is not
+# installing it, and installing it for the WRONG repo is worse than not
+# installing it at all, because it looks protected. Both states must be
+# reported by asking the running system, never by reading a staged file.
+# ===========================================================================
+
+_REPO_FLAG_RE = re.compile(r"--repo[=\s]+(\S+)")
+
+
+def _norm(path: str) -> str:
+    return os.path.normpath(os.path.expanduser(path.strip().strip('"').strip("'")))
+
+
+def parse_scheduled_repos(text: str) -> list[str]:
+    """Every --repo value on a line that actually invokes this entrypoint.
+    Commented lines don't schedule anything, so they don't count."""
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if "sable-reconcile-timer" not in s:
+            continue
+        for m in _REPO_FLAG_RE.finditer(s):
+            out.append(m.group(1))
+    return out
+
+
+def active_cron_lines(crontab_text: str) -> list[str]:
+    return [ln.strip() for ln in crontab_text.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+            and "sable-reconcile-timer" in ln]
+
+
+def schedule_problems(*, systemd_active: bool, unit_text: str,
+                       crontab_text: str, expected_repos: list[str]) -> list[str]:
+    """Problems with the LIVE schedule, empty list when it is genuinely sound.
+
+    `systemd_active` is whether the .timer unit is actually active — a unit
+    file sitting in ~/.config/systemd/user that was never enabled schedules
+    nothing, which is exactly the 'looks installed' trap this check exists
+    to break."""
+    cron_lines = active_cron_lines(crontab_text)
+    if not systemd_active and not cron_lines:
+        return ["NO SCHEDULE: no active systemd --user timer and no crontab entry "
+                "invokes sable-reconcile-timer — the reconciliation floor has NO "
+                "pane-independent leg on this host (staged unit files schedule nothing)"]
+
+    covered = []
+    if systemd_active:
+        covered += parse_scheduled_repos(unit_text)
+    covered += parse_scheduled_repos("\n".join(cron_lines))
+    covered_norm = {_norm(r) for r in covered}
+
+    problems = []
+    for repo in expected_repos:
+        if _norm(repo) not in covered_norm:
+            problems.append(
+                f"SCHEDULED BUT NOT COVERING {repo}: a schedule for "
+                f"sable-reconcile-timer exists but sweeps "
+                f"{sorted(covered_norm) or '<no --repo argument at all>'} — this "
+                "host looks protected while that repo's stranded pushes go "
+                "unreconciled")
+    return problems
+
+
+def _run_text(argv: list[str]) -> tuple[int, str]:
+    try:
+        cp = subprocess.run(argv, text=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, timeout=60)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 127, ""
+    return cp.returncode, cp.stdout or ""
+
+
+def read_live_schedule() -> tuple[bool, str, str]:
+    """(systemd_active, service unit text, crontab text) from the RUNNING
+    system — not from anything staged on disk."""
+    systemd_active = False
+    unit_text = ""
+    if shutil.which("systemctl"):
+        rc, _ = _run_text(["systemctl", "--user", "is-active", TIMER_UNIT])
+        systemd_active = rc == 0
+        _, unit_text = _run_text(["systemctl", "--user", "cat", SERVICE_UNIT])
+    crontab_text = ""
+    if shutil.which("crontab"):
+        rc, out = _run_text(["crontab", "-l"])
+        crontab_text = out if rc == 0 else ""
+    return systemd_active, unit_text, crontab_text
+
+
+def check_schedule(expected_repos: list[str], *, stream=None) -> int:
+    """Report the live schedule; exit 0 only when one exists AND covers every
+    expected repo. Exit 3 otherwise, loudly."""
+    stream = sys.stdout if stream is None else stream
+    systemd_active, unit_text, crontab_text = read_live_schedule()
+    problems = schedule_problems(systemd_active=systemd_active, unit_text=unit_text,
+                                 crontab_text=crontab_text,
+                                 expected_repos=expected_repos)
+    cron_lines = active_cron_lines(crontab_text)
+    print("sable-reconcile-timer schedule check:", file=stream)
+    print(f"  systemd --user {TIMER_UNIT}: "
+          f"{'ACTIVE' if systemd_active else 'not active'}", file=stream)
+    print(f"  crontab entries: {len(cron_lines)}", file=stream)
+    scheduled = parse_scheduled_repos(unit_text if systemd_active else "") + \
+        parse_scheduled_repos("\n".join(cron_lines))
+    print(f"  repos actually swept: {scheduled or '(none)'}", file=stream)
+    print(f"  repos expected: {expected_repos or '(none specified)'}", file=stream)
+    if problems:
+        for p in problems:
+            print(f"SCHEDULE CHECK FAILED: {p}", file=sys.stderr)
+        return 3
+    print("  OK: a live schedule covers every expected repo.", file=stream)
+    return 0
+
+
+def install_schedule(units_dir: Path, expected_repos: list[str]) -> int:
+    """Copy the staged units into the systemd --user dir, enable the timer,
+    then VERIFY — never report success on an unverified install."""
+    service_src = units_dir / SERVICE_UNIT
+    timer_src = units_dir / TIMER_UNIT
+    missing = [str(p) for p in (service_src, timer_src) if not p.is_file()]
+    if missing:
+        print(f"sable-reconcile-timer: staged unit(s) not found: {missing}. Run "
+              "sable-orchestration-install first (it stages them).", file=sys.stderr)
+        return 2
+
+    if not expected_repos:
+        expected_repos = parse_scheduled_repos(service_src.read_text())
+
+    if not shutil.which("systemctl"):
+        print("sable-reconcile-timer: no systemctl on this host — use the cron "
+              f"fallback:\n  (crontab -l 2>/dev/null; cat {units_dir}/"
+              "sable-reconcile-timer.cron) | crontab -\nthen re-run "
+              "`sable-reconcile-timer --check-schedule` to verify.", file=sys.stderr)
+        return 3
+
+    dest_dir = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) \
+        / "systemd" / "user"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for src in (service_src, timer_src):
+        shutil.copyfile(src, dest_dir / src.name)
+        print(f"installed {dest_dir / src.name}")
+
+    for argv in (["systemctl", "--user", "daemon-reload"],
+                 ["systemctl", "--user", "enable", "--now", TIMER_UNIT]):
+        rc, out = _run_text(argv)
+        if rc != 0:
+            print(f"sable-reconcile-timer: `{' '.join(argv)}` failed (rc={rc}):\n{out}",
+                  file=sys.stderr)
+
+    return check_schedule(expected_repos)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="sable-reconcile-timer")
-    parser.add_argument("--repo", default=None,
-                        help="repo to reconcile (see repo-resolution order in the module docstring)")
+    parser.add_argument("--repo", action="append", default=None,
+                        help="repo to reconcile; REPEATABLE, one flag per fleet "
+                             "(see repo-resolution order in the module docstring)")
     parser.add_argument("--config", default=str(default_config_path()),
                         help="config file carrying the repo path when --repo/$SABLE_RECONCILE_REPO are unset")
     parser.add_argument("--remote", default=os.environ.get("SABLE_RC_REMOTE", "origin"))
@@ -134,10 +357,27 @@ def main(argv: list[str] | None = None) -> int:
                              "or a cron line — the scheduler owns the cadence)")
     parser.add_argument("--dry-run", action="store_true",
                         help="forwarded to sable-reconcile-handoffs --dry-run")
+    parser.add_argument("--check-schedule", action="store_true",
+                        help="verify the RUNNING system actually schedules this "
+                             "entrypoint for the resolved repos; exit 3 when it "
+                             "does not (SABLE-5xz68)")
+    parser.add_argument("--install-schedule", action="store_true",
+                        help="install the staged systemd units, enable the timer, "
+                             "then verify — the single operator activation command")
+    parser.add_argument("--units-dir", default=str(DEFAULT_UNITS_DIR),
+                        help="where sable-orchestration-install staged the unit files")
     args = parser.parse_args(argv)
 
-    repo = resolve_repo(args.repo, Path(args.config))
-    if not repo:
+    repos = resolve_repos(args.repo, Path(args.config))
+
+    # Schedule legs resolve repos best-effort: with none given, --check-schedule
+    # still answers the primary question ('is ANYTHING scheduled at all?').
+    if args.install_schedule:
+        return install_schedule(Path(args.units_dir), repos)
+    if args.check_schedule:
+        return check_schedule(repos)
+
+    if not repos:
         parser.error(
             "no repo resolvable — pass --repo, set $SABLE_RECONCILE_REPO, or write "
             f"'repo=<path>' to {args.config} (this entrypoint never guesses from "
@@ -145,11 +385,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.once:
-        return run_once(repo, remote=args.remote, age_min=args.age_min, dry_run=args.dry_run)
+        return sweep_all(repos, remote=args.remote, age_min=args.age_min,
+                         dry_run=args.dry_run)
 
     interval_s = max(args.interval_min, 0.0) * 60.0
-    print(f"sable-reconcile-timer: looping every {args.interval_min}min against repo "
-          f"'{repo}' (no tmux server / pane context required)")
+    print(f"sable-reconcile-timer: looping every {args.interval_min}min against repos "
+          f"{repos} (no tmux server / pane context required)")
     # SIGTERM is how systemd/init actually ask a long-lived loop to stop; without
     # this handler it kills the process mid-sweep instead of exiting cleanly.
     def _on_sigterm(signum, frame):
@@ -157,7 +398,8 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _on_sigterm)
     try:
         while True:
-            run_once(repo, remote=args.remote, age_min=args.age_min, dry_run=args.dry_run)
+            sweep_all(repos, remote=args.remote, age_min=args.age_min,
+                      dry_run=args.dry_run)
             time.sleep(interval_s)
     except KeyboardInterrupt:
         return 0
