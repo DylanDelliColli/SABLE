@@ -19,6 +19,13 @@ IRON RULE (SABLE-jd5fj.3): the taxonomy 0/20/21/22/23/24/4 is UNCHANGED by the
 split. This module is where that claim is checkable — the table below is the
 whole of it.
 
+SABLE-jd5fj.5 EXTENDS that table with 25 (green-snapshot freeze in force) and
+changes none of it. 25 is deliberately NOT an outcome of a CI conclusion — no
+entry joins classify_conclusion's mapping — because a freeze is not something a
+run concluded about this merge; it is a standing refusal to promote ANY merge
+until the integration branch is healthy again. Keeping it out of OUTCOME_EXIT is
+what stops it from ever being reachable by mis-reading a verdict.
+
 Nothing here shells out, touches git, or reads the environment, so every
 function is unit-testable with no fixtures at all.
 """
@@ -41,6 +48,7 @@ EXIT_BLOCKED = 21          # actions-down / blocked (needs --override)
 EXIT_CONFLICT = 22         # merge-preview conflict (delegate to author)
 EXIT_BASE_MOVED = 23       # tip moved during gate (non-ff promote) — retry-safe
 EXIT_CANCELLED = 24        # ci-verify run cancelled mid-flight — retry-safe
+EXIT_FROZEN = 25           # green-snapshot freeze in force — promotion denied (SABLE-jd5fj.5)
 
 # Outcome names: the MEANING of a completed Actions conclusion, independent of
 # how the verdict was obtained (waited for, or read back precomputed).

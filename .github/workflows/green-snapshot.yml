@@ -1,0 +1,144 @@
+# green-snapshot — the scheduled full-suite health check of the integration
+# branch, with RETRY-AS-CLASSIFIER (SABLE-jd5fj.5).
+#
+# ── What this is, and what ci-verify is ──────────────────────────────────────
+# ci-verify answers "is THIS ONE merge safe?" — it runs per merge-preview, and
+# a green answer promotes one branch. This workflow answers the question no
+# per-merge gate can: "is the integration branch STILL healthy after all of
+# them?" Byte-identical promotion guarantees each object was verified against
+# the base it was verified against; it guarantees nothing about the base after
+# N of them land, and cmar4's impact scoping deliberately runs LESS than
+# everything. This snapshot is the backstop for exactly what impact scoping
+# under-selects — ci-verify.yml's own comment names it as the precondition for
+# ever scoping that gate.
+#
+# ── Retry-as-classifier ─────────────────────────────────────────────────────
+# bin/sable-snapshot re-runs ONLY the failed suites, exactly once, and reads the
+# second result as a verdict about the failure's NATURE (red->red deterministic,
+# red->green flaky) rather than as a second chance to pass. The whole argument
+# lives in bin/sable_snapshot_lib.py's module docstring; it is not duplicated
+# here. Job exit codes below carry the classification: 25 = deterministic red,
+# 26 = flake(s) only, 0 = clean.
+#
+# ── Trigger: schedule + manual, deliberately NOT push ───────────────────────
+# A push-triggered snapshot would run the full tier on every promotion, on top
+# of the ci-verify run that same push already triggers (whose dedup guard exists
+# precisely to stop double full-suite runs — SABLE-r3i6). The value here is
+# CADENCE — catching what accumulates across promotions — so it is scheduled,
+# with workflow_dispatch for "run it now, I just landed something scary".
+#
+# ── HONEST LIMIT: this job OBSERVES, the merge seat FREEZES ─────────────────
+# The freeze flag and quarantine list are per-repo local state
+# (.claude/sable/state/merge-gate/, git-common-dir resolved), and filing the
+# bisect / flaky-fix beads needs a real `bd` — neither exists in the SABLE-59zu
+# clean room, which has no bd and no ~/.claude install by contract. So this job
+# runs with --dry-run: it CLASSIFIES and reports, and writes no state and files
+# no beads. The authoritative snapshot is the merge seat's own scheduled
+# `sable-snapshot run`, which writes the freeze that
+# sable_gate_promote_lib.assert_not_frozen mechanically enforces.
+#
+# That split is a real seam, not a design preference — wiring this job's verdict
+# back into the merge seat's freeze state is tracked separately. Read a red job
+# here as "the merge seat's next snapshot will freeze", not as "the fleet is
+# frozen".
+
+name: green-snapshot
+
+on:
+  schedule:
+    # 07:00 UTC daily — after the fleet's working day, so the snapshot covers a
+    # full batch of promotions rather than a half-empty morning.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'Tier from the cmar4.1 SSOT (.github/ci/test-tiers.sh)'
+        default: 'full_snapshot'
+        required: false
+
+# One snapshot at a time. Unlike ci-verify's per-ref group, a coarse group is
+# CORRECT here: two concurrent snapshots of the same branch measure the same
+# thing twice, and cancel-in-progress is false because a snapshot that got
+# cancelled mid-flight would report a false red on every suite it never reached.
+concurrency:
+  group: green-snapshot-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout the integration branch (fresh — SABLE-59zu clean-room)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install clean-room deps (tmux + pytest only — no bd/dolt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          python -m pip install --upgrade pip
+          pip install pytest pytest-testmon pytest-impact
+
+      - name: Configure git identity (SABLE-59zu — clean-room needs one)
+        run: |
+          git config --global user.email "green-snapshot@sable.local"
+          git config --global user.name  "SABLE green-snapshot"
+          git config --global init.defaultBranch master
+
+      - name: pytest — full bin/ suite
+        run: python -m pytest bin/ -q -p no:cacheprovider
+
+      - name: Green snapshot — full_snapshot tier, retry-as-classifier
+        id: snapshot
+        run: |
+          set +e
+          # --dry-run: classify and report, write no state, file no beads. See
+          # the HONEST LIMIT note at the top of this file for why.
+          # SABLE_MERGE_GATE_STATE points at a scratch dir so that even a future
+          # non-dry-run here can never write into a checkout that gets thrown
+          # away — an ephemeral freeze is worse than no freeze.
+          SABLE_MERGE_GATE_STATE="$RUNNER_TEMP/merge-gate-state" \
+          python3 bin/sable-snapshot run \
+            --tier "${{ inputs.tier || 'full_snapshot' }}" \
+            --repo . \
+            --branch "${GITHUB_REF_NAME}" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --dry-run 2>&1 | tee "$RUNNER_TEMP/snapshot.log"
+          RC=${PIPESTATUS[0]}
+          set -e
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Green snapshot — \`${GITHUB_REF_NAME}\`"
+            case "$RC" in
+              0)  echo "**GREEN.** Every suite in the tier passed on the first pass." ;;
+              25) echo "**DETERMINISTIC RED (exit 25).** Suite(s) failed, were re-run, and failed again." ;;
+              26) echo "**FLAKE(S) (exit 26).** Red then green on the re-run — not a freeze." ;;
+              3)  echo "**PRECONDITION (exit 3).** The tier SSOT could not be enumerated." ;;
+              *)  echo "**Unexpected exit $RC.**" ;;
+            esac
+            echo
+            echo '```'
+            tail -c 60000 "$RUNNER_TEMP/snapshot.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$RC"
+
+      - name: Interpret the classification for a human
+        if: always()
+        run: |
+          case "${{ steps.snapshot.outputs.rc }}" in
+            25) echo "::error::Deterministic red on ${GITHUB_REF_NAME}. The merge seat's next" \
+                     "'sable-snapshot run' will FREEZE promotion and file exactly one bisect bead." ;;
+            26) echo "::warning::Flaky suite(s) on ${GITHUB_REF_NAME}. NOT a freeze; the merge seat's" \
+                     "next snapshot will quarantine them and file exactly one flaky-fix bead each." ;;
+          esac

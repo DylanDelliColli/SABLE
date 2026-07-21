@@ -67,6 +67,7 @@ import sable_footprint_lib as footprint_lib
 import sable_gate_classify_lib as classify
 import sable_gate_git_lib as git_lib
 import sable_gate_preview_lib as preview
+import sable_snapshot_lib as snapshot_lib
 from sable_gate_classify_lib import GateError
 
 
@@ -382,6 +383,48 @@ def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, st
 
 
 # --------------------------------------------------------------------------
+# Green-snapshot freeze (SABLE-jd5fj.5) — the MECHANICAL deny path
+# --------------------------------------------------------------------------
+
+def assert_not_frozen(repo: str) -> None:
+    """Refuse to promote while the green snapshot has the fleet FROZEN.
+
+    MECHANICAL, not conventional, and that distinction is the whole bead. A
+    freeze that lives in a manager's role text, a checklist, or a notify message
+    is a freeze that holds exactly as long as everyone remembers it — and the
+    moment it matters most (a broken integration branch, work queued behind it,
+    pressure to land) is precisely when someone reasons their way past it. So
+    the refusal is a code path in the only function that writes to the
+    integration branch, and it is the FIRST thing that function does: before the
+    fetch, before the preview, before any verdict is read. There is no state a
+    promote can reach where the freeze has been checked and then unchecked.
+
+    Deliberately NO environment kill switch, unlike SABLE_MG_OPTIMISTIC. That
+    switch disables an OPTIMIZATION and its off-state is the safer one; this
+    would disable a SAFETY MECHANISM and its off-state is the dangerous one — an
+    env var is exactly the kind of bypass that leaves no name attached. The two
+    ways out are a GREEN SNAPSHOT (the machine observing that the branch is
+    healthy again) or `sable-snapshot unfreeze --reason "..."` (a human saying
+    so, on the record).
+
+    Reads fail-closed: an unreadable freeze file denies. See
+    sable_snapshot_lib.read_freeze."""
+    frozen = snapshot_lib.read_freeze(repo)
+    if not frozen:
+        return
+    suites = ", ".join(frozen.get("suites") or []) or "unrecorded"
+    bead = frozen.get("bead") or "unfiled"
+    raise GateError(
+        classify.EXIT_FROZEN,
+        f"PROMOTION FROZEN by the green snapshot (SABLE-jd5fj.5) since "
+        f"{frozen.get('since') or 'unknown'}: the integration branch is "
+        f"deterministically red. Suites: {suites}. Bisect bead: {bead}. "
+        f"Reason: {frozen.get('reason', '')}. No promotion until a green snapshot "
+        f"clears the freeze, or an operator runs `sable-snapshot unfreeze "
+        f"--reason \"...\"` on the record.")
+
+
+# --------------------------------------------------------------------------
 # promote — the only writer to the integration branch
 # --------------------------------------------------------------------------
 
@@ -493,6 +536,8 @@ def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
 
 def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             manager: str, override: str | None) -> int:
+    # FIRST, before any git work: is the fleet frozen? (SABLE-jd5fj.5)
+    assert_not_frozen(repo)
     base_ref = classify.qualify_remote_ref(remote, base)
     branch_ref = classify.qualify_remote_ref(remote, branch)
     git_lib._git(repo, "fetch", remote, base, branch)

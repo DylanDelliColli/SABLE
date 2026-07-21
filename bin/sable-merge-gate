@@ -48,6 +48,12 @@ dependency order (a DAG — nothing imports "upward"):
   sable_footprint_lib.py       Changed-path footprints and the disjointness
                                test (SABLE-jd5fj.4). Evidence only — it decides
                                nothing about a promotion.
+  sable_snapshot_lib.py        The green snapshot's classifier + freeze/
+                               quarantine state (SABLE-jd5fj.5). promote reads
+                               its freeze flag as the FIRST thing it does and
+                               refuses with exit 25 — a mechanical deny path,
+                               not a convention. Nothing here imports the gate
+                               back; see bin/sable-snapshot for the runner.
 
 ── OPTIMISTIC DISJOINT PROMOTION (SABLE-jd5fj.4) ────────────────────────────
 When the base moves between a preview and its promote, the CI-green object is
@@ -171,6 +177,9 @@ Exit codes:
   23 tip moved during gate and the move was not provably disjoint (or the impact
      tier could not answer) — rebuild preview + re-gate (retry-safe)
   24 ci-verify run cancelled mid-flight — rebuild preview + re-gate (retry-safe, SABLE-sc24)
+  25 green-snapshot FREEZE in force — the integration branch is deterministically
+     red, so NO merge promotes until a green snapshot (or a recorded
+     `sable-snapshot unfreeze`) lifts it (SABLE-jd5fj.5)
   4 integrity abort (base tip != preview SHA after promote)
 """
 from __future__ import annotations
@@ -186,6 +195,7 @@ import sable_gate_classify_lib as classify           # noqa: E402
 import sable_gate_git_lib as git_lib                 # noqa: E402
 import sable_gate_preview_lib as preview_lib         # noqa: E402
 import sable_gate_promote_lib as promote_lib         # noqa: E402
+import sable_snapshot_lib as snapshot_lib            # noqa: E402
 
 # Public API re-exports. These are the names OTHER tools import from this file
 # (bin/sable-reconcile-handoffs reuses the resolver, the ref-qualifier and the
@@ -217,6 +227,8 @@ cleanup_after_merge = promote_lib.cleanup_after_merge
 decide_promotion = promote_lib.decide_promotion
 run_impact_tier = promote_lib.run_impact_tier
 assess_footprints = footprint_lib.assess
+assert_not_frozen = promote_lib.assert_not_frozen
+read_freeze = snapshot_lib.read_freeze
 
 
 def main(argv: list[str] | None = None) -> int:
