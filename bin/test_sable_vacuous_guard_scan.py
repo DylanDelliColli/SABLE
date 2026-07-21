@@ -10,10 +10,15 @@ BITE-PROOF: neutering the detector's assertion-matcher (hardcode no-match)
 must turn the i8kv-flag case red — proving the flag actually depends on the
 matcher, not a fixture that would pass regardless.
 
-INTEGRATION (E2E): runs the detector over the REAL revision history —
-`git show 94d2557:hooks/test/test-orchestration-install.sh` (pre-fix, must
-flag the i8kv block) vs the same file at current HEAD (post SABLE-f00o fix,
-home_has_timer_unit shared predicate, must NOT flag).
+INTEGRATION (E2E): runs the detector over the vendored I8KV_BLOCK fixture —
+a verbatim, working-tree-only copy of
+`git show 94d2557:hooks/test/test-orchestration-install.sh` lines 92-113
+(pre-fix, must flag) — vs the same file at current HEAD (post SABLE-f00o
+fix, home_has_timer_unit shared predicate, must NOT flag). A separate drift
+check confirms the vendored fixture still matches the real 94d2557 artifact
+when that commit is reachable, and SKIPS LOUDLY (never silently, never as a
+false pass/fail) when it isn't — e.g. in a ci-verify clean-room checkout
+that hasn't fetched that history.
 
 Run with:
 
@@ -203,16 +208,50 @@ def test_bite_proof_neutered_matcher_goes_red():
 # ---------------------------------------------------------------------------
 
 def test_integration_flags_i8kv_at_94d2557():
+    # Depends ONLY on the working tree (the vendored I8KV_BLOCK fixture),
+    # not on `git show 94d2557` — that history is not fetched in the
+    # ci-verify clean-room checkout, so shelling out here was an
+    # environment-dependent assertion masquerading as a content one
+    # (chuck, ci-verify run 29872346417). Drift between the vendored
+    # fixture and the real historical artifact is covered separately by
+    # test_vendored_i8kv_fixture_matches_94d2557_when_reachable below.
+    violations = vg.scan_bash_text(I8KV_BLOCK, "test-orchestration-install.sh@94d2557(vendored)")
+    assert_true(
+        "flags the i8kv block (vendored fixture of commit 94d2557)",
+        any("sable-reconcile-timer.timer" in v.snippet for v in violations),
+        detail=f"violations={violations!r}",
+    )
+
+
+def test_vendored_i8kv_fixture_matches_94d2557_when_reachable():
+    # Drift check, not a content assertion: confirms the vendored
+    # I8KV_BLOCK fixture used above is still byte-identical to the real
+    # historical artifact, so vendoring didn't silently detach the fixture
+    # from the thing it claims to represent. This is allowed to depend on
+    # commit reachability (unlike the test above) because it SKIPS LOUDLY
+    # rather than failing when the environment can't supply the answer —
+    # it never reports a false pass/fail on an environment property.
     repo_root = vg.repo_root_of(SCRIPT_DIR)
+    reachable = subprocess.run(
+        ["git", "cat-file", "-e", "94d2557"],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    if reachable.returncode != 0:
+        print(
+            "SKIP: test_vendored_i8kv_fixture_matches_94d2557_when_reachable "
+            "— 94d2557 not fetched in this checkout; vendored I8KV_BLOCK "
+            "fixture drift vs the real historical artifact is unverified"
+        )
+        return
     proc = subprocess.run(
         ["git", "show", "94d2557:hooks/test/test-orchestration-install.sh"],
         cwd=repo_root, capture_output=True, text=True, check=True,
     )
-    violations = vg.scan_bash_text(proc.stdout, "test-orchestration-install.sh@94d2557")
-    assert_true(
-        "flags the i8kv block at commit 94d2557",
-        any("sable-reconcile-timer.timer" in v.snippet for v in violations),
-        detail=f"violations={violations!r}",
+    lines = proc.stdout.splitlines(keepends=True)
+    actual = "".join(lines[91:113])  # 1-indexed lines 92-113, inclusive
+    assert_eq(
+        "vendored I8KV_BLOCK fixture is byte-identical to git show 94d2557 lines 92-113",
+        actual, I8KV_BLOCK,
     )
 
 
@@ -251,6 +290,7 @@ TESTS = [
     test_blank_and_comment_lines_do_not_break_adjacency,
     test_bite_proof_neutered_matcher_goes_red,
     test_integration_flags_i8kv_at_94d2557,
+    test_vendored_i8kv_fixture_matches_94d2557_when_reachable,
     test_integration_does_not_flag_head_shared_helper,
     test_main_clean_on_real_repo_corpus,
 ]
