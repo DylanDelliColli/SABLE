@@ -22,11 +22,15 @@
 # ~/.claude install are excluded in .github/ci/shell-run-set.sh, each WITH its
 # tracking bead, and widened as those land.
 #
-# ── Silent-green guard (SABLE-7v3z) ──────────────────────────────────────────
+# ── Silent-green guard (SABLE-7v3z / SABLE-lcevs) ────────────────────────────
 # pytest runs the WHOLE bin/ directory (auto-discovery, no testpaths/--ignore),
 # so no bin/ test can exist-but-not-run. The shell run-set's --manifest step
-# prints every hooks/test/test-*.sh as RUN / EXCLUDED(reason) / UNCLASSIFIED, so
-# a newly-added suite cannot silently escape the gate.
+# prints every hooks/test/test-*.sh as RUN / EXCLUDED(reason) / UNCLASSIFIED —
+# readable, but a ::warning:: annotation alone never fails a job (SABLE-lcevs:
+# this was the fail-OPEN gap that let a branch land fully green with new
+# suites UNCLASSIFIED and never executed). The --check step right after it is
+# the enforcement: same detection, but exits non-zero on any UNCLASSIFIED
+# suite or stale run-set entry, so this step is what actually blocks the gate.
 #
 # ── Cost (SABLE-oeci gotcha 5) ───────────────────────────────────────────────
 # Single job, no matrix. (Repo is public, so Actions minutes are free; kept lean
@@ -164,6 +168,14 @@ jobs:
       - name: Shell run-set coverage manifest (SABLE-7v3z — exclusions are visible)
         if: steps.dedup.outputs.already_verified != 'true'
         run: bash .github/ci/shell-run-set.sh --manifest
+
+      - name: Shell run-set fail-closed check (SABLE-lcevs — UNCLASSIFIED/stale blocks the gate)
+        if: steps.dedup.outputs.already_verified != 'true'
+        run: bash .github/ci/shell-run-set.sh --check
+
+      - name: Shell impact manifest — lib fan-out completeness (SABLE-cmar4.2)
+        if: steps.dedup.outputs.already_verified != 'true'
+        run: bash .github/ci/impact-manifest.sh --check
 
       - name: hooks/test shell suites (known-green allowlist)
         if: steps.dedup.outputs.already_verified != 'true'
