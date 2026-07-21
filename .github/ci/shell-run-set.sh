@@ -46,11 +46,12 @@ ALLOW=(
   test-no-cockpit-naming.sh
   test-no-hook-autopush.sh
   test-orchestration-install.sh
+  test-overlap-constraint.sh
+  test-overlap-dispatch-e2e.sh
   test-post-push-merge-notify.sh
   test-post-push-merge-notify-isolation.sh
   test-pre-dispatch-claim.sh
   test-pre-dispatch-model-check.sh
-  test-pre-dispatch-overlap.sh
   test-pre-dispatch-preempt.sh
   test-pre-dispatch-refresh.sh
   test-pre-push-rebase-concurrency.sh
