@@ -547,3 +547,82 @@ def test_reconcile_fetch_success_no_warning(monkeypatch, capsys):
     rc = smrh.reconcile("/repo", "origin", 10.0, dry_run=True)
     assert rc == 0
     assert capsys.readouterr().err == "", "a healthy fetch must not warn"
+
+
+# ===========================================================================
+# SABLE-2az2x: open_for_chuck_beads() -> None makes classify_branch
+# assume-named (skip-filing) for every unmerged branch it sees, cadence after
+# cadence, under a PERSISTENT corpus-query failure -- "skip this cadence"
+# silently becomes "skip forever". Before this fix the SUMMARY line read
+# identically to a genuinely healthy sweep ("0 stranded branch(es), 0
+# for-chuck bead(s) filed") in both cases, so a floor that has silently
+# stopped filing was indistinguishable from a fleet with nothing stranded.
+# Both directions: the broken-corpus summary must say so, and the
+# healthy-corpus summary must gain NO new noise.
+# ===========================================================================
+
+def _spy_reconcile_corpus(monkeypatch, *, open_beads, bd_stdout="",
+                          stranded_branch="wk-x"):
+    """Like _spy_reconcile, but drives open_for_chuck_beads directly (None to
+    simulate an unreadable corpus, [] for a healthy-empty one) so the summary
+    text can be inspected under both."""
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: [stranded_branch])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: open_beads)
+    monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)
+    monkeypatch.setattr(smrh, "find_work_bead_status", lambda repo, branch: "closed")
+    monkeypatch.setattr(smrh, "branch_tip_age_seconds", lambda *a, **k: 9999.0)
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+    monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 0, bd_stdout))
+    return smrh.reconcile("/repo", "origin", 10.0, dry_run=False)
+
+
+def _last_summary_line(out: str) -> str:
+    lines = [l for l in out.splitlines()
+             if l.startswith("sable-reconcile-handoffs:")
+             or l.startswith("sable-reconcile-handoffs [DRY-RUN]:")]
+    assert lines, f"no summary line found in: {out!r}"
+    return lines[-1]
+
+
+def test_2az2x_summary_flags_corpus_unreadable(monkeypatch, capsys):
+    rc = _spy_reconcile_corpus(monkeypatch, open_beads=None)
+    assert rc == 0
+    summary = _last_summary_line(capsys.readouterr().out)
+    assert "0 stranded branch(es), 0 for-chuck bead(s) filed" in summary, summary
+    assert "CORPUS UNREADABLE" in summary, summary
+    assert "1 branch(es) unassessed" in summary, summary
+
+
+def test_2az2x_summary_unchanged_when_corpus_healthy(monkeypatch, capsys):
+    # counterpart: a genuinely empty (not failed) corpus must file the real
+    # stranded branch exactly as before, and the summary must carry none of
+    # the new corpus-unreadable noise.
+    rc = _spy_reconcile_corpus(monkeypatch, open_beads=[], bd_stdout="created bd-xyz")
+    assert rc == 0
+    summary = _last_summary_line(capsys.readouterr().out)
+    assert "CORPUS UNREADABLE" not in summary, summary
+    assert "unassessed" not in summary, summary
+    assert "1 stranded branch(es), 1 for-chuck bead(s) filed;" in summary, summary
+
+
+def test_2az2x_dry_run_summary_flags_corpus_unreadable(monkeypatch, capsys):
+    # the --dry-run summary line is a distinct f-string from the real-run one
+    # -- cover it separately so a future edit can't silently miss one branch.
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: ["wk-x"])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: None)
+    monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)
+    monkeypatch.setattr(smrh, "find_work_bead_status", lambda repo, branch: "closed")
+    monkeypatch.setattr(smrh, "branch_tip_age_seconds", lambda *a, **k: 9999.0)
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+    monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 0, ""))
+
+    rc = smrh.reconcile("/repo", "origin", 10.0, dry_run=True)
+    assert rc == 0
+    summary = _last_summary_line(capsys.readouterr().out)
+    assert "DRY-RUN" in summary
+    assert "CORPUS UNREADABLE" in summary, summary
+    assert "1 branch(es) unassessed" in summary, summary

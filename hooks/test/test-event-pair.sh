@@ -403,6 +403,29 @@ else
   fail "C5: stranded branch is also preview-kicked" "refs=[$(ci_refs)]"
 fi
 
+# (C6) SABLE-2az2x: the for-chuck corpus query reads back genuinely
+# UNREADABLE (unparseable JSON, not merely empty) for what would otherwise be
+# the C5 true-positive stranded case. classify_branch correctly assumes-named
+# (skip-filing, no duplicate risk) -- but the operator-visible SUMMARY must
+# say the corpus could not be assessed, not print the same "0 stranded, 0
+# filed" line a genuinely healthy sweep prints. A floor that has silently
+# stopped filing must never look identical to one with nothing to file.
+fresh_pair c-corpus-unreadable
+CALLLOG="$TMPROOT/c-corpus-unreadable-bdcalls.log"
+OUT="$(BD_CALL_LOG="$CALLLOG" STUB_BD_SEARCH_STATUS=closed STUB_BD_FORCHUCK_JSON="not-json" run_reconcile)"; RC=$?
+if [ "$RC" -eq 0 ] && ! grep -q "^create " "$CALLLOG" 2>/dev/null; then
+  pass "C6 SABLE-2az2x: an unreadable for-chuck corpus suppresses filing (assume-named, no duplicate manufactured)"
+else
+  fail "C6 SABLE-2az2x: unreadable corpus must suppress filing, not crash or duplicate" "rc=$RC out=$OUT"
+fi
+SUMMARY="$(printf '%s\n' "$OUT" | grep '^sable-reconcile-handoffs:')"
+if printf '%s' "$SUMMARY" | grep -q "0 stranded branch(es), 0 for-chuck bead(s) filed" \
+   && printf '%s' "$SUMMARY" | grep -q "CORPUS UNREADABLE"; then
+  pass "C6 SABLE-2az2x: the summary flags CORPUS UNREADABLE rather than reading as an ordinary clean sweep"
+else
+  fail "C6 SABLE-2az2x: summary must distinguish could-not-assess from nothing-stranded" "summary=[$SUMMARY]"
+fi
+
 echo "----------------------------------------------------------------------"
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
 [ "$FAIL" -eq 0 ]
