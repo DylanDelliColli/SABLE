@@ -24,13 +24,26 @@
 # collide on the empty-session path.
 #
 # PURE by design: callers pass the session id and agent id they already hold
-# (the hooks parse them from the PreToolUse JSON; bin/sable-test reads
-# CLAUDE_SESSION_ID from the environment). This function reads NO session
-# environment variable itself — that is what keeps it out of the hccq trap. It
-# must never quietly substitute CLAUDE_CODE_SESSION_ID for a missing
-# CLAUDE_SESSION_ID: that value is exactly the mismatch source (the gate sees an
-# empty JSON session_id, not CLAUDE_CODE_SESSION_ID), so an absent session must
-# fall through to the ppid token, not to a different env var.
+# (the hooks parse them from the PreToolUse JSON; bin/sable-test resolves its
+# own via sable_resolve_session_id below). This function itself reads NO
+# session environment variable — that is what keeps IT out of the hccq trap.
+#
+# SABLE-0w0ou correction: an earlier version of this comment claimed the gate
+# "sees an empty JSON session_id, not CLAUDE_CODE_SESSION_ID" and used that to
+# justify never substituting CLAUDE_CODE_SESSION_ID anywhere. That premise is
+# false for every hooks-fire session (every warm-pane worker, per
+# ~/.claude/settings.json wiring tdd-evidence.sh/tdd-gate.sh to PreToolUse):
+# the PreToolUse JSON's session_id IS populated there, and it is
+# byte-for-byte CLAUDE_CODE_SESSION_ID — verified empirically (the evidence
+# file the hook writes is named /tmp/tdd-evidence-<CLAUDE_CODE_SESSION_ID>),
+# the same invariant tree-claim.sh/sable-claim already rely on and test. The
+# real defect was bin/sable-test checking ONLY CLAUDE_SESSION_ID and never
+# CLAUDE_CODE_SESSION_ID, so an env-only caller gave up on a signal that was
+# actually available and correct, and fell all the way to the ppid fallback
+# while the reader read the real id — a false-deny, not the false-permissive
+# collision this comment used to warn about. sable_resolve_session_id() below
+# is the ONE place that now walks CLAUDE_SESSION_ID -> CLAUDE_CODE_SESSION_ID
+# for such callers; this function stays pure and unaware of either variable.
 
 # sable_evidence_key <session_id> <agent_id>
 # Print the absolute TDD evidence-file path for the given identity.
@@ -60,4 +73,32 @@ sable_evidence_key() {
   else
     printf '%s-%s' "$base" "$sid"
   fi
+}
+
+# sable_resolve_session_id
+# Resolve THIS process's session identity from the environment, for callers
+# that have no PreToolUse hook JSON to read (bin/sable-test is the only
+# consumer today; any future env-only writer should call this too, rather
+# than re-deriving its own fallback order — SABLE-0w0ou is exactly what
+# happens when a second derivation drifts from the first). Checks, in order:
+#   1. $CLAUDE_SESSION_ID
+#   2. $CLAUDE_CODE_SESSION_ID — SABLE-hccq: the env var Claude Code actually
+#      exports into a Bash tool call's environment, and (SABLE-0w0ou) the
+#      SAME value every PreToolUse hook's JSON session_id carries in a
+#      hooks-fire session. CLAUDE_SESSION_ID is checked first only in case
+#      some environment sets it; it is unset in practice.
+# Prints the resolved id, or nothing if both are absent — the caller then
+# passes empty straight to sable_evidence_key, which supplies the
+# deterministic ppid fallback (reserved for genuinely no-identity-available
+# sessions: no hook ever ran to supply one, and neither env var is set).
+sable_resolve_session_id() {
+  if [ -n "${CLAUDE_SESSION_ID:-}" ]; then
+    printf '%s' "$CLAUDE_SESSION_ID"
+    return 0
+  fi
+  if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+    printf '%s' "$CLAUDE_CODE_SESSION_ID"
+    return 0
+  fi
+  printf '%s' ""
 }

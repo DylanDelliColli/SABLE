@@ -96,6 +96,56 @@ for seg in segments:
         continue
     head = seg[0]
 
+    # SABLE-0w0ou: 'sable-test <cmd...>' runs <cmd...> and propagates its
+    # exit code -- the REAL command is what must be classified, exactly like
+    # npx's subcommand below. Unwrap it FIRST (before cd/git -C/env-strip/
+    # interpreter detection) so a sable-test-wrapped run is never invisible
+    # to this hook. bin/sable-test still writes its OWN evidence too (the
+    # only writer for session types that fire no PreToolUse hooks at all);
+    # this unwrap makes the common hooks-fire case self-recording as well,
+    # so the two writers agree instead of one silently doing nothing.
+    if head == 'sable-test' and len(seg) > 1:
+        seg = seg[1:]
+        head = seg[0]
+
+    # SABLE-rzsb.5 / SABLE-j10xa: the fleet's hermetic-run contract prefixes
+    # test commands with 'env -u VAR ... <cmd>' to scrub identity env vars
+    # before the suite runs. Strip env's own option grammar so the REAL
+    # interpreter is what gets classified, not the opaque 'env' token. Must
+    # run AFTER the sable-test unwrap so 'sable-test env -u A -u B bash t.sh'
+    # -- the combined shape both wrappers can appear in together -- still
+    # resolves to 'bash'. Arity varies per env option: '-u NAME' and
+    # '--unset NAME' consume the NEXT token too; '-uNAME', '--unset=NAME',
+    # 'VAR=val', and '-i' consume only themselves; '--' ends option parsing.
+    if head == 'env':
+        i = 1
+        n = len(seg)
+        while i < n:
+            t = seg[i]
+            if t == '--':
+                i += 1
+                break
+            if t in ('-i', '--ignore-environment'):
+                i += 1
+                continue
+            if t in ('-u', '--unset'):
+                i += 2
+                continue
+            if t.startswith('--unset='):
+                i += 1
+                continue
+            if t.startswith('-u') and t != '-u':
+                i += 1
+                continue
+            if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', t):
+                i += 1
+                continue
+            break
+        seg = seg[i:]
+        if not seg:
+            continue
+        head = seg[0]
+
     # 'cd <path>' persists as the effective repo for later segments in this
     # same compound command (real shell semantics within one bash -c).
     if head == 'cd' and len(seg) > 1:
