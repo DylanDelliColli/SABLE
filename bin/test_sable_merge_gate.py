@@ -442,6 +442,54 @@ def test_cleanup_patch_equivalent_branch_deleted(monkeypatch):
     assert _destructive(calls) == ["worktree-remove", "branch-d", "branch-D", "push-delete"]
 
 
+# --- SABLE-x9vby: identifier-decay sweep at the branch-name retirement seam ----
+# Deleting the remote branch RETIRES the branch name, so any open instruction
+# keyed to that name (a hold reading "do not merge wk-foo") goes stale silently
+# at exactly that moment. The sweep is advisory: it reports and never gates.
+
+def _fake_sweeper(monkeypatch, *, rc=0, out=""):
+    seen = []
+
+    def fake_run(argv, *, cwd, check=True, timeout=None):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
+
+    monkeypatch.setattr(git_lib, "_run", fake_run)
+    return seen
+
+
+def test_cleanup_sweeps_for_branch_name_decay_before_deleting_the_remote(monkeypatch, capsys):
+    calls = _cleanup_fake_git(monkeypatch)
+    seen = _fake_sweeper(monkeypatch, out="⚠ identifier-decay: SABLE-hold still names wk-x\n")
+    smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
+    assert _destructive(calls) == ["worktree-remove", "branch-d", "push-delete"], \
+        "the sweep must not change what cleanup deletes"
+    assert seen and "wk-x" in seen[0] and "--branch" in seen[0]
+    assert "SABLE-hold" in capsys.readouterr().err
+
+
+def test_cleanup_never_aborts_when_the_sweeper_is_broken(monkeypatch, capsys):
+    """Fail-open on the DECISION, loud on the REPORT: an unrunnable sweep must
+    leave the cleanup untouched and must NOT look like a clean sweep."""
+    calls = _cleanup_fake_git(monkeypatch)
+
+    def boom(argv, *, cwd, check=True, timeout=None):
+        raise FileNotFoundError(argv[0])
+
+    monkeypatch.setattr(git_lib, "_run", boom)
+    smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
+    assert _destructive(calls) == ["worktree-remove", "branch-d", "push-delete"]
+    assert "COULD NOT ASSESS" in capsys.readouterr().err
+
+
+def test_cleanup_sweep_is_silent_when_nothing_references_the_branch(monkeypatch, capsys):
+    """Positive control: the seam can stay quiet, so its noise is real signal."""
+    _cleanup_fake_git(monkeypatch)
+    _fake_sweeper(monkeypatch, out="")
+    smg.cleanup_after_merge("/repo", "origin", "refs/remotes/origin/trunk", "wk-x")
+    assert capsys.readouterr().err == ""
+
+
 def test_cleanup_missing_worktree_is_noop(monkeypatch):
     # no registered worktree -> skip (a) entirely, still delete both branches.
     calls = _cleanup_fake_git(monkeypatch, has_worktree=False)
