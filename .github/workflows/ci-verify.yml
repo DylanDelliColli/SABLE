@@ -44,6 +44,25 @@
 # FAIL OPEN — any query error runs the suite, never skips on uncertainty — so
 # it can never mask a real regression. Do NOT remove either branch trigger
 # above (SABLE-ad21 / gah9-bypass safety net still requires both).
+#
+# ── pytest-testmon cache wiring (SABLE-cmar4.3) ───────────────────────────────
+# .testmondata (pytest-testmon's line-coverage map) persists ACROSS runs as a
+# GitHub Actions cache artifact, keyed on ref+SHA with branch-prefix
+# restore-keys below, so an exact-SHA lookup always "misses" (every push is a
+# new SHA) but falls through to the most recent cache saved for this ref, then
+# to any ref, via prefix matching — actions/cache then saves the post-run
+# .testmondata under the new exact-SHA key. testmon's own file-hash diffing
+# tolerates a "stale" cache restored from a different branch/commit; it just
+# means more files read as dirty (conservative), never fewer. This job's own
+# pytest step below stays UNCONDITIONALLY full-suite (SABLE-7v3z) — it uses
+# --testmon-noselect (record/update the map, deselect nothing) purely to keep
+# the cache warm for the actual impact-tier SELECTOR (bin/tier_selection.py,
+# .github/ci/pytest-impact-tier.sh), which is not wired into this gate: an
+# impact-scoped run here is only safe once the full-snapshot backstop
+# (SABLE-jd5fj.5) exists to catch what it under-selects. On a cache miss (no
+# .testmondata restored at all) --testmon-noselect is a no-op beyond writing a
+# fresh map from this full run — still the same conservative full run either
+# way.
 
 name: ci-verify
 
@@ -103,7 +122,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y tmux
           python -m pip install --upgrade pip
-          pip install pytest
+          # pytest-testmon / pytest-impact (SABLE-cmar4.3): both register as
+          # pytest11 plugins automatically and are strictly opt-in (no-op
+          # unless --testmon/--testmon-noselect or --impact is passed), so
+          # installing them here changes nothing about this job's own
+          # unconditional full-suite run.
+          pip install pytest pytest-testmon pytest-impact
+
+      - name: Restore pytest-testmon coverage cache (SABLE-cmar4.3)
+        if: steps.dedup.outputs.already_verified != 'true'
+        uses: actions/cache@v4
+        with:
+          path: .testmondata
+          key: testmon-v1-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            testmon-v1-${{ github.ref }}-
+            testmon-v1-
 
       - name: Configure git identity (SABLE-59zu — clean-room needs one)
         if: steps.dedup.outputs.already_verified != 'true'
@@ -149,7 +183,11 @@ jobs:
           #     (SABLE-7dva): the pty-attached tmux client now registers
           #     headlessly (TERM set, own session, drained master fd) instead of
           #     never attaching on the CI clean-room.
-          python -m pytest bin/ -q -p no:cacheprovider
+          # --testmon-noselect (SABLE-cmar4.3): records/updates .testmondata
+          # from this full run without deselecting anything — keeps the
+          # impact-tier's coverage map warm; see the cache-wiring comment
+          # above for why selection itself isn't enabled on this gate.
+          python -m pytest bin/ -q -p no:cacheprovider --testmon-noselect
 
       - name: Fixture isolation tripwire (SABLE-0ssz.2 — ban unsandboxed real-repo git ops)
         if: steps.dedup.outputs.already_verified != 'true'

@@ -22,6 +22,12 @@ __pycache__/
 *.db
 .beads-credential-key
 
+# pytest-testmon coverage map (SABLE-cmar4.3) — CI-cached artifact, local
+# scratch; -shm/-wal are SQLite WAL-mode sidecar files testmon leaves behind
+.testmondata
+.testmondata-shm
+.testmondata-wal
+
 # Cockpit install artifacts (project-scoped sable-orchestration-install output —
 # installed copies of repo sources under skills/, templates/, hooks/; not source)
 .claude/settings.local.json
