@@ -281,7 +281,15 @@ def _revert_pin_to_symlink(bin_dir: Path, target_name: str):
 
 def test_guarded_pinned_bin_sessionstart_hook_output_has_no_install_sh_instruction(installed_claude_dir):
     bin_dir = installed_claude_dir.parent / ".local" / "bin"
-    target_name = "sable-merge-gate"
+    # A PLAIN-pinnable bin (`sable-bin-install --classify` says "plain"). These
+    # three cases test the plain per-file pin contract specifically, so the
+    # target must be a tool that contract still applies to: sable-merge-gate
+    # became a python-IMPORTING tool with the SABLE-jd5fj.3 module split and is
+    # now classified "snapshot" — a plain copy of it severs its sibling imports,
+    # which sable-doctor correctly reports as broken. That detection is the
+    # SABLE-9boz4 design working, not a regression, so the fixture moves to a
+    # tool it fits rather than the assertions moving.
+    target_name = "sable-dolt-push"
     _establish_real_pin(bin_dir, target_name)
     _revert_pin_to_symlink(bin_dir, target_name)
 
@@ -302,7 +310,15 @@ def test_guarded_pinned_bin_sessionstart_hook_output_has_no_install_sh_instructi
 
 def test_guarded_pinned_bin_full_report_names_the_safe_cp_path_not_install_sh(installed_claude_dir):
     bin_dir = installed_claude_dir.parent / ".local" / "bin"
-    target_name = "sable-merge-gate"
+    # A PLAIN-pinnable bin (`sable-bin-install --classify` says "plain"). These
+    # three cases test the plain per-file pin contract specifically, so the
+    # target must be a tool that contract still applies to: sable-merge-gate
+    # became a python-IMPORTING tool with the SABLE-jd5fj.3 module split and is
+    # now classified "snapshot" — a plain copy of it severs its sibling imports,
+    # which sable-doctor correctly reports as broken. That detection is the
+    # SABLE-9boz4 design working, not a regression, so the fixture moves to a
+    # tool it fits rather than the assertions moving.
+    target_name = "sable-dolt-push"
     _establish_real_pin(bin_dir, target_name)
     _revert_pin_to_symlink(bin_dir, target_name)
 
@@ -336,7 +352,15 @@ def test_pinned_bin_survives_real_reinstall_after_the_fix(installed_claude_dir):
     # install.sh must leave the pin clean, not flagged.
     home = installed_claude_dir.parent
     bin_dir = home / ".local" / "bin"
-    target_name = "sable-merge-gate"
+    # A PLAIN-pinnable bin (`sable-bin-install --classify` says "plain"). These
+    # three cases test the plain per-file pin contract specifically, so the
+    # target must be a tool that contract still applies to: sable-merge-gate
+    # became a python-IMPORTING tool with the SABLE-jd5fj.3 module split and is
+    # now classified "snapshot" — a plain copy of it severs its sibling imports,
+    # which sable-doctor correctly reports as broken. That detection is the
+    # SABLE-9boz4 design working, not a regression, so the fixture moves to a
+    # tool it fits rather than the assertions moving.
+    target_name = "sable-dolt-push"
     _establish_real_pin(bin_dir, target_name)
 
     run_install(home)

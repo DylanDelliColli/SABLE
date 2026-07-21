@@ -22,6 +22,24 @@ _SPEC = importlib.util.spec_from_loader("sable_merge_gate", _LOADER)
 smg = importlib.util.module_from_spec(_SPEC)
 _LOADER.exec_module(smg)
 
+# SABLE-jd5fj.3 split: the gate now lives in three modules beside the CLI, and
+# each seam is patched on the module that DEFINES it (every caller invokes them
+# module-qualified, so one patch reaches the whole gate). These aliases are the
+# only plumbing change the split required here — no assertion below moved.
+classify = smg.classify
+git_lib = smg.git_lib
+preview_lib = smg.preview_lib
+promote_lib = smg.promote_lib
+
+
+def _no_stored_verdict(repo, ref, preview_sha):
+    """No verdict is stored yet, so promote falls through to wait_for_ci — the
+    pre-split path these promote cases were written against. Stubbed explicitly
+    rather than left to a failing gh call, so the case states which of the two
+    verdict sources it is exercising (SABLE-jd5fj.3)."""
+    return classify.Verdict("pending", "", preview_sha, ref,
+                            source="precomputed", complete=False)
+
 
 # --- preview_ref_name --------------------------------------------------------
 
@@ -87,7 +105,7 @@ def _fake_git_factory(monkeypatch, *, merge_tree_rc, merge_tree_out="TREEOID\n",
         if args and args[0] == "commit-tree":
             return subprocess.CompletedProcess(args, 0, stdout=commit_out, stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-    monkeypatch.setattr(smg, "_git", fake_git)
+    monkeypatch.setattr(git_lib, "_git", fake_git)
 
 
 def test_build_preview_conflict_raises_22(monkeypatch):
@@ -108,7 +126,7 @@ def test_wait_for_ci_actions_down(monkeypatch):
     # gh returns an empty run list; with grace=0 the first poll reports actions_down
     def fake_run(argv, cwd=None, check=True, timeout=None):
         return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
-    monkeypatch.setattr(smg, "_run", fake_run)
+    monkeypatch.setattr(git_lib, "_run", fake_run)
     monkeypatch.setenv("SABLE_MG_GRACE", "0")
     monkeypatch.setenv("SABLE_MG_POLL", "0")
     monkeypatch.setenv("SABLE_MG_TIMEOUT", "0")
@@ -122,7 +140,7 @@ def test_wait_for_ci_survives_gh_hang(monkeypatch):
     # subprocess.TimeoutExpired and must still converge to a clean park.
     def fake_run(argv, cwd=None, check=True, timeout=None):
         raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
-    monkeypatch.setattr(smg, "_run", fake_run)
+    monkeypatch.setattr(git_lib, "_run", fake_run)
     monkeypatch.setenv("SABLE_MG_GRACE", "0")
     monkeypatch.setenv("SABLE_MG_TIMEOUT", "0")
     monkeypatch.setenv("SABLE_MG_GH_TIMEOUT", "5")
@@ -146,7 +164,7 @@ def test_wait_for_ci_mid_flight_hang_times_out_not_hangs(monkeypatch):
             return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
         raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
 
-    monkeypatch.setattr(smg, "_run", fake_run)
+    monkeypatch.setattr(git_lib, "_run", fake_run)
     monkeypatch.setenv("SABLE_MG_POLL", "0")
     monkeypatch.setenv("SABLE_MG_GRACE", "0")
     monkeypatch.setenv("SABLE_MG_TIMEOUT", "1")
@@ -163,7 +181,7 @@ def test_wait_for_ci_success(monkeypatch):
 
     def fake_run(argv, cwd=None, check=True, timeout=None):
         return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
-    monkeypatch.setattr(smg, "_run", fake_run)
+    monkeypatch.setattr(git_lib, "_run", fake_run)
     monkeypatch.setenv("SABLE_MG_POLL", "0")
     conclusion, url = smg.wait_for_ci("/repo", "ci-verify/bead-abcdef1", "PREVIEWSHA")
     assert conclusion == "success"
@@ -192,10 +210,11 @@ def test_promote_tip_moved_non_ff_is_retryable_23(monkeypatch):
             return subprocess.CompletedProcess(args, 1, stdout="! [rejected] (non-fast-forward)", stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(smg, "_git", fake_git)
-    monkeypatch.setattr(smg, "wait_for_ci", lambda *a, **k: ("success", "http://run/1"))
-    monkeypatch.setattr(smg, "_notify", lambda *a, **k: None)
-    monkeypatch.setattr(smg, "_append_evidence", lambda *a, **k: None)
+    monkeypatch.setattr(git_lib, "_git", fake_git)
+    monkeypatch.setattr(preview_lib, "read_verdict", _no_stored_verdict)
+    monkeypatch.setattr(preview_lib, "wait_for_ci", lambda *a, **k: ("success", "http://run/1"))
+    monkeypatch.setattr(promote_lib, "_notify", lambda *a, **k: None)
+    monkeypatch.setattr(promote_lib, "_append_evidence", lambda *a, **k: None)
 
     with pytest.raises(smg.GateError) as ei:
         smg.promote("BEAD", "wk-x", "trunk", "/repo", "origin", "mgr", None)
@@ -224,11 +243,12 @@ def test_cancelled_conclusion_is_retryable(monkeypatch):
             return subprocess.CompletedProcess(args, 0, stdout="SOMESHA\n", stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(smg, "_git", fake_git)
-    monkeypatch.setattr(smg, "wait_for_ci", lambda *a, **k: ("cancelled", "http://run/cancelled"))
+    monkeypatch.setattr(git_lib, "_git", fake_git)
+    monkeypatch.setattr(preview_lib, "read_verdict", _no_stored_verdict)
+    monkeypatch.setattr(preview_lib, "wait_for_ci", lambda *a, **k: ("cancelled", "http://run/cancelled"))
     notes = []
-    monkeypatch.setattr(smg, "_notify", lambda *a, **k: None)
-    monkeypatch.setattr(smg, "_append_evidence", lambda repo, bead, note: notes.append(note))
+    monkeypatch.setattr(promote_lib, "_notify", lambda *a, **k: None)
+    monkeypatch.setattr(promote_lib, "_append_evidence", lambda repo, bead, note: notes.append(note))
 
     with pytest.raises(smg.GateError) as ei:
         smg.promote("BEAD", "wk-x", "trunk", "/repo", "origin", "mgr", None)
@@ -254,7 +274,7 @@ def _sweep_fake_git(monkeypatch, listing):
             return subprocess.CompletedProcess(args, 0, stdout=listing, stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(smg, "_git", fake_git)
+    monkeypatch.setattr(git_lib, "_git", fake_git)
     return calls
 
 
@@ -265,14 +285,14 @@ def _sweep_deletes(calls):
 def test_sweep_spares_ref_with_inflight_run(monkeypatch):
     # an aged ref (committerdate 0 = 1970) whose run is still in-flight is NOT reaped
     calls = _sweep_fake_git(monkeypatch, "origin/ci-verify/bead-abcdef1 0\n")
-    monkeypatch.setattr(smg, "ref_has_inflight_run", lambda repo, ref: True)
+    monkeypatch.setattr(preview_lib, "ref_has_inflight_run", lambda repo, ref: True)
     assert smg.sweep("/repo", "origin", 6) == 0
     assert _sweep_deletes(calls) == [], "in-flight ref was wrongly reaped"
 
 
 def test_sweep_reaps_aged_ref_without_inflight_run(monkeypatch):
     calls = _sweep_fake_git(monkeypatch, "origin/ci-verify/bead-abcdef1 0\n")
-    monkeypatch.setattr(smg, "ref_has_inflight_run", lambda repo, ref: False)
+    monkeypatch.setattr(preview_lib, "ref_has_inflight_run", lambda repo, ref: False)
     assert smg.sweep("/repo", "origin", 6) == 0
     assert _sweep_deletes(calls) == [("push", "origin", "--delete", "ci-verify/bead-abcdef1")]
 
@@ -283,7 +303,7 @@ def test_sweep_keeps_fresh_ref_regardless_of_run(monkeypatch):
     fresh_ts = str(int(_time.time()))
     calls = _sweep_fake_git(monkeypatch, f"origin/ci-verify/bead-abcdef1 {fresh_ts}\n")
     probed = []
-    monkeypatch.setattr(smg, "ref_has_inflight_run", lambda repo, ref: probed.append(ref) or False)
+    monkeypatch.setattr(preview_lib, "ref_has_inflight_run", lambda repo, ref: probed.append(ref) or False)
     assert smg.sweep("/repo", "origin", 6) == 0
     assert _sweep_deletes(calls) == [], "fresh ref wrongly reaped"
     assert probed == [], "fresh ref should not incur a gh run-status probe"
@@ -292,7 +312,7 @@ def test_sweep_keeps_fresh_ref_regardless_of_run(monkeypatch):
 # --- SABLE-sc24: ref_has_inflight_run — the sweep's live-run probe -------------
 
 def _ref_status_run(monkeypatch, *, rc, stdout):
-    monkeypatch.setattr(smg, "_run",
+    monkeypatch.setattr(git_lib, "_run",
                         lambda argv, cwd=None, check=True, timeout=None: subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr=""))
 
 
@@ -324,7 +344,7 @@ def test_ref_has_inflight_run_fail_open_on_gh_hang(monkeypatch):
     # not propagate subprocess.TimeoutExpired and wedge the sweep.
     def fake_run(argv, cwd=None, check=True, timeout=None):
         raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
-    monkeypatch.setattr(smg, "_run", fake_run)
+    monkeypatch.setattr(git_lib, "_run", fake_run)
     assert smg.ref_has_inflight_run("/repo", "ci-verify/bead-abcdef1") is False
 
 
@@ -369,7 +389,7 @@ def _cleanup_fake_git(monkeypatch, *, has_worktree=True, dirty=False, branch_exi
             return subprocess.CompletedProcess(args, push_delete_rc, stdout="", stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(smg, "_git", fake_git)
+    monkeypatch.setattr(git_lib, "_git", fake_git)
     return calls
 
 
@@ -443,7 +463,7 @@ def _fake_git_config(monkeypatch, *, config_val=None, config_rc=1):
             rc = 0 if config_val is not None else config_rc
             return subprocess.CompletedProcess(args, rc, stdout=(config_val or "") + ("\n" if config_val else ""), stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-    monkeypatch.setattr(smg, "_git", fake_git)
+    monkeypatch.setattr(git_lib, "_git", fake_git)
 
 
 def test_resolve_integration_branch_git_config_wins(monkeypatch, tmp_path):
@@ -480,18 +500,18 @@ def test_resolve_integration_branch_defaults_to_main(monkeypatch, tmp_path):
 
 def test_resolve_base_explicit_flag_wins_over_everything(monkeypatch, tmp_path):
     monkeypatch.setenv("SABLE_MG_BASE", "env-base")
-    monkeypatch.setattr(smg, "resolve_integration_branch", lambda repo: "resolved-base")
+    monkeypatch.setattr(git_lib, "resolve_integration_branch", lambda repo: "resolved-base")
     assert smg.resolve_base("flag-base", str(tmp_path)) == "flag-base"
 
 
 def test_resolve_base_env_wins_when_flag_unset(monkeypatch, tmp_path):
     monkeypatch.setenv("SABLE_MG_BASE", "env-base")
-    monkeypatch.setattr(smg, "resolve_integration_branch", lambda repo: "resolved-base")
+    monkeypatch.setattr(git_lib, "resolve_integration_branch", lambda repo: "resolved-base")
     assert smg.resolve_base(None, str(tmp_path)) == "env-base"
 
 
 def test_resolve_base_falls_back_to_resolved_integration_branch(monkeypatch, tmp_path):
     monkeypatch.delenv("SABLE_MG_BASE", raising=False)
-    monkeypatch.setattr(smg, "resolve_integration_branch", lambda repo: "resolved-base")
+    monkeypatch.setattr(git_lib, "resolve_integration_branch", lambda repo: "resolved-base")
     assert smg.resolve_base(None, str(tmp_path)) == "resolved-base"
 
