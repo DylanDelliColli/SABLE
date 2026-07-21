@@ -26,8 +26,13 @@ fail(){ FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n 
 # the leak is invisible there. Unset them up front so the suite is hermetic
 # regardless of launch context. Also clear the live-state surfaces so the base
 # cases never pick up a stray real mode-state.
-unset SABLE_WORKER_PANE CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE \
-      SABLE_MODE_STATE SABLE_ACTIVE_CONTRACTS 2>/dev/null || true
+#
+# Central scrub lives in lib-identity-isolation.sh (SABLE-j3bi) so every
+# suite shares one definition of "identity vars" instead of drifting copies
+# of an unset list.
+source "$REPO/hooks/test/lib-identity-isolation.sh"
+sable_scrub_identity_env
+unset SABLE_MODE_STATE SABLE_ACTIVE_CONTRACTS 2>/dev/null || true
 
 SS='{"hook_event_name":"SessionStart"}'
 

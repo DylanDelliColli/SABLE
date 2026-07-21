@@ -27,8 +27,11 @@ CONTRACT="$REPO/bin/sable-contract"
 
 # Hermeticity (SABLE-j3bi): strip any ambient SABLE pane env so this suite is
 # deterministic whether or not it runs inside a live manager/worker pane.
-unset SABLE_WORKER_PANE CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE \
-      SABLE_MODE_STATE SABLE_ACTIVE_CONTRACTS 2>/dev/null || true
+# Central scrub lives in lib-identity-isolation.sh so every suite shares one
+# definition of "identity vars" instead of drifting copies of an unset list.
+source "$REPO/hooks/test/lib-identity-isolation.sh"
+sable_scrub_identity_env
+unset SABLE_MODE_STATE SABLE_ACTIVE_CONTRACTS 2>/dev/null || true
 
 PASS=0; FAIL=0; FAIL_NAMES=""
 pass(){ PASS=$((PASS+1)); echo "PASS: $1"; }
