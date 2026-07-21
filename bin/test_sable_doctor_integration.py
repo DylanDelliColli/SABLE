@@ -513,3 +513,106 @@ def test_quiet_mode_sessionstart_hook_stays_silent_on_a_fresh_provenance_stamped
     assert result.returncode == 0
     assert result.stdout == ""
     assert result.stderr == ""
+
+
+# --- SABLE-rucuh: the shape-aware remedy is genuinely executable, real fs --
+#
+# The bug was never that doctor's message was worded wrong -- it's that the
+# message was EXECUTABLE and destructive. sable-merge-gate became
+# snapshot-shaped (repo-local python imports) after SABLE-jd5fj.3's module
+# split; doctor's old "pinned bins" check had no concept of that and called
+# a correctly snapshot-pinned instance "unpinned", then printed a bare `cp`
+# that severs the sibling import it now needs. These reproduce that exact
+# shape (a real module-importing entry point named sable-merge-gate) in a
+# fully sandboxed scratch tree -- never the real ~/.local/bin or
+# ~/.local/lib -- capture doctor's REAL printed remedy for a broken pin of
+# it, RUN that remedy verbatim, and assert the resulting binary still
+# executes. The companion test proves the contrast: the OLD naive cp this
+# bead is about still breaks the same bin the same way, so the fix changes
+# the OUTCOME, not merely the text.
+
+def _make_module_importing_gate_repo(repo: Path, target_name: str):
+    """repo/bin/<target_name> imports a sibling module -- modeling
+    sable-merge-gate after SABLE-jd5fj.3's module split -- plus a real,
+    executable copy of sable-bin-install so --classify / --pin-snapshot work
+    for real against this fixture."""
+    bin_dir = repo / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "sable_gate_classify_lib.py").write_text("def classify():\n    return 'ok'\n")
+    (bin_dir / target_name).write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "import sable_gate_classify_lib as classify\n"
+        "if '--help' in sys.argv:\n"
+        "    print('usage: sable-merge-gate [--help]')\n"
+        "    sys.exit(0)\n"
+        "print(classify.classify())\n"
+    )
+    (bin_dir / target_name).chmod(0o755)
+    shutil.copy(REPO / "bin" / "sable-bin-install", bin_dir / "sable-bin-install")
+    (bin_dir / "sable-bin-install").chmod(0o755)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+
+def test_snapshot_pin_repair_remedy_produces_a_binary_that_actually_runs(tmp_path):
+    target_name = "sable-merge-gate"
+    repo = tmp_path / "repo"
+    _make_module_importing_gate_repo(repo, target_name)
+
+    home_scratch = tmp_path / "sandbox-home"
+    bin_dir = home_scratch / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+
+    # Simulate a BROKEN pin: a bare regular-file copy of just the entry
+    # point -- the exact "broken-copy-pin" state a naive plain cp produces.
+    (bin_dir / target_name).write_bytes((repo / "bin" / target_name).read_bytes())
+    (bin_dir / target_name).chmod(0o755)
+
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(repo), "--claude-dir", str(tmp_path / "claude"),
+         "--bin-dir", str(bin_dir)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 1
+    assert "BROKEN-COPY-PIN" in result.stdout
+    remedy_cmd = next(
+        line.strip() for line in result.stdout.splitlines()
+        if "--pin-snapshot" in line and target_name in line
+    )
+    assert "cp " not in remedy_cmd  # never the destructive plain copy
+
+    # Execute doctor's ACTUAL printed remedy, verbatim, fully sandboxed via
+    # HOME (sable-bin-install's default DEST/LIB_DIR both derive from $HOME)
+    # and PATH (so the bare `sable-bin-install` named in the remedy resolves
+    # to THIS fixture's copy) -- never the real machine's ~/.local/bin or
+    # ~/.local/lib, per the dispatch note's explicit warning never to run the
+    # remedy under test against the live install tree.
+    env = {**os.environ, "HOME": str(home_scratch), "PATH": f"{repo / 'bin'}:{os.environ.get('PATH', '')}"}
+    repair = subprocess.run(["bash", "-c", remedy_cmd], env=env, capture_output=True, text=True)
+    assert repair.returncode == 0, repair.stdout + repair.stderr
+
+    repaired = subprocess.run([str(bin_dir / target_name), "--help"], capture_output=True, text=True)
+    assert repaired.returncode == 0, repaired.stdout + repaired.stderr
+    assert "ModuleNotFoundError" not in repaired.stderr
+
+
+def test_the_old_naive_cp_remedy_would_have_broken_the_same_bin(tmp_path):
+    # Contrast case, in a SEPARATE scratch dir: proves the destructive remedy
+    # this bead exists to prevent is real, not hypothetical -- the fix
+    # changes the OUTCOME, not just the wording.
+    target_name = "sable-merge-gate"
+    repo = tmp_path / "repo"
+    _make_module_importing_gate_repo(repo, target_name)
+
+    scratch = tmp_path / "old-remedy-scratch"
+    scratch.mkdir()
+    old_remedy = f"cp {repo / 'bin' / target_name} {scratch / target_name} && chmod +x {scratch / target_name}"
+    subprocess.run(["bash", "-c", old_remedy], check=True)
+
+    broken = subprocess.run([str(scratch / target_name), "--help"], capture_output=True, text=True)
+    assert broken.returncode != 0
+    assert "ModuleNotFoundError" in broken.stderr
