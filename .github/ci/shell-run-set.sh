@@ -165,7 +165,7 @@ declare -A COVERS=(
   [test-tdd-evidence.sh]="hooks/tdd-evidence.sh"
   [test-tdd-gate.sh]="hooks/tdd-gate.sh"
   [test-tier-ssot-consumers.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
-  [test-tree-claim.sh]="hooks/multi-manager/tree-claim.sh"
+  [test-tree-claim.sh]="hooks/multi-manager/tree-claim.sh hooks/multi-manager/tree-claim-impl.sh"
 )
 
 # LIB_FANOUT: each shared lib path (hooks/multi-manager/lib-*.sh) -> every

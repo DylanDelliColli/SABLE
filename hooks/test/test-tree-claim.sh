@@ -1172,6 +1172,314 @@ else
 fi
 
 # ============================================================
+# SABLE-k2h0m — THE GUARD THAT CANNOT RUN
+# ============================================================
+#
+# A single-file hook CANNOT fail closed on its own syntax error: bash parses
+# the whole file before executing a line, so no in-file check ever runs. The
+# fix therefore splits the hook in two — tree-claim.sh is a small, embedded-
+# language-free ENTRYPOINT whose only job is to run tree-claim-impl.sh and
+# decide what a non-zero exit MEANS, and tree-claim-impl.sh holds all the
+# volatile logic (the six embedded python programs that made the observed
+# stray-double-quote incident possible).
+#
+# THE DECIDED DIRECTION (this bead owns the decision):
+#   A guard that cannot evaluate has NOT established that the write is safe.
+#   "We could not check" is not "this is permitted". So when the impl cannot
+#   run, a command that LOOKS like a git index write is DENIED.
+#
+#   But a naive blanket deny removes the means of repair: you cannot commit
+#   the fix to a broken tree-claim.sh if tree-claim.sh blocks all commits.
+#   Three properties keep repair possible, and all three are asserted below:
+#     1. Only git-index-write-shaped commands are denied. Everything else
+#        (editors, tests, `bash -n`, `ls`) still runs, so the fix can be
+#        written and validated.
+#     2. SABLE_TREE_CLAIM_OVERRIDE=1 is honoured in degraded mode, from the
+#        hook's env OR as an inline prefix in the command itself — the latter
+#        matters because a PreToolUse hook is a separate process and a plain
+#        `VAR=1 git commit` prefix never reaches its environment.
+#     3. The degradation is LOUD: a fixed, greppable token on stderr plus
+#        additionalContext on every decision. Silence was the worst property
+#        of the old fail-open mode — 84 assertions flipped to allow at once
+#        and the suite read green-ish.
+#
+# BLAST RADIUS (stated deliberately): tree-claim.sh gates git writes in
+# whatever repo the command targets, so a deny-on-breakage mode can refuse
+# writes in unrelated repos too. That is bounded here by (1) above and by the
+# override, and it only obtains while the hook is actually broken.
+
+echo "--- SABLE-k2h0m: degraded mode (the impl cannot run) ---"
+
+BRK_ROOT=""
+BRK_HOOKDIR=""
+BRK_HOOK=""
+BRK_REPO=""
+
+# A realistic "installed copy is corrupt" fixture: both hook files copied to a
+# temp dir (the entrypoint resolves its impl relative to its OWN directory),
+# plus a real git repo with real content to commit.
+brk_setup() {
+  BRK_ROOT="$(mktemp -d)"
+  BRK_HOOKDIR="$BRK_ROOT/hooks"
+  BRK_HOOK="$BRK_HOOKDIR/tree-claim.sh"
+  BRK_REPO="$BRK_ROOT/repo"
+  mkdir -p "$BRK_HOOKDIR"
+  cp "$HOOK" "$BRK_HOOK" 2>/dev/null
+  cp "$REPO/hooks/multi-manager/tree-claim-impl.sh" "$BRK_HOOKDIR/tree-claim-impl.sh" 2>/dev/null
+  git init "$BRK_REPO" -q
+  git -C "$BRK_REPO" commit --allow-empty -m init -q
+  echo work > "$BRK_REPO/w.txt"
+}
+
+# Every corruption below must satisfy one property: `bash tree-claim-impl.sh`
+# exits non-zero WITHOUT reaching a decision. brk_assert_broken enforces it, so
+# a fixture that quietly stops corrupting anything fails loudly instead of
+# turning every degraded-mode case into an assertion about a healthy hook.
+# (It has already earned its keep: the first version of brk_corrupt appended a
+# stray quote to the END of the file, which bash — reading a script
+# INCREMENTALLY, parse a command then run it — never reaches on a run that
+# exits early. The impl behaved perfectly and the cases read green.)
+brk_assert_broken() {
+  local f="$BRK_HOOKDIR/tree-claim-impl.sh"
+  if bash -n "$f" 2>/dev/null; then
+    fail "k2h0m fixture ($1): the corrupted impl really is unparseable" \
+      "the fixture produced a file that still parses — every degraded-mode case below is vacuous"
+  fi
+}
+
+# Corruption 1 — a syntax error near the top, so nothing executes.
+#
+# A locally-illegal token rather than a stray double quote, deliberately: a
+# single injected '"' takes its meaning from the quote parity of everything
+# after it, so whether it breaks the file depends on WHERE it lands (verified
+# on this file — injecting one at line 88 or 144 breaks parsing, at 69 or 128
+# it does not). The property under test is "the file does not parse", not any
+# particular typo, so the fixture uses a corruption that cannot silently
+# succeed. Corruption 2 covers the unterminated-string class faithfully.
+brk_corrupt() {
+  local f="$BRK_HOOKDIR/tree-claim-impl.sh"
+  awk 'NR==1 { print; print ";;"; next } { print }' "$f" > "$f.tmp"
+  mv "$f.tmp" "$f"
+  brk_assert_broken "syntax error"
+}
+
+# Corruption 2 — a TRUNCATED install, the faithful form of the live incident.
+# Cutting the file inside the first embedded python program leaves its
+# double-quoted bash string with no closing quote, so bash reads to EOF looking
+# for one and dies exactly the way the stray-quote incident did. This is also
+# the failure mode a partially-written copy-install produces, which the repo's
+# `bash -n` tripwire cannot see at all — it only ever checks the repo copy.
+brk_truncate() {
+  local f="$BRK_HOOKDIR/tree-claim-impl.sh" cut
+  cut=$(grep -n 'python3 -c "' "$f" | head -1 | cut -d: -f1)
+  awk -v c="$((cut + 2))" 'NR <= c { print }' "$f" > "$f.tmp"
+  mv "$f.tmp" "$f"
+  brk_assert_broken "truncated install"
+}
+
+brk_teardown() { [ -n "$BRK_ROOT" ] && rm -rf "$BRK_ROOT"; BRK_ROOT=""; }
+
+# Run the fixture's entrypoint. stdout is the decision JSON; stderr is kept in
+# $BRK_ROOT/err so the visibility assertion can read it.
+brk_run() {
+  printf '%s' "$1" | bash "$BRK_HOOK" 2>"$BRK_ROOT/err"
+}
+
+brk_stderr() { cat "$BRK_ROOT/err" 2>/dev/null; }
+
+# --- (a) DIRECTION: a broken guard DENIES a git index write ----------------
+# The repo has NO claim at all, so an intact hook would ALLOW this and write a
+# fresh claim. A deny here can only come from the breakage — which is the
+# whole point: the direction is pinned by a test, not left to accident.
+brk_setup
+brk_corrupt
+OUT=$(brk_run "$(make_json 'git commit -am work' "sess-ME" "$BRK_REPO")")
+if is_deny "$OUT"; then
+  pass "k2h0m: a guard that cannot parse DENIES an index-mutating git command"
+else
+  fail "k2h0m: a guard that cannot parse DENIES an index-mutating git command" \
+    "the hook exited without a deny, so the write was ALLOWED by a guard that never ran (output: $OUT)"
+fi
+
+# --- (b) VISIBILITY: the failure is loud and greppable ---------------------
+if brk_stderr | grep -q 'SABLE-TREE-CLAIM-DEGRADED'; then
+  pass "k2h0m: degraded mode emits the greppable SABLE-TREE-CLAIM-DEGRADED token on stderr"
+else
+  fail "k2h0m: degraded mode emits the greppable SABLE-TREE-CLAIM-DEGRADED token on stderr" \
+    "stderr was: $(brk_stderr)"
+fi
+if printf '%s' "$OUT" | grep -q 'permissionDecisionReason'; then
+  pass "k2h0m: the degraded deny carries a reason (not a bare refusal)"
+else
+  fail "k2h0m: the degraded deny carries a reason (not a bare refusal)" "output: $OUT"
+fi
+
+# --- (c) MEANS OF REPAIR: non-git commands still run -----------------------
+for SAFE_CMD in "ls -la" "bash -n hooks/multi-manager/tree-claim-impl.sh" "python3 -m pytest"; do
+  OUT=$(brk_run "$(make_json "$SAFE_CMD" "sess-ME" "$BRK_REPO")")
+  if is_allow "$OUT"; then
+    pass "k2h0m: degraded mode still allows the non-git command: $SAFE_CMD"
+  else
+    fail "k2h0m: degraded mode still allows the non-git command: $SAFE_CMD" \
+      "a broken tree-claim gate blanket-denied unrelated work, removing the means of repair (output: $OUT)"
+  fi
+done
+
+# ...and it says so, rather than degrading silently.
+OUT=$(brk_run "$(make_json 'ls -la' "sess-ME" "$BRK_REPO")")
+if has_additional_context "$OUT"; then
+  pass "k2h0m: a degraded ALLOW still announces the degradation in additionalContext"
+else
+  fail "k2h0m: a degraded ALLOW still announces the degradation in additionalContext" \
+    "the broken guard allowed silently — the exact property that let 84 assertions flip unnoticed"
+fi
+
+# --- (d) BREAK-GLASS via the hook's environment ----------------------------
+OUT=$(SABLE_TREE_CLAIM_OVERRIDE=1 brk_run "$(make_json 'git commit -am work' "sess-ME" "$BRK_REPO")")
+if is_allow "$OUT" && has_additional_context "$OUT"; then
+  pass "k2h0m: SABLE_TREE_CLAIM_OVERRIDE=1 in the hook env breaks the glass, loudly"
+else
+  fail "k2h0m: SABLE_TREE_CLAIM_OVERRIDE=1 in the hook env breaks the glass, loudly" "output: $OUT"
+fi
+
+# --- (e) BREAK-GLASS inline in the command ---------------------------------
+# A PreToolUse hook is a separate process: an env prefix INSIDE the Bash
+# command never reaches the hook's own environment. Degraded mode therefore
+# also honours the override when it appears in the command text — otherwise
+# the documented escape hatch is unusable from the place you actually type.
+OUT=$(brk_run "$(make_json 'SABLE_TREE_CLAIM_OVERRIDE=1 git commit -am work' "sess-ME" "$BRK_REPO")")
+if is_allow "$OUT"; then
+  pass "k2h0m: an inline SABLE_TREE_CLAIM_OVERRIDE=1 prefix breaks the glass"
+else
+  fail "k2h0m: an inline SABLE_TREE_CLAIM_OVERRIDE=1 prefix breaks the glass" \
+    "the only escape hatch reachable from the command line did not work (output: $OUT)"
+fi
+
+# --- (e2) THE LIVE INCIDENT'S OWN SHAPE: an unterminated string -------------
+# Same direction, reached the way it was actually reached: a copy of the hook
+# whose first embedded python program has no closing quote.
+brk_teardown
+brk_setup
+brk_truncate
+OUT=$(brk_run "$(make_json 'git commit -am work' "sess-ME" "$BRK_REPO")")
+if is_deny "$OUT" && brk_stderr | grep -q 'SABLE-TREE-CLAIM-DEGRADED'; then
+  pass "k2h0m: a TRUNCATED impl (unterminated embedded-python string) denies, loudly"
+else
+  fail "k2h0m: a TRUNCATED impl (unterminated embedded-python string) denies, loudly" \
+    "output: $OUT / stderr: $(brk_stderr)"
+fi
+
+# --- (f) CANNOT RUN is wider than CANNOT PARSE -----------------------------
+rm -f "$BRK_HOOKDIR/tree-claim-impl.sh"
+OUT=$(brk_run "$(make_json 'git add -A' "sess-ME" "$BRK_REPO")")
+if is_deny "$OUT"; then
+  pass "k2h0m: a MISSING impl (truncated/partial install) also denies, not just a parse error"
+else
+  fail "k2h0m: a MISSING impl (truncated/partial install) also denies, not just a parse error" "output: $OUT"
+fi
+brk_teardown
+
+# --- (g) NON-VACUITY: the same fixture, INTACT, discriminates ---------------
+# Without this, every deny above could be a fixture that denies everything,
+# and every allow a gate that was simply switched off.
+brk_setup
+OUT=$(brk_run "$(make_json 'git commit -am work' "sess-ME" "$BRK_REPO")")
+if is_allow "$OUT"; then
+  pass "k2h0m control: the INTACT fixture allows an unclaimed write (the deny above came from the breakage)"
+else
+  fail "k2h0m control: the INTACT fixture allows an unclaimed write" \
+    "the fixture denies even when healthy, so the degraded-mode denies prove nothing (output: $OUT)"
+fi
+if brk_stderr | grep -q 'SABLE-TREE-CLAIM-DEGRADED'; then
+  fail "k2h0m control: a healthy hook is silent on stderr" "stderr: $(brk_stderr)"
+else
+  pass "k2h0m control: a healthy hook does NOT emit the degraded token"
+fi
+printf 'sess-OTHER %s chuck\n' "$(date +%s)" > "$BRK_REPO/.git/sable-tree-claim"
+OUT=$(brk_run "$(make_json 'git commit -am work' "sess-ME" "$BRK_REPO")")
+if is_deny "$OUT"; then
+  pass "k2h0m control: the INTACT fixture still denies a foreign fresh claim (gate not disabled)"
+else
+  fail "k2h0m control: the INTACT fixture still denies a foreign fresh claim (gate not disabled)" "output: $OUT"
+fi
+brk_teardown
+
+# ============================================================
+# SABLE-k2h0m INTEGRATION — real git commits under a broken guard
+# ============================================================
+#
+# The block above asserts decision JSON. This one closes the loop the way the
+# vx4aj integration block does: the command is really executed when the hook
+# allows, and the repo's commit count is the assertion. The operative question
+# is "did the write land", not "what shape was the JSON".
+
+echo "--- SABLE-k2h0m Integration: broken guard vs. real git state ---"
+
+# brk_gate_and_run <cmd> — gate through the FIXTURE entrypoint, execute for
+# real iff allowed. Echoes allow/deny.
+brk_gate_and_run() {
+  local cmd="$1" out
+  out=$(brk_run "$(make_json "$cmd" "sess-ME" "$BRK_REPO")")
+  if is_deny "$out"; then
+    echo "deny"
+  else
+    ( cd "$BRK_REPO" && eval "$cmd" ) >/dev/null 2>&1
+    echo "allow"
+  fi
+}
+
+# (1) Broken guard, ordinary write: refused, and nothing lands.
+brk_setup
+brk_corrupt
+BEFORE=$(count_commits "$BRK_REPO")
+DECISION=$(brk_gate_and_run "git add -A && git commit -q -m 'write under broken guard'")
+AFTER=$(count_commits "$BRK_REPO")
+if [ "$DECISION" = "deny" ] && [ "$AFTER" -eq "$BEFORE" ]; then
+  pass "k2h0m integration: a real commit under a broken guard is refused and lands nothing"
+else
+  fail "k2h0m integration: a real commit under a broken guard is refused and lands nothing" \
+    "decision=$DECISION commits $BEFORE -> $AFTER"
+fi
+
+# (2) THE MEANS-OF-REPAIR PROPERTY, tested end to end: with the guard still
+#     broken, the break-glass form really commits.
+BEFORE=$(count_commits "$BRK_REPO")
+DECISION=$(brk_gate_and_run "SABLE_TREE_CLAIM_OVERRIDE=1 git add -A && SABLE_TREE_CLAIM_OVERRIDE=1 git commit -q -m 'repair commit'")
+AFTER=$(count_commits "$BRK_REPO")
+if [ "$DECISION" = "allow" ] && [ "$AFTER" -eq $((BEFORE + 1)) ]; then
+  pass "k2h0m integration: the break-glass write really lands while the guard is broken (repair is possible)"
+else
+  fail "k2h0m integration: the break-glass write really lands while the guard is broken (repair is possible)" \
+    "decision=$DECISION commits $BEFORE -> $AFTER"
+fi
+brk_teardown
+
+# (3) NEGATIVE CONTROL, end to end: an intact guard still lets a legitimate
+#     claimed write land, and still stops an unclaimed-by-you one.
+brk_setup
+BEFORE=$(count_commits "$BRK_REPO")
+DECISION=$(brk_gate_and_run "git add -A && git commit -q -m 'legit write'")
+AFTER=$(count_commits "$BRK_REPO")
+if [ "$DECISION" = "allow" ] && [ "$AFTER" -eq $((BEFORE + 1)) ]; then
+  pass "k2h0m integration control: an intact guard still lets a legitimate write land"
+else
+  fail "k2h0m integration control: an intact guard still lets a legitimate write land" \
+    "decision=$DECISION commits $BEFORE -> $AFTER"
+fi
+echo more > "$BRK_REPO/w2.txt"
+printf 'sess-OTHER %s chuck\n' "$(date +%s)" > "$BRK_REPO/.git/sable-tree-claim"
+BEFORE=$(count_commits "$BRK_REPO")
+DECISION=$(brk_gate_and_run "git add -A && git commit -q -m 'foreign-claim write'")
+AFTER=$(count_commits "$BRK_REPO")
+if [ "$DECISION" = "deny" ] && [ "$AFTER" -eq "$BEFORE" ]; then
+  pass "k2h0m integration control: an intact guard still refuses a write under a foreign fresh claim"
+else
+  fail "k2h0m integration control: an intact guard still refuses a write under a foreign fresh claim" \
+    "decision=$DECISION commits $BEFORE -> $AFTER"
+fi
+brk_teardown
+
+# ============================================================
 # settings-snippet registration
 # ============================================================
 
@@ -1180,15 +1488,32 @@ echo "--- Registration check ---"
 # The hook's detector is a python program embedded in a single double-quoted
 # bash string, so one stray double quote anywhere in it — including in a
 # comment — terminates that string and breaks the whole hook. When that
-# happens the hook exits non-zero and every write is ALLOWED, so the failure
-# presents as a silently disarmed gate rather than an error (SABLE-k2h0m).
-# Cheap tripwire, since every assertion above would otherwise go quietly green
-# in the allow direction.
-if bash -n "$HOOK" 2>/dev/null; then
-  pass "tree-claim.sh parses (guards the embedded-python quoting hazard)"
+# happens the hook exits non-zero (SABLE-k2h0m). Cheap tripwire, since every
+# assertion above would otherwise go quietly green in whichever direction the
+# broken hook happens to fall.
+#
+# BOTH files are checked. Checking only the entrypoint would make this
+# tripwire vacuous by construction — the entrypoint holds no embedded python,
+# so it is precisely the file the hazard CANNOT reach.
+for F in "$HOOK" "$REPO/hooks/multi-manager/tree-claim-impl.sh"; do
+  B="$(basename "$F")"
+  if bash -n "$F" 2>/dev/null; then
+    pass "$B parses (guards the embedded-python quoting hazard)"
+  else
+    fail "$B parses (guards the embedded-python quoting hazard)" "$(bash -n "$F" 2>&1)"
+  fi
+done
+
+# The entrypoint's fail-closed decision is only worth anything while the
+# entrypoint itself stays simple: it is the one file whose breakage still
+# fails open (nothing can guard the outermost frame). Keeping the embedded
+# python — the demonstrated hazard — out of it is the structural property that
+# makes that residual risk small, so assert it rather than trust a comment.
+if grep -q 'python3 -c' "$HOOK"; then
+  fail "entrypoint stays free of embedded python (the hazard that broke the guard)" \
+    "tree-claim.sh has grown a 'python3 -c' program; move it to tree-claim-impl.sh"
 else
-  fail "tree-claim.sh parses (guards the embedded-python quoting hazard)" \
-    "$(bash -n "$HOOK" 2>&1)"
+  pass "entrypoint stays free of embedded python (the hazard that broke the guard)"
 fi
 
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"

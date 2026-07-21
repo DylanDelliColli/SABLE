@@ -576,6 +576,20 @@ The claim file lives at `$(git -C <cwd> rev-parse --git-dir)/sable-tree-claim` a
 - Session identity is unknowable (no `session_id` in JSON, no `CLAUDE_SESSION_ID` env) → allow + `additionalContext`.
 - The claim file is unreadable or corrupt → take over + allow + `additionalContext`.
 
+Each of these is a case where the gate **ran and reached a considered conclusion**. That is categorically different from the gate not running at all.
+
+**Fail-closed on the gate's own breakage (SABLE-k2h0m).** The hook is two files: `tree-claim.sh` is a small entrypoint, and `tree-claim-impl.sh` holds the logic (including the embedded python). The split exists because a single-file hook cannot fail closed on its own syntax error — bash parses the whole file before executing a line, so any self-check inside it is dead code exactly when it is needed. Observed live: one stray double quote in the embedded python made `bash tree-claim.sh` exit 2, and since a hook that exits non-zero without deny JSON is treated as ALLOW, the gate silently disarmed itself — 84 suite assertions flipped from deny to allow at once.
+
+Every normal path of `tree-claim-impl.sh` exits 0, so a non-zero exit means it could not run (unparseable, missing, truncated, crashed). The entrypoint then:
+
+| | Degraded behaviour |
+|---|---|
+| Git-index-write-shaped command | **Deny** — the gate has not established the write is safe |
+| Any other command | Allow (editors, tests, `bash -n`, `git status` — the means of repair) |
+| `SABLE_TREE_CLAIM_OVERRIDE=1`, in the hook env **or** inline in the command | Allow, announced — the break-glass. The inline form matters: a PreToolUse hook is a separate process, so a `VAR=1 git commit` prefix never reaches its environment |
+
+Every degraded decision prints the greppable token `SABLE-TREE-CLAIM-DEGRADED` to stderr and carries `additionalContext` or a reason. Silence was the worst property of the old mode. Note the blast radius: while broken, refusals can reach writes in other repos the command targets (see SABLE-vx4aj on attribution) — bounded by the narrow classifier, the override, and the lifetime of the breakage.
+
 ### 7. Post-push Chuck notification
 
 A `PostToolUse:Bash` hook matching successful `git push` files a `for-chuck` bead:
@@ -613,7 +627,7 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | Hook | Trigger | Purpose | Mode |
 |------|---------|---------|------|
 | `session-role-anchor.sh` | SessionStart, PreCompact | Inject role identity from `~/.claude/sable/roles/<name>.md` | Inject context |
-| `tree-claim.sh` | PreToolUse:Bash | Lockfile: one main session per checkout — deny index-mutating git commands when another session holds a fresh claim (TTL 3600s; `SABLE_TREE_CLAIM_OVERRIDE=1` or manual delete to escape) | Hard deny |
+| `tree-claim.sh` (+ `tree-claim-impl.sh`) | PreToolUse:Bash | Lockfile: one main session per checkout — deny index-mutating git commands when another session holds a fresh claim (TTL 3600s; `SABLE_TREE_CLAIM_OVERRIDE=1` or manual delete to escape). Denies git writes if the gate itself cannot run | Hard deny |
 | `read-guard.sh` | PreToolUse:Bash | Deny `bd ready -l for-<foreign>` queries (Lincoln bypassed via `cross_inbox_read: true`) | Hard deny |
 | `pre-dispatch-refresh.sh` | PreToolUse:Agent | Rebase target worktree on `$SABLE_BASE_BRANCH` | Side effect (rebase) |
 | `pre-dispatch-claim.sh` | PreToolUse:Agent | Read bead description, write file claims to bead notes | Side effect (bd update) |
