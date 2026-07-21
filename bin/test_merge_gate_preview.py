@@ -61,15 +61,20 @@ class FakeGit:
     namespace so a push made by one call is visible to the next."""
 
     def __init__(self, *, remote_refs=None, conflict=False, parents=None,
-                 base_sha=BASE_SHA, branch_sha=BRANCH_SHA):
+                 base_sha=BASE_SHA, branch_sha=BRANCH_SHA,
+                 remote_url="/fixtures/origin.git"):
         self.calls = []
         self.pushes = []
+        self.push_remotes = []
         self.previews_built = 0
         self.remote_refs = dict(remote_refs or {})
         self.conflict = conflict
         self.parents = dict(parents or {})
         self.base_sha = base_sha
         self.branch_sha = branch_sha
+        # What `git remote get-url <name>` resolves to (SABLE-ck05): pushes must
+        # address this path, not the CWD-sensitive remote NAME.
+        self.remote_url = remote_url
 
     def __call__(self, repo, *args, check=True):
         self.calls.append(args)
@@ -102,7 +107,14 @@ class FakeGit:
         if cmd == "commit-tree":
             self.previews_built += 1
             return _cp(0, PREVIEW_SHA)
+        if cmd == "remote" and len(args) >= 2 and args[1] == "get-url":
+            # Resolve a remote NAME to its configured path; a non-name (already a
+            # path) or unknown remote errors, matching real `git remote get-url`.
+            if args[-1] == REMOTE:
+                return _cp(0, self.remote_url)
+            return _cp(2, "error: No such remote")
         if cmd == "push":
+            self.push_remotes.append(args[1])
             spec = args[-1]
             self.pushes.append(spec)
             if ":" in spec and spec.startswith(("--delete",)) is False:
@@ -206,6 +218,38 @@ def test_main_preview_subcommand_routes_to_the_kick(monkeypatch, no_waiting):
     rc = smg.main(["preview", "--branch", BRANCH, "--repo", REPO, "--remote", REMOTE])
     assert rc == 0
     assert len(fake.pushes) == 1
+
+
+# --- SABLE-ck05: pushes address the resolved URL, never the remote NAME -------
+
+def test_kick_preview_pushes_resolved_url(monkeypatch, no_waiting):
+    """The kick's ref push must name the resolved remote URL/path, not the literal
+    'origin' — a CWD-sensitive name can follow a working-dir escape to the wrong
+    upstream (the ck05 bare-origin escape), a resolved path cannot. The fetch that
+    precedes it stays name-based (read-only; the ck05 harness intercepts push
+    alone)."""
+    fake = FakeGit(remote_url="/fixtures/wk-x-origin.git")
+    monkeypatch.setattr(git_lib, "_git", fake)
+    smg.kick_preview(BRANCH, BASE, REPO, REMOTE)
+    assert fake.push_remotes == ["/fixtures/wk-x-origin.git"]
+    assert REMOTE not in fake.push_remotes  # never the CWD-sensitive name
+    # Negative control: fetch may — and must — still use the remote NAME.
+    fetches = [c for c in fake.calls if c[0] == "fetch"]
+    assert fetches, "kick must still fetch base/branch before building the preview"
+    assert any(REMOTE in c for c in fetches)
+
+
+def test_materialize_preview_pushes_resolved_url(monkeypatch):
+    """The fresh-build push in materialize_preview (the pre-kick path promote
+    takes when nothing was kicked) must likewise address the resolved path, not
+    the name."""
+    fake = FakeGit(remote_url="/fixtures/wk-x-origin.git")
+    monkeypatch.setattr(git_lib, "_git", fake)
+    preview_sha, ref, adopted = preview_lib.materialize_preview(
+        REPO, REMOTE, BRANCH, BASE, BASE_SHA, BRANCH_SHA, "SABLE-x")
+    assert adopted is False  # nothing kicked, so it built + pushed a fresh ref
+    assert fake.push_remotes == ["/fixtures/wk-x-origin.git"]
+    assert REMOTE not in fake.push_remotes
 
 
 # --- adopt_kicked_preview ----------------------------------------------------

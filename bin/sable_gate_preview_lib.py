@@ -205,7 +205,11 @@ def materialize_preview(repo: str, remote: str, branch: str, base: str,
     msg = f"ci-verify merge-preview: {branch} onto {base} ({bead})"
     preview_sha = build_preview(repo, base_sha, branch_sha, msg)
     ref = classify.preview_ref_name(bead, preview_sha)
-    git_lib._git(repo, "push", remote, f"{preview_sha}:refs/heads/{ref}")
+    # Push by EXPLICIT resolved path, never the CWD-sensitive remote NAME, so a
+    # working-dir escape can't redirect this ci-verify ref to the real upstream
+    # (SABLE-ck05). Fetch above stays name-based — it only reads.
+    git_lib._git(repo, "push", git_lib.resolve_remote_url(repo, remote),
+                 f"{preview_sha}:refs/heads/{ref}")
     return (preview_sha, ref, False)
 
 
@@ -243,7 +247,12 @@ def kick_preview(branch: str, base: str, repo: str, remote: str) -> int:
 
     msg = f"ci-verify merge-preview: {branch} onto {base} (push-time kick)"
     preview_sha = build_preview(repo, base_sha, branch_sha, msg)
-    git_lib._git(repo, "push", remote, f"{preview_sha}:refs/heads/{ref}")
+    # Push by EXPLICIT resolved path, never the CWD-sensitive remote NAME
+    # (SABLE-ck05): this is the leg the post-push hook fires, and it ran under a
+    # CWD escape that redirected every name-based kick to the operator's real
+    # upstream. Fetch above stays name-based — it only reads.
+    git_lib._git(repo, "push", git_lib.resolve_remote_url(repo, remote),
+                 f"{preview_sha}:refs/heads/{ref}")
     print(f"sable-merge-gate preview: kicked {ref} (preview {preview_sha}) for {branch} "
           f"onto {base} — NOT waiting for CI")
     return 0
@@ -404,7 +413,11 @@ def delete_ci_ref(repo: str, remote: str, ref: str) -> None:
     """Delete a throwaway ci-verify ref. Best-effort by contract: the ref may
     already be gone (a concurrent sweep, a prior attempt), and failing to clean
     up must never change a promote outcome."""
-    git_lib._git(repo, "push", remote, "--delete", ref, check=False)
+    # Resolve to an explicit path first (SABLE-ck05): a name-based `push --delete`
+    # under a CWD escape would delete the ref on the wrong upstream. Best-effort
+    # unchanged.
+    git_lib._git(repo, "push", git_lib.resolve_remote_url(repo, remote),
+                 "--delete", ref, check=False)
 
 
 def sweep(repo: str, remote: str, max_age_hours: float) -> int:
@@ -412,6 +425,10 @@ def sweep(repo: str, remote: str, max_age_hours: float) -> int:
     git_lib._git(repo, "fetch", remote, "--prune")
     listing = git_lib._git(repo, "for-each-ref", "--format=%(refname:short) %(committerdate:unix)",
                            f"refs/remotes/{remote}/ci-verify/", check=False)
+    # Resolve once: the fetch/for-each-ref above are name-based reads, but every
+    # push --delete below must address an EXPLICIT path so a CWD escape can't reap
+    # refs on the wrong upstream (SABLE-ck05).
+    push_remote = git_lib.resolve_remote_url(repo, remote)
     now = time.time()
     deleted = 0
     spared = 0
@@ -436,7 +453,7 @@ def sweep(repo: str, remote: str, max_age_hours: float) -> int:
                   file=sys.stderr)
             spared += 1
             continue
-        git_lib._git(repo, "push", remote, "--delete", branch, check=False)
+        git_lib._git(repo, "push", push_remote, "--delete", branch, check=False)
         deleted += 1
     spared_note = f" (spared {spared} with an in-flight run)" if spared else ""
     print(f"sable-merge-gate sweep: deleted {deleted} orphaned ci-verify ref(s) older than {max_age_hours}h{spared_note}")
