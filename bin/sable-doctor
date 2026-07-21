@@ -49,6 +49,23 @@ from sable_pane_lib import WORKER_CAP_DEFAULT, worker_cap  # noqa: E402
 REPO = Path(__file__).resolve().parent.parent
 REFRESH_CMD = "bash install.sh"
 
+# The three CLI entrypoints an operator can deliberately PIN (real copy, not a
+# symlink) to remove the y6ik3 hot-swap hazard (SABLE-mkj6k). sable-bin-install
+# refuses to silently re-symlink one of these once pinned and records the
+# current pin set in DEST/.sable-pinned — see _read_pin_marker() below.
+PINNED_BIN_NAMES = ("sable-merge-gate", "sable-reconcile-handoffs", "sable-dolt-push")
+
+# SABLE-mkj6k INTERIM GUARD — remove this set (and every branch that reads it
+# below, in check_manifest/render_text_report/main's --quiet path) once the
+# install.sh pin-preservation fix has been verified live everywhere on the
+# fleet: with sable-bin-install honoring pins, `bash install.sh` can no longer
+# silently un-pin these bins, so the ordinary remedy is safe again for them.
+# Until that verification lands, an agent running a STALE (pre-fix) installed
+# copy of install.sh who follows the ordinary "Refresh with: bash install.sh"
+# remedy for one of these bins would silently re-symlink a deliberate pin —
+# so that remedy must not be offered for this category.
+GUARDED_CATEGORIES = {"pinned bins"}
+
 
 class NoProjectInstallError(Exception):
     """--project could not resolve a project .claude install to check."""
@@ -75,9 +92,14 @@ def skill_install_name(skill_dir: Path) -> str:
     return skill_dir.name
 
 
-def build_manifest(repo: Path, claude_dir: Path):
+def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
     """Return [(category, repo_path, installed_path), ...] mirroring exactly
-    what install.sh + sable-orchestration-install copy."""
+    what install.sh + sable-orchestration-install copy.
+
+    bin_dir, when given, adds the "pinned bins" category (PINNED_BIN_NAMES)
+    sourced from repo/bin and checked against bin_dir — the ~/.local/bin (or
+    scope-equivalent) sable-bin-install targets. Omitted by default so pure
+    unit fixtures that never populate repo/bin/ stay unaffected."""
     entries = []
 
     # Step 4: top-level hooks (hooks/*.sh -> ~/.claude/hooks/*.sh)
@@ -116,13 +138,52 @@ def build_manifest(repo: Path, claude_dir: Path):
             for f in sorted(p for p in skill_dir.iterdir() if p.is_file()):
                 entries.append((f"skill:{name}", f, dst_dir / f.name))
 
+    # Pinned CLI bins (SABLE-mkj6k) — only when a bin_dir is given (main()
+    # always supplies one for real runs; unit fixtures opt in explicitly).
+    if bin_dir is not None:
+        bin_dir = Path(bin_dir)
+        for name in PINNED_BIN_NAMES:
+            src = repo / "bin" / name
+            if src.is_file():
+                entries.append(("pinned bins", src, bin_dir / name))
+
     return entries
+
+
+def _read_pin_marker(bin_dir: Path) -> set:
+    """Names sable-bin-install currently considers pinned in bin_dir, per its
+    DEST/.sable-pinned marker (regenerated from real filesystem state on every
+    install run — see bin/sable-bin-install). Empty set if no marker exists,
+    e.g. a scope where nothing has ever been pinned."""
+    marker = Path(bin_dir) / ".sable-pinned"
+    if not marker.is_file():
+        return set()
+    return {line.strip() for line in marker.read_text(errors="replace").splitlines() if line.strip()}
 
 
 def check_manifest(entries):
     results = []
+    pin_marker_cache = {}
     for category, src, dst in entries:
-        if not dst.exists():
+        if category in GUARDED_CATEGORIES:
+            bin_dir = dst.parent
+            if bin_dir not in pin_marker_cache:
+                pin_marker_cache[bin_dir] = _read_pin_marker(bin_dir)
+            pinned_names = pin_marker_cache[bin_dir]
+            if dst.is_symlink() and dst.name in pinned_names:
+                # Policy says pinned (the marker says so) but the installed
+                # file is a symlink — exactly the DEFECT 2 signature: a
+                # deliberate pin got silently reverted. Content is irrelevant
+                # here; a symlink always resolves to current repo content, so
+                # a naive sha256 compare would wrongly call this "clean".
+                status = "unpinned"
+            elif not dst.exists():
+                status = "missing"
+            elif sha256(src) != sha256(dst):
+                status = "drift"
+            else:
+                status = "clean"
+        elif not dst.exists():
             status = "missing"
         elif sha256(src) != sha256(dst):
             status = "drift"
@@ -144,6 +205,15 @@ def resolve_claude_dir(arg_value, env):
     if override:
         return Path(override)
     return Path.home() / ".claude"
+
+
+def resolve_bin_dir(arg_value):
+    """Where sable-bin-install puts the pinnable CLI bins. Global under BOTH
+    scopes (the S2 hybrid contract — --project still links tools globally),
+    so this is intentionally independent of --claude-dir/--project."""
+    if arg_value:
+        return Path(arg_value)
+    return Path.home() / ".local" / "bin"
 
 
 def resolve_project_claude_dir(base=None):
@@ -186,6 +256,26 @@ def worker_cap_line():
     return f"worker cap: {WORKER_CAP_DEFAULT} (default)"
 
 
+_STATUS_LABELS = {"missing": "MISSING", "drift": "DRIFT  ", "unpinned": "UNPINNED"}
+
+
+def _guarded_remedy_lines(guarded_bad):
+    """SABLE-mkj6k interim guard: the safe per-file remedy for a drifted
+    GUARDED_CATEGORIES entry. Deliberately never spells out REFRESH_CMD (see
+    the comment on GUARDED_CATEGORIES for why) — not even in a negated
+    sentence ("don't run X"), since the acceptance criterion is that the
+    ordinary refresh command must not appear in this output at all."""
+    lines = [
+        "Do not use the ordinary installer refresh for the pinned bin(s) above —",
+        "until the install.sh pin-preservation fix (SABLE-mkj6k) is confirmed live",
+        "on this machine, the ordinary installer can silently re-symlink a",
+        "deliberately pinned bin. Refresh by hand instead:",
+    ]
+    for r in guarded_bad:
+        lines.append(f"  cp {r['repo_path']} {r['installed_path']} && chmod +x {r['installed_path']}")
+    return lines
+
+
 def render_text_report(results):
     bad = [r for r in results if r["status"] != "clean"]
     if not bad:
@@ -199,10 +289,17 @@ def render_text_report(results):
         if r["category"] != last_category:
             print(f"[{r['category']}]")
             last_category = r["category"]
-        label = "MISSING" if r["status"] == "missing" else "DRIFT  "
+        label = _STATUS_LABELS.get(r["status"], r["status"].upper())
         print(f"  {label} {r['installed_path']}")
         print(f"          repo: {r['repo_path']}")
-    print(f"\nRefresh with: {REFRESH_CMD}")
+    guarded_bad = [r for r in bad if r["category"] in GUARDED_CATEGORIES]
+    unguarded_bad = [r for r in bad if r["category"] not in GUARDED_CATEGORIES]
+    if guarded_bad:
+        print()
+        for line in _guarded_remedy_lines(guarded_bad):
+            print(line)
+    if unguarded_bad:
+        print(f"\nRefresh with: {REFRESH_CMD}")
     print(worker_cap_line())
 
 
@@ -215,6 +312,7 @@ def main(argv=None):
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--claude-dir", default=None, help="installed ~/.claude to check (default: $CLAUDE_USER_DIR or ~/.claude)")
     target.add_argument("--project", action="store_true", help="check the current git project's own install (sugar for --claude-dir <repo-root>/.claude via git-common-dir)")
+    parser.add_argument("--bin-dir", default=None, help="installed CLI bin dir to check pinned bins against (default: ~/.local/bin — always global, independent of --project)")
     parser.add_argument("--json", action="store_true", help="emit a machine-readable report")
     parser.add_argument("--quiet", action="store_true", help="print nothing when clean; one line when drifted")
     args = parser.parse_args(argv)
@@ -229,7 +327,8 @@ def main(argv=None):
     else:
         claude_dir = resolve_claude_dir(args.claude_dir, os.environ)
 
-    entries = build_manifest(repo, claude_dir)
+    bin_dir = resolve_bin_dir(args.bin_dir)
+    entries = build_manifest(repo, claude_dir, bin_dir)
     results = check_manifest(entries)
     bad = [r for r in results if r["status"] != "clean"]
 
@@ -237,11 +336,26 @@ def main(argv=None):
         print(json.dumps({"clean": not bad, "results": results}, indent=2))
     elif args.quiet:
         if bad:
-            print(
-                f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD "
-                f"— run `{REFRESH_CMD}` to refresh (run `sable-doctor` for detail)",
-                file=sys.stderr,
-            )
+            guarded_bad = [r for r in bad if r["category"] in GUARDED_CATEGORIES]
+            if guarded_bad:
+                # SABLE-mkj6k interim guard — see GUARDED_CATEGORIES comment.
+                # This is the SessionStart-hook path (`sable-doctor --quiet`),
+                # the highest-traffic message in the system; it must not tell
+                # a fresh pane with zero context to run the one command that
+                # could silently un-pin a deliberately pinned bin.
+                print(
+                    f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD, "
+                    f"including {len(guarded_bad)} pinned bin(s) — do not use the ordinary "
+                    "installer refresh for those (SABLE-mkj6k interim guard); run "
+                    "`sable-doctor` for the safe per-file refresh commands",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD "
+                    f"— run `{REFRESH_CMD}` to refresh (run `sable-doctor` for detail)",
+                    file=sys.stderr,
+                )
     else:
         render_text_report(results)
 
