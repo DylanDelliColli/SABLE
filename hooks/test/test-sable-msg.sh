@@ -30,6 +30,19 @@ tmux_() { tmux -L "$SOCK" "$@"; }
 cleanup() { tmux_ kill-server >/dev/null 2>&1; rm -rf "$REC"; }
 trap cleanup EXIT
 
+# This suite is itself commonly run FROM a real SABLE pane (a worker or
+# manager dispatched to verify it, per the normal workflow) whose shell
+# carries its own CLAUDE_AGENT_NAME / SABLE_WORKER_PANE / SABLE_BEAD. tmux
+# new-session/respawn-pane/new-window inherit the launching shell's
+# environment into the spawned pane's process, so a stand-in pane meant to
+# simulate a bare manager/worker process would instead inherit e.g.
+# CLAUDE_AGENT_NAME=tarzan -- and sable-msg's SABLE-to8m poisoned-identity
+# check (pane_process_identity reads /proc/PID/environ) then correctly
+# refuses delivery, since the "recipient" pane's real identity doesn't match
+# the role under test. Unset here so every pane this suite spawns starts
+# from a clean identity regardless of the invoking shell (SABLE-4nr0q).
+unset CLAUDE_AGENT_NAME SABLE_WORKER_PANE SABLE_BEAD
+
 export SABLE_TMUX_SOCKET="$SOCK"
 export SABLE_MSG_POLL_INTERVAL="0.1"
 export SABLE_MSG_SUBMIT_TRIES="30"
