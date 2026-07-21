@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""sable-snapshot — the green snapshot runner + freeze/quarantine state CLI
+(SABLE-jd5fj.5).
+
+The scheduled full-suite run on the integration branch that sits BEHIND the
+merge gate: the gate says "is this one merge safe", the snapshot says "is the
+base still healthy after all of them". Its distinguishing move is that a re-run
+is a MEASUREMENT, not a retry — see bin/sable_snapshot_lib.py's module docstring
+for the whole argument, which is not repeated here.
+
+  red -> red    deterministic: FREEZE promotion + exactly one Chuck bisect bead
+  red -> green  flaky: NO freeze; quarantine the suite + exactly one flaky-fix
+                bead (quarantined suites still RUN and are still RECORDED)
+  all green     clears any existing freeze
+
+The freeze is enforced MECHANICALLY, not by convention: bin/
+sable_gate_promote_lib.promote() reads the flag before it does anything else and
+refuses with exit 25. There is no env kill switch for it on purpose — the only
+way out is a green snapshot or an explicit, recorded `sable-snapshot unfreeze
+--reason "..."`, so every bypass has a name attached to it.
+
+Tier membership comes from the cmar4.1 SSOT (.github/ci/test-tiers.sh, tier
+full_snapshot). This tool never carries its own suite list.
+
+Usage:
+  sable-snapshot run [--tier full_snapshot] [--repo P] [--branch B]
+                     [--run-url URL] [--dry-run]
+  sable-snapshot status [--repo P] [--json]
+  sable-snapshot freeze   --reason "..." [--repo P]
+  sable-snapshot unfreeze --reason "..." [--repo P]
+  sable-snapshot quarantine list|add <suite>|remove <suite> [--repo P] [--reason "..."]
+
+Exit codes:
+  0  snapshot green (freeze cleared if one was set) / command ok
+  2  usage      3 precondition (no tier SSOT, empty tier)
+  25 FROZEN — deterministic red; promotion is denied until resolved
+  26 flake(s) quarantined; NOT frozen
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+import sable_snapshot_lib as snap  # noqa: E402
+
+# Re-exports for callers/tests that treat this file as the public entry point.
+classify_snapshot = snap.classify_snapshot
+state_dir = snap.state_dir
+read_freeze = snap.read_freeze
+read_quarantine = snap.read_quarantine
+
+
+def _status(repo: str, as_json: bool) -> int:
+    freeze = snap.read_freeze(repo)
+    quarantine = snap.read_quarantine(repo)
+    if as_json:
+        print(json.dumps({"state_dir": str(snap.state_dir(repo)),
+                          "frozen": freeze is not None, "freeze": freeze,
+                          "quarantine": quarantine}))
+        return 0
+    print(f"state dir: {snap.state_dir(repo)}")
+    if freeze:
+        print(f"FROZEN since {freeze.get('since') or 'unknown'} — promotion is DENIED (exit 25)")
+        print(f"  reason: {freeze.get('reason', '')}")
+        if freeze.get("suites"):
+            print(f"  suites: {', '.join(freeze['suites'])}")
+        if freeze.get("bead"):
+            print(f"  bisect bead: {freeze['bead']}")
+    else:
+        print("not frozen — promotion is open")
+    if quarantine:
+        print(f"quarantined ({len(quarantine)}) — still run, still recorded, "
+              f"excluded from the freeze trigger:")
+        for suite, rec in quarantine.items():
+            print(f"  {suite}  since {rec.get('since', '?')}  {rec.get('bead', '')}")
+    else:
+        print("quarantine: empty")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="sable-snapshot")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    def repo_arg(sp):
+        sp.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+
+    r = sub.add_parser("run")
+    repo_arg(r)
+    r.add_argument("--tier", default="full_snapshot")
+    r.add_argument("--branch", default=os.environ.get("SABLE_SNAPSHOT_BRANCH", ""))
+    r.add_argument("--run-url", default=os.environ.get("SABLE_SNAPSHOT_RUN_URL", ""))
+    r.add_argument("--dry-run", action="store_true",
+                   help="classify and report, but write no state and file no beads")
+
+    s = sub.add_parser("status")
+    repo_arg(s)
+    s.add_argument("--json", action="store_true")
+
+    f = sub.add_parser("freeze")
+    repo_arg(f)
+    f.add_argument("--reason", required=True)
+
+    u = sub.add_parser("unfreeze")
+    repo_arg(u)
+    u.add_argument("--reason", required=True,
+                   help="recorded on stdout; an unfreeze is a human decision, never a default")
+
+    q = sub.add_parser("quarantine")
+    repo_arg(q)
+    q.add_argument("action", choices=["list", "add", "remove"])
+    q.add_argument("suite", nargs="?")
+    q.add_argument("--reason", default="")
+
+    a = p.parse_args(argv)
+
+    if a.command == "status":
+        return _status(a.repo, a.json)
+
+    if a.command == "freeze":
+        rec = snap.write_freeze(a.repo, suites=[], reason=f"manual freeze: {a.reason}")
+        print(f"sable-snapshot: FROZEN manually — {rec['reason']}")
+        return 0
+
+    if a.command == "unfreeze":
+        if snap.clear_freeze(a.repo, reason=a.reason):
+            print(f"sable-snapshot: freeze CLEARED manually — reason: {a.reason}")
+        else:
+            print("sable-snapshot: not frozen — nothing to clear")
+        return 0
+
+    if a.command == "quarantine":
+        if a.action == "list":
+            for suite, rec in snap.read_quarantine(a.repo).items():
+                print(f"{suite}\t{rec.get('since', '?')}\t{rec.get('bead', '')}")
+            return 0
+        if not a.suite:
+            print("sable-snapshot: quarantine add/remove needs a suite name", file=sys.stderr)
+            return snap.EXIT_USAGE
+        if a.action == "add":
+            added = snap.add_quarantine(a.repo, a.suite,
+                                        reason=a.reason or "manual quarantine")
+            print(f"sable-snapshot: {'quarantined' if added else 'already quarantined'} {a.suite}")
+        else:
+            removed = snap.remove_quarantine(a.repo, a.suite)
+            print(f"sable-snapshot: {'released' if removed else 'was not quarantined'} {a.suite}")
+        return 0
+
+    try:
+        result = snap.snapshot(a.repo, tier=a.tier, branch=a.branch,
+                               run_url=a.run_url, dry_run=a.dry_run)
+    except RuntimeError as exc:
+        print(f"sable-snapshot: {exc}", file=sys.stderr)
+        return snap.EXIT_PRECONDITION
+    return result.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

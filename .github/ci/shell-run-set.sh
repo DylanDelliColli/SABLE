@@ -94,6 +94,7 @@ ALLOW=(
   test-session-role-anchor.sh
   test-shell-run-set-strict.sh
   test-sherlock-research.sh
+  test-snapshot-freeze.sh
   test-spine-pinning.sh
   test-staged-planning-docs.sh
   test-stash-worktree-guard.sh
@@ -158,6 +159,7 @@ declare -A COVERS=(
   [test-sable-mode.sh]="hooks/multi-manager/lib-mode-path.sh"
   [test-sable-test.sh]="bin/sable-test"
   [test-session-role-anchor.sh]="hooks/multi-manager/session-role-anchor.sh"
+  [test-snapshot-freeze.sh]="bin/sable-snapshot bin/sable_snapshot_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py"
   [test-tdd-evidence.sh]="hooks/tdd-evidence.sh"
   [test-tdd-gate.sh]="hooks/tdd-gate.sh"
   [test-tier-ssot-consumers.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
