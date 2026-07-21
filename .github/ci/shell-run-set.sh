@@ -82,6 +82,7 @@ ALLOW=(
   test-session-role-anchor.sh
   test-sherlock-research.sh
   test-staged-planning-docs.sh
+  test-stash-worktree-guard.sh
   test-tdd-evidence.sh
   test-tdd-gate.sh
   test-thesis-docs.sh
