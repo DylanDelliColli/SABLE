@@ -27,6 +27,7 @@ Cache miss means full run, full stop.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -163,10 +164,104 @@ def run_impact_tier(repo_root: Path, base_ref: str = "HEAD") -> int:
     return result.returncode
 
 
+# --- .testmondata cache-warm classification (SABLE-cmar4.3 second revise) ----
+# ci-verify.yml runs the FULL bin/ suite a second time with --testmon-noselect
+# purely to keep .testmondata warm for this module's selector (see module
+# docstring). pytest-testmon 2.2.0 has a real, reproduced defect: its own
+# SourceTree.get_file() (testmon/testmon_core.py:93) unconditionally does
+# `filename.rsplit(".", 1)[1]` to compute an "extension" for every file its
+# Coverage() instance measured; a filename with NO DOT makes rsplit return a
+# 1-element list and [1] raises IndexError, crashing pytest with INTERNALERROR
+# during test teardown -- AFTER every test already passed. This repo's bin/
+# has ~23 python executables with a shebang but no .py suffix (bin/sable-msg,
+# bin/sable-merge-gate, etc.) that several bin/test_*.py suites load
+# in-process via importlib.machinery.SourceFileLoader, so coverage measures
+# them and hits this every time.
+#
+# Confirmed dead end (repro'd directly against a minimal reproduction, not
+# just read): pytest-testmon's own Coverage() instance
+# (testmon.testmon_core.Testmon.setup_coverage) hardcodes
+# include=[repo_root + "/*"] -- unioned in even when a pytest-cov --cov-config
+# `source`/`run_include`/omit setting is present -- so there is no ini,
+# .coveragerc, nor pytest-cov config surface that narrows what testmon
+# measures. 2.2.0 is the latest pytest-testmon release; no upstream fix
+# exists. The crash only fires on an ACTUAL (non-collect-only) run with
+# --testmon/--testmon-noselect active, so it never affects this module's own
+# collect-only collector (_pytest_collect_only) or the "selected" run
+# (run_impact_tier does not pass --testmon) -- only a dedicated full-suite
+# cache-warm run can hit it.
+#
+# classify_cache_warm_outcome narrowly tolerates ONLY this exact signature
+# with zero reported test failures as a successful warm; anything else (a
+# real test failure, a different internal error) still propagates as a real
+# failure. A tolerated crash just leaves .testmondata stale for that run --
+# the same conservative state build_impact_tier_plan already treats as a
+# plain cache miss -- so it degrades cache freshness only, never gate
+# correctness.
+_KNOWN_TESTMON_EXTENSIONLESS_CRASH_MARKERS = (
+    "testmon_core.py",
+    'rsplit(".", 1)',
+    "IndexError: list index out of range",
+)
+
+
+def classify_cache_warm_outcome(returncode: int, output: str) -> bool:
+    """True if a `pytest bin/ --testmon-noselect` cache-warm run should be
+    treated as a successful warm; False if it must propagate as a real
+    failure. See the module-level comment above for the exact defect this
+    carves out and why it is safe to tolerate.
+    """
+    if returncode == 0:
+        return True
+    if not all(marker in output for marker in _KNOWN_TESTMON_EXTENSIONLESS_CRASH_MARKERS):
+        return False
+    if re.search(r"^\d+ failed", output, re.MULTILINE):
+        return False
+    if re.search(r"^\d+ error", output, re.MULTILINE):
+        return False
+    return bool(re.search(r"\d+ passed", output))
+
+
+def run_cache_warm(repo_root: Path, extra_pytest_args: Optional[List[str]] = None) -> int:
+    """Actually execute the full bin/ suite with --testmon-noselect (mirrors
+    ci-verify.yml's cache-warm step exactly) and apply
+    classify_cache_warm_outcome to the result, returning 0 for a real pass or
+    a tolerated known-crash, and the real returncode for anything else.
+
+    extra_pytest_args exists only for this module's own integration test,
+    which runs this function against bin/ from a test IN bin/ -- it needs
+    --ignore=<this file> to avoid the nested pytest run recursing into
+    itself. ci-verify.yml's real invocation passes none.
+    """
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "pytest", "bin/", "-q", "-p", "no:cacheprovider",
+            "--testmon-noselect", *(extra_pytest_args or []),
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    output = result.stdout + result.stderr
+    sys.stdout.write(output)
+    if classify_cache_warm_outcome(result.returncode, output):
+        if result.returncode != 0:
+            print(
+                "tier_selection: KNOWN pytest-testmon extensionless-file crash "
+                "tolerated during cache warm (all tests passed) -- .testmondata "
+                "left stale for this run",
+                file=sys.stderr,
+            )
+        return 0
+    return result.returncode
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     repo_root = Path(__file__).resolve().parent.parent
-    base_ref = "HEAD"
     args = argv if argv is not None else sys.argv[1:]
+    if "--cache-warm" in args:
+        return run_cache_warm(repo_root)
+    base_ref = "HEAD"
     for arg in args:
         if arg.startswith("--base="):
             base_ref = arg.split("=", 1)[1]

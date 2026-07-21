@@ -57,16 +57,23 @@
 # to any ref, via prefix matching — actions/cache then saves the post-run
 # .testmondata under the new exact-SHA key. testmon's own file-hash diffing
 # tolerates a "stale" cache restored from a different branch/commit; it just
-# means more files read as dirty (conservative), never fewer. This job's own
-# pytest step below stays UNCONDITIONALLY full-suite (SABLE-7v3z) — it uses
-# --testmon-noselect (record/update the map, deselect nothing) purely to keep
-# the cache warm for the actual impact-tier SELECTOR (bin/tier_selection.py,
-# .github/ci/pytest-impact-tier.sh), which is not wired into this gate: an
-# impact-scoped run here is only safe once the full-snapshot backstop
+# means more files read as dirty (conservative), never fewer.
+#
+# This job's own correctness-verifying pytest step below (the one gating the
+# merge) stays UNCONDITIONALLY full-suite (SABLE-7v3z) and plain — it does NOT
+# pass any testmon flag. Cache-warming (recording/updating .testmondata for
+# the impact-tier SELECTOR — bin/tier_selection.py, .github/ci/pytest-impact-
+# tier.sh, still not wired into this gate; see below) is a SEPARATE, later
+# step that re-runs the same full suite with --testmon-noselect. The two are
+# split deliberately (SABLE-cmar4.3 second revise) — see that step's own
+# comment for why: pytest-testmon 2.2.0 has a real, reproduced defect that
+# crashes on this repo's bin/ layout, and that crash must never take the gate
+# down when every actual test passed.
+#
+# An impact-scoped run here is only safe once the full-snapshot backstop
 # (SABLE-jd5fj.5) exists to catch what it under-selects. On a cache miss (no
 # .testmondata restored at all) --testmon-noselect is a no-op beyond writing a
-# fresh map from this full run — still the same conservative full run either
-# way.
+# fresh map from that run — still the same conservative full run either way.
 
 name: ci-verify
 
@@ -187,11 +194,33 @@ jobs:
           #     (SABLE-7dva): the pty-attached tmux client now registers
           #     headlessly (TERM set, own session, drained master fd) instead of
           #     never attaching on the CI clean-room.
-          # --testmon-noselect (SABLE-cmar4.3): records/updates .testmondata
-          # from this full run without deselecting anything — keeps the
-          # impact-tier's coverage map warm; see the cache-wiring comment
-          # above for why selection itself isn't enabled on this gate.
-          python -m pytest bin/ -q -p no:cacheprovider --testmon-noselect
+          python -m pytest bin/ -q -p no:cacheprovider
+
+      - name: Warm pytest-testmon coverage cache (SABLE-cmar4.3 second revise)
+        if: steps.dedup.outputs.already_verified != 'true'
+        run: |
+          # Re-runs the SAME full bin/ suite with --testmon-noselect
+          # (record/update .testmondata, deselect nothing) purely to keep the
+          # impact-tier's coverage map warm — see the cache-wiring comment
+          # above for why selection itself isn't enabled on this gate. Kept
+          # OUT of the correctness-verifying step above because pytest-testmon
+          # 2.2.0 has a real, reproduced defect: it crashes with INTERNALERROR
+          # (IndexError in its own SourceTree.get_file(), testmon_core.py:93
+          # `filename.rsplit(".", 1)[1]`) whenever it measures coverage on a
+          # file with no extension at all — true of ~23 of this repo's bin/
+          # python executables (shebang, no .py suffix) that several
+          # bin/test_*.py suites load in-process via
+          # importlib.machinery.SourceFileLoader. Confirmed by direct repro:
+          # testmon's own Coverage() instance hardcodes
+          # include=[repo_root + "/*"] with no ini/.coveragerc/pytest-cov
+          # config surface to narrow it, and 2.2.0 (latest) has no upstream
+          # fix. bin/tier_selection.py's classify_cache_warm_outcome()
+          # narrowly tolerates ONLY this exact signature with zero reported
+          # test failures — any other non-zero exit (a real failure, a
+          # different crash) still fails this step for real. A tolerated
+          # crash just leaves .testmondata stale for this run, same as any
+          # other cache miss.
+          bash .github/ci/testmon-cache-warm.sh
 
       - name: Fixture isolation tripwire (SABLE-0ssz.2 — ban unsandboxed real-repo git ops)
         if: steps.dedup.outputs.already_verified != 'true'

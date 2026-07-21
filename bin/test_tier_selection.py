@@ -177,5 +177,48 @@ def test_run_impact_tier_full_mode_invokes_pytest_with_full_argv(tmp_path, monke
     assert captured["cwd"] == tmp_path
 
 
+# --- classify_cache_warm_outcome (SABLE-cmar4.3 second revise) ---------------
+
+_TESTMON_CRASH_OUTPUT = (
+    "231 passed, 19 skipped in 20.41s\n"
+    "INTERNALERROR> Traceback (most recent call last):\n"
+    "INTERNALERROR>   File \".../testmon/testmon_core.py\", line 93, in get_file\n"
+    "INTERNALERROR>     ext=filename.rsplit(\".\", 1)[1],\n"
+    "INTERNALERROR>         ~~~~~~~~~~~~~~~~~~~~~~~^^^\n"
+    "INTERNALERROR> IndexError: list index out of range\n"
+)
+
+
+def test_classify_cache_warm_outcome_real_success_is_success():
+    assert ts.classify_cache_warm_outcome(0, "231 passed in 5.00s\n") is True
+
+
+def test_classify_cache_warm_outcome_tolerates_known_testmon_crash():
+    assert ts.classify_cache_warm_outcome(3, _TESTMON_CRASH_OUTPUT) is True
+
+
+def test_classify_cache_warm_outcome_rejects_crash_with_a_real_failure():
+    output = _TESTMON_CRASH_OUTPUT.replace("231 passed, 19 skipped", "1 failed, 230 passed, 19 skipped")
+    assert ts.classify_cache_warm_outcome(3, output) is False
+
+
+def test_classify_cache_warm_outcome_rejects_crash_with_a_real_error():
+    output = _TESTMON_CRASH_OUTPUT.replace("231 passed, 19 skipped", "1 error, 230 passed, 19 skipped")
+    assert ts.classify_cache_warm_outcome(3, output) is False
+
+
+def test_classify_cache_warm_outcome_rejects_unrelated_nonzero_exit():
+    # A genuinely different crash (no testmon rsplit signature at all) must
+    # never be masked -- only the exact known defect is tolerated.
+    assert ts.classify_cache_warm_outcome(2, "collected 0 items / usage error\n") is False
+
+
+def test_classify_cache_warm_outcome_rejects_partial_signature_match():
+    # Missing the IndexError line specifically -- must not pattern-match on
+    # testmon_core.py alone (too broad; could mask an unrelated testmon bug).
+    output = "231 passed in 5.00s\nINTERNALERROR> some other testmon_core.py failure\n"
+    assert ts.classify_cache_warm_outcome(1, output) is False
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

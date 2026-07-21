@@ -196,5 +196,26 @@ def test_missing_testmondata_falls_back_to_full_run_for_real_repo(fixture_repo):
     assert "2 passed" in result.stdout
 
 
+# --- cache-warm regression: real full bin/ suite, real testmon crash ---------
+# (SABLE-cmar4.3 second revise, mandated by chuck's CI root-cause on preview
+# 4a46439 / branch 2795ee2). This is deliberately NOT the synthetic
+# fixture_repo above: the defect is a property of THIS repo's actual bin/
+# layout (~23 extensionless python executables loaded in-process via
+# SourceFileLoader by real bin/test_*.py suites), which a fresh temp repo
+# cannot reproduce. Red today by construction before the cmar4.3 second
+# revise landed -- exit 3 with every test passing; run_cache_warm's
+# classify_cache_warm_outcome must turn that into exit 0.
+
+_THIS_FILE_RELATIVE = "bin/" + Path(__file__).name
+
+
+def test_real_repo_full_suite_testmon_noselect_crash_is_tolerated():
+    # --ignore=<this file> avoids the nested pytest run recursing into the
+    # test that is currently invoking it (this suite runs bin/ broadly).
+    repo_root = Path(__file__).resolve().parent.parent
+    rc = ts.run_cache_warm(repo_root, extra_pytest_args=[f"--ignore={_THIS_FILE_RELATIVE}"])
+    assert rc == 0
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
