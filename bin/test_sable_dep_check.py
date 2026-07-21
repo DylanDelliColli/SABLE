@@ -12,6 +12,7 @@ open blocker, non-blocking edge, merged branch, pruned branch, unresolvable
 ancestry.
 """
 import importlib.util
+import json
 import os
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -226,3 +227,126 @@ def test_exit_codes_are_distinct():
     assert sdc.EXIT_USAGE == 2
     assert sdc.EXIT_WARN == 3
     assert len({sdc.EXIT_CLEAN, sdc.EXIT_USAGE, sdc.EXIT_WARN}) == 3
+
+
+# --- COULD NOT ASSESS vs CLEAN (SABLE-d5iku, second revision) ----------------
+# A guard that goes quiet when its data source vanishes is a guard that fails
+# silent. In ci-verify 29867402197 bd was absent from the clean-room, this tool
+# raised out of subprocess.run, and --format json produced EMPTY STDOUT — so
+# every consumer parsing it died, and "could not assess" was indistinguishable
+# from "assessed, nothing wrong" (SABLE-2az2x's defect, SABLE-6sdpx's class).
+#
+# Every case below is paired with its healthy-path complement: the unknown
+# state must be loud, and the clean state must stay byte-for-byte silent, or
+# the fix has simply traded silence for noise on every dispatch.
+
+def _no_bd_env(monkeypatch, tmp_path):
+    """A PATH with no `bd` on it — the clean-room condition, reproduced rather
+    than simulated. Nothing here stubs the tool's own code."""
+    empty = tmp_path / "emptybin"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+
+
+def test_run_returns_127_instead_of_raising_when_the_binary_is_missing(tmp_path):
+    """The root cause. subprocess.run raises FileNotFoundError for a missing
+    executable; that traceback is what emptied stdout in CI."""
+    cp = sdc._run(["definitely-not-a-real-binary-xyz"], cwd=str(tmp_path))
+    assert cp.returncode == 127
+    assert cp.stdout == ""
+
+
+def test_run_still_reports_a_real_exit_code_when_the_binary_exists(tmp_path):
+    """Complement: hardening the missing-binary case must not swallow the
+    ordinary failed-call case."""
+    cp = sdc._run(["false"], cwd=str(tmp_path))
+    assert cp.returncode == 1
+
+
+def test_bd_unavailable_reason_names_a_missing_bd(monkeypatch, tmp_path):
+    _no_bd_env(monkeypatch, tmp_path)
+    assert "PATH" in sdc.bd_unavailable_reason(str(tmp_path))
+
+
+def test_bd_unavailable_reason_is_empty_when_bd_looks_usable(monkeypatch, tmp_path):
+    """Complement: a healthy environment must produce NO reason, or every run
+    reports itself unassessed."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "bd").write_text("#!/bin/sh\nexit 0\n")
+    (fake_bin / "bd").chmod(0o755)
+    (tmp_path / ".beads").mkdir()
+    monkeypatch.setenv("PATH", str(fake_bin))
+    assert sdc.bd_unavailable_reason(str(tmp_path)) == ""
+
+
+def test_check_beads_reports_unknown_not_clean_when_bd_is_absent(monkeypatch, tmp_path):
+    """THE REGRESSION. With bd gone the tool must not return a clean, empty
+    result — findings empty AND unknown empty is the sentence "I checked and
+    everything is fine", which would be a lie."""
+    _no_bd_env(monkeypatch, tmp_path)
+    findings, notes, unknown = sdc.check_beads(
+        str(tmp_path), str(tmp_path), "origin", "tmux-only", ["SABLE-x"])
+    assert findings == []
+    assert unknown, "bd absent must produce an explicit could-not-assess state"
+    assert "SABLE-x" in " ".join(unknown)
+
+
+def test_render_unknown_block_is_loud_and_says_it_is_not_clean():
+    block = sdc.render_unknown_block(["could not read dependencies for SABLE-x"])
+    assert "COULD NOT ASSESS" in block
+    assert "NOT a clean result" in block
+    assert "SABLE-x" in block
+
+
+def test_render_unknown_block_is_empty_when_nothing_is_unassessed():
+    """Complement: the healthy path stays silent. An advisory that speaks on
+    every dispatch is one that gets routed around."""
+    assert sdc.render_unknown_block([]) == ""
+
+
+def test_render_report_surfaces_unknown_even_with_no_findings():
+    """Notes alone stay silent (assessed and dismissed); unknown alone does
+    NOT (never assessed). That distinction is the whole fix."""
+    assert sdc.render_report([], ["a note"]) == ""
+    out = sdc.render_report([], [], ["could not read dependencies for SABLE-x"])
+    assert "COULD NOT ASSESS" in out
+
+
+def test_render_report_keeps_both_a_finding_and_an_unknown():
+    """A partial run that found something must report BOTH — the finding is
+    real, and the unassessed remainder is still unassessed."""
+    out = sdc.render_report([_finding()], [], ["SABLE-z: ancestry check failed"])
+    assert "UNMERGED-BLOCKER WARNING" in out
+    assert "COULD NOT ASSESS" in out
+    assert "SABLE-z" in out
+
+
+def test_main_emits_valid_json_with_assessed_false_when_bd_is_absent(
+        monkeypatch, tmp_path, capsys):
+    """End to end through main(), because the CI failure was a CONSUMER of the
+    json contract, not an internal state: `json.load` on empty stdout."""
+    _no_bd_env(monkeypatch, tmp_path)
+    rc = sdc.main(["--repo", str(tmp_path), "--bd-dir", str(tmp_path),
+                   "--format=json", "SABLE-x"])
+    payload = json.loads(capsys.readouterr().out)   # would raise on empty stdout
+    assert payload["assessed"] is False
+    assert payload["unknown"]
+    assert payload["findings"] == []
+    assert rc == sdc.EXIT_UNKNOWN
+
+
+def test_main_hook_format_is_non_empty_when_bd_is_absent(monkeypatch, tmp_path, capsys):
+    """The hook/dispatch surface decides purely on emptiness, so an unassessed
+    run has to break the silence there too — otherwise the dispatch path reads
+    "nothing wrong" from a check that never ran."""
+    _no_bd_env(monkeypatch, tmp_path)
+    sdc.main(["--repo", str(tmp_path), "--bd-dir", str(tmp_path),
+              "--format=hook", "SABLE-x"])
+    assert "COULD NOT ASSESS" in capsys.readouterr().out
+
+
+def test_exit_unknown_is_distinct_from_clean_and_warn():
+    assert sdc.EXIT_UNKNOWN == 4
+    assert len({sdc.EXIT_CLEAN, sdc.EXIT_USAGE, sdc.EXIT_WARN,
+                sdc.EXIT_UNKNOWN}) == 4

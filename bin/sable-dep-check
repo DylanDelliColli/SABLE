@@ -54,7 +54,21 @@ MERGE STATE, and why "branch absent" is SILENT:
      blocker — a false-block engine, the exact overcorrection the bead warns
      against ("both directions, or the check trades a false-go for a
      false-block").
-  unresolvable (no integration ref, git error)  -> a NOTE, never a warning.
+  unresolvable (no integration ref, git error)  -> COULD NOT ASSESS (below).
+
+COULD NOT ASSESS vs CLEAN — these are different answers and never share an
+output. Silence from this tool means "checked, nothing wrong"; a check that
+could not run (bd absent, bd call failed, ancestry unresolvable) says so
+explicitly in EVERY format: a named block in `text` and `hook`, `"assessed":
+false` plus a populated `"unknown"` list in `json`, and exit 4. It emits VALID
+output on every path — a missing bd once produced empty stdout and a traceback
+(ci-verify 29867402197), which broke every consumer parsing --format json and
+made "could not assess" indistinguishable from "assessed, nothing wrong"
+(SABLE-2az2x's defect, SABLE-6sdpx's class).
+
+The two axes are separate and both hold: FAIL-OPEN ON THE DECISION — a missing
+bd never blocks a dispatch, the dispatch-site caller treats this tool's output
+as advisory text only — and LOUD ON THE REPORT.
 
 STALENESS: ancestry is judged against LOCAL remote-tracking refs. A stale
 checkout can report a merged branch as unmerged. Pass --fetch to refresh
@@ -81,10 +95,14 @@ call, and its batched dep lookup is still ~0.13s per id, so `--ready` over a
 path names 1-3 beads and is timeout-bounded.
 
 EXIT CODES
-  0  no unmerged-blocker warnings (clean, or nothing resolvable)
+  0  CLEAN — the check ran and found no unmerged blocker.
   2  usage error
   3  at least one WARNING — a dependent released by a closed-but-unmerged
      blocker. Distinct from 1 so a crash is never read as a finding.
+  4  COULD NOT ASSESS — the check could not run to completion (no bd, bd call
+     failed, ancestry unresolvable) and found no warning while trying.
+     Distinct from 0 because "I found nothing" and "I could not look" are
+     different answers; 3 wins over 4 when both apply.
 """
 from __future__ import annotations
 
@@ -92,12 +110,14 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
 EXIT_CLEAN = 0
 EXIT_USAGE = 2
 EXIT_WARN = 3
+EXIT_UNKNOWN = 4
 
 # bd's dependency_type for a genuine blocking edge. `relates-to` (non-blocking
 # discoverability link) and `parent-child` (epic hierarchy) do NOT gate
@@ -230,13 +250,35 @@ def format_warning(dependent: str, blocker: str, branch: str,
             f"branch {branch} is NOT merged into {integration_branch}")
 
 
-def render_report(findings: list[dict], notes: list[str]) -> str:
-    """Human/hook text. EMPTY when there is nothing to warn about — notes alone
-    never produce output on this path, so an un-resolvable blocker (a closed
-    blocker with no branch anywhere, the common case for planning beads) stays
-    silent instead of nagging every dispatch."""
-    if not findings:
+def render_unknown_block(unknown: list[str]) -> str:
+    """The could-not-assess block. Its whole job is to be IMPOSSIBLE to read as
+    a clean result: silence means "checked, nothing wrong", so a checker that
+    could not run must say something. Empty string when there is nothing
+    unassessed, which keeps the healthy path byte-identical to before."""
+    if not unknown:
         return ""
+    lines = ["UNMERGED-BLOCKER CHECK COULD NOT ASSESS (SABLE-d5iku): this is NOT "
+             "a clean result — the check did not run to completion."]
+    lines.extend("  - " + u for u in unknown)
+    lines.append("")
+    lines.append("Merge state of the blocker(s) above is UNKNOWN, not verified. "
+                 "The dispatch is NOT blocked by this (the check is advisory), "
+                 "but verify containment by hand before dispatching anything "
+                 "sequenced behind another bead: "
+                 "git merge-base --is-ancestor <blocker-branch> <integration>.")
+    return "\n".join(lines)
+
+
+def render_report(findings: list[dict], notes: list[str],
+                  unknown: list[str] | None = None) -> str:
+    """Human/hook text. EMPTY only when there is nothing to warn about AND
+    nothing went unassessed — plain notes never produce output on this path, so
+    an un-resolvable blocker (a closed blocker with no branch anywhere, the
+    common case for planning beads) stays silent instead of nagging every
+    dispatch, while a check that COULD NOT RUN is always loud."""
+    unknown_block = render_unknown_block(unknown or [])
+    if not findings:
+        return unknown_block
     lines = ["UNMERGED-BLOCKER WARNING (SABLE-d5iku): a dependency released on "
              "CLOSE, but the blocker's code is NOT on the integration branch yet."]
     for f in findings:
@@ -252,13 +294,39 @@ def render_report(findings: list[dict], notes: list[str]) -> str:
         lines.append("")
         lines.append("Unresolved (reported, not warned):")
         lines.extend("  - " + n for n in notes)
+    if unknown_block:
+        lines.append("")
+        lines.append(unknown_block)
     return "\n".join(lines)
 
 
 # --- process boundary -------------------------------------------------------
 
 def _run(argv: list[str], cwd: str) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+    """Never raises. A MISSING executable is a normal condition here, not an
+    error: bd is deliberately absent from the ci-verify clean-room, and this
+    tool must degrade to a reported unknown rather than a traceback.
+
+    It did traceback once (ci-verify 29867402197): `bd` absent -> FileNotFoundError
+    out of subprocess.run -> EMPTY STDOUT, so every consumer parsing `--format
+    json` died on char 0. Exit 127 is the shell's own convention for
+    command-not-found, so callers that only look at the return code read it the
+    way they already read a failed call."""
+    try:
+        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+    except OSError as exc:
+        return subprocess.CompletedProcess(argv, 127, "", str(exc))
+
+
+def bd_unavailable_reason(bd_dir: str) -> str:
+    """Why a bd call could not be made, in the caller's words — or "" if bd
+    looks usable. Distinguishing "bd is not installed" from "bd ran and
+    failed" is the difference between a clean-room skip and a real fault."""
+    if shutil.which("bd") is None:
+        return "bd is not on PATH"
+    if not has_beads_db(bd_dir):
+        return f"no .beads database resolvable from {bd_dir}"
+    return ""
 
 
 def _git(repo: str, *args: str) -> subprocess.CompletedProcess:
@@ -371,31 +439,50 @@ def resolve_blocker_branch(repo: str, remote: str,
 
 
 def check_beads(repo: str, bd_dir: str, remote: str, integration_branch: str,
-                bead_ids: list[str]) -> tuple[list[dict], list[str]]:
-    """(findings, notes) for EVERY dependent bead, in exactly two bd calls:
-    one batched `bd dep list` for the edges, one batched `bd show` for the
-    blockers behind them. Per-bead calls are what made a whole-pool sweep
-    unusable, and an unusable sweep is a check nobody runs."""
+                bead_ids: list[str]) -> tuple[list[dict], list[str], list[str]]:
+    """(findings, notes, unknown) for EVERY dependent bead, in exactly two bd
+    calls: one batched `bd dep list` for the edges, one batched `bd show` for
+    the blockers behind them. Per-bead calls are what made a whole-pool sweep
+    unusable, and an unusable sweep is a check nobody runs.
+
+    THE THIRD RETURN VALUE IS THE POINT OF THE SECOND REVISION. `unknown` holds
+    could-not-assess conditions, and it is deliberately NOT merged into `notes`:
+    a note is something the check LOOKED AT and dismissed, an unknown is
+    something it could not look at at all. Collapsing them is the SABLE-2az2x /
+    SABLE-6sdpx defect — a report that reads healthy when the checker never
+    ran. `findings` empty therefore means "clean" ONLY when `unknown` is empty
+    too, and every renderer below has to say so."""
     findings: list[dict] = []
     notes: list[str] = []
+    unknown: list[str] = []
     if not bead_ids:
-        return findings, notes
+        return findings, notes, unknown
 
     deps = _bd_json(bd_dir, "dep", "list", *bead_ids)
     if deps is None:
-        return findings, [f"could not read dependencies for {', '.join(bead_ids)} "
-                          "(bd dep list failed)"]
+        reason = bd_unavailable_reason(bd_dir) or "bd dep list failed"
+        return findings, notes, [
+            f"could not read dependencies for {', '.join(bead_ids)} — {reason}"]
 
     edges = [e for e in normalize_dep_records(deps, bead_ids)
              if e["type"] == BLOCKING_DEP_TYPE and e["dependent"] in set(bead_ids)]
     if not edges:
-        return findings, notes
+        return findings, notes, unknown
 
     # One lookup for every blocker on every edge: status (is it released?),
     # metadata (its branch) and prose (its branch, the pre-metadata way).
     blocker_ids = sorted({e["blocker"] for e in edges})
     bead_by_id: dict[str, dict] = {}
     shown = _bd_json(bd_dir, "show", *blocker_ids)
+    if shown is None:
+        # Without statuses NO edge can be judged released, so every one of them
+        # would fall out of released_edges and the run would report CLEAN while
+        # having assessed nothing. That silent-healthy answer is the exact
+        # failure mode; say so instead.
+        reason = bd_unavailable_reason(bd_dir) or "bd show failed"
+        unknown.append(f"could not read blocker status for "
+                       f"{', '.join(blocker_ids)} — {reason}")
+        return findings, notes, unknown
     if isinstance(shown, list):
         for b in shown:
             if isinstance(b, dict) and b.get("id"):
@@ -423,8 +510,12 @@ def check_beads(repo: str, bd_dir: str, remote: str, integration_branch: str,
             continue
 
         if not base_ref:
-            notes.append(f"{bead_id}: blocker {blocker} branch {branch} — no ref "
-                         f"for integration branch {integration_branch}; ancestry unresolvable")
+            # An edge that COULD have been judged and was not — unknown, not a
+            # note. There is a real branch and a real closed blocker here; the
+            # only missing piece is the integration ref.
+            unknown.append(f"{bead_id}: blocker {blocker} branch {branch} — no ref "
+                           f"for integration branch {integration_branch}; ancestry "
+                           "unresolvable")
             continue
 
         verdict = ancestry_verdict(_git(repo, "merge-base", "--is-ancestor",
@@ -438,9 +529,9 @@ def check_beads(repo: str, bd_dir: str, remote: str, integration_branch: str,
                 "integration_branch": integration_branch,
             })
         elif verdict == "unresolved":
-            notes.append(f"{bead_id}: blocker {blocker} branch {branch} — "
-                         f"ancestry check against {base_ref} failed; treated as unknown")
-    return findings, notes
+            unknown.append(f"{bead_id}: blocker {blocker} branch {branch} — "
+                           f"ancestry check against {base_ref} failed")
+    return findings, notes, unknown
 
 
 def ready_bead_ids(bd_dir: str) -> list[str]:
@@ -492,23 +583,31 @@ def main(argv: list[str] | None = None) -> int:
 
     integration_branch = args.integration_branch or resolve_integration_branch(repo)
 
-    findings, notes = check_beads(repo, bd_dir, args.remote,
-                                  integration_branch, bead_ids)
+    findings, notes, unknown = check_beads(repo, bd_dir, args.remote,
+                                           integration_branch, bead_ids)
 
     fmt = "json" if args.json else args.format
     if fmt == "json":
+        # ALWAYS valid JSON, on every path including a missing bd. `assessed`
+        # is the explicit could-not-assess bit consumers need: findings==[] is
+        # not enough to conclude "clean", and a consumer that reads only
+        # `findings` must at least be able to find out it was lied to.
         print(json.dumps({
             "integration_branch": integration_branch,
             "checked": bead_ids,
+            "assessed": not unknown,
             "findings": findings,
             "notes": notes,
+            "unknown": unknown,
         }, indent=2))
     else:
-        report = render_report(findings, notes if fmt == "text" else [])
+        report = render_report(findings, notes if fmt == "text" else [], unknown)
         if report:
             print(report)
 
-    return EXIT_WARN if findings else EXIT_CLEAN
+    if findings:
+        return EXIT_WARN
+    return EXIT_UNKNOWN if unknown else EXIT_CLEAN
 
 
 if __name__ == "__main__":

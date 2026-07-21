@@ -92,6 +92,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -564,6 +565,86 @@ def preempt_check(lane: str, inbox: list[dict]) -> str | None:
             "blocking next dispatch:\n" + "\n".join(p0) +
             "\n\nResolve with bd close, or set aside with: bd update <id> --notes "
             "\"deferred: <reason>\" then bd defer <id>.")
+
+
+# --- unmerged-blocker advisory (SABLE-d5iku) ---------------------------------
+#
+# `bd ready` releases a dependent the instant its blocker's STATUS becomes
+# closed. What a BASE-PREMISE bead needs is the blocker's CODE present on the
+# branch it forks from, and those two events are separated by the whole merge
+# queue. Every `bd dep add` used for structural sequencing therefore carries a
+# false-release window in which the graph says go and the tree says not yet —
+# and the false release looks EXACTLY like a correct one.
+#
+# THIS IS THE CHECK SITE, and it is here for a reason that cost one review
+# cycle: the surfacing first landed in hooks/multi-manager/pre-dispatch-claim.sh,
+# which is registered PreToolUse with matcher `Agent`. Managers do not dispatch
+# workers with the Agent tool — they call THIS program, which is a bash
+# invocation, so the guard was structurally incapable of firing on the only
+# path it exists to guard (the bead's own live instance, SABLE-78kxu released
+# by a closed-but-unmerged SABLE-9boz4, was a sable-spawn-worker dispatch).
+# The hook leg is kept as a secondary surface for Agent-tool producer spawns;
+# this one is the primary. Do not move it back.
+#
+# ADVISORY AND FAIL-OPEN, never a deny. Merge state has genuine unresolvable
+# cases (pruned branches, stale remote-tracking refs, beads carrying no branch
+# at all), so a withhold would trade the false-go for a false-block — and the
+# ruled severity criterion makes DENY conditional on reliably discriminating
+# base-premise edges from ordinary deps, which nothing in the graph does today.
+# Option (b), merge-aware readiness at the source, lives in bd core.
+
+def resolve_dep_check_bin() -> str | None:
+    """Locate bin/sable-dep-check: explicit override, then PATH (the installed
+    spine bin), then this program's own sibling for a dev checkout whose bins
+    are not installed. Absent everywhere => None, and the advisory is skipped
+    silently — a missing tool must never cost a dispatch."""
+    override = os.environ.get("SABLE_DEP_CHECK_BIN", "")
+    if override:
+        return override if os.access(override, os.X_OK) else None
+    found = shutil.which("sable-dep-check")
+    if found:
+        return found
+    sibling = Path(__file__).resolve().parent / "sable-dep-check"
+    return str(sibling) if os.access(sibling, os.X_OK) else None
+
+
+def dep_merge_advisory(bead_ids: list[str], repo: str) -> str | None:
+    """Run the checker over the beads being dispatched and return its warning
+    text, or None when clean/unavailable/disabled.
+
+    `--format=hook` prints the block and NOTHING when clean, so emptiness is
+    the whole decision; the exit code (3 = findings) is deliberately not read —
+    the text is the signal, and that keeps a future exit-code change from
+    silently inverting this.
+
+    Every leg degrades to silence: no tool, no beads, a bd hiccup, a git error
+    or a timeout costs the WARNING, never the dispatch. Disable with
+    SABLE_DEP_MERGE_GUARD=0.
+
+    Timeout is larger than the hook leg's (which must fit a 5s PreToolUse
+    budget); here the only cost of waiting is dispatch latency, and the
+    checker's floor is two `bd` invocations at ~0.8s of process startup each
+    (SABLE-kqaj9). Tune with SABLE_DEP_CHECK_TIMEOUT."""
+    if os.environ.get("SABLE_DEP_MERGE_GUARD", "1") != "1":
+        return None
+    ids = [b for b in bead_ids if b]
+    if not ids:
+        return None
+    binary = resolve_dep_check_bin()
+    if not binary:
+        return None
+    try:
+        timeout = float(os.environ.get("SABLE_DEP_CHECK_TIMEOUT", "8"))
+    except ValueError:
+        timeout = 8.0
+    try:
+        proc = subprocess.run(
+            [binary, "--format=hook", "--repo", repo, *ids],
+            capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = (proc.stdout or "").strip()
+    return out or None
 
 
 # --- dispatch throttle + host-resource guard (SABLE-mmdt) ---------------------
@@ -1261,6 +1342,19 @@ def main(argv: list[str] | None = None) -> int:
         if err:
             sys.stderr.write(f"sable-spawn-worker: model-check blocked — {err}\n")
             return 3
+
+        # SABLE-d5iku: unmerged-blocker advisory. FIRST advisory in the chain,
+        # ahead of the duplicate/preempt/claim steps, so the manager sees the
+        # warning even when a later governance step refuses the dispatch — and
+        # so it is emitted before the first bd WRITE rather than after. Covers
+        # the lead bead and every --bundle sibling, since a bundle sibling can
+        # be the base-premise bead just as easily as the lead. Never blocks.
+        # Judged in the dispatch CWD (git reads work from any subdirectory, and
+        # unlike _repo_toplevel() it cannot raise) — merge state is a property
+        # of the repo being dispatched into, never of this program's location.
+        dep_warning = dep_merge_advisory([bid, *bundle_ids], os.getcwd())
+        if dep_warning:
+            sys.stderr.write(f"sable-spawn-worker: {dep_warning}\n")
 
         # SABLE-3eax (a): a respawn (REVISE / push-only close-out) may target a
         # CLOSED bead — reopen it to in_progress FIRST, or the `bd update --claim`
