@@ -22,8 +22,14 @@ fixing already-fixed bugs).
 You are working in {WORKING_DIR} on the {BRANCH} branch.
 
 Worktree: {WORKING_DIR}
-(Absolute path. The pre-dispatch-refresh hook rebases THIS checkout on the base
-branch before you start — SABLE-uz9.15. Keep this structured line intact.)
+(Absolute path. Historically the pre-dispatch-refresh hook rebased THIS
+checkout on the base branch before you start — SABLE-uz9.15 — but that hook
+has been retired (SABLE-o3xju de-wired it live; SABLE-mkj6k removed it
+durably from templates/multi-manager/settings-snippet.json). There is no
+automatic pre-dispatch rebase anymore — you rebase yourself, per "Verify
+current state first" below and the rebase step in your dispatch mode. Keep
+this structured line intact regardless — it's still how a manager/reader
+identifies which checkout you're in.)
 
 ## Worker model
 
@@ -433,8 +439,11 @@ without understanding what you're losing.
 5. **Populate Known acceptable failures.** Check `bd list --status=in_progress`
    and `bd list --label=coord` for the last hour. Anything that might trip
    this worker goes in the list with its tracking bead ID.
-6. **Send the dispatch.** Pre-dispatch hooks (refresh, claim, overlap,
-   preempt) fire automatically. The worker starts with a fresh rebase.
+6. **Send the dispatch.** Pre-dispatch hooks (claim, overlap, preempt,
+   model-check) fire automatically. There is no automatic pre-dispatch
+   rebase — `pre-dispatch-refresh.sh` was retired (SABLE-o3xju/SABLE-mkj6k).
+   The worker rebases itself per "Verify current state first" and the
+   rebase step in its dispatch mode.
 
 ---
 
