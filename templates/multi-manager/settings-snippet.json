@@ -52,6 +52,11 @@
           },
           {
             "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/stash-worktree-guard.sh",
+            "timeout": 3000
+          },
+          {
+            "type": "command",
             "command": "bash ~/.claude/hooks/multi-manager/read-guard.sh",
             "timeout": 3000
           },
