@@ -284,6 +284,10 @@ def _spy_reconcile(monkeypatch, *, dry_run, stranded_branch="wk-x"):
     monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)
     monkeypatch.setattr(smrh, "find_work_bead_status", lambda repo, branch: "closed")
     monkeypatch.setattr(smrh, "branch_tip_age_seconds", lambda *a, **k: 9999.0)
+    # Preview-kick leg (SABLE-jd5fj.2) is orthogonal to the stranded-handoff
+    # assertions this fixture drives — stub it so these pre-existing tests stay
+    # isolated from it. Its own behavior is covered by test_reconcile_preview.py.
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
 
     bd_calls = []
 
