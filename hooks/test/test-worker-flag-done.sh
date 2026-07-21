@@ -29,10 +29,20 @@ PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 
+# Hermeticity (SABLE-j3bi/SABLE-a9453): this suite previously forced
+# CLAUDE_AGENT_NAME="" only on its --reap call site (SABLE-dcw2), but that is
+# too late -- the manager/worker panes below are spawned BEFORE that call and
+# already inherited the launching shell's real identity by then. Scrub before
+# the FIRST pane-spawning call, and route every such call through the guarded
+# sable_tmux_spawn so a future spawn added here can't silently regress.
+source "$REPO/hooks/test/lib-identity-isolation.sh"
+sable_scrub_identity_env
+tmux_spawn() { sable_tmux_spawn -L "$SOCK" "$@"; }
+
 # --- fixture: a manager pane (holds operator focus) + a worker pane ---
-tmux -L "$SOCK" new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
+tmux_spawn new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
 sleep 0.3
-tmux -L "$SOCK" split-window -t w 'bash --noprofile --norc'
+tmux_spawn split-window -t w 'bash --noprofile --norc'
 sleep 0.3
 
 MANAGER_PANE="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"
