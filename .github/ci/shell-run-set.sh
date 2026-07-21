@@ -224,7 +224,7 @@ check() {
   manifest_scan
   local n_uncl="${#MANIFEST_UNCL_NAMES[@]}" n_stale="${#MANIFEST_STALE_NAMES[@]}"
   if [ "$n_uncl" -gt 0 ] || [ "$n_stale" -gt 0 ]; then
-    echo "::error::shell-run-set --check: $n_uncl unclassified, $n_stale stale run-set entr(y/ies) — classify in ALLOW or EXCLUDE (with reason) before merge (SABLE-lcevs)"
+    echo "::error::shell-run-set --check: $n_uncl unclassified, $n_stale stale run-set entr(y/ies) — classify in ALLOW or EXCLUDE (with reason) before merge — this will not clear on re-run: the classification is missing, not flaky (SABLE-lcevs)"
     return 1
   fi
   echo "shell-run-set --check: 0 unclassified, 0 stale — gate is fail-closed and clean"

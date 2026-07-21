@@ -140,6 +140,29 @@ else
   fail "(c) every suite classified (ALLOW or EXCLUDE-with-reason), no stale entries -> --check exits 0" "rc=$RC_C out=$OUT_C"
 fi
 
+# ---------------------------------------------------------------------------
+# Case (d) check_error_message_preempts_retry: the --check failure message
+# must state BOTH the remedy (ALLOW/EXCLUDE) AND that re-running will not
+# clear it (SABLE-capzx) — a fail-closed gate can be defeated socially by
+# retries if the message only says what to do and never what not to do.
+# Re-uses FIX_A (one UNCLASSIFIED suite, non-zero exit) from case (a) above.
+# ---------------------------------------------------------------------------
+if printf '%s' "$OUT_A" | grep -q 'classify in ALLOW or EXCLUDE' && \
+   printf '%s' "$OUT_A" | grep -q 'will not clear on re-run'; then
+  pass "(d) check_error_message_preempts_retry: --check failure message states the remedy AND that re-running will not clear it"
+else
+  fail "(d) check_error_message_preempts_retry: --check failure message states the remedy AND that re-running will not clear it" "out=$OUT_A"
+fi
+
+# The anti-retry clause must NOT bleed into the success path (FIX_C, case c
+# above) — a check that prints advice on healthy runs trains people to ignore
+# it, which is this bead's own failure mode arriving one layer up.
+if printf '%s' "$OUT_C" | grep -q 'will not clear on re-run'; then
+  fail "(d) check_error_message_preempts_retry: success path stays silent about retries" "out=$OUT_C"
+else
+  pass "(d) check_error_message_preempts_retry: success path stays silent about retries"
+fi
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
