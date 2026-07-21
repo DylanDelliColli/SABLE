@@ -66,7 +66,9 @@ is unit-testable without real git / gh / bd):
   SABLE_MG_REPO  repo path (default $PWD)                 SABLE_MG_GIT    (git)
   SABLE_MG_GH    gh command (gh)                          SABLE_MG_BD     (bd)
   SABLE_MG_NOTIFY notify command (sable-msg)              SABLE_MG_POLL   (20)
-  SABLE_MG_TIMEOUT Actions wait secs (1800)               SABLE_MG_GRACE  first-run grace secs (300)
+  SABLE_MG_TIMEOUT Actions wait secs (default: this repo's merge_preview
+                   tier budget from .github/ci/test-tiers.sh if present,
+                   else 1800 — SABLE-cmar4.1)                SABLE_MG_GRACE  first-run grace secs (300)
   SABLE_MG_SWEEP_HOURS orphan age hours (6)               SABLE_MG_GH_TIMEOUT per-gh-call secs (30, SABLE-7wyl)
 
 Exit codes:
@@ -185,6 +187,25 @@ def _git(repo: str, *args: str, check: bool = True) -> subprocess.CompletedProce
     return _run(_tool("SABLE_MG_GIT", "git") + list(args), cwd=repo, check=check)
 
 
+def default_mg_timeout(repo: str) -> float:
+    """SABLE-cmar4.1 consumption seam: when SABLE_MG_TIMEOUT is not set
+    explicitly, the merge_preview tier's duration budget from this repo's
+    .github/ci/test-tiers.sh SSOT (if it declares one) is the default Actions
+    wait — instead of a value hardcoded here that drifts from the SSOT.
+    Falls back to the pre-tier-SSOT default (1800) on any failure: no
+    test-tiers.sh, non-bash environment, or a bad/missing budget value. Never
+    raises — a missing/broken SSOT must not block the gate."""
+    tiers_sh = Path(repo) / ".github" / "ci" / "test-tiers.sh"
+    if not tiers_sh.is_file():
+        return 1800.0
+    try:
+        cp = _run(["bash", str(tiers_sh), "--budget", "merge_preview"],
+                   cwd=repo, check=False, timeout=10)
+        return float(cp.stdout.strip())
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return 1800.0
+
+
 def resolve_commit(repo: str, ref: str) -> str:
     """Resolve a fully-qualified ref (or raw SHA) to a commit SHA via
     `git rev-parse --verify <ref>^{commit}`. Raises on ambiguity/absence."""
@@ -227,7 +248,7 @@ def wait_for_ci(repo: str, ref_branch: str, preview_sha: str) -> tuple[str, str]
     import json
     gh = _tool("SABLE_MG_GH", "gh")
     poll = float(os.environ.get("SABLE_MG_POLL", "20"))
-    timeout = float(os.environ.get("SABLE_MG_TIMEOUT", "1800"))
+    timeout = float(os.environ.get("SABLE_MG_TIMEOUT") or default_mg_timeout(repo))
     grace = float(os.environ.get("SABLE_MG_GRACE", "300"))
     gh_timeout = float(os.environ.get("SABLE_MG_GH_TIMEOUT", "30"))
     waited = 0.0
