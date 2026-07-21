@@ -373,6 +373,90 @@ def test_U9_idempotency_our_own_filed_bead_suppresses(monkeypatch):
 
 
 # ===========================================================================
+# SABLE-vif5e: open_for_chuck_beads' query-failure fallback must go the
+# OPPOSITE direction from i5739's metadata-query fallback above. There, an
+# empty result would wrongly leave a branch un-strandable, so the safe
+# fallback is warn-and-continue. HERE, an empty corpus IS predicate 3's
+# suppression signal (reconcile() files a for-chuck bead only when nothing
+# already names the branch) — folding a bd failure into "empty" would file a
+# DUPLICATE into chuck's queue, which is not self-correcting the way skipping
+# one cadence is. Both directions covered, or the fix just moves the bug.
+# ===========================================================================
+
+def test_vif5e_nonzero_exit_returns_none_not_empty(monkeypatch, capsys):
+    # (1) a failed query (nonzero rc, empty stdout) must be distinguishable
+    # from a genuinely empty corpus — None, never [].
+    monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 1, ""))
+    assert smrh.open_for_chuck_beads("/repo") is None
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "1" in err, err
+
+
+def test_vif5e_rc0_empty_list_is_genuinely_empty(monkeypatch):
+    # (2) the genuine no-handoffs-yet case: rc 0, '[]' -> still resolves to an
+    # empty list (not None), so a real stranded branch still gets filed.
+    monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 0, "[]"))
+    assert smrh.open_for_chuck_beads("/repo") == []
+
+
+def test_vif5e_malformed_json_treated_as_failure_not_empty(monkeypatch, capsys):
+    # (3) rc 0 but unparseable JSON must ALSO be treated as failure, not
+    # empty — the same "can't determine" case as a nonzero exit.
+    monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 0, "not json"))
+    assert smrh.open_for_chuck_beads("/repo") is None
+    err = capsys.readouterr().err
+    assert "WARNING" in err, err
+
+
+def test_vif5e_branch_named_by_open_for_chuck_none_means_assume_named():
+    # predicate 3 fed the None sentinel: assume-named (conservative
+    # suppression), never assume-absent (which would file a duplicate).
+    assert smrh.branch_named_by_open_for_chuck(None, "wk-x") is True
+
+
+def test_vif5e_classify_branch_suppresses_filing_on_query_failure(monkeypatch):
+    # end-to-end at the classify_branch level: a branch that would otherwise
+    # classify STRANDED must NOT when the for-chuck corpus is unknown (None) —
+    # called directly (not via the `_classify` helper, whose `open_beads or
+    # []` idiom would silently coerce the None failure sentinel into empty).
+    _fake_git(monkeypatch, ancestor_rc=1, tip_ct=CT_OLD)
+    _fake_bd(monkeypatch, search_status="closed")
+    is_stranded, reason, _ = smrh.classify_branch(
+        "/repo", "origin", "wk-x", "trunk", None, 10.0, NOW)
+    assert is_stranded is False
+    assert reason == "handoff-already-on-record"
+
+
+def test_vif5e_reconcile_files_zero_when_for_chuck_query_fails(monkeypatch):
+    # the caller-level acceptance (4): reconcile() itself must issue NO bd
+    # create when open_for_chuck_beads' underlying query failed, even for a
+    # branch that is otherwise a true stranded positive.
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: ["wk-x"])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: None)
+    monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)
+    monkeypatch.setattr(smrh, "find_work_bead_status", lambda repo, branch: "closed")
+    monkeypatch.setattr(smrh, "branch_tip_age_seconds", lambda *a, **k: 9999.0)
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+
+    bd_calls = []
+
+    def fake_git(repo, *args, check=False):
+        return _cp(args, 0, "")
+
+    def fake_bd(repo, *args, check=False):
+        bd_calls.append(args)
+        return _cp(args, 0, "")
+
+    monkeypatch.setattr(smrh, "_git", fake_git)
+    monkeypatch.setattr(smrh, "_bd", fake_bd)
+    rc = smrh.reconcile("/repo", "origin", 10.0, dry_run=False)
+    assert rc == 0
+    assert not any(a and a[0] == "create" for a in bd_calls), \
+        "a for-chuck query failure must suppress filing, not file a duplicate"
+
+
+# ===========================================================================
 # reconcile() — orchestration, --dry-run files zero
 # ===========================================================================
 
