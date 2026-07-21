@@ -92,6 +92,7 @@ ALLOW=(
   test-session-role-anchor.sh
   test-shell-run-set-strict.sh
   test-sherlock-research.sh
+  test-spine-pinning.sh
   test-staged-planning-docs.sh
   test-stash-worktree-guard.sh
   test-tdd-evidence.sh
