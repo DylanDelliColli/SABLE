@@ -471,6 +471,109 @@ except Exception:
 
     bd close "$SCRATCH_ID2" --sandbox 2>/dev/null || true
   fi
+
+  # -------------------------------------------------------------------------
+  # SABLE-6la1 — wip_claims metadata SURVIVES a later --notes clobber
+  # -------------------------------------------------------------------------
+  # This is the acceptance criterion SABLE-szd's own description named but
+  # never got a test for: "a test writes WIP-CLAIMS then updates notes and
+  # asserts claims persist." Real bd, no mocks — this is the exact failure
+  # mode that motivated the metadata migration (SABLE-szd) and recurred live
+  # as a near-miss on SABLE-cmar4.1 (SABLE-sm269).
+  SCRATCH_ID3=$(bd create --sandbox \
+    --title="[int-test] pre-dispatch-claim notes-clobber regression" \
+    --description="[no-test] hooks/foo.sh is the implementation file for this scratch bead" \
+    --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+
+  if [ -z "$SCRATCH_ID3" ]; then
+    echo "SKIP (integration): could not create notes-clobber scratch bead"
+  else
+    echo "Integration: created notes-clobber scratch bead $SCRATCH_ID3"
+
+    # Establish the claim exactly as the hook does (real --set-metadata write).
+    bd update "$SCRATCH_ID3" --sandbox --set-metadata "wip_claims=a.sh,b.sh" >/dev/null 2>&1
+
+    # Simulate the exact SABLE-szd/sm269 trigger: an unrelated notes write from
+    # elsewhere in a bead's life (e.g. a manager's routine review-step note).
+    bd update "$SCRATCH_ID3" --sandbox --notes "manager review note" >/dev/null 2>&1
+
+    CLAIMS3=$(bd show "$SCRATCH_ID3" --json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    if isinstance(d, list) and d:
+        print((d[0].get('metadata', {}) or {}).get('wip_claims', '') or '')
+except Exception:
+    pass
+" 2>/dev/null || echo "")
+
+    if [ "$CLAIMS3" = "a.sh,b.sh" ]; then
+      pass "SABLE-6la1: wip_claims metadata survives an unrelated bd update --notes write (real bd)"
+    else
+      fail "SABLE-6la1: wip_claims metadata survives an unrelated bd update --notes write (real bd)" \
+           "expected 'a.sh,b.sh', got: '$CLAIMS3'"
+    fi
+
+    # Positive control: the notes write really did replace notes — otherwise a
+    # pass above would be vacuous (bd never being destructive to notes at all,
+    # rather than the metadata field specifically being immune to it).
+    NOTES3=$(bd show "$SCRATCH_ID3" --json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    if isinstance(d, list) and d:
+        print(d[0].get('notes', '') or '')
+except Exception:
+    pass
+" 2>/dev/null || echo "")
+
+    if [ "$NOTES3" = "manager review note" ]; then
+      pass "SABLE-6la1: positive control — the notes write actually replaced notes (not a vacuous pass)"
+    else
+      fail "SABLE-6la1: positive control — the notes write actually replaced notes (not a vacuous pass)" \
+           "notes: '$NOTES3'"
+    fi
+
+    bd close "$SCRATCH_ID3" --sandbox 2>/dev/null || true
+  fi
+
+  # --- SABLE-6la1: sibling-key --set-metadata merges, doesn't clobber ---------
+  # The whole design relies on --set-metadata writing one key at a time without
+  # disturbing siblings: proves setting a second, unrelated key leaves an
+  # already-established wip_claims intact.
+  SCRATCH_ID4=$(bd create --sandbox \
+    --title="[int-test] pre-dispatch-claim sibling-key metadata merge" \
+    --description="[no-test] hooks/foo.sh is the implementation file for this scratch bead" \
+    --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+
+  if [ -z "$SCRATCH_ID4" ]; then
+    echo "SKIP (integration): could not create sibling-key scratch bead"
+  else
+    echo "Integration: created sibling-key scratch bead $SCRATCH_ID4"
+
+    bd update "$SCRATCH_ID4" --sandbox --set-metadata "wip_claims=x.sh" >/dev/null 2>&1
+    bd update "$SCRATCH_ID4" --sandbox --set-metadata "otherkey=y" >/dev/null 2>&1
+
+    META4=$(bd show "$SCRATCH_ID4" --json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    if isinstance(d, list) and d:
+        m = d[0].get('metadata', {}) or {}
+        print(m.get('wip_claims', ''), '|', m.get('otherkey', ''))
+except Exception:
+    pass
+" 2>/dev/null || echo "")
+
+    if [ "$META4" = "x.sh | y" ]; then
+      pass "SABLE-6la1: --set-metadata on a sibling key merges (wip_claims survives, otherkey lands)"
+    else
+      fail "SABLE-6la1: --set-metadata on a sibling key merges (wip_claims survives, otherkey lands)" \
+           "expected 'x.sh | y', got: '$META4'"
+    fi
+
+    bd close "$SCRATCH_ID4" --sandbox 2>/dev/null || true
+  fi
 fi
 
 # ---------------------------------------------------------------------------
