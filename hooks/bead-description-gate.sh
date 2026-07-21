@@ -76,6 +76,16 @@ m = (
 print(m.group(1) if m else '')
 " 2>/dev/null || echo "")
 
+# origin: intake-attribution soft-nudge (SABLE-8b41.7). WARN only — never
+# deny, in ANY mode (including manager/block) — architecture decision:
+# preserves the instant `bd q` quick-capture flow the Prime Directive
+# depends on. Checked independently of MISSING_LIST/append_missing() so it
+# can never join the block-mode deny path below.
+ORIGIN_PRESENT=0
+if echo ",$LABELS," | grep -qE ',origin:[^,]+,'; then
+  ORIGIN_PRESENT=1
+fi
+
 SHERLOCK_FINDING=0
 if echo ",$LABELS," | grep -q ',sherlock-finding,'; then
   SHERLOCK_FINDING=1
@@ -217,6 +227,23 @@ append_missing() {
   fi
 }
 
+# get_origin_labels_hint — reads the origin: taxonomy from the single source
+# (bin/sable_telemetry_lib.py's ORIGIN_LABELS, via sable-telemetry
+# --print-origin-labels) so the nudge text never hardcodes a second copy
+# (Shotgun Surgery risk, architecture.json). Same repo-then-PATH resolution
+# as the --print-origin-labels bypass above. Never fails the hook: any
+# missing/broken CLI just yields an empty hint under set -e.
+get_origin_labels_hint() {
+  local repo_bin hint
+  repo_bin="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)/bin/sable-telemetry"
+  if [ -x "$repo_bin" ]; then
+    hint=$("$repo_bin" --print-origin-labels 2>/dev/null | tr '\n' ',' | sed 's/,$//') || hint=""
+  else
+    hint=$(sable-telemetry --print-origin-labels 2>/dev/null | tr '\n' ',' | sed 's/,$//') || hint=""
+  fi
+  echo "$hint"
+}
+
 # Sherlock-finding additional checks (only if labeled)
 if [ "$SHERLOCK_FINDING" = "1" ]; then
   echo "$DESC" | grep -qE '^## Rationale' \
@@ -286,8 +313,24 @@ if ! echo "$DESC" | grep -qiE '(\.(ts|tsx|py|js|jsx|sh|go|rs|rb|md|json|yaml|yml
   append_missing "file paths (exact files to create/modify)"
 fi
 
-# Pass — no missing sections
-[ -z "$MISSING_LIST" ] && exit 0
+# Pass on the standard/label checks — still apply the origin: soft nudge.
+# This fires in EVERY mode, including manager/block, because origin is a
+# warn-only concern (never a deny reason): a bead with everything else in
+# order but no origin: label must still be created without friction.
+if [ -z "$MISSING_LIST" ]; then
+  if [ "$ORIGIN_PRESENT" = "0" ]; then
+    ORIGIN_HINT="$(get_origin_labels_hint)"
+    ORIGIN_HINT="$ORIGIN_HINT" python3 -c "
+import json, os
+hint = os.environ.get('ORIGIN_HINT', '')
+values = f' Valid values: {hint}.' if hint else ''
+print(json.dumps({
+    'additionalContext': 'SABLE bead quality: no origin: label found (e.g. origin:planned).' + values + ' Soft nudge only — creation is never blocked; add one when convenient to improve intake-attribution telemetry.'
+}))
+"
+  fi
+  exit 0
+fi
 
 # Emit verdict based on mode
 if [ "$MODE" = "block" ]; then
