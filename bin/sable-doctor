@@ -60,20 +60,56 @@ REFRESH_CMD = "bash install.sh"
 # current pin set in DEST/.sable-pinned — see _read_pin_marker() below.
 PINNED_BIN_NAMES = ("sable-merge-gate", "sable-reconcile-handoffs", "sable-dolt-push")
 
-_SIBLING_IMPORT_RE = re.compile(r"^(?:from|import)\s+(sable_[a-zA-Z0-9_]+)", re.MULTILINE)
+def _bin_install_script(repo: Path) -> Path:
+    """Path to THIS repo's own sable-bin-install — the tool that CREATES pin
+    shapes (plain vs snapshot) and is therefore the one authoritative place
+    that decides them (SABLE-rucuh)."""
+    return repo / "bin" / "sable-bin-install"
+
+
+def classify_bin_shape(repo: Path, name: str):
+    """"snapshot" or "plain" per sable-bin-install's OWN --classify, or None
+    if the shape can't be determined (the script is missing, or the process
+    errors) — never treat None as "plain".
+
+    Doctor used to re-implement this detection independently (a hand-rolled
+    regex mirror of sable-bin-install's is_python_importing()). Two
+    independent implementations of the same classification is exactly how
+    they drifted apart and disagreed about the SAME file's pin shape
+    (SABLE-rucuh: bin-install said "snapshot", doctor said "unpinned", and
+    doctor then printed a plain-cp remedy that severs the snapshot's sibling
+    imports). Shelling out to the real classifier makes that disagreement
+    structurally impossible instead of merely unlikely — there is only ever
+    one place this decision is made. A caller that treated an undetermined
+    result as "plain" would silently reintroduce the same hazard for a bin
+    whose shape merely couldn't be confirmed."""
+    script = _bin_install_script(repo)
+    if not script.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            ["bash", str(script), "--classify", name],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    shape = proc.stdout.strip()
+    return shape if shape in ("snapshot", "plain") else None
 
 
 def python_sibling_importing_bins(repo: Path):
-    """Every bin/sable-* python script that imports a sibling module
-    physically present in bin/ — e.g. sable-spawn-worker/sable-msg importing
-    sable_pane_lib.py (SABLE-9boz4). A plain regular-file pin (PINNED_BIN_NAMES
-    style) severs that import; these need --pin-snapshot instead.
+    """Every bin/sable-* entrypoint that sable-bin-install's own classifier
+    calls "snapshot" (has repo-local python imports, SABLE-9boz4) — i.e.
+    needs --pin-snapshot rather than a plain regular-file copy.
 
-    Mirrors bin/sable-bin-install's is_python_importing() classifier exactly,
-    and is computed dynamically (not a fixed name tuple) for the same reason
-    --pin-snapshot auto-detects rather than hardcoding: a bin gaining, losing,
-    or being renamed with a sibling import must not silently drop out of
-    doctor's coverage the way an enumerated list would."""
+    Delegates to classify_bin_shape (bin-install is authoritative) instead of
+    re-deriving the detection here, and is computed dynamically (not a fixed
+    name tuple) for the same reason --pin-snapshot auto-detects rather than
+    hardcoding: a bin gaining, losing, or being renamed with a sibling import
+    must not silently drop out of doctor's coverage the way an enumerated
+    list would."""
     bin_dir = repo / "bin"
     names = []
     if not bin_dir.is_dir():
@@ -81,21 +117,8 @@ def python_sibling_importing_bins(repo: Path):
     for f in sorted(bin_dir.glob("sable-*")):
         if not f.is_file() or f.suffix in (".py", ".bak") or f.name.endswith("~"):
             continue
-        try:
-            with f.open(errors="replace") as fh:
-                first_line = fh.readline()
-        except OSError:
-            continue
-        if "python" not in first_line:
-            continue
-        try:
-            text = f.read_text(errors="replace")
-        except OSError:
-            continue
-        for m in _SIBLING_IMPORT_RE.finditer(text):
-            if (bin_dir / f"{m.group(1)}.py").is_file():
-                names.append(f.name)
-                break
+        if classify_bin_shape(repo, f.name) == "snapshot":
+            names.append(f.name)
     return names
 
 
@@ -406,8 +429,20 @@ def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
         bin_dir = Path(bin_dir)
         for name in PINNED_BIN_NAMES:
             src = repo / "bin" / name
-            if src.is_file():
-                entries.append(("pinned bins", src, bin_dir / name))
+            if not src.is_file():
+                continue
+            # A PINNED_BIN_NAMES entry that has ALSO become snapshot-shaped
+            # (repo-local python imports, e.g. sable-merge-gate after
+            # SABLE-jd5fj.3's module split) must be checked ONLY via the
+            # "pinned snapshot bins" path below, never both — checking it
+            # here too is exactly how SABLE-rucuh happened: this category's
+            # legacy marker-based check has no concept of "symlink into a
+            # snapshot dir is still a pin," so it called a correctly
+            # snapshot-pinned bin "unpinned" and recommended a destructive
+            # plain cp. One name, one classification, one category.
+            if classify_bin_shape(repo, name) == "snapshot":
+                continue
+            entries.append(("pinned bins", src, bin_dir / name))
 
         for name in python_sibling_importing_bins(repo):
             src = repo / "bin" / name
@@ -550,15 +585,43 @@ def _guarded_remedy_lines(guarded_bad):
     GUARDED_CATEGORIES entry. Deliberately never spells out REFRESH_CMD (see
     the comment on GUARDED_CATEGORIES for why) — not even in a negated
     sentence ("don't run X"), since the acceptance criterion is that the
-    ordinary refresh command must not appear in this output at all."""
+    ordinary refresh command must not appear in this output at all.
+
+    Defense in depth for SABLE-rucuh: build_manifest already routes a
+    snapshot-shaped PINNED_BIN_NAMES entry to the "pinned snapshot bins"
+    category instead of this one, so in the ordinary case every entry here
+    is genuinely plain-shaped. This still re-checks each entry's shape before
+    printing anything rather than assuming that routing always held — a
+    wrong remedy carries the tool's authority, so an entry whose shape can't
+    be confirmed here gets NO remedy at all instead of a guessed plain cp
+    that could sever a snapshot's sibling imports."""
     lines = [
         "Do not use the ordinary installer refresh for the pinned bin(s) above —",
         "until the install.sh pin-preservation fix (SABLE-mkj6k) is confirmed live",
         "on this machine, the ordinary installer can silently re-symlink a",
-        "deliberately pinned bin. Refresh by hand instead:",
+        "deliberately pinned bin.",
     ]
     for r in guarded_bad:
-        lines.append(f"  cp {r['repo_path']} {r['installed_path']} && chmod +x {r['installed_path']}")
+        name = Path(r["installed_path"]).name
+        repo_root = Path(r["repo_path"]).resolve().parent.parent
+        shape = classify_bin_shape(repo_root, name)
+        if shape == "plain":
+            lines.append("  Refresh by hand instead:")
+            lines.append(f"    cp {r['repo_path']} {r['installed_path']} && chmod +x {r['installed_path']}")
+        elif shape == "snapshot":
+            lines.append(
+                f"  {r['installed_path']} is snapshot-shaped (repo-local python imports) —"
+            )
+            lines.append("  a plain cp would sever its sibling imports. Re-pin instead:")
+            lines.append(f"    sable-bin-install --pin-snapshot {name}")
+        else:
+            lines.append(
+                f"  {r['installed_path']}: pin shape could not be determined — printing no"
+            )
+            lines.append(
+                "  remedy (a wrong guess here would carry the tool's authority). Investigate"
+            )
+            lines.append(f"  by hand: sable-bin-install --classify {name}")
     return lines
 
 
