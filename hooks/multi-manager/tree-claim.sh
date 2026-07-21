@@ -25,6 +25,14 @@
 #      walk tracks that (SABLE-5pci) so `cd <worktree> && git add` and
 #      `git -C <worktree> add` resolve to the SAME claim file instead of the
 #      cd-form silently falling back to the hook's original cwd.
+#      The claim gates the command's ACTUAL TARGET repo, never the ambient
+#      session cwd (SABLE-vx4aj). Command boundaries are recognised at ';',
+#      '&&', '||', '|', '&', newline, subshell parens and brace groups, so a
+#      multi-line or grouped command cannot hide either the `cd` prefix (which
+#      would gate an unrelated repo) or the git write itself (which would
+#      evade the claim outright). Where the target cannot be resolved from the
+#      command text — `cd "$VAR"`, `cd -`, `popd`, unparseable quoting — the
+#      command is gated against the session cwd rather than allowed through.
 #
 #   3. Claim lifecycle (TTL default: 3600s, override SABLE_TREE_CLAIM_TTL):
 #        No claim      → write this session's claim, allow.
@@ -161,26 +169,51 @@ print(json.dumps({
 # sable__is_index_mutating_git_command <command> <cwd>
 #
 # Tokenises the command with Python shlex (handles quoting).  Walks ALL
-# command positions (start of string, and after shell separators ; && || |)
-# transparently through NAME=VALUE environment-assignment prefixes and env(1)
-# invocations — aligning with the sable_is_git_push walk in lib-identity.sh.
+# command positions (start of string, and after shell separators ; && || |
+# & newline ( ) { }) transparently through NAME=VALUE environment-assignment
+# prefixes and env(1) invocations — aligning with the sable_is_git_push walk
+# in lib-identity.sh.
 #
 # If ANY command-position segment resolves to an index-mutating git invocation,
-# the function prints the effective repo directory to stdout and returns 0.
+# the function prints TWO lines to stdout and returns 0:
+#     line 1: the effective repo directory
+#     line 2: 'ok' if that directory was resolved confidently, 'ambiguous'
+#             if it is a fail-safe fallback to the session cwd
 # When multiple segments match, the FIRST mutating segment's -C path wins
 # (multi-segment chained mutating git commands are rare; using the first keeps
 # the scope conservative).
 #
-# Returns 0 (match, effective-dir printed to stdout) or 1 (no match).
+# Returns 0 (match) or 1 (no match).
 #
 # Index-mutating subcommands: add, commit, rm, mv, restore (only when
 # --staged/-S is also present), reset (any form).
 #
 # Effective repo directory:
-#   - No -C flags on the matching segment → CWD (passed as argv[2]).
-#   - One or more -C flags → accumulated left-to-right, resolved against CWD
-#     (relative -C args are joined to the accumulated base; absolute args
-#     replace it), matching git's own -C behaviour.
+#   - No -C flags on the matching segment → the shell cwd in effect at that
+#     point in the command line (session cwd, shifted by any preceding cd).
+#   - One or more -C flags → accumulated left-to-right, resolved against that
+#     directory (relative -C args are joined to the accumulated base; absolute
+#     args replace it), matching git's own -C behaviour.
+#
+# SABLE-vx4aj — attribution must follow the command's ACTUAL TARGET, never the
+# ambient session cwd. Two rules make that hold:
+#
+#   (a) EVERY shell construct that starts a new command must reset the walk to
+#       command position. Previously only ';', '&&', '||' and '|' did. A
+#       newline, a background '&', a subshell '( ... )' or a brace group
+#       '{ ...; }' left the walk stuck mid-segment, which broke BOTH ways: the
+#       preceding 'cd <elsewhere>' went unseen (so the write was gated by the
+#       session cwd's claim — the observed false positive, an unrelated
+#       throwaway repo refused because the SABLE checkout was claimed), and a
+#       later 'git commit' went unseen entirely (so a write TARGETING the
+#       claimed repo evaded the claim — the false-negative wrong-tree class of
+#       SABLE-041/936y/nsmc). A two-line Bash command was enough to trigger it.
+#
+#   (b) When the target CANNOT be resolved confidently — an unexpandable
+#       'cd \"\$VAR\"', a 'cd -', a command shlex cannot parse — gate against the
+#       session cwd rather than allow. A false positive is recoverable (the
+#       deny names the override and release hatches); a missed claim is the
+#       incident class.
 # ---------------------------------------------------------------------------
 sable__is_index_mutating_git_command() {
   local cmd="$1"
@@ -191,9 +224,63 @@ import os, re, shlex, sys
 cmd = os.environ.get('CMD_STR', '')
 cwd = os.environ.get('CWD_VAL', '')
 
+# --- Quote-aware operator normalisation (SABLE-vx4aj) ---------------------
+# shlex.split() discards newlines as plain whitespace and never separates
+# '&', '(', ')', '{', '}' from their neighbours, so those command boundaries
+# were invisible to the walk below. Rewrite them — OUTSIDE quotes only — into
+# spaced separators before tokenising. Quoted text is left byte-for-byte
+# intact so 'echo \"cd /x && git commit\"' is still one argument, not a
+# command. A backslash-newline line continuation is preserved as whitespace
+# (the backslash branch consumes the newline verbatim), which is correct:
+# it does not start a new command.
+def normalize_operators(s):
+    out = []
+    i, n = 0, len(s)
+    quote = None
+    while i < n:
+        ch = s[i]
+        if quote == chr(39):            # inside single quotes: literal
+            out.append(ch)
+            if ch == chr(39):
+                quote = None
+            i += 1
+            continue
+        if quote == chr(34):            # inside double quotes: honour \\x
+            if ch == chr(92) and i + 1 < n:
+                out.append(ch); out.append(s[i + 1]); i += 2; continue
+            out.append(ch)
+            if ch == chr(34):
+                quote = None
+            i += 1
+            continue
+        if ch == chr(92) and i + 1 < n:  # unquoted escape (incl. \\<newline>)
+            out.append(ch); out.append(s[i + 1]); i += 2; continue
+        if ch in (chr(34), chr(39)):
+            quote = ch; out.append(ch); i += 1; continue
+        if ch in '&|':
+            if i + 1 < n and s[i + 1] == ch:      # '&&' / '||'
+                out.append(' ' + ch + ch + ' '); i += 2; continue
+            if ch == '|':
+                out.append(' | '); i += 1; continue
+            out.append(' ; '); i += 1; continue   # background '&'
+        if ch in ';\n(){}':
+            out.append(' ; '); i += 1; continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+# Coarse fallback detector for commands shlex cannot tokenise (unbalanced
+# quoting). Rather than fail open on a command that plainly contains an
+# index-mutating git invocation, gate it against the session cwd.
+UNPARSEABLE_RE = re.compile(r'(^|[;&|(){}\n])\s*(\w+=\S*\s+)*git\b[^;&|(){}\n]*\b(add|commit|rm|mv|reset)\b')
+
 try:
-    tokens = shlex.split(cmd)
+    tokens = shlex.split(normalize_operators(cmd))
 except ValueError:
+    if UNPARSEABLE_RE.search(cmd):
+        print(cwd)
+        print('ambiguous')
+        sys.exit(0)
     sys.exit(1)
 
 SHELL_SEPS = {';', '&&', '||', '|'}
@@ -226,6 +313,15 @@ def resolve_effective_dir(c_paths, base_cwd):
 # (SABLE-5pci: without this, 'cd <wt> && git add' fell back to the hook's
 # original cwd instead of <wt>, landing in the wrong repo's claim file).
 shell_cwd = cwd
+# SABLE-vx4aj: set when a cd target could not be resolved to a real path
+# (variable/command substitution, glob, 'cd -', popd). shell_cwd then stays
+# at the session cwd and the decision is reported as a fail-safe fallback.
+target_ambiguous = False
+
+# A cd target we cannot expand here: anything carrying shell expansion or a
+# glob. Left unexpanded these would be joined literally onto shell_cwd and
+# resolve to nothing, which fails OPEN — the wrong direction.
+UNRESOLVABLE_RE = re.compile(r'[\$\`\*\?\[]|^~')
 
 i = 0
 n = len(tokens)
@@ -256,7 +352,17 @@ while i < n:
         continue  # re-evaluate tokens[i] still at command position
     # At command position: 'cd' — shifts shell_cwd for subsequent segments
     # in this same command line.
-    if at_cmd_pos and tok == 'cd':
+    # At command position: 'popd' — destination is unknowable from the text
+    # alone; fall back to the session cwd (fail safe, SABLE-vx4aj).
+    if at_cmd_pos and tok == 'popd':
+        shell_cwd = cwd
+        target_ambiguous = True
+        i += 1
+        while i < n and tokens[i] not in SHELL_SEPS:
+            i += 1
+        at_cmd_pos = False
+        continue
+    if at_cmd_pos and tok in ('cd', 'pushd'):
         i += 1
         # Skip cd's own flags (-L, -P, ...) but not a lone '-' (previous dir).
         while i < n and tokens[i] not in SHELL_SEPS and tokens[i].startswith('-') and tokens[i] != '-':
@@ -267,8 +373,12 @@ while i < n:
             i += 1
         if target is None:
             shell_cwd = os.environ.get('HOME', shell_cwd)
-        elif target == '-':
-            pass  # previous dir is unknowable here; leave shell_cwd as-is
+        elif target == '-' or UNRESOLVABLE_RE.search(target):
+            # Previous dir / an unexpanded variable, glob or substitution.
+            # SABLE-vx4aj: gate against the session cwd rather than let the
+            # write resolve to a path that does not exist and fail open.
+            shell_cwd = cwd
+            target_ambiguous = True
         elif os.path.isabs(target):
             shell_cwd = target
         else:
@@ -315,7 +425,14 @@ while i < n:
                         break
             if is_mutating:
                 eff = resolve_effective_dir(c_paths, shell_cwd)
+                ambiguous = target_ambiguous and not any(
+                    os.path.isabs(p) for p in c_paths)
+                if any(UNRESOLVABLE_RE.search(p) for p in c_paths):
+                    # An unexpandable -C target: same fail-safe rule as cd.
+                    eff = cwd
+                    ambiguous = True
                 print(eff)
+                print('ambiguous' if ambiguous else 'ok')
                 sys.exit(0)
             # Not mutating — this segment is done, continue outer loop
             i += 1
@@ -339,9 +456,20 @@ sys.exit(1)
 # Step 1: Check if this command is index-mutating; capture effective repo dir
 # ---------------------------------------------------------------------------
 [ -z "$COMMAND" ] && exit 0
-EFFECTIVE_DIR=$(sable__is_index_mutating_git_command "$COMMAND" "$CWD") || exit 0
+DETECTION=$(sable__is_index_mutating_git_command "$COMMAND" "$CWD") || exit 0
+EFFECTIVE_DIR=$(printf '%s\n' "$DETECTION" | sed -n '1p')
+TARGET_RESOLUTION=$(printf '%s\n' "$DETECTION" | sed -n '2p')
 # Normalise: if EFFECTIVE_DIR came back empty for any reason, fall back to CWD
 [ -z "$EFFECTIVE_DIR" ] && EFFECTIVE_DIR="$CWD"
+
+# SABLE-vx4aj: an unresolvable target was gated against the session cwd
+# instead of being allowed through. Say so in the deny reason — otherwise the
+# blocked party sees a claim on a repo their command never names and has no
+# way to tell why.
+AMBIGUITY_NOTE=""
+if [ "$TARGET_RESOLUTION" = "ambiguous" ]; then
+  AMBIGUITY_NOTE=" NOTE: the command's target repo could not be resolved from its text (an unexpanded variable, glob, 'cd -' or 'popd'), so it was gated against this session's cwd ($CWD) rather than allowed through unchecked. Re-run with a literal path to be gated against the repo you actually mean."
+fi
 
 # ---------------------------------------------------------------------------
 # Step 2: Resolve the claim file (per-checkout via git-dir)
@@ -438,7 +566,7 @@ CLAIM_AGENT=$(awk '{print $3}' "$CLAIM_FILE" 2>/dev/null) || CLAIM_AGENT=""
 
 if [ "$CLAIM_AGE" -lt "$TTL" ]; then
   # Fresh foreign claim — deny
-  deny_with_reason "tree-claim: index locked by session '$CLAIM_SESSION' (agent '$CLAIM_AGENT', ${CLAIM_AGE}s ago, TTL ${TTL}s). Your session: $SESSION_ID. Escape hatches: (1) set SABLE_TREE_CLAIM_OVERRIDE=1 to take over, or (2) delete $CLAIM_FILE manually and retry, or (3) if you ARE '$CLAIM_AGENT', run: sable-claim release \"$EFFECTIVE_DIR\". If the other session is no longer active, the claim will expire automatically after $((TTL - CLAIM_AGE))s."
+  deny_with_reason "tree-claim: index locked by session '$CLAIM_SESSION' (agent '$CLAIM_AGENT', ${CLAIM_AGE}s ago, TTL ${TTL}s). Your session: $SESSION_ID. Escape hatches: (1) set SABLE_TREE_CLAIM_OVERRIDE=1 to take over, or (2) delete $CLAIM_FILE manually and retry, or (3) if you ARE '$CLAIM_AGENT', run: sable-claim release \"$EFFECTIVE_DIR\". If the other session is no longer active, the claim will expire automatically after $((TTL - CLAIM_AGE))s.$AMBIGUITY_NOTE"
 else
   # Stale claim — take over and allow
   printf '%s %s %s\n' "$SESSION_ID" "$NOW" "$AGENT_NAME" > "$CLAIM_FILE" 2>/dev/null || true
