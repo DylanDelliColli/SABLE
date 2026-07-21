@@ -512,3 +512,176 @@ def test_doctor_reports_worker_cap_line_even_when_drifted(tmp_path, monkeypatch,
     assert rc == 1
     assert "DRIFT DETECTED" in out
     assert "worker cap: 8 (default)" in out
+
+
+# --- pinned snapshot bins (SABLE-9boz4) -----------------------------------------
+# Follow-up to SABLE-mkj6k: a regular-file pin only works for a bin with zero
+# repo-local imports. sable-spawn-worker / sable-msg import sibling modules
+# (sable_pane_lib.py, ...), so a naive copy severs the import. The pin unit
+# here is a whole versioned snapshot directory, not a single file — these
+# cover python_sibling_importing_bins() detection and _check_snapshot_pin()'s
+# status classification, including the "sha-compare snapshot vs repo AT ITS
+# PINNED SHA, not current HEAD" acceptance criterion (a plain sha256-vs-HEAD
+# compare would agree-while-wrong for a deliberately older pin).
+
+def make_snapshot_repo(tmp_path):
+    """A real git repo with bin/sable-importer (imports sable_helper_lib.py)
+    plus an ordinary no-import tool, committed so _check_snapshot_pin can
+    `git show <sha>:bin/<name>` against it."""
+    repo = tmp_path / "repo"
+    bin_dir = repo / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "sable_helper_lib.py").write_text("MARK = 'v1'\n")
+    (bin_dir / "sable-importer").write_text(
+        "#!/usr/bin/env python3\nfrom sable_helper_lib import MARK\nprint(MARK)\n"
+    )
+    (bin_dir / "sable-plain").write_text("#!/usr/bin/env bash\necho plain\n")
+
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    sha = subprocess.run(
+        ["git", "rev-parse", "--short=12", "HEAD"], cwd=repo,
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    return repo, bin_dir, sha
+
+
+def pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest, *, tamper=False):
+    """Simulates what `sable-bin-install --pin-snapshot` does: copy bin/ as
+    one unit into a versioned ~/.local/lib/sable-<sha>/ dir, then symlink the
+    entry point into it."""
+    snapshot_dir = tmp_path / "lib" / f"sable-{sha}"
+    snapshot_dir.mkdir(parents=True)
+    for f in bin_dir.iterdir():
+        if f.is_file():
+            (snapshot_dir / f.name).write_bytes(f.read_bytes())
+    if tamper:
+        (snapshot_dir / "sable-importer").write_text("# hand-tampered\n")
+
+    bin_dir_dest.mkdir(parents=True, exist_ok=True)
+    (bin_dir_dest / "sable-importer").symlink_to(snapshot_dir / "sable-importer")
+    return snapshot_dir
+
+
+def test_python_sibling_importing_bins_detects_only_the_importer(tmp_path):
+    repo, bin_dir, _sha = make_snapshot_repo(tmp_path)
+    assert doctor.python_sibling_importing_bins(repo) == ["sable-importer"]
+
+
+def test_build_manifest_includes_pinned_snapshot_bins_category(tmp_path):
+    repo, bin_dir, _sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    names = {src.name for c, src, _ in entries if c == "pinned snapshot bins"}
+    assert names == {"sable-importer"}
+
+
+def test_check_manifest_snapshot_pin_missing_when_never_installed(tmp_path):
+    repo, bin_dir, _sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    bin_dir_dest.mkdir()
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if x["category"] == "pinned snapshot bins")
+    assert r["status"] == "missing"
+
+
+def test_check_manifest_snapshot_pin_clean_for_ordinary_unpinned_symlink(tmp_path):
+    # the default un-pinned state (symlink straight into the live repo bin/)
+    # is NOT a defect — pinning is opt-in, same as the mkj6k pinned-bins category.
+    repo, bin_dir, _sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    bin_dir_dest.mkdir()
+    (bin_dir_dest / "sable-importer").symlink_to(bin_dir / "sable-importer")
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if x["category"] == "pinned snapshot bins")
+    assert r["status"] == "clean"
+
+
+def test_check_manifest_snapshot_pin_clean_when_content_matches_pinned_sha(tmp_path):
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest)
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if x["category"] == "pinned snapshot bins")
+    assert r["status"] == "clean"
+
+
+def test_check_manifest_snapshot_pin_broken_copy_pin_when_regular_file(tmp_path):
+    # a python-importing bin pinned as a BARE regular file has no sibling lib
+    # beside it -- the exact ImportError hazard this bead exists to prevent.
+    repo, bin_dir, _sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    bin_dir_dest.mkdir()
+    (bin_dir_dest / "sable-importer").write_bytes((bin_dir / "sable-importer").read_bytes())
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if x["category"] == "pinned snapshot bins")
+    assert r["status"] == "broken-copy-pin"
+
+
+def test_check_manifest_snapshot_pin_drift_when_snapshot_hand_tampered(tmp_path):
+    # the failure class this bead exists to prevent: a second, untracked
+    # drift surface INSIDE the snapshot dir itself. A plain sha256-vs-current-
+    # HEAD compare would be the wrong check (the pin is deliberately frozen at
+    # an older sha) -- this must compare against the repo AT THE PINNED SHA.
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest, tamper=True)
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if x["category"] == "pinned snapshot bins")
+    assert r["status"] == "snapshot-drift"
+
+
+def test_check_manifest_snapshot_pin_clean_even_when_pinned_sha_predates_head(tmp_path):
+    # the pin is deliberately frozen at an OLD sha while the repo moves on --
+    # that must NOT be reported as drift (drift means the SNAPSHOT no longer
+    # matches what it claims to be pinned to, not "repo has since changed").
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest)
+
+    # repo moves on after the pin was taken
+    (bin_dir / "sable-importer").write_text(
+        "#!/usr/bin/env python3\nfrom sable_helper_lib import MARK\nprint(MARK, 'v2')\n"
+    )
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "v2"], cwd=repo, check=True)
+
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if x["category"] == "pinned snapshot bins")
+    assert r["status"] == "clean"
+
+
+def test_render_text_report_snapshot_drift_never_recommends_install_sh(tmp_path, capsys):
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest, tamper=True)
+    results = doctor.check_manifest(doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest))
+    doctor.render_text_report(results)
+    out = capsys.readouterr().out
+    assert "bash install.sh" not in out
+    assert "--pin-snapshot" in out
+    assert "sable-importer" in out
+
+
+def test_quiet_mode_snapshot_drift_never_recommends_install_sh(tmp_path, capsys):
+    repo, bin_dir, sha = make_snapshot_repo(tmp_path)
+    bin_dir_dest = tmp_path / "local-bin"
+    pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest, tamper=True)
+    rc = doctor.main([
+        "--repo", str(repo), "--claude-dir", str(tmp_path / "claude"),
+        "--bin-dir", str(bin_dir_dest), "--quiet",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "bash install.sh" not in captured.err
+    assert captured.out == ""
