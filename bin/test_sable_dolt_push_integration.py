@@ -282,6 +282,91 @@ def test_pull_failure_aborts_before_push(tmp_path):
     assert not ran.exists(), "must not push when pull fails"
 
 
+# --- drift-check: --check-only / --push-if-ahead (SABLE-rzsb.9) -------------
+#
+# Unit-tier: SABLE_DOLT_DRIFT_CMD is a canned `echo <n>` double — no real
+# dolt involved, just proving the wrapper's own --check-only / --push-if-ahead
+# wiring (report vs. conditional-push, and that --check-only never pushes).
+
+def test_check_only_reports_seeded_ahead_count(tmp_path):
+    lock = tmp_path / "dolt-push.lock"
+    pushed = tmp_path / "pushed"
+    push = write_script(tmp_path / "push.sh", f': > "{pushed}"\n')
+    env = base_env(tmp_path, lock)
+    env["SABLE_DOLT_PUSH_CMD"] = f"sh {push}"
+    env["SABLE_DOLT_DRIFT_CMD"] = "echo 5"
+
+    r = run_wrapper(env, "--check-only")
+    assert r.returncode == 0, r.stderr
+    assert "ahead=5" in r.stdout
+    assert not pushed.exists(), "--check-only must never push"
+    assert not lock.exists(), "--check-only must never touch the lock"
+
+
+def test_check_only_ahead_zero_reports_zero_and_never_pushes(tmp_path):
+    lock = tmp_path / "dolt-push.lock"
+    pushed = tmp_path / "pushed"
+    push = write_script(tmp_path / "push.sh", f': > "{pushed}"\n')
+    env = base_env(tmp_path, lock)
+    env["SABLE_DOLT_PUSH_CMD"] = f"sh {push}"
+    env["SABLE_DOLT_DRIFT_CMD"] = "echo 0"
+
+    r = run_wrapper(env, "--check-only")
+    assert r.returncode == 0, r.stderr
+    assert "ahead=0" in r.stdout
+    assert not pushed.exists()
+    assert not lock.exists()
+
+
+def test_check_only_and_push_if_ahead_are_mutually_exclusive(tmp_path):
+    lock = tmp_path / "dolt-push.lock"
+    env = base_env(tmp_path, lock)
+    env["SABLE_DOLT_DRIFT_CMD"] = "echo 0"
+
+    r = run_wrapper(env, "--check-only", "--push-if-ahead")
+    assert r.returncode == 2, r.stderr   # EXIT_USAGE
+
+
+def test_push_if_ahead_pushes_exactly_once_when_seeded_ahead(tmp_path):
+    lock = tmp_path / "dolt-push.lock"
+    counter = tmp_path / "attempts"
+    push = write_script(
+        tmp_path / "push.sh",
+        f'n=$(cat "{counter}" 2>/dev/null || echo 0); '
+        f'echo $((n + 1)) > "{counter}"\n')
+    env = base_env(tmp_path, lock)
+    env["SABLE_DOLT_PUSH_CMD"] = f"sh {push}"
+    env["SABLE_DOLT_DRIFT_CMD"] = "echo 3"
+
+    r = run_wrapper(env, "--push-if-ahead")
+    assert r.returncode == 0, r.stderr
+    assert counter.read_text().strip() == "1"
+    assert not lock.exists()
+
+
+def test_push_if_ahead_zero_ahead_skips_push(tmp_path):
+    lock = tmp_path / "dolt-push.lock"
+    pushed = tmp_path / "pushed"
+    push = write_script(tmp_path / "push.sh", f': > "{pushed}"\n')
+    env = base_env(tmp_path, lock)
+    env["SABLE_DOLT_PUSH_CMD"] = f"sh {push}"
+    env["SABLE_DOLT_DRIFT_CMD"] = "echo 0"
+
+    r = run_wrapper(env, "--push-if-ahead")
+    assert r.returncode == 0, r.stderr
+    assert not pushed.exists(), "ahead=0 must push zero times"
+    assert not lock.exists()
+
+
+def test_drift_check_command_failure_reports_dedicated_exit_code(tmp_path):
+    lock = tmp_path / "dolt-push.lock"
+    env = base_env(tmp_path, lock)
+    env["SABLE_DOLT_DRIFT_CMD"] = "false"   # a command that just fails
+
+    r = run_wrapper(env, "--check-only")
+    assert r.returncode == 14, r.stderr    # EXIT_DRIFT_CHECK_FAIL
+
+
 # --- REAL dolt: scratch file:// remote round-trip ---------------------------
 
 def _make_dolt_scratch(base: Path, name: str = ""):
@@ -339,6 +424,131 @@ def test_real_dolt_push_to_scratch_remote(tmp_path, dolt_scratch):
     ls = subprocess.run(["dolt", "branch", "-r"], cwd=str(src),
                         env=dolt_scratch["denv"], capture_output=True, text=True)
     assert "origin/main" in ls.stdout, ls.stdout + ls.stderr
+
+
+def _drift_query_script(path: Path, src: Path, branch="main", remote="origin") -> Path:
+    """A cd-guarded DOLT_LOG COUNT query against a real scratch dolt repo,
+    matching the drift-check's default query (SABLE-rzsb.9)."""
+    query = (
+        f"SELECT COUNT(*) FROM dolt_log('{branch}') WHERE commit_hash NOT IN "
+        f"(SELECT commit_hash FROM dolt_log('remotes/{remote}/{branch}'))"
+    )
+    return write_script(
+        path,
+        f'cd "{src}" || exit 97\n'
+        f'exec dolt sql -r csv -q "{query}"\n',
+    )
+
+
+@pytest.mark.skipif(not HAVE_DOLT, reason="dolt not installed")
+def test_real_dolt_check_only_reports_ahead_and_never_pushes(tmp_path, dolt_scratch):
+    d = dolt_scratch["d"]
+    src = dolt_scratch["src"]
+    denv = dolt_scratch["denv"]
+    assert d("sql", "-q", "create table t (id int primary key)").returncode == 0
+    assert d("add", ".").returncode == 0
+    assert d("commit", "-m", "init").returncode == 0
+    assert d("push", "origin", "main").returncode == 0
+    assert d("fetch", "origin").returncode == 0     # populate remotes/origin/main
+
+    # one local-only commit -> ahead=1
+    assert d("sql", "-q", "insert into t values (1)").returncode == 0
+    assert d("add", ".").returncode == 0
+    assert d("commit", "-m", "local ahead").returncode == 0
+
+    lock = tmp_path / "dolt-push.lock"
+    pushed = tmp_path / "pushed"
+    fake_push = write_script(tmp_path / "push.sh", f': > "{pushed}"\n')
+    drift = _drift_query_script(tmp_path / "drift.sh", src)
+    env = base_env(tmp_path, lock, pull="true", bounce="true")
+    env["DOLT_ROOT_PATH"] = denv["DOLT_ROOT_PATH"]
+    env["SABLE_DOLT_PUSH_CMD"] = f"sh {fake_push}"
+    env["SABLE_DOLT_DRIFT_CMD"] = f"sh {drift}"
+
+    r = run_wrapper(env, "--check-only")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ahead=1" in r.stdout, r.stdout
+    assert not pushed.exists(), "--check-only must never push"
+    assert not lock.exists()
+
+    # remote is untouched by the check
+    subprocess.run(["dolt", "fetch", "origin"], cwd=str(src), env=denv,
+                   capture_output=True, text=True)
+    remote_log = subprocess.run(["dolt", "log", "--oneline", "remotes/origin/main"],
+                                cwd=str(src), env=denv,
+                                capture_output=True, text=True)
+    assert "local ahead" not in remote_log.stdout
+
+
+@pytest.mark.skipif(not HAVE_DOLT, reason="dolt not installed")
+def test_real_dolt_push_if_ahead_pushes_exactly_once(tmp_path, dolt_scratch):
+    d = dolt_scratch["d"]
+    src = dolt_scratch["src"]
+    denv = dolt_scratch["denv"]
+    assert d("sql", "-q", "create table t (id int primary key)").returncode == 0
+    assert d("add", ".").returncode == 0
+    assert d("commit", "-m", "init").returncode == 0
+    assert d("push", "origin", "main").returncode == 0
+    assert d("fetch", "origin").returncode == 0
+
+    assert d("sql", "-q", "insert into t values (1)").returncode == 0
+    assert d("add", ".").returncode == 0
+    assert d("commit", "-m", "local ahead").returncode == 0
+
+    lock = tmp_path / "dolt-push.lock"
+    counter = tmp_path / "attempts"
+    real_push = write_script(
+        tmp_path / "push.sh",
+        f'cd "{src}" || exit 97\n'
+        f'n=$(cat "{counter}" 2>/dev/null || echo 0); echo $((n + 1)) > "{counter}"\n'
+        f'exec dolt push origin main\n')
+    drift = _drift_query_script(tmp_path / "drift.sh", src)
+    env = base_env(tmp_path, lock, pull="true", bounce="true")
+    env["DOLT_ROOT_PATH"] = denv["DOLT_ROOT_PATH"]
+    env["SABLE_DOLT_PUSH_CMD"] = f"sh {real_push}"
+    env["SABLE_DOLT_DRIFT_CMD"] = f"sh {drift}"
+
+    r = run_wrapper(env, "--push-if-ahead")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert counter.read_text().strip() == "1", "must push exactly once"
+    assert not lock.exists()
+
+    subprocess.run(["dolt", "fetch", "origin"], cwd=str(src), env=denv,
+                   capture_output=True, text=True)
+    remote_log = subprocess.run(["dolt", "log", "--oneline", "remotes/origin/main"],
+                                cwd=str(src), env=denv,
+                                capture_output=True, text=True)
+    assert "local ahead" in remote_log.stdout, remote_log.stdout
+
+
+@pytest.mark.skipif(not HAVE_DOLT, reason="dolt not installed")
+def test_real_dolt_push_if_ahead_zero_pushes_zero_times(tmp_path, dolt_scratch):
+    d = dolt_scratch["d"]
+    src = dolt_scratch["src"]
+    denv = dolt_scratch["denv"]
+    assert d("sql", "-q", "create table t (id int primary key)").returncode == 0
+    assert d("add", ".").returncode == 0
+    assert d("commit", "-m", "init").returncode == 0
+    assert d("push", "origin", "main").returncode == 0
+    assert d("fetch", "origin").returncode == 0     # local == remote -> ahead=0
+
+    lock = tmp_path / "dolt-push.lock"
+    counter = tmp_path / "attempts"
+    real_push = write_script(
+        tmp_path / "push.sh",
+        f'cd "{src}" || exit 97\n'
+        f'n=$(cat "{counter}" 2>/dev/null || echo 0); echo $((n + 1)) > "{counter}"\n'
+        f'exec dolt push origin main\n')
+    drift = _drift_query_script(tmp_path / "drift.sh", src)
+    env = base_env(tmp_path, lock, pull="true", bounce="true")
+    env["DOLT_ROOT_PATH"] = denv["DOLT_ROOT_PATH"]
+    env["SABLE_DOLT_PUSH_CMD"] = f"sh {real_push}"
+    env["SABLE_DOLT_DRIFT_CMD"] = f"sh {drift}"
+
+    r = run_wrapper(env, "--push-if-ahead")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not counter.exists(), "ahead=0 must push zero times"
+    assert not lock.exists()
 
 
 @pytest.mark.skipif(not HAVE_DOLT, reason="dolt not installed")
