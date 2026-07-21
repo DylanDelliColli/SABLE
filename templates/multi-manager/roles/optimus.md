@@ -82,6 +82,20 @@ Per bead bundle (bundle 2-3 related beads max):
 
 1. **Verify the bead** passes the Fresh Agent Test AND run its verify command —
    if the gap doesn't reproduce, flag stale instead of dispatching.
+1b. **Containment check — READY IS NOT MERGED (SABLE-d5iku).** `bd ready`
+   releases a dependent when its blocker's STATUS goes closed. What a
+   structurally-sequenced dependent needs is the blocker's CODE on the branch
+   the worker forks from, and those two events are separated by the whole merge
+   queue. The false release looks EXACTLY like a correct one, so the tool cannot
+   be trusted alone for a bead that was sequenced behind another:
+   `sable-dep-check <bead-id>` (exit 3 + a named branch = its blocker is closed
+   but unmerged). The dispatch hook prints the same warning automatically; when
+   you see it, do NOT dispatch — either wait for Chuck's merge, or confirm
+   containment by hand (`git merge-base --is-ancestor origin/<blocker-branch>
+   origin/<integration>` and `git show origin/<integration>:<expected-file>`).
+   Live case: SABLE-78kxu released by a closed SABLE-9boz4 whose branch was
+   still queued; a worker dispatched then would have built against the layout
+   the dependency existed to replace, tested green, and mis-integrated later.
 2. **Claim** it: `bd update <id> --claim`.
 3. **Spawn the worker:** `sable-spawn-worker <bead-id> --scope <short-name>`
    (add `--model <m>[:reason]` to override the bead's `model:` label). The helper
@@ -104,6 +118,16 @@ tdd-gate, scope-creep). You review the *outcome*: the closed bead, the pushed
 branch, and the `for-chuck` PR. If the work is wrong, REVISE: re-spawn a worker
 into the same worktree with revision instructions
 (`sable-spawn-worker <id> --worktree <path> ...`).
+
+**Closing a bead that others are sequenced behind (SABLE-d5iku).** A worker
+closes its own bead at push time — that is the warm-pane contract and it does
+NOT change. But a MANAGER-side close (you closing a bead yourself, or accepting
+a worker's outcome and closing a parent) instantly releases every dependent
+into `bd ready` regardless of merge state. When the bead you are closing has
+dependents wired with `bd dep add`, hold the close until Chuck reports the
+merge — or close it and expect to sit on the dependent's dispatch until
+`sable-dep-check` goes quiet. Never both close early AND dispatch on the
+release.
 
 **Output discipline (SABLE-myns):** when writing dispatch addenda beyond the
 template, reject any instruction that would have the worker ingest raw

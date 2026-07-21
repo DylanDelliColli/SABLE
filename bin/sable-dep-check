@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""sable-dep-check — surface the CLOSE-vs-MERGE gap in bd dependency releases
+(SABLE-d5iku).
+
+THE DEFECT THIS EXISTS FOR
+--------------------------
+`bd ready` releases a dependent the moment its blocker's STATUS becomes
+`closed`. What a dependent sequenced behind a blocker for STRUCTURAL reasons
+actually needs is the blocker's CODE present on the branch it will fork from.
+Those two events are separated by the whole merge queue (minutes to hours).
+
+Live instance, 2026-07-21: SABLE-78kxu was sequenced behind SABLE-9boz4 so it
+would stamp the snapshot unit 9boz4 defines. 9boz4 was closed; 78kxu appeared
+in `bd ready` immediately; 9boz4's branch (wk-pin-refresh) was still in the
+merge queue. A worker dispatched then would have branched from tmux-only —
+where the snapshot-unit layout did not exist — and built exactly what the
+dependency existed to prevent. The graph said go; the tree said not yet.
+
+The false release looks EXACTLY like a correct one, which is what makes it
+dangerous rather than untidy: the work tests green against the old layout and
+mis-integrates later.
+
+WHAT THIS TOOL DOES (option (c) of the bead: SURFACE IT)
+--------------------------------------------------------
+For each bead named, it walks the `blocks` dependencies, and for every blocker
+that is CLOSED it resolves that blocker's branch and asks git whether the
+branch is an ancestor of the integration branch. A closed blocker whose branch
+is on origin and NOT yet merged produces a WARNING naming both.
+
+It is ADVISORY BY DESIGN — it warns, it never withholds. A withhold would
+trade a false-go for a false-block, and the merge-state signal has genuine
+unresolvable cases (see below) where a block would be wrong. Option (b) of the
+bead (merge-aware readiness inside `bd ready` itself) lives in bd core, which
+is not this repo.
+
+BRANCH RESOLUTION (blocker bead -> branch), first hit wins:
+  1. STRUCTURED `branch` metadata — what bin/sable-spawn-worker writes on every
+     bead at dispatch time (tag_branch_metadata there). Authoritative: an
+     exact key/value, never prose.
+  2. Prose fallback — `wk-*` tokens appearing in the blocker's description,
+     notes or close_reason, kept only if they exist as a real ref on the
+     remote. Beads dispatched before the metadata tag existed have their branch
+     only in prose (e.g. 9boz4's close_reason: "Pushed to origin/wk-pin-refresh
+     at 09295c5"), and those are exactly the old beads most likely to be
+     blockers today.
+
+MERGE STATE, and why "branch absent" is SILENT:
+  present + ancestor of the integration branch -> merged, clean, no output.
+  present + NOT an ancestor                    -> WARNING (the defect).
+  ABSENT from the remote                       -> silent. Worker branches are
+     DELETED after they merge (origin carries no wk-* branch at all between
+     merges in this fleet), so "no such ref" overwhelmingly means merged-and-
+     pruned. Treating absence as unmerged would fire on nearly every closed
+     blocker — a false-block engine, the exact overcorrection the bead warns
+     against ("both directions, or the check trades a false-go for a
+     false-block").
+  unresolvable (no integration ref, git error)  -> a NOTE, never a warning.
+
+STALENESS: ancestry is judged against LOCAL remote-tracking refs. A stale
+checkout can report a merged branch as unmerged. Pass --fetch to refresh
+first; the pre-dispatch hook path deliberately does NOT, to stay inside its
+5s budget. A stale-driven false warning costs one `git log` to dismiss; a
+network fetch on every dispatch costs every dispatch.
+
+USAGE
+  sable-dep-check SABLE-abc [SABLE-def ...]   # check specific beads
+  sable-dep-check --ready                     # scan everything bd calls ready
+  sable-dep-check --json SABLE-abc            # machine-readable
+  sable-dep-check --format=hook SABLE-abc     # one block, empty when clean
+
+`--repo` names the git repo whose ancestry answers the question; `--bd-dir`
+names where bd runs. They are usually the same checkout and default that way,
+but they are separable on purpose — merge state can be judged in a repo that
+carries no bead DB at all.
+
+COST: two `bd` invocations total regardless of how many beads are named (one
+batched `bd dep list`, one batched `bd show` for the blockers behind it), plus
+local git ref reads. bd itself is the floor — ~0.8s of process startup per
+call, and its batched dep lookup is still ~0.13s per id, so `--ready` over a
+100-bead pool is a ~20s deliberate sweep, not an interactive command. The hook
+path names 1-3 beads and is timeout-bounded.
+
+EXIT CODES
+  0  no unmerged-blocker warnings (clean, or nothing resolvable)
+  2  usage error
+  3  at least one WARNING — a dependent released by a closed-but-unmerged
+     blocker. Distinct from 1 so a crash is never read as a finding.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+EXIT_CLEAN = 0
+EXIT_USAGE = 2
+EXIT_WARN = 3
+
+# bd's dependency_type for a genuine blocking edge. `relates-to` (non-blocking
+# discoverability link) and `parent-child` (epic hierarchy) do NOT gate
+# readiness, so a closed relates-to partner with an unmerged branch is not a
+# false release and must not warn.
+BLOCKING_DEP_TYPE = "blocks"
+
+# A blocker RELEASES its dependent when its status becomes closed — that
+# release, ahead of the merge, is the whole defect.
+RELEASING_STATUS = "closed"
+
+# Worker branches are `wk-*` (mirrors is_wk_branch in bin/sable-reconcile-handoffs).
+# The prose fallback only ever proposes these: a manager's own branch or the
+# integration branch is never a worker bead's branch.
+_WK_TOKEN_RE = re.compile(r"\bwk-[A-Za-z0-9][A-Za-z0-9._/-]*")
+
+# Prose is prose: a branch name at the end of a sentence carries the sentence's
+# punctuation with it ("...pushed to origin/wk-foo.").
+_PROSE_TRIM = ".,;:!?)]}'\"`"
+
+
+# --- pure helpers (unit-tested in bin/test_sable_dep_check.py) ---------------
+
+def normalize_dep_records(dep_records: list[dict] | None,
+                          requested_ids: list[str]) -> list[dict]:
+    """Flatten the TWO shapes `bd dep list --json` emits into one.
+
+    With a SINGLE id bd returns enriched bead records — `id`, `status`,
+    `dependency_type` — and no back-reference to the bead that was asked about.
+    With SEVERAL ids it returns raw edges — `issue_id`, `depends_on_id`, `type`
+    — carrying provenance but NO status. The batched form is what makes a
+    whole-pool sweep affordable (2 bd calls instead of 2 per bead), so both
+    shapes have to be handled; reading only one of them would either break
+    `--ready` or silently drop every edge in single-bead mode.
+
+    Returns dicts of {dependent, blocker, type, status}; `status` is "" for the
+    batched shape and must be filled from a separate bead lookup."""
+    if not isinstance(dep_records, list):
+        return []
+    default_dependent = requested_ids[0] if len(requested_ids) == 1 else ""
+    out: list[dict] = []
+    for rec in dep_records:
+        if not isinstance(rec, dict):
+            continue
+        blocker = rec.get("depends_on_id") or rec.get("id") or ""
+        dependent = rec.get("issue_id") or default_dependent
+        edge_type = rec.get("type") or rec.get("dependency_type") or ""
+        if not blocker or not dependent:
+            continue
+        out.append({
+            "dependent": dependent,
+            "blocker": blocker,
+            "type": edge_type,
+            "status": rec.get("status") or "",
+        })
+    return out
+
+
+def released_edges(edges: list[dict], status_by_id: dict[str, str]) -> list[dict]:
+    """Blocking edges whose blocker is CLOSED — the edges that have ALREADY
+    released their dependent into `bd ready`. An OPEN blocker is correctly still
+    holding its dependent, so there is nothing to surface about it.
+
+    Status comes from the bead lookup when available, falling back to whatever
+    the edge record carried; the batched edge shape has no status at all, so a
+    lookup-only rule would find nothing there."""
+    out = []
+    for e in edges:
+        if e["type"] != BLOCKING_DEP_TYPE:
+            continue
+        status = status_by_id.get(e["blocker"], "") or e["status"]
+        if status == RELEASING_STATUS:
+            out.append(e)
+    return out
+
+
+def prose_branch_candidates(text: str) -> list[str]:
+    """`wk-*` branch names mentioned in free text, de-duplicated, in order of
+    first appearance. Trailing sentence punctuation is stripped — the branch is
+    usually named mid-prose ("Pushed to origin/wk-pin-refresh at 09295c5"). The
+    caller MUST filter these against real remote refs before trusting one; this
+    function deliberately over-collects (a prose token is a candidate, not a
+    fact)."""
+    out: list[str] = []
+    for raw in _WK_TOKEN_RE.findall(text or ""):
+        name = raw.rstrip(_PROSE_TRIM)
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def metadata_branch(bead: dict | None) -> str:
+    """The STRUCTURED `branch` metadata bin/sable-spawn-worker stamps at
+    dispatch. Exact identity, never prose — when present it is the answer and
+    the prose fallback is not consulted at all."""
+    if not isinstance(bead, dict):
+        return ""
+    meta = bead.get("metadata") or {}
+    if not isinstance(meta, dict):
+        return ""
+    return (meta.get("branch") or "").strip()
+
+
+def bead_prose(bead: dict | None) -> str:
+    """The free-text fields a pre-metadata bead's branch can hide in."""
+    if not isinstance(bead, dict):
+        return ""
+    return "\n".join(str(bead.get(f) or "")
+                     for f in ("description", "notes", "close_reason"))
+
+
+def ancestry_verdict(rc: int) -> str:
+    """`git merge-base --is-ancestor <branch> <base>` exit code -> verdict.
+    0 = branch IS an ancestor (merged); 1 = it is NOT (unmerged — the defect);
+    anything else (bad ref, git failure) is UNRESOLVED, never reported as
+    unmerged: an unresolvable ancestry check must not manufacture a warning."""
+    if rc == 0:
+        return "merged"
+    if rc == 1:
+        return "unmerged"
+    return "unresolved"
+
+
+def format_warning(dependent: str, blocker: str, branch: str,
+                   integration_branch: str) -> str:
+    """The one-line finding. Names the dependent, the blocker, the branch and
+    the integration branch — everything needed to decide hold-or-go without a
+    second lookup."""
+    return (f"{dependent} released by {blocker}: {blocker} is CLOSED but its "
+            f"branch {branch} is NOT merged into {integration_branch}")
+
+
+def render_report(findings: list[dict], notes: list[str]) -> str:
+    """Human/hook text. EMPTY when there is nothing to warn about — notes alone
+    never produce output on this path, so an un-resolvable blocker (a closed
+    blocker with no branch anywhere, the common case for planning beads) stays
+    silent instead of nagging every dispatch."""
+    if not findings:
+        return ""
+    lines = ["UNMERGED-BLOCKER WARNING (SABLE-d5iku): a dependency released on "
+             "CLOSE, but the blocker's code is NOT on the integration branch yet."]
+    for f in findings:
+        lines.append("  - " + format_warning(f["dependent"], f["blocker"],
+                                             f["branch"], f["integration_branch"]))
+    lines.append("")
+    lines.append("A worker dispatched now forks from a tree WITHOUT the "
+                 "prerequisite — it will build against the pre-blocker layout. "
+                 "Either wait for the merge, or verify containment by hand: "
+                 "git merge-base --is-ancestor <blocker-branch> <integration> "
+                 "&& git show <integration>:<expected-file>.")
+    if notes:
+        lines.append("")
+        lines.append("Unresolved (reported, not warned):")
+        lines.extend("  - " + n for n in notes)
+    return "\n".join(lines)
+
+
+# --- process boundary -------------------------------------------------------
+
+def _run(argv: list[str], cwd: str) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+
+
+def _git(repo: str, *args: str) -> subprocess.CompletedProcess:
+    return _run(["git", *args], cwd=repo)
+
+
+def has_beads_db(path: str) -> bool:
+    """Does `path` (or an ancestor) carry a `.beads` directory? bd discovers its
+    DB by walking up from CWD, so this is the same question bd asks."""
+    cur = os.path.abspath(path)
+    while True:
+        if os.path.isdir(os.path.join(cur, ".beads")):
+            return True
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return False
+        cur = parent
+
+
+def resolve_bd_dir(repo: str, override: str = "") -> str:
+    """Where to run bd, which is NOT necessarily where merge state is judged.
+
+    `--repo` names the git repo whose ancestry answers the question; the bead
+    DB may live somewhere else entirely (a fixture repo under /tmp, a companion
+    checkout). Explicit override wins; else the repo itself when it resolves a
+    `.beads` DB; else the process CWD, which is where a bare `bd` invocation
+    would have looked anyway."""
+    if override:
+        return os.path.abspath(override)
+    if has_beads_db(repo):
+        return repo
+    return os.getcwd()
+
+
+def _bd_json(repo: str, *args: str):
+    cp = _run(["bd", *args, "--json"], cwd=repo)
+    if cp.returncode != 0:
+        return None
+    try:
+        return json.loads(cp.stdout)
+    except Exception:
+        return None
+
+
+def resolve_integration_branch(repo: str) -> str:
+    """Bare integration-branch name for `repo`, mirroring the precedence in
+    hooks/multi-manager/lib-identity.sh::sable_resolve_integration_branch —
+    repo-local git config, then the checked-in .sable file, then env, then
+    main. Ancestry MUST be judged against the branch this repo actually
+    integrates onto; a hardcoded main would report every SABLE branch unmerged."""
+    cp = _git(repo, "config", "--get", "sable.integrationBranch")
+    if cp.returncode == 0 and cp.stdout.strip():
+        return cp.stdout.strip()
+    sable_file = os.path.join(repo, ".sable")
+    if os.path.isfile(sable_file):
+        try:
+            with open(sable_file, encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("integrationBranch="):
+                        val = line.split("=", 1)[1].strip()
+                        if val:
+                            return val
+        except OSError:
+            pass
+    val = os.environ.get("SABLE_INTEGRATION_BRANCH") or os.environ.get("SABLE_BASE_BRANCH") or "main"
+    return val[len("origin/"):] if val.startswith("origin/") else val
+
+
+def ref_exists(repo: str, ref: str) -> bool:
+    return _git(repo, "rev-parse", "--verify", "--quiet", ref).returncode == 0
+
+
+def resolve_base_ref(repo: str, remote: str, integration_branch: str) -> str:
+    """The ref ancestry is judged against: the PUBLISHED integration branch when
+    it exists, else the local branch (a repo whose integration line is not yet
+    pushed). Empty when neither exists — the caller degrades to a note."""
+    remote_ref = f"refs/remotes/{remote}/{integration_branch}"
+    if ref_exists(repo, remote_ref):
+        return remote_ref
+    local_ref = f"refs/heads/{integration_branch}"
+    if ref_exists(repo, local_ref):
+        return local_ref
+    return ""
+
+
+def resolve_blocker_branch(repo: str, remote: str,
+                           bead: dict | None) -> tuple[str, str]:
+    """(branch, source) for an ALREADY-FETCHED blocker bead, or ("", reason).
+
+    Takes the bead rather than an id so the caller can fetch every blocker in
+    ONE batched `bd show` — bd is ~0.3-1s per invocation, and a per-blocker
+    lookup made a `--ready` sweep of a ~60-bead pool take 90 seconds.
+
+    Metadata first (exact), prose second (filtered against real remote refs so
+    a stray branch name in a paragraph cannot become a finding). A prose
+    candidate that does not exist on the remote is DISCARDED silently — an
+    already-merged-and-pruned branch is the overwhelmingly common reason a
+    named branch is missing, and warning on it would fire constantly."""
+    if not isinstance(bead, dict):
+        return "", "bead not readable"
+
+    branch = metadata_branch(bead)
+    if branch:
+        return branch, "metadata"
+
+    for cand in prose_branch_candidates(bead_prose(bead)):
+        if ref_exists(repo, f"refs/remotes/{remote}/{cand}"):
+            return cand, "prose"
+    return "", "no branch on the bead (no `branch` metadata, no live wk-* branch named in its text)"
+
+
+def check_beads(repo: str, bd_dir: str, remote: str, integration_branch: str,
+                bead_ids: list[str]) -> tuple[list[dict], list[str]]:
+    """(findings, notes) for EVERY dependent bead, in exactly two bd calls:
+    one batched `bd dep list` for the edges, one batched `bd show` for the
+    blockers behind them. Per-bead calls are what made a whole-pool sweep
+    unusable, and an unusable sweep is a check nobody runs."""
+    findings: list[dict] = []
+    notes: list[str] = []
+    if not bead_ids:
+        return findings, notes
+
+    deps = _bd_json(bd_dir, "dep", "list", *bead_ids)
+    if deps is None:
+        return findings, [f"could not read dependencies for {', '.join(bead_ids)} "
+                          "(bd dep list failed)"]
+
+    edges = [e for e in normalize_dep_records(deps, bead_ids)
+             if e["type"] == BLOCKING_DEP_TYPE and e["dependent"] in set(bead_ids)]
+    if not edges:
+        return findings, notes
+
+    # One lookup for every blocker on every edge: status (is it released?),
+    # metadata (its branch) and prose (its branch, the pre-metadata way).
+    blocker_ids = sorted({e["blocker"] for e in edges})
+    bead_by_id: dict[str, dict] = {}
+    shown = _bd_json(bd_dir, "show", *blocker_ids)
+    if isinstance(shown, list):
+        for b in shown:
+            if isinstance(b, dict) and b.get("id"):
+                bead_by_id[b["id"]] = b
+    status_by_id = {bid: (b.get("status") or "") for bid, b in bead_by_id.items()}
+
+    base_ref = resolve_base_ref(repo, remote, integration_branch)
+    for edge in released_edges(edges, status_by_id):
+        bead_id = edge["dependent"]
+        blocker = edge["blocker"]
+        branch, source = resolve_blocker_branch(repo, remote, bead_by_id.get(blocker))
+        if not branch:
+            # Silent-by-design in the report; carried as a note for --json /
+            # verbose consumers. A closed blocker with no branch is usually a
+            # planning or policy bead that never produced code.
+            notes.append(f"{bead_id}: blocker {blocker} — {source}")
+            continue
+
+        branch_ref = f"refs/remotes/{remote}/{branch}"
+        if not ref_exists(repo, branch_ref):
+            # Deleted after merge (this fleet prunes worker branches) or never
+            # pushed. Not a finding — see the module docstring.
+            notes.append(f"{bead_id}: blocker {blocker} branch {branch} absent "
+                         f"on {remote} (merged-and-pruned, or never pushed)")
+            continue
+
+        if not base_ref:
+            notes.append(f"{bead_id}: blocker {blocker} branch {branch} — no ref "
+                         f"for integration branch {integration_branch}; ancestry unresolvable")
+            continue
+
+        verdict = ancestry_verdict(_git(repo, "merge-base", "--is-ancestor",
+                                        branch_ref, base_ref).returncode)
+        if verdict == "unmerged":
+            findings.append({
+                "dependent": bead_id,
+                "blocker": blocker,
+                "branch": branch,
+                "branch_source": source,
+                "integration_branch": integration_branch,
+            })
+        elif verdict == "unresolved":
+            notes.append(f"{bead_id}: blocker {blocker} branch {branch} — "
+                         f"ancestry check against {base_ref} failed; treated as unknown")
+    return findings, notes
+
+
+def ready_bead_ids(bd_dir: str) -> list[str]:
+    data = _bd_json(bd_dir, "ready")
+    if not isinstance(data, list):
+        return []
+    return [b.get("id") for b in data if isinstance(b, dict) and b.get("id")]
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="sable-dep-check",
+        description="Warn when a bead was released by a blocker whose BRANCH is "
+                    "not yet merged (SABLE-d5iku). Advisory — never withholds.")
+    ap.add_argument("beads", nargs="*", help="dependent bead id(s) to check")
+    ap.add_argument("--ready", action="store_true",
+                    help="check every bead bd currently reports ready")
+    ap.add_argument("--repo", default=".", help="repo to judge merge state in (default: cwd)")
+    ap.add_argument("--bd-dir", default="",
+                    help="where to run bd (default: --repo if it resolves a .beads "
+                         "DB, else cwd) — the bead DB need not live in the repo "
+                         "whose merge state is being judged")
+    ap.add_argument("--remote", default=os.environ.get("SABLE_REMOTE", "origin"))
+    ap.add_argument("--integration-branch", default="",
+                    help="override the resolved integration branch")
+    ap.add_argument("--fetch", action="store_true",
+                    help="git fetch --prune first (fresher, slower — off by default)")
+    ap.add_argument("--format", choices=("text", "json", "hook"), default="text")
+    ap.add_argument("--json", action="store_true", help="alias for --format=json")
+    args = ap.parse_args(argv)
+
+    repo = os.path.abspath(args.repo)
+    if not os.path.isdir(repo):
+        print(f"sable-dep-check: not a directory: {repo}", file=sys.stderr)
+        return EXIT_USAGE
+
+    bd_dir = resolve_bd_dir(repo, args.bd_dir)
+
+    bead_ids = list(args.beads)
+    if args.ready:
+        bead_ids.extend(b for b in ready_bead_ids(bd_dir) if b not in bead_ids)
+    if not bead_ids:
+        print("sable-dep-check: no beads to check (pass bead ids or --ready)",
+              file=sys.stderr)
+        return EXIT_USAGE
+
+    if args.fetch:
+        _git(repo, "fetch", "--prune", args.remote)
+
+    integration_branch = args.integration_branch or resolve_integration_branch(repo)
+
+    findings, notes = check_beads(repo, bd_dir, args.remote,
+                                  integration_branch, bead_ids)
+
+    fmt = "json" if args.json else args.format
+    if fmt == "json":
+        print(json.dumps({
+            "integration_branch": integration_branch,
+            "checked": bead_ids,
+            "findings": findings,
+            "notes": notes,
+        }, indent=2))
+    else:
+        report = render_report(findings, notes if fmt == "text" else [])
+        if report:
+            print(report)
+
+    return EXIT_WARN if findings else EXIT_CLEAN
+
+
+if __name__ == "__main__":
+    sys.exit(main())

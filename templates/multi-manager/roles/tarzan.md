@@ -85,6 +85,18 @@ Per bead:
 
 1. **Verify** the bead has file paths + acceptance criteria AND run its verify
    command — if the gap doesn't reproduce, flag stale instead of dispatching.
+1b. **Containment check — READY IS NOT MERGED (SABLE-d5iku).** `bd ready`
+   releases a dependent the moment its blocker's STATUS goes closed, but a
+   structurally-sequenced dependent needs the blocker's CODE on the branch the
+   worker forks from — separated by the whole merge queue. For any bead
+   sequenced behind another, run `sable-dep-check <bead-id>` (exit 3 + a named
+   branch = blocker closed, branch NOT merged). The dispatch hook prints the
+   same warning automatically. On a warning, do NOT dispatch: wait for Chuck's
+   merge, or verify containment by hand (`git merge-base --is-ancestor
+   origin/<blocker-branch> origin/<integration>`). A worker dispatched into the
+   gap builds against the layout the dependency existed to replace — it tests
+   green and mis-integrates later, which is why the ready signal alone is not
+   enough here.
 2. **Claim:** `bd update <id> --claim`.
 3. **Spawn:** `sable-spawn-worker <bead-id> --scope <short-name>` (add
    `--model <m>[:reason]` to override the label). Your beads are small, so spawn
@@ -104,6 +116,14 @@ one-in-one-out as workers flip done (`sable-worker-status --reap` frees slots;
 scope-creep); you review the *outcome* — the closed bead, the pushed branch, the
 `for-chuck` PR. REVISE wrong work by re-spawning into the same worktree
 (`sable-spawn-worker <id> --worktree <path> ...`).
+
+**Closing a bead that others are sequenced behind (SABLE-d5iku).** The worker
+closes its own bead at push time — unchanged. But a MANAGER-side close releases
+every dependent into `bd ready` at once, merge state irrelevant. If the bead you
+are closing has dependents wired with `bd dep add`, hold the close until Chuck
+reports the merge, or accept that the dependent's dispatch is blocked on
+`sable-dep-check` going quiet. Never both close early AND dispatch on the
+release.
 
 **Output discipline (SABLE-myns):** when writing dispatch addenda beyond the
 template, reject any instruction that would have the worker ingest raw

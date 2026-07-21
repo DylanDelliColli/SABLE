@@ -16,6 +16,12 @@
 #
 # Companion: edit-write-claim-reconciler.sh appends emergent claims as workers edit.
 #
+# SABLE-d5iku: this hook ALSO carries the unmerged-blocker warning. See the
+# block at the bottom of this file — the bead's rationale for putting it here
+# is that this hook already runs on every worker dispatch and already reads
+# bead state, so it is the cheapest place to surface a dependency that
+# released on CLOSE while its blocker's BRANCH is still in the merge queue.
+#
 # Skips if: no bead ID inferrable, no file paths in description, worker/bare
 # subagent context (manager-typed subagents ARE governed — they dispatch workers).
 
@@ -126,5 +132,82 @@ except Exception:
   # which would drop it); Chuck's batched pull+push carries it later.
   bd update "$BEAD_ID" --sandbox --set-metadata "wip_claims=$FILES" >/dev/null 2>&1 || true
 done
+
+# --- Unmerged-blocker warning (SABLE-d5iku) ---------------------------------
+# `bd ready` releases a dependent the instant its blocker's STATUS becomes
+# closed. What a dependent sequenced behind a blocker for STRUCTURAL reasons
+# needs is the blocker's CODE on the branch it forks from — and those two
+# events are separated by the whole merge queue. So every `bd dep add` used for
+# structural sequencing carries a false-release window in which the ready
+# signal says go and the tree says not yet, and the false release looks
+# EXACTLY like a correct one (live instance: SABLE-78kxu released by a closed
+# SABLE-9boz4 whose wk-pin-refresh branch was still queued; a worker dispatched
+# then would have built against the layout the dependency existed to replace).
+#
+# ADVISORY, NOT A CONSTRAINT — unlike pre-dispatch-overlap.sh, this emits
+# `additionalContext` and never a `deny`. Merge state has genuine unresolvable
+# cases (pruned branches, stale remote-tracking refs, beads with no branch at
+# all), so a withhold here would trade the false-go for a false-block. Option
+# (b) of the bead — readiness that is merge-aware at the source — belongs in bd
+# core, which is not this repo.
+#
+# Failsafe by construction: every leg degrades to silence. A missing tool, a bd
+# hiccup, or a git error costs the warning, never the dispatch. Disable with
+# SABLE_DEP_MERGE_GUARD=0.
+if [ "${SABLE_DEP_MERGE_GUARD:-1}" = "1" ]; then
+  # Resolution order for the checker: explicit override, then PATH (the
+  # installed spine bin), then the repo-relative sibling for a dev checkout
+  # whose bins are not installed. Absent everywhere => skip silently.
+  DEP_CHECK_BIN="${SABLE_DEP_CHECK_BIN:-}"
+  if [ -z "$DEP_CHECK_BIN" ] && command -v sable-dep-check >/dev/null 2>&1; then
+    DEP_CHECK_BIN=$(command -v sable-dep-check)
+  fi
+  if [ -z "$DEP_CHECK_BIN" ]; then
+    REPO_SIBLING="$(dirname "${BASH_SOURCE[0]}")/../../bin/sable-dep-check"
+    [ -x "$REPO_SIBLING" ] && DEP_CHECK_BIN="$REPO_SIBLING"
+  fi
+
+  if [ -n "$DEP_CHECK_BIN" ] && [ -x "$DEP_CHECK_BIN" ]; then
+    # Merge state is a property of the REPO being dispatched into, so judge it
+    # in the dispatch's cwd (same reasoning as SABLE-041 in
+    # post-push-merge-notify.sh: never assume the hook's own $PWD).
+    DISPATCH_CWD=$(printf '%s' "$HOOK_INPUT" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+print(d.get('cwd', '') or '')
+" 2>/dev/null) || DISPATCH_CWD=""
+    [ -z "$DISPATCH_CWD" ] && DISPATCH_CWD="$PWD"
+
+    # --format=hook prints the warning block and NOTHING when clean, so the
+    # emptiness test below is the whole decision. Exit code is deliberately
+    # ignored (3 = findings) — the text is the signal.
+    #
+    # Bounded by `timeout` because the checker costs two batched `bd`
+    # invocations and bd is ~0.8s of process startup a call — with the claims
+    # loop above already spending its own, a dispatch naming several beads can
+    # outlast this hook's 5s budget (SABLE-5r5vq tracks that). On a timeout
+    # the warning is simply lost (the claims above are already written, so
+    # nothing else is at risk), which is the right trade for an advisory
+    # surface. Tune with SABLE_DEP_CHECK_TIMEOUT.
+    # shellcheck disable=SC2086
+    DEP_WARN=$(timeout -k 1 "${SABLE_DEP_CHECK_TIMEOUT:-4}" \
+                 "$DEP_CHECK_BIN" --format=hook --repo "$DISPATCH_CWD" $BEAD_IDS 2>/dev/null) || true
+
+    if [ -n "$DEP_WARN" ]; then
+      DEP_WARN="$DEP_WARN" python3 -c "
+import json, os
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'additionalContext': os.environ.get('DEP_WARN', '')
+    }
+}))
+" 2>/dev/null || true
+    fi
+  fi
+fi
 
 exit 0
