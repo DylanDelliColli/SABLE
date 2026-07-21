@@ -345,3 +345,147 @@ def test_pinned_bin_survives_real_reinstall_after_the_fix(installed_claude_dir):
     assert result.returncode == 0, result.stdout + result.stderr
     target = bin_dir / target_name
     assert target.is_file() and not target.is_symlink()
+
+
+# --- install provenance, end-to-end (SABLE-78kxu) -----------------------------
+#
+# Reproduces today's incident as a regression test: install.sh runs against a
+# sandbox HOME (never the real machine's ~/.claude — SABLE-mkj6k), then the
+# fixture REPO gets a new commit the installed set has never seen. The
+# manifest compare still reports the installed files clean (the new commit
+# doesn't touch any installed file), but the provenance stamp now visibly
+# PREDATES that new commit — an unresolvable "is X deployed?" is answered
+# with one git merge-base check instead of ad-hoc grepping.
+#
+# Uses a throwaway `git init` seeded with a COPY of the real working tree
+# (not a clone of its history) — this needs a repo it can freely commit a new
+# file into without touching the real SABLE repo or its git history.
+
+PROVENANCE_STAMP_NAME = ".sable-install-provenance"
+
+
+def make_fixture_repo(dest: Path):
+    shutil.copytree(
+        REPO, dest,
+        ignore=shutil.ignore_patterns(".git", ".beads", ".pytest_cache", "__pycache__"),
+    )
+    subprocess.run(["git", "init", "-q"], cwd=dest, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=dest, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "snapshot"],
+        cwd=dest, check=True,
+    )
+    return dest
+
+
+def run_install_from(repo_dir: Path, home_dir: Path):
+    result = subprocess.run(
+        ["bash", str(repo_dir / "install.sh")],
+        env={**os.environ, "HOME": str(home_dir)},
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, f"install.sh failed:\n{result.stdout}\n{result.stderr}"
+
+
+def git_head(repo_dir: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+@pytest.fixture()
+def provenance_fixture(tmp_path):
+    fixture_repo = make_fixture_repo(tmp_path / "fixture-repo")
+    home = tmp_path / "home"
+    home.mkdir()
+    run_install_from(fixture_repo, home)
+    return fixture_repo, home / ".claude"
+
+
+def test_install_writes_provenance_stamp_with_the_actual_head_sha(provenance_fixture):
+    fixture_repo, claude_dir = provenance_fixture
+    expected_sha = git_head(fixture_repo)
+    stamp = claude_dir / PROVENANCE_STAMP_NAME
+    assert stamp.is_file()
+    content = stamp.read_text()
+    assert f"commit={expected_sha}" in content
+    assert "branch=" in content
+    assert "dirty=false" in content
+    assert "timestamp=" in content
+
+
+def test_provenance_reproduces_the_incident_clean_report_with_a_provable_predate(provenance_fixture):
+    fixture_repo, claude_dir = provenance_fixture
+    installed_sha = git_head(fixture_repo)
+
+    (fixture_repo / "NEW_GUARD_FILE.md").write_text("a file the installed set has never seen\n")
+    subprocess.run(["git", "add", "NEW_GUARD_FILE.md"], cwd=fixture_repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "add new file"],
+        cwd=fixture_repo, check=True,
+    )
+    new_head = git_head(fixture_repo)
+    assert new_head != installed_sha
+
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(fixture_repo), "--claude-dir", str(claude_dir),
+         "--bin-dir", str(claude_dir.parent / ".local" / "bin")],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "sable-doctor: clean" in result.stdout      # installed files: unaffected by the new commit
+    assert installed_sha in result.stdout               # the SHA the install actually came from
+
+    ancestor_check = subprocess.run(
+        ["git", "-C", str(fixture_repo), "merge-base", "--is-ancestor", installed_sha, new_head],
+    )
+    assert ancestor_check.returncode == 0  # installed sha genuinely predates the new commit
+
+
+def test_installed_from_flag_prints_the_bare_sha(provenance_fixture):
+    fixture_repo, claude_dir = provenance_fixture
+    installed_sha = git_head(fixture_repo)
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--claude-dir", str(claude_dir), "--installed-from"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == installed_sha
+
+
+def test_installed_from_flag_fails_clearly_without_a_stamp(installed_claude_dir):
+    # models a pre-existing install from before this bead: no stamp at all.
+    (installed_claude_dir / PROVENANCE_STAMP_NAME).unlink(missing_ok=True)
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--claude-dir", str(installed_claude_dir), "--installed-from"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "no provenance stamp" in result.stderr
+
+
+def test_install_from_a_dirty_tree_stamps_dirty_true(tmp_path):
+    fixture_repo = make_fixture_repo(tmp_path / "fixture-repo")
+    (fixture_repo / "UNCOMMITTED_CHANGE.md").write_text("dirties the tree post-commit\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    run_install_from(fixture_repo, home)
+    stamp = (home / ".claude" / PROVENANCE_STAMP_NAME).read_text()
+    assert "dirty=true" in stamp
+
+
+def test_quiet_mode_sessionstart_hook_stays_silent_on_a_fresh_provenance_stamped_install(provenance_fixture):
+    # SABLE-78kxu must not make the highest-traffic path (`sable-doctor
+    # --quiet`, the SessionStart hook) start speaking on every healthy run
+    # just because provenance now exists.
+    fixture_repo, claude_dir = provenance_fixture
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(fixture_repo), "--claude-dir", str(claude_dir),
+         "--bin-dir", str(claude_dir.parent / ".local" / "bin"), "--quiet"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""

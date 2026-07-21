@@ -30,6 +30,10 @@ Usage:
   --json             emit a machine-readable report instead of text
   --quiet            print nothing when clean; a one-line warning when
                       drifted (SessionStart-hook friendly)
+  --installed-from   print the bare commit SHA the installed set was copied
+                      from, then exit (0 if known, 1 if no provenance stamp
+                      exists) — pipe into `git merge-base --is-ancestor` to
+                      answer "is commit X deployed?" without ad-hoc grepping.
 
 Exit status: 0 when every checked file matches the repo, 1 when any file is
 missing or drifted.
@@ -218,6 +222,109 @@ def _check_snapshot_pin(src: Path, dst: Path, cache: dict = None):
 # remedy for one of these bins would silently re-symlink a deliberate pin —
 # so that remedy must not be offered for this category.
 GUARDED_CATEGORIES = {"pinned bins"}
+
+
+# --- Install provenance (SABLE-78kxu) --------------------------------------
+# WHICH COMMIT did the currently installed set come from? The manifest
+# compare above only proves installed files match the repo TREE as it exists
+# TODAY — a file the tree doesn't have yet (e.g. a not-yet-merged guard) is
+# invisible to it, so a "clean" report is fully compatible with that file
+# being entirely absent from the machine (the incident this bead was filed
+# from). Provenance answers a narrower, different question: which commit the
+# INSTALLED FILES were copied from. It is a fact about files on disk, never a
+# claim that any feature landed in that commit is wired active — the ACTIVE
+# leg (is a given feature actually turned on) is a separate predicate under
+# SABLE-amriy and is out of scope here. The stamp is written once, for the
+# whole installed scope, as a single unit — not per installed file.
+PROVENANCE_FILENAME = ".sable-install-provenance"
+
+
+def read_provenance(claude_dir: Path):
+    """Parse <claude_dir>/.sable-install-provenance (written by install.sh),
+    or None if no stamp exists. That's the ordinary case for every install
+    that predates this bead — callers must render that as provenance
+    UNKNOWN, never silently as "clean" or "current"; an unresolvable stamp is
+    not evidence the install is fine, only that its origin can't be named."""
+    stamp = Path(claude_dir) / PROVENANCE_FILENAME
+    if not stamp.is_file():
+        return None
+    data = {}
+    for line in stamp.read_text(errors="replace").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            data[key.strip()] = value.strip()
+    if not data.get("commit"):
+        return None
+    data.setdefault("branch", "unknown")
+    data.setdefault("dirty", "false")
+    data.setdefault("timestamp", "unknown")
+    return data
+
+
+def current_repo_head(repo: Path):
+    """`repo`'s currently checked-out commit SHA, or None if `repo` isn't a
+    git checkout / git isn't on PATH — degrades gracefully (a provenance
+    report must still render without it) rather than raising."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def provenance_ancestor_of_head(repo: Path, sha: str):
+    """True if `sha` is an ancestor of `repo`'s current HEAD (the installed
+    commit has since landed on the branch this checkout is on); False if not
+    — a feature-branch install, or one that has since diverged, which is NOT
+    an error (installing from a feature branch is legitimate, SABLE-78kxu
+    item 4); None when this can't be determined at all (unresolvable sha, no
+    git) — never treated as True by a caller."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, "HEAD"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    return None
+
+
+def _provenance_report_lines(provenance, current_head=None, ancestor_ok=None):
+    """Lines naming WHICH COMMIT the installed set came from — a fact about
+    files, never a claim about whether any feature in that commit is wired
+    active. `current_head` is passed only when reporting DRIFT, so a
+    drifted install reads as an explained 'installed from X, repo now at Y'
+    instead of a bare, unexplained mismatch (SABLE-78kxu item 2)."""
+    if provenance is None:
+        return [
+            "installed from: UNKNOWN (no provenance stamp — install predates "
+            "SABLE-78kxu, or the stamp could not be read)"
+        ]
+    sha = provenance["commit"]
+    branch = provenance["branch"]
+    when = provenance["timestamp"]
+    dirty_note = " [DIRTY tree at install time — not reproducible]" if provenance.get("dirty") == "true" else ""
+    if current_head and current_head != sha:
+        line = f"installed from {sha} ({branch}), {when}{dirty_note} — repo now at {current_head}"
+    else:
+        line = f"installed from {sha} ({branch}), {when}{dirty_note}"
+    lines = [line]
+    if ancestor_ok is False:
+        lines.append(
+            "  note: installed commit is not an ancestor of the repo's current HEAD "
+            "(a feature-branch install, or one that has since diverged — not "
+            "necessarily a problem)"
+        )
+    return lines
 
 
 class NoProjectInstallError(Exception):
@@ -483,14 +590,19 @@ def _snapshot_remedy_lines(snapshot_bad):
     return lines
 
 
-def render_text_report(results):
+def render_text_report(results, provenance=None, current_head=None, ancestor_ok=None):
     bad = [r for r in results if r["status"] != "clean"]
     if not bad:
         print(f"sable-doctor: clean — {len(results)} installed files match repo HEAD.")
+        for line in _provenance_report_lines(provenance, ancestor_ok=ancestor_ok):
+            print(line)
         print(worker_cap_line())
         return
     print(f"sable-doctor: DRIFT DETECTED — {len(bad)}/{len(results)} installed files "
           "do not match repo HEAD.\n")
+    for line in _provenance_report_lines(provenance, current_head=current_head, ancestor_ok=ancestor_ok):
+        print(line)
+    print()
     last_category = None
     for r in bad:
         if r["category"] != last_category:
@@ -535,6 +647,11 @@ def main(argv=None):
     parser.add_argument("--bin-dir", default=None, help="installed CLI bin dir to check pinned bins against (default: ~/.local/bin — always global, independent of --project)")
     parser.add_argument("--json", action="store_true", help="emit a machine-readable report")
     parser.add_argument("--quiet", action="store_true", help="print nothing when clean; one line when drifted")
+    parser.add_argument(
+        "--installed-from", action="store_true",
+        help="print the bare commit SHA the installed set was copied from and exit "
+             "(0 if known, 1 if no provenance stamp exists); skips the manifest check",
+    )
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve() if args.repo else REPO
@@ -547,13 +664,37 @@ def main(argv=None):
     else:
         claude_dir = resolve_claude_dir(args.claude_dir, os.environ)
 
+    if args.installed_from:
+        provenance = read_provenance(claude_dir)
+        if provenance is None:
+            print(
+                "sable-doctor: no provenance stamp found — install predates SABLE-78kxu, "
+                "or the stamp could not be read",
+                file=sys.stderr,
+            )
+            return 1
+        print(provenance["commit"])
+        return 0
+
     bin_dir = resolve_bin_dir(args.bin_dir)
     entries = build_manifest(repo, claude_dir, bin_dir)
     results = check_manifest(entries)
     bad = [r for r in results if r["status"] != "clean"]
 
+    provenance = read_provenance(claude_dir)
+    current_head = current_repo_head(repo)
+    ancestor_ok = None
+    if provenance is not None and current_head is not None:
+        ancestor_ok = provenance_ancestor_of_head(repo, provenance["commit"])
+
     if args.json:
-        print(json.dumps({"clean": not bad, "results": results}, indent=2))
+        print(json.dumps({
+            "clean": not bad,
+            "results": results,
+            "provenance": provenance,
+            "current_head": current_head,
+            "provenance_ancestor_of_head": ancestor_ok,
+        }, indent=2))
     elif args.quiet:
         if bad:
             guarded_bad = [r for r in bad if r["category"] in GUARDED_CATEGORIES]
@@ -592,7 +733,7 @@ def main(argv=None):
                     file=sys.stderr,
                 )
     else:
-        render_text_report(results)
+        render_text_report(results, provenance=provenance, current_head=current_head, ancestor_ok=ancestor_ok)
 
     return 1 if bad else 0
 
