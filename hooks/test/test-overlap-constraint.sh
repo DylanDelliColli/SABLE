@@ -75,9 +75,14 @@ cat > "$STUB_DIR/bd" <<'STUB'
 #!/usr/bin/env bash
 if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
   export DESC="${DISP_DESC:-implement hooks/foo.sh for the feature}"
+  export DISP_SW="${DISP_SERIALIZE_WITH:-}"
+  export DISP_NOTES="${DISP_NOTES:-}"
   python3 -c "
 import json, os, sys
-print(json.dumps([{'id': 'SABLE-disp', 'description': os.environ.get('DESC', ''), 'metadata': {}}]))
+metadata = {}
+if os.environ.get('DISP_SW', ''):
+    metadata['serialize_with'] = os.environ['DISP_SW']
+print(json.dumps([{'id': 'SABLE-disp', 'description': os.environ.get('DESC', ''), 'notes': os.environ.get('DISP_NOTES', ''), 'metadata': metadata}]))
 "
   exit 0
 fi
@@ -106,7 +111,7 @@ print(json.dumps(d))
 " "$1" "$2" "$3"
 }
 
-# run_hook <json> <overlap_file> [disp_desc]
+# run_hook <json> <overlap_file> [disp_desc] [disp_serialize_with] [disp_notes]
 run_hook() {
   BD_CALL_LOG="$FIXTURE_DIR/bd_calls.log"
   : > "$BD_CALL_LOG"
@@ -116,6 +121,8 @@ run_hook() {
         SABLE_MODE_STATE="$NONEXISTENT_MODE" \
         OVERLAP_FILE="$2" \
         DISP_DESC="${3:-}" \
+        DISP_SERIALIZE_WITH="${4:-}" \
+        DISP_NOTES="${5:-}" \
         BD_CALL_LOG="$BD_CALL_LOG" \
         PATH="$STUB_DIR:$PATH" \
         bash "$HOOK" 2>/dev/null
@@ -200,6 +207,28 @@ if printf '%s' "$OUT" | grep -q '"permissionDecision": "deny"' && printf '%s' "$
   pass "declared '## File footprint' section (extension-less path) triggers the constraint"
 else
   fail "declared '## File footprint' section (extension-less path) triggers the constraint" "got: ${OUT:-<empty>}"
+fi
+
+# Case 8 (SABLE-86bsl): the dispatch bead carries ONLY the serialize_with
+# METADATA field (already granted by an earlier dispatch) and NO Serialize-with
+# line anywhere — not in the prompt, not in notes. Must still be PERMITTED:
+# the metadata is the durable record and must not depend on the prompt/notes
+# prose surviving. Red before the metadata-first read path existed.
+OUT=$(run_hook "$(make_input a8 optimus 'Work SABLE-disp')" "hooks/foo.sh" "" "SABLE-wip" "")
+if printf '%s' "$OUT" | grep -q 'SERIALIZE-WITH ACCEPTED' && ! printf '%s' "$OUT" | grep -q '"permissionDecision": "deny"'; then
+  pass "serialize_with_read_from_metadata: metadata-only grant (no prompt/notes line) is PERMITTED"
+else
+  fail "serialize_with_read_from_metadata: metadata-only grant (no prompt/notes line) is PERMITTED" "got: ${OUT:-<empty>}"
+fi
+
+# Case 9 (SABLE-86bsl): backward-compat fallback — a bead authored before the
+# metadata field existed, carrying the declaration ONLY as a 'Serialize-with:'
+# line in its own NOTES (not the dispatch prompt) -> still PERMITTED.
+OUT=$(run_hook "$(make_input a9 optimus 'Work SABLE-disp')" "hooks/foo.sh" "" "" "Serialize-with: SABLE-wip")
+if printf '%s' "$OUT" | grep -q 'SERIALIZE-WITH ACCEPTED' && ! printf '%s' "$OUT" | grep -q '"permissionDecision": "deny"'; then
+  pass "notes-borne Serialize-with line (legacy, no metadata field) is PERMITTED"
+else
+  fail "notes-borne Serialize-with line (legacy, no metadata field) is PERMITTED" "got: ${OUT:-<empty>}"
 fi
 
 echo

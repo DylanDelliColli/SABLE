@@ -77,6 +77,52 @@ for i in sorted(ids):
 
 [ -z "$DISPATCH_IDS" ] && exit 0
 
+# SABLE-86bsl: metadata-first read for an ALREADY-GRANTED serialization. The
+# 'allow' branch below writes an accepted grant into BOTH beads' serialize_with
+# METADATA field — durable, and the exact field this hook itself maintains. Read
+# it back FIRST so a prior grant survives an unrelated notes rewrite (bd update
+# --notes, a close/reopen, etc.) on a later respawn, instead of depending on the
+# operator re-typing 'Serialize-with:' into the dispatch prompt every time. Fall
+# back to a 'Serialize-with:' line in the bead's own NOTES only for beads
+# authored before the metadata field existed; the PROMPT-parsed SERIALIZE_WITH
+# above remains the mechanism for declaring a NEW grant on this dispatch.
+SERIALIZE_WITH_STORED=$(for BID in $DISPATCH_IDS; do
+  bd show "$BID" --json 2>/dev/null | python3 -c "
+import json, re, sys
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+
+if isinstance(data, list) and data:
+    bead = data[0]
+    ids = set()
+
+    sw_meta = (bead.get('metadata', {}) or {}).get('serialize_with', '') or ''
+    for tok in sw_meta.split(','):
+        tok = tok.strip()
+        if tok:
+            ids.add(tok)
+
+    notes = bead.get('notes', '') or ''
+    for m in re.finditer(r'Serialize-with:\s*([^\n]+)', notes, re.IGNORECASE):
+        for tok in re.split(r'[,\s]+', m.group(1).strip()):
+            if tok:
+                ids.add(tok)
+
+    for i in sorted(ids):
+        print(i)
+" 2>/dev/null
+done | sort -u)
+
+SERIALIZE_WITH=$(SERIALIZE_WITH_PROMPT="$SERIALIZE_WITH" SERIALIZE_WITH_STORED="$SERIALIZE_WITH_STORED" python3 -c "
+import os
+prompt_ids = set(os.environ.get('SERIALIZE_WITH_PROMPT', '').split())
+stored_ids = set(os.environ.get('SERIALIZE_WITH_STORED', '').split())
+print(' '.join(sorted(prompt_ids | stored_ids)))
+")
+
 # Aggregate declared-footprint file claims from this dispatch's beads. Priority:
 # 1) wip_claims metadata (already established — SABLE-szd dedicated field), then
 # 2) a planner-authored '## File footprint' description section (SABLE-jd5fj.6:
