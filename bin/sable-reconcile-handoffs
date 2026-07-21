@@ -10,7 +10,47 @@ the systems of record (origin + beads) and reconciles what it finds
 (Anthropic's own "query systems of record and reconcile" pattern; TRADEOFFS #2).
 It promotes chuck.md's prose stranded-recovery sweep (chuck.md §Boundaries) to code.
 
-STRANDED PREDICATE (a branch is stranded iff ALL FOUR hold):
+HELD IS A THIRD OUTCOME, NOT A SUPPRESSION (SABLE-jejx3)
+--------------------------------------------------------
+Before this floor learned about holds it could report only two outcomes:
+STRANDED, or not. A branch that is unmerged BY DELIBERATE DECISION (a manager
+issued an explicit do-not-merge hold) satisfies all four stranded predicates
+IDENTICALLY to one that is unmerged BY ACCIDENT, so the floor filed a handoff
+whose content — "nobody merged this, merge it" — was the EXACT INVERSE of the
+standing instruction, and re-filed it every cadence once Chuck closed it.
+
+A hold is now a FIRST-CLASS, DURABLE, MACHINE-READABLE state carried as
+metadata ON THE WORK BEAD — never on the branch name, never in tmux traffic,
+neither of which survives a pane restart (that non-durability IS the root
+defect). Keying on the work bead means the hold SURVIVES A BRANCH RENAME or a
+re-push under a new name: the bead already carries `branch` metadata
+(SABLE-i5739), so re-pointing that field moves the hold with the work.
+
+  hold        the reason (any non-empty value = HELD; this is the presence key)
+  hold_by     who placed it        — an unowned hold is unreleasable after a recycle
+  hold_since  ISO8601 timestamp    — so the hold's own AGE can be escalated
+  hold_until  the release condition — "until what", the thing that prevents a
+              hold decaying into a permanent quiet veto
+
+  place:  bd update <work-bead> --sandbox \
+            --set-metadata hold="<reason>" --set-metadata hold_by="<who>" \
+            --set-metadata hold_since="<ISO8601>" --set-metadata hold_until="<condition>"
+  lift:   bd update <work-bead> --sandbox --unset-metadata hold \
+            --unset-metadata hold_by --unset-metadata hold_since --unset-metadata hold_until
+
+A held branch is NEVER silently skipped. Silence is how the previous generation
+of this bug worked (SABLE-2az2x: an instrument that cannot say "I could not
+assess"), and a hold is WORSE than a strand in that direction because it is
+SELF-SILENCING BY CONSTRUCTION — a forgotten strand is re-reported every cadence
+until someone acts, while a forgotten hold suppresses the very report that would
+surface it. So every cadence NAMES each held branch with by/since/until/reason,
+and a hold that is stale (older than $SABLE_HOLD_STALE_DAYS, default 3), unowned,
+undated, or carries no release condition is flagged NEEDING REVIEW in the summary.
+A hold whose state could not be READ at all (the bead query failed) is its own
+reported outcome — never folded into "not held", which would resume filing the
+inverted handoff, and never into a clean summary.
+
+STRANDED PREDICATE (a branch is stranded iff ALL FOUR hold, AND it is not HELD):
   1. origin's `wk-*` branch tip is NOT an ancestor of the integration branch
      (i.e. genuinely unmerged — `git merge-base --is-ancestor` exit 1).
   2. its work bead — resolved via STRUCTURED `branch` metadata first
@@ -62,9 +102,11 @@ is unit-testable without real git / bd):
   SABLE_RC_REPO   repo path (default $PWD)         SABLE_RC_GIT     (git)
   SABLE_RC_REMOTE remote name (origin)             SABLE_RC_BD      (bd)
   SABLE_RECONCILE_AGE_MIN  push-age threshold, minutes (10)
+  SABLE_HOLD_STALE_DAYS    a hold older than this is flagged for review (3)
 
 Usage:
-  sable-reconcile-handoffs [--repo PATH] [--remote NAME] [--age-min N] [--dry-run]
+  sable-reconcile-handoffs [--repo PATH] [--remote NAME] [--age-min N]
+                           [--hold-stale-days N] [--dry-run]
   sable-reconcile-handoffs --help
 
 Exit codes:
@@ -188,6 +230,128 @@ def preview_kick_eligible(rc: int, age_seconds: float | None,
     return (True, "eligible-for-preview-kick")
 
 
+# --------------------------------------------------------------------------
+# HOLD: the first-class third outcome (SABLE-jejx3). Pure functions only — the
+# hold lives in the WORK BEAD's metadata (see module docstring), so everything
+# below operates on an already-fetched bead record and is unit-testable with no
+# bd/git at all.
+# --------------------------------------------------------------------------
+
+HOLD_REASON_KEY = "hold"
+HOLD_BY_KEY = "hold_by"
+HOLD_SINCE_KEY = "hold_since"
+HOLD_UNTIL_KEY = "hold_until"
+
+# Sentinel for "the work bead could not be READ, so hold state is unknown".
+# Deliberately NOT None (which means 'read fine, not held') — collapsing the two
+# is exactly the mistake that files an inverted 'merge me' handoff for a branch
+# that is in fact under a do-not-merge hold.
+HOLD_UNKNOWN = "hold-state-unknown"
+
+DEFAULT_HOLD_STALE_DAYS = 3.0
+
+
+def hold_from_bead(bead: dict | None) -> dict | None:
+    """The hold record carried by a work bead, or None when the bead is not
+    held. Presence is keyed on a NON-EMPTY `hold` metadata value (the reason) —
+    the other three fields are detail, and their ABSENCE is reported as a review
+    flag rather than treated as a missing hold, so a sloppily-placed hold still
+    protects the branch while being loudly incomplete."""
+    if not isinstance(bead, dict):
+        return None
+    meta = bead.get("metadata")
+    if not isinstance(meta, dict):
+        return None
+    reason = meta.get(HOLD_REASON_KEY)
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    def _field(key: str) -> str | None:
+        v = meta.get(key)
+        return v.strip() if isinstance(v, str) and v.strip() else None
+    return {
+        "bead": bead.get("id"),
+        "reason": reason.strip(),
+        "by": _field(HOLD_BY_KEY),
+        "since": _field(HOLD_SINCE_KEY),
+        "until": _field(HOLD_UNTIL_KEY),
+    }
+
+
+def parse_hold_since(since: str | None) -> float | None:
+    """Epoch seconds for an ISO8601 `hold_since` (a trailing `Z` is accepted —
+    it is what bd and every SABLE timestamp writer emit). None when absent or
+    unparseable; an unparseable date is treated the same as a missing one, i.e.
+    the hold's age is UNKNOWN and that fact is flagged, never assumed fresh."""
+    if not since:
+        return None
+    text = since.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(text)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        from datetime import timezone
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def hold_age_days(hold: dict, now: float) -> float | None:
+    """Age of the hold in days, or None when `hold_since` is missing/unparseable."""
+    ts = parse_hold_since(hold.get("since"))
+    if ts is None:
+        return None
+    return max(0.0, (now - ts) / 86400.0)
+
+
+def hold_review_flags(hold: dict, now: float, stale_days: float) -> list[str]:
+    """Why this hold itself needs a human look. A hold suppresses the report
+    that would otherwise surface its branch, so an un-reviewable hold decays
+    into a permanent quiet veto that outlives everyone who knew why it was
+    placed — these flags are what make that decay LOUD instead of silent."""
+    flags: list[str] = []
+    if not hold.get("by"):
+        flags.append("UNOWNED(no hold_by — nobody can release it)")
+    if not hold.get("until"):
+        flags.append("NO-RELEASE-CONDITION(no hold_until — cannot expire)")
+    age = hold_age_days(hold, now)
+    if age is None:
+        flags.append("AGE-UNKNOWN(no parseable hold_since)")
+    elif age > stale_days:
+        flags.append(f"STALE({age:.1f}d > {stale_days:g}d)")
+    return flags
+
+
+def describe_hold(hold: dict, now: float, stale_days: float) -> str:
+    """The per-cadence HELD line. Carries all four fields chuck required —
+    held, BY WHOM, SINCE WHEN, UNTIL WHAT — plus the review flags, so a fresh
+    manager reading one sweep's output has everything needed to either respect
+    or release the hold without any surviving tmux context."""
+    age = hold_age_days(hold, now)
+    age_txt = f"{age:.1f}d" if age is not None else "age-unknown"
+    flags = hold_review_flags(hold, now, stale_days)
+    flag_txt = f" [NEEDS REVIEW: {'; '.join(flags)}]" if flags else ""
+    return (
+        f"HELD — do NOT merge (deliberate, not stranded); "
+        f"by={hold.get('by') or 'UNKNOWN'} "
+        f"since={hold.get('since') or 'UNKNOWN'} ({age_txt}) "
+        f"until={hold.get('until') or 'UNSTATED'} "
+        f"reason={hold['reason']}"
+        f"{flag_txt}"
+    )
+
+
+def hold_lift_hint(hold: dict) -> str:
+    """The exact command that releases this hold. Printed with every held
+    branch so releasing one never requires reading this source file."""
+    bead = hold.get("bead") or "<work-bead>"
+    return (f"to lift: bd update {bead} --sandbox --unset-metadata hold "
+            f"--unset-metadata hold_by --unset-metadata hold_since "
+            f"--unset-metadata hold_until")
+
+
 _BEAD_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]+(?:\.[0-9]+)*")
 
 
@@ -217,6 +381,54 @@ def status_from_show_json(text: str) -> str | None:
     if isinstance(d, list):
         d = d[0] if d else None
     return d.get("status") if isinstance(d, dict) else None
+
+
+def record_from_show_json(text: str) -> dict | None:
+    """The WHOLE bead record out of a `bd show <id> --json` payload (bare object
+    or single-element list). The record — not just its status — is what carries
+    the hold metadata (SABLE-jejx3), so resolution returns the object and the
+    status accessors read from it."""
+    try:
+        d = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(d, list):
+        d = d[0] if d else None
+    return d if isinstance(d, dict) else None
+
+
+def all_records_from_search_json(text: str) -> list[dict]:
+    """EVERY record in a `bd list`/`bd search --json` payload, in payload order.
+
+    More than one bead can legitimately carry the same `branch` metadata (an
+    observation/scratch bead filed against the same branch as the real work
+    bead — this is not hypothetical; it is what the live corpus looks like).
+    Predicate 2 only needs one status, but HOLD resolution must see them ALL:
+    if any joined bead is held, the branch is held, and letting an arbitrary
+    payload ordering decide would silently drop a hold and resume filing the
+    inverted 'merge me' handoff — the exact defect this floor is fixing."""
+    try:
+        d = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if isinstance(d, dict):
+        d = [d]
+    return [r for r in d if isinstance(r, dict)] if isinstance(d, list) else []
+
+
+def first_record_from_search_json(text: str) -> dict | None:
+    """The first whole record in a `bd list`/`bd search --json` payload (a
+    list), None if empty/unparseable. Record-level counterpart of
+    first_status_from_search_json."""
+    try:
+        d = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(d, dict):
+        d = [d]
+    if isinstance(d, list) and d and isinstance(d[0], dict):
+        return d[0]
+    return None
 
 
 def first_status_from_search_json(text: str) -> str | None:
@@ -336,6 +548,94 @@ def branch_tip_age_seconds(repo: str, remote: str, branch: str, now: float) -> f
         return None
 
 
+def find_work_bead_records(repo: str, branch: str) -> tuple[list[dict], bool]:
+    """ALL work-bead records joined to the branch, plus whether resolution was
+    READABLE.
+
+    Returns (records, resolved_ok). `resolved_ok` is False only when the
+    resolution machinery ITSELF failed (the structured metadata query exited
+    nonzero and no fallback produced a record) — i.e. "we could not read", as
+    opposed to "we read fine and there is no bead" (None, True). Predicate 2
+    (status) can safely collapse those two, because an unresolvable status
+    conservatively leaves the branch not-stranded either way. HOLD state cannot:
+    collapsing unreadable into not-held is precisely how the floor would resume
+    filing an inverted 'merge me' handoff against a held branch, so
+    find_work_bead_hold keeps the distinction and reports it.
+
+    Resolution order is unchanged from SABLE-i5739 — see find_work_bead_status
+    for the full rationale of why structured metadata is primary. What DID
+    change (SABLE-jejx3) is arity: the metadata leg returns EVERY joined bead
+    rather than only the first, because a hold on any of them holds the branch
+    (see all_records_from_search_json)."""
+    resolvable_failure = False
+    cp = _bd(repo, "list", "--status", "all",
+             "--metadata-field", f"branch={branch}", "--json", check=False)
+    if cp.returncode != 0:
+        resolvable_failure = True
+        print(f"sable-reconcile-handoffs: WARNING branch-metadata resolution "
+              f"failed for {branch} (bd list exit {cp.returncode}) — falling "
+              f"back to legacy resolution, NOT treating this as "
+              f"no-qualifying-bead: {cp.stdout.strip()}", file=sys.stderr)
+    else:
+        recs = [r for r in all_records_from_search_json(cp.stdout)
+                if r.get("status") is not None]
+        if recs:
+            return (recs, True)
+
+    bead_id = parse_bead_id(branch)
+    if bead_id:
+        cp = _bd(repo, "show", bead_id, "--json", check=False)
+        if cp.returncode == 0:
+            rec = record_from_show_json(cp.stdout)
+            if rec is not None and rec.get("status") is not None:
+                return ([rec], True)
+
+    cp = _bd(repo, "search", branch, "--status", "all", "--json", check=False)
+    if cp.returncode == 0:
+        rec = first_record_from_search_json(cp.stdout)
+        if rec is not None:
+            return ([rec], True)
+        return ([], not resolvable_failure)
+    return ([], not resolvable_failure)
+
+
+def find_work_bead(repo: str, branch: str) -> tuple[dict | None, bool]:
+    """The branch's PRIMARY work-bead record (the first joined bead) plus
+    whether resolution was readable — the single-record view predicate 2 uses."""
+    recs, ok = find_work_bead_records(repo, branch)
+    return (recs[0] if recs else None, ok)
+
+
+def find_work_bead_hold(repo: str, branch: str) -> dict | str | None:
+    """The branch's HOLD state (SABLE-jejx3). Three distinct outcomes, never two:
+
+      * a hold record  — the branch is deliberately held; do NOT file, DO report
+      * None           — the work bead read fine and carries no hold
+      * HOLD_UNKNOWN   — the bead could not be read at all, so 'held' can be
+                         neither confirmed nor ruled out. Reported as its own
+                         outcome; the floor does not file against it, because
+                         filing an INVERTED handoff for a genuinely held branch
+                         is unrecoverable-by-automation in a way that deferring
+                         one cadence of a real strand is not — and unlike a
+                         silent skip, this one says so in the summary.
+
+    The hold is read from the WORK BEAD, so it survives a branch rename: the
+    bead's `branch` metadata is re-pointed and the hold travels with it.
+
+    EVERY bead joined to the branch is consulted, not just the first: a hold on
+    any of them holds the branch. Ordering must never decide whether a hold is
+    honoured (the live corpus routinely has an observation bead joined to the
+    same branch as the real work bead, and it can sort first)."""
+    records, ok = find_work_bead_records(repo, branch)
+    if not ok:
+        return HOLD_UNKNOWN
+    for rec in records:
+        hold = hold_from_bead(rec)
+        if hold is not None:
+            return hold
+    return None
+
+
 def find_work_bead_status(repo: str, branch: str) -> str | None:
     """The branch's work-bead status (predicate 2). Resolution order
     (SABLE-i5739 — prose-search closed as the primary resolver):
@@ -371,31 +671,13 @@ def find_work_bead_status(repo: str, branch: str) -> str | None:
     bead fixes for the metadata path itself. It's printed as a loud WARNING
     (mirroring reconcile()'s git-fetch-failure WARNING) so 'nothing
     stranded' (query ran clean, found nothing) is never confused with
-    'resolution failed' (the query itself is broken) — dispatch note #8."""
-    cp = _bd(repo, "list", "--status", "all",
-             "--metadata-field", f"branch={branch}", "--json", check=False)
-    if cp.returncode != 0:
-        print(f"sable-reconcile-handoffs: WARNING branch-metadata resolution "
-              f"failed for {branch} (bd list exit {cp.returncode}) — falling "
-              f"back to legacy resolution, NOT treating this as "
-              f"no-qualifying-bead: {cp.stdout.strip()}", file=sys.stderr)
-    else:
-        status = first_status_from_search_json(cp.stdout)
-        if status is not None:
-            return status
+    'resolution failed' (the query itself is broken) — dispatch note #8.
 
-    bead_id = parse_bead_id(branch)
-    if bead_id:
-        cp = _bd(repo, "show", bead_id, "--json", check=False)
-        if cp.returncode == 0:
-            status = status_from_show_json(cp.stdout)
-            if status is not None:
-                return status
-
-    cp = _bd(repo, "search", branch, "--status", "all", "--json", check=False)
-    if cp.returncode == 0:
-        return first_status_from_search_json(cp.stdout)
-    return None
+    Thin accessor over find_work_bead (SABLE-jejx3 moved the resolution
+    itself there so the SAME resolver serves both status and hold — one
+    resolution order, one place to change it)."""
+    bead, _ = find_work_bead(repo, branch)
+    return bead.get("status") if isinstance(bead, dict) else None
 
 
 def open_for_chuck_beads(repo: str) -> list[dict] | None:
@@ -470,14 +752,31 @@ def attempt_preview_kick(repo: str, remote: str, branch: str,
 
 def classify_branch(repo: str, remote: str, branch: str, integration_branch: str,
                     open_beads: list[dict] | None, threshold_minutes: float,
-                    now: float) -> tuple[bool, str, str | None]:
-    """Apply the four-part stranded predicate to ONE branch. Returns
-    (is_stranded, reason, work_status). Cheap/pure checks first; the bead-status
-    lookup (a subprocess) runs only after ancestry + for-chuck rule the branch
-    in as a live candidate."""
+                    now: float, hold: dict | str | None = None,
+                    stale_days: float = DEFAULT_HOLD_STALE_DAYS) -> tuple[bool, str, str | None]:
+    """Apply the stranded predicate to ONE branch. Returns (is_stranded, reason,
+    work_status). Cheap/pure checks first; the bead-status lookup (a subprocess)
+    runs only after ancestry + for-chuck rule the branch in as a live candidate.
+
+    `hold` (SABLE-jejx3) is the branch's already-resolved hold state — a hold
+    record, None for not-held, or HOLD_UNKNOWN for unreadable (see
+    find_work_bead_hold). It is checked immediately after ancestry, BEFORE the
+    remaining stranded predicates, because a deliberately-held branch satisfies
+    every one of them and the handoff they would produce says the exact
+    OPPOSITE of the standing instruction. It is resolved by the caller rather
+    than here so reconcile() can also report it, held branches being a reported
+    outcome and never a silent skip. Defaults to None so every pre-existing
+    call site keeps its exact prior behavior."""
     rc = branch_ancestor_rc(repo, remote, branch, integration_branch)
     if not ancestor_rc_is_unmerged(rc):
         return (False, f"merged-or-unresolvable(is-ancestor rc={rc})", None)
+
+    if hold == HOLD_UNKNOWN:
+        return (False,
+                "hold-state-unknown(work bead unreadable) — NOT filing: cannot "
+                "rule out a deliberate do-not-merge hold", None)
+    if isinstance(hold, dict):
+        return (False, describe_hold(hold, now, stale_days), None)
 
     if branch_named_by_open_for_chuck(open_beads, branch):
         return (False, "handoff-already-on-record", None)
@@ -495,7 +794,8 @@ def classify_branch(repo: str, remote: str, branch: str, integration_branch: str
     return (True, "STRANDED", status)
 
 
-def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -> int:
+def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool,
+              stale_days: float = DEFAULT_HOLD_STALE_DAYS) -> int:
     integration_branch = resolve_integration_branch(repo)
     # Refresh remote-tracking refs so ancestry + age read origin's current
     # truth. SABLE-6sdpx: git exits nonzero here on a real network/auth
@@ -522,6 +822,8 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -
           f"{len(branches)} origin wk-* branch(es), age threshold {threshold_minutes}min")
 
     stranded: list[tuple[str, str | None]] = []
+    held: list[tuple[str, dict]] = []
+    hold_unreadable: list[str] = []
     unassessed = 0
     kick_candidates = 0
     kicked = 0
@@ -546,9 +848,21 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -
                     kicked += 1
                 print(f"  {br}: preview-kick {detail}")
 
+        # HOLD state (SABLE-jejx3) — resolved here, not inside classify_branch,
+        # because a held branch is a REPORTED outcome, not a suppressed one, so
+        # the sweep needs the record itself. Resolved only for branches that
+        # cleared P1: a merged branch is nobody's concern, held or not.
+        hold = (find_work_bead_hold(repo, br)
+                if ancestor_rc_is_unmerged(rc) else None)
+
         is_stranded, reason, status = classify_branch(
-            repo, remote, br, integration_branch, open_beads, threshold_minutes, now)
+            repo, remote, br, integration_branch, open_beads, threshold_minutes,
+            now, hold, stale_days)
         print(f"  {br}: {reason}")
+        if isinstance(hold, dict):
+            held.append((br, hold))
+        elif hold == HOLD_UNKNOWN:
+            hold_unreadable.append(br)
         if is_stranded:
             stranded.append((br, status))
         elif corpus_unknown and reason == "handoff-already-on-record":
@@ -572,6 +886,28 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -
             print(f"  WARNING: could not file for-chuck bead for {br} "
                   f"(bd exit {cp.returncode}): {cp.stdout.strip()}")
 
+    # SABLE-jejx3: HELD branches are RE-REPORTED, loudly, every single cadence.
+    # This recap exists in addition to the per-branch line above because a hold
+    # is self-silencing by construction — it suppresses the strand report that
+    # would otherwise keep its branch visible — so the one thing this floor must
+    # never do is let a hold quietly become permanent. Naming every held branch
+    # with by/since/until/reason and the exact lift command makes a forgotten
+    # hold as visible as a forgotten strand.
+    review_needed = 0
+    if held:
+        print(f"  --- HELD BRANCHES ({len(held)}) — deliberate, do NOT merge; "
+              f"re-reported every cadence by design ---")
+        for br, hold in held:
+            flags = hold_review_flags(hold, now, stale_days)
+            if flags:
+                review_needed += 1
+            print(f"  HELD {br}: {describe_hold(hold, now, stale_days)}")
+            print(f"       {hold_lift_hint(hold)}")
+    for br in hold_unreadable:
+        print(f"  HOLD-STATE UNREADABLE {br}: work bead could not be read — "
+              f"neither held nor not-held could be established, so nothing was "
+              f"filed for it this cadence")
+
     # SABLE-2az2x: an UNKNOWN for-chuck corpus makes the reconciler assume-named
     # (skip-filing) for every unmerged branch it sees, cadence after cadence, if
     # the underlying query failure is PERSISTENT rather than transient — and the
@@ -585,14 +921,30 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -
         f" (CORPUS UNREADABLE — suppression active, {unassessed} branch(es) unassessed)"
         if corpus_unknown else ""
     )
+    # SABLE-jejx3: the summary carries the held count too — the three outcomes
+    # this floor can now report are STRANDED, HELD, and could-not-assess, and a
+    # summary that named only the first would be the two-state instrument this
+    # bead exists to retire. Held branches are NAMED, not just counted, so one
+    # grep of the summary line answers "what is deliberately not merging".
+    held_note = ""
+    if held:
+        names = ", ".join(br for br, _ in held)
+        held_note = f" [{names}]"
+        if review_needed:
+            held_note += f" ({review_needed} NEEDING REVIEW)"
+    if hold_unreadable:
+        held_note += (f"; {len(hold_unreadable)} branch(es) with UNREADABLE "
+                      f"hold state [{', '.join(hold_unreadable)}]")
+    held_summary = f"{len(held)} held branch(es){held_note}"
+
     if dry_run:
         print(f"sable-reconcile-handoffs [DRY-RUN]: {len(stranded)} stranded branch(es) "
-              f"classified, 0 filed (dry-run){corpus_note}; {kick_candidates} "
-              f"preview-kick candidate(s), 0 kicked (dry-run).")
+              f"classified, 0 filed (dry-run){corpus_note}; {held_summary}; "
+              f"{kick_candidates} preview-kick candidate(s), 0 kicked (dry-run).")
     else:
         print(f"sable-reconcile-handoffs: {len(stranded)} stranded branch(es), "
-              f"{filed} for-chuck bead(s) filed{corpus_note}; {kick_candidates} "
-              f"preview-kick candidate(s), {kicked} kicked.")
+              f"{filed} for-chuck bead(s) filed{corpus_note}; {held_summary}; "
+              f"{kick_candidates} preview-kick candidate(s), {kicked} kicked.")
     return 0
 
 
@@ -605,10 +957,18 @@ def main(argv: list[str] | None = None) -> int:
                         help="push-age threshold in minutes before a branch is "
                              "eligible for reconciliation (default 10; "
                              "SABLE_RECONCILE_AGE_MIN)")
+    parser.add_argument("--hold-stale-days", type=float,
+                        default=float(os.environ.get(
+                            "SABLE_HOLD_STALE_DAYS", str(DEFAULT_HOLD_STALE_DAYS))),
+                        help="a hold older than this many days is flagged "
+                             "NEEDING REVIEW in the summary so it cannot decay "
+                             "into a permanent quiet veto (default 3; "
+                             "SABLE_HOLD_STALE_DAYS)")
     parser.add_argument("--dry-run", action="store_true",
                         help="classify + print only; file no beads; exit 0")
     args = parser.parse_args(argv)
-    return reconcile(args.repo, args.remote, args.age_min, args.dry_run)
+    return reconcile(args.repo, args.remote, args.age_min, args.dry_run,
+                     args.hold_stale_days)
 
 
 if __name__ == "__main__":
