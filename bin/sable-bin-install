@@ -20,8 +20,27 @@
 # --repin forces the re-symlink explicitly. --copy is unaffected (an explicit
 # request to write regular files is exactly what a pin already looks like).
 #
+# Snapshot pinning (SABLE-9boz4): a REGULAR-FILE pin (above) works only for
+# bins with zero repo-local imports — sable-spawn-worker and sable-msg import
+# sibling modules (sable_pane_lib.py, ...) from bin/, so copying just the one
+# file severs the import (ImportError; caught live by a smoke test and rolled
+# back once already — see the 2026-07-21 y6ik3 window). --pin-snapshot instead
+# freezes the ENTIRE bin/ directory as one versioned unit at
+# ~/.local/lib/sable-<sha>/ (bins + every sibling lib, at the repo sha current
+# when you pinned) and atomically repoints the entry symlink(s) into it, so
+# the import closure travels with the pin — including any sibling module a
+# bin gains, loses, or is renamed to later, since the unit is "all of bin/",
+# not an enumerated file list. A snapshot-pinned entry is still a SYMLINK (it
+# just resolves outside this repo's bin/ instead of a regular file), so pin
+# detection below also treats "symlink pointing outside $BIN_DIR" as pinned —
+# not just "not a symlink" — or a plain re-run would silently re-symlink it
+# back to the live repo, exactly the hazard this exists to prevent. Rollback
+# is --repin (same as a regular-file pin): re-symlinks back to the live repo.
+#
 # Usage:
 #   sable-bin-install [--dir DIR] [--copy] [--repin] [--uninstall] [--dry-run]
+#   sable-bin-install --pin-snapshot [NAME...]
+#   sable-bin-install --classify NAME   (debug: prints "plain" or "snapshot")
 
 set -u
 
@@ -40,6 +59,8 @@ MODE="symlink"
 ACTION="install"
 DRY_RUN=0
 REPIN=0
+PIN_TARGETS=""
+CLASSIFY_TARGET=""
 
 usage() {
   cat <<EOF
@@ -47,11 +68,21 @@ sable-bin-install — link the SABLE CLI tools (sable-*) onto your PATH.
 
 Usage:
   sable-bin-install [--dir DIR] [--copy] [--repin] [--uninstall] [--dry-run]
-    --dir DIR     target directory (default: ~/.local/bin)
-    --copy        copy the tools instead of symlinking (filesystems w/o symlinks)
-    --repin       force re-symlinking a pinned bin (see PIN PROTECTION below)
-    --uninstall   remove the SABLE tools previously installed into DIR
-    --dry-run     print what would happen; write nothing
+  sable-bin-install --pin-snapshot [NAME...]
+  sable-bin-install --classify NAME
+
+    --dir DIR         target directory (default: ~/.local/bin)
+    --copy            copy the tools instead of symlinking (filesystems w/o symlinks)
+    --repin           force re-symlinking a pinned bin, incl. a snapshot pin
+                      (see PIN PROTECTION / SNAPSHOT PINNING below)
+    --pin-snapshot    pin NAME... (default: every auto-detected python-importing
+                      tool) via a versioned snapshot directory instead of a
+                      plain per-file copy (see SNAPSHOT PINNING below)
+    --classify NAME   print "snapshot" (has repo-local python imports, needs
+                      --pin-snapshot) or "plain" (safe to pin as a regular
+                      file copy) for the named tool; writes nothing
+    --uninstall       remove the SABLE tools previously installed into DIR
+    --dry-run         print what would happen; write nothing
 
 Installs every sable-* shell entrypoint in $BIN_DIR; skips *.py (skill-bundled
 prefilters) and tests. Symlink (default) is preferred — a linked tool resolves
@@ -60,6 +91,16 @@ back to the repo and never goes stale.
 PIN PROTECTION (SABLE-mkj6k): if a tool already exists at the destination as a
 regular file (not a symlink), it is treated as a deliberate pin and is SKIPPED
 (with a notice) rather than silently re-symlinked. Pass --repin to override.
+
+SNAPSHOT PINNING (SABLE-9boz4): a plain regular-file pin only works for a tool
+with zero repo-local imports — sable-spawn-worker and sable-msg import sibling
+modules (sable_pane_lib.py, ...) from bin/, so copying just the one file
+severs the import. --pin-snapshot instead copies the WHOLE bin/ directory (one
+unit: every bin plus every sibling lib) into a versioned
+~/.local/lib/sable-<sha>/ directory at the CURRENT repo sha, then atomically
+repoints the entry symlink(s) into it. A pinned entry is still a symlink (it
+just resolves outside $BIN_DIR), so it is protected from an ordinary re-run
+exactly like a regular-file pin is. Rollback: --repin.
 EOF
 }
 
@@ -71,12 +112,35 @@ while [ $# -gt 0 ]; do
     --repin) REPIN=1; shift ;;
     --uninstall) ACTION="uninstall"; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --classify) ACTION="classify"; CLASSIFY_TARGET="${2:?--classify needs a tool name}"; shift 2 ;;
+    --pin-snapshot)
+      ACTION="pin-snapshot"; shift
+      while [ $# -gt 0 ]; do
+        case "$1" in --*) break ;; *) PIN_TARGETS="$PIN_TARGETS $1"; shift ;; esac
+      done
+      ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'sable-bin-install: unknown arg %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
 note() { printf '%s\n' "$*" >&2; }
+
+# Import-check classifier (SABLE-9boz4): is $1 (a path) a python script that
+# imports a sibling module physically present in $BIN_DIR? Those need
+# --pin-snapshot; everything else (shell scripts, or python with zero
+# repo-local imports) is safe for the plain regular-file pin. Prints nothing;
+# return 0 = "snapshot" needed, 1 = "plain" is safe.
+is_python_importing() {
+  f="$1"
+  [ -f "$f" ] || return 1
+  head -n1 "$f" 2>/dev/null | grep -q 'python' || return 1
+  mods="$(grep -oE '^(from|import) +sable_[a-zA-Z0-9_]+' "$f" 2>/dev/null | awk '{print $2}' | sort -u)"
+  for mod in $mods; do
+    [ -f "$BIN_DIR/$mod.py" ] && return 0
+  done
+  return 1
+}
 
 # Collect the tools to install: the bare `sable` umbrella + sable-* shell
 # entrypoints (excludes *.py / *.bak / *~).
@@ -87,6 +151,62 @@ for f in "$BIN_DIR"/sable-*; do
   case "$f" in *.py|*.bak|*~) continue ;; esac
   TOOLS="$TOOLS $(basename "$f")"
 done
+
+if [ "$ACTION" = "classify" ]; then
+  target="$CLASSIFY_TARGET"
+  case "$target" in /*) : ;; *) target="$BIN_DIR/$target" ;; esac
+  if is_python_importing "$target"; then echo snapshot; else echo plain; fi
+  exit 0
+fi
+
+if [ "$ACTION" = "pin-snapshot" ]; then
+  REPO_ROOT="$(cd -P "$BIN_DIR/.." >/dev/null 2>&1 && pwd)"
+  SHA="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD 2>/dev/null || true)"
+  if [ -z "$SHA" ]; then
+    note "sable-bin-install: --pin-snapshot requires $REPO_ROOT to be a git repo (couldn't resolve HEAD)"
+    exit 1
+  fi
+
+  targets="$PIN_TARGETS"
+  if [ -z "$targets" ]; then
+    for t in $TOOLS; do
+      is_python_importing "$BIN_DIR/$t" && targets="$targets $t"
+    done
+  fi
+  if [ -z "$targets" ]; then
+    note "sable-bin-install: --pin-snapshot found no python-importing tools to pin (and none named explicitly)"
+    exit 1
+  fi
+
+  LIB_DIR="${SABLE_LIB_DIR:-${HOME:-}/.local/lib}"
+  SNAPSHOT_DIR="$LIB_DIR/sable-$SHA"
+
+  if [ "$DRY_RUN" = "1" ]; then
+    note "  would snapshot: $BIN_DIR -> $SNAPSHOT_DIR (repo sha $SHA)"
+    for t in $targets; do note "  would pin: $DEST/$t -> $SNAPSHOT_DIR/$t"; done
+    exit 0
+  fi
+
+  mkdir -p "$SNAPSHOT_DIR" || { note "sable-bin-install: cannot create $SNAPSHOT_DIR"; exit 1; }
+  # Copy the ENTIRE bin/ dir as ONE unit (not per-file) so the import closure
+  # travels with the pin regardless of which sibling libs a bin needs today,
+  # or gains/loses/renames tomorrow (SABLE-9boz4 design constraint: the pinned
+  # unit and the implementation unit must be the same object by construction).
+  cp -a "$BIN_DIR/." "$SNAPSHOT_DIR/" || { note "sable-bin-install: snapshot copy failed"; exit 1; }
+  rm -rf "$SNAPSHOT_DIR/__pycache__"
+
+  mkdir -p "$DEST" || { note "sable-bin-install: cannot create $DEST"; exit 1; }
+  for t in $targets; do
+    if [ ! -f "$SNAPSHOT_DIR/$t" ]; then
+      note "sable-bin-install: $t not found in snapshot, skipping"
+      continue
+    fi
+    tmp_link="$DEST/.${t}.snapshot-tmp.$$"
+    ln -sf "$SNAPSHOT_DIR/$t" "$tmp_link" && mv -f "$tmp_link" "$DEST/$t"
+    note "sable-bin-install: pinned $DEST/$t -> $SNAPSHOT_DIR/$t (snapshot sable-$SHA)"
+  done
+  exit 0
+fi
 
 if [ "$ACTION" = "uninstall" ]; then
   for t in $TOOLS; do
@@ -103,15 +223,32 @@ else
   mkdir -p "$DEST" || { note "sable-bin-install: cannot create $DEST"; exit 1; }
 fi
 
+# Is $1 (an existing symlink) a deliberate PIN because it resolves OUTSIDE
+# $BIN_DIR (e.g. into a ~/.local/lib/sable-<sha>/ snapshot, SABLE-9boz4) —
+# as opposed to an ordinary managed symlink into the live repo? Empty/failed
+# resolution is treated as "not a pin" (never silently blocks an install).
+_points_outside_repo() {
+  resolved="$(readlink -f "$1" 2>/dev/null || true)"
+  [ -n "$resolved" ] || return 1
+  case "$resolved" in "$BIN_DIR"/*) return 1 ;; esac
+  return 0
+}
+
 SKIPPED_PINS=""
 for t in $TOOLS; do
   src="$BIN_DIR/$t"; dst="$DEST/$t"
   is_pinned=0
-  [ "$MODE" = "symlink" ] && [ -e "$dst" ] && [ ! -L "$dst" ] && [ "$REPIN" != "1" ] && is_pinned=1
+  if [ "$MODE" = "symlink" ] && [ "$REPIN" != "1" ] && [ -e "$dst" ]; then
+    if [ ! -L "$dst" ]; then
+      is_pinned=1
+    elif _points_outside_repo "$dst"; then
+      is_pinned=1
+    fi
+  fi
 
   if [ "$DRY_RUN" = "1" ]; then
     if [ "$is_pinned" = "1" ]; then
-      note "  would SKIP (pinned, regular file): $dst"
+      note "  would SKIP (pinned): $dst"
     else
       note "  would $MODE: $dst -> $src"
     fi
@@ -119,7 +256,11 @@ for t in $TOOLS; do
   fi
 
   if [ "$is_pinned" = "1" ]; then
-    note "sable-bin-install: SKIPPING $dst — it is a pinned regular file (not a symlink)."
+    if [ -L "$dst" ]; then
+      note "sable-bin-install: SKIPPING $dst — it is a pinned snapshot symlink (resolves outside $BIN_DIR)."
+    else
+      note "sable-bin-install: SKIPPING $dst — it is a pinned regular file (not a symlink)."
+    fi
     note "  Refusing to silently re-symlink a deliberate pin. Pass --repin to override."
     SKIPPED_PINS="$SKIPPED_PINS $t"
     continue
@@ -136,20 +277,26 @@ if [ -n "$SKIPPED_PINS" ]; then
   note "sable-bin-install: skipped pinned bin(s) (unchanged, not re-symlinked):$SKIPPED_PINS"
 fi
 
-# Refresh the pin marker (SABLE-mkj6k): a small manifest of currently-pinned
-# tool names, recomputed from the ACTUAL post-install filesystem state (a
-# regular file, not a symlink, at DEST/<tool>) every run. sable-doctor reads
-# this to tell a deliberately pinned bin apart from the ordinary symlinked
-# default when deciding whether a drifted bin is safe to recommend
-# `bash install.sh` for. Self-healing: --repin (or manually restoring the
-# symlink) drops the name out of the marker on the very next install run.
+# Refresh the pin marker (SABLE-mkj6k, extended by SABLE-9boz4): a small
+# manifest of currently-pinned tool names, recomputed from the ACTUAL
+# post-install filesystem state every run — either a regular file at
+# DEST/<tool> (a plain per-file pin) or a symlink resolving OUTSIDE $BIN_DIR
+# (a snapshot pin). sable-doctor reads this to tell a deliberately pinned bin
+# apart from the ordinary symlinked default when deciding whether a drifted
+# bin is safe to recommend `bash install.sh` for. Self-healing: --repin (or
+# manually restoring the live-repo symlink) drops the name out of the marker
+# on the very next install run.
 if [ "$DRY_RUN" != "1" ]; then
   PIN_MARKER="$DEST/.sable-pinned"
   PIN_MARKER_TMP="$(mktemp "${DEST}/.sable-pinned.XXXXXX" 2>/dev/null || true)"
   if [ -n "$PIN_MARKER_TMP" ]; then
     for t in $TOOLS; do
       dst="$DEST/$t"
-      if [ -e "$dst" ] && [ ! -L "$dst" ]; then printf '%s\n' "$t" >> "$PIN_MARKER_TMP"; fi
+      if [ -e "$dst" ] && [ ! -L "$dst" ]; then
+        printf '%s\n' "$t" >> "$PIN_MARKER_TMP"
+      elif [ -L "$dst" ] && _points_outside_repo "$dst"; then
+        printf '%s\n' "$t" >> "$PIN_MARKER_TMP"
+      fi
     done
     if [ -s "$PIN_MARKER_TMP" ]; then
       mv "$PIN_MARKER_TMP" "$PIN_MARKER"

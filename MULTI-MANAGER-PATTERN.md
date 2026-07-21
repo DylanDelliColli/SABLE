@@ -755,6 +755,38 @@ ls ~/.claude/agents/   # should list columbo.md rudy.md sherlock.md victor.md (p
 
 `sable-agents <name>` should print details for any registered agent — useful for spot-checking that the registry was copied to `~/.claude/sable/agents.yaml` correctly.
 
+### Step 10: Pin spine bins (optional hardening)
+
+By default every `sable-*` CLI tool is a live symlink from `~/.local/bin/` back into the repo's `bin/` (Step 6.5 above) — an in-flight worker or manager can be running an entrypoint whose repo source changes underneath it mid-execution. An operator can freeze a specific tool's *entrypoint* (its running invocation) to whatever content was on disk when they chose to pin it (the y6ik3 hot-swap hazard).
+
+There are two pinning mechanisms, and picking the wrong one for a given bin is exactly the failure this section exists to prevent:
+
+- **Regular-file pin** (`sable-bin-install`'s default protection): `cp bin/<tool> ~/.local/bin/<tool>` — safe only for a bin with **zero repo-local imports**. `sable-merge-gate`, `sable-reconcile-handoffs`, and `sable-dolt-push` are pinned this way.
+- **Snapshot pin** (`sable-bin-install --pin-snapshot`): freezes the **whole `bin/` directory** as one versioned unit at `~/.local/lib/sable-<sha>/` (every bin plus every sibling lib, at the repo sha current when you pin), then atomically repoints the entry symlink into it. Required for any bin that imports a sibling module — `sable-spawn-worker` and `sable-msg` import `sable_pane_lib.py`, so a bare regular-file copy severs the import (`ImportError`) the moment it runs outside the repo. This was caught live during the 2026-07-21 y6ik3 window (`sable-msg` was deliberately never copy-pinned for exactly this reason) and is why the mechanism exists as a first-class tool feature rather than an ad hoc `cp`.
+
+**Chuck's import-check gate — the pre-convert acceptance criterion**: before converting ANY bin from its default live symlink to a pin, classify it first:
+
+```bash
+sable-bin-install --classify <tool-name>   # prints "plain" or "snapshot"
+```
+
+`plain` → a regular-file `cp` pin is safe. `snapshot` → it imports a sibling module; pin it with `--pin-snapshot`, never a bare `cp`. Skipping this check is precisely the mistake the 2026-07-21 window rolled back live; `sable-doctor` now also catches it after the fact (a `snapshot`-classified bin pinned as a bare regular file reports `BROKEN-COPY-PIN`), but the classify-first step is the acceptance gate *before* the conversion, not a substitute for it.
+
+```bash
+# pin every auto-detected python-importing tool (default), or name specific ones:
+sable-bin-install --pin-snapshot
+sable-bin-install --pin-snapshot sable-msg sable-spawn-worker
+
+# rollback (either pin type) — re-symlinks the entry back to the live repo:
+sable-bin-install --repin
+```
+
+A pinned bin — regular-file or snapshot — is protected from an ordinary `sable-bin-install` / `bash install.sh` re-run: the installer detects a snapshot pin the same way it detects a regular-file pin (a snapshot's entry point is still a *symlink*, but one resolving **outside** the repo's `bin/`), and skips re-linking it with a loud notice instead of silently reverting the pin.
+
+**Doctor coverage**: `sable-doctor` reports a `pinned snapshot bins` category alongside the regular-file `pinned bins` category. Because a snapshot pin is deliberately frozen at an older sha, doctor does **not** sha256-compare it against current repo HEAD (that would treat every legitimate pin as "drifted" the moment the repo moves on — the exact "a drift check can only agree-while-wrong if the thing it compares is narrower than the thing that moved" failure this bead exists to prevent). It resolves the entry symlink, extracts the sha baked into its snapshot directory name, and compares **every file physically present in the snapshot directory** — not just the one entry-point file the symlink resolves to — against the repo's `bin/` **at that pinned sha**, file for file: a file whose content was hand-edited, a file added to the snapshot that the pinned sha never had, and a file the pinned sha shipped with that the snapshot has since lost (the shape a future `bin/` module split takes) are all reported as drift. Comparing only the entry point would have been a drift check narrower than the pin unit itself — exactly the failure this section's design argument exists to rule out — so the report also names the drifted file(s) by basename, not just the entry point's install path. Statuses: `missing` (never pinned or installed), `clean`, `BROKEN-COPY-PIN` (a snapshot-needing bin pinned as a bare regular file — the import-severing hazard), `SNAPSHOT-DRIFT` (one or more files inside the snapshot no longer match what it claims to be pinned to). The ordinary `bash install.sh` remedy is never offered for either bad status — `sable-doctor`'s own report names the safe re-pin command instead.
+
+**Gains, losses, and renames**: the pin unit is "the whole `bin/` directory", not an enumerated file list, and the *set* of tools `sable-doctor` checks is derived the same way `--pin-snapshot`'s auto-detect is — by classifying every `bin/sable-*` script live, not from a hardcoded name tuple. A bin gaining, losing, or being renamed with a sibling import (e.g. a future `bin/` module split) is covered automatically on the next run of either tool; nothing needs to be updated by hand when that happens.
+
 ---
 
 ## Operating discipline
