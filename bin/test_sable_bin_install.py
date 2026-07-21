@@ -120,6 +120,79 @@ def test_classify_import_of_absent_module_is_still_plain(tmp_path):
     assert result.stdout.strip() == "plain", result.stderr
 
 
+# --- sibling-loader classifier (SABLE-bdskx) -------------------------------------
+#
+# is_python_importing only greps for a static `import`/`from` statement.
+# SourceFileLoader / spec_from_file_location dynamically load a sibling by
+# building a __file__-relative path at runtime -- e.g.
+# bin/sable-reconcile-handoffs loading bin/sable-merge-gate. That shape has
+# no `import sable_*` line to grep for, so it classified "plain" (safe for a
+# per-file copy) even though a per-file copy severs the sibling load.
+
+def test_classify_sourcefileloader_sibling_load_is_snapshot(tmp_path):
+    repo, bin_dir = make_fixture_repo(tmp_path, extra_files={
+        "sable-sourcefileloader-importer": (
+            "#!/usr/bin/env python3\n"
+            "from importlib.machinery import SourceFileLoader\n"
+            "import importlib.util\n"
+            "from pathlib import Path\n"
+            "_SIB_PATH = Path(__file__).resolve().parent / 'sable-plain'\n"
+            "_SIB_LOADER = SourceFileLoader('sable_plain', str(_SIB_PATH))\n"
+            "_SIB_SPEC = importlib.util.spec_from_loader('sable_plain', _SIB_LOADER)\n"
+            "_sib = importlib.util.module_from_spec(_SIB_SPEC)\n"
+            "_SIB_LOADER.exec_module(_sib)\n"
+        ),
+    })
+    (bin_dir / "sable-sourcefileloader-importer").chmod(0o755)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add sourcefileloader fixture"], cwd=repo, check=True)
+    result = run_install(bin_dir, tmp_path / "dest", "--classify", "sable-sourcefileloader-importer")
+    assert result.stdout.strip() == "snapshot", result.stderr
+
+
+def test_classify_spec_from_file_location_sibling_load_is_snapshot(tmp_path):
+    repo, bin_dir = make_fixture_repo(tmp_path, extra_files={
+        "sable-specfromfile-importer": (
+            "#!/usr/bin/env python3\n"
+            "import importlib.util\n"
+            "import os\n"
+            "_SIB_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'sable-plain')\n"
+            "_SIB_SPEC = importlib.util.spec_from_file_location('sable_plain', _SIB_PATH)\n"
+            "_sib = importlib.util.module_from_spec(_SIB_SPEC)\n"
+            "_SIB_SPEC.loader.exec_module(_sib)\n"
+        ),
+    })
+    (bin_dir / "sable-specfromfile-importer").chmod(0o755)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add spec_from_file_location fixture"], cwd=repo, check=True)
+    result = run_install(bin_dir, tmp_path / "dest", "--classify", "sable-specfromfile-importer")
+    assert result.stdout.strip() == "snapshot", result.stderr
+
+
+def test_classify_genuinely_plain_python_is_still_plain(tmp_path):
+    # Negative direction: a detector that over-matches on loader-ish words
+    # alone would wrongly block per-file installs of ordinary bins. Neither
+    # SourceFileLoader/spec_from_file_location nor __file__ appear here.
+    repo, bin_dir = make_fixture_repo(tmp_path)
+    result = run_install(bin_dir, tmp_path / "dest", "--classify", "sable-nolib-py")
+    assert result.stdout.strip() == "plain", result.stderr
+
+
+def test_classify_real_reconcile_handoffs_is_not_plain(tmp_path):
+    # Real-world case (SABLE-bdskx): bin/sable-reconcile-handoffs loads its
+    # sibling bin/sable-merge-gate via SourceFileLoader on a
+    # Path(__file__).resolve().parent join. It is NOT plain -- a per-file
+    # copy without the sibling present dies at import.
+    repo, bin_dir = make_fixture_repo(tmp_path)
+    real_reconcile = REPO / "bin" / "sable-reconcile-handoffs"
+    shutil.copy(real_reconcile, bin_dir / "sable-reconcile-handoffs")
+    (bin_dir / "sable-reconcile-handoffs").chmod(0o755)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add real reconcile-handoffs"], cwd=repo, check=True)
+    result = run_install(bin_dir, tmp_path / "dest", "--classify", "sable-reconcile-handoffs")
+    assert result.stdout.strip() != "plain", result.stderr
+
+
 # --- --pin-snapshot: versioned snapshot dir + atomic repoint --------------------
 
 def test_pin_snapshot_auto_detects_python_importing_tools(tmp_path):
