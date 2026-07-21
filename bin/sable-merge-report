@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""sable-merge-report — SABLE-jd5fj.7 post-change telemetry.
+
+Derive-at-read comparison against the SABLE-nueh3 baseline: median/p90
+push-to-integrated latency, CI red rate, and the DIRECT measurement of the
+textually-clean-but-semantically-broken disjoint-promotion rate (the class
+nueh3 could only bound at 0/126, rule-of-three <=2.4%, because the pre-S2
+design structurally prevented it). Consistent with the SABLE-8b41 telemetry
+direction: a reporting tool over existing bd/git/gh sources, not a new
+capture mechanism (relate, do not block).
+
+The report NEVER uses git commit dates as a push-to-landed latency proxy
+(SABLE-jxgm4: commit-tree stamps a merge commit's dates at preview-build
+time, before the CI wait it is meant to measure) -- see
+bin/sable_merge_report_lib.py's module docstring for the full method.
+
+Usage:
+  sable-merge-report [--repo PATH] [--base BRANCH] [--remote NAME]
+                     [--since ISO8601] [--window-hours N] [--json]
+                     [--no-snapshot-check]
+
+Environment seams (mirrors sable-merge-gate's SABLE_MG_* convention):
+  SABLE_MR_GIT   git command (default: git)
+  SABLE_MR_GH    gh command (default: gh)
+  SABLE_MR_BD    bd command (default: bd)
+  SABLE_MR_NOTIFY_LOG  path to post-push-merge-notify.log
+                 (default: ~/.claude/sable/logs/post-push-merge-notify.log)
+
+Exit codes: 0 report produced (even if underlying data is sparse -- a thin
+report is not a failure, an unreadable repo is). 2 usage. 3 could not
+resolve the base branch / repo.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+import sable_gate_git_lib as git_lib          # noqa: E402
+import sable_merge_report_lib as report_lib   # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="sable-merge-report")
+    parser.add_argument("--repo", default=os.environ.get("SABLE_MR_REPO", os.getcwd()))
+    parser.add_argument("--base", default=None,
+                        help="integration branch to report on; default resolves the same way "
+                             "sable-merge-gate does (SABLE_MG_BASE / .sable / \"main\")")
+    parser.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
+    parser.add_argument("--since", default=None,
+                        help="ISO-8601 instant; report only promotions/runs/pushes at or after it "
+                             "(pass the nueh3 baseline window end for a clean post-change slice)")
+    parser.add_argument("--window-hours", type=float, default=24.0,
+                        help="how long after a disjoint promotion lands to look for a red run "
+                             "on that same SHA before concluding it was not a semantic break")
+    parser.add_argument("--max-join-gap-seconds", type=float, default=120.0,
+                        help="max gap between a confirmed push and the preview run it kicked, "
+                             "for the push->CI-done latency join")
+    parser.add_argument("--no-snapshot-check", action="store_true",
+                        help="skip the bd query for SABLE-jd5fj.5 landed status")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    try:
+        base = args.base or os.environ.get("SABLE_MG_BASE") or git_lib.resolve_integration_branch(args.repo)
+    except Exception as exc:  # noqa: BLE001 -- report a usage error, not a traceback
+        print(f"sable-merge-report: could not resolve base branch: {exc}", file=sys.stderr)
+        return 3
+
+    base_ref = f"{args.remote}/{base}"
+    report = report_lib.build_report(
+        args.repo, base_ref, base, args.since,
+        window_hours=args.window_hours,
+        max_join_gap_seconds=args.max_join_gap_seconds,
+        check_snapshot_status=not args.no_snapshot_check,
+    )
+
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        print(report_lib.format_report_text(report))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
