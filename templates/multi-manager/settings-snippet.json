@@ -2,6 +2,7 @@
   "_comment": "Multi-Manager Pattern hooks — APPEND to your existing ~/.claude/settings.json. Do not replace existing arrays; merge with them.",
   "_install": "Copy each entry under the matching event/matcher into your existing settings.json hooks block.",
   "_timeout_coupling": "pre-push-rebase-test.sh has TWO timeouts that must be kept in sync: the 'timeout' field below (ms, enforced by Claude Code, GLOBAL across all repos on this machine) and the inner test-phase budget (seconds, enforced by `timeout` inside the script via sable_resolve_test_timeout: git config sable.testTimeout > repo .sable testTimeout= > $SABLE_PRE_PUSH_TEST_TIMEOUT > hardcoded 60 default). The outer 'timeout' below has no per-repo override, so it must be sized for the LARGEST inner budget any repo on this machine resolves to, plus a ~30s buffer for fetch/rebase. Currently 210000ms, sized for wk-prepush-timeout-margin's .sable testTimeout=180 (SABLE-lp4n/dnfv: the 3-file testCommand suite runs ~53s and was flaking against the old 60s/90000ms pairing under fleet load). If a repo needs a larger per-repo testTimeout, raise BOTH its .sable value AND this outer value together (outer >= new max inner + 30s), or the outer ceiling will truncate it regardless of the repo-local override.",
+  "_close_decay_sweep": "SABLE-x9vby: close-decay-sweep.sh is ADVISORY — it never denies. Its 25000ms timeout is sized for one `bd list` of the whole open corpus (SABLE_IDREF_TIMEOUT caps the inner bd call at 20s and reports could-not-assess past that), so the outer budget must stay above the inner one or the hook is killed mid-sweep and the closer sees nothing — which is exactly the silent-clean-looking failure the hook exists to prevent.",
   "_pre_dispatch_refresh_retired": "SABLE-mkj6k: pre-dispatch-refresh.sh was deliberately DROPPED from the Agent matcher below (SABLE-o3xju de-wired it from the live settings.json; this file is the durable source, so re-adding this row here would silently re-arm the bypass on every future install.sh run). Do not re-add it without a fresh operator ruling.",
 
   "hooks": {
@@ -69,6 +70,11 @@
             "type": "command",
             "command": "bash ~/.claude/hooks/multi-manager/pre-push-rebase-test.sh",
             "timeout": 210000
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/close-decay-sweep.sh",
+            "timeout": 25000
           }
         ]
       },

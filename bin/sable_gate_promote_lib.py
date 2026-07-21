@@ -140,6 +140,28 @@ def all_commits_patch_equivalent(repo: str, base_ref: str, branch: str) -> bool:
     return all(ln.startswith("-") for ln in lines)
 
 
+def _report_identifier_decay(repo: str, identifier: str) -> None:
+    """Print any OPEN bead whose INSTRUCTIONS still name `identifier`, on the eve
+    of that identifier being retired (SABLE-x9vby, promote-time seam).
+
+    Fail-open on the decision, loud on the report (standing discipline 7): this
+    NEVER affects whether the branch is deleted, and a sweep that could not run
+    prints its could-not-assess notice rather than the silence a clean sweep
+    prints. The sweeper's own exit code 3 already carries that text."""
+    argv = git_lib._tool("SABLE_MG_IDDECAY", "sable-identifier-decay") + [
+        "--branch", "-C", repo, identifier,
+    ]
+    try:
+        cp = git_lib._run(argv, cwd=repo, check=False, timeout=30)
+    except Exception as exc:  # sweeper absent / unrunnable — say so, don't die
+        print(f"⚠ identifier-decay: COULD NOT ASSESS branch {identifier} ({exc}). "
+              f"This is NOT a clean result: nothing was checked.", file=sys.stderr)
+        return
+    out = (getattr(cp, "stdout", "") or "").strip()
+    if out:
+        print(out, file=sys.stderr)
+
+
 def cleanup_after_merge(repo: str, remote: str, base_ref: str, branch: str) -> None:
     """Reap a merged worker's worktree + local branch + remote branch. GREEN
     PATH ONLY (SABLE-dn7r): once a preview has been promoted byte-identical to
@@ -182,7 +204,13 @@ def cleanup_after_merge(repo: str, remote: str, base_ref: str, branch: str) -> N
                       f"(operator ruling needed): {d.stdout.strip()}", file=sys.stderr)
                 return
 
-    # (c) remote branch — chuck's merge path is the fleet's only push lane
+    # (c) remote branch — chuck's merge path is the fleet's only push lane.
+    # Deleting it RETIRES the branch name as an identifier, so sweep first:
+    # instructions keyed to a branch name (a HOLD that reads "do not merge
+    # wk-foo") go stale the instant the name stops resolving, and they go stale
+    # SILENTLY, still reading as satisfiable (SABLE-x9vby, instance 1). Advisory
+    # only — never gates the delete.
+    _report_identifier_decay(repo, branch)
     push = git_lib._git(repo, "push", remote, "--delete", branch, check=False)
     if push.returncode != 0:
         print(f"sable-merge-gate cleanup: could not delete remote branch {remote}/{branch}: "

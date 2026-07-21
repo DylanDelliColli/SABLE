@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""sable-identifier-decay — flag OPEN beads whose instructions name an
+identifier that is being retired right now (SABLE-x9vby).
+
+Two seams, one detector (bin/sable_identifier_decay_lib.py):
+  * CLOSE time  — `bd close SABLE-A` retires a bead id. Driven by
+                  hooks/multi-manager/close-decay-sweep.sh.
+  * PROMOTE time — the merge gate deletes a merged worker branch, retiring a
+                  branch name. Driven by sable_gate_promote_lib.cleanup_after_merge.
+
+Fail-open on the DECISION, LOUD on the REPORT (standing discipline 7): this
+never blocks anything, and a sweep that could not query says so explicitly
+rather than printing the silence that a clean run also prints.
+
+Usage:
+  sable-identifier-decay SABLE-A [SABLE-B ...]      # bead ids (close time)
+  sable-identifier-decay --branch wk-foo            # branch names (promote time)
+  sable-identifier-decay -C /path/to/repo SABLE-A   # query bd in another repo
+
+Exit codes (advisory only — callers must not gate on them):
+  0  the sweep ran (flags, if any, on stdout)
+  3  the sweep could NOT run; the could-not-assess notice is on stdout
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sable_identifier_decay_lib import (  # noqa: E402
+    KNOWN_LIMIT, format_flags, format_unassessed, sweep,
+)
+
+EXIT_OK = 0
+EXIT_UNASSESSED = 3
+
+# The sweep runs INSIDE an interactive close/promote. A bd call that hangs is a
+# worse failure than a missed flag, so cap it and report could-not-assess.
+BD_TIMEOUT_S = float(os.environ.get("SABLE_IDREF_TIMEOUT", "20"))
+
+
+def load_open_beads(repo: str | None) -> tuple[list[dict], str | None]:
+    """Every OPEN + IN_PROGRESS bead, or (empty, reason) if bd could not answer."""
+    argv = ["bd"]
+    if repo:
+        argv += ["-C", repo]
+    argv += ["list", "--status", "open,in_progress", "--json",
+             "--limit", "0", "--no-pager", "--skip-labels"]
+    try:
+        cp = subprocess.run(argv, text=True, timeout=BD_TIMEOUT_S,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        return [], "bd is not on PATH"
+    except subprocess.TimeoutExpired:
+        return [], f"bd list timed out after {BD_TIMEOUT_S:g}s"
+    if cp.returncode != 0:
+        detail = (cp.stderr or cp.stdout or "").strip().splitlines()
+        return [], f"bd list failed (rc={cp.returncode}): {detail[0] if detail else 'no output'}"
+    try:
+        data = json.loads(cp.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        return [], f"bd list returned unparseable JSON ({exc})"
+    # bd list --json is not one shape: a bare array in some invocations, an
+    # object wrapping {"issues": [...]} in others (notably --limit 0). Accept
+    # both rather than reporting could-not-assess on a perfectly good answer.
+    if isinstance(data, dict):
+        data = data.get("issues") or []
+    if not isinstance(data, list):
+        return [], "bd list returned an unexpected JSON shape"
+    return data, None
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="sable-identifier-decay",
+        description="Flag open beads whose INSTRUCTIONS name a retiring identifier.",
+        epilog=KNOWN_LIMIT,
+    )
+    ap.add_argument("identifiers", nargs="*", help="identifiers being retired")
+    ap.add_argument("--branch", action="store_true",
+                    help="treat the identifiers as branch names (no bare-suffix matching)")
+    ap.add_argument("-C", "--repo", default=None, help="run bd against this repo")
+    ap.add_argument("--json", action="store_true", help="emit flags as JSON")
+    args = ap.parse_args(argv)
+
+    identifiers = [i for i in args.identifiers if i]
+    if not identifiers:
+        return EXIT_OK  # nothing retiring — nothing to say
+
+    beads, reason = load_open_beads(args.repo)
+    if reason is not None:
+        if args.json:
+            print(json.dumps({"assessed": False, "reason": reason,
+                              "identifiers": identifiers, "flags": []}))
+        else:
+            print(format_unassessed(identifiers, reason))
+        return EXIT_UNASSESSED
+
+    flags = sweep(identifiers, beads, bare_suffix=not args.branch)
+    if args.json:
+        print(json.dumps({
+            "assessed": True, "identifiers": identifiers, "limit": KNOWN_LIMIT,
+            "flags": [f.__dict__ for f in flags],
+        }))
+    else:
+        report = format_flags(flags, identifiers)
+        if report:
+            print(report)
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
