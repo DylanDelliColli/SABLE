@@ -177,8 +177,16 @@ def _push_worker_branch(work, bead_id, *, merged_into=None):
     """Create + push a worker branch `wk-<bead_id>` with a backdated commit
     (old push-age). If merged_into is set, also fast-forward that branch to the
     worker tip and push it (models an already-merged branch)."""
-    branch = f"wk-{bead_id}"
-    feat = f"{bead_id}.txt"
+    return _push_named_branch(work, f"wk-{bead_id}", tag=bead_id, merged_into=merged_into)
+
+
+def _push_named_branch(work, branch, *, tag, merged_into=None):
+    """Create + push a branch under an EXPLICIT name (not derived from a bead
+    id) with a backdated commit (old push-age). Used by the SABLE-i5739
+    metadata-resolution rehearsal, where the branch name deliberately embeds
+    NO bead id and the bead's own title/description never mention it either —
+    the only thing tying branch to bead is structured metadata."""
+    feat = f"{tag}.txt"
     _git(work, "checkout", "-b", branch, BASE)
     (work / feat).write_text("worker feature\n")
     _git(work, "add", feat)  # named file only — NEVER -A (would stage .beads)
@@ -191,6 +199,24 @@ def _push_worker_branch(work, bead_id, *, merged_into=None):
         _git(work, "push", "origin", merged_into)
     _git(work, "checkout", BASE)
     return branch
+
+
+def _make_work_bead_with_branch_metadata(work, home, branch, *, status="closed"):
+    """Create a work bead whose title/description NEVER mention `branch` at
+    all (unlike `_make_work_bead`, which relies on the embedded-id `wk-<id>`
+    naming convention) and record the branch as STRUCTURED metadata — exactly
+    what sable-spawn-worker's tag_branch_metadata writes at dispatch time
+    (SABLE-i5739). Under the OLD prose-search resolver this bead would never
+    be found for `branch` (mode a: 0 hits)."""
+    cp = _bd(work, home, "create", "--sandbox", "--json",
+             "--title", "unit of work with a title naming nothing branch-shaped",
+             "--type=task", "--priority=2")
+    bead_id = json.loads(cp.stdout)["id"]
+    _bd(work, home, "update", bead_id, "--sandbox",
+        "--set-metadata", f"branch={branch}")
+    if status == "closed":
+        _bd(work, home, "close", bead_id, "--sandbox")
+    return bead_id
 
 
 def _reconcile(work, home, *, dry_run=False):
@@ -491,3 +517,60 @@ def test_S7oj5_without_sable_rc_bd_the_original_bug_reproduces(tmp_path):
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
     assert r.returncode != 0, r.stdout
     assert "FileNotFoundError" in r.stdout, r.stdout
+
+
+# ===========================================================================
+# SABLE-i5739: STRUCTURED branch->bead resolution replaces prose `bd search`
+# as the primary path. Real bd, real git, no mocks. Two-part acceptance:
+#   1. a branch whose work bead's text NEVER names it (the OLD resolver's
+#      mode-a silent failure: 0 hits, forever un-strandable) IS classified
+#      stranded and gets a for-chuck bead filed — because the branch is
+#      recorded on the bead as structured metadata, not found by prose.
+#   2. filing an UNRELATED bead that happens to mention the branch name in
+#      its own title afterward must NOT change the resolution/handoff on a
+#      re-run — proving modes (b) wrong-success and (c) drift are closed,
+#      not merely that resolution got luckier.
+# ===========================================================================
+
+def test_SABLE_i5739_branch_resolves_via_metadata_when_bead_text_never_names_it(tmp_path):
+    origin, work, home = _setup(tmp_path)
+    branch = "wk-totally-unrelated-slug"
+    bead_id = _make_work_bead_with_branch_metadata(work, home, branch, status="closed")
+    _push_named_branch(work, branch, tag=bead_id)
+
+    # sanity: the branch name embeds no bead id, and the bead's title/desc
+    # never mention the branch — the OLD prose-search resolver finds NOTHING
+    # for this exact case (mode a).
+    prose = _bd(work, home, "search", branch, "--status", "all", "--json", check=False)
+    assert json.loads(prose.stdout) == [], (
+        "fixture invariant broken: prose search must find zero hits for this "
+        f"branch so the test actually exercises mode (a):\n{prose.stdout}")
+
+    assert _for_chuck_beads(work, home) == []
+
+    r1 = _reconcile(work, home)
+    assert r1.returncode == 0, r1.stdout
+    beads1 = _for_chuck_beads(work, home)
+    assert len(beads1) == 1, (
+        f"branch whose bead never names it must still be classified stranded "
+        f"via structured metadata, got {beads1}\n{r1.stdout}")
+    assert branch in beads1[0]["title"], beads1[0]["title"]
+
+    # --- the acceptance criterion: file an UNRELATED bead that happens to
+    # mention this exact branch name, then re-run. Under the OLD resolver
+    # this bead would now WIN the prose search (mode b) and/or flip the
+    # answer over time (mode c) on later runs as more such beads accumulate.
+    _bd(work, home, "create", "--sandbox", "--title",
+        f"a completely unrelated bead that mentions {branch} in passing",
+        "--type=task", "--priority=2")
+
+    r2 = _reconcile(work, home)
+    assert r2.returncode == 0, r2.stdout
+    beads2 = _for_chuck_beads(work, home)
+    assert len(beads2) == 1, (
+        f"an unrelated bead mentioning the branch must not change resolution "
+        f"(mode b/c not closed): {beads2}\n{r2.stdout}")
+    assert beads2[0]["id"] == beads1[0]["id"], (
+        "re-run resolved to a DIFFERENT bead after an unrelated bead "
+        f"mentioning the branch appeared — drift (mode c) is not closed: "
+        f"{beads1} vs {beads2}")

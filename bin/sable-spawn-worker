@@ -519,6 +519,21 @@ def tag_serialize_with(bead_id: str, partner_id: str) -> None:
                     f"serialize_with={new_value}"], capture_output=True, text=True)
 
 
+def tag_branch_metadata(bead_id: str, branch: str) -> None:
+    """Record `branch` as STRUCTURED metadata on `bead_id` (SABLE-i5739): the
+    reconciliation floor (bin/sable-reconcile-handoffs find_work_bead_status)
+    resolves a branch to its work bead by an EXACT metadata key/value match,
+    never prose, so this write is what makes that resolution possible at all
+    for a branch whose bead text never happens to name it. A plain overwrite
+    (not an append like tag_serialize_with) — a bead has exactly one branch
+    per dispatch, and a --respawn into the SAME worktree/branch just re-sets
+    the same value. Best-effort: swallows bd errors, matching the rest of
+    this module's fail-open governance writes — a missed tag degrades
+    resolution to the legacy prose fallback, it never blocks dispatch."""
+    subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata",
+                    f"branch={branch}"], capture_output=True, text=True)
+
+
 def bead_already_claimed_by_lane(bead: dict, lane: str) -> bool:
     """True when `bead`'s assignee IS the dispatching lane already — regardless
     of who set it (a prior self-claim, the lane's own claim-then-hold, or a
@@ -1374,6 +1389,18 @@ def main(argv: list[str] | None = None) -> int:
         worktree = resolve_worktree_path(toplevel, wt_name)
         _run(["bd", "worktree", "create", worktree, "--branch", wt_name])
     branch = Path(worktree).name
+
+    # SABLE-i5739: tag every bead landing in this worktree (the lead bead PLUS
+    # any --bundle siblings — they share this SAME branch, see the --bundle
+    # help text above) with the branch as structured metadata, so the
+    # reconciliation floor can resolve branch->bead without a prose search.
+    # Gated on governance like every other bd WRITE in this module (claim,
+    # overlap serialize_with tagging above) — a --skip-governance dispatch is
+    # a stand-in/test spawn against a bead this caller does not own writing
+    # to, and must leave it untouched exactly as the claim/status writes do.
+    if not ns.skip_governance:
+        for tag_id in [bid, *bundle_ids]:
+            tag_branch_metadata(tag_id, branch)
 
     # SABLE-ji4h: link opted-in gitignored fixtures into the worktree. Placed
     # AFTER both arms above so a --respawn into an existing tree is repaired
