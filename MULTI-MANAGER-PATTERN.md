@@ -36,7 +36,7 @@ This pattern is described in terms of a concrete eight-agent roster — adapt th
 
 **Critical**: ownership is based on **work shape**, not priority. A P0 auth-breaking bug is Tarzan's territory if it's standalone. A P3 nice-to-have refactor is Optimus's territory if it's an epic. Priority signals urgency; structure signals ownership.
 
-These three are the original "managers." They launch with `CLAUDE_AGENT_ROLE=manager`, so all the coordination hooks (inbox injection, pre-dispatch refresh/claim/overlap/preempt/model-check, pre-push gate, post-push notify) fire for them.
+These three are the original "managers." They launch with `CLAUDE_AGENT_ROLE=manager`, so all the coordination hooks (inbox injection, pre-dispatch claim/overlap/preempt/model-check, pre-push gate, post-push notify) fire for them. (Pre-dispatch used to include an automatic rebase step too — `pre-dispatch-refresh.sh` — but that was retired; see the hook catalog below.)
 
 ### Tier 2 — Session-scoped planning agents (run during planning sessions, not continuous)
 
@@ -615,7 +615,6 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | `session-role-anchor.sh` | SessionStart, PreCompact | Inject role identity from `~/.claude/sable/roles/<name>.md` | Inject context |
 | `tree-claim.sh` | PreToolUse:Bash | Lockfile: one main session per checkout — deny index-mutating git commands when another session holds a fresh claim (TTL 3600s; `SABLE_TREE_CLAIM_OVERRIDE=1` or manual delete to escape) | Hard deny |
 | `read-guard.sh` | PreToolUse:Bash | Deny `bd ready -l for-<foreign>` queries (Lincoln bypassed via `cross_inbox_read: true`) | Hard deny |
-| `pre-dispatch-refresh.sh` | PreToolUse:Agent | Rebase target worktree on `$SABLE_BASE_BRANCH` | Side effect (rebase) |
 | `pre-dispatch-claim.sh` | PreToolUse:Agent | Read bead description, write file claims to bead notes | Side effect (bd update) |
 | `pre-dispatch-overlap.sh` | PreToolUse:Agent | Annotate overlap with other in-progress beads | Inject context |
 | `pre-dispatch-preempt.sh` | PreToolUse:Agent | Block dispatch if P0 coord bead in inbox | Hard deny |
@@ -625,6 +624,8 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | `post-push-merge-notify.sh` | PostToolUse:Bash matching `git push` | File `for-chuck` bead with overlap analysis (Chuck's own pushes are skipped) | Side effect (bd create) |
 
 Every continuous-mode hook (everything except `session-role-anchor.sh` and `read-guard.sh`) hard-exits when `CLAUDE_AGENT_ROLE != "manager"`, so they no-op in Sherlock / Victor / Rudy / Columbo sessions. (The former poll-based `inbox-injection` hooks were deleted with the tmux-only cutover — live messaging is `sable-msg`; the durable `for-X` labels remain the fallback channel.)
+
+`pre-dispatch-refresh.sh` (automatic rebase-on-dispatch) was likewise retired — SABLE-o3xju de-wired it from the live `settings.json` (both the global install and this repo's project-local copy), and SABLE-mkj6k removed it durably from `templates/multi-manager/settings-snippet.json` so `install.sh` no longer re-arms it. The script file still exists under `hooks/multi-manager/` for reference but is not registered anywhere. Dispatch no longer auto-rebases the worker's checkout — workers rebase themselves (see the "Verify current state first" step and the self-push rebase step in `templates/worker-dispatch.md`).
 
 **Bead quality hook**: `bead-description-gate.sh` (existing SABLE hook) is now mode-aware. When `CLAUDE_AGENT_NAME` is set or `CLAUDE_AGENT_ROLE=manager` (i.e. a multi-manager session), the hook hard-blocks (denies) `bd create` if the description is missing required content. Outside that context (single-agent SABLE), it nudges via `additionalContext`. Rolling execution depends on bead descriptions reliably naming files; the manager-context hard-block is the structural answer to bead-quality drift.
 
