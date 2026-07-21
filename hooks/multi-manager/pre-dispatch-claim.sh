@@ -110,7 +110,21 @@ print(','.join(sorted(paths)))
   # line, breaking the overlap detection in pre-dispatch-overlap.sh and
   # post-push-merge-notify.sh for that bead. Metadata is a separate column
   # bd never touches on a --notes write, so it survives regardless of what
-  # else updates notes afterward.
+  # else updates notes afterward. Regression coverage:
+  # hooks/test/test-pre-dispatch-claim.sh (SABLE-6la1, real bd).
+  #
+  # SABLE-6la1 verification note (2026-07-21, bd 1.0.5): use `--set-metadata
+  # key=value` here, never the `--metadata '{json}'` blob form, as a matter of
+  # intent — a blob write only ever names the key(s) you're touching, and a
+  # careless caller could hand-write one that omits wip_claims. Empirically
+  # (sandboxed probes against the installed bd 1.0.5), the blob form currently
+  # MERGES per-key exactly like --set-metadata rather than replacing the whole
+  # map, so an omitted key is not actually at risk today — but that merge
+  # behavior is not documented/guaranteed by `bd update --help`, so don't rely
+  # on it. If a future bd version changes `--metadata` back to a full-map
+  # replace, any blob write here would silently clobber wip_claims. See
+  # SABLE-gkofi (filed to reconcile this with SABLE-szd/SABLE-sm269, whose
+  # descriptions assumed the blob form already replaces).
   CURRENT_CLAIMS=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
