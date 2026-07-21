@@ -473,3 +473,7 @@ def test_two_concurrent_real_dolt_pushes_isolated_from_shared_state(tmp_path):
         "concurrent real-dolt pushes must never touch ambient dolt state "
         "reachable from the pytest CWD"
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
