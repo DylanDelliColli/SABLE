@@ -107,6 +107,7 @@ ALLOW=(
   test-worker-dispatch-template.sh
   test-worker-flag-done.sh
   test-worktree-isolation.sh
+  test-worktree-placement-guard.sh
 )
 
 # --- Excluded from the run-set, each WITH reason + tracking bead. --------------
@@ -164,6 +165,7 @@ declare -A COVERS=(
   [test-tdd-gate.sh]="hooks/tdd-gate.sh"
   [test-tier-ssot-consumers.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
   [test-tree-claim.sh]="hooks/multi-manager/tree-claim.sh"
+  [test-worktree-placement-guard.sh]="hooks/multi-manager/worktree-placement-guard.sh"
 )
 
 # LIB_FANOUT: each shared lib path (hooks/multi-manager/lib-*.sh) -> every
