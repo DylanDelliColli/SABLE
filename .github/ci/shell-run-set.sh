@@ -60,6 +60,7 @@ ALLOW=(
   test-orchestration-install.sh
   test-overlap-constraint.sh
   test-overlap-dispatch-e2e.sh
+  test-parallel-previews.sh
   test-post-push-merge-notify.sh
   test-post-push-merge-notify-isolation.sh
   test-pre-dispatch-claim.sh
@@ -142,6 +143,7 @@ declare -A COVERS=(
   [test-orchestration-install.sh]="hooks/multi-manager/inbox-injection-precompact.sh hooks/multi-manager/inbox-injection.sh hooks/multi-manager/mode-interlock.sh hooks/multi-manager/read-guard.sh hooks/multi-manager/session-role-anchor.sh"
   [test-overlap-constraint.sh]="hooks/multi-manager/pre-dispatch-overlap.sh"
   [test-overlap-dispatch-e2e.sh]="hooks/multi-manager/pre-dispatch-overlap.sh"
+  [test-parallel-previews.sh]="bin/sable-merge-gate bin/sable_gate_preview_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py bin/sable_gate_git_lib.py"
   [test-post-push-merge-notify.sh]="hooks/multi-manager/post-push-merge-notify.sh"
   [test-pre-dispatch-claim.sh]="hooks/multi-manager/pre-dispatch-claim.sh"
   [test-pre-dispatch-model-check.sh]="hooks/multi-manager/pre-dispatch-model-check.sh"
