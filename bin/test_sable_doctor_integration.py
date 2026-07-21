@@ -37,9 +37,17 @@ def run_install(home_dir: Path):
     assert result.returncode == 0, f"install.sh failed:\n{result.stdout}\n{result.stderr}"
 
 
-def run_doctor(claude_dir: Path, *extra_args, env=None):
+def run_doctor(claude_dir: Path, *extra_args, env=None, bin_dir=None):
+    # bin_dir defaults to the fixture's OWN ~/.local/bin (claude_dir's sibling
+    # under the same redirected HOME run_install used) — never the real
+    # machine's ~/.local/bin. Without this, sable-doctor's --bin-dir default
+    # (~/.local/bin under the subprocess's real $HOME) would silently pull
+    # the actual dev machine's pinned bins into every assertion here.
+    if bin_dir is None:
+        bin_dir = claude_dir.parent / ".local" / "bin"
     return subprocess.run(
-        [sys.executable, str(DOCTOR), "--repo", str(REPO), "--claude-dir", str(claude_dir), *extra_args],
+        [sys.executable, str(DOCTOR), "--repo", str(REPO), "--claude-dir", str(claude_dir),
+         "--bin-dir", str(bin_dir), *extra_args],
         capture_output=True, text=True, timeout=30,
         env=env if env is not None else os.environ,
     )
@@ -58,9 +66,16 @@ def run_project_install(project_dir: Path):
     assert result.returncode == 0, f"install.sh failed:\n{result.stdout}\n{result.stderr}"
 
 
-def run_doctor_project(cwd: Path, *extra_args):
+def run_doctor_project(cwd: Path, *extra_args, bin_dir=None):
+    # The hybrid contract keeps CLI tools global under the HOME used at
+    # install time (project_install below runs install.sh with HOME=cwd), so
+    # that's the bin_dir to check here — never the real machine's ~/.local/bin
+    # (see run_doctor's comment for why that matters).
+    if bin_dir is None:
+        bin_dir = cwd / ".local" / "bin"
     return subprocess.run(
-        [sys.executable, str(DOCTOR), "--repo", str(REPO), "--project", *extra_args],
+        [sys.executable, str(DOCTOR), "--repo", str(REPO), "--project",
+         "--bin-dir", str(bin_dir), *extra_args],
         cwd=str(cwd),
         capture_output=True, text=True, timeout=30,
     )
@@ -224,3 +239,109 @@ def test_doctor_run_shows_cap_line(installed_claude_dir):
     result = run_doctor(installed_claude_dir, env=env_set)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "worker cap: 2 (env SABLE_MAX_WORKERS)" in result.stdout
+
+
+# --- guarded remedy (SABLE-mkj6k acceptance criterion) --------------------------
+#
+# sable-doctor's SessionStart hook (`sable-doctor --quiet 2>&1 || true`) fires
+# on every fresh pane and, on drift, told the agent to `bash install.sh` —
+# while the pin-preservation fix (this same bead) is unverified fleet-wide,
+# that instruction can silently un-pin a deliberately pinned spine bin
+# (DEFECT 2). These invoke the REAL hook command against a real install with
+# a genuinely established pin (via the real sable-bin-install) that then gets
+# reverted to a symlink exactly as a stale/pre-fix install.sh would — and
+# assert the hook's ACTUAL emitted text, not a function's return value.
+
+def _establish_real_pin(bin_dir: Path, target_name: str):
+    """Turn an existing symlinked tool into a real pin the way an operator
+    would: overwrite it with a real copy, then run the REAL sable-bin-install
+    so it detects and records the pin for real (.sable-pinned marker)."""
+    target = bin_dir / target_name
+    content = target.resolve().read_bytes()
+    target.unlink()
+    target.write_bytes(content)
+    target.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(REPO / "bin" / "sable-bin-install"), "--dir", str(bin_dir)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert target.is_file() and not target.is_symlink()
+    assert (bin_dir / ".sable-pinned").is_file()
+
+
+def _revert_pin_to_symlink(bin_dir: Path, target_name: str):
+    """Simulate DEFECT 2 directly: something reverted a pinned bin back to a
+    symlink without updating the marker (a stale pre-fix install.sh, by
+    construction, since the FIXED sable-bin-install refuses to do this)."""
+    target = bin_dir / target_name
+    target.unlink()
+    target.symlink_to(REPO / "bin" / target_name)
+
+
+def test_guarded_pinned_bin_sessionstart_hook_output_has_no_install_sh_instruction(installed_claude_dir):
+    bin_dir = installed_claude_dir.parent / ".local" / "bin"
+    target_name = "sable-merge-gate"
+    _establish_real_pin(bin_dir, target_name)
+    _revert_pin_to_symlink(bin_dir, target_name)
+
+    # The REAL SessionStart hook invocation: `sable-doctor --quiet 2>&1 || true`.
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(REPO), "--claude-dir", str(installed_claude_dir),
+         "--bin-dir", str(bin_dir), "--quiet"],
+        capture_output=True, text=True, timeout=30,
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1
+    assert "bash install.sh" not in combined
+    # quiet mode is deliberately a one-liner (no filenames) — same contract
+    # the ordinary drift path already has; the full report (next test) is
+    # where the safe per-file path gets named.
+    assert "pinned bin" in combined
+
+
+def test_guarded_pinned_bin_full_report_names_the_safe_cp_path_not_install_sh(installed_claude_dir):
+    bin_dir = installed_claude_dir.parent / ".local" / "bin"
+    target_name = "sable-merge-gate"
+    _establish_real_pin(bin_dir, target_name)
+    _revert_pin_to_symlink(bin_dir, target_name)
+
+    result = run_doctor(installed_claude_dir, bin_dir=bin_dir)
+    assert result.returncode == 1
+    assert "bash install.sh" not in result.stdout
+    assert "UNPINNED" in result.stdout
+    assert f"cp {REPO / 'bin' / target_name}" in result.stdout
+
+
+def test_unguarded_drift_sessionstart_hook_still_names_install_sh(installed_claude_dir):
+    # Over-suppression check: a drifted UNGUARDED file (no pinning involved
+    # at all) must still get the ordinary remedy — silencing it globally
+    # would hide real drift, which is its own regression.
+    (installed_claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
+    bin_dir = installed_claude_dir.parent / ".local" / "bin"
+
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(REPO), "--claude-dir", str(installed_claude_dir),
+         "--bin-dir", str(bin_dir), "--quiet"],
+        capture_output=True, text=True, timeout=30,
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1
+    assert "bash install.sh" in combined
+
+
+def test_pinned_bin_survives_real_reinstall_after_the_fix(installed_claude_dir):
+    # The other half of the acceptance criterion, exercised through
+    # sable-doctor: once genuinely pinned, a real re-run of THIS (fixed)
+    # install.sh must leave the pin clean, not flagged.
+    home = installed_claude_dir.parent
+    bin_dir = home / ".local" / "bin"
+    target_name = "sable-merge-gate"
+    _establish_real_pin(bin_dir, target_name)
+
+    run_install(home)
+
+    result = run_doctor(installed_claude_dir, bin_dir=bin_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    target = bin_dir / target_name
+    assert target.is_file() and not target.is_symlink()

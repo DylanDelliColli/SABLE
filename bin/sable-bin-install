@@ -11,8 +11,17 @@
 # instead of a copy's stray ../feedback (the SABLE-ofl fragmentation), and the tools
 # never go stale. --copy is the fallback for filesystems without symlink support.
 #
+# Pin protection (SABLE-mkj6k): a bin that already exists at the destination
+# as a REGULAR FILE (not a symlink) is a deliberate pin — e.g. the operator
+# converting sable-merge-gate/-reconcile-handoffs/-dolt-push to real copies to
+# remove the y6ik3 hot-swap hazard. Before this fix, a plain re-run silently
+# re-symlinked it, reverting that decision with no warning. Default (symlink
+# mode) now SKIPS a pinned bin with a loud notice instead of overwriting it;
+# --repin forces the re-symlink explicitly. --copy is unaffected (an explicit
+# request to write regular files is exactly what a pin already looks like).
+#
 # Usage:
-#   sable-bin-install [--dir DIR] [--copy] [--uninstall] [--dry-run]
+#   sable-bin-install [--dir DIR] [--copy] [--repin] [--uninstall] [--dry-run]
 
 set -u
 
@@ -30,21 +39,27 @@ DEST="${HOME:-}/.local/bin"
 MODE="symlink"
 ACTION="install"
 DRY_RUN=0
+REPIN=0
 
 usage() {
   cat <<EOF
 sable-bin-install — link the SABLE CLI tools (sable-*) onto your PATH.
 
 Usage:
-  sable-bin-install [--dir DIR] [--copy] [--uninstall] [--dry-run]
+  sable-bin-install [--dir DIR] [--copy] [--repin] [--uninstall] [--dry-run]
     --dir DIR     target directory (default: ~/.local/bin)
     --copy        copy the tools instead of symlinking (filesystems w/o symlinks)
+    --repin       force re-symlinking a pinned bin (see PIN PROTECTION below)
     --uninstall   remove the SABLE tools previously installed into DIR
     --dry-run     print what would happen; write nothing
 
 Installs every sable-* shell entrypoint in $BIN_DIR; skips *.py (skill-bundled
 prefilters) and tests. Symlink (default) is preferred — a linked tool resolves
 back to the repo and never goes stale.
+
+PIN PROTECTION (SABLE-mkj6k): if a tool already exists at the destination as a
+regular file (not a symlink), it is treated as a deliberate pin and is SKIPPED
+(with a notice) rather than silently re-symlinked. Pass --repin to override.
 EOF
 }
 
@@ -53,6 +68,7 @@ while [ $# -gt 0 ]; do
     --dir) DEST="${2:?--dir needs a path}"; shift 2 ;;
     --dir=*) DEST="${1#--dir=}"; shift ;;
     --copy) MODE="copy"; shift ;;
+    --repin) REPIN=1; shift ;;
     --uninstall) ACTION="uninstall"; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -76,6 +92,7 @@ if [ "$ACTION" = "uninstall" ]; then
   for t in $TOOLS; do
     if [ "$DRY_RUN" = "1" ]; then note "  would remove: $DEST/$t"; else rm -f "$DEST/$t"; fi
   done
+  [ "$DRY_RUN" = "1" ] || rm -f "$DEST/.sable-pinned"
   [ "$DRY_RUN" = "1" ] || note "sable-bin-install: removed SABLE tools from $DEST"
   exit 0
 fi
@@ -86,12 +103,28 @@ else
   mkdir -p "$DEST" || { note "sable-bin-install: cannot create $DEST"; exit 1; }
 fi
 
+SKIPPED_PINS=""
 for t in $TOOLS; do
   src="$BIN_DIR/$t"; dst="$DEST/$t"
+  is_pinned=0
+  [ "$MODE" = "symlink" ] && [ -e "$dst" ] && [ ! -L "$dst" ] && [ "$REPIN" != "1" ] && is_pinned=1
+
   if [ "$DRY_RUN" = "1" ]; then
-    note "  would $MODE: $dst -> $src"
+    if [ "$is_pinned" = "1" ]; then
+      note "  would SKIP (pinned, regular file): $dst"
+    else
+      note "  would $MODE: $dst -> $src"
+    fi
     continue
   fi
+
+  if [ "$is_pinned" = "1" ]; then
+    note "sable-bin-install: SKIPPING $dst — it is a pinned regular file (not a symlink)."
+    note "  Refusing to silently re-symlink a deliberate pin. Pass --repin to override."
+    SKIPPED_PINS="$SKIPPED_PINS $t"
+    continue
+  fi
+
   if [ "$MODE" = "copy" ]; then
     cp "$src" "$dst" 2>/dev/null && chmod +x "$dst" 2>/dev/null || true
   else
@@ -99,6 +132,32 @@ for t in $TOOLS; do
   fi
 done
 [ "$DRY_RUN" = "1" ] || note "sable-bin-install: installed ($MODE) into $DEST:$TOOLS"
+if [ -n "$SKIPPED_PINS" ]; then
+  note "sable-bin-install: skipped pinned bin(s) (unchanged, not re-symlinked):$SKIPPED_PINS"
+fi
+
+# Refresh the pin marker (SABLE-mkj6k): a small manifest of currently-pinned
+# tool names, recomputed from the ACTUAL post-install filesystem state (a
+# regular file, not a symlink, at DEST/<tool>) every run. sable-doctor reads
+# this to tell a deliberately pinned bin apart from the ordinary symlinked
+# default when deciding whether a drifted bin is safe to recommend
+# `bash install.sh` for. Self-healing: --repin (or manually restoring the
+# symlink) drops the name out of the marker on the very next install run.
+if [ "$DRY_RUN" != "1" ]; then
+  PIN_MARKER="$DEST/.sable-pinned"
+  PIN_MARKER_TMP="$(mktemp "${DEST}/.sable-pinned.XXXXXX" 2>/dev/null || true)"
+  if [ -n "$PIN_MARKER_TMP" ]; then
+    for t in $TOOLS; do
+      dst="$DEST/$t"
+      if [ -e "$dst" ] && [ ! -L "$dst" ]; then printf '%s\n' "$t" >> "$PIN_MARKER_TMP"; fi
+    done
+    if [ -s "$PIN_MARKER_TMP" ]; then
+      mv "$PIN_MARKER_TMP" "$PIN_MARKER"
+    else
+      rm -f "$PIN_MARKER_TMP" "$PIN_MARKER"
+    fi
+  fi
+fi
 
 # Warn (with the exact export line) if DEST is not on PATH.
 case ":${PATH:-}:" in
