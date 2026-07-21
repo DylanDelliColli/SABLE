@@ -280,6 +280,7 @@ def read_provenance(claude_dir: Path):
         return None
     data.setdefault("branch", "unknown")
     data.setdefault("dirty", "false")
+    data.setdefault("untracked", "false")
     data.setdefault("timestamp", "unknown")
     return data
 
@@ -335,11 +336,17 @@ def _provenance_report_lines(provenance, current_head=None, ancestor_ok=None):
     sha = provenance["commit"]
     branch = provenance["branch"]
     when = provenance["timestamp"]
+    # "dirty" is a reproducibility claim (does the recorded SHA reconstruct
+    # the installed TRACKED content?); "untracked" is a separate fact that
+    # does not bear on reproducibility. Two different facts, two different
+    # notes — folding untracked presence into "not reproducible" is the
+    # defect SABLE-dt92b fixed.
     dirty_note = " [DIRTY tree at install time — not reproducible]" if provenance.get("dirty") == "true" else ""
+    untracked_note = " [untracked files present at install time]" if provenance.get("untracked") == "true" else ""
     if current_head and current_head != sha:
-        line = f"installed from {sha} ({branch}), {when}{dirty_note} — repo now at {current_head}"
+        line = f"installed from {sha} ({branch}), {when}{dirty_note}{untracked_note} — repo now at {current_head}"
     else:
-        line = f"installed from {sha} ({branch}), {when}{dirty_note}"
+        line = f"installed from {sha} ({branch}), {when}{dirty_note}{untracked_note}"
     lines = [line]
     if ancestor_ok is False:
         lines.append(

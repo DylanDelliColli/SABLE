@@ -957,11 +957,11 @@ def test_guarded_remedy_lines_undetermined_shape_prints_no_remedy(tmp_path):
 # which commit the CURRENTLY INSTALLED files were copied from — a fact about
 # files, never a claim that any feature in that commit is wired active.
 
-def write_provenance(claude_dir, *, commit="a" * 40, branch="main", dirty="false", timestamp="2026-07-21T00:00:00Z"):
+def write_provenance(claude_dir, *, commit="a" * 40, branch="main", dirty="false", untracked="false", timestamp="2026-07-21T00:00:00Z"):
     claude_dir.mkdir(parents=True, exist_ok=True)
     stamp = claude_dir / doctor.PROVENANCE_FILENAME
     stamp.write_text(
-        f"commit={commit}\nbranch={branch}\ndirty={dirty}\ntimestamp={timestamp}\n"
+        f"commit={commit}\nbranch={branch}\ndirty={dirty}\nuntracked={untracked}\ntimestamp={timestamp}\n"
     )
     return stamp
 
@@ -1094,6 +1094,50 @@ def test_render_text_report_dirty_flag_shown_in_report(tmp_path, capsys):
     )
     out = capsys.readouterr().out
     assert "DIRTY" in out
+
+
+def test_render_text_report_untracked_only_does_not_say_not_reproducible(tmp_path, capsys):
+    # SABLE-dt92b: an untracked-only tree must NOT be reported as "not
+    # reproducible" -- that claim is about TRACKED content, which the
+    # recorded SHA reconstructs exactly regardless of untracked files. This
+    # is the (b) case from the bead's test spec, asserted directly.
+    repo, claude_dir = make_repo(tmp_path)
+    write_provenance(claude_dir, commit="6" * 40, dirty="false", untracked="true")
+    provenance = doctor.read_provenance(claude_dir)
+    assert provenance["dirty"] == "false"
+    doctor.render_text_report(
+        doctor.check_manifest(doctor.build_manifest(repo, claude_dir)), provenance=provenance,
+    )
+    out = capsys.readouterr().out
+    assert "not reproducible" not in out
+    assert "untracked files present" in out
+
+
+def test_render_text_report_dirty_and_untracked_are_independent_notes(tmp_path, capsys):
+    # the mirror direction: a genuinely dirty TRACKED file must still say
+    # "not reproducible" -- separating the untracked note must not have
+    # swallowed the real dirty signal.
+    repo, claude_dir = make_repo(tmp_path)
+    write_provenance(claude_dir, commit="7" * 40, dirty="true", untracked="false")
+    provenance = doctor.read_provenance(claude_dir)
+    doctor.render_text_report(
+        doctor.check_manifest(doctor.build_manifest(repo, claude_dir)), provenance=provenance,
+    )
+    out = capsys.readouterr().out
+    assert "not reproducible" in out
+    assert "untracked files present" not in out
+
+
+def test_read_provenance_untracked_flag_defaults_false_for_pre_dt92b_stamps(tmp_path):
+    # stamps written before SABLE-dt92b have no "untracked" line at all --
+    # must degrade to false, not error or mis-render.
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir()
+    (claude_dir / doctor.PROVENANCE_FILENAME).write_text(
+        "commit=" + "8" * 40 + "\nbranch=main\ndirty=false\ntimestamp=2026-07-21T00:00:00Z\n"
+    )
+    data = doctor.read_provenance(claude_dir)
+    assert data["untracked"] == "false"
 
 
 def test_render_text_report_ancestor_false_adds_a_note_not_an_error(tmp_path, capsys):

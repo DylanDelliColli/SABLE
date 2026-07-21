@@ -491,13 +491,55 @@ def test_installed_from_flag_fails_clearly_without_a_stamp(installed_claude_dir)
 
 
 def test_install_from_a_dirty_tree_stamps_dirty_true(tmp_path):
+    # a genuinely TRACKED modification breaks reproducibility from the
+    # recorded SHA -- install.sh installs tracked content, so this MUST
+    # stamp dirty=true. (Modifying a tracked file, not adding a new
+    # untracked one -- see the untracked-only test below for the contrast
+    # this bead, SABLE-dt92b, is actually about.)
     fixture_repo = make_fixture_repo(tmp_path / "fixture-repo")
-    (fixture_repo / "UNCOMMITTED_CHANGE.md").write_text("dirties the tree post-commit\n")
+    readme = fixture_repo / "README.md"
+    readme.write_text(readme.read_text() + "\ndirties a tracked file post-commit\n")
     home = tmp_path / "home"
     home.mkdir()
     run_install_from(fixture_repo, home)
     stamp = (home / ".claude" / PROVENANCE_STAMP_NAME).read_text()
     assert "dirty=true" in stamp
+
+
+def test_install_from_an_untracked_only_tree_stamps_dirty_false(tmp_path):
+    # SABLE-dt92b: this is the defect, reproduced end-to-end. An untracked
+    # file (never `git add`ed) does not touch any tracked content, so the
+    # recorded SHA still reconstructs the installed set exactly -- dirty
+    # must read false, and doctor's rendered line must not claim "not
+    # reproducible". Untracked presence may still be surfaced, but as its
+    # own, separately-worded fact.
+    fixture_repo = make_fixture_repo(tmp_path / "fixture-repo")
+    (fixture_repo / "UNCOMMITTED_CHANGE.md").write_text("an untracked scratch file\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    run_install_from(fixture_repo, home)
+    claude_dir = home / ".claude"
+    stamp = (claude_dir / PROVENANCE_STAMP_NAME).read_text()
+    assert "dirty=false" in stamp
+    assert "untracked=true" in stamp
+
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(fixture_repo), "--claude-dir", str(claude_dir),
+         "--bin-dir", str(claude_dir.parent / ".local" / "bin")],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "not reproducible" not in result.stdout
+
+
+def test_install_from_a_fully_clean_tree_stamps_dirty_false_and_untracked_false(tmp_path):
+    fixture_repo = make_fixture_repo(tmp_path / "fixture-repo")
+    home = tmp_path / "home"
+    home.mkdir()
+    run_install_from(fixture_repo, home)
+    stamp = (home / ".claude" / PROVENANCE_STAMP_NAME).read_text()
+    assert "dirty=false" in stamp
+    assert "untracked=false" in stamp
 
 
 def test_quiet_mode_sessionstart_hook_stays_silent_on_a_fresh_provenance_stamped_install(provenance_fixture):
