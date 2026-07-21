@@ -309,3 +309,172 @@ def test_promote_taxonomy_is_untouched_by_an_adopted_preview(monkeypatch, quiet_
     monkeypatch.setattr(preview_lib, "wait_for_ci", lambda *a, **kw: ("failure", "http://run/3"))
     assert smg.promote("SABLE-x", BRANCH, BASE, REPO, REMOTE, "optimus", None) == 20
     assert fake.previews_built == 0
+
+
+# --- find_stale_green_preview: the ADOPTION MISS the serial queue creates -----
+#
+# SABLE-kzi1a. adopt_kicked_preview answers "is there a preview for THIS exact
+# (base, branch) pair?" — and under a serial merge lane the answer is no for
+# every branch after the first, because each merge moves the base and invalidates
+# the push-time preview of everything still queued. The green run those previews
+# already paid for is then discarded and a fresh one started. This is the
+# discovery half of stopping that: find the completed-GREEN preview of THIS
+# branch tip onto an OLDER base, so promote can take it to the same footprint
+# assessment a mid-gate base move takes.
+#
+# It reads only. It decides nothing — whether that preview may be promoted is
+# entirely sable_gate_promote_lib's question, and the answer still runs the
+# impact tier on the real combined tree.
+
+OLD_BASE_SHA = "9" * 40
+OLDER_BASE_SHA = "8" * 40
+STALE_PREVIEW_SHA = "5" * 40
+OLDER_PREVIEW_SHA = "6" * 40
+
+
+class StaleRemote:
+    """A remote holding kicked ci-verify refs for BRANCH, as a serial merge queue
+    leaves them: previews built against bases that have since moved on. Models
+    exactly what the discovery reads — a ref listing, the object fetch, commit
+    parents, and base ancestry — and nothing else."""
+
+    def __init__(self, refs, *, ancestors=(), fetchable=True):
+        self.refs = dict(refs)              # ref -> (preview_sha, [base_parent, branch_parent])
+        self.ancestors = set(ancestors)     # (older, newer) pairs that ARE ancestral
+        self.fetchable = fetchable
+        self.calls = []
+
+    def __call__(self, repo, *args, check=True):
+        self.calls.append(args)
+        cmd = args[0]
+        if cmd == "ls-remote":
+            pattern = args[-1][len("refs/heads/"):]
+            if not pattern.endswith("*"):           # the exact-ref adoption probe
+                hit = self.refs.get(pattern)
+                return _cp(0, f"{hit[0]}\trefs/heads/{pattern}\n") if hit else _cp(2)
+            prefix = pattern[:-1]
+            lines = [f"{sha}\trefs/heads/{ref}"
+                     for ref, (sha, _p) in sorted(self.refs.items()) if ref.startswith(prefix)]
+            return _cp(0, "".join(f"{ln}\n" for ln in lines))
+        if cmd == "fetch":
+            return _cp(0 if self.fetchable else 1)
+        if cmd == "rev-list":
+            sha = args[-1]
+            for _ref, (preview, parents) in self.refs.items():
+                if preview == sha:
+                    return _cp(0, " ".join([sha, *parents]))
+            return _cp(1, "bad object")
+        if cmd == "merge-base":
+            older, newer = args[-2], args[-1]
+            return _cp(0 if (older, newer) in self.ancestors else 1)
+        return _cp(0)
+
+
+def _queued(*, base=OLD_BASE_SHA, branch=BRANCH_SHA, preview=STALE_PREVIEW_SHA, extra=None):
+    """A remote whose only kicked preview for BRANCH is one built on `base`,
+    plus whatever `extra` refs the case needs."""
+    refs = {smg.preview_kick_ref(BRANCH, base, branch): (preview, [base, branch])}
+    refs.update(extra or {})
+    return StaleRemote(refs, ancestors={(OLD_BASE_SHA, BASE_SHA), (OLDER_BASE_SHA, BASE_SHA),
+                                        (OLDER_BASE_SHA, OLD_BASE_SHA)})
+
+
+def _verdict(monkeypatch, conclusion, *, complete=True, seen=None):
+    def _read(repo, ref, sha):
+        if seen is not None:
+            seen.append((ref, sha))
+        return classify.Verdict(conclusion, "http://run/9", sha, ref,
+                                source="precomputed", complete=complete)
+    monkeypatch.setattr(preview_lib, "read_verdict", _read)
+
+
+def test_find_stale_green_preview_finds_the_queued_branchs_green_preview(monkeypatch):
+    monkeypatch.setattr(git_lib, "_git", _queued())
+    _verdict(monkeypatch, "success")
+    found = preview_lib.find_stale_green_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA)
+    assert found is not None
+    assert (found.preview_sha, found.base_sha) == (STALE_PREVIEW_SHA, OLD_BASE_SHA)
+    assert found.ref == smg.preview_kick_ref(BRANCH, OLD_BASE_SHA, BRANCH_SHA)
+
+
+def test_find_stale_green_preview_declines_when_adoption_will_hit(monkeypatch):
+    """A preview for the CURRENT base exists, so the ordinary adoption path owns
+    this promote and there is nothing stale to reason about."""
+    current = smg.preview_kick_ref(BRANCH, BASE_SHA, BRANCH_SHA)
+    fake = _queued(extra={current: (PREVIEW_SHA, [BASE_SHA, BRANCH_SHA])})
+    monkeypatch.setattr(git_lib, "_git", fake)
+    seen = []
+    _verdict(monkeypatch, "success", seen=seen)
+    assert preview_lib.find_stale_green_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) is None
+    assert seen == [], "no verdict should be read when adoption already has an answer"
+
+
+@pytest.mark.parametrize("conclusion,complete", [
+    ("failure", True), ("cancelled", True), ("pending", False), ("timeout", True),
+])
+def test_find_stale_green_preview_declines_anything_but_a_stored_green(monkeypatch, conclusion, complete):
+    """Only a COMPLETED green preview is worth anything here. A red one says
+    nothing about the new base, and a pending one is a wait — and paying a wait
+    on a stale object is the opposite of the point."""
+    monkeypatch.setattr(git_lib, "_git", _queued())
+    _verdict(monkeypatch, conclusion, complete=complete)
+    assert preview_lib.find_stale_green_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) is None
+
+
+def test_find_stale_green_preview_declines_a_preview_of_a_stale_branch_tip(monkeypatch):
+    """The branch was re-pushed after the kick. That preview verified an object
+    that no longer exists on the branch — it is not evidence about this promote."""
+    monkeypatch.setattr(git_lib, "_git", _queued(branch="f" * 40))
+    _verdict(monkeypatch, "success")
+    assert preview_lib.find_stale_green_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) is None
+
+
+def test_find_stale_green_preview_requires_the_base_to_have_moved_FORWARD(monkeypatch):
+    """A preview base that is not an ancestor of the current base means the
+    integration branch was reset or force-pushed, not advanced by a merge. That
+    is not the queued-branch case; it takes the pre-kzi1a full re-preview."""
+    fake = _queued()
+    fake.ancestors = set()
+    monkeypatch.setattr(git_lib, "_git", fake)
+    _verdict(monkeypatch, "success")
+    assert preview_lib.find_stale_green_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) is None
+
+
+def test_find_stale_green_preview_declines_when_the_object_is_unfetchable(monkeypatch):
+    fake = _queued()
+    fake.fetchable = False
+    monkeypatch.setattr(git_lib, "_git", fake)
+    _verdict(monkeypatch, "success")
+    assert preview_lib.find_stale_green_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) is None
+
+
+def test_find_stale_green_preview_prefers_the_preview_closest_to_the_current_base(monkeypatch):
+    """Two queued previews for the same branch tip: the one built on the LATER
+    base wins, because its base-move footprint is the smaller of the two and a
+    narrower footprint is the one more likely to be provably disjoint."""
+    older = smg.preview_kick_ref(BRANCH, OLDER_BASE_SHA, BRANCH_SHA)
+    fake = _queued(extra={older: (OLDER_PREVIEW_SHA, [OLDER_BASE_SHA, BRANCH_SHA])})
+    monkeypatch.setattr(git_lib, "_git", fake)
+    _verdict(monkeypatch, "success")
+    found = preview_lib.find_stale_green_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA)
+    assert found is not None and found.base_sha == OLD_BASE_SHA
+
+
+def test_find_stale_green_preview_never_raises_into_the_promote_flow(monkeypatch):
+    """Same contract as adopt_kicked_preview: this is a strict optimization, so
+    every failure mode must be a None, never an exception that changes an exit
+    code the gate's callers branch on."""
+    def _explode(*a, **kw):
+        raise RuntimeError("git blew up")
+    monkeypatch.setattr(git_lib, "_git", _explode)
+    assert preview_lib.find_stale_green_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) is None
+
+
+def test_find_stale_green_preview_reads_only(monkeypatch):
+    """The discovery half must not push, delete, or build anything — promote
+    decides, and the module boundary says this side never writes."""
+    fake = _queued()
+    monkeypatch.setattr(git_lib, "_git", fake)
+    _verdict(monkeypatch, "success")
+    preview_lib.find_stale_green_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA)
+    assert [c for c in fake.calls if c[0] in ("push", "commit-tree", "merge-tree")] == []
