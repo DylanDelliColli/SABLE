@@ -16,6 +16,54 @@ let a test with exactly one unique line slip through) and re-running this
 file: the mutation turned this test red (the planted test's synthetic
 unique line count is 1), confirming the assertion is load-bearing. The
 mutation was reverted before this file was committed.
+
+REVISE PASS (SABLE-cmar4.6, second dispatch) -- two more findings, both
+verified by actually running the mutation, not by inspection alone:
+
+1. test_equal_duration_tests_do_not_subsume_each_other's original fixture
+   used DISJOINT coverage (t_a -> m.py:1, t_b -> m.py:2), a shape neither
+   tie handling nor its absence can ever fail on -- disjoint sets can't
+   subsume each other regardless of iteration order, so the test protected
+   nothing. It was rebuilt with OVERLAPPING coverage (t_b's set a strict
+   subset of t_a's) and the negative control was run for real: reverting
+   rank_python_tests to the pre-fix `sorted(durations.items(), key=(duration,
+   nodeid))` + single-pass-accumulation logic turns it red (t_b's
+   unique_count drops from 1 to 0, subsumed flips to True) -- confirmed by
+   temporarily reinstating that logic and re-running this file, then
+   reverting. This is what exposed the original bug: rank_python_tests'
+   docstring promised equal-duration ties never subsume each other, but the
+   code broke ties by nodeid and accumulated as it went, so the
+   alphabetically-earlier of two tied tests always "won". Fixed by
+   processing equal-duration tests in bands: every test in a band computes
+   `unique` against the `faster_union` as it stood before the band started,
+   and the band's coverage is folded in only after the whole band is
+   scored -- see rank_python_tests' docstring.
+
+2. Defect-3 audit -- asked of every test in this file: "would this fixture
+   still pass if the subtraction (`covered - faster_union`) rank_python_tests
+   performs were deleted outright (replaced with `unique = covered`)?" Run
+   for real (mutate, run, revert), not reasoned about in the abstract.
+   FOUR tests catch full deletion of the subtraction:
+   test_slow_uniquely_covering_test_is_never_proposed,
+   test_genuinely_subsumed_slow_test_is_proposed,
+   test_python_pruning_candidates_never_includes_nonempty_unique (the one
+   the dispatch flagged for particular attention), and
+   test_format_text_flags_prune_candidates. TWO tests pass either way, and
+   that's inherent to what they check rather than a gap:
+   test_fastest_test_is_never_trivially_subsumed_when_it_has_coverage and
+   test_zero_coverage_test_is_trivially_subsumed both put their subject test
+   in the position where `faster_union` is still empty (fastest-of-all, or
+   zero-coverage so nothing to subtract from), so `covered - {}` and
+   `covered` are the same value -- these tests exercise real, distinct edge
+   cases (no faster peers exist; empty coverage is trivially subsumed) but
+   cannot, by their fixture's own shape, distinguish "subtraction happened"
+   from "subtraction was skipped". Not fixed: they are testing what their
+   docstrings say they test, and a third check on the same axis as the four
+   above would be redundant. The remaining tests in this file
+   (parse_pytest_durations coverage, ranking-order, shell-half,
+   build_report/format sanity) each name a different property and were
+   checked against deletion of the mechanism they name, not the subsumption
+   subtraction -- no further gaps found.
 """
 from __future__ import annotations
 
@@ -156,17 +204,28 @@ def test_zero_coverage_test_is_trivially_subsumed():
 
 
 def test_equal_duration_tests_do_not_subsume_each_other():
-    """Ties are not 'faster than' -- two equally-fast tests each keep
-    credit for their own coverage rather than one arbitrarily 'winning'
-    based on dict/sort iteration order."""
+    """Ties are not 'faster than': t_b's coverage is a strict SUBSET of
+    t_a's, the only fixture shape that can actually exercise this
+    guarantee (disjoint coverage can never subsume regardless of tie
+    handling). Under the naive `sorted(durations.items(), key=(duration,
+    nodeid))` + single-pass-accumulation bug this replaces, "t_a" sorts
+    before "t_b" alphabetically, enters `faster_union` first, and t_b's
+    subset coverage then reads as fully subsumed -- exactly the
+    arbitrary-tie-order outcome this test guards against. Negative control
+    verified by hand: reverting rank_python_tests to that naive
+    implementation turns this test red (t_b's unique_count becomes 0,
+    subsumed becomes True) -- see SABLE-cmar4.6 revise note."""
     durations = {"t_a": 1.0, "t_b": 1.0}
     coverage_map = {
-        "t_a": {_line("m.py", 1)},
-        "t_b": {_line("m.py", 2)},
+        "t_a": {_line("m.py", 1), _line("m.py", 2)},
+        "t_b": {_line("m.py", 1)},
     }
     records = ccp.rank_python_tests(durations, coverage_map)
-    assert all(r["unique_count"] == 1 for r in records)
-    assert all(r["subsumed"] is False for r in records)
+    by_id = {r["nodeid"]: r for r in records}
+    assert by_id["t_a"]["unique_count"] == 2
+    assert by_id["t_a"]["subsumed"] is False
+    assert by_id["t_b"]["unique_count"] == 1
+    assert by_id["t_b"]["subsumed"] is False
 
 
 def test_ranked_output_sorted_slowest_first():
