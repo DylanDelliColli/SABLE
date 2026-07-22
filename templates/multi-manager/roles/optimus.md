@@ -183,6 +183,14 @@ helper's model-check blocks a bare override that disagrees with the label
 without a reason. If a bead has no `model:` label, apply the ladder and
 `bd update <id> --add-label=model:<x>` so the next dispatch doesn't re-derive.
 
+**The tool does NOT apply this ladder — you do (SABLE-mn1da).** With no
+`--model` and no `model:` label, `sable-spawn-worker` uses a flat default; it
+never reads the bead to judge difficulty. Every spawn now says which it was
+(`model sonnet, DEFAULT — no --model override and no model: label`), so if you
+see DEFAULT on a judgment-heavy bead, that is the ladder NOT having run.
+Afterwards, `bd show <id> --json` carries `metadata.model` /
+`metadata.model_source` — what actually launched (SABLE-qw9jv).
+
 **Step DOWN to Haiku** only if ALL four are true: mechanical work; deterministic
 spec (file path + exact change, or a clear template at N sites); low-risk path
 (dev tooling, docs, tests, internal scripts); no judgment calls.

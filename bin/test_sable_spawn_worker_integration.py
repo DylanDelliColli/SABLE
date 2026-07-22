@@ -1519,6 +1519,248 @@ def test_skip_governance_dispatch_does_not_write_branch_metadata(sock):
         assert "metadata" not in beads[0] or "branch" not in beads[0].get("metadata", {}), beads
 
 
+# --- SABLE-qw9jv / SABLE-mn1da: model legibility -----------------------------
+#
+# Selection (mn1da) and provenance (qw9jv) are tested together because they are
+# the same operator question at two times: "which model is about to run this?"
+# at dispatch, and "which model DID run this?" afterwards. Both are exercised
+# against a REAL tmux server and the real spawn binary; only `bd` and `claude`
+# are stand-ins, and the `claude` stand-in is deliberately a real executable so
+# the pane's ACTUAL start command carries `--model` exactly as a real dispatch
+# does — the stamp is then checked against what tmux reports the pane launched,
+# not against what the test asked for.
+
+
+def _write_fake_claude(stub_dir: Path) -> None:
+    """A `claude` stand-in that stays alive (reads stdin) so the pane behaves
+    like a booted worker. It ignores its arguments — what matters is that the
+    default worker_command path really execs `claude --model <m> ...` in a real
+    pane, so `#{pane_start_command}` carries a genuine model flag."""
+    script = stub_dir / "claude"
+    script.write_text("#!/usr/bin/env bash\nexec cat >/dev/null\n")
+    script.chmod(0o755)
+
+
+def _model_meta(env: dict, bead_id: str) -> dict:
+    show = subprocess.run(["bd", "show", bead_id, "--json"], env=env,
+                          capture_output=True, text=True)
+    meta = json.loads(show.stdout)[0].get("metadata", {}) or {}
+    return {k: v for k, v in meta.items() if k in ("model", "model_source")}
+
+
+def _pane_start_command(sock: str, bead_id: str) -> str:
+    listing = _tmux(sock, "list-panes", "-a", "-F",
+                    "#{@sable_bead}\t#{pane_start_command}").stdout
+    for line in listing.splitlines():
+        tag, _, cmd = line.partition("\t")
+        if tag == bead_id:
+            return cmd
+    return ""
+
+
+def _model_env(sock, stub_dir, dd, **overrides):
+    env = {
+        **_clean_env(),
+        "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+        "SABLE_MAX_LOAD_PER_CORE": "0",
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_SESSION": "sable",
+        "SABLE_DISPATCH_DIR": dd,
+        "SABLE_DISPATCH_READY_TIMEOUT": "0",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+    }
+    env.pop("CLAUDE_AGENT_NAME", None)  # keep lane empty -> preempt is a no-op
+    env.update(overrides)
+    return env
+
+
+def test_default_dispatch_announces_the_default_and_stamps_what_launched(sock):
+    """SABLE-mn1da + SABLE-qw9jv, the core case: a dispatch with NO --model and
+    NO model: label.
+
+    mn1da: the operator-visible output must name the model AND say it came from
+    the flat default — the silent path is the whole defect, and a manager who
+    believes a ladder graded the bead has no way to notice otherwise.
+
+    qw9jv: the bead must end up carrying a machine-readable model field whose
+    value matches what the pane ACTUALLY launched (read back from tmux's own
+    `pane_start_command`, not from what this test requested), plus the source of
+    the choice. Bundled siblings share the pane, so they are stamped too."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id, sibling_id = "FAKE-model-1", "FAKE-model-1b"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "open", "assignee": None},
+            {"id": sibling_id, "title": "T2", "description": "D2", "labels": [],
+             "status": "open", "assignee": None},
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+        _write_fake_claude(Path(stub_dir))
+
+        env = _model_env(sock, stub_dir, dd)  # NO SABLE_WORKER_CMD: real claude path
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt, "--bundle", sibling_id],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        time.sleep(0.4)
+
+        # (mn1da) the choice is legible at dispatch: model named, default named
+        assert "sonnet" in r.stderr
+        assert "DEFAULT" in r.stderr
+        assert "does NOT infer difficulty" in r.stderr
+
+        # (qw9jv) what tmux says actually launched
+        started = _pane_start_command(sock, bead_id)
+        assert "--model sonnet" in started, started
+
+        for bid in (bead_id, sibling_id):
+            assert _model_meta(env, bid) == {"model": "sonnet",
+                                             "model_source": "default"}, bid
+
+
+def test_stamp_records_the_model_that_launched_not_the_one_requested(sock):
+    """SABLE-qw9jv's stated GOTCHA: record what the spawn REPORTED, not what the
+    dispatcher REQUESTED. Here the request is `--model haiku` while the actual
+    launch command pins opus (a SABLE_WORKER_CMD override — the same divergence
+    a refusal/downgrade/retry produces). The bead must say opus."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-model-2"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "open", "assignee": None}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+        _write_fake_claude(Path(stub_dir))
+
+        env = _model_env(sock, stub_dir, dd,
+                         SABLE_WORKER_CMD="claude --model opus")
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        time.sleep(0.4)
+
+        assert "--model opus" in _pane_start_command(sock, bead_id)
+        assert _model_meta(env, bead_id)["model"] == "opus"
+        assert "differs from the resolved model" in r.stderr
+
+
+def test_stamp_says_unknown_rather_than_asserting_an_unlaunched_model(sock):
+    """A worker command that names NO model (the stand-in `bash` this suite
+    uses everywhere else) cannot support a model claim. Stamping the REQUESTED
+    model here would manufacture exactly the false attribution this bead was
+    filed over — four of the eight audited beads only 'had' a model because
+    somebody's intent was written down. Record unknown instead."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-model-3"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "open", "assignee": None}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+
+        env = _model_env(sock, stub_dir, dd,
+                         SABLE_WORKER_CMD="bash --noprofile --norc")
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        time.sleep(0.4)
+
+        assert _model_meta(env, bead_id) == {"model": "unknown",
+                                             "model_source": "worker-cmd-override"}
+        assert "haiku" not in _model_meta(env, bead_id).values()
+
+
+def test_refused_spawn_leaves_no_attribution_and_redispatch_records_the_tier_that_ran(sock):
+    """SABLE-qw9jv's test spec, verbatim: a bead dispatched, refused by the
+    host-load guard, and re-dispatched at a DIFFERENT tier must show the tier
+    that ACTUALLY RAN.
+
+    First call requests haiku and is refused (exit 8) before any pane exists —
+    it must leave NO model metadata at all, because nothing ran. Second call
+    requests opus, launches, and is the only attribution on the bead."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-model-4"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "open", "assignee": None}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+        _write_fake_claude(Path(stub_dir))
+
+        # host-guard on and impossible to satisfy -> refusal at the haiku tier
+        refused_env = _model_env(sock, stub_dir, dd,
+                                 SABLE_MAX_LOAD_PER_CORE="0.0000001")
+        r1 = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=refused_env,
+        )
+        assert r1.returncode == 8, f"stdout={r1.stdout!r} stderr={r1.stderr!r}"
+        assert _model_meta(refused_env, bead_id) == {}, "refused spawn stamped a model"
+
+        # re-dispatch at a different tier, guard cleared
+        env = _model_env(sock, stub_dir, dd)
+        r2 = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt, "--model", "opus:stepping up"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r2.returncode == 0, r2.stderr
+        time.sleep(0.4)
+
+        assert "--model opus" in _pane_start_command(sock, bead_id)
+        assert _model_meta(env, bead_id) == {"model": "opus",
+                                             "model_source": "override"}
+        # the reasoned-override announcement is unchanged by this work (mn1da)
+        assert "model opus, override: stepping up" in r2.stderr
+
+
+def test_skip_governance_dispatch_does_not_stamp_model_metadata(sock):
+    """Same invariant as the branch-metadata counterpart above: a stand-in
+    spawn against a bead this caller does not own writing to leaves it
+    untouched — but it still SAYS what it launched on stderr, so the operator
+    is not left guessing."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        bead_id = "FAKE-model-5"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([
+            {"id": bead_id, "title": "T", "description": "D", "labels": [],
+             "status": "open", "assignee": None}
+        ]))
+        _write_fake_bd(Path(stub_dir), db_path)
+        _write_fake_claude(Path(stub_dir))
+
+        env = _model_env(sock, stub_dir, dd)
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt, "--skip-governance"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        time.sleep(0.4)
+
+        assert _model_meta(env, bead_id) == {}
+        assert "model=sonnet model_source=default" in r.stderr
+        assert "not stamped: --skip-governance" in r.stderr
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

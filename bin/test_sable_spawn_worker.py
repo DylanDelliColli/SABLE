@@ -22,25 +22,110 @@ _LOADER.exec_module(ssw)
 # --- model ladder resolution ------------------------------------------------
 
 def test_resolve_model_default_sonnet():
-    assert ssw.resolve_model([], None) == ("sonnet", None)
-    assert ssw.resolve_model(["scope:foo"], None) == ("sonnet", None)
+    assert ssw.resolve_model([], None) == ("sonnet", None, "default")
+    assert ssw.resolve_model(["scope:foo"], None) == ("sonnet", None, "default")
 
 
 def test_resolve_model_from_label():
-    assert ssw.resolve_model(["model:haiku"], None) == ("haiku", None)
-    assert ssw.resolve_model(["x", "model:opus", "y"], None) == ("opus", None)
+    assert ssw.resolve_model(["model:haiku"], None) == ("haiku", None, "label")
+    assert ssw.resolve_model(["x", "model:opus", "y"], None) == ("opus", None, "label")
 
 
 def test_resolve_model_override_wins_and_carries_reason():
-    model, reason = ssw.resolve_model(["model:sonnet"], "opus:auth path now")
+    model, reason, source = ssw.resolve_model(["model:sonnet"], "opus:auth path now")
     assert model == "opus"
     assert reason == "auth path now"
+    assert source == "override"
 
 
 def test_resolve_model_override_without_reason():
-    model, reason = ssw.resolve_model([], "haiku")
+    model, reason, source = ssw.resolve_model([], "haiku")
     assert model == "haiku"
     assert reason is None
+    assert source == "override"
+
+
+# --- SABLE-mn1da: the "ladder" is a flat default, and says so ----------------
+
+def test_resolve_model_does_not_infer_difficulty_from_the_bead():
+    """The whole defect: no bead signal — type, priority, description size, an
+    unresolved ruling — moves the model. Only an override or a model: label
+    does. Asserted directly so a future 'smart' inference cannot be added
+    without deciding, explicitly, to break this."""
+    heavy = ["type:bug", "priority:0", "security", "ruling:unresolved"]
+    assert ssw.resolve_model(heavy, None) == (ssw.DEFAULT_MODEL, None, "default")
+
+
+def test_model_announcement_default_names_model_and_says_it_is_the_default():
+    ann = ssw.model_announcement("sonnet", None, "default")
+    assert "sonnet" in ann
+    assert "DEFAULT" in ann
+    # it must state WHY (neither signal was present), not just that it defaulted
+    assert "--model" in ann and "model: label" in ann
+
+
+def test_model_announcement_reasoned_override_is_byte_identical_to_the_old_wording():
+    """The path that already worked must gain no noise (SABLE-mn1da test spec):
+    this is exactly the string sable-spawn-worker printed before the fix."""
+    assert ssw.model_announcement("opus", "auth path now", "override") == \
+        "model opus, override: auth path now"
+
+
+def test_model_announcement_bare_override_says_no_reason_was_given():
+    ann = ssw.model_announcement("haiku", None, "override")
+    assert ann.startswith("model haiku, override:")
+    assert "no reason given" in ann
+
+
+def test_model_announcement_label_names_the_label_as_the_source():
+    ann = ssw.model_announcement("haiku", None, "label")
+    assert "haiku" in ann and "model:haiku" in ann
+    assert "DEFAULT" not in ann
+
+
+# --- SABLE-qw9jv: provenance comes from what LAUNCHED -----------------------
+
+def test_launched_model_reads_the_default_worker_command():
+    cmd = ssw.worker_command("haiku", None)
+    assert ssw.launched_model(cmd) == "haiku"
+
+
+def test_launched_model_survives_the_lifecycle_wrapper():
+    """The stamp is taken from the FINAL string handed to tmux, so it must
+    still be readable after with_lifecycle_flags wraps it."""
+    wrapped = ssw.with_lifecycle_flags(ssw.worker_command("opus", None))
+    assert ssw.launched_model(wrapped) == "opus"
+
+
+def test_launched_model_stops_at_shell_punctuation():
+    """Caught by the integration test, not by inspection: with_lifecycle_flags
+    joins the worker command to the done-flag write with `;`, so a command
+    ending in the model token ('claude --model opus') parsed as 'opus;' and
+    that value went straight into the bead. The stamp must be the model, not
+    the model plus whatever shell syntax followed it."""
+    wrapped = ssw.with_lifecycle_flags(ssw.worker_command("x", "claude --model opus"))
+    assert ssw.launched_model(wrapped) == "opus"
+    assert ssw.launched_model("claude --model haiku && echo hi") == "haiku"
+
+
+def test_launched_model_accepts_equals_form():
+    assert ssw.launched_model("claude --model=opus --permission-mode x") == "opus"
+
+
+def test_launched_model_is_none_when_the_command_names_no_model():
+    """A full SABLE_WORKER_CMD override replaces the command verbatim. When it
+    pins no model, the honest answer is 'unknown' — NOT the model the
+    dispatcher asked for. Recording the request here is the intent-vs-execution
+    error the bead exists to kill."""
+    assert ssw.launched_model(ssw.worker_command("opus", "bash --noprofile --norc")) is None
+    assert ssw.launched_model("") is None
+
+
+def test_launched_model_reports_the_override_model_not_the_requested_one():
+    """SABLE_WORKER_CMD naming a DIFFERENT model than the one resolved: the
+    launch wins."""
+    cmd = ssw.worker_command("sonnet", "claude --model opus --permission-mode x")
+    assert ssw.launched_model(cmd) == "opus"
 
 
 # --- naming -----------------------------------------------------------------
