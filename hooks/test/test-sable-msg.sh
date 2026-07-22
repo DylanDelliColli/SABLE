@@ -265,7 +265,6 @@ if command -v bd >/dev/null 2>&1; then
   tmux_ set-option -p -t "$stuckpane" @sable_role chuck
   sleep 0.2
 
-  live_count_before="$(cd "$REPO" && bd count 2>/dev/null)"
   ERRFILE2="$REC/fallback-err.txt"
   if CLAUDE_AGENT_NAME=lincoln SABLE_MSG_SUBMIT_TRIES=3 SABLE_MSG_POLL_INTERVAL=0.1 \
       BEADS_DB="$SCRATCH_BEADS_DIR/.beads" \
@@ -274,7 +273,6 @@ if command -v bd >/dev/null 2>&1; then
   else
     pass "unverifiable delivery to a never-ready pane reports undelivered"
   fi
-  live_count_after="$(cd "$REPO" && bd count 2>/dev/null)"
 
   if grep -q "Filed durable inbox bead" "$ERRFILE2"; then
     pass "sable-msg's SABLE-1umr fallback fired"
@@ -295,10 +293,18 @@ if command -v bd >/dev/null 2>&1; then
     fail "sandboxed fallback bead carries the for-chuck inbox label" "$(BEADS_DB="$SCRATCH_BEADS_DIR/.beads" bd list --all --json 2>/dev/null)"
   fi
 
-  if [ -n "$live_count_before" ] && [ "$live_count_before" = "$live_count_after" ]; then
-    pass "live bd DB gained ZERO beads from the fallback"
+  # Identity check, NOT a count delta (SABLE-3mrv3): a before/after bd count
+  # equality assertion is a GLOBAL COUNTER check that trips on ANY bead filed
+  # by ANY fleet actor during the window, regardless of this test. The title
+  # sable-msg would have used for a LIVE fallback bead is deterministic (see
+  # file_fallback_bead in bin/sable-msg); assert that specific title is
+  # absent from the live store instead of diffing a shared counter.
+  fallback_title="SABLE-MSG undelivered to chuck: sandbox fallback probe"
+  live_title_hits="$(cd "$REPO" && bd count --title-contains "$fallback_title" 2>/dev/null)"
+  if [ "$live_title_hits" = "0" ]; then
+    pass "live bd DB never gained the fallback bead (identity check, not a global counter)"
   else
-    fail "live bd DB gained ZERO beads from the fallback" "before=$live_count_before after=$live_count_after"
+    fail "live bd DB never gained the fallback bead" "$(cd "$REPO" && bd list --all --title-contains "$fallback_title" --json 2>/dev/null)"
   fi
 fi
 
