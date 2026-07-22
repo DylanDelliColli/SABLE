@@ -13,6 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sable_telemetry_lib as lib  # noqa: E402
+import sable_telemetry_bd_source as bd_source  # noqa: E402
 
 _LOADER = SourceFileLoader(
     "sable_telemetry_cli", str(Path(__file__).resolve().parent / "sable-telemetry")
@@ -64,6 +65,41 @@ def test_build_shift_and_trend_reports_are_empty_stubs():
     trend = lib.build_trend_report("14d")
     assert trend.window == "14d"
     assert trend.metrics == ()
+
+
+def test_bd_source_query_passes_all_flag():
+    args = bd_source.build_bd_list_args()
+    assert "--all" in args
+    assert "--json" in args
+
+    scoped_args = bd_source.build_bd_list_args(status="closed")
+    assert "--all" in scoped_args
+    assert "--status" in scoped_args
+    assert scoped_args[scoped_args.index("--status") + 1] == "closed"
+
+
+def test_bd_source_filters_cross_tracker_ids():
+    raw = [
+        {"id": "SABLE-abcd", "status": "open", "created_at": "2026-07-01T00:00:00Z"},
+        {"id": "market-brief-package-0h8k", "status": "open",
+         "created_at": "2026-07-01T00:00:00Z"},
+    ]
+    records = [
+        bd_source._to_bead_record(r) for r in raw
+        if not bd_source._is_cross_tracker_id(r["id"])
+    ]
+    assert [r.id for r in records] == ["SABLE-abcd"]
+
+
+def test_bd_source_marks_missing_started_at_as_none():
+    record = bd_source._to_bead_record({
+        "id": "SABLE-xyz",
+        "status": "closed",
+        "created_at": "2026-07-01T00:00:00Z",
+        "closed_at": "2026-07-02T00:00:00Z",
+    })
+    assert record.started_at is None
+    assert record.closed_at == "2026-07-02T00:00:00Z"
 
 
 if __name__ == "__main__":
