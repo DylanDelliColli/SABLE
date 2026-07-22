@@ -283,6 +283,28 @@ def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None
                         run=run, capture=capture, sleep=sleep)
 
 
+FALLBACK_TITLE_PREFIX = "SABLE-MSG undelivered to"
+
+
+def fallback_bead_title(to_role: str, message: str) -> str:
+    """The title file_fallback_bead gives a durable inbox bead.
+
+    Extracted so callers that need to RECOGNISE such a bead derive the title
+    the same way we compose it, instead of hand-typing the format (SABLE-3mrv3).
+    Note what `message` is at every real call site: the FRAMED message from
+    format_message ('⟦SABLE-MSG⟧ from=<frm> to=<to> :: <body>'), never the raw
+    body — so the framing sits between the role and the body, and a title
+    guessed as '<prefix> <role>: <body>' matches nothing. That mistake made a
+    live-DB-pollution assertion silently unfalsifiable; hence this seam."""
+    return f"{FALLBACK_TITLE_PREFIX} {to_role}: {message[:80]}"
+
+
+def fallback_bead_labels(to_role: str) -> str:
+    """The --labels value for a durable inbox bead. Same rationale as
+    fallback_bead_title: recognisers must reuse it, not restate it."""
+    return f"for-{to_role},coord"
+
+
 def file_fallback_bead(frm: str, to_role: str, message: str, runner=None) -> str | None:
     """File the durable for-<role> inbox bead when live delivery could not be
     verified (SABLE-1umr). Returns the new bead id, or None when bd is
@@ -298,13 +320,14 @@ def file_fallback_bead(frm: str, to_role: str, message: str, runner=None) -> str
     is read anyway. Do NOT stop filing them: the fallback is what makes an
     unverified delivery lossless, and it has worked correctly every time."""
     runner = runner or (lambda args: subprocess.run(args, capture_output=True, text=True))
-    title = f"SABLE-MSG undelivered to {to_role}: {message[:80]}"
+    title = fallback_bead_title(to_role, message)
     desc = (f"Auto-filed by sable-msg after verified-delivery failure (SABLE-1umr). "
             f"Deliver this message to {to_role} and act on it: {message} "
             f"[no-test] coordination inbox bead, no code change.")
     try:
         r = runner(["bd", "create", f"--title={title}", f"--description={desc}",
-                    "--type=task", "--priority=3", f"--labels=for-{to_role},coord"])
+                    "--type=task", "--priority=3",
+                    f"--labels={fallback_bead_labels(to_role)}"])
     except Exception:
         return None
     if getattr(r, "returncode", 1) != 0:

@@ -368,6 +368,55 @@ def test_file_fallback_bead_is_not_filed_p1():
     assert "--labels=for-optimus,coord" in argv
 
 
+def test_fallback_bead_title_is_composed_from_the_framed_message_3mrv3():
+    """SABLE-3mrv3 regression. A recogniser for "did the fallback pollute the
+    live DB?" needs the bead's title. The first attempt hand-typed it as
+    '<prefix> <role>: <body>' — but every real call site passes the FRAMED
+    message, so the framing sits BETWEEN the role and the body and the guess
+    matched nothing. `bd count --title-contains <guess>` then returned 0
+    unconditionally: an assertion that could not fail, which is worse than the
+    global counter it replaced because it looks like coverage.
+
+    Pin both directions: the composed title is what file_fallback_bead actually
+    uses, and the naive hand-typed form is NOT a substring of it."""
+    body = "sandbox fallback probe"
+    framed = sable_msg.format_message("lincoln", "chuck", body)
+    title = sable_msg.fallback_bead_title("chuck", framed)
+
+    assert title == f"SABLE-MSG undelivered to chuck: {framed[:80]}"
+    assert sable_msg.HEADER in title, "the framing must be present in the title"
+    assert body in title
+
+    naive = f"SABLE-MSG undelivered to chuck: {body}"
+    assert naive not in title, (
+        "the hand-typed '<prefix> <role>: <body>' form must NOT match — if it "
+        "ever does, the SABLE-3mrv3 trap has silently reopened"
+    )
+
+
+def test_file_fallback_bead_uses_the_shared_title_and_label_helpers_3mrv3():
+    """The seam is only useful if the filer and the recogniser cannot drift:
+    file_fallback_bead must emit exactly what fallback_bead_title /
+    fallback_bead_labels produce, so a test deriving the title from those
+    helpers is guaranteed to match a real fallback bead."""
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-ab12\n"
+        stderr = ""
+
+    def runner(args):
+        seen.append(args)
+        return R()
+
+    framed = sable_msg.format_message("lincoln", "chuck", "sandbox fallback probe")
+    sable_msg.file_fallback_bead("lincoln", "chuck", framed, runner=runner)
+    argv = seen[0]
+    assert f"--title={sable_msg.fallback_bead_title('chuck', framed)}" in argv
+    assert f"--labels={sable_msg.fallback_bead_labels('chuck')}" in argv
+
+
 def test_file_fallback_bead_returns_none_when_bd_unavailable():
     class R:
         returncode = 1
