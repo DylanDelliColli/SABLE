@@ -367,7 +367,8 @@ if [ "${#HOME_MARKERS[@]}" -eq 2 ]; then
     # ambiently) — proven with the mkdtemp'd HOME_A/HOME_B captured above.
     if [ "$STATUS_A" = "present" ] && [ "$STATUS_B" = "present" ] \
        && [ "${SPATH_A#"$HOME_A"}" != "$SPATH_A" ] \
-       && [ "${SPATH_B#"$HOME_B"}" != "$SPATH_B" ]; then
+       && [ "${SPATH_B#"$HOME_B"}" != "$SPATH_B" ] \
+       && [ "$SPATH_A" != "$SPATH_B" ]; then
       pass "S7: each tier's settings.json VIEW lives INSIDE its own isolated HOME (A=$SPATH_A B=$SPATH_B)"
     else
       fail "S7: each tier's settings.json VIEW lives INSIDE its own isolated HOME" \
