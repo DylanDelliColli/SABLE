@@ -152,6 +152,99 @@ def test_gh_source_preview_ref_regex_extracts_bead_and_sha7():
     assert gh_source.parse_preview_ref("ci-verify/SABLE-c008-notasha") is None
 
 
+def test_cycle_time_scoped_to_started_at_subset():
+    # 3 closed beads: 2 dispatched (started_at present, both merged), 1
+    # manager-closed (started_at absent). The architecture invariant: the
+    # manager-closed bead must never contribute a CycleSplitEntry, even
+    # though it is closed.
+    beads = [
+        bd_source.BeadRecord(
+            id="SABLE-a", status="closed",
+            created_at="2026-07-20T00:00:00Z",
+            closed_at="2026-07-20T01:00:00Z",
+            started_at="2026-07-20T00:30:00Z",
+        ),
+        bd_source.BeadRecord(
+            id="SABLE-b", status="closed",
+            created_at="2026-07-20T00:00:00Z",
+            closed_at="2026-07-20T02:00:00Z",
+            started_at="2026-07-20T01:30:00Z",
+        ),
+        bd_source.BeadRecord(
+            id="SABLE-manager", status="closed",
+            created_at="2026-07-20T00:00:00Z",
+            closed_at="2026-07-20T03:00:00Z",
+            started_at=None,
+        ),
+    ]
+    merges = [
+        git_source.MergeEvent(bead_id="SABLE-a", sha="aaa1111",
+                              committed_at="2026-07-20T01:05:00Z"),
+        git_source.MergeEvent(bead_id="SABLE-b", sha="bbb2222",
+                              committed_at="2026-07-20T02:10:00Z"),
+    ]
+
+    report = lib.build_cycle_split_report(beads, merges)
+
+    assert report.dispatched_count == 2
+    assert report.closed_count == 3
+    assert {e.bead_id for e in report.entries} == {"SABLE-a", "SABLE-b"}
+
+    entry_a = next(e for e in report.entries if e.bead_id == "SABLE-a")
+    assert entry_a.in_worker_seconds == 30 * 60
+    assert entry_a.merge_queue_wait_seconds == 5 * 60
+
+
+def test_cycle_time_excludes_manager_closed_beads_without_started_at():
+    beads = [
+        bd_source.BeadRecord(
+            id="SABLE-manager", status="closed",
+            created_at="2026-07-20T00:00:00Z",
+            closed_at="2026-07-20T03:00:00Z",
+            started_at=None,
+        ),
+    ]
+    # Even a bead with a matching merge event must be excluded from entries
+    # when it lacks started_at -- the scoping guard is on the bd record, not
+    # on merge-event presence.
+    merges = [
+        git_source.MergeEvent(bead_id="SABLE-manager", sha="ccc3333",
+                              committed_at="2026-07-20T03:05:00Z"),
+    ]
+
+    report = lib.build_cycle_split_report(beads, merges)
+
+    assert report.dispatched_count == 0
+    assert report.closed_count == 1
+    assert report.entries == ()
+
+
+def test_denominator_invariant_string_format():
+    assert lib.denominator_invariant_string(3, 5) == (
+        "3 of 5 closed beads had dispatch timestamps"
+    )
+    # the exact substring the fingerprint/architecture invariant anchors on
+    assert "had dispatch timestamps" in lib.denominator_invariant_string(0, 0)
+
+    beads = [
+        bd_source.BeadRecord(
+            id="SABLE-a", status="closed",
+            created_at="2026-07-20T00:00:00Z",
+            closed_at="2026-07-20T01:00:00Z",
+            started_at="2026-07-20T00:30:00Z",
+        ),
+        bd_source.BeadRecord(
+            id="SABLE-manager", status="closed",
+            created_at="2026-07-20T00:00:00Z",
+            closed_at="2026-07-20T03:00:00Z",
+            started_at=None,
+        ),
+    ]
+    report = lib.build_cycle_split_report(beads, [])
+    assert report.denominator_note == "1 of 2 closed beads had dispatch timestamps"
+    assert "had dispatch timestamps" in report.denominator_note
+
+
 def test_gh_source_dedups_post_merge_tmux_only_run():
     raw_runs = [
         {
