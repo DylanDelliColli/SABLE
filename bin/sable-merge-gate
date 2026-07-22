@@ -59,6 +59,14 @@ dependency order (a DAG — nothing imports "upward"):
                                refuses with exit 25 — a mechanical deny path,
                                not a convention. Nothing here imports the gate
                                back; see bin/sable-snapshot for the runner.
+  sable_coverage_floor_lib.py  PURE detection + decision (pruning-diff
+                               detection, named-override parsing, the
+                               allow/deny table) plus the one I/O function that
+                               shells out to .github/ci/diff-cover-gate.sh in a
+                               throwaway worktree (SABLE-cmar4.5). promote
+                               reads it right after the freeze check and
+                               refuses with exit 27 — same mechanical-deny
+                               shape as the freeze, one bead later.
 
 ── OPTIMISTIC DISJOINT PROMOTION (SABLE-jd5fj.4) ────────────────────────────
 When the base moves between a preview and its promote, the CI-green object is
@@ -227,6 +235,13 @@ Exit codes:
   25 green-snapshot FREEZE in force — the integration branch is deterministically
      red, so NO merge promotes until a green snapshot (or a recorded
      `sable-snapshot unfreeze`) lifts it (SABLE-jd5fj.5)
+  27 COVERAGE FLOOR — a pruning diff (removed test fn / newly-skipped test /
+     deleted test file) with no carried, passing coverage-delta check
+     (.github/ci/diff-cover-gate.sh) — needs the check to pass, or a named
+     `--coverage-override <reason>` (SABLE-cmar4.5). NOTE: 26 is reserved by
+     bin/sable-snapshot's own taxonomy (EXIT_QUARANTINED) — a DIFFERENT tool,
+     but 25/EXIT_FROZEN is deliberately shared between the two, so this picks
+     the next free number rather than reusing 26 with a different meaning.
   4 integrity abort (base tip != preview SHA after promote)
 """
 from __future__ import annotations
@@ -302,6 +317,13 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--override", default=None, metavar="REASON",
                     help="actions-down human bypass ONLY; the reason is required and recorded on the bead. "
                          "Not for bypassing a known-red run.")
+    pp.add_argument("--coverage-override", default=None, metavar="REASON",
+                    dest="coverage_override",
+                    help="named-reason bypass of the coverage floor on a PRUNING diff only "
+                         "(SABLE-cmar4.5) — a diff with no removed test fn / newly-skipped "
+                         "test / deleted test file never needs this. Recorded on the bead. "
+                         "Mirrors the 'Model override: <reason>' pattern; also accepted as a "
+                         "'Coverage override: <reason>' line in this flag's own value.")
 
     # SABLE-jd5fj.1 kick entrypoint. No --bead: the post-push hook that fires
     # this knows the branch it just confirmed, not the bead behind it, and a kick
@@ -362,7 +384,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "promote":
             base = git_lib.resolve_base(args.base, args.repo)
             return promote_lib.promote(args.bead, args.branch, base, args.repo,
-                                       args.remote, args.manager, args.override)
+                                       args.remote, args.manager, args.override,
+                                       args.coverage_override)
         if args.command == "preview":
             base = git_lib.resolve_base(args.base, args.repo)
             return preview_lib.kick_preview(args.branch, base, args.repo, args.remote)

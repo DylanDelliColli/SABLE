@@ -49,6 +49,7 @@ ALLOW=(
   test-columbo-quick-mode.sh
   test-concurrent-sessions.sh
   test-control-trace.sh
+  test-coverage-floor-gate.sh
   test-dep-merge-state.sh
   test-doctor-snapshot-staleness.sh
   test-edit-write-claim-reconciler.sh

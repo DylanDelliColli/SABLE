@@ -83,6 +83,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import sable_coverage_floor_lib as coverage_floor_lib
 import sable_footprint_lib as footprint_lib
 import sable_gate_budget_lib as budget_lib
 import sable_gate_classify_lib as classify
@@ -856,6 +857,87 @@ def assert_not_frozen(repo: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# Coverage floor on pruning passes (SABLE-cmar4.5) — the MECHANICAL deny path
+# --------------------------------------------------------------------------
+
+def _coverage_floor_timeout() -> float:
+    try:
+        return float(os.environ.get("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "600"))
+    except ValueError:
+        return 600.0
+
+
+def run_coverage_floor_check(repo: str, base_sha: str, branch_sha: str):
+    """Actually run the coverage-delta check — .github/ci/diff-cover-gate.sh,
+    real pytest + coverage.py + diff-cover, no mocks — against the branch's
+    checked-out tree, comparing to base_sha. Same pattern as
+    _run_impact_tier_locked: a throwaway detached worktree, because the thing
+    being measured is the code AS IT WILL EXIST on the branch, not a diff of
+    trees.
+
+    Returns True (patch coverage cleared --fail-under), False (diff-cover ran
+    and failed it), or None (the branch does not carry the script at all, the
+    worktree could not be built, or the check timed out) — None is a FAIL-
+    CLOSED read, same as assert_not_frozen's unreadable-freeze-file contract:
+    "we could not prove it's covered" denies, exactly like "we proved it's
+    not"."""
+    parent = tempfile.mkdtemp(prefix="sable-coverage-floor-")
+    worktree = str(Path(parent) / "tree")
+    try:
+        add = git_lib._git(repo, "worktree", "add", "--detach", worktree, branch_sha, check=False)
+        if add.returncode != 0:
+            return None
+        try:
+            script = Path(worktree) / ".github" / "ci" / "diff-cover-gate.sh"
+            if not script.is_file():
+                return None
+            cp = git_lib._run(["bash", str(script), base_sha], cwd=worktree, check=False,
+                              timeout=_coverage_floor_timeout())
+            return cp.returncode == 0
+        finally:
+            git_lib._git(repo, "worktree", "remove", "--force", worktree, check=False)
+            git_lib._git(repo, "worktree", "prune", check=False)
+    except subprocess.TimeoutExpired:
+        return None
+    except OSError:
+        return None
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def assert_coverage_floor(repo: str, bead: str, base_sha: str, branch_sha: str,
+                          coverage_override: str | None) -> None:
+    """Refuse to promote a PRUNING diff (removed test function, newly-added
+    skip marker, or deleted test file — sable_coverage_floor_lib.detect_pruning)
+    unless it carries a real, passing coverage-delta check, or a human recorded
+    a named 'Coverage override: <reason>' line.
+
+    A non-pruning diff is unaffected — this is a floor on PRUNING passes only
+    (the locked S3 scope), never a general coverage gate. Overridden diffs
+    consult no run at all, by contract (mirrors promote()'s own --override:
+    "An actions-down human bypass consults no run at all"), so an override
+    reason is checked BEFORE the (real, potentially slow) check ever runs."""
+    diff_text = git_lib._git(repo, "diff", f"{base_sha}...{branch_sha}").stdout
+    signal = coverage_floor_lib.detect_pruning(diff_text)
+    override_reason = coverage_floor_lib.parse_named_override(coverage_override or "")
+
+    passed = None
+    if signal.is_pruning and not override_reason:
+        passed = run_coverage_floor_check(repo, base_sha, branch_sha)
+
+    decision = coverage_floor_lib.evaluate_coverage_floor(signal, passed, override_reason)
+
+    if decision.action == coverage_floor_lib.ACTION_DENY:
+        raise GateError(
+            classify.EXIT_COVERAGE_FLOOR,
+            f"COVERAGE FLOOR (SABLE-cmar4.5): {decision.reason} — bead {bead}, "
+            f"branch {branch_sha[:7]} onto {base_sha[:7]}. Not promoted.")
+
+    if signal.is_pruning:
+        _append_evidence(repo, bead, f"coverage-floor: {decision.reason}.")
+
+
+# --------------------------------------------------------------------------
 # promote — the only writer to the integration branch
 # --------------------------------------------------------------------------
 
@@ -1054,7 +1136,8 @@ def _adoption_miss_optimistic(bead: str, branch: str, base: str, repo: str, remo
 
 
 def promote(bead: str, branch: str, base: str, repo: str, remote: str,
-            manager: str, override: str | None) -> int:
+            manager: str, override: str | None,
+            coverage_override: str | None = None) -> int:
     # FIRST, before any git work: is the fleet frozen? (SABLE-jd5fj.5)
     assert_not_frozen(repo)
     base_ref = classify.qualify_remote_ref(remote, base)
@@ -1062,6 +1145,15 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
     git_lib._git(repo, "fetch", remote, base, branch)
     base_sha = git_lib.resolve_commit(repo, base_ref)
     branch_sha = git_lib.resolve_commit(repo, branch_ref)
+
+    # SABLE-cmar4.5: next, before building anything — is this a PRUNING diff
+    # (removed test fn / newly-skipped test / deleted test file) without a
+    # carried, passing coverage-delta check? Asked here, right after
+    # assert_not_frozen and before any preview/CI work, for the same reason
+    # the freeze check goes first: this is a property of the (base, branch)
+    # diff itself, not of what CI concludes about it, so there is no reason to
+    # spend a preview build on a diff this refuses outright.
+    assert_coverage_floor(repo, bead, base_sha, branch_sha, coverage_override)
 
     # SABLE-kzi1a: before building anything, is this an ADOPTION MISS with a
     # green preview already sitting behind it — the queued-branch case a serial
