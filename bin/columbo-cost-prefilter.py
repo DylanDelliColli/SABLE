@@ -117,7 +117,52 @@ def run_python_suite_with_coverage(
 ) -> tuple[dict[str, float], dict[str, set[tuple[str, int]]]]:
     """Real pytest invocation: collects per-test duration AND per-test line
     coverage (pytest-cov dynamic contexts) in a single run, so callers never
-    have to run the target suite twice to get both signals."""
+    have to run the target suite twice to get both signals.
+
+    Isolated from ambient pytest plugins that have no business in a
+    duration/coverage measurement run (SABLE-cmar4.6 second revise,
+    confirmed against the real ci-verify red -- run 29936760714, not
+    guessed). Two independent findings, both verified live in this repo:
+
+    1. The disable spelling matters. pytest-testmon registers as a pytest11
+       entry point under the name `pytest-testmon` (NOT the module name
+       `testmon`) -- `-p no:testmon` is silently a no-op: `--trace-config`
+       still shows `testmon.pytest_testmon` registered with that spelling,
+       identically to passing no `-p` flag at all. Only `-p no:pytest-testmon`
+       actually removes it (confirmed: with it present, even an explicit
+       `--testmon-noselect` becomes an "unrecognized arguments" error,
+       because the plugin whose `pytest_addoption` would have registered
+       that flag never loads).
+
+    2. Why exclusion is necessary at all, not just cosmetic: this run passes
+       no --testmon* flag of its own, so testmon's OWN CLI-gated
+       collection/selection hooks (testmon/configure.py's
+       `_get_notestmon_reasons`) should stay inert here in isolation -- and
+       do, when this command runs alone. But pytest-testmon and pytest-cov
+       both drive a single process-wide `coverage.Coverage` instance, and
+       the real ci-verify gate's full `bin/` session ALSO collects
+       test_tier_selection_integration.py::
+       test_real_repo_full_suite_testmon_noselect_crash_is_tolerated, which
+       spawns a real `--testmon-noselect` subprocess against this same repo
+       root that re-collects and re-runs this suite's own tests. Reproduced
+       directly: forcing `--testmon-noselect` onto this exact command
+       alongside its real `--cov-context=test --cov=bin` flags produces
+       `coverage.exceptions.CoverageException: Cannot switch context,
+       coverage is not started` on every test, and separately, pytest-testmon
+       2.2.0's own extensionless-file bug (IndexError in
+       testmon_core.py:93's `filename.rsplit(".", 1)[1]`) is the exact
+       INTERNALERROR the CI log shows. Either failure mode collapses this
+       function's stdout into something `parse_pytest_durations` matches
+       nothing in, which is why the real gate saw `real_python_run = ({},
+       {})` -- an empty duration dict and empty coverage map, not a raised
+       exception, because this function never inspected returncode/stderr.
+       `-p no:pytest-testmon` removes the shared-Coverage-instance conflict
+       at its root by ensuring testmon can never attach here, regardless of
+       what triggers it elsewhere in the same host session.
+
+    `-p no:impact` (pytest-impact) is excluded for the same defense-in-depth
+    reason even though no crash was attributed to it -- it has no business
+    in a coverage-measurement run either, and costs nothing to exclude."""
     env = dict(os.environ)
     env["COVERAGE_FILE"] = str(coverage_data_file)
     args = [
@@ -127,6 +172,8 @@ def run_python_suite_with_coverage(
         *[f"--cov={t}" for t in cov_targets],
         "--cov-report=",
         "-p", "no:cacheprovider",
+        "-p", "no:pytest-testmon",
+        "-p", "no:impact",
     ]
     result = subprocess.run(args, cwd=repo_root, capture_output=True, text=True, env=env)
     durations = parse_pytest_durations(result.stdout)

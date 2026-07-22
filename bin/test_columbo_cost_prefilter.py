@@ -64,6 +64,27 @@ verified by actually running the mutation, not by inspection alone:
    build_report/format sanity) each name a different property and were
    checked against deletion of the mechanism they name, not the subsumption
    subtraction -- no further gaps found.
+
+REVISE PASS #2 (SABLE-cmar4.6, ci-verify gate red on run 29936760714) --
+test_run_python_suite_disables_ambient_testmon_and_impact_by_working_name
+was added after a real (not local-only) gate failure traced to
+pytest-testmon and pytest-cov contending for one process-wide
+coverage.Coverage instance inside run_python_suite_with_coverage's inner
+pytest invocation -- see that function's docstring in
+columbo-cost-prefilter.py for the full mechanism, confirmed against the
+actual CI log and reproduced locally via a forced --testmon-noselect
+(produced `coverage.exceptions.CoverageException: Cannot switch context,
+coverage is not started` on every test). Plant-and-fail verdict: the FIRST
+fix attempt used `-p no:testmon`, which a direct `--trace-config`
+experiment showed is a silent no-op (pytest-testmon's real entry-point
+name is `pytest-testmon`, not `testmon`) -- an integration test that only
+runs the tool end-to-end without a hostile ambient plugin forced on would
+have stayed green against that no-op exactly as this repo's own
+integration suite did locally before the real gate caught it, so this
+unit test asserts the constructed argv directly. Verified falsifiable:
+reverting to the no-op spelling (or omitting the disable flags entirely)
+turns this test red; confirmed by temporarily doing so and re-running
+this file, then reverting.
 """
 from __future__ import annotations
 
@@ -111,6 +132,48 @@ def test_parse_durations_ignores_non_duration_lines():
 
 def test_parse_durations_empty_report():
     assert ccp.parse_pytest_durations("") == {}
+
+
+# ---------------------------------------------------------------------------
+# run_python_suite_with_coverage -- ambient plugin isolation (SABLE-cmar4.6
+# second revise). The real ci-verify gate red (run 29936760714) traced to
+# pytest-testmon and pytest-cov contending for the same process-wide
+# coverage.Coverage instance, which silently collapsed this function's
+# stdout into something parse_pytest_durations matches nothing in (empty
+# durations, empty coverage -- not a raised exception). This test guards
+# the constructed argv directly, via a monkeypatched subprocess.run (no
+# real subprocess spawned, consistent with this file's synthetic-data-only
+# scope), rather than only the end-to-end integration suite, because the
+# first fix attempt here used `-p no:testmon` -- confirmed by direct
+# `--trace-config` experiment to be a silent no-op (pytest-testmon's
+# entry-point name is `pytest-testmon`, not `testmon`) -- and a test that
+# only ran the tool end-to-end without a hostile ambient plugin present
+# would have stayed green on that no-op fix exactly as the original
+# integration suite did before the real gate caught it.
+# ---------------------------------------------------------------------------
+
+
+def test_run_python_suite_disables_ambient_testmon_and_impact_by_working_name(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(args, cwd, capture_output, text, env):
+        captured["args"] = args
+        return type("Result", (), {"stdout": "", "stderr": "", "returncode": 0})()
+
+    monkeypatch.setattr(ccp.subprocess, "run", fake_run)
+    ccp.run_python_suite_with_coverage(
+        tmp_path, ["bin/test_foo.py"], ["bin"], tmp_path / ".coverage"
+    )
+    args = captured["args"]
+    # The exact working spelling, not the no-op `no:testmon` typo the first
+    # fix attempt used (see module note above and the run_python_suite_with_
+    # coverage docstring for the --trace-config proof this typo is inert).
+    assert "no:pytest-testmon" in args, (
+        "must disable pytest-testmon by its real entry-point name -- "
+        "'no:testmon' silently does nothing"
+    )
+    assert "no:testmon" not in args
+    assert "no:impact" in args
 
 
 # ---------------------------------------------------------------------------
