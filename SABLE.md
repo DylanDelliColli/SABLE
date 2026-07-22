@@ -1237,6 +1237,15 @@ mechanical the work in front of them looks; `sable-spawn-manager`'s
 manager pane. The ladder below never applies to a manager's own model — only
 to the workers a manager dispatches via `sable-spawn-worker`.
 
+**The ladder is a HUMAN/manager judgment — the tooling does not grade the bead
+(SABLE-mn1da).** `sable-spawn-worker` reads exactly two signals: an explicit
+`--model` and the bead's `model:` label. Nothing inspects bead type, priority,
+description size, or whether the bead carries an unresolved ruling. With
+neither signal present you get the flat `DEFAULT_MODEL` (Sonnet) — not a graded
+choice — so the spawn announces which of the three it used on every dispatch
+(`model sonnet, DEFAULT — no --model override and no model: label; …`). If you
+want a rung other than Sonnet, you must say so; the tool will never infer it.
+
 Different tasks need different models. Picking by bead structure (epic/feature/task) is wrong — bead structure is orthogonal to actual complexity. A 12-file rename is mechanical regardless of count; a single-file auth change is still security-sensitive. Apply the **model ladder** instead:
 
 **Default: Sonnet** (claude-sonnet-4-6). All work starts here.
@@ -1265,6 +1274,18 @@ Different tasks need different models. Picking by bead structure (epic/feature/t
 | "Many files → Opus" | Same pattern at every site is still mechanical | Mechanical-ness wins |
 
 **Encoding the choice on beads.** Beads can carry a `model:<haiku|sonnet|opus>` label set by the bead author (Sherlock auto-recommends in its bead template; manual creation should set it after applying the ladder). The label is the primary signal at dispatch time. If absent, the manager applies the ladder and adds the label after dispatch so the next worker doesn't re-derive.
+
+**Which model actually ran a bead (SABLE-qw9jv).** `sable-spawn-worker` stamps
+`model` and `model_source` metadata on the dispatched bead — and on every
+`--bundle` sibling — after the worker pane launches. Read it back with
+`bd show <id> --json` (`.metadata.model`, `.metadata.model_source`). Two rules
+make it evidence rather than intent: the value is parsed from the command that
+ACTUALLY launched (a `SABLE_WORKER_CMD` override that pins a different model,
+or none, is recorded as such — `model=unknown` rather than a claim), and a
+spawn refused by the throttle/host-guard/composer gate writes nothing at all,
+so a bead refused at one tier and re-dispatched at another carries the tier
+that ran. A `model:` label, a dispatch prompt line, or a manager note is
+INTENT and is never an attribution.
 
 **Mechanical enforcement.** When the multi-manager pattern is active, the `pre-dispatch-model-check.sh` hook hard-blocks dispatches where the dispatch's model parameter disagrees with the bead's `model:` label, unless the prompt includes a `Model override: <reason>` line. This catches "let's just send it to Opus" reflexes that compound on cost across a session of dispatches.
 
