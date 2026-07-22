@@ -67,10 +67,14 @@ def test_real_run_collects_durations_and_coverage_for_known_tests(real_python_ru
     assert durations[known] >= 0.0
     assert known in coverage_map
     assert len(coverage_map[known]) > 0
-    # real coverage.py filenames are absolute paths to real source
-    some_file = next(iter(coverage_map[known]))[0]
-    assert some_file.endswith("columbo-prefilter.py")
-    assert Path(some_file).exists()
+    # real coverage.py filenames are absolute paths to real source. --cov=bin
+    # measures the whole bin/ dir (including the test file that's running),
+    # so check the covered set as a whole rather than an arbitrary element --
+    # set iteration order is not deterministic across processes.
+    covered_files = {f for f, _lineno in coverage_map[known]}
+    assert any(f.endswith("columbo-prefilter.py") for f in covered_files)
+    for f in covered_files:
+        assert Path(f).exists()
 
 
 def test_real_coverage_has_genuine_overlap_between_tests(real_python_run):
