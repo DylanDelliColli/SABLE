@@ -87,7 +87,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y tmux
           python -m pip install --upgrade pip
-          pip install pytest pytest-testmon pytest-impact
+          # pytest-cov (SABLE-cmar4.6 third revise / SABLE-cmar4.8): this
+          # workflow runs the same full `pytest bin/` suite as ci-verify.yml,
+          # so it shares that gate's real defect -- bin/columbo-cost-prefilter.py
+          # passes --cov-context/--cov/--cov-report, which pytest rejects as
+          # unrecognized arguments (exit 4) without pytest-cov installed. See
+          # ci-verify.yml's matching clean-room step for the verbatim CI error
+          # that diagnosed this.
+          pip install pytest pytest-testmon pytest-impact pytest-cov
 
       - name: Configure git identity (SABLE-59zu — clean-room needs one)
         run: |
