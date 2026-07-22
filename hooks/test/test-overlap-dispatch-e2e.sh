@@ -30,8 +30,27 @@ if [ ! -x "$HOOK" ]; then
   exit 2
 fi
 
+# This whole suite IS the real-bd leg — there is no git-only half to fall
+# back to (unlike test-dep-merge-state.sh). So bd absence (the ci-verify
+# clean room, SABLE-59zu) skips it in full. That used to exit here with a
+# single bare "SKIP:" line and no summary — indistinguishable, to anything
+# scanning the CI log for a final tally, from a suite that has no tests at
+# all. A suite that self-skips its most important (here: only) leg must
+# never be able to print a clean summary that reads the same as having run
+# it (SABLE-jd5fj.16) — so print the same "Tests | Passed | Failed | Skipped"
+# shape the bd-present path below prints, with a non-zero Skipped count and a
+# named reason. Keep REALBD_SUBTESTS in sync with the pass()/fail() count
+# below (5 today) — this suite's own coverage is checked by
+# hooks/test/test-shell-run-set-strict.sh case (h) and by
+# hooks/test/test-ci-bd-coverage-gap.sh's negative control (bd present ->
+# 5/5, no skips).
+REALBD_SUBTESTS=5
 if ! command -v bd >/dev/null 2>&1; then
   echo "SKIP: bd not found on PATH — this suite requires a real bd (no mocks)"
+  echo
+  echo "=========================================="
+  echo "Tests: 0 | Passed: 0 | Failed: 0 | Skipped: $REALBD_SUBTESTS (entire real-bd leg — bd absent, SABLE-59zu clean room; the real executor is chuck's local combined-tree impact tier, SABLE-jd5fj.13/.16)"
+  echo "=========================================="
   exit 0
 fi
 
