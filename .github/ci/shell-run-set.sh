@@ -89,6 +89,7 @@ ALLOW=(
   test-sable-discover.sh
   test-sable-launch.sh
   test-sable-mode.sh
+  test-sable-msg.sh
   test-sable-onboarding-skill.sh
   test-sable-plan-tiers.sh
   test-sable-skills.sh
@@ -117,6 +118,16 @@ ALLOW=(
 
 # --- Excluded from the run-set, each WITH reason + tracking bead. --------------
 # Widen ALLOW (move an entry here into ALLOW) as each of these lands.
+#
+# THAT WIDENING IS NOT AUTOMATIC, AND FORGETTING IT IS ITS OWN FALSE-GREEN
+# (SABLE-8onsf). --check's staleness guard only catches an entry naming a file
+# that no longer EXISTS; it cannot see an entry whose tracking bead is closed.
+# test-sable-msg.sh sat here for ~2 weeks citing SABLE-cncs after cncs had been
+# closed as verified-fixed with an 11/11 green run, so the fleet's delivery-
+# verification suite was ungated the entire time -- and when it later went red
+# for an unrelated reason (SABLE-4nr0q's ambient-identity leak) nothing caught
+# it. When you close an exclusion's tracking bead, move the entry in the SAME
+# change.
 declare -A EXCLUDE=(
   [test-install.sh]="needs the ~/.claude SABLE install; clean-room has none (SABLE-59zu)"
   [test-install-guard.sh]="needs the ~/.claude SABLE install (real bd on PATH) for its --from-here/main-checkout proceed cases; clean-room has none (SABLE-59zu)"
@@ -126,7 +137,6 @@ declare -A EXCLUDE=(
   [test-quickstart-project.sh]="needs the ~/.claude SABLE install (bd, sable-doctor) for its E2E bootstrap-flow cases; clean-room has none (SABLE-59zu, SABLE-vivm)"
   [test-notes-clobber-guard-e2e.sh]="real-bd-only by construction — its whole claim is that CONTENT survives in a real bead store, and its negative control needs a real destructive bd write; in the clean room it would SKIP and count green (SABLE-sm269, SABLE-59zu). Run it locally against real bd; the decision logic is covered fail-closed by test-notes-clobber-guard.sh, which IS in the run-set."
   [test-tmux-e2e.sh]="vacuous without bd — prints 'SKIP: bd not installed' and exits 0 (SABLE-59zu)"
-  [test-sable-msg.sh]="known-red: legacy fixed-name tmux sessions vs per-repo naming (SABLE-cncs)"
   [test-sable-worker-status.sh]="tracked-red under ambient tmux; green in clean-room but excluded pending confirmation (SABLE-b574)"
   [test-tmux-roles.sh]="known false-positive (SABLE-p9ih)"
 )
@@ -168,6 +178,7 @@ declare -A COVERS=(
   [test-read-guard.sh]="hooks/multi-manager/read-guard.sh"
   [test-registry.sh]="hooks/multi-manager/lib-registry-path.sh"
   [test-sable-mode.sh]="hooks/multi-manager/lib-mode-path.sh"
+  [test-sable-msg.sh]="bin/sable-msg bin/sable_pane_lib.py"
   [test-sable-test.sh]="bin/sable-test"
   [test-session-role-anchor.sh]="hooks/multi-manager/session-role-anchor.sh"
   [test-snapshot-freeze.sh]="bin/sable-snapshot bin/sable_snapshot_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py"
