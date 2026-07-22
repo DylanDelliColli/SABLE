@@ -24,7 +24,7 @@ STRUCTURALLY IMPOSSIBLE, not merely rare. jd5fj.4 is precisely what removes that
 structural guarantee. The usable prior is the rule-of-three upper bound (<=2.4%),
 which is why the impact tier still runs on every optimistic path.
 
-THREE RULES THIS MODULE EXISTS TO GET RIGHT
+FOUR RULES THIS MODULE EXISTS TO GET RIGHT
 -------------------------------------------
 1. RENAMES AND DELETIONS ARE CHANGES. The changed-path set is computed with
    --find-renames and counts BOTH sides of a rename, and it INCLUDES D-status
@@ -46,6 +46,23 @@ THREE RULES THIS MODULE EXISTS TO GET RIGHT
    declared footprint that names more than the diff means the planner expected
    blast radius the diff does not show; a diff that touches more than was
    declared means the work grew. Both widen; neither narrows.
+
+4. WRITE-WRITE DISJOINTNESS DOES NOT PROVE INDEPENDENCE (SABLE-jd5fj.18). Two
+   changes can touch no file in common and still be coupled: branch A reads a
+   file that branch B writes, so A's tested behaviour silently depends on the
+   version of that file B is changing underneath it. The file-set check above
+   is blind to this — it only ever compared WRITES to WRITES. This module
+   therefore also carries a planner-declared READ footprint (`## File reads`,
+   parsed the same way as `## File footprint`) and a widened predicate,
+   `is_rw_disjoint`, that also checks writes(one side) against reads(the
+   other). Reads have no mechanical fallback yet — that is the follow-up bead,
+   built on jd5fj.10's structured footprint field — so an ABSENT `## File
+   reads` section is not "declares nothing" the way an absent `## File
+   footprint` section is. It is a NON-ANSWER, and `declared_reads()` raises
+   FootprintUndetermined for it, on purpose: the permanent floor is that an
+   undeclared read set fails toward serialization, never toward
+   "parallel-safe". A section that IS present, even naming zero paths, is a
+   real answer and is returned as an ordinary (possibly empty) Footprint.
 
 FAIL-CLOSED. Every non-answer — an unparseable diff line, an unmerged/unknown
 status, a bd read that errors — raises FootprintUndetermined rather than
@@ -232,34 +249,43 @@ def mechanical_footprint(repo: str, from_sha: str, to_sha: str, source: str = ""
 # --- planner-declared footprint (bead metadata) -----------------------------
 
 _FOOTPRINT_HEADING = re.compile(r"^#+\s*File footprint\s*$", re.IGNORECASE)
+_READS_HEADING = re.compile(r"^#+\s*File reads\s*$", re.IGNORECASE)
 _PARENTHETICAL = re.compile(r"\([^)]*\)")
 _CODE_SUFFIXES = (".py", ".sh", ".yml", ".yaml", ".json", ".md", ".ts", ".js", ".toml")
 
 
-def parse_declared_footprint(description: str) -> frozenset[str]:
-    """Entries from a bead description's `## File footprint` section.
+def _collect_section(description: str, heading: re.Pattern[str]) -> tuple[bool, frozenset[str]]:
+    """Shared prose-section extractor for the bead-description sub-sections
+    this module parses (`## File footprint`, `## File reads`).
 
-    The section is prose written by a planner, not a machine format, so parsing
-    is deliberately lossy in the WIDENING direction only: parenthetical asides
-    are dropped (they are commentary), tokens are split on commas and
+    Returns (found, entries): `found` says whether the heading appeared at all,
+    which the caller needs to tell "not declared" apart from "declared as
+    empty" (SABLE-jd5fj.18) — a distinction `parse_declared_footprint`'s
+    caller does not need, because the mechanical footprint already governs the
+    write side, but `parse_declared_reads`'s caller very much does, because
+    reads have no such fallback.
+
+    Parsing is deliberately lossy in the WIDENING direction only: parenthetical
+    asides are dropped (they are commentary), tokens are split on commas and
     whitespace, and a token is kept if it looks like a path (contains '/' or
     ends in a known code suffix). A prose fragment that survives as a bogus
-    entry can only ADD to the footprint, which costs a full re-preview at worst;
-    a real path that is missed leaves the mechanical footprint governing, which
-    is the status quo. Neither direction can narrow the mechanical answer."""
+    entry can only ADD to the set; a real path that is missed leaves whatever
+    fallback the caller has governing. Neither direction can narrow it."""
     lines = description.splitlines()
     body: list[str] = []
     collecting = False
+    found = False
     for line in lines:
-        if _FOOTPRINT_HEADING.match(line.strip()):
+        if heading.match(line.strip()):
             collecting = True
+            found = True
             continue
         if collecting:
             if line.strip().startswith("#"):
                 break
             body.append(line)
-    if not collecting:
-        return frozenset()
+    if not found:
+        return False, frozenset()
     text = _PARENTHETICAL.sub(" ", "\n".join(body))
     entries: set[str] = set()
     for raw in re.split(r"[,\s]+", text):
@@ -268,7 +294,29 @@ def parse_declared_footprint(description: str) -> frozenset[str]:
             continue
         if "/" in tok or tok.endswith(_CODE_SUFFIXES):
             entries.add(tok)
-    return frozenset(entries)
+    return True, frozenset(entries)
+
+
+def parse_declared_footprint(description: str) -> frozenset[str]:
+    """Entries from a bead description's `## File footprint` section. An
+    absent section is treated as "declares nothing" — see _collect_section —
+    because the mechanical footprint governs the write side regardless."""
+    _, entries = _collect_section(description, _FOOTPRINT_HEADING)
+    return entries
+
+
+def parse_declared_reads(description: str) -> tuple[bool, frozenset[str]]:
+    """Entries from a bead description's `## File reads` section
+    (SABLE-jd5fj.18) — the read-side counterpart to `## File footprint`.
+
+    Returns (declared, entries). `declared` is False when the heading is
+    absent (the read set is UNKNOWN, not empty) and True when the heading is
+    present, even with zero entries (the planner explicitly said "this reads
+    nothing beyond its own footprint"). The caller — declared_reads() below —
+    must treat "not declared" as a non-answer, unlike parse_declared_footprint's
+    caller: writes always have a mechanical fallback, and reads, today, do
+    not (mechanical/import-graph derivation of reads is the follow-up bead)."""
+    return _collect_section(description, _READS_HEADING)
 
 
 def declared_footprint(repo: str, bead: str) -> Footprint:
@@ -287,6 +335,31 @@ def declared_footprint(repo: str, bead: str) -> Footprint:
     if cp.returncode != 0:
         raise FootprintUndetermined(f"bd show {bead} failed: {cp.stdout.strip()[:200]}")
     return footprint(parse_declared_footprint(cp.stdout), source=f"declared:{bead}")
+
+
+def declared_reads(repo: str, bead: str) -> Footprint:
+    """The planner-declared READ footprint for <bead> (SABLE-jd5fj.18): the
+    files this branch's behaviour depends on, whether or not it writes them.
+
+    Unlike declared_footprint(), an ABSENT `## File reads` section is NOT
+    "declares nothing" — it raises FootprintUndetermined. This is the floor
+    this bead builds: reads have no mechanical fallback yet, so silence about
+    what a branch reads must fail toward serialization exactly like an
+    unparseable diff does, never toward the old silent 'parallel-safe'
+    default. A section that IS present, even declaring zero paths, is a real
+    answer and comes back as an ordinary (possibly empty) Footprint."""
+    if not bead:
+        raise FootprintUndetermined("no bead id — cannot read the declared read footprint")
+    cp = git_lib._run(git_lib._tool("SABLE_MG_BD", "bd") + ["show", bead],
+                      cwd=repo, check=False)
+    if cp.returncode != 0:
+        raise FootprintUndetermined(f"bd show {bead} failed: {cp.stdout.strip()[:200]}")
+    declared, entries = parse_declared_reads(cp.stdout)
+    if not declared:
+        raise FootprintUndetermined(
+            f"no declared '## File reads' section for {bead} — undeclared read set "
+            f"forces serialization (SABLE-jd5fj.18 floor)")
+    return footprint(entries, source=f"declared-reads:{bead}")
 
 
 # --------------------------------------------------------------------------
@@ -330,6 +403,37 @@ def is_disjoint(a: Footprint, b: Footprint) -> Disjointness:
     return Disjointness(True, "footprints are disjoint (no shared path, no sentinel)")
 
 
+def is_rw_disjoint(writes_a: Footprint, reads_a: Footprint,
+                   writes_b: Footprint, reads_b: Footprint) -> Disjointness:
+    """safe_to_parallel(A, B) == writes(A) disjoint writes(B)
+                            AND writes(A) disjoint reads(B)
+                            AND writes(B) disjoint reads(A)
+    (SABLE-jd5fj.18 — the floor layer under optimistic disjoint promotion).
+
+    Write-write disjointness (rule 4 in the module docstring) only rules out
+    two changes editing the same file; it says nothing about A reading a file
+    B writes, which is exactly the coupling that let two footprint-disjoint
+    branches promote in parallel when they were not independent. Checked in
+    this order, with the reason naming WHICH conjunct failed, because "I could
+    not tell" and "I can tell, and they conflict" must stay distinguishable in
+    the report even though both resolve to the same NOT-disjoint decision."""
+    ww = is_disjoint(writes_a, writes_b)
+    if not ww.disjoint:
+        return Disjointness(False, f"write/write: {ww.reason}", ww.overlap)
+    a_writes_b_reads = is_disjoint(writes_a, reads_b)
+    if not a_writes_b_reads.disjoint:
+        return Disjointness(False,
+                            f"read/write coupling (B reads what A writes): {a_writes_b_reads.reason}",
+                            a_writes_b_reads.overlap)
+    b_writes_a_reads = is_disjoint(writes_b, reads_a)
+    if not b_writes_a_reads.disjoint:
+        return Disjointness(False,
+                            f"read/write coupling (A reads what B writes): {b_writes_a_reads.reason}",
+                            b_writes_a_reads.overlap)
+    return Disjointness(True,
+                        "writes and declared reads are mutually disjoint (no shared path, no sentinel)")
+
+
 @dataclass(frozen=True)
 class Assessment:
     """The whole footprint story for one stale-base promote attempt.
@@ -354,8 +458,20 @@ def assess(repo: str, bead: str, base_sha: str, branch_sha: str,
     side is then WIDENED by the planner-declared footprint from the bead before
     the comparison; the base-move side has no bead and stays mechanical.
 
+    SABLE-jd5fj.18: write-write disjointness is checked first and, if it
+    already fails, decides the answer exactly as before — nothing about that
+    path changed. Only when the writes ARE disjoint does this go on to ask the
+    second question: does the branch's declared READ footprint intersect what
+    the base-move WROTE? The base-move side has no bead of its own (it may be
+    the union of several already-merged branches), so there is no declared
+    read set to ask for on that side — this floor only checks the direction
+    the concrete defect exposed, branch-reads vs base-move-writes; the
+    symmetric direction is out of scope (see the module docstring, rule 4).
+
     Any failure anywhere yields disjoint=None with the reason attached, never an
-    exception and never a permissive default."""
+    exception and never a permissive default. An undeclared read footprint is
+    exactly such a failure — there is no mechanical fallback for reads yet, so
+    silence about what the branch reads is a non-answer, not an empty one."""
     try:
         branch_fp = widen(
             mechanical_footprint(repo, base_sha, branch_sha, source="branch-diff"),
@@ -365,11 +481,30 @@ def assess(repo: str, bead: str, base_sha: str, branch_sha: str,
         base_fp = mechanical_footprint(repo, base_sha, new_base_sha, source="base-move")
     except FootprintUndetermined as exc:
         return Assessment(None, f"footprint undetermined — treating as NON-disjoint: {exc}")
-    verdict = is_disjoint(branch_fp, base_fp)
+
+    paths = tuple(sorted(branch_fp.paths | base_fp.paths))
+    ww_verdict = is_disjoint(branch_fp, base_fp)
+    if not ww_verdict.disjoint:
+        return Assessment(False, ww_verdict.reason, paths, branch_fp, base_fp)
+
+    try:
+        branch_reads = declared_reads(repo, bead)
+    except FootprintUndetermined as exc:
+        return Assessment(None, f"read footprint undetermined — treating as NON-disjoint: {exc}",
+                          paths, branch_fp, base_fp)
+
+    rw_verdict = is_rw_disjoint(branch_fp, branch_reads, base_fp, footprint(()))
+    if not rw_verdict.disjoint:
+        return Assessment(False, rw_verdict.reason, paths, branch_fp, base_fp)
+
+    # `paths` deliberately stays the CHANGED-path union (branch writes + base
+    # move), not widened by the read footprint: reads() only informs the
+    # disjointness verdict, and the impact tier this feeds is scoped to what
+    # actually changed in the combined tree, not to paths nobody touched.
     return Assessment(
-        disjoint=verdict.disjoint,
-        reason=verdict.reason,
-        paths=tuple(sorted(branch_fp.paths | base_fp.paths)),
+        disjoint=True,
+        reason=rw_verdict.reason,
+        paths=paths,
         branch=branch_fp,
         base_move=base_fp,
     )

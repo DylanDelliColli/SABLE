@@ -316,7 +316,124 @@ def test_assess_widens_the_branch_side_with_the_declared_footprint(repo, monkeyp
     assert "shared/thing.py" in a.reason
 
 
-def test_assess_returns_the_union_of_paths_for_impact_scoping(repo, monkeypatch):
+def test_assess_returns_the_union_of_paths_for_impact_scoping(repo, monkeypatch, tmp_path):
+    """SABLE-jd5fj.18: write-write disjointness alone no longer suffices — a
+    declared (even explicitly empty) read footprint is required to reach
+    disjoint=True at all, so this end-to-end path is exercised with reads
+    declared rather than with the old bare `SABLE_MG_BD=true` stub."""
+    fake_bd = tmp_path / "fake-bd-reads-declared-empty"
+    fake_bd.write_text("#!/bin/sh\necho '## File reads'\necho 'none'\n")
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("SABLE_MG_BD", str(fake_bd))
+    base = _sha(repo)
+    (repo / "left.py").write_text("l\n")
+    branch = _commit(repo, "left")
+    _git(repo, "checkout", "-q", "-b", "moved", base)
+    (repo / "right.py").write_text("r\n")
+    new_base = _commit(repo, "right")
+    a = fp.assess(str(repo), "SABLE-x", base, branch, new_base)
+    assert a.disjoint is True, a.reason
+    assert set(a.paths) == {"left.py", "right.py"}
+
+
+# --------------------------------------------------------------------------
+# 6. Read-write coupling floor (SABLE-jd5fj.18)
+# --------------------------------------------------------------------------
+
+def test_is_rw_disjoint_coupled_pair_is_not_parallel_safe():
+    """THE unit spec, literally: branch A writes={x.py} reads={t.sh}; branch B
+    writes={t.sh} reads={}. The write footprints are file-disjoint (neither
+    writes what the other writes); the read-write coupling must still report
+    NOT-parallel-safe — the live defect this bead exists to close."""
+    writes_a, reads_a = fp.footprint({"x.py"}), fp.footprint({"t.sh"})
+    writes_b, reads_b = fp.footprint({"t.sh"}), fp.footprint(())
+    verdict = fp.is_rw_disjoint(writes_a, reads_a, writes_b, reads_b)
+    assert verdict.disjoint is False
+    assert "t.sh" in verdict.reason
+
+
+def test_is_rw_disjoint_negative_control_genuinely_independent_pairs_are_parallel_safe():
+    """Non-vacuity: a predicate that always says 'unsafe' is trivially correct
+    and destroys the entire optimistic path. Truly independent write AND read
+    sets must still report PARALLEL-SAFE."""
+    writes_a, reads_a = fp.footprint({"x.py"}), fp.footprint({"y.py"})
+    writes_b, reads_b = fp.footprint({"z.py"}), fp.footprint({"w.py"})
+    verdict = fp.is_rw_disjoint(writes_a, reads_a, writes_b, reads_b)
+    assert verdict.disjoint is True
+
+
+def test_is_rw_disjoint_catches_the_coupling_from_either_side():
+    """The coupling can point either way — B reading what A writes must be
+    caught exactly like A reading what B writes."""
+    writes_a, reads_a = fp.footprint({"m.py"}), fp.footprint(())
+    writes_b, reads_b = fp.footprint({"n.py"}), fp.footprint({"m.py"})
+    verdict = fp.is_rw_disjoint(writes_a, reads_a, writes_b, reads_b)
+    assert verdict.disjoint is False
+    assert "m.py" in verdict.reason
+
+
+def test_is_rw_disjoint_write_write_overlap_still_wins_first():
+    """A write/write overlap must still be reported as such (unchanged from
+    before this bead), not silently reframed as a read/write coupling."""
+    writes_a, reads_a = fp.footprint({"shared.py"}), fp.footprint(())
+    writes_b, reads_b = fp.footprint({"shared.py"}), fp.footprint(())
+    verdict = fp.is_rw_disjoint(writes_a, reads_a, writes_b, reads_b)
+    assert verdict.disjoint is False
+    assert verdict.reason.startswith("write/write:")
+
+
+def test_parse_declared_reads_distinguishes_absent_from_declared_empty():
+    declared, entries = fp.parse_declared_reads("no reads section at all")
+    assert declared is False
+    assert entries == frozenset()
+    declared2, entries2 = fp.parse_declared_reads("## File reads\nnone\n")
+    assert declared2 is True
+    assert entries2 == frozenset()
+
+
+def test_parse_declared_reads_reads_the_bead_section():
+    description = (
+        "Story blah blah.\n\n"
+        "## File reads\n"
+        ".github/ci/test-tiers.sh\n\n"
+        "## Test spec\n"
+        "hooks/test/test-should-not-be-picked-up.sh\n"
+    )
+    declared, entries = fp.parse_declared_reads(description)
+    assert declared is True
+    assert ".github/ci/test-tiers.sh" in entries
+    assert not any("should-not-be-picked-up" in e for e in entries), \
+        "parsing ran past the end of the reads section"
+
+
+def test_declared_reads_raises_when_section_is_absent(repo, monkeypatch):
+    """The floor's whole point: an absent '## File reads' section is a
+    non-answer, not an empty footprint — unlike parse_declared_footprint."""
+    monkeypatch.setenv("SABLE_MG_BD", "true")
+    with pytest.raises(fp.FootprintUndetermined):
+        fp.declared_reads(str(repo), "SABLE-x")
+
+
+def test_declared_reads_returns_empty_footprint_when_explicitly_declared_empty(repo, tmp_path, monkeypatch):
+    fake_bd = tmp_path / "fake-bd-reads-empty"
+    fake_bd.write_text("#!/bin/sh\necho '## File reads'\necho 'none'\n")
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("SABLE_MG_BD", str(fake_bd))
+    result = fp.declared_reads(str(repo), "SABLE-x")
+    assert result.entries == frozenset()
+
+
+def test_declared_reads_raises_when_bd_cannot_be_read(repo, monkeypatch):
+    monkeypatch.setenv("SABLE_MG_BD", "false")
+    with pytest.raises(fp.FootprintUndetermined):
+        fp.declared_reads(str(repo), "SABLE-nope")
+
+
+def test_assess_forces_serialize_when_read_footprint_is_undeclared(repo, monkeypatch):
+    """SECOND CONTROL (SABLE-jd5fj.18): write-write disjointness alone is not
+    enough. With no '## File reads' section at all, the branch's read set is
+    UNKNOWN, and an unknown read set must fail toward serialization — not
+    toward the old silent 'parallel-safe' default this bead removes."""
     monkeypatch.setenv("SABLE_MG_BD", "true")
     base = _sha(repo)
     (repo / "left.py").write_text("l\n")
@@ -325,7 +442,60 @@ def test_assess_returns_the_union_of_paths_for_impact_scoping(repo, monkeypatch)
     (repo / "right.py").write_text("r\n")
     new_base = _commit(repo, "right")
     a = fp.assess(str(repo), "SABLE-x", base, branch, new_base)
-    assert a.disjoint is True
+    assert a.disjoint is None, a.reason
+    assert "undetermined" in a.reason.lower()
+
+
+def test_assess_serializes_when_branch_reads_what_base_move_writes(repo, monkeypatch, tmp_path):
+    """THE concrete defect (SABLE-jd5fj.18), reproduced end to end through
+    assess(): SABLE-jd5fj.8 declares it reads .github/ci/test-tiers.sh;
+    SABLE-cmar4.5 (played here by the base-move) edits it. The write
+    footprints are file-disjoint — no path is written by both — but the
+    read-write coupling must still resolve to NOT-disjoint."""
+    fake_bd = tmp_path / "fake-bd-reads-coupled"
+    fake_bd.write_text("#!/bin/sh\necho '## File reads'\necho '.github/ci/test-tiers.sh'\n")
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("SABLE_MG_BD", str(fake_bd))
+
+    base = _sha(repo)
+    (repo / "bin").mkdir()
+    (repo / "bin" / "tier_selection.py").write_text("x = 1\n")
+    branch = _commit(repo, "branch reads test-tiers.sh, writes only bin/")
+    _git(repo, "checkout", "-q", "-b", "moved", base)
+    (repo / ".github").mkdir()
+    (repo / ".github" / "ci").mkdir()
+    (repo / ".github" / "ci" / "test-tiers.sh").write_text("budget=1\n")
+    new_base = _commit(repo, "base move edits test-tiers.sh")
+
+    ww = fp.is_disjoint(fp.mechanical_footprint(str(repo), base, branch),
+                        fp.mechanical_footprint(str(repo), base, new_base))
+    assert ww.disjoint is True, "the write footprints must already be disjoint, or this proves nothing new"
+
+    a = fp.assess(str(repo), "SABLE-x", base, branch, new_base)
+    assert a.disjoint is False, a.reason
+    assert "test-tiers.sh" in a.reason
+    assert "read/write coupling" in a.reason
+
+
+def test_assess_still_promotes_when_reads_are_declared_and_disjoint(repo, monkeypatch, tmp_path):
+    """Non-vacuity of the floor: a bead that DOES declare its read footprint
+    and is genuinely disjoint — on writes AND reads — from the base-move
+    still takes the optimistic path. The fix does not just serialize
+    everything."""
+    fake_bd = tmp_path / "fake-bd-reads-disjoint"
+    fake_bd.write_text("#!/bin/sh\necho '## File reads'\necho 'unrelated/other.txt'\n")
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("SABLE_MG_BD", str(fake_bd))
+
+    base = _sha(repo)
+    (repo / "left.py").write_text("l\n")
+    branch = _commit(repo, "left")
+    _git(repo, "checkout", "-q", "-b", "moved", base)
+    (repo / "right.py").write_text("r\n")
+    new_base = _commit(repo, "right")
+
+    a = fp.assess(str(repo), "SABLE-x", base, branch, new_base)
+    assert a.disjoint is True, a.reason
     assert set(a.paths) == {"left.py", "right.py"}
 
 

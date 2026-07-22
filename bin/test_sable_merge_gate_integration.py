@@ -94,11 +94,27 @@ def _setup(tmp_path, *, conflict=False):
     return origin, work
 
 
+def _fake_bd_reads_none(gh_path):
+    """A `bd show` stub that declares an EXPLICIT, empty '## File reads'
+    section (SABLE-jd5fj.18). Written as a sibling of gh_path so every caller
+    gets one for free without threading tmp_path through _env()'s signature.
+    Without this, the read-write floor's undeclared-reads-forces-serialize
+    default (sable_footprint_lib.declared_reads) would fire on every rehearsal
+    here, none of which are testing that floor — a bare `true` stub answers
+    with NO '## File reads' heading at all, which is now a non-answer, not an
+    empty one."""
+    p = Path(gh_path).parent / "fake-bd-reads-none"
+    if not p.exists():
+        p.write_text("#!/bin/sh\necho '## File reads'\necho 'none'\n")
+        p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return p
+
+
 def _env(gh_path):
     e = dict(os.environ)
     e.update({
         "SABLE_MG_GH": str(gh_path),
-        "SABLE_MG_BD": "true",       # no-op evidence recorder
+        "SABLE_MG_BD": str(_fake_bd_reads_none(gh_path)),  # SABLE-jd5fj.18: declares no reads
         "SABLE_MG_NOTIFY": "true",   # no-op notifier
         "SABLE_MG_POLL": "0",
         "SABLE_MG_GRACE": "0",
