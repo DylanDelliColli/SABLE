@@ -150,7 +150,14 @@ Usage:
   sable-merge-gate verdict --branch <worker-branch> [--base <branch>] [--json]
                            [--repo <path>] [--remote <name>]
   sable-merge-gate sweep   [--max-age-hours N] [--repo <path>] [--remote <name>]
+  sable-merge-gate promote-budget [--json | --seconds]
   sable-merge-gate --help
+
+`promote-budget` (SABLE-w0zjm) exists for the code that WRAPS this one. A promote
+may legitimately spend an impact-tier queue wait PLUS the tier's own budget, so
+any enclosing `timeout` must be derived from that sum rather than copied — the
+copy was 900s at the merge seat, the same number as the tier budget, sized back
+when the tier essentially never ran.
 
 The `preview` entrypoint (SABLE-jd5fj.1) is the KICK half of promote: it builds
 the merge-preview commit and pushes the ci-verify ref — and then RETURNS, at
@@ -225,6 +232,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -266,6 +274,8 @@ promote = promote_lib.promote
 cleanup_after_merge = promote_lib.cleanup_after_merge
 decide_promotion = promote_lib.decide_promotion
 run_impact_tier = promote_lib.run_impact_tier
+impact_budget = promote_lib.impact_budget
+format_impact_budget = promote_lib.format_impact_budget
 assess_footprints = footprint_lib.assess
 assert_not_frozen = promote_lib.assert_not_frozen
 read_freeze = snapshot_lib.read_freeze
@@ -320,6 +330,23 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
     ps.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
 
+    # SABLE-w0zjm. The gate's own worst-case promote wall-clock, so an operator
+    # wrapper DERIVES its timeout instead of keeping a second copy of the number.
+    # Named promote-budget, not budget, because sable_gate_budget_lib already owns
+    # "budget" for a different thing entirely (per-tier CI DURATION budgets,
+    # SABLE-cmar4.4). Takes no --repo: every input is an env var, so this answers
+    # without touching git and can be called from anywhere, including the wrapper
+    # that has not chosen a repo yet.
+    pb = sub.add_parser("promote-budget",
+                        help="print the worst-case promote wall-clock an enclosing "
+                             "timeout must exceed")
+    pbg = pb.add_mutually_exclusive_group()
+    pbg.add_argument("--json", action="store_true",
+                     help="machine-readable single-line JSON with every component")
+    pbg.add_argument("--seconds", action="store_true",
+                     help="just the recommended enclosing timeout, as a bare integer: "
+                          "timeout \"$(sable-merge-gate promote-budget --seconds)\" ...")
+
     args = parser.parse_args(argv)
     try:
         if args.command == "promote":
@@ -335,6 +362,15 @@ def main(argv: list[str] | None = None) -> int:
                                               args.remote, args.json)
         if args.command == "sweep":
             return preview_lib.sweep(args.repo, args.remote, args.max_age_hours)
+        if args.command == "promote-budget":
+            budget = promote_lib.impact_budget()
+            if args.seconds:
+                print(budget["recommended_wrapper_timeout_s"])
+            elif args.json:
+                print(json.dumps(budget, sort_keys=True))
+            else:
+                print(promote_lib.format_impact_budget(budget))
+            return 0
     except classify.GateError as e:
         print(f"sable-merge-gate: {e}", file=sys.stderr)
         return e.code
