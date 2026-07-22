@@ -20,6 +20,19 @@ if [ -z "$SHA" ]; then
   exit 1
 fi
 
+if ! command -v gh >/dev/null 2>&1; then
+  # SABLE-apt5a: without this check, a missing gh fell through into the
+  # generic "any gh failure -> unverified" branch below, indistinguishable
+  # in the job log from a real API error. Name it here so a missing gh is
+  # loud in the log instead of silently and permanently defeating the
+  # SABLE-r3i6 dedup optimization. Still fail-open (same stdout/exit-code
+  # contract as every other unverified case) -- naming it does not change
+  # what the caller does.
+  echo "gh not installed -- dedup guard cannot query the Actions API, fail-open (SABLE-apt5a)" >&2
+  echo "unverified"
+  exit 1
+fi
+
 REPO_ARG="${GITHUB_REPOSITORY:-:owner/:repo}"
 
 RESPONSE="$(gh api "repos/${REPO_ARG}/actions/runs?head_sha=${SHA}&per_page=100" 2>/dev/null)"
