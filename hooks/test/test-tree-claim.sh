@@ -481,7 +481,7 @@ echo "--- Defect-regression (a): git -C <other-repo> from cwd with foreign fresh
 # sess-ME runs 'git -C repoB add .' from repoA's cwd.
 # Expected: allow (target is repoB), repoB gets sess-ME's claim, repoA untouched.
 REG_ROOT="$(mktemp -d)"
-trap 'rm -rf "$REG_ROOT"' EXIT
+trap 'rm -rf "$SCRATCH_ROOT" "$REG_ROOT"' EXIT
 REG_A="$REG_ROOT/repoA"
 REG_B="$REG_ROOT/repoB"
 git init "$REG_A" -q
