@@ -736,11 +736,19 @@ def dep_merge_advisory(bead_ids: list[str], repo: str) -> str | None:
     and it used to collapse into the same `None` the healthy path returns
     (SABLE-wezu1): a bd hiccup that hangs the OUTER subprocess.run past
     `timeout`, or one that raises before any text is captured, left nothing to
-    relay. Those legs now report explicitly instead of going silent. So does a
-    process that DOES exit 4 but — contrary to the tool's contract — emits no
-    text; this is defensive, not the expected shape of that exit code, and
-    exists so a future regression in the tool's own reporting cannot silently
-    re-open this hole from the other side.
+    relay. Those legs now report explicitly instead of going silent.
+
+    So does ANY process that exits with no text and a nonzero code — not just
+    the documented exit 4. The first pass here denylisted exit 4 specifically
+    and left a residual door: an UNEXPECTED crash (e.g. exit 1, a traceback on
+    stderr, empty stdout) fell through to the same `return None` as a healthy
+    run, because nothing named exit 1 as bad. A denylist can always be
+    outrun by an exit code nobody enumerated. So this enumerates the single
+    LEGAL silent case instead — exit 0 with no text, i.e. genuinely clean —
+    and treats every other empty-text outcome as COULD NOT ASSESS, trimmed
+    stderr included when the checker left any (it is captured either way and
+    was previously discarded on this leg, forcing a manager to reproduce the
+    crash by hand to learn anything).
 
     The fail-OPEN decision is unchanged either way: this function never blocks
     the dispatch, it only changes what the manager reads on stderr. Disable
@@ -776,11 +784,19 @@ def dep_merge_advisory(bead_ids: list[str], repo: str) -> str | None:
     out = (proc.stdout or "").strip()
     if out:
         return out
+    if proc.returncode == 0:
+        return None
     if proc.returncode == _DEP_CHECK_EXIT_UNKNOWN:
-        return _dep_check_could_not_assess(
+        reason = (
             f"sable-dep-check exited {_DEP_CHECK_EXIT_UNKNOWN} (COULD NOT "
             "ASSESS) but produced no report text")
-    return None
+    else:
+        reason = f"sable-dep-check exited {proc.returncode} with no report text"
+    stderr = (proc.stderr or "").strip()
+    if stderr:
+        trimmed = stderr if len(stderr) <= 500 else stderr[:500] + "…"
+        reason += f" — stderr: {trimmed}"
+    return _dep_check_could_not_assess(reason)
 
 
 # --- dispatch throttle + host-resource guard (SABLE-mmdt) ---------------------

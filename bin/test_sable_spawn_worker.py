@@ -1674,7 +1674,7 @@ def test_configured_fixture_paths_unset_key_stays_silent(tmp_path, capsys):
 # and bin/sable-dep-check. Every case is paired with its complement — a guard
 # that only ever fires has traded a false-go for a false-block.
 
-def _fake_dep_check(tmp_path, stdout="", exit_code=0, sleep=0.0):
+def _fake_dep_check(tmp_path, stdout="", exit_code=0, sleep=0.0, stderr=""):
     """A stand-in for bin/sable-dep-check. The CHECKER's own behaviour is
     covered by bin/test_sable_dep_check.py and, against real git + real bd, by
     hooks/test/test-dep-merge-state.sh; what is under test here is the wiring
@@ -1686,6 +1686,8 @@ def _fake_dep_check(tmp_path, stdout="", exit_code=0, sleep=0.0):
     body += f'printf "%s" "$*" > "{tmp_path}/argv"\n'
     if stdout:
         body += f"printf '%s\\n' {stdout!r}\n"
+    if stderr:
+        body += f"printf '%s\\n' {stderr!r} >&2\n"
     body += f"exit {exit_code}\n"
     script.write_text(body)
     script.chmod(0o755)
@@ -1742,19 +1744,21 @@ def test_dep_merge_advisory_silent_when_checker_prints_nothing(tmp_path, monkeyp
 def test_dep_merge_advisory_reads_text_not_exit_code_for_a_warning(tmp_path, monkeypatch):
     """Text is still what makes a WARNING: present with a 0 exit still warns
     (the exit code is not required to recognize a finding), and a nonzero exit
-    with no text is NOT turned into a fabricated warning — the caller never
-    invents warning text the checker did not itself produce. This is narrower
-    than it used to be: SABLE-wezu1 added a SEPARATE reported outcome for
-    exit 4 (COULD NOT ASSESS) specifically, see
-    test_dep_merge_advisory_reports_could_not_assess_on_bare_exit_unknown —
-    but exit 3 with empty text (which real sable-dep-check never actually
-    produces; findings always carry text) still stays silent rather than
-    becoming an invented WARNING."""
+    with no text is NEVER turned into a fabricated WARNING — the caller never
+    invents warning text the checker did not itself produce. SABLE-wezu1's
+    revise replaced the original exit-4-only denylist with an allowlist of the
+    single legal silent case (exit 0, no text), so bare exit 3 (which real
+    sable-dep-check never actually produces; findings always carry text) is no
+    longer silent either — it is COULD NOT ASSESS, same as any other
+    unexplained empty-text nonzero exit, never a fabricated WARNING and never
+    the clean-path None."""
     monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(tmp_path / "sable-dep-check"))
     _fake_dep_check(tmp_path, stdout="UNMERGED-BLOCKER WARNING: x", exit_code=0)
     assert ssw.dep_merge_advisory(["SABLE-a"], str(tmp_path)) is not None
     _fake_dep_check(tmp_path, stdout="", exit_code=3)
-    assert ssw.dep_merge_advisory(["SABLE-a"], str(tmp_path)) is None
+    out = ssw.dep_merge_advisory(["SABLE-a"], str(tmp_path))
+    assert out is not None and "COULD NOT ASSESS" in out
+    assert "UNMERGED-BLOCKER WARNING" not in out
 
 
 def test_dep_merge_advisory_passes_hook_format_repo_and_every_bead(tmp_path, monkeypatch):
@@ -1824,6 +1828,40 @@ def test_dep_merge_advisory_reports_could_not_assess_on_bare_exit_unknown(tmp_pa
     assert out is not None, "exit 4 must never collapse into the clean-path None (SABLE-wezu1)"
     assert "COULD NOT ASSESS" in out
     assert "UNMERGED-BLOCKER WARNING" not in out
+
+
+def test_dep_merge_advisory_reports_could_not_assess_on_unexpected_crash(
+        tmp_path, monkeypatch):
+    """SABLE-wezu1's revise: the residual door. The first pass denylisted
+    exit 4 specifically, so an UNEXPECTED nonzero exit — e.g. exit 1 from a
+    crashed checker, empty stdout, traceback on stderr — fell through to
+    `return None`, reading identically to a healthy clean run: a crashed
+    checker and a genuinely clean one produced the same report. Enumerating
+    the single legal silent case (exit 0, no text) instead of the known-bad
+    ones closes this door too, without a manager needing to name every exit
+    code a future regression might produce."""
+    _fake_dep_check(tmp_path, stdout="", exit_code=1,
+                     stderr="Traceback (most recent call last):\nRuntimeError: bd locked")
+    monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(tmp_path / "sable-dep-check"))
+    out = ssw.dep_merge_advisory(["SABLE-dep"], str(tmp_path))
+    assert out is not None, \
+        "an unexpected crash must never collapse into the clean-path None"
+    assert "COULD NOT ASSESS" in out
+    assert "UNMERGED-BLOCKER WARNING" not in out
+
+
+def test_dep_merge_advisory_relays_trimmed_stderr_on_could_not_assess(
+        tmp_path, monkeypatch):
+    """stderr is captured (capture_output=True) via subprocess.run but was
+    previously discarded on every could-not-assess leg. On a crash it holds
+    the whole diagnostic; without it a manager seeing COULD NOT ASSESS has to
+    reproduce the crash by hand just to learn why."""
+    _fake_dep_check(tmp_path, stdout="", exit_code=1,
+                     stderr="Traceback (most recent call last):\nRuntimeError: bd locked")
+    monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(tmp_path / "sable-dep-check"))
+    out = ssw.dep_merge_advisory(["SABLE-dep"], str(tmp_path))
+    assert out is not None
+    assert "RuntimeError: bd locked" in out
 
 
 def test_dep_merge_advisory_still_silent_on_healthy_exit_zero(tmp_path, monkeypatch):
