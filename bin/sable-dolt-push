@@ -28,9 +28,28 @@ Three layers, one helper:
 Chuck-only by convention, but SAFE if invoked elsewhere: the lock still
 serializes, so a stray invocation cannot interleave with chuck's push.
 
+Drift-check (SABLE-rzsb.9): `bd dolt status` does not expose ahead/behind
+(verified against both the text and --json output), so the drift-check runs
+a DOLT_LOG COUNT query directly — commits reachable from the local branch
+but not from the remote-tracking branch, i.e. the same "ahead" semantics as
+`git rev-list --count origin/main..main`. Two independent entry points:
+
+  --check-only     Report the ahead-count and exit. NEVER pulls, pushes,
+                    fetches, or touches the lock, under any condition — this
+                    is a pure read so a recycled chuck pane (or the shift
+                    report) can orient on drift state without side effects.
+  --push-if-ahead   Run the same drift-check; iff ahead>0, run the normal
+                    guarded push flow (lock + pull + push + bounce-on-
+                    dangling) exactly once. ahead=0 is a no-op — the lock is
+                    never even touched. This is the loop-trigger the sync
+                    actor's operating loop calls every wake.
+
 Usage:
   sable-dolt-push [--wait SECS] [--ttl SECS] [--lock PATH] [--fleet ID]
                   [--poll SECS]
+  sable-dolt-push --check-only [--branch NAME] [--remote NAME]
+  sable-dolt-push --push-if-ahead [--branch NAME] [--remote NAME]
+                  [--wait SECS] [--ttl SECS] [--lock PATH] [--fleet ID]
   sable-dolt-push --print-lock-path      # resolve + print the lock path, exit
   sable-dolt-push --help
 
@@ -43,8 +62,15 @@ Environment seams (all overridable; the defaults are the production commands):
   SABLE_DOLT_PULL_CMD    pull command   (default "bd dolt pull")
   SABLE_DOLT_PUSH_CMD    push command   (default "bd dolt push")
   SABLE_DOLT_BOUNCE_CMD  server-bounce command (default "bd dolt stop")
+  SABLE_DOLT_DRIFT_CMD   drift-check command; stdout's last non-blank line
+                         must be a bare integer ahead-count (default: locate
+                         the dolt data dir via `bd dolt status --json`, then
+                         run the DOLT_LOG COUNT query below against it)
+  SABLE_DOLT_DRIFT_BRANCH  local branch name for the default query (default "main")
+  SABLE_DOLT_DRIFT_REMOTE  remote name for the default query (default "origin")
 
-Exit codes: 0 ok · 2 usage · 11 lock contention · 12 pull failed · 13 push failed.
+Exit codes: 0 ok · 2 usage · 11 lock contention · 12 pull failed · 13 push
+failed · 14 drift-check failed (command errored or printed unparseable output).
 """
 from __future__ import annotations
 
@@ -64,6 +90,7 @@ EXIT_USAGE = 2
 EXIT_CONTENTION = 11
 EXIT_PULL_FAIL = 12
 EXIT_PUSH_FAIL = 13
+EXIT_DRIFT_CHECK_FAIL = 14
 
 # --- defaults ----------------------------------------------------------------
 LOCK_TTL_DEFAULT = 600.0      # 10 minutes — a held lock older than this is stale
@@ -302,11 +329,87 @@ def do_push(*, pull_cmd, push_cmd, bounce_cmd, run=_default_run, log=_log) -> in
     return EXIT_PUSH_FAIL
 
 
+# --- drift-check: ahead-count via a DOLT_LOG COUNT query --------------------
+
+class DriftCheckError(Exception):
+    """Raised when the drift-check command fails or prints output that does
+    not parse as a bare integer ahead-count."""
+
+
+# `bd dolt status --json` does not expose ahead/behind (confirmed against a
+# live embedded-mode database — only data_dir/mode/schema_version/
+# server_running are reported), so it is used ONLY to locate the dolt data
+# directory; the actual ahead-count comes from a DOLT_LOG COUNT query run
+# directly against that directory. This mirrors `git rev-list --count
+# origin/main..main`: commits reachable from the local branch that are NOT
+# reachable from the remote-tracking branch. Read-only — no fetch, so it
+# never mutates local state; it reports drift as of the last time the
+# remote-tracking ref was updated (same semantics as `git status`).
+_DEFAULT_DRIFT_SCRIPT = (
+    "set -e\n"
+    "data_dir=$(bd dolt status --json | "
+    "python3 -c 'import json,sys; print(json.load(sys.stdin)[\"data_dir\"])')\n"
+    'dolt --data-dir "$data_dir" sql -r csv -q '
+    "\"SELECT COUNT(*) FROM dolt_log('{branch}') WHERE commit_hash NOT IN "
+    "(SELECT commit_hash FROM dolt_log('remotes/{remote}/{branch}'))\"\n"
+)
+
+
+def default_drift_cmd(branch="main", remote="origin"):
+    script = _DEFAULT_DRIFT_SCRIPT.format(branch=branch, remote=remote)
+    return ["sh", "-c", script]
+
+
+def parse_ahead_count(text) -> int:
+    """The drift command's contract: its LAST non-blank stdout line is a bare
+    integer ahead-count (a `-r csv` COUNT(*) query prints a header line then
+    the value; a test double can just `echo <n>`)."""
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    if not lines:
+        raise DriftCheckError("drift-check produced no output")
+    try:
+        return int(lines[-1])
+    except ValueError:
+        raise DriftCheckError(f"drift-check output not an integer: {lines[-1]!r}")
+
+
+def check_drift(drift_cmd, run=_default_run) -> int:
+    """Run the drift-check command and return the parsed ahead-count. Purely
+    a read: does not acquire the lock, pull, push, or fetch. Raises
+    DriftCheckError if the command fails or its output doesn't parse."""
+    result = run(drift_cmd)
+    if result.returncode != 0:
+        raise DriftCheckError(
+            f"drift-check command exited {result.returncode}")
+    return parse_ahead_count(result.stdout)
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def _cmd_from_env(env, key, default):
     raw = env.get(key)
     return shlex.split(raw) if raw else list(default)
+
+
+def _guarded_push(*, lock_path, fleet, ttl, wait, poll,
+                  pull_cmd, push_cmd, bounce_cmd, log=_log) -> int:
+    """Acquire the push lock, run the pull-then-push(-then-bounce-retry) flow,
+    and release the lock. The one push path both the default invocation and
+    --push-if-ahead's ahead>0 branch funnel through, so there is exactly one
+    place that ever calls do_push()."""
+    try:
+        token = acquire_lock(lock_path, fleet, ttl=ttl, wait=wait, poll=poll)
+    except LockContention as e:
+        log(f"could not acquire push lock: {e}. Another push is in progress; "
+            f"try again shortly (lock: {lock_path}).")
+        return EXIT_CONTENTION
+
+    log(f"acquired push lock (fleet={fleet} pid={os.getpid()} lock={lock_path})")
+    try:
+        return do_push(pull_cmd=pull_cmd, push_cmd=push_cmd, bounce_cmd=bounce_cmd)
+    finally:
+        if release_lock(lock_path, token):
+            log("released push lock")
 
 
 def main(argv=None) -> int:
@@ -324,12 +427,41 @@ def main(argv=None) -> int:
     ap.add_argument("--fleet", default=None, help="fleet id override")
     ap.add_argument("--print-lock-path", action="store_true",
                     help="print the resolved lock path and exit")
+    ap.add_argument("--check-only", action="store_true",
+                    help="report the ahead-count and exit; NEVER pulls, "
+                         "pushes, fetches, or touches the lock")
+    ap.add_argument("--push-if-ahead", action="store_true",
+                    help="run the drift-check; push (once) iff ahead>0, "
+                         "otherwise no-op")
+    ap.add_argument("--branch", default=None,
+                    help="local branch name for the drift-check (default 'main' / env)")
+    ap.add_argument("--remote", default=None,
+                    help="remote name for the drift-check (default 'origin' / env)")
     args = ap.parse_args(argv)
+
+    if args.check_only and args.push_if_ahead:
+        _log("--check-only and --push-if-ahead are mutually exclusive")
+        return EXIT_USAGE
 
     env = os.environ
     lock_path = args.lock or default_lock_path(env)
     if args.print_lock_path:
         print(lock_path)
+        return EXIT_OK
+
+    if args.check_only or args.push_if_ahead:
+        branch = args.branch or env.get("SABLE_DOLT_DRIFT_BRANCH", "main")
+        remote = args.remote or env.get("SABLE_DOLT_DRIFT_REMOTE", "origin")
+        drift_cmd = _cmd_from_env(env, "SABLE_DOLT_DRIFT_CMD",
+                                  default_drift_cmd(branch, remote))
+        try:
+            ahead = check_drift(drift_cmd)
+        except DriftCheckError as e:
+            _log(f"drift-check failed: {e}")
+            return EXIT_DRIFT_CHECK_FAIL
+
+    if args.check_only:
+        print(f"ahead={ahead}")
         return EXIT_OK
 
     fleet = args.fleet or resolve_fleet_id(env)
@@ -344,19 +476,15 @@ def main(argv=None) -> int:
     push_cmd = _cmd_from_env(env, "SABLE_DOLT_PUSH_CMD", ["bd", "dolt", "push"])
     bounce_cmd = _cmd_from_env(env, "SABLE_DOLT_BOUNCE_CMD", ["bd", "dolt", "stop"])
 
-    try:
-        token = acquire_lock(lock_path, fleet, ttl=ttl, wait=wait, poll=poll)
-    except LockContention as e:
-        _log(f"could not acquire push lock: {e}. Another push is in progress; "
-             f"try again shortly (lock: {lock_path}).")
-        return EXIT_CONTENTION
+    if args.push_if_ahead:
+        if ahead <= 0:
+            _log(f"no drift (ahead={ahead}); skipping push")
+            return EXIT_OK
+        _log(f"drift detected (ahead={ahead}); pushing")
 
-    _log(f"acquired push lock (fleet={fleet} pid={os.getpid()} lock={lock_path})")
-    try:
-        return do_push(pull_cmd=pull_cmd, push_cmd=push_cmd, bounce_cmd=bounce_cmd)
-    finally:
-        if release_lock(lock_path, token):
-            _log("released push lock")
+    return _guarded_push(lock_path=lock_path, fleet=fleet, ttl=ttl, wait=wait,
+                         poll=poll, pull_cmd=pull_cmd, push_cmd=push_cmd,
+                         bounce_cmd=bounce_cmd)
 
 
 if __name__ == "__main__":
