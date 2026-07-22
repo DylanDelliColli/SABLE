@@ -298,10 +298,12 @@ TAG="run-\$\$"
 echo "\$HOME" > "$MARKERS/\$TAG.home"
 echo "\${BEADS_DB:-}" > "$MARKERS/\$TAG.beads_db"
 echo "\${TMPDIR:-}" > "$MARKERS/\$TAG.tmpdir"
-if [ -f "\$HOME/.claude/settings.json" ]; then
-  echo present > "$MARKERS/\$TAG.settings"
+SETTINGS_PATH="\$HOME/.claude/settings.json"
+if [ -f "\$SETTINGS_PATH" ]; then
+  MODE="\$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[-3:])' "\$SETTINGS_PATH" 2>/dev/null)"
+  echo "present:\$SETTINGS_PATH:\$MODE" > "$MARKERS/\$TAG.settings"
 else
-  echo absent > "$MARKERS/\$TAG.settings"
+  echo "absent::" > "$MARKERS/\$TAG.settings"
 fi
 if command -v bd >/dev/null 2>&1 && [ -n "\${BEADS_DB:-}" ]; then
   # Create OWN bead, then wait — so a run whose write leaked into (or was
@@ -357,11 +359,28 @@ if [ "${#HOME_MARKERS[@]}" -eq 2 ]; then
   if [ -f "$HOME/.claude/settings.json" ]; then
     SETTINGS_A="$(cat "$MARKERS/$TAG_A.settings" 2>/dev/null || echo "")"
     SETTINGS_B="$(cat "$MARKERS/$TAG_B.settings" 2>/dev/null || echo "")"
-    if [ "$SETTINGS_A" = "present" ] && [ "$SETTINGS_B" = "present" ]; then
-      pass "S7: both isolated HOMEs carry a settings.json VIEW (not a silent skip)"
+    IFS=: read -r STATUS_A SPATH_A SMODE_A <<< "$SETTINGS_A"
+    IFS=: read -r STATUS_B SPATH_B SMODE_B <<< "$SETTINGS_B"
+    # ATTRIBUTABLE, not just "a file exists somewhere": the path must be
+    # inside THIS run's own isolated HOME (A's prefix != B's prefix, and
+    # neither is the real live settings.json every run could otherwise see
+    # ambiently) — proven with the mkdtemp'd HOME_A/HOME_B captured above.
+    if [ "$STATUS_A" = "present" ] && [ "$STATUS_B" = "present" ] \
+       && [ "${SPATH_A#"$HOME_A"}" != "$SPATH_A" ] \
+       && [ "${SPATH_B#"$HOME_B"}" != "$SPATH_B" ]; then
+      pass "S7: each tier's settings.json VIEW lives INSIDE its own isolated HOME (A=$SPATH_A B=$SPATH_B)"
     else
-      fail "S7: both isolated HOMEs carry a settings.json VIEW (not a silent skip)" \
-           "A=$SETTINGS_A B=$SETTINGS_B"
+      fail "S7: each tier's settings.json VIEW lives INSIDE its own isolated HOME" \
+           "status_A=$STATUS_A path_A=$SPATH_A home_A=$HOME_A; status_B=$STATUS_B path_B=$SPATH_B home_B=$HOME_B"
+    fi
+    # A copy, not the live file: mode 0444 additionally proves the isolated
+    # env made its OWN read-only copy rather than inheriting the real
+    # (differently-moded) ~/.claude/settings.json.
+    if [ "$SMODE_A" = "444" ] && [ "$SMODE_B" = "444" ]; then
+      pass "S7: both settings.json VIEWs are read-only copies (mode 444), not the live file"
+    else
+      fail "S7: both settings.json VIEWs are read-only copies (mode 444)" \
+           "mode_A=$SMODE_A mode_B=$SMODE_B"
     fi
   else
     skip "S7: settings.json VIEW check — this host has no real ~/.claude/settings.json"
