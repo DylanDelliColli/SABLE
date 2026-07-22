@@ -80,6 +80,11 @@ TESTDIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$TESTDIR/../.." && pwd)"
 GATE="$REPO_ROOT/bin/sable-merge-gate"
 
+# The merge_preview tier's duration budget from the SSOT (SABLE-jd5fj.8's own
+# wall-clock assertion derives its bound from this, not a hardcoded number, so
+# it tracks the SSOT the same way default_mg_timeout already does).
+BUDGET_MERGE_PREVIEW="$(bash "$REPO_ROOT/.github/ci/test-tiers.sh" --budget merge_preview)"
+
 # shellcheck source=lib-git-sandbox.sh
 source "$TESTDIR/lib-git-sandbox.sh"
 
@@ -123,7 +128,21 @@ chmod +x "$FAKE_GH"
 # --------------------------------------------------------------------------
 seed_repo() {
   local w="$1"
-  mkdir -p "$w/.github/ci" "$w/hooks/test" "$w/left" "$w/right"
+  mkdir -p "$w/.github/ci" "$w/hooks/test" "$w/left" "$w/right" "$w/bin"
+
+  # A fast stub for the bin/ pytest half of the combined-tree impact tier
+  # (SABLE-jd5fj.8). Real bin/tier_selection.py falls back to a conservative
+  # full bin/ run on a cold .testmondata; this sandbox never carries a
+  # .testmondata (setup_pair reseeds from scratch every case), so every case
+  # whose footprint reaches bin/ exercises exactly that cold-cache path. The
+  # stub stands in for the real module the same way test-left.sh/test-right.sh
+  # already stand in for a real suite: fast and real-executed, not the
+  # production module itself.
+  cat > "$w/bin/tier_selection.py" <<'EOF'
+#!/usr/bin/env python3
+print("PASS: stub bin/ pytest impact tier")
+EOF
+  chmod +x "$w/bin/tier_selection.py"
 
   cat > "$w/.github/ci/impact-manifest.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -253,6 +272,14 @@ scenario() {
 
 # --- the mutations each case composes -------------------------------------
 mut_branch_disjoint_ok()   { echo 'feature=1' > "$B_WORK/left/feature.sh"; }
+# C1-only (SABLE-jd5fj.8): the same disjoint left-side change, PLUS a bin/
+# path, so C1's footprint reaches the pytest half of the combined-tree impact
+# tier (bin/sable_gate_promote_lib.py::_run_impact_tier_locked only invokes
+# bin/tier_selection.py when the footprint has a path starting with "bin/").
+# A dedicated function, not a change to mut_branch_disjoint_ok itself, so C6/
+# C7/C8 (which reuse that function for their own, unrelated assertions) are
+# not affected by the pytest half at all.
+mut_branch_disjoint_ok_with_bin() { mut_branch_disjoint_ok; echo 'x=2' > "$B_WORK/bin/extra.sh"; }
 mut_base_disjoint_ok()     { echo 'other=1'   > "$B_WORK/right/other.sh"; }
 mut_branch_route()         { echo 'ROUTE=/health' > "$B_WORK/left/routes.sh"; }
 mut_base_route()           { echo 'ROUTE=/health' > "$B_WORK/right/routes.sh"; }
@@ -265,8 +292,10 @@ mut_base_lockfile()        { echo 'resolved=1' > "$B_WORK/package-lock.json"; }
 # ==========================================================================
 # C1 — disjoint + stale base + green combined tree
 # ==========================================================================
-scenario c1 mut_branch_disjoint_ok mut_base_disjoint_ok
+scenario c1 mut_branch_disjoint_ok_with_bin mut_base_disjoint_ok
+START_C1=$(date +%s)
 OUT="$(FAKE_GH_ADVANCE="$MOVED_SHA" gate promote --bead TEST-C1 --branch wk-1 --base "$BASE_BR" --repo "$B_WORK" --remote origin)"; RC=$?
+ELAPSED_C1=$(( $(date +%s) - START_C1 ))
 LANDED="$(origin_sha "$BASE_BR")"
 
 if [ "$RC" -eq 0 ]; then
@@ -283,6 +312,25 @@ if printf '%s' "$OUT" | grep -q 'test-left.sh'; then
   pass "C1: the tier was IMPACT-SCOPED (named the selected suite), not a full run"
 else
   fail "C1: the tier was impact-scoped" "out=$OUT"
+fi
+# SABLE-jd5fj.8: C1's footprint now reaches bin/ (mut_branch_disjoint_ok_with_bin),
+# so the pytest half must ALSO run and name itself in the same detail string —
+# the whole point being that a cold-cache fallback to a full bin/ run is
+# reported, not silent.
+if printf '%s' "$OUT" | grep -q 'bin/ pytest impact tier'; then
+  pass "C1: the pytest half of the impact tier ran and named itself"
+else
+  fail "C1: the pytest half of the impact tier ran and named itself" "out=$OUT"
+fi
+if printf '%s' "$OUT" | grep -q 'no warm .testmondata'; then
+  pass "C1: the cold-cache fallback (no .testmondata in this sandbox) is named, not silent"
+else
+  fail "C1: the cold-cache fallback is named" "out=$OUT"
+fi
+if [ "$ELAPSED_C1" -le "$BUDGET_MERGE_PREVIEW" ]; then
+  pass "C1: the whole optimistic promote (including the bin/ pytest half) finished within the merge_preview budget (${ELAPSED_C1}s <= ${BUDGET_MERGE_PREVIEW}s)"
+else
+  fail "C1: the promote finished within the merge_preview budget" "elapsed=${ELAPSED_C1}s budget=${BUDGET_MERGE_PREVIEW}s"
 fi
 if [ "$LANDED" != "$KICKED_SHA" ] && [ "$LANDED" != "$OLD_BASE" ]; then
   pass "C1: the stale CI-green preview is NOT what landed"
