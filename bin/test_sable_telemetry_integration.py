@@ -20,6 +20,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sable_telemetry_bd_source as bd_source  # noqa: E402
+import sable_telemetry_git_source as git_source  # noqa: E402
 
 BIN_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BIN_DIR.parent
@@ -150,6 +151,64 @@ def test_bd_source_returns_closed_beads_from_seeded_db(seeded_bd_sandbox):
     assert manager_record.status == "closed"
     assert manager_record.closed_at is not None
     assert manager_record.started_at is None  # the 61%-missing case, surfaced explicitly
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", *args], cwd=repo, text=True, check=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
+def _git_commit(repo, subject, iso_date, filename="f.txt"):
+    (Path(repo) / filename).write_text(subject)
+    _git(repo, "add", "-A")
+    env = dict(os.environ, GIT_AUTHOR_DATE=iso_date, GIT_COMMITTER_DATE=iso_date,
+              GIT_AUTHOR_NAME="SABLE Test", GIT_AUTHOR_EMAIL="t@sable.invalid",
+              GIT_COMMITTER_NAME="SABLE Test", GIT_COMMITTER_EMAIL="t@sable.invalid")
+    subprocess.run(["git", "commit", "-q", "-m", subject], cwd=repo, check=True, env=env)
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def test_git_source_regex_against_real_git_fixture_repo_log(tmp_path):
+    """Real temp git repo, real `git log` subprocess output, no mocked git
+    (Prime Directive 2). Mixes real merge-preview subjects (plain bead,
+    disjoint re-verify, push-time kick) with a decoy human commit that
+    carries its own trailing (SABLE-xxxx) reference but is NOT a
+    merge-preview event -- the negative case the S2 test-strategy calls out
+    by name."""
+    repo = str(tmp_path / "gitsource_repo")
+    os.makedirs(repo)
+    _git(repo, "init", "-q", "-b", "tmux-only")
+    _git(repo, "config", "user.email", "t@sable.invalid")
+    _git(repo, "config", "user.name", "SABLE Test")
+    _git_commit(repo, "init", "2026-07-21T10:00:00+00:00")
+
+    clean_sha = _git_commit(
+        repo, "ci-verify merge-preview: wk-clean onto tmux-only (SABLE-clean1)",
+        "2026-07-21T11:00:00+00:00")
+    _git_commit(
+        repo, "fix(unrelated): patch something (SABLE-decoy1)",
+        "2026-07-21T11:05:00+00:00")
+    disjoint_sha = _git_commit(
+        repo,
+        "ci-verify merge-preview: wk-broken onto tmux-only (SABLE-broken1, disjoint re-verify)",
+        "2026-07-21T12:00:00+00:00")
+    kick_sha = _git_commit(
+        repo, "ci-verify merge-preview: wk-thing onto tmux-only (push-time kick)",
+        "2026-07-21T13:00:00+00:00")
+
+    events = git_source.fetch_merge_events(base_ref="tmux-only", cwd=repo)
+    by_sha = {e.sha: e for e in events}
+
+    assert by_sha[clean_sha].bead_id == "SABLE-clean1"
+    assert by_sha[disjoint_sha].bead_id == "SABLE-broken1"
+    # push-time kick carries no bead id -- not counted as a bead merge event
+    assert kick_sha not in by_sha
+    # the decoy human commit (its own trailing bead ref) must not appear
+    assert "SABLE-decoy1" not in {e.bead_id for e in events}
+    assert len(events) == 2
+
+    # oldest-first ordering (git log itself is newest-first)
+    assert [e.sha for e in events] == [clean_sha, disjoint_sha]
 
 
 if __name__ == "__main__":

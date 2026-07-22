@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sable_telemetry_lib as lib  # noqa: E402
 import sable_telemetry_bd_source as bd_source  # noqa: E402
+import sable_telemetry_git_source as git_source  # noqa: E402
 
 _LOADER = SourceFileLoader(
     "sable_telemetry_cli", str(Path(__file__).resolve().parent / "sable-telemetry")
@@ -100,6 +101,34 @@ def test_bd_source_marks_missing_started_at_as_none():
     })
     assert record.started_at is None
     assert record.closed_at == "2026-07-02T00:00:00Z"
+
+
+def test_git_source_merge_preview_subject_regex_extracts_bead_id():
+    assert git_source.extract_bead_id_from_subject(
+        "ci-verify merge-preview: wk-8b41-3-git-source onto tmux-only (SABLE-8b41.3)"
+    ) == "SABLE-8b41.3"
+
+    # disjoint re-verify suffix is stripped, bead id still extracted
+    assert git_source.extract_bead_id_from_subject(
+        "ci-verify merge-preview: wk-broken onto tmux-only (SABLE-broken1, disjoint re-verify)"
+    ) == "SABLE-broken1"
+
+    # push-time kick is a real merge-preview event but carries no bead
+    assert git_source.extract_bead_id_from_subject(
+        "ci-verify merge-preview: wk-thing onto tmux-only (push-time kick)"
+    ) is None
+
+
+def test_git_source_ignores_non_merge_preview_commit_with_trailing_bead_ref():
+    # A human commit that merely carries a trailing (SABLE-xxxx) reference is
+    # NOT a merge-preview event and must not be mistaken for one, even though
+    # a naive "look for a trailing paren" scan would match it.
+    assert git_source.extract_bead_id_from_subject(
+        "fix(auth): rotate expired token (SABLE-9182)"
+    ) is None
+    assert git_source.extract_bead_id_from_subject(
+        "docs: update README (SABLE-1111)"
+    ) is None
 
 
 if __name__ == "__main__":
