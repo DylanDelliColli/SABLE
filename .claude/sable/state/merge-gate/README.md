@@ -9,6 +9,7 @@ freeze** and no two repos share any.
 |---|---|---|---|
 | `freeze.json` | `sable-snapshot run` (deterministic red), `sable-snapshot freeze` | `sable_gate_promote_lib.assert_not_frozen` | promotion is DENIED (exit 25) |
 | `quarantine.json` | `sable-snapshot run` (flake), `sable-snapshot quarantine add` | `sable_snapshot_lib.classify_snapshot` | suites excluded from the freeze **trigger** — they still run, and are still recorded |
+| `testmondata-warm` | `sable-merge-gate warm-testmon-cache` (SABLE-jd5fj.8) | `sable_gate_promote_lib._warm_testmondata_source` | the combined-tree impact tier's bin/ pytest half's fallback warm `.testmondata`, used when this repo's own root copy is absent — a fresh checkout's answer to CI's runner-only copy, warmed by running the same full bin/ suite locally, not automatically on every promote |
 
 The state **files** are gitignored and this README is not. That split is
 deliberate: a freeze is a fact about a moment on one machine, not about a
