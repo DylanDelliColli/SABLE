@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sable_telemetry_bd_source as bd_source  # noqa: E402
 import sable_telemetry_git_source as git_source  # noqa: E402
 import sable_telemetry_gh_source as gh_source  # noqa: E402
+import sable_telemetry_lib as lib  # noqa: E402
 
 BIN_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BIN_DIR.parent
@@ -152,6 +154,51 @@ def test_bd_source_returns_closed_beads_from_seeded_db(seeded_bd_sandbox):
     assert manager_record.status == "closed"
     assert manager_record.closed_at is not None
     assert manager_record.started_at is None  # the 61%-missing case, surfaced explicitly
+
+
+@pytest.mark.skipif(
+    not HAVE_BD,
+    reason="ci-verify clean-room has no bd/dolt by design; real-bd integration self-skips",
+)
+def test_cycle_split_denominator_against_seeded_bd_db_mixed_dispatch(seeded_bd_sandbox):
+    """S2 denominator invariant + dispatched-subset scoping proven against a
+    REAL seeded bd DB with a genuinely mixed started_at population (open,
+    claimed+closed, and manager-closed with no claim) -- not asserted
+    against hand-authored BeadRecord fixtures (test-strategy.json S2)."""
+    records = bd_source.fetch_bead_records(cwd=str(seeded_bd_sandbox["work"]))
+    ids = seeded_bd_sandbox
+
+    dispatched_record = next(r for r in records if r.id == ids["dispatched"])
+    assert dispatched_record.started_at is not None
+
+    # git_source's own regex/fixture behavior is covered by
+    # test_git_source_regex_against_real_git_fixture_repo_log; this test's
+    # job is the S2 join + denominator against real bd corpus state, so the
+    # merge event only needs to be real-shaped, timestamped after the real
+    # closed_at this seeded DB actually produced.
+    closed_dt = datetime.fromisoformat(dispatched_record.closed_at.replace("Z", "+00:00"))
+    merged_at = (closed_dt + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    merges = [git_source.MergeEvent(bead_id=ids["dispatched"], sha="deadbee",
+                                    committed_at=merged_at)]
+
+    report = lib.build_cycle_split_report(records, merges)
+
+    # Real corpus: 2 closed beads (dispatched + manager), 1 open (excluded
+    # from closed_count entirely, per the "closed beads" scoping).
+    assert report.closed_count == 2
+    assert report.dispatched_count == 1
+    assert report.denominator_note == "1 of 2 closed beads had dispatch timestamps"
+    assert "had dispatch timestamps" in report.denominator_note
+
+    # The manager-closed bead never produces an entry, even though it is
+    # closed -- the 61%-missing case this bead exists to surface, not paper
+    # over.
+    assert {e.bead_id for e in report.entries} == {ids["dispatched"]}
+    entry = report.entries[0]
+    assert entry.merge_queue_wait_seconds == pytest.approx(300.0)
+    assert report.merge_queue_wait_share == pytest.approx(
+        entry.merge_queue_wait_seconds / entry.total_seconds
+    )
 
 
 def _git(repo, *args):
