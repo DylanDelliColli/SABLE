@@ -162,6 +162,14 @@ jobs:
           # out to real pytest-cov + diff-cover, so hooks/test/test-coverage-
           # floor-gate.sh needs both on PATH to run for real, not mocked, in
           # this clean-room (SABLE-59zu contract).
+          #
+          # This also happens to be SABLE-cmar4.6's third-revise root cause
+          # fix (pytest-cov was independently required by
+          # bin/columbo-cost-prefilter.py's --cov-context/--cov/--cov-report
+          # inner invocation; see green-snapshot.yml's matching step for the
+          # verbatim CI usage error that diagnosed it) -- the two needs
+          # converged on the same package, so cmar4.5's superset line already
+          # satisfies both.
           pip install pytest pytest-testmon pytest-impact pytest-cov diff_cover
 
       - name: Restore pytest-testmon coverage cache (SABLE-cmar4.3)
