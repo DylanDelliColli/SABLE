@@ -43,13 +43,37 @@ fail(){ FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n 
 TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/sable-test-shell-run-set-strict.XXXXXX")"
 trap 'rm -rf "$TMPROOT"' EXIT
 
+# set_iron_rule <fixture-root> <suite...>: replaces the
+# IRON_RULE_REALBD_SUITES=(...) array literal in the fixture's copy — the
+# SABLE-jd5fj.16 counterpart to set_allow_exclude below, same technique.
+# Defined ahead of new_fixture() so new_fixture can call it with zero items
+# to blank the array by default (every case before (h) below is oblivious to
+# this array; leaving it copied verbatim from production would make
+# check_loud_skip fault on fixtures whose ALLOW never mentions the two real
+# suite names it names).
+set_iron_rule() {
+  local fixture="$1"; shift
+  python3 -c "
+import re, sys
+p = sys.argv[1] + '/.github/ci/shell-run-set.sh'
+items = sys.argv[2:]
+s = open(p).read()
+body = '\n'.join(f'  {a}' for a in items)
+s, n = re.subn(r'IRON_RULE_REALBD_SUITES=\(.*?\n\)\n', f'IRON_RULE_REALBD_SUITES=(\n{body}\n)\n', s, count=1, flags=re.DOTALL)
+assert n == 1, 'IRON_RULE_REALBD_SUITES block not found'
+open(p, 'w').write(s)
+" "$fixture" "$@"
+}
+
 # new_fixture <name>: sets up <TMPROOT>/<name>/.github/ci/shell-run-set.sh
 # (a real copy of production) + an empty hooks/test/ dir, echoes the fixture
-# root path.
+# root path. IRON_RULE_REALBD_SUITES starts EMPTY (see set_iron_rule above);
+# case (h) below is the only case that populates it.
 new_fixture() {
   local dir="$TMPROOT/$1"
   mkdir -p "$dir/.github/ci" "$dir/hooks/test"
   cp "$PROD" "$dir/.github/ci/shell-run-set.sh"
+  set_iron_rule "$dir" >/dev/null
   echo "$dir"
 }
 
@@ -321,6 +345,96 @@ if command -v bd >/dev/null 2>&1; then
   fi
 else
   echo "SKIP: (f) real EXCLUDE entries resolve against the real bd store — bd not on PATH (SABLE-59zu clean room)"
+fi
+
+# ---------------------------------------------------------------------------
+# Case (h) SABLE-jd5fj.16: iron-rule real-bd suites must never be able to
+# print a clean green summary indistinguishable from having run their
+# real-bd leg. check_loud_skip() enforces this: every suite named in
+# IRON_RULE_REALBD_SUITES must (1) actually be present in ALLOW (EXCLUDE
+# would silently delete the local impact tier's selection of it too — see
+# select_impacted() in impact-manifest.sh, which only ever draws from ALLOW)
+# and (2) carry a loud "Skipped: $N" marker in its own summary text.
+#
+# PLANT-AND-FAIL, against two synthetic suites (not the real two — so this
+# case's verdict never depends on someone else's future edit to those
+# files): a "noisy" suite that skips silently (no marker) must be flagged; a
+# "loud" suite with the marker must not.
+# ---------------------------------------------------------------------------
+FIX_H="$(new_fixture case-h)"
+cat > "$FIX_H/hooks/test/test-fixture-noisy-skip.sh" <<'SH'
+#!/usr/bin/env bash
+if ! command -v bd >/dev/null 2>&1; then
+  echo "SKIP: bd not found"
+  exit 0
+fi
+echo "Tests: 1 | Passed: 1 | Failed: 0"
+SH
+chmod +x "$FIX_H/hooks/test/test-fixture-noisy-skip.sh"
+cat > "$FIX_H/hooks/test/test-fixture-loud-skip.sh" <<'SH'
+#!/usr/bin/env bash
+SKIP=0
+if ! command -v bd >/dev/null 2>&1; then
+  echo "SKIP: bd not found"
+  SKIP=1
+  echo "Tests: 0 | Passed: 0 | Failed: 0 | Skipped: $SKIP"
+  exit 0
+fi
+echo "Tests: 1 | Passed: 1 | Failed: 0 | Skipped: $SKIP"
+SH
+chmod +x "$FIX_H/hooks/test/test-fixture-loud-skip.sh"
+set_allow_exclude "$FIX_H" test-fixture-noisy-skip.sh test-fixture-loud-skip.sh --SEP--
+
+set_iron_rule "$FIX_H" test-fixture-noisy-skip.sh
+OUT_H_BAD=$(bash "$FIX_H/.github/ci/shell-run-set.sh" --check-loud-skip 2>&1); RC_H_BAD=$?
+if [ "$RC_H_BAD" -ne 0 ] && printf '%s' "$OUT_H_BAD" | grep -q 'test-fixture-noisy-skip.sh'; then
+  pass "(h) PLANT: a registered iron-rule suite with no loud Skipped marker is flagged by check_loud_skip"
+else
+  fail "(h) PLANT: a registered iron-rule suite with no loud Skipped marker is flagged by check_loud_skip" "rc=$RC_H_BAD out=$OUT_H_BAD"
+fi
+
+set_iron_rule "$FIX_H" test-fixture-loud-skip.sh
+OUT_H_GOOD=$(bash "$FIX_H/.github/ci/shell-run-set.sh" --check-loud-skip 2>&1); RC_H_GOOD=$?
+if [ "$RC_H_GOOD" -eq 0 ]; then
+  pass "(h) FIX: the same registry entry pointed at a suite carrying a loud Skipped marker passes check_loud_skip"
+else
+  fail "(h) FIX: the same registry entry pointed at a suite carrying a loud Skipped marker passes check_loud_skip" "rc=$RC_H_GOOD out=$OUT_H_GOOD"
+fi
+
+# An iron-rule suite that got moved to EXCLUDE (instead of fixed in place) is
+# ALSO flagged — the whole point is that EXCLUDE would delete its only real
+# executor, not merely its (already-vacuous) CI leg.
+set_allow_exclude "$FIX_H" test-fixture-loud-skip.sh --SEP-- "test-fixture-noisy-skip.sh=known-red [blocked-by: SABLE-fixture]"
+set_iron_rule "$FIX_H" test-fixture-noisy-skip.sh
+OUT_H_EXCL=$(bash "$FIX_H/.github/ci/shell-run-set.sh" --check-loud-skip 2>&1); RC_H_EXCL=$?
+if [ "$RC_H_EXCL" -ne 0 ] && printf '%s' "$OUT_H_EXCL" | grep -q 'missing from ALLOW'; then
+  pass "(h) an iron-rule suite moved to EXCLUDE is flagged too — that would delete its only real executor (the local impact tier), not just its CI leg"
+else
+  fail "(h) an iron-rule suite moved to EXCLUDE is flagged too — that would delete its only real executor (the local impact tier), not just its CI leg" "rc=$RC_H_EXCL out=$OUT_H_EXCL"
+fi
+
+# Finally: the REAL production registry (test-dep-merge-state.sh,
+# test-overlap-dispatch-e2e.sh in the real ALLOW list) must pass today — this
+# is the actual fix this bead ships, not just the synthetic mechanism above.
+# No bd needed (pure grep), so this runs unconditionally, same as (a)-(e2).
+OUT_H_REAL=$(bash "$PROD" --check-loud-skip 2>&1); RC_H_REAL=$?
+if [ "$RC_H_REAL" -eq 0 ]; then
+  pass "(h) the real production registry passes check_loud_skip today (test-dep-merge-state.sh, test-overlap-dispatch-e2e.sh both carry a loud Skipped marker and are in ALLOW)"
+else
+  fail "(h) the real production registry passes check_loud_skip today (test-dep-merge-state.sh, test-overlap-dispatch-e2e.sh both carry a loud Skipped marker and are in ALLOW)" "rc=$RC_H_REAL out=$OUT_H_REAL"
+fi
+
+# --check itself must also fail closed on the same violation (case (a)-style
+# wiring, not just the standalone --check-loud-skip CLI).
+FIX_H2="$(new_fixture case-h-wired)"
+cp "$FIX_H/hooks/test/test-fixture-noisy-skip.sh" "$FIX_H2/hooks/test/test-fixture-noisy-skip.sh"
+set_allow_exclude "$FIX_H2" test-fixture-noisy-skip.sh --SEP--
+set_iron_rule "$FIX_H2" test-fixture-noisy-skip.sh
+OUT_H2=$(bash "$FIX_H2/.github/ci/shell-run-set.sh" --check 2>&1); RC_H2=$?
+if [ "$RC_H2" -ne 0 ] && printf '%s' "$OUT_H2" | grep -q 'loud-skip contract'; then
+  pass "(h) --check itself (the CI-wired gate) also fails closed on a loud-skip violation, not just the standalone --check-loud-skip CLI"
+else
+  fail "(h) --check itself (the CI-wired gate) also fails closed on a loud-skip violation, not just the standalone --check-loud-skip CLI" "rc=$RC_H2 out=$OUT_H2"
 fi
 
 echo
