@@ -200,6 +200,15 @@ is unit-testable without real git / gh / bd):
   SABLE_MG_IMPACT_TIMEOUT per-command secs for the combined-tree impact tier (900)
   SABLE_MG_IMPACT      impact-tier command override (testing seam; run in the
                        combined-tree worktree with the changed paths appended)
+  SABLE_MG_IMPACT_SERIALIZE 1 (SABLE-jd5fj.13; 0 = let concurrent promotes run
+                       the local impact tier at the same time. They false-RED
+                       each other when you do — the iron-rule suites share live
+                       bd/settings/worker state. Test seam, not an operator knob.)
+  SABLE_MG_IMPACT_LOCK_TIMEOUT secs to wait for that lock (3600); giving up is an
+                       impact-tier ERROR -> full re-preview, never a promotion
+  SABLE_MG_IMPACT_LOCK path override for the lock file (default: the merge-gate
+                       state dir); SABLE_MG_IMPACT_WINDOW_LOG likewise for the
+                       tier start/end window log
 
 Exit codes:
   0 promoted / preview kicked / verdict read / sweep ok    2 usage   3 precondition failed

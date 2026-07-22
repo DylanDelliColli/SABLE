@@ -69,6 +69,9 @@ optimistic path and why an unavailable tier degrades to exit 23.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import json
 import os
 import shutil
 import subprocess
@@ -341,8 +344,164 @@ def _selected_suites(worktree: str, paths: list[str]) -> list[str]:
             if ln.strip() and not ln.startswith("::")]
 
 
+# --------------------------------------------------------------------------
+# Impact-tier serialization (SABLE-jd5fj.13) — the MECHANICAL one-at-a-time rule
+# --------------------------------------------------------------------------
+
+IMPACT_LOCK_FILE = "impact-tier.lock"
+IMPACT_WINDOW_FILE = "impact-tier-windows.jsonl"
+
+
+class ImpactLockTimeout(RuntimeError):
+    """Waited longer than SABLE_MG_IMPACT_LOCK_TIMEOUT for the tier lock. Never
+    an exit code: run_impact_tier converts it to IMPACT_ERROR, which the decision
+    table already routes to a full re-preview. A tier we could not START taught
+    us nothing, exactly like a tier that could not run."""
+
+
+def impact_lock_path(repo: str | os.PathLike = ".") -> Path:
+    """Where the one-at-a-time lock lives. Per-REPO, in the merge-gate state dir
+    that sable_snapshot_lib already resolves from git-common-dir — so every
+    worktree of the same repo contends on the same file (which is the whole
+    point: the promotes that collide are chuck's, all against one seat's repo)
+    and another repo's promotes contend on their own.
+
+    SABLE_MG_IMPACT_LOCK overrides the path outright. That seam exists for tests
+    — including the negative control that proves the instrument can see overlap —
+    and NOT as a bypass: pointing it somewhere private still takes a lock, it
+    just takes a different one."""
+    override = os.environ.get("SABLE_MG_IMPACT_LOCK")
+    if override:
+        return Path(override)
+    return snapshot_lib.ensure_state_dir(repo) / IMPACT_LOCK_FILE
+
+
+def impact_serialization_enabled() -> bool:
+    """SABLE_MG_IMPACT_SERIALIZE=0 restores the pre-jd5fj.13 free-for-all.
+
+    Unlike assert_not_frozen, this DOES get a kill switch, for one reason: the
+    integration test's negative control has to observe real overlap to prove the
+    instrument is not measuring nothing. Its off-state is the state chuck was
+    already policing by hand, so turning it off loses a control rather than
+    disabling a safety assertion — but it does lose one, so it is documented
+    here and nowhere in the operator-facing flow."""
+    return os.environ.get("SABLE_MG_IMPACT_SERIALIZE", "1") not in ("0", "false", "no")
+
+
+def _impact_lock_timeout() -> float:
+    """How long a queued promote will wait for its turn. Deliberately MUCH larger
+    than _impact_timeout(): the expected wait is one whole tier ahead of us, and
+    under a burst it is several. A promote that gives up here degrades to a full
+    re-preview, which is correct but wasteful, so the bound is a runaway-holder
+    backstop rather than a queueing policy."""
+    return float(os.environ.get("SABLE_MG_IMPACT_LOCK_TIMEOUT", "3600"))
+
+
+@contextlib.contextmanager
+def impact_tier_lock(repo: str | os.PathLike = "."):
+    """Hold the exclusive impact-tier lock for the duration of the block; yield
+    the seconds spent waiting for it.
+
+    WHY A LOCK AND NOT HERMETICIZATION (SABLE-jd5fj.13, fix direction 1). The
+    iron-rule suites this tier selects are deliberately NON-HERMETIC — real bd,
+    real sable-spawn-worker, live ~/.claude/settings.json — and they both read
+    and write that shared live state. Two tiers running at once race on it and
+    false-RED each other: under a 6+ promote pile-up at the merge seat,
+    test-dep-merge-state.sh's WIRING subtest and test-overlap-dispatch-e2e.sh's
+    serialize_grant subtest went red repeatedly while passing 18/18 and 5/5
+    standalone on the same clean HEAD. Six branches were ejected that had nothing
+    wrong with them. Hermeticizing the whole iron-rule set kills the class rather
+    than queueing around it and remains the better end state; this queues, cheaply
+    and today, and preserves every suite's current semantics exactly.
+
+    It replaces a MANAGER DISCIPLINE with a CONTROL. Chuck's interim rule — "let
+    promotes reach the local impact tier one at a time" — worked and is the same
+    guidance-as-control shape SABLE-rkc3o refuted for the pinning suites: it holds
+    exactly as long as everyone remembers it, and the moment it matters most is a
+    burst, which is exactly when nobody is counting.
+
+    flock, not a pidfile: the kernel releases it when the holder dies, so a
+    crashed or killed promote cannot wedge the seat. Acquisition polls a
+    non-blocking flock rather than blocking in the kernel so the wait is bounded
+    and the give-up is a value (IMPACT_ERROR) rather than a hang."""
+    if not impact_serialization_enabled():
+        yield 0.0
+        return
+    path = impact_lock_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    deadline = started + _impact_lock_timeout()
+    with open(path, "a+") as fh:
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                waited = time.monotonic() - started
+                if time.monotonic() >= deadline:
+                    raise ImpactLockTimeout(
+                        f"waited {waited:.0f}s for the impact-tier lock {path} and it is "
+                        f"still held (SABLE_MG_IMPACT_LOCK_TIMEOUT={_impact_lock_timeout():.0f}s)"
+                    ) from None
+                time.sleep(0.05)
+        try:
+            yield time.monotonic() - started
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _stamp_impact_window(repo: str | os.PathLike, event: str, tree_sha: str,
+                         waited: float) -> None:
+    """Append one start/end record for this tier run. Best-effort and never
+    load-bearing on the verdict — it exists so a human (and
+    hooks/test/test-impact-tier-serialization.sh) can see whether two tier
+    WINDOWS overlapped, which is the only direct evidence that the lock is doing
+    its job. Overlap is invisible from suite results alone: that is precisely why
+    the pile-up read as six broken branches instead of one broken control."""
+    try:
+        path = Path(os.environ.get("SABLE_MG_IMPACT_WINDOW_LOG")
+                    or (snapshot_lib.ensure_state_dir(repo) / IMPACT_WINDOW_FILE))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(json.dumps({"event": event, "pid": os.getpid(), "at": time.time(),
+                                 "tree": tree_sha[:12], "waited": round(waited, 3)}) + "\n")
+    except OSError:
+        pass
+
+
 def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, str]:
-    """Run the cmar4 impact tier against the REAL COMBINED TREE and report
+    """Run the cmar4 impact tier against the REAL COMBINED TREE, ONE AT A TIME
+    PER SEAT (SABLE-jd5fj.13), and report (GREEN|RED|ERROR, detail).
+
+    The serialization wraps this whole function rather than living inside
+    _run_impact_tier_locked, so that the LOCK WAIT IS OUTSIDE THE TIER'S TIMEOUT
+    BUDGET. That ordering is load-bearing, not incidental: _impact_timeout() is
+    read fresh for each subprocess AFTER the lock is held, so a promote that
+    queued behind two others still gets its full SABLE_MG_IMPACT_TIMEOUT to run
+    in. Charging queue time to the tier budget would time out a queued promote
+    through no fault of its own — turning the fix for false-REDs into a new
+    source of them.
+
+    See impact_tier_lock for why the answer here is a lock and not hermetic
+    isolation, and _run_impact_tier_locked for the tier's own contract."""
+    try:
+        with impact_tier_lock(repo) as waited:
+            if waited >= 1.0:
+                print(f"sable-merge-gate: waited {waited:.0f}s for the impact-tier lock "
+                      f"(another promote held the seat) — the tier's own "
+                      f"{_impact_timeout():.0f}s budget starts now, unspent")
+            _stamp_impact_window(repo, "start", tree_sha, waited)
+            try:
+                return _run_impact_tier_locked(repo, tree_sha, paths)
+            finally:
+                _stamp_impact_window(repo, "end", tree_sha, waited)
+    except ImpactLockTimeout as exc:
+        return (IMPACT_ERROR, f"impact tier never started: {exc}")
+
+
+def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, str]:
+    """The tier itself, with the seat's serialization lock already held. Reports
     (IMPACT_GREEN|IMPACT_RED|IMPACT_ERROR, detail).
 
     "Real" is the whole point, and it is why this checks the combined commit out
