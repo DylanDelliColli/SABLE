@@ -157,7 +157,12 @@ jobs:
           # unless --testmon/--testmon-noselect or --impact is passed), so
           # installing them here changes nothing about this job's own
           # unconditional full-suite run.
-          pip install pytest pytest-testmon pytest-impact
+          # pytest-cov / diff_cover (SABLE-cmar4.5): the coverage-delta check
+          # a PRUNING diff must carry (.github/ci/diff-cover-gate.sh) shells
+          # out to real pytest-cov + diff-cover, so hooks/test/test-coverage-
+          # floor-gate.sh needs both on PATH to run for real, not mocked, in
+          # this clean-room (SABLE-59zu contract).
+          pip install pytest pytest-testmon pytest-impact pytest-cov diff_cover
 
       - name: Restore pytest-testmon coverage cache (SABLE-cmar4.3)
         if: steps.dedup.outputs.already_verified != 'true'

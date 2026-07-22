@@ -26,6 +26,11 @@ run concluded about this merge; it is a standing refusal to promote ANY merge
 until the integration branch is healthy again. Keeping it out of OUTCOME_EXIT is
 what stops it from ever being reachable by mis-reading a verdict.
 
+SABLE-cmar4.5 EXTENDS the table again with 27 (a pruning diff without a
+carried coverage-delta check) for the same reason and the same way: not an
+outcome of a CI conclusion, not in OUTCOME_EXIT, a standing refusal that is a
+property of the DIFF being promoted rather than of what Actions concluded.
+
 Nothing here shells out, touches git, or reads the environment, so every
 function is unit-testable with no fixtures at all.
 """
@@ -49,6 +54,7 @@ EXIT_CONFLICT = 22         # merge-preview conflict (delegate to author)
 EXIT_BASE_MOVED = 23       # tip moved during gate (non-ff promote) — retry-safe
 EXIT_CANCELLED = 24        # ci-verify run cancelled mid-flight — retry-safe
 EXIT_FROZEN = 25           # green-snapshot freeze in force — promotion denied (SABLE-jd5fj.5)
+EXIT_COVERAGE_FLOOR = 27   # pruning diff without a carried coverage-delta check (SABLE-cmar4.5)
 
 # Outcome names: the MEANING of a completed Actions conclusion, independent of
 # how the verdict was obtained (waited for, or read back precomputed).
