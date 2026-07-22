@@ -187,6 +187,80 @@ def test_check_manifest_unrelated_files_stay_clean_when_one_drifts(tmp_path):
     assert statuses["agent definitions"] == "clean"
 
 
+# --- installed hook syntax check (SABLE-9rj7m) ----------------------------------
+# hooks/test/test-tree-claim.sh's `bash -n` tripwire only ever checks the REPO
+# copy of a hook, never the copy-installed one at ~/.claude/hooks/ (install.sh
+# / sable-orchestration-install), so a truncated, half-written, or hand-edited
+# installed copy is invisible to every test in that suite. This is the doctor-
+# side proactive check: a second predicate over the same manifest entries the
+# drift walk already builds, not a new traversal.
+
+def test_installed_hook_syntax_error_is_reported(tmp_path, capsys):
+    def mutate(repo, claude_dir):
+        # unterminated double quote — a real parse error, not mere drift
+        (claude_dir / "hooks" / "tdd-gate.sh").write_text('#!/bin/sh\necho "unterminated\n')
+
+    repo, claude_dir = make_repo(tmp_path, mutate=mutate)
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir)])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "SYNTAX-ERROR" in out
+    assert "tdd-gate.sh" in out
+    # the intact multi-manager hook must NOT be reported — no blanket-fail
+    assert "post-push-merge-notify.sh" not in out
+
+
+def test_check_manifest_syntax_error_names_the_parse_error_in_detail(tmp_path):
+    def mutate(repo, claude_dir):
+        (claude_dir / "hooks" / "tdd-gate.sh").write_text('#!/bin/sh\necho "unterminated\n')
+
+    repo, claude_dir = make_repo(tmp_path, mutate=mutate)
+    results = doctor.check_manifest(doctor.build_manifest(repo, claude_dir))
+    hook_result = next(r for r in results if r["category"] == "hooks")
+    mm_result = next(r for r in results if r["category"] == "multi-manager hooks")
+
+    assert hook_result["status"] == "syntax-error"
+    assert hook_result["detail"]  # names the parse error, non-empty
+    assert mm_result["status"] == "clean"
+
+
+def test_check_manifest_syntax_error_wins_over_ordinary_drift_label(tmp_path):
+    # a syntax-broken installed hook is ALSO byte-different from the repo
+    # copy — the syntax-error verdict must win, since it's the louder,
+    # actionable fact (the file is broken right now, not merely stale).
+    def mutate(repo, claude_dir):
+        (claude_dir / "hooks" / "tdd-gate.sh").write_text('#!/bin/sh\necho "unterminated\n')
+        (repo / "hooks" / "tdd-gate.sh").write_text("#!/bin/sh\necho gate\necho post-fix-line\n")
+
+    repo, claude_dir = make_repo(tmp_path, mutate=mutate)
+    results = doctor.check_manifest(doctor.build_manifest(repo, claude_dir))
+    hook_result = next(r for r in results if r["category"] == "hooks")
+    assert hook_result["status"] == "syntax-error"
+
+
+def test_check_manifest_valid_hooks_stay_clean_no_blanket_fail(tmp_path):
+    repo, claude_dir = make_repo(tmp_path)
+    results = doctor.check_manifest(doctor.build_manifest(repo, claude_dir))
+    for r in results:
+        if r["category"] in doctor.HOOK_SYNTAX_CATEGORIES:
+            assert r["status"] == "clean"
+
+
+def test_bash_syntax_error_returns_none_for_valid_script(tmp_path):
+    good = tmp_path / "good.sh"
+    good.write_text("#!/bin/sh\necho hi\n")
+    assert doctor._bash_syntax_error(good) is None
+
+
+def test_bash_syntax_error_returns_message_for_broken_script(tmp_path):
+    bad = tmp_path / "bad.sh"
+    bad.write_text('#!/bin/sh\necho "unterminated\n')
+    error = doctor._bash_syntax_error(bad)
+    assert error is not None
+    assert "bad.sh" in error or "unexpected EOF" in error.lower() or error
+
+
 # --- pinned bins (SABLE-mkj6k) --------------------------------------------------
 # Defect 2 was that install.sh silently re-symlinked a deliberately pinned
 # (regular-file) spine bin, restoring the y6ik3 hot-swap hazard the pin was
@@ -618,6 +692,57 @@ def test_check_manifest_snapshot_pin_clean_for_ordinary_unpinned_symlink(tmp_pat
     results = doctor.check_manifest(entries)
     r = next(x for x in results if x["category"] == "pinned snapshot bins")
     assert r["status"] == "clean"
+
+
+# --- SABLE-8kpk8: un-pinned symlink into a DIFFERENT (sibling) checkout ---------
+# _check_snapshot_pin's "clean, ordinary un-pinned symlink" fast path only ever
+# matched an EXACT path (target == src.resolve()). On the real machine this
+# bead was filed from, real pinned-snapshot-shaped bins (sable-agents,
+# sable-msg, sable-spawn-worker, ...) are ordinary un-pinned symlinks into the
+# canonical SABLE checkout -- but running sable-doctor from a WORKER worktree
+# (its own bin/sable-doctor, rather than the installed CLI entry point that
+# resolves --repo via the symlink chain) makes --repo resolve to that
+# worktree, a different absolute path than the symlink target even though both
+# are the same commit's content. The path-only check then fell through to the
+# snapshot-sha regex, found no sable-<sha> match, and misreported plain DRIFT
+# for byte-identical, genuinely un-pinned bins. Fixed by falling back to a
+# content compare before concluding drift.
+
+def test_check_manifest_snapshot_pin_clean_when_symlink_points_at_a_different_checkout_with_identical_content(tmp_path):
+    repo, bin_dir, _sha = make_snapshot_repo(tmp_path)
+    # a second, unrelated-by-path directory holding byte-identical content --
+    # models a sibling git worktree of the same repo at the same commit.
+    sibling_bin = tmp_path / "sibling-worktree-bin"
+    sibling_bin.mkdir()
+    (sibling_bin / "sable-importer").write_bytes((bin_dir / "sable-importer").read_bytes())
+
+    bin_dir_dest = tmp_path / "local-bin"
+    bin_dir_dest.mkdir()
+    (bin_dir_dest / "sable-importer").symlink_to(sibling_bin / "sable-importer")
+
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if x["category"] == "pinned snapshot bins")
+    assert r["status"] == "clean"
+
+
+def test_check_manifest_snapshot_pin_stays_drift_when_different_checkout_content_actually_differs(tmp_path):
+    # the counterpart: a symlink into an unrecognized (non sable-<sha>)
+    # directory whose content genuinely differs must still report drift --
+    # the content-compare fallback must not paper over a real divergence.
+    repo, bin_dir, _sha = make_snapshot_repo(tmp_path)
+    sibling_bin = tmp_path / "sibling-worktree-bin"
+    sibling_bin.mkdir()
+    (sibling_bin / "sable-importer").write_text("#!/usr/bin/env python3\nprint('stale')\n")
+
+    bin_dir_dest = tmp_path / "local-bin"
+    bin_dir_dest.mkdir()
+    (bin_dir_dest / "sable-importer").symlink_to(sibling_bin / "sable-importer")
+
+    entries = doctor.build_manifest(repo, tmp_path / "claude", bin_dir_dest)
+    results = doctor.check_manifest(entries)
+    r = next(x for x in results if x["category"] == "pinned snapshot bins")
+    assert r["status"] == "drift"
 
 
 def test_check_manifest_snapshot_pin_clean_when_content_matches_pinned_sha(tmp_path):
