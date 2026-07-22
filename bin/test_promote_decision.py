@@ -32,6 +32,7 @@ import importlib.util
 import itertools
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -1019,3 +1020,96 @@ def test_entering_the_impact_tier_is_announced_even_with_no_queue_wait(isolated_
     assert "ENTERING IMPACT TIER" in out
     assert "777s" in out, "the marker must name the budget it is entitled to spend"
     assert "waited" not in out, "an uncontended run must not claim it queued"
+
+
+# --------------------------------------------------------------------------
+# Hermetic suite env (SABLE-jd5fj.15)
+# --------------------------------------------------------------------------
+#
+# jd5fj.13 only QUEUED concurrent tiers around their shared live state (real
+# bd, live ~/.claude/settings.json); it did not remove the interaction. This
+# hermeticizes it: every suite/override invocation must run under a per-run
+# BEADS_DB/HOME/TMPDIR, nested under that run's OWN scratch parent, so two
+# tiers could run at once with nothing left to race on. Verified by CAPTURING
+# the env handed to git_lib._run's subprocess rather than trusting a
+# docstring — the same style test_lock_wait_is_not_charged... above already
+# uses for the timeout budget.
+
+HAVE_BD = shutil.which("bd") is not None
+
+
+def test_the_tier_runs_suites_under_an_isolated_bd_db(isolated_lock, tmp_path, monkeypatch):
+    repo, sha = _real_repo(tmp_path)
+    monkeypatch.setenv("SABLE_MG_IMPACT", "true")
+    real_run = git_lib._run
+    seen: list[tuple[str, dict]] = []
+    guard = threading.Lock()
+
+    def spy(argv, **kw):
+        with guard:
+            seen.append((kw["cwd"], kw.get("env")))
+        return real_run(argv, **kw)
+
+    monkeypatch.setattr(git_lib, "_run", spy)
+
+    # Two calls that could equally well be concurrent (the lock in
+    # isolated_lock still serializes them, exactly like S1 above — this test
+    # is about per-run ISOLATION, not overlap, which the integration suite
+    # covers) — each must build its own scratch parent from scratch.
+    results: list[tuple[str, str]] = []
+    barrier = threading.Barrier(2)
+
+    def go():
+        barrier.wait()
+        results.append(promote_lib.run_impact_tier(repo, sha, ["bin/thing.py"]))
+
+    threads = [threading.Thread(target=go) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert all(not t.is_alive() for t in threads), "an impact-tier thread never finished"
+    assert results == [(promote_lib.IMPACT_GREEN, "impact tier override reported green")] * 2, results
+
+    envs = [(cwd, env) for cwd, env in seen if env is not None]
+    assert len(envs) == 2, f"expected one env-carrying invocation per run, got {seen}"
+
+    real_home = os.environ.get("HOME")
+    for cwd, env in envs:
+        scratch_parent = str(Path(cwd).parent)
+        assert env["HOME"].startswith(scratch_parent + os.sep), (
+            f"HOME={env['HOME']!r} is not inside this run's own scratch parent {scratch_parent!r}")
+        assert env["HOME"] != real_home, "the isolated HOME must not be the real one"
+        if HAVE_BD:
+            assert "BEADS_DB" in env, "bd is on PATH, so this run must have an isolated BEADS_DB"
+            assert env["BEADS_DB"].startswith(scratch_parent + os.sep), (
+                f"BEADS_DB={env['BEADS_DB']!r} is not inside this run's own scratch "
+                f"parent {scratch_parent!r}")
+            assert not env["BEADS_DB"].startswith(repo), (
+                "BEADS_DB must not point inside the gate's own repo")
+
+    parents = {str(Path(cwd).parent) for cwd, _env in envs}
+    assert len(parents) == 2, (
+        f"two concurrent run_impact_tier calls shared a scratch parent: {parents}")
+
+
+@pytest.mark.skipif(not HAVE_BD, reason="nothing to isolate a bd DB from without bd on PATH")
+def test_bd_absent_env_still_isolates_home_but_bd_present_isolates_beads_db(tmp_path,
+                                                                            monkeypatch):
+    """The audited gap this bead closes: several suites self-skip on `command -v
+    bd` (bd ABSENT), not on whether BEADS_DB was redirected. So the isolated env
+    must never point BEADS_DB at a DB it could not build — only ever set it once
+    bd init on that path actually succeeded."""
+    env = promote_lib._impact_isolated_env(tmp_path)
+    assert "BEADS_DB" in env
+    beads_db = Path(env["BEADS_DB"])
+    assert beads_db.is_relative_to(tmp_path)
+    # The isolated DB must actually be USABLE, not merely present as a path —
+    # this is the exact "redirected to an uninitialized DB" gap the WHERE note
+    # in the bead flags: an uninitialized DB fails bd create, and several call
+    # sites read that failure as "skip" rather than "the redirect is broken".
+    created = subprocess.run(
+        ["bd", "create", "--sandbox", "-q", "--title=isolated-env probe"],
+        cwd=str(tmp_path), env={**os.environ, "BEADS_DB": str(beads_db)},
+        text=True, capture_output=True, timeout=30)
+    assert created.returncode == 0, created.stdout + created.stderr
