@@ -109,6 +109,50 @@ def load_python_test_coverage(coverage_data_file: Path) -> dict[str, set[tuple[s
     return coverage_map
 
 
+# Exit codes that mean the inner pytest run itself functioned -- durations
+# and coverage were genuinely produced -- even if the run's verdict wasn't a
+# clean pass. 0 (all tests passed) and 1 (some tests failed) both still walk
+# every test body and emit a real --durations report and real per-test
+# coverage contexts, so this tool's duration/coverage measurement is valid
+# either way. Anything else (2 interrupted, 3 internal error -- the exact
+# INTERNALERROR class that crashed this run in ci-verify run 29936760714 and
+# 29940963862, 4 usage error, 5 no tests collected) means the run did NOT
+# produce trustworthy output, and treating its (empty) stdout as "zero slow
+# tests" would be exactly the silent-empty-result failure SABLE-cmar4.7 and
+# SABLE-cmar4.8 exist to prevent (SABLE-cmar4.6 third revise).
+_INNER_RUN_OK_EXIT_CODES = frozenset({0, 1})
+
+
+class InnerPytestRunFailed(RuntimeError):
+    """Raised when run_python_suite_with_coverage's inner pytest invocation
+    exits with a code outside _INNER_RUN_OK_EXIT_CODES -- i.e. the run
+    itself is suspect (crashed, was interrupted, hit a usage error, or
+    collected nothing), not merely "some tests failed". Before this existed,
+    that condition silently produced ({}, {}) -- a returncode/stderr that was
+    never inspected (verified absent at 67e3a13, af95ffa, and cdbf58e) --
+    which is precisely why three ci-verify reds (runs 29936760714 and
+    29940963862 for this same empty-durations symptom) were undiagnosable
+    from CI's own output. Carries the returncode plus a bounded stdout/stderr
+    tail so the real cause prints instead of a bare KeyError/AssertionError
+    against an empty dict downstream."""
+
+    _TAIL_LINES = 40
+
+    def __init__(self, returncode: int, stdout: str, stderr: str):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        stdout_tail = "\n".join(stdout.splitlines()[-self._TAIL_LINES:])
+        stderr_tail = "\n".join(stderr.splitlines()[-self._TAIL_LINES:])
+        super().__init__(
+            f"inner pytest run exited {returncode} (not in "
+            f"{sorted(_INNER_RUN_OK_EXIT_CODES)} -- run did not produce "
+            f"trustworthy duration/coverage output)\n"
+            f"--- stdout tail ({self._TAIL_LINES} lines) ---\n{stdout_tail}\n"
+            f"--- stderr tail ({self._TAIL_LINES} lines) ---\n{stderr_tail}"
+        )
+
+
 def run_python_suite_with_coverage(
     repo_root: Path,
     test_targets: list[str],
@@ -162,7 +206,19 @@ def run_python_suite_with_coverage(
 
     `-p no:impact` (pytest-impact) is excluded for the same defense-in-depth
     reason even though no crash was attributed to it -- it has no business
-    in a coverage-measurement run either, and costs nothing to exclude."""
+    in a coverage-measurement run either, and costs nothing to exclude.
+
+    Third revise (SABLE-cmar4.6/SABLE-cmar4.8): the two exclusions above were
+    verified to fix the nested full-bin/-suite reproduction locally, but
+    ci-verify went RED on the exact same empty-durations symptom AGAIN on the
+    next push (run 29940963862, byte-identical to the first). The inner
+    run's `result.returncode` and `result.stderr` were never inspected up to
+    that point, so whatever is failing in CI's environment -- unconfirmed,
+    that is the open question this instrument exists to answer -- was
+    collapsing silently into a normal-looking ({}, {}) return instead of
+    surfacing. See InnerPytestRunFailed and _INNER_RUN_OK_EXIT_CODES above:
+    a non-tolerated returncode now raises with the real stdout/stderr tail
+    instead of being swallowed."""
     env = dict(os.environ)
     env["COVERAGE_FILE"] = str(coverage_data_file)
     args = [
@@ -176,6 +232,8 @@ def run_python_suite_with_coverage(
         "-p", "no:impact",
     ]
     result = subprocess.run(args, cwd=repo_root, capture_output=True, text=True, env=env)
+    if result.returncode not in _INNER_RUN_OK_EXIT_CODES:
+        raise InnerPytestRunFailed(result.returncode, result.stdout, result.stderr)
     durations = parse_pytest_durations(result.stdout)
     coverage_map = load_python_test_coverage(coverage_data_file)
     return durations, coverage_map
