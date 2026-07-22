@@ -72,6 +72,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -397,6 +398,86 @@ def _impact_lock_timeout() -> float:
     return float(os.environ.get("SABLE_MG_IMPACT_LOCK_TIMEOUT", "3600"))
 
 
+# --------------------------------------------------------------------------
+# The derivable promote budget (SABLE-w0zjm)
+# --------------------------------------------------------------------------
+
+BUDGET_HEADROOM = 1.2
+"""Multiplier applied to the worst case to get a RECOMMENDED enclosing timeout.
+
+Deliberately modest and NOT an env knob. The headroom exists to cover the gate's
+non-tier work (fetch, preview read, push) and clock slop, not to paper over a
+mis-sized budget: if a wrapper needs materially more than this, the honest fix is
+to raise SABLE_MG_IMPACT_TIMEOUT / SABLE_MG_IMPACT_LOCK_TIMEOUT so the number the
+wrapper derives is the number the gate actually intends to spend."""
+
+
+def impact_budget() -> dict:
+    """The gate's own worst-case promote wall-clock, so an ENCLOSING wrapper can
+    DERIVE its timeout instead of hardcoding one (SABLE-w0zjm).
+
+    WHY THIS IS A FUNCTION AND NOT A DOC LINE. Chuck ran every promote inside a
+    900s wrapper — the SAME number as the default SABLE_MG_IMPACT_TIMEOUT. That
+    was harmless only while the impact tier essentially never ran (0 optimistic
+    paths in 157 promotions). SABLE-jd5fj.4 deliberately moved cost from GitHub's
+    CI into the local promote, and SABLE-jd5fj.13 then added a queue in front of
+    it. A CHANGE THAT MOVES COST ACROSS A PROCESS BOUNDARY INVALIDATES EVERY
+    TIMEOUT SIZED AGAINST THE OLD BEHAVIOUR — and those timeouts live OUTSIDE this
+    repo, in operator wrappers, where no repo-side test can ever see them. The
+    only structural fix is to stop them being a second copy of the number.
+
+    THE WORST CASE IS A SUM, NOT THE TIER BUDGET. The lock wait is deliberately
+    EXCLUDED from the tier's own budget (see run_impact_tier — a queued promote
+    still gets its full tier budget, which is correct and must not be "fixed"), so
+    a promote can spend LOCK WAIT + TIER, i.e. ~4500s on stock defaults. A wrapper
+    sized to the tier budget alone is MORE wrong after jd5fj.13, not less: under a
+    burst the queue wait alone can exceed it.
+
+    Reported in seconds:
+      tier_timeout_s  SABLE_MG_IMPACT_TIMEOUT — the tier's own run budget.
+      lock_timeout_s  SABLE_MG_IMPACT_LOCK_TIMEOUT — how long a promote will
+                      queue for the seat. 0 when serialization is off, because
+                      then there is no queue to wait in.
+      worst_case_s    their sum: the longest a promote may legitimately take.
+      recommended_wrapper_timeout_s   worst_case_s * BUDGET_HEADROOM, rounded up.
+                      This is the number a wrapper should use.
+      serialized      whether the queue is in play at all."""
+    tier = _impact_timeout()
+    lock = _impact_lock_timeout() if impact_serialization_enabled() else 0.0
+    worst = tier + lock
+    return {
+        "tier_timeout_s": tier,
+        "lock_timeout_s": lock,
+        "worst_case_s": worst,
+        "recommended_wrapper_timeout_s": int(math.ceil(worst * BUDGET_HEADROOM)),
+        "serialized": impact_serialization_enabled(),
+    }
+
+
+def format_impact_budget(budget: dict) -> str:
+    """Human-readable breakdown. Says which number is which, because the failure
+    this prevents is a wrapper sized against the wrong one."""
+    q = (f"queue wait   {budget['lock_timeout_s']:.0f}s  (SABLE_MG_IMPACT_LOCK_TIMEOUT)"
+         if budget["serialized"] else
+         "queue wait     0s  (serialization OFF — SABLE_MG_IMPACT_SERIALIZE=0)")
+    return "\n".join([
+        "sable-merge-gate promote budget:",
+        f"  {q}",
+        f"  impact tier  {budget['tier_timeout_s']:.0f}s  (SABLE_MG_IMPACT_TIMEOUT, "
+        f"starts AFTER the queue wait — it is not charged the wait)",
+        f"  worst case   {budget['worst_case_s']:.0f}s  (queue + tier)",
+        f"  RECOMMENDED enclosing wrapper timeout: "
+        f"{budget['recommended_wrapper_timeout_s']}s",
+        "",
+        "Any timeout wrapping `sable-merge-gate promote` MUST exceed the worst case.",
+        "Derive it — `timeout \"$(sable-merge-gate promote-budget --seconds)\"",
+        "sable-merge-gate promote ...` — do not copy the number, or the two drift",
+        "apart (SABLE-w0zjm).",
+        "A wrapper kill mid-tier is SAFE (nothing is pushed before a green verdict)",
+        "but reads as a path malfunction, so it is misdiagnosed rather than noticed.",
+    ])
+
+
 @contextlib.contextmanager
 def impact_tier_lock(repo: str | os.PathLike = "."):
     """Hold the exclusive impact-tier lock for the duration of the block; yield
@@ -490,7 +571,27 @@ def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, st
             if waited >= 1.0:
                 print(f"sable-merge-gate: waited {waited:.0f}s for the impact-tier lock "
                       f"(another promote held the seat) — the tier's own "
-                      f"{_impact_timeout():.0f}s budget starts now, unspent")
+                      f"{_impact_timeout():.0f}s budget starts now, unspent",
+                      flush=True)
+            # SABLE-w0zjm (c): an UNCONDITIONAL in-tier marker, so a promote killed
+            # from OUTSIDE is diagnosable after the fact instead of mysterious. The
+            # jd5fj.13 line above only fires on a wait of 1s or more, which is
+            # exactly the uncontended case where a wrapper kill looks most like the
+            # optimistic path malfunctioning. Naming the budget here means the last
+            # line before the silence says how long the silence was entitled to be.
+            #
+            # flush=True IS THE FEATURE, not tidiness. stdout is block-buffered
+            # whenever the gate is piped or captured — which is how every operator
+            # wrapper runs it — so an unflushed marker dies in the buffer with the
+            # process that a wrapper timeout kills, i.e. it is absent from exactly
+            # the one transcript it exists to explain. C7 in
+            # hooks/test/test-optimistic-promotion.sh caught this: the assertion
+            # failed with EMPTY output while the kill itself behaved correctly.
+            print(f"sable-merge-gate: ENTERING IMPACT TIER (budget "
+                  f"{_impact_timeout():.0f}s) — if this promote dies without a "
+                  f"verdict line, suspect an enclosing wrapper timeout before the "
+                  f"tier itself (see `sable-merge-gate promote-budget`)",
+                  flush=True)
             _stamp_impact_window(repo, "start", tree_sha, waited)
             try:
                 return _run_impact_tier_locked(repo, tree_sha, paths)
