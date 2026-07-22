@@ -216,6 +216,34 @@ def shift_report_bd_sandbox(tmp_path_factory):
     return {"work": work, "closes": close_ids, "report": report_id}
 
 
+@pytest.fixture
+def shift_ledger_bd_sandbox(tmp_path_factory):
+    """A real sandbox beads DB, rooted under its own tmp_path (no shared
+    ancestor with REPO_ROOT, so bd's cwd-based auto-discovery can never
+    resolve into the live production DB) -- proves file_shift_ledger_bead's
+    real `bd create` lands only in the sandbox (SABLE-j0vr: a prior test
+    suite's real bd invocation filed durable P1 beads into the production
+    pool by skipping this isolation)."""
+    root = tmp_path_factory.mktemp("shiftledger")
+    work = root / "work"
+    work.mkdir()
+    home = root / "home"
+    home.mkdir()
+    _robust_bd_init(work, home)
+
+    def create(title):
+        cp = _bd_run(work, home, "create", "--sandbox", "--json",
+                     "--title", title, "--type=task", "--priority=2",
+                     "--description", f"seed fixture bead: {title}")
+        return json.loads(cp.stdout)["id"]
+
+    close_id = create("SEED: ordinary close for ledger shift metrics")
+    _bd_run(work, home, "close", close_id, "--sandbox",
+           "--reason", "seed: ledger shift close")
+
+    return {"work": work, "home": home, "closed": close_id}
+
+
 def test_cli_runs_and_prints_json():
     result = _run([str(CLI), "--shift", "--json"])
     payload = json.loads(result.stdout)
@@ -333,6 +361,84 @@ def test_shift_report_closes_per_day_matches_seeded_bd_db(shift_report_bd_sandbo
     assert today.intake == 3  # 2 ordinary closes + 1 shift-report bead
     assert today.net_burn == today.closes - today.intake
     assert today.shift_report_ids == (ids["report"],)
+
+
+@pytest.mark.skipif(
+    not HAVE_BD,
+    reason="ci-verify clean-room has no bd/dolt by design; real-bd integration self-skips",
+)
+def test_shift_ledger_auto_file_writes_real_bead_to_sandbox_only(shift_ledger_bd_sandbox):
+    """SABLE-8b41.8 AUTO-FILE, via the library function directly: a real
+    `bd create` lands a shift-telemetry ledger bead in the sandbox DB with
+    the right fields, and the SAME real, captured signature (never a
+    hand-written guess at the expected title/label shape -- SABLE-5lli.7)
+    is then proven absent from the live production db, attributed by that
+    exact signature rather than a before/after global count (SABLE-3mrv3: a
+    bare count can't attribute a delta; a concurrent filer elsewhere would
+    false-RED it)."""
+    ids = shift_ledger_bd_sandbox
+    work, home = str(ids["work"]), ids["home"]
+    env = _bd_env(home)
+
+    records = bd_source.fetch_bead_records(cwd=work)
+    report = lib.build_shift_report(records, tz=timezone.utc)
+
+    ledger_id = lib.file_shift_ledger_bead(report, cwd=work, env=env)
+
+    show = subprocess.run(
+        ["bd", "show", ledger_id, "--json"], cwd=work, env=env,
+        capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
+    )
+    filed = json.loads(show.stdout)[0]
+
+    assert lib.SHIFT_TELEMETRY_LABEL in filed["labels"]
+    assert "origin:operator" in filed["labels"]
+    assert filed["title"].startswith(lib.SHIFT_TELEMETRY_TITLE_PREFIX)
+    assert "closes" in filed["description"]
+
+    signature = filed["title"]  # the real captured ledger signature
+
+    live = subprocess.run(
+        ["bd", "list", "--all", "--json", "--limit", "0"], cwd=str(REPO_ROOT),
+        capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
+    )
+    live_titles = {r.get("title") for r in json.loads(live.stdout)}
+    assert signature not in live_titles
+
+
+@pytest.mark.skipif(
+    not HAVE_BD,
+    reason="ci-verify clean-room has no bd/dolt by design; real-bd integration self-skips",
+)
+def test_cli_shift_file_flag_writes_real_ledger_bead(shift_ledger_bd_sandbox):
+    """Same AUTO-FILE contract, end to end through the real `sable-telemetry
+    --shift --file` CLI subprocess rather than calling the library function
+    directly -- proves the CLI wiring (not just the lib function) lands in
+    the sandbox only."""
+    ids = shift_ledger_bd_sandbox
+    work, home = str(ids["work"]), ids["home"]
+    env = _bd_env(home)
+
+    result = subprocess.run(
+        [str(CLI), "--shift", "--file"], cwd=work, env=env,
+        capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
+    )
+    assert "filed shift-telemetry ledger bead" in result.stderr
+    ledger_id = result.stderr.strip().rsplit(" ", 1)[-1]
+
+    show = subprocess.run(
+        ["bd", "show", ledger_id, "--json"], cwd=work, env=env,
+        capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
+    )
+    filed = json.loads(show.stdout)[0]
+    assert lib.SHIFT_TELEMETRY_LABEL in filed["labels"]
+
+    live = subprocess.run(
+        ["bd", "list", "--all", "--json", "--limit", "0"], cwd=str(REPO_ROOT),
+        capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
+    )
+    live_titles = {r.get("title") for r in json.loads(live.stdout)}
+    assert filed["title"] not in live_titles
 
 
 @pytest.mark.skipif(

@@ -21,7 +21,9 @@ are wired in.
 """
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, tzinfo
@@ -106,15 +108,110 @@ def trend_report_to_dict(r: TrendReport) -> dict:
     return {"window": r.window, "metrics": [metric_to_dict(m) for m in r.metrics]}
 
 
-def build_shift_report(since: str | None = None) -> ShiftReport:
-    """Foundation stub — no source adapter is wired yet (SABLE-8b41.2/.3/.4),
-    so this always returns an empty, well-typed report."""
-    return ShiftReport(since=since, metrics=())
+def build_shift_report(
+    bead_records: Iterable["BeadRecord"] = (),
+    merge_events: Iterable["MergeEvent"] = (),
+    ci_events: Iterable["CiRunEvent"] = (),
+    since: str | None = None,
+    tz: tzinfo | None = None,
+) -> ShiftReport:
+    """Compose one shift's metrics (SABLE-8b41.8 surfacing) from already
+    -fetched adapter records: closes/intake/net-burn for the window plus the
+    S2 cycle-split denominator (always printed — see
+    denominator_invariant_string — even when the window has no closed beads
+    at all, per the same "never silently omit" philosophy as the S4 gap-day
+    backfill).
+
+    The window defaults to today's host-local calendar day (`since=None`);
+    `since` narrows it to activity at/after that instant — either a full
+    ISO-8601 timestamp or a bare YYYY-MM-DD date (host-local midnight of
+    that date). Adapters are the caller's job to fetch (main() in
+    bin/sable-telemetry); this function only composes what it is given, so
+    it stays unit-testable against synthetic records with no bd/git/gh
+    subprocess in the loop."""
+    records = list(bead_records)
+    window_start = _resolve_shift_window_start(since, tz)
+
+    intake_in_window = [b for b in records if _in_window(b.created_at, window_start)]
+    closed_in_window = [
+        b for b in records
+        if b.status == "closed" and _in_window(b.closed_at, window_start)
+    ]
+
+    closes_count = len(closed_in_window)
+    intake_count = len(intake_in_window)
+
+    cycle = build_cycle_split_report(closed_in_window, merge_events, ci_events)
+
+    metrics = [
+        MetricRecord(name="closes", value=float(closes_count), unit="count"),
+        MetricRecord(name="intake", value=float(intake_count), unit="count"),
+        MetricRecord(
+            name="net_burn", value=float(net_burn(closes_count, intake_count)),
+            unit="count",
+        ),
+        MetricRecord(
+            name="cycle_split_dispatched", value=float(cycle.dispatched_count),
+            unit="count",
+            meta={"closed_count": cycle.closed_count, "note": cycle.denominator_note},
+        ),
+    ]
+    share = cycle.merge_queue_wait_share
+    if share is not None:
+        metrics.append(MetricRecord(
+            name="merge_queue_wait_share", value=share, unit="fraction",
+            meta={"note": cycle.denominator_note},
+        ))
+
+    return ShiftReport(since=since, metrics=tuple(metrics))
 
 
-def build_trend_report(window: str = "7d") -> TrendReport:
-    """Foundation stub — see build_shift_report."""
-    return TrendReport(window=window, metrics=())
+_TREND_WINDOW_RE = re.compile(r"^(\d+)d$")
+
+
+def parse_trend_window(window: str) -> int:
+    """Parse a trend window like '7d' into its day count. Only day-suffixed
+    windows are supported — the architecture's trend spine is calendar
+    days (host-local), not hours/weeks."""
+    m = _TREND_WINDOW_RE.match(window)
+    if not m:
+        raise ValueError(f"unsupported trend window {window!r}; expected e.g. '7d'")
+    return int(m.group(1))
+
+
+def build_trend_report(
+    window: str = "7d",
+    bead_records: Iterable["BeadRecord"] = (),
+    tz: tzinfo | None = None,
+) -> TrendReport:
+    """Compose the S4 trend report: the full backfilled daily-burn spine
+    (build_daily_burn_series — zero-activity gap days included, never
+    skipped) truncated to the trailing `window` days, plus a total net-burn
+    summary across whatever days remain after truncation."""
+    n_days = parse_trend_window(window)
+    series = build_daily_burn_series(bead_records, tz=tz)
+    if n_days > 0 and len(series) > n_days:
+        series = series[-n_days:]
+
+    metrics = [
+        MetricRecord(
+            name="daily_net_burn", value=float(day.net_burn), unit="count/day",
+            meta={
+                "date": day.date, "closes": day.closes, "intake": day.intake,
+                "shift_report_ids": list(day.shift_report_ids),
+            },
+        )
+        for day in series
+    ]
+    total_closes = sum(d.closes for d in series)
+    total_intake = sum(d.intake for d in series)
+    metrics.append(MetricRecord(
+        name="total_net_burn", value=float(net_burn(total_closes, total_intake)),
+        unit="count",
+        meta={"days": len(series), "total_closes": total_closes, "total_intake": total_intake},
+    ))
+
+    return TrendReport(window=window, metrics=tuple(metrics))
 
 
 # ---------------------------------------------------------------------------
@@ -356,3 +453,133 @@ def build_daily_burn_series(
         )
         day += timedelta(days=1)
     return tuple(series)
+
+
+# ---------------------------------------------------------------------------
+# Surfacing: --shift/--trend output formatting + auto-filed shift-telemetry
+# ledger bead (SABLE-8b41.8)
+#
+# ARCHITECTURE (architecture.json, "Surfacing: CLI engine + auto-filed
+# shift-ledger bead"): one compute path (build_shift_report/build_trend_report
+# above), two surfaces -- pullable stdout/--json (format_* below) and a
+# durable ledger bead (file_shift_ledger_bead). SABLE-sn20 (session-end
+# protocol) is not live yet, so the ledger is filed via an explicit `--file`
+# flag rather than an automatic wind-down trigger; the sn20-integrated
+# auto-trigger is a follow-up once sn20 lands.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_shift_window_start(since: str | None, tz: tzinfo | None) -> datetime:
+    """The shift window's start instant. `since=None` means today's
+    host-local midnight (the same HOST-LOCAL convention as day_bucket,
+    architecture.json's Shift-boundary decision); `since` given accepts
+    either a full ISO-8601 timestamp or a bare YYYY-MM-DD date (that date's
+    host-local midnight)."""
+    now = datetime.now(tz) if tz is not None else datetime.now().astimezone()
+    if since is None:
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        return _parse_iso(since)
+    except ValueError:
+        d = date.fromisoformat(since)
+        return datetime(d.year, d.month, d.day, tzinfo=now.tzinfo)
+
+
+def _in_window(ts: str | None, window_start: datetime) -> bool:
+    """Whether ISO timestamp `ts` falls at/after `window_start`. A missing
+    timestamp (None) is never in-window -- it has no activity to attribute."""
+    if ts is None:
+        return False
+    return _parse_iso(ts) >= window_start
+
+
+def format_metrics_table(metrics: tuple[MetricRecord, ...]) -> str:
+    """The --shift/--trend human-readable table: one row per metric, with
+    any denominator/invariant note appended as a trailing comment so it is
+    never silently dropped from the human path (architecture.json S2
+    invariant -- the note must render wherever a cycle-time-derived figure
+    does). Empty input renders an explicit placeholder rather than a blank
+    string, matching the "never silently omit" convention the S4 gap-day
+    backfill established."""
+    if not metrics:
+        return "(no metrics)"
+    rows = []
+    for m in metrics:
+        row = f"{m.name:<28} {m.value!s:>14} {m.unit}"
+        note = m.meta.get("note") if m.meta else None
+        if note:
+            row += f"   # {note}"
+        rows.append(row)
+    return "\n".join(rows)
+
+
+def format_shift_report_human(report: ShiftReport) -> str:
+    scope = report.since or "today (host-local)"
+    return f"sable-telemetry --shift (since={scope})\n" + format_metrics_table(report.metrics)
+
+
+def format_trend_report_human(report: TrendReport) -> str:
+    return f"sable-telemetry --trend ({report.window})\n" + format_metrics_table(report.metrics)
+
+
+# shift-telemetry ledger beads are a distinct artifact from the human
+# "[SHIFT REPORT] ..." overlay-marker beads SHIFT_REPORT_TITLE_RE matches
+# (build_daily_burn_series's event markers) -- this prefix must never match
+# that regex, or the ledger beads this bead auto-files would start feeding
+# back into the trend spine's overlay markers as if a human had filed a
+# shift report.
+SHIFT_TELEMETRY_LABEL = "shift-telemetry"
+SHIFT_TELEMETRY_TITLE_PREFIX = "shift-telemetry:"
+
+
+def build_shift_ledger_title(report: ShiftReport, tz: tzinfo | None = None) -> str:
+    scope = report.since or (
+        datetime.now(tz) if tz is not None else datetime.now().astimezone()
+    ).date().isoformat()
+    return f"{SHIFT_TELEMETRY_TITLE_PREFIX} shift ledger ({scope})"
+
+
+def build_shift_ledger_description(report: ShiftReport) -> str:
+    return (
+        "Auto-filed shift-telemetry ledger -- the lightweight wind-down "
+        "convention SABLE-8b41.8 ships ahead of SABLE-sn20's session-end "
+        "auto-trigger (architecture.json 'Surfacing' decision).\n\n"
+        f"{format_shift_report_human(report)}\n\n"
+        f"JSON:\n{json.dumps(shift_report_to_dict(report), indent=2)}"
+    )
+
+
+def file_shift_ledger_bead(
+    report: ShiftReport,
+    cwd: str | None = None,
+    env: dict | None = None,
+    origin: str = "operator",
+    bd_bin: str = "bd",
+) -> str:
+    """File `report` as a durable shift-telemetry ledger bead via a real
+    `bd create` -- SABLE-8b41.8's wind-down-convention fallback while
+    SABLE-sn20's session-end protocol isn't live yet. Returns the new bead's
+    id.
+
+    `origin` defaults to "operator" (a human ran `--file`); pass
+    "planned" once a future sn20-integrated auto-trigger calls this
+    programmatically instead. `cwd`/`env` let callers (and tests) target an
+    isolated sandbox DB instead of always writing into whatever DB the
+    current process happens to be sitting in -- SABLE-j0vr: a prior test
+    suite's real bd-invoking test filed durable beads into the production
+    pool by skipping this isolation."""
+    if origin not in ORIGIN_LABELS:
+        raise ValueError(
+            f"origin {origin!r} is not in the single-source origin: taxonomy "
+            f"{ORIGIN_LABELS!r}"
+        )
+    title = build_shift_ledger_title(report)
+    description = build_shift_ledger_description(report)
+    result = subprocess.run(
+        [bd_bin, "create", "--title", title, "--type=task", "--priority=3",
+         "--labels", f"{SHIFT_TELEMETRY_LABEL},origin:{origin}",
+         "--description", description, "--json"],
+        capture_output=True, text=True, check=True, cwd=cwd, env=env,
+        stdin=subprocess.DEVNULL,
+    )
+    return json.loads(result.stdout)["id"]
