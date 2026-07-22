@@ -47,12 +47,26 @@ cat > "$HOME_NOFLAG/.claude/settings.json" <<'JSON'
 { "env": {} }
 JSON
 
+# Non-git scratch CWD for run_launch invocations (SABLE-jd5fj.14): the suite's
+# own CWD is inside this repo checkout, which may carry an untracked project
+# registry (.claude/sable/agents.yaml, gitignored local install state) that
+# resolves via git common-dir from ANY worktree of this repo. Running the
+# session-form subtests from the suite's inherited CWD therefore exercises
+# whatever scope the checkout happens to carry instead of the default resolver
+# path on a known-clean tree. Every run_launch invocation cd's into this fixed,
+# non-git scratch dir so the default (no-override) resolution path is always
+# exercised against a clean tree, regardless of where the suite itself runs
+# from. Tests that deliberately need a poisoned/git CWD (session name
+# derivation, the v1 fleet-boundary fixtures) bypass run_launch and cd their
+# own fixture repos directly.
+RUN_LAUNCH_CWD="$(mktemp -d)"
+
 # run <label> <home> <env_prefix> <args...> -> sets OUT/ERR/CODE globals
 run_launch() {
   local home="$1" env_prefix="$2"; shift 2
   local tmpout tmperr
   tmpout=$(mktemp); tmperr=$(mktemp)
-  env -i PATH="$STUB_BIN:$PATH" HOME="$home" $env_prefix bash "$LAUNCH" "$@" >"$tmpout" 2>"$tmperr"
+  ( cd "$RUN_LAUNCH_CWD" && env -i PATH="$STUB_BIN:$PATH" HOME="$home" $env_prefix bash "$LAUNCH" "$@" ) >"$tmpout" 2>"$tmperr"
   CODE=$?
   OUT=$(cat "$tmpout"); ERR=$(cat "$tmperr")
   rm -f "$tmpout" "$tmperr"
@@ -106,6 +120,33 @@ if [ "$CODE" -eq 0 ] && ! printf '%s' "$OUT" | grep -q "STUB_ATTACH=1" && grep -
 else
   fail "--no-attach brings up the session without attaching" "out=[$OUT] err=[$ERR] code=$CODE"
 fi
+
+# 3c. planted-poison control (SABLE-jd5fj.14): the session-form subtests above
+#     must stay green even when the SUITE's own CWD sits inside a repo that
+#     carries its own untracked project registry (mirrors the live merge-seat
+#     checkout, which is exactly this state) and HOME has no global install.
+#     Without run_launch's scratch-CWD hermeticity this reproduces the exact
+#     seat failure: FLEET_PROJECT_ONLY_REMEDY (exit 3) instead of PASS.
+POISON_TOP="$(mktemp -d)"; POISON_REPO="$POISON_TOP/poison"
+mkdir -p "$POISON_REPO/.claude/sable"
+git init -q "$POISON_REPO" 2>/dev/null
+cat > "$POISON_REPO/.claude/sable/agents.yaml" <<'YAML'
+agents:
+  optimus:
+    type: epic_manager
+YAML
+POISON_HOME="$(mktemp -d)"   # isolated HOME — no global install (worst case)
+
+cd "$POISON_REPO" || exit 1
+run_launch "$POISON_HOME" "TMUX_LOG=$WORK/tp.log ST_LOG=$WORK/sp.log STUB_HAS_SESSION=1 SABLE_TMUX_BIN=$STUB_BIN/sable-tmux-rec"
+cd "$REPO" || exit 1
+if [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "STUB_ATTACH=1" \
+   && grep -q -- "--roles lincoln" "$WORK/sp.log" 2>/dev/null; then
+  pass "session-form stays green when the suite's CWD sits inside a poisoned project-registry repo"
+else
+  fail "session-form stays green when the suite's CWD sits inside a poisoned project-registry repo" "out=[$OUT] err=[$ERR] code=$CODE sp=[$(cat "$WORK/sp.log" 2>/dev/null)]"
+fi
+rm -rf "$POISON_TOP" "$POISON_HOME"
 
 # 3b. per-repo derivation (SABLE-e1e3.2): from a repo named 'alpha' with no
 #     SABLE_TMUX_SESSION, the derived session sable-alpha reaches sable-tmux
@@ -281,7 +322,7 @@ else
 fi
 
 # Cleanup
-rm -rf "$STUB_BIN" "$HOME_FLAG" "$HOME_NOFLAG"
+rm -rf "$STUB_BIN" "$HOME_FLAG" "$HOME_NOFLAG" "$RUN_LAUNCH_CWD"
 
 echo
 echo "=========================================="
