@@ -3,16 +3,18 @@ name: columbo
 description: |
   Interview-driven test-coverage planning. Drag boundary cases, failure modes,
   and regression-from-experience cases out of your head before TDD ships
-  happy-path-only suites. Four modes: `/columbo --feature "<desc>"` for new
+  happy-path-only suites. Five modes: `/columbo --feature "<desc>"` for new
   feature work, `/columbo --bead SABLE-xxx` to enrich an existing bead,
   `/columbo --audit <path>` to find shallow tests in an existing module,
   `/columbo --epic SABLE-xxx` to review the test architecture of a
   planned epic (or any parent bead with children) before workers start
-  implementation, and `/columbo --quick "<scope>"` for a non-interview
-  test-spec on a small ask (quick-tier /sable-plan).
+  implementation, `/columbo --quick "<scope>"` for a non-interview
+  test-spec on a small ask (quick-tier /sable-plan), and
+  `/columbo --cost-audit [path]` to rank existing tests by duration vs
+  unique coverage contributed and propose pruning candidates.
   Use when asked to "scope tests", "plan test coverage", "what should I test",
   "audit this for shallow tests", "review the test architecture of this epic",
-  or "/columbo".
+  "which tests are slow and redundant", "test-cost audit", or "/columbo".
   Work-machine variant: produces real `columbo-test-spec` / `columbo-test-gap`
   beads via `bd create` plus skeleton test files. Does NOT require the SABLE
   multi-manager pattern (no agent identity, no inbox, no coordination hooks).
@@ -54,6 +56,7 @@ specific enough that "green" actually means "covered."
 /columbo --audit <path>                           # audit mode against an existing module
 /columbo --epic SABLE-xxx                         # architecture-review mode against a planned bead tree
 /columbo --quick "<scope>"                        # quick mode, non-interview test-spec for a small ask
+/columbo --cost-audit [path]                      # cost-audit mode: duration vs unique coverage, prune candidates
 ```
 
 If the user invokes `/columbo` with no arg or an ambiguous arg, ask them
@@ -139,6 +142,96 @@ smoke-only one (★ → ★★★).
 If no existing test at the cited site (truly missing coverage), file the
 gap bead with `Existing test: none — net-new test required.` in the
 quality section.
+
+### Cost-audit mode (`--cost-audit [path]`)
+
+Audit mode asks "is this test thin?" Cost-audit mode asks a different
+question: "is this test *slow*, and if so, is it buying anything a faster
+test doesn't already buy?" Two different lenses on the same test suite —
+run either independently, or both in the same session when the user wants
+a full quality-and-cost pass.
+
+This mode's evidence comes from **running the real suite**, not static
+analysis — see the boundary carve-out in "Out of scope" below. `path`
+defaults to the whole repo (bin/ python tests + hooks/test/ shell suites);
+narrow it to scope the run.
+
+1. Run the cost prefilter:
+   ```bash
+   python3 ~/.claude/skills/columbo/columbo-cost-prefilter.py --json
+   # or, scoped:
+   python3 ~/.claude/skills/columbo/columbo-cost-prefilter.py \
+     --python-target <path> --shell-suite <suite.sh> --json
+   ```
+   This drives one real pytest run (per-test duration + per-test line
+   coverage via coverage.py contexts) for the python half, and real
+   wall-clock timing of each named shell suite for the shell half. It
+   never edits or deletes anything — read-only with respect to the suite
+   it measures.
+
+2. **Python half — proven candidates only.** The report's
+   `python.pruning_candidates` list contains ONLY tests whose entire line
+   coverage is proven (from real coverage.py data) to be already covered
+   by a strictly faster test — `unique_count == 0` is a structural
+   property of the tool's output, not a judgment call Columbo makes. For
+   each candidate, file a `columbo-cost-candidate` bead (template below).
+   Do **not** file a bead for any test NOT in `pruning_candidates`, no
+   matter how slow it looks in the ranked list — a slow test with unique
+   coverage is doing real work.
+
+3. **Shell half — advisory only, never a bead.** The report's
+   `shell.ranked` list is a duration ranking with `advisory_only: true`
+   and carries no proof of redundancy (no line-coverage tool exists for
+   the shell half — accepted architectural residual, not a gap to close
+   by guessing). Present it to the user as "slowest shell suites, for your
+   awareness" — a numbered list, no beads. If the user wants to
+   investigate one, that's a manual follow-up conversation, not this
+   mode's output.
+
+4. Present the python candidates to the user one at a time
+   (`AskUserQuestion`: file the bead / skip) before creating anything —
+   same discipline as epic-review mode's Phase E5. A structurally-proven
+   candidate can still be wrong for reasons the tool can't see (the test
+   documents intent, guards a regression the coverage map doesn't
+   capture because the bug it caught was in dead code that got
+   re-enabled, etc.) — the bead is a proposal for human review, never an
+   auto-delete.
+
+### `columbo-cost-candidate` (cost-audit mode)
+
+```
+## Test node id
+`<path>::<test_function>` — exact pytest nodeid from the report
+
+## Duration
+<seconds, from the report>
+
+## Subsumed by
+{{ list the faster test(s) whose coverage the report shows fully contains
+   this test's coverage — re-derive from the JSON report's per-test
+   covered/unique counts, don't guess }}
+
+## Fingerprint
+A literal substring grep-able from the cited test file. Run
+`grep -n '<fingerprint>'` before submitting; ≤3 matches required.
+
+## Risk if pruned
+{{ one paragraph — even a proven-redundant-by-coverage test can encode
+   intent (a named regression, a documented contract) that deleting it
+   would lose. State what's actually lost, or say "none identified —
+   pure duplicate coverage." }}
+
+## Evidence
+Full JSON report path or inline excerpt showing this test's
+covered_count / unique_count / duration, and the report generation
+command used.
+```
+
+Labels for `bd create`:
+- `columbo-cost-candidate` (always)
+- `model:haiku` (verifying a proposed prune and writing the bead is
+  routine; escalate to `sonnet` only if the cited test's `Risk if pruned`
+  section requires real investigation)
 
 ### Epic-review mode (`--epic <bead-id>`)
 
@@ -676,6 +769,11 @@ Before sending the summary message, re-read each filed bead and confirm:
       recorded as deferred) — no "pending" findings at exit
 - [ ] Epic-review mode: the epic's notes contain the architecture-review
       summary section with bead IDs and architecture status
+- [ ] Cost-audit mode: every filed `columbo-cost-candidate` bead cites a
+      python test with `unique_count == 0` in the report — never a test
+      absent from `pruning_candidates`, never a shell suite
+- [ ] Cost-audit mode: the shell ranking was presented as an advisory
+      list only — no bead was filed for any shell suite
 - [ ] Could a fresh worker take a single bead + the skeleton file and
       write the implementation without re-interviewing the user?
 - [ ] Has the one-more-thing question been asked and the answer processed?
@@ -734,6 +832,17 @@ You exit when ALL of:
   list as the rationale
 - One-more-thing rule has been invoked
 
+**Cost-audit mode:**
+- The prefilter has been run for real (real coverage.py data, real shell
+  timing) — never estimated or guessed
+- Every `columbo-cost-candidate` bead corresponds to an entry in the
+  report's `python.pruning_candidates` list (`unique_count == 0`); zero
+  beads filed for tests outside that list
+- Zero beads filed for shell suites — the shell ranking was presented as
+  advisory only
+- Summary message lists: candidate count, bead IDs, and the shell
+  advisory ranking (suite name + duration, no bead references)
+
 ## Subagent dispatch rules
 
 You may dispatch (read-only only):
@@ -756,12 +865,23 @@ crossed scope. File a bead and let the user (or their managers) execute.
 ## Out of scope
 
 - Running tests yourself — out of scope; this skill plans coverage.
-  Exception: `pytest --collect-only` on a just-written Python skeleton
+  Exception 1: `pytest --collect-only` on a just-written Python skeleton
   file, required per "Skeleton-test file convention" — it discovers
   and imports test modules but executes no test bodies.
+  Exception 2: cost-audit mode's `columbo-cost-prefilter.py` invocation —
+  measuring duration and coverage IS the mode's entire mechanism, so it
+  is a named, scoped exception rather than a violation. The boundary
+  still holds in spirit: the tool only *measures* (real pytest run, real
+  shell suite execution) and never edits, deletes, or skips a test; all
+  it produces is a report Columbo turns into proposal beads for the user
+  to act on.
 - Writing test bodies — workers fill in skeletons
 - Writing or modifying source code — read-only with respect to implementation
 - Fixing tests in place — audit mode files gap beads only
+- Deleting or disabling any test — cost-audit mode proposes, never prunes;
+  even a proven-redundant python candidate is a bead, not a deletion
+- Auto-filing a shell suite as a pruning candidate — structurally
+  impossible (see `rank_shell_suites`) and explicitly forbidden here too
 - Cross-language test-framework abstraction — work in the project's primary
   stack
 
@@ -777,7 +897,7 @@ beads and skeletons, not a debrief.
 At session end, produce a single summary message:
 
 ```
-Columbo session complete — mode: <forward|audit>, scope: <feature/path>, SHA: <head>
+Columbo session complete — mode: <forward|audit|cost-audit>, scope: <feature/path>, SHA: <head>
 
 Categories covered: <list of category numbers>
 One-more-thing answer: <one line — "no additions" or "added case X (cat 8)">
@@ -793,6 +913,14 @@ Forward mode:
 Audit mode:
   Gap beads filed: N (by category: 1: X, 2: Y, ...)
     SABLE-ccc: <one-line title> [for-<manager>]
+    ...
+
+Cost-audit mode:
+  Python pruning-candidate beads filed: N
+    SABLE-ddd: <one-line title> [model:<x>]
+    ...
+  Shell suites — slowest 5 (advisory, no beads):
+    hooks/test/test-xxx.sh  dur=Ns
     ...
 
 High-priority items (concurrency / state-machine / security / property-invariant):
@@ -823,3 +951,10 @@ That's it. No prose explanation — the beads + skeletons are the explanation.
 - You may never name a Python skeleton file `<feature-name>.skel.test.py`
   (or any other double-extension `.skel.test.py` variant) — the dotted
   module name is not importable and pytest collection crashes the suite.
+- Cost-audit mode may run `columbo-cost-prefilter.py` (its one named
+  test-running exception) but may not otherwise run, edit, or delete any
+  test, and may not file a `columbo-cost-candidate` bead for any python
+  test outside the report's `pruning_candidates` list.
+- You may never file a shell suite as a pruning candidate — the shell
+  half of cost-audit mode is advisory-only by construction, and treating
+  its ranking as proof is a category error the mode exists to prevent.
