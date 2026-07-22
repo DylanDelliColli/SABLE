@@ -46,6 +46,7 @@ ALLOW=(
   test-agent-definitions.sh
   test-bead-description-gate.sh
   test-chuck-role-contract.sh
+  test-ci-bd-coverage-gap.sh
   test-columbo-quick-mode.sh
   test-concurrent-sessions.sh
   test-control-trace.sh
@@ -193,6 +194,7 @@ declare -A EXCLUDE=(
 # closed for tier membership.
 declare -A COVERS=(
   [test-active-contracts-integration.sh]="hooks/multi-manager/session-role-anchor.sh"
+  [test-ci-bd-coverage-gap.sh]=".github/ci/shell-run-set.sh hooks/test/test-dep-merge-state.sh hooks/test/test-overlap-dispatch-e2e.sh"
   [test-control-trace.sh]="hooks/multi-manager/control-trace.sh"
   [test-dep-merge-state.sh]="bin/sable-dep-check bin/sable-spawn-worker"
   [test-doctor-snapshot-staleness.sh]="bin/sable-doctor bin/sable-bin-install install.sh"
@@ -236,6 +238,55 @@ declare -A COVERS=(
   [test-tree-claim.sh]="hooks/multi-manager/tree-claim.sh hooks/multi-manager/tree-claim-impl.sh"
   [test-worktree-placement-guard.sh]="hooks/multi-manager/worktree-placement-guard.sh"
 )
+
+# --- Iron-rule real-bd suites (SABLE-jd5fj.16) ------------------------------
+# Suites whose DEFINING coverage is against a real bd (no mocks/stubs — see
+# each suite's own header) and that therefore self-skip a substantial leg —
+# for test-overlap-dispatch-e2e.sh, the WHOLE suite — in the ci-verify clean
+# room (SABLE-59zu ships no bd). jd5fj.13 established that chuck's local
+# combined-tree impact tier is their sole real executor; that tier's
+# selection (.github/ci/impact-manifest.sh's select_impacted()) draws ONLY
+# from ALLOW, so EXCLUDING these suites here would silently delete their only
+# real executor too, not just their (already-vacuous) CI leg. They MUST stay
+# in ALLOW.
+#
+# What they must NOT do is print a clean green summary that reads the same
+# as having actually run: check_loud_skip() (below) mechanically enforces
+# that every suite named here (a) is present in ALLOW and (b) carries a loud,
+# non-zero "Skipped: $N" marker in its own summary output for the bd-absent
+# path. Widen this list by hand when a new suite earns the same shape —
+# auto-detecting via `grep 'command -v bd'` false-positived on ~15 unrelated
+# ALLOW suites that merely reference bd in passing (e.g. a single negative-
+# path assertion), not suites whose entire value proposition is real-bd
+# coverage.
+IRON_RULE_REALBD_SUITES=(
+  test-dep-merge-state.sh
+  test-overlap-dispatch-e2e.sh
+)
+
+# check_loud_skip: populates LOUD_SKIP_BAD with "<suite>: <cause>" lines for
+# any IRON_RULE_REALBD_SUITES entry that (a) is not actually in ALLOW, or (b)
+# has no "Skipped: $" marker in its own file — i.e. could exit its bd-absent
+# branch without ever printing a summary that distinguishes "ran everything"
+# from "skipped the real-bd leg". Pure grep, no bd needed, so this runs in
+# the clean room same as check_exclude_tags.
+check_loud_skip() {
+  LOUD_SKIP_BAD=()
+  local name
+  for name in "${IRON_RULE_REALBD_SUITES[@]}"; do
+    if ! in_array "$name" "${ALLOW[@]}"; then
+      LOUD_SKIP_BAD+=("$name: registered in IRON_RULE_REALBD_SUITES but missing from ALLOW — EXCLUDE would silently delete its only real executor too (chuck's local impact tier draws suites from ALLOW only, SABLE-jd5fj.16)")
+      continue
+    fi
+    if [ ! -f "$TESTDIR/$name" ]; then
+      LOUD_SKIP_BAD+=("$name: registered in IRON_RULE_REALBD_SUITES but missing from hooks/test/")
+      continue
+    fi
+    if ! grep -q 'Skipped: \$' "$TESTDIR/$name"; then
+      LOUD_SKIP_BAD+=("$name: no loud 'Skipped: \$N' marker in its own summary — a self-skipped real-bd leg (bd absent, SABLE-59zu clean room) would print a clean summary indistinguishable from a full run (SABLE-jd5fj.16)")
+    fi
+  done
+}
 
 # LIB_FANOUT: each shared lib path (hooks/multi-manager/lib-*.sh) -> every
 # ALLOW suite whose covered file(s) source it, DIRECTLY OR TRANSITIVELY
@@ -437,29 +488,73 @@ check() {
     echo "::error::shell-run-set --check: $n_uncl unclassified, $n_stale stale run-set entr(y/ies) — classify in ALLOW or EXCLUDE (with reason) before merge — this will not clear on re-run: the classification is missing, not flaky (SABLE-lcevs)"
     return 1
   fi
-  echo "shell-run-set --check: 0 unclassified, 0 stale — gate is fail-closed and clean"
+  # SABLE-jd5fj.16: the iron-rule real-bd suites' loud-skip contract. No bd
+  # needed (pure grep), so this runs in the clean room right alongside the
+  # tag check above.
+  check_loud_skip
+  if [ "${#LOUD_SKIP_BAD[@]}" -gt 0 ]; then
+    echo "::error::shell-run-set --check: ${#LOUD_SKIP_BAD[@]} iron-rule real-bd suite(s) fail the loud-skip contract — a suite that self-skips its real-bd leg must never print a clean green summary indistinguishable from having run it (SABLE-jd5fj.16). This will not clear on re-run: the marker is missing, not flaky."
+    printf '  - %s\n' "${LOUD_SKIP_BAD[@]}"
+    return 1
+  fi
+  echo "shell-run-set --check: 0 unclassified, 0 stale, 0 loud-skip violations — gate is fail-closed and clean"
+  return 0
+}
+
+# check-loud-skip: standalone CLI wrapper around check_loud_skip, for direct
+# invocation (humans, or tests that want the real production registry
+# checked in a fresh subprocess rather than sourced into their own state).
+# check() already runs this same check as part of the enforced gate.
+check_loud_skip_cli() {
+  check_loud_skip
+  if [ "${#LOUD_SKIP_BAD[@]}" -gt 0 ]; then
+    echo "::error::shell-run-set --check-loud-skip: ${#LOUD_SKIP_BAD[@]} iron-rule real-bd suite(s) fail the loud-skip contract (SABLE-jd5fj.16):"
+    printf '  - %s\n' "${LOUD_SKIP_BAD[@]}"
+    return 1
+  fi
+  echo "shell-run-set --check-loud-skip: ${#IRON_RULE_REALBD_SUITES[@]} iron-rule suite(s) checked — all present in ALLOW, all carry a loud Skipped marker"
   return 0
 }
 
 run_set() {
-  local failed=() name rc
+  local failed=() skipped_realbd=() name rc out_file n_skip
+  # SABLE-jd5fj.16: the top-level rollup below used to report only pass/fail
+  # — "ci-verify shell run-set: all N suites GREEN" says nothing about a
+  # suite that passed BY SKIPPING its real-bd leg. That is exactly how the
+  # gap stayed invisible: each suite's own "Skipped: $N" line scrolled by in
+  # its own ::group::, but nothing pulled it into the summary a reader
+  # actually looks at. Tee each iron-rule suite's output to a scratch file so
+  # it can be grepped for that marker AFTER streaming (unchanged) to the log.
+  out_file="$(mktemp)"
   for name in "${ALLOW[@]}"; do
     if [ ! -f "$TESTDIR/$name" ]; then
       echo "::error::run-set names $name but it is missing from hooks/test/"; failed+=("$name (missing)"); continue
     fi
     echo "::group::$name"
-    bash "$TESTDIR/$name"; rc=$?
+    bash "$TESTDIR/$name" 2>&1 | tee "$out_file"
+    rc=${PIPESTATUS[0]}
     echo "::endgroup::"
     [ $rc -eq 0 ] || failed+=("$name (rc=$rc)")
+    if in_array "$name" "${IRON_RULE_REALBD_SUITES[@]}"; then
+      n_skip=$(grep -oE 'Skipped: [0-9]+' "$out_file" | tail -1 | grep -oE '[0-9]+' || true)
+      if [ -n "${n_skip:-}" ] && [ "$n_skip" -gt 0 ]; then
+        skipped_realbd+=("$name (Skipped: $n_skip real-bd subtest(s) — bd absent in this clean room, SABLE-59zu; runs for real only at chuck's local impact tier, SABLE-jd5fj.16)")
+      fi
+    fi
   done
+  rm -f "$out_file"
   echo "======================================================================"
   if [ ${#failed[@]} -eq 0 ]; then
     echo "ci-verify shell run-set: all ${#ALLOW[@]} suites GREEN"
-    return 0
+  else
+    echo "ci-verify shell run-set: ${#failed[@]} of ${#ALLOW[@]} suites RED:"
+    printf '  - %s\n' "${failed[@]}"
   fi
-  echo "ci-verify shell run-set: ${#failed[@]} of ${#ALLOW[@]} suites RED:"
-  printf '  - %s\n' "${failed[@]}"
-  return 1
+  if [ ${#skipped_realbd[@]} -gt 0 ]; then
+    echo "::warning::ci-verify shell run-set: ${#skipped_realbd[@]} iron-rule suite(s) skipped their real-bd leg here — NOT counted as coverage, only as a non-failing exit (SABLE-jd5fj.16):"
+    printf '  - %s\n' "${skipped_realbd[@]}"
+  fi
+  [ ${#failed[@]} -eq 0 ]
 }
 
 # SABLE-cmar4.1: guard the CLI dispatch behind a sourced-vs-executed check so
@@ -471,10 +566,11 @@ run_set() {
 # as ci-verify.yml does) is unaffected — ${BASH_SOURCE[0]} == $0 only then.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   case "${1:-}" in
-    --manifest)    manifest ;;
-    --check)       check ;;
-    --check-beads) check_beads ;;
-    --run)         run_set ;;
-    *) echo "usage: $0 --run | --manifest | --check | --check-beads" >&2; exit 2 ;;
+    --manifest)        manifest ;;
+    --check)           check ;;
+    --check-beads)     check_beads ;;
+    --check-loud-skip) check_loud_skip_cli ;;
+    --run)             run_set ;;
+    *) echo "usage: $0 --run | --manifest | --check | --check-beads | --check-loud-skip" >&2; exit 2 ;;
   esac
 fi
