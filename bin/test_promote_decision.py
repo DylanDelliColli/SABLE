@@ -898,3 +898,124 @@ def test_the_tier_window_log_records_both_edges(isolated_lock, tmp_path, monkeyp
     assert [ln["event"] for ln in lines] == ["start", "end"]
     assert all(ln["pid"] == os.getpid() and ln["tree"] == sha[:12] for ln in lines)
     assert lines[1]["at"] >= lines[0]["at"]
+
+
+# --------------------------------------------------------------------------
+# The derivable promote budget (SABLE-w0zjm)
+# --------------------------------------------------------------------------
+#
+# The defect was not in this repo at all: chuck wrapped every promote in a
+# 900s `timeout`, which is the SAME number as the default
+# SABLE_MG_IMPACT_TIMEOUT. That was harmless only while the impact tier
+# essentially never ran (0 optimistic paths in 157 promotions). jd5fj.4 moved
+# cost from GitHub's CI into the local promote and jd5fj.13 put a queue in
+# front of it, so the enclosing budget is now BOTH too small and unverifiable
+# from inside the repo. These tests pin the escape hatch: the gate reports its
+# own worst case, a wrapper derives from it, and the two cannot drift.
+
+
+@pytest.fixture()
+def clean_budget_env(monkeypatch):
+    for var in ("SABLE_MG_IMPACT_TIMEOUT", "SABLE_MG_IMPACT_LOCK_TIMEOUT",
+                "SABLE_MG_IMPACT_SERIALIZE"):
+        monkeypatch.delenv(var, raising=False)
+    return monkeypatch
+
+
+def test_impact_budget_is_queryable(clean_budget_env, capsys):
+    """THE BEAD. The gate reports its effective impact budget, and the reported
+    value TRACKS the env when overridden — so a wrapper that derives from it
+    cannot go stale the way a copied constant did.
+
+    Worst case is the SUM, not the tier budget. The lock wait is deliberately
+    outside the tier's own budget (jd5fj.13, asserted by
+    test_lock_wait_is_not_charged_to_the_impact_tier_timeout_budget), which is
+    exactly why a wrapper sized to the tier alone is MORE wrong after that bead,
+    not less: under a burst the queue wait alone can exceed it."""
+    monkeypatch = clean_budget_env
+
+    stock = promote_lib.impact_budget()
+    assert stock["tier_timeout_s"] == 900.0
+    assert stock["lock_timeout_s"] == 3600.0
+    assert stock["worst_case_s"] == 4500.0, (
+        "worst case must be queue + tier; reporting the tier budget alone is the "
+        "exact mis-sizing SABLE-w0zjm exists to prevent")
+    assert stock["serialized"] is True
+
+    # Headroom is real headroom: strictly above the worst case, and an integer a
+    # shell can hand straight to `timeout`.
+    assert isinstance(stock["recommended_wrapper_timeout_s"], int)
+    assert stock["recommended_wrapper_timeout_s"] > stock["worst_case_s"]
+
+    # Tracking, both knobs, so neither can silently stop being reported.
+    monkeypatch.setenv("SABLE_MG_IMPACT_TIMEOUT", "123")
+    monkeypatch.setenv("SABLE_MG_IMPACT_LOCK_TIMEOUT", "456")
+    tuned = promote_lib.impact_budget()
+    assert (tuned["tier_timeout_s"], tuned["lock_timeout_s"]) == (123.0, 456.0)
+    assert tuned["worst_case_s"] == 579.0
+    assert tuned["recommended_wrapper_timeout_s"] > 579
+
+    # With serialization off there is no queue to wait in, so charging the
+    # wrapper for one would overstate the budget rather than understate it.
+    monkeypatch.setenv("SABLE_MG_IMPACT_SERIALIZE", "0")
+    off = promote_lib.impact_budget()
+    assert off["lock_timeout_s"] == 0.0
+    assert off["worst_case_s"] == off["tier_timeout_s"] == 123.0
+    assert off["serialized"] is False
+
+    # The human breakdown names WHICH number is which — a wrapper author reading
+    # only one line must not be able to grab the wrong one.
+    text = promote_lib.format_impact_budget(stock)
+    assert "SABLE_MG_IMPACT_LOCK_TIMEOUT" in text and "SABLE_MG_IMPACT_TIMEOUT" in text
+    assert "4500" in text and str(stock["recommended_wrapper_timeout_s"]) in text
+    capsys.readouterr()
+
+
+def test_the_cli_reports_the_same_budget_the_library_computes(clean_budget_env, capsys):
+    """The wrapper does not import the library — it shells out. So the number a
+    shell can actually reach has to be the same number, in a form `timeout` will
+    accept: a bare integer on stdout with exit 0 and nothing else to parse."""
+    monkeypatch = clean_budget_env
+    monkeypatch.setenv("SABLE_MG_IMPACT_TIMEOUT", "200")
+    monkeypatch.setenv("SABLE_MG_IMPACT_LOCK_TIMEOUT", "400")
+    expected = promote_lib.impact_budget()
+
+    assert smg.main(["promote-budget", "--seconds"]) == 0
+    out = capsys.readouterr().out.strip()
+    assert out == str(expected["recommended_wrapper_timeout_s"])
+    assert int(out) > 600, "the derived timeout must exceed queue + tier"
+
+    assert smg.main(["promote-budget", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == expected
+
+    assert smg.main(["promote-budget"]) == 0
+    assert "worst case" in capsys.readouterr().out
+
+    # No --repo, no git, no network: a wrapper must be able to ask BEFORE it has
+    # chosen a repo, and asking must never be able to fail the promote it wraps.
+    proc = subprocess.run([sys.executable, str(_BIN / "sable-merge-gate"),
+                           "promote-budget", "--seconds"],
+                          cwd="/", text=True, capture_output=True,
+                          env={**os.environ, "SABLE_MG_IMPACT_TIMEOUT": "200",
+                               "SABLE_MG_IMPACT_LOCK_TIMEOUT": "400"})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == str(expected["recommended_wrapper_timeout_s"])
+
+
+def test_entering_the_impact_tier_is_announced_even_with_no_queue_wait(isolated_lock,
+                                                                       tmp_path,
+                                                                       monkeypatch,
+                                                                       capsys):
+    """SABLE-w0zjm (c). jd5fj.13's wait line only fires after a 1s+ queue, which
+    is precisely the UNCONTENDED case where an externally-killed promote looks
+    most like the optimistic path malfunctioning. An unconditional in-tier marker
+    naming the budget makes the last line before the silence say how long the
+    silence was entitled to be."""
+    repo, sha = _real_repo(tmp_path)
+    monkeypatch.setenv("SABLE_MG_IMPACT", "true")
+    monkeypatch.setenv("SABLE_MG_IMPACT_TIMEOUT", "777")
+    promote_lib.run_impact_tier(repo, sha, ["bin/thing.py"])
+    out = capsys.readouterr().out
+    assert "ENTERING IMPACT TIER" in out
+    assert "777s" in out, "the marker must name the budget it is entitled to spend"
+    assert "waited" not in out, "an uncontended run must not claim it queued"
