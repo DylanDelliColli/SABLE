@@ -6,6 +6,7 @@ this covers only the skeleton this bead builds.
 """
 import importlib.util
 import sys
+from datetime import timedelta, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -243,6 +244,108 @@ def test_denominator_invariant_string_format():
     report = lib.build_cycle_split_report(beads, [])
     assert report.denominator_note == "1 of 2 closed beads had dispatch timestamps"
     assert "had dispatch timestamps" in report.denominator_note
+
+
+def test_day_bucket_boundary_assignment():
+    assert lib.day_bucket("2026-07-21T23:59:59Z", tz=timezone.utc) == "2026-07-21"
+    # exact midnight is the START of the new day, not the tail of the old one
+    assert lib.day_bucket("2026-07-22T00:00:00Z", tz=timezone.utc) == "2026-07-22"
+    assert lib.day_bucket("2026-07-22T00:00:01Z", tz=timezone.utc) == "2026-07-22"
+
+
+def test_calendar_day_bucket_timezone_convention():
+    # HOST-LOCAL bucketing convention (architecture.json "Shift boundary"
+    # decision): the same instant buckets to a DIFFERENT calendar day
+    # depending on the resolved zone. The explicit `tz` param stands in for
+    # datetime.astimezone()'s real host-local resolution (the tz=None
+    # production path) so this assertion is deterministic under any CI
+    # runner's actual system timezone, while still proving the convention is
+    # NOT simply "truncate the UTC timestamp's date".
+    edt = timezone(timedelta(hours=-4))
+    utc_ts = "2026-07-22T02:30:00Z"  # 10:30pm EDT the PREVIOUS calendar day
+
+    assert lib.day_bucket(utc_ts, tz=timezone.utc) == "2026-07-22"
+    assert lib.day_bucket(utc_ts, tz=edt) == "2026-07-21"
+
+
+def test_net_burn_math():
+    assert lib.net_burn(closes=10, intake=7) == 3
+    assert lib.net_burn(closes=2, intake=5) == -3
+    assert lib.net_burn(closes=0, intake=0) == 0
+
+
+def test_net_burn_computation_closes_minus_intake():
+    beads = [
+        bd_source.BeadRecord(id="SABLE-a", status="closed",
+                              created_at="2026-07-20T09:00:00Z",
+                              closed_at="2026-07-20T10:00:00Z", started_at=None),
+        bd_source.BeadRecord(id="SABLE-b", status="closed",
+                              created_at="2026-07-19T09:00:00Z",
+                              closed_at="2026-07-20T11:00:00Z", started_at=None),
+        bd_source.BeadRecord(id="SABLE-c", status="open",
+                              created_at="2026-07-20T12:00:00Z",
+                              closed_at=None, started_at=None),
+    ]
+
+    series = lib.build_daily_burn_series(beads, tz=timezone.utc)
+    by_date = {d.date: d for d in series}
+    day = by_date["2026-07-20"]
+
+    assert day.closes == 2  # SABLE-a and SABLE-b both closed that day
+    assert day.intake == 2  # SABLE-a and SABLE-c created that day
+    assert day.net_burn == 0
+
+
+def test_trend_spine_backfills_zero_activity_gap_days():
+    beads = [
+        bd_source.BeadRecord(id="SABLE-a", status="closed",
+                              created_at="2026-07-19T09:00:00Z",
+                              closed_at="2026-07-19T10:00:00Z", started_at=None),
+        bd_source.BeadRecord(id="SABLE-b", status="closed",
+                              created_at="2026-07-22T09:00:00Z",
+                              closed_at="2026-07-22T10:00:00Z", started_at=None),
+    ]
+
+    series = lib.build_daily_burn_series(beads, tz=timezone.utc)
+
+    assert [d.date for d in series] == [
+        "2026-07-19", "2026-07-20", "2026-07-21", "2026-07-22",
+    ]
+    gap_days = [d for d in series if d.date in ("2026-07-20", "2026-07-21")]
+    assert gap_days  # both gap days present, not skipped
+    assert all(d.closes == 0 and d.intake == 0 and d.net_burn == 0 for d in gap_days)
+
+
+def test_is_shift_report_bead_matches_observed_title_variants():
+    assert lib.is_shift_report_bead("[SHIFT REPORT] chuck 2026-07-21 night") is True
+    assert lib.is_shift_report_bead("SHIFT REPORT lincoln (cockpit) 2026-07-21") is True
+    assert lib.is_shift_report_bead("shift-report: tarzan 2026-07-17") is True
+    assert lib.is_shift_report_bead("fix(auth): rotate expired token") is False
+    assert lib.is_shift_report_bead(None) is False
+
+
+def test_shift_report_beads_overlay_as_markers_not_boundaries():
+    plain = bd_source.BeadRecord(id="SABLE-plain", status="closed",
+                                  created_at="2026-07-20T09:00:00Z",
+                                  closed_at="2026-07-20T10:00:00Z", started_at=None,
+                                  title="ordinary bug fix")
+    without_report = lib.build_daily_burn_series([plain], tz=timezone.utc)
+
+    shift_report = bd_source.BeadRecord(id="SABLE-report", status="open",
+                                         created_at="2026-07-20T20:00:00Z",
+                                         closed_at=None, started_at=None,
+                                         title="[SHIFT REPORT] chuck 2026-07-20")
+    with_report = lib.build_daily_burn_series([plain, shift_report], tz=timezone.utc)
+
+    day_without, day_with = without_report[0], with_report[0]
+    # the day's boundary/identity and the plain bead's own numbers are
+    # unaffected by the shift-report bead's presence -- only the marker
+    # list changes, and intake moves exactly like it would for any bead.
+    assert day_without.date == day_with.date == "2026-07-20"
+    assert day_without.closes == day_with.closes == 1
+    assert day_without.shift_report_ids == ()
+    assert day_with.shift_report_ids == ("SABLE-report",)
+    assert day_with.intake == day_without.intake + 1
 
 
 def test_gh_source_dedups_post_merge_tmux_only_run():

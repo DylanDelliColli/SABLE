@@ -45,13 +45,19 @@ CROSS_TRACKER_ID_PREFIXES = ("market-brief-",)
 class BeadRecord:
     """One bead's lifecycle timestamps, as read from bd -- the typed record
     this adapter returns instead of a loose dict (Primitive Obsession
-    advisory, architecture.json smell_risks)."""
+    advisory, architecture.json smell_risks).
+
+    `title` defaults to None so existing positional/keyword construction
+    from earlier callers (SABLE-8b41.2/.6) stays valid; SABLE-8b41.5 reads
+    it to detect shift-report beads for the trend overlay -- an event
+    marker, never the calendar-day boundary itself."""
 
     id: str
     status: str
     created_at: str | None
     closed_at: str | None
     started_at: str | None
+    title: str | None = None
 
 
 def build_bd_list_args(status: str | None = None) -> list[str]:
@@ -77,6 +83,7 @@ def _to_bead_record(raw: dict) -> BeadRecord:
         created_at=raw.get("created_at"),
         closed_at=raw.get("closed_at"),
         started_at=raw.get("started_at"),
+        title=raw.get("title"),
     )
 
 

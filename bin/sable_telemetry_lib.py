@@ -21,8 +21,10 @@ are wired in.
 """
 from __future__ import annotations
 
+import re
+from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timedelta, tzinfo
 from typing import TYPE_CHECKING, Iterable
 
 if TYPE_CHECKING:
@@ -237,3 +239,120 @@ def build_cycle_split_report(
         closed_count=closed_count,
         entries=tuple(entries),
     )
+
+
+# ---------------------------------------------------------------------------
+# S1/S4: net burn + host-local calendar-day bucketing + backfilled trend +
+# shift-report overlays (SABLE-8b41.5)
+#
+# ARCHITECTURE DECISION (architecture.json, "Shift boundary: calendar-day
+# spine (host-local TZ) + shift-report overlays"): trend buckets are
+# calendar days boundaried at HOST-LOCAL midnight -- NOT UTC -- so an
+# evening EDT session lands in one bucket instead of splitting across two
+# UTC days. shift-report beads overlay the resulting spine as timeline
+# EVENT MARKERS; they are never the boundary itself (that alternative was
+# explicitly rejected). This section is pure computation -- CLI formatting
+# and the auto-filed shift-ledger bead are SABLE-8b41.8's job.
+# ---------------------------------------------------------------------------
+
+# shift-report bead titles observed in the live corpus (case- and
+# punctuation-varied by whichever agent filed them): "[SHIFT REPORT] ...",
+# "SHIFT REPORT lincoln ...", "shift-report: tarzan ...". Matched at the
+# start of the (stripped) title only, so a bead that merely mentions a
+# shift report in passing is not swept in.
+SHIFT_REPORT_TITLE_RE = re.compile(r"^\[?shift[\s-]report\]?:?", re.IGNORECASE)
+
+
+def is_shift_report_bead(title: str | None) -> bool:
+    """Whether `title` matches the shift-report bead naming convention --
+    the overlay-marker detector for build_daily_burn_series. None/empty
+    titles (a BeadRecord with no title populated) are never a match."""
+    if not title:
+        return False
+    return bool(SHIFT_REPORT_TITLE_RE.match(title.strip()))
+
+
+def day_bucket(iso_ts: str, tz: tzinfo | None = None) -> str:
+    """The host-local calendar-day key (YYYY-MM-DD) `iso_ts` falls into.
+
+    `tz` overrides the resolved zone (tests only, for determinism
+    independent of the host running them); the production path (tz=None)
+    resolves the true system-local zone via datetime.astimezone(), matching
+    the architecture's HOST-LOCAL (not UTC) contract."""
+    return _parse_iso(iso_ts).astimezone(tz).date().isoformat()
+
+
+def net_burn(closes: int, intake: int) -> int:
+    """BUILD spec: net burn for one calendar-day bucket = closes - intake."""
+    return closes - intake
+
+
+@dataclass(frozen=True)
+class DayBucket:
+    """One host-local calendar day's burn numbers, plus any shift-report
+    beads created that day as overlay event markers (never the boundary)."""
+
+    date: str
+    closes: int
+    intake: int
+    shift_report_ids: tuple[str, ...] = ()
+
+    @property
+    def net_burn(self) -> int:
+        return net_burn(self.closes, self.intake)
+
+
+def build_daily_burn_series(
+    bead_records: Iterable["BeadRecord"], tz: tzinfo | None = None
+) -> tuple[DayBucket, ...]:
+    """Backfilled, host-local calendar-day burn series: closes/day (from
+    closed_at) and intake/day (from created_at, every bead regardless of
+    current status) with net burn = closes - intake, oldest day first.
+
+    Backfillable from bd history alone (S4): every day strictly between the
+    earliest and latest day with recorded activity is present in the
+    result, zero-filled if bd shows no created/closed activity that day --
+    a missing key would otherwise look identical to "no activity" instead
+    of "not computed". Returns () when `bead_records` carries no
+    created_at/closed_at at all (nothing to backfill between).
+
+    Shift-report beads (is_shift_report_bead on BeadRecord.title) are
+    overlaid onto the day they were created as event markers in
+    `shift_report_ids` -- they still count toward that day's intake like
+    any other bead; only the marker list is special-cased, never the day
+    boundary itself.
+    """
+    closes: dict[str, int] = defaultdict(int)
+    intake: dict[str, int] = defaultdict(int)
+    markers: dict[str, list[str]] = defaultdict(list)
+
+    for bead in bead_records:
+        if bead.created_at:
+            day = day_bucket(bead.created_at, tz)
+            intake[day] += 1
+            if is_shift_report_bead(getattr(bead, "title", None)):
+                markers[day].append(bead.id)
+        if bead.status == "closed" and bead.closed_at:
+            closes[day_bucket(bead.closed_at, tz)] += 1
+
+    known_days = set(closes) | set(intake)
+    if not known_days:
+        return ()
+
+    start = date.fromisoformat(min(known_days))
+    end = date.fromisoformat(max(known_days))
+
+    series = []
+    day = start
+    while day <= end:
+        key = day.isoformat()
+        series.append(
+            DayBucket(
+                date=key,
+                closes=closes.get(key, 0),
+                intake=intake.get(key, 0),
+                shift_report_ids=tuple(sorted(markers.get(key, ()))),
+            )
+        )
+        day += timedelta(days=1)
+    return tuple(series)
