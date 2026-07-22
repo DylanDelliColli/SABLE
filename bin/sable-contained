@@ -29,6 +29,31 @@ merge gate and pre-push hook use), so there is no second positional an
 inverted invocation could occupy: the bug is unrepresentable, not just
 discouraged.
 
+THE SECOND DEFECT: PATH MODE (SABLE-4snb4)
+------------------------------------------
+The sibling footgun, hit live 2026-07-22 (optimus). The other containment
+question the fleet asks constantly is "is this FILE on the spine yet" — the
+PROPERTY probe (does the mechanism exist in the tree?) that the
+reference-by-property rule prefers over a SHA probe. The natural-looking
+idiom for it is silently wrong:
+
+    git ls-tree <ref> <path> --name-only && echo "PRESENT"   # WRONG
+
+`git ls-tree` EXITS 0 FOR AN ABSENT PATH — it just prints nothing. So that
+probe prints PRESENT for a file that is not in the ref, and — exactly like
+the merge-base inversion above — the failure is in the HOLD-RELEASING
+direction. Live: probing hooks/test/test-impact-tier-serialization.sh (new
+in SABLE-jd5fj.13's footprint) reported ON SPINE while .13 was in fact
+unmerged; had it been trusted, SABLE-cmar4.5 would have been dispatched onto
+a base lacking .13, into the very seat collision the sequencing exists to
+prevent. Caught only because three corroborating signals disagreed.
+
+Path mode wraps the CORRECT primitives, again in two independent legs:
+`git cat-file -e <ref>:<path>` (whose exit status DOES track presence) and
+`git ls-tree <ref> -- <path>` judged on its OUTPUT being non-empty, never on
+its exit status. Same verdict vocabulary and same exit codes as commit mode,
+so a caller never has to remember which containment question it asked.
+
 CROSS-CHECK: every call also runs a SECOND, independent method
 (`git log <integration>..<sha>` — non-empty means <sha> carries commits the
 integration branch doesn't have, i.e. NOT contained) and compares it against
@@ -39,14 +64,24 @@ wrong (or something is scribbling on the environment), so the tool refuses to
 answer CONTAINED/NOT-CONTAINED at all and says so loudly instead.
 
 USAGE
+  COMMIT MODE — has <sha> landed?
   sable-contained <sha>                             # CONTAINED / NOT-CONTAINED
   sable-contained <sha> --repo <path>                # a git repo other than CWD
   sable-contained <sha> --integration-branch <name>  # override auto-resolution
   sable-contained <sha> --format=json                # machine-readable
 
-EXIT CODES
-  0  CONTAINED     — <sha> is merged into the integration branch.
-  1  NOT-CONTAINED — <sha> is NOT merged into the integration branch.
+  PATH MODE — is <path> in the tree of <ref>?
+  sable-contained --path <path>                      # against the integration ref
+  sable-contained --path <path> --ref <ref>          # against any ref
+
+  The two modes are mutually exclusive: a <sha> positional is the commit
+  question, --path is the path question, and asking both at once is a usage
+  error rather than a silent precedence rule.
+
+EXIT CODES (identical in both modes — one vocabulary for containment)
+  0  CONTAINED     — <sha> is merged into the integration branch / <path>
+                     exists in <ref>'s tree.
+  1  NOT-CONTAINED — <sha> is NOT merged / <path> is NOT in <ref>'s tree.
   2  usage error
   3  DISAGREEMENT  — the two methods gave different answers; treat as
                      unresolved and verify by hand.
@@ -116,6 +151,30 @@ def combine_verdicts(verdict_a: str, verdict_b: str) -> tuple[str, bool]:
     return UNRESOLVED, agree
 
 
+def cat_file_verdict(rc: int) -> str:
+    """`git cat-file -e <ref>:<path>` exit code -> verdict. UNLIKE ls-tree,
+    this command's exit status actually tracks presence: 0 = the object
+    resolves (the path IS in that ref's tree), non-zero = it does not. git
+    does not distinguish "absent path" from "bad ref" in this exit code,
+    which is why main() resolves the ref FIRST — by the time this runs, a
+    non-zero can only mean the path is absent."""
+    return CONTAINED if rc == 0 else NOT_CONTAINED
+
+
+def ls_tree_verdict(rc: int, stdout: str) -> str:
+    """`git ls-tree <ref> -- <path>` -> verdict, judged on OUTPUT.
+
+    THIS IS THE DEFECT OF SABLE-4snb4, inverted into a correct probe. ls-tree
+    exits 0 for an ABSENT path and simply prints nothing, so `ls-tree ... &&
+    echo PRESENT` is a false POSITIVE generator — the hold-RELEASING
+    direction. The output, unlike the exit status, does track presence: one
+    line per matching tree entry, empty when there is no such path. A
+    non-zero rc (unresolvable ref) is UNRESOLVED, never a verdict."""
+    if rc != 0:
+        return UNRESOLVED
+    return CONTAINED if stdout.strip() else NOT_CONTAINED
+
+
 def render_report(sha: str, integration_ref: str, result: dict) -> str:
     """The one-line human/hook answer. Every non-clean path names both
     methods' verdicts so a reader never has to re-run the tool to see why."""
@@ -135,6 +194,29 @@ def render_report(sha: str, integration_ref: str, result: dict) -> str:
         f"COULD NOT ASSESS: containment of {sha} against {integration_ref} "
         f"could not be determined (merge-base={result['method_a']}, "
         f"log-range={result['method_b']})"
+    )
+
+
+def render_path_report(path: str, ref: str, result: dict) -> str:
+    """Path mode's one-line answer. Same four shapes and the same leading
+    words as render_report, so a reader (or a grep in a role card) does not
+    have to know which question was asked to read the verdict."""
+    verdict = result["verdict"]
+    if verdict == CONTAINED:
+        return f"CONTAINED: {path} is present in {ref}"
+    if verdict == NOT_CONTAINED:
+        return f"NOT-CONTAINED: {path} is NOT present in {ref}"
+    if verdict == DISAGREE:
+        return (
+            f"DISAGREEMENT (SABLE-4snb4): presence of {path} in {ref} is "
+            f"UNRESOLVED — the two independent methods disagree (cat-file "
+            f"says {result['method_a']}, ls-tree output says "
+            f"{result['method_b']}). Do not trust either; verify by hand."
+        )
+    return (
+        f"COULD NOT ASSESS: presence of {path} in {ref} could not be "
+        f"determined (cat-file={result['method_a']}, "
+        f"ls-tree={result['method_b']})"
     )
 
 
@@ -181,16 +263,49 @@ def containment_verdict(repo: str, sha: str, integration_ref: str) -> dict:
             "agree": agree}
 
 
+def ref_resolves(repo: str, ref: str) -> bool:
+    """Does <ref> name something this repo can resolve? Path mode checks this
+    BEFORE probing, because `git cat-file -e <ref>:<path>` returns the same
+    non-zero for "no such ref" as for "no such path" — without this gate a
+    typo'd ref would report a confident NOT-CONTAINED instead of COULD NOT
+    ASSESS, and only one of those is safe to act on."""
+    return _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").returncode == 0
+
+
+def path_containment_verdict(repo: str, ref: str, path: str) -> dict:
+    """Runs BOTH independent path-presence methods and reconciles them, in
+    the same shape commit mode returns. Callers must have established that
+    <ref> resolves (see ref_resolves)."""
+    a = _git(repo, "cat-file", "-e", f"{ref}:{path}")
+    method_a = cat_file_verdict(a.returncode)
+
+    b = _git(repo, "ls-tree", "--name-only", ref, "--", path)
+    method_b = ls_tree_verdict(b.returncode, b.stdout)
+
+    verdict, agree = combine_verdicts(method_a, method_b)
+    return {"verdict": verdict, "method_a": method_a, "method_b": method_b,
+            "agree": agree}
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sable-contained",
-        description="Is <sha> contained in this repo's integration branch? "
-                     "Hardcodes the merge-base --is-ancestor argument order "
-                     "so the inversion behind SABLE-gdp05 cannot be expressed.",
+        description="Is <sha> contained in this repo's integration branch, or "
+                     "is --path present in --ref? Hardcodes the merge-base "
+                     "--is-ancestor argument order so the inversion behind "
+                     "SABLE-gdp05 cannot be expressed, and never judges path "
+                     "presence by ls-tree's exit status (SABLE-4snb4).",
     )
-    parser.add_argument("sha", help="commit-ish to test for containment")
+    parser.add_argument("sha", nargs="?", default=None,
+                         help="commit-ish to test for containment (commit mode)")
+    parser.add_argument("--path", default=None,
+                         help="repo-relative path to test for presence in a "
+                              "ref's tree (path mode)")
+    parser.add_argument("--ref", default=None,
+                         help="ref whose tree --path is looked up in "
+                              "(default: the integration ref)")
     parser.add_argument("--repo", default=os.getcwd(),
                          help="git repo to check (default: CWD)")
     parser.add_argument("--integration-branch", default=None,
@@ -201,43 +316,83 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    repo = os.path.abspath(args.repo)
-    branch = args.integration_branch or git_lib.resolve_integration_branch(repo)
-    integration_ref = resolve_integration_ref(repo, branch)
+def _emit(payload: dict, message: str, fmt: str) -> None:
+    print(json.dumps({**payload, "message": message}) if fmt == "json" else message)
 
-    if not integration_ref:
-        message = (f"COULD NOT ASSESS: integration branch '{branch}' does not "
-                   f"resolve (checked origin/{branch} and {branch}) in {repo}")
-        if args.format == "json":
-            print(json.dumps({
-                "sha": args.sha, "integration_branch": branch,
-                "integration_ref": None, "verdict": UNRESOLVED,
-                "method_a": UNRESOLVED, "method_b": UNRESOLVED,
-                "agree": False, "message": message,
-            }))
-        else:
-            print(message)
-        return EXIT_UNRESOLVED
 
-    result = containment_verdict(repo, args.sha, integration_ref)
-
-    if args.format == "json":
-        print(json.dumps({
-            "sha": args.sha,
-            "integration_branch": branch,
-            "integration_ref": integration_ref,
-            **result,
-        }))
-    else:
-        print(render_report(args.sha, integration_ref, result))
-
+def _exit_for(verdict: str) -> int:
     return {
         CONTAINED: EXIT_CONTAINED,
         NOT_CONTAINED: EXIT_NOT_CONTAINED,
         DISAGREE: EXIT_DISAGREE,
-    }.get(result["verdict"], EXIT_UNRESOLVED)
+    }.get(verdict, EXIT_UNRESOLVED)
+
+
+def _run_path_mode(args, repo: str, integration_ref: str, branch: str) -> int:
+    """--path: is that path in <ref>'s tree? --ref defaults to the integration
+    ref, since "is this file on the spine yet" is the question that motivated
+    the mode."""
+    ref = args.ref or integration_ref
+    payload = {"mode": "path", "path": args.path, "ref": ref,
+                "integration_branch": branch}
+
+    if not ref or not ref_resolves(repo, ref):
+        named = ref or f"(integration branch '{branch}' did not resolve)"
+        message = (f"COULD NOT ASSESS: ref {named} does not resolve in {repo}, "
+                    f"so the presence of {args.path} is unknown")
+        _emit({**payload, "ref": ref or None, "verdict": UNRESOLVED,
+               "method_a": UNRESOLVED, "method_b": UNRESOLVED, "agree": False},
+              message, args.format)
+        return EXIT_UNRESOLVED
+
+    result = path_containment_verdict(repo, ref, args.path)
+    _emit({**payload, **result},
+          render_path_report(args.path, ref, result), args.format)
+    return _exit_for(result["verdict"])
+
+
+def _run_commit_mode(args, repo: str, integration_ref: str, branch: str) -> int:
+    if not integration_ref:
+        message = (f"COULD NOT ASSESS: integration branch '{branch}' does not "
+                   f"resolve (checked origin/{branch} and {branch}) in {repo}")
+        _emit({"mode": "commit", "sha": args.sha, "integration_branch": branch,
+               "integration_ref": None, "verdict": UNRESOLVED,
+               "method_a": UNRESOLVED, "method_b": UNRESOLVED, "agree": False},
+              message, args.format)
+        return EXIT_UNRESOLVED
+
+    result = containment_verdict(repo, args.sha, integration_ref)
+    _emit({"mode": "commit", "sha": args.sha, "integration_branch": branch,
+           "integration_ref": integration_ref, **result},
+          render_report(args.sha, integration_ref, result), args.format)
+    return _exit_for(result["verdict"])
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # Mode selection is explicit and fails closed: no silent precedence
+    # between the two containment questions, and no defaulting to one when
+    # the caller named neither.
+    if args.sha and args.path:
+        parser.error("give a <sha> (commit containment) or --path (path "
+                      "presence), not both — they are different questions")
+    if not args.sha and not args.path:
+        parser.error("nothing to check: pass a <sha> for commit containment "
+                      "or --path for path presence")
+    if args.ref and not args.path:
+        parser.error("--ref applies to --path only; commit mode derives the "
+                      "integration ref itself so the argument order cannot be "
+                      "inverted (SABLE-gdp05)")
+
+    repo = os.path.abspath(args.repo)
+    branch = args.integration_branch or git_lib.resolve_integration_branch(repo)
+    integration_ref = resolve_integration_ref(repo, branch)
+
+    if args.path:
+        return _run_path_mode(args, repo, integration_ref, branch)
+    return _run_commit_mode(args, repo, integration_ref, branch)
 
 
 if __name__ == "__main__":
