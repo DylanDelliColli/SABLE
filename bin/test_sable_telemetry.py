@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sable_telemetry_lib as lib  # noqa: E402
 import sable_telemetry_bd_source as bd_source  # noqa: E402
 import sable_telemetry_git_source as git_source  # noqa: E402
+import sable_telemetry_gh_source as gh_source  # noqa: E402
 
 _LOADER = SourceFileLoader(
     "sable_telemetry_cli", str(Path(__file__).resolve().parent / "sable-telemetry")
@@ -129,6 +130,45 @@ def test_git_source_ignores_non_merge_preview_commit_with_trailing_bead_ref():
     assert git_source.extract_bead_id_from_subject(
         "docs: update README (SABLE-1111)"
     ) is None
+
+
+def test_gh_source_preview_ref_regex_extracts_bead_and_sha7():
+    assert gh_source.parse_preview_ref(
+        "ci-verify/SABLE-c008-16d94ed"
+    ) == ("SABLE-c008", "16d94ed")
+
+    # bead ids carry their own dashes/dots (e.g. epic-child ids) -- the
+    # trailing 7-hex-char anchor, not the reverse, is what disambiguates.
+    assert gh_source.parse_preview_ref(
+        "ci-verify/SABLE-8b41.4-a1b2c3d"
+    ) == ("SABLE-8b41.4", "a1b2c3d")
+
+    # the redundant post-merge confirmation run's headBranch is plain
+    # "tmux-only" -- not a preview ref at all, rejected outright.
+    assert gh_source.parse_preview_ref("tmux-only") is None
+
+    # not everything under ci-verify/ with a trailing dash-segment is a
+    # valid preview ref -- the suffix must be exactly 7 hex chars.
+    assert gh_source.parse_preview_ref("ci-verify/SABLE-c008-notasha") is None
+
+
+def test_gh_source_dedups_post_merge_tmux_only_run():
+    raw_runs = [
+        {
+            "databaseId": 29596385380,
+            "headBranch": "ci-verify/SABLE-c008-16d94ed",
+            "displayTitle": "ci-verify merge-preview: wk-reap-superseded onto tmux-only (SABLE-c008)",
+        },
+        {
+            "databaseId": 29596766036,
+            "headBranch": "tmux-only",
+            "displayTitle": "ci-verify merge-preview: wk-reap-superseded onto tmux-only (SABLE-c008)",
+        },
+    ]
+
+    selected = gh_source.select_preview_runs(raw_runs)
+
+    assert [r["databaseId"] for r in selected] == [29596385380]
 
 
 if __name__ == "__main__":
