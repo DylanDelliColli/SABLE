@@ -6,6 +6,7 @@ Proves end-to-end: the role->pane registry (@sable_role user-option) resolves,
 the message is delivered as a real keystroke turn, and a message sent while the
 target pane is BUSY is queued and runs when free (the verified spike behavior).
 """
+import shlex
 import shutil
 import subprocess
 import time
@@ -1069,6 +1070,96 @@ def test_worker_pane_send_frames_as_worker_not_manager_lane_qqcd(tmux_socket):
     time.sleep(0.8)
     pane2 = _capture(tmux_socket, tarzan_pane)
     assert "⟦SABLE-MSG⟧ from=tarzan to=tarzan" in pane2
+
+
+# --- SABLE-tmbx1: caller-shell command-substitution hazard ------------------
+# HIT LIVE 2026-07-21: a message body composed inside a double-quoted shell
+# argument had its backticks/$(...) command-substituted by the CALLING shell
+# before sable-msg's argv was ever populated -- the substituted command
+# actually RAN, and the delivered text silently lost those passages while
+# sable-msg still reported success. sable-msg cannot detect this: by the time
+# main() sees the body, the shell has already parsed it. --body-file sidesteps
+# the hazard by reading the body from a file, which no shell re-parses.
+#
+# A passive echo REPL (not the bash REPLs used above) is the recipient here
+# deliberately: bash would itself re-interpret backticks/$() a SECOND time on
+# receipt, confounding whether corruption happened at send time or receipt
+# time. This stand-in prints the same `> ` composer glyph the bash REPLs use
+# (so dispatch_landed's box-scan heuristic still recognizes it) but only ever
+# echoes the submitted line back VERBATIM -- it never re-parses it as a shell
+# command -- so these tests isolate the SENDING side, which is where
+# SABLE-tmbx1 actually lives.
+
+def _start_echo_pane(sock, tmp_path):
+    script = tmp_path / "echo_repl.py"
+    script.write_text(
+        "import sys\n"
+        "while True:\n"
+        "    sys.stdout.write('> ')\n"
+        "    sys.stdout.flush()\n"
+        "    line = sys.stdin.readline()\n"
+        "    if not line:\n"
+        "        break\n"
+        "    sys.stdout.write(line)\n"
+        "    sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+          f"python3 -u {shlex.quote(str(script))}")
+    time.sleep(0.5)
+    _tmux(sock, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
+    return "w"
+
+
+def test_body_file_delivers_backticks_and_dollar_paren_unexecuted(tmux_socket, tmp_path):
+    _start_echo_pane(tmux_socket, tmp_path)
+    marker = tmp_path / "would-be-pwned"
+    hazardous = f"see `hostname` and $(touch {marker}) now"
+    body_path = tmp_path / "body.txt"
+    body_path.write_text(hazardous, encoding="utf-8")
+
+    r = _run_msg(tmux_socket, "optimus", "--body-file", str(body_path), "--from", "lincoln")
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.8)
+    pane = _capture(tmux_socket, "w")
+    assert "`hostname`" in pane
+    assert f"$(touch {marker})" in pane
+    assert not marker.exists(), "the file-based path must never let $(...) execute"
+
+
+def test_negative_control_inline_body_through_a_real_shell_is_corrupted_before_sable_msg_runs(
+    tmux_socket, tmp_path,
+):
+    """Plant-and-fail (non-negotiable per SABLE-tmbx1's dispatch notes): proves
+    the OLD/vulnerable invocation shape -- a body embedded inline inside a
+    double-quoted shell argument, exactly how an agent's Bash tool naively
+    composes a send -- actually corrupts the message and actually executes
+    the embedded command. This is the reproduction the --body-file fix above
+    is defending against; if this test ever stopped failing on the inline
+    path, the round-trip test above would no longer be evidence of anything."""
+    _start_echo_pane(tmux_socket, tmp_path)
+    marker = tmp_path / "executed-marker"
+    shell_cmd = (
+        f'python3 {shlex.quote(str(BIN))} optimus '
+        f'"see `hostname` and $(touch {marker}) now" --from lincoln'
+    )
+    env = {**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w"}
+    r = subprocess.run(shell_cmd, shell=True, capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.8)
+
+    # HARM 1 -- EXECUTION: $(...) actually ran, with the caller's privileges,
+    # before sable-msg's argv was even populated.
+    assert marker.exists(), (
+        "expected the pre-fix vulnerable invocation to execute the command "
+        "inside $(...) -- if this fails, the reproduction is no longer "
+        "faithful to the reported bug and the contrast above proves nothing"
+    )
+    # HARM 2 -- CORRUPTION: the delivered text is missing the substituted
+    # commands, silently replaced by their stdout, not the literal source.
+    pane = _capture(tmux_socket, "w")
+    assert "$(touch" not in pane
+    assert "`hostname`" not in pane
 
 
 if __name__ == "__main__":

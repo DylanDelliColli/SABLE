@@ -38,6 +38,29 @@ manual bead-filing hint.
 
 Usage:
   sable-msg <to-role> "<text>" [--from <role>] [--interrupt] [--bead]
+  sable-msg <to-role> --body-file <path> [--from <role>] [--interrupt] [--bead]
+    <text>          message body, given inline as the second positional arg.
+                    HAZARD (SABLE-tmbx1): the CALLING shell parses this
+                    argument before sable-msg ever sees it. A body composed
+                    inside a double-quoted (or unquoted) shell argument has
+                    its backticks and $(...) COMMAND-SUBSTITUTED by that
+                    shell — the substituted command actually RUNS with the
+                    caller's privileges, and the delivered message silently
+                    loses that text, with sable-msg reporting success. This
+                    is not a bug sable-msg can detect: by the time argv
+                    reaches main(), the damage is already done. Prefer
+                    --body-file for any body that might contain a code
+                    reference, shell snippet, or literal backtick/$( — which
+                    is the ordinary shape of a code review or incident report.
+    --body-file <path>   read the body from a file instead (or from stdin
+                    when <path> is '-', matching bd's own --body-file
+                    convention). A file's bytes are never parsed by a shell,
+                    so backticks/$()/quotes round-trip as literal characters
+                    regardless of content. Write the body with the Write tool
+                    (or any non-shell means) first, then pass only the path
+                    on the command line — the path is the only thing the
+                    calling shell ever sees, and it need not be prose.
+                    Mutually exclusive with the inline <text> positional.
     --from <role>   sender label for the framing header. Default: on a WORKER
                     pane (SABLE_WORKER_PANE=1) this is ALWAYS 'worker:<bead>'
                     (or plain 'worker' if the bead can't be resolved) — NEVER
@@ -344,7 +367,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument("to_role", help="recipient role (e.g. optimus, tarzan, lincoln), "
                                    "or a bead id when --bead is passed")
-    p.add_argument("body", help="message text (collapsed to a single line)")
+    p.add_argument("body", nargs="?", default=None,
+                   help="message text (collapsed to a single line). Mutually "
+                        "exclusive with --body-file; exactly one is required. "
+                        "HAZARD (SABLE-tmbx1): this argument is parsed by the "
+                        "CALLING shell before sable-msg sees it — a body "
+                        "containing backticks or $(...) gets command-"
+                        "substituted (and the substituted command actually "
+                        "runs) rather than delivered. Prefer --body-file.")
+    p.add_argument("--body-file", dest="body_file", default=None, metavar="PATH",
+                   help="read the body from PATH instead of the inline <body> "
+                        "argument ('-' reads stdin, matching bd's own "
+                        "--body-file convention). A file's content is never "
+                        "parsed by a shell, so backticks/$()/quotes round-trip "
+                        "literally (SABLE-tmbx1). Mutually exclusive with "
+                        "the inline <body> positional.")
     p.add_argument("--from", dest="frm", default=None,
                    help="sender label for the framing header (default: "
                         "'worker:<bead>' on a worker pane, else "
@@ -355,7 +392,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="resolve <to_role> as a bead id against a WORKER pane's "
                         "@sable_bead tag instead of a manager @sable_role "
                         "(SABLE-6izz: workers share the generic role 'worker')")
-    return p.parse_args(argv)
+    ns = p.parse_args(argv)
+    if ns.body is not None and ns.body_file is not None:
+        p.error("argument body: not allowed with argument --body-file")
+    if ns.body is None and ns.body_file is None:
+        p.error("one of the arguments body --body-file is required")
+    return ns
+
+
+def resolve_body(ns: argparse.Namespace, stdin=None) -> str:
+    """Materialize the message body text from either the inline positional or
+    --body-file (SABLE-tmbx1). A file/stdin read never invokes a shell, so
+    content read this way cannot be command-substituted no matter what
+    metacharacters it contains — unlike the inline positional, which the
+    CALLING shell has already parsed by the time argv reaches us."""
+    if ns.body_file is None:
+        return ns.body
+    stdin = stdin or sys.stdin
+    if ns.body_file == "-":
+        return stdin.read()
+    with open(ns.body_file, "r", encoding="utf-8") as fh:
+        return fh.read()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -417,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
-    message = format_message(ns.frm, ns.to_role, ns.body)
+    message = format_message(ns.frm, ns.to_role, resolve_body(ns))
     ready_timeout = float(os.environ.get("SABLE_MSG_READY_TIMEOUT", DEFAULT_READY_TIMEOUT))
     submit_tries = int(os.environ.get("SABLE_MSG_SUBMIT_TRIES", DEFAULT_SUBMIT_TRIES))
     poll_interval = float(os.environ.get("SABLE_MSG_POLL_INTERVAL", DEFAULT_POLL_INTERVAL))

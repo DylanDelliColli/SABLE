@@ -1383,5 +1383,105 @@ def test_main_bead_addressed_only_done_pane_errors_with_reap_hint_qq6r(monkeypat
     assert "reap" in err.lower()
 
 
+# --- --body-file: caller-shell command-substitution hazard (SABLE-tmbx1) ----
+# The inline <body> positional is parsed by the CALLING shell before sable-msg
+# ever sees it: a body composed inside a double-quoted shell argument has its
+# backticks/$(...) command-substituted THERE, and the substituted command
+# actually runs. sable-msg cannot detect this — by the time argv reaches
+# main() the damage is already done. --body-file sidesteps the hazard
+# entirely by reading the body from a file (or stdin), which no shell ever
+# re-parses. These assertions use REAL metacharacter content, not an innocent
+# fixture — an implementation that regressed to string-interpolating the body
+# through a shell somewhere would fail them.
+
+HAZARDOUS_BODY = "see `hostname` and $(id) for the failing host — do not run this"
+
+
+def test_parse_args_body_file_flag_alone():
+    ns = sable_msg.parse_args(["optimus", "--body-file", "/tmp/whatever"])
+    assert ns.body is None
+    assert ns.body_file == "/tmp/whatever"
+
+
+def test_parse_args_body_and_body_file_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        sable_msg.parse_args(["optimus", "inline text", "--body-file", "/tmp/x"])
+
+
+def test_resolve_body_returns_inline_positional_when_no_body_file():
+    ns = sable_msg.parse_args(["optimus", HAZARDOUS_BODY])
+    assert sable_msg.resolve_body(ns) == HAZARDOUS_BODY
+
+
+def test_resolve_body_reads_hazardous_content_from_file_verbatim(tmp_path):
+    body_path = tmp_path / "body.txt"
+    body_path.write_text(HAZARDOUS_BODY, encoding="utf-8")
+    ns = sable_msg.parse_args(["optimus", "--body-file", str(body_path)])
+    assert sable_msg.resolve_body(ns) == HAZARDOUS_BODY
+
+
+def test_resolve_body_reads_hazardous_content_from_stdin_dash():
+    import io
+    ns = sable_msg.parse_args(["optimus", "--body-file", "-"])
+    fake_stdin = io.StringIO(HAZARDOUS_BODY)
+    assert sable_msg.resolve_body(ns, stdin=fake_stdin) == HAZARDOUS_BODY
+
+
+def test_main_body_file_delivers_hazardous_content_unmodified(monkeypatch, tmp_path):
+    # NEGATIVE-CONTROL-SHAPED: this is an equality assertion against literal
+    # backticks/$(...) — a regression that re-introduced shell interpolation
+    # anywhere in this path would corrupt the string and fail it, not pass
+    # vacuously the way a metacharacter-free fixture would.
+    body_path = tmp_path / "body.txt"
+    body_path.write_text(HAZARDOUS_BODY, encoding="utf-8")
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+    delivered = {}
+
+    def fake_deliver(pane, message, interrupt, **kwargs):
+        delivered["message"] = message
+        return True
+
+    monkeypatch.setattr(sable_msg, "deliver_message", fake_deliver)
+    rc = sable_msg.main(["optimus", "--body-file", str(body_path), "--from", "lincoln"])
+    assert rc == 0
+    assert "message" in delivered
+    assert "`hostname`" in delivered["message"]
+    assert "$(id)" in delivered["message"]
+    assert delivered["message"] == sable_msg.format_message("lincoln", "optimus", HAZARDOUS_BODY)
+
+
+def test_body_file_content_never_reaches_a_shell(monkeypatch, tmp_path):
+    # Assert no subprocess is spawned FROM the content of the body at all —
+    # not merely that delivery "looks right". Every subprocess.run call made
+    # anywhere below main() is recorded; none may carry the hazardous
+    # substring or shell=True.
+    import subprocess as subprocess_module
+
+    marker = "$(id)"
+    body_path = tmp_path / "body.txt"
+    body_path.write_text(f"see `hostname` and {marker} now", encoding="utf-8")
+
+    calls = []
+    real_run = subprocess_module.run
+
+    def spying_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_run(["true"], capture_output=True, text=True)
+
+    monkeypatch.setattr(subprocess_module, "run", spying_run)
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
+
+    rc = sable_msg.main(["optimus", "--body-file", str(body_path), "--from", "lincoln"])
+    assert rc == 0
+    for args, kwargs in calls:
+        flat = " ".join(str(a) for a in args)
+        assert marker not in flat
+        assert "hostname" not in flat
+        assert kwargs.get("shell") is not True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
