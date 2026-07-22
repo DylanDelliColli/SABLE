@@ -1185,11 +1185,38 @@ def assert_not_frozen(repo: str) -> None:
 # Coverage floor on pruning passes (SABLE-cmar4.5) — the MECHANICAL deny path
 # --------------------------------------------------------------------------
 
-def _coverage_floor_timeout() -> float:
-    try:
-        return float(os.environ.get("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "600"))
-    except ValueError:
-        return 600.0
+def _coverage_floor_timeout(repo: str | None = None) -> float:
+    """SABLE-cmar4.9: the coverage-floor check's run budget, derived from the
+    merge_preview tier's SSOT (.github/ci/test-tiers.sh, via
+    sable_gate_budget_lib.tier_budget_sec) instead of a fresh hand-picked
+    literal — the same duplicated-list class SABLE-jd5fj.9 just closed for
+    _impact_timeout, and that SABLE-w0zjm's promote-budget mechanism exists to
+    eliminate generally.
+
+    Borrows merge_preview's budget rather than declaring the coverage floor
+    its own tier entry, mirroring jd5fj.9's choice for the same reason: it is
+    faithful to today's behaviour (600 sits under merge_preview's 900 today)
+    and adding a tier entry here would be scope creep this bead explicitly
+    disclaims. The coverage floor runs inside the promote path rather than
+    inside merge_preview's own suite list, so if its runtime characteristics
+    ever prove to need a different ceiling than merge_preview's, the SSOT
+    should grow a dedicated entry instead of a second borrow — flagged here,
+    not decided.
+
+    SABLE_MG_COVERAGE_FLOOR_TIMEOUT is an explicit override and always wins
+    over the SSOT, exactly as before. `repo` defaults to the current working
+    directory. A missing or broken SSOT (or an unparseable override) falls
+    back to the pre-fix constant (600) — never raises, mirroring
+    _impact_timeout's and git_lib.default_mg_timeout's never-raises
+    contract."""
+    override = os.environ.get("SABLE_MG_COVERAGE_FLOOR_TIMEOUT")
+    if override is not None:
+        try:
+            return float(override)
+        except ValueError:
+            return 600.0
+    budget = budget_lib.tier_budget_sec(repo or os.getcwd(), "merge_preview")
+    return budget if budget is not None else 600.0
 
 
 def run_coverage_floor_check(repo: str, base_sha: str, branch_sha: str):
@@ -1217,7 +1244,7 @@ def run_coverage_floor_check(repo: str, base_sha: str, branch_sha: str):
             if not script.is_file():
                 return None
             cp = git_lib._run(["bash", str(script), base_sha], cwd=worktree, check=False,
-                              timeout=_coverage_floor_timeout())
+                              timeout=_coverage_floor_timeout(repo))
             return cp.returncode == 0
         finally:
             git_lib._git(repo, "worktree", "remove", "--force", worktree, check=False)

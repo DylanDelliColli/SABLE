@@ -761,6 +761,86 @@ def test_impact_timeout_defaults_repo_to_cwd_for_repo_less_callers(tmp_path, mon
 
 
 # --------------------------------------------------------------------------
+# The coverage-floor check's timeout reads the tier-budget SSOT (SABLE-cmar4.9)
+# --------------------------------------------------------------------------
+#
+# Before this bead, _coverage_floor_timeout() returned a fresh hand-picked
+# 600 — a second hardcoded promote-path constant landed after w0zjm's
+# derivable-budget mechanism existed, the same class jd5fj.9 just closed for
+# _impact_timeout. It must now derive from the same SSOT, borrowing
+# merge_preview's budget the same way _impact_timeout does.
+
+_DISTINCTIVE_COVERAGE_BUDGET_TIERS_SH = (
+    "#!/usr/bin/env bash\n"
+    'if [ "$1" = "--budget" ] && [ "$2" = "merge_preview" ]; then\n'
+    "  echo 54321\n"
+    "  exit 0\n"
+    "fi\n"
+    "exit 1\n"
+)
+
+
+def test_coverage_floor_timeout_reads_the_tier_ssot(tmp_path, monkeypatch):
+    """(a) A DISTINCTIVE budget (54321 — cannot pass by coincidence against
+    the old 600 or the impact tier's 900, the ambient-satisfaction trap that
+    cost jd5fj.15 a revise cycle) from a repo-local test-tiers.sh is picked
+    up in place of the old literal."""
+    monkeypatch.delenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", raising=False)
+    repo, _ = _real_repo(tmp_path)
+    _write_tiers_sh(repo, _DISTINCTIVE_COVERAGE_BUDGET_TIERS_SH)
+    assert promote_lib._coverage_floor_timeout(repo) == 54321.0
+
+
+def test_coverage_floor_timeout_override_still_wins_over_the_ssot(tmp_path, monkeypatch):
+    """(b) SABLE_MG_COVERAGE_FLOOR_TIMEOUT is an explicit override and must
+    win even when the SSOT resolves to a different, equally distinctive
+    value."""
+    repo, _ = _real_repo(tmp_path)
+    _write_tiers_sh(repo, _DISTINCTIVE_COVERAGE_BUDGET_TIERS_SH)
+    monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "42")
+    assert promote_lib._coverage_floor_timeout(repo) == 42.0
+
+
+def test_coverage_floor_timeout_falls_back_without_raising_on_a_missing_ssot(tmp_path, monkeypatch):
+    """(c) No .github/ci/test-tiers.sh at all: never raise, fall back to the
+    pre-fix constant (600) — a missing SSOT must not block the gate."""
+    monkeypatch.delenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", raising=False)
+    repo, _ = _real_repo(tmp_path)
+    assert not (Path(repo) / ".github" / "ci" / "test-tiers.sh").exists()
+    assert promote_lib._coverage_floor_timeout(repo) == 600.0
+
+
+def test_coverage_floor_timeout_falls_back_without_raising_on_a_broken_ssot(tmp_path, monkeypatch):
+    """(c) A test-tiers.sh that exists but cannot answer (non-zero exit, no
+    stdout) must fall back the same way, not raise."""
+    monkeypatch.delenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", raising=False)
+    repo, _ = _real_repo(tmp_path)
+    _write_tiers_sh(repo, _BROKEN_TIERS_SH)
+    assert promote_lib._coverage_floor_timeout(repo) == 600.0
+
+
+def test_coverage_floor_timeout_falls_back_without_raising_on_an_unparseable_override(tmp_path, monkeypatch):
+    """(c) An unparseable explicit override must not raise either — mirrors
+    the pre-fix try/except ValueError contract that guarded this same env
+    var before this bead."""
+    repo, _ = _real_repo(tmp_path)
+    _write_tiers_sh(repo, _DISTINCTIVE_COVERAGE_BUDGET_TIERS_SH)
+    monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "not-a-number")
+    assert promote_lib._coverage_floor_timeout(repo) == 600.0
+
+
+def test_coverage_floor_timeout_defaults_repo_to_cwd_for_repo_less_callers(tmp_path, monkeypatch):
+    """_coverage_floor_timeout() must still answer by falling back to the
+    current working directory when called with no repo argument, mirroring
+    _impact_timeout's repo-less contract."""
+    monkeypatch.delenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", raising=False)
+    repo, _ = _real_repo(tmp_path)
+    _write_tiers_sh(repo, _DISTINCTIVE_COVERAGE_BUDGET_TIERS_SH)
+    monkeypatch.chdir(repo)
+    assert promote_lib._coverage_floor_timeout() == 54321.0
+
+
+# --------------------------------------------------------------------------
 # The bin/ pytest half's warm/cold .testmondata visibility (SABLE-jd5fj.8)
 # --------------------------------------------------------------------------
 
