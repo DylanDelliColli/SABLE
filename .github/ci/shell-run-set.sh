@@ -176,7 +176,7 @@ declare -A COVERS=(
   [test-tdd-gate.sh]="hooks/tdd-gate.sh"
   [test-tier-budget-bead.sh]="bin/sable_gate_budget_lib.py bin/sable_gate_promote_lib.py bin/sable-merge-gate"
   [test-tier-ssot-consumers.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
-  [test-tree-claim.sh]="hooks/multi-manager/tree-claim.sh"
+  [test-tree-claim.sh]="hooks/multi-manager/tree-claim.sh hooks/multi-manager/tree-claim-impl.sh"
   [test-worktree-placement-guard.sh]="hooks/multi-manager/worktree-placement-guard.sh"
 )
 
