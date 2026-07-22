@@ -157,6 +157,23 @@ What this means for the queue:
 - **Never close a for-chuck bead as "merged" before the promotion lands.** The
   close is what other people's readiness reads.
 
+**Containment checks outside the promote path — use `sable-contained`, never a
+hand-rolled git probe.** `sable-merge-gate verdict`/`promote` are already the
+mechanized, trustworthy path for the merges you drive yourself — this rule is
+for everything else you verify: reconcile-handoffs triage, hold review, and
+sanity-checking a manager's "merged" claim before you relay or act on it. For
+those, use `sable-contained <sha>` (commit) or `sable-contained --path
+<expected-file>` (the property probe, against the integration ref). Exit 0
+CONTAINED / 1 NOT-CONTAINED / 3 the two methods DISAGREE / 4 COULD NOT ASSESS
+— anything but 0 means HOLD, not "probably fine." Both raw idioms have a
+silent hold-RELEASING failure: `merge-base --is-ancestor` inverts without
+warning (SABLE-gdp05), and `git ls-tree <ref> <path>` EXITS 0 FOR AN ABSENT
+PATH, so `ls-tree ... && echo PRESENT` reports a file as on-spine when it is
+not (SABLE-4snb4). You are the seat that makes more of these calls than both
+manager lanes combined — every promote-verification and reconcile triage ends
+in "did this actually land," and a hand-rolled probe cannot express DISAGREE,
+so you cannot notice you needed it.
+
 ## Delegation rules
 File a `for-<author>` bead when:
 - Two branches modified overlapping logic in the same function

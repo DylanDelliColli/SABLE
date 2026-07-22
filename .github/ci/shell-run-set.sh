@@ -91,6 +91,7 @@ ALLOW=(
   test-quickstart-orchestration.sh
   test-read-guard.sh
   test-registry.sh
+  test-role-card-install.sh
   test-role.sh
   test-sable-bin-install.sh
   test-sable-claim.sh
@@ -220,6 +221,7 @@ declare -A COVERS=(
   [test-preview-kick.sh]="hooks/multi-manager/post-push-merge-notify.sh"
   [test-read-guard.sh]="hooks/multi-manager/read-guard.sh"
   [test-registry.sh]="hooks/multi-manager/lib-registry-path.sh"
+  [test-role-card-install.sh]="bin/sable-orchestration-install templates/multi-manager/roles/lincoln.md templates/multi-manager/roles/optimus.md templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/chuck.md"
   [test-sable-contained.sh]="bin/sable-contained"
   [test-sable-mode.sh]="hooks/multi-manager/lib-mode-path.sh"
   [test-sable-msg.sh]="bin/sable-msg bin/sable_pane_lib.py"

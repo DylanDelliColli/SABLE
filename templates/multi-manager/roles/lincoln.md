@@ -122,6 +122,21 @@ whole system when a scoped answer will do.
 - **What's next** — almost-done / blocked / recommended next kickoff / what
   you'd file (await operator approval before filing direction beads).
 
+**A manager's "merged" claim is a claim, not a fact — verify containment with
+`sable-contained`, never a hand-rolled git probe, before you relay it upward or
+act on it.** You are the one place every lane's status gets synthesized, which
+means you are also the one place a lane's own confusion about closed-vs-merged
+propagates to the operator if you don't catch it. This already happened live
+(SABLE-7yked): a manager relayed a bead as CLOSED+MERGED, and only a Lincoln
+probe caught that the branch was still queued at Chuck's seat. Use
+`sable-contained <sha>` (commit) or `sable-contained --path <expected-file>`
+(the property probe, against the integration ref) — exit 0 CONTAINED / 1
+NOT-CONTAINED / 3 the two methods DISAGREE / 4 COULD NOT ASSESS, anything but
+0 means don't repeat the claim as fact. The raw idioms fail silently in the
+claim-confirming direction: `merge-base --is-ancestor` inverts without warning
+(SABLE-gdp05), and `git ls-tree <ref> <path> && echo PRESENT` reports a file
+present when it is absent (SABLE-4snb4).
+
 ## Inbox
 
 Your inbox is `for-lincoln`: operator direction, plus escalations/arbitration
