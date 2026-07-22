@@ -64,11 +64,19 @@ declare -A SABLE_TIER_BUDGET_SEC=(
 # pre_push: curated fast subset for the local pre-push hook. Previously
 # hardcoded as a shell loop in this repo's own .sable `testCommand=` line —
 # that duplication is gone now; .sable instead calls `--run pre_push` below.
+#
+# test-shell-run-set-strict.sh earns its place here despite also being in
+# merge_preview: its case (f) is the ONLY execution of shell-run-set.sh
+# --check-beads against the REAL bead store, and that mode is local-only by
+# construction — the ci-verify clean room has no bd (SABLE-59zu), so in
+# merge_preview case (f) self-skips. Pre-push is therefore where an exclusion
+# whose tracking bead has since closed actually gets caught (SABLE-wqe2e).
 SABLE_TIER_PRE_PUSH=(
   test-pre-push-rebase-test.sh
   test-lib-identity.sh
   test-tdd-gate.sh
   test-worktree-isolation.sh
+  test-shell-run-set-strict.sh
 )
 
 SABLE_TIER_MERGE_PREVIEW=("${ALLOW[@]}")
