@@ -622,7 +622,18 @@ def impact_tier_lock(repo: str | os.PathLike = "."):
     flock, not a pidfile: the kernel releases it when the holder dies, so a
     crashed or killed promote cannot wedge the seat. Acquisition polls a
     non-blocking flock rather than blocking in the kernel so the wait is bounded
-    and the give-up is a value (IMPACT_ERROR) rather than a hang."""
+    and the give-up is a value (IMPACT_ERROR) rather than a hang.
+
+    HERMETICIZATION LANDED (SABLE-jd5fj.15): _impact_isolated_env now gives
+    every suite/override invocation its own BEADS_DB/HOME/TMPDIR, so the
+    underlying collision this lock queues around is gone, not merely
+    serialized — hooks/test/test-impact-tier-serialization.sh's S7 proves two
+    REAL concurrent tiers with this lock DISABLED (SABLE_MG_IMPACT_SERIALIZE=0)
+    neither observe nor corrupt each other's state. This lock stays ON by
+    default anyway: it is now a belt-and-suspenders mechanical rule rather than
+    the only thing standing between a promote burst and a false-RED, and
+    dropping a control that is still free is a separate, deliberately
+    unbundled decision, not a corollary of this one landing."""
     if not impact_serialization_enabled():
         yield 0.0
         return
@@ -719,6 +730,89 @@ def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, st
         return (IMPACT_ERROR, f"impact tier never started: {exc}")
 
 
+def _impact_isolated_env(parent: str | os.PathLike) -> dict[str, str]:
+    """Build the per-run env every suite/override invocation in
+    _run_impact_tier_locked runs under (SABLE-jd5fj.15): an isolated bd DB, an
+    isolated HOME carrying a read-only VIEW of the live ~/.claude/settings.json,
+    and TMPDIR scoped to this run's own scratch parent.
+
+    WHY THIS KILLS THE CLASS jd5fj.13 ONLY QUEUED. The iron-rule suites this
+    tier selects (test-dep-merge-state.sh, test-overlap-dispatch-e2e.sh, and
+    anything else the manifest picks) are deliberately non-hermetic: real bd
+    (sandbox-scoped beads, dep graphs, the DB lock), the real
+    sable-spawn-worker binary, live ~/.claude/settings.json reachability
+    checks. They read AND WRITE that shared live state, which is exactly what
+    let two concurrent tiers false-RED each other under a pile-up. jd5fj.13
+    queued around that with an flock; this makes the underlying collision
+    impossible instead, by giving each run its own copy of every piece of
+    state the suites touch. `parent` is the caller's own tempfile.mkdtemp,
+    already unique per run — nesting the sandbox under it is what makes two
+    concurrent run_impact_tier calls land in DIFFERENT scratch parents.
+
+    A FRESH bd DB, NOT A COPY of the real one. The suites create their own
+    scratch beads (blocker/dependent, A/B) and never assert anything about
+    pre-existing real bead content or the real issue prefix (checked: both
+    suites extract IDs by regex from their OWN `bd create` output, never a
+    hardcoded prefix) — so a fresh, freshly-initialized DB satisfies every
+    assertion they make while guaranteeing no real bead can leak in or out.
+
+    BD-ABSENT DEGRADES, IT DOES NOT FAIL THE TIER. If bd is not on PATH at all
+    (the ci-verify clean-room, SABLE-59zu, ships none), there is nothing to
+    isolate — the suites' own `command -v bd` guard already self-skips their
+    real-bd legs exactly as before, so BEADS_DB is simply left unset rather
+    than pointed at a DB this env can never build. The audit this bead's
+    WHERE note asked for landed here: the risk was never bd's ABSENCE (the
+    suites already handle that loudly), it was a REDIRECT to an uninitialized
+    DB — `bd create` against a bare directory fails outright and several
+    call sites read that failure as "could not create the scratch bead" and
+    silently `exit 0` (skip), which would have looked like a pass. Only
+    surface an error when bd IS present and the isolated DB still could not
+    be built — that really did not happen before and deserves an IMPACT_ERROR
+    (full re-preview), not a silent downgrade to the old shared-state path.
+
+    A COPY, not a symlink or a live pointer, of ~/.claude/settings.json — a
+    VIEW, so the live-matcher reachability check in test-dep-merge-state.sh
+    still exercises the real registration instead of skipping for want of a
+    settings file, chmod'd read-only so an accidental write inside the sandbox
+    fails loud instead of silently diverging from the file every other
+    concurrent run is also reading."""
+    parent = Path(parent)
+    home = parent / "home"
+    scratch_tmp = parent / "tmp"
+    home.mkdir(parents=True, exist_ok=True)
+    scratch_tmp.mkdir(parents=True, exist_ok=True)
+
+    real_settings = Path(os.environ.get("CLAUDE_SETTINGS")
+                          or (Path.home() / ".claude" / "settings.json"))
+    if real_settings.is_file():
+        dest_dir = home / ".claude"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / "settings.json"
+        shutil.copy2(real_settings, dest)
+        dest.chmod(0o444)
+
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["TMPDIR"] = str(scratch_tmp)
+
+    if shutil.which("bd") is None:
+        return env
+
+    beads_root = parent / "beads"
+    beads_root.mkdir(parents=True, exist_ok=True)
+    init = subprocess.run(
+        ["bd", "init", "--prefix=impacttier"], cwd=str(beads_root),
+        env={**os.environ, "BD_NON_INTERACTIVE": "1"},
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
+    )
+    if init.returncode != 0:
+        raise RuntimeError(
+            f"bd is on PATH but the isolated impact-tier bd DB failed to initialize "
+            f"at {beads_root}: {init.stdout.strip()[:400]}")
+    env["BEADS_DB"] = str(beads_root / ".beads")
+    return env
+
+
 def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, str]:
     """The tier itself, with the seat's serialization lock already held. Reports
     (IMPACT_GREEN|IMPACT_RED|IMPACT_ERROR, detail).
@@ -750,9 +844,14 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str]) -> tuple
         if add.returncode != 0:
             return (IMPACT_ERROR, f"could not check out the combined tree: {add.stdout.strip()[:400]}")
         try:
+            # SABLE-jd5fj.15: every suite/override invocation below runs under
+            # its own isolated BEADS_DB/HOME/TMPDIR, nested under this run's
+            # OWN scratch parent — see _impact_isolated_env for why that is
+            # what kills the false-RED class jd5fj.13 could only queue around.
+            env = _impact_isolated_env(parent)
             if override:
                 cp = git_lib._run(override + list(paths), cwd=worktree, check=False,
-                                  timeout=_impact_timeout())
+                                  timeout=_impact_timeout(), env=env)
                 return ((IMPACT_GREEN, "impact tier override reported green") if cp.returncode == 0
                         else (IMPACT_RED, f"impact tier override failed (rc={cp.returncode}): "
                                           f"{cp.stdout.strip()[:400]}"))
@@ -768,7 +867,7 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str]) -> tuple
                     return (IMPACT_ERROR, f"impact tier selected {suite} but it is missing "
                                           f"from the combined tree")
                 cp = git_lib._run(["bash", str(suite_path)], cwd=worktree, check=False,
-                                  timeout=_impact_timeout())
+                                  timeout=_impact_timeout(), env=env)
                 ran.append(suite)
                 if cp.returncode != 0:
                     return (IMPACT_RED, f"{suite} FAILED on the combined tree (rc={cp.returncode}): "
@@ -781,7 +880,7 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str]) -> tuple
                 if warm_source is not None:
                     shutil.copy2(warm_source, Path(worktree) / ".testmondata")
                 cp = git_lib._run([sys.executable, str(selector)], cwd=worktree, check=False,
-                                  timeout=_impact_timeout())
+                                  timeout=_impact_timeout(), env=env)
                 # SABLE-jd5fj.8: name whichever path tier_selection.py ITSELF
                 # actually took (its own stderr line, folded into cp.stdout by
                 # git_lib._run), not just whether a file was handed to it — a
