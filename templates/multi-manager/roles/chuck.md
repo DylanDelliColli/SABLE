@@ -91,6 +91,35 @@ Primary: you are **event-driven** — each framed `⟦SABLE-MSG⟧ from=<manager
    promotes on a moved base without a re-verification. `SABLE_MG_OPTIMISTIC=0`
    turns the whole path off if you ever need the old always-re-preview
    behaviour.
+
+   **If you wrap `promote` in a timeout, DERIVE the bound (SABLE-w0zjm).**
+
+   ```bash
+   timeout "$(sable-merge-gate promote-budget --seconds)" \
+     sable-merge-gate promote --bead <id> --branch <branch>
+   ```
+
+   Never hardcode it. A promote may legitimately spend an impact-tier QUEUE WAIT
+   (`SABLE_MG_IMPACT_LOCK_TIMEOUT`, default 3600s — the tier is serialized
+   one-at-a-time per seat, SABLE-jd5fj.13) plus the TIER'S OWN budget
+   (`SABLE_MG_IMPACT_TIMEOUT`, default 900s, which starts fresh AFTER the wait
+   and is not charged for it). Worst case is their SUM, ~4500s on stock
+   defaults — not 900s. `sable-merge-gate promote-budget` prints the breakdown.
+
+   This bit a real seat: the wrapper was 900s, the same number as the tier
+   budget, sized back when the optimistic path essentially never ran (0 of 157
+   promotions). Once jd5fj.4 started routing cost into the local promote, that
+   wrapper could kill a promote at the exact instant the tier was still entitled
+   to be running. The kill is SAFE — nothing is pushed before a green verdict, so
+   the tip is unmoved and the ci-verify ref is still there to retry — but it
+   surfaces as a mysterious promote failure, and the natural misdiagnosis is
+   "the optimistic path is broken". If a promote dies with no verdict line after
+   `ENTERING IMPACT TIER`, suspect your wrapper before you suspect the gate.
+
+   The general rule, which outlives this instance: **a change that moves cost
+   across a process boundary invalidates every timeout sized against the old
+   behaviour** — and those timeouts live in your wrappers, where no repo-side
+   test can see them.
 6. Close the for-chuck bead.
 
 **The flow in one line: read-verdict → sequence → promote.** Reading is
