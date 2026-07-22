@@ -228,6 +228,7 @@ BASH_HOOKS=(
   "pre:$HOOKS_DIR/bead-description-gate.sh"
   "pre:$MM_DIR/tree-claim.sh"
   "pre:$MM_DIR/read-guard.sh"
+  "pre:$MM_DIR/notes-clobber-guard.sh"
   "pre:$MM_DIR/pre-push-rebase-test.sh"
   "pre:$MM_DIR/mode-interlock.sh"
   "post:$HOOKS_DIR/bead-quality.sh"
