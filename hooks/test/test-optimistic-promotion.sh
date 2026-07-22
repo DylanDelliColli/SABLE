@@ -123,6 +123,31 @@ print(json.dumps([{"databaseId": 1, "headSha": sha, "status": "completed",
 EOF
 chmod +x "$FAKE_GH"
 
+# SABLE-jd5fj.18: `bd show <bead>` used by every scenario UNLESS a scenario
+# overrides SABLE_MG_BD itself. It declares an EXPLICIT, empty '## File
+# reads' section, so the read-write floor's undeclared-reads-forces-serialize
+# default (see sable_footprint_lib.declared_reads) does not fire on the C1-C9
+# scenarios above, none of which are testing that floor. C10-C12 below
+# override SABLE_MG_BD per-scenario to exercise it directly.
+FAKE_BD_READS_NONE="$TMPROOT/fake-bd-reads-none"
+cat > "$FAKE_BD_READS_NONE" <<'EOF'
+#!/bin/sh
+echo '## File reads'
+echo 'none'
+EOF
+chmod +x "$FAKE_BD_READS_NONE"
+
+# SABLE-jd5fj.18: a `bd show` stub that declares a REAL read footprint —
+# .github/ci/impact-manifest.sh, a file that already exists in seed_repo's
+# tree, so C10-C11 can put a real base-move edit under it.
+FAKE_BD_READS_IMPACT_MANIFEST="$TMPROOT/fake-bd-reads-impact-manifest"
+cat > "$FAKE_BD_READS_IMPACT_MANIFEST" <<'EOF'
+#!/bin/sh
+echo '## File reads'
+echo '.github/ci/impact-manifest.sh'
+EOF
+chmod +x "$FAKE_BD_READS_IMPACT_MANIFEST"
+
 # SABLE-mbkbm: reads the per-phase impact-tier journal (impact-tier-windows.jsonl)
 # a real promote just wrote and checks one of two properties against the SAME
 # paired start/end record, never against an inferred split:
@@ -288,7 +313,7 @@ commit_push() {
 gate() {
   env FAKE_GH_ORIGIN="$B_ORIGIN" FAKE_GH_BASE="$BASE_BR" \
       FAKE_GH_MODE="${FAKE_GH_MODE:-success}" FAKE_GH_ADVANCE="${FAKE_GH_ADVANCE:-}" \
-      SABLE_MG_GH="$FAKE_GH" SABLE_MG_BD=true SABLE_MG_NOTIFY=true \
+      SABLE_MG_GH="$FAKE_GH" SABLE_MG_BD="${SABLE_MG_BD:-$FAKE_BD_READS_NONE}" SABLE_MG_NOTIFY=true \
       SABLE_MG_POLL=0 SABLE_MG_GRACE=0 SABLE_MG_TIMEOUT=0 \
       SABLE_MG_OPTIMISTIC="${SABLE_MG_OPTIMISTIC:-1}" \
       SLOW_TIER="${SLOW_TIER:-}" \
@@ -303,7 +328,7 @@ gate_wrapped() {
   local secs="$1"; shift
   timeout "$secs" env FAKE_GH_ORIGIN="$B_ORIGIN" FAKE_GH_BASE="$BASE_BR" \
       FAKE_GH_MODE="${FAKE_GH_MODE:-success}" FAKE_GH_ADVANCE="${FAKE_GH_ADVANCE:-}" \
-      SABLE_MG_GH="$FAKE_GH" SABLE_MG_BD=true SABLE_MG_NOTIFY=true \
+      SABLE_MG_GH="$FAKE_GH" SABLE_MG_BD="${SABLE_MG_BD:-$FAKE_BD_READS_NONE}" SABLE_MG_NOTIFY=true \
       SABLE_MG_POLL=0 SABLE_MG_GRACE=0 SABLE_MG_TIMEOUT=0 \
       SABLE_MG_OPTIMISTIC="${SABLE_MG_OPTIMISTIC:-1}" \
       SLOW_TIER="${SLOW_TIER:-}" \
@@ -357,6 +382,9 @@ mut_base_api_last()        { sed -i '5s/.*/api_d=2/' "$B_WORK/left/api.sh"; }
 mut_branch_modify_caller() { echo 'caller_v=2' > "$B_WORK/right/caller.sh"; }
 mut_base_delete_caller()   { git -C "$B_WORK" rm -q "right/caller.sh"; }
 mut_base_lockfile()        { echo 'resolved=1' > "$B_WORK/package-lock.json"; }
+# SABLE-jd5fj.18: edits a file the read-write floor scenarios declare the
+# branch READS, via SABLE_MG_BD, never via a branch-side write.
+mut_base_edit_impact_manifest() { echo '# touched by base move' >> "$B_WORK/.github/ci/impact-manifest.sh"; }
 
 # ==========================================================================
 # C1 — disjoint + stale base + green combined tree
@@ -672,6 +700,88 @@ if [ "$(SABLE_MG_IMPACT_TIMEOUT=8 SABLE_MG_IMPACT_SERIALIZE=0 \
   pass "C9: C8's wrapper (120s) is above what the gate itself would recommend for an 8s tier"
 else
   fail "C9: C8's wrapper is above the recommended bound" "recommendation exceeds 120s"
+fi
+
+# ==========================================================================
+# C10 — SABLE-jd5fj.18 read-write floor, POSITIVE CONTROL: a declared,
+#       genuinely disjoint read set still takes the optimistic path
+# ==========================================================================
+# Non-vacuity for C11 below: the floor must not simply serialize everything
+# once a '## File reads' section exists. A branch that declares a read
+# footprint truly disjoint from the base-move's writes still promotes.
+scenario c10 mut_branch_disjoint_ok mut_base_disjoint_ok
+OUT="$(SABLE_MG_BD="$FAKE_BD_READS_IMPACT_MANIFEST" FAKE_GH_ADVANCE="$MOVED_SHA" \
+      gate promote --bead TEST-C10 --branch wk-1 --base "$BASE_BR" --repo "$B_WORK" --remote origin)"; RC=$?
+if [ "$RC" -eq 0 ]; then
+  pass "C10: a declared, genuinely disjoint read set still promotes on the optimistic path (exit 0)"
+else
+  fail "C10: a declared disjoint read set still promotes" "rc=$RC out=$OUT"
+fi
+
+# ==========================================================================
+# C11 — SABLE-jd5fj.18 THE DEFECT'S LIVE SHAPE: footprint-disjoint on WRITES,
+#       but the branch READS a file the base-move EDITS -- must NOT promote
+# ==========================================================================
+# The live instance this bead was filed against: SABLE-jd5fj.8 writes bin/ and
+# READS .github/ci/test-tiers.sh; SABLE-cmar4.5 (played by the base-move here)
+# writes .github/ci/ files including that interface. No file is written by
+# both sides -- the pre-jd5fj.18 gate would have promoted this in parallel.
+scenario c11 mut_branch_disjoint_ok mut_base_edit_impact_manifest
+OUT="$(SABLE_MG_BD="$FAKE_BD_READS_IMPACT_MANIFEST" FAKE_GH_ADVANCE="$MOVED_SHA" \
+      gate promote --bead TEST-C11 --branch wk-1 --base "$BASE_BR" --repo "$B_WORK" --remote origin)"; RC=$?
+if [ "$RC" -eq 23 ]; then
+  pass "C11: a branch that READS a file the base-move EDITS is NOT promoted in parallel (exit 23)"
+else
+  fail "C11: read-write coupling forces a full re-preview" "rc=$RC out=$OUT"
+fi
+if [ "$(origin_sha "$BASE_BR")" = "$MOVED_SHA" ]; then
+  pass "C11: nothing was promoted onto the moved base"
+else
+  fail "C11: nothing was promoted onto the moved base" "base=$(origin_sha "$BASE_BR")"
+fi
+if printf '%s' "$OUT" | grep -q 'impact-manifest.sh'; then
+  pass "C11: the refusal names the coupled read path (auditable evidence, not a bare code)"
+else
+  fail "C11: the refusal names the coupled read path" "out=$OUT"
+fi
+if printf '%s' "$OUT" | grep -qi 'read/write coupling'; then
+  pass "C11: the refusal is attributed to read/write coupling, distinguishable from a bare write overlap"
+else
+  fail "C11: the refusal distinguishes read/write coupling from other refusal reasons" "out=$OUT"
+fi
+# Non-vacuity: the write footprints alone are genuinely disjoint here, so this
+# case exercises the NEW read-write conjunct and not C3's already-covered
+# write/write overlap.
+if git -C "$B_WORK" merge-tree --write-tree "$MOVED_SHA" "$WK_SHA" >/dev/null 2>&1; then
+  pass "C11: git itself considers the merge textually clean -- the refusal is the read-write floor's own added safety"
+else
+  fail "C11: the merge should be textually clean" "merge-tree reported a conflict"
+fi
+
+# ==========================================================================
+# C12 — SABLE-jd5fj.18 SECOND CONTROL: an UNDECLARED read set forces
+#       serialization even though the write footprints are disjoint
+# ==========================================================================
+# Distinguishable from C11 in the OUTPUT, not only in the decision: C11 says
+# it COULD tell and the paths conflict; C12 says it could NOT tell at all --
+# "I could not tell" and "I can tell, and they conflict" must not read the same.
+scenario c12 mut_branch_disjoint_ok mut_base_disjoint_ok
+OUT="$(SABLE_MG_BD=true FAKE_GH_ADVANCE="$MOVED_SHA" \
+      gate promote --bead TEST-C12 --branch wk-1 --base "$BASE_BR" --repo "$B_WORK" --remote origin)"; RC=$?
+if [ "$RC" -eq 23 ]; then
+  pass "C12: an undeclared read set forces serialization even on write-disjoint footprints (exit 23)"
+else
+  fail "C12: an undeclared read set forces serialization" "rc=$RC out=$OUT"
+fi
+if printf '%s' "$OUT" | grep -qi 'undetermined'; then
+  pass "C12: the refusal says the read set was undetermined (distinct from C11's found conflict)"
+else
+  fail "C12: the refusal names the undetermined read set, distinct from a real conflict" "out=$OUT"
+fi
+if ! printf '%s' "$OUT" | grep -qi 'read/write coupling'; then
+  pass "C12: the undetermined case is NOT reported as a found conflict -- the two decisions stay distinguishable in the report"
+else
+  fail "C12: the undetermined case must not read like a found read/write conflict" "out=$OUT"
 fi
 
 echo "----------------------------------------------------------------------"
