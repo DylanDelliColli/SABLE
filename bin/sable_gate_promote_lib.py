@@ -74,6 +74,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -343,6 +344,122 @@ def _selected_suites(worktree: str, paths: list[str]) -> list[str]:
         raise RuntimeError(f"impact selection failed: {sel.stdout.strip()[:400]}")
     return [ln.strip() for ln in sel.stdout.splitlines()
             if ln.strip() and not ln.startswith("::")]
+
+
+# --------------------------------------------------------------------------
+# The bin/ pytest half's warm .testmondata (SABLE-jd5fj.8)
+# --------------------------------------------------------------------------
+#
+# tier_selection.build_impact_tier_plan falls back to a conservative FULL
+# bin/ run whenever ITS repo (the throwaway combined-tree worktree) has no
+# .testmondata -- and a fresh `git worktree add` never does. The pytest half
+# below best-effort copies one in before invoking the selector, from either
+# of two sources, in priority order:
+#
+#   1. `repo`'s OWN root .testmondata -- CI's copy, when the checkout running
+#      the gate happens to carry one (ci-verify's testmon-cache-warm.sh warms
+#      exactly this file on the runner).
+#   2. WARM_TESTMON_FILE under this repo's gate-owned state dir
+#      (snapshot_lib.state_dir -- shared by every worktree of this repo,
+#      resolved through git-common-dir). Chuck's own checkout is NOT
+#      guaranteed to carry (1) either -- it is the runner's artifact, never
+#      fetched down -- so (2) is this bead's actual fix for that gap: a
+#      LOCAL, gate-owned copy that survives a `git clean`, a fresh worktree,
+#      or a checkout that never itself ran a cache-warm pytest pass. It is
+#      refreshed by `sable-merge-gate warm-testmon-cache` (warm_gate_testmon_cache
+#      below), meant to be run periodically/by an operator -- NOT
+#      automatically after every impact-tier run, because neither tier mode
+#      (build_impact_tier_plan's "selected" or "full") passes pytest-testmon's
+#      own --testmon/--testmon-noselect flags, so a real impact-tier pytest
+#      invocation never updates .testmondata itself. Only an explicit
+#      --testmon-noselect full run (what warm_gate_testmon_cache and CI's
+#      testmon-cache-warm.sh both do) does.
+#
+# Neither existing is the genuinely-cold case, reported honestly below.
+
+WARM_TESTMON_FILE = "testmondata-warm"
+
+# tier_selection.py's own stderr line ("tier_selection: <mode> -- <reason>"),
+# folded into stdout by git_lib._run's stderr=STDOUT. Parsing THIS instead of
+# inferring warm/cold purely from file presence is the actual FAIL-VISIBLE
+# fix: a warm map that is present but STALE or CORRUPT still gets handed to
+# the selector, and build_impact_tier_plan already detects that (a broken
+# pytest-testmon collector exits outside {0, 5}) and falls back to a full run
+# -- but only THIS line says so. Reporting "warm testmon map" from file
+# presence alone, as the prior revision of this bead did, would silently
+# under-report that internal fallback as a scoped success: exactly the
+# under-selection the bead's ownership notes require to fail visible.
+_TIER_SELECTION_LINE = re.compile(r"^tier_selection: (\w+) -- (.+)$", re.MULTILINE)
+
+
+def _warm_testmondata_path(repo: str) -> Path:
+    """Where the gate persists its own warm .testmondata, independent of
+    whether `repo`'s own root carries one. See the module comment above."""
+    return snapshot_lib.ensure_state_dir(repo) / WARM_TESTMON_FILE
+
+
+def _warm_testmondata_source(repo: str) -> tuple[Path | None, str]:
+    """Which .testmondata (if any) the pytest half should copy into the
+    throwaway worktree, and the label to report if tier_selection.py's own
+    reason line (see _tier_selection_reason) is unavailable for some reason.
+    Priority: repo's own root, then the gate's persisted cache, then none."""
+    own = Path(repo) / ".testmondata"
+    if own.is_file():
+        return own, "warm testmon map"
+    persisted = _warm_testmondata_path(repo)
+    if persisted.is_file():
+        return persisted, "warm testmon map (gate cache)"
+    return None, "no warm .testmondata -- full run"
+
+
+def _tier_selection_reason(output: str) -> str | None:
+    """Pull tier_selection.py's own mode/reason line out of its captured
+    output, or None if the line is missing (an override, or a selector too
+    old to print it) so the caller falls back to its own warm/cold label
+    instead of a blank detail."""
+    m = _TIER_SELECTION_LINE.search(output)
+    return m.group(2) if m else None
+
+
+def _refresh_warm_testmondata(repo: str, updated: Path) -> None:
+    """Copy `updated` (a .testmondata that a REAL --testmon/--testmon-noselect
+    run just wrote) into the gate's persisted cache. Best-effort: a failed
+    refresh only costs the NEXT promote's tier scoping, never its
+    correctness -- the next run degrades to whatever the old cache (or none)
+    reports, and that degradation is itself named in ITS OWN detail string."""
+    try:
+        if updated.is_file():
+            shutil.copy2(updated, _warm_testmondata_path(repo))
+    except OSError:
+        pass
+
+
+def warm_gate_testmon_cache(repo: str) -> int:
+    """Refresh the gate's persisted warm .testmondata (see the module
+    comment above) by running tier_selection.py's own --cache-warm directly
+    against `repo` -- the SAME full bin/ suite + tolerant classification of
+    the known pytest-testmon extensionless-file crash that
+    .github/ci/testmon-cache-warm.sh runs on CI's ephemeral runner, just run
+    locally so a checkout that never fetches CI's own copy still gets one.
+    Meant to be invoked periodically or by an operator
+    (`sable-merge-gate warm-testmon-cache`) -- it pays the full bin/ suite
+    itself, which is exactly the cost this bead exists to keep OFF the
+    promote path, so it must never run automatically inside run_impact_tier.
+    Returns tier_selection.py's own exit code (0 = warm, non-zero = a real
+    failure -- see classify_cache_warm_outcome for what it tolerates)."""
+    selector = Path(repo) / "bin" / "tier_selection.py"
+    if not selector.is_file():
+        print(f"sable-merge-gate: {repo} has no bin/tier_selection.py — nothing to warm",
+              file=sys.stderr)
+        return 1
+    cp = git_lib._run([sys.executable, str(selector), "--cache-warm"], cwd=repo,
+                      check=False, timeout=1800)
+    print(cp.stdout, end="")
+    if cp.returncode == 0:
+        _refresh_warm_testmondata(repo, Path(repo) / ".testmondata")
+        print(f"sable-merge-gate: gate-owned warm .testmondata refreshed at "
+              f"{_warm_testmondata_path(repo)}", file=sys.stderr)
+    return cp.returncode
 
 
 # --------------------------------------------------------------------------
@@ -659,19 +776,22 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str]) -> tuple
             # The pytest half, only when the footprint reaches bin/ at all.
             selector = Path(worktree) / "bin" / "tier_selection.py"
             if selector.is_file() and any(p.startswith("bin/") for p in paths):
-                warm = Path(repo) / ".testmondata"
-                warm_map = warm.is_file()
-                if warm_map:
-                    shutil.copy2(warm, Path(worktree) / ".testmondata")
+                warm_source, warm_label = _warm_testmondata_source(repo)
+                if warm_source is not None:
+                    shutil.copy2(warm_source, Path(worktree) / ".testmondata")
                 cp = git_lib._run([sys.executable, str(selector)], cwd=worktree, check=False,
                                   timeout=_impact_timeout())
-                # SABLE-jd5fj.8: the warm/cold split must be visible in the
-                # detail string on GREEN too, not just inferable from a RED's
-                # captured stdout — a silent cold-cache fallback to the FULL
-                # bin/ suite is the exact under-reporting the ownership notes
-                # on this bead call out as needing to FAIL VISIBLE.
-                ran.append("bin/ pytest impact tier (warm testmon map)" if warm_map
-                           else "bin/ pytest impact tier (no warm .testmondata -- full run)")
+                # SABLE-jd5fj.8: name whichever path tier_selection.py ITSELF
+                # actually took (its own stderr line, folded into cp.stdout by
+                # git_lib._run), not just whether a file was handed to it — a
+                # STALE or CORRUPT warm map is still handed in, and only the
+                # selector's own reason distinguishes a genuinely-used warm
+                # map from one that triggered ITS OWN internal collector-
+                # failure fallback to a full run. A silent cold/broken
+                # fallback reported as "warm" is the exact under-selection the
+                # ownership notes on this bead require to fail visible.
+                detail_reason = _tier_selection_reason(cp.stdout) or warm_label
+                ran.append(f"bin/ pytest impact tier ({detail_reason})")
                 if cp.returncode != 0:
                     return (IMPACT_RED, f"bin/ pytest impact tier FAILED on the combined tree "
                                         f"(rc={cp.returncode}): {cp.stdout.strip()[-800:]}")

@@ -347,6 +347,16 @@ def main(argv: list[str] | None = None) -> int:
                      help="just the recommended enclosing timeout, as a bare integer: "
                           "timeout \"$(sable-merge-gate promote-budget --seconds)\" ...")
 
+    # SABLE-jd5fj.8. Refreshes the gate-owned persisted warm .testmondata
+    # (see sable_gate_promote_lib's module comment on _warm_testmondata_path)
+    # by running the full bin/ suite with --testmon-noselect, same as CI's
+    # .github/ci/testmon-cache-warm.sh — meant to be run periodically or by
+    # an operator, NOT by the gate itself on every promote.
+    pw = sub.add_parser("warm-testmon-cache",
+                        help="refresh the gate-owned warm .testmondata used by the "
+                             "combined-tree impact tier's pytest half")
+    pw.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+
     args = parser.parse_args(argv)
     try:
         if args.command == "promote":
@@ -371,6 +381,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(promote_lib.format_impact_budget(budget))
             return 0
+        if args.command == "warm-testmon-cache":
+            return promote_lib.warm_gate_testmon_cache(args.repo)
     except classify.GateError as e:
         print(f"sable-merge-gate: {e}", file=sys.stderr)
         return e.code

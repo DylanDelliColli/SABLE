@@ -356,6 +356,32 @@ else
 fi
 
 # ==========================================================================
+# C1b — the gate's OWN persisted warm .testmondata (SABLE-jd5fj.8 approach (a))
+# ==========================================================================
+# C1 above is the genuinely-cold case: this sandbox's B_WORK never carries a
+# root .testmondata (a fresh clone every scenario), so it exercises the
+# "no warm .testmondata" fallback. C1b is the gap this bead's revision
+# actually closes: a checkout — like Chuck's real one — that ALSO never
+# carries a root .testmondata, but DOES have the gate's own persisted cache
+# under its state dir (populated by `sable-merge-gate warm-testmon-cache`,
+# unit-tested directly in bin/test_promote_decision.py). That persisted copy
+# must be used and named, not silently treated as cold a second time.
+scenario c1b mut_branch_disjoint_ok_with_bin mut_base_disjoint_ok
+mkdir -p "$B_WORK/.claude/sable/state/merge-gate"
+echo 'persisted gate cache' > "$B_WORK/.claude/sable/state/merge-gate/testmondata-warm"
+OUT="$(FAKE_GH_ADVANCE="$MOVED_SHA" gate promote --bead TEST-C1B --branch wk-1 --base "$BASE_BR" --repo "$B_WORK" --remote origin)"; RC=$?
+if [ "$RC" -eq 0 ]; then
+  pass "C1b: a disjoint stale base with only a persisted gate cache still promotes (exit 0)"
+else
+  fail "C1b: a disjoint stale base with only a persisted gate cache still promotes" "rc=$RC out=$OUT"
+fi
+if printf '%s' "$OUT" | grep -q 'warm testmon map (gate cache)'; then
+  pass "C1b: the gate's own persisted warm .testmondata was found and named, not treated as cold"
+else
+  fail "C1b: the gate's persisted warm .testmondata was named" "out=$OUT"
+fi
+
+# ==========================================================================
 # C2 — disjoint + stale base + RED combined tree (C1's non-vacuity)
 # ==========================================================================
 scenario c2 mut_branch_route mut_base_route
