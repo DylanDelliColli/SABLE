@@ -886,7 +886,7 @@ def _concurrent_tier_windows(monkeypatch, hold=0.30, workers=2):
     waits: list[float] = []
     guard = threading.Lock()
 
-    def fake_tier(repo, tree_sha, paths):
+    def fake_tier(repo, tree_sha, paths, phases=None):
         window = [time.monotonic(), None]
         with guard:
             windows.append(window)
@@ -896,7 +896,7 @@ def _concurrent_tier_windows(monkeypatch, hold=0.30, workers=2):
 
     monkeypatch.setattr(promote_lib, "_run_impact_tier_locked", fake_tier)
 
-    def record_wait(repo, event, tree_sha, waited):
+    def record_wait(repo, event, tree_sha, waited, phases=None):
         if event == "start":
             with guard:
                 waits.append(waited)
@@ -1073,6 +1073,157 @@ def test_the_tier_window_log_records_both_edges(isolated_lock, tmp_path, monkeyp
     assert [ln["event"] for ln in lines] == ["start", "end"]
     assert all(ln["pid"] == os.getpid() and ln["tree"] == sha[:12] for ln in lines)
     assert lines[1]["at"] >= lines[0]["at"]
+
+
+# --------------------------------------------------------------------------
+# Per-phase tier telemetry (SABLE-mbkbm) — INSTRUMENT FIRST, ANALYSE SECOND.
+# jd5fj.8 was dispatched on the ASSUMPTION that the cold-testmon pytest
+# fallback was a first-order tier cost; measured on a real footprint the warm
+# cache saved ~2%. These tests are for the instrument that makes the next such
+# call a measurement instead of another assumption.
+# --------------------------------------------------------------------------
+
+def _real_repo_with_shell_and_pytest_impact_tier(tmp_path):
+    """A real repo whose combined-tree impact tier reaches BOTH halves: one
+    real, fast, passing shell suite (test-thing.sh) AND the bin/ pytest half
+    (a fast stub tier_selection.py) — so a single run_impact_tier call can be
+    asserted to carry a "setup", a "shell:test-thing.sh", AND a "pytest" phase
+    entry all at once."""
+    r = tmp_path / "repo"
+    r.mkdir()
+    for args in (("init", "-q", "-b", "trunk"), ("config", "user.email", "t@sable.invalid"),
+                 ("config", "user.name", "SABLE Test")):
+        subprocess.run(["git", "-C", str(r), *args], check=True, capture_output=True)
+    (r / "bin").mkdir()
+    (r / "bin" / "thing.py").write_text("x = 1\n")
+    (r / "bin" / "tier_selection.py").write_text(_DEFAULT_TESTMON_STUB)
+    (r / "bin" / "tier_selection.py").chmod(0o755)
+    (r / ".github" / "ci").mkdir(parents=True)
+    (r / ".github" / "ci" / "impact-manifest.sh").write_text(
+        "#!/bin/sh\necho test-thing.sh\n")
+    (r / ".github" / "ci" / "impact-manifest.sh").chmod(0o755)
+    (r / "hooks" / "test").mkdir(parents=True)
+    (r / "hooks" / "test" / "test-thing.sh").write_text(
+        "#!/bin/sh\necho 'PASS: real thing suite'\n")
+    (r / "hooks" / "test" / "test-thing.sh").chmod(0o755)
+    subprocess.run(["git", "-C", str(r), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(r), "commit", "-q", "-m", "init"], check=True,
+                   capture_output=True)
+    sha = subprocess.run(["git", "-C", str(r), "rev-parse", "HEAD"], check=True,
+                         capture_output=True, text=True).stdout.strip()
+    return str(r), sha
+
+
+def test_run_impact_tier_records_a_per_phase_journal_entry_for_each_real_span(
+        isolated_lock, tmp_path, monkeypatch):
+    """UNIT (test spec, first bullet). A tier reaching both halves must emit a
+    versioned end record carrying a distinct phase entry for setup, the ONE
+    shell suite it ran (named, not lumped into a single "shell" bucket — the
+    whole point is finding which suite dominates), and the pytest half."""
+    repo, sha = _real_repo_with_shell_and_pytest_impact_tier(tmp_path)
+    monkeypatch.delenv("SABLE_MG_IMPACT", raising=False)
+    outcome, detail = promote_lib.run_impact_tier(repo, sha, ["bin/thing.py"])
+    assert outcome == promote_lib.IMPACT_GREEN, detail
+
+    lines = [json.loads(ln) for ln in
+             Path(isolated_lock / "windows.jsonl").read_text().splitlines() if ln.strip()]
+    end = next(ln for ln in lines if ln["event"] == "end")
+    assert end["schema"] == promote_lib.IMPACT_WINDOW_SCHEMA_VERSION
+    names = [p["name"] for p in end["phases"]]
+    assert "setup" in names, names
+    assert "shell:test-thing.sh" in names, names
+    assert "pytest" in names, names
+    # Every recorded span is a real, non-negative measurement — never a
+    # fabricated placeholder.
+    assert all(isinstance(p["seconds"], (int, float)) and p["seconds"] >= 0
+              for p in end["phases"])
+
+
+def test_a_shell_only_tier_emits_no_pytest_phase_entry(isolated_lock, tmp_path, monkeypatch):
+    """UNIT (test spec, NEGATIVE CONTROL). A footprint that never reaches bin/
+    must not name "pytest" at all — a fabricated 0.0 would be indistinguishable
+    from "ran instantly" and would poison any later aggregate."""
+    repo, sha = _real_repo_with_shell_and_pytest_impact_tier(tmp_path)
+    monkeypatch.delenv("SABLE_MG_IMPACT", raising=False)
+    outcome, detail = promote_lib.run_impact_tier(repo, sha, ["hooks/test/other.sh"])
+    assert outcome == promote_lib.IMPACT_GREEN, detail
+
+    lines = [json.loads(ln) for ln in
+             Path(isolated_lock / "windows.jsonl").read_text().splitlines() if ln.strip()]
+    end = next(ln for ln in lines if ln["event"] == "end")
+    names = [p["name"] for p in end["phases"]]
+    assert "shell:test-thing.sh" in names, names
+    assert "pytest" not in names, (
+        f"a footprint with no bin/ path must emit no pytest phase entry at all: {names}")
+
+
+def test_phase_report_excludes_legacy_records_instead_of_zero_counting_them(
+        isolated_lock, tmp_path, monkeypatch):
+    """UNIT (test spec, SECOND CONTROL). Old-format records (no "schema" key —
+    jd5fj.13's original five keys) must still parse without error and must be
+    EXCLUDED from phase aggregates, not counted as zero-duration phases, which
+    would silently understate whichever phase actually dominates."""
+    journal = isolated_lock / "windows.jsonl"
+    legacy_end = {"event": "end", "pid": 111, "at": 1000.0, "tree": "aaaaaaaaaaaa",
+                  "waited": 0.0}  # pre-mbkbm shape: no "schema", no "phases"
+    new_start = {"schema": 2, "event": "start", "pid": 222, "at": 2000.0,
+                "tree": "bbbbbbbbbbbb", "waited": 0.0}
+    new_end = {"schema": 2, "event": "end", "pid": 222, "at": 2010.0, "tree": "bbbbbbbbbbbb",
+              "waited": 0.0,
+              "phases": [{"name": "setup", "seconds": 1.0},
+                        {"name": "shell:test-real.sh", "seconds": 7.0},
+                        {"name": "pytest", "seconds": 2.0}]}
+    with open(journal, "w") as fh:
+        for rec in (legacy_end, new_start, new_end):
+            fh.write(json.dumps(rec) + "\n")
+
+    report = promote_lib.impact_tier_phase_report("/repo")
+    assert report["legacy_records_excluded"] == 1
+    assert report["tiers_with_phase_data"] == 1
+    assert set(report["phases"]) == {"setup", "shell:test-real.sh", "pytest"}
+    assert report["phases"]["shell:test-real.sh"]["n"] == 1
+    assert report["phases"]["shell:test-real.sh"]["median_s"] == 7.0
+    # The legacy record contributes NOTHING to any phase's sample — folding it
+    # in as a zero would drag every median down and hide the real dominant phase.
+    for stat in report["phases"].values():
+        assert stat["n"] == 1
+
+
+def test_phase_report_names_the_dominant_phase_with_explicit_n(isolated_lock, tmp_path):
+    """The phase-2 acceptance criterion: the report states n explicitly and
+    names whichever phase actually accounts for the largest share — never an
+    inferred split, and never silent about how many records it is based on."""
+    journal = isolated_lock / "windows.jsonl"
+    with open(journal, "w") as fh:
+        for i in range(3):
+            pid, tree = 300 + i, f"{'c' * 11}{i}"
+            fh.write(json.dumps({"schema": 2, "event": "start", "pid": pid, "at": float(i * 100),
+                                 "tree": tree, "waited": 0.0}) + "\n")
+            fh.write(json.dumps({"schema": 2, "event": "end", "pid": pid, "at": float(i * 100 + 20),
+                                 "tree": tree, "waited": 0.0,
+                                 "phases": [{"name": "setup", "seconds": 1.0},
+                                           {"name": "shell:test-slow.sh", "seconds": 15.0},
+                                           {"name": "pytest", "seconds": 3.0}]}) + "\n")
+    report = promote_lib.impact_tier_phase_report("/repo")
+    assert report["tiers_with_phase_data"] == 3
+    dominant = max(report["phases"], key=lambda name: report["phases"][name]["total_s"])
+    assert dominant == "shell:test-slow.sh"
+    assert report["phases"]["shell:test-slow.sh"]["share_of_total"] > 0.5
+
+    text = promote_lib.format_impact_tier_phase_report(report)
+    assert "n=3" in text
+    assert "shell:test-slow.sh" in text
+
+
+def test_phase_report_on_zero_records_states_zero_not_an_inferred_split(isolated_lock):
+    """DO NOT SKIP TO PHASE 2 ON THIN DATA — the report must say n=0, not
+    silently omit the phase section or synthesize a 0% / 100% split."""
+    report = promote_lib.impact_tier_phase_report("/repo")
+    assert report["tiers_with_phase_data"] == 0
+    assert report["phases"] == {}
+    text = promote_lib.format_impact_tier_phase_report(report)
+    assert "n=0" in text
+    assert "no per-phase measurements yet" in text
 
 
 # --------------------------------------------------------------------------

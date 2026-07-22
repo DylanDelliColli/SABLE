@@ -123,6 +123,75 @@ print(json.dumps([{"databaseId": 1, "headSha": sha, "status": "completed",
 EOF
 chmod +x "$FAKE_GH"
 
+# SABLE-mbkbm: reads the per-phase impact-tier journal (impact-tier-windows.jsonl)
+# a real promote just wrote and checks one of two properties against the SAME
+# paired start/end record, never against an inferred split:
+#   reconcile               -- setup + a shell:<suite> + pytest all present,
+#                               AND their sum reconciles with the record's own
+#                               OBSERVED total wall-clock (end.at - start.at).
+#   dominant-shell-no-pytest -- the single largest phase is a shell suite (the
+#                               POSITIVE CONTROL for a known stubbed-slow cost),
+#                               and no "pytest" entry exists at all (the same
+#                               NEGATIVE CONTROL the unit suite covers, proven
+#                               again here against the real gate).
+PHASE_JOURNAL_CHECK="$TMPROOT/phase-journal-check.py"
+cat > "$PHASE_JOURNAL_CHECK" <<'EOF'
+#!/usr/bin/env python3
+import json, sys
+path, mode = sys.argv[1], sys.argv[2]
+try:
+    lines = [json.loads(l) for l in open(path) if l.strip()]
+except FileNotFoundError:
+    print("FAIL no-journal-file")
+    sys.exit(0)
+starts = {}
+paired = None
+for l in lines:
+    key = (l.get("pid"), l.get("tree"))
+    if l.get("event") == "start":
+        starts[key] = l
+    elif l.get("event") == "end" and l.get("schema", 1) >= 2 and "phases" in l:
+        s = starts.get(key)
+        if s is not None:
+            paired = (s, l)
+if paired is None:
+    print("FAIL no-schema2-paired-end-record")
+    sys.exit(0)
+s, e = paired
+total = e["at"] - s["at"]
+by_name = {}
+for p in e.get("phases") or []:
+    by_name[p["name"]] = by_name.get(p["name"], 0.0) + p["seconds"]
+phase_sum = sum(by_name.values())
+
+if mode == "reconcile":
+    has_setup = "setup" in by_name
+    has_shell = any(n.startswith("shell:") for n in by_name)
+    has_pytest = "pytest" in by_name
+    tol = max(3.0, total * 0.5)
+    within = abs(total - phase_sum) <= tol
+    ok = has_setup and has_shell and has_pytest and within
+    print(f"{'OK' if ok else 'FAIL'} setup={has_setup} shell={has_shell} pytest={has_pytest} "
+          f"total={total:.2f} phase_sum={phase_sum:.2f} within={within} phases={by_name}")
+elif mode == "dominant-shell-no-pytest":
+    dominant = max(by_name, key=by_name.get) if by_name else None
+    has_pytest = "pytest" in by_name
+    ok = (dominant is not None and dominant.startswith("shell:")
+          and by_name[dominant] >= 4.0 and not has_pytest)
+    print(f"{'OK' if ok else 'FAIL'} dominant={dominant} seconds={by_name.get(dominant)} "
+          f"has_pytest={has_pytest} phases={by_name}")
+else:
+    print(f"FAIL unknown-mode:{mode}")
+sys.exit(0)
+EOF
+chmod +x "$PHASE_JOURNAL_CHECK"
+
+# Where the sandbox's own promote calls write the journal — B_WORK is a normal
+# (non-bare) clone, so git-common-dir resolves to "$B_WORK/.git" and
+# sable_snapshot_lib.state_dir takes its parent (SABLE-mbkbm reuses the same
+# resolution the lock/window code already has, not a new path).
+window_log() { echo "$B_WORK/.claude/sable/state/merge-gate/impact-tier-windows.jsonl"; }
+
 # --------------------------------------------------------------------------
 # The sandbox repo: a real (tiny) impact tier over a real (tiny) codebase.
 # --------------------------------------------------------------------------
@@ -355,6 +424,19 @@ else
   fail "C1: ci-verify ref cleaned up" "refs=[$(ci_refs)]"
 fi
 
+# SABLE-mbkbm INTEGRATION: C1's footprint reaches BOTH halves (shell + bin/
+# pytest, see mut_branch_disjoint_ok_with_bin above), so it is the fixture that
+# proves the instrument can decompose a real tier's wall-clock, not just emit
+# a total. The check re-derives the SAME "observed total wall-clock" the
+# pre-mbkbm journal already reported (end.at - start.at) and asserts the
+# per-phase sum reconciles with it — no split is inferred, only measured.
+PHASE_CHECK_C1="$(python3 "$PHASE_JOURNAL_CHECK" "$(window_log)" reconcile)"
+if printf '%s' "$PHASE_CHECK_C1" | grep -q '^OK'; then
+  pass "C1: the impact-tier journal carries setup+shell+pytest phase entries that reconcile with the observed total tier wall-clock"
+else
+  fail "C1: the per-phase journal reconciles with the tier's own observed total wall-clock" "$PHASE_CHECK_C1"
+fi
+
 # ==========================================================================
 # C1b — the gate's OWN persisted warm .testmondata (SABLE-jd5fj.8 approach (a))
 # ==========================================================================
@@ -542,6 +624,19 @@ if [ -z "$(ci_refs)" ]; then
   pass "C8: the ci-verify ref is cleaned up, exactly as on the un-wrapped C1 path"
 else
   fail "C8: ci-verify ref cleaned up" "refs=[$(ci_refs)]"
+fi
+
+# SABLE-mbkbm INTEGRATION, POSITIVE CONTROL: C8's fixture already stubs a REAL
+# ~8s cost into test-left.sh (SLOW_TIER=8, above) under a wrapper that does NOT
+# kill the promote — an instrument that cannot show a KNOWN slow phase as
+# dominant is decorative, not a measurement. C8's footprint (mut_branch_
+# disjoint_ok / mut_base_disjoint_ok) never touches bin/, so this doubles as
+# the NEGATIVE CONTROL: no "pytest" phase entry should exist at all.
+PHASE_CHECK_C8="$(python3 "$PHASE_JOURNAL_CHECK" "$(window_log)" dominant-shell-no-pytest)"
+if printf '%s' "$PHASE_CHECK_C8" | grep -q '^OK'; then
+  pass "C8: the impact-tier journal names the stubbed 8s shell suite as the dominant phase, with no fabricated pytest entry"
+else
+  fail "C8: the journal attributes the stubbed slow phase as dominant with no pytest entry" "$PHASE_CHECK_C8"
 fi
 
 # ==========================================================================
