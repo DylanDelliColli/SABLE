@@ -247,6 +247,109 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 6. PATH MODE (SABLE-4snb4) — presence of a path in a ref's tree
+# ---------------------------------------------------------------------------
+# The sibling footgun. `git ls-tree <ref> <path>` EXITS 0 FOR AN ABSENT PATH
+# (it just prints nothing), so `ls-tree ... && echo PRESENT` false-POSITIVES —
+# the hold-RELEASING direction. Live 2026-07-22: it reported a jd5fj.13 file
+# as ON SPINE while .13 was unmerged, nearly releasing the cmar4.5 hold onto a
+# base lacking it.
+#
+# The fixture already IS the two-commit history the case needs: advance.txt is
+# absent at BASE_SHA and present at the integration tip.
+
+# NEGATIVE CONTROL FIRST — prove the bad idiom really is broken in THIS repo,
+# at process level, before asserting the wrapper resists it.
+BAD_IDIOM_OUT=$(git -C "$WORK" ls-tree --name-only "$BASE_SHA" advance.txt)
+BAD_IDIOM_RC=$?
+if [ "$BAD_IDIOM_RC" -eq 0 ] && [ -z "$BAD_IDIOM_OUT" ]; then
+  pass "negative control: raw 'git ls-tree' exits 0 with EMPTY output for an ABSENT path (the false-positive idiom reproduced)"
+else
+  fail "negative control: raw 'git ls-tree' exits 0 with EMPTY output for an ABSENT path (the false-positive idiom reproduced)" \
+       "rc=$BAD_IDIOM_RC output='$BAD_IDIOM_OUT' — fixture does not reproduce the shape"
+fi
+
+OUT_PATH_ABSENT=$("$CONTAINED" --repo "$WORK" --path advance.txt --ref "$BASE_SHA" 2>&1)
+RC_PATH_ABSENT=$?
+if [ "$RC_PATH_ABSENT" -eq 1 ] && echo "$OUT_PATH_ABSENT" | grep -q '^NOT-CONTAINED:'; then
+  pass "path mode reports NOT-CONTAINED (exit 1) for a path absent from the ref, where the ls-tree idiom said PRESENT"
+else
+  fail "path mode reports NOT-CONTAINED (exit 1) for a path absent from the ref, where the ls-tree idiom said PRESENT" \
+       "rc=$RC_PATH_ABSENT output: $OUT_PATH_ABSENT"
+fi
+
+OUT_PATH_PRESENT=$("$CONTAINED" --repo "$WORK" --path advance.txt --ref "origin/$INT_BRANCH" 2>&1)
+RC_PATH_PRESENT=$?
+if [ "$RC_PATH_PRESENT" -eq 0 ] && echo "$OUT_PATH_PRESENT" | grep -q '^CONTAINED:'; then
+  pass "path mode reports CONTAINED (exit 0) for the same path in the later ref (the negative control's complement)"
+else
+  fail "path mode reports CONTAINED (exit 0) for the same path in the later ref (the negative control's complement)" \
+       "rc=$RC_PATH_PRESENT output: $OUT_PATH_PRESENT"
+fi
+
+# --ref defaults to the integration ref: "is this file on the spine yet" is
+# the live question and must not require naming the ref by hand.
+OUT_PATH_DEFAULT=$("$CONTAINED" --repo "$WORK" --path advance.txt 2>&1)
+RC_PATH_DEFAULT=$?
+if [ "$RC_PATH_DEFAULT" -eq 0 ] && echo "$OUT_PATH_DEFAULT" | grep -q "origin/$INT_BRANCH"; then
+  pass "path mode defaults --ref to the resolved integration ref"
+else
+  fail "path mode defaults --ref to the resolved integration ref" \
+       "rc=$RC_PATH_DEFAULT output: $OUT_PATH_DEFAULT"
+fi
+
+# CROSS-MODE COHERENCE — the property probe and the sha probe must answer the
+# same question the same way. unmerged.txt exists ONLY on wk-unmerged, whose
+# sha commit mode already reported NOT-CONTAINED above; path mode must agree.
+OUT_XMODE=$("$CONTAINED" --repo "$WORK" --path unmerged.txt 2>&1)
+RC_XMODE=$?
+if [ "$RC_XMODE" -eq 1 ] && [ "$RC_UNMERGED" -eq 1 ]; then
+  pass "cross-mode coherence: the unmerged branch's FILE and its SHA both report NOT-CONTAINED (property probe agrees with the sha probe)"
+else
+  fail "cross-mode coherence: the unmerged branch's FILE and its SHA both report NOT-CONTAINED (property probe agrees with the sha probe)" \
+       "path rc=$RC_XMODE (output: $OUT_XMODE) sha rc=$RC_UNMERGED"
+fi
+
+# A TYPO'D REF MUST NOT LOOK LIKE ABSENCE. `git cat-file -e <ref>:<path>`
+# returns the same non-zero for "no such ref" as for "no such path"; reporting
+# NOT-CONTAINED there would be a fabricated verdict, which is the failure this
+# whole tool exists to refuse.
+OUT_BADREF=$("$CONTAINED" --repo "$WORK" --path advance.txt --ref no-such-ref 2>&1)
+RC_BADREF=$?
+if [ "$RC_BADREF" -eq 4 ] && echo "$OUT_BADREF" | grep -q 'COULD NOT ASSESS'; then
+  pass "path mode against an unresolvable ref reports COULD NOT ASSESS (exit 4), not a confident NOT-CONTAINED"
+else
+  fail "path mode against an unresolvable ref reports COULD NOT ASSESS (exit 4), not a confident NOT-CONTAINED" \
+       "rc=$RC_BADREF output: $OUT_BADREF"
+fi
+
+# Mode selection fails closed rather than picking a question for the caller.
+OUT_BOTHMODES=$("$CONTAINED" --repo "$WORK" "$MERGED_SHA" --path advance.txt 2>&1)
+RC_BOTHMODES=$?
+if [ "$RC_BOTHMODES" -eq 2 ]; then
+  pass "asking both containment questions at once is a usage error (exit 2), not a silent precedence rule"
+else
+  fail "asking both containment questions at once is a usage error (exit 2), not a silent precedence rule" \
+       "rc=$RC_BOTHMODES output: $OUT_BOTHMODES"
+fi
+
+JSON_PATH_OUT=$("$CONTAINED" --repo "$WORK" --path advance.txt --ref "$BASE_SHA" --format=json 2>&1)
+JSON_PATH_VERDICT=$(printf '%s' "$JSON_PATH_OUT" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get('mode', '') + ':' + d.get('verdict', ''))
+except Exception:
+    print('INVALID-JSON')
+")
+if [ "$JSON_PATH_VERDICT" = "path:not-contained" ]; then
+  pass "path mode --format=json emits valid JSON carrying the mode and the same verdict"
+else
+  fail "path mode --format=json emits valid JSON carrying the mode and the same verdict" \
+       "parsed='$JSON_PATH_VERDICT' raw='$JSON_PATH_OUT'"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

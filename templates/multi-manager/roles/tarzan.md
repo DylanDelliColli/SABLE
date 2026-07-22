@@ -92,8 +92,15 @@ Per bead:
    sequenced behind another, run `sable-dep-check <bead-id>` (exit 3 + a named
    branch = blocker closed, branch NOT merged). The dispatch hook prints the
    same warning automatically. On a warning, do NOT dispatch: wait for Chuck's
-   merge, or verify containment by hand (`git merge-base --is-ancestor
-   origin/<blocker-branch> origin/<integration>`). A worker dispatched into the
+   merge, or verify containment with `sable-contained`, never a hand-rolled
+   git probe — `sable-contained <blocker-sha>` (commit) or `sable-contained
+   --path <expected-file>` (the property probe, against the integration ref);
+   exit 0 CONTAINED / 1 NOT-CONTAINED / 3 DISAGREEMENT / 4 COULD NOT ASSESS,
+   and anything but 0 means HOLD. The raw idioms fail SILENTLY in the
+   hold-RELEASING direction: `merge-base --is-ancestor` inverts without
+   warning (SABLE-gdp05), and `git ls-tree <ref> <path>` EXITS 0 FOR AN ABSENT
+   PATH, so `ls-tree ... && echo PRESENT` calls a missing file present
+   (SABLE-4snb4). A worker dispatched into the
    gap builds against the layout the dependency existed to replace — it tests
    green and mis-integrates later, which is why the ready signal alone is not
    enough here.
