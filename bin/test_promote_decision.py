@@ -678,6 +678,180 @@ def test_an_uncheckoutable_tree_is_an_ERROR(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# The bin/ pytest half's warm/cold .testmondata visibility (SABLE-jd5fj.8)
+# --------------------------------------------------------------------------
+
+_DEFAULT_TESTMON_STUB = (
+    "#!/usr/bin/env python3\n"
+    "import os\n"
+    "from pathlib import Path\n"
+    'seen = "warm" if Path(".testmondata").is_file() else "cold"\n'
+    'marker = os.environ.get("SABLE_TEST_TESTMON_MARKER")\n'
+    "if marker:\n"
+    "    Path(marker).write_text(seen)\n"
+    'print(f"PASS: stub selector saw {seen}")\n'
+)
+
+# A stub that mimics tier_selection.py's OWN real contract (build_impact_tier_plan
+# prints "tier_selection: <mode> -- <reason>" to stderr before running anything) so
+# the parsing logic (_tier_selection_reason) can be exercised without reproducing
+# pytest-testmon's real corrupt-map behaviour. Simulates "corrupt" by content, not
+# by actually crashing pytest-testmon -- this module's job is to surface whatever
+# reason tier_selection.py reports, not to reproduce its own defect.
+_CORRUPTION_AWARE_TESTMON_STUB = (
+    "#!/usr/bin/env python3\n"
+    "import sys\n"
+    "from pathlib import Path\n"
+    'p = Path(".testmondata")\n'
+    'if p.is_file() and p.read_text() == "CORRUPT":\n'
+    '    print("tier_selection: full -- simulated corrupt testmon map -- conservative full run", file=sys.stderr)\n'
+    'elif p.is_file():\n'
+    '    print("tier_selection: selected -- 1 impacted test(s) (testmon=1, impact=0)", file=sys.stderr)\n'
+    "else:\n"
+    '    print("tier_selection: full -- testmon cache miss (.testmondata absent) -- conservative full run", file=sys.stderr)\n'
+    'print("PASS: stub selector ran")\n'
+)
+
+
+def _real_repo_with_bin_impact_tier(tmp_path, stub=_DEFAULT_TESTMON_STUB):
+    """A real repo whose combined-tree impact tier reaches the bin/ pytest
+    selector: an impact-manifest.sh that selects no shell suites at all
+    (isolating the assertions below to the pytest half) plus a fast stub
+    tier_selection.py (see `stub`) standing in for the real module."""
+    r = tmp_path / "repo"
+    r.mkdir()
+    for args in (("init", "-q", "-b", "trunk"), ("config", "user.email", "t@sable.invalid"),
+                 ("config", "user.name", "SABLE Test")):
+        subprocess.run(["git", "-C", str(r), *args], check=True, capture_output=True)
+    (r / "bin").mkdir()
+    (r / "bin" / "thing.py").write_text("x = 1\n")
+    (r / ".github" / "ci").mkdir(parents=True)
+    (r / ".github" / "ci" / "impact-manifest.sh").write_text("#!/bin/sh\nexit 0\n")
+    (r / ".github" / "ci" / "impact-manifest.sh").chmod(0o755)
+    (r / "bin" / "tier_selection.py").write_text(stub)
+    (r / "bin" / "tier_selection.py").chmod(0o755)
+    subprocess.run(["git", "-C", str(r), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(r), "commit", "-q", "-m", "init"], check=True,
+                   capture_output=True)
+    sha = subprocess.run(["git", "-C", str(r), "rev-parse", "HEAD"], check=True,
+                         capture_output=True, text=True).stdout.strip()
+    return str(r), sha
+
+
+def test_impact_tier_uses_a_warm_testmon_map_when_one_exists(tmp_path, monkeypatch):
+    """SABLE-jd5fj.8: run_impact_tier best-effort copies the gate repo's own
+    .testmondata into the throwaway combined-tree worktree so the pytest
+    selector can use it -- but until this bead, a cold cache (no warm map)
+    silently degraded to tier_selection.py's own conservative FULL bin/ run
+    with no trace of that degradation in the returned detail string. Per the
+    bead's ownership notes: a testmon map is a SELECTOR, not a verdict, and an
+    under-selection must FAIL VISIBLE -- so both the copy and its absence must
+    show up in the evidence, not just in stderr a caller may not capture."""
+    repo, sha = _real_repo_with_bin_impact_tier(tmp_path)
+    monkeypatch.delenv("SABLE_MG_IMPACT", raising=False)
+    marker = tmp_path / "selector-saw-testmondata"
+    monkeypatch.setenv("SABLE_TEST_TESTMON_MARKER", str(marker))
+
+    # Warm case: a .testmondata sitting in the gate's own repo must be copied
+    # into the throwaway worktree for the selector to see.
+    (Path(repo) / ".testmondata").write_text('{"fake": "warm map"}')
+    outcome, detail = promote_lib.run_impact_tier(repo, sha, ["bin/thing.py"])
+    assert outcome == promote_lib.IMPACT_GREEN, detail
+    assert marker.read_text().strip() == "warm", (
+        "the warm .testmondata was not copied into the throwaway worktree")
+    assert "warm testmon map" in detail, detail
+
+    # Cold case: no warm map in the gate's own repo -- the tier still runs (a
+    # conservative full run inside tier_selection.py) but the fallback must be
+    # NAMED in the detail string, not silent.
+    (Path(repo) / ".testmondata").unlink()
+    outcome, detail = promote_lib.run_impact_tier(repo, sha, ["bin/thing.py"])
+    assert outcome == promote_lib.IMPACT_GREEN, detail
+    assert marker.read_text().strip() == "cold"
+    assert "no warm .testmondata" in detail, detail
+
+
+def test_impact_tier_falls_back_to_the_gate_persisted_cache_when_the_repo_has_none(
+        tmp_path, monkeypatch):
+    """SABLE-jd5fj.8 revise: `repo`'s own root .testmondata is CI's copy and a
+    checkout like Chuck's typically never carries one -- that is the actual gap
+    this bead's approach (a) closes. When repo has no root .testmondata but the
+    gate's OWN persisted cache (_warm_testmondata_path) does, that persisted copy
+    must be used instead of silently falling all the way to cold."""
+    repo, sha = _real_repo_with_bin_impact_tier(tmp_path)
+    monkeypatch.delenv("SABLE_MG_IMPACT", raising=False)
+    marker = tmp_path / "selector-saw-testmondata"
+    monkeypatch.setenv("SABLE_TEST_TESTMON_MARKER", str(marker))
+    assert not (Path(repo) / ".testmondata").is_file()
+
+    persisted = promote_lib._warm_testmondata_path(repo)
+    persisted.parent.mkdir(parents=True, exist_ok=True)
+    persisted.write_text('{"fake": "persisted gate cache"}')
+
+    outcome, detail = promote_lib.run_impact_tier(repo, sha, ["bin/thing.py"])
+    assert outcome == promote_lib.IMPACT_GREEN, detail
+    assert marker.read_text().strip() == "warm", (
+        "the gate's persisted cache was not copied into the throwaway worktree")
+    assert "warm testmon map" in detail, detail
+    assert "gate cache" in detail, detail
+
+
+def test_impact_tier_names_a_stale_or_corrupt_warm_map_that_falls_back_internally(
+        tmp_path, monkeypatch):
+    """SABLE-jd5fj.8 revise: a warm map that is PRESENT but STALE/CORRUPT is
+    still handed to the selector -- presence alone (the prior revision's whole
+    check) cannot tell a genuinely-used map apart from one that silently
+    triggered tier_selection.py's OWN internal collector-failure fallback to a
+    full run. Only surfacing the selector's own reported reason catches this,
+    and that under-selection is exactly what the bead's ownership notes require
+    to fail visible rather than being reported as an ordinary 'warm testmon
+    map' success."""
+    repo, sha = _real_repo_with_bin_impact_tier(tmp_path, stub=_CORRUPTION_AWARE_TESTMON_STUB)
+    monkeypatch.delenv("SABLE_MG_IMPACT", raising=False)
+
+    (Path(repo) / ".testmondata").write_text("CORRUPT")
+    outcome, detail = promote_lib.run_impact_tier(repo, sha, ["bin/thing.py"])
+    assert outcome == promote_lib.IMPACT_GREEN, detail
+    assert "simulated corrupt testmon map" in detail, (
+        f"a corrupt warm map's internal fallback must be named, not reported as an "
+        f"ordinary warm-map success: {detail}")
+    assert "conservative full run" in detail, detail
+
+
+def test_warm_gate_testmon_cache_refreshes_the_persisted_cache(tmp_path, monkeypatch):
+    """SABLE-jd5fj.8: `sable-merge-gate warm-testmon-cache` is the LOCAL answer
+    to CI's testmon-cache-warm.sh -- it must actually populate the gate-owned
+    persisted cache (_warm_testmondata_path) from a real (stubbed, for speed)
+    --cache-warm run against the repo's own root .testmondata, so the NEXT
+    promote's cold-checkout fallback (the test above) has something to find."""
+    r = tmp_path / "repo"
+    r.mkdir()
+    # Real git init (not just mkdir): _warm_testmondata_path resolves through
+    # snapshot_lib.state_dir's `git rev-parse --git-common-dir`, which falls
+    # back to the REAL $HOME outside a git repo -- a non-repo `r` here would
+    # leak this test's state into the operator's actual gate state dir.
+    subprocess.run(["git", "-C", str(r), "init", "-q"], check=True, capture_output=True)
+    (r / "bin").mkdir()
+    (r / "bin" / "tier_selection.py").write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        'if "--cache-warm" in sys.argv:\n'
+        '    Path(".testmondata").write_text("REFRESHED")\n'
+        '    print("PASS: stub cache-warm ran")\n'
+        "    sys.exit(0)\n"
+        "sys.exit(1)\n"
+    )
+    (r / "bin" / "tier_selection.py").chmod(0o755)
+
+    rc = promote_lib.warm_gate_testmon_cache(str(r))
+    assert rc == 0
+    persisted = promote_lib._warm_testmondata_path(str(r))
+    assert persisted.is_file(), "the gate's persisted cache was not written"
+    assert persisted.read_text() == "REFRESHED"
+
+
+# --------------------------------------------------------------------------
 # Impact-tier serialization (SABLE-jd5fj.13)
 # --------------------------------------------------------------------------
 #
