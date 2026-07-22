@@ -265,16 +265,18 @@ if command -v bd >/dev/null 2>&1; then
   tmux_ set-option -p -t "$stuckpane" @sable_role chuck
   sleep 0.2
 
-  live_count_before="$(cd "$REPO" && bd count 2>/dev/null)"
+  # Single-sourced so the fixture body the probe SENDS and the body the
+  # attribution check LOOKS FOR can never drift apart.
+  FIXTURE_BODY="sandbox fallback probe"
+
   ERRFILE2="$REC/fallback-err.txt"
   if CLAUDE_AGENT_NAME=lincoln SABLE_MSG_SUBMIT_TRIES=3 SABLE_MSG_POLL_INTERVAL=0.1 \
       BEADS_DB="$SCRATCH_BEADS_DIR/.beads" \
-      python3 "$BIN/sable-msg" chuck "sandbox fallback probe" >/dev/null 2>"$ERRFILE2"; then
+      python3 "$BIN/sable-msg" chuck "$FIXTURE_BODY" >/dev/null 2>"$ERRFILE2"; then
     fail "unverifiable delivery to a never-ready pane reports undelivered (unexpectedly returned 0)" "$(cat "$ERRFILE2")"
   else
     pass "unverifiable delivery to a never-ready pane reports undelivered"
   fi
-  live_count_after="$(cd "$REPO" && bd count 2>/dev/null)"
 
   if grep -q "Filed durable inbox bead" "$ERRFILE2"; then
     pass "sable-msg's SABLE-1umr fallback fired"
@@ -295,11 +297,128 @@ if command -v bd >/dev/null 2>&1; then
     fail "sandboxed fallback bead carries the for-chuck inbox label" "$(BEADS_DB="$SCRATCH_BEADS_DIR/.beads" bd list --all --json 2>/dev/null)"
   fi
 
-  if [ -n "$live_count_before" ] && [ "$live_count_before" = "$live_count_after" ]; then
-    pass "live bd DB gained ZERO beads from the fallback"
+  # --- ATTRIBUTION-SCOPED live-pollution check (SABLE-3mrv3) ----------------
+  # This used to be `live_count_before=$(bd count)` / `live_count_after=$(bd
+  # count)` / assert-equal. That is a GLOBAL COUNTER diff, and a global count
+  # CANNOT ATTRIBUTE A DELTA: it answers "did the live DB change?" when the
+  # question is "did MY TEST change the live DB?". On a working fleet those
+  # differ constantly — ~1 bead filed per 5 min against a ~15 min impact tier
+  # made tripping near-certain, and it RED'd branches that never touch
+  # sable-msg. It also gets worse under exactly the behaviour we want:
+  # managers filing findings promptly.
+  #
+  # The property from SABLE-j0vr is real and still checked — just scoped to
+  # OUR fixture. The fallback bead's identity is deterministic: the title
+  # sable-msg composes, plus the for-chuck inbox label. Another agent's
+  # concurrent bead cannot match BOTH, so this is immune to fleet activity
+  # rather than merely unlikely to collide.
+  #
+  # Derive the title from bin/sable-msg ITSELF rather than hand-typing it.
+  # Hand-typing a format another file owns is what broke the first attempt at
+  # this fix: the real title interpolates the FRAMED message (see
+  # format_message), so the framing sits between the role and the body and a
+  # guessed "...to chuck: sandbox fallback probe" matched nothing —
+  # --title-contains then returned 0 unconditionally and the assertion could
+  # not fail. Control (b) below exists to catch precisely that relapse.
+  fallback_title="$(SABLE_FIXTURE_BODY="$FIXTURE_BODY" python3 - "$BIN" <<'PY'
+import importlib.util, os, sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("sable_msg", os.path.join(sys.argv[1], "sable-msg"))
+spec = importlib.util.spec_from_loader("sable_msg", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+framed = mod.format_message("lincoln", "chuck", os.environ["SABLE_FIXTURE_BODY"])
+print(mod.fallback_bead_title("chuck", framed), end="")
+PY
+)"
+  if [ -n "$fallback_title" ] && [ "$fallback_title" != "${fallback_title#*$FIXTURE_BODY}" ]; then
+    pass "fixture signature was derived from bin/sable-msg, not hand-typed"
   else
-    fail "live bd DB gained ZERO beads from the fallback" "before=$live_count_before after=$live_count_after"
+    fail "fixture signature was derived from bin/sable-msg, not hand-typed" "derived title=[$fallback_title]"
   fi
+
+  # The predicate under test, parameterised by store so both directions can be
+  # exercised against throwaway DBs instead of writing to the live one.
+  # $1 = BEADS_DB dir, or "" for the live repo DB.
+  fixture_bead_hits() {
+    if [ -n "$1" ]; then
+      BEADS_DB="$1" bd count --title-contains "$fallback_title" --label for-chuck 2>/dev/null
+    else
+      ( cd "$REPO" && bd count --title-contains "$fallback_title" --label for-chuck 2>/dev/null )
+    fi
+  }
+
+  # The actual property: the fallback wrote to the sandbox, not to live.
+  live_hits="$(fixture_bead_hits "")"
+  if [ "$live_hits" = "0" ]; then
+    pass "live bd DB never gained THIS fixture's fallback bead (attribution-scoped, not a global counter)"
+  else
+    fail "live bd DB never gained THIS fixture's fallback bead" "hits=$live_hits for title [$fallback_title]"
+  fi
+
+  # Sanity floor for the two controls: the predicate must SEE the bead the
+  # fallback really filed. If the derived title did not match the sandbox
+  # bead, the whole check is a constant and control (b) below is theatre.
+  if [ "$(fixture_bead_hits "$SCRATCH_BEADS_DIR/.beads")" = "1" ]; then
+    pass "the attribution predicate MATCHES the real fallback bead in the sandbox"
+  else
+    fail "the attribution predicate MATCHES the real fallback bead in the sandbox" \
+         "derived title [$fallback_title] vs $(BEADS_DB="$SCRATCH_BEADS_DIR/.beads" bd list --all --json 2>/dev/null)"
+  fi
+
+  # --- NEGATIVE CONTROLS. Both directions are mandatory; the fix is not done
+  # without them (skipping (b) is what let a non-functional assertion ship).
+  # Run against a throwaway "pretend-live" DB — simulating fleet activity by
+  # writing to the REAL live DB is the very pollution this leg forbids.
+  PRETEND_LIVE_DIR="$(mktemp -d)"
+  ( cd "$PRETEND_LIVE_DIR" && BD_NON_INTERACTIVE=1 bd init --prefix=plv \
+      --non-interactive --skip-agents --skip-hooks --quiet >/dev/null 2>&1 )
+  PRETEND_LIVE_DB="$PRETEND_LIVE_DIR/.beads"
+
+  # (a) UNRELATED fleet activity must NOT trip the check. This is the bug:
+  #     the old global-counter assertion RED'd here by construction.
+  before_ct="$(BEADS_DB="$PRETEND_LIVE_DB" bd count 2>/dev/null)"
+  BEADS_DB="$PRETEND_LIVE_DB" bd create --title="unrelated fleet bead filed mid-leg" \
+      --description="simulated concurrent fleet activity (SABLE-3mrv3 control a)" \
+      --type=task --priority=3 >/dev/null 2>&1
+  after_ct="$(BEADS_DB="$PRETEND_LIVE_DB" bd count 2>/dev/null)"
+  if [ "$(fixture_bead_hits "$PRETEND_LIVE_DB")" = "0" ]; then
+    pass "CONTROL (a): unrelated concurrent bead leaves the check PASSING (old counter would have RED'd: before=$before_ct after=$after_ct)"
+  else
+    fail "CONTROL (a): unrelated concurrent bead leaves the check PASSING" \
+         "predicate hit on a bead that is not ours"
+  fi
+  if [ "$before_ct" != "$after_ct" ]; then
+    pass "CONTROL (a) is a REAL simulation: the global count did move ($before_ct -> $after_ct)"
+  else
+    fail "CONTROL (a) is a REAL simulation: the global count did move" "before=$before_ct after=$after_ct"
+  fi
+
+  # (b) A bead carrying the FIXTURE SIGNATURE must MAKE the check FAIL. This
+  #     is the direction that proves the assertion still BITES and has not
+  #     been weakened into always-passing. An assertion that cannot fail is
+  #     worse than the global counter, because it looks like coverage.
+  #
+  #     Plant the title of the bead sable-msg REALLY filed, read back from the
+  #     sandbox — NOT $fallback_title. Planting the derived string would make
+  #     this control self-referential: the query would match its own input and
+  #     pass even when the derivation is wrong, which is precisely the
+  #     Defect-1 relapse this control exists to catch. The real bead is
+  #     ground truth; the derivation is the thing under test.
+  real_title="$(BEADS_DB="$SCRATCH_BEADS_DIR/.beads" bd list --all --json 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["title"], end="")' 2>/dev/null)"
+  BEADS_DB="$PRETEND_LIVE_DB" bd create --title="$real_title" \
+      --description="planted fixture-signature bead (SABLE-3mrv3 control b)" \
+      --type=task --priority=3 --labels=for-chuck,coord >/dev/null 2>&1
+  planted_hits="$(fixture_bead_hits "$PRETEND_LIVE_DB")"
+  if [ -n "$planted_hits" ] && [ "$planted_hits" -ge 1 ]; then
+    pass "CONTROL (b): a planted fixture-signature bead MAKES the check FAIL (the assertion still bites)"
+  else
+    fail "CONTROL (b): a planted fixture-signature bead MAKES the check FAIL" \
+         "predicate returned [$planted_hits] — the assertion is a CONSTANT and verifies nothing"
+  fi
+
+  rm -rf "$PRETEND_LIVE_DIR" 2>/dev/null || true
 fi
 
 echo
