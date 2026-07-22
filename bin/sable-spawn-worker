@@ -700,18 +700,51 @@ def resolve_dep_check_bin() -> str | None:
     return str(sibling) if os.access(sibling, os.X_OK) else None
 
 
+# sable-dep-check's EXIT_UNKNOWN (SABLE-wezu1). Mirrored as a literal rather
+# than imported — this program has no import path to a sibling CLI script, and
+# the value is part of that tool's documented exit-code contract, not an
+# implementation detail liable to drift silently under it.
+_DEP_CHECK_EXIT_UNKNOWN = 4
+
+
+def _dep_check_could_not_assess(reason: str) -> str:
+    """The report dep_merge_advisory emits when sable-dep-check could not run
+    to completion and left no text of its own to relay (SABLE-wezu1) — a bd
+    hiccup that hangs or errors the OUTER call, not the tool's own well-formed
+    exit-4 report (which already carries text via render_unknown_block and is
+    simply returned as-is). Distinct from both the clean-silent `None` and a
+    real UNMERGED-BLOCKER WARNING, so a manager reading stderr cannot mistake
+    "I could not check" for "I checked, and it's clean"."""
+    return (f"UNMERGED-BLOCKER CHECK COULD NOT ASSESS (SABLE-wezu1): {reason}. "
+            "Merge state of any blocker is UNKNOWN, not verified — the "
+            "dispatch is NOT blocked by this, but verify containment by hand "
+            "before dispatching anything sequenced behind another bead: "
+            "git merge-base --is-ancestor <blocker-branch> <integration>.")
+
+
 def dep_merge_advisory(bead_ids: list[str], repo: str) -> str | None:
     """Run the checker over the beads being dispatched and return its warning
-    text, or None when clean/unavailable/disabled.
+    or could-not-assess text, or None only on the genuinely healthy path.
 
-    `--format=hook` prints the block and NOTHING when clean, so emptiness is
-    the whole decision; the exit code (3 = findings) is deliberately not read —
-    the text is the signal, and that keeps a future exit-code change from
-    silently inverting this.
+    `--format=hook` prints a block and NOTHING when clean, so for a run that
+    completes, emptiness is read as "checked, clean" and any text — a WARNING
+    or the tool's own COULD-NOT-ASSESS block — is relayed unchanged; the exit
+    code is not needed to tell those apart, because the tool's exit-4 path
+    always carries its own text (render_unknown_block).
 
-    Every leg degrades to silence: no tool, no beads, a bd hiccup, a git error
-    or a timeout costs the WARNING, never the dispatch. Disable with
-    SABLE_DEP_MERGE_GUARD=0.
+    But the checker not completing at all is a SEPARATE could-not-assess door,
+    and it used to collapse into the same `None` the healthy path returns
+    (SABLE-wezu1): a bd hiccup that hangs the OUTER subprocess.run past
+    `timeout`, or one that raises before any text is captured, left nothing to
+    relay. Those legs now report explicitly instead of going silent. So does a
+    process that DOES exit 4 but — contrary to the tool's contract — emits no
+    text; this is defensive, not the expected shape of that exit code, and
+    exists so a future regression in the tool's own reporting cannot silently
+    re-open this hole from the other side.
+
+    The fail-OPEN decision is unchanged either way: this function never blocks
+    the dispatch, it only changes what the manager reads on stderr. Disable
+    entirely with SABLE_DEP_MERGE_GUARD=0.
 
     Timeout is larger than the hook leg's (which must fit a 5s PreToolUse
     budget); here the only cost of waiting is dispatch latency, and the
@@ -733,10 +766,21 @@ def dep_merge_advisory(bead_ids: list[str], repo: str) -> str | None:
         proc = subprocess.run(
             [binary, "--format=hook", "--repo", repo, *ids],
             capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.SubprocessError):
-        return None
+    except subprocess.TimeoutExpired:
+        return _dep_check_could_not_assess(
+            f"sable-dep-check did not finish within {timeout:g}s (bd likely "
+            "contended/locked) — the check was killed before it could report")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _dep_check_could_not_assess(
+            f"sable-dep-check failed to run — {exc}")
     out = (proc.stdout or "").strip()
-    return out or None
+    if out:
+        return out
+    if proc.returncode == _DEP_CHECK_EXIT_UNKNOWN:
+        return _dep_check_could_not_assess(
+            f"sable-dep-check exited {_DEP_CHECK_EXIT_UNKNOWN} (COULD NOT "
+            "ASSESS) but produced no report text")
+    return None
 
 
 # --- dispatch throttle + host-resource guard (SABLE-mmdt) ---------------------
