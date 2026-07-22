@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""sable-merge-report — SABLE-jd5fj.7 post-change telemetry.
+"""sable-merge-report — SABLE-jd5fj.7 post-change telemetry, corrected by
+SABLE-jd5fj.11 to report push-to-LANDED as the PRIMARY bar.
 
 Derive-at-read comparison against the SABLE-nueh3 baseline: median/p90
-push-to-integrated latency, CI red rate, and the DIRECT measurement of the
+push-to-LANDED latency (primary) with push-to-CI-done retained as a labelled
+secondary, CI red rate, discarded-preview cost and queue depth at promote
+(SABLE-kzi1a's confound), and the DIRECT measurement of the
 textually-clean-but-semantically-broken disjoint-promotion rate (the class
 nueh3 could only bound at 0/126, rule-of-three <=2.4%, because the pre-S2
 design structurally prevented it). Consistent with the SABLE-8b41 telemetry
@@ -11,7 +14,8 @@ capture mechanism (relate, do not block).
 
 The report NEVER uses git commit dates as a push-to-landed latency proxy
 (SABLE-jxgm4: commit-tree stamps a merge commit's dates at preview-build
-time, before the CI wait it is meant to measure) -- see
+time, before the CI wait it is meant to measure -- and, for a rebuilt
+preview, before the discarded wait too) -- see
 bin/sable_merge_report_lib.py's module docstring for the full method.
 
 Usage:
