@@ -298,6 +298,79 @@ PY
            "rc=$SPAWN_OFF_RC (want 5 — a crash must not read as silence) output: $SPAWN_OFF"
     fi
 
+    # --- 4c: bd PRESENT-BUT-UNAVAILABLE must be as LOUD as bd ABSENT (SABLE-wezu1) --
+    #
+    # bd ABSENT already has three passing loudness tests below (sable-dep-check
+    # itself detects an unresolvable `bd` early and reports COULD NOT ASSESS in
+    # every format). This is the OTHER door into the same could-not-assess
+    # state: a `bd` that resolves on PATH and LOOKS present, but hangs — the
+    # lock-contention/hiccup shape from the live incident, not a missing tool.
+    # sable-dep-check has no internal timeout on its own `bd` calls; it is
+    # bin/sable-spawn-worker's OUTER subprocess.run(timeout=...) that has to
+    # bound this, and that outer timeout used to be caught and turned into a
+    # bare `None` — silence, indistinguishable from a healthy clean run. That
+    # collapse is the bug this bead exists to close.
+    #
+    # A fake `bd` that sleeps stands in for contention deterministically —
+    # real lock contention is inherently racy and would make this suite flaky
+    # for the wrong reason. It is placed FIRST on PATH for this one dispatch
+    # only (passed through spawn_governance_run's env args, not exported), so
+    # every other bd call in this file keeps using the real one.
+    #
+    # It must be surgical: sable-spawn-worker's OWN governance makes real `bd
+    # show` calls (resolving the dispatch target bead) BEFORE it ever reaches
+    # dep_merge_advisory, and those must stay fast and real or the run never
+    # gets far enough to exercise the code under test at all. Only
+    # sable-dep-check calls `bd dep ...` (check_beads' first, batched lookup)
+    # — that is the specific call this fixture needs to hang, so only that
+    # subcommand is intercepted; everything else delegates to the real bd.
+    REAL_BD="$(command -v bd)"
+    SLOWBD_DIR="$FIX/slowbd"
+    mkdir -p "$SLOWBD_DIR"
+    cat > "$SLOWBD_DIR/bd" <<SH
+#!/usr/bin/env bash
+if [ "\$1" = "dep" ]; then
+  sleep 2
+  exit 1
+fi
+exec "$REAL_BD" "\$@"
+SH
+    chmod +x "$SLOWBD_DIR/bd"
+
+    SPAWN_SLOWBD_OUT=$(spawn_governance_run "PATH=$SLOWBD_DIR:$PATH" \
+                          SABLE_DEP_CHECK_TIMEOUT=0.5)
+    SPAWN_SLOWBD_RC=$?
+    if echo "$SPAWN_SLOWBD_OUT" | grep -q 'COULD NOT ASSESS' \
+       && ! echo "$SPAWN_SLOWBD_OUT" | grep -q 'UNMERGED-BLOCKER WARNING' \
+       && [ "$SPAWN_SLOWBD_RC" -eq 5 ]; then
+      pass "WIRING: bd PRESENT-BUT-UNAVAILABLE (hung under contention) reports COULD NOT ASSESS on the real dispatch path, not silence (SABLE-wezu1)"
+    else
+      fail "WIRING: bd PRESENT-BUT-UNAVAILABLE (hung under contention) reports COULD NOT ASSESS on the real dispatch path, not silence (SABLE-wezu1)" \
+           "rc=$SPAWN_SLOWBD_RC output: ${SPAWN_SLOWBD_OUT:-<empty — the SABLE-wezu1 defect, reproduced>}"
+    fi
+
+    # Complement, same fixture (still a genuine unmerged blocker), healthy bd:
+    # proves the SABLE-wezu1 change did not make dep_merge_advisory fabricate
+    # a COULD-NOT-ASSESS block alongside — or instead of — a real warning when
+    # bd is perfectly fine. Test 4b above already proves the warning fires at
+    # all; this is the regression guard for the new code path added here
+    # specifically. (The OTHER healthy-path property — a truly CLEAN bead
+    # produces byte-identical silence — is what the pre-existing "bd PRESENT:
+    # the healthy path stays silent" assertion further down this file proves;
+    # this fleet-wide activation depends on that one continuing to pass too,
+    # since bin/sable-spawn-worker is a live symlink into the shared checkout
+    # with no staged rollout.)
+    SPAWN_HEALTHY_OUT=$(spawn_governance_run)
+    SPAWN_HEALTHY_RC=$?
+    if [ "$SPAWN_HEALTHY_RC" -eq 5 ] \
+       && echo "$SPAWN_HEALTHY_OUT" | grep -q 'UNMERGED-BLOCKER WARNING' \
+       && ! echo "$SPAWN_HEALTHY_OUT" | grep -q 'COULD NOT ASSESS'; then
+      pass "WIRING: bd healthy + a genuine unmerged blocker reports ONLY the warning, no fabricated COULD NOT ASSESS noise (SABLE-wezu1 regression guard)"
+    else
+      fail "WIRING: bd healthy + a genuine unmerged blocker reports ONLY the warning, no fabricated COULD NOT ASSESS noise (SABLE-wezu1 regression guard)" \
+           "rc=$SPAWN_HEALTHY_RC output: ${SPAWN_HEALTHY_OUT:-<empty>}"
+    fi
+
     # --- 5: REAL merge, then the warning must STOP -------------------------
     # Nothing about the bead graph changes here — only the tree. If the check
     # still warned, it would be reading status, not merge state.
