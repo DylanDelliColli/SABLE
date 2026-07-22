@@ -220,6 +220,47 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Consumer 2b (SABLE-jd5fj.9): sable_gate_promote_lib's impact-tier timeout
+# (_impact_timeout, consumed by run_impact_tier for the cmar4 optimistic-
+# promotion combined-tree check) reads the SAME merge_preview budget from
+# the SAME SSOT — before jd5fj.9 it was a hand-copied 900 literal, the exact
+# duplicated-list class SABLE-cmar4.1 closed for tier membership,
+# reintroduced one level down. Reuses the fixture's SSOT already mutated to
+# 555 by consumer 2 above, then mutates it AGAIN to a third, distinctive
+# value to prove this is live re-resolution and not a value cached at the
+# 555 mutation.
+# ---------------------------------------------------------------------------
+
+read_impact_timeout() {
+  python3 -c "
+import importlib.util
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader('sable_merge_gate', '$SMG')
+spec = importlib.util.spec_from_loader('sable_merge_gate', loader)
+smg = importlib.util.module_from_spec(spec)
+loader.exec_module(smg)
+print(smg.promote_lib._impact_timeout('$REPO_DIR'))
+"
+}
+
+unset SABLE_MG_IMPACT_TIMEOUT
+IMPACT_AT_555=$(read_impact_timeout)
+if [ "$IMPACT_AT_555" = "555.0" ]; then
+  pass "consumer 2b (impact-tier timeout): _impact_timeout reads the SAME merge_preview budget (555) as consumer 2, not a second hardcoded copy"
+else
+  fail "consumer 2b (impact-tier timeout): _impact_timeout reads the SAME merge_preview budget (555) as consumer 2, not a second hardcoded copy" "got: $IMPACT_AT_555"
+fi
+
+set_merge_preview_budget 777
+
+IMPACT_AT_777=$(read_impact_timeout)
+if [ "$IMPACT_AT_777" = "777.0" ]; then
+  pass "consumer 2b (impact-tier timeout): after mutating the SAME file AGAIN, _impact_timeout re-resolves to the new budget (777) -- a future hardcode would fail this"
+else
+  fail "consumer 2b (impact-tier timeout): after mutating the SAME file AGAIN, _impact_timeout re-resolves to the new budget (777) -- a future hardcode would fail this" "got: $IMPACT_AT_777"
+fi
+
+# ---------------------------------------------------------------------------
 # Consumer 3 (stand-in for the not-yet-built SABLE-jd5fj.5 snapshot runner):
 # full_snapshot aliases shell-run-set.sh's ALLOW BY REFERENCE, not a copy —
 # mutating ALLOW (the file consumer 1 and 2's data both ultimately trace to
