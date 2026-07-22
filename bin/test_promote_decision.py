@@ -679,6 +679,88 @@ def test_an_uncheckoutable_tree_is_an_ERROR(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# The impact-tier timeout reads the tier-budget SSOT (SABLE-jd5fj.9)
+# --------------------------------------------------------------------------
+#
+# Before this bead, _impact_timeout() returned a hand-copied 900 — the
+# merge_preview tier's duration budget copied by hand from
+# .github/ci/test-tiers.sh, the exact duplicated-list class SABLE-cmar4.1
+# closed for tier membership, reintroduced one level down. It must now derive
+# from the same SSOT sable_gate_git_lib.default_mg_timeout and
+# sable_gate_budget_lib.tier_budget_sec already read.
+
+_DISTINCTIVE_BUDGET_TIERS_SH = (
+    "#!/usr/bin/env bash\n"
+    'if [ "$1" = "--budget" ] && [ "$2" = "merge_preview" ]; then\n'
+    "  echo 12345\n"
+    "  exit 0\n"
+    "fi\n"
+    "exit 1\n"
+)
+
+_BROKEN_TIERS_SH = (
+    "#!/usr/bin/env bash\n"
+    "exit 1\n"
+)
+
+
+def _write_tiers_sh(repo: str, contents: str) -> None:
+    ci_dir = Path(repo) / ".github" / "ci"
+    ci_dir.mkdir(parents=True, exist_ok=True)
+    path = ci_dir / "test-tiers.sh"
+    path.write_text(contents)
+    path.chmod(0o755)
+
+
+def test_impact_timeout_reads_the_tier_ssot(tmp_path, monkeypatch):
+    """(a) A DISTINCTIVE budget (12345 — cannot pass by coincidence against the
+    real 900, the ambient-satisfaction trap that cost jd5fj.15 a revise cycle)
+    from a repo-local test-tiers.sh is picked up in place of the old literal."""
+    monkeypatch.delenv("SABLE_MG_IMPACT_TIMEOUT", raising=False)
+    repo, _ = _real_repo(tmp_path)
+    _write_tiers_sh(repo, _DISTINCTIVE_BUDGET_TIERS_SH)
+    assert promote_lib._impact_timeout(repo) == 12345.0
+
+
+def test_impact_timeout_override_still_wins_over_the_ssot(tmp_path, monkeypatch):
+    """(b) SABLE_MG_IMPACT_TIMEOUT is an explicit override and must win even
+    when the SSOT resolves to a different, equally distinctive value."""
+    repo, _ = _real_repo(tmp_path)
+    _write_tiers_sh(repo, _DISTINCTIVE_BUDGET_TIERS_SH)
+    monkeypatch.setenv("SABLE_MG_IMPACT_TIMEOUT", "42")
+    assert promote_lib._impact_timeout(repo) == 42.0
+
+
+def test_impact_timeout_falls_back_without_raising_on_a_missing_ssot(tmp_path, monkeypatch):
+    """(c) No .github/ci/test-tiers.sh at all: never raise, fall back to the
+    pre-fix constant (900) — a missing SSOT must not block the gate."""
+    monkeypatch.delenv("SABLE_MG_IMPACT_TIMEOUT", raising=False)
+    repo, _ = _real_repo(tmp_path)
+    assert not (Path(repo) / ".github" / "ci" / "test-tiers.sh").exists()
+    assert promote_lib._impact_timeout(repo) == 900.0
+
+
+def test_impact_timeout_falls_back_without_raising_on_a_broken_ssot(tmp_path, monkeypatch):
+    """(c) A test-tiers.sh that exists but cannot answer (non-zero exit, no
+    stdout) must fall back the same way, not raise."""
+    monkeypatch.delenv("SABLE_MG_IMPACT_TIMEOUT", raising=False)
+    repo, _ = _real_repo(tmp_path)
+    _write_tiers_sh(repo, _BROKEN_TIERS_SH)
+    assert promote_lib._impact_timeout(repo) == 900.0
+
+
+def test_impact_timeout_defaults_repo_to_cwd_for_repo_less_callers(tmp_path, monkeypatch):
+    """impact_budget()/the `promote-budget` CLI are deliberately --repo-less
+    (see their own docstrings): _impact_timeout() must still answer by
+    falling back to the current working directory."""
+    monkeypatch.delenv("SABLE_MG_IMPACT_TIMEOUT", raising=False)
+    repo, _ = _real_repo(tmp_path)
+    _write_tiers_sh(repo, _DISTINCTIVE_BUDGET_TIERS_SH)
+    monkeypatch.chdir(repo)
+    assert promote_lib._impact_timeout() == 12345.0
+
+
+# --------------------------------------------------------------------------
 # The bin/ pytest half's warm/cold .testmondata visibility (SABLE-jd5fj.8)
 # --------------------------------------------------------------------------
 
