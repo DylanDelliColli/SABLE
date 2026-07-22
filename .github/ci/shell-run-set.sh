@@ -86,6 +86,7 @@ ALLOW=(
   test-sable-clean-room-verify.sh
   test-sable-clean-room-verify-integration.sh
   test-sable-cli.sh
+  test-sable-contained.sh
   test-sable-contract.sh
   test-sable-discover.sh
   test-sable-launch.sh
@@ -179,6 +180,7 @@ declare -A COVERS=(
   [test-preview-kick.sh]="hooks/multi-manager/post-push-merge-notify.sh"
   [test-read-guard.sh]="hooks/multi-manager/read-guard.sh"
   [test-registry.sh]="hooks/multi-manager/lib-registry-path.sh"
+  [test-sable-contained.sh]="bin/sable-contained"
   [test-sable-mode.sh]="hooks/multi-manager/lib-mode-path.sh"
   [test-sable-msg.sh]="bin/sable-msg bin/sable_pane_lib.py"
   [test-sable-test.sh]="bin/sable-test"
