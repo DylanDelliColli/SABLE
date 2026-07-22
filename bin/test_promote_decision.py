@@ -678,6 +678,80 @@ def test_an_uncheckoutable_tree_is_an_ERROR(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# The bin/ pytest half's warm/cold .testmondata visibility (SABLE-jd5fj.8)
+# --------------------------------------------------------------------------
+
+def _real_repo_with_bin_impact_tier(tmp_path):
+    """A real repo whose combined-tree impact tier reaches the bin/ pytest
+    selector: an impact-manifest.sh that selects no shell suites at all
+    (isolating the assertions below to the pytest half) plus a fast stub
+    tier_selection.py that reports whether IT saw a .testmondata in its own
+    cwd -- the throwaway combined-tree worktree, not the gate's repo -- via an
+    env-named marker file, since the worktree itself is gone by the time
+    run_impact_tier returns."""
+    r = tmp_path / "repo"
+    r.mkdir()
+    for args in (("init", "-q", "-b", "trunk"), ("config", "user.email", "t@sable.invalid"),
+                 ("config", "user.name", "SABLE Test")):
+        subprocess.run(["git", "-C", str(r), *args], check=True, capture_output=True)
+    (r / "bin").mkdir()
+    (r / "bin" / "thing.py").write_text("x = 1\n")
+    (r / ".github" / "ci").mkdir(parents=True)
+    (r / ".github" / "ci" / "impact-manifest.sh").write_text("#!/bin/sh\nexit 0\n")
+    (r / ".github" / "ci" / "impact-manifest.sh").chmod(0o755)
+    (r / "bin" / "tier_selection.py").write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        'seen = "warm" if Path(".testmondata").is_file() else "cold"\n'
+        'marker = os.environ.get("SABLE_TEST_TESTMON_MARKER")\n'
+        "if marker:\n"
+        "    Path(marker).write_text(seen)\n"
+        'print(f"PASS: stub selector saw {seen}")\n'
+    )
+    (r / "bin" / "tier_selection.py").chmod(0o755)
+    subprocess.run(["git", "-C", str(r), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(r), "commit", "-q", "-m", "init"], check=True,
+                   capture_output=True)
+    sha = subprocess.run(["git", "-C", str(r), "rev-parse", "HEAD"], check=True,
+                         capture_output=True, text=True).stdout.strip()
+    return str(r), sha
+
+
+def test_impact_tier_uses_a_warm_testmon_map_when_one_exists(tmp_path, monkeypatch):
+    """SABLE-jd5fj.8: run_impact_tier best-effort copies the gate repo's own
+    .testmondata into the throwaway combined-tree worktree so the pytest
+    selector can use it -- but until this bead, a cold cache (no warm map)
+    silently degraded to tier_selection.py's own conservative FULL bin/ run
+    with no trace of that degradation in the returned detail string. Per the
+    bead's ownership notes: a testmon map is a SELECTOR, not a verdict, and an
+    under-selection must FAIL VISIBLE -- so both the copy and its absence must
+    show up in the evidence, not just in stderr a caller may not capture."""
+    repo, sha = _real_repo_with_bin_impact_tier(tmp_path)
+    monkeypatch.delenv("SABLE_MG_IMPACT", raising=False)
+    marker = tmp_path / "selector-saw-testmondata"
+    monkeypatch.setenv("SABLE_TEST_TESTMON_MARKER", str(marker))
+
+    # Warm case: a .testmondata sitting in the gate's own repo must be copied
+    # into the throwaway worktree for the selector to see.
+    (Path(repo) / ".testmondata").write_text('{"fake": "warm map"}')
+    outcome, detail = promote_lib.run_impact_tier(repo, sha, ["bin/thing.py"])
+    assert outcome == promote_lib.IMPACT_GREEN, detail
+    assert marker.read_text().strip() == "warm", (
+        "the warm .testmondata was not copied into the throwaway worktree")
+    assert "warm testmon map" in detail, detail
+
+    # Cold case: no warm map in the gate's own repo -- the tier still runs (a
+    # conservative full run inside tier_selection.py) but the fallback must be
+    # NAMED in the detail string, not silent.
+    (Path(repo) / ".testmondata").unlink()
+    outcome, detail = promote_lib.run_impact_tier(repo, sha, ["bin/thing.py"])
+    assert outcome == promote_lib.IMPACT_GREEN, detail
+    assert marker.read_text().strip() == "cold"
+    assert "no warm .testmondata" in detail, detail
+
+
+# --------------------------------------------------------------------------
 # Impact-tier serialization (SABLE-jd5fj.13)
 # --------------------------------------------------------------------------
 #
