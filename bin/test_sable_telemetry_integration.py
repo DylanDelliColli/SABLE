@@ -21,6 +21,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sable_telemetry_bd_source as bd_source  # noqa: E402
 import sable_telemetry_git_source as git_source  # noqa: E402
+import sable_telemetry_gh_source as gh_source  # noqa: E402
 
 BIN_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BIN_DIR.parent
@@ -209,6 +210,90 @@ def test_git_source_regex_against_real_git_fixture_repo_log(tmp_path):
 
     # oldest-first ordering (git log itself is newest-first)
     assert [e.sha for e in events] == [clean_sha, disjoint_sha]
+
+
+# Real recorded `gh run list` / `gh run view --json jobs` payloads for
+# SABLE-c008 (research.json's two-run example), fetched from
+# DylanDelliColli/SABLE via `gh run view 29596385380`/`29596766036` --json
+# databaseId,createdAt,updatedAt,conclusion,status,displayTitle,jobs. Using
+# the REAL recorded shape (not a hand-authored stub) means drift in gh's
+# actual run/job JSON shape breaks this test, not just a bead-id regex typo
+# (test-strategy.json findings.deferred).
+GH_C008_PREVIEW_RUN = {
+    "databaseId": 29596385380,
+    "headBranch": "ci-verify/SABLE-c008-16d94ed",
+    "createdAt": "2026-07-17T16:29:52Z",
+    "updatedAt": "2026-07-17T16:35:14Z",
+    "conclusion": "success",
+    "status": "completed",
+    "displayTitle": "ci-verify merge-preview: wk-reap-superseded onto tmux-only (SABLE-c008)",
+}
+GH_C008_PREVIEW_JOBS = [
+    {
+        "databaseId": 87937697846,
+        "name": "verify",
+        "status": "completed",
+        "conclusion": "success",
+        "startedAt": "2026-07-17T16:29:55Z",
+        "completedAt": "2026-07-17T16:35:14Z",
+        "steps": [
+            {"number": 3, "name": "Dedup guard — skip tmux-only re-verify of an "
+                                   "already-verified preview SHA (SABLE-r3i6)",
+             "status": "completed", "conclusion": "skipped"},
+            {"number": 8, "name": "pytest — full bin/ suite (unit + integration; "
+                                   "bd/dolt suites self-skip)",
+             "status": "completed", "conclusion": "success"},
+        ],
+    }
+]
+
+GH_C008_TMUX_ONLY_RUN = {
+    "databaseId": 29596766036,
+    "headBranch": "tmux-only",
+    "createdAt": "2026-07-17T16:35:35Z",
+    "updatedAt": "2026-07-17T16:35:43Z",
+    "conclusion": "success",
+    "status": "completed",
+    "displayTitle": "ci-verify merge-preview: wk-reap-superseded onto tmux-only (SABLE-c008)",
+}
+GH_C008_TMUX_ONLY_JOBS = [
+    {
+        "databaseId": 87938950599,
+        "name": "verify",
+        "status": "completed",
+        "conclusion": "success",
+        "startedAt": "2026-07-17T16:35:38Z",
+        "completedAt": "2026-07-17T16:35:42Z",
+        "steps": [
+            {"number": 3, "name": "Dedup guard — skip tmux-only re-verify of an "
+                                   "already-verified preview SHA (SABLE-r3i6)",
+             "status": "completed", "conclusion": "success"},
+            {"number": 8, "name": "pytest — full bin/ suite (unit + integration; "
+                                   "bd/dolt suites self-skip)",
+             "status": "completed", "conclusion": "skipped"},
+        ],
+    }
+]
+
+
+def test_gh_source_dedup_against_recorded_two_run_fixture():
+    raw_runs = [GH_C008_PREVIEW_RUN, GH_C008_TMUX_ONLY_RUN]
+
+    selected = gh_source.select_preview_runs(raw_runs)
+
+    # The redundant post-merge tmux-only run is dropped by construction --
+    # only the ci-verify/<bead>-<sha7> preview-ref run survives.
+    assert [r["databaseId"] for r in selected] == [29596385380]
+
+    event = gh_source.build_ci_run_event(selected[0], GH_C008_PREVIEW_JOBS)
+
+    assert event.bead_id == "SABLE-c008"
+    assert event.sha7 == "16d94ed"
+    assert event.run_id == 29596385380
+    # job-level startedAt (16:29:55Z) -> completedAt (16:35:14Z) = 5m19s,
+    # NOT the near-instant tmux-only run's ~4s, and NOT the run-level
+    # createdAt->updatedAt span which includes Actions queue time.
+    assert event.duration_seconds == 319.0
 
 
 if __name__ == "__main__":
