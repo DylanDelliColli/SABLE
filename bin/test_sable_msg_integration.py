@@ -52,6 +52,17 @@ def _capture(sock, target):
     return _tmux(sock, "capture-pane", "-t", target, "-p").stdout
 
 
+def _read_recording(path):
+    """Defensive read for REC_FILE/ARRIVALS_FILE fixtures. Some stand-ins
+    (_BUSY_TUI, _STUCK_BOX_TUI) read the pty a character at a time, which can
+    split the multi-byte \\xe2\\x9f\\xa6 (⟦) SABLE-MSG framing glyph under host
+    load and leave bare continuation bytes behind (SABLE-wcbj; root-cause
+    conversion of those stand-ins tracked separately as SABLE-qby7). These
+    tests assert on message content, not encoding, so a strict-UTF-8 read
+    must not be able to crash them (SABLE-9qzfg)."""
+    return path.read_text(errors="replace")
+
+
 def _start_pane(sock):
     # A bash REPL stand-in for an agent pane; tag it with @sable_role=optimus.
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
@@ -88,6 +99,17 @@ def _env():
     env.pop("SABLE_WORKER_PANE", None)
     env.pop("SABLE_BEAD", None)
     return env
+
+
+def test_read_recording_survives_non_utf8_delimiter_bytes(tmp_path):
+    # SABLE-9qzfg: reproduces the observed corruption directly, no tmux needed.
+    # A char-at-a-time stand-in read can drop the leading 0xe2 of the
+    # \xe2\x9f\xa6 (⟦) SABLE-MSG framing glyph, leaving bare continuation
+    # bytes 0x9f 0xa6 that strict-UTF-8 read_text() cannot decode. The tests
+    # in this file only assert on message content, so that must not raise.
+    path = tmp_path / "rec.txt"
+    path.write_bytes(b"\x9f\xa6 from=lincoln to=optimus :: cap in force\n")
+    assert "cap in force" in _read_recording(path)
 
 
 def test_message_delivered_to_registered_pane(tmux_socket):
@@ -275,7 +297,7 @@ def test_interrupt_lands_on_busy_midturn_pane_first_attempt(tmux_socket, tmp_pat
     time.sleep(0.5)
     pane = _capture(tmux_socket, "w")
     assert "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force" in pane  # landed intact
-    assert "cap in force" in rec.read_text()         # and was SUBMITTED as a turn
+    assert "cap in force" in _read_recording(rec)    # and was SUBMITTED as a turn
 
 
 # A marker-driven variant of _BUSY_TUI, identical except the busy->idle
@@ -370,7 +392,7 @@ def test_default_send_to_busy_turn_does_not_interrupt_and_reports_undelivered(tm
     assert _wait_until(lambda: end.exists() and end.read_text().strip() == "NATURAL",
                        timeout=10), \
         "busy turn never reached its (test-controlled) natural end"
-    assert _wait_until(lambda: rec.exists() and "queued directive" in rec.read_text(),
+    assert _wait_until(lambda: rec.exists() and "queued directive" in _read_recording(rec),
                        timeout=10), \
         "line must still have been physically queued and run"
 
@@ -393,7 +415,7 @@ def test_default_send_to_busy_pane_that_frees_reports_delivered_h0jw(tmux_socket
              "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "20",
              "SABLE_MSG_POLL_INTERVAL": "0.25"},
     )
-    assert "cap in force" in rec.read_text(), \
+    assert "cap in force" in _read_recording(rec), \
         "precondition: the queued line must have really submitted as a turn"
     assert r.returncode == 0, r.stderr                 # delayed confirmation -> delivered
     assert "delivered" in r.stderr
@@ -530,7 +552,7 @@ def test_default_send_to_busy_pane_with_queued_footer_confirms_delivered_msxj(tm
     # closed by this test's design): r.returncode == 0 means sable-msg's poll
     # already observed the queued-footer posture, which requires the stand-in
     # to have already appended to ARRIVALS_FILE.
-    assert arrivals.read_text().count("cap in force") == 1
+    assert _read_recording(arrivals).count("cap in force") == 1
 
 
 def test_second_send_on_still_busy_pane_does_not_double_queue_msxj(tmux_socket, tmp_path):
@@ -557,7 +579,7 @@ def test_second_send_on_still_busy_pane_does_not_double_queue_msxj(tmux_socket, 
     r1 = subprocess.run(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"], **kwargs)
     assert r1.returncode == 0, r1.stderr
-    assert _wait_until(lambda: arrivals.read_text().count("cap in force") == 1, timeout=10), \
+    assert _wait_until(lambda: _read_recording(arrivals).count("cap in force") == 1, timeout=10), \
         "first send must have queued exactly once before the second send starts"
     r2 = subprocess.run(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"], **kwargs)
@@ -567,10 +589,10 @@ def test_second_send_on_still_busy_pane_does_not_double_queue_msxj(tmux_socket, 
     assert _wait_until(lambda: end.exists() and end.read_text().strip() == "NATURAL",
                        timeout=10), \
         "busy turn never reached its (test-controlled) natural end"
-    assert _wait_until(lambda: rec.exists() and rec.read_text().count("cap in force") == 1,
+    assert _wait_until(lambda: rec.exists() and _read_recording(rec).count("cap in force") == 1,
                        timeout=10), \
         "only a single copy of the message must ultimately submit"
-    assert arrivals.read_text().count("cap in force") == 1, \
+    assert _read_recording(arrivals).count("cap in force") == 1, \
         "the second send must not have retyped an already-queued message"
 
 
@@ -632,7 +654,7 @@ def test_idle_pane_redraw_race_reports_landed_not_undelivered(tmux_socket, tmp_p
              "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "5",
              "SABLE_MSG_POLL_INTERVAL": "0.2"},
     )
-    assert "GO push your worktree branch now" in rec.read_text(), \
+    assert "GO push your worktree branch now" in _read_recording(rec), \
         "precondition: the message must have really submitted as a turn"
     assert r.returncode == 0, r.stderr          # and sable-msg must report it LANDED
     assert "delivered" in r.stderr
@@ -765,7 +787,7 @@ def test_busy_at_t0_text_stuck_in_editable_box_self_heals_and_delivers_l7uv(tmux
         if proc.poll() is None:
             proc.kill()
             proc.communicate()
-    assert _wait_until(lambda: rec.exists() and "cap in force" in rec.read_text(),
+    assert _wait_until(lambda: rec.exists() and "cap in force" in _read_recording(rec),
                        timeout=10), \
         "the stuck line must have been submitted by the self-heal Enter"
     assert proc.returncode == 0, err             # self-heal -> delivered, no fallback
