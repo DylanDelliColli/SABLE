@@ -30,8 +30,12 @@ lives in hooks/test/test-optimistic-promotion.sh.
 """
 import importlib.util
 import itertools
+import json
+import os
 import subprocess
 import sys
+import threading
+import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -671,3 +675,226 @@ def test_an_uncheckoutable_tree_is_an_ERROR(tmp_path, monkeypatch):
     monkeypatch.setenv("SABLE_MG_IMPACT", "true")
     outcome, _ = promote_lib.run_impact_tier(repo, "0" * 40, ["bin/thing.py"])
     assert outcome == promote_lib.IMPACT_ERROR
+
+
+# --------------------------------------------------------------------------
+# Impact-tier serialization (SABLE-jd5fj.13)
+# --------------------------------------------------------------------------
+#
+# The failure this replaces was not a wrong verdict from a correct run — it was
+# SIX CORRECT BRANCHES EJECTED because their tiers ran at the same time as
+# somebody else's. The iron-rule suites share live bd/settings/worker state, so
+# concurrent tiers false-RED each other; standalone on the same HEAD they were
+# 18/18 and 5/5. Chuck's answer was a manual one-at-a-time rule, which is the
+# guidance-as-control shape SABLE-rkc3o already refuted. These tests assert the
+# mechanical replacement: tier windows cannot overlap, queue time is not charged
+# to the tier's budget, and giving up on the queue degrades to a re-preview
+# rather than a promotion.
+
+
+@pytest.fixture()
+def isolated_lock(tmp_path, monkeypatch):
+    """Point the lock + window log at this test's own tmp dir, so the suite never
+    contends with (or corrupts) a real merge seat's state dir."""
+    monkeypatch.setenv("SABLE_MG_IMPACT_LOCK", str(tmp_path / "impact-tier.lock"))
+    monkeypatch.setenv("SABLE_MG_IMPACT_WINDOW_LOG", str(tmp_path / "windows.jsonl"))
+    monkeypatch.delenv("SABLE_MG_IMPACT_SERIALIZE", raising=False)
+    monkeypatch.delenv("SABLE_MG_IMPACT_LOCK_TIMEOUT", raising=False)
+    return tmp_path
+
+
+def _concurrent_tier_windows(monkeypatch, hold=0.30, workers=2):
+    """Run `workers` run_impact_tier calls concurrently with the tier body
+    replaced by a recorder that sleeps `hold` seconds. Returns the list of
+    (start, end) windows in start order, plus each call's measured lock wait."""
+    windows: list[list[float]] = []
+    waits: list[float] = []
+    guard = threading.Lock()
+
+    def fake_tier(repo, tree_sha, paths):
+        window = [time.monotonic(), None]
+        with guard:
+            windows.append(window)
+        time.sleep(hold)
+        window[1] = time.monotonic()
+        return (promote_lib.IMPACT_GREEN, "recorded")
+
+    monkeypatch.setattr(promote_lib, "_run_impact_tier_locked", fake_tier)
+
+    def record_wait(repo, event, tree_sha, waited):
+        if event == "start":
+            with guard:
+                waits.append(waited)
+
+    monkeypatch.setattr(promote_lib, "_stamp_impact_window", record_wait)
+
+    results: list[tuple[str, str]] = []
+    barrier = threading.Barrier(workers)
+
+    def go(i):
+        barrier.wait()
+        results.append(promote_lib.run_impact_tier("/repo", f"{i:040d}", ["bin/thing.py"]))
+
+    threads = [threading.Thread(target=go, args=(i,)) for i in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert all(not t.is_alive() for t in threads), "a tier thread never finished"
+    return sorted(windows, key=lambda w: w[0]), waits, results
+
+
+def test_impact_tier_serialized(isolated_lock, monkeypatch):
+    """THE BEAD. Two promotes reaching the local impact tier on one seat must not
+    have overlapping tier windows: the second must not START until the first has
+    released the lock. Both still reach a verdict — serialization queues work, it
+    never drops it."""
+    windows, _waits, results = _concurrent_tier_windows(monkeypatch)
+    assert len(windows) == 2
+    (first_start, first_end), (second_start, second_end) = windows
+    assert None not in (first_end, second_end)
+    assert second_start >= first_end, (
+        f"the second impact tier started {first_end - second_start:.3f}s BEFORE the first "
+        f"released the lock — concurrent tiers false-RED each other (SABLE-jd5fj.13)")
+    assert results == [(promote_lib.IMPACT_GREEN, "recorded")] * 2
+
+
+def test_the_negative_control_sees_the_overlap_the_lock_removes(isolated_lock, monkeypatch):
+    """The instrument check. With serialization off, the SAME harness must
+    observe overlap — otherwise the test above proves only that the threads
+    happened not to collide."""
+    monkeypatch.setenv("SABLE_MG_IMPACT_SERIALIZE", "0")
+    windows, _waits, _results = _concurrent_tier_windows(monkeypatch)
+    (first_start, first_end), (second_start, _second_end) = windows
+    assert second_start < first_end, (
+        "with the lock disabled the two tiers did not overlap, so this harness cannot "
+        "detect overlap at all and the serialization assertion is vacuous")
+
+
+def test_lock_wait_is_not_charged_to_the_impact_tier_timeout_budget(isolated_lock, tmp_path,
+                                                                    monkeypatch):
+    """SABLE-w0zjm interaction, asserted rather than assumed: a promote that
+    QUEUED behind another must still get its full SABLE_MG_IMPACT_TIMEOUT to run
+    in. If queue time were charged to the tier budget, the fix for false-REDs
+    would become a new source of them — a branch timing out because somebody
+    else's tier was slow."""
+    repo, sha = _real_repo(tmp_path)
+    monkeypatch.setenv("SABLE_MG_IMPACT", "true")
+    monkeypatch.setenv("SABLE_MG_IMPACT_TIMEOUT", "123")
+    seen: list[float | None] = []
+    real_run = git_lib._run
+
+    def spy(argv, **kw):
+        if "timeout" in kw:
+            seen.append(kw["timeout"])
+        return real_run(argv, **kw)
+
+    monkeypatch.setattr(git_lib, "_run", spy)
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with promote_lib.impact_tier_lock(repo):
+            holding.set()
+            release.wait(timeout=10)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert holding.wait(timeout=10), "the holder never acquired the lock"
+    threading.Timer(0.40, release.set).start()
+
+    t0 = time.monotonic()
+    outcome, detail = promote_lib.run_impact_tier(repo, sha, ["bin/thing.py"])
+    waited_wall = time.monotonic() - t0
+    holder.join(timeout=10)
+
+    assert outcome == promote_lib.IMPACT_GREEN, detail
+    assert waited_wall >= 0.35, f"the queued tier did not actually wait ({waited_wall:.3f}s)"
+    assert seen, "the tier ran no timed subprocess, so this asserts nothing"
+    assert set(seen) == {123.0}, (
+        f"a queued tier was handed a reduced budget {sorted(set(seen))} instead of the full "
+        f"123s — lock-wait time leaked into the impact-tier timeout")
+
+
+def test_giving_up_on_the_lock_is_an_ERROR_not_a_pass(isolated_lock, monkeypatch):
+    """A tier that never STARTED taught us nothing about the combined tree, so it
+    must read as ERROR (-> full re-preview), never as green (which would promote
+    an unverified merge) or red (which would blame an innocent author)."""
+    monkeypatch.setenv("SABLE_MG_IMPACT_LOCK_TIMEOUT", "0.2")
+    monkeypatch.setattr(promote_lib, "_run_impact_tier_locked",
+                        lambda *a, **kw: pytest.fail("the tier ran while the lock was held"))
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with promote_lib.impact_tier_lock("/repo"):
+            holding.set()
+            release.wait(timeout=10)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert holding.wait(timeout=10)
+    try:
+        outcome, detail = promote_lib.run_impact_tier("/repo", "f" * 40, ["bin/thing.py"])
+    finally:
+        release.set()
+        holder.join(timeout=10)
+    assert outcome == promote_lib.IMPACT_ERROR, detail
+    assert "never started" in detail
+    # ...and that ERROR is already routed away from any promotion by the table.
+    assert decide(classify.GREEN, base_moved=True, disjoint=True,
+                  impact=promote_lib.IMPACT_ERROR).action == promote_lib.ACTION_REPREVIEW
+
+
+def test_a_crashed_holder_does_not_wedge_the_seat(isolated_lock, tmp_path):
+    """flock, not a pidfile: the kernel drops the lock when the holder dies. A
+    promote killed mid-tier (^C at the seat, an OOM, a closed pane) must not
+    leave every later promote queued forever."""
+    lock = tmp_path / "impact-tier.lock"
+    script = tmp_path / "holder.py"
+    script.write_text(
+        "import fcntl, os, sys, time\n"
+        f"fh = open({str(lock)!r}, 'a+')\n"
+        "fcntl.flock(fh.fileno(), fcntl.LOCK_EX)\n"
+        "print('held', flush=True)\n"
+        "time.sleep(30)\n")
+    proc = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "held"
+        proc.kill()
+        proc.wait(timeout=10)
+        t0 = time.monotonic()
+        with promote_lib.impact_tier_lock("/repo") as waited:
+            assert waited < 5.0, f"waited {waited:.1f}s on a lock whose holder was killed"
+        assert time.monotonic() - t0 < 5.0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_the_lock_is_per_repo_and_lives_in_the_merge_gate_state_dir(tmp_path, monkeypatch):
+    """Every worktree of a repo must contend on ONE file (that is the collision
+    being prevented), and a different repo must not contend at all."""
+    monkeypatch.delenv("SABLE_MG_IMPACT_LOCK", raising=False)
+    monkeypatch.setenv("SABLE_MERGE_GATE_STATE", str(tmp_path / "state"))
+    path = promote_lib.impact_lock_path("/repo")
+    assert path == tmp_path / "state" / promote_lib.IMPACT_LOCK_FILE
+    assert path.parent.is_dir(), "the state dir must exist before the lock is opened"
+    monkeypatch.setenv("SABLE_MERGE_GATE_STATE", str(tmp_path / "other"))
+    assert promote_lib.impact_lock_path("/repo") != path
+
+
+def test_the_tier_window_log_records_both_edges(isolated_lock, tmp_path, monkeypatch):
+    """The window log is the only direct evidence a human (or
+    hooks/test/test-impact-tier-serialization.sh) has that two tiers did not
+    overlap — suite results alone cannot show it, which is exactly why the
+    pile-up read as six broken branches rather than one broken control."""
+    repo, sha = _real_repo(tmp_path)
+    monkeypatch.setenv("SABLE_MG_IMPACT", "true")
+    promote_lib.run_impact_tier(repo, sha, ["bin/thing.py"])
+    lines = [json.loads(ln) for ln in
+             Path(isolated_lock / "windows.jsonl").read_text().splitlines() if ln.strip()]
+    assert [ln["event"] for ln in lines] == ["start", "end"]
+    assert all(ln["pid"] == os.getpid() and ln["tree"] == sha[:12] for ln in lines)
+    assert lines[1]["at"] >= lines[0]["at"]

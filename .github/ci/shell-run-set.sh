@@ -47,6 +47,7 @@ ALLOW=(
   test-identity-hermeticity.sh
   test-impact-manifest.sh
   test-impact-selection.sh
+  test-impact-tier-serialization.sh
   test-install-preserves-pins.sh
   test-lib-git-sandbox.sh
   test-lib-hook-trace.sh
@@ -155,6 +156,7 @@ declare -A COVERS=(
   [test-dep-merge-state.sh]="bin/sable-dep-check bin/sable-spawn-worker"
   [test-doctor-snapshot-staleness.sh]="bin/sable-doctor bin/sable-bin-install install.sh"
   [test-edit-write-claim-reconciler.sh]="hooks/multi-manager/edit-write-claim-reconciler.sh"
+  [test-impact-tier-serialization.sh]="bin/sable_gate_promote_lib.py"
   [test-lib-hook-trace.sh]="hooks/multi-manager/lib-hook-trace.sh"
   [test-lib-identity.sh]="hooks/multi-manager/lib-identity.sh"
   [test-lib-mode-path.sh]="hooks/multi-manager/lib-mode-path.sh"

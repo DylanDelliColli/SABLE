@@ -224,7 +224,17 @@ def test_promote_module_does_not_poll_or_build_previews_itself():
     assert "merge-tree" not in src, "promote module builds its own preview"
     assert "gh" not in re.findall(r'"([^"]*gh[^"]*)"', src) or "run list" not in src, \
         "promote module polls Actions directly"
-    assert "time.sleep" not in src, "promote module carries a poll loop"
+    # The `time.sleep` ban is a PROXY for "no CI poll loop lives here", and
+    # SABLE-jd5fj.13 gave the module its first legitimate sleep: the backoff that
+    # acquires the impact-tier serialization flock. That is a different thing —
+    # it waits on a local kernel lock, not on a remote verdict — so the ban is
+    # narrowed to its meaning rather than dropped. Every sleep in this module
+    # must live inside impact_tier_lock; a NEW one anywhere else still reds this,
+    # which is the erosion the check exists to catch.
+    lock_src = inspect.getsource(promote_lib.impact_tier_lock)
+    assert src.count("time.sleep") == lock_src.count("time.sleep") == 1, (
+        "promote module carries a sleep outside the impact-tier lock acquisition — "
+        "if that is a poll loop, it belongs in the preview module")
 
 
 def test_classify_module_is_pure():
