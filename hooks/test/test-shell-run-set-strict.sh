@@ -10,6 +10,14 @@
 # chuck at the merge seat after jd5fj.6 nearly shipped exactly that). --check
 # must exit non-zero whenever manifest_scan finds either condition.
 #
+# ALSO GUARDS the exclusion-rot mechanism (SABLE-wqe2e), cases (e)/(e2)/(f):
+# an EXCLUDE entry whose file EXISTS but whose tracking bead has been CLOSED is
+# invisible to the staleness guard above, so a suite can stay ungated for weeks
+# after its blocker is fixed. --check enforces that every reason carries a
+# parseable [blocked-by:]/[permanent:] tag (no bd needed, so it runs in the
+# clean room); the local-only --check-beads resolves those ids against the real
+# bead store.
+#
 # Fixture: a throwaway directory tree carrying a REAL, unmodified copy of
 # .github/ci/shell-run-set.sh (the actual production script — this is not a
 # reimplementation) with its own hooks/test/ directory and its ALLOW/EXCLUDE
@@ -130,7 +138,7 @@ fi
 FIX_C="$(new_fixture case-c)"
 touch_suite "$FIX_C/hooks/test/test-fixture-allowed.sh"
 touch_suite "$FIX_C/hooks/test/test-fixture-excluded.sh"
-set_allow_exclude "$FIX_C" test-fixture-allowed.sh --SEP-- "test-fixture-excluded.sh=known-red, tracked (SABLE-fixture)"
+set_allow_exclude "$FIX_C" test-fixture-allowed.sh --SEP-- "test-fixture-excluded.sh=known-red, tracked [blocked-by: SABLE-fixture]"
 
 OUT_C=$(bash "$FIX_C/.github/ci/shell-run-set.sh" --check 2>&1); RC_C=$?
 
@@ -161,6 +169,158 @@ if printf '%s' "$OUT_C" | grep -q 'will not clear on re-run'; then
   fail "(d) check_error_message_preempts_retry: success path stays silent about retries" "out=$OUT_C"
 else
   pass "(d) check_error_message_preempts_retry: success path stays silent about retries"
+fi
+
+# ---------------------------------------------------------------------------
+# Case (e) exclusion whose tracking bead is closed is flagged (SABLE-wqe2e).
+#
+# THE DEFECT: --check's staleness guard only catches an EXCLUDE entry naming a
+# file that is ABSENT. An entry whose file EXISTS and whose tracking bead has
+# been CLOSED is indistinguishable from a legitimately-blocked suite, so the
+# gate reports itself clean while a suite that has been green for weeks stays
+# ungated (test-sable-msg.sh sat that way for ~2 weeks citing the closed
+# SABLE-cncs — SABLE-8onsf).
+#
+# Driven against FIXTURE EXCLUDE arrays with a STUBBED bd, never the real
+# backlog: a unit test that queries live bead statuses would change verdict
+# whenever someone closes a bead, which is the opposite of a regression test.
+# The real store is exercised separately by case (f) below.
+# ---------------------------------------------------------------------------
+STUBBIN="$TMPROOT/stubbin"
+mkdir -p "$STUBBIN"
+cat > "$STUBBIN/bd" <<'STUB'
+#!/usr/bin/env bash
+# Stub bd: only `bd show <id> --json` is used by --check-beads.
+case "${2:-}" in
+  SABLE-fixclosed|SABLE-fixclosed2) printf '[{"id":"%s","status":"closed"}]\n' "$2" ;;
+  SABLE-fixopen)                    printf '[{"id":"%s","status":"open"}]\n'   "$2" ;;
+  *) printf '[]\n'; exit 1 ;;
+esac
+STUB
+chmod +x "$STUBBIN/bd"
+
+FIX_E="$(new_fixture case-e)"
+for s in stale fresh partial permanent ghostbead; do
+  touch_suite "$FIX_E/hooks/test/test-fixture-$s.sh"
+done
+set_allow_exclude "$FIX_E" --SEP-- \
+  "test-fixture-stale.sh=known-red [blocked-by: SABLE-fixclosed]" \
+  "test-fixture-fresh.sh=known-red [blocked-by: SABLE-fixopen]" \
+  "test-fixture-partial.sh=known-red [blocked-by: SABLE-fixclosed SABLE-fixopen]" \
+  "test-fixture-permanent.sh=structural, needs the install [permanent: SABLE-fixclosed]" \
+  "test-fixture-ghostbead.sh=known-red [blocked-by: SABLE-typoed]"
+
+OUT_E=$(PATH="$STUBBIN:$PATH" bash "$FIX_E/.github/ci/shell-run-set.sh" --check-beads 2>&1); RC_E=$?
+
+if [ "$RC_E" -ne 0 ] && printf '%s' "$OUT_E" | grep -q 'test-fixture-stale.sh' \
+   && printf '%s' "$OUT_E" | grep 'test-fixture-stale.sh' | grep -q 'SABLE-fixclosed'; then
+  pass "(e) exclusion whose tracking bead is closed is flagged — rc!=0 and the message names BOTH the suite file and the closed bead id"
+else
+  fail "(e) exclusion whose tracking bead is closed is flagged — rc!=0 and the message names BOTH the suite file and the closed bead id" "rc=$RC_E out=$OUT_E"
+fi
+
+if printf '%s' "$OUT_E" | grep -q 'test-fixture-fresh.sh'; then
+  fail "(e) exclusion whose sole blocker is still OPEN is NOT flagged" "out=$OUT_E"
+else
+  pass "(e) exclusion whose sole blocker is still OPEN is NOT flagged"
+fi
+
+# Promotion requires EVERY blocker cleared — one open bead keeps the exclusion
+# legitimate, so a partial close must stay silent.
+if printf '%s' "$OUT_E" | grep -q 'test-fixture-partial.sh'; then
+  fail "(e) exclusion citing two blockers, only one closed, is NOT flagged (promotion needs ALL cleared)" "out=$OUT_E"
+else
+  pass "(e) exclusion citing two blockers, only one closed, is NOT flagged (promotion needs ALL cleared)"
+fi
+
+# [permanent: ...] cites its bead as CONTEXT, not as a blocker awaiting a fix
+# (e.g. SABLE-59zu, the closed bead documenting the clean room's hermeticity).
+# Flagging those would fire on 8 of the 10 real entries on day one and the gate
+# would simply be suppressed.
+if printf '%s' "$OUT_E" | grep -q 'test-fixture-permanent.sh'; then
+  fail "(e) [permanent:] exclusion is NOT flagged when its cited bead is closed" "out=$OUT_E"
+else
+  pass "(e) [permanent:] exclusion is NOT flagged when its cited bead is closed"
+fi
+
+# Second, distinct rot mode: a reason citing an id that does not resolve at all.
+if [ "$RC_E" -ne 0 ] && printf '%s' "$OUT_E" | grep 'test-fixture-ghostbead.sh' | grep -q 'SABLE-typoed'; then
+  pass "(e) exclusion citing an UNRESOLVABLE bead id is flagged and named (distinct rot mode from 'closed')"
+else
+  fail "(e) exclusion citing an UNRESOLVABLE bead id is flagged and named (distinct rot mode from 'closed')" "rc=$RC_E out=$OUT_E"
+fi
+
+# No bd on PATH => rc 0 with an EXPLICIT skip line. A silent pass here would
+# reproduce the very false-green this case exists to close, in the one
+# environment (the SABLE-59zu clean room) where the gate is mandatory.
+OUT_E_NOBD=$(env PATH=/usr/bin:/bin /bin/bash "$FIX_E/.github/ci/shell-run-set.sh" --check-beads 2>&1); RC_E_NOBD=$?
+if [ "$RC_E_NOBD" -eq 0 ] && printf '%s' "$OUT_E_NOBD" | grep -q 'SKIP: bd not on PATH'; then
+  pass "(e) no bd on PATH -> --check-beads exits 0 with an explicit 'SKIP: bd not on PATH' line, never a silent no-op"
+else
+  fail "(e) no bd on PATH -> --check-beads exits 0 with an explicit 'SKIP: bd not on PATH' line, never a silent no-op" "rc=$RC_E_NOBD out=$OUT_E_NOBD"
+fi
+
+# A clean fixture (every blocker open, permanent entries only otherwise) must
+# exit 0 — the gate has to be quiet when there is nothing to promote, or it
+# gets ignored the way case (d) guards against.
+FIX_E2="$(new_fixture case-e-clean)"
+touch_suite "$FIX_E2/hooks/test/test-fixture-fresh.sh"
+set_allow_exclude "$FIX_E2" --SEP-- "test-fixture-fresh.sh=known-red [blocked-by: SABLE-fixopen]"
+OUT_E2=$(PATH="$STUBBIN:$PATH" bash "$FIX_E2/.github/ci/shell-run-set.sh" --check-beads 2>&1); RC_E2=$?
+if [ "$RC_E2" -eq 0 ]; then
+  pass "(e) all blockers still open -> --check-beads exits 0"
+else
+  fail "(e) all blockers still open -> --check-beads exits 0" "rc=$RC_E2 out=$OUT_E2"
+fi
+
+# ---------------------------------------------------------------------------
+# Case (e2): tracking-tag WELL-FORMEDNESS is enforced by --check, which is the
+# half of the guard the bd-less clean room can run. Without it an author could
+# write a reason with no parseable bead id at all and the local freshness gate
+# would have nothing to check — the exclusion would be unauditable by either
+# mode.
+# ---------------------------------------------------------------------------
+FIX_G="$(new_fixture case-g)"
+touch_suite "$FIX_G/hooks/test/test-fixture-untagged.sh"
+set_allow_exclude "$FIX_G" --SEP-- "test-fixture-untagged.sh=known-red, tracked (SABLE-fixopen)"
+
+OUT_G=$(bash "$FIX_G/.github/ci/shell-run-set.sh" --check 2>&1); RC_G=$?
+if [ "$RC_G" -ne 0 ] && printf '%s' "$OUT_G" | grep -q 'test-fixture-untagged.sh'; then
+  pass "(e2) EXCLUDE reason with no [blocked-by:]/[permanent:] tag -> --check exits non-zero and names the suite (no bd needed)"
+else
+  fail "(e2) EXCLUDE reason with no [blocked-by:]/[permanent:] tag -> --check exits non-zero and names the suite (no bd needed)" "rc=$RC_G out=$OUT_G"
+fi
+
+# ...and the tagged shape passes, so (e2) is asserting the tag specifically
+# and not some unrelated property of the fixture.
+FIX_G2="$(new_fixture case-g-ok)"
+touch_suite "$FIX_G2/hooks/test/test-fixture-tagged.sh"
+set_allow_exclude "$FIX_G2" --SEP-- "test-fixture-tagged.sh=known-red [blocked-by: SABLE-fixopen]"
+OUT_G2=$(bash "$FIX_G2/.github/ci/shell-run-set.sh" --check 2>&1); RC_G2=$?
+if [ "$RC_G2" -eq 0 ]; then
+  pass "(e2) EXCLUDE reason carrying a well-formed tracking tag -> --check exits 0"
+else
+  fail "(e2) EXCLUDE reason carrying a well-formed tracking tag -> --check exits 0" "rc=$RC_G2 out=$OUT_G2"
+fi
+
+# ---------------------------------------------------------------------------
+# Case (f) real EXCLUDE entries resolve against the real bd store.
+#
+# INTEGRATION, deliberately not stubbed: the unit fixtures above can never
+# catch a reason citing a typo'd or deleted bead id in the ACTUAL run-set,
+# because the stub decides what resolves. This runs the production script's
+# own --check-beads against the production EXCLUDE table and the real bead
+# store. Self-skips when bd is absent (the clean room), per SABLE-59zu.
+# ---------------------------------------------------------------------------
+if command -v bd >/dev/null 2>&1; then
+  OUT_F=$(bash "$PROD" --check-beads 2>&1); RC_F=$?
+  if [ "$RC_F" -eq 0 ]; then
+    pass "(f) real EXCLUDE entries resolve against the real bd store — every cited id resolves and no blocked-by entry has all blockers closed"
+  else
+    fail "(f) real EXCLUDE entries resolve against the real bd store — every cited id resolves and no blocked-by entry has all blockers closed" "rc=$RC_F out=$OUT_F"
+  fi
+else
+  echo "SKIP: (f) real EXCLUDE entries resolve against the real bd store — bd not on PATH (SABLE-59zu clean room)"
 fi
 
 echo
