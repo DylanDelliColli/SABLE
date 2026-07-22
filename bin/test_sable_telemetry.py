@@ -60,14 +60,167 @@ def test_metric_record_to_dict_omits_absent_fields():
     assert lib.metric_to_dict(m) == {"name": "closes_per_hour", "value": 6.0, "unit": "count/hr"}
 
 
-def test_build_shift_and_trend_reports_are_empty_stubs():
-    shift = lib.build_shift_report(since="2026-07-20")
-    assert shift.since == "2026-07-20"
-    assert shift.metrics == ()
+def test_build_shift_report_composes_real_metrics_from_bd_records():
+    beads = [
+        bd_source.BeadRecord(
+            id="SABLE-a", status="closed",
+            created_at="2026-07-20T09:00:00Z",
+            closed_at="2026-07-20T10:00:00Z",
+            started_at="2026-07-20T09:30:00Z",
+        ),
+        bd_source.BeadRecord(
+            id="SABLE-b", status="open",
+            created_at="2026-07-20T11:00:00Z",
+            closed_at=None, started_at=None,
+        ),
+    ]
+    merges = [git_source.MergeEvent(bead_id="SABLE-a", sha="aaa1111",
+                                     committed_at="2026-07-20T10:05:00Z")]
 
-    trend = lib.build_trend_report("14d")
-    assert trend.window == "14d"
-    assert trend.metrics == ()
+    report = lib.build_shift_report(beads, merges, since="2026-07-20T00:00:00Z",
+                                     tz=timezone.utc)
+
+    by_name = {m.name: m for m in report.metrics}
+    assert report.since == "2026-07-20T00:00:00Z"
+    assert by_name["closes"].value == 1
+    assert by_name["intake"].value == 2
+    assert by_name["net_burn"].value == -1
+    assert by_name["cycle_split_dispatched"].value == 1
+    assert "had dispatch timestamps" in by_name["cycle_split_dispatched"].meta["note"]
+
+
+def test_build_shift_report_with_no_activity_still_surfaces_denominator_note():
+    # An empty corpus must still surface the zero-value metrics and the
+    # denominator invariant explicitly -- never silently omitted, same
+    # philosophy as the S4 gap-day backfill. Also exercises the bare
+    # YYYY-MM-DD `since` fallback path (no time component).
+    report = lib.build_shift_report(since="2026-07-20")
+
+    by_name = {m.name: m for m in report.metrics}
+    assert by_name["closes"].value == 0
+    assert by_name["intake"].value == 0
+    assert by_name["net_burn"].value == 0
+    assert by_name["cycle_split_dispatched"].meta["note"] == (
+        "0 of 0 closed beads had dispatch timestamps"
+    )
+
+
+def test_build_trend_report_composes_daily_series_and_total():
+    beads = [
+        bd_source.BeadRecord(id="SABLE-a", status="closed",
+                              created_at="2026-07-19T09:00:00Z",
+                              closed_at="2026-07-19T10:00:00Z", started_at=None),
+        bd_source.BeadRecord(id="SABLE-b", status="closed",
+                              created_at="2026-07-22T09:00:00Z",
+                              closed_at="2026-07-22T10:00:00Z", started_at=None),
+    ]
+
+    report = lib.build_trend_report("7d", beads, tz=timezone.utc)
+
+    assert report.window == "7d"
+    daily = [m for m in report.metrics if m.name == "daily_net_burn"]
+    assert [m.meta["date"] for m in daily] == [
+        "2026-07-19", "2026-07-20", "2026-07-21", "2026-07-22",
+    ]
+    total = next(m for m in report.metrics if m.name == "total_net_burn")
+    assert total.value == 0  # 2 closes - 2 intake across the whole window
+
+
+def test_build_trend_report_truncates_series_to_requested_window():
+    beads = [
+        bd_source.BeadRecord(id=f"SABLE-day{n}", status="closed",
+                              created_at=f"2026-07-{10 + n:02d}T09:00:00Z",
+                              closed_at=f"2026-07-{10 + n:02d}T10:00:00Z",
+                              started_at=None)
+        for n in range(10)
+    ]
+
+    report = lib.build_trend_report("3d", beads, tz=timezone.utc)
+
+    daily = [m for m in report.metrics if m.name == "daily_net_burn"]
+    assert len(daily) == 3
+    assert daily[-1].meta["date"] == "2026-07-19"  # the most recent 3 days only
+
+
+def test_parse_trend_window_rejects_non_day_suffix():
+    assert lib.parse_trend_window("7d") == 7
+    with pytest.raises(ValueError):
+        lib.parse_trend_window("7w")
+
+
+def test_format_metrics_table_renders_name_value_unit_and_note():
+    metrics = (
+        lib.MetricRecord(name="closes", value=3.0, unit="count"),
+        lib.MetricRecord(name="cycle_split_dispatched", value=2.0, unit="count",
+                          meta={"note": "2 of 3 closed beads had dispatch timestamps"}),
+    )
+    table = lib.format_metrics_table(metrics)
+    assert "closes" in table
+    assert "3.0" in table
+    assert "2 of 3 closed beads had dispatch timestamps" in table
+
+
+def test_format_metrics_table_empty_is_explicit_not_blank():
+    assert lib.format_metrics_table(()) == "(no metrics)"
+
+
+def test_format_shift_report_human_includes_scope_and_table():
+    report = lib.ShiftReport(since="2026-07-20", metrics=(
+        lib.MetricRecord(name="closes", value=1.0, unit="count"),
+    ))
+    rendered = lib.format_shift_report_human(report)
+    assert "--shift" in rendered
+    assert "2026-07-20" in rendered
+    assert "closes" in rendered
+
+
+def test_format_trend_report_human_includes_window_and_table():
+    report = lib.TrendReport(window="7d", metrics=(
+        lib.MetricRecord(name="total_net_burn", value=2.0, unit="count"),
+    ))
+    rendered = lib.format_trend_report_human(report)
+    assert "--trend" in rendered
+    assert "7d" in rendered
+    assert "total_net_burn" in rendered
+
+
+def test_shift_report_to_dict_json_shape_matches_metrics():
+    report = lib.build_shift_report(since="2026-07-20")
+    payload = lib.shift_report_to_dict(report)
+    assert set(payload.keys()) == {"since", "metrics"}
+    assert all(set(m.keys()) >= {"name", "value", "unit"} for m in payload["metrics"])
+
+
+def test_trend_report_to_dict_json_shape_matches_metrics():
+    report = lib.build_trend_report("7d")
+    payload = lib.trend_report_to_dict(report)
+    assert set(payload.keys()) == {"window", "metrics"}
+
+
+def test_build_shift_ledger_title_carries_prefix_and_scope():
+    report = lib.ShiftReport(since="2026-07-20", metrics=())
+    title = lib.build_shift_ledger_title(report)
+    assert title.startswith(lib.SHIFT_TELEMETRY_TITLE_PREFIX)
+    assert "2026-07-20" in title
+    # Must never collide with the human "[SHIFT REPORT] ..." overlay-marker
+    # regex -- these are a different artifact (a tool-filed ledger, not a
+    # human-authored shift-report bead).
+    assert lib.is_shift_report_bead(title) is False
+
+
+def test_build_shift_ledger_description_includes_table_and_json():
+    report = lib.ShiftReport(since="2026-07-20", metrics=(
+        lib.MetricRecord(name="closes", value=1.0, unit="count"),
+    ))
+    description = lib.build_shift_ledger_description(report)
+    assert "closes" in description
+    assert '"since": "2026-07-20"' in description
+
+
+def test_file_shift_ledger_bead_rejects_unknown_origin():
+    report = lib.ShiftReport(since=None, metrics=())
+    with pytest.raises(ValueError):
+        lib.file_shift_ledger_bead(report, origin="bogus")
 
 
 def test_bd_source_query_passes_all_flag():
