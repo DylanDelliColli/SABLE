@@ -37,6 +37,25 @@
 #   C6 SABLE_MG_OPTIMISTIC=0                        -> exit 23 on C1's own
 #      scenario: the kill switch restores the pre-jd5fj.4 behaviour exactly.
 #
+# SABLE-w0zjm extends this suite past the gate's own boundary, because the defect
+# it covers lives OUTSIDE the repo: the operator wrapper the gate runs inside.
+# jd5fj.4 deliberately moved cost from GitHub's CI into the local promote, which
+# invalidates every enclosing timeout sized when the tier effectively never ran —
+# and no repo-side test can see those timeouts, so the suite has to build one.
+#
+#   C7 wrapper timeout BELOW the tier's cost   -> the promote is killed (124) and
+#      the kill is SAFE: the integration tip is unmoved and the ci-verify ref is
+#      untouched, so the only cost is the run. Nothing is pushed before a green
+#      verdict, which is why this is nasty rather than dangerous.
+#   C8 the SAME fixture, wrapper ABOVE the cost -> promotes normally. C7's
+#      non-vacuity: without it, C7 cannot tell an enclosing timeout apart from
+#      the optimistic path genuinely malfunctioning — which is precisely the
+#      misdiagnosis the bead predicts, arriving exactly when someone is trying to
+#      confirm jd5fj.4 works.
+#   C9 `promote-budget --seconds` -> a bare integer above queue+tier that TRACKS
+#      the gate's own knobs, so a wrapper DERIVES its bound instead of keeping a
+#      second copy of the number. Deriving is the fix; documenting is not.
+#
 # Do NOT read this suite as evidence that the relaxation is low-risk. It shows
 # the gate refuses the shapes we enumerated. SABLE-nueh3's 0/126 base rate was
 # measured under the regime this bead removes, so the usable prior for what we
@@ -133,6 +152,10 @@ EOF
 #!/usr/bin/env bash
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 2
+# SLOW_TIER makes this suite take a known, real amount of wall-clock, so C7/C8
+# can put a wrapper timeout on either side of it. Unset in every other case, so
+# the tier stays as fast as it was.
+if [ -n "${SLOW_TIER:-}" ]; then sleep "$SLOW_TIER"; fi
 n="$(grep -rho 'ROUTE=/health' left right 2>/dev/null | grep -c .)"
 if [ "$n" -gt 1 ]; then
   echo "FAIL: /health is registered $n times — duplicate route registration"
@@ -180,6 +203,22 @@ gate() {
       SABLE_MG_GH="$FAKE_GH" SABLE_MG_BD=true SABLE_MG_NOTIFY=true \
       SABLE_MG_POLL=0 SABLE_MG_GRACE=0 SABLE_MG_TIMEOUT=0 \
       SABLE_MG_OPTIMISTIC="${SABLE_MG_OPTIMISTIC:-1}" \
+      SLOW_TIER="${SLOW_TIER:-}" \
+      PATH="$PATH" python3 "$GATE" "$@" 2>&1
+}
+
+# gate_wrapped <wrapper-seconds> <gate args...> — the SABLE-w0zjm shape: the gate
+# run INSIDE an operator's enclosing `timeout`, which is where the real defect
+# lives (chuck's wrapper was 900s, the same number as the tier budget). Exits 124
+# when the wrapper kills it.
+gate_wrapped() {
+  local secs="$1"; shift
+  timeout "$secs" env FAKE_GH_ORIGIN="$B_ORIGIN" FAKE_GH_BASE="$BASE_BR" \
+      FAKE_GH_MODE="${FAKE_GH_MODE:-success}" FAKE_GH_ADVANCE="${FAKE_GH_ADVANCE:-}" \
+      SABLE_MG_GH="$FAKE_GH" SABLE_MG_BD=true SABLE_MG_NOTIFY=true \
+      SABLE_MG_POLL=0 SABLE_MG_GRACE=0 SABLE_MG_TIMEOUT=0 \
+      SABLE_MG_OPTIMISTIC="${SABLE_MG_OPTIMISTIC:-1}" \
+      SLOW_TIER="${SLOW_TIER:-}" \
       PATH="$PATH" python3 "$GATE" "$@" 2>&1
 }
 
@@ -367,6 +406,103 @@ if ! printf '%s' "$OUT" | grep -q 'impact tier'; then
   pass "C6: with the switch off, no impact tier runs at all"
 else
   fail "C6: no impact tier runs with the switch off" "out=$OUT"
+fi
+
+# ==========================================================================
+# C7 — an ENCLOSING wrapper timeout shorter than the tier kills the promote,
+#      and the kill is SAFE (SABLE-w0zjm)
+# ==========================================================================
+# The bead's whole thesis: jd5fj.4 moved cost from GitHub's CI into the local
+# promote, so a wrapper sized when the tier never ran now fires mid-tier. What
+# must be proven is not that the kill is impossible — it is that the kill costs
+# nothing but the run: nothing is pushed before a green verdict, so the base is
+# exactly where it was and the ci-verify ref is still there to retry against.
+scenario c7 mut_branch_disjoint_ok mut_base_disjoint_ok
+REFS_BEFORE="$(ci_refs)"
+OUT="$(SLOW_TIER=8 FAKE_GH_ADVANCE="$MOVED_SHA" gate_wrapped 3 promote --bead TEST-C7 \
+        --branch wk-1 --base "$BASE_BR" --repo "$B_WORK" --remote origin)"; RC=$?
+
+if [ "$RC" -eq 124 ]; then
+  pass "C7: a wrapper timeout shorter than the impact tier kills the promote (exit 124)"
+else
+  fail "C7: the short wrapper kills the promote" "rc=$RC out=$OUT"
+fi
+if [ "$(origin_sha "$BASE_BR")" = "$MOVED_SHA" ]; then
+  pass "C7: the killed promote pushed NOTHING — the integration tip is unmoved"
+else
+  fail "C7: the killed promote pushed nothing" "base=$(origin_sha "$BASE_BR") moved=$MOVED_SHA"
+fi
+if [ "$(ci_refs)" = "$REFS_BEFORE" ]; then
+  pass "C7: no ci-verify ref was created or consumed — the promote is still retryable"
+else
+  fail "C7: ci-verify refs unchanged" "before=[$REFS_BEFORE] after=[$(ci_refs)]"
+fi
+if printf '%s' "$OUT" | grep -q 'ENTERING IMPACT TIER'; then
+  pass "C7: the last line before the kill says it was IN the tier (diagnosable, not mysterious)"
+else
+  fail "C7: the in-tier marker is emitted before the kill" "out=$OUT"
+fi
+
+# ==========================================================================
+# C8 — NEGATIVE CONTROL: the same fixture with a wrapper ABOVE the budget
+# ==========================================================================
+# Without this, C7 proves only that something failed — it could not distinguish
+# an enclosing timeout from the optimistic path genuinely malfunctioning, which
+# is the exact misdiagnosis the bead predicts.
+scenario c8 mut_branch_disjoint_ok mut_base_disjoint_ok
+OUT="$(SLOW_TIER=8 FAKE_GH_ADVANCE="$MOVED_SHA" gate_wrapped 120 promote --bead TEST-C8 \
+        --branch wk-1 --base "$BASE_BR" --repo "$B_WORK" --remote origin)"; RC=$?
+LANDED="$(origin_sha "$BASE_BR")"
+
+if [ "$RC" -eq 0 ]; then
+  pass "C8: the SAME slow tier promotes normally under a wrapper above the budget (exit 0)"
+else
+  fail "C8: a wrapper above the budget promotes normally" "rc=$RC out=$OUT"
+fi
+if [ "$(parents_of "$LANDED")" = "$MOVED_SHA $WK_SHA" ]; then
+  pass "C8: the combined object landed — C7's failure was the wrapper, not the path"
+else
+  fail "C8: the combined object landed" "parents=$(parents_of "$LANDED")"
+fi
+if [ -z "$(ci_refs)" ]; then
+  pass "C8: the ci-verify ref is cleaned up, exactly as on the un-wrapped C1 path"
+else
+  fail "C8: ci-verify ref cleaned up" "refs=[$(ci_refs)]"
+fi
+
+# ==========================================================================
+# C9 — the wrapper can DERIVE its bound instead of copying it (SABLE-w0zjm b)
+# ==========================================================================
+# Documenting "make your timeout bigger" is what failed: the number lived in two
+# places and only one of them was in this repo. The gate reporting its own budget
+# is what removes the second copy.
+DERIVED="$(SABLE_MG_IMPACT_TIMEOUT=90 SABLE_MG_IMPACT_LOCK_TIMEOUT=210 \
+           python3 "$GATE" promote-budget --seconds 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ] && printf '%s' "$DERIVED" | grep -qx '[0-9]\+'; then
+  pass "C9: the gate prints a bare integer a shell can hand straight to \`timeout\`"
+else
+  fail "C9: promote-budget --seconds prints a bare integer" "rc=$RC out=$DERIVED"
+fi
+if [ "${RC}" -eq 0 ] && [ "$DERIVED" -gt 300 ]; then
+  pass "C9: the derived bound exceeds queue+tier (90+210), so a wrapper using it cannot fire early"
+else
+  fail "C9: the derived bound exceeds queue+tier" "derived=$DERIVED want>300"
+fi
+# Non-vacuity: it must TRACK the env, not print a constant that happens to be big.
+DERIVED2="$(SABLE_MG_IMPACT_TIMEOUT=900 SABLE_MG_IMPACT_LOCK_TIMEOUT=3600 \
+            python3 "$GATE" promote-budget --seconds 2>&1)"
+if [ "$DERIVED2" -gt "$DERIVED" ]; then
+  pass "C9: the derived bound TRACKS the gate's own knobs (a copied constant could not)"
+else
+  fail "C9: the derived bound tracks the knobs" "small=$DERIVED large=$DERIVED2"
+fi
+# And the wrapper C8 actually used must have been above the fixture's real cost —
+# stated here so the 120 above is a derived-style bound, not a magic number.
+if [ "$(SABLE_MG_IMPACT_TIMEOUT=8 SABLE_MG_IMPACT_SERIALIZE=0 \
+        python3 "$GATE" promote-budget --seconds)" -le 120 ]; then
+  pass "C9: C8's wrapper (120s) is above what the gate itself would recommend for an 8s tier"
+else
+  fail "C9: C8's wrapper is above the recommended bound" "recommendation exceeds 120s"
 fi
 
 echo "----------------------------------------------------------------------"
