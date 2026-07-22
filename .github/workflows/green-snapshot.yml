@@ -94,7 +94,17 @@ jobs:
           # unrecognized arguments (exit 4) without pytest-cov installed. See
           # ci-verify.yml's matching clean-room step for the verbatim CI error
           # that diagnosed this.
-          pip install pytest pytest-testmon pytest-impact pytest-cov
+          #
+          # diff_cover (SABLE-kh4sx): this workflow's full_snapshot tier runs
+          # the SAME suite set as ci-verify.yml's merge_preview tier -- both
+          # alias .github/ci/shell-run-set.sh's ALLOW array by reference (see
+          # .github/ci/test-tiers.sh) -- which includes
+          # test-coverage-floor-gate.sh. That suite FATALs (exit 2) without
+          # diff-cover on PATH; ci-verify.yml has carried it since
+          # SABLE-cmar4.6's third revise, but this line never did.
+          # bin/test_clean_room_dep_parity.py checks mechanically that these
+          # two clean-room install lines cannot silently drift apart again.
+          pip install pytest pytest-testmon pytest-impact pytest-cov diff_cover
 
       - name: Configure git identity (SABLE-59zu — clean-room needs one)
         run: |
