@@ -80,6 +80,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -470,6 +471,15 @@ def warm_gate_testmon_cache(repo: str) -> int:
 IMPACT_LOCK_FILE = "impact-tier.lock"
 IMPACT_WINDOW_FILE = "impact-tier-windows.jsonl"
 
+# SABLE-mbkbm: bumped when "end" records started carrying a "phases" list.
+# Records written before this bead (jd5fj.13's original five keys: event, pid,
+# at, tree, waited) carry no "schema" key at all -- readers must treat a
+# missing key as schema 1 and EXCLUDE it from phase aggregates rather than
+# reading a missing "phases" as zero phases. A fabricated 0.0 duration is
+# indistinguishable from "ran instantly" and would poison the aggregate the
+# same way an inferred split would (see impact_tier_phase_report).
+IMPACT_WINDOW_SCHEMA_VERSION = 2
+
 
 class ImpactLockTimeout(RuntimeError):
     """Waited longer than SABLE_MG_IMPACT_LOCK_TIMEOUT for the tier lock. Never
@@ -662,22 +672,42 @@ def impact_tier_lock(repo: str | os.PathLike = "."):
 
 
 def _stamp_impact_window(repo: str | os.PathLike, event: str, tree_sha: str,
-                         waited: float) -> None:
+                         waited: float, phases: list[dict] | None = None) -> None:
     """Append one start/end record for this tier run. Best-effort and never
     load-bearing on the verdict — it exists so a human (and
     hooks/test/test-impact-tier-serialization.sh) can see whether two tier
     WINDOWS overlapped, which is the only direct evidence that the lock is doing
     its job. Overlap is invisible from suite results alone: that is precisely why
-    the pile-up read as six broken branches instead of one broken control."""
+    the pile-up read as six broken branches instead of one broken control.
+
+    SABLE-mbkbm: `phases` (only ever passed on the "end" event, once
+    run_impact_tier knows what it ran) is the per-phase wall-clock breakdown —
+    setup, each shell suite by name, the pytest half — that answers "where did
+    the tier's own time go" instead of only "how long did it take in total".
+    Every record still carries the original five keys unchanged, so a mixed-
+    vintage journal stays readable by old consumers; "schema" and "phases" are
+    additive."""
     try:
         path = Path(os.environ.get("SABLE_MG_IMPACT_WINDOW_LOG")
                     or (snapshot_lib.ensure_state_dir(repo) / IMPACT_WINDOW_FILE))
         path.parent.mkdir(parents=True, exist_ok=True)
+        record = {"schema": IMPACT_WINDOW_SCHEMA_VERSION, "event": event, "pid": os.getpid(),
+                  "at": time.time(), "tree": tree_sha[:12], "waited": round(waited, 3)}
+        if phases is not None:
+            record["phases"] = phases
         with open(path, "a") as fh:
-            fh.write(json.dumps({"event": event, "pid": os.getpid(), "at": time.time(),
-                                 "tree": tree_sha[:12], "waited": round(waited, 3)}) + "\n")
+            fh.write(json.dumps(record) + "\n")
     except OSError:
         pass
+
+
+def _record_phase(phases: list[dict], name: str, started: float) -> None:
+    """Append one measured (not inferred) phase span to `phases`, timed from
+    `started` (a prior time.monotonic() call) to now. Multiple entries can share
+    a `name` (e.g. worktree setup and teardown both report "setup") — the phase-2
+    reader (impact_tier_phase_report) sums by name, so this stays a direct
+    measurement of each real span rather than a derived split of a total."""
+    phases.append({"name": name, "seconds": round(time.monotonic() - started, 3)})
 
 
 def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, str]:
@@ -722,10 +752,16 @@ def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, st
                   f"tier itself (see `sable-merge-gate promote-budget`)",
                   flush=True)
             _stamp_impact_window(repo, "start", tree_sha, waited)
+            # SABLE-mbkbm: a mutable OUTPUT list, not a return value — so even a
+            # tier that dies partway (an exception inside _run_impact_tier_locked
+            # that its own except clauses don't catch) still stamps whatever
+            # phases genuinely ran before that point, instead of losing every
+            # phase because the function never reached its return.
+            phases: list[dict] = []
             try:
-                return _run_impact_tier_locked(repo, tree_sha, paths)
+                return _run_impact_tier_locked(repo, tree_sha, paths, phases)
             finally:
-                _stamp_impact_window(repo, "end", tree_sha, waited)
+                _stamp_impact_window(repo, "end", tree_sha, waited, phases=phases)
     except ImpactLockTimeout as exc:
         return (IMPACT_ERROR, f"impact tier never started: {exc}")
 
@@ -813,9 +849,18 @@ def _impact_isolated_env(parent: str | os.PathLike) -> dict[str, str]:
     return env
 
 
-def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, str]:
+def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str],
+                            phases: list[dict] | None = None) -> tuple[str, str]:
     """The tier itself, with the seat's serialization lock already held. Reports
     (IMPACT_GREEN|IMPACT_RED|IMPACT_ERROR, detail).
+
+    SABLE-mbkbm: `phases`, when given, is appended to in place with each real
+    span this function times — worktree add/remove ("setup"), each shell suite
+    by its own name ("shell:<suite>"), and the pytest half ("pytest") — using
+    time.monotonic() around subprocess boundaries that already exist here. No
+    phase is invented for work that didn't run: a footprint that never reaches
+    bin/ never appends a "pytest" entry, which is the difference between an
+    absent measurement and a fabricated zero.
 
     "Real" is the whole point, and it is why this checks the combined commit out
     into a throwaway detached worktree instead of reasoning about trees: the
@@ -836,11 +881,17 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str]) -> tuple
     while ERROR means we learned nothing and must fall back to exit 23. Reporting
     a non-answer as either green or red would be the silent-green class this epic
     exists to eliminate."""
+    if phases is None:
+        phases = []
     override = os.environ.get("SABLE_MG_IMPACT", "").split()
     parent = tempfile.mkdtemp(prefix="sable-impact-")
     worktree = str(Path(parent) / "tree")
     try:
-        add = git_lib._git(repo, "worktree", "add", "--detach", worktree, tree_sha, check=False)
+        _t0 = time.monotonic()
+        try:
+            add = git_lib._git(repo, "worktree", "add", "--detach", worktree, tree_sha, check=False)
+        finally:
+            _record_phase(phases, "setup", _t0)
         if add.returncode != 0:
             return (IMPACT_ERROR, f"could not check out the combined tree: {add.stdout.strip()[:400]}")
         try:
@@ -850,8 +901,12 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str]) -> tuple
             # what kills the false-RED class jd5fj.13 could only queue around.
             env = _impact_isolated_env(parent)
             if override:
-                cp = git_lib._run(override + list(paths), cwd=worktree, check=False,
-                                  timeout=_impact_timeout(), env=env)
+                _t0 = time.monotonic()
+                try:
+                    cp = git_lib._run(override + list(paths), cwd=worktree, check=False,
+                                      timeout=_impact_timeout(), env=env)
+                finally:
+                    _record_phase(phases, "override", _t0)
                 return ((IMPACT_GREEN, "impact tier override reported green") if cp.returncode == 0
                         else (IMPACT_RED, f"impact tier override failed (rc={cp.returncode}): "
                                           f"{cp.stdout.strip()[:400]}"))
@@ -859,15 +914,26 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str]) -> tuple
             if not (Path(worktree) / ".github" / "ci" / "impact-manifest.sh").is_file():
                 return (IMPACT_ERROR, "this repo has no .github/ci/impact-manifest.sh — "
                                       "no impact tier to run on the combined tree")
-            suites = _selected_suites(worktree, list(paths))
+            _t0 = time.monotonic()
+            try:
+                suites = _selected_suites(worktree, list(paths))
+            finally:
+                _record_phase(phases, "setup", _t0)
             ran: list[str] = []
             for suite in suites:
                 suite_path = Path(worktree) / "hooks" / "test" / suite
                 if not suite_path.is_file():
                     return (IMPACT_ERROR, f"impact tier selected {suite} but it is missing "
                                           f"from the combined tree")
-                cp = git_lib._run(["bash", str(suite_path)], cwd=worktree, check=False,
-                                  timeout=_impact_timeout(), env=env)
+                _t0 = time.monotonic()
+                try:
+                    cp = git_lib._run(["bash", str(suite_path)], cwd=worktree, check=False,
+                                      timeout=_impact_timeout(), env=env)
+                finally:
+                    # SABLE-mbkbm: EACH suite gets its OWN phase name — a single
+                    # "shell" bucket would hide exactly the question this bead
+                    # exists to answer (which suite dominates).
+                    _record_phase(phases, f"shell:{suite}", _t0)
                 ran.append(suite)
                 if cp.returncode != 0:
                     return (IMPACT_RED, f"{suite} FAILED on the combined tree (rc={cp.returncode}): "
@@ -879,8 +945,12 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str]) -> tuple
                 warm_source, warm_label = _warm_testmondata_source(repo)
                 if warm_source is not None:
                     shutil.copy2(warm_source, Path(worktree) / ".testmondata")
-                cp = git_lib._run([sys.executable, str(selector)], cwd=worktree, check=False,
-                                  timeout=_impact_timeout(), env=env)
+                _t0 = time.monotonic()
+                try:
+                    cp = git_lib._run([sys.executable, str(selector)], cwd=worktree, check=False,
+                                      timeout=_impact_timeout(), env=env)
+                finally:
+                    _record_phase(phases, "pytest", _t0)
                 # SABLE-jd5fj.8: name whichever path tier_selection.py ITSELF
                 # actually took (its own stderr line, folded into cp.stdout by
                 # git_lib._run), not just whether a file was handed to it — a
@@ -903,14 +973,150 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str]) -> tuple
                                       "the combined tree")
             return (IMPACT_GREEN, f"impact tier GREEN on the combined tree: {', '.join(ran)}")
         finally:
+            _t0 = time.monotonic()
             git_lib._git(repo, "worktree", "remove", "--force", worktree, check=False)
             git_lib._git(repo, "worktree", "prune", check=False)
+            _record_phase(phases, "setup", _t0)
     except subprocess.TimeoutExpired as exc:
         return (IMPACT_ERROR, f"impact tier timed out after {_impact_timeout()}s: {exc}")
     except (OSError, RuntimeError) as exc:
         return (IMPACT_ERROR, f"impact tier could not run: {exc}")
     finally:
         shutil.rmtree(parent, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# Phase-2: decomposing the tier's own wall-clock (SABLE-mbkbm)
+# --------------------------------------------------------------------------
+#
+# THE PREMISE: this is a DECISION INPUT, not a curiosity. jd5fj.8 was dispatched
+# on the ASSUMPTION that the cold-testmon pytest fallback was a first-order tier
+# cost; measured on a real footprint the warm cache saved ~2%. The instrumentation
+# above (run_impact_tier / _run_impact_tier_locked) is what makes the next such
+# decision a measurement instead of another assumption -- this is the reader for
+# the journal it writes.
+#
+# NO INFERRED SPLITS. Every number below is either a directly-recorded phase
+# span or a directly-recorded start/end pair from the SAME journal; nothing here
+# derives a phase duration from a total. Records written before this bead (no
+# "schema" key, schema < 2, or an "end" event with no "phases" key) are counted
+# in `legacy_records_excluded` and EXCLUDED from every phase statistic -- folding
+# them in as zero-duration phases would be indistinguishable from "ran instantly"
+# and would silently understate whichever phase actually dominates.
+
+def _phase_stats(values: list[float]) -> dict | None:
+    """n / median / p90 / total for one phase's observed durations, or None for
+    an empty sample -- callers must not report statistics for zero records."""
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    median = s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
+    p90 = s[min(n - 1, math.ceil(0.9 * n) - 1)]
+    return {"n": n, "median_s": round(median, 3), "p90_s": round(p90, 3),
+            "total_s": round(sum(s), 3)}
+
+
+def impact_tier_phase_report(repo: str | os.PathLike = ".") -> dict:
+    """Decompose the impact tier's own wall-clock by phase — setup, each shell
+    suite, the pytest half — from the journal _stamp_impact_window writes.
+
+    Returns a dict with:
+      * total_tier_wall_clock: _phase_stats over each PAIRED start/end window's
+        (end.at - start.at), the same total the pre-mbkbm journal could already
+        report, recomputed here so a caller can see phase totals alongside it.
+      * phases: {name: _phase_stats(...) | share_of_total} for every phase name
+        seen across schema>=2 "end" records that carry a "phases" list.
+      * tiers_with_phase_data: how many "end" records actually had phase data —
+        THE n THE BEAD REQUIRES A CALLER TO STATE. 0 means "no measurement yet",
+        not "the split is even".
+      * legacy_records_excluded: "end" records with no usable phase data
+        (pre-mbkbm schema, or a schema>=2 record whose phases list is absent —
+        both are "we don't know", never zero).
+    """
+    path = Path(os.environ.get("SABLE_MG_IMPACT_WINDOW_LOG")
+                or (snapshot_lib.ensure_state_dir(repo) / IMPACT_WINDOW_FILE))
+    by_phase: dict[str, list[float]] = defaultdict(list)
+    total_windows: list[float] = []
+    legacy_excluded = 0
+    tiers_with_phases = 0
+    starts: dict[tuple, float] = {}
+
+    if path.is_file():
+        for raw in path.read_text().splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            key = (rec.get("pid"), rec.get("tree"))
+            event = rec.get("event")
+            if event == "start":
+                at = rec.get("at")
+                if at is not None:
+                    starts[key] = at
+                continue
+            if event != "end":
+                continue
+            start_at = starts.pop(key, None)
+            end_at = rec.get("at")
+            if start_at is not None and end_at is not None:
+                total_windows.append(end_at - start_at)
+            schema = rec.get("schema", 1)
+            phases = rec.get("phases")
+            if schema < IMPACT_WINDOW_SCHEMA_VERSION or phases is None:
+                legacy_excluded += 1
+                continue
+            if phases:
+                tiers_with_phases += 1
+            for p in phases:
+                name, seconds = p.get("name"), p.get("seconds")
+                if name is not None and seconds is not None:
+                    by_phase[name].append(float(seconds))
+
+    phase_report = {}
+    grand_total = sum(sum(v) for v in by_phase.values())
+    for name, values in by_phase.items():
+        stat = _phase_stats(values)
+        stat["share_of_total"] = round(stat["total_s"] / grand_total, 3) if grand_total else None
+        phase_report[name] = stat
+
+    return {
+        "tiers_with_phase_data": tiers_with_phases,
+        "legacy_records_excluded": legacy_excluded,
+        "total_tier_wall_clock": _phase_stats(total_windows),
+        "phases": phase_report,
+    }
+
+
+def format_impact_tier_phase_report(report: dict) -> str:
+    """Human rendering that names n explicitly and refuses to present a split
+    computed from zero or a handful of records as a finding — DO NOT SKIP TO
+    PHASE 2 ON THIN DATA is the bead's own instruction, not a formality."""
+    n = report["tiers_with_phase_data"]
+    lines = [f"impact tier phase breakdown: n={n} tier run(s) with per-phase data "
+             f"({report['legacy_records_excluded']} legacy/unphased record(s) excluded)"]
+    if n == 0:
+        lines.append("  no per-phase measurements yet — this instrument (SABLE-mbkbm) only "
+                     "started recording phases from this landing forward; re-run after real "
+                     "promotes accumulate under it. A split from zero records is a guess, "
+                     "not a finding.")
+        return "\n".join(lines)
+    if n < 5:
+        lines.append(f"  THIN DATA (n={n}): treat the shares below as a hypothesis, not a "
+                     f"decision input, until more promotes accumulate.")
+    total = report["total_tier_wall_clock"]
+    if total:
+        lines.append(f"  total tier wall-clock: n={total['n']} median={total['median_s']}s "
+                     f"p90={total['p90_s']}s")
+    for name, stat in sorted(report["phases"].items(), key=lambda kv: -kv[1]["total_s"]):
+        share = f"{stat['share_of_total'] * 100:.0f}%" if stat["share_of_total"] is not None else "n/a"
+        lines.append(f"  {name}: n={stat['n']} median={stat['median_s']}s p90={stat['p90_s']}s "
+                     f"share={share}")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------

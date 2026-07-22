@@ -159,6 +159,7 @@ Usage:
                            [--repo <path>] [--remote <name>]
   sable-merge-gate sweep   [--max-age-hours N] [--repo <path>] [--remote <name>]
   sable-merge-gate promote-budget [--json | --seconds]
+  sable-merge-gate impact-tier-phases [--repo <path>] [--json]
   sable-merge-gate --help
 
 `promote-budget` (SABLE-w0zjm) exists for the code that WRAPS this one. A promote
@@ -166,6 +167,13 @@ may legitimately spend an impact-tier queue wait PLUS the tier's own budget, so
 any enclosing `timeout` must be derived from that sum rather than copied — the
 copy was 900s at the merge seat, the same number as the tier budget, sized back
 when the tier essentially never ran.
+
+`impact-tier-phases` (SABLE-mbkbm) reports where the impact tier's OWN
+wall-clock actually goes — setup, each shell suite by name, the pytest half —
+from the per-phase journal run_impact_tier writes. Exists because jd5fj.8 was
+dispatched on an assumed cost centre (the cold-testmon pytest fallback) that,
+measured, turned out to save ~2% on its own footprint; this is the instrument
+so the next such call is a measurement, not another assumption.
 
 The `preview` entrypoint (SABLE-jd5fj.1) is the KICK half of promote: it builds
 the merge-preview commit and pushes the ci-verify ref — and then RETURNS, at
@@ -379,6 +387,17 @@ def main(argv: list[str] | None = None) -> int:
                              "combined-tree impact tier's pytest half")
     pw.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
 
+    # SABLE-mbkbm. Reads the per-phase journal run_impact_tier now writes and
+    # reports where the tier's own wall-clock actually goes (setup vs each shell
+    # suite vs the pytest half), with an explicit n — never a split inferred
+    # from totals, and never presented as a finding on thin data.
+    pt = sub.add_parser("impact-tier-phases",
+                        help="report where the local impact tier's wall-clock goes, "
+                             "by phase, from the recorded journal")
+    pt.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+    pt.add_argument("--json", action="store_true",
+                    help="machine-readable JSON instead of the human summary")
+
     args = parser.parse_args(argv)
     try:
         if args.command == "promote":
@@ -406,6 +425,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "warm-testmon-cache":
             return promote_lib.warm_gate_testmon_cache(args.repo)
+        if args.command == "impact-tier-phases":
+            report = promote_lib.impact_tier_phase_report(args.repo)
+            if args.json:
+                print(json.dumps(report, sort_keys=True))
+            else:
+                print(promote_lib.format_impact_tier_phase_report(report))
+            return 0
     except classify.GateError as e:
         print(f"sable-merge-gate: {e}", file=sys.stderr)
         return e.code
