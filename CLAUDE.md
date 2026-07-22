@@ -52,18 +52,52 @@ bd close <id>         # Complete work
 
 ## Build & Test
 
-_Add your build and test commands here_
+This repo's actual stack is Python + bash/tmux — there is no Go tooling here.
+**`bd preflight`'s built-in checklist is hardcoded to Go (`go test`,
+`golangci-lint`, `gofmt`, `cmd/bd/version.go`) and is not configurable per
+project (SABLE-4yp75)**, so on this repo every one of those checks either
+false-fails ("golangci-lint not found in PATH") or silently no-ops. Do not
+treat a red `bd preflight` run as signal here; use the commands below instead.
 
 ```bash
-# Example:
-# npm install
-# npm test
+# Full Python suite (unit + integration; bd/dolt-dependent tests self-skip
+# when those tools are absent — see ci-verify.yml):
+python -m pytest bin/ -q -p no:cacheprovider
+
+# Shell test suites (classification is fail-closed; --run executes the
+# allowlisted suites; see .github/ci/shell-run-set.sh header for the
+# excluded-suite policy):
+bash .github/ci/shell-run-set.sh --check
+bash .github/ci/shell-run-set.sh --run
+
+# Fast local pre-push subset (also runs automatically via the pre-push git
+# hook through this repo's .sable testCommand=):
+bash .github/ci/test-tiers.sh --run pre_push
 ```
+
+The two `bd preflight` checks that ARE language-agnostic (no beads pollution,
+AGENTS.md/CLAUDE.md doc-sync) are still worth a glance from its output —
+just ignore the tests/lint/format/version-sync rows.
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+SABLE is a methodology + tooling repo for bd-based multi-agent development:
+`bin/` holds the Python/bash CLI tools (`sable-*`) and their `test_*.py` /
+`hooks/test/test-*.sh` suites; `hooks/` holds the git-hook and multi-manager
+enforcement scripts; `skills/` and `templates/` hold the Claude Code skill
+definitions this methodology installs into consumer projects; `SABLE.md`
+and `QUICKSTART.md` are the portable methodology docs shipped to other repos
+(don't assume this repo's own stack when editing those — they describe
+whatever stack the *downstream* project uses).
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- New `bin/` tools follow the `sable-<name>` (bash) or `sable_<name>_lib.py`
+  (Python library) naming already in use — see `bin/sable-doctor` /
+  `bin/sable-test` for the header-comment style (context + contract, not
+  what the code obviously does).
+- Every `bin/*.py` needs a matching `test_*.py` (pytest auto-discovers all of
+  `bin/`, so an untested file is a silent gap, not a skip).
+- Every `hooks/test/test-*.sh` must be classified in
+  `.github/ci/shell-run-set.sh`'s `ALLOW`/`EXCLUDE` lists or `--check` fails
+  the gate — see that script's header for why.
