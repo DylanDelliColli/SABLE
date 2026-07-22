@@ -4,7 +4,10 @@
 #
 # Phases (in order):
 #   1. REBASE   — always runs, never skippable. Fetch + rebase on $SABLE_BASE_BRANCH.
-#   2. STATIC   — typecheck (and lint, if configured). Always runs, NEVER skippable.
+#   2. STATIC   — typecheck (and lint, if configured), plus the fixture
+#                 tripwire (bin/sable-fixture-tripwire, SABLE-digiy) when this
+#                 push touches a hooks/test/*.sh or bin/test_*.py file and the
+#                 target repo ships that checker. Always runs, NEVER skippable.
 #                 Auto-detected per project; if no typechecker found, phase no-ops.
 #   3. BUILD    — the project's build command, if one auto-detects (or is
 #                 configured). Always runs, NEVER skippable. Catches build-only
@@ -524,6 +527,44 @@ ${SUFFIX}
 
 $(sable_tail_chars "$LINT_OUT" 1500)"
     exit 0
+  fi
+fi
+
+# --- Fixture tripwire (SABLE-digiy, part of phase 2 STATIC, never skippable
+# when it fires): bin/sable-fixture-tripwire (SABLE-0ssz.2) bans unsandboxed
+# real-repo git ops in test fixtures — a bare, unguarded `cd` in a fixture
+# setup, or a mutating git/dolt op scoped to the real repo root. It ran only
+# at ci-verify (remote) until now: a violating test-file push passed the local
+# shell suite AND local unit tests, then RED'd at the seat, wasting a full
+# ci-verify cycle before the author learned (proven on jd5fj.14's 3c planted-
+# poison control — local suite 22/22 green, caught only remotely). Gated on
+# two conditions so it costs nothing outside its actual scope: (a) the target
+# repo ships the checker at all (most repos this hook gates don't — it
+# silently no-ops there), and (b) the diff this push carries actually touches
+# a hooks/test/*.sh or bin/test_*.py file (a push touching neither pays no
+# added cost — the acceptance criterion this bead is scoped to).
+TRIPWIRE_BIN="$CWD/bin/sable-fixture-tripwire"
+
+if [ -x "$TRIPWIRE_BIN" ] && [ -n "$BASE_BRANCH" ]; then
+  TRIPWIRE_TARGETS=()
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+      hooks/test/*.sh|bin/test_*.py) TRIPWIRE_TARGETS+=("$f") ;;
+    esac
+  done < <(git -C "$CWD" diff --name-only --diff-filter=ACMR "${BASE_BRANCH}...HEAD" 2>/dev/null || true)
+
+  if [ ${#TRIPWIRE_TARGETS[@]} -gt 0 ]; then
+    TW_EXIT=0
+    TW_OUT=$(cd "$CWD" && timeout "$STATIC_TIMEOUT" "$TRIPWIRE_BIN" "${TRIPWIRE_TARGETS[@]}" 2>&1) || TW_EXIT=$?
+
+    if [ "$TW_EXIT" -ne 0 ]; then
+      emit_deny "Pre-push phase 2 (static): fixture-tripwire failed (\`bin/sable-fixture-tripwire ${TRIPWIRE_TARGETS[*]}\`).
+This phase CANNOT be skipped via SABLE_SKIP_PRE_PUSH — it is structurally required (SABLE-0ssz.2: an unsandboxed fixture cd / real-repo git op that reaches ci-verify has already cost a full RED cycle — SABLE-digiy/jd5fj.14). Fix the exact file:line below (guard the cd, or scope the git op to a fixture dir), or add a KNOWN_VIOLATIONS entry with its tracking bead if this is a reviewed exception.
+
+$(sable_tail_chars "$TW_OUT" 1500)"
+      exit 0
+    fi
   fi
 fi
 

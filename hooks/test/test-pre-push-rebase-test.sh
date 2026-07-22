@@ -20,6 +20,10 @@
 set -uo pipefail
 
 HOOK="$(cd "$(dirname "$0")/.." && pwd)/multi-manager/pre-push-rebase-test.sh"
+# Absolute repo root, resolved once up front — needed by the SABLE-digiy
+# fixtures below, which `cd` into throwaway fixture repos and must not rely
+# on a relative $0 resolving correctly after the CWD has moved.
+REPO_ROOT="$(cd "$(dirname "$HOOK")/../.." && pwd)"
 
 if [ ! -x "$HOOK" ]; then
   echo "FAIL: hook not executable at $HOOK"
@@ -890,6 +894,157 @@ EOF
 assert_context "SABLE-rzsb S4: passing build script does not block the push (build phase is not a false-positive gate)" \
   "$BUILD_ENV" "git push" "$BUILD_REPO" "phase skipped"
 rm -rf "$BUILD_BARE" "$BUILD_REPO"
+
+# ---------- SABLE-digiy: fixture-tripwire wired into pre-push STATIC phase ----------
+# bin/sable-fixture-tripwire (SABLE-0ssz.2) previously ran ONLY at ci-verify
+# (remote); a violating touched fixture-test file passed the local pre-push
+# suite and only RED'd at the seat (jd5fj.14: 3c's planted-poison control was
+# local-suite 22/22 green, caught only remotely). These fixtures exercise the
+# new wiring: the checker fires only when (a) the target repo ships it AND
+# (b) the diff actually touches a hooks/test/*.sh or bin/test_*.py file — and
+# stays silent otherwise, so an unrelated push pays no added cost.
+
+TW_BARE="$TMPROOT/tripwire-bare.git"
+TW_REPO="$TMPROOT/tripwire-repo"
+rm -rf "$TW_BARE" "$TW_REPO"
+git init -q --bare "$TW_BARE"
+git clone -q "$TW_BARE" "$TW_REPO" 2>/dev/null
+(
+  cd "$TW_REPO" || exit 1
+  git config user.email "test@test"
+  git config user.name "Test"
+  git checkout -q -B main
+  mkdir -p bin hooks/test
+  # Ship the REAL checker so the "target repo has the checker" gate opens.
+  cp "$REPO_ROOT/bin/sable-fixture-tripwire" bin/sable-fixture-tripwire
+  chmod +x bin/sable-fixture-tripwire
+  echo "root" > README.md
+  git add -A
+  git commit -q -m "init"
+  git push -q origin main
+)
+TW_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TEST_PHASE=skip"
+
+# Positive (unit-spec case 1): a commit ahead of origin adds a
+# hooks/test/*.sh fixture with an unguarded `cd` — the exact SABLE-0ssz.2
+# escape shape — and the static phase DENIES with the checker's own
+# file:line, before any ci-verify cycle is spent.
+(
+  cd "$TW_REPO" || exit 1
+  # Built via a variable, not a literal heredoc line: this suite's own file
+  # lives under hooks/test/*.sh, so a literal unguarded `cd "$FIX"` line
+  # here would trip THIS repo's fixture-tripwire on itself. UNGUARDED_CD's
+  # single-quoted value masks to non-"cd" text under the checker's
+  # quote-masking, so only the file written into TW_REPO carries the real
+  # (deliberately un-excused) violation.
+  UNGUARDED_CD='cd "$FIX"'
+  cat > hooks/test/test-planted-tripwire.sh <<EOF
+#!/usr/bin/env bash
+FIX=\$(mktemp -d)
+$UNGUARDED_CD
+git config user.name "Evil"
+EOF
+  git add -A
+  git commit -q -m "add fixture with unguarded cd"
+)
+assert_deny "SABLE-digiy: touched hooks/test/*.sh with unguarded cd → static phase DENIES via fixture-tripwire" \
+  "$TW_ENV" "git push" "$TW_REPO" "cd-unguarded"
+
+OUT=$(run_hook "$TW_ENV" "git push" "$TW_REPO")
+if echo "$OUT" | grep -qF "test-planted-tripwire.sh:3"; then
+  v3pass "SABLE-digiy: deny reason names the exact file:line"
+else
+  v3fail "SABLE-digiy: deny reason names the exact file:line" "got: ${OUT:0:500}"
+fi
+
+(
+  cd "$TW_REPO" || exit 1
+  git reset -q --hard origin/main
+)
+
+# Negative (unit-spec case 2): a commit ahead of origin that touches ONLY a
+# non-fixture file → the checker is NOT invoked at all (not merely passing).
+# This is the acceptance-criteria budget requirement, not a nicety: a push
+# touching no test files must incur no new tripwire cost.
+(
+  cd "$TW_REPO" || exit 1
+  echo "more" >> README.md
+  git add -A
+  git commit -q -m "unrelated change"
+)
+OUT=$(run_hook "$TW_ENV" "git push" "$TW_REPO")
+if echo "$OUT" | grep -q '"additionalContext"' && echo "$OUT" | grep -qF "phase skipped" \
+   && ! echo "$OUT" | grep -qF "fixture-tripwire"; then
+  v3pass "SABLE-digiy: diff touching only non-test files → tripwire NOT invoked (no added cost)"
+else
+  v3fail "SABLE-digiy: diff touching only non-test files → tripwire NOT invoked (no added cost)" "got: ${OUT:0:400}"
+fi
+
+(
+  cd "$TW_REPO" || exit 1
+  git reset -q --hard origin/main
+)
+rm -rf "$TW_BARE" "$TW_REPO"
+
+# Integration control (real git repo + real hook, positive control per the
+# bead's INTEGRATION spec): the SAME violation shape, but guarded per the
+# z776 pattern, PASSES — proving the wiring is not a blanket false-positive
+# gate on every touched fixture file.
+TWC_BARE="$TMPROOT/tripwire-clean-bare.git"
+TWC_REPO="$TMPROOT/tripwire-clean-repo"
+rm -rf "$TWC_BARE" "$TWC_REPO"
+git init -q --bare "$TWC_BARE"
+git clone -q "$TWC_BARE" "$TWC_REPO" 2>/dev/null
+(
+  cd "$TWC_REPO" || exit 1
+  git config user.email "test@test"
+  git config user.name "Test"
+  git checkout -q -B main
+  mkdir -p bin hooks/test
+  cp "$REPO_ROOT/bin/sable-fixture-tripwire" bin/sable-fixture-tripwire
+  chmod +x bin/sable-fixture-tripwire
+  echo "root" > README.md
+  git add -A
+  git commit -q -m "init"
+  git push -q origin main
+  cat > hooks/test/test-clean-tripwire.sh <<'EOF'
+#!/usr/bin/env bash
+FIX=$(mktemp -d)
+cd "$FIX" || exit 1
+git -C "$FIX" config user.name "Test"
+EOF
+  git add -A
+  git commit -q -m "add fixture with guarded cd"
+)
+assert_context "SABLE-digiy: touched hooks/test/*.sh with GUARDED cd → static phase passes (not a false-positive gate)" \
+  "$TW_ENV" "git push" "$TWC_REPO" "phase skipped"
+rm -rf "$TWC_BARE" "$TWC_REPO"
+
+# Repo that does NOT ship bin/sable-fixture-tripwire at all (the common case
+# for every OTHER repo this generic hook gates) → the checker gate never
+# opens, even for a touched hooks/test/*.sh file carrying the exact violation
+# shape. Reuses REPO_DIR from the typecheck fixtures above (already
+# git-init'd, no bin/ dir at all).
+(
+  cd "$REPO_DIR" || exit 1
+  mkdir -p hooks/test
+  # See the UNGUARDED_CD comment above — same self-flagging avoidance.
+  UNGUARDED_CD='cd "$FIX"'
+  cat > hooks/test/test-no-checker.sh <<EOF
+#!/usr/bin/env bash
+FIX=\$(mktemp -d)
+$UNGUARDED_CD
+EOF
+  git add -A
+  git commit -q -m "touch a fixture-shaped file in a repo with no checker"
+)
+NOCHECKER_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true SABLE_PRE_PUSH_TEST_PHASE=skip"
+assert_context "SABLE-digiy: repo without bin/sable-fixture-tripwire → checker gate never opens" \
+  "$NOCHECKER_ENV" "git push" "$REPO_DIR" "phase skipped"
+(
+  cd "$REPO_DIR" || exit 1
+  git reset -q --hard origin/main
+)
 
 # Cleanup
 rm -rf "$REPO_DIR" "$BARE_DIR" "$V3_YAML"
