@@ -2,10 +2,15 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+`AGENTS.md` is a symlink to this file (single source of truth, no drift). `bd`'s
+default agent-instructions target is `AGENTS.md` (see `bd onboard --help`), so
+anything that writes to it — `bd` tooling, `install.sh`, a future onboarding
+step — writes through the link into this file, `CLAUDE.md`.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+This project uses **bd (beads)** for issue tracking. Run `bd onboard` for the agent-instructions snippet; run `bd prime` for full workflow context.
 
 ### Quick Reference
 
