@@ -207,6 +207,13 @@ jobs:
           command -v jq   >/dev/null || { echo "::error::jq missing";   exit 1; }
           command -v git  >/dev/null || { echo "::error::git missing";  exit 1; }
           git config --get user.email >/dev/null || { echo "::error::git identity unset"; exit 1; }
+          # gh is a real dependency of the SABLE-r3i6 dedup guard
+          # (.github/ci/preview-already-verified.sh's `gh api ...`) and
+          # sable-merge-gate's wait_for_ci poll (bin/sable_gate_preview_lib.py's
+          # `gh run list ...`), but both are deliberately fail-open on a
+          # missing gh rather than crashing, so this is a warning, not the
+          # fail-loud ::error:: pattern above (SABLE-apt5a).
+          command -v gh >/dev/null 2>&1 || echo "::warning::gh missing in clean-room -- dedup guard and merge-gate wait_for_ci silently fail open without it (SABLE-apt5a)"
           python --version
           # bd/dolt MUST be absent — their presence changes which suites are green,
           # so it would silently invalidate the SABLE-59zu contract this run pins.

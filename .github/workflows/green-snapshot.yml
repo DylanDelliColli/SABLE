@@ -106,6 +106,15 @@ jobs:
           # two clean-room install lines cannot silently drift apart again.
           pip install pytest pytest-testmon pytest-impact pytest-cov diff_cover
 
+      # gh (SABLE-apt5a): deliberately NOT checked or installed here. Unlike
+      # ci-verify.yml's SABLE-r3i6 dedup guard and sable-merge-gate's
+      # wait_for_ci poll, this workflow's job path (bin/sable-snapshot ->
+      # bin/sable_snapshot_lib.py) never shells out to gh -- verified by grep,
+      # not assumed. Adding an unused-here check would be exactly the
+      # "demand everything so the check passes trivially" trap
+      # bin/test_clean_room_binary_parity.py's negative control guards
+      # against on the ci-verify.yml side.
+
       - name: Configure git identity (SABLE-59zu — clean-room needs one)
         run: |
           git config --global user.email "green-snapshot@sable.local"
