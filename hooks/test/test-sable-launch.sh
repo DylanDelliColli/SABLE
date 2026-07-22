@@ -137,9 +137,9 @@ agents:
 YAML
 POISON_HOME="$(mktemp -d)"   # isolated HOME — no global install (worst case)
 
-cd "$POISON_REPO"
+cd "$POISON_REPO" || exit 1
 run_launch "$POISON_HOME" "TMUX_LOG=$WORK/tp.log ST_LOG=$WORK/sp.log STUB_HAS_SESSION=1 SABLE_TMUX_BIN=$STUB_BIN/sable-tmux-rec"
-cd "$REPO"
+cd "$REPO" || exit 1
 if [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "STUB_ATTACH=1" \
    && grep -q -- "--roles lincoln" "$WORK/sp.log" 2>/dev/null; then
   pass "session-form stays green when the suite's CWD sits inside a poisoned project-registry repo"
