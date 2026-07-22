@@ -91,8 +91,16 @@ Per bead bundle (bundle 2-3 related beads max):
    `sable-dep-check <bead-id>` (exit 3 + a named branch = its blocker is closed
    but unmerged). The dispatch hook prints the same warning automatically; when
    you see it, do NOT dispatch — either wait for Chuck's merge, or confirm
-   containment by hand (`git merge-base --is-ancestor origin/<blocker-branch>
-   origin/<integration>` and `git show origin/<integration>:<expected-file>`).
+   containment with `sable-contained`, never a hand-rolled git probe:
+   `sable-contained <blocker-sha>` (commit) and `sable-contained --path
+   <expected-file>` (the property probe, against the integration ref).
+   Exit 0 CONTAINED / 1 NOT-CONTAINED / 3 the two methods DISAGREE / 4 COULD
+   NOT ASSESS — anything but 0 means HOLD. Both raw idioms have a silent
+   hold-RELEASING failure and both have been hit live: `merge-base
+   --is-ancestor` inverts without warning (SABLE-gdp05) and `git ls-tree <ref>
+   <path>` EXITS 0 FOR AN ABSENT PATH, so `ls-tree ... && echo PRESENT`
+   reports a file as on-spine when it is not (SABLE-4snb4 — this nearly
+   released the cmar4.5 hold onto a base lacking jd5fj.13).
    Live case: SABLE-78kxu released by a closed SABLE-9boz4 whose branch was
    still queued; a worker dispatched then would have built against the layout
    the dependency existed to replace, tested green, and mis-integrated later.
