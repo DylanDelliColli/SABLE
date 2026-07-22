@@ -332,16 +332,33 @@ def optimistic_promotion_enabled() -> bool:
     return os.environ.get("SABLE_MG_OPTIMISTIC", "1") not in ("0", "false", "no")
 
 
-def _impact_timeout() -> float:
-    return float(os.environ.get("SABLE_MG_IMPACT_TIMEOUT", "900"))
+def _impact_timeout(repo: str | None = None) -> float:
+    """SABLE-jd5fj.9: the impact tier's own run budget, derived from the
+    merge_preview tier's SSOT (.github/ci/test-tiers.sh, via
+    sable_gate_budget_lib.tier_budget_sec) instead of a hand-copied literal —
+    the same duplicated-list class SABLE-cmar4.1 closed for tier membership,
+    reintroduced one level down as this function's old body.
+
+    SABLE_MG_IMPACT_TIMEOUT is an explicit override and always wins over the
+    SSOT. `repo` defaults to the current working directory so callers with no
+    repo path yet (sable-merge-gate promote-budget is deliberately --repo-less
+    — see its own parser help) still get an answer: tier_budget_sec fails
+    closed (returns None) when cwd has no test-tiers.sh, and this falls back
+    to the pre-fix constant (900) for that case — never raises, mirroring
+    git_lib.default_mg_timeout's never-raises contract."""
+    override = os.environ.get("SABLE_MG_IMPACT_TIMEOUT")
+    if override is not None:
+        return float(override)
+    budget = budget_lib.tier_budget_sec(repo or os.getcwd(), "merge_preview")
+    return budget if budget is not None else 900.0
 
 
-def _selected_suites(worktree: str, paths: list[str]) -> list[str]:
+def _selected_suites(repo: str, worktree: str, paths: list[str]) -> list[str]:
     """Suites the shell impact manifest selects for these changed paths
     (SABLE-cmar4.2). Its own contract already handles the dangerous direction:
     a path it cannot map selects the FULL allow-list rather than nothing."""
     sel = git_lib._run(["bash", ".github/ci/impact-manifest.sh", "--select", *paths],
-                       cwd=worktree, check=False, timeout=_impact_timeout())
+                       cwd=worktree, check=False, timeout=_impact_timeout(repo))
     if sel.returncode != 0:
         raise RuntimeError(f"impact selection failed: {sel.stdout.strip()[:400]}")
     return [ln.strip() for ln in sel.stdout.splitlines()
@@ -540,9 +557,12 @@ to raise SABLE_MG_IMPACT_TIMEOUT / SABLE_MG_IMPACT_LOCK_TIMEOUT so the number th
 wrapper derives is the number the gate actually intends to spend."""
 
 
-def impact_budget() -> dict:
+def impact_budget(repo: str | None = None) -> dict:
     """The gate's own worst-case promote wall-clock, so an ENCLOSING wrapper can
     DERIVE its timeout instead of hardcoding one (SABLE-w0zjm).
+
+    `repo` defaults to the current working directory (see _impact_timeout) so
+    the --repo-less `promote-budget` CLI command keeps working unchanged.
 
     WHY THIS IS A FUNCTION AND NOT A DOC LINE. Chuck ran every promote inside a
     900s wrapper — the SAME number as the default SABLE_MG_IMPACT_TIMEOUT. That
@@ -570,7 +590,7 @@ def impact_budget() -> dict:
       recommended_wrapper_timeout_s   worst_case_s * BUDGET_HEADROOM, rounded up.
                       This is the number a wrapper should use.
       serialized      whether the queue is in play at all."""
-    tier = _impact_timeout()
+    tier = _impact_timeout(repo)
     lock = _impact_lock_timeout() if impact_serialization_enabled() else 0.0
     worst = tier + lock
     return {
@@ -730,7 +750,7 @@ def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, st
             if waited >= 1.0:
                 print(f"sable-merge-gate: waited {waited:.0f}s for the impact-tier lock "
                       f"(another promote held the seat) — the tier's own "
-                      f"{_impact_timeout():.0f}s budget starts now, unspent",
+                      f"{_impact_timeout(repo):.0f}s budget starts now, unspent",
                       flush=True)
             # SABLE-w0zjm (c): an UNCONDITIONAL in-tier marker, so a promote killed
             # from OUTSIDE is diagnosable after the fact instead of mysterious. The
@@ -747,7 +767,7 @@ def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, st
             # hooks/test/test-optimistic-promotion.sh caught this: the assertion
             # failed with EMPTY output while the kill itself behaved correctly.
             print(f"sable-merge-gate: ENTERING IMPACT TIER (budget "
-                  f"{_impact_timeout():.0f}s) — if this promote dies without a "
+                  f"{_impact_timeout(repo):.0f}s) — if this promote dies without a "
                   f"verdict line, suspect an enclosing wrapper timeout before the "
                   f"tier itself (see `sable-merge-gate promote-budget`)",
                   flush=True)
@@ -904,7 +924,7 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str],
                 _t0 = time.monotonic()
                 try:
                     cp = git_lib._run(override + list(paths), cwd=worktree, check=False,
-                                      timeout=_impact_timeout(), env=env)
+                                      timeout=_impact_timeout(repo), env=env)
                 finally:
                     _record_phase(phases, "override", _t0)
                 return ((IMPACT_GREEN, "impact tier override reported green") if cp.returncode == 0
@@ -916,7 +936,7 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str],
                                       "no impact tier to run on the combined tree")
             _t0 = time.monotonic()
             try:
-                suites = _selected_suites(worktree, list(paths))
+                suites = _selected_suites(repo, worktree, list(paths))
             finally:
                 _record_phase(phases, "setup", _t0)
             ran: list[str] = []
@@ -928,7 +948,7 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str],
                 _t0 = time.monotonic()
                 try:
                     cp = git_lib._run(["bash", str(suite_path)], cwd=worktree, check=False,
-                                      timeout=_impact_timeout(), env=env)
+                                      timeout=_impact_timeout(repo), env=env)
                 finally:
                     # SABLE-mbkbm: EACH suite gets its OWN phase name — a single
                     # "shell" bucket would hide exactly the question this bead
@@ -948,7 +968,7 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str],
                 _t0 = time.monotonic()
                 try:
                     cp = git_lib._run([sys.executable, str(selector)], cwd=worktree, check=False,
-                                      timeout=_impact_timeout(), env=env)
+                                      timeout=_impact_timeout(repo), env=env)
                 finally:
                     _record_phase(phases, "pytest", _t0)
                 # SABLE-jd5fj.8: name whichever path tier_selection.py ITSELF
@@ -978,7 +998,7 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str],
             git_lib._git(repo, "worktree", "prune", check=False)
             _record_phase(phases, "setup", _t0)
     except subprocess.TimeoutExpired as exc:
-        return (IMPACT_ERROR, f"impact tier timed out after {_impact_timeout()}s: {exc}")
+        return (IMPACT_ERROR, f"impact tier timed out after {_impact_timeout(repo)}s: {exc}")
     except (OSError, RuntimeError) as exc:
         return (IMPACT_ERROR, f"impact tier could not run: {exc}")
     finally:
@@ -1165,11 +1185,38 @@ def assert_not_frozen(repo: str) -> None:
 # Coverage floor on pruning passes (SABLE-cmar4.5) — the MECHANICAL deny path
 # --------------------------------------------------------------------------
 
-def _coverage_floor_timeout() -> float:
-    try:
-        return float(os.environ.get("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "600"))
-    except ValueError:
-        return 600.0
+def _coverage_floor_timeout(repo: str | None = None) -> float:
+    """SABLE-cmar4.9: the coverage-floor check's run budget, derived from the
+    merge_preview tier's SSOT (.github/ci/test-tiers.sh, via
+    sable_gate_budget_lib.tier_budget_sec) instead of a fresh hand-picked
+    literal — the same duplicated-list class SABLE-jd5fj.9 just closed for
+    _impact_timeout, and that SABLE-w0zjm's promote-budget mechanism exists to
+    eliminate generally.
+
+    Borrows merge_preview's budget rather than declaring the coverage floor
+    its own tier entry, mirroring jd5fj.9's choice for the same reason: it is
+    faithful to today's behaviour (600 sits under merge_preview's 900 today)
+    and adding a tier entry here would be scope creep this bead explicitly
+    disclaims. The coverage floor runs inside the promote path rather than
+    inside merge_preview's own suite list, so if its runtime characteristics
+    ever prove to need a different ceiling than merge_preview's, the SSOT
+    should grow a dedicated entry instead of a second borrow — flagged here,
+    not decided.
+
+    SABLE_MG_COVERAGE_FLOOR_TIMEOUT is an explicit override and always wins
+    over the SSOT, exactly as before. `repo` defaults to the current working
+    directory. A missing or broken SSOT (or an unparseable override) falls
+    back to the pre-fix constant (600) — never raises, mirroring
+    _impact_timeout's and git_lib.default_mg_timeout's never-raises
+    contract."""
+    override = os.environ.get("SABLE_MG_COVERAGE_FLOOR_TIMEOUT")
+    if override is not None:
+        try:
+            return float(override)
+        except ValueError:
+            return 600.0
+    budget = budget_lib.tier_budget_sec(repo or os.getcwd(), "merge_preview")
+    return budget if budget is not None else 600.0
 
 
 def run_coverage_floor_check(repo: str, base_sha: str, branch_sha: str):
@@ -1197,7 +1244,7 @@ def run_coverage_floor_check(repo: str, base_sha: str, branch_sha: str):
             if not script.is_file():
                 return None
             cp = git_lib._run(["bash", str(script), base_sha], cwd=worktree, check=False,
-                              timeout=_coverage_floor_timeout())
+                              timeout=_coverage_floor_timeout(repo))
             return cp.returncode == 0
         finally:
             git_lib._git(repo, "worktree", "remove", "--force", worktree, check=False)
