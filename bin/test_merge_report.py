@@ -288,3 +288,98 @@ def test_parse_notify_log_respects_since_epoch():
     since_epoch = rl._iso_to_epoch("2026-07-18T00:00:00+00:00")
     pushes = rl.parse_notify_log(text, since_epoch=since_epoch)
     assert [p.branch for p in pushes] == ["late"]
+
+
+# --- promotion_landed_epochs (SABLE-jd5fj.11 primary-bar anchor) ---------------
+
+def test_promotion_landed_epochs_uses_earliest_run_on_the_exact_landed_sha():
+    promo = _promo("aaa111")
+    runs = [
+        rl.BaseRun("aaa111", 2000.0, "success"),
+        rl.BaseRun("aaa111", 1000.0, "success"),  # earlier -- this one wins
+        rl.BaseRun("bbb222", 500.0, "success"),   # different sha, ignored
+    ]
+    epochs = rl.promotion_landed_epochs([promo], runs)
+    assert epochs == {"aaa111": 1000.0}
+
+
+def test_promotion_landed_epochs_omits_promotions_with_no_observed_run():
+    promo = _promo("aaa111")
+    epochs = rl.promotion_landed_epochs([promo], [])
+    assert epochs == {}
+
+
+# --- compute_landed_metrics (THE primary-bar computation, SABLE-jd5fj.11) -----
+
+def test_push_to_landed_is_the_primary_bar():
+    # wk-blocker: pushes and lands cleanly, no invalidation of its own -- but
+    # its landing sits inside wk-queued's wait window, so it is what wk-queued
+    # is queued BEHIND.
+    blocker_push = rl.PushEvent("wk-blocker", -100.0)
+    blocker_promo = rl.PromotionCommit(
+        "shaB", "2026-07-21T00:00:00+00:00",
+        "ci-verify merge-preview: wk-blocker onto tmux-only (SABLE-blocker)",
+        "wk-blocker", "SABLE-blocker", False)
+    blocker_preview = rl.PreviewRun("ci-verify/wk-blocker-blk0001", -95.0, 195.0, "success",
+                                    head_sha="shaB")
+    blocker_land = rl.BaseRun("shaB", 200.0, "success")
+
+    # wk-queued: the push-time preview (shaOrig) goes green and is DISCARDED
+    # when wk-blocker's landing moves the base -- a fresh preview (sha2) is
+    # built and waited on before this branch finally lands (SABLE-kzi1a's
+    # shape exactly). push->CI-done only ever sees the FIRST (discarded)
+    # preview; push->landed must see the true, later, fast-forward.
+    queued_push = rl.PushEvent("wk-queued", 0.0)
+    queued_promo = rl.PromotionCommit(
+        "sha2", "2026-07-21T00:05:00+00:00",
+        "ci-verify merge-preview: wk-queued onto tmux-only (SABLE-queued)",
+        "wk-queued", "SABLE-queued", False)
+    queued_preview_discarded = rl.PreviewRun("ci-verify/wk-queued-orig0001", 5.0, 305.0, "success",
+                                             head_sha="shaOrig")
+    queued_preview_rebuilt = rl.PreviewRun("ci-verify/wk-queued-rebuild1", 310.0, 610.0, "success",
+                                           head_sha="sha2")
+    queued_land = rl.BaseRun("sha2", 615.0, "success")
+
+    # wk-solo: NO invalidation at all -- the negative direction. push->CI-done
+    # and push->landed should stay closely aligned, proving the new metric is
+    # not simply inflating every figure.
+    solo_push = rl.PushEvent("wk-solo", 1000.0)
+    solo_promo = rl.PromotionCommit(
+        "shaS", "2026-07-21T00:20:00+00:00",
+        "ci-verify merge-preview: wk-solo onto tmux-only (SABLE-solo)",
+        "wk-solo", "SABLE-solo", False)
+    solo_preview = rl.PreviewRun("ci-verify/wk-solo-sol00001", 1005.0, 1305.0, "success",
+                                 head_sha="shaS")
+    solo_land = rl.BaseRun("shaS", 1308.0, "success")
+
+    pushes = [blocker_push, queued_push, solo_push]
+    promotions = [blocker_promo, queued_promo, solo_promo]
+    preview_runs = [blocker_preview, queued_preview_discarded, queued_preview_rebuilt, solo_preview]
+    base_runs = [blocker_land, queued_land, solo_land]
+
+    records = rl.compute_landed_metrics(pushes, promotions, preview_runs, base_runs)
+    by_branch = {r.branch: r for r in records}
+    assert set(by_branch) == {"wk-blocker", "wk-queued", "wk-solo"}
+
+    # --- the primary figure is computed from the FAST-FORWARD instant (the
+    # BaseRun's created_at), never from CI completion (the PreviewRun's
+    # completed_at) -- wk-queued's rebuilt preview completed at 610, but its
+    # landed_at/push_to_landed reflect the later, real fast-forward at 615.
+    q = by_branch["wk-queued"]
+    assert q.landed_at == 615.0
+    assert q.push_to_landed_seconds == 615.0
+
+    # --- a queued branch that discarded a green preview and paid for a
+    # second CI run shows a LARGER push-to-landed than push-to-CI-done.
+    assert q.discarded_preview is True
+    assert q.push_to_ci_done_seconds == 305.0
+    assert q.push_to_landed_seconds > q.push_to_ci_done_seconds
+    assert q.queue_depth_at_promote == 1  # wk-blocker landed while wk-queued waited
+
+    # --- NEGATIVE DIRECTION: a solo branch with no invalidation (queue depth
+    # 0 -- nothing else landed while it waited) shows the two metrics closely
+    # aligned, proving push-to-landed does not simply inflate everything.
+    s = by_branch["wk-solo"]
+    assert s.discarded_preview is False
+    assert s.queue_depth_at_promote == 0
+    assert abs(s.push_to_landed_seconds - s.push_to_ci_done_seconds) <= 5.0
