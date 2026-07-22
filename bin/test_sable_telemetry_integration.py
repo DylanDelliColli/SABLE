@@ -14,7 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -34,6 +34,10 @@ HOOK = REPO_ROOT / "hooks" / "bead-description-gate.sh"
 # seeded-db test drives a REAL sandbox beads DB, so it self-skips when bd is
 # absent, matching the bd/dolt-suites-self-skip contract in ci-verify.yml.
 HAVE_BD = shutil.which("bd") is not None
+# The multiday-backfill fixture backdates seed beads via direct Dolt SQL (bd's
+# own CLI has no created_at/closed_at override flag) -- needs the standalone
+# `dolt` binary in addition to `bd` itself, so it gets its own skip guard.
+HAVE_DOLT = shutil.which("dolt") is not None
 
 _ENV_LEAKS = ("CLAUDE_AGENT_NAME", "TMUX_PANE", "SABLE_HOOK_TRACE_LOG")
 
@@ -105,6 +109,111 @@ def seeded_bd_sandbox(tmp_path_factory):
 
     return {"work": work, "open": open_id, "dispatched": dispatched_id,
             "manager": manager_id}
+
+
+def _embedded_dolt_dir(work: Path) -> Path:
+    """The sandbox's real, standalone Dolt data directory. bd's "embedded"
+    mode runs the Dolt engine in-process for the duration of one bd
+    invocation and holds no lingering server/lock afterward, so the
+    standalone `dolt` CLI can open the same directory directly once that bd
+    subprocess has exited (verified live: `bd create` then `dolt sql -q`
+    against the same path in immediate sequence)."""
+    beads_dolt = work / ".beads" / "embeddeddolt"
+    candidates = [p for p in beads_dolt.iterdir() if p.is_dir()]
+    assert len(candidates) == 1, (
+        f"expected exactly one embedded Dolt db dir under {beads_dolt}, "
+        f"found {candidates}"
+    )
+    return candidates[0]
+
+
+def _dolt_sql(work: Path, sql: str) -> None:
+    """Run one SQL statement directly against the sandbox's real Dolt
+    storage. Used ONLY to backdate created_at/closed_at for a multi-day
+    fixture -- `bd create`/`bd close` have no timestamp-override flag, and
+    real historical dates can't otherwise be produced without waiting real
+    days. Every assertion still reads back through bd's own real query path
+    (bd_source.fetch_bead_records -> `bd list --json`), not through this
+    helper -- this only seeds state, per Prime Directive 2 (no mocked DB)."""
+    subprocess.run(
+        ["dolt", "sql", "-q", sql], cwd=str(_embedded_dolt_dir(work)),
+        capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
+    )
+
+
+@pytest.fixture
+def multiday_bd_sandbox(tmp_path_factory):
+    """A real sandbox beads DB backdated to a 3-day, non-contiguous corpus
+    (verified UTC storage: dolt's `datetime` columns hold the same wall-clock
+    value `bd list --json` renders with a trailing 'Z', confirmed by probing
+    a freshly created bead's stored value against its JSON rendering):
+    DAY1 (one close), DAY2 is a deliberate GAP -- no created/closed activity
+    at all, the zero-fill case S4 exists to prove -- and DAY3 (one close plus
+    a same-day shift-report bead, left open, for the overlay-marker case)."""
+    root = tmp_path_factory.mktemp("multiday")
+    work = root / "work"
+    work.mkdir()
+    home = root / "home"
+    home.mkdir()
+    _robust_bd_init(work, home)
+
+    def create(title):
+        cp = _bd_run(work, home, "create", "--sandbox", "--json",
+                     "--title", title, "--type=task", "--priority=2",
+                     "--description", f"seed fixture bead: {title}")
+        return json.loads(cp.stdout)["id"]
+
+    day1_id = create("DAY1: closes")
+    _bd_run(work, home, "close", day1_id, "--sandbox", "--reason", "seed: day1 close")
+
+    day3_id = create("DAY3: closes")
+    _bd_run(work, home, "close", day3_id, "--sandbox", "--reason", "seed: day3 close")
+
+    report_id = create("[SHIFT REPORT] seed 2026-07-23")
+
+    # Backdated to noon UTC -- far from any midnight boundary in every real
+    # timezone, so bucketing with tz=timezone.utc in the assertions is
+    # unambiguous regardless of what zone the test runner itself is in.
+    _dolt_sql(work, "UPDATE issues SET created_at='2026-07-21 12:00:00', "
+                    f"closed_at='2026-07-21 12:30:00' WHERE id='{day1_id}'")
+    _dolt_sql(work, "UPDATE issues SET created_at='2026-07-23 12:00:00', "
+                    f"closed_at='2026-07-23 12:30:00' WHERE id='{day3_id}'")
+    _dolt_sql(work, "UPDATE issues SET created_at='2026-07-23 13:00:00' "
+                    f"WHERE id='{report_id}'")
+
+    return {"work": work, "day1": day1_id, "day3": day3_id, "report": report_id}
+
+
+@pytest.fixture
+def shift_report_bd_sandbox(tmp_path_factory):
+    """A real sandbox beads DB with two ordinary closed beads plus one
+    shift-report-titled bead (left open, matching the live corpus pattern —
+    see SABLE-75dz5 et al.), all created at real, current, same-day
+    timestamps -- no backdating, exercising the true host-local (tz=None)
+    default path end to end."""
+    root = tmp_path_factory.mktemp("shiftreport")
+    work = root / "work"
+    work.mkdir()
+    home = root / "home"
+    home.mkdir()
+    _robust_bd_init(work, home)
+
+    def create(title):
+        cp = _bd_run(work, home, "create", "--sandbox", "--json",
+                     "--title", title, "--type=task", "--priority=2",
+                     "--description", f"seed fixture bead: {title}")
+        return json.loads(cp.stdout)["id"]
+
+    close_ids = []
+    for n in (1, 2):
+        bead_id = create(f"CLOSE {n}: ordinary work")
+        _bd_run(work, home, "close", bead_id, "--sandbox",
+               "--reason", f"seed: ordinary close {n}")
+        close_ids.append(bead_id)
+
+    report_id = create("SHIFT REPORT seed-fixture: today's summary")
+
+    return {"work": work, "closes": close_ids, "report": report_id}
 
 
 def test_cli_runs_and_prints_json():
@@ -199,6 +308,87 @@ def test_cycle_split_denominator_against_seeded_bd_db_mixed_dispatch(seeded_bd_s
     assert report.merge_queue_wait_share == pytest.approx(
         entry.merge_queue_wait_seconds / entry.total_seconds
     )
+
+
+@pytest.mark.skipif(
+    not HAVE_BD,
+    reason="ci-verify clean-room has no bd/dolt by design; real-bd integration self-skips",
+)
+def test_shift_report_closes_per_day_matches_seeded_bd_db(shift_report_bd_sandbox):
+    """S1: closes/day and intake/day computed from a REAL seeded bd DB, with
+    a real shift-report-titled bead overlaid as a marker on its day --
+    proving the overlay never gets miscounted as a close itself and never
+    perturbs the ordinary beads' own numbers."""
+    ids = shift_report_bd_sandbox
+    records = bd_source.fetch_bead_records(cwd=str(ids["work"]))
+
+    series = lib.build_daily_burn_series(records)
+    assert len(series) == 1  # every seed bead was created today, host-local
+    today = series[0]
+
+    today_local = datetime.now().astimezone().date().isoformat()
+    assert today.date == today_local
+
+    assert today.closes == len(ids["closes"]) == 2
+    assert today.intake == 3  # 2 ordinary closes + 1 shift-report bead
+    assert today.net_burn == today.closes - today.intake
+    assert today.shift_report_ids == (ids["report"],)
+
+
+@pytest.mark.skipif(
+    not HAVE_BD,
+    reason="ci-verify clean-room has no bd/dolt by design; real-bd integration self-skips",
+)
+def test_trend_output_reproducible_across_two_runs_same_seeded_state(seeded_bd_sandbox):
+    """S4: the derive-at-read burn series is durable/reproducible from bd
+    alone -- two independent real `bd list --json` subprocess calls against
+    the SAME unchanged seeded state must compute byte-for-byte identical
+    daily series, proving there is no hidden mutation or non-determinism in
+    the read-and-aggregate path."""
+    work = str(seeded_bd_sandbox["work"])
+
+    records_run1 = bd_source.fetch_bead_records(cwd=work)
+    series_run1 = lib.build_daily_burn_series(records_run1, tz=timezone.utc)
+
+    records_run2 = bd_source.fetch_bead_records(cwd=work)
+    series_run2 = lib.build_daily_burn_series(records_run2, tz=timezone.utc)
+
+    assert series_run1 == series_run2
+    assert series_run1  # non-vacuous: the seeded corpus actually produced days
+
+
+@pytest.mark.skipif(
+    not (HAVE_BD and HAVE_DOLT),
+    reason="needs both bd and the standalone dolt CLI to backdate the multi-day fixture",
+)
+def test_backfill_full_history_from_seeded_multiday_corpus(multiday_bd_sandbox):
+    """S4: a real seeded bd DB backdated across a 3-day, non-contiguous
+    corpus backfills to a full spine -- including the deliberate zero-activity
+    gap day -- purely from bd history, with the shift-report bead correctly
+    overlaid on its own day rather than the gap."""
+    ids = multiday_bd_sandbox
+    records = bd_source.fetch_bead_records(cwd=str(ids["work"]))
+
+    series = lib.build_daily_burn_series(records, tz=timezone.utc)
+    by_date = {d.date: d for d in series}
+
+    assert [d.date for d in series] == ["2026-07-21", "2026-07-22", "2026-07-23"]
+
+    day1 = by_date["2026-07-21"]
+    assert day1.closes == 1
+    assert day1.intake == 1
+    assert day1.shift_report_ids == ()
+
+    gap_day = by_date["2026-07-22"]
+    assert gap_day.closes == 0
+    assert gap_day.intake == 0
+    assert gap_day.net_burn == 0
+    assert gap_day.shift_report_ids == ()
+
+    day3 = by_date["2026-07-23"]
+    assert day3.closes == 1  # the shift-report bead itself was never closed
+    assert day3.intake == 2  # DAY3 close-bead + the shift-report bead
+    assert day3.shift_report_ids == (ids["report"],)
 
 
 def _git(repo, *args):
