@@ -16,13 +16,17 @@
 # to remove it, which works whether or not this environment has it.
 #
 # THE NEGATIVE CONTROL (bd present) is the complement: with bd on PATH, both
-# suites must report their FULL subtest count (test-dep-merge-state.sh
-# 18/18, test-overlap-dispatch-e2e.sh 5/5) with zero skips — proving the
-# bd-absent branch above is a real skip of real coverage, not a suite that
-# always reports fewer tests than it has. Self-skips loudly if bd is not on
-# PATH here (SABLE-59zu clean room) — this suite's own real-bd leg is exactly
-# the shape it is testing for, so it is registered here as a fixture, not
-# lectured about elsewhere.
+# suites must report STRICTLY MORE subtests than their own bd-absent run
+# (above) reported, with zero skips — proving the bd-absent branch above is
+# a real skip of real coverage, not a suite that always reports fewer tests
+# than it has. Asserted as a relative property (bd-present count > bd-absent
+# count) rather than a hardcoded literal, so growing either fixture suite's
+# subtest count over time does not re-red this control (SABLE-xanum — a
+# literal '18/18' stood in for this property and broke the day
+# test-dep-merge-state.sh legitimately grew from 18 to 20 subtests).
+# Self-skips loudly if bd is not on PATH here (SABLE-59zu clean room) — this
+# suite's own real-bd leg is exactly the shape it is testing for, so it is
+# registered here as a fixture, not lectured about elsewhere.
 #
 # Run with:
 #   bash hooks/test/test-ci-bd-coverage-gap.sh
@@ -72,6 +76,7 @@ fi
 # ---------------------------------------------------------------------------
 OUT_DM_NOBD=$(env PATH="$NOBD_PATH" bash "$DEP_MERGE" 2>&1)
 RC_DM_NOBD=$?
+DM_NOBD_TESTS=$(printf '%s' "$OUT_DM_NOBD" | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+')
 
 if [ "$RC_DM_NOBD" -eq 0 ]; then
   pass "bd-absent: test-dep-merge-state.sh exits 0 (a self-skip is not a failure)"
@@ -97,6 +102,7 @@ fi
 # ---------------------------------------------------------------------------
 OUT_OV_NOBD=$(env PATH="$NOBD_PATH" bash "$OVERLAP" 2>&1)
 RC_OV_NOBD=$?
+OV_NOBD_TESTS=$(printf '%s' "$OUT_OV_NOBD" | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+')
 
 if [ "$RC_OV_NOBD" -eq 0 ]; then
   pass "bd-absent: test-overlap-dispatch-e2e.sh exits 0 (a self-skip is not a failure)"
@@ -128,37 +134,37 @@ else
   RC_DM_BD=$?
   DM_BD_TESTS=$(printf '%s' "$OUT_DM_BD" | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+')
   DM_BD_SKIPPED=$(printf '%s' "$OUT_DM_BD" | grep -oE 'Skipped: [0-9]+' | tail -1 | grep -oE '[0-9]+')
-  if [ "$RC_DM_BD" -eq 0 ] && [ "${DM_BD_TESTS:-0}" -eq 18 ] && [ "${DM_BD_SKIPPED:-1}" -eq 0 ]; then
-    pass "negative control: test-dep-merge-state.sh with bd PRESENT reports the full subtest count (18/18, Skipped: 0)"
+  if [ "$RC_DM_BD" -eq 0 ] && [ "${DM_BD_TESTS:-0}" -gt "${DM_NOBD_TESTS:-0}" ] && [ "${DM_BD_SKIPPED:-1}" -eq 0 ]; then
+    pass "negative control: test-dep-merge-state.sh with bd PRESENT reports strictly more subtests than bd-absent (${DM_BD_TESTS:-<none>} > ${DM_NOBD_TESTS:-<none>}), Skipped: 0"
   else
-    fail "negative control: test-dep-merge-state.sh with bd PRESENT reports the full subtest count (18/18, Skipped: 0)" \
-         "rc=$RC_DM_BD tests=${DM_BD_TESTS:-<none>} skipped=${DM_BD_SKIPPED:-<none>}"
+    fail "negative control: test-dep-merge-state.sh with bd PRESENT reports strictly more subtests than bd-absent, Skipped: 0" \
+         "rc=$RC_DM_BD bd-present tests=${DM_BD_TESTS:-<none>} bd-absent tests=${DM_NOBD_TESTS:-<none>} skipped=${DM_BD_SKIPPED:-<none>}"
   fi
 
   OUT_OV_BD=$(bash "$OVERLAP" 2>&1)
   RC_OV_BD=$?
   OV_BD_TESTS=$(printf '%s' "$OUT_OV_BD" | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+')
-  if [ "$RC_OV_BD" -eq 0 ] && [ "${OV_BD_TESTS:-0}" -eq 5 ] && ! printf '%s' "$OUT_OV_BD" | grep -q 'Skipped:'; then
-    pass "negative control: test-overlap-dispatch-e2e.sh with bd PRESENT reports the full subtest count (5/5, no Skipped line at all)"
+  if [ "$RC_OV_BD" -eq 0 ] && [ "${OV_BD_TESTS:-0}" -gt "${OV_NOBD_TESTS:-0}" ] && ! printf '%s' "$OUT_OV_BD" | grep -q 'Skipped:'; then
+    pass "negative control: test-overlap-dispatch-e2e.sh with bd PRESENT reports strictly more subtests than bd-absent (${OV_BD_TESTS:-<none>} > ${OV_NOBD_TESTS:-<none>}), no Skipped line at all"
   else
-    fail "negative control: test-overlap-dispatch-e2e.sh with bd PRESENT reports the full subtest count (5/5, no Skipped line at all)" \
-         "rc=$RC_OV_BD tests=${OV_BD_TESTS:-<none>} output=$OUT_OV_BD"
+    fail "negative control: test-overlap-dispatch-e2e.sh with bd PRESENT reports strictly more subtests than bd-absent, no Skipped line at all" \
+         "rc=$RC_OV_BD bd-present tests=${OV_BD_TESTS:-<none>} bd-absent tests=${OV_NOBD_TESTS:-<none>} output=$OUT_OV_BD"
   fi
 
   # THE DISTINGUISHING PROPERTY, stated directly: the bd-absent and bd-
   # present summaries for the SAME suite must never be able to read as the
   # same result. Tests-count is the sharpest signal (7 vs 18, 0 vs 5).
-  if [ "${DM_BD_TESTS:-0}" != "$(printf '%s' "$OUT_DM_NOBD" | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+')" ]; then
+  if [ "${DM_BD_TESTS:-0}" != "${DM_NOBD_TESTS:-0}" ]; then
     pass "distinguishing property: test-dep-merge-state.sh's Tests count differs between bd-absent and bd-present runs"
   else
     fail "distinguishing property: test-dep-merge-state.sh's Tests count differs between bd-absent and bd-present runs" \
-         "bd-present tests=$DM_BD_TESTS bd-absent output=$OUT_DM_NOBD"
+         "bd-present tests=$DM_BD_TESTS bd-absent tests=$DM_NOBD_TESTS"
   fi
-  if [ "${OV_BD_TESTS:-0}" != "$(printf '%s' "$OUT_OV_NOBD" | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+')" ]; then
+  if [ "${OV_BD_TESTS:-0}" != "${OV_NOBD_TESTS:-0}" ]; then
     pass "distinguishing property: test-overlap-dispatch-e2e.sh's Tests count differs between bd-absent and bd-present runs"
   else
     fail "distinguishing property: test-overlap-dispatch-e2e.sh's Tests count differs between bd-absent and bd-present runs" \
-         "bd-present tests=$OV_BD_TESTS bd-absent output=$OUT_OV_NOBD"
+         "bd-present tests=$OV_BD_TESTS bd-absent tests=$OV_NOBD_TESTS"
   fi
 fi
 
