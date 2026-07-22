@@ -146,30 +146,44 @@ def rank_python_tests(
     """Order tests fastest-first and compute each one's UNIQUE contribution
     -- the lines it covers that no strictly-faster test already covers.
 
-    Equal-duration tests never subsume one another (strict `<` only): a tie
-    is not "faster", and treating it as one would let an arbitrary
-    dict-iteration order decide which of two equally-fast tests "loses" its
-    coverage credit. Conservative by construction.
+    Equal-duration tests never subsume one another (strict `<` only): tests
+    are processed in BANDS of equal duration, slowest-band-last. Every test
+    in a band computes its unique contribution against `faster_union` as it
+    stood BEFORE that band started -- i.e. against only strictly-faster
+    tests -- and the band's own coverage is folded into `faster_union` only
+    after the whole band has been scored. This makes the strict-`<` promise
+    a property of the algorithm, not of dict/sort iteration order: two
+    equal-duration tests can never subsume each other even when one's
+    coverage happens to be a subset of the other's. Conservative by
+    construction.
 
     Returns records sorted slowest-first (the order a human triaging cost
     wants to see), each: {nodeid, duration, covered_count, unique_count,
     subsumed}. `subsumed` is exactly `unique_count == 0` -- see module
     docstring for why that's the ONLY definition of a pruning candidate.
     """
-    ordered = sorted(durations.items(), key=lambda kv: (kv[1], kv[0]))
+    bands: dict[float, list[str]] = {}
+    for nodeid, duration in durations.items():
+        bands.setdefault(duration, []).append(nodeid)
+
     faster_union: set[tuple[str, int]] = set()
     records: list[dict] = []
-    for nodeid, duration in ordered:
-        covered = coverage_map.get(nodeid, set())
-        unique = covered - faster_union
-        records.append({
-            "nodeid": nodeid,
-            "duration": duration,
-            "covered_count": len(covered),
-            "unique_count": len(unique),
-            "subsumed": len(unique) == 0,
-        })
-        faster_union |= covered
+    for duration in sorted(bands):
+        band_nodeids = sorted(bands[duration])
+        band_covered: dict[str, set[tuple[str, int]]] = {}
+        for nodeid in band_nodeids:
+            covered = coverage_map.get(nodeid, set())
+            unique = covered - faster_union
+            band_covered[nodeid] = covered
+            records.append({
+                "nodeid": nodeid,
+                "duration": duration,
+                "covered_count": len(covered),
+                "unique_count": len(unique),
+                "subsumed": len(unique) == 0,
+            })
+        for covered in band_covered.values():
+            faster_union |= covered
     records.sort(key=lambda r: (-r["duration"], r["nodeid"]))
     return records
 

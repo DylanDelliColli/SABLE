@@ -3,20 +3,38 @@
 
 Real pytest + real coverage.py collection against a real slice of THIS
 repo's test tree (bin/test_columbo_prefilter.py, 58 tests over
-columbo-prefilter.py), and real wall-clock timing of two real, fast
-hooks/test/*.sh suites. No mocked coverage, no mocked subprocess, no
-synthetic fixture repo -- per the dispatch note, mocking coverage here
-would defeat the entire bead.
+columbo-prefilter.py, plus bin/test_sable_fixture_tripwire_integration.py,
+6 tests over sable-fixture-tripwire), and real wall-clock timing of two
+real, fast hooks/test/*.sh suites. No mocked coverage, no mocked
+subprocess, no synthetic fixture repo -- per the dispatch note, mocking
+coverage here would defeat the entire bead.
 
-Scope note: the python target is one real, fast (~0.2s) suite rather than
-the full bin/ tree (which takes several minutes and, per SABLE-cmar4.3,
-has an unrelated pytest-testmon crash class on this repo's extensionless
-executables -- irrelevant here since this tool uses plain pytest-cov, not
-testmon, but the full-suite runtime alone would make this test too slow
-for routine use). "Real coverage data against the real repo test tree"
-is satisfied by running real tests against real source with a real
-coverage.py context db -- the scope restriction only bounds wall-clock
-cost, not realism.
+Scope note: the python targets are two real, fast (~1s combined) suites
+rather than the full bin/ tree (which takes several minutes and, per
+SABLE-cmar4.3, has an unrelated pytest-testmon crash class on this repo's
+extensionless executables -- irrelevant here since this tool uses plain
+pytest-cov, not testmon, but the full-suite runtime alone would make this
+test too slow for routine use). "Real coverage data against the real repo
+test tree" is satisfied by running real tests against real source with a
+real coverage.py context db -- the scope restriction only bounds
+wall-clock cost, not realism.
+
+REVISE PASS (SABLE-cmar4.6, second dispatch): the second target
+(test_sable_fixture_tripwire_integration.py) was added because
+bin/test_columbo_prefilter.py's real durations, at the 2-decimal
+precision pytest's textual `--durations` report emits, ALL round to
+0.00s -- every one of its 58 tests ties. Once rank_python_tests'
+equal-duration-band fix landed (see test_columbo_cost_prefilter.py's
+module docstring), a single all-tied corpus produces ZERO cross-test
+subtraction by construction (there is no strictly-faster band for any of
+them to be subtracted against), which starved
+test_real_pipeline_subtraction_actually_uses_the_overlap of the real
+non-degenerate duration spread it needs to prove the subtraction
+mechanism actually fires on real data. This was caught by actually
+running the suite against real data, not assumed -- see that test's
+history. test_sable_fixture_tripwire_integration.py's 6 tests span
+0.04s-0.33s (real subprocess calls to git/bash), giving the combined
+corpus genuine duration separation.
 """
 from __future__ import annotations
 
@@ -47,13 +65,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 @pytest.fixture(scope="module")
 def real_python_run(tmp_path_factory):
-    """One real pytest run over bin/test_columbo_prefilter.py with real
+    """One real pytest run over two real repo test files with real
     per-test coverage contexts, shared across the python-half assertions
-    below so the (real, non-trivial) subprocess cost is paid once."""
+    below so the (real, non-trivial) subprocess cost is paid once.
+    test_sable_fixture_tripwire_integration.py is included alongside
+    test_columbo_prefilter.py specifically for its real duration spread
+    (0.04s-0.33s) -- see module docstring."""
     coverage_file = tmp_path_factory.mktemp("cost-prefilter-cov") / ".coverage"
     durations, coverage_map = ccp.run_python_suite_with_coverage(
         REPO_ROOT,
-        ["bin/test_columbo_prefilter.py"],
+        ["bin/test_columbo_prefilter.py", "bin/test_sable_fixture_tripwire_integration.py"],
         ["bin"],
         coverage_file,
     )
@@ -91,7 +112,7 @@ def test_real_coverage_has_genuine_overlap_between_tests(real_python_run):
     union = set()
     for v in coverage_map.values():
         union |= v
-    assert len(coverage_map) > 10, "expected the full 58-test suite to have run"
+    assert len(coverage_map) > 10, "expected the full combined test suite to have run"
     assert total > len(union), (
         f"expected real overlapping coverage (sum={total} should exceed "
         f"distinct union={len(union)}) -- got no overlap, which would mean "
