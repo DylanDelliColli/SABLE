@@ -370,6 +370,14 @@ The bead's `model:` label is the primary signal. If absent, apply the ladder
 to pick — and add the `model:` label to the bead via `bd update` so the next
 dispatch doesn't re-litigate.
 
+**This ladder is applied by the dispatching manager, not by the tooling
+(SABLE-mn1da).** `sable-spawn-worker` reads only `--model` and the `model:`
+label; with neither it uses a flat default (Sonnet) and says so on the spawn
+line. It never infers difficulty from the bead. After the spawn, the bead
+carries `metadata.model` / `metadata.model_source` recording what actually
+launched (SABLE-qw9jv) — that, not a label or a prompt line, is the durable
+answer to "which model ran this bead?".
+
 **Default: Sonnet** (claude-sonnet-4-6). All work starts here.
 
 **Step DOWN to Haiku** only if ALL four are true:

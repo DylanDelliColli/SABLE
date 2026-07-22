@@ -3,13 +3,22 @@
 topology (SABLE-bldh.3). Replaces the in-process Agent-tool dispatch.
 
 Per bead, a manager (Optimus/Tarzan) calls this to:
-  1. resolve the worker model from the bead's `model:` label (or --model override),
+  1. resolve the worker model from the bead's `model:` label (or --model
+     override) — a FLAT DEFAULT, not a ladder (SABLE-mn1da): no bead content is
+     inspected to infer difficulty, and the choice + its source is announced on
+     every spawn, default path included,
   2. (re)use a worktree (--worktree) or create one (`bd worktree create wk-<name>`),
   3. write the full dispatch prompt to a dispatch file (keeps the worktree clean),
   4. open a new tmux WINDOW running `claude --model <model>` with CWD = the worktree,
   5. tag the worker pane (@sable_role=worker / @sable_bead / @sable_status=running
      / @sable_lane=<owning manager>, SABLE-dcw2),
-  6. send a single-line "read your dispatch file and execute it" instruction.
+  6. send a single-line "read your dispatch file and execute it" instruction,
+  7. stamp `model` / `model_source` metadata on the bead (and every --bundle
+     sibling) from the command that ACTUALLY LAUNCHED — the durable answer to
+     "which model ran this bead?" that no part of the record used to carry
+     (SABLE-qw9jv). Written only after the pane exists, so a refused spawn
+     leaves no attribution and a re-dispatch at another tier records the tier
+     that ran.
 
 The worker then runs the warm-pane self-push lifecycle (worker-dispatch.md):
 self-push its branch and bd close. The done-flag itself is DETERMINISTIC
@@ -238,16 +247,73 @@ def link_fixture_paths(toplevel: str, worktree: str) -> list[tuple]:
     return results
 
 
-def resolve_model(labels: list[str], override: str | None):
-    """Return (model, reason). Override syntax: 'opus' or 'opus:why'. Label
-    'model:<m>' is the primary signal; default sonnet."""
+class ModelChoice(NamedTuple):
+    """(model, reason, source) — `source` is WHY this model was chosen:
+    'override' (--model), 'label' (bead `model:` label), or 'default'
+    (DEFAULT_MODEL, because neither was given)."""
+    model: str
+    reason: str | None
+    source: str
+
+
+def resolve_model(labels: list[str], override: str | None) -> ModelChoice:
+    """Return ModelChoice(model, reason, source). Override syntax: 'opus' or
+    'opus:why'. Label 'model:<m>' is the next signal; otherwise DEFAULT_MODEL.
+
+    SABLE-mn1da: this is a FLAT DEFAULT, not a ladder. Nothing here inspects
+    the bead to infer difficulty — not type, not priority, not description
+    size, not whether it carries an unresolved ruling. The 'model ladder' in
+    SABLE.md 6.9 / the role cards is a MANAGER judgment expressed through
+    --model or a `model:` label; a manager who dispatches without either gets
+    a constant. That gap used to be invisible at dispatch (only the override
+    path announced itself) and surfaced 30+ minutes later as a shallow result,
+    so `source` exists to make the default path as loud as the override one —
+    see model_announcement."""
     if override:
         model, _, reason = override.partition(":")
-        return model.strip(), (reason.strip() or None)
+        return ModelChoice(model.strip(), (reason.strip() or None), "override")
     for lab in labels:
         if lab.startswith("model:"):
-            return lab.split(":", 1)[1].strip(), None
-    return DEFAULT_MODEL, None
+            return ModelChoice(lab.split(":", 1)[1].strip(), None, "label")
+    return ModelChoice(DEFAULT_MODEL, None, "default")
+
+
+def model_announcement(model: str, reason: str | None, source: str) -> str:
+    """Operator-visible one-liner naming the model AND why it was chosen
+    (SABLE-mn1da). The reasoned-override wording is BYTE-IDENTICAL to what this
+    tool has always printed ('model opus, override: <reason>') — the fix adds
+    no noise to the path that already worked; it makes the two SILENT paths
+    (default, and a bare unreasoned override) say what they are."""
+    if source == "override":
+        return f"model {model}, override: {reason}" if reason else \
+            f"model {model}, override: (no reason given)"
+    if source == "label":
+        return f"model {model}, from bead label model:{model}"
+    return (f"model {model}, DEFAULT — no --model override and no model: label; "
+            "sable-spawn-worker does NOT infer difficulty from the bead")
+
+
+# `--model X` / `--model=X` as it appears in the command actually handed to
+# tmux. Used for provenance (SABLE-qw9jv): what LAUNCHED, not what was asked for.
+# The value stops at shell punctuation, not just whitespace: with_lifecycle_flags
+# joins the worker command to the done-flag write with `;`, so a command whose
+# LAST token is the model (a bare SABLE_WORKER_CMD='claude --model opus') yields
+# 'opus;' under a plain \S+ — a wrong value written straight into the bead.
+_MODEL_FLAG_RE = re.compile(r"--model[=\s]+([^\s;&|'\"]+)")
+
+
+def launched_model(worker_cmd: str) -> str | None:
+    """The model named by the command that actually launches in the pane, or
+    None when that command names no model at all (SABLE-qw9jv).
+
+    This reads the FINAL command string — after worker_command() has applied
+    any SABLE_WORKER_CMD override and after with_lifecycle_flags() has wrapped
+    it — precisely because the dispatcher's REQUEST and what the spawn RUNS can
+    diverge: a full SABLE_WORKER_CMD override replaces the command verbatim, so
+    it may pin a different model, or none. Recording the request instead of the
+    launch is the exact intent-vs-execution error this bead exists to kill."""
+    m = _MODEL_FLAG_RE.search(worker_cmd or "")
+    return m.group(1) if m else None
 
 
 def parse_bead(raw: str) -> dict:
@@ -533,6 +599,32 @@ def tag_branch_metadata(bead_id: str, branch: str) -> None:
     resolution to the legacy prose fallback, it never blocks dispatch."""
     subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata",
                     f"branch={branch}"], capture_output=True, text=True)
+
+
+def tag_model_metadata(bead_id: str, model: str, source: str) -> None:
+    """Record which model ACTUALLY RAN this bead, as structured metadata
+    (SABLE-qw9jv): `model=<m>` plus `model_source=<override|label|default|
+    worker-cmd-override>`.
+
+    Nothing in the bead record used to capture this. A dispatch's `model:`
+    label, a manager note, a dispatch prompt line — all of them are INTENT, and
+    this fleet's own rule is that an instruction written into a bead is never
+    evidence it executed. So a shift's worth of haiku-vs-sonnet analysis was
+    unanswerable from the moment it was asked, across eight beads with zero
+    durable attributions. This write is the artefact: emitted by the spawn
+    path, not typed by a manager, and only AFTER the pane actually launched —
+    a spawn refused by the throttle/host-guard/composer-posture gate writes
+    nothing, so a bead refused at one tier and re-dispatched at another shows
+    the tier that RAN, not the one first attempted.
+
+    A plain overwrite, like tag_branch_metadata: a re-dispatch supersedes the
+    previous attempt (dolt history keeps the prior values for anyone
+    reconstructing the whole sequence). Best-effort — swallows bd errors,
+    matching every other governance write here; a missed stamp must never
+    block a dispatch."""
+    for kv in (f"model={model}", f"model_source={source}"):
+        subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata", kv],
+                       capture_output=True, text=True)
 
 
 def bead_already_claimed_by_lane(bead: dict, lane: str) -> bool:
@@ -1316,8 +1408,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- fetch bead for the prompt + label-based model resolution ---
     bead = parse_bead(_run(["bd", "show", bid, "--json"]))
-    model, reason = resolve_model(bead_labels(bead), ns.model)
+    model, reason, model_source = resolve_model(bead_labels(bead), ns.model)
     lane = resolve_lane(ns.lane)
+
+    # SABLE-mn1da: announce the model AND why, BEFORE any governance step that
+    # can refuse — a manager must be able to see that a flat default (not a
+    # ladder) picked the tier even on a spawn that never reaches the pane.
+    sys.stderr.write("sable-spawn-worker: model selection — "
+                     f"{model_announcement(model, reason, model_source)}\n")
 
     # --- SABLE-q13h: fetch bundled sibling beads (if any) for the prompt.
     # Fetched unconditionally (even under --skip-governance) since prompt
@@ -1573,9 +1671,39 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"sable-spawn-worker: WARNING dispatch may be unsubmitted in "
                          f"{pane_id}; nudge with: tmux send-keys -t {pane_id} Enter\n")
 
-    note = (f" (model {model}" + (f", override: {reason}" if reason else "")
+    # --- SABLE-qw9jv: stamp the model provenance onto the bead(s). LAST, after
+    # the pane exists and the dispatch has been typed into it, so the stamp is
+    # a record of a spawn that actually happened — every refusal path above
+    # returns before this point and leaves no attribution behind. Value comes
+    # from the command that LAUNCHED (launched_model), never from ns.model.
+    # Bundled siblings share this pane, hence this model. Gated on governance
+    # like every other bd WRITE here: a --skip-governance stand-in spawn must
+    # leave a bead it does not own untouched. ---
+    ran = launched_model(wcmd)
+    stamped_model = ran or "unknown"
+    stamped_source = model_source if ran else "worker-cmd-override"
+    if ran and ran != model:
+        sys.stderr.write(
+            f"sable-spawn-worker: NOTE launched model '{ran}' differs from the "
+            f"resolved model '{model}' (SABLE_WORKER_CMD override) — recording "
+            "what launched\n")
+    elif not ran:
+        sys.stderr.write(
+            "sable-spawn-worker: NOTE worker command names no --model "
+            f"({wcmd!r}) — recording model=unknown rather than asserting "
+            f"'{model}' ran\n")
+    if not ns.skip_governance:
+        for tag_id in [bid, *bundle_ids]:
+            tag_model_metadata(tag_id, stamped_model, stamped_source)
+
+    note = (f" ({model_announcement(model, reason, model_source)}"
             + (f", lane {lane}" if lane else "") + ")")
     sys.stderr.write(f"sable-spawn-worker: spawned {win} for {bid} at {pane_id}{note}\n")
+    sys.stderr.write(f"sable-spawn-worker: model provenance for {bid}"
+                     + (f" (+{','.join(bundle_ids)})" if bundle_ids else "")
+                     + f": model={stamped_model} model_source={stamped_source}"
+                     + (" [not stamped: --skip-governance]" if ns.skip_governance else "")
+                     + "\n")
     return 0
 
 
