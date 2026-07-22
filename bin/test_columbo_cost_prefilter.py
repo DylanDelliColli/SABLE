@@ -85,6 +85,23 @@ unit test asserts the constructed argv directly. Verified falsifiable:
 reverting to the no-op spelling (or omitting the disable flags entirely)
 turns this test red; confirmed by temporarily doing so and re-running
 this file, then reverting.
+
+REVISE PASS #3 (SABLE-cmar4.6/SABLE-cmar4.8, ci-verify red AGAIN on run
+29940963862, byte-identical to the first): revise #2's fix was verified
+correct against the reproduction that was possible locally, but the same
+empty-durations symptom recurred in CI on the very next push, and
+`result.returncode` / `result.stderr` were never inspected -- a dead inner
+run returned ({}, {}) exactly like a legitimately-quiet one. This is not
+polish, it's the prerequisite for diagnosing the still-open CI-only
+failure at all (see run_python_suite_with_coverage's docstring).
+test_run_python_suite_raises_loud_on_non_tolerated_returncode adds the
+guard; test_run_python_suite_tolerates_test_failures_and_bare_pass prove
+the two codes that must NOT raise. Plant-and-fail verified by hand:
+commenting out the `if result.returncode not in _INNER_RUN_OK_EXIT_CODES`
+raise in columbo-cost-prefilter.py and re-running this file turns
+test_run_python_suite_raises_loud_on_non_tolerated_returncode red
+(fake_run's returncode=3 case then returns ({}, {}) instead of raising,
+same as the bug this closes); reverted before commit.
 """
 from __future__ import annotations
 
@@ -174,6 +191,77 @@ def test_run_python_suite_disables_ambient_testmon_and_impact_by_working_name(mo
     )
     assert "no:testmon" not in args
     assert "no:impact" in args
+
+
+# ---------------------------------------------------------------------------
+# run_python_suite_with_coverage -- loud failure on a non-tolerated inner
+# returncode (SABLE-cmar4.6 third revise / SABLE-cmar4.8). Before this, a
+# dead inner run (crash, interrupt, usage error, no tests collected) was
+# indistinguishable from a legitimately quiet one: both produced ({}, {})
+# because result.returncode/result.stderr were never inspected. See
+# InnerPytestRunFailed and _INNER_RUN_OK_EXIT_CODES in
+# columbo-cost-prefilter.py.
+# ---------------------------------------------------------------------------
+
+
+def _fake_run_with_returncode(returncode, stdout="", stderr=""):
+    captured = {}
+
+    def fake_run(args, cwd, capture_output, text, env):
+        captured["args"] = args
+        return type(
+            "Result", (), {"stdout": stdout, "stderr": stderr, "returncode": returncode}
+        )()
+
+    return fake_run, captured
+
+
+def test_run_python_suite_raises_loud_on_non_tolerated_returncode(monkeypatch, tmp_path):
+    """Reproduces the exact class of failure that made runs 29936760714 and
+    29940963862 undiagnosable: the inner pytest exits 3 (INTERNALERROR)
+    with a real crash on stderr, and that must surface as a raised
+    exception carrying the returncode and stderr -- never as a silent
+    ({}, {})."""
+    fake_run, _captured = _fake_run_with_returncode(
+        returncode=3,
+        stdout="internal error summary\n",
+        stderr="INTERNALERROR> IndexError: list index out of range\n",
+    )
+    monkeypatch.setattr(ccp.subprocess, "run", fake_run)
+    with pytest.raises(ccp.InnerPytestRunFailed) as excinfo:
+        ccp.run_python_suite_with_coverage(
+            tmp_path, ["bin/test_foo.py"], ["bin"], tmp_path / ".coverage"
+        )
+    assert excinfo.value.returncode == 3
+    assert "INTERNALERROR" in str(excinfo.value)
+    assert "IndexError" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_run_python_suite_tolerates_bare_pass_and_test_failures(monkeypatch, tmp_path, returncode):
+    """Codes 0 (all passed) and 1 (some tests failed) both mean the inner
+    run genuinely executed every test body and produced real durations/
+    coverage -- these must NOT raise."""
+    fake_run, _captured = _fake_run_with_returncode(returncode=returncode)
+    monkeypatch.setattr(ccp.subprocess, "run", fake_run)
+    # must not raise
+    ccp.run_python_suite_with_coverage(
+        tmp_path, ["bin/test_foo.py"], ["bin"], tmp_path / ".coverage"
+    )
+
+
+@pytest.mark.parametrize("returncode", [2, 4, 5])
+def test_run_python_suite_raises_on_every_other_non_tolerated_code(monkeypatch, tmp_path, returncode):
+    """Interrupted (2), usage error (4), and no-tests-collected (5) are all
+    outcomes where the inner run did not produce trustworthy timing/
+    coverage data -- each must raise, not just the returncode==3 case."""
+    fake_run, _captured = _fake_run_with_returncode(returncode=returncode, stderr="boom")
+    monkeypatch.setattr(ccp.subprocess, "run", fake_run)
+    with pytest.raises(ccp.InnerPytestRunFailed) as excinfo:
+        ccp.run_python_suite_with_coverage(
+            tmp_path, ["bin/test_foo.py"], ["bin"], tmp_path / ".coverage"
+        )
+    assert excinfo.value.returncode == returncode
 
 
 # ---------------------------------------------------------------------------

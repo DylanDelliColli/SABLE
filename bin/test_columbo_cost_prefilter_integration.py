@@ -70,7 +70,16 @@ def real_python_run(tmp_path_factory):
     below so the (real, non-trivial) subprocess cost is paid once.
     test_sable_fixture_tripwire_integration.py is included alongside
     test_columbo_prefilter.py specifically for its real duration spread
-    (0.04s-0.33s) -- see module docstring."""
+    (0.04s-0.33s) -- see module docstring.
+
+    SABLE-cmar4.6 third revise / SABLE-cmar4.8: this fixture does not
+    catch ccp.InnerPytestRunFailed deliberately. If the inner pytest run
+    this drives ever exits outside {0, 1} again (as it silently did in
+    ci-verify runs 29936760714 and 29940963862, both times as an empty
+    durations dict rather than a visible error), every test depending on
+    this fixture now errors at setup with the real returncode and
+    stdout/stderr tail in the traceback, instead of failing downstream
+    with an opaque `assert X in {}` that hides the actual cause."""
     coverage_file = tmp_path_factory.mktemp("cost-prefilter-cov") / ".coverage"
     durations, coverage_map = ccp.run_python_suite_with_coverage(
         REPO_ROOT,
