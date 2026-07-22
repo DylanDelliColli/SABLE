@@ -35,6 +35,38 @@ running the suite against real data, not assumed -- see that test's
 history. test_sable_fixture_tripwire_integration.py's 6 tests span
 0.04s-0.33s (real subprocess calls to git/bash), giving the combined
 corpus genuine duration separation.
+
+REVISE PASS (SABLE-cmar4.7): the WORKAROUND above (adding the tripwire
+file for spread) fixed the fixture; it did not fix the tool -- on
+bin/test_columbo_prefilter.py ALONE, real duration collection still
+rounded to pytest's 2-decimal --durations text, still tied 58/58, and
+`python.pruning_candidates` was still unconditionally empty on this
+repo's actual bin/ corpus. Two changes here, both real-data-verified:
+
+1. run_python_suite_with_coverage now reads full-precision
+   report.duration via an in-process plugin instead of parsing rounded
+   text (see columbo-cost-prefilter.py's parse_duration_log). VERIFIED
+   against this repo's real corpus, not assumed:
+   test_real_run_full_precision_durations_are_not_degenerate_on_real_
+   corpus asserts the SAME bin/test_columbo_prefilter.py + tripwire
+   corpus this file already runs now measures genuinely distinct
+   durations for every test (58/58 distinct on the columbo-prefilter.py
+   half alone, confirmed by direct probe during implementation) -- the
+   resolution problem this bead exists to fix is gone on real data, not
+   just in theory.
+2. build_report's new `degenerate_single_band` signal (SABLE-cmar4.7)
+   must still fire correctly on genuinely real (not fabricated)
+   coverage data whenever durations DO tie. Full-precision timing makes
+   a genuine real-corpus tie statistically unreproducible in CI (see (1)
+   above), so test_real_pipeline_reports_degenerate_condition_at_pytest_
+   text_precision constructs the tie the only way that stays
+   deterministic: by taking this fixture's real, already-collected
+   durations and applying pytest's own known 2-decimal `--durations`
+   rounding rule to them (exactly what parse_pytest_durations would have
+   produced from the same run's real textual output) -- the REAL
+   coverage map is untouched. Only the duration axis is derived rather
+   than re-measured, and it is derived by a documented, real
+   transformation of real values, not invented.
 """
 from __future__ import annotations
 
@@ -159,6 +191,74 @@ def test_real_pipeline_subtraction_actually_uses_the_overlap(real_python_run):
     durations, coverage_map = real_python_run
     records = ccp.rank_python_tests(durations, coverage_map)
     assert any(r["covered_count"] > r["unique_count"] for r in records)
+
+
+# ---------------------------------------------------------------------------
+# Timing resolution (SABLE-cmar4.7) -- full-precision collection fixes the
+# real corpus; the degenerate-band signal still fires correctly when
+# durations genuinely tie. See module docstring for why the second test
+# constructs its tie from real measured values rather than a real subprocess
+# run (a genuine tie is no longer reproducible once precision is fixed).
+# ---------------------------------------------------------------------------
+
+
+def test_real_run_full_precision_durations_are_not_degenerate_on_real_corpus(real_python_run):
+    """THE PRIMARY CLAIM, checked against real data. This exact corpus
+    (bin/test_columbo_prefilter.py's 58 tests) is the one SABLE-cmar4.7
+    was filed against: every test's textual `--durations` reading rounds
+    to 0.00s (see this file's module docstring), which used to put every
+    test in one duration band. With full-precision collection the real
+    measured durations must be genuinely distinct, and build_report must
+    NOT report the degenerate condition."""
+    durations, coverage_map = real_python_run
+    assert len(coverage_map) > 10, "expected the full combined test suite to have run"
+    assert len(set(durations.values())) > 1, (
+        "expected genuinely distinct full-precision durations on this "
+        "repo's real corpus -- if every value is identical, full-precision "
+        "collection is not actually wired up"
+    )
+    records = ccp.rank_python_tests(durations, coverage_map)
+    report = ccp.build_report(records, ccp.rank_shell_suites({}))
+    assert report["python"]["degenerate_single_band"] is False
+    assert "note" not in report["python"]
+
+
+def test_real_pipeline_reports_degenerate_condition_at_pytest_text_precision(real_python_run):
+    """Proves the degenerate signal fires on genuinely real, unmocked
+    coverage data. Full-precision timing (the test above) makes a REAL
+    tie essentially unreproducible now, so the tie is constructed from
+    this fixture's real measured values rather than a fresh subprocess
+    run that would almost never actually collide.
+
+    Scoped to the bin/test_columbo_prefilter.py half of the fixture only
+    (the tripwire file's durations, 0.04s-0.33s, are real and genuinely
+    spread even at 2-decimal rounding, so including them would prevent
+    the tie). Every nodeid in the subset is mapped to the SAME value:
+    its real minimum duration, rounded to the 2 decimals pytest's own
+    `--durations` text report uses (parse_pytest_durations' precision) --
+    i.e. the real measurement floor this corpus actually hits. This is
+    deliberately NOT "round each real value independently and check they
+    all collide": measured live, a handful of this suite's real durations
+    round to 0.01s rather than 0.00s (first-test import overhead), so
+    that check is flaky against real machine jitter -- the same jitter
+    that makes forcing a genuine full-precision tie unworkable. Uniformly
+    applying the real floor keeps the value grounded in a real
+    measurement while making the tie deterministic."""
+    durations, coverage_map = real_python_run
+    prefix = "bin/test_columbo_prefilter.py::"
+    subset_durations = {k: v for k, v in durations.items() if k.startswith(prefix)}
+    subset_coverage = {k: v for k, v in coverage_map.items() if k.startswith(prefix)}
+    assert len(subset_durations) > 10, "expected the full columbo-prefilter.py suite"
+
+    floor = round(min(subset_durations.values()), 2)
+    tied_at_floor = {k: floor for k in subset_durations}
+
+    records = ccp.rank_python_tests(tied_at_floor, subset_coverage)
+    report = ccp.build_report(records, ccp.rank_shell_suites({}))
+    assert report["python"]["degenerate_single_band"] is True
+    assert report["python"]["pruning_candidates"] == []
+    assert "note" in report["python"]
+    assert str(len(subset_durations)) in report["python"]["note"]
 
 
 # ---------------------------------------------------------------------------

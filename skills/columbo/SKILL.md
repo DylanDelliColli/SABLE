@@ -179,6 +179,16 @@ narrow it to scope the run.
    matter how slow it looks in the ranked list — a slow test with unique
    coverage is doing real work.
 
+   **Check `python.degenerate_single_band` before reading an empty
+   `pruning_candidates` list as a finding (SABLE-cmar4.7).** If it's
+   `true`, every measured test tied at the same duration — no test had a
+   strictly-faster peer, so cross-test subsumption was never computable —
+   and `python.note` names the count. Report this to the user as "cost
+   audit could not measure redundancy on this corpus" (the run's own
+   worded note), never as "no redundant tests found". Only an empty
+   `pruning_candidates` list with `degenerate_single_band: false` is a
+   genuine "nothing is redundant" finding.
+
 3. **Shell half — advisory only, never a bead.** The report's
    `shell.ranked` list is a duration ranking with `advisory_only: true`
    and carries no proof of redundancy (no line-coverage tool exists for
@@ -774,6 +784,10 @@ Before sending the summary message, re-read each filed bead and confirm:
       absent from `pruning_candidates`, never a shell suite
 - [ ] Cost-audit mode: the shell ranking was presented as an advisory
       list only — no bead was filed for any shell suite
+- [ ] Cost-audit mode: if `python.degenerate_single_band` was `true`, the
+      user was told the run could not measure redundancy — an empty
+      `pruning_candidates` list was never presented as "no redundant
+      tests found" (SABLE-cmar4.7)
 - [ ] Could a fresh worker take a single bead + the skeleton file and
       write the implementation without re-interviewing the user?
 - [ ] Has the one-more-thing question been asked and the answer processed?

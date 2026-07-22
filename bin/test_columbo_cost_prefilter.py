@@ -102,10 +102,48 @@ raise in columbo-cost-prefilter.py and re-running this file turns
 test_run_python_suite_raises_loud_on_non_tolerated_returncode red
 (fake_run's returncode=3 case then returns ({}, {}) instead of raising,
 same as the bug this closes); reverted before commit.
+
+REVISE PASS (SABLE-cmar4.7) -- the resolution-limit follow-on cmar4.6's
+worker found and escalated: pytest's textual `--durations` report
+hardcodes 2-decimal formatting, and this repo's real bin/ corpus ties at
+that precision (every test reads "0.00s"), which put every test in ONE
+duration band and made cross-test subsumption unconditionally empty --
+indistinguishable, from the output alone, from a genuine "nothing is
+redundant" finding. Two changes, both required (the bead's own framing:
+option 2 is not optional even if option 1 lands):
+
+1. Full-precision duration collection. run_python_suite_with_coverage now
+   reads report.duration via an in-process pytest plugin
+   (parse_duration_log) instead of parsing 2-decimal --durations text
+   (parse_pytest_durations, retained -- see its docstring in
+   columbo-cost-prefilter.py for why). VERIFIED, not assumed: a direct
+   probe against this repo's real bin/test_columbo_prefilter.py (58 tests,
+   all "0.00s" in --durations text) showed 58/58 DISTINCT full-precision
+   durations, ranging ~0.0002s-0.0025s -- the hypothesis that pytest's
+   report objects carry usable precision was checked before committing to
+   it (per dispatch note), not taken on faith.
+2. Degenerate-single-band signal. build_report now computes
+   `python.degenerate_single_band` (helper: _degenerate_single_band) and,
+   when true, a human-readable `python.note` -- so an empty
+   pruning_candidates list can never be silently read as "measured, found
+   nothing" when it actually means "every test tied; nothing was
+   comparable". test_build_report_degenerate_signal_fires_on_all_tied_
+   durations and its negative control
+   test_build_report_degenerate_signal_absent_with_real_spread pin both
+   directions; test_rank_python_tests_distinguishes_durations_below_
+   2_decimal_precision pins that rank_python_tests itself (unchanged --
+   it was always agnostic to the precision of its input) correctly bands
+   floats that would have tied under 2-decimal rounding.
+
+See test_columbo_cost_prefilter_integration.py's module docstring for how
+the degenerate signal is proven against real, unmocked coverage data
+despite full-precision durations making a genuine real-corpus tie
+essentially unreproducible now (which is itself evidence option 1 works).
 """
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -152,6 +190,38 @@ def test_parse_durations_empty_report():
 
 
 # ---------------------------------------------------------------------------
+# parse_duration_log -- full-precision duration collection (SABLE-cmar4.7)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_duration_log_sums_phases_per_nodeid_at_full_precision(tmp_path):
+    log = tmp_path / "durations.jsonl"
+    log.write_text(
+        '{"nodeid": "bin/test_foo.py::test_a", "duration": 0.0011234}\n'
+        '{"nodeid": "bin/test_foo.py::test_a", "duration": 0.0002211}\n'
+        '{"nodeid": "bin/test_foo.py::test_b", "duration": 0.0009999}\n'
+    )
+    durations = ccp.parse_duration_log(log)
+    assert durations["bin/test_foo.py::test_a"] == pytest.approx(0.0013445)
+    assert durations["bin/test_foo.py::test_b"] == pytest.approx(0.0009999)
+
+
+def test_parse_duration_log_missing_file_reads_as_no_durations(tmp_path):
+    """Consistent with parse_pytest_durations("") == {} -- a log that was
+    never written (e.g. the inner run never started) is not a crash."""
+    assert ccp.parse_duration_log(tmp_path / "never-written.jsonl") == {}
+
+
+def test_duration_plugin_source_reads_env_var_by_name():
+    """The plugin file is generated from a template at collection-import
+    time (see run_python_suite_with_coverage) -- pin that the generated
+    source references the real env var name, not a stale/typo'd one that
+    would silently read nothing (os.environ[...] would KeyError instead,
+    but a typo'd *different* real env var would not)."""
+    assert f'os.environ["{ccp._DURATION_LOG_ENV_VAR}"]' in ccp._DURATION_PLUGIN_SOURCE
+
+
+# ---------------------------------------------------------------------------
 # run_python_suite_with_coverage -- ambient plugin isolation (SABLE-cmar4.6
 # second revise). The real ci-verify gate red (run 29936760714) traced to
 # pytest-testmon and pytest-cov contending for the same process-wide
@@ -191,6 +261,36 @@ def test_run_python_suite_disables_ambient_testmon_and_impact_by_working_name(mo
     )
     assert "no:testmon" not in args
     assert "no:impact" in args
+
+
+# ---------------------------------------------------------------------------
+# run_python_suite_with_coverage -- full-precision duration plugin wiring
+# (SABLE-cmar4.7). The inner run must load the duration-capture plugin by
+# module name and be able to import it, and must tell it where to write
+# via the env var parse_duration_log later reads from.
+# ---------------------------------------------------------------------------
+
+
+def test_run_python_suite_wires_duration_plugin_into_argv_and_env(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(args, cwd, capture_output, text, env):
+        captured["args"] = args
+        captured["env"] = env
+        return type("Result", (), {"stdout": "", "stderr": "", "returncode": 0})()
+
+    monkeypatch.setattr(ccp.subprocess, "run", fake_run)
+    ccp.run_python_suite_with_coverage(
+        tmp_path, ["bin/test_foo.py"], ["bin"], tmp_path / ".coverage"
+    )
+    args = captured["args"]
+    env = captured["env"]
+    assert ccp._DURATION_PLUGIN_MODULE_NAME in args
+    assert ccp._DURATION_LOG_ENV_VAR in env
+    # the plugin module must actually be importable by the inner process
+    plugin_dir = Path(env[ccp._DURATION_LOG_ENV_VAR]).parent
+    assert (plugin_dir / f"{ccp._DURATION_PLUGIN_MODULE_NAME}.py").is_file()
+    assert str(plugin_dir) in env["PYTHONPATH"].split(os.pathsep)
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +479,39 @@ def test_equal_duration_tests_do_not_subsume_each_other():
     assert by_id["t_b"]["subsumed"] is False
 
 
+def test_rank_python_tests_distinguishes_durations_below_2_decimal_precision():
+    """SABLE-cmar4.7: rank_python_tests was never the bug (it bands by
+    float equality, which already handles arbitrary precision) -- the bug
+    was upstream, in a duration SOURCE (pytest's --durations text) that
+    rounded to 2 decimals before this function ever saw the data. Pin the
+    property directly: two durations that would both round to "0.00s"
+    (0.0011s and 0.0022s) but are genuinely distinct at full precision must
+    land in different bands, so the slower one's non-overlapping coverage
+    is correctly NOT credited to the faster one, and a slower test whose
+    coverage IS a strict subset of a "tied-at-2-decimals" faster test's
+    coverage is correctly identified as subsumed."""
+    durations = {"t_faster": 0.0011, "t_slower_subset": 0.0022}
+    coverage_map = {
+        "t_faster": {_line("m.py", 1), _line("m.py", 2)},
+        "t_slower_subset": {_line("m.py", 1)},
+    }
+    records = ccp.rank_python_tests(durations, coverage_map)
+    by_id = {r["nodeid"]: r for r in records}
+    assert by_id["t_faster"]["unique_count"] == 2
+    assert by_id["t_slower_subset"]["unique_count"] == 0
+    assert by_id["t_slower_subset"]["subsumed"] is True
+    # negative control: at 2-decimal rounding both would read "0.00s" and
+    # (per the equal-duration guarantee above) neither could ever subsume
+    # the other -- confirming the distinction above depends on genuinely
+    # reading the sub-hundredth-second difference, not an artifact of the
+    # fixture's other values.
+    rounded = {k: round(v, 2) for k, v in durations.items()}
+    assert len(set(rounded.values())) == 1
+    rounded_records = ccp.rank_python_tests(rounded, coverage_map)
+    rounded_by_id = {r["nodeid"]: r for r in rounded_records}
+    assert rounded_by_id["t_slower_subset"]["subsumed"] is False
+
+
 def test_ranked_output_sorted_slowest_first():
     durations = {"t_a": 0.5, "t_b": 5.0, "t_c": 0.1}
     coverage_map = {k: {_line("m.py", i)} for i, k in enumerate(durations)}
@@ -457,6 +590,66 @@ def test_build_report_python_pruning_candidates_subset_of_ranked():
 
 
 # ---------------------------------------------------------------------------
+# build_report -- degenerate_single_band signal (SABLE-cmar4.7). An empty
+# pruning_candidates list must never be silently readable as "measured,
+# nothing redundant" when it actually means "every test tied; nothing was
+# comparable" -- see _degenerate_single_band's docstring.
+# ---------------------------------------------------------------------------
+
+
+def test_build_report_degenerate_signal_fires_on_all_tied_durations():
+    """THE LIVE CASE (SABLE-cmar4.7's finding): every duration identical,
+    overlapping coverage that would otherwise look prunable. Even though
+    there IS coverage overlap here, the report must say the run could not
+    measure subsumption, not that it measured zero."""
+    python_records = ccp.rank_python_tests(
+        {"t_a": 1.0, "t_b": 1.0, "t_c": 1.0},
+        {
+            "t_a": {_line("m.py", 1), _line("m.py", 2)},
+            "t_b": {_line("m.py", 1)},
+            "t_c": {_line("m.py", 2)},
+        },
+    )
+    report = ccp.build_report(python_records, ccp.rank_shell_suites({}))
+    assert report["python"]["degenerate_single_band"] is True
+    assert report["python"]["pruning_candidates"] == []
+    assert "note" in report["python"]
+    assert "3" in report["python"]["note"]
+
+
+def test_build_report_degenerate_signal_absent_with_real_spread():
+    """NEGATIVE CONTROL: a corpus with a genuine duration spread must NOT
+    emit the degenerate signal, even when it happens to have zero pruning
+    candidates -- otherwise the signal becomes an always-on banner that
+    stops distinguishing anything (the exact failure mode the negative
+    control in the bead spec exists to catch)."""
+    python_records = ccp.rank_python_tests(
+        {"t_a": 0.1, "t_b": 0.2, "t_c": 0.3},
+        {
+            "t_a": {_line("m.py", 1)},
+            "t_b": {_line("m.py", 2)},
+            "t_c": {_line("m.py", 3)},
+        },
+    )
+    report = ccp.build_report(python_records, ccp.rank_shell_suites({}))
+    assert report["python"]["pruning_candidates"] == []
+    assert report["python"]["degenerate_single_band"] is False
+    assert "note" not in report["python"]
+
+
+def test_build_report_degenerate_signal_absent_with_single_or_zero_tests():
+    """A single test (or none) has nothing to tie WITH -- not the
+    ambiguous state this signal exists to name."""
+    one = ccp.build_report(
+        ccp.rank_python_tests({"t_a": 1.0}, {"t_a": {_line("m.py", 1)}}),
+        ccp.rank_shell_suites({}),
+    )
+    assert one["python"]["degenerate_single_band"] is False
+    zero = ccp.build_report(ccp.rank_python_tests({}, {}), ccp.rank_shell_suites({}))
+    assert zero["python"]["degenerate_single_band"] is False
+
+
+# ---------------------------------------------------------------------------
 # format_json / format_text -- basic shape sanity
 # ---------------------------------------------------------------------------
 
@@ -484,6 +677,33 @@ def test_format_text_flags_prune_candidates():
     text = ccp.format_text(report)
     assert "PRUNE-CANDIDATE" in text
     assert "ADVISORY" in text.upper()
+
+
+def test_format_text_surfaces_degenerate_note():
+    report = ccp.build_report(
+        ccp.rank_python_tests(
+            {"t_a": 1.0, "t_b": 1.0},
+            {"t_a": {_line("m.py", 1)}, "t_b": {_line("m.py", 1)}},
+        ),
+        ccp.rank_shell_suites({}),
+    )
+    text = ccp.format_text(report)
+    assert "python pruning candidates: 0" in text
+    assert report["python"]["note"] in text
+
+
+def test_format_text_omits_degenerate_note_with_real_spread():
+    """NEGATIVE CONTROL for the formatter itself: a non-degenerate report
+    (even with zero candidates) must not print a NOTE line at all."""
+    report = ccp.build_report(
+        ccp.rank_python_tests(
+            {"t_a": 0.1, "t_b": 0.2},
+            {"t_a": {_line("m.py", 1)}, "t_b": {_line("m.py", 2)}},
+        ),
+        ccp.rank_shell_suites({}),
+    )
+    text = ccp.format_text(report)
+    assert "NOTE:" not in text
 
 
 if __name__ == "__main__":

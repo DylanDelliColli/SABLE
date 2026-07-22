@@ -36,8 +36,20 @@ Coverage-context format (confirmed against a live pytest-cov 7.1.0 / py
 coverage 7.15.2 capture, not guessed): pytest-cov's dynamic `test` context
 writes ONE flat context per test, `"<nodeid>|run"` — not split into
 per-phase (setup/call/teardown) contexts. The `|run` suffix is stripped to
-recover the nodeid, which is joined against the `--durations` report's
-nodeid column (same format: `bin/test_foo.py::test_bar`).
+recover the nodeid, which is joined against real per-test durations (see
+"full-precision duration collection" below).
+
+Timing resolution (SABLE-cmar4.7): pytest's own `--durations` TEXT report
+hardcodes 2-decimal formatting — not a limit of the underlying
+measurement. On this repo's bin/ corpus every test's textual duration
+rounds to 0.00s, which puts every test in ONE duration band and makes
+cross-test subsumption unconditionally empty — indistinguishable, from
+the output alone, from a genuine "nothing is redundant" finding. This
+tool collects durations from pytest's report objects directly (full
+float precision, verified 58/58 distinct on this repo's real corpus —
+see run_python_suite_with_coverage), and any run that still lands every
+test in one band is reported as such rather than silently returning an
+empty candidate list (see `degenerate_single_band` in build_report).
 """
 
 from __future__ import annotations
@@ -57,19 +69,33 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 # ---------------------------------------------------------------------------
-# Python half — duration parsing
+# Python half — duration parsing (pytest's rounded TEXT report)
 # ---------------------------------------------------------------------------
 
 # Matches one line of `pytest --durations=0 --durations-min=0.0` output,
 # e.g. "0.12s call     bin/test_foo.py::test_bar". Three lines (setup, call,
 # teardown) are emitted per test; costs are summed per nodeid below since
 # fixture setup cost is part of what pruning the test would actually save.
+#
+# NOT used by run_python_suite_with_coverage below (SABLE-cmar4.7): pytest's
+# own textual `--durations` report hardcodes 2-decimal formatting
+# (_pytest/terminal.py's "{:.2f}s"), which collapsed this repo's entire
+# bin/ corpus to "0.00s" and made cross-test subsumption unconditionally
+# empty. Production duration collection now reads report.duration directly
+# (see _DURATION_PLUGIN_SOURCE / parse_duration_log) to get full float
+# precision instead. This function is retained because it is exactly the
+# reduced-precision transform pytest's own text report performs, and
+# bin/test_columbo_cost_prefilter_integration.py uses it against real
+# captured output to prove the degenerate-band signal (build_report's
+# `degenerate_single_band`) fires correctly on genuine 2-decimal-rounded
+# data, not just synthetic ties.
 _DURATION_LINE = re.compile(r"^\s*([\d.]+)s\s+(setup|call|teardown)\s+(.+?)\s*$")
 
 
 def parse_pytest_durations(text: str) -> dict[str, float]:
     """Parse a pytest `--durations=0 --durations-min=0.0` textual report,
-    summing setup+call+teardown per node id into one total-cost figure."""
+    summing setup+call+teardown per node id into one total-cost figure.
+    2-decimal precision only -- see module note above."""
     durations: dict[str, float] = {}
     for line in text.splitlines():
         m = _DURATION_LINE.match(line)
@@ -77,6 +103,67 @@ def parse_pytest_durations(text: str) -> dict[str, float]:
             continue
         dur, _phase, nodeid = m.groups()
         durations[nodeid] = durations.get(nodeid, 0.0) + float(dur)
+    return durations
+
+
+# ---------------------------------------------------------------------------
+# Python half — full-precision duration collection (SABLE-cmar4.7)
+# ---------------------------------------------------------------------------
+
+# Env var the inner pytest's duration-capture plugin reads to find its
+# output log; also set by run_python_suite_with_coverage below.
+_DURATION_LOG_ENV_VAR = "_COLUMBO_COST_PREFILTER_DURATION_LOG"
+
+_DURATION_PLUGIN_MODULE_NAME = "_columbo_cost_prefilter_duration_plugin"
+
+# A real pytest plugin, written to a temp dir and loaded into the inner run
+# by module name (see run_python_suite_with_coverage). pytest_runtest_
+# logreport fires once per phase (setup/call/teardown) with a TestReport
+# whose `.duration` is a full-precision float straight from the underlying
+# clock -- never rounded the way the textual `--durations` report is.
+# Verified against this repo's real corpus (bin/test_columbo_prefilter.py,
+# 58 tests, all "0.00s" in --durations text): 58/58 distinct full-precision
+# durations, ranging ~0.0002s-0.0025s.
+_DURATION_PLUGIN_SOURCE = '''\
+"""Auto-written by columbo-cost-prefilter.py (SABLE-cmar4.7) -- records
+each pytest phase's full-precision report.duration to a JSONL side
+channel, bypassing pytest's own 2-decimal-rounded --durations text."""
+import json
+import os
+
+_LOG_PATH = os.environ["{env_var}"]
+
+
+def pytest_runtest_logreport(report):
+    with open(_LOG_PATH, "a") as f:
+        f.write(json.dumps({{"nodeid": report.nodeid, "duration": report.duration}}) + "\\n")
+'''.format(env_var=_DURATION_LOG_ENV_VAR)
+
+
+def _write_duration_plugin(plugin_dir: Path) -> None:
+    """Write the duration-capture plugin source into plugin_dir so it is
+    importable by _DURATION_PLUGIN_MODULE_NAME once plugin_dir is placed
+    on the inner pytest's PYTHONPATH."""
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    plugin_file = plugin_dir / f"{_DURATION_PLUGIN_MODULE_NAME}.py"
+    plugin_file.write_text(_DURATION_PLUGIN_SOURCE)
+
+
+def parse_duration_log(log_path: Path) -> dict[str, float]:
+    """Parse the duration-capture plugin's JSONL log, summing setup+call+
+    teardown per nodeid into one total-cost figure -- same semantics as
+    parse_pytest_durations, at full float precision. Missing file (e.g. the
+    inner run never started) reads as no durations, consistent with
+    parse_pytest_durations("") == {}."""
+    durations: dict[str, float] = {}
+    if not log_path.exists():
+        return durations
+    for line in log_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        durations[rec["nodeid"]] = durations.get(rec["nodeid"], 0.0) + rec["duration"]
     return durations
 
 
@@ -218,9 +305,25 @@ def run_python_suite_with_coverage(
     collapsing silently into a normal-looking ({}, {}) return instead of
     surfacing. See InnerPytestRunFailed and _INNER_RUN_OK_EXIT_CODES above:
     a non-tolerated returncode now raises with the real stdout/stderr tail
-    instead of being swallowed."""
+    instead of being swallowed.
+
+    SABLE-cmar4.7: durations are read from the duration-capture plugin's
+    JSONL log (parse_duration_log), not from `--durations` text
+    (parse_pytest_durations) -- the text report hardcodes 2-decimal
+    precision and this repo's real bin/ corpus ties at that precision
+    (every test 0.00s), which made every test land in one duration band
+    and cross-test subsumption unconditionally empty. `--durations=0
+    --durations-min=0.0` is still passed so a failure's stdout tail
+    (InnerPytestRunFailed above) remains human-readable."""
     env = dict(os.environ)
     env["COVERAGE_FILE"] = str(coverage_data_file)
+    plugin_dir = Path(tempfile.mkdtemp(prefix="columbo-cost-prefilter-plugin-"))
+    _write_duration_plugin(plugin_dir)
+    duration_log = plugin_dir / "durations.jsonl"
+    env[_DURATION_LOG_ENV_VAR] = str(duration_log)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in [str(plugin_dir), env.get("PYTHONPATH", "")] if p
+    )
     args = [
         sys.executable, "-m", "pytest", *test_targets, "-q",
         "--durations=0", "--durations-min=0.0",
@@ -230,11 +333,12 @@ def run_python_suite_with_coverage(
         "-p", "no:cacheprovider",
         "-p", "no:pytest-testmon",
         "-p", "no:impact",
+        "-p", _DURATION_PLUGIN_MODULE_NAME,
     ]
     result = subprocess.run(args, cwd=repo_root, capture_output=True, text=True, env=env)
     if result.returncode not in _INNER_RUN_OK_EXIT_CODES:
         raise InnerPytestRunFailed(result.returncode, result.stdout, result.stderr)
-    durations = parse_pytest_durations(result.stdout)
+    durations = parse_duration_log(duration_log)
     coverage_map = load_python_test_coverage(coverage_data_file)
     return durations, coverage_map
 
@@ -337,15 +441,38 @@ def rank_shell_suites(durations: dict[str, float]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+def _degenerate_single_band(records: list[dict]) -> bool:
+    """True when every python test in `records` measured the identical
+    duration -- i.e. rank_python_tests produced exactly one duration band,
+    so no test has a strictly-faster peer and cross-test unique-coverage
+    subtraction never ran (SABLE-cmar4.7). An empty pruning_candidates list
+    in this state means "could not measure redundancy", not "measured and
+    found none" -- and the two must never render identically.
+
+    A single test (or zero tests) is NOT degenerate in this sense: there is
+    no tie to be ambiguous about when there is nothing to compare against."""
+    if len(records) <= 1:
+        return False
+    return len({r["duration"] for r in records}) <= 1
+
+
 def build_report(
     python_records: list[dict],
     shell_records: list[dict],
 ) -> dict:
+    python_section = {
+        "ranked": python_records,
+        "pruning_candidates": python_pruning_candidates(python_records),
+        "degenerate_single_band": _degenerate_single_band(python_records),
+    }
+    if python_section["degenerate_single_band"]:
+        python_section["note"] = (
+            f"no strictly-faster bands: {len(python_records)} test(s) share "
+            "a single duration band at the measurement floor; no "
+            "subsumption is computable from this run"
+        )
     return {
-        "python": {
-            "ranked": python_records,
-            "pruning_candidates": python_pruning_candidates(python_records),
-        },
+        "python": python_section,
         "shell": {
             "ranked": shell_records,
             "advisory_only": True,
@@ -370,6 +497,8 @@ def format_text(report: dict) -> str:
     lines.append(
         f"python pruning candidates: {len(report['python']['pruning_candidates'])}"
     )
+    if report["python"].get("degenerate_single_band"):
+        lines.append(f"NOTE: {report['python']['note']}")
     lines.append("")
     lines.append("== shell (suite granularity, duration-only, ADVISORY) ==")
     for r in report["shell"]["ranked"]:
