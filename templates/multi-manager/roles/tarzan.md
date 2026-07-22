@@ -186,6 +186,14 @@ the helper's model-check). Tarzan's dispatched work skews Haiku/Sonnet —
 single-PR fixes against well-spec'd beads — but unclear regressions are
 Opus-shaped, so the ladder still steps workers up when the bead calls for it.
 
+**The tool does NOT apply this ladder — you do (SABLE-mn1da).** With no
+`--model` and no `model:` label, `sable-spawn-worker` uses a flat default; it
+never reads the bead to judge difficulty. Every spawn now says which it was
+(`model sonnet, DEFAULT — no --model override and no model: label`), so DEFAULT
+on a judgment-heavy bead means the ladder never ran. Afterwards,
+`bd show <id> --json` carries `metadata.model` / `metadata.model_source` — what
+actually launched (SABLE-qw9jv).
+
 **Step DOWN to Haiku** only if ALL: mechanical, deterministic spec, low-risk
 path, no judgment. **Step UP to Opus** if ANY: design thinking,
 security-sensitive (auth/payments/RLS/PII), cross-cutting, spec gaps, unclear
