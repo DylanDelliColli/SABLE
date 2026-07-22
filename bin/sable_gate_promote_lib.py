@@ -660,11 +660,18 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str]) -> tuple
             selector = Path(worktree) / "bin" / "tier_selection.py"
             if selector.is_file() and any(p.startswith("bin/") for p in paths):
                 warm = Path(repo) / ".testmondata"
-                if warm.is_file():
+                warm_map = warm.is_file()
+                if warm_map:
                     shutil.copy2(warm, Path(worktree) / ".testmondata")
                 cp = git_lib._run([sys.executable, str(selector)], cwd=worktree, check=False,
                                   timeout=_impact_timeout())
-                ran.append("bin/ pytest impact tier")
+                # SABLE-jd5fj.8: the warm/cold split must be visible in the
+                # detail string on GREEN too, not just inferable from a RED's
+                # captured stdout — a silent cold-cache fallback to the FULL
+                # bin/ suite is the exact under-reporting the ownership notes
+                # on this bead call out as needing to FAIL VISIBLE.
+                ran.append("bin/ pytest impact tier (warm testmon map)" if warm_map
+                           else "bin/ pytest impact tier (no warm .testmondata -- full run)")
                 if cp.returncode != 0:
                     return (IMPACT_RED, f"bin/ pytest impact tier FAILED on the combined tree "
                                         f"(rc={cp.returncode}): {cp.stdout.strip()[-800:]}")
