@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""sable-contained — the containment check, with the argument order hardcoded
+(SABLE-gdp05).
+
+THE DEFECT THIS EXISTS FOR
+--------------------------
+SABLE-4344d prescribes `git merge-base --is-ancestor <sha> origin/<integration>`
+as THE containment check between serialized dispatches: "has <sha> landed on
+the integration branch". Both argument orders are valid git and both exit
+0/1 — nothing warns when they are swapped. Live incident, 2026-07-21 (optimus):
+the inverted form ("--is-ancestor origin/tmux-only <sha>") asks the OPPOSITE
+question ("is origin's tip an ancestor of <sha>"), returned false, and was
+read as "the work was lost" when it had in fact merged cleanly.
+
+The inversion has TWO directions and they are not equally dangerous:
+  - <sha> old, integration advanced since it merged -> inverted form says
+    NOT-CONTAINED for something that IS contained. A FALSE ALARM: harmless,
+    costs time (this is what hit optimus).
+  - <sha> is an unmerged branch freshly forked from the integration tip ->
+    inverted form says CONTAINED for something that is NOT. A FALSE GREEN: a
+    manager serializing dispatches into the same module gets a spurious
+    "go ahead" and dispatches into a live collision. This is the SABLE-5lli
+    class danger and the reason this wrapper exists rather than a comment.
+
+THE FIX: hardcode the order at the interface. This tool takes EXACTLY ONE
+positional argument (<sha>) and derives the integration branch itself
+(bin/sable_gate_git_lib.resolve_integration_branch — the same resolver the
+merge gate and pre-push hook use), so there is no second positional an
+inverted invocation could occupy: the bug is unrepresentable, not just
+discouraged.
+
+CROSS-CHECK: every call also runs a SECOND, independent method
+(`git log <integration>..<sha>` — non-empty means <sha> carries commits the
+integration branch doesn't have, i.e. NOT contained) and compares it against
+`merge-base --is-ancestor`. The two ask the containment question through
+different git plumbing; a real git repository can never make them disagree.
+If they do disagree here, that means one of the two invocations was built
+wrong (or something is scribbling on the environment), so the tool refuses to
+answer CONTAINED/NOT-CONTAINED at all and says so loudly instead.
+
+USAGE
+  sable-contained <sha>                             # CONTAINED / NOT-CONTAINED
+  sable-contained <sha> --repo <path>                # a git repo other than CWD
+  sable-contained <sha> --integration-branch <name>  # override auto-resolution
+  sable-contained <sha> --format=json                # machine-readable
+
+EXIT CODES
+  0  CONTAINED     — <sha> is merged into the integration branch.
+  1  NOT-CONTAINED — <sha> is NOT merged into the integration branch.
+  2  usage error
+  3  DISAGREEMENT  — the two methods gave different answers; treat as
+                     unresolved and verify by hand.
+  4  COULD NOT ASSESS — the integration branch/ref does not resolve, or both
+                     methods errored (bad ref, git failure).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+import sable_gate_git_lib as git_lib  # noqa: E402
+
+EXIT_CONTAINED = 0
+EXIT_NOT_CONTAINED = 1
+EXIT_USAGE = 2
+EXIT_DISAGREE = 3
+EXIT_UNRESOLVED = 4
+
+CONTAINED = "contained"
+NOT_CONTAINED = "not-contained"
+UNRESOLVED = "unresolved"
+DISAGREE = "disagree"
+
+
+# --- pure-ish helpers (unit-tested in bin/test_sable_contained.py) ----------
+
+def is_ancestor_verdict(rc: int) -> str:
+    """`git merge-base --is-ancestor <sha> <base>` exit code -> verdict.
+    0 = <sha> IS an ancestor of <base> (contained); 1 = it is NOT
+    (not-contained); anything else (bad ref, git failure) is UNRESOLVED and
+    must never be guessed at as either verdict."""
+    if rc == 0:
+        return CONTAINED
+    if rc == 1:
+        return NOT_CONTAINED
+    return UNRESOLVED
+
+
+def log_range_verdict(rc: int, stdout: str) -> str:
+    """`git log <base>..<sha>` -> verdict. A non-zero exit (bad ref) is
+    UNRESOLVED. Otherwise: an EMPTY range means every commit reachable from
+    <sha> is already reachable from <base> — contained. Any listed commit is
+    one <base> does not have — not contained."""
+    if rc != 0:
+        return UNRESOLVED
+    return CONTAINED if not stdout.strip() else NOT_CONTAINED
+
+
+def combine_verdicts(verdict_a: str, verdict_b: str) -> tuple[str, bool]:
+    """Reconcile the two independent methods into one answer plus an `agree`
+    flag. Both resolved and matching -> that verdict. Both resolved and
+    DIFFERENT -> DISAGREE (the cross-check firing) regardless of which side
+    said what. Anything else (either side UNRESOLVED) -> UNRESOLVED — a
+    single working method is not enough to answer on its own, since the
+    entire point of the second leg is that neither is trusted alone."""
+    agree = verdict_a == verdict_b
+    if agree and verdict_a != UNRESOLVED:
+        return verdict_a, True
+    if not agree and UNRESOLVED not in (verdict_a, verdict_b):
+        return DISAGREE, False
+    return UNRESOLVED, agree
+
+
+def render_report(sha: str, integration_ref: str, result: dict) -> str:
+    """The one-line human/hook answer. Every non-clean path names both
+    methods' verdicts so a reader never has to re-run the tool to see why."""
+    verdict = result["verdict"]
+    if verdict == CONTAINED:
+        return f"CONTAINED: {sha} is merged into {integration_ref}"
+    if verdict == NOT_CONTAINED:
+        return f"NOT-CONTAINED: {sha} is NOT merged into {integration_ref}"
+    if verdict == DISAGREE:
+        return (
+            f"DISAGREEMENT (SABLE-gdp05): containment of {sha} against "
+            f"{integration_ref} is UNRESOLVED — the two independent methods "
+            f"disagree (merge-base says {result['method_a']}, log-range says "
+            f"{result['method_b']}). Do not trust either; verify by hand."
+        )
+    return (
+        f"COULD NOT ASSESS: containment of {sha} against {integration_ref} "
+        f"could not be determined (merge-base={result['method_a']}, "
+        f"log-range={result['method_b']})"
+    )
+
+
+# --- process boundary --------------------------------------------------------
+
+def _git(repo: str, *args: str) -> subprocess.CompletedProcess:
+    """Never raises: a missing/misconfigured git is COULD-NOT-ASSESS here,
+    not a traceback. The tool binary is overridable via SABLE_CONTAINED_GIT
+    (mirrors sable_gate_git_lib's own SABLE_MG_GIT seam) so tests can inject
+    a faulty git and prove the cross-check actually fires — real git can
+    never disagree with itself, so seeding a fault is the only way to
+    exercise that leg at all."""
+    tool = os.environ.get("SABLE_CONTAINED_GIT", "git").split()
+    try:
+        return subprocess.run(tool + list(args), cwd=repo, text=True,
+                               capture_output=True)
+    except OSError as exc:
+        return subprocess.CompletedProcess(list(args), 127, "", str(exc))
+
+
+def resolve_integration_ref(repo: str, branch: str) -> str:
+    """The ref to judge ancestry against: prefer the PUBLISHED
+    origin/<branch> (what every worker/manager actually lands onto); fall
+    back to the local refs/heads/<branch> when the integration branch is not
+    (yet) published. "" when neither resolves."""
+    for ref in (f"origin/{branch}", branch):
+        cp = _git(repo, "rev-parse", "--verify", "--quiet", ref)
+        if cp.returncode == 0:
+            return ref
+    return ""
+
+
+def containment_verdict(repo: str, sha: str, integration_ref: str) -> dict:
+    """Runs BOTH independent methods and reconciles them. Returns
+    {verdict, method_a, method_b, agree}."""
+    a = _git(repo, "merge-base", "--is-ancestor", sha, integration_ref)
+    method_a = is_ancestor_verdict(a.returncode)
+
+    b = _git(repo, "log", f"{integration_ref}..{sha}")
+    method_b = log_range_verdict(b.returncode, b.stdout)
+
+    verdict, agree = combine_verdicts(method_a, method_b)
+    return {"verdict": verdict, "method_a": method_a, "method_b": method_b,
+            "agree": agree}
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sable-contained",
+        description="Is <sha> contained in this repo's integration branch? "
+                     "Hardcodes the merge-base --is-ancestor argument order "
+                     "so the inversion behind SABLE-gdp05 cannot be expressed.",
+    )
+    parser.add_argument("sha", help="commit-ish to test for containment")
+    parser.add_argument("--repo", default=os.getcwd(),
+                         help="git repo to check (default: CWD)")
+    parser.add_argument("--integration-branch", default=None,
+                         help="override the auto-resolved integration branch "
+                              "(default: resolve_integration_branch, same as "
+                              "the merge gate / pre-push hook)")
+    parser.add_argument("--format", choices=["text", "json"], default="text")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    repo = os.path.abspath(args.repo)
+    branch = args.integration_branch or git_lib.resolve_integration_branch(repo)
+    integration_ref = resolve_integration_ref(repo, branch)
+
+    if not integration_ref:
+        message = (f"COULD NOT ASSESS: integration branch '{branch}' does not "
+                   f"resolve (checked origin/{branch} and {branch}) in {repo}")
+        if args.format == "json":
+            print(json.dumps({
+                "sha": args.sha, "integration_branch": branch,
+                "integration_ref": None, "verdict": UNRESOLVED,
+                "method_a": UNRESOLVED, "method_b": UNRESOLVED,
+                "agree": False, "message": message,
+            }))
+        else:
+            print(message)
+        return EXIT_UNRESOLVED
+
+    result = containment_verdict(repo, args.sha, integration_ref)
+
+    if args.format == "json":
+        print(json.dumps({
+            "sha": args.sha,
+            "integration_branch": branch,
+            "integration_ref": integration_ref,
+            **result,
+        }))
+    else:
+        print(render_report(args.sha, integration_ref, result))
+
+    return {
+        CONTAINED: EXIT_CONTAINED,
+        NOT_CONTAINED: EXIT_NOT_CONTAINED,
+        DISAGREE: EXIT_DISAGREE,
+    }.get(result["verdict"], EXIT_UNRESOLVED)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
