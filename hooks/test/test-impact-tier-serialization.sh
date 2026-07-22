@@ -49,6 +49,13 @@
 #      full re-preview rather than promote or blame an author.
 #   S5 flock, not a pidfile: killing a holder mid-tier releases the seat. A ^C at
 #      the merge seat must not wedge every later promote.
+#   S7 SABLE-jd5fj.15 (the follow-up this bead's own docstring calls for):
+#      hermeticizing beats queueing. With the lock OFF (SABLE_MG_IMPACT_SERIALIZE=0)
+#      and the tier body replaced by a probe that actually touches bd + a
+#      HOME/settings-shaped path, two REAL concurrent tiers must land in
+#      DIFFERENT isolated HOME/BEADS_DB scratch dirs and neither may observe the
+#      other's write — the overlap S2 proves is dangerous here becomes provably
+#      harmless, which is the whole point of hermeticizing instead of queueing.
 #
 # The tier body is driven through the SABLE_MG_IMPACT override — a real
 # subprocess in a real checked-out combined-tree worktree that sleeps a known
@@ -76,8 +83,10 @@ source "$TESTDIR/lib-git-sandbox.sh"
 
 PASS=0
 FAIL=0
+SKIP=0
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
+skip() { SKIP=$((SKIP+1)); echo "SKIP: $1"; }
 
 [ -f "$LIB" ] || { echo "FATAL: missing $LIB"; exit 2; }
 
@@ -268,6 +277,158 @@ else
   fail "S6: every tier run cleans up its throwaway worktree" "$LEFT"
 fi
 
+# ==========================================================================
+# S7 — HERMETIC (SABLE-jd5fj.15): with serialization OFF, two REAL concurrent
+# tiers whose suite bodies actually touch bd + a HOME/settings-shaped path
+# must not observe each other's writes, and both must still go GREEN. This is
+# the claim jd5fj.13's own docstring makes: hermeticizing the shared state
+# kills the false-RED class outright, where the flock only ever queued
+# around it. Clean-room safe: the bd-touching assertions below SKIP loudly
+# (never a silent pass) when bd is not on PATH; the HOME/TMPDIR isolation
+# assertions need only bash + python3 and always run.
+# ==========================================================================
+MARKERS="$TMPROOT/markers"
+mkdir -p "$MARKERS"
+
+BDPROBE="$TMPROOT/bd-settings-probe.sh"
+cat > "$BDPROBE" <<PROBE
+#!/usr/bin/env bash
+set -uo pipefail
+TAG="run-\$\$"
+echo "\$HOME" > "$MARKERS/\$TAG.home"
+echo "\${BEADS_DB:-}" > "$MARKERS/\$TAG.beads_db"
+echo "\${TMPDIR:-}" > "$MARKERS/\$TAG.tmpdir"
+SETTINGS_PATH="\$HOME/.claude/settings.json"
+if [ -f "\$SETTINGS_PATH" ]; then
+  MODE="\$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[-3:])' "\$SETTINGS_PATH" 2>/dev/null)"
+  echo "present:\$SETTINGS_PATH:\$MODE" > "$MARKERS/\$TAG.settings"
+else
+  echo "absent::" > "$MARKERS/\$TAG.settings"
+fi
+if command -v bd >/dev/null 2>&1 && [ -n "\${BEADS_DB:-}" ]; then
+  # Create OWN bead, then wait — so a run whose write leaked into (or was
+  # visible from) the OTHER run's DB would already show it by the time each
+  # side snapshots its own listing below. The snapshot is taken and written
+  # to the marker HERE, before run_impact_tier's own cleanup rmtree's this
+  # DB out from under a post-hoc query.
+  bd create --sandbox -q --title="jd5fj15-hermetic-probe-\$TAG" >/dev/null 2>&1 || true
+  sleep 1.0
+  bd list --all --json > "$MARKERS/\$TAG.titles.json" 2>/dev/null || echo '[]' > "$MARKERS/\$TAG.titles.json"
+else
+  sleep 0.5
+fi
+exit 0
+PROBE
+chmod +x "$BDPROBE"
+
+run_pair "$TMPROOT/hermetic.jsonl" env SABLE_MG_IMPACT_SERIALIZE=0 \
+  SABLE_MG_IMPACT="bash $BDPROBE"
+
+if [ "$RC1" -eq 0 ] && [ "$RC2" -eq 0 ]; then
+  pass "S7: two REAL concurrent hermetic tiers (serialization OFF) both report GREEN"
+else
+  fail "S7: two REAL concurrent hermetic tiers (serialization OFF) both report GREEN" \
+       "rc1=$RC1 out1=$OUT1 rc2=$RC2 out2=$OUT2"
+fi
+
+mapfile -t HOME_MARKERS < <(find "$MARKERS" -maxdepth 1 -name '*.home' | sort)
+if [ "${#HOME_MARKERS[@]}" -eq 2 ]; then
+  pass "S7: exactly two hermetic probe runs recorded a HOME marker"
+  HOME_A="$(cat "${HOME_MARKERS[0]}")"; HOME_B="$(cat "${HOME_MARKERS[1]}")"
+  TAG_A="$(basename "${HOME_MARKERS[0]}" .home)"; TAG_B="$(basename "${HOME_MARKERS[1]}" .home)"
+
+  if [ -n "$HOME_A" ] && [ -n "$HOME_B" ] && [ "$HOME_A" != "$HOME_B" ]; then
+    pass "S7: the two concurrent tiers got DIFFERENT isolated HOME dirs"
+  else
+    fail "S7: the two concurrent tiers got DIFFERENT isolated HOME dirs" "A=$HOME_A B=$HOME_B"
+  fi
+  if [ "$HOME_A" != "$HOME" ] && [ "$HOME_B" != "$HOME" ]; then
+    pass "S7: neither tier ran under the REAL \$HOME"
+  else
+    fail "S7: neither tier ran under the REAL \$HOME" "real=$HOME A=$HOME_A B=$HOME_B"
+  fi
+
+  TMPDIR_A="$(cat "$MARKERS/$TAG_A.tmpdir" 2>/dev/null || echo "")"
+  TMPDIR_B="$(cat "$MARKERS/$TAG_B.tmpdir" 2>/dev/null || echo "")"
+  if [ -n "$TMPDIR_A" ] && [ -n "$TMPDIR_B" ] && [ "$TMPDIR_A" != "$TMPDIR_B" ]; then
+    pass "S7: the two concurrent tiers got DIFFERENT isolated TMPDIRs"
+  else
+    fail "S7: the two concurrent tiers got DIFFERENT isolated TMPDIRs" "A=$TMPDIR_A B=$TMPDIR_B"
+  fi
+
+  if [ -f "$HOME/.claude/settings.json" ]; then
+    SETTINGS_A="$(cat "$MARKERS/$TAG_A.settings" 2>/dev/null || echo "")"
+    SETTINGS_B="$(cat "$MARKERS/$TAG_B.settings" 2>/dev/null || echo "")"
+    IFS=: read -r STATUS_A SPATH_A SMODE_A <<< "$SETTINGS_A"
+    IFS=: read -r STATUS_B SPATH_B SMODE_B <<< "$SETTINGS_B"
+    # ATTRIBUTABLE, not just "a file exists somewhere": the path must be
+    # inside THIS run's own isolated HOME (A's prefix != B's prefix, and
+    # neither is the real live settings.json every run could otherwise see
+    # ambiently) — proven with the mkdtemp'd HOME_A/HOME_B captured above.
+    if [ "$STATUS_A" = "present" ] && [ "$STATUS_B" = "present" ] \
+       && [ "${SPATH_A#"$HOME_A"}" != "$SPATH_A" ] \
+       && [ "${SPATH_B#"$HOME_B"}" != "$SPATH_B" ] \
+       && [ "$SPATH_A" != "$SPATH_B" ]; then
+      pass "S7: each tier's settings.json VIEW lives INSIDE its own isolated HOME (A=$SPATH_A B=$SPATH_B)"
+    else
+      fail "S7: each tier's settings.json VIEW lives INSIDE its own isolated HOME" \
+           "status_A=$STATUS_A path_A=$SPATH_A home_A=$HOME_A; status_B=$STATUS_B path_B=$SPATH_B home_B=$HOME_B"
+    fi
+    # A copy, not the live file: mode 0444 additionally proves the isolated
+    # env made its OWN read-only copy rather than inheriting the real
+    # (differently-moded) ~/.claude/settings.json.
+    if [ "$SMODE_A" = "444" ] && [ "$SMODE_B" = "444" ]; then
+      pass "S7: both settings.json VIEWs are read-only copies (mode 444), not the live file"
+    else
+      fail "S7: both settings.json VIEWs are read-only copies (mode 444)" \
+           "mode_A=$SMODE_A mode_B=$SMODE_B"
+    fi
+  else
+    skip "S7: settings.json VIEW check — this host has no real ~/.claude/settings.json"
+  fi
+
+  if command -v bd >/dev/null 2>&1; then
+    BEADS_DB_A="$(cat "$MARKERS/$TAG_A.beads_db" 2>/dev/null || echo "")"
+    BEADS_DB_B="$(cat "$MARKERS/$TAG_B.beads_db" 2>/dev/null || echo "")"
+    if [ -n "$BEADS_DB_A" ] && [ -n "$BEADS_DB_B" ] && [ "$BEADS_DB_A" != "$BEADS_DB_B" ]; then
+      pass "S7: the two concurrent tiers got DIFFERENT isolated BEADS_DBs"
+    else
+      fail "S7: the two concurrent tiers got DIFFERENT isolated BEADS_DBs" \
+           "A=$BEADS_DB_A B=$BEADS_DB_B"
+    fi
+
+    TITLES_A="$(python3 -c 'import json,sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    data = []
+print(" ".join(b.get("title","") for b in data))' "$MARKERS/$TAG_A.titles.json" 2>/dev/null)"
+    TITLES_B="$(python3 -c 'import json,sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    data = []
+print(" ".join(b.get("title","") for b in data))' "$MARKERS/$TAG_B.titles.json" 2>/dev/null)"
+    if printf '%s' "$TITLES_A" | grep -q "$TAG_A" && ! printf '%s' "$TITLES_A" | grep -q "$TAG_B"; then
+      pass "S7: run A's isolated bd DB has its OWN probe bead and NOT run B's"
+    else
+      fail "S7: run A's isolated bd DB has its OWN probe bead and NOT run B's" \
+           "titles_A='$TITLES_A' (want $TAG_A, not $TAG_B)"
+    fi
+    if printf '%s' "$TITLES_B" | grep -q "$TAG_B" && ! printf '%s' "$TITLES_B" | grep -q "$TAG_A"; then
+      pass "S7: run B's isolated bd DB has its OWN probe bead and NOT run A's"
+    else
+      fail "S7: run B's isolated bd DB has its OWN probe bead and NOT run A's" \
+           "titles_B='$TITLES_B' (want $TAG_B, not $TAG_A)"
+    fi
+  else
+    skip "S7: bd-isolation assertions — bd not on PATH (clean-room) — HOME/TMPDIR isolation above still ran for real"
+  fi
+else
+  fail "S7: exactly two hermetic probe runs recorded a HOME marker" \
+       "found ${#HOME_MARKERS[@]}: ${HOME_MARKERS[*]:-<none>}"
+fi
+
 echo "----------------------------------------------------------------------"
-echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
+echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL | Skipped: $SKIP"
 [ "$FAIL" -eq 0 ]

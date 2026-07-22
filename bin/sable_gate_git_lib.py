@@ -28,9 +28,14 @@ def _tool(env_name: str, default: str) -> list[str]:
 
 
 def _run(argv: list[str], *, cwd: str, check: bool = True,
-         timeout: float | None = None) -> subprocess.CompletedProcess:
+         timeout: float | None = None,
+         env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """env=None (the default) inherits this process's environment exactly as
+    subprocess.run already does — passing it through is what lets a caller
+    (SABLE-jd5fj.15's per-run isolated env, e.g.) hand a MODIFIED environment
+    to one subprocess without every other _run call having to know about it."""
     return subprocess.run(
-        argv, cwd=cwd, text=True, check=check, timeout=timeout,
+        argv, cwd=cwd, text=True, check=check, timeout=timeout, env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
 
