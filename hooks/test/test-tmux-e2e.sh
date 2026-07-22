@@ -51,6 +51,21 @@ export SABLE_TMUX_SOCKET="$SOCK"
 export SABLE_TMUX_SESSION="$SESS"
 export SABLE_TMUX_PANE_CMD="bash --noprofile --norc"   # stand-in for claude
 
+# This suite is itself commonly run FROM a live SABLE agent pane (a worker or
+# manager dispatched to verify it), whose shell carries its own
+# CLAUDE_AGENT_NAME / SABLE_WORKER_PANE / CLAUDE_AGENT_ROLE / SABLE_BEAD.
+# bin/sable-tmux (step 1) and bin/sable-spawn-worker (step 3) both spawn tmux
+# panes as subprocesses of THIS shell, so an unscrubbed identity here leaks
+# into every pane they create -- e.g. sable-msg's from= resolution picking up
+# ambient SABLE_WORKER_PANE=1 and reporting from=worker instead of the
+# CLAUDE_AGENT_NAME override given at the call site, or a spawned worker pane
+# inheriting a contradicting identity that downstream checks then correctly
+# refuse. Scrub BEFORE the first pane-spawning call (SABLE-j3bi/SABLE-a9453) --
+# see hooks/test/lib-identity-isolation.sh for the confirmed mechanism and why
+# a later, call-site-only scrub cannot retroactively clean it up.
+source "$REPO/hooks/test/lib-identity-isolation.sh"
+sable_scrub_identity_env
+
 # 1) sable-tmux brings up the role panes -------------------------------------
 if python3 "$BIN/sable-tmux" --session "$SESS" >/dev/null 2>&1; then pass "sable-tmux launches"; else fail "sable-tmux launches"; fi
 sleep 0.6
