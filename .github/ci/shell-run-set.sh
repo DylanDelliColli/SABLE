@@ -9,6 +9,16 @@
 #               UNCLASSIFIED, then a totals line. Informational (exit 0) — kept
 #               for human-readable output — but it emits ::warning:: for any
 #               test file that is in neither list.
+#   --check-beads
+#               LOCAL-ONLY freshness gate (SABLE-wqe2e): resolves every bead id
+#               cited in an EXCLUDE entry's tracking tag against the real bd
+#               store and fails when a [blocked-by: ...] entry's blockers are
+#               ALL closed (the suite is a promotion candidate) or when any
+#               cited id does not resolve at all (typo'd/deleted). NOT wired
+#               into ci-verify — the clean room deliberately has no bd
+#               (SABLE-59zu) — so it prints an explicit SKIP and exits 0 there.
+#               See the EXCLUDE tracking-tag block below for the split of
+#               responsibility between this mode and --check.
 #   --check     the SAME classification as --manifest, but FAIL-CLOSED
 #               (SABLE-lcevs): exits non-zero if any suite is UNCLASSIFIED or
 #               any ALLOW/EXCLUDE entry is stale (listed but the file is
@@ -96,6 +106,7 @@ ALLOW=(
   test-sable-plan-tiers.sh
   test-sable-skills.sh
   test-sable-test.sh
+  test-sable-worker-status.sh
   test-script-dir-symlink.sh
   test-session-role-anchor.sh
   test-shell-run-set-strict.sh
@@ -111,6 +122,7 @@ ALLOW=(
   test-tier-budget-bead.sh
   test-tier-ssot.sh
   test-tier-ssot-consumers.sh
+  test-tmux-roles.sh
   test-tree-claim.sh
   test-worker-dispatch-template.sh
   test-worker-flag-done.sh
@@ -118,8 +130,8 @@ ALLOW=(
   test-worktree-placement-guard.sh
 )
 
-# --- Excluded from the run-set, each WITH reason + tracking bead. --------------
-# Widen ALLOW (move an entry here into ALLOW) as each of these lands.
+# --- Excluded from the run-set, each WITH reason + tracking tag. ---------------
+# Widen ALLOW (move an entry here into ALLOW) as each blocked-by entry lands.
 #
 # THAT WIDENING IS NOT AUTOMATIC, AND FORGETTING IT IS ITS OWN FALSE-GREEN
 # (SABLE-8onsf). --check's staleness guard only catches an entry naming a file
@@ -128,19 +140,46 @@ ALLOW=(
 # closed as verified-fixed with an 11/11 green run, so the fleet's delivery-
 # verification suite was ungated the entire time -- and when it later went red
 # for an unrelated reason (SABLE-4nr0q's ambient-identity leak) nothing caught
-# it. When you close an exclusion's tracking bead, move the entry in the SAME
-# change.
+# it.
+#
+# TRACKING TAG, REQUIRED IN EVERY REASON (SABLE-wqe2e). Prose is free-form, but
+# each reason must carry EXACTLY ONE machine-readable tag:
+#
+#   [blocked-by: <id> ...]  TEMPORARY. This suite would be in ALLOW if those
+#                           beads were fixed. When ALL of them close, the suite
+#                           must be promoted — --check-beads FAILS until it is.
+#   [permanent: <id> ...]   STRUCTURAL. The exclusion follows from how the
+#                           clean room is built (no bd, no ~/.claude install)
+#                           or from what the suite is, not from an open defect.
+#                           The cited beads are CONTEXT; their closing changes
+#                           nothing, so --check-beads does not flag them.
+#
+# The split exists because a naive "all cited beads closed => promote" rule
+# fires on 8 of the entries below on day one: they cite SABLE-59zu, which is
+# the CLOSED bead that DOCUMENTS the clean room's hermeticity, not a defect
+# awaiting a fix. A gate that is wrong 8 times out of 10 gets suppressed, which
+# is the same "train everyone to ignore it" failure this file already guards
+# against elsewhere. Tagging makes the author state which kind of citation it
+# is, once, at the point they know.
+#
+# WHO ENFORCES WHAT: --check (runs in the bd-less clean room) enforces only
+# WELL-FORMEDNESS — every reason carries exactly one tag with parseable bead
+# ids. --check-beads (local, where bd exists) enforces FRESHNESS against the
+# real store. Neither can do the other's job in the other's environment.
+#
+# THE RESIDUAL HOLE, stated rather than papered over: nothing stops an author
+# from writing [permanent: ...] on a genuinely temporary exclusion. That is a
+# deliberate-miscategorization risk, not the accidental-drift risk this bead
+# closes; drift is what actually happened to test-sable-msg.sh.
 declare -A EXCLUDE=(
-  [test-install.sh]="needs the ~/.claude SABLE install; clean-room has none (SABLE-59zu)"
-  [test-install-guard.sh]="needs the ~/.claude SABLE install (real bd on PATH) for its --from-here/main-checkout proceed cases; clean-room has none (SABLE-59zu)"
-  [test-install-agent-defs.sh]="needs the ~/.claude SABLE install (SABLE-59zu)"
-  [test-install-version-floor.sh]="needs the ~/.claude SABLE install (SABLE-59zu)"
-  [test-install-multi-manager.sh]="vacuous without bd — prints 'SKIP: bd not on PATH' and exits 0 (SABLE-59zu/SABLE-7v3z)"
-  [test-quickstart-project.sh]="needs the ~/.claude SABLE install (bd, sable-doctor) for its E2E bootstrap-flow cases; clean-room has none (SABLE-59zu, SABLE-vivm)"
-  [test-notes-clobber-guard-e2e.sh]="real-bd-only by construction — its whole claim is that CONTENT survives in a real bead store, and its negative control needs a real destructive bd write; in the clean room it would SKIP and count green (SABLE-sm269, SABLE-59zu). Run it locally against real bd; the decision logic is covered fail-closed by test-notes-clobber-guard.sh, which IS in the run-set."
-  [test-tmux-e2e.sh]="vacuous without bd — prints 'SKIP: bd not installed' and exits 0 (SABLE-59zu)"
-  [test-sable-worker-status.sh]="tracked-red under ambient tmux; green in clean-room but excluded pending confirmation (SABLE-b574)"
-  [test-tmux-roles.sh]="known false-positive (SABLE-p9ih)"
+  [test-install.sh]="needs the ~/.claude SABLE install; clean-room has none [permanent: SABLE-59zu]"
+  [test-install-guard.sh]="needs the ~/.claude SABLE install (real bd on PATH) for its --from-here/main-checkout proceed cases; clean-room has none [permanent: SABLE-59zu]"
+  [test-install-agent-defs.sh]="needs the ~/.claude SABLE install [permanent: SABLE-59zu]"
+  [test-install-version-floor.sh]="needs the ~/.claude SABLE install [permanent: SABLE-59zu]"
+  [test-install-multi-manager.sh]="vacuous without bd — prints 'SKIP: bd not on PATH' and exits 0 [permanent: SABLE-59zu SABLE-7v3z]"
+  [test-quickstart-project.sh]="needs the ~/.claude SABLE install (bd, sable-doctor) for its E2E bootstrap-flow cases; clean-room has none [permanent: SABLE-59zu SABLE-vivm]"
+  [test-notes-clobber-guard-e2e.sh]="real-bd-only by construction — its whole claim is that CONTENT survives in a real bead store, and its negative control needs a real destructive bd write; in the clean room it would SKIP and count green. Run it locally against real bd; the decision logic is covered fail-closed by test-notes-clobber-guard.sh, which IS in the run-set. [permanent: SABLE-sm269 SABLE-59zu]"
+  [test-tmux-e2e.sh]="vacuous without bd — prints 'SKIP: bd not installed' and exits 0 [permanent: SABLE-59zu]"
 )
 
 # --- Shell impact manifest (SABLE-cmar4.2) --------------------------------
@@ -184,6 +223,7 @@ declare -A COVERS=(
   [test-sable-mode.sh]="hooks/multi-manager/lib-mode-path.sh"
   [test-sable-msg.sh]="bin/sable-msg bin/sable_pane_lib.py"
   [test-sable-test.sh]="bin/sable-test"
+  [test-sable-worker-status.sh]="bin/sable-worker-status bin/sable_pane_lib.py"
   [test-session-role-anchor.sh]="hooks/multi-manager/session-role-anchor.sh"
   [test-snapshot-freeze.sh]="bin/sable-snapshot bin/sable_snapshot_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py"
   [test-tarzan-optimus-accept-contract.sh]="templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/optimus.md"
@@ -191,6 +231,7 @@ declare -A COVERS=(
   [test-tdd-gate.sh]="hooks/tdd-gate.sh"
   [test-tier-budget-bead.sh]="bin/sable_gate_budget_lib.py bin/sable_gate_promote_lib.py bin/sable-merge-gate"
   [test-tier-ssot-consumers.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
+  [test-tmux-roles.sh]="templates/multi-manager/roles/lincoln.md templates/multi-manager/roles/optimus.md templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/chuck.md templates/multi-manager/agents.yaml"
   [test-tree-claim.sh]="hooks/multi-manager/tree-claim.sh hooks/multi-manager/tree-claim-impl.sh"
   [test-worktree-placement-guard.sh]="hooks/multi-manager/worktree-placement-guard.sh"
 )
@@ -213,6 +254,128 @@ declare -A LIB_FANOUT=(
 )
 
 in_array() { local n="$1"; shift; local e; for e in "$@"; do [ "$e" = "$n" ] && return 0; done; return 1; }
+
+# --- EXCLUDE tracking-tag machinery (SABLE-wqe2e) ----------------------------
+
+# parse_exclude_tag <reason>: on success sets TAG_KIND (blocked-by|permanent)
+# and TAG_IDS (array of bead ids) and returns 0. Returns 1 — and sets
+# TAG_ERR to a human-readable cause — when the reason carries zero tags, more
+# than one, an empty id list, or an id that is not a bead-id shape. Pure bash
+# (BASH_REMATCH), so --check can call it in the bd-less clean room.
+parse_exclude_tag() {
+  local reason="$1" rest="$1" count=0 raw="" id
+  TAG_KIND=""; TAG_IDS=(); TAG_ERR=""
+  while [[ "$rest" =~ \[(blocked-by|permanent):([^]]*)\] ]]; do
+    count=$((count+1))
+    TAG_KIND="${BASH_REMATCH[1]}"
+    raw="${BASH_REMATCH[2]}"
+    rest="${rest#*"${BASH_REMATCH[0]}"}"
+  done
+  if [ "$count" -eq 0 ]; then
+    TAG_ERR="no tracking tag — every EXCLUDE reason needs exactly one [blocked-by: <id> ...] or [permanent: <id> ...]"
+    return 1
+  fi
+  if [ "$count" -gt 1 ]; then
+    TAG_ERR="$count tracking tags — exactly one is allowed, so the entry states ONE promotion rule"
+    return 1
+  fi
+  read -r -a TAG_IDS <<< "$raw"
+  if [ "${#TAG_IDS[@]}" -eq 0 ]; then
+    TAG_ERR="[$TAG_KIND:] tag cites no bead id"
+    return 1
+  fi
+  for id in "${TAG_IDS[@]}"; do
+    if ! [[ "$id" =~ ^[A-Za-z][A-Za-z0-9-]*-[A-Za-z0-9.]+$ ]]; then
+      TAG_ERR="'$id' is not a bead-id shape (expected e.g. SABLE-wqe2e or market-brief-package-ssd8)"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# check_exclude_tags: well-formedness pass over the whole EXCLUDE table.
+# Populates EXCLUDE_TAG_BAD with "<suite>: <cause>" lines. Needs no bd, so
+# this is the half of SABLE-wqe2e that the clean room CAN enforce.
+check_exclude_tags() {
+  EXCLUDE_TAG_BAD=()
+  local name
+  for name in "${!EXCLUDE[@]}"; do
+    parse_exclude_tag "${EXCLUDE[$name]}" || EXCLUDE_TAG_BAD+=("$name: $TAG_ERR")
+  done
+}
+
+# bead_status <id>: prints the bead's status, or the literal __unresolved__
+# when bd cannot resolve the id at all (typo'd, deleted, wrong tracker).
+bead_status() {
+  bd show "$1" --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("__unresolved__"); raise SystemExit
+if isinstance(d, dict):
+    d = [d]
+print((d[0].get("status") if d else None) or "__unresolved__")
+'
+}
+
+# check_beads: the FRESHNESS gate. Local-only by design — the ci-verify clean
+# room has no bd (SABLE-59zu), so there it prints an explicit SKIP and exits 0
+# rather than silently passing. A silent no-op here would reproduce exactly the
+# false-green SABLE-wqe2e closes.
+check_beads() {
+  if ! command -v bd >/dev/null 2>&1; then
+    echo "SKIP: bd not on PATH — shell-run-set --check-beads cannot resolve EXCLUDE tracking beads here."
+    echo "SKIP: this is expected in the ci-verify clean room (SABLE-59zu); freshness is a LOCAL gate and --check still enforces tag well-formedness (SABLE-wqe2e)."
+    return 0
+  fi
+
+  check_exclude_tags
+  if [ "${#EXCLUDE_TAG_BAD[@]}" -gt 0 ]; then
+    echo "::error::shell-run-set --check-beads: ${#EXCLUDE_TAG_BAD[@]} malformed EXCLUDE tracking tag(s):"
+    printf '  - %s\n' "${EXCLUDE_TAG_BAD[@]}"
+    return 1
+  fi
+
+  local name id status all_closed closed_ids
+  local promote=() unresolved=()
+  for name in "${!EXCLUDE[@]}"; do
+    parse_exclude_tag "${EXCLUDE[$name]}"
+    local kind="$TAG_KIND"
+    local ids=("${TAG_IDS[@]}")
+    all_closed=1; closed_ids=""
+    for id in "${ids[@]}"; do
+      status="$(bead_status "$id")"
+      case "$status" in
+        __unresolved__)
+          unresolved+=("$name — cites $id, which does not resolve in the bead store")
+          all_closed=0 ;;
+        closed)
+          closed_ids="$closed_ids $id" ;;
+        *)
+          all_closed=0 ;;
+      esac
+    done
+    if [ "$kind" = "blocked-by" ] && [ "$all_closed" -eq 1 ]; then
+      promote+=("$name — every blocker is CLOSED:$closed_ids")
+    fi
+  done
+
+  local rc=0
+  if [ "${#unresolved[@]}" -gt 0 ]; then
+    echo "::error::shell-run-set --check-beads: ${#unresolved[@]} EXCLUDE entr(y/ies) cite an UNRESOLVABLE bead id — the reason is unfalsifiable, so the exclusion is unaudited (SABLE-wqe2e):"
+    printf '  - %s\n' "${unresolved[@]}"
+    rc=1
+  fi
+  if [ "${#promote[@]}" -gt 0 ]; then
+    echo "::error::shell-run-set --check-beads: ${#promote[@]} EXCLUDE entr(y/ies) are PROMOTION CANDIDATES — the blockers they cite are all closed, so the suite is excluded on the authority of a defect that no longer exists (SABLE-wqe2e):"
+    printf '  - %s\n' "${promote[@]}"
+    echo "::error::remedy: run each named suite; if green, MOVE it from EXCLUDE into ALLOW (and give it a COVERS entry). This will not clear on re-run — the exclusion is stale, not flaky."
+    rc=1
+  fi
+  [ "$rc" -eq 0 ] && echo "shell-run-set --check-beads: ${#EXCLUDE[@]} exclusion(s) checked — 0 stale blockers, 0 unresolvable bead ids"
+  return "$rc"
+}
 
 # manifest_scan: the shared classification pass behind both --manifest and
 # --check. Prints the same RUN/EXCLUDED/UNCLASSIFIED lines and totals either
@@ -258,6 +421,16 @@ manifest() {
 # instead of a warning a branch can land while ignoring.
 check() {
   manifest_scan
+  # SABLE-wqe2e: the bd-free half of the exclusion-rot guard. --check runs in
+  # the clean room and cannot ask whether a tracking bead is CLOSED, but it CAN
+  # insist every exclusion states its promotion rule in a parseable form — which
+  # is what makes the local --check-beads freshness gate possible at all.
+  check_exclude_tags
+  if [ "${#EXCLUDE_TAG_BAD[@]}" -gt 0 ]; then
+    echo "::error::shell-run-set --check: ${#EXCLUDE_TAG_BAD[@]} EXCLUDE entr(y/ies) lack a well-formed tracking tag — each reason needs exactly one [blocked-by: <id> ...] or [permanent: <id> ...] so the local --check-beads gate can tell a temporary exclusion from a structural one (SABLE-wqe2e). This will not clear on re-run: the tag is missing, not flaky."
+    printf '  - %s\n' "${EXCLUDE_TAG_BAD[@]}"
+    return 1
+  fi
   local n_uncl="${#MANIFEST_UNCL_NAMES[@]}" n_stale="${#MANIFEST_STALE_NAMES[@]}"
   if [ "$n_uncl" -gt 0 ] || [ "$n_stale" -gt 0 ]; then
     echo "::error::shell-run-set --check: $n_uncl unclassified, $n_stale stale run-set entr(y/ies) — classify in ALLOW or EXCLUDE (with reason) before merge — this will not clear on re-run: the classification is missing, not flaky (SABLE-lcevs)"
@@ -297,9 +470,10 @@ run_set() {
 # as ci-verify.yml does) is unaffected — ${BASH_SOURCE[0]} == $0 only then.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   case "${1:-}" in
-    --manifest) manifest ;;
-    --check)    check ;;
-    --run)      run_set ;;
-    *) echo "usage: $0 --run | --manifest | --check" >&2; exit 2 ;;
+    --manifest)    manifest ;;
+    --check)       check ;;
+    --check-beads) check_beads ;;
+    --run)         run_set ;;
+    *) echo "usage: $0 --run | --manifest | --check | --check-beads" >&2; exit 2 ;;
   esac
 fi

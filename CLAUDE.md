@@ -70,6 +70,14 @@ python -m pytest bin/ -q -p no:cacheprovider
 bash .github/ci/shell-run-set.sh --check
 bash .github/ci/shell-run-set.sh --run
 
+# Exclusion-freshness gate (LOCAL ONLY — resolves each EXCLUDE entry's
+# tracking beads against the real bd store and fails when a [blocked-by: ...]
+# entry's blockers have all closed, i.e. the suite should be promoted to
+# ALLOW). It prints SKIP and exits 0 where bd is absent, which is why it is
+# NOT part of ci-verify's clean room (SABLE-59zu/SABLE-wqe2e). Runs
+# automatically pre-push via test-shell-run-set-strict.sh's case (f):
+bash .github/ci/shell-run-set.sh --check-beads
+
 # Fast local pre-push subset (also runs automatically via the pre-push git
 # hook through this repo's .sable testCommand=):
 bash .github/ci/test-tiers.sh --run pre_push
@@ -101,3 +109,10 @@ whatever stack the *downstream* project uses).
 - Every `hooks/test/test-*.sh` must be classified in
   `.github/ci/shell-run-set.sh`'s `ALLOW`/`EXCLUDE` lists or `--check` fails
   the gate — see that script's header for why.
+- Every `EXCLUDE` reason must carry exactly one tracking tag —
+  `[blocked-by: <bead-id> ...]` for a temporary exclusion (promote the suite
+  when those beads close) or `[permanent: <bead-id> ...]` for a structural one
+  (the clean room has no bd / no `~/.claude` install). `--check` enforces the
+  tag's shape; `--check-beads` enforces its freshness. Untagged reasons rot
+  invisibly, which is how a suite stayed ungated for two weeks after its
+  blocker was fixed (SABLE-wqe2e).
