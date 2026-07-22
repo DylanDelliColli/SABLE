@@ -22,6 +22,13 @@ directory name claims) and SNAPSHOT-STALE (the pin is honestly named but behind
 HEAD, so code merged since is merged-but-dark in this runtime). Doctor once
 checked only the first, and a pin three files behind HEAD read as "clean".
 
+Installed hook copies (top-level and multi-manager) get one more, independent
+check (SABLE-9rj7m): `bash -n` against the installed file itself, not just the
+repo source. A stale-but-parseable hook already shows up as ordinary DRIFT;
+SYNTAX-ERROR is the louder, separate fact that the installed copy is actually
+broken right now — truncated, half-written by an interrupted install, or
+hand-edited in place — something a hash mismatch alone doesn't say.
+
 Usage:
   sable-doctor [--repo DIR] [--claude-dir DIR | --project] [--json] [--quiet]
 
@@ -44,7 +51,7 @@ Usage:
                       answer "is commit X deployed?" without ad-hoc grepping.
 
 Exit status: 0 when every checked file matches the repo, 1 when any file is
-missing or drifted.
+missing, drifted, or fails to parse.
 """
 import argparse
 import hashlib
@@ -255,6 +262,25 @@ def _check_snapshot_pin(src: Path, dst: Path, cache: dict = None):
     snapshot_dir = target.parent
     sha = _snapshot_sha_from_target(target)
     if sha is None:
+        # Not a recognizable sable-<sha> snapshot directory name. Before
+        # calling this drift, check by CONTENT rather than path: an ordinary
+        # (never pinned) managed symlink still reads "clean" when it points
+        # into a different checkout of the same repo at the same commit --
+        # e.g. a sibling git worktree of the canonical install target, which
+        # is exactly what running sable-doctor from a worker worktree's own
+        # bin/sable-doctor (instead of the installed CLI entry point) looks
+        # like on disk (SABLE-8kpk8: real machine symlinks into a DIFFERENT
+        # worktree than the one --repo happened to resolve to were misread
+        # as generic DRIFT even though their content matched byte-for-byte).
+        # A path mismatch with matching content is un-pinned-and-current; a
+        # path mismatch with differing content is un-pinned-and-stale --
+        # ordinary "drift" either way, never silently "clean" when it isn't.
+        if target.is_file():
+            try:
+                if sha256(target) == sha256(src):
+                    return "clean", None
+            except OSError:
+                pass
         return "drift", None  # unrecognized target — its pinned sha can't be resolved
     repo_root = src.parent.parent
 
@@ -518,6 +544,38 @@ def _read_pin_marker(bin_dir: Path) -> set:
     return {line.strip() for line in marker.read_text(errors="replace").splitlines() if line.strip()}
 
 
+# Categories whose installed copy is a shell script sable-doctor can itself
+# parse-check (SABLE-9rj7m). hooks/test/test-tree-claim.sh's `bash -n`
+# tripwire only ever runs against the REPO copy, so a copy-installed hook
+# that is truncated, half-written by an interrupted install, or hand-edited
+# in place is invisible to every test in that suite — the live k2h0m
+# incident was a repo-copy corruption; an installed-copy version of it would
+# be strictly harder to notice. This is deliberately checked against the SAME
+# manifest entries the drift walk already built, not a second traversal.
+HOOK_SYNTAX_CATEGORIES = ("hooks", "multi-manager hooks")
+
+
+def _bash_syntax_error(path: Path):
+    """None if `path` parses cleanly under `bash -n`; otherwise bash's own
+    parse-error message. Installed hook copies are exact filesystem mirrors
+    of repo/hooks*/*.sh, so a file that fails to parse here got that way
+    through install/edit-in-place corruption, not ordinary source drift
+    (source drift — stale-but-valid content — is already caught, separately,
+    by the sha256 compare below; a syntax error is the louder fact and wins
+    when both are true, same precedent as tamper winning over staleness for
+    a snapshot pin above)."""
+    try:
+        proc = subprocess.run(
+            ["bash", "-n", str(path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=10,
+        )
+    except OSError as exc:
+        return f"could not run bash -n to check this file: {exc}"
+    if proc.returncode == 0:
+        return None
+    return proc.stderr.strip() or f"bash -n exited {proc.returncode} with no message"
+
+
 def check_manifest(entries):
     results = []
     pin_marker_cache = {}
@@ -550,6 +608,11 @@ def check_manifest(entries):
             status = "drift"
         else:
             status = "clean"
+        if category in HOOK_SYNTAX_CATEGORIES and dst.is_file():
+            syntax_error = _bash_syntax_error(dst)
+            if syntax_error is not None:
+                status = "syntax-error"
+                detail = syntax_error
         results.append({
             "category": category,
             "repo_path": str(src),
@@ -625,6 +688,7 @@ _STATUS_LABELS = {
     "snapshot-drift": "SNAPSHOT-DRIFT",
     "snapshot-stale": "SNAPSHOT-STALE",
     "broken-copy-pin": "BROKEN-COPY-PIN",
+    "syntax-error": "SYNTAX-ERROR",
 }
 
 # Statuses on a "pinned snapshot bins" entry where the ordinary `bash
@@ -748,7 +812,9 @@ def render_text_report(results, provenance=None, current_head=None, ancestor_ok=
         label = _STATUS_LABELS.get(r["status"], r["status"].upper())
         print(f"  {label} {r['installed_path']}")
         print(f"          repo: {r['repo_path']}")
-        if r.get("detail"):
+        if r["status"] == "syntax-error":
+            print(f"          parse error: {r['detail']}")
+        elif r.get("detail"):
             print(f"          drifted file(s): {r['detail']}")
     guarded_bad = [r for r in bad if r["category"] in GUARDED_CATEGORIES]
     snapshot_bad = [

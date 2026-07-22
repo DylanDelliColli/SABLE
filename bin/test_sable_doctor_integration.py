@@ -136,6 +136,31 @@ def test_stale_hook_missing_a_fix_is_detected(installed_claude_dir):
     assert "bash install.sh" in result.stdout
 
 
+# --- proactive check: syntax-broken installed hook copy (SABLE-9rj7m) --------
+# hooks/test/test-tree-claim.sh's `bash -n` tripwire only ever checks the REPO
+# copy — an installed copy that is truncated, half-written by an interrupted
+# install, or hand-edited in place is invisible to every test in that suite.
+# This proves the doctor-side check against a REAL install.sh install (real
+# `bash -n`, real subprocess, real filesystem), and that it discriminates
+# rather than always firing: corrupt -> reported, restore -> clean again.
+
+def test_installed_hook_syntax_error_is_detected_then_clears_on_restore(installed_claude_dir):
+    hook = installed_claude_dir / "hooks" / "tdd-evidence.sh"
+    original = hook.read_text()
+    hook.write_text('#!/bin/sh\necho "unterminated\n')  # real parse error, not mere drift
+
+    result = run_doctor(installed_claude_dir)
+    assert result.returncode == 1
+    assert "SYNTAX-ERROR" in result.stdout
+    assert "tdd-evidence.sh" in result.stdout
+
+    hook.write_text(original)
+    result = run_doctor(installed_claude_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "clean" in result.stdout
+    assert "SYNTAX-ERROR" not in result.stdout
+
+
 # --- real incident #2: installed role file missing a block -------------------
 
 def test_role_file_missing_a_block_is_detected(installed_claude_dir):
