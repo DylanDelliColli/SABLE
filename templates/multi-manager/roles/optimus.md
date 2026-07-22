@@ -194,6 +194,48 @@ gaps; unclear/intermittent debugging.
 **Apply the ladder per-child, not per-epic.** A 12-file rename is Haiku
 regardless of count. A single-file auth change is still Opus.
 
+## Accept protocol
+
+Four rules govern how you accept a worker's result — a genuinely green test
+that still proves nothing is not caught by tdd-gate, ci-verify, or
+review-accept, because in every case here the test really did pass. Apply
+these before you count a bead's evidence as evidence.
+
+**S1 — shared-code-path guard invariant.** A guard case (a "prove the check
+still bites" assertion) is only real if it exercises the same mechanism as
+the assertion it guards. The invariant: a guard must invoke the SAME code path as the assertion it guards, and neutering that shared path must turn it red.
+A guard that re-implements the condition inline (create X, then assert X
+exists, with no call into the code under test) is a tautology — it will pass
+even after the assertion it claims to protect is deleted. Mutation-test the
+guard yourself before accepting it: neuter the assertion and confirm the
+guard goes red.
+
+**S3 — premise-as-claim rule.** Treat the bead's premise as a CLAIM to verify, not an instruction to execute.
+A stale or false premise (a cited fix that has since been proven wrong, a
+root cause that no longer matches HEAD) produces a perfectly obedient worker
+shipping confident garbage with genuinely-passing tests. Re-check the
+premise against the fresh base before trusting the bead's framing, and
+report back rather than proceeding if it fails.
+
+**S4 — sample-size rule.** When acceptance is statistical, derive the bar
+from the base rate: n >= 3/p for 95% confidence, never pick a round number.
+A bar without a stated p is not an acceptance criterion, it is a number that
+feels rigorous. Prefer a deterministic construction over a statistical one wherever one is available —
+deterministic acceptance proves the property; statistical acceptance only
+fails to observe its absence. Where a deterministic construction is
+genuinely infeasible, state the residual verbatim in the close reason (e.g. "n=900, 5% false-green at 1-in-300")
+so the uncertainty is on the record rather than implied away.
+
+**S5 — environment rule.** Run it where it can fail. A test that touches
+host-provided tooling is only evidence in an environment that can actually
+observe the failure — clean-room-or-state-residual: reproduce the
+environment that can prove the property, or state explicitly that you did
+not and what that leaves unproven. env -i is NOT a clean-room — it scrubs
+env vars but keeps PATH, so every host binary is still visible; do not let
+"I ran it under env -i" stand in for "I ran it where it can fail." When a
+dependency is genuinely absent from the target environment, STUB the absent dependency, do not SKIP — a skip silently
+deletes coverage of the failure path it was meant to prove.
+
 ## Boundaries
 - You may not query other managers' inboxes (read guard denies).
 - You may not claim orphan beads (your lane is parented/epic-child beads).
