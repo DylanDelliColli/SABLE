@@ -61,12 +61,15 @@ Usage:
                      [--respawn] [--bundle id1,id2,...]
 
   --bundle (SABLE-q13h): sibling bead ids dispatched alongside <bead-id> into
-    the SAME worktree/branch. Every bundled bead is claimed up front (same as
-    the lead) and its full title/description is rendered into the dispatch
-    prompt itself, under a "Bundle contract" section binding the worker to
-    ALL listed beads regardless of claim state — replacing the prior prose
-    convention (a bundle spec left in the lead bead's notes/description) that
-    lost non-lead beads in 6+ documented dispatches.
+    the SAME worktree/branch. Every bundled bead is claimed (same as the lead)
+    and its full title/description is rendered into the dispatch prompt itself,
+    under a "Bundle contract" section binding the worker to ALL listed beads
+    regardless of claim state — replacing the prior prose convention (a bundle
+    spec left in the lead bead's notes/description) that lost non-lead beads in
+    6+ documented dispatches. SABLE-fz8kd: the bundle is the UNIT OF DISPATCH
+    for governance too — the overlap gate compares the union of the bundle's
+    declared footprints and never treats a sibling as foreign concurrent work,
+    and no bead is claimed until every gate that can refuse has passed.
 
 Env:
   SABLE_TMUX_SOCKET    tmux socket (-L) for isolation/tests
@@ -645,7 +648,8 @@ class OverlapVerdict(NamedTuple):
     warnings: tuple[str, ...] = ()
 
 
-def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> OverlapVerdict:
+def overlap_check(bead_id: str, bead: dict, in_progress: list[dict],
+                  bundle: list[dict] | tuple[dict, ...] = ()) -> OverlapVerdict:
     """SABLE-jd5fj.6: overlap flips from ADVISORY (re-homed pre-dispatch-overlap,
     SABLE-bldh.8) to a SCHEDULING CONSTRAINT. A declared footprint overlapping a
     DIFFERENT in-progress bead's footprint DENIES the dispatch. Two named outs:
@@ -664,8 +668,39 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> OverlapV
     jd5fj.6's constraint to nothing at all for that bead and leaving no event
     anywhere. The three outcomes below are now distinguished explicitly:
     declares-nothing releases, unreadable is 'could-not-assess', and a
-    partially-read footprint still checks but warns."""
+    partially-read footprint still checks but warns.
+
+    SABLE-fz8kd: *** THE UNIT OF COMPARISON IS THE DISPATCH, NOT THE LEAD BEAD.
+    *** `bundle` is the sibling beads (SABLE-q13h) this same invocation is
+    dispatching into the SAME worktree/branch. They are claimed up front, so by
+    the time this ran they appeared in `in_progress` as if they were foreign
+    concurrent work — and since the whole reason to bundle two beads is that
+    they touch the same files, a well-formed bundle DENIED ITSELF
+    deterministically. The lead was excluded by `oid == bead_id`; its siblings
+    were not.
+
+    Two things follow from "the dispatch is the unit", and they must move
+    together or the fix trades one silent failure for another:
+
+      (a) every dispatched id is excluded from the candidate list, and
+      (b) every dispatched bead's footprint is UNIONED into the footprint being
+          compared. Without (b), (a) would quietly SHRINK the constraint —
+          a sibling's files would stop being contended for at all, which is the
+          gate-that-can-never-deny failure and the exact mirror of SABLE-47try's
+          gate-that-can-never-release.
+
+    This is the shape hooks/multi-manager/pre-dispatch-overlap.sh (the shell
+    twin of this gate) has always had: it aggregates DISPATCH_IDS' footprints
+    and skips `bid in dispatch_ids`. The python side compared only the lead.
+    Serialize-with is unioned across the dispatch for the same reason — one
+    worker, one branch, one merge, so the grant belongs to the dispatch."""
+    dispatch = [bead, *bundle]
+    dispatch_ids = {bead_id} | {b.get("id", "") for b in bundle if b.get("id")}
+    ids_label = bead_id if not bundle else (
+        f"{bead_id} (+{', '.join(sorted(dispatch_ids - {bead_id}))})")
     mine = read_bead_footprint(bead)
+    for sibling in bundle:
+        mine = mine.merge(read_bead_footprint(sibling))
     if mine.could_not_assess:
         # SABLE-47try: the one outcome that must never be spelled 'none'. Every
         # declared-footprint source this bead offered was present and yielded
@@ -673,7 +708,7 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> OverlapV
         # BE EVALUATED. Reported as its own decision; the caller refuses.
         return OverlapVerdict(
             "could-not-assess",
-            f"OVERLAP CHECK COULD NOT RUN — {bead_id} declares a file footprint "
+            f"OVERLAP CHECK COULD NOT RUN — {ids_label} declares a file footprint "
             f"that could not be read ({', '.join(mine.unreadable_sources)} present "
             "but naming no path). The overlap SCHEDULING CONSTRAINT cannot be "
             "evaluated against an unreadable footprint, and a check that did not "
@@ -688,7 +723,7 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> OverlapV
         # Readable in at least one source, so the check CAN run — but on a
         # footprint that is possibly short. Degraded, not disabled: say so.
         warnings.append(
-            f"{bead_id}'s footprint was read from some sources but not all "
+            f"{ids_label}'s footprint was read from some sources but not all "
             f"({', '.join(mine.unreadable_sources)} present but naming no path) "
             "— the overlap check below ran against a possibly-incomplete footprint.")
     if not my_files:
@@ -700,7 +735,9 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> OverlapV
     hits: list[tuple[str, str, list[str]]] = []
     for other in in_progress:
         oid = other.get("id", "")
-        if not oid or oid == bead_id:
+        # SABLE-fz8kd: `dispatch_ids`, not just `bead_id` — a bundle sibling in
+        # this list is THIS invocation's own claim, not a competitor.
+        if not oid or oid in dispatch_ids:
             continue
         theirs = read_bead_footprint(other)
         if theirs.unreadable_sources:
@@ -720,7 +757,7 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> OverlapV
     if not hits:
         return OverlapVerdict("none", warnings=tuple(warnings))
 
-    serialize_with = bead_serialize_with(bead)
+    serialize_with = set().union(*(bead_serialize_with(b) for b in dispatch))
     uncovered = [h for h in hits if h[0] not in serialize_with]
     if uncovered:
         lines = "\n".join(
@@ -1751,21 +1788,15 @@ def main(argv: list[str] | None = None) -> int:
         if dep_warning:
             sys.stderr.write(f"sable-spawn-worker: {dep_warning}\n")
 
-        # SABLE-3eax (a): a respawn (REVISE / push-only close-out) may target a
-        # CLOSED bead — reopen it to in_progress FIRST, or the `bd update --claim`
-        # that follows a non-respawn path traceback-crashes on it AND the worker's
-        # own `bd close` has nothing to close. model-check above already ran, so
-        # keeping it active is preserved.
-        if ns.respawn and needs_reopen(bead):
-            reopen = subprocess.run(["bd", "update", bid, "--status", "in_progress"],
-                                    capture_output=True, text=True)
-            if reopen.returncode != 0:
-                sys.stderr.write(f"sable-spawn-worker: respawn could not reopen closed "
-                                 f"bead {bid}: {reopen.stderr.strip()}\n")
-                return 5
-            bead["status"] = "in_progress"
-            sys.stderr.write(f"sable-spawn-worker: respawn reopened closed bead {bid} "
-                             "-> in_progress\n")
+        # SABLE-fz8kd: THE STATUS WRITES ARE NOW BELOW, AFTER EVERY GATE THAT CAN
+        # REFUSE — see the "claims land here" block. The duplicate guard still
+        # has to judge a respawn AS IF the reopen had already happened: a CLOSED
+        # bead short-circuits already_in_progress_check to None, which would skip
+        # the live-pane refusal that is the whole point of the guard on a
+        # respawn. So the reopen's EFFECT is modelled locally here, on a copy,
+        # instead of by mutating the store ahead of a gate that may say no.
+        dup_bead = ({**bead, "status": "in_progress"}
+                    if (ns.respawn and needs_reopen(bead)) else bead)
 
         # SABLE-676c: an IN_PROGRESS bead is a duplicate ONLY when dispatch
         # evidence exists — a RUNNING worker pane tagged with the bead, or the
@@ -1777,7 +1808,7 @@ def main(argv: list[str] | None = None) -> int:
         tl = "" if ns.worktree else _repo_toplevel()
         wt_ev = worktree_dispatch_exists(
             prospective_worktree_path(bid, ns.scope, ns.worktree, tl))
-        dup_err = already_in_progress_check(bead, pane_ev, wt_ev, respawn=ns.respawn)
+        dup_err = already_in_progress_check(dup_bead, pane_ev, wt_ev, respawn=ns.respawn)
         if dup_err:
             sys.stderr.write(f"sable-spawn-worker: duplicate-dispatch blocked — {dup_err}\n")
             return 5
@@ -1789,7 +1820,53 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stderr.write(f"sable-spawn-worker: preempt blocked — {preempt_err}\n")
                 return 6
 
+        in_progress = parse_bead_list(_run(["bd", "list", "--status=in_progress", "--json"]))
+        overlap_verdict = overlap_check(bid, bead, in_progress, bundle_beads)
+        # SABLE-47try: surfaced on EVERY decision, before any of them is acted
+        # on — a degraded comparison must be visible even when it released.
+        for warning in overlap_verdict.warnings:
+            sys.stderr.write(f"sable-spawn-worker: OVERLAP CHECK DEGRADED — {warning}\n")
+        if overlap_verdict.decision == "could-not-assess":
+            # The deliberate caller decision the bead asks for, stated here
+            # rather than left to a fallthrough: a SCHEDULING CONSTRAINT that
+            # cannot be evaluated REFUSES. Distinct exit code from the overlap
+            # deny (11) so "the gate refused" and "the gate could not run" are
+            # never conflated downstream — which is the whole defect.
+            sys.stderr.write(
+                f"sable-spawn-worker: overlap-constraint could-not-assess — "
+                f"{overlap_verdict.message}\n")
+            return 12
+        if overlap_verdict.decision == "deny":
+            sys.stderr.write(
+                f"sable-spawn-worker: overlap-constraint blocked — {overlap_verdict.message}\n")
+            return 11
+
+        # --- claims land HERE (SABLE-fz8kd), below the LAST gate that can
+        # refuse. They used to run above the overlap check, so a denied dispatch
+        # left the lead AND every bundled sibling in_progress with no worker:
+        # invisible as available work, and counted as live concurrent work by
+        # every subsequent overlap check in the fleet — a refusal that makes the
+        # NEXT refusal more likely, against work that does not exist. The bead
+        # asks for ordering over rollback (a rollback path is itself rarely
+        # exercised), so no gate below this point writes a status it may have to
+        # take back. The one write that still precedes a failure is the
+        # dispatch-typing refusal further down, which leaves the claim
+        # DELIBERATELY and says so. ---
         if ns.respawn:
+            # SABLE-3eax (a): a respawn (REVISE / push-only close-out) may target
+            # a CLOSED bead — reopen it to in_progress, or the worker's own
+            # `bd close` has nothing to close. Judged for the duplicate guard
+            # above via `dup_bead`; performed here, once the gates have passed.
+            if needs_reopen(bead):
+                reopen = subprocess.run(["bd", "update", bid, "--status", "in_progress"],
+                                        capture_output=True, text=True)
+                if reopen.returncode != 0:
+                    sys.stderr.write(f"sable-spawn-worker: respawn could not reopen closed "
+                                     f"bead {bid}: {reopen.stderr.strip()}\n")
+                    return 5
+                bead["status"] = "in_progress"
+                sys.stderr.write(f"sable-spawn-worker: respawn reopened closed bead {bid} "
+                                 "-> in_progress\n")
             # SABLE-3eax (c): a respawn is a REVISE / push-only close-out of work
             # THIS lane already owns — never re-run `bd update --claim`. The bead
             # is (re)opened above and already assigned; real `bd --claim` errors
@@ -1832,26 +1909,6 @@ def main(argv: list[str] | None = None) -> int:
         if bundle_beads:
             claim_bundle_beads(bundle_beads, lane)
 
-        in_progress = parse_bead_list(_run(["bd", "list", "--status=in_progress", "--json"]))
-        overlap_verdict = overlap_check(bid, bead, in_progress)
-        # SABLE-47try: surfaced on EVERY decision, before any of them is acted
-        # on — a degraded comparison must be visible even when it released.
-        for warning in overlap_verdict.warnings:
-            sys.stderr.write(f"sable-spawn-worker: OVERLAP CHECK DEGRADED — {warning}\n")
-        if overlap_verdict.decision == "could-not-assess":
-            # The deliberate caller decision the bead asks for, stated here
-            # rather than left to a fallthrough: a SCHEDULING CONSTRAINT that
-            # cannot be evaluated REFUSES. Distinct exit code from the overlap
-            # deny (11) so "the gate refused" and "the gate could not run" are
-            # never conflated downstream — which is the whole defect.
-            sys.stderr.write(
-                f"sable-spawn-worker: overlap-constraint could-not-assess — "
-                f"{overlap_verdict.message}\n")
-            return 12
-        if overlap_verdict.decision == "deny":
-            sys.stderr.write(
-                f"sable-spawn-worker: overlap-constraint blocked — {overlap_verdict.message}\n")
-            return 11
         if overlap_verdict.decision == "allow":
             for partner in overlap_verdict.tagged_ids:
                 tag_serialize_with(bid, partner)

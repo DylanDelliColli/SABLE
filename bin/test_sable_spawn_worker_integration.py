@@ -12,6 +12,7 @@ is written, and the read-instruction is delivered into the pane.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -1883,6 +1884,189 @@ def test_skip_governance_dispatch_does_not_stamp_model_metadata(sock):
         assert _model_meta(env, bead_id) == {}
         assert "model=sonnet model_source=default" in r.stderr
         assert "not stamped: --skip-governance" in r.stderr
+
+
+# --- SABLE-fz8kd: a bundled dispatch must not deny itself, and a refused -----
+# --- dispatch must claim nothing. REAL bd store, REAL tmux, REAL CLI. --------
+#
+# *** WHICH FILE IS UNDER TEST ***
+# `sable-spawn-worker` on PATH is a symlink into the SHARED main checkout, NOT
+# into this worktree:
+#     /home/ddc/.local/bin/sable-spawn-worker -> <main checkout>/bin/sable-spawn-worker
+# So anything that invokes the tool BY NAME — a bare `sable-spawn-worker`, a
+# subprocess call with no explicit path, a helper that shells out — runs the
+# INSTALLED copy and silently measures a file nobody in this branch edited.
+# Both failure directions are quiet: a pre-fix demonstration can pass spuriously,
+# and a post-fix green can be green about code that was never written. Every test
+# in this module therefore runs `python3 <absolute BIN>`, and _assert_bin_is_this_branch
+# states, in the test output, exactly which file was executed.
+#
+# The positive leg below is additionally SELF-CERTIFYING: a bundle whose members
+# share a declared path CANNOT dispatch under the installed (unfixed) copy — it
+# denies itself, which is this bead. A green there is only reachable from the
+# branch artifact.
+
+
+def _assert_bin_is_this_branch() -> Path:
+    """Resolve, PRINT, and assert the tool actually under test. A test that
+    cannot say which file it exercised cannot support a green claim."""
+    resolved = BIN.resolve()
+    print(f"[SABLE-fz8kd] tool under test: {resolved}")
+    installed = shutil.which("sable-spawn-worker")
+    if installed:
+        print(f"[SABLE-fz8kd] installed on PATH:  {Path(installed).resolve()}")
+    assert resolved.parent == Path(__file__).resolve().parent, (
+        f"tool under test {resolved} is not this branch's copy "
+        f"(expected alongside {__file__})")
+    assert resolved.is_file()
+    return resolved
+
+
+def test_the_tool_under_test_is_this_branch_not_the_installed_symlink():
+    """Guard for every other test here: fail LOUD if the absolute-path binding
+    ever regresses to a PATH lookup. Asserts both that BIN is this worktree's
+    copy and that no test in this module spells a bare `sable-spawn-worker`
+    invocation."""
+    _assert_bin_is_this_branch()
+    source = Path(__file__).read_text()
+    by_name = re.findall(
+        r"(?:run|Popen|check_output|check_call)\(\s*\[[^\]]*[\"']sable-spawn-worker[\"']",
+        source)
+    assert by_name == [], (
+        "a test invokes the tool by NAME — that resolves through PATH to the "
+        f"installed copy, not this branch: {by_name}")
+    assert "str(BIN)" in source
+
+
+@pytest.fixture()
+def real_bd_repo():
+    """A REAL bd store — embedded dolt, the same backend the fleet runs — in a
+    throwaway git repo. Not a stand-in CLI and not the project database: the
+    dispatch-prep brief for this bead is explicit that stray scratch beads feed
+    the very overlap_check under repair, so nothing here is allowed to touch
+    the project's beads. The whole store dies with the temp dir."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        init = subprocess.run(["bd", "init", "--prefix", "FZTEST"],
+                              cwd=repo, capture_output=True, text=True)
+        if init.returncode != 0:
+            pytest.skip(f"could not create an isolated bd store: {init.stderr[-400:]}")
+        yield repo
+
+
+def _bd(repo: Path, *args) -> str:
+    r = subprocess.run(["bd", *args], cwd=repo, capture_output=True, text=True)
+    assert r.returncode == 0, f"bd {' '.join(args)} failed: {r.stderr}"
+    return r.stdout
+
+
+def _new_bead(repo: Path, title: str, description: str) -> str:
+    out = _bd(repo, "create", f"--title={title}", f"--description={description}",
+              "--type=task", "-p", "2", "--json")
+    try:
+        return json.loads(out)["id"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        # older bd prints "✓ Created issue: <id> — <title>"
+        for tok in out.replace("—", " ").split():
+            if tok.startswith("FZTEST-"):
+                return tok
+        raise AssertionError(f"could not read a bead id out of: {out!r}")
+
+
+def _status(repo: Path, bead_id: str) -> str:
+    return json.loads(_bd(repo, "show", bead_id, "--json"))[0]["status"]
+
+
+def _real_bd_env(sock, dd):
+    env = {
+        **_clean_env(),
+        "SABLE_MAX_LOAD_PER_CORE": "0",
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_SESSION": "sable",
+        "SABLE_WORKER_CMD": "bash --noprofile --norc",
+        "SABLE_DISPATCH_DIR": dd,
+        "SABLE_DISPATCH_READY_TIMEOUT": "0",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+    }
+    env.pop("CLAUDE_AGENT_NAME", None)  # empty lane -> preempt is a no-op
+    return env
+
+
+_FOOTPRINT = "Story.\n\n## File footprint\nshared_target.py\n\n## Test spec\nx"
+
+
+def test_real_bd_bundle_sharing_a_declared_path_dispatches(sock, real_bd_repo):
+    """THE BEAD, end to end. Two REAL beads in a REAL bd store, both declaring
+    shared_target.py — which is the ordinary reason to bundle them into one
+    worktree — dispatched as one bundle through the real CLI. Before the fix the
+    invocation claimed the sibling, then denied itself against that claim:
+
+        - SABLE-bjabn (…, in-progress): hooks/test/test-tier-red-capture.sh
+        SCHEDULING CONSTRAINT: dispatch denied.
+
+    Now it spawns, and BOTH beads end up in_progress WITH a worker."""
+    _assert_bin_is_this_branch()
+    lead = _new_bead(real_bd_repo, "bundle lead", _FOOTPRINT)
+    sib = _new_bead(real_bd_repo, "bundle sibling", _FOOTPRINT)
+
+    with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as wt:
+        r = subprocess.run(
+            ["python3", str(BIN), lead, "--bundle", sib,
+             "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=_real_bd_env(sock, dd),
+            cwd=real_bd_repo,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "SCHEDULING CONSTRAINT" not in r.stderr
+        time.sleep(0.6)
+
+        # a worker pane really exists for the lead bead
+        assert len(_worker_panes(sock, lead)) == 1
+        # and the dispatch prompt binds the worker to BOTH beads
+        assert sib in (Path(dd) / f"{lead}.md").read_text()
+
+    # both beads are claimed in the REAL store, matching the pane that exists
+    assert _status(real_bd_repo, lead) == "in_progress"
+    assert _status(real_bd_repo, sib) == "in_progress"
+
+
+def test_real_bd_foreign_overlap_denies_and_leaves_the_bundle_open(sock, real_bd_repo):
+    """COMPLEMENT LEG, and it carries both halves of the acceptance criteria.
+
+    (1) The constraint is still REAL: a genuinely FOREIGN in-progress bead
+        holding shared_target.py denies the same bundle that just dispatched
+        cleanly above. Without this, the fix is a gate that can never deny.
+    (2) Defect 2: the refusal leaves NOTHING claimed. Pre-fix, both bundle beads
+        sat in_progress with no worker — invisible as available work and counted
+        as live concurrent work by every later overlap check in the fleet, so a
+        denied dispatch made the NEXT dispatch more likely to be denied against
+        work that does not exist."""
+    _assert_bin_is_this_branch()
+    foreign = _new_bead(real_bd_repo, "foreign holder", "Someone else's work.")
+    _bd(real_bd_repo, "update", foreign, "--status", "in_progress")
+    _bd(real_bd_repo, "update", foreign, "--set-metadata",
+        "wip_claims=shared_target.py")
+    lead = _new_bead(real_bd_repo, "bundle lead 2", _FOOTPRINT)
+    sib = _new_bead(real_bd_repo, "bundle sibling 2", _FOOTPRINT)
+
+    with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as wt:
+        r = subprocess.run(
+            ["python3", str(BIN), lead, "--bundle", sib,
+             "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=_real_bd_env(sock, dd),
+            cwd=real_bd_repo,
+        )
+        assert r.returncode == 11, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "OVERLAP DETECTED" in r.stderr
+        assert foreign in r.stderr        # the refusal names the real competitor
+        assert sib not in r.stderr.split("OVERLAP DETECTED")[1].split("SCHEDULING")[0]
+        assert _worker_panes(sock, lead) == []
+
+    # THE POINT: a dispatch that produced no worker claimed no bead.
+    assert _status(real_bd_repo, lead) == "open"
+    assert _status(real_bd_repo, sib) == "open"
 
 
 if __name__ == "__main__":
