@@ -137,6 +137,26 @@ def test_report_is_bounded_but_bound_is_announced(isolated_lock, tmp_path):
         f"the report was bounded but never says so: {detail!r}")
 
 
+def test_report_names_which_anchor_rule_matched(isolated_lock, tmp_path):
+    """SABLE-1u6dr: the report must say WHICH anchor rule picked the excerpt
+    start, through the real end-to-end path (run_impact_tier), not just the
+    extracted helper — a bad anchor is only diagnosable at the seat if the
+    name actually reaches the propagated report."""
+    padding = "P" * 5000
+    suite = (
+        "#!/bin/sh\n"
+        f"echo 'FAIL: {MARKER}'\n"
+        f"echo '  {DETAIL_LINE}'\n"
+        f"echo '{padding}'\n"
+        "exit 1\n"
+    )
+    repo, sha = _real_repo_with_shell_impact_tier(tmp_path, suite)
+    outcome, detail = promote_lib.run_impact_tier(repo, sha, ["hooks/test/test-red-marker.sh"])
+    assert outcome == promote_lib.IMPACT_RED, detail
+    assert "[anchor: strict-fail-line]" in detail, (
+        f"the report never names which anchor rule matched: {detail!r}")
+
+
 # --------------------------------------------------------------------------
 # Direct coverage of the extracted helper — fast, no subprocess, pins the
 # anchoring/announcement logic the tests above exercise end-to-end.
@@ -152,7 +172,8 @@ def test_bounded_failure_detail_anchors_on_the_first_fail_marker():
     out = promote_lib._bounded_failure_detail(text)
     assert f"FAIL: {MARKER}" in out
     assert DETAIL_LINE in out
-    assert not out.startswith("noise"), "the leading noise before the marker should be elided"
+    assert "noise" not in out, "the leading noise before the marker should be elided"
+    assert "[anchor: strict-fail-line]" in out
 
 
 def test_bounded_failure_detail_falls_back_to_the_head_with_no_marker():
@@ -162,4 +183,51 @@ def test_bounded_failure_detail_falls_back_to_the_head_with_no_marker():
     text = "Z" * 9000
     out = promote_lib._bounded_failure_detail(text)
     assert "truncat" in out.lower()
-    assert out.startswith("Z")
+    assert "[anchor: no-marker-found]" in out
+    assert out.split("\n", 1)[1].startswith("Z")
+
+
+def test_anchor_skips_a_passing_line_that_merely_mentions_failure():
+    """PLANT (SABLE-1u6dr): a PASS line that merely MENTIONS "failure" in its
+    own message — the exact shape hooks/test/test-pre-dispatch-preempt.sh and
+    hooks/test/test-coverage-floor-gate.sh both print in the wild — must not
+    displace the real failure region. Against the pre-fix single loose regex
+    (any line containing FAIL/FAILED/FAILURE anywhere), the anchor lands on
+    this PASS line at position 0, and the 4000-char bound then truncates
+    5000+ characters before ever reaching the real FAIL marker — this
+    assertion fails against that code."""
+    padding = "P" * 5000
+    text = (
+        "PASS: SABLE-mji: bd failure fails open (rc=0, silent allow)\n"
+        + padding + "\n"
+        + f"FAIL: {MARKER}\n  {DETAIL_LINE}\n"
+    )
+    out = promote_lib._bounded_failure_detail(text)
+    assert f"FAIL: {MARKER}" in out, f"the real FAIL marker did not survive: {out!r}"
+    assert DETAIL_LINE in out, f"the failure's detail line did not survive: {out!r}"
+    assert "[anchor: strict-fail-line]" in out
+
+
+def test_anchor_still_finds_a_loose_form_failure_with_no_strict_marker():
+    """Negative control, load-bearing: a suite whose ONLY failure indication
+    is a loose-form mention (no line starting with FAIL/FAILED/FAILURE at
+    column 0) must still anchor on it, not fall back to the head — otherwise
+    a fix that only accepts the strict fail() form silently regresses every
+    suite that reports failures without that exact convention."""
+    padding = "P" * 5000
+    text = (
+        "noise before\n" * 5
+        + f"  something went wrong: FAILURE detected in {MARKER}\n  {DETAIL_LINE}\n"
+        + padding
+    )
+    out = promote_lib._bounded_failure_detail(text)
+    assert f"FAILURE detected in {MARKER}" in out, f"the loose-form marker did not survive: {out!r}"
+    assert DETAIL_LINE in out
+    assert "noise before" not in out
+    assert "[anchor: loose-failure-mention]" in out
+
+
+def test_bounded_failure_detail_names_the_anchor_rule_used():
+    text = f"FAIL: {MARKER}\n" + ("Z" * 5000)
+    out = promote_lib._bounded_failure_detail(text)
+    assert "[anchor: strict-fail-line]" in out
