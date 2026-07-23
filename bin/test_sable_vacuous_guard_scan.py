@@ -20,6 +20,19 @@ when that commit is reachable, and SKIPS LOUDLY (never silently, never as a
 false pass/fail) when it isn't — e.g. in a ci-verify clean-room checkout
 that hasn't fetched that history.
 
+SLICE-THEN-ASSERT (SABLE-p9n7k): a second detector shape, added to the same
+scanner rather than a new tool. Flags a collection built by bash array
+slicing (`TARGET=("${SRC[@]:OFF:CNT}")`) or a filtered `mapfile` read, then
+consumed by a `for ITEM in "${TARGET[@]}"; do ... done` loop that asserts on
+each item with no `${#TARGET[@]}`-style non-emptiness guard anywhere in
+between. This is the bash transliteration of the real SABLE-pk15w defect: a
+`lead = samples[:n]` slice asserted over with no length guard, which passed
+44/44 vacuously on a fast CI runner (the slice landed empty) and produced a
+manager SIGN-OFF rather than a caught bug. An E2E integration case runs the
+real scanner binary as a subprocess against a vendored fixture file
+reproducing that exact empty-lead-slice shape, asserting the correct
+file:line.
+
 Run with:
 
   python3 bin/test_sable_vacuous_guard_scan.py
@@ -32,6 +45,7 @@ from __future__ import annotations
 import importlib.util
 import subprocess
 import sys
+import tempfile
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -139,6 +153,43 @@ if [ ! -e "$RA/agents/optimus.md" ]; then pass "retired agent removed"; else fai
 if [ -e "$RA/agents/my-custom-agent.md" ]; then pass "custom agent survives"; else fail "custom agent survives"; fi
 """
 
+# The bash transliteration of the real SABLE-pk15w defect: a `lead` window is
+# sliced off a sampled array, then asserted over item-by-item with NO check
+# that the slice actually contains anything. On a host where the slice
+# happens to land empty, the `for` loop runs zero times and every assertion
+# inside it is skipped — same green as a real pass, per the summary-line
+# invisibility this bead is filed against.
+SLICE_THEN_ASSERT_BLOCK = """\
+mapfile -t SAMPLES < <(printf '%s\\n' clear clear busy busy clear)
+LEAD=("${SAMPLES[@]:0:3}")
+for s in "${LEAD[@]}"; do
+  if [ "$s" = "busy" ]; then
+    fail "no busy sample in lead window"
+  else
+    pass "lead window sample is clear"
+  fi
+done
+"""
+SLICE_ASSERT_LOOP_LINE = 3  # 1-indexed line within SLICE_THEN_ASSERT_BLOCK
+
+# Identical shape, but with an explicit non-emptiness guard before the loop
+# (the repo's own escape, mirroring the real `[ "${#HOME_MARKERS[@]}" -eq 2 ]`
+# guard at hooks/test/test-impact-tier-serialization.sh:335) — must NOT flag.
+SLICE_WITH_GUARD_BLOCK = """\
+mapfile -t SAMPLES < <(printf '%s\\n' clear clear busy busy clear)
+LEAD=("${SAMPLES[@]:0:3}")
+if [ "${#LEAD[@]}" -eq 0 ]; then
+  fail "lead window unexpectedly empty"
+fi
+for s in "${LEAD[@]}"; do
+  if [ "$s" = "busy" ]; then
+    fail "no busy sample in lead window"
+  else
+    pass "lead window sample is clear"
+  fi
+done
+"""
+
 
 # ---------------------------------------------------------------------------
 # UNIT
@@ -184,6 +235,27 @@ def test_blank_and_comment_lines_do_not_break_adjacency():
     assert_eq("blank/comment-tolerant adjacency still flags", len(violations), 1)
 
 
+def test_flags_slice_then_assert_without_nonempty_guard():
+    violations = vg.scan_bash_text(SLICE_THEN_ASSERT_BLOCK, "f.sh")
+    assert_eq("flags exactly one slice-then-assert violation", len(violations), 1)
+    if violations:
+        assert_eq("flags the for-loop line", violations[0].line, SLICE_ASSERT_LOOP_LINE)
+        assert_true(
+            "finding names the non-empty guard form",
+            "non-empty" in violations[0].fix,
+            detail=f"fix={violations[0].fix!r}",
+        )
+
+
+def test_does_not_flag_slice_with_nonempty_guard():
+    # Negative control (SABLE-rhsuj false-positive law): the identical slice
+    # shape, plus an explicit `${#LEAD[@]}` guard, must NOT be flagged — a
+    # matcher that flags every slice regardless of guarding is noise, not a
+    # detector.
+    violations = vg.scan_bash_text(SLICE_WITH_GUARD_BLOCK, "f.sh")
+    assert_eq("guarded slice produces no violations", violations, [])
+
+
 # ---------------------------------------------------------------------------
 # BITE-PROOF
 # ---------------------------------------------------------------------------
@@ -200,6 +272,26 @@ def test_bite_proof_neutered_matcher_goes_red():
     # test_flags_real_i8kv_shape, not incidental.
     assert_eq("neutered matcher misses the i8kv guard (bite-proof)", neutered, [])
     real = vg.scan_bash_text(I8KV_BLOCK, "f.sh")
+    assert_true("unneutered matcher still flags it", len(real) == 1)
+
+
+def test_bite_proof_neutered_empty_slice_matcher_goes_red():
+    # Mirrors test_bite_proof_neutered_matcher_goes_red above, for form 2:
+    # neuter the assert-call detector the slice-then-assert pass depends on
+    # and confirm the proven SLICE_THEN_ASSERT_BLOCK case stops being
+    # flagged — proving the flag depends on the matcher, not a fixture that
+    # would pass regardless.
+    original = vg._has_assert_call
+    vg._has_assert_call = lambda code: False
+    try:
+        neutered = vg.scan_bash_text(SLICE_THEN_ASSERT_BLOCK, "f.sh")
+    finally:
+        vg._has_assert_call = original
+    assert_eq(
+        "neutered assert-call matcher misses the slice-then-assert case (bite-proof)",
+        neutered, [],
+    )
+    real = vg.scan_bash_text(SLICE_THEN_ASSERT_BLOCK, "f.sh")
     assert_true("unneutered matcher still flags it", len(real) == 1)
 
 
@@ -272,6 +364,31 @@ def test_integration_does_not_flag_head_shared_helper():
     )
 
 
+def test_integration_real_binary_flags_vendored_pk15w_fixture():
+    # Runs the REAL scanner binary (subprocess, not a direct function call)
+    # against a vendored fixture file reproducing the pk15w empty-lead-slice
+    # shape, and checks the reported file:line — the strongest form of this
+    # bead's test spec, since it exercises the actual CLI a suite author
+    # would invoke rather than only the library function.
+    with tempfile.TemporaryDirectory() as td:
+        fixture_path = Path(td) / "test-pk15w-empty-lead-slice.sh"
+        fixture_path.write_text(SLICE_THEN_ASSERT_BLOCK)
+        proc = subprocess.run(
+            [sys.executable, str(TOOL_PATH), str(fixture_path)],
+            capture_output=True, text=True,
+        )
+        assert_eq(
+            "real binary exits 1 (violation found) on the vendored pk15w fixture",
+            proc.returncode, 1,
+        )
+        expected_marker = f"{fixture_path}:{SLICE_ASSERT_LOOP_LINE}"
+        assert_true(
+            "real binary reports the correct file:line for the vendored pk15w fixture",
+            expected_marker in proc.stdout,
+            detail=f"stdout={proc.stdout!r}",
+        )
+
+
 # ---------------------------------------------------------------------------
 # REGRESSION — CLI wiring + real default-corpus sanity
 # ---------------------------------------------------------------------------
@@ -288,10 +405,14 @@ TESTS = [
     test_echo_redirect_creation_flagged,
     test_test_dash_e_form_flagged,
     test_blank_and_comment_lines_do_not_break_adjacency,
+    test_flags_slice_then_assert_without_nonempty_guard,
+    test_does_not_flag_slice_with_nonempty_guard,
     test_bite_proof_neutered_matcher_goes_red,
+    test_bite_proof_neutered_empty_slice_matcher_goes_red,
     test_integration_flags_i8kv_at_94d2557,
     test_vendored_i8kv_fixture_matches_94d2557_when_reachable,
     test_integration_does_not_flag_head_shared_helper,
+    test_integration_real_binary_flags_vendored_pk15w_fixture,
     test_main_clean_on_real_repo_corpus,
 ]
 
