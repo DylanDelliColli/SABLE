@@ -1,41 +1,40 @@
 #!/usr/bin/env bash
-# test-seat-sighting.sh — the merge seat records a durable observation with
-# no manager in the loop, against a REAL bd store (SABLE-441vl).
+# test-seat-sighting.sh — capture is mandatory, priority is advisory, against
+# a REAL bd store (SABLE-441vl).
 #
 # WHAT IS UNDER TEST
 # ------------------
-# Before this bead, chuck (the merge seat) could not file work-creating beads
-# and had NO lesser "record an observation" path either — any finding he made
-# reached the backlog only if a manager happened to read his message and
-# choose to file it. That worked on ATTENTION, not STRUCTURE: an unfiled
-# finding left no artifact at all. `sable-msg --file-sighting` closes the gap
-# without widening the seat's authority.
+# The bead this covers was originally scoped on the premise that the merge
+# seat (chuck) CANNOT create work-creating beads at all. That premise is
+# measured FALSE (chuck filed seven beads the same day the premise was
+# written) and a cockpit ruling — recorded as a COMMENT on SABLE-441vl, not
+# in its description — re-scoped the deliverable: CAPTURE IS MANDATORY (the
+# seat's `bd create` must never be refused), PRIORITY IS ADVISORY (a
+# creation-time hook auto-labels a seat-filed bead and marks its priority
+# provisional, for a manager's later triage).
 #
-#   C1  filing a sighting (chuck identity) produces a bead that is DURABLE
-#       (bd show finds it), DEFERRED (status=deferred), carries the
-#       sighting,for-triage label, and is ABSENT from `bd ready`.
-#   C2  POSITIVE CONTROL: once a manager promotes it (bd update
-#       --status=open), it DOES appear in `bd ready` — the deferred status
-#       above was a real exclusion, not a fixture artifact.
-#   C3  the seat's boundary still holds for a NORMAL work `bd create` (no
-#       sighting label) run through the enforcement hook directly — the
-#       governance limit this bead must not widen.
+#   C1  a plain `bd create` from the seat's identity is never denied and
+#       lands LIVE in `bd ready` immediately — no promotion step, because
+#       capture must never be blocked.
+#   C2  hooks/multi-manager/seat-sighting-gate.sh (a PostToolUse hook that
+#       never denies) auto-labels the just-created bead `seat-filed` and
+#       marks `metadata.priority_provisional=true` afterward.
+#   C3  a `bd create` from a NON-seat identity is left completely untouched —
+#       no label, no metadata — proving the hook discriminates on identity.
 #
 # Run with:
 #   bash hooks/test/test-seat-sighting.sh
 #
 # SELF-SKIPS (loudly) when bd is not on PATH — this suite's whole claim is
-# about a real bd store's ready-pool visibility; it drives its own throwaway
-# DB, never the real bead pool.
+# about a real bd store's label/metadata/ready-pool state; it drives its own
+# throwaway DB, never the real bead pool.
 
 set -uo pipefail
 
 TESTDIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$TESTDIR/../.." && pwd)"
-SABLE_MSG="$REPO_ROOT/bin/sable-msg"
 SEAT_GATE="$REPO_ROOT/hooks/multi-manager/seat-sighting-gate.sh"
 
-[ -f "$SABLE_MSG" ] || { echo "FATAL: missing $SABLE_MSG"; exit 2; }
 [ -f "$SEAT_GATE" ] || { echo "FATAL: missing $SEAT_GATE"; exit 2; }
 
 if ! command -v bd >/dev/null 2>&1; then
@@ -59,67 +58,81 @@ if [ ! -d "$BEADS_ROOT/.beads" ]; then
 fi
 export BEADS_DB="$BEADS_ROOT/.beads"
 
+run_gate() {
+  # $1 = command string, $2 = bd create's real stdout, $3 = agent name
+  python3 -c "
+import json
+print(json.dumps({
+    'tool_input': {'command': '''$1'''},
+    'tool_response': {'stdout': '''$2''', 'stderr': ''},
+}))
+" | env CLAUDE_AGENT_NAME="$3" CLAUDE_AGENT_ROLE=manager BEADS_DB="$BEADS_DB" bash "$SEAT_GATE"
+}
+
 # ---------------------------------------------------------------------------
-# C1 — filing a sighting from the seat's own identity
+# C1/C2 — a plain bd create from the seat is never refused, lands live in
+# bd ready, then gets auto-labeled/annotated afterward.
 # ---------------------------------------------------------------------------
-SIGHT_OUT="$(env CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager \
-    python3 "$SABLE_MSG" --file-sighting --from chuck \
-    "found a defect while verifying a branch at the seat" 2>&1)"
-SIGHT_RC=$?
-BID="$(echo "$SIGHT_OUT" | grep -oE 'sighting [a-zA-Z0-9_-]+' | awk '{print $2}')"
+CREATE_CMD='bd create --title="found a defect while verifying a branch" --description="text [no-test]" --type=task --priority=2'
+CREATE_OUT="$(bd create --title="found a defect while verifying a branch" \
+  --description="text [no-test]" --type=task --priority=2 2>&1)"
+CREATE_RC=$?
+BID="$(echo "$CREATE_OUT" | grep -oE 'Created issue:\s*[a-zA-Z0-9_-]+' | awk '{print $NF}')"
 
-if [ "$SIGHT_RC" -eq 0 ] && [ -n "$BID" ]; then
-  pass "C1 --file-sighting exits 0 and reports a bead id ($BID)"
+if [ "$CREATE_RC" -eq 0 ] && [ -n "$BID" ]; then
+  pass "C1 a plain bd create from the seat succeeds (bead $BID) — capture is never refused"
 else
-  fail "C1 --file-sighting exits 0 with a bead id" "rc=$SIGHT_RC
-$SIGHT_OUT"
-fi
-
-if [ -n "$BID" ] && bd show "$BID" --json >/dev/null 2>&1; then
-  pass "C1 the sighting bead is DURABLE — bd show finds it"
-else
-  fail "C1 the sighting bead is durable" "bd show $BID failed"
-fi
-
-STATUS="$(bd show "$BID" --json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print((d[0] if isinstance(d, list) else d).get('status',''))" 2>/dev/null)"
-if [ "$STATUS" = "deferred" ]; then
-  pass "C1 the sighting bead is DEFERRED"
-else
-  fail "C1 the sighting bead is deferred" "status=$STATUS"
-fi
-
-LABELS="$(bd show "$BID" --json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(','.join((d[0] if isinstance(d, list) else d).get('labels') or []))" 2>/dev/null)"
-if echo ",$LABELS," | grep -qE ',sighting,'; then
-  pass "C1 the sighting bead carries the sighting label"
-else
-  fail "C1 the sighting bead carries the sighting label" "labels=$LABELS"
+  fail "C1 a plain bd create from the seat succeeds" "rc=$CREATE_RC
+$CREATE_OUT"
 fi
 
 if bd ready 2>/dev/null | grep -qF "$BID"; then
-  fail "C1 the sighting bead is absent from bd ready" "found in bd ready"
+  pass "C1 the seat-filed bead is LIVE in bd ready immediately — no promotion step"
 else
-  pass "C1 the sighting bead is ABSENT from bd ready"
+  fail "C1 the seat-filed bead is live in bd ready immediately" "$(bd ready 2>&1)"
+fi
+
+run_gate "$CREATE_CMD" "$CREATE_OUT" chuck >/dev/null 2>&1
+GATE_RC=$?
+if [ "$GATE_RC" -eq 0 ]; then
+  pass "C2 seat-sighting-gate.sh exits 0 (never denies)"
+else
+  fail "C2 seat-sighting-gate.sh exits 0" "rc=$GATE_RC"
+fi
+
+LABELS="$(bd show "$BID" --json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); d=d[0] if isinstance(d,list) else d; print(','.join(d.get('labels') or []))" 2>/dev/null)"
+if echo ",$LABELS," | grep -qE ',seat-filed,'; then
+  pass "C2 the bead is auto-labeled seat-filed"
+else
+  fail "C2 the bead is auto-labeled seat-filed" "labels=$LABELS"
+fi
+
+PROVISIONAL="$(bd show "$BID" --json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); d=d[0] if isinstance(d,list) else d; print((d.get('metadata') or {}).get('priority_provisional'))" 2>/dev/null)"
+if [ "$PROVISIONAL" = "True" ] || [ "$PROVISIONAL" = "true" ]; then
+  pass "C2 metadata.priority_provisional=true is set"
+else
+  fail "C2 metadata.priority_provisional=true is set" "got: $PROVISIONAL"
+fi
+
+if [ "$(bd show "$BID" --json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); d=d[0] if isinstance(d,list) else d; print(d.get('priority'))")" = "2" ]; then
+  pass "C2 the seat's own priority estimate (P2) is preserved, not overridden"
+else
+  fail "C2 the seat's priority estimate is preserved" "$(bd show "$BID" --json 2>&1)"
 fi
 
 # ---------------------------------------------------------------------------
-# C2 — POSITIVE CONTROL: a manager promotes it, and it appears in bd ready
+# C3 — a non-seat identity's bd create is left completely untouched
 # ---------------------------------------------------------------------------
-bd update "$BID" --status=open >/dev/null 2>&1
-if bd ready 2>/dev/null | grep -qF "$BID"; then
-  pass "C2 once promoted (status=open), the bead DOES appear in bd ready"
-else
-  fail "C2 promoted sighting appears in bd ready" "$(bd ready 2>&1)"
-fi
+CREATE2_OUT="$(bd create --title="ordinary work bead" --description="text [no-test]" --type=task 2>&1)"
+BID2="$(echo "$CREATE2_OUT" | grep -oE 'Created issue:\s*[a-zA-Z0-9_-]+' | awk '{print $NF}')"
+run_gate 'bd create --title="ordinary work bead" --description="text [no-test]" --type=task' \
+  "$CREATE2_OUT" optimus >/dev/null 2>&1
 
-# ---------------------------------------------------------------------------
-# C3 — the seat's boundary still holds for a plain work bd create
-# ---------------------------------------------------------------------------
-GATE_OUT="$(printf '%s' '{"tool_input":{"command":"bd create --title=\"fix the thing\" --description=\"foo bar\" --type=task"}}' \
-  | env CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager bash "$SEAT_GATE" 2>&1)"
-if echo "$GATE_OUT" | grep -q '"permissionDecision": "deny"'; then
-  pass "C3 the seat is still refused a normal WORK bd create"
+LABELS2="$(bd show "$BID2" --json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); d=d[0] if isinstance(d,list) else d; print(','.join(d.get('labels') or []))" 2>/dev/null)"
+if [ -z "$LABELS2" ]; then
+  pass "C3 a non-seat identity's bead is left untouched — no seat-filed label"
 else
-  fail "C3 seat refused a normal work bd create" "$GATE_OUT"
+  fail "C3 a non-seat identity's bead is left untouched" "labels=$LABELS2"
 fi
 
 echo

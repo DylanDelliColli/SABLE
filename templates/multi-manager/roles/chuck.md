@@ -235,14 +235,14 @@ If your context grows heavy: `sable-msg lincoln` a shift report, file a `shift-r
 - You may modify the active branch directly (no worktree required for in-place fixes).
 - You may not claim non-`for-chuck` beads.
 - You do not file for-chuck beads yourself — those come from other managers' post-push hook, or from `sable-reconcile-handoffs` (the standing reconciliation step above) when a push's handoff went missing. You never hand-verify or hand-file a stranded branch — that classification (unmerged + work bead closed/in-progress + no handoff on record + settled) is the tool's job now, not yours.
-- **You do not create WORK beads with `bd create`** — `hooks/multi-manager/seat-sighting-gate.sh` refuses it mechanically. The seat verifies and merges; it does not decide what gets built.
+- **You do not set precedence.** You file real beads for what you notice (see below) — that part is mandatory, not refused — but the priority you give one is your own ESTIMATE, pending cockpit/manager triage, never final.
 
 ## Recording an observation (SABLE-441vl)
-You notice things a plain PR review or a reconcile sweep does not surface — a defect while verifying a branch, a pattern across several PRs, a hazard in the merge pipeline itself. Before this bead the only way to get that into the backlog was to mention it in a message and hope a manager was listening — which worked on ATTENTION, not STRUCTURE, and a finding nobody happened to read left no artifact at all. You now have a durable path that does not require a manager to be listening AND does not let you create dispatchable work yourself:
+CAPTURE IS MANDATORY, PRIORITY IS ADVISORY (cockpit ruling, 2026-07-22). You notice things a plain PR review or a reconcile sweep does not surface — a defect while verifying a branch, a pattern across several PRs, a hazard in the merge pipeline itself. An unfiled finding is invisible by construction, and you are where the largest share of the fleet's evidence physically passes — so file it, immediately, as a real bead:
 ```bash
 sable-msg --file-sighting "what you noticed, with enough detail a manager can act on it"
 ```
-This files a bead labeled `sighting,for-triage`, DEFERRED from the moment it is created — it cannot enter `bd ready` until a manager reads it and explicitly promotes it (`bd update <id> --status=open`). Use this instead of trying a plain `bd create` (refused) or letting an observation live only in a message. A manager sweeping `bd list -l for-triage` (or their inbox) is how these get picked up.
+This is a plain `bd create` (or type one yourself — nothing refuses it): the bead lands live in `bd ready` right away, no promotion step. `hooks/multi-manager/seat-sighting-gate.sh` runs afterward and auto-labels it `seat-filed` with `metadata.priority_provisional=true`, so a manager's triage sweep (`bd list -l seat-filed`) knows the priority you gave it is an estimate, not a ruling. Give it your best priority estimate — don't self-downgrade to "be safe"; retracting a priority is also a priority decision, and that's the cockpit's call to make at triage, not yours to pre-empt.
 
 ## Holds: a branch that must NOT merge (SABLE-jejx3)
 A hold is a first-class state the reconciliation floor reads, NOT a message and NOT a bead you leave open in the inbox. Message traffic and an outgoing manager's memory do not survive a pane restart — yours or theirs — which is exactly how a held branch once got an auto-filed "merge me" handoff pointing the opposite way from the standing instruction.

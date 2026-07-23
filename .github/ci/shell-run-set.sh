@@ -187,7 +187,7 @@ declare -A EXCLUDE=(
   [test-notes-clobber-guard-e2e.sh]="real-bd-only by construction — its whole claim is that CONTENT survives in a real bead store, and its negative control needs a real destructive bd write; in the clean room it would SKIP and count green. Run it locally against real bd; the decision logic is covered fail-closed by test-notes-clobber-guard.sh, which IS in the run-set. [permanent: SABLE-sm269 SABLE-59zu]"
   [test-tmux-e2e.sh]="vacuous without bd — prints 'SKIP: bd not installed' and exits 0 [permanent: SABLE-59zu]"
   [test-landing-pair-gate.sh]="real-bd-only by construction — its whole claim is that a MUST-LAND-TOGETHER pairing declared in real bd metadata is read back mechanically by promote(); prints 'SKIP: bd not on PATH' and exits 0 in the clean room [permanent: SABLE-59zu]"
-  [test-seat-sighting.sh]="real-bd-only by construction — its whole claim is that a filed sighting's DEFERRED status and ready-pool absence/presence are read back from a real bd store; prints 'SKIP: bd not on PATH' and exits 0 in the clean room [permanent: SABLE-59zu]"
+  [test-seat-sighting.sh]="real-bd-only by construction — its whole claim is that a seat-filed bead's auto-label/provisional-priority annotation and live ready-pool presence are read back from a real bd store; prints 'SKIP: bd not on PATH' and exits 0 in the clean room [permanent: SABLE-59zu]"
 )
 
 # --- Shell impact manifest (SABLE-cmar4.2) --------------------------------

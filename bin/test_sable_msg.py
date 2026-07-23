@@ -11,6 +11,8 @@ manager-name lookups never fall through to a worker pane's bead tag).
 import importlib.util
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
@@ -431,20 +433,18 @@ def test_file_fallback_bead_returns_none_when_bd_unavailable():
 
 # --- seat sightings (SABLE-441vl) -------------------------------------------
 #
-# The merge seat (chuck) cannot file WORK-creating beads
-# (hooks/multi-manager/seat-sighting-gate.sh). Before this bead there was no
-# lesser "record an observation" path either, so any finding chuck made
-# reached the backlog only if a manager read his message and chose to file
-# it — capture ran on ATTENTION, not STRUCTURE. `--file-sighting` closes that
-# gap WITHOUT widening the seat's authority: a sighting is durable and
-# DEFERRED from creation, so it can never enter `bd ready` until a manager
-# promotes it.
+# CAPTURE IS MANDATORY, PRIORITY IS ADVISORY (cockpit ruling, 2026-07-22
+# 16:23, recorded as a comment on SABLE-441vl — NOT in its description, which
+# is why an earlier pass here built the wrong thing: a DENY hook on the
+# premise the seat cannot create beads at all. That premise is measured
+# FALSE). `--file-sighting` is a plain `bd create`, never refused or
+# deferred; hooks/multi-manager/seat-sighting-gate.sh annotates the result
+# AFTER it lands, for any chuck-identity `bd create` whether or not it went
+# through this wrapper.
 
-def test_file_sighting_bead_creates_a_deferred_sighting_bead():
-    """Two bd calls, not one: `bd create` has no --status flag at all
-    (verified against the real CLI), so landing a bead already excluded from
-    `bd ready` is create-then-update. Both calls, and their order, are
-    asserted here — the deferred update is not optional decoration."""
+def test_file_sighting_bead_is_a_single_plain_create():
+    """One bd call, not two: capture is mandatory, so there is nothing to
+    defer and nothing to promote later."""
     seen = []
 
     class R:
@@ -459,39 +459,14 @@ def test_file_sighting_bead_creates_a_deferred_sighting_bead():
     bead_id = sable_msg.file_sighting_bead(
         "chuck", "found a defect while verifying wk-foo", runner=runner)
     assert bead_id == "SABLE-ab12"
-    assert len(seen) == 2
-    create_argv, update_argv = seen
-    assert create_argv[:2] == ["bd", "create"]
-    joined_create = " ".join(create_argv)
-    assert "SIGHTING:" in joined_create
-    assert "found a defect while verifying wk-foo" in joined_create
-    assert "--labels=sighting,for-triage" in create_argv
-    assert update_argv == ["bd", "update", "SABLE-ab12", "--status=deferred"]
-
-
-def test_file_sighting_bead_deletes_on_a_failed_defer_update():
-    """A sighting bead that landed OPEN (dispatchable) is a work-creating side
-    effect this function must never produce: if the deferred-status update
-    fails, the just-created bead is deleted rather than left un-deferred."""
-    seen = []
-
-    class Ok:
-        returncode = 0
-        stdout = "Created issue: SABLE-ab12\n"
-        stderr = ""
-
-    class Fail:
-        returncode = 1
-        stdout = ""
-        stderr = "bd: db locked"
-
-    def runner(args):
-        seen.append(args)
-        return Fail() if args[:2] == ["bd", "update"] else Ok()
-
-    bead_id = sable_msg.file_sighting_bead("chuck", "text", runner=runner)
-    assert bead_id is None
-    assert ["bd", "delete", "SABLE-ab12", "--force"] in seen
+    assert len(seen) == 1
+    argv = seen[0]
+    assert argv[:2] == ["bd", "create"]
+    joined = " ".join(argv)
+    assert "SEAT-FILED:" in joined
+    assert "found a defect while verifying wk-foo" in joined
+    assert not any(a.startswith("--status") for a in argv), \
+        "capture is mandatory — a sighting must never be deferred"
 
 
 def test_file_sighting_bead_returns_none_when_bd_unavailable():
@@ -526,7 +501,7 @@ def test_main_file_sighting_reports_failure_and_a_manual_fallback(monkeypatch, c
     monkeypatch.setattr(sable_msg, "file_sighting_bead", lambda frm, text, **k: None)
     rc = sable_msg.main(["--file-sighting", "--from", "chuck", "an observation"])
     assert rc == 1
-    assert "could not file sighting" in capsys.readouterr().err
+    assert "could not file" in capsys.readouterr().err
 
 
 def test_parse_args_file_sighting_treats_the_single_positional_as_body():
@@ -545,7 +520,7 @@ def test_parse_args_still_requires_to_role_without_file_sighting():
 SEAT_GATE_HOOK = Path(__file__).resolve().parent.parent / "hooks" / "multi-manager" / "seat-sighting-gate.sh"
 
 
-def _run_seat_gate(command, agent_name, agent_role="manager"):
+def _run_seat_gate(command, agent_name, agent_role="manager", stdout="", extra_env=None):
     env = dict(os.environ)
     if agent_name:
         env["CLAUDE_AGENT_NAME"] = agent_name
@@ -553,56 +528,67 @@ def _run_seat_gate(command, agent_name, agent_role="manager"):
     else:
         env.pop("CLAUDE_AGENT_NAME", None)
         env.pop("CLAUDE_AGENT_ROLE", None)
-    hook_input = json.dumps({"tool_input": {"command": command}})
+    env.update(extra_env or {})
+    hook_input = json.dumps({
+        "tool_input": {"command": command},
+        "tool_response": {"stdout": stdout, "stderr": ""},
+    })
     return subprocess.run(["bash", str(SEAT_GATE_HOOK)], input=hook_input, text=True,
                           capture_output=True, env=env, timeout=10)
 
 
-def test_seat_sighting_is_deferred_and_not_work():
-    """THE property SABLE-441vl is accepted or rejected on. Filing a sighting
-    from the seat's own identity (via file_sighting_bead) produces a bead
-    that is deferred by default and carries the sighting/for-triage marker.
-    NEGATIVE CONTROL, in this same test: an attempt by the seat to file a
-    NORMAL WORK bead — a plain `bd create`, the exact command
-    file_sighting_bead is NOT wrapping — is still REFUSED by
-    hooks/multi-manager/seat-sighting-gate.sh. This is the assertion most
-    likely to be lost in implementation, because it is the one that proves
-    the governance limit was not quietly widened."""
-    seen = []
-
-    class R:
-        returncode = 0
-        stdout = "Created issue: SABLE-ab12\n"
-        stderr = ""
-
-    def runner(args):
-        seen.append(args)
-        return R()
-
-    bead_id = sable_msg.file_sighting_bead("chuck", "an observation", runner=runner)
-    assert bead_id == "SABLE-ab12"
-    assert "--labels=sighting,for-triage" in seen[0]
-    assert seen[1] == ["bd", "update", "SABLE-ab12", "--status=deferred"]
-
+def test_seat_gate_never_denies_a_normal_work_bd_create():
+    """THE property SABLE-441vl is accepted or rejected on, corrected against
+    the actual cockpit ruling: capture is MANDATORY, so a plain work `bd
+    create` from the seat's own identity must NEVER be refused. (An earlier,
+    wrong pass here asserted the opposite — that this must be denied unless
+    labeled a sighting. The ruling that reopened this bead exists precisely
+    because that premise was measured false.)"""
     if not SEAT_GATE_HOOK.is_file():
         pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
     result = _run_seat_gate(
         'bd create --title="fix the thing" --description="foo bar" --type=task',
-        agent_name="chuck")
-    out = json.loads(result.stdout)
-    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert "SABLE-441vl" in out["hookSpecificOutput"]["permissionDecisionReason"]
+        agent_name="chuck", stdout="Created issue: SABLE-ab12 — fix the thing\n")
+    assert result.returncode == 0
+    assert "deny" not in result.stdout
 
 
-def test_seat_gate_allows_a_sighting_labeled_create():
+def test_seat_gate_annotates_the_created_bead_afterward(monkeypatch, tmp_path):
+    """The hook's actual job: after a successful chuck-identity `bd create`,
+    it runs a follow-up `bd update <id> --add-label seat-filed
+    --set-metadata priority_provisional=true`. Verified end to end against a
+    real, throwaway bd DB (real bd or self-skip — no mocks)."""
     if not SEAT_GATE_HOOK.is_file():
         pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    if shutil.which("bd") is None:
+        pytest.skip("bd not on PATH")
+    beads_root = tmp_path / "beads"
+    beads_root.mkdir()
+    init = subprocess.run(["bd", "init", "--prefix=sga"], cwd=str(beads_root),
+                          env={**os.environ, "BD_NON_INTERACTIVE": "1"},
+                          text=True, capture_output=True, timeout=60)
+    assert init.returncode == 0, init.stdout + init.stderr
+    beads_db = str(beads_root / ".beads")
+
+    created = subprocess.run(
+        ["bd", "create", "--title=found a defect", "--description=text [no-test]",
+         "--type=task"],
+        env={**os.environ, "BEADS_DB": beads_db}, text=True, capture_output=True, timeout=30)
+    assert created.returncode == 0, created.stdout + created.stderr
+    bead_id = re.search(r"Created issue:\s*(\S+)", created.stdout).group(1)
+
     result = _run_seat_gate(
-        'bd create --title="SIGHTING: x" --description="y" --type=task '
-        '--priority=3 --labels=sighting,for-triage',
-        agent_name="chuck")
-    assert result.stdout.strip() == ""
+        'bd create --title="found a defect" --description="text [no-test]" --type=task',
+        agent_name="chuck", stdout=created.stdout, extra_env={"BEADS_DB": beads_db})
     assert result.returncode == 0
+    # The hook's own `bd update` call must reach the SAME isolated DB.
+    show = subprocess.run(["bd", "show", bead_id, "--json"],
+                          env={**os.environ, "BEADS_DB": beads_db}, text=True,
+                          capture_output=True, timeout=30)
+    data = json.loads(show.stdout)
+    data = data[0] if isinstance(data, list) else data
+    assert "seat-filed" in (data.get("labels") or [])
+    assert (data.get("metadata") or {}).get("priority_provisional") in (True, "true", "True")
 
 
 def test_seat_gate_ignores_non_seat_identities():
@@ -612,8 +598,7 @@ def test_seat_gate_ignores_non_seat_identities():
         pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
     result = _run_seat_gate(
         'bd create --title="fix the thing" --description="foo bar" --type=task',
-        agent_name="optimus")
-    assert result.stdout.strip() == ""
+        agent_name="optimus", stdout="Created issue: SABLE-ab12 — fix the thing\n")
     assert result.returncode == 0
 
 

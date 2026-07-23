@@ -73,11 +73,6 @@
           },
           {
             "type": "command",
-            "command": "bash ~/.claude/hooks/multi-manager/seat-sighting-gate.sh",
-            "timeout": 3000
-          },
-          {
-            "type": "command",
             "command": "bash ~/.claude/hooks/multi-manager/pre-push-rebase-test.sh",
             "timeout": 210000
           },
@@ -138,6 +133,11 @@
             "type": "command",
             "command": "bash ~/.claude/hooks/multi-manager/post-push-merge-notify.sh",
             "timeout": 10000
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/seat-sighting-gate.sh",
+            "timeout": 5000
           }
         ]
       }

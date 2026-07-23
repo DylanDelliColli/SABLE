@@ -1,49 +1,66 @@
 #!/usr/bin/env bash
-# seat-sighting-gate.sh — the merge seat (chuck) may not create WORK beads
-# directly; sightings are the carve-out (SABLE-441vl).
+# seat-sighting-gate.sh — mechanical support for "capture is mandatory,
+# priority is advisory" (SABLE-441vl, cockpit ruling 2026-07-22 16:23).
 #
-# Trigger: PreToolUse on Bash (matching `bd create`) | identity-gated on chuck
+# Trigger: PostToolUse on Bash (a SUCCESSFUL `bd create`) | identity-gated on chuck
 #
-# BACKGROUND. "Chuck cannot file work-creating beads" was, before this hook,
-# ONLY role prose (templates/multi-manager/roles/chuck.md's boundaries
-# section) — no PreToolUse hook, no code path anywhere actually refused a
-# `bd create` from the seat. That gap is what made SABLE-441vl possible in
-# the first place: any finding chuck made reached the backlog ONLY IF a
-# manager read his message and chose to file it, which worked on ATTENTION,
-# not STRUCTURE. This hook makes the boundary MECHANICAL for the first time,
-# and builds the carve-out in from day one rather than bolting it on later:
-# a SIGHTING (label `sighting`, filed via `sable-msg --file-sighting` —
-# see bin/sable-msg's file_sighting_bead) is allowed through; anything else
-# from chuck's identity is refused.
+# THE ACTUAL RULING, so no future worker re-litigates it. The bead this hook
+# implements was originally scoped on the premise that the merge seat (chuck)
+# CANNOT create work-creating beads at all. That premise is MEASURED FALSE —
+# chuck filed seven beads the same day the premise was written — and a
+# cockpit ruling (recorded as a COMMENT on SABLE-441vl, not in its
+# description, which is why an earlier pass here missed it and built the
+# wrong thing) re-scoped the deliverable: CAPTURE IS MANDATORY — an unfiled
+# seat finding is invisible by construction, and the seat is where the
+# largest share of the fleet's evidence physically passes, so the seat MUST
+# be free to file. What the seat does NOT do is set precedence: priority on
+# any seat-filed bead is a SEAT ESTIMATE pending cockpit/manager triage,
+# never final. "An unenforced boundary the governed party believes is
+# enforced fails both ways" — before this hook that split was carried only by
+# chuck hand-typing a prose prefix into the description, which is real but
+# drifts the moment anyone forgets it.
 #
-# WHY THIS MUST NOT WIDEN THE SEAT'S AUTHORITY. The principle this hook
-# exists to preserve, not relax: the seat verifies and merges, it does not
-# decide what gets built. A sighting is NOT an exception to that — it is
-# DEFERRED from the moment sable-msg's create call returns (a second `bd
-# update --status=deferred` call, since `bd create` has no --status flag at
-# all), so it can never enter `bd ready` until a manager reads it and
-# explicitly promotes it. The carve-out widens WHAT CAN BE RECORDED, never
-# WHAT CAN BE DISPATCHED.
+# THIS HOOK NEVER DENIES. It fires AFTER a `bd create` already succeeded and
+# annotates the result: extracts the new bead id from the create's own
+# stdout ("Created issue: <id>", the same pattern bin/sable-msg's
+# file_fallback_bead already parses) and runs a follow-up `bd update
+# --add-label seat-filed --set-metadata priority_provisional=true`. A
+# PreToolUse hook in this catalog can only allow/deny/inject context — see
+# bead-description-gate.sh — it cannot rewrite the command's own flags, which
+# is why the annotation has to be a SEPARATE write after the fact rather than
+# an injected --labels flag on the original call.
 #
 # Only ever acts on identity == chuck (the seat) via lib-identity.sh's
-# sable_resolve_identity (agent_type first, CLAUDE_AGENT_NAME env fallback —
-# see that file for the priority order and the subagent-contamination
-# rationale). Every other identity's `bd create` passes through untouched:
-# this hook has exactly one job.
+# sable_resolve_identity. Every other identity's `bd create` is untouched.
 
 set -euo pipefail
 
 HOOK_INPUT_JSON="$(cat)"
 
-COMMAND=$(printf '%s' "$HOOK_INPUT_JSON" | python3 -c "
+# Field names are defensive: the platform's tool-result key has been observed
+# under more than one name (tool_response vs tool_result — see
+# hooks/tdd-evidence.sh's own note on this), so both are checked and whichever
+# the running platform emits is picked up without a schema guess breaking the
+# other.
+PARSED=$(printf '%s' "$HOOK_INPUT_JSON" | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
     d = {}
-print(d.get('tool_input', {}).get('command', ''))
+cmd = d.get('tool_input', {}).get('command', '')
+resp = d.get('tool_response')
+if not isinstance(resp, dict) or not resp:
+    resp = d.get('tool_result')
+if not isinstance(resp, dict):
+    resp = {}
+stdout = resp.get('stdout', '') or ''
+print(cmd)
+print('---STDOUT---')
+print(stdout)
 " 2>/dev/null) || exit 0
 
+COMMAND=$(echo "$PARSED" | sed -n '1p')
 [ -z "$COMMAND" ] && exit 0
 
 # Only act on bd create.
@@ -56,42 +73,17 @@ sable_resolve_identity "$HOOK_INPUT_JSON"
 # Not the seat: no-op. This hook has exactly one job.
 [ "$SABLE_ID_NAME" = "chuck" ] || exit 0
 
-# A sighting carries the `sighting` label (bin/sable-msg's SIGHTING_LABELS —
-# "sighting,for-triage"). Any --labels/-l value containing it, in any of bd's
-# accepted quoting forms, is a sighting and passes through.
-LABELS=$(echo "$COMMAND" | python3 -c "
-import sys, re
-cmd = sys.stdin.read()
-m = (
-    re.search(r'--labels?[= ]\"([^\"]+)\"', cmd)
-    or re.search(r\"--labels?[= ]'([^']+)'\", cmd)
-    or re.search(r'--labels?[= ]([^\s\"\']+)', cmd)
-    or re.search(r'(?:^|\s)-l[= ]\"([^\"]+)\"', cmd)
-    or re.search(r\"(?:^|\s)-l[= ]'([^']+)'\", cmd)
-    or re.search(r'(?:^|\s)-l[= ]([^\s\"\']+)', cmd)
-)
-print(m.group(1) if m else '')
-" 2>/dev/null || echo "")
+STDOUT=$(echo "$PARSED" | sed -n '/^---STDOUT---$/,$p' | tail -n +2)
 
-if echo ",$LABELS," | grep -qE ',sighting,'; then
-  exit 0
-fi
+# "Created issue: <id>" only appears in stdout on a genuine success — a
+# failed create never reaches this line, so no separate exit-code check is
+# needed (mirrors hooks/bead-quality.sh's own PostToolUse-after-bd-create
+# convention).
+BEAD_ID=$(echo "$STDOUT" | grep -oE 'Created issue:[[:space:]]*[A-Za-z0-9_-]+' | awk '{print $NF}')
+[ -z "$BEAD_ID" ] && exit 0
 
-python3 -c "
-import json
-print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'PreToolUse',
-        'permissionDecision': 'deny',
-        'permissionDecisionReason': (
-            'SABLE seat boundary (SABLE-441vl): chuck (the merge seat) may not create '
-            'WORK beads directly — the seat verifies and merges, it does not decide what '
-            'gets built. Record this as a durable SIGHTING instead: sable-msg '
-            '--file-sighting \"<observation>\" (deferred on creation, label '
-            'sighting,for-triage; a manager promotes it later with bd update <id> '
-            '--status=open). If this is delegated author work, message the author lane '
-            'instead of filing it yourself.'
-        ),
-    }
-}))
-"
+# Best-effort, never fails the hook: an annotation that could not be written
+# is a missed label, not a reason to fail a Bash tool call after it already
+# ran (the create already happened; this is pure side-effect bookkeeping).
+bd update "$BEAD_ID" --add-label seat-filed --set-metadata priority_provisional=true \
+  >/dev/null 2>&1 || true
