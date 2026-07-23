@@ -618,6 +618,35 @@ Chuck uses the registry's `fix_directly` and `delegate_to_author` lists to decid
 
 Mechanical conflicts (no intent to get wrong) → Chuck fixes inline. Semantic conflicts (where author intent matters) → Chuck files a `for-<author>` bead with the conflict context and a suggested resolution.
 
+### 8. MATCHED PAIR / MUST-LAND-TOGETHER beads (SABLE-rzkw7)
+
+A planner or manager can rule that two beads may be worked in parallel but
+must only be *promoted* together — e.g. two halves of one hardcoded-timeout
+fix ("twin hardcodes"), or a cross-epic contract where one side is only
+sound because the other backstops it ("this impact tier is sound only
+because the other epic's green snapshot backstops under-selection; neither
+ships without the other's counterpart"). Before this bead that ruling lived
+only in a bead note or a manager's working memory — nowhere Chuck's promote
+path ever read it, so he could be holding one signed-off half with no way to
+know it was half of a pair. That is a near-miss with no failure event at the
+promote: both halves are individually green, which is exactly what makes
+them individually signable, so nothing red announces the split.
+
+The ruling is now `metadata.landing_pair` on the bead itself, set on BOTH
+sides of the pair:
+
+```bash
+bd update <id-a> --set-metadata landing_pair=<id-b>
+bd update <id-b> --set-metadata landing_pair=<id-a>
+```
+
+`sable-merge-gate promote` reads it mechanically (exit 28, naming the
+counterpart) — see chuck.md's promote step for the full contract and the
+`--with-pair` flag that lets Chuck promote both in one sitting. This is
+distinct from `bd dep add` (which means "cannot **start** until") — a
+landing pair CAN be worked in parallel; it can only never be **promoted**
+solo.
+
 ---
 
 ## Hook catalog (advanced — multi-manager)
