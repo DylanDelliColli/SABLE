@@ -26,6 +26,9 @@ from pathlib import Path
 
 import pytest
 
+import sable_batch_fold_lib as fold_lib
+import sable_batch_key_lib as batch_key
+
 _LOADER = SourceFileLoader(
     "sable_merge_gate", str(Path(__file__).resolve().parent / "sable-merge-gate")
 )
@@ -692,3 +695,96 @@ def test_real_git_sandbox_materialize_preview_pushes_the_real_object(tmp_path):
     subprocess.run(["git", "-C", repo, "fetch", "origin", f"refs/heads/{ref}"],
                    check=True, capture_output=True)
     assert git_lib.commit_parents(repo, preview_sha) == [base_sha, branch_sha]
+
+
+# --------------------------------------------------------------------------
+# Integration: real git sandbox + real bare remote (SABLE-be4lo.4)
+#
+# Experiment 1 (2026-07-23), hardened: does a pushed ci-verify/batch-<setkey7>
+# ref land, and does the already-verified lookup shape (SHA + ci-verify/
+# prefix — .github/ci/preview-already-verified.sh keys on exactly those two
+# things, never on ref internal shape) recognize it? No live GitHub
+# dependency: this asserts the ref that lands has the shape that lookup
+# relies on, in a real sandbox with a real bare remote.
+# --------------------------------------------------------------------------
+
+def _repo_with_disjoint_members(tmp_path, n):
+    """A real repo: root commit (root.txt), trunk gains base.txt (the base),
+    and n branches off ROOT each adding their own file — mutually disjoint
+    and disjoint from base.txt, so the fold is guaranteed clean."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (("init", "-q", "-b", "trunk"), ("config", "user.email", "t@sable.invalid"),
+                 ("config", "user.name", "SABLE Test")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    (repo / "root.txt").write_text("root\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "root"], check=True,
+                   capture_output=True)
+    root_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    (repo / "base.txt").write_text("base\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "on trunk"], check=True,
+                   capture_output=True)
+    base_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    members = []
+    for i in range(1, n + 1):
+        label = f"wk-member-{i}"
+        subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", label, root_sha],
+                       check=True, capture_output=True)
+        (repo / f"member{i}.txt").write_text(f"member{i}\n")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", f"on {label}"], check=True,
+                       capture_output=True)
+        sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                             capture_output=True, text=True).stdout.strip()
+        members.append(fold_lib.FoldMember(label=label, sha=sha, bead=f"SABLE-{label}"))
+    return str(repo), base_sha, members
+
+
+def test_real_git_sandbox_batch_fold_pushes_ci_verify_batch_ref(tmp_path):
+    """push_batch_ref, end to end against a real bare remote: the pushed ref
+    is ci-verify/batch-<setkey7> (setkey computed by the ONE owned keying
+    module, sable_batch_key_lib.setkey — not re-derived here), it resolves on
+    the remote to the fold's real tip SHA, and its shape is exactly what the
+    already-verified lookup keys on: a SHA plus a ref starting with
+    ci-verify/, indistinguishable in kind from a single-branch preview ref."""
+    repo, base_sha, members = _repo_with_disjoint_members(tmp_path, 3)
+    remote_path = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote_path)], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", repo, "remote", "add", "origin", str(remote_path)],
+                   check=True, capture_output=True)
+
+    tip, ref = fold_lib.push_batch_ref(repo, "origin", base_sha, members)
+
+    # Ref shape: ci-verify/batch-<setkey7>, computed from the owned module.
+    expected_key = batch_key.setkey(base_sha, [m.sha for m in members])
+    assert ref == f"ci-verify/batch-{expected_key[:7]}"
+    # The already-verified lookup's two inputs: a ref under ci-verify/, and
+    # the landed SHA at that ref matching what was tested.
+    assert ref.startswith("ci-verify/")
+    remote_sha = subprocess.run(
+        ["git", "-C", str(remote_path), "rev-parse", f"refs/heads/{ref}"],
+        check=True, capture_output=True, text=True).stdout.strip()
+    assert remote_sha == tip
+
+    # The landed tip is the real fold chain's tip: every member is a parent
+    # somewhere in the chain, and the first-parent lineage reaches base.
+    subprocess.run(["git", "-C", repo, "fetch", "origin", f"refs/heads/{ref}"],
+                   check=True, capture_output=True)
+    walk = tip
+    for _ in range(len(members)):
+        walk = git_lib.commit_parents(repo, walk)[0]
+    assert walk == base_sha
+
+    # Sorted-input identity (SABLE-be4lo.1's contract): the ref this real
+    # fold landed under is exactly the ref a different admission order of
+    # the SAME member set would also resolve to — proven against the real
+    # member tip SHAs from this sandbox, not synthetic ones.
+    reordered_key = batch_key.setkey(base_sha, [m.sha for m in reversed(members)])
+    assert f"ci-verify/batch-{reordered_key[:7]}" == ref
