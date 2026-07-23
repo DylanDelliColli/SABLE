@@ -373,10 +373,7 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
     ps.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
     ps.add_argument("--dry-run", action="store_true", dest="dry_run",
-                    help="report exactly which refs match the age threshold (and would be "
-                         "deleted) without deleting anything (SABLE-o9b8u) — the same "
-                         "candidate list a real run would act on, including the "
-                         "in-flight-run exclusion")
+                    help="report the refs that would be deleted, deleting nothing (SABLE-o9b8u)")
 
     # SABLE-w0zjm. The gate's own worst-case promote wall-clock, so an operator
     # wrapper DERIVES its timeout instead of keeping a second copy of the number.
