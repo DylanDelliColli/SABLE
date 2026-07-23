@@ -37,6 +37,7 @@ import sys
 import time
 from dataclasses import dataclass
 
+import sable_batch_key_lib as batch_key
 import sable_gate_classify_lib as classify
 import sable_gate_git_lib as git_lib
 from sable_gate_classify_lib import GateError
@@ -54,7 +55,8 @@ def build_preview(repo: str, base_sha: str, branch_sha: str, message: str) -> st
     if mt.returncode != 0:
         raise GateError(3, f"merge-tree failed: {mt.stdout.strip()}")
     tree = mt.stdout.splitlines()[0].strip()
-    ct = git_lib._git(repo, "commit-tree", tree, "-p", base_sha, "-p", branch_sha, "-m", message)
+    parent1, parent2 = batch_key.pair_parents(base_sha, branch_sha)
+    ct = git_lib._git(repo, "commit-tree", tree, "-p", parent1, "-p", parent2, "-m", message)
     return ct.stdout.strip()
 
 
@@ -80,7 +82,7 @@ def adopt_kicked_preview(repo: str, remote: str, branch: str,
         # another worktree), so this repo may not have the commit locally.
         if git_lib._git(repo, "fetch", remote, f"refs/heads/{ref}", check=False).returncode != 0:
             return None
-        if git_lib.commit_parents(repo, remote_sha) != [base_sha, branch_sha]:
+        if git_lib.commit_parents(repo, remote_sha) != batch_key.pair_parents(base_sha, branch_sha):
             return None
         return (remote_sha, ref)
     except Exception:  # noqa: BLE001 — adoption must never break the promote flow

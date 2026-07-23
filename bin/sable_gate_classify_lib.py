@@ -42,8 +42,9 @@ function is unit-testable with no fixtures at all.
 """
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
+
+from sable_batch_key_lib import preview_kick_key  # noqa: F401 — re-exported (SABLE-be4lo.1)
 
 
 # --------------------------------------------------------------------------
@@ -187,19 +188,6 @@ def preview_ref_prefix(name: str) -> str:
     if not safe.strip("-"):
         raise ValueError(f"ref name sanitizes to empty: {name!r}")
     return f"ci-verify/{safe}-"
-
-
-def preview_kick_key(base_sha: str, branch_sha: str) -> str:
-    """The SHARED IDEMPOTENCY KEY for a push-time preview kick (SABLE-jd5fj.1):
-    a pure function of the two commits being merged. A preview is fully
-    determined by (base, branch), but the preview COMMIT's own SHA is not —
-    git commit-tree stamps a committer date, so building the same merge twice
-    yields two distinct SHAs. Keying the ref on the parents instead means the
-    push-time kick, the poll-leg reconciler (jd5fj.2) and promote's adoption
-    check all name the SAME ref for the same merge, so the work happens once."""
-    if not base_sha or not branch_sha:
-        raise ValueError(f"both parent SHAs are required, got {base_sha!r}, {branch_sha!r}")
-    return hashlib.sha1(f"{base_sha}\n{branch_sha}\n".encode()).hexdigest()
 
 
 def preview_kick_ref(branch: str, base_sha: str, branch_sha: str) -> str:
