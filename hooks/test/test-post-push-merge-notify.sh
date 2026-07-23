@@ -1799,7 +1799,15 @@ else
   GX_BARE=$(mktemp -d)
   GX_REPO=$(mktemp -d)
   GX_INT_STUB=$(mktemp -d)
-  trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$GX_BARE" "$GX_REPO" "$GX_INT_STUB"' EXIT
+  # SABLE-1cb2b: reap on EVERY exit path, not only the happy path a trailing
+  # cleanup line covers — a script killed, interrupted, or aborted between the
+  # push above and the explicit cleanup call below must still not leave a
+  # stray for-chuck bead live in the real pool. `gx7p3_cleanup_stray_forchuck`
+  # is defined below (function definitions execute before this trap fires at
+  # real EXIT time); GX_BRANCH is unset if the script dies before reaching its
+  # assignment, in which case no push happened yet either — the guard makes
+  # that a no-op rather than an error under set -u.
+  trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$GX_BARE" "$GX_REPO" "$GX_INT_STUB"; [ -n "${GX_BRANCH:-}" ] && command -v gx7p3_cleanup_stray_forchuck >/dev/null 2>&1 && gx7p3_cleanup_stray_forchuck "$GX_BRANCH"' EXIT
 
   # Safety-net teardown (requirement 2): find and close/relabel ANY real
   # for-chuck bead naming $1, regardless of whether the assertions above it
