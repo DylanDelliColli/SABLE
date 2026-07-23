@@ -236,7 +236,7 @@ fi
 [ -z "$DISPATCH_FILES" ] && exit 0
 
 # Find all in-progress beads (status=in_progress) not in dispatch set
-IN_PROGRESS=$(bd list --status=in_progress --json 2>/dev/null || echo "[]")
+IN_PROGRESS=$(bd list --status=in_progress --json --limit 0 2>/dev/null || echo "[]")
 
 OVERLAPS_JSON=$(echo "$IN_PROGRESS" | DISPATCH_IDS="$DISPATCH_IDS" DISPATCH_FILES="$DISPATCH_FILES" python3 -c "
 import json, sys, os

@@ -260,7 +260,7 @@ def existing_open_tripwire_for(workflow_url_substr: str) -> Optional[str]:
     """Return the bead ID of an existing open tripwire bead for this workflow,
     or None if no such bead exists. Idempotency check before filing."""
 
-    cmd = ["bd", "list", "--status=open", "--label=tripwire", "--json"]
+    cmd = ["bd", "list", "--status=open", "--label=tripwire", "--json", "--limit", "0"]
     try:
         out = subprocess.check_output(cmd, text=True, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
