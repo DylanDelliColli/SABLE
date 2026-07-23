@@ -1182,6 +1182,87 @@ def test_flag_dialog_stalls_carries_evidence_snippet():
     assert "Enter to confirm" in result[0]["evidence"]
 
 
+# --- SABLE-n87ov: reporting a stall reproduces the symptom on the reporter's
+# own audience. The old classifier grepped the WHOLE capture for a dialog
+# affordance substring, so a sable-msg relay QUOTING that substring (to name
+# the earlier true positive for the recipient) rendered the same text into the
+# recipient's healthy pane and re-triggered the detector. The fix restricts the
+# match to the pane's current cursor region -- content after the LAST bare
+# composer prompt line -- since a live overlay owns the bottom of the pane
+# (nothing follows it) while a mention is followed, on an idle pane, by the
+# reappeared empty composer. ---
+
+# ordinary output that merely CONTAINS the same affordance text a real overlay
+# would show, but with the idle composer reappearing below it.
+MENTION_OF_DIALOG_TEXT = (
+    "⟦SABLE-MSG⟧ from optimus: pane %120 is DIALOG-STALLED -- matched "
+    "'(Use arrow keys, Enter to select)'\n"
+    "❯")
+
+
+def test_overlay_evidence_none_for_mention_followed_by_idle_composer():
+    # NEGATIVE CONTROL: a mention of the affordance text, in ordinary output,
+    # is not itself a stall -- the composer redraws idle and empty below it.
+    assert sws.overlay_evidence(MENTION_OF_DIALOG_TEXT) is None
+    assert sws.dialog_stall(MENTION_OF_DIALOG_TEXT) is False
+
+
+def test_overlay_evidence_still_true_for_real_dialog():
+    # POSITIVE CONTROL alongside the negative one above: a genuine overlay (no
+    # composer line follows it) must still flag -- otherwise the fix would
+    # just be "detect nothing", which trivially passes every false-positive
+    # case above.
+    assert sws.overlay_evidence(REAL_PERMISSION_DIALOG) is not None
+    assert sws.dialog_stall(REAL_PERMISSION_DIALOG) is True
+
+
+def test_quoted_evidence_does_not_retrigger_when_relayed_onward():
+    # Acceptance criterion: the [matched: ...] string this tool reports, sent
+    # verbatim to another pane and followed there by that pane's own idle
+    # composer, must not itself cause a fresh DIALOG-STALLED report.
+    evidence = sws.overlay_evidence(REAL_PERMISSION_DIALOG)
+    assert evidence is not None
+    relayed = f"⟦SABLE-MSG⟧ from optimus: matched {evidence!r}\n❯"
+    assert sws.overlay_evidence(relayed) is None
+    assert sws.dialog_stall(relayed) is False
+
+
+def test_self_reference_tool_own_alert_output_does_not_retrigger():
+    # SELF-REFERENCE: the closed loop a manager hits constantly -- capturing
+    # this tool's OWN stdout table row + stderr alert line (reconstructed via
+    # the exact f-strings sable-worker-status prints) into a pane that is
+    # otherwise idle must not itself read as a fresh dialog-stall, even though
+    # the alert text carries the trigger substring in TWO places (the table
+    # row's inline snip and the stderr alert's [matched: ...]-style suffix).
+    evidence = "Enter to select · ↑/↓ to navigate · Esc to cancel"
+    stdout_row = (f"⚠ DIALOG-STALLED %159     optimus    "
+                  f"SABLE-rrn6r      blocked on a dialog/overlay "
+                  f"[matched: {evidence!r}] — dismiss it (Esc) or nudge the pane")
+    stderr_alert = (
+        "sable-worker-status: ⚠ 1 pane(s) STALLED on a dialog/overlay, "
+        f"silently absorbing messages — %159(optimus: {evidence!r}). "
+        "Dismiss (Esc) or nudge each; nothing was auto-cleared "
+        "(SABLE-axp0 v1 is detect-only).")
+    captured_tool_output = stdout_row + "\n" + stderr_alert + "\n❯"
+    assert sws.overlay_evidence(captured_tool_output) is None
+    assert sws.dialog_stall(captured_tool_output) is False
+
+
+def test_flag_dialog_stalls_ignores_mention_but_flags_real_dialog():
+    # the flag_dialog_stalls-level assertion mirroring the bead's two-pane
+    # integration repro: of a pane merely displaying a mention and a pane
+    # genuinely parked on a dialog, only the latter is reported.
+    panes = [
+        {"pane": "%1", "role": "lincoln", "bead": "", "status": "running",
+         "class": "manager", "lane": "lincoln"},
+        {"pane": "%2", "role": "tarzan", "bead": "", "status": "running",
+         "class": "manager", "lane": "tarzan"},
+    ]
+    caps = {"%1": MENTION_OF_DIALOG_TEXT, "%2": REAL_PERMISSION_DIALOG}
+    result = sws.flag_dialog_stalls(panes, None, capture=lambda p: caps[p])
+    assert [r["pane"] for r in result] == ["%2"]
+
+
 def test_flag_dialog_stalls_ignores_busy_and_idle_false_positives():
     # a fleet of the two healthy false-positive panes yields ZERO stalls.
     panes = [
