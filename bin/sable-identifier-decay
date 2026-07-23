@@ -35,28 +35,96 @@ from sable_identifier_decay_lib import (  # noqa: E402
     KNOWN_LIMIT, format_flags, format_unassessed, sweep,
 )
 
+try:
+    import sable_gate_budget_lib as budget_lib  # noqa: E402
+except ImportError:  # pragma: no cover - ships alongside this file in bin/
+    budget_lib = None
+
 EXIT_OK = 0
 EXIT_UNASSESSED = 3
 
-# The sweep runs INSIDE an interactive close/promote. A bd call that hangs is a
-# worse failure than a missed flag, so cap it and report could-not-assess.
-BD_TIMEOUT_S = float(os.environ.get("SABLE_IDREF_TIMEOUT", "20"))
+# Pre-fix constant. Still the fallback when the SSOT below cannot be read at
+# all (no repo, no .github/ci/test-tiers.sh) — never the steady-state budget
+# anymore, see bd_timeout().
+DEFAULT_BD_TIMEOUT_S = 20.0
+
+
+def bd_timeout(repo: str | None = None) -> float:
+    """SABLE-wr6zp: the bd-list query's own run budget, derived from the
+    merge_preview tier's SSOT (.github/ci/test-tiers.sh, via
+    sable_gate_budget_lib.tier_budget_sec) instead of the hand-picked 20s
+    literal that timed out under the exact burst load this check exists to
+    catch — the same SSOT-not-a-literal treatment SABLE-jd5fj.9
+    (_impact_timeout) and SABLE-cmar4.9 (_coverage_floor_timeout) already
+    applied one level up, in sable_gate_promote_lib. A promote already
+    tolerates minutes (the hand-run that found SABLE-50z5g took ~110s
+    against the very store the tool gave up on after 20s); the query was
+    never impossible, the old budget was just shorter than burst-load
+    latency.
+
+    SABLE_IDREF_TIMEOUT is an explicit override and always wins over the
+    SSOT — same env var the pre-fix constant already read, contract
+    unchanged. `repo` defaults to the current working directory (the
+    close-time seam calls this with no -C at all). A missing or broken SSOT
+    (or an unparseable override) falls back to the pre-fix constant (20) —
+    never raises, mirroring _impact_timeout's and _coverage_floor_timeout's
+    never-raises contract."""
+    override = os.environ.get("SABLE_IDREF_TIMEOUT")
+    if override is not None:
+        try:
+            return float(override)
+        except ValueError:
+            return DEFAULT_BD_TIMEOUT_S
+    if budget_lib is None:
+        return DEFAULT_BD_TIMEOUT_S
+    budget = budget_lib.tier_budget_sec(repo or os.getcwd(), "merge_preview")
+    return budget if budget is not None else DEFAULT_BD_TIMEOUT_S
+
+
+class _BdUnavailable(Exception):
+    """bd is not on PATH — retrying will not help, so this short-circuits
+    the retry-once loop below instead of burning a second attempt on it."""
+
+
+def _run_bd_list_once(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(argv, text=True, timeout=timeout,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        raise _BdUnavailable("bd is not on PATH") from None
 
 
 def load_open_beads(repo: str | None) -> tuple[list[dict], str | None]:
-    """Every OPEN + IN_PROGRESS bead, or (empty, reason) if bd could not answer."""
+    """Every OPEN + IN_PROGRESS bead, or (empty, reason) if bd could not answer.
+
+    SABLE-wr6zp: retries the query ONCE on a timeout before giving up. Burst
+    latency is spiky rather than sustained (see bd_timeout's docstring), so a
+    single retry against the same budget covers a transient spike; two
+    consecutive timeouts against a (now much larger, SSOT-derived) budget is
+    treated as a genuinely unanswerable store, not another spike to absorb.
+    A missing bd binary is not retried — it will not appear on a second try."""
     argv = ["bd"]
     if repo:
         argv += ["-C", repo]
     argv += ["list", "--status", "open,in_progress", "--json",
              "--limit", "0", "--no-pager", "--skip-labels"]
-    try:
-        cp = subprocess.run(argv, text=True, timeout=BD_TIMEOUT_S,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except FileNotFoundError:
-        return [], "bd is not on PATH"
-    except subprocess.TimeoutExpired:
-        return [], f"bd list timed out after {BD_TIMEOUT_S:g}s"
+    timeout = bd_timeout(repo)
+
+    cp = None
+    timeout_reason = None
+    for attempt in range(2):
+        try:
+            cp = _run_bd_list_once(argv, timeout)
+            timeout_reason = None
+            break
+        except _BdUnavailable as exc:
+            return [], str(exc)
+        except subprocess.TimeoutExpired:
+            timeout_reason = f"bd list timed out after {timeout:g}s"
+            continue
+    if cp is None:
+        return [], f"{timeout_reason} (retried once, still no answer)"
+
     if cp.returncode != 0:
         detail = (cp.stderr or cp.stdout or "").strip().splitlines()
         return [], f"bd list failed (rc={cp.returncode}): {detail[0] if detail else 'no output'}"

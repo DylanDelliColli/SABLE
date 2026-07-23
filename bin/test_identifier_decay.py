@@ -13,8 +13,11 @@ found by hand — SABLE-gz3v2 <- SABLE-jejx3 — using that bead's VERBATIM note
 line. An instrument that reports a comfortable number without detecting the
 case it was built for is a dead grep.
 """
+import importlib.util
+import os
 import subprocess
 import sys
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
@@ -27,6 +30,15 @@ from sable_identifier_decay_lib import (  # noqa: E402
 )
 
 CLI = Path(__file__).resolve().parent / "sable-identifier-decay"
+
+# In-process import of the extensionless CLI script (same pattern as
+# test_sable_probe.py / test_sable_vacuous_guard_scan.py) so bd_timeout() and
+# load_open_beads()'s retry logic can be exercised directly, without paying a
+# subprocess per case.
+_LOADER = SourceFileLoader("sable_identifier_decay_cli", str(CLI))
+_SPEC = importlib.util.spec_from_loader("sable_identifier_decay_cli", _LOADER)
+idd_cli = importlib.util.module_from_spec(_SPEC)
+_LOADER.exec_module(idd_cli)
 
 
 def bead(bead_id, *, title="a bead", description="", notes=""):
@@ -227,6 +239,119 @@ def test_unassessed_report_is_loud_and_never_reads_as_clean():
     assert "bd is not on PATH" in msg
     assert "NOT a clean result" in msg
     assert "fail-open" in msg.lower()
+
+
+# --------------------------------------------------------------------------
+# SABLE-wr6zp: budget derivation + retry-once-on-timeout
+#
+# The check's whole value is being available at the exact moment (burst
+# load) it is most needed. These tests pin the two halves of the fix: the
+# budget is no longer a hand-picked literal that a burst can outrun, and a
+# transient timeout no longer immediately reports could-not-assess without
+# a second try. The regression guard (a bd that hangs BOTH times must still
+# report could-not-assess, never a false clean) is what stops a future "just
+# raise the number again" patch from silently reintroducing the original
+# false-clean failure at the next load level.
+# --------------------------------------------------------------------------
+
+def _write_bd_stub(bin_dir: Path, script_body: str) -> None:
+    stub = bin_dir / "bd"
+    stub.write_text(f"#!/usr/bin/env bash\n{script_body}\n")
+    stub.chmod(0o755)
+
+
+def _prepend_path(monkeypatch, bin_dir: Path) -> None:
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+def test_budget_is_derived_not_hardcoded(tmp_path, monkeypatch):
+    """Mirrors _impact_timeout's own SSOT tests (SABLE-jd5fj.9): the budget
+    reads .github/ci/test-tiers.sh's merge_preview budget instead of the old
+    hardcoded 20."""
+    monkeypatch.delenv("SABLE_IDREF_TIMEOUT", raising=False)
+    ci_dir = tmp_path / ".github" / "ci"
+    ci_dir.mkdir(parents=True)
+    (ci_dir / "test-tiers.sh").write_text("#!/usr/bin/env bash\necho 12345\n")
+    (ci_dir / "test-tiers.sh").chmod(0o755)
+    assert idd_cli.bd_timeout(str(tmp_path)) == 12345.0
+
+
+def test_budget_override_still_wins_over_the_ssot(tmp_path, monkeypatch):
+    ci_dir = tmp_path / ".github" / "ci"
+    ci_dir.mkdir(parents=True)
+    (ci_dir / "test-tiers.sh").write_text("#!/usr/bin/env bash\necho 12345\n")
+    (ci_dir / "test-tiers.sh").chmod(0o755)
+    monkeypatch.setenv("SABLE_IDREF_TIMEOUT", "42")
+    assert idd_cli.bd_timeout(str(tmp_path)) == 42.0
+
+
+def test_budget_falls_back_to_pre_fix_constant_without_an_ssot(tmp_path, monkeypatch):
+    """No .github/ci/test-tiers.sh at all (e.g. a repo-less caller) must not
+    raise — it gets the old 20s, exactly today's behaviour."""
+    monkeypatch.delenv("SABLE_IDREF_TIMEOUT", raising=False)
+    assert idd_cli.bd_timeout(str(tmp_path)) == 20.0
+
+
+def test_budget_falls_back_on_an_unparseable_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("SABLE_IDREF_TIMEOUT", "not-a-number")
+    assert idd_cli.bd_timeout(str(tmp_path)) == 20.0
+
+
+def test_timeout_reports_could_not_assess_not_clean(tmp_path, monkeypatch):
+    """Regression guard on today's good behaviour: a stubbed bd that hangs on
+    EVERY attempt must produce COULD NOT ASSESS, never an empty clean result.
+    This is the property that must not regress while fixing the timing."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_bd_stub(bin_dir, "sleep 30")
+    _prepend_path(monkeypatch, bin_dir)
+    monkeypatch.setenv("SABLE_IDREF_TIMEOUT", "0.1")
+
+    beads, reason = idd_cli.load_open_beads(None)
+
+    assert beads == []
+    assert reason is not None and "timed out" in reason
+    assert "retried once" in reason, "must report having retried, not just the first failure"
+
+
+def test_timeout_retries_once_before_reporting(tmp_path, monkeypatch):
+    """Stub bd to hang once then succeed; assert exactly one retry and a
+    real verdict, not could-not-assess."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    call_count = tmp_path / "calls"
+    _write_bd_stub(bin_dir, f"""
+COUNT_FILE={call_count}
+N=$( [ -f "$COUNT_FILE" ] && cat "$COUNT_FILE" || echo 0 )
+N=$((N + 1))
+echo "$N" > "$COUNT_FILE"
+if [ "$N" -eq 1 ]; then
+  sleep 30
+fi
+echo '[]'
+""")
+    _prepend_path(monkeypatch, bin_dir)
+    monkeypatch.setenv("SABLE_IDREF_TIMEOUT", "0.2")
+
+    beads, reason = idd_cli.load_open_beads(None)
+
+    assert reason is None, f"a retry that succeeds must not report could-not-assess: {reason}"
+    assert beads == []
+    assert call_count.read_text().strip() == "2", "must retry exactly once, not more, not zero"
+
+
+def test_missing_bd_is_not_retried(tmp_path, monkeypatch):
+    """FileNotFoundError is not a transient spike — retrying it wastes the
+    interactive close/promote's time on a binary that will not appear."""
+    empty_bin = tmp_path / "emptybin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
+    monkeypatch.setenv("SABLE_IDREF_TIMEOUT", "5")
+
+    beads, reason = idd_cli.load_open_beads(None)
+
+    assert beads == []
+    assert reason == "bd is not on PATH"
 
 
 # --------------------------------------------------------------------------
