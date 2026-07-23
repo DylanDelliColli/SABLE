@@ -734,6 +734,115 @@ def test_second_spawn_for_in_progress_bead_is_refused(sock):
         assert len(matches) == 1, listing
 
 
+# --- SABLE-47try: could-not-assess vs declares-nothing, real dispatch path ----
+#
+# These drive the REAL sable-spawn-worker binary against a real tmux server and
+# a real bd-CLI seam (the JSON-backed stand-in above is a genuine subprocess
+# CLI, not a mocked function), with an overlapping bead genuinely in_progress.
+# The complementary real-bd leg — the same distinction through the shell gate
+# against the actual project beads database — is
+# hooks/test/test-overlap-dispatch-e2e.sh cases 4 and 5.
+
+
+def _overlap_env(stub_dir, sock, dd):
+    env = {
+        **_clean_env(),
+        "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+        "SABLE_MAX_LOAD_PER_CORE": "0",
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_SESSION": "sable",
+        "SABLE_WORKER_CMD": "bash --noprofile --norc",
+        "SABLE_DISPATCH_DIR": dd,
+        "SABLE_DISPATCH_READY_TIMEOUT": "0",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+    }
+    env.pop("CLAUDE_AGENT_NAME", None)
+    return env
+
+
+def _overlap_db(stub_dir, dispatch_description):
+    """DB with an in-progress bead holding a claim on shared.py, plus the
+    dispatch target carrying `dispatch_description`."""
+    db_path = Path(stub_dir) / "beads.json"
+    db_path.write_text(json.dumps([
+        {"id": "FAKE-47try-target", "title": "T", "description": dispatch_description,
+         "labels": [], "status": "open", "assignee": None},
+        {"id": "FAKE-47try-active", "title": "active", "description": "",
+         "labels": [], "status": "in_progress", "assignee": "tarzan",
+         "metadata": {"wip_claims": "shared.py"}},
+    ]))
+    _write_fake_bd(Path(stub_dir), db_path)
+    return db_path
+
+
+def _worker_panes(sock, bead_id):
+    listing = _tmux(sock, "list-panes", "-a", "-F",
+                    "#{@sable_role} #{@sable_bead}").stdout
+    return [line for line in listing.splitlines()
+            if line.startswith("worker") and bead_id in line]
+
+
+def test_unreadable_footprint_dispatch_does_not_silently_proceed(sock):
+    """SABLE-47try: the dispatching bead's '## File footprint' heading is
+    PRESENT but names no path, while an overlapping bead is genuinely
+    in_progress. The overlap SCHEDULING CONSTRAINT cannot be evaluated, so the
+    dispatch must NOT proceed — and must not report the 'none' verdict of a
+    check that ran and found nothing. Before the fix this exited 0 and spawned
+    a worker, with no event anywhere recording that the gate declined to run."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        _overlap_db(stub_dir, "Story.\n\n## File footprint\n   \n\n## Test spec\nx")
+        r = subprocess.run(
+            ["python3", str(BIN), "FAKE-47try-target", "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=_overlap_env(stub_dir, sock, dd),
+        )
+        assert r.returncode == 12, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "could-not-assess" in r.stderr
+        assert "FAKE-47try-target" in r.stderr
+        # and no worker was spawned for it
+        assert _worker_panes(sock, "FAKE-47try-target") == []
+
+
+def test_bead_declaring_no_footprint_still_dispatches_over_active_claim(sock):
+    """LOAD-BEARING COMPLEMENT (prove-the-gate-can-release). Same setup, except
+    the dispatch target declares NO footprint at all. Many beads legitimately
+    do. It must still dispatch — a gate that can never release is
+    indistinguishable from correct caution, and this fix would be reverted
+    within a day if it blocked every footprint-less bead."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        _overlap_db(stub_dir, "Ordinary prose with no declared footprint.")
+        r = subprocess.run(
+            ["python3", str(BIN), "FAKE-47try-target", "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=_overlap_env(stub_dir, sock, dd),
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        time.sleep(0.5)
+        assert len(_worker_panes(sock, "FAKE-47try-target")) == 1
+
+
+def test_wellformed_overlapping_footprint_still_denies_with_overlap_code(sock):
+    """The working path is undisturbed: a READABLE footprint that really does
+    collide still denies with the ordinary overlap exit 11, distinct from the
+    could-not-assess exit 12. Two different failures must stay two different
+    exit codes — conflating them is the defect this bead is about."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        _overlap_db(stub_dir, "Story.\n\n## File footprint\nshared.py")
+        r = subprocess.run(
+            ["python3", str(BIN), "FAKE-47try-target", "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=_overlap_env(stub_dir, sock, dd),
+        )
+        assert r.returncode == 11, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "OVERLAP DETECTED" in r.stderr
+        assert "could-not-assess" not in r.stderr
+        assert _worker_panes(sock, "FAKE-47try-target") == []
+
+
 # --- SABLE-676c: claim-then-hold first dispatch must succeed ------------------
 
 
