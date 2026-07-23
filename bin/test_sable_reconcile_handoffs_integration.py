@@ -59,12 +59,26 @@ _ENV_LEAKS = (
 # a committer date old enough that push-age >> the 10-minute settle threshold
 _OLD_DATE = "2001-01-01T00:00:00 +0000"
 
+# SABLE-4709h: live_pane_bead_ids() shells out to $SABLE_RC_TMUX (default
+# "tmux"). This dev host runs a REAL SABLE fleet under a real tmux server —
+# stripping TMUX_PANE above does NOT stop `tmux list-panes -a` from finding
+# that server's default socket and enumerating its ACTUAL live panes, which
+# would couple every rehearsal in this module to whatever real work happens
+# to be running at test time. Point at a binary that cannot exist so the
+# reconciler's _tmux() raises FileNotFoundError and live_pane_bead_ids fails
+# open to an empty set — the exact, hermetic, always-"no live panes" behavior
+# every pre-existing rehearsal here already assumes. The one rehearsal that
+# WANTS a live pane (test_4709h_live_worker_pane_suppresses_filing) overrides
+# this with its own stub tmux script.
+_NO_TMUX = "sable-reconcile-tests-hermetic-no-such-tmux-binary"
+
 
 def _env(home):
     env = {k: v for k, v in os.environ.items() if k not in _ENV_LEAKS}
     env["HOME"] = str(home)
     env["BD_NON_INTERACTIVE"] = "1"
     env["CI"] = "true"
+    env["SABLE_RC_TMUX"] = _NO_TMUX
     return env
 
 
@@ -219,11 +233,11 @@ def _make_work_bead_with_branch_metadata(work, home, branch, *, status="closed")
     return bead_id
 
 
-def _reconcile(work, home, *, dry_run=False):
+def _reconcile(work, home, *, dry_run=False, extra_env=None):
     argv = [sys.executable, str(BIN), "--repo", str(work), "--remote", "origin"]
     if dry_run:
         argv.append("--dry-run")
-    return _run(argv, work, home)
+    return _run(argv, work, home, extra_env=extra_env)
 
 
 def _reconcile_via_timer(work, home, *, repo_via="cli", dry_run=False, extra_env=None):
@@ -880,3 +894,75 @@ def test_5xz68_a_broken_fleet_does_not_skip_the_healthy_one(tmp_path):
     assert len(beads) == 1, f"healthy fleet skipped after a broken one: {beads}\n{r.stdout}"
     assert branch in beads[0]["title"], beads[0]["title"]
     assert r.returncode != 0, f"the broken fleet's failure was swallowed:\n{r.stdout}"
+
+
+# ===========================================================================
+# SABLE-z7gue / SABLE-4709h: content-containment, real git + real bd.
+#
+# z7gue's live instance: a worker branch's tip was NOT an ancestor of the
+# integration branch (a rebase changes every sha), yet its content had
+# already landed at the spine under a DIFFERENT sha — tip-containment
+# (predicate 1) cannot see this, and 'ask both lanes' can't either, because
+# every lane truthfully answers 'not mine' when the work is already on the
+# spine in nobody's hand. 4709h's own triage record names this as one of
+# sixteen [RECONCILE] false-positive firings with zero demonstrated true
+# positives across the shift — so this single real-git+real-bd test carries
+# BOTH the missing known-positive control (a genuinely unlanded branch DOES
+# still file) and the rebase-copy negative (a landed one does NOT), per the
+# spec's "at least the rebase-copy negative" plus the true-positive
+# requirement. Assertions key on the SPECIFIC branch names this test
+# created (SABLE-jd5fj.15 attributable absence), never a global bead count.
+# ===========================================================================
+
+def _land_same_content_on_trunk(work, feat_name, content):
+    """Commit `content` into `feat_name` directly on BASE and push — models a
+    worker branch that was rebased and squash-merged onto the integration
+    branch under a NEW sha, without its own branch ref ever being deleted.
+    `git cherry` computes patch-id from the diff against a commit's own
+    parent, so as long as BASE has not moved since the worker branch forked
+    from it, this commit's patch is byte-identical to the worker branch's own
+    commit — the exact rebase-copy relation z7gue is about — without this
+    fixture needing to run an actual `git rebase`."""
+    _git(work, "checkout", BASE)
+    (work / feat_name).write_text(content)
+    _git(work, "add", feat_name)
+    _git(work, "commit", "-m", "worker feature (landed via squash/rebase onto trunk)")
+    _git(work, "push", "origin", BASE)
+
+
+def test_reconcile_against_real_git_and_real_bd(tmp_path):
+    origin, work, home = _setup(tmp_path)
+
+    # Leg 1 (true positive, the missing known-positive control): a worker
+    # branch pushed, unmerged, work bead closed, no for-chuck bead, and
+    # NOTHING landed anywhere else — must still file exactly one bead naming
+    # it.
+    stranded_bead = _make_work_bead(work, home, status="closed")
+    stranded_branch = _push_worker_branch(work, stranded_bead)
+
+    # Leg 2 (rebase-copy negative, SABLE-z7gue): a second worker branch,
+    # pushed and unmerged by TIP (git merge-base --is-ancestor reads it as
+    # not-an-ancestor), but its content is already on BASE under a different
+    # commit/sha — the ref itself is never deleted, modeling the general
+    # class this floor's predicate 1 gets wrong (z7gue's own instance had the
+    # ref deleted too, but that is a DIFFERENT probe's failure — the ref
+    # being live here is what actually exercises THIS reconciler's
+    # list_origin_wk_branches + ancestry check against the fix).
+    landed_bead = _make_work_bead(work, home, status="closed")
+    landed_branch = _push_worker_branch(work, landed_bead)
+    _land_same_content_on_trunk(work, f"{landed_bead}.txt", "worker feature\n")
+    _git(work, "checkout", BASE)
+
+    cp = _reconcile(work, home)
+    assert cp.returncode == 0, cp.stdout
+    assert f"{stranded_branch}: STRANDED" in cp.stdout, cp.stdout
+    assert f"{landed_branch}: landed-under-different-sha" in cp.stdout, cp.stdout
+
+    beads = _for_chuck_beads(work, home)
+    titles = [b.get("title", "") for b in beads]
+    assert any(stranded_branch in t for t in titles), \
+        f"genuinely unlanded branch {stranded_branch} must file a for-chuck bead: {titles}"
+    assert not any(landed_branch in t for t in titles), \
+        f"rebased-and-landed branch {landed_branch} must file NO for-chuck bead: {titles}"
+    assert len(beads) == 1, \
+        f"exactly one bead expected (the genuine strand only): {titles}"
