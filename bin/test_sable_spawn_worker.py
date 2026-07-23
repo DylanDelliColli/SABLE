@@ -1130,6 +1130,53 @@ def test_assemble_dispatch_prompt_is_the_sole_render_path_for_respawn():
     assert src.count("assemble_dispatch_prompt(") == 2  # def + the one call site
 
 
+# --- per-section declaration form (SABLE-50z5g) -----------------------------
+
+def _states_per_section_declaration_form(text: str) -> bool:
+    """True iff `text` names BOTH the footprint and reads sections AND states
+    their DIFFERENT declaration-form requirements — comma-separated for
+    footprint, slash-or-suffix per entry for reads. Shared by the positive
+    check on the real prompt and the negative controls below so both exercise
+    the identical rule, not two different ones (SABLE-50z5g)."""
+    has_footprint_section = "File footprint" in text
+    has_reads_section = "File reads" in text
+    footprint_rule = "comma-separated" in text
+    reads_rule = "slash" in text and "suffix" in text
+    return has_footprint_section and has_reads_section and footprint_rule and reads_rule
+
+
+def test_dispatch_prompt_states_per_section_declaration_form():
+    """SABLE-50z5g: footprint and reads sections have DIFFERENT parsing
+    hazards — a footprint reformatted one-path-per-line silently drops 3 of 4
+    paths (measured, SABLE-546m5), while the same reformat on a reads section
+    is harmless. Advice that comma-separates BOTH sections is safe-sounding
+    but teaches a uniform-risk model that is false, so the dispatch prompt
+    must name each section AND its own, different requirement — not a shared
+    form applied to both."""
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="sonnet",
+    )
+    assert _states_per_section_declaration_form(p)
+
+    # Negative control 1: only one section named — the same check must fail,
+    # so the assertion above isn't trivially satisfied by any footprint prose.
+    only_footprint = "## File footprint\nMust be comma-separated on one line.\n"
+    assert not _states_per_section_declaration_form(only_footprint)
+
+    # Negative control 2: one uniform form prescribed for both sections — the
+    # exact wrong advice this bead exists to prevent ("comma-separate both" is
+    # safe-sounding but implies uniform risk). It names both sections but
+    # never states the reads-specific slash-or-suffix rule, so it must fail
+    # the same check the real prompt passes — otherwise this test would pass
+    # on the very advice SABLE-50z5g says is wrong.
+    uniform_form = (
+        "## File footprint\nComma-separate every entry on one line.\n"
+        "## File reads\nComma-separate every entry on one line.\n"
+    )
+    assert not _states_per_section_declaration_form(uniform_form)
+
+
 def test_claim_bundle_beads_claims_each_unclaimed_sibling(monkeypatch):
     """Claim-all-up-front (SABLE-q13h DESIGN): every bundled sibling gets the
     same `bd update --claim` the lead bead does, so none of them looks
