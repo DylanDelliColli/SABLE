@@ -683,3 +683,94 @@ def test_the_old_naive_cp_remedy_would_have_broken_the_same_bin(tmp_path):
     broken = subprocess.run([str(scratch / target_name), "--help"], capture_output=True, text=True)
     assert broken.returncode != 0
     assert "ModuleNotFoundError" in broken.stderr
+
+
+# --- SABLE-5gxj3: staleness is scoped to the pinned tool, not the whole
+# shared bin/ snapshot directory it lives in, end to end -------------------
+#
+# The live incident this reproduces: sable-reconcile-handoffs's pinned
+# snapshot content was measured BYTE-IDENTICAL to repo HEAD (git diff --stat
+# across the whole range was empty for that one path), yet sable-doctor
+# reported it "points into an honestly-named snapshot that is BEHIND repo
+# HEAD ... merged but NOT live" -- because dozens of OTHER, unrelated files
+# under bin/ had changed since the pin was taken. Real git checkout, real
+# `sable-bin-install --pin-snapshot`, real `sable-doctor` subprocess -- no
+# mocked filesystem, no mocked git -- and assertions are ATTRIBUTABLE to the
+# specific pinned tool name this test created (SABLE-jd5fj.15), never a
+# global drift count.
+
+def _make_snapshot_pin_with_an_unrelated_sibling(repo: Path, target_name: str):
+    """repo/bin/<target_name> imports a sibling module (needs --pin-snapshot,
+    modeling sable-merge-gate/-reconcile-handoffs after SABLE-jd5fj.3's module
+    split) plus a genuinely UNRELATED plain tool sharing the same bin/
+    directory -- and a real, executable copy of sable-bin-install so
+    --classify / --pin-snapshot run for real against this fixture."""
+    bin_dir = repo / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "sable_gate_helper_lib.py").write_text("MARK = 'v1'\n")
+    (bin_dir / target_name).write_text(
+        "#!/usr/bin/env python3\nfrom sable_gate_helper_lib import MARK\nprint(MARK)\n"
+    )
+    (bin_dir / target_name).chmod(0o755)
+    (bin_dir / "sable-unrelated-tool").write_text("#!/usr/bin/env bash\necho unrelated\n")
+    (bin_dir / "sable-unrelated-tool").chmod(0o755)
+    shutil.copy(REPO / "bin" / "sable-bin-install", bin_dir / "sable-bin-install")
+    (bin_dir / "sable-bin-install").chmod(0o755)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+
+def test_pin_drift_against_real_install_tree(tmp_path):
+    target_name = "sable-merge-gate"
+    repo = tmp_path / "repo"
+    _make_snapshot_pin_with_an_unrelated_sibling(repo, target_name)
+
+    home_scratch = tmp_path / "sandbox-home"
+    bin_dir = home_scratch / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+
+    pin_env = {**os.environ, "HOME": str(home_scratch)}
+    pin_result = subprocess.run(
+        ["bash", str(repo / "bin" / "sable-bin-install"), "--dir", str(bin_dir),
+         "--pin-snapshot", target_name],
+        env=pin_env, capture_output=True, text=True, timeout=30,
+    )
+    assert pin_result.returncode == 0, pin_result.stdout + pin_result.stderr
+    assert (bin_dir / target_name).is_symlink()
+
+    # Advance HEAD, touching only the UNRELATED tool -- the exact false-alarm
+    # shape measured live. The pinned tool's own content never moves.
+    (repo / "bin" / "sable-unrelated-tool").write_text("#!/usr/bin/env bash\necho changed\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "unrelated tool changes"], cwd=repo, check=True)
+
+    clean_check = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(repo), "--claude-dir", str(tmp_path / "claude"),
+         "--bin-dir", str(bin_dir)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert clean_check.returncode == 0, clean_check.stdout + clean_check.stderr
+    assert "sable-doctor: clean" in clean_check.stdout
+    assert "NOT live" not in clean_check.stdout
+    assert target_name not in clean_check.stdout  # attributable: never named as drifted
+
+    # NOW advance the pinned tool's OWN content -- genuine staleness must
+    # still be caught, and named specifically, never as a global count.
+    (repo / "bin" / target_name).write_text(
+        "#!/usr/bin/env python3\nfrom sable_gate_helper_lib import MARK\nprint('v2: ' + MARK)\n"
+    )
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "advance the pinned entrypoint"], cwd=repo, check=True)
+
+    stale_check = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(repo), "--claude-dir", str(tmp_path / "claude"),
+         "--bin-dir", str(bin_dir)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert stale_check.returncode == 1
+    assert "SNAPSHOT-STALE" in stale_check.stdout
+    assert target_name in stale_check.stdout
+    assert "sable-unrelated-tool" not in stale_check.stdout

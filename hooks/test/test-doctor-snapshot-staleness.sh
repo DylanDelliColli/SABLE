@@ -12,10 +12,21 @@
 # switch code was absent from the pin entirely.
 #
 # The invariant this suite pins down: "doctor reports clean" must imply "the
-# pinned content is byte-identical to repo HEAD for every file in the snapshot
-# closure" — and, critically, that verdict must not change across a `bash
-# install.sh` run. install.sh CORRECTLY does not touch a pin (SABLE-mkj6k
+# pinned tool's own installed content is byte-identical to repo HEAD's copy of
+# that same file" — and, critically, that verdict must not change across a
+# `bash install.sh` run. install.sh CORRECTLY does not touch a pin (SABLE-mkj6k
 # pin-preservation); a detector that goes quiet around it is the defect.
+#
+# REVISED by SABLE-5gxj3: staleness is now scoped to the pinned tool's OWN
+# entry-point file, not the whole shared bin/ snapshot directory (see
+# bin/sable-doctor's _check_snapshot_pin docstring) — comparing the whole
+# directory made every pinned tool read stale whenever ANY other, unrelated
+# file under bin/ changed (measured live: sable-reconcile-handoffs
+# byte-identical to HEAD, reported "merged but NOT live" because dozens of
+# unrelated bin/ files had changed since the pin). This suite advances the
+# sibling module ($CLOSURE_LIB) alongside the entry point purely to prove the
+# sibling change is NOT what doctor now names — the STALE-vs-HEAD detail
+# below asserts only the entry point's own name.
 #
 # INTEGRATION: real fs, real git, real sable-bin-install, real install.sh, no
 # mocks. Every install runs against a throwaway clone + throwaway HOME — this
@@ -116,9 +127,9 @@ case "$PIN_TARGET" in
 esac
 PINNED_SHA_DIR="$(dirname "$PIN_TARGET")"
 
-# ---- 2. advance the repo so the pinned bin's CLOSURE changes ---------------
-# A sibling module inside the pin unit, not the entry point: the pin unit is
-# the whole snapshot directory, so staleness must be visible for any file in it.
+# ---- 2. advance the repo so the pinned bin's own entry point changes ------
+# Advance the sibling module too (proves it is NOT named below — SABLE-5gxj3
+# scoped staleness to the entry point alone) alongside the entry point itself.
 printf '\n# SABLE-0jplo staleness fixture — post-pin change\n' >> "$FIXREPO/bin/$CLOSURE_LIB"
 printf '\n# SABLE-0jplo staleness fixture — post-pin change\n' >> "$FIXREPO/bin/$TARGET_BIN"
 git -C "$FIXREPO" add -A
@@ -144,10 +155,10 @@ if grep -q "SNAPSHOT-STALE" "$WORK/doctor-1.log"; then
 else
   fail "doctor #1 reports SNAPSHOT-STALE" "$(cat "$WORK/doctor-1.log")"
 fi
-if grep -q "$CLOSURE_LIB" "$WORK/doctor-1.log" && grep -q "$TARGET_BIN" "$WORK/doctor-1.log"; then
-  pass "doctor #1 NAMES both stale files in the snapshot closure"
+if grep -q "$TARGET_BIN" "$WORK/doctor-1.log" && ! grep -q "$CLOSURE_LIB" "$WORK/doctor-1.log"; then
+  pass "doctor #1 names the entry point, not the unrelated sibling (SABLE-5gxj3)"
 else
-  fail "doctor #1 names the stale files" "$(cat "$WORK/doctor-1.log")"
+  fail "doctor #1 names the entry point, not the sibling" "$(cat "$WORK/doctor-1.log")"
 fi
 
 # ---- 4. the install path must not change that verdict ----------------------
@@ -178,15 +189,15 @@ if grep -q "SNAPSHOT-STALE" "$WORK/doctor-2.log"; then
 else
   fail "doctor #2 still reports SNAPSHOT-STALE" "$(cat "$WORK/doctor-2.log")"
 fi
-if grep -q "$CLOSURE_LIB" "$WORK/doctor-2.log" && grep -q "$TARGET_BIN" "$WORK/doctor-2.log"; then
-  pass "doctor #2 STILL names the stale files after install.sh"
+if grep -q "$TARGET_BIN" "$WORK/doctor-2.log" && ! grep -q "$CLOSURE_LIB" "$WORK/doctor-2.log"; then
+  pass "doctor #2 STILL names the entry point, not the sibling, after install.sh"
 else
-  fail "doctor #2 still names the stale files" "$(cat "$WORK/doctor-2.log")"
+  fail "doctor #2 still names the entry point, not the sibling" "$(cat "$WORK/doctor-2.log")"
 fi
 
 # ---- 5. the invariant, asserted directly ----------------------------------
-# "doctor reports clean" must imply "the pinned content is byte-identical to
-# repo HEAD for every file in the snapshot closure". Re-pin at current HEAD and
+# "doctor reports clean" must imply "the pinned entry point's own content is
+# byte-identical to repo HEAD's copy of that file". Re-pin at current HEAD and
 # assert the entry goes clean — the other half of the biconditional, without
 # which "always report stale" would pass everything above.
 PATH="$STUB:$PATH" HOME="$SANDBOX" SABLE_LIB_DIR="$SANDBOX/.local/lib" \
