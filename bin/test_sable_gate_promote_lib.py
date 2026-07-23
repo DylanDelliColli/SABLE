@@ -231,3 +231,72 @@ def test_bounded_failure_detail_names_the_anchor_rule_used():
     text = f"FAIL: {MARKER}\n" + ("Z" * 5000)
     out = promote_lib._bounded_failure_detail(text)
     assert "[anchor: strict-fail-line]" in out
+
+
+# --------------------------------------------------------------------------
+# SABLE-be4lo.1 regression: the fast-forward integrity check at the end of
+# promote() moved from an inline `landed != preview_sha` to
+# `not batch_key.tip_matches(landed, preview_sha)` when the keying module was
+# consolidated. Same predicate, same GateError(4), same message — this pins
+# that the abort still fires when the base's post-push tip is not the exact
+# object promote just tested.
+# --------------------------------------------------------------------------
+
+REPO = "/repo"
+REMOTE = "origin"
+BASE = "trunk"
+BRANCH = "wk-x"
+BASE_SHA = "a" * 40
+BRANCH_SHA = "b" * 40
+PREVIEW_SHA = "c" * 40
+DRIFTED_SHA = "d" * 40
+
+
+def _cp(returncode=0, stdout=""):
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout)
+
+
+def test_tip_equals_tested_integrity_abort_still_fires(monkeypatch):
+    classify = promote_lib.classify
+    preview = promote_lib.preview
+    git_lib = promote_lib.git_lib
+
+    base_ref = classify.qualify_remote_ref(REMOTE, BASE)
+    branch_ref = classify.qualify_remote_ref(REMOTE, BRANCH)
+    ref = "ci-verify/wk-x-ccccccc"
+
+    # Preconditions unrelated to the integrity check itself — no-op them so
+    # the test isolates exactly the tip-equals-tested assertion.
+    monkeypatch.setattr(promote_lib, "assert_not_frozen", lambda repo: None)
+    monkeypatch.setattr(promote_lib, "assert_landing_pair_satisfied", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "assert_coverage_floor", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "_adoption_miss_optimistic", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "cleanup_after_merge", lambda *a, **kw: None)
+
+    monkeypatch.setattr(git_lib, "_git", lambda repo, *args, check=True: _cp(0))
+    monkeypatch.setattr(preview, "materialize_preview",
+                        lambda *a, **kw: (PREVIEW_SHA, ref, False))
+    monkeypatch.setattr(preview, "acquire_verdict",
+                        lambda repo, ref, sha: classify.Verdict(
+                            "success", "http://run/1", sha, ref, source="waited"))
+
+    # base_ref resolves to BASE_SHA for the pre-push read and the stale-base
+    # check, then DRIFTED_SHA on the THIRD read — the post-push landed tip —
+    # so the push itself is reported as succeeding but what landed is not the
+    # object that was promoted.
+    base_reads = {"n": 0}
+
+    def _resolve(repo, ref_arg):
+        if ref_arg == branch_ref:
+            return BRANCH_SHA
+        assert ref_arg == base_ref, f"unexpected ref resolved: {ref_arg!r}"
+        base_reads["n"] += 1
+        return DRIFTED_SHA if base_reads["n"] >= 3 else BASE_SHA
+
+    monkeypatch.setattr(git_lib, "resolve_commit", _resolve)
+
+    with pytest.raises(promote_lib.GateError) as exc:
+        promote_lib.promote("SABLE-x", BRANCH, BASE, REPO, REMOTE, "optimus", None)
+    assert exc.value.code == 4
+    assert f"tip {DRIFTED_SHA}" in str(exc.value)
+    assert f"tested preview {PREVIEW_SHA}" in str(exc.value)

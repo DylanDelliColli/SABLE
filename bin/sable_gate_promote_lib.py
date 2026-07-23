@@ -85,6 +85,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+import sable_batch_key_lib as batch_key
 import sable_coverage_floor_lib as coverage_floor_lib
 import sable_footprint_lib as footprint_lib
 import sable_gate_budget_lib as budget_lib
@@ -1937,7 +1938,7 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
                 raise GateError(23, f"base {base} advanced during CI; preview {preview_sha} is non-ff — rebuild and re-gate")
             git_lib._git(repo, "fetch", remote, base)
             landed = git_lib.resolve_commit(repo, base_ref)
-            if landed != preview_sha:
+            if not batch_key.tip_matches(landed, preview_sha):
                 # F3 (tarzan review): defensive integrity guard. Under chuck's
                 # serialized push discipline (single writer to the integration
                 # branch) this cannot fire — the fast-forward above is the last write

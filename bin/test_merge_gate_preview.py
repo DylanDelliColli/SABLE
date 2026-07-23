@@ -266,6 +266,34 @@ def test_adopt_returns_the_kicked_preview_when_parents_match(monkeypatch):
     assert smg.adopt_kicked_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) == (PREVIEW_SHA, ref)
 
 
+# --- SABLE-be4lo.1 regression: keying-module consolidation changes nothing ---
+
+def test_build_preview_commit_tree_parents_are_base_then_branch(monkeypatch):
+    """The two-parent build (preview_lib.py:57) now orders its commit-tree
+    parents via batch_key.pair_parents instead of the literal base_sha,
+    branch_sha pair — the call must still be byte-identical: base first,
+    branch second."""
+    fake = FakeGit()
+    monkeypatch.setattr(git_lib, "_git", fake)
+    preview_lib.build_preview(REPO, BASE_SHA, BRANCH_SHA, "msg")
+    ct_calls = [c for c in fake.calls if c[0] == "commit-tree"]
+    assert len(ct_calls) == 1
+    assert ct_calls[0][2:6] == ("-p", BASE_SHA, "-p", BRANCH_SHA)
+
+
+def test_adoption_identity_check_stays_byte_identical_after_consolidation(monkeypatch):
+    """The adoption identity check (preview_lib.py:83) now compares against
+    batch_key.pair_parents(base_sha, branch_sha) instead of the literal
+    [base_sha, branch_sha] — same comparison, same result both ways."""
+    fake, ref = _kicked_fake(parents=(BASE_SHA, BRANCH_SHA))
+    monkeypatch.setattr(git_lib, "_git", fake)
+    assert smg.adopt_kicked_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) == (PREVIEW_SHA, ref)
+    # Negative control: a swapped-order pair must still fail the identity check.
+    fake2, _ = _kicked_fake(parents=(BRANCH_SHA, BASE_SHA))
+    monkeypatch.setattr(git_lib, "_git", fake2)
+    assert smg.adopt_kicked_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) is None
+
+
 def test_adopt_declines_when_no_kick_happened(monkeypatch):
     monkeypatch.setattr(git_lib, "_git", FakeGit())
     assert smg.adopt_kicked_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA) is None
@@ -575,3 +603,92 @@ def test_report_verdict_prints_none_when_nothing_was_kicked(monkeypatch, capsys)
     assert rc == 0
     assert out["state"] == "none"
     assert out["promotable"] is False
+
+
+# --------------------------------------------------------------------------
+# Integration: real git sandbox (SABLE-be4lo.1)
+#
+# Everything above mocks git_lib._git. These two tests run build_preview and
+# preview_kick_ref through REAL git, in a real repo, to prove the keying-
+# module consolidation left the single-branch path byte-identical: same
+# parent order, same ref shape, no mock standing in for the actual object
+# git produces.
+# --------------------------------------------------------------------------
+
+def _real_repo_with_base_and_branch(tmp_path):
+    """A real repo with two divergent branches — trunk (base) and wk-x
+    (branch) — each one commit past a shared root, so their merge-tree is a
+    clean two-way merge with no conflict."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (("init", "-q", "-b", "trunk"), ("config", "user.email", "t@sable.invalid"),
+                 ("config", "user.name", "SABLE Test")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    (repo / "root.txt").write_text("root\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "root"], check=True,
+                   capture_output=True)
+    root_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    (repo / "base.txt").write_text("base\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "on trunk"], check=True,
+                   capture_output=True)
+    base_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "wk-x", root_sha],
+                   check=True, capture_output=True)
+    (repo / "branch.txt").write_text("branch\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "on wk-x"], check=True,
+                   capture_output=True)
+    branch_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                                capture_output=True, text=True).stdout.strip()
+    return str(repo), base_sha, branch_sha
+
+
+def test_real_git_sandbox_single_branch_preview_parents_and_ref_byte_match(tmp_path):
+    """Build a single-branch preview through the refactored path with REAL
+    git (build_preview -> batch_key.pair_parents -> commit-tree), then assert
+    the built commit's actual parents and the ci-verify ref name it would be
+    pushed under are exactly what the pre-consolidation code produced:
+    parents == [base_sha, branch_sha], ref == ci-verify/<branch>-<sha7>."""
+    repo, base_sha, branch_sha = _real_repo_with_base_and_branch(tmp_path)
+    message = f"ci-verify merge-preview: {BRANCH} onto {BASE} (SABLE-x)"
+
+    preview_sha = preview_lib.build_preview(repo, base_sha, branch_sha, message)
+
+    assert git_lib.commit_parents(repo, preview_sha) == [base_sha, branch_sha]
+
+    ref = classify.preview_ref_name(BRANCH, preview_sha)
+    assert ref == f"ci-verify/{BRANCH}-{preview_sha[:7]}"
+
+    kick_ref = smg.preview_kick_ref(BRANCH, base_sha, branch_sha)
+    assert kick_ref.startswith(f"ci-verify/{BRANCH}-")
+    assert kick_ref.count("/") == 1
+
+
+def test_real_git_sandbox_materialize_preview_pushes_the_real_object(tmp_path):
+    """materialize_preview's fresh-build path (no kick to adopt) end to end
+    against a real bare remote: the pushed ref resolves to a commit whose
+    parents are exactly [base_sha, branch_sha]."""
+    repo, base_sha, branch_sha = _real_repo_with_base_and_branch(tmp_path)
+    remote_path = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote_path)], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", repo, "remote", "add", "origin", str(remote_path)],
+                   check=True, capture_output=True)
+
+    preview_sha, ref, adopted = preview_lib.materialize_preview(
+        repo, "origin", BRANCH, BASE, base_sha, branch_sha, "SABLE-x")
+    assert adopted is False
+
+    remote_sha = subprocess.run(
+        ["git", "-C", str(remote_path), "rev-parse", f"refs/heads/{ref}"],
+        check=True, capture_output=True, text=True).stdout.strip()
+    assert remote_sha == preview_sha
+    subprocess.run(["git", "-C", repo, "fetch", "origin", f"refs/heads/{ref}"],
+                   check=True, capture_output=True)
+    assert git_lib.commit_parents(repo, preview_sha) == [base_sha, branch_sha]
