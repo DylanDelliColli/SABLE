@@ -109,6 +109,15 @@ sys.exit(0)
 PYEOF
 cat > "$STUB_DIR/gh" <<'EOF'
 #!/usr/bin/env bash
+# SABLE-xw32f: configurable so PART E's QUEUED-AT-SEAT cases can report an
+# in-flight or terminal Actions run via STUB_GH_RUN_LIST_JSON. Every OTHER
+# test in this suite relies on the pre-existing default below (exit 1 —
+# "gh unavailable", which ref_has_inflight_run fails open on to
+# not-in-flight) and stays unaffected unless that var is set.
+if [ "${1:-}" = "run" ] && [ "${2:-}" = "list" ] && [ -n "${STUB_GH_RUN_LIST_JSON:-}" ]; then
+  echo "$STUB_GH_RUN_LIST_JSON"
+  exit 0
+fi
 exit 1
 EOF
 cat > "$STUB_DIR/sable-msg" <<'EOF'
@@ -223,6 +232,8 @@ run_reconcile() {
       STUB_BD_WORKBEAD_JSON="${STUB_BD_WORKBEAD_JSON:-[]}" \
       STUB_BD_WORKBEAD_RC="${STUB_BD_WORKBEAD_RC:-0}" \
       SABLE_HOLD_STALE_DAYS="${SABLE_HOLD_STALE_DAYS:-3}" \
+      STUB_GH_RUN_LIST_JSON="${STUB_GH_RUN_LIST_JSON:-}" \
+      SABLE_QUEUED_STALE_MIN="${SABLE_QUEUED_STALE_MIN:-120}" \
       python3 "$RECONCILE" --repo "$WORK" --remote origin --age-min "$age_min"
 }
 
@@ -553,6 +564,91 @@ if [ "$(ci_ref_count)" -eq 1 ]; then
   pass "D4 SABLE-jejx3: the preview-kick leg still fires for a branch whose hold state is unreadable"
 else
   fail "D4 SABLE-jejx3: preview-kick must stay structurally independent of hold state" "refs=[$(ci_refs)]"
+fi
+
+# ==========================================================================
+# PART E — SABLE-xw32f: QUEUED AT THE SEAT is a reported, non-stranded
+# outcome, not a suppression.
+#
+# A branch with a ci-verify preview IN FLIGHT satisfies the ordinary
+# stranded predicate identically to abandoned work — under burst load, six
+# such branches (already in chuck's hands, previews running) would have been
+# re-filed as for-chuck handoffs as fast as chuck closed them. This suite
+# kicks a REAL preview via the REAL hook (the SAME preview_kick_ref key the
+# poll leg's own no-op check already uses — one source of truth, not a
+# second one invented for the test), then drives the REAL reconciler with a
+# controllable `gh` stub reporting the run in-flight vs. terminal.
+# ==========================================================================
+
+# (E1) a branch with a genuinely in-flight preview: no handoff is filed, and
+# the sweep NAMES it queued, with a count.
+fresh_pair e-queued
+E1_BRANCH="$BRANCH"
+run_hook "$BRANCH"
+if [ "$(await_ref_count 1)" -lt 1 ]; then
+  fail "E1 SABLE-xw32f precondition: the hook must have kicked a real ci-verify ref" "refs=[$(ci_refs)]"
+else
+  pass "E1 precondition: a real ci-verify preview ref exists for $BRANCH"
+fi
+CLOSED_JSON="[{\"id\": \"SABLE-work\", \"status\": \"closed\", \"metadata\": {\"branch\": \"$BRANCH\"}}]"
+CALLLOG="$TMPROOT/e-queued-bdcalls.log"
+OUT="$(BD_CALL_LOG="$CALLLOG" STUB_BD_WORKBEAD_JSON="$CLOSED_JSON" \
+       STUB_GH_RUN_LIST_JSON='[{"status":"in_progress"}]' run_reconcile)"; RC=$?
+E1_OUT="$OUT"
+if [ "$RC" -eq 0 ] && ! grep -q "^create " "$CALLLOG" 2>/dev/null; then
+  pass "E1 SABLE-xw32f: a branch with an in-flight preview files NO for-chuck handoff"
+else
+  fail "E1 SABLE-xw32f: a queued branch must not file" "rc=$RC out=$OUT"
+fi
+if printf '%s' "$OUT" | grep -q "$BRANCH: QUEUED("; then
+  pass "E1 SABLE-xw32f: the queued branch is NAMED, not silently skipped (SABLE-2az2x's constraint)"
+else
+  fail "E1 SABLE-xw32f: a queued branch must be reported by name" "out=$OUT"
+fi
+SUMMARY="$(printf '%s\n' "$OUT" | grep '^sable-reconcile-handoffs:')"
+if printf '%s' "$SUMMARY" | grep -q "1 queued-at-seat branch(es)" \
+   && printf '%s' "$SUMMARY" | grep -q "$BRANCH"; then
+  pass "E1 SABLE-xw32f: the SUMMARY carries a queued count naming the branch"
+else
+  fail "E1 SABLE-xw32f: summary must name queued branches with a count" "summary=[$SUMMARY]"
+fi
+
+# (E2) same ci-verify ref, but Actions now reports it TERMINAL (completed) —
+# a stale, uncleaned-up ref must NOT read as still-queued forever; the
+# branch falls through to the ordinary predicate and files.
+CALLLOG="$TMPROOT/e-terminal-bdcalls.log"
+OUT="$(BD_CALL_LOG="$CALLLOG" STUB_BD_WORKBEAD_JSON="$CLOSED_JSON" \
+       STUB_GH_RUN_LIST_JSON='[{"status":"completed"}]' run_reconcile)"; RC=$?
+if [ "$RC" -eq 0 ] && grep -q "^create " "$CALLLOG" 2>/dev/null; then
+  pass "E2 SABLE-xw32f: a TERMINAL preview run does not swallow a real strand — the branch still files"
+else
+  fail "E2 SABLE-xw32f: a terminal preview must not suppress filing forever" "rc=$RC out=$OUT"
+fi
+
+# (E2-positive-control) a SEPARATE branch with NO preview kicked at all DOES
+# file — proving the sweep is capable of filing in this exact fixture
+# configuration, so E1's silence is the queued check's doing, not a broken
+# harness (xw32f's own required positive control).
+fresh_pair e-no-preview
+CALLLOG="$TMPROOT/e-no-preview-bdcalls.log"
+OUT="$(BD_CALL_LOG="$CALLLOG" STUB_BD_WORKBEAD_JSON="$CLOSED_JSON" run_reconcile)"; RC=$?
+if [ "$RC" -eq 0 ] && grep -q "^create " "$CALLLOG" 2>/dev/null; then
+  pass "E2 POSITIVE CONTROL: a branch with no preview at all still files (the sweep can file in this run)"
+else
+  fail "E2 POSITIVE CONTROL: an unqueued, genuinely stranded branch must still file" "rc=$RC out=$OUT"
+fi
+
+# (E3) the preview-kick leg (jd5fj.2) stays structurally independent of the
+# QUEUED check — reading P1/P4 only, exactly as SABLE-jejx3's D4 pins for
+# HELD. E1's own run (captured in E1_OUT, the SAME queued branch) already
+# printed its preview-kick line BEFORE classify_branch ever ran (reconcile()
+# runs the preview-kick pass unconditionally per branch, ahead of the
+# stranded/queued classification) — confirm that line is there, so a queued
+# verdict is never mistaken for having silently disabled CI warm-up.
+if printf '%s' "$E1_OUT" | grep -q "$E1_BRANCH: preview-kick kick-ok"; then
+  pass "E3 SABLE-xw32f: the preview-kick leg still fires independently of the queued predicate"
+else
+  fail "E3 SABLE-xw32f: preview-kick must stay structurally independent of the queued check" "E1_OUT=$E1_OUT"
 fi
 
 echo "----------------------------------------------------------------------"

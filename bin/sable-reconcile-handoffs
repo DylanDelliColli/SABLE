@@ -71,11 +71,11 @@ hook and sable-merge-gate use post-SABLE-dtp1 (imported from bin/sable-merge-gat
 resolve_integration_branch) — never a hardcoded main/tmux-only, so ancestry is
 judged against the branch this repo actually integrates onto.
 
-TWO MORE NON-STRANDED OUTCOMES, CHECKED RIGHT AFTER HOLD (SABLE-4709h)
+THREE MORE NON-STRANDED OUTCOMES, CHECKED RIGHT AFTER HOLD (SABLE-4709h)
 ------------------------------------------------------------------------
 A shift's worth of sixteen [RECONCILE] firings triaged to ZERO genuinely
-stranded branches (SABLE-4709h). Two of the surviving healthy states were not
-distinguishable from a real strand by ANY predicate above:
+stranded branches (SABLE-4709h). Three of the surviving healthy states were
+not distinguishable from a real strand by ANY predicate above:
 
   IN-ACTIVE-REVISE    a live tmux worker pane is bound (via @sable_bead) to
                       this branch's work bead RIGHT NOW — a manager already
@@ -108,6 +108,35 @@ distinguishable from a real strand by ANY predicate above:
                       floor's own stranded remedy is a WRITE to the spine and
                       an indeterminate reading must never assert containment
                       it cannot fully back.
+
+  QUEUED-AT-THE-SEAT  a ci-verify preview is IN FLIGHT for this branch's exact
+                      current sha pair (SABLE-xw32f) — under burst load, six
+                      branches legitimately queued for CI satisfied the
+                      stranded predicate identically to abandoned work, and a
+                      real (non-dry-run) sweep would have re-filed handoffs
+                      for work already in chuck's hands as fast as he closed
+                      them. Checked via branch_queued_at_seat: the SAME
+                      shared idempotency ref attempt_preview_kick's own no-op
+                      check already keys on (classify.preview_kick_ref), so
+                      'is this branch queued' and 'would kicking it be a
+                      no-op' resolve from one source of truth. Only covers
+                      the KICKED-preview ref scheme (hook or this floor's own
+                      poll leg) — a preview built directly by `sable-merge-
+                      gate promote` uses a different, bead-keyed ref scheme
+                      and is a known, logged scope gap, not a silent one.
+                      Checked AFTER content-containment and deliberately: a
+                      '+' (not-patch-id-equivalent) reading from that check
+                      is NOT proof of stranded on its own — a patch-id can
+                      change mid-queue (a rebase or conflict-resolution edit
+                      while the branch sits at the seat) — so '+' means
+                      UNKNOWN until this check also clears. AGE-BOUNDED
+                      (mirrors hold_since/hold_until): a preview in flight
+                      longer than $SABLE_QUEUED_STALE_MIN (default 120min)
+                      escalates back to ordinary classification rather than
+                      suppressing indefinitely — the same argument that made
+                      SABLE-jejx3's holds carry an age. Reported as its own
+                      named outcome with a count every cadence, never a
+                      silent skip (SABLE-2az2x's constraint).
 
 ACTION: for each stranded branch, file ONE `for-chuck,coord` bead whose title
 names the branch. Chuck merges it from the pool exactly as he would a
@@ -142,6 +171,10 @@ is unit-testable without real git / bd / tmux):
                                                     SABLE_RC_TMUX    (tmux)
   SABLE_RECONCILE_AGE_MIN  push-age threshold, minutes (10)
   SABLE_HOLD_STALE_DAYS    a hold older than this is flagged for review (3)
+  SABLE_QUEUED_STALE_MIN   a queued-at-seat preview older than this many
+                           minutes escalates to ordinary classification (120)
+  SABLE_MG_GH  (gh)  reused from sable-merge-gate's own env seam for the
+                     queued-at-seat Actions check (branch_queued_at_seat)
 
 Usage:
   sable-reconcile-handoffs [--repo PATH] [--remote NAME] [--age-min N]
@@ -182,6 +215,13 @@ _MG_LOADER.exec_module(_smg)
 resolve_integration_branch = _smg.resolve_integration_branch
 qualify_remote_ref = _smg.qualify_remote_ref
 kick_preview = _smg.kick_preview
+# SABLE-xw32f queued-at-seat check — top-level bindings (not `_smg.git_lib....`
+# inline) so tests can monkeypatch them the same way every other reused
+# sable-merge-gate seam here is monkeypatched (see kick_preview above).
+resolve_commit = _smg.git_lib.resolve_commit
+remote_ref_commit = _smg.git_lib.remote_ref_commit
+preview_kick_ref = _smg.classify.preview_kick_ref
+ref_has_inflight_run = _smg.preview_lib.ref_has_inflight_run
 
 # --------------------------------------------------------------------------
 # Reuse the fleet pane inventory — SINGLE SOURCE OF TRUTH (SABLE-4709h
@@ -610,6 +650,24 @@ def branch_tip_age_seconds(repo: str, remote: str, branch: str, now: float) -> f
         return None
 
 
+def preview_ref_age_seconds(repo: str, sha: str, now: float) -> float | None:
+    """Age of a ci-verify preview ref's commit, given its SHA (already
+    resolved via remote_ref_commit's `ls-remote`). Reads the commit LOCALLY
+    (`git log -1 --format=%ct <sha>`, no network) — reconcile()'s own blanket
+    `git fetch <remote> --prune` at the top of every sweep already pulled the
+    object regardless of which local ref name it landed under, since a
+    fetch's default refspec covers every `refs/heads/*` including ci-verify/*.
+    None on any resolution failure (SABLE-xw32f's queued check fails open on
+    this exactly like branch_tip_age_seconds does for predicate 4)."""
+    cp = _git(repo, "log", "-1", "--format=%ct", sha, check=False)
+    if cp.returncode != 0:
+        return None
+    try:
+        return now - float(cp.stdout.strip())
+    except ValueError:
+        return None
+
+
 def find_work_bead_records(repo: str, branch: str) -> tuple[list[dict], bool]:
     """ALL work-bead records joined to the branch, plus whether resolution was
     READABLE.
@@ -899,6 +957,77 @@ def branch_content_contained(repo: str, remote: str, branch: str,
                   f"at the spine under a different sha)")
 
 
+DEFAULT_QUEUED_STALE_MIN = 120.0  # 2h — a preview should not run this long
+
+
+def branch_queued_at_seat(repo: str, remote: str, branch: str, integration_branch: str,
+                          now: float, queued_stale_min: float = DEFAULT_QUEUED_STALE_MIN
+                          ) -> tuple[bool, str]:
+    """SABLE-xw32f: is `branch` actively being processed at the merge seat
+    RIGHT NOW — a ci-verify preview ref exists for its exact (base, branch)
+    sha pair and Actions shows the run has not yet completed? Under burst
+    load a branch legitimately queued for CI satisfies the ordinary stranded
+    predicate IDENTICALLY to abandoned work (unmerged, work bead open/
+    in-progress, no for-chuck handoff, past the settle window) — chuck's
+    live incident was six such branches, all already in his hands, that a
+    real (non-dry-run) sweep would have re-filed as fast as he closed them.
+
+    Reuses the SAME shared idempotency key attempt_preview_kick's own no-op
+    check already keys on (classify.preview_kick_ref, sable-merge-gate) — 'is
+    this branch queued' and 'would kicking it be a no-op' resolve from the
+    identical ref, one source of truth, not a second one invented here. Only
+    covers the KICKED-preview ref scheme (hook or this floor's own poll leg);
+    a preview built directly by `sable-merge-gate promote` uses a DIFFERENT
+    ref-naming scheme keyed on the bead rather than the branch and is NOT
+    covered by this check — a known scope gap, not silently dropped (bd q
+    logged it).
+
+    Deliberately does NOT treat `git cherry`'s '+' result as proof of
+    anything (optimus's night-shift audit measured this directly): a
+    patch-id changes across a rebase or conflict-resolution edit while the
+    branch is genuinely queued at the seat, so a '+' from
+    branch_content_contained is UNKNOWN, never STRANDED, until THIS or
+    another discriminator resolves it — content-containment and queued-
+    at-seat are complementary, not substitutable.
+
+    AGE-BOUNDED (xw32f's own requirement, mirroring hold_since/hold_until on
+    SABLE-jejx3's holds): a preview that has been in flight longer than
+    `queued_stale_min` is exactly how a genuinely dropped branch would
+    masquerade as in-progress forever, so QUEUED escalates back to the
+    ordinary predicate rather than suppressing indefinitely. The clock here
+    is the PREVIEW REF's own commit date, never the branch's own push age —
+    a branch can be old (pushed long before this cadence) while its preview
+    was kicked moments ago, and keying staleness on the branch's push age
+    would misclassify a perfectly fresh queue as stale on every branch this
+    floor's own settle window (predicate 4) already required to be old.
+
+    Fails OPEN to NOT-QUEUED on any git/gh resolution failure (unresolvable
+    sha, `gh` absent, an Actions API error or hang — ref_has_inflight_run is
+    itself already fail-open) — never wedges the ordinary stranded predicate
+    behind an unanswerable seat-status question."""
+    try:
+        base_ref = qualify_remote_ref(remote, integration_branch)
+        branch_ref = qualify_remote_ref(remote, branch)
+        base_sha = resolve_commit(repo, base_ref)
+        branch_sha = resolve_commit(repo, branch_ref)
+        ref = preview_kick_ref(branch, base_sha, branch_sha)
+    except Exception as exc:  # noqa: BLE001 — an unresolvable sha must never crash the sweep
+        return (False, f"queued-check-unresolvable({exc})")
+    existing = remote_ref_commit(repo, remote, ref)
+    if not existing:
+        return (False, "no-preview-ref")
+
+    ref_age = preview_ref_age_seconds(repo, existing, now)
+    if ref_age is not None and ref_age > queued_stale_min * 60.0:
+        return (False, f"queued-check-stale(preview ref age {ref_age:.0f}s "
+                        f"exceeds {queued_stale_min}min queued-stale bound — "
+                        f"escalating to ordinary classification)")
+
+    if ref_has_inflight_run(repo, ref):
+        return (True, f"QUEUED(preview {ref} in flight at the seat)")
+    return (False, f"preview-ref-present-but-terminal({ref})")
+
+
 # --------------------------------------------------------------------------
 # Classification + orchestration
 # --------------------------------------------------------------------------
@@ -907,7 +1036,9 @@ def classify_branch(repo: str, remote: str, branch: str, integration_branch: str
                     open_beads: list[dict] | None, threshold_minutes: float,
                     now: float, hold: dict | str | None = None,
                     stale_days: float = DEFAULT_HOLD_STALE_DAYS,
-                    live_bead_ids: set[str] | None = None) -> tuple[bool, str, str | None]:
+                    live_bead_ids: set[str] | None = None,
+                    queued_stale_min: float = DEFAULT_QUEUED_STALE_MIN
+                    ) -> tuple[bool, str, str | None]:
     """Apply the stranded predicate to ONE branch. Returns (is_stranded, reason,
     work_status). Cheap/pure checks first; the bead-status lookup (a subprocess)
     runs only after ancestry + for-chuck rule the branch in as a live candidate.
@@ -957,6 +1088,16 @@ def classify_branch(repo: str, remote: str, branch: str, integration_branch: str
     if contained:
         return (False, f"landed-under-different-sha({contained_detail})", None)
 
+    # SABLE-xw32f: checked AFTER content-containment, deliberately, so a '+'
+    # (not-yet-landed) reading from branch_content_contained is never treated
+    # as proof of stranded on its own — a patch-id can change mid-queue (a
+    # rebase or conflict-resolution edit while the branch sits at the seat),
+    # so '+' means UNKNOWN, not stranded, until THIS check also clears.
+    queued, queued_detail = branch_queued_at_seat(
+        repo, remote, branch, integration_branch, now, queued_stale_min)
+    if queued:
+        return (False, queued_detail, None)
+
     if branch_named_by_open_for_chuck(open_beads, branch):
         return (False, "handoff-already-on-record", None)
 
@@ -974,7 +1115,8 @@ def classify_branch(repo: str, remote: str, branch: str, integration_branch: str
 
 
 def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool,
-              stale_days: float = DEFAULT_HOLD_STALE_DAYS) -> int:
+              stale_days: float = DEFAULT_HOLD_STALE_DAYS,
+              queued_stale_min: float = DEFAULT_QUEUED_STALE_MIN) -> int:
     integration_branch = resolve_integration_branch(repo)
     # Refresh remote-tracking refs so ancestry + age read origin's current
     # truth. SABLE-6sdpx: git exits nonzero here on a real network/auth
@@ -1007,6 +1149,7 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool,
     stranded: list[tuple[str, str | None]] = []
     held: list[tuple[str, dict]] = []
     hold_unreadable: list[str] = []
+    queued: list[str] = []
     unassessed = 0
     kick_candidates = 0
     kicked = 0
@@ -1040,12 +1183,14 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool,
 
         is_stranded, reason, status = classify_branch(
             repo, remote, br, integration_branch, open_beads, threshold_minutes,
-            now, hold, stale_days, live_bead_ids)
+            now, hold, stale_days, live_bead_ids, queued_stale_min)
         print(f"  {br}: {reason}")
         if isinstance(hold, dict):
             held.append((br, hold))
         elif hold == HOLD_UNKNOWN:
             hold_unreadable.append(br)
+        if reason.startswith("QUEUED("):
+            queued.append(br)
         if is_stranded:
             stranded.append((br, status))
         elif corpus_unknown and reason == "handoff-already-on-record":
@@ -1091,6 +1236,17 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool,
               f"neither held nor not-held could be established, so nothing was "
               f"filed for it this cadence")
 
+    # SABLE-xw32f: QUEUED branches are NAMED, not silently skipped — the exact
+    # constraint SABLE-2az2x's instrument-cannot-say-'could-not-assess' lesson
+    # and jejx3's hold re-report both established: a suppressed report must
+    # never look identical to nothing-to-report. 'the seat is busy' has its
+    # own visible line, every cadence.
+    if queued:
+        print(f"  --- QUEUED AT THE SEAT ({len(queued)}) — preview in flight, "
+              f"already owned; not stranded ---")
+        for br in queued:
+            print(f"  QUEUED {br}")
+
     # SABLE-2az2x: an UNKNOWN for-chuck corpus makes the reconciler assume-named
     # (skip-filing) for every unmerged branch it sees, cadence after cadence, if
     # the underlying query failure is PERSISTENT rather than transient — and the
@@ -1119,14 +1275,18 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool,
         held_note += (f"; {len(hold_unreadable)} branch(es) with UNREADABLE "
                       f"hold state [{', '.join(hold_unreadable)}]")
     held_summary = f"{len(held)} held branch(es){held_note}"
+    queued_note = f" [{', '.join(queued)}]" if queued else ""
+    queued_summary = f"{len(queued)} queued-at-seat branch(es){queued_note}"
 
     if dry_run:
         print(f"sable-reconcile-handoffs [DRY-RUN]: {len(stranded)} stranded branch(es) "
               f"classified, 0 filed (dry-run){corpus_note}; {held_summary}; "
+              f"{queued_summary}; "
               f"{kick_candidates} preview-kick candidate(s), 0 kicked (dry-run).")
     else:
         print(f"sable-reconcile-handoffs: {len(stranded)} stranded branch(es), "
               f"{filed} for-chuck bead(s) filed{corpus_note}; {held_summary}; "
+              f"{queued_summary}; "
               f"{kick_candidates} preview-kick candidate(s), {kicked} kicked.")
     return 0
 
@@ -1147,11 +1307,18 @@ def main(argv: list[str] | None = None) -> int:
                              "NEEDING REVIEW in the summary so it cannot decay "
                              "into a permanent quiet veto (default 3; "
                              "SABLE_HOLD_STALE_DAYS)")
+    parser.add_argument("--queued-stale-min", type=float,
+                        default=float(os.environ.get(
+                            "SABLE_QUEUED_STALE_MIN", str(DEFAULT_QUEUED_STALE_MIN))),
+                        help="a branch queued at the seat (preview in flight) "
+                             "longer than this many minutes escalates back to "
+                             "ordinary classification instead of suppressing "
+                             "indefinitely (default 120; SABLE_QUEUED_STALE_MIN)")
     parser.add_argument("--dry-run", action="store_true",
                         help="classify + print only; file no beads; exit 0")
     args = parser.parse_args(argv)
     return reconcile(args.repo, args.remote, args.age_min, args.dry_run,
-                     args.hold_stale_days)
+                     args.hold_stale_days, args.queued_stale_min)
 
 
 if __name__ == "__main__":

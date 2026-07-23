@@ -1269,3 +1269,99 @@ def test_no_bead_when_a_seat_hold_reason_is_recorded(monkeypatch):
         "/repo", "origin", "wk-x", "trunk", [], 10.0, NOW, hold)
     assert is_stranded is False
     assert reason.startswith("HELD"), reason
+
+
+# ===========================================================================
+# SABLE-xw32f: QUEUED AT THE SEAT. A branch whose ci-verify preview is
+# actively running satisfies the ordinary stranded predicate identically to
+# abandoned work — under burst load, six branches legitimately queued for CI
+# (already in chuck's hands) would have been re-filed as for-chuck handoffs
+# as fast as he closed them. branch_queued_at_seat reuses the SAME shared
+# idempotency ref attempt_preview_kick's own no-op check already keys on
+# (classify.preview_kick_ref), so 'is this branch queued' and 'would kicking
+# it be a no-op' resolve from one source of truth.
+# ===========================================================================
+
+def _fake_queued(monkeypatch, *, ref_exists=True, inflight=True, ref_age=601.0,
+                 resolve_ok=True):
+    """resolve_commit/preview_kick_ref/remote_ref_commit/ref_has_inflight_run
+    are top-level names bound to sable-merge-gate's own seams at import time
+    (see the module's import block) — monkeypatched here the same way
+    kick_preview already is. `ref_age` is the PREVIEW REF's own age (via
+    preview_ref_age_seconds) — deliberately NOT the branch's push age, which
+    every classify_branch-level test in this file backdates to far in the
+    past (CT_OLD) so it always clears predicate 4; conflating the two clocks
+    is the exact bug this fixture is shaped to avoid reintroducing."""
+    if not resolve_ok:
+        def boom(*a, **k):
+            raise RuntimeError("cannot resolve ref")
+        monkeypatch.setattr(smrh, "resolve_commit", boom)
+        return
+    monkeypatch.setattr(smrh, "resolve_commit", lambda repo, ref: "deadbeef")
+    monkeypatch.setattr(smrh, "preview_kick_ref",
+                        lambda branch, base_sha, branch_sha: "ci-verify/wk-x-1234567")
+    monkeypatch.setattr(smrh, "remote_ref_commit",
+                        lambda repo, remote, ref: ("cafefeed" if ref_exists else None))
+    monkeypatch.setattr(smrh, "preview_ref_age_seconds", lambda repo, sha, now: ref_age)
+    monkeypatch.setattr(smrh, "ref_has_inflight_run", lambda repo, ref: inflight)
+
+
+def test_branch_queued_at_seat_true_when_ref_exists_and_inflight(monkeypatch):
+    _fake_queued(monkeypatch, ref_exists=True, inflight=True)
+    queued, detail = smrh.branch_queued_at_seat("/repo", "origin", "wk-x", "trunk", NOW)
+    assert queued is True
+    assert "QUEUED" in detail
+
+
+def test_branch_queued_at_seat_false_when_ref_present_but_terminal(monkeypatch):
+    _fake_queued(monkeypatch, ref_exists=True, inflight=False)
+    queued, detail = smrh.branch_queued_at_seat("/repo", "origin", "wk-x", "trunk", NOW)
+    assert queued is False
+    assert "terminal" in detail
+
+
+def test_branch_queued_at_seat_false_when_no_preview_ref(monkeypatch):
+    _fake_queued(monkeypatch, ref_exists=False)
+    queued, detail = smrh.branch_queued_at_seat("/repo", "origin", "wk-x", "trunk", NOW)
+    assert queued is False
+    assert "no-preview-ref" in detail
+
+
+def test_branch_queued_at_seat_false_on_unresolvable_sha(monkeypatch):
+    _fake_queued(monkeypatch, resolve_ok=False)
+    queued, detail = smrh.branch_queued_at_seat("/repo", "origin", "wk-x", "trunk", NOW)
+    assert queued is False
+    assert "unresolvable" in detail
+
+
+def test_branch_queued_at_seat_stale_escalates(monkeypatch):
+    # a preview in flight far past the stale bound must escalate rather than
+    # suppress indefinitely -- mirrors hold_since/hold_until on SABLE-jejx3.
+    _fake_queued(monkeypatch, ref_exists=True, inflight=True, ref_age=999999.0)
+    queued, detail = smrh.branch_queued_at_seat(
+        "/repo", "origin", "wk-x", "trunk", NOW, queued_stale_min=1.0)
+    assert queued is False
+    assert "queued-check-stale" in detail
+
+
+def test_queued_branch_classifies_as_queued_not_stranded(monkeypatch):
+    # THE test named in xw32f's spec.
+    _fake_git(monkeypatch, ancestor_rc=1, tip_ct=CT_OLD)
+    _fake_bd(monkeypatch, search_status="closed")
+    _fake_queued(monkeypatch, ref_exists=True, inflight=True)
+    is_stranded, reason, _ = _classify()
+    assert is_stranded is False, reason
+    assert "QUEUED" in reason
+
+
+def test_queued_branch_with_terminal_preview_is_still_stranded(monkeypatch):
+    # Negative direction, same file (xw32f's spec): a TERMINAL preview and
+    # still unmerged must still classify STRANDED -- the queued state cannot
+    # swallow a real strand.
+    _fake_git(monkeypatch, ancestor_rc=1, tip_ct=CT_OLD)
+    _fake_bd(monkeypatch, search_status="closed")
+    _fake_queued(monkeypatch, ref_exists=True, inflight=False)
+    is_stranded, reason, status = _classify()
+    assert is_stranded is True, reason
+    assert reason == "STRANDED"
+    assert status == "closed"
