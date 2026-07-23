@@ -855,7 +855,7 @@ def tag_footprint_metadata(bead_id: str, description: str) -> None:
                         f"footprint_writes={','.join(sorted(writes_read.files))}"],
                        capture_output=True, text=True)
 
-    reads_declared, reads = fp_lib.parse_declared_reads(description)
+    reads_declared, reads, _reads_dropped = fp_lib.parse_declared_reads(description)
     if reads_declared:
         subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata",
                         f"footprint_reads_declared={','.join(sorted(reads))}"],
