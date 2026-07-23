@@ -53,6 +53,63 @@ for f in "$DEP_MERGE" "$OVERLAP"; do
   fi
 done
 
+# ---------------------------------------------------------------------------
+# PLANT-AND-FAIL, SABLE-bjabn (test-require-all.sh's own pattern, SABLE-5lli.7
+# style): this suite's own two Skipped-count controls below (bd-absent
+# test-dep-merge-state.sh / test-overlap-dispatch-e2e.sh) used to collapse
+# "no Skipped: line was found at all" and "a Skipped: line was found but its
+# count was zero" into ONE `if A && B; then pass; else fail "..."; fi`. Prove
+# THIS SPECIFIC conversion is non-vacuous -- not just inheriting lib-require-
+# all.sh's own generic proof from test-require-all.sh -- by reproducing the
+# exact pre-conversion collapsed shape against the same synthetic clause
+# values used by both real conversions below, and asserting the collapsed
+# form cannot name which clause failed while require_all can.
+# ---------------------------------------------------------------------------
+_bjabn_plant_collapsed_skip_count() {
+  # The pre-bjabn shape: one AND, one verdict, no per-clause detail -- exactly
+  # this file's DM_NOBD_SKIPPED / OV_NOBD_SKIPPED controls before this bead.
+  # c1 = "a Skipped: line was found" (0=held), c2 = "count > 0" (0=held).
+  local c1="$1" c2="$2"
+  if [ "$c1" -eq 0 ] && [ "$c2" -eq 0 ]; then
+    _bjabn_plant_ok=1; _bjabn_plant_detail=""
+  else
+    _bjabn_plant_ok=0; _bjabn_plant_detail="the conjunction control failed"
+  fi
+}
+# Synthetic case matching a REAL failure shape either conversion below can
+# hit: the Skipped: line WAS found (c1=0/held) but its count was NOT > 0
+# (c2=1/failed) -- two claims that disagree, which a collapsed boolean
+# cannot distinguish and require_all must.
+_bjabn_plant_collapsed_skip_count 0 1
+require_all "plant: skip-count conjunction" \
+  "a Skipped: count line was found" 0 "the Skipped count is > 0" 1
+if [ "$_bjabn_plant_ok" -eq 0 ] \
+   && [ "$_bjabn_plant_detail" = "the conjunction control failed" ] \
+   && [ "$REQUIRE_ALL_OK" -eq 0 ] \
+   && [ "${REQUIRE_ALL_DETAIL#*the Skipped count is > 0}" != "$REQUIRE_ALL_DETAIL" ] \
+   && [ "${REQUIRE_ALL_DETAIL#*a Skipped: count line was found}" = "$REQUIRE_ALL_DETAIL" ]; then
+  pass "PLANT: the pre-bjabn collapsed skip-count shape cannot name which clause failed, require_all does"
+else
+  fail "PLANT: the pre-bjabn collapsed skip-count shape cannot name which clause failed, require_all does" \
+       "collapsed_ok=$_bjabn_plant_ok collapsed_detail=$_bjabn_plant_detail require_all_ok=$REQUIRE_ALL_OK require_all_detail=$REQUIRE_ALL_DETAIL"
+fi
+# Opposite polarity of the same synthetic shape: the line was NOT found at
+# all (c1=1/failed) but a stale count happened to be > 0 (c2=0/held) -- the
+# OTHER clause must be the one named, proving the plant exercises both
+# directions rather than a single hardcoded outcome.
+_bjabn_plant_collapsed_skip_count 1 0
+require_all "plant: skip-count conjunction" \
+  "a Skipped: count line was found" 1 "the Skipped count is > 0" 0
+if [ "$_bjabn_plant_ok" -eq 0 ] \
+   && [ "$REQUIRE_ALL_OK" -eq 0 ] \
+   && [ "${REQUIRE_ALL_DETAIL#*a Skipped: count line was found}" != "$REQUIRE_ALL_DETAIL" ] \
+   && [ "${REQUIRE_ALL_DETAIL#*the Skipped count is > 0}" = "$REQUIRE_ALL_DETAIL" ]; then
+  pass "PLANT: opposite polarity -- the OTHER clause is named when it is the one that broke"
+else
+  fail "PLANT: opposite polarity -- the OTHER clause is named when it is the one that broke" \
+       "require_all_ok=$REQUIRE_ALL_OK require_all_detail=$REQUIRE_ALL_DETAIL"
+fi
+
 # --- Build a bd-absent PATH the same way the ci-verify clean room is bd-
 # absent: bd's own directory removed, everything else (python3, git, mktemp,
 # bash) left resolvable. Blanking PATH outright would make python3/git
@@ -94,10 +151,21 @@ else
 fi
 
 DM_NOBD_SKIPPED=$(printf '%s' "$OUT_DM_NOBD" | grep -oE 'Skipped: [0-9]+' | tail -1 | grep -oE '[0-9]+')
-if [ -n "${DM_NOBD_SKIPPED:-}" ] && [ "$DM_NOBD_SKIPPED" -gt 0 ]; then
+# SABLE-bjabn: a red here used to collapse two independently-meaningful
+# claims -- "no Skipped: count line was found at all" (a parsing/output-shape
+# break) vs "a Skipped: count line WAS found but its count was zero" (a real
+# behavior difference) -- into one boolean, exactly muew7's shape: a reader
+# on RED could not tell which had actually happened.
+[ -n "${DM_NOBD_SKIPPED:-}" ]; _dm_skip_c1=$?
+[ "${DM_NOBD_SKIPPED:-0}" -gt 0 ] 2>/dev/null; _dm_skip_c2=$?
+require_all "bd-absent: test-dep-merge-state.sh non-zero Skipped count" \
+  "a Skipped: count line was found" "$_dm_skip_c1" \
+  "the Skipped count is > 0" "$_dm_skip_c2"
+if [ "$REQUIRE_ALL_OK" -eq 1 ]; then
   pass "bd-absent: test-dep-merge-state.sh summary shows a non-zero Skipped count ($DM_NOBD_SKIPPED)"
 else
-  fail "bd-absent: test-dep-merge-state.sh summary shows a non-zero Skipped count" "parsed='${DM_NOBD_SKIPPED:-<none>}' output=$OUT_DM_NOBD"
+  fail "bd-absent: test-dep-merge-state.sh summary shows a non-zero Skipped count" \
+       "$REQUIRE_ALL_DETAIL (parsed='${DM_NOBD_SKIPPED:-<none>}' output=$OUT_DM_NOBD)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -120,10 +188,18 @@ else
 fi
 
 OV_NOBD_SKIPPED=$(printf '%s' "$OUT_OV_NOBD" | grep -oE 'Skipped: [0-9]+' | tail -1 | grep -oE '[0-9]+')
-if [ -n "${OV_NOBD_SKIPPED:-}" ] && [ "$OV_NOBD_SKIPPED" -gt 0 ]; then
+# SABLE-bjabn: same two-claim collapse as the DM control above, converted the
+# same way.
+[ -n "${OV_NOBD_SKIPPED:-}" ]; _ov_skip_c1=$?
+[ "${OV_NOBD_SKIPPED:-0}" -gt 0 ] 2>/dev/null; _ov_skip_c2=$?
+require_all "bd-absent: test-overlap-dispatch-e2e.sh non-zero Skipped count" \
+  "a Skipped: count line was found" "$_ov_skip_c1" \
+  "the Skipped count is > 0" "$_ov_skip_c2"
+if [ "$REQUIRE_ALL_OK" -eq 1 ]; then
   pass "bd-absent: test-overlap-dispatch-e2e.sh summary shows a non-zero Skipped count ($OV_NOBD_SKIPPED)"
 else
-  fail "bd-absent: test-overlap-dispatch-e2e.sh summary shows a non-zero Skipped count" "parsed='${OV_NOBD_SKIPPED:-<none>}' output=$OUT_OV_NOBD"
+  fail "bd-absent: test-overlap-dispatch-e2e.sh summary shows a non-zero Skipped count" \
+       "$REQUIRE_ALL_DETAIL (parsed='${OV_NOBD_SKIPPED:-<none>}' output=$OUT_OV_NOBD)"
 fi
 
 # ---------------------------------------------------------------------------
