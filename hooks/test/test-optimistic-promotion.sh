@@ -36,6 +36,9 @@
 #      intersection anywhere to justify it.
 #   C6 SABLE_MG_OPTIMISTIC=0                        -> exit 23 on C1's own
 #      scenario: the kill switch restores the pre-jd5fj.4 behaviour exactly.
+#   C13 (SABLE-jd5fj.10) a STRUCTURED footprint_writes metadata field (not
+#      prose) declares a path outside both mechanical diffs -> exit 23, same
+#      shape as C3 but sourced entirely from bd's --json metadata.
 #
 # SABLE-w0zjm extends this suite past the gate's own boundary, because the defect
 # it covers lives OUTSIDE the repo: the operator wrapper the gate runs inside.
@@ -147,6 +150,23 @@ echo '## File reads'
 echo '.github/ci/impact-manifest.sh'
 EOF
 chmod +x "$FAKE_BD_READS_IMPACT_MANIFEST"
+
+# SABLE-jd5fj.10: a `bd show <bead> --json` stub emitting the STRUCTURED
+# footprint field (real JSON, not prose) — declares footprint_writes naming a
+# lockfile-shaped path neither mutation function touches at all (outside BOTH
+# mechanical diffs). This exercises the structured field end to end: the
+# widen forcing C13's refusal comes ENTIRELY from bd's metadata, not from
+# any prose the gate could have parsed instead.
+FAKE_BD_STRUCTURED_FOOTPRINT="$TMPROOT/fake-bd-structured-footprint"
+cat > "$FAKE_BD_STRUCTURED_FOOTPRINT" <<'EOF'
+#!/usr/bin/env python3
+import json
+print(json.dumps([{
+    "description": "story text, no '## File footprint' prose section at all",
+    "metadata": {"footprint_writes": "totally/unrelated/module/poetry.lock"},
+}]))
+EOF
+chmod +x "$FAKE_BD_STRUCTURED_FOOTPRINT"
 
 # SABLE-mbkbm: reads the per-phase impact-tier journal (impact-tier-windows.jsonl)
 # a real promote just wrote and checks one of two properties against the SAME
@@ -782,6 +802,45 @@ if ! printf '%s' "$OUT" | grep -qi 'read/write coupling'; then
   pass "C12: the undetermined case is NOT reported as a found conflict -- the two decisions stay distinguishable in the report"
 else
   fail "C12: the undetermined case must not read like a found read/write conflict" "out=$OUT"
+fi
+
+# ==========================================================================
+# C13 — SABLE-jd5fj.10: the STRUCTURED footprint_writes metadata field (not
+#       prose) declares a path outside both mechanical diffs -> full re-preview
+# ==========================================================================
+# Both sides are mechanically disjoint (same fixture as C1/C6) -- git alone
+# would call this a clean, disjoint merge. bd's --json output carries a
+# structured footprint_writes field naming a lockfile-shaped path neither
+# mutation touches; declared_footprint() must consume that field VERBATIM
+# (the description above literally says it has no prose section) and the
+# widened branch footprint must still force the refusal via the sentinel rule.
+scenario c13 mut_branch_disjoint_ok mut_base_disjoint_ok
+OUT="$(SABLE_MG_BD="$FAKE_BD_STRUCTURED_FOOTPRINT" FAKE_GH_ADVANCE="$MOVED_SHA" \
+      gate promote --bead TEST-C13 --branch wk-1 --base "$BASE_BR" --repo "$B_WORK" --remote origin)"; RC=$?
+if [ "$RC" -eq 23 ]; then
+  pass "C13: a structured footprint_writes field declaring a path outside both diffs forces a full re-preview (exit 23)"
+else
+  fail "C13: a structured declared-footprint path forces a full re-preview" "rc=$RC out=$OUT"
+fi
+if [ "$(origin_sha "$BASE_BR")" = "$MOVED_SHA" ]; then
+  pass "C13: nothing was promoted onto the moved base"
+else
+  fail "C13: nothing was promoted onto the moved base" "base=$(origin_sha "$BASE_BR")"
+fi
+if printf '%s' "$OUT" | grep -q 'totally/unrelated/module/poetry.lock'; then
+  pass "C13: the refusal names the structured-field-declared path (auditable evidence, not a bare code)"
+else
+  fail "C13: the refusal names the structured-field-declared path" "out=$OUT"
+fi
+# Non-vacuity: C1/C6 already prove this EXACT mutation pair
+# (mut_branch_disjoint_ok / mut_base_disjoint_ok) promotes on exit 0 when bd
+# declares nothing extra (FAKE_BD_READS_NONE, no footprint_writes key at all)
+# -- so C13's refusal here is attributable to the structured field alone, not
+# to the fixture already being non-disjoint.
+if git -C "$B_WORK" merge-tree --write-tree "$MOVED_SHA" "$WK_SHA" >/dev/null 2>&1; then
+  pass "C13: git itself considers the merge textually clean -- the refusal is the structured field's own added safety"
+else
+  fail "C13: the merge should be textually clean" "merge-tree reported a conflict"
 fi
 
 echo "----------------------------------------------------------------------"
