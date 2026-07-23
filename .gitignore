@@ -48,6 +48,11 @@ __pycache__/
 .claude/sable/*
 !.claude/sable/state/
 .claude/sable/state/*
+# SECOND exception (SABLE-ztks1): the live operator-contract surface is doctrine,
+# not runtime state — tracked so a working-tree loss cannot destroy it. The
+# cockpit re-commits it at shift boundaries and after operator rulings; runtime
+# state (mode-state.json etc.) stays ignored by the line above.
+!.claude/sable/state/active-contracts.md
 !.claude/sable/state/merge-gate/
 .claude/sable/state/merge-gate/*
 !.claude/sable/state/merge-gate/README.md
