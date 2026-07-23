@@ -69,6 +69,7 @@ optimistic path and why an unavailable tier degrades to exit 23.
 """
 from __future__ import annotations
 
+import ast
 import contextlib
 import fcntl
 import json
@@ -577,25 +578,46 @@ def impact_budget(repo: str | None = None) -> dict:
     THE WORST CASE IS A SUM, NOT THE TIER BUDGET. The lock wait is deliberately
     EXCLUDED from the tier's own budget (see run_impact_tier — a queued promote
     still gets its full tier budget, which is correct and must not be "fixed"), so
-    a promote can spend LOCK WAIT + TIER, i.e. ~4500s on stock defaults. A wrapper
-    sized to the tier budget alone is MORE wrong after jd5fj.13, not less: under a
-    burst the queue wait alone can exceed it.
+    a promote can spend LOCK WAIT + TIER + COVERAGE FLOOR, i.e. ~5400s on stock
+    defaults. A wrapper sized to the tier budget alone is MORE wrong after
+    jd5fj.13, not less: under a burst the queue wait alone can exceed it.
+
+    THE COVERAGE FLOOR IS A THIRD TERM, NOT A FOOTNOTE (SABLE-5v3d5). cmar4.5
+    put assert_coverage_floor()'s subprocess check (run_coverage_floor_check,
+    bounded by _coverage_floor_timeout) INSIDE promote(), deliberately early —
+    before any preview/CI work — so a promote may legitimately spend that
+    ceiling too, on top of the queue wait and the impact tier. Before this fix
+    that ceiling was NOT in this sum: cmar4.9 later re-pinned
+    _coverage_floor_timeout to borrow the same SSOT the tier budget does (900s
+    in place of a hardcoded 600s) and worst_case_s did not move, because the
+    changed term was never a summand — an instrument that cannot see its own
+    blind spot, pointed at the number that bounds every promote.
 
     Reported in seconds:
-      tier_timeout_s  SABLE_MG_IMPACT_TIMEOUT — the tier's own run budget.
-      lock_timeout_s  SABLE_MG_IMPACT_LOCK_TIMEOUT — how long a promote will
-                      queue for the seat. 0 when serialization is off, because
-                      then there is no queue to wait in.
-      worst_case_s    their sum: the longest a promote may legitimately take.
+      tier_timeout_s           SABLE_MG_IMPACT_TIMEOUT — the tier's own run
+                                budget.
+      lock_timeout_s           SABLE_MG_IMPACT_LOCK_TIMEOUT — how long a
+                                promote will queue for the seat. 0 when
+                                serialization is off, because then there is no
+                                queue to wait in.
+      coverage_floor_timeout_s SABLE_MG_COVERAGE_FLOOR_TIMEOUT (or its SSOT
+                                default, see _coverage_floor_timeout) — the
+                                coverage-delta check's own run budget, paid on
+                                every promote of a pruning diff, BEFORE the
+                                queue wait or the tier even start.
+      worst_case_s              the sum of all three: the longest a promote
+                                may legitimately take.
       recommended_wrapper_timeout_s   worst_case_s * BUDGET_HEADROOM, rounded up.
                       This is the number a wrapper should use.
       serialized      whether the queue is in play at all."""
     tier = _impact_timeout(repo)
     lock = _impact_lock_timeout() if impact_serialization_enabled() else 0.0
-    worst = tier + lock
+    coverage_floor = _coverage_floor_timeout(repo)
+    worst = tier + lock + coverage_floor
     return {
         "tier_timeout_s": tier,
         "lock_timeout_s": lock,
+        "coverage_floor_timeout_s": coverage_floor,
         "worst_case_s": worst,
         "recommended_wrapper_timeout_s": int(math.ceil(worst * BUDGET_HEADROOM)),
         "serialized": impact_serialization_enabled(),
@@ -613,7 +635,10 @@ def format_impact_budget(budget: dict) -> str:
         f"  {q}",
         f"  impact tier  {budget['tier_timeout_s']:.0f}s  (SABLE_MG_IMPACT_TIMEOUT, "
         f"starts AFTER the queue wait — it is not charged the wait)",
-        f"  worst case   {budget['worst_case_s']:.0f}s  (queue + tier)",
+        f"  coverage floor {budget['coverage_floor_timeout_s']:.0f}s  "
+        f"(SABLE_MG_COVERAGE_FLOOR_TIMEOUT, paid on a pruning diff BEFORE the "
+        f"queue wait or the tier even start)",
+        f"  worst case   {budget['worst_case_s']:.0f}s  (queue + tier + coverage floor)",
         f"  RECOMMENDED enclosing wrapper timeout: "
         f"{budget['recommended_wrapper_timeout_s']}s",
         "",
@@ -624,6 +649,122 @@ def format_impact_budget(budget: dict) -> str:
         "A wrapper kill mid-tier is SAFE (nothing is pushed before a green verdict)",
         "but reads as a path malfunction, so it is misdiagnosed rather than noticed.",
     ])
+
+
+# --------------------------------------------------------------------------
+# Promote-path timeout completeness (SABLE-5v3d5) — catches the NEXT omission
+# --------------------------------------------------------------------------
+#
+# impact_budget()'s coverage-floor omission happened because the coupling
+# between "a bounded subprocess call lives in promote()'s path" and "its
+# ceiling is a summand in impact_budget()" is maintained by memory: nothing
+# breaks when the two drift apart, which is exactly how they drifted apart.
+# This is the structural half of the fix — a check that FAILS the moment a
+# new `timeout=`-bearing call joins promote()'s reachable call graph without
+# a registered budget term, in the spirit of cmar4.2's manifest fan-out check
+# (.github/ci/impact-manifest.sh) erroring on an unmapped sourced lib rather
+# than silently under-selecting.
+
+_BUDGETED_TIMEOUT_SOURCES = {
+    "_impact_timeout": "tier_timeout_s",
+    "_impact_lock_timeout": "lock_timeout_s",
+    "_coverage_floor_timeout": "coverage_floor_timeout_s",
+}
+"""Maps the helper a `timeout=` keyword argument calls to get its value, to
+the impact_budget() key that accounts for it. A `timeout=` call reachable
+from promote() whose source is neither a key here nor in
+_KNOWN_UNBUDGETED_PROMOTE_TIMEOUTS below is an unbudgeted term —
+unbudgeted_promote_timeouts() reports it."""
+
+_KNOWN_UNBUDGETED_PROMOTE_TIMEOUTS = {
+    ("_report_identifier_decay", "30"),
+    ("_impact_isolated_env", "60"),
+}
+"""(function, literal-source) pairs already reachable from promote() at the
+time this check was written that are deliberately NOT folded into
+worst_case_s: both are small (<=60s), run at most once per promote, and are
+independently exception/return-guarded so they cannot hang past their own
+bound (see _report_identifier_decay's broad except and
+_impact_isolated_env's caller, whose worktree-setup failures already return
+IMPACT_ERROR rather than hang). Flagged HERE, visibly, rather than silently
+passing the check — SABLE-5v3d5 filed the follow-up to fold them in or
+re-justify the exclusion (bd q). This set exists so a THIRD, unreviewed one
+cannot join them unnoticed: it is matched by EXACT (function, literal) pair,
+not by function name alone, so a literal that changes (the way the coverage
+floor's 600 once did) still falls through as a fresh gap."""
+
+
+def _reachable_function_defs(tree: ast.Module, entry: str) -> dict[str, ast.FunctionDef]:
+    """Every module-level function def reachable from `entry` by NAME-based
+    call references, transitively. Derived from the AST rather than
+    hand-listed, so a new function promote() starts calling is automatically
+    in scope — the completeness property this check exists for must not
+    itself depend on someone remembering to extend a list."""
+    defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    seen: dict[str, ast.FunctionDef] = {}
+    stack = [entry]
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in defs:
+            continue
+        node = defs[name]
+        seen[name] = node
+        for call in ast.walk(node):
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+                stack.append(call.func.id)
+    return seen
+
+
+def _timeout_kwarg_sources(node: ast.AST):
+    """Yields the source of every `timeout=` keyword argument in any call
+    within `node`: the callee's name when the value is itself a call (e.g.
+    `_impact_timeout(repo)` -> "_impact_timeout"), else the literal's own
+    text (so two different literal ceilings, e.g. 30 vs 60, are never
+    conflated into one entry)."""
+    for call in ast.walk(node):
+        if not isinstance(call, ast.Call):
+            continue
+        for kw in call.keywords:
+            if kw.arg != "timeout":
+                continue
+            if isinstance(kw.value, ast.Call) and isinstance(kw.value.func, ast.Name):
+                yield kw.value.func.id
+            elif isinstance(kw.value, ast.Constant):
+                yield str(kw.value.value)
+            else:
+                yield ast.dump(kw.value)
+
+
+def unbudgeted_promote_timeouts(tree: ast.Module, entry: str = "promote",
+                                 budgeted: set | None = None,
+                                 known_unbudgeted: set | None = None) -> list:
+    """THE COMPLETENESS CHECK (SABLE-5v3d5). Returns (function, source) pairs
+    for every `timeout=`-bearing call reachable from `entry` whose source is
+    neither a registered budget term (`budgeted`, defaulting to
+    _BUDGETED_TIMEOUT_SOURCES) nor a documented exclusion (`known_unbudgeted`,
+    defaulting to _KNOWN_UNBUDGETED_PROMOTE_TIMEOUTS). Empty means every
+    bounded call in the promote path is accounted for by impact_budget() or
+    explicitly, visibly excused from it.
+
+    Takes an already-parsed `tree` (rather than reading this module's own
+    __file__ internally) so a test can hand it a synthetic snippet and prove
+    the check actually fires on a planted gap, without touching this file."""
+    budgeted = budgeted if budgeted is not None else set(_BUDGETED_TIMEOUT_SOURCES)
+    known_unbudgeted = (known_unbudgeted if known_unbudgeted is not None
+                        else _KNOWN_UNBUDGETED_PROMOTE_TIMEOUTS)
+    gaps = []
+    for name, node in _reachable_function_defs(tree, entry).items():
+        for source in _timeout_kwarg_sources(node):
+            if source in budgeted or (name, source) in known_unbudgeted:
+                continue
+            gaps.append((name, source))
+    return gaps
+
+
+def promote_module_ast() -> ast.Module:
+    """This module's own AST, freshly re-read from disk — see
+    unbudgeted_promote_timeouts()."""
+    return ast.parse(Path(__file__).read_text(), filename=__file__)
 
 
 @contextlib.contextmanager
