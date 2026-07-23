@@ -31,6 +31,12 @@ carried coverage-delta check) for the same reason and the same way: not an
 outcome of a CI conclusion, not in OUTCOME_EXIT, a standing refusal that is a
 property of the DIFF being promoted rather than of what Actions concluded.
 
+SABLE-rzkw7 EXTENDS the table again with 28 (a bead declares a
+MUST-LAND-TOGETHER `landing_pair` whose counterpart is neither landed nor
+named on this same promote call) for the same reason again: not an outcome of
+a CI conclusion, not in OUTCOME_EXIT, a standing refusal that is a property of
+a DECLARED CROSS-BEAD CONSTRAINT rather than of what Actions concluded.
+
 Nothing here shells out, touches git, or reads the environment, so every
 function is unit-testable with no fixtures at all.
 """
@@ -55,6 +61,7 @@ EXIT_BASE_MOVED = 23       # tip moved during gate (non-ff promote) — retry-sa
 EXIT_CANCELLED = 24        # ci-verify run cancelled mid-flight — retry-safe
 EXIT_FROZEN = 25           # green-snapshot freeze in force — promotion denied (SABLE-jd5fj.5)
 EXIT_COVERAGE_FLOOR = 27   # pruning diff without a carried coverage-delta check (SABLE-cmar4.5)
+EXIT_PAIR_REFUSED = 28     # MUST-LAND-TOGETHER counterpart not landed / not named (SABLE-rzkw7)
 
 # Outcome names: the MEANING of a completed Actions conclusion, independent of
 # how the verdict was obtained (waited for, or read back precomputed).
