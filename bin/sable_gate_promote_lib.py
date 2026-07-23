@@ -909,12 +909,13 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str],
     (IMPACT_GREEN|IMPACT_RED|IMPACT_ERROR, detail).
 
     SABLE-mbkbm: `phases`, when given, is appended to in place with each real
-    span this function times — worktree add/remove ("setup"), each shell suite
-    by its own name ("shell:<suite>"), and the pytest half ("pytest") — using
-    time.monotonic() around subprocess boundaries that already exist here. No
-    phase is invented for work that didn't run: a footprint that never reaches
-    bin/ never appends a "pytest" entry, which is the difference between an
-    absent measurement and a fabricated zero.
+    span this function times — worktree add/remove and the isolated-env build
+    (all folded into "setup", SABLE-np1nx), each shell suite by its own name
+    ("shell:<suite>"), and the pytest half ("pytest") — using time.monotonic()
+    around subprocess boundaries that already exist here. No phase is invented
+    for work that didn't run: a footprint that never reaches bin/ never
+    appends a "pytest" entry, which is the difference between an absent
+    measurement and a fabricated zero.
 
     "Real" is the whole point, and it is why this checks the combined commit out
     into a throwaway detached worktree instead of reasoning about trees: the
@@ -953,7 +954,20 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str],
             # its own isolated BEADS_DB/HOME/TMPDIR, nested under this run's
             # OWN scratch parent — see _impact_isolated_env for why that is
             # what kills the false-RED class jd5fj.13 could only queue around.
-            env = _impact_isolated_env(parent)
+            #
+            # SABLE-np1nx: this call was the phase journal's actual blind spot.
+            # When bd is on PATH it runs a real `bd init` subprocess (fresh DB,
+            # real disk I/O) that this span never timed, so under host
+            # contention it could eat several real seconds attributed to no
+            # phase at all — the "reconcile" check (this bucket is folded into
+            # "setup", same as the worktree add/remove either side of it) then
+            # failed on total >> phase_sum, which was never scheduling noise
+            # around an already-measured block, only a genuinely-unmeasured one.
+            _t0 = time.monotonic()
+            try:
+                env = _impact_isolated_env(parent)
+            finally:
+                _record_phase(phases, "setup", _t0)
             if override:
                 _t0 = time.monotonic()
                 try:
