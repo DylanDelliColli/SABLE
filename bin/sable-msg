@@ -39,6 +39,10 @@ manual bead-filing hint.
 Usage:
   sable-msg <to-role> "<text>" [--from <role>] [--interrupt] [--bead]
   sable-msg <to-role> --body-file <path> [--from <role>] [--interrupt] [--bead]
+  sable-msg --file-sighting "<text>" [--from <role>]
+    --file-sighting file a durable, DEFERRED sighting bead (SABLE-441vl)
+                    instead of messaging a pane — no <to-role>, no tmux, no
+                    pane lookup. See file_sighting_bead's docstring below.
     <text>          message body, given inline as the second positional arg.
                     HAZARD (SABLE-tmbx1): the CALLING shell parses this
                     argument before sable-msg ever sees it. A body composed
@@ -360,13 +364,92 @@ def file_fallback_bead(frm: str, to_role: str, message: str, runner=None) -> str
     return m.group(1) if m else None
 
 
+# --------------------------------------------------------------------------
+# Seat sightings (SABLE-441vl) — recording an observation without a manager
+# --------------------------------------------------------------------------
+#
+# The merge seat (chuck) cannot file WORK-creating beads — hooks/multi-manager/
+# seat-sighting-gate.sh refuses a plain `bd create` from that identity. Before
+# this bead there was no lesser "record an observation" path either, so any
+# finding chuck made reached the backlog ONLY IF a manager happened to read his
+# message and choose to file it. That worked on ATTENTION, not STRUCTURE: an
+# unfiled finding left no artifact at all, nothing to grep, no way to measure
+# how often it was lost.
+#
+# `--file-sighting` closes the gap WITHOUT widening the seat's authority: a
+# sighting is durable and DEFERRED from creation — it cannot enter `bd ready`
+# until a manager reads it and explicitly promotes it (`bd update <id>
+# --status=open`). The seat still never decides what gets built; it can now
+# only ever make an observation durable, never dispatchable.
+
+SIGHTING_TITLE_PREFIX = "SIGHTING"
+SIGHTING_LABELS = "sighting,for-triage"
+
+
+def sighting_bead_title(text: str) -> str:
+    """The title file_sighting_bead gives a durable sighting bead. Extracted
+    for the same reason fallback_bead_title is: a recogniser must derive the
+    title the same way we compose it, not hand-type the format."""
+    return f"{SIGHTING_TITLE_PREFIX}: {text[:80]}"
+
+
+def file_sighting_bead(frm: str, text: str, runner=None) -> str | None:
+    """File a durable, DEFERRED sighting bead (SABLE-441vl). Two bd calls, not
+    one: `bd create` has no --status flag at all (verified against the real
+    CLI, SABLE-a dispatch note), so the only way to land a bead already
+    excluded from `bd ready` is create-then-update. The bead is labeled
+    `sighting,for-triage` (the label a manager's inbox sweep or `bd ready
+    -l for-triage` picks up) so it is findable without being dispatchable —
+    labels alone do not exclude a bead from `bd ready`; deferred STATUS is
+    what does that, which is why the second call is not optional. Returns the
+    new bead id, or None when bd is unavailable/errored (mirrors
+    file_fallback_bead's contract) or when the deferred-status update fails —
+    a sighting bead that landed OPEN is a work-creating side effect this
+    function must never produce, so a failed second call deletes the
+    just-created bead rather than leaving it un-deferred."""
+    runner = runner or (lambda args: subprocess.run(args, capture_output=True, text=True))
+    title = sighting_bead_title(text)
+    desc = (f"SIGHTING filed via `sable-msg --file-sighting` by {frm} (SABLE-441vl): {text} "
+            f"[no-test] durable observation, not yet promoted to work. A manager reviews "
+            f"it and either promotes it (bd update <id> --status=open) or closes it as a "
+            f"non-issue.")
+    try:
+        r = runner(["bd", "create", f"--title={title}", f"--description={desc}",
+                    "--type=task", "--priority=3", f"--labels={SIGHTING_LABELS}"])
+    except Exception:
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    out = (getattr(r, "stdout", "") or "") + (getattr(r, "stderr", "") or "")
+    m = re.search(r"Created issue:\s*(\S+)", out) or re.search(r"([A-Za-z0-9_-]+-[a-z0-9.]+)", out)
+    bead_id = m.group(1) if m else None
+    if not bead_id:
+        return None
+    try:
+        deferred = runner(["bd", "update", bead_id, "--status=deferred"])
+    except Exception:
+        deferred = None
+    if getattr(deferred, "returncode", 1) != 0:
+        # A sighting bead landed OPEN — dispatchable — is a work-creating side
+        # effect from the seat this function must never produce. Best-effort
+        # delete rather than leave it in the ready pool un-deferred.
+        try:
+            runner(["bd", "delete", bead_id, "--force"])
+        except Exception:
+            pass
+        return None
+    return bead_id
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="sable-msg",
         description="Message a SABLE agent pane over tmux (lead<->manager, or a bead-addressed worker).",
     )
-    p.add_argument("to_role", help="recipient role (e.g. optimus, tarzan, lincoln), "
-                                   "or a bead id when --bead is passed")
+    p.add_argument("to_role", nargs="?", default=None,
+                   help="recipient role (e.g. optimus, tarzan, lincoln), or a bead id "
+                        "when --bead is passed. Omit entirely with --file-sighting — a "
+                        "sighting contacts no pane and addresses no role.")
     p.add_argument("body", nargs="?", default=None,
                    help="message text (collapsed to a single line). Mutually "
                         "exclusive with --body-file; exactly one is required. "
@@ -392,11 +475,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="resolve <to_role> as a bead id against a WORKER pane's "
                         "@sable_bead tag instead of a manager @sable_role "
                         "(SABLE-6izz: workers share the generic role 'worker')")
+    p.add_argument("--file-sighting", dest="file_sighting", action="store_true",
+                   help="file a durable, DEFERRED sighting bead instead of messaging a "
+                        "pane (SABLE-441vl) — the observation comes from the inline "
+                        "<body> or --body-file, exactly as a message's body would. No "
+                        "pane is contacted and no <to_role> is needed; the filed bead is "
+                        "labeled sighting,for-triage and can never enter `bd ready` until "
+                        "a manager promotes it (bd update <id> --status=open). Primarily "
+                        "for the merge seat (chuck), whose identity is refused a normal "
+                        "work-creating `bd create` by hooks/multi-manager/"
+                        "seat-sighting-gate.sh but must still be able to record what it "
+                        "notices with no manager in the loop.")
     ns = p.parse_args(argv)
+    if ns.file_sighting and ns.to_role is not None and ns.body is None:
+        # --file-sighting takes no to_role, so a single positional is the
+        # BODY, not a role — argparse fills the first optional positional
+        # (to_role) greedily and has no way to know that in advance.
+        ns.body, ns.to_role = ns.to_role, None
     if ns.body is not None and ns.body_file is not None:
         p.error("argument body: not allowed with argument --body-file")
     if ns.body is None and ns.body_file is None:
         p.error("one of the arguments body --body-file is required")
+    if not ns.file_sighting and not ns.to_role:
+        p.error("the following arguments are required: to_role")
     return ns
 
 
@@ -420,6 +521,23 @@ def main(argv: list[str] | None = None) -> int:
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
     if ns.frm is None:
         ns.frm = resolve_from(socket)
+
+    if ns.file_sighting:
+        # No pane, no tmux session, no framing header — a sighting is a bd
+        # write, not a message (SABLE-441vl). Resolved and returned BEFORE any
+        # session/pane lookup below, which a sighting never needs.
+        bead_id = file_sighting_bead(ns.frm, resolve_body(ns))
+        if bead_id:
+            sys.stderr.write(
+                f"sable-msg: filed sighting {bead_id} (deferred, label sighting) — "
+                f"durable now; absent from `bd ready` until a manager promotes it.\n")
+            return 0
+        sys.stderr.write(
+            "sable-msg: could not file sighting bead — bd unavailable or errored. "
+            "Fall back to: bd create --title=\"SIGHTING: ...\" --labels=sighting,for-triage "
+            "--type=task, then bd update <id> --status=deferred\n")
+        return 1
+
     try:
         session = resolve_session(socket=socket)
     except SessionCollision as e:

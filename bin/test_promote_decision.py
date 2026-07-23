@@ -1600,3 +1600,157 @@ def test_bd_absent_env_still_isolates_home_but_bd_present_isolates_beads_db(tmp_
         cwd=str(tmp_path), env={**os.environ, "BEADS_DB": str(beads_db)},
         text=True, capture_output=True, timeout=30)
     assert created.returncode == 0, created.stdout + created.stderr
+
+
+# --------------------------------------------------------------------------
+# MUST-LAND-TOGETHER pairing gate (SABLE-rzkw7)
+# --------------------------------------------------------------------------
+#
+# The near-miss this bead closes: chuck held one half of a deliberately-paired
+# change and said he would have promoted it on the other lane's sign-off
+# alone, because the pairing lived only in a bead note and a manager's working
+# memory — nowhere the promote path reads. The fix is a `landing_pair`
+# metadata field the promote decision reads mechanically, so a solo promote of
+# either half is refused BY DEFAULT rather than merely by luck.
+
+def _fake_bd_show(responses: dict[str, dict]):
+    """Stand in for promote_lib._bd_show: <responses> maps bead id -> the
+    bd-show-json body it should answer with (missing keys -> a clean 404-style
+    non-zero exit, matching a bd that genuinely doesn't know the bead)."""
+    def fake(repo, bead_id):
+        body = responses.get(bead_id)
+        if body is None:
+            return subprocess.CompletedProcess([], 1, stdout="issue not found")
+        return subprocess.CompletedProcess([], 0, stdout=json.dumps(body))
+    return fake
+
+
+def test_landing_pair_refuses_a_solo_promote_but_never_touches_an_unpaired_bead(monkeypatch):
+    """THE property this bead is accepted or rejected on: a bead declaring a
+    landing_pair counterpart that is neither landed nor named on this call is
+    REFUSED, naming the counterpart. Negative control IN THE SAME TEST: a bead
+    with no landing_pair metadata at all — however similar its footprint to
+    the paired one — must never be touched by this check, proving it
+    discriminates on the declared relation rather than on any file-level
+    property."""
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
+        "SABLE-a": {"metadata": {"landing_pair": "SABLE-b"}, "notes": ""},
+        "SABLE-b": {"metadata": {}, "notes": ""},
+        "SABLE-c": {"metadata": {}, "notes": ""},
+    }))
+    with pytest.raises(promote_lib.LandingPairRefused) as exc:
+        promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a")
+    assert "SABLE-b" in str(exc.value)
+
+    # Negative control: an unpaired bead promotes its own check without a hitch.
+    promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-c")
+
+
+def test_landing_pair_satisfied_when_the_counterpart_already_landed(monkeypatch):
+    """The counterpart's OWN notes carry the exact marker every green promote
+    path in this module writes ('promoted byte-identical to') — not bead
+    status. SABLE-d5iku already established a closed bead is not a merged
+    bead; reusing status here would reopen that exact gap."""
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
+        "SABLE-a": {"metadata": {"landing_pair": "SABLE-b"}, "notes": ""},
+        "SABLE-b": {"metadata": {}, "status": "open",
+                    "notes": "merge-preview ci-verify gate GREEN: ... promoted "
+                             "byte-identical to trunk (verdict stored)."},
+    }))
+    promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a")  # must not raise
+
+
+def test_a_closed_but_unlanded_counterpart_still_refuses(monkeypatch):
+    """Non-vacuity for the status-vs-landed distinction: CLOSED alone (no
+    landed marker in notes) must NOT satisfy the pairing — otherwise the
+    worker's close-at-push (which happens before chuck ever merges, per
+    SABLE-d5iku) would silently open the exact split-promote hole this bead
+    closes."""
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
+        "SABLE-a": {"metadata": {"landing_pair": "SABLE-b"}, "notes": ""},
+        "SABLE-b": {"metadata": {}, "status": "closed", "notes": "closed at push time"},
+    }))
+    with pytest.raises(promote_lib.LandingPairRefused):
+        promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a")
+
+
+def test_landing_pair_satisfied_when_the_counterpart_is_named_on_this_same_call(monkeypatch):
+    """--with-pair: the operator's mechanical acknowledgement that both halves
+    are being promoted together satisfies the check even before either has
+    landed."""
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
+        "SABLE-a": {"metadata": {"landing_pair": "SABLE-b"}, "notes": ""},
+        "SABLE-b": {"metadata": {}, "notes": ""},
+    }))
+    promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a", with_pair=frozenset({"SABLE-b"}))
+
+
+def test_declared_landing_pair_parses_comma_and_whitespace_separated_ids(monkeypatch):
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
+        "SABLE-a": {"metadata": {"landing_pair": "SABLE-b, SABLE-c\nSABLE-d"}},
+    }))
+    assert promote_lib.declared_landing_pair("/repo", "SABLE-a") == {
+        "SABLE-b", "SABLE-c", "SABLE-d"}
+
+
+def test_declared_landing_pair_is_empty_when_bd_cannot_be_read(monkeypatch):
+    """Fail OPEN on the bead's OWN unreadable metadata — the pre-existing
+    default for every bead this mechanism does not apply to (almost all of
+    them) must not become 'refuse everything' just because bd hiccuped once."""
+    monkeypatch.setattr(promote_lib, "_bd_show",
+                        lambda repo, bead_id: subprocess.CompletedProcess([], 1, stdout=""))
+    assert promote_lib.declared_landing_pair("/repo", "SABLE-a") == frozenset()
+    promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a")  # must not raise
+
+
+def test_an_unresolvable_counterpart_fails_closed(monkeypatch):
+    """Fail CLOSED on an unresolvable COUNTERPART: a declared pairing whose
+    counterpart bd cannot even find is exactly the uncertain case this bead
+    defends against, and must refuse rather than silently assume landed."""
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
+        "SABLE-a": {"metadata": {"landing_pair": "SABLE-ghost"}, "notes": ""},
+    }))
+    with pytest.raises(promote_lib.LandingPairRefused) as exc:
+        promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a")
+    assert "SABLE-ghost" in str(exc.value)
+
+
+def test_promote_refuses_a_paired_bead_before_any_git_work(gate, monkeypatch):
+    """Wiring: promote() itself consults the check, and as the SECOND thing it
+    does (right after the freeze check) — before the fetch, before the
+    preview, before any verdict is read. A correct decision function proves
+    nothing if promote() never asks it."""
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
+        "SABLE-x": {"metadata": {"landing_pair": "SABLE-y"}, "notes": ""},
+        "SABLE-y": {"metadata": {}, "notes": ""},
+    }))
+    monkeypatch.setattr(git_lib, "resolve_commit", lambda *a, **kw: pytest.fail(
+        "the landing-pair check must refuse before any git work happens"))
+    with pytest.raises(classify.GateError) as exc:
+        _run()
+    assert exc.value.code == classify.EXIT_PAIR_REFUSED
+    assert "SABLE-y" in str(exc.value)
+    assert gate["pushes"] == []
+
+
+def test_promote_succeeds_for_a_paired_bead_named_via_with_pair(gate, monkeypatch):
+    """Non-vacuity: the SAME paired bead promotes normally once --with-pair
+    names the counterpart — the refusal above was the missing acknowledgement,
+    not a broken gate."""
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
+        "SABLE-x": {"metadata": {"landing_pair": "SABLE-y"}, "notes": ""},
+        "SABLE-y": {"metadata": {}, "notes": ""},
+    }))
+    _arm(gate, disjoint=True, impact=promote_lib.IMPACT_GREEN)
+    assert promote_lib.promote("SABLE-x", BRANCH, BASE, REPO, REMOTE, MANAGER, None,
+                               with_pair=frozenset({"SABLE-y"})) == 0
+
+
+def test_promote_is_unaffected_for_a_bead_with_no_landing_pair_metadata(gate, monkeypatch):
+    """Non-vacuity for the whole feature: a bead with no landing_pair metadata
+    at all is not slowed or altered by this bead in any way."""
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
+        "SABLE-x": {"metadata": {}, "notes": ""},
+    }))
+    _arm(gate, disjoint=True, impact=promote_lib.IMPACT_GREEN)
+    assert _run() == 0

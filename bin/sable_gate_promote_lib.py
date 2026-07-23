@@ -1230,6 +1230,125 @@ def assert_not_frozen(repo: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# MUST-LAND-TOGETHER pairing (SABLE-rzkw7) — the MECHANICAL deny path
+# --------------------------------------------------------------------------
+#
+# Before this bead, a "these two must land in the same promote" ruling lived
+# in a bead NOTE or a manager's working memory — nowhere the seat's own
+# promote path ever reads. The near-miss that named this bead: chuck was
+# holding one half of a deliberately-paired change and said, in his own
+# words, he would have promoted it on the other lane's sign-off alone,
+# because nothing told him the pairing existed. Splitting a matched pair
+# PROMOTES SUCCESSFULLY — both halves are individually green, which is
+# exactly what makes them individually signable — so there is no failure
+# event at the promote; the damage is an invariant that only holds jointly
+# now half-landed.
+#
+# The fix is a metadata field ON THE BEAD ITSELF (`landing_pair`, set the
+# same way chuck.md's `hold` metadata already is: `bd update <id>
+# --set-metadata landing_pair=<counterpart-id>[,<counterpart-id>...]`) so the
+# declaration lives where THIS function already looks, instead of somewhere
+# it never reads. A solo promote of either half is refused, naming the
+# counterpart, unless the counterpart is explicitly named on THIS SAME
+# promote call via --with-pair (the operator's mechanical acknowledgement
+# that both halves are being promoted together) or the counterpart has
+# ALREADY landed.
+#
+# "Landed" is deliberately NOT bead status. SABLE-d5iku (chuck.md) already
+# established that a CLOSED bead is not a MERGED bead — status flips at the
+# worker's push, landing happens only at chuck's promote — so reusing status
+# here would silently reopen the exact gap that bead documents. Instead this
+# reads for the literal marker every successful path through THIS module's
+# own promote() already writes via _append_evidence: "promoted
+# byte-identical to" appears in a bead's notes if and only if some earlier
+# promote() call actually landed it.
+
+_LANDING_PAIR_KEY = "landing_pair"
+_LANDED_MARKER = "promoted byte-identical to"
+
+
+class LandingPairRefused(Exception):
+    """A bead's declared `landing_pair` counterpart is neither landed nor
+    named via --with-pair on this promote call."""
+
+
+def _bd_show(repo: str, bead_id: str) -> subprocess.CompletedProcess:
+    """bd show <bead_id> --json, tolerant of a repo path that does not exist
+    or isn't executable-from at all (a fixture/test double, or a promote()
+    call whose bd-only checks run before any real checkout is guaranteed) —
+    those degrade to the same 'could not read' outcome as a non-zero bd exit,
+    rather than raising OSError out of a check every promote() call makes
+    unconditionally."""
+    try:
+        return git_lib._run(git_lib._tool("SABLE_MG_BD", "bd") + ["show", bead_id, "--json"],
+                            cwd=repo, check=False)
+    except OSError as exc:
+        return subprocess.CompletedProcess([], 1, stdout=str(exc))
+
+
+def _bd_show_json(repo: str, bead_id: str) -> dict:
+    """bd show <bead_id> --json, parsed defensively. Returns {} on any
+    failure (unreadable bd, unknown bead, unparseable output) — callers below
+    treat that as 'no pairing declared' when reading a bead's OWN metadata
+    (fail toward the pre-existing default of an unconstrained promote) and as
+    'not landed' when checking a COUNTERPART's status (fail toward refusing
+    the promote — an unresolvable counterpart cannot be proven landed)."""
+    cp = _bd_show(repo, bead_id)
+    if cp.returncode != 0:
+        return {}
+    try:
+        data = json.loads(cp.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    return data if isinstance(data, dict) else {}
+
+
+def parse_with_pair(values: list[str]) -> frozenset[str]:
+    """--with-pair CLI values (repeatable, or comma-separated) -> a flat id
+    set. Lives here, not in the CLI, so bin/sable-merge-gate stays thin."""
+    return frozenset(tok.strip() for raw in values for tok in raw.split(",") if tok.strip())
+
+
+def declared_landing_pair(repo: str, bead: str) -> frozenset[str]:
+    """The bead ids <bead> itself declares via `metadata.landing_pair`
+    (comma/whitespace-separated). Empty when unset, unreadable, or bead is
+    falsy — "no pairing declared" is the correct default for every bead this
+    mechanism does not apply to, which is almost all of them."""
+    if not bead:
+        return frozenset()
+    raw = (_bd_show_json(repo, bead).get("metadata") or {}).get(_LANDING_PAIR_KEY) or ""
+    return frozenset(tok.strip() for tok in re.split(r"[,\s]+", raw) if tok.strip())
+
+
+def _bead_landed(repo: str, bead_id: str) -> bool:
+    notes = _bd_show_json(repo, bead_id).get("notes") or ""
+    return _LANDED_MARKER in notes
+
+
+def assert_landing_pair_satisfied(repo: str, bead: str,
+                                  with_pair: frozenset[str] = frozenset()) -> None:
+    """Refuse a solo promote of <bead> when it declares a `landing_pair`
+    counterpart that is neither already landed nor named in <with_pair> (the
+    --with-pair CLI flag, i.e. this SAME promote call). Two unpaired beads —
+    no `landing_pair` metadata at all — are never touched by this check,
+    however similar their footprints: it discriminates on the declared
+    relation, not on any file-level property."""
+    for counterpart in declared_landing_pair(repo, bead):
+        if counterpart in with_pair:
+            continue
+        if _bead_landed(repo, counterpart):
+            continue
+        raise LandingPairRefused(
+            f"{bead} declares metadata.{_LANDING_PAIR_KEY}={counterpart!r} (SABLE-rzkw7: "
+            f"MUST-LAND-TOGETHER) and {counterpart} is neither landed nor named on this "
+            f"promote call. Refusing a solo promote of {bead}. Promote both together — "
+            f"sable-merge-gate promote --bead {bead} --branch <branch> --with-pair {counterpart} "
+            f"— or wait for {counterpart} to land first.")
+
+
+# --------------------------------------------------------------------------
 # Coverage floor on pruning passes (SABLE-cmar4.5) — the MECHANICAL deny path
 # --------------------------------------------------------------------------
 
@@ -1537,9 +1656,17 @@ def _adoption_miss_optimistic(bead: str, branch: str, base: str, repo: str, remo
 
 def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             manager: str, override: str | None,
-            coverage_override: str | None = None) -> int:
+            coverage_override: str | None = None,
+            with_pair: frozenset[str] = frozenset()) -> int:
     # FIRST, before any git work: is the fleet frozen? (SABLE-jd5fj.5)
     assert_not_frozen(repo)
+    # SECOND, still before any git work — a bd-only check, cheap like the
+    # freeze read above: does <bead> declare a MUST-LAND-TOGETHER counterpart
+    # that this solo promote would silently split? (SABLE-rzkw7)
+    try:
+        assert_landing_pair_satisfied(repo, bead, with_pair)
+    except LandingPairRefused as exc:
+        raise GateError(classify.EXIT_PAIR_REFUSED, str(exc)) from exc
     base_ref = classify.qualify_remote_ref(remote, base)
     branch_ref = classify.qualify_remote_ref(remote, branch)
     git_lib._git(repo, "fetch", remote, base, branch)

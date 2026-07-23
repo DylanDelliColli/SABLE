@@ -9,6 +9,8 @@ in the pane, not just assumed from a zero exit code), and SABLE-6izz
 manager-name lookups never fall through to a worker pane's bead tag).
 """
 import importlib.util
+import json
+import os
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
@@ -425,6 +427,202 @@ def test_file_fallback_bead_returns_none_when_bd_unavailable():
 
     assert sable_msg.file_fallback_bead("lincoln", "optimus", "msg",
                                         runner=lambda a: R()) is None
+
+
+# --- seat sightings (SABLE-441vl) -------------------------------------------
+#
+# The merge seat (chuck) cannot file WORK-creating beads
+# (hooks/multi-manager/seat-sighting-gate.sh). Before this bead there was no
+# lesser "record an observation" path either, so any finding chuck made
+# reached the backlog only if a manager read his message and chose to file
+# it — capture ran on ATTENTION, not STRUCTURE. `--file-sighting` closes that
+# gap WITHOUT widening the seat's authority: a sighting is durable and
+# DEFERRED from creation, so it can never enter `bd ready` until a manager
+# promotes it.
+
+def test_file_sighting_bead_creates_a_deferred_sighting_bead():
+    """Two bd calls, not one: `bd create` has no --status flag at all
+    (verified against the real CLI), so landing a bead already excluded from
+    `bd ready` is create-then-update. Both calls, and their order, are
+    asserted here — the deferred update is not optional decoration."""
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-ab12\n"
+        stderr = ""
+
+    def runner(args):
+        seen.append(args)
+        return R()
+
+    bead_id = sable_msg.file_sighting_bead(
+        "chuck", "found a defect while verifying wk-foo", runner=runner)
+    assert bead_id == "SABLE-ab12"
+    assert len(seen) == 2
+    create_argv, update_argv = seen
+    assert create_argv[:2] == ["bd", "create"]
+    joined_create = " ".join(create_argv)
+    assert "SIGHTING:" in joined_create
+    assert "found a defect while verifying wk-foo" in joined_create
+    assert "--labels=sighting,for-triage" in create_argv
+    assert update_argv == ["bd", "update", "SABLE-ab12", "--status=deferred"]
+
+
+def test_file_sighting_bead_deletes_on_a_failed_defer_update():
+    """A sighting bead that landed OPEN (dispatchable) is a work-creating side
+    effect this function must never produce: if the deferred-status update
+    fails, the just-created bead is deleted rather than left un-deferred."""
+    seen = []
+
+    class Ok:
+        returncode = 0
+        stdout = "Created issue: SABLE-ab12\n"
+        stderr = ""
+
+    class Fail:
+        returncode = 1
+        stdout = ""
+        stderr = "bd: db locked"
+
+    def runner(args):
+        seen.append(args)
+        return Fail() if args[:2] == ["bd", "update"] else Ok()
+
+    bead_id = sable_msg.file_sighting_bead("chuck", "text", runner=runner)
+    assert bead_id is None
+    assert ["bd", "delete", "SABLE-ab12", "--force"] in seen
+
+
+def test_file_sighting_bead_returns_none_when_bd_unavailable():
+    class R:
+        returncode = 1
+        stdout = ""
+        stderr = "bd: not a beads workspace"
+
+    assert sable_msg.file_sighting_bead("chuck", "text", runner=lambda a: R()) is None
+
+
+def test_sighting_bead_title_truncates_and_prefixes():
+    title = sable_msg.sighting_bead_title("x" * 200)
+    assert title.startswith(f"{sable_msg.SIGHTING_TITLE_PREFIX}: ")
+    assert title == f"{sable_msg.SIGHTING_TITLE_PREFIX}: {'x' * 80}"
+
+
+def test_main_file_sighting_bypasses_pane_lookup_entirely(monkeypatch, capsys):
+    """--file-sighting is a bd write, not a message: it must never touch
+    tmux/session resolution at all."""
+    monkeypatch.setattr(sable_msg, "resolve_session", lambda *a, **k: pytest.fail(
+        "a sighting must not resolve a tmux session"))
+    monkeypatch.setattr(sable_msg, "file_sighting_bead", lambda frm, text, **k: "SABLE-xyz")
+    rc = sable_msg.main(["--file-sighting", "--from", "chuck", "an observation"])
+    assert rc == 0
+    assert "SABLE-xyz" in capsys.readouterr().err
+
+
+def test_main_file_sighting_reports_failure_and_a_manual_fallback(monkeypatch, capsys):
+    monkeypatch.setattr(sable_msg, "resolve_session", lambda *a, **k: pytest.fail(
+        "a sighting must not resolve a tmux session"))
+    monkeypatch.setattr(sable_msg, "file_sighting_bead", lambda frm, text, **k: None)
+    rc = sable_msg.main(["--file-sighting", "--from", "chuck", "an observation"])
+    assert rc == 1
+    assert "could not file sighting" in capsys.readouterr().err
+
+
+def test_parse_args_file_sighting_treats_the_single_positional_as_body():
+    """--file-sighting takes no to_role — argparse fills the first optional
+    positional (to_role) greedily, so parse_args must re-route it into body."""
+    ns = sable_msg.parse_args(["--file-sighting", "an observation body"])
+    assert ns.to_role is None
+    assert ns.body == "an observation body"
+
+
+def test_parse_args_still_requires_to_role_without_file_sighting():
+    with pytest.raises(SystemExit):
+        sable_msg.parse_args(["--body-file", "-"])
+
+
+SEAT_GATE_HOOK = Path(__file__).resolve().parent.parent / "hooks" / "multi-manager" / "seat-sighting-gate.sh"
+
+
+def _run_seat_gate(command, agent_name, agent_role="manager"):
+    env = dict(os.environ)
+    if agent_name:
+        env["CLAUDE_AGENT_NAME"] = agent_name
+        env["CLAUDE_AGENT_ROLE"] = agent_role or ""
+    else:
+        env.pop("CLAUDE_AGENT_NAME", None)
+        env.pop("CLAUDE_AGENT_ROLE", None)
+    hook_input = json.dumps({"tool_input": {"command": command}})
+    return subprocess.run(["bash", str(SEAT_GATE_HOOK)], input=hook_input, text=True,
+                          capture_output=True, env=env, timeout=10)
+
+
+def test_seat_sighting_is_deferred_and_not_work():
+    """THE property SABLE-441vl is accepted or rejected on. Filing a sighting
+    from the seat's own identity (via file_sighting_bead) produces a bead
+    that is deferred by default and carries the sighting/for-triage marker.
+    NEGATIVE CONTROL, in this same test: an attempt by the seat to file a
+    NORMAL WORK bead — a plain `bd create`, the exact command
+    file_sighting_bead is NOT wrapping — is still REFUSED by
+    hooks/multi-manager/seat-sighting-gate.sh. This is the assertion most
+    likely to be lost in implementation, because it is the one that proves
+    the governance limit was not quietly widened."""
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-ab12\n"
+        stderr = ""
+
+    def runner(args):
+        seen.append(args)
+        return R()
+
+    bead_id = sable_msg.file_sighting_bead("chuck", "an observation", runner=runner)
+    assert bead_id == "SABLE-ab12"
+    assert "--labels=sighting,for-triage" in seen[0]
+    assert seen[1] == ["bd", "update", "SABLE-ab12", "--status=deferred"]
+
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    result = _run_seat_gate(
+        'bd create --title="fix the thing" --description="foo bar" --type=task',
+        agent_name="chuck")
+    out = json.loads(result.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "SABLE-441vl" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_seat_gate_allows_a_sighting_labeled_create():
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    result = _run_seat_gate(
+        'bd create --title="SIGHTING: x" --description="y" --type=task '
+        '--priority=3 --labels=sighting,for-triage',
+        agent_name="chuck")
+    assert result.stdout.strip() == ""
+    assert result.returncode == 0
+
+
+def test_seat_gate_ignores_non_seat_identities():
+    """Every other manager's `bd create` — the ordinary work-filing path —
+    must pass through untouched. This hook has exactly one job."""
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    result = _run_seat_gate(
+        'bd create --title="fix the thing" --description="foo bar" --type=task',
+        agent_name="optimus")
+    assert result.stdout.strip() == ""
+    assert result.returncode == 0
+
+
+def test_seat_gate_ignores_commands_that_are_not_bd_create():
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    result = _run_seat_gate("bd show SABLE-x", agent_name="chuck")
+    assert result.stdout.strip() == ""
+    assert result.returncode == 0
 
 
 # --- deliver_message: stub-tmux retry + verification (SABLE-bq93) -----------
