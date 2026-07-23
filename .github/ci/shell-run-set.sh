@@ -523,8 +523,41 @@ check_loud_skip_cli() {
   return 0
 }
 
+# runlock_hold <label>: take a suite-run registration for the WHOLE run and
+# release it on EXIT (SABLE-pk15w / SABLE-4qlcf). Held continuously on purpose:
+# this runner EXECS each suite as a subprocess, so a point-in-time ps can miss
+# it BETWEEN invocations — which is exactly how the 2026-07-22 clearance read
+# CLEAR while this runner was mid-flight executing a real sable-spawn-worker.
+# Registers $$ (this runner's shell), not the short-lived python child.
+#
+# A failure to register is LOUD but non-fatal: clearance fails closed on the
+# same condition (an unresolvable/unwritable registry is could-not-assess, never
+# clear), so a run can never go unrecorded while the seat reads CLEAR.
+runlock_hold() {
+  RUNLOCK_TOKEN=""
+  local cli="$REPO/bin/sable-run-registry"
+  [ -x "$cli" ] || return 0
+  RUNLOCK_TOKEN="$(python3 "$cli" register --runner "$1" --pid $$ 2>/dev/null)" || {
+    RUNLOCK_TOKEN=""
+    echo "::warning::shell-run-set: could not take a suite-run registration — hot-swap clearance will read could-not-assess, not clear (SABLE-pk15w)" >&2
+    return 0
+  }
+  # shellcheck disable=SC2064 — expand the token now, at trap-install time.
+  trap "python3 '$cli' release '$RUNLOCK_TOKEN' >/dev/null 2>&1" EXIT
+  # An ORDERLY termination (Ctrl-C, a CI `timeout`) must release: bash does not
+  # fire an EXIT trap on an untrapped signal, so without these a timed-out run
+  # leaves a STALE entry that only an operator reap can clear. Converting the
+  # signal into a normal exit is what lets the EXIT trap above run. A SIGKILL or
+  # a crash still leaves the entry stale — that is the fail-closed half, and it
+  # is deliberate: the releasing direction is the dangerous one.
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+}
+
 run_set() {
   local failed=() skipped_realbd=() name rc out_file n_skip
+  runlock_hold "shell-run-set.sh --run"
   # SABLE-jd5fj.16: the top-level rollup below used to report only pass/fail
   # — "ci-verify shell run-set: all N suites GREEN" says nothing about a
   # suite that passed BY SKIPPING its real-bd leg. That is exactly how the
