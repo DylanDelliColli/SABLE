@@ -27,12 +27,29 @@ set -euo pipefail
 
 # Resolve the role PROJECT-FIRST (a project-scoped orchestration install lives in
 # ./.claude) then fall back to the user-level install (~/.claude).
+_PROJECT_CAND="$PWD/.claude/sable/roles/${CLAUDE_AGENT_NAME}.md"
+_USER_CAND="$HOME/.claude/sable/roles/${CLAUDE_AGENT_NAME}.md"
 ROLE_FILE=""
-for _cand in "$PWD/.claude/sable/roles/${CLAUDE_AGENT_NAME}.md" \
-             "$HOME/.claude/sable/roles/${CLAUDE_AGENT_NAME}.md"; do
+for _cand in "$_PROJECT_CAND" "$_USER_CAND"; do
     if [ -f "$_cand" ]; then ROLE_FILE="$_cand"; break; fi
 done
 [ -z "$ROLE_FILE" ] && exit 0
+
+# SABLE-thx70: LOUD ON SHADOWING. Project-first precedence is a supported
+# feature (the comment above), but a stale project-local copy silently
+# outranking a freshly-edited user-level one, forever, with no event, is not
+# -- it defeated six days of role-card edits fleet-wide before anyone noticed
+# (measured on this bead's own optimus.md: 6 bead ids present ONLY in the
+# user-level copy, never read). Precedence is UNCHANGED here; this only makes
+# the disagreement visible. Fires ONLY when both candidates exist AND differ
+# in content -- identical content, or only one candidate present, is the
+# ordinary case and must stay silent or every boot would warn.
+if [ -f "$_PROJECT_CAND" ] && [ -f "$_USER_CAND" ] && ! cmp -s "$_PROJECT_CAND" "$_USER_CAND"; then
+    _proj_mtime=$(stat -c '%y' "$_PROJECT_CAND" 2>/dev/null || stat -f '%Sm' "$_PROJECT_CAND" 2>/dev/null || echo unknown)
+    _user_mtime=$(stat -c '%y' "$_USER_CAND" 2>/dev/null || stat -f '%Sm' "$_USER_CAND" 2>/dev/null || echo unknown)
+    printf 'SABLE-ROLE-CARD-SHADOWED: role card for %s differs between the project-local and user-level installs. Precedence is unchanged -- the project-local copy WINS -- but the user-level copy is being silently ignored:\n  WINNER   (project-local): %s (mtime: %s)\n  SHADOWED (user-level):    %s (mtime: %s)\nIf the user-level edit was intentional, it will never be read while the project-local copy exists.\n' \
+        "$CLAUDE_AGENT_NAME" "$_PROJECT_CAND" "$_proj_mtime" "$_USER_CAND" "$_user_mtime" >&2
+fi
 
 ROLE_CONTENT=$(cat "$ROLE_FILE")
 
