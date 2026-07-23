@@ -255,23 +255,36 @@ _PARENTHETICAL = re.compile(r"\([^)]*\)")
 _CODE_SUFFIXES = (".py", ".sh", ".yml", ".yaml", ".json", ".md", ".ts", ".js", ".toml")
 
 
-def _collect_section(description: str, heading: re.Pattern[str]) -> tuple[bool, frozenset[str]]:
+def _collect_section(description: str, heading: re.Pattern[str]
+                     ) -> tuple[bool, frozenset[str], frozenset[str]]:
     """Shared prose-section extractor for the bead-description sub-sections
     this module parses (`## File footprint`, `## File reads`).
 
-    Returns (found, entries): `found` says whether the heading appeared at all,
-    which the caller needs to tell "not declared" apart from "declared as
-    empty" (SABLE-jd5fj.18) — a distinction `parse_declared_footprint`'s
-    caller does not need, because the mechanical footprint already governs the
-    write side, but `parse_declared_reads`'s caller very much does, because
-    reads have no such fallback.
+    Returns (found, entries, dropped): `found` says whether the heading
+    appeared at all, which the caller needs to tell "not declared" apart from
+    "declared as empty" (SABLE-jd5fj.18) — a distinction
+    `parse_declared_footprint`'s caller does not need, because the mechanical
+    footprint already governs the write side, but `parse_declared_reads`'s
+    caller very much does, because reads have no such fallback.
 
     Parsing is deliberately lossy in the WIDENING direction only: parenthetical
     asides are dropped (they are commentary), tokens are split on commas and
     whitespace, and a token is kept if it looks like a path (contains '/' or
     ends in a known code suffix). A prose fragment that survives as a bogus
     entry can only ADD to the set; a real path that is missed leaves whatever
-    fallback the caller has governing. Neither direction can narrow it."""
+    fallback the caller has governing. Neither direction can narrow it.
+
+    `dropped` is every non-empty token that did NOT look like a path
+    (SABLE-kznzo). A bare filename ('Makefile', 'Dockerfile', an
+    extension-less script) is lexically identical to an ordinary English word
+    to this tokenizer, so silently discarding what fails the path-shaped test
+    would make a genuinely dropped path indistinguishable from prose noise —
+    exactly the failure this module must not reproduce on its own read side.
+    Reporting the drop is what lets a caller (or a human reading the section)
+    notice a real path went missing instead of finding out from a promotion
+    gap. This is why the '## File reads' section must carry entries only —
+    any prose placed inside it buries a true drop in the surrounding noise;
+    put rationale in a sibling section or in the bead body instead."""
     lines = description.splitlines()
     body: list[str] = []
     collecting = False
@@ -286,37 +299,49 @@ def _collect_section(description: str, heading: re.Pattern[str]) -> tuple[bool, 
                 break
             body.append(line)
     if not found:
-        return False, frozenset()
+        return False, frozenset(), frozenset()
     text = _PARENTHETICAL.sub(" ", "\n".join(body))
     entries: set[str] = set()
+    dropped: set[str] = set()
     for raw in re.split(r"[,\s]+", text):
         tok = raw.strip().strip("`*-—;:").rstrip(".")
         if not tok:
             continue
         if "/" in tok or tok.endswith(_CODE_SUFFIXES):
             entries.add(tok)
-    return True, frozenset(entries)
+        else:
+            dropped.add(tok)
+    return True, frozenset(entries), frozenset(dropped)
 
 
 def parse_declared_footprint(description: str) -> frozenset[str]:
     """Entries from a bead description's `## File footprint` section. An
     absent section is treated as "declares nothing" — see _collect_section —
     because the mechanical footprint governs the write side regardless."""
-    _, entries = _collect_section(description, _FOOTPRINT_HEADING)
+    _, entries, _ = _collect_section(description, _FOOTPRINT_HEADING)
     return entries
 
 
-def parse_declared_reads(description: str) -> tuple[bool, frozenset[str]]:
+def parse_declared_reads(description: str) -> tuple[bool, frozenset[str], frozenset[str]]:
     """Entries from a bead description's `## File reads` section
     (SABLE-jd5fj.18) — the read-side counterpart to `## File footprint`.
 
-    Returns (declared, entries). `declared` is False when the heading is
-    absent (the read set is UNKNOWN, not empty) and True when the heading is
-    present, even with zero entries (the planner explicitly said "this reads
-    nothing beyond its own footprint"). The caller — declared_reads() below —
-    must treat "not declared" as a non-answer, unlike parse_declared_footprint's
-    caller: writes always have a mechanical fallback, and reads, today, do
-    not (mechanical/import-graph derivation of reads is the follow-up bead)."""
+    Returns (declared, entries, dropped). `declared` is False when the
+    heading is absent (the read set is UNKNOWN, not empty) and True when the
+    heading is present, even with zero entries (the planner explicitly said
+    "this reads nothing beyond its own footprint"). The caller —
+    declared_reads() below — must treat "not declared" as a non-answer,
+    unlike parse_declared_footprint's caller: writes always have a mechanical
+    fallback, and reads, today, do not (mechanical/import-graph derivation of
+    reads is the follow-up bead).
+
+    `dropped` (SABLE-kznzo) is every token in the section that did not look
+    like a path — the loud-on-ambiguity report described on
+    `_collect_section`. A bare filename and a prose word are lexically
+    identical to the tokenizer, so a real dropped path is otherwise invisible
+    the moment the section carries any rationale; surfacing every drop is
+    what lets an author (or a caller building a lint on top of this) notice
+    when the true one is among them."""
     return _collect_section(description, _READS_HEADING)
 
 
@@ -411,7 +436,7 @@ def declared_reads(repo: str, bead: str) -> Footprint:
     structured = _metadata_entries(record["metadata"], "footprint_reads_declared")
     if structured is not None:
         return footprint(structured, source=f"declared-reads:{bead}:field")
-    declared, entries = parse_declared_reads(record["description"])
+    declared, entries, _dropped = parse_declared_reads(record["description"])
     if not declared:
         raise FootprintUndetermined(
             f"no declared read footprint (field or '## File reads' section) for "
