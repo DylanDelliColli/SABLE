@@ -174,6 +174,172 @@ def test_spawn_bundle_renders_all_bead_descriptions_into_prompt(sock):
         assert "every other bundled bead listed above" in body
 
 
+def _create_scratch_bead(title: str, description: str = "") -> str:
+    """Create a real, ephemeral (TTL-compacted, no backlog pollution) scratch
+    bead via a raw subprocess call to `bd create` — bypassing the agent-level
+    bead-description-gate hook, which only intercepts `bd create` invoked
+    directly through the Bash tool, not a nested subprocess call from test
+    code. Returns the new bead's id."""
+    args = ["bd", "create", f"--title={title}", "--type=task", "--priority=3",
+            "--ephemeral", "--json"]
+    if description:
+        args.append(f"--description={description}")
+    r = subprocess.run(args, capture_output=True, text=True, check=True)
+    return json.loads(r.stdout)["id"]
+
+
+def _delete_scratch_bead(bead_id: str) -> None:
+    subprocess.run(["bd", "delete", bead_id, "--force"],
+                   capture_output=True, text=True)
+
+
+def test_worker_prompt_file_contains_notes(sock):
+    """TEST SPEC (SABLE-h8swc): a real bead, created via real bd, whose NOTES
+    (not description) carry a unique marker added via real 'bd update
+    --append-notes' — the marker must appear in the prompt actually WRITTEN
+    to the dispatch file for a real sable-spawn-worker invocation BY
+    ABSOLUTE WORKTREE PATH (BIN is resolved relative to THIS test file's own
+    directory, never a PATH symlink that could resolve to the shared main
+    checkout's — possibly older — copy). Positive control required: the
+    bead's own DESCRIPTION marker must also be found by the same probe, so a
+    zero match on the notes marker cannot be attributed to a broken probe."""
+    desc_marker = f"DESCMARKER-{uuid.uuid4().hex[:12]}"
+    notes_marker = f"NOTESMARKER-{uuid.uuid4().hex[:12]}"
+    bead_id = _create_scratch_bead(
+        "scratch: h8swc notes-render probe",
+        f"probe bead {desc_marker} [no-test] — throwaway, deleted at teardown")
+    try:
+        subprocess.run(["bd", "update", bead_id, "--append-notes", notes_marker],
+                       capture_output=True, text=True, check=True)
+
+        with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
+            env = {
+                **_clean_env(),
+                "SABLE_TMUX_SOCKET": sock,
+                "SABLE_TMUX_SESSION": "sable",
+                "SABLE_WORKER_CMD": "bash --noprofile --norc",
+                "SABLE_DISPATCH_DIR": dd,
+                "SABLE_DISPATCH_READY_TIMEOUT": "0",
+                "SABLE_MAX_LOAD_PER_CORE": "0",
+                "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+                "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+            }
+            r = subprocess.run(
+                ["python3", str(BIN), bead_id, "--worktree", wt,
+                 "--model", "haiku", "--skip-governance"],
+                capture_output=True, text=True, env=env,
+            )
+            assert r.returncode == 0, r.stderr
+            time.sleep(0.6)
+            body = (Path(dd) / f"{bead_id}.md").read_text()
+            assert desc_marker in body   # positive control: probe finds what IS pushed
+            assert notes_marker in body  # the fix: notes now reach the prompt too
+    finally:
+        _delete_scratch_bead(bead_id)
+
+
+def test_worker_prompt_file_contains_comments(sock):
+    """TEST SPEC (SABLE-pruak): a comment added via a real 'bd comments add'
+    must reach the prompt actually WRITTEN to the dispatch file. This is the
+    leg that matters — the defect is in what the REAL bd read path returns
+    and what the real assembler does with it, and a stubbed bead would let a
+    wrong field name pass silently. Positive control: the bead's own
+    description marker is also found by the same probe. (Filed in this
+    Python integration suite alongside the sibling h8swc/kv44f integration
+    tests, all three exercising the same real dispatch-prompt-assembly path
+    against a real bd store — not a new hooks/test/ shell suite, since that
+    would duplicate the harness this file already provides for identical
+    coverage.)"""
+    desc_marker = f"DESCMARKER-{uuid.uuid4().hex[:12]}"
+    comment_marker = f"COMMENTMARKER-{uuid.uuid4().hex[:12]}"
+    bead_id = _create_scratch_bead(
+        "scratch: pruak comments-render probe",
+        f"probe bead {desc_marker} [no-test] — throwaway, deleted at teardown")
+    try:
+        subprocess.run(["bd", "comments", "add", bead_id, comment_marker],
+                       capture_output=True, text=True, check=True)
+
+        with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
+            env = {
+                **_clean_env(),
+                "SABLE_TMUX_SOCKET": sock,
+                "SABLE_TMUX_SESSION": "sable",
+                "SABLE_WORKER_CMD": "bash --noprofile --norc",
+                "SABLE_DISPATCH_DIR": dd,
+                "SABLE_DISPATCH_READY_TIMEOUT": "0",
+                "SABLE_MAX_LOAD_PER_CORE": "0",
+                "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+                "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+            }
+            r = subprocess.run(
+                ["python3", str(BIN), bead_id, "--worktree", wt,
+                 "--model", "haiku", "--skip-governance"],
+                capture_output=True, text=True, env=env,
+            )
+            assert r.returncode == 0, r.stderr
+            time.sleep(0.6)
+            body = (Path(dd) / f"{bead_id}.md").read_text()
+            assert desc_marker in body
+            assert comment_marker in body
+    finally:
+        _delete_scratch_bead(bead_id)
+
+
+def test_dispatch_refused_on_notes_only_bead(sock):
+    """TEST SPEC (SABLE-kv44f): against a real bd store, a bead whose
+    description is empty and whose notes hold >= threshold chars refuses the
+    dispatch end-to-end with the loud report on stderr and no worktree/pane
+    side effects (no dispatch file written, no worker pane tagged with the
+    bead). Positive control: the SAME bead, with a description subsequently
+    added, dispatches past this check."""
+    big_notes = "y" * 250
+    bead_id = _create_scratch_bead("scratch: kv44f empty-desc-guard probe")
+    try:
+        subprocess.run(["bd", "update", bead_id, "--append-notes", big_notes],
+                       capture_output=True, text=True, check=True)
+
+        with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
+            env = {
+                **_clean_env(),
+                "SABLE_TMUX_SOCKET": sock,
+                "SABLE_TMUX_SESSION": "sable",
+                "SABLE_WORKER_CMD": "bash --noprofile --norc",
+                "SABLE_DISPATCH_DIR": dd,
+                "SABLE_DISPATCH_READY_TIMEOUT": "0",
+                "SABLE_MAX_LOAD_PER_CORE": "0",
+                "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+                "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+            }
+            r = subprocess.run(
+                ["python3", str(BIN), bead_id, "--worktree", wt,
+                 "--model", "haiku", "--skip-governance"],
+                capture_output=True, text=True, env=env,
+            )
+            assert r.returncode == 13, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+            assert "dispatch-content blocked" in r.stderr
+            assert "fold" in r.stderr
+            assert not (Path(dd) / f"{bead_id}.md").exists()
+            listing = _tmux(sock, "list-panes", "-a", "-F",
+                            "#{@sable_role} #{@sable_bead}").stdout
+            assert not any(bead_id in line for line in listing.splitlines()), listing
+
+            # positive control: same bead, description now populated, must
+            # dispatch PAST this check (a real window this time).
+            subprocess.run(["bd", "update", bead_id, "--description",
+                            "a real description now exists"],
+                           capture_output=True, text=True, check=True)
+            r2 = subprocess.run(
+                ["python3", str(BIN), bead_id, "--worktree", wt,
+                 "--model", "haiku", "--skip-governance"],
+                capture_output=True, text=True, env=env,
+            )
+            assert r2.returncode == 0, r2.stderr
+            time.sleep(0.6)
+            assert (Path(dd) / f"{bead_id}.md").exists()
+    finally:
+        _delete_scratch_bead(bead_id)
+
+
 def test_spawn_without_worktree_lands_where_dispatch_points(sock):
     """SABLE-bldh.11 regression: with NO --worktree, the path `bd worktree create`
     actually creates MUST equal the path embedded in the dispatch file (== the
