@@ -104,6 +104,27 @@ def test_read_verdict_never_invents_a_conclusion_from_a_non_answer(monkeypatch, 
     assert v.complete is False and v.conclusion == "pending"
 
 
+def test_read_verdict_marks_a_non_answer_as_unanswered(monkeypatch, never_waits):
+    """SABLE-fewih: a non-answer (gh missing/erroring/hanging, _gh_runs -> None)
+    must be distinguishable from a genuinely in-flight run, even though both
+    collapse to complete=False. Chuck's non-blocking verdict CLI (report_verdict)
+    has no wait loop to converge through the way promote's wait_for_ci
+    fallthrough does, so it needs this bit to avoid printing 'pending' for a gh
+    that could not be asked at all."""
+    monkeypatch.setattr(preview_lib, "_gh_runs", lambda *a, **kw: None)
+    v = preview_lib.read_verdict(REPO, REF, PREVIEW_SHA)
+    assert v.answered is False
+
+
+def test_read_verdict_marks_a_genuinely_in_flight_run_as_answered(monkeypatch, never_waits):
+    """The counterpart: gh DID answer here (a run exists, just not completed),
+    so answered must stay True — only a non-answer flips it."""
+    runs = [{"headSha": PREVIEW_SHA, "status": "in_progress", "conclusion": None, "url": "u"}]
+    monkeypatch.setattr(preview_lib, "_gh_runs", lambda *a, **kw: runs)
+    v = preview_lib.read_verdict(REPO, REF, PREVIEW_SHA)
+    assert v.answered is True
+
+
 def test_read_verdict_ignores_a_completed_run_for_a_different_sha(monkeypatch, never_waits):
     monkeypatch.setattr(preview_lib, "_gh_runs",
                         lambda *a, **kw: _completed_run(sha="f" * 40))
