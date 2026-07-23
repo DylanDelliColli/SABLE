@@ -402,6 +402,118 @@ rm -f "$TRAILFLAG_EV"
 run_hook_silent "bash setup.sh --run pre_push (non-test script) not recognized" \
   "bash setup.sh --run pre_push"
 
+# ---------- SABLE-rd9n0: documented canonical script names, not just 'test-*' ----------
+# SCRIPT_RE requires the basename to START with the literal 'test-', so it
+# never matched this repo's DOCUMENTED canonical test command (CLAUDE.md,
+# Build & Test): 'bash .github/ci/shell-run-set.sh --run' -- basename
+# 'shell-run-set.sh' does not start with 'test-'. A close citing that
+# command legitimately ran the suite but was not credited. Fix: an
+# allowlist of the specific canonical basenames, not a loosened regex (a
+# loosened regex would also credit an arbitrary '.sh' like deploy.sh).
+
+run_hook_writes "bash .github/ci/shell-run-set.sh --run recognized (SABLE-rd9n0)" \
+  "bash .github/ci/shell-run-set.sh --run"
+
+run_hook_writes "direct execution ./.github/ci/shell-run-set.sh --run recognized" \
+  "./.github/ci/shell-run-set.sh --run"
+
+run_hook_writes "absolute direct execution of shell-run-set.sh recognized" \
+  "/home/ddc/dev-environment/SABLE/.github/ci/shell-run-set.sh --run"
+
+run_hook_writes "bash .github/ci/shell-run-set.sh with no trailing args recognized" \
+  "bash .github/ci/shell-run-set.sh"
+
+# REGRESSION: the existing 'test-*.sh' convention still works after the
+# allowlist is added (test-tiers.sh already matches SCRIPT_RE; must not
+# regress).
+run_hook_writes "regression: bash .github/ci/test-tiers.sh --run pre_push still recognized" \
+  "bash .github/ci/test-tiers.sh --run pre_push"
+
+run_hook_writes "regression: bash test-foo.sh still recognized" \
+  "bash hooks/test/test-foo.sh"
+
+# NEGATIVE CONTROL (load-bearing half): the allowlist names specific
+# canonical scripts -- it must not become "any .sh is a test command".
+run_hook_silent "bash .github/ci/deploy.sh not recognized (non-canonical .sh)" \
+  "bash .github/ci/deploy.sh"
+
+run_hook_silent "bash build.sh not recognized (non-canonical .sh)" \
+  "bash build.sh"
+
+run_hook_silent "./deploy.sh direct execution not recognized" \
+  "./deploy.sh --run"
+
+# ---------- INTEGRATION: shell-run-set.sh evidence + real tdd-gate.sh close ----------
+# Acceptance criterion for SABLE-rd9n0: a worker whose recorded TDD evidence
+# cites the repo's documented canonical suite must be able to close its bead
+# afterward. Real writer hook + real gate hook, same session, no mocks.
+SRS_STUB_DIR=$(mktemp -d)
+cat > "$SRS_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-stub","notes":"integration stub"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$SRS_STUB_DIR/bd"
+SRS_GATE_HOOK_FILE="$(cd "$(dirname "$0")/.." && pwd)/tdd-gate.sh"
+
+SRS_SID="tdd-ev-shellrunset-gate-$$-$RANDOM"
+SRS_EV="/tmp/tdd-evidence-${SRS_SID}"
+rm -f "$SRS_EV"
+make_input "bash .github/ci/shell-run-set.sh --run" "$SRS_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if [ -s "$SRS_EV" ]; then
+  pass "shell-run-set.sh evidence: real writer hook records evidence (SABLE-rd9n0)"
+else
+  fail "shell-run-set.sh evidence: real writer hook records evidence (SABLE-rd9n0)" "no $SRS_EV"
+fi
+SRS_GATE_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$SRS_SID" | env PATH="$SRS_STUB_DIR:$PATH" bash "$SRS_GATE_HOOK_FILE" 2>/dev/null)
+if [ -z "$SRS_GATE_OUT" ]; then
+  pass "shell-run-set.sh evidence: real gate ALLOWS the close (SABLE-rd9n0 acceptance criterion)"
+else
+  fail "shell-run-set.sh evidence: real gate ALLOWS the close" "gate denied: $SRS_GATE_OUT"
+fi
+rm -f "$SRS_EV"
+rm -rf "$SRS_STUB_DIR"
+
+# NEGATIVE CONTROL in the same real-hook harness: evidence naming a
+# non-canonical '.sh' still does not get credited, proving the recogniser
+# still discriminates rather than crediting any script.
+SRSNEG_STUB_DIR=$(mktemp -d)
+cat > "$SRSNEG_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-stub","notes":"integration stub"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$SRSNEG_STUB_DIR/bd"
+SRSNEG_GATE_HOOK_FILE="$(cd "$(dirname "$0")/.." && pwd)/tdd-gate.sh"
+
+SRSNEG_SID="tdd-ev-deploy-gate-$$-$RANDOM"
+SRSNEG_EV="/tmp/tdd-evidence-${SRSNEG_SID}"
+rm -f "$SRSNEG_EV"
+make_input "bash .github/ci/deploy.sh" "$SRSNEG_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if [ ! -s "$SRSNEG_EV" ]; then
+  pass "deploy.sh evidence: real writer hook records nothing (negative control)"
+else
+  fail "deploy.sh evidence: real writer hook records nothing (negative control)" "unexpected evidence: $(cat "$SRSNEG_EV")"
+fi
+SRSNEG_GATE_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$SRSNEG_SID" | env PATH="$SRSNEG_STUB_DIR:$PATH" bash "$SRSNEG_GATE_HOOK_FILE" 2>/dev/null)
+if [ -n "$SRSNEG_GATE_OUT" ]; then
+  pass "deploy.sh evidence: real gate DENIES the close (negative control)"
+else
+  fail "deploy.sh evidence: real gate DENIES the close" "gate unexpectedly allowed the close with no test evidence"
+fi
+rm -f "$SRSNEG_EV"
+rm -rf "$SRSNEG_STUB_DIR"
+
 # ---------- SABLE-x8mx7: bare inline VAR=value prefix must be unwrapped ----------
 # A bare 'NAME=value ... <cmd>' assignment prefix is the shell's own
 # env-for-one-command form (e.g. the fleet's sandbox-pinning contract:
