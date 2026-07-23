@@ -47,9 +47,19 @@ def export_snapshot(scope_args: list[str] | None = None, run=None) -> list:
     """One `bd list --json` call for the whole sweep — a point-in-time
     snapshot. A bead created, closed, or edited in the live db after this call
     returns never retroactively appears in (or vanishes from) the list handed
-    back here; shards only ever see what existed at export time."""
+    back here; shards only ever see what existed at export time.
+
+    `bd list` defaults to `--limit 50` with no truncation marker in its
+    output — a 48-of-335 result is byte-for-byte indistinguishable from a
+    48-of-48 one (SABLE-52aym). This is the shared seam every sweep caller
+    goes through, so it defaults to `--limit 0` (unlimited) unless
+    `scope_args` already names an explicit `--limit`/`-n`, rather than
+    trusting every future caller to remember the flag."""
     run = run or _run_bd_list
-    raw = run(["bd", "list", "--json", *(scope_args or [])])
+    args = list(scope_args or [])
+    if not any(a in ("--limit", "-n") or a.startswith("--limit=") for a in args):
+        args += ["--limit", "0"]
+    raw = run(["bd", "list", "--json", *args])
     if not raw or not raw.strip():
         return []
     data = json.loads(raw)
