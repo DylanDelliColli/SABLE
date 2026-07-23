@@ -5,6 +5,8 @@ Pure-function coverage: model resolution from label + override, worktree/window
 naming, dispatch-prompt assembly, bead JSON parsing.
 """
 import importlib.util
+import json
+import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -525,6 +527,193 @@ def test_overlap_check_denies_when_serialize_with_names_unrelated_bead():
     other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
     verdict = ssw.overlap_check("X-1", bead, [other])
     assert verdict.decision == "deny"
+
+
+# --- SABLE-fz8kd: a bundled dispatch must not deny against itself -------------
+#
+# PLANT-AND-FAIL (SABLE-5lli.7), both polarities MEASURED, not argued:
+#
+#   UNDER-FIX plant — revert the candidate skip to `oid == bead_id` and drop the
+#   bundle footprint union (i.e. the code as shipped before this bead):
+#     test_bundled_siblings_are_not_candidates_for_their_own_overlap_check RED
+#       ('deny' — the self-denial this bead reports),
+#     test_bundle_sibling_footprint_is_compared_against_foreign_work RED,
+#     test_a_foreign_in_progress_bead_still_denies_a_bundled_dispatch RED on its
+#       "the refusal must not name the sibling" clause (the pre-fix message named
+#       BOTH the foreigner and the sibling).
+#
+#   OVER-FIX plant — let the skip swallow every candidate (`if not oid or True`),
+#   which is what "skip the bundle" degrades into if written carelessly:
+#     test_a_foreign_in_progress_bead_still_denies_a_bundled_dispatch RED,
+#     test_bundle_sibling_footprint_is_compared_against_foreign_work RED,
+#     test_overlap_check_without_a_bundle_is_unchanged RED,
+#     test_overlap_check_wellformed_overlap_still_denies (pre-existing) RED.
+#
+# The second plant is the load-bearing one: it is the gate-that-can-never-deny,
+# the exact mirror of SABLE-47try's gate-that-can-never-release, and it is the
+# failure a fix for defect 1 is most likely to ship by accident.
+
+
+def test_bundled_siblings_are_not_candidates_for_their_own_overlap_check():
+    """THE BEAD, defect 1. The lead and its bundled sibling declare the SAME
+    path — which is the ordinary reason to bundle them into one worktree at all.
+    The sibling is in_progress because THIS SAME INVOCATION claimed it seconds
+    earlier (claim_bundle_beads), so the pre-fix gate counted it as foreign
+    concurrent work and denied the dispatch against its own claim."""
+    lead = {"id": "X-1", "description": "S.\n\n## File footprint\nshared.py"}
+    sibling = {"id": "X-2", "description": "S.\n\n## File footprint\nshared.py",
+               "assignee": "tarzan", "status": "in_progress"}
+    verdict = ssw.overlap_check("X-1", lead, [sibling], [sibling])
+    assert verdict.decision != "deny", verdict.message
+    assert verdict.decision == "none"
+
+
+def test_a_foreign_in_progress_bead_still_denies_a_bundled_dispatch():
+    """LOAD-BEARING NEGATIVE CONTROL. 'Skip the bundle' must not degrade into
+    'skip everything' — that is the gate-that-can-never-deny failure, the exact
+    mirror of SABLE-47try's gate-that-can-never-release. Same bundle as above,
+    plus a genuinely foreign bead holding the same path: still denied, and the
+    refusal names the foreigner and NOT the sibling."""
+    lead = {"id": "X-1", "description": "S.\n\n## File footprint\nshared.py"}
+    sibling = {"id": "X-2", "description": "S.\n\n## File footprint\nshared.py",
+               "assignee": "tarzan", "status": "in_progress"}
+    foreign = {"id": "Y-9", "notes": "WIP-CLAIMS: shared.py", "assignee": "optimus"}
+    verdict = ssw.overlap_check("X-1", lead, [sibling, foreign], [sibling])
+    assert verdict.decision == "deny"
+    assert "Y-9" in verdict.message
+    assert "X-2" not in verdict.message
+
+
+def test_bundle_sibling_footprint_is_compared_against_foreign_work():
+    """The other half of "the dispatch is the unit" (see overlap_check): excluding
+    siblings from the CANDIDATE list without unioning their footprints into the
+    comparison would silently shrink the constraint — a file only the SIBLING
+    declares would stop being contended for. Here the lead declares lead.py and
+    the sibling declares shared.py; the foreign in-progress bead holds shared.py."""
+    lead = {"id": "X-1", "description": "S.\n\n## File footprint\nlead.py"}
+    sibling = {"id": "X-2", "description": "S.\n\n## File footprint\nshared.py"}
+    foreign = {"id": "Y-9", "notes": "WIP-CLAIMS: shared.py", "assignee": "optimus"}
+    verdict = ssw.overlap_check("X-1", lead, [foreign], [sibling])
+    assert verdict.decision == "deny"
+    assert "shared.py" in verdict.message
+
+
+def test_bundle_serialize_with_is_read_from_the_whole_dispatch():
+    """One worker, one branch, one merge — so the Serialize-with grant belongs to
+    the DISPATCH, not to whichever bead happens to lead it. Mirrors the shell twin
+    (pre-dispatch-overlap.sh aggregates SERIALIZE_WITH_STORED over DISPATCH_IDS)."""
+    lead = {"id": "X-1", "description": "S.\n\n## File footprint\nshared.py"}
+    sibling = {"id": "X-2", "notes": "Serialize-with: Y-9"}
+    foreign = {"id": "Y-9", "notes": "WIP-CLAIMS: shared.py", "assignee": "optimus"}
+    verdict = ssw.overlap_check("X-1", lead, [foreign], [sibling])
+    assert verdict.decision == "allow"
+    assert verdict.tagged_ids == ("Y-9",)
+
+
+def test_overlap_check_without_a_bundle_is_unchanged():
+    """The default argument keeps every existing single-bead caller's behaviour
+    byte-identical — the fix must not be reachable only through --bundle."""
+    bead = {"id": "X-1", "notes": "WIP-CLAIMS: shared.py"}
+    other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
+    assert ssw.overlap_check("X-1", bead, [other]).decision == "deny"
+    assert ssw.overlap_check("X-1", bead, [other], []).decision == "deny"
+
+
+# --- SABLE-fz8kd defect 2: a refused dispatch claims NOTHING ------------------
+
+
+class _RecordingBd:
+    """Stand-in for the two subprocess seams main() uses (`_run` for reads,
+    `subprocess.run` for writes), recording every argv so a test can assert
+    which bd WRITES a refused dispatch issued — the answer must be none."""
+
+    def __init__(self, beads: dict):
+        self.beads = beads
+        self.calls: list[list[str]] = []
+
+    def run_read(self, args):
+        self.calls.append(list(args))
+        if args[:1] == ["bd"] and args[1:2] == ["show"]:
+            return json.dumps([self.beads[args[2]]])
+        if args[:1] == ["bd"] and args[1:2] == ["list"]:
+            return json.dumps([b for b in self.beads.values()
+                               if b.get("status") == "in_progress"])
+        if args[:1] == ["bd"] and args[1:2] == ["ready"]:
+            return "[]"
+        return ""           # tmux list-panes etc: no live panes
+
+    def run_write(self, args, **kwargs):
+        self.calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    @property
+    def writes(self):
+        return [c for c in self.calls
+                if c[:2] == ["bd", "update"] or c[:2] == ["bd", "close"]]
+
+
+def _denied_dispatch(monkeypatch, tmp_path, bundle: bool):
+    """Drive main() to a genuine overlap DENIAL (exit 11) against a foreign
+    in-progress bead, and return the recorder. `--worktree` points at a temp
+    path so no worktree-evidence and no git/tmux mutation is involved."""
+    lead = {"id": "X-1", "title": "lead", "labels": [], "status": "open",
+            "assignee": None, "description": "S.\n\n## File footprint\nshared.py"}
+    sibling = {"id": "X-2", "title": "sib", "labels": [], "status": "open",
+               "assignee": None, "description": "S.\n\n## File footprint\nshared.py"}
+    foreign = {"id": "Y-9", "title": "foreign", "labels": [], "status": "in_progress",
+               "assignee": "optimus", "metadata": {"wip_claims": "shared.py"}}
+    rec = _RecordingBd({"X-1": lead, "X-2": sibling, "Y-9": foreign})
+    monkeypatch.setattr(ssw, "_run", rec.run_read)
+    monkeypatch.setattr(ssw.subprocess, "run", rec.run_write)
+    for var in ("SABLE_WORKER_PANE", "CLAUDE_AGENT_NAME", "SABLE_LANE", "SABLE_ROLE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("SABLE_MAX_LOAD_PER_CORE", "0")
+    argv = ["X-1", "--worktree", str(tmp_path / "wt"), "--session", "sable",
+            "--model", "haiku"]
+    if bundle:
+        argv += ["--bundle", "X-2"]
+    return rec, ssw.main(argv)
+
+
+def test_denied_dispatch_claims_no_bead_at_all(monkeypatch, tmp_path):
+    """THE BEAD, defect 2. The claim used to run BEFORE the overlap gate, so a
+    refusal left the lead (and every bundled sibling) in_progress with no worker:
+    invisible as available work, and counted as live concurrent work by the next
+    dispatch's overlap check. A refused dispatch must write nothing."""
+    rec, code = _denied_dispatch(monkeypatch, tmp_path, bundle=True)
+    assert code == 11
+    assert rec.writes == [], rec.writes
+    # specifically: neither bead was transitioned out of open
+    assert all("--claim" not in c and "in_progress" not in c for c in rec.writes)
+
+
+def test_denied_single_bead_dispatch_claims_nothing_either(monkeypatch, tmp_path):
+    """Same invariant with no bundle — the ordering fix is not bundle-specific."""
+    rec, code = _denied_dispatch(monkeypatch, tmp_path, bundle=False)
+    assert code == 11
+    assert rec.writes == [], rec.writes
+
+
+def test_allowed_dispatch_still_claims_the_lead_and_the_bundle(monkeypatch, tmp_path):
+    """LOAD-BEARING COMPLEMENT: moving the claims below the gate must not turn
+    into never claiming. With no overlapping in-progress work, the gate releases
+    and BOTH bundle members are claimed before the pane work begins."""
+    lead = {"id": "X-1", "title": "lead", "labels": [], "status": "open",
+            "assignee": None, "description": "S.\n\n## File footprint\nshared.py"}
+    sibling = {"id": "X-2", "title": "sib", "labels": [], "status": "open",
+               "assignee": None, "description": "S.\n\n## File footprint\nshared.py"}
+    rec = _RecordingBd({"X-1": lead, "X-2": sibling})
+    monkeypatch.setattr(ssw, "_run", rec.run_read)
+    monkeypatch.setattr(ssw.subprocess, "run", rec.run_write)
+    for var in ("SABLE_WORKER_PANE", "CLAUDE_AGENT_NAME", "SABLE_LANE", "SABLE_ROLE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("SABLE_MAX_LOAD_PER_CORE", "0")
+    monkeypatch.setenv("SABLE_DISPATCH_DIR", str(tmp_path / "dd"))
+    monkeypatch.setenv("SABLE_DISPATCH_READY_TIMEOUT", "0")
+    ssw.main(["X-1", "--worktree", str(tmp_path / "wt"), "--session", "sable",
+              "--model", "haiku", "--bundle", "X-2"])
+    claimed = [c for c in rec.calls if c[:2] == ["bd", "update"] and "--claim" in c]
+    assert [c[2] for c in claimed] == ["X-1", "X-2"], rec.calls
 
 
 def test_preempt_check_blocks_on_p0_in_inbox():
