@@ -730,6 +730,40 @@ def _record_phase(phases: list[dict], name: str, started: float) -> None:
     phases.append({"name": name, "seconds": round(time.monotonic() - started, 3)})
 
 
+_SUITE_FAILURE_MARKER_RE = re.compile(r'(?im)^.*\bFAIL(?:ED|URE)?\b.*$')
+
+
+def _bounded_failure_detail(stdout: str, limit: int = 4000) -> str:
+    """Bound a FAILED suite's stdout for the gate's RED report WITHOUT a
+    positional tail (SABLE-twpe2).
+
+    cp.stdout.strip()[-800:] kept whatever happened to be LAST, regardless of
+    where the failure actually was. On a real suite (test-ci-bd-coverage-
+    gap.sh) that cut every inline "FAIL: <name>" line and its detail while a
+    trailing summary survived by accident of layout — not because it was more
+    useful than the lines it displaced. A suite with no trailing epilogue
+    would have propagated NOTHING usable on a red at all, and nothing about
+    the gate would have looked wrong.
+
+    Anchor on the first line naming a failure instead, so the excerpt always
+    starts at the region that explains the red rather than wherever the
+    output happened to stop. If a bound still applies, announce it — a
+    truncated report that reads as complete is the exact hazard SABLE-np1nx's
+    no-tail rule exists to forbid, now applied to the gate's own reporting of
+    that rule's own violations."""
+    text = stdout.strip()
+    if len(text) <= limit:
+        return text
+    match = _SUITE_FAILURE_MARKER_RE.search(text)
+    start = match.start() if match else 0
+    prefix = f"[{start} leading char(s) elided]\n" if start else ""
+    excerpt = text[start:]
+    if len(excerpt) <= limit:
+        return f"{prefix}{excerpt}"
+    dropped = len(excerpt) - limit
+    return f"{prefix}{excerpt[:limit]}\n[...truncated, {dropped} more char(s) omitted...]"
+
+
 def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, str]:
     """Run the cmar4 impact tier against the REAL COMBINED TREE, ONE AT A TIME
     PER SEAT (SABLE-jd5fj.13), and report (GREEN|RED|ERROR, detail).
@@ -957,7 +991,7 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str],
                 ran.append(suite)
                 if cp.returncode != 0:
                     return (IMPACT_RED, f"{suite} FAILED on the combined tree (rc={cp.returncode}): "
-                                        f"{cp.stdout.strip()[-800:]}")
+                                        f"{_bounded_failure_detail(cp.stdout)}")
 
             # The pytest half, only when the footprint reaches bin/ at all.
             selector = Path(worktree) / "bin" / "tier_selection.py"
@@ -984,7 +1018,7 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str],
                 ran.append(f"bin/ pytest impact tier ({detail_reason})")
                 if cp.returncode != 0:
                     return (IMPACT_RED, f"bin/ pytest impact tier FAILED on the combined tree "
-                                        f"(rc={cp.returncode}): {cp.stdout.strip()[-800:]}")
+                                        f"(rc={cp.returncode}): {_bounded_failure_detail(cp.stdout)}")
 
             if not ran:
                 # Nothing selected and nothing to select from is not a pass —

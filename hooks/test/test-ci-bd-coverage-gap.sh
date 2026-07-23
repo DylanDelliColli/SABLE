@@ -38,6 +38,9 @@ TESTDIR="$REPO/hooks/test"
 DEP_MERGE="$TESTDIR/test-dep-merge-state.sh"
 OVERLAP="$TESTDIR/test-overlap-dispatch-e2e.sh"
 
+# shellcheck source=lib-require-all.sh
+source "$TESTDIR/lib-require-all.sh"
+
 PASS=0; FAIL=0; SKIP=0; FAIL_NAMES=""
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
@@ -134,21 +137,43 @@ else
   RC_DM_BD=$?
   DM_BD_TESTS=$(printf '%s' "$OUT_DM_BD" | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+')
   DM_BD_SKIPPED=$(printf '%s' "$OUT_DM_BD" | grep -oE 'Skipped: [0-9]+' | tail -1 | grep -oE '[0-9]+')
-  if [ "$RC_DM_BD" -eq 0 ] && [ "${DM_BD_TESTS:-0}" -gt "${DM_NOBD_TESTS:-0}" ] && [ "${DM_BD_SKIPPED:-1}" -eq 0 ]; then
+  [ "$RC_DM_BD" -eq 0 ]; _dm_c1=$?
+  [ "${DM_BD_TESTS:-0}" -gt "${DM_NOBD_TESTS:-0}" ]; _dm_c2=$?
+  [ "${DM_BD_SKIPPED:-1}" -eq 0 ]; _dm_c3=$?
+  # SABLE-muew7: a conjunction's RED must name WHICH clause broke, not just
+  # that the control failed — three agents burned an evening on this exact
+  # control's twin (below) unable to tell rc, count, and skip-state apart.
+  require_all "test-dep-merge-state.sh bd-present negative control" \
+    "rc is 0" "$_dm_c1" \
+    "bd-present tests > bd-absent tests" "$_dm_c2" \
+    "Skipped == 0" "$_dm_c3"
+  if [ "$REQUIRE_ALL_OK" -eq 1 ]; then
     pass "negative control: test-dep-merge-state.sh with bd PRESENT reports strictly more subtests than bd-absent (${DM_BD_TESTS:-<none>} > ${DM_NOBD_TESTS:-<none>}), Skipped: 0"
   else
     fail "negative control: test-dep-merge-state.sh with bd PRESENT reports strictly more subtests than bd-absent, Skipped: 0" \
-         "rc=$RC_DM_BD bd-present tests=${DM_BD_TESTS:-<none>} bd-absent tests=${DM_NOBD_TESTS:-<none>} skipped=${DM_BD_SKIPPED:-<none>}"
+         "$REQUIRE_ALL_DETAIL (rc=$RC_DM_BD bd-present tests=${DM_BD_TESTS:-<none>} bd-absent tests=${DM_NOBD_TESTS:-<none>} skipped=${DM_BD_SKIPPED:-<none>})"
   fi
 
   OUT_OV_BD=$(bash "$OVERLAP" 2>&1)
   RC_OV_BD=$?
   OV_BD_TESTS=$(printf '%s' "$OUT_OV_BD" | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+')
-  if [ "$RC_OV_BD" -eq 0 ] && [ "${OV_BD_TESTS:-0}" -gt "${OV_NOBD_TESTS:-0}" ] && ! printf '%s' "$OUT_OV_BD" | grep -q 'Skipped:'; then
+  [ "$RC_OV_BD" -eq 0 ]; _ov_c1=$?
+  [ "${OV_BD_TESTS:-0}" -gt "${OV_NOBD_TESTS:-0}" ]; _ov_c2=$?
+  ! printf '%s' "$OUT_OV_BD" | grep -q 'Skipped:'; _ov_c3=$?
+  # SABLE-muew7 / SABLE-1gnuj: THIS is the control whose collapsed single
+  # boolean cost three agents an evening — chuck saw it FAIL, tarzan saw it
+  # PASS on two trees, and nobody could say whether rc or the Skipped-line
+  # check was the differing conjunct, because the control only ever emitted
+  # PASS or FAIL. require_all's report is the fix for exactly this.
+  require_all "test-overlap-dispatch-e2e.sh bd-present negative control" \
+    "rc is 0" "$_ov_c1" \
+    "bd-present tests > bd-absent tests" "$_ov_c2" \
+    "no Skipped line at all" "$_ov_c3"
+  if [ "$REQUIRE_ALL_OK" -eq 1 ]; then
     pass "negative control: test-overlap-dispatch-e2e.sh with bd PRESENT reports strictly more subtests than bd-absent (${OV_BD_TESTS:-<none>} > ${OV_NOBD_TESTS:-<none>}), no Skipped line at all"
   else
     fail "negative control: test-overlap-dispatch-e2e.sh with bd PRESENT reports strictly more subtests than bd-absent, no Skipped line at all" \
-         "rc=$RC_OV_BD bd-present tests=${OV_BD_TESTS:-<none>} bd-absent tests=${OV_NOBD_TESTS:-<none>} output=$OUT_OV_BD"
+         "$REQUIRE_ALL_DETAIL (rc=$RC_OV_BD bd-present tests=${OV_BD_TESTS:-<none>} bd-absent tests=${OV_NOBD_TESTS:-<none>} output=$OUT_OV_BD)"
   fi
 
   # THE DISTINGUISHING PROPERTY, stated directly: the bd-absent and bd-
