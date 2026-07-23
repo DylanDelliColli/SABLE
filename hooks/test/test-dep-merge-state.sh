@@ -9,7 +9,9 @@
 # the blocker's CODE on the branch it forks from, and those two events are
 # separated by the whole merge queue. This suite stands the real defect up:
 #
-#   real bd  — a real blocker bead and a real dependent bead in the real bd DB,
+#   real bd  — a real blocker bead and a real dependent bead in an ISOLATED,
+#              per-run bd DB (SABLE-b0w8k: never the shared live pool this
+#              repo's own .beads points at — see the BEADS_ROOT setup below),
 #              wired with a real `bd dep add`. The suite ASSERTS the dependent
 #              is withheld while the blocker is open and ASSERTS it appears in
 #              `bd ready` the moment the blocker closes. That second assertion
@@ -114,10 +116,11 @@ fi
 # ---------------------------------------------------------------------------
 BLOCKER_ID=""
 DEPENDENT_ID=""
+BEADS_ROOT=""
 bd_cleanup() {
-  [ -n "$DEPENDENT_ID" ] && bd -C "$REPO" close "$DEPENDENT_ID" --sandbox \
+  [ -n "$DEPENDENT_ID" ] && [ -n "$BEADS_ROOT" ] && bd -C "$BEADS_ROOT" close "$DEPENDENT_ID" --sandbox \
     --reason "[no-test] test-dep-merge-state scratch" >/dev/null 2>&1
-  [ -n "$BLOCKER_ID" ] && bd -C "$REPO" close "$BLOCKER_ID" --sandbox \
+  [ -n "$BLOCKER_ID" ] && [ -n "$BEADS_ROOT" ] && bd -C "$BEADS_ROOT" close "$BLOCKER_ID" --sandbox \
     --reason "[no-test] test-dep-merge-state scratch" >/dev/null 2>&1
   rm -rf "$FIX"
 }
@@ -127,13 +130,27 @@ if ! command -v bd >/dev/null 2>&1; then
 else
   trap bd_cleanup EXIT
 
-  # bd is invoked with -C "$REPO" throughout: the sandbox preamble moved CWD
-  # away from the real checkout, and bd auto-discovers .beads/*.db from CWD.
-  BLOCKER_ID=$(bd -C "$REPO" create --sandbox -q --type=task \
+  # Isolated per-run bd DB (SABLE-b0w8k, fix shape 1 / SABLE-jd5fj.15
+  # pattern): a FRESH throwaway DB every run, never the shared live pool
+  # this repo's own .beads points at. Everything below still exercises a
+  # REAL bd (real `bd dep add`, real `bd ready`, a real governance run
+  # through bin/sable-spawn-worker) — only its location changed.
+  BEADS_ROOT="$FIX/beads"
+  mkdir -p "$BEADS_ROOT"
+  BD_INIT_OUT="$(cd "$BEADS_ROOT" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=depms 2>&1)"
+  if [ ! -d "$BEADS_ROOT/.beads" ]; then
+    echo "FATAL: could not initialize an isolated per-run bd DB: $BD_INIT_OUT"
+    exit 2
+  fi
+
+  # bd is invoked with -C "$BEADS_ROOT" throughout this section — bd
+  # auto-discovers .beads/*.db from the -C'd directory, same as -C "$REPO"
+  # used to, just pointed at the isolated DB instead of the shared one.
+  BLOCKER_ID=$(bd -C "$BEADS_ROOT" create --sandbox -q --type=task \
     --title="[int-test] d5iku blocker ($BLOCKER_BRANCH)" \
     --description="[no-test] scratch blocker for test-dep-merge-state.sh" \
     2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9.]+' | head -1)
-  DEPENDENT_ID=$(bd -C "$REPO" create --sandbox -q --type=task \
+  DEPENDENT_ID=$(bd -C "$BEADS_ROOT" create --sandbox -q --type=task \
     --title="[int-test] d5iku dependent ($BLOCKER_BRANCH)" \
     --description="[no-test] scratch dependent for test-dep-merge-state.sh" \
     2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9.]+' | head -1)
@@ -144,15 +161,25 @@ else
   else
     echo "Integration: blocker=$BLOCKER_ID dependent=$DEPENDENT_ID branch=$BLOCKER_BRANCH"
 
+    # Hermeticity assertion (SABLE-b0w8k): these scratch beads must be
+    # invisible in the REAL shared pool this repo's own .beads points at —
+    # that is the whole point of the isolated BEADS_ROOT above.
+    if bd -C "$REPO" show "$BLOCKER_ID" >/dev/null 2>&1 || bd -C "$REPO" show "$DEPENDENT_ID" >/dev/null 2>&1; then
+      fail "hermeticity: scratch blocker/dependent beads are NOT visible in the real project bd pool" \
+           "one of $BLOCKER_ID / $DEPENDENT_ID resolved against \$REPO's real DB"
+    else
+      pass "hermeticity: scratch blocker/dependent beads are NOT visible in the real project bd pool"
+    fi
+
     # The STRUCTURED branch tag bin/sable-spawn-worker writes at dispatch —
     # the same key the checker reads back.
-    bd -C "$REPO" update "$BLOCKER_ID" --sandbox \
+    bd -C "$BEADS_ROOT" update "$BLOCKER_ID" --sandbox \
       --set-metadata "branch=$BLOCKER_BRANCH" >/dev/null 2>&1
     # A real blocking edge: dependent needs blocker.
-    bd -C "$REPO" dep add "$DEPENDENT_ID" "$BLOCKER_ID" >/dev/null 2>&1
+    bd -C "$BEADS_ROOT" dep add "$DEPENDENT_ID" "$BLOCKER_ID" >/dev/null 2>&1
 
     ready_has() {
-      bd -C "$REPO" ready --json 2>/dev/null | python3 -c "
+      bd -C "$BEADS_ROOT" ready --json 2>/dev/null | python3 -c "
 import json, sys
 want = sys.argv[1]
 try:
@@ -172,7 +199,7 @@ sys.exit(0 if any(isinstance(b, dict) and b.get('id') == want for b in data) els
     fi
 
     # --- 2: closing the blocker RELEASES it — the branch is still unmerged ---
-    bd -C "$REPO" close "$BLOCKER_ID" --sandbox \
+    bd -C "$BEADS_ROOT" close "$BLOCKER_ID" --sandbox \
       --reason "[no-test] closed before merge — reproducing the d5iku window" >/dev/null 2>&1
     if ready_has "$DEPENDENT_ID"; then
       pass "bd: closing the blocker releases the dependent into 'bd ready' WHILE its branch is unmerged (the defect, reproduced)"
@@ -182,7 +209,7 @@ sys.exit(0 if any(isinstance(b, dict) and b.get('id') == want for b in data) els
     fi
 
     # --- 3: the tooling WARNS across that window ---------------------------
-    OUT=$("$DEP_CHECK" --repo "$WORK" --bd-dir "$REPO" --integration-branch "$INT_BRANCH" "$DEPENDENT_ID" 2>&1)
+    OUT=$("$DEP_CHECK" --repo "$WORK" --bd-dir "$BEADS_ROOT" --integration-branch "$INT_BRANCH" "$DEPENDENT_ID" 2>&1)
     RC=$?
     if [ "$RC" -eq 3 ] \
        && echo "$OUT" | grep -q 'UNMERGED-BLOCKER WARNING' \
@@ -195,7 +222,7 @@ sys.exit(0 if any(isinstance(b, dict) and b.get('id') == want for b in data) els
     fi
 
     # --- 4: --ready finds it without being told which bead to look at ------
-    OUT_READY=$("$DEP_CHECK" --repo "$WORK" --bd-dir "$REPO" --integration-branch "$INT_BRANCH" --ready 2>&1)
+    OUT_READY=$("$DEP_CHECK" --repo "$WORK" --bd-dir "$BEADS_ROOT" --integration-branch "$INT_BRANCH" --ready 2>&1)
     if echo "$OUT_READY" | grep -q "$DEPENDENT_ID"; then
       pass "sable-dep-check --ready surfaces the falsely-released bead from the ready pool"
     else
@@ -230,7 +257,7 @@ sys.exit(0 if any(isinstance(b, dict) and b.get('id') == want for b in data) els
     # in. BEADS_DIR is bd's own supported override; ask bd where that is rather
     # than assuming "$REPO/.beads" (in a worktree it redirects to the primary
     # checkout's DB, so the literal path is the wrong one).
-    BEADS_WORKSPACE=$(bd -C "$REPO" where 2>/dev/null | head -1 | tr -d '[:space:]')
+    BEADS_WORKSPACE=$(bd -C "$BEADS_ROOT" where 2>/dev/null | head -1 | tr -d '[:space:]')
 
     spawn_governance_run() {
       # $1.. = extra env assignments; runs the real program from the fixture
@@ -260,7 +287,7 @@ print(m.resolve_worktree_path(sys.argv[2], m.worktree_name(sys.argv[3], None)))
 PY
 )
     mkdir -p "$DERIVED_WT"
-    bd -C "$REPO" update "$DEPENDENT_ID" --sandbox --status in_progress >/dev/null 2>&1
+    bd -C "$BEADS_ROOT" update "$DEPENDENT_ID" --sandbox --status in_progress >/dev/null 2>&1
 
     SPAWN_OUT=$(spawn_governance_run)
     SPAWN_RC=$?
@@ -378,7 +405,7 @@ SH
     git -C "$WORK" push -q origin "$INT_BRANCH"
     git -C "$WORK" fetch -q origin
 
-    OUT_AFTER=$("$DEP_CHECK" --repo "$WORK" --bd-dir "$REPO" --integration-branch "$INT_BRANCH" "$DEPENDENT_ID" 2>&1)
+    OUT_AFTER=$("$DEP_CHECK" --repo "$WORK" --bd-dir "$BEADS_ROOT" --integration-branch "$INT_BRANCH" "$DEPENDENT_ID" 2>&1)
     RC_AFTER=$?
     if [ "$RC_AFTER" -eq 0 ] && ! echo "$OUT_AFTER" | grep -q 'UNMERGED-BLOCKER WARNING'; then
       pass "after the REAL merge the same bead graph is clean (exit 0, no warning)"
@@ -392,7 +419,7 @@ SH
     # resurrect the warning, or every merged blocker would warn forever.
     git -C "$WORK" push -q origin --delete "$BLOCKER_BRANCH"
     git -C "$WORK" fetch -q --prune origin
-    OUT_PRUNED=$("$DEP_CHECK" --repo "$WORK" --bd-dir "$REPO" --integration-branch "$INT_BRANCH" "$DEPENDENT_ID" 2>&1)
+    OUT_PRUNED=$("$DEP_CHECK" --repo "$WORK" --bd-dir "$BEADS_ROOT" --integration-branch "$INT_BRANCH" "$DEPENDENT_ID" 2>&1)
     RC_PRUNED=$?
     if [ "$RC_PRUNED" -eq 0 ] && ! echo "$OUT_PRUNED" | grep -q 'UNMERGED-BLOCKER WARNING'; then
       pass "blocker branch pruned after merge → still clean (no false-block)"
