@@ -14,13 +14,18 @@ registry + role files, and the SABLE skills), sha256-compares each installed
 file against its repo source, and reports MISSING / DRIFT / clean with the
 exact refresh command.
 
-For a deliberately PINNED bin the unit checked is the whole snapshot directory,
-and "clean" carries a strict guarantee (SABLE-0jplo): it means the pinned
-content is byte-identical to repo HEAD for every file in that closure. Two
-distinct ways it can fail — SNAPSHOT-DRIFT (the pin is no longer what its own
-directory name claims) and SNAPSHOT-STALE (the pin is honestly named but behind
-HEAD, so code merged since is merged-but-dark in this runtime). Doctor once
-checked only the first, and a pin three files behind HEAD read as "clean".
+For a deliberately PINNED bin, "clean" carries a strict guarantee (SABLE-0jplo):
+it means the pinned tool's own installed content is byte-identical to repo
+HEAD's copy of that file. Two distinct ways it can fail — SNAPSHOT-DRIFT (the
+pin is no longer what its own directory name claims — checked against the
+WHOLE shared snapshot directory, since hand-tampering anywhere in a frozen pin
+is an integrity concern) and SNAPSHOT-STALE (the pin is honestly named but
+this tool's own file is behind HEAD, so code merged since is merged-but-dark
+in this runtime — checked against just that one file, SABLE-5gxj3: comparing
+the whole shared directory here made every pinned tool read stale whenever any
+other, unrelated file in bin/ changed). A third status, COULD-NOT-ASSESS,
+covers a pinned file that can't be read or resolved against HEAD — held as
+drift, never silently read as clean.
 
 Installed hook copies (top-level and multi-manager) get one more, independent
 check (SABLE-9rj7m): `bash -n` against the installed file itself, not just the
@@ -211,44 +216,66 @@ def _check_snapshot_pin(src: Path, dst: Path, cache: dict = None):
 
     The pin UNIT is the whole versioned snapshot directory — every bin plus
     every sibling lib, copied together by `sable-bin-install --pin-snapshot`
-    — not the single entry-point file dst happens to resolve to. So this
-    walks every file physically present in that directory (plus every file
-    the repo had under bin/ at the comparison sha, to catch one going
-    missing) and never just the entry point (that would miss a hand-tampered,
-    added, or removed SIBLING file inside the snapshot — a drift check
-    narrower than the thing that moved).
+    — not the single entry-point file dst happens to resolve to. So the
+    TAMPER check below walks every file physically present in that directory
+    (plus every file the repo had under bin/ at the pinned sha, to catch one
+    going missing) and never just the entry point (that would miss a
+    hand-tampered, added, or removed SIBLING file inside the snapshot — a
+    drift check narrower than the thing that moved).
 
     There are TWO independent questions here, and answering only the first is
     what SABLE-0jplo was filed for:
 
       "snapshot-drift" — is the snapshot still what it CLAIMS to be? Compares
-        against the repo AT THE SHA BAKED INTO the snapshot's own directory
-        name. Non-empty means the pin was hand-tampered with (or written into
-        by something that had no business doing so — SABLE-33hw3).
+        the WHOLE directory against the repo AT THE SHA BAKED INTO the
+        snapshot's own directory name. Non-empty means the pin was
+        hand-tampered with (or written into by something that had no business
+        doing so — SABLE-33hw3).
 
-      "snapshot-stale" — is what it claims to be still CURRENT? Compares the
-        same directory against repo HEAD. Non-empty means the pin is honestly
-        named but genuinely behind: the code in the closure is NOT the code in
-        the repo, so a feature merged since the pin was taken is merged-but-
-        dark in this runtime.
+      "snapshot-stale" — is what it claims to be still CURRENT for THIS
+        pinned tool? Compares just the resolved entry-point file against repo
+        HEAD's copy of the same path. Non-empty means the pin is honestly
+        named but genuinely behind: the code THIS tool runs is not the code
+        in the repo, so a feature merged since the pin was taken is
+        merged-but-dark in this runtime.
 
     Doctor used to ask only the first, so a correctly-named stale pin — three
     files behind HEAD, with SABLE-jd5fj.4's module absent from the closure
     entirely — reported "clean". That is the exact false-green class this
     detector exists to eliminate, and it made a reader trusting doctor
     conclude a merged feature was active when its code was not on the machine.
-    The invariant now enforced: doctor reporting clean for a pinned bin IMPLIES
-    the pinned content is byte-identical to repo HEAD for every file in the
-    snapshot closure.
 
-    Tamper wins when both fire — it is the louder fact (something wrote into a
-    frozen pin), and its remedy is a rollback rather than an advance. Staleness
-    is checked against the CLOSURE, not the sha: a pin taken at an older commit
-    that touched nothing under bin/ is byte-identical to HEAD and stays clean,
-    so this does not cry wolf every time the repo moves.
+    SABLE-0jplo's original fix compared the STALENESS question against the
+    whole closure too (same as tamper) — which over-corrected: --pin-snapshot
+    copies the ENTIRE bin/ directory as one unit, so dozens of files that have
+    nothing to do with any one pinned tool live in the same snapshot dir, and
+    a commit touching ANY of them aged every pinned tool's staleness verdict
+    even though that tool's own bytes never moved (measured, SABLE-5gxj3:
+    sable-reconcile-handoffs byte-identical to repo HEAD, reported "merged but
+    NOT live" because 37 unrelated bin/ files — mostly unrelated test files —
+    had changed since the pin was taken). The false-alarm direction is safe in
+    the small (it never hides a real staleness) but trains reflexive re-pinning
+    in the large, which is how a pin gets POLLUTED (SABLE-33hw3). So staleness
+    is now scoped to the one file this tool actually runs; tamper detection
+    stays whole-directory, since hand-tampering anywhere in a frozen pin is a
+    real integrity concern regardless of which tool notices it.
 
-    `detail` names the offending file(s) for both drifted statuses; None
-    otherwise."""
+    The invariant enforced: doctor reporting clean for a pinned bin IMPLIES the
+    pinned entry-point content is byte-identical to repo HEAD's copy of that
+    same file. Tamper wins when both fire — it is the louder fact (something
+    wrote into a frozen pin), and its remedy is a rollback rather than an
+    advance.
+
+    An unresolvable comparison — the resolved file can't be read, or its repo
+    counterpart can't be resolved via git — is "could-not-assess", never
+    silently "clean" (a resolution failure reading as agreement is the whole
+    failure mode this detector exists to prevent) and never silently rolled
+    into ordinary "snapshot-drift" either, since that carries a rollback
+    remedy that may not apply.
+
+    `detail` names the offending file(s) for "snapshot-drift" (the whole
+    tampered closure), and the single entry-point name for "snapshot-stale"
+    and "could-not-assess"; None otherwise."""
     if not dst.exists():
         return "missing", None
     if not dst.is_symlink():
@@ -284,6 +311,17 @@ def _check_snapshot_pin(src: Path, dst: Path, cache: dict = None):
         return "drift", None  # unrecognized target — its pinned sha can't be resolved
     repo_root = src.parent.parent
 
+    # Existence/readability precondition (SABLE-5gxj3): if the pinned tool's
+    # own resolved file can't even be read, nothing below — tamper or
+    # staleness — can be trusted. Checked BEFORE the whole-directory tamper
+    # walk so an unreadable entry point reports its own specific fact rather
+    # than surfacing as an ordinary (also-true, but not the loudest) drifted
+    # sibling inside that walk.
+    try:
+        installed_bytes = target.read_bytes()
+    except OSError:
+        return "could-not-assess", target.name
+
     def _diff(against):
         cache_key = (str(snapshot_dir), against)
         if cache is not None and cache_key in cache:
@@ -299,15 +337,15 @@ def _check_snapshot_pin(src: Path, dst: Path, cache: dict = None):
     if drifted:
         return "snapshot-drift", ", ".join(sorted(drifted))
 
-    # The snapshot is honestly named. Now the second question: is the sha it
-    # is honestly named FOR still current? An unresolvable comparison is
-    # treated as drift, never silently as clean — a resolution failure reading
-    # as agreement is the whole failure mode this detector exists to prevent.
-    stale = _diff("HEAD")
-    if stale is None:
-        return "drift", None
-    if stale:
-        return "snapshot-stale", ", ".join(sorted(stale))
+    # The snapshot is honestly named and un-tampered. Now the second
+    # question: is THIS tool's own installed file still current? Single-file
+    # compare against repo HEAD's copy of the same path (see docstring for
+    # why this is scoped to one file rather than the whole shared directory).
+    head_bytes = _git_show_bytes(repo_root, "HEAD", f"bin/{target.name}")
+    if head_bytes is None:
+        return "could-not-assess", target.name
+    if installed_bytes != head_bytes:
+        return "snapshot-stale", target.name
     return "clean", None
 
 # SABLE-mkj6k INTERIM GUARD — remove this set (and every branch that reads it
@@ -689,6 +727,7 @@ _STATUS_LABELS = {
     "snapshot-stale": "SNAPSHOT-STALE",
     "broken-copy-pin": "BROKEN-COPY-PIN",
     "syntax-error": "SYNTAX-ERROR",
+    "could-not-assess": "COULD-NOT-ASSESS",
 }
 
 # Statuses on a "pinned snapshot bins" entry where the ordinary `bash
@@ -705,7 +744,7 @@ _STATUS_LABELS = {
 # guaranteed to leave the staleness exactly where it is — and then report
 # nothing, which is how a false green becomes a false green the reader has
 # already "fixed".
-_SNAPSHOT_REMEDY_STATUSES = ("broken-copy-pin", "snapshot-drift", "snapshot-stale")
+_SNAPSHOT_REMEDY_STATUSES = ("broken-copy-pin", "snapshot-drift", "snapshot-stale", "could-not-assess")
 
 
 def _guarded_remedy_lines(guarded_bad):
@@ -777,11 +816,20 @@ def _snapshot_remedy_lines(snapshot_bad):
                 f"  {r['installed_path']} points into an honestly-named snapshot that is"
             )
             lines.append(
-                "  BEHIND repo HEAD — the file(s) named above are merged but NOT live in this"
+                "  BEHIND repo HEAD — the file named above is merged but NOT live in this"
             )
             lines.append("  runtime. Advance the pin (or drop it to track the repo):")
             lines.append(f"    sable-bin-install --pin-snapshot {name}      # re-pin at HEAD")
             lines.append(f"    sable-bin-install --repin                    # un-pin, follow the repo")
+        elif r["status"] == "could-not-assess":
+            lines.append(
+                f"  {r['installed_path']}'s pinned file could not be read (permission denied,"
+            )
+            lines.append(
+                "  or its repo-HEAD counterpart could not be resolved via git) — staleness"
+            )
+            lines.append("  could not be determined. This is held as drift, not clean. Investigate:")
+            lines.append(f"    ls -la {r['installed_path']}")
         else:
             lines.append(
                 f"  {r['installed_path']} points into a snapshot whose content no longer"
