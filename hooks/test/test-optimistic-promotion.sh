@@ -715,11 +715,55 @@ else
 fi
 # And the wrapper C8 actually used must have been above the fixture's real cost —
 # stated here so the 120 above is a derived-style bound, not a magic number.
+# SABLE_MG_COVERAGE_FLOOR_TIMEOUT is pinned here (SABLE-5v3d5: it is now a
+# THIRD, always-present summand, unaffected by SABLE_MG_IMPACT_SERIALIZE) so
+# this assertion stays a deterministic property of the gate's arithmetic
+# instead of depending on this repo's own ambient merge_preview SSOT value.
 if [ "$(SABLE_MG_IMPACT_TIMEOUT=8 SABLE_MG_IMPACT_SERIALIZE=0 \
+        SABLE_MG_COVERAGE_FLOOR_TIMEOUT=8 \
         python3 "$GATE" promote-budget --seconds)" -le 120 ]; then
   pass "C9: C8's wrapper (120s) is above what the gate itself would recommend for an 8s tier"
 else
   fail "C9: C8's wrapper is above the recommended bound" "recommendation exceeds 120s"
+fi
+
+# ==========================================================================
+# C9b — the coverage-floor ceiling is a THIRD summand, not a silent gap
+#       (SABLE-5v3d5)
+# ==========================================================================
+# assert_coverage_floor()'s own subprocess bound (run_coverage_floor_check)
+# runs INSIDE promote(), before any preview/CI work -- but before this bead it
+# was never a term in promote-budget's sum. The seat's own post-re-pin check
+# ("did the number move?") read the SAME 5400 before and after cmar4.9 moved
+# the coverage floor's SSOT from 600 to 900, because the changed term was
+# never a summand. This proves the CLI's reported number tracks a
+# DISTINCTIVE coverage-floor override end to end, through the real
+# subcommand -- not just inside the library.
+BASE_BUDGET="$(SABLE_MG_IMPACT_TIMEOUT=90 SABLE_MG_IMPACT_LOCK_TIMEOUT=210 \
+               SABLE_MG_COVERAGE_FLOOR_TIMEOUT=11 \
+               python3 "$GATE" promote-budget --seconds 2>&1)"
+BUMPED_BUDGET="$(SABLE_MG_IMPACT_TIMEOUT=90 SABLE_MG_IMPACT_LOCK_TIMEOUT=210 \
+                 SABLE_MG_COVERAGE_FLOOR_TIMEOUT=9011 \
+                 python3 "$GATE" promote-budget --seconds 2>&1)"
+if [ "$BUMPED_BUDGET" -gt "$BASE_BUDGET" ]; then
+  pass "C9b: promote-budget's recommended timeout TRACKS SABLE_MG_COVERAGE_FLOOR_TIMEOUT end to end"
+else
+  fail "C9b: promote-budget's recommended timeout tracks the coverage-floor override" \
+       "base(11s)=$BASE_BUDGET bumped(9011s)=$BUMPED_BUDGET"
+fi
+COVERAGE_JSON="$(SABLE_MG_IMPACT_TIMEOUT=90 SABLE_MG_IMPACT_LOCK_TIMEOUT=210 \
+                 SABLE_MG_COVERAGE_FLOOR_TIMEOUT=4321 \
+                 python3 "$GATE" promote-budget --json 2>&1)"
+if printf '%s' "$COVERAGE_JSON" | grep -q '"coverage_floor_timeout_s": *4321'; then
+  pass "C9b: promote-budget --json reports coverage_floor_timeout_s as its own decomposition key"
+else
+  fail "C9b: promote-budget --json reports coverage_floor_timeout_s" "$COVERAGE_JSON"
+fi
+WORST_CASE="$(printf '%s' "$COVERAGE_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(int(d["worst_case_s"]))')"
+if [ "$WORST_CASE" -eq $((90 + 210 + 4321)) ]; then
+  pass "C9b: worst_case_s is the sum of all three terms, coverage floor included"
+else
+  fail "C9b: worst_case_s equals tier+lock+coverage_floor" "worst_case_s=$WORST_CASE want=$((90+210+4321))"
 fi
 
 # ==========================================================================
