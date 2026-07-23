@@ -22,6 +22,11 @@ THREE UNPRIVILEGED CHECKS:
       defect of THIS stack, and must not be reported as one (SABLE-h5czc).
   (b) GHOST TASKS — a live cgroup exists for a container-shaped ID `docker ps`
       does not list — containerd kept it running behind dockerd's back.
+      Unlike (a), this check is NOT project-scoped (a ghost has no docker
+      record to read a compose-project label from). The JSON report exposes
+      `probe_container_id` (the host-namespace probe's own container ID) so
+      a caller can attribute a specific ID rather than asserting global
+      ghost-emptiness, which is not attributable on a shared host.
   (c) DUAL POSTMASTER — the Supabase db's postmaster start time seen via
       `docker exec` (whichever process dockerd's record points at) must equal,
       to the microsecond, the start time seen over a raw TCP connection to the
@@ -395,7 +400,7 @@ def tcp_postmaster_start_time(container, host_port):
 # ---------------------------------------------------------------------------
 
 def run_checks(db_container_arg, helper_image, debounce_seconds, skip_pg_check):
-    diagnosis = {"phantoms": [], "ghosts": [], "dual_postmaster": None, "errors": []}
+    diagnosis = {"phantoms": [], "ghosts": [], "dual_postmaster": None, "errors": [], "probe_container_id": None}
     exit_code = 0
     project = _target_project(db_container_arg, skip_pg_check)
 
@@ -403,6 +408,7 @@ def run_checks(db_container_arg, helper_image, debounce_seconds, skip_pg_check):
         inspect_records = docker_inspect_running()
         ps_ids = docker_ps_ids()
         proc_listing, cgroup_raw1, cgroup_raw2, self_id = gather_host_namespace(helper_image, debounce_seconds)
+        diagnosis["probe_container_id"] = self_id or None
         live_pids = parse_proc_pid_listing(proc_listing)
         cgroup_pids1 = parse_cgroup_pid_listing(cgroup_raw1)
         cgroup_pids2 = parse_cgroup_pid_listing(cgroup_raw2)
