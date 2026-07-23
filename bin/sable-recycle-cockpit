@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""sable-recycle-cockpit — mechanized cockpit context-reclamation (SABLE-twn37).
+
+Replaces the manual tmux send-keys procedure SABLE-snn8h step 2 improvised for
+the 2026-07-22 overnight protocol: verify a cockpit shift-report bead exists
+and is fresh, verify the target pane is idle, send the /clear keystroke, then
+verify the new session actually booted. Every refusal is LOUD (the
+silent-instrument contract) — a caller that gets empty output learned nothing.
+
+Five distinct outcomes, never silent (SABLE-twn37 dispatch + same-day notes
+after the manual procedure was run three times):
+  NO-BEAD            (exit 1) the shift-report bead does not exist.
+  STALE-BEAD         (exit 2) it exists but is older than --max-age-seconds.
+  BUSY-PANE          (exit 3) the pane is mid-turn; never clip a live turn.
+  BOOT-NOT-OBSERVED  (exit 4) /clear was sent but no SessionStart marker
+                     ('[bd prime]', this repo's actual SessionStart hook
+                     command) showed up within --boot-timeout.
+  ALREADY-RECYCLED   (exit 0, no keys sent) the pane already shows a fresh
+                     boot banner with nothing before it in its scrollback —
+                     someone else's recycle (or a concurrent human /clear)
+                     already happened. Detected BEFORE the idle poll AND
+                     re-checked immediately before send-keys.
+
+ALREADY-RECYCLED and the re-check exist because of a near-miss (optimus,
+2026-07-23 midday cockpit recycle, recorded in this bead's notes): a
+busy-at-t0 pane polled idle with two consecutive clean reads 4s apart still
+raced a CONCURRENT human /clear — the poll sampled the reboot window (which
+legitimately shows no working indicator) and reported IDLE about a session
+that no longer existed. Idle is therefore NOT a sufficient precondition to
+send: the gate is idle AND "the session I polled is still the session I'm
+about to type into", re-asserted with a fresh already-recycled check taken
+immediately before send-keys, not carried over from the top of the poll.
+
+Also handles the composer-already-contains-/clear edge case an operator hit
+running the manual procedure by hand: if the composer already has a pending
+`/clear` sitting in it (unsubmitted), send Enter only — retyping `/clear`
+would double it up.
+
+Design constraint (SABLE-twn37, the gq8d3 delivery-verification findings):
+does NOT use sable-msg for the boot handoff. It prints the shift-report bead
+id on stdout on both success paths (sent-and-booted, and already-recycled —
+the relay must run even when this script sends nothing, since the incoming
+session still needs the shift report) and leaves delivery + pane-readback
+verification to the initiator.
+
+Usage:
+  sable-recycle-cockpit <shift-report-bead-id> [--pane TARGET]
+                        [--socket SOCK] [--max-age-seconds N]
+                        [--idle-timeout N] [--poll-interval N]
+                        [--boot-timeout N]
+
+  --pane TARGET      tmux target for the cockpit pane
+                      (default: $SABLE_COCKPIT_PANE or '%0')
+  --socket SOCK       tmux -L socket (default: $SABLE_TMUX_SOCKET, the
+                      operator's default server)
+  --max-age-seconds N how fresh the shift-report bead's created_at must be
+                      (default 3600 — the "stated window")
+  --idle-timeout N    seconds to wait for the pane to go idle before refusing
+                      as busy (default 30)
+  --poll-interval N   seconds between polls (default 2)
+  --boot-timeout N    seconds to wait for the SessionStart marker after
+                      sending /clear before refusing as boot-not-observed
+                      (default 20)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_pane_lib import (  # noqa: E402
+    capture_pane,
+    pane_busy,
+    tmux_base,
+    wait_for_idle,
+)
+
+DEFAULT_MAX_AGE_SECONDS = 3600.0
+DEFAULT_IDLE_TIMEOUT = 30.0
+DEFAULT_POLL_INTERVAL = 2.0
+DEFAULT_BOOT_TIMEOUT = 20.0
+
+# The real Claude Code TUI's boot splash banner ("Claude Code v2.1.214" per
+# this bead's notes) — the ALREADY-RECYCLED signature is exactly one match of
+# this, over the pane's FULL scrollback, with nothing but blank lines above
+# it (a real reboot clears tmux's own scrollback; a mid-transcript MENTION of
+# the banner text has real content above it).
+_BANNER_RE = re.compile(r"Claude Code v\d+\.\d+\.\d+")
+
+# This repo's actual SessionStart hook command is `bd prime`, which prints
+# this literal marker as the first thing it emits (.claude/settings.json) —
+# the concrete, repo-real signal "verifies the new session booted" keys on.
+_BOOT_MARKER = "[bd prime]"
+
+
+# --- pure predicates (unit-testable without tmux or bd) ---------------------
+
+def bd_show(bead_id: str, run) -> dict | None:
+    """The bead dict for `bd show <bead_id> --json`, or None if the bead
+    doesn't exist / bd errors / the output isn't parseable JSON. `run` is an
+    injected `list[str] -> CompletedProcess`-shaped callable."""
+    proc = run(["bd", "show", bead_id, "--json"])
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(data, list):
+        data = data[0] if data else None
+    return data if isinstance(data, dict) else None
+
+
+def bead_age_seconds(bead: dict | None, now: datetime) -> float | None:
+    """Seconds between `bead`'s created_at and `now`, or None if the bead is
+    missing the field or it doesn't parse."""
+    created = (bead or {}).get("created_at")
+    if not created:
+        return None
+    try:
+        created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (now - created_dt).total_seconds()
+
+
+def bead_is_fresh(bead: dict | None, now: datetime, max_age_seconds: float) -> bool:
+    age = bead_age_seconds(bead, now)
+    return age is not None and 0 <= age <= max_age_seconds
+
+
+def already_recycled(full_scrollback: str) -> bool:
+    """True when `full_scrollback` (a -S - capture) shows the boot banner
+    EXACTLY once with nothing but blank lines above it — a real fresh boot,
+    not a mention of the banner text deep in a transcript (which would have
+    real content above it)."""
+    lines = full_scrollback.splitlines()
+    banner_idxs = [i for i, line in enumerate(lines) if _BANNER_RE.search(line)]
+    if len(banner_idxs) != 1:
+        return False
+    return all(not line.strip() for line in lines[:banner_idxs[0]])
+
+
+def boot_observed(capture_after: str) -> bool:
+    return _BOOT_MARKER in capture_after
+
+
+def composer_has_pending_clear(capture: str) -> bool:
+    """True when a `/clear` already sits in the composer (typed but not yet
+    submitted) — the edge case an operator hit running the manual procedure
+    by hand. When true, the caller must send Enter only; retyping `/clear`
+    would double it up."""
+    lines = capture.splitlines()
+    box_start = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith(("❯", ">")):
+            box_start = i
+    if box_start is None:
+        return False
+    return "/clear" in "\n".join(lines[box_start:])
+
+
+# --- loud, distinct outcome messages (silent-instrument contract) -----------
+
+def no_bead_message(bead_id: str) -> str:
+    return (
+        f"REFUSED (no-bead): shift-report bead {bead_id} not found via "
+        "`bd show`. No shift report exists to justify a cockpit recycle. "
+        "Retry: file the shift-report bead first, then rerun naming it."
+    )
+
+
+def stale_bead_message(bead_id: str, age_seconds: float | None, max_age_seconds: float) -> str:
+    age_text = "unknown (no created_at)" if age_seconds is None else f"{age_seconds:.0f}s"
+    return (
+        f"REFUSED (stale-bead): shift-report bead {bead_id} is stale "
+        f"(age={age_text}, max {max_age_seconds:.0f}s). Retry: file a fresh "
+        "shift-report bead immediately before recycling."
+    )
+
+
+def busy_pane_message(pane: str) -> str:
+    return (
+        f"REFUSED (busy-pane): pane {pane} is mid-turn (working indicator "
+        "present). Never send /clear into a busy pane — it clips a live "
+        "turn. Retry: wait for the pane to go idle and rerun."
+    )
+
+
+def boot_not_observed_message(pane: str, boot_timeout: float) -> str:
+    return (
+        f"WARNING (boot-not-observed): sent /clear to pane {pane} but the "
+        f"SessionStart marker {_BOOT_MARKER!r} did not appear within "
+        f"{boot_timeout:.0f}s. The recycle may not have booted correctly. "
+        "Retry: capture the pane by hand and verify before relaying the "
+        "shift report."
+    )
+
+
+def already_recycled_message(bead_id: str, pane: str) -> str:
+    return (
+        f"NOOP (already-recycled): pane {pane} already shows a fresh boot "
+        "banner with nothing before it in scrollback — the recycle already "
+        f"happened (concurrently, or by another actor). No keys sent. Relay "
+        f"shift-report bead {bead_id} to the incoming session."
+    )
+
+
+# --- orchestration, IO injected so this is unit-testable without tmux/bd ----
+
+def run_recycle(bead_id: str, pane: str, *, now: datetime, max_age_seconds: float,
+                boot_timeout: float, bd_show_fn, capture_history_fn,
+                capture_visible_fn, wait_idle_fn, send_fn, poll_boot_fn
+                ) -> tuple[int, str, bool]:
+    """Returns (exit_code, message, sent). `sent` is True only when /clear
+    keys were actually written to the pane."""
+    bead = bd_show_fn(bead_id)
+    if bead is None:
+        return 1, no_bead_message(bead_id), False
+
+    if not bead_is_fresh(bead, now, max_age_seconds):
+        age = bead_age_seconds(bead, now)
+        return 2, stale_bead_message(bead_id, age, max_age_seconds), False
+
+    if already_recycled(capture_history_fn()):
+        return 0, already_recycled_message(bead_id, pane), False
+
+    if not wait_idle_fn():
+        return 3, busy_pane_message(pane), False
+
+    # Re-assert immediately before send-keys (SABLE-twn37 notes): the idle
+    # poll above can race a CONCURRENT recycle completing mid-poll. Idle
+    # alone is not sufficient — re-check both already-recycled and busy
+    # freshly, right here, rather than trusting the state from the top of
+    # the poll.
+    if already_recycled(capture_history_fn()):
+        return 0, already_recycled_message(bead_id, pane), False
+    visible = capture_visible_fn()
+    if pane_busy(visible):
+        return 3, busy_pane_message(pane), False
+
+    send_fn(visible)
+
+    if not poll_boot_fn():
+        return 4, boot_not_observed_message(pane, boot_timeout), False
+
+    return 0, bead_id, True
+
+
+def _poll_boot(base: list[str], pane: str, timeout: float, interval: float,
+               capture=None, sleep=None) -> bool:
+    capture = capture or (lambda: capture_pane(base, pane))
+    sleep = sleep or time.sleep
+    waited = 0.0
+    while True:
+        if boot_observed(capture()):
+            return True
+        if waited >= timeout:
+            return False
+        sleep(interval)
+        waited += interval
+
+
+def _capture_full_history(base: list[str], pane: str) -> str:
+    return subprocess.run(base + ["capture-pane", "-p", "-J", "-S", "-", "-t", pane],
+                          capture_output=True, text=True).stdout
+
+
+def _send_clear(base: list[str], pane: str, run, visible_capture: str) -> None:
+    if composer_has_pending_clear(visible_capture):
+        run(base + ["send-keys", "-t", pane, "Enter"])
+    else:
+        run(base + ["send-keys", "-t", pane, "-l", "/clear"])
+        run(base + ["send-keys", "-t", pane, "Enter"])
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="sable-recycle-cockpit")
+    p.add_argument("bead_id", help="shift-report bead id to verify before recycling")
+    p.add_argument("--pane", default=os.environ.get("SABLE_COCKPIT_PANE", "%0"))
+    p.add_argument("--socket", default=os.environ.get("SABLE_TMUX_SOCKET"))
+    p.add_argument("--max-age-seconds", type=float, default=DEFAULT_MAX_AGE_SECONDS)
+    p.add_argument("--idle-timeout", type=float, default=DEFAULT_IDLE_TIMEOUT)
+    p.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL)
+    p.add_argument("--boot-timeout", type=float, default=DEFAULT_BOOT_TIMEOUT)
+    ns = p.parse_args(sys.argv[1:] if argv is None else argv)
+
+    base = tmux_base(ns.socket)
+    run = lambda cmd: subprocess.run(cmd, capture_output=True, text=True)  # noqa: E731
+
+    code, message, sent = run_recycle(
+        ns.bead_id, ns.pane,
+        now=datetime.now(timezone.utc),
+        max_age_seconds=ns.max_age_seconds,
+        boot_timeout=ns.boot_timeout,
+        bd_show_fn=lambda bid: bd_show(bid, run),
+        capture_history_fn=lambda: _capture_full_history(base, ns.pane),
+        capture_visible_fn=lambda: capture_pane(base, ns.pane),
+        wait_idle_fn=lambda: wait_for_idle(
+            base, ns.pane, ns.idle_timeout, ns.poll_interval,
+            capture=lambda: capture_pane(base, ns.pane)),
+        send_fn=lambda visible: _send_clear(base, ns.pane, run, visible),
+        poll_boot_fn=lambda: _poll_boot(base, ns.pane, ns.boot_timeout, ns.poll_interval),
+    )
+
+    print(message, file=sys.stderr)
+    if code == 0:
+        # The shift-report bead id, bare, for the initiator to relay
+        # (SABLE-twn37: never via sable-msg here — pane-readback verified
+        # delivery is the caller's job). Printed on BOTH success paths (sent,
+        # and already-recycled) since the relay must run even when this
+        # script sends nothing.
+        print(ns.bead_id)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
