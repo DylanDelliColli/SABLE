@@ -89,6 +89,7 @@ ALLOW=(
   test-preview-already-verified.sh
   test-preview-kick.sh
   test-project-clone-portability.sh
+  test-provenance-guard.sh
   test-quickstart-orchestration.sh
   test-read-guard.sh
   test-reconcile-rebase-copy.sh
@@ -227,6 +228,7 @@ declare -A COVERS=(
   [test-pre-dispatch-refresh.sh]="hooks/multi-manager/pre-dispatch-refresh.sh"
   [test-pre-push-rebase-test.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
   [test-preview-kick.sh]="hooks/multi-manager/post-push-merge-notify.sh"
+  [test-provenance-guard.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
   [test-read-guard.sh]="hooks/multi-manager/read-guard.sh"
   [test-registry.sh]="hooks/multi-manager/lib-registry-path.sh"
   [test-require-all.sh]="hooks/test/lib-require-all.sh"
