@@ -33,6 +33,20 @@ smrh = importlib.util.module_from_spec(_SPEC)
 _LOADER.exec_module(smrh)
 
 
+@pytest.fixture(autouse=True)
+def _no_live_panes(monkeypatch):
+    """SABLE-4709h: reconcile() calls the real live_pane_bead_ids(repo), which
+    shells out to the REAL `tmux` on PATH — this dev host runs an actual SABLE
+    fleet, so an un-neutered call would classify against the CURRENT live
+    fleet's panes, coupling this unit suite's outcome to whatever real work is
+    running at test time (SABLE_RC_GIT/SABLE_RC_BD already get this hermetic
+    treatment via _fake_git/_fake_bd; tmux gets it here, once, for every test).
+    Autouse so every pre-existing reconcile()-level test keeps its exact prior
+    'no live panes' behavior without individually opting in. Tests that WANT a
+    live pane override this per-test with their own monkeypatch."""
+    monkeypatch.setattr(smrh, "live_pane_bead_ids", lambda repo: set())
+
+
 def _cp(args, rc, out):
     return subprocess.CompletedProcess(args, rc, stdout=out, stderr="")
 
@@ -1040,3 +1054,218 @@ def test_reconcile_held_branch_is_still_preview_kicked(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "preview-kick" in out
     assert "1 preview-kick candidate(s)" in _last_summary_line(out)
+
+
+# ===========================================================================
+# SABLE-z7gue: content-containment (patch-id). A rebased branch changes every
+# SHA, so tip-containment (predicate 1, `git merge-base --is-ancestor`)
+# cannot tell a REBASED-AND-LANDED branch from a genuinely stranded one — and
+# neither can 'ask both lanes' (SABLE-xw32f's remedy for the ambiguous case),
+# because every lane truthfully answers 'not mine' when the work is already
+# on the spine. branch_content_contained reads `git cherry <upstream>
+# <head>`: '-' means a patch-id-equivalent commit already exists at the
+# spine, '+' means genuinely new.
+# ===========================================================================
+
+def _fake_git_cherry(monkeypatch, *, ancestor_rc=1, tip_ct="1000", cherry_lines=()):
+    """merge-base --is-ancestor -> ancestor_rc; log -1 --format=%ct -> tip_ct;
+    cherry <upstream> <head> -> cherry_lines, one per line."""
+    def fake_git(repo, *args, check=False):
+        head = args[0] if args else ""
+        if head == "merge-base":
+            return _cp(args, ancestor_rc, "")
+        if head == "log":
+            return _cp(args, 0, tip_ct + "\n")
+        if head == "cherry":
+            body = "\n".join(cherry_lines) + ("\n" if cherry_lines else "")
+            return _cp(args, 0, body)
+        return _cp(args, 0, "")
+    monkeypatch.setattr(smrh, "_git", fake_git)
+
+
+def test_branch_content_contained_true_when_every_commit_equivalent(monkeypatch):
+    _fake_git_cherry(monkeypatch, cherry_lines=["- abc1234 rebase copy of the only commit"])
+    contained, detail = smrh.branch_content_contained("/repo", "origin", "wk-x", "trunk")
+    assert contained is True
+    assert "content-contained" in detail
+
+
+def test_branch_content_contained_false_when_any_commit_is_new(monkeypatch):
+    # PARTIAL landing (some commits landed, some not) stays conservatively
+    # NOT-contained — this floor's own stranded remedy is a write to the
+    # spine, so an indeterminate reading must never assert containment it
+    # cannot fully back.
+    _fake_git_cherry(monkeypatch, cherry_lines=[
+        "- abc1234 landed commit",
+        "+ def5678 genuinely new, unlanded commit",
+    ])
+    contained, detail = smrh.branch_content_contained("/repo", "origin", "wk-x", "trunk")
+    assert contained is False
+    assert "patch-id-partial" in detail
+
+
+def test_branch_content_contained_false_on_git_error(monkeypatch):
+    def fake_git(repo, *args, check=False):
+        if args and args[0] == "cherry":
+            return _cp(args, 128, "fatal: bad revision")
+        return _cp(args, 0, "")
+    monkeypatch.setattr(smrh, "_git", fake_git)
+    contained, detail = smrh.branch_content_contained("/repo", "origin", "wk-x", "trunk")
+    assert contained is False
+    assert "unresolvable" in detail
+
+
+def test_branch_content_contained_false_on_empty_result(monkeypatch):
+    # ancestry already said unmerged; an EMPTY cherry listing disagrees with
+    # that, so this is left NOT-contained rather than inventing a verdict.
+    _fake_git_cherry(monkeypatch, cherry_lines=[])
+    contained, detail = smrh.branch_content_contained("/repo", "origin", "wk-x", "trunk")
+    assert contained is False
+    assert "empty" in detail
+
+
+def test_rebased_and_landed_commit_is_not_stranded(monkeypatch):
+    # THE test named in z7gue's spec: unmerged by tip (predicate 1 says
+    # "not an ancestor"), but the commit is patch-id-equivalent at the spine
+    # under a different sha -> NOT stranded.
+    _fake_git_cherry(monkeypatch, ancestor_rc=1, tip_ct=CT_OLD,
+                     cherry_lines=["- abc1234 rebase copy"])
+    _fake_bd(monkeypatch, search_status="closed")
+    is_stranded, reason, _ = _classify()
+    assert is_stranded is False, reason
+    assert "landed-under-different-sha" in reason
+
+
+def test_genuinely_unlanded_commit_is_still_stranded(monkeypatch):
+    # Negative control in the SAME file (z7gue's spec, plant-and-fail
+    # requirement): no patch-id equivalent exists at the spine -> the branch
+    # MUST still classify STRANDED, so the fix above cannot pass by simply
+    # disabling the detector.
+    _fake_git_cherry(monkeypatch, ancestor_rc=1, tip_ct=CT_OLD,
+                     cherry_lines=["+ abc1234 genuinely new, unlanded commit"])
+    _fake_bd(monkeypatch, search_status="closed")
+    is_stranded, reason, status = _classify()
+    assert is_stranded is True, reason
+    assert reason == "STRANDED"
+    assert status == "closed"
+
+
+def test_no_bead_when_content_is_contained_under_a_different_sha(monkeypatch, capsys):
+    # SABLE-4709h's negative-control matrix, full reconcile() sweep: a
+    # rebased-and-landed branch must file NOTHING end-to-end, not merely
+    # classify correctly in isolation.
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: ["wk-x"])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+    monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)
+    monkeypatch.setattr(smrh, "find_work_bead_status", lambda repo, branch: "closed")
+    monkeypatch.setattr(smrh, "branch_tip_age_seconds", lambda *a, **k: 9999.0)
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+    monkeypatch.setattr(smrh, "branch_content_contained",
+                        lambda *a, **k: (True, "content-contained(1 commit(s))"))
+
+    bd_calls = []
+
+    def fake_bd(repo, *args, check=False):
+        bd_calls.append(args)
+        return _cp(args, 0, "created bd-xyz")
+
+    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+    monkeypatch.setattr(smrh, "_bd", fake_bd)
+
+    rc = smrh.reconcile("/repo", "origin", 10.0, dry_run=False)
+    assert rc == 0
+    assert not any(a and a[0] == "create" for a in bd_calls), bd_calls
+    assert "landed-under-different-sha" in capsys.readouterr().out
+
+
+# ===========================================================================
+# SABLE-4709h: no true positive had ever been demonstrated end-to-end for
+# this detector across a full shift of sixteen firings. This is that missing
+# known-positive control at the reconcile()-level (test_U5_true_positive_is_
+# stranded already pins the pure classify_branch predicate; this pins the
+# full sweep filing a bead off it), plus the negative-control matrix for the
+# three other live states a real fleet actually produces.
+# ===========================================================================
+
+def test_detector_fires_on_a_constructed_true_positive(monkeypatch, capsys):
+    rc, bd_calls = _spy_reconcile(monkeypatch, dry_run=False)
+    assert rc == 0
+    creates = [a for a in bd_calls if a and a[0] == "create"]
+    assert len(creates) == 1, "the constructed true positive must file exactly one bead"
+    assert "--labels=for-chuck,coord" in creates[0]
+    out = capsys.readouterr().out
+    assert "STRANDED" in out
+    assert "filed for-chuck bead for stranded branch wk-x" in out
+
+
+def test_no_bead_when_a_live_worker_pane_holds_the_branch(monkeypatch, capsys):
+    # SABLE-4709h IN-ACTIVE-REVISE: "1 IN ACTIVE REVISE — a live worker pane,
+    # bounced by its own manager (SABLE-660hy)" from the sixteen-firing
+    # triage. A live pane tagged (via @sable_bead) with this branch's work
+    # bead id means a manager already knows and a worker is on it — every
+    # OTHER stranded predicate is satisfied here, and it must still file
+    # nothing.
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches",
+                        lambda repo, remote: ["wk-SABLE-live1"])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+    monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)
+    monkeypatch.setattr(smrh, "find_work_bead_status", lambda repo, branch: "closed")
+    monkeypatch.setattr(smrh, "branch_tip_age_seconds", lambda *a, **k: 9999.0)
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+    monkeypatch.setattr(smrh, "live_pane_bead_ids", lambda repo: {"SABLE-live1"})
+
+    bd_calls = []
+
+    def fake_bd(repo, *args, check=False):
+        head = args[0] if args else ""
+        if head == "create":
+            bd_calls.append(args)
+            return _cp(args, 0, "created bd-xyz")
+        if head == "show":
+            return _cp(args, 1, "not found")
+        return _cp(args, 0, "[]")
+
+    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+    monkeypatch.setattr(smrh, "_bd", fake_bd)
+
+    rc = smrh.reconcile("/repo", "origin", 10.0, dry_run=False)
+    assert rc == 0
+    assert not bd_calls, bd_calls
+    assert "in-active-revise" in capsys.readouterr().out
+
+
+def test_no_bead_when_the_work_bead_was_reopened(monkeypatch):
+    # `bd reopen` sets status back to 'open' (bd's documented semantics:
+    # "Reopen closed issues by setting status to 'open'..."). This is a PURE
+    # negative-control pin, not a code change: work_bead_qualifies already
+    # excludes 'open' (real merge work is only closed/in_progress), so a
+    # bead reopened for more work already correctly suppresses filing. Pinned
+    # explicitly under SABLE-4709h's negative-control matrix so a future
+    # loosening of work_bead_qualifies cannot silently regress it.
+    _fake_git(monkeypatch, ancestor_rc=1, tip_ct=CT_OLD)
+    _fake_bd(monkeypatch, search_status="open")
+    is_stranded, reason, status = _classify()
+    assert is_stranded is False
+    assert "no-qualifying-work-bead" in reason
+    assert status == "open"
+
+
+def test_no_bead_when_a_seat_hold_reason_is_recorded(monkeypatch):
+    # SABLE-4709h HELD-UNDER-PULL / HELD-ON-INFRA: the pre-existing
+    # SABLE-jejx3 hold mechanism already covers this population (see
+    # test_held_branch_classifies_as_held_not_stranded above); pinned again
+    # under the literal name SABLE-4709h's test spec calls for, so the
+    # bead's own four-state discriminator matrix has one traceable test per
+    # row.
+    _fake_git(monkeypatch, ancestor_rc=1, tip_ct=CT_OLD)
+    _fake_bd(monkeypatch, search_status="closed")
+    hold = smrh.hold_from_bead(_bead(
+        hold="seat-side hold: verified in hand, not yet promoted",
+        by="chuck", since=_iso_days_ago_wallclock(0.1),
+        until="chuck promotes on the next batch"))
+    is_stranded, reason, _ = smrh.classify_branch(
+        "/repo", "origin", "wk-x", "trunk", [], 10.0, NOW, hold)
+    assert is_stranded is False
+    assert reason.startswith("HELD"), reason

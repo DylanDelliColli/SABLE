@@ -71,6 +71,44 @@ hook and sable-merge-gate use post-SABLE-dtp1 (imported from bin/sable-merge-gat
 resolve_integration_branch) — never a hardcoded main/tmux-only, so ancestry is
 judged against the branch this repo actually integrates onto.
 
+TWO MORE NON-STRANDED OUTCOMES, CHECKED RIGHT AFTER HOLD (SABLE-4709h)
+------------------------------------------------------------------------
+A shift's worth of sixteen [RECONCILE] firings triaged to ZERO genuinely
+stranded branches (SABLE-4709h). Two of the surviving healthy states were not
+distinguishable from a real strand by ANY predicate above:
+
+  IN-ACTIVE-REVISE    a live tmux worker pane is bound (via @sable_bead) to
+                      this branch's work bead RIGHT NOW — a manager already
+                      knows and a worker is on it. Checked via
+                      branch_has_live_worker_pane against a fleet-wide pane
+                      inventory (live_pane_bead_ids, reused from
+                      bin/sable-worker-status — SINGLE SOURCE OF TRUTH, not
+                      reimplemented). Fails OPEN to "no live pane found" when
+                      tmux/pane context is unavailable at all (the
+                      sable-reconcile-timer headless cadence runs with
+                      neither by design), so a missing tmux server never
+                      suppresses a genuine strand — it only means this ONE
+                      extra discriminator sat out that cadence.
+
+  REBASED-AND-LANDED  the branch's content is already at the spine under a
+                      DIFFERENT sha (SABLE-z7gue). Predicate 1 above
+                      (`git merge-base --is-ancestor`) asks "is this exact
+                      SHA reachable", and a rebase changes every SHA, so a
+                      fully-landed rebase copy answers 'not an ancestor'
+                      IDENTICALLY to a genuinely stranded branch — and 'ask
+                      both lanes' (SABLE-xw32f's remedy for the ambiguous
+                      case) cannot separate them either, because every lane
+                      truthfully answers 'not mine': the branch really is on
+                      the spine, in nobody's hand. Checked via
+                      branch_content_contained (`git cherry <upstream>
+                      <head>`, the patch-id-equivalence relation) — contained
+                      ONLY when EVERY commit unique to the branch is
+                      patch-id-equivalent at the spine; a partially-landed
+                      branch is conservatively left NOT-contained, since this
+                      floor's own stranded remedy is a WRITE to the spine and
+                      an indeterminate reading must never assert containment
+                      it cannot fully back.
+
 ACTION: for each stranded branch, file ONE `for-chuck,coord` bead whose title
 names the branch. Chuck merges it from the pool exactly as he would a
 hook-filed handoff.
@@ -98,9 +136,10 @@ BOUNDARIES (hard):
   * `--dry-run` classifies + prints + files NOTHING + exits 0.
 
 Environment seams (overridable; defaults are the production commands so the flow
-is unit-testable without real git / bd):
+is unit-testable without real git / bd / tmux):
   SABLE_RC_REPO   repo path (default $PWD)         SABLE_RC_GIT     (git)
   SABLE_RC_REMOTE remote name (origin)             SABLE_RC_BD      (bd)
+                                                    SABLE_RC_TMUX    (tmux)
   SABLE_RECONCILE_AGE_MIN  push-age threshold, minutes (10)
   SABLE_HOLD_STALE_DAYS    a hold older than this is flagged for review (3)
 
@@ -143,6 +182,25 @@ _MG_LOADER.exec_module(_smg)
 resolve_integration_branch = _smg.resolve_integration_branch
 qualify_remote_ref = _smg.qualify_remote_ref
 kick_preview = _smg.kick_preview
+
+# --------------------------------------------------------------------------
+# Reuse the fleet pane inventory — SINGLE SOURCE OF TRUTH (SABLE-4709h
+# IN-ACTIVE-REVISE discriminator). sable-worker-status already parses
+# `tmux list-panes` into {pane, bead, status, ...} records and already knows
+# which bead ids have a currently-LIVE pane (live_beads); re-implementing that
+# tab-format/parse contract here would drift the moment either file's pane
+# tagging changes. Same SourceFileLoader technique as the sable-merge-gate
+# import above.
+# --------------------------------------------------------------------------
+_WS_PATH = Path(__file__).resolve().parent / "sable-worker-status"
+_WS_LOADER = SourceFileLoader("sable_worker_status", str(_WS_PATH))
+_WS_SPEC = importlib.util.spec_from_loader("sable_worker_status", _WS_LOADER)
+_sws = importlib.util.module_from_spec(_WS_SPEC)
+_WS_LOADER.exec_module(_sws)
+
+_ws_parse_fleet_panes = _sws.parse_fleet_panes
+_ws_live_beads = _sws.live_beads
+_ws_pane_format = _sws._FORMAT
 
 
 # --------------------------------------------------------------------------
@@ -499,6 +557,10 @@ def _bd(repo: str, *args: str, check: bool = False) -> subprocess.CompletedProce
     return _run(_tool("SABLE_RC_BD", "bd") + list(args), cwd=repo, check=check)
 
 
+def _tmux(repo: str, *args: str, check: bool = False) -> subprocess.CompletedProcess:
+    return _run(_tool("SABLE_RC_TMUX", "tmux") + list(args), cwd=repo, check=check)
+
+
 # --------------------------------------------------------------------------
 # Systems-of-record queries (git + beads, behind the pure predicates)
 # --------------------------------------------------------------------------
@@ -746,6 +808,97 @@ def attempt_preview_kick(repo: str, remote: str, branch: str,
         return (False, f"kick-error:{exc}")
 
 
+def live_pane_bead_ids(repo: str) -> set[str]:
+    """Bead ids with a currently-LIVE tmux worker pane bound to them (SABLE-4709h
+    IN-ACTIVE-REVISE discriminator — "1 IN ACTIVE REVISE — a live worker pane,
+    bounced by its own manager (SABLE-660hy)" was one of sixteen false-positive
+    firings a plain tip/handoff-bead classifier cannot tell apart from a real
+    strand). A live pane tagged with a bead via @sable_bead means a manager
+    already knows this branch's work is being actively reworked right now —
+    filing a stranded handoff against it repeats the exact 'ask every lane,
+    get a truthful not-mine from each' trap this floor exists to avoid, except
+    here the answer WAS available, just not from bd or git.
+
+    Fails OPEN to an EMPTY set — NEVER raises, never treated as unknown-and-
+    suppress. sable-reconcile-timer's headless cadence deliberately runs with
+    NO tmux server and NO pane context at all (SABLE-jd5fj.2 S5 walk-away
+    path; see test_S5_U1_timer_once_catches_notify_miss_without_tmux_or_pane_
+    context), so 'could not enumerate panes' must never make the floor stop
+    reporting real strands the way an unreadable hold or for-chuck corpus
+    does — it only means this ONE extra discriminator is unavailable this
+    cadence; every other predicate still runs unchanged."""
+    try:
+        cp = _tmux(repo, "list-panes", "-a", "-F", _ws_pane_format, check=False)
+    except (OSError, FileNotFoundError):
+        return set()
+    if cp.returncode != 0:
+        return set()
+    return _ws_live_beads(_ws_parse_fleet_panes(cp.stdout))
+
+
+def branch_has_live_worker_pane(repo: str, branch: str, live_bead_ids: set[str]) -> bool:
+    """True iff ANY bead joined to `branch` (every record find_work_bead_records
+    resolves, plus a bead id embedded in the branch name itself — the same two
+    sources the hold check consults) has a currently-live pane. Checked against
+    the whole joined set, not just the primary work bead, for the same reason
+    find_work_bead_hold does: an observation/scratch bead can be joined to the
+    same branch and sort first, and a live pane on THAT bead is just as much
+    in-active-revise as one on the primary."""
+    if not live_bead_ids:
+        return False
+    records, _ = find_work_bead_records(repo, branch)
+    ids = {r.get("id") for r in records if isinstance(r, dict) and r.get("id")}
+    embedded = parse_bead_id(branch)
+    if embedded:
+        ids.add(embedded)
+    return bool(ids & live_bead_ids)
+
+
+def branch_content_contained(repo: str, remote: str, branch: str,
+                             integration_branch: str) -> tuple[bool, str]:
+    """SABLE-z7gue: does `branch`'s content already exist at the spine under a
+    DIFFERENT sha — a REBASED-AND-LANDED branch whose original ref may still
+    be a tip-keyed corpse (or, per z7gue's actual instance, whose ref was
+    already deleted but a preview/tag/other tip-keyed probe still finds the
+    pre-rebase commit). Ancestry (predicate 1, `git merge-base --is-ancestor`)
+    is exactly wrong for this: it asks "is this exact SHA reachable from the
+    integration branch", and a rebase changes every SHA, so a fully-landed
+    rebase copy answers 'not an ancestor' IDENTICALLY to a genuinely stranded
+    branch. 'ask both lanes' (SABLE-xw32f's remedy) cannot separate them
+    either: every lane truthfully answers 'not mine', because the branch
+    really is in nobody's hand — it is on the spine.
+
+    Uses `git cherry <upstream> <head>` (z7gue's own suggested mechanism):
+    each commit unique to `branch` is prefixed '-' when a patch-id-equivalent
+    commit already exists in `integration_branch` (the exact rebase-copy
+    relation), '+' when it is genuinely new. Returns (fully_contained, detail).
+
+    fully_contained is True ONLY when EVERY commit unique to the branch is
+    patch-id-equivalent — a PARTIALLY landed branch (some commits landed, some
+    not) is conservatively left NOT-contained, per the module's stated
+    default: this floor's stranded verdict is the ONE place its own remedy is
+    a WRITE to the spine (re-merge), so an indeterminate/partial reading must
+    fall through to the ordinary predicates rather than assert containment it
+    cannot fully back. An unresolvable `git cherry` (nonzero exit) or an EMPTY
+    result (ancestry already said unmerged, so a genuinely empty cherry
+    listing would mean the two views disagree) both return NOT-contained —
+    never invent a landed verdict off a failed or ambiguous comparison."""
+    branch_ref = qualify_remote_ref(remote, branch)
+    base_ref = qualify_remote_ref(remote, integration_branch)
+    cp = _git(repo, "cherry", base_ref, branch_ref, check=False)
+    if cp.returncode != 0:
+        return (False, f"patch-id-check-unresolvable(git cherry exit {cp.returncode})")
+    lines = [ln for ln in cp.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return (False, "patch-id-check-empty(no unique commits found)")
+    new_commits = [ln for ln in lines if ln.startswith("+")]
+    if new_commits:
+        return (False, f"patch-id-partial({len(lines) - len(new_commits)} of "
+                        f"{len(lines)} commit(s) patch-id-equivalent at the spine)")
+    return (True, f"content-contained({len(lines)} commit(s) patch-id-equivalent "
+                  f"at the spine under a different sha)")
+
+
 # --------------------------------------------------------------------------
 # Classification + orchestration
 # --------------------------------------------------------------------------
@@ -753,7 +906,8 @@ def attempt_preview_kick(repo: str, remote: str, branch: str,
 def classify_branch(repo: str, remote: str, branch: str, integration_branch: str,
                     open_beads: list[dict] | None, threshold_minutes: float,
                     now: float, hold: dict | str | None = None,
-                    stale_days: float = DEFAULT_HOLD_STALE_DAYS) -> tuple[bool, str, str | None]:
+                    stale_days: float = DEFAULT_HOLD_STALE_DAYS,
+                    live_bead_ids: set[str] | None = None) -> tuple[bool, str, str | None]:
     """Apply the stranded predicate to ONE branch. Returns (is_stranded, reason,
     work_status). Cheap/pure checks first; the bead-status lookup (a subprocess)
     runs only after ancestry + for-chuck rule the branch in as a live candidate.
@@ -766,7 +920,23 @@ def classify_branch(repo: str, remote: str, branch: str, integration_branch: str
     OPPOSITE of the standing instruction. It is resolved by the caller rather
     than here so reconcile() can also report it, held branches being a reported
     outcome and never a silent skip. Defaults to None so every pre-existing
-    call site keeps its exact prior behavior."""
+    call site keeps its exact prior behavior.
+
+    `live_bead_ids` (SABLE-4709h) is the whole fleet's set of bead ids with a
+    currently-live tmux pane, resolved ONCE per sweep by the caller (mirrors
+    `open_beads`) and checked immediately after HOLD, before predicate 3 — a
+    branch actively being reworked in a live pane is exactly as much a
+    reported non-strand as a held one, and for the same reason: filing a
+    handoff would say the opposite of what is actually happening. Defaults to
+    None (treated as empty) so every pre-existing call site keeps its exact
+    prior behavior.
+
+    Content-containment (SABLE-z7gue) is checked right after that, still
+    ahead of predicate 3: a branch whose commits are already patch-id-
+    equivalent at the spine under a different sha is REBASED-AND-LANDED, not
+    stranded, regardless of what the for-chuck corpus or work-bead status say
+    — tip-containment (predicate 1 above) cannot see this, because a rebase
+    changes every SHA."""
     rc = branch_ancestor_rc(repo, remote, branch, integration_branch)
     if not ancestor_rc_is_unmerged(rc):
         return (False, f"merged-or-unresolvable(is-ancestor rc={rc})", None)
@@ -777,6 +947,15 @@ def classify_branch(repo: str, remote: str, branch: str, integration_branch: str
                 "rule out a deliberate do-not-merge hold", None)
     if isinstance(hold, dict):
         return (False, describe_hold(hold, now, stale_days), None)
+
+    if branch_has_live_worker_pane(repo, branch, live_bead_ids or set()):
+        return (False, "in-active-revise(a live worker pane is bound to this "
+                        "branch's work bead)", None)
+
+    contained, contained_detail = branch_content_contained(
+        repo, remote, branch, integration_branch)
+    if contained:
+        return (False, f"landed-under-different-sha({contained_detail})", None)
 
     if branch_named_by_open_for_chuck(open_beads, branch):
         return (False, "handoff-already-on-record", None)
@@ -815,6 +994,10 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool,
     branches = list_origin_wk_branches(repo, remote)
     open_beads = open_for_chuck_beads(repo)
     corpus_unknown = open_beads is None
+    # SABLE-4709h: resolved ONCE per sweep, mirroring open_beads — a pane
+    # enumeration per branch would be wasteful and (worse) could observe a
+    # different fleet snapshot for different branches in the same cadence.
+    live_bead_ids = live_pane_bead_ids(repo)
     now = time.time()
 
     mode = "DRY-RUN" if dry_run else "reconcile"
@@ -857,7 +1040,7 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool,
 
         is_stranded, reason, status = classify_branch(
             repo, remote, br, integration_branch, open_beads, threshold_minutes,
-            now, hold, stale_days)
+            now, hold, stale_days, live_bead_ids)
         print(f"  {br}: {reason}")
         if isinstance(hold, dict):
             held.append((br, hold))
