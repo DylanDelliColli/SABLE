@@ -186,6 +186,8 @@ declare -A EXCLUDE=(
   [test-quickstart-project.sh]="needs the ~/.claude SABLE install (bd, sable-doctor) for its E2E bootstrap-flow cases; clean-room has none [permanent: SABLE-59zu SABLE-vivm]"
   [test-notes-clobber-guard-e2e.sh]="real-bd-only by construction — its whole claim is that CONTENT survives in a real bead store, and its negative control needs a real destructive bd write; in the clean room it would SKIP and count green. Run it locally against real bd; the decision logic is covered fail-closed by test-notes-clobber-guard.sh, which IS in the run-set. [permanent: SABLE-sm269 SABLE-59zu]"
   [test-tmux-e2e.sh]="vacuous without bd — prints 'SKIP: bd not installed' and exits 0 [permanent: SABLE-59zu]"
+  [test-landing-pair-gate.sh]="real-bd-only by construction — its whole claim is that a MUST-LAND-TOGETHER pairing declared in real bd metadata is read back mechanically by promote(); prints 'SKIP: bd not on PATH' and exits 0 in the clean room [permanent: SABLE-59zu]"
+  [test-seat-sighting.sh]="real-bd-only by construction — its whole claim is that a filed sighting's DEFERRED status and ready-pool absence/presence are read back from a real bd store; prints 'SKIP: bd not on PATH' and exits 0 in the clean room [permanent: SABLE-59zu]"
 )
 
 # --- Shell impact manifest (SABLE-cmar4.2) --------------------------------
@@ -204,6 +206,7 @@ declare -A COVERS=(
   [test-doctor-snapshot-staleness.sh]="bin/sable-doctor bin/sable-bin-install install.sh"
   [test-edit-write-claim-reconciler.sh]="hooks/multi-manager/edit-write-claim-reconciler.sh"
   [test-impact-tier-serialization.sh]="bin/sable_gate_promote_lib.py"
+  [test-landing-pair-gate.sh]="bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py bin/sable-merge-gate"
   [test-lib-hook-trace.sh]="hooks/multi-manager/lib-hook-trace.sh"
   [test-lib-identity.sh]="hooks/multi-manager/lib-identity.sh"
   [test-lib-mode-path.sh]="hooks/multi-manager/lib-mode-path.sh"
@@ -233,6 +236,7 @@ declare -A COVERS=(
   [test-sable-msg.sh]="bin/sable-msg bin/sable_pane_lib.py"
   [test-sable-test.sh]="bin/sable-test"
   [test-sable-worker-status.sh]="bin/sable-worker-status bin/sable_pane_lib.py"
+  [test-seat-sighting.sh]="bin/sable-msg hooks/multi-manager/seat-sighting-gate.sh"
   [test-session-role-anchor.sh]="hooks/multi-manager/session-role-anchor.sh"
   [test-snapshot-freeze.sh]="bin/sable-snapshot bin/sable_snapshot_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py"
   [test-tarzan-optimus-accept-contract.sh]="templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/optimus.md"
