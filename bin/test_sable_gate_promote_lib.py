@@ -21,6 +21,7 @@ whole point of the defect is WHERE in a real byte stream the cut lands.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +30,12 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import sable_gate_promote_lib as promote_lib  # noqa: E402
+
+# The ci-verify clean-room is tmux+pytest only -- no bd/dolt by design. The
+# real-sandbox attention-record test drives a REAL sandbox promote() call
+# (which shells to bd), so it self-skips when bd is absent, matching the
+# bd/dolt-suites-self-skip contract in ci-verify.yml.
+HAVE_BD = shutil.which("bd") is not None
 
 MARKER = "distinctive-marker-alpha-7f3c"
 DETAIL_LINE = "root-cause-detail-line-zzyx: rc mismatch, see conjunct 2"
@@ -477,6 +484,9 @@ def _real_two_repo_sandbox(tmp_path):
     return str(work), str(bare), branch_sha
 
 
+@pytest.mark.skipif(
+    not HAVE_BD,
+    reason="ci-verify clean-room has no bd/dolt by design; real-bd integration self-skips")
 def test_a_real_landing_leaves_a_complete_attention_record_in_the_durable_artifacts(
         tmp_path, monkeypatch):
     """ACCEPTANCE (SABLE-21rug.1): a real landing in the sandbox leaves a
