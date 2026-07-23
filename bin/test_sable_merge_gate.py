@@ -9,7 +9,9 @@ against a scratch remote (the three o9aa rehearsals) lives in the integration
 variant.
 """
 import importlib.util
+import re
 import subprocess
+import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -307,6 +309,113 @@ def test_sweep_keeps_fresh_ref_regardless_of_run(monkeypatch):
     assert smg.sweep("/repo", "origin", 6) == 0
     assert _sweep_deletes(calls) == [], "fresh ref wrongly reaped"
     assert probed == [], "fresh ref should not incur a gh run-status probe"
+
+
+# --- SABLE-o9b8u: sweep --dry-run reports the blast radius, deletes nothing ---
+# The default's safety is a function of how recently the sweep last ran, and the
+# command has no memory of that: the identical --max-age-hours can mean 3 refs
+# or 232, and the operator has no way to see which before it acts on the shared
+# remote. --dry-run is the look-before-you-leap.
+
+def _dry_run_reported(out):
+    return set(re.findall(r"would delete (\S+) \(age", out))
+
+
+def test_dry_run_lists_candidates_and_deletes_nothing(monkeypatch, capsys):
+    listing = "origin/ci-verify/old-abcdef1 0\norigin/ci-verify/older-bbbbbb1 100\n"
+    calls = _sweep_fake_git(monkeypatch, listing)
+    monkeypatch.setattr(preview_lib, "ref_has_inflight_run", lambda repo, ref: False)
+
+    assert smg.sweep("/repo", "origin", 6, dry_run=True) == 0
+
+    assert _sweep_deletes(calls) == [], "dry run must never invoke the delete path"
+    out = capsys.readouterr().out
+    assert _dry_run_reported(out) == {"ci-verify/old-abcdef1", "ci-verify/older-bbbbbb1"}, (
+        "dry run must print exactly the over-threshold refs"
+    )
+    assert "would be deleted" in out
+
+
+def test_dry_run_excludes_fresh_and_inflight_refs(monkeypatch, capsys):
+    # a dry run that over-reports (lists a ref the real run would spare) is
+    # worse than no dry run at all — it manufactures false confidence.
+    fresh_ts = str(int(time.time()))
+    listing = (
+        "origin/ci-verify/old-abcdef1 0\n"
+        "origin/ci-verify/inflight-cc1 0\n"
+        f"origin/ci-verify/fresh-dddddd1 {fresh_ts}\n"
+    )
+    _sweep_fake_git(monkeypatch, listing)
+    monkeypatch.setattr(preview_lib, "ref_has_inflight_run",
+                        lambda repo, ref: ref == "ci-verify/inflight-cc1")
+
+    assert smg.sweep("/repo", "origin", 6, dry_run=True) == 0
+
+    out = capsys.readouterr().out
+    assert _dry_run_reported(out) == {"ci-verify/old-abcdef1"}
+
+
+def test_real_run_deletes_exactly_the_dry_run_set(monkeypatch, capsys):
+    # opposite polarity of the two tests above: whatever dry-run reported, a
+    # real run against the SAME fixture must delete exactly that set — no
+    # more, no less.
+    fresh_ts = str(int(time.time()))
+    listing = (
+        "origin/ci-verify/old-abcdef1 0\n"
+        "origin/ci-verify/older-bbbbbb1 100\n"
+        f"origin/ci-verify/fresh-dddddd1 {fresh_ts}\n"
+    )
+    _sweep_fake_git(monkeypatch, listing)
+    monkeypatch.setattr(preview_lib, "ref_has_inflight_run", lambda repo, ref: False)
+    assert smg.sweep("/repo", "origin", 6, dry_run=True) == 0
+    dry_reported = _dry_run_reported(capsys.readouterr().out)
+
+    calls = _sweep_fake_git(monkeypatch, listing)
+    monkeypatch.setattr(preview_lib, "ref_has_inflight_run", lambda repo, ref: False)
+    assert smg.sweep("/repo", "origin", 6, dry_run=False) == 0
+    real_deleted = {a[3] for a in _sweep_deletes(calls)}
+
+    assert dry_reported == real_deleted == {"ci-verify/old-abcdef1", "ci-verify/older-bbbbbb1"}
+
+
+def test_sweep_reports_count_before_acting_above_threshold(monkeypatch, capsys):
+    # a large over-threshold set: the count and age span must be visible
+    # BEFORE any deletion is attempted, not just after the fact.
+    listing = "\n".join(
+        f"origin/ci-verify/bead{i}-abcdef1 {i}" for i in range(50)
+    ) + "\n"
+    events = []
+
+    def fake_git(repo, *args, check=True):
+        if args and args[0] == "for-each-ref":
+            return subprocess.CompletedProcess(args, 0, stdout=listing, stderr="")
+        if args and args[0] == "push" and "--delete" in args:
+            events.append(("delete", args))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(git_lib, "_git", fake_git)
+    monkeypatch.setattr(preview_lib, "ref_has_inflight_run", lambda repo, ref: False)
+
+    real_print = print
+
+    def recording_print(*a, **kw):
+        events.append(("print", " ".join(str(x) for x in a)))
+        real_print(*a, **kw)
+
+    monkeypatch.setattr(preview_lib, "print", recording_print, raising=False)
+
+    assert smg.sweep("/repo", "origin", 6, dry_run=False) == 0
+
+    kinds = [k for k, _ in events]
+    first_delete = kinds.index("delete")
+    report_lines = [v for k, v in events if k == "print" and "ref(s) match the" in v]
+    assert report_lines, "no count/age-span report line was printed"
+    # the report line specifically (not just any print) must precede the first delete
+    report_index = next(i for i, (k, v) in enumerate(events)
+                        if k == "print" and "ref(s) match the" in v)
+    assert report_index < first_delete, "count/age-span report must be emitted before any deletion"
+    assert "50 ref(s) match" in report_lines[0]
+    assert "oldest" in report_lines[0] and "newest" in report_lines[0]
 
 
 # --- SABLE-sc24: ref_has_inflight_run — the sweep's live-run probe -------------

@@ -418,6 +418,40 @@ def test_sweep_deletes_only_aged_orphans(tmp_path):
     assert "refs/heads/ci-verify/new-bbbbbbb" in remaining, "fresh ref wrongly swept"
 
 
+# --- SABLE-o9b8u: sweep --dry-run against a REAL remote leaves every ref intact -
+# The unit tests above prove dry_run's candidate list against a mocked git seam;
+# this proves it end to end through the real CLI subprocess against a real bare
+# repo, with no mocked git and no mocked remote — the destructive push --delete
+# path must never be invoked for real refs either.
+
+def test_dry_run_against_a_real_remote_leaves_refs_intact(tmp_path):
+    origin, work = _setup(tmp_path)
+    base_sha = _origin_base_sha(origin)
+    base_tree = _git(work, "rev-parse", base_sha + "^{tree}")
+    old_env = dict(os.environ,
+                   GIT_COMMITTER_DATE="2000-01-01T00:00:00 +0000",
+                   GIT_AUTHOR_DATE="2000-01-01T00:00:00 +0000")
+    old_sha = _run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit-tree", base_tree, "-m", "old-preview"], cwd=str(work), env=old_env).stdout.strip()
+    _git(work, "push", "origin", f"{old_sha}:refs/heads/ci-verify/dryrun-old-aaaaaaa")
+    _git(work, "push", "origin", f"{base_sha}:refs/heads/ci-verify/dryrun-new-bbbbbbb")
+
+    cp = _run([sys.executable, str(BIN), "sweep", "--max-age-hours", "6", "--dry-run",
+               "--repo", str(work), "--remote", "origin"], cwd=str(work),
+              env=_env(_write_fake_gh(tmp_path, origin, "empty")))
+    assert cp.returncode == 0, cp.stdout
+    # the specific refs THIS test created must still resolve — not a global
+    # count, which would miss a dry run that deleted these and nothing else
+    # (attributable absence, SABLE-jd5fj.15)
+    remaining = _ci_verify_refs(origin)
+    assert "refs/heads/ci-verify/dryrun-old-aaaaaaa" in remaining, \
+        "dry run deleted the aged ref — it must report only, never delete"
+    assert "refs/heads/ci-verify/dryrun-new-bbbbbbb" in remaining
+    assert "ci-verify/dryrun-old-aaaaaaa" in cp.stdout, \
+        "dry run must name the ref it would have deleted"
+    assert "would be deleted" in cp.stdout
+
+
 # --- SABLE-kzi1a: a SERIAL merge queue must not discard green previews --------
 #
 # The failure this pins is not a bug in a function; it is what the serial merge
