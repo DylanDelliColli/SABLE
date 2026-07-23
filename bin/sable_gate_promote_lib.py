@@ -654,6 +654,128 @@ def format_impact_budget(budget: dict) -> str:
 
 
 # --------------------------------------------------------------------------
+# The combined-tree BATCH budget (SABLE-be4lo.6) — a NEW named field, never
+# an overload of recommended_wrapper_timeout_s
+# --------------------------------------------------------------------------
+
+BISECTION_RESERVE_RUNS = 3
+"""Architecture decision 4 of the SABLE-be4lo epic: a red n=4 batch bisects
+into at most 3 EXTRA combined runs before a member is isolated or the batch
+reports COULD-NOT-ATTRIBUTE. Each bisection round re-runs only the impact
+tier on a re-formed fold chain — it does not re-queue for the seat lock or
+re-pay the coverage floor, both of which are paid once per batch (decision 7:
+a batch is one promote). The reserve is therefore RESERVE_RUNS extra
+tier_timeout_s terms, not extra worst_case_s terms."""
+
+
+def combined_tree_budget(member_footprints: list, repo: str | None = None) -> dict:
+    """SABLE-be4lo.6: price a BATCH's combined tree — union of member
+    footprints, member impact tiers on that tree, plus the bisection reserve
+    — as its OWN named field, `recommended_batch_wrapper_timeout_s`, never by
+    overloading impact_budget()'s recommended_wrapper_timeout_s (the 5v3d5
+    lesson: one name carrying two quantities is how a fix straddles both
+    readings of a number at once). This function is purely additive:
+    impact_budget() itself is untouched, so the single-branch report and its
+    recommended_wrapper_timeout_s stay byte-identical to before this bead.
+
+    `member_footprints` is one entry (an iterable of changed paths) per batch
+    member. Every member currently prices against the SAME repo-wide tier
+    SSOT — impact_budget() has no per-path tier selection yet (the fleet
+    still runs a single flat "merge_preview" tier, SABLE-cmar4.1) — so today
+    every member's tier_timeout_s is identical and the max() below is a
+    no-op. The max()-over-members shape is kept anyway so a future
+    footprint-sensitive tier slots in here without a second combined-budget
+    function needing to be built to receive it; a caller may already
+    monkeypatch/stub impact_budget() per member to exercise that shape ahead
+    of time.
+
+    Governing precedent: no hand-carried terms. A batch wrapper derives its
+    timeout from THIS field at run time (`sable-merge-gate promote-budget
+    --member-footprint ... --seconds`); copying the number forfeits the
+    derivation, the same retired +900 pattern impact_budget()'s own docstring
+    already warns against.
+
+    Raises ValueError on an empty batch — a zero-member request is a caller
+    bug, not a valid "no reserve needed" answer, so it must never return a
+    number (SABLE-p9n7k vacuous-pass discipline)."""
+    if not member_footprints:
+        raise ValueError("combined_tree_budget requires at least one member footprint")
+
+    member_budgets = [impact_budget(repo) for _ in member_footprints]
+    tier_timeout_s = max(m["tier_timeout_s"] for m in member_budgets)
+    # Paid ONCE per batch (decision 7: a batch is one promote), so any
+    # member's own value is the same as any other's under the current
+    # repo-wide (not per-member) lock/coverage-floor knobs.
+    lock_timeout_s = member_budgets[0]["lock_timeout_s"]
+    coverage_floor_timeout_s = member_budgets[0]["coverage_floor_timeout_s"]
+    bisection_reserve_s = BISECTION_RESERVE_RUNS * tier_timeout_s
+    worst_case_s = tier_timeout_s + lock_timeout_s + coverage_floor_timeout_s + bisection_reserve_s
+
+    union_footprint_paths = sorted({path for fp in member_footprints for path in fp})
+
+    return {
+        "member_count": len(member_footprints),
+        "union_footprint_paths": union_footprint_paths,
+        "tier_timeout_s": tier_timeout_s,
+        "lock_timeout_s": lock_timeout_s,
+        "coverage_floor_timeout_s": coverage_floor_timeout_s,
+        "bisection_reserve_runs": BISECTION_RESERVE_RUNS,
+        "bisection_reserve_s": bisection_reserve_s,
+        "worst_case_s": worst_case_s,
+        "recommended_batch_wrapper_timeout_s": int(math.ceil(worst_case_s * BUDGET_HEADROOM)),
+        "serialized": member_budgets[0]["serialized"],
+    }
+
+
+def format_combined_tree_budget(budget: dict) -> str:
+    """Human-readable breakdown, mirroring format_impact_budget's shape and
+    the same "say which number is which" discipline."""
+    return "\n".join([
+        f"sable-merge-gate combined-tree batch budget ({budget['member_count']} members):",
+        f"  impact tier  {budget['tier_timeout_s']:.0f}s  (worst tier required by any member)",
+        f"  queue wait   {budget['lock_timeout_s']:.0f}s",
+        f"  coverage floor {budget['coverage_floor_timeout_s']:.0f}s",
+        f"  bisection reserve {budget['bisection_reserve_s']:.0f}s  "
+        f"({budget['bisection_reserve_runs']} extra combined runs reserved, "
+        f"architecture decision 4)",
+        f"  worst case   {budget['worst_case_s']:.0f}s",
+        f"  RECOMMENDED enclosing batch wrapper timeout: "
+        f"{budget['recommended_batch_wrapper_timeout_s']}s",
+        "",
+        "A NEW named field — never recommended_wrapper_timeout_s, which stays the",
+        "single-branch number unchanged (SABLE-be4lo.6, the 5v3d5 lesson: one name,",
+        "one quantity). Any wrapper enclosing a batched `sable-merge-gate promote`",
+        "MUST derive from recommended_batch_wrapper_timeout_s, not copy it.",
+    ])
+
+
+def render_promote_budget_report(member_footprints: list | None, seconds: bool,
+                                 as_json: bool) -> str:
+    """The `promote-budget` CLI command's dispatch, factored out of
+    bin/sable-merge-gate so the single-branch/combined-tree-batch branch this
+    bead adds, plus the seconds/json/text format selection, both stay inside
+    the thin-CLI budget test_merge_gate_modules.py::test_cli_is_thin enforces.
+
+    `member_footprints` is the raw repeated --member-footprint values (each
+    entry one member's comma-separated changed paths); empty/None reports the
+    pre-existing single-branch budget, unchanged."""
+    if member_footprints:
+        members = [fp.split(",") for fp in member_footprints]
+        budget = combined_tree_budget(members)
+        if seconds:
+            return str(budget["recommended_batch_wrapper_timeout_s"])
+        if as_json:
+            return json.dumps(budget, sort_keys=True)
+        return format_combined_tree_budget(budget)
+    budget = impact_budget()
+    if seconds:
+        return str(budget["recommended_wrapper_timeout_s"])
+    if as_json:
+        return json.dumps(budget, sort_keys=True)
+    return format_impact_budget(budget)
+
+
+# --------------------------------------------------------------------------
 # Promote-path timeout completeness (SABLE-5v3d5) — catches the NEXT omission
 # --------------------------------------------------------------------------
 #

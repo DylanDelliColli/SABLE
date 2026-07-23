@@ -1603,6 +1603,125 @@ def test_the_cli_reports_the_same_budget_the_library_computes(clean_budget_env, 
 
 
 # --------------------------------------------------------------------------
+# The combined-tree BATCH budget (SABLE-be4lo.6) -- a NEW named field
+# --------------------------------------------------------------------------
+#
+# combined_tree_budget() is purely additive next to impact_budget() -- it
+# calls impact_budget() rather than reimplementing any of its terms, so the
+# single-branch report cannot drift just because the batch report exists.
+
+
+def test_recommended_wrapper_timeout_s_is_unchanged_by_the_batch_field(clean_budget_env):
+    """REGRESSION, priority 1 (columbo cmar4/be4lo matrix, S1 load-bearing
+    case). Fixed fixture, both the FIELD and the VALUE asserted -- the exact
+    two-things-on-one-name failure the 5v3d5 lesson names: 5400 sitting on
+    both sides of a fix as two different quantities. combined_tree_budget()
+    existing must not move recommended_wrapper_timeout_s by one second, nor
+    rename/remove it from impact_budget()'s own report."""
+    monkeypatch = clean_budget_env
+    monkeypatch.setenv("SABLE_MG_IMPACT_TIMEOUT", "200")
+    monkeypatch.setenv("SABLE_MG_IMPACT_LOCK_TIMEOUT", "400")
+    monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "111")
+
+    before = promote_lib.impact_budget()
+    # Exercise the new batch path in between, so a shared-mutable-state bug
+    # would show up as a moved `before`/`after` value.
+    promote_lib.combined_tree_budget([["bin/a.py"], ["bin/b.py"], ["bin/c.py"]])
+    after = promote_lib.impact_budget()
+
+    assert "recommended_wrapper_timeout_s" in after
+    assert after["recommended_wrapper_timeout_s"] == before["recommended_wrapper_timeout_s"] == 854
+    assert after == before
+
+
+def test_combined_tree_budget_is_monotonic_and_carries_a_bisection_reserve(clean_budget_env):
+    """3-member fixture (columbo S1 case): the combined field exists, is
+    monotonic (combined worst_case_s >= max of the members' own worst_case_s),
+    and includes a non-zero bisection reserve term distinct from the tier/
+    lock/coverage-floor terms it is added to."""
+    monkeypatch = clean_budget_env
+    monkeypatch.setenv("SABLE_MG_IMPACT_TIMEOUT", "300")
+    monkeypatch.setenv("SABLE_MG_IMPACT_LOCK_TIMEOUT", "150")
+    monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "50")
+
+    member_footprints = [["bin/a.py"], ["bin/b.py", "bin/c.py"], ["hooks/test/x.sh"]]
+    member_worst_cases = [promote_lib.impact_budget()["worst_case_s"] for _ in member_footprints]
+
+    combined = promote_lib.combined_tree_budget(member_footprints)
+
+    assert combined["member_count"] == 3
+    assert combined["union_footprint_paths"] == [
+        "bin/a.py", "bin/b.py", "bin/c.py", "hooks/test/x.sh"]
+    assert combined["bisection_reserve_runs"] == 3
+    assert combined["bisection_reserve_s"] == 3 * combined["tier_timeout_s"] > 0
+    assert combined["worst_case_s"] == (
+        combined["tier_timeout_s"] + combined["lock_timeout_s"]
+        + combined["coverage_floor_timeout_s"] + combined["bisection_reserve_s"])
+    assert combined["worst_case_s"] >= max(member_worst_cases)
+    assert isinstance(combined["recommended_batch_wrapper_timeout_s"], int)
+    assert combined["recommended_batch_wrapper_timeout_s"] > combined["worst_case_s"]
+    # A NEW field, never the single-branch one:
+    assert "recommended_batch_wrapper_timeout_s" in combined
+    assert "recommended_wrapper_timeout_s" not in combined
+
+
+def test_combined_tree_budget_rejects_an_empty_batch():
+    """VACUOUS-PASS GUARD (SABLE-p9n7k applied to this new field): a
+    zero-member budget request must error, never return a number that could
+    masquerade as "no reserve needed". Matched on the guard's OWN message,
+    not merely `pytest.raises(ValueError)` -- an empty member_budgets list
+    fed to max() would ALSO raise a bare ValueError with no explicit guard at
+    all (confirmed by planting: deleting the guard still passed a
+    message-blind version of this test), which is exactly the accidental-
+    exception-masquerading-as-a-guard failure mode SABLE-p9n7k exists to
+    catch."""
+    with pytest.raises(ValueError, match="at least one member footprint"):
+        promote_lib.combined_tree_budget([])
+
+
+def test_the_cli_reports_the_combined_tree_batch_budget(clean_budget_env, capsys):
+    """The batch CLI path mirrors the single-branch one (SABLE-w0zjm
+    precedent): --member-footprint (repeatable) switches promote-budget to
+    the batch report, and --seconds/--json/plain all reach it. The wrapper
+    shells out, so the number a shell can actually reach has to be the same
+    one the library computes -- and it must be the BATCH field, not the
+    single-branch one, so a wrapper cannot silently derive from the wrong
+    name."""
+    monkeypatch = clean_budget_env
+    monkeypatch.setenv("SABLE_MG_IMPACT_TIMEOUT", "200")
+    monkeypatch.setenv("SABLE_MG_IMPACT_LOCK_TIMEOUT", "400")
+    monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "111")
+    members = [["bin/a.py"], ["bin/b.py"]]
+    expected = promote_lib.combined_tree_budget(members)
+
+    argv = ["promote-budget", "--member-footprint", "bin/a.py",
+            "--member-footprint", "bin/b.py"]
+    assert smg.main([*argv, "--seconds"]) == 0
+    out = capsys.readouterr().out.strip()
+    assert out == str(expected["recommended_batch_wrapper_timeout_s"])
+    # Never the single-branch field's value under these knobs -- if the CLI
+    # wired the wrong field this assertion is the one that would catch it.
+    assert out != str(promote_lib.impact_budget()["recommended_wrapper_timeout_s"])
+
+    assert smg.main([*argv, "--json"]) == 0
+    reported = json.loads(capsys.readouterr().out)
+    assert reported == expected
+    assert "recommended_batch_wrapper_timeout_s" in reported
+
+    assert smg.main(argv) == 0
+    assert "combined-tree batch budget" in capsys.readouterr().out
+
+    # No --repo, no git: matches the single-branch CLI's own no-repo contract.
+    proc = subprocess.run([sys.executable, str(_BIN / "sable-merge-gate"), *argv, "--seconds"],
+                          cwd="/", text=True, capture_output=True,
+                          env={**os.environ, "SABLE_MG_IMPACT_TIMEOUT": "200",
+                               "SABLE_MG_IMPACT_LOCK_TIMEOUT": "400",
+                               "SABLE_MG_COVERAGE_FLOOR_TIMEOUT": "111"})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == str(expected["recommended_batch_wrapper_timeout_s"])
+
+
+# --------------------------------------------------------------------------
 # Promote-path timeout completeness (SABLE-5v3d5) -- the general fix
 # --------------------------------------------------------------------------
 #
