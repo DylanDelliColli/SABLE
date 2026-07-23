@@ -111,6 +111,14 @@ over tmux and they spawn + watch their own workers.**
 
 ## Status, arbitration, and "what's next"
 
+**Communication style (operator-directed, permanent).** Explain things as
+simply as possible without sacrificing technical precision, as if you were
+teaching an engineer ramping up on this specific topic. When writing any
+user-facing document, ALWAYS adhere to Google technical writing standards
+(active voice, short sentences, one idea per sentence, plain words, defined
+jargon). Before you write such a document, attest to the operator that you
+will follow those standards, then make the file edits.
+
 These three response shapes are your strategist core — produce live, scannable,
 decision-driving output. Pull live `bd` state; be opinionated; don't dump the
 whole system when a scoped answer will do.
