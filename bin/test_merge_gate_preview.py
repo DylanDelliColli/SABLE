@@ -19,6 +19,7 @@ Real git composition (a temp repo + stub gh, and the promote exit-code taxonomy
 regression) lives in hooks/test/test-preview-kick.sh.
 """
 import importlib.util
+import json
 import subprocess
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -522,3 +523,55 @@ def test_find_stale_green_preview_reads_only(monkeypatch):
     _verdict(monkeypatch, "success")
     preview_lib.find_stale_green_preview(REPO, REMOTE, BRANCH, BASE_SHA, BRANCH_SHA)
     assert [c for c in fake.calls if c[0] in ("push", "commit-tree", "merge-tree")] == []
+
+
+# --- report_verdict (Chuck's non-blocking read-verdict CLI leg) --------------
+#
+# SABLE-fewih: unlike wait_for_ci, this leg has no timeout to converge through,
+# so a gh non-answer must print something OTHER than 'pending' — otherwise a
+# broken/missing gh is indistinguishable from a genuinely in-flight run.
+
+def test_report_verdict_prints_pending_for_a_genuinely_in_flight_run(monkeypatch, capsys):
+    fake, _ = _kicked_fake()
+    monkeypatch.setattr(git_lib, "_git", fake)
+    monkeypatch.setattr(preview_lib, "read_verdict",
+                        lambda repo, ref, sha: classify.Verdict(
+                            "pending", "", sha, ref, source="precomputed",
+                            complete=False, answered=True))
+    rc = preview_lib.report_verdict(BRANCH, BASE, REPO, REMOTE, as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert out["state"] == "pending"
+    assert out["promotable"] is False
+
+
+def test_report_verdict_prints_unknown_when_gh_gave_no_answer(monkeypatch, capsys):
+    """gh missing/erroring/hanging -> read_verdict's answered=False. This must
+    read as 'unknown', NOT 'pending' — the bug this bead exists to fix."""
+    fake, _ = _kicked_fake()
+    monkeypatch.setattr(git_lib, "_git", fake)
+    monkeypatch.setattr(preview_lib, "read_verdict",
+                        lambda repo, ref, sha: classify.Verdict(
+                            "pending", "", sha, ref, source="precomputed",
+                            complete=False, answered=False))
+    rc = preview_lib.report_verdict(BRANCH, BASE, REPO, REMOTE, as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert out["state"] == "unknown"
+    assert out["state"] != "pending"
+    assert out["promotable"] is False
+
+
+def test_report_verdict_prints_none_when_nothing_was_kicked(monkeypatch, capsys):
+    """No ref at all (never kicked) stays its own distinct state — not
+    conflated with either pending or unknown."""
+    monkeypatch.setattr(git_lib, "_git", FakeGit())
+
+    def _boom(*a, **kw):
+        raise AssertionError("nothing was kicked; read_verdict must not be called")
+    monkeypatch.setattr(preview_lib, "read_verdict", _boom)
+    rc = preview_lib.report_verdict(BRANCH, BASE, REPO, REMOTE, as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert out["state"] == "none"
+    assert out["promotable"] is False

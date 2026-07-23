@@ -117,6 +117,17 @@ class Verdict:
     `complete` is False only for the sentinel returned when nothing is known yet
     (a pending run), which read_verdict uses to say "come back later" without
     inventing a conclusion.
+
+    `answered` is False only when `complete` is also False AND the reason is
+    that no answer was obtainable at all (gh missing, erroring, or hanging —
+    read_verdict's _gh_runs returning None) rather than gh having genuinely
+    answered "no completed run yet". Both collapse to the same `complete=False`
+    sentinel because promote's fallthrough to wait_for_ci treats them alike
+    (SABLE-jd5fj.3) — wait_for_ci owns the grace/actions_down distinction for
+    that path. But a NON-BLOCKING caller like report_verdict has no wait loop to
+    converge through, so `answered` is what lets it tell "gh could not be asked"
+    apart from "asked, still running" instead of printing 'pending' for both
+    (SABLE-fewih).
     """
     conclusion: str
     run_url: str = ""
@@ -124,6 +135,7 @@ class Verdict:
     ref: str = ""
     source: str = "waited"
     complete: bool = True
+    answered: bool = True
 
     @property
     def outcome(self) -> str:

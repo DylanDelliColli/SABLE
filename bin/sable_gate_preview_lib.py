@@ -299,11 +299,15 @@ def read_verdict(repo: str, ref_branch: str, preview_sha: str) -> classify.Verdi
     outcome is this one call. Returns a Verdict with complete=False when no
     COMPLETED run for this SHA is visible yet — pending, or unreadable — which is
     the caller's cue to wait (promote) or report 'pending' (the verdict CLI).
-    A non-answer is never turned into a conclusion here."""
+    A non-answer is never turned into a conclusion here. Non-answers (gh
+    missing/erroring/timing out inside _gh_runs) also carry answered=False, so
+    report_verdict — which has no wait loop to converge through — can print a
+    distinct 'unknown' instead of a 'pending' indistinguishable from a
+    genuinely in-flight run (SABLE-fewih)."""
     runs = _gh_runs(repo, ref_branch, "databaseId,headSha,status,conclusion,url")
     if runs is None:
         return classify.Verdict("pending", "", preview_sha, ref_branch,
-                                source="precomputed", complete=False)
+                                source="precomputed", complete=False, answered=False)
     for r in runs:
         if r.get("headSha") != preview_sha:
             continue
@@ -476,9 +480,12 @@ def report_verdict(branch: str, base: str, repo: str, remote: str, as_json: bool
     than discovering each outcome only by starting a promote and blocking on it.
 
     States: green / red / retry (cancelled) / pending (running or not started) /
-    none (nothing kicked for this exact base+branch pair). Always exits 0 when it
-    can answer at all — a verdict read is an observation, not a gate, and callers
-    branch on the printed state. Exit 3 only if base/branch cannot be resolved."""
+    unknown (gh could not be asked at all — missing, erroring, or timing out;
+    NOT the same as pending, which means gh answered and the run is genuinely
+    in flight — SABLE-fewih) / none (nothing kicked for this exact base+branch
+    pair). Always exits 0 when it can answer at all — a verdict read is an
+    observation, not a gate, and callers branch on the printed state. Exit 3
+    only if base/branch cannot be resolved."""
     base_ref = classify.qualify_remote_ref(remote, base)
     branch_ref = classify.qualify_remote_ref(remote, branch)
     git_lib._git(repo, "fetch", remote, base, branch, check=False)
@@ -491,7 +498,12 @@ def report_verdict(branch: str, base: str, repo: str, remote: str, as_json: bool
         state, verdict = "none", classify.Verdict("none", "", "", ref, complete=False)
     else:
         verdict = read_verdict(repo, ref, kicked)
-        state = "pending" if not verdict.complete else verdict.outcome
+        if verdict.complete:
+            state = verdict.outcome
+        elif not verdict.answered:
+            state = "unknown"
+        else:
+            state = "pending"
 
     if as_json:
         print(json.dumps({
