@@ -568,6 +568,22 @@ def test_bundled_siblings_are_not_candidates_for_their_own_overlap_check():
     assert verdict.decision == "none"
 
 
+def test_bundle_members_do_not_block_their_own_dispatch():
+    """SABLE-k9syl (the LIVE reproduction of this bead: tarzan's real 3-bead
+    bundle self-denied and stranded all three claims). Same defect as above at
+    the size it actually fired: a lead and TWO siblings all declaring the same
+    file. Nothing in the fix may be arity-sensitive — excluding "the sibling"
+    is not the same as excluding "every member"."""
+    fp = "S.\n\n## File footprint\nshared.py"
+    lead = {"id": "X-1", "description": fp}
+    sib_a = {"id": "X-2", "description": fp, "status": "in_progress",
+             "assignee": "tarzan"}
+    sib_b = {"id": "X-3", "description": fp, "status": "in_progress",
+             "assignee": "tarzan"}
+    verdict = ssw.overlap_check("X-1", lead, [sib_a, sib_b], [sib_a, sib_b])
+    assert verdict.decision == "none", verdict.message
+
+
 def test_a_foreign_in_progress_bead_still_denies_a_bundled_dispatch():
     """LOAD-BEARING NEGATIVE CONTROL. 'Skip the bundle' must not degrade into
     'skip everything' — that is the gate-that-can-never-deny failure, the exact
@@ -644,6 +660,16 @@ class _RecordingBd:
 
     def run_write(self, args, **kwargs):
         self.calls.append(list(args))
+        # APPLY the write, don't just record it — otherwise "the beads are still
+        # open afterwards" would be true of a recorder that ignores claims, and
+        # the pool-unchanged assertion would prove nothing (SABLE-k9syl).
+        if args[:2] == ["bd", "update"] and args[2] in self.beads:
+            bead = self.beads[args[2]]
+            if "--claim" in args:
+                bead["status"] = "in_progress"
+                bead["assignee"] = "test-worker"
+            elif "--status" in args:
+                bead["status"] = args[args.index("--status") + 1]
         return subprocess.CompletedProcess(args, 0, "", "")
 
     @property
@@ -656,13 +682,16 @@ def _denied_dispatch(monkeypatch, tmp_path, bundle: bool):
     """Drive main() to a genuine overlap DENIAL (exit 11) against a foreign
     in-progress bead, and return the recorder. `--worktree` points at a temp
     path so no worktree-evidence and no git/tmux mutation is involved."""
+    fp = "S.\n\n## File footprint\nshared.py"
     lead = {"id": "X-1", "title": "lead", "labels": [], "status": "open",
-            "assignee": None, "description": "S.\n\n## File footprint\nshared.py"}
-    sibling = {"id": "X-2", "title": "sib", "labels": [], "status": "open",
-               "assignee": None, "description": "S.\n\n## File footprint\nshared.py"}
+            "assignee": None, "description": fp}
+    sib_a = {"id": "X-2", "title": "sib a", "labels": [], "status": "open",
+             "assignee": None, "description": fp}
+    sib_b = {"id": "X-3", "title": "sib b", "labels": [], "status": "open",
+             "assignee": None, "description": fp}
     foreign = {"id": "Y-9", "title": "foreign", "labels": [], "status": "in_progress",
                "assignee": "optimus", "metadata": {"wip_claims": "shared.py"}}
-    rec = _RecordingBd({"X-1": lead, "X-2": sibling, "Y-9": foreign})
+    rec = _RecordingBd({"X-1": lead, "X-2": sib_a, "X-3": sib_b, "Y-9": foreign})
     monkeypatch.setattr(ssw, "_run", rec.run_read)
     monkeypatch.setattr(ssw.subprocess, "run", rec.run_write)
     for var in ("SABLE_WORKER_PANE", "CLAUDE_AGENT_NAME", "SABLE_LANE", "SABLE_ROLE"):
@@ -671,20 +700,26 @@ def _denied_dispatch(monkeypatch, tmp_path, bundle: bool):
     argv = ["X-1", "--worktree", str(tmp_path / "wt"), "--session", "sable",
             "--model", "haiku"]
     if bundle:
-        argv += ["--bundle", "X-2"]
+        argv += ["--bundle", "X-2,X-3"]
     return rec, ssw.main(argv)
 
 
-def test_denied_dispatch_claims_no_bead_at_all(monkeypatch, tmp_path):
-    """THE BEAD, defect 2. The claim used to run BEFORE the overlap gate, so a
-    refusal left the lead (and every bundled sibling) in_progress with no worker:
-    invisible as available work, and counted as live concurrent work by the next
-    dispatch's overlap check. A refused dispatch must write nothing."""
+def test_refused_dispatch_leaves_no_claim(monkeypatch, tmp_path):
+    """THE BEAD, defect 2, at SABLE-k9syl's precision: after a refusing gate the
+    BEAD POOL IS BYTE-IDENTICAL to how the dispatch found it — status AND
+    assignee, for every bead named on the command line, not just the lead.
+
+    Asserted two ways, because they are different claims. (1) No bd WRITE was
+    issued at all — the strongest form, since a write that never happened cannot
+    have changed a field this test forgot to check. (2) The recorded beads still
+    read open/unassigned, which is the fact an operator would check with
+    `bd show`. Pre-fix, all three sat in_progress with no worker."""
     rec, code = _denied_dispatch(monkeypatch, tmp_path, bundle=True)
     assert code == 11
     assert rec.writes == [], rec.writes
-    # specifically: neither bead was transitioned out of open
-    assert all("--claim" not in c and "in_progress" not in c for c in rec.writes)
+    for bid in ("X-1", "X-2", "X-3"):
+        assert rec.beads[bid]["status"] == "open", bid
+        assert not rec.beads[bid]["assignee"], bid
 
 
 def test_denied_single_bead_dispatch_claims_nothing_either(monkeypatch, tmp_path):
@@ -695,14 +730,16 @@ def test_denied_single_bead_dispatch_claims_nothing_either(monkeypatch, tmp_path
 
 
 def test_allowed_dispatch_still_claims_the_lead_and_the_bundle(monkeypatch, tmp_path):
-    """LOAD-BEARING COMPLEMENT: moving the claims below the gate must not turn
-    into never claiming. With no overlapping in-progress work, the gate releases
-    and BOTH bundle members are claimed before the pane work begins."""
-    lead = {"id": "X-1", "title": "lead", "labels": [], "status": "open",
-            "assignee": None, "description": "S.\n\n## File footprint\nshared.py"}
-    sibling = {"id": "X-2", "title": "sib", "labels": [], "status": "open",
-               "assignee": None, "description": "S.\n\n## File footprint\nshared.py"}
-    rec = _RecordingBd({"X-1": lead, "X-2": sibling})
+    """LOAD-BEARING COMPLEMENT, and the POSITIVE CONTROL for the assignee
+    assertion above: moving the claims below the gate must not turn into never
+    claiming. With no overlapping in-progress work the gate releases, and every
+    bundle member ends up in_progress WITH an assignee — so "no assignee after a
+    refusal" cannot pass merely because the field is never written at all."""
+    fp = "S.\n\n## File footprint\nshared.py"
+    rec = _RecordingBd({
+        bid: {"id": bid, "title": bid, "labels": [], "status": "open",
+              "assignee": None, "description": fp}
+        for bid in ("X-1", "X-2", "X-3")})
     monkeypatch.setattr(ssw, "_run", rec.run_read)
     monkeypatch.setattr(ssw.subprocess, "run", rec.run_write)
     for var in ("SABLE_WORKER_PANE", "CLAUDE_AGENT_NAME", "SABLE_LANE", "SABLE_ROLE"):
@@ -711,9 +748,12 @@ def test_allowed_dispatch_still_claims_the_lead_and_the_bundle(monkeypatch, tmp_
     monkeypatch.setenv("SABLE_DISPATCH_DIR", str(tmp_path / "dd"))
     monkeypatch.setenv("SABLE_DISPATCH_READY_TIMEOUT", "0")
     ssw.main(["X-1", "--worktree", str(tmp_path / "wt"), "--session", "sable",
-              "--model", "haiku", "--bundle", "X-2"])
+              "--model", "haiku", "--bundle", "X-2,X-3"])
     claimed = [c for c in rec.calls if c[:2] == ["bd", "update"] and "--claim" in c]
-    assert [c[2] for c in claimed] == ["X-1", "X-2"], rec.calls
+    assert [c[2] for c in claimed] == ["X-1", "X-2", "X-3"], rec.calls
+    for bid in ("X-1", "X-2", "X-3"):
+        assert rec.beads[bid]["status"] == "in_progress", bid
+        assert rec.beads[bid]["assignee"], bid
 
 
 def test_preempt_check_blocks_on_p0_in_inbox():

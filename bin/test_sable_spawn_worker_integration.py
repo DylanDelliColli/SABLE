@@ -1978,6 +1978,15 @@ def _status(repo: Path, bead_id: str) -> str:
     return json.loads(_bd(repo, "show", bead_id, "--json"))[0]["status"]
 
 
+def _status_and_assignee(repo: Path, bead_id: str) -> tuple[str, str]:
+    """SABLE-k9syl: a refused dispatch must leave the pool byte-identical, which
+    is a claim about ASSIGNEE as well as status — `bd update --claim` writes
+    both, and a release that restored only the status would leave a bead that
+    reads unowned-but-owned to anything matching on assignee."""
+    bead = json.loads(_bd(repo, "show", bead_id, "--json"))[0]
+    return bead["status"], (bead.get("assignee") or "")
+
+
 def _real_bd_env(sock, dd):
     env = {
         **_clean_env(),
@@ -1998,22 +2007,24 @@ _FOOTPRINT = "Story.\n\n## File footprint\nshared_target.py\n\n## Test spec\nx"
 
 
 def test_real_bd_bundle_sharing_a_declared_path_dispatches(sock, real_bd_repo):
-    """THE BEAD, end to end. Two REAL beads in a REAL bd store, both declaring
+    """THE BEAD, end to end, at the size it actually fired (SABLE-k9syl: tarzan's
+    live 3-bead bundle). THREE REAL beads in a REAL bd store, all declaring
     shared_target.py — which is the ordinary reason to bundle them into one
     worktree — dispatched as one bundle through the real CLI. Before the fix the
-    invocation claimed the sibling, then denied itself against that claim:
+    invocation claimed the siblings, then denied itself against its own claims:
 
         - SABLE-bjabn (…, in-progress): hooks/test/test-tier-red-capture.sh
         SCHEDULING CONSTRAINT: dispatch denied.
 
-    Now it spawns, and BOTH beads end up in_progress WITH a worker."""
+    Now it spawns, and ALL THREE beads end up in_progress WITH a worker."""
     _assert_bin_is_this_branch()
     lead = _new_bead(real_bd_repo, "bundle lead", _FOOTPRINT)
-    sib = _new_bead(real_bd_repo, "bundle sibling", _FOOTPRINT)
+    sib_a = _new_bead(real_bd_repo, "bundle sibling a", _FOOTPRINT)
+    sib_b = _new_bead(real_bd_repo, "bundle sibling b", _FOOTPRINT)
 
     with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as wt:
         r = subprocess.run(
-            ["python3", str(BIN), lead, "--bundle", sib,
+            ["python3", str(BIN), lead, "--bundle", f"{sib_a},{sib_b}",
              "--worktree", wt, "--model", "haiku"],
             capture_output=True, text=True, env=_real_bd_env(sock, dd),
             cwd=real_bd_repo,
@@ -2024,49 +2035,80 @@ def test_real_bd_bundle_sharing_a_declared_path_dispatches(sock, real_bd_repo):
 
         # a worker pane really exists for the lead bead
         assert len(_worker_panes(sock, lead)) == 1
-        # and the dispatch prompt binds the worker to BOTH beads
-        assert sib in (Path(dd) / f"{lead}.md").read_text()
+        # and the dispatch prompt binds the worker to ALL THREE beads
+        prompt = (Path(dd) / f"{lead}.md").read_text()
+        assert sib_a in prompt and sib_b in prompt
 
-    # both beads are claimed in the REAL store, matching the pane that exists
-    assert _status(real_bd_repo, lead) == "in_progress"
-    assert _status(real_bd_repo, sib) == "in_progress"
+    # Every bundle member is claimed in the REAL store, matching the live pane —
+    # status AND assignee. This is also the POSITIVE CONTROL for the complement
+    # leg's "no assignee after a refusal": that assertion must not be able to
+    # pass because the field is never written on this path at all.
+    for bid in (lead, sib_a, sib_b):
+        status, assignee = _status_and_assignee(real_bd_repo, bid)
+        assert status == "in_progress", bid
+        assert assignee, bid
 
 
 def test_real_bd_foreign_overlap_denies_and_leaves_the_bundle_open(sock, real_bd_repo):
-    """COMPLEMENT LEG, and it carries both halves of the acceptance criteria.
+    """COMPLEMENT LEG, carrying every acceptance criterion at once (SABLE-k9syl).
 
-    (1) The constraint is still REAL: a genuinely FOREIGN in-progress bead
-        holding shared_target.py denies the same bundle that just dispatched
-        cleanly above. Without this, the fix is a gate that can never deny.
-    (2) Defect 2: the refusal leaves NOTHING claimed. Pre-fix, both bundle beads
-        sat in_progress with no worker — invisible as available work and counted
-        as live concurrent work by every later overlap check in the fleet, so a
-        denied dispatch made the NEXT dispatch more likely to be denied against
-        work that does not exist."""
+    (1) The constraint is still REAL: a genuinely UNRELATED in-progress bead
+        holding shared_target.py denies the same 3-bead bundle that dispatched
+        cleanly above. Without this, the fix is a gate that can never deny —
+        which is worse than the bug.
+    (2) The refusal is FOR THE UNRELATED BEAD ONLY: it names the foreigner and
+        names NONE of the bundle's own members.
+    (3) Defect 2, at full precision: after the refusal the bead pool is
+        byte-identical to how the dispatch found it — all three members `open`
+        with NO assignee. Pre-fix, all three sat in_progress with no worker,
+        invisible as available work and counted as live concurrent work by
+        every later overlap check in the fleet, so a denied dispatch made the
+        NEXT dispatch more likely to be denied against work that does not
+        exist."""
     _assert_bin_is_this_branch()
     foreign = _new_bead(real_bd_repo, "foreign holder", "Someone else's work.")
     _bd(real_bd_repo, "update", foreign, "--status", "in_progress")
     _bd(real_bd_repo, "update", foreign, "--set-metadata",
         "wip_claims=shared_target.py")
     lead = _new_bead(real_bd_repo, "bundle lead 2", _FOOTPRINT)
-    sib = _new_bead(real_bd_repo, "bundle sibling 2", _FOOTPRINT)
+    sib_a = _new_bead(real_bd_repo, "bundle sibling 2a", _FOOTPRINT)
+    sib_b = _new_bead(real_bd_repo, "bundle sibling 2b", _FOOTPRINT)
+    before = {bid: _status_and_assignee(real_bd_repo, bid)
+              for bid in (lead, sib_a, sib_b)}
+    assert set(before.values()) == {("open", "")}, before
 
     with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as wt:
         r = subprocess.run(
-            ["python3", str(BIN), lead, "--bundle", sib,
+            ["python3", str(BIN), lead, "--bundle", f"{sib_a},{sib_b}",
              "--worktree", wt, "--model", "haiku"],
             capture_output=True, text=True, env=_real_bd_env(sock, dd),
             cwd=real_bd_repo,
         )
         assert r.returncode == 11, f"stdout={r.stdout!r} stderr={r.stderr!r}"
         assert "OVERLAP DETECTED" in r.stderr
-        assert foreign in r.stderr        # the refusal names the real competitor
-        assert sib not in r.stderr.split("OVERLAP DETECTED")[1].split("SCHEDULING")[0]
+        # refused for the UNRELATED bead ONLY — it is named, its own members are not
+        cited = r.stderr.split("OVERLAP DETECTED")[1].split("SCHEDULING")[0]
+        assert foreign in cited
+        for bid in (lead, sib_a, sib_b):
+            assert bid not in cited, f"{bid} (a bundle member) was cited as an overlap"
         assert _worker_panes(sock, lead) == []
 
-    # THE POINT: a dispatch that produced no worker claimed no bead.
-    assert _status(real_bd_repo, lead) == "open"
-    assert _status(real_bd_repo, sib) == "open"
+    # THE POINT: a dispatch that produced no worker left the pool untouched —
+    # status AND assignee, for every bead named on the command line. Asserted as
+    # a whole-pool equality against the pre-dispatch snapshot AND spelled out
+    # per field, because `bd update --claim` writes BOTH: a rollback that
+    # restored only the status would leave a bead reading OPEN while still
+    # ASSIGNED to a lane — the "manager-reassigned, assignee already the lane,
+    # status still OPEN" state this tool already carries special handling for
+    # (SABLE-ixps). That bead looks available and is not: a subtler form of the
+    # residue defect 2 is about, not an absence of it.
+    after = {bid: _status_and_assignee(real_bd_repo, bid)
+             for bid in (lead, sib_a, sib_b)}
+    assert after == before, after
+    for bid in (lead, sib_a, sib_b):
+        status, assignee = after[bid]
+        assert status == "open", bid
+        assert assignee == "", f"{bid} left assigned to {assignee!r} by a refusal"
 
 
 if __name__ == "__main__":
