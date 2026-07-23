@@ -92,6 +92,7 @@ ALLOW=(
   test-quickstart-orchestration.sh
   test-read-guard.sh
   test-registry.sh
+  test-require-all.sh
   test-role-card-install.sh
   test-role.sh
   test-sable-bin-install.sh
@@ -123,6 +124,7 @@ ALLOW=(
   test-tdd-gate.sh
   test-thesis-docs.sh
   test-tier-budget-bead.sh
+  test-tier-red-capture.sh
   test-tier-ssot.sh
   test-tier-ssot-consumers.sh
   test-tmux-roles.sh
@@ -195,7 +197,7 @@ declare -A EXCLUDE=(
 # closed for tier membership.
 declare -A COVERS=(
   [test-active-contracts-integration.sh]="hooks/multi-manager/session-role-anchor.sh"
-  [test-ci-bd-coverage-gap.sh]=".github/ci/shell-run-set.sh hooks/test/test-dep-merge-state.sh hooks/test/test-overlap-dispatch-e2e.sh"
+  [test-ci-bd-coverage-gap.sh]=".github/ci/shell-run-set.sh hooks/test/test-dep-merge-state.sh hooks/test/test-overlap-dispatch-e2e.sh hooks/test/lib-require-all.sh"
   [test-control-trace.sh]="hooks/multi-manager/control-trace.sh"
   [test-dep-merge-state.sh]="bin/sable-dep-check bin/sable-spawn-worker"
   [test-doctor-snapshot-staleness.sh]="bin/sable-doctor bin/sable-bin-install install.sh"
@@ -223,6 +225,7 @@ declare -A COVERS=(
   [test-preview-kick.sh]="hooks/multi-manager/post-push-merge-notify.sh"
   [test-read-guard.sh]="hooks/multi-manager/read-guard.sh"
   [test-registry.sh]="hooks/multi-manager/lib-registry-path.sh"
+  [test-require-all.sh]="hooks/test/lib-require-all.sh"
   [test-role-card-install.sh]="bin/sable-orchestration-install templates/multi-manager/roles/lincoln.md templates/multi-manager/roles/optimus.md templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/chuck.md"
   [test-sable-contained.sh]="bin/sable-contained"
   [test-sable-mode.sh]="hooks/multi-manager/lib-mode-path.sh"
@@ -235,6 +238,7 @@ declare -A COVERS=(
   [test-tdd-evidence.sh]="hooks/tdd-evidence.sh"
   [test-tdd-gate.sh]="hooks/tdd-gate.sh"
   [test-tier-budget-bead.sh]="bin/sable_gate_budget_lib.py bin/sable_gate_promote_lib.py bin/sable-merge-gate"
+  [test-tier-red-capture.sh]="bin/sable_gate_promote_lib.py hooks/test/lib-require-all.sh"
   [test-tier-ssot-consumers.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
   [test-tmux-roles.sh]="templates/multi-manager/roles/lincoln.md templates/multi-manager/roles/optimus.md templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/chuck.md templates/multi-manager/agents.yaml"
   [test-tree-claim.sh]="hooks/multi-manager/tree-claim.sh hooks/multi-manager/tree-claim-impl.sh"
