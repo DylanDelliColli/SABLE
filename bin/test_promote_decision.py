@@ -28,6 +28,7 @@ table consulted in the wrong place proves nothing. Real-git composition —
 including the impact tier actually running against a checked-out combined tree —
 lives in hooks/test/test-optimistic-promotion.sh.
 """
+import ast
 import importlib.util
 import itertools
 import json
@@ -35,6 +36,7 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from importlib.machinery import SourceFileLoader
@@ -712,6 +714,20 @@ def _write_tiers_sh(repo: str, contents: str) -> None:
     path.chmod(0o755)
 
 
+def _tiers_sh_with_budget(merge_preview_budget: int) -> str:
+    """A test-tiers.sh reporting a caller-chosen merge_preview budget, for
+    tests that need to move the SSOT to a SPECIFIC value (not merely a
+    distinctive one) and observe what tracks it."""
+    return (
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "--budget" ] && [ "$2" = "merge_preview" ]; then\n'
+        f"  echo {merge_preview_budget}\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n"
+    )
+
+
 def test_impact_timeout_reads_the_tier_ssot(tmp_path, monkeypatch):
     """(a) A DISTINCTIVE budget (12345 — cannot pass by coincidence against the
     real 900, the ambient-satisfaction trap that cost jd5fj.15 a revise cycle)
@@ -1139,15 +1155,25 @@ def test_lock_wait_is_not_charged_to_the_impact_tier_timeout_budget(isolated_loc
     holder = threading.Thread(target=hold)
     holder.start()
     assert holding.wait(timeout=10), "the holder never acquired the lock"
-    threading.Timer(0.40, release.set).start()
 
+    # SABLE-kq8kn: t0 is captured BEFORE starting the release timer, not after
+    # — under load (e.g. a full bin/ suite run contending for the GIL/CPU),
+    # threading.Timer()'s own thread-creation overhead could land BETWEEN "start
+    # a 0.40s countdown" and "capture t0", silently eating into the margin the
+    # assert below relies on (measured: 0.320s < 0.35s). Capturing t0 first
+    # means any such overhead is counted AS PART OF waited_wall instead of
+    # stolen from it, so the measured wait can only read >= the timer's own
+    # delay, never less. The delay/threshold pair is also widened (0.40s/0.30s,
+    # a 0.10s margin instead of 0.05s) as defense in depth against poll-loop
+    # granularity (impact_tier_lock polls every 0.05s) on a loaded box.
     t0 = time.monotonic()
+    threading.Timer(0.40, release.set).start()
     outcome, detail = promote_lib.run_impact_tier(repo, sha, ["bin/thing.py"])
     waited_wall = time.monotonic() - t0
     holder.join(timeout=10)
 
     assert outcome == promote_lib.IMPACT_GREEN, detail
-    assert waited_wall >= 0.35, f"the queued tier did not actually wait ({waited_wall:.3f}s)"
+    assert waited_wall >= 0.30, f"the queued tier did not actually wait ({waited_wall:.3f}s)"
     assert seen, "the tier ran no timed subprocess, so this asserts nothing"
     assert set(seen) == {123.0}, (
         f"a queued tier was handed a reduced budget {sorted(set(seen))} instead of the full "
@@ -1405,7 +1431,7 @@ def test_phase_report_on_zero_records_states_zero_not_an_inferred_split(isolated
 @pytest.fixture()
 def clean_budget_env(monkeypatch):
     for var in ("SABLE_MG_IMPACT_TIMEOUT", "SABLE_MG_IMPACT_LOCK_TIMEOUT",
-                "SABLE_MG_IMPACT_SERIALIZE"):
+                "SABLE_MG_IMPACT_SERIALIZE", "SABLE_MG_COVERAGE_FLOOR_TIMEOUT"):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
 
@@ -1415,19 +1441,29 @@ def test_impact_budget_is_queryable(clean_budget_env, capsys):
     value TRACKS the env when overridden — so a wrapper that derives from it
     cannot go stale the way a copied constant did.
 
-    Worst case is the SUM, not the tier budget. The lock wait is deliberately
-    outside the tier's own budget (jd5fj.13, asserted by
+    Worst case is the SUM of THREE terms, not the tier budget alone. The lock
+    wait is deliberately outside the tier's own budget (jd5fj.13, asserted by
     test_lock_wait_is_not_charged_to_the_impact_tier_timeout_budget), which is
-    exactly why a wrapper sized to the tier alone is MORE wrong after that bead,
-    not less: under a burst the queue wait alone can exceed it."""
+    exactly why a wrapper sized to the tier alone is MORE wrong after that
+    bead, not less: under a burst the queue wait alone can exceed it.
+
+    THE COVERAGE FLOOR IS THE THIRD TERM (SABLE-5v3d5). assert_coverage_floor's
+    subprocess check runs INSIDE promote(), before the queue wait or the tier
+    even start, so its ceiling is spent on every promote of a pruning diff —
+    omitting it from the sum is the exact defect this bead fixes. Every value
+    below is set explicitly (never left to the ambient repo's own SSOT) so this
+    test cannot pass by an accident of what merge_preview's budget happens to
+    be today."""
     monkeypatch = clean_budget_env
+    monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "900")
 
     stock = promote_lib.impact_budget()
     assert stock["tier_timeout_s"] == 900.0
     assert stock["lock_timeout_s"] == 3600.0
-    assert stock["worst_case_s"] == 4500.0, (
-        "worst case must be queue + tier; reporting the tier budget alone is the "
-        "exact mis-sizing SABLE-w0zjm exists to prevent")
+    assert stock["coverage_floor_timeout_s"] == 900.0
+    assert stock["worst_case_s"] == 5400.0, (
+        "worst case must be queue + tier + coverage floor; omitting any one "
+        "term is the exact mis-sizing SABLE-w0zjm/SABLE-5v3d5 exist to prevent")
     assert stock["serialized"] is True
 
     # Headroom is real headroom: strictly above the worst case, and an integer a
@@ -1435,28 +1471,99 @@ def test_impact_budget_is_queryable(clean_budget_env, capsys):
     assert isinstance(stock["recommended_wrapper_timeout_s"], int)
     assert stock["recommended_wrapper_timeout_s"] > stock["worst_case_s"]
 
-    # Tracking, both knobs, so neither can silently stop being reported.
+    # Tracking, all three knobs, so none can silently stop being reported.
     monkeypatch.setenv("SABLE_MG_IMPACT_TIMEOUT", "123")
     monkeypatch.setenv("SABLE_MG_IMPACT_LOCK_TIMEOUT", "456")
+    monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "789")
     tuned = promote_lib.impact_budget()
-    assert (tuned["tier_timeout_s"], tuned["lock_timeout_s"]) == (123.0, 456.0)
-    assert tuned["worst_case_s"] == 579.0
-    assert tuned["recommended_wrapper_timeout_s"] > 579
+    assert (tuned["tier_timeout_s"], tuned["lock_timeout_s"],
+            tuned["coverage_floor_timeout_s"]) == (123.0, 456.0, 789.0)
+    assert tuned["worst_case_s"] == 1368.0
+    assert tuned["recommended_wrapper_timeout_s"] > 1368
 
     # With serialization off there is no queue to wait in, so charging the
-    # wrapper for one would overstate the budget rather than understate it.
+    # wrapper for one would overstate the budget rather than understate it —
+    # but the coverage floor is UNAFFECTED by that knob: it runs on every
+    # pruning diff regardless of whether the impact tier is ever serialized.
     monkeypatch.setenv("SABLE_MG_IMPACT_SERIALIZE", "0")
     off = promote_lib.impact_budget()
     assert off["lock_timeout_s"] == 0.0
-    assert off["worst_case_s"] == off["tier_timeout_s"] == 123.0
+    assert off["worst_case_s"] == off["tier_timeout_s"] + off["coverage_floor_timeout_s"] == 912.0
     assert off["serialized"] is False
+
+    # The decomposition keys are present and PROVABLY sum to the total, so a
+    # future reader can attribute a change in worst_case_s to a specific term.
+    for budget in (stock, tuned, off):
+        assert (budget["tier_timeout_s"] + budget["lock_timeout_s"]
+                + budget["coverage_floor_timeout_s"]) == budget["worst_case_s"]
 
     # The human breakdown names WHICH number is which — a wrapper author reading
     # only one line must not be able to grab the wrong one.
     text = promote_lib.format_impact_budget(stock)
     assert "SABLE_MG_IMPACT_LOCK_TIMEOUT" in text and "SABLE_MG_IMPACT_TIMEOUT" in text
-    assert "4500" in text and str(stock["recommended_wrapper_timeout_s"]) in text
+    assert "SABLE_MG_COVERAGE_FLOOR_TIMEOUT" in text
+    assert "5400" in text and str(stock["recommended_wrapper_timeout_s"]) in text
     capsys.readouterr()
+
+
+def test_impact_budget_worst_case_tracks_the_coverage_floor_ssot_in_isolation(
+        clean_budget_env, tmp_path):
+    """NEGATIVE CONTROL, load-bearing (SABLE-5v3d5). Before this bead,
+    _coverage_floor_timeout() derived from the merge_preview SSOT (cmar4.9)
+    but impact_budget()['worst_case_s'] never read it — so moving the SSOT
+    moved _coverage_floor_timeout()'s own return value while worst_case_s
+    stayed exactly the same. That is precisely what happened in the wild:
+    cmar4.9 re-pinned the coverage floor from a hardcoded 600 to the
+    merge_preview SSOT (900 today), and `sable-merge-gate promote-budget`
+    read 5400 before and after, because the changed term was never a
+    summand. Tier and lock are pinned via env override here so ONLY the
+    coverage floor moves — a test that let tier float too could pass even if
+    the sum still silently dropped the coverage-floor term, exactly like
+    test_impact_budget_is_queryable's own predecessor did."""
+    monkeypatch = clean_budget_env
+    monkeypatch.setenv("SABLE_MG_IMPACT_TIMEOUT", "100")
+    monkeypatch.setenv("SABLE_MG_IMPACT_LOCK_TIMEOUT", "200")
+    monkeypatch.delenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", raising=False)
+
+    repo, _ = _real_repo(tmp_path)
+    _write_tiers_sh(repo, _DISTINCTIVE_COVERAGE_BUDGET_TIERS_SH)  # merge_preview=54321
+    before = promote_lib.impact_budget(repo)
+    assert before["coverage_floor_timeout_s"] == 54321.0
+    assert before["worst_case_s"] == 100.0 + 200.0 + 54321.0
+
+    _write_tiers_sh(repo, _tiers_sh_with_budget(600))
+    after_small = promote_lib.impact_budget(repo)
+    assert after_small["coverage_floor_timeout_s"] == 600.0
+    assert after_small["worst_case_s"] == 100.0 + 200.0 + 600.0
+
+    _write_tiers_sh(repo, _tiers_sh_with_budget(900))
+    after_big = promote_lib.impact_budget(repo)
+    assert after_big["coverage_floor_timeout_s"] == 900.0
+    assert after_big["worst_case_s"] == 100.0 + 200.0 + 900.0
+
+    # THE CHECK ITSELF: the coverage-floor term moved (600 -> 900) and
+    # worst_case_s MUST move with it, by exactly the delta.
+    assert after_big["worst_case_s"] != after_small["worst_case_s"], (
+        "the coverage-floor SSOT moved but worst_case_s did not -- the exact "
+        "instrument-blindness SABLE-5v3d5 reports")
+    assert (after_big["worst_case_s"] - after_small["worst_case_s"]
+            == after_big["coverage_floor_timeout_s"] - after_small["coverage_floor_timeout_s"]
+            == 300.0)
+
+
+def test_impact_budget_worst_case_sum_is_wrong_for_a_reverted_two_term_sum():
+    """PLANT-AND-FAIL (SABLE-5lli.7 pattern). Reproduces the PRE-fix shape of
+    impact_budget() inline -- worst = tier + lock, exactly as it read before
+    this bead -- and proves the SAME equality assertion the tests above rely
+    on (worst_case_s == tier + lock + coverage_floor) correctly REJECTS it.
+    If this assertion could not tell the two-term sum apart from the
+    three-term one, the tests above would pass today for the wrong reason,
+    the exact "two errors cancel" trap this bead's own dispatch calls out."""
+    tier, lock, coverage_floor = 900.0, 3600.0, 900.0
+    reverted_worst_case_s = tier + lock  # the bug, reproduced on purpose
+    assert reverted_worst_case_s != tier + lock + coverage_floor, (
+        "the reverted two-term sum must be distinguishable from the correct "
+        "three-term sum, or the equality checks above are vacuous")
 
 
 def test_the_cli_reports_the_same_budget_the_library_computes(clean_budget_env, capsys):
@@ -1466,6 +1573,7 @@ def test_the_cli_reports_the_same_budget_the_library_computes(clean_budget_env, 
     monkeypatch = clean_budget_env
     monkeypatch.setenv("SABLE_MG_IMPACT_TIMEOUT", "200")
     monkeypatch.setenv("SABLE_MG_IMPACT_LOCK_TIMEOUT", "400")
+    monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "111")
     expected = promote_lib.impact_budget()
 
     assert smg.main(["promote-budget", "--seconds"]) == 0
@@ -1481,13 +1589,111 @@ def test_the_cli_reports_the_same_budget_the_library_computes(clean_budget_env, 
 
     # No --repo, no git, no network: a wrapper must be able to ask BEFORE it has
     # chosen a repo, and asking must never be able to fail the promote it wraps.
+    # All three knobs are explicit overrides here (SABLE_MG_COVERAGE_FLOOR_TIMEOUT
+    # included) so the comparison does not depend on whatever cwd="/" (no
+    # .github/ci/test-tiers.sh) falls back to for the un-overridden knobs.
     proc = subprocess.run([sys.executable, str(_BIN / "sable-merge-gate"),
                            "promote-budget", "--seconds"],
                           cwd="/", text=True, capture_output=True,
                           env={**os.environ, "SABLE_MG_IMPACT_TIMEOUT": "200",
-                               "SABLE_MG_IMPACT_LOCK_TIMEOUT": "400"})
+                               "SABLE_MG_IMPACT_LOCK_TIMEOUT": "400",
+                               "SABLE_MG_COVERAGE_FLOOR_TIMEOUT": "111"})
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == str(expected["recommended_wrapper_timeout_s"])
+
+
+# --------------------------------------------------------------------------
+# Promote-path timeout completeness (SABLE-5v3d5) -- the general fix
+# --------------------------------------------------------------------------
+#
+# impact_budget()'s coverage-floor omission happened because nothing enforced
+# the coupling between "a bounded subprocess call lives in promote()'s path"
+# and "its ceiling is a term in impact_budget()'s sum" -- the coupling was
+# maintained by memory. unbudgeted_promote_timeouts() derives promote()'s
+# real call graph from the AST and flags any `timeout=`-bearing call whose
+# source is neither a registered budget term nor a documented exclusion.
+
+def test_promote_path_timeout_completeness_is_clean_today():
+    """Running the real check against this module's own source: every
+    `timeout=`-bearing call reachable from promote() is either counted in
+    impact_budget() or explicitly, visibly excused (see
+    _KNOWN_UNBUDGETED_PROMOTE_TIMEOUTS) -- never silently missing both."""
+    gaps = promote_lib.unbudgeted_promote_timeouts(promote_lib.promote_module_ast())
+    assert gaps == [], (
+        f"promote() reaches a bounded call with no budget term and no "
+        f"documented exclusion: {gaps}")
+
+
+def test_promote_path_timeout_completeness_fires_on_a_planted_unbudgeted_timeout():
+    """COMPLETENESS, non-vacuous (SABLE-5v3d5): the point of this whole test.
+    A SYNTHETIC call graph -- not this module's real source -- with a fresh
+    helper function reachable from `promote` that bounds a subprocess with a
+    timeout= this check has never seen. Proves the check DETECTS a gap,
+    rather than merely observing that today's real code happens to have
+    none (a completeness check that has never been shown to fail is
+    indistinguishable from one that cannot)."""
+    src = textwrap.dedent("""
+        def _new_bounded_step(repo):
+            return 42
+
+        def promote(repo):
+            subprocess.run(["true"], timeout=_new_bounded_step(repo))
+            return 0
+    """)
+    tree = ast.parse(src)
+    gaps = promote_lib.unbudgeted_promote_timeouts(tree)
+    assert gaps == [("promote", "_new_bounded_step")], gaps
+
+
+def test_promote_path_timeout_completeness_ignores_a_registered_source():
+    """Non-vacuity in the other direction: a call whose source IS registered
+    must not be flagged, or the check would be useless noise on every green
+    run."""
+    src = textwrap.dedent("""
+        def _impact_timeout(repo):
+            return 900
+
+        def promote(repo):
+            subprocess.run(["true"], timeout=_impact_timeout(repo))
+            return 0
+    """)
+    tree = ast.parse(src)
+    assert promote_lib.unbudgeted_promote_timeouts(tree) == []
+
+
+def test_promote_path_timeout_completeness_does_not_follow_unreachable_functions():
+    """Scoped to promote()'s OWN wall-clock, not every `timeout=` in the
+    module: a bounded call in a function promote() never calls (directly or
+    transitively) -- e.g. warm_gate_testmon_cache, a separate CLI entry point
+    promote() never reaches -- must not be flagged."""
+    src = textwrap.dedent("""
+        def unrelated_cli_command(repo):
+            subprocess.run(["true"], timeout=1800)
+
+        def promote(repo):
+            return 0
+    """)
+    tree = ast.parse(src)
+    assert promote_lib.unbudgeted_promote_timeouts(tree) == []
+
+
+def test_promote_path_timeout_completeness_flags_a_changed_literal_in_a_known_exclusion():
+    """The (function, literal) exclusion is exact, not a function-name
+    allowlist: if a currently-excused incidental timeout's literal ever
+    changes -- the same way the coverage floor's own 600 once did -- it must
+    fall through as a FRESH gap rather than staying silently excused under
+    its old value."""
+    src = textwrap.dedent("""
+        def _report_identifier_decay(branch):
+            subprocess.run(["true"], timeout=45)
+
+        def promote(repo):
+            _report_identifier_decay(repo)
+            return 0
+    """)
+    tree = ast.parse(src)
+    assert promote_lib.unbudgeted_promote_timeouts(tree) == [
+        ("_report_identifier_decay", "45")]
 
 
 def test_entering_the_impact_tier_is_announced_even_with_no_queue_wait(isolated_lock,
