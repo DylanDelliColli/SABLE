@@ -146,6 +146,15 @@ ref whose Actions run is still in-flight, however old the ref's commit date —
 deleting the ref cancels the run, which is exactly the spurious-RED failure
 SABLE-sc24 exists to prevent.
 
+`sweep --dry-run` (SABLE-o9b8u) reports the exact candidate list — same age
+filter, same in-flight exclusion — WITHOUT deleting anything. The default's
+safety is a function of how recently the sweep last ran and the command has no
+memory of that: an identical --max-age-hours 6 deletes 3 refs run daily and 232
+after a multi-day gap, and nothing about the command distinguishes those cases
+before it acts on the shared remote. --dry-run is the look-before-you-leap.
+Both dry and real runs report the candidate COUNT and age span BEFORE any
+deletion is attempted.
+
 Prior art: the throwaway-branch pattern from the 754r verification (ci-verify-754r).
 
 Usage:
@@ -157,7 +166,7 @@ Usage:
                            [--repo <path>] [--remote <name>]
   sable-merge-gate verdict --branch <worker-branch> [--base <branch>] [--json]
                            [--repo <path>] [--remote <name>]
-  sable-merge-gate sweep   [--max-age-hours N] [--repo <path>] [--remote <name>]
+  sable-merge-gate sweep   [--max-age-hours N] [--dry-run] [--repo <path>] [--remote <name>]
   sable-merge-gate promote-budget [--json | --seconds]
   sable-merge-gate impact-tier-phases [--repo <path>] [--json]
   sable-merge-gate --help
@@ -363,6 +372,11 @@ def main(argv: list[str] | None = None) -> int:
                     default=float(os.environ.get("SABLE_MG_SWEEP_HOURS", "6")))
     ps.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
     ps.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
+    ps.add_argument("--dry-run", action="store_true", dest="dry_run",
+                    help="report exactly which refs match the age threshold (and would be "
+                         "deleted) without deleting anything (SABLE-o9b8u) — the same "
+                         "candidate list a real run would act on, including the "
+                         "in-flight-run exclusion")
 
     # SABLE-w0zjm. The gate's own worst-case promote wall-clock, so an operator
     # wrapper DERIVES its timeout instead of keeping a second copy of the number.
@@ -418,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
             return preview_lib.report_verdict(args.branch, base, args.repo,
                                               args.remote, args.json)
         if args.command == "sweep":
-            return preview_lib.sweep(args.repo, args.remote, args.max_age_hours)
+            return preview_lib.sweep(args.repo, args.remote, args.max_age_hours, args.dry_run)
         if args.command == "promote-budget":
             budget = promote_lib.impact_budget()
             if args.seconds:

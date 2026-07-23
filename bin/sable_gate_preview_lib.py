@@ -424,8 +424,24 @@ def delete_ci_ref(repo: str, remote: str, ref: str) -> None:
                  "--delete", ref, check=False)
 
 
-def sweep(repo: str, remote: str, max_age_hours: float) -> int:
-    """Delete orphaned ci-verify/* refs older than the threshold."""
+def sweep(repo: str, remote: str, max_age_hours: float, dry_run: bool = False) -> int:
+    """Delete orphaned ci-verify/* refs older than the threshold — or, with
+    dry_run, report exactly what WOULD be deleted and delete nothing
+    (SABLE-o9b8u).
+
+    THE PROBLEM THIS EXISTS FOR: the sweep's safety is a function of how
+    recently it last ran, and the command has no memory of that. The
+    identical --max-age-hours default deletes a handful of refs when run
+    daily and hundreds when run after a gap, and an operator typing the
+    command cannot tell which situation they are in before it acts on a
+    SHARED remote. dry_run is the look-before-you-leap: it walks the exact
+    same candidate list the real run would delete (same age filter, same
+    in-flight-run exclusion) and prints it instead of deleting.
+
+    Scale-proportionate reporting: the candidate COUNT and age span are
+    always printed before any deletion is attempted (dry or real) — a
+    3-ref sweep and a 232-ref sweep should not look like the same amount of
+    ceremony on the way past."""
     git_lib._git(repo, "fetch", remote, "--prune")
     listing = git_lib._git(repo, "for-each-ref", "--format=%(refname:short) %(committerdate:unix)",
                            f"refs/remotes/{remote}/ci-verify/", check=False)
@@ -434,7 +450,7 @@ def sweep(repo: str, remote: str, max_age_hours: float) -> int:
     # refs on the wrong upstream (SABLE-ck05).
     push_remote = git_lib.resolve_remote_url(repo, remote)
     now = time.time()
-    deleted = 0
+    candidates: list[tuple[str, float]] = []  # (branch, age_seconds) — what WOULD be deleted
     spared = 0
     for line in listing.stdout.splitlines():
         parts = line.rsplit(" ", 1)
@@ -450,16 +466,36 @@ def sweep(repo: str, remote: str, max_age_hours: float) -> int:
         branch = short.split("/", 1)[1] if "/" in short else short  # strip remote/ prefix
         # SABLE-sc24: age alone does not make a ref an orphan. A ref whose Actions
         # run is still in-flight is LIVE — deleting it cancels the run and REDs the
-        # gate spuriously. Never reap it, regardless of the ref's commit date.
+        # gate spuriously. Never reap it, regardless of the ref's commit date. This
+        # applies identically in dry_run: a dry run that lists a ref the real run
+        # would spare is not a faithful preview of the real run.
         if ref_has_inflight_run(repo, branch):
             print(f"sable-merge-gate sweep: {branch} is past the {max_age_hours}h age threshold but its "
                   f"Actions run is still in-flight — NOT reaping (deleting it would cancel the run)",
                   file=sys.stderr)
             spared += 1
             continue
+        candidates.append((branch, age))
+
+    spared_note = f" (spared {spared} with an in-flight run)" if spared else ""
+    if candidates:
+        ages_h = sorted(age / 3600 for _, age in candidates)
+        print(f"sable-merge-gate sweep: {len(candidates)} ref(s) match the >{max_age_hours}h age "
+              f"threshold (oldest {ages_h[-1]:.1f}h, newest {ages_h[0]:.1f}h){spared_note}")
+    else:
+        print(f"sable-merge-gate sweep: 0 ref(s) match the >{max_age_hours}h age threshold{spared_note}")
+
+    if dry_run:
+        for branch, age in candidates:
+            print(f"sable-merge-gate sweep --dry-run: would delete {branch} (age {age / 3600:.1f}h)")
+        print(f"sable-merge-gate sweep --dry-run: {len(candidates)} ref(s) would be deleted — "
+              f"nothing deleted (dry run)")
+        return 0
+
+    deleted = 0
+    for branch, _age in candidates:
         git_lib._git(repo, "push", push_remote, "--delete", branch, check=False)
         deleted += 1
-    spared_note = f" (spared {spared} with an in-flight run)" if spared else ""
     print(f"sable-merge-gate sweep: deleted {deleted} orphaned ci-verify ref(s) older than {max_age_hours}h{spared_note}")
     return 0
 
