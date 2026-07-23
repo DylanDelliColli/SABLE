@@ -1130,6 +1130,142 @@ def test_assemble_dispatch_prompt_is_the_sole_render_path_for_respawn():
     assert src.count("assemble_dispatch_prompt(") == 2  # def + the one call site
 
 
+# --- SABLE-h8swc: notes rendered into the dispatch prompt --------------------
+
+def test_dispatch_prompt_includes_bead_notes():
+    """TEST SPEC (SABLE-h8swc): a bead whose notes carry a unique marker must
+    have that marker reach the assembled prompt — notes were previously never
+    rendered anywhere in the prompt path (description-only). Negative control
+    in the SAME test: a bead with NO notes must not grow an empty/dangling
+    notes section, so the fix doesn't emit a vacuous header on every
+    dispatch."""
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="haiku",
+        notes="MARKER-NOTES-4f8a2 — cockpit ruling: do it this other way",
+    )
+    assert "MARKER-NOTES-4f8a2" in p
+
+    p_empty = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="haiku",
+    )
+    assert "## Notes" not in p_empty
+    p_whitespace = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="haiku", notes="   \n  ",
+    )
+    assert "## Notes" not in p_whitespace
+
+
+def test_bundled_sibling_notes_are_rendered_too():
+    """TEST SPEC (SABLE-h8swc): the identical description-only omission
+    existed for --bundle siblings — a sibling's notes marker must also reach
+    the assembled prompt."""
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Lead thing", description="lead desc",
+        worktree="/wt/wk-x", branch="wk-x", model="sonnet",
+        bundle=[
+            {"id": "Y-2", "title": "Sibling one", "description": "sibling one desc",
+             "notes": "MARKER-SIBLING-NOTES-9c31"},
+        ],
+    )
+    assert "MARKER-SIBLING-NOTES-9c31" in p
+
+
+# --- SABLE-pruak: comments rendered into the dispatch prompt -----------------
+
+def test_dispatch_prompt_includes_bead_comments():
+    """TEST SPEC (SABLE-pruak): a bead with a description AND two comments
+    must render BOTH comment bodies, stamped with author/date, newest
+    present. Negative controls in the SAME test: (a) a bead with zero
+    comments renders no empty comments section, and (b) a BUNDLED sibling's
+    comments are rendered too — the bundle path is separate code and is where
+    the notes gap previously hid."""
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="haiku",
+        comments=[
+            {"author": "chuck", "created_at": "2026-07-20T10:00:00Z",
+             "text": "MARKER-COMMENT-OLD-1a2b"},
+            {"author": "optimus", "created_at": "2026-07-22T09:00:00Z",
+             "text": "MARKER-COMMENT-NEW-3c4d overturns the premise"},
+        ],
+    )
+    assert "MARKER-COMMENT-OLD-1a2b" in p
+    assert "MARKER-COMMENT-NEW-3c4d" in p
+    assert "chuck" in p and "optimus" in p
+    assert "2026-07-20T10:00:00Z" in p and "2026-07-22T09:00:00Z" in p
+    # newest present, rendered after the oldest (newest-last)
+    assert p.index("MARKER-COMMENT-OLD-1a2b") < p.index("MARKER-COMMENT-NEW-3c4d")
+
+    # negative control (a): zero comments -> no empty section
+    p_empty = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="haiku", comments=[],
+    )
+    assert "## Comments" not in p_empty
+
+    # negative control (b): bundled sibling's comments are rendered too —
+    # separate code path from the lead bead's own comments render.
+    p_bundle = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Lead thing", description="lead desc",
+        worktree="/wt/wk-x", branch="wk-x", model="sonnet",
+        bundle=[
+            {"id": "Y-2", "title": "Sibling one", "description": "sibling one desc",
+             "comments": [{"author": "tarzan", "created_at": "2026-07-21T00:00:00Z",
+                           "text": "MARKER-SIBLING-COMMENT-7e8f"}]},
+        ],
+    )
+    assert "MARKER-SIBLING-COMMENT-7e8f" in p_bundle
+    assert "tarzan" in p_bundle
+
+
+def test_dispatch_prompt_truncation_is_visible():
+    """TEST SPEC (SABLE-pruak): with more comments than the render limit, the
+    prompt must STATE the total count rather than silently dropping the
+    excess — 'there were more comments' must never be indistinguishable from
+    'there were none'."""
+    limit = ssw.COMMENTS_RENDER_LIMIT
+    total = limit + 5
+    comments = [
+        {"author": f"agent{i}", "created_at": f"2026-07-{i + 1:02d}T00:00:00Z",
+         "text": f"comment body {i}"}
+        for i in range(total)
+    ]
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="haiku", comments=comments,
+    )
+    assert str(total) in p
+    # the oldest comments beyond the limit are the ones dropped; newest kept
+    assert "comment body 0" not in p
+    assert f"comment body {total - 1}" in p
+
+
+# --- SABLE-kv44f: refuse dispatch on empty description + substantive notes --
+
+def test_empty_description_nontrivial_notes_refuses_loudly():
+    """TEST SPEC (SABLE-kv44f): empty desc + big notes -> refuse with a
+    message naming the fold requirement; empty desc + empty notes ->
+    existing (allow) behavior; populated desc + big notes -> dispatch
+    proceeds; whitespace-only desc is treated as empty."""
+    big_notes = "x" * (ssw.DISPATCH_NOTES_THRESHOLD + 1)
+    small_notes = "x" * (ssw.DISPATCH_NOTES_THRESHOLD - 1)
+
+    err = ssw.dispatch_content_guard("", big_notes)
+    assert err is not None
+    assert "fold" in err.lower()
+    assert str(len(big_notes)) in err
+
+    assert ssw.dispatch_content_guard("", "") is None
+    assert ssw.dispatch_content_guard("", small_notes) is None
+    assert ssw.dispatch_content_guard("a real description", big_notes) is None
+    # whitespace-only description is treated as empty
+    err_ws = ssw.dispatch_content_guard("   \n  ", big_notes)
+    assert err_ws is not None
+
+
 def test_claim_bundle_beads_claims_each_unclaimed_sibling(monkeypatch):
     """Claim-all-up-front (SABLE-q13h DESIGN): every bundled sibling gets the
     same `bd update --claim` the lead bead does, so none of them looks

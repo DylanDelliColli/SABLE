@@ -105,6 +105,13 @@ constraint cannot be evaluated against an unreadable footprint, and a check
 that did not run must not report the same verdict as one that ran and found
 nothing. A bead that declares NO footprint at all is a different fact and
 dispatches normally.
+
+Dispatch-content guard (SABLE-kv44f): a bead whose description is empty or
+whitespace-only while its notes hold >= DISPATCH_NOTES_THRESHOLD chars of
+content refuses the spawn — exit 13, naming the notes length. The dispatch
+prompt is built from the description (SABLE-h8swc/SABLE-pruak render notes
+and comments AFTER it, not instead of it); an empty description hands the
+worker nothing to build from no matter how much evidence lives in notes.
 """
 from __future__ import annotations
 
@@ -359,6 +366,33 @@ def model_check(labels: list[str], override: str | None) -> str | None:
     return None
 
 
+DISPATCH_NOTES_THRESHOLD = 200
+
+
+def dispatch_content_guard(description: str, notes: str,
+                           threshold: int = DISPATCH_NOTES_THRESHOLD) -> str | None:
+    """Refuse a dispatch whose description is empty/whitespace-only while its
+    notes hold substantive content (SABLE-kv44f). SABLE-h8swc/SABLE-pruak
+    close the notes/comments RENDER gap, but a bead whose description is
+    genuinely empty still hands the worker nothing to build from — a bead's
+    entire evidentiary base can accumulate across many individually-correct
+    `bd update --append-notes` sessions and end dispatch-invisible with
+    nothing warning the author, the manager, or the spawner. Does NOT
+    auto-fold notes into the description (authoring is manager work) — this
+    only refuses loudly. Returns an error string to block, or None to
+    allow."""
+    if (description or "").strip():
+        return None
+    note_len = len((notes or "").strip())
+    if note_len < threshold:
+        return None
+    return (f"description empty, notes hold {note_len} chars -- fold "
+            "worker-relevant content into the description before dispatch "
+            "(SABLE-kv44f: the dispatched worker prompt is built from the "
+            "description; an empty one hands the worker nothing regardless "
+            "of how much evidence lives in notes).")
+
+
 def parse_bead_list(raw: str) -> list[dict]:
     """Best-effort parse of a `bd ... --json` array response. Empty list on any
     malformed/non-array payload — governance below fails OPEN, never blocks a
@@ -368,6 +402,23 @@ def parse_bead_list(raw: str) -> list[dict]:
     except Exception:
         return []
     return data if isinstance(data, list) else []
+
+
+def fetch_bead_comments(bead_id: str) -> list[dict]:
+    """`bd comments <id> --json` for the dispatch prompt (SABLE-pruak): a
+    comment is where an operator/cockpit ruling that overturns a bead's
+    premise typically lands, and until this fix it never reached the
+    dispatched worker. A fetch failure degrades to no comments rendered
+    (warned to stderr, not raised) rather than aborting the whole spawn —
+    comments are additive context, not a spawn precondition."""
+    r = subprocess.run(["bd", "comments", bead_id, "--json"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.stderr.write(
+            f"sable-spawn-worker: could not fetch comments for {bead_id}: "
+            f"{r.stderr.strip()}\n")
+        return []
+    return parse_bead_list(r.stdout)
 
 
 # Tab-delimited @sable_bead + @sable_status dump for dispatch-evidence detection
@@ -1518,6 +1569,51 @@ def parse_bundle_ids(raw: str | None, lead_id: str) -> list[str]:
     return out
 
 
+COMMENTS_RENDER_LIMIT = 20
+
+
+def render_notes_section(notes: str) -> str:
+    """Render a bead's `notes` field as its own labelled section in the
+    dispatch prompt (SABLE-h8swc), placed after the description. Notes are
+    already load-bearing for the footprint/serialize-with gates (:PULLED by
+    machinery) but were never PUSHED to the dispatched worker -- this is
+    where manager rulings, revise briefs and merge-seat diagnoses actually
+    live. Returns "" for empty/whitespace notes so a note-free bead does not
+    grow a dangling empty header on every dispatch."""
+    notes = (notes or "").strip()
+    if not notes:
+        return ""
+    return f"\n## Notes\n\n{notes}\n"
+
+
+def render_comments_section(comments: list[dict] | None,
+                            limit: int = COMMENTS_RENDER_LIMIT) -> str:
+    """Render a bead's comments, oldest-first / newest-last, each stamped
+    with author and date (SABLE-pruak) -- a comment is the natural place an
+    operator or cockpit ruling that OVERTURNS a bead's premise lands, and the
+    dispatch prompt previously never rendered them at all. Comments beyond
+    `limit` are dropped from the render, but the total count is always
+    stated so truncation is VISIBLE rather than indistinguishable from zero
+    comments. Returns "" for an empty/absent comment list so a comment-free
+    bead does not grow a dangling empty header."""
+    comments = comments or []
+    if not comments:
+        return ""
+    ordered = sorted(comments, key=lambda c: c.get("created_at") or "")
+    total = len(ordered)
+    shown = ordered[-limit:] if total > limit else ordered
+    header = f"\n## Comments ({total} total"
+    if total > limit:
+        header += f", showing most recent {limit}"
+    header += ")\n"
+    body = "".join(
+        f"\n- **{c.get('author', 'unknown')}** "
+        f"({c.get('created_at', 'unknown date')}):\n  {c.get('text', '')}\n"
+        for c in shown
+    )
+    return header + body
+
+
 def bundle_ready_for_done(bundle_ids: list[str], bead_statuses: dict[str, str]) -> str | None:
     """The done-flag gate for a bundled dispatch (SABLE-q13h): returns None
     when every id in `bundle_ids` is closed per `bead_statuses`, else an error
@@ -1537,21 +1633,32 @@ def bundle_ready_for_done(bundle_ids: list[str], bead_statuses: dict[str, str]) 
 
 
 def assemble_dispatch_prompt(bead_id, title, description, worktree, branch, model,
-                             bundle: list[dict] | None = None) -> str:
+                             bundle: list[dict] | None = None,
+                             notes: str = "",
+                             comments: list[dict] | None = None) -> str:
     """`bundle` (SABLE-q13h), when non-empty, is a list of {id, title,
-    description} dicts for sibling beads dispatched alongside `bead_id` in the
-    SAME worktree/branch. Every bundled bead's FULL description is rendered
-    inline here — not left for the worker to go find in a lead bead's notes
-    (the fybj+vyhn failure: a worker never read past the dispatch prompt into
-    notes where a bundle addendum lived) — and the bundle contract below binds
-    the worker to every listed bead regardless of claim state (the 7a6h+np7c
-    failure: a worker declined a bundled bead because a manager pre-claim made
-    it look separately-owned)."""
+    description, notes, comments} dicts for sibling beads dispatched alongside
+    `bead_id` in the SAME worktree/branch. Every bundled bead's FULL
+    description is rendered inline here — not left for the worker to go find
+    in a lead bead's notes (the fybj+vyhn failure: a worker never read past
+    the dispatch prompt into notes where a bundle addendum lived) — and the
+    bundle contract below binds the worker to every listed bead regardless of
+    claim state (the 7a6h+np7c failure: a worker declined a bundled bead
+    because a manager pre-claim made it look separately-owned).
+
+    `notes` / `comments` are the lead bead's own fields, rendered the same
+    way each bundled sibling's are (SABLE-h8swc / SABLE-pruak): a manager
+    ruling, revise brief or merge-seat diagnosis routinely lands in one of
+    these two fields rather than the description, and until this fix neither
+    was ever rendered into the dispatch prompt at all — reachable only by a
+    worker choosing to run `bd show`/`bd comments` unprompted."""
     bundle = bundle or []
     all_ids = [bead_id] + [b["id"] for b in bundle]
 
     bundled_sections = "".join(
         f"\n## Bundled bead — {b['id']}: {b['title']}\n\n{b['description']}\n"
+        f"{render_notes_section(b.get('notes', ''))}"
+        f"{render_comments_section(b.get('comments'))}"
         for b in bundle
     )
 
@@ -1592,7 +1699,7 @@ Worker model: {model}
 {bead_id}: {title}
 
 {description}
-{bundled_sections}{bundle_contract}
+{render_notes_section(notes)}{render_comments_section(comments)}{bundled_sections}{bundle_contract}
 ## Contract
 - Verify current state first; if the work is already done / clean, STOP and report.
 - Implement, then run the UNIT and INTEGRATION tests; capture the exact command + output.
@@ -1750,6 +1857,17 @@ def main(argv: list[str] | None = None) -> int:
     # ladder) picked the tier even on a spawn that never reaches the pane.
     sys.stderr.write("sable-spawn-worker: model selection — "
                      f"{model_announcement(model, reason, model_source)}\n")
+
+    # --- SABLE-kv44f: refuse a dispatch whose description is empty while its
+    # notes hold substantive content — a worker prompt is built from the
+    # description (SABLE-h8swc/SABLE-pruak render notes/comments AFTER it,
+    # not INSTEAD of it), so an empty description hands the worker nothing to
+    # build from. Content check, not a governance race — runs unconditionally,
+    # even under --skip-governance, and before any bd WRITE. ---
+    content_err = dispatch_content_guard(bead.get("description", ""), bead.get("notes", ""))
+    if content_err:
+        sys.stderr.write(f"sable-spawn-worker: dispatch-content blocked — {content_err}\n")
+        return 13
 
     # --- SABLE-q13h: fetch bundled sibling beads (if any) for the prompt.
     # Fetched unconditionally (even under --skip-governance) since prompt
@@ -1980,11 +2098,15 @@ def main(argv: list[str] | None = None) -> int:
     ddir.mkdir(parents=True, exist_ok=True)
     dispatch_path = ddir / f"{bid}.md"
     bundle_arg = [{"id": b.get("id", i), "title": b.get("title", ""),
-                  "description": b.get("description", "")}
+                  "description": b.get("description", ""),
+                  "notes": b.get("notes", ""),
+                  "comments": fetch_bead_comments(b.get("id", i))}
                  for i, b in zip(bundle_ids, bundle_beads)]
     dispatch_path.write_text(assemble_dispatch_prompt(
         bid, bead.get("title", ""), bead.get("description", ""),
-        worktree, branch, model, bundle=bundle_arg))
+        worktree, branch, model, bundle=bundle_arg,
+        notes=bead.get("notes", ""),
+        comments=fetch_bead_comments(bid)))
 
     # --- open the worker window (stamped with the lane identity) + capture pane ---
     # SABLE-5v9n: set remain-on-exit GLOBALLY, BEFORE the window is created,
