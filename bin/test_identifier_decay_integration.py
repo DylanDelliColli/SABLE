@@ -267,3 +267,94 @@ def test_promote_seam_never_raises_when_the_sweeper_is_missing(sandbox, capsys):
     finally:
         os.environ.pop("SABLE_MG_IDDECAY", None)
     assert "COULD NOT ASSESS" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# SABLE-wr6zp: timing under a realistically-sized, real bd store
+#
+# The bug this bead fixes was never about correctness — it was that the
+# check's own bd query timed out under burst load precisely when the burst
+# (many identifiers retiring at once, on a slow store) made the check most
+# valuable. Both tests below run the REAL CLI against a REAL bd store, no
+# mocks, per the bead's own file footprint.
+# --------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def bulk_sandbox(tmp_path_factory):
+    """A SEPARATE sandbox DB seeded to the size seen the night this bead was
+    filed (50+ open beads) via `bd import`, real end-to-end. A fresh module
+    fixture rather than reusing `sandbox` above: bulk-seeding 50+ beads into
+    the same store the four-bead fixture's identity assertions depend on
+    would make those tests' referrer counts a moving target."""
+    root = tmp_path_factory.mktemp("iddecay-bulk")
+    work = root / "work"
+    work.mkdir()
+    home = root / "home"
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(work)], check=True)
+    _robust_bd_init(work, home)
+
+    # The real merge_preview SSOT, copied in so bd_timeout() against this
+    # sandbox resolves the SAME derived budget (900s) a real promote would
+    # get — not the repo-less 20s fallback, which would leave the "budget is
+    # now derived, not hardcoded" half of the fix unexercised here.
+    ci_dir = work / ".github" / "ci"
+    ci_dir.mkdir(parents=True)
+    shutil.copy(REPO / ".github" / "ci" / "test-tiers.sh", ci_dir / "test-tiers.sh")
+
+    seed = root / "seed.jsonl"
+    lines = [json.dumps({"title": f"bulk seed bead {i}", "issue_type": "task",
+                         "priority": 2, "status": "open"}) for i in range(55)]
+    seed.write_text("\n".join(lines) + "\n")
+    imported = _run(["bd", "import", "--sandbox", "-i", str(seed)], work, home)
+    assert imported.returncode == 0, imported.stdout + imported.stderr
+
+    return {"work": work, "home": home}
+
+
+def test_sweep_completes_against_a_realistically_sized_store(bulk_sandbox):
+    """The real CLI, against a real 55-open-bead store carrying the real
+    SSOT, must return a genuine (assessed=True) verdict — not a
+    could-not-assess — well within its derived budget."""
+    cp = _run([sys.executable, str(SWEEPER), "--json", "SABLE-nonexistent-id"],
+              bulk_sandbox["work"], bulk_sandbox["home"])
+    assert cp.returncode == 0, cp.stderr
+    payload = json.loads(cp.stdout)
+    assert payload["assessed"] is True, (
+        f"a realistically-sized store must produce a real verdict, not could-not-assess: {payload}")
+    assert payload["flags"] == []
+
+
+def test_slow_store_still_never_reports_a_false_clean(bulk_sandbox):
+    """LOAD-BEARING NEGATIVE CONTROL. Constrain the budget far below what the
+    real store needs to answer (SABLE_IDREF_TIMEOUT=0.001s — the same override
+    seam a real burst-load operator would use, just pushed to an extreme that
+    is guaranteed to be exceeded, real bd process and all) and assert the
+    output is could-not-assess, not a false clean: exit code EXIT_UNASSESSED
+    (3), never 0-with-no-flags, and the stdout never silently reads as
+    success. Without this, a fix that merely raises the timeout number could
+    silently reintroduce the false-clean failure at the next load level."""
+    env_over = {"SABLE_IDREF_TIMEOUT": "0.001"}
+    env = _env(bulk_sandbox["home"])
+    env.update(env_over)
+    cp = subprocess.run([sys.executable, str(SWEEPER), "--json", "SABLE-nonexistent-id"],
+                        cwd=str(bulk_sandbox["work"]), env=env, text=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+
+    assert cp.returncode == 3, (
+        f"an unanswerable-in-budget store must exit EXIT_UNASSESSED (3), not read as success: "
+        f"rc={cp.returncode} stdout={cp.stdout!r}")
+    payload = json.loads(cp.stdout)
+    assert payload["assessed"] is False, (
+        "the process exit and payload must never read as success-with-no-findings")
+    assert payload["flags"] == []
+    assert "timed out" in payload["reason"]
+    assert "retried once" in payload["reason"], "the retry-once path must still have run and failed"
+
+    # Non-JSON mode carries the same loud, unmistakable text on stdout.
+    cp_text = subprocess.run([sys.executable, str(SWEEPER), "SABLE-nonexistent-id"],
+                             cwd=str(bulk_sandbox["work"]), env=env, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    assert cp_text.returncode == 3
+    assert "COULD NOT ASSESS" in cp_text.stdout
+    assert "NOT a clean result" in cp_text.stdout
