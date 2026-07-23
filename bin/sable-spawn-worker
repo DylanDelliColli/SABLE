@@ -94,6 +94,14 @@ spawn — exit 11, naming the overlapping bead(s) and files. Two outs: wait for
 the overlapping bead to clear, or add an explicit 'Serialize-with: <bead-id>'
 line (bead notes/description) naming it — the spawn then proceeds and both
 beads' `serialize_with` metadata is tagged for Chuck's for-chuck handoff.
+
+A bead that declares a footprint the parser CANNOT READ (a '## File footprint'
+heading naming no path, a WIP-CLAIMS line or wip_claims value that yields none)
+refuses the spawn separately — exit 12, could-not-assess (SABLE-47try). The
+constraint cannot be evaluated against an unreadable footprint, and a check
+that did not run must not report the same verdict as one that ran and found
+nothing. A bead that declares NO footprint at all is a different fact and
+dispatches normally.
 """
 from __future__ import annotations
 
@@ -446,15 +454,67 @@ def already_in_progress_check(bead: dict, pane_evidence: bool,
             "no worktree is the claim-then-hold pattern and is allowed.)")
 
 
+class FootprintRead(NamedTuple):
+    """The result of READING a bead's declared file footprint — `files` plus
+    WHICH SOURCES WERE PRESENT AND YIELDED NOTHING (SABLE-47try).
+
+    The bare `set[str]` this replaces could not tell two facts apart:
+
+      (a) this bead DECLARES NO FOOTPRINT — legitimate, common, and it must
+          still be allowed to dispatch; and
+      (b) this bead's footprint COULD NOT BE READ — a `## File footprint`
+          heading with nothing parseable under it, a `WIP-CLAIMS:` line that
+          yields no path, a `wip_claims` metadata value that is all separators.
+
+    Both produced an empty set, so the information did not exist at
+    overlap_check's call site at all, and (b) silently disabled a SCHEDULING
+    CONSTRAINT while reporting the same 'none' verdict as a completed check.
+    `unreadable_sources` is what carries (b) forward.
+
+    It is a tuple of source NAMES, not a boolean, because the sources are
+    unioned: a bead can be unparseable in one source and simply silent in the
+    other two. When some source did yield files, the check still runs — it is
+    answerable, just on a possibly-incomplete footprint — and the unreadable
+    source is surfaced as a warning rather than a refusal. Only a read that
+    yielded NO files from ANY source while some source was present is
+    unanswerable; that is what `could_not_assess` names."""
+    files: frozenset[str]
+    unreadable_sources: tuple[str, ...] = ()
+
+    @property
+    def could_not_assess(self) -> bool:
+        """True only for case (b) above with nothing salvaged from any source.
+        Deliberately NOT true for a bead that declares no footprint at all —
+        that bead is assessable (it collides with nothing) and must dispatch."""
+        return not self.files and bool(self.unreadable_sources)
+
+    def merge(self, other: "FootprintRead") -> "FootprintRead":
+        return FootprintRead(
+            self.files | other.files,
+            tuple(dict.fromkeys(self.unreadable_sources + other.unreadable_sources)))
+
+
 def extract_wip_claims(text: str) -> set[str]:
     """File paths from `WIP-CLAIMS: a, b, c` lines in bead notes/description."""
+    return set(read_wip_claims(text).files)
+
+
+def read_wip_claims(text: str) -> FootprintRead:
+    """`extract_wip_claims` plus the PRESENT-BUT-EMPTY signal (SABLE-47try): a
+    `WIP-CLAIMS:` line that exists but yields no path is an author who meant to
+    declare a footprint and wrote it in a form this parser does not read. That
+    is not the same fact as having written no WIP-CLAIMS line at all, and the
+    bare set return could not express the difference."""
     claims: set[str] = set()
+    marker = False
     for m in re.finditer(r"WIP-CLAIMS:\s*([^\n]+)", text or ""):
+        marker = True
         for p in m.group(1).split(","):
             p = p.strip()
             if p:
                 claims.add(p)
-    return claims
+    return FootprintRead(frozenset(claims),
+                         () if claims or not marker else ("WIP-CLAIMS line",))
 
 
 def extract_footprint_section(text: str) -> set[str]:
@@ -466,30 +526,81 @@ def extract_footprint_section(text: str) -> set[str]:
     scripts are captured — the WIP-CLAIMS/metadata sources below don't need an
     extension either, but the OLD generic-regex fallback in the hook-based
     claim writer did, which is exactly the gap this section format closes."""
-    m = re.search(r"^##\s*File footprint\s*\n(.+?)(?=\n##\s|\Z)", text or "",
-                  re.MULTILINE | re.DOTALL)
-    if not m:
-        return set()
+    return set(read_footprint_section(text).files)
+
+
+def read_footprint_section(text: str) -> FootprintRead:
+    """`extract_footprint_section` plus the PRESENT-BUT-EMPTY signal
+    (SABLE-47try). A `## File footprint` HEADING that is present but whose body
+    yields no path token — an empty section, a placeholder the planner never
+    filled in — reports the section as unreadable rather than silently reading
+    as "this bead declares no footprint". An ABSENT heading is the genuine
+    declares-nothing case and reports no unreadable source.
+
+    Mirrors sable_footprint_lib._collect_section's `(found, entries)` contract,
+    which draws the same heading-present/heading-absent line for `## File
+    reads` (SABLE-jd5fj.18). The two parsers stay separate deliberately: that
+    one filters tokens to path-shaped ones, this one takes the leading token of
+    each comma-separated entry verbatim so extension-less script paths survive.
+
+    Scans the body LINE-WISE rather than with a body-capturing regex
+    (SABLE-wihrz): the previous body-capturing lookahead form required at least one
+    body character, so an EMPTY section immediately followed by another `##`
+    heading captured that heading's literal '##' as a claimed path. That bogus
+    non-empty footprint is exactly what this function must not produce — it
+    would read as a successful parse and let the gate proceed on garbage,
+    defeating the could-not-assess distinction above."""
+    heading = re.compile(r"^##\s*File footprint\s*$")
+    found = False
+    body: list[str] = []
+    for line in (text or "").splitlines():
+        if heading.match(line.strip()):
+            found = True
+            continue
+        if found:
+            if line.strip().startswith("#"):
+                break
+            body.append(line)
+    if not found:
+        return FootprintRead(frozenset())
     files: set[str] = set()
-    for part in m.group(1).split(","):
+    for part in "\n".join(body).split(","):
         part = part.strip()
         if not part:
             continue
         files.add(part.split()[0])
-    return files
+    return FootprintRead(frozenset(files),
+                         () if files else ("'## File footprint' section",))
 
 
-def bead_claimed_files(bead: dict) -> set[str]:
+def read_bead_footprint(bead: dict) -> FootprintRead:
     """Union of every declared-footprint source for `bead`: WIP-CLAIMS text
     lines (notes/description), the wip_claims metadata field (SABLE-szd
     dedicated column — pre-dispatch-claim.sh's write target), and a planner-
-    authored '## File footprint' description section (SABLE-jd5fj.6)."""
+    authored '## File footprint' description section (SABLE-jd5fj.6) — carrying
+    the per-source PRESENT-BUT-UNREADABLE signal each parser now reports
+    (SABLE-47try). See FootprintRead for why the union makes this per-source
+    rather than a single boolean."""
     text = (bead.get("notes") or "") + "\n" + (bead.get("description") or "")
-    claims = extract_wip_claims(text) | extract_footprint_section(bead.get("description") or "")
+    read = read_wip_claims(text).merge(
+        read_footprint_section(bead.get("description") or ""))
     metadata = bead.get("metadata", {}) or {}
     wip_claims = metadata.get("wip_claims", "") or ""
-    claims |= {p.strip() for p in wip_claims.split(",") if p.strip()}
-    return claims
+    meta_files = frozenset(p.strip() for p in wip_claims.split(",") if p.strip())
+    # A wip_claims KEY carrying a non-blank value that parses to no path is the
+    # metadata-column form of the same authoring error; an absent or blank
+    # value is simply "nothing claimed here yet" and is not a failed read
+    # (pre-dispatch-claim.sh has not necessarily fired — no ordering guarantee).
+    meta_unreadable = ("wip_claims metadata",) if wip_claims.strip() and not meta_files else ()
+    return read.merge(FootprintRead(meta_files, meta_unreadable))
+
+
+def bead_claimed_files(bead: dict) -> set[str]:
+    """The declared-footprint file set for `bead`. Thin projection of
+    read_bead_footprint for callers that only need the paths — every caller
+    that must DECIDE something reads the full FootprintRead instead, because
+    this return value cannot express a failed read (SABLE-47try)."""
+    return set(read_bead_footprint(bead).files)
 
 
 def extract_serialize_with(text: str) -> set[str]:
@@ -510,13 +621,28 @@ def bead_serialize_with(bead: dict) -> set[str]:
 
 
 class OverlapVerdict(NamedTuple):
-    """decision: 'none' (no overlap, nothing to do) | 'deny' (SCHEDULING
+    """decision: 'none' (CHECK COMPLETED, no overlap) | 'deny' (SCHEDULING
     CONSTRAINT — the spawn must be refused) | 'allow' (overlap permitted via a
     matching Serialize-with line; tagged_ids names the partner bead(s) to tag
-    serialize_with on both sides)."""
+    serialize_with on both sides) | 'could-not-assess' (SABLE-47try — THE CHECK
+    DID NOT RUN, because the dispatching bead's footprint could not be read).
+
+    'could-not-assess' exists so that a check which never ran can no longer be
+    reported as one that ran and found nothing. It is a distinct outcome
+    precisely because 'none' is a POSITIVE claim — "I compared footprints and
+    they are disjoint" — and the old empty-footprint short-circuit returned it
+    without comparing anything.
+
+    `warnings` is the non-fatal channel: conditions that degrade the check
+    without preventing it (an IN-PROGRESS bead whose own footprint could not be
+    read, so it could not be compared against; a dispatching bead readable in
+    one source and unreadable in another). The caller must surface these on
+    every decision, including 'none' — a silently partial comparison is the
+    same failure this bead is about, one degree weaker."""
     decision: str
     message: str = ""
     tagged_ids: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> OverlapVerdict:
@@ -530,20 +656,69 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> OverlapV
     an unrelated bead in Serialize-with does not launder an uncovered overlap:
     every overlap hit must be covered, or the whole dispatch still denies.
     Same-bead duplication is handled separately (blocking) by
-    already_in_progress_check()."""
-    my_files = bead_claimed_files(bead)
+    already_in_progress_check().
+
+    SABLE-47try: this function used to open with `if not my_files: return
+    OverlapVerdict("none")` — one line that returned the CLEAN-RESULT verdict
+    for a bead whose footprint the parser could not read, silently reverting
+    jd5fj.6's constraint to nothing at all for that bead and leaving no event
+    anywhere. The three outcomes below are now distinguished explicitly:
+    declares-nothing releases, unreadable is 'could-not-assess', and a
+    partially-read footprint still checks but warns."""
+    mine = read_bead_footprint(bead)
+    if mine.could_not_assess:
+        # SABLE-47try: the one outcome that must never be spelled 'none'. Every
+        # declared-footprint source this bead offered was present and yielded
+        # nothing, so there is no footprint to compare and the constraint CANNOT
+        # BE EVALUATED. Reported as its own decision; the caller refuses.
+        return OverlapVerdict(
+            "could-not-assess",
+            f"OVERLAP CHECK COULD NOT RUN — {bead_id} declares a file footprint "
+            f"that could not be read ({', '.join(mine.unreadable_sources)} present "
+            "but naming no path). The overlap SCHEDULING CONSTRAINT cannot be "
+            "evaluated against an unreadable footprint, and a check that did not "
+            "run must not be reported as one that found no overlap. Fix the "
+            "footprint on the bead (a '## File footprint' section listing "
+            "comma-separated paths), or remove the empty declaration entirely if "
+            "this bead genuinely touches no declared files — a bead that declares "
+            "NO footprint dispatches normally.")
+    my_files = mine.files
+    warnings: list[str] = []
+    if mine.unreadable_sources:
+        # Readable in at least one source, so the check CAN run — but on a
+        # footprint that is possibly short. Degraded, not disabled: say so.
+        warnings.append(
+            f"{bead_id}'s footprint was read from some sources but not all "
+            f"({', '.join(mine.unreadable_sources)} present but naming no path) "
+            "— the overlap check below ran against a possibly-incomplete footprint.")
     if not my_files:
-        return OverlapVerdict("none")
+        # The genuine declares-nothing case: no footprint source was present at
+        # all. This bead collides with nothing and MUST still dispatch — see the
+        # do-not clause on SABLE-47try. A gate that can never release is
+        # indistinguishable from correct caution.
+        return OverlapVerdict("none", warnings=tuple(warnings))
     hits: list[tuple[str, str, list[str]]] = []
     for other in in_progress:
         oid = other.get("id", "")
         if not oid or oid == bead_id:
             continue
-        shared = my_files & bead_claimed_files(other)
+        theirs = read_bead_footprint(other)
+        if theirs.unreadable_sources:
+            # The same defect on the OTHER side: an in-progress bead whose
+            # footprint cannot be read drops silently out of the comparison, so
+            # a real overlap with it would go unseen. WARN rather than deny —
+            # denying here would let one malformed in-progress bead block every
+            # unrelated dispatch, which is the reverted-within-a-day failure.
+            warnings.append(
+                f"in-progress {oid} declares a footprint that could not be read "
+                f"({', '.join(theirs.unreadable_sources)} present but naming no "
+                "path) — it could not be compared against, so an overlap with it "
+                "would NOT have been detected.")
+        shared = my_files & theirs.files
         if shared:
             hits.append((oid, other.get("assignee") or "unassigned", sorted(shared)))
     if not hits:
-        return OverlapVerdict("none")
+        return OverlapVerdict("none", warnings=tuple(warnings))
 
     serialize_with = bead_serialize_with(bead)
     uncovered = [h for h in hits if h[0] not in serialize_with]
@@ -559,6 +734,7 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> OverlapV
             "dispatch denied. Wait for the overlapping bead to clear, or add "
             "an explicit 'Serialize-with: <bead-id>' line naming it to proceed "
             "— both merges will be tagged serialize-together for Chuck.",
+            warnings=tuple(warnings),
         )
     tagged = tuple(sorted({h[0] for h in hits}))
     return OverlapVerdict(
@@ -566,6 +742,7 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> OverlapV
         f"SERIALIZE-WITH ACCEPTED — overlap with {', '.join(tagged)} permitted; "
         "tagging serialize-together for Chuck's handoff.",
         tagged,
+        tuple(warnings),
     )
 
 
@@ -1647,6 +1824,20 @@ def main(argv: list[str] | None = None) -> int:
 
         in_progress = parse_bead_list(_run(["bd", "list", "--status=in_progress", "--json"]))
         overlap_verdict = overlap_check(bid, bead, in_progress)
+        # SABLE-47try: surfaced on EVERY decision, before any of them is acted
+        # on — a degraded comparison must be visible even when it released.
+        for warning in overlap_verdict.warnings:
+            sys.stderr.write(f"sable-spawn-worker: OVERLAP CHECK DEGRADED — {warning}\n")
+        if overlap_verdict.decision == "could-not-assess":
+            # The deliberate caller decision the bead asks for, stated here
+            # rather than left to a fallthrough: a SCHEDULING CONSTRAINT that
+            # cannot be evaluated REFUSES. Distinct exit code from the overlap
+            # deny (11) so "the gate refused" and "the gate could not run" are
+            # never conflated downstream — which is the whole defect.
+            sys.stderr.write(
+                f"sable-spawn-worker: overlap-constraint could-not-assess — "
+                f"{overlap_verdict.message}\n")
+            return 12
         if overlap_verdict.decision == "deny":
             sys.stderr.write(
                 f"sable-spawn-worker: overlap-constraint blocked — {overlap_verdict.message}\n")

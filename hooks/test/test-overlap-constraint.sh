@@ -77,11 +77,14 @@ if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
   export DESC="${DISP_DESC:-implement hooks/foo.sh for the feature}"
   export DISP_SW="${DISP_SERIALIZE_WITH:-}"
   export DISP_NOTES="${DISP_NOTES:-}"
+  export DISP_WC="${DISP_WIP_CLAIMS:-}"
   python3 -c "
 import json, os, sys
 metadata = {}
 if os.environ.get('DISP_SW', ''):
     metadata['serialize_with'] = os.environ['DISP_SW']
+if os.environ.get('DISP_WC', ''):
+    metadata['wip_claims'] = os.environ['DISP_WC']
 print(json.dumps([{'id': 'SABLE-disp', 'description': os.environ.get('DESC', ''), 'notes': os.environ.get('DISP_NOTES', ''), 'metadata': metadata}]))
 "
   exit 0
@@ -112,6 +115,7 @@ print(json.dumps(d))
 }
 
 # run_hook <json> <overlap_file> [disp_desc] [disp_serialize_with] [disp_notes]
+#          [disp_wip_claims]
 run_hook() {
   BD_CALL_LOG="$FIXTURE_DIR/bd_calls.log"
   : > "$BD_CALL_LOG"
@@ -123,6 +127,7 @@ run_hook() {
         DISP_DESC="${3:-}" \
         DISP_SERIALIZE_WITH="${4:-}" \
         DISP_NOTES="${5:-}" \
+        DISP_WIP_CLAIMS="${6:-}" \
         BD_CALL_LOG="$BD_CALL_LOG" \
         PATH="$STUB_DIR:$PATH" \
         bash "$HOOK" 2>/dev/null
@@ -229,6 +234,72 @@ if printf '%s' "$OUT" | grep -q 'SERIALIZE-WITH ACCEPTED' && ! printf '%s' "$OUT
   pass "notes-borne Serialize-with line (legacy, no metadata field) is PERMITTED"
 else
   fail "notes-borne Serialize-with line (legacy, no metadata field) is PERMITTED" "got: ${OUT:-<empty>}"
+fi
+
+# --- SABLE-47try: could-not-assess vs declares-nothing ----------------------
+# The shell twin of bin/sable-spawn-worker's overlap_check short-circuit. The
+# old `[ -z "$DISPATCH_FILES" ] && exit 0` stood the SCHEDULING CONSTRAINT down
+# silently for a bead whose footprint could not be parsed, which is
+# indistinguishable at every downstream point from a check that ran and found
+# nothing.
+
+# Case 10: a '## File footprint' section that is PRESENT but names no path.
+# The gate cannot be evaluated -> DENY, naming what could not be read. This is
+# the case the old code exited 0 on. Plant-and-fail control: restoring the bare
+# `[ -z "$DISPATCH_FILES" ] && exit 0` turns this RED (observed).
+EMPTY_FOOTPRINT_DESC=$'Story.\n\n## File footprint\n   \n'
+OUT=$(run_hook "$(make_input a10 optimus 'Work SABLE-disp')" "hooks/foo.sh" "$EMPTY_FOOTPRINT_DESC")
+if printf '%s' "$OUT" | grep -q '"permissionDecision": "deny"' \
+   && printf '%s' "$OUT" | grep -q 'COULD NOT RUN' \
+   && printf '%s' "$OUT" | grep -q 'File footprint'; then
+  pass "unreadable footprint section is COULD-NOT-ASSESS (deny), not a silent stand-down"
+else
+  fail "unreadable footprint section is COULD-NOT-ASSESS (deny), not a silent stand-down" "got: ${OUT:-<empty>}"
+fi
+
+# Case 11 (LOAD-BEARING NEGATIVE CONTROL — prove-the-gate-can-release): a bead
+# that genuinely declares NO footprint (no section, no metadata, and prose with
+# no extension-bearing token for the generic fallback to find) must still
+# dispatch silently. If this goes red the fix has become a gate that can never
+# release, and it must be reverted.
+NO_FOOTPRINT_DESC='a bead with no declared footprint and no file-shaped tokens at all'
+OUT=$(run_hook "$(make_input a11 optimus 'Work SABLE-disp')" "hooks/foo.sh" "$NO_FOOTPRINT_DESC")
+if [ -z "$OUT" ]; then
+  pass "bead declaring NO footprint still dispatches (gate can still release)"
+else
+  fail "bead declaring NO footprint still dispatches (gate can still release)" "got: $OUT"
+fi
+
+# Case 12: an EMPTY footprint section immediately followed by another '##'
+# heading (SABLE-wihrz). The old body-capturing regex captured that heading's
+# literal '##' as a claimed path — a bogus non-empty footprint that reads as a
+# successful parse and would slip past the could-not-assess door entirely.
+BLEED_DESC=$'Story.\n\n## File footprint\n\n## Test spec\nsomething'
+OUT=$(run_hook "$(make_input a12 optimus 'Work SABLE-disp')" "hooks/foo.sh" "$BLEED_DESC")
+if printf '%s' "$OUT" | grep -q 'COULD NOT RUN' && ! printf '%s' "$OUT" | grep -q "'##'"; then
+  pass "empty section before another '## heading' is COULD-NOT-ASSESS, not a bogus '##' claim"
+else
+  fail "empty section before another '## heading' is COULD-NOT-ASSESS, not a bogus '##' claim" "got: ${OUT:-<empty>}"
+fi
+
+# Case 13: wip_claims METADATA present but parsing to no path — the
+# metadata-column form of the same authoring error, and the source the python
+# twin and this gate genuinely share.
+OUT=$(run_hook "$(make_input a13 optimus 'Work SABLE-disp')" "hooks/foo.sh" "$NO_FOOTPRINT_DESC" "" "" " , , ")
+if printf '%s' "$OUT" | grep -q 'COULD NOT RUN' && printf '%s' "$OUT" | grep -q 'wip_claims metadata'; then
+  pass "unparseable wip_claims metadata is COULD-NOT-ASSESS (deny)"
+else
+  fail "unparseable wip_claims metadata is COULD-NOT-ASSESS (deny)" "got: ${OUT:-<empty>}"
+fi
+
+# Case 14: a well-formed footprint with a real overlap must STILL DENY with the
+# ordinary overlap reason — the fix did not disturb the working path, and the
+# two denies stay distinguishable from each other.
+OUT=$(run_hook "$(make_input a14 optimus 'Work SABLE-disp')" "bin/sable-spawn-worker" "$FOOTPRINT_DESC")
+if printf '%s' "$OUT" | grep -q 'OVERLAP DETECTED' && ! printf '%s' "$OUT" | grep -q 'COULD NOT RUN'; then
+  pass "well-formed overlapping footprint still denies with the ORDINARY overlap reason"
+else
+  fail "well-formed overlapping footprint still denies with the ORDINARY overlap reason" "got: ${OUT:-<empty>}"
 fi
 
 echo

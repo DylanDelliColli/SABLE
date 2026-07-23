@@ -348,6 +348,133 @@ def test_bead_claimed_files_reads_file_footprint_section():
     assert ssw.bead_claimed_files(bead) == {"hooks/foo.sh", "bin/sable-spawn-worker"}
 
 
+# --- SABLE-47try: could-not-assess vs declares-nothing -----------------------
+# The old `if not my_files: return OverlapVerdict("none")` collapsed two facts
+# into the releasing verdict. These assert the distinction now exists at the
+# parse layer (where the information has to come from) and at the call site.
+
+
+def test_read_bead_footprint_reports_empty_footprint_section_as_unreadable():
+    bead = {"description": "Story text.\n\n## File footprint\n\n## Next section\nx"}
+    read = ssw.read_bead_footprint(bead)
+    assert read.files == frozenset()
+    assert read.could_not_assess is True
+    assert "## File footprint" in read.unreadable_sources[0]
+
+
+def test_extract_footprint_section_present_but_empty_yields_no_paths():
+    # SABLE-qm9ky's named spec. The old regex's trailing \s* consumed the blank
+    # line, so (.+?) matched INTO the following heading and part.split()[0]
+    # yielded the literal token '##' — a DECLARED-EMPTY footprint section
+    # producing a claimed file named '##'.
+    desc = "Story.\n\n## File footprint\n\n## Test spec\nsomething"
+    assert ssw.extract_footprint_section(desc) == set()
+    assert "##" not in ssw.extract_footprint_section(desc)
+    # Negative controls, same test: heading genuinely absent still returns the
+    # absent form, and a two-real-path section still returns exactly those two.
+    assert ssw.extract_footprint_section("no heading here") == set()
+    assert ssw.extract_footprint_section(
+        "S.\n\n## File footprint\nbin/a.py, bin/b.py\n\n## Next\nx"
+    ) == {"bin/a.py", "bin/b.py"}
+    # The SECOND caller qm9ky warned about: extract_footprint_section's set
+    # signature is deliberately unchanged, so bead_claimed_files' union is
+    # undisturbed. The (declared, entries) shape lives on read_footprint_section
+    # alongside it rather than replacing it.
+    assert ssw.bead_claimed_files({"description": desc}) == set()
+
+
+def test_read_bead_footprint_absent_sources_is_not_could_not_assess():
+    # The load-bearing negative control at the parse layer: a bead that names
+    # no footprint source at all DECLARES NOTHING. That is a real answer.
+    read = ssw.read_bead_footprint({"id": "X-1", "description": "just prose"})
+    assert read.files == frozenset()
+    assert read.unreadable_sources == ()
+    assert read.could_not_assess is False
+
+
+def test_read_bead_footprint_reports_unreadable_per_source_not_as_a_boolean():
+    # Unparseable in one source, silent in the other two, and READABLE in a
+    # third — the union means the check is still answerable, so this is a
+    # warning-grade condition, not could-not-assess.
+    bead = {"notes": "WIP-CLAIMS: real.py",
+            "description": "Story.\n\n## File footprint\n   \n"}
+    read = ssw.read_bead_footprint(bead)
+    assert read.files == frozenset({"real.py"})
+    assert read.could_not_assess is False
+    assert any("File footprint" in s for s in read.unreadable_sources)
+
+
+def test_read_bead_footprint_reports_unparseable_wip_claims_metadata():
+    read = ssw.read_bead_footprint({"metadata": {"wip_claims": " , , "}})
+    assert read.could_not_assess is True
+    assert read.unreadable_sources == ("wip_claims metadata",)
+
+
+def test_read_bead_footprint_blank_wip_claims_metadata_is_not_a_failed_read():
+    # pre-dispatch-claim.sh may simply not have fired yet — an absent/blank
+    # claim value is "nothing claimed", not a footprint that failed to parse.
+    read = ssw.read_bead_footprint({"metadata": {"wip_claims": ""}})
+    assert read.unreadable_sources == ()
+    assert read.could_not_assess is False
+
+
+def test_overlap_check_malformed_footprint_is_could_not_assess_not_none():
+    # THE BEAD. A dispatching bead whose footprint section is present but
+    # malformed must NOT return the same verdict as a completed clean check.
+    # Plant-and-fail control: restoring the bare `return OverlapVerdict("none")`
+    # at the top of overlap_check turns this assertion RED (observed).
+    bead = {"id": "X-1", "description": "Story.\n\n## File footprint\n \n"}
+    other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
+    verdict = ssw.overlap_check("X-1", bead, [other])
+    assert verdict.decision == "could-not-assess"
+    assert verdict.decision != "none"
+    assert "X-1" in verdict.message and "could not be read" in verdict.message
+
+
+def test_overlap_check_bead_declaring_no_footprint_still_dispatches():
+    # LOAD-BEARING NEGATIVE CONTROL (prove-the-gate-can-release): many beads
+    # legitimately declare no footprint. If this ever goes red, the fix has
+    # become a gate that can never release and must be reverted.
+    bead = {"id": "X-1", "description": "just prose, no footprint declared"}
+    other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
+    verdict = ssw.overlap_check("X-1", bead, [other])
+    assert verdict.decision == "none"
+
+
+def test_overlap_check_wellformed_overlap_still_denies():
+    # The working path is undisturbed by the fix.
+    bead = {"id": "X-1", "description": "Story.\n\n## File footprint\nshared.py"}
+    other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
+    verdict = ssw.overlap_check("X-1", bead, [other])
+    assert verdict.decision == "deny"
+    assert "shared.py" in verdict.message
+
+
+def test_overlap_check_warns_when_an_in_progress_bead_footprint_is_unreadable():
+    # Same defect on the other side: an unreadable in-progress footprint drops
+    # out of the comparison silently. It warns (naming the bead) and does NOT
+    # deny — denying would let one malformed bead block every dispatch.
+    bead = {"id": "X-1", "notes": "WIP-CLAIMS: mine.py"}
+    other = {"id": "Y-1", "description": "S.\n\n## File footprint\n \n"}
+    verdict = ssw.overlap_check("X-1", bead, [other])
+    assert verdict.decision == "none"
+    assert any("Y-1" in w and "NOT have been detected" in w for w in verdict.warnings)
+
+
+def test_overlap_check_partial_read_still_checks_but_warns():
+    bead = {"id": "X-1",
+            "notes": "WIP-CLAIMS: shared.py",
+            "description": "S.\n\n## File footprint\n \n"}
+    other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
+    verdict = ssw.overlap_check("X-1", bead, [other])
+    assert verdict.decision == "deny"
+    assert any("possibly-incomplete" in w for w in verdict.warnings)
+
+
+def test_bead_claimed_files_still_returns_a_plain_set_for_legacy_callers():
+    assert ssw.bead_claimed_files({"notes": "WIP-CLAIMS: a.py"}) == {"a.py"}
+
+
 def test_extract_serialize_with_parses_comma_list():
     text = "notes\nSerialize-with: SABLE-a, SABLE-b\nmore"
     assert ssw.extract_serialize_with(text) == {"SABLE-a", "SABLE-b"}
