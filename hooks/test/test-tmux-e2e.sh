@@ -28,9 +28,10 @@ DD="$(mktemp -d)"
 SCRATCH_BEADS_DIR="$(mktemp -d)"
 READ_BEAD="SABLE-bldh.8"   # an open bead, read-only here
 
-PASS=0; FAIL=0; FAIL_NAMES=""
+PASS=0; FAIL=0; SKIP=0; FAIL_NAMES=""
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
+skip() { SKIP=$((SKIP+1)); echo "SKIP: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 tmux_() { tmux -L "$SOCK" "$@"; }
 cleanup() { tmux_ kill-server >/dev/null 2>&1; rm -rf "$WT" "$DD" "$SCRATCH_BEADS_DIR"; }
 trap cleanup EXIT
@@ -79,7 +80,22 @@ optpane="$(tmux_ list-panes -a -F '#{pane_id} #{@sable_role}' | awk '$2=="optimu
 tmux_ send-keys -t "$optpane" "echo BUSY; sleep 2; echo FREE" Enter
 sleep 0.2
 live_count_before="$(cd "$REPO" && bd count 2>/dev/null)"
-if CLAUDE_AGENT_NAME=lincoln BEADS_DB="$SCRATCH_BEADS_DIR/.beads" python3 "$BIN/sable-msg" optimus "drop auth, API urgent" >/dev/null 2>&1; then pass "sable-msg lincoln->optimus returns ok"; else fail "sable-msg lincoln->optimus returns ok"; fi
+# SABLE-gcmu: sable-msg's own exit code encodes VERIFIED delivery
+# (sable_pane_lib.dispatch_landed / pane_idle), which fails CLOSED
+# (SABLE-wvk9) whenever it cannot locate a Claude-TUI composer glyph
+# ("❯"/">") in the recipient pane's capture. The stand-in recipient here
+# is a bare `bash --noprofile --norc` pane (SABLE_TMUX_PANE_CMD, set
+# above) -- it never renders that glyph, so verified delivery is
+# STRUCTURALLY unattainable in this fixture regardless of whether the
+# message actually lands. Confirmed by direct repro: with this exact
+# invocation the message DOES land in the pane (see the "framed message
+# delivered to optimus pane" assertion below, which greps the pane
+# content directly and is the real check for this leg) while sable-msg
+# still exits 1. Do not gate the suite on sable-msg's exit code against a
+# non-TUI stand-in pane; record it as an observation instead.
+msg_rc=0
+CLAUDE_AGENT_NAME=lincoln BEADS_DB="$SCRATCH_BEADS_DIR/.beads" python3 "$BIN/sable-msg" optimus "drop auth, API urgent" >/dev/null 2>&1 || msg_rc=$?
+skip "sable-msg lincoln->optimus exit code (not gated)" "exit=$msg_rc against a bash stand-in pane -- dispatch_landed cannot locate a Claude-TUI composer glyph there (SABLE-gcmu); see 'framed message delivered to optimus pane' below for the real delivery check"
 sleep 3
 live_count_after="$(cd "$REPO" && bd count 2>/dev/null)"
 case "$SCRATCH_BEADS_DIR" in
@@ -120,7 +136,7 @@ done
 
 echo
 echo "=========================================="
-echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
+echo "Tests: $((PASS+FAIL+SKIP)) | Passed: $PASS | Failed: $FAIL | Skipped: $SKIP"
 echo "=========================================="
 if [ "$FAIL" -gt 0 ]; then echo -e "Failed tests:$FAIL_NAMES"; exit 1; fi
 exit 0
