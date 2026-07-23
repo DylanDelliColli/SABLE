@@ -1564,3 +1564,126 @@ def test_quiet_mode_clean_stays_silent_with_a_provenance_stamp_present(tmp_path,
     assert captured.out == ""
     assert captured.err == ""
     assert captured.out == ""
+
+
+# --- shadowed role cards (SABLE-thx70) --------------------------------------
+# hooks/multi-manager/session-role-anchor.sh resolves a manager's role card
+# PROJECT-FIRST ($PWD/.claude/sable/roles/<name>.md) then falls back to
+# $HOME/.claude/sable/roles/<name>.md — a stale project-local copy can
+# silently outrank a freshly-edited user-level one forever, with no event.
+# check_shadowed_role_cards() mirrors that EXACT resolution so doctor can
+# flag it the way it already flags pin drift. These are pure-function tests
+# against constructed cwd/home fixtures — no dependency on doctor.main()'s
+# argument parsing, since the check is deliberately independent of
+# --claude-dir/--project (see the comment at its call site in main()).
+
+def _write_role(root: Path, role: str, content: str):
+    p = root / ".claude" / "sable" / "roles" / f"{role}.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    return p
+
+
+def test_check_shadowed_role_cards_flags_differing_content(tmp_path):
+    cwd = tmp_path / "proj"
+    home = tmp_path / "home"
+    project = _write_role(cwd, "optimus", "PROJECT_VERSION\n")
+    user = _write_role(home, "optimus", "USER_VERSION\n")
+
+    shadowed = doctor.check_shadowed_role_cards(cwd, home)
+
+    assert len(shadowed) == 1
+    entry = shadowed[0]
+    assert entry["role"] == "optimus"
+    assert entry["winner_path"] == str(project)
+    assert entry["shadowed_path"] == str(user)
+
+
+def test_check_shadowed_role_cards_negative_control_only_project_local(tmp_path):
+    cwd = tmp_path / "proj"
+    home = tmp_path / "home"
+    _write_role(cwd, "optimus", "PROJECT_VERSION\n")
+    # no user-level copy at all
+    assert doctor.check_shadowed_role_cards(cwd, home) == []
+
+
+def test_check_shadowed_role_cards_negative_control_only_user_level(tmp_path):
+    cwd = tmp_path / "proj"
+    home = tmp_path / "home"
+    _write_role(home, "optimus", "USER_VERSION\n")
+    # no project-local copy at all
+    assert doctor.check_shadowed_role_cards(cwd, home) == []
+
+
+def test_check_shadowed_role_cards_negative_control_identical_content(tmp_path):
+    cwd = tmp_path / "proj"
+    home = tmp_path / "home"
+    _write_role(cwd, "optimus", "SAME_VERSION\n")
+    _write_role(home, "optimus", "SAME_VERSION\n")
+    assert doctor.check_shadowed_role_cards(cwd, home) == []
+
+
+def test_check_shadowed_role_cards_only_checks_the_four_manager_roles(tmp_path):
+    cwd = tmp_path / "proj"
+    home = tmp_path / "home"
+    # A producer role fragment (not one of the four warm-pane manager roles)
+    # differing between the two trees must NOT be reported — the resolver
+    # (and doctor's mirror of it) only ever fires for CLAUDE_AGENT_NAME values
+    # a manager pane sets, which is exactly MANAGER_ROLE_NAMES.
+    _write_role(cwd, "sherlock", "PROJECT_SHERLOCK\n")
+    _write_role(home, "sherlock", "USER_SHERLOCK\n")
+    assert doctor.check_shadowed_role_cards(cwd, home) == []
+
+
+def test_main_json_includes_shadowed_role_cards_and_flips_clean_false(tmp_path, monkeypatch, capsys):
+    repo, claude_dir = make_repo(tmp_path)
+    cwd = tmp_path / "proj"
+    home = tmp_path / "home"
+    _write_role(cwd, "chuck", "PROJECT_CHUCK\n")
+    _write_role(home, "chuck", "USER_CHUCK\n")
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("HOME", str(home))
+
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["clean"] is False
+    assert payload["shadowed_role_cards"][0]["role"] == "chuck"
+
+
+def test_main_quiet_mode_reports_shadowed_role_card(tmp_path, monkeypatch, capsys):
+    repo, claude_dir = make_repo(tmp_path)
+    cwd = tmp_path / "proj"
+    home = tmp_path / "home"
+    _write_role(cwd, "tarzan", "PROJECT_TARZAN\n")
+    _write_role(home, "tarzan", "USER_TARZAN\n")
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("HOME", str(home))
+
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir), "--quiet"])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "shadowed" in captured.err.lower()
+    assert "SABLE-thx70" in captured.err
+
+
+def test_main_quiet_mode_clean_when_no_shadow_present(tmp_path, monkeypatch, capsys):
+    # NEGATIVE CONTROL at the main()/--quiet level: an otherwise clean install
+    # with no role-card shadowing anywhere must stay silent, same as any other
+    # clean run — the whole point of --quiet.
+    repo, claude_dir = make_repo(tmp_path)
+    cwd = tmp_path / "proj"
+    home = tmp_path / "home"
+    cwd.mkdir()
+    home.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("HOME", str(home))
+
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir), "--quiet"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert captured.out == ""
+    assert captured.err == ""
