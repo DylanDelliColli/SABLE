@@ -16,6 +16,12 @@
 #   - dispatching B with 'Serialize-with: <A>' is ALLOWED, and the
 #     serialize_with tag lands in BOTH beads' real metadata (bd show --json) —
 #     the for-chuck handoff reads this same dedicated metadata field.
+#   - SABLE-47try: a bead whose '## File footprint' heading is PRESENT but names
+#     no path does NOT silently proceed — the gate reports could-not-assess and
+#     denies, instead of exiting 0 indistinguishably from a clean check.
+#   - SABLE-47try complement, load-bearing: a bead that declares NO footprint at
+#     all still dispatches while an overlapping bead is in-progress. Without
+#     this leg the fix above could be a gate that never releases.
 #
 # Run with:
 #   bash hooks/test/test-overlap-dispatch-e2e.sh
@@ -43,8 +49,8 @@ fi
 # below (5 today) — this suite's own coverage is checked by
 # hooks/test/test-shell-run-set-strict.sh case (h) and by
 # hooks/test/test-ci-bd-coverage-gap.sh's negative control (bd present ->
-# 5/5, no skips).
-REALBD_SUBTESTS=5
+# 7/7, no skips).
+REALBD_SUBTESTS=7
 if ! command -v bd >/dev/null 2>&1; then
   echo "SKIP: bd not found on PATH — this suite requires a real bd (no mocks)"
   echo
@@ -192,6 +198,61 @@ if printf '%s' "$SERIALIZE_B_AFTER" | grep -q "$BEAD_A" && printf '%s' "$SERIALI
 else
   fail "real bd: metadata still agrees on both beads after the notes rewrite" \
        "B.serialize_with='$SERIALIZE_B_AFTER' A.serialize_with='$SERIALIZE_A_AFTER'"
+fi
+
+# --- Case 4 (SABLE-47try): unreadable footprint, against a REAL bd ----------
+# Bead C's description carries a '## File footprint' HEADING that names no
+# path. Bead A is still in-progress on SHARED_FILE. The gate cannot compare
+# anything, so it must NOT silently proceed — the old
+# `[ -z "$DISPATCH_FILES" ] && exit 0` exited 0 here, which is byte-identical
+# downstream to a check that ran and found no overlap.
+BEAD_C=$(bd create --sandbox \
+  --title="[int-test] 47try unreadable-footprint bead C" \
+  --description="Scratch bead C for the SABLE-47try could-not-assess e2e test.
+
+## File footprint
+
+## Test spec
+nothing here" \
+  --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+
+if [ -n "$BEAD_C" ]; then
+  trap 'cleanup_bead "$BEAD_A"; cleanup_bead "${BEAD_B:-}"; cleanup_bead "${BEAD_C:-}"; cleanup_bead "${BEAD_D:-}"; rm -rf "$FIXTURE_DIR"' EXIT
+  echo "Integration: created scratch bead C = $BEAD_C"
+  OUT=$(run_hook "Work $BEAD_C")
+  if printf '%s' "$OUT" | grep -q '"permissionDecision": "deny"' \
+     && printf '%s' "$OUT" | grep -q 'COULD NOT RUN'; then
+    pass "real bd: an unreadable declared footprint does NOT silently proceed — could-not-assess deny"
+  else
+    fail "real bd: an unreadable declared footprint does NOT silently proceed — could-not-assess deny" \
+         "got: ${OUT:-<empty>}"
+  fi
+else
+  fail "real bd: an unreadable declared footprint does NOT silently proceed — could-not-assess deny" \
+       "could not create scratch bead C"
+fi
+
+# --- Case 5 (SABLE-47try): the LOAD-BEARING complement, against a real bd ---
+# Bead D declares NO footprint at all while bead A is still in-progress on
+# SHARED_FILE. It must dispatch silently. This is the assertion that proves the
+# fix did not turn the gate into one that can never release.
+BEAD_D=$(bd create --sandbox \
+  --title="[int-test] 47try no-footprint bead D" \
+  --description="Scratch bead D for the SABLE-47try negative control. It declares no footprint and names no file-shaped token at all." \
+  --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+
+if [ -n "$BEAD_D" ]; then
+  echo "Integration: created scratch bead D = $BEAD_D"
+  OUT=$(run_hook "Work $BEAD_D")
+  if [ -z "$OUT" ]; then
+    pass "real bd: a bead declaring NO footprint still dispatches (gate can still release)"
+  else
+    fail "real bd: a bead declaring NO footprint still dispatches (gate can still release)" \
+         "got: $OUT"
+  fi
+else
+  fail "real bd: a bead declaring NO footprint still dispatches (gate can still release)" \
+       "could not create scratch bead D"
 fi
 
 echo

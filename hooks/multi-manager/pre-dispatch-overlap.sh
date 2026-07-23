@@ -133,7 +133,22 @@ print(' '.join(sorted(prompt_ids | stored_ids)))
 #    footprint-section convention. Claims may not exist yet at pre-dispatch time
 #    (this hook and pre-dispatch-claim.sh fire on the same trigger with no
 #    ordering guarantee), so all three sources are unioned.
-DISPATCH_FILES=$(for BID in $DISPATCH_IDS; do
+#
+# SABLE-47try: each bead is read as TWO streams, not one — 'f<path>' for a file
+# and 'u<source>' for a footprint SOURCE THAT WAS PRESENT AND YIELDED NO PATH.
+# The old single stream could not tell "this bead declares no footprint" (fine,
+# dispatch) from "this bead's footprint could not be read" (the gate cannot run
+# at all), so the `[ -z "$DISPATCH_FILES" ] && exit 0` below silently STOOD DOWN
+# THE SCHEDULING CONSTRAINT for the second case. This is the shell twin of the
+# same defect in bin/sable-spawn-worker's overlap_check; both had to change or
+# the constraint stayed disable-able through whichever path was left.
+#
+# NOT a port of the python fix — the two gates read different inputs. This one
+# has a generic-regex fallback the python side does not, and does not parse
+# 'WIP-CLAIMS:' prose lines at all (which the python side does). The generic
+# regex is a scavenge over arbitrary prose rather than a declaration, so
+# finding nothing with it is never a failed read and it emits no 'u' marker.
+DISPATCH_READ=$(for BID in $DISPATCH_IDS; do
   bd show "$BID" --json 2>/dev/null | python3 -c "
 import json, sys, re
 try:
@@ -142,27 +157,82 @@ try:
         sys.exit(0)
     metadata = data[0].get('metadata', {}) or {}
     wip_claims = metadata.get('wip_claims', '') or ''
-    for p in wip_claims.split(','):
-        p = p.strip()
-        if p:
-            print(p)
+    meta_files = [p.strip() for p in wip_claims.split(',') if p.strip()]
+    for p in meta_files:
+        print('f' + p)
+    if wip_claims.strip() and not meta_files:
+        print('uwip_claims metadata')
     desc = data[0].get('description', '') or ''
-    section = re.search(r'^##\s*File footprint\s*\n(.+?)(?=\n##\s|\Z)', desc,
-                         re.MULTILINE | re.DOTALL)
-    if section:
-        for part in section.group(1).split(','):
+    # Line-wise body scan, not a body-capturing lookahead (SABLE-wihrz): the
+    # regex form required a non-empty body, so an EMPTY footprint section
+    # followed by another '##' heading captured that heading's literal '##' as
+    # a claimed path — a bogus non-empty footprint that reads as a successful
+    # parse and defeats the very distinction being drawn here.
+    heading = re.compile(r'^##\s*File footprint\s*\$')
+    found = False
+    body = []
+    for line in desc.splitlines():
+        if heading.match(line.strip()):
+            found = True
+            continue
+        if found:
+            if line.strip().startswith('#'):
+                break
+            body.append(line)
+    if found:
+        section_files = []
+        for part in chr(10).join(body).split(','):
             part = part.strip()
-            if not part:
-                continue
-            print(part.split()[0])
+            if part:
+                section_files.append(part.split()[0])
+        for p in section_files:
+            print('f' + p)
+        if not section_files:
+            print('u' + chr(39) + '## File footprint' + chr(39) + ' section')
     else:
         for m in re.finditer(r'(?:^|[\s\(\[\"\\'])((?:[\w\-./]+/)?[\w\-./]+\.(?:ts|tsx|js|jsx|py|rs|go|java|rb|md|yaml|yml|toml|json|sh|sql|css|scss|html))(?=[\s\)\]\"\\',:;]|$)', desc, re.MULTILINE):
-            print(m.group(1))
+            print('f' + m.group(1))
 except Exception:
     pass
 " 2>/dev/null
 done | sort -u)
 
+DISPATCH_FILES=$(printf '%s\n' "$DISPATCH_READ" | sed -n 's/^f//p')
+DISPATCH_UNREADABLE=$(printf '%s\n' "$DISPATCH_READ" | sed -n 's/^u//p' | paste -sd, -)
+
+# SABLE-47try: the could-not-assess door. Every footprint source this dispatch
+# offered was PRESENT and named no path, so there is nothing to compare and the
+# SCHEDULING CONSTRAINT CANNOT BE EVALUATED. That is not the same outcome as a
+# completed check, and it must not exit 0 like one. Conservative default for a
+# scheduling constraint that cannot run: DENY, naming what could not be read.
+if [ -z "$DISPATCH_FILES" ] && [ -n "$DISPATCH_UNREADABLE" ]; then
+  DISPATCH_UNREADABLE="$DISPATCH_UNREADABLE" DISPATCH_ID_LIST="$(echo $DISPATCH_IDS)" python3 -c "
+import json, os
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'permissionDecision': 'deny',
+        'permissionDecisionReason': (
+            'OVERLAP CHECK COULD NOT RUN — dispatched bead(s) '
+            + os.environ.get('DISPATCH_ID_LIST', '')
+            + ' declare a file footprint that could not be read ('
+            + os.environ.get('DISPATCH_UNREADABLE', '')
+            + ' present but naming no path). The overlap SCHEDULING CONSTRAINT '
+              'cannot be evaluated against an unreadable footprint, and a check '
+              'that did not run must not pass as one that found no overlap. Fix '
+              'the footprint on the bead (a \'## File footprint\' section listing '
+              'comma-separated paths), or remove the empty declaration entirely '
+              'if this bead genuinely touches no declared files — a bead that '
+              'declares NO footprint dispatches normally.')
+    }
+}))
+"
+  exit 0
+fi
+
+# No footprint source was present at all: this dispatch DECLARES NOTHING, which
+# is legitimate and common. It collides with nothing and must still be released
+# — a gate that can never release is indistinguishable from correct caution.
 [ -z "$DISPATCH_FILES" ] && exit 0
 
 # Find all in-progress beads (status=in_progress) not in dispatch set
