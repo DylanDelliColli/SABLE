@@ -1700,6 +1700,23 @@ Worker model: {model}
 
 {description}
 {render_notes_section(notes)}{render_comments_section(comments)}{bundled_sections}{bundle_contract}
+## Declaring file footprint / reads (SABLE-50z5g)
+If you author or edit ANY bead's `## File footprint` or `## File reads`
+section (a new bead, a follow-up split, a bundle sibling), the two headings
+have DIFFERENT parsing rules and DIFFERENT failure directions — do not give
+them the same form:
+  - `## File footprint` (writes): every path on ONE comma-separated line. A
+    newline-per-path or hyphen-bulleted reformat SILENTLY DROPS 3 of 4 entries
+    (measured, SABLE-546m5) — the writer's own declaration narrows with no
+    error. Do not "tidy" this into one path per line.
+  - `## File reads`: any layout is fine, but every entry must contain a slash
+    or end in a known code suffix — a bare Makefile, Dockerfile, .env, an
+    extensionless script, or a directory missing its trailing slash is
+    SILENTLY DROPPED once the heading is present (SABLE-zx2yv).
+  - When unsure, OVER-DECLARE. Forced serialization and an extra preview are
+    recoverable; an under-declared footprint that collides with a live worker
+    is not caught by anything.
+
 ## Contract
 - Verify current state first; if the work is already done / clean, STOP and report.
 - Implement, then run the UNIT and INTEGRATION tests; capture the exact command + output.
