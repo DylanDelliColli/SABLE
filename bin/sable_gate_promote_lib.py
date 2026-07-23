@@ -730,7 +730,33 @@ def _record_phase(phases: list[dict], name: str, started: float) -> None:
     phases.append({"name": name, "seconds": round(time.monotonic() - started, 3)})
 
 
-_SUITE_FAILURE_MARKER_RE = re.compile(r'(?im)^.*\bFAIL(?:ED|URE)?\b.*$')
+_SUITE_STRICT_FAIL_RE = re.compile(r'(?im)^FAIL(?:ED|URE)?\b.*$')
+_SUITE_LOOSE_FAIL_RE = re.compile(r'(?im)^.*\bFAIL(?:ED|URE)?\b.*$')
+
+
+def _anchor_failure_region(text: str) -> tuple[int, str]:
+    """Pick where a bounded failure excerpt should start, and NAME the rule
+    that picked it (SABLE-1u6dr).
+
+    A single loose regex — any line CONTAINING FAIL/FAILED/FAILURE anywhere —
+    anchors just as readily on a PASSING line that merely mentions the word
+    in its message (e.g. "PASS: SABLE-mji: bd failure fails open (rc=0,
+    silent allow)", a real line in hooks/test/test-pre-dispatch-preempt.sh)
+    as on the real failure. Try the fail() convention's actual shape first —
+    a line BEGINNING with FAIL/FAILED/FAILURE, which is what hooks/test/
+    lib-require-all.sh's pass/fail/skip idiom always emits for a real
+    failure and a PASS/SKIP line never does — and fall back to the loose
+    match only for suites that don't follow that convention, so the
+    stricter default never regresses a suite the loose rule used to find.
+    Naming which rule matched turns a bad anchor into something diagnosable
+    instead of merely wrong."""
+    match = _SUITE_STRICT_FAIL_RE.search(text)
+    if match:
+        return match.start(), "strict-fail-line"
+    match = _SUITE_LOOSE_FAIL_RE.search(text)
+    if match:
+        return match.start(), "loose-failure-mention"
+    return 0, "no-marker-found"
 
 
 def _bounded_failure_detail(stdout: str, limit: int = 4000) -> str:
@@ -745,18 +771,23 @@ def _bounded_failure_detail(stdout: str, limit: int = 4000) -> str:
     would have propagated NOTHING usable on a red at all, and nothing about
     the gate would have looked wrong.
 
-    Anchor on the first line naming a failure instead, so the excerpt always
-    starts at the region that explains the red rather than wherever the
-    output happened to stop. If a bound still applies, announce it — a
-    truncated report that reads as complete is the exact hazard SABLE-np1nx's
-    no-tail rule exists to forbid, now applied to the gate's own reporting of
-    that rule's own violations."""
+    Anchor on the first line naming a failure instead (via
+    _anchor_failure_region, SABLE-1u6dr), so the excerpt always starts at the
+    region that explains the red rather than wherever the output happened to
+    stop, or wherever a PASS line's own wording happened to mention the word
+    "failure". If a bound still applies, announce it — a truncated report
+    that reads as complete is the exact hazard SABLE-np1nx's no-tail rule
+    exists to forbid, now applied to the gate's own reporting of that rule's
+    own violations — and name which anchor rule was used, so a future bad
+    anchor is diagnosable rather than merely wrong."""
     text = stdout.strip()
     if len(text) <= limit:
         return text
-    match = _SUITE_FAILURE_MARKER_RE.search(text)
-    start = match.start() if match else 0
-    prefix = f"[{start} leading char(s) elided]\n" if start else ""
+    start, anchor = _anchor_failure_region(text)
+    prefix = f"[anchor: {anchor}]"
+    if start:
+        prefix += f" [{start} leading char(s) elided]"
+    prefix += "\n"
     excerpt = text[start:]
     if len(excerpt) <= limit:
         return f"{prefix}{excerpt}"
