@@ -288,7 +288,7 @@ PR_URL=$(gh pr view --json url -q .url 2>/dev/null || echo "")
 # Find overlaps with in-progress beads' WIP-CLAIMS
 FILES_CSV=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')
 
-OVERLAPS=$(bd list --status=in_progress --json 2>/dev/null | FILES_CSV="$FILES_CSV" python3 -c "
+OVERLAPS=$(bd list --status=in_progress --json --limit 0 2>/dev/null | FILES_CSV="$FILES_CSV" python3 -c "
 import json, sys, os, re
 
 pushed = set(os.environ.get('FILES_CSV', '').split(','))
@@ -397,7 +397,7 @@ if [ "${SABLE_WORKER_LAND_NOTIFY:-1}" = "1" ] \
     BEAD_CLOSED_COUNT=0
     BEAD_OPEN_LIST=""
     BEAD_ALL_IDS=""
-    BEAD_QUERY=$(bd list --status all --metadata-field "branch=$BRANCH" --json 2>/dev/null || echo "")
+    BEAD_QUERY=$(bd list --status all --metadata-field "branch=$BRANCH" --json --limit 0 2>/dev/null || echo "")
     if [ -n "$BEAD_QUERY" ]; then
       BEAD_ROWS=$(printf '%s' "$BEAD_QUERY" | python3 -c "
 import json, sys
@@ -504,7 +504,7 @@ fi
 # for-chuck bead's title already names $BRANCH on a delimited-token boundary
 # (so wk-foo does not false-match wk-foobar) — that earlier bead already
 # covers this branch's handoff; update it by hand if the file list changed.
-EXISTING_FOR_CHUCK=$(bd list --status open,in_progress --label for-chuck --json 2>/dev/null || echo "")
+EXISTING_FOR_CHUCK=$(bd list --status open,in_progress --label for-chuck --json --limit 0 2>/dev/null || echo "")
 if printf '%s' "$EXISTING_FOR_CHUCK" | BRANCH="$BRANCH" python3 -c "
 import json, os, re, sys
 branch = os.environ.get('BRANCH', '')
