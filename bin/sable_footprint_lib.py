@@ -73,6 +73,7 @@ re-preview. An empty footprint means "git said nothing changed"; it never means
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 
@@ -319,47 +320,103 @@ def parse_declared_reads(description: str) -> tuple[bool, frozenset[str]]:
     return _collect_section(description, _READS_HEADING)
 
 
+def _read_bead(repo: str, bead: str) -> dict:
+    """Read <bead> via the bd seam ONCE, preferring `--json` so the structured
+    footprint fields (SABLE-jd5fj.10) are visible. Returns
+    {"description": str, "metadata": dict}.
+
+    A bd stub that ignores `--json` and emits raw prose (every fixture that
+    predates this bead, and any real bd whose `show` output is not valid JSON
+    for some other reason) is NOT an error: its whole stdout becomes
+    `description`, `metadata` stays `{}`, and the structured path is simply
+    never consulted — the prose parser takes over exactly as it did before
+    this function existed. Only a genuine bd FAILURE (non-zero exit) raises."""
+    cp = git_lib._run(git_lib._tool("SABLE_MG_BD", "bd") + ["show", bead, "--json"],
+                      cwd=repo, check=False)
+    if cp.returncode != 0:
+        raise FootprintUndetermined(f"bd show {bead} failed: {cp.stdout.strip()[:200]}")
+    try:
+        data = json.loads(cp.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return {"description": cp.stdout, "metadata": {}}
+    record = data[0] if isinstance(data, list) and data else data
+    if not isinstance(record, dict):
+        return {"description": cp.stdout, "metadata": {}}
+    return {"description": record.get("description") or "",
+            "metadata": record.get("metadata") or {}}
+
+
+def _metadata_entries(metadata: dict, key: str) -> frozenset[str] | None:
+    """The trichotomy (tarzan's ruling, SABLE-jd5fj.10) applied to one flat
+    string-list metadata key: `None` means the key is ABSENT (undeclared /
+    not run — the caller must fail toward the next fallback, never toward an
+    empty footprint); a present key returns its comma-split entries, which may
+    themselves be an empty frozenset (declared, found nothing). Collapsing
+    the `None` case into `frozenset()` here would be the exact writer-side
+    collapse this schema exists to prevent, just moved into the reader."""
+    if key not in metadata:
+        return None
+    raw = metadata.get(key) or ""
+    return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
 def declared_footprint(repo: str, bead: str) -> Footprint:
-    """The planner-declared footprint for <bead>, read via the bd seam.
+    """The planner-declared footprint for <bead>.
+
+    Prefers the structured `footprint_writes` metadata field (SABLE-jd5fj.10)
+    over the `## File footprint` prose section: the field, when present, is
+    used VERBATIM and the prose parser is not consulted at all. A bead
+    dispatched before this field existed carries no such key, so this falls
+    back to the prose parser exactly as before — the fallback is not a
+    degraded mode, it is the ordinary path for every pre-field bead.
 
     Raises FootprintUndetermined when bd cannot be read at all. That is
     fail-closed on purpose: without the declared footprint we cannot honour
     "wider governs", and promoting on a possibly-narrower mechanical answer is
-    the one direction this bead is not allowed to take. A bd that ANSWERS with a
-    description containing no footprint section is a different thing entirely —
-    that is an empty declared footprint, and the mechanical one governs."""
+    the one direction this bead is not allowed to take. A bd that ANSWERS with
+    no structured field and no prose footprint section is a different thing
+    entirely — that is an empty declared footprint, and the mechanical one
+    governs."""
     if not bead:
         raise FootprintUndetermined("no bead id — cannot read the declared footprint")
-    cp = git_lib._run(git_lib._tool("SABLE_MG_BD", "bd") + ["show", bead],
-                      cwd=repo, check=False)
-    if cp.returncode != 0:
-        raise FootprintUndetermined(f"bd show {bead} failed: {cp.stdout.strip()[:200]}")
-    return footprint(parse_declared_footprint(cp.stdout), source=f"declared:{bead}")
+    record = _read_bead(repo, bead)
+    structured = _metadata_entries(record["metadata"], "footprint_writes")
+    if structured is not None:
+        return footprint(structured, source=f"declared:{bead}:field")
+    return footprint(parse_declared_footprint(record["description"]),
+                     source=f"declared:{bead}:prose")
 
 
 def declared_reads(repo: str, bead: str) -> Footprint:
     """The planner-declared READ footprint for <bead> (SABLE-jd5fj.18): the
     files this branch's behaviour depends on, whether or not it writes them.
 
-    Unlike declared_footprint(), an ABSENT `## File reads` section is NOT
-    "declares nothing" — it raises FootprintUndetermined. This is the floor
-    this bead builds: reads have no mechanical fallback yet, so silence about
-    what a branch reads must fail toward serialization exactly like an
-    unparseable diff does, never toward the old silent 'parallel-safe'
-    default. A section that IS present, even declaring zero paths, is a real
-    answer and comes back as an ordinary (possibly empty) Footprint."""
+    Prefers the structured `footprint_reads_declared` metadata field
+    (SABLE-jd5fj.10) over the `## File reads` prose section, same precedence
+    as declared_footprint(). The trichotomy is carried through unchanged: a
+    present-but-empty structured field ("declared, found nothing") behaves
+    exactly like a present-but-empty prose section — both return an ordinary
+    empty Footprint — while an ABSENT structured field falls back to the
+    prose parser, and only if THAT is also absent does this raise.
+
+    Unlike declared_footprint(), an ABSENT read declaration (structured AND
+    prose) is NOT "declares nothing" — it raises FootprintUndetermined. This
+    is the floor this bead builds: reads have no mechanical fallback yet, so
+    silence about what a branch reads must fail toward serialization exactly
+    like an unparseable diff does, never toward the old silent 'parallel-safe'
+    default."""
     if not bead:
         raise FootprintUndetermined("no bead id — cannot read the declared read footprint")
-    cp = git_lib._run(git_lib._tool("SABLE_MG_BD", "bd") + ["show", bead],
-                      cwd=repo, check=False)
-    if cp.returncode != 0:
-        raise FootprintUndetermined(f"bd show {bead} failed: {cp.stdout.strip()[:200]}")
-    declared, entries = parse_declared_reads(cp.stdout)
+    record = _read_bead(repo, bead)
+    structured = _metadata_entries(record["metadata"], "footprint_reads_declared")
+    if structured is not None:
+        return footprint(structured, source=f"declared-reads:{bead}:field")
+    declared, entries = parse_declared_reads(record["description"])
     if not declared:
         raise FootprintUndetermined(
-            f"no declared '## File reads' section for {bead} — undeclared read set "
-            f"forces serialization (SABLE-jd5fj.18 floor)")
-    return footprint(entries, source=f"declared-reads:{bead}")
+            f"no declared read footprint (field or '## File reads' section) for "
+            f"{bead} — undeclared read set forces serialization (SABLE-jd5fj.18 floor)")
+    return footprint(entries, source=f"declared-reads:{bead}:prose")
 
 
 # --------------------------------------------------------------------------

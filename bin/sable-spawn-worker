@@ -116,6 +116,7 @@ from sable_pane_lib import (  # noqa: E402
     wait_for_ready, worker_cap,
 )
 from sable_pane_lib import deliver_text as deliver_dispatch  # noqa: E402
+import sable_footprint_lib as fp_lib  # noqa: E402
 
 DEFAULT_SESSION = "sable"
 DEFAULT_MODEL = "sonnet"
@@ -599,6 +600,42 @@ def tag_branch_metadata(bead_id: str, branch: str) -> None:
     resolution to the legacy prose fallback, it never blocks dispatch."""
     subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata",
                     f"branch={branch}"], capture_output=True, text=True)
+
+
+def tag_footprint_metadata(bead_id: str, description: str) -> None:
+    """Record the planner-declared write/read footprint as STRUCTURED metadata
+    at dispatch time (SABLE-jd5fj.10, tarzan's settled schema): footprint_writes
+    and footprint_reads_declared, each a flat comma-joined string list --
+    matching how branch/model/wip_claims are already carried in this same flat
+    dict. footprint_reads_derived is part of the settled schema too, but it is
+    POPULATED by the mechanical-derivation follow-up bead, never here.
+
+    THE WRITER-SIDE TRAP (optimus's brief, this is the acceptance criterion):
+    a key must be OMITTED entirely when `description` supplies no section for
+    it -- stamping an empty list instead would silently convert UNDECLARED
+    into DECLARED-EMPTY, which the jd5fj.18 read/write floor cannot tell apart
+    from an explicit "this bead reads nothing" and would therefore wrongly
+    release the bead for parallel promotion. A section that IS present, even
+    naming zero paths, DOES get an explicit metadata value (possibly the empty
+    string) -- that is the declared-empty state and it must stay
+    distinguishable from absence at the far end (sable_footprint_lib's
+    _metadata_entries: key-not-in-dict is None, key-present is a frozenset,
+    however small).
+
+    Best-effort like every other governance write in this module (branch,
+    model, serialize_with): a missed tag degrades to the prose fallback in
+    sable_footprint_lib, it never blocks dispatch."""
+    writes = extract_footprint_section(description)
+    if writes:
+        subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata",
+                        f"footprint_writes={','.join(sorted(writes))}"],
+                       capture_output=True, text=True)
+
+    reads_declared, reads = fp_lib.parse_declared_reads(description)
+    if reads_declared:
+        subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata",
+                        f"footprint_reads_declared={','.join(sorted(reads))}"],
+                       capture_output=True, text=True)
 
 
 def tag_model_metadata(bead_id: str, model: str, source: str) -> None:
@@ -1651,8 +1688,10 @@ def main(argv: list[str] | None = None) -> int:
     # a stand-in/test spawn against a bead this caller does not own writing
     # to, and must leave it untouched exactly as the claim/status writes do.
     if not ns.skip_governance:
+        beads_by_id = {bid: bead, **dict(zip(bundle_ids, bundle_beads))}
         for tag_id in [bid, *bundle_ids]:
             tag_branch_metadata(tag_id, branch)
+            tag_footprint_metadata(tag_id, beads_by_id[tag_id].get("description") or "")
 
     # SABLE-ji4h: link opted-in gitignored fixtures into the worktree. Placed
     # AFTER both arms above so a --respawn into an existing tree is repaired

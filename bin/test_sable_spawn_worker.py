@@ -799,6 +799,75 @@ def test_tag_branch_metadata_swallows_bd_failure(monkeypatch):
     ssw.tag_branch_metadata("SABLE-x1", "wk-my-slug")  # must not raise
 
 
+# --- tag_footprint_metadata (SABLE-jd5fj.10) --------------------------------
+
+def test_tag_footprint_metadata_writes_both_fields_when_both_sections_present(monkeypatch):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ssw.subprocess, "run", fake_run)
+    description = ("Story.\n\n## File footprint\nbin/one.py, bin/two.py\n\n"
+                   "## File reads\nhooks/read.sh\n")
+    ssw.tag_footprint_metadata("SABLE-x1", description)
+    assert calls == [
+        ["bd", "update", "SABLE-x1", "--sandbox", "--set-metadata",
+         "footprint_writes=bin/one.py,bin/two.py"],
+        ["bd", "update", "SABLE-x1", "--sandbox", "--set-metadata",
+         "footprint_reads_declared=hooks/read.sh"],
+    ]
+
+
+def test_tag_footprint_metadata_omits_both_keys_when_no_sections_at_all(monkeypatch):
+    """THE WRITER-SIDE TRAP, negative direction: a bead with no '## File
+    footprint' and no '## File reads' section must get NEITHER key stamped --
+    not stamped with an empty list. ABSENT is the correct encoding of
+    "nothing was supplied", and the reader distinguishes it from
+    present-and-empty by key membership alone."""
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ssw.subprocess, "run", fake_run)
+    ssw.tag_footprint_metadata("SABLE-x1", "just a story, no sections at all")
+    assert calls == [], (
+        "no section declared -> no metadata write at all; a stamped empty "
+        "list here would silently convert UNDECLARED into DECLARED-EMPTY")
+
+
+def test_tag_footprint_metadata_writes_present_and_empty_reads_when_explicitly_declared_empty(monkeypatch):
+    """The negative control's counterpart: when the planner DID declare an
+    explicit (even empty) '## File reads' section, the key MUST be present
+    with an empty value -- this is the "declared, found nothing" state and it
+    is a real answer, not an omission."""
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ssw.subprocess, "run", fake_run)
+    description = "Story, no footprint section.\n\n## File reads\nnone\n"
+    ssw.tag_footprint_metadata("SABLE-x1", description)
+    assert calls == [
+        ["bd", "update", "SABLE-x1", "--sandbox", "--set-metadata",
+         "footprint_reads_declared="],
+    ], "an explicitly-declared-empty reads section must still stamp the key, with an empty value"
+
+
+def test_tag_footprint_metadata_swallows_bd_failure(monkeypatch):
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="db locked")
+
+    monkeypatch.setattr(ssw.subprocess, "run", fake_run)
+    description = "Story.\n\n## File footprint\nbin/one.py\n\n## File reads\nnone\n"
+    ssw.tag_footprint_metadata("SABLE-x1", description)  # must not raise
+
+
 # --- worker command ---------------------------------------------------------
 
 def test_worker_command_default_pins_model_and_auto_approves(monkeypatch):

@@ -22,6 +22,7 @@ would be testing this module against my belief about git rather than against
 git. The pure parser and the set algebra are tested directly, without a repo,
 because they have no such dependency.
 """
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -281,6 +282,40 @@ def test_declared_footprint_raises_when_bd_cannot_be_read(repo, monkeypatch):
     monkeypatch.setenv("SABLE_MG_BD", "false")
     with pytest.raises(fp.FootprintUndetermined):
         fp.declared_footprint(str(repo), "SABLE-nope")
+
+
+def test_declared_footprint_prefers_the_structured_field(repo, tmp_path, monkeypatch):
+    """SABLE-jd5fj.10: a structured `footprint_writes` metadata field is used
+    VERBATIM and the prose parser is not consulted at all — even when a
+    (deliberately different) '## File footprint' prose section is ALSO
+    present in the same description, its entries must not leak into the
+    result."""
+    record = [{
+        "description": "story text\n\n## File footprint\nprose/only.py",
+        "metadata": {"footprint_writes": "structured/one.py,structured/two.py"},
+    }]
+    fake_bd = tmp_path / "fake-bd-structured"
+    # printf, not echo -- dash's echo interprets \n escapes by default and
+    # would corrupt the JSON's own \n escape into a literal newline.
+    fake_bd.write_text(f"#!/bin/sh\nprintf '%s' '{json.dumps(record)}'\n")
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("SABLE_MG_BD", str(fake_bd))
+
+    result = fp.declared_footprint(str(repo), "SABLE-x")
+    assert result.entries == {"structured/one.py", "structured/two.py"}
+    assert "prose/only.py" not in result.entries, (
+        "the prose parser must not be consulted when the structured field is present")
+
+    # A bead that predates the field carries no metadata key at all (and a bd
+    # stub predating --json support just echoes raw prose regardless of the
+    # flag) -- the prose parser must still be the fallback.
+    fake_bd_prose = tmp_path / "fake-bd-prose-only"
+    fake_bd_prose.write_text(
+        "#!/bin/sh\necho '## File footprint'\necho 'legacy/prose.py'\n")
+    fake_bd_prose.chmod(0o755)
+    monkeypatch.setenv("SABLE_MG_BD", str(fake_bd_prose))
+    fallback = fp.declared_footprint(str(repo), "SABLE-y")
+    assert fallback.entries == {"legacy/prose.py"}
 
 
 def test_assess_reports_undetermined_instead_of_raising(repo, monkeypatch):
