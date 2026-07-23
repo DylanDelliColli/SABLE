@@ -32,6 +32,7 @@ FALSE CLEAR in a gap, which is the defect itself rather than a proxy for it.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -215,6 +216,128 @@ def test_real_registry_resolves_under_the_scratch_repos_own_git_dir(scratch):
     d = rl.registry_dir(str(scratch))
     assert d.startswith(str(Path(scratch / ".git").resolve()))
     assert rl.registry_dir(str(REPO)) != d      # and cannot collide with the fleet's
+
+
+# --- SABLE-skrdj: a readable-but-unattributed cwd is never silently dropped --
+#
+# These sample clearance through the REAL CLI subprocess (`sable-run-registry
+# clearance --json`), not the in-process `rl.clearance()` function directly.
+# That is deliberate, not stylistic: this test's own pytest process spawns the
+# "foreign" process it launches, so calling `rl.clearance()` in-process would
+# make `self` (this test) that foreign process's actual PARENT — the very
+# fork-to-exec descendant rule this fix relies on (see scan_processes) would
+# then correctly, but unhelpfully, call it CONFIDENTLY OURS regardless of its
+# cwd, defeating the point of these two tests. A separate CLI subprocess is
+# `self` in production too, so this also matches how the gate is really used.
+
+CLI_SAMPLE_INTERVAL = 0.15
+
+
+@pytest.fixture()
+def foreign_repo(tmp_path):
+    """A second, wholly separate real git repo — simulates an unrelated fleet
+    worktree running its own suite concurrently on the same host."""
+    repo = tmp_path / "foreign"
+    repo.mkdir()
+    env = _child_env(GIT_CONFIG_GLOBAL=str(tmp_path / "gitconfig-foreign"),
+                     GIT_CONFIG_SYSTEM="/dev/null")
+    _run("git", "init", "-q", "-b", "main", cwd=repo, env=env)
+    _run("git", "config", "user.email", "t@t", cwd=repo, env=env)
+    _run("git", "config", "user.name", "t", cwd=repo, env=env)
+    return repo
+
+
+def _cli_clearance(scratch: Path) -> dict:
+    out = subprocess.run(
+        [sys.executable, str(scratch / "bin" / "sable-run-registry"),
+         "clearance", "--json"],
+        cwd=str(scratch), env=_child_env(), capture_output=True, text=True)
+    return json.loads(out.stdout)
+
+
+def test_a_real_foreign_suite_process_is_never_clear(scratch, tmp_path):
+    """THE CORE SABLE-skrdj REGRESSION, with a REAL process and a REAL (but
+    non-git) directory: a suite-shaped, same-uid process whose cwd is
+    readable, outside the scratch repo's roots, AND resolves into no git repo
+    at all (a bare tmp dir) must never let clearance(base=scratch) read CLEAR
+    while it runs — and must name it in the reason.
+
+    Control, same base: with no such process running, clearance DOES read
+    CLEAR — so this proves a discriminating gate, not one that never clears."""
+    assert _cli_clearance(scratch)["state"] == rl.CLEAR
+
+    outside = tmp_path / "not-a-git-repo-at-all"
+    outside.mkdir()
+    (outside / "test_slow.py").write_text(
+        "def test_slow():\n    import time\n    time.sleep(3.0)\n")
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pytest", "test_slow.py", "-q",
+         "-p", "no:cacheprovider"],
+        cwd=str(outside), env=_child_env(),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 15.0
+        states = []
+        reasons = []
+        while proc.poll() is None and time.monotonic() < deadline:
+            d = _cli_clearance(scratch)
+            # Only count a sample if the process was CONFIRMED still running
+            # both before AND after the clearance round-trip — the CLI
+            # subprocess itself takes real time to spawn, and a sample
+            # straddling the process's actual exit is correctly CLEAR, not a
+            # gap (same "two moments not part of the run" edge as
+            # held_window() below, just bracketed explicitly here because
+            # there is no registration to window on).
+            if proc.poll() is None:
+                states.append(d["state"])
+                reasons.append(" ".join(d["reasons"]))
+            time.sleep(CLI_SAMPLE_INTERVAL)
+    finally:
+        proc.wait(timeout=30)
+
+    assert len(states) > 5, f"sampling window too short to mean anything: {states}"
+    assert rl.CLEAR not in states, (
+        f"clearance(base=scratch) read CLEAR while a foreign, unattributable "
+        f"suite process was live: {states}")
+    assert any("not-a-git-repo-at-all" in r for r in reasons), (
+        f"the loud state did not name the unattributed process: {reasons}")
+
+    assert _cli_clearance(scratch)["state"] == rl.CLEAR, \
+        "not released once the foreign process exited"
+
+
+def test_real_quiet_repo_stays_clear_while_an_unrelated_real_repo_runs_a_suite(
+        scratch, foreign_repo):
+    """THE GATE-CAN-RELEASE CANARY UNDER REAL AMBIENT LOAD (SABLE-skrdj
+    additional acceptance criteria). A real suite-shaped process running in a
+    DIFFERENT real git repo — CONFIDENTLY FOREIGN, not genuinely unknown —
+    must not flip clearance(base=scratch) away from CLEAR. A naive fix that
+    makes every unattributed candidate loud would make this repo's own
+    clearance flap non-clear every time any other agent on the host runs a
+    suite, which is exactly how test_real_quiet_repo_returns_clear goes red
+    the moment another agent runs a suite, and a gate nobody can ever satisfy
+    gets bypassed — which is its own failure mode."""
+    (foreign_repo / "test_slow.py").write_text(
+        "def test_slow():\n    import time\n    time.sleep(3.0)\n")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pytest", "test_slow.py", "-q",
+         "-p", "no:cacheprovider"],
+        cwd=str(foreign_repo), env=_child_env(),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 15.0
+        states = []
+        while proc.poll() is None and time.monotonic() < deadline:
+            states.append(_cli_clearance(scratch)["state"])
+            time.sleep(CLI_SAMPLE_INTERVAL)
+    finally:
+        proc.wait(timeout=30)
+
+    assert len(states) > 5, f"sampling window too short to mean anything: {states}"
+    assert all(s == rl.CLEAR for s in states), (
+        f"clearance(base=scratch) left CLEAR while an unrelated real repo's "
+        f"own suite ran: {states}")
 
 
 # --- the shipped shell runner, verbatim --------------------------------------
