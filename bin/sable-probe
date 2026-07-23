@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""sable-probe — refuses to report a probe verdict unless the TERM has been
+shown to discriminate first (SABLE-xhrt0).
+
+THE DEFECT THIS EXISTS FOR
+--------------------------
+A probe (grep term, count comparison, exit-code test) is written from what
+the author BELIEVES an artifact looks like -- a paraphrase, a remembered
+format, a structure that ought to be there -- and its result is then
+trusted. When the term does not match the artifact's real structure, the
+probe returns a value that LOOKS like an answer and is not one.
+
+The dangerous form is the ZERO READING. A term that can never match returns
+0. A term that matches nothing because the content is genuinely absent also
+returns 0. THESE ARE THE SAME OUTPUT. Nothing in a bare `git grep` result
+distinguishes "the thing is not there" from "my question was malformed".
+
+Three live instances, one shift, 2026-07-22 (SABLE-mn1da, SABLE-rhsuj,
+SABLE-wqe2e) -- all caught, all luck of phrasing rather than discipline: the
+same one-line probe can fail toward a false alarm OR a false clearance, and
+nothing in its form tells you which direction it failed.
+
+THE FIX: run BOTH polarities before answering. The term must read NONZERO
+against a KNOWN-POSITIVE artifact (proving it CAN match) and ZERO against a
+KNOWN-NEGATIVE artifact (proving the zero reading is a real negative, not a
+broken term) before this tool will say ABSENT. A term that has only ever
+been run against the case under test has never been shown to discriminate
+-- this is plant-and-fail applied to probes, the SABLE-3mrv3 lesson (derive
+signatures from a real captured instance, never a memory of a format)
+escaping from test assertions into operator probes.
+
+Existence is checked BEFORE grepping (git cat-file -e / rev-parse --verify),
+per the bead's exit-code corollary: a ref that does not resolve is
+COULD-NOT-ASSESS, never a negative answer (SABLE-rhsuj, instance 2: a
+containment probe's `|| echo NOT CONTAINED` fired on a *missing ref*, not a
+real negative, and reported a clean merge as lost).
+
+USAGE
+  sable-probe --term TERM --known-positive REF --known-negative REF
+  sable-probe --term TERM --known-positive REF --known-negative REF --path PATH
+  sable-probe --term TERM --known-positive REF --known-negative REF --repo PATH
+  sable-probe --term TERM --known-positive REF --known-negative REF --format=json
+
+  --known-positive REF   a ref where TERM is independently known to be
+                          present (a captured diff hunk, a fixture, a
+                          post-change state you already confirmed by other
+                          means). Validates that TERM can match at all.
+  --known-negative REF   a ref where TERM is independently known/expected to
+                          be absent (a pre-change base, an unrelated ref).
+                          The verdict answers whether TERM is present here.
+  --path PATH             scope the search to one path within both refs'
+                          trees (default: search the whole tree).
+  TERM is matched as a FIXED STRING (git grep -F), never a regex -- a term
+  copied verbatim out of an artifact routinely contains regex metacharacters
+  ('(', ')', '.', '*') that would silently change its meaning.
+
+EXIT CODES
+  0  ABSENT   — TERM is validated (matches known-positive) and genuinely
+                absent from known-negative. The only verdict this tool
+                exists to make trustworthy.
+  1  PRESENT  — TERM matches known-negative too. The caller's assumption
+                that known-negative is a valid negative control does not
+                hold; reported honestly rather than discarded.
+  2  usage error
+  3  COULD NOT ASSESS — TERM does not even match known-positive (the term
+                itself is unvalidated -- NOT evidence of absence), or a
+                ref/path does not resolve. Never guessed at as a verdict.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+EXIT_ABSENT = 0
+EXIT_PRESENT = 1
+EXIT_USAGE = 2
+EXIT_COULD_NOT_ASSESS = 3
+
+MATCH_YES = "match-yes"
+MATCH_NO = "match-no"
+MATCH_UNRESOLVED = "match-unresolved"
+
+ABSENT = "absent"
+PRESENT = "present"
+COULD_NOT_ASSESS = "could-not-assess"
+
+
+# --- pure-ish helpers (unit-tested in bin/test_sable_probe.py) --------------
+
+def grep_verdict(rc: int) -> str:
+    """`git grep -q -F -e TERM REF [-- PATH]` exit code -> match verdict.
+    0 = matched (TERM is present); 1 = ran cleanly and found nothing (TERM is
+    absent); anything else (128 for a bad ref, or any other git failure) is
+    MATCH_UNRESOLVED -- git grep's own exit codes already distinguish "no
+    match" (1) from "could not even run the search" (128), and this function
+    preserves that distinction rather than collapsing both into a zero."""
+    if rc == 0:
+        return MATCH_YES
+    if rc == 1:
+        return MATCH_NO
+    return MATCH_UNRESOLVED
+
+
+def combine_probe(positive_verdict: str, negative_verdict: str) -> tuple[str, str]:
+    """Reconcile the two independent grep verdicts into one probe verdict
+    plus a human reason. THE GUARD (SABLE-xhrt0): ABSENT is refused unless
+    TERM first proved it CAN match something. Without this gate, a term that
+    matches nothing anywhere (a paraphrase, a remembered format) produces
+    the exact same ABSENT reading as a term that correctly discriminates --
+    the zero-reading confusion the whole bead is about."""
+    if positive_verdict == MATCH_UNRESOLVED:
+        return COULD_NOT_ASSESS, "known-positive ref/path is unreadable"
+    if positive_verdict == MATCH_NO:
+        return (COULD_NOT_ASSESS,
+                "term does not match the known-positive artifact -- the "
+                "term itself is unvalidated, this is NOT evidence of absence")
+    # positive_verdict == MATCH_YES from here: TERM is proven capable of
+    # matching, so a reading against known-negative can now be trusted.
+    if negative_verdict == MATCH_UNRESOLVED:
+        return COULD_NOT_ASSESS, "known-negative ref/path is unreadable"
+    if negative_verdict == MATCH_NO:
+        return (ABSENT,
+                "validated: term matches known-positive and is genuinely "
+                "absent from known-negative")
+    return (PRESENT,
+            "term matches known-negative too -- the assumed negative "
+            "control does not hold, reported as found rather than discarded")
+
+
+def render_report(term: str, positive_ref: str, negative_ref: str,
+                   verdict: str, reason: str) -> str:
+    """The one-line human/hook answer. Every verdict names the reason so a
+    reader never has to re-run the tool to see why."""
+    if verdict == ABSENT:
+        return (f"ABSENT: '{term}' is validated (matches {positive_ref}) "
+                f"and genuinely absent from {negative_ref}")
+    if verdict == PRESENT:
+        return (f"PRESENT: '{term}' matches {negative_ref} too -- {reason}")
+    return f"COULD NOT ASSESS: '{term}' -- {reason}"
+
+
+# --- process boundary --------------------------------------------------------
+
+def _git(repo: str, *args: str) -> subprocess.CompletedProcess:
+    """Never raises: a missing/misconfigured git is COULD-NOT-ASSESS here,
+    not a traceback. Overridable via SABLE_PROBE_GIT (mirrors
+    sable_contained's SABLE_CONTAINED_GIT seam) so tests can inject a faulty
+    git for fault-injection coverage."""
+    tool = os.environ.get("SABLE_PROBE_GIT", "git").split()
+    try:
+        return subprocess.run(tool + list(args), cwd=repo, text=True,
+                               capture_output=True)
+    except OSError as exc:
+        return subprocess.CompletedProcess(list(args), 127, "", str(exc))
+
+
+def ref_resolves(repo: str, ref: str) -> bool:
+    """Does <ref> name something this repo can resolve? Checked BEFORE
+    grepping so a bad ref is reported as unreadable, not silently folded
+    into git grep's own error path (SABLE-rhsuj corollary: existence
+    precondition first, failure is COULD-NOT-ASSESS, never a negative)."""
+    return _git(repo, "rev-parse", "--verify", "--quiet",
+                f"{ref}^{{commit}}").returncode == 0
+
+
+def path_exists(repo: str, ref: str, path: str) -> bool:
+    """Does <path> exist in <ref>'s tree? Only called once ref_resolves has
+    already passed, so a non-zero here can only mean the path is absent."""
+    return _git(repo, "cat-file", "-e", f"{ref}:{path}").returncode == 0
+
+
+def grep_side(repo: str, term: str, ref: str, path: str | None) -> str:
+    """Runs the existence precondition then the grep, returning a
+    grep_verdict string. Never runs git grep against a ref/path that has not
+    already been confirmed to resolve."""
+    if not ref_resolves(repo, ref):
+        return MATCH_UNRESOLVED
+    if path is not None and not path_exists(repo, ref, path):
+        return MATCH_UNRESOLVED
+    args = ["grep", "-q", "-F", "-e", term, ref]
+    if path is not None:
+        args += ["--", path]
+    return grep_verdict(_git(repo, *args).returncode)
+
+
+def probe(repo: str, term: str, positive_ref: str, negative_ref: str,
+          path: str | None) -> dict:
+    positive = grep_side(repo, term, positive_ref, path)
+    negative = grep_side(repo, term, negative_ref, path)
+    verdict, reason = combine_probe(positive, negative)
+    return {"verdict": verdict, "reason": reason,
+            "known_positive_match": positive, "known_negative_match": negative}
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sable-probe",
+        description="Refuses to report a probe verdict for TERM unless it "
+                     "reads nonzero against --known-positive and zero "
+                     "against --known-negative first (SABLE-xhrt0) -- a "
+                     "zero reading from an unvalidated term is "
+                     "indistinguishable from a true negative.",
+    )
+    parser.add_argument("--term", required=True,
+                         help="fixed-string term to search for (git grep -F)")
+    parser.add_argument("--known-positive", required=True, dest="known_positive",
+                         help="ref where TERM is independently known to be present")
+    parser.add_argument("--known-negative", required=True, dest="known_negative",
+                         help="ref where TERM is independently known/expected "
+                              "to be absent -- the verdict answers this side")
+    parser.add_argument("--path", default=None,
+                         help="scope the search to one path in both refs' "
+                              "trees (default: whole tree)")
+    parser.add_argument("--repo", default=os.getcwd(),
+                         help="git repo to check (default: CWD)")
+    parser.add_argument("--format", choices=["text", "json"], default="text")
+    return parser
+
+
+def _emit(payload: dict, message: str, fmt: str) -> None:
+    print(json.dumps({**payload, "message": message}) if fmt == "json" else message)
+
+
+def _exit_for(verdict: str) -> int:
+    return {
+        ABSENT: EXIT_ABSENT,
+        PRESENT: EXIT_PRESENT,
+    }.get(verdict, EXIT_COULD_NOT_ASSESS)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    repo = os.path.abspath(args.repo)
+    result = probe(repo, args.term, args.known_positive, args.known_negative,
+                    args.path)
+    payload = {"term": args.term, "known_positive": args.known_positive,
+               "known_negative": args.known_negative, "path": args.path,
+               **result}
+    message = render_report(args.term, args.known_positive, args.known_negative,
+                             result["verdict"], result["reason"])
+    _emit(payload, message, args.format)
+    return _exit_for(result["verdict"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
