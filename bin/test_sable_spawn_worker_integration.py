@@ -12,6 +12,7 @@ is written, and the read-instruction is delivered into the pane.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -1883,6 +1884,231 @@ def test_skip_governance_dispatch_does_not_stamp_model_metadata(sock):
         assert _model_meta(env, bead_id) == {}
         assert "model=sonnet model_source=default" in r.stderr
         assert "not stamped: --skip-governance" in r.stderr
+
+
+# --- SABLE-fz8kd: a bundled dispatch must not deny itself, and a refused -----
+# --- dispatch must claim nothing. REAL bd store, REAL tmux, REAL CLI. --------
+#
+# *** WHICH FILE IS UNDER TEST ***
+# `sable-spawn-worker` on PATH is a symlink into the SHARED main checkout, NOT
+# into this worktree:
+#     /home/ddc/.local/bin/sable-spawn-worker -> <main checkout>/bin/sable-spawn-worker
+# So anything that invokes the tool BY NAME — a bare `sable-spawn-worker`, a
+# subprocess call with no explicit path, a helper that shells out — runs the
+# INSTALLED copy and silently measures a file nobody in this branch edited.
+# Both failure directions are quiet: a pre-fix demonstration can pass spuriously,
+# and a post-fix green can be green about code that was never written. Every test
+# in this module therefore runs `python3 <absolute BIN>`, and _assert_bin_is_this_branch
+# states, in the test output, exactly which file was executed.
+#
+# The positive leg below is additionally SELF-CERTIFYING: a bundle whose members
+# share a declared path CANNOT dispatch under the installed (unfixed) copy — it
+# denies itself, which is this bead. A green there is only reachable from the
+# branch artifact.
+
+
+def _assert_bin_is_this_branch() -> Path:
+    """Resolve, PRINT, and assert the tool actually under test. A test that
+    cannot say which file it exercised cannot support a green claim."""
+    resolved = BIN.resolve()
+    print(f"[SABLE-fz8kd] tool under test: {resolved}")
+    installed = shutil.which("sable-spawn-worker")
+    if installed:
+        print(f"[SABLE-fz8kd] installed on PATH:  {Path(installed).resolve()}")
+    assert resolved.parent == Path(__file__).resolve().parent, (
+        f"tool under test {resolved} is not this branch's copy "
+        f"(expected alongside {__file__})")
+    assert resolved.is_file()
+    return resolved
+
+
+def test_the_tool_under_test_is_this_branch_not_the_installed_symlink():
+    """Guard for every other test here: fail LOUD if the absolute-path binding
+    ever regresses to a PATH lookup. Asserts both that BIN is this worktree's
+    copy and that no test in this module spells a bare `sable-spawn-worker`
+    invocation."""
+    _assert_bin_is_this_branch()
+    source = Path(__file__).read_text()
+    by_name = re.findall(
+        r"(?:run|Popen|check_output|check_call)\(\s*\[[^\]]*[\"']sable-spawn-worker[\"']",
+        source)
+    assert by_name == [], (
+        "a test invokes the tool by NAME — that resolves through PATH to the "
+        f"installed copy, not this branch: {by_name}")
+    assert "str(BIN)" in source
+
+
+@pytest.fixture()
+def real_bd_repo():
+    """A REAL bd store — embedded dolt, the same backend the fleet runs — in a
+    throwaway git repo. Not a stand-in CLI and not the project database: the
+    dispatch-prep brief for this bead is explicit that stray scratch beads feed
+    the very overlap_check under repair, so nothing here is allowed to touch
+    the project's beads. The whole store dies with the temp dir."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        init = subprocess.run(["bd", "init", "--prefix", "FZTEST"],
+                              cwd=repo, capture_output=True, text=True)
+        if init.returncode != 0:
+            pytest.skip(f"could not create an isolated bd store: {init.stderr[-400:]}")
+        yield repo
+
+
+def _bd(repo: Path, *args) -> str:
+    r = subprocess.run(["bd", *args], cwd=repo, capture_output=True, text=True)
+    assert r.returncode == 0, f"bd {' '.join(args)} failed: {r.stderr}"
+    return r.stdout
+
+
+def _new_bead(repo: Path, title: str, description: str) -> str:
+    out = _bd(repo, "create", f"--title={title}", f"--description={description}",
+              "--type=task", "-p", "2", "--json")
+    try:
+        return json.loads(out)["id"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        # older bd prints "✓ Created issue: <id> — <title>"
+        for tok in out.replace("—", " ").split():
+            if tok.startswith("FZTEST-"):
+                return tok
+        raise AssertionError(f"could not read a bead id out of: {out!r}")
+
+
+def _status(repo: Path, bead_id: str) -> str:
+    return json.loads(_bd(repo, "show", bead_id, "--json"))[0]["status"]
+
+
+def _status_and_assignee(repo: Path, bead_id: str) -> tuple[str, str]:
+    """SABLE-k9syl: a refused dispatch must leave the pool byte-identical, which
+    is a claim about ASSIGNEE as well as status — `bd update --claim` writes
+    both, and a release that restored only the status would leave a bead that
+    reads unowned-but-owned to anything matching on assignee."""
+    bead = json.loads(_bd(repo, "show", bead_id, "--json"))[0]
+    return bead["status"], (bead.get("assignee") or "")
+
+
+def _real_bd_env(sock, dd):
+    env = {
+        **_clean_env(),
+        "SABLE_MAX_LOAD_PER_CORE": "0",
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_SESSION": "sable",
+        "SABLE_WORKER_CMD": "bash --noprofile --norc",
+        "SABLE_DISPATCH_DIR": dd,
+        "SABLE_DISPATCH_READY_TIMEOUT": "0",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+    }
+    env.pop("CLAUDE_AGENT_NAME", None)  # empty lane -> preempt is a no-op
+    return env
+
+
+_FOOTPRINT = "Story.\n\n## File footprint\nshared_target.py\n\n## Test spec\nx"
+
+
+def test_real_bd_bundle_sharing_a_declared_path_dispatches(sock, real_bd_repo):
+    """THE BEAD, end to end, at the size it actually fired (SABLE-k9syl: tarzan's
+    live 3-bead bundle). THREE REAL beads in a REAL bd store, all declaring
+    shared_target.py — which is the ordinary reason to bundle them into one
+    worktree — dispatched as one bundle through the real CLI. Before the fix the
+    invocation claimed the siblings, then denied itself against its own claims:
+
+        - SABLE-bjabn (…, in-progress): hooks/test/test-tier-red-capture.sh
+        SCHEDULING CONSTRAINT: dispatch denied.
+
+    Now it spawns, and ALL THREE beads end up in_progress WITH a worker."""
+    _assert_bin_is_this_branch()
+    lead = _new_bead(real_bd_repo, "bundle lead", _FOOTPRINT)
+    sib_a = _new_bead(real_bd_repo, "bundle sibling a", _FOOTPRINT)
+    sib_b = _new_bead(real_bd_repo, "bundle sibling b", _FOOTPRINT)
+
+    with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as wt:
+        r = subprocess.run(
+            ["python3", str(BIN), lead, "--bundle", f"{sib_a},{sib_b}",
+             "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=_real_bd_env(sock, dd),
+            cwd=real_bd_repo,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "SCHEDULING CONSTRAINT" not in r.stderr
+        time.sleep(0.6)
+
+        # a worker pane really exists for the lead bead
+        assert len(_worker_panes(sock, lead)) == 1
+        # and the dispatch prompt binds the worker to ALL THREE beads
+        prompt = (Path(dd) / f"{lead}.md").read_text()
+        assert sib_a in prompt and sib_b in prompt
+
+    # Every bundle member is claimed in the REAL store, matching the live pane —
+    # status AND assignee. This is also the POSITIVE CONTROL for the complement
+    # leg's "no assignee after a refusal": that assertion must not be able to
+    # pass because the field is never written on this path at all.
+    for bid in (lead, sib_a, sib_b):
+        status, assignee = _status_and_assignee(real_bd_repo, bid)
+        assert status == "in_progress", bid
+        assert assignee, bid
+
+
+def test_real_bd_foreign_overlap_denies_and_leaves_the_bundle_open(sock, real_bd_repo):
+    """COMPLEMENT LEG, carrying every acceptance criterion at once (SABLE-k9syl).
+
+    (1) The constraint is still REAL: a genuinely UNRELATED in-progress bead
+        holding shared_target.py denies the same 3-bead bundle that dispatched
+        cleanly above. Without this, the fix is a gate that can never deny —
+        which is worse than the bug.
+    (2) The refusal is FOR THE UNRELATED BEAD ONLY: it names the foreigner and
+        names NONE of the bundle's own members.
+    (3) Defect 2, at full precision: after the refusal the bead pool is
+        byte-identical to how the dispatch found it — all three members `open`
+        with NO assignee. Pre-fix, all three sat in_progress with no worker,
+        invisible as available work and counted as live concurrent work by
+        every later overlap check in the fleet, so a denied dispatch made the
+        NEXT dispatch more likely to be denied against work that does not
+        exist."""
+    _assert_bin_is_this_branch()
+    foreign = _new_bead(real_bd_repo, "foreign holder", "Someone else's work.")
+    _bd(real_bd_repo, "update", foreign, "--status", "in_progress")
+    _bd(real_bd_repo, "update", foreign, "--set-metadata",
+        "wip_claims=shared_target.py")
+    lead = _new_bead(real_bd_repo, "bundle lead 2", _FOOTPRINT)
+    sib_a = _new_bead(real_bd_repo, "bundle sibling 2a", _FOOTPRINT)
+    sib_b = _new_bead(real_bd_repo, "bundle sibling 2b", _FOOTPRINT)
+    before = {bid: _status_and_assignee(real_bd_repo, bid)
+              for bid in (lead, sib_a, sib_b)}
+    assert set(before.values()) == {("open", "")}, before
+
+    with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as wt:
+        r = subprocess.run(
+            ["python3", str(BIN), lead, "--bundle", f"{sib_a},{sib_b}",
+             "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=_real_bd_env(sock, dd),
+            cwd=real_bd_repo,
+        )
+        assert r.returncode == 11, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "OVERLAP DETECTED" in r.stderr
+        # refused for the UNRELATED bead ONLY — it is named, its own members are not
+        cited = r.stderr.split("OVERLAP DETECTED")[1].split("SCHEDULING")[0]
+        assert foreign in cited
+        for bid in (lead, sib_a, sib_b):
+            assert bid not in cited, f"{bid} (a bundle member) was cited as an overlap"
+        assert _worker_panes(sock, lead) == []
+
+    # THE POINT: a dispatch that produced no worker left the pool untouched —
+    # status AND assignee, for every bead named on the command line. Asserted as
+    # a whole-pool equality against the pre-dispatch snapshot AND spelled out
+    # per field, because `bd update --claim` writes BOTH: a rollback that
+    # restored only the status would leave a bead reading OPEN while still
+    # ASSIGNED to a lane — the "manager-reassigned, assignee already the lane,
+    # status still OPEN" state this tool already carries special handling for
+    # (SABLE-ixps). That bead looks available and is not: a subtler form of the
+    # residue defect 2 is about, not an absence of it.
+    after = {bid: _status_and_assignee(real_bd_repo, bid)
+             for bid in (lead, sib_a, sib_b)}
+    assert after == before, after
+    for bid in (lead, sib_a, sib_b):
+        status, assignee = after[bid]
+        assert status == "open", bid
+        assert assignee == "", f"{bid} left assigned to {assignee!r} by a refusal"
 
 
 if __name__ == "__main__":
