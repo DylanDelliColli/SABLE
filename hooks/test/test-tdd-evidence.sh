@@ -366,6 +366,42 @@ run_hook_silent "bare 'sable-test' with no command not recognized" \
 run_hook_writes "sable-test env -u A -u B <suite> (combined wrapper shape) recognized" \
   "sable-test env -u CLAUDE_AGENT_NAME -u SABLE_WORKER_PANE bash hooks/test/test-foo.sh"
 
+# ---------- SABLE-u2cig: trailing flags after the script name must not hide it ----------
+# The script path is not necessarily the segment's LAST token -- real CI
+# invocations pass flags AFTER the script name, e.g.
+# 'bash .github/ci/test-tiers.sh --run pre_push'. Requiring it be
+# positionally last silently dropped evidence for a genuine green run.
+
+run_hook_writes "bash <suite> with trailing flag+value recognized (test-tiers.sh --run pre_push)" \
+  "bash .github/ci/test-tiers.sh --run pre_push"
+
+run_hook_writes "bash <suite> with a single trailing flag recognized" \
+  "bash hooks/test/test-foo.sh --verbose"
+
+run_hook_writes "direct execution with trailing flag+value recognized" \
+  "./hooks/test/test-foo.sh --run pre_push"
+
+run_hook_writes "absolute direct execution with trailing flags recognized" \
+  "/home/ddc/dev-environment/SABLE/hooks/test/test-foo.sh --run pre_push"
+
+# repo-tagging must still work when the absolute direct-exec script carries
+# trailing flags (the self-tagging path keys off the matched script token,
+# not the segment's last token).
+TRAILFLAG_SID="tdd-ev-trailflag-$$-$RANDOM"
+TRAILFLAG_EV="/tmp/tdd-evidence-${TRAILFLAG_SID}"
+rm -f "$TRAILFLAG_EV"
+make_input "bash /home/ddc/dev-environment/SABLE/hooks/test/test-tree-claim.sh --run pre_push" "$TRAILFLAG_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if grep -q 'REPO=/home/ddc/dev-environment/SABLE' "$TRAILFLAG_EV" 2>/dev/null; then
+  pass "trailing-flags run: evidence line still tagged with its own hooks/ repo"
+else
+  fail "trailing-flags run: evidence line still tagged with its own hooks/ repo" "got: $(cat "$TRAILFLAG_EV" 2>/dev/null)"
+fi
+rm -f "$TRAILFLAG_EV"
+
+# Negative: a non-test script with trailing flags still does not register.
+run_hook_silent "bash setup.sh --run pre_push (non-test script) not recognized" \
+  "bash setup.sh --run pre_push"
+
 # ---------- SABLE-x8mx7: bare inline VAR=value prefix must be unwrapped ----------
 # A bare 'NAME=value ... <cmd>' assignment prefix is the shell's own
 # env-for-one-command form (e.g. the fleet's sandbox-pinning contract:
