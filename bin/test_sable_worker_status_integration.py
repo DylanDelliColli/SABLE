@@ -575,6 +575,86 @@ def test_dialog_probe_json_carries_stalls_and_workers(sock):
     assert payload["dialog_stalls"][0]["class"] == "manager"
 
 
+# --- SABLE-n87ov: reporting a stall reproduces the symptom on the reporter's
+# own audience. The probe used to grep the WHOLE visible pane for a dialog
+# affordance substring, so a sable-msg relay QUOTING that substring (to help
+# the recipient recognise the earlier true positive) rendered the same text
+# into the recipient's healthy pane and re-triggered the detector on it. Fixed
+# by anchoring the match to the pane's CURRENT CURSOR REGION -- content after
+# the last bare composer prompt line -- since a live overlay owns the bottom
+# of the pane (nothing, least of all a composer, follows it) while a mention
+# is followed, on an otherwise-idle pane, by the reappeared empty composer. ---
+
+def _echo_dialog_text_as_mention(s, target):
+    """Print the SAME dialog-affordance text a real overlay would show, but as
+    ordinary scrollback output -- a stand-in for a sable-msg relay quoting a
+    stall report -- followed by a bare composer prompt glyph proving the pane
+    is otherwise idle, not actually parked on a dialog."""
+    _tmux(s, "send-keys", "-t", target,
+          "printf '\\342\\237\\246SABLE-MSG\\342\\237\\247 pane w0 stalled -- "
+          "matched (Use arrow keys, Enter to select)\\n\\342\\235\\257\\n'", "Enter")
+    time.sleep(0.4)
+
+
+def test_dialog_probe_ignores_mention_but_still_flags_real_overlay(sock):
+    """The bead's core two-pane repro: pane 0 genuinely shows the select-overlay
+    text (no composer follows it); pane 1 shows the IDENTICAL affordance text
+    as an ordinary echoed mention, followed by an idle composer glyph. Exactly
+    ONE pane -- the real overlay -- is reported DIALOG-STALLED."""
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_role", "tarzan")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_lane", "tarzan")
+    _prime_dialog(sock, "w.0")
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_role", "lincoln")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_lane", "lincoln")
+    _echo_dialog_text_as_mention(sock, "w.1")
+    time.sleep(0.3)
+
+    p0 = _tmux(sock, "display-message", "-p", "-t", "w.0", "#{pane_id}").stdout.strip()
+    p1 = _tmux(sock, "display-message", "-p", "-t", "w.1", "#{pane_id}").stdout.strip()
+
+    r = _run(sock, "--all")
+    assert r.returncode == 0, r.stderr
+    combined = r.stdout + r.stderr
+    assert r.stdout.count("DIALOG-STALLED") == 1, r.stdout
+    assert p0 in combined, combined                 # the real overlay IS flagged
+    assert p1 not in r.stderr, r.stderr              # the mention is NOT flagged
+    assert "STALLED on a dialog/overlay" in r.stderr, r.stderr
+
+
+def test_dialog_probe_positive_control_neither_flagged_once_dismissed(sock):
+    """Positive control for the case above: once the genuinely-stalled pane's
+    overlay is dismissed (back to a plain idle composer) and the mention pane
+    is likewise idle, NEITHER pane is flagged -- the fix isn't 'detect
+    nothing', it correctly clears once the real condition is gone."""
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_role", "tarzan")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_lane", "tarzan")
+    _tmux(sock, "send-keys", "-t", "w.0", "printf 'back to normal\\n\\342\\235\\257\\n'", "Enter")
+    time.sleep(0.4)
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_role", "lincoln")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_lane", "lincoln")
+    _echo_dialog_text_as_mention(sock, "w.1")
+    time.sleep(0.3)
+
+    r = _run(sock, "--all")
+    assert r.returncode == 0, r.stderr
+    assert "DIALOG-STALLED" not in r.stdout, r.stdout
+    assert "STALLED on a dialog/overlay" not in r.stderr, r.stderr
+
+
 # --- reaper liveness guard: a live agent we didn't spawn as a worker survives
 # --reap (SABLE-to8m, generalized by SABLE-k8o5) ------------------------------
 # Resuming an interactive claude inside a finished worker window left it carrying
