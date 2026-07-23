@@ -250,24 +250,38 @@ for seg in segments:
 
     if not matched:
         # Drop a trailing redirect operator and everything after it (its
-        # target file, fd, etc.) so the script path is still found as the
-        # segment's true last token — 'test.sh 2>&1' must match like 'test.sh'.
+        # target file, fd, etc.) — 'test.sh 2>&1' must match like 'test.sh'.
         core = seg
         for i, t in enumerate(seg):
             if REDIRECT_RE.match(t):
                 core = seg[:i]
                 break
-        last = core[-1] if core else seg[-1]
-        # 'bash x' / 'sh x' / 'source x' style, OR direct execution
-        # (./test-x.sh, /abs/path/test-x.sh — no interpreter token at all).
-        interpreted = head in ('bash', 'sh', 'source', '.') and SCRIPT_RE.search(last)
-        direct_exec = (last == head) and (last.startswith('./') or last.startswith('/')) and SCRIPT_RE.search(last)
-        if interpreted or direct_exec:
+        if not core:
+            core = seg
+        # SABLE-u2cig: the script path is not necessarily the segment's LAST
+        # token — real invocations pass flags AFTER the script name (e.g.
+        # 'bash .github/ci/test-tiers.sh --run pre_push'). Requiring it be
+        # positionally last silently dropped evidence for any such run even
+        # though the command genuinely executed (and passed) a test script.
+        # Search the interpreter's argument tokens for the one naming a test
+        # script, rather than pinning to the last position.
+        script_token = None
+        if head in ('bash', 'sh', 'source', '.'):
+            for t in core[1:]:
+                if SCRIPT_RE.search(t):
+                    script_token = t
+                    break
+        # Direct execution (./test-x.sh --run, /abs/path/test-x.sh --run):
+        # the script IS the segment's own command token (head), which can
+        # likewise carry its own trailing args/flags — not necessarily last.
+        if script_token is None and (head.startswith('./') or head.startswith('/')) and SCRIPT_RE.search(head):
+            script_token = head
+        if script_token is not None:
             matched = True
             # An absolute path naming its own hooks/ tree is a stronger repo
             # signal than any earlier cd/-C tracking — use it directly.
-            if last.startswith('/') and '/hooks/' in last:
-                effective_repo = last.split('/hooks/')[0]
+            if script_token.startswith('/') and '/hooks/' in script_token:
+                effective_repo = script_token.split('/hooks/')[0]
 
     if matched:
         hits.append((effective_repo or cwd or '', joined))
