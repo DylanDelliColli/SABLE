@@ -334,6 +334,21 @@ print('\n'.join(lines))
 # worker-landing wake and the Chuck handoff).
 FILES_BRIEF=$(echo "$FILES" | sed 's#.*/##' | head -8 | tr '\n' ' ')
 
+# SABLE-f916: both landing artifacts below (the live chuck message AND the
+# durable for-chuck bead fallback) were byte-identical in framing to what a
+# manager's deliberate, reviewed PR-ready sign-off would look like — Chuck had
+# no mechanical way to tell "hook auto-detected a push" apart from "a manager
+# actually reviewed this and accepts it." Incident 2026-07-15: an auto-notify
+# for wk-bin-symlink-parity (SABLE-59t6.6) was queued+inspected as if
+# PR-ready, but optimus had NOT accepted it (later rejected for false-green
+# tests). This tag self-labels every auto-notify so it's grep-distinguishable
+# from a real sign-off (which carries no such tag) — it does not change
+# firing/registration behavior. Defined here (moved up from just above the
+# Chuck-handoff block, SABLE-gx7p3) so the worker-landing wake below can also
+# carry it — that message went out untagged and asserted closure it never
+# observed.
+AUTO_NOTIFY_TAG="[AUTO-NOTIFY: push detected by hook, NOT a manager sign-off]"
+
 # --- Wake the dispatching manager on a worker landing (SABLE-nmmh) ---------
 # Managers now run an EVENT-DRIVEN loop: they END their turn when nothing is
 # actionable (optimus.md / tarzan.md), so a worker landing must ACTIVELY wake
@@ -353,7 +368,71 @@ if [ "${SABLE_WORKER_LAND_NOTIFY:-1}" = "1" ] \
    && command -v sable-msg >/dev/null 2>&1; then
   PANE_ROLE=$(tmux display-message -p -t "$TMUX_PANE" '#{@sable_role}' 2>/dev/null || echo "")
   if [ "$PANE_ROLE" = "worker" ]; then
-    LAND_MSG="Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed & bead closed. Review the outcome — closed bead + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
+    # SABLE-gx7p3: the hook observed exactly one thing — a confirmed push. It
+    # previously asserted "bead closed" and "for-chuck PR" unconditionally,
+    # which is TRUE only when the branch's work bead is actually closed;
+    # every other case (in_progress, unresolvable query) rendered the same
+    # false terminal claim at the moment a lane manager is most likely to act
+    # on it. Resolve the bead(s) here (only on the worker-landing path — a
+    # manager's own push never reaches this branch) via the SAME structured
+    # `branch` metadata sable-spawn-worker writes at dispatch time (mirrors
+    # sable-reconcile-handoffs's find_work_bead_status resolver), and report
+    # closure only when actually observed; otherwise say what is known (the
+    # push, and the real status) and say explicitly this is not a sign-off.
+    # A query failure leaves the set empty ("unknown") rather than defaulting
+    # to a claim.
+    #
+    # CARDINALITY (live second instance, optimus/tarzan, SABLE-dhcyu bundle,
+    # same evening as the original finding): a BUNDLED dispatch joins N>1
+    # beads to the SAME branch metadata. Taking only the first matching
+    # bead's status — this hook's own first-cut fix — reproduces the exact
+    # defect one level down: if that first bead happens to be closed while a
+    # sibling in the same bundle is still in_progress, the notify again
+    # asserts a singular "bead closed" that is false about the unit of work.
+    # So closure is asserted ONLY when EVERY bead sharing this branch's
+    # metadata is closed; a partial bundle reports the set (closed count /
+    # total, and which remain open) rather than a singular claim.
+    BEAD_ID=""
+    BEAD_TOTAL=0
+    BEAD_CLOSED_COUNT=0
+    BEAD_OPEN_LIST=""
+    BEAD_ALL_IDS=""
+    BEAD_QUERY=$(bd list --status all --metadata-field "branch=$BRANCH" --json 2>/dev/null || echo "")
+    if [ -n "$BEAD_QUERY" ]; then
+      BEAD_ROWS=$(printf '%s' "$BEAD_QUERY" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+if isinstance(data, list):
+    for item in data:
+        if isinstance(item, dict) and item.get('status'):
+            print(f\"{item.get('id', '')}\t{item.get('status', '')}\")
+" 2>/dev/null) || BEAD_ROWS=""
+      while IFS=$'\t' read -r bid bstatus; do
+        [ -z "$bid" ] && continue
+        BEAD_TOTAL=$((BEAD_TOTAL + 1))
+        BEAD_ALL_IDS="${BEAD_ALL_IDS}${BEAD_ALL_IDS:+ }${bid}"
+        if [ "$bstatus" = "closed" ]; then
+          BEAD_CLOSED_COUNT=$((BEAD_CLOSED_COUNT + 1))
+        else
+          BEAD_OPEN_LIST="${BEAD_OPEN_LIST}${BEAD_OPEN_LIST:+, }${bid}(${bstatus})"
+        fi
+      done <<< "$BEAD_ROWS"
+      BEAD_ID=$(printf '%s' "$BEAD_ALL_IDS" | cut -d' ' -f1)
+    fi
+    if [ "$BEAD_TOTAL" -gt 0 ] && [ "$BEAD_CLOSED_COUNT" -eq "$BEAD_TOTAL" ]; then
+      if [ "$BEAD_TOTAL" -eq 1 ]; then
+        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; bead ${BEAD_ID:-?} is CLOSED. Review the outcome — closed bead + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
+      else
+        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; ALL ${BEAD_TOTAL} beads on this branch are CLOSED (${BEAD_ALL_IDS}). Review the outcome — closed beads + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
+      fi
+    elif [ "$BEAD_TOTAL" -gt 0 ]; then
+      LAND_MSG="${AUTO_NOTIFY_TAG} Worker pushed: branch ${BRANCH} (${FILES_BRIEF}). ${BEAD_CLOSED_COUNT}/${BEAD_TOTAL} bead(s) on this branch are closed — NOT all done (open: ${BEAD_OPEN_LIST}). This is NOT a completion signal; check \`bd show <id>\` for each and \`sable-worker-status\` before reviewing."
+    else
+      LAND_MSG="${AUTO_NOTIFY_TAG} Worker pushed: branch ${BRANCH} (${FILES_BRIEF}). No bead resolved via branch metadata — status unknown. The worker may still be running. This is NOT a completion signal; check \`bd show <bead>\` and \`sable-worker-status\` before reviewing."
+    fi
     [ -n "$OVERLAPS" ] && LAND_MSG="${LAND_MSG} OVERLAP-WARNING: shares files with in-flight work."
     if sable-msg "$SABLE_ID_NAME" "$LAND_MSG" --from worker >/dev/null 2>&1; then
       sable_pp_trace "WORKER-LAND-MSG sent -> ${SABLE_ID_NAME}"
@@ -379,17 +458,8 @@ sable_chuck_pane_present() {
   printf '%s\n' "$roles" | grep -qx chuck
 }
 
-# SABLE-f916: both landing artifacts below (the live chuck message AND the
-# durable for-chuck bead fallback) were byte-identical in framing to what a
-# manager's deliberate, reviewed PR-ready sign-off would look like — Chuck had
-# no mechanical way to tell "hook auto-detected a push" apart from "a manager
-# actually reviewed this and accepts it." Incident 2026-07-15: an auto-notify
-# for wk-bin-symlink-parity (SABLE-59t6.6) was queued+inspected as if
-# PR-ready, but optimus had NOT accepted it (later rejected for false-green
-# tests). This tag self-labels every auto-notify so it's grep-distinguishable
-# from a real sign-off (which carries no such tag) — it does not change
-# firing/registration behavior.
-AUTO_NOTIFY_TAG="[AUTO-NOTIFY: push detected by hook, NOT a manager sign-off]"
+# AUTO_NOTIFY_TAG (SABLE-f916) is defined earlier, above the worker-landing
+# wake block, so that message can carry it too (SABLE-gx7p3).
 
 # --- Message-first handoff with durable fallback (SABLE-bldh.15 / SABLE-wvk9) --
 # In the tmux warm-pane topology the worker->merge handoff is a direct message to

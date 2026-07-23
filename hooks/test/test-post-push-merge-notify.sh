@@ -811,12 +811,17 @@ assert_bd_not_called "SABLE-b06t: 'Everything up-to-date' no-op push does NOT fi
 # read SABLE_STUB_PANE_ROLE through it directly.
 
 # (a) worker landing (@sable_role=worker), Chuck reachable: the dispatching
-# manager (optimus) is messaged with a "Worker landed" wake, --from worker; the
-# Chuck merge handoff still fires alongside it.
+# manager (optimus) is messaged with an AUTO-NOTIFY wake, --from worker; the
+# Chuck merge handoff still fires alongside it. SABLE-gx7p3: the wording is no
+# longer a fixed "Worker landed ... bead closed" string (that was the false
+# terminal claim this bead fixes) — with the plain bd stub returning no
+# metadata match, the bead status resolves unknown, so the message reads
+# "Worker pushed ... status: unknown". The wake-fired assertion below checks
+# for the AUTO-NOTIFY tag reaching optimus rather than the old fixed wording.
 rm -f "$BD_LOG" "$SABLE_MSG_LOG"
 SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker" \
   "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
-if grep -qE '^optimus .*Worker landed' "$SABLE_MSG_LOG" 2>/dev/null \
+if grep -qE '^optimus .*\[AUTO-NOTIFY' "$SABLE_MSG_LOG" 2>/dev/null \
    && grep -q 'from worker' "$SABLE_MSG_LOG" 2>/dev/null; then
   pass "SABLE-nmmh: worker landing wakes the dispatching manager (optimus, from worker)"
 else
@@ -833,7 +838,7 @@ fi
 rm -f "$BD_LOG" "$SABLE_MSG_LOG"
 SABLE_MSG_STUB_RC=1 run_hook "$MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker" \
   "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
-if grep -q 'Worker landed' "$SABLE_MSG_LOG" 2>/dev/null; then
+if grep -qE '^optimus .*\[AUTO-NOTIFY' "$SABLE_MSG_LOG" 2>/dev/null; then
   pass "SABLE-nmmh: manager wake fires even when Chuck is unreachable"
 else
   fail "SABLE-nmmh: manager wake fires even when Chuck is unreachable" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
@@ -845,10 +850,10 @@ assert_bd_called "SABLE-nmmh: for-chuck fallback bead still filed on landing whe
 rm -f "$BD_LOG" "$SABLE_MSG_LOG"
 SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV TMUX_PANE=%mgr SABLE_STUB_PANE_ROLE=optimus" \
   "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
-if grep -q 'Worker landed' "$SABLE_MSG_LOG" 2>/dev/null; then
+if grep -qE '^optimus ' "$SABLE_MSG_LOG" 2>/dev/null; then
   fail "SABLE-nmmh: manager emergency push does NOT self-notify" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
 else
-  pass "SABLE-nmmh: manager emergency push does NOT self-notify (no Worker-landed msg)"
+  pass "SABLE-nmmh: manager emergency push does NOT self-notify (no worker-landing wake msg)"
 fi
 if grep -qE '^chuck ' "$SABLE_MSG_LOG" 2>/dev/null; then
   pass "SABLE-nmmh: emergency push still hands off to chuck"
@@ -861,7 +866,7 @@ fi
 rm -f "$BD_LOG" "$SABLE_MSG_LOG"
 SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker SABLE_WORKER_LAND_NOTIFY=0" \
   "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
-if grep -q 'Worker landed' "$SABLE_MSG_LOG" 2>/dev/null; then
+if grep -qE '^optimus ' "$SABLE_MSG_LOG" 2>/dev/null; then
   fail "SABLE-nmmh: SABLE_WORKER_LAND_NOTIFY=0 suppresses the manager wake" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
 else
   pass "SABLE-nmmh: SABLE_WORKER_LAND_NOTIFY=0 suppresses the manager wake"
@@ -1125,7 +1130,7 @@ rm -f "$BD_LOG" "$SABLE_MSG_LOG" "$TB1Y_COUNT"
 SABLE_MSG_STUB_RC=0 run_hook \
   "$MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker SABLE_TEST_LSREMOTE_LAG=2 SABLE_TEST_LSREMOTE_COUNT_FILE=$TB1Y_COUNT SABLE_PUSH_CONFIRM_SLEEP=0.02" \
   "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
-if grep -q 'Worker landed' "$SABLE_MSG_LOG" 2>/dev/null; then
+if grep -qE '^optimus .*\[AUTO-NOTIFY' "$SABLE_MSG_LOG" 2>/dev/null; then
   pass "SABLE-tb1y: ls-remote lag then settle — manager wake still fires (not stranded)"
 else
   fail "SABLE-tb1y: ls-remote lag then settle — manager wake still fires (not stranded)" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
@@ -1454,6 +1459,499 @@ echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
 exit 0
 EOF
 chmod +x "$STUB_DIR/bd"
+
+# --------------------------------------------------------------------------
+# SABLE-gx7p3: the worker-landing notify must state ONLY what the hook
+# observed (a push), never assert "bead closed"/"closed bead + for-chuck PR"
+# unless the branch's work bead is ACTUALLY closed. Every auto-notify must
+# carry the AUTO-NOTIFY tag regardless of recipient (it previously reached
+# the manager untagged while the chuck-facing message already carried it).
+#
+# UNIT fixture: a dedicated bd stub models the `bd list --status all
+# --metadata-field branch=<b> --json` resolver query directly (isolating the
+# message-rendering logic from real bd/dolt state), driven by
+# $UNIT_BEAD_STATUS (single bead) or $UNIT_BEAD_BUNDLE_FILE (a path to a
+# literal JSON array, for the bundled-dispatch cardinality cases below — a
+# FILE rather than an inline env value because run_hook's env_prefix is
+# word-split unquoted, which would corrupt a JSON value containing spaces).
+# The OVERLAPS query (`bd list --status=in_progress --json`, no
+# metadata-field arg) still returns `[]` through the same stub.
+# --------------------------------------------------------------------------
+
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "list" ]; then
+  for a in "$@"; do
+    case "$a" in
+      branch=*)
+        if [ -n "${UNIT_BEAD_BUNDLE_FILE:-}" ] && [ -f "${UNIT_BEAD_BUNDLE_FILE}" ]; then
+          cat "$UNIT_BEAD_BUNDLE_FILE"
+        else
+          printf '[{"id": "%s", "status": "%s"}]\n' "${UNIT_BEAD_ID:-SABLE-gxunit}" "${UNIT_BEAD_STATUS:-in_progress}"
+        fi
+        exit 0
+        ;;
+    esac
+  done
+  echo '[]'
+  exit 0
+fi
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+# UNIT (a): bead is in_progress. NEGATIVE assertion — the notify must NOT
+# assert closure, but MUST carry the AUTO-NOTIFY tag (both halves of the
+# acceptance criteria).
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker UNIT_BEAD_STATUS=in_progress UNIT_BEAD_ID=SABLE-gxunit" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -qE '^optimus .*\[AUTO-NOTIFY' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "UNIT SABLE-gx7p3: in_progress bead — notify carries the AUTO-NOTIFY tag"
+else
+  fail "UNIT SABLE-gx7p3: in_progress bead — notify carries the AUTO-NOTIFY tag" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+if grep -qiE 'bead closed|closed bead' "$SABLE_MSG_LOG" 2>/dev/null; then
+  fail "UNIT SABLE-gx7p3: in_progress bead — notify must NOT assert closure" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+else
+  pass "UNIT SABLE-gx7p3: in_progress bead — notify does NOT assert closure"
+fi
+if grep -q 'SABLE-gxunit' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "UNIT SABLE-gx7p3: notify names the resolved bead id"
+else
+  fail "UNIT SABLE-gx7p3: notify names the resolved bead id" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+
+# UNIT (b) — NEGATIVE CONTROL: a genuinely closed bead. Without this control,
+# a "fix" that simply strips all closure wording (rather than reporting real
+# status) would pass (a) above while making the notify permanently useless —
+# unable to ever say a worker finished.
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker UNIT_BEAD_STATUS=closed UNIT_BEAD_ID=SABLE-gxunit" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -qE '^optimus .*\[AUTO-NOTIFY' "$SABLE_MSG_LOG" 2>/dev/null \
+   && grep -qiE 'closed bead' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "UNIT SABLE-gx7p3 NEGATIVE CONTROL: genuinely closed bead — notify may state closure, still tagged"
+else
+  fail "UNIT SABLE-gx7p3 NEGATIVE CONTROL: genuinely closed bead — notify may state closure, still tagged" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+
+# UNIT (c) — CARDINALITY / bundled dispatch (second live instance, optimus's
+# lane: SABLE-dhcyu still in_progress inside a bundle where a sibling bead on
+# the SAME branch had already closed). Two beads share this branch's
+# metadata; ONE is closed, ONE is in_progress. The notify must NOT render a
+# singular closure claim for the unit of work — a fix that resolves only the
+# first-matched bead's status would wrongly say "bead closed" here.
+GX_BUNDLE_PARTIAL="$STUB_DIR/bundle-partial.json"
+cat > "$GX_BUNDLE_PARTIAL" <<'JSON'
+[{"id": "SABLE-dhcyu-a", "status": "closed"}, {"id": "SABLE-dhcyu-b", "status": "in_progress"}]
+JSON
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker UNIT_BEAD_BUNDLE_FILE=$GX_BUNDLE_PARTIAL" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -qiE 'bead closed|closed bead|ALL 2 beads' "$SABLE_MSG_LOG" 2>/dev/null; then
+  fail "UNIT SABLE-gx7p3 CARDINALITY: partial bundle (1/2 closed) must NOT assert a singular/all-closed claim" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+else
+  pass "UNIT SABLE-gx7p3 CARDINALITY: partial bundle (1/2 closed) does NOT assert closure for the unit of work"
+fi
+if grep -qE '^optimus .*\[AUTO-NOTIFY' "$SABLE_MSG_LOG" 2>/dev/null \
+   && grep -q 'SABLE-dhcyu-b' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "UNIT SABLE-gx7p3 CARDINALITY: partial bundle notify names the still-open sibling bead"
+else
+  fail "UNIT SABLE-gx7p3 CARDINALITY: partial bundle notify names the still-open sibling bead" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+
+# UNIT (d) — bundle NEGATIVE CONTROL: ALL beads sharing the branch ARE
+# closed. Without this, a fix that never allows a bundle to report closure
+# would pass (c) while making the notify unable to ever report a genuinely
+# finished bundled dispatch.
+GX_BUNDLE_FULL="$STUB_DIR/bundle-full.json"
+cat > "$GX_BUNDLE_FULL" <<'JSON'
+[{"id": "SABLE-dhcyu-a", "status": "closed"}, {"id": "SABLE-dhcyu-b", "status": "closed"}]
+JSON
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker UNIT_BEAD_BUNDLE_FILE=$GX_BUNDLE_FULL" \
+  "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
+if grep -qE '^optimus .*\[AUTO-NOTIFY' "$SABLE_MSG_LOG" 2>/dev/null \
+   && grep -qiE 'ALL 2 beads.*CLOSED' "$SABLE_MSG_LOG" 2>/dev/null \
+   && grep -q 'SABLE-dhcyu-a' "$SABLE_MSG_LOG" 2>/dev/null \
+   && grep -q 'SABLE-dhcyu-b' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "UNIT SABLE-gx7p3 CARDINALITY NEGATIVE CONTROL: fully-closed bundle (2/2) — notify states closure for both members"
+else
+  fail "UNIT SABLE-gx7p3 CARDINALITY NEGATIVE CONTROL: fully-closed bundle (2/2) — notify states closure for both members" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+
+# --------------------------------------------------------------------------
+# SABLE-gx7p3 PLANT-AND-FAIL (SABLE-5lli.7 pattern, mirroring
+# hooks/test/test-require-all.sh's own plant): reconstruct the EXACT pre-fix
+# LAND_MSG shape — unconditional "pushed & bead closed", no AUTO-NOTIFY tag —
+# as a mutated copy of the real hook script, run it against the SAME
+# in_progress-bead fixture as UNIT (a) above, and assert BOTH of that test's
+# assertions correctly flag it as wrong. This proves the assertions are
+# load-bearing: they distinguish the fixed behavior from the actual defect
+# being fixed, not merely from an empty string.
+# --------------------------------------------------------------------------
+# The hook sources sibling libs via `dirname "${BASH_SOURCE[0]}"`
+# (lib-hook-trace.sh, lib-identity.sh), and lib-identity.sh itself sources
+# further siblings (e.g. lib-mode-path.sh) the SAME way — so symlinking only
+# the two directly-sourced libs still fails one level down (confirmed: "line
+# 47: .../lib-mode-path.sh: No such file or directory") because a sourced
+# symlink's BASH_SOURCE dirname resolves to the symlink's OWN directory, not
+# its target's. Symlinking every sibling *.sh into one dedicated subdir
+# handles the transitive chain at any depth. A dedicated subdir keeps these
+# symlinks out of STUB_DIR's own bd/tmux/sable-msg stub lookups. Any
+# sourcing failure here would silently exit before ever composing LAND_MSG,
+# which would make the plant's negative-tag check "pass" for the wrong
+# reason — hence checking it actually ran below.
+PLANT_DIR="$STUB_DIR/plant-gx7p3"
+mkdir -p "$PLANT_DIR"
+for f in "$LIB_DIR"/*.sh; do
+  ln -sf "$f" "$PLANT_DIR/$(basename "$f")"
+done
+MUTATED_HOOK="$PLANT_DIR/post-push-merge-notify-PLANT.sh"
+# Marker-based whole-block replace (not a fragile regex over the block's
+# internals — the block's own shape changes as this hook evolves; the START
+# marker is unique to the resolution block, and the END marker is the
+# OVERLAPS line that unconditionally follows it, so this stays correct
+# across future edits to what's IN BETWEEN).
+PLANT_SETUP_ERR=$(python3 - "$HOOK" "$MUTATED_HOOK" <<'PYEOF'
+import sys
+src_path, dst_path = sys.argv[1], sys.argv[2]
+src = open(src_path).read()
+start_marker = '    BEAD_ID=""\n'
+end_marker = '\n    [ -n "$OVERLAPS" ] && LAND_MSG='
+start = src.find(start_marker)
+end = src.find(end_marker)
+if start == -1 or end == -1 or end < start:
+    print(f"could not locate resolution block: start={start} end={end}", file=sys.stderr)
+    sys.exit(1)
+reverted = ('    LAND_MSG="Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed & '
+            'bead closed. Review the outcome — closed bead + for-chuck PR — and '
+            'REVISE by re-spawning into the same worktree if wrong."')
+new_src = src[:start] + reverted + src[end:]
+open(dst_path, "w").write(new_src)
+PYEOF
+)
+PLANT_SETUP_RC=$?
+chmod +x "$MUTATED_HOOK" 2>/dev/null || true
+
+if [ "$PLANT_SETUP_RC" -ne 0 ] || [ ! -s "$MUTATED_HOOK" ]; then
+  fail "PLANT-AND-FAIL SABLE-gx7p3: could not construct the reverted mutant hook" "rc=$PLANT_SETUP_RC err=$PLANT_SETUP_ERR"
+else
+  rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+  env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" \
+    SABLE_MSG_LOG="$SABLE_MSG_LOG" SABLE_MSG_STUB_RC=0 \
+    SABLE_HOOK_TRACE_LOG="$STUB_DIR/hook-trace-plant.log" \
+    $MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker UNIT_BEAD_STATUS=in_progress UNIT_BEAD_ID=SABLE-gxunit \
+    bash "$MUTATED_HOOK" <<< "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null 2>&1
+
+  # Non-vacuity precondition: confirm the mutant actually ran past the push
+  # confirmation and reached the worker-landing block, rather than exiting
+  # early on a sourcing/env error and leaving both checks below vacuously
+  # "pass" for the wrong reason (this is exactly the empty-MSG_LOG failure
+  # mode hit while writing this plant, caused by a transitive sibling-lib
+  # sourcing gap — see the PLANT_DIR symlink comment above).
+  if grep -q 'CONFIRMED' "$STUB_DIR/hook-trace-plant.log" 2>/dev/null; then
+    pass "PLANT-AND-FAIL SABLE-gx7p3: mutant hook actually ran (non-vacuity precondition)"
+  else
+    fail "PLANT-AND-FAIL SABLE-gx7p3: mutant hook actually ran (non-vacuity precondition)" "hook-trace-plant.log: $(cat "$STUB_DIR/hook-trace-plant.log" 2>/dev/null)"
+  fi
+  if grep -qiE 'bead closed|closed bead' "$SABLE_MSG_LOG" 2>/dev/null; then
+    pass "PLANT-AND-FAIL SABLE-gx7p3: reverted wording DOES assert closure for an in_progress bead (proves the 'no closure claim' assertion is load-bearing)"
+  else
+    fail "PLANT-AND-FAIL SABLE-gx7p3: reverted wording DOES assert closure for an in_progress bead" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+  fi
+  if grep -qE '^optimus .*\[AUTO-NOTIFY' "$SABLE_MSG_LOG" 2>/dev/null; then
+    fail "PLANT-AND-FAIL SABLE-gx7p3: reverted wording correctly lacks the AUTO-NOTIFY tag" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+  else
+    pass "PLANT-AND-FAIL SABLE-gx7p3: reverted wording correctly lacks the AUTO-NOTIFY tag (proves the tag assertion is load-bearing)"
+  fi
+fi
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+
+# --------------------------------------------------------------------------
+# SABLE-gx7p3 PLANT-AND-FAIL #2 — CARDINALITY regression (the SECOND live
+# instance, optimus/tarzan's bundled-dispatch report: even a fix that
+# correctly checks bead status can still assert a false singular closure if
+# it only looks at the FIRST bead sharing a branch's metadata). Mutate the
+# CURRENT (fixed) resolution block back to that naive first-match shape —
+# this hook's own earlier, less-robust draft — and confirm it WRONGLY
+# asserts closure against the partial-bundle fixture (bundle-partial.json:
+# first bead closed, second still in_progress) that UNIT (c) above correctly
+# refuses. Proves the "ALL members must be closed" requirement is
+# load-bearing, not merely untested.
+# --------------------------------------------------------------------------
+CARDINALITY_MUTANT="$PLANT_DIR/post-push-merge-notify-CARD-PLANT.sh"
+CARD_SETUP_ERR=$(python3 - "$HOOK" "$CARDINALITY_MUTANT" <<'PYEOF'
+import sys
+src_path, dst_path = sys.argv[1], sys.argv[2]
+src = open(src_path).read()
+start_marker = '    BEAD_ID=""\n'
+end_marker = '\n    [ -n "$OVERLAPS" ] && LAND_MSG='
+start = src.find(start_marker)
+end = src.find(end_marker)
+if start == -1 or end == -1 or end < start:
+    print(f"could not locate resolution block: start={start} end={end}", file=sys.stderr)
+    sys.exit(1)
+# The naive, pre-cardinality-fix shape: take only the FIRST bead matching
+# the branch metadata and break — reproduces the exact regression a
+# bundled dispatch exposes.
+naive = '''    BEAD_ID=""
+    BEAD_STATUS=""
+    BEAD_QUERY=$(bd list --status all --metadata-field "branch=$BRANCH" --json 2>/dev/null || echo "")
+    if [ -n "$BEAD_QUERY" ]; then
+      BEAD_INFO=$(printf '%s' "$BEAD_QUERY" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+if isinstance(data, list):
+    for item in data:
+        if isinstance(item, dict) and item.get('status'):
+            print(f\\"{item.get('id', '')}\\t{item.get('status', '')}\\")
+            break
+" 2>/dev/null) || BEAD_INFO=""
+      BEAD_ID=$(printf '%s' "$BEAD_INFO" | cut -f1)
+      BEAD_STATUS=$(printf '%s' "$BEAD_INFO" | cut -f2)
+    fi
+    if [ "$BEAD_STATUS" = "closed" ]; then
+      LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; bead ${BEAD_ID:-?} is CLOSED. Review the outcome — closed bead + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
+    else
+      LAND_MSG="${AUTO_NOTIFY_TAG} Worker pushed: branch ${BRANCH} (${FILES_BRIEF}). Bead ${BEAD_ID:-<unresolved>} status: ${BEAD_STATUS:-unknown} — the worker may still be running. This is NOT a completion signal; check \\`bd show ${BEAD_ID:-<bead>}\\` and \\`sable-worker-status\\` before reviewing."
+    fi'''
+new_src = src[:start] + naive + src[end:]
+open(dst_path, "w").write(new_src)
+PYEOF
+)
+CARD_SETUP_RC=$?
+chmod +x "$CARDINALITY_MUTANT" 2>/dev/null || true
+
+if [ "$CARD_SETUP_RC" -ne 0 ] || [ ! -s "$CARDINALITY_MUTANT" ]; then
+  fail "PLANT-AND-FAIL SABLE-gx7p3 CARDINALITY: could not construct the naive-resolver mutant hook" "rc=$CARD_SETUP_RC err=$CARD_SETUP_ERR"
+else
+  rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+  env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" \
+    SABLE_MSG_LOG="$SABLE_MSG_LOG" SABLE_MSG_STUB_RC=0 \
+    SABLE_HOOK_TRACE_LOG="$STUB_DIR/hook-trace-plant-card.log" \
+    $MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker UNIT_BEAD_BUNDLE_FILE=$GX_BUNDLE_PARTIAL \
+    bash "$CARDINALITY_MUTANT" <<< "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null 2>&1
+
+  if grep -q 'CONFIRMED' "$STUB_DIR/hook-trace-plant-card.log" 2>/dev/null; then
+    pass "PLANT-AND-FAIL SABLE-gx7p3 CARDINALITY: naive-resolver mutant actually ran (non-vacuity precondition)"
+  else
+    fail "PLANT-AND-FAIL SABLE-gx7p3 CARDINALITY: naive-resolver mutant actually ran (non-vacuity precondition)" "hook-trace-plant-card.log: $(cat "$STUB_DIR/hook-trace-plant-card.log" 2>/dev/null)"
+  fi
+  if grep -qiE 'bead closed|closed bead' "$SABLE_MSG_LOG" 2>/dev/null; then
+    pass "PLANT-AND-FAIL SABLE-gx7p3 CARDINALITY: naive first-match resolver WRONGLY asserts closure on a partial bundle (proves UNIT (c)'s all-members check is load-bearing)"
+  else
+    fail "PLANT-AND-FAIL SABLE-gx7p3 CARDINALITY: naive first-match resolver WRONGLY asserts closure on a partial bundle" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+  fi
+fi
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+rm -rf "$PLANT_DIR"
+
+# Restore the plain bd stub for hermeticity if more tests are appended later.
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+# --------------------------------------------------------------------------
+# INTEGRATION SABLE-gx7p3 — real bd in the project repo, real hook invocation,
+# no mocks of bd. Creates a scratch bead in the real, shared project Dolt db
+# (--sandbox on every write, never pushed to the shared remote) carrying the
+# `branch` metadata sable-spawn-worker writes at dispatch time, pushes a real
+# worker branch naming it, and asserts the delivered worker-landing message
+# reflects the bead's REAL status rather than an assumed one.
+#
+# PRODUCTION-POLLUTION INCIDENT (optimus, live, during this bead's own
+# authoring — SABLE-1cb2b): an earlier draft of this test passed
+# SABLE_MERGE_NOTIFY_VIA_MSG=0 with REAL bd on PATH. That env var disables
+# ONLY the message-first attempt to chuck, forcing the hook past it into the
+# REAL durable for-chuck `bd create` fallback — for a branch that never
+# existed on origin. Three real, untagged, production-shaped for-chuck beads
+# landed in the live pool (SABLE-r67s9, SABLE-d4kbz, SABLE-wafm7) before
+# chuck/optimus caught it; all three closed as test-artifact pollution. The
+# fix has three parts, matching chuck's SABLE-1cb2b spec: (1) do NOT disable
+# the message-first path — stub sable-msg/tmux so it SUCCEEDS, so the hook
+# takes `sable-msg chuck ... && exit 0` and never reaches real bd create; (2)
+# a stray-bead safety net that runs on every exit path (success OR failure),
+# not just the happy path, in case the stub ever misbehaves; (3) an explicit
+# negative control asserting the pool carries NO for-chuck bead naming this
+# branch afterward — proving the fix isn't "shipped" by silently disabling
+# the notify (a silenced notify and a fixed one look identical from the
+# pass-side without this control). bd itself stays real throughout — only
+# sable-msg/tmux (transport plumbing, not the property under test) are
+# stubbed, the same scope the rest of this suite stubs them at.
+# --------------------------------------------------------------------------
+
+if ! command -v bd >/dev/null 2>&1; then
+  echo "SKIP (integration SABLE-gx7p3): bd not found on PATH"
+else
+  GX_BARE=$(mktemp -d)
+  GX_REPO=$(mktemp -d)
+  GX_INT_STUB=$(mktemp -d)
+  trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$GX_BARE" "$GX_REPO" "$GX_INT_STUB"' EXIT
+
+  # Safety-net teardown (requirement 2): find and close/relabel ANY real
+  # for-chuck bead naming $1, regardless of whether the assertions above it
+  # passed or failed. Called after EVERY hook invocation below, not only on
+  # a happy path — a cleanup that only fires on success is the exact trap
+  # that let the incident's stray beads go unnoticed.
+  gx7p3_cleanup_stray_forchuck() {
+    local branch="$1" ids
+    ids=$(bd list --status open,in_progress --label for-chuck --title-contains "$branch" --json 2>/dev/null \
+      | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = []
+for i in d:
+    if isinstance(i, dict):
+        print(i.get('id', ''))
+" 2>/dev/null)
+    for id in $ids; do
+      [ -z "$id" ] && continue
+      echo "SABLE-gx7p3 integration safety net: stray for-chuck bead $id named branch $branch — closing as test artifact"
+      bd update "$id" --sandbox --notes "[no-test] SABLE-gx7p3 integration-test safety net: this for-chuck bead names a scratch branch ($branch) that only ever existed in a test fixture. Closing immediately as test pollution." 2>/dev/null || true
+      bd close "$id" --sandbox --reason "SABLE-gx7p3 integration-test safety-net cleanup (test-fixture branch, never real work)" 2>/dev/null || true
+    done
+  }
+
+  git init -q --bare "$GX_BARE"
+  git clone -q "$GX_BARE" "$GX_REPO"
+  cd_fixture "$GX_REPO"
+  git -C "$GX_REPO" config user.email "gx@gx"; git -C "$GX_REPO" config user.name "gx"
+  echo base > base.txt; git add base.txt; git commit -q -m base
+  GX_MAIN=$(git symbolic-ref --short HEAD)
+  git push -q "$GX_BARE" "HEAD:refs/heads/$GX_MAIN" 2>/dev/null
+  git update-ref "refs/remotes/origin/$GX_MAIN" HEAD
+  git push -q "$GX_BARE" HEAD:refs/heads/main 2>/dev/null
+  git update-ref refs/remotes/origin/main HEAD
+  GX_BRANCH="wk-gx7p3-inttest-$$"
+  git checkout -q -b "$GX_BRANCH"
+  echo change > gx_change.txt; git add gx_change.txt; git commit -q -m "worker change"
+  git push -q "$GX_BARE" "HEAD:refs/heads/$GX_BRANCH" 2>/dev/null
+  git update-ref "refs/remotes/origin/$GX_BRANCH" HEAD
+  cd - >/dev/null
+
+  GX_SCRATCH_ID=$(bd create --sandbox \
+    --title="[int-test] SABLE-gx7p3 scratch bead for ${GX_BRANCH}" \
+    --description="Scratch bead created by hooks/test/test-post-push-merge-notify.sh (SABLE-gx7p3 integration test) to verify the worker-landing auto-notify states only the bead's OBSERVED status. [no-test] — safe to close immediately, no code of its own." \
+    --type=task \
+    --metadata "{\"branch\": \"${GX_BRANCH}\"}" 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+
+  if [ -z "$GX_SCRATCH_ID" ]; then
+    echo "SKIP (integration SABLE-gx7p3): could not create scratch bead — bd create output did not match ID pattern"
+  else
+    echo "Integration SABLE-gx7p3: created scratch bead $GX_SCRATCH_ID for branch $GX_BRANCH"
+    bd update "$GX_SCRATCH_ID" --sandbox --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
+
+    # sable-msg/tmux stubs model a REACHABLE chuck who CONFIRMS delivery
+    # (rc=0) — the message-first path this hook prefers — so the real
+    # durable for-chuck `bd create` fallback is never reached. This is the
+    # opposite of disabling the notify: both the worker-land AND chuck
+    # messages still fire for real (asserted below); only the transport is
+    # stubbed.
+    cat > "$GX_INT_STUB/sable-msg" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >> "${GX_MSG_LOG:-/dev/null}"
+exit 0
+EOF
+    chmod +x "$GX_INT_STUB/sable-msg"
+    cat > "$GX_INT_STUB/tmux" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  [ "$a" = "list-panes" ] && { echo chuck; exit 0; }
+  [ "$a" = "display-message" ] && { echo "worker"; exit 0; }
+done
+exit 0
+EOF
+    chmod +x "$GX_INT_STUB/tmux"
+
+    GX_MSG_LOG="$GX_INT_STUB/msg.log"
+    : > "$GX_MSG_LOG"
+
+    # (1) Bead is genuinely in_progress (its natural post-create state): the
+    # delivered message must carry the AUTO-NOTIFY tag and must NOT assert
+    # closure.
+    INT_GX_INPUT=$(make_post_input "git push" "$GX_REPO")
+    CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager TMUX_PANE=%gxinttest \
+      PATH="$GX_INT_STUB:$PATH" GX_MSG_LOG="$GX_MSG_LOG" \
+      bash "$HOOK" <<< "$INT_GX_INPUT" >/dev/null 2>&1
+    gx7p3_cleanup_stray_forchuck "$GX_BRANCH"
+
+    if grep -qE '^optimus .*\[AUTO-NOTIFY' "$GX_MSG_LOG" 2>/dev/null; then
+      pass "integration SABLE-gx7p3: in_progress bead — notify carries the AUTO-NOTIFY tag"
+    else
+      fail "integration SABLE-gx7p3: in_progress bead — notify carries the AUTO-NOTIFY tag" "MSG_LOG: $(cat "$GX_MSG_LOG" 2>/dev/null)"
+    fi
+    if grep -qiE 'bead closed|closed bead' "$GX_MSG_LOG" 2>/dev/null; then
+      fail "integration SABLE-gx7p3: in_progress bead — notify must NOT assert closure" "MSG_LOG: $(cat "$GX_MSG_LOG" 2>/dev/null)"
+    else
+      pass "integration SABLE-gx7p3: in_progress bead — notify does NOT assert closure"
+    fi
+    if grep -q "$GX_SCRATCH_ID" "$GX_MSG_LOG" 2>/dev/null; then
+      pass "integration SABLE-gx7p3: notify names the resolved real bead id ($GX_SCRATCH_ID)"
+    else
+      fail "integration SABLE-gx7p3: notify names the resolved real bead id" "MSG_LOG: $(cat "$GX_MSG_LOG" 2>/dev/null)"
+    fi
+    # NEGATIVE CONTROL (requirement 3): the notify must still genuinely FIRE
+    # to chuck too (proving the fix is not "pass by silencing the notify")
+    # while leaving NOTHING behind in the real pool for this fake branch.
+    if grep -qE '^chuck .*\[AUTO-NOTIFY' "$GX_MSG_LOG" 2>/dev/null; then
+      pass "integration SABLE-gx7p3 NEGATIVE CONTROL: chuck handoff message still genuinely fires (notify not silenced)"
+    else
+      fail "integration SABLE-gx7p3 NEGATIVE CONTROL: chuck handoff message still genuinely fires (notify not silenced)" "MSG_LOG: $(cat "$GX_MSG_LOG" 2>/dev/null)"
+    fi
+    GX_STRAY_CHECK=$(bd list --status all --label for-chuck --title-contains "$GX_BRANCH" --json 2>/dev/null || echo "")
+    if [ -z "$GX_STRAY_CHECK" ] || [ "$GX_STRAY_CHECK" = "[]" ] || [ "$GX_STRAY_CHECK" = "null" ]; then
+      pass "integration SABLE-gx7p3 NEGATIVE CONTROL: no stray for-chuck bead was created for this fake branch (no pool pollution)"
+    else
+      fail "integration SABLE-gx7p3 NEGATIVE CONTROL: no stray for-chuck bead was created for this fake branch (no pool pollution)" "pool still shows: $GX_STRAY_CHECK"
+    fi
+
+    # (2) POSITIVE CONTROL: close the bead for real, push a second commit on
+    # the SAME branch (metadata association unchanged), and confirm the
+    # notify DOES state closure once bd actually shows it closed.
+    bd close "$GX_SCRATCH_ID" --sandbox --reason "integration test complete" 2>/dev/null || true
+    : > "$GX_MSG_LOG"
+    cd_fixture "$GX_REPO"
+    git checkout -q "$GX_BRANCH"
+    echo change2 > gx_change2.txt; git add gx_change2.txt; git commit -q -m "worker change 2"
+    git push -q "$GX_BARE" "HEAD:refs/heads/$GX_BRANCH" 2>/dev/null
+    git update-ref "refs/remotes/origin/$GX_BRANCH" HEAD
+    cd - >/dev/null
+
+    INT_GX_INPUT2=$(make_post_input "git push" "$GX_REPO")
+    CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager TMUX_PANE=%gxinttest \
+      PATH="$GX_INT_STUB:$PATH" GX_MSG_LOG="$GX_MSG_LOG" \
+      bash "$HOOK" <<< "$INT_GX_INPUT2" >/dev/null 2>&1
+    gx7p3_cleanup_stray_forchuck "$GX_BRANCH"
+
+    if grep -qE '^optimus .*\[AUTO-NOTIFY' "$GX_MSG_LOG" 2>/dev/null \
+       && grep -qiE 'closed bead' "$GX_MSG_LOG" 2>/dev/null; then
+      pass "integration SABLE-gx7p3 POSITIVE CONTROL: genuinely closed bead — notify states closure"
+    else
+      fail "integration SABLE-gx7p3 POSITIVE CONTROL: genuinely closed bead — notify states closure" "MSG_LOG: $(cat "$GX_MSG_LOG" 2>/dev/null)"
+    fi
+    GX_STRAY_CHECK2=$(bd list --status all --label for-chuck --title-contains "$GX_BRANCH" --json 2>/dev/null || echo "")
+    if [ -z "$GX_STRAY_CHECK2" ] || [ "$GX_STRAY_CHECK2" = "[]" ] || [ "$GX_STRAY_CHECK2" = "null" ]; then
+      pass "integration SABLE-gx7p3 NEGATIVE CONTROL: no stray for-chuck bead after the positive-control push either"
+    else
+      fail "integration SABLE-gx7p3 NEGATIVE CONTROL: no stray for-chuck bead after the positive-control push either" "pool still shows: $GX_STRAY_CHECK2"
+    fi
+  fi
+fi
 
 # --------------------------------------------------------------------------
 # Summary
