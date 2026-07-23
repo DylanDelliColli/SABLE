@@ -97,6 +97,11 @@ def test_spawn_creates_tagged_worker_window(sock):
         assert dispatch.exists()
         body = dispatch.read_text()
         assert BEAD in body and wt in body and "haiku" in body
+        # SABLE-4jogz: every dispatched worker prompt carries the
+        # plant-and-fail verdict requirement, unconditionally.
+        assert "NOT TRIGGERED" in body
+        assert "TRIGGERED AND CLEARED" in body
+        assert "TRIGGERED AND DEMONSTRATED" in body
 
         # a worker pane exists, correctly tagged
         listing = _tmux(sock, "list-panes", "-a", "-F",
@@ -1298,13 +1303,23 @@ def test_respawn_reopens_closed_bead_and_releases_stale_tree_claim(sock):
         assert not claim.exists(), "stale tree-claim was not released"
 
         # the worker window was spawned + tagged running for the bead
-        assert (Path(dd) / f"{bead_id}.md").exists()
+        dispatch = Path(dd) / f"{bead_id}.md"
+        assert dispatch.exists()
         listing = _tmux(sock, "list-panes", "-a", "-F",
                         "#{@sable_role} #{@sable_bead} #{@sable_status}").stdout
         assert any(
             line.startswith("worker") and bead_id in line and "running" in line
             for line in listing.splitlines()
         ), listing
+
+        # SABLE-4jogz POSITIVE CONTROL: --respawn is exactly the path where
+        # briefs are most often ad-hoc (the mechanism this bead documents), so
+        # the plant-and-fail verdict requirement must reach it too, not just
+        # a normal first dispatch.
+        body = dispatch.read_text()
+        assert "NOT TRIGGERED" in body
+        assert "TRIGGERED AND CLEARED" in body
+        assert "TRIGGERED AND DEMONSTRATED" in body
 
 
 def test_respawn_refused_when_live_pane_carries_bead_tag(sock):

@@ -1376,6 +1376,19 @@ Worker model: {model}
   `git push` from this CWD. NEVER use `git -C <other-tree>` — your CWD is the
   worktree (this deletes the SABLE-041 wrong-tree bug). Do NOT bypass pre-push.
 - The post-push hook files the for-chuck handoff; Chuck merges. You do NOT open PRs.
+- State the plant-and-fail verdict in your close evidence — required on every
+  close, regardless of whether this dispatch prompt happened to ask for it
+  (SABLE-4jogz: an unreported verdict is indistinguishable from an
+  unperformed one). Exactly three legal values, so silence is never mistaken
+  for non-applicability:
+    NOT TRIGGERED (state the basis, e.g. zero removed/weakened assertions,
+      measured)
+    TRIGGERED AND CLEARED (state what you read and why it is not a weakening)
+    TRIGGERED AND DEMONSTRATED (state the control shown to bite, both
+      polarities where applicable)
+  Put it in the `bd close --reason` text itself — that is the field
+  compliance checks read (SABLE-bp57h: `bd close` writes `close_reason`, not
+  `notes`).
 - {close_line} with the test evidence. Check the exit code for each close —
   a non-zero exit (e.g. the TDD gate denying the close) means it did NOT
   close. Do not report success on a failed close; read the gate's stderr
