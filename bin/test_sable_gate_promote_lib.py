@@ -19,6 +19,7 @@ These tests exercise the REAL propagation path — a real git repo, a real
 promote_lib.run_impact_tier — rather than mocking the transport, because the
 whole point of the defect is WHERE in a real byte stream the cut lands.
 """
+import itertools
 import json
 import os
 import shutil
@@ -447,6 +448,150 @@ def test_stamp_impact_verdict_is_a_noop_when_there_is_no_end_line_to_augment():
 
 
 # --------------------------------------------------------------------------
+# BatchRecord — the typed, durable batch manifest (SABLE-be4lo.2, S2)
+# --------------------------------------------------------------------------
+
+def test_batch_record_names_every_member_branch_bead_and_disjointness_evidence():
+    """UNIT (S2 matrix case, verbatim): the promote record for a batched
+    landing names every member branch, each member's bead(s), the
+    disjointness evidence used (declared footprints AND the mechanical fold
+    result), and the combined ref."""
+    members = [
+        promote_lib.BatchMember("wk-a", "a" * 40, ("SABLE-a",), ("bin/a.py",)),
+        promote_lib.BatchMember("wk-b", "b" * 40, ("SABLE-b1", "SABLE-b2"),
+                                ("bin/b.py", "bin/c.py")),
+        promote_lib.BatchMember("wk-c", "c" * 40, ("SABLE-c",), ("hooks/test/x.sh",)),
+    ]
+    record = promote_lib.BatchRecord.from_members(
+        "base" + "0" * 36, members, combined_ref="ci-verify/batch-abc1234",
+        outcome=promote_lib.BATCH_OUTCOME_LANDED, fold_disjoint=True)
+
+    assert set(record.member_branches()) == {"wk-a", "wk-b", "wk-c"}
+    assert set(record.member_bead_ids()) == {
+        ("SABLE-a",), ("SABLE-b1", "SABLE-b2"), ("SABLE-c",)}
+    assert set(record.declared_footprint_paths()) == {
+        "bin/a.py", "bin/b.py", "bin/c.py", "hooks/test/x.sh"}
+    assert record.fold_disjoint is True
+    assert record.combined_ref == "ci-verify/batch-abc1234"
+
+    data = record.to_dict()
+    assert {m["branch"] for m in data["members"]} == {"wk-a", "wk-b", "wk-c"}
+    assert {tuple(m["bead_ids"]) for m in data["members"]} == {
+        ("SABLE-a",), ("SABLE-b1", "SABLE-b2"), ("SABLE-c",)}
+    assert data["combined_ref"] == "ci-verify/batch-abc1234"
+    assert data["fold_disjoint"] is True
+
+
+def test_batch_record_ordering_safety_across_a_permutation_set():
+    """UNIT (S2 matrix case, load-bearing — the Primitive Obsession guard):
+    constructing the record from members in ANY input order yields an
+    identical serialized manifest and an identical setkey. Asserted over a
+    genuine PERMUTATION SET (4 members, all 24 distinct orders) rather than
+    two hand-picked orders — a test fed an already-sorted list would pass
+    this by accident and prove nothing."""
+    members = [
+        promote_lib.BatchMember("wk-d", "d" * 40, ("SABLE-d",), ("bin/d.py",)),
+        promote_lib.BatchMember("wk-a", "a" * 40, ("SABLE-a",), ("bin/a.py",)),
+        promote_lib.BatchMember("wk-c", "c" * 40, ("SABLE-c",), ("bin/c.py",)),
+        promote_lib.BatchMember("wk-b", "b" * 40, ("SABLE-b",), ("bin/b.py",)),
+    ]
+    base_sha = "e" * 40
+    serialized = set()
+    setkeys = set()
+    for order in itertools.permutations(members):
+        record = promote_lib.BatchRecord.from_members(
+            base_sha, list(order), combined_ref="ci-verify/batch-fixed",
+            outcome=promote_lib.BATCH_OUTCOME_LANDED, fold_disjoint=True)
+        serialized.add(json.dumps(record.to_dict(), sort_keys=True))
+        setkeys.add(record.setkey)
+
+    assert len(serialized) == 1, "input order leaked into the serialized manifest"
+    assert len(setkeys) == 1, "input order leaked into the setkey"
+
+
+def test_batch_record_from_members_raises_on_an_empty_batch():
+    """Vacuous guard, load-bearing (SABLE-p9n7k): an empty batch must RAISE,
+    never construct a record — a zero-member manifest is indistinguishable
+    from 'we never checked', not a valid empty answer."""
+    with pytest.raises(promote_lib.EmptyBatchError):
+        promote_lib.BatchRecord.from_members(
+            "a" * 40, [], combined_ref="ci-verify/batch-x",
+            outcome=promote_lib.BATCH_OUTCOME_LANDED, fold_disjoint=True)
+
+
+def test_batch_record_round_trips_with_unknown_field_tolerance():
+    """A BatchRecord survives to_dict -> from_dict with every field typed,
+    and a future/unrecognized key in the dict must not break the
+    reconstruction — the same additive-field discipline AttentionRecord's
+    own round-trip test asserts above."""
+    members = [
+        promote_lib.BatchMember("wk-a", "a" * 40, ("SABLE-a",), ("bin/a.py",)),
+        promote_lib.BatchMember("wk-b", "b" * 40, ("SABLE-b",), ("bin/b.py",)),
+    ]
+    record = promote_lib.BatchRecord.from_members(
+        "base" + "0" * 36, members, combined_ref="ci-verify/batch-xyz",
+        outcome=promote_lib.BATCH_OUTCOME_LANDED, fold_disjoint=False)
+    data = record.to_dict()
+    data["some_future_field_nobody_wrote_yet"] = "surprise"
+    restored = promote_lib.BatchRecord.from_dict(data)
+    assert restored == record
+    assert isinstance(restored.members, tuple)
+    assert all(isinstance(m.bead_ids, tuple) for m in restored.members)
+
+
+def test_batch_record_from_dict_tolerates_a_bare_minimum_dict():
+    """Negative-space companion: a dict missing every optional key entirely
+    (not just carrying an extra one) must still reconstruct instead of
+    raising KeyError."""
+    restored = promote_lib.BatchRecord.from_dict({"combined_ref": "ci-verify/batch-min"})
+    assert restored.members == ()
+    assert restored.fold_disjoint is False
+    assert restored.outcome == ""
+    assert restored.combined_ref == "ci-verify/batch-min"
+
+
+def test_fold_commit_message_round_trips_through_its_own_parser():
+    msg = promote_lib.fold_commit_message("wk-a", ("SABLE-a1", "SABLE-a2"))
+    assert promote_lib.parse_fold_commit_message(msg) == ("wk-a", ("SABLE-a1", "SABLE-a2"))
+
+
+def test_parse_fold_commit_message_returns_none_for_an_unrelated_message():
+    """Negative space: the batch's own base commit, or any commit that
+    predates the fold-message contract, must not be misread as naming a
+    member."""
+    assert promote_lib.parse_fold_commit_message("init") is None
+    assert promote_lib.parse_fold_commit_message("Merge pull request #1") is None
+
+
+def test_stamp_and_read_batch_record_round_trip(tmp_path, monkeypatch):
+    """The write/read halves of the durable promote-record log, isolated
+    from the real state dir via SABLE_MG_BATCH_RECORD_LOG — mirrors
+    test_stamp_impact_verdict_augments_the_end_record_in_place's isolation
+    pattern."""
+    monkeypatch.setenv("SABLE_MG_BATCH_RECORD_LOG", str(tmp_path / "batch-records.jsonl"))
+    members = [promote_lib.BatchMember("wk-a", "a" * 40, ("SABLE-a",), ("bin/a.py",))]
+    record = promote_lib.BatchRecord.from_members(
+        "base" + "0" * 36, members, combined_ref="ci-verify/batch-solo",
+        outcome=promote_lib.BATCH_OUTCOME_LANDED, fold_disjoint=True)
+
+    promote_lib._stamp_batch_record(".", record)
+    records = promote_lib.read_batch_records(".")
+    assert records == [record]
+    assert promote_lib.find_batch_record(".", "ci-verify/batch-solo") == record
+    assert promote_lib.find_batch_record(".", "ci-verify/batch-nope") is None
+
+
+def test_stamp_batch_record_is_a_noop_for_a_synthetic_repo_path():
+    """Mirrors _stamp_attention_record's own guard test: a non-existent repo
+    path (and no env override) must degrade to a silent no-op, never raise
+    and never write into the real ~/.claude/sable/state."""
+    promote_lib._stamp_batch_record("/does/not/exist", promote_lib.BatchRecord.from_members(
+        "a" * 40, [promote_lib.BatchMember("wk-a", "a" * 40, ("SABLE-a",), ())],
+        combined_ref="ci-verify/batch-noop", outcome=promote_lib.BATCH_OUTCOME_LANDED,
+        fold_disjoint=True))
+
+
+# --------------------------------------------------------------------------
 # INTEGRATION (SABLE-21rug.1): a REAL git sandbox (a bare origin + a real
 # working clone), the real promote() landing path, and the real durable
 # attention-record log — read back from the durable artifacts alone, with no
@@ -591,3 +736,112 @@ def test_the_real_promote_budget_tool_reports_the_combined_tree_batch_field(tmp_
     assert bumped_timeout_s > timeout_s, (
         "the batch wrapper timeout did not track the underlying tier budget -- "
         "a consumer reading this artifact would be sized against a stale number")
+
+
+# --------------------------------------------------------------------------
+# MANIFEST COMPLETENESS (SABLE-be4lo.2 S2 acceptance, verbatim): a REAL git
+# sandbox, REAL fold commits (built directly with git plumbing here, since
+# SABLE-be4lo.4's fold builder has not landed yet), and a real durable
+# BatchRecord log. The reconstruction below reads ONLY the promote record
+# (find_batch_record) and the fold commit messages (git log +
+# parse_fold_commit_message) -- no bd, no in-memory reuse of the `members`
+# list built above, no other state. That is the "no asking" property itself.
+# --------------------------------------------------------------------------
+
+def _build_real_fold_chain(repo, base_sha, members):
+    """A REAL two-parent fold chain in `repo`: base -> fold(m1) -> fold(m2)
+    -> ... -> fold(mN), each fold commit's message naming exactly the ONE
+    member it folds in (fold_commit_message). Stands in for
+    SABLE-be4lo.4's fold builder, which owns this in production once it
+    lands; built directly with git plumbing here because that bead has not
+    landed yet and this test needs REAL fold commits regardless of that."""
+    tip = base_sha
+    for m in members:
+        cp = subprocess.run(["git", "-C", repo, "rev-parse", f"{m.tip_sha}^{{tree}}"],
+                            check=True, capture_output=True, text=True)
+        tree = cp.stdout.strip()
+        message = promote_lib.fold_commit_message(m.branch, m.bead_ids)
+        cp = subprocess.run(
+            ["git", "-C", repo, "commit-tree", tree, "-p", tip, "-p", m.tip_sha,
+             "-m", message], check=True, capture_output=True, text=True)
+        tip = cp.stdout.strip()
+    return tip
+
+
+def test_manifest_completeness_reconstructs_from_promote_record_and_fold_commits_alone(
+        tmp_path, monkeypatch):
+    """ACCEPTANCE (S2 manifest completeness, verbatim from the matrix): from
+    a landed batch, reconstruct member branches + beads + disjointness
+    evidence + combined ref reading ONLY the promote record and the fold
+    commit messages."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (("init", "-q", "-b", "trunk"), ("config", "user.email", "t@sable.invalid"),
+                 ("config", "user.name", "SABLE Test")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    (repo / "README.md").write_text("trunk\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True,
+                   capture_output=True)
+    base_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "trunk"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    member_specs = [
+        ("wk-a", ("SABLE-a",), ("bin/a.py",)),
+        ("wk-c", ("SABLE-c",), ("bin/c.py",)),
+        ("wk-b", ("SABLE-b1", "SABLE-b2"), ("bin/b.py", "bin/d.py")),
+    ]
+    members = []
+    for branch, beads, footprint in member_specs:
+        subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", branch, "trunk"],
+                       check=True, capture_output=True)
+        for p in footprint:
+            f = repo / p
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(f"{branch}\n")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", branch], check=True,
+                       capture_output=True)
+        tip = subprocess.run(["git", "-C", str(repo), "rev-parse", branch], check=True,
+                             capture_output=True, text=True).stdout.strip()
+        members.append(promote_lib.BatchMember(branch, tip, beads, footprint))
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "trunk"], check=True,
+                   capture_output=True)
+
+    combined_tip = _build_real_fold_chain(str(repo), base_sha, members)
+    combined_ref = "refs/ci-verify/batch-manifest-test"
+    subprocess.run(["git", "-C", str(repo), "update-ref", combined_ref, combined_tip],
+                   check=True, capture_output=True)
+
+    record = promote_lib.BatchRecord.from_members(
+        base_sha, members, combined_ref=combined_ref,
+        outcome=promote_lib.BATCH_OUTCOME_LANDED, fold_disjoint=True)
+    monkeypatch.setenv("SABLE_MG_BATCH_RECORD_LOG", str(tmp_path / "batch-records.jsonl"))
+    promote_lib._stamp_batch_record(".", record)
+
+    # ---- RECONSTRUCTION: reads ONLY the durable promote-record log and the
+    # fold commit messages from git -- `members`/`record` above are never
+    # touched again below this line. ----
+    manifest_record = promote_lib.find_batch_record(".", combined_ref)
+    assert manifest_record is not None, "the promote record for this combined_ref was not durable"
+
+    cp = subprocess.run(
+        ["git", "-C", str(repo), "log", "--format=%s", f"{base_sha}..{combined_ref}"],
+        check=True, capture_output=True, text=True)
+    fold_members = [promote_lib.parse_fold_commit_message(line)
+                    for line in cp.stdout.splitlines() if line.strip()]
+    fold_members = [fm for fm in fold_members if fm is not None]
+
+    assert set(manifest_record.member_branches()) == {"wk-a", "wk-b", "wk-c"}
+    assert set(manifest_record.member_bead_ids()) == {
+        ("SABLE-a",), ("SABLE-b1", "SABLE-b2"), ("SABLE-c",)}
+    assert manifest_record.declared_footprint_paths() == (
+        "bin/a.py", "bin/b.py", "bin/c.py", "bin/d.py")
+    assert manifest_record.fold_disjoint is True
+    assert manifest_record.combined_ref == combined_ref
+
+    assert {fm[0] for fm in fold_members} == {"wk-a", "wk-b", "wk-c"}, (
+        "fold commit messages did not independently name every member branch")
+    assert {fm[1] for fm in fold_members} == {
+        ("SABLE-a",), ("SABLE-b1", "SABLE-b2"), ("SABLE-c",)}, (
+        "fold commit messages did not independently name every member's bead(s)")

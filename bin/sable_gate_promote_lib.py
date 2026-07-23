@@ -2022,6 +2022,253 @@ def compute_attention_baseline(records: list[AttentionRecord]) -> dict:
 
 
 # --------------------------------------------------------------------------
+# BatchRecord — the typed, durable manifest for a batched landing
+# (SABLE-be4lo.2, architecture decision 5)
+# --------------------------------------------------------------------------
+#
+# S2 of the SABLE-be4lo epic: "the seat holds no state a recycle could lose —
+# the record is reconstructible from git plus the promote log alone." Two
+# durable artifacts carry the manifest, independently:
+#   1. the PROMOTE RECORD — one BatchRecord.to_dict() appended to
+#      batch-records.jsonl per batched landing (_stamp_batch_record writes it;
+#      read_batch_records / find_batch_record read it back), mirroring
+#      AttentionRecord's own durable-log precedent immediately above.
+#   2. the FOLD COMMIT MESSAGES — each two-parent commit in the batch's fold
+#      chain names exactly the ONE member it folds in (fold_commit_message /
+#      parse_fold_commit_message). Building the fold chain itself is
+#      SABLE-be4lo.4's bead; this module owns the message FORMAT both that
+#      builder and this manifest's reconstruction agree on, so the contract
+#      exists before either side needs it.
+#
+# Primitive Obsession guard (architecture smell_risks): a batch's member set
+# is NEVER passed across a module boundary as a loose tuple/list of branch
+# names — BatchMember/BatchRecord own it, typed, so no caller-supplied input
+# order can corrupt the manifest or its setkey. BatchRecord.from_members is
+# the only constructor that matters here: it canonicalizes (sorts by
+# tip_sha) before anything is stored or hashed, which is what makes the
+# ordering-safety property true rather than merely asserted.
+
+
+class EmptyBatchError(ValueError):
+    """Raised by BatchRecord.from_members on a zero-member batch. A batch
+    manifest with no members is a caller bug, never a valid vacuous record
+    (SABLE-p9n7k discipline) — must never construct a record."""
+
+
+@dataclass(frozen=True)
+class BatchMember:
+    """One member of a batched landing — the typed unit BatchRecord.members
+    holds instead of a loose (branch, bead, footprint) tuple crossing a
+    module boundary.
+
+    branch           — the member's own branch name.
+    tip_sha          — the member branch's tip commit; the value setkey()
+                       and the canonical (sorted) member ordering are keyed
+                       on.
+    bead_ids         — every bead this member branch closes (usually one;
+                       typed as a tuple so a multi-bead branch is not a
+                       caller-side special case).
+    footprint_paths  — this member's OWN declared footprint
+                       (sable_footprint_lib) at admission time — half of the
+                       disjointness evidence BatchRecord carries; the other
+                       half is BatchRecord.fold_disjoint, the mechanical fold
+                       result."""
+    branch: str
+    tip_sha: str
+    bead_ids: tuple[str, ...]
+    footprint_paths: tuple[str, ...]
+
+    def to_dict(self) -> dict:
+        return {
+            "branch": self.branch,
+            "tip_sha": self.tip_sha,
+            "bead_ids": list(self.bead_ids),
+            "footprint_paths": list(self.footprint_paths),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "BatchMember":
+        return cls(
+            branch=str(data.get("branch", "")),
+            tip_sha=str(data.get("tip_sha", "")),
+            bead_ids=tuple(data.get("bead_ids") or ()),
+            footprint_paths=tuple(data.get("footprint_paths") or ()),
+        )
+
+
+BATCH_RECORD_FILE = "batch-records.jsonl"
+BATCH_RECORD_SCHEMA_VERSION = 1
+
+# Outcome constants, mirroring the ACTION_* / IMPACT_* module-level-constant
+# style above rather than inventing an enum this bead's siblings (the
+# admission/bisection children, be4lo.3/.7/.8) don't own yet. Additive: those
+# children may define further outcome strings without touching this one.
+BATCH_OUTCOME_LANDED = "landed"
+BATCH_OUTCOME_FELL_BACK_SERIAL = "fell_back_serial"
+
+
+@dataclass(frozen=True)
+class BatchRecord:
+    """The typed, durable manifest for one batched landing (S2, architecture
+    decision 5) — the promote record for a batch. Carries everything the S2
+    reconstruct-without-asking acceptance requires: member branches, member
+    bead ids, the disjointness evidence used (declared footprints per member
+    AND the mechanical fold result), the combined ref, the setkey, and the
+    outcome.
+
+    members is ALWAYS in canonical order (sorted by tip_sha) regardless of
+    the order from_members was called with — the ordering-safety contract:
+    the same member set, admitted in any order, serializes identically and
+    keys identically. Construct via from_members(); the bare dataclass
+    constructor exists for from_dict()'s round trip, which reproduces a
+    persisted (already-canonicalized) record rather than re-deriving one."""
+    base_sha: str
+    setkey: str
+    combined_ref: str
+    outcome: str
+    fold_disjoint: bool
+    members: tuple[BatchMember, ...]
+
+    @classmethod
+    def from_members(cls, base_sha: str, members: list[BatchMember], *,
+                     combined_ref: str, outcome: str, fold_disjoint: bool) -> "BatchRecord":
+        """The only constructor that canonicalizes: members is re-sorted by
+        tip_sha (the same key setkey() sorts on) before anything is stored or
+        hashed, so a caller's admission order can never leak into the
+        manifest or the setkey. Raises EmptyBatchError on an empty batch —
+        never a vacuous zero-member record."""
+        if not members:
+            raise EmptyBatchError(
+                "BatchRecord requires at least one member — an empty batch is "
+                "a caller bug, never a valid vacuous record")
+        canonical = tuple(sorted(members, key=lambda m: m.tip_sha))
+        key = batch_key.setkey(base_sha, [m.tip_sha for m in canonical])
+        return cls(base_sha=base_sha, setkey=key, combined_ref=combined_ref,
+                   outcome=outcome, fold_disjoint=fold_disjoint, members=canonical)
+
+    def member_branches(self) -> tuple[str, ...]:
+        return tuple(m.branch for m in self.members)
+
+    def member_bead_ids(self) -> tuple[tuple[str, ...], ...]:
+        return tuple(m.bead_ids for m in self.members)
+
+    def declared_footprint_paths(self) -> tuple[str, ...]:
+        """The declared-footprint half of the disjointness evidence: the
+        UNION of every member's own declared footprint, sorted — a set
+        union, so it is order-independent regardless of canonical ordering."""
+        return tuple(sorted({p for m in self.members for p in m.footprint_paths}))
+
+    def to_dict(self) -> dict:
+        return {
+            "schema": BATCH_RECORD_SCHEMA_VERSION,
+            "base_sha": self.base_sha,
+            "setkey": self.setkey,
+            "combined_ref": self.combined_ref,
+            "outcome": self.outcome,
+            "fold_disjoint": self.fold_disjoint,
+            "members": [m.to_dict() for m in self.members],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "BatchRecord":
+        """Reconstruct from a dict, TOLERATING unknown keys — mirrors
+        AttentionRecord.from_dict's additive-field discipline. Does NOT
+        re-canonicalize members: a persisted record was already canonicalized
+        by from_members at write time, and from_dict's job is to reproduce
+        exactly what was written, not to re-derive it."""
+        members = tuple(BatchMember.from_dict(m) for m in (data.get("members") or ()))
+        return cls(
+            base_sha=str(data.get("base_sha", "")),
+            setkey=str(data.get("setkey", "")),
+            combined_ref=str(data.get("combined_ref", "")),
+            outcome=str(data.get("outcome", "")),
+            fold_disjoint=bool(data.get("fold_disjoint", False)),
+            members=members,
+        )
+
+
+def _stamp_batch_record(repo: str | os.PathLike, record: BatchRecord) -> None:
+    """Append one BatchRecord to the durable per-batch log — the promote
+    record half of the S2 manifest. Mirrors _stamp_attention_record's guard
+    exactly: best-effort (a write failure here must never flip a green
+    promote red), and skips silently (no write, no directory created) on a
+    synthetic/non-existent repo path so unit tests never leak into the real
+    ~/.claude/sable/state."""
+    override = os.environ.get("SABLE_MG_BATCH_RECORD_LOG")
+    if not override and not Path(repo).is_dir():
+        return
+    try:
+        path = Path(override) if override else (
+            snapshot_lib.ensure_state_dir(repo) / BATCH_RECORD_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(json.dumps(record.to_dict()) + "\n")
+    except OSError:
+        pass
+
+
+def read_batch_records(repo: str | os.PathLike = ".") -> list[BatchRecord]:
+    """Read every durable batch record back — the read half of the round
+    trip _stamp_batch_record writes. Tolerates malformed/unreadable lines
+    (skipped, never fatal); mirrors read_attention_records' repo-existence
+    guard so a synthetic repo path reads as 'no records'."""
+    override = os.environ.get("SABLE_MG_BATCH_RECORD_LOG")
+    if not override and not Path(repo).is_dir():
+        return []
+    path = Path(override) if override else (
+        snapshot_lib.ensure_state_dir(repo) / BATCH_RECORD_FILE)
+    records: list[BatchRecord] = []
+    if not path.is_file():
+        return records
+    for raw in path.read_text().splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        records.append(BatchRecord.from_dict(data))
+    return records
+
+
+def find_batch_record(repo: str | os.PathLike, combined_ref: str) -> BatchRecord | None:
+    """The most recent durable batch record for `combined_ref`, or None —
+    the lookup the S2 manifest-reconstruction path uses instead of scanning
+    read_batch_records() by hand at every call site."""
+    matches = [r for r in read_batch_records(repo) if r.combined_ref == combined_ref]
+    return matches[-1] if matches else None
+
+
+# The fold-commit-message CONTRACT — S2's other durable artifact: every
+# fold-chain commit for a batched landing names exactly the ONE member it
+# folds in. SABLE-be4lo.4 (the fold builder) is this format's WRITER once it
+# lands; this module owns the format itself plus the reader, so the manifest
+# is reconstructible from fold commit messages ALONE even with the promote
+# record log unavailable.
+FOLD_COMMIT_MESSAGE_PREFIX = "batch-fold: "
+
+
+def fold_commit_message(branch: str, bead_ids: tuple[str, ...]) -> str:
+    """The commit message a fold-chain commit for `branch` MUST carry."""
+    return f"{FOLD_COMMIT_MESSAGE_PREFIX}{branch} ({','.join(bead_ids)})"
+
+
+def parse_fold_commit_message(message: str) -> tuple[str, tuple[str, ...]] | None:
+    """Inverse of fold_commit_message. None if `message` is not a fold-chain
+    commit message at all — e.g. the batch's own base commit, or an
+    unrelated commit swept up by a broad `git log` range."""
+    if not message.startswith(FOLD_COMMIT_MESSAGE_PREFIX):
+        return None
+    body = message[len(FOLD_COMMIT_MESSAGE_PREFIX):]
+    m = re.match(r"^(.*) \(([^)]*)\)$", body)
+    if not m:
+        return None
+    beads = tuple(b for b in m.group(2).split(",") if b)
+    return m.group(1), beads
+
+
+# --------------------------------------------------------------------------
 # promote — the only writer to the integration branch
 # --------------------------------------------------------------------------
 
