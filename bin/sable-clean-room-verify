@@ -98,5 +98,29 @@ if [ $# -eq 0 ]; then
     set -- bash "$REPO/.github/ci/shell-run-set.sh" --run
 fi
 
+# Suite-run registration for the whole scrubbed run (SABLE-pk15w / SABLE-4qlcf).
+# This tool is the AD-HOC runner class the empirical clearance list never named:
+# `sable-clean-room-verify bash hooks/test/<suite>` is an operator executing a
+# suite by hand, and nothing else in that path registers it. Resolved from this
+# script's own directory rather than $REPO — $REPO is one level too high
+# (SABLE-tztqd) and fixing it is not this change's business.
+SELF_BIN="$(cd "$(dirname "$0")" && pwd)"
+RUNLOCK_CLI="$SELF_BIN/sable-run-registry"
+RUNLOCK_TOKEN=""
+if [ -x "$RUNLOCK_CLI" ]; then
+    if RUNLOCK_TOKEN="$(python3 "$RUNLOCK_CLI" register --runner "sable-clean-room-verify $*" --pid $$ 2>/dev/null)"; then
+        # shellcheck disable=SC2064 — expand the token at trap-install time.
+        trap "python3 '$RUNLOCK_CLI' release '$RUNLOCK_TOKEN' >/dev/null 2>&1" EXIT
+        # Orderly termination releases (bash fires no EXIT trap on an untrapped
+        # signal); SIGKILL/crash still leaves it STALE, which is fail-closed.
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        trap 'exit 129' HUP
+    else
+        RUNLOCK_TOKEN=""
+        echo "sable-clean-room-verify: could not take a suite-run registration — hot-swap clearance will read could-not-assess, not clear (SABLE-pk15w)" >&2
+    fi
+fi
+
 echo "sable-clean-room-verify: running under scrubbed PATH: $*" >&2
 PATH="$SCRUBBED_PATH" "$@"
