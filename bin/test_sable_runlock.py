@@ -192,8 +192,16 @@ def test_plant_and_fail_pk15w_half_removing_the_interlock_restores_the_false_cle
 def test_another_repos_suite_run_does_not_block_this_repo(reg, monkeypatch):
     """Scoping half of the negative control. The invariant is "any worktree of
     THIS repo" — a suite running in an unrelated checkout must still clear, or
-    the gate never releases on a multi-repo host."""
+    the gate never releases on a multi-repo host.
+
+    "/other" is CONFIDENTLY FOREIGN (a real, different repo elsewhere on the
+    host) rather than genuinely unidentifiable, so the discriminator is told
+    that directly — this unit suite injects the process table, not the
+    filesystem, and a hand-built cwd has no real .git for the real resolver to
+    find (see test_a_real_foreign_suite_process_is_never_clear in the
+    integration suite for that check exercised for real)."""
     _roots(monkeypatch, "/repo")
+    monkeypatch.setattr(rl, "_cwd_resolves_to_a_git_repo", lambda cwd: cwd == "/other")
     table = [_proc(4141, 1, "bash /other/hooks/test/test-role.sh", cwd="/other")]
     assert rl.clearance(base="/repo", table=table).state == rl.CLEAR
 
@@ -307,6 +315,52 @@ def test_unattributable_same_uid_candidate_is_could_not_assess(reg, monkeypatch)
     c = rl.clearance(base="/repo", table=table)
     assert c.state == rl.COULD_NOT_ASSESS
     assert c.state != rl.CLEAR
+
+
+def test_readable_cwd_outside_roots_is_unattributable_not_dropped(monkeypatch):
+    """A candidate that IS suite-shaped, IS same-uid, and has a PERFECTLY
+    READABLE cwd that simply is not one of `roots` must never be silently
+    discarded (SABLE-skrdj) — it must surface in `unattributable`, not vanish
+    from both return lists as it did before this fix.
+
+    Controls, all in the same table: an ATTRIBUTED row (cwd inside roots)
+    still lands in `attributed`; a non-suite-shaped row is still ignored
+    entirely; a row whose pid has since exited is still dropped (a race, not
+    a gap — matches the existing tolerance for the cwd-unreadable case)."""
+    # The unit suite injects the process table, not the filesystem — tell the
+    # real-repo discriminator there is none here, so the defect case falls
+    # through to GENUINELY UNKNOWN rather than CONFIDENTLY FOREIGN.
+    monkeypatch.setattr(rl, "_cwd_resolves_to_a_git_repo", lambda cwd: False)
+    monkeypatch.setattr(rl, "pid_alive", lambda pid: pid != 400)
+    table = [
+        _proc(100, 1, "bash /repo/hooks/test/test-role.sh", cwd="/repo"),
+        _proc(200, 1, "bash /elsewhere/hooks/test/test-role.sh", cwd="/elsewhere"),
+        _proc(300, 1, "vim some_file.py", cwd="/elsewhere"),
+        _proc(400, 1, "bash /elsewhere/hooks/test/test-role.sh", cwd="/elsewhere"),
+    ]
+    attributed, unattributable = rl.scan_processes(["/repo"], table=table,
+                                                    self_pid=999999)
+    assert {c.pid for c in attributed} == {100}
+    assert {c.pid for c in unattributable} == {200}
+
+
+def test_unattributable_candidate_makes_clearance_not_clear(reg, monkeypatch):
+    """Under a clearance gate, could-not-assess must resolve NOT CLEAR, and the
+    rendered reason must name pid, ppid, cwd and argv — a partial report is
+    not a report (SABLE-skrdj acceptance criteria)."""
+    _roots(monkeypatch, "/repo")
+    monkeypatch.setattr(rl, "_cwd_resolves_to_a_git_repo", lambda cwd: False)
+    monkeypatch.setattr(rl, "pid_alive", lambda pid: True)
+    table = [_proc(9191, 42, "bash /elsewhere/hooks/test/test-role.sh",
+                   cwd="/elsewhere")]
+    c = rl.clearance(base="/repo", table=table)
+    assert c.state == rl.COULD_NOT_ASSESS
+    assert c.state != rl.CLEAR
+    reason = c.render()
+    assert "9191" in reason                          # pid
+    assert "42" in reason                             # ppid
+    assert "/elsewhere" in reason                      # cwd
+    assert "hooks/test/test-role.sh" in reason          # argv
 
 
 def test_probe_failure_is_could_not_assess(reg, monkeypatch):
