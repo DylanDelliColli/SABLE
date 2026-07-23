@@ -87,3 +87,39 @@ def test_tip_matches_true_on_equal_shas():
 
 def test_tip_matches_false_on_differing_shas():
     assert batch_key.tip_matches(M1, M2) is False
+
+
+# --- preview_kick_key: pinned to pre-consolidation digests (SABLE-be4lo.9) ----
+#
+# Every other assertion in this file computes both sides with THIS module, so
+# it only proves internal self-consistency, not that the byte-identical
+# acceptance criterion from SABLE-be4lo.1 actually holds. These digests were
+# computed from bin/sable_gate_classify_lib.py's preview_kick_key BEFORE
+# SABLE-be4lo.1 deleted it (sha1(base + "\n" + branch + "\n")), and are
+# hardcoded here as an external witness — never recompute them by calling the
+# module, or this guard degrades back into a self-comparison.
+
+def test_preview_kick_key_matches_the_pre_consolidation_digests():
+    # Pinned from bin/sable_gate_classify_lib.py BEFORE SABLE-be4lo.1.
+    # DO NOT regenerate these by calling the module — the whole point is an
+    # external witness. If this fails, the key formula changed and every
+    # existing ci-verify ref name is invalidated.
+    assert batch_key.preview_kick_key("a" * 40, "b" * 40) == "db909b02a3393127e753836d23409196002cf365"
+    assert batch_key.preview_kick_key("0" * 40, "f" * 40) == "f939fb9ef6d4a3501eae9c96de52df266f5e0ead"
+    # Negative control: swapped parents must NOT hit either pinned digest, so
+    # the assertions above cannot be satisfied by a constant-vs-constant
+    # coincidence — the function's actual output has to land on the pin.
+    swapped = batch_key.preview_kick_key("b" * 40, "a" * 40)
+    assert swapped != "db909b02a3393127e753836d23409196002cf365"
+    assert swapped != "f939fb9ef6d4a3501eae9c96de52df266f5e0ead"
+
+
+def test_pinned_digests_are_not_recomputed():
+    # Guard on the guard: if a future "cleanup" replaces the hardcoded digests
+    # above with a call to the module, this file stops being an external
+    # witness. Catch that by asserting the literal strings are still present
+    # in this file's own source.
+    with open(__file__, encoding="utf-8") as f:
+        source = f.read()
+    assert "db909b02a3393127e753836d23409196002cf365" in source
+    assert "f939fb9ef6d4a3501eae9c96de52df266f5e0ead" in source
