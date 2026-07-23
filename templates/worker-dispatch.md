@@ -46,6 +46,29 @@ section below for rules.)
 
 {PASTE FULL BEAD DESCRIPTION HERE — file paths, acceptance criteria, test spec}
 
+## Declaring file footprint / reads (SABLE-50z5g)
+
+If you author or edit ANY bead's `## File footprint` or `## File reads`
+section — a new bead, a follow-up split, a bundle sibling — the two headings
+carry DIFFERENT parsing rules and DIFFERENT failure directions. Advice that
+comma-separates both sections is safe-sounding but teaches the wrong model:
+it implies the risk is uniform, when it is not (measured across both parsers,
+SABLE-546m5).
+
+- `## File footprint` (writes) MUST be comma-separated on ONE logical line.
+  A newline-per-path or hyphen-bulleted reformat SILENTLY DROPS 3 of 4
+  entries — do not "tidy" this into one path per line, even though that is
+  the natural instinct for the next editor.
+- `## File reads` accepts any layout, but every entry must contain a slash
+  or end in a known code suffix — a bare `Makefile`, `Dockerfile`, `.env`,
+  an extensionless script, or a directory missing its trailing slash is
+  SILENTLY DROPPED once the heading is present (SABLE-zx2yv).
+- When unsure, OVER-DECLARE. Forced serialization and an extra preview are
+  recoverable; an under-declared footprint that collides with a live worker
+  is not caught by anything.
+- Change the WORK to fit an honest declaration, never soften the declaration
+  to fit the work — restructure or split the bead instead.
+
 ## Verify current state first
 
 Before writing any code, run:
@@ -450,6 +473,7 @@ without understanding what you're losing.
 | Known acceptable failures | Workers refile duplicate beads for issues already tracked + claimed |
 | Report back rubric | Manager has to re-investigate worker output to know what shipped |
 | Plant-and-fail verdict | A performed-but-unreported control is indistinguishable from one never run (SABLE-4jogz) |
+| Declaring file footprint / reads | A footprint reformatted one-path-per-line silently drops 3 of 4 paths; the same reformat on reads is harmless — uniform advice trains the destructive habit (SABLE-50z5g) |
 
 ---
 
