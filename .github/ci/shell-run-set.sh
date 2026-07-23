@@ -89,6 +89,7 @@ ALLOW=(
   test-preview-already-verified.sh
   test-preview-kick.sh
   test-project-clone-portability.sh
+  test-provenance-guard.sh
   test-quickstart-orchestration.sh
   test-read-guard.sh
   test-reconcile-rebase-copy.sh
@@ -227,6 +228,7 @@ declare -A COVERS=(
   [test-pre-dispatch-refresh.sh]="hooks/multi-manager/pre-dispatch-refresh.sh"
   [test-pre-push-rebase-test.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
   [test-preview-kick.sh]="hooks/multi-manager/post-push-merge-notify.sh"
+  [test-provenance-guard.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
   [test-read-guard.sh]="hooks/multi-manager/read-guard.sh"
   [test-registry.sh]="hooks/multi-manager/lib-registry-path.sh"
   [test-require-all.sh]="hooks/test/lib-require-all.sh"
@@ -309,10 +311,10 @@ check_loud_skip() {
 # list, fails the gate (SABLE-cmar4.2) — this table cannot silently drift out
 # of sync with the real sourcing graph the way a hand-audited doc could.
 declare -A LIB_FANOUT=(
-  [hooks/multi-manager/lib-identity.sh]="test-pre-push-rebase-test.sh test-tier-ssot-consumers.sh test-mode-interlock.sh test-mode-tier.sh test-post-push-merge-notify.sh test-preview-kick.sh test-pre-dispatch-claim.sh test-pre-dispatch-model-check.sh test-pre-dispatch-preempt.sh test-pre-dispatch-refresh.sh test-overlap-constraint.sh test-overlap-dispatch-e2e.sh test-read-guard.sh test-orchestration-install.sh test-lib-identity.sh"
+  [hooks/multi-manager/lib-identity.sh]="test-pre-push-rebase-test.sh test-tier-ssot-consumers.sh test-mode-interlock.sh test-mode-tier.sh test-post-push-merge-notify.sh test-preview-kick.sh test-pre-dispatch-claim.sh test-pre-dispatch-model-check.sh test-pre-dispatch-preempt.sh test-pre-dispatch-refresh.sh test-overlap-constraint.sh test-overlap-dispatch-e2e.sh test-read-guard.sh test-orchestration-install.sh test-lib-identity.sh test-provenance-guard.sh"
   [hooks/multi-manager/lib-hook-trace.sh]="test-post-push-merge-notify.sh test-preview-kick.sh test-tdd-gate.sh test-tdd-evidence.sh test-lib-hook-trace.sh"
-  [hooks/multi-manager/lib-mode-path.sh]="test-pre-push-rebase-test.sh test-tier-ssot-consumers.sh test-mode-interlock.sh test-mode-tier.sh test-post-push-merge-notify.sh test-preview-kick.sh test-pre-dispatch-claim.sh test-pre-dispatch-model-check.sh test-pre-dispatch-preempt.sh test-pre-dispatch-refresh.sh test-overlap-constraint.sh test-overlap-dispatch-e2e.sh test-read-guard.sh test-orchestration-install.sh test-lib-identity.sh test-session-role-anchor.sh test-active-contracts-integration.sh test-lib-mode-path.sh test-sable-mode.sh"
-  [hooks/multi-manager/lib-registry-path.sh]="test-pre-push-rebase-test.sh test-tier-ssot-consumers.sh test-mode-interlock.sh test-mode-tier.sh test-post-push-merge-notify.sh test-preview-kick.sh test-pre-dispatch-claim.sh test-pre-dispatch-model-check.sh test-pre-dispatch-preempt.sh test-pre-dispatch-refresh.sh test-overlap-constraint.sh test-overlap-dispatch-e2e.sh test-read-guard.sh test-orchestration-install.sh test-lib-identity.sh test-registry.sh test-lib-registry-path.sh"
+  [hooks/multi-manager/lib-mode-path.sh]="test-pre-push-rebase-test.sh test-tier-ssot-consumers.sh test-mode-interlock.sh test-mode-tier.sh test-post-push-merge-notify.sh test-preview-kick.sh test-pre-dispatch-claim.sh test-pre-dispatch-model-check.sh test-pre-dispatch-preempt.sh test-pre-dispatch-refresh.sh test-overlap-constraint.sh test-overlap-dispatch-e2e.sh test-read-guard.sh test-orchestration-install.sh test-lib-identity.sh test-session-role-anchor.sh test-active-contracts-integration.sh test-lib-mode-path.sh test-sable-mode.sh test-provenance-guard.sh"
+  [hooks/multi-manager/lib-registry-path.sh]="test-pre-push-rebase-test.sh test-tier-ssot-consumers.sh test-mode-interlock.sh test-mode-tier.sh test-post-push-merge-notify.sh test-preview-kick.sh test-pre-dispatch-claim.sh test-pre-dispatch-model-check.sh test-pre-dispatch-preempt.sh test-pre-dispatch-refresh.sh test-overlap-constraint.sh test-overlap-dispatch-e2e.sh test-read-guard.sh test-orchestration-install.sh test-lib-identity.sh test-registry.sh test-lib-registry-path.sh test-provenance-guard.sh"
   [hooks/multi-manager/lib-evidence-key.sh]="test-tdd-gate.sh test-tdd-evidence.sh test-sable-test.sh"
 )
 

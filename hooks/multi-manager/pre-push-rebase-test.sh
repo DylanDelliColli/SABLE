@@ -421,6 +421,72 @@ Resolve network/auth and retry. This phase cannot be skipped — rebase is manda
   exit 0
 }
 
+# --- SABLE-rrn6r: provenance guard for a direct push of the branch that IS
+# the integration branch. bin/sable-merge-gate promotes by pushing a python
+# subprocess (sable_gate_git_lib._git), never a literal `git push` Bash
+# command, so a legitimate gate promotion NEVER reaches this hook at all —
+# this guard exists for the OTHER path: an agent typing `git push` directly
+# against the integration branch, which is exactly how commit 2b1a15b landed
+# with no ci-verify ref and no merge-preview provenance (SABLE-qhjq3):
+# single-parent, CI ran only AFTER it was already on the branch instead of
+# before. The gate's own promotion pushes the previewed object (byte-
+# identical, I2 in bin/sable-merge-gate) to `refs/heads/ci-verify/<bead>-
+# <sha7>` on origin BEFORE it ever promotes (sable_gate_preview_lib.py
+# materialize_preview/kick_preview); the standard fetch refspec mirrors any
+# refs/heads/* ref under refs/remotes/origin/*, so the `git fetch origin`
+# above already pulled it down if it exists. A commit missing a matching ref
+# was never previewed — deny it.
+#
+# Local-only leg (mechanism 2 of SABLE-rrn6r's two candidates): binds THIS
+# fleet's hooked clients, not an unhooked client on the other side of a
+# shared repo. Mechanism 1 (a GitHub ruleset on tmux-only requiring the
+# ci-verify status check server-side, which WOULD bind an unhooked client
+# too) is the binding fix and is DEFERRED pending operator-brokered
+# cross-fleet coordination — see SABLE-rrn6r's notes for why it isn't done
+# here.
+#
+# Scoped to the CURRENT_BRANCH == INTEGRATION_BRANCH self-push case (the same
+# trigger the fofc guard below uses) and only when origin/<INT> is already
+# published — an unpublished first-time publish has no remote history to
+# check provenance against, matching SKIP_REBASE's own unpublished carve-out.
+#
+# Also scoped to an EXPLICITLY configured integration branch — repo-local
+# `sable.integrationBranch`, a checked-in `.sable` integrationBranch= line, or
+# $SABLE_INTEGRATION_BRANCH — NOT sable_resolve_integration_branch's own
+# lower-priority fallbacks (deriving from $SABLE_BASE_BRANCH, or defaulting to
+# "main"). Without this, a repo that never configured an integration branch
+# at all still resolves one to "main" (the function's final fallback), which
+# — for the overwhelmingly common case of a single-branch repo whose push
+# target IS "main" — made CURRENT_BRANCH == INTEGRATION_BRANCH true for
+# EVERY ordinary push and denied it for lacking a ci-verify ref no ordinary
+# repo has ever heard of (caught by hooks/test/test-pre-push-rebase-test.sh
+# going red across 8 unrelated fixtures on first run of this guard). The
+# provenance requirement is meaningful only where a project has actually
+# opted into the multi-manager integration-branch pattern.
+INTEGRATION_BRANCH_EXPLICIT=$(git -C "$CWD" config --get sable.integrationBranch 2>/dev/null || true)
+if [ -z "$INTEGRATION_BRANCH_EXPLICIT" ] && [ -f "$CWD/.sable" ]; then
+  INTEGRATION_BRANCH_EXPLICIT=$(sed -n 's/^integrationBranch=//p' "$CWD/.sable" 2>/dev/null | head -1)
+fi
+[ -z "$INTEGRATION_BRANCH_EXPLICIT" ] && INTEGRATION_BRANCH_EXPLICIT="${SABLE_INTEGRATION_BRANCH:-}"
+
+if [ -n "$INTEGRATION_BRANCH_EXPLICIT" ] && [ -n "$CURRENT_BRANCH" ] \
+   && [ "$CURRENT_BRANCH" = "$INTEGRATION_BRANCH" ] \
+   && git -C "$CWD" rev-parse --verify --quiet "origin/$INTEGRATION_BRANCH" >/dev/null 2>&1; then
+  UNPROVEN=""
+  while IFS= read -r new_sha; do
+    [ -z "$new_sha" ] && continue
+    if ! git -C "$CWD" for-each-ref "refs/remotes/origin/ci-verify/" --format='%(objectname)' 2>/dev/null \
+         | grep -qx "$new_sha"; then
+      UNPROVEN="$UNPROVEN ${new_sha:0:7}"
+    fi
+  done < <(git -C "$CWD" rev-list "origin/$INTEGRATION_BRANCH..HEAD" 2>/dev/null || true)
+
+  if [ -n "$UNPROVEN" ]; then
+    emit_deny "Pre-push denied (provenance guard): direct push to '$CURRENT_BRANCH' introduces commit(s)$UNPROVEN with no matching refs/heads/ci-verify/<bead>-<sha7> ref on origin — no evidence they were ever previewed by sable-merge-gate before landing (the SABLE-qhjq3 class: commit 2b1a15b landed the same way, single-parent, CI running only after the fact). Land this through 'sable-merge-gate' instead of a direct 'git push', so the exact object is previewed at a ci-verify/<bead>-<sha7> ref and CI-verified BEFORE it promotes."
+    exit 0
+  fi
+fi
+
 # --- SABLE-1238 (supersedes SABLE-4amz's inline derivation): resolve the
 # phase-1 rebase base AUTHORITATIVELY from the target repo's own integration
 # branch, never from the session env. When origin/<INT> is published that ref
