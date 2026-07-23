@@ -16,6 +16,10 @@ Supabase. Full forensics + recovery runbook: market-brief-package-9scm.
 THREE UNPRIVILEGED CHECKS:
   (a) PHANTOM containers — dockerd's own record claims Running, but neither
       the process nor a live cgroup for that container ID actually exists.
+      Scoped to the target dev stack's `com.docker.compose.project` label
+      whenever one is known (i.e. not --skip-pg-check): a phantom belonging
+      to something else entirely on the same host is host noise, not a
+      defect of THIS stack, and must not be reported as one (SABLE-h5czc).
   (b) GHOST TASKS — a live cgroup exists for a container-shaped ID `docker ps`
       does not list — containerd kept it running behind dockerd's back.
   (c) DUAL POSTMASTER — the Supabase db's postmaster start time seen via
@@ -136,16 +140,33 @@ def parse_cgroup_pid_listing(raw_listing):
     return result
 
 
-def find_phantom_containers(inspect_records, live_pids, cgroup_pids):
+def find_phantom_containers(inspect_records, live_pids, cgroup_pids, project=None):
     """(a) A docker-tracked container is a PHANTOM when it claims to be
     Running but neither its State.Pid is a live process nor does a live
     (resolvable, pid>0) cgroup exist for its full ID — dockerd's own record
-    is stale."""
+    is stale.
+
+    project: when given, scope the check to MY STACK — only records whose
+    `com.docker.compose.project` label equals `project` are considered.
+    ATTRIBUTABLE ABSENCE, not global emptiness (SABLE-h5czc): a phantom left
+    on the host by something else entirely (the real, observed case was a
+    container named 'elastic_buck' with no live process and no cgroup — host
+    noise unrelated to any SABLE-managed stack) must not be reported as a
+    defect of a specific stack this check was asked about. A record with no
+    matching label is excluded rather than included, so an unattributable
+    phantom is invisible under scope rather than assumed foreign — the same
+    "don't claim what you can't prove" posture as the rest of this module.
+    When project is None (no target stack known, e.g. --skip-pg-check with
+    no --db-container), scans all running containers as before."""
     phantoms = []
     for rec in inspect_records:
         state = rec.get("State") or {}
         if not state.get("Running"):
             continue
+        if project is not None:
+            labels = ((rec.get("Config") or {}).get("Labels")) or {}
+            if labels.get("com.docker.compose.project") != project:
+                continue
         full_id = rec.get("Id", "")
         pid = state.get("Pid")
         pid_alive = pid in live_pids
@@ -283,6 +304,37 @@ def find_db_container(name_prefix="supabase_db_"):
     return names[0] if names else None
 
 
+def _container_compose_project(container):
+    """Best-effort read of `container`'s `com.docker.compose.project` label,
+    used to scope phantom detection to MY STACK. Returns None (not an error)
+    when the label is absent or the inspect fails — callers must fall back
+    to the previous unscoped behaviour rather than silently hiding a real
+    phantom because attribution could not be established."""
+    r = _sh(["docker", "inspect", container, "--format",
+             '{{index .Config.Labels "com.docker.compose.project"}}'])
+    if r.returncode != 0:
+        return None
+    label = r.stdout.strip()
+    return label or None
+
+
+def _target_project(db_container_arg, skip_pg_check):
+    """Resolve the compose project of the dev stack this run is checking, so
+    check (a) can scope to it (SABLE-h5czc). Independent of, and silent
+    about, the pg-check's own db-container resolution below — any failure
+    here just falls back to project=None (unscoped) rather than masking or
+    duplicating the pg check's real error reporting."""
+    if skip_pg_check:
+        return None
+    try:
+        container = db_container_arg or find_db_container()
+    except PreflightError:
+        return None
+    if not container:
+        return None
+    return _container_compose_project(container)
+
+
 def docker_exec_postmaster_start_time(container):
     r = _sh(["docker", "exec", container, "psql", "-U", "postgres", "-tAc",
              "select pg_postmaster_start_time()"])
@@ -345,6 +397,7 @@ def tcp_postmaster_start_time(container, host_port):
 def run_checks(db_container_arg, helper_image, debounce_seconds, skip_pg_check):
     diagnosis = {"phantoms": [], "ghosts": [], "dual_postmaster": None, "errors": []}
     exit_code = 0
+    project = _target_project(db_container_arg, skip_pg_check)
 
     try:
         inspect_records = docker_inspect_running()
@@ -359,7 +412,16 @@ def run_checks(db_container_arg, helper_image, debounce_seconds, skip_pg_check):
         # (captured before the probe started, so it never lists it).
         known_ids = ps_ids + ([self_id] if self_id else [])
 
-        diagnosis["phantoms"] = find_phantom_containers(inspect_records, live_pids, cgroup_pids2)
+        diagnosis["phantoms"] = find_phantom_containers(inspect_records, live_pids, cgroup_pids2, project=project)
+        # NOTE: ghost-task detection (check b) is NOT project-scoped here —
+        # a ghost has no docker record (that is the whole point: dockerd
+        # lost track of it), so no compose-project label is available to
+        # attribute it to a specific stack. It already carries its own
+        # noise-rejection (pid>0 resolvable in OUR namespace + persists
+        # across two debounced samples — see module docstring), which is
+        # why the observed full-run-only flake (SABLE-h5czc) was a phantom,
+        # not a ghost. Accepted residual, same shape as the shell-suite
+        # advisory-only limitation elsewhere in this repo.
         diagnosis["ghosts"] = find_ghost_tasks(cgroup_pids1, cgroup_pids2, known_ids)
         if diagnosis["phantoms"]:
             exit_code |= EXIT_PHANTOM
