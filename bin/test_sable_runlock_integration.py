@@ -121,14 +121,54 @@ def _suite_processes_visible(repo: Path) -> bool:
     return bool(attributed)
 
 
+LEAD_DIAGNOSTIC_SAMPLES = 8
+
+
+class Samples(list):
+    """The (state, ps_visible) sample list, plus `lead_diagnostics`: for the
+    first few samples, everything needed to say WHY the answer was what it was.
+
+    This exists because the 2026-07-22 clean-room red reported only the verdict
+    list — five bare 'clear' strings — and every subsequent diagnosis of it was
+    therefore a guess made from a different host. A verdict without the process
+    table that produced it is not a measurement, it is a rumour.
+    """
+
+    lead_diagnostics: list[dict]
+
+
+def _lead_diagnostic(repo: Path, state: str) -> dict:
+    """The decisive evidence for one early sample: what the probe was allowed to
+    attribute to, and every same-uid process that even looks suite-shaped —
+    INCLUDING the ones scan_processes silently drops for having a readable cwd
+    outside the roots, which is the only path by which a live forked child can
+    produce a CLEAR."""
+    roots = rl.worktree_roots(str(repo))
+    seen: list[dict] = []
+    try:
+        for p in rl.read_process_table():
+            if p.uid != os.getuid():
+                continue
+            if "pytest" not in p.args and "test_" not in p.args and "test-" not in p.args:
+                continue
+            seen.append({"pid": p.pid, "ppid": p.ppid, "cwd": rl.proc_cwd(p.pid),
+                         "args": p.args[:300]})
+    except rl.ProbeError as exc:
+        seen.append({"probe_error": str(exc)})
+    return {"state": state, "roots": roots, "suite_shaped_same_uid": seen}
+
+
 def _sample_until_exit(proc: subprocess.Popen, repo: Path, limit: float = 90.0):
     """Sample clearance densely for the runner's whole lifetime. A sample is
     (state, ps_visible)."""
-    samples: list[tuple[str, bool]] = []
+    samples = Samples()
+    samples.lead_diagnostics = []
     deadline = time.monotonic() + limit
     while proc.poll() is None and time.monotonic() < deadline:
         visible = _suite_processes_visible(repo)
         state = rl.clearance(base=str(repo)).state
+        if len(samples) < LEAD_DIAGNOSTIC_SAMPLES:
+            samples.lead_diagnostics.append(_lead_diagnostic(repo, state))
         samples.append((state, visible))
         time.sleep(SAMPLE_INTERVAL)
     proc.wait(timeout=30)
@@ -272,8 +312,29 @@ def test_real_pytest_run_is_never_clear_for_its_whole_duration(scratch):
     # process attributed to this repo, so those samples read UNREGISTERED-RUNNER
     # — loud, and conservative in the safe direction. Never clear.
     lead = samples[:samples.index(next(s for s in samples if s[0] == rl.BUSY))]
-    assert rl.CLEAR not in [s for s, _ in lead], \
-        f"a pytest run read CLEAR before its session registered: {samples}"
+
+    # ASSERT ON THE INSTRUMENT BEFORE ASSERTING WITH IT (SABLE-tgi9y).
+    # `lead` is the startup edge: the samples taken after the child forked and
+    # before its conftest registered. If the sampler never lands inside that
+    # window the slice is EMPTY and the assertion below passes over nothing —
+    # a green that means "measured nothing", not "found nothing". Measured on
+    # the 2026-07-23 host: len(lead) == 4 on five consecutive runs, so the
+    # window is comfortably sampleable here; a zero is a broken instrument (or
+    # a host so slow the edge closed before the first sample) and must be
+    # INCONCLUSIVE, never a pass.
+    assert lead, (
+        "INCONCLUSIVE, not passing: the sampler never landed between the child "
+        "pytest's fork and its registration, so the startup-edge assertion below "
+        f"would have run over an empty slice. samples={samples}")
+
+    assert rl.CLEAR not in [s for s, _ in lead], (
+        "a pytest run read CLEAR before its session registered.\n"
+        f"lead states: {[s for s, _ in lead]}\n"
+        f"all samples: {samples}\n"
+        "LEAD DIAGNOSTICS (roots the probe may attribute to, and every same-uid "
+        "suite-shaped process with its cwd — a CLEAR here means none of these "
+        "were attributable to the roots):\n"
+        + "\n".join(repr(d) for d in samples.lead_diagnostics))
     assert rl.clearance(base=str(scratch)).state == rl.CLEAR, "not released on exit"
 
 
