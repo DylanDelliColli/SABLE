@@ -73,6 +73,11 @@
           },
           {
             "type": "command",
+            "command": "bash ~/.claude/hooks/multi-manager/inline-body-guard.sh",
+            "timeout": 3000
+          },
+          {
+            "type": "command",
             "command": "bash ~/.claude/hooks/multi-manager/pre-push-rebase-test.sh",
             "timeout": 210000
           },
