@@ -618,6 +618,35 @@ Chuck uses the registry's `fix_directly` and `delegate_to_author` lists to decid
 
 Mechanical conflicts (no intent to get wrong) → Chuck fixes inline. Semantic conflicts (where author intent matters) → Chuck files a `for-<author>` bead with the conflict context and a suggested resolution.
 
+### 8. MATCHED PAIR / MUST-LAND-TOGETHER beads (SABLE-rzkw7)
+
+A planner or manager can rule that two beads may be worked in parallel but
+must only be *promoted* together — e.g. two halves of one hardcoded-timeout
+fix ("twin hardcodes"), or a cross-epic contract where one side is only
+sound because the other backstops it ("this impact tier is sound only
+because the other epic's green snapshot backstops under-selection; neither
+ships without the other's counterpart"). Before this bead that ruling lived
+only in a bead note or a manager's working memory — nowhere Chuck's promote
+path ever read it, so he could be holding one signed-off half with no way to
+know it was half of a pair. That is a near-miss with no failure event at the
+promote: both halves are individually green, which is exactly what makes
+them individually signable, so nothing red announces the split.
+
+The ruling is now `metadata.landing_pair` on the bead itself, set on BOTH
+sides of the pair:
+
+```bash
+bd update <id-a> --set-metadata landing_pair=<id-b>
+bd update <id-b> --set-metadata landing_pair=<id-a>
+```
+
+`sable-merge-gate promote` reads it mechanically (exit 28, naming the
+counterpart) — see chuck.md's promote step for the full contract and the
+`--with-pair` flag that lets Chuck promote both in one sitting. This is
+distinct from `bd dep add` (which means "cannot **start** until") — a
+landing pair CAN be worked in parallel; it can only never be **promoted**
+solo.
+
 ---
 
 ## Hook catalog (advanced — multi-manager)
@@ -639,6 +668,7 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | `edit-write-claim-reconciler.sh` | PreToolUse:Edit\|Write | Append modified file to bead claims | Side effect (bd update) |
 | `pre-push-rebase-test.sh` | PreToolUse:Bash matching `git push` | Force rebase + tests before push | Hard deny |
 | `post-push-merge-notify.sh` | PostToolUse:Bash matching `git push` | File `for-chuck` bead with overlap analysis (Chuck's own pushes are skipped) | Side effect (bd create) |
+| `seat-sighting-gate.sh` | PostToolUse:Bash matching `bd create`, identity-gated on chuck | Mechanizes "capture is mandatory, priority is advisory" (SABLE-441vl): after a seat-filed bead lands, auto-labels it `seat-filed` and marks `metadata.priority_provisional=true` for a manager's later triage. Never denies — the seat's `bd create` is never refused | Side effect (bd update), never blocks |
 | `close-decay-sweep.sh` | PreToolUse:Bash matching `bd close` | Identifier-decay sweep (SABLE-x9vby): flag OPEN beads whose INSTRUCTIONS still name the bead id being retired, with the matching line | Inject context (never denies) |
 
 **Identifier decay (`close-decay-sweep.sh`)**: an instruction pinned to an identifier decays *silently* when that identifier is retired through normal, correct action — nothing fails, and the stale instruction still reads as satisfiable, so whoever follows it does something harmless and wrong. This hook is the retirement-time catch: at `bd close`, it sweeps open beads for instructional references to the closing id and prints them inline (`sable-identifier-decay` does the work; the same detector runs at the merge gate's branch-delete, where a branch NAME is the retiring identifier). It is deliberately not role-gated — workers close their own beads, so a manager-only guard would miss most closes. It never denies: fail-open on the decision, loud on the report (a sweep that could not run says `COULD NOT ASSESS` rather than printing the silence a clean sweep prints). **Known limit, shipped in the flag text itself**: it sees instructions that NAME a retired identifier, not ones invalidated because a code path stopped being reached (SABLE-3nymz). A detector whose limits are undocumented gets trusted past them.
