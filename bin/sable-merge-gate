@@ -332,6 +332,10 @@ def main(argv: list[str] | None = None) -> int:
                          "test / deleted test file never needs this. Recorded on the bead. "
                          "Mirrors the 'Model override: <reason>' pattern; also accepted as a "
                          "'Coverage override: <reason>' line in this flag's own value.")
+    pp.add_argument("--with-pair", action="append", default=[], dest="with_pair",
+                    metavar="BEAD_ID",
+                    help="BEAD_ID is promoted together with --bead in THIS call (repeatable "
+                         "or comma-separated) — satisfies a landing_pair constraint (SABLE-rzkw7)")
 
     # SABLE-jd5fj.1 kick entrypoint. No --bead: the post-push hook that fires
     # this knows the branch it just confirmed, not the bead behind it, and a kick
@@ -402,9 +406,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "promote":
             base = git_lib.resolve_base(args.base, args.repo)
+            with_pair = promote_lib.parse_with_pair(args.with_pair)
             return promote_lib.promote(args.bead, args.branch, base, args.repo,
                                        args.remote, args.manager, args.override,
-                                       args.coverage_override)
+                                       args.coverage_override, with_pair)
         if args.command == "preview":
             base = git_lib.resolve_base(args.base, args.repo)
             return preview_lib.kick_preview(args.branch, base, args.repo, args.remote)
