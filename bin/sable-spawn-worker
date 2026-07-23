@@ -802,10 +802,20 @@ def tag_footprint_metadata(bead_id: str, description: str) -> None:
     Best-effort like every other governance write in this module (branch,
     model, serialize_with): a missed tag degrades to the prose fallback in
     sable_footprint_lib, it never blocks dispatch."""
-    writes = extract_footprint_section(description)
-    if writes:
+    # SABLE-47try/SABLE-qm9ky: reads the PRESENCE signal, not just the paths.
+    # This used to be `if extract_footprint_section(description):`, which could
+    # not implement the criterion stated above — a present-but-empty section is
+    # falsy, so the key would be OMITTED and DECLARED-EMPTY would silently
+    # become UNDECLARED. The gap was invisible while the parser's heading-scrape
+    # bug made that case return the junk token '##': it was truthy, so the key
+    # was always stamped, with garbage. Fixing the parser exposed the writer.
+    # read_footprint_section reports the heading as an unreadable source exactly
+    # when it was FOUND and yielded nothing, so `files or unreadable_sources`
+    # is "the planner supplied a section", which is what this key encodes.
+    writes_read = read_footprint_section(description)
+    if writes_read.files or writes_read.unreadable_sources:
         subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata",
-                        f"footprint_writes={','.join(sorted(writes))}"],
+                        f"footprint_writes={','.join(sorted(writes_read.files))}"],
                        capture_output=True, text=True)
 
     reads_declared, reads = fp_lib.parse_declared_reads(description)

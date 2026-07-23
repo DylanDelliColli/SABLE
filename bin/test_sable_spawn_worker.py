@@ -1015,6 +1015,34 @@ def test_tag_footprint_metadata_omits_both_keys_when_no_sections_at_all(monkeypa
         "list here would silently convert UNDECLARED into DECLARED-EMPTY")
 
 
+def test_tag_footprint_metadata_writes_present_and_empty_writes_when_declared_empty(monkeypatch):
+    """SABLE-47try/SABLE-qm9ky: the WRITES-side counterpart of the reads case
+    below, which had no coverage because the parser's heading-scrape bug hid
+    it — a present-but-empty '## File footprint' section used to parse as the
+    junk path '##', so the key was always stamped and always truthy.
+
+    With the parser fixed, the writer must still stamp the key with an EMPTY
+    value here: the planner DID supply a section, so this is DECLARED-EMPTY,
+    and _metadata_entries distinguishes it from absence by key membership
+    alone. Guards the regression the parser fix would otherwise have caused
+    (declared-empty silently collapsing into undeclared)."""
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ssw.subprocess, "run", fake_run)
+    ssw.tag_footprint_metadata(
+        "SABLE-x1", "Story.\n\n## File footprint\n\n## Test spec\nsomething")
+    assert calls == [
+        ["bd", "update", "SABLE-x1", "--sandbox", "--set-metadata",
+         "footprint_writes="],
+    ], "a present-but-empty footprint section is DECLARED-EMPTY, not undeclared"
+    # and specifically never the scraped heading token
+    assert "##" not in calls[0][-1]
+
+
 def test_tag_footprint_metadata_writes_present_and_empty_reads_when_explicitly_declared_empty(monkeypatch):
     """The negative control's counterpart: when the planner DID declare an
     explicit (even empty) '## File reads' section, the key MUST be present
