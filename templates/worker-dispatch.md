@@ -101,6 +101,21 @@ Return:
   output lines proving the gate ran. Report the REAL command, not a reconstructed
   path — a wrong path makes the reviewer's re-run `collect 0 items` and falsely
   read as green (observed live, twice).
+- **Plant-and-fail verdict (SABLE-4jogz).** Required on EVERY close, not only
+  when a manager's brief happens to ask for it — a requirement that lives only
+  in per-dispatch prose gets dropped exactly when dispatch is hurried, and an
+  unreported verdict is indistinguishable from an unperformed one to everyone
+  downstream. Exactly three legal values, so silence is never mistaken for
+  non-applicability:
+    - `NOT TRIGGERED` — state the basis (e.g. zero removed/weakened
+      assertions, measured).
+    - `TRIGGERED AND CLEARED` — state what you read and why it is not a
+      weakening.
+    - `TRIGGERED AND DEMONSTRATED` — state the control that was shown to
+      bite (both polarities, for a gate change per SABLE-5lli.7).
+  State it in the `bd close --reason` text itself — that's the field
+  compliance checks read (SABLE-bp57h: `bd close` writes `close_reason`, not
+  `notes`).
 ```
 
 ---
@@ -243,8 +258,11 @@ pool: the manager watches your bead's status, not a returned message. Lifecycle:
    plain `git push` from your CWD. The `pre-push-rebase-test` gate runs; on
    failure STOP and report — do not bypass. The post-push hook files the
    `for-chuck` handoff; **Chuck merges your branch** as usual. You do NOT open PRs.
-4. `bd close <bead-id>` with the test evidence (the tdd-gate keys off your real
-   session — warm panes satisfy it natively). **Check the exit code.** A
+4. `bd close <bead-id>` with the test evidence, INCLUDING the plant-and-fail
+   verdict per the Report back rubric above (SABLE-4jogz — required on every
+   close, one of the three legal values) in the `--reason` text (the tdd-gate
+   keys off your real session — warm panes satisfy it natively). **Check the
+   exit code.** A
    non-zero exit (e.g. the TDD gate's deny) means the close did NOT land —
    do not report success. Read the gate's stderr reason verbatim, fix the
    real cause (missing test evidence, or add `[no-test]` to the bead's
@@ -431,6 +449,7 @@ without understanding what you're losing.
 | Constraints — rebase | Worker pushes on a 30-min-old base, hits avoidable conflicts |
 | Known acceptable failures | Workers refile duplicate beads for issues already tracked + claimed |
 | Report back rubric | Manager has to re-investigate worker output to know what shipped |
+| Plant-and-fail verdict | A performed-but-unreported control is indistinguishable from one never run (SABLE-4jogz) |
 
 ---
 
