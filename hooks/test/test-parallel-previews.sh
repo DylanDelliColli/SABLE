@@ -73,6 +73,11 @@ BASE_BR="trunk"
 #   FAKE_GH_MODE=empty      models actions-down (no runs at all)
 #   FAKE_GH_MODE=pending    a run exists but has NOT completed — the read must
 #                           decline to call it a verdict
+#   FAKE_GH_MODE=error      models gh itself failing (missing/erroring/hanging
+#                           in prod) — a non-zero exit, so _gh_runs returns
+#                           None: a NON-ANSWER, distinct from 'empty' (gh
+#                           answered "no runs") and from 'pending' (gh
+#                           answered "still running") — SABLE-fewih
 #   FAKE_GH_ADVANCE=<sha>   moves origin's base at call time (the real
 #                           base-moved-during-CI race, exit 23)
 #   FAKE_GH_CALLS=<file>    appends one line per invocation, so "promote read the
@@ -91,6 +96,8 @@ advance = os.environ.get("FAKE_GH_ADVANCE", "")
 if advance:
     subprocess.run(["git", "--git-dir=" + od, "update-ref",
                     "refs/heads/" + os.environ["FAKE_GH_BASE"], advance], check=False)
+if mode == "error":
+    print("gh: network error", file=sys.stderr); sys.exit(1)
 if mode == "empty":
     print("[]"); sys.exit(0)
 a = sys.argv[1:]
@@ -250,6 +257,17 @@ if printf '%s' "$OUT" | grep -q '"state": "pending"' && printf '%s' "$OUT" | gre
   pass "P2b: an in-flight run reads as pending, not green (the read is a real observation)"
 else
   fail "P2b: in-flight run reads pending" "out=$OUT"
+fi
+
+# (P2b') Non-vacuity in the other direction (SABLE-fewih): when gh itself
+# cannot be asked at all (missing/erroring/hanging), the verdict CLI must NOT
+# report the same 'pending' as a genuinely in-flight run — this read has no
+# wait loop to converge through, unlike promote's wait_for_ci fallthrough.
+OUT="$(FAKE_GH_MODE=error gate verdict --branch wk-1 --base "$BASE_BR" --repo "$B_WORK" --remote origin --json)"
+if printf '%s' "$OUT" | grep -q '"state": "unknown"' && printf '%s' "$OUT" | grep -q '"promotable": false'; then
+  pass "P2b': gh erroring reads as unknown, not pending (SABLE-fewih)"
+else
+  fail "P2b': non-answer verdict reads as unknown" "out=$OUT"
 fi
 
 # (P2c) promote CONSUMES that stored verdict: it says so, it does not poll, and
