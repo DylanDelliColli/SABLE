@@ -418,10 +418,10 @@ def test_is_rw_disjoint_write_write_overlap_still_wins_first():
 
 
 def test_parse_declared_reads_distinguishes_absent_from_declared_empty():
-    declared, entries = fp.parse_declared_reads("no reads section at all")
+    declared, entries, _dropped = fp.parse_declared_reads("no reads section at all")
     assert declared is False
     assert entries == frozenset()
-    declared2, entries2 = fp.parse_declared_reads("## File reads\nnone\n")
+    declared2, entries2, _dropped2 = fp.parse_declared_reads("## File reads\nnone\n")
     assert declared2 is True
     assert entries2 == frozenset()
 
@@ -434,11 +434,60 @@ def test_parse_declared_reads_reads_the_bead_section():
         "## Test spec\n"
         "hooks/test/test-should-not-be-picked-up.sh\n"
     )
-    declared, entries = fp.parse_declared_reads(description)
+    declared, entries, _dropped = fp.parse_declared_reads(description)
     assert declared is True
     assert ".github/ci/test-tiers.sh" in entries
     assert not any("should-not-be-picked-up" in e for e in entries), \
         "parsing ran past the end of the reads section"
+
+
+# --------------------------------------------------------------------------
+# 7. Loud-on-ambiguity: a dropped token is reported, never silently discarded
+#    (SABLE-kznzo) — prose in a '## File reads' section must not be able to
+#    hide a genuinely dropped bare filename among the noise.
+# --------------------------------------------------------------------------
+
+def test_reads_section_with_prose_reports_dropped_tokens():
+    description = (
+        "Story blah blah.\n\n"
+        "## File reads\n"
+        "bin/one.py, bin/two.py, bin/three.py, bin/four.py, bin/five.py, "
+        "bin/six.py. COMMA FORM IS DELIBERATE (SABLE-546m5): the dispatch-side "
+        "parser truncates newline form to one entry, so do not reformat this "
+        "section.\n"
+    )
+    declared, entries, dropped = fp.parse_declared_reads(description)
+    assert declared is True
+    assert entries == {
+        "bin/one.py", "bin/two.py", "bin/three.py",
+        "bin/four.py", "bin/five.py", "bin/six.py",
+    }
+    assert dropped, "a section with a trailing rationale paragraph must report drops"
+    assert any(tok.isalpha() for tok in dropped), \
+        "the dropped report must name at least one prose word from the paragraph"
+
+
+def test_bare_filename_entry_is_reported_as_dropped():
+    """THE LOAD-BEARING CASE. A bare filename ('Makefile') has no '/' and no
+    known code suffix, so it is lexically identical to an English word to
+    this tokenizer. It must show up in the dropped report rather than
+    vanishing silently — a fix that merely learns to ignore prose sentences
+    does not satisfy this: it must ALSO surface the genuine miss."""
+    declared, entries, dropped = fp.parse_declared_reads("## File reads\nMakefile\n")
+    assert declared is True
+    assert entries == frozenset(), "a bare filename does not look path-shaped to this parser"
+    assert "Makefile" in dropped, \
+        "a bare filename that fails the path-shaped test must be reported, not swallowed"
+
+
+def test_entries_only_section_reports_zero_drops():
+    """NEGATIVE CONTROL: the dropped report is not trivially always-on. A
+    clean comma-separated path list with no rationale drops nothing."""
+    description = "## File reads\nbin/one.py, bin/two.py, hooks/test/test-thing.sh\n"
+    declared, entries, dropped = fp.parse_declared_reads(description)
+    assert declared is True
+    assert entries == {"bin/one.py", "bin/two.py", "hooks/test/test-thing.sh"}
+    assert dropped == frozenset()
 
 
 def test_declared_reads_raises_when_section_is_absent(repo, monkeypatch):
