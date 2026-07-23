@@ -254,24 +254,47 @@ _READS_HEADING = re.compile(r"^#+\s*File reads\s*$", re.IGNORECASE)
 _PARENTHETICAL = re.compile(r"\([^)]*\)")
 _CODE_SUFFIXES = (".py", ".sh", ".yml", ".yaml", ".json", ".md", ".ts", ".js", ".toml")
 
+# The fleet-wide convention (hooks/test/test-optimistic-promotion.sh,
+# bin/sable-spawn-worker's tag_footprint_metadata, and this module's own
+# tests) for writing an EXPLICITLY empty section: a lone 'none' line under
+# the heading. It is not path-shaped and is correctly never added to
+# `entries`, but it is also not an authoring error the SABLE-zx2yv
+# completeness check should flag — it is the deliberate spelling of "this
+# section is declared, and empty", so it must not count as a `dropped` token.
+_EMPTY_SECTION_MARKERS = frozenset({"none"})
 
-def _collect_section(description: str, heading: re.Pattern[str]) -> tuple[bool, frozenset[str]]:
+
+def _collect_section(description: str, heading: re.Pattern[str]
+                     ) -> tuple[bool, frozenset[str], frozenset[str]]:
     """Shared prose-section extractor for the bead-description sub-sections
     this module parses (`## File footprint`, `## File reads`).
 
-    Returns (found, entries): `found` says whether the heading appeared at all,
-    which the caller needs to tell "not declared" apart from "declared as
-    empty" (SABLE-jd5fj.18) — a distinction `parse_declared_footprint`'s
+    Returns (found, entries, dropped): `found` says whether the heading
+    appeared at all, which the caller needs to tell "not declared" apart from
+    "declared as empty" (SABLE-jd5fj.18) — a distinction `parse_declared_footprint`'s
     caller does not need, because the mechanical footprint already governs the
     write side, but `parse_declared_reads`'s caller very much does, because
     reads have no such fallback.
 
     Parsing is deliberately lossy in the WIDENING direction only: parenthetical
     asides are dropped (they are commentary), tokens are split on commas and
-    whitespace, and a token is kept if it looks like a path (contains '/' or
-    ends in a known code suffix). A prose fragment that survives as a bogus
-    entry can only ADD to the set; a real path that is missed leaves whatever
-    fallback the caller has governing. Neither direction can narrow it."""
+    whitespace, and a token is kept in `entries` if it looks like a path
+    (contains '/' or ends in a known code suffix). A prose fragment that
+    survives as a bogus entry can only ADD to the set; a real path that is
+    missed leaves whatever fallback the caller has governing. Neither
+    direction can narrow `entries` itself.
+
+    `dropped` is the SABLE-zx2yv completeness signal: every non-empty token
+    that was NOT kept in `entries` AND is not a recognised "this section is
+    declared, and empty" marker (`_EMPTY_SECTION_MARKERS`, e.g. a lone
+    'none' line) — a bare filename like 'Makefile', a directory name with no
+    trailing slash, an extensionless script. It is empty precisely when
+    every token in the section was either recognised as a path or was the
+    deliberate empty-section spelling. A caller with no mechanical fallback
+    for narrowing (declared_reads) must treat a non-empty `dropped` as "this
+    declaration could not be fully understood", not as "declared, and
+    complete" — the write side ignores it, because the mechanical footprint
+    already covers whatever a dropped write token would have named."""
     lines = description.splitlines()
     body: list[str] = []
     collecting = False
@@ -286,23 +309,31 @@ def _collect_section(description: str, heading: re.Pattern[str]) -> tuple[bool, 
                 break
             body.append(line)
     if not found:
-        return False, frozenset()
+        return False, frozenset(), frozenset()
     text = _PARENTHETICAL.sub(" ", "\n".join(body))
     entries: set[str] = set()
+    dropped: set[str] = set()
     for raw in re.split(r"[,\s]+", text):
         tok = raw.strip().strip("`*-—;:").rstrip(".")
         if not tok:
             continue
         if "/" in tok or tok.endswith(_CODE_SUFFIXES):
             entries.add(tok)
-    return True, frozenset(entries)
+        elif tok.lower() not in _EMPTY_SECTION_MARKERS:
+            dropped.add(tok)
+    return True, frozenset(entries), frozenset(dropped)
 
 
 def parse_declared_footprint(description: str) -> frozenset[str]:
     """Entries from a bead description's `## File footprint` section. An
     absent section is treated as "declares nothing" — see _collect_section —
-    because the mechanical footprint governs the write side regardless."""
-    _, entries = _collect_section(description, _FOOTPRINT_HEADING)
+    because the mechanical footprint governs the write side regardless.
+
+    A dropped token (SABLE-zx2yv) is silently ignored here, on purpose: the
+    write side's guarantee never depended on the prose parser catching every
+    token, only on the mechanical footprint being unioned in afterward — see
+    declared_footprint()."""
+    _, entries, _ = _collect_section(description, _FOOTPRINT_HEADING)
     return entries
 
 
@@ -316,8 +347,16 @@ def parse_declared_reads(description: str) -> tuple[bool, frozenset[str]]:
     nothing beyond its own footprint"). The caller — declared_reads() below —
     must treat "not declared" as a non-answer, unlike parse_declared_footprint's
     caller: writes always have a mechanical fallback, and reads, today, do
-    not (mechanical/import-graph derivation of reads is the follow-up bead)."""
-    return _collect_section(description, _READS_HEADING)
+    not (mechanical/import-graph derivation of reads is the follow-up bead).
+
+    This function's 2-tuple return is a stable public contract other callers
+    (bin/sable-spawn-worker's tag_footprint_metadata) unpack directly, so it
+    deliberately does NOT surface the `dropped`-token completeness signal
+    _collect_section now tracks (SABLE-zx2yv) — declared_reads() below reads
+    _collect_section itself to get at that third element instead of widening
+    this signature."""
+    declared, entries, _ = _collect_section(description, _READS_HEADING)
+    return declared, entries
 
 
 def _read_bead(repo: str, bead: str) -> dict:
@@ -404,18 +443,38 @@ def declared_reads(repo: str, bead: str) -> Footprint:
     is the floor this bead builds: reads have no mechanical fallback yet, so
     silence about what a branch reads must fail toward serialization exactly
     like an unparseable diff does, never toward the old silent 'parallel-safe'
-    default."""
+    default.
+
+    SABLE-zx2yv: the floor above catches TOTAL silence (heading absent) but
+    used to miss PARTIAL silence — a `## File reads` section that IS present
+    but contains a token the tokenizer cannot recognise as a path (a bare
+    repo-root filename like 'Makefile', a directory name with no trailing
+    slash, an extensionless script) was consumed as a complete answer,
+    silently narrowing the declared read set with nothing behind it. This
+    reads _collect_section directly (rather than going through
+    parse_declared_reads) to get at its `dropped` token set and raises the
+    same FootprintUndetermined a missing heading would, rather than trusting
+    an incompletely-tokenized section as complete. Only the PROSE path needs
+    this: the structured `footprint_reads_declared` metadata field above is
+    consumed verbatim, never re-tokenized, so it cannot suffer this gap."""
     if not bead:
         raise FootprintUndetermined("no bead id — cannot read the declared read footprint")
     record = _read_bead(repo, bead)
     structured = _metadata_entries(record["metadata"], "footprint_reads_declared")
     if structured is not None:
         return footprint(structured, source=f"declared-reads:{bead}:field")
-    declared, entries = parse_declared_reads(record["description"])
+    declared, entries, dropped = _collect_section(record["description"], _READS_HEADING)
     if not declared:
         raise FootprintUndetermined(
             f"no declared read footprint (field or '## File reads' section) for "
             f"{bead} — undeclared read set forces serialization (SABLE-jd5fj.18 floor)")
+    if dropped:
+        raise FootprintUndetermined(
+            f"'## File reads' section for {bead} contains unrecognised token(s) "
+            f"{', '.join(sorted(dropped))} — the parser cannot tell whether these "
+            f"name real paths, so the declared read set may be narrower than "
+            f"intended (SABLE-zx2yv: present-but-incomplete forces serialization "
+            f"exactly like an absent heading, never toward a trusted-complete set)")
     return footprint(entries, source=f"declared-reads:{bead}:prose")
 
 
