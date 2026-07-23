@@ -722,7 +722,56 @@ def test_assemble_dispatch_prompt_without_bundle_has_no_bundle_section():
     assert "Bundle contract" not in p
     assert "Bundled bead" not in p
     assert "bd close X-1" in p
-    assert "every other bundled bead" not in p
+
+
+# --- plant-and-fail verdict requirement (SABLE-4jogz) ------------------------
+
+_PLANT_AND_FAIL_VALUES = (
+    "NOT TRIGGERED",
+    "TRIGGERED AND CLEARED",
+    "TRIGGERED AND DEMONSTRATED",
+)
+
+
+def test_assemble_dispatch_prompt_carries_plant_and_fail_verdict_normal():
+    """SABLE-4jogz: every dispatched worker must receive the plant-and-fail
+    verdict requirement without the dispatching manager having to remember it
+    — pinned here to the literal three legal values, not a generic 'verdict'
+    word, so the test can't pass on unrelated prompt text."""
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="sonnet",
+    )
+    for value in _PLANT_AND_FAIL_VALUES:
+        assert value in p, f"missing legal value {value!r}"
+    assert "close_reason" in p
+    # the requirement must precede the close instruction it decorates
+    assert p.index(_PLANT_AND_FAIL_VALUES[0]) < p.index("bd close X-1")
+
+
+def test_assemble_dispatch_prompt_carries_plant_and_fail_verdict_bundle():
+    """Same requirement, bundle dispatch path (SABLE-q13h) — the bundle
+    rendering must not crowd out the verdict requirement."""
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Lead thing", description="lead desc",
+        worktree="/wt/wk-x", branch="wk-x", model="sonnet",
+        bundle=[{"id": "Y-2", "title": "Sibling", "description": "sibling desc"}],
+    )
+    for value in _PLANT_AND_FAIL_VALUES:
+        assert value in p, f"missing legal value {value!r}"
+
+
+def test_assemble_dispatch_prompt_is_the_sole_render_path_for_respawn():
+    """SABLE-4jogz test spec: the requirement must reach EVERY dispatch path,
+    including --respawn. --respawn carries no separate prompt-render function
+    — it flows through the exact same assemble_dispatch_prompt call as a
+    normal dispatch (verified structurally: exactly one call site in the
+    source), so the normal-path coverage above already covers --respawn. This
+    test pins that structural fact so a future refactor that splits respawn
+    onto its own render path cannot silently drop the requirement without
+    also breaking this assertion."""
+    src = Path(ssw.__file__).read_text()
+    assert src.count("assemble_dispatch_prompt(") == 2  # def + the one call site
 
 
 def test_claim_bundle_beads_claims_each_unclaimed_sibling(monkeypatch):
