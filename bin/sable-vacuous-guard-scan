@@ -10,8 +10,8 @@ Python stdlib, so this is a regex-based detector, not an addition to
 bin/columbo-prefilter.py's Python/TS heuristic registry (that is the sibling
 S1 surface).
 
-WHAT IT FLAGS
--------------
+WHAT IT FLAGS (form 1 — touch-then-assert, SABLE-i8kv)
+--------------------------------------------------------
 A `touch $X` / `echo ... > $X` / `printf ... > $X` line whose very next
 non-blank, non-comment line is a raw `[ -e $X ]` / `test -e $X` check on the
 SAME target — i.e. nothing runs between the write and the read. That
@@ -29,6 +29,29 @@ any other real code between a touch and a later `[ -e ]` on the same target
 (another write, a call into the installer under test, an unrelated
 assertion, ...) breaks the adjacency and the check is left unflagged, since
 something now sits between the write and the read.
+
+WHAT IT FLAGS (form 2 — slice-then-assert, SABLE-pk15w/SABLE-p9n7k)
+----------------------------------------------------------------------
+A collection built by BASH ARRAY SLICING (`TARGET=("${SRC[@]:OFF:CNT}")`) or
+by a filtered `mapfile` read (`mapfile -t TARGET < <(... | head/tail/grep/
+find/awk/sed -n ...)`), then consumed by a `for ITEM in "${TARGET[@]}"; do`
+loop that asserts (`pass`/`fail`/`assert...`) on each item — with no
+statement anywhere in between that checks `${#TARGET[@]}` (or similar) is
+non-empty first. Mirrors SABLE-pk15w exactly: a `lead = samples[:n]` slice
+sampled before a registration event, then `assert 'clear' not in lead` with
+no guard that `lead` was non-empty. On the contended host the slice was
+always non-empty and the assertion bit; on a fast idle CI runner the slice
+came back EMPTY and the assertion passed vacuously over zero items — 44/44
+green was a manager SIGN-OFF, not a false alarm, because nothing distinguished
+"checked and passed" from "had nothing to check". The bash form is the exact
+transliteration: a `for` loop over an empty array runs its body zero times
+and the surrounding suite reports the same unconditional green.
+
+The escape is the same shape as form 1's: exercise a guard that actually
+depends on the collection's size, e.g. `[ "${#TARGET[@]}" -gt 0 ]` (or an
+exact-count check like the repo's own `[ "${#HOME_MARKERS[@]}" -eq 2 ]` at
+hooks/test/test-impact-tier-serialization.sh) before trusting a loop over it
+to mean anything.
 
 USAGE
     sable-vacuous-guard-scan              # scan the repo's bash test corpus
@@ -88,6 +111,48 @@ _ASSERT_RE = re.compile(
     r"|\btest\s+-e\s+(?P<t2>" + _TARGET + r")"
 )
 
+# ---------------------------------------------------------------------------
+# Form 2 — slice-then-assert (SABLE-pk15w class)
+# ---------------------------------------------------------------------------
+_SLICE_ASSIGN_RE = re.compile(
+    r'^\s*(?P<var>\w+)=\(\s*"?\$\{(?P<src>\w+)\[@\]:[^}]+\}"?\s*\)'
+)
+_FILTER_MAPFILE_RE = re.compile(
+    r'^\s*mapfile\s+(?:-t\s+)?(?P<var>\w+)\s*<\s*<\(\s*(?P<cmd>.+)\)\s*$'
+)
+_FILTER_CMD_HINT_RE = re.compile(r'\b(?:head|tail|grep|find|awk)\b|\bsed\s+-n\b')
+_FOR_LOOP_START_RE = re.compile(
+    r'^\s*for\s+\w+\s+in\s+"?\$\{(?P<var>\w+)\[@\]\}"?\s*;\s*do\b'
+)
+_LOOP_OPEN_RE = re.compile(r';\s*do\s*$|^\s*do\s*$')
+_DONE_RE = re.compile(r'^\s*done\b')
+_COUNT_GUARD_RE = re.compile(r'\$\{#(?P<var>\w+)\[[@*]\]\}')
+_ASSERT_CALL_RE = re.compile(r'\b(?:pass|fail|assert\w*)\b')
+
+
+def _match_slice_or_filter_creation(masked: str) -> Optional[str]:
+    m = _SLICE_ASSIGN_RE.match(masked)
+    if m:
+        return m.group("var")
+    m = _FILTER_MAPFILE_RE.match(masked)
+    if m and _FILTER_CMD_HINT_RE.search(m.group("cmd")):
+        return m.group("var")
+    return None
+
+
+def _match_count_guard(masked: str) -> Optional[str]:
+    m = _COUNT_GUARD_RE.search(masked)
+    return m.group("var") if m else None
+
+
+def _match_for_loop_start(masked: str) -> Optional[str]:
+    m = _FOR_LOOP_START_RE.match(masked)
+    return m.group("var") if m else None
+
+
+def _has_assert_call(masked: str) -> bool:
+    return bool(_ASSERT_CALL_RE.search(masked))
+
 
 def _norm(target: str) -> str:
     t = target.strip()
@@ -115,14 +180,27 @@ def _match_assertion(masked: str, original: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Scanner
 # ---------------------------------------------------------------------------
+_TOUCH_THEN_ASSERT_FIX = (
+    "route the check through a named predicate function that the real "
+    "assertion ALSO calls (shared code path), instead of re-reading the raw "
+    "filesystem state the guard just wrote itself."
+)
+_SLICE_THEN_ASSERT_FIX = (
+    "assert the collection is non-empty before asserting over it "
+    "(e.g. `[ \"${#TARGET[@]}\" -gt 0 ]`) — a for-loop over an empty slice "
+    "runs zero times and reports the same unconditional green as a real pass."
+)
+
+
 @dataclass(frozen=True)
 class Violation:
     file: str
     line: int
     snippet: str
+    fix: str = _TOUCH_THEN_ASSERT_FIX
 
 
-def scan_bash_text(text: str, path: str) -> List[Violation]:
+def _scan_touch_then_assert(text: str, path: str) -> List[Violation]:
     out: List[Violation] = []
     last_create_target: Optional[str] = None
 
@@ -144,12 +222,80 @@ def scan_bash_text(text: str, path: str) -> List[Violation]:
         asserted = _match_assertion(masked, code)
         if asserted is not None:
             if last_create_target is not None and asserted == last_create_target:
-                out.append(Violation(path, i, stripped))
+                out.append(Violation(path, i, stripped, _TOUCH_THEN_ASSERT_FIX))
             last_create_target = None
             continue
 
         last_create_target = None  # any other real code breaks the adjacency
 
+    return out
+
+
+def _find_matching_done(masked_lines: List[str], for_idx: int) -> Optional[int]:
+    """Given the index of a `for ...; do` line, return the index of the
+    `done` that closes it (0-indexed into masked_lines), tracking nested
+    for/while/until loops by their own do/done pairs."""
+    depth = 1
+    i = for_idx + 1
+    while i < len(masked_lines):
+        masked = masked_lines[i]
+        if _DONE_RE.match(masked):
+            depth -= 1
+            if depth == 0:
+                return i
+        elif _LOOP_OPEN_RE.search(masked):
+            depth += 1
+        i += 1
+    return None
+
+
+def _scan_slice_then_assert(text: str, path: str) -> List[Violation]:
+    # Unlike form 1, these patterns (`${VAR[@]}`, `${#VAR[@]}`) live almost
+    # exclusively INSIDE double quotes in idiomatic bash — mask_quotes would
+    # blank them out. So this pass matches against comment-stripped code with
+    # quotes left intact (strip_comment's first return value), not the
+    # quote-masked text form 1 uses.
+    out: List[Violation] = []
+    raw_lines = text.splitlines()
+    code_lines: List[str] = []
+    for raw in raw_lines:
+        masked = mask_quotes(raw)
+        code, _ = strip_comment(raw, masked)
+        code_lines.append(code)
+
+    sliced_vars: dict = {}   # var -> 1-indexed line it was sliced/filtered on
+    guarded_vars: set = set()
+
+    for i, code in enumerate(code_lines):
+        if not code.strip():
+            continue
+
+        created = _match_slice_or_filter_creation(code)
+        if created is not None:
+            sliced_vars[created] = i + 1
+            continue
+
+        guarded = _match_count_guard(code)
+        if guarded is not None:
+            guarded_vars.add(guarded)
+            continue
+
+        loop_var = _match_for_loop_start(code)
+        if loop_var is not None and loop_var in sliced_vars and loop_var not in guarded_vars:
+            done_idx = _find_matching_done(code_lines, i)
+            end = done_idx if done_idx is not None else len(code_lines)
+            body = code_lines[i + 1:end]
+            if any(_has_assert_call(b) for b in body):
+                out.append(Violation(
+                    path, i + 1, raw_lines[i].strip(), _SLICE_THEN_ASSERT_FIX,
+                ))
+
+    return out
+
+
+def scan_bash_text(text: str, path: str) -> List[Violation]:
+    out = _scan_touch_then_assert(text, path) + _scan_slice_then_assert(text, path)
+    out.sort(key=lambda v: v.line)
     return out
 
 
@@ -180,7 +326,10 @@ def repo_root_of(start: Path) -> Path:
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Flag bash create-then-assert-exists vacuous guards (SABLE-5lli.4)."
+        description=(
+            "Flag bash vacuous guards: create-then-assert-exists (SABLE-5lli.4) "
+            "and slice-then-assert (SABLE-p9n7k)."
+        )
     )
     ap.add_argument("paths", nargs="*", help="files to scan, or '-' for stdin (default: repo bash test corpus)")
     args = ap.parse_args(argv)
@@ -210,10 +359,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     for v in violations:
         print(f"  {v.file}:{v.line}")
         print(f"      {v.snippet}")
-    print()
-    print("Fix: route the check through a named predicate function that the real")
-    print("assertion ALSO calls (shared code path), instead of re-reading the raw")
-    print("filesystem state the guard just wrote itself.")
+        print(f"      Fix: {v.fix}")
     return 1
 
 
