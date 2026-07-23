@@ -396,22 +396,63 @@ class Candidate:
     args: str
     why: str
     attributed: bool
+    cwd: str | None = None
+
+
+def _cwd_resolves_to_a_git_repo(cwd: str) -> bool:
+    """Does `cwd` sit inside SOME git working tree — any repo, not necessarily
+    one of `roots`? Walked via the filesystem (a `.git` entry, file for a
+    linked worktree or dir for a normal repo, at or above `cwd`) rather than
+    shelling out to git. Called only once a candidate's cwd has already failed
+    the roots check, to tell CONFIDENTLY A DIFFERENT, REAL REPO (safely
+    foreign) apart from GENUINELY UNIDENTIFIABLE (e.g. a bare /tmp dir) — see
+    scan_processes."""
+    cur = cwd
+    while True:
+        if os.path.exists(os.path.join(cur, ".git")):
+            return True
+        parent = os.path.dirname(cur)
+        if not cur or parent == cur:
+            return False
+        cur = parent
 
 
 def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
                    self_pid: int | None = None,
                    uid: int | None = None) -> tuple[list[Candidate], list[Candidate]]:
     """(attributed, unattributable). A process is a candidate when its command
-    line names one of this repo's suite shapes; it is ATTRIBUTED when its cwd or
-    an absolute path in its argv lands inside one of `roots`. A same-uid
-    candidate we cannot attribute at all is returned separately and reads
-    could-not-assess — "I saw something suite-shaped and could not tell whose"
-    is not the same claim as "nothing is running"."""
+    line names one of this repo's suite shapes. It is ATTRIBUTED when:
+      - its cwd or an absolute path in its argv lands inside one of `roots`, or
+      - it is a DESCENDANT of this process or of an already-attributed one.
+        Reuses `_ancestors`'s upward walk (the same tree-walk `_covered_by`
+        proved for the fork/exec wrapper case): the fork-to-exec window means
+        a not-yet-exec'd child can still report its PARENT's pre-chdir cwd —
+        the cwd lies, the ancestry does not.
+        ONE direction only, deliberately NOT `_covered_by` wholesale: its
+        other direction — "candidate is an ANCESTOR of something already
+        attributed" — is wrong here. `self` is a descendant of whatever
+        spawned the calling process (a shell, a tmux pane, an outer test
+        runner), and none of THAT ancestry belongs to `roots` just because
+        `self` is reachable from it. Reusing `_covered_by` as-is over-attributed
+        an unrelated outer `pytest` invocation to an unrelated scratch repo
+        under test — caught by test_cli_clearance_exit_code_drives_a_shell_gate
+        going red under the two-direction version.
+
+    A same-uid candidate that fails both is NEVER silently dropped. It is
+    either:
+      - CONFIDENTLY FOREIGN: cwd is readable and resolves into some other real
+        git working tree (not one of `roots`) — a genuinely unrelated suite
+        elsewhere on the host, safely ignored so a clearance gate can still
+        release on a shared host running unrelated fleet suites.
+      - GENUINELY UNKNOWN: cwd is unreadable, or readable but resolves into no
+        git repo at all. Returned separately and reads could-not-assess — "I
+        saw something suite-shaped and could not tell whose" is not the same
+        claim as "nothing is running"."""
     tbl = read_process_table() if table is None else table
     me = os.getpid() if self_pid is None else self_pid
     my_uid = os.getuid() if uid is None else uid
     attributed: list[Candidate] = []
-    unattributable: list[Candidate] = []
+    unresolved: list[tuple[ProcInfo, str, str | None]] = []
     for p in tbl:
         if p.pid == me or p.uid != my_uid:
             continue
@@ -432,12 +473,36 @@ def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
                 hit = True
                 break
         if hit:
-            attributed.append(Candidate(p.pid, p.ppid, p.args, why, True))
-        elif cwd is None:
-            # Same user, suite-shaped, and its cwd could not be read. Only a
-            # process that has since exited is dropped (a race, not a gap).
-            if pid_alive(p.pid):
-                unattributable.append(Candidate(p.pid, p.ppid, p.args, why, False))
+            attributed.append(Candidate(p.pid, p.ppid, p.args, why, True, cwd))
+        else:
+            unresolved.append((p, why, cwd))
+
+    # Fixpoint: a candidate descended from self or from an already-attributed
+    # process is CONFIDENTLY OURS even when its cwd disagrees.
+    attributed_pids = {c.pid for c in attributed}
+    attributed_pids.add(me)
+    changed = True
+    while changed:
+        changed = False
+        still_unresolved: list[tuple[ProcInfo, str, str | None]] = []
+        for p, why, cwd in unresolved:
+            if not attributed_pids.isdisjoint(_ancestors(p.pid, tbl)):
+                attributed.append(Candidate(p.pid, p.ppid, p.args, why, True, cwd))
+                attributed_pids.add(p.pid)
+                changed = True
+            else:
+                still_unresolved.append((p, why, cwd))
+        unresolved = still_unresolved
+
+    unattributable: list[Candidate] = []
+    for p, why, cwd in unresolved:
+        if cwd is not None and _cwd_resolves_to_a_git_repo(cwd):
+            continue  # CONFIDENTLY FOREIGN — a real, different repo.
+        # GENUINELY UNKNOWN: cwd unreadable, or readable but not inside any
+        # git repo at all. Only a process that has since exited is dropped
+        # (a race, not a gap).
+        if pid_alive(p.pid):
+            unattributable.append(Candidate(p.pid, p.ppid, p.args, why, False, cwd))
     return attributed, unattributable
 
 
@@ -579,8 +644,10 @@ def clearance(base: str | None = None, table: list[ProcInfo] | None = None,
                 tbl = read_process_table() if table is None else table
                 attributed, unattributable = scan_processes(roots, table=tbl)
                 for c in unattributable:
-                    unknown.append(f"suite-shaped process pid {c.pid} could not be "
-                                   f"attributed to a repo ({c.why}): {c.args}")
+                    unknown.append(
+                        f"suite-shaped process pid {c.pid} (ppid {c.ppid}, cwd "
+                        f"{c.cwd!r}) could not be attributed to a repo ({c.why}): "
+                        f"{c.args}")
                 live_pids = {e.pid for e in live}
                 for c in attributed:
                     if not _covered_by(c.pid, live_pids, tbl):
