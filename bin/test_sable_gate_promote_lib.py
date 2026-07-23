@@ -19,6 +19,7 @@ These tests exercise the REAL propagation path — a real git repo, a real
 promote_lib.run_impact_tier — rather than mocking the transport, because the
 whole point of the defect is WHERE in a real byte stream the cut lands.
 """
+import json
 import os
 import subprocess
 import sys
@@ -300,3 +301,220 @@ def test_tip_equals_tested_integrity_abort_still_fires(monkeypatch):
     assert exc.value.code == 4
     assert f"tip {DRIFTED_SHA}" in str(exc.value)
     assert f"tested preview {PREVIEW_SHA}" in str(exc.value)
+
+
+# --------------------------------------------------------------------------
+# SABLE-21rug.1: seat-attention instrumentation — per-landing attention
+# record, additive tier-journal verdict+writer_identity fields, and the
+# baseline computation. THE MANDATORY FIRST bead of the merge-seat epic: no
+# sibling may claim a reduction in attended time without this baseline.
+# --------------------------------------------------------------------------
+
+def test_attention_record_round_trips_with_unknown_field_tolerance():
+    """UNIT: an AttentionRecord survives to_dict -> from_dict with every field
+    typed, and a future/unrecognized key in the dict must not break the
+    reconstruction — the same additive-field discipline the tier journal's
+    schema already carries, applied here to the attention record."""
+    record = promote_lib.AttentionRecord(
+        bead="SABLE-x", branch="wk-x",
+        verdict_source=promote_lib.VerdictSource.PRECOMPUTED,
+        hand_run_suites=("test-a.sh", "test-b.sh"),
+        red_triage_events=("base_moved",),
+        attention_span_seconds=42.5)
+    data = record.to_dict()
+    data["some_future_field_nobody_wrote_yet"] = "surprise"
+    restored = promote_lib.AttentionRecord.from_dict(data)
+    assert restored == record
+    assert isinstance(restored.verdict_source, promote_lib.VerdictSource)
+    assert isinstance(restored.hand_run_suites, tuple)
+    assert isinstance(restored.red_triage_events, tuple)
+    assert isinstance(restored.attention_span_seconds, float)
+
+
+def test_attention_record_from_dict_tolerates_a_bare_minimum_dict():
+    """Negative-space companion: a dict missing every optional key entirely
+    (not just carrying an extra one) must still reconstruct instead of
+    raising KeyError."""
+    restored = promote_lib.AttentionRecord.from_dict({"bead": "SABLE-y", "branch": "wk-y"})
+    assert restored.verdict_source == promote_lib.VerdictSource.WAITED
+    assert restored.hand_run_suites == ()
+    assert restored.red_triage_events == ()
+    assert restored.attention_span_seconds == 0.0
+
+
+def test_suites_from_impact_detail_parses_the_green_suite_list():
+    detail = "impact tier GREEN on the combined tree: test-a.sh, test-b.sh"
+    assert promote_lib._suites_from_impact_detail(detail) == ("test-a.sh", "test-b.sh")
+
+
+def test_suites_from_impact_detail_empty_for_an_unrecognized_format():
+    """An override's detail names no suites at all — this must degrade to an
+    empty tuple, not guess or crash."""
+    assert promote_lib._suites_from_impact_detail("impact tier override reported green") == ()
+
+
+def test_compute_attention_baseline_raises_on_empty_landing_set():
+    """Vacuous guard, load-bearing: an empty landing set must RAISE, never
+    return zero-as-a-number — '0 attended minutes' is indistinguishable from
+    'we measured nothing', the exact failure this epic exists to fix."""
+    with pytest.raises(promote_lib.EmptyLandingSetError):
+        promote_lib.compute_attention_baseline([])
+
+
+def test_compute_attention_baseline_computes_a_figure_from_a_landing_fixture():
+    records = [
+        promote_lib.AttentionRecord(bead="SABLE-a", branch="wk-a",
+                                    verdict_source=promote_lib.VerdictSource.WAITED,
+                                    attention_span_seconds=60.0),
+        promote_lib.AttentionRecord(bead="SABLE-b", branch="wk-b",
+                                    verdict_source=promote_lib.VerdictSource.PRECOMPUTED,
+                                    attention_span_seconds=120.0),
+    ]
+    baseline = promote_lib.compute_attention_baseline(records)
+    assert baseline["n"] == 2
+    assert baseline["mean_attended_minutes"] == 1.5
+    assert baseline["median_attended_minutes"] == 1.5
+    assert baseline["total_attended_minutes"] == 3.0
+
+
+def test_impact_tier_phase_report_ignores_additive_verdict_and_writer_identity_keys(
+        tmp_path, monkeypatch):
+    """REGRESSION (priority 1): impact_tier_phase_report (the tier journal's
+    reader) must be BYTE-IDENTICAL whether or not the 'end' record also
+    carries the additive 'verdict'/'writer_identity' keys — existing readers
+    ignore additions. Real journal files on disk, not mocked I/O."""
+    tree = "a" * 12
+    start_line = json.dumps({"schema": 2, "event": "start", "pid": 1, "at": 1000.0, "tree": tree,
+                             "waited": 0.0})
+    end_record = {"schema": 2, "event": "end", "pid": 1, "at": 1010.0, "tree": tree,
+                  "waited": 0.0, "phases": [{"name": "setup", "seconds": 1.0},
+                                            {"name": "shell:x.sh", "seconds": 9.0}]}
+
+    without_path = tmp_path / "without.jsonl"
+    without_path.write_text(start_line + "\n" + json.dumps(end_record) + "\n")
+    monkeypatch.setenv("SABLE_MG_IMPACT_WINDOW_LOG", str(without_path))
+    report_without = promote_lib.impact_tier_phase_report(".")
+
+    augmented_end = dict(end_record, verdict=promote_lib.IMPACT_GREEN, writer_identity="gate")
+    with_path = tmp_path / "with.jsonl"
+    with_path.write_text(start_line + "\n" + json.dumps(augmented_end) + "\n")
+    monkeypatch.setenv("SABLE_MG_IMPACT_WINDOW_LOG", str(with_path))
+    report_with = promote_lib.impact_tier_phase_report(".")
+
+    assert json.dumps(report_with, sort_keys=True) == json.dumps(report_without, sort_keys=True), (
+        "the additive verdict/writer_identity keys on the 'end' record changed the phase "
+        "report — existing readers must ignore additions")
+    assert report_with["tiers_with_phase_data"] == 1
+
+
+def test_stamp_impact_verdict_augments_the_end_record_in_place(isolated_lock):
+    """The write side of the same regression: _stamp_impact_verdict must fold
+    its typed fields onto the EXISTING 'end' line rather than appending a new
+    one — the event sequence stays exactly ["start", "end"], which is also
+    what bin/test_promote_decision.py's
+    test_the_tier_window_log_records_both_edges (outside this bead's
+    footprint) hard-asserts on the same file."""
+    tree_sha = "b" * 40
+    promote_lib._stamp_impact_window(".", "start", tree_sha, 0.0)
+    promote_lib._stamp_impact_window(".", "end", tree_sha, 0.0,
+                                     phases=[{"name": "setup", "seconds": 2.0}])
+    promote_lib._stamp_impact_verdict(".", tree_sha, promote_lib.IMPACT_GREEN)
+
+    log_path = isolated_lock / "windows.jsonl"
+    lines = [json.loads(ln) for ln in log_path.read_text().splitlines() if ln.strip()]
+    assert [ln["event"] for ln in lines] == ["start", "end"]
+    assert lines[1]["verdict"] == promote_lib.IMPACT_GREEN
+    assert lines[1]["writer_identity"] == "gate"
+    assert lines[1]["phases"] == [{"name": "setup", "seconds": 2.0}]
+
+    report = promote_lib.impact_tier_phase_report(".")
+    assert report["tiers_with_phase_data"] == 1
+    assert report["legacy_records_excluded"] == 0
+
+
+def test_stamp_impact_verdict_is_a_noop_when_there_is_no_end_line_to_augment():
+    """A caller whose _stamp_impact_window was itself stubbed out (as several
+    tests in this module's sibling suite do) leaves no file to augment —
+    this must degrade to a silent no-op, never raise."""
+    promote_lib._stamp_impact_verdict("/does/not/exist", "c" * 40, promote_lib.IMPACT_GREEN)
+
+
+# --------------------------------------------------------------------------
+# INTEGRATION (SABLE-21rug.1): a REAL git sandbox (a bare origin + a real
+# working clone), the real promote() landing path, and the real durable
+# attention-record log — read back from the durable artifacts alone, with no
+# bd dependency. The only mocked boundary is CI itself (materialize_preview /
+# acquire_verdict / delete_ci_ref) — there is no real Actions run to consult
+# in a test sandbox; every git fetch/push/resolve and every attention-record
+# write/read below is real.
+# --------------------------------------------------------------------------
+
+def _real_two_repo_sandbox(tmp_path):
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "trunk", str(bare)], check=True,
+                   capture_output=True)
+    work = tmp_path / "work"
+    subprocess.run(["git", "clone", "-q", str(bare), str(work)], check=True, capture_output=True)
+    for args in (("config", "user.email", "t@sable.invalid"),
+                 ("config", "user.name", "SABLE Test")):
+        subprocess.run(["git", "-C", str(work), *args], check=True, capture_output=True)
+    (work / "README.md").write_text("trunk\n")
+    subprocess.run(["git", "-C", str(work), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(work), "commit", "-q", "-m", "init"], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", str(work), "push", "-q", "origin", "trunk"], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", str(work), "checkout", "-q", "-b", "wk-x"], check=True,
+                   capture_output=True)
+    (work / "feature.txt").write_text("landing\n")
+    subprocess.run(["git", "-C", str(work), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(work), "commit", "-q", "-m", "feature"], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", str(work), "push", "-q", "origin", "wk-x"], check=True,
+                   capture_output=True)
+    branch_sha = subprocess.run(["git", "-C", str(work), "rev-parse", "wk-x"], check=True,
+                                capture_output=True, text=True).stdout.strip()
+    return str(work), str(bare), branch_sha
+
+
+def test_a_real_landing_leaves_a_complete_attention_record_in_the_durable_artifacts(
+        tmp_path, monkeypatch):
+    """ACCEPTANCE (SABLE-21rug.1): a real landing in the sandbox leaves a
+    complete attention record; the baseline function computes over it; the
+    existing GREEN evidence path is unaffected."""
+    work, bare, branch_sha = _real_two_repo_sandbox(tmp_path)
+    monkeypatch.setattr(promote_lib.preview, "materialize_preview",
+                        lambda *a, **kw: (branch_sha, "ci-verify/fake-ref", False))
+    monkeypatch.setattr(promote_lib.preview, "acquire_verdict",
+                        lambda *a, **kw: promote_lib.classify.Verdict(
+                            "success", "http://run/1", branch_sha, "ci-verify/fake-ref",
+                            source="waited"))
+    monkeypatch.setattr(promote_lib.preview, "delete_ci_ref", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "cleanup_after_merge", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "_notify", lambda *a, **kw: None)
+
+    rc = promote_lib.promote("SABLE-test-landing", "wk-x", "trunk", work, "origin", "chuck", None)
+    assert rc == 0
+
+    # Read back from the durable artifacts alone — a FRESH call, not the
+    # in-memory record promote() built.
+    records = promote_lib.read_attention_records(work)
+    assert len(records) == 1
+    record = records[0]
+    assert record.bead == "SABLE-test-landing"
+    assert record.branch == "wk-x"
+    assert record.verdict_source == promote_lib.VerdictSource.WAITED
+    assert record.hand_run_suites == ()
+    assert record.red_triage_events == ()
+    assert record.attention_span_seconds >= 0.0
+
+    baseline = promote_lib.compute_attention_baseline(records)
+    assert baseline["n"] == 1
+    assert baseline["total_attended_minutes"] >= 0.0
+
+    # The landing itself really happened — the bare origin's trunk ref (not
+    # work's stale local branch, which a plain fetch never updates) now
+    # points at the branch's own commit, byte-identical.
+    cp = subprocess.run(["git", "-C", bare, "rev-parse", "trunk"], check=True,
+                        capture_output=True, text=True)
+    assert cp.stdout.strip() == branch_sha, "the landing did not fast-forward trunk"
