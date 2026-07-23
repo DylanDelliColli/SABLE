@@ -534,6 +534,87 @@ def test_assess_still_promotes_when_reads_are_declared_and_disjoint(repo, monkey
     assert set(a.paths) == {"left.py", "right.py"}
 
 
+def test_declared_reads_raises_when_a_token_in_the_section_is_unrecognised(repo, tmp_path, monkeypatch):
+    """SABLE-zx2yv: the jd5fj.18 floor catches an ABSENT '## File reads'
+    heading but used to miss a PRESENT one whose body contains a token the
+    tokenizer cannot recognise as a path (no slash, no known code suffix) —
+    'Makefile' here. That token used to vanish silently from the declared
+    set, so a bead that actually reads Makefile looked like it read only
+    bin/foo.py. Present-but-incomplete must be indistinguishable from an
+    absent heading, never from a complete one. Plant-and-fail: against the
+    pre-fix code this section returns a plain complete Footprint of one
+    entry and this assertion fails."""
+    fake_bd = tmp_path / "fake-bd-reads-partial"
+    fake_bd.write_text(
+        "#!/bin/sh\necho '## File reads'\necho 'Makefile'\necho 'bin/foo.py'\n")
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("SABLE_MG_BD", str(fake_bd))
+    with pytest.raises(fp.FootprintUndetermined):
+        fp.declared_reads(str(repo), "SABLE-x")
+
+
+def test_declared_reads_negative_control_a_fully_recognised_section_stays_complete(repo, tmp_path, monkeypatch):
+    """LOAD-BEARING negative control (SABLE-zx2yv): a '## File reads' section
+    whose every token is path-shaped must still return an ordinary complete
+    Footprint with no serialization penalty. Without this, a fix that marks
+    every reads section undetermined would also pass the test above and
+    silently serialize the whole fleet — the gate-that-can-never-release
+    failure (SABLE-47try's DO-NOT clause, same polarity)."""
+    fake_bd = tmp_path / "fake-bd-reads-complete"
+    fake_bd.write_text(
+        "#!/bin/sh\necho '## File reads'\necho 'bin/foo.py'\necho 'bin/bar.sh'\n")
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("SABLE_MG_BD", str(fake_bd))
+    result = fp.declared_reads(str(repo), "SABLE-x")
+    assert result.entries == frozenset({"bin/foo.py", "bin/bar.sh"})
+
+
+def test_declared_footprint_writes_path_is_unaffected_by_a_dropped_token(repo, tmp_path, monkeypatch):
+    """SABLE-zx2yv acceptance criterion: the fix must not make the WRITES
+    path (parse_declared_footprint / declared_footprint) any stricter. A
+    dropped token in a '## File footprint' section still just falls out of
+    the declared set exactly as before this bead — the mechanical footprint
+    governs the write side regardless (rule 3 in this module's docstring),
+    so there is nothing for the write side to fail toward."""
+    description = "## File footprint\nMakefile\nbin/foo.py\n"
+    assert fp.parse_declared_footprint(description) == frozenset({"bin/foo.py"})
+
+    fake_bd = tmp_path / "fake-bd-writes-partial"
+    fake_bd.write_text(
+        "#!/bin/sh\necho '## File footprint'\necho 'Makefile'\necho 'bin/foo.py'\n")
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("SABLE_MG_BD", str(fake_bd))
+    result = fp.declared_footprint(str(repo), "SABLE-x")
+    assert result.entries == frozenset({"bin/foo.py"})
+
+
+def test_assess_serializes_when_reads_section_has_an_unrecognised_token(repo, tmp_path, monkeypatch):
+    """End-to-end through assess() (SABLE-zx2yv): a bead's '## File reads'
+    section names a bare repo-root filename ('Makefile') alongside a real
+    path. Before this fix, 'Makefile' silently vanished from the declared
+    read set, so a base-move that only edits Makefile looked write/write
+    disjoint from the branch and the whole assessment reported
+    disjoint=True — the RELEASING failure direction the bead describes, not
+    a tokenizer nit. After the fix the incomplete declaration forces the
+    same undetermined/serialize outcome an absent heading would."""
+    fake_bd = tmp_path / "fake-bd-reads-partial-assess"
+    fake_bd.write_text(
+        "#!/bin/sh\necho '## File reads'\necho 'Makefile'\necho 'bin/foo.py'\n")
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("SABLE_MG_BD", str(fake_bd))
+
+    base = _sha(repo)
+    (repo / "left.py").write_text("l\n")
+    branch = _commit(repo, "left")
+    _git(repo, "checkout", "-q", "-b", "moved", base)
+    (repo / "Makefile").write_text("all:\n\techo hi\n")
+    new_base = _commit(repo, "edit Makefile")
+
+    a = fp.assess(str(repo), "SABLE-x", base, branch, new_base)
+    assert a.disjoint is None, a.reason
+    assert "undetermined" in a.reason.lower()
+
+
 def test_the_git_seam_is_the_shared_one(monkeypatch):
     """This module must be stubbable through the same seam as the rest of the
     gate — one monkeypatch of git_lib._git reaches it too."""
