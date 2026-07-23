@@ -91,6 +91,7 @@ ALLOW=(
   test-project-clone-portability.sh
   test-quickstart-orchestration.sh
   test-read-guard.sh
+  test-reconcile-rebase-copy.sh
   test-registry.sh
   test-require-all.sh
   test-role-card-install.sh

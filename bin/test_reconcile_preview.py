@@ -38,6 +38,17 @@ smrh = importlib.util.module_from_spec(_SPEC)
 _LOADER.exec_module(smrh)
 
 
+@pytest.fixture(autouse=True)
+def _no_live_panes(monkeypatch):
+    """SABLE-4709h: reconcile() (used by the U9/U10 IDEMPOTENCY OVERLAP tests
+    below) calls the real live_pane_bead_ids(repo), which shells out to the
+    REAL `tmux` on PATH — this dev host runs an actual SABLE fleet. Same
+    hermetic neutering as test_sable_reconcile_handoffs.py's fixture of the
+    same name, so this suite's outcome never depends on what the live fleet
+    happens to be doing at test time."""
+    monkeypatch.setattr(smrh, "live_pane_bead_ids", lambda repo: set())
+
+
 # ===========================================================================
 # preview_kick_eligible — P1 + P4 only, P2/P3 never consulted
 # ===========================================================================
