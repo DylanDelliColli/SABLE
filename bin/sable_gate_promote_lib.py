@@ -83,6 +83,7 @@ import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import sable_batch_key_lib as batch_key
@@ -863,6 +864,80 @@ def _stamp_impact_window(repo: str | os.PathLike, event: str, tree_sha: str,
         pass
 
 
+class TierWriterIdentity(str, Enum):
+    """WHO/WHAT produced a given impact-tier journal window — the tier
+    journal's additive 'writer_identity' field (SABLE-21rug.1). Typed so a
+    producer discriminator cannot be typo'd into an unenumerated value the
+    way a bare string could (Primitive Obsession guard).
+
+    GATE     — the merge gate's own automated re-verification. Every call
+               site in this module produces this identity today.
+    HAND_RUN — a human explicitly ran the tier outside the gate's own flow.
+               Reserved: no caller sets this yet — this epic's runner-offload
+               sibling is what will ever produce it, so the schema does not
+               need a second migration when that caller lands.
+    """
+    GATE = "gate"
+    HAND_RUN = "hand_run"
+
+
+class TierVerdict(str, Enum):
+    """Typed mirror of IMPACT_GREEN/IMPACT_RED/IMPACT_ERROR for the tier
+    journal's additive 'verdict' field (SABLE-21rug.1) — the same enumerated
+    vocabulary the decision table already uses, wrapped here so the journal
+    write validates against it instead of accepting an arbitrary string."""
+    GREEN = IMPACT_GREEN
+    RED = IMPACT_RED
+    ERROR = IMPACT_ERROR
+
+
+def _stamp_impact_verdict(repo: str | os.PathLike, tree_sha: str, verdict: str,
+                          writer_identity: TierWriterIdentity = TierWriterIdentity.GATE) -> None:
+    """Fold the tier's typed outcome + producer identity into the JUST-WRITTEN
+    'end' record of impact-tier-windows.jsonl, as ADDITIVE keys on that SAME
+    line (SABLE-21rug.1) — never a new line/event, and never a change to
+    _stamp_impact_window's own call signature.
+
+    Why an in-place augment and not a new call argument on the existing
+    writes: run_impact_tier's two calls to _stamp_impact_window are exercised
+    via monkeypatch with a FIXED signature by bin/test_promote_decision.py (a
+    suite outside this bead's declared footprint) — adding a kwarg there
+    would break it. Why not a separate 'verdict' event instead: a sibling
+    test in that same file (test_the_tier_window_log_records_both_edges)
+    asserts the window log's event sequence is EXACTLY ["start", "end"] per
+    run — a third event breaks that literal check too. Rewriting the 'end'
+    line's own dict in place is the shape compatible with both constraints,
+    and it is exactly what 'additive fields' means at the record level.
+
+    Safe under concurrency: this runs inside run_impact_tier's SAME
+    impact_tier_lock critical section that guards every write to this file,
+    so no other writer can be mid-append while this reads/rewrites it.
+
+    Best-effort like its sibling: any failure here (file absent because
+    _stamp_impact_window was itself stubbed out by a caller, an unenumerated
+    verdict, a disk error) leaves the 'end' line exactly as
+    _stamp_impact_window wrote it and must never affect a promote's real
+    outcome."""
+    try:
+        path = Path(os.environ.get("SABLE_MG_IMPACT_WINDOW_LOG")
+                    or (snapshot_lib.ensure_state_dir(repo) / IMPACT_WINDOW_FILE))
+        if not path.is_file():
+            return
+        lines = path.read_text().splitlines()
+        if not lines:
+            return
+        last = json.loads(lines[-1])
+        if (last.get("event") != "end" or last.get("tree") != tree_sha[:12]
+                or last.get("pid") != os.getpid()):
+            return
+        last["verdict"] = TierVerdict(verdict).value
+        last["writer_identity"] = TierWriterIdentity(writer_identity).value
+        lines[-1] = json.dumps(last)
+        path.write_text("\n".join(lines) + "\n")
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+
+
 def _record_phase(phases: list[dict], name: str, started: float) -> None:
     """Append one measured (not inferred) phase span to `phases`, timed from
     `started` (a prior time.monotonic() call) to now. Multiple entries can share
@@ -985,10 +1060,19 @@ def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, st
             # phases genuinely ran before that point, instead of losing every
             # phase because the function never reached its return.
             phases: list[dict] = []
+            outcome: str | None = None
             try:
-                return _run_impact_tier_locked(repo, tree_sha, paths, phases)
+                outcome, detail = _run_impact_tier_locked(repo, tree_sha, paths, phases)
+                return outcome, detail
             finally:
                 _stamp_impact_window(repo, "end", tree_sha, waited, phases=phases)
+                # SABLE-21rug.1: folds the additive verdict/writer_identity
+                # fields onto the "end" line the call above just wrote. Kept
+                # as a separate call (not a new kwarg on the call above) so
+                # that call's monkeypatched stand-ins in
+                # bin/test_promote_decision.py stay untouched.
+                if outcome is not None:
+                    _stamp_impact_verdict(repo, tree_sha, outcome)
     except ImpactLockTimeout as exc:
         return (IMPACT_ERROR, f"impact tier never started: {exc}")
 
@@ -1630,6 +1714,192 @@ def assert_coverage_floor(repo: str, bead: str, base_sha: str, branch_sha: str,
 
 
 # --------------------------------------------------------------------------
+# Seat-attention instrumentation (SABLE-21rug.1) — the metric's mandatory
+# baseline. No sibling in the merge-seat epic may claim a reduction in
+# attended time without this: an AttentionRecord per landing, joined to the
+# promote evidence notes, plus the baseline computation over a set of them.
+# The 18-promote night that motivated this epic ran zero local impact tiers,
+# so no baseline is derivable retroactively — every landing from here on
+# writes one of these before any offload/auto-promote sibling may close.
+# --------------------------------------------------------------------------
+
+class VerdictSource(str, Enum):
+    """Typed mirror of classify.Verdict.source's three legal values
+    (SABLE-jd5fj.3) — enumerated here rather than carried across the module
+    boundary as a bare string, so a value classify_lib doesn't recognize
+    surfaces as a construction error instead of a silently-stored typo
+    (Primitive Obsession guard)."""
+    PRECOMPUTED = "precomputed"
+    WAITED = "waited"
+    OVERRIDE = "override"
+
+
+ATTENTION_RECORD_FILE = "attention-records.jsonl"
+ATTENTION_RECORD_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class AttentionRecord:
+    """One per-landing record of the human attention a promote consumed.
+
+    bead / branch           — which landing this record describes.
+    verdict_source          — classify.Verdict.source, typed (VerdictSource).
+    hand_run_suites         — suite names an impact tier actually ran on the
+                              real combined tree for THIS landing (empty when
+                              the optimistic disjoint path never fired for it
+                              — no re-verification means nothing to name, not
+                              zero suites available).
+    red_triage_events       — labels for what this landing passed through
+                              before reaching GREEN (e.g. "base_moved",
+                              "override") — empty for a landing that went
+                              straight to GREEN with no intervention.
+    attention_span_seconds  — measured wall-clock this promote call spent
+                              waiting on a verdict or a hand-run tier for this
+                              landing. Never inferred; zero is a legitimate,
+                              measured value (e.g. an override consults no
+                              run and waits on nothing) — it is only the
+                              BASELINE's empty-INPUT case that must never
+                              read as zero (see EmptyLandingSetError below).
+    """
+    bead: str
+    branch: str
+    verdict_source: VerdictSource
+    hand_run_suites: tuple[str, ...] = ()
+    red_triage_events: tuple[str, ...] = ()
+    attention_span_seconds: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "schema": ATTENTION_RECORD_SCHEMA_VERSION,
+            "bead": self.bead,
+            "branch": self.branch,
+            "verdict_source": self.verdict_source.value,
+            "hand_run_suites": list(self.hand_run_suites),
+            "red_triage_events": list(self.red_triage_events),
+            "attention_span_seconds": round(self.attention_span_seconds, 3),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AttentionRecord":
+        """Reconstruct from a dict, TOLERATING unknown keys — a future
+        additive field an older reader doesn't recognize must never break
+        this round trip, the same additive discipline the tier journal's
+        schema carries."""
+        return cls(
+            bead=str(data.get("bead", "")),
+            branch=str(data.get("branch", "")),
+            verdict_source=VerdictSource(data.get("verdict_source", VerdictSource.WAITED.value)),
+            hand_run_suites=tuple(data.get("hand_run_suites") or ()),
+            red_triage_events=tuple(data.get("red_triage_events") or ()),
+            attention_span_seconds=float(data.get("attention_span_seconds", 0.0)),
+        )
+
+
+def _suites_from_impact_detail(detail: str) -> tuple[str, ...]:
+    """Which suite names an impact tier's own GREEN report named as having
+    run, parsed from run_impact_tier's existing detail format ('...on the
+    combined tree: <suite1>, <suite2>'). Informational only, for the
+    attention record's hand_run_suites — a format this can't recognize (an
+    override's 'impact tier override reported green', or any non-GREEN
+    detail) degrades to an empty tuple rather than guessing."""
+    marker = "on the combined tree: "
+    idx = detail.find(marker)
+    if idx == -1:
+        return ()
+    tail = detail[idx + len(marker):]
+    return tuple(s.strip() for s in tail.split(",") if s.strip())
+
+
+def _stamp_attention_record(repo: str | os.PathLike, record: AttentionRecord) -> None:
+    """Append one AttentionRecord to the durable per-landing log — the
+    baseline computation's only input, and what the promote evidence note's
+    'attention-record:' line mirrors. Best-effort: a write failure here must
+    never flip a green promote red.
+
+    Skips silently (no write, no directory created) when `repo` is not a
+    real, existing directory and no SABLE_MG_ATTENTION_LOG override is set.
+    Several unit tests elsewhere in this module's sibling suites drive
+    promote()/_stale_base with a synthetic, non-existent repo path — without
+    this guard, snapshot_lib.ensure_state_dir's own last-resort fallback
+    would resolve to the real ~/.claude/sable/state and write there on every
+    such test run, which is a real-filesystem side effect no test asked for."""
+    override = os.environ.get("SABLE_MG_ATTENTION_LOG")
+    if not override and not Path(repo).is_dir():
+        return
+    try:
+        path = Path(override) if override else (
+            snapshot_lib.ensure_state_dir(repo) / ATTENTION_RECORD_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(json.dumps(record.to_dict()) + "\n")
+    except OSError:
+        pass
+
+
+def read_attention_records(repo: str | os.PathLike = ".") -> list[AttentionRecord]:
+    """Read every durable attention record back — the read half of the round
+    trip _stamp_attention_record writes. Tolerates malformed or unreadable
+    lines (skipped, never fatal); mirrors the same repo-existence guard so a
+    synthetic repo path reads as 'no records' rather than reaching into
+    ~/.claude/sable/state."""
+    override = os.environ.get("SABLE_MG_ATTENTION_LOG")
+    if not override and not Path(repo).is_dir():
+        return []
+    path = Path(override) if override else (
+        snapshot_lib.ensure_state_dir(repo) / ATTENTION_RECORD_FILE)
+    records: list[AttentionRecord] = []
+    if not path.is_file():
+        return records
+    for raw in path.read_text().splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        try:
+            records.append(AttentionRecord.from_dict(data))
+        except ValueError:
+            continue
+    return records
+
+
+class EmptyLandingSetError(ValueError):
+    """Raised by compute_attention_baseline on an empty landing set. A
+    baseline computed over zero records is not a baseline — it is
+    indistinguishable from 'we measured nothing', which is the exact failure
+    this epic exists to fix. NEVER return 0.0 for no data."""
+
+
+def compute_attention_baseline(records: list[AttentionRecord]) -> dict:
+    """Attended-minutes-per-landing baseline: n / mean / median / p90 / total,
+    computed only from each record's measured attention_span_seconds — never
+    inferred (mirrors _phase_stats' own discipline). This is the number no
+    offload/auto-promote sibling in this epic may claim a reduction against
+    until it exists.
+
+    Raises EmptyLandingSetError on an empty `records` — the vacuous-guard
+    contract this bead is required to honour literally."""
+    if not records:
+        raise EmptyLandingSetError(
+            "cannot compute an attention baseline over zero landing records — an "
+            "empty set means 'we measured nothing', not '0 attended minutes'")
+    minutes = sorted(r.attention_span_seconds / 60.0 for r in records)
+    n = len(minutes)
+    mid = n // 2
+    median = minutes[mid] if n % 2 else (minutes[mid - 1] + minutes[mid]) / 2
+    p90 = minutes[min(n - 1, math.ceil(0.9 * n) - 1)]
+    return {
+        "n": n,
+        "mean_attended_minutes": round(sum(minutes) / n, 3),
+        "median_attended_minutes": round(median, 3),
+        "p90_attended_minutes": round(p90, 3),
+        "total_attended_minutes": round(sum(minutes), 3),
+    }
+
+
+# --------------------------------------------------------------------------
 # promote — the only writer to the integration branch
 # --------------------------------------------------------------------------
 
@@ -1644,7 +1914,8 @@ class _OptimisticNotApplicable(Exception):
 def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
                 manager: str, base_ref: str, ref: str, preview_sha: str,
                 base_sha: str, branch_sha: str, current_base: str,
-                *, on_adoption_miss: bool = False) -> int:
+                *, on_adoption_miss: bool = False,
+                verdict_source: str = VerdictSource.WAITED.value) -> int:
     """The base moved out from under a GREEN preview. Decide what that costs.
 
     Reached from three places that mean the same thing — a green verdict for a
@@ -1667,7 +1938,13 @@ def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
     re-preview outcome is raised as _OptimisticNotApplicable instead, because on
     that entry nothing has been pushed and the caller simply continues into the
     ordinary build-and-gate flow. Every other row — the tier, the invariants, the
-    integrity assertion, the RED eject — is the same code."""
+    integrity assertion, the RED eject — is the same code.
+
+    `verdict_source` (SABLE-21rug.1) carries the ORIGINAL verdict's provenance
+    into this landing's AttentionRecord — 'waited'/'precomputed' from the
+    caller's own classify.Verdict, or 'precomputed' from
+    _adoption_miss_optimistic (a stale GREEN preview is consumed, never
+    waited on). Purely for that record; it changes no promotion decision."""
     if not optimistic_promotion_enabled():
         assessment = footprint_lib.Assessment(
             None, "optimistic disjoint promotion is disabled (SABLE_MG_OPTIMISTIC=0)")
@@ -1677,6 +1954,7 @@ def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
     decision = decide_promotion(classify.GREEN, base_moved=True, disjoint=assessment.disjoint,
                                 impact=None, preview_sha=preview_sha)
     combined_sha, impact, impact_detail = "", None, ""
+    impact_wall_clock = 0.0
     if decision.action == ACTION_REVERIFY:
         print(f"sable-merge-gate: base {base} moved to {current_base[:7]} but the footprints are "
               f"disjoint — re-verifying the REAL combined tree with the impact tier "
@@ -1684,7 +1962,12 @@ def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
         combined_sha = preview.build_preview(
             repo, current_base, branch_sha,
             f"ci-verify merge-preview: {branch} onto {base} ({bead}, disjoint re-verify)")
+        # SABLE-21rug.1: this call IS the hand-run attention this landing
+        # spends — measured here (never inferred) for the AttentionRecord
+        # written on the ACTION_PROMOTE branch below.
+        _t0 = time.monotonic()
         impact, impact_detail = run_impact_tier(repo, combined_sha, list(assessment.paths))
+        impact_wall_clock = time.monotonic() - _t0
         print(f"sable-merge-gate: impact tier on combined tree {combined_sha[:7]}: "
               f"{impact} — {impact_detail}")
         decision = decide_promotion(classify.GREEN, base_moved=True, disjoint=assessment.disjoint,
@@ -1721,6 +2004,18 @@ def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
             f"to {current_base[:7]}. Footprints disjoint ({assessment.reason}). The combined tree "
             f"{combined_sha} was RE-VERIFIED on the real merge: {impact_detail}. Promoted that same "
             f"combined object byte-identical to {base} — NOT the stale preview.")
+        try:
+            record = AttentionRecord(
+                bead=bead, branch=branch,
+                verdict_source=VerdictSource(verdict_source),
+                hand_run_suites=_suites_from_impact_detail(impact_detail),
+                red_triage_events=("base_moved",),
+                attention_span_seconds=impact_wall_clock)
+            _stamp_attention_record(repo, record)
+            _append_evidence(repo, bead, f"attention-record: {json.dumps(record.to_dict())}")
+        except Exception as exc:  # noqa: BLE001 — observability must never block a green promote
+            print(f"sable-merge-gate: attention record skipped after unexpected error: {exc}",
+                  file=sys.stderr)
         try:
             cleanup_after_merge(repo, remote, base_ref, branch)
         except Exception as exc:  # noqa: BLE001 — a green merge must stay green
@@ -1813,7 +2108,11 @@ def _adoption_miss_optimistic(bead: str, branch: str, base: str, repo: str, remo
     try:
         code = _stale_base(bead, branch, base, repo, remote, manager, base_ref,
                            stale.ref, stale.preview_sha, stale.base_sha, branch_sha,
-                           base_sha, on_adoption_miss=True)
+                           base_sha, on_adoption_miss=True,
+                           # SABLE-21rug.1: a stale GREEN preview is CONSUMED
+                           # here, never waited on — the same 'precomputed'
+                           # semantics jd5fj.3 gives a stored-run read.
+                           verdict_source=VerdictSource.PRECOMPUTED.value)
     except _OptimisticNotApplicable as exc:
         print(f"sable-merge-gate: the queued preview for {branch} is not usable against the "
               f"current base ({exc}) — building a fresh preview the pre-kick way")
@@ -1873,6 +2172,11 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
     # outside the try/finally below, exactly as the pre-split flow did.
     preview_sha, ref, adopted = preview.materialize_preview(
         repo, remote, branch, base, base_sha, branch_sha, bead)
+    # SABLE-21rug.1: this landing's attention span — the measured wall-clock
+    # this promote call spends waiting on a verdict. Zero is the honest value
+    # for an override (no run is consulted, nothing is waited on), never an
+    # inferred one.
+    attention_span = 0.0
     try:
         if override:
             # An actions-down human bypass consults no run at all.
@@ -1895,7 +2199,8 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             # (idempotently) a suite-optimization bead.
             t0 = time.monotonic()
             verdict = preview.acquire_verdict(repo, ref, preview_sha)
-            budget_lib.check_and_file(repo, "merge_preview", time.monotonic() - t0,
+            attention_span = time.monotonic() - t0
+            budget_lib.check_and_file(repo, "merge_preview", attention_span,
                                       context=f"bead={bead} branch={branch} ref={ref}")
         conclusion, url = verdict.conclusion, verdict.run_url
 
@@ -1909,7 +2214,8 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             current_base = git_lib.resolve_commit(repo, base_ref)
             if current_base != base_sha:
                 return _stale_base(bead, branch, base, repo, remote, manager, base_ref,
-                                   ref, preview_sha, base_sha, branch_sha, current_base)
+                                   ref, preview_sha, base_sha, branch_sha, current_base,
+                                   verdict_source=verdict.source)
             push_cp = git_lib._git(repo, "push", remote, f"{preview_sha}:refs/heads/{base}", check=False)
             if push_cp.returncode != 0:
                 # F1 (tarzan review): the base advanced during the CI wait, so the
@@ -1927,7 +2233,8 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
                 current_base = git_lib.resolve_commit(repo, base_ref)
                 if current_base != base_sha:
                     return _stale_base(bead, branch, base, repo, remote, manager, base_ref,
-                                       ref, preview_sha, base_sha, branch_sha, current_base)
+                                       ref, preview_sha, base_sha, branch_sha, current_base,
+                                       verdict_source=verdict.source)
                 _notify(manager,
                     f"merge-preview ci-verify gate for {bead} ({branch}): promote to {base} was rejected "
                     f"though the base tip still reads {base_sha[:7]} — NOT promoted. Rebuild preview + re-gate "
@@ -1960,6 +2267,21 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
                     f"merge-preview ci-verify gate GREEN: ref {ref}, run {url or 'n/a'}, "
                     f"preview {preview_sha}, promoted byte-identical to {base} "
                     f"(verdict {verdict.source}, preview {'adopted' if adopted else 'built'}).")
+            # SABLE-21rug.1: a per-landing attention record joins the evidence
+            # notes above — the epic's mandatory-first baseline input. Wrapped
+            # like the cleanup below: observability must never block a green
+            # promote.
+            try:
+                record = AttentionRecord(
+                    bead=bead, branch=branch,
+                    verdict_source=VerdictSource(verdict.source),
+                    red_triage_events=("override",) if override else (),
+                    attention_span_seconds=attention_span)
+                _stamp_attention_record(repo, record)
+                _append_evidence(repo, bead, f"attention-record: {json.dumps(record.to_dict())}")
+            except Exception as exc:  # noqa: BLE001 — observability must never block a green promote
+                print(f"sable-merge-gate: attention record skipped after unexpected error: {exc}",
+                      file=sys.stderr)
             # SABLE-dn7r: the promotion landed byte-identical, so the worker's
             # worktree + local branch + remote branch are dead weight — reap them.
             # Wrapped so a cleanup fault can never flip a green merge to non-zero.
