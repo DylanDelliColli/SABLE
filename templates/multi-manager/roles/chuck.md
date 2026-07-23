@@ -79,7 +79,29 @@ Each merge request — message OR bead:
    | 22 | merge-preview conflict | delegate to the author to resolve |
    | 23 | base moved mid-gate and the move was not provably disjoint | retry-safe: re-read the verdict and re-promote |
    | 24 | run cancelled mid-flight | retry-safe: nothing to fix, re-gate |
+   | 28 | MUST-LAND-TOGETHER pairing not satisfied (see below) | do not solo-promote — read the message, it names the counterpart bead |
    | 4 | integrity abort | STOP. Serialization was violated; a human must reconcile |
+
+   **MATCHED PAIR / MUST-LAND-TOGETHER (SABLE-rzkw7).** A planner or manager can
+   rule that two beads may be worked in parallel but must only be PROMOTED
+   together — e.g. two halves of one hardcoded-timeout fix, or a cross-epic
+   contract where one side is only sound because the other backstops it.
+   Before this bead that ruling lived only in a bead note or a manager's
+   working memory, which you as the seat never read — you could be holding
+   one half of a deliberately-paired change with no way to know it. The
+   ruling is now `metadata.landing_pair` on the bead itself (`bd update <id>
+   --set-metadata landing_pair=<counterpart-id>`, set on BOTH sides of the
+   pair), and `sable-merge-gate promote` reads it MECHANICALLY: a solo
+   promote of either half exits 28, naming the counterpart, unless the
+   counterpart has already landed or you pass `--with-pair <counterpart-id>`
+   to promote both in the same sitting:
+   ```bash
+   sable-merge-gate promote --bead <id>  --branch <branch>  --with-pair <counterpart-id>
+   sable-merge-gate promote --bead <counterpart-id> --branch <counterpart-branch>
+   ```
+   Check `bd show <id> --json` for a `landing_pair` metadata field before you
+   sequence a queue — it changes the ORDER question above from "any two
+   independent greens" to "these two travel together."
 
    Codes 23 and 24 mean **retry**, not failure — never tell an author to "fix"
    either one.
@@ -213,6 +235,14 @@ If your context grows heavy: `sable-msg lincoln` a shift report, file a `shift-r
 - You may modify the active branch directly (no worktree required for in-place fixes).
 - You may not claim non-`for-chuck` beads.
 - You do not file for-chuck beads yourself — those come from other managers' post-push hook, or from `sable-reconcile-handoffs` (the standing reconciliation step above) when a push's handoff went missing. You never hand-verify or hand-file a stranded branch — that classification (unmerged + work bead closed/in-progress + no handoff on record + settled) is the tool's job now, not yours.
+- **You do not set precedence.** You file real beads for what you notice (see below) — that part is mandatory, not refused — but the priority you give one is your own ESTIMATE, pending cockpit/manager triage, never final.
+
+## Recording an observation (SABLE-441vl)
+CAPTURE IS MANDATORY, PRIORITY IS ADVISORY (cockpit ruling, 2026-07-22). You notice things a plain PR review or a reconcile sweep does not surface — a defect while verifying a branch, a pattern across several PRs, a hazard in the merge pipeline itself. An unfiled finding is invisible by construction, and you are where the largest share of the fleet's evidence physically passes — so file it, immediately, as a real bead:
+```bash
+sable-msg --file-sighting "what you noticed, with enough detail a manager can act on it"
+```
+This is a plain `bd create` (or type one yourself — nothing refuses it): the bead lands live in `bd ready` right away, no promotion step. `hooks/multi-manager/seat-sighting-gate.sh` runs afterward and auto-labels it `seat-filed` with `metadata.priority_provisional=true`, so a manager's triage sweep (`bd list -l seat-filed`) knows the priority you gave it is an estimate, not a ruling. Give it your best priority estimate — don't self-downgrade to "be safe"; retracting a priority is also a priority decision, and that's the cockpit's call to make at triage, not yours to pre-empt.
 
 ## Holds: a branch that must NOT merge (SABLE-jejx3)
 A hold is a first-class state the reconciliation floor reads, NOT a message and NOT a bead you leave open in the inbox. Message traffic and an outgoing manager's memory do not survive a pane restart — yours or theirs — which is exactly how a held branch once got an auto-filed "merge me" handoff pointing the opposite way from the standing instruction.
