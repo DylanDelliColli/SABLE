@@ -528,3 +528,66 @@ def test_a_real_landing_leaves_a_complete_attention_record_in_the_durable_artifa
     cp = subprocess.run(["git", "-C", bare, "rev-parse", "trunk"], check=True,
                         capture_output=True, text=True)
     assert cp.stdout.strip() == branch_sha, "the landing did not fast-forward trunk"
+
+
+# --------------------------------------------------------------------------
+# The combined-tree BATCH budget, against the REAL tool (SABLE-be4lo.6)
+# --------------------------------------------------------------------------
+#
+# Unit-level coverage of combined_tree_budget() itself lives in
+# bin/test_promote_decision.py, alongside impact_budget()'s own tests (the
+# module that owns both functions and the fixtures the CLI test needs --
+# clean_budget_env, smg, _BIN). This is the REAL-composition half: a real
+# subprocess invocation of `sable-merge-gate promote-budget --json`, so the
+# thing asserted is what a wrapper shelling out actually receives on stdout,
+# not an in-process call to the library that skips the CLI entirely.
+
+
+def _derive_batch_wrapper_timeout_from_artifact(cli_repo, member_footprints, env):
+    """A stand-in BATCH-WRAPPER consumer: shells out to the real tool exactly
+    as an operator wrapper would, reads ONLY the JSON artifact on stdout, and
+    returns the field it would size a `timeout` around. Never touches
+    promote_lib in-process and never hardcodes a number -- the governing
+    precedent this bead states explicitly (the retired +900 pattern): a
+    consumer that copies the number instead of reading the artifact forfeits
+    the derivation."""
+    argv = [sys.executable, str(cli_repo / "sable-merge-gate"), "promote-budget", "--json"]
+    for fp in member_footprints:
+        argv += ["--member-footprint", ",".join(fp)]
+    cp = subprocess.run(argv, cwd="/", text=True, capture_output=True, env=env)
+    assert cp.returncode == 0, cp.stderr
+    artifact = json.loads(cp.stdout)
+    assert "recommended_batch_wrapper_timeout_s" in artifact, (
+        "the combined-tree batch field is absent from the tool's own output")
+    return artifact["recommended_batch_wrapper_timeout_s"], artifact
+
+
+def test_the_real_promote_budget_tool_reports_the_combined_tree_batch_field(tmp_path):
+    """INTEGRATION (SABLE-be4lo.6 acceptance): run the REAL budget tool via
+    subprocess against a sandbox with 3 member footprints; the field is
+    present in the artifact, and a consumer reading the artifact -- not a
+    hand-carried constant -- gets the derived value. Changing the env the
+    tool derives from (not the consumer's code) moves the number the
+    consumer reads, proving it is a live derivation."""
+    _BIN = Path(__file__).resolve().parent
+    members = [["bin/a.py"], ["bin/b.py", "bin/c.py"], ["hooks/test/x.sh"]]
+    base_env = {**os.environ, "SABLE_MG_IMPACT_TIMEOUT": "300",
+                "SABLE_MG_IMPACT_LOCK_TIMEOUT": "150",
+                "SABLE_MG_COVERAGE_FLOOR_TIMEOUT": "50"}
+
+    timeout_s, artifact = _derive_batch_wrapper_timeout_from_artifact(_BIN, members, base_env)
+    assert isinstance(timeout_s, int) and timeout_s > 0
+    assert artifact["member_count"] == 3
+    assert artifact["bisection_reserve_s"] > 0
+    assert "recommended_wrapper_timeout_s" not in artifact, (
+        "the batch report must never carry the single-branch field name too "
+        "-- a consumer keying on field presence would misread which budget "
+        "it got")
+
+    # DERIVATION, not a copy: moving the SSOT-equivalent env the tool reads
+    # moves the number this consumer gets, with no change to the consumer.
+    bumped_env = {**base_env, "SABLE_MG_IMPACT_TIMEOUT": "3000"}
+    bumped_timeout_s, _ = _derive_batch_wrapper_timeout_from_artifact(_BIN, members, bumped_env)
+    assert bumped_timeout_s > timeout_s, (
+        "the batch wrapper timeout did not track the underlying tier budget -- "
+        "a consumer reading this artifact would be sized against a stale number")

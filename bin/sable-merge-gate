@@ -380,6 +380,13 @@ def main(argv: list[str] | None = None) -> int:
     pbg.add_argument("--seconds", action="store_true",
                      help="just the recommended enclosing timeout, as a bare integer: "
                           "timeout \"$(sable-merge-gate promote-budget --seconds)\" ...")
+    # SABLE-be4lo.6: >=1 occurrence switches this command from the single-branch
+    # report to the combined-tree BATCH report (a NEW field,
+    # recommended_batch_wrapper_timeout_s — never an overload of the
+    # single-branch recommended_wrapper_timeout_s above).
+    pb.add_argument("--member-footprint", action="append", default=[],
+                    dest="member_footprints", metavar="PATH[,...]",
+                    help="repeatable; one per batch member (SABLE-be4lo.6)")
 
     # SABLE-jd5fj.8. Refreshes the gate-owned persisted warm .testmondata
     # (see sable_gate_promote_lib's module comment on _warm_testmondata_path)
@@ -420,13 +427,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "sweep":
             return preview_lib.sweep(args.repo, args.remote, args.max_age_hours)
         if args.command == "promote-budget":
-            budget = promote_lib.impact_budget()
-            if args.seconds:
-                print(budget["recommended_wrapper_timeout_s"])
-            elif args.json:
-                print(json.dumps(budget, sort_keys=True))
-            else:
-                print(promote_lib.format_impact_budget(budget))
+            print(promote_lib.render_promote_budget_report(
+                args.member_footprints, args.seconds, args.json))
             return 0
         if args.command == "warm-testmon-cache":
             return promote_lib.warm_gate_testmon_cache(args.repo)
