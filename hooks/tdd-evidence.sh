@@ -98,11 +98,26 @@ if not cmd:
 
 SEPS = {';', '&&', '||', '|'}
 SCRIPT_RE = re.compile(r'test-[A-Za-z0-9_-]+\.sh\$')
+# SABLE-rd9n0: SCRIPT_RE requires the basename to START with the literal
+# 'test-', so it never matches this repo's DOCUMENTED canonical suite
+# ('.github/ci/shell-run-set.sh' -- CLAUDE.md, Build & Test) even though a
+# close citing it is legitimate TDD evidence. An allowlist of the specific
+# canonical basenames (not a loosened regex) closes that gap without
+# crediting an arbitrary '.sh' -- 'test-tiers.sh' is included too even
+# though it already matches SCRIPT_RE, so the allowlist names every
+# documented canonical script in one place.
+CANONICAL_TEST_SCRIPTS = {'shell-run-set.sh', 'test-tiers.sh'}
 PYTEST_FILE_RE = re.compile(r'test_[A-Za-z0-9_-]+\.py')
 # A redirect operator as its own shlex token (2>&1, >, >>, 2>, <, 1>&2, ...).
 # SEPS only splits on command separators, not redirects, so a trailing
 # 'script.sh 2>&1' leaves '2>&1' — not the script path — as seg[-1].
 REDIRECT_RE = re.compile(r'^\d*(>>?|<)&?\d*\$')
+
+def is_test_script(token):
+    if SCRIPT_RE.search(token):
+        return True
+    basename = token.rsplit('/', 1)[-1]
+    return basename in CANONICAL_TEST_SCRIPTS
 
 # SABLE-2nak (same class as SABLE-sxhx in lib-identity.sh): plain shlex.split
 # only treats ; && || | as separators when they are whitespace-delimited from
@@ -268,13 +283,13 @@ for seg in segments:
         script_token = None
         if head in ('bash', 'sh', 'source', '.'):
             for t in core[1:]:
-                if SCRIPT_RE.search(t):
+                if is_test_script(t):
                     script_token = t
                     break
         # Direct execution (./test-x.sh --run, /abs/path/test-x.sh --run):
         # the script IS the segment's own command token (head), which can
         # likewise carry its own trailing args/flags — not necessarily last.
-        if script_token is None and (head.startswith('./') or head.startswith('/')) and SCRIPT_RE.search(head):
+        if script_token is None and (head.startswith('./') or head.startswith('/')) and is_test_script(head):
             script_token = head
         if script_token is not None:
             matched = True
