@@ -264,6 +264,18 @@ def test_boot_observed_keys_on_sessionstart_marker():
     assert src.boot_observed("ordinary content\n❯ ") is False
 
 
+def test_boot_observed_uses_a_marker_a_real_boot_renders():
+    # SABLE-vsfvl Defect 1 repro: a captured-pane fixture with the ACTUAL
+    # boot banner but NOT '[bd prime]' (the hook token this host's
+    # SessionStart output truncates-and-persists to a file instead of
+    # rendering) must still be judged an observed boot.
+    real_boot_no_marker = "Claude Code v2.1.218\n\n❯ "
+    assert src.boot_observed(real_boot_no_marker) is True
+    # Negative control: neither marker present.
+    neither_marker = "ordinary pane content\n❯ "
+    assert src.boot_observed(neither_marker) is False
+
+
 def test_composer_has_pending_clear_true_when_unsubmitted():
     cap = "some transcript\n❯ /clear"
     assert src.composer_has_pending_clear(cap) is True
@@ -300,6 +312,19 @@ def test_bead_is_fresh_boundary():
     assert src.bead_is_fresh(bead_over, NOW, 3600) is False
 
 
+def test_relay_payload_is_an_instruction_not_a_bare_id():
+    # SABLE-vsfvl Defect 2 repro: relaying a bare bead id did NOT cause a
+    # fresh agent to ingest it as a boot document. The stdout relay payload
+    # must instruct the reader to ingest the bead, not just name it.
+    bead_id = "SABLE-shift1"
+    text = src.relay_instruction(bead_id)
+    assert bead_id in text
+    assert text != bead_id, "a bare id is exactly the delivery that does not deliver"
+    assert "bd show" in text
+    assert "boot" in text.lower()
+    assert len(text.split()) > 5, "an instruction, not a bare token"
+
+
 def test_success_path_prints_bare_bead_id_for_relay():
     code, message, sent_flag = src.run_recycle(
         "SABLE-shift1", "%0",
@@ -314,3 +339,20 @@ def test_success_path_prints_bare_bead_id_for_relay():
     assert code == 0
     assert message == "SABLE-shift1"
     assert sent_flag is True
+
+
+# --- SABLE-uc7kh: the duty must actually be assigned on a role card ---------
+
+def test_role_card_assigns_the_duty():
+    card_path = Path(__file__).resolve().parent.parent / "templates" / "multi-manager" / "roles" / "optimus.md"
+    card = card_path.read_text()
+    assert "sable-recycle-cockpit" in card, (
+        "optimus.md must invoke sable-recycle-cockpit — the tool shipping "
+        "is not the duty being assigned (SABLE-uc7kh)"
+    )
+    for outcome in ("NO-BEAD", "STALE-BEAD", "BUSY-PANE", "BOOT-NOT-OBSERVED", "ALREADY-RECYCLED"):
+        assert outcome in card, f"optimus.md must name the {outcome} exit outcome"
+    # Positive control: the probe can see words it's looking for, so the
+    # absence checked above is real and not a search artifact (mirrors the
+    # bead's own grep-for-'lincoln' control).
+    assert "lincoln" in card.lower()
