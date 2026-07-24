@@ -359,9 +359,17 @@ class ProbeError(Exception):
     pass
 
 
-def read_process_table() -> list[ProcInfo]:
+def read_process_table(debug: dict | None = None) -> list[ProcInfo]:
     """The host process table via ps. Raises ProbeError if ps is unusable — the
-    probe's own failure is could-not-assess, never a quiet CLEAR."""
+    probe's own failure is could-not-assess, never a quiet CLEAR.
+
+    `debug`, when passed a dict, is filled with what happened BELOW the
+    caller's own filters, at parse time — SABLE-skrdj revise #1, round three:
+    a `ps` line whose fields don't split into (at least) four, or whose
+    pid/ppid/uid aren't parseable ints, is silently dropped by the two
+    `continue`s below, one layer further down than anything scan_debug (in
+    scan_processes/clearance) can see, since that instrument starts from the
+    ALREADY-parsed rows. Never used to alter behaviour."""
     try:
         proc = subprocess.run(["ps", "-eo", "pid=,ppid=,uid=,args="],
                               capture_output=True, text=True)
@@ -369,16 +377,31 @@ def read_process_table() -> list[ProcInfo]:
         raise ProbeError(f"cannot run ps: {exc}") from exc
     if proc.returncode != 0:
         raise ProbeError(f"ps exited {proc.returncode}: {(proc.stderr or '').strip()}")
+    raw_lines = proc.stdout.splitlines()
     out: list[ProcInfo] = []
-    for line in proc.stdout.splitlines():
+    dropped_short: list[str] = []
+    dropped_valueerror: list[str] = []
+    for line in raw_lines:
         parts = line.strip().split(None, 3)
         if len(parts) < 4:
+            dropped_short.append(line)
             continue
         try:
             pid, ppid, uid = int(parts[0]), int(parts[1]), int(parts[2])
         except ValueError:
+            dropped_valueerror.append(line)
             continue
         out.append(ProcInfo(pid=pid, ppid=ppid, uid=uid, args=parts[3]))
+    if debug is not None:
+        debug.update({
+            "raw_ps_lines": len(raw_lines),
+            "parsed_rows": len(out),
+            "dropped_short_rows": len(dropped_short),
+            "dropped_short_sample": dropped_short[:5],
+            "dropped_valueerror_rows": len(dropped_valueerror),
+            "dropped_valueerror_sample": dropped_valueerror[:5],
+            "raw_lines": raw_lines,
+        })
     return out
 
 
@@ -421,7 +444,8 @@ def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
                    self_pid: int | None = None,
                    uid: int | None = None,
                    trace: list[dict] | None = None,
-                   scan_debug: dict | None = None) -> tuple[list[Candidate], list[Candidate]]:
+                   scan_debug: dict | None = None,
+                   read_debug: dict | None = None) -> tuple[list[Candidate], list[Candidate]]:
     """(attributed, unattributable). A process is a candidate when its command
     line names one of this repo's suite shapes. It is ATTRIBUTED when:
       - its cwd or an absolute path in its argv lands inside one of `roots`, or
@@ -470,8 +494,12 @@ def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
     list above cannot distinguish, since `trace` only records rows that
     ALREADY passed those filters (SABLE-skrdj revise #1, second round:
     tarzan's request after the H1 close, to stop conflating an empty
-    candidate set with an empty raw table). Never used to alter behaviour."""
-    tbl = read_process_table() if table is None else table
+    candidate set with an empty raw table). Never used to alter behaviour.
+
+    `read_debug`, when passed a dict, is forwarded to `read_process_table`
+    verbatim (round three: raw ps line count and every line silently dropped
+    at parse time, one layer below `scan_debug`)."""
+    tbl = read_process_table(debug=read_debug) if table is None else table
     me = os.getpid() if self_pid is None else self_pid
     my_uid = os.getuid() if uid is None else uid
     if scan_debug is not None:
@@ -651,20 +679,23 @@ class Clearance:
 
 def clearance(base: str | None = None, table: list[ProcInfo] | None = None,
               probe: bool = True, trace: list[dict] | None = None,
-              scan_debug: dict | None = None) -> Clearance:
+              scan_debug: dict | None = None,
+              read_debug: dict | None = None) -> Clearance:
     """Answer "is any test suite executing in any worktree of this repo?".
 
     Precedence, most-informative first — every finding still appears in
     `reasons`, so nothing is hidden by the winning label:
       could-not-assess > unregistered-runner > busy > stale > clear
 
-    `trace` and `scan_debug`, when given, are forwarded to `scan_processes`
-    verbatim — they fill from the SAME table/decision this call's verdict
-    came from (see `scan_processes`'s docstring; SABLE-skrdj revise #1's
-    temporary instrument for telling a misclassification apart from a
-    snapshot that plain never saw the candidate, and — round two —
-    for telling "never in the raw table" apart from "in the table but
-    filtered before classification").
+    `trace`, `scan_debug`, and `read_debug`, when given, are forwarded to
+    `scan_processes`/`read_process_table` verbatim — they fill from the SAME
+    table/decision this call's verdict came from (see those functions'
+    docstrings; SABLE-skrdj revise #1's temporary instrument for telling a
+    misclassification apart from a snapshot that plain never saw the
+    candidate, then — round two — "never in the raw table" apart from "in
+    the table but filtered before classification", then — round three —
+    whether a `ps` line for the candidate was silently dropped at parse time,
+    below where `scan_debug` starts looking).
     """
     reasons: list[str] = []
     checked: list[str] = []
@@ -715,7 +746,7 @@ def clearance(base: str | None = None, table: list[ProcInfo] | None = None,
                            "probe has nothing to attribute candidates to")
         else:
             try:
-                tbl = read_process_table() if table is None else table
+                tbl = read_process_table(debug=read_debug) if table is None else table
                 attributed, unattributable = scan_processes(
                     roots, table=tbl, trace=trace, scan_debug=scan_debug)
                 for c in unattributable:

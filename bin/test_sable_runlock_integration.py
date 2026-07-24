@@ -137,33 +137,54 @@ class Samples(list):
     OWN process-table snapshot (H1) — so `lead_diagnostics` now carries the
     `trace` `rl.clearance()` itself built while producing the state, branch
     label included (roots / ancestry / confidently-foreign / genuinely-unknown),
-    not a second, differently-timed read.
+    not a second, differently-timed read. Round two added `scan_debug` (counts
+    from BEFORE classification, so an empty `trace` can be told apart from an
+    empty raw table). Round three added `read_debug` and a direct
+    `child_pid_visible_in_raw_ps` check, one layer further down still: whether
+    `ps`'s own output for the runner's child was silently dropped at parse
+    time, and whether the child's pid appears in the raw `ps` text at all.
     """
 
     lead_diagnostics: list[dict]
 
 
-def _lead_diagnostic(repo: Path, state: str, trace: list[dict], scan_debug: dict) -> dict:
+def _lead_diagnostic(repo: Path, state: str, trace: list[dict], scan_debug: dict,
+                     read_debug: dict, child_pid: int) -> dict:
     """The decisive evidence for one early sample.
 
-    `trace` and `scan_debug` MUST come from the SAME `rl.clearance(...,
-    trace=trace, scan_debug=scan_debug)` call that produced `state`
-    (SABLE-skrdj revise #1, H1): a diagnostic that takes its OWN separate
-    `read_process_table()` snapshot can show a candidate that scan_processes's
-    own decision never saw (or vice versa), because the two reads are not the
-    same instant — the 2026-07-23 clean-room red's "state contradicts the
-    printed table" puzzle traced to exactly that gap. Passing the real trace
-    through means what you see here is provably what informed `state`, not a
-    rumour from a nearby read.
+    `trace`, `scan_debug`, and `read_debug` MUST come from the SAME
+    `rl.clearance(..., trace=trace, scan_debug=scan_debug,
+    read_debug=read_debug)` call that produced `state` (SABLE-skrdj revise
+    #1, H1): a diagnostic that takes its OWN separate `read_process_table()`
+    snapshot can show a candidate that scan_processes's own decision never
+    saw (or vice versa), because the two reads are not the same instant — the
+    2026-07-23 clean-room red's "state contradicts the printed table" puzzle
+    traced to exactly that gap. Passing the real trace through means what you
+    see here is provably what informed `state`, not a rumour from a nearby
+    read.
 
     `scan_debug` additionally distinguishes (revise #1, round two, per
     tarzan): an EMPTY `trace` because the forked child was never in THIS
     call's own raw process table at all, from an empty `trace` because it was
     in the table but a pre-classification filter (uid / self-pid /
-    suite-shape) dropped it before roots/ancestry/foreign/unknown ever ran."""
+    suite-shape) dropped it before roots/ancestry/foreign/unknown ever ran.
+
+    `read_debug` goes one layer further (round three): whether `ps`'s raw
+    output line for the candidate was silently dropped by
+    read_process_table's own parse-time `continue`s, below where `scan_debug`
+    starts looking. `child_pid_visible_in_raw_ps` asks the most direct
+    version of the question — does str(child_pid) appear ANYWHERE in the raw
+    `ps` text this call read, regardless of which column or whether it
+    parsed — since everything measured so far asks "is there a row matching
+    our filters", not "is our specific child visible to ps at all"."""
     roots = rl.worktree_roots(str(repo))
+    raw_lines = read_debug.get("raw_lines", [])
+    child_pid_visible_in_raw_ps = any(str(child_pid) in line for line in raw_lines)
+    read_debug_trimmed = {k: v for k, v in read_debug.items() if k != "raw_lines"}
     return {"state": state, "roots": roots, "suite_shaped_same_uid": trace,
-            "scan_debug": scan_debug}
+            "scan_debug": scan_debug, "read_debug": read_debug_trimmed,
+            "child_pid": child_pid,
+            "child_pid_visible_in_raw_ps": child_pid_visible_in_raw_ps}
 
 
 def _sample_until_exit(proc: subprocess.Popen, repo: Path, limit: float = 90.0):
@@ -176,9 +197,12 @@ def _sample_until_exit(proc: subprocess.Popen, repo: Path, limit: float = 90.0):
         visible = _suite_processes_visible(repo)
         trace: list[dict] = []
         scan_debug: dict = {}
-        state = rl.clearance(base=str(repo), trace=trace, scan_debug=scan_debug).state
+        read_debug: dict = {}
+        state = rl.clearance(base=str(repo), trace=trace, scan_debug=scan_debug,
+                             read_debug=read_debug).state
         if len(samples) < LEAD_DIAGNOSTIC_SAMPLES:
-            samples.lead_diagnostics.append(_lead_diagnostic(repo, state, trace, scan_debug))
+            samples.lead_diagnostics.append(
+                _lead_diagnostic(repo, state, trace, scan_debug, read_debug, proc.pid))
         samples.append((state, visible))
         time.sleep(SAMPLE_INTERVAL)
     proc.wait(timeout=30)
