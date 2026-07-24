@@ -43,6 +43,7 @@ function is unit-testable with no fixtures at all.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 
 from sable_batch_key_lib import preview_kick_key  # noqa: F401 — re-exported (SABLE-be4lo.1)
 
@@ -105,6 +106,52 @@ def classify_conclusion(conclusion: str) -> str:
     return RED
 
 
+class VerdictSource(str, Enum):
+    """The typed producer discriminator for Verdict.source (SABLE-21rug.2) —
+    WHO/WHAT answered "what does CI say", the same WHO/WHAT-produced-this role
+    the tier journal's own writer-identity field plays for a tier window. A
+    plain `str` field can't stop a typo'd source from being silently stored
+    and later misread (Primitive Obsession guard); this is the whole
+    vocabulary, not a suggestion — see parse_verdict_source.
+
+    Subclassing str keeps every EXISTING call site (which passes the bare
+    literals "precomputed"/"waited"/"override") byte-identical: a member
+    compares equal to, and serializes as, its string value, so this addition
+    changes no stored or printed verdict for the GitHub-Actions leg.
+
+    PRECOMPUTED — read_verdict found an already-completed Actions run.
+    WAITED      — acquire_verdict polled wait_for_ci for one (pre-split path).
+    OVERRIDE    — a human actions-down bypass; no run was consulted.
+    LOCAL_RUNNER — a hand-run/base-moved local tier's own verdict, journal-
+                   backed (SABLE-21rug.2's second verdict source) rather than
+                   read from Actions. Binds to one preview SHA; a record whose
+                   own SHA disagrees with the SHA under decision is refused by
+                   the reader that consumes it, never adapted (see the preview
+                   module's journal-reading function)."""
+    PRECOMPUTED = "precomputed"
+    WAITED = "waited"
+    OVERRIDE = "override"
+    LOCAL_RUNNER = "local-runner"
+
+
+def parse_verdict_source(value: str) -> VerdictSource:
+    """Validate an untrusted producer value (a journal record field, not a
+    value this module itself constructed) against the typed vocabulary above.
+
+    Existing to make refusal the ONLY outcome for anything outside the enum:
+    an unrecognized producer is a GateError, the SAME integrity-abort code a
+    post-promote base-tip mismatch raises (EXIT_INTEGRITY) — both mean "this
+    thing cannot be trusted as an answer for the decision at hand," and
+    neither may be silently coerced into something usable (SABLE-21rug.2)."""
+    try:
+        return VerdictSource(value)
+    except ValueError:
+        legal = ", ".join(m.value for m in VerdictSource)
+        raise GateError(EXIT_INTEGRITY,
+                        f"unrecognized verdict producer {value!r}; refusing rather than "
+                        f"passing it through (legal values: {legal})") from None
+
+
 @dataclass(frozen=True)
 class Verdict:
     """A CI verdict for one merge-preview commit, as promote consumes it.
@@ -121,6 +168,10 @@ class Verdict:
       'waited'      — no completed run existed yet, so promote polled for one
                       (the pre-split behaviour, unchanged and still correct).
       'override'    — a human actions-down bypass; no run was consulted.
+      'local-runner' — a journal-backed verdict from a local tier run, the
+                      SECOND verdict source (SABLE-21rug.2). See VerdictSource
+                      above and the preview module's journal-reading function
+                      for the refuse-on-SHA-mismatch contract this carries.
 
     `complete` is False only for the sentinel returned when nothing is known yet
     (a pending run), which read_verdict uses to say "come back later" without

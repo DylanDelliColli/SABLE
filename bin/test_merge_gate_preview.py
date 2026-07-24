@@ -609,6 +609,126 @@ def test_report_verdict_prints_none_when_nothing_was_kicked(monkeypatch, capsys)
 
 
 # --------------------------------------------------------------------------
+# Local-runner verdict journal — the SECOND verdict source (SABLE-21rug.2)
+#
+# read_verdict now consults two independent sources behind the SAME
+# interface: this journal (a plain file, checked first) and the Actions leg
+# above (unchanged). Every case below points SABLE_MG_RUNNER_VERDICT_LOG at a
+# throwaway tmp_path file, so none of it touches the real per-repo state dir
+# _runner_verdict_log_path falls back to when the env var is unset.
+# --------------------------------------------------------------------------
+
+RUNNER_REF = "ci-verify/wk-x-ccccccc"
+
+
+def _write_journal_line(path, **fields):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as fh:
+        fh.write(json.dumps(fields) + "\n")
+
+
+def test_read_verdict_actions_leg_stays_byte_identical_with_no_journal_entry(monkeypatch, tmp_path):
+    """REGRESSION (priority 1): with no journal file at all (the state every
+    existing fixture is in — none of them ever write to it), read_verdict must
+    still answer purely from _gh_runs, with the exact fields the pre-seam code
+    produced. This is what "the GitHub-Actions verdict path is byte-identical"
+    means made concrete: same conclusion, same source, same completeness, same
+    outcome."""
+    monkeypatch.setenv("SABLE_MG_RUNNER_VERDICT_LOG", str(tmp_path / "absent-runner-verdicts.jsonl"))
+    monkeypatch.setattr(preview_lib, "_gh_runs", lambda *a, **kw: [
+        {"databaseId": 9, "headSha": PREVIEW_SHA, "status": "completed",
+         "conclusion": "success", "url": "http://run/9"}])
+    v = preview_lib.read_verdict(REPO, RUNNER_REF, PREVIEW_SHA)
+    assert v.conclusion == "success"
+    assert v.source == "precomputed"
+    assert v.complete is True
+    assert v.outcome == classify.GREEN
+    assert v.run_url == "http://run/9"
+
+
+def test_read_verdict_consumes_a_matching_sha_journal_verdict(monkeypatch, tmp_path):
+    """A journal-backed verdict with the SAME sha as the one under decision is
+    consumed, carries the local-runner producer, and never touches Actions."""
+    log = tmp_path / "runner-verdicts.jsonl"
+    monkeypatch.setenv("SABLE_MG_RUNNER_VERDICT_LOG", str(log))
+    _write_journal_line(log, ref=RUNNER_REF, preview_sha=PREVIEW_SHA, conclusion="success",
+                        run_url="http://hand-run/1", producer="local-runner")
+
+    def _boom(*a, **kw):
+        raise AssertionError("a consumed journal verdict must not fall through to Actions")
+    monkeypatch.setattr(preview_lib, "_gh_runs", _boom)
+
+    v = preview_lib.read_verdict(REPO, RUNNER_REF, PREVIEW_SHA)
+    assert v.complete is True
+    assert v.conclusion == "success"
+    assert v.source == classify.VerdictSource.LOCAL_RUNNER
+    assert v.source == "local-runner"
+    assert v.outcome == classify.GREEN
+    assert v.run_url == "http://hand-run/1"
+
+
+def test_read_verdict_refuses_a_journal_verdict_for_the_wrong_sha(monkeypatch, tmp_path):
+    """Refuse-on-SHA-mismatch, both polarities in one test: the SAME journal
+    entry that test_read_verdict_consumes_a_matching_sha_journal_verdict
+    admits is REFUSED — loudly, via GateError, never silently adapted or
+    treated as absent — when asked about a DIFFERENT sha than the one it
+    binds to."""
+    log = tmp_path / "runner-verdicts.jsonl"
+    monkeypatch.setenv("SABLE_MG_RUNNER_VERDICT_LOG", str(log))
+    _write_journal_line(log, ref=RUNNER_REF, preview_sha=PREVIEW_SHA, conclusion="success",
+                        run_url="http://hand-run/1", producer="local-runner")
+
+    other_sha = "f" * 40
+    with pytest.raises(classify.GateError) as exc:
+        preview_lib.read_verdict(REPO, RUNNER_REF, other_sha)
+    assert exc.value.code == classify.EXIT_INTEGRITY
+    assert PREVIEW_SHA[:7] in str(exc.value)
+    assert other_sha[:7] in str(exc.value)
+
+
+def test_read_verdict_refuses_an_unrecognized_journal_producer(monkeypatch, tmp_path):
+    """Producer values are drawn from the typed enum (classify.VerdictSource);
+    a value outside it is refused, never passed through as if trustworthy."""
+    log = tmp_path / "runner-verdicts.jsonl"
+    monkeypatch.setenv("SABLE_MG_RUNNER_VERDICT_LOG", str(log))
+    _write_journal_line(log, ref=RUNNER_REF, preview_sha=PREVIEW_SHA, conclusion="success",
+                        run_url="http://hand-run/1", producer="a-typo-d-producer")
+
+    with pytest.raises(classify.GateError) as exc:
+        preview_lib.read_verdict(REPO, RUNNER_REF, PREVIEW_SHA)
+    assert exc.value.code == classify.EXIT_INTEGRITY
+    assert "a-typo-d-producer" in str(exc.value)
+
+
+def test_parse_verdict_source_accepts_every_enum_member():
+    for member in classify.VerdictSource:
+        assert classify.parse_verdict_source(member.value) is member
+
+
+def test_parse_verdict_source_rejects_an_unenumerated_value():
+    with pytest.raises(classify.GateError) as exc:
+        classify.parse_verdict_source("actions-robot")
+    assert exc.value.code == classify.EXIT_INTEGRITY
+
+
+def test_read_verdict_ignores_a_journal_entry_for_a_different_ref(monkeypatch, tmp_path):
+    """The journal is keyed by ref, same axis Actions is queried on. A record
+    for some OTHER ref must never leak into an answer for this one — falls
+    through to Actions exactly as an empty journal would."""
+    log = tmp_path / "runner-verdicts.jsonl"
+    monkeypatch.setenv("SABLE_MG_RUNNER_VERDICT_LOG", str(log))
+    _write_journal_line(log, ref="ci-verify/other-branch-1234567", preview_sha=PREVIEW_SHA,
+                        conclusion="success", producer="local-runner")
+    monkeypatch.setattr(preview_lib, "_gh_runs", lambda *a, **kw: [
+        {"databaseId": 1, "headSha": PREVIEW_SHA, "status": "completed",
+         "conclusion": "failure", "url": "http://run/1"}])
+
+    v = preview_lib.read_verdict(REPO, RUNNER_REF, PREVIEW_SHA)
+    assert v.source == "precomputed"
+    assert v.outcome == classify.RED
+
+
+# --------------------------------------------------------------------------
 # Integration: real git sandbox (SABLE-be4lo.1)
 #
 # Everything above mocks git_lib._git. These two tests run build_preview and
@@ -788,3 +908,55 @@ def test_real_git_sandbox_batch_fold_pushes_ci_verify_batch_ref(tmp_path):
     # member tip SHAs from this sandbox, not synthetic ones.
     reordered_key = batch_key.setkey(base_sha, [m.sha for m in reversed(members)])
     assert f"ci-verify/batch-{reordered_key[:7]}" == ref
+
+
+# --------------------------------------------------------------------------
+# Integration: real journal file + real Actions leg in the same run
+# (SABLE-21rug.2) — the two verdict sources actually coexisting, not just
+# each individually mocked. write_runner_verdict is the seat-side writer a
+# real tier-runner (SABLE-21rug.3) will call; this proves read_verdict reads
+# its own output back end to end, on a real filesystem, with no mock standing
+# in for either the journal or the file I/O around it.
+# --------------------------------------------------------------------------
+
+def test_seat_side_read_of_a_runner_written_journal_verdict_end_to_end(monkeypatch, tmp_path):
+    """A real journal file, written by write_runner_verdict exactly as a
+    runner would, read back by read_verdict with no mocking of the journal
+    path or its I/O — then, in the SAME run, an ordinary Actions-only verdict
+    is read for a completely different ref+sha, proving the two sources
+    coexist rather than one seam having quietly replaced the other."""
+    log = tmp_path / "runner-verdicts.jsonl"
+    monkeypatch.setenv("SABLE_MG_RUNNER_VERDICT_LOG", str(log))
+    assert not log.exists()
+
+    runner_ref = "ci-verify/wk-hand-run-1112223"
+    preview_lib.write_runner_verdict(REPO, runner_ref, PREVIEW_SHA, "success",
+                                     run_url="http://hand-run/42")
+    assert log.is_file()
+
+    runner_verdict = preview_lib.read_verdict(REPO, runner_ref, PREVIEW_SHA)
+    assert runner_verdict.complete is True
+    assert runner_verdict.source == classify.VerdictSource.LOCAL_RUNNER
+    assert runner_verdict.outcome == classify.GREEN
+    assert runner_verdict.run_url == "http://hand-run/42"
+
+    # Coexistence: a DIFFERENT ref+sha, answered purely by the Actions leg,
+    # still works in this same process — the journal for the ref above did
+    # not become a global override of every read_verdict call.
+    actions_ref = "ci-verify/wk-x-9998887"
+    actions_sha = "e" * 40
+    monkeypatch.setattr(preview_lib, "_gh_runs", lambda *a, **kw: [
+        {"databaseId": 5, "headSha": actions_sha, "status": "completed",
+         "conclusion": "failure", "url": "http://run/5"}])
+    actions_verdict = preview_lib.read_verdict(REPO, actions_ref, actions_sha)
+    assert actions_verdict.source == "precomputed"
+    assert actions_verdict.outcome == classify.RED
+
+    # A second hand-run write for the SAME ref (a re-run) appends rather than
+    # rewriting, and the newest line is what gets consumed.
+    preview_lib.write_runner_verdict(REPO, runner_ref, PREVIEW_SHA, "failure",
+                                     run_url="http://hand-run/43")
+    assert len(log.read_text().splitlines()) == 2
+    rerun_verdict = preview_lib.read_verdict(REPO, runner_ref, PREVIEW_SHA)
+    assert rerun_verdict.outcome == classify.RED
+    assert rerun_verdict.run_url == "http://hand-run/43"
