@@ -14,6 +14,12 @@
 #      `serialize_with` metadata so Chuck's for-chuck handoff sequences the
 #      merges together instead of racing them.
 #
+# SABLE-e2ic3: a dispatch that declares NO footprint at all still releases —
+# it collides with nothing the gate could check — but is announced LOUDLY as
+# NO-DECLARATION (additionalContext, not a deny) rather than exiting silently.
+# That is a DIFFERENT verdict from a footprint that was actually compared and
+# found clean; before this fix both were the same silent exit-0-no-output.
+#
 # Skips: worker/bare subagent context, dispatches with no inferrable bead IDs.
 
 set -euo pipefail
@@ -231,9 +237,35 @@ print(json.dumps({
 fi
 
 # No footprint source was present at all: this dispatch DECLARES NOTHING, which
-# is legitimate and common. It collides with nothing and must still be released
-# — a gate that can never release is indistinguishable from correct caution.
-[ -z "$DISPATCH_FILES" ] && exit 0
+# is legitimate and common. It must still be RELEASED — a gate that can never
+# release is indistinguishable from correct caution (SABLE-47try) — but this
+# is a DIFFERENT fact from a footprint that was actually compared and found
+# clean (SABLE-e2ic3), and the two used to be the exact same silent exit-0
+# no-output outcome. A manager reading a normal run could not tell "the
+# constraint ran and released me" from "the constraint had nothing to check
+# against" — measured at 96.4% of the live pool declaring nothing at all — so
+# say so, loudly, on every dispatch that lands here, without refusing it.
+if [ -z "$DISPATCH_FILES" ]; then
+  DISPATCH_ID_LIST="$(echo $DISPATCH_IDS)" python3 -c "
+import json, os
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'additionalContext': (
+            'NO-DECLARATION — dispatched bead(s) '
+            + os.environ.get('DISPATCH_ID_LIST', '')
+            + ' declare NO file footprint at all (no wip_claims metadata, no '
+            + chr(39) + '## File footprint' + chr(39) + ' section, no '
+              'file-shaped token in the description). The overlap SCHEDULING '
+              'CONSTRAINT has no input to compare this dispatch against, and '
+              'cannot tell it apart from one that WAS checked and found '
+              'clean. Dispatching normally -- this is NOT the same verdict '
+              'as a checked CLEAR.')
+    }
+}))
+"
+  exit 0
+fi
 
 # Find all in-progress beads (status=in_progress) not in dispatch set
 IN_PROGRESS=$(bd list --status=in_progress --json --limit 0 2>/dev/null || echo "[]")

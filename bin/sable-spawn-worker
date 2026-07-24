@@ -103,8 +103,18 @@ heading naming no path, a WIP-CLAIMS line or wip_claims value that yields none)
 refuses the spawn separately — exit 12, could-not-assess (SABLE-47try). The
 constraint cannot be evaluated against an unreadable footprint, and a check
 that did not run must not report the same verdict as one that ran and found
-nothing. A bead that declares NO footprint at all is a different fact and
-dispatches normally.
+nothing.
+
+A bead that declares NO footprint at all (no source present, as opposed to a
+source present-but-unreadable) is a THIRD, different fact and dispatches
+normally too — but SABLE-e2ic3: it is announced LOUDLY on stderr as
+NO-DECLARATION, a decision distinct from a footprint that was actually
+compared and found clean. Before this fix "declares nothing" and "checked,
+disjoint" were the same silent no-output exit 0, so a manager reading normal
+output could not tell "the constraint ran and released me" from "the
+constraint had nothing to check" — 96.4% of the live pool measured as the
+latter. Not a refusal (that would re-create the could-never-release gate
+SABLE-47try warns against) — only the silence ends.
 
 Dispatch-content guard (SABLE-kv44f): a bead whose description is empty or
 whitespace-only while its notes hold >= DISPATCH_NOTES_THRESHOLD chars of
@@ -675,17 +685,26 @@ def bead_serialize_with(bead: dict) -> set[str]:
 
 
 class OverlapVerdict(NamedTuple):
-    """decision: 'none' (CHECK COMPLETED, no overlap) | 'deny' (SCHEDULING
-    CONSTRAINT — the spawn must be refused) | 'allow' (overlap permitted via a
-    matching Serialize-with line; tagged_ids names the partner bead(s) to tag
-    serialize_with on both sides) | 'could-not-assess' (SABLE-47try — THE CHECK
-    DID NOT RUN, because the dispatching bead's footprint could not be read).
+    """decision: 'none' (CHECK COMPLETED against a real declared footprint, no
+    overlap found — a POSITIVE claim: "I compared footprints and they are
+    disjoint") | 'no-declaration' (SABLE-e2ic3 — THE CHECK HAD NO INPUT: this
+    bead declares no footprint at all, so there was nothing to compare against
+    any in-progress bead; dispatch still proceeds, but this is NOT the same
+    fact as 'none') | 'deny' (SCHEDULING CONSTRAINT — the spawn must be
+    refused) | 'allow' (overlap permitted via a matching Serialize-with line;
+    tagged_ids names the partner bead(s) to tag serialize_with on both sides)
+    | 'could-not-assess' (SABLE-47try — THE CHECK DID NOT RUN, because the
+    dispatching bead's footprint was PRESENT but unreadable).
 
-    'could-not-assess' exists so that a check which never ran can no longer be
-    reported as one that ran and found nothing. It is a distinct outcome
-    precisely because 'none' is a POSITIVE claim — "I compared footprints and
-    they are disjoint" — and the old empty-footprint short-circuit returned it
-    without comparing anything.
+    'no-declaration' and 'could-not-assess' both exist so that a check which
+    never ran can no longer be reported as one that ran and found nothing —
+    and they are DIFFERENT never-ran reasons, not one: 'could-not-assess' is a
+    footprint source that was present and unreadable (refuses the spawn,
+    SABLE-47try); 'no-declaration' is no source present at all (releases the
+    spawn, but says so loudly — SABLE-e2ic3). Collapsing 'no-declaration' into
+    'none' is the exact defect SABLE-e2ic3 is about: a caller reading 'none'
+    cannot tell "checked, clean" from "nothing to check with", and the two
+    read identically on every normal run.
 
     `warnings` is the non-fatal channel: conditions that degrade the check
     without preventing it (an IN-PROGRESS bead whose own footprint could not be
@@ -778,11 +797,23 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict],
             f"({', '.join(mine.unreadable_sources)} present but naming no path) "
             "— the overlap check below ran against a possibly-incomplete footprint.")
     if not my_files:
-        # The genuine declares-nothing case: no footprint source was present at
-        # all. This bead collides with nothing and MUST still dispatch — see the
-        # do-not clause on SABLE-47try. A gate that can never release is
-        # indistinguishable from correct caution.
-        return OverlapVerdict("none", warnings=tuple(warnings))
+        # SABLE-e2ic3: the genuine declares-nothing case — no footprint source
+        # was present at all (mine.unreadable_sources is necessarily empty here,
+        # or could_not_assess above would have already returned). This bead
+        # MUST still dispatch — see the do-not clause on SABLE-47try, a gate
+        # that can never release is indistinguishable from correct caution —
+        # but this is NOT the same fact as a footprint that was compared and
+        # found disjoint. Reported as its own decision so the caller can say so
+        # loudly instead of the two silently reading the same on every run.
+        return OverlapVerdict(
+            "no-declaration",
+            f"{ids_label} declares NO file footprint at all (no wip_claims "
+            "metadata, no '## File footprint' section, no WIP-CLAIMS line). "
+            "The overlap SCHEDULING CONSTRAINT has no input to compare this "
+            "dispatch against, and cannot tell it apart from one that WAS "
+            "checked and found clean. Dispatching normally — this is NOT a "
+            "CLEAR verdict, only an absence of anything to check.",
+            warnings=tuple(warnings))
     hits: list[tuple[str, str, list[str]]] = []
     for other in in_progress:
         oid = other.get("id", "")
@@ -832,6 +863,34 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict],
         tagged,
         tuple(warnings),
     )
+
+
+def widening_report(declared, actual) -> str | None:
+    """Compare a bead's DECLARED footprint against what a worker ACTUALLY
+    changed and name the paths that were never claimed, or None when `actual`
+    is fully covered by `declared` (SABLE-e2ic3, suggested-approach item 3 —
+    the pure comparison PRIMITIVE; the push-side ENFORCEMENT of it already
+    exists at HEAD via SABLE-pfbjw's ground-truth branch-ref diff in
+    post-push-merge-notify.sh, which is out of this bead's declared footprint
+    — re-solving it here would be the SABLE-12rin trap).
+
+    Reported NEUTRALLY — 'declaration and delivery disagree' — never as a
+    discipline finding against the worker: a manager's footprint is a guess at
+    a code layout it may not have read, and that guess is sometimes wrong
+    about WHERE the code lives while the worker's edit is entirely correct
+    (the o9b8u / SABLE-4wo60 class — a declared-but-never-touched file next to
+    an undeclared-but-correct one looks identical to genuine drift from here,
+    and only a human reading the diff can tell them apart).
+
+    declared EMPTY + actual NON-EMPTY is reported too, BY NAME, rather than as
+    a vacuous empty-vs-empty 'no discrepancy' — an empty declaration must not
+    defeat this comparison the same way it defeats the spawn-time gate
+    (SABLE-p9n7k's class of vacuous pass)."""
+    undeclared = sorted(set(actual) - set(declared))
+    if not undeclared:
+        return None
+    return ("declaration and delivery disagree — changed but never declared: "
+            + ", ".join(undeclared))
 
 
 def tag_serialize_with(bead_id: str, partner_id: str) -> None:
@@ -1975,6 +2034,13 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(
                 f"sable-spawn-worker: overlap-constraint blocked — {overlap_verdict.message}\n")
             return 11
+        if overlap_verdict.decision == "no-declaration":
+            # SABLE-e2ic3: distinct from 'none' (checked, clean) — LOUD, but NOT
+            # a refusal. A gate that can never release is indistinguishable from
+            # correct caution (SABLE-47try); this only ends the SILENCE around
+            # the case where nothing was checked, not the release itself.
+            sys.stderr.write(
+                f"sable-spawn-worker: NO-DECLARATION — {overlap_verdict.message}\n")
 
         # --- claims land HERE (SABLE-fz8kd), below the LAST gate that can
         # refuse. They used to run above the overlap check, so a denied dispatch
