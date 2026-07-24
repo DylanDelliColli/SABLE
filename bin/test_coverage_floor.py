@@ -51,7 +51,10 @@ index 1111111..2222222 100644
 
 def test_a_moved_test_function_nets_to_zero():
     """Removed in one hunk, re-added elsewhere in the SAME diff (a rename/move)
-    is not pruning — only a NET removal counts."""
+    is not pruning — only a NET reduction in the function-COUNT counts
+    (SABLE-owix4). removed_test_functions/added_test_functions stay raw
+    (informational — they still name what moved), the netting happens via
+    net_test_function_delta, not via name subtraction."""
     diff = """\
 diff --git a/bin/test_foo.py b/bin/test_foo.py
 --- a/bin/test_foo.py
@@ -66,7 +69,120 @@ diff --git a/bin/test_bar.py b/bin/test_bar.py
 """
     signal = cf.detect_pruning(diff)
     assert not signal.is_pruning
-    assert signal.removed_test_functions == []
+    assert signal.net_test_function_delta == 0
+    assert signal.removed_test_functions == ["test_moved"]
+    assert signal.added_test_functions == ["test_moved"]
+
+
+def test_renamed_and_strengthened_test_is_not_pruning():
+    """The concrete SABLE-owix4 / SABLE-be4lo.7 instance: a test is renamed
+    to reflect a STRONGER invariant (two unordered writers pinned ->
+    three writers pinned in source order). One def name vanishes and a
+    differently-named, stronger successor appears elsewhere in the same
+    file. THE PROPERTY THE FLOOR WANTS is "did coverage decrease" — it did
+    not, it went up — so this must be allowed silently, with no coverage
+    -delta check required at all, exactly like a plain move/rename."""
+    diff = """\
+diff --git a/bin/test_sable_gate_promote_lib.py b/bin/test_sable_gate_promote_lib.py
+--- a/bin/test_sable_gate_promote_lib.py
++++ b/bin/test_sable_gate_promote_lib.py
+@@ -50,10 +50,12 @@
+-def test_the_module_has_exactly_two_writers_to_the_integration_branch():
+-    writers = {"optimus", "tarzan"}
+-    assert set(get_writers()) == writers
++def test_the_module_has_exactly_three_writers_to_the_integration_branch():
++    writers = ["optimus", "tarzan", "chuck"]
++    assert get_writers_in_source_order() == writers
++    assert "lincoln" not in get_writers_in_source_order()
+"""
+    signal = cf.detect_pruning(diff)
+    assert not signal.is_pruning
+    decision = cf.evaluate_coverage_floor(signal, None, None)
+    assert decision.action == cf.ACTION_ALLOW
+    assert "not a pruning diff" in decision.reason
+
+
+def test_genuine_deletion_with_no_replacement_is_pruning_and_denies():
+    """NEGATIVE CONTROL (SABLE-owix4): a test removed with nothing added to
+    replace it anywhere in the diff is a real net reduction in the
+    function-count and must still be flagged pruning and denied absent a
+    passing coverage check or an override — proving the fix does not
+    regress into "never deny anything"."""
+    diff = """\
+diff --git a/bin/test_foo.py b/bin/test_foo.py
+--- a/bin/test_foo.py
++++ b/bin/test_foo.py
+@@ -10,6 +10,0 @@
+-def test_edge_case_that_covers_the_branch():
+-    assert foo(-1) == "negative"
+-
+"""
+    signal = cf.detect_pruning(diff)
+    assert signal.is_pruning
+    assert signal.net_test_function_delta == -1
+    denied_no_check = cf.evaluate_coverage_floor(signal, None, None)
+    assert denied_no_check.action == cf.ACTION_DENY
+    denied_failed_check = cf.evaluate_coverage_floor(signal, False, None)
+    assert denied_failed_check.action == cf.ACTION_DENY
+
+
+def test_split_test_into_two_is_not_pruning():
+    """Recommended additional shape (SABLE-owix4): one test split into two
+    is a net INCREASE in function count and must pass, same net-zero-or
+    -positive logic as a plain rename."""
+    diff = """\
+diff --git a/bin/test_foo.py b/bin/test_foo.py
+--- a/bin/test_foo.py
++++ b/bin/test_foo.py
+@@ -1,4 +1,8 @@
+-def test_positive_and_negative():
+-    assert foo(1) == 1
+-    assert foo(-1) == -1
++def test_positive():
++    assert foo(1) == 1
++
++def test_negative():
++    assert foo(-1) == -1
+"""
+    signal = cf.detect_pruning(diff)
+    assert not signal.is_pruning
+    assert signal.net_test_function_delta == 1
+    decision = cf.evaluate_coverage_floor(signal, None, None)
+    assert decision.action == cf.ACTION_ALLOW
+
+
+def test_parametrized_merge_is_pruning_shaped_but_passes_with_coverage_check():
+    """Recommended additional shape (SABLE-owix4): several tests merged into
+    one @pytest.mark.parametrize function IS a net DECREASE in def count
+    (3 -> 1) by this measure — a static diff scan cannot see that the
+    parametrize cases replay every input, so this shape is deliberately
+    left pruning-shaped rather than special-cased (that would be exactly
+    the "another spelling" trap this bead exists to avoid). It must not be
+    allowed outright, and it must not be permanently denied either: routed
+    to the real coverage-delta check, a passing result (patch coverage
+    held, as it does when the cases are preserved) allows it."""
+    diff = """\
+diff --git a/bin/test_foo.py b/bin/test_foo.py
+--- a/bin/test_foo.py
++++ b/bin/test_foo.py
+@@ -1,9 +1,5 @@
+-def test_foo_zero():
+-    assert foo(0) == 0
+-def test_foo_one():
+-    assert foo(1) == 1
+-def test_foo_negative():
+-    assert foo(-1) == -1
++@pytest.mark.parametrize("x,expected", [(0, 0), (1, 1), (-1, -1)])
++def test_foo(x, expected):
++    assert foo(x) == expected
+"""
+    signal = cf.detect_pruning(diff)
+    assert signal.is_pruning
+    assert signal.net_test_function_delta == -2
+    denied = cf.evaluate_coverage_floor(signal, None, None)
+    assert denied.action == cf.ACTION_DENY
+    allowed = cf.evaluate_coverage_floor(signal, True, None)
+    assert allowed.action == cf.ACTION_ALLOW
 
 
 # --------------------------------------------------------------------------
