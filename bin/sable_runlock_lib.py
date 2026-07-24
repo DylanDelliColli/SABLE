@@ -371,7 +371,15 @@ def read_process_table(debug: dict | None = None) -> list[ProcInfo]:
     scan_processes/clearance) can see, since that instrument starts from the
     ALREADY-parsed rows. Never used to alter behaviour."""
     try:
-        proc = subprocess.run(["ps", "-eo", "pid=,ppid=,uid=,args="],
+        # -ww: DO NOT let ps truncate `args` to terminal width (SABLE-skrdj
+        # revise #1, round 5 — the actual defect four rounds of process-table
+        # instrumentation were built to find). Without it, ps truncates to
+        # COLUMNS, which is 80 in the ci-verify clean room: the runner
+        # child's args cut mid-word ("...python -m pyte"), missing "pytest"
+        # entirely, so it fails EVERY SUITE_PATTERNS regex and is silently
+        # invisible to classification — not dropped by any of the filters
+        # measured so far, but never able to reach them with intact args.
+        proc = subprocess.run(["ps", "-ww", "-eo", "pid=,ppid=,uid=,args="],
                               capture_output=True, text=True)
     except OSError as exc:
         raise ProbeError(f"cannot run ps: {exc}") from exc

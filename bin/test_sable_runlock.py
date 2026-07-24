@@ -33,6 +33,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -361,6 +362,51 @@ def test_unattributable_candidate_makes_clearance_not_clear(reg, monkeypatch):
     assert "42" in reason                             # ppid
     assert "/elsewhere" in reason                      # cwd
     assert "hooks/test/test-role.sh" in reason          # argv
+
+
+def test_read_process_table_uses_ww_so_columns_does_not_truncate_args(monkeypatch):
+    """SABLE-skrdj revise #1, round 5 — the ACTUAL root cause behind rounds
+    1-4's process-table instrumentation: `ps` truncates its `args` column to
+    terminal width unless invoked with `-ww`. The ci-verify clean room runs
+    at COLUMNS=80 (no controlling tty), which cut a real runner's argv
+    mid-word ("...python -m pyte") — missing "pytest" entirely, so it failed
+    EVERY SUITE_PATTERNS regex and was invisible to classification. Not
+    dropped by any filter measured so far; it never had the substring to
+    match because ps had already thrown it away.
+
+    A REAL subprocess and a REAL `ps` invocation, deliberately breaking this
+    file's own "the process table is INJECTED in every unit case" rule
+    (see module docstring): the defect is IN read_process_table's own `ps`
+    invocation, so an injected table cannot exercise it — this is the one
+    case where faking the table would fake away the bug.
+
+    Deterministic without CI: force COLUMNS=80 in the environment (verified
+    locally that `ps` honours it even with no tty attached) and give the
+    child a long-enough argv that truncation would cut the suite-shape
+    marker off the end."""
+    monkeypatch.setenv("COLUMNS", "80")
+    marker = "bin/test_columns_repro_marker.py"
+    padding = "x" * 60
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         f"import time; time.sleep(5)  # {padding} {marker}"])
+    try:
+        found = None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            for p in rl.read_process_table():
+                if p.pid == proc.pid:
+                    found = p
+                    break
+            if found is not None:
+                break
+            time.sleep(0.05)
+        assert found is not None, "spawned process never appeared in the process table"
+        assert marker in found.args, (
+            f"args truncated by COLUMNS=80 (missing {marker!r}): {found.args!r}")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
 
 
 def test_probe_failure_is_could_not_assess(reg, monkeypatch):
