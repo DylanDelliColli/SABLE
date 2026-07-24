@@ -2277,6 +2277,103 @@ def test_real_bd_foreign_overlap_denies_and_leaves_the_bundle_open(sock, real_bd
         assert assignee == "", f"{bid} left assigned to {assignee!r} by a refusal"
 
 
+# --- SABLE-xrcce: the repeated `--bundle` flag form must not silently drop --
+
+
+def test_real_bd_bundle_repeated_flag_form_dispatches_all_three(sock, real_bd_repo):
+    """TEST SPEC (SABLE-xrcce), the leg a unit test on argparse alone would not
+    catch: THREE REAL beads in a REAL bd store, dispatched with the REPEATED
+    `--bundle` flag form (the exact shape from the bug report:
+    `--bundle A --bundle B`), not the comma-separated form the other bundle
+    integration test uses. Pre-fix, argparse's default store action kept only
+    the LAST `--bundle` value, so `sib_a` never made it into the parsed bundle
+    at all: it stayed OPEN while lead + sib_b went in_progress, and the
+    dispatch prompt never named it. Post-fix, ALL THREE must read in_progress
+    and the tool's stdout/prompt must name all three."""
+    _assert_bin_is_this_branch()
+    lead = _new_bead(real_bd_repo, "repeated-flag bundle lead", _FOOTPRINT)
+    sib_a = _new_bead(real_bd_repo, "repeated-flag bundle sibling a", _FOOTPRINT)
+    sib_b = _new_bead(real_bd_repo, "repeated-flag bundle sibling b", _FOOTPRINT)
+
+    with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as wt:
+        r = subprocess.run(
+            ["python3", str(BIN), lead,
+             "--bundle", sib_a, "--bundle", sib_b,
+             "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=_real_bd_env(sock, dd),
+            cwd=real_bd_repo,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "SCHEDULING CONSTRAINT" not in r.stderr
+        time.sleep(0.6)
+
+        assert len(_worker_panes(sock, lead)) == 1
+        prompt = (Path(dd) / f"{lead}.md").read_text()
+        # THE DEFECT, precisely: sib_a is the FIRST --bundle value, the one
+        # argparse's pre-fix _StoreAction silently discarded.
+        assert sib_a in prompt, "the first --bundle occurrence was dropped"
+        assert sib_b in prompt
+
+    for bid in (lead, sib_a, sib_b):
+        status, assignee = _status_and_assignee(real_bd_repo, bid)
+        assert status == "in_progress", bid
+        assert assignee, bid
+
+
+# --- SABLE-zv0h6: a failed pre-spawn refresh must reach the WORKER's prompt -
+
+
+def test_reused_dirty_worktree_dispatch_warns(sock, real_bd_repo, tmp_path):
+    """TEST SPEC (SABLE-zv0h6): a REAL reused (linked) git worktree, left
+    DIRTY with an uncommitted modification, dispatched via `--worktree`. The
+    pre-spawn refresh's rebase must fail on the dirty tree (real git's own
+    "cannot rebase: You have unstaged changes"), and the fix requires that
+    fact — and the dirty path — to reach the rendered dispatch prompt, not
+    just the manager's stderr. The uncommitted change must still be present
+    afterward: this dispatch must not be the thing that discards it."""
+    _assert_bin_is_this_branch()
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    primary = tmp_path / "primary"
+    subprocess.run(["git", "clone", "-q", str(origin), str(primary)], check=True)
+    (primary / "shared_target.py").write_text("v1\n")
+    subprocess.run(["git", "-C", str(primary), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(primary), "-c", "user.email=t@t.example",
+                    "-c", "user.name=t", "commit", "-q", "-m", "init"], check=True)
+    subprocess.run(["git", "-C", str(primary), "branch", "-M", "main"], check=True)
+    subprocess.run(["git", "-C", str(primary), "push", "-q", "origin", "main"], check=True)
+
+    worktree = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(primary), "worktree", "add", "-q",
+                    "-b", "wk-reused-dirty", str(worktree), "main"], check=True)
+
+    dirty_content = "UNCOMMITTED — the only copy of this work\n"
+    dirty_path = worktree / "shared_target.py"
+    dirty_path.write_text(dirty_content)
+
+    lead = _new_bead(real_bd_repo, "reused dirty worktree lead",
+                     "Story.\n\n## Test spec\nx")
+
+    with tempfile.TemporaryDirectory() as dd:
+        env = _real_bd_env(sock, dd)
+        env["SABLE_BASE_BRANCH"] = "origin/main"
+        r = subprocess.run(
+            ["python3", str(BIN), lead, "--worktree", str(worktree), "--model", "haiku"],
+            capture_output=True, text=True, env=env, cwd=real_bd_repo,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "cannot rebase" in r.stderr, r.stderr
+        assert "refresh:" in r.stderr
+
+        prompt = (Path(dd) / f"{lead}.md").read_text()
+        assert "PRE-SPAWN REFRESH FAILED" in prompt
+        assert "shared_target.py" in prompt
+        assert "DO NOT DISCARD" in prompt
+
+    # THE POINT: nothing in this dispatch discarded the only copy.
+    assert dirty_path.read_text() == dirty_content
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
