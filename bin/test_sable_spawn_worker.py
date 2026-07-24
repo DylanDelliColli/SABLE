@@ -1025,6 +1025,102 @@ def test_parse_bundle_ids_empty_or_none():
     assert ssw.parse_bundle_ids("", "X-1") == []
 
 
+# --- SABLE-xrcce: --bundle silently kept only the last repeated flag --------
+
+
+def test_bundle_flag_accumulates_every_occurrence():
+    """TEST SPEC (SABLE-xrcce): parse an argv with three --bundle occurrences
+    through the REAL argparse parser; assert all three ids survive. Negative
+    control in the SAME test: a single --bundle still yields exactly one, and
+    no --bundle yields an empty list — so the fix is not just 'returns more'."""
+    p = ssw.build_arg_parser()
+
+    ns = p.parse_args(["X-1", "--bundle", "Y-2", "--bundle", "Z-3", "--bundle", "W-4"])
+    assert ssw.resolve_bundle_ids(ns.bundle, "X-1") == ["Y-2", "Z-3", "W-4"]
+
+    ns_one = p.parse_args(["X-1", "--bundle", "Y-2"])
+    assert ssw.resolve_bundle_ids(ns_one.bundle, "X-1") == ["Y-2"]
+
+    ns_none = p.parse_args(["X-1"])
+    assert ssw.resolve_bundle_ids(ns_none.bundle, "X-1") == []
+
+
+def test_bundle_flag_repeated_and_comma_forms_are_equivalent():
+    """The documented comma-separated form and the repeated-flag form (and a
+    mix of both) must all flatten to the identical result."""
+    p = ssw.build_arg_parser()
+    repeated = p.parse_args(["X-1", "--bundle", "Y-2", "--bundle", "Z-3"])
+    comma = p.parse_args(["X-1", "--bundle", "Y-2,Z-3"])
+    mixed = p.parse_args(["X-1", "--bundle", "Y-2", "--bundle", "Z-3,W-4"])
+    assert ssw.resolve_bundle_ids(repeated.bundle, "X-1") == ["Y-2", "Z-3"]
+    assert ssw.resolve_bundle_ids(comma.bundle, "X-1") == ["Y-2", "Z-3"]
+    assert ssw.resolve_bundle_ids(mixed.bundle, "X-1") == ["Y-2", "Z-3", "W-4"]
+
+
+def test_unclaimed_after_dispatch_names_the_bead_that_did_not_claim(monkeypatch):
+    """unclaimed_after_dispatch is the post-claim readback: given ids that were
+    supposed to reach in_progress, it re-reads each via `bd show` and returns
+    the ones that did not."""
+    beads = {
+        "X-1": {"id": "X-1", "status": "in_progress"},
+        "Y-2": {"id": "Y-2", "status": "in_progress"},
+        "Z-3": {"id": "Z-3", "status": "open"},  # dropped bead, did not claim
+    }
+
+    def fake_run(args):
+        assert args[:2] == ["bd", "show"]
+        return json.dumps([beads[args[2]]])
+
+    monkeypatch.setattr(ssw, "_run", fake_run)
+    assert ssw.unclaimed_after_dispatch(["X-1", "Y-2", "Z-3"]) == ["Z-3"]
+    assert ssw.unclaimed_after_dispatch(["X-1", "Y-2"]) == []
+
+
+def test_dispatch_fails_loud_when_a_bundled_bead_did_not_claim(monkeypatch, tmp_path, capsys):
+    """TEST SPEC (SABLE-xrcce): stub the claim path so one bundled bead stays
+    OPEN despite being asked for; assert main() exits non-zero and the message
+    NAMES the unclaimed bead. Reuses the _RecordingBd harness from the
+    SABLE-fz8kd claim-ordering tests, but overrides claim_bundle_beads so one
+    sibling's claim silently fails to land in the store — the exact shape of
+    the original defect, reproduced at the post-claim readback rather than at
+    the argparse layer."""
+    fp = "S.\n\n## File footprint\nunique.py"
+    lead = {"id": "X-1", "title": "lead", "labels": [], "status": "open",
+            "assignee": None, "description": fp}
+    sib_ok = {"id": "Y-2", "title": "sib ok", "labels": [], "status": "open",
+              "assignee": None, "description": fp}
+    sib_dropped = {"id": "Z-3", "title": "sib dropped", "labels": [], "status": "open",
+                   "assignee": None, "description": fp}
+    rec = _RecordingBd({"X-1": lead, "Y-2": sib_ok, "Z-3": sib_dropped})
+    monkeypatch.setattr(ssw, "_run", rec.run_read)
+    monkeypatch.setattr(ssw.subprocess, "run", rec.run_write)
+
+    # Simulate the original defect's outcome: the claim step runs but Z-3 never
+    # actually reaches in_progress in the store (a dropped bundle id, or any
+    # other claim-write failure the belt-and-suspenders claim swallows).
+    def half_claim(bundle, lane):
+        for b in bundle:
+            if b.get("id") == "Y-2":
+                b["status"] = "in_progress"
+                b["assignee"] = lane or "test-worker"
+        # Z-3 is deliberately left untouched — the silent drop.
+
+    monkeypatch.setattr(ssw, "claim_bundle_beads", half_claim)
+    for var in ("SABLE_WORKER_PANE", "CLAUDE_AGENT_NAME", "SABLE_LANE", "SABLE_ROLE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("SABLE_MAX_LOAD_PER_CORE", "0")
+    monkeypatch.setenv("SABLE_DISPATCH_DIR", str(tmp_path / "dd"))
+    monkeypatch.setenv("SABLE_DISPATCH_READY_TIMEOUT", "0")
+
+    code = ssw.main(["X-1", "--worktree", str(tmp_path / "wt"), "--session", "sable",
+                     "--model", "haiku", "--bundle", "Y-2", "--bundle", "Z-3"])
+    assert code == 14
+    err = capsys.readouterr().err
+    assert "Z-3" in err
+    # No worker was spawned: no tmux new-window write was issued.
+    assert not any("new-window" in c for c in rec.calls)
+
+
 def test_bundle_ready_for_done_all_closed():
     assert ssw.bundle_ready_for_done(
         ["Y-2", "Z-3"], {"Y-2": "closed", "Z-3": "closed"}) is None
@@ -1078,6 +1174,81 @@ def test_assemble_dispatch_prompt_without_bundle_has_no_bundle_section():
     assert "Bundle contract" not in p
     assert "Bundled bead" not in p
     assert "bd close X-1" in p
+
+
+# --- SABLE-zv0h6: a failed pre-spawn refresh must reach the WORKER, not just
+# the manager's stderr ---------------------------------------------------
+
+def test_failed_refresh_warning_reaches_the_dispatch_prompt():
+    """TEST SPEC (SABLE-zv0h6): stub refresh_worktree's return value straight
+    into assemble_dispatch_prompt (as main() now does); assert the rendered
+    prompt CONTAINS the warning text. Against pre-fix code this must fail,
+    since the string was written only to stderr and never threaded through."""
+    warning = ("refresh: rebase of /wt/wk-x on origin/tmux-only failed and was "
+               "aborted: error: cannot rebase: You have unstaged changes.")
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="haiku",
+        refresh_warning=warning,
+    )
+    assert warning in p
+    assert "PRE-SPAWN REFRESH FAILED" in p
+
+
+def test_dirty_worktree_paths_are_named_in_the_prompt():
+    """TEST SPEC (SABLE-zv0h6): with a fake worktree reporting two modified
+    paths (as worktree_dirty_paths would from `git status --porcelain`),
+    assert BOTH paths appear in the prompt alongside a do-not-discard
+    instruction — the actionable fact is WHICH files, not just 'dirty'."""
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="haiku",
+        refresh_warning="refresh: rebase of /wt/wk-x failed and was aborted: "
+                         "error: cannot rebase: You have unstaged changes.",
+        dirty_paths=["bin/sable_runlock_lib.py", "bin/test_sable_runlock_lib.py"],
+    )
+    assert "bin/sable_runlock_lib.py" in p
+    assert "bin/test_sable_runlock_lib.py" in p
+    assert "DO NOT DISCARD" in p
+
+
+def test_successful_refresh_emits_no_warning_stanza():
+    """KNOWN-POSITIVE, LOAD-BEARING (SABLE-zv0h6): on a SUCCESSFUL refresh (no
+    refresh_warning, the default), the prompt must carry NO warning stanza at
+    all. Without this the fix degrades into a banner on every dispatch, which
+    trains workers to skip it — the SABLE-r5pfw erosion this bead's own
+    argument rests on."""
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="haiku",
+    )
+    assert "PRE-SPAWN REFRESH FAILED" not in p
+    assert "DO NOT DISCARD" not in p
+
+
+def test_worktree_dirty_paths_reads_git_status_porcelain(monkeypatch):
+    """worktree_dirty_paths strips the two-char porcelain status prefix and
+    returns the bare paths; a clean tree (no output) yields []."""
+    def fake_run(args, **kwargs):
+        assert args[:4] == ["git", "-C", "/wt/wk-x", "status"]
+        return subprocess.CompletedProcess(
+            args, 0,
+            " M bin/sable_runlock_lib.py\n?? bin/test_sable_runlock_lib.py\n", "")
+
+    monkeypatch.setattr(ssw.subprocess, "run", fake_run)
+    assert ssw.worktree_dirty_paths("/wt/wk-x") == [
+        "bin/sable_runlock_lib.py", "bin/test_sable_runlock_lib.py"]
+
+
+def test_worktree_dirty_paths_empty_on_git_failure(monkeypatch):
+    """Best-effort, never raises: a failed `git status` yields [] rather than
+    propagating — the warning itself must still reach the worker even if this
+    enrichment can't run."""
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 128, "", "fatal: not a git repository")
+
+    monkeypatch.setattr(ssw.subprocess, "run", fake_run)
+    assert ssw.worktree_dirty_paths("/not/a/repo") == []
 
 
 # --- plant-and-fail verdict requirement (SABLE-4jogz) ------------------------
