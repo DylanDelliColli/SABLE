@@ -132,6 +132,45 @@ if ! printf '%s' "$out" | grep -q 'additionalContext'; then pass "jiqm: PreCompa
 out="$(cd "$PROJ" && printf '%s' "$SS" | CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
 if printf '%s' "$out" | grep -q '"hookEventName": "SessionStart"'; then pass "jiqm: SessionStart leg still emits valid hookEventName+additionalContext"; else fail "jiqm: SessionStart leg still emits valid hookEventName+additionalContext" "got: ${out:0:200}"; fi
 
+# ---------- SABLE-thx70: LOUD ON SHADOWING ----------
+# Six days of role-card edits went dark because a stale project-local copy
+# silently outranked a freshly-edited user-level one with no event. Precedence
+# stays project-first; the fix is that the disagreement is no longer silent.
+# The negative controls are load-bearing: without them this would warn on
+# every ordinary boot (either shape alone, or two byte-identical copies, is
+# the normal, unremarkable case).
+SHADOW="$(mktemp -d)"
+mkdir -p "$SHADOW/.claude/sable/roles"
+SHADOW_HOME="$(mktemp -d)"
+mkdir -p "$SHADOW_HOME/.claude/sable/roles"
+
+# both present and DIFFER -> warns, names both paths, precedence unchanged (project wins)
+printf 'PROJECT_SHADOW_MARKER\n' > "$SHADOW/.claude/sable/roles/cockpit.md"
+printf 'USER_SHADOW_MARKER\n' > "$SHADOW_HOME/.claude/sable/roles/cockpit.md"
+out="$(cd "$SHADOW" && printf '%s' "$SS" | HOME="$SHADOW_HOME" CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
+err="$(cd "$SHADOW" && printf '%s' "$SS" | HOME="$SHADOW_HOME" CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>&1 1>/dev/null)"
+if printf '%s' "$out" | grep -q 'PROJECT_SHADOW_MARKER'; then pass "thx70: differing shadow still resolves project-local (precedence unchanged)"; else fail "thx70: differing shadow still resolves project-local (precedence unchanged)" "got: ${out:0:200}"; fi
+if printf '%s' "$err" | grep -q 'SABLE-ROLE-CARD-SHADOWED'; then pass "thx70: differing shadow warns with fixed token"; else fail "thx70: differing shadow warns with fixed token" "got: ${err:0:300}"; fi
+if printf '%s' "$err" | grep -q "$SHADOW/.claude/sable/roles/cockpit.md" && printf '%s' "$err" | grep -q "$SHADOW_HOME/.claude/sable/roles/cockpit.md"; then pass "thx70: warning names both paths"; else fail "thx70: warning names both paths" "got: ${err:0:400}"; fi
+
+# NEGATIVE CONTROL 1: only project-local present -> no warning
+rm -f "$SHADOW_HOME/.claude/sable/roles/cockpit.md"
+err="$(cd "$SHADOW" && printf '%s' "$SS" | HOME="$SHADOW_HOME" CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>&1 1>/dev/null)"
+if ! printf '%s' "$err" | grep -q 'SABLE-ROLE-CARD-SHADOWED'; then pass "thx70: NEGATIVE CONTROL only-project-local -> no warning"; else fail "thx70: NEGATIVE CONTROL only-project-local -> no warning" "got: ${err:0:200}"; fi
+
+# NEGATIVE CONTROL 2: only user-level present -> no warning
+rm -f "$SHADOW/.claude/sable/roles/cockpit.md"
+printf 'USER_SHADOW_MARKER\n' > "$SHADOW_HOME/.claude/sable/roles/cockpit.md"
+err="$(cd "$SHADOW" && printf '%s' "$SS" | HOME="$SHADOW_HOME" CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>&1 1>/dev/null)"
+if ! printf '%s' "$err" | grep -q 'SABLE-ROLE-CARD-SHADOWED'; then pass "thx70: NEGATIVE CONTROL only-user-level -> no warning"; else fail "thx70: NEGATIVE CONTROL only-user-level -> no warning" "got: ${err:0:200}"; fi
+
+# NEGATIVE CONTROL 3: both present and IDENTICAL -> no warning
+printf 'USER_SHADOW_MARKER\n' > "$SHADOW/.claude/sable/roles/cockpit.md"
+err="$(cd "$SHADOW" && printf '%s' "$SS" | HOME="$SHADOW_HOME" CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>&1 1>/dev/null)"
+if ! printf '%s' "$err" | grep -q 'SABLE-ROLE-CARD-SHADOWED'; then pass "thx70: NEGATIVE CONTROL identical content -> no warning"; else fail "thx70: NEGATIVE CONTROL identical content -> no warning" "got: ${err:0:200}"; fi
+
+rm -rf "$SHADOW" "$SHADOW_HOME"
+
 rm -rf "$PROJ" "$HOMETMP" "$NOPROJ" "$LS" "$LS2" "$LS3"
 echo
 echo "=========================================="
