@@ -866,6 +866,82 @@ def test_view_and_reap_all_scope_agree_on_done_worker_pane(sock):
     assert remaining.returncode != 0 or not remaining.stdout.strip()
 
 
+# --- SABLE-h1fa7: sable-worker-status answered a LANE question when asked a
+# FLEET one -- it filtered panes to the caller's own lane with NO indication
+# it had done so. Byte-indistinguishable from a genuine fleet-wide "nothing
+# else is running", so a stranded-claim sweep reading tarzan's own-lane table
+# nearly released four OTHER lanes' live workers' claims. Real tmux panes
+# across two lanes here (not mocked -- this tool reads live pane state), to
+# prove the fix against the actual failure, not a stand-in for it. ---
+
+def _three_lane_session(sock):
+    """Session 'w': pane0 = tarzan's ONE live worker (bead-t, running); panes
+    1-2 = optimus's TWO MORE live workers (bead-o1/bead-o2, running) --
+    reconstructs the incident shape: the caller's own lane has a single live
+    pane, while another lane has MULTIPLE live (not done) panes a silently
+    lane-scoped listing would make invisible."""
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.0", "worker", "bead-t", "running")
+    _tag_lane(sock, "w.0", "tarzan")
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.1", "worker", "bead-o1", "running")
+    _tag_lane(sock, "w.1", "optimus")
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.2", "worker", "bead-o2", "running")
+    _tag_lane(sock, "w.2", "optimus")
+
+
+def test_default_scope_named_and_hidden_count_for_real_panes(sock):
+    """THE REGRESSION THAT MATTERS: a lane-scoped default listing must never
+    read as a fleet-wide "nothing else is running". tarzan's default view
+    must name its own scope, show only its own pane (bead-t), and STATE that
+    two panes are hidden -- proof a reader cannot conclude bead-o1/bead-o2
+    aren't running, the exact conclusion that would have released four real
+    workers' claims in the recorded incident. --all then shows all three,
+    labelled all-lanes."""
+    _three_lane_session(sock)
+
+    mine = _run_as(sock, "tarzan")
+    assert mine.returncode == 0, mine.stderr
+    assert "bead-t" in mine.stdout, mine.stdout
+    assert "bead-o1" not in mine.stdout and "bead-o2" not in mine.stdout, mine.stdout
+    assert "lane=tarzan" in mine.stdout, mine.stdout
+    assert "2 hidden" in mine.stdout, mine.stdout
+
+    everything = _run_as(sock, "tarzan", "--all")
+    assert everything.returncode == 0, everything.stderr
+    assert "bead-t" in everything.stdout, everything.stdout
+    assert "bead-o1" in everything.stdout, everything.stdout
+    assert "bead-o2" in everything.stdout, everything.stdout
+    assert "all-lanes" in everything.stdout, everything.stdout
+
+
+def test_json_output_carries_scope_metadata(sock):
+    """--json exposes the same scope facts machine-readably (lane/shown/
+    hidden) so a scripted caller -- e.g. the stranded-claim sweep that
+    motivated this bead -- can check for hidden panes programmatically
+    instead of grepping table text."""
+    _three_lane_session(sock)
+
+    mine = _run_as(sock, "tarzan", "--json")
+    assert mine.returncode == 0, mine.stderr
+    payload = json.loads(mine.stdout)
+    assert payload["scope"]["lane"] == "tarzan"
+    assert payload["scope"]["shown"] == 1
+    assert payload["scope"]["hidden"] == 2
+
+    everything = _run_as(sock, "tarzan", "--all", "--json")
+    assert everything.returncode == 0, everything.stderr
+    payload_all = json.loads(everything.stdout)
+    assert payload_all["scope"]["lane"] is None
+    assert payload_all["scope"]["shown"] == 3
+    assert payload_all["scope"]["hidden"] == 0
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
