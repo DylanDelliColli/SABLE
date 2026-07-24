@@ -144,7 +144,11 @@ class Samples(list):
     four replaced round three's substring-based presence check (a false
     positive risk tarzan caught) with a proper keyed lookup: the child's own
     row, found by its PARSED pid field, printed verbatim rather than
-    inferred from a capped sample.
+    inferred from a capped sample — the measurement that ended the hunt, by
+    showing `args` cut at '-m pyte'. Round five keeps that keyed lookup,
+    retires the now-redundant raw-ps presence check with its unbounded line
+    dump, and promotes the parse-drop counts out of instrumentation into
+    ProcessTable, where clearance() reports them on every call.
     """
 
     lead_diagnostics: list[dict]
@@ -178,20 +182,24 @@ def _lead_diagnostic(repo: Path, state: str, trace: list[dict], scan_debug: dict
 
     ROUND FOUR (tarzan): key the lookup by the child's own pid instead of
     characterising the population in buckets — bucket counts say where the
-    child ISN'T, never where it IS. Two independent, un-sampled answers:
-      - `child_row_in_parsed_table`: the child's OWN row (pid, ppid, uid,
-        args — untruncated) from `scan_debug["parsed_rows_full"]` (round
-        four's addition), found by matching the PARSED pid field. `None`
-        means the row never reached classification at all.
-      - `child_pid_first_field_in_raw_ps`: is the child present in the raw
-        `ps` text, matched on the first whitespace-delimited field (the pid
-        column) — NOT a substring of the whole line. Round three's
-        `child_pid_visible_in_raw_ps` used `str(child_pid) in line`, which a
-        ppid/uid column or a numeral embedded in some unrelated argv could
-        satisfy just as well (tarzan caught this: pid 17433 would
-        false-positive against a line starting with 117433, or one
-        containing "174330" anywhere) — so that flag never actually
-        established what its name claimed."""
+    child ISN'T, never where it IS. `child_row_in_parsed_table` is the child's
+    OWN row (pid, ppid, uid, args) from `scan_debug["parsed_rows_full"]`,
+    found by matching the PARSED pid field; `None` means the row never reached
+    classification at all. THIS IS THE MEASUREMENT THAT ENDED THE HUNT: it
+    printed `args` ending at '-m pyte' — two characters short of `pytest` —
+    which is how SABLE-mpz6s's argv truncation was finally seen instead of
+    inferred. It stays.
+
+    ROUND FIVE (this change) RETIRES round three's raw-ps presence check.
+    `child_pid_first_field_in_raw_ps` answered "is the child in the raw ps
+    text at all", and answering it required carrying every raw `ps` line
+    through the debug dict. Round four's keyed lookup answers a strictly
+    stronger question — not merely whether the child is present, but what its
+    row actually SAYS — so the weaker check now only adds an unbounded dump of
+    the whole process table to every diagnostic. A probe whose output is too
+    noisy to read trains its reader to stop reading it (SABLE-r5pfw), so it
+    goes; `read_debug`'s bounded drop COUNTS and samples remain, and are now
+    first-class fields of ProcessTable rather than instrumentation."""
     roots = rl.worktree_roots(str(repo))
 
     parsed_rows_full = scan_debug.get("parsed_rows_full", [])
@@ -202,23 +210,12 @@ def _lead_diagnostic(repo: Path, state: str, trace: list[dict], scan_debug: dict
             (label for label, pat in rl.SUITE_PATTERNS if pat.search(child_row["args"])),
             None)
 
-    raw_lines = read_debug.get("raw_lines", [])
-
-    def _first_field(line: str) -> str | None:
-        parts = line.strip().split(None, 1)
-        return parts[0] if parts else None
-
-    child_pid_first_field_in_raw_ps = any(
-        _first_field(line) == str(child_pid) for line in raw_lines)
-
     scan_debug_trimmed = {k: v for k, v in scan_debug.items() if k != "parsed_rows_full"}
-    read_debug_trimmed = {k: v for k, v in read_debug.items() if k != "raw_lines"}
     return {"state": state, "roots": roots, "suite_shaped_same_uid": trace,
-            "scan_debug": scan_debug_trimmed, "read_debug": read_debug_trimmed,
+            "scan_debug": scan_debug_trimmed, "read_debug": read_debug,
             "child_pid": child_pid,
             "child_row_in_parsed_table": child_row,
-            "child_row_matches_suite_pattern": child_row_matches_suite_pattern,
-            "child_pid_first_field_in_raw_ps": child_pid_first_field_in_raw_ps}
+            "child_row_matches_suite_pattern": child_row_matches_suite_pattern}
 
 
 def _sample_until_exit(proc: subprocess.Popen, repo: Path, limit: float = 90.0):
@@ -528,6 +525,100 @@ def test_real_pytest_run_is_never_clear_for_its_whole_duration(scratch):
         "absent from the table this decision used):\n"
         + "\n".join(repr(d) for d in samples.lead_diagnostics))
     assert rl.clearance(base=str(scratch)).state == rl.CLEAR, "not released on exit"
+
+
+def test_real_ps_output_conserves_lines_and_this_processs_own_argv(scratch):
+    """Real `ps`, no stub — the real output SHAPE, which a stub is exactly what
+    would hide (SABLE-n8ykm).
+
+    TWO conservation axes, because the first alone was TRUE AND USELESS against
+    SABLE-mpz6s and that near-miss is the reason this test exists:
+      LINES   — every raw line is kept or counted as dropped.
+      CONTENT — the one row whose truth this process can obtain independently
+                (its OWN, from /proc/self/cmdline) arrived in FULL. No line was
+                dropped during the truncation bug either; every line arrived
+                cut, and only a content check can see that."""
+    t = rl.read_process_table()
+
+    assert t.rows, "real ps returned no parseable rows at all"
+    assert t.conserves_lines, (
+        f"{t.raw_line_count} raw lines != {len(t.rows)} rows + "
+        f"{t.dropped_count} counted drops — rows vanished by an uncounted path")
+    assert t.truncated_evidence is None, t.truncated_evidence
+
+    with open(f"/proc/{os.getpid()}/cmdline", "rb") as fh:
+        real_argv = " ".join(p for p in fh.read().decode().split("\0") if p)
+    mine = next((p for p in t.rows if p.pid == os.getpid()), None)
+    assert mine is not None, "this process is missing from its own ps table"
+    assert mine.args == real_argv, (
+        f"ps rendered this process's argv as {mine.args!r} but the kernel says "
+        f"{real_argv!r} — the table is not carrying real command lines")
+
+
+def test_a_real_live_suite_is_detected_at_columns_80(scratch, monkeypatch):
+    """SABLE-mpz6s IN THE ENVIRONMENT THAT CAN ACTUALLY FAIL (standing rule S5).
+
+    The clean room differs from a dev host in exactly one respect that mattered:
+    it effectively runs at 80 columns, so `ps` cut every argv to 80 chars and a
+    live `python -m pytest ...` became `... -m pyte`, matching no SUITE_PATTERN.
+
+    THIS ASSERTS ON THE PROBE DIRECTLY, NOT ON THE CLEARANCE STATE, and that is
+    deliberate: during the body of a real pytest run conftest's REGISTRATION
+    already makes clearance BUSY, so a state-only assertion stays green with the
+    probe completely blind and would not have caught this defect. The probe is
+    the layer truncation broke, so the probe is the layer this measures."""
+    monkeypatch.setenv("COLUMNS", "80")
+    (scratch / "bin" / "test_scratch_slow.py").write_text(
+        "def test_slow():\n    import time\n    time.sleep(3.0)\n")
+    root = os.path.realpath(str(scratch))
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pytest", "bin/test_scratch_slow.py", "-q",
+         "-p", "no:cacheprovider"],
+        cwd=str(scratch), env=_child_env(),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    seen_rows, attributed_hits = [], 0
+    try:
+        while proc.poll() is None:
+            table = rl.read_process_table()
+            row = next((p for p in table.rows if p.pid == proc.pid), None)
+            if row is not None:
+                seen_rows.append(row.args)
+                attributed, _unattributable = rl.scan_processes([root], table=table)
+                if proc.pid in [c.pid for c in attributed]:
+                    attributed_hits += 1
+            time.sleep(SAMPLE_INTERVAL)
+    finally:
+        proc.wait(timeout=30)
+
+    # A row rendered as a bracketed comm ("[python]") is ps reporting that the
+    # kernel has NO argv for that pid — a process caught mid-exit, whose
+    # /proc/<pid>/cmdline is already empty. That is a different condition from a
+    # TRUNCATED argv (a strict prefix of a real one) and folding the two
+    # together would be wrong in both directions: it would red this test on an
+    # ordinary exit race, and it would let a genuinely empty argv read as
+    # "fine". Measured here: exactly 1 such sample in 111, at the tail of the
+    # run. Sensitivity is unaffected — under the planted defect all 111 samples
+    # were truncated AND unbracketed.
+    argv_rows = [a for a in seen_rows if not a.startswith("[")]
+
+    # ASSERT ON THE INSTRUMENT BEFORE ASSERTING WITH IT (SABLE-tgi9y): if the
+    # child's row was never sampled carrying a real argv, everything below
+    # passes over nothing.
+    assert argv_rows, (
+        "INCONCLUSIVE, not passing: the child pytest's row never appeared in "
+        "any sampled ps table with a readable argv, so the truncation "
+        f"assertions below would have run over an empty list. seen={seen_rows[:3]}")
+
+    # The canary token sits at the very END of the argv, comfortably past
+    # column 80 on any host — asserting on total length would be host-dependent.
+    truncated = [a for a in argv_rows if not a.endswith("-p no:cacheprovider")]
+    assert not truncated, (
+        f"ps truncated a real suite's argv at COLUMNS=80 ({len(truncated)} of "
+        f"{len(argv_rows)} samples). This is SABLE-mpz6s: {truncated[:3]}")
+    assert all("pytest" in a for a in argv_rows), argv_rows[:3]
+    assert attributed_hits, (
+        f"a real live pytest run was never attributed to its own repo by the "
+        f"process probe at COLUMNS=80; sampled rows: {seen_rows[:3]}")
 
 
 def test_a_pytest_run_of_a_single_file_registers_too(scratch):

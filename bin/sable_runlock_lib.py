@@ -359,17 +359,164 @@ class ProbeError(Exception):
     pass
 
 
-def read_process_table(debug: dict | None = None) -> list[ProcInfo]:
-    """The host process table via ps. Raises ProbeError if ps is unusable — the
-    probe's own failure is could-not-assess, never a quiet CLEAR.
+# Bounded on purpose: a verbatim sample makes a drop DIAGNOSABLE, an unbounded
+# dump makes the probe's output unreadable, and an unreadable probe trains its
+# reader to stop reading it (SABLE-r5pfw).
+PS_DROP_SAMPLE_CAP = 5
 
-    `debug`, when passed a dict, is filled with what happened BELOW the
-    caller's own filters, at parse time — SABLE-skrdj revise #1, round three:
-    a `ps` line whose fields don't split into (at least) four, or whose
-    pid/ppid/uid aren't parseable ints, is silently dropped by the two
-    `continue`s below, one layer further down than anything scan_debug (in
-    scan_processes/clearance) can see, since that instrument starts from the
-    ALREADY-parsed rows. Never used to alter behaviour."""
+
+@dataclass
+class ProcessTable:
+    """The parsed `ps` rows PLUS everything lost while building them.
+
+    TWO INDEPENDENT KINDS OF LOSS, tracked separately because they fail
+    differently and because conflating them cost this cluster five CI rounds:
+
+      ROW loss — a `ps` line that did not parse (too few fields, or a
+        non-integer pid/ppid/uid). Counted in `dropped_short` /
+        `dropped_unparseable`.
+      CONTENT loss — every line arrived, and arrived SHORT. `truncated_evidence`.
+
+    *** CONSERVATION OF LINES DOES NOT IMPLY CONSERVATION OF CONTENT, and
+    assuming it did is precisely the near-miss that let SABLE-mpz6s survive
+    four rounds of increasingly precise measurement. *** Round three's
+    conservation check (raw lines == parsed rows, both drop counters zero) was
+    TRUE AND USELESS against argv truncation: no line was dropped, every line
+    was cut. A parser that counts what it discards still cannot see what
+    arrived already short — so this type measures BOTH axes, and a table that
+    is lossy on EITHER cannot support a CLEAR.
+    """
+    rows: list[ProcInfo] = field(default_factory=list)
+    raw_line_count: int = 0
+    dropped_short: list[str] = field(default_factory=list)
+    dropped_unparseable: list[str] = field(default_factory=list)
+    truncated_evidence: str | None = None
+
+    # Reading the table as a plain sequence of rows stays natural; what it
+    # CANNOT do is read as a sequence and thereby lose the loss counters,
+    # because clearance() reports them from the table itself, not from an
+    # opt-in debug dict.
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    @property
+    def dropped_count(self) -> int:
+        return len(self.dropped_short) + len(self.dropped_unparseable)
+
+    @property
+    def is_lossy(self) -> bool:
+        return self.dropped_count > 0 or self.truncated_evidence is not None
+
+    @property
+    def conserves_lines(self) -> bool:
+        """Every raw line is accounted for: kept, or counted as dropped. This
+        is the falsifiable form of "the child was never there"."""
+        return self.raw_line_count == len(self.rows) + self.dropped_count
+
+    def integrity_summary(self) -> str:
+        """ALWAYS reported, clean or not — standing discipline 7's report axis.
+        A CLEAR derived from a lossy table must be distinguishable from a CLEAR
+        derived from a complete one, which means the complete case has to say
+        so out loud too."""
+        return (f"ps table integrity: {self.raw_line_count} raw lines -> "
+                f"{len(self.rows)} parsed rows, {len(self.dropped_short)} short, "
+                f"{len(self.dropped_unparseable)} unparseable, argv truncation: "
+                f"{'DETECTED' if self.truncated_evidence else 'none detected'}")
+
+    def loss_reasons(self) -> list[str]:
+        """One loud, self-explaining reason per kind of loss, naming the
+        verbatim lines. Empty for a clean table — so this never becomes
+        always-on noise."""
+        out: list[str] = []
+        if self.dropped_short:
+            out.append(
+                f"ps table is LOSSY: {len(self.dropped_short)} line(s) had fewer "
+                f"than 4 fields and were dropped at parse — the process table "
+                f"every clearance is decided against is incomplete, so an absence "
+                f"of candidates proves nothing. Sample (up to "
+                f"{PS_DROP_SAMPLE_CAP}): {self.dropped_short[:PS_DROP_SAMPLE_CAP]!r}")
+        if self.dropped_unparseable:
+            out.append(
+                f"ps table is LOSSY: {len(self.dropped_unparseable)} line(s) had a "
+                f"non-integer pid/ppid/uid and were dropped at parse — same "
+                f"consequence. Sample (up to {PS_DROP_SAMPLE_CAP}): "
+                f"{self.dropped_unparseable[:PS_DROP_SAMPLE_CAP]!r}")
+        if self.truncated_evidence:
+            out.append(f"ps table is TRUNCATED: {self.truncated_evidence}")
+        if not self.conserves_lines:
+            out.append(
+                f"ps table does not conserve lines: {self.raw_line_count} raw vs "
+                f"{len(self.rows)} rows + {self.dropped_count} counted drops — "
+                f"rows went missing by a path that is not counted at all")
+        return out
+
+
+def _as_process_table(table) -> ProcessTable:
+    """Accept either a real ProcessTable or a plain list of rows (which every
+    unit test injects, deliberately — see this module's test docstring). A
+    hand-built list has no loss to report, and says so rather than defaulting
+    to a silent zero that could be mistaken for a measured zero."""
+    if isinstance(table, ProcessTable):
+        return table
+    rows = list(table)
+    return ProcessTable(rows=rows, raw_line_count=len(rows))
+
+
+def _self_argv_truncation(rows: list[ProcInfo]) -> str | None:
+    """CONTENT conservation, checked against the one row whose true argv this
+    process can independently obtain: its OWN, from /proc/<self>/cmdline (the
+    kernel's copy, which has no width limit).
+
+    This is the regression guard that fails LOUDLY if `-ww` is ever dropped
+    again, or if some `ps` implementation ignores it — a guard the unit test
+    alone cannot provide, because the unit test only runs in CI while this runs
+    on every real clearance.
+
+    Deliberately conservative: it reports truncation ONLY when ps's rendering
+    is a STRICT PREFIX of the kernel's. Any other disagreement (argv rewritten
+    after exec, an empty argv element, /proc unreadable) returns None rather
+    than guessing, so this can raise a false alarm only if ps genuinely
+    returned a shortened prefix of a real command line."""
+    me = os.getpid()
+    try:
+        with open(f"/proc/{me}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None  # no /proc — the check is unavailable, not failed.
+    real = " ".join(p for p in raw.decode("utf-8", "replace").split("\0") if p)
+    mine = next((p for p in rows if p.pid == me), None)
+    if not real or mine is None or mine.args == real:
+        return None
+    if real.startswith(mine.args) and len(mine.args) < len(real):
+        return (f"ps reported this process's own argv as {len(mine.args)} chars "
+                f"but the kernel reports {len(real)} — ps returned a strict "
+                f"prefix, so EVERY row in this table may be cut and no pattern "
+                f"match over it can be trusted (this is SABLE-mpz6s: `ps` "
+                f"truncating argv to terminal width). Observed: {mine.args!r}")
+    return None
+
+
+def read_process_table(debug: dict | None = None) -> ProcessTable:
+    """The host process table via ps, WITH an account of everything lost
+    building it. Raises ProbeError if ps is unusable — the probe's own failure
+    is could-not-assess, never a quiet CLEAR.
+
+    That contract used to hold at WHOLE-COMMAND granularity (bad exit code,
+    OSError) and be VIOLATED at ROW granularity: a line that did not parse
+    vanished through a bare `continue` with no counter, no sample and no
+    signal, so a table missing rows produced a CLEAR indistinguishable from a
+    table that legitimately had nothing in it (SABLE-n8ykm). The drops are now
+    first-class fields of the returned ProcessTable, reported by clearance()
+    itself rather than through an opt-in debug dict — dropping a malformed row
+    is fine, dropping it INVISIBLY is not.
+
+    `debug`, when passed a dict, mirrors those same counts for the integration
+    suite's failure diagnostics. It is a VIEW of the return value now, never
+    the only place the information exists, and is never used to alter
+    behaviour."""
     try:
         # -ww: DO NOT let ps truncate `args` to terminal width (SABLE-skrdj
         # revise #1, round 5 — the actual defect four rounds of process-table
@@ -400,17 +547,23 @@ def read_process_table(debug: dict | None = None) -> list[ProcInfo]:
             dropped_valueerror.append(line)
             continue
         out.append(ProcInfo(pid=pid, ppid=ppid, uid=uid, args=parts[3]))
+    table = ProcessTable(rows=out, raw_line_count=len(raw_lines),
+                         dropped_short=dropped_short,
+                         dropped_unparseable=dropped_valueerror,
+                         truncated_evidence=_self_argv_truncation(out))
     if debug is not None:
         debug.update({
-            "raw_ps_lines": len(raw_lines),
-            "parsed_rows": len(out),
-            "dropped_short_rows": len(dropped_short),
-            "dropped_short_sample": dropped_short[:5],
-            "dropped_valueerror_rows": len(dropped_valueerror),
-            "dropped_valueerror_sample": dropped_valueerror[:5],
-            "raw_lines": raw_lines,
+            "raw_ps_lines": table.raw_line_count,
+            "parsed_rows": len(table.rows),
+            "dropped_short_rows": len(table.dropped_short),
+            "dropped_short_sample": table.dropped_short[:PS_DROP_SAMPLE_CAP],
+            "dropped_valueerror_rows": len(table.dropped_unparseable),
+            "dropped_valueerror_sample":
+                table.dropped_unparseable[:PS_DROP_SAMPLE_CAP],
+            "conserves_lines": table.conserves_lines,
+            "truncated_evidence": table.truncated_evidence,
         })
-    return out
+    return table
 
 
 def proc_cwd(pid: int) -> str | None:
@@ -512,7 +665,8 @@ def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
     `read_debug`, when passed a dict, is forwarded to `read_process_table`
     verbatim (round three: raw ps line count and every line silently dropped
     at parse time, one layer below `scan_debug`)."""
-    tbl = read_process_table(debug=read_debug) if table is None else table
+    tbl = (read_process_table(debug=read_debug) if table is None
+           else _as_process_table(table)).rows
     me = os.getpid() if self_pid is None else self_pid
     my_uid = os.getuid() if uid is None else uid
     if scan_debug is not None:
@@ -709,6 +863,13 @@ def clearance(base: str | None = None, table: list[ProcInfo] | None = None,
     `reasons`, so nothing is hidden by the winning label:
       could-not-assess > unregistered-runner > busy > stale > clear
 
+    THE PROCESS TABLE'S OWN INTEGRITY IS PART OF THE ANSWER (SABLE-n8ykm).
+    Every call reports it in `checked` whether it is clean or not, and a table
+    that dropped rows at parse or that `ps` returned truncated resolves to
+    could-not-assess rather than CLEAR: "I could not see the whole table" is a
+    different claim from "nothing is running", and only the second one may
+    release a hot-swap.
+
     `trace`, `scan_debug`, and `read_debug`, when given, are forwarded to
     `scan_processes`/`read_process_table` verbatim — they fill from the SAME
     table/decision this call's verdict came from (see those functions'
@@ -768,7 +929,22 @@ def clearance(base: str | None = None, table: list[ProcInfo] | None = None,
                            "probe has nothing to attribute candidates to")
         else:
             try:
-                tbl = read_process_table(debug=read_debug) if table is None else table
+                tbl = (read_process_table(debug=read_debug) if table is None
+                       else _as_process_table(table))
+                # THE REPORT AXIS, ALWAYS — clean or lossy (standing discipline
+                # 7). Stating the integrity of the table unconditionally is what
+                # makes a CLEAR from a complete table distinguishable from a
+                # CLEAR from a lossy one; a counter that only speaks up when it
+                # is unhappy cannot be trusted to have been running at all.
+                checked.append(tbl.integrity_summary())
+                # THE DECISION AXIS, ruled per-site and fail-CLOSED here: this
+                # site is a hot-swap clearance gate, where a wrong CLEAR costs a
+                # corrupted binary swap for every agent on the host and a wrong
+                # refusal costs one brokered window. Those are not symmetric, so
+                # a table known to be missing rows or known to be cut may not
+                # produce a CLEAR — it produces the loud could-not-assess that
+                # `unknown` already means here.
+                unknown.extend(tbl.loss_reasons())
                 attributed, unattributable = scan_processes(
                     roots, table=tbl, trace=trace, scan_debug=scan_debug)
                 for c in unattributable:
