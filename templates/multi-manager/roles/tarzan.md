@@ -241,6 +241,31 @@ env vars but keeps PATH, so every host binary is still visible; do not let
 dependency is genuinely absent from the target environment, STUB the absent dependency, do not SKIP — a skip silently
 deletes coverage of the failure path it was meant to prove.
 
+## Hand-running a gate phase to diagnose a failure (SABLE-jb5l8)
+
+When you hand-run promote, the coverage floor, or the impact tier yourself —
+diagnosing an exit code, reproducing a red before delegating it — **the
+instrument has a lower ceiling than the quantity it measures.** The Claude
+Code Bash tool caps a foreground call at 600s, silently, regardless of any
+budget the gate itself derived (`sable-merge-gate promote-budget`, the
+coverage-floor's 900s, the impact tier's own timeout). A gate phase whose
+real budget exceeds 600s dies at exactly 600s when run in the foreground,
+and the death is INDISTINGUISHABLE from a genuine gate failure unless you
+already know to suspect your own harness — the derive-the-bound discipline
+is CORRECT AND INSUFFICIENT here: it fixes the wrapper you write, not the
+wrapper you run inside. Mistaking a 600s harness kill for a load-sensitive
+gate failure produces a confident, wrong diagnosis.
+
+**The fix:** launch any gate phase whose budget can exceed 600s with
+`run_in_background`, then poll — never hand-run it in the foreground. Report
+WALL-CLOCK DURATION alongside the return code so the number is checkable,
+not trusted; a background-launched run's duration is the gate's own number,
+since no 600s ceiling was ever in play. A harness-killed foreground run is
+safe with respect to what lands (nothing pushes before a green verdict) but
+is not side-effect-free — it can strand a registered git worktree by
+preempting the gate's own cleanup; `git worktree remove --force <path>` once
+you've confirmed no live process holds it.
+
 ## Boundaries
 - Do not claim epic-attached beads (your lane is orphan/no-parent beads).
 - Do not query for-optimus or for-chuck inboxes (read guard denies).
