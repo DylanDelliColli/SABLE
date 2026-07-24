@@ -17,6 +17,7 @@ import sable_telemetry_lib as lib  # noqa: E402
 import sable_telemetry_bd_source as bd_source  # noqa: E402
 import sable_telemetry_git_source as git_source  # noqa: E402
 import sable_telemetry_gh_source as gh_source  # noqa: E402
+import sable_gate_promote_lib as promote_lib  # noqa: E402
 
 _LOADER = SourceFileLoader(
     "sable_telemetry_cli", str(Path(__file__).resolve().parent / "sable-telemetry")
@@ -499,6 +500,121 @@ def test_shift_report_beads_overlay_as_markers_not_boundaries():
     assert day_without.shift_report_ids == ()
     assert day_with.shift_report_ids == ("SABLE-report",)
     assert day_with.intake == day_without.intake + 1
+
+
+def test_gh_source_batch_ref_regex_extracts_setkey7():
+    assert gh_source.parse_batch_ref("ci-verify/batch-1234abc") == "1234abc"
+    # a legacy ref is not a batch ref, even though its trailing chars are hex
+    assert gh_source.parse_batch_ref("ci-verify/SABLE-c008-16d94ed") is None
+    # the setkey suffix must be exactly 7 hex chars, same discipline as sha7
+    assert gh_source.parse_batch_ref("ci-verify/batch-notasha") is None
+
+
+def test_gh_source_classify_head_branch_dispositions():
+    assert gh_source.classify_head_branch("ci-verify/SABLE-c008-16d94ed") == (
+        "legacy", ("SABLE-c008", "16d94ed"))
+    assert gh_source.classify_head_branch("ci-verify/batch-1234abc") == ("batch", "1234abc")
+    # not a ci-verify ref at all -- the redundant post-merge confirmation run
+    assert gh_source.classify_head_branch("tmux-only") == ("not_ci_verify", None)
+    # under ci-verify/ but neither shape -- the LOUD-OR-COUNTED case
+    assert gh_source.classify_head_branch("ci-verify/totally-bogus") == ("unmatched", None)
+
+
+def test_gh_source_batch_ref_never_mis_attributed_to_literal_bead_batch():
+    # The literal-capture failure the bead names: PREVIEW_REF_RE's own greedy
+    # `.+` bead group DOES still match a batch ref syntactically (proving the
+    # precedence check below is load-bearing, not vacuously true because the
+    # legacy pattern happens to reject the input).
+    assert gh_source.parse_preview_ref("ci-verify/batch-1234abc") == ("batch", "1234abc")
+
+    # classify_head_branch's batch-first precedence makes that
+    # mis-attribution structurally unreachable: the same ref classifies as a
+    # BATCH disposition, never a legacy one with bead=="batch".
+    disposition, parsed = gh_source.classify_head_branch("ci-verify/batch-1234abc")
+    assert disposition == "batch"
+    assert parsed == "1234abc"
+
+
+def test_gh_source_batch_ref_end_to_end_produces_batch_run_event_with_resolved_members(
+    monkeypatch, tmp_path,
+):
+    # Real durable manifest, isolated from the real state dir via
+    # SABLE_MG_BATCH_RECORD_LOG -- mirrors
+    # test_stamp_and_read_batch_record_round_trip's own isolation pattern in
+    # test_sable_gate_promote_lib.py.
+    monkeypatch.setenv("SABLE_MG_BATCH_RECORD_LOG", str(tmp_path / "batch-records.jsonl"))
+    combined_ref = "ci-verify/batch-1234abc"
+    members = [
+        promote_lib.BatchMember("wk-a", "a" * 40, ("SABLE-a",), ("bin/a.py",)),
+        promote_lib.BatchMember("wk-b", "b" * 40, ("SABLE-b",), ("bin/b.py",)),
+    ]
+    record = promote_lib.BatchRecord.from_members(
+        "base" + "0" * 36, members, combined_ref=combined_ref,
+        outcome=promote_lib.BATCH_OUTCOME_LANDED, fold_disjoint=True)
+    promote_lib._stamp_batch_record(".", record)
+
+    run = {"databaseId": 999, "headBranch": combined_ref}
+    jobs = [{"name": "verify", "startedAt": "2026-07-23T10:00:00Z",
+             "completedAt": "2026-07-23T10:05:00Z"}]
+
+    event = gh_source.build_ci_run_event(run, jobs, cwd=".")
+
+    assert isinstance(event, gh_source.BatchRunEvent)
+    assert not isinstance(event, gh_source.CiRunEvent)
+    assert event.setkey7 == "1234abc"
+    assert event.run_id == 999
+    assert event.duration_seconds == 300.0
+    # member set RESOLVED VIA THE MANIFEST -- never bead="batch", never guessed
+    assert set(event.member_bead_ids) == {"SABLE-a", "SABLE-b"}
+    assert set(event.member_branches) == {"wk-a", "wk-b"}
+
+
+def test_gh_source_batch_ref_with_no_manifest_record_resolves_empty_member_set(
+    monkeypatch, tmp_path,
+):
+    # Negative space of manifest resolution: no durable record exists yet for
+    # this ref. The member set must be EMPTY, not guessed from the ref's
+    # setkey7 (which carries no member information at all).
+    monkeypatch.setenv("SABLE_MG_BATCH_RECORD_LOG", str(tmp_path / "batch-records.jsonl"))
+    run = {"databaseId": 1000, "headBranch": "ci-verify/batch-deadbee"}
+    jobs = [{"name": "verify", "startedAt": "2026-07-23T10:00:00Z",
+             "completedAt": "2026-07-23T10:05:00Z"}]
+
+    event = gh_source.build_ci_run_event(run, jobs, cwd=".")
+
+    assert isinstance(event, gh_source.BatchRunEvent)
+    assert event.member_bead_ids == ()
+    assert event.member_branches == ()
+
+
+def test_gh_source_unparseable_ci_ref_is_logged_loudly(capsys):
+    # LOUD-OR-COUNTED (SABLE-x2n8a family): a ci-verify ref matching neither
+    # shape must never be a silent drop.
+    raw_runs = [{"databaseId": 1, "headBranch": "ci-verify/totally-bogus"}]
+
+    selected = gh_source.select_preview_runs(raw_runs)
+
+    assert selected == []
+    captured = capsys.readouterr()
+    assert "unparseable ci-verify ref" in captured.err
+    assert "ci-verify/totally-bogus" in captured.err
+
+
+def test_gh_source_matching_refs_never_trigger_the_unparseable_log_negative_control(capsys):
+    # NEGATIVE CONTROL, load-bearing (dispatch brief): a counter/log that
+    # always fires is noise. Neither a legacy ref, a batch ref, nor a
+    # non-ci-verify branch may trigger the unparseable-ref log line.
+    raw_runs = [
+        {"databaseId": 1, "headBranch": "ci-verify/SABLE-c008-16d94ed"},
+        {"databaseId": 2, "headBranch": "ci-verify/batch-1234abc"},
+        {"databaseId": 3, "headBranch": "tmux-only"},
+    ]
+
+    selected = gh_source.select_preview_runs(raw_runs)
+
+    assert [r["databaseId"] for r in selected] == [1, 2]
+    captured = capsys.readouterr()
+    assert "unparseable ci-verify ref" not in captured.err
 
 
 def test_gh_source_dedups_post_merge_tmux_only_run():
