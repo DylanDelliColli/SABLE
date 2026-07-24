@@ -65,6 +65,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -571,6 +572,78 @@ def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
     return entries
 
 
+# --- Shadowed role cards (SABLE-thx70) --------------------------------------
+# hooks/multi-manager/session-role-anchor.sh resolves a manager's role card
+# PROJECT-FIRST ($PWD/.claude/sable/roles/<name>.md) then falls back to
+# $HOME/.claude/sable/roles/<name>.md. That precedence is a supported feature;
+# the defect this bead was filed for is that a stale project-local copy can
+# silently outrank a freshly-edited user-level one forever, with no event —
+# six days of role-card edits went dark fleet-wide before anyone noticed. The
+# hook itself now warns to stderr at SessionStart (see that file), but a
+# manager pane that never restarts never sees it. This mirrors the hook's
+# EXACT two candidate paths and precedence — same $PWD/$HOME resolution, same
+# four warm-pane roles the install manifest above installs — so doctor and
+# the hook can never disagree about which case counts as shadowed.
+MANAGER_ROLE_NAMES = ("lincoln", "optimus", "tarzan", "chuck")
+
+
+def _mtime_str(path: Path) -> str:
+    """Human-readable mtime for a shadow report, or 'unknown' if the file
+    can't be stat'd (removed between the is_file() check and here) — never
+    raises, since a report line is better than a crash."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime).isoformat(sep=" ", timespec="seconds")
+    except OSError:
+        return "unknown"
+
+
+def check_shadowed_role_cards(cwd: Path, home: Path, roles=MANAGER_ROLE_NAMES):
+    """Manager role cards that are SHADOWED: a project-local
+    <cwd>/.claude/sable/roles/<role>.md and a user-level
+    <home>/.claude/sable/roles/<role>.md both exist and DIFFER in content.
+    Returns [] when nothing is shadowed — including when only one candidate
+    exists, or both exist with IDENTICAL content. Those are NOT shadowing;
+    flagging them would fire on every ordinary boot, which is exactly the
+    noise the negative controls in this bead's test spec exist to prevent."""
+    shadowed = []
+    for role in roles:
+        project_path = Path(cwd) / ".claude" / "sable" / "roles" / f"{role}.md"
+        user_path = Path(home) / ".claude" / "sable" / "roles" / f"{role}.md"
+        if not project_path.is_file() or not user_path.is_file():
+            continue
+        try:
+            project_bytes = project_path.read_bytes()
+            user_bytes = user_path.read_bytes()
+        except OSError:
+            continue
+        if project_bytes == user_bytes:
+            continue
+        shadowed.append({
+            "role": role,
+            "winner_path": str(project_path),
+            "winner_mtime": _mtime_str(project_path),
+            "shadowed_path": str(user_path),
+            "shadowed_mtime": _mtime_str(user_path),
+        })
+    return shadowed
+
+
+def _shadowed_role_card_report_lines(shadowed):
+    lines = [f"[shadowed role cards] {len(shadowed)} manager role card(s) shadowed by project-local precedence:"]
+    for s in shadowed:
+        lines.append(f"  SHADOWED {s['role']}")
+        lines.append(f"          winner   (project-local): {s['winner_path']} (mtime: {s['winner_mtime']})")
+        lines.append(f"          shadowed (user-level):    {s['shadowed_path']} (mtime: {s['shadowed_mtime']})")
+    lines.append(
+        "  The project-local copy wins (precedence unchanged); the user-level edit(s)"
+    )
+    lines.append(
+        "  above are never read while it exists. If unintentional, update or remove"
+    )
+    lines.append("  the project-local copy.")
+    return lines
+
+
 def _read_pin_marker(bin_dir: Path) -> set:
     """Names sable-bin-install currently considers pinned in bin_dir, per its
     DEST/.sable-pinned marker (regenerated from real filesystem state on every
@@ -839,16 +912,21 @@ def _snapshot_remedy_lines(snapshot_bad):
     return lines
 
 
-def render_text_report(results, provenance=None, current_head=None, ancestor_ok=None):
+def render_text_report(results, provenance=None, current_head=None, ancestor_ok=None, shadowed_roles=None):
+    shadowed_roles = shadowed_roles or []
     bad = [r for r in results if r["status"] != "clean"]
-    if not bad:
+    if not bad and not shadowed_roles:
         print(f"sable-doctor: clean — {len(results)} installed files match repo HEAD.")
         for line in _provenance_report_lines(provenance, ancestor_ok=ancestor_ok):
             print(line)
         print(worker_cap_line())
         return
-    print(f"sable-doctor: DRIFT DETECTED — {len(bad)}/{len(results)} installed files "
-          "do not match repo HEAD.\n")
+    if bad:
+        print(f"sable-doctor: DRIFT DETECTED — {len(bad)}/{len(results)} installed files "
+              "do not match repo HEAD.\n")
+    else:
+        print(f"sable-doctor: clean — {len(results)} installed files match repo HEAD, "
+              f"but {len(shadowed_roles)} role card(s) are shadowed (see below).\n")
     for line in _provenance_report_lines(provenance, current_head=current_head, ancestor_ok=ancestor_ok):
         print(line)
     print()
@@ -883,6 +961,10 @@ def render_text_report(results, provenance=None, current_head=None, ancestor_ok=
             print(line)
     if unguarded_bad:
         print(f"\nRefresh with: {REFRESH_CMD}")
+    if shadowed_roles:
+        print()
+        for line in _shadowed_role_card_report_lines(shadowed_roles):
+            print(line)
     print(worker_cap_line())
 
 
@@ -932,6 +1014,16 @@ def main(argv=None):
     results = check_manifest(entries)
     bad = [r for r in results if r["status"] != "clean"]
 
+    # SABLE-thx70: mirrors session-role-anchor.sh's OWN resolution ($PWD vs
+    # $HOME, never CLAUDE_USER_DIR/--claude-dir) so doctor and the hook can
+    # never disagree about which case is shadowed. Independent of
+    # --claude-dir/--project — the shadow question is about the CURRENT
+    # process's cwd and home, not whichever install the operator asked to
+    # inspect.
+    shadowed_roles = check_shadowed_role_cards(
+        Path(os.getcwd()), Path(os.environ.get("HOME") or Path.home())
+    )
+
     provenance = read_provenance(claude_dir)
     current_head = current_repo_head(repo)
     ancestor_ok = None
@@ -940,13 +1032,20 @@ def main(argv=None):
 
     if args.json:
         print(json.dumps({
-            "clean": not bad,
+            "clean": not bad and not shadowed_roles,
             "results": results,
+            "shadowed_role_cards": shadowed_roles,
             "provenance": provenance,
             "current_head": current_head,
             "provenance_ancestor_of_head": ancestor_ok,
         }, indent=2))
     elif args.quiet:
+        if shadowed_roles:
+            print(
+                f"sable-doctor: {len(shadowed_roles)} manager role card(s) shadowed by "
+                "project-local precedence (SABLE-thx70) — run `sable-doctor` for detail",
+                file=sys.stderr,
+            )
         if bad:
             guarded_bad = [r for r in bad if r["category"] in GUARDED_CATEGORIES]
             snapshot_bad = [
@@ -984,9 +1083,10 @@ def main(argv=None):
                     file=sys.stderr,
                 )
     else:
-        render_text_report(results, provenance=provenance, current_head=current_head, ancestor_ok=ancestor_ok)
+        render_text_report(results, provenance=provenance, current_head=current_head,
+                            ancestor_ok=ancestor_ok, shadowed_roles=shadowed_roles)
 
-    return 1 if bad else 0
+    return 1 if (bad or shadowed_roles) else 0
 
 
 if __name__ == "__main__":
