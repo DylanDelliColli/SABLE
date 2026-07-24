@@ -409,6 +409,203 @@ def test_read_process_table_uses_ww_so_columns_does_not_truncate_args(monkeypatc
         proc.wait(timeout=5)
 
 
+def test_columns_80_still_classifies_a_real_suite_shaped_process(reg, monkeypatch,
+                                                                 tmp_path):
+    """THE KNOWN-POSITIVE, and the test that actually proves the REPORTED CHAIN
+    rather than just the `ps` call: under a real COLUMNS=80, with a real
+    process whose suite markers sit well beyond column 80, the row must still
+    reach classification as an ATTRIBUTED candidate.
+
+    The chain SABLE-mpz6s described ran truncation -> pattern miss -> zero
+    candidates -> CLEAR. The previous test pins the first link (argv survives
+    the read). This one pins the whole rest of it, so a future regression
+    anywhere between `ps` and `scan_processes` is caught by the property that
+    actually matters: a live suite is SEEN.
+
+    The child is a harmless `sleep`-alike carrying a pytest-shaped argv — it
+    must not be a real pytest, which would register itself and recurse."""
+    monkeypatch.setenv("COLUMNS", "80")
+    root = os.path.realpath(str(tmp_path))
+    padding = "x" * 70
+    # Real OS argv; the suite markers deliberately sit past column 80.
+    proc = subprocess.Popen(
+        [sys.executable, "-c", f"import time; time.sleep(10)  # {padding}",
+         "-m", "pytest", "bin/test_scratch_slow.py", "-q"],
+        cwd=root)
+    try:
+        deadline = time.monotonic() + 10.0
+        row = None
+        while time.monotonic() < deadline:
+            row = next((p for p in rl.read_process_table() if p.pid == proc.pid),
+                       None)
+            if row is not None:
+                break
+            time.sleep(0.05)
+        assert row is not None, "spawned process never appeared in the process table"
+
+        # Link 1: the argv survived the read at 80 columns.
+        assert "bin/test_scratch_slow.py" in row.args, (
+            f"argv truncated at COLUMNS=80: {row.args!r}")
+        # Link 2: it is suite-SHAPED — the pattern match that a truncated
+        # '-m pyte' could not satisfy.
+        matched = [label for label, pat in rl.SUITE_PATTERNS if pat.search(row.args)]
+        assert matched, f"no SUITE_PATTERNS matched {row.args!r}"
+        # Link 3: it reaches classification as OURS, all the way to a candidate.
+        attributed, _unattributable = rl.scan_processes([root])
+        assert proc.pid in [c.pid for c in attributed], (
+            f"suite-shaped process pid {proc.pid} never became an attributed "
+            f"candidate; matched patterns were {matched}")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+# --- SABLE-n8ykm: the parse-drop path is COUNTED and LOUD --------------------
+#
+# A truncated row IS A SHORT ROW. These counters are the instrument that would
+# have caught SABLE-mpz6s in one round instead of five, which is why the two
+# ship together.
+
+
+def _fake_ps(monkeypatch, stdout: str, returncode: int = 0, stderr: str = ""):
+    """Stub `ps` at the subprocess boundary — the ONLY way to feed
+    read_process_table a chosen raw table, since its whole job is turning ps
+    text into rows. Complements (never replaces) the real-ps integration
+    cases: a stub is exactly what would hide a real format surprise."""
+    def fake_run(argv, **kwargs):
+        assert argv[0] == "ps", argv
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+    monkeypatch.setattr(rl.subprocess, "run", fake_run)
+
+
+def test_unparseable_ps_rows_are_counted_and_reported(monkeypatch):
+    """Both silent-drop paths, counted and REACHABLE BY THE CALLER — not
+    swallowed by a bare `continue`, and not buried in an opt-in debug dict."""
+    _fake_ps(monkeypatch, "\n".join([
+        "  100   1 1000 sleep 30",
+        "  short-row",                       # < 4 fields
+        "  notapid 1 1000 weird args here",  # non-integer pid
+        "  101   1 1000 sleep 60",
+    ]))
+    t = rl.read_process_table()
+
+    assert [p.pid for p in t.rows] == [100, 101]
+    assert len(t.dropped_short) == 1
+    assert len(t.dropped_unparseable) == 1
+    assert t.dropped_count == 2
+    assert t.is_lossy is True
+    # The verbatim lines are named, so a drop is DIAGNOSABLE and not merely
+    # countable — "2 rows were dropped" without saying which is a new mystery.
+    assert "short-row" in t.dropped_short[0]
+    assert "notapid" in t.dropped_unparseable[0]
+    # And the loss speaks for itself in the probe's own output.
+    reasons = t.loss_reasons()
+    assert any("short-row" in r for r in reasons)
+    assert any("notapid" in r for r in reasons)
+
+
+def test_clean_ps_table_reports_zero_drops(monkeypatch):
+    """THE NEGATIVE CONTROL. Without it, an implementation that counts every
+    row as dropped passes the test above and turns the gate into a permanent
+    could-not-assess — the counter must be capable of reading zero."""
+    _fake_ps(monkeypatch, "  100   1 1000 sleep 30\n  101   1 1000 sleep 60")
+    t = rl.read_process_table()
+
+    assert len(t.rows) == 2
+    assert t.dropped_count == 0
+    assert t.dropped_short == []
+    assert t.dropped_unparseable == []
+    assert t.is_lossy is False
+    assert t.loss_reasons() == []          # silent BECAUSE clean, not by default
+    assert "0 short" in t.integrity_summary()   # but still reports, out loud
+
+
+def test_row_count_plus_drop_counts_equals_raw_line_count(monkeypatch):
+    """The conservation property — what makes "the child was never there"
+    falsifiable rather than merely unproven."""
+    _fake_ps(monkeypatch, "\n".join([
+        "  100   1 1000 sleep 30",
+        "  bad",
+        "  x 1 1000 nope",
+        "  101   1 1000 sleep 60",
+    ]))
+    t = rl.read_process_table()
+    assert t.raw_line_count == 4
+    assert len(t.rows) + t.dropped_count == t.raw_line_count
+    assert t.conserves_lines is True
+
+
+def test_a_lossy_process_table_cannot_produce_clear(reg, monkeypatch):
+    """THE DECISION AXIS at this site, fail-closed: rows were dropped, so the
+    table the verdict rests on is incomplete and an absence of candidates
+    proves nothing. Contrast test_quiet_host_returns_clear, where the same
+    empty candidate set from a COMPLETE table correctly clears — that pair is
+    the whole point: a CLEAR from a lossy table is distinguishable from a
+    CLEAR from a clean one."""
+    _roots(monkeypatch, "/repo")
+    _fake_ps(monkeypatch, "  100   1 1000 sleep 30\n  mangled-row")
+    c = rl.clearance(base="/repo")
+
+    assert c.state == rl.COULD_NOT_ASSESS
+    assert c.state != rl.CLEAR
+    assert any("mangled-row" in r for r in c.reasons), c.reasons
+
+
+def test_clean_table_reports_its_integrity_even_when_clearing(reg, monkeypatch):
+    """THE REPORT AXIS is never traded away, not even on the happy path: the
+    clean case states its own integrity too. A counter that speaks only when
+    unhappy cannot be distinguished from one that is not running."""
+    _roots(monkeypatch, "/repo")
+    _fake_ps(monkeypatch, "  100   1 1000 sleep 30")
+    c = rl.clearance(base="/repo")
+
+    assert c.state == rl.CLEAR          # the gate can still release
+    assert any("ps table integrity" in line for line in c.checked), c.checked
+    assert any("0 short, 0 unparseable" in line for line in c.checked), c.checked
+
+
+def test_truncated_ps_output_is_detected_and_cannot_produce_clear(reg, monkeypatch):
+    """CONTENT conservation, the axis line-counting cannot see: every line
+    arrived, and arrived SHORT. This is SABLE-mpz6s's exact signature, and it
+    is the guard that fails loudly on a real clearance if `-ww` is ever
+    dropped again — the unit test above only runs in CI, this runs every time
+    the gate is asked."""
+    _roots(monkeypatch, "/repo")
+    me = os.getpid()
+    with open(f"/proc/{me}/cmdline", "rb") as fh:
+        real = " ".join(p for p in fh.read().decode().split("\0") if p)
+    cut = real[:len(real) // 2]           # a strict prefix — exactly what ps does
+    _fake_ps(monkeypatch, f"  {me}   1 {os.getuid()} {cut}")
+    c = rl.clearance(base="/repo")
+
+    assert c.state == rl.COULD_NOT_ASSESS
+    assert any("TRUNCATED" in r for r in c.reasons), c.reasons
+
+
+def test_untruncated_ps_output_is_not_flagged(reg, monkeypatch):
+    """The negative control for the truncation detector: our own row, reported
+    in full, must NOT trip it. Without this, a detector that always fires
+    passes the test above and makes the gate useless."""
+    _roots(monkeypatch, "/repo")
+    me = os.getpid()
+    with open(f"/proc/{me}/cmdline", "rb") as fh:
+        real = " ".join(p for p in fh.read().decode().split("\0") if p)
+    _fake_ps(monkeypatch, f"  {me}   1 {os.getuid()} {real}")
+    t = rl.read_process_table()
+
+    assert t.truncated_evidence is None
+    assert t.is_lossy is False
+
+
+def test_ps_failure_still_raises_ProbeError(monkeypatch):
+    """Regression guard: the WHOLE-COMMAND contract this function already
+    honoured must survive the row-granularity work."""
+    _fake_ps(monkeypatch, "", returncode=1, stderr="ps: boom")
+    with pytest.raises(rl.ProbeError) as exc:
+        rl.read_process_table()
+    assert "boom" in str(exc.value)
+
+
 def test_probe_failure_is_could_not_assess(reg, monkeypatch):
     _roots(monkeypatch, "/repo")
 
