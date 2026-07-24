@@ -104,6 +104,15 @@ has  "cites SABLE-546m5 as the two-parser divergence probe"        "SABLE-546m5"
 has  "cites SABLE-zx2yv as the reads-side silent-drop bead"        "SABLE-zx2yv"
 hasre "instructs over-declaring when unsure"                       "over-declare"
 
+# ---------- SABLE-e2ic3: NO-DECLARATION is announced, not silent -----------
+# A bead declaring no footprint at all still dispatches, but must no longer
+# read the same as a checked-clean footprint — the template must tell the
+# manager what the loud NO-DECLARATION line on their own dispatch means.
+
+has  "cites SABLE-e2ic3 as the tracking bead for the NO-DECLARATION announcement" "SABLE-e2ic3"
+has  "names the NO-DECLARATION verdict"                             "NO-DECLARATION"
+hasre "states a bead declaring nothing still dispatches"            "declares nothing|declares NOTHING"
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
