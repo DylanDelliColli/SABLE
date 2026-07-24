@@ -24,6 +24,7 @@ import sable_telemetry_bd_source as bd_source  # noqa: E402
 import sable_telemetry_git_source as git_source  # noqa: E402
 import sable_telemetry_gh_source as gh_source  # noqa: E402
 import sable_telemetry_lib as lib  # noqa: E402
+import sable_gate_promote_lib as promote_lib  # noqa: E402
 
 BIN_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BIN_DIR.parent
@@ -637,6 +638,86 @@ def test_gh_source_dedup_against_recorded_two_run_fixture():
     # NOT the near-instant tmux-only run's ~4s, and NOT the run-level
     # createdAt->updatedAt span which includes Actions queue time.
     assert event.duration_seconds == 319.0
+
+
+def test_gh_source_batch_aware_adapter_handles_legacy_batch_and_garbage_refs_in_one_pass(
+    monkeypatch, tmp_path, capsys,
+):
+    """SABLE-be4lo.5 INTEGRATION (test spec, verbatim): the real source
+    adapter (select_preview_runs + build_ci_run_event, the same production
+    functions fetch_ci_run_events calls, no mocks) run over a run-list
+    fixture containing a legacy ref, a batch ref, and a garbage ref
+    TOGETHER, asserting all three dispositions in ONE pass -- a regex
+    alternative that steals matches from its sibling would show up here even
+    if isolated single-shape tests missed it.
+
+    The batch record manifest is a REAL file round trip
+    (promote_lib._stamp_batch_record / find_batch_record), isolated from the
+    real state dir via SABLE_MG_BATCH_RECORD_LOG -- never a mocked lookup."""
+    monkeypatch.setenv("SABLE_MG_BATCH_RECORD_LOG", str(tmp_path / "batch-records.jsonl"))
+
+    combined_ref = "ci-verify/batch-1234abc"
+    members = [
+        promote_lib.BatchMember("wk-alpha", "a" * 40, ("SABLE-alpha",), ("bin/alpha.py",)),
+        promote_lib.BatchMember("wk-beta", "b" * 40, ("SABLE-beta",), ("bin/beta.py",)),
+    ]
+    record = promote_lib.BatchRecord.from_members(
+        "base" + "0" * 36, members, combined_ref=combined_ref,
+        outcome=promote_lib.BATCH_OUTCOME_LANDED, fold_disjoint=True)
+    promote_lib._stamp_batch_record(".", record)
+
+    batch_run = {
+        "databaseId": 42424242, "headBranch": combined_ref,
+        "createdAt": "2026-07-23T09:00:00Z", "updatedAt": "2026-07-23T09:05:10Z",
+        "conclusion": "success", "status": "completed",
+        "displayTitle": "ci-verify merge-preview: batch onto tmux-only",
+    }
+    garbage_run = {
+        "databaseId": 13131313, "headBranch": "ci-verify/totally-bogus",
+        "createdAt": "2026-07-23T09:00:00Z", "updatedAt": "2026-07-23T09:00:05Z",
+        "conclusion": "success", "status": "completed",
+        "displayTitle": "garbage run, should never be selected",
+    }
+    raw_runs = [GH_C008_PREVIEW_RUN, batch_run, garbage_run]
+    batch_jobs = [{"name": "verify", "startedAt": "2026-07-23T09:00:05Z",
+                   "completedAt": "2026-07-23T09:05:05Z"}]
+
+    selected = gh_source.select_preview_runs(raw_runs)
+
+    # DISPOSITION 1 (selection): exactly the legacy + batch runs survive --
+    # the garbage ref is never a candidate.
+    assert [r["databaseId"] for r in selected] == [
+        GH_C008_PREVIEW_RUN["databaseId"], batch_run["databaseId"],
+    ]
+
+    events = {}
+    for run in selected:
+        jobs = GH_C008_PREVIEW_JOBS if run["databaseId"] == GH_C008_PREVIEW_RUN["databaseId"] \
+            else batch_jobs
+        event = gh_source.build_ci_run_event(run, jobs, cwd=".")
+        assert event is not None
+        events[run["databaseId"]] = event
+
+    legacy_event = events[GH_C008_PREVIEW_RUN["databaseId"]]
+    batch_event = events[batch_run["databaseId"]]
+
+    # DISPOSITION 2 (legacy attribution, P1 regression): byte-identical to
+    # the pre-batch behaviour proven by test_gh_source_dedup_against_recorded_two_run_fixture.
+    assert isinstance(legacy_event, gh_source.CiRunEvent)
+    assert legacy_event.bead_id == "SABLE-c008"
+    assert legacy_event.sha7 == "16d94ed"
+
+    # DISPOSITION 3 (batch attribution): a typed BatchRecord, member set
+    # resolved via the real manifest -- never bead_id="batch".
+    assert isinstance(batch_event, gh_source.BatchRunEvent)
+    assert batch_event.setkey7 == "1234abc"
+    assert set(batch_event.member_bead_ids) == {"SABLE-alpha", "SABLE-beta"}
+    assert set(batch_event.member_branches) == {"wk-alpha", "wk-beta"}
+
+    # DISPOSITION 4 (garbage, loud-or-counted): never a silent drop.
+    captured = capsys.readouterr()
+    assert "unparseable ci-verify ref" in captured.err
+    assert "ci-verify/totally-bogus" in captured.err
 
 
 if __name__ == "__main__":
