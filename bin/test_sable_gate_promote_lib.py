@@ -983,6 +983,34 @@ def test_the_allowing_assert_returns_the_evaluation_and_does_not_raise(ap_repo, 
     assert evaluation.allowed
 
 
+def test_the_denying_assert_raises_auto_promote_refused_carrying_the_evaluation(
+        ap_repo, ap_seams):
+    """The DENY half of the assert, bd-free (ap_seams stubs the bd read). A
+    perturbed footprint makes the evaluation deny, so assert_auto_promote_allowed
+    RAISES AutoPromoteRefused rather than returning. The exception must carry the
+    whole evaluation, not just a string — SABLE-21rug.5's shadow mode logs the
+    table off exc.evaluation — and its message must BE the evaluation's reason,
+    which is what AutoPromoteRefused.__init__ binds. Covers the assert's raise
+    arm and the exception constructor, both reachable in CI only through a unit
+    case like this one (the real-promote polarity that hit them self-skips
+    without bd)."""
+    repo, base_sha, branch_sha = ap_repo
+    ap_seams["bead"]["metadata"]["footprint_writes"] = promote_lib.admission.DISPATCH_FILE
+    with pytest.raises(promote_lib.AutoPromoteRefused) as exc:
+        promote_lib.assert_auto_promote_allowed(
+            "SABLE-auto", "wk-auto", "trunk", repo, "origin", base_sha, branch_sha)
+    evaluation = exc.value.evaluation
+    _record_rows(evaluation)
+    assert not evaluation.allowed
+    assert promote_lib.AutoPromoteDisqualifier.GATE_CLASS_FILE in evaluation.rows, \
+        evaluation.reason
+    # str(exc) is what a bare `except ... as e: log(e)` would surface — it must
+    # equal the evaluation's own reason (AutoPromoteRefused.__init__ passes it
+    # to super().__init__), and exc.evaluation must be the same object.
+    assert str(exc.value) == evaluation.reason
+    assert exc.value.evaluation is evaluation
+
+
 # --- rows 1-3: the three faces of the non_gate_class clause -----------------
 
 def test_declines_naming_gate_class_file(ap_repo, ap_seams):
@@ -1374,6 +1402,93 @@ def test_every_disqualifier_row_has_a_case_that_fires_it(request):
     missing = set(promote_lib.AutoPromoteDisqualifier) - _ROWS_OBSERVED
     assert not missing, (
         f"disqualifier rows never seen to fire: {sorted(d.value for d in missing)}")
+
+
+# --------------------------------------------------------------------------
+# AUTO-PROMOTE, the promote() entry wiring (SABLE-21rug.4) — bd-free
+# --------------------------------------------------------------------------
+#
+# The `if auto:` block at the top of promote() is the seam between the entry
+# point and the disqualifier table. The S3 integration cases below drive it
+# through a real promote() with a real bd store, so they self-skip in the
+# ci-verify clean room (no bd/dolt) — which leaves the block's own lines
+# UNCOVERED exactly where the merge decision is gated. These two cases cover
+# both polarities of the block with no bd at all, monkeypatching promote()'s
+# prologue the same way test_tip_equals_tested_integrity_abort_still_fires
+# does, and stubbing assert_auto_promote_allowed itself (its own arms are
+# covered by the ap_seams unit cases above). So the wiring — record-the-ALLOW,
+# record-and-raise-on-DENY — is verified where it is actually enforced, not
+# only where bd happens to be installed.
+
+def _auto_block_prologue_stubs(monkeypatch, evidence):
+    """No-op every promote() precondition that runs BEFORE the `if auto:`
+    block, and capture _append_evidence so the polarity of what the block
+    recorded is observable. Leaves the auto block itself real."""
+    git_lib = promote_lib.git_lib
+    base_ref = promote_lib.classify.qualify_remote_ref(REMOTE, BASE)
+    monkeypatch.setattr(promote_lib, "assert_not_frozen", lambda repo: None)
+    monkeypatch.setattr(promote_lib, "assert_landing_pair_satisfied",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(git_lib, "_git", lambda repo, *args, check=True: _cp(0))
+    monkeypatch.setattr(git_lib, "resolve_commit",
+                        lambda repo, ref: BASE_SHA if ref == base_ref else BRANCH_SHA)
+    monkeypatch.setattr(promote_lib, "_append_evidence",
+                        lambda repo, bead, msg: evidence.append(msg))
+
+
+def test_promote_with_auto_allow_records_the_allow_and_proceeds(monkeypatch):
+    """auto=True + an ALLOW: the block records the allow durably (SABLE-21rug.6
+    replays landings that actually happened, so the ALLOW write is not
+    optional) and promote() proceeds past the gate. The rest of promote() is
+    short-circuited at the adoption-miss check so the test isolates the block."""
+    evidence = []
+    _auto_block_prologue_stubs(monkeypatch, evidence)
+    allow_eval = promote_lib.AutoPromoteEvaluation(
+        bead="SABLE-x", branch=BRANCH, base_sha=BASE_SHA, branch_sha=BRANCH_SHA,
+        preview_sha="c" * 40, self_hash="a" * 64, provenance="precomputed",
+        disqualifications=())
+    assert allow_eval.allowed
+    monkeypatch.setattr(promote_lib, "assert_auto_promote_allowed",
+                        lambda *a, **kw: allow_eval)
+    # Past the block, stop promote() at the first cheap exit so nothing builds.
+    monkeypatch.setattr(promote_lib, "assert_coverage_floor", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "_adoption_miss_optimistic", lambda *a, **kw: 0)
+
+    rc = promote_lib.promote("SABLE-x", BRANCH, BASE, REPO, REMOTE, "chuck", None,
+                             auto=True)
+    assert rc == 0
+    allowed_writes = [m for m in evidence if "auto-promote ALLOWED" in m]
+    assert allowed_writes, f"the ALLOW was not recorded: {evidence}"
+    assert "SABLE-21rug.4" in allowed_writes[0]
+
+
+def test_promote_with_auto_decline_records_and_raises_gate_error(monkeypatch):
+    """auto=True + a DENY: the block records the decline durably AND raises a
+    GateError that NAMES the disqualifier, routing the branch back to the
+    seat's ordinary queue. A decline is not an error state — nothing was built
+    — but it must halt this auto promote loudly and observably."""
+    evidence = []
+    _auto_block_prologue_stubs(monkeypatch, evidence)
+    deny_eval = promote_lib.AutoPromoteEvaluation(
+        bead="SABLE-x", branch=BRANCH, base_sha=BASE_SHA, branch_sha=BRANCH_SHA,
+        preview_sha="", self_hash="a" * 64, provenance="",
+        disqualifications=(promote_lib.Disqualification(
+            promote_lib.AutoPromoteDisqualifier.LIVE_HOLD, "planted live hold"),))
+    assert not deny_eval.allowed
+
+    def _decline(*a, **kw):
+        raise promote_lib.AutoPromoteRefused(deny_eval)
+    monkeypatch.setattr(promote_lib, "assert_auto_promote_allowed", _decline)
+
+    with pytest.raises(promote_lib.GateError) as exc:
+        promote_lib.promote("SABLE-x", BRANCH, BASE, REPO, REMOTE, "chuck", None,
+                            auto=True)
+    assert exc.value.code == promote_lib.classify.EXIT_PRECONDITION
+    assert "AUTO-PROMOTE DECLINED" in str(exc.value)
+    assert promote_lib.AutoPromoteDisqualifier.LIVE_HOLD.value in str(exc.value)
+    declined_writes = [m for m in evidence if "auto-promote DECLINED" in m]
+    assert declined_writes, f"the decline was not recorded: {evidence}"
+    assert "SABLE-21rug.4" in declined_writes[0]
 
 
 # --------------------------------------------------------------------------
