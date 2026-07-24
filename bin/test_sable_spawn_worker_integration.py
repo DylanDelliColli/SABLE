@@ -2338,29 +2338,36 @@ def test_real_bd_widening_past_declaration_is_named_against_a_real_git_diff(real
     path; widening_report() over the actual `git diff --name-only` output
     names exactly the undeclared path and stays silent about the declared
     one."""
-    repo = real_bd_repo
-    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "--allow-empty", "-q", "-m", "init"], check=True)
-    base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+    # NOT aliased to a local var named `repo` — bin/sable-fixture-tripwire's
+    # real-repo-git rule flags `\brepo\b` file-wide (this test file also binds
+    # `repo = Path(__file__).resolve().parent.parent` — the ACTUAL SABLE repo
+    # root — in other, unrelated tests), so reusing that name here for a
+    # throwaway fixture dir would read as a mutating op against the real repo.
+    subprocess.run(["git", "-C", str(real_bd_repo), "config", "user.email", "t@example.com"],
+                   check=True)
+    subprocess.run(["git", "-C", str(real_bd_repo), "config", "user.name", "T"], check=True)
+    subprocess.run(["git", "-C", str(real_bd_repo), "commit", "--allow-empty", "-q", "-m", "init"],
+                   check=True)
+    base = subprocess.run(["git", "-C", str(real_bd_repo), "rev-parse", "HEAD"],
                           capture_output=True, text=True, check=True).stdout.strip()
 
-    bead_b = _new_bead(repo, "widening leg B",
+    bead_b = _new_bead(real_bd_repo, "widening leg B",
                        "Story.\n\n## File footprint\nshared_target.py")
-    declared = ssw.bead_claimed_files(json.loads(_bd(repo, "show", bead_b, "--json"))[0])
+    declared = ssw.bead_claimed_files(json.loads(_bd(real_bd_repo, "show", bead_b, "--json"))[0])
     assert declared == {"shared_target.py"}
 
     # The worker's real commit touches BOTH the declared file and a SECOND,
     # undeclared one — the shape that matters: a declared-and-genuinely-changed
     # path must NOT be reported alongside the undeclared one.
-    (repo / "shared_target.py").write_text("declared change\n")
-    (repo / "undeclared_extra.py").write_text("undeclared change\n")
-    subprocess.run(["git", "-C", str(repo), "add", "shared_target.py", "undeclared_extra.py"],
+    (real_bd_repo / "shared_target.py").write_text("declared change\n")
+    (real_bd_repo / "undeclared_extra.py").write_text("undeclared change\n")
+    subprocess.run(["git", "-C", str(real_bd_repo), "add",
+                    "shared_target.py", "undeclared_extra.py"], check=True)
+    subprocess.run(["git", "-C", str(real_bd_repo), "commit", "-q", "-m", "worker change"],
                    check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "worker change"], check=True)
 
     diff_out = subprocess.run(
-        ["git", "-C", str(repo), "diff", "--name-only", base, "HEAD"],
+        ["git", "-C", str(real_bd_repo), "diff", "--name-only", base, "HEAD"],
         capture_output=True, text=True, check=True).stdout
     changed = {ln for ln in diff_out.splitlines() if ln}
     assert changed == {"shared_target.py", "undeclared_extra.py"}
