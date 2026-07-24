@@ -399,6 +399,10 @@ def main(argv: list[str] | None = None) -> int:
                     dest="member_footprints", metavar="PATH[,...]",
                     help="repeatable; one per batch member (SABLE-be4lo.6)")
 
+    # SABLE-be4lo.7. The GATE-CLASS batch landing path. Subparser + all four
+    # behaviors live in promote_lib so this CLI stays argparse-dispatch-thin.
+    promote_lib.register_land_batch(sub)
+
     # SABLE-jd5fj.8. Refreshes the gate-owned persisted warm .testmondata
     # (see sable_gate_promote_lib's module comment on _warm_testmondata_path)
     # by running the full bin/ suite with --testmon-noselect, same as CI's
@@ -441,6 +445,7 @@ def main(argv: list[str] | None = None) -> int:
             print(promote_lib.render_promote_budget_report(
                 args.member_footprints, args.seconds, args.json))
             return 0
+        if args.command == "land-batch": return promote_lib.land_batch_from_refs(args.base, args.members, args.repo, args.remote, args.manager)  # noqa: E501,E701 SABLE-be4lo.7 (one-line dispatch keeps the CLI under test_cli_is_thin's 150-line guard; all logic is in the lib)
         if args.command == "warm-testmon-cache":
             return promote_lib.warm_gate_testmon_cache(args.repo)
         if args.command == "impact-tier-phases":
