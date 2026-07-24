@@ -62,6 +62,14 @@
 #      DIFFERENT isolated HOME/BEADS_DB scratch dirs and neither may observe the
 #      other's write — the overlap S2 proves is dangerous here becomes provably
 #      harmless, which is the whole point of hermeticizing instead of queueing.
+#   S8 tier_window_verdict's SKIP path, forced rather than awaited: a driver is
+#      genuinely SIGKILLed mid-tier, and the verdict on its (real, incomplete)
+#      window must be SKIP, never FAIL/ERR. A green S1/S2 alone never proves
+#      this path executes — it only fires under real CI contention.
+#   S9 the negative control for S8: an incomplete window whose driver exited
+#      with a plain non-signal rc must still classify ERR, not SKIP — rules
+#      out an implementation that fails open by SKIPping every incomplete
+#      window regardless of cause.
 #
 # The tier body is driven through the SABLE_MG_IMPACT override — a real
 # subprocess in a real checked-out combined-tree worktree that sleeps a known
@@ -482,6 +490,115 @@ print(" ".join(b.get("title","") for b in data))' "$MARKERS/$TAG_B.titles.json" 
 else
   fail "S7: exactly two hermetic probe runs recorded a HOME marker" \
        "found ${#HOME_MARKERS[@]}: ${HOME_MARKERS[*]:-<none>}"
+fi
+
+# ==========================================================================
+# S8 — tier_window_verdict's SKIP path, forced deterministically (SABLE-awmj4
+# review, optimus): a driver genuinely SIGKILLed mid-tier must classify SKIP,
+# never FAIL/ERR. This is the exact mechanism the bead exists to add, and a
+# green run of S1/S2 alone never proves it executes — it only fires when CI
+# contention supplies a real kill, which no ordinary run does. Force it.
+# ==========================================================================
+KILLLOG="$TMPROOT/skip.jsonl"
+rm -f "$KILLLOG"
+
+SLOWTIER="$TMPROOT/slow-tier.sh"
+cat > "$SLOWTIER" <<'EOF'
+#!/usr/bin/env bash
+sleep 5
+exit 0
+EOF
+chmod +x "$SLOWTIER"
+
+( SABLE_MG_IMPACT_WINDOW_LOG="$KILLLOG" SABLE_MG_IMPACT="bash $SLOWTIER" \
+    python3 "$DRIVER" "$REPO_ROOT/bin" "$FIXTURE" "$COMBINED_SHA" \
+    > "$TMPROOT/kill_out" 2>&1 ) &
+KILL_SUBPID=$!
+KILL_PID=""
+for _ in $(seq 1 100); do
+  KILL_PID="$(sed -n 's/^PID=//p' "$TMPROOT/kill_out" 2>/dev/null | head -n1)"
+  [ -n "$KILL_PID" ] && break
+  sleep 0.05
+done
+# Killed the instant its own PID is visible — the tier body sleeps 5s, so
+# this lands well before any "end" stamp could exist; no timing margin to
+# tune, no chance of the tier finishing first.
+if [ -n "$KILL_PID" ]; then
+  kill -9 "$KILL_PID" 2>/dev/null
+fi
+wait "$KILL_SUBPID"; KILL_RC=$?
+
+( SABLE_MG_IMPACT_WINDOW_LOG="$KILLLOG" python3 "$DRIVER" "$REPO_ROOT/bin" "$FIXTURE" "$COMBINED_SHA" \
+    > "$TMPROOT/kill_ok_out" 2>&1 ) &
+OK_SUBPID=$!
+wait "$OK_SUBPID"; OK_RC=$?
+OK_PID="$(sed -n 's/^PID=//p' "$TMPROOT/kill_ok_out" 2>/dev/null | head -n1)"
+
+if [ -n "$KILL_PID" ] && [ "$KILL_RC" -ge 128 ]; then
+  pass "S8: the SIGKILLed driver's own rc is signal-shaped (rc=$KILL_RC)"
+else
+  fail "S8: the SIGKILLed driver's own rc is signal-shaped" \
+       "pid='$KILL_PID' rc=$KILL_RC — the kill may not have landed before the tier finished"
+fi
+if [ -n "$OK_PID" ] && [ "$OK_RC" -eq 0 ]; then
+  VERDICT8="$(tier_window_verdict "$KILLLOG" "$KILL_PID" "$KILL_RC" "$OK_PID" "$OK_RC")"
+  case "$VERDICT8" in
+    SKIP:*) pass "S8: a genuinely SIGKILLed driver classifies SKIP, not FAIL/ERR (${VERDICT8#SKIP:})" ;;
+    *) fail "S8: a genuinely SIGKILLed driver classifies SKIP, not FAIL/ERR" "got: $VERDICT8" ;;
+  esac
+else
+  fail "S8: the counterpart driver completed normally" \
+       "pid='$OK_PID' rc=$OK_RC out=$(cat "$TMPROOT/kill_ok_out" 2>/dev/null)"
+fi
+
+# ==========================================================================
+# S9 — tier_window_verdict's ERR path, forced deterministically: the negative
+# control for S8. An incomplete window whose driver did NOT die by signal (a
+# plain non-zero exit) must still classify ERR, never SKIP. Without this, an
+# implementation that returns SKIP for EVERY incomplete window — the fail-
+# open bug S8 alone cannot catch — would pass S8 undetected.
+# ==========================================================================
+INCLOG="$TMPROOT/err.jsonl"
+rm -f "$INCLOG"
+
+INCDRIVER="$TMPROOT/incomplete-driver.py"
+cat > "$INCDRIVER" <<'EOF'
+import json, os, sys
+print(f"PID={os.getpid()}", flush=True)
+with open(os.environ["SABLE_MG_IMPACT_WINDOW_LOG"], "a") as fh:
+    fh.write(json.dumps({"event": "start", "pid": os.getpid(), "at": 0,
+                          "tree": "deadbeef", "waited": 0}) + "\n")
+# A real "end" stamp is deliberately never written: this simulates a driver
+# that recorded start and then exited abnormally WITHOUT a signal — must
+# read as ERR, never as the SKIP path S8 forces.
+sys.exit(1)
+EOF
+
+INC_OUT="$(SABLE_MG_IMPACT_WINDOW_LOG="$INCLOG" python3 "$INCDRIVER" 2>&1)"; INC_RC=$?
+INC_PID="$(printf '%s\n' "$INC_OUT" | sed -n 's/^PID=//p' | head -n1)"
+
+( SABLE_MG_IMPACT_WINDOW_LOG="$INCLOG" python3 "$DRIVER" "$REPO_ROOT/bin" "$FIXTURE" "$COMBINED_SHA" \
+    > "$TMPROOT/err_ok_out" 2>&1 ) &
+ERR_OK_SUBPID=$!
+wait "$ERR_OK_SUBPID"; ERR_OK_RC=$?
+ERR_OK_PID="$(sed -n 's/^PID=//p' "$TMPROOT/err_ok_out" 2>/dev/null | head -n1)"
+
+if [ -n "$INC_PID" ] && [ "$INC_RC" -eq 1 ]; then
+  pass "S9: the incomplete driver's own rc is a plain, non-signal exit (rc=$INC_RC)"
+else
+  fail "S9: the incomplete driver's own rc is a plain, non-signal exit" \
+       "pid='$INC_PID' rc=$INC_RC out=$INC_OUT"
+fi
+if [ -n "$ERR_OK_PID" ] && [ "$ERR_OK_RC" -eq 0 ]; then
+  VERDICT9="$(tier_window_verdict "$INCLOG" "$INC_PID" "$INC_RC" "$ERR_OK_PID" "$ERR_OK_RC")"
+  case "$VERDICT9" in
+    ERR:*) pass "S9: an incomplete window with a non-signal rc classifies ERR, not SKIP (${VERDICT9#ERR:})" ;;
+    *) fail "S9: an incomplete window with a non-signal rc classifies ERR, not SKIP" \
+            "got: $VERDICT9 — a SKIP here would be the fail-open bug S8 cannot catch alone" ;;
+  esac
+else
+  fail "S9: the counterpart driver completed normally" \
+       "pid='$ERR_OK_PID' rc=$ERR_OK_RC out=$(cat "$TMPROOT/err_ok_out" 2>/dev/null)"
 fi
 
 echo "----------------------------------------------------------------------"
