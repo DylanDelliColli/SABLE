@@ -297,6 +297,8 @@ def test_interrupt_lands_on_busy_midturn_pane_first_attempt(tmux_socket, tmp_pat
     assert end.read_text().strip() == "INTERRUPTED"  # settled via Escape, not a timeout
     time.sleep(0.5)
     pane = _capture(tmux_socket, "w")
+    # composed=<ts> (SABLE-xwy0b) trails the body in a bracket, so the
+    # pre-xwy0b literal header+body text is still a straight substring.
     assert "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force" in pane  # landed intact
     assert "cap in force" in _read_recording(rec)    # and was SUBMITTED as a turn
 
@@ -1160,6 +1162,250 @@ def test_negative_control_inline_body_through_a_real_shell_is_corrupted_before_s
     pane = _capture(tmux_socket, "w")
     assert "$(touch" not in pane
     assert "`hostname`" not in pane
+
+
+# --- SABLE-o8uti: does delivery outcome depend on PATH, or on PANE STATE? --
+#
+# The sighting: two long inline sends to a busy manager pane failed verified
+# delivery (auto-filed as beads) while a short one to the SAME pane landed
+# moments later; two immediate --body-file replays of previously-failed
+# inline bodies then landed first attempt. LENGTH ALONE was refuted by a
+# counter-example the same shift (a 3067-char --body-file send landed while a
+# shorter 2675-char inline send failed to an overlapping recipient). PATH
+# (inline vs --body-file) was the leading hypothesis after that, but every
+# trial ran on LIVE manager panes whose busy/idle state was never held fixed
+# across arms — the residual confound the dispatch flagged: retry time itself
+# could free a pane, making a later attempt succeed regardless of its path.
+# A later live trial then showed a THIRD failure mode (--body-file itself
+# failing twice in a row to the same recipient, with --interrupt landing the
+# identical content first attempt) that refutes path as a sole mechanism too
+# and points at pane state as the dominant variable, with --interrupt as a
+# candidate practical fix.
+#
+# This test is the controlled experiment the dispatch asks for, run against a
+# DETERMINISTIC stand-in instead of a live pane: busy/idle becomes a FIXED
+# variable per trial (a fresh stand-in per busy-cell trial, never inferred
+# from real-time drift), which eliminates the exact confound above by
+# construction rather than by hoping retries happen to interleave kindly.
+
+def test_delivery_outcome_by_path_and_pane_state_o8uti(tmux_socket, tmp_path):
+    """SABLE-o8uti controlled experiment (three-arm design per the dispatch's
+    2026-07-23 update): does verified-delivery outcome depend on PATH (inline
+    positional / --body-file / --body-file+--interrupt) or on PANE STATE
+    (busy / idle)? Six cells, three trials each, bodies IDENTICAL in length
+    and character content across every cell and trial, so path and pane-state
+    are the only variables that move.
+
+    The busy pane is torn down and respawned fresh before each busy-cell
+    trial rather than shared across a whole round: --interrupt's own Escape
+    legitimately ends a busy turn, so reusing one busy pane across an
+    interrupt trial and a later inline/body-file trial in the same round
+    would silently turn a later "busy" trial into an idle one."""
+    idle_session = "idle"
+    busy_session = "busy"
+    _tmux(tmux_socket, "new-session", "-d", "-s", idle_session, "-x", "200", "-y", "50",
+          "PS1='> ' bash --noprofile --norc")
+    time.sleep(0.5)
+    _tmux(tmux_socket, "set-option", "-p", "-t", idle_session, "@sable_role", "optimus")
+
+    body = ("o8uti controlled-experiment body: identical length and content "
+            "across every path and pane-state cell and every trial, so only "
+            "the path and pane-state variables ever move")
+    body_path = tmp_path / "cell_body.txt"
+    body_path.write_text(body, encoding="utf-8")
+    busy_script = tmp_path / "busy_tui.sh"
+    busy_script.write_text(_BUSY_MARKER_TUI)
+    busy_script.chmod(0o755)
+    state_dir = tmp_path / "freshness"
+
+    def respawn_busy():
+        subprocess.run(["tmux", "-L", tmux_socket, "kill-session", "-t", busy_session],
+                       capture_output=True, text=True, env=_server_env())
+        busy_ready = tmp_path / "busy_ready"
+        busy_ready.unlink(missing_ok=True)
+        go_idle = tmp_path / "busy_go_idle"
+        go_idle.unlink(missing_ok=True)
+        _tmux(tmux_socket, "new-session", "-d", "-s", busy_session, "-x", "200", "-y", "50",
+              f"REC_FILE={tmp_path / 'busy_rec.txt'} END_FILE={tmp_path / 'busy_end.txt'} "
+              f"BUSY_READY={busy_ready} GO_IDLE={go_idle} bash {busy_script}")
+        time.sleep(0.4)
+        _tmux(tmux_socket, "set-option", "-p", "-t", busy_session, "@sable_role", "optimus")
+        assert _wait_until(busy_ready.exists, timeout=10), \
+            "busy stand-in never signalled busy-entry"
+
+    def send(path, session):
+        env = {**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": session,
+               "SABLE_MSG_STATE_DIR": str(state_dir), "SABLE_MSG_AUTO_FALLBACK": "0",
+               "SABLE_MSG_SUBMIT_TRIES": "3", "SABLE_MSG_POLL_INTERVAL": "0.2",
+               "SABLE_MSG_READY_TIMEOUT": "5"}
+        if path == "inline":
+            args = ["optimus", body, "--from", "lincoln"]
+        elif path == "body-file":
+            args = ["optimus", "--body-file", str(body_path), "--from", "lincoln"]
+        else:
+            args = ["optimus", "--body-file", str(body_path), "--from", "lincoln", "--interrupt"]
+        r = subprocess.run(["python3", str(BIN), *args], capture_output=True, text=True, env=env)
+        return r.returncode == 0
+
+    paths = ["inline", "body-file", "interrupt"]
+    results = {(p, s): [] for p in paths for s in ("busy", "idle")}
+
+    for _trial in range(3):
+        for p in paths:
+            respawn_busy()
+            results[(p, "busy")].append(send(p, busy_session))
+            results[(p, "idle")].append(send(p, idle_session))
+
+    table = {f"{p}/{s}": (sum(v), len(v)) for (p, s), v in results.items()}
+    print(f"SABLE-o8uti cell table (successes/trials): {table}")
+
+    # IDLE: every path must be reliable regardless of path -- rules out
+    # inline/body-file/interrupt as a mechanism on an uncontended pane.
+    for p in paths:
+        assert all(results[(p, "idle")]), f"{p}/idle was not 100% reliable: {results[(p, 'idle')]}"
+
+    # BUSY, no --interrupt: the pane never frees within this budget, so
+    # inline and body-file must show the SAME outcome here -- if PATH alone
+    # were the mechanism, one would reliably outperform the other.
+    assert results[("inline", "busy")] == results[("body-file", "busy")], (
+        f"inline and body-file diverged against an identically-busy pane -- this "
+        f"would be evidence FOR path as a mechanism: {table}"
+    )
+    # BUSY, --interrupt: must be reliable -- the "practical fix" candidate the
+    # dispatch's update asked this experiment to check.
+    assert all(results[("interrupt", "busy")]), (
+        f"--interrupt was not reliable against a busy pane: {results[('interrupt', 'busy')]}"
+    )
+
+
+# --- freshness: supersession (SABLE-xwy0b) ----------------------------------
+#
+# The observed defect this bead is about: message A queues behind a busy
+# pane and enters its own verified-delivery retry loop; before it confirms, a
+# corrected message B (same sender, same recipient) is composed and forced
+# in with --interrupt. Every participant behaves correctly — the manager sent
+# a stronger instruction, the recipient's TUI would obey whichever text it
+# last accepted — yet A's retry loop is a mechanism by which the recipient
+# could end up acting on A anyway, later, with nothing marking it stale.
+#
+# _BUSY_MARKER_DISCARD_TUI is a one-line variant of _BUSY_MARKER_TUI above:
+# Escape DISCARDS any not-yet-submitted queued text instead of flushing it to
+# REC_FILE. This models the real Claude-TUI's --interrupt clearing the
+# composer NON-DESTRUCTIVELY (sable-msg's own module docstring: "--interrupt's
+# Escape CLEARS the composer non-destructively") — the physical mechanism
+# that keeps a still-queued, not-yet-submitted stale message from ever
+# becoming a real turn. Reusing the flush-on-interrupt _BUSY_MARKER_TUI here
+# would leak A's text into REC_FILE regardless of whether sable-msg's own
+# supersession bookkeeping works at all, making even a fully correct fix look
+# broken — so this test needs the discard variant specifically.
+_BUSY_MARKER_DISCARD_TUI = r'''#!/usr/bin/env bash
+queued=""
+busy=1
+: > "$BUSY_READY"                                  # signal busy-entry BEFORE first read
+while [ "$busy" = 1 ]; do
+  printf '\033[H\033[2J  Running the turn (esc to interrupt)\n'
+  printf '\xe2\x9d\xaf %s\n' "$queued"
+  if IFS= read -rsN1 -t 0.2 ch; then
+    case "$ch" in
+      $'\x1b') printf 'INTERRUPTED' > "$END_FILE"; queued=""; busy=0 ;;
+      $'\n'|$'\r'|'') : ;;
+      *) IFS= read -r rest; queued="$ch$rest" ;;
+    esac
+  fi
+  if [ "$busy" = 1 ] && [ -e "$GO_IDLE" ]; then
+    printf 'NATURAL' > "$END_FILE"; busy=0
+  fi
+done
+printf '\033[H\033[2J'
+printf '%.0s\n' $(seq 1 60)
+if [ -n "$queued" ]; then
+  printf '\xe2\x9d\xaf %s\n' "$queued"
+  printf '%s\n' "$queued" >> "$REC_FILE"
+fi
+while true; do
+  printf '\xe2\x9d\xaf '
+  IFS= read -r line || break
+  printf '%s\n' "$line" >> "$REC_FILE"
+done
+'''
+
+
+def _start_busy_pane_markers_discard(sock, tmp_path):
+    """Like _start_busy_pane_markers, but running _BUSY_MARKER_DISCARD_TUI
+    (see above) so Escape discards rather than flushes a queued line."""
+    rec = tmp_path / "rec.txt"
+    end = tmp_path / "end.txt"
+    busy_ready = tmp_path / "busy_ready"
+    go_idle = tmp_path / "go_idle"
+    script = tmp_path / "busy_marker_discard_tui.sh"
+    script.write_text(_BUSY_MARKER_DISCARD_TUI)
+    script.chmod(0o755)
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+          f"REC_FILE={rec} END_FILE={end} BUSY_READY={busy_ready} "
+          f"GO_IDLE={go_idle} bash {script}")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
+    return rec, end, busy_ready, go_idle
+
+
+def test_superseded_send_never_lands_after_a_later_correction_xwy0b(tmux_socket, tmp_path):
+    """SABLE-xwy0b end-to-end repro. Message A is composed to a BUSY pane
+    (queues, enters its own verified-delivery retry loop); while A is still
+    retrying, message B — same sender, same recipient — is composed and
+    forced in with --interrupt, exactly as the real incident did. A must
+    abort and report `superseded` (never confirm delivered after the fact);
+    B must deliver normally; and the pane's real transcript must show ONLY
+    B ever became a submitted turn."""
+    rec, end, busy_ready, go_idle = _start_busy_pane_markers_discard(tmux_socket, tmp_path)
+    assert _wait_until(busy_ready.exists, timeout=10), \
+        "stand-in never signalled busy-entry"
+
+    a_body = "HOLD-A push-only, superseded"
+    b_body = "HOLD-B two-part corrected hold"
+    state_dir = tmp_path / "freshness"
+    env_common = {**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
+                 "SABLE_MSG_STATE_DIR": str(state_dir)}
+
+    proc_a = subprocess.Popen(
+        ["python3", str(BIN), "optimus", a_body, "--from", "lincoln"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={**env_common, "SABLE_MSG_SUBMIT_TRIES": "40", "SABLE_MSG_POLL_INTERVAL": "0.1",
+             "SABLE_MSG_AUTO_FALLBACK": "0"},
+    )
+    try:
+        # Wait until A has actually queued its line into the busy pane (i.e.
+        # is now in its own retry/poll phase) before composing the
+        # superseding B — this is the "still retrying" window the bug lives in.
+        assert _wait_until(lambda: a_body in _capture(tmux_socket, "w"), timeout=10), \
+            "message A never queued into the busy pane"
+
+        r_b = subprocess.run(
+            ["python3", str(BIN), "optimus", b_body, "--from", "lincoln", "--interrupt"],
+            capture_output=True, text=True,
+            env={**env_common, "SABLE_MSG_SUBMIT_TRIES": "8", "SABLE_MSG_POLL_INTERVAL": "0.2",
+                "SABLE_MSG_READY_TIMEOUT": "5"},
+        )
+        assert r_b.returncode == 0, r_b.stderr
+        assert "delivered" in r_b.stderr
+
+        out_a, err_a = proc_a.communicate(timeout=20)
+    finally:
+        if proc_a.poll() is None:
+            proc_a.kill()
+        go_idle.touch()  # release the stand-in so the fixture's teardown is clean
+
+    assert proc_a.returncode != 0, (
+        f"a superseded send must not report success -- stdout={out_a!r} stderr={err_a!r}"
+    )
+    assert "superseded" in err_a, err_a
+
+    assert _wait_until(lambda: rec.exists() and b_body in _read_recording(rec), timeout=10), \
+        "message B must have actually landed as a submitted turn"
+    rec_text = _read_recording(rec)
+    assert a_body not in rec_text, (
+        "the superseded message A must never surface as a submitted turn once "
+        "B has replaced it"
+    )
 
 
 if __name__ == "__main__":
