@@ -143,19 +143,27 @@ class Samples(list):
     lead_diagnostics: list[dict]
 
 
-def _lead_diagnostic(repo: Path, state: str, trace: list[dict]) -> dict:
+def _lead_diagnostic(repo: Path, state: str, trace: list[dict], scan_debug: dict) -> dict:
     """The decisive evidence for one early sample.
 
-    `trace` MUST come from the SAME `rl.clearance(..., trace=trace)` call that
-    produced `state` (SABLE-skrdj revise #1, H1): a diagnostic that takes its
-    OWN separate `read_process_table()` snapshot can show a candidate that
-    scan_processes's own decision never saw (or vice versa), because the two
-    reads are not the same instant — the 2026-07-23 clean-room red's "state
-    contradicts the printed table" puzzle traced to exactly that gap. Passing
-    the real trace through means what you see here is provably what informed
-    `state`, not a rumour from a nearby read."""
+    `trace` and `scan_debug` MUST come from the SAME `rl.clearance(...,
+    trace=trace, scan_debug=scan_debug)` call that produced `state`
+    (SABLE-skrdj revise #1, H1): a diagnostic that takes its OWN separate
+    `read_process_table()` snapshot can show a candidate that scan_processes's
+    own decision never saw (or vice versa), because the two reads are not the
+    same instant — the 2026-07-23 clean-room red's "state contradicts the
+    printed table" puzzle traced to exactly that gap. Passing the real trace
+    through means what you see here is provably what informed `state`, not a
+    rumour from a nearby read.
+
+    `scan_debug` additionally distinguishes (revise #1, round two, per
+    tarzan): an EMPTY `trace` because the forked child was never in THIS
+    call's own raw process table at all, from an empty `trace` because it was
+    in the table but a pre-classification filter (uid / self-pid /
+    suite-shape) dropped it before roots/ancestry/foreign/unknown ever ran."""
     roots = rl.worktree_roots(str(repo))
-    return {"state": state, "roots": roots, "suite_shaped_same_uid": trace}
+    return {"state": state, "roots": roots, "suite_shaped_same_uid": trace,
+            "scan_debug": scan_debug}
 
 
 def _sample_until_exit(proc: subprocess.Popen, repo: Path, limit: float = 90.0):
@@ -167,9 +175,10 @@ def _sample_until_exit(proc: subprocess.Popen, repo: Path, limit: float = 90.0):
     while proc.poll() is None and time.monotonic() < deadline:
         visible = _suite_processes_visible(repo)
         trace: list[dict] = []
-        state = rl.clearance(base=str(repo), trace=trace).state
+        scan_debug: dict = {}
+        state = rl.clearance(base=str(repo), trace=trace, scan_debug=scan_debug).state
         if len(samples) < LEAD_DIAGNOSTIC_SAMPLES:
-            samples.lead_diagnostics.append(_lead_diagnostic(repo, state, trace))
+            samples.lead_diagnostics.append(_lead_diagnostic(repo, state, trace, scan_debug))
         samples.append((state, visible))
         time.sleep(SAMPLE_INTERVAL)
     proc.wait(timeout=30)
