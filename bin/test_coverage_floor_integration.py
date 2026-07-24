@@ -13,19 +13,28 @@ diff). This file proves the fix against the gate the fleet actually runs:
     diff content, independent of how long the real coverage-delta check
     takes to run.
 
-  * REAL CASE, SLOW — the same base/tip pair, this time through the actual
-    .github/ci/diff-cover-gate.sh end to end (a `git worktree add --detach`
-    checkout of the tip, real pytest + coverage.py + diff-cover), asserting
-    exit 0 WITHOUT any override. Measured on this host: this repo's own
-    `pytest bin/ --cov=bin` run alone exceeds 1500s wall — a known, already
-    -tracked, OPEN adjacent defect (SABLE-9yjt5; corroborating measurement
-    logged there 2026-07-24) unrelated to detect_pruning's logic, not this
-    bead's footprint to fix. Rather than hard-fail the whole bead's test
-    evidence on that unrelated defect, this test SKIPS (not passes, not
-    silently) with a message naming SABLE-9yjt5 if the real run can't
-    complete in the time budgeted — the REAL DIFF, FAST test above is what
-    actually proves the fix; this one is the full end-to-end rehearsal for
-    whenever the host/gate is fast enough to complete it.
+  * REAL CASE, SLOW, OPT-IN ONLY — the same base/tip pair, this time
+    through the actual .github/ci/diff-cover-gate.sh end to end (a `git
+    worktree add --detach` checkout of the tip, real pytest + coverage.py +
+    diff-cover), asserting exit 0 WITHOUT any override. Gated behind
+    SABLE_RUN_SLOW_COVERAGE_FLOOR_INTEGRATION=1 (skipped otherwise): this
+    test's own body shells out to the SAME `pytest bin/ --cov=bin` command
+    an ordinary `pytest bin/` sweep is already running — including the
+    coverage floor's own real check when IT promotes this very branch, so
+    left enabled by default this test would recursively re-run the entire
+    bin/ suite from inside itself on every sweep, the load-manufacturing
+    the dispatch explicitly forbids taking unilaterally (its section 9).
+    Measured on this host even so: this repo's own `pytest bin/ --cov=bin`
+    run alone exceeds 1500s wall — a known, already-tracked, OPEN adjacent
+    defect (SABLE-9yjt5; corroborating measurement logged there
+    2026-07-24) unrelated to detect_pruning's logic, not this bead's
+    footprint to fix. Rather than hard-fail the whole bead's test evidence
+    on that unrelated defect, this test additionally SKIPS (not passes,
+    not silently) with a message naming SABLE-9yjt5 if the real run can't
+    complete in the time budgeted once it IS opted in — the REAL DIFF,
+    FAST test above is what actually, unconditionally proves the fix; this
+    one is the full end-to-end rehearsal for whenever a human/agent wants
+    it and the host/gate is fast enough to complete it.
 
   * POSITIVE CONTROL — a synthetic scratch repo mirroring this repo's
     bin/-rooted layout (diff-cover-gate.sh hardcodes `pytest bin/
@@ -95,18 +104,33 @@ def test_real_be4lo7_diff_is_not_flagged_pruning():
     assert "not a pruning diff" in decision.reason
 
 
+@pytest.mark.skipif(
+    os.environ.get("SABLE_RUN_SLOW_COVERAGE_FLOOR_INTEGRATION") != "1",
+    reason="opt-in only (SABLE-owix4 self-screen finding): this test shells "
+           "out to the REAL diff-cover-gate.sh, which itself runs `pytest "
+           "bin/ --cov=bin` — the SAME command an ordinary `pytest bin/` "
+           "sweep is already running. Left enabled by default, this test "
+           "would recursively re-run the ENTIRE bin/ suite from inside "
+           "itself every time bin/ is swept — including inside the "
+           "coverage floor's own real invocation of that exact command "
+           "against this branch, which is exactly the kind of load-"
+           "manufacturing the dispatch's NO LOAD MANUFACTURING rule (SABLE-"
+           "owix4 section 9) forbids taking unilaterally. Opt in explicitly: "
+           "SABLE_RUN_SLOW_COVERAGE_FLOOR_INTEGRATION=1 pytest "
+           "bin/test_coverage_floor_integration.py -k real_be4lo7_rename_pair")
 def test_real_be4lo7_rename_pair_passes_the_real_gate_without_override(tmp_path):
-    """REAL CASE, SLOW: run the actual gate script the merge seat runs,
-    against the actual commits that were denied at exit 27 on 2026-07-24.
-    Coverage went UP (net +12 tests); this must exit 0 with no 'Coverage
-    override' line anywhere in play — the gate is never even told about
-    one. If the underlying pytest+coverage run cannot complete in the time
-    budgeted here, that is the separate, already-tracked, OPEN adjacent
-    defect SABLE-9yjt5 (bare `pytest bin/` measured at 15+min, --cov adds
-    more on top) — NOT this bead's footprint to fix — so this test SKIPS
-    with that reason rather than failing the whole bead's evidence on an
-    unrelated defect. test_real_be4lo7_diff_is_not_flagged_pruning above is
-    the fast, unconditional proof the fix itself is correct."""
+    """REAL CASE, SLOW, OPT-IN ONLY (see skipif reason above): run the
+    actual gate script the merge seat runs, against the actual commits that
+    were denied at exit 27 on 2026-07-24. Coverage went UP (net +12 tests);
+    this must exit 0 with no 'Coverage override' line anywhere in play — the
+    gate is never even told about one. If the underlying pytest+coverage run
+    cannot complete in the time budgeted here, that is the separate,
+    already-tracked, OPEN adjacent defect SABLE-9yjt5 (bare `pytest bin/`
+    measured at 15+min, --cov adds more on top) — NOT this bead's footprint
+    to fix — so this test SKIPS with that reason rather than failing the
+    whole bead's evidence on an unrelated defect.
+    test_real_be4lo7_diff_is_not_flagged_pruning above is the fast,
+    unconditional, always-on proof the fix itself is correct."""
     _require_real_history()
     worktree = tmp_path / "be4lo7-tip"
     add = _run(["git", "worktree", "add", "--detach", str(worktree), BE4LO7_TIP],
