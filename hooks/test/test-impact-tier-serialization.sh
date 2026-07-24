@@ -42,6 +42,12 @@
 #   S2 NEGATIVE CONTROL: the same two invocations with SABLE_MG_IMPACT_SERIALIZE=0
 #      -> overlap IS observed. Without this, S1 proves only that two processes
 #      happened not to collide, and would keep passing if the stamps were bogus.
+#      S1/S2 both classify overlap from the window log's own APPEND ORDER, not
+#      wall-clock timestamps (SABLE-awmj4) — immune to clock skew and to a
+#      near-zero-margin threshold flake. A driver killed by a contended CI
+#      host (its own rc is 128+signal) makes its window legitimately
+#      incomplete; that reports SKIP (inconclusive), never a FAIL, because
+#      host contention killing a process is not evidence the lock is broken.
 #   S3 the lock is one file per repo, in the merge-gate state dir, so every
 #      worktree of a seat contends on it (that IS the collision being prevented).
 #   S4 a tier that could not START (lock timeout) reports ERROR, not GREEN and
@@ -56,6 +62,14 @@
 #      DIFFERENT isolated HOME/BEADS_DB scratch dirs and neither may observe the
 #      other's write — the overlap S2 proves is dangerous here becomes provably
 #      harmless, which is the whole point of hermeticizing instead of queueing.
+#   S8 tier_window_verdict's SKIP path, forced rather than awaited: a driver is
+#      genuinely SIGKILLed mid-tier, and the verdict on its (real, incomplete)
+#      window must be SKIP, never FAIL/ERR. A green S1/S2 alone never proves
+#      this path executes — it only fires under real CI contention.
+#   S9 the negative control for S8: an incomplete window whose driver exited
+#      with a plain non-signal rc must still classify ERR, not SKIP — rules
+#      out an implementation that fails open by SKIPping every incomplete
+#      window regardless of cause.
 #
 # The tier body is driven through the SABLE_MG_IMPACT override — a real
 # subprocess in a real checked-out combined-tree worktree that sleeps a known
@@ -124,16 +138,24 @@ chmod +x "$TIER"
 # Not a reimplementation of the lock — it imports the production module and
 # calls run_impact_tier, which is the function the promote flow calls.
 cat > "$DRIVER" <<'EOF'
-import sys
+import os, sys
 sys.path.insert(0, sys.argv[1])
 import sable_gate_promote_lib as promote_lib
+# SABLE-awmj4: flushed BEFORE run_impact_tier does any real work, so this
+# line survives even a driver that a contended CI host kills mid-tier — it
+# is what lets the test correlate ITS OWN rc/output with a specific pid in
+# the window log, instead of guessing from bash's internal subshell pid.
+print(f"PID={os.getpid()}", flush=True)
 outcome, detail = promote_lib.run_impact_tier(sys.argv[2], sys.argv[3], ["bin/thing.py"])
 print(f"{outcome}\t{detail}")
 sys.exit(0 if outcome == promote_lib.IMPACT_GREEN else 1)
 EOF
 
 # run_pair <window-log> [extra env assignments...] — two backgrounded tier runs
-# against the one fixture repo. Echoes nothing; sets RC1/RC2/OUT1/OUT2.
+# against the one fixture repo. Echoes nothing; sets RC1/RC2/OUT1/OUT2/PID1/PID2.
+# PID1/PID2 come from the DRIVER's own flushed "PID=" line (SABLE-awmj4), not
+# bash's $!, so they name the SAME process identity the window log itself
+# records via os.getpid() even when a driver dies before writing anything else.
 run_pair() {
   local log="$1"; shift
   rm -f "$log"
@@ -147,24 +169,69 @@ run_pair() {
   wait $p2; RC2=$?
   OUT1="$(cat "$TMPROOT/out1")"
   OUT2="$(cat "$TMPROOT/out2")"
+  PID1="$(printf '%s\n' "$OUT1" | sed -n 's/^PID=//p' | head -n1)"
+  PID2="$(printf '%s\n' "$OUT2" | sed -n 's/^PID=//p' | head -n1)"
 }
 
-# overlap_seconds <window-log> — prints the number of seconds by which the two
-# recorded tier windows overlap (0 or negative means they did not), or "ERR:..."
-# if the log does not carry exactly two complete windows.
-overlap_seconds() {
-  python3 - "$1" <<'EOF'
+# tier_window_verdict <window-log> <pid1> <rc1> <pid2> <rc2> — classifies the
+# two recorded tier windows as OVERLAP or SEPARATE using the window log's own
+# APPEND ORDER (SABLE-awmj4), never wall-clock `at` deltas: O_APPEND writes to
+# one file are kernel-serialized, so a line's POSITION is a true total order
+# of when each stamp actually landed, with no clock-skew or near-zero-margin
+# flakiness a wall-clock subtraction invites. Prints exactly one of:
+#   SEPARATE:<info>  the two windows did not interleave in log order
+#   OVERLAP:<info>   the two windows DID interleave in log order
+#   SKIP:<info>      a pid's driver was killed by an external signal (its own
+#                     rc is 128+N) so its window is legitimately incomplete —
+#                     this run is INCONCLUSIVE about serialization, not a
+#                     failure of it; host contention is not a lock defect
+#   ERR:<info>       a stamp is missing for a reason other than a signalled
+#                     kill — names exactly which pid/event, a real gap to
+#                     investigate rather than a bare stamp-count mismatch
+tier_window_verdict() {
+  local log="$1" pid1="$2" rc1="$3" pid2="$4" rc2="$5"
+  if [ -z "$pid1" ] || [ -z "$pid2" ]; then
+    printf 'ERR:%s\n' "a driver's own PID line was never seen (pid1='$pid1' rc1=$rc1, pid2='$pid2' rc2=$rc2) — cannot correlate window-log rows to a driver"
+    return
+  fi
+  python3 - "$log" "$pid1" "$rc1" "$pid2" "$rc2" <<'EOF'
 import json, sys
-rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+
+log, pid1, rc1, pid2, rc2 = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+rcs = {pid1: rc1, pid2: rc2}
+
+try:
+    rows = [json.loads(l) for l in open(log) if l.strip()]
+except FileNotFoundError:
+    rows = []
+
 spans = {}
-for r in rows:
-    spans.setdefault(r["pid"], {})[r["event"]] = r["at"]
-done = [(v["start"], v["end"]) for v in spans.values() if "start" in v and "end" in v]
-if len(done) != 2:
-    print(f"ERR:expected 2 complete windows, got {len(done)} from {len(rows)} stamps")
+for idx, r in enumerate(rows):
+    spans.setdefault(r.get("pid"), {})[r.get("event")] = idx
+
+expected = [pid1, pid2]
+incomplete = [p for p in expected if not ({"start", "end"} <= spans.get(p, {}).keys())]
+
+if incomplete:
+    if all(rcs.get(p, 0) >= 128 for p in incomplete):
+        detail = "; ".join(
+            f"pid {p} driver terminated by signal {rcs[p] - 128} (rc={rcs[p]})" for p in incomplete
+        )
+        print(f"SKIP:{detail}")
+        sys.exit(0)
+    detail = "; ".join(
+        f"pid {p}: recorded {sorted(spans.get(p, {}).keys()) or ['nothing']} (rc={rcs.get(p)})"
+        for p in incomplete
+    )
+    print(f"ERR:missing stamp(s) — {detail}")
     sys.exit(0)
-a, b = sorted(done)
-print(f"{min(a[1], b[1]) - b[0]:.3f}")
+
+a = (spans[pid1]["start"], spans[pid1]["end"], pid1)
+b = (spans[pid2]["start"], spans[pid2]["end"], pid2)
+first, second = sorted([a, b])
+gap = second[0] - first[1]
+verdict = "SEPARATE" if gap > 0 else "OVERLAP"
+print(f"{verdict}:log-order gap {gap} line(s) between pid {first[2]}'s end stamp and pid {second[2]}'s start stamp")
 EOF
 }
 
@@ -176,36 +243,32 @@ unset SABLE_MG_IMPACT_LOCK SABLE_MG_IMPACT_SERIALIZE SABLE_MG_IMPACT_LOCK_TIMEOU
 # S1 — serialized: the windows do not overlap, and both promotes get answers
 # ==========================================================================
 run_pair "$TMPROOT/serialized.jsonl"
-OV="$(overlap_seconds "$TMPROOT/serialized.jsonl")"
 if [ "$RC1" -eq 0 ] && [ "$RC2" -eq 0 ]; then
   pass "S1: both concurrent impact tiers completed GREEN"
 else
   fail "S1: both concurrent impact tiers complete green" "rc1=$RC1 out1=$OUT1 rc2=$RC2 out2=$OUT2"
 fi
-case "$OV" in
-  ERR:*) fail "S1: the window log records two complete tier windows" "$OV" ;;
-  *) if python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) <= 0 else 1)" "$OV"; then
-       pass "S1: the two tier windows do NOT overlap (overlap=${OV}s, i.e. a real gap)"
-     else
-       fail "S1: concurrent tier windows must not overlap" \
-            "they overlapped by ${OV}s — the seat ran two non-hermetic tiers at once"
-     fi ;;
+VERDICT="$(tier_window_verdict "$TMPROOT/serialized.jsonl" "$PID1" "$RC1" "$PID2" "$RC2")"
+case "$VERDICT" in
+  SKIP:*) skip "S1: the window log records two complete tier windows — ${VERDICT#SKIP:}" ;;
+  ERR:*) fail "S1: the window log records two complete tier windows" "${VERDICT#ERR:}" ;;
+  SEPARATE:*) pass "S1: the two tier windows do NOT overlap (${VERDICT#SEPARATE:})" ;;
+  OVERLAP:*) fail "S1: concurrent tier windows must not overlap" \
+                   "they overlapped (${VERDICT#OVERLAP:}) — the seat ran two non-hermetic tiers at once" ;;
 esac
 
 # ==========================================================================
 # S2 — NEGATIVE CONTROL: with the lock off, the same harness SEES the overlap
 # ==========================================================================
 run_pair "$TMPROOT/unserialized.jsonl" env SABLE_MG_IMPACT_SERIALIZE=0
-OV0="$(overlap_seconds "$TMPROOT/unserialized.jsonl")"
-case "$OV0" in
-  ERR:*) fail "S2: the window log records two complete tier windows" "$OV0" ;;
-  *) if python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" "$OV0"; then
-       pass "S2: negative control — unserialized tiers DO overlap (${OV0}s), so S1 is not vacuous"
-     else
-       fail "S2: the instrument can detect overlap at all" \
-            "with SABLE_MG_IMPACT_SERIALIZE=0 the windows still did not overlap (overlap=${OV0}s); \
-S1's non-overlap therefore proves nothing"
-     fi ;;
+VERDICT0="$(tier_window_verdict "$TMPROOT/unserialized.jsonl" "$PID1" "$RC1" "$PID2" "$RC2")"
+case "$VERDICT0" in
+  SKIP:*) skip "S2: negative control — inconclusive, a driver was killed by host contention (${VERDICT0#SKIP:})" ;;
+  ERR:*) fail "S2: the window log records two complete tier windows" "${VERDICT0#ERR:}" ;;
+  OVERLAP:*) pass "S2: negative control — unserialized tiers DO overlap (${VERDICT0#OVERLAP:}), so S1 is not vacuous" ;;
+  SEPARATE:*) fail "S2: the instrument can detect overlap at all" \
+                    "with SABLE_MG_IMPACT_SERIALIZE=0 the windows still did not overlap (${VERDICT0#SEPARATE:}); \
+S1's non-overlap therefore proves nothing" ;;
 esac
 
 # ==========================================================================
@@ -427,6 +490,115 @@ print(" ".join(b.get("title","") for b in data))' "$MARKERS/$TAG_B.titles.json" 
 else
   fail "S7: exactly two hermetic probe runs recorded a HOME marker" \
        "found ${#HOME_MARKERS[@]}: ${HOME_MARKERS[*]:-<none>}"
+fi
+
+# ==========================================================================
+# S8 — tier_window_verdict's SKIP path, forced deterministically (SABLE-awmj4
+# review, optimus): a driver genuinely SIGKILLed mid-tier must classify SKIP,
+# never FAIL/ERR. This is the exact mechanism the bead exists to add, and a
+# green run of S1/S2 alone never proves it executes — it only fires when CI
+# contention supplies a real kill, which no ordinary run does. Force it.
+# ==========================================================================
+KILLLOG="$TMPROOT/skip.jsonl"
+rm -f "$KILLLOG"
+
+SLOWTIER="$TMPROOT/slow-tier.sh"
+cat > "$SLOWTIER" <<'EOF'
+#!/usr/bin/env bash
+sleep 5
+exit 0
+EOF
+chmod +x "$SLOWTIER"
+
+( SABLE_MG_IMPACT_WINDOW_LOG="$KILLLOG" SABLE_MG_IMPACT="bash $SLOWTIER" \
+    python3 "$DRIVER" "$REPO_ROOT/bin" "$FIXTURE" "$COMBINED_SHA" \
+    > "$TMPROOT/kill_out" 2>&1 ) &
+KILL_SUBPID=$!
+KILL_PID=""
+for _ in $(seq 1 100); do
+  KILL_PID="$(sed -n 's/^PID=//p' "$TMPROOT/kill_out" 2>/dev/null | head -n1)"
+  [ -n "$KILL_PID" ] && break
+  sleep 0.05
+done
+# Killed the instant its own PID is visible — the tier body sleeps 5s, so
+# this lands well before any "end" stamp could exist; no timing margin to
+# tune, no chance of the tier finishing first.
+if [ -n "$KILL_PID" ]; then
+  kill -9 "$KILL_PID" 2>/dev/null
+fi
+wait "$KILL_SUBPID"; KILL_RC=$?
+
+( SABLE_MG_IMPACT_WINDOW_LOG="$KILLLOG" python3 "$DRIVER" "$REPO_ROOT/bin" "$FIXTURE" "$COMBINED_SHA" \
+    > "$TMPROOT/kill_ok_out" 2>&1 ) &
+OK_SUBPID=$!
+wait "$OK_SUBPID"; OK_RC=$?
+OK_PID="$(sed -n 's/^PID=//p' "$TMPROOT/kill_ok_out" 2>/dev/null | head -n1)"
+
+if [ -n "$KILL_PID" ] && [ "$KILL_RC" -ge 128 ]; then
+  pass "S8: the SIGKILLed driver's own rc is signal-shaped (rc=$KILL_RC)"
+else
+  fail "S8: the SIGKILLed driver's own rc is signal-shaped" \
+       "pid='$KILL_PID' rc=$KILL_RC — the kill may not have landed before the tier finished"
+fi
+if [ -n "$OK_PID" ] && [ "$OK_RC" -eq 0 ]; then
+  VERDICT8="$(tier_window_verdict "$KILLLOG" "$KILL_PID" "$KILL_RC" "$OK_PID" "$OK_RC")"
+  case "$VERDICT8" in
+    SKIP:*) pass "S8: a genuinely SIGKILLed driver classifies SKIP, not FAIL/ERR (${VERDICT8#SKIP:})" ;;
+    *) fail "S8: a genuinely SIGKILLed driver classifies SKIP, not FAIL/ERR" "got: $VERDICT8" ;;
+  esac
+else
+  fail "S8: the counterpart driver completed normally" \
+       "pid='$OK_PID' rc=$OK_RC out=$(cat "$TMPROOT/kill_ok_out" 2>/dev/null)"
+fi
+
+# ==========================================================================
+# S9 — tier_window_verdict's ERR path, forced deterministically: the negative
+# control for S8. An incomplete window whose driver did NOT die by signal (a
+# plain non-zero exit) must still classify ERR, never SKIP. Without this, an
+# implementation that returns SKIP for EVERY incomplete window — the fail-
+# open bug S8 alone cannot catch — would pass S8 undetected.
+# ==========================================================================
+INCLOG="$TMPROOT/err.jsonl"
+rm -f "$INCLOG"
+
+INCDRIVER="$TMPROOT/incomplete-driver.py"
+cat > "$INCDRIVER" <<'EOF'
+import json, os, sys
+print(f"PID={os.getpid()}", flush=True)
+with open(os.environ["SABLE_MG_IMPACT_WINDOW_LOG"], "a") as fh:
+    fh.write(json.dumps({"event": "start", "pid": os.getpid(), "at": 0,
+                          "tree": "deadbeef", "waited": 0}) + "\n")
+# A real "end" stamp is deliberately never written: this simulates a driver
+# that recorded start and then exited abnormally WITHOUT a signal — must
+# read as ERR, never as the SKIP path S8 forces.
+sys.exit(1)
+EOF
+
+INC_OUT="$(SABLE_MG_IMPACT_WINDOW_LOG="$INCLOG" python3 "$INCDRIVER" 2>&1)"; INC_RC=$?
+INC_PID="$(printf '%s\n' "$INC_OUT" | sed -n 's/^PID=//p' | head -n1)"
+
+( SABLE_MG_IMPACT_WINDOW_LOG="$INCLOG" python3 "$DRIVER" "$REPO_ROOT/bin" "$FIXTURE" "$COMBINED_SHA" \
+    > "$TMPROOT/err_ok_out" 2>&1 ) &
+ERR_OK_SUBPID=$!
+wait "$ERR_OK_SUBPID"; ERR_OK_RC=$?
+ERR_OK_PID="$(sed -n 's/^PID=//p' "$TMPROOT/err_ok_out" 2>/dev/null | head -n1)"
+
+if [ -n "$INC_PID" ] && [ "$INC_RC" -eq 1 ]; then
+  pass "S9: the incomplete driver's own rc is a plain, non-signal exit (rc=$INC_RC)"
+else
+  fail "S9: the incomplete driver's own rc is a plain, non-signal exit" \
+       "pid='$INC_PID' rc=$INC_RC out=$INC_OUT"
+fi
+if [ -n "$ERR_OK_PID" ] && [ "$ERR_OK_RC" -eq 0 ]; then
+  VERDICT9="$(tier_window_verdict "$INCLOG" "$INC_PID" "$INC_RC" "$ERR_OK_PID" "$ERR_OK_RC")"
+  case "$VERDICT9" in
+    ERR:*) pass "S9: an incomplete window with a non-signal rc classifies ERR, not SKIP (${VERDICT9#ERR:})" ;;
+    *) fail "S9: an incomplete window with a non-signal rc classifies ERR, not SKIP" \
+            "got: $VERDICT9 — a SKIP here would be the fail-open bug S8 cannot catch alone" ;;
+  esac
+else
+  fail "S9: the counterpart driver completed normally" \
+       "pid='$ERR_OK_PID' rc=$ERR_OK_RC out=$(cat "$TMPROOT/err_ok_out" 2>/dev/null)"
 fi
 
 echo "----------------------------------------------------------------------"
