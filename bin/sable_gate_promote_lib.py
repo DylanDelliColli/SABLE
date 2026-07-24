@@ -88,6 +88,7 @@ from enum import Enum
 from pathlib import Path
 
 import sable_batch_admission_lib as admission
+import sable_batch_fold_lib as fold_lib
 import sable_batch_key_lib as batch_key
 import sable_coverage_floor_lib as coverage_floor_lib
 import sable_footprint_lib as footprint_lib
@@ -2629,6 +2630,12 @@ BATCH_RECORD_SCHEMA_VERSION = 1
 # children may define further outcome strings without touching this one.
 BATCH_OUTCOME_LANDED = "landed"
 BATCH_OUTCOME_FELL_BACK_SERIAL = "fell_back_serial"
+# The two terminal outcomes of the bisection child (SABLE-be4lo.8) — added
+# here, beside their siblings, exactly as this block's comment anticipated
+# ("those children may define further outcome strings"). Neither can ever
+# accompany a landing: both describe a batch that was RED and stayed unlanded.
+BATCH_OUTCOME_BISECTED_CULPRIT = "bisected_culprit"
+BATCH_OUTCOME_COULD_NOT_ATTRIBUTE = "could_not_attribute"
 
 
 @dataclass(frozen=True)
@@ -2645,17 +2652,27 @@ class BatchRecord:
     the same member set, admitted in any order, serializes identically and
     keys identically. Construct via from_members(); the bare dataclass
     constructor exists for from_dict()'s round trip, which reproduces a
-    persisted (already-canonicalized) record rather than re-deriving one."""
+    persisted (already-canonicalized) record rather than re-deriving one.
+
+    culprit / report_lines are ADDITIVE fields for the red-batch bisection
+    child (SABLE-be4lo.8): a batch that went red and was bisected still
+    produces a promote record — it just records WHO was named (culprit) and
+    the verbatim report the seat and the fleet saw (report_lines), rather than
+    a landing. They default to absent so every pre-bisection caller, and every
+    record already persisted, reconstructs unchanged."""
     base_sha: str
     setkey: str
     combined_ref: str
     outcome: str
     fold_disjoint: bool
     members: tuple[BatchMember, ...]
+    culprit: str = ""
+    report_lines: tuple[str, ...] = ()
 
     @classmethod
     def from_members(cls, base_sha: str, members: list[BatchMember], *,
-                     combined_ref: str, outcome: str, fold_disjoint: bool) -> "BatchRecord":
+                     combined_ref: str, outcome: str, fold_disjoint: bool,
+                     culprit: str = "", report_lines: tuple[str, ...] = ()) -> "BatchRecord":
         """The only constructor that canonicalizes: members is re-sorted by
         tip_sha (the same key setkey() sorts on) before anything is stored or
         hashed, so a caller's admission order can never leak into the
@@ -2668,7 +2685,8 @@ class BatchRecord:
         canonical = tuple(sorted(members, key=lambda m: m.tip_sha))
         key = batch_key.setkey(base_sha, [m.tip_sha for m in canonical])
         return cls(base_sha=base_sha, setkey=key, combined_ref=combined_ref,
-                   outcome=outcome, fold_disjoint=fold_disjoint, members=canonical)
+                   outcome=outcome, fold_disjoint=fold_disjoint, members=canonical,
+                   culprit=culprit, report_lines=tuple(report_lines))
 
     def member_branches(self) -> tuple[str, ...]:
         return tuple(m.branch for m in self.members)
@@ -2691,6 +2709,8 @@ class BatchRecord:
             "outcome": self.outcome,
             "fold_disjoint": self.fold_disjoint,
             "members": [m.to_dict() for m in self.members],
+            "culprit": self.culprit,
+            "report_lines": list(self.report_lines),
         }
 
     @classmethod
@@ -2708,6 +2728,8 @@ class BatchRecord:
             outcome=str(data.get("outcome", "")),
             fold_disjoint=bool(data.get("fold_disjoint", False)),
             members=members,
+            culprit=str(data.get("culprit", "")),
+            report_lines=tuple(data.get("report_lines") or ()),
         )
 
 
@@ -3473,6 +3495,31 @@ def land_batch(repo: str, remote: str, base: str, base_sha: str, fold_tip: str,
     return BatchLandResult(BATCH_OUTCOME_LANDED, landed, reason, ())
 
 
+def resolve_batch_members(repo: str, remote: str, base_sha: str, member_specs: list,
+                          command: str) -> list[BatchMember]:
+    """Turn raw `branch` / `branch:BEAD[,BEAD...]` CLI specs into the typed
+    BatchMember set both batch entrypoints (land-batch, bisect-batch) need.
+
+    ONE resolver rather than one per subcommand: a bisection that derived its
+    member tips or footprints even slightly differently from the land it feeds
+    would be bisecting a different batch than the one that went red — the
+    Shotgun Surgery risk the epic's architecture review flagged on the
+    (base, branch)-pair sites, in its member-set form. Raises EXIT_USAGE on an
+    empty spec list: a batch command with no members is a usage error, never a
+    vacuous no-op (SABLE-p9n7k)."""
+    members: list[BatchMember] = []
+    for spec in member_specs:
+        branch, _, bead_part = spec.partition(":")
+        bead_ids = tuple(b for b in bead_part.split(",") if b)
+        git_lib._git(repo, "fetch", remote, branch, check=False)
+        tip = git_lib.resolve_commit(repo, classify.qualify_remote_ref(remote, branch))
+        paths = tuple(sorted(footprint_lib.changed_paths(repo, base_sha, tip)))
+        members.append(BatchMember(branch, tip, bead_ids, paths))
+    if not members:
+        raise GateError(classify.EXIT_USAGE, f"{command} requires at least one --member")
+    return members
+
+
 def land_batch_from_refs(base: str, member_specs: list, repo: str, remote: str,
                          manager: str = "lincoln") -> int:
     """CLI orchestrator for `sable-merge-gate land-batch`: resolve each member
@@ -3491,16 +3538,7 @@ def land_batch_from_refs(base: str, member_specs: list, repo: str, remote: str,
     git_lib._git(repo, "fetch", remote, base, check=False)
     base_sha = git_lib.resolve_commit(repo, base_ref)
 
-    members: list[BatchMember] = []
-    for spec in member_specs:
-        branch, _, bead_part = spec.partition(":")
-        bead_ids = tuple(b for b in bead_part.split(",") if b)
-        git_lib._git(repo, "fetch", remote, branch, check=False)
-        tip = git_lib.resolve_commit(repo, classify.qualify_remote_ref(remote, branch))
-        paths = tuple(sorted(footprint_lib.changed_paths(repo, base_sha, tip)))
-        members.append(BatchMember(branch, tip, bead_ids, paths))
-    if not members:
-        raise GateError(classify.EXIT_USAGE, "land-batch requires at least one --member")
+    members = resolve_batch_members(repo, remote, base_sha, member_specs, "land-batch")
 
     budget = combined_tree_budget([list(m.footprint_paths) for m in members])
     setkey = batch_key.setkey(base_sha, [m.tip_sha for m in members])
@@ -3533,3 +3571,445 @@ def register_land_batch(sub) -> None:
     lb.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
     lb.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
     lb.add_argument("--manager", default="lincoln")
+
+
+# --------------------------------------------------------------------------
+# THE RED-BATCH BISECTION STATE MACHINE (SABLE-be4lo.8, architecture decision 4)
+# --------------------------------------------------------------------------
+#
+# The other half of the batched gate: what happens when the combined run comes
+# back RED. GATE-CLASS, like the landing path above, and — this is the whole
+# safety argument — a NON-LANDING path. Nothing in this section pushes to the
+# integration branch. It only re-folds subsets, re-verifies them, and reports.
+# "Zero members land from the batched path across every red node of the
+# bisection tree" is therefore STRUCTURAL, not a discipline this code has to
+# keep: land_batch is the only writer, and nothing here calls it.
+#
+# THE STATE MACHINE. A node is a member subset PRESUMED to carry the failure.
+# Starting at the whole (verified-red) batch:
+#
+#   |S| == 1   verify S alone. RED -> S's one member IS the culprit, and it was
+#              seen red BY ITSELF, never inferred. GREEN -> this branch of the
+#              tree attributes nothing.
+#   |S| >= 2   split into halves L, R (left takes the extra on an odd count).
+#              Verify L.
+#                RED   -> descend into L. R is untouched and re-batchable.
+#                GREEN -> descend into R WITHOUT spending a run on R itself:
+#                         the culprit, if there is a single one, is in R, and
+#                         if R's own descent finds nothing then no single member
+#                         is at fault and the redness is an INTERACTION.
+#
+# Two properties fall out of that shape, and both are the point:
+#
+#  1. A NAMED CULPRIT IS ALWAYS BACKED BY A SOLO RED RUN. The machine never
+#     concludes "it must be the other one" from a green sibling — that
+#     inference is unsound precisely when the failure is an interaction, which
+#     is the case this whole section exists for. Descending on a green half is
+#     a cheap SEARCH heuristic; the naming itself is always a measurement.
+#  2. THE <=3-RUNS-AT-n=4 BOUND (architecture decision 4) is arithmetic, not
+#     aspiration — max_bisection_rounds() states it and bisect_red_batch()
+#     ASSERTS its own run count against it, so a future edit that widens the
+#     search reds the gate here rather than silently costing the fleet CI
+#     cycles. Verifying BOTH halves at every level (the obvious alternative)
+#     costs 4 at n=4 and misses the bound.
+#
+# COULD-NOT-ATTRIBUTE is the interaction verdict: the combined object is red
+# and every subset the descent verified came back green. No member-level
+# disjointness check can catch that — two members can touch disjoint files and
+# still break each other, which is exactly why the epic verifies the COMBINED
+# tree rather than trusting disjointness (locked contract SABLE-djopw:
+# disjointness is necessary, never sufficient). The safe degradation is
+# ALL-SERIAL: every member goes back to the serial queue and lands as itself,
+# where the interacting pair surfaces LATE BUT LOUD — as a red on the second
+# member's own serial gate cycle, against a base that by then contains the
+# first. Late-but-loud beats fast-and-silent; the alternative (land the batch
+# anyway, or drop members quietly) is the failure this bead exists to prevent.
+
+
+BISECT_REPORT_COULD_NOT_ATTRIBUTE = "COULD-NOT-ATTRIBUTE"
+"""The interaction verdict's token, verbatim. Named as a constant so the
+acceptance, the report and any downstream reader agree on ONE spelling."""
+
+
+class VacuousBisectionError(ValueError):
+    """Raised when a bisection result would carry ZERO verification rounds.
+
+    A red batch that produced no bisection rounds has not been bisected — it
+    has been asserted about. Every property this section reports (a culprit, a
+    COULD-NOT-ATTRIBUTE, a bound) is a statement ABOUT the round set, so an
+    empty round set makes all of them vacuously true at once, which is the
+    exact shape SABLE-p9n7k exists to refuse. Constructing the result raises
+    instead, so neither the caller nor a test can pass over nothing."""
+
+
+@dataclass(frozen=True)
+class BisectionRound:
+    """ONE combined verification run performed during a bisection — a node of
+    the bisection tree, recorded whether it came back green or red.
+
+    branches    — the member subset this round verified, in canonical order.
+    combined_ref— the ci-verify/batch-<setkey7> ref this round's object was
+                  pushed to; one ref per round is the observable proof of how
+                  many extra combined runs the bisection actually cost.
+    fold_tip    — the folded object that ref carries.
+    green       — the verdict. `green is False` is a RED NODE, and the
+                  no-silent-landing sweep is defined over exactly those.
+    adopted     — True when this round ADOPTED an object already standing on
+                  its ref rather than folding and pushing a fresh one (see
+                  _batch_round_object)."""
+    branches: tuple[str, ...]
+    combined_ref: str
+    fold_tip: str
+    green: bool
+    adopted: bool = False
+
+    def to_dict(self) -> dict:
+        return {"branches": list(self.branches), "combined_ref": self.combined_ref,
+                "fold_tip": self.fold_tip, "green": self.green, "adopted": self.adopted}
+
+
+@dataclass(frozen=True)
+class BisectionResult:
+    """The terminal shape of one red-batch bisection.
+
+    outcome      — BATCH_OUTCOME_BISECTED_CULPRIT or
+                   BATCH_OUTCOME_COULD_NOT_ATTRIBUTE. Never a landing outcome:
+                   this path lands nothing.
+    culprit      — the member branch verified RED ALONE, or "" when the
+                   bisection could not attribute.
+    rounds       — every combined run the bisection spent, in the order spent.
+    serial_queue — the members returning to the SERIAL queue as themselves:
+                   just the culprit on an attribution, ALL members on a
+                   COULD-NOT-ATTRIBUTE (the all-serial fallback).
+    rebatch      — the members that may be re-batched together (empty on a
+                   COULD-NOT-ATTRIBUTE — an unattributed interaction makes the
+                   whole set suspect, so re-batching any of it would re-run the
+                   same unanswered question).
+    report_lines — the loud, observable report, verbatim as printed, notified,
+                   and stamped into the promote record."""
+    outcome: str
+    culprit: str
+    rounds: tuple[BisectionRound, ...]
+    serial_queue: tuple[str, ...]
+    rebatch: tuple[str, ...]
+    report_lines: tuple[str, ...]
+
+    def __post_init__(self):
+        if not self.rounds:
+            raise VacuousBisectionError(
+                "a bisection result must carry at least one verification round — "
+                "a red batch that produced zero rounds was never bisected, and "
+                "every assertion over an empty round set passes vacuously "
+                "(SABLE-p9n7k)")
+
+    @property
+    def attributed(self) -> bool:
+        return self.outcome == BATCH_OUTCOME_BISECTED_CULPRIT
+
+    @property
+    def red_rounds(self) -> tuple[BisectionRound, ...]:
+        """Every RED node of the bisection tree — the set the no-silent-landing
+        sweep is defined over. Non-empty on an attribution (the culprit's own
+        solo run is red); empty on a COULD-NOT-ATTRIBUTE, which is what that
+        verdict MEANS."""
+        return tuple(r for r in self.rounds if not r.green)
+
+    @property
+    def exit_code(self) -> int:
+        """EXIT_RED for both outcomes. The batch was red and nothing landed —
+        the same thing a red single-branch promote reports, so a caller that
+        already branches on the taxonomy needs no new case to stay correct."""
+        return classify.EXIT_RED
+
+
+def max_bisection_rounds(n: int) -> int:
+    """The WORST-CASE number of extra combined runs bisect_red_batch can spend
+    on an n-member red batch. Pure arithmetic over the state machine's own
+    shape: one run to verify the left half, then the worst of the two halves.
+
+        f(1) = 1                      (the solo verification that names a culprit)
+        f(n) = 1 + max(f(|L|), f(|R|))
+
+    f(4) == 3, which IS architecture decision 4's "<=3 extra combined runs at
+    n=4" — stated here as a computation so the bound is checkable at any n and
+    asserted by the machine against itself, rather than being a sentence in a
+    bead that only a hand-written n=4 test ever compares against."""
+    if n < 1:
+        raise ValueError(f"a bisection needs at least one member, got n={n}")
+    if n == 1:
+        return 1
+    left = (n + 1) // 2
+    return 1 + max(max_bisection_rounds(left), max_bisection_rounds(n - left))
+
+
+def bisection_split(members: list) -> tuple[list, list]:
+    """Split a bisection node into halves; the LEFT half takes the extra member
+    on an odd count. Both halves are non-empty by construction, so the descent
+    always makes progress and cannot loop."""
+    if len(members) < 2:
+        raise ValueError("bisection_split needs at least two members to split")
+    mid = (len(members) + 1) // 2
+    return list(members[:mid]), list(members[mid:])
+
+
+def _bisection_report(outcome: str, culprit: str, members: tuple, rounds: list,
+                      bound: int, serial_queue: tuple, rebatch: tuple) -> tuple[str, ...]:
+    """The report's exact words. Kept in ONE function because the vocabulary is
+    the deliverable — 'the report NAMES the member' and the literal token
+    COULD-NOT-ATTRIBUTE are what the acceptance reads, and a second site
+    phrasing either of them slightly differently is how a verbatim contract
+    stops being verbatim. Note what is NOT here: the attributed report never
+    contains the COULD-NOT-ATTRIBUTE token, which is what makes that token a
+    discriminating signal rather than decoration."""
+    n = len(members)
+    held = (f"ZERO members landed from the batched path: all {n} member(s) are held "
+            f"at the batch and land only through the serial queue.")
+    if outcome == BATCH_OUTCOME_BISECTED_CULPRIT:
+        return (
+            f"BATCH RED — CULPRIT ISOLATED: {culprit}. Verified RED ALONE (never "
+            f"inferred from a green sibling) in {len(rounds)} extra combined run(s), "
+            f"bound {bound} at n={n}.",
+            f"SERIAL QUEUE: {culprit} returns to the serial queue as itself.",
+            "RE-BATCH: " + (", ".join(rebatch) if rebatch else
+                            "(nothing — the culprit was the only member)"),
+            held,
+        )
+    return (
+        f"{BISECT_REPORT_COULD_NOT_ATTRIBUTE}: the combined object is RED and every "
+        f"bisected half verified GREEN. This is an INTERACTION-ONLY failure — no "
+        f"member is individually at fault — and it is the case member disjointness "
+        f"cannot catch, which is why the combined run exists at all.",
+        f"ALL-SERIAL FALLBACK: all {n} member(s) return to the serial queue and land "
+        f"as themselves, in canonical order: {', '.join(serial_queue)}. The "
+        f"interacting pair surfaces LATE BUT LOUD, as a red on the second member's "
+        f"own serial gate cycle against a base that by then carries the first.",
+        held,
+    )
+
+
+def _batch_round_object(repo: str, remote: str, base_sha: str, subset: list) -> tuple[str, str, bool]:
+    """The combined object for ONE bisection round, as (tip, ref, adopted).
+
+    ADOPT BEFORE RE-FOLDING, for the same reason promote() adopts a kicked
+    preview instead of rebuilding one. The round's ref name is a pure function
+    of (base_sha, member tips) — batch_key.setkey — but the FOLDED COMMIT is
+    not: commit-tree stamps a committer date, so re-folding the same subset a
+    second later produces a different SHA for the same ref. Pushing that is a
+    NON-FAST-FORWARD (git refuses it, and a --force would cancel any run
+    already in flight on that ref — the SABLE-sc24 spurious-RED failure). So
+    when the ref already stands, and the object standing on it is verifiably a
+    fold chain of exactly this many members built on exactly this base
+    (_fold_tip_built_on — the ref name alone is not taken as proof), that
+    object IS this round's object: same base, same member tips, already
+    triggered. Anything else — ref absent, unfetchable, or not built on this
+    base — falls through to a normal fold-and-push, so adoption can never
+    change a verdict, only skip a duplicate.
+
+    This is what makes a bisection RESUMABLE: a seat that crashed mid-bisection
+    re-runs it and pays only for the rounds it had not yet triggered."""
+    fold_members = [fold_lib.FoldMember(m.branch, m.tip_sha,
+                                        m.bead_ids[0] if m.bead_ids else "")
+                    for m in subset]
+    ref = classify.preview_ref_name(
+        "batch", batch_key.setkey(base_sha, [m.tip_sha for m in subset]))
+    standing = git_lib.remote_ref_commit(repo, remote, ref)
+    if standing:
+        git_lib._git(repo, "fetch", remote, ref, check=False)
+        if _fold_tip_built_on(repo, base_sha, standing, len(subset)):
+            return standing, ref, True
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"bisection round REFUSED: {ref} already stands at {standing[:7]}, which is "
+            f"NOT a {len(subset)}-member fold chain built on base {base_sha[:7]} (or is "
+            f"not fetchable, so it cannot be shown to be one). The ref name is derived "
+            f"from exactly that base and member set, so this is a foreign or corrupt "
+            f"ref, not this round's object. Refusing rather than force-pushing over it: "
+            f"a force would cancel any run in flight on that ref (SABLE-sc24). Delete "
+            f"the ref and re-run.")
+    tip, pushed_ref = fold_lib.push_batch_ref(repo, remote, base_sha, fold_members)
+    return tip, pushed_ref, False
+
+
+def bisect_red_batch(repo: str, remote: str, base_sha: str, members: list, verify,
+                     *, combined_ref: str = "", manager: str = "lincoln") -> BisectionResult:
+    """Bisect a RED batch: name the culprit, or say COULD-NOT-ATTRIBUTE — and
+    land nothing either way. See this section's header for the state machine.
+
+    `verify(subset, fold_tip, combined_ref) -> bool` is the combined-run seam:
+    True means that subset's folded object verified GREEN. ci_batch_verify()
+    is the production implementation (read the Actions verdict for the ref this
+    function just pushed); a caller with its own verifier — a local impact tier,
+    an integration sandbox — passes one in. Every subset's object comes from
+    sable_batch_fold_lib, the SAME builder that produced the object which went
+    red (or is adopted from that subset's standing ref — see
+    _batch_round_object), so a bisection round tests what a landing of that
+    subset would land.
+
+    Raises EmptyBatchError on an empty member list (never a vacuous no-op
+    bisection) and GateError(EXIT_PRECONDITION) if the machine ever spends more
+    runs than max_bisection_rounds() allows."""
+    if not members:
+        raise EmptyBatchError(
+            "bisect_red_batch requires at least one member — an empty batch cannot "
+            "be red, and bisecting nothing is a caller bug (SABLE-p9n7k)")
+    # Canonical order, by the SAME key BatchRecord.from_members sorts on: the
+    # bisection tree — and therefore which culprit a multi-culprit batch names
+    # first — must be a function of the member SET, not of the caller's
+    # admission order.
+    canonical = tuple(sorted(members, key=lambda m: m.tip_sha))
+    rounds: list[BisectionRound] = []
+    seen: dict[tuple[str, ...], bool] = {}
+
+    def _verify_subset(subset: list) -> bool:
+        key = tuple(m.branch for m in subset)
+        if key in seen:
+            # Already measured this exact subset (the |L|==1 red case descends
+            # into a half it just verified). Re-running it would spend a real CI
+            # cycle to re-learn a known fact and would inflate the round count
+            # past the bound for no information.
+            return seen[key]
+        tip, ref, adopted = _batch_round_object(repo, remote, base_sha, subset)
+        green = bool(verify(list(subset), tip, ref))
+        rounds.append(BisectionRound(key, ref, tip, green, adopted))
+        seen[key] = green
+        return green
+
+    def _descend(subset: list) -> str:
+        if len(subset) == 1:
+            # A culprit is named ONLY here, and only on a solo RED run.
+            return "" if _verify_subset(subset) else subset[0].branch
+        left, right = bisection_split(subset)
+        if not _verify_subset(left):
+            return _descend(left)
+        return _descend(right)
+
+    culprit = _descend(list(canonical))
+
+    bound = max_bisection_rounds(len(canonical))
+    if len(rounds) > bound:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"bisection spent {len(rounds)} combined runs on n={len(canonical)}, past "
+            f"its own bound of {bound} (architecture decision 4). The search widened "
+            f"without the bound moving with it — a batch that costs more CI cycles "
+            f"than it saves is the failure this check exists to catch.")
+
+    branches = tuple(m.branch for m in canonical)
+    if culprit:
+        outcome = BATCH_OUTCOME_BISECTED_CULPRIT
+        serial_queue = (culprit,)
+        rebatch = tuple(b for b in branches if b != culprit)
+    else:
+        outcome = BATCH_OUTCOME_COULD_NOT_ATTRIBUTE
+        serial_queue = branches
+        rebatch = ()
+    report = _bisection_report(outcome, culprit, canonical, rounds, bound,
+                               serial_queue, rebatch)
+    result = BisectionResult(outcome, culprit, tuple(rounds), serial_queue, rebatch, report)
+
+    # LOUD AND OBSERVABLE, on all three channels a red batch is read through:
+    # the seat's own stdout, the lane manager's cockpit, and the durable promote
+    # record. A degradation only one of the three can see is the silent kind.
+    rendered = render_bisection_report(result)
+    print(rendered)
+    _notify(manager, f"batch RED ({combined_ref or 'batch'}):\n{rendered}")
+    _stamp_batch_record(repo, BatchRecord.from_members(
+        base_sha, list(canonical), combined_ref=combined_ref, outcome=outcome,
+        fold_disjoint=True, culprit=culprit, report_lines=report))
+    return result
+
+
+def render_bisection_report(result: BisectionResult) -> str:
+    """The report as one printable block — the report LINES, verbatim, never a
+    re-derivation. Every channel renders through here so stdout, the cockpit
+    notification and the promote record cannot drift apart."""
+    return "\n".join(result.report_lines)
+
+
+def ci_batch_verify(repo: str, remote: str):
+    """The PRODUCTION verify seam: a bisection round's object has just been
+    pushed to its own ci-verify/batch-<setkey7> ref, so the verdict for that
+    round is the Actions verdict for that ref — read, never recomputed.
+
+    A verdict that is neither green nor red (Actions down, a cancelled run)
+    RAISES with that verdict's own taxonomy code rather than being coerced to
+    either. A bisection that guessed 'red' on an unobtainable verdict would
+    name an innocent member; one that guessed 'green' would clear a guilty
+    one.
+
+    The ref is deleted once its verdict is IN HAND — the same cleanup-on-both-
+    polarities discipline promote() keeps, and the complement of
+    _batch_round_object's adoption rather than a contradiction of it: a seat
+    that dies BEFORE the verdict leaves the ref standing, so the re-run adopts
+    it and re-triggers nothing; one that dies AFTER has already consumed it,
+    so the re-run correctly folds and pushes afresh."""
+    def _verify(subset: list, fold_tip: str, combined_ref: str) -> bool:
+        verdict = preview.acquire_verdict(repo, combined_ref, fold_tip)
+        preview.delete_ci_ref(repo, remote, combined_ref)
+        if verdict.outcome == classify.GREEN:
+            return True
+        if verdict.outcome == classify.RED:
+            return False
+        raise GateError(
+            verdict.exit_code,
+            f"bisection round {combined_ref} got no usable verdict "
+            f"({verdict.outcome}/{verdict.conclusion}) — a bisection may not guess a "
+            f"verdict it could not read: guessing red names an innocent member, "
+            f"guessing green clears a guilty one.")
+    return _verify
+
+
+def bisect_batch_from_refs(base: str, member_specs: list, repo: str, remote: str,
+                           manager: str = "lincoln") -> int:
+    """CLI orchestrator for `sable-merge-gate bisect-batch`: resolve the member
+    set exactly as land-batch does (resolve_batch_members — one resolver, so the
+    bisected batch is the batch that went red), then run the state machine with
+    the production CI verifier. Returns the result's exit code (always
+    EXIT_RED — the batch was red and nothing landed)."""
+    base = git_lib.resolve_base(base, repo)
+    git_lib._git(repo, "fetch", remote, base, check=False)
+    base_sha = git_lib.resolve_commit(repo, classify.qualify_remote_ref(remote, base))
+    members = resolve_batch_members(repo, remote, base_sha, member_specs, "bisect-batch")
+    setkey = batch_key.setkey(base_sha, [m.tip_sha for m in members])
+    result = bisect_red_batch(repo, remote, base_sha, members,
+                              ci_batch_verify(repo, remote),
+                              combined_ref=classify.preview_ref_name("batch", setkey),
+                              manager=manager)
+    return result.exit_code
+
+
+def register_bisect_batch(sub) -> None:
+    """Register the `bisect-batch` subcommand — same declaration-not-logic
+    placement as register_land_batch above, for the same test_cli_is_thin
+    reason."""
+    bb = sub.add_parser("bisect-batch", help="bisect a RED batch: name the culprit in "
+                        "<=3 extra combined runs at n=4, or report COULD-NOT-ATTRIBUTE. "
+                        "Lands nothing.")
+    bb.add_argument("--base", default=None, help="integration branch the batch was "
+                    "formed on; same resolution as promote")
+    bb.add_argument("--member", action="append", default=[], dest="members", required=True,
+                    metavar="BRANCH[:BEAD[,BEAD...]]", help="repeatable; one per batch member")
+    bb.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+    bb.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
+    bb.add_argument("--manager", default="lincoln")
+
+
+def register_batch_subcommands(sub) -> None:
+    """Register BOTH batch subcommands in one call, and dispatch them through
+    dispatch_batch_command below. One registrar and one dispatch line rather
+    than a pair per subcommand: bin/sable-merge-gate sits one line under
+    test_cli_is_thin's 150-line budget (SABLE-ehx8u), so a second subcommand
+    could not be added the obvious way without breaching a guard that exists
+    to stop exactly this file from regrowing its logic."""
+    register_land_batch(sub)
+    register_bisect_batch(sub)
+
+
+def dispatch_batch_command(args) -> int:
+    """Dispatch either batch subcommand from the parsed args. Both take the
+    identical flag set, so this is a two-way branch, not a table."""
+    if args.command == "land-batch":
+        return land_batch_from_refs(args.base, args.members, args.repo, args.remote,
+                                    args.manager)
+    return bisect_batch_from_refs(args.base, args.members, args.repo, args.remote,
+                                  args.manager)
