@@ -146,6 +146,36 @@ Each merge request — message OR bead:
    across a process boundary invalidates every timeout sized against the old
    behaviour** — and those timeouts live in your wrappers, where no repo-side
    test can see them.
+
+   **The instrument has a lower ceiling than the quantity it measures — launch
+   in the BACKGROUND, never the foreground (SABLE-jb5l8).** The derive-the-bound
+   rule above is CORRECT AND INSUFFICIENT: it fixes the wrapper *you write*
+   (the `timeout` around `promote`) and cannot touch the wrapper *you run
+   inside*. The Claude Code Bash tool has its own 600s maximum that silently
+   supersedes any longer inner timeout — a derived budget of 6480s means
+   nothing to a tool that kills your Bash call at 600s regardless. This is not
+   specific to `promote`: it applies to EVERY hand-run gate phase whose budget
+   can exceed 600s — promote, coverage floor, and the impact tier alike. The
+   failure presents exactly like the "mysterious promote failure" described
+   above — no verdict line after `ENTERING IMPACT TIER` — so a seat can chase
+   the gate instead of its own harness, and the safe-kill property (below)
+   means it leaves no wreckage to make you suspicious.
+
+   **The fix:** launch `promote` — and any hand-run gate phase whose budget
+   can exceed 600s — with `run_in_background`, then poll for the result.
+   Never run it in the Bash tool's foreground; a foreground call is
+   truncated at 600s regardless of any budget you derived. Report
+   WALL-CLOCK DURATION alongside the return code when you relay the
+   outcome, so the number is checkable rather than trusted — a
+   background-launched run has no 600s ceiling in play, so its duration is
+   the gate's own number, not the harness's.
+
+   A harness-killed run is SAFE WITH RESPECT TO WHAT LANDS — nothing is
+   pushed before a green verdict, so the tip is unmoved — but it is NOT
+   side-effect-free: the kill can preempt the gate's own cleanup and strand a
+   registered git worktree. Check `git worktree list` after any
+   harness-killed run; remove a leaked entry with `git worktree remove
+   --force <path>` once you've confirmed no live process holds it.
 6. Close the for-chuck bead.
 
 **The flow in one line: read-verdict → sequence → promote.** Reading is
