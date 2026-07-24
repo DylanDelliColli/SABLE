@@ -366,7 +366,7 @@ def test_unattributable_candidate_makes_clearance_not_clear(reg, monkeypatch):
 def test_probe_failure_is_could_not_assess(reg, monkeypatch):
     _roots(monkeypatch, "/repo")
 
-    def boom():
+    def boom(debug=None):
         raise rl.ProbeError("ps unavailable")
 
     monkeypatch.setattr(rl, "read_process_table", boom)
