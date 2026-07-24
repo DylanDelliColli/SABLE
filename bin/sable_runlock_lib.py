@@ -419,7 +419,8 @@ def _cwd_resolves_to_a_git_repo(cwd: str) -> bool:
 
 def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
                    self_pid: int | None = None,
-                   uid: int | None = None) -> tuple[list[Candidate], list[Candidate]]:
+                   uid: int | None = None,
+                   trace: list[dict] | None = None) -> tuple[list[Candidate], list[Candidate]]:
     """(attributed, unattributable). A process is a candidate when its command
     line names one of this repo's suite shapes. It is ATTRIBUTED when:
       - its cwd or an absolute path in its argv lands inside one of `roots`, or
@@ -447,12 +448,24 @@ def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
       - GENUINELY UNKNOWN: cwd is unreadable, or readable but resolves into no
         git repo at all. Returned separately and reads could-not-assess — "I
         saw something suite-shaped and could not tell whose" is not the same
-        claim as "nothing is running"."""
+        claim as "nothing is running".
+
+    `trace`, when passed a list, is appended one dict per same-uid
+    pattern-matched row (pid, ppid, args, cwd, and the branch it resolved to:
+    roots / ancestry / confidently-foreign / genuinely-unknown-alive /
+    genuinely-unknown-dead) — a TEMPORARY instrument (SABLE-skrdj revise #1)
+    to tell "this call classified it and dropped it" apart from "this call's
+    own process-table snapshot never contained it at all", since those two
+    produce an identical external symptom (CLEAR) but implicate different
+    code. Callers reuse the SAME table/decision the verdict came from, so the
+    trace cannot itself be a second, differently-timed snapshot (SABLE-skrdj
+    revise #1's H1)."""
     tbl = read_process_table() if table is None else table
     me = os.getpid() if self_pid is None else self_pid
     my_uid = os.getuid() if uid is None else uid
     attributed: list[Candidate] = []
     unresolved: list[tuple[ProcInfo, str, str | None]] = []
+    trace_by_pid: dict[int, dict] = {}
     for p in tbl:
         if p.pid == me or p.uid != my_uid:
             continue
@@ -464,6 +477,11 @@ def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
         if not why:
             continue
         cwd = p.cwd if p.cwd is not None else proc_cwd(p.pid)
+        if trace is not None:
+            entry = {"pid": p.pid, "ppid": p.ppid, "args": p.args[:300],
+                     "cwd": cwd, "why": why, "me": me, "branch": None}
+            trace_by_pid[p.pid] = entry
+            trace.append(entry)
         hit = False
         for r in roots:
             if cwd and (cwd == r or cwd.startswith(r + os.sep)):
@@ -474,6 +492,8 @@ def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
                 break
         if hit:
             attributed.append(Candidate(p.pid, p.ppid, p.args, why, True, cwd))
+            if p.pid in trace_by_pid:
+                trace_by_pid[p.pid]["branch"] = "roots"
         else:
             unresolved.append((p, why, cwd))
 
@@ -486,10 +506,15 @@ def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
         changed = False
         still_unresolved: list[tuple[ProcInfo, str, str | None]] = []
         for p, why, cwd in unresolved:
-            if not attributed_pids.isdisjoint(_ancestors(p.pid, tbl)):
+            ancestors = _ancestors(p.pid, tbl)
+            if trace_by_pid.get(p.pid) is not None:
+                trace_by_pid[p.pid]["ancestors"] = ancestors
+            if not attributed_pids.isdisjoint(ancestors):
                 attributed.append(Candidate(p.pid, p.ppid, p.args, why, True, cwd))
                 attributed_pids.add(p.pid)
                 changed = True
+                if p.pid in trace_by_pid:
+                    trace_by_pid[p.pid]["branch"] = "ancestry"
             else:
                 still_unresolved.append((p, why, cwd))
         unresolved = still_unresolved
@@ -497,12 +522,18 @@ def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
     unattributable: list[Candidate] = []
     for p, why, cwd in unresolved:
         if cwd is not None and _cwd_resolves_to_a_git_repo(cwd):
+            if p.pid in trace_by_pid:
+                trace_by_pid[p.pid]["branch"] = "confidently-foreign"
             continue  # CONFIDENTLY FOREIGN — a real, different repo.
         # GENUINELY UNKNOWN: cwd unreadable, or readable but not inside any
         # git repo at all. Only a process that has since exited is dropped
         # (a race, not a gap).
         if pid_alive(p.pid):
             unattributable.append(Candidate(p.pid, p.ppid, p.args, why, False, cwd))
+            if p.pid in trace_by_pid:
+                trace_by_pid[p.pid]["branch"] = "genuinely-unknown-alive"
+        elif p.pid in trace_by_pid:
+            trace_by_pid[p.pid]["branch"] = "genuinely-unknown-dead-skipped"
     return attributed, unattributable
 
 
@@ -585,12 +616,18 @@ class Clearance:
 
 
 def clearance(base: str | None = None, table: list[ProcInfo] | None = None,
-              probe: bool = True) -> Clearance:
+              probe: bool = True, trace: list[dict] | None = None) -> Clearance:
     """Answer "is any test suite executing in any worktree of this repo?".
 
     Precedence, most-informative first — every finding still appears in
     `reasons`, so nothing is hidden by the winning label:
       could-not-assess > unregistered-runner > busy > stale > clear
+
+    `trace`, when given a list, is forwarded to `scan_processes` verbatim —
+    it fills with the SAME table/decision this call's verdict came from (see
+    `scan_processes`'s docstring; SABLE-skrdj revise #1's temporary
+    instrument for telling a misclassification apart from a snapshot that
+    plain never saw the candidate).
     """
     reasons: list[str] = []
     checked: list[str] = []
@@ -642,7 +679,7 @@ def clearance(base: str | None = None, table: list[ProcInfo] | None = None,
         else:
             try:
                 tbl = read_process_table() if table is None else table
-                attributed, unattributable = scan_processes(roots, table=tbl)
+                attributed, unattributable = scan_processes(roots, table=tbl, trace=trace)
                 for c in unattributable:
                     unknown.append(
                         f"suite-shaped process pid {c.pid} (ppid {c.ppid}, cwd "
