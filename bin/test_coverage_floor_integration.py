@@ -84,6 +84,23 @@ def _require_real_history():
                     "cannot run the real be4lo.7 rehearsal")
 
 
+def _local_clone(tmp_path):
+    """A local clone of THIS repo (`git clone --local` only READS from
+    REPO_ROOT — cloning is not in sable-fixture-tripwire's MUTATING set)
+    so every worktree add/remove/prune that follows runs against an
+    ISOLATED fixture, never the live repo this dispatch is running out of.
+    A mutating `git worktree` op with cwd bound to the real repo root —
+    even one a test intends to clean up after itself — is exactly the
+    escape-hatch shape SABLE-0ssz.2's tripwire exists to ban (three prior
+    P0s shared that mechanism); routing through a throwaway clone first
+    means a bug in this test's cleanup can only ever corrupt the clone."""
+    clone = tmp_path / "repo-clone"
+    cp = _run(["git", "clone", "--local", "-q", str(REPO_ROOT), str(clone)],
+              cwd=tmp_path)
+    assert cp.returncode == 0, f"local clone of REPO_ROOT failed: {cp.stdout}"
+    return clone
+
+
 def test_real_be4lo7_diff_is_not_flagged_pruning():
     """REAL DIFF, FAST (SABLE-owix4, direct proof): detect_pruning fed the
     ACTUAL `git diff` between the real base and tip commits — no hand-built
@@ -132,9 +149,10 @@ def test_real_be4lo7_rename_pair_passes_the_real_gate_without_override(tmp_path)
     test_real_be4lo7_diff_is_not_flagged_pruning above is the fast,
     unconditional, always-on proof the fix itself is correct."""
     _require_real_history()
+    clone = _local_clone(tmp_path)
     worktree = tmp_path / "be4lo7-tip"
     add = _run(["git", "worktree", "add", "--detach", str(worktree), BE4LO7_TIP],
-              cwd=REPO_ROOT)
+              cwd=clone)
     assert add.returncode == 0, f"worktree add failed: {add.stdout}"
     try:
         script = worktree / ".github" / "ci" / "diff-cover-gate.sh"
@@ -154,8 +172,8 @@ def test_real_be4lo7_rename_pair_passes_the_real_gate_without_override(tmp_path)
             f"increased test coverage (89->90, 32->43 defs) — output:\n"
             f"{cp.stdout}")
     finally:
-        _run(["git", "worktree", "remove", "--force", str(worktree)], cwd=REPO_ROOT)
-        _run(["git", "worktree", "prune"], cwd=REPO_ROOT)
+        _run(["git", "worktree", "remove", "--force", str(worktree)], cwd=clone)
+        _run(["git", "worktree", "prune"], cwd=clone)
 
 
 def _init_synthetic_repo(root: Path):
