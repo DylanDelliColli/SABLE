@@ -420,7 +420,8 @@ def _cwd_resolves_to_a_git_repo(cwd: str) -> bool:
 def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
                    self_pid: int | None = None,
                    uid: int | None = None,
-                   trace: list[dict] | None = None) -> tuple[list[Candidate], list[Candidate]]:
+                   trace: list[dict] | None = None,
+                   scan_debug: dict | None = None) -> tuple[list[Candidate], list[Candidate]]:
     """(attributed, unattributable). A process is a candidate when its command
     line names one of this repo's suite shapes. It is ATTRIBUTED when:
       - its cwd or an absolute path in its argv lands inside one of `roots`, or
@@ -459,10 +460,43 @@ def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
     produce an identical external symptom (CLEAR) but implicate different
     code. Callers reuse the SAME table/decision the verdict came from, so the
     trace cannot itself be a second, differently-timed snapshot (SABLE-skrdj
-    revise #1's H1)."""
+    revise #1's H1).
+
+    `scan_debug`, when passed a dict, is filled with counts taken BEFORE any
+    classification, so a caller can tell "the forked child was never in this
+    call's own raw table" apart from "it was in the table but a
+    pre-classification filter (uid, self-pid, suite-shape) dropped it before
+    roots/ancestry/foreign/unknown ever ran" — two different bugs the `trace`
+    list above cannot distinguish, since `trace` only records rows that
+    ALREADY passed those filters (SABLE-skrdj revise #1, second round:
+    tarzan's request after the H1 close, to stop conflating an empty
+    candidate set with an empty raw table). Never used to alter behaviour."""
     tbl = read_process_table() if table is None else table
     me = os.getpid() if self_pid is None else self_pid
     my_uid = os.getuid() if uid is None else uid
+    if scan_debug is not None:
+        same_uid = [p for p in tbl if p.uid == my_uid]
+        same_uid_excl_self = [p for p in same_uid if p.pid != me]
+        no_pattern = [p for p in same_uid_excl_self
+                     if not any(pat.search(p.args) for _label, pat in SUITE_PATTERNS)]
+        diff_uid_pattern_match = [
+            p for p in tbl if p.uid != my_uid
+            and any(pat.search(p.args) for _label, pat in SUITE_PATTERNS)]
+        scan_debug.update({
+            "me": me, "my_uid": my_uid,
+            "raw_table_rows": len(tbl),
+            "self_row_present": any(p.pid == me for p in tbl),
+            "same_uid_rows": len(same_uid),
+            "same_uid_excl_self_rows": len(same_uid_excl_self),
+            "same_uid_excl_self_no_pattern_match_rows": len(no_pattern),
+            "same_uid_excl_self_no_pattern_match_sample":
+                [{"pid": p.pid, "ppid": p.ppid, "args": p.args[:200]}
+                 for p in no_pattern[:5]],
+            "diff_uid_pattern_match_rows": len(diff_uid_pattern_match),
+            "diff_uid_pattern_match_sample":
+                [{"pid": p.pid, "ppid": p.ppid, "uid": p.uid, "args": p.args[:200]}
+                 for p in diff_uid_pattern_match[:5]],
+        })
     attributed: list[Candidate] = []
     unresolved: list[tuple[ProcInfo, str, str | None]] = []
     trace_by_pid: dict[int, dict] = {}
@@ -616,18 +650,21 @@ class Clearance:
 
 
 def clearance(base: str | None = None, table: list[ProcInfo] | None = None,
-              probe: bool = True, trace: list[dict] | None = None) -> Clearance:
+              probe: bool = True, trace: list[dict] | None = None,
+              scan_debug: dict | None = None) -> Clearance:
     """Answer "is any test suite executing in any worktree of this repo?".
 
     Precedence, most-informative first — every finding still appears in
     `reasons`, so nothing is hidden by the winning label:
       could-not-assess > unregistered-runner > busy > stale > clear
 
-    `trace`, when given a list, is forwarded to `scan_processes` verbatim —
-    it fills with the SAME table/decision this call's verdict came from (see
-    `scan_processes`'s docstring; SABLE-skrdj revise #1's temporary
-    instrument for telling a misclassification apart from a snapshot that
-    plain never saw the candidate).
+    `trace` and `scan_debug`, when given, are forwarded to `scan_processes`
+    verbatim — they fill from the SAME table/decision this call's verdict
+    came from (see `scan_processes`'s docstring; SABLE-skrdj revise #1's
+    temporary instrument for telling a misclassification apart from a
+    snapshot that plain never saw the candidate, and — round two —
+    for telling "never in the raw table" apart from "in the table but
+    filtered before classification").
     """
     reasons: list[str] = []
     checked: list[str] = []
@@ -679,7 +716,8 @@ def clearance(base: str | None = None, table: list[ProcInfo] | None = None,
         else:
             try:
                 tbl = read_process_table() if table is None else table
-                attributed, unattributable = scan_processes(roots, table=tbl, trace=trace)
+                attributed, unattributable = scan_processes(
+                    roots, table=tbl, trace=trace, scan_debug=scan_debug)
                 for c in unattributable:
                     unknown.append(
                         f"suite-shaped process pid {c.pid} (ppid {c.ppid}, cwd "
