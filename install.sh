@@ -387,10 +387,22 @@ else
 fi
 echo
 
-# 8. Print settings.json snippet (do NOT auto-edit — settings is too important to clobber)
-bold "Step 8/8: Settings.json hook block"
+# 8. Print the BASE-tier settings.json snippet for manual pasting.
+#
+# SCOPE OF THE "we do not auto-edit" promise, which used to be stated as if it
+# covered the whole file (SABLE-nn54x): it covers THIS block only — the
+# base-tier hooks (tdd-evidence, tdd-gate, bead-description-gate, ...). Step 6
+# delegates to sable-orchestration-install, which DOES merge the orchestration
+# (multi-manager) rows into the same settings file automatically, backing it up
+# first and never clobbering existing entries. An operator reading this step in
+# isolation previously came away believing settings.json was untouched when it
+# had already been modified. Both halves are printed below so the contract and
+# the behaviour agree.
+bold "Step 8/8: Settings.json hook block (base tier — paste this yourself)"
 echo "Add the following block to your ${SETTINGS_FILE} under the top-level 'hooks' key."
 echo "If you already have a 'hooks' key, merge carefully (don't overwrite existing entries)."
+echo "NOTE: this block is the BASE tier only. The orchestration (multi-manager) rows were"
+echo "already merged into ${SETTINGS_FILE} by step 6 — do not paste those again."
 echo
 cat <<EOF
 {
@@ -512,7 +524,8 @@ echo
 bold "Install complete."
 echo
 echo "Next steps:"
-echo "  1. Paste the hook block(s) above into ${SETTINGS_FILE} (merge with existing config)."
+echo "  1. Paste the BASE-tier hook block above into ${SETTINGS_FILE} (merge with existing"
+echo "     config). The orchestration rows are already merged — step 6 did that for you."
 echo "  2. In your project: bd init && bd hooks install"
 echo "  3. RESTART Claude Code so the agent defs, /sable-plan /sable-execute /gaudi /columbo, and hooks register."
 echo "  4. Start your session:  sable-launch   (Lincoln only, wraps sable-tmux; managers spawn on demand)"
