@@ -1962,6 +1962,312 @@ EOF
 fi
 
 # --------------------------------------------------------------------------
+# SABLE-pfbjw — ground-truth branch-ref overlap scan.
+#
+# Replaces the prior mechanism entirely: the old scan intersected this push's
+# files against `bd list --status=in_progress`'s wip_claims metadata, and
+# both directions of that were wrong, measured live rather than theorized:
+#   (A) FALSE POSITIVE — wip_claims is a claim, true only when written and
+#       never invalidated. SABLE-23upx's (wk-sable-screen) own wip_claims was
+#       byte-identical to its own pushed file list; SABLE-be4lo.4
+#       (wk-trains-fold)'s wip_claims contained the exact file its own push
+#       touched. Both beads were still in_progress at push time, so the
+#       branch matched itself.
+#   (B) FALSE NEGATIVE, the dangerous direction — `--status=in_progress` can
+#       never see the CLOSED-BUT-UNLANDED population, which in this fleet is
+#       the NORMAL end state. Live case (optimus): skrdj pushed with NO
+#       warning while genuinely sharing a file with qwthx, which was CLOSED
+#       and its branch still uncontained.
+#
+# One real bare origin hosts every branch below. Occupancy is derived purely
+# from git refs (uncontained = not an ancestor of the integration branch);
+# bd is consulted ONLY to label an overlap with a bead id, never to decide
+# whether one exists — proven directly by giving the genuinely-overlapping
+# branch a CLOSED bead and confirming the warning still fires.
+# --------------------------------------------------------------------------
+
+PFBJW_BARE=$(mktemp -d)
+PFBJW_REPO=$(mktemp -d)
+trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$PFBJW_BARE" "$PFBJW_REPO"' EXIT
+
+git init -q --bare "$PFBJW_BARE"
+git clone -q "$PFBJW_BARE" "$PFBJW_REPO"
+cd_fixture "$PFBJW_REPO"
+git -C "$PFBJW_REPO" config user.email "pf@pf"; git -C "$PFBJW_REPO" config user.name "pf"
+echo base > base.txt; git add base.txt; git commit -q -m base
+git push -q "$PFBJW_BARE" HEAD:refs/heads/main 2>/dev/null
+git update-ref refs/remotes/origin/main HEAD
+
+# Integration branch (SABLE-pzfk default-base resolution picks this up via
+# sable.integrationBranch, same as the PZFK fixture above).
+git checkout -q -b tmux-only
+git push -q "$PFBJW_BARE" HEAD:refs/heads/tmux-only 2>/dev/null
+git update-ref refs/remotes/origin/tmux-only HEAD
+git -C "$PFBJW_REPO" config sable.integrationBranch tmux-only
+
+# Occupant A: genuinely uncontained (never merged into tmux-only), touches
+# libfile.py. Its bead will be modeled as CLOSED via the bd stub below — the
+# skrdj/qwthx shape this bead exists to fix.
+git checkout -q tmux-only
+git checkout -q -b wk-occupant-a
+echo lib > libfile.py; git add libfile.py; git commit -q -m "occupant-a: libfile"
+git push -q "$PFBJW_BARE" HEAD:refs/heads/wk-occupant-a 2>/dev/null
+git update-ref refs/remotes/origin/wk-occupant-a HEAD
+
+# Occupant B: all-new files that exist nowhere else in the tree (SABLE-23upx
+# shape — the free positive control the dispatch highlighted). Genuinely
+# uncontained, but structurally cannot share a path with anything.
+git checkout -q tmux-only
+git checkout -q -b wk-newfiles-only
+echo n1 > brandnew1.txt; echo n2 > brandnew2.txt
+git add brandnew1.txt brandnew2.txt; git commit -q -m "newfiles-only: two new files"
+git push -q "$PFBJW_BARE" HEAD:refs/heads/wk-newfiles-only 2>/dev/null
+git update-ref refs/remotes/origin/wk-newfiles-only HEAD
+
+# The pushing branch: touches libfile.py (genuine overlap with occupant-a)
+# plus a file unique to itself.
+git checkout -q tmux-only
+git checkout -q -b wk-pusher
+echo lib2 > libfile.py; echo p > pusher_only.txt
+git add libfile.py pusher_only.txt; git commit -q -m "pusher: touches libfile + own file"
+git push -q "$PFBJW_BARE" HEAD:refs/heads/wk-pusher 2>/dev/null
+git update-ref refs/remotes/origin/wk-pusher HEAD
+cd - >/dev/null
+
+# bd stub: ONLY occupant-a resolves to a bead, and it is CLOSED — proving
+# label resolution works and that closure does not suppress detection. Every
+# other `bd list` (wk-newfiles-only, wk-pusher itself) resolves to no bead,
+# proving detection needs no bd record at all.
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "list" ]; then
+  for a in "$@"; do
+    if [ "$a" = "branch=wk-occupant-a" ]; then
+      cat <<'JSON'
+[{"id": "SABLE-pfqwthx", "status": "closed"}]
+JSON
+      exit 0
+    fi
+  done
+  echo "[]"
+  exit 0
+fi
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+# --- POSITIVE CONTROL, load-bearing (SABLE-pfbjw / optimus): genuinely
+# overlapping CLOSED-but-unlanded branch MUST warn, and must NAME the bead
+# and the shared file. SABLE_MSG_STUB_RC=0 so the live chuck message (not
+# just the durable fallback bead) is what's asserted on. ---
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+PFBJW_PUSHER_INPUT=$(make_post_input "git push" "$PFBJW_REPO")
+SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV" "$PFBJW_PUSHER_INPUT" >/dev/null
+
+if grep -q 'OVERLAP-WARNING' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "SABLE-pfbjw: genuinely overlapping CLOSED-but-unlanded branch DOES warn (skrdj/qwthx shape)"
+else
+  fail "SABLE-pfbjw: genuinely overlapping CLOSED-but-unlanded branch DOES warn (skrdj/qwthx shape)" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+if grep -q 'libfile.py' "$SABLE_MSG_LOG" 2>/dev/null && grep -qE 'wk-occupant-a|SABLE-pfqwthx' "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "SABLE-pfbjw: warning names WHAT is shared (libfile.py) and WITH WHAT (wk-occupant-a / SABLE-pfqwthx)"
+else
+  fail "SABLE-pfbjw: warning names WHAT is shared and WITH WHAT" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
+if grep -qE 'brandnew1\.txt|brandnew2\.txt|wk-newfiles-only' "$SABLE_MSG_LOG" 2>/dev/null; then
+  fail "SABLE-pfbjw: unrelated disjoint branch (wk-newfiles-only) is NOT named as an overlap" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+else
+  pass "SABLE-pfbjw: unrelated disjoint branch (wk-newfiles-only) is NOT named as an overlap"
+fi
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+
+# --- NEGATIVE CONTROL, load-bearing: a push composed ONLY of files absent
+# from the base tree everywhere else (SABLE-23upx shape) must NOT warn, even
+# though it is genuinely uncontained real work. ---
+cd_fixture "$PFBJW_REPO"
+git checkout -q wk-newfiles-only
+cd - >/dev/null
+PFBJW_NEWFILES_INPUT=$(make_post_input "git push" "$PFBJW_REPO")
+SABLE_MSG_STUB_RC=0 run_hook "$MGR_ENV" "$PFBJW_NEWFILES_INPUT" >/dev/null
+
+if grep -q 'OVERLAP-WARNING' "$SABLE_MSG_LOG" 2>/dev/null; then
+  fail "SABLE-pfbjw NEGATIVE CONTROL: only-new-files branch does NOT self-match (SABLE-23upx shape)" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+else
+  pass "SABLE-pfbjw NEGATIVE CONTROL: only-new-files branch does NOT self-match (SABLE-23upx shape)"
+fi
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+
+# --------------------------------------------------------------------------
+# PLANT-AND-FAIL (SABLE-5lli.7): remove the self-skip-by-branch-name line and
+# confirm the SAME only-new-files push (wk-newfiles-only) STARTS warning
+# against its own ref — this is the exact self-match failure mode measured
+# live (SABLE-23upx), reproduced on demand to prove the exclusion is
+# load-bearing rather than untested.
+# --------------------------------------------------------------------------
+PFBJW_PLANT_DIR="$STUB_DIR/plant-pfbjw"
+mkdir -p "$PFBJW_PLANT_DIR"
+for f in "$LIB_DIR"/*.sh; do
+  ln -sf "$f" "$PFBJW_PLANT_DIR/$(basename "$f")"
+done
+PFBJW_MUTANT="$PFBJW_PLANT_DIR/post-push-merge-notify-PFBJW-PLANT.sh"
+PFBJW_PLANT_ERR=$(python3 - "$HOOK" "$PFBJW_MUTANT" <<'PYEOF'
+import sys
+src_path, dst_path = sys.argv[1], sys.argv[2]
+src = open(src_path).read()
+needle = '    [ "$CAND_SHORT" = "$BRANCH" ] && continue  # never compare the push to itself\n'
+if needle not in src:
+    print(f"could not locate self-skip line", file=sys.stderr)
+    sys.exit(1)
+new_src = src.replace(needle, '', 1)
+open(dst_path, "w").write(new_src)
+PYEOF
+)
+PFBJW_PLANT_RC=$?
+chmod +x "$PFBJW_MUTANT" 2>/dev/null || true
+
+if [ "$PFBJW_PLANT_RC" -ne 0 ] || [ ! -s "$PFBJW_MUTANT" ]; then
+  fail "PLANT-AND-FAIL SABLE-pfbjw: could not construct the self-skip-removed mutant hook" "rc=$PFBJW_PLANT_RC err=$PFBJW_PLANT_ERR"
+else
+  rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+  env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" SABLE_MSG_LOG="$SABLE_MSG_LOG" SABLE_MSG_STUB_RC=0 \
+    SABLE_HOOK_TRACE_LOG="$STUB_DIR/hook-trace-pfbjw-plant.log" \
+    $MGR_ENV bash "$PFBJW_MUTANT" <<< "$PFBJW_NEWFILES_INPUT" >/dev/null 2>&1
+
+  if grep -q 'CONFIRMED' "$STUB_DIR/hook-trace-pfbjw-plant.log" 2>/dev/null; then
+    pass "PLANT-AND-FAIL SABLE-pfbjw: mutant hook actually ran (non-vacuity precondition)"
+  else
+    fail "PLANT-AND-FAIL SABLE-pfbjw: mutant hook actually ran (non-vacuity precondition)" "hook-trace-pfbjw-plant.log: $(cat "$STUB_DIR/hook-trace-pfbjw-plant.log" 2>/dev/null)"
+  fi
+  if grep -q 'OVERLAP-WARNING' "$SABLE_MSG_LOG" 2>/dev/null; then
+    pass "PLANT-AND-FAIL SABLE-pfbjw: removing the self-skip DOES reintroduce self-match on the only-new-files branch (proves the exclusion is load-bearing)"
+  else
+    fail "PLANT-AND-FAIL SABLE-pfbjw: removing the self-skip DOES reintroduce self-match on the only-new-files branch" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+  fi
+fi
+rm -f "$BD_LOG" "$SABLE_MSG_LOG"
+rm -rf "$PFBJW_PLANT_DIR"
+
+# Restore the plain bd stub for hermeticity if more tests are appended later.
+cat > "$STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >> "${BD_LOG:-/tmp/bd-stub.log}"
+exit 0
+EOF
+chmod +x "$STUB_DIR/bd"
+
+# --------------------------------------------------------------------------
+# INTEGRATION SABLE-pfbjw — real bd, real git, no mocks of either. Creates a
+# scratch bead in the real project Dolt db (--sandbox on every write, never
+# pushed to the shared remote), closes it immediately (modeling the fleet's
+# normal end state), and confirms a genuinely overlapping push against its
+# still-uncontained branch warns anyway — the property no declaration-based
+# implementation (bd status OR wip_claims) can pass, per optimus.
+# --------------------------------------------------------------------------
+
+if ! command -v bd >/dev/null 2>&1; then
+  echo "SKIP (integration SABLE-pfbjw): bd not found on PATH"
+else
+  PFI_BARE=$(mktemp -d)
+  PFI_REPO=$(mktemp -d)
+  PFI_STUB=$(mktemp -d)
+  PFI_MSG_LOG="$PFI_STUB/sable-msg-calls.log"
+  PFI_BRANCH=""
+  pfbjw_cleanup_stray_forchuck() {
+    local branch="$1" ids
+    [ -z "$branch" ] && return 0
+    ids=$(bd list --status open,in_progress --label for-chuck --title-contains "$branch" --json 2>/dev/null \
+      | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = []
+for i in d:
+    if isinstance(i, dict):
+        print(i.get('id', ''))
+" 2>/dev/null)
+    for id in $ids; do
+      [ -z "$id" ] && continue
+      bd update "$id" --sandbox --notes "[no-test] SABLE-pfbjw integration-test safety net: scratch branch ($branch), test fixture only." 2>/dev/null || true
+      bd close "$id" --sandbox --reason "SABLE-pfbjw integration-test safety-net cleanup" 2>/dev/null || true
+    done
+  }
+  trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$PFBJW_BARE" "$PFBJW_REPO" "$PFI_BARE" "$PFI_REPO" "$PFI_STUB"; [ -n "${PFI_BRANCH:-}" ] && command -v pfbjw_cleanup_stray_forchuck >/dev/null 2>&1 && pfbjw_cleanup_stray_forchuck "$PFI_BRANCH"' EXIT
+
+  cat > "$PFI_STUB/sable-msg" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >> "${PFI_MSG_LOG:-/dev/null}"
+exit 0
+EOF
+  chmod +x "$PFI_STUB/sable-msg"
+  cat > "$PFI_STUB/tmux" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  if [ "$a" = "list-panes" ]; then echo "chuck"; exit 0; fi
+  if [ "$a" = "display-message" ]; then echo ""; exit 0; fi
+done
+exit 0
+EOF
+  chmod +x "$PFI_STUB/tmux"
+
+  git init -q --bare "$PFI_BARE"
+  git clone -q "$PFI_BARE" "$PFI_REPO"
+  cd_fixture "$PFI_REPO"
+  git -C "$PFI_REPO" config user.email "pfi@pfi"; git -C "$PFI_REPO" config user.name "pfi"
+  echo base > base.txt; git add base.txt; git commit -q -m base
+  git push -q "$PFI_BARE" HEAD:refs/heads/main 2>/dev/null
+  git update-ref refs/remotes/origin/main HEAD
+  git checkout -q -b tmux-only
+  git push -q "$PFI_BARE" HEAD:refs/heads/tmux-only 2>/dev/null
+  git update-ref refs/remotes/origin/tmux-only HEAD
+  git -C "$PFI_REPO" config sable.integrationBranch tmux-only
+
+  PFI_SUFFIX="$$-${RANDOM}"
+  PFI_OCC_BRANCH="wk-pfbjwreal-occ-${PFI_SUFFIX}"
+  git checkout -q tmux-only
+  git checkout -q -b "$PFI_OCC_BRANCH"
+  echo shared > shared_real.txt; git add shared_real.txt; git commit -q -m "occupant: shared_real.txt"
+  git push -q "$PFI_BARE" "HEAD:refs/heads/$PFI_OCC_BRANCH" 2>/dev/null
+  git update-ref "refs/remotes/origin/$PFI_OCC_BRANCH" HEAD
+
+  PFI_BRANCH="wk-pfbjwreal-pusher-${PFI_SUFFIX}"
+  git checkout -q tmux-only
+  git checkout -q -b "$PFI_BRANCH"
+  echo shared2 > shared_real.txt; git add shared_real.txt; git commit -q -m "pusher: shared_real.txt"
+  git push -q "$PFI_BARE" "HEAD:refs/heads/$PFI_BRANCH" 2>/dev/null
+  git update-ref "refs/remotes/origin/$PFI_BRANCH" HEAD
+  cd - >/dev/null
+
+  # Real bd: create a bead for the occupant branch, then CLOSE it immediately
+  # (the fleet's normal end state) BEFORE the pusher's push runs. If the scan
+  # were bd-status-gated in any way, a closed occupant would be invisible.
+  PFI_SCRATCH_ID=$(bd create --sandbox \
+    --title="[int-test] SABLE-pfbjw scratch bead for ${PFI_OCC_BRANCH}" \
+    --description="Scratch bead created by hooks/test/test-post-push-merge-notify.sh (SABLE-pfbjw integration test) to verify the overlap scan warns on a genuinely overlapping CLOSED-but-unlanded branch (the skrdj/qwthx shape). [no-test] — safe to close immediately, no code of its own." \
+    --type=task \
+    --metadata "{\"branch\": \"${PFI_OCC_BRANCH}\"}" 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+  if [ -z "$PFI_SCRATCH_ID" ]; then
+    echo "SKIP (integration SABLE-pfbjw): could not create scratch bead — bd create output did not match ID pattern"
+  else
+    bd close "$PFI_SCRATCH_ID" --sandbox --reason "SABLE-pfbjw integration test: modeling closed-but-unlanded" 2>/dev/null || true
+
+    PFI_INPUT=$(make_post_input "git push" "$PFI_REPO")
+    CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
+      PATH="$PFI_STUB:$PATH" PFI_MSG_LOG="$PFI_MSG_LOG" \
+      bash "$HOOK" <<< "$PFI_INPUT" >/dev/null 2>&1
+    pfbjw_cleanup_stray_forchuck "$PFI_BRANCH"
+    pfbjw_cleanup_stray_forchuck "$PFI_OCC_BRANCH"
+
+    if grep -q 'OVERLAP-WARNING' "$PFI_MSG_LOG" 2>/dev/null && grep -q 'shared_real.txt' "$PFI_MSG_LOG" 2>/dev/null; then
+      pass "integration SABLE-pfbjw: real bd + real git — CLOSED-but-unlanded occupant STILL warns (skrdj/qwthx case, no declaration-based implementation can pass this)"
+    else
+      fail "integration SABLE-pfbjw: real bd + real git — CLOSED-but-unlanded occupant STILL warns" "MSG_LOG: $(cat "$PFI_MSG_LOG" 2>/dev/null)"
+    fi
+  fi
+fi
+
+# --------------------------------------------------------------------------
 # Summary
 # --------------------------------------------------------------------------
 
