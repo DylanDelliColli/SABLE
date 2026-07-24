@@ -19,6 +19,7 @@ These tests exercise the REAL propagation path — a real git repo, a real
 promote_lib.run_impact_tier — rather than mocking the transport, because the
 whole point of the defect is WHERE in a real byte stream the cut lands.
 """
+import ast
 import itertools
 import json
 import os
@@ -30,6 +31,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import sable_footprint_lib as footprint_lib_for_auto  # noqa: E402
 import sable_gate_promote_lib as promote_lib  # noqa: E402
 
 # The ci-verify clean-room is tmux+pytest only -- no bd/dolt by design. The
@@ -845,3 +847,741 @@ def test_manifest_completeness_reconstructs_from_promote_record_and_fold_commits
     assert {fm[1] for fm in fold_members} == {
         ("SABLE-a",), ("SABLE-b1", "SABLE-b2"), ("SABLE-c",)}, (
         "fold commit messages did not independently name every member's bead(s)")
+
+
+# --------------------------------------------------------------------------
+# AUTO-PROMOTE (SABLE-21rug.4) — THE DISQUALIFIER TABLE, EVERY ROW SEEN TO FIRE
+# --------------------------------------------------------------------------
+#
+# The bead's own framing: "a disqualifier never seen to fire is untested by
+# construction". So there is one case per row of AutoPromoteDisqualifier below,
+# each asserting the decline NAMES that row, plus a healthy-mechanical control
+# in the same suite that ALLOWS — without the control, every row could be
+# firing for a reason unrelated to the one it claims (a fixture that denies no
+# matter what would pass all fourteen).
+#
+# test_every_disqualifier_row_has_a_case_that_fires_it closes the loop
+# structurally: it is not enough that fourteen cases exist, the union of the
+# rows they actually observed must equal the enum. A row added later with no
+# case reds that test rather than joining the table unexercised.
+#
+# What is real here and what is stubbed, and why. Real git does everything git
+# decides: the mechanical footprint (non_gate_class) and the single-member fold
+# (zero_conflicts) run against real commits, mirroring
+# bin/test_sable_batch_admission_lib.py's own convention of never hand-
+# simulating what git would say. The bd seam is stubbed at
+# sable_footprint_lib._read_bead — the ONE bd-read function the declared
+# footprint and the hold read both consult. CI is stubbed at
+# sable_gate_preview_lib.adopt_kicked_preview / read_verdict, because there is
+# no Actions run to consult in a sandbox. The integration section further down
+# removes the git stubs entirely and drives the real promote() path.
+
+_ROWS_OBSERVED: set = set()
+
+
+def _record_rows(evaluation):
+    """Every case funnels its evaluation through here, so the suite can prove
+    at the end that the union of observed rows covers the enum."""
+    _ROWS_OBSERVED.update(evaluation.rows)
+    return evaluation
+
+
+def _ap_run(repo, *args, **kw):
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True)
+
+
+def _ap_sha(repo, ref="HEAD"):
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", ref],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+@pytest.fixture()
+def ap_repo(tmp_path):
+    """A real repo with a real base commit and a real branch commit, plus the
+    remote-tracking ref refs/remotes/origin/trunk pointing at the base — so
+    the base-unchanged check reads a real ref rather than always failing to
+    resolve one (which would make every other row's case ambiguous)."""
+    r = tmp_path / "repo"
+    r.mkdir()
+    _ap_run(r, "init", "-q", "-b", "trunk")
+    _ap_run(r, "config", "user.email", "t@sable.invalid")
+    _ap_run(r, "config", "user.name", "SABLE Test")
+    (r / "bin").mkdir()
+    (r / "bin" / "harmless.py").write_text("x = 1\n")
+    _ap_run(r, "add", "-A")
+    _ap_run(r, "commit", "-q", "-m", "base")
+    base_sha = _ap_sha(r)
+    _ap_run(r, "checkout", "-q", "-b", "wk-auto", base_sha)
+    (r / "bin" / "harmless.py").write_text("x = 2\n")
+    _ap_run(r, "add", "-A")
+    _ap_run(r, "commit", "-q", "-m", "branch work")
+    branch_sha = _ap_sha(r)
+    _ap_run(r, "checkout", "-q", "trunk")
+    _ap_run(r, "update-ref", "refs/remotes/origin/trunk", base_sha)
+    return str(r), base_sha, branch_sha
+
+
+PREVIEW_SHA = "0" * 40
+
+
+@pytest.fixture()
+def ap_seams(monkeypatch, ap_repo):
+    """The healthy defaults every case starts from: one harmless declared
+    footprint, no hold, an adopted preview, a GREEN verdict bound to that
+    exact preview SHA with a typed producer. Each case perturbs exactly ONE
+    of these, which is what makes the row it observes attributable."""
+    state = {
+        "bead": {"description": "",
+                 "metadata": {"footprint_writes": "bin/harmless.py",
+                              "footprint_reads_declared": ""}},
+        "adopted": (PREVIEW_SHA, "ci-verify/auto-fixture"),
+        "verdict": promote_lib.classify.Verdict(
+            "success", "", PREVIEW_SHA, "ci-verify/auto-fixture",
+            source="precomputed", complete=True),
+    }
+
+    def _read_bead(repo, bead):
+        record = state["bead"]
+        if isinstance(record, Exception):
+            raise record
+        return record
+
+    monkeypatch.setattr(footprint_lib_for_auto, "_read_bead", _read_bead)
+    monkeypatch.setattr(promote_lib.preview, "adopt_kicked_preview",
+                        lambda *a, **kw: state["adopted"])
+    monkeypatch.setattr(promote_lib.preview, "read_verdict",
+                        lambda *a, **kw: state["verdict"])
+    return state
+
+
+def _evaluate(ap_repo, **kw):
+    repo, base_sha, branch_sha = ap_repo
+    return _record_rows(promote_lib.evaluate_auto_promote(
+        "SABLE-auto", "wk-auto", "trunk", repo, "origin", base_sha, branch_sha, **kw))
+
+
+# --- the control: without it, every row below is unattributable --------------
+
+def test_a_healthy_mechanical_branch_is_allowed(ap_repo, ap_seams):
+    """THE CONTROL. Nothing is perturbed, so every clause of the shared
+    predicate passes, the evidence chain is complete and bound to the preview
+    SHA, and all three vacuous-green preconditions hold — the evaluation
+    ALLOWS, with an empty disqualifier table."""
+    evaluation = _evaluate(ap_repo)
+    assert evaluation.allowed, evaluation.reason
+    assert evaluation.disqualifications == ()
+    assert evaluation.preview_sha == PREVIEW_SHA
+    assert evaluation.provenance == promote_lib.VerdictSource.PRECOMPUTED.value
+    assert len(evaluation.self_hash) == 64
+    assert "ALLOWED" in evaluation.reason
+
+
+def test_the_allowing_assert_returns_the_evaluation_and_does_not_raise(ap_repo, ap_seams):
+    repo, base_sha, branch_sha = ap_repo
+    evaluation = promote_lib.assert_auto_promote_allowed(
+        "SABLE-auto", "wk-auto", "trunk", repo, "origin", base_sha, branch_sha)
+    assert evaluation.allowed
+
+
+# --- rows 1-3: the three faces of the non_gate_class clause -----------------
+
+def test_declines_naming_gate_class_file(ap_repo, ap_seams):
+    ap_seams["bead"]["metadata"]["footprint_writes"] = promote_lib.admission.DISPATCH_FILE
+    evaluation = _evaluate(ap_repo)
+    assert promote_lib.AutoPromoteDisqualifier.GATE_CLASS_FILE in evaluation.rows, \
+        evaluation.reason
+    assert promote_lib.admission.DISPATCH_FILE in evaluation.reason
+
+
+def test_declines_naming_the_78qck_tier_mechanism_file(ap_repo, ap_seams):
+    """SABLE-78qck's reaches-the-tier-mechanism exclusion gets its OWN row, not
+    the generic gate-class one: 'you touched the thing that decides which
+    suites run' is a different instruction to the human than 'you touched
+    merge tooling'."""
+    tier_file = ".github/ci/test-tiers.sh"
+    assert tier_file in promote_lib.admission.GATE_TIER_FILES
+    ap_seams["bead"]["metadata"]["footprint_writes"] = tier_file
+    evaluation = _evaluate(ap_repo)
+    assert promote_lib.AutoPromoteDisqualifier.TIER_MECHANISM_FILE in evaluation.rows, \
+        evaluation.reason
+    assert promote_lib.AutoPromoteDisqualifier.GATE_CLASS_FILE not in evaluation.rows, \
+        "a tier-mechanism file was named as a generic gate-class file"
+
+
+def test_declines_naming_classification_ambiguity(ap_repo, ap_seams):
+    """A footprint that could not be DETERMINED is not a footprint that is
+    clean. sable_footprint_lib.FootprintUndetermined reaches the table as its
+    own row, fail-closed."""
+    ap_seams["bead"] = footprint_lib_for_auto.FootprintUndetermined("bd unavailable in fixture")
+    evaluation = _evaluate(ap_repo)
+    assert promote_lib.AutoPromoteDisqualifier.CLASSIFICATION_AMBIGUITY in evaluation.rows, \
+        evaluation.reason
+
+
+def test_classification_ambiguity_maps_from_a_real_undetermined_clause(ap_repo, ap_seams):
+    """ANTI-DRIFT. The three-way fan-out reads the shared predicate's own
+    reason text, so it is coupled to wording this module does not own. This
+    case pins the coupling against a REAL verdict produced by the REAL
+    predicate — if be4lo.3 rewords 'undetermined', this reds here instead of
+    silently degrading every ambiguous footprint into the wrong row."""
+    repo, base_sha, branch_sha = ap_repo
+    ap_seams["bead"] = footprint_lib_for_auto.FootprintUndetermined("bd unavailable in fixture")
+    verdict = promote_lib.admission.is_this_branch_mechanical(
+        repo, "origin", "SABLE-auto", "wk-auto", base_sha, branch_sha)
+    clause = verdict.clause("non_gate_class")
+    assert not clause.passed
+    assert promote_lib._row_for_non_gate_class(clause.reason) is \
+        promote_lib.AutoPromoteDisqualifier.CLASSIFICATION_AMBIGUITY, \
+        f"the real predicate's undetermined reason no longer maps: {clause.reason!r}"
+
+
+# --- rows 4-7: the remaining clauses of the shared predicate ----------------
+
+def test_declines_naming_a_non_green_verdict(ap_repo, ap_seams):
+    ap_seams["verdict"] = promote_lib.classify.Verdict(
+        "failure", "", PREVIEW_SHA, "ci-verify/auto-fixture",
+        source="precomputed", complete=True)
+    evaluation = _evaluate(ap_repo)
+    assert promote_lib.AutoPromoteDisqualifier.NOT_INDIVIDUALLY_GREEN in evaluation.rows, \
+        evaluation.reason
+
+
+def test_declines_naming_a_live_hold(ap_repo, ap_seams):
+    ap_seams["bead"]["metadata"]["hold"] = "held by lincoln pending a ruling"
+    evaluation = _evaluate(ap_repo)
+    assert promote_lib.AutoPromoteDisqualifier.LIVE_HOLD in evaluation.rows, evaluation.reason
+    assert "held by lincoln" in evaluation.reason
+
+
+def test_declines_naming_a_missing_clean_ff_adoption(ap_repo, ap_seams):
+    """No kicked preview for the CURRENT (base, branch) pair: nothing can be
+    fast-forwarded, and there is equally no verdict to attribute a producer
+    to — so the provenance row fires alongside, which is correct rather than
+    redundant (they are two different absent things)."""
+    ap_seams["adopted"] = None
+    evaluation = _evaluate(ap_repo)
+    assert promote_lib.AutoPromoteDisqualifier.NO_CLEAN_FF_ADOPTION in evaluation.rows, \
+        evaluation.reason
+    assert promote_lib.AutoPromoteDisqualifier.MISSING_PROVENANCE in evaluation.rows
+
+
+def test_declines_naming_a_conflict(tmp_path, monkeypatch, ap_seams, ap_repo):
+    """A REAL single-member fold conflict, from real git: the base advances
+    with a change to the same lines the branch rewrote, so folding the branch
+    alone onto that base cannot apply."""
+    repo, base_sha, _ = ap_repo
+    _ap_run(repo, "checkout", "-q", "trunk")
+    (Path(repo) / "bin" / "harmless.py").write_text("x = 99\n")
+    _ap_run(repo, "add", "-A")
+    _ap_run(repo, "commit", "-q", "-m", "conflicting base advance")
+    moved_base = _ap_sha(repo)
+    _ap_run(repo, "update-ref", "refs/remotes/origin/trunk", moved_base)
+    branch_sha = _ap_sha(repo, "wk-auto")
+
+    evaluation = _record_rows(promote_lib.evaluate_auto_promote(
+        "SABLE-auto", "wk-auto", "trunk", repo, "origin", moved_base, branch_sha))
+    assert promote_lib.AutoPromoteDisqualifier.CONFLICT in evaluation.rows, evaluation.reason
+
+
+# --- rows 8-11: the evidence chain -----------------------------------------
+
+def test_declines_naming_missing_provenance(ap_repo, ap_seams):
+    """An UNENUMERATED producer is refused, never passed through — the same
+    contract SABLE-21rug.2 states for the verdict source it is adding."""
+    ap_seams["verdict"] = promote_lib.classify.Verdict(
+        "success", "", PREVIEW_SHA, "ci-verify/auto-fixture",
+        source="some-untyped-producer", complete=True)
+    evaluation = _evaluate(ap_repo)
+    assert promote_lib.AutoPromoteDisqualifier.MISSING_PROVENANCE in evaluation.rows, \
+        evaluation.reason
+    assert "some-untyped-producer" in evaluation.reason
+
+
+def test_declines_naming_a_missing_self_hash(ap_repo, ap_seams, monkeypatch, tmp_path):
+    """An implementation that cannot be hashed cannot be recorded, and a
+    landing whose record cannot say which code decided it is not replayable by
+    SABLE-21rug.6. Fail-closed: absence of a hash is not a hash."""
+    monkeypatch.setattr(promote_lib, "_deciding_sources",
+                        lambda: [tmp_path / "no-such-implementation.py"])
+    assert promote_lib.gate_self_hash() == ""
+    evaluation = _evaluate(ap_repo)
+    assert promote_lib.AutoPromoteDisqualifier.MISSING_SELF_HASH in evaluation.rows, \
+        evaluation.reason
+    assert evaluation.self_hash == ""
+
+
+def test_gate_self_hash_over_zero_sources_is_absence_not_a_digest(monkeypatch):
+    """p9n7k applied to the hash function's own input: sha256 of nothing is a
+    perfectly well-formed digest, and returning it would make 'no sources' read
+    as 'hashed successfully'."""
+    monkeypatch.setattr(promote_lib, "_deciding_sources", lambda: [])
+    assert promote_lib.gate_self_hash() == ""
+
+
+def test_declines_naming_a_verdict_sha_mismatch(ap_repo, ap_seams):
+    """A verdict for a DIFFERENT object is refused, never re-pointed at the
+    object in hand."""
+    ap_seams["verdict"] = promote_lib.classify.Verdict(
+        "success", "", "f" * 40, "ci-verify/auto-fixture",
+        source="precomputed", complete=True)
+    evaluation = _evaluate(ap_repo)
+    assert promote_lib.AutoPromoteDisqualifier.VERDICT_SHA_MISMATCH in evaluation.rows, \
+        evaluation.reason
+
+
+def test_declines_naming_a_base_that_moved_since_the_verdict(ap_repo, ap_seams):
+    """The base is re-observed LIVE rather than taken from the caller's
+    argument — the whole question being whether that argument is still true."""
+    repo, base_sha, branch_sha = ap_repo
+    _ap_run(repo, "checkout", "-q", "trunk")
+    (Path(repo) / "unrelated.txt").write_text("base advanced\n")
+    _ap_run(repo, "add", "-A")
+    _ap_run(repo, "commit", "-q", "-m", "base advance")
+    _ap_run(repo, "update-ref", "refs/remotes/origin/trunk", _ap_sha(repo))
+
+    evaluation = _evaluate(ap_repo)
+    assert promote_lib.AutoPromoteDisqualifier.BASE_MOVED in evaluation.rows, evaluation.reason
+
+
+def test_an_unresolvable_base_denies_rather_than_raising(ap_repo, ap_seams):
+    """'Unchanged' must not be inferred from 'unreadable'. The evaluation
+    returns a row; it never raises out of the table."""
+    repo, base_sha, branch_sha = ap_repo
+    _ap_run(repo, "update-ref", "-d", "refs/remotes/origin/trunk")
+    evaluation = _evaluate(ap_repo)
+    assert promote_lib.AutoPromoteDisqualifier.BASE_MOVED in evaluation.rows, evaluation.reason
+    assert "could not be resolved" in evaluation.reason
+
+
+# --- rows 12-14: the three vacuous-green preconditions ----------------------
+
+def _verdict_with(clauses):
+    return promote_lib.admission.MechanicalVerdict(
+        branch="wk-auto", bead="SABLE-auto",
+        mechanical=all(c.passed for c in clauses), clauses=clauses)
+
+
+def test_declines_naming_an_absent_non_vacuous_proof(ap_repo, ap_seams):
+    """SABLE-p9n7k, literally: all(...) over an empty clause tuple is True, so
+    a verdict that checked NOTHING presents as mechanical=True. The assert
+    must not believe it."""
+    empty = _verdict_with(())
+    assert empty.mechanical is True, \
+        "fixture no longer reproduces the vacuous green this row exists for"
+    evaluation = _evaluate(ap_repo, mechanical=empty)
+    assert promote_lib.AutoPromoteDisqualifier.NON_VACUOUS_PROOF_ABSENT in evaluation.rows, \
+        evaluation.reason
+    assert not evaluation.allowed
+
+
+def test_declines_naming_absent_selection_completeness(ap_repo, ap_seams):
+    """SABLE-x2n8a: a TRUNCATED clause set is non-empty and every clause in it
+    passes — indistinguishable from a complete one at the call site, which is
+    the whole defect. Distinct from p9n7k's row: something WAS checked here,
+    just not everything."""
+    partial = _verdict_with(tuple(
+        promote_lib.admission.ClauseResult(name, True, "passed")
+        for name in ("non_gate_class", "zero_holds")))
+    assert partial.mechanical is True
+    evaluation = _evaluate(ap_repo, mechanical=partial)
+    rows = evaluation.rows
+    assert promote_lib.AutoPromoteDisqualifier.SELECTION_COMPLETENESS_ABSENT in rows, \
+        evaluation.reason
+    assert promote_lib.AutoPromoteDisqualifier.NON_VACUOUS_PROOF_ABSENT not in rows, \
+        "a short clause set was reported as an empty one — the two rows are different defects"
+    for missing in ("individually_green", "clean_ff_adoption", "zero_conflicts"):
+        assert missing in evaluation.reason
+
+
+def test_declines_naming_a_truncated_bd_read(ap_repo, ap_seams):
+    """SABLE-52aym: an enumerating bd read with no explicit --limit is
+    silently cut at 50, and every absence-shaped conclusion drawn from it is
+    wrong in the RELEASING direction."""
+    planted = ast.parse('argv = ["list", "--json", "--status=open"]')
+    evaluation = _evaluate(ap_repo, module_asts=[planted])
+    assert promote_lib.AutoPromoteDisqualifier.TRUNCATED_BD_READ in evaluation.rows, \
+        evaluation.reason
+    assert "list --json --status=open" in evaluation.reason
+
+
+def test_an_explicitly_bounded_bd_read_is_not_flagged(ap_repo, ap_seams):
+    """The negative control for the row above (SABLE-rhsuj false-positive law):
+    the SAME shape carrying --limit 0 must pass, or the check is just 'any bd
+    list denies'."""
+    bounded = ast.parse('argv = ["list", "--json", "--limit", "0"]')
+    assert promote_lib.unlimited_bd_reads(bounded) == []
+    evaluation = _evaluate(ap_repo, module_asts=[bounded])
+    assert evaluation.allowed, evaluation.reason
+
+
+def test_the_real_deciding_sources_carry_no_unbounded_enumerating_bd_read():
+    """Non-vacuity against the real modules: the scanner is run over the
+    ACTUAL deciding sources and must find them clean. If this ever reds, a bd
+    enumeration joined the deciding path without a --limit — which is the
+    defect, not a false alarm."""
+    for path in promote_lib._deciding_sources():
+        tree = ast.parse(path.read_text(), filename=str(path))
+        assert promote_lib.unlimited_bd_reads(tree) == [], f"unbounded bd read in {path}"
+
+
+def test_a_bd_read_addressing_one_bead_by_id_is_never_flagged():
+    """`show` and `update` name a single bead, so there is no result set to
+    truncate. Flagging them would make the precondition unsatisfiable and
+    therefore meaningless."""
+    tree = ast.parse('a = ["show", bead, "--json"]\nb = ["update", bead, "--append-notes", n]')
+    assert promote_lib.unlimited_bd_reads(tree) == []
+
+
+def test_an_unparseable_deciding_source_denies_rather_than_scanning_nothing(
+        ap_repo, ap_seams, monkeypatch, tmp_path):
+    """A scan that COULD NOT RUN and a scan that FOUND NOTHING must not read
+    the same — the bounded-search failure 52aym is itself an instance of."""
+    broken = tmp_path / "broken_source.py"
+    broken.write_text("def (((:\n")
+    monkeypatch.setattr(promote_lib, "_deciding_sources", lambda: [broken])
+    evaluation = _evaluate(ap_repo)
+    assert promote_lib.AutoPromoteDisqualifier.TRUNCATED_BD_READ in evaluation.rows, \
+        evaluation.reason
+    assert "broken_source.py" in evaluation.reason
+
+
+# --- table-level properties -------------------------------------------------
+
+def test_the_completeness_target_matches_the_real_predicates_clause_set(ap_repo, ap_seams):
+    """x2n8a's completeness precondition compares against a literal list of
+    clause names. Read the names off a REAL verdict from the REAL predicate so
+    the literal cannot drift away from what be4lo.3 actually returns — a
+    drifted target would either deny every healthy branch or stop detecting
+    truncation."""
+    repo, base_sha, branch_sha = ap_repo
+    verdict = promote_lib.admission.is_this_branch_mechanical(
+        repo, "origin", "SABLE-auto", "wk-auto", base_sha, branch_sha)
+    assert tuple(c.name for c in verdict.clauses) == promote_lib.REQUIRED_MECHANICAL_CLAUSES
+
+
+def test_every_clause_of_the_shared_predicate_has_a_row(ap_repo, ap_seams):
+    """No clause may deny anonymously. Every name the predicate can return is
+    mapped — either through _CLAUSE_ROWS or through non_gate_class's fan-out —
+    so a failing clause always NAMES a row."""
+    mapped = set(promote_lib._CLAUSE_ROWS) | {"non_gate_class"}
+    assert set(promote_lib.REQUIRED_MECHANICAL_CLAUSES) == mapped
+
+
+def test_the_decline_names_every_row_that_fired_not_just_the_first(ap_repo, ap_seams):
+    """Never short-circuited, mirroring is_this_branch_mechanical's own
+    contract: one decline that hides three others costs three more round trips
+    at the seat."""
+    ap_seams["bead"]["metadata"]["footprint_writes"] = promote_lib.admission.DISPATCH_FILE
+    ap_seams["bead"]["metadata"]["hold"] = "held"
+    ap_seams["verdict"] = promote_lib.classify.Verdict(
+        "failure", "", "f" * 40, "ci-verify/auto-fixture",
+        source="precomputed", complete=True)
+    evaluation = _evaluate(ap_repo)
+    rows = set(evaluation.rows)
+    assert {promote_lib.AutoPromoteDisqualifier.GATE_CLASS_FILE,
+            promote_lib.AutoPromoteDisqualifier.LIVE_HOLD,
+            promote_lib.AutoPromoteDisqualifier.NOT_INDIVIDUALLY_GREEN,
+            promote_lib.AutoPromoteDisqualifier.VERDICT_SHA_MISMATCH} <= rows, evaluation.reason
+    assert "4 disqualifier(s)" in evaluation.reason
+
+
+def test_the_table_is_reported_in_table_order_not_evaluation_order(ap_repo, ap_seams):
+    """Two records for the same facts must be byte-identical however the
+    evaluation was scheduled — a property SABLE-21rug.6's replay compares on."""
+    ap_seams["bead"]["metadata"]["footprint_writes"] = promote_lib.admission.DISPATCH_FILE
+    ap_seams["bead"]["metadata"]["hold"] = "held"
+    rows = _evaluate(ap_repo).rows
+    order = list(promote_lib.AutoPromoteDisqualifier)
+    assert list(rows) == sorted(rows, key=order.index)
+
+
+def test_the_evaluation_record_round_trips_with_unknown_field_tolerance(ap_repo, ap_seams):
+    """SABLE-21rug.6 replays from durable records; an additive field a later
+    sibling writes must not break an older reader."""
+    ap_seams["bead"]["metadata"]["hold"] = "held"
+    evaluation = _evaluate(ap_repo)
+    data = evaluation.to_dict()
+    data["a_field_from_the_future"] = {"nested": True}
+    restored = promote_lib.AutoPromoteEvaluation.from_dict(data)
+    assert restored == evaluation
+    assert restored.rows == evaluation.rows
+
+
+def test_an_allowing_evaluation_is_recorded_just_as_completely(ap_repo, ap_seams):
+    """The landings that actually happen must not be the unobservable ones."""
+    data = _evaluate(ap_repo).to_dict()
+    assert data["allowed"] is True
+    assert data["disqualifiers"] == []
+    assert data["preview_sha"] == PREVIEW_SHA
+    assert data["provenance"] == promote_lib.VerdictSource.PRECOMPUTED.value
+    assert len(data["self_hash"]) == 64
+
+
+def test_the_auto_promote_assert_re_derives_no_mechanical_clause():
+    """ACCEPTANCE (SABLE-21rug.4): 'the predicate is consumed from its one home
+    — grep proves no clause re-derivation in this file'.
+
+    Checked over the AST rather than by substring, so the prose above that
+    NAMES these functions (deliberately, to explain the boundary) cannot be
+    mistaken for a call to them. Every clause-deriving function
+    sable_batch_admission_lib uses to build a MechanicalVerdict is banned here;
+    a second derivation of any of them is the drift the factoring exists to
+    prevent."""
+    banned = {"declared_footprint", "mechanical_footprint", "declared_reads",
+              "gate_class_roster", "is_disjoint", "is_rw_disjoint", "fold_check",
+              "_read_bead", "_non_gate_class", "_zero_holds", "_zero_conflicts",
+              "_individually_green_and_ff", "admit_batch"}
+    tree = ast.parse(Path(promote_lib.__file__).read_text())
+    called = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = (func.attr if isinstance(func, ast.Attribute)
+                else func.id if isinstance(func, ast.Name) else None)
+        if name:
+            called.add(name)
+    assert not (banned & called), (
+        f"the auto-promote assert re-derives mechanical clauses: {sorted(banned & called)}")
+    # Positive control: the ban above is only meaningful if this file really
+    # does consume the shared predicate. An empty file would pass the ban.
+    assert "is_this_branch_mechanical" in called, \
+        "this file does not consume the shared predicate at all — the ban above proves nothing"
+
+
+def test_every_disqualifier_row_has_a_case_that_fires_it(request):
+    """THE COMPLETENESS GATE for this bead's whole test spec: 'a disqualifier
+    never seen to fire is untested by construction'. The union of rows the
+    cases above actually OBSERVED must equal the enum — not merely be covered
+    by an equal count of tests. A row added later with no case reds here.
+
+    It reads an accumulator the cases above fill, so it is only meaningful
+    when they all ran. Two things deselect them routinely — a `-k` filter, and
+    this repo's own pytest-testmon/pytest-impact selection in ci-verify — and
+    under either, an accumulator gate that still ASSERTED would red on a
+    selection artifact rather than a defect. So it SKIPS instead, naming
+    exactly which cases were absent: a skip that says why is distinguishable
+    from a pass, which is the whole point of the p9n7k family. What it must
+    never become is a silent pass on a partial run."""
+    cases = {name for name in globals()
+             if name.startswith("test_declines_") or name == "test_an_unparseable_"
+             "deciding_source_denies_rather_than_scanning_nothing"}
+    selected = {item.name.split("[")[0] for item in request.session.items}
+    absent = cases - selected
+    if absent:
+        pytest.skip(f"auto-promote section only partially selected — {len(absent)} "
+                    f"disqualifier case(s) not run: {sorted(absent)}")
+    missing = set(promote_lib.AutoPromoteDisqualifier) - _ROWS_OBSERVED
+    assert not missing, (
+        f"disqualifier rows never seen to fire: {sorted(d.value for d in missing)}")
+
+
+# --------------------------------------------------------------------------
+# AUTO-PROMOTE INTEGRATION (SABLE-21rug.4) — the S3 acceptance
+# --------------------------------------------------------------------------
+#
+# A REAL two-repo sandbox (a bare origin + a real working clone), the REAL
+# promote() entry point, and a REAL bd store for the evidence write. Nothing
+# about the auto-promote decision is stubbed here: the mechanical footprint,
+# the hold read, the single-member fold, the base re-observation and the
+# landing itself are all real. Only CI is stubbed (materialize_preview /
+# acquire_verdict / delete_ci_ref) — there is no Actions run to consult in a
+# sandbox, exactly as in the SABLE-21rug.1 integration case above.
+#
+# The acceptance is a PAIR, run against the same sandbox: one branch with a
+# planted disqualifier and one healthy control. Without the control, "nothing
+# landed" is satisfied by a gate that refuses everything; without the plant,
+# "the healthy one landed" is satisfied by a gate that refuses nothing.
+
+def _ap_sandbox_branch(work, bare, name, filename, content):
+    subprocess.run(["git", "-C", work, "checkout", "-q", "-b", name, "trunk"],
+                   check=True, capture_output=True)
+    path = Path(work) / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    subprocess.run(["git", "-C", work, "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", work, "commit", "-q", "-m", f"work on {name}"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", work, "push", "-q", "origin", name],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", work, "checkout", "-q", "trunk"], check=True,
+                   capture_output=True)
+    return subprocess.run(["git", "-C", work, "rev-parse", name], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _ap_origin_tip(bare, ref="trunk"):
+    return subprocess.run(["git", "-C", bare, "rev-parse", ref], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+@pytest.mark.skipif(
+    not HAVE_BD,
+    reason="ci-verify clean-room has no bd/dolt by design; real-bd integration self-skips")
+def test_the_auto_path_declines_loudly_and_lands_nothing_a_decider_would_have_held(
+        tmp_path, monkeypatch):
+    """S3 ACCEPTANCE (SABLE-21rug.4). Real sandbox, real bd, real promote().
+
+    HARD INVARIANT, asserted directly rather than inferred from an exit code:
+    ZERO LANDINGS A DECIDER WOULD HAVE HELD. The origin's trunk tip is read
+    before and after the declined auto-promote and must be byte-identical —
+    the branch is still sitting in the seat's ordinary queue, promotable by a
+    human exactly as it is today."""
+    work, bare, _ = _real_two_repo_sandbox(tmp_path)
+    monkeypatch.setattr(promote_lib, "_notify", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "cleanup_after_merge", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib.preview, "delete_ci_ref", lambda *a, **kw: None)
+    subprocess.run(["git", "-C", work, "fetch", "-q", "origin"], check=True,
+                   capture_output=True)
+    base_sha = _ap_origin_tip(bare)
+
+    # The PLANT: a branch whose declared footprint reaches the gate's own
+    # dispatch file — gate-class, and therefore never mechanically promotable.
+    held_sha = _ap_sandbox_branch(work, bare, "wk-held", "bin/harmless-held.py", "h = 1\n")
+    # The CONTROL: an ordinary, disjoint, non-gate-class branch.
+    ok_sha = _ap_sandbox_branch(work, bare, "wk-ok", "bin/harmless-ok.py", "k = 1\n")
+
+    previews = {held_sha: ("p" * 40, "ci-verify/held"), ok_sha: ("q" * 40, "ci-verify/ok")}
+    monkeypatch.setattr(
+        promote_lib.preview, "adopt_kicked_preview",
+        lambda repo, remote, branch, b, br: previews.get(br))
+    monkeypatch.setattr(
+        promote_lib.preview, "read_verdict",
+        lambda repo, ref, preview_sha: promote_lib.classify.Verdict(
+            "success", "", preview_sha, ref, source="precomputed", complete=True))
+    # The declared footprint is the ONLY thing distinguishing the two branches,
+    # read through the real bd seam's shape.
+    declared = {"SABLE-auto-held": promote_lib.admission.DISPATCH_FILE,
+                "SABLE-auto-ok": "bin/harmless-ok.py"}
+    monkeypatch.setattr(
+        footprint_lib_for_auto, "_read_bead",
+        lambda repo, bead: {"description": "",
+                            "metadata": {"footprint_writes": declared[bead],
+                                         "footprint_reads_declared": ""}})
+
+    tip_before = _ap_origin_tip(bare)
+
+    # --- the planted disqualifier: DECLINED, loudly, by name ---------------
+    with pytest.raises(promote_lib.GateError) as excinfo:
+        promote_lib.promote("SABLE-auto-held", "wk-held", "trunk", work, "origin",
+                            "chuck", None, auto=True)
+    message = str(excinfo.value)
+    assert excinfo.value.code == promote_lib.classify.EXIT_PRECONDITION
+    assert "AUTO-PROMOTE DECLINED" in message
+    assert promote_lib.AutoPromoteDisqualifier.GATE_CLASS_FILE.value in message, message
+    assert promote_lib.admission.DISPATCH_FILE in message, \
+        "the decline did not name the specific file that disqualified it"
+    assert "ordinary queue" in message
+
+    # HARD INVARIANT: nothing landed from the auto path.
+    assert _ap_origin_tip(bare) == tip_before, \
+        "a branch the auto-promote gate DECLINED reached the integration branch anyway"
+    # And the branch is still there to be promoted by a human — a decline
+    # removes nothing from the seat's ordinary queue.
+    assert _ap_origin_tip(bare, "wk-held") == held_sha
+
+    # --- the healthy control: the SAME auto path lands it -----------------
+    monkeypatch.setattr(promote_lib.preview, "materialize_preview",
+                        lambda *a, **kw: (ok_sha, "ci-verify/ok", False))
+    monkeypatch.setattr(promote_lib.preview, "acquire_verdict",
+                        lambda *a, **kw: promote_lib.classify.Verdict(
+                            "success", "", ok_sha, "ci-verify/ok", source="precomputed"))
+    rc = promote_lib.promote("SABLE-auto-ok", "wk-ok", "trunk", work, "origin",
+                             "chuck", None, auto=True)
+    assert rc == 0, "the healthy control did not land — the gate refuses everything"
+    assert _ap_origin_tip(bare) == ok_sha, "the control landed something other than its own commit"
+
+
+@pytest.mark.skipif(
+    not HAVE_BD,
+    reason="ci-verify clean-room has no bd/dolt by design; real-bd integration self-skips")
+def test_both_polarities_of_the_auto_gate_are_recorded_durably(tmp_path, monkeypatch):
+    """An ALLOW must be as durable as a DENY. A gate that only records its
+    refusals makes the landings that ACTUALLY HAPPENED the unobservable ones,
+    which is the shape SABLE-21rug.6's audit ('zero input on a landing day is
+    RED') exists to catch.
+
+    Driven through the REAL promote() against the real two-repo sandbox — real
+    fetch, real refs, real landing — and captured at the _append_evidence seam,
+    so what is asserted is what promote() really writes rather than what it
+    computes. The two polarities differ in ONE fact (a hold on the bead), which
+    is what makes the difference in the record attributable."""
+    work, bare, branch_sha = _real_two_repo_sandbox(tmp_path)
+    monkeypatch.setattr(promote_lib, "_notify", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "cleanup_after_merge", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib.preview, "delete_ci_ref", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib.preview, "adopt_kicked_preview",
+                        lambda *a, **kw: (branch_sha, "ci-verify/polarity"))
+    monkeypatch.setattr(promote_lib.preview, "read_verdict",
+                        lambda repo, ref, sha: promote_lib.classify.Verdict(
+                            "success", "", sha, ref, source="precomputed", complete=True))
+    held = {"on": True}
+    monkeypatch.setattr(
+        footprint_lib_for_auto, "_read_bead",
+        lambda repo, bead: {"description": "", "metadata": dict(
+            {"footprint_writes": "feature.txt", "footprint_reads_declared": ""},
+            **({"hold": "held by lincoln"} if held["on"] else {}))})
+    written = []
+    monkeypatch.setattr(promote_lib, "_append_evidence",
+                        lambda repo, bead, note: written.append(note))
+    monkeypatch.setattr(promote_lib.preview, "materialize_preview",
+                        lambda *a, **kw: pytest.fail("a DECLINE built a preview"))
+
+    # --- DENY polarity ----------------------------------------------------
+    with pytest.raises(promote_lib.GateError):
+        promote_lib.promote("SABLE-auto", "wk-x", "trunk", work, "origin",
+                            "chuck", None, auto=True)
+    declines = [n for n in written if n.startswith("auto-promote DECLINED (SABLE-21rug.4): ")]
+    assert len(declines) == 1, written
+    denied = promote_lib.AutoPromoteEvaluation.from_dict(
+        json.loads(declines[0].split(": ", 1)[1]))
+    assert not denied.allowed
+    assert promote_lib.AutoPromoteDisqualifier.LIVE_HOLD in denied.rows
+    assert _ap_origin_tip(bare) != branch_sha, "the declined branch landed anyway"
+
+    # --- ALLOW polarity: the SAME sandbox, one fact changed ---------------
+    written.clear()
+    held["on"] = False
+    monkeypatch.setattr(promote_lib.preview, "materialize_preview",
+                        lambda *a, **kw: (branch_sha, "ci-verify/polarity", False))
+    monkeypatch.setattr(promote_lib.preview, "acquire_verdict",
+                        lambda *a, **kw: promote_lib.classify.Verdict(
+                            "success", "", branch_sha, "ci-verify/polarity",
+                            source="precomputed"))
+
+    assert promote_lib.promote("SABLE-auto", "wk-x", "trunk", work, "origin",
+                               "chuck", None, auto=True) == 0
+    allow_notes = [n for n in written if n.startswith("auto-promote ALLOWED (SABLE-21rug.4): ")]
+    assert len(allow_notes) == 1, f"the ALLOW was not recorded durably: {written}"
+    permitted = promote_lib.AutoPromoteEvaluation.from_dict(
+        json.loads(allow_notes[0].split(": ", 1)[1]))
+    assert permitted.allowed
+    assert permitted.disqualifications == ()
+    assert len(permitted.self_hash) == 64
+    assert permitted.provenance == promote_lib.VerdictSource.PRECOMPUTED.value
+    assert _ap_origin_tip(bare) == branch_sha, "the allowed branch did not land"
+
+
+@pytest.mark.skipif(
+    not HAVE_BD,
+    reason="ci-verify clean-room has no bd/dolt by design; real-bd integration self-skips")
+def test_a_seat_promote_never_reaches_the_auto_gate(tmp_path, monkeypatch):
+    """REGRESSION, and the reason this bead is behaviour-neutral on landing:
+    every caller today promotes WITHOUT `auto`, and that path must not consult
+    the auto-promote gate at all. The same planted disqualifier that declined
+    above lands normally here, because a human asked for it."""
+    work, bare, branch_sha = _real_two_repo_sandbox(tmp_path)
+    monkeypatch.setattr(promote_lib, "_notify", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "cleanup_after_merge", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib.preview, "delete_ci_ref", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib.preview, "materialize_preview",
+                        lambda *a, **kw: (branch_sha, "ci-verify/seat", False))
+    monkeypatch.setattr(promote_lib.preview, "acquire_verdict",
+                        lambda *a, **kw: promote_lib.classify.Verdict(
+                            "success", "", branch_sha, "ci-verify/seat", source="waited"))
+    monkeypatch.setattr(promote_lib, "evaluate_auto_promote", lambda *a, **kw: pytest.fail(
+        "a seat promote consulted the auto-promote gate"))
+
+    assert promote_lib.promote("SABLE-seat", "wk-x", "trunk", work, "origin",
+                               "chuck", None) == 0
+    assert _ap_origin_tip(bare) == branch_sha
