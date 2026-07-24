@@ -29,12 +29,18 @@
 # templates/multi-manager/settings-snippet.json instead.
 #
 # FAIL-OPEN, BUT NEVER SILENTLY (Standing Discipline 7): when the guard
-# cannot locate its own pattern-logic library (an installed ~/.claude/hooks
-# copy with no bin/ sibling — install.sh COPIES hooks; it does not ship
-# bin/sable_inline_body_guard_lib.py alongside them, since sable-bin-install
-# only symlinks *.py-less sable-* entrypoints onto PATH), it ALLOWS the
-# command through but says so loudly via additionalContext rather than
-# quietly passing everything.
+# cannot locate its own pattern-logic library it ALLOWS the command through
+# but says so loudly via additionalContext rather than quietly passing
+# everything. That loudness is the only reason SABLE-nn54x was caught in
+# seconds: bin/sable-orchestration-install used to COPY this hook into
+# ~/.claude/hooks/multi-manager/ WITHOUT the bin/ sibling it imports (there is
+# no PATH-installed form of a *.py lib — sable-bin-install only symlinks
+# *.py-less sable-* entrypoints), so the guard fired on every Bash call
+# fleet-wide and checked nothing while four independent probes reported it
+# ACTIVE. The installer now installs the sibling-library closure alongside the
+# hook and REFUSES to register a hook whose closure it cannot satisfy; this
+# branch remains as the belt to that braces. Had it failed CLOSED instead, it
+# would have refused every bd call in the fleet simultaneously.
 
 set -uo pipefail
 
