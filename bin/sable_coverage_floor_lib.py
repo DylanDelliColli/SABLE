@@ -23,6 +23,18 @@ is invisible to diff-cover (it is not a coverage.py/pytest tool); only a
 removed MAPPING is caught, by the separate manifest-completeness check
 (SABLE-cmar4.2). Do not extend this module to fake shell coverage — that is
 the accepted gap, not a bug in this file.
+
+FIXED DEFECT (SABLE-owix4): detect_pruning's function-removal leg used to
+ask "did a specific def NAME disappear from the diff", which made a test
+RENAME invisible to it BY CONSTRUCTION — the same is true of any refactor
+that moves a test between files, splits one test into two, or parametrizes
+several into one, all of which INCREASE coverage. It now asks the property
+the floor actually wants — "did the SIZE of the test-function set go down"
+(PruningSignal.net_test_function_delta) — so a rename, move, or split net to
+zero-or-positive and pass silently; only a genuine reduction in the number
+of test functions is reported as pruning. See detect_pruning's own
+docstring for the full reasoning, including why a parametrize-merge is
+deliberately left pruning-shaped rather than special-cased.
 """
 from __future__ import annotations
 
@@ -48,20 +60,36 @@ _TEST_FILE_RE = re.compile(
 @dataclass
 class PruningSignal:
     removed_test_functions: list = field(default_factory=list)
+    added_test_functions: list = field(default_factory=list)
     newly_skipped_markers: int = 0
     deleted_test_files: list = field(default_factory=list)
 
     @property
+    def net_test_function_delta(self) -> int:
+        """len(added) - len(removed), i.e. did the SIZE of the test-function
+        set grow or shrink (SABLE-owix4). This is the property the floor
+        actually cares about — not which individual names moved. A rename
+        removes one name and adds a different one: delta 0. A move to
+        another file: delta 0. A split into two: delta +1. All three land
+        at zero-or-positive here and are NOT pruning, regardless of the
+        fact that a specific name vanished from the diff. Only a genuine
+        reduction in the number of test functions goes negative."""
+        return len(self.added_test_functions) - len(self.removed_test_functions)
+
+    @property
     def is_pruning(self) -> bool:
-        return bool(self.removed_test_functions or self.newly_skipped_markers
+        return bool(self.net_test_function_delta < 0 or self.newly_skipped_markers
                     or self.deleted_test_files)
 
     @property
     def reasons(self) -> list:
         out = []
-        if self.removed_test_functions:
-            out.append("removed test function(s): "
-                       + ", ".join(self.removed_test_functions))
+        if self.net_test_function_delta < 0:
+            removed_str = ", ".join(self.removed_test_functions) or "none"
+            added_str = ", ".join(self.added_test_functions) or "none"
+            out.append(
+                f"net decrease of {-self.net_test_function_delta} test "
+                f"function(s) (removed: {removed_str}; added: {added_str})")
         if self.newly_skipped_markers:
             out.append(f"{self.newly_skipped_markers} newly-added skip marker(s)")
         if self.deleted_test_files:
@@ -71,9 +99,34 @@ class PruningSignal:
 
 def detect_pruning(diff_text: str) -> PruningSignal:
     """Scan a unified diff (as produced by `git diff <base>...<branch>`) for
-    the three named pruning shapes. A function removed in one hunk and
-    re-added elsewhere in the SAME diff (a move/rename) nets out and is not
-    reported — only a NET removal counts."""
+    signals correlated with a coverage regression.
+
+    THE PROPERTY detect_pruning's function-count leg ANSWERS (SABLE-owix4):
+    did the NUMBER of test functions go down between base and tip — not did
+    a specific def NAME disappear. A unified diff only ever shows lines that
+    CHANGED, so every `def test_*` line present in base but absent in tip
+    appears as a `-` line somewhere in the diff, and every one present in
+    tip but absent in base appears as a `+` line, regardless of which file
+    it ended up in or what it was renamed to. Comparing the SIZE of those
+    two sets (PruningSignal.net_test_function_delta), instead of asking
+    which individual names are common to both, is what makes a rename, a
+    move to another file, or a split into more functions net to
+    zero-or-positive and pass silently — only a genuine NET reduction in
+    the number of test functions is reported as pruning.
+
+    (Several tests merged into one @pytest.mark.parametrize function IS
+    still a net reduction in def count by this measure — a static diff scan
+    cannot see that the parametrize cases replay every input, so that shape
+    is deliberately left flagged as pruning-shaped, which routes it to the
+    real coverage-delta check rather than allowing or denying it outright;
+    see evaluate_coverage_floor.)
+
+    Skip markers and whole-file deletions are kept as direct property
+    checks rather than set comparisons: a newly-added skip marker doesn't
+    change any def count but does stop a test from running, and this
+    module's KNOWN RESIDUAL (see module docstring) never parses shell
+    test-file bodies at all, so for a deleted `.sh` suite file-existence is
+    the only signal available — there is no name or count to compare."""
     removed_fns: set = set()
     added_fns: set = set()
     skip_count = 0
@@ -107,8 +160,8 @@ def detect_pruning(diff_text: str) -> PruningSignal:
             skip_count += 1
     _flush()
 
-    net_removed = sorted(removed_fns - added_fns)
-    return PruningSignal(removed_test_functions=net_removed,
+    return PruningSignal(removed_test_functions=sorted(removed_fns),
+                         added_test_functions=sorted(added_fns),
                          newly_skipped_markers=skip_count,
                          deleted_test_files=deleted_files)
 
