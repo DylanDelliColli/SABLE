@@ -83,12 +83,18 @@ RETIRED_AGENT_DEFS="optimus.md tarzan.md chuck.md"
 # (event, matcher, command-basename) so a hook registered under two matchers (e.g.
 # mode-interlock.sh under both Bash and Agent) is preserved, while a re-run adds
 # nothing. Backs up, validates JSON, never clobbers existing entries.
+#
+# $4 (optional) is a space-separated list of hook basenames to leave OUT of the
+# merge entirely — hooks this run REFUSED to install because their sibling
+# library closure could not be satisfied (SABLE-nn54x). Registering one of those
+# would wire an inert gate, which is worse than no gate at all.
 merge_snippet() {
-    SETTINGS_PATH="$1" SNIPPET_PATH="$2" BASE_DIR="$3" python3 - <<'PY'
+    SETTINGS_PATH="$1" SNIPPET_PATH="$2" BASE_DIR="$3" SKIP_MARKERS="${4:-}" python3 - <<'PY'
 import json, os, shutil
 settings = os.environ['SETTINGS_PATH']
 with open(os.environ['SNIPPET_PATH']) as f: snip = json.load(f)
 base = os.environ['BASE_DIR']
+skip = set(os.environ.get('SKIP_MARKERS', '').split())
 data = {}
 if os.path.exists(settings):
     shutil.copy(settings, settings + '.bak')
@@ -118,6 +124,7 @@ for event, blocks in snip.get('hooks', {}).items():
         for h in b.get('hooks', []):
             if not isinstance(h, dict): continue
             cmd = (h.get('command', '') or '').replace('~/.claude', base)
+            if marker(cmd) in skip: continue
             key = (m, marker(cmd))
             if key in existing: continue
             existing.add(key)
@@ -263,6 +270,129 @@ install_file() {
     fi
 }
 
+# --- Hook sibling-library closure (SABLE-nn54x) ---
+#
+# Hooks are COPY-installed, so a repo-relative sibling a hook imports resolves
+# from the INSTALLED path, never the repo path. inline-body-guard.sh resolves
+# its pattern logic as "$HOOK_DIR/../../bin/sable_inline_body_guard_lib.py":
+# from hooks/multi-manager/ in the repo that lands on repo/bin/ and works, but
+# from BASE/hooks/multi-manager/ it lands on BASE/bin/, which this installer
+# never created. The copy severed the import and the hook was then WIRED,
+# FIRING AND INERT — it intercepted every Bash call fleet-wide and checked
+# nothing, while an installed-path presence probe, a settings.json wiring grep
+# and a cmp against the landed blob all reported it ACTIVE. None of them
+# inspected the DEPENDENCY CLOSURE. An activation check must verify the
+# closure, not the entry point.
+#
+# Scope is python sibling LIBRARIES (bin/*.py) reached through a literal
+# ../-prefixed reference. The two sable-* EXECUTABLES some hooks reference
+# (bin/sable-mode, bin/sable-dep-check) are deliberately out of scope: both
+# have a PATH-installed form via sable-bin-install and both already degrade
+# to silence when absent, whereas a *.py lib has no PATH form at all — which
+# is precisely why its absence was invisible.
+#
+# MENTION IS NOT EXECUTION, and the difference decides whether an install
+# REFUSES. This scanner reads text; it does not parse shell. A hook's own
+# comments routinely NAME the library they document, and a scanner that reads a
+# comment as a dependency would refuse to install a hook over a stale sentence.
+# So each reference carries a HARD flag:
+#   hard=1  the reference appears on at least one non-comment line — a real
+#           dependency. Unresolvable => REFUSE the hook.
+#   hard=0  the reference appears only on comment lines — documentation. If the
+#           named lib exists it is installed anyway (harmless, and correct if
+#           the comment is accurate); if it does not exist the reference is
+#           IGNORED. A comment can never cost the fleet a hook.
+# Comment detection is deliberately the crude "first non-space char is #" rule
+# rather than a half-written shell parser: it can only ever RELAX a refusal,
+# never cause one, so its failure direction is safe.
+#
+# THE SCANNER'S BOUNDARY, documented here because this is where it is enforced
+# and the person who adds a hook is reading the code, not a bead. Two reference
+# shapes are deliberately NOT dependencies of the installed hook:
+#
+#   1. VARIABLE-COMPOSED SIBLING PATHS — LIB="${HOOK_DIR}/../../bin/${NAME}"
+#      carries no literal *.py token and is NOT SEEN. This is genuine
+#      under-detection, not a decision: a hook written that way would be back
+#      in the wired-inert state with no warning. No shipped hook does this
+#      today (see the per-hook closure table on SABLE-nn54x), so the table must
+#      be re-run whenever a hook grows a new sibling reference.
+#   2. $CWD-ROOTED TOOL LOOKUPS — pre-push-rebase-test.sh:612's
+#      TRIPWIRE_BIN="$CWD/bin/sable-fixture-tripwire" resolves against the REPO
+#      BEING PUSHED FROM, not against this hook's installed location, so no
+#      amount of installing into BASE/bin would satisfy it. It is guarded by
+#      [ -x "$TRIPWIRE_BIN" ] and its own comment states the no-op case ("most
+#      repos this hook gates don't ship the checker"), so its absence costs a
+#      skipped check, never a failure. Correctly out of scope.
+#
+# Both shapes are named because a reader grepping these hooks for "bin/" finds
+# FOUR references and only three are in the table; the fourth's absence must
+# not have to be re-derived.
+#
+# hook_sibling_libs HOOK_FILE INSTALLED_HOOK_DIR — print one
+# "<abs-target-dir><TAB><lib-name><TAB><hard>" line per library the hook needs,
+# where <abs-target-dir> is where the INSTALLED hook will actually look. Closes
+# transitively: python resolves a lib's own sable_* imports from that lib's
+# directory, so a one-level scan would rebuild this same defect one level down.
+hook_sibling_libs() {
+    HOOK_FILE="$1" HOOK_DEST_DIR="$2" REPO_DIR="$REPO" python3 - <<'PY'
+import os, re
+
+REF_RE = re.compile(r'((?:\.\./)+)bin/([A-Za-z0-9_]+\.py)')
+IMPORT_RE = re.compile(r'^\s*(?:import|from)\s+(sable_[A-Za-z0-9_]+)', re.M)
+
+repo = os.environ['REPO_DIR']
+dest = os.environ['HOOK_DEST_DIR']
+try:
+    with open(os.environ['HOOK_FILE'], encoding='utf-8', errors='replace') as f:
+        lines = f.read().splitlines()
+except OSError:
+    raise SystemExit(0)
+
+# hard[(target, name)] is True once the reference is seen off a comment line.
+hard, order, queue = {}, [], []
+
+
+def note(target, name, is_hard):
+    key = (target, name)
+    if key not in hard:
+        hard[key] = False
+        order.append(key)
+        queue.append(key)
+    if is_hard and not hard[key]:
+        # Upgrading to hard changes what this entry propagates, so it has to be
+        # walked again -- otherwise a dep first reached through a comment stays
+        # soft even after a real reference to its parent turns up.
+        hard[key] = True
+        queue.append(key)
+
+
+for line in lines:
+    is_comment = line.lstrip().startswith('#')
+    for updirs, name in REF_RE.findall(line):
+        note(os.path.normpath(os.path.join(dest, updirs, 'bin')), name, not is_comment)
+
+while queue:
+    target, name = queue.pop()
+    try:
+        with open(os.path.join(repo, 'bin', name), encoding='utf-8', errors='replace') as f:
+            body = f.read()
+    except OSError:
+        # Unreadable here means unresolvable at install time too; the caller's
+        # readability check reports it and refuses the hook when it is hard.
+        continue
+    for mod in IMPORT_RE.findall(body):
+        dep = mod + '.py'
+        if not os.path.exists(os.path.join(repo, 'bin', dep)):
+            continue  # not a repo sibling (stdlib / third party) — nothing to install
+        # A transitive dep is exactly as load-bearing as the parent that
+        # imports it: inherit the flag rather than re-deriving it.
+        note(target, dep, hard[(target, name)])
+
+for target, name in order:
+    print('%s\t%s\t%d' % (target, name, 1 if hard[(target, name)] else 0))
+PY
+}
+
 # Stage (never activate) the host timer entrypoint's systemd/cron artifacts
 # (SABLE-jfg6.5 / D3 TIMER LEG): sable-reconcile-timer needs NO tmux server and
 # NO live panes, so it's the catch for a stranded push when the operator has
@@ -396,6 +526,18 @@ EOF
     rm -f "$BASE/sable/roles/lincoln.md" "$BASE/sable/roles/optimus.md" \
           "$BASE/sable/roles/tarzan.md" "$BASE/sable/roles/chuck.md" \
           "$BASE/sable/roles/cockpit.md" "$BASE/sable/agents.yaml"
+    # Sibling libraries installed for the hooks' dependency closure
+    # (SABLE-nn54x). Removed FILE-BY-FILE, never as a directory: BASE/bin is a
+    # shared location this installer does not own.
+    for hook in "$REPO"/hooks/multi-manager/*.sh; do
+        [ -f "$hook" ] || continue
+        while IFS="$(printf '\t')" read -r _dir _lib _hard; do
+            [ -n "${_lib:-}" ] || continue
+            rm -f "$_dir/$_lib"
+        done <<EOF
+$(hook_sibling_libs "$hook" "$HOOKS_DIR")
+EOF
+    done
     # agents-teams/ is no longer installed; the rm below cleans up installs
     # that predate the tmux-only layer.
     rm -rf "$HOOKS_DIR" "$BASE/agents-teams" "$BASE/sable/reconcile-timer"
@@ -412,13 +554,72 @@ mkdir -p "$HOOKS_DIR" "$BASE/sable/roles" "$SKILLS"
 
 cleanup_retired_artifacts
 
-# All multi-manager hooks (lib-identity.sh included — sourced by the others).
+# All multi-manager hooks (lib-identity.sh included — sourced by the others),
+# each preceded by its sibling-library closure (SABLE-nn54x).
+HOOK_LIB_LOG=()
+REFUSED_HOOKS=()
+REFUSED_HOOK_NAMES=""
 for hook in "$REPO"/hooks/multi-manager/*.sh; do
     [ -f "$hook" ] || continue
     _name="$(basename "$hook")"
+
+    _libs="$(hook_sibling_libs "$hook" "$HOOKS_DIR")"
+
+    # Resolve the whole closure BEFORE copying anything: a hook installed
+    # first and refused second would still be sitting at the installed path.
+    # Only HARD references (seen off a comment line) can refuse.
+    _missing=""
+    while IFS="$(printf '\t')" read -r _dir _lib _hard; do
+        [ -n "${_lib:-}" ] || continue
+        [ "${_hard:-0}" = "1" ] || continue
+        [ -r "$REPO/bin/$_lib" ] || _missing="${_missing} bin/$_lib"
+    done <<EOF
+$_libs
+EOF
+
+    if [ -n "$_missing" ]; then
+        # An UNREGISTERED hook is strictly better than a wired inert one: a
+        # gate that fires and checks nothing teaches the fleet to ignore its
+        # banner, and every activation probe reports it healthy.
+        REFUSED_HOOKS+=("$_name — sibling library not installable:${_missing}")
+        REFUSED_HOOK_NAMES="${REFUSED_HOOK_NAMES} $_name"
+        rm -f "$HOOKS_DIR/$_name"
+        continue
+    fi
+
+    while IFS="$(printf '\t')" read -r _dir _lib _hard; do
+        [ -n "${_lib:-}" ] || continue
+        # A soft (comment-only) reference to a lib that does not exist is
+        # documentation, not a dependency — install nothing, refuse nothing.
+        [ -r "$REPO/bin/$_lib" ] || continue
+        mkdir -p "$_dir"
+        _librel="${_dir#"$BASE"/}/$_lib"
+        install_file "$REPO/bin/$_lib" "$_dir/$_lib" "$_librel"
+        if [ -x "$REPO/bin/$_lib" ]; then chmod +x "$_dir/$_lib" 2>/dev/null || true; fi
+        if [ "${_hard:-0}" = "1" ]; then
+            HOOK_LIB_LOG+=("$_name -> $_dir/$_lib")
+        else
+            HOOK_LIB_LOG+=("$_name -> $_dir/$_lib  (comment-only reference)")
+        fi
+    done <<EOF
+$_libs
+EOF
+
     install_file "$hook" "$HOOKS_DIR/$_name" "hooks/multi-manager/$_name"
     chmod +x "$HOOKS_DIR/$_name" 2>/dev/null || true
 done
+
+# Auditable per-hook record of the resolved closure — the thing no instrument
+# reported when this went wrong (SABLE-nn54x).
+if [ "${#HOOK_LIB_LOG[@]}" -gt 0 ]; then
+    echo "Hook sibling libraries installed (dependency closure, SABLE-nn54x):"
+    printf '  - %s\n' "${HOOK_LIB_LOG[@]}"
+fi
+if [ "${#REFUSED_HOOKS[@]}" -gt 0 ]; then
+    echo "REFUSED to install these hooks — their settings registration is NOT merged" >&2
+    echo "(an unregistered hook beats a wired inert one, SABLE-nn54x):" >&2
+    printf '  - %s\n' "${REFUSED_HOOKS[@]}" >&2
+fi
 
 # Registry + lincoln role + identity. Remove a stale installed cockpit role
 # (v2: the agent is lincoln; SABLE-uz9.5).
@@ -444,8 +645,14 @@ for skdir in "$REPO"/skills/*/; do
     done
 done
 
-# Merge the settings snippet.
-merge_snippet "$SETTINGS" "$SNIPPET" "$SNIPPET_BASE"
+# Merge the settings snippet, minus any hook this run refused. A refused hook
+# may still be REGISTERED from an earlier install that did satisfy its closure
+# (or from before this check existed), and its file has just been removed — so
+# strip its rows too, rather than leaving settings pointing at nothing.
+if [ -n "$REFUSED_HOOK_NAMES" ]; then
+    remove_retired_hook_rows "$SETTINGS" "$REFUSED_HOOK_NAMES" >/dev/null || true
+fi
+merge_snippet "$SETTINGS" "$SNIPPET" "$SNIPPET_BASE" "$REFUSED_HOOK_NAMES"
 
 # Stage the host timer entrypoint's systemd/cron artifacts (never activates them).
 install_reconcile_timer

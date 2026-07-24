@@ -13,10 +13,16 @@ PATTERN-KEYED, not command-name-keyed. The bead's second instance (a
 backtick in a `sable-msg` body) defeated a mitigation that had been scoped to
 "bd write commands" only -- a name-list is exactly the shape that already
 failed once. So every entry in SURFACES below still names one concrete
-(command, argument) prose carrier -- detection has to know WHERE prose can
-appear, or it cannot tell a hazardous field from an inert one such as
-`--body-file <path>` -- but the table spans multiple tools on purpose, and
-adding a new tool means adding a row, not widening a name filter.
+prose carrier -- detection has to know WHERE prose can appear, or it cannot
+tell a hazardous field from an inert one such as `--body-file <path>` -- but
+the table spans multiple tools on purpose, and adding a new tool means adding
+a row, not widening a name filter.
+
+Most rows name a (command, argument) pair. One names a SHAPE instead: an
+interpreter wrapper (`python3 -c`, `bash -c`, ...) whose script string
+performs the bd/sable-msg write itself, so the wrapper's OWN literal is
+shell-parsed before the interpreter exists (SABLE-jjn0d). Still a row, still
+scoped to where substitution is never intended -- see that row's comment.
 
 This module is intentionally import-only-safe (no top-level side effects) so
 bin/test_sable_inline_body_guard.py can unit-test `classify()` directly, and
@@ -238,7 +244,96 @@ SURFACES = [
         'arg_desc': 'its inline body argument',
         'safe_hint': "sable-msg --body-file <path> (or --stdin) instead of the inline body argument",
     },
+    # SABLE-jjn0d. An ADDED ROW, not a widened filter -- the distinction the
+    # module docstring draws, and the one qwthx's recorded scope rationale
+    # turns on. The rows above inspect bd's OWN inline-body arguments; this one
+    # inspects an INTERPRETER WRAPPER whose -c/-e script string itself performs
+    # the bd/sable-msg write:
+    #
+    #   python3 -c "import subprocess; subprocess.run(['bd','update','SABLE-x',
+    #               '--append-notes','Hooks run as `parented` directly'])"
+    #
+    # Bash substitutes the backtick inside that double-quoted string BEFORE
+    # python exists. The wrapper hands bd a clean argv element and the
+    # wrapper's own literal is already corrupted. Three agents adopted this
+    # wrapper across a shift SPECIFICALLY to avoid the hazard, reasoning that
+    # an argv list is not shell-parsed -- true of the bd call, false of the
+    # string carrying it. SABLE-s5103's description lost a whole backticked
+    # span this way while staying a grammatical sentence.
+    #
+    # WHY NOT "any backtick anywhere": rejected on principle when qwthx landed.
+    # In an ordinary argument $(...) is frequently INTENDED --
+    # `timeout $(sable-merge-gate promote-budget --seconds) ...` is this
+    # fleet's own mandated derive-never-hardcode practice -- so a blanket guard
+    # would refuse doctrine and trip its own rollback condition. The principled
+    # boundary is WHERE SUBSTITUTION IS NEVER INTENDED, and a command whose
+    # purpose is a bd/sable-msg WRITE is such a place regardless of which
+    # argument carries the prose. Note the rule keys on bd WRITE subcommands
+    # and sable-msg, NOT on "any sable binary": the derive-never-hardcode idiom
+    # above contains both $( and a sable tool, and must still pass.
+    {
+        'id': 'interpreter-wrapper-bd-write',
+        'command': None, 'subcommand': None,
+        'interpreter_wrapper': True,
+        'arg_desc': "an interpreter wrapper's own -c/-e script string, which itself performs a bd/sable-msg write",
+        'safe_hint': (
+            "a file-based path -- bd note <id> --file <path>, bd create/update "
+            "--body-file <path>, --stdin, sable-msg --body-file <path>, or a "
+            "QUOTED heredoc; a file's content is never shell-parsed. Passing an "
+            "argv LIST from python/bash -c does NOT help: the calling shell "
+            "substitutes the wrapper's own literal before the interpreter exists"
+        ),
+    },
 ]
+
+# Interpreters whose -c/-e/--command argument is a SCRIPT the calling shell
+# parses first. Matched anywhere in the segment, not just at argv[0], so a
+# `timeout 30 python3 -c ...` or `env FOO=1 bash -c ...` prefix is still seen.
+INTERPRETERS = {'python', 'python3', 'perl', 'ruby', 'node', 'bash', 'sh', 'zsh', 'ksh'}
+SCRIPT_FLAGS = ('-c', '-e', '--command')
+
+# bd's WRITE subcommands. `bd show`/`bd list` are reads: a $(...) in one of
+# those is the derive-never-hardcode idiom, not residue in prose.
+_BD_WRITE_RE = re.compile(
+    r"(?<![\w-])bd(?![\w-]).{0,160}?"
+    r"(?<![\w-])(?:create|update|note|remember|q|close)(?![\w-])",
+    re.S,
+)
+_SABLE_MSG_RE = re.compile(r"(?<![\w-])sable-msg(?![\w-])")
+
+
+def _performs_bd_write(text):
+    """True when *text* invokes a bd WRITE subcommand or sable-msg."""
+    return bool(_BD_WRITE_RE.search(text) or _SABLE_MSG_RE.search(text))
+
+
+def _scan_interpreter_wrapper(seg):
+    """Return the wrapper SURFACE when *seg* runs an interpreter whose script
+    string BOTH carries a substitution hazard AND performs a bd/sable-msg
+    write. Both clauses are required on the SAME span: a hazardous wrapper
+    doing no bd write is the ordinary command-substitution the fleet relies on.
+    """
+    surface = next((s for s in SURFACES if s.get('interpreter_wrapper')), None)
+    if surface is None:
+        return None
+
+    for i, (tok, _hz) in enumerate(seg):
+        if os.path.basename(tok) not in INTERPRETERS:
+            continue
+        for j in range(i + 1, len(seg)):
+            flag_tok, flag_hz = seg[j]
+            flag_name = flag_tok.split('=', 1)[0]
+            if flag_name not in SCRIPT_FLAGS:
+                continue
+            if '=' in flag_tok and flag_tok.startswith('--'):
+                script, hazardous = flag_tok.split('=', 1)[1], flag_hz
+            elif j + 1 < len(seg):
+                script, hazardous = seg[j + 1]
+            else:
+                continue
+            if hazardous and _performs_bd_write(script):
+                return surface
+    return None
 
 
 def _flag_value_hazardous(rest, k, flag_tok):
@@ -274,7 +369,9 @@ def _scan_segment(seg):
         )
     ]
     if not applicable:
-        return None
+        # The command is not itself a prose carrier -- but it may be an
+        # interpreter wrapper around one (SABLE-jjn0d).
+        return _scan_interpreter_wrapper(seg)
 
     # Args considered for a flag surface are everything after the subcommand
     # token when this tool has a subcommand concept (bd), else everything
@@ -296,7 +393,7 @@ def _scan_segment(seg):
             if hz:
                 return surface
 
-    return None
+    return _scan_interpreter_wrapper(seg)
 
 
 def classify(command):
