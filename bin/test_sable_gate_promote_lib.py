@@ -23,6 +23,7 @@ import ast
 import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -2184,3 +2185,733 @@ def test_a_seat_promote_never_reaches_the_auto_gate(tmp_path, monkeypatch):
     assert promote_lib.promote("SABLE-seat", "wk-x", "trunk", work, "origin",
                                "chuck", None) == 0
     assert _ap_origin_tip(bare) == branch_sha
+
+
+# ==========================================================================
+# THE RED-BATCH BISECTION STATE MACHINE (SABLE-be4lo.8) — S3
+# ==========================================================================
+#
+# Layout mirrors the be4lo.7 batch-land section above: the pure arithmetic and
+# the state-machine properties first, then E2E cases on a REAL git sandbox with
+# a REAL content-derived verifier. Every fold below is built by the real
+# sable_batch_fold_lib and every ci-verify ref is really pushed to a real bare
+# remote, so "how many extra combined runs did it cost" is COUNTED off the
+# remote rather than tallied by the code under test.
+#
+# WHAT IS AND IS NOT MODELLED. There is no Actions run in a sandbox, so the
+# verify seam is supplied. It is supplied two ways, deliberately:
+#   * the UNIT cases pass a predicate over the member SET (a named culprit, or
+#     a named interacting pair) — the cheapest way to force each branch of the
+#     state machine deterministically;
+#   * the E2E cases pass _sandbox_verifier, which derives its verdict from the
+#     REAL FOLDED TREE by reading the folded object's blobs and running a real
+#     check over them (does every module compile; does any exported symbol have
+#     two owners). Nothing there is a lookup table: plant a broken file and the
+#     verdict goes red because the file is broken.
+
+
+def _bisect_members(repo, base_sha, specs):
+    """specs: [(label, filename, content)] -> [BatchMember], each a real branch
+    off base_sha pushed to the real origin."""
+    return [_member_branch(repo, base_sha, label, filename, content, (f"SABLE-{label}",))
+            for label, filename, content in specs]
+
+
+def _set_verifier(red_when_all_present, log=None):
+    """A verify seam that answers RED exactly when the subset contains EVERY
+    branch in `red_when_all_present`. One member named models a SINGLE CULPRIT
+    (any subset containing it is red); two members model an INTERACTION (each
+    alone is green, only the combination is red). Records every call so a test
+    can assert what was actually asked, not just what came back."""
+    culprits = set(red_when_all_present)
+
+    def verify(members, fold_tip, combined_ref):
+        branches = {m.branch for m in members}
+        green = not culprits.issubset(branches)
+        if log is not None:
+            log.append((tuple(sorted(branches)), combined_ref, green))
+        return green
+    return verify
+
+
+def _ci_refs(bare):
+    return sorted(subprocess.run(
+        ["git", "-C", str(bare), "for-each-ref", "--format=%(refname:short)",
+         "refs/heads/ci-verify/"], capture_output=True, text=True).stdout.split())
+
+
+# --- the pure arithmetic: the bound IS a computation ------------------------
+
+def test_the_bisection_bound_is_three_extra_combined_runs_at_n_of_four():
+    """UNIT (architecture decision 4, verbatim): at n=4 the culprit is isolated
+    in AT MOST 3 extra combined runs. Stated as the machine's own arithmetic so
+    the number in the architecture and the number the code will spend are the
+    same object, not two claims that happen to agree today."""
+    assert promote_lib.max_bisection_rounds(4) == 3
+    assert [promote_lib.max_bisection_rounds(n) for n in range(1, 9)] == \
+        [1, 2, 3, 3, 4, 4, 4, 4]
+
+
+def test_the_bound_refuses_a_batch_of_no_members():
+    with pytest.raises(ValueError):
+        promote_lib.max_bisection_rounds(0)
+
+
+def test_bisection_split_halves_with_the_extra_member_on_the_left():
+    assert promote_lib.bisection_split(["a", "b", "c", "d"]) == (["a", "b"], ["c", "d"])
+    assert promote_lib.bisection_split(["a", "b", "c"]) == (["a", "b"], ["c"])
+    # Both halves non-empty at every n>=2 — the descent always makes progress.
+    for n in range(2, 17):
+        left, right = promote_lib.bisection_split(list(range(n)))
+        assert left and right and len(left) + len(right) == n
+
+
+def test_bisection_split_refuses_a_node_it_cannot_split():
+    with pytest.raises(ValueError):
+        promote_lib.bisection_split(["only-one"])
+
+
+# --- the VACUOUS-PASS GUARD (SABLE-p9n7k on the round sequence) -------------
+
+def test_a_zero_round_bisection_result_raises_instead_of_existing():
+    """VACUOUS-PASS GUARD, load-bearing. Every property this section reports —
+    a culprit, a COULD-NOT-ATTRIBUTE, a bound — is a statement ABOUT the round
+    set, so a result carrying ZERO rounds makes all of them vacuously true at
+    once. It must be unconstructable, which is what makes every round-set
+    assertion below non-vacuous by construction rather than by inspection."""
+    with pytest.raises(promote_lib.VacuousBisectionError):
+        promote_lib.BisectionResult(
+            promote_lib.BATCH_OUTCOME_COULD_NOT_ATTRIBUTE, "", (), ("wk-a",), (),
+            ("a report over nothing",))
+
+
+def test_bisect_red_batch_refuses_an_empty_batch():
+    """The other end of the same guard: an empty batch cannot be red, so
+    bisecting one is a caller bug, never a vacuous no-op result."""
+    with pytest.raises(promote_lib.EmptyBatchError):
+        promote_lib.bisect_red_batch("/nonexistent", "origin", "a" * 40, [],
+                                     _set_verifier(["wk-a"]))
+
+
+def test_every_real_bisection_spends_at_least_one_round(tmp_path, fleet_sink):
+    """The guard's positive control: for EVERY batch size the machine handles,
+    a real bisection produces a non-empty round set. Without this the guard
+    above could be satisfied by a machine that simply never returns a result."""
+    for n in range(1, 5):
+        repo, bare, base_sha = _batch_sandbox(tmp_path / f"n{n}")
+        members = _bisect_members(repo, base_sha, [
+            (f"wk-{i}", f"bin/m{i}.py", f"m{i} = 1\n") for i in range(n)])
+        res = promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members,
+                                           _set_verifier(["wk-0"]))
+        assert res.rounds, f"n={n} bisected in zero rounds — every assertion would be vacuous"
+        assert len(res.rounds) <= promote_lib.max_bisection_rounds(n)
+
+
+# --- COULD-NOT-ATTRIBUTE: BOTH polarities, or the assertion is worthless ----
+
+def test_could_not_attribute_is_emitted_when_both_halves_verify_green(
+        tmp_path, capsys, fleet_sink):
+    """UNIT (S3 matrix case, POSITIVE polarity): an interaction-only red — two
+    members individually green whose combination is red — emits
+    COULD-NOT-ATTRIBUTE as an observable line, names no culprit, and engages the
+    all-serial fallback for EVERY member."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = _bisect_members(repo, base_sha, [
+        ("wk-a", "bin/a.py", "a = 1\n"), ("wk-b", "bin/b.py", "b = 1\n")])
+    res = promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members,
+                                       _set_verifier(["wk-a", "wk-b"]),
+                                       combined_ref="ci-verify/batch-inter")
+
+    assert res.outcome == promote_lib.BATCH_OUTCOME_COULD_NOT_ATTRIBUTE
+    assert res.culprit == ""
+    assert not res.attributed
+    assert res.rounds, "vacuity guard: no rounds means the verdict is about nothing"
+    # Every half really did verify green — that is what the verdict CLAIMS.
+    assert all(r.green for r in res.rounds)
+    assert res.red_rounds == ()
+    # LOUD on all three channels.
+    report = promote_lib.render_bisection_report(res)
+    assert promote_lib.BISECT_REPORT_COULD_NOT_ATTRIBUTE in report
+    assert promote_lib.BISECT_REPORT_COULD_NOT_ATTRIBUTE in capsys.readouterr().out
+    assert any(promote_lib.BISECT_REPORT_COULD_NOT_ATTRIBUTE in line
+               for line in fleet_sink()), "the interaction verdict never reached the cockpit"
+    # ALL-SERIAL fallback: every member back to the serial queue, nothing re-batched.
+    assert set(res.serial_queue) == {"wk-a", "wk-b"}
+    assert res.rebatch == ()
+    assert res.exit_code == promote_lib.classify.EXIT_RED
+
+
+def test_a_normally_attributed_red_does_not_emit_could_not_attribute(
+        tmp_path, capsys, fleet_sink):
+    """UNIT (S3 matrix case, NEGATIVE CONTROL — the half that makes the case
+    above mean anything): a red with a real single culprit names the member and
+    emits NO COULD-NOT-ATTRIBUTE, on any channel. Without this, a machine that
+    printed the token unconditionally would pass the positive case."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = _bisect_members(repo, base_sha, [
+        ("wk-a", "bin/a.py", "a = 1\n"), ("wk-bad", "bin/bad.py", "bad = 1\n")])
+    res = promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members,
+                                       _set_verifier(["wk-bad"]),
+                                       combined_ref="ci-verify/batch-single")
+
+    assert res.outcome == promote_lib.BATCH_OUTCOME_BISECTED_CULPRIT
+    assert res.culprit == "wk-bad"
+    report = promote_lib.render_bisection_report(res)
+    assert "wk-bad" in report, "the report did not NAME the member it isolated"
+    assert promote_lib.BISECT_REPORT_COULD_NOT_ATTRIBUTE not in report
+    assert promote_lib.BISECT_REPORT_COULD_NOT_ATTRIBUTE not in capsys.readouterr().out
+    assert not any(promote_lib.BISECT_REPORT_COULD_NOT_ATTRIBUTE in line
+                   for line in fleet_sink()), \
+        "an attributed red emitted the interaction verdict — the token discriminates nothing"
+    assert res.serial_queue == ("wk-bad",)
+    assert set(res.rebatch) == {"wk-a"}
+
+
+# --- the naming discipline: a culprit is MEASURED, never inferred -----------
+
+@pytest.mark.parametrize("guilty", ["wk-0", "wk-1", "wk-2", "wk-3"])
+def test_a_named_culprit_was_verified_red_alone_within_the_bound(
+        tmp_path, guilty, fleet_sink):
+    """The load-bearing property, swept over EVERY culprit position at n=4 (the
+    worst case is position-dependent, so one hand-picked position would prove
+    only that position): the machine names the right member, the naming is
+    backed by a round in which that member was verified RED **by itself**, and
+    the whole search stays inside max_bisection_rounds(4) == 3."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = _bisect_members(repo, base_sha, [
+        (f"wk-{i}", f"bin/m{i}.py", f"m{i} = 1\n") for i in range(4)])
+    res = promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members,
+                                       _set_verifier([guilty]))
+
+    assert res.culprit == guilty
+    assert res.rounds, "vacuity guard"
+    assert len(res.rounds) <= 3, f"n=4 cost {len(res.rounds)} extra runs, bound is 3"
+    solo_red = [r for r in res.rounds if r.branches == (guilty,) and not r.green]
+    assert solo_red, (
+        f"{guilty} was named without ever being verified alone — the naming was "
+        f"INFERRED from a green sibling, which is unsound exactly when the failure "
+        f"is an interaction")
+    assert set(res.rebatch) == {m.branch for m in members} - {guilty}
+
+
+def test_the_bisection_tree_is_a_function_of_the_member_set_not_the_input_order(
+        tmp_path, fleet_sink):
+    """Ordering safety, the bisection analogue of BatchRecord's own: the SAME
+    member set admitted in any of its 24 orders must name the same culprit and
+    walk the same tree. A machine that bisected in caller order would name
+    whichever member the caller happened to list first into a red half."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = _bisect_members(repo, base_sha, [
+        (f"wk-{i}", f"bin/m{i}.py", f"m{i} = 1\n") for i in range(4)])
+    trees, culprits = set(), set()
+    for order in itertools.permutations(members):
+        res = promote_lib.bisect_red_batch(str(repo), "origin", base_sha, list(order),
+                                           _set_verifier(["wk-2"]))
+        trees.add(tuple(r.branches for r in res.rounds))
+        culprits.add(res.culprit)
+    assert culprits == {"wk-2"}
+    assert len(trees) == 1, f"input order leaked into the bisection tree: {trees}"
+
+
+def test_a_subset_is_never_verified_twice(tmp_path, fleet_sink):
+    """A combined run is a real CI cycle. Re-asking a subset the machine already
+    measured would spend one to re-learn a known fact — and would push the run
+    count past the bound for zero information."""
+    log = []
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = _bisect_members(repo, base_sha, [
+        (f"wk-{i}", f"bin/m{i}.py", f"m{i} = 1\n") for i in range(4)])
+    res = promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members,
+                                       _set_verifier(["wk-0"], log))
+    asked = [entry[0] for entry in log]
+    assert len(asked) == len(set(asked)), f"a subset was verified twice: {asked}"
+    assert len(res.rounds) == len(asked)
+
+
+# --- the production verify seam ---------------------------------------------
+
+def _verdict(outcome_conclusion):
+    return promote_lib.classify.Verdict(outcome_conclusion, "", "f" * 40,
+                                        "ci-verify/batch-x", source="precomputed",
+                                        complete=True)
+
+
+@pytest.mark.parametrize("conclusion,green", [("success", True), ("failure", False)])
+def test_ci_batch_verify_reads_the_actions_verdict_for_the_round(
+        monkeypatch, conclusion, green):
+    """The production seam maps a round's Actions verdict to green/red — it
+    READS the verdict for the ref the round just pushed, it does not recompute
+    one (the promote module's standing boundary)."""
+    monkeypatch.setattr(promote_lib.preview, "acquire_verdict",
+                        lambda repo, ref, sha: _verdict(conclusion))
+    monkeypatch.setattr(promote_lib.preview, "delete_ci_ref", lambda *a, **kw: None)
+    verify = promote_lib.ci_batch_verify("/repo", "origin")
+    assert verify([], "f" * 40, "ci-verify/batch-x") is green
+
+
+@pytest.mark.parametrize("conclusion", ["cancelled", "actions_down", "timeout"])
+def test_ci_batch_verify_refuses_to_guess_a_verdict_it_could_not_read(
+        monkeypatch, conclusion):
+    """Negative space, and the reason this seam is not a truthy coercion: an
+    unreadable verdict is neither green nor red. Guessing red would name an
+    innocent member; guessing green would clear a guilty one. It raises with the
+    verdict's OWN taxonomy code so the caller's existing exit-code handling
+    stays correct."""
+    monkeypatch.setattr(promote_lib.preview, "acquire_verdict",
+                        lambda repo, ref, sha: _verdict(conclusion))
+    monkeypatch.setattr(promote_lib.preview, "delete_ci_ref", lambda *a, **kw: None)
+    verify = promote_lib.ci_batch_verify("/repo", "origin")
+    with pytest.raises(promote_lib.GateError) as exc:
+        verify([], "f" * 40, "ci-verify/batch-x")
+    assert exc.value.code == _verdict(conclusion).exit_code
+    assert "no usable verdict" in str(exc.value)
+
+
+# --- the manifest records the report vocabulary verbatim --------------------
+
+def test_the_promote_record_names_the_culprit_and_carries_the_report_verbatim(
+        tmp_path, monkeypatch, fleet_sink):
+    """ACCEPTANCE clause: 'the report vocabulary (named member /
+    COULD-NOT-ATTRIBUTE) appears verbatim in output the manifest records'. Read
+    back off the REAL durable promote-record log, not off the in-memory result."""
+    monkeypatch.setenv("SABLE_MG_BATCH_RECORD_LOG", str(tmp_path / "batch-records.jsonl"))
+    repo, bare, base_sha = _batch_sandbox(tmp_path / "s")
+    members = _bisect_members(repo, base_sha, [
+        ("wk-a", "bin/a.py", "a = 1\n"), ("wk-bad", "bin/bad.py", "bad = 1\n")])
+    res = promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members,
+                                       _set_verifier(["wk-bad"]),
+                                       combined_ref="ci-verify/batch-named")
+
+    record = promote_lib.find_batch_record(str(repo), "ci-verify/batch-named")
+    assert record is not None, "the bisection wrote no promote record"
+    assert record.outcome == promote_lib.BATCH_OUTCOME_BISECTED_CULPRIT
+    assert record.culprit == "wk-bad"
+    assert record.report_lines == res.report_lines
+    assert any("wk-bad" in line for line in record.report_lines)
+    assert set(record.member_branches()) == {"wk-a", "wk-bad"}
+
+
+def test_the_promote_record_carries_could_not_attribute_verbatim(
+        tmp_path, monkeypatch, fleet_sink):
+    """The other polarity of the same acceptance clause, in the durable record."""
+    monkeypatch.setenv("SABLE_MG_BATCH_RECORD_LOG", str(tmp_path / "batch-records.jsonl"))
+    repo, bare, base_sha = _batch_sandbox(tmp_path / "s")
+    members = _bisect_members(repo, base_sha, [
+        ("wk-a", "bin/a.py", "a = 1\n"), ("wk-b", "bin/b.py", "b = 1\n")])
+    promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members,
+                                 _set_verifier(["wk-a", "wk-b"]),
+                                 combined_ref="ci-verify/batch-cna")
+
+    record = promote_lib.find_batch_record(str(repo), "ci-verify/batch-cna")
+    assert record.outcome == promote_lib.BATCH_OUTCOME_COULD_NOT_ATTRIBUTE
+    assert record.culprit == ""
+    assert any(promote_lib.BISECT_REPORT_COULD_NOT_ATTRIBUTE in line
+               for line in record.report_lines), \
+        "the durable manifest does not carry the verdict token verbatim"
+
+
+def test_the_batch_record_round_trips_the_additive_bisection_fields():
+    """The bisection fields are ADDITIVE on BatchRecord: they survive the round
+    trip, and a record written before they existed (no keys at all) still
+    reconstructs — the same additive discipline the pre-existing round-trip
+    cases assert for the fields already there."""
+    members = [promote_lib.BatchMember("wk-a", "a" * 40, ("SABLE-a",), ("bin/a.py",))]
+    record = promote_lib.BatchRecord.from_members(
+        "b" * 40, members, combined_ref="ci-verify/batch-rt",
+        outcome=promote_lib.BATCH_OUTCOME_BISECTED_CULPRIT, fold_disjoint=True,
+        culprit="wk-a", report_lines=("CULPRIT ISOLATED: wk-a",))
+    assert promote_lib.BatchRecord.from_dict(record.to_dict()) == record
+    legacy = promote_lib.BatchRecord.from_dict({"combined_ref": "ci-verify/batch-old"})
+    assert legacy.culprit == "" and legacy.report_lines == ()
+
+
+# --- round-object adoption: both polarities ---------------------------------
+
+def test_a_re_run_bisection_adopts_the_objects_already_standing_on_its_refs(
+        tmp_path, fleet_sink):
+    """A bisection round's ref name is a pure function of (base, member tips)
+    but its folded COMMIT is not — commit-tree stamps a committer date. So a
+    re-run must ADOPT the object standing on each round's ref, not re-fold a
+    fresh-timestamped duplicate and try to push it (a non-fast-forward; a
+    --force would cancel any in-flight run, SABLE-sc24). Asserted as the same
+    verdict reached over the same OBJECTS, which is also what makes a
+    crashed-mid-bisection seat resumable."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = _bisect_members(repo, base_sha, [
+        (f"wk-{i}", f"bin/m{i}.py", f"m{i} = 1\n") for i in range(4)])
+    first = promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members,
+                                         _set_verifier(["wk-1"]))
+    assert [r.adopted for r in first.rounds] == [False] * len(first.rounds)
+    refs_after_first = _ci_refs(bare)
+
+    second = promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members,
+                                          _set_verifier(["wk-1"]))
+    assert all(r.adopted for r in second.rounds), \
+        "a re-run re-folded instead of adopting — the next push is a non-fast-forward"
+    assert [r.fold_tip for r in second.rounds] == [r.fold_tip for r in first.rounds]
+    assert second.culprit == first.culprit == "wk-1"
+    assert _ci_refs(bare) == refs_after_first, "adoption pushed a new CI trigger anyway"
+
+
+def test_a_round_refuses_a_foreign_object_standing_on_its_ref(tmp_path, fleet_sink):
+    """NEGATIVE CONTROL for the adoption above: the ref name is not taken as
+    proof. An object on that ref that is NOT a fold chain of this member count
+    built on this base is foreign, and the round refuses LOUDLY instead of
+    adopting it (which would verify the wrong object) or force-pushing over it
+    (which would cancel an in-flight run)."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = _bisect_members(repo, base_sha, [
+        ("wk-a", "bin/a.py", "a = 1\n"), ("wk-b", "bin/b.py", "b = 1\n")])
+    # Squat the ref the FIRST round will want with an unrelated commit.
+    left, _right = promote_lib.bisection_split(
+        sorted(members, key=lambda m: m.tip_sha))
+    squatted = promote_lib.classify.preview_ref_name(
+        "batch", promote_lib.batch_key.setkey(base_sha, [m.tip_sha for m in left]))
+    _bg(repo, "push", "-q", "origin", f"{base_sha}:refs/heads/{squatted}")
+
+    with pytest.raises(promote_lib.GateError) as exc:
+        promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members,
+                                     _set_verifier(["wk-a"]))
+    assert exc.value.code == promote_lib.classify.EXIT_PRECONDITION
+    assert squatted in str(exc.value)
+    assert "NOT a 1-member fold chain" in str(exc.value)
+
+
+# ==========================================================================
+# E2E (SABLE-be4lo.8, S3): a REAL git sandbox, the REAL fold builder, and a
+# REAL content-derived verifier.
+# ==========================================================================
+#
+# The verifier below is the thing that makes these cases E2E rather than
+# elaborate unit tests. It takes no member names and consults no table: it
+# READS THE FOLDED OBJECT'S OWN BLOBS out of the real git object store and runs
+# two real checks over them — every module must compile, and no EXPORT_ symbol
+# may have two owning modules. That second check is what a footprint-disjoint
+# INTERACTION looks like in the small: two members touching two different files
+# are perfectly disjoint and still break each other when combined, which is the
+# whole reason the epic verifies the combined tree instead of trusting
+# disjointness (locked contract SABLE-djopw).
+#
+# So: plant a file with a syntax error and the verdict is red BECAUSE the file
+# does not compile. Plant two modules exporting the same symbol and the
+# combined verdict is red BECAUSE the tree really does carry two owners, while
+# each member alone really is green. Nothing is stubbed into being red.
+
+
+def _tree_py_sources(repo, tip):
+    """Every bin/*.py blob in the folded object, read out of the real object
+    store — no checkout, no working tree, so this reads exactly the object that
+    was folded and would be landed."""
+    names = _bg(repo, "ls-tree", "-r", "--name-only", tip).splitlines()
+    return {n: _bg(repo, "show", f"{tip}:{n}")
+            for n in names if n.startswith("bin/") and n.endswith(".py")}
+
+
+def _real_tree_check(sources):
+    """The real verification a bisection round's CI run stands for. Returns the
+    list of problems found (empty == green)."""
+    problems = []
+    for name, src in sorted(sources.items()):
+        try:
+            compile(src, name, "exec")
+        except SyntaxError as exc:
+            problems.append(f"{name}: does not compile: {exc.msg}")
+    owners = {}
+    for name, src in sorted(sources.items()):
+        for match in re.finditer(r"^EXPORT_([A-Z_]+)\s*=", src, re.M):
+            owners.setdefault(match.group(1), []).append(name)
+    for symbol, names in sorted(owners.items()):
+        if len(names) > 1:
+            problems.append(f"EXPORT_{symbol} has {len(names)} owning modules: {names}")
+    return problems
+
+
+def _sandbox_verifier(repo, log=None):
+    """The E2E verify seam: green iff the REAL folded tree passes the REAL
+    check. Records (branches, ref, tip, problems) for every round."""
+    def verify(members, fold_tip, combined_ref):
+        problems = _real_tree_check(_tree_py_sources(repo, fold_tip))
+        if log is not None:
+            log.append((tuple(m.branch for m in members), combined_ref, fold_tip, problems))
+        return not problems
+    return verify
+
+
+BROKEN_SOURCE = "def planted_failure(:\n"        # a real syntax error
+EXPORTER = "EXPORT_LIMIT = {}\n"                 # two of these collide
+
+
+def _assert_nothing_landed_from_the_batched_path(bare, result, trunk_before):
+    """The NO SILENT LANDING sweep, as one reusable assertion so every E2E case
+    below carries it rather than only the case named after it.
+
+    Sweeps EVERY node of the bisection tree — red ones included, which is the
+    clause that matters: a red node is exactly where a batched path would be
+    tempted to salvage 'the good half'. The round-set non-emptiness guard is
+    asserted FIRST, because a sweep over zero nodes passes for free and would
+    hide a bisection that never ran (SABLE-p9n7k)."""
+    assert result.rounds, \
+        "no bisection rounds — the no-silent-landing sweep would pass vacuously"
+    trunk_now = _remote_head(bare, "trunk")
+    assert trunk_now == trunk_before, \
+        f"the integration branch moved during a bisection: {trunk_before} -> {trunk_now}"
+    for round_ in result.rounds:
+        assert trunk_now != round_.fold_tip, (
+            f"a bisection node's combined object landed on the integration branch: "
+            f"{round_.branches} ({'red' if not round_.green else 'green'} node)")
+
+
+def _serial_gate_cycle(repo, bare, member):
+    """ONE real serial gate cycle for a single member: re-resolve the current
+    integration tip, fold this member alone onto it, run the SAME real check on
+    the result, and land it through the SAME writer (land_batch of one member)
+    only if green. Returns (landed, problems) — a red cycle lands nothing and
+    reports what it found."""
+    _bg(repo, "fetch", "-q", "origin", "trunk")
+    base_sha = _bg(repo, "rev-parse", "refs/remotes/origin/trunk")
+    fold_tip = _fold(repo, base_sha, [member])
+    problems = _real_tree_check(_tree_py_sources(repo, fold_tip))
+    if problems:
+        return False, problems
+    res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
+                                 [member], budget=_ok_budget([member]),
+                                 combined_ref=f"ci-verify/serial-{member.branch}")
+    return res.landed, []
+
+
+def test_S3_acceptance_a_planted_failure_is_named_and_nothing_lands_from_the_batch(
+        tmp_path, monkeypatch, capsys, fleet_sink):
+    """S3 ACCEPTANCE (verbatim). A failing branch is planted in an otherwise-
+    green batch; the combined run is red; ZERO members land from the batched
+    path; the report NAMES the member; the remaining members land serially
+    WITHOUT manual re-queueing (the loop below iterates result.rebatch as
+    handed back — it never re-derives the member set). A HEALTHY-BATCH CONTROL
+    lands whole in the SAME test: without it, 'nothing landed' is satisfied by
+    a machine that refuses everything."""
+    monkeypatch.setenv("SABLE_MG_BATCH_RECORD_LOG", str(tmp_path / "records.jsonl"))
+    repo, bare, base_sha = _batch_sandbox(tmp_path / "s3")
+    members = _bisect_members(repo, base_sha, [
+        ("wk-good1", "bin/good1.py", "good1 = 1\n"),
+        ("wk-good2", "bin/good2.py", "good2 = 1\n"),
+        ("wk-planted", "bin/planted.py", BROKEN_SOURCE)])
+    by_branch = {m.branch: m for m in members}
+
+    # The ORIGINAL combined run, for real: fold the whole batch, push its ref,
+    # verify it. It must come back RED before there is anything to bisect.
+    fold_members = [fold_lib.FoldMember(m.branch, m.tip_sha, m.bead_ids[0]) for m in members]
+    combined_tip, combined_ref = fold_lib.push_batch_ref(str(repo), "origin", base_sha,
+                                                         fold_members)
+    verify = _sandbox_verifier(str(repo))
+    assert verify(members, combined_tip, combined_ref) is False, \
+        "the planted failure did not make the combined run red — nothing to bisect"
+    trunk_before = _remote_head(bare, "trunk")
+
+    res = promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members, verify,
+                                       combined_ref=combined_ref)
+
+    # ... the report NAMES the member ...
+    assert res.culprit == "wk-planted"
+    report = promote_lib.render_bisection_report(res)
+    assert "wk-planted" in report and "wk-planted" in capsys.readouterr().out
+    assert promote_lib.BISECT_REPORT_COULD_NOT_ATTRIBUTE not in report
+    # ... ZERO members land from the batched path, at EVERY node of the tree ...
+    _assert_nothing_landed_from_the_batched_path(bare, res, trunk_before)
+    assert res.red_rounds, "an attribution with no red node did not measure anything"
+    # ... the manifest records it ...
+    assert promote_lib.find_batch_record(str(repo), combined_ref).culprit == "wk-planted"
+
+    # ... and the remaining members land SERIALLY, straight off the result, with
+    # no manual re-queueing step in between.
+    assert set(res.rebatch) == {"wk-good1", "wk-good2"}
+    for branch in res.rebatch:
+        landed, problems = _serial_gate_cycle(repo, bare, by_branch[branch])
+        assert landed, f"{branch} did not land serially after the batch was bisected: {problems}"
+    for branch in res.rebatch:
+        anc = subprocess.run(["git", "-C", str(bare), "merge-base", "--is-ancestor",
+                              by_branch[branch].tip_sha, _remote_head(bare, "trunk")],
+                             capture_output=True)
+        assert anc.returncode == 0, f"{branch} is not an ancestor of the integration tip"
+    # The culprit did NOT land — it is in the serial queue, and its own serial
+    # cycle is still red until its author fixes it.
+    landed, problems = _serial_gate_cycle(repo, bare, by_branch["wk-planted"])
+    assert not landed and problems
+
+    # ---- the HEALTHY-BATCH CONTROL, same suite, same machinery -------------
+    crepo, cbare, cbase = _batch_sandbox(tmp_path / "control")
+    healthy = _bisect_members(crepo, cbase, [
+        ("wk-h1", "bin/h1.py", "h1 = 1\n"),
+        ("wk-h2", "bin/h2.py", "h2 = 1\n"),
+        ("wk-h3", "bin/h3.py", "h3 = 1\n")])
+    hfold = [fold_lib.FoldMember(m.branch, m.tip_sha, m.bead_ids[0]) for m in healthy]
+    htip, href = fold_lib.push_batch_ref(str(crepo), "origin", cbase, hfold)
+    assert _sandbox_verifier(str(crepo))(healthy, htip, href) is True, \
+        "the control batch was red — the acceptance would prove nothing"
+    control = promote_lib.land_batch(str(crepo), "origin", "trunk", cbase, htip, healthy,
+                                     budget=_ok_budget(healthy), combined_ref=href)
+    assert control.landed, control.reason
+    assert _remote_head(cbare, "trunk") == htip, "the healthy batch did not land WHOLE"
+
+
+def test_S3_interaction_red_is_loud_all_serial_and_surfaces_late_on_the_second_member(
+        tmp_path, monkeypatch, capsys, fleet_sink):
+    """INTERACTION-RED (S3 matrix case, verbatim). Two members are individually
+    green and their COMBINATION is red — a real footprint-disjoint interaction
+    (two different files, one shared exported symbol). Every bisected half
+    verifies green, so: COULD-NOT-ATTRIBUTE, loudly; the all-serial fallback
+    engages for ALL members; nothing lands from the batched path; and the
+    interacting pair surfaces LATE BUT LOUD — as a RED on the SECOND member's
+    own serial gate cycle, against a base that by then carries the first — and
+    that red is recorded rather than swallowed."""
+    monkeypatch.setenv("SABLE_MG_BATCH_RECORD_LOG", str(tmp_path / "records.jsonl"))
+    repo, bare, base_sha = _batch_sandbox(tmp_path / "inter")
+    members = _bisect_members(repo, base_sha, [
+        ("wk-x", "bin/x.py", EXPORTER.format(10)),
+        ("wk-y", "bin/y.py", EXPORTER.format(20))])
+    by_branch = {m.branch: m for m in members}
+    verify = _sandbox_verifier(str(repo))
+
+    # Each member is individually GREEN against the base — established by real
+    # verification, not asserted. Without this the "interaction" claim is empty.
+    for m in members:
+        solo_tip = _fold(repo, base_sha, [m])
+        assert verify([m], solo_tip, "ci-verify/solo") is True, \
+            f"{m.branch} is not individually green — this is not an interaction"
+    fold_members = [fold_lib.FoldMember(m.branch, m.tip_sha, m.bead_ids[0]) for m in members]
+    combined_tip, combined_ref = fold_lib.push_batch_ref(str(repo), "origin", base_sha,
+                                                         fold_members)
+    assert verify(members, combined_tip, combined_ref) is False, \
+        "the combination is not red — there is no interaction to fall back from"
+    trunk_before = _remote_head(bare, "trunk")
+
+    res = promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members, verify,
+                                       combined_ref=combined_ref)
+
+    # COULD-NOT-ATTRIBUTE, loud on stdout, the cockpit and the durable manifest.
+    assert res.outcome == promote_lib.BATCH_OUTCOME_COULD_NOT_ATTRIBUTE
+    token = promote_lib.BISECT_REPORT_COULD_NOT_ATTRIBUTE
+    assert token in capsys.readouterr().out
+    assert any(token in line for line in fleet_sink())
+    assert any(token in line for line in
+               promote_lib.find_batch_record(str(repo), combined_ref).report_lines)
+    # ALL-SERIAL fallback for EVERY member; nothing landed from the batch.
+    assert set(res.serial_queue) == {"wk-x", "wk-y"} and res.rebatch == ()
+    _assert_nothing_landed_from_the_batched_path(bare, res, trunk_before)
+
+    # LATE BUT LOUD: each member takes its own serial cycle, off the result's
+    # serial_queue. The first lands; the second's cycle goes RED against a base
+    # that now carries the first, which is where the interaction becomes visible.
+    order = list(res.serial_queue)
+    first_landed, first_problems = _serial_gate_cycle(repo, bare, by_branch[order[0]])
+    assert first_landed, f"the first serial member did not land: {first_problems}"
+    second_landed, second_problems = _serial_gate_cycle(repo, bare, by_branch[order[1]])
+    assert not second_landed, \
+        "the interacting pair landed anyway — the interaction never surfaced"
+    assert second_problems and any("EXPORT_LIMIT" in p for p in second_problems), \
+        f"the second member's red does not name the interaction: {second_problems}"
+    # Recorded, not swallowed: the integration tip carries the first member only.
+    tip = _remote_head(bare, "trunk")
+    assert subprocess.run(["git", "-C", str(bare), "merge-base", "--is-ancestor",
+                           by_branch[order[0]].tip_sha, tip], capture_output=True).returncode == 0
+    assert subprocess.run(["git", "-C", str(bare), "merge-base", "--is-ancestor",
+                           by_branch[order[1]].tip_sha, tip], capture_output=True).returncode != 0
+
+
+def test_S3_an_n4_single_culprit_isolates_within_three_extra_combined_runs(
+        tmp_path, monkeypatch, capsys, fleet_sink):
+    """BISECTION BOUND (S3 matrix case, verbatim): an n=4 single-culprit red
+    isolates in <=3 EXTRA combined runs, the culprit is named, and the rest are
+    re-batched and land. The run count is COUNTED off the real remote — one
+    ci-verify ref per combined run — not tallied by the code under test, so a
+    machine that under-reported its own rounds could not pass this."""
+    monkeypatch.setenv("SABLE_MG_BATCH_RECORD_LOG", str(tmp_path / "records.jsonl"))
+    repo, bare, base_sha = _batch_sandbox(tmp_path / "n4")
+    members = _bisect_members(repo, base_sha, [
+        ("wk-p", "bin/p.py", "p = 1\n"), ("wk-q", "bin/q.py", "q = 1\n"),
+        ("wk-r", "bin/r.py", "r = 1\n"), ("wk-bad", "bin/bad.py", BROKEN_SOURCE)])
+    by_branch = {m.branch: m for m in members}
+    verify = _sandbox_verifier(str(repo))
+
+    fold_members = [fold_lib.FoldMember(m.branch, m.tip_sha, m.bead_ids[0]) for m in members]
+    combined_tip, combined_ref = fold_lib.push_batch_ref(str(repo), "origin", base_sha,
+                                                         fold_members)
+    assert verify(members, combined_tip, combined_ref) is False
+    refs_before = set(_ci_refs(bare))       # the ORIGINAL combined run's ref
+    trunk_before = _remote_head(bare, "trunk")
+
+    res = promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members, verify,
+                                       combined_ref=combined_ref)
+
+    extra_refs = set(_ci_refs(bare)) - refs_before
+    assert res.rounds, "vacuity guard"
+    assert len(extra_refs) <= 3, \
+        f"n=4 cost {len(extra_refs)} EXTRA combined runs (bound 3): {sorted(extra_refs)}"
+    assert len(extra_refs) == len(res.rounds), \
+        "the reported round count does not match the CI triggers actually pushed"
+    assert res.culprit == "wk-bad"
+    assert "wk-bad" in promote_lib.render_bisection_report(res)
+    _assert_nothing_landed_from_the_batched_path(bare, res, trunk_before)
+
+    # The rest are RE-BATCHED (as a batch, not one at a time) and land whole.
+    rest = [by_branch[b] for b in res.rebatch]
+    assert {m.branch for m in rest} == {"wk-p", "wk-q", "wk-r"}
+    rest_fold = [fold_lib.FoldMember(m.branch, m.tip_sha, m.bead_ids[0]) for m in rest]
+    rest_tip, rest_ref = fold_lib.push_batch_ref(str(repo), "origin", base_sha, rest_fold)
+    assert verify(rest, rest_tip, rest_ref) is True, "the re-batch of the innocent members is red"
+    landed = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, rest_tip, rest,
+                                    budget=_ok_budget(rest), combined_ref=rest_ref)
+    assert landed.landed, landed.reason
+    assert _remote_head(bare, "trunk") == rest_tip
+
+
+def test_S3_no_silent_landing_across_every_red_node_of_the_bisection_tree(
+        tmp_path, monkeypatch, fleet_sink):
+    """NO SILENT LANDING (S3 matrix case, verbatim). Sweeps every RED node of
+    the bisection tree — over every culprit position at n=4, so every shape the
+    tree can take is swept, not one shape — and asserts ZERO batched-path
+    landings from any of them: the integration branch never moves, and no red
+    node's combined object is ever the integration tip.
+
+    NON-VACUITY, twice over: the swept red-node set is asserted non-empty
+    (a sweep over nothing passes for free), and the same sandbox then LANDS a
+    green batch through the same writer, proving the integration branch was
+    movable all along and 'it never moved' is a property of the bisection, not
+    of a sandbox where nothing can land."""
+    monkeypatch.setenv("SABLE_MG_BATCH_RECORD_LOG", str(tmp_path / "records.jsonl"))
+    swept = 0
+    for guilty in ("wk-0", "wk-1", "wk-2", "wk-3"):
+        repo, bare, base_sha = _batch_sandbox(tmp_path / f"sweep-{guilty}")
+        members = _bisect_members(repo, base_sha, [
+            (f"wk-{i}", f"bin/m{i}.py",
+             BROKEN_SOURCE if f"wk-{i}" == guilty else f"m{i} = 1\n") for i in range(4)])
+        verify = _sandbox_verifier(str(repo))
+        trunk_before = _remote_head(bare, "trunk")
+
+        res = promote_lib.bisect_red_batch(str(repo), "origin", base_sha, members, verify)
+
+        assert res.culprit == guilty
+        assert res.red_rounds, f"culprit {guilty}: no red node in the tree to sweep"
+        _assert_nothing_landed_from_the_batched_path(bare, res, trunk_before)
+        for red in res.red_rounds:
+            assert _remote_head(bare, "trunk") != red.fold_tip
+            # And no red node's members reached the integration branch either.
+            for branch in red.branches:
+                member = next(m for m in members if m.branch == branch)
+                anc = subprocess.run(["git", "-C", str(bare), "merge-base", "--is-ancestor",
+                                      member.tip_sha, _remote_head(bare, "trunk")],
+                                     capture_output=True)
+                assert anc.returncode != 0, \
+                    f"{branch}, a member of RED node {red.branches}, landed anyway"
+            swept += 1
+
+        # NON-VACUITY: this very sandbox CAN land a batch. The innocent members,
+        # re-batched, land whole through the real writer — so "trunk never
+        # moved" above was the bisection's doing.
+        rest = [m for m in members if m.branch != guilty]
+        rest_fold = [fold_lib.FoldMember(m.branch, m.tip_sha, m.bead_ids[0]) for m in rest]
+        rest_tip, rest_ref = fold_lib.push_batch_ref(str(repo), "origin", base_sha, rest_fold)
+        ok = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, rest_tip, rest,
+                                    budget=_ok_budget(rest), combined_ref=rest_ref)
+        assert ok.landed, f"the sandbox could not land anything at all: {ok.reason}"
+        assert _remote_head(bare, "trunk") != trunk_before
+
+    assert swept >= 4, f"the no-silent-landing sweep covered only {swept} red nodes"
