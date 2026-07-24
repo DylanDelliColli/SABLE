@@ -437,10 +437,99 @@ def test_overlap_check_bead_declaring_no_footprint_still_dispatches():
     # LOAD-BEARING NEGATIVE CONTROL (prove-the-gate-can-release): many beads
     # legitimately declare no footprint. If this ever goes red, the fix has
     # become a gate that can never release and must be reverted.
+    #
+    # SABLE-e2ic3: the verdict is 'no-declaration', NOT 'none' — those two used
+    # to be the same decision, which is the defect this bead is about. A caller
+    # must still treat 'no-declaration' as non-blocking (see main()'s handling),
+    # only the SILENCE around it changed.
     bead = {"id": "X-1", "description": "just prose, no footprint declared"}
     other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
     verdict = ssw.overlap_check("X-1", bead, [other])
-    assert verdict.decision == "none"
+    assert verdict.decision == "no-declaration"
+    assert verdict.decision != "none"
+
+
+# --- SABLE-e2ic3: NO-DECLARATION is a DISTINCT, LOUD, non-blocking verdict ---
+#
+# THE BEAD: a bead that declares no footprint at all used to return the exact
+# same 'none' decision as a footprint that was actually compared and found
+# clean — so a manager reading normal dispatch output could not tell "checked,
+# nothing overlapped" from "nothing to check with". Three states, not two:
+# NO-DECLARATION (this section), CLEAR ('none', checked, disjoint — covered
+# above/below), COLLIDES ('deny', covered above and by
+# test_overlap_check_wellformed_overlap_still_denies).
+#
+# PLANT-AND-FAIL (SABLE-5lli.7), MEASURED: reverting the `if not my_files:`
+# branch in overlap_check back to `return OverlapVerdict("none", ...)` turns
+# test_absent_footprint_is_announced_not_silent RED — 'no-declaration' ==
+# 'none' fails. Observed by temporarily reverting, running this test, and
+# restoring the fix; see this bead's close evidence for the transcript.
+
+
+def test_absent_footprint_is_announced_not_silent():
+    """A bead that declares NO footprint at all must produce a DISTINCT verdict
+    from a checked-clean comparison — 'no-declaration', never 'none' — and the
+    message must name the dispatching bead, so a caller's stderr announcement
+    is never silent. Negative control in the SAME test, load-bearing: a bead
+    WITH a declared footprint and no overlap emits 'none' and does NOT mention
+    NO-DECLARATION — the signal must stay rare enough to read."""
+    bare = {"id": "X-1", "description": "just prose, no footprint declared"}
+    other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
+    verdict = ssw.overlap_check("X-1", bare, [other])
+    assert verdict.decision == "no-declaration"
+    assert "X-1" in verdict.message
+
+    declared = {"id": "X-2", "description": "S.\n\n## File footprint\nmine.py"}
+    clean_verdict = ssw.overlap_check("X-2", declared, [other])
+    assert clean_verdict.decision == "none"
+    assert "NO-DECLARATION" not in clean_verdict.message
+    assert "no-declaration" not in clean_verdict.message.lower()
+
+
+def test_absent_footprint_still_dispatches():
+    """The warning must not become a refusal. main() only treats 'deny' (exit
+    11) and 'could-not-assess' (exit 12) as refusals; 'no-declaration' is
+    neither, so a bead declaring nothing keeps dispatching (SABLE-47try: a gate
+    that can never release is indistinguishable from correct caution — this
+    fix must not re-create it one decision value later)."""
+    bare = {"id": "X-1", "description": "just prose, no footprint declared"}
+    verdict = ssw.overlap_check("X-1", bare, [])
+    assert verdict.decision == "no-declaration"
+    assert verdict.decision not in ("deny", "could-not-assess")
+
+
+def test_widening_past_declaration_is_reported():
+    """SABLE-e2ic3 suggested-approach item 3: widening_report() is the pure
+    comparison PRIMITIVE between a bead's DECLARED footprint and what a worker
+    ACTUALLY changed, naming the undeclared paths. Reported NEUTRALLY
+    ('declaration and delivery disagree') — never as a discipline finding
+    against the worker, because a wrong guess about where the code lives
+    (the o9b8u / SABLE-4wo60 class) is indistinguishable from genuine drift
+    without a human reading the diff.
+
+    Also covers the vacuous-pass trap named in this bead's notes (SABLE-p9n7k's
+    class): an EMPTY declared set does not defeat the comparison — a
+    non-empty actual set against an empty declaration is still reported, by
+    name, not silently treated as 'nothing to compare'."""
+    report = ssw.widening_report(
+        {"templates/worker-dispatch.md"},
+        {"templates/worker-dispatch.md", "bin/sable-spawn-worker"})
+    assert report is not None
+    assert "bin/sable-spawn-worker" in report
+    assert "templates/worker-dispatch.md" not in report
+
+    empty_declared_report = ssw.widening_report(set(), {"bin/sable-spawn-worker"})
+    assert empty_declared_report is not None
+    assert "bin/sable-spawn-worker" in empty_declared_report
+
+
+def test_widening_within_declaration_is_silent():
+    """Negative control, load-bearing: an actual changed set equal to or
+    narrower than the declared footprint reports nothing — over-declaring (the
+    fleet's standing advice) must never itself read as widening."""
+    assert ssw.widening_report({"a.py", "b.py"}, {"a.py"}) is None
+    assert ssw.widening_report({"a.py", "b.py"}, {"a.py", "b.py"}) is None
+    assert ssw.widening_report({"a.py"}, set()) is None
 
 
 def test_overlap_check_wellformed_overlap_still_denies():
@@ -508,9 +597,11 @@ def test_overlap_check_none_when_no_shared_files():
     assert ssw.overlap_check("X-1", bead, [other]).decision == "none"
 
 
-def test_overlap_check_none_when_bead_has_no_claims():
+def test_overlap_check_no_declaration_when_bead_has_no_claims():
+    # Renamed from test_overlap_check_none_when_bead_has_no_claims (SABLE-e2ic3):
+    # a bead carrying NO footprint source at all is 'no-declaration', not 'none'.
     verdict = ssw.overlap_check("X-1", {"id": "X-1"}, [{"id": "Y-1", "notes": "WIP-CLAIMS: a.py"}])
-    assert verdict.decision == "none"
+    assert verdict.decision == "no-declaration"
 
 
 def test_overlap_check_allows_with_matching_serialize_with():

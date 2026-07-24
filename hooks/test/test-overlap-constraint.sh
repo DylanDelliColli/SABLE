@@ -260,14 +260,33 @@ fi
 # Case 11 (LOAD-BEARING NEGATIVE CONTROL — prove-the-gate-can-release): a bead
 # that genuinely declares NO footprint (no section, no metadata, and prose with
 # no extension-bearing token for the generic fallback to find) must still
-# dispatch silently. If this goes red the fix has become a gate that can never
-# release, and it must be reverted.
+# dispatch. If this goes red the fix has become a gate that can never release,
+# and it must be reverted.
+#
+# SABLE-e2ic3: it must NOT dispatch SILENTLY anymore — a bead declaring
+# nothing and a bead whose footprint was compared and found clean used to
+# produce the exact same silent exit-0-no-output, so a manager reading normal
+# output could not tell the two apart. This is now a DISTINCT, LOUD
+# NO-DECLARATION additionalContext, and still not a deny.
 NO_FOOTPRINT_DESC='a bead with no declared footprint and no file-shaped tokens at all'
 OUT=$(run_hook "$(make_input a11 optimus 'Work SABLE-disp')" "hooks/foo.sh" "$NO_FOOTPRINT_DESC")
-if [ -z "$OUT" ]; then
-  pass "bead declaring NO footprint still dispatches (gate can still release)"
+if printf '%s' "$OUT" | grep -q 'NO-DECLARATION' \
+   && ! printf '%s' "$OUT" | grep -q '"permissionDecision": "deny"'; then
+  pass "bead declaring NO footprint still dispatches, LOUDLY as NO-DECLARATION (gate can still release)"
 else
-  fail "bead declaring NO footprint still dispatches (gate can still release)" "got: $OUT"
+  fail "bead declaring NO footprint still dispatches, LOUDLY as NO-DECLARATION (gate can still release)" "got: ${OUT:-<empty>}"
+fi
+
+# Case 11b (SABLE-e2ic3 complement, load-bearing): a bead that DOES declare a
+# footprint, checked against a genuinely non-overlapping in-progress claim,
+# must NOT say NO-DECLARATION — that would make the signal noisy enough to
+# stop being read. Reuses the Case-7-shaped footprint declaration but against
+# a DIFFERENT in-progress file so nothing overlaps (silent, like Case 2).
+OUT=$(run_hook "$(make_input a11b optimus 'Work SABLE-disp')" "unrelated/other.py" "$FOOTPRINT_DESC")
+if [ -z "$OUT" ] && ! printf '%s' "$OUT" | grep -q 'NO-DECLARATION'; then
+  pass "a bead WITH a declared, non-overlapping footprint does not say NO-DECLARATION"
+else
+  fail "a bead WITH a declared, non-overlapping footprint does not say NO-DECLARATION" "got: ${OUT:-<empty>}"
 fi
 
 # Case 12: an EMPTY footprint section immediately followed by another '##'
