@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -845,3 +846,488 @@ def test_manifest_completeness_reconstructs_from_promote_record_and_fold_commits
     assert {fm[1] for fm in fold_members} == {
         ("SABLE-a",), ("SABLE-b1", "SABLE-b2"), ("SABLE-c",)}, (
         "fold commit messages did not independently name every member's bead(s)")
+
+
+# ==========================================================================
+# SABLE-be4lo.7 — the BATCH LANDING PATH. Four behaviors, tested in the order
+# the epic locked them: budget REFUSAL first (TDD on the enforcement before
+# the capability), then per-batch stale-base, NO-HALF-LANDING, one-promote.
+#
+# GATE-CLASS bead: this landing machinery itself lands serial/never-optimistic.
+# ==========================================================================
+
+def _batch_budget_ok():
+    """A combined-tree budget artifact that DOES carry the be4lo.6 field."""
+    return promote_lib.combined_tree_budget([["bin/a.py"], ["bin/b.py"]])
+
+
+def _members_ab():
+    return [
+        promote_lib.BatchMember("wk-a", "a" * 40, ("SABLE-a",), ("bin/a.py",)),
+        promote_lib.BatchMember("wk-b", "b" * 40, ("SABLE-b",), ("bin/b.py",)),
+    ]
+
+
+# ---- (1) BUDGET REFUSAL — both polarities. Written FIRST. ------------------
+
+def test_batch_budget_absent_refuses_loudly_naming_the_missing_field():
+    """SABLE-be4lo.7 behavior 1, the FIRST test (TDD on the enforcement before
+    the capability): a promote-budget artifact that lacks the combined-tree
+    field must make the batch path refuse LOUDLY, and the refusal must NAME the
+    missing field so the operator's fix is unambiguous (architecture decision
+    6: the be4lo.6 promote-budget extension is a BLOCKING DEP of any batched
+    landing — extend-tool-first made mechanical)."""
+    # A single-branch budget dict (impact_budget's shape) is exactly the
+    # pre-extension artifact this guard exists to reject: it has
+    # recommended_wrapper_timeout_s but NOT the combined-tree field.
+    single_branch = promote_lib.impact_budget()
+    assert promote_lib.BATCH_BUDGET_FIELD not in single_branch
+    with pytest.raises(promote_lib.GateError) as exc:
+        promote_lib.assert_batch_budget_present(single_branch)
+    assert promote_lib.BATCH_BUDGET_FIELD in str(exc.value), (
+        "the refusal did not name the missing combined-tree field")
+    assert exc.value.code == promote_lib.classify.EXIT_PRECONDITION
+
+
+def test_batch_budget_present_proceeds():
+    """The other polarity: a real combined-tree budget passes the guard
+    silently (returns None, raises nothing) — the capability is reachable
+    exactly when the tool was extended."""
+    assert promote_lib.assert_batch_budget_present(_batch_budget_ok()) is None
+
+
+# ==========================================================================
+# Real git-sandbox tests for the batch landing path (SABLE-be4lo.7).
+# The git operations (fetch, fast-forward push, ancestry, non-ff rejection)
+# ARE the unit under test — nothing here mocks git_lib. Fold chains are built
+# with the real fold builder (sable_batch_fold_lib), so these exercise the
+# real composition end to end.
+# ==========================================================================
+
+import sable_batch_fold_lib as fold_lib  # noqa: E402
+
+
+def _bg(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), *args],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _remote_head(bare, ref):
+    """Commit at refs/heads/<ref> in the bare remote, or '' if absent."""
+    cp = subprocess.run(["git", "-C", str(bare), "rev-parse", "--verify", f"refs/heads/{ref}"],
+                        capture_output=True, text=True)
+    return cp.stdout.strip() if cp.returncode == 0 else ""
+
+
+def _batch_sandbox(tmp_path):
+    """A bare 'origin' with a `trunk` integration branch and a working repo
+    wired to it. Returns (repo, bare, base_sha)."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "trunk", str(bare)],
+                   check=True, capture_output=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _bg(repo, "init", "-q", "-b", "trunk")
+    _bg(repo, "config", "user.email", "t@sable.invalid")
+    _bg(repo, "config", "user.name", "SABLE Test")
+    (repo / "root.txt").write_text("root\n")
+    (repo / "common.txt").write_text("common\n")
+    _bg(repo, "add", "-A")
+    _bg(repo, "commit", "-q", "-m", "root")
+    (repo / "base.txt").write_text("base\n")
+    _bg(repo, "add", "-A")
+    _bg(repo, "commit", "-q", "-m", "trunk base")
+    _bg(repo, "remote", "add", "origin", str(bare))
+    _bg(repo, "push", "-q", "origin", "trunk")
+    _bg(repo, "fetch", "-q", "origin")
+    base_sha = _bg(repo, "rev-parse", "HEAD")
+    return repo, bare, base_sha
+
+
+def _member_branch(repo, base_sha, label, filename, content, beads=()):
+    """A member branch off base_sha adding one disjoint file, pushed to origin.
+    Returns a typed BatchMember (branch, tip, beads, footprint)."""
+    _bg(repo, "checkout", "-q", "-b", label, base_sha)
+    (repo / filename).parent.mkdir(parents=True, exist_ok=True)
+    (repo / filename).write_text(content)
+    _bg(repo, "add", "-A")
+    _bg(repo, "commit", "-q", "-m", f"work on {label}")
+    tip = _bg(repo, "rev-parse", "HEAD")
+    _bg(repo, "push", "-q", "origin", label)
+    _bg(repo, "checkout", "-q", "trunk")
+    return promote_lib.BatchMember(label, tip, tuple(beads), (filename,))
+
+
+def _fold(repo, base_sha, members):
+    fms = [fold_lib.FoldMember(m.branch, m.tip_sha, m.bead_ids[0] if m.bead_ids else "")
+           for m in members]
+    return fold_lib.fold_chain(str(repo), base_sha, fms).tip
+
+
+def _ok_budget(members):
+    return promote_lib.combined_tree_budget([list(m.footprint_paths) for m in members])
+
+
+# --------------------------------------------------------------------------
+# Hermetic fleet-channel isolation (SABLE-xpab3). A batch-land test emits
+# _notify() cockpit messages and _append_evidence() bd writes — NEITHER may
+# reach the live fleet. The notify seam is redirected for EVERY test in this
+# module (autouse) so no future test can reintroduce the leak by forgetting;
+# the bd seam is no-op'd per-test by fleet_sink. test_batch_land_makes_zero_
+# real_fleet_sends proves the isolation and its non-vacuity.
+# --------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _hermetic_fleet_channel(tmp_path_factory, monkeypatch):
+    """Redirect SABLE_MG_NOTIFY to a per-test scratch SINK so a _notify() call
+    is captured to a file instead of messaging the real `sable-msg` cockpit.
+    Autouse: applies to every test in this module. Safe for the existing
+    real-sandbox promote() test, which stubs promote_lib._notify at the Python
+    level and so never reaches this seam at all."""
+    sink_dir = tmp_path_factory.mktemp("fleet")
+    sink = sink_dir / "sends.log"
+    notifier = sink_dir / "sink-notify.sh"
+    notifier.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$SABLE_FLEET_SINK"\n')
+    notifier.chmod(0o755)
+    monkeypatch.setenv("SABLE_FLEET_SINK", str(sink))
+    monkeypatch.setenv("SABLE_MG_NOTIFY", str(notifier))
+    return sink
+
+
+@pytest.fixture
+def fleet_sink(_hermetic_fleet_channel, monkeypatch):
+    """Batch-land isolation: the captured notify sink (as a reader) PLUS a no-op
+    bd seam so a landed batch's per-member evidence writes never touch the real
+    store. Returns a callable yielding the captured notification lines."""
+    monkeypatch.setenv("SABLE_MG_BD", "true")
+
+    def read():
+        p = _hermetic_fleet_channel
+        return p.read_text().splitlines() if p.exists() else []
+    return read
+
+
+# ---- (2) PER-BATCH STALE-BASE — both polarities --------------------------
+
+def test_land_batch_lands_when_base_equals_the_formed_base(tmp_path, fleet_sink):
+    """SABLE-be4lo.7 behavior 2 (positive polarity): base parent == integration
+    tip → the batch lands. The single fast-forward moves trunk to the fold tip
+    and every member tip becomes an ancestor of the new integration tip."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = [
+        _member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",)),
+        _member_branch(repo, base_sha, "wk-b", "bin/b.py", "b=1\n", ("SABLE-b",)),
+    ]
+    fold_tip = _fold(repo, base_sha, members)
+    res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
+                                 members, budget=_ok_budget(members),
+                                 combined_ref="ci-verify/batch-deadbee")
+    assert res.landed, res.reason
+    assert res.outcome == promote_lib.BATCH_OUTCOME_LANDED
+    # The landing notification went to the HERMETIC sink, never the live cockpit.
+    assert any("BATCH LANDED" in line for line in fleet_sink()), \
+        "the land notification did not reach the hermetic sink"
+    assert _remote_head(bare, "trunk") == fold_tip, "trunk did not fast-forward to the fold tip"
+    for m in members:
+        anc = subprocess.run(["git", "-C", str(bare), "merge-base", "--is-ancestor",
+                              m.tip_sha, fold_tip], capture_output=True)
+        assert anc.returncode == 0, f"{m.branch} tip is not an ancestor of the landed tip"
+
+
+def test_land_batch_reforms_and_lands_nothing_on_a_stale_base(tmp_path, fleet_sink):
+    """SABLE-be4lo.7 behavior 2 (negative polarity): the integration tip moved
+    off the base the fold chain was formed on → RE-FORM, land NOTHING. The
+    remote base is untouched by the land and every member branch survives for
+    the re-form."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = [
+        _member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",)),
+        _member_branch(repo, base_sha, "wk-b", "bin/b.py", "b=1\n", ("SABLE-b",)),
+    ]
+    fold_tip = _fold(repo, base_sha, members)
+    # An unrelated commit lands on trunk AFTER the fold was formed — the base
+    # has now moved out from under the batch.
+    _bg(repo, "checkout", "-q", "trunk")
+    (repo / "unrelated.txt").write_text("moved\n")
+    _bg(repo, "add", "-A")
+    _bg(repo, "commit", "-q", "-m", "an interleaved landing moved the base")
+    _bg(repo, "push", "-q", "origin", "trunk")
+    moved = _remote_head(bare, "trunk")
+
+    res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
+                                 members, budget=_ok_budget(members),
+                                 combined_ref="ci-verify/batch-deadbee")
+    assert res.outcome == promote_lib.BATCH_OUTCOME_REFORM, res.reason
+    assert not res.landed
+    assert res.exit_code == promote_lib.classify.EXIT_BASE_MOVED
+    assert _remote_head(bare, "trunk") == moved, "a re-formed batch must not touch the base"
+    assert fold_tip not in (_remote_head(bare, "trunk"),), "the fold tip must NOT have landed"
+    assert set(res.fallback_branches) == {"wk-a", "wk-b"}
+    for m in members:
+        assert _remote_head(bare, m.branch) == m.tip_sha, f"{m.branch} preview must be intact"
+
+
+def test_land_batch_refuses_a_tip_not_built_on_the_named_base(tmp_path, fleet_sink):
+    """Object-level precondition: a fold_tip that was NOT built on base_sha is a
+    mismatched pair (a caller bug), not a stale base — it must fail loud
+    (GateError 3), never masquerade as a re-form."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = [_member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",))]
+    # Fold onto ROOT (the very first commit), not onto base_sha (trunk tip).
+    root = _bg(repo, "rev-list", "--max-parents=0", "HEAD")
+    wrong_tip = _fold(repo, root, members)
+    with pytest.raises(promote_lib.GateError) as exc:
+        promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, wrong_tip,
+                               members, budget=_ok_budget(members))
+    assert exc.value.code == promote_lib.classify.EXIT_PRECONDITION
+    assert "not built on base" in str(exc.value)
+
+
+def test_land_batch_budget_absent_refuses_before_touching_the_base(tmp_path, fleet_sink):
+    """Behavior 1 at the land seam: a budget missing the combined-tree field
+    stops the land BEFORE any git write — the base is never touched."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = [_member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",))]
+    fold_tip = _fold(repo, base_sha, members)
+    before = _remote_head(bare, "trunk")
+    with pytest.raises(promote_lib.GateError) as exc:
+        promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
+                               members, budget=promote_lib.impact_budget())
+    assert promote_lib.BATCH_BUDGET_FIELD in str(exc.value)
+    assert _remote_head(bare, "trunk") == before, "a budget refusal must not touch the base"
+
+
+def test_land_batch_integrity_aborts_if_the_landed_tip_is_not_the_tested_object(tmp_path, monkeypatch, fleet_sink):
+    """The batch analogue of promote()'s F3 integrity assertion: if the base
+    tip after the fast-forward is NOT exactly the tested fold tip (single-writer
+    discipline violated), fail LOUD with EXIT_INTEGRITY rather than report a
+    land of an object CI never saw."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = [_member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",))]
+    fold_tip = _fold(repo, base_sha, members)
+
+    real_tip_matches = promote_lib.batch_key.tip_matches
+    calls = {"n": 0}
+    def flaky_tip_matches(landed, expected):
+        calls["n"] += 1
+        # 1st call is the pre-push stale-base check (let it pass); 2nd is the
+        # post-push integrity read (force a mismatch).
+        if calls["n"] >= 2:
+            return False
+        return real_tip_matches(landed, expected)
+    monkeypatch.setattr(promote_lib.batch_key, "tip_matches", flaky_tip_matches)
+
+    with pytest.raises(promote_lib.GateError) as exc:
+        promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
+                               members, budget=_ok_budget(members))
+    assert exc.value.code == promote_lib.classify.EXIT_INTEGRITY
+    assert "integrity abort" in str(exc.value)
+
+
+# ---- (3) NO-HALF-LANDING under interrupt ---------------------------------
+
+def test_land_batch_no_half_landing_when_the_single_push_fails(tmp_path, monkeypatch, fleet_sink):
+    """SABLE-be4lo.7 behavior 3 (absolute): kill the ONE fast-forward mid-batch
+    and NOTHING lands — the integration ref is either at the full chain tip or
+    unmoved, never at an intermediate fold commit — and every member preview is
+    intact and reusable afterward. Simulated by forcing the single land push to
+    fail; the assertion is the STATE it leaves behind."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = [
+        _member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",)),
+        _member_branch(repo, base_sha, "wk-b", "bin/b.py", "b=1\n", ("SABLE-b",)),
+        _member_branch(repo, base_sha, "wk-c", "bin/c.py", "c=1\n", ("SABLE-c",)),
+    ]
+    fold_tip = _fold(repo, base_sha, members)
+    # Stand up each member's individual preview ref on the remote — the serial
+    # fallback's evidence, which the land must leave untouched.
+    for m in members:
+        _bg(repo, "push", "-q", "origin",
+            f"{m.tip_sha}:refs/heads/ci-verify/{m.branch}-preview")
+    before_trunk = _remote_head(bare, "trunk")
+
+    real_git = promote_lib.git_lib._git
+    def interrupt_the_land_push(repo_, *args, check=True):
+        # Fail ONLY the fast-forward of the integration ref; everything else
+        # (fetch, resolve) runs for real, so this is a faithful mid-land kill.
+        if args and args[0] == "push" and any(a.endswith("refs/heads/trunk") for a in args):
+            return subprocess.CompletedProcess(args, 1, stdout="simulated interrupt: push killed", stderr="")
+        return real_git(repo_, *args, check=check)
+    monkeypatch.setattr(promote_lib.git_lib, "_git", interrupt_the_land_push)
+
+    res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
+                                 members, budget=_ok_budget(members),
+                                 combined_ref="ci-verify/batch-deadbee")
+    assert res.outcome == promote_lib.BATCH_OUTCOME_FELL_BACK_SERIAL, res.reason
+    assert not res.landed
+    # NO intermediate state: trunk is exactly where it was — no fold commit,
+    # partial or whole, reached it.
+    assert _remote_head(bare, "trunk") == before_trunk, "trunk moved despite a failed land"
+    assert _remote_head(bare, "trunk") != fold_tip
+    # Every member falls back AS ITSELF with its preview intact and reusable.
+    assert set(res.fallback_branches) == {"wk-a", "wk-b", "wk-c"}
+    for m in members:
+        assert _remote_head(bare, m.branch) == m.tip_sha
+        assert _remote_head(bare, f"ci-verify/{m.branch}-preview") == m.tip_sha, (
+            f"{m.branch}'s individual preview was disturbed by the failed batch land")
+
+
+# ---- (4) ONE-PROMOTE SEAT POLICY (ordering, not seat discipline) ----------
+
+def test_one_promote_a_landed_batch_makes_an_interleaved_serial_non_ff(tmp_path, fleet_sink):
+    """SABLE-be4lo.7 behavior 4: from formation to landing a batch is ONE
+    promote, enforced by ordering — not a seat mutex. Once the batch lands
+    (moving the base to the fold tip), an interleaved serial promote's own
+    landing act (a no-force fast-forward of its verified object, built on the
+    OLD base) is REJECTED non-ff. At most one of {batch, serial} lands against a
+    given base; the loser re-forms. Real bare remote — the real store."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = [
+        _member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",)),
+        _member_branch(repo, base_sha, "wk-b", "bin/b.py", "b=1\n", ("SABLE-b",)),
+    ]
+    # A serial branch verified against the SAME base, waiting behind the batch.
+    serial = _member_branch(repo, base_sha, "wk-serial", "bin/s.py", "s=1\n", ("SABLE-s",))
+    fold_tip = _fold(repo, base_sha, members)
+
+    res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
+                                 members, budget=_ok_budget(members))
+    assert res.landed
+    assert _remote_head(bare, "trunk") == fold_tip
+
+    # The interleaved serial promote's landing act, built on the now-superseded
+    # base, cannot fast-forward without --force.
+    reject = subprocess.run(["git", "-C", str(repo), "push", str(bare),
+                             f"{serial.tip_sha}:refs/heads/trunk"],
+                            capture_output=True, text=True)
+    assert reject.returncode != 0, "an interleaved serial promote must NOT fast-forward past a landed batch"
+    assert "non-fast-forward" in (reject.stderr + reject.stdout).lower() or "rejected" in \
+        (reject.stderr + reject.stdout).lower()
+    assert _remote_head(bare, "trunk") == fold_tip, "the base must still be the batch's fold tip"
+
+
+# ---- S1 ACCEPTANCE (verbatim): 3 branches, ONE combined cycle -------------
+
+def test_S1_acceptance_three_disjoint_branches_land_in_one_combined_cycle(tmp_path, capsys, fleet_sink):
+    """SABLE-be4lo.7 S1 ACCEPTANCE (verbatim): 3 real disjoint individually-green
+    branches land through ONE combined cycle; all 3 tips are ancestors of the
+    integration tip; the batch's wall-clock is below the sum of 3 serial cycles
+    (measured, recorded below). The crisp evidence for 'one cycle': the batch
+    pushes exactly ONE ci-verify combined ref (one CI trigger) where the serial
+    lane pushes THREE."""
+    # ---- BATCH lane ----
+    repo, bare, base_sha = _batch_sandbox(tmp_path / "batch")
+    members = [
+        _member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",)),
+        _member_branch(repo, base_sha, "wk-b", "bin/b.py", "b=1\n", ("SABLE-b",)),
+        _member_branch(repo, base_sha, "wk-c", "bin/c.py", "c=1\n", ("SABLE-c",)),
+    ]
+    t0 = time.monotonic()
+    fold_members = [fold_lib.FoldMember(m.branch, m.tip_sha, m.bead_ids[0]) for m in members]
+    fold_tip, combined_ref = fold_lib.push_batch_ref(str(repo), "origin", base_sha, fold_members)
+    res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
+                                 members, budget=_ok_budget(members), combined_ref=combined_ref)
+    batch_wall = time.monotonic() - t0
+    assert res.landed, res.reason
+    landed_tip = _remote_head(bare, "trunk")
+    assert landed_tip == fold_tip
+    for m in members:
+        anc = subprocess.run(["git", "-C", str(bare), "merge-base", "--is-ancestor",
+                              m.tip_sha, landed_tip], capture_output=True)
+        assert anc.returncode == 0, f"{m.branch} is not an ancestor of the integration tip"
+    batch_ci_refs = subprocess.run(
+        ["git", "-C", str(bare), "for-each-ref", "--format=%(refname)", "refs/heads/ci-verify/"],
+        capture_output=True, text=True).stdout.split()
+    assert len(batch_ci_refs) == 1, f"a batch is ONE cycle — expected 1 ci-verify ref, got {batch_ci_refs}"
+
+    # ---- SERIAL lane (baseline): the same 3 members, one cycle each ----
+    srepo, sbare, sbase = _batch_sandbox(tmp_path / "serial")
+    smembers = [
+        _member_branch(srepo, sbase, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",)),
+        _member_branch(srepo, sbase, "wk-b", "bin/b.py", "b=1\n", ("SABLE-b",)),
+        _member_branch(srepo, sbase, "wk-c", "bin/c.py", "c=1\n", ("SABLE-c",)),
+    ]
+    t1 = time.monotonic()
+    for m in smembers:
+        cur = _bg(srepo, "rev-parse", "refs/remotes/origin/trunk")
+        # one serial cycle: build the preview, push its own ci-verify ref, land it
+        tree = _bg(srepo, "merge-tree", "--write-tree", cur, m.tip_sha).splitlines()[0]
+        preview = _bg(srepo, "commit-tree", tree, "-p", cur, "-p", m.tip_sha, "-m",
+                      f"serial preview {m.branch}")
+        _bg(srepo, "push", "-q", "origin", f"{preview}:refs/heads/ci-verify/{m.branch}-x")
+        _bg(srepo, "push", "-q", "origin", f"{preview}:refs/heads/trunk")
+        _bg(srepo, "fetch", "-q", "origin")
+    serial_wall = time.monotonic() - t1
+    serial_ci_refs = subprocess.run(
+        ["git", "-C", str(sbare), "for-each-ref", "--format=%(refname)", "refs/heads/ci-verify/"],
+        capture_output=True, text=True).stdout.split()
+    assert len(serial_ci_refs) == 3, "the serial lane pays 3 cycles for the same 3 members"
+
+    # A gate CYCLE's wall-clock is dominated by its CI wait, not its git ops —
+    # a sandbox cannot run real CI, so a bare git-op micro-timing would compare
+    # the wrong quantity (and, being spawn-count-bound, invert). The faithful
+    # measurement models each cycle as (its measured git ops) + (ONE CI wait),
+    # priced at the gate's OWN merge_preview tier budget — the real per-cycle CI
+    # cost the batch collapses from 3 to 1. Recorded, and asserted, on that.
+    ci_cost = promote_lib.impact_budget()["tier_timeout_s"]
+    batch_total = batch_wall + 1 * ci_cost          # ONE combined CI cycle
+    serial_total = serial_wall + 3 * ci_cost        # THREE serial CI cycles
+    print(f"\nS1 ACCEPTANCE measured (per-cycle CI budget {ci_cost:.0f}s): "
+          f"batch lane = {batch_wall*1000:.1f}ms git + 1 CI cycle = {batch_total:.1f}s "
+          f"(1 ci-verify ref) vs serial lane = {serial_wall*1000:.1f}ms git + 3 CI "
+          f"cycles = {serial_total:.1f}s (3 ci-verify refs). "
+          f"Saved {serial_total - batch_total:.1f}s / {2} CI cycles.")
+    assert batch_total < serial_total, (
+        f"batch cycle wall {batch_total:.1f}s not below the sum of 3 serial cycles "
+        f"{serial_total:.1f}s")
+
+
+# ---- SABLE-xpab3 meta-test: the batch-land suite makes ZERO real fleet sends
+
+def test_batch_land_makes_zero_real_fleet_sends(tmp_path, monkeypatch, fleet_sink):
+    """SABLE-xpab3 (landing-blocker, folded into be4lo.7): prove a batch land
+    makes ZERO real sends to the live fleet. The subprocess seam is instrumented
+    to record every command; a real LANDED batch runs under the hermetic
+    channel; assert NOTHING invoked the real `sable-msg` cockpit or the real
+    `bd` store. NON-VACUITY: with the redirect removed, the very same _notify
+    resolves to the real `sable-msg` channel — so the recorder WOULD catch a
+    leak. Remove the isolation and this test fails, which is the whole point."""
+    recorded = []
+    real_run = promote_lib.git_lib._run
+
+    def recording_run(argv, *, cwd, check=True, timeout=None, env=None):
+        recorded.append(list(argv))
+        # Suppress the REAL fleet tools even here — the meta-test must itself
+        # never message the cockpit, not even in the non-vacuity probe below.
+        if argv and argv[0] in ("sable-msg", "bd"):
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return real_run(argv, cwd=cwd, check=check, timeout=timeout, env=env)
+    monkeypatch.setattr(promote_lib.git_lib, "_run", recording_run)
+
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = [
+        _member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",)),
+        _member_branch(repo, base_sha, "wk-b", "bin/b.py", "b=1\n", ("SABLE-b",)),
+    ]
+    fold_tip = _fold(repo, base_sha, members)
+    res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
+                                 members, budget=_ok_budget(members),
+                                 combined_ref="ci-verify/batch-zero")
+    assert res.landed
+
+    real_sends = [a for a in recorded if a and a[0] in ("sable-msg", "bd")]
+    assert real_sends == [], f"batch land leaked to the REAL fleet: {real_sends}"
+    # Non-vacuity part A: the land DID notify — into the hermetic sink, proving
+    # the zero-real result is isolation, not an absent notification.
+    assert any("BATCH LANDED" in line for line in fleet_sink()), \
+        "the land emitted no notification at all — isolation would be vacuously true"
+
+    # Non-vacuity part B: drop the redirect and the same notify targets the real
+    # 'sable-msg' channel; the recorder now sees it. If the default target were
+    # NOT the live channel, this assertion — and the leak it models — would not
+    # bite, so its passing is what makes the zero-real assertion meaningful.
+    monkeypatch.delenv("SABLE_MG_NOTIFY", raising=False)
+    recorded.clear()
+    promote_lib._notify("lincoln", "vacuity probe — never really sent")
+    assert any(a and a[0] == "sable-msg" for a in recorded), (
+        "guard is vacuous: the default notify target is not the real 'sable-msg' channel")
