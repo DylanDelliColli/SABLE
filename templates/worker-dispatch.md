@@ -68,6 +68,15 @@ SABLE-546m5).
   is not caught by anything.
 - Change the WORK to fit an honest declaration, never soften the declaration
   to fit the work — restructure or split the bead instead.
+- A bead that declares NOTHING at all (no `## File footprint` section, no
+  `wip_claims`, no `WIP-CLAIMS:` line) still dispatches, but the spawn now
+  announces it LOUDLY — `sable-spawn-worker: NO-DECLARATION — ...` on stderr,
+  and the shell hook's own `additionalContext` — as a DISTINCT verdict from a
+  footprint that was actually compared and found clean (SABLE-e2ic3). Seeing
+  that line on your own dispatch means the overlap SCHEDULING CONSTRAINT had
+  nothing to compare your work against; it is not evidence you are safe, only
+  evidence nothing was checked. Measured live: 96.4% of the open pool carries
+  no declaration at all, so this is the common case, not an edge case.
 
 ## Verify current state first
 

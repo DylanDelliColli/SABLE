@@ -10,6 +10,7 @@ Proves: a worker WINDOW is created, its pane is tagged
 (@sable_role=worker/@sable_bead/@sable_status=running), the dispatch prompt file
 is written, and the read-instruction is delivered into the pane.
 """
+import importlib.util
 import json
 import os
 import re
@@ -18,11 +19,22 @@ import subprocess
 import tempfile
 import time
 import uuid
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
 
 BIN = Path(__file__).resolve().parent / "sable-spawn-worker"
+
+# SABLE-e2ic3: widening_report() is a pure function this suite calls directly
+# (not through the subprocess boundary every other test here uses) — same
+# SourceFileLoader pattern as test_sable_spawn_worker.py's `ssw`, kept under a
+# distinct in-process module name so the two test files never collide if a
+# full run imports both into one process.
+_SSW_LOADER = SourceFileLoader("sable_spawn_worker_itg", str(BIN))
+_SSW_SPEC = importlib.util.spec_from_loader("sable_spawn_worker_itg", _SSW_LOADER)
+ssw = importlib.util.module_from_spec(_SSW_SPEC)
+_SSW_LOADER.exec_module(ssw)
 HAVE_TMUX = shutil.which("tmux") is not None
 HAVE_BD = shutil.which("bd") is not None
 BEAD = "SABLE-bldh.2"  # an open bead in this repo (read-only here)
@@ -2275,6 +2287,88 @@ def test_real_bd_foreign_overlap_denies_and_leaves_the_bundle_open(sock, real_bd
         status, assignee = after[bid]
         assert status == "open", bid
         assert assignee == "", f"{bid} left assigned to {assignee!r} by a refusal"
+
+
+# --- SABLE-e2ic3: NO-DECLARATION, against a REAL bd store and REAL git repo --
+
+
+def test_real_bd_no_declaration_dispatches_and_announces_loudly(sock, real_bd_repo):
+    """First leg of this bead's TEST SPEC integration bullet, no mocks: bead A
+    holds a REAL declared claim on shared_target.py in a REAL bd store and is
+    in-progress; bead B is dispatched declaring NO footprint at all. The
+    overlap SCHEDULING CONSTRAINT has nothing to compare, so the dispatch
+    proceeds (SABLE-47try: a gate that can never release is indistinguishable
+    from correct caution) — but the caller must say so LOUDLY, naming B, so
+    NO-DECLARATION never reads the same as a checked-clean CLEAR verdict (the
+    defect this bead exists to end: before the fix both were the identical
+    silent no-output success)."""
+    _assert_bin_is_this_branch()
+    bead_a = _new_bead(real_bd_repo, "no-decl leg A", "Scratch bead A, holds a real claim.")
+    _bd(real_bd_repo, "update", bead_a, "--status", "in_progress")
+    _bd(real_bd_repo, "update", bead_a, "--set-metadata", "wip_claims=shared_target.py")
+    bead_b = _new_bead(real_bd_repo, "no-decl leg B",
+                       "Ordinary prose, no footprint declared at all.")
+
+    with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as wt:
+        r = subprocess.run(
+            ["python3", str(BIN), bead_b, "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=_real_bd_env(sock, dd),
+            cwd=real_bd_repo,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "NO-DECLARATION" in r.stderr
+        assert bead_b in r.stderr
+        time.sleep(0.6)
+        assert len(_worker_panes(sock, bead_b)) == 1
+
+    status, assignee = _status_and_assignee(real_bd_repo, bead_b)
+    assert status == "in_progress" and assignee
+
+
+def test_real_bd_widening_past_declaration_is_named_against_a_real_git_diff(real_bd_repo):
+    """Second leg, no mocks: bead B's REAL declared footprint (read with the
+    exact same reader overlap_check uses) compared against a REAL git diff of
+    what its repo actually changed. The push-side ENFORCEMENT of this
+    comparison already exists at HEAD (SABLE-pfbjw's ground-truth branch-ref
+    diff in post-push-merge-notify.sh) — out of this bead's declared
+    footprint, and re-solving it here would be the SABLE-12rin trap. What
+    belongs in THIS bead is the pure comparison PRIMITIVE (widening_report),
+    proven here against ground truth rather than a synthetic set: bead B
+    declares one path; a second, real commit touches a SECOND, undeclared
+    path; widening_report() over the actual `git diff --name-only` output
+    names exactly the undeclared path and stays silent about the declared
+    one."""
+    repo = real_bd_repo
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "--allow-empty", "-q", "-m", "init"], check=True)
+    base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+    bead_b = _new_bead(repo, "widening leg B",
+                       "Story.\n\n## File footprint\nshared_target.py")
+    declared = ssw.bead_claimed_files(json.loads(_bd(repo, "show", bead_b, "--json"))[0])
+    assert declared == {"shared_target.py"}
+
+    # The worker's real commit touches BOTH the declared file and a SECOND,
+    # undeclared one — the shape that matters: a declared-and-genuinely-changed
+    # path must NOT be reported alongside the undeclared one.
+    (repo / "shared_target.py").write_text("declared change\n")
+    (repo / "undeclared_extra.py").write_text("undeclared change\n")
+    subprocess.run(["git", "-C", str(repo), "add", "shared_target.py", "undeclared_extra.py"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "worker change"], check=True)
+
+    diff_out = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--name-only", base, "HEAD"],
+        capture_output=True, text=True, check=True).stdout
+    changed = {ln for ln in diff_out.splitlines() if ln}
+    assert changed == {"shared_target.py", "undeclared_extra.py"}
+
+    report = ssw.widening_report(declared, changed)
+    assert report is not None
+    assert "undeclared_extra.py" in report
+    assert "shared_target.py" not in report
 
 
 if __name__ == "__main__":
