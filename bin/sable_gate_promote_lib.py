@@ -72,6 +72,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -86,6 +87,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+import sable_batch_admission_lib as admission
 import sable_batch_key_lib as batch_key
 import sable_coverage_floor_lib as coverage_floor_lib
 import sable_footprint_lib as footprint_lib
@@ -1836,6 +1838,528 @@ def assert_coverage_floor(repo: str, bead: str, base_sha: str, branch_sha: str,
 
 
 # --------------------------------------------------------------------------
+# AUTO-PROMOTE (SABLE-21rug.4) — the gated deny/allow assert
+# --------------------------------------------------------------------------
+#
+# The last member of the assert_* family, and the only one whose ALLOW means
+# "no human turn is owed here". Everything above it refuses a promote a human
+# asked for; this one decides whether a promote may happen with no human
+# asking at all. That inversion is why it is built as a DISQUALIFIER TABLE
+# rather than a boolean: an unattended landing that turns out to be wrong is
+# only debuggable if the decision named, in a durable record, exactly which
+# row it turned on — and a row that has never been SEEN to fire is untested by
+# construction, so every row below has a unit case that observes it fire BY
+# NAME (this bead's whole test spec).
+#
+# WHERE THE MECHANICAL-CLASS JUDGEMENT COMES FROM, and where it does not.
+# Five of the rows are clauses of the SHARED per-member predicate
+# sable_batch_admission_lib.is_this_branch_mechanical (SABLE-be4lo.3, which
+# this bead is dep-blocked on). This module CONSUMES that verdict and
+# re-derives NO clause of it: it never computes a footprint, never resolves
+# the gate-class roster, never reads a hold, never runs a fold check. A clause
+# appearing in two places is precisely the drift the factoring exists to
+# prevent, and bin/test_sable_gate_promote_lib.py asserts the absence
+# structurally (test_the_auto_promote_assert_re_derives_no_mechanical_clause)
+# so the property is checked rather than promised.
+#
+# The remaining rows are this bead's OWN, and they are a different question
+# from "is this branch mechanical":
+#   * THE EVIDENCE CHAIN — a provenance record (a typed producer for the
+#     verdict) and a self-hash (which implementation decided), each bound to
+#     the EXACT preview SHA under decision, refusing on mismatch rather than
+#     adapting. SABLE-21rug.6 replays unattended landings from durable records
+#     alone; a record that cannot say who produced the verdict, or which code
+#     read it, is not replayable.
+#   * BASE-UNCHANGED-SINCE-VERDICT — the base ref, re-observed live, still the
+#     commit this decision was made against. Distinct from adoption: adoption
+#     proves a preview exists for the (base, branch) pair the CALLER named,
+#     which says nothing about whether that pair is still current.
+#   * THE THREE VACUOUS-GREEN PRECONDITIONS — see below. These are the rows
+#     that make the other rows mean something.
+#
+# WHY THE VACUOUS-GREEN PRECONDITIONS ARE ROWS AND NOT COMMENTS. `mechanical =
+# all(c.passed for c in clauses)` is True over an EMPTY clause tuple. That is
+# not a hypothetical: it is SABLE-p9n7k's exact shape (a summary that cannot
+# distinguish checked-and-passed from had-nothing-to-check), sitting in the
+# one predicate this gate trusts most, and an auto-promote is the worst
+# possible consumer of it because there is no human between the vacuous green
+# and the landing. So the assert proves its own inputs were non-vacuous before
+# it believes them:
+#   p9n7k  NON-VACUOUS      the clause set is non-empty — something was checked.
+#   x2n8a  COMPLETE         the clause set covers every clause the table maps,
+#                           so a TRUNCATED verdict cannot pass as a small one.
+#   52aym  BOUNDED READS    every enumerating bd read in the deciding source
+#                           carries an explicit --limit, so no absence-shaped
+#                           input to this decision can be a silent prefix of
+#                           the real answer.
+# All three deny FAIL-CLOSED, in the same direction as assert_not_frozen's
+# unreadable-freeze-file contract: "we could not prove it" denies exactly like
+# "we proved it does not hold".
+
+class AutoPromoteDisqualifier(str, Enum):
+    """Every reason an auto-promote may be refused, enumerated so a decline
+    NAMES its row instead of carrying a free-text reason a replay cannot
+    group on (Primitive Obsession guard, same as VerdictSource/TierVerdict).
+
+    The twelve rows this bead's test spec enumerates, plus the two remaining
+    clauses of the shared predicate (NOT_INDIVIDUALLY_GREEN,
+    NO_CLEAN_FF_ADOPTION). Those two are deliberately included even though the
+    spec's table did not name them: without them a branch whose verdict is RED
+    would be refused by an unnamed catch-all, and an unnamed refusal is the
+    thing this enum exists to make impossible. The table is COMPLETE over the
+    predicate's clause set — every clause has a row — which is what lets
+    x2n8a's completeness precondition below be stated as a set comparison.
+    """
+    # --- clauses of the shared predicate (consumed, never re-derived) ------
+    GATE_CLASS_FILE = "gate-class-file"
+    TIER_MECHANISM_FILE = "tier-mechanism-file"
+    CLASSIFICATION_AMBIGUITY = "classification-ambiguity"
+    NOT_INDIVIDUALLY_GREEN = "not-individually-green"
+    LIVE_HOLD = "live-hold"
+    NO_CLEAN_FF_ADOPTION = "no-clean-ff-adoption"
+    CONFLICT = "conflict"
+    # --- the evidence chain (this bead's own) -----------------------------
+    MISSING_PROVENANCE = "missing-provenance"
+    MISSING_SELF_HASH = "missing-self-hash"
+    VERDICT_SHA_MISMATCH = "verdict-sha-mismatch"
+    BASE_MOVED = "base-moved-since-verdict"
+    # --- the three vacuous-green preconditions ----------------------------
+    NON_VACUOUS_PROOF_ABSENT = "non-vacuous-proof-absent"        # SABLE-p9n7k
+    SELECTION_COMPLETENESS_ABSENT = "selection-completeness-absent"  # SABLE-x2n8a
+    TRUNCATED_BD_READ = "truncated-bd-read"                      # SABLE-52aym
+
+
+# The clause names is_this_branch_mechanical is contracted to return, in its
+# own documented order. Stated here as the COMPLETENESS TARGET for x2n8a's
+# precondition: a verdict missing any of these is a truncated selection, not a
+# small one, and must not be believed. Kept in sync by
+# test_the_completeness_target_matches_the_real_predicates_clause_set, which
+# reads the names off a REAL verdict rather than trusting this literal.
+REQUIRED_MECHANICAL_CLAUSES = (
+    "non_gate_class", "individually_green", "zero_holds",
+    "clean_ff_adoption", "zero_conflicts",
+)
+
+# Which row a failing clause of the shared predicate maps to. non_gate_class
+# is the one clause that fans out to three rows, because "your footprint
+# touches gate tooling", "your footprint touches the tier mechanism" and "your
+# footprint could not be determined at all" are three different things for the
+# human who has to act on the decline, and the predicate reports them through
+# one clause. The fan-out reads the clause's OWN reason text — it does not
+# recompute the footprint (see _row_for_non_gate_class).
+_CLAUSE_ROWS = {
+    "individually_green": AutoPromoteDisqualifier.NOT_INDIVIDUALLY_GREEN,
+    "zero_holds": AutoPromoteDisqualifier.LIVE_HOLD,
+    "clean_ff_adoption": AutoPromoteDisqualifier.NO_CLEAN_FF_ADOPTION,
+    "zero_conflicts": AutoPromoteDisqualifier.CONFLICT,
+}
+
+# The marker sable_batch_admission_lib._non_gate_class puts on the clause when
+# sable_footprint_lib raised FootprintUndetermined — i.e. the footprint is not
+# WRONG, it is UNKNOWN, which is a materially different decline. Matched
+# loosely (substring, case-folded) so a reword of that reason degrades to the
+# generic gate-class row rather than to a crash, and pinned against the real
+# producer by test_classification_ambiguity_maps_from_a_real_undetermined_clause.
+_UNDETERMINED_MARKER = "undetermined"
+
+# bd subcommands that ENUMERATE and therefore truncate at bd's default limit.
+# `show` and `update` are absent on purpose: they address one bead by id, so
+# there is no result set to silently cut (SABLE-52aym's defect is specifically
+# that a truncated LIST is indistinguishable from a complete one).
+_BD_ENUMERATING_SUBCOMMANDS = frozenset({"list", "ready", "query"})
+
+
+class AutoPromoteRefused(Exception):
+    """An auto-promote evaluation DENIED. Carries the evaluation itself, so a
+    caller (and SABLE-21rug.5's shadow mode, which logs a verdict instead of
+    acting on it) has the whole disqualifier table rather than a message."""
+
+    def __init__(self, evaluation: "AutoPromoteEvaluation") -> None:
+        super().__init__(evaluation.reason)
+        self.evaluation = evaluation
+
+
+@dataclass(frozen=True)
+class Disqualification:
+    """One row of the table, seen to fire: which row, and the specific detail
+    that fired it (the failing clause's own reason, or this module's own
+    observation). `detail` is for the human; `disqualifier` is what a replay
+    groups on."""
+    disqualifier: AutoPromoteDisqualifier
+    detail: str
+
+    def to_dict(self) -> dict:
+        return {"disqualifier": self.disqualifier.value, "detail": self.detail}
+
+
+AUTO_PROMOTE_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class AutoPromoteEvaluation:
+    """The whole auto-promote story for one (bead, branch, base) decision —
+    durable, replayable, and complete whether it allowed or denied.
+
+    Complete on ALLOW too, deliberately: SABLE-21rug.6 audits unattended
+    landings by replaying recorded evaluations, and a record written only on
+    denial makes the landings that actually happened the unobservable ones.
+
+    self_hash / provenance / preview_sha are the evidence chain: WHICH
+    implementation decided, WHO produced the verdict it decided on, and WHICH
+    object both are bound to.
+    """
+    bead: str
+    branch: str
+    base_sha: str
+    branch_sha: str
+    preview_sha: str
+    self_hash: str
+    provenance: str
+    disqualifications: tuple[Disqualification, ...]
+
+    @property
+    def allowed(self) -> bool:
+        return not self.disqualifications
+
+    @property
+    def rows(self) -> tuple[AutoPromoteDisqualifier, ...]:
+        """Every row that fired, in table order — what a decline NAMES."""
+        return tuple(d.disqualifier for d in self.disqualifications)
+
+    @property
+    def reason(self) -> str:
+        if self.allowed:
+            return ("auto-promote ALLOWED: every disqualifier cleared, evidence chain "
+                    f"bound to preview {self.preview_sha[:7]} "
+                    f"(provenance={self.provenance}, self-hash={self.self_hash[:12]})")
+        named = "; ".join(f"{d.disqualifier.value}: {d.detail}" for d in self.disqualifications)
+        return f"auto-promote DENIED ({len(self.disqualifications)} disqualifier(s)) — {named}"
+
+    def to_dict(self) -> dict:
+        return {
+            "schema": AUTO_PROMOTE_SCHEMA_VERSION,
+            "bead": self.bead,
+            "branch": self.branch,
+            "base_sha": self.base_sha,
+            "branch_sha": self.branch_sha,
+            "preview_sha": self.preview_sha,
+            "self_hash": self.self_hash,
+            "provenance": self.provenance,
+            "allowed": self.allowed,
+            "disqualifiers": [d.to_dict() for d in self.disqualifications],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AutoPromoteEvaluation":
+        """Reconstruct from a durable record, TOLERATING unknown keys — the
+        same additive discipline AttentionRecord.from_dict carries, so a field
+        a later sibling adds never breaks SABLE-21rug.6's replay of an older
+        record."""
+        return cls(
+            bead=str(data.get("bead", "")),
+            branch=str(data.get("branch", "")),
+            base_sha=str(data.get("base_sha", "")),
+            branch_sha=str(data.get("branch_sha", "")),
+            preview_sha=str(data.get("preview_sha", "")),
+            self_hash=str(data.get("self_hash", "")),
+            provenance=str(data.get("provenance", "")),
+            disqualifications=tuple(
+                Disqualification(AutoPromoteDisqualifier(d["disqualifier"]),
+                                 str(d.get("detail", "")))
+                for d in (data.get("disqualifiers") or [])),
+        )
+
+
+def _deciding_sources() -> list[Path]:
+    """The files that JOINTLY decide an auto-promote: this module (the table)
+    and the shared predicate's module (the five clauses). The self-hash covers
+    both, because "which implementation decided" is not answered by either one
+    alone — a swap of the predicate underneath an unchanged table changes the
+    decision just as completely."""
+    return [Path(__file__), Path(admission.__file__)]
+
+
+def gate_self_hash(sources: list[Path] | None = None) -> str:
+    """sha256 over the deciding implementation's own source — the evidence
+    chain's answer to "which code made this decision", which SABLE-21rug.6's
+    replay needs to tell a re-derivation from a re-implementation.
+
+    Returns "" when any source cannot be read. That empty string is the
+    MISSING_SELF_HASH row: an unreadable implementation is not a self-hash of
+    zero, it is the absence of one, and the assert denies on it (fail-closed,
+    same contract as run_coverage_floor_check's None).
+
+    Hashes (path-basename, digest) pairs rather than the concatenated bytes so
+    the digest is stable under a checkout at a different absolute path — a
+    worktree and its origin must produce the same self-hash for the same
+    code."""
+    digests = []
+    for path in (sources if sources is not None else _deciding_sources()):
+        try:
+            digests.append(f"{Path(path).name}:"
+                           f"{hashlib.sha256(Path(path).read_bytes()).hexdigest()}")
+        except OSError:
+            return ""
+    if not digests:
+        # p9n7k discipline applied to this function's own inputs: a hash over
+        # zero sources is a well-formed digest of nothing, which would read as
+        # a present self-hash. Absence, not a digest.
+        return ""
+    return hashlib.sha256("\n".join(sorted(digests)).encode()).hexdigest()
+
+
+def unlimited_bd_reads(tree: ast.Module) -> list[str]:
+    """SABLE-52aym's precondition, checked STRUCTURALLY. Returns the argv of
+    every bd invocation in `tree` that enumerates (`list`/`ready`/`query`)
+    without an explicit `--limit`/`-n` — each one a read whose result is a
+    silent prefix of the real answer whenever the store holds more than bd's
+    default 50, and therefore a source of absence-shaped conclusions that fail
+    in the RELEASING direction.
+
+    Recognises the argv shape this codebase's bd seam actually uses — a list
+    literal of string constants passed to (or concatenated onto)
+    git_lib._tool("SABLE_MG_BD", "bd") — rather than trying to model bd
+    invocation in general. A shape it does not recognise is simply not
+    reported: this is a floor on the known seam, not a proof of universal
+    boundedness, and saying so here is cheaper than a future reader inferring
+    a guarantee that was never made.
+
+    Takes an already-parsed `tree` (never reading a file itself) for the same
+    reason unbudgeted_promote_timeouts does: a test can hand it a planted
+    snippet and prove the check fires, without editing a real module."""
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.List) or not node.elts:
+            continue
+        first = node.elts[0]
+        if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+            continue
+        if first.value not in _BD_ENUMERATING_SUBCOMMANDS:
+            continue
+        argv = [e.value for e in node.elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        if not any(a == "--limit" or a == "-n" or a.startswith("--limit=") for a in argv):
+            offenders.append(" ".join(argv))
+    return offenders
+
+
+def _row_for_non_gate_class(reason: str) -> AutoPromoteDisqualifier:
+    """Which of the three non_gate_class rows a failing clause fired.
+
+    Reads the clause's OWN reason string. This is a projection of the shared
+    predicate's output, NOT a second derivation of it: nothing here computes a
+    footprint, resolves the roster, or re-asks whether the sets intersect —
+    the predicate already answered that, and this only decides how to NAME the
+    answer it gave."""
+    folded = reason.casefold()
+    if _UNDETERMINED_MARKER in folded:
+        return AutoPromoteDisqualifier.CLASSIFICATION_AMBIGUITY
+    if any(tier_file.casefold() in folded for tier_file in admission.GATE_TIER_FILES):
+        return AutoPromoteDisqualifier.TIER_MECHANISM_FILE
+    return AutoPromoteDisqualifier.GATE_CLASS_FILE
+
+
+def _preconditions(mechanical, module_asts: list[ast.Module]) -> list[Disqualification]:
+    """The three vacuous-green preconditions, in bead order (p9n7k, x2n8a,
+    52aym). Evaluated BEFORE `mechanical.mechanical` is believed, and every
+    one of them is evaluated — never short-circuited — so a decline names
+    every precondition that failed rather than only the first."""
+    found: list[Disqualification] = []
+
+    # p9n7k — all(...) over an empty clause tuple is True. Something must have
+    # been checked before "everything passed" can mean anything.
+    present = tuple(c.name for c in mechanical.clauses)
+    if not present:
+        found.append(Disqualification(
+            AutoPromoteDisqualifier.NON_VACUOUS_PROOF_ABSENT,
+            "the mechanical verdict carries ZERO clauses — 'all clauses passed' over an "
+            "empty set is a vacuous green (SABLE-p9n7k), not a proof that anything was "
+            "checked. Refusing to auto-promote on it."))
+
+    # x2n8a — non-empty but SHORT reads exactly like non-empty and complete.
+    missing = [name for name in REQUIRED_MECHANICAL_CLAUSES if name not in present]
+    if present and missing:
+        found.append(Disqualification(
+            AutoPromoteDisqualifier.SELECTION_COMPLETENESS_ABSENT,
+            f"the mechanical verdict is missing clause(s) {', '.join(missing)} — a "
+            f"TRUNCATED clause set is indistinguishable from a genuinely small one "
+            f"(SABLE-x2n8a). Got {', '.join(present)}."))
+
+    # 52aym — an unbounded enumerating bd read anywhere in the deciding source
+    # can turn a real result into a silent prefix, in the releasing direction.
+    unbounded = [argv for tree in module_asts for argv in unlimited_bd_reads(tree)]
+    if unbounded:
+        found.append(Disqualification(
+            AutoPromoteDisqualifier.TRUNCATED_BD_READ,
+            f"the deciding source carries {len(unbounded)} enumerating bd read(s) with no "
+            f"explicit --limit, which bd silently truncates at 50 (SABLE-52aym): "
+            f"{'; '.join(f'bd {a}' for a in unbounded)}"))
+
+    return found
+
+
+def _evidence_chain(repo: str, remote: str, branch: str, base: str, base_ref: str,
+                    base_sha: str, branch_sha: str,
+                    self_hash: str) -> tuple[str, str, list[Disqualification]]:
+    """The evidence-chain rows. Returns (preview_sha, provenance, rows).
+
+    The preview/verdict READ here is not a re-derivation of the
+    individually_green clause: that clause already answered "is the verdict
+    GREEN", and this asks the separate questions the clause does not carry out
+    of the predicate — WHICH object the verdict names, and WHO produced it.
+    Both are needed because a verdict is a value, and a value with no producer
+    and no binding is exactly the artifact an unattended landing must not
+    trust. read_verdict (not acquire_verdict) on purpose: an auto-promote
+    consults what already exists and NEVER waits for a run."""
+    rows: list[Disqualification] = []
+
+    if not self_hash:
+        rows.append(Disqualification(
+            AutoPromoteDisqualifier.MISSING_SELF_HASH,
+            "the deciding implementation could not be hashed, so this landing's record "
+            "cannot say WHICH code decided it — unreplayable by SABLE-21rug.6, refused "
+            "fail-closed rather than landed unattributed."))
+
+    # BASE-UNCHANGED-SINCE-VERDICT. Re-observed LIVE from the remote, not
+    # taken from the caller's argument, because the whole question is whether
+    # the caller's argument is still true.
+    # Narrowed to the base branch, mirroring promote()'s own stale-base fetch
+    # exactly — a bare `fetch <remote>` would pull every ref in the repo on
+    # every auto evaluation, and the only ref this question is about is the base.
+    git_lib._git(repo, "fetch", remote, base, check=False)
+    try:
+        current_base = git_lib.resolve_commit(repo, base_ref)
+    except GateError as exc:
+        # An unresolvable base is not "unchanged" — it is UNKNOWN, and this
+        # function must return a row rather than raise one (the whole table is
+        # always evaluated). Fail closed onto the same row.
+        current_base = ""
+        rows.append(Disqualification(
+            AutoPromoteDisqualifier.BASE_MOVED,
+            f"the base ref {base_ref} could not be resolved, so 'unchanged since the "
+            f"verdict' is unprovable: {exc}"))
+    if current_base and current_base != base_sha:
+        rows.append(Disqualification(
+            AutoPromoteDisqualifier.BASE_MOVED,
+            f"the base moved since this decision's inputs were taken: {base_ref} now reads "
+            f"{current_base[:7]}, the verdict is bound to {base_sha[:7]}. An auto-promote "
+            f"never adapts a verdict to a base it was not produced against."))
+
+    adopted = preview.adopt_kicked_preview(repo, remote, branch, base_sha, branch_sha)
+    if adopted is None:
+        rows.append(Disqualification(
+            AutoPromoteDisqualifier.MISSING_PROVENANCE,
+            f"no kicked preview exists for the (base={base_sha[:7]}, branch={branch_sha[:7]}) "
+            f"pair, so there is no verdict to attribute a producer to."))
+        return "", "", rows
+
+    preview_sha, ref = adopted
+    verdict = preview.read_verdict(repo, ref, preview_sha)
+
+    try:
+        provenance = VerdictSource(verdict.source).value
+    except ValueError:
+        provenance = ""
+        rows.append(Disqualification(
+            AutoPromoteDisqualifier.MISSING_PROVENANCE,
+            f"the verdict for preview {preview_sha[:7]} carries producer {verdict.source!r}, "
+            f"which is not one of the typed producers "
+            f"({', '.join(s.value for s in VerdictSource)}). An unenumerated producer is "
+            f"refused, never passed through."))
+
+    # Bound to the EXACT preview SHA, refuse-on-mismatch — never adapted.
+    if verdict.preview_sha != preview_sha:
+        rows.append(Disqualification(
+            AutoPromoteDisqualifier.VERDICT_SHA_MISMATCH,
+            f"the verdict names object {verdict.preview_sha[:7] or '<none>'} but the object "
+            f"under decision is {preview_sha[:7]}. A verdict for a different SHA is REFUSED, "
+            f"never re-pointed at the object in hand."))
+
+    return preview_sha, provenance, rows
+
+
+def evaluate_auto_promote(bead: str, branch: str, base: str, repo: str, remote: str,
+                          base_sha: str, branch_sha: str,
+                          mechanical=None,
+                          module_asts: list[ast.Module] | None = None
+                          ) -> AutoPromoteEvaluation:
+    """Evaluate the full disqualifier table for one candidate landing and
+    return the record. NEVER raises on a disqualifier and never writes
+    anything — the whole table is always evaluated, so the record names EVERY
+    row that fired rather than the first (mirroring
+    is_this_branch_mechanical's own never-short-circuit contract, and for the
+    same reason: one decline that hides four others costs four more round
+    trips at the seat).
+
+    `mechanical` and `module_asts` are injection seams for the tests that must
+    observe rows the real inputs cannot produce on demand — a verdict with a
+    truncated clause set (x2n8a) has no natural fixture, and planting an
+    unbounded bd read (52aym) must not require editing a real module. Default
+    None means: ask the real shared predicate, and read the real deciding
+    sources."""
+    if mechanical is None:
+        mechanical = admission.is_this_branch_mechanical(
+            repo, remote, bead, branch, base_sha, branch_sha)
+    if module_asts is None:
+        module_asts = []
+        for path in _deciding_sources():
+            try:
+                module_asts.append(ast.parse(path.read_text(), filename=str(path)))
+            except (OSError, SyntaxError, UnicodeDecodeError):
+                # An unparseable deciding source cannot be PROVEN to carry only
+                # bounded reads. Fail closed with a synthetic offender rather
+                # than silently checking nothing (a scan that could not run and
+                # a scan that found nothing must not read the same — the same
+                # bounded-search failure 52aym itself is an instance of).
+                module_asts.append(ast.parse(f'_unreadable = ["list", "{path.name}"]'))
+
+    self_hash = gate_self_hash()
+    base_ref = classify.qualify_remote_ref(remote, base)
+
+    rows: list[Disqualification] = []
+    rows.extend(_preconditions(mechanical, module_asts))
+    preview_sha, provenance, evidence_rows = _evidence_chain(
+        repo, remote, branch, base, base_ref, base_sha, branch_sha, self_hash)
+    rows.extend(evidence_rows)
+    for clause in mechanical.clauses:
+        if clause.passed:
+            continue
+        row = (_row_for_non_gate_class(clause.reason) if clause.name == "non_gate_class"
+               else _CLAUSE_ROWS.get(clause.name))
+        if row is not None:
+            rows.append(Disqualification(row, clause.reason))
+
+    # Table order, not evaluation order, so two records for the same facts are
+    # byte-identical however the evaluation happened to be scheduled — a
+    # property SABLE-21rug.6's replay compares on.
+    order = list(AutoPromoteDisqualifier)
+    rows.sort(key=lambda d: order.index(d.disqualifier))
+
+    return AutoPromoteEvaluation(
+        bead=bead, branch=branch, base_sha=base_sha, branch_sha=branch_sha,
+        preview_sha=preview_sha, self_hash=self_hash, provenance=provenance,
+        disqualifications=tuple(rows))
+
+
+def assert_auto_promote_allowed(bead: str, branch: str, base: str, repo: str,
+                                remote: str, base_sha: str, branch_sha: str
+                                ) -> AutoPromoteEvaluation:
+    """The assert. ALLOW returns the evaluation and the caller's existing
+    mechanical decision tree proceeds with no human turn; DENY raises
+    AutoPromoteRefused, whose message NAMES every row that fired, and the
+    branch goes back to the seat's ordinary queue exactly as it does today.
+
+    A DENY is not an error state and must not read like one: nothing has been
+    built, nothing pushed, nothing consumed. It means "this one wants a human",
+    which is the status quo for every branch in the fleet."""
+    evaluation = evaluate_auto_promote(bead, branch, base, repo, remote,
+                                       base_sha, branch_sha)
+    if not evaluation.allowed:
+        raise AutoPromoteRefused(evaluation)
+    return evaluation
+
+
+# --------------------------------------------------------------------------
 # Seat-attention instrumentation (SABLE-21rug.1) — the metric's mandatory
 # baseline. No sibling in the merge-seat epic may claim a reduction in
 # attended time without this: an AttentionRecord per landing, joined to the
@@ -2498,7 +3022,8 @@ def _adoption_miss_optimistic(bead: str, branch: str, base: str, repo: str, remo
 def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             manager: str, override: str | None,
             coverage_override: str | None = None,
-            with_pair: frozenset[str] = frozenset()) -> int:
+            with_pair: frozenset[str] = frozenset(),
+            auto: bool = False) -> int:
     # FIRST, before any git work: is the fleet frozen? (SABLE-jd5fj.5)
     assert_not_frozen(repo)
     # SECOND, still before any git work — a bd-only check, cheap like the
@@ -2513,6 +3038,37 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
     git_lib._git(repo, "fetch", remote, base, branch)
     base_sha = git_lib.resolve_commit(repo, base_ref)
     branch_sha = git_lib.resolve_commit(repo, branch_ref)
+
+    # SABLE-21rug.4: THE AUTO-PROMOTE GATE. Reached only when this promote is
+    # running with NO HUMAN ASKING FOR IT (`auto`); a seat promote — every
+    # caller today — takes the identical path it always has, which is what
+    # keeps this bead's landing behaviour-neutral until SABLE-21rug.5's shadow
+    # mode and computed activation decide when `auto` may be set.
+    #
+    # Placed HERE, in the assert_* prologue, because it must sit IN FRONT OF
+    # BOTH integration-branch writers with nothing built and nothing pushed
+    # behind it: a decline costs a preview build, a CI ref, or an impact tier
+    # only if it happens after them. A decline routes to the seat's ordinary
+    # queue — the status quo for the branch, not a failure of it.
+    if auto:
+        try:
+            allowed = assert_auto_promote_allowed(bead, branch, base, repo, remote,
+                                                  base_sha, branch_sha)
+            # The ALLOW is recorded just as durably as the DENY. Writing only
+            # declines would make the landings that ACTUALLY HAPPENED the
+            # unobservable ones — and an unattended landing nobody recorded is
+            # precisely what SABLE-21rug.6's audit ("zero input on a landing
+            # day is RED") is built to catch.
+            _append_evidence(repo, bead,
+                f"auto-promote ALLOWED (SABLE-21rug.4): {json.dumps(allowed.to_dict())}")
+        except AutoPromoteRefused as exc:
+            _append_evidence(repo, bead,
+                f"auto-promote DECLINED (SABLE-21rug.4): {json.dumps(exc.evaluation.to_dict())}")
+            raise GateError(
+                classify.EXIT_PRECONDITION,
+                f"AUTO-PROMOTE DECLINED for {bead} ({branch}) — {exc.evaluation.reason}. "
+                f"Nothing was built and nothing landed; {branch} stays in the seat's "
+                f"ordinary queue for a human to promote.") from exc
 
     # SABLE-cmar4.5: next, before building anything — is this a PRUNING diff
     # (removed test fn / newly-skipped test / deleted test file) without a
