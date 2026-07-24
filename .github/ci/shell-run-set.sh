@@ -59,6 +59,7 @@ ALLOW=(
   test-identity-hermeticity.sh
   test-impact-manifest.sh
   test-impact-selection.sh
+  test-impact-tier-serialization.sh
   test-install-preserves-pins.sh
   test-lib-git-sandbox.sh
   test-lib-hook-trace.sh
@@ -189,7 +190,6 @@ declare -A EXCLUDE=(
   [test-tmux-e2e.sh]="vacuous without bd — prints 'SKIP: bd not installed' and exits 0 [permanent: SABLE-59zu]"
   [test-landing-pair-gate.sh]="real-bd-only by construction — its whole claim is that a MUST-LAND-TOGETHER pairing declared in real bd metadata is read back mechanically by promote(); prints 'SKIP: bd not on PATH' and exits 0 in the clean room [permanent: SABLE-59zu]"
   [test-seat-sighting.sh]="real-bd-only by construction — its whole claim is that a seat-filed bead's auto-label/provisional-priority annotation and live ready-pool presence are read back from a real bd store; prints 'SKIP: bd not on PATH' and exits 0 in the clean room [permanent: SABLE-59zu]"
-  [test-impact-tier-serialization.sh]="TIMING-FLAKY: S2 ('window log records two complete tier windows') asserts tier serialization by WALL-CLOCK and false-REDs under CI load — a stamp-flush race (missing close-stamp: expected 2 windows, got 1 from 3 stamps). Verified GREEN 5/5 against the branch's own code locally; false-RED'd wk-msg-delivery-seam and wk-batch-landing back to back. QUARANTINED to unblock the operator-present drain; deflake to assert serialization by a logical ordering signal, not wall-clock, then promote back to ALLOW. [blocked-by: SABLE-awmj4]"
 )
 
 # --- Shell impact manifest (SABLE-cmar4.2) --------------------------------
