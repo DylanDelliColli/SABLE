@@ -1387,5 +1387,84 @@ def test_empty_worker_message_names_other_lanes_when_fleet_nonempty():
     assert "2" in msg  # count of panes in other lanes
 
 
+# --- SABLE-h1fa7: sable-worker-status answers a LANE question when asked a
+# FLEET one. Its output was scoped to the caller's own lane with NO
+# indication it had done so -- byte-indistinguishable from a genuine
+# fleet-wide "nothing else is running". The recorded near-miss: a
+# stranded-claim sweep reading tarzan's own-lane table ("2 panes, both mine")
+# would have released FOUR live workers' claims in another lane, because
+# absent-from-output was read as not-running. scoped_workers/scope_label/
+# scope_summary make the scope actually applied -- and what it hid -- part of
+# every invocation's output, not just the already-empty case
+# (empty_worker_message above). ---
+
+def test_default_scope_is_named_in_output():
+    # PLANT-AND-FAIL (SABLE-5lli.7): with panes from two lanes present, the
+    # default (lane-scoped) invocation's output must CONTAIN the lane it
+    # filtered to. Against the pre-fix code -- no scope line existed at all --
+    # this fails with AttributeError (scope_summary doesn't exist yet).
+    all_workers = [
+        {"pane": "%1", "bead": "a", "status": "running", "lane": "tarzan"},
+        {"pane": "%2", "bead": "b", "status": "running", "lane": "optimus"},
+    ]
+    view_lane = "tarzan"
+    shown = sws.scoped_workers(all_workers, view_lane)
+    line = sws.scope_summary(view_lane, len(shown), len(all_workers))
+    assert view_lane in line
+
+
+def test_all_lanes_scope_lists_every_worker_pane():
+    # a fixture pane table with workers in three lanes; the fleet-wide scope
+    # (view_lane=None, what --all resolves to) returns every one of them.
+    all_workers = [
+        {"pane": "%1", "bead": "a", "status": "running", "lane": "optimus"},
+        {"pane": "%2", "bead": "b", "status": "running", "lane": "tarzan"},
+        {"pane": "%3", "bead": "c", "status": "done", "lane": "chuck"},
+    ]
+    assert sws.scoped_workers(all_workers, None) == all_workers
+
+
+def test_default_scope_still_filters_to_caller():
+    # NEGATIVE CONTROL, LOAD-BEARING: the default scope MUST remain
+    # lane-scoped. Without this the fix becomes "always show everything",
+    # which breaks the legitimate "what am I running" use and floods every
+    # manager's status read.
+    all_workers = [
+        {"pane": "%1", "bead": "a", "status": "running", "lane": "optimus"},
+        {"pane": "%2", "bead": "b", "status": "running", "lane": "tarzan"},
+    ]
+    assert sws.scoped_workers(all_workers, "tarzan") == [all_workers[1]]
+    assert sws.scoped_workers(all_workers, "optimus") == [all_workers[0]]
+
+
+def test_hidden_rows_are_counted():
+    # default scope reports how many panes it did NOT show -- the exact count
+    # that would have told the stranded-claim sweep four workers were running
+    # ELSEWHERE instead of nowhere.
+    line = sws.scope_summary("tarzan", 2, 9)
+    assert "7" in line
+    assert "hidden" in line
+
+
+def test_scope_label_names_lane_or_all_lanes():
+    assert sws.scope_label("tarzan") == "lane=tarzan"
+    assert sws.scope_label(None) == "all-lanes"
+
+
+def test_scope_summary_fleet_wide_reports_no_hidden_count():
+    # a fleet-wide scope hides nothing by construction (view_lane is None) --
+    # asserting "hidden" is absent here is itself a control: it proves the
+    # hidden-count text above is driven by real filtering, not always printed.
+    line = sws.scope_summary(None, 9, 9)
+    assert "all-lanes" in line
+    assert "hidden" not in line
+
+
+def test_scope_summary_lane_with_nothing_hidden_omits_hidden_note():
+    line = sws.scope_summary("tarzan", 2, 2)
+    assert "lane=tarzan" in line
+    assert "hidden" not in line
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
