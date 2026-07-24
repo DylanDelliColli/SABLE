@@ -132,31 +132,30 @@ class Samples(list):
     This exists because the 2026-07-22 clean-room red reported only the verdict
     list — five bare 'clear' strings — and every subsequent diagnosis of it was
     therefore a guess made from a different host. A verdict without the process
-    table that produced it is not a measurement, it is a rumour.
+    table that produced it is not a measurement, it is a rumour. The 2026-07-23
+    revise found that even a same-call diagnostic can mislead if it takes its
+    OWN process-table snapshot (H1) — so `lead_diagnostics` now carries the
+    `trace` `rl.clearance()` itself built while producing the state, branch
+    label included (roots / ancestry / confidently-foreign / genuinely-unknown),
+    not a second, differently-timed read.
     """
 
     lead_diagnostics: list[dict]
 
 
-def _lead_diagnostic(repo: Path, state: str) -> dict:
-    """The decisive evidence for one early sample: what the probe was allowed to
-    attribute to, and every same-uid process that even looks suite-shaped —
-    INCLUDING the ones scan_processes silently drops for having a readable cwd
-    outside the roots, which is the only path by which a live forked child can
-    produce a CLEAR."""
+def _lead_diagnostic(repo: Path, state: str, trace: list[dict]) -> dict:
+    """The decisive evidence for one early sample.
+
+    `trace` MUST come from the SAME `rl.clearance(..., trace=trace)` call that
+    produced `state` (SABLE-skrdj revise #1, H1): a diagnostic that takes its
+    OWN separate `read_process_table()` snapshot can show a candidate that
+    scan_processes's own decision never saw (or vice versa), because the two
+    reads are not the same instant — the 2026-07-23 clean-room red's "state
+    contradicts the printed table" puzzle traced to exactly that gap. Passing
+    the real trace through means what you see here is provably what informed
+    `state`, not a rumour from a nearby read."""
     roots = rl.worktree_roots(str(repo))
-    seen: list[dict] = []
-    try:
-        for p in rl.read_process_table():
-            if p.uid != os.getuid():
-                continue
-            if "pytest" not in p.args and "test_" not in p.args and "test-" not in p.args:
-                continue
-            seen.append({"pid": p.pid, "ppid": p.ppid, "cwd": rl.proc_cwd(p.pid),
-                         "args": p.args[:300]})
-    except rl.ProbeError as exc:
-        seen.append({"probe_error": str(exc)})
-    return {"state": state, "roots": roots, "suite_shaped_same_uid": seen}
+    return {"state": state, "roots": roots, "suite_shaped_same_uid": trace}
 
 
 def _sample_until_exit(proc: subprocess.Popen, repo: Path, limit: float = 90.0):
@@ -167,9 +166,10 @@ def _sample_until_exit(proc: subprocess.Popen, repo: Path, limit: float = 90.0):
     deadline = time.monotonic() + limit
     while proc.poll() is None and time.monotonic() < deadline:
         visible = _suite_processes_visible(repo)
-        state = rl.clearance(base=str(repo)).state
+        trace: list[dict] = []
+        state = rl.clearance(base=str(repo), trace=trace).state
         if len(samples) < LEAD_DIAGNOSTIC_SAMPLES:
-            samples.lead_diagnostics.append(_lead_diagnostic(repo, state))
+            samples.lead_diagnostics.append(_lead_diagnostic(repo, state, trace))
         samples.append((state, visible))
         time.sleep(SAMPLE_INTERVAL)
     proc.wait(timeout=30)
@@ -455,8 +455,10 @@ def test_real_pytest_run_is_never_clear_for_its_whole_duration(scratch):
         f"lead states: {[s for s, _ in lead]}\n"
         f"all samples: {samples}\n"
         "LEAD DIAGNOSTICS (roots the probe may attribute to, and every same-uid "
-        "suite-shaped process with its cwd — a CLEAR here means none of these "
-        "were attributable to the roots):\n"
+        "suite-shaped process scan_processes considered THIS call, with the "
+        "branch it actually resolved to — a CLEAR here despite a non-empty "
+        "trace means every row present resolved to confidently-foreign or was "
+        "absent from the table this decision used):\n"
         + "\n".join(repr(d) for d in samples.lead_diagnostics))
     assert rl.clearance(base=str(scratch)).state == rl.CLEAR, "not released on exit"
 
