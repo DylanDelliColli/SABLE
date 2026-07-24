@@ -87,6 +87,44 @@ def test_the_enumeration_is_the_whole_space():
 
 
 # --------------------------------------------------------------------------
+# REGRESSION (SABLE-be4lo.7, priority 1): the single-branch decision tree is
+# BYTE-IDENTICAL after the batch-landing path is added alongside it.
+# --------------------------------------------------------------------------
+
+# A HARDCODED fingerprint of decide_promotion over the ENTIRE 240-row input
+# space, captured the moment before SABLE-be4lo.7 added the batch-landing path
+# beside it. Hardcoded (not recomputed from the current source, which would be
+# circular): the literal below is the pre-change value, so if the batch work
+# alters ANY cell of the single-branch table — a reordered branch, a changed
+# reason string, a different exit code — the recomputed hash diverges from this
+# literal and reds here, rather than surfacing as a silent bad merge. To
+# legitimately change the single-branch table, a future edit must recompute and
+# update this literal deliberately, which is exactly the review gate intended.
+_DECISION_TABLE_GOLDEN_SHA256 = (
+    "2d72b3a4a46007f2eaf2cb3277627c7e9e54122db66a03cf17cdc969c64d2480")
+
+
+def test_REGRESSION_single_branch_decision_tree_is_byte_identical():
+    """SABLE-be4lo.7 regression (priority 1): every field of every decision
+    over this module's 240-row enumeration hashes byte-identical to the
+    pre-batch-path golden. decide_promotion is the sole authority on the
+    single-branch promote; adding the batch path must leave it untouched."""
+    import hashlib
+    rows = []
+    for kw in ALL_INPUTS:
+        d = decide(**kw)
+        rows.append(repr((kw["outcome"], kw["base_moved"], kw["disjoint"],
+                          kw["impact"], kw["combined_sha"], d.action, d.exit_code,
+                          d.verified_sha, d.reverified, d.reason)))
+    assert len(rows) == 240
+    got = hashlib.sha256("\n".join(rows).encode()).hexdigest()
+    assert got == _DECISION_TABLE_GOLDEN_SHA256, (
+        "the single-branch decision tree changed — batch-path work must not alter "
+        f"it. Recomputed {got}, golden {_DECISION_TABLE_GOLDEN_SHA256}. If this "
+        "change is intentional, update the golden deliberately.")
+
+
+# --------------------------------------------------------------------------
 # PROPERTY INVARIANT I1
 # --------------------------------------------------------------------------
 
@@ -597,20 +635,29 @@ def test_a_human_override_does_not_take_the_widened_entry(queued, monkeypatch):
     assert queued["materialized"] == 1
 
 
-def test_the_module_has_exactly_two_writers_to_the_integration_branch():
+def test_the_module_has_exactly_three_writers_to_the_integration_branch():
     """The bridge between 'the table is safe' and 'no path bypasses the table'.
 
     An enumeration over decide_promotion proves I1 only if every write to the
-    integration branch is guarded by it. Checked against the SOURCE, like the
-    other structural properties of this gate (bin/test_merge_gate_modules.py):
-    there are exactly TWO refspecs targeting the base — the unmoved-base
-    promotion of the CI-verified preview, and _stale_base's promotion of the
-    re-verified combined object — and no third one can appear without failing
-    here. A third writer is how an 'unreachable' path becomes reachable."""
+    integration branch is guarded. Checked against the SOURCE, like the other
+    structural properties of this gate (bin/test_merge_gate_modules.py). There
+    are exactly THREE refspecs targeting the base, each preceded by a guard the
+    caller cannot skip:
+      * combined_sha — _stale_base's promotion of the re-verified combined
+        object (guarded by decide_promotion);
+      * preview_sha  — the unmoved-base promotion of the CI-verified preview
+        (guarded by decide_promotion);
+      * fold_tip     — SABLE-be4lo.7's batch land (guarded by
+        assert_batch_budget_present + the per-batch stale-base check + the
+        built-on-this-base ancestry precondition, the batch analogues of the
+        table's own guards).
+    A FOURTH, unguarded writer is how an 'unreachable' path becomes reachable,
+    and it still fails here. The list is source-ORDER (_stale_base precedes
+    promote precedes land_batch), so this pins WHERE each writer lives too."""
     import inspect
     import re
     writers = re.findall(r'f"\{(\w+)\}:refs/heads/\{base\}"', inspect.getsource(promote_lib))
-    assert writers == ["combined_sha", "preview_sha"], (
+    assert writers == ["combined_sha", "preview_sha", "fold_tip"], (
         f"the integration branch has writers this proof does not cover: {writers}")
 
 

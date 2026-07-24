@@ -2694,3 +2694,286 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
     finally:
         # Both-path cleanup: delete the throwaway ref (best-effort).
         preview.delete_ci_ref(repo, remote, ref)
+
+
+# --------------------------------------------------------------------------
+# The BATCH LANDING PATH (SABLE-be4lo.7, architecture decisions 6-8)
+# --------------------------------------------------------------------------
+#
+# GATE-CLASS by construction: this path lands a whole fold chain onto the
+# integration branch in exactly ONE fast-forward, or lands NOTHING. It is the
+# THIRD (and, by test_the_module_has_exactly_two_writers_to_the_integration_
+# branch's successor, last-enumerated) writer to the integration branch — and
+# like the two single-branch writers it is preceded by a guard the caller
+# cannot skip: the two single-branch writers are guarded by decide_promotion;
+# this one by assert_batch_budget_present + the per-batch stale-base check +
+# the built-on-this-base ancestry precondition + the post-push integrity
+# assertion. Four behaviors, in the order the epic locked them:
+#
+#   1. BUDGET REFUSAL (decision 6) — before ANY git work, refuse unless the
+#      promote-budget artifact carries the be4lo.6 combined-tree field, naming
+#      it. Extend-tool-first enforcement made mechanical: a pre-extension
+#      budget tool cannot silently drive a batch on hand-carried terms.
+#   2. PER-BATCH STALE-BASE (decision 7) — the fold chain was formed on
+#      base_sha; if the integration tip has moved off base_sha by land time,
+#      RE-FORM (land nothing) rather than land onto a base the chain, and the
+#      CI run that verified it, never saw.
+#   3. NO-HALF-LANDING (decision 8, absolute) — the land is exactly ONE
+#      `git push <fold_tip>:refs/heads/<base>` fast-forward. git moves the ref
+#      to the chain tip or not at all; there is no intermediate state to
+#      observe or recover from. On ANY push failure nothing landed and every
+#      member falls back to the serial queue AS ITSELF, its own preview ref
+#      untouched (this path never writes a member ref, so "previews intact" is
+#      structural, not best-effort).
+#   4. ONE-PROMOTE SEAT POLICY (decision 7) — enforced by 2+3, NOT by a seat
+#      mutex: a serial promote that interleaves moves the base, so this land's
+#      stale-base check (2) refuses it before the push, or its no-force
+#      fast-forward is rejected non-ff (3); symmetrically, a landed batch makes
+#      an interleaved serial promote's own push non-ff. At most one of the two
+#      lands against a given base; the other re-forms. The ordering invariant
+#      lives in the flow, so no seat needs to hold state a recycle could lose.
+
+BATCH_BUDGET_FIELD = "recommended_batch_wrapper_timeout_s"
+"""The combined-tree field combined_tree_budget() adds (SABLE-be4lo.6). Its
+PRESENCE in a promote-budget artifact is the mechanical proof the budget tool
+was extended before this batch runs — decision 6's blocking dependency."""
+
+# Land dispositions — the three terminal shapes a batch land can take. Named
+# next to (and reusing) the BATCH_OUTCOME_* record constants above: a LANDED
+# result stamps BATCH_OUTCOME_LANDED, a fell-back result BATCH_OUTCOME_
+# FELL_BACK_SERIAL; REFORM is transient (the caller rebuilds + re-gates) so it
+# stamps no durable record.
+BATCH_OUTCOME_REFORM = "reform"
+
+
+def assert_batch_budget_present(budget: dict) -> None:
+    """BUDGET REFUSAL (behavior 1, decision 6). Raise LOUDLY — naming the
+    missing field — unless `budget` carries the be4lo.6 combined-tree field.
+    Returns None (proceeds silently) when it is present.
+
+    This is the batch path's before-anything guard, the same placement
+    assert_not_frozen / assert_coverage_floor occupy in promote(): a budget
+    artifact that predates the be4lo.6 extension (e.g. impact_budget()'s
+    single-branch shape, which carries recommended_wrapper_timeout_s but not
+    this field) must stop the batch here, not deep in the land where a
+    hand-carried interim number could paper over the gap (the retired +900
+    pattern; the 5v3d5 precedent). Exit code is EXIT_PRECONDITION — a property
+    of the inputs, decided before any git work, exactly like the freeze and
+    coverage-floor refusals."""
+    if not isinstance(budget, dict) or BATCH_BUDGET_FIELD not in budget:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"batch landing REFUSED: the promote-budget artifact is missing the "
+            f"combined-tree field {BATCH_BUDGET_FIELD!r}. The SABLE-be4lo.6 "
+            f"promote-budget extension is a BLOCKING DEPENDENCY of any batched "
+            f"landing (architecture decision 6, extend-tool-first): derive the "
+            f"budget from `sable-merge-gate promote-budget --member-footprint "
+            f"<paths> [--member-footprint ...] --json`, which produces "
+            f"{BATCH_BUDGET_FIELD!r}. A batch must never run on a budget that "
+            f"does not name it.")
+
+
+@dataclass(frozen=True)
+class BatchLandResult:
+    """The terminal shape of one batch land. `outcome` is one of
+    BATCH_OUTCOME_LANDED / BATCH_OUTCOME_REFORM / BATCH_OUTCOME_FELL_BACK_SERIAL;
+    `landed_tip` is the integration tip after a successful land and None
+    otherwise; `fallback_branches` is every member branch returning to the
+    serial queue as itself (empty only on a clean land) so the caller never has
+    to re-derive the member set from the outcome string."""
+    outcome: str
+    landed_tip: str | None
+    reason: str
+    fallback_branches: tuple[str, ...]
+
+    @property
+    def landed(self) -> bool:
+        return self.outcome == BATCH_OUTCOME_LANDED
+
+    @property
+    def exit_code(self) -> int:
+        if self.outcome == BATCH_OUTCOME_LANDED:
+            return classify.EXIT_OK
+        # REFORM and FELL_BACK_SERIAL are both retry-safe "rebuild + re-gate"
+        # states — nothing landed, nothing to fix — so they share the same
+        # retryable taxonomy code the single-branch base-moved path uses.
+        return classify.EXIT_BASE_MOVED
+
+
+def _fold_tip_built_on(repo: str, base_sha: str, fold_tip: str, member_count: int) -> bool:
+    """True iff `base_sha` is the fold chain's BASE PARENT — the object-level
+    proof the tested combined tip was actually folded ONTO this base. A
+    sable_batch_fold_lib fold chain is exactly `member_count` two-parent
+    commits deep, each commit's FIRST parent being the previous fold commit and
+    the deepest commit's first parent being base_sha — so walking first parents
+    `member_count` times from the tip lands EXACTLY on base_sha. This is
+    stronger than plain ancestry: a member branch may itself descend from
+    base_sha, which would make base_sha a general ancestor of the tip even when
+    the chain was folded onto a DIFFERENT base. Only the first-parent-depth
+    check distinguishes a genuine stale base from a mismatched (base_sha,
+    fold_tip) pair (a precondition bug, not a stale base)."""
+    cp = git_lib._git(repo, "rev-parse", "--verify",
+                      f"{fold_tip}~{member_count}^{{commit}}", check=False)
+    return cp.returncode == 0 and cp.stdout.strip() == base_sha
+
+
+def land_batch(repo: str, remote: str, base: str, base_sha: str, fold_tip: str,
+               members: list, *, budget: dict, combined_ref: str = "",
+               manager: str = "lincoln") -> BatchLandResult:
+    """Land a verified batch fold chain onto the integration branch, whole or
+    not at all. `fold_tip` is the SAME combined object CI verified on
+    ci-verify/batch-<setkey7> (byte-identical promotion — never re-folded here,
+    which would produce an untested SHA); `base_sha` is the integration tip the
+    chain was formed on; `members` are the typed BatchMember set. See this
+    section's header for the four behaviors and their ordering.
+
+    Never raises on a stale base or a losing push race — those are RETURNED as
+    REFORM / FELL_BACK_SERIAL results so the caller can act on the disposition.
+    Raises only on a true precondition breach (budget absent → GateError 3;
+    empty batch → EmptyBatchError; a fold_tip not built on base_sha →
+    GateError 3) or the post-push integrity failure (GateError 4)."""
+    # 0. Freeze first — the same before-any-git-work read promote() opens with.
+    assert_not_frozen(repo)
+    # 1. BUDGET REFUSAL — before any git work.
+    assert_batch_budget_present(budget)
+    if not members:
+        raise EmptyBatchError(
+            "land_batch requires at least one member — an empty batch is a "
+            "caller bug, never a vacuous no-op land (SABLE-p9n7k)")
+    fallback = tuple(m.branch for m in members)
+    base_ref = classify.qualify_remote_ref(remote, base)
+
+    # Object-level precondition: the tested tip must actually have been built
+    # ON base_sha. A tip that was not is a mismatched (base_sha, fold_tip) pair
+    # — a caller bug — NOT a stale base, so it must fail loud here rather than
+    # masquerade as a re-form.
+    resolved_tip = git_lib.resolve_commit(repo, fold_tip)
+    if not _fold_tip_built_on(repo, base_sha, resolved_tip, len(members)):
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"batch fold tip {resolved_tip[:7]} was not built on base {base_sha[:7]} "
+            f"— the (base_sha, fold_tip) pair does not correspond; not a stale base.")
+
+    # 2. PER-BATCH STALE-BASE — is the integration tip still the commit this
+    # chain (and its CI run) was formed on? Asked from an OBSERVATION before the
+    # push, mirroring promote()'s jd5fj.4 pre-push check. A move → RE-FORM: land
+    # nothing, touch no member ref, hand the members back to be rebuilt.
+    git_lib._git(repo, "fetch", remote, base, check=False)
+    current_base = git_lib.resolve_commit(repo, base_ref)
+    if not batch_key.tip_matches(current_base, base_sha):
+        reason = (f"per-batch stale base: integration tip {current_base[:7]} != "
+                  f"{base_sha[:7]} the fold chain was formed on — RE-FORM, nothing "
+                  f"landed; member previews intact.")
+        _notify(manager, f"batch land RE-FORM ({combined_ref or 'batch'}): {reason}")
+        return BatchLandResult(BATCH_OUTCOME_REFORM, None, reason, fallback)
+
+    # 3. NO-HALF-LANDING — ONE fast-forward. No --force, so git rejects a
+    # non-ff push (the narrow race where the base moved between the check above
+    # and here) rather than clobbering: the ref advances to fold_tip atomically
+    # or does not move. On any failure NOTHING landed and every member falls
+    # back to the serial queue as itself.
+    push_cp = git_lib._git(repo, "push", git_lib.resolve_remote_url(repo, remote),
+                           f"{fold_tip}:refs/heads/{base}", check=False)
+    if push_cp.returncode != 0:
+        reason = (f"NO-HALF-LANDING: the single fast-forward of {base} to fold tip "
+                  f"{resolved_tip[:7]} failed (non-ff or push error) — nothing landed; "
+                  f"{len(fallback)} member(s) fall back to the serial queue as "
+                  f"themselves: {push_cp.stdout.strip()[:300]}")
+        _notify(manager, f"batch land FELL BACK to serial ({combined_ref or 'batch'}): {reason}")
+        return BatchLandResult(BATCH_OUTCOME_FELL_BACK_SERIAL, None, reason, fallback)
+
+    # 4. Integrity: the integration tip must now be EXACTLY the tested object.
+    # Not rollback-capable (the object is already pushed) — it fails LOUD if
+    # chuck's single-writer discipline was violated, the batch analogue of
+    # promote()'s F3 assertion.
+    git_lib._git(repo, "fetch", remote, base)
+    landed = git_lib.resolve_commit(repo, base_ref)
+    if not batch_key.tip_matches(landed, resolved_tip):
+        raise GateError(
+            classify.EXIT_INTEGRITY,
+            f"integrity abort: base {base} tip {landed} != tested fold tip "
+            f"{resolved_tip} after the batch fast-forward")
+
+    # Landed. Stamp the durable manifest (best-effort — observability must never
+    # flip a landed batch), append per-member evidence, and hand back the tip.
+    reason = (f"BATCH LANDED: {len(members)} member(s) fast-forwarded {base} to "
+              f"fold tip {resolved_tip[:7]} in ONE cycle (combined_ref "
+              f"{combined_ref or 'n/a'}).")
+    try:
+        record = BatchRecord.from_members(
+            base_sha, list(members), combined_ref=combined_ref,
+            outcome=BATCH_OUTCOME_LANDED, fold_disjoint=True)
+        _stamp_batch_record(repo, record)
+    except Exception as exc:  # noqa: BLE001 — a landed batch must stay landed
+        print(f"sable-merge-gate: batch record skipped after unexpected error: {exc}",
+              file=sys.stderr)
+    for m in members:
+        for bead_id in m.bead_ids:
+            try:
+                _append_evidence(repo, bead_id, reason)
+            except Exception:  # noqa: BLE001 — evidence is best-effort
+                pass
+    _notify(manager, reason)
+    return BatchLandResult(BATCH_OUTCOME_LANDED, landed, reason, ())
+
+
+def land_batch_from_refs(base: str, member_specs: list, repo: str, remote: str,
+                         manager: str = "lincoln") -> int:
+    """CLI orchestrator for `sable-merge-gate land-batch`: resolve each member
+    branch's tip and changed-path footprint, DERIVE the combined-tree budget
+    (so the be4lo.6 field is present by construction on the sanctioned path),
+    resolve the already-verified combined object from its ci-verify/batch-
+    <setkey7> ref, and land it via land_batch. Returns the land result's exit
+    code. Kept in the lib so bin/sable-merge-gate stays argparse + one call
+    (test_cli_is_thin).
+
+    `base` is the raw --base value (None → resolved here via resolve_base, the
+    same precedence promote() uses); `member_specs` are raw `branch` or
+    `branch:BEAD[,BEAD...]` strings."""
+    base = git_lib.resolve_base(base, repo)
+    base_ref = classify.qualify_remote_ref(remote, base)
+    git_lib._git(repo, "fetch", remote, base, check=False)
+    base_sha = git_lib.resolve_commit(repo, base_ref)
+
+    members: list[BatchMember] = []
+    for spec in member_specs:
+        branch, _, bead_part = spec.partition(":")
+        bead_ids = tuple(b for b in bead_part.split(",") if b)
+        git_lib._git(repo, "fetch", remote, branch, check=False)
+        tip = git_lib.resolve_commit(repo, classify.qualify_remote_ref(remote, branch))
+        paths = tuple(sorted(footprint_lib.changed_paths(repo, base_sha, tip)))
+        members.append(BatchMember(branch, tip, bead_ids, paths))
+    if not members:
+        raise GateError(classify.EXIT_USAGE, "land-batch requires at least one --member")
+
+    budget = combined_tree_budget([list(m.footprint_paths) for m in members])
+    setkey = batch_key.setkey(base_sha, [m.tip_sha for m in members])
+    combined_ref = classify.preview_ref_name("batch", setkey)
+    fold_tip = git_lib.remote_ref_commit(repo, remote, combined_ref)
+    if not fold_tip:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"no verified combined object to land: {combined_ref} is absent on "
+            f"{remote}. Form + CI-verify the batch (sable_batch_fold_lib.push_batch_ref) "
+            f"before landing it.")
+    result = land_batch(repo, remote, base, base_sha, fold_tip, members,
+                        budget=budget, combined_ref=combined_ref, manager=manager)
+    print(result.reason)
+    return result.exit_code
+
+
+def register_land_batch(sub) -> None:
+    """Register the `land-batch` subcommand on an argparse subparsers object.
+    Lives here rather than in bin/sable-merge-gate so the CLI stays argparse-
+    dispatch-thin (test_cli_is_thin) even as this GATE-CLASS path adds a
+    subcommand — the subparser is declaration, not logic, and the logic it
+    dispatches to (land_batch_from_refs) is all in this module."""
+    lb = sub.add_parser("land-batch", help="land a CI-verified batch fold chain "
+                        "onto the integration branch in ONE fast-forward, or nothing")
+    lb.add_argument("--base", default=None, help="integration branch to land onto; "
+                    "same resolution as promote")
+    lb.add_argument("--member", action="append", default=[], dest="members", required=True,
+                    metavar="BRANCH[:BEAD[,BEAD...]]", help="repeatable; one per batch member")
+    lb.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+    lb.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
+    lb.add_argument("--manager", default="lincoln")
