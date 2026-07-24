@@ -115,6 +115,13 @@ sable_tier_budget_sec() {
 sable_tier_run() {
   local tier="${1:-}" name failed=() rc
   sable_tier_suites "$tier" >/dev/null || return 1
+  # Suite-run registration for the whole tier run (SABLE-pk15w / SABLE-4qlcf).
+  # runlock_hold comes from the shell-run-set.sh sourced above — deliberately
+  # NOT re-implemented here, for the same no-second-SSOT reason ALLOW is aliased
+  # rather than copied. This is the tier-runner class the empirical clearance
+  # list never named: it execs suites as subprocesses, so it is INTERMITTENT to
+  # ps and would read CLEAR between invocations.
+  runlock_hold "test-tiers.sh --run $tier"
   while IFS= read -r name; do
     [ -z "$name" ] && continue
     if [ ! -f "$TESTDIR/$name" ]; then
