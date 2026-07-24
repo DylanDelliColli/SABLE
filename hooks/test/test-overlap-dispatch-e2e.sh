@@ -299,10 +299,14 @@ else
        "could not create scratch bead C"
 fi
 
-# --- Case 5 (SABLE-47try): the LOAD-BEARING complement, against a real bd ---
+# --- Case 5 (SABLE-47try / SABLE-e2ic3): the LOAD-BEARING complement, real bd
 # Bead D declares NO footprint at all while bead A is still in-progress on
-# SHARED_FILE. It must dispatch silently. This is the assertion that proves the
-# fix did not turn the gate into one that can never release.
+# SHARED_FILE. It must dispatch — the assertion that proves the fix did not
+# turn the gate into one that can never release — but SABLE-e2ic3: no longer
+# SILENTLY. A bead declaring nothing and a bead whose footprint was checked
+# and found clean used to be the identical silent exit-0-no-output; this must
+# now be a DISTINCT, LOUD NO-DECLARATION additionalContext naming bead D,
+# still not a deny.
 BEAD_D=$(bd create --sandbox \
   --title="[int-test] 47try no-footprint bead D" \
   --description="Scratch bead D for the SABLE-47try negative control. It declares no footprint and names no file-shaped token at all." \
@@ -311,14 +315,16 @@ BEAD_D=$(bd create --sandbox \
 if [ -n "$BEAD_D" ]; then
   echo "Integration: created scratch bead D = $BEAD_D"
   OUT=$(run_hook "Work $BEAD_D")
-  if [ -z "$OUT" ]; then
-    pass "real bd: a bead declaring NO footprint still dispatches (gate can still release)"
+  if printf '%s' "$OUT" | grep -q 'NO-DECLARATION' \
+     && printf '%s' "$OUT" | grep -q "$BEAD_D" \
+     && ! printf '%s' "$OUT" | grep -q '"permissionDecision": "deny"'; then
+    pass "real bd: a bead declaring NO footprint still dispatches, LOUDLY as NO-DECLARATION (gate can still release)"
   else
-    fail "real bd: a bead declaring NO footprint still dispatches (gate can still release)" \
-         "got: $OUT"
+    fail "real bd: a bead declaring NO footprint still dispatches, LOUDLY as NO-DECLARATION (gate can still release)" \
+         "got: ${OUT:-<empty>}"
   fi
 else
-  fail "real bd: a bead declaring NO footprint still dispatches (gate can still release)" \
+  fail "real bd: a bead declaring NO footprint still dispatches, LOUDLY as NO-DECLARATION (gate can still release)" \
        "could not create scratch bead D"
 fi
 
