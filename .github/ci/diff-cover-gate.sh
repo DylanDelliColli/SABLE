@@ -23,6 +23,17 @@
 # never penalized for it — only new/changed lines in THIS diff must clear the
 # floor.
 #
+# IMPACT-SCOPED (SABLE-hauwa): the pytest+coverage.py run below that produces
+# coverage.xml is scoped to the diff's own footprint of test suites via
+# bin/tier_selection.py's --diff-cover-scope mode WHENEVER that mode can
+# PROVE the scoped selection covers this diff (see
+# tier_selection.build_diff_cover_scope_plan's docstring for the exact
+# guarantees) — a full `pytest bin/` run takes ~887s idle on a 24-core box
+# against this floor's 900s budget, so it does not fit even idle. On any
+# doubt (missing/broken selector, unprovable selection, tier_selection.py
+# itself absent — e.g. an older checkout) this falls back to exactly the
+# full run this script always did before this fix.
+#
 # Usage: diff-cover-gate.sh <compare-ref> [fail-under]
 #   compare-ref   the base commit/ref to diff against (required)
 #   fail-under    patch-coverage percentage floor (default: $SABLE_COVERAGE_
@@ -43,7 +54,33 @@ cd "$REPO"
 COVERAGE_XML="coverage-floor.xml"
 trap 'rm -f "$COVERAGE_XML"' EXIT
 
-python3 -m pytest bin/ -q -p no:cacheprovider \
-  --cov=bin --cov-report="xml:$COVERAGE_XML"
+# SABLE-hauwa: ask tier_selection.py for a provably-safe scoped selection.
+# Guarded so a missing/broken selector script (e.g. an older checkout that
+# predates this fix, or a synthetic test fixture that doesn't carry it)
+# degrades to the full run below rather than aborting this script outright
+# under `set -e`.
+SCOPE_MODE="full"
+SCOPE_PATHS=()
+if [[ -f bin/tier_selection.py ]]; then
+  if SCOPE_OUTPUT="$(python3 bin/tier_selection.py "--diff-cover-scope=$COMPARE_REF")"; then
+    SCOPE_MODE="${SCOPE_OUTPUT%%$'\n'*}"
+    if [[ "$SCOPE_MODE" == "scoped" ]]; then
+      mapfile -t SCOPE_PATHS <<<"$SCOPE_OUTPUT"
+      SCOPE_PATHS=("${SCOPE_PATHS[@]:1}")
+    else
+      SCOPE_MODE="full"
+    fi
+  else
+    SCOPE_MODE="full"
+  fi
+fi
+
+if [[ "$SCOPE_MODE" == "scoped" && "${#SCOPE_PATHS[@]}" -gt 0 ]]; then
+  python3 -m pytest "${SCOPE_PATHS[@]}" -q -p no:cacheprovider \
+    --cov=bin --cov-report="xml:$COVERAGE_XML"
+else
+  python3 -m pytest bin/ -q -p no:cacheprovider \
+    --cov=bin --cov-report="xml:$COVERAGE_XML"
+fi
 
 diff-cover "$COVERAGE_XML" --compare-branch="$COMPARE_REF" --fail-under="$FAIL_UNDER"

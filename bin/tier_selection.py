@@ -24,10 +24,24 @@ silently empty testmon map paired with a narrow fixture-only selector could
 select close to nothing while "passing" by not running -- exactly the
 silent-green failure class SABLE-7v3z and this epic exist to eliminate.
 Cache miss means full run, full stop.
+
+DIFF-COVER SCOPING (SABLE-hauwa): build_diff_cover_scope_plan / run_diff_cover_
+scope below are a SEPARATE consumer of this module's machinery, added to let
+.github/ci/diff-cover-gate.sh scope the pytest+coverage.py run it needs for
+patch-coverage measurement to the diff's own footprint instead of paying the
+full bin/ suite's ~887s every time. See build_diff_cover_scope_plan's own
+docstring for why this needs an ADDITIONAL guarantee on top of
+build_impact_tier_plan's existing cache-miss/collector-failure safety net:
+a selection good enough to decide "does the test suite still pass" is not
+automatically good enough to decide "is this exact diff line covered" --
+lines covered only by a suite this selection left out would silently read as
+uncovered (a false miss), which is worse than the slow full run this exists
+to avoid.
 """
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -164,6 +178,228 @@ def run_impact_tier(repo_root: Path, base_ref: str = "HEAD") -> int:
     return result.returncode
 
 
+# --------------------------------------------------------------------------
+# diff-cover coverage-run scoping (SABLE-hauwa) -------------------------------
+# --------------------------------------------------------------------------
+# Python-only mirror of sable_coverage_floor_lib._TEST_FILE_RE's naming
+# convention (bin/test_*.py / bin/*_test.py) -- deliberately duplicated
+# rather than imported: this module has zero cross-module dependencies today
+# (stdlib + subprocess only), and diff-cover only ever measures the pytest/
+# coverage.py half of this repo's suites, so the .sh half of that sibling
+# regex could never match anything reachable from here anyway.
+_PY_TEST_FILE_RE = re.compile(r'(^|/)(test_[\w]+\.py|[\w]+_test\.py)$')
+
+
+class DiffCoverScopePlan(NamedTuple):
+    mode: str  # "scoped" | "full"
+    test_paths: List[str]  # whole test FILE paths (not node ids) to hand to pytest
+    reason: str
+
+
+def build_diff_cover_scope_plan(
+    tier_plan: ImpactTierPlan,
+    diff_touched_files: Optional[List[str]],
+    repo_root: Path,
+) -> DiffCoverScopePlan:
+    """PURE decision layer: is it PROVEN safe to hand diff-cover-gate.sh a
+    scoped pytest invocation instead of the full `pytest bin/`?
+
+    build_impact_tier_plan above already answers "which tests need to
+    re-run so the suite's PASS/FAIL verdict stays trustworthy" -- that is a
+    weaker question than the one THIS function must answer: "is every line
+    this diff touches going to be correctly reported as covered or not".
+    A test that isn't selected doesn't corrupt a pass/fail verdict (it
+    simply doesn't run, so it can't report a false pass or false fail) but
+    DOES corrupt a coverage.xml report -- coverage.py only knows about lines
+    the processes it measured actually executed, so any line covered
+    exclusively by an unselected test reads as 0% hit. "Faster and wrong is
+    worse than slow and right" (SABLE-hauwa dispatch) is why this function
+    exists as a layer on top of build_impact_tier_plan rather than a bare
+    passthrough of its verdict.
+
+    Two independent guarantees, EITHER of which failing fails CLOSED to a
+    full run (mode="full"):
+
+      1. tier_plan itself must be "selected" or "none", not "full" already
+         (a passthrough of build_impact_tier_plan's own cache-miss/
+         collector-failure safety net -- see its docstring).
+
+      2. EVERY test file the diff itself touches (added, modified, or
+         renamed-in) must be a member of the selected file set. This is the
+         line-1400 guarantee (be4lo.7/21rug.4): a `pytest.skip(...)` call
+         inside a test body is "covered" by nothing more than that test
+         file being collected and run far enough to hit it -- a full run
+         always does that trivially (every test file it owns is, by
+         definition, run); a narrower selection only does if this check
+         forces it to. Since a diff-touched test file is directly readable
+         off the diff itself (no inference, no trusting a plugin's static
+         or coverage-based reasoning), this check is unconditional --
+         build_impact_tier_plan's testmon+impact union is trusted for
+         OTHER files' transitive dependents, never for the file that is
+         itself IN the diff.
+
+      A file the diff touches that no longer exists on disk (deleted, or
+      renamed away under a name git didn't fold into one line) can never be
+      re-collected -- pytest cannot run a path that isn't there. Guarantee 2
+      is then structurally unsatisfiable for it, so this is checked FIRST,
+      before ever asking the collector anything: a diff that deletes a test
+      file always falls back to full. This is deliberate, not an oversight
+      -- a deleted test file is exactly one of the three
+      sable_coverage_floor_lib.detect_pruning pruning shapes (its
+      deleted_test_files signal), the shape most likely to silently erase
+      coverage, and therefore the shape this function refuses to shortcut.
+
+    diff_touched_files being None (not an empty list) means the caller
+    could not determine the diff's file list at all (e.g. `git diff`
+    itself failed) -- an unknown diff can never be proven covered, so this
+    also fails closed unconditionally, before consulting tier_plan.
+    """
+    if diff_touched_files is None:
+        return DiffCoverScopePlan(
+            mode="full", test_paths=[],
+            reason="could not determine diff-touched files (git diff failed) -- "
+                   "cannot prove an unknown diff is covered")
+
+    diff_test_files = sorted(f for f in diff_touched_files if _PY_TEST_FILE_RE.search(f))
+
+    for f in diff_test_files:
+        if not (Path(repo_root) / f).is_file():
+            return DiffCoverScopePlan(
+                mode="full", test_paths=[],
+                reason=f"diff touches test file {f!r} that no longer exists at "
+                       f"HEAD (deleted or renamed away) -- it cannot be "
+                       f"re-collected, so the provably-covers guarantee is "
+                       f"unsatisfiable for it")
+
+    if tier_plan.mode == "full":
+        return DiffCoverScopePlan(
+            mode="full", test_paths=[],
+            reason=f"impact-tier plan: {tier_plan.reason}")
+
+    selected_files = sorted({nid.split("::", 1)[0] for nid in tier_plan.argv if "::" in nid})
+    missing = [f for f in diff_test_files if f not in selected_files]
+    if missing:
+        return DiffCoverScopePlan(
+            mode="full", test_paths=[],
+            reason=f"impact-tier selection omits diff-touched test file(s) "
+                   f"{missing} -- cannot prove the selection covers the diff "
+                   f"(line-1400 guarantee, SABLE-hauwa)")
+
+    scope_files = sorted(set(selected_files) | set(diff_test_files))
+    if not scope_files:
+        return DiffCoverScopePlan(
+            mode="full", test_paths=[],
+            reason="impact-tier plan selected no tests and the diff touches no "
+                   "test file -- cannot prove an empty selection covers the diff")
+
+    return DiffCoverScopePlan(
+        mode="scoped", test_paths=scope_files,
+        reason=f"{len(scope_files)} impact-scoped test file(s) "
+               f"(impact-tier selected {len(selected_files)}, diff directly "
+               f"touches {len(diff_test_files)})")
+
+
+def _git_diff_touched_files(repo_root: Path, compare_ref: str) -> Optional[List[str]]:
+    """I/O wrapper: paths touched between compare_ref and HEAD, three-dot
+    (against their merge-base) -- matches pytest-impact's own --impact-base
+    semantics (merge-base(REF, HEAD) unless --impact-no-merge-base) and
+    sable_gate_promote_lib.assert_coverage_floor's diff_text computation, so
+    "touched" here means exactly what detect_pruning already scanned.
+
+    Returns None -- NOT an empty list -- when git itself fails (bad ref, not
+    a git repo, ...): an empty list would read as "the diff touches
+    nothing", a checkable fact build_diff_cover_scope_plan could reason
+    about; None keeps that distinguishable from "we don't actually know",
+    which must fail closed instead."""
+    result = subprocess.run(
+        ["git", "diff", "--name-only", f"{compare_ref}...HEAD"],
+        cwd=repo_root, capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _stage_testmondata(repo_root: Path) -> None:
+    """Copy a warm .testmondata from this checkout's PRIMARY working tree
+    into repo_root, if repo_root doesn't already have one of its own
+    (SABLE-hauwa). .testmondata is gitignored, so a linked `git worktree
+    add` checkout -- exactly what sable_gate_promote_lib.
+    run_coverage_floor_check creates to run this floor's check -- never
+    inherits it just by sharing the primary tree's .git. Without this,
+    build_impact_tier_plan reads every promotion as a cache miss and always
+    falls back to the full run, silently negating this whole fix in the one
+    place it is supposed to fire.
+
+    Read-only against the primary tree (never writes back), so this has no
+    interaction with hooks/test/test-impact-tier-serialization.sh's
+    concurrent-WRITE concern -- that suite guards multiple runs writing the
+    SAME file; this is a one-way copy out of it.
+
+    Best-effort and silent: any failure (not a git repo, `git` missing, the
+    primary tree has no .testmondata of its own, ...) just leaves repo_root
+    without a cache, which build_impact_tier_plan already treats as an
+    ordinary, safe cache miss -- so this function never raises."""
+    if testmondata_path(repo_root).exists():
+        return
+    try:
+        common_dir = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=repo_root, capture_output=True, text=True, check=False,
+        )
+        if common_dir.returncode != 0 or not common_dir.stdout.strip():
+            return
+        common_dir_path = Path(common_dir.stdout.strip())
+        if not common_dir_path.is_absolute():
+            common_dir_path = Path(repo_root) / common_dir_path
+        primary_tree = common_dir_path.resolve().parent
+        if primary_tree == Path(repo_root).resolve():
+            return
+        primary_cache = primary_tree / TESTMON_DATAFILE
+        if primary_cache.is_file():
+            shutil.copy2(primary_cache, testmondata_path(repo_root))
+    except OSError:
+        return
+
+
+def run_diff_cover_scope(
+    repo_root: Path, compare_ref: str, collector: Collector = _pytest_collect_only,
+) -> DiffCoverScopePlan:
+    """I/O wrapper: stage a warm testmon cache if one exists, build the real
+    impact-tier plan, read the real diff-touched-files list, and hand all
+    three to the pure build_diff_cover_scope_plan decision above."""
+    _stage_testmondata(repo_root)
+    tier_plan = build_impact_tier_plan(repo_root, base_ref=compare_ref, collector=collector)
+    diff_touched_files = _git_diff_touched_files(repo_root, compare_ref)
+    return build_diff_cover_scope_plan(tier_plan, diff_touched_files, repo_root)
+
+
+def print_diff_cover_scope(repo_root: Path, compare_ref: str) -> int:
+    """CLI entry point .github/ci/diff-cover-gate.sh shells out to. Contract:
+    stdout's first line is always exactly "scoped" or "full"; on "scoped"
+    every following line is one test-file path (repo-root-relative) to hand
+    to pytest.
+
+    ALWAYS exits 0 and NEVER lets an exception escape: diff-cover-gate.sh
+    runs under `set -e`, so an uncaught crash here would abort the ENTIRE
+    coverage check rather than just falling back to the full run it is
+    supposed to degrade to -- strictly worse than the 900s this bead exists
+    to avoid."""
+    try:
+        plan = run_diff_cover_scope(repo_root, compare_ref)
+    except Exception as exc:  # noqa: BLE001 -- must degrade to full, never crash; see docstring
+        print("full")
+        print(f"tier_selection: diff-cover-scope crashed, falling back to full "
+              f"run: {exc!r}", file=sys.stderr)
+        return 0
+
+    print(f"tier_selection: diff-cover-scope {plan.mode} -- {plan.reason}", file=sys.stderr)
+    print(plan.mode)
+    for path in plan.test_paths:
+        print(path)
+    return 0
+
+
 # --- .testmondata cache-warm classification (SABLE-cmar4.3 second revise) ----
 # ci-verify.yml runs the FULL bin/ suite a second time with --testmon-noselect
 # purely to keep .testmondata warm for this module's selector (see module
@@ -261,6 +497,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = argv if argv is not None else sys.argv[1:]
     if "--cache-warm" in args:
         return run_cache_warm(repo_root)
+    for arg in args:
+        if arg.startswith("--diff-cover-scope="):
+            return print_diff_cover_scope(repo_root, arg.split("=", 1)[1])
     base_ref = "HEAD"
     for arg in args:
         if arg.startswith("--base="):

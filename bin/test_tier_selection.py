@@ -220,5 +220,187 @@ def test_classify_cache_warm_outcome_rejects_partial_signature_match():
     assert ts.classify_cache_warm_outcome(1, output) is False
 
 
+# --- build_diff_cover_scope_plan (SABLE-hauwa) --------------------------------
+# PURE decision layer on top of build_impact_tier_plan -- every test here
+# injects an ImpactTierPlan directly, no subprocess, no filesystem beyond a
+# tmp_path used only for the "file still exists" guarantee-2 pre-check.
+
+def _selected_plan(*node_ids):
+    return ts.ImpactTierPlan("selected", [*node_ids, "-q"], f"{len(node_ids)} impacted test(s)")
+
+
+_FULL_PLAN = ts.ImpactTierPlan("full", ["bin/", "-q", "-p", "no:cacheprovider"], "testmon cache miss")
+_NONE_PLAN = ts.ImpactTierPlan("none", [], "no impacted tests")
+
+
+def test_scopes_when_selection_covers_every_diff_touched_test_file(tmp_path):
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "test_foo.py").write_text("def test_x(): pass\n")
+
+    plan = ts.build_diff_cover_scope_plan(
+        _selected_plan("bin/test_foo.py::test_x"),
+        diff_touched_files=["bin/test_foo.py"],
+        repo_root=tmp_path,
+    )
+
+    assert plan.mode == "scoped"
+    assert plan.test_paths == ["bin/test_foo.py"]
+
+
+def test_scopes_and_unions_selection_with_diff_touched_files_not_individually_selected(tmp_path):
+    # A test file the diff touches is always folded in even if the
+    # impact-tier plan's own node ids happen to name a DIFFERENT file (e.g.
+    # a fixture/conftest-mediated dependent) -- both are included.
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "test_foo.py").write_text("def test_x(): pass\n")
+
+    plan = ts.build_diff_cover_scope_plan(
+        _selected_plan("bin/test_foo.py::test_x", "bin/test_dependent.py::test_y"),
+        diff_touched_files=["bin/test_foo.py"],
+        repo_root=tmp_path,
+    )
+
+    assert plan.mode == "scoped"
+    assert plan.test_paths == ["bin/test_dependent.py", "bin/test_foo.py"]
+
+
+def test_full_when_impact_tier_plan_is_already_full(tmp_path):
+    plan = ts.build_diff_cover_scope_plan(_FULL_PLAN, diff_touched_files=[], repo_root=tmp_path)
+
+    assert plan.mode == "full"
+    assert plan.test_paths == []
+    assert "testmon cache miss" in plan.reason
+
+
+def test_full_when_diff_touched_files_is_none_git_diff_failed(tmp_path):
+    plan = ts.build_diff_cover_scope_plan(
+        _selected_plan("bin/test_foo.py::test_x"), diff_touched_files=None, repo_root=tmp_path)
+
+    assert plan.mode == "full"
+    assert "could not determine diff-touched files" in plan.reason
+
+
+def test_full_when_a_diff_touched_test_file_no_longer_exists(tmp_path):
+    # Deleted (or renamed away) -- cannot be re-collected, so the guarantee
+    # is unsatisfiable regardless of what the collector says. This must be
+    # checked BEFORE consulting tier_plan at all.
+    (tmp_path / "bin").mkdir()
+
+    plan = ts.build_diff_cover_scope_plan(
+        _selected_plan("bin/test_foo.py::test_x"),
+        diff_touched_files=["bin/test_foo.py"],
+        repo_root=tmp_path,
+    )
+
+    assert plan.mode == "full"
+    assert "no longer exists at HEAD" in plan.reason
+
+
+def test_negative_control_fails_closed_when_selection_omits_a_diff_touched_test_file(tmp_path):
+    # THE NEGATIVE CONTROL (SABLE-hauwa, non-negotiable): the diff touches
+    # bin/test_bar.py, but the impact-tier plan's selection only names a
+    # DIFFERENT file. Coverage on test_bar.py's changed lines would come
+    # from a suite this selection never runs -- a false miss waiting to
+    # happen. Must fail closed to full, not silently proceed scoped.
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "test_bar.py").write_text("def test_y(): pass\n")
+
+    plan = ts.build_diff_cover_scope_plan(
+        _selected_plan("bin/test_foo.py::test_x"),
+        diff_touched_files=["bin/test_bar.py"],
+        repo_root=tmp_path,
+    )
+
+    assert plan.mode == "full"
+    assert plan.test_paths == []
+    assert "omits diff-touched test file(s)" in plan.reason
+    assert "bin/test_bar.py" in plan.reason
+
+
+def test_full_when_impact_tier_plan_mode_is_none_and_diff_touches_a_test_file(tmp_path):
+    # "none" means the impact-tier plan itself selected nothing; a diff
+    # that touches a test file can never be proven covered by an empty
+    # selection.
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "test_foo.py").write_text("def test_x(): pass\n")
+
+    plan = ts.build_diff_cover_scope_plan(
+        _NONE_PLAN, diff_touched_files=["bin/test_foo.py"], repo_root=tmp_path)
+
+    assert plan.mode == "full"
+    assert "omits diff-touched test file(s)" in plan.reason
+
+
+def test_full_when_impact_tier_plan_mode_is_none_and_diff_touches_no_test_file():
+    # Defensive: this function is never called outside the pruning-diff
+    # context in production (a pruning diff always touches >=1 test file),
+    # but must still fail closed rather than silently treat "nothing
+    # selected, nothing to check" as vacuously safe.
+    plan = ts.build_diff_cover_scope_plan(_NONE_PLAN, diff_touched_files=[], repo_root=Path("/nonexistent"))
+
+    assert plan.mode == "full"
+    assert "selected no tests" in plan.reason
+
+
+def test_line_1400_shape_added_inline_skip_call_keeps_its_file_in_scope(tmp_path):
+    # be4lo.7/21rug.4 shape: a `pytest.skip(...)` call ADDED inside an
+    # existing test body. The line is only "covered" by the test file being
+    # collected and run far enough to hit it -- since the file containing
+    # it is directly touched by the diff, guarantee 2 must keep it in scope
+    # regardless of what the impact-tier plan's own selection says.
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "test_rehearsal.py").write_text(
+        "import pytest\n"
+        "def test_slow_rehearsal():\n"
+        "    if True:\n"
+        "        pytest.skip('opt-in only')\n"
+    )
+
+    plan = ts.build_diff_cover_scope_plan(
+        _selected_plan("bin/test_rehearsal.py::test_slow_rehearsal"),
+        diff_touched_files=["bin/test_rehearsal.py"],
+        repo_root=tmp_path,
+    )
+
+    assert plan.mode == "scoped"
+    assert "bin/test_rehearsal.py" in plan.test_paths
+
+
+# --- _git_diff_touched_files (SABLE-hauwa) ------------------------------------
+
+def test_git_diff_touched_files_returns_none_on_git_failure(tmp_path):
+    # Not a git repo at all -- git itself fails, must be None not [].
+    assert ts._git_diff_touched_files(tmp_path, "HEAD") is None
+
+
+# --- print_diff_cover_scope CLI contract (SABLE-hauwa) ------------------------
+
+def test_print_diff_cover_scope_never_raises_and_prints_full_on_crash(tmp_path, monkeypatch, capsys):
+    def boom(repo_root, compare_ref, collector=None):
+        raise RuntimeError("synthetic crash")
+
+    monkeypatch.setattr(ts, "run_diff_cover_scope", boom)
+
+    rc = ts.print_diff_cover_scope(tmp_path, "HEAD")
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == "full"
+
+
+def test_print_diff_cover_scope_prints_scoped_mode_and_paths(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(
+        ts, "run_diff_cover_scope",
+        lambda repo_root, compare_ref, collector=None: ts.DiffCoverScopePlan(
+            "scoped", ["bin/test_a.py", "bin/test_b.py"], "2 impact-scoped test file(s)"),
+    )
+
+    rc = ts.print_diff_cover_scope(tmp_path, "HEAD")
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == ["scoped", "bin/test_a.py", "bin/test_b.py"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
