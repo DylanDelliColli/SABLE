@@ -494,7 +494,12 @@ def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
     list above cannot distinguish, since `trace` only records rows that
     ALREADY passed those filters (SABLE-skrdj revise #1, second round:
     tarzan's request after the H1 close, to stop conflating an empty
-    candidate set with an empty raw table). Never used to alter behaviour.
+    candidate set with an empty raw table). Its bucket-count fields are
+    capped SAMPLES, explicitly named as such; `parsed_rows_full` (round four)
+    is the un-sampled, un-truncated escape hatch — every row this call
+    classified from, so a caller with one specific pid to hunt (a known
+    child's) can look its row up directly instead of trusting that a 5- or
+    50-row sample happened to include it. Never used to alter behaviour.
 
     `read_debug`, when passed a dict, is forwarded to `read_process_table`
     verbatim (round three: raw ps line count and every line silently dropped
@@ -503,6 +508,7 @@ def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
     me = os.getpid() if self_pid is None else self_pid
     my_uid = os.getuid() if uid is None else uid
     if scan_debug is not None:
+        SAMPLE_CAP = 50  # explicit in the field name below — never a silent truncation
         same_uid = [p for p in tbl if p.uid == my_uid]
         same_uid_excl_self = [p for p in same_uid if p.pid != me]
         no_pattern = [p for p in same_uid_excl_self
@@ -517,13 +523,21 @@ def scan_processes(roots: list[str], table: list[ProcInfo] | None = None,
             "same_uid_rows": len(same_uid),
             "same_uid_excl_self_rows": len(same_uid_excl_self),
             "same_uid_excl_self_no_pattern_match_rows": len(no_pattern),
-            "same_uid_excl_self_no_pattern_match_sample":
-                [{"pid": p.pid, "ppid": p.ppid, "args": p.args[:200]}
-                 for p in no_pattern[:5]],
+            f"same_uid_excl_self_no_pattern_match_sample_capped_at_{SAMPLE_CAP}":
+                [{"pid": p.pid, "ppid": p.ppid, "args": p.args}
+                 for p in no_pattern[:SAMPLE_CAP]],
             "diff_uid_pattern_match_rows": len(diff_uid_pattern_match),
-            "diff_uid_pattern_match_sample":
-                [{"pid": p.pid, "ppid": p.ppid, "uid": p.uid, "args": p.args[:200]}
-                 for p in diff_uid_pattern_match[:5]],
+            f"diff_uid_pattern_match_sample_capped_at_{SAMPLE_CAP}":
+                [{"pid": p.pid, "ppid": p.ppid, "uid": p.uid, "args": p.args}
+                 for p in diff_uid_pattern_match[:SAMPLE_CAP]],
+            # THE DECISIVE ROW, keyed by pid rather than characterised in
+            # buckets (tarzan, round 4): every row in the table this call
+            # actually classified from, verbatim and untruncated, so a
+            # caller can look up ONE specific pid (e.g. a known child pid)
+            # and see its real ppid/uid/args rather than trusting a sample.
+            "parsed_rows_full":
+                [{"pid": p.pid, "ppid": p.ppid, "uid": p.uid, "args": p.args}
+                 for p in tbl],
         })
     attributed: list[Candidate] = []
     unresolved: list[tuple[ProcInfo, str, str | None]] = []

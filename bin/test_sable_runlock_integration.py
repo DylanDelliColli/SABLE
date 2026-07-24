@@ -139,10 +139,12 @@ class Samples(list):
     label included (roots / ancestry / confidently-foreign / genuinely-unknown),
     not a second, differently-timed read. Round two added `scan_debug` (counts
     from BEFORE classification, so an empty `trace` can be told apart from an
-    empty raw table). Round three added `read_debug` and a direct
-    `child_pid_visible_in_raw_ps` check, one layer further down still: whether
-    `ps`'s own output for the runner's child was silently dropped at parse
-    time, and whether the child's pid appears in the raw `ps` text at all.
+    empty raw table). Round three added `read_debug`: whether `ps`'s own
+    output for the runner's child was silently dropped at parse time. Round
+    four replaced round three's substring-based presence check (a false
+    positive risk tarzan caught) with a proper keyed lookup: the child's own
+    row, found by its PARSED pid field, printed verbatim rather than
+    inferred from a capped sample.
     """
 
     lead_diagnostics: list[dict]
@@ -172,19 +174,51 @@ def _lead_diagnostic(repo: Path, state: str, trace: list[dict], scan_debug: dict
     `read_debug` goes one layer further (round three): whether `ps`'s raw
     output line for the candidate was silently dropped by
     read_process_table's own parse-time `continue`s, below where `scan_debug`
-    starts looking. `child_pid_visible_in_raw_ps` asks the most direct
-    version of the question — does str(child_pid) appear ANYWHERE in the raw
-    `ps` text this call read, regardless of which column or whether it
-    parsed — since everything measured so far asks "is there a row matching
-    our filters", not "is our specific child visible to ps at all"."""
+    starts looking.
+
+    ROUND FOUR (tarzan): key the lookup by the child's own pid instead of
+    characterising the population in buckets — bucket counts say where the
+    child ISN'T, never where it IS. Two independent, un-sampled answers:
+      - `child_row_in_parsed_table`: the child's OWN row (pid, ppid, uid,
+        args — untruncated) from `scan_debug["parsed_rows_full"]` (round
+        four's addition), found by matching the PARSED pid field. `None`
+        means the row never reached classification at all.
+      - `child_pid_first_field_in_raw_ps`: is the child present in the raw
+        `ps` text, matched on the first whitespace-delimited field (the pid
+        column) — NOT a substring of the whole line. Round three's
+        `child_pid_visible_in_raw_ps` used `str(child_pid) in line`, which a
+        ppid/uid column or a numeral embedded in some unrelated argv could
+        satisfy just as well (tarzan caught this: pid 17433 would
+        false-positive against a line starting with 117433, or one
+        containing "174330" anywhere) — so that flag never actually
+        established what its name claimed."""
     roots = rl.worktree_roots(str(repo))
+
+    parsed_rows_full = scan_debug.get("parsed_rows_full", [])
+    child_row = next((r for r in parsed_rows_full if r["pid"] == child_pid), None)
+    child_row_matches_suite_pattern = None
+    if child_row is not None:
+        child_row_matches_suite_pattern = next(
+            (label for label, pat in rl.SUITE_PATTERNS if pat.search(child_row["args"])),
+            None)
+
     raw_lines = read_debug.get("raw_lines", [])
-    child_pid_visible_in_raw_ps = any(str(child_pid) in line for line in raw_lines)
+
+    def _first_field(line: str) -> str | None:
+        parts = line.strip().split(None, 1)
+        return parts[0] if parts else None
+
+    child_pid_first_field_in_raw_ps = any(
+        _first_field(line) == str(child_pid) for line in raw_lines)
+
+    scan_debug_trimmed = {k: v for k, v in scan_debug.items() if k != "parsed_rows_full"}
     read_debug_trimmed = {k: v for k, v in read_debug.items() if k != "raw_lines"}
     return {"state": state, "roots": roots, "suite_shaped_same_uid": trace,
-            "scan_debug": scan_debug, "read_debug": read_debug_trimmed,
+            "scan_debug": scan_debug_trimmed, "read_debug": read_debug_trimmed,
             "child_pid": child_pid,
-            "child_pid_visible_in_raw_ps": child_pid_visible_in_raw_ps}
+            "child_row_in_parsed_table": child_row,
+            "child_row_matches_suite_pattern": child_row_matches_suite_pattern,
+            "child_pid_first_field_in_raw_ps": child_pid_first_field_in_raw_ps}
 
 
 def _sample_until_exit(proc: subprocess.Popen, repo: Path, limit: float = 90.0):
