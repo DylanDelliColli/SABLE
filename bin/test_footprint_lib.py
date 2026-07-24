@@ -23,6 +23,8 @@ git. The pure parser and the set algebra are tested directly, without a repo,
 because they have no such dependency.
 """
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -622,3 +624,120 @@ def test_the_git_seam_is_the_shared_one(monkeypatch):
         AssertionError("reached the real git")))
     with pytest.raises(AssertionError):
         fp.changed_paths("/nowhere", "a" * 40, "b" * 40)
+
+
+# --------------------------------------------------------------------------
+# 7. Integration section (SABLE-be4lo.3): real bd sandbox, real pairwise loop
+# --------------------------------------------------------------------------
+#
+# Every case above stubs `bd show` with a shell script via SABLE_MG_BD — the
+# right choice for testing the parser and the disjointness algebra in
+# isolation, but the merge-trains admission check (SABLE-be4lo.3) consumes
+# declared_footprint() through the REAL `bd` binary for two REAL, live-shaped
+# beads and then runs the actual pairwise disjointness loop over them. This
+# section proves that path survives the real seam, not just a hand-written
+# stub — mirrors test_footprint_lib_integration.py's sandbox discipline
+# (throwaway HOME + `bd init --non-interactive`, never the developer's own
+# beads DB) without touching that file, which SABLE-kznzo's redo worker was
+# editing at dispatch time.
+
+HAVE_BD = shutil.which("bd") is not None
+_integration = pytest.mark.skipif(
+    not HAVE_BD,
+    reason="ci-verify clean-room has no bd by design; real-bd integration self-skips",
+)
+
+_ENV_LEAKS = ("CLAUDE_AGENT_NAME", "TMUX_PANE", "SABLE_TMUX_SOCKET", "SABLE_MG_BD")
+
+
+def _robust_bd_init(work, home):
+    """Mirrors test_footprint_lib_integration.py's helper: `bd init` on the
+    embedded-Dolt backend can leave a partial DB on a first-run race (rc 0
+    but no .beads/config.yaml) — gate success on that artifact and
+    wipe+retry rather than run against a broken DB."""
+    env = {k: v for k, v in os.environ.items() if k not in _ENV_LEAKS}
+    env["HOME"] = str(home)
+    env["BD_NON_INTERACTIVE"] = "1"
+    env["CI"] = "true"
+    beads = work / ".beads"
+    last = None
+    for _ in range(4):
+        if beads.exists():
+            shutil.rmtree(beads)
+        last = subprocess.run(["bd", "init", "--non-interactive"], cwd=str(work),
+                              env=env, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=180, check=False)
+        if last.returncode == 0 and (beads / "config.yaml").is_file():
+            return last
+    raise AssertionError(f"bd init never produced a clean DB: {last.stdout if last else '<none>'}")
+
+
+def _bd_create(work, home, title, description):
+    env = {k: v for k, v in os.environ.items() if k not in _ENV_LEAKS}
+    env["HOME"] = str(home)
+    env["BD_NON_INTERACTIVE"] = "1"
+    env["CI"] = "true"
+    cp = subprocess.run(
+        ["bd", "create", f"--title={title}", "--type=task",
+         f"--description={description}"],
+        cwd=str(work), env=env, text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, timeout=60, check=True)
+    for tok in cp.stdout.split():
+        if tok.startswith("work-"):
+            return tok.rstrip(":")
+    raise AssertionError(f"could not find created bead id in: {cp.stdout!r}")
+
+
+@pytest.fixture()
+def bd_sandbox(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    home = tmp_path / "home"
+    work.mkdir()
+    home.mkdir()
+    _git(work, "init", "-q", "-b", "trunk")
+    (work / ".gitignore").write_text(".beads/\n")
+    (work / "root.txt").write_text("root\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "init")
+    _robust_bd_init(work, home)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("BD_NON_INTERACTIVE", "1")
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.delenv("SABLE_MG_BD", raising=False)
+    return work, home
+
+
+@_integration
+def test_real_declared_footprints_of_a_disjoint_pair_admit(bd_sandbox):
+    """Two real, live-shaped beads (own '## File footprint' sections) whose
+    declared write sets share no path: the real pairwise loop through
+    declared_footprint() + is_disjoint() must say disjoint=True."""
+    work, _home = bd_sandbox
+    bead_a = _bd_create(work, _home, "be4lo.3 integration: member A",
+                        "Trains member.\n\n## File footprint\nbin/member_a.py\n")
+    bead_b = _bd_create(work, _home, "be4lo.3 integration: member B",
+                        "Trains member.\n\n## File footprint\nbin/member_b.py\n")
+
+    fp_a = fp.declared_footprint(str(work), bead_a)
+    fp_b = fp.declared_footprint(str(work), bead_b)
+    verdict = fp.is_disjoint(fp_a, fp_b)
+    assert verdict.disjoint is True, verdict.reason
+
+
+@_integration
+def test_real_declared_footprints_of_an_overlapping_pair_exclude(bd_sandbox):
+    """The other polarity, same real seam: two real beads whose declared
+    footprints share a path must come back NOT disjoint, naming the overlap
+    — this is the exact check SABLE-be4lo.3's admission loop excludes a
+    candidate on."""
+    work, _home = bd_sandbox
+    bead_a = _bd_create(work, _home, "be4lo.3 integration: member C",
+                        "Trains member.\n\n## File footprint\nbin/shared_module.py\n")
+    bead_b = _bd_create(work, _home, "be4lo.3 integration: member D",
+                        "Trains member.\n\n## File footprint\nbin/shared_module.py\n")
+
+    fp_a = fp.declared_footprint(str(work), bead_a)
+    fp_b = fp.declared_footprint(str(work), bead_b)
+    verdict = fp.is_disjoint(fp_a, fp_b)
+    assert verdict.disjoint is False
+    assert "bin/shared_module.py" in verdict.reason
