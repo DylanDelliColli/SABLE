@@ -12,9 +12,14 @@ after the manual procedure was run three times):
   NO-BEAD            (exit 1) the shift-report bead does not exist.
   STALE-BEAD         (exit 2) it exists but is older than --max-age-seconds.
   BUSY-PANE          (exit 3) the pane is mid-turn; never clip a live turn.
-  BOOT-NOT-OBSERVED  (exit 4) /clear was sent but no SessionStart marker
-                     ('[bd prime]', this repo's actual SessionStart hook
-                     command) showed up within --boot-timeout.
+  BOOT-NOT-OBSERVED  (exit 4) /clear was sent but neither the SessionStart
+                     marker ('[bd prime]', this repo's actual SessionStart
+                     hook command) NOR the Claude Code boot banner showed
+                     up within --boot-timeout. Checking the banner too is
+                     the SABLE-vsfvl Defect 1 fix: on hosts where the hook's
+                     payload is too large to render into the pane (it gets
+                     truncated-and-persisted to a file instead), the
+                     banner is the channel a real boot reliably renders.
   ALREADY-RECYCLED   (exit 0, no keys sent) the pane already shows a fresh
                      boot banner with nothing before it in its scrollback —
                      someone else's recycle (or a concurrent human /clear)
@@ -37,11 +42,25 @@ running the manual procedure by hand: if the composer already has a pending
 would double it up.
 
 Design constraint (SABLE-twn37, the gq8d3 delivery-verification findings):
-does NOT use sable-msg for the boot handoff. It prints the shift-report bead
-id on stdout on both success paths (sent-and-booted, and already-recycled —
-the relay must run even when this script sends nothing, since the incoming
-session still needs the shift report) and leaves delivery + pane-readback
-verification to the initiator.
+does NOT use sable-msg for the boot handoff. It prints an INGESTION
+INSTRUCTION naming the shift-report bead id on stdout on both success paths
+(sent-and-booted, and already-recycled — the relay must run even when this
+script sends nothing, since the incoming session still needs the shift
+report) and leaves delivery + pane-readback verification to the initiator.
+
+SABLE-vsfvl fixed two silent handoff defects found running this for real:
+  Defect 1 — BOOT-NOT-OBSERVED false-negatived a boot that had actually
+    succeeded, because '[bd prime]' (this repo's SessionStart hook's
+    leading stdout token) does not reliably render into the visible pane on
+    hosts where that hook's payload is large enough to be
+    truncated-and-persisted to a file instead ("Output too large ... Full
+    output saved to..."). boot_observed() now also keys on the Claude Code
+    boot banner, which a real boot DOES reliably render into the pane.
+  Defect 2 — relaying the bare bead id as printed on stdout did NOT cause a
+    fresh agent to ingest it as a boot document; a bare id reads as noise.
+    The stdout payload is now relay_instruction(bead_id), an explicit
+    "bd show this, treat it as your boot document" instruction, not a bare
+    id.
 
 Usage:
   sable-recycle-cockpit <shift-report-bead-id> [--pane TARGET]
@@ -148,7 +167,19 @@ def already_recycled(full_scrollback: str) -> bool:
 
 
 def boot_observed(capture_after: str) -> bool:
-    return _BOOT_MARKER in capture_after
+    """True once `capture_after` shows evidence of a completed fresh boot.
+
+    Checks two independent channels rather than one (SABLE-vsfvl Defect 1):
+    the repo's SessionStart marker ('[bd prime]') when it happens to render
+    into the pane, OR the Claude Code boot banner. The banner is the fix —
+    on a host where the SessionStart hook's payload is large enough to be
+    truncated-and-persisted to a file instead of rendered ("Output too
+    large ... Full output saved to..."), '[bd prime]' never reaches the
+    pane and a healthy boot false-negatives on that marker alone. The
+    banner is what a real boot reliably renders into the visible pane
+    instead — verified against a captured fixture of an actual successful
+    boot that carried the banner but not the hook token."""
+    return _BOOT_MARKER in capture_after or bool(_BANNER_RE.search(capture_after))
 
 
 def composer_has_pending_clear(capture: str) -> bool:
@@ -200,6 +231,23 @@ def boot_not_observed_message(pane: str, boot_timeout: float) -> str:
         f"{boot_timeout:.0f}s. The recycle may not have booted correctly. "
         "Retry: capture the pane by hand and verify before relaying the "
         "shift report."
+    )
+
+
+def relay_instruction(bead_id: str) -> str:
+    """The stdout relay payload the initiator sends into the fresh pane.
+
+    Must be an INSTRUCTION, not a bare id (SABLE-vsfvl Defect 2, reproduced
+    directly on the 2026-07-24 recycle): a fresh agent whose first prompt
+    is a bare bead id reads it as noise, not as "this is your boot
+    document" — it boots ALIVE BUT BLIND to the whole shift report, and
+    nothing in the chain errors. `bd show <id>` succeeding and the agent
+    self-identifying as booted both look like success while the ingestion
+    step silently never happens."""
+    return (
+        f"You were recycled. {bead_id} is your BOOT SHIFT REPORT — run "
+        f"`bd show {bead_id}`, treat it as your boot document, and resume "
+        "your loop from what it says."
     )
 
 
@@ -311,12 +359,13 @@ def main(argv: list[str] | None = None) -> int:
 
     print(message, file=sys.stderr)
     if code == 0:
-        # The shift-report bead id, bare, for the initiator to relay
-        # (SABLE-twn37: never via sable-msg here — pane-readback verified
-        # delivery is the caller's job). Printed on BOTH success paths (sent,
-        # and already-recycled) since the relay must run even when this
-        # script sends nothing.
-        print(ns.bead_id)
+        # An ingestion INSTRUCTION, not a bare id (SABLE-vsfvl Defect 2): a
+        # bare id delivered successfully still fails to make a fresh agent
+        # treat it as its boot document. Printed on BOTH success paths
+        # (sent, and already-recycled) since the relay must run even when
+        # this script sends nothing. Never via sable-msg here (SABLE-twn37)
+        # — pane-readback verified delivery is the caller's job.
+        print(relay_instruction(ns.bead_id))
     return code
 
 
