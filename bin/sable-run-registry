@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""sable-run-registry — CLI over the suite-run registry that answers hot-swap
+clearance (SABLE-pk15w / SABLE-4qlcf).
+
+Thin shim: all behaviour, and the whole rationale for why clearance is a
+registry question rather than a process-table question, lives in
+bin/sable_runlock_lib.py. Kept separate for the same reason the other sable
+bins are (a `sable-*` name is what sable-bin-install globs onto PATH, and the
+lib stays importable by tests without going through argv).
+
+  sable-run-registry register --runner "<label>" [--pid $$]
+  sable-run-registry release <token>
+  sable-run-registry clearance [--json]     exit 0 ONLY when clear
+  sable-run-registry list [--json]
+  sable-run-registry reap <token> | --all-stale
+  sable-run-registry audit                  static "every runner registers" gate
+
+Shell runners hold a registration for the WHOLE run — that continuity is the
+point, since a point-in-time ps misses a subprocess-exec'ing runner BETWEEN its
+invocations:
+
+  _tok="$(sable-run-registry register --runner 'my-runner --run' --pid $$)"
+  trap 'sable-run-registry release "$_tok"' EXIT
+"""
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent / "sable_runlock_lib.py"
+_spec = importlib.util.spec_from_file_location("sable_runlock_lib", _LIB)
+_mod = importlib.util.module_from_spec(_spec)
+sys.modules["sable_runlock_lib"] = _mod
+_spec.loader.exec_module(_mod)
+
+if __name__ == "__main__":
+    sys.exit(_mod._main(sys.argv))
