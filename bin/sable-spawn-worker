@@ -1329,6 +1329,25 @@ def refresh_worktree(worktree: str, base_branch: str | None) -> str | None:
     return None
 
 
+def worktree_dirty_paths(worktree: str) -> list[str]:
+    """`git status --porcelain` paths for `worktree` (SABLE-zv0h6): the
+    actionable fact when a pre-spawn refresh fails is not "the tree is dirty"
+    but WHICH FILES are the only copy of someone's work — a worker that sees
+    filenames it did not create behaves very differently from one told the
+    tree is merely unclean. Returns [] (never raises) when the worktree path
+    is invalid or the command fails — a failed-refresh warning must still
+    reach the worker even if this best-effort enrichment cannot."""
+    r = subprocess.run(["git", "-C", worktree, "status", "--porcelain"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    paths = []
+    for line in r.stdout.splitlines():
+        if len(line) > 3:
+            paths.append(line[3:].strip())
+    return paths
+
+
 # --- respawn (REVISE / push-only close-out) support (SABLE-3eax) --------------
 
 
@@ -1533,6 +1552,27 @@ def claim_bundle_beads(bundle: list[dict], lane: str) -> None:
                 f"{b.get('id', '?')}: {r.stderr.strip()}\n")
 
 
+def unclaimed_after_dispatch(dispatch_ids: list[str]) -> list[str]:
+    """Post-claim readback (SABLE-xrcce, the load-bearing second half of the
+    fix): re-`bd show` every id this dispatch was asked to claim — the lead
+    PLUS every --bundle sibling — after the claim writes above, and return the
+    subset that did NOT reach in_progress. Turns a silent partial claim (the
+    3-in/2-out drop this bead documents) into a positive, checkable fact
+    instead of a shorter provenance line the caller reads as confirmation.
+    A bead that fails to parse (malformed `bd show` output) counts as
+    unclaimed — fail safe, not fail open."""
+    unclaimed: list[str] = []
+    for did in dispatch_ids:
+        try:
+            b = parse_bead(_run(["bd", "show", did, "--json"]))
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            unclaimed.append(did)
+            continue
+        if b.get("status") != "in_progress":
+            unclaimed.append(did)
+    return unclaimed
+
+
 def new_window_args(session: str, win: str, worktree: str,
                     env_args: list[str], wcmd: str) -> list[str]:
     """tmux argv for the worker window. -d spawns it in the BACKGROUND: without
@@ -1632,10 +1672,51 @@ def bundle_ready_for_done(bundle_ids: list[str], bead_statuses: dict[str, str]) 
             "(bd q \"<one-liner>\" explaining why).")
 
 
+def render_refresh_warning_section(refresh_warning: str,
+                                   dirty_paths: list[str] | None = None) -> str:
+    """Top-of-prompt stanza (SABLE-zv0h6) for a FAILED pre-spawn worktree
+    refresh. `refresh_worktree`'s warning used to be written ONLY to the
+    spawning manager's stderr — the one party who is not about to run git in
+    this tree — and never reached the dispatched worker who actually inherits
+    the un-rebased (and often dirty) state. Rendered near the top of the
+    prompt, ahead of the bead body, because "HEAD may not be on the current
+    spine" and "this dirt may be someone else's only copy" outrank the bead
+    description in urgency. Returns "" when there is no warning, so a
+    SUCCESSFUL refresh (the common case) adds nothing to the prompt — the
+    SABLE-r5pfw erosion (a signal that fires on every dispatch trains its
+    reader to skip it) this bead's own argument rests on."""
+    if not refresh_warning:
+        return ""
+    dirty_paths = dirty_paths or []
+    dirty_block = ""
+    if dirty_paths:
+        paths_line = "\n".join(f"  {p}" for p in dirty_paths)
+        dirty_block = f"""
+The following paths are UNCOMMITTED in this worktree right now and may be
+the ONLY COPY of someone else's work:
+{paths_line}
+
+DO NOT DISCARD THEM — no `git checkout .`, no `git stash` without a plan to
+recover it, no `git reset --hard` — until you have committed them, confirmed
+whose work they are, or gotten explicit confirmation from the dispatching
+manager that they are safe to drop.
+"""
+    return f"""
+## PRE-SPAWN REFRESH FAILED — READ BEFORE TOUCHING GIT (SABLE-zv0h6)
+{refresh_warning}
+
+HEAD in this worktree is NOT confirmed to be on the current integration
+spine — the rebase meant to guarantee that did not complete.
+{dirty_block}
+"""
+
+
 def assemble_dispatch_prompt(bead_id, title, description, worktree, branch, model,
                              bundle: list[dict] | None = None,
                              notes: str = "",
-                             comments: list[dict] | None = None) -> str:
+                             comments: list[dict] | None = None,
+                             refresh_warning: str = "",
+                             dirty_paths: list[str] | None = None) -> str:
     """`bundle` (SABLE-q13h), when non-empty, is a list of {id, title,
     description, notes, comments} dicts for sibling beads dispatched alongside
     `bead_id` in the SAME worktree/branch. Every bundled bead's FULL
@@ -1694,7 +1775,7 @@ contract below.
 Worktree: {worktree}
 Branch: {branch}
 Worker model: {model}
-
+{render_refresh_warning_section(refresh_warning, dirty_paths)}
 ## Bead
 {bead_id}: {title}
 
@@ -1794,14 +1875,19 @@ def _live_bead_pane(base: list[str], session: str, bead_id: str) -> bool:
     return bead_pane_tagged(listing, bead_id)
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sable-spawn-worker")
     p.add_argument("bead_id")
     p.add_argument("--worktree", help="existing worktree path (else bd worktree create)")
-    p.add_argument("--bundle", help="comma-separated sibling bead ids bundled with "
-                                    "bead_id into the SAME worktree/branch (SABLE-q13h): "
-                                    "claimed up front and rendered in full into the "
-                                    "dispatch prompt, so the worker cannot skip them")
+    p.add_argument("--bundle", action="append",
+                   help="comma-separated sibling bead ids bundled with "
+                        "bead_id into the SAME worktree/branch (SABLE-q13h): "
+                        "claimed up front and rendered in full into the "
+                        "dispatch prompt, so the worker cannot skip them. May be "
+                        "repeated (SABLE-xrcce: the repeated-flag form used to "
+                        "silently keep only the last occurrence); every "
+                        "occurrence is accumulated and its comma-separated ids "
+                        "flattened together.")
     p.add_argument("--model", help="model or 'model:reason' override")
     p.add_argument("--scope", help="short name for the worktree (else derived from bead)")
     p.add_argument("--lane", help="lane manager identity stamped on the worker "
@@ -1815,6 +1901,22 @@ def main(argv: list[str] | None = None) -> int:
                         "stale tree-claim, and pass the duplicate guard when no "
                         "live pane carries the tag — model-check stays active. "
                         "Requires --worktree.")
+    return p
+
+
+def resolve_bundle_ids(bundle_args: list[str] | None, lead_id: str) -> list[str]:
+    """Flatten `--bundle`'s accumulated occurrences (action='append', SABLE-xrcce)
+    into the deduped sibling id list. Each occurrence may itself be
+    comma-separated, so '--bundle A --bundle B', '--bundle A,B', and any mix of
+    the two all flatten to the same result via parse_bundle_ids — joining on
+    "," before the split is what makes the repeated-flag form and the
+    documented comma-separated form equivalent instead of the repeated form
+    silently keeping only its last occurrence."""
+    return parse_bundle_ids(",".join(bundle_args) if bundle_args else None, lead_id)
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = build_arg_parser()
     ns = p.parse_args(sys.argv[1:] if argv is None else argv)
 
     # --respawn re-enters a SPECIFIC existing worktree — it has no meaning without
@@ -1890,7 +1992,7 @@ def main(argv: list[str] | None = None) -> int:
     # Fetched unconditionally (even under --skip-governance) since prompt
     # assembly always needs their titles/descriptions; only the up-front
     # claim below is gated on governance. ---
-    bundle_ids = parse_bundle_ids(ns.bundle, bid)
+    bundle_ids = resolve_bundle_ids(ns.bundle, bid)
     bundle_beads = [parse_bead(_run(["bd", "show", b, "--json"])) for b in bundle_ids]
 
     # Dispatch evidence: a LIVE running pane tagged with this bead. Computed once
@@ -2044,6 +2146,19 @@ def main(argv: list[str] | None = None) -> int:
         if bundle_beads:
             claim_bundle_beads(bundle_beads, lane)
 
+        # SABLE-xrcce: fail LOUD, before any pane/worktree side effect, if any
+        # bead this dispatch was supposed to claim did not actually reach
+        # in_progress — the positive readback that makes a silent partial
+        # bundle claim impossible instead of merely fixing one input shape.
+        unclaimed = unclaimed_after_dispatch([bid, *bundle_ids])
+        if unclaimed:
+            sys.stderr.write(
+                f"sable-spawn-worker: post-claim readback refused — "
+                f"{', '.join(unclaimed)} did not reach in_progress after the "
+                "claim writes above; no worker spawned. Investigate with "
+                f"`bd show <id> --json` for each of: {', '.join(unclaimed)}.\n")
+            return 14
+
         if overlap_verdict.decision == "allow":
             for partner in overlap_verdict.tagged_ids:
                 tag_serialize_with(bid, partner)
@@ -2051,6 +2166,11 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"sable-spawn-worker: {overlap_verdict.message}\n")
 
     # --- worktree ---
+    # SABLE-zv0h6: default is "no warning" for the fresh-worktree branch below
+    # (a `bd worktree create`d tree is already at base HEAD, nothing to warn
+    # about) and for a --skip-governance spawn that never calls refresh_worktree.
+    refresh_warning = None
+    dirty_paths: list[str] = []
     if ns.worktree:
         worktree = ns.worktree
         # SABLE-3eax (b): before the fresh worker runs any git, release a
@@ -2074,6 +2194,13 @@ def main(argv: list[str] | None = None) -> int:
                 worktree, os.environ.get("SABLE_BASE_BRANCH"))
             if refresh_warning:
                 sys.stderr.write(f"sable-spawn-worker: {refresh_warning}\n")
+                # SABLE-zv0h6: the failed refresh is reported to stderr above
+                # for the MANAGER, and separately threaded into the dispatch
+                # prompt below for the WORKER — the one party who is about to
+                # run git in this tree and previously heard nothing. Best-effort
+                # (worktree_dirty_paths never raises): the warning still reaches
+                # the worker even if this enrichment can't run.
+                dirty_paths = worktree_dirty_paths(worktree)
     else:
         wt_name = worktree_name(bid, ns.scope)
         toplevel = _run(["git", "rev-parse", "--show-toplevel"]).strip()
@@ -2123,7 +2250,9 @@ def main(argv: list[str] | None = None) -> int:
         bid, bead.get("title", ""), bead.get("description", ""),
         worktree, branch, model, bundle=bundle_arg,
         notes=bead.get("notes", ""),
-        comments=fetch_bead_comments(bid)))
+        comments=fetch_bead_comments(bid),
+        refresh_warning=refresh_warning or "",
+        dirty_paths=dirty_paths))
 
     # --- open the worker window (stamped with the lane identity) + capture pane ---
     # SABLE-5v9n: set remain-on-exit GLOBALLY, BEFORE the window is created,
