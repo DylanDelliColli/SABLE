@@ -43,7 +43,7 @@ function is unit-testable with no fixtures at all.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 from sable_batch_key_lib import preview_kick_key  # noqa: F401 — re-exported (SABLE-be4lo.1)
 
@@ -106,7 +106,7 @@ def classify_conclusion(conclusion: str) -> str:
     return RED
 
 
-class VerdictSource(str, Enum):
+class VerdictSource(StrEnum):
     """The typed producer discriminator for Verdict.source (SABLE-21rug.2) —
     WHO/WHAT answered "what does CI say", the same WHO/WHAT-produced-this role
     the tier journal's own writer-identity field plays for a tier window. A
@@ -114,9 +114,13 @@ class VerdictSource(str, Enum):
     and later misread (Primitive Obsession guard); this is the whole
     vocabulary, not a suggestion — see parse_verdict_source.
 
-    Subclassing str keeps every EXISTING call site (which passes the bare
-    literals "precomputed"/"waited"/"override") byte-identical: a member
-    compares equal to, and serializes as, its string value, so this addition
+    StrEnum (not plain `str, Enum` — that mixin leaves __str__/__format__ on
+    Enum, so f-strings/str() render the qualified name 'VerdictSource.FOO'
+    instead of the value, even though == and json.dumps already see the
+    value; caught post-close as a real display defect, see SABLE-21rug.2)
+    keeps every EXISTING call site (which passes the bare literals
+    "precomputed"/"waited"/"override") byte-identical: a member compares
+    equal to, AND PRINTS/FORMATS as, its string value, so this addition
     changes no stored or printed verdict for the GitHub-Actions leg.
 
     PRECOMPUTED — read_verdict found an already-completed Actions run.

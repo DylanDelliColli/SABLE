@@ -711,6 +711,48 @@ def test_parse_verdict_source_rejects_an_unenumerated_value():
     assert exc.value.code == classify.EXIT_INTEGRITY
 
 
+# --------------------------------------------------------------------------
+# VerdictSource rendering — REVISE fix (SABLE-21rug.2, second reader):
+# `class VerdictSource(str, Enum)` leaves __str__/__format__ on Enum, so
+# str()/f-strings render 'VerdictSource.LOCAL_RUNNER' instead of the value
+# even though == and json.dumps already saw the value. StrEnum fixes it.
+# Equality alone (as asserted throughout the section above) is exactly the
+# property that SURVIVES the broken mixin, which is why those tests passed
+# against the defective code — these pin the RENDERED byte instead.
+# --------------------------------------------------------------------------
+
+def test_verdict_source_members_render_as_their_value_not_the_repr():
+    """NEGATIVE CONTROL: fails on `class VerdictSource(str, Enum)` (renders
+    'VerdictSource.LOCAL_RUNNER' etc.) and passes on StrEnum."""
+    for member in classify.VerdictSource:
+        assert f"{member}" == member.value
+        assert str(member) == member.value
+        assert ("%s" % member) == member.value
+        assert "VerdictSource." not in f"{member}"
+
+
+def test_acquire_verdict_prints_the_source_value_not_the_enum_repr(monkeypatch, capsys):
+    """The operator-facing acquire_verdict print (preview_lib.py:512) is the
+    ONLY human-visible signal that a verdict did not come from Actions.
+    Asserts both polarities in one test: the pre-existing Actions/precomputed
+    line (negative control — must stay byte-identical) and the new
+    local-runner line (must show 'local-runner', never 'VerdictSource')."""
+    monkeypatch.setattr(preview_lib, "read_verdict", lambda repo, ref, sha: classify.Verdict(
+        "success", "http://run/1", sha, ref, source="precomputed", complete=True))
+    preview_lib.acquire_verdict(REPO, "wk-actions-leg", PREVIEW_SHA)
+    actions_line = capsys.readouterr().out
+    assert "consuming precomputed verdict" in actions_line
+    assert "VerdictSource" not in actions_line
+
+    monkeypatch.setattr(preview_lib, "read_verdict", lambda repo, ref, sha: classify.Verdict(
+        "success", "http://hand-run/1", sha, ref, source=classify.VerdictSource.LOCAL_RUNNER,
+        complete=True))
+    preview_lib.acquire_verdict(REPO, "wk-runner-leg", PREVIEW_SHA)
+    runner_line = capsys.readouterr().out
+    assert "consuming local-runner verdict" in runner_line
+    assert "VerdictSource" not in runner_line
+
+
 def test_read_verdict_ignores_a_journal_entry_for_a_different_ref(monkeypatch, tmp_path):
     """The journal is keyed by ref, same axis Actions is queried on. A record
     for some OTHER ref must never leak into an answer for this one — falls
