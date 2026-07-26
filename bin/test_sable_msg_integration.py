@@ -6,6 +6,7 @@ Proves end-to-end: the role->pane registry (@sable_role user-option) resolves,
 the message is delivered as a real keystroke turn, and a message sent while the
 target pane is BUSY is queued and runs when free (the verified spike behavior).
 """
+import shlex
 import shutil
 import subprocess
 import time
@@ -52,6 +53,17 @@ def _capture(sock, target):
     return _tmux(sock, "capture-pane", "-t", target, "-p").stdout
 
 
+def _read_recording(path):
+    """Defensive read for REC_FILE/ARRIVALS_FILE fixtures. Some stand-ins
+    (_BUSY_TUI, _STUCK_BOX_TUI) read the pty a character at a time, which can
+    split the multi-byte \\xe2\\x9f\\xa6 (⟦) SABLE-MSG framing glyph under host
+    load and leave bare continuation bytes behind (SABLE-wcbj; root-cause
+    conversion of those stand-ins tracked separately as SABLE-qby7). These
+    tests assert on message content, not encoding, so a strict-UTF-8 read
+    must not be able to crash them (SABLE-9qzfg)."""
+    return path.read_text(errors="replace")
+
+
 def _start_pane(sock):
     # A bash REPL stand-in for an agent pane; tag it with @sable_role=optimus.
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
@@ -88,6 +100,17 @@ def _env():
     env.pop("SABLE_WORKER_PANE", None)
     env.pop("SABLE_BEAD", None)
     return env
+
+
+def test_read_recording_survives_non_utf8_delimiter_bytes(tmp_path):
+    # SABLE-9qzfg: reproduces the observed corruption directly, no tmux needed.
+    # A char-at-a-time stand-in read can drop the leading 0xe2 of the
+    # \xe2\x9f\xa6 (⟦) SABLE-MSG framing glyph, leaving bare continuation
+    # bytes 0x9f 0xa6 that strict-UTF-8 read_text() cannot decode. The tests
+    # in this file only assert on message content, so that must not raise.
+    path = tmp_path / "rec.txt"
+    path.write_bytes(b"\x9f\xa6 from=lincoln to=optimus :: cap in force\n")
+    assert "cap in force" in _read_recording(path)
 
 
 def test_message_delivered_to_registered_pane(tmux_socket):
@@ -275,7 +298,7 @@ def test_interrupt_lands_on_busy_midturn_pane_first_attempt(tmux_socket, tmp_pat
     time.sleep(0.5)
     pane = _capture(tmux_socket, "w")
     assert "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force" in pane  # landed intact
-    assert "cap in force" in rec.read_text()         # and was SUBMITTED as a turn
+    assert "cap in force" in _read_recording(rec)    # and was SUBMITTED as a turn
 
 
 # A marker-driven variant of _BUSY_TUI, identical except the busy->idle
@@ -370,7 +393,7 @@ def test_default_send_to_busy_turn_does_not_interrupt_and_reports_undelivered(tm
     assert _wait_until(lambda: end.exists() and end.read_text().strip() == "NATURAL",
                        timeout=10), \
         "busy turn never reached its (test-controlled) natural end"
-    assert _wait_until(lambda: rec.exists() and "queued directive" in rec.read_text(),
+    assert _wait_until(lambda: rec.exists() and "queued directive" in _read_recording(rec),
                        timeout=10), \
         "line must still have been physically queued and run"
 
@@ -393,7 +416,7 @@ def test_default_send_to_busy_pane_that_frees_reports_delivered_h0jw(tmux_socket
              "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "20",
              "SABLE_MSG_POLL_INTERVAL": "0.25"},
     )
-    assert "cap in force" in rec.read_text(), \
+    assert "cap in force" in _read_recording(rec), \
         "precondition: the queued line must have really submitted as a turn"
     assert r.returncode == 0, r.stderr                 # delayed confirmation -> delivered
     assert "delivered" in r.stderr
@@ -530,7 +553,7 @@ def test_default_send_to_busy_pane_with_queued_footer_confirms_delivered_msxj(tm
     # closed by this test's design): r.returncode == 0 means sable-msg's poll
     # already observed the queued-footer posture, which requires the stand-in
     # to have already appended to ARRIVALS_FILE.
-    assert arrivals.read_text().count("cap in force") == 1
+    assert _read_recording(arrivals).count("cap in force") == 1
 
 
 def test_second_send_on_still_busy_pane_does_not_double_queue_msxj(tmux_socket, tmp_path):
@@ -557,7 +580,7 @@ def test_second_send_on_still_busy_pane_does_not_double_queue_msxj(tmux_socket, 
     r1 = subprocess.run(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"], **kwargs)
     assert r1.returncode == 0, r1.stderr
-    assert _wait_until(lambda: arrivals.read_text().count("cap in force") == 1, timeout=10), \
+    assert _wait_until(lambda: _read_recording(arrivals).count("cap in force") == 1, timeout=10), \
         "first send must have queued exactly once before the second send starts"
     r2 = subprocess.run(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"], **kwargs)
@@ -567,10 +590,10 @@ def test_second_send_on_still_busy_pane_does_not_double_queue_msxj(tmux_socket, 
     assert _wait_until(lambda: end.exists() and end.read_text().strip() == "NATURAL",
                        timeout=10), \
         "busy turn never reached its (test-controlled) natural end"
-    assert _wait_until(lambda: rec.exists() and rec.read_text().count("cap in force") == 1,
+    assert _wait_until(lambda: rec.exists() and _read_recording(rec).count("cap in force") == 1,
                        timeout=10), \
         "only a single copy of the message must ultimately submit"
-    assert arrivals.read_text().count("cap in force") == 1, \
+    assert _read_recording(arrivals).count("cap in force") == 1, \
         "the second send must not have retyped an already-queued message"
 
 
@@ -632,7 +655,7 @@ def test_idle_pane_redraw_race_reports_landed_not_undelivered(tmux_socket, tmp_p
              "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "5",
              "SABLE_MSG_POLL_INTERVAL": "0.2"},
     )
-    assert "GO push your worktree branch now" in rec.read_text(), \
+    assert "GO push your worktree branch now" in _read_recording(rec), \
         "precondition: the message must have really submitted as a turn"
     assert r.returncode == 0, r.stderr          # and sable-msg must report it LANDED
     assert "delivered" in r.stderr
@@ -765,7 +788,7 @@ def test_busy_at_t0_text_stuck_in_editable_box_self_heals_and_delivers_l7uv(tmux
         if proc.poll() is None:
             proc.kill()
             proc.communicate()
-    assert _wait_until(lambda: rec.exists() and "cap in force" in rec.read_text(),
+    assert _wait_until(lambda: rec.exists() and "cap in force" in _read_recording(rec),
                        timeout=10), \
         "the stuck line must have been submitted by the self-heal Enter"
     assert proc.returncode == 0, err             # self-heal -> delivered, no fallback
@@ -1047,6 +1070,96 @@ def test_worker_pane_send_frames_as_worker_not_manager_lane_qqcd(tmux_socket):
     time.sleep(0.8)
     pane2 = _capture(tmux_socket, tarzan_pane)
     assert "⟦SABLE-MSG⟧ from=tarzan to=tarzan" in pane2
+
+
+# --- SABLE-tmbx1: caller-shell command-substitution hazard ------------------
+# HIT LIVE 2026-07-21: a message body composed inside a double-quoted shell
+# argument had its backticks/$(...) command-substituted by the CALLING shell
+# before sable-msg's argv was ever populated -- the substituted command
+# actually RAN, and the delivered text silently lost those passages while
+# sable-msg still reported success. sable-msg cannot detect this: by the time
+# main() sees the body, the shell has already parsed it. --body-file sidesteps
+# the hazard by reading the body from a file, which no shell re-parses.
+#
+# A passive echo REPL (not the bash REPLs used above) is the recipient here
+# deliberately: bash would itself re-interpret backticks/$() a SECOND time on
+# receipt, confounding whether corruption happened at send time or receipt
+# time. This stand-in prints the same `> ` composer glyph the bash REPLs use
+# (so dispatch_landed's box-scan heuristic still recognizes it) but only ever
+# echoes the submitted line back VERBATIM -- it never re-parses it as a shell
+# command -- so these tests isolate the SENDING side, which is where
+# SABLE-tmbx1 actually lives.
+
+def _start_echo_pane(sock, tmp_path):
+    script = tmp_path / "echo_repl.py"
+    script.write_text(
+        "import sys\n"
+        "while True:\n"
+        "    sys.stdout.write('> ')\n"
+        "    sys.stdout.flush()\n"
+        "    line = sys.stdin.readline()\n"
+        "    if not line:\n"
+        "        break\n"
+        "    sys.stdout.write(line)\n"
+        "    sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+          f"python3 -u {shlex.quote(str(script))}")
+    time.sleep(0.5)
+    _tmux(sock, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
+    return "w"
+
+
+def test_body_file_delivers_backticks_and_dollar_paren_unexecuted(tmux_socket, tmp_path):
+    _start_echo_pane(tmux_socket, tmp_path)
+    marker = tmp_path / "would-be-pwned"
+    hazardous = f"see `hostname` and $(touch {marker}) now"
+    body_path = tmp_path / "body.txt"
+    body_path.write_text(hazardous, encoding="utf-8")
+
+    r = _run_msg(tmux_socket, "optimus", "--body-file", str(body_path), "--from", "lincoln")
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.8)
+    pane = _capture(tmux_socket, "w")
+    assert "`hostname`" in pane
+    assert f"$(touch {marker})" in pane
+    assert not marker.exists(), "the file-based path must never let $(...) execute"
+
+
+def test_negative_control_inline_body_through_a_real_shell_is_corrupted_before_sable_msg_runs(
+    tmux_socket, tmp_path,
+):
+    """Plant-and-fail (non-negotiable per SABLE-tmbx1's dispatch notes): proves
+    the OLD/vulnerable invocation shape -- a body embedded inline inside a
+    double-quoted shell argument, exactly how an agent's Bash tool naively
+    composes a send -- actually corrupts the message and actually executes
+    the embedded command. This is the reproduction the --body-file fix above
+    is defending against; if this test ever stopped failing on the inline
+    path, the round-trip test above would no longer be evidence of anything."""
+    _start_echo_pane(tmux_socket, tmp_path)
+    marker = tmp_path / "executed-marker"
+    shell_cmd = (
+        f'python3 {shlex.quote(str(BIN))} optimus '
+        f'"see `hostname` and $(touch {marker}) now" --from lincoln'
+    )
+    env = {**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w"}
+    r = subprocess.run(shell_cmd, shell=True, capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.8)
+
+    # HARM 1 -- EXECUTION: $(...) actually ran, with the caller's privileges,
+    # before sable-msg's argv was even populated.
+    assert marker.exists(), (
+        "expected the pre-fix vulnerable invocation to execute the command "
+        "inside $(...) -- if this fails, the reproduction is no longer "
+        "faithful to the reported bug and the contrast above proves nothing"
+    )
+    # HARM 2 -- CORRUPTION: the delivered text is missing the substituted
+    # commands, silently replaced by their stdout, not the literal source.
+    pane = _capture(tmux_socket, "w")
+    assert "$(touch" not in pane
+    assert "`hostname`" not in pane
 
 
 if __name__ == "__main__":

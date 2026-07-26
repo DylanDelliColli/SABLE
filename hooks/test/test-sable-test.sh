@@ -86,12 +86,17 @@ fi
 rm -f "$EV4"
 
 # ---------- S3-U3: absent-session green run writes at the ppid fallback ----------
-# No CLAUDE_SESSION_ID in the env (the hccq trap). The lib must derive a
-# deterministic, non-empty ppid key — NEVER the empty-session garbage path — and
-# sable-test must write there. We confirm the exact path via derive_key (a
-# sibling subprocess with the SAME $PPID frame), so this also proves the key
-# sable-test writes is byte-identical to the key another consumer derives.
-ABS_KEY=$(env -u CLAUDE_SESSION_ID -u CLAUDE_AGENT_ID bash -c '. "$0"; sable_evidence_key "" ""' "$LIB")
+# No CLAUDE_SESSION_ID AND no CLAUDE_CODE_SESSION_ID in the env — true absent
+# identity (the hccq trap covers the FIRST var; SABLE-0w0ou's fix now also
+# consults the second, so a genuinely absent-session test must unset BOTH, the
+# same isolation test-tree-claim.sh/test-sable-claim.sh already use, since
+# this harness's own real session sets CLAUDE_CODE_SESSION_ID ambiently). The
+# lib must derive a deterministic, non-empty ppid key — NEVER the
+# empty-session garbage path — and sable-test must write there. We confirm
+# the exact path via derive_key (a sibling subprocess with the SAME $PPID
+# frame), so this also proves the key sable-test writes is byte-identical to
+# the key another consumer derives.
+ABS_KEY=$(env -u CLAUDE_SESSION_ID -u CLAUDE_CODE_SESSION_ID -u CLAUDE_AGENT_ID bash -c '. "$0"; sable_evidence_key "" ""' "$LIB")
 # ^ derived with THIS shell as parent frame; sable-test below shares it.
 rm -f "$ABS_KEY"
 case "$ABS_KEY" in
@@ -103,7 +108,7 @@ if [ "$ABS_KEY" != "/tmp/tdd-evidence-" ] && [ -n "${ABS_KEY#/tmp/tdd-evidence-}
 else
   fail "S3-U3b: absent-session key is non-empty" "got: [$ABS_KEY]"
 fi
-env -u CLAUDE_SESSION_ID -u CLAUDE_AGENT_ID "$SABLE_TEST" bash -c 'exit 0' >/dev/null 2>&1; RC_ABS=$?
+env -u CLAUDE_SESSION_ID -u CLAUDE_CODE_SESSION_ID -u CLAUDE_AGENT_ID "$SABLE_TEST" bash -c 'exit 0' >/dev/null 2>&1; RC_ABS=$?
 if [ "$RC_ABS" -eq 0 ] && [ -s "$ABS_KEY" ]; then
   pass "S3-U3c: absent-session green run writes evidence at the ppid fallback key"
 else
@@ -171,10 +176,13 @@ rm -f "$INT_EV_R"
 # in the same process frame. Both are launched here as bare STATEMENTS (the gate
 # via a temp-file redirect, NOT a $(...)-wrapped pipeline — a cmdsubst pipeline
 # forks an extra subshell that shifts the hook's $PPID), so each resolves $PPID
-# to THIS test shell: the same real-world invariant, and the same key.
-ABS_INT_KEY=$(env -u CLAUDE_SESSION_ID -u CLAUDE_AGENT_ID bash -c '. "$0"; sable_evidence_key "" ""' "$LIB")
+# to THIS test shell: the same real-world invariant, and the same key. Both
+# CLAUDE_SESSION_ID and CLAUDE_CODE_SESSION_ID must be unset for the writer to
+# actually hit the ppid fallback (SABLE-0w0ou: sable-test now also consults
+# CLAUDE_CODE_SESSION_ID, which this harness's real session sets ambiently).
+ABS_INT_KEY=$(env -u CLAUDE_SESSION_ID -u CLAUDE_CODE_SESSION_ID -u CLAUDE_AGENT_ID bash -c '. "$0"; sable_evidence_key "" ""' "$LIB")
 rm -f "$ABS_INT_KEY"
-env -u CLAUDE_SESSION_ID -u CLAUDE_AGENT_ID "$SABLE_TEST" bash -c 'exit 0' >/dev/null 2>&1
+env -u CLAUDE_SESSION_ID -u CLAUDE_CODE_SESSION_ID -u CLAUDE_AGENT_ID "$SABLE_TEST" bash -c 'exit 0' >/dev/null 2>&1
 ABS_GATE_OUT_FILE=$(mktemp)
 gate_input 'bd close SABLE-stub SABLE-other' '' | env PATH="$STUB_DIR:$PATH" bash "$GATE_HOOK" > "$ABS_GATE_OUT_FILE" 2>/dev/null
 GATE_OUT_A=$(cat "$ABS_GATE_OUT_FILE"); rm -f "$ABS_GATE_OUT_FILE"
@@ -184,6 +192,64 @@ else
   fail "integration: absent-session sable-test green unblocks the real gate" "gate denied: $GATE_OUT_A; key=[$ABS_INT_KEY] exists=$([ -s "$ABS_INT_KEY" ] && echo yes || echo no)"
 fi
 rm -f "$ABS_INT_KEY"
+
+# ---------- SABLE-0w0ou: writer/reader key agreement via CLAUDE_CODE_SESSION_ID ----------
+# The actual defect: bin/sable-test read ONLY CLAUDE_SESSION_ID (empty in
+# every warm-pane worker), so it fell to the ppid fallback while
+# tdd-gate.sh's reader picked up the real, POPULATED session id from the
+# PreToolUse hook JSON — which in every hooks-fire session IS
+# CLAUDE_CODE_SESSION_ID. Prove the writer's key now equals the reader's key
+# in BOTH directions: CLAUDE_SESSION_ID absent (the real-world hccq-trap
+# shape, red before the fix) and CLAUDE_SESSION_ID present (must not regress
+# the already-working case).
+
+# (a) CLAUDE_SESSION_ID UNSET, CLAUDE_CODE_SESSION_ID set: writer key must
+# equal sable_evidence_key(<that value>, "") — the SAME key tdd-gate.sh
+# derives from a hook JSON session_id carrying that same value.
+OW_CCS="sable-test-owccs-$$-$RANDOM"
+WRITER_KEY=$(env -u CLAUDE_SESSION_ID -u CLAUDE_AGENT_ID CLAUDE_CODE_SESSION_ID="$OW_CCS" bash -c '. "$0"; sable_evidence_key "$(sable_resolve_session_id)" ""' "$LIB")
+READER_KEY=$(bash -c '. "$0"; sable_evidence_key "$1" ""' "$LIB" "$OW_CCS")
+if [ "$WRITER_KEY" = "$READER_KEY" ] && [ "$WRITER_KEY" = "/tmp/tdd-evidence-${OW_CCS}" ]; then
+  pass "SABLE-0w0ou: writer key (CLAUDE_SESSION_ID absent, CLAUDE_CODE_SESSION_ID set) equals reader key — $WRITER_KEY"
+else
+  fail "SABLE-0w0ou: writer key equals reader key (CLAUDE_SESSION_ID absent)" "writer=[$WRITER_KEY] reader=[$READER_KEY]"
+fi
+
+# (b) inverse: CLAUDE_SESSION_ID SET (already-working path) must still match,
+# and must WIN over a CLAUDE_CODE_SESSION_ID that disagrees with it — fixing
+# the absent case must not break the present case.
+OW_CSI="sable-test-owcsi-$$-$RANDOM"
+WRITER_KEY2=$(env -u CLAUDE_AGENT_ID CLAUDE_SESSION_ID="$OW_CSI" CLAUDE_CODE_SESSION_ID="sable-test-owccs-decoy" bash -c '. "$0"; sable_evidence_key "$(sable_resolve_session_id)" ""' "$LIB")
+READER_KEY2=$(bash -c '. "$0"; sable_evidence_key "$1" ""' "$LIB" "$OW_CSI")
+if [ "$WRITER_KEY2" = "$READER_KEY2" ] && [ "$WRITER_KEY2" = "/tmp/tdd-evidence-${OW_CSI}" ]; then
+  pass "SABLE-0w0ou: writer key (CLAUDE_SESSION_ID present) still equals reader key, CLAUDE_SESSION_ID wins over a disagreeing CLAUDE_CODE_SESSION_ID — $WRITER_KEY2"
+else
+  fail "SABLE-0w0ou: writer key equals reader key (CLAUDE_SESSION_ID present)" "writer=[$WRITER_KEY2] reader=[$READER_KEY2]"
+fi
+
+# (c) INTEGRATION (the acceptance criterion): a real sable-test green run,
+# identity available ONLY via CLAUDE_CODE_SESSION_ID (the actual shape of
+# every warm-pane worker's Bash tool-call environment), unblocks the REAL
+# tdd-gate.sh hook whose PreToolUse JSON session_id carries that SAME value.
+# A unit-level key match (a/b above) could pass while the composed
+# writer+reader pair still disagreed at runtime — this is what actually
+# shipped broken, so it is the real acceptance test.
+OW_INT_SID="sable-test-owint-$$-$RANDOM"
+OW_INT_EV="/tmp/tdd-evidence-${OW_INT_SID}"
+rm -f "$OW_INT_EV"
+env -u CLAUDE_SESSION_ID -u CLAUDE_AGENT_ID CLAUDE_CODE_SESSION_ID="$OW_INT_SID" "$SABLE_TEST" bash -c 'exit 0' >/dev/null 2>&1
+if [ -s "$OW_INT_EV" ]; then
+  pass "SABLE-0w0ou integration: sable-test (CLAUDE_CODE_SESSION_ID only) writes evidence at the JSON-derived key"
+else
+  fail "SABLE-0w0ou integration: sable-test (CLAUDE_CODE_SESSION_ID only) writes evidence at the JSON-derived key" "no $OW_INT_EV"
+fi
+OW_GATE_OUT=$(gate_input 'bd close SABLE-stub SABLE-other' "$OW_INT_SID" | env PATH="$STUB_DIR:$PATH" bash "$GATE_HOOK" 2>/dev/null)
+if [ -z "$OW_GATE_OUT" ]; then
+  pass "SABLE-0w0ou integration: the real gate ALLOWS the close (writer/reader agree, no manual CLAUDE_SESSION_ID export needed)"
+else
+  fail "SABLE-0w0ou integration: the real gate ALLOWS the close" "gate denied: $OW_GATE_OUT"
+fi
+rm -f "$OW_INT_EV"
 
 # ---------- INTEGRATION: real bd --sandbox close succeeds after sable-test green ----------
 # The worker's real workflow: run the suite through sable-test (green), then

@@ -205,6 +205,26 @@ Dispatch read-only Explore subagents in parallel, 1-3 beads per worker. Each wor
    - **(c) Fallback: LLM judgement** — read the cited files at HEAD, judge whether the bead's described issue still exists. If unclear, flag as `needs-verification-spec` rather than guessing.
 4. Report back: bead-id, classification, evidence
 
+**Your "current HEAD" can lag origin — verify presence with `sable-contained`,
+never a bare grep-and-assume, when the fingerprint comes back empty (SABLE-z9ux).**
+A local checkout that hasn't pulled a recent merge is not the same thing as
+code that was never written: during an active merge drain your checkout can
+sit commits behind origin, and a fingerprint grep that finds nothing cannot
+tell you which case you're in. Grepping "not found" and classifying
+`stale-fixed` on that alone conflates "the fix genuinely isn't here" with "I
+can't see it from where I'm standing" — exactly the distinction a hand-rolled
+probe cannot express. Before classifying a not-found fingerprint as
+`stale-fixed`/`stale-moved`, run `sable-contained --path <cited-file>` against
+the integration ref (or `sable-contained <sha>` for a cited commit). Exit 0
+CONTAINED / 1 NOT-CONTAINED confirms your grep; exit 3 the two methods
+DISAGREE or exit 4 COULD NOT ASSESS means your checkout cannot answer this —
+classify `needs-verification-spec` (or skip the bead this run) instead of a
+confident stale verdict. This already mattered once in the other direction: a
+victor presence determination at a specific HEAD correctly refuted a false
+NEUTRALIZED claim (SABLE-nsmc note 13, upheld by Lincoln at note 14) — your
+containment calls are load-bearing when they're right, so don't let a lagging
+checkout make one look wrong.
+
 Worker classifications (one per bead, can stack with `model-stale`):
 - `valid` — issue still reproduces / fingerprint matches / verification passes
 - `reference` — bead carries a `reference` or `runbook` label (or is

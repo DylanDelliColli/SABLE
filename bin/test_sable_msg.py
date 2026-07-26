@@ -9,6 +9,10 @@ in the pane, not just assumed from a zero exit code), and SABLE-6izz
 manager-name lookups never fall through to a worker pane's bead tag).
 """
 import importlib.util
+import json
+import os
+import re
+import shutil
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
@@ -335,6 +339,86 @@ def test_file_fallback_bead_creates_for_role_inbox_bead():
     joined = " ".join(argv)
     assert "for-optimus" in joined
     assert message in joined
+    assert "coord" in joined
+
+
+def test_file_fallback_bead_is_not_filed_p1():
+    """costing-comparison-573: an undelivered-message bead is an INBOX item, not
+    a work item. Filing it P1 sorted it ABOVE genuine P1 engineering work in
+    `bd ready` — one measured pool held 26 items of which 11 were these, all
+    outranking the real work. The fallback itself is correct and must keep
+    existing: it is what made this session's tmux delivery failures lossless.
+    Only its priority is wrong."""
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-ab12\n"
+        stderr = ""
+
+    def runner(args):
+        seen.append(args)
+        return R()
+
+    sable_msg.file_fallback_bead("lincoln", "optimus", "body", runner=runner)
+    argv = seen[0]
+    assert "--priority=1" not in argv, (
+        "fallback inbox beads must not be P1 — they bury real engineering work "
+        "in bd ready (costing-comparison-573)"
+    )
+    assert "--priority=3" in argv
+    # The for-ROLE label is how the recipient actually reads their inbox, so it
+    # must survive any change to pool membership.
+    assert "--labels=for-optimus,coord" in argv
+
+
+def test_fallback_bead_title_is_composed_from_the_framed_message_3mrv3():
+    """SABLE-3mrv3 regression. A recogniser for "did the fallback pollute the
+    live DB?" needs the bead's title. The first attempt hand-typed it as
+    '<prefix> <role>: <body>' — but every real call site passes the FRAMED
+    message, so the framing sits BETWEEN the role and the body and the guess
+    matched nothing. `bd count --title-contains <guess>` then returned 0
+    unconditionally: an assertion that could not fail, which is worse than the
+    global counter it replaced because it looks like coverage.
+
+    Pin both directions: the composed title is what file_fallback_bead actually
+    uses, and the naive hand-typed form is NOT a substring of it."""
+    body = "sandbox fallback probe"
+    framed = sable_msg.format_message("lincoln", "chuck", body)
+    title = sable_msg.fallback_bead_title("chuck", framed)
+
+    assert title == f"SABLE-MSG undelivered to chuck: {framed[:80]}"
+    assert sable_msg.HEADER in title, "the framing must be present in the title"
+    assert body in title
+
+    naive = f"SABLE-MSG undelivered to chuck: {body}"
+    assert naive not in title, (
+        "the hand-typed '<prefix> <role>: <body>' form must NOT match — if it "
+        "ever does, the SABLE-3mrv3 trap has silently reopened"
+    )
+
+
+def test_file_fallback_bead_uses_the_shared_title_and_label_helpers_3mrv3():
+    """The seam is only useful if the filer and the recogniser cannot drift:
+    file_fallback_bead must emit exactly what fallback_bead_title /
+    fallback_bead_labels produce, so a test deriving the title from those
+    helpers is guaranteed to match a real fallback bead."""
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-ab12\n"
+        stderr = ""
+
+    def runner(args):
+        seen.append(args)
+        return R()
+
+    framed = sable_msg.format_message("lincoln", "chuck", "sandbox fallback probe")
+    sable_msg.file_fallback_bead("lincoln", "chuck", framed, runner=runner)
+    argv = seen[0]
+    assert f"--title={sable_msg.fallback_bead_title('chuck', framed)}" in argv
+    assert f"--labels={sable_msg.fallback_bead_labels('chuck')}" in argv
 
 
 def test_file_fallback_bead_returns_none_when_bd_unavailable():
@@ -345,6 +429,185 @@ def test_file_fallback_bead_returns_none_when_bd_unavailable():
 
     assert sable_msg.file_fallback_bead("lincoln", "optimus", "msg",
                                         runner=lambda a: R()) is None
+
+
+# --- seat sightings (SABLE-441vl) -------------------------------------------
+#
+# CAPTURE IS MANDATORY, PRIORITY IS ADVISORY (cockpit ruling, 2026-07-22
+# 16:23, recorded as a comment on SABLE-441vl — NOT in its description, which
+# is why an earlier pass here built the wrong thing: a DENY hook on the
+# premise the seat cannot create beads at all. That premise is measured
+# FALSE). `--file-sighting` is a plain `bd create`, never refused or
+# deferred; hooks/multi-manager/seat-sighting-gate.sh annotates the result
+# AFTER it lands, for any chuck-identity `bd create` whether or not it went
+# through this wrapper.
+
+def test_file_sighting_bead_is_a_single_plain_create():
+    """One bd call, not two: capture is mandatory, so there is nothing to
+    defer and nothing to promote later."""
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-ab12\n"
+        stderr = ""
+
+    def runner(args):
+        seen.append(args)
+        return R()
+
+    bead_id = sable_msg.file_sighting_bead(
+        "chuck", "found a defect while verifying wk-foo", runner=runner)
+    assert bead_id == "SABLE-ab12"
+    assert len(seen) == 1
+    argv = seen[0]
+    assert argv[:2] == ["bd", "create"]
+    joined = " ".join(argv)
+    assert "SEAT-FILED:" in joined
+    assert "found a defect while verifying wk-foo" in joined
+    assert not any(a.startswith("--status") for a in argv), \
+        "capture is mandatory — a sighting must never be deferred"
+
+
+def test_file_sighting_bead_returns_none_when_bd_unavailable():
+    class R:
+        returncode = 1
+        stdout = ""
+        stderr = "bd: not a beads workspace"
+
+    assert sable_msg.file_sighting_bead("chuck", "text", runner=lambda a: R()) is None
+
+
+def test_sighting_bead_title_truncates_and_prefixes():
+    title = sable_msg.sighting_bead_title("x" * 200)
+    assert title.startswith(f"{sable_msg.SIGHTING_TITLE_PREFIX}: ")
+    assert title == f"{sable_msg.SIGHTING_TITLE_PREFIX}: {'x' * 80}"
+
+
+def test_main_file_sighting_bypasses_pane_lookup_entirely(monkeypatch, capsys):
+    """--file-sighting is a bd write, not a message: it must never touch
+    tmux/session resolution at all."""
+    monkeypatch.setattr(sable_msg, "resolve_session", lambda *a, **k: pytest.fail(
+        "a sighting must not resolve a tmux session"))
+    monkeypatch.setattr(sable_msg, "file_sighting_bead", lambda frm, text, **k: "SABLE-xyz")
+    rc = sable_msg.main(["--file-sighting", "--from", "chuck", "an observation"])
+    assert rc == 0
+    assert "SABLE-xyz" in capsys.readouterr().err
+
+
+def test_main_file_sighting_reports_failure_and_a_manual_fallback(monkeypatch, capsys):
+    monkeypatch.setattr(sable_msg, "resolve_session", lambda *a, **k: pytest.fail(
+        "a sighting must not resolve a tmux session"))
+    monkeypatch.setattr(sable_msg, "file_sighting_bead", lambda frm, text, **k: None)
+    rc = sable_msg.main(["--file-sighting", "--from", "chuck", "an observation"])
+    assert rc == 1
+    assert "could not file" in capsys.readouterr().err
+
+
+def test_parse_args_file_sighting_treats_the_single_positional_as_body():
+    """--file-sighting takes no to_role — argparse fills the first optional
+    positional (to_role) greedily, so parse_args must re-route it into body."""
+    ns = sable_msg.parse_args(["--file-sighting", "an observation body"])
+    assert ns.to_role is None
+    assert ns.body == "an observation body"
+
+
+def test_parse_args_still_requires_to_role_without_file_sighting():
+    with pytest.raises(SystemExit):
+        sable_msg.parse_args(["--body-file", "-"])
+
+
+SEAT_GATE_HOOK = Path(__file__).resolve().parent.parent / "hooks" / "multi-manager" / "seat-sighting-gate.sh"
+
+
+def _run_seat_gate(command, agent_name, agent_role="manager", stdout="", extra_env=None):
+    env = dict(os.environ)
+    if agent_name:
+        env["CLAUDE_AGENT_NAME"] = agent_name
+        env["CLAUDE_AGENT_ROLE"] = agent_role or ""
+    else:
+        env.pop("CLAUDE_AGENT_NAME", None)
+        env.pop("CLAUDE_AGENT_ROLE", None)
+    env.update(extra_env or {})
+    hook_input = json.dumps({
+        "tool_input": {"command": command},
+        "tool_response": {"stdout": stdout, "stderr": ""},
+    })
+    return subprocess.run(["bash", str(SEAT_GATE_HOOK)], input=hook_input, text=True,
+                          capture_output=True, env=env, timeout=10)
+
+
+def test_seat_gate_never_denies_a_normal_work_bd_create():
+    """THE property SABLE-441vl is accepted or rejected on, corrected against
+    the actual cockpit ruling: capture is MANDATORY, so a plain work `bd
+    create` from the seat's own identity must NEVER be refused. (An earlier,
+    wrong pass here asserted the opposite — that this must be denied unless
+    labeled a sighting. The ruling that reopened this bead exists precisely
+    because that premise was measured false.)"""
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    result = _run_seat_gate(
+        'bd create --title="fix the thing" --description="foo bar" --type=task',
+        agent_name="chuck", stdout="Created issue: SABLE-ab12 — fix the thing\n")
+    assert result.returncode == 0
+    assert "deny" not in result.stdout
+
+
+def test_seat_gate_annotates_the_created_bead_afterward(monkeypatch, tmp_path):
+    """The hook's actual job: after a successful chuck-identity `bd create`,
+    it runs a follow-up `bd update <id> --add-label seat-filed
+    --set-metadata priority_provisional=true`. Verified end to end against a
+    real, throwaway bd DB (real bd or self-skip — no mocks)."""
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    if shutil.which("bd") is None:
+        pytest.skip("bd not on PATH")
+    beads_root = tmp_path / "beads"
+    beads_root.mkdir()
+    init = subprocess.run(["bd", "init", "--prefix=sga"], cwd=str(beads_root),
+                          env={**os.environ, "BD_NON_INTERACTIVE": "1"},
+                          text=True, capture_output=True, timeout=60)
+    assert init.returncode == 0, init.stdout + init.stderr
+    beads_db = str(beads_root / ".beads")
+
+    created = subprocess.run(
+        ["bd", "create", "--title=found a defect", "--description=text [no-test]",
+         "--type=task"],
+        env={**os.environ, "BEADS_DB": beads_db}, text=True, capture_output=True, timeout=30)
+    assert created.returncode == 0, created.stdout + created.stderr
+    bead_id = re.search(r"Created issue:\s*(\S+)", created.stdout).group(1)
+
+    result = _run_seat_gate(
+        'bd create --title="found a defect" --description="text [no-test]" --type=task',
+        agent_name="chuck", stdout=created.stdout, extra_env={"BEADS_DB": beads_db})
+    assert result.returncode == 0
+    # The hook's own `bd update` call must reach the SAME isolated DB.
+    show = subprocess.run(["bd", "show", bead_id, "--json"],
+                          env={**os.environ, "BEADS_DB": beads_db}, text=True,
+                          capture_output=True, timeout=30)
+    data = json.loads(show.stdout)
+    data = data[0] if isinstance(data, list) else data
+    assert "seat-filed" in (data.get("labels") or [])
+    assert (data.get("metadata") or {}).get("priority_provisional") in (True, "true", "True")
+
+
+def test_seat_gate_ignores_non_seat_identities():
+    """Every other manager's `bd create` — the ordinary work-filing path —
+    must pass through untouched. This hook has exactly one job."""
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    result = _run_seat_gate(
+        'bd create --title="fix the thing" --description="foo bar" --type=task',
+        agent_name="optimus", stdout="Created issue: SABLE-ab12 — fix the thing\n")
+    assert result.returncode == 0
+
+
+def test_seat_gate_ignores_commands_that_are_not_bd_create():
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    result = _run_seat_gate("bd show SABLE-x", agent_name="chuck")
+    assert result.stdout.strip() == ""
+    assert result.returncode == 0
 
 
 # --- deliver_message: stub-tmux retry + verification (SABLE-bq93) -----------
@@ -1301,6 +1564,106 @@ def test_main_bead_addressed_only_done_pane_errors_with_reap_hint_qq6r(monkeypat
     assert "SABLE-pi5m" in err
     assert "done" in err
     assert "reap" in err.lower()
+
+
+# --- --body-file: caller-shell command-substitution hazard (SABLE-tmbx1) ----
+# The inline <body> positional is parsed by the CALLING shell before sable-msg
+# ever sees it: a body composed inside a double-quoted shell argument has its
+# backticks/$(...) command-substituted THERE, and the substituted command
+# actually runs. sable-msg cannot detect this — by the time argv reaches
+# main() the damage is already done. --body-file sidesteps the hazard
+# entirely by reading the body from a file (or stdin), which no shell ever
+# re-parses. These assertions use REAL metacharacter content, not an innocent
+# fixture — an implementation that regressed to string-interpolating the body
+# through a shell somewhere would fail them.
+
+HAZARDOUS_BODY = "see `hostname` and $(id) for the failing host — do not run this"
+
+
+def test_parse_args_body_file_flag_alone():
+    ns = sable_msg.parse_args(["optimus", "--body-file", "/tmp/whatever"])
+    assert ns.body is None
+    assert ns.body_file == "/tmp/whatever"
+
+
+def test_parse_args_body_and_body_file_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        sable_msg.parse_args(["optimus", "inline text", "--body-file", "/tmp/x"])
+
+
+def test_resolve_body_returns_inline_positional_when_no_body_file():
+    ns = sable_msg.parse_args(["optimus", HAZARDOUS_BODY])
+    assert sable_msg.resolve_body(ns) == HAZARDOUS_BODY
+
+
+def test_resolve_body_reads_hazardous_content_from_file_verbatim(tmp_path):
+    body_path = tmp_path / "body.txt"
+    body_path.write_text(HAZARDOUS_BODY, encoding="utf-8")
+    ns = sable_msg.parse_args(["optimus", "--body-file", str(body_path)])
+    assert sable_msg.resolve_body(ns) == HAZARDOUS_BODY
+
+
+def test_resolve_body_reads_hazardous_content_from_stdin_dash():
+    import io
+    ns = sable_msg.parse_args(["optimus", "--body-file", "-"])
+    fake_stdin = io.StringIO(HAZARDOUS_BODY)
+    assert sable_msg.resolve_body(ns, stdin=fake_stdin) == HAZARDOUS_BODY
+
+
+def test_main_body_file_delivers_hazardous_content_unmodified(monkeypatch, tmp_path):
+    # NEGATIVE-CONTROL-SHAPED: this is an equality assertion against literal
+    # backticks/$(...) — a regression that re-introduced shell interpolation
+    # anywhere in this path would corrupt the string and fail it, not pass
+    # vacuously the way a metacharacter-free fixture would.
+    body_path = tmp_path / "body.txt"
+    body_path.write_text(HAZARDOUS_BODY, encoding="utf-8")
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+    delivered = {}
+
+    def fake_deliver(pane, message, interrupt, **kwargs):
+        delivered["message"] = message
+        return True
+
+    monkeypatch.setattr(sable_msg, "deliver_message", fake_deliver)
+    rc = sable_msg.main(["optimus", "--body-file", str(body_path), "--from", "lincoln"])
+    assert rc == 0
+    assert "message" in delivered
+    assert "`hostname`" in delivered["message"]
+    assert "$(id)" in delivered["message"]
+    assert delivered["message"] == sable_msg.format_message("lincoln", "optimus", HAZARDOUS_BODY)
+
+
+def test_body_file_content_never_reaches_a_shell(monkeypatch, tmp_path):
+    # Assert no subprocess is spawned FROM the content of the body at all —
+    # not merely that delivery "looks right". Every subprocess.run call made
+    # anywhere below main() is recorded; none may carry the hazardous
+    # substring or shell=True.
+    import subprocess as subprocess_module
+
+    marker = "$(id)"
+    body_path = tmp_path / "body.txt"
+    body_path.write_text(f"see `hostname` and {marker} now", encoding="utf-8")
+
+    calls = []
+    real_run = subprocess_module.run
+
+    def spying_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_run(["true"], capture_output=True, text=True)
+
+    monkeypatch.setattr(subprocess_module, "run", spying_run)
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
+
+    rc = sable_msg.main(["optimus", "--body-file", str(body_path), "--from", "lincoln"])
+    assert rc == 0
+    for args, kwargs in calls:
+        flat = " ".join(str(a) for a in args)
+        assert marker not in flat
+        assert "hostname" not in flat
+        assert kwargs.get("shell") is not True
 
 
 if __name__ == "__main__":
