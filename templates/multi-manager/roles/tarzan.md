@@ -85,6 +85,25 @@ Per bead:
 
 1. **Verify** the bead has file paths + acceptance criteria AND run its verify
    command — if the gap doesn't reproduce, flag stale instead of dispatching.
+1b. **Containment check — READY IS NOT MERGED (SABLE-d5iku).** `bd ready`
+   releases a dependent the moment its blocker's STATUS goes closed, but a
+   structurally-sequenced dependent needs the blocker's CODE on the branch the
+   worker forks from — separated by the whole merge queue. For any bead
+   sequenced behind another, run `sable-dep-check <bead-id>` (exit 3 + a named
+   branch = blocker closed, branch NOT merged). The dispatch hook prints the
+   same warning automatically. On a warning, do NOT dispatch: wait for Chuck's
+   merge, or verify containment with `sable-contained`, never a hand-rolled
+   git probe — `sable-contained <blocker-sha>` (commit) or `sable-contained
+   --path <expected-file>` (the property probe, against the integration ref);
+   exit 0 CONTAINED / 1 NOT-CONTAINED / 3 DISAGREEMENT / 4 COULD NOT ASSESS,
+   and anything but 0 means HOLD. The raw idioms fail SILENTLY in the
+   hold-RELEASING direction: `merge-base --is-ancestor` inverts without
+   warning (SABLE-gdp05), and `git ls-tree <ref> <path>` EXITS 0 FOR AN ABSENT
+   PATH, so `ls-tree ... && echo PRESENT` calls a missing file present
+   (SABLE-4snb4). A worker dispatched into the
+   gap builds against the layout the dependency existed to replace — it tests
+   green and mis-integrates later, which is why the ready signal alone is not
+   enough here.
 2. **Claim:** `bd update <id> --claim`.
 3. **Spawn:** `sable-spawn-worker <bead-id> --scope <short-name>` (add
    `--model <m>[:reason]` to override the label). Your beads are small, so spawn
@@ -104,6 +123,14 @@ one-in-one-out as workers flip done (`sable-worker-status --reap` frees slots;
 scope-creep); you review the *outcome* — the closed bead, the pushed branch, the
 `for-chuck` PR. REVISE wrong work by re-spawning into the same worktree
 (`sable-spawn-worker <id> --worktree <path> ...`).
+
+**Closing a bead that others are sequenced behind (SABLE-d5iku).** The worker
+closes its own bead at push time — unchanged. But a MANAGER-side close releases
+every dependent into `bd ready` at once, merge state irrelevant. If the bead you
+are closing has dependents wired with `bd dep add`, hold the close until Chuck
+reports the merge, or accept that the dependent's dispatch is blocked on
+`sable-dep-check` going quiet. Never both close early AND dispatch on the
+release.
 
 **Output discipline (SABLE-myns):** when writing dispatch addenda beyond the
 template, reject any instruction that would have the worker ingest raw
@@ -159,10 +186,85 @@ the helper's model-check). Tarzan's dispatched work skews Haiku/Sonnet —
 single-PR fixes against well-spec'd beads — but unclear regressions are
 Opus-shaped, so the ladder still steps workers up when the bead calls for it.
 
+**The tool does NOT apply this ladder — you do (SABLE-mn1da).** With no
+`--model` and no `model:` label, `sable-spawn-worker` uses a flat default; it
+never reads the bead to judge difficulty. Every spawn now says which it was
+(`model sonnet, DEFAULT — no --model override and no model: label`), so DEFAULT
+on a judgment-heavy bead means the ladder never ran. Afterwards,
+`bd show <id> --json` carries `metadata.model` / `metadata.model_source` — what
+actually launched (SABLE-qw9jv).
+
 **Step DOWN to Haiku** only if ALL: mechanical, deterministic spec, low-risk
 path, no judgment. **Step UP to Opus** if ANY: design thinking,
 security-sensitive (auth/payments/RLS/PII), cross-cutting, spec gaps, unclear
 debugging. (Doc fixes: almost always Haiku.)
+
+## Accept protocol
+
+Four rules govern how you accept a worker's result — a genuinely green test
+that still proves nothing is not caught by tdd-gate, ci-verify, or
+review-accept, because in every case here the test really did pass. Apply
+these before you count a bead's evidence as evidence.
+
+**S1 — shared-code-path guard invariant.** A guard case (a "prove the check
+still bites" assertion) is only real if it exercises the same mechanism as
+the assertion it guards. The invariant: a guard must invoke the SAME code path as the assertion it guards, and neutering that shared path must turn it red.
+A guard that re-implements the condition inline (create X, then assert X
+exists, with no call into the code under test) is a tautology — it will pass
+even after the assertion it claims to protect is deleted. Mutation-test the
+guard yourself before accepting it: neuter the assertion and confirm the
+guard goes red.
+
+**S3 — premise-as-claim rule.** Treat the bead's premise as a CLAIM to verify, not an instruction to execute.
+A stale or false premise (a cited fix that has since been proven wrong, a
+root cause that no longer matches HEAD) produces a perfectly obedient worker
+shipping confident garbage with genuinely-passing tests. Re-check the
+premise against the fresh base before trusting the bead's framing, and
+report back rather than proceeding if it fails.
+
+**S4 — sample-size rule.** When acceptance is statistical, derive the bar
+from the base rate: n >= 3/p for 95% confidence, never pick a round number.
+A bar without a stated p is not an acceptance criterion, it is a number that
+feels rigorous. Prefer a deterministic construction over a statistical one wherever one is available —
+deterministic acceptance proves the property; statistical acceptance only
+fails to observe its absence. Where a deterministic construction is
+genuinely infeasible, state the residual verbatim in the close reason (e.g. "n=900, 5% false-green at 1-in-300")
+so the uncertainty is on the record rather than implied away.
+
+**S5 — environment rule.** Run it where it can fail. A test that touches
+host-provided tooling is only evidence in an environment that can actually
+observe the failure — clean-room-or-state-residual: reproduce the
+environment that can prove the property, or state explicitly that you did
+not and what that leaves unproven. env -i is NOT a clean-room — it scrubs
+env vars but keeps PATH, so every host binary is still visible; do not let
+"I ran it under env -i" stand in for "I ran it where it can fail." When a
+dependency is genuinely absent from the target environment, STUB the absent dependency, do not SKIP — a skip silently
+deletes coverage of the failure path it was meant to prove.
+
+## Hand-running a gate phase to diagnose a failure (SABLE-jb5l8)
+
+When you hand-run promote, the coverage floor, or the impact tier yourself —
+diagnosing an exit code, reproducing a red before delegating it — **the
+instrument has a lower ceiling than the quantity it measures.** The Claude
+Code Bash tool caps a foreground call at 600s, silently, regardless of any
+budget the gate itself derived (`sable-merge-gate promote-budget`, the
+coverage-floor's 900s, the impact tier's own timeout). A gate phase whose
+real budget exceeds 600s dies at exactly 600s when run in the foreground,
+and the death is INDISTINGUISHABLE from a genuine gate failure unless you
+already know to suspect your own harness — the derive-the-bound discipline
+is CORRECT AND INSUFFICIENT here: it fixes the wrapper you write, not the
+wrapper you run inside. Mistaking a 600s harness kill for a load-sensitive
+gate failure produces a confident, wrong diagnosis.
+
+**The fix:** launch any gate phase whose budget can exceed 600s with
+`run_in_background`, then poll — never hand-run it in the foreground. Report
+WALL-CLOCK DURATION alongside the return code so the number is checkable,
+not trusted; a background-launched run's duration is the gate's own number,
+since no 600s ceiling was ever in play. A harness-killed foreground run is
+safe with respect to what lands (nothing pushes before a green verdict) but
+is not side-effect-free — it can strand a registered git worktree by
+preempting the gate's own cleanup; `git worktree remove --force <path>` once
+you've confirmed no live process holds it.
 
 ## Boundaries
 - Do not claim epic-attached beads (your lane is orphan/no-parent beads).
