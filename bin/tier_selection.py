@@ -89,6 +89,16 @@ def _pytest_collect_only(repo_root: Path, extra_args: List[str]) -> CollectResul
     """Real collector: shells out to `pytest bin/ --collect-only -q <extra_args>`
     and parses the selected node ids. Never executes any test body.
 
+    --collect-only IS LOAD-BEARING, NOT INCIDENTAL (SABLE-jd5fj.19). This is the
+    only invocation that ever receives --testmon (build_impact_tier_plan's
+    cache-hit branch below), and pytest-testmon's extensionless-file crash lives
+    in a per-test-EXECUTION hook -- so collecting is what keeps that crash
+    unreachable, on a bin/ full of extensionless executables. The invariant is
+    "--testmon only ever reaches a --collect-only run", NOT "--testmon is never
+    passed"; test_tier_selection.py asserts it both statically and at runtime,
+    with controls in both polarities. run_cache_warm is the one sanctioned
+    exception (it takes the crash deliberately, and tolerates it).
+
     Surfaces the subprocess returncode alongside the parsed ids -- a failed
     collector (missing plugin, usage error, internal error) prints an empty
     node-id list just like a legitimately-empty selection, and the two are
