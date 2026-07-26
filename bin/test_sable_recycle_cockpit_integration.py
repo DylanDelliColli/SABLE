@@ -32,6 +32,7 @@ one flow: keys land ONLY at idle (busy first, refused, no keys recorded) and
 boot is observed (idle second, keys land, marker appears).
 """
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -149,12 +150,15 @@ def _capture(sock, target):
 # erased screen. This reproduces the bead notes' verified real-TUI signature:
 # after a genuine reboot, full scrollback shows the banner exactly once with
 # nothing above it.
+# The banner text lives in a FILE (not an env var / inline script literal)
+# so a real embedded newline (splitting the banner from the marker line)
+# never has to survive quoting through the tmux new-session command string.
 _COCKPIT_STUB = r'''#!/usr/bin/env bash
 STATUS_ROW=1
 PROMPT_ROW=2
 boot_now() {
   printf '\033[2J\033[3J\033[H'
-  printf 'Claude Code v9.9.9 (stand-in)\n[bd prime] fresh session booted\n'
+  cat "$BANNER_FILE"
   STATUS_ROW=4
   PROMPT_ROW=5
 }
@@ -182,11 +186,25 @@ while true; do
 done
 '''
 
+# Standard banner: real boot renders both the banner AND this repo's actual
+# SessionStart marker ('[bd prime]').
+_BANNER_WITH_MARKER = "Claude Code v9.9.9 (stand-in)\n[bd prime] fresh session booted\n"
 
-def _start_cockpit_pane(sock, tmp_path, start_busy, start_booted=False):
+# SABLE-vsfvl Defect 1 repro banner: a real boot that renders ONLY the
+# banner, never '[bd prime]' — the exact host condition that produced the
+# false BOOT-NOT-OBSERVED (that hook's payload truncated-and-persisted to a
+# file instead of rendering into the pane). Proves the fix end-to-end
+# against a real tmux pane, not just the unit-level predicate.
+_BANNER_ONLY = "Claude Code v9.9.9 (stand-in)\n"
+
+
+def _start_cockpit_pane(sock, tmp_path, start_busy, start_booted=False,
+                        banner=_BANNER_WITH_MARKER):
     rec = tmp_path / "rec.txt"
     busy_flag = tmp_path / "busy_flag"
     booted_flag = tmp_path / "booted_flag"
+    banner_file = tmp_path / "banner.txt"
+    banner_file.write_text(banner)
     script = tmp_path / "cockpit_stub.sh"
     script.write_text(_COCKPIT_STUB)
     script.chmod(0o755)
@@ -199,7 +217,8 @@ def _start_cockpit_pane(sock, tmp_path, start_busy, start_booted=False):
     if start_booted:
         booted_flag.touch()
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
-          f"REC_FILE={rec} BUSY_FLAG={busy_flag} BOOTED_FLAG={booted_flag} bash {script}")
+          f"REC_FILE={rec} BUSY_FLAG={busy_flag} BOOTED_FLAG={booted_flag} "
+          f"BANNER_FILE={banner_file} bash {script}")
     time.sleep(0.5)
     return rec, busy_flag, booted_flag
 
@@ -246,8 +265,14 @@ def test_full_recycle_against_scratch_tmux_session(bd_sandbox, tmux_socket, tmp_
     busy_flag.unlink()
     r_idle = _run(common_args, work, home, check=False)
     assert r_idle.returncode == 0, r_idle.stdout
-    # bare bead id printed for the initiator to relay (last line of stdout)
-    assert r_idle.stdout.strip().splitlines()[-1] == bead_id
+    # An ingestion INSTRUCTION is printed for the initiator to relay
+    # (SABLE-vsfvl Defect 2), not the bare bead id — the bare id delivered
+    # successfully still failed to make a fresh agent treat it as its boot
+    # document.
+    relay_line = r_idle.stdout.strip().splitlines()[-1]
+    assert bead_id in relay_line
+    assert relay_line != bead_id
+    assert "bd show" in relay_line
 
     assert _wait_until(lambda: "/clear" in (rec.read_text() if rec.exists() else "")), \
         "the /clear keystroke must have actually landed in the pane"
@@ -267,7 +292,10 @@ def test_already_recycled_pane_is_a_noop_and_still_relays(bd_sandbox, tmux_socke
              "--boot-timeout", "6"], work, home, check=False)
     assert r.returncode == 0, r.stdout
     assert "already" in r.stdout.lower()
-    assert r.stdout.strip().splitlines()[-1] == bead_id
+    relay_line = r.stdout.strip().splitlines()[-1]
+    assert bead_id in relay_line
+    assert relay_line != bead_id
+    assert "bd show" in relay_line
     rec_text = rec.read_text() if rec.exists() else ""
     assert "/clear" not in rec_text, "an already-recycled pane must never receive /clear"
 
@@ -285,3 +313,59 @@ def test_stale_shift_report_refuses_without_touching_the_pane(bd_sandbox, tmux_s
     time.sleep(0.5)
     rec_text = rec.read_text() if rec.exists() else ""
     assert "/clear" not in rec_text
+
+
+def test_boot_observed_via_banner_when_sessionstart_marker_never_renders(bd_sandbox, tmux_socket, tmp_path):
+    """SABLE-vsfvl Defect 1, reproduced end-to-end against a real pane: a
+    real boot that renders ONLY the banner, never '[bd prime]' (the exact
+    host condition: that hook's SessionStart payload gets
+    truncated-and-persisted to a file, "Output too large ... Full output
+    saved to...", instead of reaching the pane) must still be judged
+    BOOT-OBSERVED (exit 0), not the false-negative BOOT-NOT-OBSERVED
+    (exit 4) the unfixed tool returned on this exact condition."""
+    work, home = bd_sandbox
+    bead_id = _plant_shift_report(work, home)
+    rec, busy_flag, booted_flag = _start_cockpit_pane(
+        tmux_socket, tmp_path, start_busy=False, banner=_BANNER_ONLY)
+
+    r = _run(["python3", str(BIN), bead_id, "--pane", "w", "--socket", tmux_socket,
+             "--max-age-seconds", "3600", "--idle-timeout", "3", "--poll-interval", "0.3",
+             "--boot-timeout", "6"], work, home, check=False)
+    assert r.returncode == 0, r.stdout
+    assert _wait_until(lambda: "/clear" in (rec.read_text() if rec.exists() else "")), \
+        "the /clear keystroke must have actually landed in the pane"
+    assert _wait_until(booted_flag.exists), "the stand-in never observed a real reboot"
+    # Ground truth: the marker this fix stops depending on exclusively is
+    # genuinely absent from the pane, so the boot really was detected via
+    # the banner channel, not by accident.
+    assert "[bd prime]" not in _capture(tmux_socket, "w")
+
+
+def test_duty_is_executable_as_written(bd_sandbox, tmux_socket, tmp_path):
+    """SABLE-uc7kh: exercises the LITERAL command line documented in
+    optimus.md's "Recycling the cockpit" section, not a hand-retyped copy —
+    the doc and the tool cannot drift apart without this test going red."""
+    card = (Path(__file__).resolve().parent.parent / "templates" / "multi-manager"
+           / "roles" / "optimus.md").read_text()
+    match = re.search(r"sable-recycle-cockpit <shift-report-bead-id> (--pane \S+)", card)
+    assert match, "optimus.md must document a literal sable-recycle-cockpit invocation"
+    pane_args = match.group(1).split()  # ["--pane", "%0"]
+
+    work, home = bd_sandbox
+    bead_id = _plant_shift_report(work, home)
+    # A fresh isolated tmux server assigns %0 to the FIRST pane it ever
+    # spawns, so the role card's literal "--pane %0" targets the real pane
+    # here without retyping the doc's text.
+    rec, _busy_flag, booted_flag = _start_cockpit_pane(tmux_socket, tmp_path, start_busy=False)
+
+    # The documented command has no --socket (it assumes the operator's
+    # default tmux server); route it to this test's isolated server the
+    # same way the tool itself resolves a default -- via SABLE_TMUX_SOCKET
+    # -- rather than appending an undocumented flag to the extracted text.
+    r = _run(["python3", str(BIN), bead_id] + pane_args, work, home,
+             extra_env={"SABLE_TMUX_SOCKET": tmux_socket}, check=False)
+    assert r.returncode == 0, r.stdout
+    assert bead_id in r.stdout
+    assert _wait_until(lambda: "/clear" in (rec.read_text() if rec.exists() else "")), \
+        "the documented command must actually recycle the pane"
+    assert _wait_until(booted_flag.exists)
