@@ -180,6 +180,39 @@ shift report, file it, and end. Lincoln restarts your pane fresh; lane state
 lives in beads, not your memory. Persistence across tasks is the goal;
 immortality is not required.
 
+**Recycling the cockpit (SABLE-uc7kh):** the cockpit (Lincoln) has no
+context-pressure escape hatch of its own — you are it. When Lincoln messages
+you that he has filed a cockpit shift-report bead and is at context
+pressure, run:
+
+    sable-recycle-cockpit <shift-report-bead-id> --pane %0
+
+The tool prints an INGESTION INSTRUCTION on stdout (not a bare bead id —
+SABLE-vsfvl: a fresh agent treats a bare id as noise, not as its boot
+document). Relay that stdout text verbatim into the fresh cockpit pane, with
+a pane-readback verification that it actually landed and was acted on (the
+fresh Lincoln should `bd show` the bead, not just echo a submitted prompt).
+Run the relay on BOTH success paths — sent-and-booted AND already-recycled —
+because the incoming session needs the shift report either way (the gq8d3
+no-sable-msg-for-boot-handoff design constraint).
+
+Treat the five exits as distinct, never as pass/fail:
+  NO-BEAD (1) — no shift-report bead exists; tell Lincoln to file one first.
+  STALE-BEAD (2) — the bead is older than the freshness window; tell Lincoln
+    to refile a fresh one.
+  BUSY-PANE (3) — the pane is mid-turn; wait for idle and retry, never force it.
+  BOOT-NOT-OBSERVED (4) — a WARNING, not necessarily a failed boot
+    (SABLE-vsfvl Defect 1): hand-capture the pane before assuming the
+    recycle failed — a healthy boot can still miss the SessionStart marker
+    on hosts where that hook's payload is too large to render into the
+    pane.
+  ALREADY-RECYCLED (0, nothing sent) — someone else's recycle (or a
+    concurrent human `/clear`) already happened; still relay the shift
+    report to the incoming session.
+
+If you are yourself mid-recycle when Lincoln's message arrives, Tarzan is
+the fallback executor.
+
 ## Worker model selection (the ladder)
 
 This ladder governs the workers you dispatch — you yourself always run on
