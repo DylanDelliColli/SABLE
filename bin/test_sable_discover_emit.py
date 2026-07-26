@@ -6,6 +6,7 @@ epic_intention linkage) + a decision record with EVERY candidate verdict and the
 no-go rationale verbatim. no-go candidates get NO charter file.
 """
 import importlib.util
+import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -74,3 +75,41 @@ def test_emit_survivor_requires_epic_intention(monkeypatch, tmp_path):
     bad = {"session": "s", "candidates": [{"title": "X", "verdict": "go", "rationale": "r"}]}
     with pytest.raises(Exception):
         sde.emit(bad)
+
+
+# --- gitignore check-ignore branch behavior (SABLE-lavb) --------------------
+# sable_charter_lib.write_charter/write_decision_record now run every emitted
+# path through ensure_charter_committable; emit() re-checks each written path
+# and surfaces any un-cleared warning in the result JSON (not just stderr),
+# since callers of this script parse stdout, not stderr.
+
+def test_emit_charter_committable_when_dot_claude_gitignored(monkeypatch, tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text(".claude/\n")
+    charters = tmp_path / ".claude" / "sable" / "charters"
+    monkeypatch.setenv("SABLE_CHARTERS_DIR", str(charters))
+
+    out = sde.emit(_triage())
+
+    assert "warnings" not in out  # auto-carve cleared the ignore
+    charter_path = charters / "real-time-alerts.md"
+    assert charter_path.exists()
+    ci = subprocess.run(
+        ["git", "-C", str(tmp_path), "check-ignore", "-q",
+         str(charter_path.relative_to(tmp_path))])
+    assert ci.returncode == 1  # not ignored -> committable
+    gi_text = (tmp_path / ".gitignore").read_text()
+    assert "!.claude/sable/charters/**" in gi_text
+
+
+def test_emit_surfaces_warning_when_autofix_cannot_clear(monkeypatch, tmp_path):
+    monkeypatch.setenv("SABLE_CHARTERS_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sde.lib, "ensure_charter_committable",
+        lambda path: f"sable-charter: WARNING - {path} still ignored")
+
+    out = sde.emit(_triage())
+
+    # 2 survivor charters + 1 decision record == 3 writes, all "still ignored"
+    assert len(out["warnings"]) == 3
+    assert all("WARNING" in w for w in out["warnings"])

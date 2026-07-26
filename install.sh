@@ -440,13 +440,73 @@ echo "The SessionStart sable-doctor entry above warns (non-fatal) at session sta
 echo "when your installed ~/.claude drifts from this repo — see SABLE-1i6m / bin/sable-doctor."
 echo
 
+# 9. Record install provenance (SABLE-78kxu) — without this, "is X deployed?"
+# is unanswerable: sable-doctor's manifest check only asks "do installed files
+# MATCH the tree?", so a file that doesn't exist in the tree yet is invisible
+# to it and a "clean" report is fully compatible with a not-yet-merged guard
+# being entirely absent. Best-effort: a repo dir that isn't a git checkout
+# (unlikely for this installer) skips silently rather than failing the install.
+bold "Recording install provenance"
+if [ "$DRY_RUN" = "1" ]; then
+    yellow "  would write: ${CLAUDE_DIR}/.sable-install-provenance"
+elif command -v git >/dev/null 2>&1 && PROV_SHA="$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null)"; then
+    PROV_BRANCH="$(git -C "${REPO_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")"
+    # "dirty" is a reproducibility claim: can the recorded SHA reconstruct the
+    # INSTALLED SET? install.sh installs TRACKED content, so only tracked
+    # modifications break that (-uno excludes untracked entries). Untracked
+    # presence is a different fact — it does not affect reproducibility from
+    # the recorded SHA — so it gets its own field rather than being folded
+    # into "dirty" (SABLE-dt92b: an untracked-only tree was stamping DIRTY /
+    # "not reproducible", which is false).
+    if [ -n "$(git -C "${REPO_DIR}" status --porcelain -uno 2>/dev/null)" ]; then
+        PROV_DIRTY="true"
+    else
+        PROV_DIRTY="false"
+    fi
+    if git -C "${REPO_DIR}" status --porcelain 2>/dev/null | grep -q '^??'; then
+        PROV_UNTRACKED="true"
+    else
+        PROV_UNTRACKED="false"
+    fi
+    PROV_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    {
+        printf 'commit=%s\n' "${PROV_SHA}"
+        printf 'branch=%s\n' "${PROV_BRANCH}"
+        printf 'dirty=%s\n' "${PROV_DIRTY}"
+        printf 'untracked=%s\n' "${PROV_UNTRACKED}"
+        printf 'timestamp=%s\n' "${PROV_TIMESTAMP}"
+    } > "${CLAUDE_DIR}/.sable-install-provenance"
+    PROV_NOTE=""
+    if [ "${PROV_DIRTY}" = "true" ]; then
+        PROV_NOTE="DIRTY tree — not reproducible"
+    fi
+    if [ "${PROV_UNTRACKED}" = "true" ]; then
+        if [ -n "${PROV_NOTE}" ]; then
+            PROV_NOTE="${PROV_NOTE}; untracked files present"
+        else
+            PROV_NOTE="untracked files present"
+        fi
+    fi
+    if [ -n "${PROV_NOTE}" ]; then
+        green "  installed from ${PROV_SHA} (${PROV_BRANCH}) — ${PROV_NOTE}"
+    else
+        green "  installed from ${PROV_SHA} (${PROV_BRANCH})"
+    fi
+else
+    yellow "  Could not determine repo commit (not a git checkout?) — skipping provenance stamp."
+fi
+echo
+
 bold "Orchestration hooks"
 echo "The orchestration settings snippet was merged into the scope's settings file"
 echo "automatically by sable-orchestration-install (backed up; existing entries kept)."
 echo "sable-orchestration-install also STAGES (never activates) the reconciliation"
 echo "floor's host timer artifacts (systemd --user unit + cron fallback line) under"
-echo "${CLAUDE_DIR}/sable/reconcile-timer/ — see its own output above for the"
-echo "activation commands (SABLE-jfg6.5 / D3 TIMER LEG)."
+echo "${CLAUDE_DIR}/sable/reconcile-timer/. Activate with the ONE self-verifying"
+echo "command it prints above — 'sable-reconcile-timer --install-schedule' — and"
+echo "re-check any time with 'sable-reconcile-timer --check-schedule --repo <repo>',"
+echo "which fails loudly when nothing is scheduled OR when what is scheduled sweeps"
+echo "a different repo (SABLE-jfg6.5 / D3 TIMER LEG; SABLE-5xz68)."
 echo
 
 bold "Install complete."

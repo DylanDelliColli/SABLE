@@ -315,7 +315,15 @@ def _payload(session_id: str, agent_id: str = "") -> str:
 
 def _fire_once(hook: Path, env: dict, stdin_data: str) -> None:
     """Invoke one hook exactly as PreToolUse would: piped stdin, argv tool-hint.
-    Failsafe — a hook that errors must not abort the matrix run."""
+    Failsafe — a hook that errors must not abort the matrix run.
+
+    SABLE-6sdpx audit: genuinely fire-and-forget, not a swallowed failure.
+    The CompletedProcess (and its returncode) is intentionally discarded —
+    this harness's signal is the two observer log files the hook writes as a
+    side effect (control-trace.log / hook-trace.log), read back separately by
+    drive_real_cell, never the hook's own exit code. A crashing hook still
+    produces its ground-truth log entries or doesn't; either way that is what
+    the matrix measures."""
     try:
         subprocess.run(
             ["bash", str(hook), "Bash"],

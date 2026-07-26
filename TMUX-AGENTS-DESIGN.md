@@ -174,7 +174,12 @@ Conclusion: the Lincoln→busy-manager path works with nothing dropped, and
 - Chuck's merge-queue role and the `for-chuck` handoff.
 - The bead pool as "the plan"; the Fresh Agent Test; unit+integration mandate.
 - The model ladder *policy* (Sonnet default; down to Haiku / up to Opus) — only
-  the *enforcement point* moves (into `sable-spawn-worker`).
+  the *enforcement point* moves (into `sable-spawn-worker`). Note what "pins
+  cleanly here" (§ above) does and does not mean: the helper PINS the model on
+  the pane, it does not GRADE the bead. Applying the ladder stays a manager
+  judgment expressed as `--model` or a `model:` label; absent both, the helper
+  uses a flat default and announces it as such (SABLE-mn1da), and stamps what
+  actually launched onto the bead afterwards (SABLE-qw9jv).
 
 ---
 

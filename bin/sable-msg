@@ -38,6 +38,35 @@ manual bead-filing hint.
 
 Usage:
   sable-msg <to-role> "<text>" [--from <role>] [--interrupt] [--bead]
+  sable-msg <to-role> --body-file <path> [--from <role>] [--interrupt] [--bead]
+  sable-msg --file-sighting "<text>" [--from <role>]
+    --file-sighting file a bead recording an observation (SABLE-441vl) —
+                    capture is mandatory, never refused or deferred; priority
+                    is a seat estimate a hook later marks provisional. No
+                    <to-role>, no tmux, no pane lookup. See
+                    file_sighting_bead's docstring below.
+    <text>          message body, given inline as the second positional arg.
+                    HAZARD (SABLE-tmbx1): the CALLING shell parses this
+                    argument before sable-msg ever sees it. A body composed
+                    inside a double-quoted (or unquoted) shell argument has
+                    its backticks and $(...) COMMAND-SUBSTITUTED by that
+                    shell — the substituted command actually RUNS with the
+                    caller's privileges, and the delivered message silently
+                    loses that text, with sable-msg reporting success. This
+                    is not a bug sable-msg can detect: by the time argv
+                    reaches main(), the damage is already done. Prefer
+                    --body-file for any body that might contain a code
+                    reference, shell snippet, or literal backtick/$( — which
+                    is the ordinary shape of a code review or incident report.
+    --body-file <path>   read the body from a file instead (or from stdin
+                    when <path> is '-', matching bd's own --body-file
+                    convention). A file's bytes are never parsed by a shell,
+                    so backticks/$()/quotes round-trip as literal characters
+                    regardless of content. Write the body with the Write tool
+                    (or any non-shell means) first, then pass only the path
+                    on the command line — the path is the only thing the
+                    calling shell ever sees, and it need not be prose.
+                    Mutually exclusive with the inline <text> positional.
     --from <role>   sender label for the framing header. Default: on a WORKER
                     pane (SABLE_WORKER_PANE=1) this is ALWAYS 'worker:<bead>'
                     (or plain 'worker' if the bead can't be resolved) — NEVER
@@ -283,20 +312,105 @@ def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None
                         run=run, capture=capture, sleep=sleep)
 
 
+FALLBACK_TITLE_PREFIX = "SABLE-MSG undelivered to"
+
+
+def fallback_bead_title(to_role: str, message: str) -> str:
+    """The title file_fallback_bead gives a durable inbox bead.
+
+    Extracted so callers that need to RECOGNISE such a bead derive the title
+    the same way we compose it, instead of hand-typing the format (SABLE-3mrv3).
+    Note what `message` is at every real call site: the FRAMED message from
+    format_message ('⟦SABLE-MSG⟧ from=<frm> to=<to> :: <body>'), never the raw
+    body — so the framing sits between the role and the body, and a title
+    guessed as '<prefix> <role>: <body>' matches nothing. That mistake made a
+    live-DB-pollution assertion silently unfalsifiable; hence this seam."""
+    return f"{FALLBACK_TITLE_PREFIX} {to_role}: {message[:80]}"
+
+
+def fallback_bead_labels(to_role: str) -> str:
+    """The --labels value for a durable inbox bead. Same rationale as
+    fallback_bead_title: recognisers must reuse it, not restate it."""
+    return f"for-{to_role},coord"
+
+
 def file_fallback_bead(frm: str, to_role: str, message: str, runner=None) -> str | None:
     """File the durable for-<role> inbox bead when live delivery could not be
     verified (SABLE-1umr). Returns the new bead id, or None when bd is
     unavailable/errored (the caller then prints the manual hint instead).
     Runs in the sender's cwd, which for manager/lead panes is the repo whose
-    beads db owns the coordination inbox."""
+    beads db owns the coordination inbox.
+
+    Filed at P3, NOT P1 (costing-comparison-573). These are INBOX items, not
+    work items: at P1 they sorted above genuine P1 engineering beads in
+    `bd ready`, and one measured pool held 26 items of which 11 were these —
+    roughly doubling the apparent queue and pushing the real work down it. The
+    recipient still finds them by the for-<role> label, which is how the inbox
+    is read anyway. Do NOT stop filing them: the fallback is what makes an
+    unverified delivery lossless, and it has worked correctly every time."""
     runner = runner or (lambda args: subprocess.run(args, capture_output=True, text=True))
-    title = f"SABLE-MSG undelivered to {to_role}: {message[:80]}"
+    title = fallback_bead_title(to_role, message)
     desc = (f"Auto-filed by sable-msg after verified-delivery failure (SABLE-1umr). "
             f"Deliver this message to {to_role} and act on it: {message} "
             f"[no-test] coordination inbox bead, no code change.")
     try:
         r = runner(["bd", "create", f"--title={title}", f"--description={desc}",
-                    "--type=task", "--priority=1", f"--labels=for-{to_role},coord"])
+                    "--type=task", "--priority=3",
+                    f"--labels={fallback_bead_labels(to_role)}"])
+    except Exception:
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    out = (getattr(r, "stdout", "") or "") + (getattr(r, "stderr", "") or "")
+    m = re.search(r"Created issue:\s*(\S+)", out) or re.search(r"([A-Za-z0-9_-]+-[a-z0-9.]+)", out)
+    return m.group(1) if m else None
+
+
+# --------------------------------------------------------------------------
+# Seat sightings (SABLE-441vl) — recording an observation, mandatory capture
+# --------------------------------------------------------------------------
+#
+# CAPTURE IS MANDATORY, PRIORITY IS ADVISORY (cockpit ruling, 2026-07-22
+# 16:23, recorded as a COMMENT on SABLE-441vl). The bead this implements was
+# originally scoped on the premise that the merge seat (chuck) CANNOT create
+# work-creating beads at all — that premise is MEASURED FALSE (chuck filed
+# seven beads the same day) and the ruling re-scoped the deliverable: the
+# seat MUST be free to file what it notices (an unfiled finding is invisible
+# by construction), and what it does NOT do is set precedence — priority on
+# a seat-filed bead is a SEAT ESTIMATE pending cockpit/manager triage.
+#
+# `--file-sighting` is therefore a PLAIN `bd create` with no refusal, no
+# deferred status, and no promotion step — capture must never be blocked.
+# hooks/multi-manager/seat-sighting-gate.sh (a PostToolUse hook that never
+# denies) mechanizes the "priority is advisory" half by auto-labeling the
+# result `seat-filed` and marking `priority_provisional` afterward, for ANY
+# `bd create` under chuck's identity — whether it came through this
+# convenience wrapper or a hand-typed `bd create`.
+
+SIGHTING_TITLE_PREFIX = "SEAT-FILED"
+
+
+def sighting_bead_title(text: str) -> str:
+    """The title file_sighting_bead gives a filed bead. Extracted for the
+    same reason fallback_bead_title is: a recogniser must derive the title
+    the same way we compose it, not hand-type the format."""
+    return f"{SIGHTING_TITLE_PREFIX}: {text[:80]}"
+
+
+def file_sighting_bead(frm: str, text: str, runner=None) -> str | None:
+    """File a bead recording an observation the seat noticed (SABLE-441vl).
+    A single, ordinary `bd create` — capture is mandatory, so this never
+    refuses, defers, or requires a later promotion. Priority is left at bd's
+    own default (a seat ESTIMATE, per the ruling); the seat-sighting-gate
+    hook marks it provisional afterward, mechanically, regardless of how the
+    bead was created. Returns the new bead id, or None when bd is
+    unavailable/errored (mirrors file_fallback_bead's contract)."""
+    runner = runner or (lambda args: subprocess.run(args, capture_output=True, text=True))
+    title = sighting_bead_title(text)
+    desc = (f"Filed via `sable-msg --file-sighting` by {frm} (SABLE-441vl: capture is "
+            f"mandatory, priority is a seat estimate pending triage): {text}")
+    try:
+        r = runner(["bd", "create", f"--title={title}", f"--description={desc}", "--type=task"])
     except Exception:
         return None
     if getattr(r, "returncode", 1) != 0:
@@ -311,9 +425,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         prog="sable-msg",
         description="Message a SABLE agent pane over tmux (lead<->manager, or a bead-addressed worker).",
     )
-    p.add_argument("to_role", help="recipient role (e.g. optimus, tarzan, lincoln), "
-                                   "or a bead id when --bead is passed")
-    p.add_argument("body", help="message text (collapsed to a single line)")
+    p.add_argument("to_role", nargs="?", default=None,
+                   help="recipient role (e.g. optimus, tarzan, lincoln), or a bead id "
+                        "when --bead is passed. Omit entirely with --file-sighting — a "
+                        "sighting contacts no pane and addresses no role.")
+    p.add_argument("body", nargs="?", default=None,
+                   help="message text (collapsed to a single line). Mutually "
+                        "exclusive with --body-file; exactly one is required. "
+                        "HAZARD (SABLE-tmbx1): this argument is parsed by the "
+                        "CALLING shell before sable-msg sees it — a body "
+                        "containing backticks or $(...) gets command-"
+                        "substituted (and the substituted command actually "
+                        "runs) rather than delivered. Prefer --body-file.")
+    p.add_argument("--body-file", dest="body_file", default=None, metavar="PATH",
+                   help="read the body from PATH instead of the inline <body> "
+                        "argument ('-' reads stdin, matching bd's own "
+                        "--body-file convention). A file's content is never "
+                        "parsed by a shell, so backticks/$()/quotes round-trip "
+                        "literally (SABLE-tmbx1). Mutually exclusive with "
+                        "the inline <body> positional.")
     p.add_argument("--from", dest="frm", default=None,
                    help="sender label for the framing header (default: "
                         "'worker:<bead>' on a worker pane, else "
@@ -324,7 +454,42 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="resolve <to_role> as a bead id against a WORKER pane's "
                         "@sable_bead tag instead of a manager @sable_role "
                         "(SABLE-6izz: workers share the generic role 'worker')")
-    return p.parse_args(argv)
+    p.add_argument("--file-sighting", dest="file_sighting", action="store_true",
+                   help="file a bead recording an observation instead of messaging a pane "
+                        "(SABLE-441vl: capture is mandatory, priority is advisory) — the "
+                        "observation comes from the inline <body> or --body-file. No pane "
+                        "is contacted and no <to_role> is needed; a plain bd create, never "
+                        "refused or deferred. hooks/multi-manager/seat-sighting-gate.sh "
+                        "auto-labels the result seat-filed and marks its priority "
+                        "provisional afterward, for the merge seat's identity specifically.")
+    ns = p.parse_args(argv)
+    if ns.file_sighting and ns.to_role is not None and ns.body is None:
+        # --file-sighting takes no to_role, so a single positional is the
+        # BODY, not a role — argparse fills the first optional positional
+        # (to_role) greedily and has no way to know that in advance.
+        ns.body, ns.to_role = ns.to_role, None
+    if ns.body is not None and ns.body_file is not None:
+        p.error("argument body: not allowed with argument --body-file")
+    if ns.body is None and ns.body_file is None:
+        p.error("one of the arguments body --body-file is required")
+    if not ns.file_sighting and not ns.to_role:
+        p.error("the following arguments are required: to_role")
+    return ns
+
+
+def resolve_body(ns: argparse.Namespace, stdin=None) -> str:
+    """Materialize the message body text from either the inline positional or
+    --body-file (SABLE-tmbx1). A file/stdin read never invokes a shell, so
+    content read this way cannot be command-substituted no matter what
+    metacharacters it contains — unlike the inline positional, which the
+    CALLING shell has already parsed by the time argv reaches us."""
+    if ns.body_file is None:
+        return ns.body
+    stdin = stdin or sys.stdin
+    if ns.body_file == "-":
+        return stdin.read()
+    with open(ns.body_file, "r", encoding="utf-8") as fh:
+        return fh.read()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -332,6 +497,22 @@ def main(argv: list[str] | None = None) -> int:
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
     if ns.frm is None:
         ns.frm = resolve_from(socket)
+
+    if ns.file_sighting:
+        # No pane, no tmux session, no framing header — a sighting is a bd
+        # write, not a message (SABLE-441vl). Resolved and returned BEFORE any
+        # session/pane lookup below, which a sighting never needs.
+        bead_id = file_sighting_bead(ns.frm, resolve_body(ns))
+        if bead_id:
+            sys.stderr.write(
+                f"sable-msg: filed {bead_id} — capture is mandatory, this bead is live in "
+                f"bd ready now; priority is an estimate pending triage.\n")
+            return 0
+        sys.stderr.write(
+            "sable-msg: could not file bead — bd unavailable or errored. "
+            "Fall back to: bd create --title=\"SEAT-FILED: ...\" --type=task\n")
+        return 1
+
     try:
         session = resolve_session(socket=socket)
     except SessionCollision as e:
@@ -386,7 +567,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
-    message = format_message(ns.frm, ns.to_role, ns.body)
+    message = format_message(ns.frm, ns.to_role, resolve_body(ns))
     ready_timeout = float(os.environ.get("SABLE_MSG_READY_TIMEOUT", DEFAULT_READY_TIMEOUT))
     submit_tries = int(os.environ.get("SABLE_MSG_SUBMIT_TRIES", DEFAULT_SUBMIT_TRIES))
     poll_interval = float(os.environ.get("SABLE_MSG_POLL_INTERVAL", DEFAULT_POLL_INTERVAL))

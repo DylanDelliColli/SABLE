@@ -86,6 +86,24 @@ has  "cites SABLE-u0c6 as the tracking bead for the close-verification guard" "S
 hasre "instructs checking bd close's exit code"                 "check the exit code|exit code"
 hasre "instructs re-verifying status via bd show before flagging done"  "bd show.*--json.*status|verify the close"
 
+# ---------- SABLE-50z5g: per-section declaration form (footprint vs reads) ----------
+# Two parsers sit behind one heading grammar and disagree (SABLE-546m5): a
+# footprint reformatted one-path-per-line silently drops 3 of 4 paths, while
+# the same reformat on a reads section is harmless. Advice that comma-separates
+# BOTH sections teaches a uniform-risk model that is false, so the template
+# must name each section AND its own, DIFFERENT requirement.
+
+has  "cites SABLE-50z5g as the tracking bead for per-section declaration form" "SABLE-50z5g"
+has  "names the File footprint section"                          "File footprint"
+has  "names the File reads section"                               "File reads"
+hasre "states footprint must be comma-separated on one line"       "footprint.{0,200}comma-separated|comma-separated.{0,200}footprint"
+hasre "states a newline/hyphen reformat of footprint drops entries" "silently drop|silently loses"
+has  "states reads entries need a slash"                           "contain a slash"
+has  "states reads entries need a known code suffix"               "known code suffix"
+has  "cites SABLE-546m5 as the two-parser divergence probe"        "SABLE-546m5"
+has  "cites SABLE-zx2yv as the reads-side silent-drop bead"        "SABLE-zx2yv"
+hasre "instructs over-declaring when unsure"                       "over-declare"
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

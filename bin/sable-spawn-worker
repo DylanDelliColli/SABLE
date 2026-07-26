@@ -3,13 +3,22 @@
 topology (SABLE-bldh.3). Replaces the in-process Agent-tool dispatch.
 
 Per bead, a manager (Optimus/Tarzan) calls this to:
-  1. resolve the worker model from the bead's `model:` label (or --model override),
+  1. resolve the worker model from the bead's `model:` label (or --model
+     override) — a FLAT DEFAULT, not a ladder (SABLE-mn1da): no bead content is
+     inspected to infer difficulty, and the choice + its source is announced on
+     every spawn, default path included,
   2. (re)use a worktree (--worktree) or create one (`bd worktree create wk-<name>`),
   3. write the full dispatch prompt to a dispatch file (keeps the worktree clean),
   4. open a new tmux WINDOW running `claude --model <model>` with CWD = the worktree,
   5. tag the worker pane (@sable_role=worker / @sable_bead / @sable_status=running
      / @sable_lane=<owning manager>, SABLE-dcw2),
-  6. send a single-line "read your dispatch file and execute it" instruction.
+  6. send a single-line "read your dispatch file and execute it" instruction,
+  7. stamp `model` / `model_source` metadata on the bead (and every --bundle
+     sibling) from the command that ACTUALLY LAUNCHED — the durable answer to
+     "which model ran this bead?" that no part of the record used to carry
+     (SABLE-qw9jv). Written only after the pane exists, so a refused spawn
+     leaves no attribution and a re-dispatch at another tier records the tier
+     that ran.
 
 The worker then runs the warm-pane self-push lifecycle (worker-dispatch.md):
 self-push its branch and bd close. The done-flag itself is DETERMINISTIC
@@ -52,12 +61,15 @@ Usage:
                      [--respawn] [--bundle id1,id2,...]
 
   --bundle (SABLE-q13h): sibling bead ids dispatched alongside <bead-id> into
-    the SAME worktree/branch. Every bundled bead is claimed up front (same as
-    the lead) and its full title/description is rendered into the dispatch
-    prompt itself, under a "Bundle contract" section binding the worker to
-    ALL listed beads regardless of claim state — replacing the prior prose
-    convention (a bundle spec left in the lead bead's notes/description) that
-    lost non-lead beads in 6+ documented dispatches.
+    the SAME worktree/branch. Every bundled bead is claimed (same as the lead)
+    and its full title/description is rendered into the dispatch prompt itself,
+    under a "Bundle contract" section binding the worker to ALL listed beads
+    regardless of claim state — replacing the prior prose convention (a bundle
+    spec left in the lead bead's notes/description) that lost non-lead beads in
+    6+ documented dispatches. SABLE-fz8kd: the bundle is the UNIT OF DISPATCH
+    for governance too — the overlap gate compares the union of the bundle's
+    declared footprints and never treats a sibling as foreign concurrent work,
+    and no bead is claimed until every gate that can refuse has passed.
 
 Env:
   SABLE_TMUX_SOCKET    tmux socket (-L) for isolation/tests
@@ -77,6 +89,29 @@ Env:
                        booting, or stuck on an unrecognized dialog/selector,
                        SABLE-m94k) is never typed into — refusal = exit 10,
                        naming the pane; the bead stays claimed for retry.
+
+Overlap scheduling constraint (SABLE-jd5fj.6): a bead whose declared file
+footprint (wip_claims metadata / '## File footprint' description section /
+WIP-CLAIMS text) overlaps a DIFFERENT in-progress bead's footprint refuses the
+spawn — exit 11, naming the overlapping bead(s) and files. Two outs: wait for
+the overlapping bead to clear, or add an explicit 'Serialize-with: <bead-id>'
+line (bead notes/description) naming it — the spawn then proceeds and both
+beads' `serialize_with` metadata is tagged for Chuck's for-chuck handoff.
+
+A bead that declares a footprint the parser CANNOT READ (a '## File footprint'
+heading naming no path, a WIP-CLAIMS line or wip_claims value that yields none)
+refuses the spawn separately — exit 12, could-not-assess (SABLE-47try). The
+constraint cannot be evaluated against an unreadable footprint, and a check
+that did not run must not report the same verdict as one that ran and found
+nothing. A bead that declares NO footprint at all is a different fact and
+dispatches normally.
+
+Dispatch-content guard (SABLE-kv44f): a bead whose description is empty or
+whitespace-only while its notes hold >= DISPATCH_NOTES_THRESHOLD chars of
+content refuses the spawn — exit 13, naming the notes length. The dispatch
+prompt is built from the description (SABLE-h8swc/SABLE-pruak render notes
+and comments AFTER it, not instead of it); an empty description hands the
+worker nothing to build from no matter how much evidence lives in notes.
 """
 from __future__ import annotations
 
@@ -84,9 +119,11 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 # Shared pane-readiness/dispatch helpers (SABLE-bldh.14). Resolve the lib next to
 # THIS script even when invoked via a PATH symlink.
@@ -97,6 +134,7 @@ from sable_pane_lib import (  # noqa: E402
     wait_for_ready, worker_cap,
 )
 from sable_pane_lib import deliver_text as deliver_dispatch  # noqa: E402
+import sable_footprint_lib as fp_lib  # noqa: E402
 
 DEFAULT_SESSION = "sable"
 DEFAULT_MODEL = "sonnet"
@@ -130,16 +168,171 @@ def resolve_worktree_path(toplevel: str, wt_name: str) -> str:
     return str(Path(toplevel).parent / wt_name)
 
 
-def resolve_model(labels: list[str], override: str | None):
-    """Return (model, reason). Override syntax: 'opus' or 'opus:why'. Label
-    'model:<m>' is the primary signal; default sonnet."""
+# --- fixture linking (SABLE-ji4h) -------------------------------------------
+# A git worktree materialises TRACKED files only. Gitignored integration
+# fixtures therefore exist ONLY in the primary checkout, so every worker
+# worktree silently loses them: costing-comparison's 22 integration tests
+# skipped in every worker tree, and pytest exits 0 on an all-skipped run, so no
+# gate caught it. Workers reported integration tests "passing" on runs where
+# nothing executed. Proven both directions: 24 passed with the directory
+# symlinked in, 24 skipped in the identical tree without it.
+#
+# GENERIC BY CONSTRAINT: no repo's directory names appear here. A repo opts in
+# via `git config --add sable.fixturePath <relpath>` (repeatable). Worktrees
+# share the primary checkout's config, so one setting covers every future tree.
+#
+# SYMLINK rather than copy: the source is gitignored customer material. A link
+# commits nothing, copies nothing, exposes no byte not already on the machine
+# under the same user, and the ignore rules stay in force inside the worktree,
+# so a worker cannot `git add` the linked files even deliberately.
+
+FIXTURE_PATH_CONFIG_KEY = "sable.fixturePath"
+
+
+def configured_fixture_paths(toplevel: str) -> list[str]:
+    """Repo-relative fixture paths opted in via sable.fixturePath. Empty (never
+    an error) when the key is unset — repos that need nothing pay nothing.
+
+    SABLE-6sdpx: `git config --get-all` documents exit 1 SPECIFICALLY for "the
+    section or key is invalid" (i.e. legitimately unset) — that is the one
+    nonzero code meaning empty-by-design, exactly like pytest's exit 5. Every
+    OTHER nonzero code (2 bad params, 3 malformed config file, 128 not-a-repo,
+    ...) is a real failure git could not even evaluate the key for, and must
+    not be silently folded into "unconfigured", or a repo that genuinely opted
+    in via sable.fixturePath would silently run every worker without its
+    fixtures with no signal anywhere."""
+    try:
+        cp = subprocess.run(
+            ["git", "-C", toplevel, "config", "--get-all", FIXTURE_PATH_CONFIG_KEY],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return []
+    if cp.returncode == 1:
+        return []  # key/section not found — legitimately unconfigured
+    if cp.returncode != 0:
+        print(f"sable-spawn-worker: WARNING git config --get-all "
+              f"{FIXTURE_PATH_CONFIG_KEY} failed (exit {cp.returncode}) — "
+              f"treating as unconfigured, fixtures may be silently skipped: "
+              f"{cp.stderr.strip() or cp.stdout.strip()}", file=sys.stderr)
+        return []
+    return [ln.strip() for ln in cp.stdout.splitlines() if ln.strip()]
+
+
+def plan_fixture_links(toplevel: str, worktree: str, rels: list[str]) -> list[tuple]:
+    """Pure planner: -> [(rel, action, src, dst)] with action one of
+    link | skip-missing-source | skip-exists | skip-escapes-repo.
+
+    Split from the doer so the decision logic is unit-testable without a real
+    worktree, and so a dry run can be inspected. Ordering of checks matters:
+    containment is validated BEFORE existence so a traversal attempt is
+    reported as such rather than as a missing source."""
+    top, wt = Path(toplevel).resolve(), Path(worktree).resolve()
+    plan = []
+    for rel in rels:
+        src, dst = (top / rel), (wt / rel)
+        try:
+            inside = src.resolve().is_relative_to(top) and dst.resolve().is_relative_to(wt)
+        except (OSError, ValueError):
+            inside = False
+        if not inside:
+            plan.append((rel, "skip-escapes-repo", str(src), str(dst)))
+        elif not src.exists():
+            plan.append((rel, "skip-missing-source", str(src), str(dst)))
+        elif dst.exists() or dst.is_symlink():
+            plan.append((rel, "skip-exists", str(src), str(dst)))
+        else:
+            plan.append((rel, "link", str(src), str(dst)))
+    return plan
+
+
+def link_fixture_paths(toplevel: str, worktree: str) -> list[tuple]:
+    """Materialise the plan. Never raises: a fixture-link failure must not take
+    down a dispatch that would otherwise succeed — the worker then runs without
+    fixtures, which is exactly today's behaviour, and the strict-fixture guard
+    (costing-comparison-0cp) is what turns that into a loud failure rather than
+    a silent skip. Returns the plan with failures recorded as link-failed."""
+    results = []
+    for rel, action, src, dst in plan_fixture_links(toplevel, worktree, configured_fixture_paths(toplevel)):
+        if action != "link":
+            results.append((rel, action, src, dst))
+            continue
+        try:
+            Path(dst).parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(src, dst)
+            results.append((rel, "link", src, dst))
+        except OSError as e:
+            results.append((rel, f"link-failed: {e}", src, dst))
+    return results
+
+
+class ModelChoice(NamedTuple):
+    """(model, reason, source) — `source` is WHY this model was chosen:
+    'override' (--model), 'label' (bead `model:` label), or 'default'
+    (DEFAULT_MODEL, because neither was given)."""
+    model: str
+    reason: str | None
+    source: str
+
+
+def resolve_model(labels: list[str], override: str | None) -> ModelChoice:
+    """Return ModelChoice(model, reason, source). Override syntax: 'opus' or
+    'opus:why'. Label 'model:<m>' is the next signal; otherwise DEFAULT_MODEL.
+
+    SABLE-mn1da: this is a FLAT DEFAULT, not a ladder. Nothing here inspects
+    the bead to infer difficulty — not type, not priority, not description
+    size, not whether it carries an unresolved ruling. The 'model ladder' in
+    SABLE.md 6.9 / the role cards is a MANAGER judgment expressed through
+    --model or a `model:` label; a manager who dispatches without either gets
+    a constant. That gap used to be invisible at dispatch (only the override
+    path announced itself) and surfaced 30+ minutes later as a shallow result,
+    so `source` exists to make the default path as loud as the override one —
+    see model_announcement."""
     if override:
         model, _, reason = override.partition(":")
-        return model.strip(), (reason.strip() or None)
+        return ModelChoice(model.strip(), (reason.strip() or None), "override")
     for lab in labels:
         if lab.startswith("model:"):
-            return lab.split(":", 1)[1].strip(), None
-    return DEFAULT_MODEL, None
+            return ModelChoice(lab.split(":", 1)[1].strip(), None, "label")
+    return ModelChoice(DEFAULT_MODEL, None, "default")
+
+
+def model_announcement(model: str, reason: str | None, source: str) -> str:
+    """Operator-visible one-liner naming the model AND why it was chosen
+    (SABLE-mn1da). The reasoned-override wording is BYTE-IDENTICAL to what this
+    tool has always printed ('model opus, override: <reason>') — the fix adds
+    no noise to the path that already worked; it makes the two SILENT paths
+    (default, and a bare unreasoned override) say what they are."""
+    if source == "override":
+        return f"model {model}, override: {reason}" if reason else \
+            f"model {model}, override: (no reason given)"
+    if source == "label":
+        return f"model {model}, from bead label model:{model}"
+    return (f"model {model}, DEFAULT — no --model override and no model: label; "
+            "sable-spawn-worker does NOT infer difficulty from the bead")
+
+
+# `--model X` / `--model=X` as it appears in the command actually handed to
+# tmux. Used for provenance (SABLE-qw9jv): what LAUNCHED, not what was asked for.
+# The value stops at shell punctuation, not just whitespace: with_lifecycle_flags
+# joins the worker command to the done-flag write with `;`, so a command whose
+# LAST token is the model (a bare SABLE_WORKER_CMD='claude --model opus') yields
+# 'opus;' under a plain \S+ — a wrong value written straight into the bead.
+_MODEL_FLAG_RE = re.compile(r"--model[=\s]+([^\s;&|'\"]+)")
+
+
+def launched_model(worker_cmd: str) -> str | None:
+    """The model named by the command that actually launches in the pane, or
+    None when that command names no model at all (SABLE-qw9jv).
+
+    This reads the FINAL command string — after worker_command() has applied
+    any SABLE_WORKER_CMD override and after with_lifecycle_flags() has wrapped
+    it — precisely because the dispatcher's REQUEST and what the spawn RUNS can
+    diverge: a full SABLE_WORKER_CMD override replaces the command verbatim, so
+    it may pin a different model, or none. Recording the request instead of the
+    launch is the exact intent-vs-execution error this bead exists to kill."""
+    m = _MODEL_FLAG_RE.search(worker_cmd or "")
+    return m.group(1) if m else None
 
 
 def parse_bead(raw: str) -> dict:
@@ -173,6 +366,33 @@ def model_check(labels: list[str], override: str | None) -> str | None:
     return None
 
 
+DISPATCH_NOTES_THRESHOLD = 200
+
+
+def dispatch_content_guard(description: str, notes: str,
+                           threshold: int = DISPATCH_NOTES_THRESHOLD) -> str | None:
+    """Refuse a dispatch whose description is empty/whitespace-only while its
+    notes hold substantive content (SABLE-kv44f). SABLE-h8swc/SABLE-pruak
+    close the notes/comments RENDER gap, but a bead whose description is
+    genuinely empty still hands the worker nothing to build from — a bead's
+    entire evidentiary base can accumulate across many individually-correct
+    `bd update --append-notes` sessions and end dispatch-invisible with
+    nothing warning the author, the manager, or the spawner. Does NOT
+    auto-fold notes into the description (authoring is manager work) — this
+    only refuses loudly. Returns an error string to block, or None to
+    allow."""
+    if (description or "").strip():
+        return None
+    note_len = len((notes or "").strip())
+    if note_len < threshold:
+        return None
+    return (f"description empty, notes hold {note_len} chars -- fold "
+            "worker-relevant content into the description before dispatch "
+            "(SABLE-kv44f: the dispatched worker prompt is built from the "
+            "description; an empty one hands the worker nothing regardless "
+            "of how much evidence lives in notes).")
+
+
 def parse_bead_list(raw: str) -> list[dict]:
     """Best-effort parse of a `bd ... --json` array response. Empty list on any
     malformed/non-array payload — governance below fails OPEN, never blocks a
@@ -182,6 +402,23 @@ def parse_bead_list(raw: str) -> list[dict]:
     except Exception:
         return []
     return data if isinstance(data, list) else []
+
+
+def fetch_bead_comments(bead_id: str) -> list[dict]:
+    """`bd comments <id> --json` for the dispatch prompt (SABLE-pruak): a
+    comment is where an operator/cockpit ruling that overturns a bead's
+    premise typically lands, and until this fix it never reached the
+    dispatched worker. A fetch failure degrades to no comments rendered
+    (warned to stderr, not raised) rather than aborting the whole spawn —
+    comments are additive context, not a spawn precondition."""
+    r = subprocess.run(["bd", "comments", bead_id, "--json"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.stderr.write(
+            f"sable-spawn-worker: could not fetch comments for {bead_id}: "
+            f"{r.stderr.strip()}\n")
+        return []
+    return parse_bead_list(r.stdout)
 
 
 # Tab-delimited @sable_bead + @sable_status dump for dispatch-evidence detection
@@ -271,45 +508,435 @@ def already_in_progress_check(bead: dict, pane_evidence: bool,
             "no worktree is the claim-then-hold pattern and is allowed.)")
 
 
+class FootprintRead(NamedTuple):
+    """The result of READING a bead's declared file footprint — `files` plus
+    WHICH SOURCES WERE PRESENT AND YIELDED NOTHING (SABLE-47try).
+
+    The bare `set[str]` this replaces could not tell two facts apart:
+
+      (a) this bead DECLARES NO FOOTPRINT — legitimate, common, and it must
+          still be allowed to dispatch; and
+      (b) this bead's footprint COULD NOT BE READ — a `## File footprint`
+          heading with nothing parseable under it, a `WIP-CLAIMS:` line that
+          yields no path, a `wip_claims` metadata value that is all separators.
+
+    Both produced an empty set, so the information did not exist at
+    overlap_check's call site at all, and (b) silently disabled a SCHEDULING
+    CONSTRAINT while reporting the same 'none' verdict as a completed check.
+    `unreadable_sources` is what carries (b) forward.
+
+    It is a tuple of source NAMES, not a boolean, because the sources are
+    unioned: a bead can be unparseable in one source and simply silent in the
+    other two. When some source did yield files, the check still runs — it is
+    answerable, just on a possibly-incomplete footprint — and the unreadable
+    source is surfaced as a warning rather than a refusal. Only a read that
+    yielded NO files from ANY source while some source was present is
+    unanswerable; that is what `could_not_assess` names."""
+    files: frozenset[str]
+    unreadable_sources: tuple[str, ...] = ()
+
+    @property
+    def could_not_assess(self) -> bool:
+        """True only for case (b) above with nothing salvaged from any source.
+        Deliberately NOT true for a bead that declares no footprint at all —
+        that bead is assessable (it collides with nothing) and must dispatch."""
+        return not self.files and bool(self.unreadable_sources)
+
+    def merge(self, other: "FootprintRead") -> "FootprintRead":
+        return FootprintRead(
+            self.files | other.files,
+            tuple(dict.fromkeys(self.unreadable_sources + other.unreadable_sources)))
+
+
 def extract_wip_claims(text: str) -> set[str]:
     """File paths from `WIP-CLAIMS: a, b, c` lines in bead notes/description."""
+    return set(read_wip_claims(text).files)
+
+
+def read_wip_claims(text: str) -> FootprintRead:
+    """`extract_wip_claims` plus the PRESENT-BUT-EMPTY signal (SABLE-47try): a
+    `WIP-CLAIMS:` line that exists but yields no path is an author who meant to
+    declare a footprint and wrote it in a form this parser does not read. That
+    is not the same fact as having written no WIP-CLAIMS line at all, and the
+    bare set return could not express the difference."""
     claims: set[str] = set()
+    marker = False
     for m in re.finditer(r"WIP-CLAIMS:\s*([^\n]+)", text or ""):
+        marker = True
         for p in m.group(1).split(","):
             p = p.strip()
             if p:
                 claims.add(p)
-    return claims
+    return FootprintRead(frozenset(claims),
+                         () if claims or not marker else ("WIP-CLAIMS line",))
+
+
+def extract_footprint_section(text: str) -> set[str]:
+    """Files from a planner-authored '## File footprint' description section
+    (SABLE-jd5fj.6: DECOMPOSITION-authored declared footprint — see this bead's
+    own description for the format). Entries are comma-separated; a trailing
+    parenthetical annotation (e.g. 'bin/sable-spawn-worker (constraint
+    surfacing)') is stripped to the leading path token so extension-less
+    scripts are captured — the WIP-CLAIMS/metadata sources below don't need an
+    extension either, but the OLD generic-regex fallback in the hook-based
+    claim writer did, which is exactly the gap this section format closes."""
+    return set(read_footprint_section(text).files)
+
+
+def read_footprint_section(text: str) -> FootprintRead:
+    """`extract_footprint_section` plus the PRESENT-BUT-EMPTY signal
+    (SABLE-47try). A `## File footprint` HEADING that is present but whose body
+    yields no path token — an empty section, a placeholder the planner never
+    filled in — reports the section as unreadable rather than silently reading
+    as "this bead declares no footprint". An ABSENT heading is the genuine
+    declares-nothing case and reports no unreadable source.
+
+    Mirrors sable_footprint_lib._collect_section's `(found, entries)` contract,
+    which draws the same heading-present/heading-absent line for `## File
+    reads` (SABLE-jd5fj.18). The two parsers stay separate deliberately: that
+    one filters tokens to path-shaped ones, this one takes the leading token of
+    each comma-separated entry verbatim so extension-less script paths survive.
+
+    Scans the body LINE-WISE rather than with a body-capturing regex
+    (SABLE-wihrz): the previous body-capturing lookahead form required at least one
+    body character, so an EMPTY section immediately followed by another `##`
+    heading captured that heading's literal '##' as a claimed path. That bogus
+    non-empty footprint is exactly what this function must not produce — it
+    would read as a successful parse and let the gate proceed on garbage,
+    defeating the could-not-assess distinction above."""
+    heading = re.compile(r"^##\s*File footprint\s*$")
+    found = False
+    body: list[str] = []
+    for line in (text or "").splitlines():
+        if heading.match(line.strip()):
+            found = True
+            continue
+        if found:
+            if line.strip().startswith("#"):
+                break
+            body.append(line)
+    if not found:
+        return FootprintRead(frozenset())
+    files: set[str] = set()
+    for part in "\n".join(body).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        files.add(part.split()[0])
+    return FootprintRead(frozenset(files),
+                         () if files else ("'## File footprint' section",))
+
+
+def read_bead_footprint(bead: dict) -> FootprintRead:
+    """Union of every declared-footprint source for `bead`: WIP-CLAIMS text
+    lines (notes/description), the wip_claims metadata field (SABLE-szd
+    dedicated column — pre-dispatch-claim.sh's write target), and a planner-
+    authored '## File footprint' description section (SABLE-jd5fj.6) — carrying
+    the per-source PRESENT-BUT-UNREADABLE signal each parser now reports
+    (SABLE-47try). See FootprintRead for why the union makes this per-source
+    rather than a single boolean."""
+    text = (bead.get("notes") or "") + "\n" + (bead.get("description") or "")
+    read = read_wip_claims(text).merge(
+        read_footprint_section(bead.get("description") or ""))
+    metadata = bead.get("metadata", {}) or {}
+    wip_claims = metadata.get("wip_claims", "") or ""
+    meta_files = frozenset(p.strip() for p in wip_claims.split(",") if p.strip())
+    # A wip_claims KEY carrying a non-blank value that parses to no path is the
+    # metadata-column form of the same authoring error; an absent or blank
+    # value is simply "nothing claimed here yet" and is not a failed read
+    # (pre-dispatch-claim.sh has not necessarily fired — no ordering guarantee).
+    meta_unreadable = ("wip_claims metadata",) if wip_claims.strip() and not meta_files else ()
+    return read.merge(FootprintRead(meta_files, meta_unreadable))
 
 
 def bead_claimed_files(bead: dict) -> set[str]:
+    """The declared-footprint file set for `bead`. Thin projection of
+    read_bead_footprint for callers that only need the paths — every caller
+    that must DECIDE something reads the full FootprintRead instead, because
+    this return value cannot express a failed read (SABLE-47try)."""
+    return set(read_bead_footprint(bead).files)
+
+
+def extract_serialize_with(text: str) -> set[str]:
+    """Bead ids named in a `Serialize-with: <id>[, <id>...]` line — the
+    explicit out (SABLE-jd5fj.6) that permits dispatch despite an overlapping
+    declared footprint. See overlap_check."""
+    ids: set[str] = set()
+    for m in re.finditer(r"Serialize-with:\s*([^\n]+)", text or "", re.IGNORECASE):
+        for tok in re.split(r"[,\s]+", m.group(1).strip()):
+            if tok:
+                ids.add(tok)
+    return ids
+
+
+def bead_serialize_with(bead: dict) -> set[str]:
     text = (bead.get("notes") or "") + "\n" + (bead.get("description") or "")
-    return extract_wip_claims(text)
+    return extract_serialize_with(text)
 
 
-def overlap_check(bead_id: str, bead: dict, in_progress: list[dict]) -> str | None:
-    """Re-homed pre-dispatch-overlap (SABLE-bldh.8): ADVISORY ONLY, matching the
-    original hook — does not block. Warns when this bead's WIP-CLAIMS files
-    overlap a DIFFERENT in-progress bead's claims, so a coord bead can be filed
-    if needed. Same-bead duplication is handled separately (blocking) by
-    already_in_progress_check(). Returns a warning string to print, or None."""
-    my_files = bead_claimed_files(bead)
+class OverlapVerdict(NamedTuple):
+    """decision: 'none' (CHECK COMPLETED, no overlap) | 'deny' (SCHEDULING
+    CONSTRAINT — the spawn must be refused) | 'allow' (overlap permitted via a
+    matching Serialize-with line; tagged_ids names the partner bead(s) to tag
+    serialize_with on both sides) | 'could-not-assess' (SABLE-47try — THE CHECK
+    DID NOT RUN, because the dispatching bead's footprint could not be read).
+
+    'could-not-assess' exists so that a check which never ran can no longer be
+    reported as one that ran and found nothing. It is a distinct outcome
+    precisely because 'none' is a POSITIVE claim — "I compared footprints and
+    they are disjoint" — and the old empty-footprint short-circuit returned it
+    without comparing anything.
+
+    `warnings` is the non-fatal channel: conditions that degrade the check
+    without preventing it (an IN-PROGRESS bead whose own footprint could not be
+    read, so it could not be compared against; a dispatching bead readable in
+    one source and unreadable in another). The caller must surface these on
+    every decision, including 'none' — a silently partial comparison is the
+    same failure this bead is about, one degree weaker."""
+    decision: str
+    message: str = ""
+    tagged_ids: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+def overlap_check(bead_id: str, bead: dict, in_progress: list[dict],
+                  bundle: list[dict] | tuple[dict, ...] = ()) -> OverlapVerdict:
+    """SABLE-jd5fj.6: overlap flips from ADVISORY (re-homed pre-dispatch-overlap,
+    SABLE-bldh.8) to a SCHEDULING CONSTRAINT. A declared footprint overlapping a
+    DIFFERENT in-progress bead's footprint DENIES the dispatch. Two named outs:
+    wait for the in-progress bead to clear, or name the overlapping bead(s) in
+    an explicit 'Serialize-with: <bead-id>' line (bead notes/description) — that
+    ALLOWS the dispatch, and the caller tags both beads' `serialize_with`
+    metadata so Chuck's for-chuck handoff sequences the merges together. Naming
+    an unrelated bead in Serialize-with does not launder an uncovered overlap:
+    every overlap hit must be covered, or the whole dispatch still denies.
+    Same-bead duplication is handled separately (blocking) by
+    already_in_progress_check().
+
+    SABLE-47try: this function used to open with `if not my_files: return
+    OverlapVerdict("none")` — one line that returned the CLEAN-RESULT verdict
+    for a bead whose footprint the parser could not read, silently reverting
+    jd5fj.6's constraint to nothing at all for that bead and leaving no event
+    anywhere. The three outcomes below are now distinguished explicitly:
+    declares-nothing releases, unreadable is 'could-not-assess', and a
+    partially-read footprint still checks but warns.
+
+    SABLE-fz8kd: *** THE UNIT OF COMPARISON IS THE DISPATCH, NOT THE LEAD BEAD.
+    *** `bundle` is the sibling beads (SABLE-q13h) this same invocation is
+    dispatching into the SAME worktree/branch. They are claimed up front, so by
+    the time this ran they appeared in `in_progress` as if they were foreign
+    concurrent work — and since the whole reason to bundle two beads is that
+    they touch the same files, a well-formed bundle DENIED ITSELF
+    deterministically. The lead was excluded by `oid == bead_id`; its siblings
+    were not.
+
+    Two things follow from "the dispatch is the unit", and they must move
+    together or the fix trades one silent failure for another:
+
+      (a) every dispatched id is excluded from the candidate list, and
+      (b) every dispatched bead's footprint is UNIONED into the footprint being
+          compared. Without (b), (a) would quietly SHRINK the constraint —
+          a sibling's files would stop being contended for at all, which is the
+          gate-that-can-never-deny failure and the exact mirror of SABLE-47try's
+          gate-that-can-never-release.
+
+    This is the shape hooks/multi-manager/pre-dispatch-overlap.sh (the shell
+    twin of this gate) has always had: it aggregates DISPATCH_IDS' footprints
+    and skips `bid in dispatch_ids`. The python side compared only the lead.
+    Serialize-with is unioned across the dispatch for the same reason — one
+    worker, one branch, one merge, so the grant belongs to the dispatch."""
+    dispatch = [bead, *bundle]
+    dispatch_ids = {bead_id} | {b.get("id", "") for b in bundle if b.get("id")}
+    ids_label = bead_id if not bundle else (
+        f"{bead_id} (+{', '.join(sorted(dispatch_ids - {bead_id}))})")
+    mine = read_bead_footprint(bead)
+    for sibling in bundle:
+        mine = mine.merge(read_bead_footprint(sibling))
+    if mine.could_not_assess:
+        # SABLE-47try: the one outcome that must never be spelled 'none'. Every
+        # declared-footprint source this bead offered was present and yielded
+        # nothing, so there is no footprint to compare and the constraint CANNOT
+        # BE EVALUATED. Reported as its own decision; the caller refuses.
+        return OverlapVerdict(
+            "could-not-assess",
+            f"OVERLAP CHECK COULD NOT RUN — {ids_label} declares a file footprint "
+            f"that could not be read ({', '.join(mine.unreadable_sources)} present "
+            "but naming no path). The overlap SCHEDULING CONSTRAINT cannot be "
+            "evaluated against an unreadable footprint, and a check that did not "
+            "run must not be reported as one that found no overlap. Fix the "
+            "footprint on the bead (a '## File footprint' section listing "
+            "comma-separated paths), or remove the empty declaration entirely if "
+            "this bead genuinely touches no declared files — a bead that declares "
+            "NO footprint dispatches normally.")
+    my_files = mine.files
+    warnings: list[str] = []
+    if mine.unreadable_sources:
+        # Readable in at least one source, so the check CAN run — but on a
+        # footprint that is possibly short. Degraded, not disabled: say so.
+        warnings.append(
+            f"{ids_label}'s footprint was read from some sources but not all "
+            f"({', '.join(mine.unreadable_sources)} present but naming no path) "
+            "— the overlap check below ran against a possibly-incomplete footprint.")
     if not my_files:
-        return None
-    hits = []
+        # The genuine declares-nothing case: no footprint source was present at
+        # all. This bead collides with nothing and MUST still dispatch — see the
+        # do-not clause on SABLE-47try. A gate that can never release is
+        # indistinguishable from correct caution.
+        return OverlapVerdict("none", warnings=tuple(warnings))
+    hits: list[tuple[str, str, list[str]]] = []
     for other in in_progress:
         oid = other.get("id", "")
-        if not oid or oid == bead_id:
+        # SABLE-fz8kd: `dispatch_ids`, not just `bead_id` — a bundle sibling in
+        # this list is THIS invocation's own claim, not a competitor.
+        if not oid or oid in dispatch_ids:
             continue
-        shared = my_files & bead_claimed_files(other)
+        theirs = read_bead_footprint(other)
+        if theirs.unreadable_sources:
+            # The same defect on the OTHER side: an in-progress bead whose
+            # footprint cannot be read drops silently out of the comparison, so
+            # a real overlap with it would go unseen. WARN rather than deny —
+            # denying here would let one malformed in-progress bead block every
+            # unrelated dispatch, which is the reverted-within-a-day failure.
+            warnings.append(
+                f"in-progress {oid} declares a footprint that could not be read "
+                f"({', '.join(theirs.unreadable_sources)} present but naming no "
+                "path) — it could not be compared against, so an overlap with it "
+                "would NOT have been detected.")
+        shared = my_files & theirs.files
         if shared:
-            assignee = other.get("assignee") or "unassigned"
-            hits.append(f"  - {oid} ({assignee}, in-progress): {', '.join(sorted(shared))}")
+            hits.append((oid, other.get("assignee") or "unassigned", sorted(shared)))
     if not hits:
-        return None
-    return ("OVERLAP DETECTED — this dispatch shares files with active in-progress "
-            "work:\n" + "\n".join(hits) + "\n\nProceeding. File a coord bead if "
-            "collaboration/sequencing is needed.")
+        return OverlapVerdict("none", warnings=tuple(warnings))
+
+    serialize_with = set().union(*(bead_serialize_with(b) for b in dispatch))
+    uncovered = [h for h in hits if h[0] not in serialize_with]
+    if uncovered:
+        lines = "\n".join(
+            f"  - {oid} ({assignee}, in-progress): {', '.join(files)}"
+            for oid, assignee, files in uncovered
+        )
+        return OverlapVerdict(
+            "deny",
+            "OVERLAP DETECTED — this dispatch shares declared footprint with "
+            f"active in-progress work:\n{lines}\n\nSCHEDULING CONSTRAINT: "
+            "dispatch denied. Wait for the overlapping bead to clear, or add "
+            "an explicit 'Serialize-with: <bead-id>' line naming it to proceed "
+            "— both merges will be tagged serialize-together for Chuck.",
+            warnings=tuple(warnings),
+        )
+    tagged = tuple(sorted({h[0] for h in hits}))
+    return OverlapVerdict(
+        "allow",
+        f"SERIALIZE-WITH ACCEPTED — overlap with {', '.join(tagged)} permitted; "
+        "tagging serialize-together for Chuck's handoff.",
+        tagged,
+        tuple(warnings),
+    )
+
+
+def tag_serialize_with(bead_id: str, partner_id: str) -> None:
+    """Append `partner_id` to `bead_id`'s serialize_with metadata (dedup,
+    sorted csv) — mirrors the wip_claims append convention
+    (edit-write-claim-reconciler.sh) so a later metadata write from elsewhere
+    never clobbers it. Best-effort: swallows bd errors, matching the rest of
+    this module's fail-open governance writes."""
+    try:
+        current = parse_bead(_run(["bd", "show", bead_id, "--json"])) \
+            .get("metadata", {}).get("serialize_with", "") or ""
+    except Exception:
+        current = ""
+    existing = {p.strip() for p in current.split(",") if p.strip()}
+    existing.add(partner_id)
+    new_value = ",".join(sorted(existing))
+    subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata",
+                    f"serialize_with={new_value}"], capture_output=True, text=True)
+
+
+def tag_branch_metadata(bead_id: str, branch: str) -> None:
+    """Record `branch` as STRUCTURED metadata on `bead_id` (SABLE-i5739): the
+    reconciliation floor (bin/sable-reconcile-handoffs find_work_bead_status)
+    resolves a branch to its work bead by an EXACT metadata key/value match,
+    never prose, so this write is what makes that resolution possible at all
+    for a branch whose bead text never happens to name it. A plain overwrite
+    (not an append like tag_serialize_with) — a bead has exactly one branch
+    per dispatch, and a --respawn into the SAME worktree/branch just re-sets
+    the same value. Best-effort: swallows bd errors, matching the rest of
+    this module's fail-open governance writes — a missed tag degrades
+    resolution to the legacy prose fallback, it never blocks dispatch."""
+    subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata",
+                    f"branch={branch}"], capture_output=True, text=True)
+
+
+def tag_footprint_metadata(bead_id: str, description: str) -> None:
+    """Record the planner-declared write/read footprint as STRUCTURED metadata
+    at dispatch time (SABLE-jd5fj.10, tarzan's settled schema): footprint_writes
+    and footprint_reads_declared, each a flat comma-joined string list --
+    matching how branch/model/wip_claims are already carried in this same flat
+    dict. footprint_reads_derived is part of the settled schema too, but it is
+    POPULATED by the mechanical-derivation follow-up bead, never here.
+
+    THE WRITER-SIDE TRAP (optimus's brief, this is the acceptance criterion):
+    a key must be OMITTED entirely when `description` supplies no section for
+    it -- stamping an empty list instead would silently convert UNDECLARED
+    into DECLARED-EMPTY, which the jd5fj.18 read/write floor cannot tell apart
+    from an explicit "this bead reads nothing" and would therefore wrongly
+    release the bead for parallel promotion. A section that IS present, even
+    naming zero paths, DOES get an explicit metadata value (possibly the empty
+    string) -- that is the declared-empty state and it must stay
+    distinguishable from absence at the far end (sable_footprint_lib's
+    _metadata_entries: key-not-in-dict is None, key-present is a frozenset,
+    however small).
+
+    Best-effort like every other governance write in this module (branch,
+    model, serialize_with): a missed tag degrades to the prose fallback in
+    sable_footprint_lib, it never blocks dispatch."""
+    # SABLE-47try/SABLE-qm9ky: reads the PRESENCE signal, not just the paths.
+    # This used to be `if extract_footprint_section(description):`, which could
+    # not implement the criterion stated above — a present-but-empty section is
+    # falsy, so the key would be OMITTED and DECLARED-EMPTY would silently
+    # become UNDECLARED. The gap was invisible while the parser's heading-scrape
+    # bug made that case return the junk token '##': it was truthy, so the key
+    # was always stamped, with garbage. Fixing the parser exposed the writer.
+    # read_footprint_section reports the heading as an unreadable source exactly
+    # when it was FOUND and yielded nothing, so `files or unreadable_sources`
+    # is "the planner supplied a section", which is what this key encodes.
+    writes_read = read_footprint_section(description)
+    if writes_read.files or writes_read.unreadable_sources:
+        subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata",
+                        f"footprint_writes={','.join(sorted(writes_read.files))}"],
+                       capture_output=True, text=True)
+
+    reads_declared, reads = fp_lib.parse_declared_reads(description)
+    if reads_declared:
+        subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata",
+                        f"footprint_reads_declared={','.join(sorted(reads))}"],
+                       capture_output=True, text=True)
+
+
+def tag_model_metadata(bead_id: str, model: str, source: str) -> None:
+    """Record which model ACTUALLY RAN this bead, as structured metadata
+    (SABLE-qw9jv): `model=<m>` plus `model_source=<override|label|default|
+    worker-cmd-override>`.
+
+    Nothing in the bead record used to capture this. A dispatch's `model:`
+    label, a manager note, a dispatch prompt line — all of them are INTENT, and
+    this fleet's own rule is that an instruction written into a bead is never
+    evidence it executed. So a shift's worth of haiku-vs-sonnet analysis was
+    unanswerable from the moment it was asked, across eight beads with zero
+    durable attributions. This write is the artefact: emitted by the spawn
+    path, not typed by a manager, and only AFTER the pane actually launched —
+    a spawn refused by the throttle/host-guard/composer-posture gate writes
+    nothing, so a bead refused at one tier and re-dispatched at another shows
+    the tier that RAN, not the one first attempted.
+
+    A plain overwrite, like tag_branch_metadata: a re-dispatch supersedes the
+    previous attempt (dolt history keeps the prior values for anyone
+    reconstructing the whole sequence). Best-effort — swallows bd errors,
+    matching every other governance write here; a missed stamp must never
+    block a dispatch."""
+    for kv in (f"model={model}", f"model_source={source}"):
+        subprocess.run(["bd", "update", bead_id, "--sandbox", "--set-metadata", kv],
+                       capture_output=True, text=True)
 
 
 def bead_already_claimed_by_lane(bead: dict, lane: str) -> bool:
@@ -344,6 +971,146 @@ def preempt_check(lane: str, inbox: list[dict]) -> str | None:
             "\"deferred: <reason>\" then bd defer <id>.")
 
 
+# --- unmerged-blocker advisory (SABLE-d5iku) ---------------------------------
+#
+# `bd ready` releases a dependent the instant its blocker's STATUS becomes
+# closed. What a BASE-PREMISE bead needs is the blocker's CODE present on the
+# branch it forks from, and those two events are separated by the whole merge
+# queue. Every `bd dep add` used for structural sequencing therefore carries a
+# false-release window in which the graph says go and the tree says not yet —
+# and the false release looks EXACTLY like a correct one.
+#
+# THIS IS THE CHECK SITE, and it is here for a reason that cost one review
+# cycle: the surfacing first landed in hooks/multi-manager/pre-dispatch-claim.sh,
+# which is registered PreToolUse with matcher `Agent`. Managers do not dispatch
+# workers with the Agent tool — they call THIS program, which is a bash
+# invocation, so the guard was structurally incapable of firing on the only
+# path it exists to guard (the bead's own live instance, SABLE-78kxu released
+# by a closed-but-unmerged SABLE-9boz4, was a sable-spawn-worker dispatch).
+# The hook leg is kept as a secondary surface for Agent-tool producer spawns;
+# this one is the primary. Do not move it back.
+#
+# ADVISORY AND FAIL-OPEN, never a deny. Merge state has genuine unresolvable
+# cases (pruned branches, stale remote-tracking refs, beads carrying no branch
+# at all), so a withhold would trade the false-go for a false-block — and the
+# ruled severity criterion makes DENY conditional on reliably discriminating
+# base-premise edges from ordinary deps, which nothing in the graph does today.
+# Option (b), merge-aware readiness at the source, lives in bd core.
+
+def resolve_dep_check_bin() -> str | None:
+    """Locate bin/sable-dep-check: explicit override, then PATH (the installed
+    spine bin), then this program's own sibling for a dev checkout whose bins
+    are not installed. Absent everywhere => None, and the advisory is skipped
+    silently — a missing tool must never cost a dispatch."""
+    override = os.environ.get("SABLE_DEP_CHECK_BIN", "")
+    if override:
+        return override if os.access(override, os.X_OK) else None
+    found = shutil.which("sable-dep-check")
+    if found:
+        return found
+    sibling = Path(__file__).resolve().parent / "sable-dep-check"
+    return str(sibling) if os.access(sibling, os.X_OK) else None
+
+
+# sable-dep-check's EXIT_UNKNOWN (SABLE-wezu1). Mirrored as a literal rather
+# than imported — this program has no import path to a sibling CLI script, and
+# the value is part of that tool's documented exit-code contract, not an
+# implementation detail liable to drift silently under it.
+_DEP_CHECK_EXIT_UNKNOWN = 4
+
+
+def _dep_check_could_not_assess(reason: str) -> str:
+    """The report dep_merge_advisory emits when sable-dep-check could not run
+    to completion and left no text of its own to relay (SABLE-wezu1) — a bd
+    hiccup that hangs or errors the OUTER call, not the tool's own well-formed
+    exit-4 report (which already carries text via render_unknown_block and is
+    simply returned as-is). Distinct from both the clean-silent `None` and a
+    real UNMERGED-BLOCKER WARNING, so a manager reading stderr cannot mistake
+    "I could not check" for "I checked, and it's clean"."""
+    return (f"UNMERGED-BLOCKER CHECK COULD NOT ASSESS (SABLE-wezu1): {reason}. "
+            "Merge state of any blocker is UNKNOWN, not verified — the "
+            "dispatch is NOT blocked by this, but verify containment by hand "
+            "before dispatching anything sequenced behind another bead: "
+            "git merge-base --is-ancestor <blocker-branch> <integration>.")
+
+
+def dep_merge_advisory(bead_ids: list[str], repo: str) -> str | None:
+    """Run the checker over the beads being dispatched and return its warning
+    or could-not-assess text, or None only on the genuinely healthy path.
+
+    `--format=hook` prints a block and NOTHING when clean, so for a run that
+    completes, emptiness is read as "checked, clean" and any text — a WARNING
+    or the tool's own COULD-NOT-ASSESS block — is relayed unchanged; the exit
+    code is not needed to tell those apart, because the tool's exit-4 path
+    always carries its own text (render_unknown_block).
+
+    But the checker not completing at all is a SEPARATE could-not-assess door,
+    and it used to collapse into the same `None` the healthy path returns
+    (SABLE-wezu1): a bd hiccup that hangs the OUTER subprocess.run past
+    `timeout`, or one that raises before any text is captured, left nothing to
+    relay. Those legs now report explicitly instead of going silent.
+
+    So does ANY process that exits with no text and a nonzero code — not just
+    the documented exit 4. The first pass here denylisted exit 4 specifically
+    and left a residual door: an UNEXPECTED crash (e.g. exit 1, a traceback on
+    stderr, empty stdout) fell through to the same `return None` as a healthy
+    run, because nothing named exit 1 as bad. A denylist can always be
+    outrun by an exit code nobody enumerated. So this enumerates the single
+    LEGAL silent case instead — exit 0 with no text, i.e. genuinely clean —
+    and treats every other empty-text outcome as COULD NOT ASSESS, trimmed
+    stderr included when the checker left any (it is captured either way and
+    was previously discarded on this leg, forcing a manager to reproduce the
+    crash by hand to learn anything).
+
+    The fail-OPEN decision is unchanged either way: this function never blocks
+    the dispatch, it only changes what the manager reads on stderr. Disable
+    entirely with SABLE_DEP_MERGE_GUARD=0.
+
+    Timeout is larger than the hook leg's (which must fit a 5s PreToolUse
+    budget); here the only cost of waiting is dispatch latency, and the
+    checker's floor is two `bd` invocations at ~0.8s of process startup each
+    (SABLE-kqaj9). Tune with SABLE_DEP_CHECK_TIMEOUT."""
+    if os.environ.get("SABLE_DEP_MERGE_GUARD", "1") != "1":
+        return None
+    ids = [b for b in bead_ids if b]
+    if not ids:
+        return None
+    binary = resolve_dep_check_bin()
+    if not binary:
+        return None
+    try:
+        timeout = float(os.environ.get("SABLE_DEP_CHECK_TIMEOUT", "8"))
+    except ValueError:
+        timeout = 8.0
+    try:
+        proc = subprocess.run(
+            [binary, "--format=hook", "--repo", repo, *ids],
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return _dep_check_could_not_assess(
+            f"sable-dep-check did not finish within {timeout:g}s (bd likely "
+            "contended/locked) — the check was killed before it could report")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _dep_check_could_not_assess(
+            f"sable-dep-check failed to run — {exc}")
+    out = (proc.stdout or "").strip()
+    if out:
+        return out
+    if proc.returncode == 0:
+        return None
+    if proc.returncode == _DEP_CHECK_EXIT_UNKNOWN:
+        reason = (
+            f"sable-dep-check exited {_DEP_CHECK_EXIT_UNKNOWN} (COULD NOT "
+            "ASSESS) but produced no report text")
+    else:
+        reason = f"sable-dep-check exited {proc.returncode} with no report text"
+    stderr = (proc.stderr or "").strip()
+    if stderr:
+        trimmed = stderr if len(stderr) <= 500 else stderr[:500] + "…"
+        reason += f" — stderr: {trimmed}"
+    return _dep_check_could_not_assess(reason)
+
+
 # --- dispatch throttle + host-resource guard (SABLE-mmdt) ---------------------
 #
 # 3 managers x ~15 concurrent worker panes + the Docker stack froze the WSL host
@@ -353,14 +1120,29 @@ def preempt_check(lane: str, inbox: list[dict]) -> str | None:
 # --skip-governance — they protect the HOST, not bead hygiene.
 
 # Tab-delimited like sable-worker-status's _FORMAT (SABLE-exab: empty fields
-# collapse under space-joining, shifting columns).
-_CAP_FORMAT = "#{@sable_role}\t#{@sable_status}\t#{@sable_class}"
+# collapse under space-joining, shifting columns). #{window_name} (SABLE-6xtx)
+# mirrors the same fallback field sable-worker-status's classifier added — this
+# counter had the identical tag-only blindness (a pane whose
+# @sable_role/@sable_class tags are absent/lost was invisible here too). A
+# live-process-based (#{pane_current_command}) done override was ALSO tried
+# here and reverted: this project's integration-test fixtures simulate a
+# "running" worker with a plain `bash --noprofile --norc` pane and never
+# launch a real claude process, so the live foreground command is indistinguishable
+# from "claude exited" by that heuristic — see sable-worker-status's
+# WINDOW_NAME_WORKER_PREFIX comment for the full incident.
+_CAP_FORMAT = "#{@sable_role}\t#{@sable_status}\t#{@sable_class}\t#{window_name}"
+
+# SABLE-6xtx: sable-spawn-worker's own window_name() always stamps this prefix
+# at creation, independent of the @sable_role/@sable_class pane options — the
+# same fallback classification signal sable-worker-status uses.
+_WINDOW_NAME_WORKER_PREFIX = "worker-"
 
 
 def count_live_workers(listing: str) -> int:
     """Live worker panes in a `list-panes -F _CAP_FORMAT` listing: class-stamped
-    workers plus legacy classless panes whose role starts with 'worker' (the
-    same recognition rule as sable-worker-status), excluding done panes — a
+    workers plus legacy classless panes whose role starts with 'worker' OR
+    whose window name carries the worker-<bead> prefix (SABLE-6xtx fallback —
+    the same recognition rule as sable-worker-status), excluding done panes — a
     done-but-unreaped worker has released its claude process and must not hold
     a dispatch slot. Managers and bounded producers never count. An EMPTY
     status counts as live: a just-spawned pane may not carry its tag yet."""
@@ -370,7 +1152,9 @@ def count_live_workers(listing: str) -> int:
         role = parts[0] if parts else ""
         status = parts[1] if len(parts) >= 2 else ""
         cls = parts[2] if len(parts) >= 3 else ""
-        is_worker = cls == "worker" or (not cls and role.startswith("worker"))
+        window = parts[3] if len(parts) >= 4 else ""
+        is_worker = cls == "worker" or (
+            not cls and (role.startswith("worker") or window.startswith(_WINDOW_NAME_WORKER_PREFIX)))
         if is_worker and status != "done":
             n += 1
     return n
@@ -785,6 +1569,51 @@ def parse_bundle_ids(raw: str | None, lead_id: str) -> list[str]:
     return out
 
 
+COMMENTS_RENDER_LIMIT = 20
+
+
+def render_notes_section(notes: str) -> str:
+    """Render a bead's `notes` field as its own labelled section in the
+    dispatch prompt (SABLE-h8swc), placed after the description. Notes are
+    already load-bearing for the footprint/serialize-with gates (:PULLED by
+    machinery) but were never PUSHED to the dispatched worker -- this is
+    where manager rulings, revise briefs and merge-seat diagnoses actually
+    live. Returns "" for empty/whitespace notes so a note-free bead does not
+    grow a dangling empty header on every dispatch."""
+    notes = (notes or "").strip()
+    if not notes:
+        return ""
+    return f"\n## Notes\n\n{notes}\n"
+
+
+def render_comments_section(comments: list[dict] | None,
+                            limit: int = COMMENTS_RENDER_LIMIT) -> str:
+    """Render a bead's comments, oldest-first / newest-last, each stamped
+    with author and date (SABLE-pruak) -- a comment is the natural place an
+    operator or cockpit ruling that OVERTURNS a bead's premise lands, and the
+    dispatch prompt previously never rendered them at all. Comments beyond
+    `limit` are dropped from the render, but the total count is always
+    stated so truncation is VISIBLE rather than indistinguishable from zero
+    comments. Returns "" for an empty/absent comment list so a comment-free
+    bead does not grow a dangling empty header."""
+    comments = comments or []
+    if not comments:
+        return ""
+    ordered = sorted(comments, key=lambda c: c.get("created_at") or "")
+    total = len(ordered)
+    shown = ordered[-limit:] if total > limit else ordered
+    header = f"\n## Comments ({total} total"
+    if total > limit:
+        header += f", showing most recent {limit}"
+    header += ")\n"
+    body = "".join(
+        f"\n- **{c.get('author', 'unknown')}** "
+        f"({c.get('created_at', 'unknown date')}):\n  {c.get('text', '')}\n"
+        for c in shown
+    )
+    return header + body
+
+
 def bundle_ready_for_done(bundle_ids: list[str], bead_statuses: dict[str, str]) -> str | None:
     """The done-flag gate for a bundled dispatch (SABLE-q13h): returns None
     when every id in `bundle_ids` is closed per `bead_statuses`, else an error
@@ -804,21 +1633,32 @@ def bundle_ready_for_done(bundle_ids: list[str], bead_statuses: dict[str, str]) 
 
 
 def assemble_dispatch_prompt(bead_id, title, description, worktree, branch, model,
-                             bundle: list[dict] | None = None) -> str:
+                             bundle: list[dict] | None = None,
+                             notes: str = "",
+                             comments: list[dict] | None = None) -> str:
     """`bundle` (SABLE-q13h), when non-empty, is a list of {id, title,
-    description} dicts for sibling beads dispatched alongside `bead_id` in the
-    SAME worktree/branch. Every bundled bead's FULL description is rendered
-    inline here — not left for the worker to go find in a lead bead's notes
-    (the fybj+vyhn failure: a worker never read past the dispatch prompt into
-    notes where a bundle addendum lived) — and the bundle contract below binds
-    the worker to every listed bead regardless of claim state (the 7a6h+np7c
-    failure: a worker declined a bundled bead because a manager pre-claim made
-    it look separately-owned)."""
+    description, notes, comments} dicts for sibling beads dispatched alongside
+    `bead_id` in the SAME worktree/branch. Every bundled bead's FULL
+    description is rendered inline here — not left for the worker to go find
+    in a lead bead's notes (the fybj+vyhn failure: a worker never read past
+    the dispatch prompt into notes where a bundle addendum lived) — and the
+    bundle contract below binds the worker to every listed bead regardless of
+    claim state (the 7a6h+np7c failure: a worker declined a bundled bead
+    because a manager pre-claim made it look separately-owned).
+
+    `notes` / `comments` are the lead bead's own fields, rendered the same
+    way each bundled sibling's are (SABLE-h8swc / SABLE-pruak): a manager
+    ruling, revise brief or merge-seat diagnosis routinely lands in one of
+    these two fields rather than the description, and until this fix neither
+    was ever rendered into the dispatch prompt at all — reachable only by a
+    worker choosing to run `bd show`/`bd comments` unprompted."""
     bundle = bundle or []
     all_ids = [bead_id] + [b["id"] for b in bundle]
 
     bundled_sections = "".join(
         f"\n## Bundled bead — {b['id']}: {b['title']}\n\n{b['description']}\n"
+        f"{render_notes_section(b.get('notes', ''))}"
+        f"{render_comments_section(b.get('comments'))}"
         for b in bundle
     )
 
@@ -859,7 +1699,24 @@ Worker model: {model}
 {bead_id}: {title}
 
 {description}
-{bundled_sections}{bundle_contract}
+{render_notes_section(notes)}{render_comments_section(comments)}{bundled_sections}{bundle_contract}
+## Declaring file footprint / reads (SABLE-50z5g)
+If you author or edit ANY bead's `## File footprint` or `## File reads`
+section (a new bead, a follow-up split, a bundle sibling), the two headings
+have DIFFERENT parsing rules and DIFFERENT failure directions — do not give
+them the same form:
+  - `## File footprint` (writes): every path on ONE comma-separated line. A
+    newline-per-path or hyphen-bulleted reformat SILENTLY DROPS 3 of 4 entries
+    (measured, SABLE-546m5) — the writer's own declaration narrows with no
+    error. Do not "tidy" this into one path per line.
+  - `## File reads`: any layout is fine, but every entry must contain a slash
+    or end in a known code suffix — a bare Makefile, Dockerfile, .env, an
+    extensionless script, or a directory missing its trailing slash is
+    SILENTLY DROPPED once the heading is present (SABLE-zx2yv).
+  - When unsure, OVER-DECLARE. Forced serialization and an extra preview are
+    recoverable; an under-declared footprint that collides with a live worker
+    is not caught by anything.
+
 ## Contract
 - Verify current state first; if the work is already done / clean, STOP and report.
 - Implement, then run the UNIT and INTEGRATION tests; capture the exact command + output.
@@ -867,6 +1724,19 @@ Worker model: {model}
   `git push` from this CWD. NEVER use `git -C <other-tree>` — your CWD is the
   worktree (this deletes the SABLE-041 wrong-tree bug). Do NOT bypass pre-push.
 - The post-push hook files the for-chuck handoff; Chuck merges. You do NOT open PRs.
+- State the plant-and-fail verdict in your close evidence — required on every
+  close, regardless of whether this dispatch prompt happened to ask for it
+  (SABLE-4jogz: an unreported verdict is indistinguishable from an
+  unperformed one). Exactly three legal values, so silence is never mistaken
+  for non-applicability:
+    NOT TRIGGERED (state the basis, e.g. zero removed/weakened assertions,
+      measured)
+    TRIGGERED AND CLEARED (state what you read and why it is not a weakening)
+    TRIGGERED AND DEMONSTRATED (state the control shown to bite, both
+      polarities where applicable)
+  Put it in the `bd close --reason` text itself — that is the field
+  compliance checks read (SABLE-bp57h: `bd close` writes `close_reason`, not
+  `notes`).
 - {close_line} with the test evidence. Check the exit code for each close —
   a non-zero exit (e.g. the TDD gate denying the close) means it did NOT
   close. Do not report success on a failed close; read the gate's stderr
@@ -996,8 +1866,25 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- fetch bead for the prompt + label-based model resolution ---
     bead = parse_bead(_run(["bd", "show", bid, "--json"]))
-    model, reason = resolve_model(bead_labels(bead), ns.model)
+    model, reason, model_source = resolve_model(bead_labels(bead), ns.model)
     lane = resolve_lane(ns.lane)
+
+    # SABLE-mn1da: announce the model AND why, BEFORE any governance step that
+    # can refuse — a manager must be able to see that a flat default (not a
+    # ladder) picked the tier even on a spawn that never reaches the pane.
+    sys.stderr.write("sable-spawn-worker: model selection — "
+                     f"{model_announcement(model, reason, model_source)}\n")
+
+    # --- SABLE-kv44f: refuse a dispatch whose description is empty while its
+    # notes hold substantive content — a worker prompt is built from the
+    # description (SABLE-h8swc/SABLE-pruak render notes/comments AFTER it,
+    # not INSTEAD of it), so an empty description hands the worker nothing to
+    # build from. Content check, not a governance race — runs unconditionally,
+    # even under --skip-governance, and before any bd WRITE. ---
+    content_err = dispatch_content_guard(bead.get("description", ""), bead.get("notes", ""))
+    if content_err:
+        sys.stderr.write(f"sable-spawn-worker: dispatch-content blocked — {content_err}\n")
+        return 13
 
     # --- SABLE-q13h: fetch bundled sibling beads (if any) for the prompt.
     # Fetched unconditionally (even under --skip-governance) since prompt
@@ -1023,21 +1910,28 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"sable-spawn-worker: model-check blocked — {err}\n")
             return 3
 
-        # SABLE-3eax (a): a respawn (REVISE / push-only close-out) may target a
-        # CLOSED bead — reopen it to in_progress FIRST, or the `bd update --claim`
-        # that follows a non-respawn path traceback-crashes on it AND the worker's
-        # own `bd close` has nothing to close. model-check above already ran, so
-        # keeping it active is preserved.
-        if ns.respawn and needs_reopen(bead):
-            reopen = subprocess.run(["bd", "update", bid, "--status", "in_progress"],
-                                    capture_output=True, text=True)
-            if reopen.returncode != 0:
-                sys.stderr.write(f"sable-spawn-worker: respawn could not reopen closed "
-                                 f"bead {bid}: {reopen.stderr.strip()}\n")
-                return 5
-            bead["status"] = "in_progress"
-            sys.stderr.write(f"sable-spawn-worker: respawn reopened closed bead {bid} "
-                             "-> in_progress\n")
+        # SABLE-d5iku: unmerged-blocker advisory. FIRST advisory in the chain,
+        # ahead of the duplicate/preempt/claim steps, so the manager sees the
+        # warning even when a later governance step refuses the dispatch — and
+        # so it is emitted before the first bd WRITE rather than after. Covers
+        # the lead bead and every --bundle sibling, since a bundle sibling can
+        # be the base-premise bead just as easily as the lead. Never blocks.
+        # Judged in the dispatch CWD (git reads work from any subdirectory, and
+        # unlike _repo_toplevel() it cannot raise) — merge state is a property
+        # of the repo being dispatched into, never of this program's location.
+        dep_warning = dep_merge_advisory([bid, *bundle_ids], os.getcwd())
+        if dep_warning:
+            sys.stderr.write(f"sable-spawn-worker: {dep_warning}\n")
+
+        # SABLE-fz8kd: THE STATUS WRITES ARE NOW BELOW, AFTER EVERY GATE THAT CAN
+        # REFUSE — see the "claims land here" block. The duplicate guard still
+        # has to judge a respawn AS IF the reopen had already happened: a CLOSED
+        # bead short-circuits already_in_progress_check to None, which would skip
+        # the live-pane refusal that is the whole point of the guard on a
+        # respawn. So the reopen's EFFECT is modelled locally here, on a copy,
+        # instead of by mutating the store ahead of a gate that may say no.
+        dup_bead = ({**bead, "status": "in_progress"}
+                    if (ns.respawn and needs_reopen(bead)) else bead)
 
         # SABLE-676c: an IN_PROGRESS bead is a duplicate ONLY when dispatch
         # evidence exists — a RUNNING worker pane tagged with the bead, or the
@@ -1049,7 +1943,7 @@ def main(argv: list[str] | None = None) -> int:
         tl = "" if ns.worktree else _repo_toplevel()
         wt_ev = worktree_dispatch_exists(
             prospective_worktree_path(bid, ns.scope, ns.worktree, tl))
-        dup_err = already_in_progress_check(bead, pane_ev, wt_ev, respawn=ns.respawn)
+        dup_err = already_in_progress_check(dup_bead, pane_ev, wt_ev, respawn=ns.respawn)
         if dup_err:
             sys.stderr.write(f"sable-spawn-worker: duplicate-dispatch blocked — {dup_err}\n")
             return 5
@@ -1061,7 +1955,53 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stderr.write(f"sable-spawn-worker: preempt blocked — {preempt_err}\n")
                 return 6
 
+        in_progress = parse_bead_list(_run(["bd", "list", "--status=in_progress", "--json"]))
+        overlap_verdict = overlap_check(bid, bead, in_progress, bundle_beads)
+        # SABLE-47try: surfaced on EVERY decision, before any of them is acted
+        # on — a degraded comparison must be visible even when it released.
+        for warning in overlap_verdict.warnings:
+            sys.stderr.write(f"sable-spawn-worker: OVERLAP CHECK DEGRADED — {warning}\n")
+        if overlap_verdict.decision == "could-not-assess":
+            # The deliberate caller decision the bead asks for, stated here
+            # rather than left to a fallthrough: a SCHEDULING CONSTRAINT that
+            # cannot be evaluated REFUSES. Distinct exit code from the overlap
+            # deny (11) so "the gate refused" and "the gate could not run" are
+            # never conflated downstream — which is the whole defect.
+            sys.stderr.write(
+                f"sable-spawn-worker: overlap-constraint could-not-assess — "
+                f"{overlap_verdict.message}\n")
+            return 12
+        if overlap_verdict.decision == "deny":
+            sys.stderr.write(
+                f"sable-spawn-worker: overlap-constraint blocked — {overlap_verdict.message}\n")
+            return 11
+
+        # --- claims land HERE (SABLE-fz8kd), below the LAST gate that can
+        # refuse. They used to run above the overlap check, so a denied dispatch
+        # left the lead AND every bundled sibling in_progress with no worker:
+        # invisible as available work, and counted as live concurrent work by
+        # every subsequent overlap check in the fleet — a refusal that makes the
+        # NEXT refusal more likely, against work that does not exist. The bead
+        # asks for ordering over rollback (a rollback path is itself rarely
+        # exercised), so no gate below this point writes a status it may have to
+        # take back. The one write that still precedes a failure is the
+        # dispatch-typing refusal further down, which leaves the claim
+        # DELIBERATELY and says so. ---
         if ns.respawn:
+            # SABLE-3eax (a): a respawn (REVISE / push-only close-out) may target
+            # a CLOSED bead — reopen it to in_progress, or the worker's own
+            # `bd close` has nothing to close. Judged for the duplicate guard
+            # above via `dup_bead`; performed here, once the gates have passed.
+            if needs_reopen(bead):
+                reopen = subprocess.run(["bd", "update", bid, "--status", "in_progress"],
+                                        capture_output=True, text=True)
+                if reopen.returncode != 0:
+                    sys.stderr.write(f"sable-spawn-worker: respawn could not reopen closed "
+                                     f"bead {bid}: {reopen.stderr.strip()}\n")
+                    return 5
+                bead["status"] = "in_progress"
+                sys.stderr.write(f"sable-spawn-worker: respawn reopened closed bead {bid} "
+                                 "-> in_progress\n")
             # SABLE-3eax (c): a respawn is a REVISE / push-only close-out of work
             # THIS lane already owns — never re-run `bd update --claim`. The bead
             # is (re)opened above and already assigned; real `bd --claim` errors
@@ -1104,10 +2044,11 @@ def main(argv: list[str] | None = None) -> int:
         if bundle_beads:
             claim_bundle_beads(bundle_beads, lane)
 
-        in_progress = parse_bead_list(_run(["bd", "list", "--status=in_progress", "--json"]))
-        overlap_warning = overlap_check(bid, bead, in_progress)
-        if overlap_warning:
-            sys.stderr.write(f"sable-spawn-worker: {overlap_warning}\n")
+        if overlap_verdict.decision == "allow":
+            for partner in overlap_verdict.tagged_ids:
+                tag_serialize_with(bid, partner)
+                tag_serialize_with(partner, bid)
+            sys.stderr.write(f"sable-spawn-worker: {overlap_verdict.message}\n")
 
     # --- worktree ---
     if ns.worktree:
@@ -1144,16 +2085,45 @@ def main(argv: list[str] | None = None) -> int:
         _run(["bd", "worktree", "create", worktree, "--branch", wt_name])
     branch = Path(worktree).name
 
+    # SABLE-i5739: tag every bead landing in this worktree (the lead bead PLUS
+    # any --bundle siblings — they share this SAME branch, see the --bundle
+    # help text above) with the branch as structured metadata, so the
+    # reconciliation floor can resolve branch->bead without a prose search.
+    # Gated on governance like every other bd WRITE in this module (claim,
+    # overlap serialize_with tagging above) — a --skip-governance dispatch is
+    # a stand-in/test spawn against a bead this caller does not own writing
+    # to, and must leave it untouched exactly as the claim/status writes do.
+    if not ns.skip_governance:
+        beads_by_id = {bid: bead, **dict(zip(bundle_ids, bundle_beads))}
+        for tag_id in [bid, *bundle_ids]:
+            tag_branch_metadata(tag_id, branch)
+            tag_footprint_metadata(tag_id, beads_by_id[tag_id].get("description") or "")
+
+    # SABLE-ji4h: link opted-in gitignored fixtures into the worktree. Placed
+    # AFTER both arms above so a --respawn into an existing tree is repaired
+    # too, not just a freshly created one. Idempotent (skip-exists) and silent
+    # for repos that have not opted in.
+    for rel, action, _src, dst in link_fixture_paths(
+            _run(["git", "rev-parse", "--show-toplevel"]).strip(), worktree):
+        if action == "link":
+            sys.stderr.write(f"sable-spawn-worker: linked fixtures {rel} -> {dst}\n")
+        elif action.startswith("link-failed") or action == "skip-escapes-repo":
+            sys.stderr.write(f"sable-spawn-worker: fixture {rel}: {action}\n")
+
     # --- write the dispatch prompt file (keeps the worktree clean) ---
     ddir = dispatch_dir()
     ddir.mkdir(parents=True, exist_ok=True)
     dispatch_path = ddir / f"{bid}.md"
     bundle_arg = [{"id": b.get("id", i), "title": b.get("title", ""),
-                  "description": b.get("description", "")}
+                  "description": b.get("description", ""),
+                  "notes": b.get("notes", ""),
+                  "comments": fetch_bead_comments(b.get("id", i))}
                  for i, b in zip(bundle_ids, bundle_beads)]
     dispatch_path.write_text(assemble_dispatch_prompt(
         bid, bead.get("title", ""), bead.get("description", ""),
-        worktree, branch, model, bundle=bundle_arg))
+        worktree, branch, model, bundle=bundle_arg,
+        notes=bead.get("notes", ""),
+        comments=fetch_bead_comments(bid)))
 
     # --- open the worker window (stamped with the lane identity) + capture pane ---
     # SABLE-5v9n: set remain-on-exit GLOBALLY, BEFORE the window is created,
@@ -1210,9 +2180,39 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"sable-spawn-worker: WARNING dispatch may be unsubmitted in "
                          f"{pane_id}; nudge with: tmux send-keys -t {pane_id} Enter\n")
 
-    note = (f" (model {model}" + (f", override: {reason}" if reason else "")
+    # --- SABLE-qw9jv: stamp the model provenance onto the bead(s). LAST, after
+    # the pane exists and the dispatch has been typed into it, so the stamp is
+    # a record of a spawn that actually happened — every refusal path above
+    # returns before this point and leaves no attribution behind. Value comes
+    # from the command that LAUNCHED (launched_model), never from ns.model.
+    # Bundled siblings share this pane, hence this model. Gated on governance
+    # like every other bd WRITE here: a --skip-governance stand-in spawn must
+    # leave a bead it does not own untouched. ---
+    ran = launched_model(wcmd)
+    stamped_model = ran or "unknown"
+    stamped_source = model_source if ran else "worker-cmd-override"
+    if ran and ran != model:
+        sys.stderr.write(
+            f"sable-spawn-worker: NOTE launched model '{ran}' differs from the "
+            f"resolved model '{model}' (SABLE_WORKER_CMD override) — recording "
+            "what launched\n")
+    elif not ran:
+        sys.stderr.write(
+            "sable-spawn-worker: NOTE worker command names no --model "
+            f"({wcmd!r}) — recording model=unknown rather than asserting "
+            f"'{model}' ran\n")
+    if not ns.skip_governance:
+        for tag_id in [bid, *bundle_ids]:
+            tag_model_metadata(tag_id, stamped_model, stamped_source)
+
+    note = (f" ({model_announcement(model, reason, model_source)}"
             + (f", lane {lane}" if lane else "") + ")")
     sys.stderr.write(f"sable-spawn-worker: spawned {win} for {bid} at {pane_id}{note}\n")
+    sys.stderr.write(f"sable-spawn-worker: model provenance for {bid}"
+                     + (f" (+{','.join(bundle_ids)})" if bundle_ids else "")
+                     + f": model={stamped_model} model_source={stamped_source}"
+                     + (" [not stamped: --skip-governance]" if ns.skip_governance else "")
+                     + "\n")
     return 0
 
 

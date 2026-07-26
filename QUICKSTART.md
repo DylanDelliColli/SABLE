@@ -74,7 +74,7 @@ There is **one install** — no tiers, no topology choices. It:
    settings snippet (backed up; existing entries preserved)
 6. Prepends the SABLE Prime Directives to `~/.claude/CLAUDE.md` (with a timestamped backup if one already exists)
 7. Prints the base-hook JSON snippet you paste into `~/.claude/settings.json` (does NOT auto-edit that block — you review and paste). The snippet includes the `sable-doctor --quiet` SessionStart drift-warn.
-8. Stages (never activates) the reconciliation-floor host timer artifacts under `~/.claude/sable/reconcile-timer/` — activation is a deliberate operator step, commands in the install output.
+8. Stages (never activates) the reconciliation-floor host timer artifacts under `~/.claude/sable/reconcile-timer/` — activation is a deliberate operator step: one command, `sable-reconcile-timer --install-schedule`, which installs the units *and* verifies afterwards that a schedule really fires (exit 3 if not). By default it sweeps the repo you installed from; set `SABLE_RECONCILE_TARGET_REPO=<repo>[:<repo>...]` before installing to name other fleets, since a timer that sweeps one repo leaves every other fleet on the host unprotected while looking installed (SABLE-5xz68).
 
 Idempotent and safe to re-run. `bash install.sh --dry-run` reports exactly what
 would be copied and writes nothing. On native Windows, `pwsh ./install.ps1`
@@ -286,9 +286,15 @@ pane count, are what exhaust a host.
 hook loses the handoff, `sable-reconcile-handoffs` (pull-based, idempotent,
 beads-only) files the missing merge-queue bead. It runs on Chuck's wake, and
 the installer also stages a host-level 15-minute timer (systemd --user unit +
-cron fallback under `~/.claude/sable/reconcile-timer/` — activation commands in
-the install output; activating it is a deliberate operator step). Nobody
-manually sweeps for stranded branches.
+cron fallback under `~/.claude/sable/reconcile-timer/`). Activating it is a
+deliberate operator step, but a single self-verifying one —
+`sable-reconcile-timer --install-schedule` installs the units and then confirms
+against the running system that something is actually scheduled for the repos
+you named; `sable-reconcile-timer --check-schedule --repo <repo>` re-asks that
+question any time, and fails loudly both when nothing is scheduled and when a
+schedule exists but sweeps some other repo. Nobody manually sweeps for stranded
+branches — and nobody has to take "the units are on disk" as evidence that the
+floor is running.
 
 (`sable-launch` wraps the lower-level `sable-tmux` layout tool and attaches
 with `tmux attach -t "$(sable-session)"`; `sable-launch lincoln` still launches
