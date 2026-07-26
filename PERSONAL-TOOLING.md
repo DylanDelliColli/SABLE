@@ -96,7 +96,7 @@ See [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) for the full design a
 
 Files:
 - `MULTI-MANAGER-PATTERN.md` — design doc and setup instructions
-- `hooks/multi-manager/*.sh` — twelve coordination hooks (session-role-anchor, read-guard, inbox-injection, inbox-injection-precompact, pre-dispatch refresh/claim/overlap/preempt/model-check, edit-write-claim-reconciler, pre-push-rebase-test, post-push-merge-notify) + `upgrade-notes.md`
+- `hooks/multi-manager/*.sh` — coordination hooks (session-role-anchor, read-guard, pre-dispatch claim/overlap/preempt/model-check, edit-write-claim-reconciler, pre-push-rebase-test, post-push-merge-notify) + `upgrade-notes.md`. (`pre-dispatch-refresh.sh` — automatic rebase-on-dispatch — was retired, SABLE-o3xju/SABLE-mkj6k; the file remains on disk but is not registered in `settings.json`.)
 - `templates/multi-manager/agents.yaml` — agent registry: Optimus / Tarzan / Chuck (managers), Sherlock / Victor / Rudy / Columbo (planning agents), Lincoln (strategist)
 - `templates/multi-manager/roles/*.md` — role prompts injected at SessionStart (one per agent)
 - `templates/multi-manager/commands/inbox.md` — `/inbox` slash command

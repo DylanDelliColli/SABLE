@@ -14,6 +14,26 @@ registry + role files, and the SABLE skills), sha256-compares each installed
 file against its repo source, and reports MISSING / DRIFT / clean with the
 exact refresh command.
 
+For a deliberately PINNED bin, "clean" carries a strict guarantee (SABLE-0jplo):
+it means the pinned tool's own installed content is byte-identical to repo
+HEAD's copy of that file. Two distinct ways it can fail — SNAPSHOT-DRIFT (the
+pin is no longer what its own directory name claims — checked against the
+WHOLE shared snapshot directory, since hand-tampering anywhere in a frozen pin
+is an integrity concern) and SNAPSHOT-STALE (the pin is honestly named but
+this tool's own file is behind HEAD, so code merged since is merged-but-dark
+in this runtime — checked against just that one file, SABLE-5gxj3: comparing
+the whole shared directory here made every pinned tool read stale whenever any
+other, unrelated file in bin/ changed). A third status, COULD-NOT-ASSESS,
+covers a pinned file that can't be read or resolved against HEAD — held as
+drift, never silently read as clean.
+
+Installed hook copies (top-level and multi-manager) get one more, independent
+check (SABLE-9rj7m): `bash -n` against the installed file itself, not just the
+repo source. A stale-but-parseable hook already shows up as ordinary DRIFT;
+SYNTAX-ERROR is the louder, separate fact that the installed copy is actually
+broken right now — truncated, half-written by an interrupted install, or
+hand-edited in place — something a hash mismatch alone doesn't say.
+
 Usage:
   sable-doctor [--repo DIR] [--claude-dir DIR | --project] [--json] [--quiet]
 
@@ -30,16 +50,22 @@ Usage:
   --json             emit a machine-readable report instead of text
   --quiet            print nothing when clean; a one-line warning when
                       drifted (SessionStart-hook friendly)
+  --installed-from   print the bare commit SHA the installed set was copied
+                      from, then exit (0 if known, 1 if no provenance stamp
+                      exists) — pipe into `git merge-base --is-ancestor` to
+                      answer "is commit X deployed?" without ad-hoc grepping.
 
 Exit status: 0 when every checked file matches the repo, 1 when any file is
-missing or drifted.
+missing, drifted, or fails to parse.
 """
 import argparse
 import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -48,6 +74,401 @@ from sable_pane_lib import WORKER_CAP_DEFAULT, worker_cap  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 REFRESH_CMD = "bash install.sh"
+
+# The three CLI entrypoints an operator can deliberately PIN (real copy, not a
+# symlink) to remove the y6ik3 hot-swap hazard (SABLE-mkj6k). sable-bin-install
+# refuses to silently re-symlink one of these once pinned and records the
+# current pin set in DEST/.sable-pinned — see _read_pin_marker() below.
+PINNED_BIN_NAMES = ("sable-merge-gate", "sable-reconcile-handoffs", "sable-dolt-push")
+
+def _bin_install_script(repo: Path) -> Path:
+    """Path to THIS repo's own sable-bin-install — the tool that CREATES pin
+    shapes (plain vs snapshot) and is therefore the one authoritative place
+    that decides them (SABLE-rucuh)."""
+    return repo / "bin" / "sable-bin-install"
+
+
+def classify_bin_shape(repo: Path, name: str):
+    """"snapshot" or "plain" per sable-bin-install's OWN --classify, or None
+    if the shape can't be determined (the script is missing, or the process
+    errors) — never treat None as "plain".
+
+    Doctor used to re-implement this detection independently (a hand-rolled
+    regex mirror of sable-bin-install's is_python_importing()). Two
+    independent implementations of the same classification is exactly how
+    they drifted apart and disagreed about the SAME file's pin shape
+    (SABLE-rucuh: bin-install said "snapshot", doctor said "unpinned", and
+    doctor then printed a plain-cp remedy that severs the snapshot's sibling
+    imports). Shelling out to the real classifier makes that disagreement
+    structurally impossible instead of merely unlikely — there is only ever
+    one place this decision is made. A caller that treated an undetermined
+    result as "plain" would silently reintroduce the same hazard for a bin
+    whose shape merely couldn't be confirmed."""
+    script = _bin_install_script(repo)
+    if not script.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            ["bash", str(script), "--classify", name],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    shape = proc.stdout.strip()
+    return shape if shape in ("snapshot", "plain") else None
+
+
+def python_sibling_importing_bins(repo: Path):
+    """Every bin/sable-* entrypoint that sable-bin-install's own classifier
+    calls "snapshot" (has repo-local python imports, SABLE-9boz4) — i.e.
+    needs --pin-snapshot rather than a plain regular-file copy.
+
+    Delegates to classify_bin_shape (bin-install is authoritative) instead of
+    re-deriving the detection here, and is computed dynamically (not a fixed
+    name tuple) for the same reason --pin-snapshot auto-detects rather than
+    hardcoding: a bin gaining, losing, or being renamed with a sibling import
+    must not silently drop out of doctor's coverage the way an enumerated
+    list would."""
+    bin_dir = repo / "bin"
+    names = []
+    if not bin_dir.is_dir():
+        return names
+    for f in sorted(bin_dir.glob("sable-*")):
+        if not f.is_file() or f.suffix in (".py", ".bak") or f.name.endswith("~"):
+            continue
+        if classify_bin_shape(repo, f.name) == "snapshot":
+            names.append(f.name)
+    return names
+
+
+_SNAPSHOT_DIR_RE = re.compile(r"sable-([0-9a-f]{4,40})$")
+
+
+def _snapshot_sha_from_target(target: Path):
+    """The pinned sha baked into a snapshot symlink's resolved containing
+    directory name (~/.local/lib/sable-<sha>/<name>), or None if the target
+    doesn't look like a sable-bin-install snapshot path at all."""
+    m = _SNAPSHOT_DIR_RE.search(str(target.parent))
+    return m.group(1) if m else None
+
+
+def _git_show_bytes(repo_root: Path, sha: str, relpath: str):
+    """bytes of <relpath> at <sha> in the repo at repo_root, or None if git
+    can't resolve it (unknown sha, missing path, no git, ...) — treated as
+    drift rather than a crash, since the whole point is to never let a
+    resolution failure silently read as 'clean'."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{sha}:{relpath}"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    return proc.stdout
+
+
+def _git_ls_tree_names(repo_root: Path, sha: str, subdir: str):
+    """Basenames of every file git tracked under <subdir>/ at <sha>, or None
+    if git can't resolve it. Non-recursive (bin/ is flat) — mirrors what
+    sable-bin-install's `cp -a` actually snapshots."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-tree", "--name-only", sha, f"{subdir}/"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, text=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    return {Path(line).name for line in proc.stdout.splitlines() if line.strip()}
+
+
+def _diff_snapshot_dir(repo_root: Path, snapshot_dir: Path, sha: str):
+    """Names of every file that differs between snapshot_dir (a pinned
+    ~/.local/lib/sable-<sha>/, SABLE-9boz4) and the repo's bin/ AT THAT SHA —
+    added (present in the snapshot, absent from the pinned repo state),
+    removed (the pinned repo state had it, the snapshot dropped it — the
+    exact shape a future bin/ module split takes), or content-changed
+    (hand-tampered). Empty set means the snapshot is byte-for-byte, file-for-
+    file identical to bin/ at its own pinned sha. None if git can't resolve
+    the comparison at all (treated as drift by the caller, never 'clean')."""
+    repo_names = _git_ls_tree_names(repo_root, sha, "bin")
+    if repo_names is None:
+        return None
+    try:
+        snapshot_names = {p.name for p in snapshot_dir.iterdir() if p.is_file()}
+    except OSError:
+        return None
+    drifted = snapshot_names ^ repo_names  # gained or lost, relative to the pinned sha
+    for name in snapshot_names & repo_names:
+        pinned_bytes = _git_show_bytes(repo_root, sha, f"bin/{name}")
+        try:
+            current_bytes = (snapshot_dir / name).read_bytes()
+        except OSError:
+            current_bytes = None
+        if pinned_bytes is None or current_bytes != pinned_bytes:
+            drifted.add(name)
+    return drifted
+
+
+def _check_snapshot_pin(src: Path, dst: Path, cache: dict = None):
+    """(status, detail) for a python-sibling-importing bin's snapshot pin
+    (SABLE-9boz4).
+
+    The pin UNIT is the whole versioned snapshot directory — every bin plus
+    every sibling lib, copied together by `sable-bin-install --pin-snapshot`
+    — not the single entry-point file dst happens to resolve to. So the
+    TAMPER check below walks every file physically present in that directory
+    (plus every file the repo had under bin/ at the pinned sha, to catch one
+    going missing) and never just the entry point (that would miss a
+    hand-tampered, added, or removed SIBLING file inside the snapshot — a
+    drift check narrower than the thing that moved).
+
+    There are TWO independent questions here, and answering only the first is
+    what SABLE-0jplo was filed for:
+
+      "snapshot-drift" — is the snapshot still what it CLAIMS to be? Compares
+        the WHOLE directory against the repo AT THE SHA BAKED INTO the
+        snapshot's own directory name. Non-empty means the pin was
+        hand-tampered with (or written into by something that had no business
+        doing so — SABLE-33hw3).
+
+      "snapshot-stale" — is what it claims to be still CURRENT for THIS
+        pinned tool? Compares just the resolved entry-point file against repo
+        HEAD's copy of the same path. Non-empty means the pin is honestly
+        named but genuinely behind: the code THIS tool runs is not the code
+        in the repo, so a feature merged since the pin was taken is
+        merged-but-dark in this runtime.
+
+    Doctor used to ask only the first, so a correctly-named stale pin — three
+    files behind HEAD, with SABLE-jd5fj.4's module absent from the closure
+    entirely — reported "clean". That is the exact false-green class this
+    detector exists to eliminate, and it made a reader trusting doctor
+    conclude a merged feature was active when its code was not on the machine.
+
+    SABLE-0jplo's original fix compared the STALENESS question against the
+    whole closure too (same as tamper) — which over-corrected: --pin-snapshot
+    copies the ENTIRE bin/ directory as one unit, so dozens of files that have
+    nothing to do with any one pinned tool live in the same snapshot dir, and
+    a commit touching ANY of them aged every pinned tool's staleness verdict
+    even though that tool's own bytes never moved (measured, SABLE-5gxj3:
+    sable-reconcile-handoffs byte-identical to repo HEAD, reported "merged but
+    NOT live" because 37 unrelated bin/ files — mostly unrelated test files —
+    had changed since the pin was taken). The false-alarm direction is safe in
+    the small (it never hides a real staleness) but trains reflexive re-pinning
+    in the large, which is how a pin gets POLLUTED (SABLE-33hw3). So staleness
+    is now scoped to the one file this tool actually runs; tamper detection
+    stays whole-directory, since hand-tampering anywhere in a frozen pin is a
+    real integrity concern regardless of which tool notices it.
+
+    The invariant enforced: doctor reporting clean for a pinned bin IMPLIES the
+    pinned entry-point content is byte-identical to repo HEAD's copy of that
+    same file. Tamper wins when both fire — it is the louder fact (something
+    wrote into a frozen pin), and its remedy is a rollback rather than an
+    advance.
+
+    An unresolvable comparison — the resolved file can't be read, or its repo
+    counterpart can't be resolved via git — is "could-not-assess", never
+    silently "clean" (a resolution failure reading as agreement is the whole
+    failure mode this detector exists to prevent) and never silently rolled
+    into ordinary "snapshot-drift" either, since that carries a rollback
+    remedy that may not apply.
+
+    `detail` names the offending file(s) for "snapshot-drift" (the whole
+    tampered closure), and the single entry-point name for "snapshot-stale"
+    and "could-not-assess"; None otherwise."""
+    if not dst.exists():
+        return "missing", None
+    if not dst.is_symlink():
+        # A python-importing bin as a bare regular file has no sibling libs
+        # beside it — the exact ImportError hazard this bead exists to
+        # prevent (naive copy-pinning severs the import).
+        return "broken-copy-pin", None
+    target = Path(os.path.realpath(dst))
+    if target == src.resolve():
+        return "clean", None  # ordinary un-pinned managed symlink into the live repo
+    snapshot_dir = target.parent
+    sha = _snapshot_sha_from_target(target)
+    if sha is None:
+        # Not a recognizable sable-<sha> snapshot directory name. Before
+        # calling this drift, check by CONTENT rather than path: an ordinary
+        # (never pinned) managed symlink still reads "clean" when it points
+        # into a different checkout of the same repo at the same commit --
+        # e.g. a sibling git worktree of the canonical install target, which
+        # is exactly what running sable-doctor from a worker worktree's own
+        # bin/sable-doctor (instead of the installed CLI entry point) looks
+        # like on disk (SABLE-8kpk8: real machine symlinks into a DIFFERENT
+        # worktree than the one --repo happened to resolve to were misread
+        # as generic DRIFT even though their content matched byte-for-byte).
+        # A path mismatch with matching content is un-pinned-and-current; a
+        # path mismatch with differing content is un-pinned-and-stale --
+        # ordinary "drift" either way, never silently "clean" when it isn't.
+        if target.is_file():
+            try:
+                if sha256(target) == sha256(src):
+                    return "clean", None
+            except OSError:
+                pass
+        return "drift", None  # unrecognized target — its pinned sha can't be resolved
+    repo_root = src.parent.parent
+
+    # Existence/readability precondition (SABLE-5gxj3): if the pinned tool's
+    # own resolved file can't even be read, nothing below — tamper or
+    # staleness — can be trusted. Checked BEFORE the whole-directory tamper
+    # walk so an unreadable entry point reports its own specific fact rather
+    # than surfacing as an ordinary (also-true, but not the loudest) drifted
+    # sibling inside that walk.
+    try:
+        installed_bytes = target.read_bytes()
+    except OSError:
+        return "could-not-assess", target.name
+
+    def _diff(against):
+        cache_key = (str(snapshot_dir), against)
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+        result = _diff_snapshot_dir(repo_root, snapshot_dir, against)
+        if cache is not None:
+            cache[cache_key] = result
+        return result
+
+    drifted = _diff(sha)
+    if drifted is None:
+        return "drift", None
+    if drifted:
+        return "snapshot-drift", ", ".join(sorted(drifted))
+
+    # The snapshot is honestly named and un-tampered. Now the second
+    # question: is THIS tool's own installed file still current? Single-file
+    # compare against repo HEAD's copy of the same path (see docstring for
+    # why this is scoped to one file rather than the whole shared directory).
+    head_bytes = _git_show_bytes(repo_root, "HEAD", f"bin/{target.name}")
+    if head_bytes is None:
+        return "could-not-assess", target.name
+    if installed_bytes != head_bytes:
+        return "snapshot-stale", target.name
+    return "clean", None
+
+# SABLE-mkj6k INTERIM GUARD — remove this set (and every branch that reads it
+# below, in check_manifest/render_text_report/main's --quiet path) once the
+# install.sh pin-preservation fix has been verified live everywhere on the
+# fleet: with sable-bin-install honoring pins, `bash install.sh` can no longer
+# silently un-pin these bins, so the ordinary remedy is safe again for them.
+# Until that verification lands, an agent running a STALE (pre-fix) installed
+# copy of install.sh who follows the ordinary "Refresh with: bash install.sh"
+# remedy for one of these bins would silently re-symlink a deliberate pin —
+# so that remedy must not be offered for this category.
+GUARDED_CATEGORIES = {"pinned bins"}
+
+
+# --- Install provenance (SABLE-78kxu) --------------------------------------
+# WHICH COMMIT did the currently installed set come from? The manifest
+# compare above only proves installed files match the repo TREE as it exists
+# TODAY — a file the tree doesn't have yet (e.g. a not-yet-merged guard) is
+# invisible to it, so a "clean" report is fully compatible with that file
+# being entirely absent from the machine (the incident this bead was filed
+# from). Provenance answers a narrower, different question: which commit the
+# INSTALLED FILES were copied from. It is a fact about files on disk, never a
+# claim that any feature landed in that commit is wired active — the ACTIVE
+# leg (is a given feature actually turned on) is a separate predicate under
+# SABLE-amriy and is out of scope here. The stamp is written once, for the
+# whole installed scope, as a single unit — not per installed file.
+PROVENANCE_FILENAME = ".sable-install-provenance"
+
+
+def read_provenance(claude_dir: Path):
+    """Parse <claude_dir>/.sable-install-provenance (written by install.sh),
+    or None if no stamp exists. That's the ordinary case for every install
+    that predates this bead — callers must render that as provenance
+    UNKNOWN, never silently as "clean" or "current"; an unresolvable stamp is
+    not evidence the install is fine, only that its origin can't be named."""
+    stamp = Path(claude_dir) / PROVENANCE_FILENAME
+    if not stamp.is_file():
+        return None
+    data = {}
+    for line in stamp.read_text(errors="replace").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            data[key.strip()] = value.strip()
+    if not data.get("commit"):
+        return None
+    data.setdefault("branch", "unknown")
+    data.setdefault("dirty", "false")
+    data.setdefault("untracked", "false")
+    data.setdefault("timestamp", "unknown")
+    return data
+
+
+def current_repo_head(repo: Path):
+    """`repo`'s currently checked-out commit SHA, or None if `repo` isn't a
+    git checkout / git isn't on PATH — degrades gracefully (a provenance
+    report must still render without it) rather than raising."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def provenance_ancestor_of_head(repo: Path, sha: str):
+    """True if `sha` is an ancestor of `repo`'s current HEAD (the installed
+    commit has since landed on the branch this checkout is on); False if not
+    — a feature-branch install, or one that has since diverged, which is NOT
+    an error (installing from a feature branch is legitimate, SABLE-78kxu
+    item 4); None when this can't be determined at all (unresolvable sha, no
+    git) — never treated as True by a caller."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, "HEAD"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    return None
+
+
+def _provenance_report_lines(provenance, current_head=None, ancestor_ok=None):
+    """Lines naming WHICH COMMIT the installed set came from — a fact about
+    files, never a claim about whether any feature in that commit is wired
+    active. `current_head` is passed only when reporting DRIFT, so a
+    drifted install reads as an explained 'installed from X, repo now at Y'
+    instead of a bare, unexplained mismatch (SABLE-78kxu item 2)."""
+    if provenance is None:
+        return [
+            "installed from: UNKNOWN (no provenance stamp — install predates "
+            "SABLE-78kxu, or the stamp could not be read)"
+        ]
+    sha = provenance["commit"]
+    branch = provenance["branch"]
+    when = provenance["timestamp"]
+    # "dirty" is a reproducibility claim (does the recorded SHA reconstruct
+    # the installed TRACKED content?); "untracked" is a separate fact that
+    # does not bear on reproducibility. Two different facts, two different
+    # notes — folding untracked presence into "not reproducible" is the
+    # defect SABLE-dt92b fixed.
+    dirty_note = " [DIRTY tree at install time — not reproducible]" if provenance.get("dirty") == "true" else ""
+    untracked_note = " [untracked files present at install time]" if provenance.get("untracked") == "true" else ""
+    if current_head and current_head != sha:
+        line = f"installed from {sha} ({branch}), {when}{dirty_note}{untracked_note} — repo now at {current_head}"
+    else:
+        line = f"installed from {sha} ({branch}), {when}{dirty_note}{untracked_note}"
+    lines = [line]
+    if ancestor_ok is False:
+        lines.append(
+            "  note: installed commit is not an ancestor of the repo's current HEAD "
+            "(a feature-branch install, or one that has since diverged — not "
+            "necessarily a problem)"
+        )
+    return lines
 
 
 class NoProjectInstallError(Exception):
@@ -75,9 +496,16 @@ def skill_install_name(skill_dir: Path) -> str:
     return skill_dir.name
 
 
-def build_manifest(repo: Path, claude_dir: Path):
+def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
     """Return [(category, repo_path, installed_path), ...] mirroring exactly
-    what install.sh + sable-orchestration-install copy."""
+    what install.sh + sable-orchestration-install copy.
+
+    bin_dir, when given, adds the "pinned bins" category (PINNED_BIN_NAMES)
+    and the "pinned snapshot bins" category (python_sibling_importing_bins,
+    SABLE-9boz4), both sourced from repo/bin and checked against bin_dir — the
+    ~/.local/bin (or scope-equivalent) sable-bin-install targets. Omitted by
+    default so pure unit fixtures that never populate repo/bin/ stay
+    unaffected."""
     entries = []
 
     # Step 4: top-level hooks (hooks/*.sh -> ~/.claude/hooks/*.sh)
@@ -116,23 +544,192 @@ def build_manifest(repo: Path, claude_dir: Path):
             for f in sorted(p for p in skill_dir.iterdir() if p.is_file()):
                 entries.append((f"skill:{name}", f, dst_dir / f.name))
 
+    # Pinned CLI bins (SABLE-mkj6k) — only when a bin_dir is given (main()
+    # always supplies one for real runs; unit fixtures opt in explicitly).
+    if bin_dir is not None:
+        bin_dir = Path(bin_dir)
+        for name in PINNED_BIN_NAMES:
+            src = repo / "bin" / name
+            if not src.is_file():
+                continue
+            # A PINNED_BIN_NAMES entry that has ALSO become snapshot-shaped
+            # (repo-local python imports, e.g. sable-merge-gate after
+            # SABLE-jd5fj.3's module split) must be checked ONLY via the
+            # "pinned snapshot bins" path below, never both — checking it
+            # here too is exactly how SABLE-rucuh happened: this category's
+            # legacy marker-based check has no concept of "symlink into a
+            # snapshot dir is still a pin," so it called a correctly
+            # snapshot-pinned bin "unpinned" and recommended a destructive
+            # plain cp. One name, one classification, one category.
+            if classify_bin_shape(repo, name) == "snapshot":
+                continue
+            entries.append(("pinned bins", src, bin_dir / name))
+
+        for name in python_sibling_importing_bins(repo):
+            src = repo / "bin" / name
+            entries.append(("pinned snapshot bins", src, bin_dir / name))
+
     return entries
+
+
+# --- Shadowed role cards (SABLE-thx70) --------------------------------------
+# hooks/multi-manager/session-role-anchor.sh resolves a manager's role card
+# PROJECT-FIRST ($PWD/.claude/sable/roles/<name>.md) then falls back to
+# $HOME/.claude/sable/roles/<name>.md. That precedence is a supported feature;
+# the defect this bead was filed for is that a stale project-local copy can
+# silently outrank a freshly-edited user-level one forever, with no event —
+# six days of role-card edits went dark fleet-wide before anyone noticed. The
+# hook itself now warns to stderr at SessionStart (see that file), but a
+# manager pane that never restarts never sees it. This mirrors the hook's
+# EXACT two candidate paths and precedence — same $PWD/$HOME resolution, same
+# four warm-pane roles the install manifest above installs — so doctor and
+# the hook can never disagree about which case counts as shadowed.
+MANAGER_ROLE_NAMES = ("lincoln", "optimus", "tarzan", "chuck")
+
+
+def _mtime_str(path: Path) -> str:
+    """Human-readable mtime for a shadow report, or 'unknown' if the file
+    can't be stat'd (removed between the is_file() check and here) — never
+    raises, since a report line is better than a crash."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime).isoformat(sep=" ", timespec="seconds")
+    except OSError:
+        return "unknown"
+
+
+def check_shadowed_role_cards(cwd: Path, home: Path, roles=MANAGER_ROLE_NAMES):
+    """Manager role cards that are SHADOWED: a project-local
+    <cwd>/.claude/sable/roles/<role>.md and a user-level
+    <home>/.claude/sable/roles/<role>.md both exist and DIFFER in content.
+    Returns [] when nothing is shadowed — including when only one candidate
+    exists, or both exist with IDENTICAL content. Those are NOT shadowing;
+    flagging them would fire on every ordinary boot, which is exactly the
+    noise the negative controls in this bead's test spec exist to prevent."""
+    shadowed = []
+    for role in roles:
+        project_path = Path(cwd) / ".claude" / "sable" / "roles" / f"{role}.md"
+        user_path = Path(home) / ".claude" / "sable" / "roles" / f"{role}.md"
+        if not project_path.is_file() or not user_path.is_file():
+            continue
+        try:
+            project_bytes = project_path.read_bytes()
+            user_bytes = user_path.read_bytes()
+        except OSError:
+            continue
+        if project_bytes == user_bytes:
+            continue
+        shadowed.append({
+            "role": role,
+            "winner_path": str(project_path),
+            "winner_mtime": _mtime_str(project_path),
+            "shadowed_path": str(user_path),
+            "shadowed_mtime": _mtime_str(user_path),
+        })
+    return shadowed
+
+
+def _shadowed_role_card_report_lines(shadowed):
+    lines = [f"[shadowed role cards] {len(shadowed)} manager role card(s) shadowed by project-local precedence:"]
+    for s in shadowed:
+        lines.append(f"  SHADOWED {s['role']}")
+        lines.append(f"          winner   (project-local): {s['winner_path']} (mtime: {s['winner_mtime']})")
+        lines.append(f"          shadowed (user-level):    {s['shadowed_path']} (mtime: {s['shadowed_mtime']})")
+    lines.append(
+        "  The project-local copy wins (precedence unchanged); the user-level edit(s)"
+    )
+    lines.append(
+        "  above are never read while it exists. If unintentional, update or remove"
+    )
+    lines.append("  the project-local copy.")
+    return lines
+
+
+def _read_pin_marker(bin_dir: Path) -> set:
+    """Names sable-bin-install currently considers pinned in bin_dir, per its
+    DEST/.sable-pinned marker (regenerated from real filesystem state on every
+    install run — see bin/sable-bin-install). Empty set if no marker exists,
+    e.g. a scope where nothing has ever been pinned."""
+    marker = Path(bin_dir) / ".sable-pinned"
+    if not marker.is_file():
+        return set()
+    return {line.strip() for line in marker.read_text(errors="replace").splitlines() if line.strip()}
+
+
+# Categories whose installed copy is a shell script sable-doctor can itself
+# parse-check (SABLE-9rj7m). hooks/test/test-tree-claim.sh's `bash -n`
+# tripwire only ever runs against the REPO copy, so a copy-installed hook
+# that is truncated, half-written by an interrupted install, or hand-edited
+# in place is invisible to every test in that suite — the live k2h0m
+# incident was a repo-copy corruption; an installed-copy version of it would
+# be strictly harder to notice. This is deliberately checked against the SAME
+# manifest entries the drift walk already built, not a second traversal.
+HOOK_SYNTAX_CATEGORIES = ("hooks", "multi-manager hooks")
+
+
+def _bash_syntax_error(path: Path):
+    """None if `path` parses cleanly under `bash -n`; otherwise bash's own
+    parse-error message. Installed hook copies are exact filesystem mirrors
+    of repo/hooks*/*.sh, so a file that fails to parse here got that way
+    through install/edit-in-place corruption, not ordinary source drift
+    (source drift — stale-but-valid content — is already caught, separately,
+    by the sha256 compare below; a syntax error is the louder fact and wins
+    when both are true, same precedent as tamper winning over staleness for
+    a snapshot pin above)."""
+    try:
+        proc = subprocess.run(
+            ["bash", "-n", str(path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=10,
+        )
+    except OSError as exc:
+        return f"could not run bash -n to check this file: {exc}"
+    if proc.returncode == 0:
+        return None
+    return proc.stderr.strip() or f"bash -n exited {proc.returncode} with no message"
 
 
 def check_manifest(entries):
     results = []
+    pin_marker_cache = {}
+    snapshot_cache = {}
     for category, src, dst in entries:
-        if not dst.exists():
+        detail = None
+        if category == "pinned snapshot bins":
+            status, detail = _check_snapshot_pin(src, dst, cache=snapshot_cache)
+        elif category in GUARDED_CATEGORIES:
+            bin_dir = dst.parent
+            if bin_dir not in pin_marker_cache:
+                pin_marker_cache[bin_dir] = _read_pin_marker(bin_dir)
+            pinned_names = pin_marker_cache[bin_dir]
+            if dst.is_symlink() and dst.name in pinned_names:
+                # Policy says pinned (the marker says so) but the installed
+                # file is a symlink — exactly the DEFECT 2 signature: a
+                # deliberate pin got silently reverted. Content is irrelevant
+                # here; a symlink always resolves to current repo content, so
+                # a naive sha256 compare would wrongly call this "clean".
+                status = "unpinned"
+            elif not dst.exists():
+                status = "missing"
+            elif sha256(src) != sha256(dst):
+                status = "drift"
+            else:
+                status = "clean"
+        elif not dst.exists():
             status = "missing"
         elif sha256(src) != sha256(dst):
             status = "drift"
         else:
             status = "clean"
+        if category in HOOK_SYNTAX_CATEGORIES and dst.is_file():
+            syntax_error = _bash_syntax_error(dst)
+            if syntax_error is not None:
+                status = "syntax-error"
+                detail = syntax_error
         results.append({
             "category": category,
             "repo_path": str(src),
             "installed_path": str(dst),
             "status": status,
+            "detail": detail,
         })
     return results
 
@@ -144,6 +741,15 @@ def resolve_claude_dir(arg_value, env):
     if override:
         return Path(override)
     return Path.home() / ".claude"
+
+
+def resolve_bin_dir(arg_value):
+    """Where sable-bin-install puts the pinnable CLI bins. Global under BOTH
+    scopes (the S2 hybrid contract — --project still links tools globally),
+    so this is intentionally independent of --claude-dir/--project."""
+    if arg_value:
+        return Path(arg_value)
+    return Path.home() / ".local" / "bin"
 
 
 def resolve_project_claude_dir(base=None):
@@ -186,23 +792,179 @@ def worker_cap_line():
     return f"worker cap: {WORKER_CAP_DEFAULT} (default)"
 
 
-def render_text_report(results):
+_STATUS_LABELS = {
+    "missing": "MISSING",
+    "drift": "DRIFT  ",
+    "unpinned": "UNPINNED",
+    "snapshot-drift": "SNAPSHOT-DRIFT",
+    "snapshot-stale": "SNAPSHOT-STALE",
+    "broken-copy-pin": "BROKEN-COPY-PIN",
+    "syntax-error": "SYNTAX-ERROR",
+    "could-not-assess": "COULD-NOT-ASSESS",
+}
+
+# Statuses on a "pinned snapshot bins" entry where the ordinary `bash
+# install.sh` remedy is actively WRONG (SABLE-9boz4): both mean the entry is
+# already pinned (a bare regular file, or a symlink into a snapshot dir), so
+# sable-bin-install's pin protection makes the ordinary installer skip it —
+# the pin itself needs repair, not a re-run of the thing that can't touch it.
+# ("missing" is excluded: nothing is pinned yet there, so the ordinary
+# installer's plain first-time symlink is the correct and safe remedy.)
+#
+# "snapshot-stale" (SABLE-0jplo) belongs here for the same reason and one more:
+# install.sh CORRECTLY refuses to touch a pin (SABLE-mkj6k pin-preservation),
+# so recommending it for a stale pin would send the reader to a command that is
+# guaranteed to leave the staleness exactly where it is — and then report
+# nothing, which is how a false green becomes a false green the reader has
+# already "fixed".
+_SNAPSHOT_REMEDY_STATUSES = ("broken-copy-pin", "snapshot-drift", "snapshot-stale", "could-not-assess")
+
+
+def _guarded_remedy_lines(guarded_bad):
+    """SABLE-mkj6k interim guard: the safe per-file remedy for a drifted
+    GUARDED_CATEGORIES entry. Deliberately never spells out REFRESH_CMD (see
+    the comment on GUARDED_CATEGORIES for why) — not even in a negated
+    sentence ("don't run X"), since the acceptance criterion is that the
+    ordinary refresh command must not appear in this output at all.
+
+    Defense in depth for SABLE-rucuh: build_manifest already routes a
+    snapshot-shaped PINNED_BIN_NAMES entry to the "pinned snapshot bins"
+    category instead of this one, so in the ordinary case every entry here
+    is genuinely plain-shaped. This still re-checks each entry's shape before
+    printing anything rather than assuming that routing always held — a
+    wrong remedy carries the tool's authority, so an entry whose shape can't
+    be confirmed here gets NO remedy at all instead of a guessed plain cp
+    that could sever a snapshot's sibling imports."""
+    lines = [
+        "Do not use the ordinary installer refresh for the pinned bin(s) above —",
+        "until the install.sh pin-preservation fix (SABLE-mkj6k) is confirmed live",
+        "on this machine, the ordinary installer can silently re-symlink a",
+        "deliberately pinned bin.",
+    ]
+    for r in guarded_bad:
+        name = Path(r["installed_path"]).name
+        repo_root = Path(r["repo_path"]).resolve().parent.parent
+        shape = classify_bin_shape(repo_root, name)
+        if shape == "plain":
+            lines.append("  Refresh by hand instead:")
+            lines.append(f"    cp {r['repo_path']} {r['installed_path']} && chmod +x {r['installed_path']}")
+        elif shape == "snapshot":
+            lines.append(
+                f"  {r['installed_path']} is snapshot-shaped (repo-local python imports) —"
+            )
+            lines.append("  a plain cp would sever its sibling imports. Re-pin instead:")
+            lines.append(f"    sable-bin-install --pin-snapshot {name}")
+        else:
+            lines.append(
+                f"  {r['installed_path']}: pin shape could not be determined — printing no"
+            )
+            lines.append(
+                "  remedy (a wrong guess here would carry the tool's authority). Investigate"
+            )
+            lines.append(f"  by hand: sable-bin-install --classify {name}")
+    return lines
+
+
+def _snapshot_remedy_lines(snapshot_bad):
+    """The safe remedy for a drifted "pinned snapshot bins" entry (SABLE-9boz4)
+    — never the ordinary installer refresh, which sable-bin-install's pin
+    protection makes a no-op against these anyway."""
+    lines = [
+        "Do not use the ordinary installer refresh for the snapshot-pinned bin(s)",
+        "above — sable-bin-install's pin protection makes it skip them. Re-pin",
+        "instead:",
+    ]
+    for r in snapshot_bad:
+        name = Path(r["installed_path"]).name
+        if r["status"] == "broken-copy-pin":
+            lines.append(
+                f"  {r['installed_path']} is a bare regular-file copy with no sibling"
+            )
+            lines.append(
+                "  libs beside it (severs the python import). Remove it and re-pin properly:"
+            )
+            lines.append(f"    rm {r['installed_path']} && sable-bin-install --pin-snapshot {name}")
+        elif r["status"] == "snapshot-stale":
+            lines.append(
+                f"  {r['installed_path']} points into an honestly-named snapshot that is"
+            )
+            lines.append(
+                "  BEHIND repo HEAD — the file named above is merged but NOT live in this"
+            )
+            lines.append("  runtime. Advance the pin (or drop it to track the repo):")
+            lines.append(f"    sable-bin-install --pin-snapshot {name}      # re-pin at HEAD")
+            lines.append(f"    sable-bin-install --repin                    # un-pin, follow the repo")
+        elif r["status"] == "could-not-assess":
+            lines.append(
+                f"  {r['installed_path']}'s pinned file could not be read (permission denied,"
+            )
+            lines.append(
+                "  or its repo-HEAD counterpart could not be resolved via git) — staleness"
+            )
+            lines.append("  could not be determined. This is held as drift, not clean. Investigate:")
+            lines.append(f"    ls -la {r['installed_path']}")
+        else:
+            lines.append(
+                f"  {r['installed_path']} points into a snapshot whose content no longer"
+            )
+            lines.append("  matches its pinned sha (hand-tampered). Roll back and re-pin fresh:")
+            lines.append(f"    sable-bin-install --repin && sable-bin-install --pin-snapshot {name}")
+    return lines
+
+
+def render_text_report(results, provenance=None, current_head=None, ancestor_ok=None, shadowed_roles=None):
+    shadowed_roles = shadowed_roles or []
     bad = [r for r in results if r["status"] != "clean"]
-    if not bad:
+    if not bad and not shadowed_roles:
         print(f"sable-doctor: clean — {len(results)} installed files match repo HEAD.")
+        for line in _provenance_report_lines(provenance, ancestor_ok=ancestor_ok):
+            print(line)
         print(worker_cap_line())
         return
-    print(f"sable-doctor: DRIFT DETECTED — {len(bad)}/{len(results)} installed files "
-          "do not match repo HEAD.\n")
+    if bad:
+        print(f"sable-doctor: DRIFT DETECTED — {len(bad)}/{len(results)} installed files "
+              "do not match repo HEAD.\n")
+    else:
+        print(f"sable-doctor: clean — {len(results)} installed files match repo HEAD, "
+              f"but {len(shadowed_roles)} role card(s) are shadowed (see below).\n")
+    for line in _provenance_report_lines(provenance, current_head=current_head, ancestor_ok=ancestor_ok):
+        print(line)
+    print()
     last_category = None
     for r in bad:
         if r["category"] != last_category:
             print(f"[{r['category']}]")
             last_category = r["category"]
-        label = "MISSING" if r["status"] == "missing" else "DRIFT  "
+        label = _STATUS_LABELS.get(r["status"], r["status"].upper())
         print(f"  {label} {r['installed_path']}")
         print(f"          repo: {r['repo_path']}")
-    print(f"\nRefresh with: {REFRESH_CMD}")
+        if r["status"] == "syntax-error":
+            print(f"          parse error: {r['detail']}")
+        elif r.get("detail"):
+            print(f"          drifted file(s): {r['detail']}")
+    guarded_bad = [r for r in bad if r["category"] in GUARDED_CATEGORIES]
+    snapshot_bad = [
+        r for r in bad
+        if r["category"] == "pinned snapshot bins" and r["status"] in _SNAPSHOT_REMEDY_STATUSES
+    ]
+    unguarded_bad = [
+        r for r in bad
+        if r["category"] not in GUARDED_CATEGORIES and r not in snapshot_bad
+    ]
+    if guarded_bad:
+        print()
+        for line in _guarded_remedy_lines(guarded_bad):
+            print(line)
+    if snapshot_bad:
+        print()
+        for line in _snapshot_remedy_lines(snapshot_bad):
+            print(line)
+    if unguarded_bad:
+        print(f"\nRefresh with: {REFRESH_CMD}")
+    if shadowed_roles:
+        print()
+        for line in _shadowed_role_card_report_lines(shadowed_roles):
+            print(line)
     print(worker_cap_line())
 
 
@@ -215,8 +977,14 @@ def main(argv=None):
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--claude-dir", default=None, help="installed ~/.claude to check (default: $CLAUDE_USER_DIR or ~/.claude)")
     target.add_argument("--project", action="store_true", help="check the current git project's own install (sugar for --claude-dir <repo-root>/.claude via git-common-dir)")
+    parser.add_argument("--bin-dir", default=None, help="installed CLI bin dir to check pinned bins against (default: ~/.local/bin — always global, independent of --project)")
     parser.add_argument("--json", action="store_true", help="emit a machine-readable report")
     parser.add_argument("--quiet", action="store_true", help="print nothing when clean; one line when drifted")
+    parser.add_argument(
+        "--installed-from", action="store_true",
+        help="print the bare commit SHA the installed set was copied from and exit "
+             "(0 if known, 1 if no provenance stamp exists); skips the manifest check",
+    )
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve() if args.repo else REPO
@@ -229,23 +997,96 @@ def main(argv=None):
     else:
         claude_dir = resolve_claude_dir(args.claude_dir, os.environ)
 
-    entries = build_manifest(repo, claude_dir)
+    if args.installed_from:
+        provenance = read_provenance(claude_dir)
+        if provenance is None:
+            print(
+                "sable-doctor: no provenance stamp found — install predates SABLE-78kxu, "
+                "or the stamp could not be read",
+                file=sys.stderr,
+            )
+            return 1
+        print(provenance["commit"])
+        return 0
+
+    bin_dir = resolve_bin_dir(args.bin_dir)
+    entries = build_manifest(repo, claude_dir, bin_dir)
     results = check_manifest(entries)
     bad = [r for r in results if r["status"] != "clean"]
 
+    # SABLE-thx70: mirrors session-role-anchor.sh's OWN resolution ($PWD vs
+    # $HOME, never CLAUDE_USER_DIR/--claude-dir) so doctor and the hook can
+    # never disagree about which case is shadowed. Independent of
+    # --claude-dir/--project — the shadow question is about the CURRENT
+    # process's cwd and home, not whichever install the operator asked to
+    # inspect.
+    shadowed_roles = check_shadowed_role_cards(
+        Path(os.getcwd()), Path(os.environ.get("HOME") or Path.home())
+    )
+
+    provenance = read_provenance(claude_dir)
+    current_head = current_repo_head(repo)
+    ancestor_ok = None
+    if provenance is not None and current_head is not None:
+        ancestor_ok = provenance_ancestor_of_head(repo, provenance["commit"])
+
     if args.json:
-        print(json.dumps({"clean": not bad, "results": results}, indent=2))
+        print(json.dumps({
+            "clean": not bad and not shadowed_roles,
+            "results": results,
+            "shadowed_role_cards": shadowed_roles,
+            "provenance": provenance,
+            "current_head": current_head,
+            "provenance_ancestor_of_head": ancestor_ok,
+        }, indent=2))
     elif args.quiet:
-        if bad:
+        if shadowed_roles:
             print(
-                f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD "
-                f"— run `{REFRESH_CMD}` to refresh (run `sable-doctor` for detail)",
+                f"sable-doctor: {len(shadowed_roles)} manager role card(s) shadowed by "
+                "project-local precedence (SABLE-thx70) — run `sable-doctor` for detail",
                 file=sys.stderr,
             )
+        if bad:
+            guarded_bad = [r for r in bad if r["category"] in GUARDED_CATEGORIES]
+            snapshot_bad = [
+                r for r in bad
+                if r["category"] == "pinned snapshot bins" and r["status"] in _SNAPSHOT_REMEDY_STATUSES
+            ]
+            if guarded_bad:
+                # SABLE-mkj6k interim guard — see GUARDED_CATEGORIES comment.
+                # This is the SessionStart-hook path (`sable-doctor --quiet`),
+                # the highest-traffic message in the system; it must not tell
+                # a fresh pane with zero context to run the one command that
+                # could silently un-pin a deliberately pinned bin.
+                print(
+                    f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD, "
+                    f"including {len(guarded_bad)} pinned bin(s) — do not use the ordinary "
+                    "installer refresh for those (SABLE-mkj6k interim guard); run "
+                    "`sable-doctor` for the safe per-file refresh commands",
+                    file=sys.stderr,
+                )
+            elif snapshot_bad:
+                # SABLE-9boz4 — same principle as the mkj6k guard above: a
+                # broken/drifted snapshot pin needs `--pin-snapshot` repair,
+                # not the ordinary installer refresh (which skips it anyway).
+                print(
+                    f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD, "
+                    f"including {len(snapshot_bad)} snapshot-pinned bin(s) — do not use the "
+                    "ordinary installer refresh for those; run `sable-doctor` for the safe "
+                    "re-pin commands",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD "
+                    f"— run `{REFRESH_CMD}` to refresh (run `sable-doctor` for detail)",
+                    file=sys.stderr,
+                )
     else:
-        render_text_report(results)
+        render_text_report(results, provenance=provenance, current_head=current_head,
+                            ancestor_ok=ancestor_ok, shadowed_roles=shadowed_roles)
 
-    return 1 if bad else 0
+    return 1 if (bad or shadowed_roles) else 0
 
 
 if __name__ == "__main__":

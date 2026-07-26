@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""sable-bd-remember — file/stdin-safe wrapper for `bd remember` (SABLE-tmbx1).
+
+HAZARD THIS CLOSES: `bd remember "<insight>"` takes the insight as an inline
+shell argument. The CALLING shell parses that argument before bd ever sees
+it — a body containing backticks or $(...) gets command-substituted (the
+substituted command actually RUNS with the caller's privileges) rather than
+stored, and `bd remember` reports success on the corrupted remainder. This is
+not a bug in bd: by the time its argv arrives, the damage is already done.
+The same class of caller-side hazard is documented for sable-msg bodies in
+this same bead.
+
+`bd create`/`bd update` already have a safe escape hatch for this
+(`--body-file`/`--stdin` for description, `--design-file`/`--stdin` for
+design) and `bd note <id>` already has `--file`/`--stdin` for the notes
+field — use those directly, no wrapper needed. `bd remember` is the one
+bd subcommand named in this repo's own CLAUDE.md with no file/stdin
+ingestion path, so this wrapper exists ONLY to close that one gap: it reads
+the insight from a file (or stdin) in Python and hands it to the real `bd`
+binary via subprocess.run with a LIST argument, never a shell string — a
+list argument never invokes a shell, so command substitution CANNOT occur
+and an apostrophe, dollar sign, or backtick is just a character.
+
+Usage:
+  sable-bd-remember --file <path> [--key <key>]
+  sable-bd-remember --stdin [--key <key>]
+  sable-bd-remember "<insight>" [--key <key>]   # inline positional, still
+                                                 # exposed to the calling-shell
+                                                 # hazard above — prefer --file
+    --file <path>   read the insight from PATH ('-' reads stdin, matching
+                    bd's own --body-file convention)
+    --stdin         read the insight from stdin (alias for --file -)
+    --key <key>     forwarded to `bd remember --key` (updates in place if the
+                    key already exists)
+
+Exactly one of the inline positional, --file, or --stdin is required.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from subprocess import run
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="sable-bd-remember",
+        description="File/stdin-safe wrapper for `bd remember` (SABLE-tmbx1).",
+    )
+    p.add_argument("insight", nargs="?", default=None,
+                   help="insight text, given inline (still exposed to the "
+                        "calling-shell command-substitution hazard — prefer "
+                        "--file/--stdin)")
+    p.add_argument("--file", dest="file", default=None, metavar="PATH",
+                   help="read the insight from PATH ('-' reads stdin)")
+    p.add_argument("--stdin", action="store_true",
+                   help="read the insight from stdin (alias for --file -)")
+    p.add_argument("--key", default=None, help="forwarded to `bd remember --key`")
+    ns = p.parse_args(argv)
+
+    sources = [ns.insight is not None, ns.file is not None, ns.stdin]
+    if sum(sources) == 0:
+        p.error("one of the arguments insight --file --stdin is required")
+    if sum(sources) > 1:
+        p.error("argument insight/--file/--stdin: only one may be given")
+    return ns
+
+
+def resolve_insight(ns: argparse.Namespace, stdin=None) -> str:
+    """Materialize the insight text from the inline positional, --file, or
+    --stdin. A file/stdin read never invokes a shell, so content read this
+    way cannot be command-substituted no matter what metacharacters it
+    contains (SABLE-tmbx1)."""
+    if ns.insight is not None:
+        return ns.insight
+    stdin = stdin or sys.stdin
+    path = "-" if ns.stdin else ns.file
+    if path == "-":
+        return stdin.read()
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def main(argv: list[str] | None = None, runner=None) -> int:
+    ns = parse_args(sys.argv[1:] if argv is None else argv)
+    insight = resolve_insight(ns)
+    runner = runner or (lambda args: run(args, text=True))
+    cmd = ["bd", "remember", insight]
+    if ns.key:
+        cmd += ["--key", ns.key]
+    result = runner(cmd)
+    return getattr(result, "returncode", 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

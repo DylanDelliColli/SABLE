@@ -22,6 +22,12 @@ __pycache__/
 *.db
 .beads-credential-key
 
+# pytest-testmon coverage map (SABLE-cmar4.3) — CI-cached artifact, local
+# scratch; -shm/-wal are SQLite WAL-mode sidecar files testmon leaves behind
+.testmondata
+.testmondata-shm
+.testmondata-wal
+
 # Cockpit install artifacts (project-scoped sable-orchestration-install output —
 # installed copies of repo sources under skills/, templates/, hooks/; not source)
 .claude/settings.local.json
@@ -29,3 +35,24 @@ __pycache__/
 .claude/skills/execute/
 .claude/sable/
 .claude/hooks/multi-manager/mode-interlock.sh
+
+# ONE exception inside .claude/sable/ (SABLE-jd5fj.5): the merge-gate state
+# DIRECTORY and its README are tracked, so the freeze/quarantine location is
+# real and documented in a fresh checkout; the state FILES inside it stay
+# ephemeral and ignored (a freeze is a fact about a moment, not about a commit).
+# The re-ignore lines are load-bearing: git will not descend into an excluded
+# directory, so each level has to be un-excluded and then its OTHER contents
+# re-excluded — that is what keeps mode-state.json and the installed cockpit
+# artifacts ignored. hooks/test/test-snapshot-freeze.sh asserts both directions.
+!.claude/sable/
+.claude/sable/*
+!.claude/sable/state/
+.claude/sable/state/*
+# SECOND exception (SABLE-ztks1): the live operator-contract surface is doctrine,
+# not runtime state — tracked so a working-tree loss cannot destroy it. The
+# cockpit re-commits it at shift boundaries and after operator rulings; runtime
+# state (mode-state.json etc.) stays ignored by the line above.
+!.claude/sable/state/active-contracts.md
+!.claude/sable/state/merge-gate/
+.claude/sable/state/merge-gate/*
+!.claude/sable/state/merge-gate/README.md

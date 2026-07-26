@@ -195,17 +195,38 @@ def overlay_evidence(capture: str) -> str | None:
     line is the evidence snippet the DIALOG-STALLED alert surfaces (SABLE-ccxc)
     so an operator can judge true-vs-false from the alert itself.
 
+    SABLE-n87ov: a MENTION of dialog text (e.g. a sable-msg relay quoting the
+    'Enter to select ...' string of a real stall elsewhere, so the recipient
+    could recognise it) rendered into an otherwise-healthy pane reproduced the
+    exact substring this used to grep for anywhere in the capture — reporting
+    a stall manufactured a false one on the reporter's own audience. A live
+    dialog/overlay OWNS the bottom of the pane (it blocks the composer, so no
+    empty prompt line is drawn below it); a mention is ordinary transcript
+    output, and on an otherwise-idle pane the empty composer prompt reappears
+    BELOW it. So the affordance/dismiss search is restricted to the pane's
+    current cursor region — everything strictly after the LAST bare composer
+    prompt line (❯ or >) in the capture. A mention followed by the reappeared
+    idle composer sits entirely above that region and cannot match; a genuine
+    overlay has no such composer line after it (any bare-prompt line found is
+    from an OLDER idle moment, further up), so its affordance text still falls
+    inside the region.
+
     dialog_posture (m94k's spawn gate) is intentionally left untouched: this is
     the probe-only classifier, and the spawn gate's looser numbered-menu match is
     fine in its own context (a freshly spawned, not-yet-ready pane)."""
-    for raw in capture.splitlines():
-        line = _clean(raw)
+    lines = [_clean(raw) for raw in capture.splitlines()]
+    last_composer_idx = -1
+    for i, line in enumerate(lines):
+        if line in ("❯", ">"):
+            last_composer_idx = i
+    tail = lines[last_composer_idx + 1:]
+    for line in tail:
         if line and (_DIALOG_AFFORDANCE_RE.search(line)
                      or _OVERLAY_DISMISS_RE.search(line)):
             return line
-    if accept_startup_gate(capture) is not None:
-        for raw in capture.splitlines():
-            line = _clean(raw)
+    tail_text = "\n".join(tail)
+    if accept_startup_gate(tail_text) is not None:
+        for line in tail:
             low = line.lower()
             if "trust" in low or "bypass permissions" in low:
                 return line

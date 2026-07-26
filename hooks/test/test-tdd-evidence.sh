@@ -312,6 +312,428 @@ else
 fi
 rm -f "$UNSPACED_SEMI_EV"
 
+# ---------- SABLE-rzsb.5 / SABLE-j10xa: 'env' prefix must not blind the detector ----------
+# The fleet's hermetic-run contract wraps test commands as
+# 'env -u VAR1 -u VAR2 ... <suite>' to scrub identity env vars before running.
+# Every real 'env' option-arity form must be stripped so the REAL interpreter
+# underneath is what gets classified — not merely the '-i VAR=x' shape the
+# bead was originally filed under.
+
+run_hook_writes "env -i VAR=x bash <suite> recognized"        "env -i FOO=1 bash hooks/test/test-foo.sh"
+run_hook_writes "env VAR=x python3 <suite>.py recognized"     "env FOO=1 python3 bin/test_foo.py"
+run_hook_writes "env -u NAME bash <suite> (single -u) recognized" \
+  "env -u CLAUDE_AGENT_NAME bash hooks/test/test-foo.sh"
+run_hook_writes "env -u A -u B -u C bash <suite> (the mandated multi -u contract shape) recognized" \
+  "env -u CLAUDE_AGENT_NAME -u SABLE_WORKER_PANE -u SABLE_BEAD bash hooks/test/test-foo.sh"
+run_hook_writes "env -uNAME (attached form) bash <suite> recognized" \
+  "env -uCLAUDE_AGENT_NAME bash hooks/test/test-foo.sh"
+run_hook_writes "env --unset=NAME (attached form) python -m pytest recognized" \
+  "env --unset=CLAUDE_AGENT_NAME python -m pytest tests/"
+run_hook_writes "env --unset NAME (two-token form) bash <suite> recognized" \
+  "env --unset CLAUDE_AGENT_NAME bash hooks/test/test-foo.sh"
+run_hook_writes "env -- bash <suite> (terminator) recognized" \
+  "env -- bash hooks/test/test-foo.sh"
+run_hook_writes "env -u NAME npx vitest run recognized (composes with the npx unwrap)" \
+  "env -u CLAUDE_AGENT_NAME npx vitest run"
+
+run_hook_silent "bare 'env' with no command not recognized"    "env"
+run_hook_silent "'env' with only a VAR=val assignment, no command, not recognized" "env FOO=1"
+
+# ---------- Regression: plain (unwrapped) invocations classify unchanged ----------
+run_hook_writes "regression: plain bash <suite> still recognized"   "bash hooks/test/test-foo.sh"
+run_hook_writes "regression: plain source <suite> still recognized" "source hooks/test/test-foo.sh"
+run_hook_writes "regression: plain npx vitest still recognized"     "npx vitest run"
+
+# ---------- SABLE-0w0ou: 'sable-test <cmd>' unwrapped like npx ----------
+# bin/sable-test wraps a test command and propagates its exit code; the real
+# command underneath must be what this hook classifies, so a sable-test-
+# wrapped run is never invisible to it (previously: no case for 'sable-test'
+# at all — it fell through every matcher, same failure shape as the
+# unrecognized 'env' prefix above).
+
+run_hook_writes "sable-test <suite> unwrapped and recognized" \
+  "sable-test bash hooks/test/test-foo.sh"
+
+run_hook_silent "sable-test wrapping a non-test script still not recognized" \
+  "sable-test bash setup.sh"
+
+run_hook_silent "bare 'sable-test' with no command not recognized" \
+  "sable-test"
+
+# Combined shape: sable-test wrapping an env-prefixed hermetic run — the case
+# that silently rots if the two unwraps aren't composed in the right order
+# (sable-test unwrap MUST run before the env-grammar strip).
+run_hook_writes "sable-test env -u A -u B <suite> (combined wrapper shape) recognized" \
+  "sable-test env -u CLAUDE_AGENT_NAME -u SABLE_WORKER_PANE bash hooks/test/test-foo.sh"
+
+# ---------- SABLE-u2cig: trailing flags after the script name must not hide it ----------
+# The script path is not necessarily the segment's LAST token -- real CI
+# invocations pass flags AFTER the script name, e.g.
+# 'bash .github/ci/test-tiers.sh --run pre_push'. Requiring it be
+# positionally last silently dropped evidence for a genuine green run.
+
+run_hook_writes "bash <suite> with trailing flag+value recognized (test-tiers.sh --run pre_push)" \
+  "bash .github/ci/test-tiers.sh --run pre_push"
+
+run_hook_writes "bash <suite> with a single trailing flag recognized" \
+  "bash hooks/test/test-foo.sh --verbose"
+
+run_hook_writes "direct execution with trailing flag+value recognized" \
+  "./hooks/test/test-foo.sh --run pre_push"
+
+run_hook_writes "absolute direct execution with trailing flags recognized" \
+  "/home/ddc/dev-environment/SABLE/hooks/test/test-foo.sh --run pre_push"
+
+# repo-tagging must still work when the absolute direct-exec script carries
+# trailing flags (the self-tagging path keys off the matched script token,
+# not the segment's last token).
+TRAILFLAG_SID="tdd-ev-trailflag-$$-$RANDOM"
+TRAILFLAG_EV="/tmp/tdd-evidence-${TRAILFLAG_SID}"
+rm -f "$TRAILFLAG_EV"
+make_input "bash /home/ddc/dev-environment/SABLE/hooks/test/test-tree-claim.sh --run pre_push" "$TRAILFLAG_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if grep -q 'REPO=/home/ddc/dev-environment/SABLE' "$TRAILFLAG_EV" 2>/dev/null; then
+  pass "trailing-flags run: evidence line still tagged with its own hooks/ repo"
+else
+  fail "trailing-flags run: evidence line still tagged with its own hooks/ repo" "got: $(cat "$TRAILFLAG_EV" 2>/dev/null)"
+fi
+rm -f "$TRAILFLAG_EV"
+
+# Negative: a non-test script with trailing flags still does not register.
+run_hook_silent "bash setup.sh --run pre_push (non-test script) not recognized" \
+  "bash setup.sh --run pre_push"
+
+# ---------- SABLE-rd9n0: documented canonical script names, not just 'test-*' ----------
+# SCRIPT_RE requires the basename to START with the literal 'test-', so it
+# never matched this repo's DOCUMENTED canonical test command (CLAUDE.md,
+# Build & Test): 'bash .github/ci/shell-run-set.sh --run' -- basename
+# 'shell-run-set.sh' does not start with 'test-'. A close citing that
+# command legitimately ran the suite but was not credited. Fix: an
+# allowlist of the specific canonical basenames, not a loosened regex (a
+# loosened regex would also credit an arbitrary '.sh' like deploy.sh).
+
+run_hook_writes "bash .github/ci/shell-run-set.sh --run recognized (SABLE-rd9n0)" \
+  "bash .github/ci/shell-run-set.sh --run"
+
+run_hook_writes "direct execution ./.github/ci/shell-run-set.sh --run recognized" \
+  "./.github/ci/shell-run-set.sh --run"
+
+run_hook_writes "absolute direct execution of shell-run-set.sh recognized" \
+  "/home/ddc/dev-environment/SABLE/.github/ci/shell-run-set.sh --run"
+
+run_hook_writes "bash .github/ci/shell-run-set.sh with no trailing args recognized" \
+  "bash .github/ci/shell-run-set.sh"
+
+# REGRESSION: the existing 'test-*.sh' convention still works after the
+# allowlist is added (test-tiers.sh already matches SCRIPT_RE; must not
+# regress).
+run_hook_writes "regression: bash .github/ci/test-tiers.sh --run pre_push still recognized" \
+  "bash .github/ci/test-tiers.sh --run pre_push"
+
+run_hook_writes "regression: bash test-foo.sh still recognized" \
+  "bash hooks/test/test-foo.sh"
+
+# NEGATIVE CONTROL (load-bearing half): the allowlist names specific
+# canonical scripts -- it must not become "any .sh is a test command".
+run_hook_silent "bash .github/ci/deploy.sh not recognized (non-canonical .sh)" \
+  "bash .github/ci/deploy.sh"
+
+run_hook_silent "bash build.sh not recognized (non-canonical .sh)" \
+  "bash build.sh"
+
+run_hook_silent "./deploy.sh direct execution not recognized" \
+  "./deploy.sh --run"
+
+# ---------- INTEGRATION: shell-run-set.sh evidence + real tdd-gate.sh close ----------
+# Acceptance criterion for SABLE-rd9n0: a worker whose recorded TDD evidence
+# cites the repo's documented canonical suite must be able to close its bead
+# afterward. Real writer hook + real gate hook, same session, no mocks.
+SRS_STUB_DIR=$(mktemp -d)
+cat > "$SRS_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-stub","notes":"integration stub"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$SRS_STUB_DIR/bd"
+SRS_GATE_HOOK_FILE="$(cd "$(dirname "$0")/.." && pwd)/tdd-gate.sh"
+
+SRS_SID="tdd-ev-shellrunset-gate-$$-$RANDOM"
+SRS_EV="/tmp/tdd-evidence-${SRS_SID}"
+rm -f "$SRS_EV"
+make_input "bash .github/ci/shell-run-set.sh --run" "$SRS_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if [ -s "$SRS_EV" ]; then
+  pass "shell-run-set.sh evidence: real writer hook records evidence (SABLE-rd9n0)"
+else
+  fail "shell-run-set.sh evidence: real writer hook records evidence (SABLE-rd9n0)" "no $SRS_EV"
+fi
+SRS_GATE_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$SRS_SID" | env PATH="$SRS_STUB_DIR:$PATH" bash "$SRS_GATE_HOOK_FILE" 2>/dev/null)
+if [ -z "$SRS_GATE_OUT" ]; then
+  pass "shell-run-set.sh evidence: real gate ALLOWS the close (SABLE-rd9n0 acceptance criterion)"
+else
+  fail "shell-run-set.sh evidence: real gate ALLOWS the close" "gate denied: $SRS_GATE_OUT"
+fi
+rm -f "$SRS_EV"
+rm -rf "$SRS_STUB_DIR"
+
+# NEGATIVE CONTROL in the same real-hook harness: evidence naming a
+# non-canonical '.sh' still does not get credited, proving the recogniser
+# still discriminates rather than crediting any script.
+SRSNEG_STUB_DIR=$(mktemp -d)
+cat > "$SRSNEG_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-stub","notes":"integration stub"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$SRSNEG_STUB_DIR/bd"
+SRSNEG_GATE_HOOK_FILE="$(cd "$(dirname "$0")/.." && pwd)/tdd-gate.sh"
+
+SRSNEG_SID="tdd-ev-deploy-gate-$$-$RANDOM"
+SRSNEG_EV="/tmp/tdd-evidence-${SRSNEG_SID}"
+rm -f "$SRSNEG_EV"
+make_input "bash .github/ci/deploy.sh" "$SRSNEG_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if [ ! -s "$SRSNEG_EV" ]; then
+  pass "deploy.sh evidence: real writer hook records nothing (negative control)"
+else
+  fail "deploy.sh evidence: real writer hook records nothing (negative control)" "unexpected evidence: $(cat "$SRSNEG_EV")"
+fi
+SRSNEG_GATE_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$SRSNEG_SID" | env PATH="$SRSNEG_STUB_DIR:$PATH" bash "$SRSNEG_GATE_HOOK_FILE" 2>/dev/null)
+if [ -n "$SRSNEG_GATE_OUT" ]; then
+  pass "deploy.sh evidence: real gate DENIES the close (negative control)"
+else
+  fail "deploy.sh evidence: real gate DENIES the close" "gate unexpectedly allowed the close with no test evidence"
+fi
+rm -f "$SRSNEG_EV"
+rm -rf "$SRSNEG_STUB_DIR"
+
+# ---------- SABLE-x8mx7: bare inline VAR=value prefix must be unwrapped ----------
+# A bare 'NAME=value ... <cmd>' assignment prefix is the shell's own
+# env-for-one-command form (e.g. the fleet's sandbox-pinning contract:
+# 'SABLE_LIB_DIR=/scratch python3 -m pytest ...'). Previously only the
+# explicit 'env VAR=val cmd' wrapper was unwrapped, so a bare prefix left the
+# head as the VAR=value token, matched no runner, and silently produced NO
+# evidence -- a scoped test run was invisible and tdd-gate denied the close.
+# Strip leading NAME=value tokens the same way the env-wrapper branch does.
+
+run_hook_writes "bare VAR=val python3 -m pytest recognized" \
+  "SABLE_LIB_DIR=/scratch python3 -m pytest tests/"
+
+run_hook_writes "bare VAR=val pytest recognized" \
+  "FOO=1 pytest tests/"
+
+run_hook_writes "bare VAR=val bash <suite> recognized" \
+  "SABLE_LIB_DIR=/scratch bash hooks/test/test-foo.sh"
+
+run_hook_writes "multiple bare VAR=val assignments before the command recognized" \
+  "FOO=1 BAR=2 python3 bin/test_foo.py"
+
+run_hook_writes "bare VAR=val npx vitest recognized (composes with the npx unwrap)" \
+  "FOO=1 npx vitest run"
+
+# Combined shape: a bare assignment prefix in front of an env-wrapped hermetic
+# run must still resolve through both (assignment strip runs BEFORE the env
+# grammar strip / sable-test unwrap).
+run_hook_writes "bare VAR=val env -u A bash <suite> (assignment + env wrapper) recognized" \
+  "SABLE_LIB_DIR=/scratch env -u CLAUDE_AGENT_NAME bash hooks/test/test-foo.sh"
+
+run_hook_writes "bare VAR=val sable-test <suite> (assignment + sable-test wrapper) recognized" \
+  "SABLE_LIB_DIR=/scratch sable-test bash hooks/test/test-foo.sh"
+
+# Negative: a bare assignment in front of a NON-test command still records
+# nothing (the strip exposes the real command, which is correctly ignored).
+run_hook_silent "bare VAR=val in front of a non-test command not recognized" \
+  "SABLE_LIB_DIR=/scratch python3 deploy.py"
+
+# Negative: an assignment-only segment (no command at all) records nothing --
+# the shell would set the var and run nothing.
+run_hook_silent "assignment-only segment (no command) not recognized" \
+  "SABLE_LIB_DIR=/scratch"
+
+# repo-tagging must survive the strip: a bare-prefixed same-repo run is still
+# tagged with the hook's own cwd, and the recorded CMD is the REAL command
+# (the VAR=value token stripped), not the assignment.
+VARPREFIX_SID="tdd-ev-varprefix-$$-$RANDOM"
+VARPREFIX_EV="/tmp/tdd-evidence-${VARPREFIX_SID}"
+rm -f "$VARPREFIX_EV"
+python3 -c "
+import json, sys
+print(json.dumps({'tool_input': {'command': 'SABLE_LIB_DIR=/scratch pytest tests/'}, 'session_id': sys.argv[1], 'cwd': '/home/ddc/dev-environment/market-brief-package'}))
+" "$VARPREFIX_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if grep -q 'REPO=/home/ddc/dev-environment/market-brief-package CMD=pytest tests/$' "$VARPREFIX_EV" 2>/dev/null; then
+  pass "bare VAR=val prefix: evidence tags cwd and records the stripped real command"
+else
+  fail "bare VAR=val prefix: evidence tags cwd and records the stripped real command" "got: $(cat "$VARPREFIX_EV" 2>/dev/null)"
+fi
+rm -f "$VARPREFIX_EV"
+
+# ---------- INTEGRATION: bare VAR=val hermetic run + real tdd-gate.sh close ----------
+# The acceptance criterion for SABLE-x8mx7: a worker who scopes a test run with
+# the mandated sandbox-pinning form ('SABLE_LIB_DIR=<scratch> python3 -m pytest')
+# must be able to close its bead afterward. Real writer hook + real gate hook,
+# same session, no mocks -- the exact composition the unit tests cannot prove.
+VP_STUB_DIR=$(mktemp -d)
+cat > "$VP_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-stub","notes":"integration stub"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$VP_STUB_DIR/bd"
+VP_GATE_HOOK_FILE="$(cd "$(dirname "$0")/.." && pwd)/tdd-gate.sh"
+
+VP_SID="tdd-ev-varprefix-gate-$$-$RANDOM"
+VP_EV="/tmp/tdd-evidence-${VP_SID}"
+rm -f "$VP_EV"
+make_input "SABLE_LIB_DIR=/scratch python3 -m pytest tests/test_foo.py" "$VP_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if [ -s "$VP_EV" ]; then
+  pass "bare VAR=val hermetic run: real writer hook records evidence"
+else
+  fail "bare VAR=val hermetic run: real writer hook records evidence" "no $VP_EV"
+fi
+VP_GATE_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$VP_SID" | env PATH="$VP_STUB_DIR:$PATH" bash "$VP_GATE_HOOK_FILE" 2>/dev/null)
+if [ -z "$VP_GATE_OUT" ]; then
+  pass "bare VAR=val hermetic run: real gate ALLOWS the close (SABLE-x8mx7 acceptance criterion)"
+else
+  fail "bare VAR=val hermetic run: real gate ALLOWS the close" "gate denied: $VP_GATE_OUT"
+fi
+rm -f "$VP_EV"
+rm -rf "$VP_STUB_DIR"
+
+# ---------- INTEGRATION: env-u hermetic run + real tdd-gate.sh close ----------
+# The acceptance criterion for SABLE-j10xa/rzsb.5: a worker that follows the
+# fleet's mandated hermetic-run contract exactly must be able to close its
+# bead afterward. Real writer hook + real gate hook, same session, no mocks.
+EU_STUB_DIR=$(mktemp -d)
+cat > "$EU_STUB_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  cat <<'JSON'
+[{"id":"SABLE-stub","notes":"integration stub"}]
+JSON
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "$EU_STUB_DIR/bd"
+GATE_HOOK_FILE="$(cd "$(dirname "$0")/.." && pwd)/tdd-gate.sh"
+
+EU_SID="tdd-ev-envu-gate-$$-$RANDOM"
+EU_EV="/tmp/tdd-evidence-${EU_SID}"
+rm -f "$EU_EV"
+make_input "env -u CLAUDE_AGENT_NAME -u SABLE_WORKER_PANE -u SABLE_BEAD bash hooks/test/test-foo.sh" "$EU_SID" | bash "$HOOK" >/dev/null 2>&1 || true
+if [ -s "$EU_EV" ]; then
+  pass "env-u hermetic run: real writer hook records evidence"
+else
+  fail "env-u hermetic run: real writer hook records evidence" "no $EU_EV"
+fi
+EU_GATE_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$EU_SID" | env PATH="$EU_STUB_DIR:$PATH" bash "$GATE_HOOK_FILE" 2>/dev/null)
+if [ -z "$EU_GATE_OUT" ]; then
+  pass "env-u hermetic run: real gate ALLOWS the close (SABLE-j10xa acceptance criterion)"
+else
+  fail "env-u hermetic run: real gate ALLOWS the close" "gate denied: $EU_GATE_OUT"
+fi
+rm -f "$EU_EV"
+rm -rf "$EU_STUB_DIR"
+
+# ---------- SABLE-5lli.1: S2 prerequisite -- PASS/FAIL exit-status field ----------
+# tdd-evidence.sh fires PreToolUse (before the command runs), so it has no
+# result to report on that path -- STATUS stays omitted, preserving today's
+# CMD=-only evidence-registration behavior exactly. When the incoming payload
+# DOES carry a completed result (a PostToolUse-shaped event, or here a
+# synthetic fixture standing in for one), the same command must be recorded
+# as either STATUS=PASS or STATUS=FAIL depending on its real exit status --
+# never inferred from the command text, only from the result data.
+
+make_input_result() {
+  # $1 = command, $2 = session_id, $3 = python dict literal for the result
+  # payload (e.g. "{'exit_code': 1}"), $4 = result key name
+  # ('tool_response' or 'tool_result')
+  python3 -c "
+import json, sys
+result = eval(sys.argv[3])
+d = {'tool_input': {'command': sys.argv[1]}, 'session_id': sys.argv[2], sys.argv[4]: result}
+print(json.dumps(d))
+" "$1" "$2" "$3" "$4"
+}
+
+# run_hook_status <name> <command> <result-dict-literal> <result-key> <expected STATUS|none>
+run_hook_status() {
+  local name="$1" command="$2" result_literal="$3" result_key="$4" expected="$5"
+  local sid evidence
+  sid=$(fake_session)
+  evidence="/tmp/tdd-evidence-${sid}"
+  rm -f "$evidence"
+  make_input_result "$command" "$sid" "$result_literal" "$result_key" | bash "$HOOK" >/dev/null 2>&1 || true
+  if [ "$expected" = "none" ]; then
+    if [ -s "$evidence" ] && ! grep -q 'STATUS=' "$evidence"; then
+      pass "$name"
+    else
+      fail "$name" "got: $(cat "$evidence" 2>/dev/null || echo '(missing)')"
+    fi
+  else
+    if grep -qF "STATUS=$expected" "$evidence" 2>/dev/null; then
+      pass "$name"
+    else
+      fail "$name" "expected STATUS=$expected, got: $(cat "$evidence" 2>/dev/null || echo '(missing)')"
+    fi
+  fi
+  rm -f "$evidence"
+}
+
+run_hook_status "failing test command (tool_response.exit_code=1) records FAIL" \
+  "pytest tests/" "{'exit_code': 1}" "tool_response" "FAIL"
+
+run_hook_status "passing test command (tool_response.exit_code=0) records PASS" \
+  "pytest tests/" "{'exit_code': 0}" "tool_response" "PASS"
+
+run_hook_status "failing test command via tool_result.exit_code=1 records FAIL" \
+  "npm test" "{'exit_code': 1}" "tool_result" "FAIL"
+
+run_hook_status "passing test command via tool_result.exit_code=0 records PASS" \
+  "npm test" "{'exit_code': 0}" "tool_result" "PASS"
+
+run_hook_status "alt key exitCode=1 records FAIL" \
+  "bash hooks/test/test-foo.sh" "{'exitCode': 1}" "tool_response" "FAIL"
+
+run_hook_status "boolean success=False records FAIL" \
+  "pytest tests/" "{'success': False}" "tool_response" "FAIL"
+
+run_hook_status "boolean success=True records PASS" \
+  "pytest tests/" "{'success': True}" "tool_response" "PASS"
+
+# non-test command: still records NOTHING regardless of a present, failing
+# result -- STATUS is only ever attached to a command that already matched
+# the existing evidence-registration rules; it never becomes a NEW way for
+# an unrelated command to register.
+FAILNONTEST_SID="tdd-ev-failnontest-$$-$RANDOM"
+FAILNONTEST_EV="/tmp/tdd-evidence-${FAILNONTEST_SID}"
+rm -f "$FAILNONTEST_EV"
+make_input_result "git status" "$FAILNONTEST_SID" "{'exit_code': 1}" "tool_response" | bash "$HOOK" >/dev/null 2>&1 || true
+if [ ! -s "$FAILNONTEST_EV" ]; then
+  pass "non-test command with a failing result present still records neither"
+else
+  fail "non-test command with a failing result present still records neither" "unexpected evidence: $(cat "$FAILNONTEST_EV")"
+fi
+rm -f "$FAILNONTEST_EV"
+
+# IRON-RULE regression: a PreToolUse-shaped payload (no result field at all,
+# today's exact production shape) still records the plain CMD= line with NO
+# STATUS= suffix -- the pass/fail field is additive, not a replacement.
+run_hook_status "PreToolUse-shaped payload (no result yet) omits STATUS entirely" \
+  "pytest tests/" "{}" "__no_such_key__" "none"
+
 # ---------- Summary ----------
 
 echo
