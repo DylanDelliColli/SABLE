@@ -1768,7 +1768,91 @@ def _coverage_floor_timeout(repo: str | None = None) -> float:
     return budget if budget is not None else 600.0
 
 
-def run_coverage_floor_check(repo: str, base_sha: str, branch_sha: str):
+# --- Phase attribution for the coverage floor (SABLE-9yjt5) ---------------
+#
+# The floor used to answer ONE question ("did the script exit 0?") and print
+# ONE sentence ("coverage regressed"), for THREE unrelated causes: a red
+# suite, a budget overrun, and a genuine patch-coverage miss. The named cause
+# was frequently the wrong one, and the remedy it named was actively harmful:
+# SABLE-21rug.4's worker read "coverage regressed" literally and added 115
+# lines of tests to a branch whose real problem was that the run was blowing
+# through its 900s budget — which LENGTHENS the very run that is overrunning.
+#
+# So the runner now returns an attributable result. The DECISION AXIS DOES NOT
+# MOVE — every phase below still denies, fail-closed, and `passed` is still
+# derived from `rc == 0` exactly as before. Only the REPORT axis gains
+# resolution (standing discipline 7).
+#
+# The three phases map to THREE DIFFERENT OPERATOR ACTIONS, which is the whole
+# reason collapsing them was expensive:
+#   pytest-failed          -> fix the suite   (adding tests does not help)
+#   timed-out              -> fix the budget  (adding tests makes it WORSE)
+#   diff-cover-under-floor -> add tests       (the only case that advice fits)
+PHASE_OK = "ok"
+PHASE_PYTEST_FAILED = "pytest-failed"
+PHASE_DIFF_COVER_UNDER_FLOOR = "diff-cover-under-floor"
+PHASE_CANNOT_ASSESS = "cannot-assess"
+PHASE_TIMED_OUT = "timed-out"
+PHASE_NO_SCRIPT = "no-script"
+PHASE_NO_WORKTREE = "no-worktree"
+PHASE_OS_ERROR = "os-error"
+PHASE_UNATTRIBUTED = "unattributed-exit"
+
+# Script exit codes -> phase. Kept in lockstep with the table in
+# .github/ci/diff-cover-gate.sh's header; anything not listed here is
+# UNATTRIBUTED (an older branch's set -e script, or a shell/bash failure),
+# which is a could-not-assess, NOT a coverage verdict.
+_COVERAGE_FLOOR_EXIT_PHASES = {
+    0: PHASE_OK,
+    10: PHASE_PYTEST_FAILED,
+    11: PHASE_DIFF_COVER_UNDER_FLOOR,
+    12: PHASE_CANNOT_ASSESS,
+}
+
+# The script's machine-readable self-report. Preferred over the exit code for
+# ATTRIBUTION (never for the decision), so a script that grows a new marker is
+# readable by an older runner as "unattributed" rather than mis-attributed.
+_COVERAGE_PHASE_MARKER_RE = re.compile(
+    r'^SABLE-COVERAGE-FLOOR-PHASE:[ \t]+(\S+)', re.MULTILINE)
+_MARKER_PHASES = {
+    "ok": PHASE_OK,
+    "pytest-failed": PHASE_PYTEST_FAILED,
+    "diff-cover-under-floor": PHASE_DIFF_COVER_UNDER_FLOOR,
+    "diff-cover-unavailable": PHASE_CANNOT_ASSESS,
+    "coverage-xml-missing": PHASE_CANNOT_ASSESS,
+}
+
+_PYTEST_FAILED_TEST_RE = re.compile(r'^FAILED[ \t]+(\S+)', re.MULTILINE)
+
+
+@dataclass
+class CoverageFloorRun:
+    """What the coverage-delta check actually did.
+
+    `passed` is the UNCHANGED tri-state fed to
+    coverage_floor_lib.evaluate_coverage_floor (True cleared / False measured-
+    and-under-floor / None could-not-assess) — the decision axis. `phase` and
+    `detail` are the report axis: which of the causes fired, and the sentence
+    an operator can act on. They never influence the decision."""
+    passed: bool | None
+    phase: str
+    detail: str
+
+
+def _failing_tests_from(output: str, limit: int = 5) -> str:
+    """The `FAILED <nodeid>` lines pytest -q prints in its short summary, so a
+    pytest-phase deny NAMES the tests instead of sending the reader back to a
+    log they may no longer have."""
+    names = _PYTEST_FAILED_TEST_RE.findall(output or "")
+    if not names:
+        return "no FAILED lines parsed from the run's output"
+    shown = "; ".join(names[:limit])
+    if len(names) > limit:
+        shown += f"; (+{len(names) - limit} more)"
+    return shown
+
+
+def run_coverage_floor_check(repo: str, base_sha: str, branch_sha: str) -> CoverageFloorRun:
     """Actually run the coverage-delta check — .github/ci/diff-cover-gate.sh,
     real pytest + coverage.py + diff-cover, no mocks — against the branch's
     checked-out tree, comparing to base_sha. Same pattern as
@@ -1776,34 +1860,108 @@ def run_coverage_floor_check(repo: str, base_sha: str, branch_sha: str):
     being measured is the code AS IT WILL EXIST on the branch, not a diff of
     trees.
 
-    Returns True (patch coverage cleared --fail-under), False (diff-cover ran
-    and failed it), or None (the branch does not carry the script at all, the
-    worktree could not be built, or the check timed out) — None is a FAIL-
-    CLOSED read, same as assert_not_frozen's unreadable-freeze-file contract:
-    "we could not prove it's covered" denies, exactly like "we proved it's
-    not"."""
+    Returns a CoverageFloorRun (SABLE-9yjt5). Its `.passed` carries the same
+    tri-state this function used to return directly — True (patch coverage
+    cleared --fail-under), False (diff-cover ran and failed it), None (could
+    not assess: no script, no worktree, timeout, or an exit this runner cannot
+    attribute) — and None is still a FAIL-CLOSED read, same as
+    assert_not_frozen's unreadable-freeze-file contract: "we could not prove
+    it's covered" denies, exactly like "we proved it's not".
+
+    What is NEW is that `.phase`/`.detail` say WHICH of those happened. Note
+    that a red suite is now None rather than False: the pytest phase failing
+    (scoped or full — SABLE-hauwa's selection does not change this) means
+    diff-cover never ran, so there is no coverage number and claiming one
+    ("coverage regressed") was a false statement about the branch. It still
+    denies."""
     parent = tempfile.mkdtemp(prefix="sable-coverage-floor-")
     worktree = str(Path(parent) / "tree")
+    started = time.monotonic()
     try:
         add = git_lib._git(repo, "worktree", "add", "--detach", worktree, branch_sha, check=False)
         if add.returncode != 0:
-            return None
+            return CoverageFloorRun(None, PHASE_NO_WORKTREE,
+                "the throwaway worktree for the check could not be built, so the check "
+                "NEVER RAN — this is gate infrastructure, not a property of the branch")
         try:
             script = Path(worktree) / ".github" / "ci" / "diff-cover-gate.sh"
             if not script.is_file():
-                return None
+                return CoverageFloorRun(None, PHASE_NO_SCRIPT,
+                    "the branch does not carry .github/ci/diff-cover-gate.sh at all — add "
+                    "the check, or record a 'Coverage override: <reason>' line")
+            # The budget term stays SPELLED AS THE CALL here, not hoisted into a
+            # local: unbudgeted_promote_timeouts() reads `timeout=`'s callee name
+            # out of the AST, and a local would read as an unregistered source
+            # (SABLE-5v3d5's completeness check caught exactly that during this
+            # bead's own work). The message path below reads the budget back off
+            # the exception instead.
             cp = git_lib._run(["bash", str(script), base_sha], cwd=worktree, check=False,
                               timeout=_coverage_floor_timeout(repo))
-            return cp.returncode == 0
+            return _attribute_coverage_run(cp.returncode, cp.stdout or "")
         finally:
             git_lib._git(repo, "worktree", "remove", "--force", worktree, check=False)
             git_lib._git(repo, "worktree", "prune", check=False)
-    except subprocess.TimeoutExpired:
-        return None
-    except OSError:
-        return None
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.monotonic() - started
+        limit = exc.timeout if exc.timeout is not None else _coverage_floor_timeout(repo)
+        return CoverageFloorRun(None, PHASE_TIMED_OUT,
+            f"the check RAN but did not finish: killed after {elapsed:.0f}s against a "
+            f"{float(limit):.0f}s budget (SABLE_MG_COVERAGE_FLOOR_TIMEOUT / the "
+            f"merge_preview tier), so NO coverage number was produced. The branch DOES "
+            f"carry the check. Adding tests LENGTHENS this run and makes it strictly "
+            f"worse — raise the budget or shorten the suite")
+    except OSError as exc:
+        return CoverageFloorRun(None, PHASE_OS_ERROR,
+            f"the check could not be executed ({exc.__class__.__name__}: {exc}), so it "
+            f"NEVER RAN — gate infrastructure, not a property of the branch")
     finally:
         shutil.rmtree(parent, ignore_errors=True)
+
+
+def _attribute_coverage_run(returncode: int, output: str) -> CoverageFloorRun:
+    """Map a completed diff-cover-gate.sh run to its phase.
+
+    DECISION AXIS, unchanged and deliberately derived from the exit code alone:
+    `passed is True` iff rc == 0. The marker is consulted only to say WHICH
+    non-zero this was, so a branch carrying a marker this runner does not know
+    reads as could-not-assess rather than as a measured coverage failure."""
+    markers = _COVERAGE_PHASE_MARKER_RE.findall(output)
+    phase = None
+    if markers:
+        phase = _MARKER_PHASES.get(markers[-1])
+    if phase is None:
+        phase = _COVERAGE_FLOOR_EXIT_PHASES.get(returncode, PHASE_UNATTRIBUTED)
+
+    if returncode == 0:
+        return CoverageFloorRun(True, PHASE_OK,
+            "diff-cover ran and the patch cleared --fail-under")
+
+    # rc != 0 below. `ok` from a non-zero run is self-contradictory: trust the
+    # exit code and refuse to attribute.
+    if phase == PHASE_OK:
+        phase = PHASE_UNATTRIBUTED
+
+    if phase == PHASE_DIFF_COVER_UNDER_FLOOR:
+        return CoverageFloorRun(False, PHASE_DIFF_COVER_UNDER_FLOOR,
+            "diff-cover RAN and produced a real patch-coverage number, and that number "
+            "was under --fail-under")
+
+    if phase == PHASE_PYTEST_FAILED:
+        return CoverageFloorRun(None, PHASE_PYTEST_FAILED,
+            f"the branch's own pytest suite FAILED (scoped or full — SABLE-hauwa's "
+            f"selection does not change the attribution), so diff-cover NEVER RAN and NO "
+            f"patch-coverage number exists. Fix the suite — adding tests does not clear "
+            f"this. Failing test(s): {_failing_tests_from(output)}")
+
+    if phase == PHASE_CANNOT_ASSESS:
+        return CoverageFloorRun(None, PHASE_CANNOT_ASSESS,
+            "the suite passed but no patch-coverage number could be produced (diff-cover "
+            "missing, or coverage.py emitted no XML) — a tooling gap, not a measurement")
+
+    return CoverageFloorRun(None, PHASE_UNATTRIBUTED,
+        f"the check exited {returncode} without naming a phase, so which of "
+        f"suite-failure / budget-overrun / coverage-miss occurred is UNKNOWN — no "
+        f"coverage number can be claimed either way")
 
 
 def assert_coverage_floor(repo: str, bead: str, base_sha: str, branch_sha: str,
@@ -1822,20 +1980,61 @@ def assert_coverage_floor(repo: str, bead: str, base_sha: str, branch_sha: str,
     signal = coverage_floor_lib.detect_pruning(diff_text)
     override_reason = coverage_floor_lib.parse_named_override(coverage_override or "")
 
-    passed = None
+    run = None
     if signal.is_pruning and not override_reason:
-        passed = run_coverage_floor_check(repo, base_sha, branch_sha)
+        run = run_coverage_floor_check(repo, base_sha, branch_sha)
 
+    passed = run.passed if run is not None else None
     decision = coverage_floor_lib.evaluate_coverage_floor(signal, passed, override_reason)
+    reason = _coverage_floor_report(signal, run, decision)
 
     if decision.action == coverage_floor_lib.ACTION_DENY:
         raise GateError(
             classify.EXIT_COVERAGE_FLOOR,
-            f"COVERAGE FLOOR (SABLE-cmar4.5): {decision.reason} — bead {bead}, "
+            f"COVERAGE FLOOR (SABLE-cmar4.5): {reason} — bead {bead}, "
             f"branch {branch_sha[:7]} onto {base_sha[:7]}. Not promoted.")
 
     if signal.is_pruning:
-        _append_evidence(repo, bead, f"coverage-floor: {decision.reason}.")
+        _append_evidence(repo, bead, f"coverage-floor: {reason}.")
+
+
+def _coverage_floor_report(signal, run, decision) -> str:
+    """The REPORT axis of the coverage floor (SABLE-9yjt5), composed HERE
+    rather than in coverage_floor_lib.evaluate_coverage_floor because only
+    this layer knows which phase ran — evaluate_coverage_floor sees the
+    tri-state and nothing else, and stays the single source of the DECISION.
+
+    Two of the stock texts are wrong once you know the phase, and the fix is
+    not symmetric between them:
+
+      * the False arm ("coverage regressed on the removed/skipped test's
+        lines") is TRUE exactly when diff-cover produced a number, which after
+        this bead is the only way False is reachable. It is kept verbatim and
+        merely stamped with the phase.
+      * the None arm ("no coverage-delta check ... was carried on this
+        branch") is AFFIRMATIVELY FALSE for every None cause except a
+        genuinely absent script: on a timeout the branch carries the check and
+        it ran for fifteen minutes. A reader acting on that sentence goes and
+        adds a check that is already there (SABLE-be4lo.7's denial, measured).
+        So it is REPLACED with the phase's own sentence — except in the one
+        case where it happens to be true, where it is kept and stamped.
+
+    The decision is not consulted for any of this and cannot be changed by it:
+    every branch below is reached with `decision` already fixed."""
+    if run is None:
+        # No check was consulted at all (non-pruning, or a named override).
+        return decision.reason
+
+    if run.passed is True or run.phase == PHASE_NO_SCRIPT:
+        return f"{decision.reason} [phase: {run.phase}]"
+
+    if run.passed is False:
+        return f"{decision.reason} [phase: {run.phase}] — {run.detail}"
+
+    return (f"pruning diff ({'; '.join(signal.reasons)}) and the coverage-delta check "
+            f"COULD NOT ASSESS this branch [phase: {run.phase}] — {run.detail}. DENIED "
+            f"(fail-closed): a check that produced no number cannot clear the floor. "
+            f"Record a 'Coverage override: <reason>' line if it should land anyway.")
 
 
 # --------------------------------------------------------------------------
