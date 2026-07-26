@@ -8,6 +8,7 @@ a skip, never a false-fail/false-pass) when either plugin isn't importable in
 this interpreter.
 """
 import importlib.util
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -199,12 +200,22 @@ def test_missing_testmondata_falls_back_to_full_run_for_real_repo(fixture_repo):
 # --- cache-warm regression: real full bin/ suite, real testmon crash ---------
 # (SABLE-cmar4.3 second revise, mandated by chuck's CI root-cause on preview
 # 4a46439 / branch 2795ee2). This is deliberately NOT the synthetic
-# fixture_repo above: the defect is a property of THIS repo's actual bin/
-# layout (~23 extensionless python executables loaded in-process via
-# SourceFileLoader by real bin/test_*.py suites), which a fresh temp repo
-# cannot reproduce. Red today by construction before the cmar4.3 second
-# revise landed -- exit 3 with every test passing; run_cache_warm's
-# classify_cache_warm_outcome must turn that into exit 0.
+# fixture_repo above: run_cache_warm's tolerance has to hold against THIS
+# repo's actual bin/ layout (44 extensionless files, 34 of them python by
+# shebang -- counted 2026-07-26, up from the ~23 this comment first recorded --
+# loaded in-process via SourceFileLoader by real bin/test_*.py suites). Red by
+# construction before the cmar4.3 second revise landed -- exit 3 with every
+# test passing; run_cache_warm's classify_cache_warm_outcome must turn that
+# into exit 0.
+#
+# CORRECTION (SABLE-jd5fj.19): an earlier revision of this comment added "which
+# a fresh temp repo cannot reproduce". That is FALSE, measured. One
+# extensionless python file that a test loads in-process is enough -- see
+# extensionless_repo at the bottom of this file, where the crash reproduces in a
+# synthetic tmp repo in ~0.1s. Only the REAL-REPO SCOPE is what this particular
+# test needs, not reproducibility, which is why the sentence mattered: believing
+# it stops the next person from writing the cheap synthetic A/B that isolates
+# --collect-only as the variable.
 
 _THIS_FILE_RELATIVE = "bin/" + Path(__file__).name
 
@@ -215,6 +226,157 @@ def test_real_repo_full_suite_testmon_noselect_crash_is_tolerated():
     repo_root = Path(__file__).resolve().parent.parent
     rc = ts.run_cache_warm(repo_root, extra_pytest_args=[f"--ignore={_THIS_FILE_RELATIVE}"])
     assert rc == 0
+
+
+# --- the extensionless-file crash: reachable by EXECUTION, not by collection -
+# (SABLE-jd5fj.19)
+#
+# The invariant "--testmon only ever reaches a --collect-only invocation" is
+# asserted structurally in test_tier_selection.py. This is the other half:
+# evidence that the invariant is worth having, i.e. that an EXECUTING --testmon
+# run on a corpus shaped like this repo's really does crash, while the tier's
+# collect-only call on the SAME corpus does not. The two differ in exactly one
+# flag, which is the whole point -- an A/B this tight is only possible on a
+# fixture small enough to hold both legs.
+#
+# POSITIVE CONTROL (SABLE-xhrt0): test_positive_control_* below asserts the
+# fixture DOES crash under an executing --testmon run. Without it the
+# collect-only leg's clean result would be worth nothing -- a corpus incapable
+# of crashing proves nothing about --collect-only.
+#
+# SCOPE (optimus, 2026-07-26): synthetic tmp repo ONLY. The positive control
+# deliberately provokes a real INTERNALERROR, so it must never be pointed at
+# this repo's real bin/ nor be allowed to write the shared checkout's
+# .testmondata. Everything below runs against tmp_path with cwd=tmp_path, one
+# test file, ~0.1s per leg.
+
+_EXTENSIONLESS_CRASH_MARKERS = ("INTERNALERROR", "testmon_core.py",
+                                "IndexError: list index out of range")
+
+
+@pytest.fixture
+def extensionless_repo(tmp_path):
+    """A minimal repo whose bin/ holds ONE extensionless python executable that
+    a test loads via SourceFileLoader -- the shape of this repo's own bin/
+    (sable-merge-gate, sable-tmux, ... loaded in-process by bin/test_*.py), at
+    the smallest size that still exhibits the defect."""
+    repo = tmp_path / "repo"
+    bin_dir = repo / "bin"
+    bin_dir.mkdir(parents=True)
+
+    (bin_dir / "sable-toy").write_text(
+        dedent(
+            """\
+            #!/usr/bin/env python3
+            def answer():
+                return 42
+            """
+        )
+    )
+    (bin_dir / "test_toy.py").write_text(
+        dedent(
+            """\
+            import importlib.machinery
+            import importlib.util
+            from pathlib import Path
+
+            def _load():
+                path = Path(__file__).resolve().parent / "sable-toy"
+                loader = importlib.machinery.SourceFileLoader("sable_toy", str(path))
+                spec = importlib.util.spec_from_loader(loader.name, loader)
+                mod = importlib.util.module_from_spec(spec)
+                loader.exec_module(mod)
+                return mod
+
+            def test_toy_answer():
+                assert _load().answer() == 42
+            """
+        )
+    )
+
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "baseline")
+    return repo
+
+
+def _executing_testmon_run(repo):
+    """The cache-warm shape: a real, test-EXECUTING --testmon-noselect run.
+    Also the only thing that produces genuine coverage fingerprints, so it
+    doubles as this fixture's warm-up."""
+    return _run(repo, "bin/", "-q", "-p", "no:cacheprovider", "--testmon-noselect")
+
+
+def test_positive_control_executing_testmon_run_crashes_on_this_fixture(extensionless_repo):
+    result = _executing_testmon_run(extensionless_repo)
+    output = result.stdout + result.stderr
+
+    assert result.returncode != 0, output
+    for marker in _EXTENSIONLESS_CRASH_MARKERS:
+        assert marker in output, (
+            f"{marker!r} absent -- this fixture can no longer exhibit the crash, so "
+            f"the collect-only test below has stopped proving anything:\n{output}")
+    # The crash fires from a per-test-EXECUTION hook, so it lands AFTER the test
+    # itself passed -- which is exactly what makes it read as an innocent RED.
+    assert "1 passed" in output, output
+    assert "pytest_runtest_logreport" in output, output
+
+
+def test_collect_only_testmon_is_clean_on_the_same_fixture(extensionless_repo):
+    # Same corpus, same plugin, ONE flag different -- and this is the real
+    # collector the tier calls, not a hand-written argv.
+    _executing_testmon_run(extensionless_repo)  # leaves a warm .testmondata
+    assert ts.testmondata_path(extensionless_repo).exists()
+
+    result = ts._pytest_collect_only(extensionless_repo, ["--testmon"])
+
+    assert result.returncode in ts._COLLECTOR_OK_EXIT_CODES
+    assert result.ids == ["bin/test_toy.py::test_toy_answer"]
+
+
+def test_impact_tier_completes_on_a_crash_capable_corpus(extensionless_repo, capfd):
+    # End to end: the real build_impact_tier_plan + the real executing run it
+    # decides on, over a corpus proven one test above to be able to crash.
+    _executing_testmon_run(extensionless_repo)
+    capfd.readouterr()  # discard the deliberate crash from the warm-up
+
+    rc = ts.run_impact_tier(extensionless_repo)
+
+    output = "".join(capfd.readouterr())
+    assert rc == 0, output
+    for marker in _EXTENSIONLESS_CRASH_MARKERS:
+        assert marker not in output, output
+
+
+def test_collect_only_never_records_executed_coverage_fingerprints(extensionless_repo):
+    """The fingerprint-level half of the promote_lib claim this bead corrects.
+
+    A collect-only --testmon run is NOT a no-op on .testmondata -- it inserts
+    the node ids it collected plus a checksum of each test FILE. What it can
+    never record is which files a test EXECUTES, because nothing executed. That
+    is both why an impact-tier run can never keep the coverage map fresh (only
+    warm_gate_testmon_cache / testmon-cache-warm.sh can) and why it never
+    reaches get_tests_fingerprints, the crash site.
+    """
+    result = ts._pytest_collect_only(extensionless_repo, ["--testmon"])
+    assert result.returncode in ts._COLLECTOR_OK_EXIT_CODES
+
+    db = ts.testmondata_path(extensionless_repo)
+    assert db.exists(), "collect-only --testmon wrote no map at all -- the file is absent"
+    conn = sqlite3.connect(db)
+    try:
+        recorded = {row[0] for row in conn.execute("SELECT filename FROM file_fp")}
+    finally:
+        conn.close()
+
+    # It DID write: the test file's own checksum is there...
+    assert "bin/test_toy.py" in recorded, recorded
+    # ...but never the extensionless module the test EXECUTES. That absence is
+    # the crash's structural unreachability, stated as data rather than prose:
+    # get_file() is only ever called for files a test was observed executing.
+    assert not any(Path(f).name == "sable-toy" for f in recorded), recorded
 
 
 if __name__ == "__main__":
