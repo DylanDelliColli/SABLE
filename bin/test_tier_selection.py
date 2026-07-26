@@ -402,5 +402,217 @@ def test_print_diff_cover_scope_prints_scoped_mode_and_paths(monkeypatch, tmp_pa
     assert lines == ["scoped", "bin/test_a.py", "bin/test_b.py"]
 
 
+# --- invariant: --testmon only ever reaches a --collect-only run -------------
+# (SABLE-jd5fj.19)
+#
+# THE INVARIANT: every pytest invocation this module builds that carries a
+# pytest-testmon flag (--testmon / --testmon-noselect) also carries
+# --collect-only -- with exactly ONE deliberate exception, run_cache_warm,
+# whose whole job is to take an executing --testmon-noselect run in order to
+# rebuild the coverage map.
+#
+# It is NOT "--testmon is never passed". build_impact_tier_plan does pass
+# --testmon; it passes it to a --collect-only collector. Stating the invariant
+# the blanket way is the exact error this bead exists to correct (it was the
+# claim in sable_gate_promote_lib.py's warm-testmon comment), so the checks
+# below carry a control in BOTH polarities: a violating call must be caught,
+# and a legitimate --collect-only --testmon call must NOT be.
+#
+# WHY IT IS LOAD-BEARING: pytest-testmon 2.2.0 crashes on extensionless files
+# (testmon_core.py:93 rsplit(".", 1)[1] -> IndexError) from
+# pytest_runtest_logreport -- a per-test-EXECUTION hook. Under --collect-only
+# no test executes, so the crash site is unreachable. This repo's bin/ carries
+# dozens of extensionless python executables, so a maintainer who "restores"
+# --testmon to a genuine executing call reintroduces the crash into the merge
+# seat's local impact tier. Two independent checks below:
+#   A. STATIC (_pytest_argv_literals): reads tier_selection.py's own source, so
+#      it also covers argv literals no test happens to execute.
+#   B. RUNTIME (_captured_pytest_argvs): every argv the real code path actually
+#      hands to subprocess.run, including ones assembled dynamically.
+
+import ast  # noqa: E402
+import subprocess  # noqa: E402
+
+_TIER_SELECTION_SOURCE = Path(__file__).resolve().parent / "tier_selection.py"
+
+# The ONE function allowed to hand a testmon flag to an executing pytest run.
+# Asserted as an exact set below: growing it silently is itself a failure.
+_EXECUTING_TESTMON_ALLOWLIST = {"run_cache_warm"}
+
+
+def _is_testmon_flag(arg):
+    return arg.split("=", 1)[0].startswith("--testmon")
+
+
+def _hands_testmon_to_an_executing_run(argv):
+    """The invariant, as a predicate: True when `argv` would give pytest-testmon
+    a run that actually EXECUTES tests (and therefore reaches the crash site).
+    False both for a legitimate --collect-only --testmon call and for a call
+    that never mentions testmon at all."""
+    return any(_is_testmon_flag(a) for a in argv) and "--collect-only" not in argv
+
+
+def _pytest_argv_literals(source):
+    """[(enclosing function name, [string literals in the argv list]), ...] for
+    every `subprocess.run([...])` in `source` whose argv literal invokes pytest.
+
+    Non-literal elements (*extra_args, f-strings) are simply absent from the
+    returned list -- this check only ever reasons about flags it can SEE, which
+    is why the runtime check below exists alongside it."""
+    tree = ast.parse(source)
+    found = []
+    stack = []
+
+    class _Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node):
+            stack.append(node.name)
+            self.generic_visit(node)
+            stack.pop()
+
+        def visit_Call(self, node):
+            func = node.func
+            if (isinstance(func, ast.Attribute) and func.attr == "run"
+                    and isinstance(func.value, ast.Name) and func.value.id == "subprocess"
+                    and node.args and isinstance(node.args[0], ast.List)):
+                literals = [e.value for e in node.args[0].elts
+                            if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+                if "pytest" in literals:
+                    found.append((stack[-1] if stack else "<module>", literals))
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+    return found
+
+
+def test_static_no_executing_pytest_call_passes_a_testmon_flag():
+    invocations = _pytest_argv_literals(_TIER_SELECTION_SOURCE.read_text())
+
+    # Vacuity guard: if the scanner stops seeing tier_selection's pytest calls
+    # (renamed import, argv built some other way), it would pass by finding
+    # nothing at all.
+    assert len(invocations) >= 2, f"scanner found too few pytest invocations: {invocations}"
+
+    offenders = {fn for fn, argv in invocations if _hands_testmon_to_an_executing_run(argv)}
+    assert offenders == _EXECUTING_TESTMON_ALLOWLIST, (
+        f"functions handing a testmon flag to an EXECUTING pytest run: {offenders}; "
+        f"the only sanctioned one is {_EXECUTING_TESTMON_ALLOWLIST} (the deliberate "
+        f"cache-warm, guarded by classify_cache_warm_outcome). See SABLE-jd5fj.19."
+    )
+
+
+def test_static_collector_is_the_thing_that_makes_testmon_safe():
+    # The positive half of the same fact: the collector every --testmon call
+    # goes through really does carry --collect-only. If this ever stops being
+    # true the check above flips to RED, so pin it explicitly here rather than
+    # leaving the reason implicit.
+    by_fn = dict(_pytest_argv_literals(_TIER_SELECTION_SOURCE.read_text()))
+    assert "--collect-only" in by_fn["_pytest_collect_only"]
+
+
+def test_negative_control_static_check_catches_a_planted_executing_testmon_call():
+    # Exactly the change this bead exists to prevent: a maintainer who believes
+    # "the tier never passes --testmon" adds a genuine, non-collect-only one.
+    planted = (
+        "import subprocess\n"
+        "def run_impact_tier(repo_root, plan):\n"
+        "    subprocess.run(['python', '-m', 'pytest', 'bin/', '-q', '--testmon'])\n"
+    )
+    offenders = {fn for fn, argv in _pytest_argv_literals(planted)
+                 if _hands_testmon_to_an_executing_run(argv)}
+    assert offenders == {"run_impact_tier"}
+
+
+def test_negative_control_predicate_discriminates_rather_than_banning_testmon():
+    # BOTH polarities. A check that merely banned --testmon would pass the two
+    # asserts above while restating the bead's own error in a new place.
+    assert _hands_testmon_to_an_executing_run(["bin/", "-q", "--testmon"])
+    assert _hands_testmon_to_an_executing_run(["bin/", "-q", "--testmon-noselect"])
+    # ...and must NOT flag the legitimate call the tier actually makes:
+    assert not _hands_testmon_to_an_executing_run(
+        ["bin/", "--collect-only", "-q", "--testmon"])
+    assert not _hands_testmon_to_an_executing_run(["bin/", "-q", "-p", "no:cacheprovider"])
+
+
+def _captured_pytest_argvs(monkeypatch, collect_only_stdout):
+    """Record every argv tier_selection hands to subprocess.run, standing in
+    for the real pytest process. Returns the (growing) list of argvs."""
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        stdout = collect_only_stdout if "--collect-only" in argv else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(ts.subprocess, "run", fake_run)
+    return calls
+
+
+def test_runtime_selected_mode_never_executes_a_testmon_run(tmp_path, monkeypatch):
+    ts.testmondata_path(tmp_path).write_text("{}")
+    calls = _captured_pytest_argvs(monkeypatch, "bin/test_x.py::test_a\n")
+
+    rc = ts.run_impact_tier(tmp_path)
+
+    assert rc == 0
+    # Vacuity guard: the tier must STILL be passing --testmon somewhere, or
+    # this test proves nothing about an invariant governing --testmon.
+    assert any(any(_is_testmon_flag(a) for a in argv) for argv in calls), \
+        f"the tier no longer passes --testmon at all: {calls}"
+    # And the executing run must have happened, or "no violation" is trivial.
+    assert any("--collect-only" not in argv for argv in calls), \
+        f"no executing pytest run was made: {calls}"
+    assert [argv for argv in calls if _hands_testmon_to_an_executing_run(argv)] == []
+
+
+def test_runtime_full_mode_never_executes_a_testmon_run(tmp_path, monkeypatch):
+    # Cache-miss path: no .testmondata, so the tier skips the collector
+    # entirely and goes straight to the executing full run.
+    calls = _captured_pytest_argvs(monkeypatch, "")
+
+    rc = ts.run_impact_tier(tmp_path)
+
+    assert rc == 0
+    assert calls and all(not _hands_testmon_to_an_executing_run(argv) for argv in calls)
+
+
+def test_runtime_diff_cover_scope_never_executes_a_testmon_run(tmp_path, monkeypatch):
+    ts.testmondata_path(tmp_path).write_text("{}")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "test_x.py").write_text("def test_a(): pass\n")
+    monkeypatch.setattr(ts, "_git_diff_touched_files",
+                        lambda repo_root, compare_ref: ["bin/test_x.py"])
+    calls = _captured_pytest_argvs(monkeypatch, "bin/test_x.py::test_a\n")
+
+    plan = ts.run_diff_cover_scope(tmp_path, "HEAD")
+
+    assert plan.mode == "scoped"
+    assert any(any(_is_testmon_flag(a) for a in argv) for argv in calls), \
+        f"the diff-cover path no longer passes --testmon at all: {calls}"
+    assert [argv for argv in calls if _hands_testmon_to_an_executing_run(argv)] == []
+
+
+def test_negative_control_runtime_capture_catches_a_collector_missing_collect_only(
+        tmp_path, monkeypatch):
+    # Plant the same maintainer mistake at RUNTIME rather than in source text:
+    # a collector that drops --collect-only. The capture harness must report a
+    # violation, otherwise the three runtime asserts above are green-by-
+    # construction and could never have failed.
+    ts.testmondata_path(tmp_path).write_text("{}")
+    calls = _captured_pytest_argvs(monkeypatch, "bin/test_x.py::test_a\n")
+
+    def collector_without_collect_only(repo_root, extra_args):
+        result = ts.subprocess.run(
+            [sys.executable, "-m", "pytest", "bin/", "-q", *extra_args],
+            cwd=repo_root, capture_output=True, text=True, check=False)
+        return ts.CollectResult(ids=ts.parse_collect_only_nodeids(result.stdout),
+                                returncode=result.returncode)
+
+    ts.build_impact_tier_plan(tmp_path, collector=collector_without_collect_only)
+
+    violations = [argv for argv in calls if _hands_testmon_to_an_executing_run(argv)]
+    assert len(violations) == 1
+    assert "--testmon" in violations[0] and "--collect-only" not in violations[0]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

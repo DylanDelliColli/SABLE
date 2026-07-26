@@ -393,12 +393,52 @@ def _selected_suites(repo: str, worktree: str, paths: list[str]) -> list[str]:
 #      or a checkout that never itself ran a cache-warm pytest pass. It is
 #      refreshed by `sable-merge-gate warm-testmon-cache` (warm_gate_testmon_cache
 #      below), meant to be run periodically/by an operator -- NOT
-#      automatically after every impact-tier run, because neither tier mode
-#      (build_impact_tier_plan's "selected" or "full") passes pytest-testmon's
-#      own --testmon/--testmon-noselect flags, so a real impact-tier pytest
-#      invocation never updates .testmondata itself. Only an explicit
-#      --testmon-noselect full run (what warm_gate_testmon_cache and CI's
-#      testmon-cache-warm.sh both do) does.
+#      automatically after every impact-tier run, because an impact-tier run
+#      never refreshes the coverage map itself. See below for WHY, which is
+#      not what an earlier revision of this comment claimed (SABLE-jd5fj.19).
+#
+# WHY AN IMPACT-TIER RUN NEVER REFRESHES THE MAP (SABLE-jd5fj.19) -- and the
+# invariant a maintainer must not break:
+#
+#   build_impact_tier_plan DOES pass --testmon (tier_selection.py, in the
+#   cache-hit branch: `collector(repo_root, ["--testmon"])`). An earlier
+#   revision of this comment asserted the opposite -- "neither tier mode
+#   passes pytest-testmon's own --testmon/--testmon-noselect flags" -- and
+#   that is simply false. What makes the tier safe is narrower and load-
+#   bearing: --testmon is only ever handed to the --COLLECT-ONLY collector
+#   (tier_selection._pytest_collect_only shells out to
+#   `pytest bin/ --collect-only -q <extra_args>`), which never executes a
+#   test body. The tier's one EXECUTING pytest call, in run_impact_tier,
+#   runs plan.argv -- node ids, or the full-run argv -- and carries no
+#   testmon flag at all.
+#
+#   So the true invariant is "--testmon only ever reaches a --collect-only
+#   invocation", NOT "--testmon is never passed". The distinction matters
+#   because pytest-testmon 2.2.0's extensionless-file crash
+#   (testmon_core.py:93 `filename.rsplit(".", 1)[1]` -> IndexError) is raised
+#   from pytest_runtest_logreport (pytest_testmon.py:416) -- a PER-TEST-
+#   EXECUTION hook. Under --collect-only no test executes, so the hook never
+#   fires and the crash site is structurally unreachable; this repo's bin/
+#   carries 44 extensionless files, 34 of them python by shebang (counted
+#   2026-07-26), so an executing --testmon run here does reach it -- and
+#   reproducing it needs only ONE such file that a test loads in-process
+#   (measured; see test_tier_selection_integration.extensionless_repo)
+#   (see tier_selection.classify_cache_warm_outcome, which exists
+#   solely to tolerate that crash on the one path that deliberately takes
+#   it). A maintainer who believed the old blanket claim and "restored"
+#   --testmon to a genuine, non-collect-only call would reintroduce the crash
+#   into the merge seat's local impact tier as innocent REDs on unrelated
+#   branches. That is now pinned mechanically rather than by this prose:
+#   bin/test_tier_selection.py's "--testmon implies --collect-only" section
+#   fails on exactly that change.
+#
+#   Refreshing the map is a separate consequence of the same fact. A
+#   collect-only --testmon run does write to .testmondata -- it records the
+#   node ids it collected and a checksum of each test FILE (measured) -- but
+#   it can never record which files a test EXECUTES, since nothing executed.
+#   Only a genuinely-executing --testmon/--testmon-noselect run produces
+#   those coverage fingerprints, which is what warm_gate_testmon_cache and
+#   CI's testmon-cache-warm.sh are for.
 #
 # Neither existing is the genuinely-cold case, reported honestly below.
 
