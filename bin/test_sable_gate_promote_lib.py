@@ -2915,3 +2915,492 @@ def test_S3_no_silent_landing_across_every_red_node_of_the_bisection_tree(
         assert _remote_head(bare, "trunk") != trunk_before
 
     assert swept >= 4, f"the no-silent-landing sweep covered only {swept} red nodes"
+
+
+# ==========================================================================
+# COVERAGE-FLOOR PHASE ATTRIBUTION (SABLE-9yjt5)
+# ==========================================================================
+#
+# The floor collapsed THREE independent causes into one boolean and printed
+# ONE sentence for all of them — "coverage regressed on the removed/skipped
+# test's lines" — which is a POSITIVE FALSE STATEMENT about the branch for two
+# of the three. It cost a full revise cycle: SABLE-21rug.4's worker read that
+# sentence literally and added 115 lines of tests to a branch whose real
+# problem was the run overrunning its 900s budget, i.e. the advice LENGTHENED
+# the run that was already too long.
+#
+# Every assertion below carries all three legs:
+#   (a) the condition is FORCED deterministically — the timeout is INJECTED
+#       (subprocess.TimeoutExpired raised at the seam), never approximated by
+#       making the host slow, which would be both flaky and a manufactured-load
+#       violation of the standing fleet rule;
+#   (b) the intended phase is NAMED;
+#   (c) a NEGATIVE CONTROL proves the check DISCRIMINATES — every case asserts
+#       the OTHER phases' vocabulary is ABSENT. Asserting only that the
+#       pytest case says "pytest" passes against an implementation that
+#       hardcodes one string; asserting the coverage case does NOT say
+#       "pytest" is what makes it bite.
+#
+# And the DECISION AXIS is pinned separately (test_coverage_floor_every_phase_
+# still_denies): all three still DENY at exit 27. This bead moves the report
+# axis and only the report axis — a change that made any of them start passing
+# would have converted a reporting bug into a false-green.
+
+_PRUNED_TEST_FILE_BASE = (
+    "import sys, os\n"
+    "sys.path.insert(0, os.path.dirname(__file__))\n"
+    "from mod import foo, bar\n"
+    "\n"
+    "def test_foo():\n"
+    "    assert foo(1) == 1\n"
+    "\n"
+    "def test_bar():\n"
+    "    assert bar(1) == 2\n"
+)
+_PRUNED_TEST_FILE_TIP = (
+    "import sys, os\n"
+    "sys.path.insert(0, os.path.dirname(__file__))\n"
+    "from mod import foo\n"
+    "\n"
+    "def test_foo():\n"
+    "    assert foo(1) == 1\n"
+)
+
+
+def _coverage_git(repo, *args):
+    cp = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                        text=True, check=True)
+    return cp.stdout.strip()
+
+
+def _coverage_floor_repo(tmp_path, *, carry_script: bool = True,
+                         script_body: str | None = None):
+    """A REAL git repo whose base..tip diff is a genuine PRUNING diff (bar()'s
+    only test is removed while bar() itself changes), so detect_pruning fires
+    for real and assert_coverage_floor actually consults the check. Returns
+    (repo, base_sha, tip_sha).
+
+    The pruning half is never faked: the whole gate only reaches the phase
+    logic through a real pruning verdict, so a hand-stubbed signal would test
+    a path the gate does not have."""
+    repo = tmp_path / "floor-repo"
+    (repo / "bin").mkdir(parents=True)
+    (repo / ".github" / "ci").mkdir(parents=True)
+    _coverage_git(repo.parent, "init", "-q", str(repo))
+    _coverage_git(repo, "config", "user.email", "t@sable.invalid")
+    _coverage_git(repo, "config", "user.name", "SABLE Test")
+    _coverage_git(repo, "config", "commit.gpgsign", "false")
+
+    (repo / "bin" / "mod.py").write_text(
+        "def foo(x):\n    return x\n\n\ndef bar(x):\n    return x + 1\n")
+    (repo / "bin" / "test_mod.py").write_text(_PRUNED_TEST_FILE_BASE)
+    if carry_script:
+        (repo / ".github" / "ci" / "diff-cover-gate.sh").write_text(
+            script_body if script_body is not None
+            else (REPO_ROOT_FOR_FLOOR / ".github" / "ci" / "diff-cover-gate.sh").read_text())
+        os.chmod(repo / ".github" / "ci" / "diff-cover-gate.sh", 0o755)
+    _coverage_git(repo, "add", "-A")
+    _coverage_git(repo, "commit", "-q", "-m", "base")
+    base_sha = _coverage_git(repo, "rev-parse", "HEAD")
+
+    (repo / "bin" / "mod.py").write_text(
+        "def foo(x):\n    return x\n\n\ndef bar(x):\n"
+        "    if x > 0:\n        return x + 2\n    return x - 2\n")
+    (repo / "bin" / "test_mod.py").write_text(_PRUNED_TEST_FILE_TIP)
+    _coverage_git(repo, "add", "-A")
+    _coverage_git(repo, "commit", "-q", "-m", "tip: prune bar's only test")
+    return repo, base_sha, _coverage_git(repo, "rev-parse", "HEAD")
+
+
+REPO_ROOT_FOR_FLOOR = Path(__file__).resolve().parent.parent
+
+
+def _force_gate_script(monkeypatch, *, returncode=None, stdout="", raises=None):
+    """Force ONE deterministic outcome out of the gate script's subprocess and
+    leave every other subprocess (all the real git plumbing) untouched.
+
+    This is the seam the defect lives at: the caller sees one CompletedProcess
+    and used to reduce it to `rc == 0`. Intercepting exactly the `bash <script>`
+    invocation — and nothing else — is what makes the timeout INJECTABLE
+    instead of waited for."""
+    real_run = promote_lib.git_lib._run
+
+    def fake_run(argv, **kwargs):
+        if argv and argv[0] == "bash":
+            if raises is not None:
+                raise raises
+            return subprocess.CompletedProcess(argv, returncode, stdout, None)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(promote_lib.git_lib, "_run", fake_run)
+
+
+def _coverage_floor_deny_message(tmp_path, monkeypatch, **forced):
+    """Run the REAL assert_coverage_floor over a REAL pruning diff with one
+    forced script outcome, and return the exit-27 message an operator reads."""
+    repo, base_sha, tip_sha = _coverage_floor_repo(tmp_path)
+    _force_gate_script(monkeypatch, **forced)
+    monkeypatch.setattr(promote_lib, "_append_evidence", lambda *a, **kw: None)
+    with pytest.raises(promote_lib.GateError) as excinfo:
+        promote_lib.assert_coverage_floor(str(repo), "TEST-9yjt5", base_sha, tip_sha, None)
+    assert excinfo.value.code == promote_lib.classify.EXIT_COVERAGE_FLOOR, (
+        "the DECISION axis moved: a denied pruning diff must still be exit 27")
+    return str(excinfo.value)
+
+
+# The vocabulary each phase owns. A message may contain ONLY its own row's
+# words — that mutual exclusion is the negative control that would catch an
+# implementation hardcoding a single phase string.
+_PYTEST_PHASE_WORDS = ("[phase: pytest-failed]", "pytest suite FAILED")
+_COVERAGE_PHASE_WORDS = ("[phase: diff-cover-under-floor]", "coverage regressed")
+_TIMEOUT_PHASE_WORDS = ("[phase: timed-out]", "did not finish")
+_ABSENT_SCRIPT_WORDS = ("no coverage-delta check",)
+
+
+def test_coverage_floor_names_the_failing_phase(tmp_path, monkeypatch):
+    """(A) A RED SUITE. diff-cover never ran, so there is no coverage number
+    to regress — the old message claimed one anyway, and the worker who
+    believed it went and wrote tests."""
+    msg = _coverage_floor_deny_message(
+        tmp_path, monkeypatch, returncode=10,
+        stdout=("FAILED bin/test_mod.py::test_foo - assert 1 == 999\n"
+                "FAILED bin/test_mod.py::test_other - AssertionError\n"
+                "SABLE-COVERAGE-FLOOR-PHASE: pytest-failed rc=1\n"))
+
+    # (b) it names the PYTEST phase, and the tests that failed.
+    for word in _PYTEST_PHASE_WORDS:
+        assert word in msg, f"the pytest-phase deny does not say {word!r}: {msg}"
+    assert "bin/test_mod.py::test_foo" in msg, \
+        f"the pytest-phase deny does not NAME the failing test: {msg}"
+    assert "diff-cover NEVER RAN" in msg, msg
+
+    # (c) NEGATIVE CONTROL — it must not borrow any other phase's vocabulary.
+    # "coverage regressed" here is the exact false statement this bead exists
+    # to delete, and "no coverage-delta check ... was carried" is the other
+    # false one (the branch carries it; it ran and failed).
+    for word in _COVERAGE_PHASE_WORDS + _TIMEOUT_PHASE_WORDS + _ABSENT_SCRIPT_WORDS:
+        assert word not in msg, \
+            f"the pytest-phase deny wrongly claims {word!r} — phases are not discriminated: {msg}"
+
+
+def test_coverage_floor_names_the_diff_cover_phase(tmp_path, monkeypatch):
+    """(C) A GENUINE PATCH-COVERAGE MISS — the one cause the old message
+    actually described. Its wording must SURVIVE the fix (this is the
+    over-correction control: it would be just as broken to stop saying
+    'coverage regressed' when coverage really did regress)."""
+    msg = _coverage_floor_deny_message(
+        tmp_path, monkeypatch, returncode=11,
+        stdout=("SABLE-COVERAGE-FLOOR-PHASE: diff-cover-under-floor rc=1 fail_under=80\n"))
+
+    for word in _COVERAGE_PHASE_WORDS:
+        assert word in msg, f"the coverage-miss deny does not say {word!r}: {msg}"
+    assert "diff-cover RAN and produced a real patch-coverage number" in msg, msg
+
+    # (c) NEGATIVE CONTROL — and specifically NOT the pytest phase.
+    for word in _PYTEST_PHASE_WORDS + _TIMEOUT_PHASE_WORDS + _ABSENT_SCRIPT_WORDS:
+        assert word not in msg, \
+            f"the coverage-miss deny wrongly claims {word!r}: {msg}"
+
+
+def test_coverage_floor_timeout_reads_could_not_assess(tmp_path, monkeypatch):
+    """(B) A BUDGET OVERRUN — the most expensive misreport of the three,
+    because the remedy the old message named (add tests) makes the true cause
+    STRICTLY WORSE by lengthening the run that is already overrunning.
+
+    The timeout is INJECTED at the subprocess seam, never produced by making
+    the host slow: a wall-clock-dependent timeout test is flaky AND is exactly
+    the manufactured host load the standing fleet rule forbids."""
+    monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "900")
+    msg = _coverage_floor_deny_message(
+        tmp_path, monkeypatch,
+        raises=subprocess.TimeoutExpired(cmd=["bash", "diff-cover-gate.sh"], timeout=900))
+
+    # (b) could-not-assess, with elapsed vs budget, and the branch DOES carry it.
+    assert "COULD NOT ASSESS" in msg, msg
+    for word in _TIMEOUT_PHASE_WORDS:
+        assert word in msg, f"the timeout deny does not say {word!r}: {msg}"
+    assert re.search(r"killed after \d+s against a 900s budget", msg), \
+        f"the timeout deny does not state elapsed vs budget: {msg}"
+    assert "The branch DOES carry the check" in msg, msg
+    assert "Adding tests LENGTHENS this run" in msg, \
+        f"the timeout deny does not warn off the remedy that deepens it: {msg}"
+
+    # (c) NEGATIVE CONTROL — the two false statements the old gate made here.
+    for word in _COVERAGE_PHASE_WORDS + _PYTEST_PHASE_WORDS + _ABSENT_SCRIPT_WORDS:
+        assert word not in msg, \
+            f"the timeout deny wrongly claims {word!r} — this is the be4lo.7 misreport: {msg}"
+
+
+def test_coverage_floor_unattributed_exit_claims_no_coverage_number(tmp_path, monkeypatch):
+    """An OLD branch's set -e script: non-zero, no phase marker. Attribution is
+    genuinely unavailable, and saying so is the honest report — the one thing
+    it must not do is pick a phase and assert it."""
+    msg = _coverage_floor_deny_message(tmp_path, monkeypatch, returncode=1,
+                                       stdout="some legacy output, no marker\n")
+
+    assert "[phase: unattributed-exit]" in msg, msg
+    assert "exited 1 without naming a phase" in msg, msg
+    assert "UNKNOWN" in msg, msg
+    for word in _COVERAGE_PHASE_WORDS + _PYTEST_PHASE_WORDS + _TIMEOUT_PHASE_WORDS:
+        assert word not in msg, \
+            f"an unattributable exit was attributed to {word!r} anyway: {msg}"
+
+
+def test_coverage_floor_absent_script_still_says_the_branch_lacks_it(tmp_path, monkeypatch):
+    """The one None cause whose STOCK sentence was already true. Over-
+    correcting it into 'could not assess' would lose the only actionable
+    instruction an operator has here: add the check."""
+    repo, base_sha, tip_sha = _coverage_floor_repo(tmp_path, carry_script=False)
+    monkeypatch.setattr(promote_lib, "_append_evidence", lambda *a, **kw: None)
+    with pytest.raises(promote_lib.GateError) as excinfo:
+        promote_lib.assert_coverage_floor(str(repo), "TEST-9yjt5", base_sha, tip_sha, None)
+    msg = str(excinfo.value)
+
+    assert excinfo.value.code == promote_lib.classify.EXIT_COVERAGE_FLOOR
+    assert "no coverage-delta check" in msg, msg
+    assert "[phase: no-script]" in msg, msg
+    for word in _COVERAGE_PHASE_WORDS + _PYTEST_PHASE_WORDS + _TIMEOUT_PHASE_WORDS:
+        assert word not in msg, msg
+
+
+def test_coverage_floor_phase_vocabularies_are_mutually_exclusive(tmp_path, monkeypatch):
+    """THE DISCRIMINATION CONTROL, stated as one property instead of four
+    scattered absences: across the four attributable denies, every phase's
+    signature phrase appears in EXACTLY ONE message.
+
+    An implementation that hardcoded a single phase string, or that appended
+    every phase's text unconditionally, fails here even if each individual
+    positive assertion above still passed."""
+    cases = {
+        "pytest": dict(returncode=10,
+                       stdout="SABLE-COVERAGE-FLOOR-PHASE: pytest-failed rc=1\n"),
+        "coverage": dict(returncode=11,
+                         stdout="SABLE-COVERAGE-FLOOR-PHASE: diff-cover-under-floor rc=1\n"),
+        "cannot-assess": dict(returncode=12,
+                              stdout="SABLE-COVERAGE-FLOOR-PHASE: diff-cover-unavailable rc=0\n"),
+        "unattributed": dict(returncode=1, stdout="legacy\n"),
+    }
+    messages = {}
+    for name, forced in cases.items():
+        mp = pytest.MonkeyPatch()
+        try:
+            messages[name] = _coverage_floor_deny_message(
+                tmp_path / f"mx-{name}", mp, **forced)
+        finally:
+            mp.undo()
+
+    signatures = {
+        "[phase: pytest-failed]": "pytest",
+        "[phase: diff-cover-under-floor]": "coverage",
+        "[phase: cannot-assess]": "cannot-assess",
+        "[phase: unattributed-exit]": "unattributed",
+        "coverage regressed": "coverage",
+        "pytest suite FAILED": "pytest",
+    }
+    for token, owner in signatures.items():
+        holders = sorted(n for n, m in messages.items() if token in m)
+        assert holders == [owner], (
+            f"{token!r} should appear in exactly the {owner!r} message, "
+            f"but appears in {holders}")
+
+
+def test_coverage_floor_every_phase_still_denies(tmp_path, monkeypatch):
+    """THE DECISION AXIS, pinned. This bead changes the REPORT and nothing
+    else: all three causes (red suite, budget overrun, real coverage miss) —
+    plus every could-not-assess variant — must STILL deny at exit 27, and a
+    clean run must still allow. A change that made any of them start passing
+    would have turned a reporting bug into a false-green, which is strictly
+    worse than the bug it replaced."""
+    denying = [
+        ("red suite", dict(returncode=10,
+                           stdout="SABLE-COVERAGE-FLOOR-PHASE: pytest-failed rc=1\n")),
+        ("coverage miss", dict(returncode=11,
+                               stdout="SABLE-COVERAGE-FLOOR-PHASE: diff-cover-under-floor rc=1\n")),
+        ("tooling gap", dict(returncode=12,
+                             stdout="SABLE-COVERAGE-FLOOR-PHASE: coverage-xml-missing rc=0\n")),
+        ("legacy non-zero", dict(returncode=1, stdout="")),
+        ("budget overrun", dict(raises=subprocess.TimeoutExpired(cmd=["bash"], timeout=1))),
+        ("os error", dict(raises=OSError("no bash here"))),
+    ]
+    for label, forced in denying:
+        mp = pytest.MonkeyPatch()
+        try:
+            repo, base_sha, tip_sha = _coverage_floor_repo(tmp_path / f"deny-{label}")
+            _force_gate_script(mp, **forced)
+            mp.setattr(promote_lib, "_append_evidence", lambda *a, **kw: None)
+            with pytest.raises(promote_lib.GateError) as excinfo:
+                promote_lib.assert_coverage_floor(str(repo), "TEST-9yjt5",
+                                                  base_sha, tip_sha, None)
+            assert excinfo.value.code == promote_lib.classify.EXIT_COVERAGE_FLOOR, \
+                f"{label} did not deny at exit 27"
+        finally:
+            mp.undo()
+
+    # NON-VACUITY: the same harness CAN allow. Without this, every assertion
+    # above would pass against a gate that denies unconditionally.
+    mp = pytest.MonkeyPatch()
+    try:
+        repo, base_sha, tip_sha = _coverage_floor_repo(tmp_path / "allow")
+        _force_gate_script(mp, returncode=0,
+                           stdout="SABLE-COVERAGE-FLOOR-PHASE: ok rc=0 fail_under=80\n")
+        recorded = []
+        mp.setattr(promote_lib, "_append_evidence",
+                   lambda repo_, bead_, note: recorded.append(note))
+        promote_lib.assert_coverage_floor(str(repo), "TEST-9yjt5", base_sha, tip_sha, None)
+        assert recorded and "check passed" in recorded[0], recorded
+        assert "[phase: ok]" in recorded[0], recorded
+    finally:
+        mp.undo()
+
+
+# --------------------------------------------------------------------------
+# INTEGRATION — the REAL script, real git worktree, real bash, real pytest,
+# real coverage.py, real diff-cover. NOTHING mocked.
+#
+# The entire defect is that a REAL script's REAL exit code was collapsed, so a
+# mocked script would test the mock. These two fixtures are planted to differ
+# in exactly one respect — one has a deliberately failing test, one is green
+# but under --fail-under — and the deliverable is that they come out
+# DISTINGUISHABLE. Both run through run_coverage_floor_check itself, so the
+# throwaway `git worktree add --detach` is real too.
+# --------------------------------------------------------------------------
+
+def _real_gate_repo(root: Path, *, tip_source: str, tip_test: str):
+    """A synthetic repo mirroring this repo's bin/-rooted layout, carrying the
+    ACTUAL diff-cover-gate.sh (copied, never reimplemented — the script under
+    test is the shipped one). Tiny on purpose: the real `pytest bin/ --cov=bin`
+    is what runs, so the fixture is two files, not this repo."""
+    (root / "bin").mkdir(parents=True)
+    ci = root / ".github" / "ci"
+    ci.mkdir(parents=True)
+    gate = REPO_ROOT_FOR_FLOOR / ".github" / "ci" / "diff-cover-gate.sh"
+    (ci / "diff-cover-gate.sh").write_text(gate.read_text())
+    os.chmod(ci / "diff-cover-gate.sh", 0o755)
+
+    _coverage_git(root.parent, "init", "-q", str(root))
+    _coverage_git(root, "config", "user.email", "t@sable.invalid")
+    _coverage_git(root, "config", "user.name", "SABLE Test")
+    _coverage_git(root, "config", "commit.gpgsign", "false")
+
+    (root / "bin" / "mod.py").write_text("def foo(x):\n    return x\n")
+    (root / "bin" / "test_mod.py").write_text(
+        "import sys, os\n"
+        "sys.path.insert(0, os.path.dirname(__file__))\n"
+        "from mod import foo\n"
+        "\n"
+        "def test_foo():\n"
+        "    assert foo(1) == 1\n")
+    _coverage_git(root, "add", "-A")
+    _coverage_git(root, "commit", "-q", "-m", "base")
+    base_sha = _coverage_git(root, "rev-parse", "HEAD")
+
+    (root / "bin" / "mod.py").write_text(tip_source)
+    (root / "bin" / "test_mod.py").write_text(tip_test)
+    _coverage_git(root, "add", "-A")
+    _coverage_git(root, "commit", "-q", "-m", "tip")
+    return base_sha, _coverage_git(root, "rev-parse", "HEAD")
+
+
+_GREEN_TEST = (
+    "import sys, os\n"
+    "sys.path.insert(0, os.path.dirname(__file__))\n"
+    "from mod import foo\n"
+    "\n"
+    "def test_foo():\n"
+    "    assert foo(1) == 1\n")
+_FAILING_TEST = (
+    "import sys, os\n"
+    "sys.path.insert(0, os.path.dirname(__file__))\n"
+    "from mod import foo\n"
+    "\n"
+    "def test_foo_deliberately_fails():\n"
+    "    assert foo(1) == 999\n")
+# A tip whose NEW lines are entirely uncovered: diff-cover measures a real
+# number and it lands under --fail-under.
+_UNCOVERED_SOURCE = (
+    "def foo(x):\n"
+    "    return x\n"
+    "\n"
+    "\n"
+    "def never_exercised(a):\n"
+    "    if a > 0:\n"
+    "        return 1\n"
+    "    if a < 0:\n"
+    "        return 2\n"
+    "    return 3\n")
+
+
+def test_coverage_floor_phases_against_real_script(tmp_path):
+    """THE DELIVERABLE, measured: two planted fixtures differing only in which
+    phase breaks produce DISTINCT phases out of the real script, through the
+    real worktree, with nothing mocked.
+
+    Fixture 1: a deliberately failing test (source unchanged).
+    Fixture 2: green suite, new source lines nobody covers -> under
+               --fail-under.
+
+    If these two came out the same, the gate would once again be telling a
+    worker with a red suite to go write tests."""
+    fail_repo = tmp_path / "real-pytest-fail"
+    fail_base, fail_tip = _real_gate_repo(
+        fail_repo, tip_source="def foo(x):\n    return x\n", tip_test=_FAILING_TEST)
+    fail_run = promote_lib.run_coverage_floor_check(str(fail_repo), fail_base, fail_tip)
+
+    miss_repo = tmp_path / "real-coverage-miss"
+    miss_base, miss_tip = _real_gate_repo(
+        miss_repo, tip_source=_UNCOVERED_SOURCE, tip_test=_GREEN_TEST)
+    miss_run = promote_lib.run_coverage_floor_check(str(miss_repo), miss_base, miss_tip)
+
+    # (b) each is attributed to ITS OWN phase, by the real script's real exit.
+    assert fail_run.phase == promote_lib.PHASE_PYTEST_FAILED, \
+        f"real red suite attributed to {fail_run.phase}: {fail_run.detail}"
+    assert miss_run.phase == promote_lib.PHASE_DIFF_COVER_UNDER_FLOOR, \
+        f"real coverage miss attributed to {miss_run.phase}: {miss_run.detail}"
+
+    # (c) NEGATIVE CONTROL — DISTINCTNESS is the deliverable, so assert the
+    # two differ rather than only that each matches. Under the old script both
+    # were "non-zero" and indistinguishable.
+    assert fail_run.phase != miss_run.phase
+    assert fail_run.detail != miss_run.detail
+
+    # The tri-state moves with the phase: a red suite produced NO coverage
+    # number (None, could-not-assess), a real miss produced one (False).
+    assert fail_run.passed is None, \
+        "a red suite must not be reported as a measured coverage failure"
+    assert miss_run.passed is False, \
+        "a real diff-cover miss is a measured failure, not a could-not-assess"
+
+    # The real script really did name the failing test.
+    assert "test_foo_deliberately_fails" in fail_run.detail, fail_run.detail
+
+    # DECISION AXIS unchanged: both still deny.
+    for run in (fail_run, miss_run):
+        decision = promote_lib.coverage_floor_lib.evaluate_coverage_floor(
+            promote_lib.coverage_floor_lib.PruningSignal(removed_test_functions=["test_x"]),
+            run.passed, None)
+        assert decision.action == promote_lib.coverage_floor_lib.ACTION_DENY, \
+            f"{run.phase} stopped denying — a reporting fix turned into a false-green"
+
+
+def test_coverage_floor_real_script_allows_a_covered_patch(tmp_path):
+    """NON-VACUITY for the integration pair above: the same real script, real
+    worktree and real diff-cover CAN return a clean allow. Without this, both
+    phase assertions would hold just as well against a script that could only
+    ever fail."""
+    repo = tmp_path / "real-clean"
+    base, tip = _real_gate_repo(
+        repo,
+        tip_source="def foo(x):\n    return x\n\n\ndef bar(a):\n    return a + 1\n",
+        tip_test=(
+            "import sys, os\n"
+            "sys.path.insert(0, os.path.dirname(__file__))\n"
+            "from mod import foo, bar\n"
+            "\n"
+            "def test_foo():\n"
+            "    assert foo(1) == 1\n"
+            "\n"
+            "def test_bar():\n"
+            "    assert bar(1) == 2\n"))
+    run = promote_lib.run_coverage_floor_check(str(repo), base, tip)
+    assert run.passed is True, f"{run.phase}: {run.detail}"
+    assert run.phase == promote_lib.PHASE_OK
