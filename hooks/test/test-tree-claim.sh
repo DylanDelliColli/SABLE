@@ -481,7 +481,7 @@ echo "--- Defect-regression (a): git -C <other-repo> from cwd with foreign fresh
 # sess-ME runs 'git -C repoB add .' from repoA's cwd.
 # Expected: allow (target is repoB), repoB gets sess-ME's claim, repoA untouched.
 REG_ROOT="$(mktemp -d)"
-trap 'rm -rf "$REG_ROOT"' EXIT
+trap 'rm -rf "$SCRATCH_ROOT" "$REG_ROOT"' EXIT
 REG_A="$REG_ROOT/repoA"
 REG_B="$REG_ROOT/repoB"
 git init "$REG_A" -q
@@ -655,10 +655,866 @@ else
 fi
 
 # ============================================================
+# SABLE-vx4aj — the claim must gate the command's ACTUAL TARGET repo,
+# never the ambient session cwd
+# ============================================================
+#
+# Observed (tarzan, 2026-07-21): a git write in an unrelated throwaway repo
+# was refused citing the SABLE checkout's claim. The hypothesis was
+# "attribution is session-cwd based". Investigation narrowed it: cd tracking
+# (SABLE-5pci) only fires when 'cd' sits at a command position the tokenizer
+# RECOGNISES. Any shell construct it does not model — a newline separator,
+# a subshell '(...)', a brace group, a background '&' — knocks the walk out
+# of command position, and then BOTH failure directions appear:
+#   FALSE POSITIVE: the 'cd <elsewhere>' prefix is invisible, so the git
+#     write is attributed to the ambient session cwd and gated by a claim on
+#     a repo it never touches (the observed symptom).
+#   FALSE NEGATIVE (the incident class, SABLE-041/936y/nsmc): the git write
+#     itself is invisible, so a write TARGETING the claimed repo sails past
+#     the claim entirely. A two-line Bash command is enough.
+#
+# Both directions are tested here. Ambiguous targets (an unexpandable 'cd
+# "$VAR"', an unparseable command) must GATE against the session cwd rather
+# than allow — a false positive is recoverable, a missed claim is not.
+
+echo "--- SABLE-vx4aj: target-repo attribution (two real repos) ---"
+
+VX_ROOT="$(mktemp -d)"
+VX_CLAIMED="$VX_ROOT/claimed"
+VX_UNRELATED="$VX_ROOT/unrelated"
+git init "$VX_CLAIMED" -q
+git -C "$VX_CLAIMED" commit --allow-empty -m init -q
+git init "$VX_UNRELATED" -q
+git -C "$VX_UNRELATED" commit --allow-empty -m init -q
+
+CF_CLAIMED="$(claim_file "$VX_CLAIMED")"
+CF_UNRELATED="$(claim_file "$VX_UNRELATED")"
+
+# Re-arm the foreign fresh claim on the claimed repo, clear the other side.
+vx_arm() {
+  printf 'sess-HOLDER %s chuck\n' "$(date +%s)" > "$CF_CLAIMED"
+  rm -f "$CF_UNRELATED"
+}
+
+# vx_check <label> <cwd> <command> <expect: deny|allow>
+vx_check() {
+  local label="$1" cwd="$2" cmd="$3" expect="$4"
+  vx_arm
+  local json out
+  json=$(make_json "$cmd" "sess-ME" "$cwd")
+  out=$(run_hook "$json")
+  if [ "$expect" = "deny" ]; then
+    if is_deny "$out"; then pass "vx4aj: $label"; else fail "vx4aj: $label" "expected deny, got allow: ${out:-<empty>}"; fi
+  else
+    if is_allow "$out"; then pass "vx4aj: $label"; else fail "vx4aj: $label" "expected allow, got deny: $out"; fi
+  fi
+}
+
+# --- Regression: the three forms the bead's test spec names explicitly ---
+vx_check "cd <unrelated> && git commit (cwd=claimed) is NOT gated by the claimed repo" \
+  "$VX_CLAIMED" "cd $VX_UNRELATED && git commit -m x" allow
+vx_check "git -C <claimed> commit (cwd=unrelated) IS gated" \
+  "$VX_UNRELATED" "git -C $VX_CLAIMED commit -m x" deny
+vx_check "plain git commit (cwd=claimed) IS gated" \
+  "$VX_CLAIMED" "git commit -m x" deny
+
+# --- FALSE NEGATIVE class: newline as a command separator ---
+# A multi-line Bash command is the single most common shape an agent sends.
+# Every one of these targets the claimed repo and must be refused.
+vx_check "newline separator: 'cd <claimed>' NEWLINE 'git commit' (cwd=unrelated) IS gated" \
+  "$VX_UNRELATED" "cd $VX_CLAIMED
+git commit -m x" deny
+vx_check "newline separator: non-git first line then 'git commit' (cwd=claimed) IS gated" \
+  "$VX_CLAIMED" "echo hi
+git commit -m x" deny
+vx_check "background '&' separator: 'sleep 1 & git commit' (cwd=claimed) IS gated" \
+  "$VX_CLAIMED" "sleep 1 & git commit -m x" deny
+vx_check "subshell: '( cd <claimed> && git commit )' (cwd=unrelated) IS gated" \
+  "$VX_UNRELATED" "( cd $VX_CLAIMED && git commit -m x )" deny
+vx_check "brace group: '{ cd <claimed>; git commit; }' (cwd=unrelated) IS gated" \
+  "$VX_UNRELATED" "{ cd $VX_CLAIMED; git commit -m x; }" deny
+
+# --- FALSE POSITIVE class: unrelated targets must proceed ---
+vx_check "newline separator: 'cd <unrelated>' NEWLINE 'git commit' (cwd=claimed) is NOT gated" \
+  "$VX_CLAIMED" "cd $VX_UNRELATED
+git commit -m x" allow
+vx_check "subshell: '( cd <unrelated> && git commit )' (cwd=claimed) is NOT gated" \
+  "$VX_CLAIMED" "( cd $VX_UNRELATED && git commit -m x )" allow
+vx_check "brace group: '{ cd <unrelated>; git commit; }' (cwd=claimed) is NOT gated" \
+  "$VX_CLAIMED" "{ cd $VX_UNRELATED; git commit -m x; }" allow
+vx_check "observed repro: 'cd <scratch> && git init && git add && git commit' (cwd=claimed) is NOT gated" \
+  "$VX_CLAIMED" "cd $VX_UNRELATED && git init -q . && git config user.email a@b && git add -A && git commit -m init" allow
+
+# The allowed unrelated write must claim the UNRELATED repo, and must leave
+# the claimed repo's foreign holder untouched.
+vx_arm
+JSON=$(make_json "cd $VX_UNRELATED
+git commit -m x" "sess-ME" "$VX_CLAIMED")
+OUT=$(run_hook "$JSON")
+if [ "$(awk '{print $1}' "$CF_UNRELATED" 2>/dev/null)" = "sess-ME" ]; then
+  pass "vx4aj: allowed unrelated write claims the UNRELATED repo"
+else
+  fail "vx4aj: allowed unrelated write claims the UNRELATED repo" "got: $(awk '{print $1}' "$CF_UNRELATED" 2>/dev/null)"
+fi
+if [ "$(awk '{print $1}' "$CF_CLAIMED" 2>/dev/null)" = "sess-HOLDER" ]; then
+  pass "vx4aj: claimed repo's foreign holder untouched by the unrelated write"
+else
+  fail "vx4aj: claimed repo's foreign holder untouched by the unrelated write" "got: $(awk '{print $1}' "$CF_CLAIMED" 2>/dev/null)"
+fi
+
+# --- Quoted text is NOT a command: no spurious gate ---
+vx_check "quoted 'cd /x && git commit' inside an echo argument is not read as a command" \
+  "$VX_UNRELATED" "echo \"cd $VX_CLAIMED && git commit -m x\"" allow
+
+# --- Fail-safe on ambiguity: gate rather than allow ---
+vx_check "unexpandable cd target ('cd \$VAR && git commit') falls back to the session cwd and IS gated" \
+  "$VX_CLAIMED" "cd \$SOMEWHERE && git commit -m x" deny
+vx_check "unparseable command (unbalanced quote) containing a git write IS gated" \
+  "$VX_CLAIMED" "echo \"unterminated && git commit -m x" deny
+
+vx_arm
+JSON=$(make_json "cd \$SOMEWHERE && git commit -m x" "sess-ME" "$VX_CLAIMED")
+OUT=$(run_hook "$JSON")
+if printf '%s' "$OUT" | grep -q "could not be resolved"; then
+  pass "vx4aj: ambiguous-target deny explains that the target was unresolvable"
+else
+  fail "vx4aj: ambiguous-target deny explains that the target was unresolvable" "output: $OUT"
+fi
+
+# ============================================================
+# SABLE-vx4aj INTEGRATION — real git writes, real claim files, no mocks
+# ============================================================
+#
+# The unit block above asserts the hook's decision JSON. This block closes
+# the loop: when the hook ALLOWS, the command is actually executed against
+# real repos and the resulting git state is asserted; when it DENIES, the
+# command is not executed and the target repo is proven unchanged. That is
+# the property that matters operationally — "the write landed / did not
+# land" — not just the shape of the decision.
+
+echo "--- SABLE-vx4aj Integration: gate decision drives real git state ---"
+
+# gate_and_run <cwd> <command> — run the hook; execute for real iff allowed.
+# Echoes "allow" or "deny".
+gate_and_run() {
+  local cwd="$1" cmd="$2" json out
+  json=$(make_json "$cmd" "sess-ME" "$cwd")
+  out=$(run_hook "$json")
+  if is_deny "$out"; then
+    echo "deny"
+  else
+    ( cd "$cwd" && eval "$cmd" ) >/dev/null 2>&1
+    echo "allow"
+  fi
+}
+
+count_commits() { git -C "$1" rev-list --count HEAD 2>/dev/null || echo 0; }
+
+# Real content to commit in each repo.
+echo unrelated-work > "$VX_UNRELATED/u.txt"
+echo claimed-work   > "$VX_CLAIMED/c.txt"
+
+# (1) Real write in the UNRELATED repo, issued from the CLAIMED repo's cwd
+#     while a foreign session holds the CLAIMED repo's claim: must proceed
+#     and must actually produce a commit in the unrelated repo.
+vx_arm
+BEFORE_U=$(count_commits "$VX_UNRELATED")
+DECISION=$(gate_and_run "$VX_CLAIMED" "cd $VX_UNRELATED && git add -A && git commit -q -m 'unrelated real write'")
+AFTER_U=$(count_commits "$VX_UNRELATED")
+if [ "$DECISION" = "allow" ] && [ "$AFTER_U" -eq $((BEFORE_U + 1)) ]; then
+  pass "vx4aj integration: real write in unrelated repo proceeds under a foreign claim on the SABLE-like checkout"
+else
+  fail "vx4aj integration: real write in unrelated repo proceeds under a foreign claim on the SABLE-like checkout" "decision=$DECISION commits $BEFORE_U -> $AFTER_U"
+fi
+# ...and the claimed repo must have gained nothing.
+if [ -z "$(git -C "$VX_CLAIMED" log --oneline --all --grep='unrelated real write' 2>/dev/null)" ]; then
+  pass "vx4aj integration: claimed repo received no commit from the unrelated write"
+else
+  fail "vx4aj integration: claimed repo received no commit from the unrelated write"
+fi
+
+# (2) Real 'git -C <claimed>' write issued from the UNRELATED repo's cwd:
+#     must be refused, and the claimed repo must be provably unchanged.
+vx_arm
+BEFORE_C=$(count_commits "$VX_CLAIMED")
+DECISION=$(gate_and_run "$VX_UNRELATED" "git -C $VX_CLAIMED add -A && git -C $VX_CLAIMED commit -q -m 'cross-repo write'")
+AFTER_C=$(count_commits "$VX_CLAIMED")
+if [ "$DECISION" = "deny" ] && [ "$AFTER_C" -eq "$BEFORE_C" ]; then
+  pass "vx4aj integration: real 'git -C <claimed>' write from another repo's cwd is refused and lands nothing"
+else
+  fail "vx4aj integration: real 'git -C <claimed>' write from another repo's cwd is refused and lands nothing" "decision=$DECISION commits $BEFORE_C -> $AFTER_C"
+fi
+
+# (3) The false-negative class, end to end: a newline-separated
+#     'cd <claimed>' + 'git commit' issued from the unrelated repo must be
+#     refused and must leave the claimed repo untouched.
+vx_arm
+BEFORE_C=$(count_commits "$VX_CLAIMED")
+DECISION=$(gate_and_run "$VX_UNRELATED" "cd $VX_CLAIMED
+git add -A
+git commit -q -m 'newline evasion'")
+AFTER_C=$(count_commits "$VX_CLAIMED")
+if [ "$DECISION" = "deny" ] && [ "$AFTER_C" -eq "$BEFORE_C" ]; then
+  pass "vx4aj integration: newline-separated write into the claimed repo is refused and lands nothing"
+else
+  fail "vx4aj integration: newline-separated write into the claimed repo is refused and lands nothing" "decision=$DECISION commits $BEFORE_C -> $AFTER_C"
+fi
+
+rm -rf "$VX_ROOT"
+
+# ============================================================
+# SABLE-vx4aj / SABLE-hfkdd — REAL-BASH ORACLE
+# ============================================================
+#
+# Everything above asserts hand-written expected values. That is exactly how
+# the previous 102-assertion revision of this suite passed while shipping a
+# live evasion: it enumerated the constructs the fix had ADDED handling for,
+# and asserted the case where the 'cd' and the write are BOTH inside a
+# subshell — the complement of the failing case. Coverage read complete while
+# the load-bearing invariant went unasserted.
+#
+# THE INVARIANT, asserted directly and in both directions:
+#   the claim gates a command IF AND ONLY IF that command's write really
+#   lands in the claimed repo.
+#
+# Expected values below are NOT hand-written. For each probe, bash itself
+# executes the command against a fresh pair of real repos and we observe which
+# repo actually gained a commit; the hook's decision must agree with what bash
+# really did. Bash's own scoping is the ground truth.
+#
+# Every probe additionally carries a POSITIVE CONTROL in its own fixture (see
+# oracle_check): an allow is an absence-assertion, and a rig that has stopped
+# gating anything returns allow for everything and looks green. The control
+# proves the fixture denies when it must before any allow from it is believed.
+#
+# Cases are derived from what the tokenizer's normalisation DISCARDS. It
+# rewrites shell operators into separators, which resets command position but
+# throws away SCOPE — and scope is load-bearing for a gate that attributes
+# writes to directories. Hence the central pair:
+#   '( cd X ) ; git commit'    -> bash unwinds the cd at ')': writes HERE
+#   '{ cd X ; } ; git commit'  -> brace group runs in THIS shell: writes in X
+# Subshell and brace group MUST differ; any implementation treating them alike
+# is wrong by construction in one direction or the other.
+
+echo "--- SABLE-vx4aj/hfkdd: real-bash oracle (hook decision vs. where bash actually writes) ---"
+
+ORC_ROOT=""
+ORC_CLAIMED=""
+ORC_UNRELATED=""
+
+# Fresh pair of real repos, both dirty so 'git commit -am' can succeed in
+# EITHER one — otherwise a probe could "land nowhere" for an uninteresting
+# reason and vacuously agree with an allow.
+orc_setup() {
+  ORC_ROOT="$(mktemp -d)"
+  ORC_CLAIMED="$ORC_ROOT/claimed"
+  ORC_UNRELATED="$ORC_ROOT/unrelated"
+  local r
+  for r in "$ORC_CLAIMED" "$ORC_UNRELATED"; do
+    git init -q "$r"
+    git -C "$r" config user.email oracle@test
+    git -C "$r" config user.name oracle
+    echo base > "$r/f.txt"
+    git -C "$r" add f.txt
+    git -C "$r" commit -qm init
+    echo change >> "$r/f.txt"
+  done
+}
+orc_teardown() { [ -n "$ORC_ROOT" ] && rm -rf "$ORC_ROOT"; ORC_ROOT=""; }
+
+orc_expand() {
+  # $1 = template using @CLAIMED@ / @UNRELATED@ placeholders
+  local t="$1"
+  t="${t//@CLAIMED@/$ORC_CLAIMED}"
+  t="${t//@UNRELATED@/$ORC_UNRELATED}"
+  printf '%s' "$t"
+}
+
+# oracle_check <label> <cwd: claimed|unrelated> <command template>
+oracle_check() {
+  local label="$1" cwdsel="$2" tmpl="$3"
+  local cmd cwd truth c_before c_after u_before u_after
+
+  # --- Phase 1: ORACLE. Real bash, real repos, hook not involved at all.
+  orc_setup
+  cmd="$(orc_expand "$tmpl")"
+  if [ "$cwdsel" = "claimed" ]; then cwd="$ORC_CLAIMED"; else cwd="$ORC_UNRELATED"; fi
+  c_before=$(git -C "$ORC_CLAIMED" rev-list --count HEAD)
+  u_before=$(git -C "$ORC_UNRELATED" rev-list --count HEAD)
+  ( cd "$cwd" && bash -c "$cmd" ) >/dev/null 2>&1
+  c_after=$(git -C "$ORC_CLAIMED" rev-list --count HEAD)
+  u_after=$(git -C "$ORC_UNRELATED" rev-list --count HEAD)
+  orc_teardown
+
+  if [ "$c_after" -gt "$c_before" ]; then
+    truth="claimed"
+  elif [ "$u_after" -gt "$u_before" ]; then
+    truth="unrelated"
+  else
+    # The probe committed nowhere — a broken probe command, not a result.
+    # Fail loudly rather than let it agree with 'allow' by accident.
+    fail "oracle: $label" "PROBE BROKEN — bash committed to neither repo; cmd: $cmd"
+    return
+  fi
+
+  # --- Phase 2: the hook, identical fresh sandbox, foreign fresh claim on
+  #     the claimed repo.
+  orc_setup
+  cmd="$(orc_expand "$tmpl")"
+  if [ "$cwdsel" = "claimed" ]; then cwd="$ORC_CLAIMED"; else cwd="$ORC_UNRELATED"; fi
+  printf 'sess-HOLDER %s chuck\n' "$(date +%s)" > "$ORC_CLAIMED/.git/sable-tree-claim"
+  local out decision want
+  out=$(run_hook "$(make_json "$cmd" "sess-ME" "$cwd")")
+  if is_deny "$out"; then decision="deny"; else decision="allow"; fi
+
+  # --- POSITIVE CONTROL, in this same fixture, before teardown.
+  # An ALLOW is an ABSENCE-assertion: a rig that has silently stopped gating
+  # anything at all returns ALLOW for every probe and reads as a clean pass.
+  # So prove the fixture still DENIES when it must, every time — a plain
+  # 'git commit' into the claimed repo from its own cwd, which is
+  # unconditionally gated. Without this pairing an allow-shaped assertion is
+  # worthless: it cannot distinguish working from broken.
+  local ctl ctl_ok
+  printf 'sess-HOLDER %s chuck\n' "$(date +%s)" > "$ORC_CLAIMED/.git/sable-tree-claim"
+  ctl=$(run_hook "$(make_json "git commit -qam control" "sess-ME" "$ORC_CLAIMED")")
+  if is_deny "$ctl"; then ctl_ok="yes"; else ctl_ok="no"; fi
+  orc_teardown
+
+  if [ "$truth" = "claimed" ]; then want="deny"; else want="allow"; fi
+  if [ "$ctl_ok" != "yes" ]; then
+    fail "oracle: $label" "POSITIVE CONTROL FAILED — a plain 'git commit' into the claimed repo from its own cwd was NOT denied in this fixture, so the rig is not gating and no allow/deny result from it can be believed. control output: ${ctl:-<empty>}"
+  elif [ "$decision" = "$want" ]; then
+    pass "oracle: $label [bash wrote to $truth -> hook $decision; control denies]"
+  else
+    fail "oracle: $label" "bash wrote to $truth, so the hook must $want, but it returned $decision. cmd: $cmd"
+  fi
+}
+
+# --- The scoping invariant: subshell unwinds, brace group persists ---------
+# These four are the whole bead. The first is the regression that shipped:
+# the write really lands in the claimed repo and the hook allowed it.
+oracle_check "subshell cd is unwound at ')': '( cd <unrel> ) ; git commit' from claimed cwd" \
+  claimed '( cd @UNRELATED@ && true ) ; git commit -qam probe'
+oracle_check "brace-group cd PERSISTS past '}': '{ cd <unrel>; } ; git commit' from claimed cwd" \
+  claimed '{ cd @UNRELATED@ ; true ; } ; git commit -qam probe'
+oracle_check "subshell cd is unwound (mirror): '( cd <claimed> ) ; git commit' from unrelated cwd" \
+  unrelated '( cd @CLAIMED@ && true ) ; git commit -qam probe'
+oracle_check "brace-group cd PERSISTS (mirror): '{ cd <claimed>; } ; git commit' from unrelated cwd" \
+  unrelated '{ cd @CLAIMED@ ; true ; } ; git commit -qam probe'
+
+# --- The complement the old suite covered: cd and write both inside --------
+oracle_check "both inside subshell: '( cd <unrel> && git commit )' from claimed cwd" \
+  claimed '( cd @UNRELATED@ && git commit -qam probe )'
+oracle_check "both inside subshell: '( cd <claimed> && git commit )' from unrelated cwd" \
+  unrelated '( cd @CLAIMED@ && git commit -qam probe )'
+
+# --- Nesting and ordering: scope must stack, not merely toggle -------------
+oracle_check "nested subshell: '( ( cd <unrel> ) ; git commit )' from claimed cwd" \
+  claimed '( ( cd @UNRELATED@ ) ; git commit -qam probe )'
+oracle_check "persistent cd then subshell cd: only the persistent one survives" \
+  claimed 'cd @UNRELATED@ ; ( cd @CLAIMED@ ) ; git commit -qam probe'
+oracle_check "subshell cd then persistent cd: the persistent one wins" \
+  unrelated '( cd @UNRELATED@ ) ; cd @CLAIMED@ ; git commit -qam probe'
+oracle_check "backgrounded subshell: '( cd <unrel> ) & wait ; git commit' from claimed cwd" \
+  claimed '( cd @UNRELATED@ ) & wait ; git commit -qam probe'
+
+# --- Unmatched ')' — a case-pattern terminator, not a subshell close -------
+# These belong to the paren work: ')' resets command position, and popping an
+# empty scope stack must NOT relocate the shell cwd, because a case body runs
+# in the CURRENT shell. Getting this wrong reopens the false negative.
+oracle_check "case body: 'case x in x) git commit ;; esac' from claimed cwd" \
+  claimed 'case x in x) git commit -qam probe ;; esac'
+oracle_check "cd then case body: 'cd <claimed>; case x in x) git commit;; esac' from unrelated cwd" \
+  unrelated 'cd @CLAIMED@ ; case x in x) git commit -qam probe ;; esac'
+
+# --- Baselines: the shapes that already worked must still agree -----------
+oracle_check "plain 'git commit' from claimed cwd" \
+  claimed 'git commit -qam probe'
+oracle_check "'cd <unrel> && git commit' from claimed cwd" \
+  claimed 'cd @UNRELATED@ && git commit -qam probe'
+oracle_check "'git -C <claimed> commit' from unrelated cwd" \
+  unrelated 'git -C @CLAIMED@ commit -qam probe'
+oracle_check "newline separator: 'cd <claimed>' NEWLINE 'git commit' from unrelated cwd" \
+  unrelated 'cd @CLAIMED@
+git commit -qam probe'
+
+# ============================================================
+# SABLE-hfkdd: reserved words are command positions
+# ============================================================
+#
+# Same oracle, same positive control on every probe. The defect: the walk
+# only restored command position on OPERATORS, so after 'if true;' the ';'
+# reset correctly but the token 'then' — not cd/env/git — knocked the walk
+# OFF command position, and the 'git commit' behind it was never evaluated as
+# a command at all. Every compound construct in bash puts a reserved word
+# exactly where a command name is expected, so 'if', 'for' and 'while'
+# wrappers made writes invisible to the gate. These are ordinary shapes in
+# agent-composed bash, not adversarial ones.
+#
+# The fix is stated as a PROPERTY, not an enumeration of constructs: a
+# reserved word sitting at command position is TRANSPARENT — skip it and stay
+# at command position — exactly as the walk already treats NAME=VALUE
+# prefixes and env(1). The probes below are therefore chosen to cover the
+# distinct POSITIONS a reserved word can occupy (compound head, body opener,
+# branch, loop, prefix), not a checklist of statement types.
+#
+# BOTH DIRECTIONS ARE MANDATORY. Making 'git' visible behind a keyword is
+# worthless if it is bought by denying every keyword-wrapped command: that
+# trades a false negative for a blanket deny-on-keyword, which is the failure
+# the paired unrelated-cwd probes exist to catch. Each denies-in-claimed probe
+# has an allows-in-unrelated mirror.
+
+echo "--- SABLE-hfkdd: reserved words at command position (real-bash oracle) ---"
+
+# --- The three shapes confirmed live-evading on the base branch ------------
+oracle_check "if/then body: 'if true; then git commit; fi' from claimed cwd" \
+  claimed 'if true; then git commit -qam probe; fi'
+oracle_check "for/do body: 'for f in 1; do git commit; done' from claimed cwd" \
+  claimed 'for f in 1; do git commit -qam probe; done'
+oracle_check "while/do body: 'while true; do git commit; break; done' from claimed cwd" \
+  claimed 'while true; do git commit -qam probe; break; done'
+oracle_check "until/do body: 'until false; do git commit; break; done' from claimed cwd" \
+  claimed 'until false; do git commit -qam probe; break; done'
+
+# --- Multi-line forms: the keyword arrives on its own line -----------------
+# normalize_operators turns the newline into ';', so the keyword is then the
+# FIRST token of its own segment — the purest form of the defect.
+oracle_check "multi-line if: 'if true' NL 'then' NL 'git commit' NL 'fi' from claimed cwd" \
+  claimed 'if true
+then
+git commit -qam probe
+fi'
+oracle_check "multi-line for: 'for f in 1' NL 'do' NL 'git commit' NL 'done' from claimed cwd" \
+  claimed 'for f in 1
+do
+git commit -qam probe
+done'
+
+# --- Branch keywords: else / elif are command positions too ----------------
+oracle_check "else branch: 'if false; then :; else git commit; fi' from claimed cwd" \
+  claimed 'if false; then :; else git commit -qam probe; fi'
+oracle_check "elif branch: 'if false; then :; elif true; then git commit; fi' from claimed cwd" \
+  claimed 'if false; then :; elif true; then git commit -qam probe; fi'
+
+# --- Keyword as a PREFIX of a simple command -------------------------------
+oracle_check "'time git commit' from claimed cwd" \
+  claimed 'time git commit -qam probe'
+oracle_check "'! git commit' (negation prefix) from claimed cwd" \
+  claimed '! git commit -qam probe'
+
+# --- The other direction: keyword-wrapped writes elsewhere still ALLOW -----
+# If these flip to deny, the fix has become a blanket deny-on-keyword and has
+# traded a false negative for a false positive.
+oracle_check "if/then body from UNRELATED cwd must still be allowed" \
+  unrelated 'if true; then git commit -qam probe; fi'
+oracle_check "for/do body from UNRELATED cwd must still be allowed" \
+  unrelated 'for f in 1; do git commit -qam probe; done'
+oracle_check "cd inside an if body PERSISTS: 'if true; then cd <unrel>; git commit; fi' from claimed cwd" \
+  claimed 'if true; then cd @UNRELATED@; git commit -qam probe; fi'
+
+# --- Keywords must compose with the cd tracking, in both directions --------
+oracle_check "until/do with persistent cd: 'until false; do cd <claimed>; git commit; break; done' from unrelated cwd" \
+  unrelated 'until false; do cd @CLAIMED@; git commit -qam probe; break; done'
+oracle_check "cd then if body: 'cd <claimed>; if true; then git commit; fi' from unrelated cwd" \
+  unrelated 'cd @CLAIMED@; if true; then git commit -qam probe; fi'
+
+# --- Keywords must not disturb the vx4aj subshell/brace-group scoping ------
+oracle_check "subshell inside an if body is still unwound at ')' (claimed cwd)" \
+  claimed 'if true; then ( cd @UNRELATED@ ) ; git commit -qam probe; fi'
+oracle_check "brace group inside an if body still persists past '}' (claimed cwd)" \
+  claimed 'if true; then { cd @UNRELATED@ ; } ; git commit -qam probe; fi'
+
+# --- Quoted text is DATA, never a command ---------------------------------
+# Not oracle-able (it commits nowhere by design, which the oracle correctly
+# rejects as a broken probe), so asserted directly — with the same positive
+# control discipline: the fixture must deny a real write before its allow is
+# believed.
+orc_setup
+printf 'sess-HOLDER %s chuck\n' "$(date +%s)" > "$ORC_CLAIMED/.git/sable-tree-claim"
+kw_ctl=$(run_hook "$(make_json "git commit -qam control" "sess-ME" "$ORC_CLAIMED")")
+kw_out=$(run_hook "$(make_json 'echo "if true; then git commit -am x; fi"' "sess-ME" "$ORC_CLAIMED")")
+orc_teardown
+if ! is_deny "$kw_ctl"; then
+  fail "quoted keyword+git text is data, not a command" \
+    "POSITIVE CONTROL FAILED — the fixture did not deny a plain 'git commit' into the claimed repo, so its allow proves nothing"
+elif is_allow "$kw_out"; then
+  pass "quoted keyword+git text is data, not a command [control denies]"
+else
+  fail "quoted keyword+git text is data, not a command" \
+    "echo of a quoted 'if ... git commit ... fi' string was DENIED; quoted text must never be treated as a command"
+fi
+
+# --- The unparseable-command fallback must see keywords too ----------------
+# A command shlex cannot tokenise (unbalanced quote) never reaches the walk at
+# all; it is matched by UNPARSEABLE_RE and gated against the session cwd. That
+# regex anchored 'git' to a separator or a NAME=VALUE prefix, so the very same
+# keyword blindness lived on the second path to a decision and fell through to
+# fail OPEN. Not oracle-able — bash cannot execute an unbalanced quote, so
+# there is no ground truth to observe — hence a direct assertion, with the
+# positive control kept.
+orc_setup
+printf 'sess-HOLDER %s chuck\n' "$(date +%s)" > "$ORC_CLAIMED/.git/sable-tree-claim"
+kw_ctl=$(run_hook "$(make_json "git commit -qam control" "sess-ME" "$ORC_CLAIMED")")
+kw_unp=$(run_hook "$(make_json 'if true; then git commit -am "x; fi' "sess-ME" "$ORC_CLAIMED")")
+kw_unp_far=$(run_hook "$(make_json 'if true; then git commit -am "x; fi' "sess-ME" "$ORC_UNRELATED")")
+orc_teardown
+if ! is_deny "$kw_ctl"; then
+  fail "unparseable keyword-wrapped git write is gated" \
+    "POSITIVE CONTROL FAILED — the fixture did not deny a plain 'git commit' into the claimed repo"
+elif ! is_deny "$kw_unp"; then
+  fail "unparseable keyword-wrapped git write is gated" \
+    "an untokenisable 'if true; then git commit -am \"x; fi' from the claimed repo's cwd was ALLOWED — the fallback regex failed open behind the keyword"
+elif is_allow "$kw_unp_far"; then
+  pass "unparseable keyword-wrapped git write is gated (and only in the claimed repo) [control denies]"
+else
+  fail "unparseable keyword-wrapped git write is gated" \
+    "the same unparseable command from an UNRELATED repo's cwd was denied — the fallback has become a blanket deny"
+fi
+
+# ============================================================
+# SABLE-k2h0m — THE GUARD THAT CANNOT RUN
+# ============================================================
+#
+# A single-file hook CANNOT fail closed on its own syntax error: bash parses
+# the whole file before executing a line, so no in-file check ever runs. The
+# fix therefore splits the hook in two — tree-claim.sh is a small, embedded-
+# language-free ENTRYPOINT whose only job is to run tree-claim-impl.sh and
+# decide what a non-zero exit MEANS, and tree-claim-impl.sh holds all the
+# volatile logic (the six embedded python programs that made the observed
+# stray-double-quote incident possible).
+#
+# THE DECIDED DIRECTION (this bead owns the decision):
+#   A guard that cannot evaluate has NOT established that the write is safe.
+#   "We could not check" is not "this is permitted". So when the impl cannot
+#   run, a command that LOOKS like a git index write is DENIED.
+#
+#   But a naive blanket deny removes the means of repair: you cannot commit
+#   the fix to a broken tree-claim.sh if tree-claim.sh blocks all commits.
+#   Three properties keep repair possible, and all three are asserted below:
+#     1. Only git-index-write-shaped commands are denied. Everything else
+#        (editors, tests, `bash -n`, `ls`) still runs, so the fix can be
+#        written and validated.
+#     2. SABLE_TREE_CLAIM_OVERRIDE=1 is honoured in degraded mode, from the
+#        hook's env OR as an inline prefix in the command itself — the latter
+#        matters because a PreToolUse hook is a separate process and a plain
+#        `VAR=1 git commit` prefix never reaches its environment.
+#     3. The degradation is LOUD: a fixed, greppable token on stderr plus
+#        additionalContext on every decision. Silence was the worst property
+#        of the old fail-open mode — 84 assertions flipped to allow at once
+#        and the suite read green-ish.
+#
+# BLAST RADIUS (stated deliberately): tree-claim.sh gates git writes in
+# whatever repo the command targets, so a deny-on-breakage mode can refuse
+# writes in unrelated repos too. That is bounded here by (1) above and by the
+# override, and it only obtains while the hook is actually broken.
+
+echo "--- SABLE-k2h0m: degraded mode (the impl cannot run) ---"
+
+BRK_ROOT=""
+BRK_HOOKDIR=""
+BRK_HOOK=""
+BRK_REPO=""
+
+# A realistic "installed copy is corrupt" fixture: both hook files copied to a
+# temp dir (the entrypoint resolves its impl relative to its OWN directory),
+# plus a real git repo with real content to commit.
+brk_setup() {
+  BRK_ROOT="$(mktemp -d)"
+  BRK_HOOKDIR="$BRK_ROOT/hooks"
+  BRK_HOOK="$BRK_HOOKDIR/tree-claim.sh"
+  BRK_REPO="$BRK_ROOT/repo"
+  mkdir -p "$BRK_HOOKDIR"
+  cp "$HOOK" "$BRK_HOOK" 2>/dev/null
+  cp "$REPO/hooks/multi-manager/tree-claim-impl.sh" "$BRK_HOOKDIR/tree-claim-impl.sh" 2>/dev/null
+  git init "$BRK_REPO" -q
+  git -C "$BRK_REPO" commit --allow-empty -m init -q
+  echo work > "$BRK_REPO/w.txt"
+}
+
+# Every corruption below must satisfy one property: `bash tree-claim-impl.sh`
+# exits non-zero WITHOUT reaching a decision. brk_assert_broken enforces it, so
+# a fixture that quietly stops corrupting anything fails loudly instead of
+# turning every degraded-mode case into an assertion about a healthy hook.
+# (It has already earned its keep: the first version of brk_corrupt appended a
+# stray quote to the END of the file, which bash — reading a script
+# INCREMENTALLY, parse a command then run it — never reaches on a run that
+# exits early. The impl behaved perfectly and the cases read green.)
+brk_assert_broken() {
+  local f="$BRK_HOOKDIR/tree-claim-impl.sh"
+  if bash -n "$f" 2>/dev/null; then
+    fail "k2h0m fixture ($1): the corrupted impl really is unparseable" \
+      "the fixture produced a file that still parses — every degraded-mode case below is vacuous"
+  fi
+}
+
+# Corruption 1 — a syntax error near the top, so nothing executes.
+#
+# A locally-illegal token rather than a stray double quote, deliberately: a
+# single injected '"' takes its meaning from the quote parity of everything
+# after it, so whether it breaks the file depends on WHERE it lands (verified
+# on this file — injecting one at line 88 or 144 breaks parsing, at 69 or 128
+# it does not). The property under test is "the file does not parse", not any
+# particular typo, so the fixture uses a corruption that cannot silently
+# succeed. Corruption 2 covers the unterminated-string class faithfully.
+brk_corrupt() {
+  local f="$BRK_HOOKDIR/tree-claim-impl.sh"
+  awk 'NR==1 { print; print ";;"; next } { print }' "$f" > "$f.tmp"
+  mv "$f.tmp" "$f"
+  brk_assert_broken "syntax error"
+}
+
+# Corruption 2 — a TRUNCATED install, the faithful form of the live incident.
+# Cutting the file inside the first embedded python program leaves its
+# double-quoted bash string with no closing quote, so bash reads to EOF looking
+# for one and dies exactly the way the stray-quote incident did. This is also
+# the failure mode a partially-written copy-install produces, which the repo's
+# `bash -n` tripwire cannot see at all — it only ever checks the repo copy.
+brk_truncate() {
+  local f="$BRK_HOOKDIR/tree-claim-impl.sh" cut
+  cut=$(grep -n 'python3 -c "' "$f" | head -1 | cut -d: -f1)
+  awk -v c="$((cut + 2))" 'NR <= c { print }' "$f" > "$f.tmp"
+  mv "$f.tmp" "$f"
+  brk_assert_broken "truncated install"
+}
+
+brk_teardown() { [ -n "$BRK_ROOT" ] && rm -rf "$BRK_ROOT"; BRK_ROOT=""; }
+
+# Run the fixture's entrypoint. stdout is the decision JSON; stderr is kept in
+# $BRK_ROOT/err so the visibility assertion can read it.
+brk_run() {
+  printf '%s' "$1" | bash "$BRK_HOOK" 2>"$BRK_ROOT/err"
+}
+
+brk_stderr() { cat "$BRK_ROOT/err" 2>/dev/null; }
+
+# --- (a) DIRECTION: a broken guard DENIES a git index write ----------------
+# The repo has NO claim at all, so an intact hook would ALLOW this and write a
+# fresh claim. A deny here can only come from the breakage — which is the
+# whole point: the direction is pinned by a test, not left to accident.
+brk_setup
+brk_corrupt
+OUT=$(brk_run "$(make_json 'git commit -am work' "sess-ME" "$BRK_REPO")")
+if is_deny "$OUT"; then
+  pass "k2h0m: a guard that cannot parse DENIES an index-mutating git command"
+else
+  fail "k2h0m: a guard that cannot parse DENIES an index-mutating git command" \
+    "the hook exited without a deny, so the write was ALLOWED by a guard that never ran (output: $OUT)"
+fi
+
+# --- (b) VISIBILITY: the failure is loud and greppable ---------------------
+if brk_stderr | grep -q 'SABLE-TREE-CLAIM-DEGRADED'; then
+  pass "k2h0m: degraded mode emits the greppable SABLE-TREE-CLAIM-DEGRADED token on stderr"
+else
+  fail "k2h0m: degraded mode emits the greppable SABLE-TREE-CLAIM-DEGRADED token on stderr" \
+    "stderr was: $(brk_stderr)"
+fi
+if printf '%s' "$OUT" | grep -q 'permissionDecisionReason'; then
+  pass "k2h0m: the degraded deny carries a reason (not a bare refusal)"
+else
+  fail "k2h0m: the degraded deny carries a reason (not a bare refusal)" "output: $OUT"
+fi
+
+# --- (c) MEANS OF REPAIR: non-git commands still run -----------------------
+for SAFE_CMD in "ls -la" "bash -n hooks/multi-manager/tree-claim-impl.sh" "python3 -m pytest"; do
+  OUT=$(brk_run "$(make_json "$SAFE_CMD" "sess-ME" "$BRK_REPO")")
+  if is_allow "$OUT"; then
+    pass "k2h0m: degraded mode still allows the non-git command: $SAFE_CMD"
+  else
+    fail "k2h0m: degraded mode still allows the non-git command: $SAFE_CMD" \
+      "a broken tree-claim gate blanket-denied unrelated work, removing the means of repair (output: $OUT)"
+  fi
+done
+
+# ...and it says so, rather than degrading silently.
+OUT=$(brk_run "$(make_json 'ls -la' "sess-ME" "$BRK_REPO")")
+if has_additional_context "$OUT"; then
+  pass "k2h0m: a degraded ALLOW still announces the degradation in additionalContext"
+else
+  fail "k2h0m: a degraded ALLOW still announces the degradation in additionalContext" \
+    "the broken guard allowed silently — the exact property that let 84 assertions flip unnoticed"
+fi
+
+# --- (d) BREAK-GLASS via the hook's environment ----------------------------
+OUT=$(SABLE_TREE_CLAIM_OVERRIDE=1 brk_run "$(make_json 'git commit -am work' "sess-ME" "$BRK_REPO")")
+if is_allow "$OUT" && has_additional_context "$OUT"; then
+  pass "k2h0m: SABLE_TREE_CLAIM_OVERRIDE=1 in the hook env breaks the glass, loudly"
+else
+  fail "k2h0m: SABLE_TREE_CLAIM_OVERRIDE=1 in the hook env breaks the glass, loudly" "output: $OUT"
+fi
+
+# --- (e) BREAK-GLASS inline in the command ---------------------------------
+# A PreToolUse hook is a separate process: an env prefix INSIDE the Bash
+# command never reaches the hook's own environment. Degraded mode therefore
+# also honours the override when it appears in the command text — otherwise
+# the documented escape hatch is unusable from the place you actually type.
+OUT=$(brk_run "$(make_json 'SABLE_TREE_CLAIM_OVERRIDE=1 git commit -am work' "sess-ME" "$BRK_REPO")")
+if is_allow "$OUT"; then
+  pass "k2h0m: an inline SABLE_TREE_CLAIM_OVERRIDE=1 prefix breaks the glass"
+else
+  fail "k2h0m: an inline SABLE_TREE_CLAIM_OVERRIDE=1 prefix breaks the glass" \
+    "the only escape hatch reachable from the command line did not work (output: $OUT)"
+fi
+
+# --- (e2) THE LIVE INCIDENT'S OWN SHAPE: an unterminated string -------------
+# Same direction, reached the way it was actually reached: a copy of the hook
+# whose first embedded python program has no closing quote.
+brk_teardown
+brk_setup
+brk_truncate
+OUT=$(brk_run "$(make_json 'git commit -am work' "sess-ME" "$BRK_REPO")")
+if is_deny "$OUT" && brk_stderr | grep -q 'SABLE-TREE-CLAIM-DEGRADED'; then
+  pass "k2h0m: a TRUNCATED impl (unterminated embedded-python string) denies, loudly"
+else
+  fail "k2h0m: a TRUNCATED impl (unterminated embedded-python string) denies, loudly" \
+    "output: $OUT / stderr: $(brk_stderr)"
+fi
+
+# --- (f) CANNOT RUN is wider than CANNOT PARSE -----------------------------
+rm -f "$BRK_HOOKDIR/tree-claim-impl.sh"
+OUT=$(brk_run "$(make_json 'git add -A' "sess-ME" "$BRK_REPO")")
+if is_deny "$OUT"; then
+  pass "k2h0m: a MISSING impl (truncated/partial install) also denies, not just a parse error"
+else
+  fail "k2h0m: a MISSING impl (truncated/partial install) also denies, not just a parse error" "output: $OUT"
+fi
+brk_teardown
+
+# --- (g) NON-VACUITY: the same fixture, INTACT, discriminates ---------------
+# Without this, every deny above could be a fixture that denies everything,
+# and every allow a gate that was simply switched off.
+brk_setup
+OUT=$(brk_run "$(make_json 'git commit -am work' "sess-ME" "$BRK_REPO")")
+if is_allow "$OUT"; then
+  pass "k2h0m control: the INTACT fixture allows an unclaimed write (the deny above came from the breakage)"
+else
+  fail "k2h0m control: the INTACT fixture allows an unclaimed write" \
+    "the fixture denies even when healthy, so the degraded-mode denies prove nothing (output: $OUT)"
+fi
+if brk_stderr | grep -q 'SABLE-TREE-CLAIM-DEGRADED'; then
+  fail "k2h0m control: a healthy hook is silent on stderr" "stderr: $(brk_stderr)"
+else
+  pass "k2h0m control: a healthy hook does NOT emit the degraded token"
+fi
+printf 'sess-OTHER %s chuck\n' "$(date +%s)" > "$BRK_REPO/.git/sable-tree-claim"
+OUT=$(brk_run "$(make_json 'git commit -am work' "sess-ME" "$BRK_REPO")")
+if is_deny "$OUT"; then
+  pass "k2h0m control: the INTACT fixture still denies a foreign fresh claim (gate not disabled)"
+else
+  fail "k2h0m control: the INTACT fixture still denies a foreign fresh claim (gate not disabled)" "output: $OUT"
+fi
+brk_teardown
+
+# ============================================================
+# SABLE-k2h0m INTEGRATION — real git commits under a broken guard
+# ============================================================
+#
+# The block above asserts decision JSON. This one closes the loop the way the
+# vx4aj integration block does: the command is really executed when the hook
+# allows, and the repo's commit count is the assertion. The operative question
+# is "did the write land", not "what shape was the JSON".
+
+echo "--- SABLE-k2h0m Integration: broken guard vs. real git state ---"
+
+# brk_gate_and_run <cmd> — gate through the FIXTURE entrypoint, execute for
+# real iff allowed. Echoes allow/deny.
+brk_gate_and_run() {
+  local cmd="$1" out
+  out=$(brk_run "$(make_json "$cmd" "sess-ME" "$BRK_REPO")")
+  if is_deny "$out"; then
+    echo "deny"
+  else
+    ( cd "$BRK_REPO" && eval "$cmd" ) >/dev/null 2>&1
+    echo "allow"
+  fi
+}
+
+# (1) Broken guard, ordinary write: refused, and nothing lands.
+brk_setup
+brk_corrupt
+BEFORE=$(count_commits "$BRK_REPO")
+DECISION=$(brk_gate_and_run "git add -A && git commit -q -m 'write under broken guard'")
+AFTER=$(count_commits "$BRK_REPO")
+if [ "$DECISION" = "deny" ] && [ "$AFTER" -eq "$BEFORE" ]; then
+  pass "k2h0m integration: a real commit under a broken guard is refused and lands nothing"
+else
+  fail "k2h0m integration: a real commit under a broken guard is refused and lands nothing" \
+    "decision=$DECISION commits $BEFORE -> $AFTER"
+fi
+
+# (2) THE MEANS-OF-REPAIR PROPERTY, tested end to end: with the guard still
+#     broken, the break-glass form really commits.
+BEFORE=$(count_commits "$BRK_REPO")
+DECISION=$(brk_gate_and_run "SABLE_TREE_CLAIM_OVERRIDE=1 git add -A && SABLE_TREE_CLAIM_OVERRIDE=1 git commit -q -m 'repair commit'")
+AFTER=$(count_commits "$BRK_REPO")
+if [ "$DECISION" = "allow" ] && [ "$AFTER" -eq $((BEFORE + 1)) ]; then
+  pass "k2h0m integration: the break-glass write really lands while the guard is broken (repair is possible)"
+else
+  fail "k2h0m integration: the break-glass write really lands while the guard is broken (repair is possible)" \
+    "decision=$DECISION commits $BEFORE -> $AFTER"
+fi
+brk_teardown
+
+# (3) NEGATIVE CONTROL, end to end: an intact guard still lets a legitimate
+#     claimed write land, and still stops an unclaimed-by-you one.
+brk_setup
+BEFORE=$(count_commits "$BRK_REPO")
+DECISION=$(brk_gate_and_run "git add -A && git commit -q -m 'legit write'")
+AFTER=$(count_commits "$BRK_REPO")
+if [ "$DECISION" = "allow" ] && [ "$AFTER" -eq $((BEFORE + 1)) ]; then
+  pass "k2h0m integration control: an intact guard still lets a legitimate write land"
+else
+  fail "k2h0m integration control: an intact guard still lets a legitimate write land" \
+    "decision=$DECISION commits $BEFORE -> $AFTER"
+fi
+echo more > "$BRK_REPO/w2.txt"
+printf 'sess-OTHER %s chuck\n' "$(date +%s)" > "$BRK_REPO/.git/sable-tree-claim"
+BEFORE=$(count_commits "$BRK_REPO")
+DECISION=$(brk_gate_and_run "git add -A && git commit -q -m 'foreign-claim write'")
+AFTER=$(count_commits "$BRK_REPO")
+if [ "$DECISION" = "deny" ] && [ "$AFTER" -eq "$BEFORE" ]; then
+  pass "k2h0m integration control: an intact guard still refuses a write under a foreign fresh claim"
+else
+  fail "k2h0m integration control: an intact guard still refuses a write under a foreign fresh claim" \
+    "decision=$DECISION commits $BEFORE -> $AFTER"
+fi
+brk_teardown
+
+# ============================================================
 # settings-snippet registration
 # ============================================================
 
 echo "--- Registration check ---"
+
+# The hook's detector is a python program embedded in a single double-quoted
+# bash string, so one stray double quote anywhere in it — including in a
+# comment — terminates that string and breaks the whole hook. When that
+# happens the hook exits non-zero (SABLE-k2h0m). Cheap tripwire, since every
+# assertion above would otherwise go quietly green in whichever direction the
+# broken hook happens to fall.
+#
+# BOTH files are checked. Checking only the entrypoint would make this
+# tripwire vacuous by construction — the entrypoint holds no embedded python,
+# so it is precisely the file the hazard CANNOT reach.
+for F in "$HOOK" "$REPO/hooks/multi-manager/tree-claim-impl.sh"; do
+  B="$(basename "$F")"
+  if bash -n "$F" 2>/dev/null; then
+    pass "$B parses (guards the embedded-python quoting hazard)"
+  else
+    fail "$B parses (guards the embedded-python quoting hazard)" "$(bash -n "$F" 2>&1)"
+  fi
+done
+
+# The entrypoint's fail-closed decision is only worth anything while the
+# entrypoint itself stays simple: it is the one file whose breakage still
+# fails open (nothing can guard the outermost frame). Keeping the embedded
+# python — the demonstrated hazard — out of it is the structural property that
+# makes that residual risk small, so assert it rather than trust a comment.
+if grep -q 'python3 -c' "$HOOK"; then
+  fail "entrypoint stays free of embedded python (the hazard that broke the guard)" \
+    "tree-claim.sh has grown a 'python3 -c' program; move it to tree-claim-impl.sh"
+else
+  pass "entrypoint stays free of embedded python (the hazard that broke the guard)"
+fi
 
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 if python3 -c "import json; json.load(open('$SNIPPET'))" 2>/dev/null; then

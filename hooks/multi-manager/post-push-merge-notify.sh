@@ -234,6 +234,54 @@ if [ -z "$FILES" ]; then
   exit 0
 fi
 
+# --- Push-time preview kick (SABLE-jd5fj.1) ---------------------------------
+# The merge-preview ci-verify run is the slowest link in the worker->merge path,
+# and until now it only STARTED once Chuck picked the handoff up — so its whole
+# duration sat between the push and the merge. Fire `sable-merge-gate preview`
+# here instead — it builds the merge-preview commit, pushes the ci-verify ref
+# (the CI trigger) and returns WITHOUT waiting — so the verdict is already
+# computing before Chuck wakes. Chuck's later `promote` adopts that same ref via
+# the shared (base_sha, branch_sha) key, so this starts the run he waits on
+# rather than a second one.
+#
+# Placement is the contract: every no-kick guard already stands above this line
+# and stays authoritative — integration-branch self-push, 'Everything
+# up-to-date' no-op, unconfirmed-on-origin push, and empty diff vs the base all
+# exit before reaching here. So a kick happens exactly once per confirmed,
+# non-empty, non-self push, which is exactly the set of pushes that become a
+# Chuck merge.
+#
+# Fire-and-forget by construction: detached (setsid/nohup, own stdio) because the
+# kick's fetch+push outlives this hook's 10s timeout and must not be reaped with
+# the hook, and NON-BLOCKING because the handoff below must never wait on it. The
+# kick is pure warm-up — it writes no bead evidence and reports no verdict, so
+# losing one costs latency only (jd5fj.2's poll leg re-kicks a missed preview,
+# and promote still builds its own preview when none was kicked). Disable with
+# SABLE_PREVIEW_KICK=0; output lands in SABLE_PREVIEW_KICK_LOG.
+if [ "${SABLE_PREVIEW_KICK:-1}" = "1" ]; then
+  if command -v sable-merge-gate >/dev/null 2>&1; then
+    PREVIEW_KICK_LOG="${SABLE_PREVIEW_KICK_LOG:-$(dirname "$SABLE_HOOK_TRACE_LOG")/preview-kick.log}"
+    mkdir -p "$(dirname "$PREVIEW_KICK_LOG")" 2>/dev/null || true
+    if command -v setsid >/dev/null 2>&1; then
+      setsid sable-merge-gate preview --branch "$BRANCH" --repo "$CWD" \
+        >> "$PREVIEW_KICK_LOG" 2>&1 < /dev/null &
+    else
+      nohup sable-merge-gate preview --branch "$BRANCH" --repo "$CWD" \
+        >> "$PREVIEW_KICK_LOG" 2>&1 < /dev/null &
+    fi
+    PREVIEW_KICK_PID=$!
+    disown "$PREVIEW_KICK_PID" 2>/dev/null || true
+    sable_pp_trace "PREVIEW-KICK fired branch=${BRANCH} pid=${PREVIEW_KICK_PID}"
+  else
+    # Loud skip (SABLE-tb1y deliverable 3): never swallow a disposition on a
+    # confirmed push. Costs latency only — Chuck's promote builds its own preview.
+    echo "post-push-merge-notify: not kicking the merge preview — sable-merge-gate is not on PATH; Chuck's promote will build the preview at merge time (slower, not broken)."
+    sable_pp_trace "PREVIEW-KICK skipped no-binary branch=${BRANCH}"
+  fi
+else
+  sable_pp_trace "PREVIEW-KICK disabled (SABLE_PREVIEW_KICK=0) branch=${BRANCH}"
+fi
+
 # Try to detect PR URL via gh (best-effort, optional)
 PR_URL=$(gh pr view --json url -q .url 2>/dev/null || echo "")
 
@@ -286,6 +334,21 @@ print('\n'.join(lines))
 # worker-landing wake and the Chuck handoff).
 FILES_BRIEF=$(echo "$FILES" | sed 's#.*/##' | head -8 | tr '\n' ' ')
 
+# SABLE-f916: both landing artifacts below (the live chuck message AND the
+# durable for-chuck bead fallback) were byte-identical in framing to what a
+# manager's deliberate, reviewed PR-ready sign-off would look like — Chuck had
+# no mechanical way to tell "hook auto-detected a push" apart from "a manager
+# actually reviewed this and accepts it." Incident 2026-07-15: an auto-notify
+# for wk-bin-symlink-parity (SABLE-59t6.6) was queued+inspected as if
+# PR-ready, but optimus had NOT accepted it (later rejected for false-green
+# tests). This tag self-labels every auto-notify so it's grep-distinguishable
+# from a real sign-off (which carries no such tag) — it does not change
+# firing/registration behavior. Defined here (moved up from just above the
+# Chuck-handoff block, SABLE-gx7p3) so the worker-landing wake below can also
+# carry it — that message went out untagged and asserted closure it never
+# observed.
+AUTO_NOTIFY_TAG="[AUTO-NOTIFY: push detected by hook, NOT a manager sign-off]"
+
 # --- Wake the dispatching manager on a worker landing (SABLE-nmmh) ---------
 # Managers now run an EVENT-DRIVEN loop: they END their turn when nothing is
 # actionable (optimus.md / tarzan.md), so a worker landing must ACTIVELY wake
@@ -305,7 +368,71 @@ if [ "${SABLE_WORKER_LAND_NOTIFY:-1}" = "1" ] \
    && command -v sable-msg >/dev/null 2>&1; then
   PANE_ROLE=$(tmux display-message -p -t "$TMUX_PANE" '#{@sable_role}' 2>/dev/null || echo "")
   if [ "$PANE_ROLE" = "worker" ]; then
-    LAND_MSG="Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed & bead closed. Review the outcome — closed bead + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
+    # SABLE-gx7p3: the hook observed exactly one thing — a confirmed push. It
+    # previously asserted "bead closed" and "for-chuck PR" unconditionally,
+    # which is TRUE only when the branch's work bead is actually closed;
+    # every other case (in_progress, unresolvable query) rendered the same
+    # false terminal claim at the moment a lane manager is most likely to act
+    # on it. Resolve the bead(s) here (only on the worker-landing path — a
+    # manager's own push never reaches this branch) via the SAME structured
+    # `branch` metadata sable-spawn-worker writes at dispatch time (mirrors
+    # sable-reconcile-handoffs's find_work_bead_status resolver), and report
+    # closure only when actually observed; otherwise say what is known (the
+    # push, and the real status) and say explicitly this is not a sign-off.
+    # A query failure leaves the set empty ("unknown") rather than defaulting
+    # to a claim.
+    #
+    # CARDINALITY (live second instance, optimus/tarzan, SABLE-dhcyu bundle,
+    # same evening as the original finding): a BUNDLED dispatch joins N>1
+    # beads to the SAME branch metadata. Taking only the first matching
+    # bead's status — this hook's own first-cut fix — reproduces the exact
+    # defect one level down: if that first bead happens to be closed while a
+    # sibling in the same bundle is still in_progress, the notify again
+    # asserts a singular "bead closed" that is false about the unit of work.
+    # So closure is asserted ONLY when EVERY bead sharing this branch's
+    # metadata is closed; a partial bundle reports the set (closed count /
+    # total, and which remain open) rather than a singular claim.
+    BEAD_ID=""
+    BEAD_TOTAL=0
+    BEAD_CLOSED_COUNT=0
+    BEAD_OPEN_LIST=""
+    BEAD_ALL_IDS=""
+    BEAD_QUERY=$(bd list --status all --metadata-field "branch=$BRANCH" --json 2>/dev/null || echo "")
+    if [ -n "$BEAD_QUERY" ]; then
+      BEAD_ROWS=$(printf '%s' "$BEAD_QUERY" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+if isinstance(data, list):
+    for item in data:
+        if isinstance(item, dict) and item.get('status'):
+            print(f\"{item.get('id', '')}\t{item.get('status', '')}\")
+" 2>/dev/null) || BEAD_ROWS=""
+      while IFS=$'\t' read -r bid bstatus; do
+        [ -z "$bid" ] && continue
+        BEAD_TOTAL=$((BEAD_TOTAL + 1))
+        BEAD_ALL_IDS="${BEAD_ALL_IDS}${BEAD_ALL_IDS:+ }${bid}"
+        if [ "$bstatus" = "closed" ]; then
+          BEAD_CLOSED_COUNT=$((BEAD_CLOSED_COUNT + 1))
+        else
+          BEAD_OPEN_LIST="${BEAD_OPEN_LIST}${BEAD_OPEN_LIST:+, }${bid}(${bstatus})"
+        fi
+      done <<< "$BEAD_ROWS"
+      BEAD_ID=$(printf '%s' "$BEAD_ALL_IDS" | cut -d' ' -f1)
+    fi
+    if [ "$BEAD_TOTAL" -gt 0 ] && [ "$BEAD_CLOSED_COUNT" -eq "$BEAD_TOTAL" ]; then
+      if [ "$BEAD_TOTAL" -eq 1 ]; then
+        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; bead ${BEAD_ID:-?} is CLOSED. Review the outcome — closed bead + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
+      else
+        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; ALL ${BEAD_TOTAL} beads on this branch are CLOSED (${BEAD_ALL_IDS}). Review the outcome — closed beads + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
+      fi
+    elif [ "$BEAD_TOTAL" -gt 0 ]; then
+      LAND_MSG="${AUTO_NOTIFY_TAG} Worker pushed: branch ${BRANCH} (${FILES_BRIEF}). ${BEAD_CLOSED_COUNT}/${BEAD_TOTAL} bead(s) on this branch are closed — NOT all done (open: ${BEAD_OPEN_LIST}). This is NOT a completion signal; check \`bd show <id>\` for each and \`sable-worker-status\` before reviewing."
+    else
+      LAND_MSG="${AUTO_NOTIFY_TAG} Worker pushed: branch ${BRANCH} (${FILES_BRIEF}). No bead resolved via branch metadata — status unknown. The worker may still be running. This is NOT a completion signal; check \`bd show <bead>\` and \`sable-worker-status\` before reviewing."
+    fi
     [ -n "$OVERLAPS" ] && LAND_MSG="${LAND_MSG} OVERLAP-WARNING: shares files with in-flight work."
     if sable-msg "$SABLE_ID_NAME" "$LAND_MSG" --from worker >/dev/null 2>&1; then
       sable_pp_trace "WORKER-LAND-MSG sent -> ${SABLE_ID_NAME}"
@@ -331,17 +458,8 @@ sable_chuck_pane_present() {
   printf '%s\n' "$roles" | grep -qx chuck
 }
 
-# SABLE-f916: both landing artifacts below (the live chuck message AND the
-# durable for-chuck bead fallback) were byte-identical in framing to what a
-# manager's deliberate, reviewed PR-ready sign-off would look like — Chuck had
-# no mechanical way to tell "hook auto-detected a push" apart from "a manager
-# actually reviewed this and accepts it." Incident 2026-07-15: an auto-notify
-# for wk-bin-symlink-parity (SABLE-59t6.6) was queued+inspected as if
-# PR-ready, but optimus had NOT accepted it (later rejected for false-green
-# tests). This tag self-labels every auto-notify so it's grep-distinguishable
-# from a real sign-off (which carries no such tag) — it does not change
-# firing/registration behavior.
-AUTO_NOTIFY_TAG="[AUTO-NOTIFY: push detected by hook, NOT a manager sign-off]"
+# AUTO_NOTIFY_TAG (SABLE-f916) is defined earlier, above the worker-landing
+# wake block, so that message can carry it too (SABLE-gx7p3).
 
 # --- Message-first handoff with durable fallback (SABLE-bldh.15 / SABLE-wvk9) --
 # In the tmux warm-pane topology the worker->merge handoff is a direct message to

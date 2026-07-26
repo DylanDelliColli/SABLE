@@ -73,12 +73,23 @@ done
 # claude_manifest DIR HOMEDIR — content-hash manifest of every file under DIR,
 # with HOMEDIR normalized to a placeholder so HOME-embedding files (settings.json)
 # hash deterministically across scratch HOMEs. Excludes .bak / *install-bak*.
+# .sable-install-provenance (SABLE-78kxu) additionally gets its commit=/branch=/
+# timestamp= fields normalized: those are stamped from the CURRENT repo HEAD and
+# wall-clock time, so they vary every run/commit/worktree and would make the
+# golden baseline re-drift immediately after any regen (SABLE-z31s1).
 # MUST stay byte-identical to fixtures/regen: golden was captured with this exact fn.
 claude_manifest() {
   local dir="$1" home="$2"
   [ -d "$dir" ] || { printf '(no dir: %s)\n' "$dir"; return 0; }
   ( cd "$dir" && find . -type f ! -name '*.bak' ! -path '*install-bak*' | LC_ALL=C sort | while IFS= read -r f; do
-      h="$(sed "s@${home}@__HOME__@g" "$f" | sha256sum | cut -d' ' -f1)"
+      if [ "$f" = "./.sable-install-provenance" ]; then
+        h="$(sed -e "s@${home}@__HOME__@g" \
+                  -e 's/^commit=.*/commit=__COMMIT__/' \
+                  -e 's/^branch=.*/branch=__BRANCH__/' \
+                  -e 's/^timestamp=.*/timestamp=__TIMESTAMP__/' "$f" | sha256sum | cut -d' ' -f1)"
+      else
+        h="$(sed "s@${home}@__HOME__@g" "$f" | sha256sum | cut -d' ' -f1)"
+      fi
       printf '%s  %s\n' "$h" "$f"
     done )
 }

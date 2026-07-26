@@ -186,6 +186,21 @@ command). Spawn **victor** for a freshness pass, then run the post-batch-create
 verification: `bd dep tree <epic-id>` (edges match intent), `bd ready` (children
 that should be blocked are NOT ready), and `bd swarm validate <epic-id>`.
 
+**Every child's description MUST carry a `## File footprint` section** (SABLE-jd5fj.6):
+a comma-separated list of the files/paths the bead will touch, planner-declared —
+not left for a worker to infer. This is a scheduling constraint, not documentation:
+`hooks/multi-manager/pre-dispatch-overlap.sh` (and `sable-spawn-worker`'s own
+governance) DENY dispatching a bead whose declared footprint overlaps a
+DIFFERENT in-progress bead's footprint. The two outs at dispatch time are wait,
+or an explicit `Serialize-with: <bead-id>` line that tags both merges
+serialize-together for Chuck. Decompose with this in mind: children whose
+footprints are expected to overlap (shared files, sequential edits to the same
+module) should either be scoped narrower to avoid the overlap, or you should
+flag the expected serialization in the epic notes so the dispatching manager
+isn't surprised by the constraint. Entries may be extension-less (e.g.
+`bin/sable-spawn-worker`) — the footprint section is parsed as a dedicated
+field, not the generic file-extension regex used as a fallback for older beads.
+
 **Deliverable:** write `decomposition.json` to the planning state dir — the
 children (id/title/type/deps/ready-state), the `bd swarm validate` verdict, and
 victor's summary line — then run the gate protocol for the final signoff.

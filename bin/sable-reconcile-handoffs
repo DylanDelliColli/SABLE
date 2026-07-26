@@ -10,11 +10,54 @@ the systems of record (origin + beads) and reconciles what it finds
 (Anthropic's own "query systems of record and reconcile" pattern; TRADEOFFS #2).
 It promotes chuck.md's prose stranded-recovery sweep (chuck.md §Boundaries) to code.
 
-STRANDED PREDICATE (a branch is stranded iff ALL FOUR hold):
+HELD IS A THIRD OUTCOME, NOT A SUPPRESSION (SABLE-jejx3)
+--------------------------------------------------------
+Before this floor learned about holds it could report only two outcomes:
+STRANDED, or not. A branch that is unmerged BY DELIBERATE DECISION (a manager
+issued an explicit do-not-merge hold) satisfies all four stranded predicates
+IDENTICALLY to one that is unmerged BY ACCIDENT, so the floor filed a handoff
+whose content — "nobody merged this, merge it" — was the EXACT INVERSE of the
+standing instruction, and re-filed it every cadence once Chuck closed it.
+
+A hold is now a FIRST-CLASS, DURABLE, MACHINE-READABLE state carried as
+metadata ON THE WORK BEAD — never on the branch name, never in tmux traffic,
+neither of which survives a pane restart (that non-durability IS the root
+defect). Keying on the work bead means the hold SURVIVES A BRANCH RENAME or a
+re-push under a new name: the bead already carries `branch` metadata
+(SABLE-i5739), so re-pointing that field moves the hold with the work.
+
+  hold        the reason (any non-empty value = HELD; this is the presence key)
+  hold_by     who placed it        — an unowned hold is unreleasable after a recycle
+  hold_since  ISO8601 timestamp    — so the hold's own AGE can be escalated
+  hold_until  the release condition — "until what", the thing that prevents a
+              hold decaying into a permanent quiet veto
+
+  place:  bd update <work-bead> --sandbox \
+            --set-metadata hold="<reason>" --set-metadata hold_by="<who>" \
+            --set-metadata hold_since="<ISO8601>" --set-metadata hold_until="<condition>"
+  lift:   bd update <work-bead> --sandbox --unset-metadata hold \
+            --unset-metadata hold_by --unset-metadata hold_since --unset-metadata hold_until
+
+A held branch is NEVER silently skipped. Silence is how the previous generation
+of this bug worked (SABLE-2az2x: an instrument that cannot say "I could not
+assess"), and a hold is WORSE than a strand in that direction because it is
+SELF-SILENCING BY CONSTRUCTION — a forgotten strand is re-reported every cadence
+until someone acts, while a forgotten hold suppresses the very report that would
+surface it. So every cadence NAMES each held branch with by/since/until/reason,
+and a hold that is stale (older than $SABLE_HOLD_STALE_DAYS, default 3), unowned,
+undated, or carries no release condition is flagged NEEDING REVIEW in the summary.
+A hold whose state could not be READ at all (the bead query failed) is its own
+reported outcome — never folded into "not held", which would resume filing the
+inverted handoff, and never into a clean summary.
+
+STRANDED PREDICATE (a branch is stranded iff ALL FOUR hold, AND it is not HELD):
   1. origin's `wk-*` branch tip is NOT an ancestor of the integration branch
      (i.e. genuinely unmerged — `git merge-base --is-ancestor` exit 1).
-  2. its work bead (id parsed from the branch name, else `bd search`) is
-     closed or in_progress (real, done-or-in-flight work — never an experiment).
+  2. its work bead — resolved via STRUCTURED `branch` metadata first
+     (SABLE-i5739; see find_work_bead_status), else an id parsed from the
+     branch name, else a legacy prose `bd search` for pre-metadata branches
+     — is closed or in_progress (real, done-or-in-flight work — never an
+     experiment).
   3. NO open/in-progress `for-chuck` bead already NAMES the branch (the handoff
      was filed — by the hook OR a prior run of this tool). This is the
      idempotency key: our own filed bead names the branch, so a re-run finds it
@@ -28,9 +71,90 @@ hook and sable-merge-gate use post-SABLE-dtp1 (imported from bin/sable-merge-gat
 resolve_integration_branch) — never a hardcoded main/tmux-only, so ancestry is
 judged against the branch this repo actually integrates onto.
 
+THREE MORE NON-STRANDED OUTCOMES, CHECKED RIGHT AFTER HOLD (SABLE-4709h)
+------------------------------------------------------------------------
+A shift's worth of sixteen [RECONCILE] firings triaged to ZERO genuinely
+stranded branches (SABLE-4709h). Three of the surviving healthy states were
+not distinguishable from a real strand by ANY predicate above:
+
+  IN-ACTIVE-REVISE    a live tmux worker pane is bound (via @sable_bead) to
+                      this branch's work bead RIGHT NOW — a manager already
+                      knows and a worker is on it. Checked via
+                      branch_has_live_worker_pane against a fleet-wide pane
+                      inventory (live_pane_bead_ids, reused from
+                      bin/sable-worker-status — SINGLE SOURCE OF TRUTH, not
+                      reimplemented). Fails OPEN to "no live pane found" when
+                      tmux/pane context is unavailable at all (the
+                      sable-reconcile-timer headless cadence runs with
+                      neither by design), so a missing tmux server never
+                      suppresses a genuine strand — it only means this ONE
+                      extra discriminator sat out that cadence.
+
+  REBASED-AND-LANDED  the branch's content is already at the spine under a
+                      DIFFERENT sha (SABLE-z7gue). Predicate 1 above
+                      (`git merge-base --is-ancestor`) asks "is this exact
+                      SHA reachable", and a rebase changes every SHA, so a
+                      fully-landed rebase copy answers 'not an ancestor'
+                      IDENTICALLY to a genuinely stranded branch — and 'ask
+                      both lanes' (SABLE-xw32f's remedy for the ambiguous
+                      case) cannot separate them either, because every lane
+                      truthfully answers 'not mine': the branch really is on
+                      the spine, in nobody's hand. Checked via
+                      branch_content_contained (`git cherry <upstream>
+                      <head>`, the patch-id-equivalence relation) — contained
+                      ONLY when EVERY commit unique to the branch is
+                      patch-id-equivalent at the spine; a partially-landed
+                      branch is conservatively left NOT-contained, since this
+                      floor's own stranded remedy is a WRITE to the spine and
+                      an indeterminate reading must never assert containment
+                      it cannot fully back.
+
+  QUEUED-AT-THE-SEAT  a ci-verify preview is IN FLIGHT for this branch's exact
+                      current sha pair (SABLE-xw32f) — under burst load, six
+                      branches legitimately queued for CI satisfied the
+                      stranded predicate identically to abandoned work, and a
+                      real (non-dry-run) sweep would have re-filed handoffs
+                      for work already in chuck's hands as fast as he closed
+                      them. Checked via branch_queued_at_seat: the SAME
+                      shared idempotency ref attempt_preview_kick's own no-op
+                      check already keys on (classify.preview_kick_ref), so
+                      'is this branch queued' and 'would kicking it be a
+                      no-op' resolve from one source of truth. Only covers
+                      the KICKED-preview ref scheme (hook or this floor's own
+                      poll leg) — a preview built directly by `sable-merge-
+                      gate promote` uses a different, bead-keyed ref scheme
+                      and is a known, logged scope gap, not a silent one.
+                      Checked AFTER content-containment and deliberately: a
+                      '+' (not-patch-id-equivalent) reading from that check
+                      is NOT proof of stranded on its own — a patch-id can
+                      change mid-queue (a rebase or conflict-resolution edit
+                      while the branch sits at the seat) — so '+' means
+                      UNKNOWN until this check also clears. AGE-BOUNDED
+                      (mirrors hold_since/hold_until): a preview in flight
+                      longer than $SABLE_QUEUED_STALE_MIN (default 120min)
+                      escalates back to ordinary classification rather than
+                      suppressing indefinitely — the same argument that made
+                      SABLE-jejx3's holds carry an age. Reported as its own
+                      named outcome with a count every cadence, never a
+                      silent skip (SABLE-2az2x's constraint).
+
 ACTION: for each stranded branch, file ONE `for-chuck,coord` bead whose title
 names the branch. Chuck merges it from the pool exactly as he would a
 hook-filed handoff.
+
+PREVIEW-KICK LEG (SABLE-jd5fj.2 / S5 poll leg): independently of the stranded
+predicate above, any origin `wk-*` branch that is genuinely unmerged (P1) and
+past the settle window (P4) is a candidate for a MISSED push-time preview kick
+(SABLE-jd5fj.1) — the hook may be unwired, may have raced the ref update, or
+may have died mid-flight. This leg deliberately does NOT consult the work-bead
+status (P2) or the for-chuck corpus (P3): a preview kick is a speculative CI
+warm-up, not a merge handoff, so it fires regardless of whether a handoff bead
+exists yet. Double-kick safety (hook vs. poll racing, or poll vs. poll) is
+NEVER decided here — it is the SHARED IDEMPOTENCY KEY inside sable-merge-gate's
+own `kick_preview` (preview_kick_ref, keyed on the (base_sha, branch_sha) pair),
+which no-ops when a ref already exists for that exact pair. This leg is an
+ADDITIONAL classification pass over the same branch list; it reads the four-
+part stranded predicate below not at all and changes none of its outcomes.
 
 BOUNDARIES (hard):
   * Files beads ONLY. NEVER merges, NEVER pushes code, NEVER deletes branches —
@@ -41,13 +165,20 @@ BOUNDARIES (hard):
   * `--dry-run` classifies + prints + files NOTHING + exits 0.
 
 Environment seams (overridable; defaults are the production commands so the flow
-is unit-testable without real git / bd):
+is unit-testable without real git / bd / tmux):
   SABLE_RC_REPO   repo path (default $PWD)         SABLE_RC_GIT     (git)
   SABLE_RC_REMOTE remote name (origin)             SABLE_RC_BD      (bd)
+                                                    SABLE_RC_TMUX    (tmux)
   SABLE_RECONCILE_AGE_MIN  push-age threshold, minutes (10)
+  SABLE_HOLD_STALE_DAYS    a hold older than this is flagged for review (3)
+  SABLE_QUEUED_STALE_MIN   a queued-at-seat preview older than this many
+                           minutes escalates to ordinary classification (120)
+  SABLE_MG_GH  (gh)  reused from sable-merge-gate's own env seam for the
+                     queued-at-seat Actions check (branch_queued_at_seat)
 
 Usage:
-  sable-reconcile-handoffs [--repo PATH] [--remote NAME] [--age-min N] [--dry-run]
+  sable-reconcile-handoffs [--repo PATH] [--remote NAME] [--age-min N]
+                           [--hold-stale-days N] [--dry-run]
   sable-reconcile-handoffs --help
 
 Exit codes:
@@ -83,6 +214,33 @@ _MG_LOADER.exec_module(_smg)
 
 resolve_integration_branch = _smg.resolve_integration_branch
 qualify_remote_ref = _smg.qualify_remote_ref
+kick_preview = _smg.kick_preview
+# SABLE-xw32f queued-at-seat check — top-level bindings (not `_smg.git_lib....`
+# inline) so tests can monkeypatch them the same way every other reused
+# sable-merge-gate seam here is monkeypatched (see kick_preview above).
+resolve_commit = _smg.git_lib.resolve_commit
+remote_ref_commit = _smg.git_lib.remote_ref_commit
+preview_kick_ref = _smg.classify.preview_kick_ref
+ref_has_inflight_run = _smg.preview_lib.ref_has_inflight_run
+
+# --------------------------------------------------------------------------
+# Reuse the fleet pane inventory — SINGLE SOURCE OF TRUTH (SABLE-4709h
+# IN-ACTIVE-REVISE discriminator). sable-worker-status already parses
+# `tmux list-panes` into {pane, bead, status, ...} records and already knows
+# which bead ids have a currently-LIVE pane (live_beads); re-implementing that
+# tab-format/parse contract here would drift the moment either file's pane
+# tagging changes. Same SourceFileLoader technique as the sable-merge-gate
+# import above.
+# --------------------------------------------------------------------------
+_WS_PATH = Path(__file__).resolve().parent / "sable-worker-status"
+_WS_LOADER = SourceFileLoader("sable_worker_status", str(_WS_PATH))
+_WS_SPEC = importlib.util.spec_from_loader("sable_worker_status", _WS_LOADER)
+_sws = importlib.util.module_from_spec(_WS_SPEC)
+_WS_LOADER.exec_module(_sws)
+
+_ws_parse_fleet_panes = _sws.parse_fleet_panes
+_ws_live_beads = _sws.live_beads
+_ws_pane_format = _sws._FORMAT
 
 
 # --------------------------------------------------------------------------
@@ -125,9 +283,21 @@ def title_names_branch(title: str | None, branch: str) -> bool:
     return re.search(pat, title) is not None
 
 
-def branch_named_by_open_for_chuck(open_beads: list[dict], branch: str) -> bool:
+def branch_named_by_open_for_chuck(open_beads: list[dict] | None, branch: str) -> bool:
     """Predicate 3. True iff any open/in-progress `for-chuck` bead's title names
-    the branch (a hook-filed handoff OR a prior reconciliation)."""
+    the branch (a hook-filed handoff OR a prior reconciliation).
+
+    open_beads is None when open_for_chuck_beads' query FAILED (corpus
+    unknown, not legitimately empty) — treated as True (assume-named) so a
+    transient bd failure suppresses filing rather than risking a duplicate.
+    The conservative direction is deliberately the OPPOSITE of
+    find_work_bead_status's metadata-query failure elsewhere in this file:
+    there, an empty result would wrongly leave a branch un-strandable, so the
+    safe fallback is to warn and keep going; here, an empty result IS the
+    suppression signal reconcile() acts on, so the safe fallback is to
+    assume-suppressed and skip this cadence."""
+    if open_beads is None:
+        return True
     return any(title_names_branch(b.get("title"), branch) for b in open_beads)
 
 
@@ -136,6 +306,148 @@ def age_exceeds_threshold(age_seconds: float, threshold_minutes: float) -> bool:
     settle window and is left for the next sweep (mirrors is_orphan's strict-`>`
     in sable-merge-gate so the boundary is unambiguous)."""
     return age_seconds > threshold_minutes * 60.0
+
+
+def preview_kick_eligible(rc: int, age_seconds: float | None,
+                          threshold_minutes: float) -> tuple[bool, str]:
+    """S5 poll-leg kick decision (SABLE-jd5fj.2): is this branch a candidate for
+    a MISSED preview kick? Reuses predicate 1 (`ancestor_rc_is_unmerged`) and
+    predicate 4 (`age_exceeds_threshold`) — the SAME pure checks the stranded
+    predicate uses — but deliberately skips predicates 2/3 (work-bead status,
+    for-chuck handoff already filed): a preview kick is a speculative CI
+    warm-up, not a merge handoff, so it is eligible even for a branch with no
+    work bead yet or one whose handoff bead already exists. Double-kick safety
+    is NOT decided here — see `attempt_preview_kick`. Returns (eligible, reason)
+    for the print trail, mirroring `classify_branch`'s shape."""
+    if not ancestor_rc_is_unmerged(rc):
+        return (False, f"merged-or-unresolvable(is-ancestor rc={rc})")
+    if age_seconds is None:
+        return (False, "age-unresolvable")
+    if not age_exceeds_threshold(age_seconds, threshold_minutes):
+        return (False, f"too-fresh({age_seconds:.0f}s <= {threshold_minutes}min settle)")
+    return (True, "eligible-for-preview-kick")
+
+
+# --------------------------------------------------------------------------
+# HOLD: the first-class third outcome (SABLE-jejx3). Pure functions only — the
+# hold lives in the WORK BEAD's metadata (see module docstring), so everything
+# below operates on an already-fetched bead record and is unit-testable with no
+# bd/git at all.
+# --------------------------------------------------------------------------
+
+HOLD_REASON_KEY = "hold"
+HOLD_BY_KEY = "hold_by"
+HOLD_SINCE_KEY = "hold_since"
+HOLD_UNTIL_KEY = "hold_until"
+
+# Sentinel for "the work bead could not be READ, so hold state is unknown".
+# Deliberately NOT None (which means 'read fine, not held') — collapsing the two
+# is exactly the mistake that files an inverted 'merge me' handoff for a branch
+# that is in fact under a do-not-merge hold.
+HOLD_UNKNOWN = "hold-state-unknown"
+
+DEFAULT_HOLD_STALE_DAYS = 3.0
+
+
+def hold_from_bead(bead: dict | None) -> dict | None:
+    """The hold record carried by a work bead, or None when the bead is not
+    held. Presence is keyed on a NON-EMPTY `hold` metadata value (the reason) —
+    the other three fields are detail, and their ABSENCE is reported as a review
+    flag rather than treated as a missing hold, so a sloppily-placed hold still
+    protects the branch while being loudly incomplete."""
+    if not isinstance(bead, dict):
+        return None
+    meta = bead.get("metadata")
+    if not isinstance(meta, dict):
+        return None
+    reason = meta.get(HOLD_REASON_KEY)
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    def _field(key: str) -> str | None:
+        v = meta.get(key)
+        return v.strip() if isinstance(v, str) and v.strip() else None
+    return {
+        "bead": bead.get("id"),
+        "reason": reason.strip(),
+        "by": _field(HOLD_BY_KEY),
+        "since": _field(HOLD_SINCE_KEY),
+        "until": _field(HOLD_UNTIL_KEY),
+    }
+
+
+def parse_hold_since(since: str | None) -> float | None:
+    """Epoch seconds for an ISO8601 `hold_since` (a trailing `Z` is accepted —
+    it is what bd and every SABLE timestamp writer emit). None when absent or
+    unparseable; an unparseable date is treated the same as a missing one, i.e.
+    the hold's age is UNKNOWN and that fact is flagged, never assumed fresh."""
+    if not since:
+        return None
+    text = since.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(text)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        from datetime import timezone
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def hold_age_days(hold: dict, now: float) -> float | None:
+    """Age of the hold in days, or None when `hold_since` is missing/unparseable."""
+    ts = parse_hold_since(hold.get("since"))
+    if ts is None:
+        return None
+    return max(0.0, (now - ts) / 86400.0)
+
+
+def hold_review_flags(hold: dict, now: float, stale_days: float) -> list[str]:
+    """Why this hold itself needs a human look. A hold suppresses the report
+    that would otherwise surface its branch, so an un-reviewable hold decays
+    into a permanent quiet veto that outlives everyone who knew why it was
+    placed — these flags are what make that decay LOUD instead of silent."""
+    flags: list[str] = []
+    if not hold.get("by"):
+        flags.append("UNOWNED(no hold_by — nobody can release it)")
+    if not hold.get("until"):
+        flags.append("NO-RELEASE-CONDITION(no hold_until — cannot expire)")
+    age = hold_age_days(hold, now)
+    if age is None:
+        flags.append("AGE-UNKNOWN(no parseable hold_since)")
+    elif age > stale_days:
+        flags.append(f"STALE({age:.1f}d > {stale_days:g}d)")
+    return flags
+
+
+def describe_hold(hold: dict, now: float, stale_days: float) -> str:
+    """The per-cadence HELD line. Carries all four fields chuck required —
+    held, BY WHOM, SINCE WHEN, UNTIL WHAT — plus the review flags, so a fresh
+    manager reading one sweep's output has everything needed to either respect
+    or release the hold without any surviving tmux context."""
+    age = hold_age_days(hold, now)
+    age_txt = f"{age:.1f}d" if age is not None else "age-unknown"
+    flags = hold_review_flags(hold, now, stale_days)
+    flag_txt = f" [NEEDS REVIEW: {'; '.join(flags)}]" if flags else ""
+    return (
+        f"HELD — do NOT merge (deliberate, not stranded); "
+        f"by={hold.get('by') or 'UNKNOWN'} "
+        f"since={hold.get('since') or 'UNKNOWN'} ({age_txt}) "
+        f"until={hold.get('until') or 'UNSTATED'} "
+        f"reason={hold['reason']}"
+        f"{flag_txt}"
+    )
+
+
+def hold_lift_hint(hold: dict) -> str:
+    """The exact command that releases this hold. Printed with every held
+    branch so releasing one never requires reading this source file."""
+    bead = hold.get("bead") or "<work-bead>"
+    return (f"to lift: bd update {bead} --sandbox --unset-metadata hold "
+            f"--unset-metadata hold_by --unset-metadata hold_since "
+            f"--unset-metadata hold_until")
 
 
 _BEAD_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]+(?:\.[0-9]+)*")
@@ -167,6 +479,54 @@ def status_from_show_json(text: str) -> str | None:
     if isinstance(d, list):
         d = d[0] if d else None
     return d.get("status") if isinstance(d, dict) else None
+
+
+def record_from_show_json(text: str) -> dict | None:
+    """The WHOLE bead record out of a `bd show <id> --json` payload (bare object
+    or single-element list). The record — not just its status — is what carries
+    the hold metadata (SABLE-jejx3), so resolution returns the object and the
+    status accessors read from it."""
+    try:
+        d = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(d, list):
+        d = d[0] if d else None
+    return d if isinstance(d, dict) else None
+
+
+def all_records_from_search_json(text: str) -> list[dict]:
+    """EVERY record in a `bd list`/`bd search --json` payload, in payload order.
+
+    More than one bead can legitimately carry the same `branch` metadata (an
+    observation/scratch bead filed against the same branch as the real work
+    bead — this is not hypothetical; it is what the live corpus looks like).
+    Predicate 2 only needs one status, but HOLD resolution must see them ALL:
+    if any joined bead is held, the branch is held, and letting an arbitrary
+    payload ordering decide would silently drop a hold and resume filing the
+    inverted 'merge me' handoff — the exact defect this floor is fixing."""
+    try:
+        d = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if isinstance(d, dict):
+        d = [d]
+    return [r for r in d if isinstance(r, dict)] if isinstance(d, list) else []
+
+
+def first_record_from_search_json(text: str) -> dict | None:
+    """The first whole record in a `bd list`/`bd search --json` payload (a
+    list), None if empty/unparseable. Record-level counterpart of
+    first_status_from_search_json."""
+    try:
+        d = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(d, dict):
+        d = [d]
+    if isinstance(d, list) and d and isinstance(d[0], dict):
+        return d[0]
+    return None
 
 
 def first_status_from_search_json(text: str) -> str | None:
@@ -206,6 +566,16 @@ def reconcile_bead_description(branch: str, work_status: str | None) -> str:
 
 # --------------------------------------------------------------------------
 # Command plumbing (env-seam overridable — mirrors sable-merge-gate)
+#
+# SABLE-6sdpx AUDIT: every _git/_bd call in this file runs with check=False.
+# All but one already inspect .returncode right at (or immediately after) the
+# call site and fall through to the CONSERVATIVE branch on failure — merged-
+# or-unresolvable stays not-stranded (branch_ancestor_rc / ancestor_rc_is_
+# unmerged), an unresolvable age/status returns None and the branch is left
+# for the next sweep (branch_tip_age_seconds, find_work_bead_status), and a
+# failed bead write is a loud caller-side WARNING (file_for_chuck_bead, see
+# reconcile()). The one exception — the reconcile()-level `git fetch --prune`
+# refresh, which discarded its CompletedProcess outright — is fixed below.
 # --------------------------------------------------------------------------
 
 def _tool(env_name: str, default: str) -> list[str]:
@@ -225,6 +595,10 @@ def _git(repo: str, *args: str, check: bool = False) -> subprocess.CompletedProc
 
 def _bd(repo: str, *args: str, check: bool = False) -> subprocess.CompletedProcess:
     return _run(_tool("SABLE_RC_BD", "bd") + list(args), cwd=repo, check=check)
+
+
+def _tmux(repo: str, *args: str, check: bool = False) -> subprocess.CompletedProcess:
+    return _run(_tool("SABLE_RC_TMUX", "tmux") + list(args), cwd=repo, check=check)
 
 
 # --------------------------------------------------------------------------
@@ -276,34 +650,185 @@ def branch_tip_age_seconds(repo: str, remote: str, branch: str, now: float) -> f
         return None
 
 
-def find_work_bead_status(repo: str, branch: str) -> str | None:
-    """The branch's work-bead status (predicate 2). Try an embedded bead id
-    (`bd show`), else `bd search` the branch text across all statuses; None when
-    neither resolves a bead. All reads (no --sandbox needed for reads)."""
+def preview_ref_age_seconds(repo: str, sha: str, now: float) -> float | None:
+    """Age of a ci-verify preview ref's commit, given its SHA (already
+    resolved via remote_ref_commit's `ls-remote`). Reads the commit LOCALLY
+    (`git log -1 --format=%ct <sha>`, no network) — reconcile()'s own blanket
+    `git fetch <remote> --prune` at the top of every sweep already pulled the
+    object regardless of which local ref name it landed under, since a
+    fetch's default refspec covers every `refs/heads/*` including ci-verify/*.
+    None on any resolution failure (SABLE-xw32f's queued check fails open on
+    this exactly like branch_tip_age_seconds does for predicate 4)."""
+    cp = _git(repo, "log", "-1", "--format=%ct", sha, check=False)
+    if cp.returncode != 0:
+        return None
+    try:
+        return now - float(cp.stdout.strip())
+    except ValueError:
+        return None
+
+
+def find_work_bead_records(repo: str, branch: str) -> tuple[list[dict], bool]:
+    """ALL work-bead records joined to the branch, plus whether resolution was
+    READABLE.
+
+    Returns (records, resolved_ok). `resolved_ok` is False only when the
+    resolution machinery ITSELF failed (the structured metadata query exited
+    nonzero and no fallback produced a record) — i.e. "we could not read", as
+    opposed to "we read fine and there is no bead" (None, True). Predicate 2
+    (status) can safely collapse those two, because an unresolvable status
+    conservatively leaves the branch not-stranded either way. HOLD state cannot:
+    collapsing unreadable into not-held is precisely how the floor would resume
+    filing an inverted 'merge me' handoff against a held branch, so
+    find_work_bead_hold keeps the distinction and reports it.
+
+    Resolution order is unchanged from SABLE-i5739 — see find_work_bead_status
+    for the full rationale of why structured metadata is primary. What DID
+    change (SABLE-jejx3) is arity: the metadata leg returns EVERY joined bead
+    rather than only the first, because a hold on any of them holds the branch
+    (see all_records_from_search_json)."""
+    resolvable_failure = False
+    cp = _bd(repo, "list", "--status", "all",
+             "--metadata-field", f"branch={branch}", "--json", check=False)
+    if cp.returncode != 0:
+        resolvable_failure = True
+        print(f"sable-reconcile-handoffs: WARNING branch-metadata resolution "
+              f"failed for {branch} (bd list exit {cp.returncode}) — falling "
+              f"back to legacy resolution, NOT treating this as "
+              f"no-qualifying-bead: {cp.stdout.strip()}", file=sys.stderr)
+    else:
+        recs = [r for r in all_records_from_search_json(cp.stdout)
+                if r.get("status") is not None]
+        if recs:
+            return (recs, True)
+
     bead_id = parse_bead_id(branch)
     if bead_id:
         cp = _bd(repo, "show", bead_id, "--json", check=False)
         if cp.returncode == 0:
-            st = status_from_show_json(cp.stdout)
-            if st is not None:
-                return st
+            rec = record_from_show_json(cp.stdout)
+            if rec is not None and rec.get("status") is not None:
+                return ([rec], True)
+
     cp = _bd(repo, "search", branch, "--status", "all", "--json", check=False)
     if cp.returncode == 0:
-        return first_status_from_search_json(cp.stdout)
+        rec = first_record_from_search_json(cp.stdout)
+        if rec is not None:
+            return ([rec], True)
+        return ([], not resolvable_failure)
+    return ([], not resolvable_failure)
+
+
+def find_work_bead(repo: str, branch: str) -> tuple[dict | None, bool]:
+    """The branch's PRIMARY work-bead record (the first joined bead) plus
+    whether resolution was readable — the single-record view predicate 2 uses."""
+    recs, ok = find_work_bead_records(repo, branch)
+    return (recs[0] if recs else None, ok)
+
+
+def find_work_bead_hold(repo: str, branch: str) -> dict | str | None:
+    """The branch's HOLD state (SABLE-jejx3). Three distinct outcomes, never two:
+
+      * a hold record  — the branch is deliberately held; do NOT file, DO report
+      * None           — the work bead read fine and carries no hold
+      * HOLD_UNKNOWN   — the bead could not be read at all, so 'held' can be
+                         neither confirmed nor ruled out. Reported as its own
+                         outcome; the floor does not file against it, because
+                         filing an INVERTED handoff for a genuinely held branch
+                         is unrecoverable-by-automation in a way that deferring
+                         one cadence of a real strand is not — and unlike a
+                         silent skip, this one says so in the summary.
+
+    The hold is read from the WORK BEAD, so it survives a branch rename: the
+    bead's `branch` metadata is re-pointed and the hold travels with it.
+
+    EVERY bead joined to the branch is consulted, not just the first: a hold on
+    any of them holds the branch. Ordering must never decide whether a hold is
+    honoured (the live corpus routinely has an observation bead joined to the
+    same branch as the real work bead, and it can sort first)."""
+    records, ok = find_work_bead_records(repo, branch)
+    if not ok:
+        return HOLD_UNKNOWN
+    for rec in records:
+        hold = hold_from_bead(rec)
+        if hold is not None:
+            return hold
     return None
 
 
-def open_for_chuck_beads(repo: str) -> list[dict]:
+def find_work_bead_status(repo: str, branch: str) -> str | None:
+    """The branch's work-bead status (predicate 2). Resolution order
+    (SABLE-i5739 — prose-search closed as the primary resolver):
+
+      1. STRUCTURED metadata: `bd list --metadata-field branch=<branch>
+         --status all --json` — an EXACT key/value match against the
+         `branch` metadata field sable-spawn-worker now writes on every
+         bead at dispatch time (see tag_branch_metadata there). This is the
+         PRIMARY path and, once a bead carries the field, the ONLY path
+         consulted: an unrelated bead whose title/description merely
+         mentions the branch text can never win here (closes mode b — WRONG
+         SUCCESS), and the answer cannot drift as such beads accumulate
+         later (closes mode c — DRIFT), because bead-carried metadata
+         identity, not prose content, is what is being matched. A branch
+         whose bead text never names it at all still resolves correctly
+         (closes mode a — SILENT FAILURE), since this path never reads
+         title/description.
+      2. Embedded bead id in the branch name (`bd show`) — a pure
+         convenience for a branch that happens to carry a bead id token;
+         unaffected by this change.
+      3. LEGACY prose `bd search` fallback — reached ONLY when neither of
+         the above resolves anything, i.e. a branch dispatched BEFORE the
+         metadata field existed. Prose-fragile by construction (the exact
+         defect this bead closes), but every branch dispatched going
+         forward always carries the metadata field, so this path retires
+         naturally as old branches merge or expire; it is kept only so
+         already-pushed pre-fix branches are not made WORSE (silently
+         un-strandable) than they were before.
+
+    A failed metadata query (nonzero bd exit) is NEVER silently folded into
+    "no bead" — falling through unresolved-but-loud would leave the branch
+    un-strandable with zero operator signal, one of the exact modes this
+    bead fixes for the metadata path itself. It's printed as a loud WARNING
+    (mirroring reconcile()'s git-fetch-failure WARNING) so 'nothing
+    stranded' (query ran clean, found nothing) is never confused with
+    'resolution failed' (the query itself is broken) — dispatch note #8.
+
+    Thin accessor over find_work_bead (SABLE-jejx3 moved the resolution
+    itself there so the SAME resolver serves both status and hold — one
+    resolution order, one place to change it)."""
+    bead, _ = find_work_bead(repo, branch)
+    return bead.get("status") if isinstance(bead, dict) else None
+
+
+def open_for_chuck_beads(repo: str) -> list[dict] | None:
     """Open + in-progress `for-chuck` beads (predicate 3's corpus). in_progress
-    included so a handoff Chuck has already STARTED still suppresses a duplicate."""
+    included so a handoff Chuck has already STARTED still suppresses a duplicate.
+
+    Returns None — NOT [] — when the query itself failed (nonzero bd exit or
+    unparseable JSON), so a transient bd failure is never indistinguishable
+    from 'genuinely zero open handoffs'. Unlike find_work_bead_status's
+    metadata query (SABLE-i5739), where a silent 'no bead' makes a branch
+    un-strandable and the safe fallback is to WARN-AND-CONTINUE, an empty
+    result HERE is predicate 3's suppression signal: reconcile() files a
+    for-chuck bead only when this corpus does NOT already name the branch.
+    Folding query-failure into empty would make the sweep FILE A DUPLICATE
+    into chuck's queue — not self-correcting, unlike skipping one cadence."""
     cp = _bd(repo, "list", "--status", "open,in_progress",
              "--label", "for-chuck", "--json", check=False)
     if cp.returncode != 0:
-        return []
+        print(f"sable-reconcile-handoffs: WARNING for-chuck bead query failed "
+              f"(bd list exit {cp.returncode}) — treating the corpus as "
+              f"UNKNOWN, not empty, so this cadence skips filing rather than "
+              f"risk a duplicate handoff: {cp.stdout.strip()}", file=sys.stderr)
+        return None
     try:
         d = json.loads(cp.stdout)
     except (json.JSONDecodeError, ValueError):
-        return []
+        print(f"sable-reconcile-handoffs: WARNING for-chuck bead query "
+              f"returned unparseable JSON — treating the corpus as UNKNOWN, "
+              f"not empty, so this cadence skips filing rather than risk a "
+              f"duplicate handoff", file=sys.stderr)
+        return None
     return [b for b in d if isinstance(b, dict)] if isinstance(d, list) else []
 
 
@@ -321,20 +846,257 @@ def file_for_chuck_bead(repo: str, branch: str, work_status: str | None) -> subp
     )
 
 
+def attempt_preview_kick(repo: str, remote: str, branch: str,
+                         integration_branch: str) -> tuple[bool, str]:
+    """Kick the SABLE-jd5fj.1 preview entrypoint for a branch whose push-time
+    kick may have been missed (hook unwired, race, mid-flight crash). Delegates
+    entirely to sable-merge-gate's `kick_preview`, which is ALREADY idempotent
+    on the shared `preview_kick_ref` key (base_sha, branch_sha) — a ref that
+    exists because the hook (or a prior poll run) already kicked it is a no-op
+    read inside `kick_preview`, never a rebuild or a second CI trigger. That
+    single shared key — not any dedup logic here — is what makes a hook-kicked
+    and a poll-kicked preview mutually suppressing in EITHER race order (the
+    columbo IDEMPOTENCY OVERLAP boundary case). Never raises: a missed or
+    failed kick is a lost optimization, not a reconcile failure, so promote
+    still builds its own preview later if this attempt never landed one."""
+    try:
+        rc = kick_preview(branch, integration_branch, repo, remote)
+        return (rc == 0, "kick-ok(kicked-or-already-kicked)" if rc == 0 else f"kick-exit-{rc}")
+    except Exception as exc:  # noqa: BLE001 — a kick failure must never abort the sweep
+        return (False, f"kick-error:{exc}")
+
+
+def live_pane_bead_ids(repo: str) -> set[str]:
+    """Bead ids with a currently-LIVE tmux worker pane bound to them (SABLE-4709h
+    IN-ACTIVE-REVISE discriminator — "1 IN ACTIVE REVISE — a live worker pane,
+    bounced by its own manager (SABLE-660hy)" was one of sixteen false-positive
+    firings a plain tip/handoff-bead classifier cannot tell apart from a real
+    strand). A live pane tagged with a bead via @sable_bead means a manager
+    already knows this branch's work is being actively reworked right now —
+    filing a stranded handoff against it repeats the exact 'ask every lane,
+    get a truthful not-mine from each' trap this floor exists to avoid, except
+    here the answer WAS available, just not from bd or git.
+
+    Fails OPEN to an EMPTY set — NEVER raises, never treated as unknown-and-
+    suppress. sable-reconcile-timer's headless cadence deliberately runs with
+    NO tmux server and NO pane context at all (SABLE-jd5fj.2 S5 walk-away
+    path; see test_S5_U1_timer_once_catches_notify_miss_without_tmux_or_pane_
+    context), so 'could not enumerate panes' must never make the floor stop
+    reporting real strands the way an unreadable hold or for-chuck corpus
+    does — it only means this ONE extra discriminator is unavailable this
+    cadence; every other predicate still runs unchanged."""
+    try:
+        cp = _tmux(repo, "list-panes", "-a", "-F", _ws_pane_format, check=False)
+    except (OSError, FileNotFoundError):
+        return set()
+    if cp.returncode != 0:
+        return set()
+    return _ws_live_beads(_ws_parse_fleet_panes(cp.stdout))
+
+
+def branch_has_live_worker_pane(repo: str, branch: str, live_bead_ids: set[str]) -> bool:
+    """True iff ANY bead joined to `branch` (every record find_work_bead_records
+    resolves, plus a bead id embedded in the branch name itself — the same two
+    sources the hold check consults) has a currently-live pane. Checked against
+    the whole joined set, not just the primary work bead, for the same reason
+    find_work_bead_hold does: an observation/scratch bead can be joined to the
+    same branch and sort first, and a live pane on THAT bead is just as much
+    in-active-revise as one on the primary."""
+    if not live_bead_ids:
+        return False
+    records, _ = find_work_bead_records(repo, branch)
+    ids = {r.get("id") for r in records if isinstance(r, dict) and r.get("id")}
+    embedded = parse_bead_id(branch)
+    if embedded:
+        ids.add(embedded)
+    return bool(ids & live_bead_ids)
+
+
+def branch_content_contained(repo: str, remote: str, branch: str,
+                             integration_branch: str) -> tuple[bool, str]:
+    """SABLE-z7gue: does `branch`'s content already exist at the spine under a
+    DIFFERENT sha — a REBASED-AND-LANDED branch whose original ref may still
+    be a tip-keyed corpse (or, per z7gue's actual instance, whose ref was
+    already deleted but a preview/tag/other tip-keyed probe still finds the
+    pre-rebase commit). Ancestry (predicate 1, `git merge-base --is-ancestor`)
+    is exactly wrong for this: it asks "is this exact SHA reachable from the
+    integration branch", and a rebase changes every SHA, so a fully-landed
+    rebase copy answers 'not an ancestor' IDENTICALLY to a genuinely stranded
+    branch. 'ask both lanes' (SABLE-xw32f's remedy) cannot separate them
+    either: every lane truthfully answers 'not mine', because the branch
+    really is in nobody's hand — it is on the spine.
+
+    Uses `git cherry <upstream> <head>` (z7gue's own suggested mechanism):
+    each commit unique to `branch` is prefixed '-' when a patch-id-equivalent
+    commit already exists in `integration_branch` (the exact rebase-copy
+    relation), '+' when it is genuinely new. Returns (fully_contained, detail).
+
+    fully_contained is True ONLY when EVERY commit unique to the branch is
+    patch-id-equivalent — a PARTIALLY landed branch (some commits landed, some
+    not) is conservatively left NOT-contained, per the module's stated
+    default: this floor's stranded verdict is the ONE place its own remedy is
+    a WRITE to the spine (re-merge), so an indeterminate/partial reading must
+    fall through to the ordinary predicates rather than assert containment it
+    cannot fully back. An unresolvable `git cherry` (nonzero exit) or an EMPTY
+    result (ancestry already said unmerged, so a genuinely empty cherry
+    listing would mean the two views disagree) both return NOT-contained —
+    never invent a landed verdict off a failed or ambiguous comparison."""
+    branch_ref = qualify_remote_ref(remote, branch)
+    base_ref = qualify_remote_ref(remote, integration_branch)
+    cp = _git(repo, "cherry", base_ref, branch_ref, check=False)
+    if cp.returncode != 0:
+        return (False, f"patch-id-check-unresolvable(git cherry exit {cp.returncode})")
+    lines = [ln for ln in cp.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return (False, "patch-id-check-empty(no unique commits found)")
+    new_commits = [ln for ln in lines if ln.startswith("+")]
+    if new_commits:
+        return (False, f"patch-id-partial({len(lines) - len(new_commits)} of "
+                        f"{len(lines)} commit(s) patch-id-equivalent at the spine)")
+    return (True, f"content-contained({len(lines)} commit(s) patch-id-equivalent "
+                  f"at the spine under a different sha)")
+
+
+DEFAULT_QUEUED_STALE_MIN = 120.0  # 2h — a preview should not run this long
+
+
+def branch_queued_at_seat(repo: str, remote: str, branch: str, integration_branch: str,
+                          now: float, queued_stale_min: float = DEFAULT_QUEUED_STALE_MIN
+                          ) -> tuple[bool, str]:
+    """SABLE-xw32f: is `branch` actively being processed at the merge seat
+    RIGHT NOW — a ci-verify preview ref exists for its exact (base, branch)
+    sha pair and Actions shows the run has not yet completed? Under burst
+    load a branch legitimately queued for CI satisfies the ordinary stranded
+    predicate IDENTICALLY to abandoned work (unmerged, work bead open/
+    in-progress, no for-chuck handoff, past the settle window) — chuck's
+    live incident was six such branches, all already in his hands, that a
+    real (non-dry-run) sweep would have re-filed as fast as he closed them.
+
+    Reuses the SAME shared idempotency key attempt_preview_kick's own no-op
+    check already keys on (classify.preview_kick_ref, sable-merge-gate) — 'is
+    this branch queued' and 'would kicking it be a no-op' resolve from the
+    identical ref, one source of truth, not a second one invented here. Only
+    covers the KICKED-preview ref scheme (hook or this floor's own poll leg);
+    a preview built directly by `sable-merge-gate promote` uses a DIFFERENT
+    ref-naming scheme keyed on the bead rather than the branch and is NOT
+    covered by this check — a known scope gap, not silently dropped (bd q
+    logged it).
+
+    Deliberately does NOT treat `git cherry`'s '+' result as proof of
+    anything (optimus's night-shift audit measured this directly): a
+    patch-id changes across a rebase or conflict-resolution edit while the
+    branch is genuinely queued at the seat, so a '+' from
+    branch_content_contained is UNKNOWN, never STRANDED, until THIS or
+    another discriminator resolves it — content-containment and queued-
+    at-seat are complementary, not substitutable.
+
+    AGE-BOUNDED (xw32f's own requirement, mirroring hold_since/hold_until on
+    SABLE-jejx3's holds): a preview that has been in flight longer than
+    `queued_stale_min` is exactly how a genuinely dropped branch would
+    masquerade as in-progress forever, so QUEUED escalates back to the
+    ordinary predicate rather than suppressing indefinitely. The clock here
+    is the PREVIEW REF's own commit date, never the branch's own push age —
+    a branch can be old (pushed long before this cadence) while its preview
+    was kicked moments ago, and keying staleness on the branch's push age
+    would misclassify a perfectly fresh queue as stale on every branch this
+    floor's own settle window (predicate 4) already required to be old.
+
+    Fails OPEN to NOT-QUEUED on any git/gh resolution failure (unresolvable
+    sha, `gh` absent, an Actions API error or hang — ref_has_inflight_run is
+    itself already fail-open) — never wedges the ordinary stranded predicate
+    behind an unanswerable seat-status question."""
+    try:
+        base_ref = qualify_remote_ref(remote, integration_branch)
+        branch_ref = qualify_remote_ref(remote, branch)
+        base_sha = resolve_commit(repo, base_ref)
+        branch_sha = resolve_commit(repo, branch_ref)
+        ref = preview_kick_ref(branch, base_sha, branch_sha)
+    except Exception as exc:  # noqa: BLE001 — an unresolvable sha must never crash the sweep
+        return (False, f"queued-check-unresolvable({exc})")
+    existing = remote_ref_commit(repo, remote, ref)
+    if not existing:
+        return (False, "no-preview-ref")
+
+    ref_age = preview_ref_age_seconds(repo, existing, now)
+    if ref_age is not None and ref_age > queued_stale_min * 60.0:
+        return (False, f"queued-check-stale(preview ref age {ref_age:.0f}s "
+                        f"exceeds {queued_stale_min}min queued-stale bound — "
+                        f"escalating to ordinary classification)")
+
+    if ref_has_inflight_run(repo, ref):
+        return (True, f"QUEUED(preview {ref} in flight at the seat)")
+    return (False, f"preview-ref-present-but-terminal({ref})")
+
+
 # --------------------------------------------------------------------------
 # Classification + orchestration
 # --------------------------------------------------------------------------
 
 def classify_branch(repo: str, remote: str, branch: str, integration_branch: str,
-                    open_beads: list[dict], threshold_minutes: float,
-                    now: float) -> tuple[bool, str, str | None]:
-    """Apply the four-part stranded predicate to ONE branch. Returns
-    (is_stranded, reason, work_status). Cheap/pure checks first; the bead-status
-    lookup (a subprocess) runs only after ancestry + for-chuck rule the branch
-    in as a live candidate."""
+                    open_beads: list[dict] | None, threshold_minutes: float,
+                    now: float, hold: dict | str | None = None,
+                    stale_days: float = DEFAULT_HOLD_STALE_DAYS,
+                    live_bead_ids: set[str] | None = None,
+                    queued_stale_min: float = DEFAULT_QUEUED_STALE_MIN
+                    ) -> tuple[bool, str, str | None]:
+    """Apply the stranded predicate to ONE branch. Returns (is_stranded, reason,
+    work_status). Cheap/pure checks first; the bead-status lookup (a subprocess)
+    runs only after ancestry + for-chuck rule the branch in as a live candidate.
+
+    `hold` (SABLE-jejx3) is the branch's already-resolved hold state — a hold
+    record, None for not-held, or HOLD_UNKNOWN for unreadable (see
+    find_work_bead_hold). It is checked immediately after ancestry, BEFORE the
+    remaining stranded predicates, because a deliberately-held branch satisfies
+    every one of them and the handoff they would produce says the exact
+    OPPOSITE of the standing instruction. It is resolved by the caller rather
+    than here so reconcile() can also report it, held branches being a reported
+    outcome and never a silent skip. Defaults to None so every pre-existing
+    call site keeps its exact prior behavior.
+
+    `live_bead_ids` (SABLE-4709h) is the whole fleet's set of bead ids with a
+    currently-live tmux pane, resolved ONCE per sweep by the caller (mirrors
+    `open_beads`) and checked immediately after HOLD, before predicate 3 — a
+    branch actively being reworked in a live pane is exactly as much a
+    reported non-strand as a held one, and for the same reason: filing a
+    handoff would say the opposite of what is actually happening. Defaults to
+    None (treated as empty) so every pre-existing call site keeps its exact
+    prior behavior.
+
+    Content-containment (SABLE-z7gue) is checked right after that, still
+    ahead of predicate 3: a branch whose commits are already patch-id-
+    equivalent at the spine under a different sha is REBASED-AND-LANDED, not
+    stranded, regardless of what the for-chuck corpus or work-bead status say
+    — tip-containment (predicate 1 above) cannot see this, because a rebase
+    changes every SHA."""
     rc = branch_ancestor_rc(repo, remote, branch, integration_branch)
     if not ancestor_rc_is_unmerged(rc):
         return (False, f"merged-or-unresolvable(is-ancestor rc={rc})", None)
+
+    if hold == HOLD_UNKNOWN:
+        return (False,
+                "hold-state-unknown(work bead unreadable) — NOT filing: cannot "
+                "rule out a deliberate do-not-merge hold", None)
+    if isinstance(hold, dict):
+        return (False, describe_hold(hold, now, stale_days), None)
+
+    if branch_has_live_worker_pane(repo, branch, live_bead_ids or set()):
+        return (False, "in-active-revise(a live worker pane is bound to this "
+                        "branch's work bead)", None)
+
+    contained, contained_detail = branch_content_contained(
+        repo, remote, branch, integration_branch)
+    if contained:
+        return (False, f"landed-under-different-sha({contained_detail})", None)
+
+    # SABLE-xw32f: checked AFTER content-containment, deliberately, so a '+'
+    # (not-yet-landed) reading from branch_content_contained is never treated
+    # as proof of stranded on its own — a patch-id can change mid-queue (a
+    # rebase or conflict-resolution edit while the branch sits at the seat),
+    # so '+' means UNKNOWN, not stranded, until THIS check also clears.
+    queued, queued_detail = branch_queued_at_seat(
+        repo, remote, branch, integration_branch, now, queued_stale_min)
+    if queued:
+        return (False, queued_detail, None)
 
     if branch_named_by_open_for_chuck(open_beads, branch):
         return (False, "handoff-already-on-record", None)
@@ -352,13 +1114,32 @@ def classify_branch(repo: str, remote: str, branch: str, integration_branch: str
     return (True, "STRANDED", status)
 
 
-def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -> int:
+def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool,
+              stale_days: float = DEFAULT_HOLD_STALE_DAYS,
+              queued_stale_min: float = DEFAULT_QUEUED_STALE_MIN) -> int:
     integration_branch = resolve_integration_branch(repo)
-    # Refresh remote-tracking refs so ancestry + age read origin's current truth.
-    _git(repo, "fetch", remote, "--prune", check=False)
+    # Refresh remote-tracking refs so ancestry + age read origin's current
+    # truth. SABLE-6sdpx: git exits nonzero here on a real network/auth
+    # failure and NOT on "nothing new to fetch" (that is still exit 0), so a
+    # nonzero rc always means the refresh did not happen — never a
+    # legitimate no-op. A failed refresh is not fatal (the sweep can still
+    # run stale-but-real local refs and will fetch again next cadence), but
+    # it must be LOUD: silently classifying against stale refs looks
+    # identical to a healthy sweep otherwise.
+    fetch_cp = _git(repo, "fetch", remote, "--prune", check=False)
+    if fetch_cp.returncode != 0:
+        print(f"sable-reconcile-handoffs: WARNING git fetch {remote} --prune "
+              f"failed (exit {fetch_cp.returncode}) — classifying against "
+              f"POSSIBLY STALE remote-tracking refs: {fetch_cp.stdout.strip()}",
+              file=sys.stderr)
 
     branches = list_origin_wk_branches(repo, remote)
     open_beads = open_for_chuck_beads(repo)
+    corpus_unknown = open_beads is None
+    # SABLE-4709h: resolved ONCE per sweep, mirroring open_beads — a pane
+    # enumeration per branch would be wasteful and (worse) could observe a
+    # different fleet snapshot for different branches in the same cadence.
+    live_bead_ids = live_pane_bead_ids(repo)
     now = time.time()
 
     mode = "DRY-RUN" if dry_run else "reconcile"
@@ -366,14 +1147,59 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -
           f"{len(branches)} origin wk-* branch(es), age threshold {threshold_minutes}min")
 
     stranded: list[tuple[str, str | None]] = []
+    held: list[tuple[str, dict]] = []
+    hold_unreadable: list[str] = []
+    queued: list[str] = []
+    unassessed = 0
+    kick_candidates = 0
+    kicked = 0
     for br in branches:
         if br == integration_branch:
             continue
+
+        # Preview-kick leg (SABLE-jd5fj.2 / S5 poll leg): an ADDITIONAL,
+        # independent classification pass — reuses P1/P4 only (see
+        # preview_kick_eligible), never touches the stranded predicate below.
+        rc = branch_ancestor_rc(repo, remote, br, integration_branch)
+        kick_age = (branch_tip_age_seconds(repo, remote, br, now)
+                    if ancestor_rc_is_unmerged(rc) else None)
+        kick_eligible, kick_reason = preview_kick_eligible(rc, kick_age, threshold_minutes)
+        if kick_eligible:
+            kick_candidates += 1
+            if dry_run:
+                print(f"  {br}: [dry-run] would attempt preview-kick ({kick_reason})")
+            else:
+                ok, detail = attempt_preview_kick(repo, remote, br, integration_branch)
+                if ok:
+                    kicked += 1
+                print(f"  {br}: preview-kick {detail}")
+
+        # HOLD state (SABLE-jejx3) — resolved here, not inside classify_branch,
+        # because a held branch is a REPORTED outcome, not a suppressed one, so
+        # the sweep needs the record itself. Resolved only for branches that
+        # cleared P1: a merged branch is nobody's concern, held or not.
+        hold = (find_work_bead_hold(repo, br)
+                if ancestor_rc_is_unmerged(rc) else None)
+
         is_stranded, reason, status = classify_branch(
-            repo, remote, br, integration_branch, open_beads, threshold_minutes, now)
+            repo, remote, br, integration_branch, open_beads, threshold_minutes,
+            now, hold, stale_days, live_bead_ids, queued_stale_min)
         print(f"  {br}: {reason}")
+        if isinstance(hold, dict):
+            held.append((br, hold))
+        elif hold == HOLD_UNKNOWN:
+            hold_unreadable.append(br)
+        if reason.startswith("QUEUED("):
+            queued.append(br)
         if is_stranded:
             stranded.append((br, status))
+        elif corpus_unknown and reason == "handoff-already-on-record":
+            # predicate 3 assumed-named this branch only because the for-chuck
+            # corpus query failed (branch_named_by_open_for_chuck(None, ...) is
+            # unconditionally True) — its real strandedness was never actually
+            # checked. Count it so the summary can say so instead of reading
+            # identical to a fleet where nothing is stranded.
+            unassessed += 1
 
     filed = 0
     for br, status in stranded:
@@ -388,12 +1214,80 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool) -
             print(f"  WARNING: could not file for-chuck bead for {br} "
                   f"(bd exit {cp.returncode}): {cp.stdout.strip()}")
 
+    # SABLE-jejx3: HELD branches are RE-REPORTED, loudly, every single cadence.
+    # This recap exists in addition to the per-branch line above because a hold
+    # is self-silencing by construction — it suppresses the strand report that
+    # would otherwise keep its branch visible — so the one thing this floor must
+    # never do is let a hold quietly become permanent. Naming every held branch
+    # with by/since/until/reason and the exact lift command makes a forgotten
+    # hold as visible as a forgotten strand.
+    review_needed = 0
+    if held:
+        print(f"  --- HELD BRANCHES ({len(held)}) — deliberate, do NOT merge; "
+              f"re-reported every cadence by design ---")
+        for br, hold in held:
+            flags = hold_review_flags(hold, now, stale_days)
+            if flags:
+                review_needed += 1
+            print(f"  HELD {br}: {describe_hold(hold, now, stale_days)}")
+            print(f"       {hold_lift_hint(hold)}")
+    for br in hold_unreadable:
+        print(f"  HOLD-STATE UNREADABLE {br}: work bead could not be read — "
+              f"neither held nor not-held could be established, so nothing was "
+              f"filed for it this cadence")
+
+    # SABLE-xw32f: QUEUED branches are NAMED, not silently skipped — the exact
+    # constraint SABLE-2az2x's instrument-cannot-say-'could-not-assess' lesson
+    # and jejx3's hold re-report both established: a suppressed report must
+    # never look identical to nothing-to-report. 'the seat is busy' has its
+    # own visible line, every cadence.
+    if queued:
+        print(f"  --- QUEUED AT THE SEAT ({len(queued)}) — preview in flight, "
+              f"already owned; not stranded ---")
+        for br in queued:
+            print(f"  QUEUED {br}")
+
+    # SABLE-2az2x: an UNKNOWN for-chuck corpus makes the reconciler assume-named
+    # (skip-filing) for every unmerged branch it sees, cadence after cadence, if
+    # the underlying query failure is PERSISTENT rather than transient — and the
+    # summary below would otherwise print the exact same "0 stranded, 0 filed"
+    # a genuinely healthy fleet prints. That is indistinguishable-from-healthy,
+    # which is worse than the duplicate handoff the suppression prevents (a
+    # duplicate is visible and reconcilable; a silently-stopped floor is not).
+    # Suppression itself stays unbounded here (per-cadence WARNING already
+    # covers the transient case) — this only makes the SUMMARY say so.
+    corpus_note = (
+        f" (CORPUS UNREADABLE — suppression active, {unassessed} branch(es) unassessed)"
+        if corpus_unknown else ""
+    )
+    # SABLE-jejx3: the summary carries the held count too — the three outcomes
+    # this floor can now report are STRANDED, HELD, and could-not-assess, and a
+    # summary that named only the first would be the two-state instrument this
+    # bead exists to retire. Held branches are NAMED, not just counted, so one
+    # grep of the summary line answers "what is deliberately not merging".
+    held_note = ""
+    if held:
+        names = ", ".join(br for br, _ in held)
+        held_note = f" [{names}]"
+        if review_needed:
+            held_note += f" ({review_needed} NEEDING REVIEW)"
+    if hold_unreadable:
+        held_note += (f"; {len(hold_unreadable)} branch(es) with UNREADABLE "
+                      f"hold state [{', '.join(hold_unreadable)}]")
+    held_summary = f"{len(held)} held branch(es){held_note}"
+    queued_note = f" [{', '.join(queued)}]" if queued else ""
+    queued_summary = f"{len(queued)} queued-at-seat branch(es){queued_note}"
+
     if dry_run:
         print(f"sable-reconcile-handoffs [DRY-RUN]: {len(stranded)} stranded branch(es) "
-              f"classified, 0 filed (dry-run).")
+              f"classified, 0 filed (dry-run){corpus_note}; {held_summary}; "
+              f"{queued_summary}; "
+              f"{kick_candidates} preview-kick candidate(s), 0 kicked (dry-run).")
     else:
         print(f"sable-reconcile-handoffs: {len(stranded)} stranded branch(es), "
-              f"{filed} for-chuck bead(s) filed.")
+              f"{filed} for-chuck bead(s) filed{corpus_note}; {held_summary}; "
+              f"{queued_summary}; "
+              f"{kick_candidates} preview-kick candidate(s), {kicked} kicked.")
     return 0
 
 
@@ -406,10 +1300,25 @@ def main(argv: list[str] | None = None) -> int:
                         help="push-age threshold in minutes before a branch is "
                              "eligible for reconciliation (default 10; "
                              "SABLE_RECONCILE_AGE_MIN)")
+    parser.add_argument("--hold-stale-days", type=float,
+                        default=float(os.environ.get(
+                            "SABLE_HOLD_STALE_DAYS", str(DEFAULT_HOLD_STALE_DAYS))),
+                        help="a hold older than this many days is flagged "
+                             "NEEDING REVIEW in the summary so it cannot decay "
+                             "into a permanent quiet veto (default 3; "
+                             "SABLE_HOLD_STALE_DAYS)")
+    parser.add_argument("--queued-stale-min", type=float,
+                        default=float(os.environ.get(
+                            "SABLE_QUEUED_STALE_MIN", str(DEFAULT_QUEUED_STALE_MIN))),
+                        help="a branch queued at the seat (preview in flight) "
+                             "longer than this many minutes escalates back to "
+                             "ordinary classification instead of suppressing "
+                             "indefinitely (default 120; SABLE_QUEUED_STALE_MIN)")
     parser.add_argument("--dry-run", action="store_true",
                         help="classify + print only; file no beads; exit 0")
     args = parser.parse_args(argv)
-    return reconcile(args.repo, args.remote, args.age_min, args.dry_run)
+    return reconcile(args.repo, args.remote, args.age_min, args.dry_run,
+                     args.hold_stale_days, args.queued_stale_min)
 
 
 if __name__ == "__main__":

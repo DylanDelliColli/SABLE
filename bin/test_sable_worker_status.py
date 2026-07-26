@@ -298,6 +298,46 @@ def test_reap_flag_message_truncates_long_pending_text(capsys):
     assert "…" in err
 
 
+# --- SABLE-jb3o: the pending-input reap flag previously cited a cross-tracker
+# provenance id (market-brief-package-0h8k) in OPERATOR-FACING stderr. `bd show
+# market-brief-package-0h8k` cannot resolve it against the SABLE beads DB, so an
+# agent reading the reap line chases a dangling ref (optimus did exactly this,
+# 2026-07-17). Provenance cites belong in comments (the ones in this module's
+# docstrings stay); runtime output must never contain a bare non-SABLE
+# bead-id-shaped token a reader would try to `bd show`. ---
+
+def _dangling_bead_ids(text: str) -> list[str]:
+    """Bead-id-shaped tokens (>=2 hyphens, final segment mixing letters+digits
+    like a real bead suffix -- '0h8k', 'b5ow') that are NOT a SABLE-* id. A
+    plain English hyphenated phrase (e.g. this tool's own 'sable-worker-status'
+    name) never has a digit-bearing final segment, so it is never mistaken for
+    a dangling cross-tracker reference."""
+    hits = []
+    for token in text.replace("'", " ").replace('"', " ").split():
+        token = token.strip(".,:;()[]{}")
+        parts = token.split("-")
+        if len(parts) < 3:
+            continue
+        last = parts[-1]
+        if any(c.isdigit() for c in last) and any(c.isalpha() for c in last):
+            if token.upper() != token or not token.startswith("SABLE-"):
+                hits.append(token)
+    return hits
+
+
+def test_reap_pending_input_message_has_no_dangling_cross_tracker_id(capsys):
+    def fake_run(args):
+        return ""
+
+    def fake_capture(pane):
+        return "❯ check the pool for next work"
+
+    sws.reap(["%2"], None, run=fake_run, capture=fake_capture)
+    err = capsys.readouterr().err
+    assert _dangling_bead_ids(err) == [], (
+        f"reap stderr contains a dangling cross-tracker bead id: {err!r}")
+
+
 def test_list_workers_scopes_to_session_when_given():
     # SABLE-e1e3.3: discovery is per-repo — a session target replaces the
     # server-wide -a listing, so another repo's fleet is never enumerated.
@@ -1142,6 +1182,87 @@ def test_flag_dialog_stalls_carries_evidence_snippet():
     assert "Enter to confirm" in result[0]["evidence"]
 
 
+# --- SABLE-n87ov: reporting a stall reproduces the symptom on the reporter's
+# own audience. The old classifier grepped the WHOLE capture for a dialog
+# affordance substring, so a sable-msg relay QUOTING that substring (to name
+# the earlier true positive for the recipient) rendered the same text into the
+# recipient's healthy pane and re-triggered the detector. The fix restricts the
+# match to the pane's current cursor region -- content after the LAST bare
+# composer prompt line -- since a live overlay owns the bottom of the pane
+# (nothing follows it) while a mention is followed, on an idle pane, by the
+# reappeared empty composer. ---
+
+# ordinary output that merely CONTAINS the same affordance text a real overlay
+# would show, but with the idle composer reappearing below it.
+MENTION_OF_DIALOG_TEXT = (
+    "⟦SABLE-MSG⟧ from optimus: pane %120 is DIALOG-STALLED -- matched "
+    "'(Use arrow keys, Enter to select)'\n"
+    "❯")
+
+
+def test_overlay_evidence_none_for_mention_followed_by_idle_composer():
+    # NEGATIVE CONTROL: a mention of the affordance text, in ordinary output,
+    # is not itself a stall -- the composer redraws idle and empty below it.
+    assert sws.overlay_evidence(MENTION_OF_DIALOG_TEXT) is None
+    assert sws.dialog_stall(MENTION_OF_DIALOG_TEXT) is False
+
+
+def test_overlay_evidence_still_true_for_real_dialog():
+    # POSITIVE CONTROL alongside the negative one above: a genuine overlay (no
+    # composer line follows it) must still flag -- otherwise the fix would
+    # just be "detect nothing", which trivially passes every false-positive
+    # case above.
+    assert sws.overlay_evidence(REAL_PERMISSION_DIALOG) is not None
+    assert sws.dialog_stall(REAL_PERMISSION_DIALOG) is True
+
+
+def test_quoted_evidence_does_not_retrigger_when_relayed_onward():
+    # Acceptance criterion: the [matched: ...] string this tool reports, sent
+    # verbatim to another pane and followed there by that pane's own idle
+    # composer, must not itself cause a fresh DIALOG-STALLED report.
+    evidence = sws.overlay_evidence(REAL_PERMISSION_DIALOG)
+    assert evidence is not None
+    relayed = f"⟦SABLE-MSG⟧ from optimus: matched {evidence!r}\n❯"
+    assert sws.overlay_evidence(relayed) is None
+    assert sws.dialog_stall(relayed) is False
+
+
+def test_self_reference_tool_own_alert_output_does_not_retrigger():
+    # SELF-REFERENCE: the closed loop a manager hits constantly -- capturing
+    # this tool's OWN stdout table row + stderr alert line (reconstructed via
+    # the exact f-strings sable-worker-status prints) into a pane that is
+    # otherwise idle must not itself read as a fresh dialog-stall, even though
+    # the alert text carries the trigger substring in TWO places (the table
+    # row's inline snip and the stderr alert's [matched: ...]-style suffix).
+    evidence = "Enter to select · ↑/↓ to navigate · Esc to cancel"
+    stdout_row = (f"⚠ DIALOG-STALLED %159     optimus    "
+                  f"SABLE-rrn6r      blocked on a dialog/overlay "
+                  f"[matched: {evidence!r}] — dismiss it (Esc) or nudge the pane")
+    stderr_alert = (
+        "sable-worker-status: ⚠ 1 pane(s) STALLED on a dialog/overlay, "
+        f"silently absorbing messages — %159(optimus: {evidence!r}). "
+        "Dismiss (Esc) or nudge each; nothing was auto-cleared "
+        "(SABLE-axp0 v1 is detect-only).")
+    captured_tool_output = stdout_row + "\n" + stderr_alert + "\n❯"
+    assert sws.overlay_evidence(captured_tool_output) is None
+    assert sws.dialog_stall(captured_tool_output) is False
+
+
+def test_flag_dialog_stalls_ignores_mention_but_flags_real_dialog():
+    # the flag_dialog_stalls-level assertion mirroring the bead's two-pane
+    # integration repro: of a pane merely displaying a mention and a pane
+    # genuinely parked on a dialog, only the latter is reported.
+    panes = [
+        {"pane": "%1", "role": "lincoln", "bead": "", "status": "running",
+         "class": "manager", "lane": "lincoln"},
+        {"pane": "%2", "role": "tarzan", "bead": "", "status": "running",
+         "class": "manager", "lane": "tarzan"},
+    ]
+    caps = {"%1": MENTION_OF_DIALOG_TEXT, "%2": REAL_PERMISSION_DIALOG}
+    result = sws.flag_dialog_stalls(panes, None, capture=lambda p: caps[p])
+    assert [r["pane"] for r in result] == ["%2"]
+
+
 def test_flag_dialog_stalls_ignores_busy_and_idle_false_positives():
     # a fleet of the two healthy false-positive panes yields ZERO stalls.
     panes = [
@@ -1194,6 +1315,63 @@ def test_empty_worker_message_bare_for_global_view():
 
 def test_empty_worker_message_bare_when_fleet_truly_empty():
     assert sws.empty_worker_message("tarzan", []) == "no worker panes"
+
+
+# --- SABLE-6xtx: tmux held 5 windows (worker-market-brief-package-{129o,268o,
+# wfab0,m7xs9,pjfll}) whose claude process had exited back to zsh; yet
+# sable-worker-status printed 'no worker panes' and --reap could not clean
+# them. parse_worker_panes classified purely by @sable_role/@sable_class pane
+# OPTIONS, so a pane whose tags were never stamped (or were lost) vanished
+# from every listing even though the window itself still carried its
+# worker-<bead> name (sable-spawn-worker's window_name(), stamped at creation,
+# independent of the mutable @sable_role/@sable_class options). The fallback
+# below recognizes such a pane as a worker from its window name alone.
+#
+# An earlier version of this fix ALSO forced status="done" whenever the
+# pane's live #{pane_current_command} was a bare shell (reasoning:
+# with_lifecycle_flags/SABLE-5v9n has no tag-writer for an untagged pane).
+# That broke this suite's own integration fixtures, which simulate a
+# "running" worker with a plain `bash --noprofile --norc` pane and never
+# launch a real claude process — pane_current_command reads "bash" for the
+# pane's entire life, indistinguishable from "claude exited" by that
+# heuristic, and the override reaped live-simulated workers wholesale. So
+# @sable_status remains the SOLE source of truth for a worker's status; only
+# the CLASSIFICATION (is this pane a worker at all) gets the window-name
+# fallback. ---
+
+def test_parse_worker_panes_window_name_fallback_when_tags_absent():
+    # no @sable_role, no @sable_class -- only the window-name prefix identifies
+    # this as a worker pane; its @sable_status tag still drives the status
+    out = "%20\t\t\trunning\t\t\t\tworker-market-brief-package-129o\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%20", "bead": "", "status": "running"}]
+
+
+def test_parse_worker_panes_window_name_fallback_recognizes_done_zombie():
+    # the core incident repro: tags absent (or lost), but the window name
+    # alone is enough to surface the pane -- and once its @sable_status tag
+    # reads "done" (set by with_lifecycle_flags before the pane returned to
+    # its idle shell), --reap can finally collect it
+    out = "%21\t\t\tdone\t\t\t\tworker-market-brief-package-268o\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%21", "bead": "", "status": "done"}]
+    assert sws.reaping_decision(panes) == ["%21"]
+
+
+def test_parse_worker_panes_window_name_fallback_ignores_non_worker_window():
+    # empty tags AND a non-worker-prefixed window name -- still skipped, exactly
+    # as the pre-existing legacy rule already required
+    out = "%22\t\t\trunning\t\t\t\tlincoln\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == []
+
+
+def test_parse_worker_panes_window_name_fallback_defaults_missing_status_running():
+    # a just-spawned fallback-classified pane with no @sable_status tag yet
+    # still defaults to "running", exactly like the tag-classified path
+    out = "%23\t\t\t\t\t\t\tworker-sable-x\n"
+    panes = sws.parse_worker_panes(out)
+    assert panes == [{"pane": "%23", "bead": "", "status": "running"}]
 
 
 def test_empty_worker_message_names_other_lanes_when_fleet_nonempty():
