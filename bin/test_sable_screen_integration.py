@@ -18,6 +18,22 @@ hold). `dispatch` is exercised with a real occupant built from BOTH legs —
 an in-progress bead's declared writes, and an uncontained wk-* branch's
 ACTUAL changed files for a bead that declares nothing at all (SABLE-krbxd:
 the undeclared-collateral-edit case a declaration-only screen cannot see).
+
+The three hardening axes are each driven end-to-end through the REAL CLI:
+  * SABLE-1muvg — the MULTI-ARG form over real beads with real
+    footprint_writes metadata, which is the only form the defect lives in.
+  * SABLE-qyr0f — a real `bd dep add` blocker left OPEN, then really closed,
+    asserting the SAME invocation flips. Verified against a live sandbox
+    before it was written: `bd dep add <child> <blocker>` stores type
+    'blocks', `bd show --json` resolves the dep with a status that really
+    does go open -> closed, and `bd ready` really does drop and re-admit the
+    child — a fixture whose blocked state is indistinguishable from its
+    ready state would assert nothing.
+  * SABLE-jhako — a real bundled branch on the real remote carrying two real
+    closed beads with the hold on only one.
+
+Assertions are by ATTRIBUTABLE IDENTITY — the specific ids/branches the
+fixture created — never a global count (SABLE-jd5fj.15).
 """
 import json
 import os
@@ -150,9 +166,22 @@ def _create_bead(work, home, *, title, status="open", metadata=None):
     return bead_id
 
 
+def _dep_add(work, home, blocked, blocker):
+    """Real `bd dep add <blocked> <blocker>` — requirement language, not
+    temporal: the FIRST id is the one that needs the second. Verified in a
+    live sandbox to store dependency_type 'blocks' and to drop `blocked` out
+    of `bd ready` while `blocker` is open."""
+    return _bd(work, home, "dep", "add", blocked, blocker, "--sandbox")
+
+
 def _screen(work, home, *args, check=False):
     argv = [sys.executable, str(BIN), *args, "--repo", str(work)]
     return _run(argv, work, home, check=check)
+
+
+def _rows_by_id(cp):
+    payload = json.loads(cp.stdout)
+    return {row["bead_id"]: row for row in payload["results"]}
 
 
 # ===========================================================================
@@ -272,6 +301,226 @@ def test_dispatch_candidate_declaring_nothing_is_no_declaration(tmp_path):
     assert row["verdict"] == "no-declaration", row
     # a no-declaration candidate must still be allowed to dispatch
     assert r.returncode == 0
+
+
+# ===========================================================================
+# dispatch, multi-arg: candidate-vs-candidate (SABLE-1muvg)
+# ===========================================================================
+
+def test_dispatch_multiarg_reports_sibling_collision_and_spares_the_disjoint_one(tmp_path):
+    """THE DEFECT, end-to-end through the real CLI in the form it actually
+    bit: three real beads with real footprint_writes metadata, dispatched in
+    ONE invocation. Two share a path, one shares nothing.
+
+    The argument ORDER is deliberate — the disjoint bead goes FIRST, so the
+    overlapping pair is the 2nd and 3rd candidate. An implementation that
+    compares every candidate only against the first would return all-CLEAR
+    here (and would still pass a two-candidate fixture)."""
+    origin, work, home = _setup(tmp_path)
+    disjoint = _create_bead(work, home, title="candidate with its own file",
+                            metadata={"footprint_writes": "bin/only_mine.py"})
+    lead = _create_bead(work, home, title="lead candidate",
+                        metadata={"footprint_writes": "bin/contested.py,bin/lead.py"})
+    sibling = _create_bead(work, home, title="sibling candidate",
+                           metadata={"footprint_writes": "bin/contested.py,bin/sib.py"})
+
+    r = _screen(work, home, "dispatch", disjoint, lead, sibling, "--format", "json")
+    rows = _rows_by_id(r)
+
+    assert rows[lead]["verdict"] == "sibling-collision", rows[lead]
+    assert rows[sibling]["verdict"] == "sibling-collision", rows[sibling]
+    # both directions name the other bead AND the shared path
+    assert rows[lead]["sibling_hits"] == {sibling: ["bin/contested.py"]}, rows[lead]
+    assert rows[sibling]["sibling_hits"] == {lead: ["bin/contested.py"]}, rows[sibling]
+    # NEGATIVE CONTROL inside the same invocation: the fix must not have
+    # simply made co-dispatch impossible.
+    assert rows[disjoint]["verdict"] == "clear", rows[disjoint]
+    assert rows[disjoint]["sibling_hits"] == {}, rows[disjoint]
+    assert r.returncode == 1, r.stdout
+
+
+def test_dispatch_multiarg_byte_identical_declarations_do_not_read_clear(tmp_path):
+    """The maximal-overlap case measured live (`dispatch SABLE-su3j3
+    SABLE-xgb29` -> CLEAR/CLEAR on byte-identical declared sets). If the
+    pairwise axis cannot catch total identity it is catching nothing."""
+    origin, work, home = _setup(tmp_path)
+    files = "bin/sable-recover,bin/test_sable_recover.py"
+    first = _create_bead(work, home, title="twin one",
+                         metadata={"footprint_writes": files})
+    second = _create_bead(work, home, title="twin two",
+                          metadata={"footprint_writes": files})
+
+    r = _screen(work, home, "dispatch", first, second)
+    assert r.returncode == 1, r.stdout
+    assert "SIBLING-COLLISION" in r.stdout, r.stdout
+    # the rendered line names the co-candidate and the remedy, because the
+    # live failure was a reader trusting the verdict line above the operands
+    assert second in r.stdout and first in r.stdout, r.stdout
+    assert "--bundle" in r.stdout, r.stdout
+
+
+def test_dispatch_single_arg_is_unaffected_by_the_sibling_leg(tmp_path):
+    """Compatibility guarantee: with N=1 no pair can form, so a bead that
+    would sibling-collide against a co-candidate still screens CLEAR on its
+    own — and the exit status stays 0."""
+    origin, work, home = _setup(tmp_path)
+    files = "bin/sable-recover,bin/test_sable_recover.py"
+    first = _create_bead(work, home, title="twin one",
+                         metadata={"footprint_writes": files})
+    _create_bead(work, home, title="twin two",
+                 metadata={"footprint_writes": files})
+
+    r = _screen(work, home, "dispatch", first, "--format", "json")
+    row = _rows_by_id(r)[first]
+    assert row["verdict"] == "clear", row
+    assert row["sibling_hits"] == {}, row
+    assert r.returncode == 0, r.stdout
+
+
+def test_dispatch_multiarg_undeclared_pair_is_no_declaration_not_clear(tmp_path):
+    """SABLE-e2ic3's trichotomy on the pairwise axis: two candidates that
+    declare NOTHING have no operands to compare, so they must NOT come back
+    CLEAR — 'nothing to check with' stays distinct from 'checked, found no
+    overlap'. Both still dispatch."""
+    origin, work, home = _setup(tmp_path)
+    a = _create_bead(work, home, title="undeclared one")
+    b = _create_bead(work, home, title="undeclared two")
+
+    r = _screen(work, home, "dispatch", a, b, "--format", "json")
+    rows = _rows_by_id(r)
+    assert rows[a]["verdict"] == "no-declaration", rows[a]
+    assert rows[b]["verdict"] == "no-declaration", rows[b]
+    assert r.returncode == 0, r.stdout
+
+
+# ===========================================================================
+# dispatch: the readiness axis (SABLE-qyr0f)
+# ===========================================================================
+
+def test_dispatch_blocked_bead_is_not_presented_as_dispatchable_then_flips_on_close(tmp_path):
+    """A real `bd dep add` blocker, left OPEN, on a candidate declaring only
+    NEW files — the exact live shape (SABLE-21rug.3): it overlaps nothing, so
+    the footprint axis is honestly clear and the OLD tool emitted its most
+    confident ✓. Then the blocker is really closed and the SAME invocation
+    must flip to dispatchable, which is what proves the fix reads dependency
+    STATUS rather than dependency presence."""
+    origin, work, home = _setup(tmp_path)
+    blocker = _create_bead(work, home, title="earlier bead in the chain")
+    child = _create_bead(work, home, title="later bead declaring only new files",
+                         metadata={"footprint_writes": "bin/sable-tier-runner"})
+    _dep_add(work, home, child, blocker)
+
+    r = _screen(work, home, "dispatch", child, "--format", "json")
+    row = _rows_by_id(r)[child]
+    assert row["readiness"] == "blocked", row
+    assert row["blockers"] == [blocker], row
+    # the footprint axis is untouched — both facts are reported, neither
+    # replaces the other
+    assert row["verdict"] == "clear", row
+    assert r.returncode == 1, r.stdout
+
+    text = _screen(work, home, "dispatch", child)
+    assert "BLOCKED" in text.stdout, text.stdout
+    assert blocker in text.stdout, text.stdout
+
+    _bd(work, home, "close", blocker, "--sandbox")
+
+    after = _screen(work, home, "dispatch", child, "--format", "json")
+    row_after = _rows_by_id(after)[child]
+    assert row_after["readiness"] == "ready", row_after
+    assert row_after["blockers"] == [], row_after
+    assert row_after["verdict"] == "clear", row_after
+    assert after.returncode == 0, after.stdout
+
+
+def test_dispatch_ready_bead_with_the_same_footprint_shape_still_clears(tmp_path):
+    """NEGATIVE CONTROL for the readiness axis, run against the same
+    declaring-only-new-files shape as the blocked case above: the fix must
+    not pass by making everything non-dispatchable."""
+    origin, work, home = _setup(tmp_path)
+    candidate = _create_bead(work, home, title="unblocked bead declaring only new files",
+                             metadata={"footprint_writes": "bin/sable-tier-runner"})
+
+    r = _screen(work, home, "dispatch", candidate, "--format", "json")
+    row = _rows_by_id(r)[candidate]
+    assert row["readiness"] == "ready", row
+    assert row["verdict"] == "clear", row
+    assert r.returncode == 0, r.stdout
+
+
+def test_dispatch_relates_to_dependency_does_not_block(tmp_path):
+    """Only 'blocks' gates readiness. A real non-blocking `bd dep relate`
+    edge to an OPEN bead must leave the candidate dispatchable — otherwise
+    every cross-referenced bead in the pool reads blocked."""
+    origin, work, home = _setup(tmp_path)
+    other = _create_bead(work, home, title="merely related bead")
+    candidate = _create_bead(work, home, title="candidate with a relates-to edge",
+                             metadata={"footprint_writes": "bin/mine.py"})
+    _bd(work, home, "dep", "relate", candidate, other, "--sandbox")
+
+    r = _screen(work, home, "dispatch", candidate, "--format", "json")
+    row = _rows_by_id(r)[candidate]
+    assert row["blockers"] == [], row
+    assert row["readiness"] == "ready", row
+    assert r.returncode == 0, r.stdout
+
+
+# ===========================================================================
+# holds: branch-scoped, bundled siblings (SABLE-jhako)
+# ===========================================================================
+
+def test_holds_bundled_branch_held_via_one_sibling_reports_the_branch_held(tmp_path):
+    """THE DEFECT end-to-end: one real uncontained branch on the real remote
+    carrying TWO real closed beads, with a full four-field hold on only ONE
+    of them — the wk-recycle-handoff shape. The old sweep printed the branch
+    twice, once NEEDS-HOLD and once held-ok. It must now appear exactly once,
+    held, naming both beads.
+
+    A second bundled branch with NO hold anywhere is created in the same pass
+    as the negative control: branch-scoping must not make every bundled
+    branch read as held."""
+    origin, work, home = _setup(tmp_path)
+
+    held_hold = {"branch": "wk-bundled-held", "hold": "merge seat, hot-swap regime",
+                 "hold_by": "chuck", "hold_since": "2026-07-24",
+                 "hold_until": "2026-07-31"}
+    holder = _create_bead(work, home, title="bundled sibling carrying the hold",
+                          status="closed", metadata=held_hold)
+    bare_sibling = _create_bead(work, home, title="bundled sibling with no hold fields",
+                                status="closed", metadata={"branch": "wk-bundled-held"})
+    _push_branch(work, "wk-bundled-held")
+
+    # negative control: a bundled branch nobody held
+    unheld_a = _create_bead(work, home, title="unheld bundled sibling A",
+                            status="closed", metadata={"branch": "wk-bundled-unheld"})
+    unheld_b = _create_bead(work, home, title="unheld bundled sibling B",
+                            status="closed", metadata={"branch": "wk-bundled-unheld"})
+    _push_branch(work, "wk-bundled-unheld")
+
+    r = _screen(work, home, "holds", "--format", "json")
+    payload = json.loads(r.stdout)
+    rows = [row for row in payload["results"]
+            if row["branch"] in ("wk-bundled-held", "wk-bundled-unheld")]
+    by_branch = {row["branch"]: row for row in rows}
+
+    # exactly one row per branch — no branch appears twice with two verdicts
+    assert len(rows) == 2, rows
+    held_row = by_branch["wk-bundled-held"]
+    assert held_row["verdict"] == "held-ok", held_row
+    assert held_row["verdict"] != "needs-hold", held_row
+    assert set(held_row["beads"]) == {holder, bare_sibling}, held_row
+    assert held_row["held_by"] == [holder], held_row
+
+    unheld_row = by_branch["wk-bundled-unheld"]
+    assert unheld_row["verdict"] == "needs-hold", unheld_row
+    assert set(unheld_row["beads"]) == {unheld_a, unheld_b}, unheld_row
+
+    text = _screen(work, home, "holds")
+    needs_section = text.stdout.split("*** NEEDS HOLD")[1].split("other (")[0]
+    assert "wk-bundled-held" not in needs_section, text.stdout
+    assert needs_section.count("wk-bundled-unheld") == 1, text.stdout
+    # the whole point of the branch row: both bundled beads are still named
+    assert holder in text.stdout and bare_sibling in text.stdout, text.stdout
 
 
 # ===========================================================================

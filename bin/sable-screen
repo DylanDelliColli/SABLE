@@ -40,6 +40,45 @@ dispatch <bead-id> [<bead-id> ...]
   COLLIDES, and it still dispatches: a screen that can never release a
   no-declaration bead is exactly as broken as one that can never deny a real
   collision.
+    (c) SIBLING LEG (SABLE-1muvg). Excluding the candidates from leg (a) is
+        right for leg (a)'s purpose — a bead must not collide with itself —
+        but for two releases NOTHING re-added candidate-vs-candidate
+        comparison, so a multi-bead invocation screened each candidate
+        against the WORLD and never against its siblings. A manager passes N
+        ids for exactly one reason (can these go out in parallel?), so
+        all-CLEAR read as co-dispatch approved: `dispatch SABLE-su3j3
+        SABLE-xgb29` returned CLEAR/CLEAR for BYTE-IDENTICAL declared sets,
+        the maximal-overlap case. Every PAIR of candidates is now compared —
+        all pairs, not each-against-the-first — and an overlapping pair gets
+        its own SIBLING-COLLISION verdict naming both bead ids and the
+        shared paths, distinct from both CLEAR and COLLIDES because the
+        remedy is different (bundle onto one worktree, or serialize —
+        neither of which is what COLLIDES asks for). With N=1 the leg cannot
+        fire and single-arg output is unchanged.
+
+  READINESS AXIS (SABLE-qyr0f), reported ALONGSIDE the footprint verdict and
+  never folded into it. The three verdicts above answer "does this collide on
+  files?" while the caller is asking "is this dispatchable?" (the SABLE-1eeg7
+  §9 instrument-reach hazard), and a BLOCKED bead declaring only NEW files is
+  both maximally likely to screen CLEAR and exactly the shape of a
+  later-in-the-chain bead: SABLE-21rug.3 and SABLE-21rug.6 both screened a
+  clean ✓ while blocked by an open sibling. Readiness is resolved from two
+  sources with different precisions:
+    - the candidate's OPEN 'blocks' dependencies, read from its own `bd show
+      --json` record (which carries each dep's resolved status) — this is the
+      precise signal, it names the blocker ids, and it DENIES.
+    - membership in `bd ready --limit 0` — bd's own definition of
+      dispatchable. Absence is the fuzzy signal: an in_progress or closed
+      bead is also absent, so absence alone means "not dispatchable now",
+      NOT "blocked by a dependency". It is REPORTED (not-ready, naming the
+      status) and does not deny, because turning an ambiguous signal into a
+      deny inside the very tool whose bug class is "answered a narrower
+      question than the one asked" is the same mistake with the sign
+      flipped. Measured against this repo's store: 21 open beads with an
+      open 'blocks' dep, ALL 21 absent from bd ready, zero blocked-but-ready
+      — the precise leg agrees with bd and never over-denies.
+  blocked-by-dependency and collides-on-files are different facts with
+  different remedies; a candidate that is both reports both.
 
 holds
   The hold sweep. Any CLOSED bead whose metadata.branch still exists on
@@ -53,6 +92,23 @@ holds
   origin is reported as reaped-or-unpushed, never as needing a hold — this
   tool exists so that failure mode is structurally avoided rather than
   merely documented in a shift report.
+
+  BRANCH-SCOPED, NOT BEAD-SCOPED (SABLE-jhako). The sweep's unit of concern
+  is the BRANCH — it keys on metadata.branch existing on origin and not
+  being contained in the integration ref — but the hold FIELDS live on the
+  bead, so with N beads bundled onto one branch, N-1 could be silently
+  unheld. wk-recycle-handoff carried SABLE-vsfvl + SABLE-uc7kh; chuck placed
+  a full four-field hold on uc7kh and one run reported BOTH "NEEDS HOLD:
+  SABLE-vsfvl wk-recycle-handoff" AND "SABLE-uc7kh held-ok" — one branch,
+  two verdicts, each truthful about its bead and contradictory about the
+  branch. Both directions are damaging: a seat reading vsfvl may promote a
+  branch chuck holds for three reasons, and the NEEDS-HOLD line is a false
+  alarm that trains readers to discount the sweep (the SABLE-ijd7j
+  false-fallback dynamic that made the durable inbox write-only). Rows are
+  therefore emitted PER BRANCH, exactly once, listing every bead on it: a
+  branch is HELD when ANY of its beads carries all four fields, and the
+  NEEDS-HOLD line reports what is still missing on the best-covered bead. A
+  single-bead branch is unchanged — its row is its bead's row.
 
 NO PROSE FALLBACK (intentional — do not add one)
 -------------------------------------------------
@@ -68,18 +124,27 @@ NO-DECLARATION here, never a best-effort guess reconstructed from prose.
 
 LIMIT 0
 -------
-Every `bd list` call passes --limit 0 explicitly (SABLE-52aym: a bare `bd
-list` truncates at 50 SILENTLY, and a truncated occupant set or closed-bead
-set fails in the RELEASING direction — exactly the direction a safety
-screen must never fail in).
+Every `bd list` / `bd ready` call passes --limit 0 explicitly (SABLE-52aym: a
+bare `bd list` truncates at 50 SILENTLY, and a truncated occupant set,
+closed-bead set, or READY set fails in the RELEASING direction — exactly the
+direction a safety screen must never fail in. A truncated ready set in
+particular would make blocked and ready indistinguishable, recreating
+SABLE-qyr0f inside its own fix).
+
+`bd list --status closed` keeps its explicit status filter: a bare `bd list`
+returns open/deferred/in_progress/blocked and NO closed beads at all
+(measured: 556 rows, zero closed), so dropping the filter would silently
+sweep nothing. The filter is also never REPEATED — `bd list` keeps only the
+last of a repeated --status and drops the rest silently (SABLE-4t97d).
 
 Usage:
   sable-screen dispatch <bead-id> [<bead-id> ...] [--repo DIR] [--format text|json]
   sable-screen holds [--repo DIR] [--format text|json]
 
 Exit codes:
-  dispatch: 0 clear/no-declaration for every candidate, 1 at least one
-            COLLIDES, 2 a candidate bead id could not be read at all.
+  dispatch: 0 every candidate is dispatchable (clear/no-declaration, and
+            not blocked), 1 at least one COLLIDES, SIBLING-COLLISION, or
+            BLOCKED, 2 a candidate bead id could not be read at all.
   holds:    0 no NEEDS-HOLD findings, 1 at least one.
 
 Env overrides (test seams, mirroring SABLE_CONTAINED_GIT / SABLE_MG_GIT):
@@ -101,10 +166,27 @@ import sable_gate_git_lib as git_lib  # noqa: E402
 
 HOLD_FIELDS = ("hold", "hold_by", "hold_since", "hold_until")
 
-# dispatch verdicts
+# dispatch verdicts (the footprint axis)
 NO_DECLARATION = "no-declaration"
 CLEAR = "clear"
 COLLIDES = "collides"
+SIBLING_COLLISION = "sibling-collision"
+
+# dispatch readiness (a SECOND axis, reported alongside — never folded into
+# the footprint verdict: blocked-by-dependency and collides-on-files are
+# different facts with different remedies, SABLE-qyr0f)
+READY = "ready"
+BLOCKED = "blocked"
+NOT_READY = "not-ready"
+READINESS_UNKNOWN = "readiness-unknown"
+
+# Only 'blocks' edges gate readiness. 'relates-to' (442 of 538 edges in this
+# repo's store) and 'parent-child' do NOT: counting them would report this
+# tool's own beads as blocked by every bead anyone ever cross-referenced.
+BLOCKING_DEP_TYPES = frozenset({"blocks"})
+# A dep whose status is missing from the record is treated as still blocking:
+# an unreadable blocker must fail toward the deny, never toward the release.
+CLOSED_DEP_STATUSES = frozenset({"closed"})
 
 # hold-sweep verdicts
 NEEDS_HOLD = "needs-hold"
@@ -193,19 +275,133 @@ class ScreenVerdict:
     verdict: str
     declared_files: frozenset = frozenset()
     hits: dict = field(default_factory=dict)
+    sibling_hits: dict = field(default_factory=dict)
+    readiness: str = READY
+    blockers: tuple = ()
 
 
 def screen_candidate(bead_id: str, declared: bool, files: frozenset,
-                      occupants: dict) -> ScreenVerdict:
+                      occupants: dict, sibling_hits: dict | None = None,
+                      readiness: str = READY, blockers=()) -> ScreenVerdict:
     """The pure collision decision. `occupants` is {label: frozenset(paths)}
     built from BOTH occupant legs, already excluding this dispatch's own
-    bead id(s) from leg (a)."""
+    bead id(s) from leg (a). `sibling_hits` is leg (c) — {other_candidate_id:
+    (shared paths,)} from sibling_overlaps().
+
+    Verdict precedence on the footprint axis: NO-DECLARATION (nothing to
+    check with) > COLLIDES (an occupant holds the file NOW) > SIBLING-
+    COLLISION (only a co-candidate wants it) > CLEAR. A candidate that hits
+    both an occupant and a sibling reads COLLIDES, and its sibling hits are
+    still carried in `sibling_hits` and rendered — the stronger verdict wins
+    the label, neither fact is discarded.
+
+    `readiness`/`blockers` ride alongside and never change the footprint
+    verdict: a blocked bead that genuinely does not overlap anything is
+    honestly CLEAR *on files* and BLOCKED *on readiness*, and collapsing
+    those into one word is the SABLE-qyr0f defect itself."""
+    sibling_hits = dict(sibling_hits or {})
     if not declared:
-        return ScreenVerdict(bead_id, NO_DECLARATION)
+        # No declaration means no operands — for the occupant legs AND for
+        # the sibling leg. An undeclared pair is NOT a CLEAR pair
+        # (SABLE-e2ic3): "nothing to compare" must not read as "compared,
+        # found nothing".
+        return ScreenVerdict(bead_id, NO_DECLARATION, readiness=readiness,
+                             blockers=tuple(blockers))
     hits = {label: tuple(sorted(files & occ_files))
             for label, occ_files in occupants.items() if files & occ_files}
-    verdict = COLLIDES if hits else CLEAR
-    return ScreenVerdict(bead_id, verdict, files, hits)
+    if hits:
+        verdict = COLLIDES
+    elif sibling_hits:
+        verdict = SIBLING_COLLISION
+    else:
+        verdict = CLEAR
+    return ScreenVerdict(bead_id, verdict, files, hits, sibling_hits,
+                         readiness, tuple(blockers))
+
+
+def sibling_overlaps(declarations: dict) -> dict:
+    """Occupant leg (c): candidate-vs-candidate (SABLE-1muvg).
+
+    `declarations` is {candidate_id: frozenset(paths)} for the candidates
+    that DECLARED something (undeclared candidates are absent from it — they
+    have no operands, and inventing an empty set for them would let a pair
+    of undeclared beads read as compared-and-clean). Returns
+    {candidate_id: {sibling_id: (shared, paths)}}, entries only for
+    candidates with at least one overlap.
+
+    EVERY PAIR, not each-against-the-first: an implementation that compares
+    candidate i only to candidate 0 passes a 2-candidate test and misses a
+    3-candidate list whose 2nd and 3rd overlap. A repeated bead id collapses
+    to one key here, so a bead can never collide with itself."""
+    ids = list(declarations)
+    out: dict[str, dict] = {bid: {} for bid in ids}
+    for i, left in enumerate(ids):
+        for right in ids[i + 1:]:
+            shared = tuple(sorted(declarations[left] & declarations[right]))
+            if shared:
+                out[left][right] = shared
+                out[right][left] = shared
+    return {bid: hits for bid, hits in out.items() if hits}
+
+
+def open_blocking_deps(bead: dict) -> tuple:
+    """The precise readiness signal (SABLE-qyr0f): the ids of this bead's
+    'blocks' dependencies that are not closed, read from the bead's own `bd
+    show --json` record.
+
+    Two record shapes exist and both are accepted — `bd show --json` resolves
+    each dep to a full record ({'id', 'status', 'dependency_type'}) while `bd
+    list --json` returns raw edges ({'depends_on_id', 'type'}) with no
+    status. Status is read, never mere presence: a CLOSED blocker must not
+    suppress CLEAR, and a screen that read dep presence instead of dep status
+    would deny every bead that ever had a dependency."""
+    blockers = []
+    for dep in bead.get("dependencies") or []:
+        if (dep.get("dependency_type") or dep.get("type")) not in BLOCKING_DEP_TYPES:
+            continue
+        dep_id = dep.get("id") or dep.get("depends_on_id")
+        if not dep_id:
+            continue
+        if (dep.get("status") or "") in CLOSED_DEP_STATUSES:
+            continue
+        blockers.append(dep_id)
+    return tuple(sorted(set(blockers)))
+
+
+def readiness_for(bead: dict, ready_ids) -> tuple:
+    """(readiness, blockers) for one candidate.
+
+    `ready_ids` is the id set from `bd ready --limit 0`, or None when that
+    query could not be read at all — None yields READINESS-UNKNOWN rather
+    than a guess in either direction, because a probe that cannot fire is
+    indistinguishable from a condition never met.
+
+    BLOCKED (open 'blocks' dep) denies. NOT-READY (absent from the ready pool
+    for some OTHER reason — already in_progress, closed) is reported with the
+    status named but does not deny: absence from `bd ready` conflates
+    blocked-by-dependency with already-claimed, and the two have different
+    remedies."""
+    blockers = open_blocking_deps(bead)
+    if blockers:
+        return BLOCKED, blockers
+    if ready_ids is None:
+        return READINESS_UNKNOWN, ()
+    if (bead.get("id") or "") in ready_ids:
+        return READY, ()
+    return NOT_READY, ()
+
+
+def ready_id_set(repo: str):
+    """The id set from `bd ready --limit 0`, or None when unreadable.
+
+    --limit 0 is MANDATORY: a bare `bd ready` truncates at 50 silently
+    (SABLE-52aym) and a truncated ready set makes blocked and ready
+    indistinguishable — which would fail in the RELEASING direction inside
+    the fix for a releasing-direction bug."""
+    rows = _bd_json(repo, "ready", "--json", "--limit", "0")
+    if rows is None:
+        return None
+    return frozenset(r.get("id") for r in rows if r.get("id"))
 
 
 def in_progress_occupants(beads: list, exclude_ids) -> dict:
@@ -292,14 +488,42 @@ def wk_branch_occupants(repo: str, integration_ref: str) -> dict:
     return occ
 
 
-def hold_verdict_for_bead(repo: str, integration_ref: str, branch: str,
-                          metadata: dict):
-    """(verdict, fields) for one closed bead's branch.
+def hold_fields_state(metadatas: list) -> tuple:
+    """(holders, best_missing, any_present) across every bead on ONE branch.
+
+    Pure — no git. `holders` is the index list of beads carrying all four
+    fields; the BRANCH is held when that list is non-empty (SABLE-jhako: a
+    hold is placed once, on whichever bead the placer was shown, and the
+    thing actually held is the branch). `best_missing` is what is still
+    missing on the best-covered bead — the shortest real remedy, not the
+    union across beads, which would ask a placer to re-add fields a sibling
+    already carries. `any_present` is every hold field present anywhere on
+    the branch, used only to spot a stale hold on a landed branch."""
+    holders = []
+    missing_sets = []
+    present: set = set()
+    for idx, meta in enumerate(metadatas):
+        meta = meta or {}
+        missing = tuple(f for f in HOLD_FIELDS if not meta.get(f))
+        present.update(f for f in HOLD_FIELDS if meta.get(f))
+        if missing:
+            missing_sets.append(missing)
+        else:
+            holders.append(idx)
+    best_missing = () if holders else min(
+        missing_sets, key=lambda m: (len(m), m), default=HOLD_FIELDS)
+    return holders, best_missing, tuple(f for f in HOLD_FIELDS if f in present)
+
+
+def hold_verdict_for_branch(repo: str, integration_ref: str, branch: str,
+                            metadatas: list):
+    """(verdict, fields, holders) for ONE branch and every closed bead on it.
 
     verdict is one of REAPED_OR_UNPUSHED, NEEDS_HOLD, HELD_OK, LANDED_CLEAN,
     LANDED_STALE_HOLD, UNRESOLVED. `fields` is the missing-fields tuple for
     NEEDS_HOLD, the present-fields tuple for LANDED_STALE_HOLD, and empty
-    otherwise.
+    otherwise. `holders` is the indexes of the beads that carry a complete
+    hold.
 
     THE REAPED-BRANCH REGRESSION this function is the fix for: resolve_ref
     (not a bare rev-parse) decides whether the branch exists on origin at
@@ -308,16 +532,24 @@ def hold_verdict_for_bead(repo: str, integration_ref: str, branch: str,
     metadata does or does not carry."""
     tip = resolve_ref(repo, f"origin/{branch}")
     if not tip:
-        return REAPED_OR_UNPUSHED, ()
+        return REAPED_OR_UNPUSHED, (), []
     contained = is_ancestor(repo, tip, integration_ref)
     if contained is None:
-        return UNRESOLVED, ()
-    meta = metadata or {}
+        return UNRESOLVED, (), []
+    holders, missing, present = hold_fields_state(metadatas)
     if contained:
-        present = tuple(f for f in HOLD_FIELDS if meta.get(f))
-        return (LANDED_STALE_HOLD if present else LANDED_CLEAN), present
-    missing = tuple(f for f in HOLD_FIELDS if not meta.get(f))
-    return (NEEDS_HOLD if missing else HELD_OK), missing
+        return (LANDED_STALE_HOLD if present else LANDED_CLEAN), present, holders
+    return (NEEDS_HOLD if missing else HELD_OK), missing, holders
+
+
+def hold_verdict_for_bead(repo: str, integration_ref: str, branch: str,
+                          metadata: dict):
+    """(verdict, fields) for ONE bead's branch — the single-bead spelling of
+    hold_verdict_for_branch, kept because a one-bead branch is exactly the
+    case that must stay unchanged (SABLE-jhako's third control)."""
+    verdict, fields_, _ = hold_verdict_for_branch(
+        repo, integration_ref, branch, [metadata])
+    return verdict, fields_
 
 
 # --- bd-touching orchestration ------------------------------------------------
@@ -335,25 +567,82 @@ def run_dispatch(repo: str, bead_ids: list) -> tuple[list, str]:
     integration_branch = git_lib.resolve_integration_branch(repo)
     integration_ref = f"origin/{integration_branch}"
     occupants = build_occupants(repo, integration_ref, set(bead_ids))
+    ready_ids = ready_id_set(repo)
 
+    # Read every candidate FIRST: leg (c) is a property of the candidate SET,
+    # so no candidate can be decided until all of them have been read. A
+    # repeated id collapses to one entry here, which is what stops leg (c)
+    # from reporting a bead as colliding with itself.
+    beads: dict[str, dict] = {}
     results = []
     for bid in bead_ids:
         record = _bd_json(repo, "show", bid, "--json")
         if not record:
             results.append({"bead_id": bid, "verdict": "not-found",
-                            "declared_files": [], "hits": {}})
+                            "declared_files": [], "hits": {},
+                            "sibling_hits": {}, "readiness": READINESS_UNKNOWN,
+                            "blockers": []})
             continue
-        bead = record[0]
+        beads[bid] = record[0]
+
+    declarations = {}
+    for bid, bead in beads.items():
         declared, files = declared_writes_from_metadata(bead.get("metadata") or {})
-        verdict = screen_candidate(bid, declared, files, occupants)
+        if declared:
+            declarations[bid] = files
+    sibling_hits = sibling_overlaps(declarations)
+
+    for bid, bead in beads.items():
+        declared, files = declared_writes_from_metadata(bead.get("metadata") or {})
+        readiness, blockers = readiness_for(bead, ready_ids)
+        verdict = screen_candidate(bid, declared, files, occupants,
+                                    sibling_hits.get(bid), readiness, blockers)
         results.append({
             "bead_id": bid,
             "title": (bead.get("title") or "")[:80],
             "verdict": verdict.verdict,
             "declared_files": sorted(verdict.declared_files),
             "hits": verdict.hits,
+            "sibling_hits": verdict.sibling_hits,
+            "readiness": verdict.readiness,
+            "blockers": list(verdict.blockers),
+            "status": bead.get("status") or "",
         })
+    # not-found rows were appended during the read pass; restore the order the
+    # caller asked in so a reader can match rows to argv positionally.
+    order = {bid: i for i, bid in enumerate(bead_ids)}
+    results.sort(key=lambda r: order.get(r["bead_id"], len(order)))
     return results, integration_ref
+
+
+def dispatch_exit_code(results: list) -> int:
+    """0 every candidate is dispatchable, 1 at least one deny, 2 a candidate
+    could not be read at all.
+
+    A deny is COLLIDES, SIBLING-COLLISION, or BLOCKED — three different facts
+    that all mean "do not dispatch this set as asked". NO-DECLARATION and
+    NOT-READY are reported and still release: a screen that can never release
+    is exactly as broken as one that can never deny."""
+    if any(r["verdict"] == "not-found" for r in results):
+        return 2
+    denied = {COLLIDES, SIBLING_COLLISION}
+    if any(r["verdict"] in denied or r.get("readiness") == BLOCKED
+           for r in results):
+        return 1
+    return 0
+
+
+def group_by_branch(beads: list) -> dict:
+    """{branch: [bead, ...]} in first-seen order, skipping beads with no
+    metadata.branch. The grouping IS the SABLE-jhako fix: it is what makes
+    one branch produce one row instead of one row per bundled bead."""
+    groups: dict[str, list] = {}
+    for b in beads:
+        branch = (b.get("metadata") or {}).get("branch")
+        if not branch:
+            continue
+        groups.setdefault(branch, []).append(b)
+    return groups
 
 
 def run_holds(repo: str) -> tuple[list, str]:
@@ -363,20 +652,28 @@ def run_holds(repo: str) -> tuple[list, str]:
                       "--limit", "0") or []
 
     results = []
-    for b in closed:
-        meta = b.get("metadata") or {}
-        branch = meta.get("branch")
-        if not branch:
-            continue
-        verdict, fields_ = hold_verdict_for_bead(repo, integration_ref, branch, meta)
-        results.append({"bead_id": b.get("id"), "branch": branch,
-                        "verdict": verdict, "fields": list(fields_)})
+    for branch, group in group_by_branch(closed).items():
+        metas = [b.get("metadata") or {} for b in group]
+        ids = [b.get("id") for b in group]
+        verdict, fields_, holders = hold_verdict_for_branch(
+            repo, integration_ref, branch, metas)
+        results.append({
+            "branch": branch,
+            "beads": ids,
+            # kept so a reader keyed on a single id still resolves; with one
+            # bead on the branch this row is byte-identical to the old one.
+            "bead_id": ids[0] if ids else None,
+            "verdict": verdict,
+            "fields": list(fields_),
+            "held_by": [ids[i] for i in holders],
+        })
     return results, integration_ref
 
 
 # --- rendering ----------------------------------------------------------------
 
-_DISPATCH_ICON = {NO_DECLARATION: "⚠", CLEAR: "✓", COLLIDES: "✗"}
+_DISPATCH_ICON = {NO_DECLARATION: "⚠", CLEAR: "✓", COLLIDES: "✗",
+                  SIBLING_COLLISION: "⇄"}
 
 
 def render_dispatch_text(results: list, integration_ref: str) -> str:
@@ -394,21 +691,56 @@ def render_dispatch_text(results: list, integration_ref: str) -> str:
             lines.append(f"    declares: {', '.join(r['declared_files'])}")
         for label, shared in r.get("hits", {}).items():
             lines.append(f"    ↳ {label}: {', '.join(shared)}")
+        for sibling, shared in sorted(r.get("sibling_hits", {}).items()):
+            lines.append(f"    ⇄ co-candidate {sibling}: {', '.join(shared)}")
+        if r.get("sibling_hits"):
+            lines.append("      remedy: bundle onto ONE worktree "
+                          "(sable-spawn-worker <lead> --bundle <sibling>) or "
+                          "dispatch them one after the other — do NOT give "
+                          "them separate panes")
+        lines.extend(_render_readiness(r))
         lines.append("")
     return "\n".join(lines)
+
+
+def _render_readiness(r: dict) -> list:
+    """The readiness axis prints on its OWN line, below the footprint verdict
+    (SABLE-qyr0f). A READY candidate prints nothing extra, which is what
+    keeps the ordinary single-candidate output unchanged."""
+    readiness = r.get("readiness", READY)
+    if readiness == BLOCKED:
+        return [f"    ⛔ BLOCKED: open blocking dependency "
+                f"{', '.join(r.get('blockers') or [])} — not dispatchable "
+                f"(readiness is a SEPARATE axis from the footprint verdict "
+                f"above)"]
+    if readiness == NOT_READY:
+        status = r.get("status") or "unknown"
+        return [f"    ⚠ not in the ready pool (status: {status}) — no open "
+                f"blocking dep, so this is 'not dispatchable NOW', not "
+                f"'blocked'"]
+    if readiness == READINESS_UNKNOWN:
+        return ["    ⚠ READINESS UNKNOWN: `bd ready --limit 0` unreadable; "
+                "the footprint verdict above stands alone"]
+    return []
 
 
 def render_holds_text(results: list, integration_ref: str) -> str:
     needs = [r for r in results if r["verdict"] == NEEDS_HOLD]
     other = [r for r in results if r["verdict"] != NEEDS_HOLD]
+    bead_count = sum(len(r.get("beads") or []) for r in results)
     lines = [
         f"integration ref: {integration_ref}",
-        f"closed beads with a branch: {len(results)}",
+        # rows are BRANCHES now (SABLE-jhako), so both counts are printed:
+        # bundled branches make them differ, and the difference is the thing
+        # the old bead-keyed sweep could not see.
+        f"branches with a closed bead: {len(results)} "
+        f"(across {bead_count} closed bead(s))",
         "",
         f"*** NEEDS HOLD ({len(needs)}) ***",
     ]
     for r in needs:
-        lines.append(f"  {r['bead_id']:18s} {r['branch']:32s} missing: {','.join(r['fields'])}")
+        lines.append(f"  {r['branch']:32s} missing: {','.join(r['fields'])}"
+                      f"  beads: {', '.join(b for b in r['beads'] if b)}")
     if not needs:
         lines.append("  none")
     lines.append("")
@@ -417,7 +749,10 @@ def render_holds_text(results: list, integration_ref: str) -> str:
         note = ""
         if r["verdict"] == LANDED_STALE_HOLD:
             note = f" (landed but still holds {','.join(r['fields'])})"
-        lines.append(f"  {r['bead_id']:18s} {r['branch']:32s} {r['verdict']}{note}")
+        elif r["verdict"] == HELD_OK and r.get("held_by"):
+            note = f" (hold carried by {', '.join(r['held_by'])})"
+        lines.append(f"  {r['branch']:32s} {r['verdict']}{note}"
+                      f"  beads: {', '.join(b for b in r['beads'] if b)}")
     return "\n".join(lines)
 
 
@@ -453,9 +788,7 @@ def main(argv: list | None = None) -> int:
             print(json.dumps({"integration_ref": integration_ref, "results": results}, indent=2))
         else:
             print(render_dispatch_text(results, integration_ref))
-        if any(r["verdict"] == "not-found" for r in results):
-            return 2
-        return 1 if any(r["verdict"] == COLLIDES for r in results) else 0
+        return dispatch_exit_code(results)
 
     results, integration_ref = run_holds(repo)
     if args.format == "json":
