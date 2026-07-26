@@ -47,6 +47,7 @@ ALLOW=(
   test-bead-description-gate.sh
   test-chuck-role-contract.sh
   test-ci-bd-coverage-gap.sh
+  test-close-hold-guard.sh
   test-columbo-quick-mode.sh
   test-concurrent-sessions.sh
   test-control-trace.sh
