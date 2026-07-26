@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -25,6 +26,34 @@ import pytest
 BIN = Path(__file__).resolve().parent / "sable-spawn-worker"
 HAVE_TMUX = shutil.which("tmux") is not None
 HAVE_BD = shutil.which("bd") is not None
+
+
+def _load_ssw():
+    """Import bin/sable-spawn-worker as a module (it has no .py extension).
+
+    *** THIS BINDING WAS MISSING AND A TEST HAD NEVER RUN AN ASSERTION BECAUSE
+    OF IT (SABLE-7ixf8). *** test_real_bd_widening_past_declaration_is_named_
+    against_a_real_git_diff called `ssw.bead_claimed_files(...)` at what is now
+    line ~2440 and died at `NameError: name 'ssw' is not defined` before
+    reaching a single assert — while counting as one collected test and
+    contributing its name to the suite's coverage. `ssw.widening_report` is real
+    code that exists in the tool, so this was genuine coverage that had never
+    executed: a test that is present, named, and inert.
+
+    Found while landing the footprint-parser consolidation (SABLE-g0elq) — the
+    same silent-instrument class as the beads that branch fixes, one layer over
+    in the suite rather than in the gate."""
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    loader = SourceFileLoader("sable_spawn_worker_int", str(BIN))
+    spec = importlib.util.spec_from_loader("sable_spawn_worker_int", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+ssw = _load_ssw()
 BEAD = "SABLE-bldh.2"  # an open bead in this repo (read-only here)
 BUNDLE_SIBLING = "SABLE-06dr"  # a second open bead, used only as --bundle sibling (read-only here)
 pytestmark = pytest.mark.skipif(not (HAVE_TMUX and HAVE_BD),
@@ -2466,3 +2495,172 @@ def test_real_bd_widening_past_declaration_is_named_against_a_real_git_diff(real
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ===========================================================================
+# The footprint-parser consolidation, against a REAL bd store
+# (SABLE-g0elq / SABLE-546m5 / SABLE-9dmuu)
+# ===========================================================================
+# Cross-gate parity and the shell hook live in
+# bin/test_footprint_gate_parity_integration.py. What is here is the part that
+# needs sable-spawn-worker's OWN production write path: overlap_check against real
+# bead records, and tag_footprint_metadata performing a real `bd update`.
+
+def test_real_bead_with_prose_tail_collides_only_on_genuine_paths(real_bd_repo):
+    """SABLE-g0elq's integration leg, on real bead records through real bd.
+
+    Both beads carry a footprint section FOLLOWED BY the verbatim prose that
+    produced the live phantoms. The refusal must name the ONE genuinely shared
+    path and contain no non-path token — because these phantoms appeared IN THE
+    REFUSAL MESSAGE, and a manager who reads `failing, never, so` in a blocker
+    list learns the gate is noisy. That is the prove-the-gate-can-release erosion
+    arriving from the noise side."""
+    repo = real_bd_repo
+    prose = ("the fleet-binding lane rule (derive membership from declared "
+             "footprints,\nnever from an enumerated list) is SILENT on a bead "
+             "that declares nothing,\nfailing in the RELEASING direction, so it "
+             "was dispatchable.\n")
+    shared = "bin/shared-g0elq-fixture.py"
+    a = _new_bead(repo, "prose-tail occupant",
+                  f"Occupant.\n\n## File footprint\n{shared}\n\n{prose}")
+    _bd(repo, "update", a, "--claim")
+    b = _new_bead(repo, "prose-tail dispatch",
+                  f"Dispatch.\n\n## File footprint\n{shared}\n\n{prose}")
+
+    bead_b = json.loads(_bd(repo, "show", b, "--json"))[0]
+    in_progress = json.loads(_bd(repo, "list", "--status=in_progress", "--json",
+                                 "--limit", "0") or "[]")
+    verdict = ssw.overlap_check(b, bead_b, in_progress)
+
+    assert verdict.decision == "deny", f"{verdict.decision}: {verdict.message}"
+    assert shared in verdict.message
+    for phantom in ("failing", "never", "SILENT", "dispatchable", "enumerated"):
+        assert phantom not in verdict.message, (
+            f"prose token {phantom!r} reached the refusal text:\n{verdict.message}")
+    # And the claim set itself, read off the real record, is exactly the one path.
+    assert ssw.bead_claimed_files(bead_b) == {shared}
+
+
+def test_real_bead_narrowed_footprint_now_collides(real_bd_repo):
+    """SABLE-546m5's integration leg, and *** THE UNSAFE DIRECTION OF THE WHOLE
+    CLUSTER. *** SABLE-rrn6r's real section body parsed to ['GitHub'] — a prose
+    word — DROPPING both real paths, so the two beads below did NOT collide and
+    both dispatched into the same files.
+
+    At promote time this is invisible (the mechanical diff is authoritative and
+    unioned, which is why it survived); at DISPATCH time no diff exists yet, so
+    the declared footprint is the only signal there is."""
+    repo = real_bd_repo
+    body = ("GitHub repo settings (rulesets) OR "
+            "hooks/multi-manager/pre-push-rebase-test.sh (leg 2); docs update in "
+            "MULTI-MANAGER-PATTERN.md merge-path section")
+    a = _new_bead(repo, "rrn6r-shaped occupant",
+                  f"Occupant.\n\n## File footprint\n{body}\n")
+    _bd(repo, "update", a, "--claim")
+    b = _new_bead(repo, "colliding dispatch",
+                  "Dispatch.\n\n## File footprint\n"
+                  "hooks/multi-manager/pre-push-rebase-test.sh\n")
+
+    bead_b = json.loads(_bd(repo, "show", b, "--json"))[0]
+    in_progress = json.loads(_bd(repo, "list", "--status=in_progress", "--json",
+                                 "--limit", "0") or "[]")
+    verdict = ssw.overlap_check(b, bead_b, in_progress)
+    assert verdict.decision == "deny", (
+        f"the narrowed footprint still hides the collision: "
+        f"{verdict.decision} {verdict.message}")
+    assert "hooks/multi-manager/pre-push-rebase-test.sh" in verdict.message
+    assert "GitHub" not in verdict.message
+
+
+def test_real_tagger_stores_the_union_of_two_footprint_sections(real_bd_repo, monkeypatch):
+    """SABLE-9dmuu's integration leg through the REAL dispatch-time write path: a
+    real bead with two contradicting '## File footprint' sections, the real
+    tag_footprint_metadata, and the stored footprint_writes read back out of real
+    bd. Previously the stored value reflected THE FIRST SECTION ALONE, so a
+    manager's appended correction was discarded by the act of dispatching."""
+    repo = real_bd_repo
+    # chdir: tag_footprint_metadata shells out to a bare `bd`, which resolves its
+    # store from CWD. Without this the test would write into the PROJECT pool —
+    # the exact contamination real_bd_repo exists to prevent.
+    monkeypatch.chdir(repo)
+    bead_id = _new_bead(
+        repo, "two contradicting sections",
+        "Story.\n\n## File footprint\n"
+        "bin/sable_coverage_floor_lib.py, bin/test_sable_coverage_floor_lib.py\n\n"
+        "## Test spec\nwords\n\n"
+        "## File footprint\n"
+        "bin/sable_coverage_floor_lib.py, bin/test_coverage_floor.py, "
+        "bin/test_coverage_floor_integration.py\n")
+
+    description = json.loads(_bd(repo, "show", bead_id, "--json"))[0]["description"]
+    ssw.tag_footprint_metadata(bead_id, description, stored={})
+
+    stored = (json.loads(_bd(repo, "show", bead_id, "--json"))[0]
+              .get("metadata") or {}).get("footprint_writes") or ""
+    got = {p.strip() for p in stored.split(",") if p.strip()}
+    assert "bin/test_coverage_floor.py" in got, (
+        f"the appended correction was discarded at the write path: {stored!r}")
+    assert "bin/test_coverage_floor_integration.py" in got
+    assert got == {"bin/sable_coverage_floor_lib.py",
+                   "bin/test_sable_coverage_floor_lib.py",
+                   "bin/test_coverage_floor.py",
+                   "bin/test_coverage_floor_integration.py"}
+
+
+def test_real_tagger_reports_a_divergent_overwrite(real_bd_repo, monkeypatch, capsys):
+    """SECOND LEG, the overwrite, end to end: a footprint_writes stored BY HAND,
+    then the real tagger run over a description deriving a DIFFERENT set. The
+    divergence must be REPORTED — not merely performed — because a manager who
+    hand-corrected a footprint and then dispatched had the correction reverted with
+    no output saying so.
+
+    NEGATIVE CONTROL in the same test: re-running the tagger once the stored value
+    agrees is SILENT, so the message stays worth reading."""
+    repo = real_bd_repo
+    monkeypatch.chdir(repo)
+    bead_id = _new_bead(repo, "hand-stamped footprint",
+                        "Story.\n\n## File footprint\nbin/derived-by-dispatch.py\n")
+    _bd(repo, "update", bead_id, "--set-metadata",
+        "footprint_writes=bin/hand-stamped.py")
+
+    record = json.loads(_bd(repo, "show", bead_id, "--json"))[0]
+    capsys.readouterr()
+    ssw.tag_footprint_metadata(bead_id, record["description"],
+                              stored=record.get("metadata") or {})
+    err = capsys.readouterr().err
+    assert "FOOTPRINT OVERWRITE" in err, f"the overwrite was mute: {err!r}"
+    assert "bin/hand-stamped.py" in err and "bin/derived-by-dispatch.py" in err
+
+    stored = (json.loads(_bd(repo, "show", bead_id, "--json"))[0]
+              .get("metadata") or {}).get("footprint_writes") or ""
+    assert stored == "bin/derived-by-dispatch.py", (
+        "the re-derived value must still win — a stale hand-stamp left in place "
+        f"would put metadata and prose out of step: {stored!r}")
+
+    # Re-run: stored now agrees, so nothing is announced.
+    record = json.loads(_bd(repo, "show", bead_id, "--json"))[0]
+    capsys.readouterr()
+    ssw.tag_footprint_metadata(bead_id, record["description"],
+                              stored=record.get("metadata") or {})
+    assert "FOOTPRINT OVERWRITE" not in capsys.readouterr().err
+
+
+def test_real_bead_declaring_a_phantom_path_is_reported(real_bd_repo):
+    """SABLE-9dmuu approach 3 against a real record: a declared path absent from
+    the working tree is surfaced. *** A PATH THAT CANNOT EXIST CANNOT COLLIDE, SO
+    AN UNVALIDATED FOOTPRINT FAILS IN THE RELEASING DIRECTION BY CONSTRUCTION. ***
+
+    Advisory, not a refusal, and the corpus says why: 165 of 303 live beads with a
+    footprint section declare at least one path that does not exist yet, because
+    that is what a bead that ADDS a file looks like. A deny here would have blocked
+    all of them."""
+    repo = real_bd_repo
+    bead_id = _new_bead(repo, "phantom declaration",
+                        "Story.\n\n## File footprint\n"
+                        "bin/sable-spawn-worker, bin/test_sable_coverage_floor_lib.py\n")
+    record = json.loads(_bd(repo, "show", bead_id, "--json"))[0]
+    root = str(Path(__file__).resolve().parent.parent)
+    advisory = ssw.footprint_existence_advisory(ssw.bead_claimed_files(record), root)
+    assert advisory is not None
+    assert "bin/test_sable_coverage_floor_lib.py" in advisory
+    assert "bin/sable-spawn-worker" not in advisory

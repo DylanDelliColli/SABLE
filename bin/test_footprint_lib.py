@@ -234,10 +234,22 @@ def test_a_declared_footprint_never_narrows_the_mechanical_one():
 
 
 def test_declared_directory_prefixes_cover_everything_beneath_them():
+    """Prefix COVERAGE is unchanged by SABLE-g0elq's tokenizer filter, and the two
+    layers must not be confused: `_entry_covers` still expands any directory entry
+    over everything beneath it. What changed is that the TOKENIZER will no longer
+    MANUFACTURE a bare 'bin/' out of prose — see
+    test_a_bare_directory_prefix_is_not_tokenized_from_prose below. This entry is
+    therefore built directly, which is now the only way a depth-1 directory can
+    reach this predicate at all."""
     declared = fp.footprint({"bin/"})
     assert fp.is_disjoint(declared, fp.footprint({"bin/deep/nested.py"})).disjoint is False
     assert fp.is_disjoint(declared, fp.footprint({"binary/nested.py"})).disjoint is True, \
         "a prefix must match on path segments, not on raw string prefix"
+    # A DEEP directory entry — the form the tokenizer does still produce — covers
+    # beneath itself identically. Asserted here so the filter cannot be "fixed"
+    # later by disabling prefix coverage instead of narrowing the tokenizer.
+    assert fp.is_disjoint(fp.footprint({"hooks/test/"}),
+                          fp.footprint({"hooks/test/test-x.sh"})).disjoint is False
 
 
 def test_parse_declared_footprint_reads_the_bead_section():
@@ -250,11 +262,44 @@ def test_parse_declared_footprint_reads_the_bead_section():
         "hooks/test/test-should-not-be-picked-up.sh\n"
     )
     entries = fp.parse_declared_footprint(description)
-    assert "bin/" in entries
+    # *** ASSERTION DELIBERATELY INVERTED (SABLE-g0elq), NOT RELAXED. ***
+    # This line read `assert "bin/" in entries` and encoded the behaviour that
+    # was later measured as a defect: the fixture body above is EXACTLY the live
+    # prose form ('bin/ (annotation)') that a corpus census found on 6 beads, and
+    # once the parenthetical is stripped the surviving 'bin/' is not a path but a
+    # QUANTIFIER OVER EVERY FILE UNDER bin/ at fp._entry_covers — measured
+    # non-disjoint against unrelated bin/ work, which silently destroys optimistic
+    # parallel promotion for the bead. The replacement is an equally strong
+    # positive claim about the opposite outcome, and every other assertion in this
+    # test is untouched. Deliberate directory declarations still parse at depth >=2
+    # (test_a_bare_directory_prefix_is_not_tokenized_from_prose).
+    assert "bin/" not in entries, (
+        "a bare top-level directory prefix scraped from prose became a declared "
+        "entry — at _entry_covers that quantifies over every file beneath it")
     assert "bin/sable-merge-gate" in entries
     assert "hooks/test/test-optimistic-promotion.sh" in entries
     assert not any("should-not-be-picked-up" in e for e in entries), \
         "parsing ran past the end of the footprint section"
+
+
+def test_a_bare_directory_prefix_is_not_tokenized_from_prose():
+    """The depth rule, stated on its own and with its NEGATIVE CONTROL, because
+    the threshold is the whole decision and it was measured rather than guessed:
+    over 3257 live beads the depth-1 form was prose every time (6 beads), while
+    all 9 deeper directory entries were deliberate declarations."""
+    assert fp.parse_declared_footprint(
+        "S.\n\n## File footprint\nbin/, hooks/, /\n") == frozenset()
+    assert fp.parse_declared_footprint(
+        "S.\n\n## File footprint\n.github/ci/, hooks/test/, "
+        ".claude/sable/state/planning/SABLE-jd5fj/\n"
+    ) == {".github/ci/", "hooks/test/",
+          ".claude/sable/state/planning/SABLE-jd5fj/"}
+    # Rejected, never silent: the tokens are reported through the SABLE-zx2yv
+    # dropped channel so the refusal downstream can name them.
+    _, entries, dropped = fp._collect_section(
+        "S.\n\n## File footprint\nbin/, hooks/\n", fp._FOOTPRINT_HEADING)
+    assert entries == frozenset()
+    assert {"bin/", "hooks/"} <= dropped
 
 
 def test_parse_declared_footprint_is_empty_without_a_section():
@@ -741,3 +786,158 @@ def test_real_declared_footprints_of_an_overlapping_pair_exclude(bd_sandbox):
     verdict = fp.is_disjoint(fp_a, fp_b)
     assert verdict.disjoint is False
     assert "bin/shared_module.py" in verdict.reason
+
+
+# --------------------------------------------------------------------------
+# The CLI seam the SHELL gates consume (SABLE-7gesd)
+# --------------------------------------------------------------------------
+# hooks/multi-manager/pre-dispatch-overlap.sh has no parser of its own any more —
+# it pipes bd's JSON through this module. These pin the stream contract, because
+# the shell side reads it with sed/grep and a silent format change would turn the
+# gate inert (wired-and-firing-and-checking-nothing, SABLE-nn54x).
+
+def _cli(mode, payload, *extra):
+    import subprocess
+    lib = str(Path(__file__).resolve().parent / "sable_footprint_lib.py")
+    cp = subprocess.run([sys.executable, lib, mode, *extra],
+                        input=json.dumps(payload), capture_output=True, text=True)
+    assert cp.returncode == 0, cp.stderr
+    return cp.stdout.splitlines()
+
+
+def test_cli_read_declared_emits_the_four_source_union():
+    bead = {
+        "id": "SABLE-x",
+        "notes": "WIP-CLAIMS: hooks/a.sh",
+        "description": "S.\n\n## File footprint\nhooks/b.sh\n",
+        "metadata": {"wip_claims": "hooks/c.sh", "footprint_writes": "hooks/d.sh"},
+    }
+    lines = _cli("--read-declared", [bead])
+    assert sorted(lines) == ["fhooks/a.sh", "fhooks/b.sh", "fhooks/c.sh", "fhooks/d.sh"]
+
+
+def test_cli_read_declared_emits_the_unreadable_channel_separately():
+    lines = _cli("--read-declared",
+                 [{"id": "SABLE-x",
+                   "description": "S.\n\n## File footprint\nGitHub settings\n"}])
+    assert not [ln for ln in lines if ln.startswith("f")]
+    u = [ln for ln in lines if ln.startswith("u")]
+    assert len(u) == 1 and "File footprint" in u[0] and "GitHub" in u[0]
+
+
+def test_cli_scavenge_fires_on_an_ABSENT_heading_not_on_an_empty_result():
+    """The leg-3 condition, pinned. It must be "no section heading", NOT "no files
+    found": gating on emptiness would narrow the dispatch-side claim set for a bead
+    that has metadata but no section, and fewer files compared means a real overlap
+    can go unseen (the releasing direction, SABLE-546m5).
+
+    And the complement, which is what stops the scavenge laundering a bad
+    declaration: a heading that IS present but unreadable stays unreadable rather
+    than being topped up from prose (SABLE-47try)."""
+    # metadata present, NO heading -> scavenge still runs and adds prose tokens
+    lines = _cli("--read-declared",
+                 [{"id": "SABLE-x", "metadata": {"wip_claims": "hooks/claimed.sh"},
+                   "description": "touches bin/scavenged.py as well"}],
+                 "--scavenge")
+    files = {ln[1:] for ln in lines if ln.startswith("f")}
+    assert files == {"hooks/claimed.sh", "bin/scavenged.py"}
+
+    # heading PRESENT but unreadable -> NOT topped up; stays could-not-assess
+    lines = _cli("--read-declared",
+                 [{"id": "SABLE-x",
+                   "description": "mentions bin/elsewhere.py\n\n"
+                                  "## File footprint\nprose only\n"}],
+                 "--scavenge")
+    assert not [ln for ln in lines if ln.startswith("f")], (
+        "the scavenge laundered a mis-authored section into a successful parse")
+    assert [ln for ln in lines if ln.startswith("u")]
+
+
+def test_cli_read_declared_list_groups_by_bead_id():
+    lines = _cli("--read-declared-list", [
+        {"id": "SABLE-a", "description": "S.\n\n## File footprint\nhooks/a.sh\n"},
+        {"id": "SABLE-b", "metadata": {"footprint_writes": "hooks/b.sh"}},
+        {"description": "no id — skipped"},
+    ])
+    assert sorted(lines) == ["SABLE-a\tfhooks/a.sh", "SABLE-b\tfhooks/b.sh"]
+
+
+def test_cli_never_crashes_the_gate_on_unreadable_input():
+    """The hook runs under `set -euo pipefail`; a non-zero exit here would take
+    the whole gate down and fail OPEN. Garbage in means an empty stream out, which
+    the caller already handles as its own no-declaration verdict."""
+    import subprocess
+    lib = str(Path(__file__).resolve().parent / "sable_footprint_lib.py")
+    for junk in ("", "not json at all", "null", "42", '{"unclosed":'):
+        cp = subprocess.run([sys.executable, lib, "--read-declared"], input=junk,
+                            capture_output=True, text=True)
+        assert cp.returncode == 0, f"{junk!r} exited {cp.returncode}: {cp.stderr}"
+
+
+# --------------------------------------------------------------------------
+# section_bodies — EVERY matching section, not the first (SABLE-9dmuu)
+# --------------------------------------------------------------------------
+
+def test_section_bodies_returns_every_section_in_document_order():
+    """The scan this replaces set a `found` flag it never reset and BROKE OUT of
+    the loop at the first '#' after the first heading, so only the FIRST section
+    was ever read. Asserted directly on the scanner, not only through the
+    footprint reader, so the multiplicity property has more than one point of
+    detection — a single failing test is a single point of failure for a control."""
+    desc = ("Story.\n"
+            "## File footprint\n"
+            "first-a, first-b\n"
+            "\n"
+            "## Test spec\n"
+            "words that must not be collected\n"
+            "\n"
+            "## File footprint\n"
+            "second-a\n"
+            "\n"
+            "## Another\n"
+            "more words\n"
+            "\n"
+            "## File footprint\n"
+            "third-a\n")
+    bodies = fp.section_bodies(desc, fp._FOOTPRINT_HEADING)
+    assert len(bodies) == 3, f"sections dropped: {bodies}"
+    assert "first-a, first-b" in bodies[0]
+    assert "second-a" in bodies[1]
+    assert "third-a" in bodies[2]
+    assert not any("must not be collected" in b for b in bodies)
+    assert not any("more words" in b for b in bodies)
+
+
+def test_section_bodies_absent_heading_is_an_empty_list_not_one_empty_body():
+    """The absent/declared-empty distinction at the scanner layer: NO sections is
+    an empty list, while a PRESENT-but-empty section is one empty body. Collapsing
+    them here would destroy the SABLE-47try trichotomy at its source, before any
+    caller could draw it."""
+    assert fp.section_bodies("no heading at all", fp._FOOTPRINT_HEADING) == []
+    assert fp.section_bodies("S.\n## File footprint\n\n## Next\nx",
+                             fp._FOOTPRINT_HEADING) == [""]
+
+
+def test_multiple_sections_union_and_are_reported_by_the_footprint_reader():
+    """Union + report, end to end at the lib layer. UNION because that is the
+    reading a human gives an appended correction and it is the WIDENING (safe)
+    direction; REPORT because silence is what let a discarded correction look
+    identical to a clean read."""
+    desc = ("S.\n\n## File footprint\nbin/first.py\n\n"
+            "## Test spec\nx\n\n## File footprint\nbin/second.py\n")
+    read = fp.read_footprint_section(desc)
+    assert read.files == {"bin/first.py", "bin/second.py"}
+    assert read.could_not_assess is False
+    assert any("2" in s and "File footprint" in s for s in read.unreadable_sources)
+    # parse_declared_footprint (the PROMOTE gate's entry point) unions too, so the
+    # two moments cannot disagree about what the bead declared.
+    assert fp.parse_declared_footprint(desc) == {"bin/first.py", "bin/second.py"}
+
+
+def test_a_single_section_reports_no_multiplicity():
+    """NEGATIVE CONTROL for the reporting half: 301 of 303 live beads with a
+    footprint section have exactly one, so a multiplicity warning on the ordinary
+    case would be noise on nearly every dispatch."""
+    read = fp.read_footprint_section("S.\n\n## File footprint\nbin/a.py\n\n## Next\nx")
+    assert read.files == {"bin/a.py"}
+    assert read.unreadable_sources == ()
