@@ -63,6 +63,15 @@ and a reap consumed DONE panes the owning manager was still event-waiting on.
 caller with no $CLAUDE_AGENT_NAME (e.g. the operator running it by hand) is
 un-laned, so the default is the global view for them.
 
+A lane-scoped result and a fleet-wide one used to be byte-indistinguishable —
+this tool filtered to the caller's lane with NO indication it had done so, so
+a stranded-claim sweep reading a lane-scoped "2 panes, both mine" as
+fleet-wide nearly released four OTHER lanes' live workers' claims (SABLE-h1fa7).
+Every invocation, default path included, now prints a leading scope line
+("scope: lane=tarzan (2 shown, 7 hidden in other lane(s) — use --all to see
+the fleet)" / "scope: all-lanes (9 worker pane(s))") — see scope_summary — and
+--json carries the same as a {"lane", "shown", "hidden"} "scope" object.
+
 Usage:
   sable-worker-status            # own-lane table (default: @sable_lane==$CLAUDE_AGENT_NAME)
   sable-worker-status --mine     # explicit form of the default own-lane filter
@@ -95,16 +104,40 @@ from sable_pane_lib import (  # noqa: E402
     pane_working, resolve_session, session_limit_reset)
 
 WORKER_ROLE_PREFIX = "worker"
+# SABLE-6xtx: a worker window is always named worker-<sanitized-bead-id>
+# (sable-spawn-worker's window_name()) at creation time, independent of the
+# @sable_role/@sable_class pane OPTIONS -- so a pane whose tags are absent or
+# lost still carries this signal. Used as the classification fallback below
+# when the @sable_role/@sable_class check finds nothing.
+#
+# NOTE: an earlier version of this fix also forced status="done" whenever a
+# worker/producer pane's LIVE #{pane_current_command} was a bare shell
+# (claude exited to zsh/bash) on the theory that with_lifecycle_flags
+# (SABLE-5v9n) has no tag-writer for an untagged pane. That broke every
+# integration-test fixture in this suite: they simulate a "running" worker
+# with a plain `bash --noprofile --norc` pane and NEVER launch a real
+# claude process, so pane_current_command reads "bash" for the pane's ENTIRE
+# lifetime — indistinguishable, by that heuristic, from "claude exited". The
+# override reaped live-simulated workers wholesale (one run killed the whole
+# tmux session). Process identity IS still authoritative for a NARROWER
+# question elsewhere (filter_live_agents: is a live resumed cockpit/manager
+# occupying this window), but it is not a safe DONE signal here — @sable_status
+# stays the sole source of truth for worker liveness; only the classification
+# (is this pane a worker at all) gets the window-name fallback.
+WINDOW_NAME_WORKER_PREFIX = "worker-"
 # Tab-delimited (SABLE-exab): a space-joined format collapses an EMPTY field
 # (e.g. a producer pane spawned without a bead tag) into its neighboring
 # whitespace, shifting every later column left by one. Tabs never collapse,
 # so an empty @sable_bead placeholder still occupies its own field.
-# @sable_lane (SABLE-dcw2) is the LAST field: appended so a pane spawned before
-# this column existed (no @sable_lane) simply renders a trailing empty field
-# rather than shifting @sable_class/@sable_deliverable — the same tab-delimited
-# discipline the fields above rely on.
+# @sable_lane (SABLE-dcw2) is the LAST TAG field: appended so a pane spawned
+# before this column existed (no @sable_lane) simply renders a trailing empty
+# field rather than shifting @sable_class/@sable_deliverable — the same
+# tab-delimited discipline the fields above rely on. #{window_name}
+# (SABLE-6xtx) is pure tmux window state, never unset, so it is appended last
+# of all without disturbing any tag column.
 _FORMAT = ("#{pane_id}\t#{@sable_role}\t#{@sable_bead}\t#{@sable_status}\t"
-           "#{@sable_class}\t#{@sable_deliverable}\t#{@sable_lane}")
+           "#{@sable_class}\t#{@sable_deliverable}\t#{@sable_lane}\t"
+           "#{window_name}")
 
 
 def tmux_base(socket: str | None) -> list[str]:
@@ -126,7 +159,17 @@ def parse_worker_panes(output: str) -> list[dict]:
     ONLY when non-empty, exactly like "class"/"deliverable": a pane spawned
     before this column (or without a resolvable lane) keeps the bare shape, so
     every pre-existing exact-shape assertion stays valid and an unattributed
-    pane is surfaced only under --all."""
+    pane is surfaced only under --all.
+
+    SABLE-6xtx: when @sable_role/@sable_class are BOTH absent (the classless
+    branch below), the window name is checked for the worker-<bead> prefix
+    sable-spawn-worker always stamps at creation (window_name()) as a
+    fallback classification signal — a pane whose tags were never stamped or
+    were lost is still recognized as a worker instead of silently vanishing
+    from every listing. This is classification ONLY: the pane's @sable_status
+    tag (or the 'running' default) still decides its reported status exactly
+    as before — see the WINDOW_NAME_WORKER_PREFIX comment above for why a
+    live-process-based done override was tried and reverted."""
     workers: list[dict] = []
     for line in output.splitlines():
         parts = line.split("\t")
@@ -138,11 +181,13 @@ def parse_worker_panes(output: str) -> list[dict]:
         cls = parts[4] if len(parts) >= 5 and parts[4] else ""
         deliverable = parts[5] if len(parts) >= 6 and parts[5] else ""
         lane = parts[6] if len(parts) >= 7 and parts[6] else ""
+        window = parts[7] if len(parts) >= 8 and parts[7] else ""
 
         if cls == "manager":
             continue  # always-on manager loops are never surfaced/reaped
         if cls == "":
-            if not role.startswith(WORKER_ROLE_PREFIX):
+            if not (role.startswith(WORKER_ROLE_PREFIX)
+                    or window.startswith(WINDOW_NAME_WORKER_PREFIX)):
                 continue  # legacy rule: role-less / non-worker panes skipped
             rec = {"pane": pane, "bead": bead, "status": status}
         elif cls == "worker":
@@ -570,8 +615,8 @@ def reap(panes: list[str], socket: str | None, run=_runner, capture=None) -> lis
                 text = text[:_PENDING_TEXT_LOG_LIMIT] + "…[truncated]"
             sys.stderr.write(
                 f"sable-worker-status: pane {pane} is done but holds unsubmitted "
-                f"composer input — clearing + flagging before reap "
-                f"(market-brief-package-0h8k): pending text={text!r}\n")
+                f"composer input — clearing + flagging before reap: "
+                f"pending text={text!r}\n")
             run(base + ["send-keys", "-t", pane, "C-u"])
         try:
             run(base + ["kill-pane", "-t", pane])
@@ -687,6 +732,45 @@ def filter_live_agents(panes: list[str], socket: str | None, run=None,
     return kept
 
 
+def scoped_workers(all_workers: list[dict], view_lane: str | None) -> list[dict]:
+    """The workers actually shown for `view_lane` — the same combination main()
+    applies, pulled out so it is directly testable (SABLE-h1fa7). `view_lane
+    is None` (the fleet-wide scope: --all, or an un-laned caller) returns
+    every pane unfiltered; otherwise SABLE-dcw2's filter_by_lane applies."""
+    return all_workers if view_lane is None else filter_by_lane(all_workers, view_lane)
+
+
+def scope_label(view_lane: str | None) -> str:
+    """Human-readable name for the scope actually applied to a listing —
+    'lane=<name>' or 'all-lanes'. SABLE-h1fa7: a lane-scoped answer and a
+    fleet-wide answer used to be byte-indistinguishable (the tool filters
+    panes to the caller's lane with NO indication it did so), so a
+    stranded-claim sweep reading a lane-scoped "2 panes, both mine" as
+    fleet-wide nearly released four OTHER lanes' live workers' claims. This
+    label is printed on EVERY invocation, default path included — the same
+    announce-your-provenance discipline sable-spawn-worker already applies to
+    model selection."""
+    return f"lane={view_lane}" if view_lane is not None else "all-lanes"
+
+
+def scope_summary(view_lane: str | None, shown: int, total: int) -> str:
+    """The self-describing scope line (SABLE-h1fa7): names the scope AND how
+    many panes it did NOT show, so a lane-scoped result can never again be
+    read as a complete fleet-wide one — the hidden count is the fact that
+    would have told the stranded-claim sweep four workers were running
+    ELSEWHERE instead of nowhere. `total` is the unfiltered all_workers count;
+    `shown` is the post-scope count actually listed. A fleet-wide scope
+    (view_lane is None) hides nothing by construction, so no count is
+    appended — asserted by test_scope_summary_fleet_wide_reports_no_hidden_count
+    as a control that this isn't just always-on boilerplate."""
+    if view_lane is None:
+        return f"scope: {scope_label(view_lane)} ({shown} worker pane(s))"
+    hidden = total - shown
+    hidden_note = (f", {hidden} hidden in other lane(s) (--all to see the fleet)"
+                   if hidden else "")
+    return f"scope: {scope_label(view_lane)} ({shown} shown{hidden_note})"
+
+
 def resolve_view_lane(ns) -> str | None:
     """The lane to scope the listing/reap to (SABLE-dcw2), or None for the
     fleet-wide view. --all => None; --lane <name> => that name; otherwise (the
@@ -749,9 +833,13 @@ def main(argv: list[str] | None = None) -> int:
     # honest (SABLE-1g8i): 'no worker panes' when THIS lane has none but others
     # are busy false-empties the fleet.
     view_lane = resolve_view_lane(ns)
-    workers = filter_by_lane(all_workers, view_lane) if view_lane is not None else all_workers
+    workers = scoped_workers(all_workers, view_lane)
     workers = flag_rate_limit_stalls(workers, socket)
     dnd_panes = {w["pane"] for w in done_no_deliverable(workers)}
+    # SABLE-h1fa7: the scope actually applied, and how many panes it did NOT
+    # show, computed BEFORE anything prints — on every invocation, not just
+    # the already-empty case empty_worker_message covers.
+    scope_line = scope_summary(view_lane, len(workers), len(all_workers))
 
     # SABLE-axp0: the fleet-wide dialog/overlay liveness probe. It is INTENTIONALLY
     # NOT scoped to view_lane and INTENTIONALLY spans managers: the motivating
@@ -763,8 +851,15 @@ def main(argv: list[str] | None = None) -> int:
     dialog_stalls = flag_dialog_stalls(list_fleet_panes(socket, session=session), socket)
 
     if ns.json:
-        print(json.dumps({"workers": workers, "dialog_stalls": dialog_stalls}, indent=2))
+        scope_meta = {
+            "lane": view_lane,
+            "shown": len(workers),
+            "hidden": (len(all_workers) - len(workers)) if view_lane is not None else 0,
+        }
+        print(json.dumps({"scope": scope_meta, "workers": workers,
+                          "dialog_stalls": dialog_stalls}, indent=2))
     else:
+        print(scope_line)
         if not workers:
             print(empty_worker_message(view_lane, all_workers))
         for w in workers:

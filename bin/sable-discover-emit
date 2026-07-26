@@ -17,6 +17,14 @@ Triage JSON:
      {"title": "...", "verdict": "go|reshape", "rationale": "...",
       "epic_intention": "SABLE-xxx", "charter": {<charter section fields>}},
      {"title": "...", "verdict": "no-go", "rationale": "..."}]}
+
+Charters + the decision record are committed markdown (see sable_charter_lib's
+module docstring); a repo that gitignores .claude/ wholesale would otherwise
+swallow them silently. The result JSON's "warnings" key (present only if
+non-empty) carries any gitignore fix-it text sable_charter_lib.
+ensure_charter_committable couldn't auto-clear (SABLE-lavb) — surfaced here,
+not just to stderr, since callers of this script parse stdout JSON and may
+never see stderr.
 """
 from __future__ import annotations
 
@@ -35,7 +43,7 @@ _MANAGED = ("slug", "title", "epic_intention", "decision_record")
 def emit(triage: dict, base: str | None = None) -> dict:
     session = triage["session"]
     decision_slug = f"{lib.slugify(session)}-decisions"
-    candidates, survivors, nogos = [], [], []
+    candidates, survivors, nogos, warnings = [], [], [], []
     for cand in triage.get("candidates", []):
         title = cand["title"]
         verdict = cand["verdict"]
@@ -48,9 +56,12 @@ def emit(triage: dict, base: str | None = None) -> dict:
             slug = lib.slugify(title)
             fields = {k: v for k, v in (cand.get("charter") or {}).items()
                       if k not in _MANAGED}
-            lib.write_charter(
+            charter_path = lib.write_charter(
                 lib.Charter(slug=slug, title=title, epic_intention=epic,
                             decision_record=decision_slug, **fields), base)
+            warn = lib.ensure_charter_committable(charter_path)
+            if warn:
+                warnings.append(warn)
             survivors.append(slug)
         else:
             nogos.append(title)
@@ -59,12 +70,18 @@ def emit(triage: dict, base: str | None = None) -> dict:
     decision_path = lib.write_decision_record(
         lib.DecisionRecord(session=session, title=triage.get("title"),
                            created=triage.get("created"), candidates=candidates), base)
-    return {
+    warn = lib.ensure_charter_committable(decision_path)
+    if warn:
+        warnings.append(warn)
+    result = {
         "survivors": survivors,
         "nogos": nogos,
         "decision": str(decision_path),
         "charters": {s: str(lib.charters_dir(base) / f"{s}.md") for s in survivors},
     }
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 def main(argv=None):

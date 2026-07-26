@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""sable-screen — the two manager pre-dispatch/pre-close safety screens,
+mechanized (SABLE-23upx).
+
+CONTEXT
+-------
+The optimus shift report (SABLE-1eeg7 sections 3 and 4a) carries two
+mandatory screens as PROSE ALGORITHMS that every manager recycle re-authors
+from scratch: a pre-dispatch collision check and a pre-close hold sweep. The
+algorithm is durable; the implementation is not, and each re-implementation
+is a fresh chance to get it wrong. It already has: the first hold-sweep
+re-author used bare `git rev-parse origin/<branch>`, which ECHOES the
+literal ref string back to stdout for a ref that does not exist (failure
+shows up only in the exit status / stderr), so every branch that had already
+landed and been reaped resolved to a truthy, plausible-looking string. The
+sweep reported 300 of 309 closed beads as NEEDS HOLD while simultaneously
+printing "landed: 0" — caught only because that number contradicted two
+facts (SABLE-be4lo.1, SABLE-be4lo.6) the operator had independently verified
+minutes earlier. A screen that reports 300 findings and one that reports 6
+look equally "working" without an independent fact to check the output
+against.
+
+CONTRACT
+--------
+dispatch <bead-id> [<bead-id> ...]
+  The screen-v2 collision check. Occupant set is built TWO ways — a
+  declaration-only screen is blind to the second:
+    (a) every OTHER in_progress bead's declared writes (metadata.wip_claims /
+        metadata.footprint_writes, read DIRECTLY — see "NO PROSE FALLBACK").
+    (b) every origin wk-* branch NOT contained in the integration branch,
+        using its ACTUAL git-diffed changed files, never any declaration
+        (SABLE-krbxd: this is the only leg that catches undeclared
+        collateral edits — a declaration-only screen cannot see them).
+  Each candidate's own declared writes are checked against the union of both
+  occupant sets, excluding the candidates themselves from leg (a). A
+  candidate that declares no footprint at all gets the distinct
+  NO-DECLARATION verdict (SABLE-e2ic3 / SABLE-tm8nl: 96.4% of the open pool
+  declares nothing, and "checked, found no overlap" must stay
+  distinguishable from "nothing to check with") — it is neither CLEAR nor
+  COLLIDES, and it still dispatches: a screen that can never release a
+  no-declaration bead is exactly as broken as one that can never deny a real
+  collision.
+
+holds
+  The hold sweep. Any CLOSED bead whose metadata.branch still exists on
+  origin AND is NOT contained in the integration branch MUST carry all four
+  hold fields (hold, hold_by, hold_since, hold_until) — SABLE-zvx4i, the
+  stranded-branch class a missing hold makes invisible to the ready pool,
+  the lane record, and the merge seat all at once.
+  THE FIX: containment is decided from `git rev-parse --verify --quiet
+  "origin/<branch>^{commit}"`, whose EMPTY stdout means "no such ref" and
+  whose non-empty stdout is a real commit SHA. A branch with no ref on
+  origin is reported as reaped-or-unpushed, never as needing a hold — this
+  tool exists so that failure mode is structurally avoided rather than
+  merely documented in a shift report.
+
+NO PROSE FALLBACK (intentional — do not add one)
+-------------------------------------------------
+Both screens read metadata.wip_claims / metadata.footprint_writes and STOP.
+An earlier prototype of the dispatch screen fell back to parsing a bead's
+'## File footprint' prose section when metadata was absent, and that
+fallback manufactured junk tokens ("bin/sable-spawn-worker's",
+"bin/sable-merge-gate:295") that do not exist anywhere in the stored
+claims — a false "the corpus is corrupted" signal that was actually the
+parser's own artifact (same class as SABLE-r5pfw: mentioning something is
+not the same as it being true). A bead with no structured declaration gets
+NO-DECLARATION here, never a best-effort guess reconstructed from prose.
+
+LIMIT 0
+-------
+Every `bd list` call passes --limit 0 explicitly (SABLE-52aym: a bare `bd
+list` truncates at 50 SILENTLY, and a truncated occupant set or closed-bead
+set fails in the RELEASING direction — exactly the direction a safety
+screen must never fail in).
+
+Usage:
+  sable-screen dispatch <bead-id> [<bead-id> ...] [--repo DIR] [--format text|json]
+  sable-screen holds [--repo DIR] [--format text|json]
+
+Exit codes:
+  dispatch: 0 clear/no-declaration for every candidate, 1 at least one
+            COLLIDES, 2 a candidate bead id could not be read at all.
+  holds:    0 no NEEDS-HOLD findings, 1 at least one.
+
+Env overrides (test seams, mirroring SABLE_CONTAINED_GIT / SABLE_MG_GIT):
+  SABLE_SCREEN_GIT   git binary/wrapper (default: git)
+  SABLE_SCREEN_BD    bd binary/wrapper (default: bd)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from dataclasses import dataclass, field
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+import sable_gate_git_lib as git_lib  # noqa: E402
+
+HOLD_FIELDS = ("hold", "hold_by", "hold_since", "hold_until")
+
+# dispatch verdicts
+NO_DECLARATION = "no-declaration"
+CLEAR = "clear"
+COLLIDES = "collides"
+
+# hold-sweep verdicts
+NEEDS_HOLD = "needs-hold"
+HELD_OK = "held-ok"
+LANDED_CLEAN = "landed"
+LANDED_STALE_HOLD = "landed-stale-hold"
+REAPED_OR_UNPUSHED = "reaped-or-unpushed"
+UNRESOLVED = "unresolved"
+
+
+# --- process boundary --------------------------------------------------------
+
+def _git(repo: str, *args: str) -> subprocess.CompletedProcess:
+    """Never raises: a missing/misconfigured git is an UNRESOLVED verdict
+    here, not a traceback. Overridable via SABLE_SCREEN_GIT so tests can
+    inject a faulty git for fault-injection coverage (mirrors
+    sable-contained's SABLE_CONTAINED_GIT seam)."""
+    tool = os.environ.get("SABLE_SCREEN_GIT", "git").split()
+    try:
+        return subprocess.run(tool + list(args), cwd=repo, text=True,
+                              capture_output=True)
+    except OSError as exc:
+        return subprocess.CompletedProcess(list(args), 127, "", str(exc))
+
+
+def _bd(repo: str, *args: str) -> subprocess.CompletedProcess:
+    tool = os.environ.get("SABLE_SCREEN_BD", "bd").split()
+    try:
+        return subprocess.run(tool + list(args), cwd=repo, text=True,
+                              capture_output=True)
+    except OSError as exc:
+        return subprocess.CompletedProcess(list(args), 127, "", str(exc))
+
+
+def _bd_json(repo: str, *args: str) -> list | None:
+    """`bd ... --json` -> a list of records, or None on any failure (bad
+    exit, empty stdout, unparseable JSON). Callers treat None exactly like
+    "nothing came back" — never as a silent empty-list success, since a
+    caller that cannot tell "zero records" from "bd is broken" is how a
+    truncated read gets mistaken for a clean one."""
+    cp = _bd(repo, *args)
+    if cp.returncode != 0 or not cp.stdout.strip():
+        return None
+    try:
+        data = json.loads(cp.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(data, list):
+        return data
+    return [data]
+
+
+# --- metadata declaration reading (NO prose fallback, by design) -----------
+
+def declared_writes_from_metadata(metadata: dict) -> tuple[bool, frozenset]:
+    """(declared, files).
+
+    `declared` is False ONLY when NEITHER wip_claims NOR footprint_writes is
+    a key in `metadata` at all — the distinct NO-DECLARATION case
+    (SABLE-e2ic3 / SABLE-tm8nl). When either key IS present, even with an
+    empty/blank value, `declared` is True: a present-but-empty declaration is
+    a real "declares nothing" answer and must stay distinguishable from an
+    absent one, the same trichotomy this codebase already applies elsewhere
+    (sable_footprint_lib._metadata_entries). `files` is the union of
+    whatever both keys parse to when more than one is present.
+
+    There is deliberately NO fallback to parsing a bead's '## File
+    footprint' prose section here — see the module docstring's "NO PROSE
+    FALLBACK" section for why."""
+    meta = metadata or {}
+    present = [k for k in ("wip_claims", "footprint_writes") if k in meta]
+    if not present:
+        return False, frozenset()
+    files: set[str] = set()
+    for key in present:
+        raw = meta.get(key) or ""
+        files.update(p.strip() for p in raw.split(",") if p.strip())
+    return True, frozenset(files)
+
+
+# --- pure dispatch-screening logic -------------------------------------------
+
+@dataclass(frozen=True)
+class ScreenVerdict:
+    bead_id: str
+    verdict: str
+    declared_files: frozenset = frozenset()
+    hits: dict = field(default_factory=dict)
+
+
+def screen_candidate(bead_id: str, declared: bool, files: frozenset,
+                      occupants: dict) -> ScreenVerdict:
+    """The pure collision decision. `occupants` is {label: frozenset(paths)}
+    built from BOTH occupant legs, already excluding this dispatch's own
+    bead id(s) from leg (a)."""
+    if not declared:
+        return ScreenVerdict(bead_id, NO_DECLARATION)
+    hits = {label: tuple(sorted(files & occ_files))
+            for label, occ_files in occupants.items() if files & occ_files}
+    verdict = COLLIDES if hits else CLEAR
+    return ScreenVerdict(bead_id, verdict, files, hits)
+
+
+def in_progress_occupants(beads: list, exclude_ids) -> dict:
+    """Occupant leg (a): every OTHER in_progress bead's declared writes. A
+    bead that itself declares nothing does not occupy anything — that is a
+    fact about occupancy (nothing to collide with), orthogonal to whether a
+    CANDIDATE declares nothing (which is reported, never silently CLEAR)."""
+    exclude = set(exclude_ids)
+    occ: dict[str, frozenset] = {}
+    for b in beads:
+        bid = b.get("id") or ""
+        if not bid or bid in exclude:
+            continue
+        _, files = declared_writes_from_metadata(b.get("metadata") or {})
+        if files:
+            occ[f"in_progress:{bid}"] = files
+    return occ
+
+
+# --- git-plumbing primitives (each pinned by a unit test against real git) --
+
+def resolve_ref(repo: str, ref: str) -> str:
+    """`git rev-parse --verify --quiet "<ref>^{commit}"` -> "" when
+    unresolvable, a commit SHA otherwise.
+
+    THE FIX this whole bead exists for: the bare form `git rev-parse <ref>`
+    ECHOES the literal ref string back to stdout when <ref> does not exist,
+    reporting failure ONLY through the exit status. A caller that reads
+    stdout as the answer without checking rc sees a non-empty, plausible
+    string for a branch that landed and was reaped months ago. --verify
+    --quiet instead answers with EMPTY stdout for an unresolvable ref, which
+    is the only thing every caller in this file treats as "no such ref"."""
+    cp = _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    return cp.stdout.strip() if cp.returncode == 0 else ""
+
+
+def is_ancestor(repo: str, sha: str, ancestor_of: str):
+    """`git merge-base --is-ancestor <sha> <ancestor_of>` -> True (sha IS
+    contained), False (sha is NOT contained), or None (unresolved — bad ref
+    or git failure; never guessed at as either verdict). The argument order
+    is fixed at this single call site rather than accepted from a caller, so
+    the SABLE-gdp05 inversion class of bug has nowhere to enter here."""
+    cp = _git(repo, "merge-base", "--is-ancestor", sha, ancestor_of)
+    if cp.returncode == 0:
+        return True
+    if cp.returncode == 1:
+        return False
+    return None
+
+
+def branch_diff_files(repo: str, base: str, tip: str) -> frozenset:
+    cp = _git(repo, "diff", "--name-only", base, tip)
+    if cp.returncode != 0:
+        return frozenset()
+    return frozenset(p for p in cp.stdout.splitlines() if p.strip())
+
+
+def wk_branch_occupants(repo: str, integration_ref: str) -> dict:
+    """Occupant leg (b): every origin wk-* branch NOT contained in the
+    integration branch, keyed by its ACTUAL git-diffed changed files —
+    ground truth, never a declaration. This is the leg a declaration-only
+    screen cannot see (SABLE-krbxd: undeclared collateral edits)."""
+    occ: dict[str, frozenset] = {}
+    refs_cp = _git(repo, "for-each-ref", "--format=%(refname:short)",
+                    "refs/remotes/origin/wk-*")
+    if refs_cp.returncode != 0:
+        return occ
+    for ref in refs_cp.stdout.splitlines():
+        ref = ref.strip()
+        if not ref:
+            continue
+        tip = resolve_ref(repo, ref)
+        if not tip:
+            continue  # gone from origin between the listing and the probe
+        contained = is_ancestor(repo, tip, integration_ref)
+        if contained:
+            continue  # landed — not an occupant
+        base_cp = _git(repo, "merge-base", integration_ref, tip)
+        base = base_cp.stdout.strip() if base_cp.returncode == 0 else integration_ref
+        branch_name = ref[len("origin/"):] if ref.startswith("origin/") else ref
+        files = branch_diff_files(repo, base, tip)
+        if files:
+            occ[f"branch:{branch_name}"] = files
+    return occ
+
+
+def hold_verdict_for_bead(repo: str, integration_ref: str, branch: str,
+                          metadata: dict):
+    """(verdict, fields) for one closed bead's branch.
+
+    verdict is one of REAPED_OR_UNPUSHED, NEEDS_HOLD, HELD_OK, LANDED_CLEAN,
+    LANDED_STALE_HOLD, UNRESOLVED. `fields` is the missing-fields tuple for
+    NEEDS_HOLD, the present-fields tuple for LANDED_STALE_HOLD, and empty
+    otherwise.
+
+    THE REAPED-BRANCH REGRESSION this function is the fix for: resolve_ref
+    (not a bare rev-parse) decides whether the branch exists on origin at
+    all, BEFORE any containment question is asked. A branch with no ref on
+    origin is REAPED_OR_UNPUSHED — never NEEDS_HOLD — regardless of what its
+    metadata does or does not carry."""
+    tip = resolve_ref(repo, f"origin/{branch}")
+    if not tip:
+        return REAPED_OR_UNPUSHED, ()
+    contained = is_ancestor(repo, tip, integration_ref)
+    if contained is None:
+        return UNRESOLVED, ()
+    meta = metadata or {}
+    if contained:
+        present = tuple(f for f in HOLD_FIELDS if meta.get(f))
+        return (LANDED_STALE_HOLD if present else LANDED_CLEAN), present
+    missing = tuple(f for f in HOLD_FIELDS if not meta.get(f))
+    return (NEEDS_HOLD if missing else HELD_OK), missing
+
+
+# --- bd-touching orchestration ------------------------------------------------
+
+def build_occupants(repo: str, integration_ref: str, exclude_ids) -> dict:
+    occ: dict[str, frozenset] = {}
+    in_progress = _bd_json(repo, "list", "--status", "in_progress", "--json",
+                          "--limit", "0") or []
+    occ.update(in_progress_occupants(in_progress, exclude_ids))
+    occ.update(wk_branch_occupants(repo, integration_ref))
+    return occ
+
+
+def run_dispatch(repo: str, bead_ids: list) -> tuple[list, str]:
+    integration_branch = git_lib.resolve_integration_branch(repo)
+    integration_ref = f"origin/{integration_branch}"
+    occupants = build_occupants(repo, integration_ref, set(bead_ids))
+
+    results = []
+    for bid in bead_ids:
+        record = _bd_json(repo, "show", bid, "--json")
+        if not record:
+            results.append({"bead_id": bid, "verdict": "not-found",
+                            "declared_files": [], "hits": {}})
+            continue
+        bead = record[0]
+        declared, files = declared_writes_from_metadata(bead.get("metadata") or {})
+        verdict = screen_candidate(bid, declared, files, occupants)
+        results.append({
+            "bead_id": bid,
+            "title": (bead.get("title") or "")[:80],
+            "verdict": verdict.verdict,
+            "declared_files": sorted(verdict.declared_files),
+            "hits": verdict.hits,
+        })
+    return results, integration_ref
+
+
+def run_holds(repo: str) -> tuple[list, str]:
+    integration_branch = git_lib.resolve_integration_branch(repo)
+    integration_ref = f"origin/{integration_branch}"
+    closed = _bd_json(repo, "list", "--status", "closed", "--json",
+                      "--limit", "0") or []
+
+    results = []
+    for b in closed:
+        meta = b.get("metadata") or {}
+        branch = meta.get("branch")
+        if not branch:
+            continue
+        verdict, fields_ = hold_verdict_for_bead(repo, integration_ref, branch, meta)
+        results.append({"bead_id": b.get("id"), "branch": branch,
+                        "verdict": verdict, "fields": list(fields_)})
+    return results, integration_ref
+
+
+# --- rendering ----------------------------------------------------------------
+
+_DISPATCH_ICON = {NO_DECLARATION: "⚠", CLEAR: "✓", COLLIDES: "✗"}
+
+
+def render_dispatch_text(results: list, integration_ref: str) -> str:
+    lines = [f"integration ref: {integration_ref}", ""]
+    for r in results:
+        if r["verdict"] == "not-found":
+            lines.append(f"{r['bead_id']}: NOT FOUND")
+            lines.append("")
+            continue
+        icon = _DISPATCH_ICON[r["verdict"]]
+        lines.append(f"{icon} {r['bead_id']} [{r['verdict'].upper()}] {r.get('title', '')}")
+        if r["verdict"] == NO_DECLARATION:
+            lines.append("    NO DECLARED FOOTPRINT (SABLE-e2ic3: distinct from CLEAR)")
+        elif r["declared_files"]:
+            lines.append(f"    declares: {', '.join(r['declared_files'])}")
+        for label, shared in r.get("hits", {}).items():
+            lines.append(f"    ↳ {label}: {', '.join(shared)}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def render_holds_text(results: list, integration_ref: str) -> str:
+    needs = [r for r in results if r["verdict"] == NEEDS_HOLD]
+    other = [r for r in results if r["verdict"] != NEEDS_HOLD]
+    lines = [
+        f"integration ref: {integration_ref}",
+        f"closed beads with a branch: {len(results)}",
+        "",
+        f"*** NEEDS HOLD ({len(needs)}) ***",
+    ]
+    for r in needs:
+        lines.append(f"  {r['bead_id']:18s} {r['branch']:32s} missing: {','.join(r['fields'])}")
+    if not needs:
+        lines.append("  none")
+    lines.append("")
+    lines.append(f"other ({len(other)}):")
+    for r in other:
+        note = ""
+        if r["verdict"] == LANDED_STALE_HOLD:
+            note = f" (landed but still holds {','.join(r['fields'])})"
+        lines.append(f"  {r['bead_id']:18s} {r['branch']:32s} {r['verdict']}{note}")
+    return "\n".join(lines)
+
+
+# --- CLI -----------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sable-screen",
+        description="The two manager pre-dispatch/pre-close safety screens, "
+                     "mechanized so they survive a recycle (SABLE-23upx).",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    d = sub.add_parser("dispatch", help="pre-dispatch collision screen")
+    d.add_argument("bead_ids", nargs="+", metavar="BEAD-ID")
+    d.add_argument("--repo", default=os.getcwd())
+    d.add_argument("--format", choices=["text", "json"], default="text")
+
+    h = sub.add_parser("holds", help="pre-close hold sweep")
+    h.add_argument("--repo", default=os.getcwd())
+    h.add_argument("--format", choices=["text", "json"], default="text")
+
+    return parser
+
+
+def main(argv: list | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    repo = os.path.abspath(args.repo)
+
+    if args.cmd == "dispatch":
+        results, integration_ref = run_dispatch(repo, args.bead_ids)
+        if args.format == "json":
+            print(json.dumps({"integration_ref": integration_ref, "results": results}, indent=2))
+        else:
+            print(render_dispatch_text(results, integration_ref))
+        if any(r["verdict"] == "not-found" for r in results):
+            return 2
+        return 1 if any(r["verdict"] == COLLIDES for r in results) else 0
+
+    results, integration_ref = run_holds(repo)
+    if args.format == "json":
+        print(json.dumps({"integration_ref": integration_ref, "results": results}, indent=2))
+    else:
+        print(render_holds_text(results, integration_ref))
+    return 1 if any(r["verdict"] == NEEDS_HOLD for r in results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

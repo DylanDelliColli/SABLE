@@ -14,7 +14,7 @@ green — it promotes the same commit object it tested.
        git merge-tree --write-tree <base> <branch>   -> merged tree (exit 1 = conflict -> exit 22, delegate)
        git commit-tree <tree> -p <base> -p <branch>   -> preview commit
   3. push the preview commit to  ci-verify/<bead>-<previewsha7>
-  4. wait for the Actions run keyed to the preview commit SHA
+  4. READ the verdict for the preview SHA; wait only if there isn't one yet
   5. GREEN  -> push the SAME object to the integration branch (fast-forward),
      then assert remote base tip SHA == preview SHA (integrity; exit 4 if not).
      Delete the ci-verify ref, append evidence to the bead.
@@ -31,6 +31,110 @@ green — it promotes the same commit object it tested.
      bead). NEVER fall back to a local suite run (ayzv-class env brittleness).
      Exit 21.
 
+── MODULE LAYOUT (SABLE-jd5fj.3) ────────────────────────────────────────────
+This file is the CLI. The gate itself lives in three modules beside it, in
+dependency order (a DAG — nothing imports "upward"):
+
+  sable_gate_classify_lib.py   PURE. Ref naming, the shared idempotency key, the
+                               sweep age predicate, and the exit-code taxonomy:
+                               what an Actions conclusion MEANS and which code
+                               that meaning carries. No I/O at all.
+  sable_gate_git_lib.py        The subprocess seam: SABLE_MG_GIT/_GH/_BD/_NOTIFY,
+                               `_git`, and repo-identity resolution.
+  sable_gate_preview_lib.py    Builds previews, kicks ci-verify refs, READS
+                               verdicts, sweeps orphans. Never promotes.
+  sable_gate_promote_lib.py    Consumes a verdict and promotes (or refuses).
+                               The only writer to the integration branch.
+  sable_gate_budget_lib.py     Per-tier duration budget breach detection +
+                               idempotent bead filing (SABLE-cmar4.4). Called
+                               by promote, wrapped around the acquire_verdict
+                               call — the one place the gate's own wall-clock
+                               for the merge_preview tier is observable.
+  sable_footprint_lib.py       Changed-path footprints and the disjointness
+                               test (SABLE-jd5fj.4). Evidence only — it decides
+                               nothing about a promotion.
+  sable_snapshot_lib.py        The green snapshot's classifier + freeze/
+                               quarantine state (SABLE-jd5fj.5). promote reads
+                               its freeze flag as the FIRST thing it does and
+                               refuses with exit 25 — a mechanical deny path,
+                               not a convention. Nothing here imports the gate
+                               back; see bin/sable-snapshot for the runner.
+  sable_coverage_floor_lib.py  PURE detection + decision (pruning-diff
+                               detection, named-override parsing, the
+                               allow/deny table) plus the one I/O function that
+                               shells out to .github/ci/diff-cover-gate.sh in a
+                               throwaway worktree (SABLE-cmar4.5). promote
+                               reads it right after the freeze check and
+                               refuses with exit 27 — same mechanical-deny
+                               shape as the freeze, one bead later.
+
+── OPTIMISTIC DISJOINT PROMOTION (SABLE-jd5fj.4) ────────────────────────────
+When the base moves between a preview and its promote, the CI-green object is
+no longer what would land. Before jd5fj.4 that was always exit 23: rebuild and
+re-gate through a full CI cycle. Now the gate asks a second question first — are
+the base-move's changed paths DISJOINT from the branch's? — and if they are, it
+re-verifies the REAL COMBINED TREE with the cmar4 impact tier instead of a full
+re-preview. Green promotes that combined object; red ejects on exit 20; an
+impact tier that cannot answer falls back to exit 23.
+
+That path is entered from an ADOPTION MISS too (SABLE-kzi1a), not only from a
+base that moved mid-gate. Chuck promotes SERIALLY and is the only writer to the
+integration branch, so the base cannot move DURING a promote — the mid-gate entry
+is unreachable in the real operating model (measured: 0 optimistic promotions in
+157, and 0 across a 15-worker burst that queued 11 branches). What the queue does
+produce is the same situation one step earlier: each merge moves the base and
+invalidates the push-time preview of every branch still queued, so the next
+promote finds a COMPLETED GREEN run for a preview whose base has moved. It now
+takes that to the same decision — same footprint computation, same mandatory
+impact tier on the real combined tree — instead of discarding the green run and
+paying for a fresh one. When the assessment does not license the cheap path, the
+promote simply builds a preview the pre-kick way, which is what it did before.
+
+Disjointness is NECESSARY, NEVER SUFFICIENT (locked contract SABLE-djopw):
+file-disjoint changes break each other semantically all the time, so a disjoint
+verdict buys a CHEAPER re-test, never a skipped one. Footprints follow renames,
+INCLUDE deletions, treat lockfiles and committed generated artifacts as
+non-disjoint sentinels, and are widened (never narrowed) by the bead's declared
+footprint. Two invariants are enumerated exhaustively in
+bin/test_promote_decision.py: no promote path where the base moved and the
+footprints are not proven disjoint and nothing re-verified; and every promotion
+pushes exactly the object some verifier attested. SABLE_MG_OPTIMISTIC=0 restores
+the pre-jd5fj.4 behaviour exactly.
+
+The split was made because this file had grown into a god-module carrying a
+safety-critical write path (locked smell risk, relates SABLE-hhw7t), and because
+the parallel-preview flow needs a VERDICT to be a value that can be computed at
+push time and consumed later — not a side effect reachable only by running
+promote end to end. Module boundaries are asserted, not just described:
+bin/test_merge_gate_modules.py fails if promote logic reappears in the preview
+module or if the taxonomy drifts.
+
+PATCHING NOTE for tests: the seams live in the module that DEFINES them. Patch
+`sable_gate_git_lib._git`, not a re-export here — every module calls the seams
+module-qualified precisely so one patch reaches the whole gate. The private
+seams are deliberately NOT re-exported below, so that a patch aimed at the wrong
+object fails loudly (AttributeError) instead of silently doing nothing.
+
+── PER-TIER DURATION BUDGET (SABLE-cmar4.4) ─────────────────────────────────
+promote measures its own wall-clock spent reading/waiting for the verdict
+(sable_gate_preview_lib.acquire_verdict) and checks it against the
+merge_preview tier's budget declared in .github/ci/test-tiers.sh (the cmar4.1
+SSOT). This is a per-TIER-TOTAL measurement, never per-test (locked,
+split-invariant): splitting a slow suite into faster pieces cannot evade a
+breach, only reducing the tier's real total can. A breach WARNs on stderr and
+auto-files exactly ONE suite-optimization bead via sable_gate_budget_lib,
+idempotent on (tier, budget_sec) — the budget value doubles as its own
+version, so bumping the SSOT's number for a tier is what a "version bump"
+IS, and re-runs against an unedited, still-open breach file nothing new. Never
+blocks or fails a promotion; an unresolvable budget silently skips the check.
+
+── PARALLEL PREVIEWS ────────────────────────────────────────────────────────
+N previews on N distinct ci-verify/<bead>-<sha7> refs run CONCURRENTLY:
+ci-verify.yml's concurrency group is `ci-verify-${{ github.ref }}`, so distinct
+refs are distinct groups and cancel-in-progress never reaches across them. The
+ceiling is GitHub's 20 concurrent jobs per account — beyond that previews QUEUE
+(latency), they do not fail. hooks/test/test-parallel-previews.sh pins both.
+
 Base resolution is ALWAYS fully qualified (refs/remotes/<remote>/<branch> via
 `git rev-parse --verify`); bare `origin/<branch>` is refused because a stray
 local branch named `origin` makes it ambiguous (SABLE-92kc-adjacent).
@@ -42,6 +146,15 @@ ref whose Actions run is still in-flight, however old the ref's commit date —
 deleting the ref cancels the run, which is exactly the spurious-RED failure
 SABLE-sc24 exists to prevent.
 
+`sweep --dry-run` (SABLE-o9b8u) reports the exact candidate list — same age
+filter, same in-flight exclusion — WITHOUT deleting anything. The default's
+safety is a function of how recently the sweep last ran and the command has no
+memory of that: an identical --max-age-hours 6 deletes 3 refs run daily and 232
+after a multi-day gap, and nothing about the command distinguishes those cases
+before it acts on the shared remote. --dry-run is the look-before-you-leap.
+Both dry and real runs report the candidate COUNT and age span BEFORE any
+deletion is attempted.
+
 Prior art: the throwaway-branch pattern from the 754r verification (ci-verify-754r).
 
 Usage:
@@ -49,8 +162,53 @@ Usage:
                            [--repo <path>] [--remote <name>] [--manager <name>]
                            [--override <reason>]   # actions-down human bypass ONLY,
                                                     # reason recorded; never for a known-red
-  sable-merge-gate sweep   [--max-age-hours N] [--repo <path>] [--remote <name>]
+  sable-merge-gate preview --branch <worker-branch> [--base <branch>]
+                           [--repo <path>] [--remote <name>]
+  sable-merge-gate verdict --branch <worker-branch> [--base <branch>] [--json]
+                           [--repo <path>] [--remote <name>]
+  sable-merge-gate sweep   [--max-age-hours N] [--dry-run] [--repo <path>] [--remote <name>]
+  sable-merge-gate promote-budget [--json | --seconds]
+  sable-merge-gate impact-tier-phases [--repo <path>] [--json]
   sable-merge-gate --help
+
+`promote-budget` (SABLE-w0zjm) exists for the code that WRAPS this one. A promote
+may legitimately spend an impact-tier queue wait PLUS the tier's own budget, so
+any enclosing `timeout` must be derived from that sum rather than copied — the
+copy was 900s at the merge seat, the same number as the tier budget, sized back
+when the tier essentially never ran.
+
+`impact-tier-phases` (SABLE-mbkbm) reports where the impact tier's OWN
+wall-clock actually goes — setup, each shell suite by name, the pytest half —
+from the per-phase journal run_impact_tier writes. Exists because jd5fj.8 was
+dispatched on an assumed cost centre (the cold-testmon pytest fallback) that,
+measured, turned out to save ~2% on its own footprint; this is the instrument
+so the next such call is a measurement, not another assumption.
+
+The `preview` entrypoint (SABLE-jd5fj.1) is the KICK half of promote: it builds
+the merge-preview commit and pushes the ci-verify ref — and then RETURNS, at
+once, without waiting for the Actions run. hooks/multi-manager/post-push-merge-
+notify.sh fires it in the background on a confirmed worker push, so the verdict
+is already computing by the time Chuck wakes to merge.
+
+The `verdict` entrypoint (SABLE-jd5fj.3) is the READ half: it reports what CI
+already concluded about merging <branch> onto <base> — green / red / retry /
+pending / none — in ONE API call, without building, pushing, waiting, or
+promoting. It is the first step of Chuck's flow (read-verdict -> sequence ->
+promote): read N verdicts for N workers' concurrent previews, sequence the green
+ones into the serialized promote lane, leave the rest. `promote` then consumes
+that same stored verdict in seconds instead of constructing and waiting.
+
+The kick and promote meet at a SHARED IDEMPOTENCY KEY (preview_kick_ref): the
+kicked ref is named from the (base_sha, branch_sha) pair, NOT from the
+nondeterministic preview commit's own SHA (commit-tree stamps a committer date,
+so rebuilding the same merge twice yields two different SHAs — and two different
+refs, i.e. two CI runs). Because the key is a pure function of the two parents,
+promote can look for an already-kicked ref and ADOPT it instead of building a
+second preview: same parents => same merge result, and the object it promotes is
+still byte-identical to the object CI tested. Adoption is a pure optimization —
+it verifies the kicked commit's parents against the freshly resolved base/branch
+SHAs and falls through to the normal build on ANY mismatch, error, or absence, so
+a stale or missing kick can never change an outcome.
 
 Base resolution (SABLE-dtp1): an explicit --base flag wins outright; else
 SABLE_MG_BASE wins; else the base is resolved via resolve_integration_branch()
@@ -66,485 +224,93 @@ is unit-testable without real git / gh / bd):
   SABLE_MG_REPO  repo path (default $PWD)                 SABLE_MG_GIT    (git)
   SABLE_MG_GH    gh command (gh)                          SABLE_MG_BD     (bd)
   SABLE_MG_NOTIFY notify command (sable-msg)              SABLE_MG_POLL   (20)
-  SABLE_MG_TIMEOUT Actions wait secs (1800)               SABLE_MG_GRACE  first-run grace secs (300)
+  SABLE_MG_TIMEOUT Actions wait secs (default: this repo's merge_preview
+                   tier budget from .github/ci/test-tiers.sh if present,
+                   else 1800 — SABLE-cmar4.1)                SABLE_MG_GRACE  first-run grace secs (300)
   SABLE_MG_SWEEP_HOURS orphan age hours (6)               SABLE_MG_GH_TIMEOUT per-gh-call secs (30, SABLE-7wyl)
+  SABLE_MG_OPTIMISTIC  1 (SABLE-jd5fj.4; 0 = every base-move is a full re-preview)
+  SABLE_MG_IMPACT_TIMEOUT per-command secs for the combined-tree impact tier (900)
+  SABLE_MG_IMPACT      impact-tier command override (testing seam; run in the
+                       combined-tree worktree with the changed paths appended)
+  SABLE_MG_IMPACT_SERIALIZE 1 (SABLE-jd5fj.13; 0 = let concurrent promotes run
+                       the local impact tier at the same time. They false-RED
+                       each other when you do — the iron-rule suites share live
+                       bd/settings/worker state. Test seam, not an operator knob.)
+  SABLE_MG_IMPACT_LOCK_TIMEOUT secs to wait for that lock (3600); giving up is an
+                       impact-tier ERROR -> full re-preview, never a promotion
+  SABLE_MG_IMPACT_LOCK path override for the lock file (default: the merge-gate
+                       state dir); SABLE_MG_IMPACT_WINDOW_LOG likewise for the
+                       tier start/end window log
 
 Exit codes:
-  0 promoted / sweep ok     2 usage        3 precondition failed
+  0 promoted / preview kicked / verdict read / sweep ok    2 usage   3 precondition failed
   20 ci red, not promoted   21 actions-down / blocked (needs --override)
   22 merge-preview conflict (delegate to author)
-  23 tip moved during gate (non-ff promote) — rebuild preview + re-gate (retry-safe)
+  23 tip moved during gate and the move was not provably disjoint (or the impact
+     tier could not answer) — rebuild preview + re-gate (retry-safe)
   24 ci-verify run cancelled mid-flight — rebuild preview + re-gate (retry-safe, SABLE-sc24)
+  25 green-snapshot FREEZE in force — the integration branch is deterministically
+     red, so NO merge promotes until a green snapshot (or a recorded
+     `sable-snapshot unfreeze`) lifts it (SABLE-jd5fj.5)
+  27 COVERAGE FLOOR — a pruning diff (removed test fn / newly-skipped test /
+     deleted test file) with no carried, passing coverage-delta check
+     (.github/ci/diff-cover-gate.sh) — needs the check to pass, or a named
+     `--coverage-override <reason>` (SABLE-cmar4.5). NOTE: 26 is reserved by
+     bin/sable-snapshot's own taxonomy (EXIT_QUARANTINED) — a DIFFERENT tool,
+     but 25/EXIT_FROZEN is deliberately shared between the two, so this picks
+     the next free number rather than reusing 26 with a different meaning.
   4 integrity abort (base tip != preview SHA after promote)
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
-import subprocess
 import sys
-import time
-from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
-# --------------------------------------------------------------------------
-# Pure helpers (unit-tested directly — no git/gh/bd required)
-# --------------------------------------------------------------------------
+import sable_footprint_lib as footprint_lib          # noqa: E402
+import sable_gate_classify_lib as classify           # noqa: E402
+import sable_gate_git_lib as git_lib                 # noqa: E402
+import sable_gate_preview_lib as preview_lib         # noqa: E402
+import sable_gate_promote_lib as promote_lib         # noqa: E402
+import sable_snapshot_lib as snapshot_lib            # noqa: E402
 
-def preview_ref_name(bead: str, preview_sha: str) -> str:
-    """Throwaway ci-verify ref for a merge-preview commit. The 7-char preview
-    SHA makes it unique per attempt (a re-push after red never collides). The
-    bead id is sanitized to the ref-safe charset so a stray slash cannot create
-    a nested ref the flat sweep listing would miss."""
-    if not preview_sha or len(preview_sha) < 7:
-        raise ValueError(f"preview_sha must be >= 7 chars, got {preview_sha!r}")
-    safe_bead = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in bead)
-    if not safe_bead.strip("-"):
-        raise ValueError(f"bead id sanitizes to empty: {bead!r}")
-    return f"ci-verify/{safe_bead}-{preview_sha[:7]}"
-
-
-def is_orphan(ref_age_seconds: float, max_age_hours: float) -> bool:
-    """True iff a ci-verify ref is old enough to sweep. Pure so the threshold
-    logic is testable without real refs or wall-clock."""
-    return ref_age_seconds > max_age_hours * 3600.0
-
-
-def qualify_remote_ref(remote: str, branch: str) -> str:
-    """Fully-qualified remote-tracking ref. Refuse anything that would resolve
-    ambiguously — callers pass a bare branch name, never 'origin/foo'."""
-    if "/" in remote:
-        raise ValueError(f"remote must be a bare name, got {remote!r}")
-    if branch.startswith("refs/") or branch.startswith(f"{remote}/"):
-        raise ValueError(f"branch must be a bare name (no refs/ or {remote}/ prefix): {branch!r}")
-    return f"refs/remotes/{remote}/{branch}"
-
-
-def resolve_integration_branch(repo: str) -> str:
-    """Python mirror of hooks/multi-manager/lib-identity.sh's
-    sable_resolve_integration_branch (bin/sable-spawn-worker:431 carries the
-    same mirror for the spawn path) — <repo>'s OWN integration branch.
-    Integration-branch identity is a property of the TARGET REPO, not the
-    caller's env, so this is consulted in the same order the pre-push hook
-    uses, first match wins:
-      1. `git -C <repo> config --get sable.integrationBranch` (repo-local, unshared)
-      2. `<repo>/.sable` file, a line `integrationBranch=<name>` (checked in, shared)
-      3. $SABLE_INTEGRATION_BRANCH (explicit env override, bare name)
-      4. $SABLE_BASE_BRANCH with a leading `origin/` stripped
-      5. "main"
-    Always returns a bare branch name (SABLE-dtp1 — without this, promote()
-    disagreed with the pre-push hook about what the integration branch is)."""
-    cfg = _git(repo, "config", "--get", "sable.integrationBranch", check=False)
-    val = cfg.stdout.strip() if cfg.returncode == 0 else ""
-    if val:
-        return val
-    sable_file = Path(repo) / ".sable"
-    if sable_file.is_file():
-        for line in sable_file.read_text().splitlines():
-            if line.startswith("integrationBranch="):
-                val = line[len("integrationBranch="):].strip()
-                if val:
-                    return val
-    val = os.environ.get("SABLE_INTEGRATION_BRANCH") or os.environ.get("SABLE_BASE_BRANCH") or "main"
-    return val[len("origin/"):] if val.startswith("origin/") else val
-
-
-def resolve_base(explicit_base: str | None, repo: str) -> str:
-    """promote()'s --base precedence (SABLE-dtp1): an explicit --base flag
-    wins outright; else SABLE_MG_BASE (this tool's own env override); else
-    fall through to resolve_integration_branch(repo) instead of a hardcoded
-    default — so an unset --base/SABLE_MG_BASE targets the SAME branch the
-    pre-push hook already resolved for this repo, not a literal
-    'llm-integration' that typically doesn't exist."""
-    return explicit_base or os.environ.get("SABLE_MG_BASE") or resolve_integration_branch(repo)
-
-
-# --------------------------------------------------------------------------
-# Command plumbing (env-seam overridable)
-# --------------------------------------------------------------------------
-
-class GateError(Exception):
-    def __init__(self, code: int, message: str):
-        super().__init__(message)
-        self.code = code
-
-
-def _tool(env_name: str, default: str) -> list[str]:
-    return os.environ.get(env_name, default).split()
-
-
-def _run(argv: list[str], *, cwd: str, check: bool = True,
-         timeout: float | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        argv, cwd=cwd, text=True, check=check, timeout=timeout,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-
-
-def _git(repo: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return _run(_tool("SABLE_MG_GIT", "git") + list(args), cwd=repo, check=check)
-
-
-def resolve_commit(repo: str, ref: str) -> str:
-    """Resolve a fully-qualified ref (or raw SHA) to a commit SHA via
-    `git rev-parse --verify <ref>^{commit}`. Raises on ambiguity/absence."""
-    cp = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False)
-    if cp.returncode != 0:
-        raise GateError(3, f"cannot resolve ref {ref!r}: {cp.stdout.strip()}")
-    return cp.stdout.strip()
-
-
-def build_preview(repo: str, base_sha: str, branch_sha: str, message: str) -> str:
-    """Build the merge-preview commit with NO working tree. Conflict -> exit 22."""
-    mt = _git(repo, "merge-tree", "--write-tree", base_sha, branch_sha, check=False)
-    if mt.returncode == 1:
-        raise GateError(22, f"merge-preview conflict between base and branch:\n{mt.stdout.strip()}")
-    if mt.returncode != 0:
-        raise GateError(3, f"merge-tree failed: {mt.stdout.strip()}")
-    tree = mt.stdout.splitlines()[0].strip()
-    ct = _git(repo, "commit-tree", tree, "-p", base_sha, "-p", branch_sha, "-m", message)
-    return ct.stdout.strip()
-
-
-# --------------------------------------------------------------------------
-# Actions polling
-# --------------------------------------------------------------------------
-
-def wait_for_ci(repo: str, ref_branch: str, preview_sha: str) -> tuple[str, str]:
-    """Poll the Actions run keyed to preview_sha on ref_branch until it completes.
-    Returns (conclusion, run_url). conclusion == 'actions_down' if no run appears
-    within SABLE_MG_GRACE. Blocks up to SABLE_MG_TIMEOUT for completion.
-
-    SABLE-7wyl: the 2026-07-16 sustained-503 outage stalled the gate mid-verify
-    despite SABLE_MG_TIMEOUT/GRACE already existing, because those are wall-clock
-    bookkeeping around each `gh run list` call — they only get to fire if the call
-    itself returns. A dead Actions API can make the `gh` subprocess hang (not just
-    error fast), and a hung call blocks this loop forever regardless of the
-    timeout math. SABLE_MG_GH_TIMEOUT bounds each individual poll call; a hang is
-    treated exactly like a fast API error (run stays undiscovered this iteration)
-    so the existing grace/timeout logic still converges to a clean actions_down/
-    timeout park instead of an unbounded hang needing a manual kill+requeue."""
-    import json
-    gh = _tool("SABLE_MG_GH", "gh")
-    poll = float(os.environ.get("SABLE_MG_POLL", "20"))
-    timeout = float(os.environ.get("SABLE_MG_TIMEOUT", "1800"))
-    grace = float(os.environ.get("SABLE_MG_GRACE", "300"))
-    gh_timeout = float(os.environ.get("SABLE_MG_GH_TIMEOUT", "30"))
-    waited = 0.0
-    seen_run = False
-    while True:
-        try:
-            cp = _run(gh + ["run", "list", "--branch", ref_branch, "--limit", "10",
-                            "--json", "databaseId,headSha,status,conclusion,url"],
-                      cwd=repo, check=False, timeout=gh_timeout)
-        except subprocess.TimeoutExpired:
-            cp = None
-        run = None
-        if cp is not None and cp.returncode == 0:
-            try:
-                for r in json.loads(cp.stdout or "[]"):
-                    if r.get("headSha") == preview_sha:
-                        run = r
-                        break
-            except json.JSONDecodeError:
-                run = None
-        if run is not None:
-            seen_run = True
-            if run.get("status") == "completed":
-                return (run.get("conclusion") or "unknown", run.get("url") or "")
-        elif not seen_run and waited >= grace:
-            return ("actions_down", "")
-        if waited >= timeout:
-            return ("actions_down" if not seen_run else "timeout", "")
-        if cp is None:
-            waited += gh_timeout
-        else:
-            time.sleep(poll)
-            waited += poll
-
-
-def ref_has_inflight_run(repo: str, ref_branch: str) -> bool:
-    """True iff Actions shows a not-yet-completed run on ref_branch. Deleting a
-    ci-verify ref cancels its in-progress GitHub run — the SABLE-sc24 root cause —
-    so `sweep` must never reap a ref whose run is still live, no matter how old the
-    ref's commit date is. A run is live unless its status is 'completed'
-    (queued/in_progress/waiting/requested all count as in-flight).
-
-    Best-effort and FAIL-OPEN: a gh error, unparseable output, an absent run, or
-    a hung gh call (SABLE-7wyl — same unbounded-subprocess class as wait_for_ci)
-    all return False. An undiscoverable run cannot be protected, and the ref is
-    only a sweep candidate because it is already past the age threshold — so a
-    non-answer must not wedge the orphan cleanup permanently."""
-    import json
-    gh = _tool("SABLE_MG_GH", "gh")
-    gh_timeout = float(os.environ.get("SABLE_MG_GH_TIMEOUT", "30"))
-    try:
-        cp = _run(gh + ["run", "list", "--branch", ref_branch, "--limit", "10",
-                        "--json", "status"], cwd=repo, check=False, timeout=gh_timeout)
-    except subprocess.TimeoutExpired:
-        return False
-    if cp.returncode != 0:
-        return False
-    try:
-        runs = json.loads(cp.stdout or "[]")
-    except json.JSONDecodeError:
-        return False
-    return any((r.get("status") or "completed") != "completed" for r in runs)
-
-
-# --------------------------------------------------------------------------
-# Orchestration
-# --------------------------------------------------------------------------
-
-def _notify(target: str, message: str) -> None:
-    _run(_tool("SABLE_MG_NOTIFY", "sable-msg") + [target, message], cwd=".", check=False)
-
-
-def _append_evidence(repo: str, bead: str, note: str) -> None:
-    _run(_tool("SABLE_MG_BD", "bd") + ["update", bead, "--append-notes", note], cwd=repo, check=False)
-
-
-# --------------------------------------------------------------------------
-# Post-merge cleanup (SABLE-dn7r) — GREEN path only
-# --------------------------------------------------------------------------
-
-def worktree_for_branch(repo: str, branch: str) -> str | None:
-    """Path of the registered worktree checked out on refs/heads/<branch>, or
-    None if no worktree holds it. Parsed from `git worktree list --porcelain`,
-    NEVER inferred from a naming convention: promote() runs against the main
-    checkout while worker worktrees live elsewhere, and acting on a
-    convention-guessed path was a real bug class here (SABLE-041)."""
-    cp = _git(repo, "worktree", "list", "--porcelain", check=False)
-    if cp.returncode != 0:
-        return None
-    target = f"refs/heads/{branch}"
-    path: str | None = None
-    for line in cp.stdout.splitlines():
-        if line.startswith("worktree "):
-            path = line[len("worktree "):].strip()
-        elif line.startswith("branch ") and line[len("branch "):].strip() == target:
-            return path
-        elif not line.strip():
-            path = None
-    return None
-
-
-def worktree_is_dirty(worktree_path: str) -> bool:
-    """True iff the worktree has uncommitted changes. Runs `git status
-    --porcelain` INSIDE the worktree (its own CWD) — the one place this flow is
-    meant to read the shell CWD, because that dir IS the tree being cleaned. On
-    any error, assume dirty (fail-closed: never destroy under uncertainty)."""
-    cp = _git(worktree_path, "status", "--porcelain", check=False)
-    if cp.returncode != 0:
-        return True
-    return bool(cp.stdout.strip())
-
-
-def branch_exists_locally(repo: str, branch: str) -> bool:
-    cp = _git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
-    return cp.returncode == 0
-
-
-def all_commits_patch_equivalent(repo: str, base_ref: str, branch: str) -> bool:
-    """True iff every commit unique to <branch> is already patch-present in
-    <base_ref>. `git cherry` marks each such commit '-' (an equivalent exists in
-    upstream) or '+' (genuinely absent); empty output means the branch is a pure
-    ancestor. This is the ONLY justification for escalating a refused `branch -d`
-    to `-D` — the wk-git-autopush-hunt case (rebased-and-landed: unmerged by
-    ancestry yet patch-identical). Any '+' line, or a cherry error, refuses."""
-    cp = _git(repo, "cherry", base_ref, branch, check=False)
-    if cp.returncode != 0:
-        return False
-    lines = [ln for ln in cp.stdout.splitlines() if ln.strip()]
-    return all(ln.startswith("-") for ln in lines)
-
-
-def cleanup_after_merge(repo: str, remote: str, base_ref: str, branch: str) -> None:
-    """Reap a merged worker's worktree + local branch + remote branch. GREEN
-    PATH ONLY (SABLE-dn7r): once a preview has been promoted byte-identical to
-    the integration branch, these are dead weight and re-accumulate at fleet pace
-    (58 in one day) without this. Order is load-bearing — the worktree comes off
-    FIRST (git refuses to delete a branch checked out in a worktree), then the
-    local branch, then the remote.
-
-    Every step is best-effort: failures warn on stderr and the caller swallows
-    them so a green merge stays green. A DIRTY worktree aborts the WHOLE cleanup
-    (uncommitted work is never destroyed). The remote delete is legal here
-    because this runs inside chuck's merge path — the fleet's only push lane — so
-    the chuck-only-push convention holds."""
-    # (a) worktree — resolved from porcelain, refused if dirty
-    worktree = worktree_for_branch(repo, branch)
-    if worktree is not None:
-        if worktree_is_dirty(worktree):
-            print(f"sable-merge-gate cleanup: worktree {worktree} for {branch} is DIRTY — "
-                  f"leaving worktree, local branch, and remote branch intact for the operator",
-                  file=sys.stderr)
-            return
-        rm = _git(repo, "worktree", "remove", worktree, check=False)
-        if rm.returncode != 0:
-            print(f"sable-merge-gate cleanup: could not remove worktree {worktree} for {branch} "
-                  f"({rm.stdout.strip()}) — leaving branches intact", file=sys.stderr)
-            return
-
-    # (b) local branch — -d, escalating to -D only on proven patch-equivalence
-    if branch_exists_locally(repo, branch):
-        d = _git(repo, "branch", "-d", branch, check=False)
-        if d.returncode != 0:
-            if all_commits_patch_equivalent(repo, base_ref, branch):
-                dd = _git(repo, "branch", "-D", branch, check=False)
-                if dd.returncode != 0:
-                    print(f"sable-merge-gate cleanup: guarded -D of {branch} failed: "
-                          f"{dd.stdout.strip()}", file=sys.stderr)
-            else:
-                print(f"sable-merge-gate cleanup: local branch {branch} is neither fully merged "
-                      f"nor patch-equivalent to base — NOT deleting local or remote branch "
-                      f"(operator ruling needed): {d.stdout.strip()}", file=sys.stderr)
-                return
-
-    # (c) remote branch — chuck's merge path is the fleet's only push lane
-    push = _git(repo, "push", remote, "--delete", branch, check=False)
-    if push.returncode != 0:
-        print(f"sable-merge-gate cleanup: could not delete remote branch {remote}/{branch}: "
-              f"{push.stdout.strip()}", file=sys.stderr)
-
-
-def promote(bead: str, branch: str, base: str, repo: str, remote: str,
-            manager: str, override: str | None) -> int:
-    base_ref = qualify_remote_ref(remote, base)
-    branch_ref = qualify_remote_ref(remote, branch)
-    _git(repo, "fetch", remote, base, branch)
-    base_sha = resolve_commit(repo, base_ref)
-    branch_sha = resolve_commit(repo, branch_ref)
-
-    msg = f"ci-verify merge-preview: {branch} onto {base} ({bead})"
-    preview_sha = build_preview(repo, base_sha, branch_sha, msg)
-    ref = preview_ref_name(bead, preview_sha)
-
-    _git(repo, "push", remote, f"{preview_sha}:refs/heads/{ref}")
-    try:
-        if override:
-            conclusion, url = "override", override
-        else:
-            conclusion, url = wait_for_ci(repo, ref, preview_sha)
-
-        if conclusion == "success" or override:
-            push_cp = _git(repo, "push", remote, f"{preview_sha}:refs/heads/{base}", check=False)
-            if push_cp.returncode != 0:
-                # F1 (tarzan review): the base advanced during the CI wait, so the
-                # promote is non-fast-forward. Nothing wrong was shipped — the push
-                # was REJECTED — the tested-green ref is simply stale against a base
-                # that moved. Exit cleanly and retryably (rebuild the preview on the
-                # new base and re-gate) instead of letting CalledProcessError escape
-                # as an uncaught traceback. Cleanup still runs via the finally below.
-                _notify(manager,
-                    f"merge-preview ci-verify gate for {bead} ({branch}): base {base} moved during the CI "
-                    f"wait — promote is non-fast-forward, NOT promoted. Rebuild preview + re-gate (ref {ref} was green).")
-                _append_evidence(repo, bead,
-                    f"merge-preview ci-verify gate BASE-MOVED (retryable): ref {ref}, preview {preview_sha}, "
-                    f"non-ff on promote, not promoted: {push_cp.stdout.strip()}")
-                raise GateError(23, f"base {base} advanced during CI; preview {preview_sha} is non-ff — rebuild and re-gate")
-            _git(repo, "fetch", remote, base)
-            landed = resolve_commit(repo, base_ref)
-            if landed != preview_sha:
-                # F3 (tarzan review): defensive integrity guard. Under chuck's
-                # serialized push discipline (single writer to the integration
-                # branch) this cannot fire — the fast-forward above is the last write
-                # before this read. It is NOT rollback-capable (the object is already
-                # pushed); it exists to fail LOUD rather than silently ship a base
-                # whose tip is not the exact tested object. If it fires, serialization
-                # was violated and a human must reconcile.
-                raise GateError(4, f"integrity abort: base {base} tip {landed} != tested preview {preview_sha}")
-            if override:
-                # F2 (tarzan review + lincoln ruling): --override is an
-                # actions-down human bypass ONLY, and must carry a reason (enforced
-                # by argparse requiring the value). Using it to bypass a KNOWN-RED is
-                # out of contract — documented, recorded, human-owned.
-                _append_evidence(repo, bead,
-                    f"merge-preview ci-verify gate OVERRIDE (actions-down human bypass): ref {ref}, "
-                    f"reason={override!r}, preview {preview_sha}, promoted byte-identical to {base}.")
-            else:
-                _append_evidence(repo, bead,
-                    f"merge-preview ci-verify gate GREEN: ref {ref}, run {url or 'n/a'}, "
-                    f"preview {preview_sha}, promoted byte-identical to {base}.")
-            # SABLE-dn7r: the promotion landed byte-identical, so the worker's
-            # worktree + local branch + remote branch are dead weight — reap them.
-            # Wrapped so a cleanup fault can never flip a green merge to non-zero.
-            try:
-                cleanup_after_merge(repo, remote, base_ref, branch)
-            except Exception as exc:  # noqa: BLE001 — a green merge must stay green
-                print(f"sable-merge-gate cleanup: skipped after unexpected error: {exc}",
-                      file=sys.stderr)
-            return 0
-
-        if conclusion in ("actions_down", "timeout"):
-            _notify("lincoln",
-                f"merge-preview ci-verify gate BLOCKED for {bead} ({branch}): Actions {conclusion}, "
-                f"no green result on ref {ref}/{preview_sha[:7]}. No promotion. Needs --override <url> or a recovered Actions.")
-            _append_evidence(repo, bead,
-                f"merge-preview ci-verify gate BLOCKED: ref {ref}, preview {preview_sha}, Actions {conclusion}, no promotion.")
-            return 21
-
-        if conclusion == "cancelled":
-            # SABLE-sc24: the run was CANCELLED mid-flight, not failed. A
-            # cancellation is not a content defect — it happens when a concurrent
-            # sweep deletes the in-flight ci-verify ref, a human cancels, or the
-            # per-ref concurrency group pre-empts the run. Treating it as RED
-            # (exit 20) mis-instructs the author to "fix + re-push" when there is
-            # nothing to fix. Instead map it to the SAME retryable contract as
-            # BASE-MOVED: no promotion, rebuild the preview + re-gate. The finally
-            # below deletes the (possibly already-gone) throwaway ref.
-            _notify(manager,
-                f"merge-preview ci-verify gate CANCELLED (retryable) for {bead} ({branch}): run {url or 'n/a'} "
-                f"was cancelled mid-flight, NOT a test failure — nothing to fix. Rebuild preview + re-gate.")
-            _append_evidence(repo, bead,
-                f"merge-preview ci-verify gate CANCELLED (retryable): ref {ref}, run {url or 'n/a'}, "
-                f"preview {preview_sha}, run cancelled mid-flight, not promoted, no content fix needed.")
-            raise GateError(24, f"ci-verify run for {bead} was cancelled mid-flight (not a failure) — rebuild preview + re-gate")
-
-        _notify(manager,
-            f"merge-preview ci-verify gate RED for {bead} ({branch}): run {url}, no promotion. Fix + re-push.")
-        _append_evidence(repo, bead,
-            f"merge-preview ci-verify gate RED: ref {ref}, run {url}, preview {preview_sha}, NOT promoted.")
-        return 20
-    finally:
-        # Both-path cleanup: delete the throwaway ref (best-effort).
-        _git(repo, "push", remote, "--delete", ref, check=False)
-
-
-def sweep(repo: str, remote: str, max_age_hours: float) -> int:
-    """Delete orphaned ci-verify/* refs older than the threshold."""
-    _git(repo, "fetch", remote, "--prune")
-    listing = _git(repo, "for-each-ref", "--format=%(refname:short) %(committerdate:unix)",
-                   f"refs/remotes/{remote}/ci-verify/", check=False)
-    now = time.time()
-    deleted = 0
-    spared = 0
-    for line in listing.stdout.splitlines():
-        parts = line.rsplit(" ", 1)
-        if len(parts) != 2:
-            continue
-        short, ts = parts
-        try:
-            age = now - float(ts)
-        except ValueError:
-            continue
-        if not is_orphan(age, max_age_hours):
-            continue
-        branch = short.split("/", 1)[1] if "/" in short else short  # strip remote/ prefix
-        # SABLE-sc24: age alone does not make a ref an orphan. A ref whose Actions
-        # run is still in-flight is LIVE — deleting it cancels the run and REDs the
-        # gate spuriously. Never reap it, regardless of the ref's commit date.
-        if ref_has_inflight_run(repo, branch):
-            print(f"sable-merge-gate sweep: {branch} is past the {max_age_hours}h age threshold but its "
-                  f"Actions run is still in-flight — NOT reaping (deleting it would cancel the run)",
-                  file=sys.stderr)
-            spared += 1
-            continue
-        _git(repo, "push", remote, "--delete", branch, check=False)
-        deleted += 1
-    spared_note = f" (spared {spared} with an in-flight run)" if spared else ""
-    print(f"sable-merge-gate sweep: deleted {deleted} orphaned ci-verify ref(s) older than {max_age_hours}h{spared_note}")
-    return 0
+# Public API re-exports. These are the names OTHER tools import from this file
+# (bin/sable-reconcile-handoffs reuses the resolver, the ref-qualifier and the
+# kick as a single source of truth), plus the pure helpers external unit tests
+# call. The private subprocess seams are NOT re-exported — see the PATCHING NOTE
+# in the module docstring.
+GateError = classify.GateError
+preview_ref_name = classify.preview_ref_name
+preview_kick_key = classify.preview_kick_key
+preview_kick_ref = classify.preview_kick_ref
+is_orphan = classify.is_orphan
+qualify_remote_ref = classify.qualify_remote_ref
+classify_conclusion = classify.classify_conclusion
+Verdict = classify.Verdict
+resolve_integration_branch = git_lib.resolve_integration_branch
+resolve_base = git_lib.resolve_base
+resolve_commit = git_lib.resolve_commit
+default_mg_timeout = git_lib.default_mg_timeout
+build_preview = preview_lib.build_preview
+adopt_kicked_preview = preview_lib.adopt_kicked_preview
+kick_preview = preview_lib.kick_preview
+read_verdict = preview_lib.read_verdict
+acquire_verdict = preview_lib.acquire_verdict
+wait_for_ci = preview_lib.wait_for_ci
+ref_has_inflight_run = preview_lib.ref_has_inflight_run
+sweep = preview_lib.sweep
+promote = promote_lib.promote
+cleanup_after_merge = promote_lib.cleanup_after_merge
+decide_promotion = promote_lib.decide_promotion
+run_impact_tier = promote_lib.run_impact_tier
+impact_budget = promote_lib.impact_budget
+format_impact_budget = promote_lib.format_impact_budget
+assess_footprints = footprint_lib.assess
+assert_not_frozen = promote_lib.assert_not_frozen
+read_freeze = snapshot_lib.read_freeze
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -568,22 +334,128 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--override", default=None, metavar="REASON",
                     help="actions-down human bypass ONLY; the reason is required and recorded on the bead. "
                          "Not for bypassing a known-red run.")
+    pp.add_argument("--coverage-override", default=None, metavar="REASON",
+                    dest="coverage_override",
+                    help="named-reason bypass of the coverage floor on a PRUNING diff only "
+                         "(SABLE-cmar4.5) — a diff with no removed test fn / newly-skipped "
+                         "test / deleted test file never needs this. Recorded on the bead. "
+                         "Mirrors the 'Model override: <reason>' pattern; also accepted as a "
+                         "'Coverage override: <reason>' line in this flag's own value.")
+    pp.add_argument("--with-pair", action="append", default=[], dest="with_pair",
+                    metavar="BEAD_ID",
+                    help="BEAD_ID is promoted together with --bead in THIS call (repeatable "
+                         "or comma-separated) — satisfies a landing_pair constraint (SABLE-rzkw7)")
+
+    # SABLE-jd5fj.1 kick entrypoint. No --bead: the post-push hook that fires
+    # this knows the branch it just confirmed, not the bead behind it, and a kick
+    # writes no bead evidence anyway.
+    pv = sub.add_parser("preview")
+    pv.add_argument("--branch", required=True)
+    pv.add_argument("--base", default=None,
+                    help="integration branch to preview onto; same resolution as promote")
+    pv.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+    pv.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
+
+    # SABLE-jd5fj.3 read entrypoint. Also no --bead: a verdict is a property of
+    # the (base, branch) merge, which is what the shared idempotency key names.
+    pj = sub.add_parser("verdict")
+    pj.add_argument("--branch", required=True)
+    pj.add_argument("--base", default=None,
+                    help="integration branch to read the verdict against; same resolution as promote")
+    pj.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+    pj.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
+    pj.add_argument("--json", action="store_true",
+                    help="machine-readable single-line JSON (chuck's read-verdict step)")
 
     ps = sub.add_parser("sweep")
     ps.add_argument("--max-age-hours", type=float,
                     default=float(os.environ.get("SABLE_MG_SWEEP_HOURS", "6")))
     ps.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
     ps.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
+    ps.add_argument("--dry-run", action="store_true", dest="dry_run",
+                    help="report the refs that would be deleted, deleting nothing (SABLE-o9b8u)")
+
+    # SABLE-w0zjm. The gate's own worst-case promote wall-clock, so an operator
+    # wrapper DERIVES its timeout instead of keeping a second copy of the number.
+    # Named promote-budget, not budget, because sable_gate_budget_lib already owns
+    # "budget" for a different thing entirely (per-tier CI DURATION budgets,
+    # SABLE-cmar4.4). Takes no --repo: every input is an env var, so this answers
+    # without touching git and can be called from anywhere, including the wrapper
+    # that has not chosen a repo yet.
+    pb = sub.add_parser("promote-budget",
+                        help="print the worst-case promote wall-clock an enclosing "
+                             "timeout must exceed")
+    pbg = pb.add_mutually_exclusive_group()
+    pbg.add_argument("--json", action="store_true",
+                     help="machine-readable single-line JSON with every component")
+    pbg.add_argument("--seconds", action="store_true",
+                     help="just the recommended enclosing timeout, as a bare integer: "
+                          "timeout \"$(sable-merge-gate promote-budget --seconds)\" ...")
+    # SABLE-be4lo.6: >=1 occurrence switches this command from the single-branch
+    # report to the combined-tree BATCH report (a NEW field,
+    # recommended_batch_wrapper_timeout_s — never an overload of the
+    # single-branch recommended_wrapper_timeout_s above).
+    pb.add_argument("--member-footprint", action="append", default=[],
+                    dest="member_footprints", metavar="PATH[,...]",
+                    help="repeatable; one per batch member (SABLE-be4lo.6)")
+
+    # SABLE-be4lo.7. The GATE-CLASS batch landing path. Subparser + all four
+    # behaviors live in promote_lib so this CLI stays argparse-dispatch-thin.
+    promote_lib.register_land_batch(sub)
+
+    # SABLE-jd5fj.8. Refreshes the gate-owned persisted warm .testmondata
+    # (see sable_gate_promote_lib's module comment on _warm_testmondata_path)
+    # by running the full bin/ suite with --testmon-noselect, same as CI's
+    # .github/ci/testmon-cache-warm.sh — meant to be run periodically or by
+    # an operator, NOT by the gate itself on every promote.
+    pw = sub.add_parser("warm-testmon-cache",
+                        help="refresh the gate-owned warm .testmondata used by the "
+                             "combined-tree impact tier's pytest half")
+    pw.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+
+    # SABLE-mbkbm. Reads the per-phase journal run_impact_tier now writes and
+    # reports where the tier's own wall-clock actually goes (setup vs each shell
+    # suite vs the pytest half), with an explicit n — never a split inferred
+    # from totals, and never presented as a finding on thin data.
+    pt = sub.add_parser("impact-tier-phases",
+                        help="report where the local impact tier's wall-clock goes, "
+                             "by phase, from the recorded journal")
+    pt.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+    pt.add_argument("--json", action="store_true",
+                    help="machine-readable JSON instead of the human summary")
 
     args = parser.parse_args(argv)
     try:
         if args.command == "promote":
-            base = resolve_base(args.base, args.repo)
-            return promote(args.bead, args.branch, base, args.repo,
-                           args.remote, args.manager, args.override)
+            base = git_lib.resolve_base(args.base, args.repo)
+            with_pair = promote_lib.parse_with_pair(args.with_pair)
+            return promote_lib.promote(args.bead, args.branch, base, args.repo,
+                                       args.remote, args.manager, args.override,
+                                       args.coverage_override, with_pair)
+        if args.command == "preview":
+            base = git_lib.resolve_base(args.base, args.repo)
+            return preview_lib.kick_preview(args.branch, base, args.repo, args.remote)
+        if args.command == "verdict":
+            base = git_lib.resolve_base(args.base, args.repo)
+            return preview_lib.report_verdict(args.branch, base, args.repo,
+                                              args.remote, args.json)
         if args.command == "sweep":
-            return sweep(args.repo, args.remote, args.max_age_hours)
-    except GateError as e:
+            return preview_lib.sweep(args.repo, args.remote, args.max_age_hours, args.dry_run)
+        if args.command == "promote-budget":
+            print(promote_lib.render_promote_budget_report(
+                args.member_footprints, args.seconds, args.json))
+            return 0
+        if args.command == "land-batch": return promote_lib.land_batch_from_refs(args.base, args.members, args.repo, args.remote, args.manager)  # noqa: E501,E701 SABLE-be4lo.7 (one-line dispatch keeps the CLI under test_cli_is_thin's 150-line guard; all logic is in the lib)
+        if args.command == "warm-testmon-cache":
+            return promote_lib.warm_gate_testmon_cache(args.repo)
+        if args.command == "impact-tier-phases":
+            report = promote_lib.impact_tier_phase_report(args.repo)
+            if args.json:
+                print(json.dumps(report, sort_keys=True))
+            else:
+                print(promote_lib.format_impact_tier_phase_report(report))
+            return 0
+    except classify.GateError as e:
         print(f"sable-merge-gate: {e}", file=sys.stderr)
         return e.code
     return 2
