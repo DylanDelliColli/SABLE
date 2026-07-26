@@ -19,6 +19,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 import sable_coverage_floor_lib as cf  # noqa: E402
@@ -189,6 +191,20 @@ diff --git a/bin/test_foo.py b/bin/test_foo.py
 # detect_pruning — newly-added skip marker
 # --------------------------------------------------------------------------
 
+def _one_file_diff(path, added_lines, start=5):
+    """A minimal, well-formed one-hunk diff adding `added_lines` to `path`,
+    preceded by one context line so the post-image line numbers this module
+    reports are actually exercised rather than trivially equal to the hunk
+    start."""
+    body = "".join("+" + line + "\n" for line in added_lines)
+    return (f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n"
+            f"+++ b/{path}\n"
+            f"@@ -{start},1 +{start},{len(added_lines) + 1} @@\n"
+            f" import pytest\n"
+            f"{body}")
+
+
 def test_newly_added_pytest_mark_skip_is_detected():
     diff = """\
 diff --git a/bin/test_foo.py b/bin/test_foo.py
@@ -205,6 +221,26 @@ diff --git a/bin/test_foo.py b/bin/test_foo.py
     assert signal.is_pruning
     assert signal.newly_skipped_markers == 1
     assert signal.removed_test_functions == []
+
+
+def test_skipif_marker_is_detected_as_pruning():
+    """*** THE EXACT REGRESSION (SABLE-a4i8h). *** The predecessor pattern
+    ended its first alternative with `@pytest\\.mark\\.skip\\b`, and a word
+    boundary requires a word char beside a NON-word char — in `skipif` the
+    next char is `i`, a word char, so the boundary is UNSATISFIABLE and the
+    single most common conditional-skip form in this repo could never match.
+    That is a fail-open on the gate that decides what lands: a pruning diff
+    whose markers were all `skipif` scored NOT-pruning and promoted with no
+    coverage check at all. This test fails against the pre-fix code."""
+    diff = _one_file_diff("bin/test_foo.py", [
+        '@pytest.mark.skipif(shutil.which("bd") is None, reason="needs bd")',
+        'def test_needs_bd():',
+        '    assert bd_version()',
+    ])
+    signal = cf.detect_pruning(diff)
+    assert signal.is_pruning
+    assert signal.newly_skipped_markers == 1
+    assert signal.skip_markers[0].marker == "pytest.mark.skipif"
 
 
 def test_newly_added_unittest_skip_is_detected():
@@ -236,6 +272,259 @@ diff --git a/bin/test_foo.py b/bin/test_foo.py
 """
     signal = cf.detect_pruning(diff)
     assert signal.newly_skipped_markers == 2
+
+
+# --------------------------------------------------------------------------
+# detect_pruning — the gating-suppressing marker CLASS
+#
+# WHY THERE IS A HAND-WRITTEN LIST HERE, AND WHY IT IS NOT THE SAME MISTAKE
+# (this bead's own warning: "a table-driven test that enumerates the same
+# strings the regex enumerates proves only that two enumerations agree").
+# The list below is INPUT DATA — real spellings pytest and unittest actually
+# ship, which is why they must be written out somewhere. The IMPLEMENTATION
+# holds no matching list: it classifies a marker by a stem predicate
+# (`suppresses_gating`), so there is no second enumeration for this one to
+# agree with. The load-bearing proof that the fix is class-shaped rather than
+# list-shaped is test_unlisted_skip_and_xfail_spellings_are_detected_by_class
+# below, which feeds spellings that appear NOWHERE in the module — if someone
+# ever replaces the predicate with an alternation of spellings, THAT test
+# fails while this one still passes. That is the pair that would rot if
+# separated; do not delete one and keep the other.
+# --------------------------------------------------------------------------
+
+SUPPRESSING_FORMS = [
+    ('@pytest.mark.skip', 'pytest.mark.skip'),
+    ('@pytest.mark.skip(reason="flaky")', 'pytest.mark.skip'),
+    ('@pytest.mark.skipif(sys.platform == "win32", reason="posix only")',
+     'pytest.mark.skipif'),
+    ('@pytest.mark.xfail', 'pytest.mark.xfail'),
+    ('@pytest.mark.xfail(strict=False)', 'pytest.mark.xfail'),
+    ('    pytest.skip("no bd on this host")', 'pytest.skip'),
+    ('    pytest.xfail("known broken")', 'pytest.xfail'),
+    ('@unittest.skip("wip")', 'unittest.skip'),
+    ('@unittest.skipIf(x, "y")', 'unittest.skipIf'),
+    ('@unittest.skipUnless(x, "y")', 'unittest.skipUnless'),
+    ('@unittest.expectedFailure', 'unittest.expectedFailure'),
+    ('        self.skipTest("needs a real db")', 'self.skipTest'),
+    ('        raise unittest.SkipTest("needs a real db")', 'unittest.SkipTest'),
+]
+
+
+@pytest.mark.parametrize("line,expected_marker", SUPPRESSING_FORMS)
+def test_every_real_pruning_form_is_detected(line, expected_marker):
+    """Every form measured MISSING by three agents against the pre-fix
+    pattern (3 of 10 matched), plus the two the fleet's sweep did not reach.
+    Each is asserted to be detected AND to be NAMED correctly — a detector
+    that fires but cannot say what it saw is what made the original 1-vs-4
+    disagreement cost a hand-diff."""
+    signal = cf.detect_pruning(_one_file_diff("bin/test_foo.py", [line]))
+    assert signal.is_pruning, f"{line!r} not detected as pruning"
+    assert signal.newly_skipped_markers == 1
+    assert signal.skip_markers[0].marker == expected_marker
+
+
+def test_the_count_equals_the_number_of_markers_planted():
+    """*** THE 4-VS-1 BUG ITSELF. *** A test asserting merely "is_pruning is
+    True" passes while the count is wrong — the incident that produced this
+    bead was a gate reporting 1 where a seat counted 4, on a diff that was
+    denied anyway, which is why the defect stayed invisible. So the count,
+    not the boolean, is what this asserts, over every form at once."""
+    lines = [line for line, _ in SUPPRESSING_FORMS]
+    signal = cf.detect_pruning(_one_file_diff("bin/test_foo.py", lines))
+    assert signal.newly_skipped_markers == len(SUPPRESSING_FORMS), (
+        f"planted {len(SUPPRESSING_FORMS)} markers, detector reported "
+        f"{signal.newly_skipped_markers}: "
+        f"{[m.marker for m in signal.skip_markers]}")
+
+
+UNLISTED_SPELLINGS = [
+    # None of these strings appear anywhere in sable_coverage_floor_lib.py.
+    # They stand in for "the next spelling nobody thought to list", which is
+    # how this defect would silently reopen after a spelling-by-spelling fix.
+    ('@pytest.mark.skipwhen(SLOW, reason="hypothetical future mark")',
+     'pytest.mark.skipwhen'),
+    ('@pytest.mark.xfail_on_windows', 'pytest.mark.xfail_on_windows'),
+    ('    pytest.skip_module("hypothetical")', 'pytest.skip_module'),
+    ('@unittest.skipForNow', 'unittest.skipForNow'),
+]
+
+
+@pytest.mark.parametrize("line,expected_marker", UNLISTED_SPELLINGS)
+def test_unlisted_skip_and_xfail_spellings_are_detected_by_class(line, expected_marker):
+    """*** THE LOAD-BEARING STRUCTURAL TEST. *** These spellings do not exist
+    in pytest or unittest and appear nowhere in the module under test. They
+    are detected because the implementation classifies a marker by the stems
+    `skip*`/`xfail*` rather than by matching a list of remembered spellings —
+    i.e. the fix dissolves the generator of holes instead of patching two of
+    its members. Replace `suppresses_gating` with an alternation of real
+    spellings and this test goes red while every other test in this file
+    still passes."""
+    signal = cf.detect_pruning(_one_file_diff("bin/test_foo.py", [line]))
+    assert signal.is_pruning
+    assert signal.skip_markers[0].marker == expected_marker
+
+
+NON_SUPPRESSING_FORMS = [
+    '@pytest.mark.parametrize("x", [1, 2, 3])',
+    '@pytest.mark.usefixtures("tmp_repo")',
+    '@pytest.mark.slow',
+    '@pytest.fixture',
+    '@unittest.mock.patch("bin.foo.bar")',
+    '    self.assertEqual(foo(-1), "negative")',
+    '    pytest.raises(ValueError)',
+    '    pytest.fail("boom")',
+]
+
+
+@pytest.mark.parametrize("line", NON_SUPPRESSING_FORMS)
+def test_markers_that_do_not_suppress_gating_are_not_counted(line):
+    """KNOWN-NEGATIVE, and it is load-bearing in the other direction. A stem
+    predicate is only safe if it is narrow: `parametrize`, `usefixtures` and
+    `mock.patch` sit in the same syntactic position as a skip and must not
+    count, or the floor fires on ordinary test edits and the seat learns to
+    reach for --coverage-override by reflex (SABLE-r5pfw) — strictly worse
+    than the under-match this bead fixes. `pytest.fail` is the sharp one: it
+    is adjacent vocabulary that does the OPPOSITE of suppressing a result."""
+    signal = cf.detect_pruning(_one_file_diff("bin/test_foo.py", [line]))
+    assert signal.skip_markers == []
+    assert not signal.is_pruning
+
+
+def test_the_word_skipif_in_a_non_test_file_is_not_counted():
+    """KNOWN-NEGATIVE (this bead's third bullet, the easy one to skip). A
+    marker only suppresses a test if it lands somewhere pytest COLLECTS, so
+    the word in a comment, a docstring or a string literal in an ordinary
+    source file — including this floor's own source, which discusses these
+    markers at length — prunes nothing and must not be counted."""
+    diff = """\
+diff --git a/bin/sable_coverage_floor_lib.py b/bin/sable_coverage_floor_lib.py
+--- a/bin/sable_coverage_floor_lib.py
++++ b/bin/sable_coverage_floor_lib.py
+@@ -40,2 +40,6 @@
+ import re
++# @pytest.mark.skipif is the most common conditional-skip form in this repo.
++HINT = "add @pytest.mark.skipif rather than deleting the test"
++DOC = '''pytest.skip("...") inside a test body also prunes.'''
++SKIPIF_HELP = "@unittest.skipUnless(cond, reason)"
+"""
+    signal = cf.detect_pruning(diff)
+    assert signal.skip_markers == []
+    assert not signal.is_pruning
+
+
+def test_a_commented_out_marker_in_a_test_file_is_not_counted():
+    """A commented-out decorator is not code and suppresses nothing. Without
+    this, a diff that DISABLES a skip (the un-pruning direction) would read
+    as one that adds it."""
+    diff = _one_file_diff("bin/test_foo.py", [
+        '# @pytest.mark.skipif(shutil.which("bd") is None, reason="needs bd")',
+        '    # pytest.skip("temporarily disabled while we debug")',
+    ])
+    signal = cf.detect_pruning(diff)
+    assert signal.skip_markers == []
+    assert not signal.is_pruning
+
+
+def test_a_removed_skip_marker_is_not_counted_as_pruning():
+    """KNOWN-NEGATIVE, opposite polarity: deleting a skip RE-ENABLES a test.
+    Only ADDED markers prune."""
+    diff = """\
+diff --git a/bin/test_foo.py b/bin/test_foo.py
+--- a/bin/test_foo.py
++++ b/bin/test_foo.py
+@@ -5,7 +5,6 @@
+ import pytest
+-@pytest.mark.skipif(True, reason="was broken")
+-@pytest.mark.xfail
+ def test_edge_case():
+     assert foo(-1) == "negative"
+"""
+    signal = cf.detect_pruning(diff)
+    assert signal.skip_markers == []
+    assert not signal.is_pruning
+
+
+def test_a_marker_added_to_conftest_is_counted():
+    """conftest.py is collected by pytest and its markers apply to whole
+    directories of tests, so it is inside the property even though its name
+    matches no test_*.py convention."""
+    signal = cf.detect_pruning(_one_file_diff(
+        "bin/conftest.py",
+        ['collect_ignore = ["test_slow.py"]',
+         '@pytest.mark.skipif(True, reason="module-wide")']))
+    assert signal.is_pruning
+    assert signal.skip_markers[0].path == "bin/conftest.py"
+
+
+def test_each_matched_marker_is_named_with_its_file_and_line():
+    """*** ACCEPTANCE CRITERION (SABLE-a4i8h), not polish. *** The incident
+    behind this bead cost a seat a hand-diff to settle a 4-vs-1 disagreement
+    against a count with no operands. Every match must carry its file, its
+    line in the POST-image, and the source line itself, and those must reach
+    the deny reason the seat actually reads."""
+    diff = """\
+diff --git a/bin/test_foo.py b/bin/test_foo.py
+--- a/bin/test_foo.py
++++ b/bin/test_foo.py
+@@ -10,4 +10,7 @@ class T:
+ import pytest
+
++@pytest.mark.skipif(shutil.which("bd") is None, reason="needs bd")
+ def test_needs_bd():
+     assert bd_version()
++
++@pytest.mark.xfail(strict=False)
+ def test_flaky():
+"""
+    signal = cf.detect_pruning(diff)
+    assert [(m.path, m.line, m.marker) for m in signal.skip_markers] == [
+        ("bin/test_foo.py", 12, "pytest.mark.skipif"),
+        ("bin/test_foo.py", 16, "pytest.mark.xfail"),
+    ]
+    decision = cf.evaluate_coverage_floor(signal, None, None)
+    assert "bin/test_foo.py:12" in decision.reason
+    assert "bin/test_foo.py:16" in decision.reason
+    assert "needs bd" in decision.reason
+
+
+def test_line_numbers_are_reported_per_file_across_a_multi_file_diff():
+    """Post-image line numbers reset at each file's hunk header — a counter
+    that leaked across files would report plausible-looking but wrong lines,
+    which is worse than no line at all because it cannot be spotted by eye."""
+    diff = """\
+diff --git a/bin/test_a.py b/bin/test_a.py
+--- a/bin/test_a.py
++++ b/bin/test_a.py
+@@ -100,2 +100,3 @@
+ import pytest
++@pytest.mark.skip
+ def test_a(): pass
+diff --git a/bin/test_b.py b/bin/test_b.py
+--- a/bin/test_b.py
++++ b/bin/test_b.py
+@@ -3,2 +3,3 @@
+ import pytest
++@pytest.mark.skipif(True, reason="x")
+ def test_b(): pass
+"""
+    signal = cf.detect_pruning(diff)
+    assert [(m.path, m.line) for m in signal.skip_markers] == [
+        ("bin/test_a.py", 101),
+        ("bin/test_b.py", 4),
+    ]
+
+
+def test_suppresses_gating_classifies_by_stem_not_by_spelling():
+    """The predicate directly, so its shape is pinned independently of the
+    diff plumbing: every skip*/xfail* spelling in, the one irregular member
+    (`expectedFailure`) in, adjacent test vocabulary out."""
+    for name in ("skip", "skipif", "skipIf", "skipUnless", "skipTest",
+                 "SkipTest", "xfail", "xfail_slow", "expectedFailure",
+                 "skip_this_hypothetical_future_mark"):
+        assert cf.suppresses_gating(name), f"{name} should suppress gating"
+    for name in ("parametrize", "usefixtures", "fixture", "patch", "fail",
+                 "raises", "slow", "expected", "failure"):
+        assert not cf.suppresses_gating(name), f"{name} should not suppress gating"
 
 
 # --------------------------------------------------------------------------
@@ -380,6 +669,11 @@ def _signal(**kw):
     return cf.PruningSignal(**kw)
 
 
+def _marker(path="bin/test_foo.py", line=12, marker="pytest.mark.skipif",
+            text='@pytest.mark.skipif(True, reason="x")'):
+    return cf.SkipMarker(path=path, line=line, marker=marker, text=text)
+
+
 def test_non_pruning_diff_always_allows_regardless_of_check_result():
     clean = _signal()
     for passed in (True, False, None):
@@ -414,22 +708,39 @@ def test_pruning_with_no_carried_check_denies():
 def test_pruning_with_named_override_allows_even_when_check_failed():
     """The override is a human bypass, checked ahead of the coverage result —
     same contract as promote()'s own --override: 'consults no run at all'."""
-    signal = _signal(newly_skipped_markers=1)
+    signal = _signal(skip_markers=[_marker()])
     decision = cf.evaluate_coverage_floor(signal, False, "flaky on CI, tracked in SABLE-xyz")
     assert decision.action == cf.ACTION_ALLOW
     assert "flaky on CI, tracked in SABLE-xyz" in decision.reason
 
 
 def test_pruning_with_named_override_allows_when_check_never_ran():
-    signal = _signal(newly_skipped_markers=1)
+    signal = _signal(skip_markers=[_marker()])
     decision = cf.evaluate_coverage_floor(signal, None, "reason")
     assert decision.action == cf.ACTION_ALLOW
 
 
 def test_decision_reason_names_every_pruning_signal():
-    signal = _signal(removed_test_functions=["test_a"], newly_skipped_markers=2,
+    signal = _signal(removed_test_functions=["test_a"],
+                     skip_markers=[_marker(line=12),
+                                   _marker(path="bin/test_c.py", line=40)],
                      deleted_test_files=["bin/test_b.py"])
     decision = cf.evaluate_coverage_floor(signal, None, None)
     assert "test_a" in decision.reason
-    assert "2 newly-added skip marker" in decision.reason
+    assert "2 newly-added skip/xfail marker" in decision.reason
+    assert "bin/test_foo.py:12" in decision.reason
+    assert "bin/test_c.py:40" in decision.reason
     assert "bin/test_b.py" in decision.reason
+
+
+def test_a_very_long_marker_line_is_truncated_in_the_report():
+    """The report NAMES every match, and a pruning diff can legitimately
+    carry many — a deny reason that pastes a 400-char skipif verbatim per
+    marker becomes unreadable, which defeats the point of naming them."""
+    long_reason = "x" * 400
+    signal = _signal(skip_markers=[
+        _marker(text=f'@pytest.mark.skipif(True, reason="{long_reason}")')])
+    decision = cf.evaluate_coverage_floor(signal, None, None)
+    assert "bin/test_foo.py:12" in decision.reason
+    assert long_reason not in decision.reason
+    assert "..." in decision.reason
