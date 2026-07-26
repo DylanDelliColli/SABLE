@@ -20,6 +20,21 @@ FROM_HERE=0
 PROJECT_MODE=0
 FORCE=0
 PROJECT_PATH_ARG=""
+
+# --- THE settings.json CONTRACT (SABLE-gxsji) ---
+# ONE string, printed to the operator by step 6 AND asserted by
+# bin/test_sable_install.py against the code that enforces it, so the promise
+# and the behaviour cannot drift apart again. They already did once: step 8
+# promised "do NOT auto-edit — settings is too important to clobber" while
+# step 6's delegate merged rows into that same file on every ordinary run. The
+# row it merged on 2026-07-23 was a PreToolUse hook — an interceptor that runs
+# BEFORE EVERY TOOL CALL OF EVERY AGENT — and nothing in the install output
+# named it. It was noticed only because that particular hook was too broken to
+# stay quiet; a working one would still be running, unnoticed and unconsented.
+# So the default is now print-only, and consent is an explicit flag.
+SETTINGS_CONTRACT="install.sh does NOT write settings.json — the step-6 delegate runs inside a guard that restores the file afterwards. Pass --merge-settings to consent to the write."
+MERGE_SETTINGS=0
+
 for arg in "$@"; do
     case "$arg" in
         --dry-run)       DRY_RUN=1 ;;
@@ -27,6 +42,7 @@ for arg in "$@"; do
         --project)       PROJECT_MODE=1 ;;
         --project=*)     PROJECT_MODE=1; PROJECT_PATH_ARG="${arg#--project=}" ;;
         --force)         FORCE=1 ;;
+        --merge-settings) MERGE_SETTINGS=1 ;;
         --subagent|--nested|--teams)
             echo "install.sh: '$arg' was retired — SABLE runs on the tmux warm-pane layout only (see TMUX-AGENTS-DESIGN.md)" >&2
             exit 1 ;;
@@ -34,7 +50,7 @@ for arg in "$@"; do
             echo "install.sh: '$arg' was retired — there is one install: the full workflow including the orchestration layer (see QUICKSTART.md)" >&2
             exit 1 ;;
         -h|--help)
-            echo "Usage: install.sh [--dry-run] [--from-here] [--project[=<path>]] [--force]"
+            echo "Usage: install.sh [--dry-run] [--from-here] [--project[=<path>]] [--force] [--merge-settings]"
             echo "  Installs the complete SABLE workflow: beads discipline + hooks,"
             echo "  producer agent defs, and the tmux warm-pane orchestration layer."
             echo "  --dry-run              report what would be done; write nothing"
@@ -47,6 +63,12 @@ for arg in "$@"; do
             echo "                         into ~/.local/bin (hybrid contract, SABLE-59t6)."
             echo "  --force                proceed with --project even when ~/.claude already"
             echo "                         carries SABLE hooks (accepts hooks firing twice)."
+            echo "  --merge-settings       CONSENT to this install writing the scope's"
+            echo "                         settings.json. Without it the install is print-only:"
+            echo "                         the step-6 delegate's merge is reverted, the exact"
+            echo "                         changes are printed, and the would-be result is"
+            echo "                         parked as a .proposed file for you to apply."
+            echo "                         ${SETTINGS_CONTRACT}"
             exit 0 ;;
     esac
 done
@@ -76,6 +98,251 @@ bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
 green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 red()    { printf '\033[31m%s\033[0m\n' "$*"; }
+
+# --- BEGIN settings-guard (SABLE-gxsji) ---
+# Everything between these two sentinels is self-contained and is EXTRACTED AND
+# SOURCED VERBATIM by bin/test_sable_install.py so the mutation reporter can be
+# unit-tested without running a whole install. The sentinels are part of the
+# contract: the test fails if they go missing, so this block cannot be quietly
+# dissolved back into the script body.
+#
+# WHY THIS EXISTS. install.sh's step 6 delegates to bin/sable-orchestration-install,
+# which merges hook rows into the scope's settings.json. install.sh promised
+# in source that it did not touch that file. On 2026-07-23 an ordinary install
+# merged a PreToolUse row — an interceptor that runs before EVERY tool call of
+# EVERY agent in the fleet — with nobody having decided to turn it on and
+# nothing in the install output naming it. It was discovered only because that
+# hook could not load its own library and therefore announced itself on every
+# command. A working payload would have been silent and would still be running.
+#
+# So: the delegate is run INSIDE this guard. By default the guard restores the
+# file and prints what would have changed (the promise becomes real);
+# --merge-settings keeps the write and prints what changed. Either way the
+# install SAYS SO and NAMES what was added, removed, or modified — a silent
+# REMOVAL is strictly harder to detect than a silent addition, because an
+# addition at least has a payload that might misbehave and an absence has
+# nothing that could ever fire.
+
+SETTINGS_GUARD_TMP=""
+SETTINGS_PRE_SNAPSHOT=""   # copy of the file as it was before the delegate ran
+SETTINGS_PRE_EXISTED=0
+SETTINGS_BACKUP_PATH=""    # timestamped rollback copy; named in the output
+SETTINGS_PROPOSED_PATH=""  # print-only: where the delegate's would-be result was parked
+
+settings_guard_tmpdir() {
+    if [ -z "${SETTINGS_GUARD_TMP}" ]; then
+        SETTINGS_GUARD_TMP="$(mktemp -d)"
+    fi
+    printf '%s\n' "${SETTINGS_GUARD_TMP}"
+}
+
+# settings_rotating_path <file> <infix> — a TIMESTAMPED, collision-free name.
+#
+# The delegate's own backup is `<file>.bak`, SINGLE-SLOT, same name every run,
+# so each install DESTROYS the previous one. That is not a footnote: the
+# pre-window backup that proved the 2026-07-23 wiring did not pre-exist was
+# already gone by 2026-07-26, overwritten by a later ordinary install. The
+# evidence needed to measure how often this happens is destroyed by the same
+# operation whose rate we are trying to measure. The installer already knows
+# how to do this properly — sable-orchestration-install snapshots changed
+# artifacts into a timestamped .install-bak-<ts>/ dir — so this reuses that
+# idea for the single most security-relevant file it touches.
+#
+# date(1) resolves to one second and two installs fit inside one second, so a
+# same-second collision is broken with a counter: a rotation that can still
+# clobber its predecessor is not a rotation.
+settings_rotating_path() {
+    local file="$1" infix="$2" ts base candidate n
+    ts="$(date +%Y%m%d%H%M%S)"
+    base="${file}.${infix}.${ts}"
+    candidate="${base}"
+    n=1
+    while [ -e "${candidate}" ]; do
+        candidate="${base}.${n}"
+        n=$((n + 1))
+    done
+    printf '%s\n' "${candidate}"
+}
+
+# settings_report_mutations <pre> <post> [label] — print one indented line per
+# SEMANTIC difference between two settings files. Either path argument may name
+# a file that does not exist, which means "absent". [label] is the name the
+# CREATED/DELETED lines use for the file being reported on (the caller passes
+# the real settings path, since <pre>/<post> are throwaway snapshot copies whose
+# temp paths would mean nothing to a reader). Prints NOTHING and returns 1 when
+# the two are semantically identical.
+#
+# THE COMPARISON IS SEMANTIC, NOT BYTE-FOR-BYTE, AND THAT IS LOAD-BEARING. The
+# delegate re-serializes the entire file with json.dumps(indent=2) on every
+# run, so a byte comparison would report a mutation every single time — the
+# "this install changed nothing" outcome would be unreachable and the report
+# would be the always-fires shape that a check must never have. A reporter that
+# cannot return "unchanged" is indistinguishable from one that is broken.
+settings_report_mutations() {
+    SETTINGS_PRE_PATH="${1:-}" SETTINGS_POST_PATH="${2:-}" SETTINGS_LABEL="${3:-}" python3 - <<'PY'
+import json, os, sys
+
+
+def load(path):
+    """None means the file is absent; {} means present but unreadable as JSON."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+pre_path = os.environ.get('SETTINGS_PRE_PATH', '')
+post_path = os.environ.get('SETTINGS_POST_PATH', '')
+label = os.environ.get('SETTINGS_LABEL', '') or post_path or pre_path
+pre, post = load(pre_path), load(post_path)
+
+
+def rows(data):
+    """(event, matcher, command) -> the hook row, flattened across blocks."""
+    out = {}
+    hooks = (data or {}).get('hooks')
+    if not isinstance(hooks, dict):
+        return out
+    for event, blocks in hooks.items():
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            matcher = block.get('matcher', '')
+            for hook in block.get('hooks') or []:
+                if isinstance(hook, dict):
+                    out[(event, matcher, hook.get('command', ''))] = hook
+    return out
+
+
+lines = []
+if pre is None and post is not None:
+    lines.append('CREATED   %s (did not exist before)' % label)
+elif pre is not None and post is None:
+    lines.append('DELETED   %s (existed before, gone now)' % label)
+
+before, after = rows(pre), rows(post)
+for key in sorted(set(before) | set(after)):
+    event, matcher, command = key
+    where = '%s[%s]' % (event, matcher or '*')
+    if key not in before:
+        lines.append('ADDED     hook %s %s' % (where, command))
+    elif key not in after:
+        # The strictly more dangerous half. Nothing fires to announce an
+        # absence, so a removal that is not reported here is unreportable
+        # anywhere else.
+        lines.append('REMOVED   hook %s %s' % (where, command))
+    elif before[key] != after[key]:
+        lines.append('MODIFIED  hook %s %s (%s -> %s)' % (
+            where, command,
+            json.dumps(before[key], sort_keys=True),
+            json.dumps(after[key], sort_keys=True)))
+
+
+def others(data):
+    return {k: v for k, v in (data or {}).items() if k != 'hooks'}
+
+
+oa, ob = others(pre), others(post)
+for key in sorted(set(oa) | set(ob)):
+    if key not in oa:
+        lines.append('ADDED     key %s' % key)
+    elif key not in ob:
+        lines.append('REMOVED   key %s' % key)
+    elif oa[key] != ob[key]:
+        lines.append('MODIFIED  key %s' % key)
+
+# Backstop: a 'hooks' value that is not a dict (hand-edited, or a schema this
+# reporter does not model) diffs to nothing above. Report it rather than let an
+# unmodelled shape read as "unchanged" — an unreadable diff is not a clean one.
+if not lines and (pre or {}).get('hooks') != (post or {}).get('hooks'):
+    lines.append('MODIFIED  key hooks')
+
+for line in lines:
+    print('    ' + line)
+sys.exit(0 if lines else 1)
+PY
+}
+
+# settings_guard_capture — snapshot the scope's settings file BEFORE the
+# delegate runs, and take the timestamped rollback copy.
+settings_guard_capture() {
+    local tmp
+    tmp="$(settings_guard_tmpdir)"
+    SETTINGS_PRE_SNAPSHOT="${tmp}/settings.pre.json"
+    rm -f "${SETTINGS_PRE_SNAPSHOT}"
+    if [ -f "${SETTINGS_FILE}" ]; then
+        SETTINGS_PRE_EXISTED=1
+        cp "${SETTINGS_FILE}" "${SETTINGS_PRE_SNAPSHOT}"
+        SETTINGS_BACKUP_PATH="$(settings_rotating_path "${SETTINGS_FILE}" "bak")"
+        cp "${SETTINGS_FILE}" "${SETTINGS_BACKUP_PATH}"
+    else
+        SETTINGS_PRE_EXISTED=0
+        SETTINGS_BACKUP_PATH=""
+    fi
+}
+
+# settings_guard_settle — report, then either keep the delegate's write
+# (--merge-settings) or restore the file (default, print-only).
+settings_guard_settle() {
+    local tmp post report changed=0
+    tmp="$(settings_guard_tmpdir)"
+    post="${tmp}/settings.post.json"
+    report="${tmp}/settings.report.txt"
+    rm -f "${post}"
+    [ -f "${SETTINGS_FILE}" ] && cp "${SETTINGS_FILE}" "${post}"
+
+    if settings_report_mutations "${SETTINGS_PRE_SNAPSHOT}" "${post}" "${SETTINGS_FILE}" > "${report}"; then
+        changed=1
+    fi
+
+    echo
+    bold "  settings.json (${SETTINGS_FILE})"
+    if [ "${MERGE_SETTINGS}" = "1" ]; then
+        if [ "${changed}" = "1" ]; then
+            yellow "  --merge-settings given — this install CHANGED your settings.json:"
+            cat "${report}"
+            [ -n "${SETTINGS_BACKUP_PATH}" ] && green "  Roll back with: cp ${SETTINGS_BACKUP_PATH} ${SETTINGS_FILE}"
+        else
+            green "  unchanged — this install added, removed and modified nothing."
+        fi
+        return 0
+    fi
+
+    # Print-only (the default). Restore whenever the BYTES differ, not only
+    # when the semantics do: a re-serialization with no semantic change is
+    # still a write to a file this installer promises not to write.
+    if [ "${changed}" = "1" ]; then
+        SETTINGS_PROPOSED_PATH="$(settings_rotating_path "${SETTINGS_FILE}" "proposed")"
+        red   "  This install's step-6 delegate WOULD have changed settings.json:"
+        cat "${report}"
+        yellow "  NOT APPLIED. ${SETTINGS_CONTRACT}"
+        yellow "  Ignore the delegate's own 'settings snippet merged' line above — this guard"
+        yellow "  reverted that write."
+        [ -f "${SETTINGS_FILE}" ] && cp "${SETTINGS_FILE}" "${SETTINGS_PROPOSED_PATH}"
+        yellow "  The would-be result is parked, unapplied, at:"
+        yellow "    ${SETTINGS_PROPOSED_PATH}"
+        yellow "  Apply it by re-running with --merge-settings, or by merging that file yourself."
+    else
+        green "  unchanged — this install added, removed and modified nothing."
+    fi
+
+    if [ "${SETTINGS_PRE_EXISTED}" = "1" ]; then
+        if ! cmp -s "${SETTINGS_PRE_SNAPSHOT}" "${SETTINGS_FILE}"; then
+            cp "${SETTINGS_PRE_SNAPSHOT}" "${SETTINGS_FILE}"
+        fi
+    elif [ -f "${SETTINGS_FILE}" ]; then
+        rm -f "${SETTINGS_FILE}"
+    fi
+    [ -n "${SETTINGS_BACKUP_PATH}" ] && green "  Pre-install rollback copy: ${SETTINGS_BACKUP_PATH}"
+    return 0
+}
+# --- END settings-guard (SABLE-gxsji) ---
 
 # --- Canonical-checkout guard (SABLE-s6qk) ---
 # Running the installer from a linked git worktree re-derives every hook copy
@@ -350,13 +617,32 @@ echo
 # 6. Install the orchestration (multi-manager) layer by DELEGATING to the
 # complete-layer installer (SABLE-ppy). Always runs — there is one install
 # (SABLE-ssws.1). The delegate installs all hooks + registry + skills + the four
-# pane roles and merges the settings snippet.
+# pane roles, and it WANTS to merge the settings snippet into the scope's
+# settings.json.
+#
+# THE DELEGATE'S SETTINGS WRITE IS FENCED (SABLE-gxsji). It runs between
+# settings_guard_capture and settings_guard_settle. By default the guard
+# restores the file and prints exactly what the merge would have added,
+# removed or modified; --merge-settings keeps the write and prints the same
+# report. Neither path is silent, which is the whole point: the 2026-07-23
+# incident was a PreToolUse interceptor merged fleet-wide by an ordinary
+# install with nothing in the output naming it.
+#
+# The revert is a REVERT, not a prevention — the delegate does write the file
+# and the guard puts it back a moment later, so a session starting inside that
+# window reads the merged file. Removing the window means giving the delegate
+# its own print-only mode, which was outside this bead's declared file
+# footprint. Tracked as SABLE-93txr, which also covers the delegate's DIRECT
+# invocation (still unguarded) and its single-slot .bak.
 bold "Step 6/8: Orchestration (multi-manager) layer"
 if [ "$DRY_RUN" = "1" ]; then
     yellow "  would delegate: sable-orchestration-install ${ORCH_SCOPE_FLAG}"
+    yellow "  would NOT change ${SETTINGS_FILE} — ${SETTINGS_CONTRACT}"
 elif [ -x "${REPO_DIR}/bin/sable-orchestration-install" ]; then
+    settings_guard_capture
     green "  Delegating to sable-orchestration-install (${ORCH_SCOPE_FLAG})..."
     SABLE_PROJECT_DIR="${PROJECT_ROOT}" bash "${REPO_DIR}/bin/sable-orchestration-install" "${ORCH_SCOPE_FLAG}"
+    settings_guard_settle
 else
     yellow "  bin/sable-orchestration-install not found — skipping the orchestration layer"
 fi
@@ -389,20 +675,19 @@ echo
 
 # 8. Print the BASE-tier settings.json snippet for manual pasting.
 #
-# SCOPE OF THE "we do not auto-edit" promise, which used to be stated as if it
-# covered the whole file (SABLE-nn54x): it covers THIS block only — the
-# base-tier hooks (tdd-evidence, tdd-gate, bead-description-gate, ...). Step 6
-# delegates to sable-orchestration-install, which DOES merge the orchestration
-# (multi-manager) rows into the same settings file automatically, backing it up
-# first and never clobbering existing entries. An operator reading this step in
-# isolation previously came away believing settings.json was untouched when it
-# had already been modified. Both halves are printed below so the contract and
-# the behaviour agree.
+# HISTORY OF THIS COMMENT, kept because it is the shape of the defect. It once
+# read "do NOT auto-edit — settings is too important to clobber" as if that
+# covered the whole file, while step 6's delegate merged the orchestration rows
+# into that same file on every run (SABLE-nn54x narrowed the wording to the
+# base-tier block and said so). SABLE-gxsji then took the other half: rather
+# than documenting the auto-merge, the auto-merge now requires consent. So the
+# promise is once again whole-file, and this time it is enforced in code by the
+# settings-guard around step 6 rather than asserted in prose.
 bold "Step 8/8: Settings.json hook block (base tier — paste this yourself)"
 echo "Add the following block to your ${SETTINGS_FILE} under the top-level 'hooks' key."
 echo "If you already have a 'hooks' key, merge carefully (don't overwrite existing entries)."
-echo "NOTE: this block is the BASE tier only. The orchestration (multi-manager) rows were"
-echo "already merged into ${SETTINGS_FILE} by step 6 — do not paste those again."
+echo "NOTE: this block is the BASE tier only. The orchestration (multi-manager) rows are"
+echo "printed by step 6 above and are NOT applied unless you re-run with --merge-settings."
 echo
 cat <<EOF
 {
@@ -510,8 +795,10 @@ fi
 echo
 
 bold "Orchestration hooks"
-echo "The orchestration settings snippet was merged into the scope's settings file"
-echo "automatically by sable-orchestration-install (backed up; existing entries kept)."
+echo "${SETTINGS_CONTRACT}"
+echo "Step 6 above printed the exact add/remove/modify set the orchestration snippet"
+echo "wants, and (unless you passed --merge-settings) parked the would-be result as a"
+echo ".proposed file next to your settings.json instead of applying it."
 echo "sable-orchestration-install also STAGES (never activates) the reconciliation"
 echo "floor's host timer artifacts (systemd --user unit + cron fallback line) under"
 echo "${CLAUDE_DIR}/sable/reconcile-timer/. Activate with the ONE self-verifying"
@@ -525,7 +812,8 @@ bold "Install complete."
 echo
 echo "Next steps:"
 echo "  1. Paste the BASE-tier hook block above into ${SETTINGS_FILE} (merge with existing"
-echo "     config). The orchestration rows are already merged — step 6 did that for you."
+echo "     config), and apply the orchestration rows step 6 reported — either by merging its"
+echo "     .proposed file yourself or by re-running: bash install.sh --merge-settings"
 echo "  2. In your project: bd init && bd hooks install"
 echo "  3. RESTART Claude Code so the agent defs, /sable-plan /sable-execute /gaudi /columbo, and hooks register."
 echo "  4. Start your session:  sable-launch   (Lincoln only, wraps sable-tmux; managers spawn on demand)"
