@@ -44,6 +44,26 @@ diff). This file proves the fix against the gate the fleet actually runs:
     still denies a genuine pruning diff through the same real path — the
     fix is a precision fix on the PRE-filter (detect_pruning), not a
     weakening of the actual coverage measurement.
+
+SABLE-a4i8h adds a second real-repo pair to the same synthetic harness, this
+time driven through the merge gate's OWN entry point
+(sable_gate_promote_lib.assert_coverage_floor) rather than the gate script
+alone, because the defect it covers lived in the PRE-filter that decides
+whether the script is ever run at all:
+
+  * SKIPIF-ONLY PRUNING, DENIED — a tip whose ONLY pruning signal is a
+    `@pytest.mark.skipif` decorator (no test function removed, no test file
+    deleted), which erases the coverage of a source branch added in the same
+    commit. Pre-fix this scored NOT-pruning, so assert_coverage_floor
+    returned without consulting any check and the diff promoted with no
+    event. Must now raise GateError(EXIT_COVERAGE_FLOOR).
+
+  * SKIPIF-ONLY, NON-PRUNING SIBLING, ALLOWED — the same harness with an
+    ordinary test added and no marker anywhere: assert_coverage_floor must
+    return silently and must not run the (slow, real) check at all. Without
+    this leg the deny above is equally consistent with a floor that now
+    denies everything, which is the SABLE-r5pfw erosion the fix must not
+    cause.
 """
 from __future__ import annotations
 
@@ -59,6 +79,8 @@ GATE_SCRIPT = REPO_ROOT / ".github" / "ci" / "diff-cover-gate.sh"
 
 sys.path.insert(0, str(REPO_ROOT / "bin"))
 import sable_coverage_floor_lib as cf  # noqa: E402
+import sable_gate_classify_lib as classify  # noqa: E402
+import sable_gate_promote_lib as promote_lib  # noqa: E402
 
 BE4LO7_BASE = "5ac902e"
 BE4LO7_TIP = "e3e776a"
@@ -231,6 +253,154 @@ def test_synthetic_genuine_pruning_pair_still_denies_through_the_real_gate(tmp_p
         f"uncovered branch, only covering test deleted) — this would mean "
         f"the SABLE-owix4 fix weakened the real check, not just the "
         f"pre-filter. output:\n{cp.stdout}")
+
+
+# --------------------------------------------------------------------------
+# SABLE-a4i8h — skipif-only pruning, through the gate's own entry point
+# --------------------------------------------------------------------------
+
+def _commit_skipif_only_pair(repo: Path):
+    """Build a base/tip pair whose ONLY pruning signal is a newly-added
+    `@pytest.mark.skipif`. The tip also grows an uncovered branch in the
+    source the skipped test was the sole cover for, so the skip genuinely
+    erases coverage — which is the whole reason this shape must reach the
+    real check instead of being waved through by the pre-filter."""
+    (repo / "bin" / "foo.py").write_text(
+        "def foo(x):\n"
+        "    return x\n")
+    (repo / "bin" / "test_foo.py").write_text(
+        "import sys, os\n"
+        "sys.path.insert(0, os.path.dirname(__file__))\n"
+        "from foo import foo\n"
+        "\n"
+        "def test_foo():\n"
+        "    assert foo(1) == 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base: foo() and its only test")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+
+    # tip: foo() grows an uncovered branch, and its only test is SKIPPED —
+    # not removed, not renamed, not deleted. The skipif is the only signal.
+    (repo / "bin" / "foo.py").write_text(
+        "def foo(x):\n"
+        "    if x < 0:\n"
+        "        return -x\n"
+        "    return x\n")
+    (repo / "bin" / "test_foo.py").write_text(
+        "import sys, os\n"
+        "import pytest\n"
+        "sys.path.insert(0, os.path.dirname(__file__))\n"
+        "from foo import foo\n"
+        "\n"
+        '@pytest.mark.skipif(True, reason="env-gated, like the bd/dolt guards")\n'
+        "def test_foo():\n"
+        "    assert foo(1) == 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "tip: add uncovered branch, skipif its only test")
+    return base_sha, _git(repo, "rev-parse", "HEAD")
+
+
+def test_skipif_only_pruning_diff_is_denied_through_the_real_gate(tmp_path, monkeypatch):
+    """*** THE INTEGRATION LEG OF SABLE-a4i8h. *** REAL git repo, REAL `git
+    diff` (no hand-built diff string anywhere in this test), REAL
+    diff-cover-gate.sh with real pytest + coverage.py + diff-cover, driven
+    through the merge gate's own entry point — sable_gate_promote_lib.
+    assert_coverage_floor, the function promote() actually calls.
+
+    The defect lived in the PRE-filter, so testing the gate SCRIPT alone
+    could never have caught it: pre-fix, detect_pruning scored this diff
+    NOT-pruning, assert_coverage_floor returned without running any check,
+    and the branch promoted with its coverage silently erased. The floor
+    must now DENY with EXIT_COVERAGE_FLOOR (27), and the deny message must
+    NAME the marker's file and line — the acceptance criterion, asserted
+    end-to-end on the string a seat would actually read."""
+    monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "300")
+    repo = _init_synthetic_repo(tmp_path / "skipif-only-repo")
+    base_sha, tip_sha = _commit_skipif_only_pair(repo)
+
+    diff_text = _git(repo, "diff", f"{base_sha}...{tip_sha}")
+    signal = cf.detect_pruning(diff_text)
+    assert signal.is_pruning, (
+        f"a real skipif-only pruning diff scored NOT-pruning — this is the "
+        f"exact fail-open: {diff_text}")
+    # The skipif is the ONLY signal: no def count change, no deleted file.
+    assert signal.net_test_function_delta == 0
+    assert signal.deleted_test_files == []
+    assert signal.newly_skipped_markers == 1
+
+    marker = signal.skip_markers[0]
+    assert marker.path == "bin/test_foo.py"
+    assert marker.marker == "pytest.mark.skipif"
+    # The reported line number is checked against the REAL post-image, so a
+    # plausible-but-wrong line cannot pass: read the file at the tip and
+    # confirm the named line is the marker it claims.
+    tip_lines = (repo / "bin" / "test_foo.py").read_text().splitlines()
+    assert tip_lines[marker.line - 1].strip() == marker.text
+
+    with pytest.raises(classify.GateError) as excinfo:
+        promote_lib.assert_coverage_floor(str(repo), "SABLE-a4i8h",
+                                          base_sha, tip_sha, None)
+    assert excinfo.value.code == classify.EXIT_COVERAGE_FLOOR
+    message = str(excinfo.value)
+    # DENIED-BECAUSE-MEASURED, not denied-because-unmeasurable. Both outcomes
+    # exit 27, so a test that asserted only the code would pass just as
+    # happily if diff-cover never ran (missing script, failed worktree add,
+    # timeout) — which would make this leg a green light for a path that was
+    # never exercised, the same silent-instrument shape as the defect itself.
+    assert "check FAILED" in message, (
+        f"the floor denied, but not because the real check ran and failed — "
+        f"this leg proves nothing about the real path. message: {message}")
+    assert "no coverage-delta check" not in message
+    assert "bin/test_foo.py:6" in message, (
+        f"the deny must NAME the marker's file and line — a count with no "
+        f"operands is what cost a seat a hand-diff. message: {message}")
+    assert "skipif" in message
+
+
+def test_a_non_pruning_diff_still_allows_through_the_real_gate(tmp_path, monkeypatch):
+    """KNOWN-POSITIVE / LOAD-BEARING NEGATIVE CONTROL, same real path. The
+    deny above is equally consistent with a floor that now denies
+    everything, and a gate that fires on ordinary test edits trains the seat
+    to reach for --coverage-override by reflex (SABLE-r5pfw) — strictly
+    worse than the under-match this bead fixes. Same harness, same entry
+    point, tip adds an ordinary test and no marker: assert_coverage_floor
+    must return silently.
+
+    It must also do so WITHOUT running the real check. That is asserted, not
+    assumed: run_coverage_floor_check is monkeypatched to explode, so if the
+    pre-filter ever starts classifying a plain test addition as pruning this
+    test fails loudly instead of merely getting slower."""
+    monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "300")
+    repo = _init_synthetic_repo(tmp_path / "non-pruning-repo")
+    (repo / "bin" / "foo.py").write_text("def foo(x):\n    return x\n")
+    (repo / "bin" / "test_foo.py").write_text(
+        "import sys, os\n"
+        "sys.path.insert(0, os.path.dirname(__file__))\n"
+        "from foo import foo\n"
+        "\n"
+        "def test_foo():\n"
+        "    assert foo(1) == 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+
+    with (repo / "bin" / "test_foo.py").open("a") as fh:
+        fh.write("\ndef test_foo_negative():\n    assert foo(-1) == -1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "tip: add an ordinary test, no markers")
+    tip_sha = _git(repo, "rev-parse", "HEAD")
+
+    def _explode(*a, **kw):
+        raise AssertionError(
+            "the coverage-delta check ran on a diff that adds a test and "
+            "prunes nothing — the pre-filter has broadened into a gate that "
+            "fires on everything (SABLE-r5pfw)")
+
+    monkeypatch.setattr(promote_lib, "run_coverage_floor_check", _explode)
+    signal = cf.detect_pruning(_git(repo, "diff", f"{base_sha}...{tip_sha}"))
+    assert not signal.is_pruning, signal.reasons
+    promote_lib.assert_coverage_floor(str(repo), "SABLE-a4i8h",
+                                      base_sha, tip_sha, None)
 
 
 def test_synthetic_rename_with_strengthened_assertion_passes_the_real_gate(tmp_path):
