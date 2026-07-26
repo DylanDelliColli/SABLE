@@ -552,10 +552,20 @@ def test_reconcile_fetch_failure_warns_but_continues(monkeypatch, capsys):
 
 
 def test_reconcile_fetch_success_no_warning(monkeypatch, capsys):
+    # SABLE-q0e3n note: the fake git must ANSWER `rev-parse` with a sha, or the
+    # sweep-start base pin fails to resolve and correctly emits its own (second,
+    # unrelated) warning. This assertion is still the full `err == ""` it always
+    # was — only the fixture changed, from a git that answers nothing to one
+    # that models a repo whose integration branch actually resolves.
+    def fake_git(repo, *args, check=False):
+        if args and args[0] == "rev-parse":
+            return _cp(args, 0, "a" * 40 + "\n")
+        return _cp(args, 0, "")
+
     monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
     monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: [])
     monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
-    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+    monkeypatch.setattr(smrh, "_git", fake_git)
     monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 0, ""))
 
     rc = smrh.reconcile("/repo", "origin", 10.0, dry_run=True)
@@ -1365,3 +1375,751 @@ def test_queued_branch_with_terminal_preview_is_still_stranded(monkeypatch):
     assert is_stranded is True, reason
     assert reason == "STRANDED"
     assert status == "closed"
+
+
+# ===========================================================================
+# SABLE-rhsuj: THE BEAD IS TRUE WHEN FILED AND ROTS AFTERWARDS.
+#
+# A [RECONCILE] bead asserts, in the present tense, "this branch is pushed and
+# UNMERGED". Chuck then merges it — CORRECT ACTION — which produces no event,
+# no failure and no update, so the bead outlives its own premise. Measured 5 of
+# 13 (38%) already-landed on one morning; 100% across a full shift. The remedy
+# is to RE-EVALUATE THE CONDITION AT READ TIME and retire the bead when the
+# work is CONTAINED at the spine, naming the landing sha.
+#
+# *** THE GOVERNING CONSTRAINT: PRESENCE PROBE, NEVER ABSENCE PROBE. *** The
+# retirement must NOT be keyed on the origin branch being GONE — a branch
+# deleted for cleanup, a bad push or a rename would retire a genuinely stranded
+# merge. test_reconcile_does_not_autoclose_on_deleted_but_uncontained_branch
+# below is the control for exactly that, and it is the one that fails if
+# someone implements the absence probe.
+# ===========================================================================
+
+BASE_SHA = "b" * 40
+LANDED_SHA = "1" * 40
+UNLANDED_SHA = "2" * 40
+
+
+def _reconcile_bead(branch, *, bead_id="RB-1", branch_sha=None):
+    """An open for-chuck bead of THIS FLOOR'S OWN filing (title produced by
+    reconcile_bead_title), optionally carrying the recorded branch_sha."""
+    rec = {"id": bead_id, "status": "open",
+           "title": smrh.reconcile_bead_title(branch),
+           "labels": ["for-chuck", "coord"]}
+    if branch_sha:
+        rec["metadata"] = {smrh.BRANCH_SHA_KEY: branch_sha}
+    return rec
+
+
+def _fake_git_containment(monkeypatch, *, existing_objects, ancestors,
+                          branch_tips, cherry_lines=()):
+    """A git that models an object database rather than a fixed rc.
+
+    `existing_objects` is the set of revs `cat-file -e` resolves — this is what
+    lets a test DELETE a branch (drop its ref from `branch_tips`) while the
+    commit object itself remains, and vice versa. `ancestors` is the set of
+    shas contained in the base. Calls are recorded on the returned list so a
+    test can assert WHICH probe ran."""
+    calls = []
+
+    def fake_git(repo, *args, check=False):
+        calls.append(args)
+        head = args[0] if args else ""
+        if head == "cat-file":
+            rev = args[-1].split("^")[0]
+            return _cp(args, 0 if rev in existing_objects else 128, "")
+        if head == "rev-parse":
+            ref = args[-1].split("^")[0]
+            for br, sha in branch_tips.items():
+                if ref.endswith("/" + br) or ref == br:
+                    return _cp(args, 0, sha + "\n")
+            return _cp(args, 1, "")
+        if head == "merge-base":
+            sha = args[2]
+            return _cp(args, 0 if sha in ancestors else 1, "")
+        if head == "cherry":
+            return _cp(args, 0, "\n".join(cherry_lines))
+        if head == "log":
+            return _cp(args, 0, "1000\n")
+        return _cp(args, 0, "")
+
+    monkeypatch.setattr(smrh, "_git", fake_git)
+    return calls
+
+
+# --- the three-valued containment vocabulary (pure) -------------------------
+
+@pytest.mark.parametrize("rc,expected", [
+    (0, smrh.CONTAINED),
+    (1, smrh.NOT_CONTAINED),
+    (128, smrh.CONTAINMENT_UNASSESSABLE),   # missing ref/object
+    (127, smrh.CONTAINMENT_UNASSESSABLE),   # broken git
+])
+def test_containment_verdict_from_rc_is_three_valued(rc, expected):
+    # SABLE-8b41.8: a two-valued probe renders "I could not look" identically
+    # to "it is not there", and the `|| echo NOT CONTAINED` idiom built on it
+    # reported a correct merge as lost. Neither error rc may collapse into a
+    # verdict.
+    assert smrh.containment_verdict_from_rc(rc) == expected
+
+
+# --- reconcile_bead_branch: only OUR OWN beads are auto-closable ------------
+
+def test_reconcile_bead_branch_round_trips_our_own_title():
+    assert smrh.reconcile_bead_branch(smrh.reconcile_bead_title("wk-foo")) == "wk-foo"
+
+
+@pytest.mark.parametrize("title", [
+    "[AUTO-NOTIFY] Review PR from optimus: wk-foo",      # hook-filed handoff
+    "merge wk-foo please",                               # hand-written
+    "[RECONCILE] stranded merge: tmux-only — no for-chuck handoff on record",  # not wk-*
+    "[RECONCILE] something else entirely",
+    None,
+    "",
+])
+def test_reconcile_bead_branch_refuses_beads_we_did_not_file(title):
+    # An auto-close may only retire a bead whose premise this floor AUTHORED
+    # and can therefore re-check. Retiring a human's coordination bead off a
+    # title match would close an instruction we never evaluated.
+    assert smrh.reconcile_bead_branch(title) is None
+
+
+# --- sha_contained_in_base: the presence probe + existence precondition -----
+
+def test_sha_contained_in_base_contained(monkeypatch):
+    _fake_git_containment(monkeypatch, existing_objects={LANDED_SHA, BASE_SHA},
+                          ancestors={LANDED_SHA}, branch_tips={})
+    verdict, detail = smrh.sha_contained_in_base("/repo", LANDED_SHA, BASE_SHA)
+    assert verdict == smrh.CONTAINED
+    assert LANDED_SHA in detail and BASE_SHA in detail
+
+
+def test_sha_contained_in_base_not_contained(monkeypatch):
+    _fake_git_containment(monkeypatch, existing_objects={UNLANDED_SHA, BASE_SHA},
+                          ancestors=set(), branch_tips={})
+    verdict, _ = smrh.sha_contained_in_base("/repo", UNLANDED_SHA, BASE_SHA)
+    assert verdict == smrh.NOT_CONTAINED
+
+
+def test_sha_contained_in_base_missing_object_is_could_not_assess(monkeypatch):
+    # THE EXISTENCE PRECONDITION (SABLE-8b41.8). An object git cannot resolve
+    # must be its OWN outcome — folding it into NOT_CONTAINED is the false
+    # alarm chuck hit; folding it into CONTAINED would silently retire a real
+    # strand whose evidence was merely cleaned up.
+    calls = _fake_git_containment(monkeypatch, existing_objects={BASE_SHA},
+                                  ancestors=set(), branch_tips={})
+    verdict, detail = smrh.sha_contained_in_base("/repo", LANDED_SHA, BASE_SHA)
+    assert verdict == smrh.CONTAINMENT_UNASSESSABLE
+    assert "could not assess" in detail
+    assert not any(a and a[0] == "merge-base" for a in calls), \
+        "the containment probe must not even RUN against an unresolvable object"
+
+
+@pytest.mark.parametrize("sha,base", [(None, BASE_SHA), (LANDED_SHA, None)])
+def test_sha_contained_in_base_missing_input_is_could_not_assess(monkeypatch, sha, base):
+    _fake_git_containment(monkeypatch, existing_objects={LANDED_SHA, BASE_SHA},
+                          ancestors={LANDED_SHA}, branch_tips={})
+    verdict, _ = smrh.sha_contained_in_base("/repo", sha, base)
+    assert verdict == smrh.CONTAINMENT_UNASSESSABLE
+
+
+# --- THE HEADLINE PAIR, named in the bead's own test spec -------------------
+
+def test_reconcile_autocloses_bead_whose_branch_is_now_contained(monkeypatch):
+    """POSITIVE: branch B is now an ancestor of the base, so the [RECONCILE]
+    bead for B is CLOSED and the close reason carries the landing SHA."""
+    _fake_git_containment(monkeypatch,
+                          existing_objects={LANDED_SHA, BASE_SHA},
+                          ancestors={LANDED_SHA},
+                          branch_tips={"wk-landed": LANDED_SHA})
+    closes = []
+    monkeypatch.setattr(smrh, "close_reconcile_bead",
+                        lambda repo, bead_id, reason: closes.append((bead_id, reason))
+                        or _cp(("close",), 0, ""))
+
+    bead = _reconcile_bead("wk-landed", bead_id="RB-LANDED", branch_sha=LANDED_SHA)
+    closed, kept, unassessable = smrh.autoclose_landed_reconcile_beads(
+        "/repo", "origin", "trunk", BASE_SHA, [bead], dry_run=False)
+
+    assert [b for b, _, _ in closed] == ["RB-LANDED"], (closed, kept, unassessable)
+    assert kept == [] and unassessable == []
+    assert len(closes) == 1
+    bead_id, reason = closes[0]
+    assert bead_id == "RB-LANDED"
+    assert LANDED_SHA in reason, f"close reason must carry the landing SHA: {reason}"
+    assert BASE_SHA in reason, reason
+    assert "AUTO-CLOSED" in reason and "SABLE-rhsuj" in reason
+
+
+def test_reconcile_does_not_autoclose_on_deleted_but_uncontained_branch(monkeypatch):
+    """*** THE PLANT-AND-FAIL CONTROL FOR THIS WHOLE CHANGE. ***
+
+    The origin ref is DELETED (no branch tip resolves) but the work was never
+    merged (the recorded sha is not an ancestor of the base). The bead MUST
+    stay OPEN.
+
+    This is the test that bites if someone keys the auto-close on the branch
+    being GONE — an ABSENCE probe. Absence probes decay toward RELEASING: a
+    branch deleted for cleanup, a bad push or a rename is indistinguishable
+    from one deleted because it landed, and only one of those may retire a
+    handoff. Note the commit OBJECT deliberately still exists here, so the
+    probe can give a real NOT_CONTAINED answer rather than an ambiguous one —
+    that isolates 'the ref is gone' as the only thing an absence-keyed
+    implementation could be reading."""
+    calls = _fake_git_containment(monkeypatch,
+                                  existing_objects={UNLANDED_SHA, BASE_SHA},
+                                  ancestors=set(),              # never merged
+                                  branch_tips={})               # ref DELETED
+    closes = []
+    monkeypatch.setattr(smrh, "close_reconcile_bead",
+                        lambda repo, bead_id, reason: closes.append(bead_id)
+                        or _cp(("close",), 0, ""))
+
+    bead = _reconcile_bead("wk-deleted", bead_id="RB-STRANDED", branch_sha=UNLANDED_SHA)
+    closed, kept, unassessable = smrh.autoclose_landed_reconcile_beads(
+        "/repo", "origin", "trunk", BASE_SHA, [bead], dry_run=False)
+
+    assert closes == [], "a deleted-but-UNCONTAINED branch must not be auto-closed"
+    assert closed == []
+    assert [b for b, _, _ in kept] == ["RB-STRANDED"], (kept, unassessable)
+    assert unassessable == []
+    # ...and the verdict came from an actual containment probe, not from the
+    # ref lookup: a real merge-base ran against the recorded sha.
+    assert any(a and a[0] == "merge-base" and UNLANDED_SHA in a for a in calls), calls
+
+
+def test_reconcile_does_not_autoclose_when_containment_is_unassessable(monkeypatch):
+    # The third value. No recorded sha, no live ref, nothing to probe: the bead
+    # stays OPEN and is reported as unassessable — never quietly retired, and
+    # never counted as a clean 'still stranded' either.
+    _fake_git_containment(monkeypatch, existing_objects={BASE_SHA},
+                          ancestors=set(), branch_tips={})
+    monkeypatch.setattr(smrh, "close_reconcile_bead",
+                        lambda *a, **k: pytest.fail("must not close an unassessable bead"))
+
+    bead = _reconcile_bead("wk-gone", bead_id="RB-UNKNOWN")   # no branch_sha
+    closed, kept, unassessable = smrh.autoclose_landed_reconcile_beads(
+        "/repo", "origin", "trunk", BASE_SHA, [bead], dry_run=False)
+    assert closed == [] and kept == []
+    assert [b for b, _, _ in unassessable] == ["RB-UNKNOWN"]
+
+
+def test_autoclose_falls_back_to_the_live_ref_for_a_legacy_bead(monkeypatch):
+    # Beads filed BEFORE the branch_sha stamp existed carry no metadata. While
+    # their ref is still live the tip is probeable, so they auto-close too —
+    # the fallback is a PRESENCE read of the ref's tip, never an inference from
+    # its absence.
+    _fake_git_containment(monkeypatch,
+                          existing_objects={LANDED_SHA, BASE_SHA},
+                          ancestors={LANDED_SHA},
+                          branch_tips={"wk-legacy": LANDED_SHA})
+    monkeypatch.setattr(smrh, "close_reconcile_bead",
+                        lambda repo, bead_id, reason: _cp(("close",), 0, ""))
+    bead = _reconcile_bead("wk-legacy", bead_id="RB-LEGACY")  # no branch_sha
+    closed, _, _ = smrh.autoclose_landed_reconcile_beads(
+        "/repo", "origin", "trunk", BASE_SHA, [bead], dry_run=False)
+    assert [b for b, _, _ in closed] == ["RB-LEGACY"]
+
+
+def test_autoclose_retires_a_rebased_and_landed_branch(monkeypatch):
+    # SABLE-z7gue's shape: a rebase changes every SHA, so tip containment says
+    # NOT_CONTAINED for work that fully landed. The patch-id leg is still a
+    # PRESENCE probe (every unique commit is equivalent AT the spine).
+    _fake_git_containment(monkeypatch,
+                          existing_objects={UNLANDED_SHA, BASE_SHA},
+                          ancestors=set(),
+                          branch_tips={"wk-rebased": UNLANDED_SHA},
+                          cherry_lines=["- aaa1111", "- aaa2222"])
+    monkeypatch.setattr(smrh, "close_reconcile_bead",
+                        lambda repo, bead_id, reason: _cp(("close",), 0, ""))
+    bead = _reconcile_bead("wk-rebased", bead_id="RB-REBASED", branch_sha=UNLANDED_SHA)
+    closed, kept, _ = smrh.autoclose_landed_reconcile_beads(
+        "/repo", "origin", "trunk", BASE_SHA, [bead], dry_run=False)
+    assert [b for b, _, _ in closed] == ["RB-REBASED"], (closed, kept)
+
+
+def test_autoclose_does_not_retire_a_partially_landed_branch(monkeypatch):
+    # Counterpart: a '+' in `git cherry` means at least one commit is genuinely
+    # new, so the branch is NOT fully landed and its bead stays open.
+    _fake_git_containment(monkeypatch,
+                          existing_objects={UNLANDED_SHA, BASE_SHA},
+                          ancestors=set(),
+                          branch_tips={"wk-partial": UNLANDED_SHA},
+                          cherry_lines=["- aaa1111", "+ bbb2222"])
+    monkeypatch.setattr(smrh, "close_reconcile_bead",
+                        lambda *a, **k: pytest.fail("must not close a partially-landed branch"))
+    bead = _reconcile_bead("wk-partial", bead_id="RB-PARTIAL", branch_sha=UNLANDED_SHA)
+    closed, kept, _ = smrh.autoclose_landed_reconcile_beads(
+        "/repo", "origin", "trunk", BASE_SHA, [bead], dry_run=False)
+    assert closed == []
+    assert [b for b, _, _ in kept] == ["RB-PARTIAL"]
+
+
+def test_autoclose_never_touches_a_bead_this_floor_did_not_file(monkeypatch):
+    # Even when the branch IS contained: a hook-filed [AUTO-NOTIFY] handoff
+    # asserts a condition we did not author and did not re-check.
+    _fake_git_containment(monkeypatch,
+                          existing_objects={LANDED_SHA, BASE_SHA},
+                          ancestors={LANDED_SHA},
+                          branch_tips={"wk-landed": LANDED_SHA})
+    monkeypatch.setattr(smrh, "close_reconcile_bead",
+                        lambda *a, **k: pytest.fail("closed a bead we did not file"))
+    foreign = {"id": "HOOK-1", "status": "open",
+               "title": "[AUTO-NOTIFY] Review PR from optimus: wk-landed"}
+    closed, kept, unassessable = smrh.autoclose_landed_reconcile_beads(
+        "/repo", "origin", "trunk", BASE_SHA, [foreign], dry_run=False)
+    assert (closed, kept, unassessable) == ([], [], [])
+
+
+def test_autoclose_closes_nothing_when_the_corpus_is_unreadable(monkeypatch):
+    # open_for_chuck_beads returns None on a bd failure (SABLE-vif5e). Acting
+    # on a corpus we could not read is how a transient failure becomes a bulk
+    # retirement.
+    monkeypatch.setattr(smrh, "close_reconcile_bead",
+                        lambda *a, **k: pytest.fail("closed against an unreadable corpus"))
+    assert smrh.autoclose_landed_reconcile_beads(
+        "/repo", "origin", "trunk", BASE_SHA, None, dry_run=False) == ([], [], [])
+
+
+def test_autoclose_dry_run_closes_nothing(monkeypatch):
+    _fake_git_containment(monkeypatch,
+                          existing_objects={LANDED_SHA, BASE_SHA},
+                          ancestors={LANDED_SHA},
+                          branch_tips={"wk-landed": LANDED_SHA})
+    monkeypatch.setattr(smrh, "close_reconcile_bead",
+                        lambda *a, **k: pytest.fail("--dry-run must issue no bd close"))
+    bead = _reconcile_bead("wk-landed", branch_sha=LANDED_SHA)
+    closed, _, _ = smrh.autoclose_landed_reconcile_beads(
+        "/repo", "origin", "trunk", BASE_SHA, [bead], dry_run=True)
+    assert len(closed) == 1 and "[dry-run]" in closed[0][2]
+
+
+def test_autoclose_reports_a_failed_close_instead_of_counting_it(monkeypatch):
+    # A close that bd REJECTED must never be reported as retired — SABLE-u0c6's
+    # rule (a denied close mis-reported as success strands the bead) applied to
+    # the automated path.
+    _fake_git_containment(monkeypatch,
+                          existing_objects={LANDED_SHA, BASE_SHA},
+                          ancestors={LANDED_SHA},
+                          branch_tips={"wk-landed": LANDED_SHA})
+    monkeypatch.setattr(smrh, "close_reconcile_bead",
+                        lambda repo, bead_id, reason: _cp(("close",), 1, "gate denied"))
+    bead = _reconcile_bead("wk-landed", bead_id="RB-DENIED", branch_sha=LANDED_SHA)
+    closed, _, unassessable = smrh.autoclose_landed_reconcile_beads(
+        "/repo", "origin", "trunk", BASE_SHA, [bead], dry_run=False)
+    assert closed == []
+    assert [b for b, _, _ in unassessable] == ["RB-DENIED"]
+    assert "close FAILED" in unassessable[0][2]
+
+
+# --- the filed bead must RECORD the sha its own auto-close will probe -------
+
+def test_filed_bead_records_the_branch_sha(monkeypatch, capsys):
+    bd_calls = []
+
+    def fake_bd(repo, *args, check=False):
+        bd_calls.append(args)
+        if args and args[0] == "create":
+            return _cp(args, 0, json.dumps({"id": "NEW-1", "status": "open"}))
+        return _cp(args, 0, "")
+
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: ["wk-x"])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+    monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)
+    monkeypatch.setattr(smrh, "branch_content_contained", lambda *a, **k: (False, "new"))
+    monkeypatch.setattr(smrh, "find_work_bead_hold", lambda repo, br: None)
+    monkeypatch.setattr(smrh, "find_work_bead_matched_pair", lambda repo, br: None)
+    monkeypatch.setattr(smrh, "find_work_bead_status", lambda repo, branch: "closed")
+    monkeypatch.setattr(smrh, "branch_tip_age_seconds", lambda *a, **k: 9999.0)
+    monkeypatch.setattr(smrh, "branch_tip_sha", lambda repo, remote, br: UNLANDED_SHA)
+    monkeypatch.setattr(smrh, "resolve_base_sha", lambda *a, **k: BASE_SHA)
+    monkeypatch.setattr(smrh, "reverify_containment_before_filing",
+                        lambda *a, **k: (smrh.NOT_CONTAINED, "still unmerged"))
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+    monkeypatch.setattr(smrh, "_bd", fake_bd)
+
+    assert smrh.reconcile("/repo", "origin", 10.0, dry_run=False) == 0
+    updates = [a for a in bd_calls if a and a[0] == "update"]
+    assert len(updates) == 1, bd_calls
+    assert f"{smrh.BRANCH_SHA_KEY}={UNLANDED_SHA}" in updates[0], updates[0]
+    # ...and the description carries it too, so the evidence survives a lost
+    # metadata write and is readable by a human.
+    creates = [a for a in bd_calls if a and a[0] == "create"]
+    assert any(UNLANDED_SHA in part for part in creates[0]), creates[0]
+
+
+# ===========================================================================
+# SABLE-q0e3n: THE BEAD IS FALSE AT THE MOMENT OF FILING.
+#
+# A sweep that STRADDLES a landing re-resolved the base REF per branch, so a
+# concurrent promote moved the spine mid-run: three already-merged branches
+# were reclassified HELD / QUEUED-AT-SEAT and a durable, UNSATISFIABLE
+# stranded handoff (SABLE-kiem2) was filed for a branch that was contained and
+# whose ref was already deleted.
+#
+# *** FOUR MANUAL SWEEPS ACROSS TWO LANES ALL SELF-REPORTED "0 filed". The
+# attended path is 4-for-4 clean against one durable false filing from the
+# unattended timer. So a test that RUNS THE SWEEP ON A QUIET REPO PASSES
+# AGAINST THE UNFIXED CODE AND PROVES NOTHING — the race must be SIMULATED,
+# not waited for. Below, the spine MOVES between two branch evaluations
+# inside one sweep; the integration leg drives a real concurrent push. ***
+# ===========================================================================
+
+def test_q0e3n_every_branch_is_evaluated_against_the_sweep_start_sha(monkeypatch, capsys):
+    """THE unit named in q0e3n's spec: given a fixture where the base MOVES
+    between two branch evaluations within one sweep, assert every branch is
+    evaluated against the sha resolved at sweep start.
+
+    The base ref is rigged to return a DIFFERENT sha on each `rev-parse` — a
+    promote landing mid-sweep. If any containment probe names the base REF
+    instead of the pinned sha, the two branches get judged against two
+    different spines and this test sees it directly in the recorded argv."""
+    spine = iter(["s" * 40, "t" * 40, "u" * 40, "v" * 40, "w" * 40])
+    seen_bases = []
+
+    def fake_git(repo, *args, check=False):
+        head = args[0] if args else ""
+        if head == "rev-parse":
+            ref = args[-1]
+            if "trunk" in ref:
+                return _cp(args, 0, next(spine, "z" * 40) + "\n")
+            return _cp(args, 0, UNLANDED_SHA + "\n")
+        if head == "merge-base":
+            seen_bases.append(args[-1])       # whatever the base argument was
+            return _cp(args, 1, "")
+        if head == "cherry":
+            seen_bases.append(args[1])        # `git cherry <base> <head>`
+            return _cp(args, 0, "+ aaa1111")
+        if head == "log":
+            return _cp(args, 0, "1000\n")
+        return _cp(args, 0, "")
+
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches",
+                        lambda repo, remote: ["wk-a", "wk-b"])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+    monkeypatch.setattr(smrh, "find_work_bead_hold", lambda repo, br: None)
+    monkeypatch.setattr(smrh, "find_work_bead_matched_pair", lambda repo, br: None)
+    monkeypatch.setattr(smrh, "find_work_bead_status", lambda repo, branch: "open")
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+    monkeypatch.setattr(smrh, "_git", fake_git)
+    monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 0, "[]"))
+
+    assert smrh.reconcile("/repo", "origin", 10.0, dry_run=True) == 0
+
+    pinned = "s" * 40                      # the FIRST spine value = sweep start
+    assert seen_bases, "no containment probe ran at all"
+    assert set(seen_bases) == {pinned}, (
+        "every containment probe in one sweep must name the sweep-start sha; "
+        f"these named something else: {sorted(set(seen_bases) - {pinned})}")
+    assert pinned in capsys.readouterr().out, "the pinned base sha must be reported"
+
+
+def test_q0e3n_unpinnable_base_warns_instead_of_degrading_silently(monkeypatch, capsys):
+    # A base that will not resolve means the straddle protection is OFF for
+    # this cadence. It still sweeps (degraded > nothing) but it must SAY SO —
+    # a silent degradation reads identical to a protected sweep.
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: [])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 1, ""))
+    monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 0, ""))
+
+    assert smrh.reconcile("/repo", "origin", 10.0, dry_run=True) == 0
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "base sha" in err and "q0e3n" in err.lower(), err
+
+
+# --- part 2: containment is decided BEFORE the held / queued joins ----------
+
+def test_q0e3n_a_landed_branch_can_never_be_labelled_held(monkeypatch, capsys):
+    """A HELD label on an already-merged branch is INCOHERENT, and worse, held
+    branches are re-reported every cadence BY DESIGN — so a spurious hold is
+    self-perpetuating noise in the one report that must stay trustworthy. The
+    fix is not 'containment wins the tie'; it is that the hold join must not
+    happen at all for a contained branch."""
+    hold_lookups = []
+
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: ["wk-landed"])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+    monkeypatch.setattr(smrh, "resolve_base_sha", lambda *a, **k: BASE_SHA)
+    monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)   # tip says unmerged
+    monkeypatch.setattr(smrh, "branch_content_contained",
+                        lambda *a, **k: (True, "content-contained(2 commit(s))"))
+    monkeypatch.setattr(smrh, "find_work_bead_hold",
+                        lambda repo, br: hold_lookups.append(br) or smrh.hold_from_bead(
+                            _bead(hold="do not merge", by="tarzan")))
+    monkeypatch.setattr(smrh, "find_work_bead_matched_pair",
+                        lambda repo, br: pytest.fail("joined a landed branch"))
+    monkeypatch.setattr(smrh, "branch_queued_at_seat",
+                        lambda *a, **k: pytest.fail("queued-join on a landed branch"))
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+    monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 0, "[]"))
+
+    assert smrh.reconcile("/repo", "origin", 10.0, dry_run=False) == 0
+    out = capsys.readouterr().out
+    assert hold_lookups == [], "a contained branch must not even be joined for a hold"
+    assert "wk-landed: landed-under-different-sha" in out, out
+    assert "HELD wk-landed" not in out, out
+    assert "0 held branch(es)" in out, out
+
+
+def test_q0e3n_an_unlanded_held_branch_is_still_reported_held(monkeypatch, capsys):
+    # NEGATIVE CONTROL for the reorder: the hold machinery must still work for
+    # a branch that has NOT landed, or the fix above would be indistinguishable
+    # from having broken hold reporting outright.
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: ["wk-held"])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+    monkeypatch.setattr(smrh, "resolve_base_sha", lambda *a, **k: BASE_SHA)
+    monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)
+    monkeypatch.setattr(smrh, "branch_content_contained", lambda *a, **k: (False, "new"))
+    monkeypatch.setattr(smrh, "find_work_bead_hold",
+                        lambda repo, br: smrh.hold_from_bead(
+                            _bead(hold="do not merge", by="tarzan",
+                                  since=_iso_days_ago_wallclock(0.1), until="review")))
+    monkeypatch.setattr(smrh, "find_work_bead_matched_pair", lambda repo, br: None)
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+    monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 0, "[]"))
+
+    assert smrh.reconcile("/repo", "origin", 10.0, dry_run=False) == 0
+    out = capsys.readouterr().out
+    assert "HELD wk-held" in out, out
+    assert "1 held branch(es)" in out, out
+
+
+# --- part 3: the filing path re-verifies containment immediately before create
+
+def test_q0e3n_filing_is_suppressed_when_the_branch_landed_mid_sweep(monkeypatch, capsys):
+    """The kiem2 shape. Classification (against the sweep-start base) says
+    STRANDED; by the time we are about to WRITE, the branch has landed. A
+    contained branch must NEVER produce a stranded bead."""
+    bd_calls = []
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: ["wk-raced"])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+    monkeypatch.setattr(smrh, "resolve_base_sha", lambda *a, **k: BASE_SHA)
+    monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)
+    monkeypatch.setattr(smrh, "branch_content_contained", lambda *a, **k: (False, "new"))
+    monkeypatch.setattr(smrh, "find_work_bead_hold", lambda repo, br: None)
+    monkeypatch.setattr(smrh, "find_work_bead_matched_pair", lambda repo, br: None)
+    monkeypatch.setattr(smrh, "find_work_bead_status", lambda repo, branch: "closed")
+    monkeypatch.setattr(smrh, "branch_tip_age_seconds", lambda *a, **k: 9999.0)
+    monkeypatch.setattr(smrh, "branch_queued_at_seat", lambda *a, **k: (False, "no-preview-ref"))
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+    # the landing happens between classification and the write
+    monkeypatch.setattr(smrh, "reverify_containment_before_filing",
+                        lambda *a, **k: (smrh.CONTAINED, f"{LANDED_SHA} is contained in {BASE_SHA}"))
+    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+    monkeypatch.setattr(smrh, "_bd",
+                        lambda repo, *a, check=False: bd_calls.append(a) or _cp(a, 0, "[]"))
+
+    assert smrh.reconcile("/repo", "origin", 10.0, dry_run=False) == 0
+    assert not any(a and a[0] == "create" for a in bd_calls), \
+        "a branch that landed during the sweep must file ZERO beads"
+    out = capsys.readouterr().out
+    assert "LANDED DURING THIS SWEEP" in out, out
+    assert "SUPPRESSED" in out, out
+
+
+@pytest.mark.parametrize("verdict", [smrh.NOT_CONTAINED, smrh.CONTAINMENT_UNASSESSABLE])
+def test_q0e3n_only_an_affirmative_containment_suppresses_the_filing(monkeypatch, verdict):
+    """BOTH the other verdicts must still FILE. The safe direction for a
+    detector is to keep the alarm: a redundant handoff is visible and cheap to
+    close, a suppressed real strand is neither. In particular a re-verify that
+    COULD NOT ASSESS must never be read as 'it landed'."""
+    bd_calls = []
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: ["wk-real"])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+    monkeypatch.setattr(smrh, "resolve_base_sha", lambda *a, **k: BASE_SHA)
+    monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)
+    monkeypatch.setattr(smrh, "branch_content_contained", lambda *a, **k: (False, "new"))
+    monkeypatch.setattr(smrh, "find_work_bead_hold", lambda repo, br: None)
+    monkeypatch.setattr(smrh, "find_work_bead_matched_pair", lambda repo, br: None)
+    monkeypatch.setattr(smrh, "find_work_bead_status", lambda repo, branch: "closed")
+    monkeypatch.setattr(smrh, "branch_tip_age_seconds", lambda *a, **k: 9999.0)
+    monkeypatch.setattr(smrh, "branch_queued_at_seat", lambda *a, **k: (False, "no-preview-ref"))
+    monkeypatch.setattr(smrh, "branch_tip_sha", lambda *a, **k: UNLANDED_SHA)
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+    monkeypatch.setattr(smrh, "reverify_containment_before_filing",
+                        lambda *a, **k: (verdict, "detail"))
+    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+    monkeypatch.setattr(smrh, "_bd",
+                        lambda repo, *a, check=False: bd_calls.append(a) or _cp(a, 0, "[]"))
+
+    assert smrh.reconcile("/repo", "origin", 10.0, dry_run=False) == 0
+    assert any(a and a[0] == "create" for a in bd_calls), \
+        f"a {verdict} re-verify must still file the handoff: {bd_calls}"
+
+
+def test_q0e3n_reverify_refetches_the_base_before_deciding(monkeypatch):
+    # The re-verify is worthless if it reads the same stale refs classification
+    # already read — it must go back to the remote for the integration branch.
+    calls = []
+
+    def fake_git(repo, *args, check=False):
+        calls.append(args)
+        head = args[0] if args else ""
+        if head == "rev-parse":
+            return _cp(args, 0, LANDED_SHA + "\n")
+        if head == "cat-file":
+            return _cp(args, 0, "")
+        if head == "merge-base":
+            return _cp(args, 0, "")
+        return _cp(args, 0, "")
+
+    monkeypatch.setattr(smrh, "_git", fake_git)
+    verdict, _ = smrh.reverify_containment_before_filing("/repo", "origin", "wk-x", "trunk")
+    assert verdict == smrh.CONTAINED
+    fetches = [a for a in calls if a and a[0] == "fetch"]
+    assert fetches and "trunk" in fetches[0], \
+        f"the pre-create re-verify must re-fetch the integration branch: {calls}"
+
+
+# ===========================================================================
+# SABLE-tseoz's ruling, carried into SABLE-rhsuj: HELD-ON-MATCHED-PAIR.
+#
+# Five non-stranded states were catalogued across a seventeen-bead population
+# with ZERO genuine strands. Four need inputs this floor does not have. THE
+# FIFTH DOES NOT — a land-together ruling is already structured, symmetric,
+# queryable metadata on the work bead, written specifically so automated
+# checks could read it, and the reconciler filed a stranded bead for it
+# anyway. So the leading step is not "design new discriminators", it is
+# "read the one that already exists".
+# ===========================================================================
+
+def _pair_bead(kind="land-together", partner="SABLE-cmar4.9", bead_id="WB-1"):
+    meta = {"branch": "wk-x"}
+    if kind:
+        meta["serialize_kind"] = kind
+    if partner:
+        meta["serialize_with"] = partner
+    meta["serialize_branch"] = "wk-timeout-ssot"
+    meta["serialize_reason"] = "twin-hardcodes-same-file"
+    meta["serialize_ruling"] = "lincoln-2026-07-22"
+    return {"id": bead_id, "status": "closed", "metadata": meta}
+
+
+def test_matched_pair_from_bead_reads_the_land_together_ruling():
+    pair = smrh.matched_pair_from_bead(_pair_bead())
+    assert pair is not None
+    assert pair["with"] == "SABLE-cmar4.9"
+    assert pair["branch"] == "wk-timeout-ssot"
+    assert pair["ruling"] == "lincoln-2026-07-22"
+    assert pair["bead"] == "WB-1"
+
+
+def test_matched_pair_requires_the_explicit_land_together_value():
+    # *** THE OVER-SUPPRESSION CONTROL. *** A bare `serialize_with` is what the
+    # overlap hook writes to mean "sequence these two handoffs" — a scheduling
+    # hint, NOT a do-not-merge-alone instruction. Keying on it would suppress
+    # every overlapping branch in the fleet, converting this discriminator into
+    # the blanket silence the floor exists to avoid.
+    assert smrh.matched_pair_from_bead(_pair_bead(kind=None)) is None
+    assert smrh.matched_pair_from_bead(_pair_bead(kind="sequence-only")) is None
+
+
+@pytest.mark.parametrize("bead", [None, {}, {"metadata": None}, {"metadata": {}}])
+def test_matched_pair_from_bead_absent(bead):
+    assert smrh.matched_pair_from_bead(bead) is None
+
+
+def test_matched_pair_found_even_when_another_bead_joins_the_branch_first(monkeypatch):
+    # Same live-corpus hazard find_work_bead_hold has: a scratch observation
+    # bead joins the same branch and can sort first. Ordering must never decide
+    # whether a ruling is honoured.
+    def fake_bd(repo, *args, check=False):
+        if args and args[0] == "list":
+            return _cp(args, 0, json.dumps([
+                {"id": "SCRATCH", "status": "closed", "metadata": {"branch": "wk-x"}},
+                _pair_bead(bead_id="REAL"),
+            ]))
+        return _cp(args, 0, "[]")
+    monkeypatch.setattr(smrh, "_bd", fake_bd)
+    pair = smrh.find_work_bead_matched_pair("/repo", "wk-x")
+    assert pair is not None and pair["bead"] == "REAL"
+
+
+def test_matched_pair_branch_classifies_as_matched_pair_not_stranded(monkeypatch):
+    """POSITIVE + NEGATIVE in one place: the branch with the ruling is reported
+    HELD-ON-MATCHED-PAIR, and the byte-identical branch WITHOUT it is still
+    STRANDED — so the metadata is what does the work and this cannot pass
+    vacuously."""
+    _fake_git(monkeypatch, ancestor_rc=1, tip_ct=CT_OLD)
+    _fake_bd(monkeypatch, search_status="closed")
+    pair = smrh.matched_pair_from_bead(_pair_bead())
+
+    is_stranded, reason, _ = smrh.classify_branch(
+        "/repo", "origin", "wk-x", "trunk", [], 10.0, NOW, matched_pair=pair)
+    assert is_stranded is False, reason
+    assert reason.startswith("HELD-ON-MATCHED-PAIR"), reason
+    assert "SABLE-cmar4.9" in reason and "lincoln-2026-07-22" in reason
+
+    is_stranded, reason, status = smrh.classify_branch(
+        "/repo", "origin", "wk-x", "trunk", [], 10.0, NOW, matched_pair=None)
+    assert is_stranded is True, reason
+    assert reason == "STRANDED"
+    assert status == "closed"
+
+
+def test_reconcile_names_every_matched_pair_branch_every_cadence(monkeypatch, capsys):
+    # Same standard holds meet: NAMED, never a silent skip. A discriminator
+    # that suppresses without reporting repeats this bead's own invisibility
+    # failure in the other direction.
+    monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+    monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: ["wk-pair"])
+    monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+    monkeypatch.setattr(smrh, "resolve_base_sha", lambda *a, **k: BASE_SHA)
+    monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)
+    monkeypatch.setattr(smrh, "branch_content_contained", lambda *a, **k: (False, "new"))
+    monkeypatch.setattr(smrh, "find_work_bead_hold", lambda repo, br: None)
+    monkeypatch.setattr(smrh, "find_work_bead_matched_pair",
+                        lambda repo, br: smrh.matched_pair_from_bead(_pair_bead()))
+    monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+    monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+    monkeypatch.setattr(smrh, "_bd",
+                        lambda repo, *a, check=False: pytest.fail("filed against a matched pair")
+                        if a and a[0] == "create" else _cp(a, 0, "[]"))
+
+    assert smrh.reconcile("/repo", "origin", 10.0, dry_run=False) == 0
+    out = capsys.readouterr().out
+    assert "MATCHED-PAIR wk-pair" in out, out
+    assert "1 matched-pair branch(es) [wk-pair]" in out, out
+
+
+def test_q0e3n_a_content_contained_branch_is_not_preview_kicked(monkeypatch, capsys):
+    """q0e3n cost (b): the straddling run burned CI on three extra preview kicks
+    for already-merged branches. Tip-ancestry never sees a rebased-and-landed
+    branch, so without consulting content-containment the kick leg keeps warming
+    CI for a merge that happened days ago.
+
+    NEGATIVE half in the same test: the identical branch that is NOT contained
+    IS still kicked — the kick leg must not have been disabled outright."""
+    def drive(contained):
+        monkeypatch.setattr(smrh, "resolve_integration_branch", lambda repo: "trunk")
+        monkeypatch.setattr(smrh, "list_origin_wk_branches", lambda repo, remote: ["wk-k"])
+        monkeypatch.setattr(smrh, "open_for_chuck_beads", lambda repo: [])
+        monkeypatch.setattr(smrh, "resolve_base_sha", lambda *a, **k: BASE_SHA)
+        monkeypatch.setattr(smrh, "branch_ancestor_rc", lambda *a, **k: 1)
+        monkeypatch.setattr(smrh, "branch_content_contained", lambda *a, **k: contained)
+        monkeypatch.setattr(smrh, "branch_tip_age_seconds", lambda *a, **k: 9999.0)
+        monkeypatch.setattr(smrh, "find_work_bead_hold", lambda repo, br: None)
+        monkeypatch.setattr(smrh, "find_work_bead_matched_pair", lambda repo, br: None)
+        monkeypatch.setattr(smrh, "find_work_bead_status", lambda repo, br: "open")
+        monkeypatch.setattr(smrh, "kick_preview", lambda *a, **k: 0)
+        monkeypatch.setattr(smrh, "_git", lambda repo, *a, check=False: _cp(a, 0, ""))
+        monkeypatch.setattr(smrh, "_bd", lambda repo, *a, check=False: _cp(a, 0, "[]"))
+        assert smrh.reconcile("/repo", "origin", 10.0, dry_run=False) == 0
+        return _last_summary_line(capsys.readouterr().out)
+
+    landed = drive((True, "content-contained(2 commit(s) patch-id-equivalent)"))
+    assert "0 preview-kick candidate(s), 0 kicked" in landed, landed
+
+    unlanded = drive((False, "patch-id-partial(0 of 1)"))
+    assert "1 preview-kick candidate(s), 1 kicked" in unlanded, unlanded

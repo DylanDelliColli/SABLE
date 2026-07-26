@@ -966,3 +966,372 @@ def test_reconcile_against_real_git_and_real_bd(tmp_path):
         f"rebased-and-landed branch {landed_branch} must file NO for-chuck bead: {titles}"
     assert len(beads) == 1, \
         f"exactly one bead expected (the genuine strand only): {titles}"
+
+
+# ===========================================================================
+# SABLE-rhsuj / SABLE-q0e3n — real git on disk AND a real sandbox beads DB.
+# Nothing mocked on either side: real merges, real branch deletes, a real
+# concurrent push moving the spine mid-sweep, real `bd create` / `bd close`.
+#
+# ASSERT BY ATTRIBUTABLE ABSENCE (SABLE-jd5fj.15): every assertion below names
+# the SPECIFIC branch and bead ids this test created. The fleet files beads
+# concurrently, so a global open-bead count is a flake generator, not a check.
+#
+# *** THE REPRODUCTION TRAP (q0e3n §4). Four manual sweeps across two lanes all
+# self-reported "0 for-chuck beads filed", against one durable false filing
+# from the unattended timer. The attended path is 4-for-4 clean. So A SWEEP RUN
+# ON A QUIET REPO PASSES AGAINST THE UNFIXED CODE AND PROVES NOTHING — here
+# that is the DEFAULT outcome, not an unlucky one. The race legs below
+# therefore SIMULATE the interleaving with a git wrapper that performs a real
+# landing at a chosen point inside the sweep, rather than running the tool and
+# hoping. ***
+# ===========================================================================
+
+def _reconcile_bead_title(branch):
+    """Mirror of sable-reconcile-handoffs' own reconcile_bead_title — kept
+    literal here so a change to the filed title breaks this rehearsal loudly
+    instead of silently matching nothing."""
+    return f"[RECONCILE] stranded merge: {branch} — no for-chuck handoff on record"
+
+
+def _bead_record(work, home, bead_id):
+    cp = _bd(work, home, "show", bead_id, "--json", check=False)
+    try:
+        d = json.loads(cp.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(d, list):
+        d = d[0] if d else None
+    return d if isinstance(d, dict) else None
+
+
+def _file_reconcile_bead(work, home, branch, *, branch_sha=None):
+    """File a [RECONCILE] bead by hand, in exactly the shape the floor files
+    them (same title, same labels, optionally the same branch_sha metadata) —
+    so the auto-close leg is exercised against a REAL bd record rather than a
+    dict a test author wrote."""
+    cp = _bd(work, home, "create", "--sandbox", "--json",
+             "--title", _reconcile_bead_title(branch),
+             "--type=task", "--priority=2", "--labels=for-chuck,coord",
+             "--description", f"Filed by the reconciliation floor.\n\nBranch: {branch}\n")
+    bead_id = json.loads(cp.stdout)["id"]
+    if branch_sha:
+        _bd(work, home, "update", bead_id, "--sandbox",
+            "--set-metadata", f"branch_sha={branch_sha}")
+    return bead_id
+
+
+def _land_branch_for_real(work, branch):
+    """A REAL landing: merge the branch into BASE, push the spine, delete the
+    branch from origin. Returns the landed sha. This is the correct action that
+    silently retires a [RECONCILE] bead's premise (SABLE-rhsuj) — no event, no
+    failure, no update to the bead."""
+    sha = _git(work, "rev-parse", f"origin/{branch}")
+    _git(work, "checkout", BASE)
+    _git(work, "merge", "--no-ff", "-m", f"merge {branch}", branch)
+    _git(work, "push", "origin", BASE)
+    _git(work, "push", "origin", "--delete", branch)
+    _git(work, "fetch", "origin", "--prune")
+    return sha
+
+
+def test_autoclose_against_real_git_and_real_bd(tmp_path):
+    """THE integration named in rhsuj's spec, both polarities against real
+    composition.
+
+    LEG 1 (positive): a branch that really merged — its ref really deleted from
+    origin afterwards, as a correct promote does — has its [RECONCILE] bead
+    AUTO-CLOSED, with the landing sha in the close reason.
+
+    LEG 2 (*** the plant-and-fail control ***): a branch whose origin ref is
+    ALSO deleted but which was NEVER merged keeps its bead OPEN. The two
+    branches are byte-identical from an absence probe's point of view — both
+    gone from origin — so an implementation keyed on the branch being GONE
+    closes both and this leg bites. Only the CONTENT tells them apart."""
+    origin, work, home = _setup(tmp_path)
+
+    landed_bead = _make_work_bead(work, home, status="closed")
+    landed_branch = _push_worker_branch(work, landed_bead)
+    stranded_bead = _make_work_bead(work, home, status="closed")
+    stranded_branch = _push_worker_branch(work, stranded_bead)
+
+    landed_sha = _git(work, "rev-parse", f"origin/{landed_branch}")
+    stranded_sha = _git(work, "rev-parse", f"origin/{stranded_branch}")
+
+    rb_landed = _file_reconcile_bead(work, home, landed_branch, branch_sha=landed_sha)
+    rb_stranded = _file_reconcile_bead(work, home, stranded_branch, branch_sha=stranded_sha)
+
+    # LEG 1's correct action: a real merge + push, then the ref really goes.
+    _land_branch_for_real(work, landed_branch)
+    # LEG 2's confound: the ref goes for a NON-merge reason (cleanup / bad push
+    # / rename). The work never landed.
+    _git(work, "push", "origin", "--delete", stranded_branch)
+    _git(work, "fetch", "origin", "--prune")
+
+    # Both branches are now equally ABSENT from origin — the whole point.
+    assert not _origin_has_branch(origin, landed_branch)
+    assert not _origin_has_branch(origin, stranded_branch)
+
+    cp = _reconcile(work, home)
+    assert cp.returncode == 0, cp.stdout
+
+    landed_rec = _bead_record(work, home, rb_landed)
+    stranded_rec = _bead_record(work, home, rb_stranded)
+    assert landed_rec is not None and stranded_rec is not None
+
+    assert landed_rec["status"] == "closed", \
+        f"a bead whose branch is CONTAINED must be auto-closed: {landed_rec}\n{cp.stdout}"
+    reason = json.dumps(landed_rec)
+    assert landed_sha in reason, \
+        f"the close reason must carry the landing SHA {landed_sha}: {reason}"
+
+    assert stranded_rec["status"] != "closed", (
+        "*** ABSENCE PROBE ***: a branch deleted from origin WITHOUT merging must "
+        f"keep its bead OPEN — {rb_stranded} was closed anyway:\n{cp.stdout}")
+
+
+def test_autoclose_leaves_an_unmerged_live_branch_alone(tmp_path):
+    # The ordinary case, kept explicit so the auto-close cannot pass by simply
+    # never closing anything: a live, unmerged branch's bead stays open AND the
+    # sweep still reports it.
+    origin, work, home = _setup(tmp_path)
+    bead = _make_work_bead(work, home, status="closed")
+    branch = _push_worker_branch(work, bead)
+    sha = _git(work, "rev-parse", f"origin/{branch}")
+    rb = _file_reconcile_bead(work, home, branch, branch_sha=sha)
+
+    cp = _reconcile(work, home)
+    assert cp.returncode == 0, cp.stdout
+    rec = _bead_record(work, home, rb)
+    assert rec["status"] != "closed", f"{rb} closed for a live unmerged branch:\n{cp.stdout}"
+
+
+def test_filed_bead_carries_a_branch_sha_that_its_own_autoclose_can_probe(tmp_path):
+    """END-TO-END for the rhsuj remedy: the floor FILES a handoff, the branch
+    then really merges and its ref is really deleted, and the NEXT sweep
+    retires the floor's own bead. Nobody looked at it. That whole chain is the
+    fix, and it only works because the filed bead recorded the sha — after the
+    ref is gone there is nothing else left to probe that is not an absence."""
+    origin, work, home = _setup(tmp_path)
+    bead = _make_work_bead(work, home, status="closed")
+    branch = _push_worker_branch(work, bead)
+
+    r1 = _reconcile(work, home)
+    assert r1.returncode == 0, r1.stdout
+    filed = [b for b in _for_chuck_beads(work, home) if branch in b.get("title", "")]
+    assert len(filed) == 1, f"{branch} should have filed exactly one handoff: {r1.stdout}"
+    rb = filed[0]["id"]
+
+    rec = _bead_record(work, home, rb)
+    recorded = (rec.get("metadata") or {}).get("branch_sha")
+    assert recorded, f"the filed bead must record its branch sha: {rec}"
+
+    landed_sha = _land_branch_for_real(work, branch)
+    assert recorded == landed_sha, (recorded, landed_sha)
+
+    r2 = _reconcile(work, home)
+    assert r2.returncode == 0, r2.stdout
+    rec2 = _bead_record(work, home, rb)
+    assert rec2["status"] == "closed", \
+        f"the floor's own bead must be retired once its branch lands:\n{r2.stdout}"
+    assert landed_sha in json.dumps(rec2), rec2
+
+
+# --- the race legs (q0e3n §4): SIMULATE the interleaving, never wait for it --
+
+def _racing_git(tmp_path, *, trigger_arg, script_lines):
+    """A real-git wrapper that performs a REAL landing at a chosen point inside
+    the sweep. It forwards every call to the real git; the first time it sees
+    `trigger_arg` in its argv it first runs `script_lines` (arbitrary real git
+    against the same repos), then forwards. That is a genuine concurrent push
+    moving the base mid-run — the same shape as a promote landing while the
+    unattended timer sweeps, which is the only path that has ever produced the
+    defect. Returns the wrapper path, for $SABLE_RC_GIT."""
+    marker = tmp_path / "raced.marker"
+    land = tmp_path / "land.sh"
+    land.write_text("set -e\n" + "\n".join(script_lines) + "\n")
+    wrapper = tmp_path / "git-racer"
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [ ! -e "{marker}" ]; then\n'
+        f'  for a in "$@"; do\n'
+        f'    if [ "$a" = "{trigger_arg}" ]; then\n'
+        f'      touch "{marker}"\n'
+        f'      bash "{land}" >"{tmp_path}/land.log" 2>&1 || true\n'
+        f"      break\n"
+        f"    fi\n"
+        f"  done\n"
+        f"fi\n"
+        'exec git "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    return wrapper, marker
+
+
+def test_q0e3n_a_sweep_racing_a_spine_advancing_push_files_zero_beads(tmp_path):
+    """*** THE kiem2 REHEARSAL. *** The landing happens AFTER the sweep's own
+    `git fetch --prune` — the window in which the sweep's refs are stale and it
+    classifies an already-landed branch as STRANDED. Unfixed, that is a DURABLE
+    false work item in the merge seat's inbox naming a branch that no longer
+    exists, i.e. an UNSATISFIABLE instruction whose evidence is self-erasing.
+
+    Fixed, the pre-create containment re-verify re-fetches and refuses: a
+    contained branch NEVER produces a stranded bead, whatever the
+    classification said earlier in the sweep.
+
+    Attributable absence: asserted about THIS branch's title only."""
+    origin, work, home = _setup(tmp_path)
+    bead = _make_work_bead(work, home, status="closed")
+    branch = _push_worker_branch(work, bead)
+
+    # A second clone is the "other process" (the promote) — the sweep's own
+    # repo must not be mutated by the racer, or the race would be fictional.
+    racer_clone = tmp_path / "promote"
+    _git(tmp_path, "clone", str(origin), str(racer_clone))
+    wrapper, marker = _racing_git(
+        tmp_path,
+        trigger_arg="for-each-ref",   # fires right AFTER reconcile's fetch --prune
+        script_lines=[
+            f'cd "{racer_clone}"',
+            f"git -c user.email=t@t -c user.name=t checkout {BASE}",
+            f"git -c user.email=t@t -c user.name=t merge --no-ff -m land origin/{branch}",
+            f"git push origin {BASE}",
+            f"git push origin --delete {branch}",
+        ])
+
+    cp = _reconcile(work, home, extra_env={"SABLE_RC_GIT": str(wrapper)})
+    assert cp.returncode == 0, cp.stdout
+    assert marker.exists(), f"the race never fired — this test proves nothing:\n{cp.stdout}"
+
+    # GROUND TRUTH, checked at the object with the mandated presence probe
+    # (never "the branch is gone"): the work really is contained in the spine.
+    _git(work, "fetch", "origin", "--prune")
+    branch_sha = _git(work, "rev-parse", f"{BASE}@{{u}}^2")
+    _git(work, "merge-base", "--is-ancestor", branch_sha, f"origin/{BASE}")
+
+    named = [b for b in _for_chuck_beads(work, home) if branch in b.get("title", "")]
+    assert named == [], (
+        f"a sweep racing a spine-advancing push must file ZERO for-chuck beads for "
+        f"{branch} — it landed mid-sweep and the filed instruction would be "
+        f"unsatisfiable (SABLE-kiem2):\n{cp.stdout}")
+
+
+def test_q0e3n_a_merged_branch_is_never_reported_held_or_queued_under_a_race(tmp_path):
+    """*** THE STRADDLE REHEARSAL. *** The measured incident: run 2 straddled a
+    landing and reclassified three ALREADY-MERGED branches as HELD /
+    QUEUED-AT-SEAT, and kicked previews for them. Here the local
+    remote-tracking ref really moves UNDER the classification loop (a real
+    `git fetch` from another process mid-sweep, which is what a promote's
+    pre-push hook does), while a branch that merged BEFORE the sweep began is
+    also under a real do-not-merge hold.
+
+    A HELD label on an already-merged branch is incoherent AND self-
+    perpetuating — held branches are re-reported every cadence by design. With
+    containment pinned and decided ahead of the hold join, the merged branch
+    can never reach the hold path at all."""
+    origin, work, home = _setup(tmp_path)
+
+    # merged BEFORE the sweep, and deliberately held — the incoherent pair
+    merged_bead = _make_work_bead(work, home, status="closed")
+    merged_branch = _push_worker_branch(work, merged_bead, merged_into=BASE)
+    _place_hold(work, home, merged_bead, reason="do not merge, superseded")
+
+    # THE CASE THAT ACTUALLY DECIDES THE ORDERING, and the one the branch above
+    # cannot reach: unmerged BY TIP (a rebase changed every sha, so
+    # `merge-base --is-ancestor` says not-an-ancestor) but fully CONTAINED BY
+    # CONTENT — and also held. Tip-ancestry short-circuits the merged branch at
+    # predicate 1 whatever the order is, so only this one proves the hold join
+    # is gated on containment rather than merely losing to it.
+    rebased_bead = _make_work_bead(work, home, status="closed")
+    rebased_branch = _push_worker_branch(work, rebased_bead)
+    _land_same_content_on_trunk(work, f"{rebased_bead}.txt", "worker feature\n")
+    _git(work, "checkout", BASE)
+    _place_hold(work, home, rebased_bead, reason="do not merge, superseded")
+
+    # a genuinely unmerged branch, so the sweep still has real work to do
+    live_bead = _make_work_bead(work, home, status="closed")
+    live_branch = _push_worker_branch(work, live_bead)
+
+    # the racer advances the spine on origin AND fetches into the SWEEP's repo,
+    # so the tracking ref moves mid-loop exactly as a concurrent promote does
+    racer_clone = tmp_path / "promote"
+    _git(tmp_path, "clone", str(origin), str(racer_clone))
+    (racer_clone / "spine.txt").write_text("spine advanced\n")
+    wrapper, marker = _racing_git(
+        tmp_path,
+        trigger_arg="cherry",   # fires mid-classification, after branch 1
+        script_lines=[
+            f'cd "{racer_clone}"',
+            f"git -c user.email=t@t -c user.name=t checkout {BASE}",
+            "git -c user.email=t@t -c user.name=t add spine.txt",
+            "git -c user.email=t@t -c user.name=t commit -m 'spine advanced mid-sweep'",
+            f"git push origin {BASE}",
+            f'cd "{work}"',
+            "git fetch origin --prune",
+        ])
+
+    cp = _reconcile(work, home, extra_env={"SABLE_RC_GIT": str(wrapper)})
+    assert cp.returncode == 0, cp.stdout
+    assert marker.exists(), f"the race never fired — this test proves nothing:\n{cp.stdout}"
+
+    out = cp.stdout
+    assert f"HELD {merged_branch}" not in out, (
+        f"an already-merged branch was labelled HELD under a straddling sweep — "
+        f"incoherent, and held branches are re-reported every cadence:\n{out}")
+    assert f"QUEUED {merged_branch}" not in out, (
+        f"an already-merged branch was labelled QUEUED-AT-SEAT — that tells the "
+        f"seat it owns work it does not:\n{out}")
+    assert f"{merged_branch}: merged-or-unresolvable" in out, out
+    assert f"{merged_branch}: preview-kick" not in out, \
+        f"CI was burned on an already-merged branch:\n{out}"
+
+    # ...and the rebase-landed one, which is where the ordering is load-bearing
+    assert f"HELD {rebased_branch}" not in out, (
+        f"a branch whose CONTENT is already at the spine was labelled HELD — the "
+        f"hold join must be gated on containment, not merely lose to it:\n{out}")
+    assert f"QUEUED {rebased_branch}" not in out, out
+    assert f"{rebased_branch}: landed-under-different-sha" in out, out
+    assert f"{rebased_branch}: preview-kick" not in out, \
+        f"CI was burned on a rebased-and-landed branch:\n{out}"
+    assert [b for b in _for_chuck_beads(work, home)
+            if rebased_branch in b.get("title", "")] == [], out
+
+    # attributable absence: no handoff for the merged branch...
+    assert [b for b in _for_chuck_beads(work, home)
+            if merged_branch in b.get("title", "")] == [], out
+    # ...and the POSITIVE control, so this cannot pass by the floor having
+    # stopped filing altogether under the race.
+    assert [b for b in _for_chuck_beads(work, home)
+            if live_branch in b.get("title", "")] != [], \
+        f"the genuinely stranded branch {live_branch} must still file:\n{out}"
+
+
+def test_tseoz_a_land_together_branch_files_no_handoff(tmp_path):
+    """SABLE-tseoz's ruling against real bd: the discriminating input for
+    HELD-ON-MATCHED-PAIR is ALREADY structured, symmetric, queryable metadata
+    on the work bead — and the reconciler filed a stranded bead for it anyway.
+    Positive and negative, so the metadata is provably what does the work."""
+    origin, work, home = _setup(tmp_path)
+
+    paired_bead = _make_work_bead(work, home, status="closed")
+    paired_branch = _push_worker_branch(work, paired_bead)
+    _bd(work, home, "update", paired_bead, "--sandbox",
+        "--set-metadata", "serialize_kind=land-together",
+        "--set-metadata", "serialize_with=SABLE-cmar4.9",
+        "--set-metadata", "serialize_reason=twin-hardcodes-same-file",
+        "--set-metadata", "serialize_ruling=lincoln-2026-07-22")
+
+    plain_bead = _make_work_bead(work, home, status="closed")
+    plain_branch = _push_worker_branch(work, plain_bead)
+
+    cp = _reconcile(work, home)
+    assert cp.returncode == 0, cp.stdout
+    out = cp.stdout
+
+    assert f"MATCHED-PAIR {paired_branch}" in out, out
+    assert "SABLE-cmar4.9" in out and "lincoln-2026-07-22" in out, out
+    titles = [b.get("title", "") for b in _for_chuck_beads(work, home)]
+    assert not any(paired_branch in t for t in titles), \
+        f"a land-together branch must file no stranded handoff: {titles}\n{out}"
+    assert any(plain_branch in t for t in titles), \
+        f"the unpaired control must still file: {titles}\n{out}"
