@@ -172,6 +172,40 @@ for seg in segments:
     if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', head):
         continue
 
+    # SABLE-z95e2: 'timeout [OPTIONS] DURATION COMMAND [ARGS...]' bounds a
+    # command's wall-clock time -- the exact shape the fleet's own budget
+    # rules (SABLE-jb5l8) push workers toward for long test runs, so a green
+    # 'timeout 900 python -m pytest ...' must not go unrecognized. This MUST
+    # run before the sable-test / env unwraps below so 'timeout 900
+    # sable-test pytest ...' and 'timeout 900 env -u FOO python -m pytest
+    # ...' still fall through into those existing unwraps rather than being
+    # bypassed. Options that take an argument (-k/--kill-after DURATION,
+    # -s/--signal SIG) must be consumed as a pair -- a naive \"drop N
+    # tokens\" either eats the runner or misparses the duration as an
+    # option's argument. If no DURATION-shaped token follows the options, or
+    # nothing follows the duration (a bare 'timeout', 'timeout 900' alone, or
+    # 'timeout' with a non-duration next token), the segment is left
+    # UNWRAPPED: falling through to match no runner is the correct failure
+    # for a malformed command, not inventing one.
+    if head.rsplit('/', 1)[-1] == 'timeout':
+        i = 1
+        n = len(seg)
+        while i < n:
+            t = seg[i]
+            if t in ('-k', '--kill-after', '-s', '--signal'):
+                i += 2
+                continue
+            if t.startswith('--kill-after=') or t.startswith('--signal='):
+                i += 1
+                continue
+            if t in ('--preserve-status', '--foreground', '-v', '--verbose'):
+                i += 1
+                continue
+            break
+        if i < n and i + 1 < n and re.match(r'^[0-9]+(\.[0-9]+)?[smhd]?\$', seg[i]):
+            seg = seg[i + 1:]
+            head = seg[0]
+
     # SABLE-0w0ou: 'sable-test <cmd...>' runs <cmd...> and propagates its
     # exit code -- the REAL command is what must be classified, exactly like
     # npx's subcommand below. Unwrap it FIRST (before cd/git -C/env-strip/

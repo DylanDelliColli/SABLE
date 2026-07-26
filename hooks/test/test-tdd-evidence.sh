@@ -734,6 +734,105 @@ rm -f "$FAILNONTEST_EV"
 run_hook_status "PreToolUse-shaped payload (no result yet) omits STATUS entirely" \
   "pytest tests/" "{}" "__no_such_key__" "none"
 
+# ---------- SABLE-z95e2: 'timeout N <cmd>' must be unwrapped ----------
+# A genuinely green 'timeout 900 python -m pytest ...' had head token
+# 'timeout', matched no runner, and wrote NO evidence -- tdd-gate.sh then
+# denied the close with "No tests were run this session" even though the
+# suite really ran and passed. The 'timeout N <cmd>' spelling is not exotic:
+# it is the exact form the fleet's own budget rules (SABLE-jb5l8) push
+# workers toward for long test runs, so this hole penalised the compliant
+# spelling. FOUND on SABLE-be4lo.8.
+
+# run_hook_resolves <test-name> <command> <expected-resolved-cmd>
+# Asserts an evidence file was written AND that the recorded CMD= segment is
+# the fully-unwrapped runner invocation, not merely that some evidence
+# exists -- the option-with-argument cases are exactly where a naive strip
+# would silently name the wrong runner while still "writing evidence".
+run_hook_resolves() {
+  local name="$1" command="$2" expected="$3"
+  local sid evidence
+  sid=$(fake_session)
+  evidence="/tmp/tdd-evidence-${sid}"
+  rm -f "$evidence"
+  make_input "$command" "$sid" | bash "$HOOK" >/dev/null 2>&1 || true
+  if grep -qF "CMD=$expected" "$evidence" 2>/dev/null; then
+    PASS=$((PASS+1))
+    echo "PASS: $name"
+  else
+    FAIL=$((FAIL+1))
+    FAIL_NAMES="$FAIL_NAMES\n  $name (expected CMD=$expected)"
+    echo "FAIL: $name"
+    echo "  Expected: CMD=$expected"
+    echo "  Got:      $(cat "$evidence" 2>/dev/null || echo '(missing)')"
+  fi
+  rm -f "$evidence"
+}
+
+# Bare duration: the exact regression from SABLE-be4lo.8 (plant-and-fail:
+# this MUST fail against pre-fix code, since 'timeout' was not unwrapped
+# at all).
+run_hook_resolves "timeout 900 python -m pytest recognized and resolves to the real runner" \
+  "timeout 900 python -m pytest bin/ -q" \
+  "python -m pytest bin/ -q"
+
+# Table-driven over the real option grammar. Each case asserts the
+# RESOLVED runner, not merely "some evidence" -- an option-with-argument
+# form (-k, -s) is exactly where a naive "drop N tokens" strip would eat
+# the runner or misparse the duration as an option's argument instead.
+run_hook_resolves "timeout with a suffixed duration (15m) resolves correctly" \
+  "timeout 15m python -m pytest tests/" \
+  "python -m pytest tests/"
+
+run_hook_resolves "timeout -k DURATION (kill-after, takes an argument) resolves correctly" \
+  "timeout -k 30 900 python -m pytest tests/" \
+  "python -m pytest tests/"
+
+run_hook_resolves "timeout -s SIGNAL (takes an argument) resolves correctly" \
+  "timeout -s KILL 900 python -m pytest tests/" \
+  "python -m pytest tests/"
+
+run_hook_resolves "timeout --preserve-status (boolean flag) resolves correctly" \
+  "timeout --preserve-status 900 python -m pytest tests/" \
+  "python -m pytest tests/"
+
+run_hook_resolves "/usr/bin/timeout (absolute path) resolves correctly" \
+  "/usr/bin/timeout 900 python -m pytest tests/" \
+  "python -m pytest tests/"
+
+# Composition, load-bearing: proves the timeout unwrap recurses into the
+# EXISTING sable-test / env unwraps rather than special-casing a runner
+# name directly after 'timeout DURATION'. Must run BEFORE those unwraps so
+# a timeout-wrapped sable-test or env invocation is not bypassed.
+run_hook_resolves "timeout composes with the sable-test unwrap" \
+  "timeout 900 sable-test bash hooks/test/test-foo.sh" \
+  "bash hooks/test/test-foo.sh"
+
+run_hook_resolves "timeout composes with the env -u unwrap" \
+  "timeout 900 env -u VAR python -m pytest tests/" \
+  "python -m pytest tests/"
+
+# Negative controls, non-vacuity: without these the fix degrades into
+# "anything wrapped in timeout counts as a test run", a false-green hole in
+# the one gate whose job is to prove tests ran -- strictly worse than the
+# original bug (the failure direction flips from restrictive to permissive).
+run_hook_silent "timeout wrapping a non-test command not recognized" \
+  "timeout 900 sleep 5"
+
+run_hook_silent "bare 'timeout' with no arguments at all not recognized" \
+  "timeout"
+
+run_hook_silent "'timeout 900' with no command after the duration not recognized" \
+  "timeout 900"
+
+run_hook_silent "malformed 'timeout' with no duration-shaped token not recognized" \
+  "timeout sable-test bash hooks/test/test-foo.sh"
+
+# NOTE: the real-writer + real-gate end-to-end acceptance criterion for
+# SABLE-z95e2 (a timeout-wrapped green pytest run must permit the close, and
+# a timeout-wrapped non-test command must not) lives in
+# hooks/test/test-tdd-gate.sh, alongside the SABLE-f6aw end-to-end test —
+# that is the suite that already exercises the real tdd-gate.sh hook.
+
 # ---------- Summary ----------
 
 echo

@@ -670,6 +670,53 @@ else
 fi
 rm -f "$F6AW_EV"
 
+# ---------- SABLE-z95e2 e2e: 'timeout N <cmd>' unwrap unblocks the real gate ----------
+# Real composition, not a fabricated evidence line: pipe a timeout-wrapped
+# green test invocation through the ACTUAL tdd-evidence.sh writer hook, then
+# confirm the ACTUAL tdd-gate.sh reader hook allows the close on that
+# evidence. Regression guard for the SABLE-be4lo.8 bug: pre-fix,
+# tdd-evidence.sh did not unwrap a leading 'timeout' segment at all, so a
+# genuinely green 'timeout 900 python -m pytest ...' had head token
+# 'timeout', matched no runner, wrote no evidence, and this same close was
+# DENIED with "No tests were run this session" even though the suite ran
+# green. Paired negative: a timeout-wrapped NON-test command must still
+# leave the gate denying -- proving the fix did not loosen the gate itself.
+
+TIMEOUT_EVIDENCE_HOOK="$(cd "$(dirname "$0")/.." && pwd)/tdd-evidence.sh"
+
+TZ95_SID="tdd-z95e2-e2e-$$-$RANDOM"
+TZ95_EV="/tmp/tdd-evidence-${TZ95_SID}"
+rm -f "$TZ95_EV"
+
+# Real writer: a timeout-wrapped green pytest invocation, through tdd-evidence.sh.
+make_input "timeout 900 python -m pytest bin/ -q -p no:cacheprovider" "$TZ95_SID" | bash "$TIMEOUT_EVIDENCE_HOOK" >/dev/null 2>&1 || true
+
+# Real reader: a two-bead close routes past the [no-test] hatch to the evidence check.
+TZ95_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$TZ95_SID" | env PATH="$STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null)
+if [ -z "$TZ95_OUT" ]; then
+  pa_pass "SABLE-z95e2 e2e: timeout-wrapped pytest recorded by the real writer hook unblocks the real gate hook"
+else
+  TZ95_EV_CONTENT=$(cat "$TZ95_EV" 2>/dev/null || echo '<missing>')
+  pa_fail "SABLE-z95e2 e2e: timeout-wrapped pytest unblocks the gate" "got: ${TZ95_OUT:-<empty>}; evidence file: $TZ95_EV_CONTENT"
+fi
+rm -f "$TZ95_EV"
+
+# Paired negative: a timeout-wrapped NON-test command records no evidence,
+# so the real gate still denies the close (the gate was not loosened).
+TZ95N_SID="tdd-z95e2-e2e-neg-$$-$RANDOM"
+TZ95N_EV="/tmp/tdd-evidence-${TZ95N_SID}"
+rm -f "$TZ95N_EV"
+
+make_input "timeout 900 sleep 5" "$TZ95N_SID" | bash "$TIMEOUT_EVIDENCE_HOOK" >/dev/null 2>&1 || true
+
+TZ95N_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$TZ95N_SID" | env PATH="$STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null)
+if echo "$TZ95N_OUT" | grep -q '"permissionDecision": "deny"'; then
+  pa_pass "SABLE-z95e2 e2e negative: timeout-wrapped non-test command still leaves the real gate DENYING"
+else
+  pa_fail "SABLE-z95e2 e2e negative: timeout-wrapped non-test command must still deny" "got: ${TZ95N_OUT:-<empty>}"
+fi
+rm -f "$TZ95N_EV"
+
 # ---------- SABLE-jfg6.4 (D4): key-agreement invariant across BOTH consumers ----------
 # tdd-gate.sh (reader) and tdd-evidence.sh (writer) now derive the evidence path
 # from ONE shared function (lib-evidence-key.sh). Same input => identical path,
