@@ -36,10 +36,12 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import sable_batch_key_lib as batch_key
 import sable_gate_classify_lib as classify
 import sable_gate_git_lib as git_lib
+import sable_snapshot_lib as snapshot_lib
 from sable_gate_classify_lib import GateError
 
 
@@ -261,6 +263,109 @@ def kick_preview(branch: str, base: str, repo: str, remote: str) -> int:
 
 
 # --------------------------------------------------------------------------
+# Local-runner verdict journal — the SECOND verdict source (SABLE-21rug.2)
+#
+# read_verdict's original leg answers "what does GitHub Actions say" from ONE
+# gh call. A hand-run/base-moved local tier (SABLE-21rug.3's tier-runner)
+# never touches Actions at all, so it has nothing for that leg to find — this
+# journal is the second, independent way to answer the same question. Kept
+# behind the SAME read_verdict interface: a caller never needs to know which
+# leg actually answered, only that the answer is a classify.Verdict.
+# --------------------------------------------------------------------------
+
+RUNNER_VERDICT_FILE = "runner-verdicts.jsonl"
+
+
+def _runner_verdict_log_path(repo: str | os.PathLike) -> Path:
+    """Where the local-runner verdict journal lives. SABLE_MG_RUNNER_VERDICT_LOG
+    overrides outright — the same test/override seam the tier journal's own
+    path helper uses, so a test never has to touch the real per-repo state
+    dir."""
+    override = os.environ.get("SABLE_MG_RUNNER_VERDICT_LOG")
+    if override:
+        return Path(override)
+    return snapshot_lib.state_dir(repo) / RUNNER_VERDICT_FILE
+
+
+def write_runner_verdict(repo: str | os.PathLike, ref_branch: str, preview_sha: str,
+                         conclusion: str, run_url: str = "",
+                         producer: classify.VerdictSource | str = classify.VerdictSource.LOCAL_RUNNER
+                         ) -> None:
+    """Append one record to the runner verdict journal — the write half of the
+    second source _read_runner_verdict below consumes. One JSON line per call;
+    append-only, so a re-run after a fix simply adds a newer line rather than
+    needing an in-place rewrite (the impact-tier window journal's own
+    discipline). The LAST line matching a ref is what a reader trusts.
+
+    Best-effort, like every other journal writer in this gate: a write failure
+    here must never break the runner's own flow — it only means this verdict
+    is not yet consumable through read_verdict."""
+    path = _runner_verdict_log_path(repo)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {"ref": ref_branch, "preview_sha": preview_sha, "conclusion": conclusion,
+                  "run_url": run_url,
+                  "producer": classify.parse_verdict_source(producer).value,
+                  "at": time.time()}
+        with open(path, "a") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
+def _read_runner_verdict(repo: str | os.PathLike, ref_branch: str,
+                         preview_sha: str) -> classify.Verdict | None:
+    """The journal-backed second verdict source (SABLE-21rug.2): a local
+    runner's off-Actions verdict for <ref_branch>, if one was written.
+
+    Returns None for "nothing to say" — no journal file, or no record for this
+    ref — and read_verdict falls through to the GitHub Actions leg exactly as
+    it always has. This is what keeps that leg byte-identical for every
+    existing fixture: none of them ever write to this journal, so this
+    function is a no-op file-existence check on their path, never a source of
+    a different answer.
+
+    A record IS a real answer once found, and is held to a harder standard
+    than "found": its OWN preview_sha must equal the SHA under decision. A
+    verdict binds to one SHA — a record for a different one (the branch tip
+    moved since the runner wrote it, a stale entry from an earlier attempt) is
+    REFUSED loudly (GateError), never silently adapted into an answer for a
+    SHA it was never about. The same refusal applies to a producer value
+    outside the typed vocabulary (classify.parse_verdict_source) — an
+    unrecognized producer is never passed through as if it were trustworthy."""
+    path = _runner_verdict_log_path(repo)
+    if not path.is_file():
+        return None
+    record = None
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if candidate.get("ref") == ref_branch:
+            record = candidate  # last matching line wins — a re-run appends, never rewrites
+    if record is None:
+        return None
+    recorded_sha = record.get("preview_sha") or ""
+    if recorded_sha != preview_sha:
+        raise GateError(classify.EXIT_INTEGRITY,
+                        f"runner verdict for {ref_branch} binds to preview "
+                        f"{recorded_sha[:7] or '(none)'}, not the {preview_sha[:7]} under "
+                        f"decision — refusing rather than adapting a stale verdict to a "
+                        f"different SHA")
+    producer = classify.parse_verdict_source(record.get("producer") or "")
+    return classify.Verdict(record.get("conclusion") or "unknown", record.get("run_url") or "",
+                            preview_sha, ref_branch, source=producer, complete=True)
+
+
+# --------------------------------------------------------------------------
 # Actions polling / verdict reading
 # --------------------------------------------------------------------------
 
@@ -291,21 +396,39 @@ def _gh_runs(repo: str, ref_branch: str, fields: str) -> list | None:
 
 
 def read_verdict(repo: str, ref_branch: str, preview_sha: str) -> classify.Verdict:
-    """NON-BLOCKING peek at the verdict already stored on GitHub for this exact
-    preview SHA (SABLE-jd5fj.3). Exactly one API call; never sleeps, never
+    """NON-BLOCKING peek at the verdict already known for this exact preview
+    SHA (SABLE-jd5fj.3), from EITHER of two independent sources
+    (SABLE-21rug.2). Exactly one API call at most; never sleeps, never
     retries, never waits for a run to finish.
 
-    This is the read half of "Chuck reads precomputed verdicts". The push-time
-    kick (jd5fj.1) starts the run at push; by the time Chuck sequences merges,
-    the run has usually long since completed, and the whole cost of knowing its
-    outcome is this one call. Returns a Verdict with complete=False when no
-    COMPLETED run for this SHA is visible yet — pending, or unreadable — which is
-    the caller's cue to wait (promote) or report 'pending' (the verdict CLI).
-    A non-answer is never turned into a conclusion here. Non-answers (gh
-    missing/erroring/timing out inside _gh_runs) also carry answered=False, so
-    report_verdict — which has no wait loop to converge through — can print a
-    distinct 'unknown' instead of a 'pending' indistinguishable from a
-    genuinely in-flight run (SABLE-fewih)."""
+    SOURCE 1 — the local-runner journal (_read_runner_verdict), checked first
+    because it is a plain file read with no network call. A hand-run/
+    base-moved local tier never touches Actions, so this is the only leg that
+    can ever answer for it. Absence here (no journal, or nothing for this ref)
+    is silent and falls through — this is what keeps SOURCE 2 byte-identical
+    for every fixture that never exercises a runner. A record present but for
+    the WRONG sha, or carrying an unrecognized producer, is refused loudly
+    (GateError) rather than silently treated as absent — see
+    _read_runner_verdict's own docstring for why "refused" and not "adapted".
+
+    SOURCE 2 — this is the read half of "Chuck reads precomputed verdicts".
+    The push-time kick (jd5fj.1) starts the run at push; by the time Chuck
+    sequences merges, the run has usually long since completed, and the whole
+    cost of knowing its outcome is this one call. Returns a Verdict with
+    complete=False when no COMPLETED run for this SHA is visible yet —
+    pending, or unreadable — which is the caller's cue to wait (promote) or
+    report 'pending' (the verdict CLI). A non-answer is never turned into a
+    conclusion here. Non-answers (gh missing/erroring/timing out inside
+    _gh_runs) also carry answered=False, so report_verdict — which has no wait
+    loop to converge through — can print a distinct 'unknown' instead of a
+    'pending' indistinguishable from a genuinely in-flight run (SABLE-fewih).
+
+    Neither source ever needs the other consulted: the interface a caller sees
+    is unchanged — one classify.Verdict, or a pending/refused signal — exactly
+    as before this second source existed."""
+    runner_verdict = _read_runner_verdict(repo, ref_branch, preview_sha)
+    if runner_verdict is not None:
+        return runner_verdict
     runs = _gh_runs(repo, ref_branch, "databaseId,headSha,status,conclusion,url")
     if runs is None:
         return classify.Verdict("pending", "", preview_sha, ref_branch,
@@ -386,7 +509,7 @@ def acquire_verdict(repo: str, ref: str, preview_sha: str) -> classify.Verdict:
     completion condition."""
     stored = read_verdict(repo, ref, preview_sha)
     if stored.complete:
-        print(f"sable-merge-gate: consuming precomputed verdict for {ref} "
+        print(f"sable-merge-gate: consuming {stored.source} verdict for {ref} "
               f"({preview_sha[:7]}): {stored.conclusion} — no CI wait")
         return stored
     conclusion, url = wait_for_ci(repo, ref, preview_sha)
