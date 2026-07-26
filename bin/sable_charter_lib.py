@@ -9,17 +9,27 @@ PLANNING-MODES-DESIGN.md):
     with the no-go rationales kept verbatim, the relitigation-killer.
 
 Both are COMMITTED markdown under ``<repo>/.claude/sable/charters/`` — the
-come-back-to record, NOT ephemeral like ``.claude/sable/state/`` (so this lib has
-no gitignore step). Path resolution mirrors bin/sable-mode's resolve_state_path:
-``SABLE_CHARTERS_DIR`` override -> repo main-worktree charters dir -> HOME
-fallback. Logic lives here (importable) so the thin ``sable-charter`` bin and
-pytest share one implementation.
+come-back-to record, NOT ephemeral like ``.claude/sable/state/``. Path resolution
+mirrors bin/sable-mode's resolve_state_path: ``SABLE_CHARTERS_DIR`` override ->
+repo main-worktree charters dir -> HOME fallback. Logic lives here (importable)
+so the thin ``sable-charter`` bin and pytest share one implementation.
+
+Being committed markdown cuts against repos that gitignore ``.claude/``
+wholesale (a common blanket pattern for editor/agent scratch state), which would
+silently swallow charters too. ``ensure_charter_committable`` (SABLE-lavb) checks
+each written path with ``git check-ignore`` and, if caught, carves a negation
+exception into the repo's root ``.gitignore`` (mirrors sable-mode's
+``ensure_state_gitignored`` in reverse: un-ignore instead of ignore) so the
+durable record stays committable; if the auto-carve can't clear it (e.g. a
+global excludesfile this lib doesn't touch), it returns a loud warning naming
+the exact fix instead of failing silently.
 """
 from __future__ import annotations
 
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -238,6 +248,81 @@ class DecisionRecord:
         )
 
 
+# --- gitignore committability (SABLE-lavb) ----------------------------------
+
+def _find_repo_root(path: Path) -> Path | None:
+    """Working-tree root containing ``path``, or None if not inside a git repo.
+    Derived from the path itself (not a passed-in ``base``) so it's correct
+    regardless of whether the caller resolved the dir via SABLE_CHARTERS_DIR,
+    git-common-dir, or HOME fallback."""
+    d = path if path.is_dir() else path.parent
+    r = subprocess.run(
+        ["git", "-C", str(d), "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return None
+    return Path(r.stdout.strip())
+
+
+def _is_git_ignored(repo_root: Path, rel_path: str) -> bool:
+    r = subprocess.run(
+        ["git", "-C", str(repo_root), "check-ignore", "-q", rel_path],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
+def ensure_charter_committable(path: Path) -> str | None:
+    """Best-effort: if the just-written ``path`` is gitignored, carve a negation
+    exception into the repo's root .gitignore covering every ancestor directory
+    (git refuses to re-include a file whose parent dir is excluded, so each
+    level needs its own ``!`` line) plus a trailing glob for the dir's contents.
+    Returns None when the path isn't ignored (or isn't inside a git repo at
+    all — HOME fallback, or a SABLE_CHARTERS_DIR pointed outside any repo).
+    Returns a loud warning string naming the exact fix when the auto-carve
+    couldn't clear the ignore (e.g. a global excludesfile this can't rewrite)."""
+    root = _find_repo_root(path)
+    if root is None:
+        return None
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return None
+    rel_str = str(rel)
+    if not _is_git_ignored(root, rel_str):
+        return None
+
+    gi = root / ".gitignore"
+    existing = set(gi.read_text().splitlines()) if gi.exists() else set()
+    needed = []
+    prefix = ""
+    for part in rel.parts[:-1]:
+        prefix += part + "/"
+        neg = f"!{prefix}"
+        if neg not in existing:
+            needed.append(neg)
+    neg_glob = f"!{prefix}**" if prefix else f"!{rel_str}"
+    if neg_glob not in existing:
+        needed.append(neg_glob)
+
+    if needed:
+        content = gi.read_text() if gi.exists() else ""
+        if content and not content.endswith("\n"):
+            content += "\n"
+        content += "\n".join(needed) + "\n"
+        gi.write_text(content)
+
+    if _is_git_ignored(root, rel_str):
+        exact = needed or [neg_glob]
+        return (
+            f"sable-charter: WARNING - {rel_str} is still gitignored after an "
+            f"auto-fix attempt. Add these lines to {gi} to make it committable:\n"
+            + "\n".join(f"  {n}" for n in exact)
+        )
+    return None
+
+
 # --- write / locate --------------------------------------------------------
 
 def write_charter(charter: Charter, base: str | None = None) -> Path:
@@ -245,6 +330,9 @@ def write_charter(charter: Charter, base: str | None = None) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"{charter.slug}.md"
     p.write_text(charter.to_markdown())
+    warn = ensure_charter_committable(p)
+    if warn:
+        print(warn, file=sys.stderr)
     return p
 
 
@@ -253,6 +341,9 @@ def write_decision_record(record: DecisionRecord, base: str | None = None) -> Pa
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"{slugify(record.session)}-decisions.md"
     p.write_text(record.to_markdown())
+    warn = ensure_charter_committable(p)
+    if warn:
+        print(warn, file=sys.stderr)
     return p
 
 

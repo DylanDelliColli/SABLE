@@ -80,3 +80,37 @@ def test_write_locate_and_durable(repo):
         ["git", "-C", str(repo), "check-ignore", ".claude/sable/charters/alerts.md"],
         capture_output=True, text=True)
     assert ci.returncode != 0  # nonzero exit == path is NOT ignored
+
+
+def test_write_charter_committable_when_dot_claude_gitignored(repo):
+    """SABLE-lavb: a repo that gitignores .claude/ wholesale must not silently
+    swallow the durable charter record — it must become committable, or the
+    operator must be told exactly how."""
+    (repo / ".gitignore").write_text(".claude/\n")
+
+    f = repo / "c.json"
+    f.write_text(json.dumps({
+        "slug": "alerts", "title": "Real-Time Alerts",
+        "problem_statement": "Users miss time-critical events.",
+    }))
+    r = _run(["write-charter", "--json", str(f)], cwd=repo)
+    assert r.returncode == 0, r.stderr
+
+    charter_path = repo / ".claude" / "sable" / "charters" / "alerts.md"
+    assert charter_path.exists()
+
+    ci = subprocess.run(
+        ["git", "-C", str(repo), "check-ignore", "-q",
+         str(charter_path.relative_to(repo))])
+    committable = ci.returncode != 0
+    named_the_fix = "gitignore" in r.stderr.lower() and "!.claude/" in r.stderr
+    assert committable or named_the_fix
+
+    if committable:
+        add = subprocess.run(
+            ["git", "-C", str(repo), "add", "-A"], capture_output=True, text=True)
+        assert add.returncode == 0, add.stderr
+        staged = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+            capture_output=True, text=True, check=True).stdout
+        assert ".claude/sable/charters/alerts.md" in staged

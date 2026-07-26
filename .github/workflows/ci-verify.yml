@@ -22,11 +22,15 @@
 # ~/.claude install are excluded in .github/ci/shell-run-set.sh, each WITH its
 # tracking bead, and widened as those land.
 #
-# ── Silent-green guard (SABLE-7v3z) ──────────────────────────────────────────
+# ── Silent-green guard (SABLE-7v3z / SABLE-lcevs) ────────────────────────────
 # pytest runs the WHOLE bin/ directory (auto-discovery, no testpaths/--ignore),
 # so no bin/ test can exist-but-not-run. The shell run-set's --manifest step
-# prints every hooks/test/test-*.sh as RUN / EXCLUDED(reason) / UNCLASSIFIED, so
-# a newly-added suite cannot silently escape the gate.
+# prints every hooks/test/test-*.sh as RUN / EXCLUDED(reason) / UNCLASSIFIED —
+# readable, but a ::warning:: annotation alone never fails a job (SABLE-lcevs:
+# this was the fail-OPEN gap that let a branch land fully green with new
+# suites UNCLASSIFIED and never executed). The --check step right after it is
+# the enforcement: same detection, but exits non-zero on any UNCLASSIFIED
+# suite or stale run-set entry, so this step is what actually blocks the gate.
 #
 # ── Cost (SABLE-oeci gotcha 5) ───────────────────────────────────────────────
 # Single job, no matrix. (Repo is public, so Actions minutes are free; kept lean
@@ -44,6 +48,32 @@
 # FAIL OPEN — any query error runs the suite, never skips on uncertainty — so
 # it can never mask a real regression. Do NOT remove either branch trigger
 # above (SABLE-ad21 / gah9-bypass safety net still requires both).
+#
+# ── pytest-testmon cache wiring (SABLE-cmar4.3) ───────────────────────────────
+# .testmondata (pytest-testmon's line-coverage map) persists ACROSS runs as a
+# GitHub Actions cache artifact, keyed on ref+SHA with branch-prefix
+# restore-keys below, so an exact-SHA lookup always "misses" (every push is a
+# new SHA) but falls through to the most recent cache saved for this ref, then
+# to any ref, via prefix matching — actions/cache then saves the post-run
+# .testmondata under the new exact-SHA key. testmon's own file-hash diffing
+# tolerates a "stale" cache restored from a different branch/commit; it just
+# means more files read as dirty (conservative), never fewer.
+#
+# This job's own correctness-verifying pytest step below (the one gating the
+# merge) stays UNCONDITIONALLY full-suite (SABLE-7v3z) and plain — it does NOT
+# pass any testmon flag. Cache-warming (recording/updating .testmondata for
+# the impact-tier SELECTOR — bin/tier_selection.py, .github/ci/pytest-impact-
+# tier.sh, still not wired into this gate; see below) is a SEPARATE, later
+# step that re-runs the same full suite with --testmon-noselect. The two are
+# split deliberately (SABLE-cmar4.3 second revise) — see that step's own
+# comment for why: pytest-testmon 2.2.0 has a real, reproduced defect that
+# crashes on this repo's bin/ layout, and that crash must never take the gate
+# down when every actual test passed.
+#
+# An impact-scoped run here is only safe once the full-snapshot backstop
+# (SABLE-jd5fj.5) exists to catch what it under-selects. On a cache miss (no
+# .testmondata restored at all) --testmon-noselect is a no-op beyond writing a
+# fresh map from that run — still the same conservative full run either way.
 
 name: ci-verify
 
@@ -54,6 +84,25 @@ on:
       - 'tmux-only'      # integration branch baseline
   workflow_dispatch: {}
 
+# ── Concurrency: PER-REF, and that is load-bearing (SABLE-jd5fj.3) ───────────
+# The group is keyed on github.ref, so N merge previews on N distinct
+# ci-verify/<bead>-<sha7> refs land in N DISTINCT groups and run CONCURRENTLY —
+# none of them cancels another. cancel-in-progress: true is safe only under that
+# keying: what it supersedes is a re-push to the SAME ref (a stale run for a
+# merge state that has been replaced), which is exactly what should be dropped.
+#
+# DO NOT coarsen this key. A constant, or github.workflow alone, would collapse
+# every in-flight preview into one group, and each new worker's kick would
+# cancel the run before it — SABLE-sc24's spurious-cancel shape, fleet-wide,
+# with authors told to "fix + re-push" work that has nothing wrong with it.
+# hooks/test/test-parallel-previews.sh (P1a) and bin/test_merge_gate_modules.py
+# both red the gate if this stops naming github.ref.
+#
+# CEILING: GitHub Actions runs at most 20 concurrent jobs per account on the
+# free tier. Previews past that QUEUE — they do not fail — so exceeding it costs
+# merge latency, not correctness. A fleet wider than ~20 simultaneous in-flight
+# previews is running against that queue; SABLE-jd5fj.7's merge-latency
+# telemetry is where it would show up.
 concurrency:
   group: ci-verify-${{ github.ref }}
   cancel-in-progress: true
@@ -103,7 +152,35 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y tmux
           python -m pip install --upgrade pip
-          pip install pytest
+          # pytest-testmon / pytest-impact (SABLE-cmar4.3): both register as
+          # pytest11 plugins automatically and are strictly opt-in (no-op
+          # unless --testmon/--testmon-noselect or --impact is passed), so
+          # installing them here changes nothing about this job's own
+          # unconditional full-suite run.
+          # pytest-cov / diff_cover (SABLE-cmar4.5): the coverage-delta check
+          # a PRUNING diff must carry (.github/ci/diff-cover-gate.sh) shells
+          # out to real pytest-cov + diff-cover, so hooks/test/test-coverage-
+          # floor-gate.sh needs both on PATH to run for real, not mocked, in
+          # this clean-room (SABLE-59zu contract).
+          #
+          # This also happens to be SABLE-cmar4.6's third-revise root cause
+          # fix (pytest-cov was independently required by
+          # bin/columbo-cost-prefilter.py's --cov-context/--cov/--cov-report
+          # inner invocation; see green-snapshot.yml's matching step for the
+          # verbatim CI usage error that diagnosed it) -- the two needs
+          # converged on the same package, so cmar4.5's superset line already
+          # satisfies both.
+          pip install pytest pytest-testmon pytest-impact pytest-cov diff_cover
+
+      - name: Restore pytest-testmon coverage cache (SABLE-cmar4.3)
+        if: steps.dedup.outputs.already_verified != 'true'
+        uses: actions/cache@v4
+        with:
+          path: .testmondata
+          key: testmon-v1-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            testmon-v1-${{ github.ref }}-
+            testmon-v1-
 
       - name: Configure git identity (SABLE-59zu — clean-room needs one)
         if: steps.dedup.outputs.already_verified != 'true'
@@ -130,6 +207,13 @@ jobs:
           command -v jq   >/dev/null || { echo "::error::jq missing";   exit 1; }
           command -v git  >/dev/null || { echo "::error::git missing";  exit 1; }
           git config --get user.email >/dev/null || { echo "::error::git identity unset"; exit 1; }
+          # gh is a real dependency of the SABLE-r3i6 dedup guard
+          # (.github/ci/preview-already-verified.sh's `gh api ...`) and
+          # sable-merge-gate's wait_for_ci poll (bin/sable_gate_preview_lib.py's
+          # `gh run list ...`), but both are deliberately fail-open on a
+          # missing gh rather than crashing, so this is a warning, not the
+          # fail-loud ::error:: pattern above (SABLE-apt5a).
+          command -v gh >/dev/null 2>&1 || echo "::warning::gh missing in clean-room -- dedup guard and merge-gate wait_for_ci silently fail open without it (SABLE-apt5a)"
           python --version
           # bd/dolt MUST be absent — their presence changes which suites are green,
           # so it would silently invalidate the SABLE-59zu contract this run pins.
@@ -151,6 +235,32 @@ jobs:
           #     never attaching on the CI clean-room.
           python -m pytest bin/ -q -p no:cacheprovider
 
+      - name: Warm pytest-testmon coverage cache (SABLE-cmar4.3 second revise)
+        if: steps.dedup.outputs.already_verified != 'true'
+        run: |
+          # Re-runs the SAME full bin/ suite with --testmon-noselect
+          # (record/update .testmondata, deselect nothing) purely to keep the
+          # impact-tier's coverage map warm — see the cache-wiring comment
+          # above for why selection itself isn't enabled on this gate. Kept
+          # OUT of the correctness-verifying step above because pytest-testmon
+          # 2.2.0 has a real, reproduced defect: it crashes with INTERNALERROR
+          # (IndexError in its own SourceTree.get_file(), testmon_core.py:93
+          # `filename.rsplit(".", 1)[1]`) whenever it measures coverage on a
+          # file with no extension at all — true of ~23 of this repo's bin/
+          # python executables (shebang, no .py suffix) that several
+          # bin/test_*.py suites load in-process via
+          # importlib.machinery.SourceFileLoader. Confirmed by direct repro:
+          # testmon's own Coverage() instance hardcodes
+          # include=[repo_root + "/*"] with no ini/.coveragerc/pytest-cov
+          # config surface to narrow it, and 2.2.0 (latest) has no upstream
+          # fix. bin/tier_selection.py's classify_cache_warm_outcome()
+          # narrowly tolerates ONLY this exact signature with zero reported
+          # test failures — any other non-zero exit (a real failure, a
+          # different crash) still fails this step for real. A tolerated
+          # crash just leaves .testmondata stale for this run, same as any
+          # other cache miss.
+          bash .github/ci/testmon-cache-warm.sh
+
       - name: Fixture isolation tripwire (SABLE-0ssz.2 — ban unsandboxed real-repo git ops)
         if: steps.dedup.outputs.already_verified != 'true'
         run: |
@@ -164,6 +274,14 @@ jobs:
       - name: Shell run-set coverage manifest (SABLE-7v3z — exclusions are visible)
         if: steps.dedup.outputs.already_verified != 'true'
         run: bash .github/ci/shell-run-set.sh --manifest
+
+      - name: Shell run-set fail-closed check (SABLE-lcevs — UNCLASSIFIED/stale blocks the gate)
+        if: steps.dedup.outputs.already_verified != 'true'
+        run: bash .github/ci/shell-run-set.sh --check
+
+      - name: Shell impact manifest — lib fan-out completeness (SABLE-cmar4.2)
+        if: steps.dedup.outputs.already_verified != 'true'
+        run: bash .github/ci/impact-manifest.sh --check
 
       - name: hooks/test shell suites (known-green allowlist)
         if: steps.dedup.outputs.already_verified != 'true'

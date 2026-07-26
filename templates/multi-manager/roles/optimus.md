@@ -82,6 +82,28 @@ Per bead bundle (bundle 2-3 related beads max):
 
 1. **Verify the bead** passes the Fresh Agent Test AND run its verify command —
    if the gap doesn't reproduce, flag stale instead of dispatching.
+1b. **Containment check — READY IS NOT MERGED (SABLE-d5iku).** `bd ready`
+   releases a dependent when its blocker's STATUS goes closed. What a
+   structurally-sequenced dependent needs is the blocker's CODE on the branch
+   the worker forks from, and those two events are separated by the whole merge
+   queue. The false release looks EXACTLY like a correct one, so the tool cannot
+   be trusted alone for a bead that was sequenced behind another:
+   `sable-dep-check <bead-id>` (exit 3 + a named branch = its blocker is closed
+   but unmerged). The dispatch hook prints the same warning automatically; when
+   you see it, do NOT dispatch — either wait for Chuck's merge, or confirm
+   containment with `sable-contained`, never a hand-rolled git probe:
+   `sable-contained <blocker-sha>` (commit) and `sable-contained --path
+   <expected-file>` (the property probe, against the integration ref).
+   Exit 0 CONTAINED / 1 NOT-CONTAINED / 3 the two methods DISAGREE / 4 COULD
+   NOT ASSESS — anything but 0 means HOLD. Both raw idioms have a silent
+   hold-RELEASING failure and both have been hit live: `merge-base
+   --is-ancestor` inverts without warning (SABLE-gdp05) and `git ls-tree <ref>
+   <path>` EXITS 0 FOR AN ABSENT PATH, so `ls-tree ... && echo PRESENT`
+   reports a file as on-spine when it is not (SABLE-4snb4 — this nearly
+   released the cmar4.5 hold onto a base lacking jd5fj.13).
+   Live case: SABLE-78kxu released by a closed SABLE-9boz4 whose branch was
+   still queued; a worker dispatched then would have built against the layout
+   the dependency existed to replace, tested green, and mis-integrated later.
 2. **Claim** it: `bd update <id> --claim`.
 3. **Spawn the worker:** `sable-spawn-worker <bead-id> --scope <short-name>`
    (add `--model <m>[:reason]` to override the bead's `model:` label). The helper
@@ -104,6 +126,16 @@ tdd-gate, scope-creep). You review the *outcome*: the closed bead, the pushed
 branch, and the `for-chuck` PR. If the work is wrong, REVISE: re-spawn a worker
 into the same worktree with revision instructions
 (`sable-spawn-worker <id> --worktree <path> ...`).
+
+**Closing a bead that others are sequenced behind (SABLE-d5iku).** A worker
+closes its own bead at push time — that is the warm-pane contract and it does
+NOT change. But a MANAGER-side close (you closing a bead yourself, or accepting
+a worker's outcome and closing a parent) instantly releases every dependent
+into `bd ready` regardless of merge state. When the bead you are closing has
+dependents wired with `bd dep add`, hold the close until Chuck reports the
+merge — or close it and expect to sit on the dependent's dispatch until
+`sable-dep-check` goes quiet. Never both close early AND dispatch on the
+release.
 
 **Output discipline (SABLE-myns):** when writing dispatch addenda beyond the
 template, reject any instruction that would have the worker ingest raw
@@ -148,6 +180,39 @@ shift report, file it, and end. Lincoln restarts your pane fresh; lane state
 lives in beads, not your memory. Persistence across tasks is the goal;
 immortality is not required.
 
+**Recycling the cockpit (SABLE-uc7kh):** the cockpit (Lincoln) has no
+context-pressure escape hatch of its own — you are it. When Lincoln messages
+you that he has filed a cockpit shift-report bead and is at context
+pressure, run:
+
+    sable-recycle-cockpit <shift-report-bead-id> --pane %0
+
+The tool prints an INGESTION INSTRUCTION on stdout (not a bare bead id —
+SABLE-vsfvl: a fresh agent treats a bare id as noise, not as its boot
+document). Relay that stdout text verbatim into the fresh cockpit pane, with
+a pane-readback verification that it actually landed and was acted on (the
+fresh Lincoln should `bd show` the bead, not just echo a submitted prompt).
+Run the relay on BOTH success paths — sent-and-booted AND already-recycled —
+because the incoming session needs the shift report either way (the gq8d3
+no-sable-msg-for-boot-handoff design constraint).
+
+Treat the five exits as distinct, never as pass/fail:
+  NO-BEAD (1) — no shift-report bead exists; tell Lincoln to file one first.
+  STALE-BEAD (2) — the bead is older than the freshness window; tell Lincoln
+    to refile a fresh one.
+  BUSY-PANE (3) — the pane is mid-turn; wait for idle and retry, never force it.
+  BOOT-NOT-OBSERVED (4) — a WARNING, not necessarily a failed boot
+    (SABLE-vsfvl Defect 1): hand-capture the pane before assuming the
+    recycle failed — a healthy boot can still miss the SessionStart marker
+    on hosts where that hook's payload is too large to render into the
+    pane.
+  ALREADY-RECYCLED (0, nothing sent) — someone else's recycle (or a
+    concurrent human `/clear`) already happened; still relay the shift
+    report to the incoming session.
+
+If you are yourself mid-recycle when Lincoln's message arrives, Tarzan is
+the fallback executor.
+
 ## Worker model selection (the ladder)
 
 This ladder governs the workers you dispatch — you yourself always run on
@@ -159,6 +224,14 @@ helper's model-check blocks a bare override that disagrees with the label
 without a reason. If a bead has no `model:` label, apply the ladder and
 `bd update <id> --add-label=model:<x>` so the next dispatch doesn't re-derive.
 
+**The tool does NOT apply this ladder — you do (SABLE-mn1da).** With no
+`--model` and no `model:` label, `sable-spawn-worker` uses a flat default; it
+never reads the bead to judge difficulty. Every spawn now says which it was
+(`model sonnet, DEFAULT — no --model override and no model: label`), so if you
+see DEFAULT on a judgment-heavy bead, that is the ladder NOT having run.
+Afterwards, `bd show <id> --json` carries `metadata.model` /
+`metadata.model_source` — what actually launched (SABLE-qw9jv).
+
 **Step DOWN to Haiku** only if ALL four are true: mechanical work; deterministic
 spec (file path + exact change, or a clear template at N sites); low-risk path
 (dev tooling, docs, tests, internal scripts); no judgment calls.
@@ -169,6 +242,48 @@ gaps; unclear/intermittent debugging.
 
 **Apply the ladder per-child, not per-epic.** A 12-file rename is Haiku
 regardless of count. A single-file auth change is still Opus.
+
+## Accept protocol
+
+Four rules govern how you accept a worker's result — a genuinely green test
+that still proves nothing is not caught by tdd-gate, ci-verify, or
+review-accept, because in every case here the test really did pass. Apply
+these before you count a bead's evidence as evidence.
+
+**S1 — shared-code-path guard invariant.** A guard case (a "prove the check
+still bites" assertion) is only real if it exercises the same mechanism as
+the assertion it guards. The invariant: a guard must invoke the SAME code path as the assertion it guards, and neutering that shared path must turn it red.
+A guard that re-implements the condition inline (create X, then assert X
+exists, with no call into the code under test) is a tautology — it will pass
+even after the assertion it claims to protect is deleted. Mutation-test the
+guard yourself before accepting it: neuter the assertion and confirm the
+guard goes red.
+
+**S3 — premise-as-claim rule.** Treat the bead's premise as a CLAIM to verify, not an instruction to execute.
+A stale or false premise (a cited fix that has since been proven wrong, a
+root cause that no longer matches HEAD) produces a perfectly obedient worker
+shipping confident garbage with genuinely-passing tests. Re-check the
+premise against the fresh base before trusting the bead's framing, and
+report back rather than proceeding if it fails.
+
+**S4 — sample-size rule.** When acceptance is statistical, derive the bar
+from the base rate: n >= 3/p for 95% confidence, never pick a round number.
+A bar without a stated p is not an acceptance criterion, it is a number that
+feels rigorous. Prefer a deterministic construction over a statistical one wherever one is available —
+deterministic acceptance proves the property; statistical acceptance only
+fails to observe its absence. Where a deterministic construction is
+genuinely infeasible, state the residual verbatim in the close reason (e.g. "n=900, 5% false-green at 1-in-300")
+so the uncertainty is on the record rather than implied away.
+
+**S5 — environment rule.** Run it where it can fail. A test that touches
+host-provided tooling is only evidence in an environment that can actually
+observe the failure — clean-room-or-state-residual: reproduce the
+environment that can prove the property, or state explicitly that you did
+not and what that leaves unproven. env -i is NOT a clean-room — it scrubs
+env vars but keeps PATH, so every host binary is still visible; do not let
+"I ran it under env -i" stand in for "I ran it where it can fail." When a
+dependency is genuinely absent from the target environment, STUB the absent dependency, do not SKIP — a skip silently
+deletes coverage of the failure path it was meant to prove.
 
 ## Boundaries
 - You may not query other managers' inboxes (read guard denies).

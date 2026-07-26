@@ -59,12 +59,26 @@ _ENV_LEAKS = (
 # a committer date old enough that push-age >> the 10-minute settle threshold
 _OLD_DATE = "2001-01-01T00:00:00 +0000"
 
+# SABLE-4709h: live_pane_bead_ids() shells out to $SABLE_RC_TMUX (default
+# "tmux"). This dev host runs a REAL SABLE fleet under a real tmux server —
+# stripping TMUX_PANE above does NOT stop `tmux list-panes -a` from finding
+# that server's default socket and enumerating its ACTUAL live panes, which
+# would couple every rehearsal in this module to whatever real work happens
+# to be running at test time. Point at a binary that cannot exist so the
+# reconciler's _tmux() raises FileNotFoundError and live_pane_bead_ids fails
+# open to an empty set — the exact, hermetic, always-"no live panes" behavior
+# every pre-existing rehearsal here already assumes. The one rehearsal that
+# WANTS a live pane (test_4709h_live_worker_pane_suppresses_filing) overrides
+# this with its own stub tmux script.
+_NO_TMUX = "sable-reconcile-tests-hermetic-no-such-tmux-binary"
+
 
 def _env(home):
     env = {k: v for k, v in os.environ.items() if k not in _ENV_LEAKS}
     env["HOME"] = str(home)
     env["BD_NON_INTERACTIVE"] = "1"
     env["CI"] = "true"
+    env["SABLE_RC_TMUX"] = _NO_TMUX
     return env
 
 
@@ -128,11 +142,11 @@ def _bare_git(origin, *args, check=True):
 # unhanded-off push.
 # --------------------------------------------------------------------------
 
-def _setup(tmp_path, *, integration_branch=BASE):
+def _setup(tmp_path, *, integration_branch=BASE, home=None):
     origin = tmp_path / "origin.git"
     work = tmp_path / "work"
-    home = tmp_path / "home"
-    home.mkdir()
+    home = (tmp_path / "home") if home is None else home
+    home.mkdir(exist_ok=True)
 
     _git(tmp_path, "init", "--bare", "-b", BASE, str(origin))
     _git(tmp_path, "clone", str(origin), str(work))
@@ -177,8 +191,16 @@ def _push_worker_branch(work, bead_id, *, merged_into=None):
     """Create + push a worker branch `wk-<bead_id>` with a backdated commit
     (old push-age). If merged_into is set, also fast-forward that branch to the
     worker tip and push it (models an already-merged branch)."""
-    branch = f"wk-{bead_id}"
-    feat = f"{bead_id}.txt"
+    return _push_named_branch(work, f"wk-{bead_id}", tag=bead_id, merged_into=merged_into)
+
+
+def _push_named_branch(work, branch, *, tag, merged_into=None):
+    """Create + push a branch under an EXPLICIT name (not derived from a bead
+    id) with a backdated commit (old push-age). Used by the SABLE-i5739
+    metadata-resolution rehearsal, where the branch name deliberately embeds
+    NO bead id and the bead's own title/description never mention it either —
+    the only thing tying branch to bead is structured metadata."""
+    feat = f"{tag}.txt"
     _git(work, "checkout", "-b", branch, BASE)
     (work / feat).write_text("worker feature\n")
     _git(work, "add", feat)  # named file only — NEVER -A (would stage .beads)
@@ -193,11 +215,29 @@ def _push_worker_branch(work, bead_id, *, merged_into=None):
     return branch
 
 
-def _reconcile(work, home, *, dry_run=False):
+def _make_work_bead_with_branch_metadata(work, home, branch, *, status="closed"):
+    """Create a work bead whose title/description NEVER mention `branch` at
+    all (unlike `_make_work_bead`, which relies on the embedded-id `wk-<id>`
+    naming convention) and record the branch as STRUCTURED metadata — exactly
+    what sable-spawn-worker's tag_branch_metadata writes at dispatch time
+    (SABLE-i5739). Under the OLD prose-search resolver this bead would never
+    be found for `branch` (mode a: 0 hits)."""
+    cp = _bd(work, home, "create", "--sandbox", "--json",
+             "--title", "unit of work with a title naming nothing branch-shaped",
+             "--type=task", "--priority=2")
+    bead_id = json.loads(cp.stdout)["id"]
+    _bd(work, home, "update", bead_id, "--sandbox",
+        "--set-metadata", f"branch={branch}")
+    if status == "closed":
+        _bd(work, home, "close", bead_id, "--sandbox")
+    return bead_id
+
+
+def _reconcile(work, home, *, dry_run=False, extra_env=None):
     argv = [sys.executable, str(BIN), "--repo", str(work), "--remote", "origin"]
     if dry_run:
         argv.append("--dry-run")
-    return _run(argv, work, home)
+    return _run(argv, work, home, extra_env=extra_env)
 
 
 def _reconcile_via_timer(work, home, *, repo_via="cli", dry_run=False, extra_env=None):
@@ -452,6 +492,31 @@ def test_S7oj5_generated_unit_env_survives_systemd_shaped_stripped_path(tmp_path
     assert branch in beads[0]["title"], beads[0]["title"]
 
 
+# ===========================================================================
+# SABLE-6sdpx: reconcile()'s `git fetch --prune` refresh was check=False and
+# never inspected — a real fetch failure (unreachable/misconfigured remote)
+# was previously silent, classifying against stale refs with zero signal.
+# Real subprocess, real (broken) remote, no mocks: assert the observable
+# outcome is a loud warning plus a still-successful, non-crashing sweep — the
+# conservative direction (best-effort continue + noise) rather than a swallow.
+# ===========================================================================
+
+def test_fetch_failure_against_unconfigured_remote_warns_but_still_sweeps(tmp_path):
+    origin, work, home = _setup(tmp_path)
+    bead_id = _make_work_bead(work, home, status="closed")
+    _push_worker_branch(work, bead_id)
+
+    # a remote name with nothing configured for it -> `git fetch garbage-remote
+    # --prune` fails for real (unlike origin, which the fixture wires up).
+    argv = [sys.executable, str(BIN), "--repo", str(work), "--remote", "garbage-remote"]
+    r = _run(argv, work, home)
+    assert r.returncode == 0, ("a failed refresh must not crash the sweep — "
+                               f"best-effort continue is the conservative fallback:\n{r.stdout}")
+    assert "WARNING" in r.stdout and "fetch" in r.stdout, (
+        f"a real fetch failure must be loud, never silent:\n{r.stdout}"
+    )
+
+
 def test_S7oj5_without_sable_rc_bd_the_original_bug_reproduces(tmp_path):
     # Pins the FAILURE this bead fixes: bare 'bd' + a stripped systemd-shaped
     # PATH really does FileNotFoundError — proof the fix above (not some
@@ -466,3 +531,438 @@ def test_S7oj5_without_sable_rc_bd_the_original_bug_reproduces(tmp_path):
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
     assert r.returncode != 0, r.stdout
     assert "FileNotFoundError" in r.stdout, r.stdout
+
+
+# ===========================================================================
+# SABLE-i5739: STRUCTURED branch->bead resolution replaces prose `bd search`
+# as the primary path. Real bd, real git, no mocks. Two-part acceptance:
+#   1. a branch whose work bead's text NEVER names it (the OLD resolver's
+#      mode-a silent failure: 0 hits, forever un-strandable) IS classified
+#      stranded and gets a for-chuck bead filed — because the branch is
+#      recorded on the bead as structured metadata, not found by prose.
+#   2. filing an UNRELATED bead that happens to mention the branch name in
+#      its own title afterward must NOT change the resolution/handoff on a
+#      re-run — proving modes (b) wrong-success and (c) drift are closed,
+#      not merely that resolution got luckier.
+# ===========================================================================
+
+def test_SABLE_i5739_branch_resolves_via_metadata_when_bead_text_never_names_it(tmp_path):
+    origin, work, home = _setup(tmp_path)
+    branch = "wk-totally-unrelated-slug"
+    bead_id = _make_work_bead_with_branch_metadata(work, home, branch, status="closed")
+    _push_named_branch(work, branch, tag=bead_id)
+
+    # sanity: the branch name embeds no bead id, and the bead's title/desc
+    # never mention the branch — the OLD prose-search resolver finds NOTHING
+    # for this exact case (mode a).
+    prose = _bd(work, home, "search", branch, "--status", "all", "--json", check=False)
+    assert json.loads(prose.stdout) == [], (
+        "fixture invariant broken: prose search must find zero hits for this "
+        f"branch so the test actually exercises mode (a):\n{prose.stdout}")
+
+    assert _for_chuck_beads(work, home) == []
+
+    r1 = _reconcile(work, home)
+    assert r1.returncode == 0, r1.stdout
+    beads1 = _for_chuck_beads(work, home)
+    assert len(beads1) == 1, (
+        f"branch whose bead never names it must still be classified stranded "
+        f"via structured metadata, got {beads1}\n{r1.stdout}")
+    assert branch in beads1[0]["title"], beads1[0]["title"]
+
+    # --- the acceptance criterion: file an UNRELATED bead that happens to
+    # mention this exact branch name, then re-run. Under the OLD resolver
+    # this bead would now WIN the prose search (mode b) and/or flip the
+    # answer over time (mode c) on later runs as more such beads accumulate.
+    _bd(work, home, "create", "--sandbox", "--title",
+        f"a completely unrelated bead that mentions {branch} in passing",
+        "--type=task", "--priority=2")
+
+    r2 = _reconcile(work, home)
+    assert r2.returncode == 0, r2.stdout
+    beads2 = _for_chuck_beads(work, home)
+    assert len(beads2) == 1, (
+        f"an unrelated bead mentioning the branch must not change resolution "
+        f"(mode b/c not closed): {beads2}\n{r2.stdout}")
+    assert beads2[0]["id"] == beads1[0]["id"], (
+        "re-run resolved to a DIFFERENT bead after an unrelated bead "
+        f"mentioning the branch appeared — drift (mode c) is not closed: "
+        f"{beads1} vs {beads2}")
+
+
+# ===========================================================================
+# SABLE-vif5e: open_for_chuck_beads' query-failure fallback previously folded
+# a genuine bd failure into the SAME [] value as "no open handoffs yet" —
+# predicate 3's suppression corpus — so a transient bd break during a sweep
+# cadence would DUPLICATE a for-chuck bead that already exists. Real bd, real
+# git, no mocks: break the REAL beads database out from under the reconciler
+# subprocess (rename `.beads` away so bd's real workspace-discovery fails for
+# real, matching bd's actual "no beads database found" exit), with a for-chuck
+# bead ALREADY open for the branch, and assert the sweep does NOT create a
+# duplicate — then restore bd and assert the sweep still correctly suppresses.
+# ===========================================================================
+
+def test_SABLE_vif5e_for_chuck_query_failure_does_not_duplicate_handoff(tmp_path):
+    origin, work, home = _setup(tmp_path)
+    bead_id = _make_work_bead(work, home, status="closed")
+    branch = _push_worker_branch(work, bead_id)
+
+    # establish the ALREADY-OPEN for-chuck handoff this sweep must not duplicate
+    assert _for_chuck_beads(work, home) == []
+    r0 = _reconcile(work, home)
+    assert r0.returncode == 0, r0.stdout
+    beads0 = _for_chuck_beads(work, home)
+    assert len(beads0) == 1, f"fixture invariant broken: expected one pre-existing handoff, got {beads0}\n{r0.stdout}"
+    original_id = beads0[0]["id"]
+
+    # break the REAL beads database out from under the reconciler: rename
+    # .beads away so `bd list --label for-chuck` genuinely cannot find a
+    # workspace and exits nonzero — no stubbing, the real bd binary fails.
+    beads_dir = work / ".beads"
+    disabled_dir = work / ".beads.disabled"
+    beads_dir.rename(disabled_dir)
+    try:
+        r1 = _reconcile(work, home)
+    finally:
+        disabled_dir.rename(beads_dir)
+
+    assert r1.returncode == 0, (
+        f"a for-chuck query failure must not crash the sweep — best-effort "
+        f"continue is the conservative fallback:\n{r1.stdout}")
+    assert "WARNING" in r1.stdout, (
+        f"a real for-chuck query failure must be loud, never silent:\n{r1.stdout}")
+
+    # the acceptance criterion: bd is restored now — assert NO duplicate was
+    # created while it was broken.
+    beads_after_break = _for_chuck_beads(work, home)
+    assert len(beads_after_break) == 1, (
+        f"a transient for-chuck query failure duplicated the handoff: "
+        f"{beads_after_break}\n{r1.stdout}")
+    assert beads_after_break[0]["id"] == original_id, (
+        f"the surviving bead changed identity across the broken run: "
+        f"{beads0} vs {beads_after_break}")
+
+    # restore-and-recheck: with bd healthy again, the sweep still correctly
+    # suppresses the already-on-record handoff (not just during breakage).
+    r2 = _reconcile(work, home)
+    assert r2.returncode == 0, r2.stdout
+    beads_final = _for_chuck_beads(work, home)
+    assert len(beads_final) == 1, (
+        f"sweep failed to keep suppressing after bd was restored: "
+        f"{beads_final}\n{r2.stdout}")
+    assert beads_final[0]["id"] == original_id, beads_final
+
+
+# ===========================================================================
+# SABLE-jejx3: HELD is a first-class third outcome — real bd, real git, no mocks.
+#
+# The defect (OBSERVED at the merge seat, not theorised): a branch under an
+# explicit do-not-merge hold satisfies all four stranded predicates identically
+# to an accidentally-unmerged one, so the floor filed a handoff saying "nobody
+# merged this — merge it", the EXACT INVERSE of the standing instruction, and
+# re-filed it every cadence once Chuck closed it.
+#
+# The hold is now durable metadata on the WORK BEAD (never the branch name,
+# never tmux traffic), so it outlives a pane restart AND a branch rename.
+# Every rehearsal below carries its POSITIVE CONTROL: the same sweep, in the
+# same run or immediately after, DOES file for an unheld branch — proving the
+# sweep was capable of filing and the hold marker is what stopped it.
+# ===========================================================================
+
+def _now_iso():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _place_hold(work, home, bead_id, *, reason, by="tarzan",
+                since="2026-07-21T00:00:00Z", until="tarzan green-lights a revised tip"):
+    """Place a first-class hold on a REAL work bead via real `bd update
+    --set-metadata` — the same command the module docstring documents for a
+    manager at the merge seat."""
+    args = ["update", bead_id, "--sandbox", "--set-metadata", f"hold={reason}"]
+    if by is not None:
+        args += ["--set-metadata", f"hold_by={by}"]
+    if since is not None:
+        args += ["--set-metadata", f"hold_since={since}"]
+    if until is not None:
+        args += ["--set-metadata", f"hold_until={until}"]
+    _bd(work, home, *args)
+
+
+def _lift_hold(work, home, bead_id):
+    _bd(work, home, "update", bead_id, "--sandbox",
+        "--unset-metadata", "hold", "--unset-metadata", "hold_by",
+        "--unset-metadata", "hold_since", "--unset-metadata", "hold_until")
+
+
+def test_jejx3_held_branch_files_no_handoff_and_is_still_named(tmp_path):
+    """(i) NO for-chuck 'merge me' bead is filed for a held branch, and (ii) the
+    sweep still NAMES it — a held branch is never silently invisible. Positive
+    control at the end: lifting the hold makes the SAME sweep file, so the
+    marker is doing the work and this cannot pass vacuously."""
+    origin, work, home = _setup(tmp_path)
+    branch = "wk-held-target"
+    bead_id = _make_work_bead_with_branch_metadata(work, home, branch, status="closed")
+    _push_named_branch(work, branch, tag="held")
+
+    # BEFORE the hold: this is a textbook stranded branch (the inverted-handoff
+    # case as it fired in production) — assert the sweep would file, in dry-run
+    # so the corpus stays clean for the real assertion below.
+    pre = _reconcile(work, home, dry_run=True)
+    assert pre.returncode == 0, pre.stdout
+    assert "STRANDED" in pre.stdout, (
+        f"fixture invariant broken: the unheld branch must classify STRANDED "
+        f"or the hold assertion below proves nothing:\n{pre.stdout}")
+
+    _place_hold(work, home, bead_id,
+                reason="false-negative security regression in the tree-claim gate")
+
+    r1 = _reconcile(work, home)
+    assert r1.returncode == 0, r1.stdout
+
+    # (i) NOTHING filed — the inverted 'merge me' handoff is not manufactured
+    assert _for_chuck_beads(work, home) == [], (
+        f"a HELD branch must never produce a 'merge me' handoff:\n{r1.stdout}")
+
+    # (ii) it is still NAMED, with all four fields, every cadence
+    assert branch in r1.stdout, f"held branch went invisible:\n{r1.stdout}"
+    assert "HELD" in r1.stdout, r1.stdout
+    assert "by=tarzan" in r1.stdout, r1.stdout
+    assert "until=tarzan green-lights a revised tip" in r1.stdout, r1.stdout
+    assert "false-negative security regression" in r1.stdout, r1.stdout
+    summary = [l for l in r1.stdout.splitlines()
+               if l.startswith("sable-reconcile-handoffs:")][-1]
+    assert "1 held branch(es)" in summary and branch in summary, summary
+
+    # re-running does NOT accumulate anything either (the re-file loop that made
+    # the original defect recurring rather than one-shot)
+    r2 = _reconcile(work, home)
+    assert r2.returncode == 0, r2.stdout
+    assert _for_chuck_beads(work, home) == [], (
+        f"a second cadence re-filed against a held branch:\n{r2.stdout}")
+
+    # POSITIVE CONTROL: lift the hold; the SAME sweep now files exactly one
+    # handoff for the SAME branch — proving the sweep could file all along.
+    _lift_hold(work, home, bead_id)
+    r3 = _reconcile(work, home)
+    assert r3.returncode == 0, r3.stdout
+    filed = _for_chuck_beads(work, home)
+    assert len(filed) == 1, (
+        f"positive control failed — an UNHELD stranded branch must still file: "
+        f"{filed}\n{r3.stdout}")
+    assert branch in filed[0]["title"], filed[0]["title"]
+
+
+def test_jejx3_hold_survives_a_branch_rename(tmp_path):
+    """The fourth destroyer of the gz3v2 bandage: it keyed suppression on the
+    BRANCH NAME appearing in a bead title, so a rename or re-push under a new
+    name silently dropped the protection with nothing logged. A hold keyed on
+    the WORK BEAD travels with the work: re-point the bead's `branch` metadata
+    and the hold still applies under the new name."""
+    origin, work, home = _setup(tmp_path)
+    old_branch = "wk-renamed-before"
+    bead_id = _make_work_bead_with_branch_metadata(work, home, old_branch, status="closed")
+    _push_named_branch(work, old_branch, tag="rename")
+    _place_hold(work, home, bead_id, reason="rejected tip, revision inbound")
+
+    r0 = _reconcile(work, home)
+    assert r0.returncode == 0, r0.stdout
+    assert _for_chuck_beads(work, home) == [], r0.stdout
+
+    # RENAME: the work reappears on origin under a brand-new name, the old ref
+    # is gone, and the work bead is re-pointed at it (the SABLE-i5739 join).
+    new_branch = "wk-renamed-after"
+    _git(work, "checkout", old_branch)
+    _git(work, "branch", "-m", new_branch)
+    _git(work, "push", "origin", new_branch)
+    _git(work, "push", "origin", "--delete", old_branch)
+    _git(work, "checkout", BASE)
+    _bd(work, home, "update", bead_id, "--sandbox",
+        "--set-metadata", f"branch={new_branch}")
+
+    r1 = _reconcile(work, home)
+    assert r1.returncode == 0, r1.stdout
+    assert _for_chuck_beads(work, home) == [], (
+        f"the hold did not survive the rename — the floor resumed filing the "
+        f"inverted handoff against {new_branch}:\n{r1.stdout}")
+    assert new_branch in r1.stdout and "HELD" in r1.stdout, r1.stdout
+
+    # POSITIVE CONTROL, same run shape: a second, UNHELD branch in the same
+    # sweep DOES file — the sweep was capable of filing while the renamed held
+    # branch was correctly skipped.
+    other = "wk-unheld-control"
+    _make_work_bead_with_branch_metadata(work, home, other, status="closed")
+    _push_named_branch(work, other, tag="control")
+    r2 = _reconcile(work, home)
+    assert r2.returncode == 0, r2.stdout
+    filed = _for_chuck_beads(work, home)
+    assert len(filed) == 1, f"positive control failed: {filed}\n{r2.stdout}"
+    assert other in filed[0]["title"], filed[0]["title"]
+    assert new_branch not in filed[0]["title"], filed[0]["title"]
+
+
+def test_jejx3_stale_and_incomplete_holds_are_flagged_for_review(tmp_path):
+    """A forgotten hold is SELF-SILENCING BY CONSTRUCTION — it suppresses the
+    very report that would surface its branch — so age and missing fields must
+    escalate into the summary, or 'held' decays into a permanent quiet veto."""
+    origin, work, home = _setup(tmp_path)
+    branch = "wk-stale-hold"
+    bead_id = _make_work_bead_with_branch_metadata(work, home, branch, status="closed")
+    _push_named_branch(work, branch, tag="stale")
+    # placed long ago, by nobody, with no release condition
+    _place_hold(work, home, bead_id, reason="reason lost to a pane restart",
+                by=None, since="2001-01-01T00:00:00Z", until=None)
+
+    r = _reconcile(work, home)
+    assert r.returncode == 0, r.stdout
+    assert _for_chuck_beads(work, home) == [], r.stdout
+    assert "STALE(" in r.stdout, r.stdout
+    assert "UNOWNED" in r.stdout, r.stdout
+    assert "NO-RELEASE-CONDITION" in r.stdout, r.stdout
+    summary = [l for l in r.stdout.splitlines()
+               if l.startswith("sable-reconcile-handoffs:")][-1]
+    assert "1 NEEDING REVIEW" in summary, summary
+
+    # counterpart: a well-formed, fresh hold adds no review noise — so the
+    # flag means something when it appears.
+    _place_hold(work, home, bead_id, reason="rejected tip, revision inbound",
+                since=_now_iso())
+    r2 = _reconcile(work, home)
+    assert r2.returncode == 0, r2.stdout
+    summary2 = [l for l in r2.stdout.splitlines()
+                if l.startswith("sable-reconcile-handoffs:")][-1]
+    assert "NEEDING REVIEW" not in summary2, summary2
+    assert "1 held branch(es)" in summary2, summary2
+
+
+# ===========================================================================
+# SABLE-5xz68 — MULTI-FLEET. This host runs more than one fleet, and the timer
+# leg's generated units used to name exactly one repo (a hardcoded one at
+# that). A floor that sweeps one fleet and silently ignores the others is the
+# vacuous-green shape in infrastructure form: it looks installed, it fires on
+# a cadence, and every other fleet's stranded pushes stay stranded.
+# Real fixtures, real git, real bd — TWO independent fleets, ONE firing.
+# ===========================================================================
+
+def test_5xz68_one_firing_sweeps_every_fleet_on_a_multi_fleet_host(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    alpha = tmp_path / "alpha"; alpha.mkdir()
+    beta = tmp_path / "beta"; beta.mkdir()
+    _, work_a, _ = _setup(alpha, home=home)
+    _, work_b, _ = _setup(beta, home=home)
+
+    bead_a = _make_work_bead(work_a, home, status="closed")
+    branch_a = _push_worker_branch(work_a, bead_a)
+    bead_b = _make_work_bead(work_b, home, status="closed")
+    branch_b = _push_worker_branch(work_b, bead_b)
+    assert _for_chuck_beads(work_a, home) == []
+    assert _for_chuck_beads(work_b, home) == []
+
+    # ONE invocation, both fleets — the shape a systemd/cron unit generated by
+    # sable-orchestration-install with SABLE_RECONCILE_TARGET_REPO=a:b fires.
+    argv = [sys.executable, str(TIMER_BIN), "--once", "--remote", "origin",
+            "--repo", str(work_a), "--repo", str(work_b)]
+    r = _run(argv, tmp_path, home)
+    assert r.returncode == 0, r.stdout
+
+    a_beads = _for_chuck_beads(work_a, home)
+    b_beads = _for_chuck_beads(work_b, home)
+    assert len(a_beads) == 1, f"fleet alpha not reconciled: {a_beads}\n{r.stdout}"
+    assert branch_a in a_beads[0]["title"], a_beads[0]["title"]
+    assert len(b_beads) == 1, f"fleet beta not reconciled: {b_beads}\n{r.stdout}"
+    assert branch_b in b_beads[0]["title"], b_beads[0]["title"]
+
+
+def test_5xz68_a_broken_fleet_does_not_skip_the_healthy_one(tmp_path):
+    """An unswept fleet is an unprotected fleet: a repo that blows up must not
+    abort the firing before the remaining repos are swept, and the failure must
+    still be visible in the exit code (not swallowed to keep the timer green)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    good = tmp_path / "good"; good.mkdir()
+    _, work_good, _ = _setup(good, home=home)
+    bead = _make_work_bead(work_good, home, status="closed")
+    branch = _push_worker_branch(work_good, bead)
+
+    broken = tmp_path / "does-not-exist"
+    argv = [sys.executable, str(TIMER_BIN), "--once", "--remote", "origin",
+            "--repo", str(broken), "--repo", str(work_good)]
+    r = _run(argv, tmp_path, home)
+
+    beads = _for_chuck_beads(work_good, home)
+    assert len(beads) == 1, f"healthy fleet skipped after a broken one: {beads}\n{r.stdout}"
+    assert branch in beads[0]["title"], beads[0]["title"]
+    assert r.returncode != 0, f"the broken fleet's failure was swallowed:\n{r.stdout}"
+
+
+# ===========================================================================
+# SABLE-z7gue / SABLE-4709h: content-containment, real git + real bd.
+#
+# z7gue's live instance: a worker branch's tip was NOT an ancestor of the
+# integration branch (a rebase changes every sha), yet its content had
+# already landed at the spine under a DIFFERENT sha — tip-containment
+# (predicate 1) cannot see this, and 'ask both lanes' can't either, because
+# every lane truthfully answers 'not mine' when the work is already on the
+# spine in nobody's hand. 4709h's own triage record names this as one of
+# sixteen [RECONCILE] false-positive firings with zero demonstrated true
+# positives across the shift — so this single real-git+real-bd test carries
+# BOTH the missing known-positive control (a genuinely unlanded branch DOES
+# still file) and the rebase-copy negative (a landed one does NOT), per the
+# spec's "at least the rebase-copy negative" plus the true-positive
+# requirement. Assertions key on the SPECIFIC branch names this test
+# created (SABLE-jd5fj.15 attributable absence), never a global bead count.
+# ===========================================================================
+
+def _land_same_content_on_trunk(work, feat_name, content):
+    """Commit `content` into `feat_name` directly on BASE and push — models a
+    worker branch that was rebased and squash-merged onto the integration
+    branch under a NEW sha, without its own branch ref ever being deleted.
+    `git cherry` computes patch-id from the diff against a commit's own
+    parent, so as long as BASE has not moved since the worker branch forked
+    from it, this commit's patch is byte-identical to the worker branch's own
+    commit — the exact rebase-copy relation z7gue is about — without this
+    fixture needing to run an actual `git rebase`."""
+    _git(work, "checkout", BASE)
+    (work / feat_name).write_text(content)
+    _git(work, "add", feat_name)
+    _git(work, "commit", "-m", "worker feature (landed via squash/rebase onto trunk)")
+    _git(work, "push", "origin", BASE)
+
+
+def test_reconcile_against_real_git_and_real_bd(tmp_path):
+    origin, work, home = _setup(tmp_path)
+
+    # Leg 1 (true positive, the missing known-positive control): a worker
+    # branch pushed, unmerged, work bead closed, no for-chuck bead, and
+    # NOTHING landed anywhere else — must still file exactly one bead naming
+    # it.
+    stranded_bead = _make_work_bead(work, home, status="closed")
+    stranded_branch = _push_worker_branch(work, stranded_bead)
+
+    # Leg 2 (rebase-copy negative, SABLE-z7gue): a second worker branch,
+    # pushed and unmerged by TIP (git merge-base --is-ancestor reads it as
+    # not-an-ancestor), but its content is already on BASE under a different
+    # commit/sha — the ref itself is never deleted, modeling the general
+    # class this floor's predicate 1 gets wrong (z7gue's own instance had the
+    # ref deleted too, but that is a DIFFERENT probe's failure — the ref
+    # being live here is what actually exercises THIS reconciler's
+    # list_origin_wk_branches + ancestry check against the fix).
+    landed_bead = _make_work_bead(work, home, status="closed")
+    landed_branch = _push_worker_branch(work, landed_bead)
+    _land_same_content_on_trunk(work, f"{landed_bead}.txt", "worker feature\n")
+    _git(work, "checkout", BASE)
+
+    cp = _reconcile(work, home)
+    assert cp.returncode == 0, cp.stdout
+    assert f"{stranded_branch}: STRANDED" in cp.stdout, cp.stdout
+    assert f"{landed_branch}: landed-under-different-sha" in cp.stdout, cp.stdout
+
+    beads = _for_chuck_beads(work, home)
+    titles = [b.get("title", "") for b in beads]
+    assert any(stranded_branch in t for t in titles), \
+        f"genuinely unlanded branch {stranded_branch} must file a for-chuck bead: {titles}"
+    assert not any(landed_branch in t for t in titles), \
+        f"rebased-and-landed branch {landed_branch} must file NO for-chuck bead: {titles}"
+    assert len(beads) == 1, \
+        f"exactly one bead expected (the genuine strand only): {titles}"

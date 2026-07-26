@@ -99,12 +99,12 @@ def test_mini_sweep_shards_make_zero_bd_calls_and_writes_are_post_merge(tmp_path
     # 1. export: ONE real `bd list --json` subprocess call through the shim.
     exported = lib.export_snapshot(run=lambda cmd: _run_real_bd(cmd, env))
     assert exported == beads
-    assert _call_log_lines(call_log) == ["list --json"]
+    assert _call_log_lines(call_log) == ["list --json --limit 0"]
 
     # 2. slice + run stub shards (the "shard context") — must add ZERO bd calls.
     slices = lib.slice(exported, 3)
     shard_reports = [stub_shard(s) for s in slices if s]
-    assert _call_log_lines(call_log) == ["list --json"], (
+    assert _call_log_lines(call_log) == ["list --json --limit 0"], (
         "shard context made a bd call — shards must never touch bd")
 
     # 3. merge preserves every shard finding; merge/write_plan add no bd calls.
@@ -115,7 +115,7 @@ def test_mini_sweep_shards_make_zero_bd_calls_and_writes_are_post_merge(tmp_path
     assert {f["bead_id"] for f in merged["findings"]} == {b["id"] for b in beads}
 
     plan = lib.write_plan(merged)
-    assert _call_log_lines(call_log) == ["list --json"], (
+    assert _call_log_lines(call_log) == ["list --json --limit 0"], (
         "merge/write_plan must not call bd directly — only the executed plan does")
 
     # 4. the PARENT executes the plan — the ONLY bd writes, and only now.
@@ -123,7 +123,7 @@ def test_mini_sweep_shards_make_zero_bd_calls_and_writes_are_post_merge(tmp_path
         _run_real_bd(cmd, env)
 
     calls = _call_log_lines(call_log)
-    assert calls[0] == "list --json"
+    assert calls[0] == "list --json --limit 0"
     assert len(calls) == 1 + len(plan)
     assert all(c.startswith("update ") for c in calls[1:])
     assert all("--append-notes" in c for c in calls[1:])
@@ -195,4 +195,4 @@ def test_mini_sweep_deficient_shard_raises_before_any_bd_write(tmp_path):
 
     # the deficient report never became a write plan, so bd saw only the
     # original export call — no `update` calls at all.
-    assert _call_log_lines(call_log) == ["list --json"]
+    assert _call_log_lines(call_log) == ["list --json --limit 0"]

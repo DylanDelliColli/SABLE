@@ -78,8 +78,11 @@ def test_parse_cgroup_pid_listing_empty():
 
 # --- find_phantom_containers (check a) --------------------------------------
 
-def _rec(id_, running, pid, name="/foo"):
-    return {"Id": id_, "Name": name, "State": {"Running": running, "Pid": pid}}
+def _rec(id_, running, pid, name="/foo", labels=None):
+    rec = {"Id": id_, "Name": name, "State": {"Running": running, "Pid": pid}}
+    if labels is not None:
+        rec["Config"] = {"Labels": labels}
+    return rec
 
 
 def test_find_phantom_containers_healthy_pid_alive():
@@ -122,6 +125,56 @@ def test_find_phantom_containers_ignores_unrelated_running_container():
         [healthy, phantom], live_pids={100}, cgroup_pids={_ID_A: 100}
     )
     assert [p["id"] for p in phantoms] == [_ID_B]
+
+
+# --- find_phantom_containers project scoping (SABLE-h5czc) -----------------
+#
+# The observed live failure: a full `pytest bin/` run REDed a doc-only branch
+# on test_healthy_dev_stack_is_clean_end_to_end because container
+# 'elastic_buck' — host noise unrelated to any SABLE-managed stack — was
+# flagged as a phantom. "there are no phantoms on this host" is the wrong
+# assertion for a check about ONE specific dev stack; "MY STACK left no
+# phantom" is attributable and does not regress when unrelated hosts
+# accumulate unrelated cruft.
+
+def test_find_phantom_containers_project_scope_excludes_foreign_project():
+    foreign = _rec(_ID_A, True, 12345, name="/elastic_buck",
+                    labels={"com.docker.compose.project": "some-other-stack"})
+    no_project_label = _rec(_ID_B, True, 12345, labels={})
+    phantoms = preflight.find_phantom_containers(
+        [foreign, no_project_label], live_pids=set(), cgroup_pids={}, project="sable-dev-stack"
+    )
+    assert phantoms == []
+
+
+def test_find_phantom_containers_project_scope_still_catches_own_stack():
+    # The opposite control: scoping must not go blind to a REAL desync of
+    # the very stack it exists to protect.
+    own = _rec(_ID_A, True, 12345, name="/supabase_db_dev-environment",
+               labels={"com.docker.compose.project": "sable-dev-stack"})
+    phantoms = preflight.find_phantom_containers(
+        [own], live_pids=set(), cgroup_pids={}, project="sable-dev-stack"
+    )
+    assert [p["id"] for p in phantoms] == [_ID_A]
+
+
+def test_find_phantom_containers_no_project_scans_all_as_before():
+    # project=None (e.g. --skip-pg-check, no target stack known) preserves
+    # the original, unscoped, global behaviour.
+    rec = _rec(_ID_A, True, 12345, labels={"com.docker.compose.project": "unrelated"})
+    phantoms = preflight.find_phantom_containers([rec], live_pids=set(), cgroup_pids={})
+    assert [p["id"] for p in phantoms] == [_ID_A]
+
+
+def test_find_phantom_containers_project_scope_excludes_record_missing_config():
+    # A record with no Config/Labels at all (should not happen for a real
+    # `docker inspect`, but the pure function must not crash on it) is
+    # treated as unattributable, not as belonging to the scope.
+    rec = {"Id": _ID_A, "Name": "/foo", "State": {"Running": True, "Pid": 12345}}
+    phantoms = preflight.find_phantom_containers(
+        [rec], live_pids=set(), cgroup_pids={}, project="sable-dev-stack"
+    )
+    assert phantoms == []
 
 
 # --- find_ghost_tasks (check b) ---------------------------------------------

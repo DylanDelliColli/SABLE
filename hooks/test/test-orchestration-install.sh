@@ -84,10 +84,19 @@ if printf '%s' "$out1" | grep -qi "NOT activated"; then
 else
   fail "project: install output says the timer is staged, not activated"
 fi
-if printf '%s' "$out1" | grep -q "systemctl --user enable"; then
-  pass "project: install output prints the systemd activation command (for the operator, not run here)"
+# SABLE-5xz68 DEFECT ONE: the old output printed a multi-command recipe that
+# nobody ever ran, so the units sat staged and NOTHING was scheduled. The
+# activation instruction must now be ONE copy-pasteable command that verifies
+# itself, plus a standalone check the operator can re-run any time.
+if printf '%s' "$out1" | grep -q -- "sable-reconcile-timer --install-schedule"; then
+  pass "project: install output prints the ONE self-verifying activation command"
 else
-  fail "project: install output prints the systemd activation command"
+  fail "project: install output prints the ONE self-verifying activation command" "out=$out1"
+fi
+if printf '%s' "$out1" | grep -q -- "--check-schedule"; then
+  pass "project: install output points at the post-install schedule verification"
+else
+  fail "project: install output points at the post-install schedule verification"
 fi
 # the install itself must never actually touch a live systemd/cron surface.
 # SABLE-i8kv: run this against a SANDBOXED HOME, not the developer's real one —
@@ -173,6 +182,52 @@ if grep -q '^Environment=PATH=' "$SVC_NOBD"; then
 else
   fail "project: .service carries a fallback Environment=PATH= line even when bd is absent"
 fi
+
+# ---------- SABLE-5xz68 DEFECT TWO: the swept repo is a PARAMETER ----------
+# The shipped units used to hardcode the SABLE tooling repo, so an operator who
+# followed the printed recipe exactly got a timer that swept the WRONG repo and
+# never looked at the fleet it was meant to protect. These assert the generated
+# unit and cron lines carry the repo actually PASSED IN — and that a host
+# running several fleets gets every one of them swept, since a unit covering
+# one repo looks protected while leaving the others stranded.
+P_REPO="$(mktemp -d)"
+SABLE_PROJECT_DIR="$P_REPO" SABLE_RECONCILE_TARGET_REPO=/srv/fleet-alpha \
+  bash "$INSTALLER" --project >/dev/null 2>&1
+SVC_REPO="$P_REPO/.claude/sable/reconcile-timer/sable-reconcile-timer.service"
+CRON_REPO="$P_REPO/.claude/sable/reconcile-timer/sable-reconcile-timer.cron"
+if grep -q -- "--repo /srv/fleet-alpha" "$SVC_REPO"; then
+  pass "project: .service ExecStart carries the repo PASSED IN, not a hardcoded path"
+else
+  fail "project: .service ExecStart carries the repo PASSED IN, not a hardcoded path" "$(grep ExecStart "$SVC_REPO")"
+fi
+if grep -q -- "--repo /srv/fleet-alpha" "$CRON_REPO"; then
+  pass "project: .cron line carries the repo PASSED IN, not a hardcoded path"
+else
+  fail "project: .cron line carries the repo PASSED IN, not a hardcoded path" "$(cat "$CRON_REPO")"
+fi
+if grep -q -- "--repo $REPO" "$SVC_REPO"; then
+  fail "project: the passed-in repo REPLACES the default, it does not sweep both" "$(grep ExecStart "$SVC_REPO")"
+else
+  pass "project: the passed-in repo REPLACES the default, it does not sweep both"
+fi
+rm -rf "$P_REPO"
+
+P_MULTI="$(mktemp -d)"
+SABLE_PROJECT_DIR="$P_MULTI" SABLE_RECONCILE_TARGET_REPO=/srv/fleet-alpha:/srv/fleet-beta \
+  bash "$INSTALLER" --project >/dev/null 2>&1
+SVC_MULTI="$P_MULTI/.claude/sable/reconcile-timer/sable-reconcile-timer.service"
+CRON_MULTI="$P_MULTI/.claude/sable/reconcile-timer/sable-reconcile-timer.cron"
+if grep -q -- "--repo /srv/fleet-alpha --repo /srv/fleet-beta" "$SVC_MULTI"; then
+  pass "project: .service sweeps EVERY repo on a multi-fleet host"
+else
+  fail "project: .service sweeps EVERY repo on a multi-fleet host" "$(grep ExecStart "$SVC_MULTI")"
+fi
+if grep -q -- "--repo /srv/fleet-alpha --repo /srv/fleet-beta" "$CRON_MULTI"; then
+  pass "project: .cron line sweeps EVERY repo on a multi-fleet host"
+else
+  fail "project: .cron line sweeps EVERY repo on a multi-fleet host" "$(cat "$CRON_MULTI")"
+fi
+rm -rf "$P_MULTI"
 
 # env override of the cadence
 P_CADENCE="$(mktemp -d)"

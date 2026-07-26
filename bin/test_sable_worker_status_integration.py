@@ -5,6 +5,7 @@ Isolated socket (-L). Proves: worker panes are discovered by their @sable_role/
 @sable_bead/@sable_status user-options, a done worker is reported done, and
 --reap kills ONLY the done worker pane (the running one survives).
 """
+import json
 import os
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ from pathlib import Path
 import pytest
 
 BIN = Path(__file__).resolve().parent / "sable-worker-status"
+VIEW_BIN = Path(__file__).resolve().parent / "sable-view"
 HAVE_TMUX = shutil.which("tmux") is not None
 pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="tmux not installed")
 
@@ -573,6 +575,86 @@ def test_dialog_probe_json_carries_stalls_and_workers(sock):
     assert payload["dialog_stalls"][0]["class"] == "manager"
 
 
+# --- SABLE-n87ov: reporting a stall reproduces the symptom on the reporter's
+# own audience. The probe used to grep the WHOLE visible pane for a dialog
+# affordance substring, so a sable-msg relay QUOTING that substring (to help
+# the recipient recognise the earlier true positive) rendered the same text
+# into the recipient's healthy pane and re-triggered the detector on it. Fixed
+# by anchoring the match to the pane's CURRENT CURSOR REGION -- content after
+# the last bare composer prompt line -- since a live overlay owns the bottom
+# of the pane (nothing, least of all a composer, follows it) while a mention
+# is followed, on an otherwise-idle pane, by the reappeared empty composer. ---
+
+def _echo_dialog_text_as_mention(s, target):
+    """Print the SAME dialog-affordance text a real overlay would show, but as
+    ordinary scrollback output -- a stand-in for a sable-msg relay quoting a
+    stall report -- followed by a bare composer prompt glyph proving the pane
+    is otherwise idle, not actually parked on a dialog."""
+    _tmux(s, "send-keys", "-t", target,
+          "printf '\\342\\237\\246SABLE-MSG\\342\\237\\247 pane w0 stalled -- "
+          "matched (Use arrow keys, Enter to select)\\n\\342\\235\\257\\n'", "Enter")
+    time.sleep(0.4)
+
+
+def test_dialog_probe_ignores_mention_but_still_flags_real_overlay(sock):
+    """The bead's core two-pane repro: pane 0 genuinely shows the select-overlay
+    text (no composer follows it); pane 1 shows the IDENTICAL affordance text
+    as an ordinary echoed mention, followed by an idle composer glyph. Exactly
+    ONE pane -- the real overlay -- is reported DIALOG-STALLED."""
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_role", "tarzan")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_lane", "tarzan")
+    _prime_dialog(sock, "w.0")
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_role", "lincoln")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_lane", "lincoln")
+    _echo_dialog_text_as_mention(sock, "w.1")
+    time.sleep(0.3)
+
+    p0 = _tmux(sock, "display-message", "-p", "-t", "w.0", "#{pane_id}").stdout.strip()
+    p1 = _tmux(sock, "display-message", "-p", "-t", "w.1", "#{pane_id}").stdout.strip()
+
+    r = _run(sock, "--all")
+    assert r.returncode == 0, r.stderr
+    combined = r.stdout + r.stderr
+    assert r.stdout.count("DIALOG-STALLED") == 1, r.stdout
+    assert p0 in combined, combined                 # the real overlay IS flagged
+    assert p1 not in r.stderr, r.stderr              # the mention is NOT flagged
+    assert "STALLED on a dialog/overlay" in r.stderr, r.stderr
+
+
+def test_dialog_probe_positive_control_neither_flagged_once_dismissed(sock):
+    """Positive control for the case above: once the genuinely-stalled pane's
+    overlay is dismissed (back to a plain idle composer) and the mention pane
+    is likewise idle, NEITHER pane is flagged -- the fix isn't 'detect
+    nothing', it correctly clears once the real condition is gone."""
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_role", "tarzan")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_lane", "tarzan")
+    _tmux(sock, "send-keys", "-t", "w.0", "printf 'back to normal\\n\\342\\235\\257\\n'", "Enter")
+    time.sleep(0.4)
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_role", "lincoln")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_lane", "lincoln")
+    _echo_dialog_text_as_mention(sock, "w.1")
+    time.sleep(0.3)
+
+    r = _run(sock, "--all")
+    assert r.returncode == 0, r.stderr
+    assert "DIALOG-STALLED" not in r.stdout, r.stdout
+    assert "STALLED on a dialog/overlay" not in r.stderr, r.stderr
+
+
 # --- reaper liveness guard: a live agent we didn't spawn as a worker survives
 # --reap (SABLE-to8m, generalized by SABLE-k8o5) ------------------------------
 # Resuming an interactive claude inside a finished worker window left it carrying
@@ -734,6 +816,130 @@ def test_reap_spares_lone_done_unconfirmed_pane(sock, tmp_path):
     assert r.returncode == 0, r.stderr
     time.sleep(0.4)
     assert _pane_count(sock) == 1  # lone done-unconfirmed pane survives
+
+
+# --- SABLE-1tzv: sable-view listed a done-tagged worker pane correctly while
+# sable-worker-status --reap, run moments later, printed 'no worker panes' and
+# reaped nothing -- read live as "reap vs view detection disagree". The
+# REVISED hypothesis (confirmed here): sable-view (parse_panes/_FORMAT above)
+# has NO lane concept at all -- it always lists the whole fleet -- while
+# sable-worker-status's DEFAULT view is scoped to the caller's own lane
+# (SABLE-dcw2, landed after this incident). The two tools were being compared
+# under DIFFERENT scopes, not disagreeing about the SAME scope. The honest
+# fleet-wide equivalent is `sable-worker-status --all` (also already
+# implicit in --reap: main() reaps exactly the `workers` list it prints, so
+# view and reap can never diverge for a given scope by construction). This
+# locks that parity in: under the SAME (fleet-wide) scope, sable-view and
+# `sable-worker-status --all` agree on a done worker pane, and --reap --all
+# actually collects what both list. ---
+
+def _run_view(s, *args):
+    return subprocess.run(["python3", str(VIEW_BIN), *args], capture_output=True,
+                          text=True, env={**_scrubbed_env(), "SABLE_TMUX_SOCKET": s,
+                                          "SABLE_TMUX_SESSION": "w"})
+
+
+def test_view_and_reap_all_scope_agree_on_done_worker_pane(sock):
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    pane = _tmux(sock, "display-message", "-p", "-t", "w.0", "#{pane_id}").stdout.strip()
+    _tag(sock, pane, "worker", "SABLE-1tzv-x", "done")
+
+    view = _run_view(sock, "--json")
+    assert view.returncode == 0, view.stderr
+    view_hit = [p for p in json.loads(view.stdout) if p["pane"] == pane]
+    assert view_hit and view_hit[0]["status"] == "done", view.stdout
+
+    status = _run_as(sock, "", "--all", "--json")
+    assert status.returncode == 0, status.stderr
+    status_hit = [w for w in json.loads(status.stdout)["workers"] if w["pane"] == pane]
+    assert status_hit and status_hit[0]["status"] == "done", status.stdout
+
+    reap = _run_as(sock, "", "--all", "--reap")
+    assert reap.returncode == 0, reap.stderr
+    time.sleep(0.3)
+    # the lone pane was killed -- the server itself may have exited with it
+    # (no clients attached, no panes left), so tolerate a failed list-panes
+    # exactly like that: zero panes.
+    remaining = _tmux(sock, "list-panes", "-a", "-F", "#{pane_id}", check=False)
+    assert remaining.returncode != 0 or not remaining.stdout.strip()
+
+
+# --- SABLE-h1fa7: sable-worker-status answered a LANE question when asked a
+# FLEET one -- it filtered panes to the caller's own lane with NO indication
+# it had done so. Byte-indistinguishable from a genuine fleet-wide "nothing
+# else is running", so a stranded-claim sweep reading tarzan's own-lane table
+# nearly released four OTHER lanes' live workers' claims. Real tmux panes
+# across two lanes here (not mocked -- this tool reads live pane state), to
+# prove the fix against the actual failure, not a stand-in for it. ---
+
+def _three_lane_session(sock):
+    """Session 'w': pane0 = tarzan's ONE live worker (bead-t, running); panes
+    1-2 = optimus's TWO MORE live workers (bead-o1/bead-o2, running) --
+    reconstructs the incident shape: the caller's own lane has a single live
+    pane, while another lane has MULTIPLE live (not done) panes a silently
+    lane-scoped listing would make invisible."""
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.0", "worker", "bead-t", "running")
+    _tag_lane(sock, "w.0", "tarzan")
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.1", "worker", "bead-o1", "running")
+    _tag_lane(sock, "w.1", "optimus")
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    time.sleep(0.4)
+    _tag(sock, "w.2", "worker", "bead-o2", "running")
+    _tag_lane(sock, "w.2", "optimus")
+
+
+def test_default_scope_named_and_hidden_count_for_real_panes(sock):
+    """THE REGRESSION THAT MATTERS: a lane-scoped default listing must never
+    read as a fleet-wide "nothing else is running". tarzan's default view
+    must name its own scope, show only its own pane (bead-t), and STATE that
+    two panes are hidden -- proof a reader cannot conclude bead-o1/bead-o2
+    aren't running, the exact conclusion that would have released four real
+    workers' claims in the recorded incident. --all then shows all three,
+    labelled all-lanes."""
+    _three_lane_session(sock)
+
+    mine = _run_as(sock, "tarzan")
+    assert mine.returncode == 0, mine.stderr
+    assert "bead-t" in mine.stdout, mine.stdout
+    assert "bead-o1" not in mine.stdout and "bead-o2" not in mine.stdout, mine.stdout
+    assert "lane=tarzan" in mine.stdout, mine.stdout
+    assert "2 hidden" in mine.stdout, mine.stdout
+
+    everything = _run_as(sock, "tarzan", "--all")
+    assert everything.returncode == 0, everything.stderr
+    assert "bead-t" in everything.stdout, everything.stdout
+    assert "bead-o1" in everything.stdout, everything.stdout
+    assert "bead-o2" in everything.stdout, everything.stdout
+    assert "all-lanes" in everything.stdout, everything.stdout
+
+
+def test_json_output_carries_scope_metadata(sock):
+    """--json exposes the same scope facts machine-readably (lane/shown/
+    hidden) so a scripted caller -- e.g. the stranded-claim sweep that
+    motivated this bead -- can check for hidden panes programmatically
+    instead of grepping table text."""
+    _three_lane_session(sock)
+
+    mine = _run_as(sock, "tarzan", "--json")
+    assert mine.returncode == 0, mine.stderr
+    payload = json.loads(mine.stdout)
+    assert payload["scope"]["lane"] == "tarzan"
+    assert payload["scope"]["shown"] == 1
+    assert payload["scope"]["hidden"] == 2
+
+    everything = _run_as(sock, "tarzan", "--all", "--json")
+    assert everything.returncode == 0, everything.stderr
+    payload_all = json.loads(everything.stdout)
+    assert payload_all["scope"]["lane"] is None
+    assert payload_all["scope"]["shown"] == 3
+    assert payload_all["scope"]["hidden"] == 0
 
 
 if __name__ == "__main__":
