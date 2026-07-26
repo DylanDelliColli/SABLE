@@ -435,16 +435,63 @@ def run_suite(repo: str | os.PathLike, suite: str) -> tuple[bool, str]:
     return cp.returncode == 0, out[-2000:]
 
 
+def _runlock():
+    """The suite-run registry module, loaded by path (this file imports no
+    siblings otherwise). None when it is unavailable — see _hold_runlock."""
+    import importlib.util
+    lib = Path(__file__).resolve().parent / "sable_runlock_lib.py"
+    if not lib.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("sable_runlock_lib", lib)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("sable_runlock_lib", mod)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:  # noqa: BLE001
+        return None
+    return mod
+
+
 def run_suites(repo: str | os.PathLike, suites, *, banner: str = "") -> tuple[dict[str, bool], dict[str, str]]:
+    """Run each suite in turn, holding ONE suite-run registration across the
+    whole loop (SABLE-pk15w / SABLE-4qlcf).
+
+    This is the snapshot runner class — a THIRD runner beyond the two the
+    2026-07-22 clearance question enumerated, and the reason that question could
+    never have been made complete by extending its list. It execs each suite as
+    a separate subprocess, so a point-in-time ps sees it only DURING an
+    invocation and reads CLEAR in the gaps between them; the registration is
+    held continuously across those gaps, which is what makes clearance
+    answerable at all. Registering per-suite instead would reproduce the gap.
+
+    Registration failure is loud-but-non-fatal for the same reason as everywhere
+    else: clearance fails closed on the identical condition, so the run cannot
+    go unrecorded while the seat reads CLEAR."""
     results: dict[str, bool] = {}
     logs: dict[str, str] = {}
-    for suite in suites:
-        if banner:
-            print(f"sable-snapshot: [{banner}] {suite}")
-        ok, out = run_suite(repo, suite)
-        results[suite] = ok
-        if not ok:
-            logs[suite] = out
+    runlock, token = _runlock(), None
+    if runlock is not None:
+        try:
+            token = runlock.register(f"sable-snapshot run_suites ({banner or 'snapshot'})",
+                                     base=str(repo))
+        except Exception as exc:  # noqa: BLE001
+            print(f"::warning::sable-snapshot: suite run NOT registered ({exc}); "
+                  f"hot-swap clearance will read could-not-assess (SABLE-pk15w)",
+                  file=sys.stderr)
+    try:
+        for suite in suites:
+            if banner:
+                print(f"sable-snapshot: [{banner}] {suite}")
+            ok, out = run_suite(repo, suite)
+            results[suite] = ok
+            if not ok:
+                logs[suite] = out
+    finally:
+        if runlock is not None and token:
+            try:
+                runlock.release(token, base=str(repo))
+            except Exception:  # noqa: BLE001
+                pass
     return results, logs
 
 
