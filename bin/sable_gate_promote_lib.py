@@ -1203,7 +1203,17 @@ def _is_suite_infra_abort(returncode: int, output: str) -> bool:
     a FATAL line (a future suite reusing the code for something else) reads
     as content-attributable rather than silently swallowed as
     infrastructure — fails toward blaming the branch, never toward
-    excusing it."""
+    excusing it.
+
+    THE ASSUMPTION THIS RESTS ON, NAMED SO IT CANNOT DECAY UNEXAMINED: the
+    convention above must keep HOLDING GOING FORWARD. This function has no
+    way to distinguish "genuinely could not build its fixture" from "chose
+    to print FATAL: and exit 2 for a content reason" — it trusts the
+    convention, not the suite's intent. A future suite that prints FATAL:
+    and exits 2 for what is actually a content defect would be silently
+    excused as infrastructure, which is the ONE way this fix fails
+    permissive. Nothing enforces the convention mechanically; it holds only
+    because every site observed at fix time (2026-07-27) honors it."""
     return returncode == 2 and bool(_SUITE_FATAL_ABORT_RE.search(output or ""))
 
 
