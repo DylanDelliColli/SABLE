@@ -468,7 +468,8 @@ def test_batch_record_names_every_member_branch_bead_and_disjointness_evidence()
     ]
     record = promote_lib.BatchRecord.from_members(
         "base" + "0" * 36, members, combined_ref="ci-verify/batch-abc1234",
-        outcome=promote_lib.BATCH_OUTCOME_LANDED, fold_disjoint=True)
+        outcome=promote_lib.BATCH_OUTCOME_LANDED, fold_disjoint=True,
+        fold_tip="f" * 40, recorded_at=1234.5)
 
     assert set(record.member_branches()) == {"wk-a", "wk-b", "wk-c"}
     assert set(record.member_bead_ids()) == {
@@ -477,6 +478,8 @@ def test_batch_record_names_every_member_branch_bead_and_disjointness_evidence()
         "bin/a.py", "bin/b.py", "bin/c.py", "hooks/test/x.sh"}
     assert record.fold_disjoint is True
     assert record.combined_ref == "ci-verify/batch-abc1234"
+    assert record.fold_tip == "f" * 40
+    assert record.recorded_at == 1234.5
 
     data = record.to_dict()
     assert {m["branch"] for m in data["members"]} == {"wk-a", "wk-b", "wk-c"}
@@ -484,6 +487,8 @@ def test_batch_record_names_every_member_branch_bead_and_disjointness_evidence()
         ("SABLE-a",), ("SABLE-b1", "SABLE-b2"), ("SABLE-c",)}
     assert data["combined_ref"] == "ci-verify/batch-abc1234"
     assert data["fold_disjoint"] is True
+    assert data["fold_tip"] == "f" * 40
+    assert data["recorded_at"] == 1234.5
 
 
 def test_batch_record_ordering_safety_across_a_permutation_set():
@@ -552,6 +557,11 @@ def test_batch_record_from_dict_tolerates_a_bare_minimum_dict():
     assert restored.fold_disjoint is False
     assert restored.outcome == ""
     assert restored.combined_ref == "ci-verify/batch-min"
+    corrupt_time = promote_lib.BatchRecord.from_dict({
+        "combined_ref": "ci-verify/batch-old",
+        "recorded_at": "not-a-timestamp",
+    })
+    assert corrupt_time.recorded_at == 0.0
 
 
 def test_fold_commit_message_round_trips_through_its_own_parser():

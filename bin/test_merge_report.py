@@ -309,6 +309,55 @@ def test_promotion_landed_epochs_omits_promotions_with_no_observed_run():
     assert epochs == {}
 
 
+def test_exact_batch_landing_hint_is_not_replaced_by_base_run_time():
+    promo = rl.PromotionCommit(
+        "aaa111", "2026-07-21T00:00:00+00:00", "batch", "wk-a",
+        "SABLE-a", False, landing_mode="batch", landed_at_hint=2000.0)
+    runs = [rl.BaseRun("aaa111", 1900.0, "success")]
+
+    epochs = rl.promotion_landed_epochs([promo], runs)
+
+    assert epochs == {"aaa111": 2000.0}
+
+
+def test_batch_manifest_expands_to_member_promotions_with_exact_landing_time(
+        monkeypatch):
+    members = [
+        rl.promote_lib.BatchMember(
+            "wk-a", "a" * 40, ("SABLE-a",), ("a.py",)),
+        rl.promote_lib.BatchMember(
+            "wk-b", "b" * 40, ("SABLE-b",), ("b.py",)),
+    ]
+    record = rl.promote_lib.BatchRecord.from_members(
+        "0" * 40, members, combined_ref="ci-verify/batch-x",
+        outcome=rl.promote_lib.BATCH_OUTCOME_LANDED,
+        fold_disjoint=True, fold_tip="f" * 40, recorded_at=2000.0)
+    monkeypatch.setattr(
+        rl.promote_lib, "read_batch_records", lambda repo: [record])
+
+    promotions = rl.collect_batch_promotions("/repo")
+
+    assert [promotion.branch for promotion in promotions] == ["wk-a", "wk-b"]
+    assert {promotion.landing_mode for promotion in promotions} == {"batch"}
+    assert {promotion.batch_size for promotion in promotions} == {2}
+    assert {promotion.landed_at_hint for promotion in promotions} == {2000.0}
+
+    pushes = [
+        rl.PushEvent("wk-a", 1000.0),
+        rl.PushEvent("wk-b", 1100.0),
+    ]
+    previews = [
+        rl.PreviewRun(
+            "ci-verify/wk-a", 1001.0, 1200.0, "success", "a" * 40),
+        rl.PreviewRun(
+            "ci-verify/wk-b", 1101.0, 1300.0, "success", "b" * 40),
+    ]
+    landed = rl.compute_landed_metrics(pushes, promotions, previews, [])
+    assert {item.push_to_landed_seconds for item in landed} == {1000.0, 900.0}
+    assert {item.queue_depth_at_promote for item in landed} == {0}
+    assert {item.discarded_preview for item in landed} == {False}
+
+
 # --- compute_landed_metrics (THE primary-bar computation, SABLE-jd5fj.11) -----
 
 def test_push_to_landed_is_the_primary_bar():

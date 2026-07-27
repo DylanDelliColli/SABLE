@@ -56,34 +56,45 @@ Each merge request — message OR bead:
    You are reading a PRECOMPUTED result, not starting one. Do not `gh pr view` /
    `gh pr checks` for the merge decision — the ci-verify gate, not the PR page,
    is the authority on whether a branch may land.
-3. **Seal the next micro-batch** — verdicts are parallel and landing is one
-   atomic integration-ref write. Collect the oldest ready `BRANCH:BEAD` specs
-   and run up to eight together:
+3. **Drain bounded micro-batches** — verdicts are parallel and landing is one
+   atomic integration-ref write. Let the queue adapter join unlanded
+   `origin/wk-*` refs to their exact Beads branch metadata and run up to four
+   sealed cycles of eight:
 
    ```bash
-   sable-merge-gate batch-cycle \
-     --member wk-a:SABLE-a \
-     --member wk-b:SABLE-b \
-     --member wk-c:SABLE-c
+   sable-merge-gate batch-drain --max-members 8 --max-cycles 4
    ```
 
-   `batch-cycle` owns the overlap/read-write admission check, canonical fold,
-   exact combined CI verdict, atomic landing, and red-batch diagnosis. It
-   prints every excluded member; do not silently drop one. A `none` verdict
-   from step 2 does not by itself exclude a queued branch: after an earlier
-   batch moves the base, the branch's completed GREEN preview on the ancestor
-   base remains branch-tip qualification, while this cycle's combined run is
-   the landing authority.
+   `batch-drain` chooses oldest-closed work deterministically, reports every
+   unreadable/held/ambiguous exclusion, and feeds the existing `batch-cycle`
+   authority. That authority still owns overlap/read-write admission,
+   canonical fold, exact combined CI verdict, atomic landing, and red-batch
+   diagnosis; discovery is not another writer. Use `batch-drain --dry-run`
+   to inspect the queue without CI or a landing.
 
-   The batch is sealed when the command starts. Messages that arrive while CI
-   runs remain queued for the next invocation—there is no swarm-wide batch
-   boundary and no reason to wait for the queue to become quiet. If fewer than
-   two candidates survive admission, use the serial fallback in step 5.
+   Each cycle is sealed before its CI run. Messages that arrive while CI runs
+   are discovered only after that cycle finishes and therefore enter the next
+   cycle—there is no swarm-wide boundary and no reason to wait for quiet. The
+   drain stops on red/retry, a queue smaller than two, or its cycle bound. For
+   a forensic/manual retry, `batch-cycle --member BRANCH:BEAD ...` remains the
+   explicit single-cycle interface. If fewer than two candidates survive,
+   use the serial fallback in step 5.
+
+   Throughput observations are durable:
+
+   ```bash
+   sable-merge-gate batch-metrics
+   sable-merge-report --since <shift-start-ISO8601>
+   ```
+
+   The first reports arrival/drain rates, fill, outcomes, and actual CI rounds.
+   The second compares push-to-landed latency for serial versus batched member
+   promotions and excludes same-batch siblings from queue-depth inflation.
 4. **Conflict classification** (use the registry's `fix_directly` and `delegate_to_author` lists):
    - Mechanical conflicts (imports, lockfiles, whitespace, non-overlapping diffs, docs) → fix in place: rebase, resolve, push
    - Semantic conflicts (overlapping logic, competing implementations, test divergence, config changes) → file `for-<author>` bead with conflict context and suggested resolution; close the for-chuck bead with reason "delegated to author"
 5. **SERIAL FALLBACK** — use `sable-merge-gate promote --bead <id> --branch
-   <branch>` only for a lone survivor or a member that `batch-cycle` explicitly
+   <branch>` only for a lone survivor or a member that `batch-drain` explicitly
    excluded. On a green verdict this consumes the stored result and
    fast-forwards in seconds; it never re-merges, so what lands is
    byte-identical to what CI verified. Read its exit code:

@@ -1749,6 +1749,11 @@ def _bead_landed(repo: str, bead_id: str) -> bool:
     return _LANDED_MARKER in notes
 
 
+def bead_landed(repo: str, bead_id: str) -> bool:
+    """Public read Interface for the landing marker this authority writes."""
+    return _bead_landed(repo, bead_id)
+
+
 def assert_landing_pair_satisfied(repo: str, bead: str,
                                   with_pair: frozenset[str] = frozenset()) -> None:
     """Refuse a solo promote of <bead> when it declares a `landing_pair`
@@ -2879,7 +2884,7 @@ class BatchMember:
 
 
 BATCH_RECORD_FILE = "batch-records.jsonl"
-BATCH_RECORD_SCHEMA_VERSION = 1
+BATCH_RECORD_SCHEMA_VERSION = 2
 
 # Outcome constants, mirroring the ACTION_* / IMPACT_* module-level-constant
 # style above rather than inventing an enum this bead's siblings (the
@@ -2915,8 +2920,10 @@ class BatchRecord:
     child (SABLE-be4lo.8): a batch that went red and was bisected still
     produces a promote record — it just records WHO was named (culprit) and
     the verbatim report the seat and the fleet saw (report_lines), rather than
-    a landing. They default to absent so every pre-bisection caller, and every
-    record already persisted, reconstructs unchanged."""
+    a landing. ``fold_tip`` and ``recorded_at`` bind a successful manifest to
+    the exact landed object and its post-fast-forward observation time, which
+    lets derive-at-read telemetry measure members without a parallel writer.
+    They default to absent so every older record reconstructs unchanged."""
     base_sha: str
     setkey: str
     combined_ref: str
@@ -2925,11 +2932,14 @@ class BatchRecord:
     members: tuple[BatchMember, ...]
     culprit: str = ""
     report_lines: tuple[str, ...] = ()
+    fold_tip: str = ""
+    recorded_at: float = 0.0
 
     @classmethod
     def from_members(cls, base_sha: str, members: list[BatchMember], *,
                      combined_ref: str, outcome: str, fold_disjoint: bool,
-                     culprit: str = "", report_lines: tuple[str, ...] = ()) -> "BatchRecord":
+                     culprit: str = "", report_lines: tuple[str, ...] = (),
+                     fold_tip: str = "", recorded_at: float = 0.0) -> "BatchRecord":
         """The only constructor that canonicalizes: members is re-sorted by
         tip_sha (the same key setkey() sorts on) before anything is stored or
         hashed, so a caller's admission order can never leak into the
@@ -2943,7 +2953,8 @@ class BatchRecord:
         key = batch_key.setkey(base_sha, [m.tip_sha for m in canonical])
         return cls(base_sha=base_sha, setkey=key, combined_ref=combined_ref,
                    outcome=outcome, fold_disjoint=fold_disjoint, members=canonical,
-                   culprit=culprit, report_lines=tuple(report_lines))
+                   culprit=culprit, report_lines=tuple(report_lines),
+                   fold_tip=fold_tip, recorded_at=recorded_at)
 
     def member_branches(self) -> tuple[str, ...]:
         return tuple(m.branch for m in self.members)
@@ -2968,6 +2979,8 @@ class BatchRecord:
             "members": [m.to_dict() for m in self.members],
             "culprit": self.culprit,
             "report_lines": list(self.report_lines),
+            "fold_tip": self.fold_tip,
+            "recorded_at": self.recorded_at,
         }
 
     @classmethod
@@ -2978,6 +2991,10 @@ class BatchRecord:
         by from_members at write time, and from_dict's job is to reproduce
         exactly what was written, not to re-derive it."""
         members = tuple(BatchMember.from_dict(m) for m in (data.get("members") or ()))
+        try:
+            recorded_at = float(data.get("recorded_at") or 0.0)
+        except (TypeError, ValueError):
+            recorded_at = 0.0
         return cls(
             base_sha=str(data.get("base_sha", "")),
             setkey=str(data.get("setkey", "")),
@@ -2987,6 +3004,8 @@ class BatchRecord:
             members=members,
             culprit=str(data.get("culprit", "")),
             report_lines=tuple(data.get("report_lines") or ()),
+            fold_tip=str(data.get("fold_tip", "")),
+            recorded_at=recorded_at,
         )
 
 
@@ -3004,10 +3023,18 @@ def _stamp_batch_record(repo: str | os.PathLike, record: BatchRecord) -> None:
         path = Path(override) if override else (
             snapshot_lib.ensure_state_dir(repo) / BATCH_RECORD_FILE)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as fh:
-            fh.write(json.dumps(record.to_dict()) + "\n")
-    except OSError:
-        pass
+        payload = (json.dumps(record.to_dict()) + "\n").encode()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        print(
+            f"sable-merge-gate: WARNING could not persist batch manifest: {exc}",
+            file=sys.stderr)
 
 
 def read_batch_records(repo: str | os.PathLike = ".") -> list[BatchRecord]:
@@ -3777,7 +3804,8 @@ def land_batch(repo: str, remote: str, base: str, base_sha: str, fold_tip: str,
     try:
         record = BatchRecord.from_members(
             base_sha, list(members), combined_ref=combined_ref,
-            outcome=BATCH_OUTCOME_LANDED, fold_disjoint=True)
+            outcome=BATCH_OUTCOME_LANDED, fold_disjoint=True,
+            fold_tip=resolved_tip, recorded_at=time.time())
         _stamp_batch_record(repo, record)
     except Exception as exc:  # noqa: BLE001 — a landed batch must stay landed
         print(f"sable-merge-gate: batch record skipped after unexpected error: {exc}",
@@ -3793,7 +3821,9 @@ def land_batch(repo: str, remote: str, base: str, base_sha: str, fold_tip: str,
 
 
 def resolve_batch_members(repo: str, remote: str, base_sha: str, member_specs: list,
-                          command: str) -> list[BatchMember]:
+                          command: str, *, refresh_refs: bool = True,
+                          expected_tips: dict[str, str] | None = None
+                          ) -> list[BatchMember]:
     """Turn raw `branch` / `branch:BEAD[,BEAD...]` CLI specs into the typed
     BatchMember set both batch entrypoints (land-batch, bisect-batch) need.
 
@@ -3803,13 +3833,20 @@ def resolve_batch_members(repo: str, remote: str, base_sha: str, member_specs: l
     Shotgun Surgery risk the epic's architecture review flagged on the
     (base, branch)-pair sites, in its member-set form. Raises EXIT_USAGE on an
     empty spec list: a batch command with no members is a usage error, never a
-    vacuous no-op (SABLE-p9n7k)."""
+    vacuous no-op (SABLE-p9n7k). ``refresh_refs=False`` is only for a caller
+    that already fetched and sealed a remote-tracking snapshot (batch-drain);
+    that caller also supplies ``expected_tips`` so another process refreshing
+    a remote-tracking ref cannot mutate the sealed object. Explicit commands
+    retain the refresh default."""
     members: list[BatchMember] = []
     for spec in member_specs:
         branch, _, bead_part = spec.partition(":")
         bead_ids = tuple(b for b in bead_part.split(",") if b)
-        git_lib._git(repo, "fetch", remote, branch, check=False)
-        tip = git_lib.resolve_commit(repo, classify.qualify_remote_ref(remote, branch))
+        if refresh_refs:
+            git_lib._git(repo, "fetch", remote, branch, check=False)
+        tip = git_lib.resolve_commit(
+            repo, (expected_tips or {}).get(branch)
+            or classify.qualify_remote_ref(remote, branch))
         paths = tuple(sorted(footprint_lib.changed_paths(repo, base_sha, tip)))
         members.append(BatchMember(branch, tip, bead_ids, paths))
     if not members:

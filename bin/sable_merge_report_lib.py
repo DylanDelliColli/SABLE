@@ -13,8 +13,8 @@ class SABLE-nueh3's baseline could only bound at 0/126, rule-of-three
 at all).
 
 Consistent with the SABLE-8b41 telemetry direction: this is a derive-at-read
-reporting tool, not a new capture mechanism (relate, do not block). Three
-adapters, same split as sable-merge-gate's own git/gh/bd seams:
+reporting tool, not a second merge-event capture mechanism (relate, do not
+block). Four adapters:
 
   git   -- `git log <base>` on THIS repo. Promotion count and, critically,
             which promotions landed via OPTIMISTIC DISJOINT PROMOTION
@@ -45,6 +45,10 @@ adapters, same split as sable-merge-gate's own git/gh/bd seams:
             both the promotion commit subject and the CONFIRMED log line
             carry the real branch name, so no proximity heuristic is needed
             there.
+  batch -- the landing authority's existing batch-records.jsonl manifest.
+            Batch folds deliberately do not impersonate serial merge-preview
+            subjects, so this supplies exact fold SHA, members, and the
+            post-fast-forward timestamp. Capture remains owned by the writer.
 
 CORRECTNESS NOTE carried forward from SABLE-jxgm4 (found reviewing nueh3),
 and the reason SABLE-jd5fj.11 exists: git commit-tree stamps a merge
@@ -56,8 +60,9 @@ builds a fresh one) even the rebuilt commit's own dates only cover the LAST
 wait, not the discarded one before it. This module therefore NEVER uses
 commit dates as a push-to-landed latency proxy for either metric; git is
 used only to detect and count promotions (including which are disjoint).
-push-to-CI-done comes from the log x gh (preview runs) join; push-to-landed
-comes from the log x git (promotions) x gh (base-branch runs) join.
+push-to-CI-done comes from the log x gh (preview runs) join; serial
+push-to-landed comes from log x git x gh, while batched push-to-landed joins
+the same push log to the landing authority's exact manifest.
 """
 from __future__ import annotations
 
@@ -67,11 +72,12 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 import sable_gate_classify_lib as classify  # noqa: E402
+import sable_gate_promote_lib as promote_lib  # noqa: E402
 
 RED = classify.RED
 GREEN = classify.GREEN
@@ -197,6 +203,10 @@ class PromotionCommit:
     branch: str | None
     bead: str | None
     disjoint: bool
+    landing_mode: str = "serial"
+    batch_size: int = 1
+    batch_setkey: str = ""
+    landed_at_hint: float | None = None
 
 
 def parse_promotion_subject(sha: str, committed_at: str, subject: str) -> PromotionCommit | None:
@@ -352,8 +362,15 @@ def promotion_landed_epochs(promotions: list[PromotionCommit], base_runs: list[B
     the fast-forward that put it there. The same join key
     count_semantic_breaks already uses for a different purpose (a LATER red
     run on a landed sha), reused here for its EARLIEST run instead."""
-    epochs: dict[str, float] = {}
+    epochs: dict[str, float] = {
+        promotion.sha: promotion.landed_at_hint
+        for promotion in promotions
+        if promotion.landed_at_hint is not None
+    }
+    hinted_shas = set(epochs)
     for run in base_runs:
+        if run.head_sha in hinted_shas:
+            continue
         current = epochs.get(run.head_sha)
         if current is None or run.created_at < current:
             epochs[run.head_sha] = run.created_at
@@ -371,6 +388,9 @@ class LandedRecord:
     push_to_ci_done_seconds: float | None
     discarded_preview: bool
     queue_depth_at_promote: int
+    landing_mode: str
+    batch_size: int
+    batch_setkey: str
 
 
 def compute_landed_metrics(pushes: list[PushEvent], promotions: list[PromotionCommit],
@@ -414,14 +434,22 @@ def compute_landed_metrics(pushes: list[PushEvent], promotions: list[PromotionCo
         ci_run = ci_done_matches.get(promo.branch)
         push_to_ci_done = (ci_run.completed_at - push.confirmed_at
                           if ci_run is not None and ci_run.completed_at is not None else None)
-        discarded = bool(ci_run is not None and ci_run.head_sha is not None and ci_run.head_sha != promo.sha)
+        discarded = bool(
+            promo.landing_mode == "serial"
+            and ci_run is not None
+            and ci_run.head_sha is not None
+            and ci_run.head_sha != promo.sha)
         staged.append((promo, push, landed_at, push_to_ci_done, discarded))
 
     records: list[LandedRecord] = []
     for idx, (promo, push, landed_at, push_to_ci_done, discarded) in enumerate(staged):
         depth = sum(
-            1 for j, (_, _, other_landed, _, _) in enumerate(staged)
-            if j != idx and push.confirmed_at < other_landed <= landed_at
+            1 for j, (other_promo, _, other_landed, _, _) in enumerate(staged)
+            if j != idx
+            and not (
+                promo.batch_setkey
+                and other_promo.batch_setkey == promo.batch_setkey)
+            and push.confirmed_at < other_landed <= landed_at
         )
         records.append(LandedRecord(
             branch=promo.branch, bead=promo.bead, sha=promo.sha,
@@ -430,6 +458,9 @@ def compute_landed_metrics(pushes: list[PushEvent], promotions: list[PromotionCo
             push_to_ci_done_seconds=push_to_ci_done,
             discarded_preview=discarded,
             queue_depth_at_promote=depth,
+            landing_mode=promo.landing_mode,
+            batch_size=promo.batch_size,
+            batch_setkey=promo.batch_setkey,
         ))
     return records
 
@@ -508,6 +539,51 @@ def collect_promotions(repo: str, base_ref: str, since: str | None = None) -> li
             out.append(parsed)
     out.reverse()  # git log is newest-first; report oldest-first
     return out
+
+
+def collect_batch_promotions(
+        repo: str, since: str | None = None) -> list[PromotionCommit]:
+    """Expand landed batch manifests into one member-level promotion each.
+
+    Fold commits deliberately do not impersonate serial ``merge-preview``
+    subjects.  The landing authority therefore stamps the exact fold tip and
+    post-fast-forward time in its durable BatchRecord; this adapter expands
+    that existing artifact instead of inferring batch membership from git
+    prose or maintaining a second capture path.
+    """
+    since_epoch = _since_epoch(since)
+    latest: dict[tuple[str, str], promote_lib.BatchRecord] = {}
+    for record in promote_lib.read_batch_records(repo):
+        if record.outcome != promote_lib.BATCH_OUTCOME_LANDED:
+            continue
+        if not record.fold_tip or record.recorded_at <= 0:
+            continue
+        if since_epoch is not None and record.recorded_at < since_epoch:
+            continue
+        for member in record.members:
+            latest[(record.setkey, member.branch)] = record
+
+    out = []
+    for (setkey, branch), record in latest.items():
+        member = next(
+            member for member in record.members if member.branch == branch)
+        bead = member.bead_ids[0] if member.bead_ids else None
+        committed_at = datetime.fromtimestamp(
+            record.recorded_at, tz=timezone.utc).isoformat()
+        out.append(PromotionCommit(
+            record.fold_tip,
+            committed_at,
+            f"batch landing {record.setkey}: {branch}",
+            branch,
+            bead,
+            False,
+            landing_mode="batch",
+            batch_size=len(record.members),
+            batch_setkey=setkey,
+            landed_at_hint=record.recorded_at,
+        ))
+    return sorted(out, key=lambda promotion: (
+        promotion.landed_at_hint or 0.0, promotion.branch or ""))
 
 
 def promotion_epochs(promotions: list[PromotionCommit]) -> dict[str, float]:
@@ -619,7 +695,15 @@ def build_report(repo: str, git_base_ref: str, bare_base_branch: str, since: str
     real bug shape here: gh silently returns zero runs for a ref-qualified
     branch name instead of erroring, which would read as "no CI activity"
     rather than "wrong argument"."""
-    promotions = collect_promotions(repo, git_base_ref, since)
+    serial_promotions = collect_promotions(repo, git_base_ref, since)
+    batch_promotions = collect_batch_promotions(repo, since)
+    promotions = sorted(
+        serial_promotions + batch_promotions,
+        key=lambda promotion: (
+            promotion.landed_at_hint
+            if promotion.landed_at_hint is not None
+            else _iso_to_epoch(promotion.committed_at),
+            promotion.branch or ""))
     epochs = promotion_epochs(promotions)
     base_runs = collect_base_runs(bare_base_branch, since)
     preview_runs = collect_preview_runs(since=since)
@@ -643,6 +727,15 @@ def build_report(repo: str, git_base_ref: str, bare_base_branch: str, since: str
     landed = latency_stats(landed_latencies)
     landed["coverage"] = f"{len(landed_records)}/{len(pushes)} pushes matched to an observed fast-forward"
     discarded_preview_count = sum(1 for r in landed_records if r.discarded_preview)
+    landed_by_mode = {}
+    for mode in ("serial", "batch"):
+        mode_records = [
+            record for record in landed_records
+            if record.landing_mode == mode]
+        stats = latency_stats(
+            [record.push_to_landed_seconds for record in mode_records])
+        stats["branches"] = len(mode_records)
+        landed_by_mode[mode] = stats
 
     reds = red_rate([r.conclusion for r in preview_runs if r.conclusion])
     semantic = count_semantic_breaks(promotions, base_runs, epochs, window_hours * 3600.0)
@@ -663,8 +756,11 @@ def build_report(repo: str, git_base_ref: str, bare_base_branch: str, since: str
         "since": since,
         "window_hours": window_hours,
         "promotions_total": len(promotions),
+        "promotions_serial": len(serial_promotions),
+        "promotions_batch_members": len(batch_promotions),
         "promotions_disjoint": disjoint_n,
         "push_to_landed": landed,
+        "push_to_landed_by_mode": landed_by_mode,
         "push_to_ci_done": latency,
         "discarded_preview_count": discarded_preview_count,
         "landed_records": [
@@ -675,6 +771,9 @@ def build_report(repo: str, git_base_ref: str, bare_base_branch: str, since: str
                 "push_to_ci_done_seconds": r.push_to_ci_done_seconds,
                 "discarded_preview": r.discarded_preview,
                 "queue_depth_at_promote": r.queue_depth_at_promote,
+                "landing_mode": r.landing_mode,
+                "batch_size": r.batch_size,
+                "batch_setkey": r.batch_setkey,
             }
             for r in landed_records
         ],
@@ -691,11 +790,19 @@ def format_report_text(report: dict) -> str:
     lines.append(f"SABLE merge-pipeline telemetry (vs SABLE-nueh3 baseline), base={report['base_branch']}")
     if report.get("since"):
         lines.append(f"  window: since {report['since']}")
-    lines.append(f"  promotions observed: {report['promotions_total']} "
-                 f"({report['promotions_disjoint']} via optimistic disjoint promotion)")
+    lines.append(
+        f"  member promotions observed: {report['promotions_total']} "
+        f"(serial={report['promotions_serial']}, "
+        f"batch={report['promotions_batch_members']}, "
+        f"{report['promotions_disjoint']} via optimistic disjoint promotion)")
     landed = report["push_to_landed"]
     lines.append(f"  push->LANDED latency [PRIMARY, SABLE-jd5fj.11]: n={landed['n']} "
                  f"median={landed['median']} p90={landed['p90']} ({landed['coverage']})")
+    for mode in ("serial", "batch"):
+        stats = report["push_to_landed_by_mode"][mode]
+        lines.append(
+            f"    {mode}: n={stats['n']} median={stats['median']} "
+            f"p90={stats['p90']}")
     lines.append(f"    discarded-preview cost: {report['discarded_preview_count']}/{landed['n']} landed "
                  f"branch(es) paid for a rebuilt preview after their push-time preview was discarded")
     lat = report["push_to_ci_done"]

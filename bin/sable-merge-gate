@@ -450,7 +450,7 @@ def main(argv: list[str] | None = None) -> int:
             print(promote_lib.render_promote_budget_report(
                 args.member_footprints, args.seconds, args.json))
             return 0
-        if args.command in ("land-batch", "bisect-batch", "batch-cycle"): return batch_coordinator.dispatch_batch_command(args)  # noqa: E501,E701 SABLE-be4lo.7/.8, SABLE-z3j28.1
+        if args.command in ("land-batch", "bisect-batch", "batch-cycle", "batch-drain", "batch-metrics"): return batch_coordinator.dispatch_batch_command(args)  # noqa: E501,E701 SABLE-be4lo.7/.8, SABLE-z3j28.1/.4
         if args.command == "warm-testmon-cache":
             return promote_lib.warm_gate_testmon_cache(args.repo)
         if args.command == "impact-tier-phases":
