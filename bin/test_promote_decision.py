@@ -29,6 +29,7 @@ including the impact tier actually running against a checked-out combined tree �
 lives in hooks/test/test-optimistic-promotion.sh.
 """
 import ast
+import collections
 import importlib.util
 import itertools
 import json
@@ -635,6 +636,392 @@ def test_a_human_override_does_not_take_the_widened_entry(queued, monkeypatch):
     assert queued["materialized"] == 1
 
 
+# --------------------------------------------------------------------------
+# THE NO-UNGUARDED-WRITER PROOF (SABLE-67qxt) — derive it, do not spell it
+# --------------------------------------------------------------------------
+#
+# THE PROPERTY THE MACHINERY BELOW STANDS IN FOR: *no path in
+# sable_gate_promote_lib writes a ref in a remote repository except the writers
+# pinned in test_the_module_has_exactly_three_writers_to_the_integration_branch.*
+# That property is the bridge between "the decision table is safe" and "no path
+# bypasses the table" — the I1 enumeration and the 240-row golden table above
+# are both CONDITIONAL on it, so its blind spots are the blind spots of the
+# whole promote-safety argument.
+#
+# It used to be checked by regexing the module source for
+# f"\{(\w+)\}:refs/heads/\{base\}". That matched ONE SPELLING OF A PUSH, not the
+# property: to be counted, a writer had to be ALL of a literal f-string, with
+# exactly one {var} before the colon, the literal text refs/heads/, and a branch
+# variable named literally `base`. A writer that was any of these instead — a
+# refspec built in a variable, a branch variable named `target`, %/format/+
+# concatenation, the bare-ref push form, a push in a helper, a push through a
+# different runner — was INVISIBLE, and invisible meant the suite went MORE
+# green, not less. (The evading form was never hypothetical: line ~126 of the
+# module under analysis already builds a ref as f"refs/heads/{branch}".)
+#
+# So this DERIVES the writers in three steps, each of which FAILS LOUD rather
+# than silently not counting something:
+#
+#   1. CALL SITES — every call in the module whose argument tokens contain a git
+#      verb that can write a remote ref, through whatever runner it goes, in
+#      every kind of scope Python has: functions, nested closures, lambdas,
+#      class bodies, decorators, default arguments and module scope.
+#   2. VERBS — every verb the module hands to git must be classified below as
+#      remote-ref-writing or not. An UNCLASSIFIED verb fails the check: a verb
+#      nobody has reasoned about may well move a ref.
+#   3. DESTINATIONS — each refspec of each such call is resolved to a SHAPE
+#      through f-strings, %, str.format, str.join, + concatenation and local
+#      single-assignment variables. A refspec, flag or argv layout the resolver
+#      cannot decide is reported UNDECIDABLE, never skipped: a writer the
+#      analysis cannot classify is exactly the case this check exists to stop.
+#
+# What it deliberately does NOT do is decide, from a name, whether a given
+# destination IS the integration branch — a refspec built from a parameter
+# called `target` writes the base exactly as much as one built from `base`, and
+# no static rule tells them apart. So it pins the whole INVENTORY of remote-ref
+# writes instead, in source order, with each destination's resolved shape. A new
+# writer in ANY spelling, aimed anywhere, changes the inventory and fails.
+# Judging a new write harmless is a human review step, recorded by editing the
+# expected list — which is fail-CLOSED, the opposite polarity to the regex it
+# replaces.
+#
+# SCOPE, stated so its edge is visible rather than assumed away: this is a
+# static analysis of THIS module's source. A push inside a helper in ANOTHER
+# module that promote() calls is beyond its reach (SABLE-taz3q).
+
+_GIT_VERBS_THAT_CAN_WRITE_A_REMOTE_REF = frozenset({"push", "send-pack"})
+"""Verbs that can move a ref in a repository other than the one they run in.
+Every call site invoking one of these is parsed for its destination refspecs
+below. A verb in NEITHER this set nor the reviewed-benign set below is
+UNCLASSIFIED and fails: `git replay`, `git subtree push`, `git svn dcommit` and
+friends are exactly the kind of arrival this check must not sleep through."""
+
+_GIT_VERBS_REVIEWED_AS_NOT_WRITING_A_REMOTE_REF = frozenset({
+    # read-only
+    "status", "show", "show-ref", "rev-parse", "rev-list", "log", "diff", "cherry",
+    "cat-file", "ls-files", "ls-tree", "ls-remote", "for-each-ref", "merge-base",
+    "name-rev", "describe", "blame", "grep", "count-objects", "fsck", "config",
+    # writes the working tree, the object store, or a LOCAL ref only — out of
+    # scope: the integration branch this gate protects is the ref on the REMOTE,
+    # which nothing here can move without a push.
+    "init", "add", "commit", "checkout", "switch", "restore", "reset", "clean",
+    "branch", "tag", "update-ref", "symbolic-ref", "notes", "stash", "worktree",
+    "fetch", "merge", "rebase", "cherry-pick", "revert", "apply", "am", "remote",
+    "gc", "prune", "hash-object", "write-tree", "commit-tree", "read-tree",
+})
+
+_PUSH_FLAGS_WITH_NO_EFFECT_ON_THE_DESTINATION = frozenset({
+    "--force", "-f", "--force-with-lease", "--quiet", "-q", "--verbose", "-v",
+    "--porcelain", "--atomic", "--no-verify", "--verify", "--set-upstream", "-u",
+    "--follow-tags", "--thin", "--no-thin", "--progress", "--no-progress",
+    "--dry-run", "-n",
+})
+"""Flags that change HOW a push happens, never WHICH refs it lands on. Anything
+else — --all, --mirror, --tags, or a flag added to git after this was written —
+makes the destination set something this parser has not reasoned about, so it is
+reported UNDECIDABLE rather than quietly ignored."""
+
+_RefWrite = collections.namedtuple("_RefWrite", "function mode src dest")
+_Undecidable = collections.namedtuple("_Undecidable", "function reason")
+_WriterReport = collections.namedtuple(
+    "_WriterReport", "writes undecidable unclassified_verbs")
+
+
+def _dotted(node):
+    """`git_lib._git` for an Attribute chain, `_git` for a Name, else a marker."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return f"{_dotted(node.value)}.{node.attr}"
+    return "expression"
+
+
+def _marker(text):
+    """An opaque `<...>` stand-in for something the resolver could not decide.
+    Colons are stripped HERE, once, rather than trusted not to occur: a marker
+    carrying one would split like a refspec and hand back a `dest` the parser
+    never resolved — an undecidable write reading as a decided one, which is
+    the exact failure direction this whole section exists to remove."""
+    return "<" + str(text).replace(":", " ") + ">"
+
+
+def _is_string_building(node):
+    """Whether a bound value is worth inlining into a shape: only expressions
+    that BUILD A STRING. A name bound to a call keeps its {name} placeholder —
+    inlining would trade a readable placeholder for an opaque marker."""
+    if isinstance(node, ast.JoinedStr):
+        return True
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return True
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+        return True
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("format", "join"))
+
+
+def _inline(name, assigns, seen):
+    """The shape of `name` when this scope binds it EXACTLY ONCE to a
+    string-building expression — i.e. the `spec = f"{sha}:refs/heads/{base}"`
+    then `_git(..., spec)` evasion, which the old regex could not see. `seen`
+    breaks a self-referential binding rather than recursing forever."""
+    if name in seen:
+        return None
+    value = assigns.get(name)
+    if value is None or not _is_string_building(value):
+        return None
+    return _shape(value, assigns, seen + (name,))
+
+
+def _interpolated(node, assigns, seen):
+    """The text an f-string's `{...}` contributes to a shape: `{name}` for a
+    plain variable, the inlined shape when that variable is itself a built
+    string, and an opaque marker for anything undecidable."""
+    if isinstance(node, ast.Name):
+        inlined = _inline(node.id, assigns, seen)
+        return inlined if inlined is not None else "{" + node.id + "}"
+    if isinstance(node, ast.Attribute):
+        return "{" + _dotted(node) + "}"
+    if isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp, ast.Call)):
+        return _shape(node, assigns, seen)
+    return _marker("unresolved expression")
+
+
+def _percent_shape(node, assigns, seen):
+    """`"%s:refs/heads/%s" % (sha, base)` -> `{sha}:refs/heads/{base}`."""
+    fmt = _shape(node.left, assigns, seen)
+    values = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+    parts = fmt.split("%s")
+    if len(parts) != len(values) + 1 or "%" in "".join(parts):
+        return _marker("unresolved %-format")
+    out = [parts[0]]
+    for value, tail in zip(values, parts[1:]):
+        out.append(_interpolated(value, assigns, seen))
+        out.append(tail)
+    return "".join(out)
+
+
+def _call_shape(node, assigns, seen):
+    """str.format and str.join resolve to a shape; every other call is opaque
+    (`<call name>`), which makes it UNDECIDABLE in a refspec position."""
+    func = node.func
+    if isinstance(func, ast.Attribute) and func.attr == "format":
+        parts = _shape(func.value, assigns, seen).split("{}")
+        if len(parts) == len(node.args) + 1 and "{" not in "".join(parts):
+            out = [parts[0]]
+            for value, tail in zip(node.args, parts[1:]):
+                out.append(_interpolated(value, assigns, seen))
+                out.append(tail)
+            return "".join(out)
+        return _marker("unresolved str.format")
+    if isinstance(func, ast.Attribute) and func.attr == "join":
+        if len(node.args) == 1 and isinstance(node.args[0], (ast.List, ast.Tuple)):
+            sep = _shape(func.value, assigns, seen)
+            return sep.join(_shape(e, assigns, seen) for e in node.args[0].elts)
+        return _marker("unresolved str.join")
+    return _marker("call " + _dotted(func))
+
+
+def _shape(node, assigns, seen=()):
+    """An expression rendered as the STRING IT BUILDS, with each interpolated
+    variable as `{name}` and everything undecidable as an opaque `<...>` marker.
+    No marker contains a colon, so an unresolved argument can never be mistaken
+    for the `src:dest` half of a refspec."""
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else _marker(f"constant {node.value!r}")
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            _interpolated(part.value, assigns, seen)
+            if isinstance(part, ast.FormattedValue) else _shape(part, assigns, seen)
+            for part in node.values)
+    if isinstance(node, ast.Name):
+        inlined = _inline(node.id, assigns, seen)
+        return inlined if inlined is not None else "{" + node.id + "}"
+    if isinstance(node, ast.Attribute):
+        return "{" + _dotted(node) + "}"
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _shape(node.left, assigns, seen) + _shape(node.right, assigns, seen)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        return _percent_shape(node, assigns, seen)
+    if isinstance(node, ast.Call):
+        return _call_shape(node, assigns, seen)
+    if isinstance(node, ast.Starred):
+        return _marker("starred argument")
+    return _marker("unresolved expression")
+
+
+def _tokens(node, assigns):
+    """One call argument flattened into argv tokens: a list/tuple literal (or a
+    variable bound to one, or a `_tool(...) + [...]` concatenation) contributes
+    its elements in place, everything else contributes its own shape. This is
+    what makes the runner irrelevant — `_git(repo, "push", ...)`,
+    `subprocess.run(["git", "push", ...])` and `_run(_tool(...) + ["push", ...])`
+    all flatten to a token sequence containing "push"."""
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [t for e in node.elts for t in _tokens(e, assigns)]
+    if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)
+            and (isinstance(node.left, (ast.List, ast.Tuple))
+                 or isinstance(node.right, (ast.List, ast.Tuple)))):
+        return _tokens(node.left, assigns) + _tokens(node.right, assigns)
+    if isinstance(node, ast.Name) and isinstance(assigns.get(node.id), (ast.List, ast.Tuple)):
+        return _tokens(assigns[node.id], assigns)
+    return [_shape(node, assigns)]
+
+
+def _own_nodes(scope):
+    """Every node under `scope` WITHOUT descending into a nested scope, so each
+    call is attributed to the innermost scope containing it and resolves its
+    variables against that scope's own bindings. Seeded from the node's CHILDREN
+    rather than from its body, so a call hiding in a decorator, a default
+    argument or an annotation still belongs to somebody — an unattributed call is
+    an uncounted one."""
+    out, stack = [], list(ast.iter_child_nodes(scope))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                             ast.Lambda)):
+            continue
+        out.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    return out
+
+
+def _assignments(nodes):
+    """name -> the single expression bound to it in this scope. A name bound
+    more than once maps to None: two bindings mean the value at the call site is
+    not decidable from one of them, and guessing is how a check starts lying."""
+    bound = {}
+    for node in nodes:
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = [(t, node.value) for t in node.targets]
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [(node.target, node.value)]
+        elif isinstance(node, ast.AugAssign):
+            targets = [(node.target, None)]
+        elif isinstance(node, ast.NamedExpr):
+            targets = [(node.target, node.value)]
+        for target, value in targets:
+            if isinstance(target, ast.Name):
+                bound[target.id] = None if target.id in bound else value
+    return bound
+
+
+def _scopes(tree):
+    """(name, own nodes) for module scope and EVERY nested scope — functions,
+    async functions, methods, class bodies and lambdas. A push hidden in any of
+    them is still a push this module can perform, and the enumeration is over
+    Python's scope kinds rather than over the places writers happen to live
+    today."""
+    yield "<module>", _own_nodes(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            yield node.name, _own_nodes(node)
+        elif isinstance(node, ast.Lambda):
+            yield "<lambda>", _own_nodes(node)
+
+
+def _git_argv(call, tokens):
+    """The git arguments of a call that demonstrably runs git — this module's
+    `_git(repo, *args)` runner, or any runner handed an argv starting with
+    "git". Used for the VERB inventory; the refspec scan below does not depend
+    on recognising the runner."""
+    if _dotted(call.func).split(".")[-1] == "_git":
+        return tokens[1:]
+    if tokens[:1] == ["git"]:
+        return tokens[1:]
+    return []
+
+
+def _parse_push(function, tokens):
+    """Destinations of one push, from its verb onwards. Returns (writes,
+    problems); a problem is a destination this parser could NOT decide, which
+    fails the check rather than dropping the site."""
+    remote, deleting, specs, problems = None, False, [], []
+    for token in tokens[1:]:
+        if token in ("--delete", "-d"):
+            deleting = True
+        elif token.startswith("-"):
+            if token not in _PUSH_FLAGS_WITH_NO_EFFECT_ON_THE_DESTINATION:
+                problems.append(f"push flag {token} this parser has not reasoned about")
+        elif remote is None:
+            remote = token
+        else:
+            specs.append(token)
+    if not specs:
+        problems.append("push with no explicit refspec — the destination is whatever "
+                        "push.default resolves to at runtime")
+    writes = []
+    for spec in specs:
+        spec = spec.lstrip("+")
+        # A bare ref pushes to the ref of the SAME NAME on the remote, which is
+        # why `_git(repo, "push", remote, sha, base)` writes the base too.
+        src, _, dest = spec.partition(":") if ":" in spec else (spec, "", spec)
+        if deleting:
+            src, dest = None, spec
+        if "<" in dest:
+            problems.append(f"refspec destination this parser could not resolve: {dest}")
+        writes.append(_RefWrite(function, "delete" if deleting else "update", src, dest))
+    return writes, problems
+
+
+def _writer_report(tree):
+    """THE CHECK. Every remote-ref write `tree`'s module can perform, in source
+    order, with everything the analysis could not decide reported alongside
+    rather than dropped.
+
+    Takes an already-parsed tree — like promote_lib.unbudgeted_promote_timeouts,
+    and for the same reason — so the tests below can hand it a planted writer
+    and prove the mechanism FIRES, instead of only observing that today's real
+    source happens to be clean."""
+    writes, undecidable, verbs = [], [], []
+    for function, nodes in _scopes(tree):
+        assigns = _assignments(nodes)
+        for node in nodes:
+            if not isinstance(node, ast.Call):
+                continue
+            tokens = [t for arg in node.args for t in _tokens(arg, assigns)]
+            argv = _git_argv(node, tokens)
+            if argv:
+                verbs.append(argv[0])
+            for index, token in enumerate(tokens):
+                if token in _GIT_VERBS_THAT_CAN_WRITE_A_REMOTE_REF:
+                    found, problems = _parse_push(function, tokens[index:])
+                    writes.extend((node.lineno, w) for w in found)
+                    undecidable.extend((node.lineno, _Undecidable(function, p))
+                                       for p in problems)
+                    break
+    known = (_GIT_VERBS_THAT_CAN_WRITE_A_REMOTE_REF
+             | _GIT_VERBS_REVIEWED_AS_NOT_WRITING_A_REMOTE_REF)
+    return _WriterReport(
+        writes=[w for _, w in sorted(writes, key=lambda pair: pair[0])],
+        undecidable=[u for _, u in sorted(undecidable, key=lambda pair: pair[0])],
+        unclassified_verbs=sorted({v for v in verbs if v not in known}))
+
+
+def _planted(source):
+    """The report for a synthetic module — the plant half of plant-and-fail."""
+    return _writer_report(ast.parse(textwrap.dedent(source)))
+
+
+# The three guarded writers, as the derived check reports them. Source order
+# (_stale_base precedes promote precedes land_batch), so this pins WHERE each
+# writer lives, not just how many there are.
+_GUARDED_INTEGRATION_WRITERS = [
+    _RefWrite("_stale_base", "update", "{combined_sha}", "refs/heads/{base}"),
+    _RefWrite("promote", "update", "{preview_sha}", "refs/heads/{base}"),
+    _RefWrite("land_batch", "update", "{fold_tip}", "refs/heads/{base}"),
+]
+
+# Every OTHER remote-ref write the module performs, reviewed and pinned so that
+# a fourth writer cannot hide among them. Today there is one: chuck's cleanup
+# retiring a merged worker branch. It is a DELETE of `branch`, never an update
+# of `base` — and it is pinned by shape, so a `branch` that ever became `base`
+# would have to change this line to pass.
+_REVIEWED_NON_INTEGRATION_WRITES = [
+    _RefWrite("cleanup_after_merge", "delete", None, "{branch}"),
+]
+
+
 def test_the_module_has_exactly_three_writers_to_the_integration_branch():
     """The bridge between 'the table is safe' and 'no path bypasses the table'.
 
@@ -651,14 +1038,198 @@ def test_the_module_has_exactly_three_writers_to_the_integration_branch():
         assert_batch_budget_present + the per-batch stale-base check + the
         built-on-this-base ancestry precondition, the batch analogues of the
         table's own guards).
-    A FOURTH, unguarded writer is how an 'unreachable' path becomes reachable,
-    and it still fails here. The list is source-ORDER (_stale_base precedes
-    promote precedes land_batch), so this pins WHERE each writer lives too."""
-    import inspect
-    import re
-    writers = re.findall(r'f"\{(\w+)\}:refs/heads/\{base\}"', inspect.getsource(promote_lib))
-    assert writers == ["combined_sha", "preview_sha", "fold_tip"], (
+    A FOURTH, unguarded writer is how an 'unreachable' path becomes reachable.
+    Since SABLE-67qxt it fails in ANY spelling — but be exact about WHERE: this
+    test covers a fourth writer whose destination resolves under refs/heads/,
+    and a writer aimed anywhere else (the bare-ref form, an unresolved refspec,
+    an unclassified verb) fails in
+    test_writers_guard_over_real_module_still_finds_three, which pins the whole
+    inventory. The pair is the proof; neither half is it alone."""
+    writers = [w for w in _writer_report(promote_lib.promote_module_ast()).writes
+               if w.mode == "update" and w.dest.startswith("refs/heads/")]
+    assert writers == _GUARDED_INTEGRATION_WRITERS, (
         f"the integration branch has writers this proof does not cover: {writers}")
+
+
+def test_writers_guard_over_real_module_still_finds_three():
+    """EQUIVALENCE ON THE REAL ARTIFACT, and the no-false-positive half of the
+    standard: run the derived mechanism against the REAL module — real source,
+    real import, no fixtures — and it must report the SAME three guarded writers
+    the retired regex reported, no more, plus the one reviewed non-integration
+    write, and NOTHING it could not decide. A check that flags everything is as
+    useless as one that flags nothing; this is the assertion that keeps the new
+    mechanism honest in that direction."""
+    report = _writer_report(promote_lib.promote_module_ast())
+    assert report.undecidable == [], (
+        "the analysis cannot decide where these writes land, so it cannot claim "
+        f"the base is unwritten by them: {report.undecidable}")
+    assert report.unclassified_verbs == [], (
+        "this module now hands git a verb nobody has classified — put it in "
+        "_GIT_VERBS_THAT_CAN_WRITE_A_REMOTE_REF or in the reviewed-benign set: "
+        f"{report.unclassified_verbs}")
+    assert report.writes == _REVIEWED_NON_INTEGRATION_WRITES + _GUARDED_INTEGRATION_WRITERS
+
+
+def test_writers_guard_catches_a_differently_spelled_writer():
+    """PLANT-AND-FAIL, evasion 1 — the refspec built in a variable and pushed by
+    name. Worth being exact about what the retired regex did here, because it
+    counted refspec LITERALS anywhere in the file rather than PUSH SITES: it
+    happened to still see the f-string form below (a literal is a literal, even
+    one that is never pushed) while seeing nothing at all in the second case,
+    which builds the identical refspec by concatenation. The resolver follows
+    the single binding in both, from the push site outwards."""
+    report = _planted("""
+        def sneak(repo, remote, sha, base):
+            spec = f"{sha}:refs/heads/{base}"
+            git_lib._git(repo, "push", remote, spec, check=False)
+            hidden = sha + ":refs/heads/" + base
+            git_lib._git(repo, "push", remote, hidden, check=False)
+    """)
+    assert report.writes == [_RefWrite("sneak", "update", "{sha}", "refs/heads/{base}")] * 2
+    assert report.undecidable == []
+
+
+def test_writers_guard_catches_a_differently_named_branch_variable():
+    """PLANT-AND-FAIL, evasion 2 — same shape as a guarded writer but the branch
+    variable is called `target`, which the retired regex required to be spelled
+    `base`. The check does not try to decide whether `target` IS the base: it
+    reports the write, and the inventory pin makes an unreviewed one fail."""
+    report = _planted("""
+        def sneak(repo, remote, sha, target):
+            git_lib._git(repo, "push", remote, f"{sha}:refs/heads/{target}", check=False)
+    """)
+    assert report.writes == [_RefWrite("sneak", "update", "{sha}", "refs/heads/{target}")]
+
+
+def test_writers_guard_catches_a_refspec_built_without_an_fstring():
+    """PLANT-AND-FAIL, evasion 3 — %-format, str.format and + concatenation.
+    Three spellings of one refspec, none of them an f-string, all resolving to
+    the same shape as the writers they imitate."""
+    report = _planted("""
+        def sneak(repo, remote, sha, base):
+            git_lib._git(repo, "push", remote, "%s:refs/heads/%s" % (sha, base))
+            git_lib._git(repo, "push", remote, "{}:refs/heads/{}".format(sha, base))
+            git_lib._git(repo, "push", remote, sha + ":refs/heads/" + base)
+    """)
+    assert report.writes == [_RefWrite("sneak", "update", "{sha}", "refs/heads/{base}")] * 3
+    assert report.undecidable == []
+
+
+def test_writers_guard_catches_the_bare_ref_push_form():
+    """PLANT-AND-FAIL, evasion 4 — the two-argument form. `git push remote sha
+    base` is two refspecs, and a bare refspec writes the ref of the SAME NAME on
+    the remote, so this lands on the base with no `refs/heads/` text anywhere
+    for a regex to match."""
+    report = _planted("""
+        def sneak(repo, remote, sha, base):
+            git_lib._git(repo, "push", remote, sha, base, check=False)
+    """)
+    assert report.writes == [
+        _RefWrite("sneak", "update", "{sha}", "{sha}"),
+        _RefWrite("sneak", "update", "{base}", "{base}"),
+    ]
+
+
+def test_writers_guard_catches_a_push_inside_a_helper_or_at_module_scope():
+    """PLANT-AND-FAIL, evasion 5 — the push moved out of the guarded functions.
+    A helper, a nested closure, a lambda, a class body and module scope are all
+    still places this module can push from, so every Python scope kind is
+    walked. Each plant also names its branch variable `target`, so none of them
+    is visible to the retired regex on top of living where it was not looking."""
+    report = _planted("""
+        git_lib._git(REPO, "push", REMOTE, f"{boot_sha}:refs/heads/{target}")
+
+        def _helper(repo, remote, sha, target):
+            git_lib._git(repo, "push", remote, f"{sha}:refs/heads/{target}")
+
+        def outer(repo, remote, sha, target):
+            def inner():
+                git_lib._git(repo, "push", remote, f"{sha}:refs/heads/{target}")
+            hook = lambda: git_lib._git(repo, "push", remote, f"{sha}:refs/heads/{target}")
+            return inner, hook
+
+        class Lander:
+            AT_IMPORT = git_lib._git(REPO, "push", REMOTE, f"{boot_sha}:refs/heads/{target}")
+    """)
+    assert [(w.function, w.dest) for w in report.writes] == [
+        ("<module>", "refs/heads/{target}"),
+        ("_helper", "refs/heads/{target}"),
+        ("inner", "refs/heads/{target}"),
+        ("<lambda>", "refs/heads/{target}"),
+        ("Lander", "refs/heads/{target}"),
+    ]
+
+
+def test_writers_guard_catches_a_push_through_a_different_runner():
+    """PLANT-AND-FAIL, evasion 6 — bypassing git_lib._git entirely. The scan is
+    over the argv TOKENS, not the callee, so subprocess.run, an argv assembled in
+    a list variable and the module's `_tool(...) + [...]` idiom are all as
+    visible as the module's own runner. No plant here is an f-string literal
+    either, so none of the three is visible to the retired regex."""
+    report = _planted("""
+        def sneak(repo, remote, sha, base):
+            subprocess.run(["git", "push", remote, "{}:refs/heads/{}".format(sha, base)])
+            argv = ["git", "push", remote, sha + ":refs/heads/" + base]
+            git_lib._run(argv, cwd=repo)
+            git_lib._run(git_lib._tool("SABLE_MG_GIT", "git") + ["push", remote, "HEAD:main"])
+    """)
+    assert [(w.src, w.dest) for w in report.writes] == [
+        ("{sha}", "refs/heads/{base}"),
+        ("{sha}", "refs/heads/{base}"),
+        ("HEAD", "main"),
+    ]
+
+
+def test_writers_guard_fails_loud_on_a_destination_it_cannot_decide():
+    """A writer the analysis cannot classify is the case this check exists to
+    stop, so an unresolvable refspec, an unreviewed push flag and a push with no
+    refspec at all must FAIL rather than be silently uncounted — the failure
+    direction the retired regex got backwards."""
+    report = _planted("""
+        def sneak(repo, remote, base, specs):
+            git_lib._git(repo, "push", remote, _build_spec(base))
+            git_lib._git(repo, "push", remote, *specs)
+            git_lib._git(repo, "push", "--mirror", remote)
+            git_lib._git(repo, "push")
+    """)
+    no_refspec = ("push with no explicit refspec — the destination is whatever "
+                  "push.default resolves to at runtime")
+    assert [u.reason for u in report.undecidable] == [
+        "refspec destination this parser could not resolve: <call _build_spec>",
+        "refspec destination this parser could not resolve: <starred argument>",
+        "push flag --mirror this parser has not reasoned about",
+        no_refspec,
+        no_refspec,
+    ]
+
+
+def test_writers_guard_fails_loud_on_a_git_verb_nobody_has_classified():
+    """Step 2 of the derivation. `git replay` writes refs; so do `git subtree
+    push` and `git svn dcommit`. None of them is a `push` this parser knows how
+    to read, so the arrival of an unclassified verb has to stop the check rather
+    than pass through it."""
+    report = _planted("""
+        def sneak(repo, base, sha):
+            git_lib._git(repo, "replay", "--onto", base, sha)
+            git_lib._git(repo, "fetch", "origin", base)
+    """)
+    assert report.unclassified_verbs == ["replay"]
+
+
+def test_writers_guard_does_not_flag_the_reads_and_local_writes_around_it():
+    """NEGATIVE CONTROL, load-bearing: a guard that flags everything gets
+    disabled, and then it protects nothing. Reads, local-ref writes and a
+    non-git subprocess must all report NOTHING — no write, no undecidable
+    destination, no unclassified verb."""
+    report = _planted("""
+        def ordinary(repo, remote, base, branch, sha):
+            git_lib._git(repo, "fetch", remote, base, check=False)
+            git_lib._git(repo, "rev-parse", f"refs/heads/{branch}")
+            git_lib._git(repo, "branch", "-D", branch, check=False)
+            git_lib._git(repo, "worktree", "add", "--detach", "/tmp/wt", sha)
+            git_lib._run(["bash", ".github/ci/impact-manifest.sh", "--select"], cwd=repo)
+    """)
+    assert report == _WriterReport(writes=[], undecidable=[], unclassified_verbs=[])
 
 
 # --------------------------------------------------------------------------
