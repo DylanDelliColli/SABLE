@@ -352,6 +352,17 @@ def test_ci_verify_still_triggers_on_ci_verify_refs():
     assert "'ci-verify/**'" in _CI_VERIFY.read_text()
 
 
+def test_ci_verify_runs_the_full_python_suite_exactly_once():
+    """A combined verdict must not pay a second full-suite run merely to warm
+    a selector cache this workflow never consumes."""
+    text = _CI_VERIFY.read_text()
+    invocation = "python -m pytest bin/ -q -p no:cacheprovider"
+    assert text.count(invocation) == 1, \
+        f"ci-verify must run one authoritative Python suite, found {text.count(invocation)}"
+    assert "testmon-cache-warm.sh" not in text
+    assert "actions/cache@" not in text
+
+
 def test_the_split_makes_the_gate_a_snapshot_pinned_tool():
     """A CONSEQUENCE of the split that must not go unnoticed: the gate now
     imports sibling modules, so a plain per-file pin of bin/sable-merge-gate

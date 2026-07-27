@@ -56,20 +56,37 @@ Each merge request — message OR bead:
    You are reading a PRECOMPUTED result, not starting one. Do not `gh pr view` /
    `gh pr checks` for the merge decision — the ci-verify gate, not the PR page,
    is the authority on whether a branch may land.
-3. **Sequencing decision** — verdicts are parallel, promotions are SERIAL. You
-   are the single writer to the integration branch, so order the `green` ones
-   and promote them one at a time:
-   - No overlap with in-flight PRs → queue it for promotion
-   - Overlap with a PR that hasn't merged → **hold this one**, file a follow-up
-     note in the bead, set bead status accordingly
-   - Anything not `green` → it is not in this queue at all
+3. **Seal the next micro-batch** — verdicts are parallel and landing is one
+   atomic integration-ref write. Collect the oldest ready `BRANCH:BEAD` specs
+   and run up to eight together:
+
+   ```bash
+   sable-merge-gate batch-cycle \
+     --member wk-a:SABLE-a \
+     --member wk-b:SABLE-b \
+     --member wk-c:SABLE-c
+   ```
+
+   `batch-cycle` owns the overlap/read-write admission check, canonical fold,
+   exact combined CI verdict, atomic landing, and red-batch diagnosis. It
+   prints every excluded member; do not silently drop one. A `none` verdict
+   from step 2 does not by itself exclude a queued branch: after an earlier
+   batch moves the base, the branch's completed GREEN preview on the ancestor
+   base remains branch-tip qualification, while this cycle's combined run is
+   the landing authority.
+
+   The batch is sealed when the command starts. Messages that arrive while CI
+   runs remain queued for the next invocation—there is no swarm-wide batch
+   boundary and no reason to wait for the queue to become quiet. If fewer than
+   two candidates survive admission, use the serial fallback in step 5.
 4. **Conflict classification** (use the registry's `fix_directly` and `delegate_to_author` lists):
    - Mechanical conflicts (imports, lockfiles, whitespace, non-overlapping diffs, docs) → fix in place: rebase, resolve, push
    - Semantic conflicts (overlapping logic, competing implementations, test divergence, config changes) → file `for-<author>` bead with conflict context and suggested resolution; close the for-chuck bead with reason "delegated to author"
-5. **PROMOTE** — `sable-merge-gate promote --bead <id> --branch <branch>`, one
-   branch at a time, in the order you sequenced. On a green verdict this
-   consumes the stored result and fast-forwards in seconds; it never re-merges,
-   so what lands is byte-identical to what CI verified. Read its exit code:
+5. **SERIAL FALLBACK** — use `sable-merge-gate promote --bead <id> --branch
+   <branch>` only for a lone survivor or a member that `batch-cycle` explicitly
+   excluded. On a green verdict this consumes the stored result and
+   fast-forwards in seconds; it never re-merges, so what lands is
+   byte-identical to what CI verified. Read its exit code:
 
    | code | meaning | what you do |
    |---|---|---|
@@ -102,6 +119,9 @@ Each merge request — message OR bead:
    Check `bd show <id> --json` for a `landing_pair` metadata field before you
    sequence a queue — it changes the ORDER question above from "any two
    independent greens" to "these two travel together."
+
+   `batch-cycle` enforces the same metadata at its final writer: every declared
+   counterpart must be a member of the same atomic batch (or already landed).
 
    Codes 23 and 24 mean **retry**, not failure — never tell an author to "fix"
    either one.

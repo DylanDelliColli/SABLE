@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # close-decay-sweep.sh — PreToolUse:Bash advisory: when a bead id is retired by
 # `bd close`, flag OPEN beads whose INSTRUCTIONS still name it (SABLE-x9vby).
-# Trigger: PreToolUse:Bash | Timeout: 25000ms
+# Manual close-time advisory since SABLE-z3j28.3; no default lifecycle trigger.
 #
 # THE DEFECT CLASS. An instruction pinned to an identifier decays silently when
 # that identifier is retired through NORMAL, CORRECT ACTION. Nothing fails,

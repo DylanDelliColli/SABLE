@@ -361,6 +361,8 @@ SABLE_PROJECT_DIR="$PIH" bash "$INSTALLER" --project >/dev/null 2>&1
 PIHSET="$PIH/.claude/settings.json"
 if [ "$(count_marker "$PIHSET" inbox-injection)" = "0" ]; then pass "settings register no inbox-injection hooks (sable-msg replaces the poll)"; else fail "settings register no inbox-injection hooks" "count=$(count_marker "$PIHSET" inbox-injection)"; fi
 if [ ! -e "$PIH/.claude/hooks/multi-manager/inbox-injection.sh" ] && [ ! -e "$PIH/.claude/hooks/multi-manager/inbox-injection-precompact.sh" ]; then pass "no inbox-injection hook files installed"; else fail "no inbox-injection hook files installed"; fi
+if [ "$(count_marker "$PIHSET" control-trace.sh)" = "0" ] && [ "$(count_marker "$PIHSET" close-decay-sweep.sh)" = "0" ]; then pass "settings register no diagnostic/advisory observer hooks"; else fail "settings register no diagnostic/advisory observer hooks"; fi
+if [ ! -e "$PIH/.claude/hooks/multi-manager/control-trace.sh" ] && [ ! -e "$PIH/.claude/hooks/multi-manager/close-decay-sweep.sh" ]; then pass "retired observer hook files are not installed"; else fail "retired observer hook files are not installed"; fi
 if [ -e "$PIH/.claude/hooks/multi-manager/read-guard.sh" ]; then pass "read-guard survives (durable-inbox guard stays)"; else fail "read-guard survives (durable-inbox guard stays)"; fi
 rm -rf "$PIH"
 
@@ -393,6 +395,8 @@ seed = {
     ],
     "PreToolUse": [
       {"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "bash ~/.claude/hooks/multi-manager/control-trace.sh", "timeout": 3000},
+        {"type": "command", "command": "bash ~/.claude/hooks/multi-manager/close-decay-sweep.sh", "timeout": 25000},
         {"type": "command", "command": "bash /tmp/other-hook.sh", "timeout": 1000}
       ]}
     ]
@@ -409,6 +413,8 @@ touch "$RA/.claude/agents/optimus.md" "$RA/.claude/agents/tarzan.md" "$RA/.claud
 touch "$RA/.claude/agents/my-custom-agent.md"
 printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/inbox-injection.sh"
 printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/inbox-injection-precompact.sh"
+printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/control-trace.sh"
+printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/close-decay-sweep.sh"
 seed_retired_settings "$RA/.claude/settings.json"
 
 RA_OUT="$(SABLE_PROJECT_DIR="$RA" bash "$INSTALLER" --project 2>&1)"
@@ -417,6 +423,8 @@ RASET="$RA/.claude/settings.json"
 if [ ! -e "$RA/.claude/hooks/multi-manager/inbox-injection.sh" ]; then pass "gsqj: retired inbox-injection.sh removed on plain (upgrade) install"; else fail "gsqj: retired inbox-injection.sh removed on plain install"; fi
 if [ ! -e "$RA/.claude/hooks/multi-manager/inbox-injection-precompact.sh" ]; then pass "gsqj: retired inbox-injection-precompact.sh removed"; else fail "gsqj: retired inbox-injection-precompact.sh removed"; fi
 if [ "$(count_marker "$RASET" inbox-injection)" = "0" ]; then pass "gsqj: retired settings rows removed"; else fail "gsqj: retired settings rows removed" "count=$(count_marker "$RASET" inbox-injection)"; fi
+if [ ! -e "$RA/.claude/hooks/multi-manager/control-trace.sh" ] && [ ! -e "$RA/.claude/hooks/multi-manager/close-decay-sweep.sh" ]; then pass "gsqj: retired observer hook files removed"; else fail "gsqj: retired observer hook files removed"; fi
+if [ "$(count_marker "$RASET" control-trace.sh)" = "0" ] && [ "$(count_marker "$RASET" close-decay-sweep.sh)" = "0" ]; then pass "gsqj: retired observer settings rows removed"; else fail "gsqj: retired observer settings rows removed"; fi
 if [ ! -e "$RA/.claude/agents-teams" ]; then pass "gsqj: retired agents-teams dir removed on plain install (not just --uninstall)"; else fail "gsqj: retired agents-teams dir removed on plain install"; fi
 if [ ! -e "$RA/.claude/agents/optimus.md" ] && [ ! -e "$RA/.claude/agents/tarzan.md" ] && [ ! -e "$RA/.claude/agents/chuck.md" ]; then pass "gsqj: retired manager agent defs removed from scope's agents/ dir"; else fail "gsqj: retired manager agent defs removed from scope's agents/ dir"; fi
 if [ -e "$RA/.claude/agents/my-custom-agent.md" ]; then pass "gsqj: genuinely custom agent def survives"; else fail "gsqj: genuinely custom agent def survives"; fi

@@ -84,7 +84,7 @@ SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 # otherwise — these must be actively retired on every plain install, not just
 # --uninstall, or they stay live (e.g. a deleted poll hook still registered
 # in settings, or a retired manager def the Agent tool still offers).
-RETIRED_HOOK_FILES="inbox-injection.sh inbox-injection-precompact.sh"
+RETIRED_HOOK_FILES="inbox-injection.sh inbox-injection-precompact.sh control-trace.sh close-decay-sweep.sh"
 RETIRED_AGENT_DEFS="optimus.md tarzan.md chuck.md"
 
 # Merge a settings snippet's hooks into the target settings file, idempotently.
@@ -576,6 +576,9 @@ REFUSED_HOOK_NAMES=""
 for hook in "$REPO"/hooks/multi-manager/*.sh; do
     [ -f "$hook" ] || continue
     _name="$(basename "$hook")"
+    case " $RETIRED_HOOK_FILES " in
+        *" $_name "*) continue ;;
+    esac
 
     _libs="$(hook_sibling_libs "$hook" "$HOOKS_DIR")"
 

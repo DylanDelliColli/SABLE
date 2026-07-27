@@ -496,6 +496,12 @@ def skill_install_name(skill_dir: Path) -> str:
     return skill_dir.name
 
 
+REPO_RUNNABLE_ONLY_HOOKS = frozenset({
+    "control-trace.sh",
+    "close-decay-sweep.sh",
+})
+
+
 def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
     """Return [(category, repo_path, installed_path), ...] mirroring exactly
     what install.sh + sable-orchestration-install copy.
@@ -518,6 +524,8 @@ def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
 
     # Step 6 (delegated to sable-orchestration-install): multi-manager hooks
     for f in sorted((repo / "hooks" / "multi-manager").glob("*.sh")):
+        if f.name in REPO_RUNNABLE_ONLY_HOOKS:
+            continue
         entries.append(("multi-manager hooks", f, claude_dir / "hooks" / "multi-manager" / f.name))
 
     # registry

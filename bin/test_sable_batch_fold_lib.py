@@ -363,20 +363,34 @@ def test_push_batch_ref_uses_setkey_from_the_owned_module(tmp_path):
     assert remote_sha == tip
 
 
-def test_push_batch_ref_setkey_is_order_independent(tmp_path):
+def test_push_batch_ref_setkey_and_object_are_order_independent(
+        tmp_path, monkeypatch):
     """Sorted-input identity (SABLE-be4lo.1's contract), exercised through the
     fold builder: admitting the same member set in a different order must
-    still resolve to the SAME ref."""
+    resolve to the SAME ref AND the same fold object.  A shared ref with
+    order-dependent content is an identity collision, not order independence."""
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2000-01-01T00:00:00 +0000")
+    monkeypatch.setenv("GIT_AUTHOR_DATE", "2000-01-01T00:00:00 +0000")
     repo, root_sha = _init_repo(tmp_path)
     base_sha = _make_base(repo, root_sha)
     m1 = _make_member(repo, root_sha, "m1", "m1.txt", "m1\n")
     m2 = _make_member(repo, root_sha, "m2", "m2.txt", "m2\n")
+    remote = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(remote)],
+        check=True, capture_output=True)
+    _run(repo, "remote", "add", "origin", str(remote))
+
     key_forward = batch_key.setkey(base_sha, [m1.sha, m2.sha])
     key_reversed = batch_key.setkey(base_sha, [m2.sha, m1.sha])
-    assert key_forward == key_reversed  # sorted-input identity, not this module's job to prove
-    # ...but the ref this module produces for either admission order matches:
-    ref = fold_lib.classify.preview_ref_name("batch", key_forward)
-    assert ref.startswith("ci-verify/batch-")
+    forward_tip, forward_ref = fold_lib.push_batch_ref(
+        str(repo), "origin", base_sha, [m1, m2])
+    reversed_tip, reversed_ref = fold_lib.push_batch_ref(
+        str(repo), "origin", base_sha, [m2, m1])
+
+    assert key_forward == key_reversed
+    assert forward_ref == reversed_ref
+    assert forward_tip == reversed_tip
 
 
 # --------------------------------------------------------------------------

@@ -1770,6 +1770,24 @@ def assert_landing_pair_satisfied(repo: str, bead: str,
             f"— or wait for {counterpart} to land first.")
 
 
+def assert_batch_landing_pairs_satisfied(repo: str, members: list) -> None:
+    """Apply the existing MUST-LAND-TOGETHER authority to a whole batch.
+
+    A batch is the one place where ``--with-pair`` has a concrete artifact:
+    every bead named in ``members`` will share the same atomic integration-ref
+    write.  A counterpart absent from that set still refuses exactly like a
+    solo promote.
+    """
+    batch_beads = frozenset(
+        bead_id for member in members for bead_id in member.bead_ids)
+    for bead_id in batch_beads:
+        try:
+            assert_landing_pair_satisfied(
+                repo, bead_id, batch_beads - {bead_id})
+        except LandingPairRefused as exc:
+            raise GateError(classify.EXIT_PAIR_REFUSED, str(exc)) from exc
+
+
 # --------------------------------------------------------------------------
 # Coverage floor on pruning passes (SABLE-cmar4.5) — the MECHANICAL deny path
 # --------------------------------------------------------------------------
@@ -3634,8 +3652,45 @@ def _fold_tip_built_on(repo: str, base_sha: str, fold_tip: str, member_count: in
     return cp.returncode == 0 and cp.stdout.strip() == base_sha
 
 
+def assert_exact_green_batch_verdict(
+        verdict: classify.Verdict, fold_tip: str, combined_ref: str) -> None:
+    """Authorize a batch integration-ref write from one exact-object verdict.
+
+    A batch ref exists before CI starts, so ref existence is only a trigger,
+    never evidence.  The writer requires a completed, non-override GREEN
+    verdict whose own identity fields bind both the exact fold tip and the
+    exact combined ref.  Keeping this check inside the writer makes it
+    impossible for a new caller to reproduce the old ``land-batch`` bug by
+    resolving a pending ref and calling :func:`land_batch` directly.
+    """
+    if not combined_ref:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            "batch landing requires the exact combined ci-verify ref; an empty "
+            "ref cannot bind a verdict to the object being landed")
+    if not verdict.complete:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"batch verdict for {combined_ref} is statusless/pending; no integration "
+            "write is authorized")
+    if verdict.preview_sha != fold_tip or verdict.ref != combined_ref:
+        raise GateError(
+            classify.EXIT_INTEGRITY,
+            f"batch verdict identity mismatch: verdict binds "
+            f"{verdict.ref or '<no-ref>'}/{(verdict.preview_sha or '<no-sha>')[:7]}, "
+            f"but landing requested {combined_ref}/{fold_tip[:7]}")
+    if verdict.outcome != classify.GREEN or verdict.conclusion == "override":
+        raise GateError(
+            verdict.exit_code if verdict.outcome != classify.GREEN
+            else classify.EXIT_PRECONDITION,
+            f"batch verdict for {combined_ref}/{fold_tip[:7]} is "
+            f"{verdict.outcome}/{verdict.conclusion}, not an exact CI GREEN; "
+            "nothing landed")
+
+
 def land_batch(repo: str, remote: str, base: str, base_sha: str, fold_tip: str,
-               members: list, *, budget: dict, combined_ref: str = "",
+               members: list, *, budget: dict, combined_ref: str,
+               verdict: classify.Verdict,
                manager: str = "lincoln") -> BatchLandResult:
     """Land a verified batch fold chain onto the integration branch, whole or
     not at all. `fold_tip` is the SAME combined object CI verified on
@@ -3646,12 +3701,15 @@ def land_batch(repo: str, remote: str, base: str, base_sha: str, fold_tip: str,
 
     Never raises on a stale base or a losing push race — those are RETURNED as
     REFORM / FELL_BACK_SERIAL results so the caller can act on the disposition.
-    Raises only on a true precondition breach (budget absent → GateError 3;
-    empty batch → EmptyBatchError; a fold_tip not built on base_sha →
-    GateError 3) or the post-push integrity failure (GateError 4)."""
+    Raises only on a true precondition breach (missing/non-green/mismatched
+    verdict; budget absent → GateError 3; empty batch → EmptyBatchError; a
+    fold_tip not built on base_sha → GateError 3) or the post-push integrity
+    failure (GateError 4)."""
     # 0. Freeze first — the same before-any-git-work read promote() opens with.
     assert_not_frozen(repo)
-    # 1. BUDGET REFUSAL — before any git work.
+    # 1. AUTHORITY + BUDGET REFUSAL — before any git work.
+    assert_exact_green_batch_verdict(verdict, fold_tip, combined_ref)
+    assert_batch_landing_pairs_satisfied(repo, members)
     assert_batch_budget_present(budget)
     if not members:
         raise EmptyBatchError(
@@ -3789,8 +3847,14 @@ def land_batch_from_refs(base: str, member_specs: list, repo: str, remote: str,
             f"no verified combined object to land: {combined_ref} is absent on "
             f"{remote}. Form + CI-verify the batch (sable_batch_fold_lib.push_batch_ref) "
             f"before landing it.")
-    result = land_batch(repo, remote, base, base_sha, fold_tip, members,
-                        budget=budget, combined_ref=combined_ref, manager=manager)
+    verdict = preview.acquire_verdict(repo, combined_ref, fold_tip)
+    try:
+        result = land_batch(
+            repo, remote, base, base_sha, fold_tip, members,
+            budget=budget, combined_ref=combined_ref, verdict=verdict,
+            manager=manager)
+    finally:
+        preview.delete_ci_ref(repo, remote, combined_ref)
     print(result.reason)
     return result.exit_code
 

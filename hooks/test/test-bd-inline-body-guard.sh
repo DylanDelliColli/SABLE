@@ -60,7 +60,7 @@ fi
 # dropped sibling fails loudly instead of surviving as a smaller-but-still-
 # nonzero count.
 # ===========================================================================
-PRE_EXISTING_BASH_HOOKS="control-trace.sh mode-interlock.sh tree-claim.sh stash-worktree-guard.sh worktree-placement-guard.sh read-guard.sh notes-clobber-guard.sh pre-push-rebase-test.sh close-decay-sweep.sh"
+PRE_EXISTING_BASH_HOOKS="mode-interlock.sh tree-claim.sh stash-worktree-guard.sh worktree-placement-guard.sh read-guard.sh notes-clobber-guard.sh pre-push-rebase-test.sh"
 
 if [ -f "$SNIPPET" ]; then
   SNIPPET_CHECK=$(python3 -c "

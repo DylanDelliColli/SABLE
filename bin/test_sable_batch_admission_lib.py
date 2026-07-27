@@ -226,6 +226,78 @@ def test_individually_green_fails_on_a_red_verdict(repo, monkeypatch):
     assert verdict.mechanical is False
 
 
+def test_rolling_batch_accepts_exact_tip_green_after_the_base_advances(
+        repo, monkeypatch):
+    """A sealed prior batch moves the base, but it does not change this
+    candidate's tip.  Its older GREEN is qualification evidence; the new
+    combined batch run is what will authorize landing on the current base.
+    Serial mechanical adoption remains false, proving the two authorities did
+    not get accidentally conflated."""
+    old_base = _sha(repo)
+    branch_sha = _branch(repo, old_base, "queued", "queued.py", "x = 1\n")
+    _run(repo, "checkout", "-q", "trunk")
+    _write(repo, "landed-before.py", "prior = 1\n")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "-m", "prior batch moved base")
+    current_base = _sha(repo)
+    _stub_bd(monkeypatch, {
+        "SABLE-queued": _bead_record(writes="queued.py"),
+    })
+    monkeypatch.setattr(preview_lib, "adopt_kicked_preview",
+                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        preview_lib, "find_stale_green_preview",
+        lambda *args, **kwargs: preview_lib.StalePreview(
+            "a" * 40, "ci-verify/queued-old", old_base,
+            "https://example.invalid/run"))
+
+    serial = adm.is_this_branch_mechanical(
+        str(repo), "origin", "SABLE-queued", "queued",
+        current_base, branch_sha)
+    batch = adm.is_this_branch_batchable(
+        str(repo), "origin", "SABLE-queued", "queued",
+        current_base, branch_sha)
+
+    assert serial.mechanical is False
+    assert serial.clause("clean_ff_adoption").passed is False
+    assert batch.batchable is True
+    assert batch.clause("branch_tip_qualified").passed is True
+    assert "ancestor base" in batch.clause("branch_tip_qualified").reason
+
+
+def test_current_red_qualification_is_not_hidden_by_an_older_green(
+        repo, monkeypatch):
+    """When an exact current-base preview exists, its RED wins.  Falling back
+    to an older green here would admit a branch after newer evidence rejected
+    the same tip."""
+    base_sha = _sha(repo)
+    branch_sha = _branch(repo, base_sha, "red-now", "red-now.py", "x = 1\n")
+    _stub_bd(monkeypatch, {
+        "SABLE-red-now": _bead_record(writes="red-now.py"),
+    })
+    current_preview = "b" * 40
+    monkeypatch.setattr(
+        preview_lib, "adopt_kicked_preview",
+        lambda *args, **kwargs: (current_preview, "ci-verify/red-now"))
+    monkeypatch.setattr(
+        preview_lib, "read_verdict",
+        lambda *args, **kwargs: classify.Verdict(
+            "failure", "", current_preview, "ci-verify/red-now",
+            source="precomputed", complete=True))
+    monkeypatch.setattr(
+        preview_lib, "find_stale_green_preview",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("older green must not be consulted after current RED")))
+
+    batch = adm.is_this_branch_batchable(
+        str(repo), "origin", "SABLE-red-now", "red-now",
+        base_sha, branch_sha)
+
+    assert batch.batchable is False
+    assert batch.clause("branch_tip_qualified").passed is False
+    assert "not green" in batch.clause("branch_tip_qualified").reason
+
+
 def test_zero_holds_fails_when_the_bead_is_held(repo, monkeypatch):
     base_sha = _sha(repo)
     branch_sha = _branch(repo, base_sha, "held", "x.py", "x = 1\n")
@@ -398,15 +470,19 @@ def test_excludes_a_not_individually_green_branch_reason_recorded(repo, monkeypa
     assert [c.branch for c in result.admitted] == ["ok"]
     assert len(result.excluded) == 1
     assert result.excluded[0].candidate.branch == "red"
-    assert "individually_green" in result.excluded[0].reason
+    assert "branch_tip_qualified" in result.excluded[0].reason
 
 
-def test_rejects_an_overlapping_pair_via_fold_check_failure_falls_back_to_serial(repo, monkeypatch):
+def test_mechanical_writes_widen_declarations_and_reject_overlap_before_combined_fold(
+        repo, monkeypatch):
     """Declared footprints are DISJOINT (A only declares a.py; B only
-    declares shared.py) but A's REAL diff also touches shared.py, undeclared
-    -- so the cheap pairwise check passes and only the real fold_check (on
-    the accumulated set) catches the conflict. Distinct exclusion message
-    from the declared-footprint-overlap case."""
+    declares shared.py), but A's REAL diff also touches shared.py.
+
+    The mechanical footprint is the write-side floor, so admission must
+    reject B at the cheap pairwise check.  Relying on the later fold check
+    would miss clean-but-order-sensitive overlapping edits and spend needless
+    git work on an already-ineligible pair.
+    """
     _write(repo, "shared.py", "base\n")
     _run(repo, "add", "-A")
     _run(repo, "commit", "-q", "-m", "add shared.py")
@@ -439,17 +515,27 @@ def test_rejects_an_overlapping_pair_via_fold_check_failure_falls_back_to_serial
 
     candidates = [Candidate(bead="SABLE-a", branch="a", sha=sha_a),
                  Candidate(bead="SABLE-b", branch="b", sha=sha_b)]
+    fold_calls = []
+    import sable_batch_fold_lib as fold_lib
+    real_fold_check = fold_lib.fold_check
+
+    def _counting_fold_check(*args, **kwargs):
+        fold_calls.append(args)
+        return real_fold_check(*args, **kwargs)
+
+    monkeypatch.setattr(fold_lib, "fold_check", _counting_fold_check)
     # root_with_shared (which already carries shared.py) is the fold base, so
-    # the merge-tree step actually has shared.py present on every side.
+    # mechanical footprints are computed against the same starting point.
     result = adm.admit_batch(str(repo), "origin", root_with_shared, candidates)
 
     assert [c.branch for c in result.admitted] == ["a"]
     assert len(result.excluded) == 1
     assert result.excluded[0].candidate.branch == "b"
-    assert "fold-check FAILURE" in result.excluded[0].reason
-    assert "falls back to serial" in result.excluded[0].reason
-    assert "overlaps admitted member" not in result.excluded[0].reason, (
-        "must be distinguishable from the declared-footprint-overlap exclusion")
+    assert "overlaps admitted member" in result.excluded[0].reason
+    assert "shared.py" in result.excluded[0].reason
+    combined_calls = [call for call in fold_calls if len(call[2]) > 1]
+    assert combined_calls == [], (
+        "mechanical overlap must be rejected before a combined fold check")
 
 
 def test_declared_footprint_undetermined_excludes_rather_than_raising(repo, monkeypatch):

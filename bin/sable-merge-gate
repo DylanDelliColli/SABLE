@@ -45,6 +45,11 @@ dependency order (a DAG — nothing imports "upward"):
                                verdicts, sweeps orphans. Never promotes.
   sable_gate_promote_lib.py    Consumes a verdict and promotes (or refuses).
                                The only writer to the integration branch.
+  sable_batch_coordinator_lib.py
+                               Composes admission, fold, exact combined
+                               verdict, atomic landing, and red diagnosis for
+                               one bounded rolling-queue cycle. Owns no second
+                               writer or verifier.
   sable_gate_budget_lib.py     Per-tier duration budget breach detection +
                                idempotent bead filing (SABLE-cmar4.4). Called
                                by promote, wrapped around the acquire_verdict
@@ -274,7 +279,7 @@ import sable_footprint_lib as footprint_lib          # noqa: E402
 import sable_gate_classify_lib as classify           # noqa: E402
 import sable_gate_git_lib as git_lib                 # noqa: E402
 import sable_gate_preview_lib as preview_lib         # noqa: E402
-import sable_gate_promote_lib as promote_lib         # noqa: E402
+import sable_batch_coordinator_lib as batch_coordinator, sable_gate_promote_lib as promote_lib  # noqa: E402,E501
 import sable_snapshot_lib as snapshot_lib            # noqa: E402
 
 # Public API re-exports. These are the names OTHER tools import from this file
@@ -399,18 +404,15 @@ def main(argv: list[str] | None = None) -> int:
                     dest="member_footprints", metavar="PATH[,...]",
                     help="repeatable; one per batch member (SABLE-be4lo.6)")
 
-    # SABLE-be4lo.7 (land-batch, the GATE-CLASS landing path) and SABLE-be4lo.8
-    # (bisect-batch, the red-batch bisection state machine). Both subparsers and
-    # all of their logic live in promote_lib so this CLI stays argparse-dispatch-
-    # thin; they register and dispatch through ONE pair of calls because this
-    # file sits against test_cli_is_thin's 150-line budget (SABLE-ehx8u).
-    promote_lib.register_batch_subcommands(sub)
+    # Batch primitives plus SABLE-z3j28.1's composed rolling cycle register
+    # through one coordinator seam so this CLI stays argparse-dispatch-thin.
+    batch_coordinator.register_batch_subcommands(sub)
 
     # SABLE-jd5fj.8. Refreshes the gate-owned persisted warm .testmondata
     # (see sable_gate_promote_lib's module comment on _warm_testmondata_path)
-    # by running the full bin/ suite with --testmon-noselect, same as CI's
-    # .github/ci/testmon-cache-warm.sh — meant to be run periodically or by
-    # an operator, NOT by the gate itself on every promote.
+    # by running the full bin/ suite with --testmon-noselect. CI no longer pays
+    # this duplicate run (SABLE-z3j28.2); this is an explicit local operator
+    # action for the local impact tier.
     pw = sub.add_parser("warm-testmon-cache",
                         help="refresh the gate-owned warm .testmondata used by the "
                              "combined-tree impact tier's pytest half")
@@ -448,7 +450,7 @@ def main(argv: list[str] | None = None) -> int:
             print(promote_lib.render_promote_budget_report(
                 args.member_footprints, args.seconds, args.json))
             return 0
-        if args.command in ("land-batch", "bisect-batch"): return promote_lib.dispatch_batch_command(args)  # noqa: E501,E701 SABLE-be4lo.7/.8 (one-line dispatch keeps the CLI under test_cli_is_thin's 150-line guard; all logic is in the lib)
+        if args.command in ("land-batch", "bisect-batch", "batch-cycle"): return batch_coordinator.dispatch_batch_command(args)  # noqa: E501,E701 SABLE-be4lo.7/.8, SABLE-z3j28.1
         if args.command == "warm-testmon-cache":
             return promote_lib.warm_gate_testmon_cache(args.repo)
         if args.command == "impact-tier-phases":

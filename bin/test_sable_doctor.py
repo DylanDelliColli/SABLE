@@ -103,6 +103,21 @@ def test_build_manifest_installed_paths_match_install_layout(tmp_path):
     assert by_category["skill:columbo"] == claude_dir / "skills" / "columbo" / "SKILL.md"
 
 
+def test_build_manifest_omits_repo_runnable_only_observer_hooks(tmp_path):
+    repo, claude_dir = make_repo(tmp_path)
+    for name in doctor.REPO_RUNNABLE_ONLY_HOOKS:
+        (repo / "hooks" / "multi-manager" / name).write_text(
+            "#!/bin/sh\nexit 0\n")
+
+    entries = doctor.build_manifest(repo, claude_dir)
+    multi_manager_sources = {
+        src.name for category, src, _dst in entries
+        if category == "multi-manager hooks"
+    }
+
+    assert multi_manager_sources == {"post-push-merge-notify.sh"}
+
+
 def test_build_manifest_only_installs_the_four_manager_roles(tmp_path):
     # a producer role fragment sitting alongside the manager roles (e.g.
     # sherlock.md) must NOT be treated as an installed manager role — those

@@ -971,6 +971,17 @@ def _ok_budget(members):
     return promote_lib.combined_tree_budget([list(m.footprint_paths) for m in members])
 
 
+def _green_batch_verdict(fold_tip, combined_ref="ci-verify/batch-test"):
+    """Exact-object CI authority for direct writer tests.
+
+    The batch coordinator tests exercise verdict acquisition itself.  These
+    lower-level writer tests supply the value the writer now requires so each
+    case can stay focused on stale-base, atomic-push, and integrity behavior.
+    """
+    return promote_lib.classify.Verdict(
+        "success", "", fold_tip, combined_ref, source="precomputed", complete=True)
+
+
 # --------------------------------------------------------------------------
 # Hermetic fleet-channel isolation (SABLE-xpab3). A batch-land test emits
 # _notify() cockpit messages and _append_evidence() bd writes — NEITHER may
@@ -1012,6 +1023,112 @@ def fleet_sink(_hermetic_fleet_channel, monkeypatch):
 
 # ---- (2) PER-BATCH STALE-BASE — both polarities --------------------------
 
+@pytest.mark.parametrize(
+    ("conclusion", "complete", "identity_offset", "expected_code"),
+    [
+        ("pending", False, False, promote_lib.classify.EXIT_PRECONDITION),
+        ("failure", True, False, promote_lib.classify.EXIT_RED),
+        ("success", True, True, promote_lib.classify.EXIT_INTEGRITY),
+    ],
+)
+def test_land_batch_from_refs_refuses_non_green_or_mismatched_authority(
+        tmp_path, monkeypatch, fleet_sink, conclusion, complete, identity_offset,
+        expected_code):
+    """The sanctioned CLI path cannot turn ref existence into authorization.
+
+    The combined ref is present in a real bare remote in every case.  Pending,
+    red, and exact-SHA-mismatched verdicts all fail before the integration ref
+    moves.  This is the negative control the original implementation lacked:
+    deleting the verdict assertion makes all three cases land.
+    """
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = [
+        _member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",)),
+        _member_branch(repo, base_sha, "wk-b", "bin/b.py", "b=1\n", ("SABLE-b",)),
+    ]
+    fold_members = [
+        fold_lib.FoldMember(m.branch, m.tip_sha, m.bead_ids[0]) for m in members]
+    fold_tip, combined_ref = fold_lib.push_batch_ref(
+        str(repo), "origin", base_sha, fold_members)
+    before = _remote_head(bare, "trunk")
+    seen = []
+
+    def verdict_for_exact_request(repo_, ref, sha):
+        seen.append((ref, sha))
+        bound_sha = ("f" * 40) if identity_offset else sha
+        return promote_lib.classify.Verdict(
+            conclusion, "", bound_sha, ref, source="precomputed",
+            complete=complete)
+
+    monkeypatch.setattr(promote_lib.preview, "acquire_verdict",
+                        verdict_for_exact_request)
+    with pytest.raises(promote_lib.GateError) as exc:
+        promote_lib.land_batch_from_refs(
+            "trunk", ["wk-a:SABLE-a", "wk-b:SABLE-b"],
+            str(repo), "origin")
+
+    assert exc.value.code == expected_code
+    assert seen == [(combined_ref, fold_tip)], \
+        "landing did not ask for the verdict of the exact combined object"
+    assert _remote_head(bare, "trunk") == before, \
+        "a non-green or mismatched verdict moved the integration ref"
+
+
+def test_land_batch_from_refs_lands_only_the_exact_green_object(
+        tmp_path, monkeypatch, fleet_sink):
+    """Positive control for the authority matrix above: exact ref + exact SHA
+    + completed GREEN reaches the existing atomic writer and lands that object."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = [
+        _member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",)),
+        _member_branch(repo, base_sha, "wk-b", "bin/b.py", "b=1\n", ("SABLE-b",)),
+    ]
+    fold_members = [
+        fold_lib.FoldMember(m.branch, m.tip_sha, m.bead_ids[0]) for m in members]
+    fold_tip, combined_ref = fold_lib.push_batch_ref(
+        str(repo), "origin", base_sha, fold_members)
+    monkeypatch.setattr(
+        promote_lib.preview, "acquire_verdict",
+        lambda repo_, ref, sha: _green_batch_verdict(sha, ref))
+
+    rc = promote_lib.land_batch_from_refs(
+        "trunk", ["wk-a:SABLE-a", "wk-b:SABLE-b"],
+        str(repo), "origin")
+
+    assert rc == 0
+    assert _remote_head(bare, "trunk") == fold_tip
+    assert _remote_head(bare, combined_ref) == "", \
+        "a consumed terminal batch ref was not cleaned up"
+
+
+def test_batch_writer_refuses_a_declared_pair_missing_from_the_atomic_set(
+        tmp_path, monkeypatch, fleet_sink):
+    """The new batch writer must not become a bypass around the existing
+    MUST-LAND-TOGETHER authority."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = [
+        _member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",)),
+    ]
+    fold_tip = _fold(repo, base_sha, members)
+    combined_ref = "ci-verify/batch-incomplete-pair"
+    before = _remote_head(bare, "trunk")
+    monkeypatch.setattr(
+        promote_lib, "declared_landing_pair",
+        lambda repo_, bead: (
+            frozenset({"SABLE-b"}) if bead == "SABLE-a" else frozenset()))
+    monkeypatch.setattr(promote_lib, "_bead_landed", lambda *args: False)
+
+    with pytest.raises(promote_lib.GateError) as exc:
+        promote_lib.land_batch(
+            str(repo), "origin", "trunk", base_sha, fold_tip, members,
+            budget=_ok_budget(members), combined_ref=combined_ref,
+            verdict=_green_batch_verdict(fold_tip, combined_ref))
+
+    assert exc.value.code == promote_lib.classify.EXIT_PAIR_REFUSED
+    assert "SABLE-b" in str(exc.value)
+    assert _remote_head(bare, "trunk") == before
+
+
 def test_land_batch_lands_when_base_equals_the_formed_base(tmp_path, fleet_sink):
     """SABLE-be4lo.7 behavior 2 (positive polarity): base parent == integration
     tip → the batch lands. The single fast-forward moves trunk to the fold tip
@@ -1022,9 +1139,11 @@ def test_land_batch_lands_when_base_equals_the_formed_base(tmp_path, fleet_sink)
         _member_branch(repo, base_sha, "wk-b", "bin/b.py", "b=1\n", ("SABLE-b",)),
     ]
     fold_tip = _fold(repo, base_sha, members)
+    combined_ref = "ci-verify/batch-deadbee"
     res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
                                  members, budget=_ok_budget(members),
-                                 combined_ref="ci-verify/batch-deadbee")
+                                 combined_ref=combined_ref,
+                                 verdict=_green_batch_verdict(fold_tip, combined_ref))
     assert res.landed, res.reason
     assert res.outcome == promote_lib.BATCH_OUTCOME_LANDED
     # The landing notification went to the HERMETIC sink, never the live cockpit.
@@ -1057,9 +1176,11 @@ def test_land_batch_reforms_and_lands_nothing_on_a_stale_base(tmp_path, fleet_si
     _bg(repo, "push", "-q", "origin", "trunk")
     moved = _remote_head(bare, "trunk")
 
-    res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
-                                 members, budget=_ok_budget(members),
-                                 combined_ref="ci-verify/batch-deadbee")
+    combined_ref = "ci-verify/batch-deadbee"
+    res = promote_lib.land_batch(
+        str(repo), "origin", "trunk", base_sha, fold_tip, members,
+        budget=_ok_budget(members), combined_ref=combined_ref,
+        verdict=_green_batch_verdict(fold_tip, combined_ref))
     assert res.outcome == promote_lib.BATCH_OUTCOME_REFORM, res.reason
     assert not res.landed
     assert res.exit_code == promote_lib.classify.EXIT_BASE_MOVED
@@ -1079,9 +1200,12 @@ def test_land_batch_refuses_a_tip_not_built_on_the_named_base(tmp_path, fleet_si
     # Fold onto ROOT (the very first commit), not onto base_sha (trunk tip).
     root = _bg(repo, "rev-list", "--max-parents=0", "HEAD")
     wrong_tip = _fold(repo, root, members)
+    combined_ref = "ci-verify/batch-wrongbase"
     with pytest.raises(promote_lib.GateError) as exc:
         promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, wrong_tip,
-                               members, budget=_ok_budget(members))
+                               members, budget=_ok_budget(members),
+                               combined_ref=combined_ref,
+                               verdict=_green_batch_verdict(wrong_tip, combined_ref))
     assert exc.value.code == promote_lib.classify.EXIT_PRECONDITION
     assert "not built on base" in str(exc.value)
 
@@ -1093,9 +1217,12 @@ def test_land_batch_budget_absent_refuses_before_touching_the_base(tmp_path, fle
     members = [_member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",))]
     fold_tip = _fold(repo, base_sha, members)
     before = _remote_head(bare, "trunk")
+    combined_ref = "ci-verify/batch-no-budget"
     with pytest.raises(promote_lib.GateError) as exc:
         promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
-                               members, budget=promote_lib.impact_budget())
+                               members, budget=promote_lib.impact_budget(),
+                               combined_ref=combined_ref,
+                               verdict=_green_batch_verdict(fold_tip, combined_ref))
     assert promote_lib.BATCH_BUDGET_FIELD in str(exc.value)
     assert _remote_head(bare, "trunk") == before, "a budget refusal must not touch the base"
 
@@ -1120,9 +1247,12 @@ def test_land_batch_integrity_aborts_if_the_landed_tip_is_not_the_tested_object(
         return real_tip_matches(landed, expected)
     monkeypatch.setattr(promote_lib.batch_key, "tip_matches", flaky_tip_matches)
 
+    combined_ref = "ci-verify/batch-integrity"
     with pytest.raises(promote_lib.GateError) as exc:
         promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
-                               members, budget=_ok_budget(members))
+                               members, budget=_ok_budget(members),
+                               combined_ref=combined_ref,
+                               verdict=_green_batch_verdict(fold_tip, combined_ref))
     assert exc.value.code == promote_lib.classify.EXIT_INTEGRITY
     assert "integrity abort" in str(exc.value)
 
@@ -1158,9 +1288,11 @@ def test_land_batch_no_half_landing_when_the_single_push_fails(tmp_path, monkeyp
         return real_git(repo_, *args, check=check)
     monkeypatch.setattr(promote_lib.git_lib, "_git", interrupt_the_land_push)
 
-    res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
-                                 members, budget=_ok_budget(members),
-                                 combined_ref="ci-verify/batch-deadbee")
+    combined_ref = "ci-verify/batch-deadbee"
+    res = promote_lib.land_batch(
+        str(repo), "origin", "trunk", base_sha, fold_tip, members,
+        budget=_ok_budget(members), combined_ref=combined_ref,
+        verdict=_green_batch_verdict(fold_tip, combined_ref))
     assert res.outcome == promote_lib.BATCH_OUTCOME_FELL_BACK_SERIAL, res.reason
     assert not res.landed
     # NO intermediate state: trunk is exactly where it was — no fold commit,
@@ -1193,8 +1325,11 @@ def test_one_promote_a_landed_batch_makes_an_interleaved_serial_non_ff(tmp_path,
     serial = _member_branch(repo, base_sha, "wk-serial", "bin/s.py", "s=1\n", ("SABLE-s",))
     fold_tip = _fold(repo, base_sha, members)
 
-    res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
-                                 members, budget=_ok_budget(members))
+    combined_ref = "ci-verify/batch-one-promote"
+    res = promote_lib.land_batch(
+        str(repo), "origin", "trunk", base_sha, fold_tip, members,
+        budget=_ok_budget(members), combined_ref=combined_ref,
+        verdict=_green_batch_verdict(fold_tip, combined_ref))
     assert res.landed
     assert _remote_head(bare, "trunk") == fold_tip
 
@@ -1228,8 +1363,10 @@ def test_S1_acceptance_three_disjoint_branches_land_in_one_combined_cycle(tmp_pa
     t0 = time.monotonic()
     fold_members = [fold_lib.FoldMember(m.branch, m.tip_sha, m.bead_ids[0]) for m in members]
     fold_tip, combined_ref = fold_lib.push_batch_ref(str(repo), "origin", base_sha, fold_members)
-    res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
-                                 members, budget=_ok_budget(members), combined_ref=combined_ref)
+    res = promote_lib.land_batch(
+        str(repo), "origin", "trunk", base_sha, fold_tip, members,
+        budget=_ok_budget(members), combined_ref=combined_ref,
+        verdict=_green_batch_verdict(fold_tip, combined_ref))
     batch_wall = time.monotonic() - t0
     assert res.landed, res.reason
     landed_tip = _remote_head(bare, "trunk")
@@ -1313,9 +1450,11 @@ def test_batch_land_makes_zero_real_fleet_sends(tmp_path, monkeypatch, fleet_sin
         _member_branch(repo, base_sha, "wk-b", "bin/b.py", "b=1\n", ("SABLE-b",)),
     ]
     fold_tip = _fold(repo, base_sha, members)
-    res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
-                                 members, budget=_ok_budget(members),
-                                 combined_ref="ci-verify/batch-zero")
+    combined_ref = "ci-verify/batch-zero"
+    res = promote_lib.land_batch(
+        str(repo), "origin", "trunk", base_sha, fold_tip, members,
+        budget=_ok_budget(members), combined_ref=combined_ref,
+        verdict=_green_batch_verdict(fold_tip, combined_ref))
     assert res.landed
 
     real_sends = [a for a in recorded if a and a[0] in ("sable-msg", "bd")]
@@ -2675,7 +2814,9 @@ def _serial_gate_cycle(repo, bare, member):
         return False, problems
     res = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, fold_tip,
                                  [member], budget=_ok_budget([member]),
-                                 combined_ref=f"ci-verify/serial-{member.branch}")
+                                 combined_ref=f"ci-verify/serial-{member.branch}",
+                                 verdict=_green_batch_verdict(
+                                     fold_tip, f"ci-verify/serial-{member.branch}"))
     return res.landed, []
 
 
@@ -2746,8 +2887,10 @@ def test_S3_acceptance_a_planted_failure_is_named_and_nothing_lands_from_the_bat
     htip, href = fold_lib.push_batch_ref(str(crepo), "origin", cbase, hfold)
     assert _sandbox_verifier(str(crepo))(healthy, htip, href) is True, \
         "the control batch was red — the acceptance would prove nothing"
-    control = promote_lib.land_batch(str(crepo), "origin", "trunk", cbase, htip, healthy,
-                                     budget=_ok_budget(healthy), combined_ref=href)
+    control = promote_lib.land_batch(
+        str(crepo), "origin", "trunk", cbase, htip, healthy,
+        budget=_ok_budget(healthy), combined_ref=href,
+        verdict=_green_batch_verdict(htip, href))
     assert control.landed, control.reason
     assert _remote_head(cbare, "trunk") == htip, "the healthy batch did not land WHOLE"
 
@@ -2857,8 +3000,10 @@ def test_S3_an_n4_single_culprit_isolates_within_three_extra_combined_runs(
     rest_fold = [fold_lib.FoldMember(m.branch, m.tip_sha, m.bead_ids[0]) for m in rest]
     rest_tip, rest_ref = fold_lib.push_batch_ref(str(repo), "origin", base_sha, rest_fold)
     assert verify(rest, rest_tip, rest_ref) is True, "the re-batch of the innocent members is red"
-    landed = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, rest_tip, rest,
-                                    budget=_ok_budget(rest), combined_ref=rest_ref)
+    landed = promote_lib.land_batch(
+        str(repo), "origin", "trunk", base_sha, rest_tip, rest,
+        budget=_ok_budget(rest), combined_ref=rest_ref,
+        verdict=_green_batch_verdict(rest_tip, rest_ref))
     assert landed.landed, landed.reason
     assert _remote_head(bare, "trunk") == rest_tip
 
@@ -2909,8 +3054,10 @@ def test_S3_no_silent_landing_across_every_red_node_of_the_bisection_tree(
         rest = [m for m in members if m.branch != guilty]
         rest_fold = [fold_lib.FoldMember(m.branch, m.tip_sha, m.bead_ids[0]) for m in rest]
         rest_tip, rest_ref = fold_lib.push_batch_ref(str(repo), "origin", base_sha, rest_fold)
-        ok = promote_lib.land_batch(str(repo), "origin", "trunk", base_sha, rest_tip, rest,
-                                    budget=_ok_budget(rest), combined_ref=rest_ref)
+        ok = promote_lib.land_batch(
+            str(repo), "origin", "trunk", base_sha, rest_tip, rest,
+            budget=_ok_budget(rest), combined_ref=rest_ref,
+            verdict=_green_batch_verdict(rest_tip, rest_ref))
         assert ok.landed, f"the sandbox could not land anything at all: {ok.reason}"
         assert _remote_head(bare, "trunk") != trunk_before
 
