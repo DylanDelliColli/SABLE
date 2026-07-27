@@ -98,7 +98,16 @@ mkdir -p "$BEADS_ROOT"
 # prefix produces bead IDs the hook's own id-extraction never matches, so
 # DISPATCH_IDS comes back empty and the hook silently no-ops on every case
 # (discovered running this suite against SABLE-b0w8k's isolated DB fix).
-BD_INIT_OUT="$(cd "$BEADS_ROOT" && env BD_NON_INTERACTIVE=1 bd init --prefix=sable 2>&1)"
+#
+# -u BEADS_DB (SABLE-sx1rb): when this suite runs under the impact tier, the
+# tier has ALREADY exported BEADS_DB pointing at ITS OWN isolated DB. Left
+# ambient, `bd init` follows that var instead of CWD and "initializes" the
+# tier's already-initialized DB instead of building this suite's own —
+# aborting with "This workspace is already initialized" and reading as a
+# content RED on whichever branch happened to be the first to enter the
+# tier. Same pattern this file already applies at the hermeticity probe
+# below (line ~364) and test-dep-merge-state.sh applies at its own init.
+BD_INIT_OUT="$(cd "$BEADS_ROOT" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=sable 2>&1)"
 if [ ! -d "$BEADS_ROOT/.beads" ]; then
   echo "FATAL: could not initialize an isolated per-run bd DB: $BD_INIT_OUT"
   exit 2
