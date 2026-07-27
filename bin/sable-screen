@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sable-screen — the two manager pre-dispatch/pre-close safety screens,
+"""sable-screen — the manager pre-dispatch/pre-close safety screens,
 mechanized (SABLE-23upx).
 
 CONTEXT
@@ -110,9 +110,70 @@ holds
   NEEDS-HOLD line reports what is still missing on the best-covered bead. A
   single-bead branch is unchanged — its row is its bead's row.
 
-NO PROSE FALLBACK (intentional — do not add one)
--------------------------------------------------
-Both screens read metadata.wip_claims / metadata.footprint_writes and STOP.
+activation <bead-id> ... | --ready
+  THE LANDABILITY SCREEN (SABLE-6eu9w). Every gate above answers "will this
+  bead COLLIDE with something in flight?"; NOTHING answered "if this bead
+  succeeds, CAN THE RESULT ACTUALLY LAND?" — so a manager could dispatch work
+  that is perfectly scoped, perfectly disjoint, correctly implemented, fully
+  verified, and then structurally unmergeable. Measured 2026-07-26: of 43
+  installed sable bins, 39 were LIVE SYMLINKS into the working tree, so the
+  pull IS the activation and ~90% of bin/ work is verify-but-hold under the
+  standing operator-present hot-swap regime. Three finished, well-evidenced
+  branches were correctly held that night for activation shape rather than for
+  any defect; the dispatch decisions that produced them were made blind.
+
+  Landability is decided ENTIRELY by the activation shape of the files in the
+  footprint, which is knowable BEFORE dispatch from the declared footprint
+  alone. Each declared path classifies as:
+    HOT-SWAP        an installed artifact resolves INTO a live working tree of
+                    this repo. Landing ACTIVATES. Operator-present event.
+    HOT-SWAP-       not installed itself, but imported/sourced by a hot-swap
+      CLOSURE       artifact beside it, so the pull activates it all the same.
+                    A symlink activates its whole import closure, not just the
+                    file it names — see ClosureIndex.
+    PIN-MANAGED     installed as a symlink resolving OUTSIDE every live tree
+                    (a pinned snapshot). Lands inert; a re-pin activates.
+    COPY-INSTALLED  installed as a real file. Lands inert; an install
+                    activates, and that obligation has no ledger (SABLE-3zjc1).
+    INERT           nothing installed corresponds to it (tests, CI scripts,
+                    docs). Lands and takes effect with no activation step.
+  The BEAD verdict is the WORST CASE across its paths — one hot-swap path holds
+  the whole branch.
+
+  THE DERIVATION IS MECHANICAL, NEVER A LIST. The install state is resolved at
+  screen time by walking the install roots and realpath()-ing each artifact
+  against `git worktree list`. A hand-maintained catalogue of which bins are
+  symlinks is the SABLE-hadqx failure this fleet keeps repeating (SABLE-ev5i5
+  three resolver mirrors, SABLE-e535u a hand-enumerated lane, SABLE-r69ho
+  hardcoded pane ids in a stall probe that therefore could not detect a stall).
+  An install layout that CAN change WILL change. Only the install ROOTS — where
+  installers write — are configured, and they are overridable.
+
+  IT MUST NOT BE NOISY and IT MUST NOT GUESS, in that order of temptation. A
+  fully-inert footprint produces NO warning and exits 0; a screen that warns on
+  every dispatch gets ignored, which is worse than absent (the SABLE-r5pfw
+  erosion). But a token it cannot classify is COULD-NOT-ASSESS, NEVER inert —
+  INERT is a positive claim ("this activates on nothing"), and defaulting to it
+  fails PERMISSIVE. That direction is not hypothetical: the hand-run this bead
+  replaces decided path-ness by testing for a slash, and SABLE-p0grx declares
+  the token `wk-runlock-instrument/land).` — a phantom WITH a slash, which
+  matches no installed artifact and so classified INERT, pushing the bead
+  TOWARD the landable list. A declared path that does not exist in the repo is
+  therefore COULD-NOT-ASSESS (phantom or to-be-created, and both need saying
+  out loud), never INERT. 19 of 67 open beads carrying a footprint section
+  parsed to phantoms at the time this was specified — dirty input is the
+  normal case, not the anomaly.
+
+  THE SECTION TRICHOTOMY IS PRESERVED: ABSENT ("declares nothing" — legitimate,
+  dispatches normally, no warning), PRESENT-BUT-UNREADABLE (prose that yields
+  no path token — e.g. writing "(none — ...)" inside the section, which parses
+  to the tokens "(none" and "it"), and POPULATED are three inputs, not two.
+
+  TOKENIZATION IS BORROWED, NOT REBUILT — see _footprint_section() below.
+
+NO PROSE FALLBACK IN dispatch/holds (intentional — do not add one)
+------------------------------------------------------------------
+Both of those screens read metadata.wip_claims / metadata.footprint_writes and STOP.
 An earlier prototype of the dispatch screen fell back to parsing a bead's
 '## File footprint' prose section when metadata was absent, and that
 fallback manufactured junk tokens ("bin/sable-spawn-worker's",
@@ -121,6 +182,16 @@ claims — a false "the corpus is corrupted" signal that was actually the
 parser's own artifact (same class as SABLE-r5pfw: mentioning something is
 not the same as it being true). A bead with no structured declaration gets
 NO-DECLARATION here, never a best-effort guess reconstructed from prose.
+
+`activation` DOES read the prose section, and that is not an inconsistency:
+the two screens fail in opposite directions on a junk token. A junk token in a
+COLLISION screen manufactures a false overlap — a deny nobody can act on. The
+same token in a LANDABILITY screen matches no installed artifact, so treating
+it as a path would manufacture a false LANDABLE. `activation` therefore
+consumes the prose section but classifies an unrecognised token, and a path
+absent from the repo, as COULD-NOT-ASSESS rather than as a real path or as
+inert — which turns the junk into an honest non-answer instead of either kind
+of false verdict.
 
 LIMIT 0
 -------
@@ -140,22 +211,37 @@ last of a repeated --status and drops the rest silently (SABLE-4t97d).
 Usage:
   sable-screen dispatch <bead-id> [<bead-id> ...] [--repo DIR] [--format text|json]
   sable-screen holds [--repo DIR] [--format text|json]
+  sable-screen activation [<bead-id> ...] [--ready] [--install-root DIR]...
+                          [--repo DIR] [--format text|json]
 
 Exit codes:
-  dispatch: 0 every candidate is dispatchable (clear/no-declaration, and
-            not blocked), 1 at least one COLLIDES, SIBLING-COLLISION, or
-            BLOCKED, 2 a candidate bead id could not be read at all.
-  holds:    0 no NEEDS-HOLD findings, 1 at least one.
+  dispatch:   0 every candidate is dispatchable (clear/no-declaration, and
+              not blocked), 1 at least one COLLIDES, SIBLING-COLLISION, or
+              BLOCKED, 2 a candidate bead id could not be read at all.
+  holds:      0 no NEEDS-HOLD findings, 1 at least one.
+  activation: 0 every bead is landable (or declares nothing), 1 at least one
+              HOLD-EXPECTED, 2 at least one COULD-NOT-ASSESS or unreadable
+              bead id. 2 outranks 1: "the screen could not do its job" is a
+              different call to action from "the screen did its job and the
+              answer is no", and the louder code belongs to the one a reader
+              must not silently treat as answered.
 
 Env overrides (test seams, mirroring SABLE_CONTAINED_GIT / SABLE_MG_GIT):
-  SABLE_SCREEN_GIT   git binary/wrapper (default: git)
-  SABLE_SCREEN_BD    bd binary/wrapper (default: bd)
+  SABLE_SCREEN_GIT             git binary/wrapper (default: git)
+  SABLE_SCREEN_BD              bd binary/wrapper (default: bd)
+  SABLE_SCREEN_INSTALL_ROOTS   os.pathsep-separated install roots for
+                               `activation` (default: see DEFAULT install
+                               roots below). Set to a scratch prefix in tests
+                               — SABLE-2avau records an installer silently
+                               targeting the live ~/.claude and SABLE-k0nvp a
+                               pinning suite polluting the real ~/.local twice.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -552,6 +638,543 @@ def hold_verdict_for_bead(repo: str, integration_ref: str, branch: str,
     return verdict, fields_
 
 
+# =============================================================================
+# ACTIVATION SHAPE — the landability screen (SABLE-6eu9w)
+# =============================================================================
+
+# Path-level activation classes. The RANK is the whole point: a bead's verdict
+# is the worst case across its paths, because one hot-swap path holds the whole
+# branch. COULD-NOT-ASSESS sits ABOVE the two inert-but-owing classes and BELOW
+# hot-swap: an unknown must not be quietly reported as landable, but neither
+# should it mask a hot-swap path we DID resolve.
+HOT_SWAP = "hot-swap"
+HOT_SWAP_CLOSURE = "hot-swap-closure"
+PIN_MANAGED = "pin-managed"
+COPY_INSTALLED = "copy-installed"
+INERT = "inert"
+PATH_UNASSESSED = "could-not-assess"
+
+_ACTIVATION_RANK = {INERT: 0, COPY_INSTALLED: 1, PIN_MANAGED: 2,
+                    PATH_UNASSESSED: 3, HOT_SWAP_CLOSURE: 4, HOT_SWAP: 5}
+
+# Bead-level verdicts.
+LANDABLE = "landable"
+LANDABLE_OWES_ACTIVATION = "landable-owes-activation"
+ACTIVATION_UNASSESSED = "could-not-assess"
+HOLD_EXPECTED = "hold-expected"
+NO_FOOTPRINT = "no-declaration"
+
+_VERDICT_FOR_CLASS = {
+    INERT: LANDABLE,
+    COPY_INSTALLED: LANDABLE_OWES_ACTIVATION,
+    PIN_MANAGED: LANDABLE_OWES_ACTIVATION,
+    PATH_UNASSESSED: ACTIVATION_UNASSESSED,
+    HOT_SWAP_CLOSURE: HOLD_EXPECTED,
+    HOT_SWAP: HOLD_EXPECTED,
+}
+
+# Section states (the SABLE-47try trichotomy, kept as three inputs not two).
+SECTION_ABSENT = "absent"
+SECTION_UNREADABLE = "present-but-unreadable"
+SECTION_EMPTY = "declared-empty"
+SECTION_DECLARED = "declared"
+SECTION_FIELD = "declared-field"
+
+
+def _footprint_section(bead: dict) -> tuple:
+    """(section_state, entries, unparsed) for ONE bead's declared writes.
+
+    TOKENIZATION IS BORROWED, NEVER REBUILT. sable_footprint_lib is the single
+    owner of footprint tokenization for this repo, and a screen carrying its
+    own private token filter is the SABLE-ev5i5 three-mirror disease — the one
+    that cost a full investigation on 2026-07-26. This deliberately consumes
+    the lib's section reader instead of re-deriving a weaker one, so it
+    inherits whatever that parser decides, including SABLE-g0elq's
+    path_tokens() filter-plus-diagnostic once it lands.
+
+    The names bound here are private today because the lib's only public
+    footprint entry point, parse_declared_footprint(), discards the two facts
+    this screen needs: whether the heading was present AT ALL (absent means
+    "declares nothing", which is legitimate and must not read as a finding),
+    and which tokens the parser could NOT recognise as paths. declared_reads()
+    inside the lib reaches for _collect_section for exactly this reason and
+    documents it; this is the same reach from one module out. The import is
+    LATE so that a rename upstream breaks only this subcommand, loudly, instead
+    of taking `dispatch` and `holds` — which never touch the lib — down with it.
+
+    Structured-field precedence mirrors the lib's own declared_footprint():
+    metadata.footprint_writes, when present, is used VERBATIM and the prose
+    parser is not consulted. `bd show --json` carries that metadata; `bd ready
+    --json` does not, so pool-wide screening runs on prose, which is precisely
+    the input the phantom correction is about.
+    """
+    import sable_footprint_lib as fp_lib
+
+    structured = fp_lib._metadata_entries(bead.get("metadata") or {},
+                                          "footprint_writes")
+    if structured is not None:
+        state = SECTION_FIELD if structured else SECTION_EMPTY
+        return state, frozenset(structured), frozenset()
+    found, entries, dropped = fp_lib._collect_section(
+        bead.get("description") or "", fp_lib._FOOTPRINT_HEADING)
+    if not found:
+        return SECTION_ABSENT, frozenset(), frozenset()
+    if not entries:
+        # Present, and yields no path token. Two sub-cases collapse here on
+        # purpose: a deliberate lone 'none' marker (dropped is empty — a real
+        # "declared, and empty" answer) and a prose paragraph the parser could
+        # not read (dropped is not empty — SABLE-47try's unreadable state).
+        return (SECTION_EMPTY if not dropped else SECTION_UNREADABLE), \
+            frozenset(), dropped
+    return SECTION_DECLARED, entries, dropped
+
+
+# --- install-state resolution (resolved live, never enumerated) -------------
+
+@dataclass(frozen=True)
+class InstalledArtifact:
+    """One thing an installer wrote into an install root."""
+    path: str      # absolute path of the installed entry
+    root: str      # the install root it was found under
+    rel: str       # its path relative to that root
+    target: str    # os.path.realpath(path) — where it ACTUALLY resolves
+    linked: bool   # the entry (or a component of it) is a symlink
+
+
+@dataclass(frozen=True)
+class InstallScan:
+    artifacts: tuple = ()
+    scanned: tuple = ()      # roots that existed and were read completely
+    unreadable: tuple = ()   # roots that exist but could not be fully read
+    absent: tuple = ()       # roots that are simply not there
+
+
+def default_install_roots() -> tuple:
+    """Where THIS methodology's installers write — sable-bin-install's DEST
+    (~/.local/bin) and install.sh's destinations under CLAUDE_DIR.
+
+    This is a list of DESTINATIONS, not a classification: it says where to
+    LOOK, and every verdict is still resolved from what is actually found
+    there. That distinction is the whole SABLE-hadqx line — a hardcoded list
+    of which bins are symlinks rots the moment someone pins one; a list of
+    directories installers write to changes only when the installers do.
+    CLAUDE_DIR's subdirectories are named rather than walking CLAUDE_DIR
+    itself, which also holds ~/.claude/projects and the .install-bak-* trees —
+    tens of thousands of files that no installer sourced from this repo."""
+    home = os.path.expanduser("~")
+    claude = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home, ".claude")
+    return (
+        os.path.join(home, ".local", "bin"),
+        os.path.join(claude, "hooks"),
+        os.path.join(claude, "agents"),
+        os.path.join(claude, "skills"),
+        os.path.join(claude, "commands"),
+        os.path.join(claude, "bin"),
+    )
+
+
+def configured_install_roots(override=None) -> tuple:
+    """CLI flag > SABLE_SCREEN_INSTALL_ROOTS > defaults.
+
+    An env var set to the EMPTY string yields no roots, which this reports as
+    a scan with nothing scanned — i.e. COULD-NOT-ASSESS, not "nothing is
+    installed". A test that wants "nothing is installed" points the seam at an
+    empty scratch directory, which is a real (and readable) answer."""
+    if override:
+        return tuple(override)
+    raw = os.environ.get("SABLE_SCREEN_INSTALL_ROOTS")
+    if raw is not None:
+        return tuple(p for p in raw.split(os.pathsep) if p.strip())
+    return default_install_roots()
+
+
+def scan_install_roots(roots) -> InstallScan:
+    """Walk every install root and record what is there, with each entry
+    resolved through readlink -f (os.path.realpath).
+
+    A root is walked at its REALPATH so that a symlinked ancestor (e.g. a
+    /home that is itself a link) does not make every entry beneath it look
+    linked. Symlinked DIRECTORIES are recorded as artifacts in their own right
+    and not descended into: a skill directory linked into the repo is one
+    hot-swap artifact, not a hundred.
+
+    A root that does not exist is `absent` — an installer that was never run
+    contributes nothing and that is a real answer. A root that exists but
+    cannot be fully read is `unreadable`, which the caller turns into
+    COULD-NOT-ASSESS: an unreadable install prefix is NOT "nothing is
+    installed" (the standing silent-instrument contract)."""
+    artifacts: list = []
+    scanned: list = []
+    unreadable: list = []
+    absent: list = []
+    for raw_root in roots:
+        root = os.path.realpath(os.path.expanduser(raw_root))
+        if not os.path.isdir(root):
+            absent.append(root)
+            continue
+        errors: list = []
+        try:
+            for dirpath, dirnames, filenames in os.walk(
+                    root, followlinks=False, onerror=errors.append):
+                linked_dirs = [d for d in dirnames
+                               if os.path.islink(os.path.join(dirpath, d))]
+                for d in linked_dirs:
+                    dirnames.remove(d)
+                for name in filenames + linked_dirs:
+                    path = os.path.join(dirpath, name)
+                    target = os.path.realpath(path)
+                    artifacts.append(InstalledArtifact(
+                        path=path, root=root,
+                        rel=os.path.relpath(path, root),
+                        target=target,
+                        linked=target != path))
+        except OSError as exc:               # pragma: no cover - defensive
+            errors.append(exc)
+        (unreadable if errors else scanned).append(root)
+    return InstallScan(tuple(artifacts), tuple(scanned), tuple(unreadable),
+                       tuple(absent))
+
+
+def worktree_roots(repo: str):
+    """Every live working tree of THIS repo, from `git worktree list
+    --porcelain` — or None when git cannot answer.
+
+    This is what makes HOT-SWAP mechanical. The installed symlinks point at
+    whichever tree the operator installed from (usually the main worktree, not
+    the caller's), so "resolves into the working tree" can only be decided
+    against the FULL set of trees. None (git failed, or the answer was empty)
+    is a non-answer, never a guess: silently missing the main worktree would
+    reclassify every live symlink as PIN-MANAGED, i.e. downgrade a hold to a
+    landable — the one direction this screen must not fail in."""
+    cp = _git(repo, "worktree", "list", "--porcelain")
+    if cp.returncode != 0:
+        return None
+    roots = [os.path.realpath(line[len("worktree "):].strip())
+             for line in cp.stdout.splitlines()
+             if line.startswith("worktree ")]
+    return tuple(dict.fromkeys(roots)) or None
+
+
+def _under_any(path: str, roots) -> bool:
+    return any(path == r or path.startswith(r.rstrip(os.sep) + os.sep)
+               for r in roots)
+
+
+def artifact_class(art: InstalledArtifact, tree_roots) -> str:
+    """The activation shape of ONE installed artifact.
+
+    Resolved, in this order, from facts about the artifact itself:
+      resolves INTO a live working tree  -> HOT-SWAP     (the pull activates)
+      resolves elsewhere, via a link     -> PIN-MANAGED  (a re-pin activates)
+      is a real file                     -> COPY-INSTALLED (an install activates)
+    PIN-MANAGED is defined as "linked, but not into a live tree" rather than
+    "under ~/.local/lib/sable-<sha>/", so it needs no knowledge of the pinning
+    layout and survives that layout changing. Note gate-closure membership is a
+    SEPARATE question from being pinned, and is not answered here."""
+    if _under_any(art.target, tree_roots):
+        return HOT_SWAP
+    return PIN_MANAGED if art.linked else COPY_INSTALLED
+
+
+# --- the live import closure (SABLE-9boz4's hazard, read forwards) ----------
+
+# Deliberately NARROW. Only an IMPORT or a SOURCE statement counts, never a
+# mention: a docstring naming a test file is not a dependency, and the loose
+# "same directory" and "appears anywhere in the text" rules were both measured
+# against this repo's bin/ before being rejected — same-directory pulls in every
+# test file (making every bin/ bead read HOLD-EXPECTED, which destroys the
+# negative control), and word-mention pulls in 6 test files that live bins merely
+# name in prose. The narrow rule adds exactly the 23 sibling libraries and zero
+# test files.
+_PY_IMPORT = re.compile(r"^[ \t]*(?:from|import)[ \t]+([A-Za-z_]\w*)", re.M)
+_SH_SOURCE = re.compile(
+    r"(?:^|[ \t;])(?:source|\.)[ \t]+[^\n]*?([\w.-]+\.(?:sh|bash))", re.M)
+
+# A file bigger than this is not a script this closure is about; skipping it
+# bounds the read cost of a directory that happens to hold a large artifact.
+_CLOSURE_MAX_BYTES = 512 * 1024
+
+
+class ClosureIndex:
+    """Which repo files are ALREADY LIVE because a hot-swap artifact imports
+    them (SABLE-6eu9w, found while smoke-testing this screen against the real
+    install state).
+
+    A hot-swap symlink activates its whole IMPORT CLOSURE, not just the one
+    file the symlink names — sable-bin-install's own docstring records the
+    other half of this (copying just the entry point severs the sibling
+    imports, which broke a smoke test and was rolled back live). So a bead
+    touching only bin/sable_footprint_lib.py — which no installer links, and
+    which therefore matches no artifact — would read LANDABLE while in fact
+    sable-spawn-worker imports it through a live symlink and the branch is
+    held. That is the SAME permissive direction the phantom correction is
+    about, reached from the other side: a file can activate on pull without
+    being installed.
+
+    The closure is RESOLVED, not listed: the seeds are wherever hot-swap
+    targets actually landed, and the edges are read out of the files
+    themselves at screen time. Scope is one directory — sibling imports are
+    how every seed in this repo reaches its libraries (Python inserts the
+    script's own dir on sys.path; the shell hooks source `$(dirname)/lib-*.sh`)
+    — and it is transitive within it, so a lib reached only through another
+    lib is still caught."""
+
+    def __init__(self, repo_root: str, seeds: dict):
+        self.repo_root = repo_root
+        self.seeds = seeds          # repo-relative dir -> {basename, ...}
+        self._cache: dict = {}
+
+    def members(self, reldir: str) -> frozenset:
+        if reldir not in self._cache:
+            self._cache[reldir] = self._compute(reldir)
+        return self._cache[reldir]
+
+    def _compute(self, reldir: str) -> frozenset:
+        seeds = self.seeds.get(reldir)
+        if not seeds:
+            return frozenset()
+        directory = os.path.join(self.repo_root, reldir) if reldir else self.repo_root
+        texts: dict = {}
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return frozenset()
+        for name in names:
+            path = os.path.join(directory, name)
+            try:
+                if not os.path.isfile(path) or os.path.getsize(path) > _CLOSURE_MAX_BYTES:
+                    continue
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    texts[name] = fh.read()
+            except OSError:
+                continue
+        closure = set(seeds)
+        frontier = set(seeds)
+        while frontier:
+            nxt: set = set()
+            for name in frontier:
+                for ref in self._refs(texts.get(name, ""), texts):
+                    if ref not in closure:
+                        nxt.add(ref)
+            closure |= nxt
+            frontier = nxt
+        return frozenset(closure - set(seeds))
+
+    @staticmethod
+    def _refs(text: str, texts: dict) -> set:
+        out = set()
+        for module in _PY_IMPORT.findall(text):
+            if module + ".py" in texts:
+                out.add(module + ".py")
+        for name in _SH_SOURCE.findall(text):
+            if name in texts:
+                out.add(name)
+        return out
+
+
+def hot_swap_seeds(scan: InstallScan, tree_roots) -> dict:
+    """{repo-relative dir: {basename, ...}} for every artifact that resolves
+    into a live tree — the closure's seeds, read off the resolved targets so
+    they move when the install layout does."""
+    seeds: dict = {}
+    for art in scan.artifacts:
+        if artifact_class(art, tree_roots) != HOT_SWAP:
+            continue
+        root = next((r for r in tree_roots if _under_any(art.target, [r])), None)
+        if root is None:                     # pragma: no cover - defensive
+            continue
+        rel = os.path.relpath(art.target, root)
+        seeds.setdefault(os.path.dirname(rel), set()).add(os.path.basename(rel))
+    return seeds
+
+
+def _rel_suffix_match(repo_rel: str, install_rel: str) -> bool:
+    """Does an artifact installed at <root>/<install_rel> correspond to the
+    repo path <repo_rel>?
+
+    Matched on a whole-component suffix, which covers both install layouts
+    without naming either: the flat one (bin/sable-doctor -> ~/.local/bin/
+    sable-doctor) and the mirrored one (hooks/multi-manager/x.sh ->
+    ~/.claude/hooks/multi-manager/x.sh). It is the ONLY way a PIN-MANAGED or
+    COPY-INSTALLED artifact can be attributed to a repo path at all: those do
+    not resolve back into the tree, so exact-target matching cannot see them.
+    A false match here over-reports (a copy owing an install), never under."""
+    if not install_rel or install_rel.startswith(".."):
+        return False
+    return repo_rel == install_rel or repo_rel.endswith("/" + install_rel)
+
+
+def classify_repo_path(rel: str, repo_root: str, scan: InstallScan,
+                       tree_roots, closure: "ClosureIndex | None" = None) -> tuple:
+    """(klass, evidence, reason) for ONE repo-relative path.
+
+    An artifact is attributed to this path either because it RESOLVES to it
+    (the same repo-relative path under any live tree — this is the leg that
+    catches hot-swaps) or because its installed-relative path is a
+    whole-component suffix of it (the leg that catches pins and copies).
+
+    A path that does not EXIST in the repo contributes COULD-NOT-ASSESS
+    (SABLE-35mqf's gate): it is either a phantom scraped out of prose or a
+    file the bead will create, and both need saying out loud. Reporting it
+    INERT is the permissive failure the hand-run made — a phantom matches no
+    installed artifact, so it would push the bead toward the landable list.
+    Because the classes are RANKED rather than sequenced, a dangling installed
+    symlink pointing at a not-yet-existing path still reads HOT-SWAP: the fact
+    we resolved outranks the fact we could not."""
+    if os.path.isabs(rel) or rel.startswith("../") or not rel:
+        return PATH_UNASSESSED, (), "not a repo-relative path"
+    candidates = {os.path.realpath(os.path.join(root, rel))
+                  for root in tree_roots}
+    hits = [a for a in scan.artifacts
+            if a.target in candidates or _rel_suffix_match(rel, a.rel)]
+    classes = [(artifact_class(a, tree_roots), a) for a in hits]
+    exists = os.path.exists(os.path.join(repo_root, rel))
+    if not exists:
+        classes.append((PATH_UNASSESSED, None))
+    if closure is not None and os.path.basename(rel) in closure.members(
+            os.path.dirname(rel)):
+        classes.append((HOT_SWAP_CLOSURE, None))
+    if not classes:
+        return INERT, (), "no installed artifact resolves to it"
+    klass = max((k for k, _ in classes), key=lambda k: _ACTIVATION_RANK[k])
+    evidence = tuple(sorted(a.path for k, a in classes
+                            if a is not None and k == klass))
+    reason = {
+        HOT_SWAP: "installed artifact resolves into a live working tree — "
+                  "the pull IS the activation",
+        HOT_SWAP_CLOSURE: "not installed itself, but imported/sourced by a "
+                          "hot-swap artifact beside it — the pull activates "
+                          "the whole import closure",
+        PIN_MANAGED: "installed as a symlink into a pinned snapshot — lands "
+                     "inert; a re-pin activates",
+        COPY_INSTALLED: "installed as a real file — lands inert; an install "
+                        "activates (obligation has no ledger, SABLE-3zjc1)",
+        PATH_UNASSESSED: "no such path in the repo — phantom token or a file "
+                         "this bead creates; NOT assumed inert",
+    }[klass]
+    return klass, evidence, reason
+
+
+def expand_entry(repo_root: str, entry: str) -> tuple:
+    """(paths, resolvable) for one declared entry.
+
+    A concrete path expands to itself. A directory entry (the trailing-slash
+    form only planner-declared footprints produce) expands to every file
+    beneath it, so a declared directory is classified by what is actually IN
+    it rather than by a guess about the directory as a whole."""
+    rel = entry.rstrip("/")
+    # An absolute or escaping entry is not resolvable AND must not be walked:
+    # expanding '../' would classify files outside the repo entirely.
+    if os.path.isabs(rel) or not rel or rel.startswith("../") or rel == "..":
+        return (rel,), False
+    target = os.path.join(repo_root, rel)
+    if os.path.isdir(target):
+        out = []
+        for dirpath, dirnames, filenames in os.walk(target):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+            for name in filenames:
+                out.append(os.path.relpath(os.path.join(dirpath, name),
+                                           repo_root))
+        return tuple(sorted(out)), True
+    return (rel,), True
+
+
+@dataclass(frozen=True)
+class ActivationVerdict:
+    bead_id: str
+    verdict: str
+    section: str
+    paths: tuple = ()        # ({"path", "class", "installed", "reason"}, ...)
+    unparsed: tuple = ()
+    note: str = ""
+    title: str = ""
+
+
+def activation_for_bead(bead: dict, repo_root: str, scan: InstallScan,
+                        tree_roots, blocked: str = "",
+                        closure: "ClosureIndex | None" = None) -> ActivationVerdict:
+    """The whole landability story for ONE bead.
+
+    `blocked` is a non-empty reason when the install state itself could not be
+    resolved (no readable install root, or git could not enumerate the
+    worktrees). Every DECLARED bead then reads COULD-NOT-ASSESS — a broken
+    instrument reports that it is broken rather than reporting that nothing
+    activates. A bead that declares nothing is unaffected: there was nothing
+    to assess either way, which is why NO-DECLARATION is its own verdict and
+    not a flavour of landable."""
+    bead_id = bead.get("id") or ""
+    title = (bead.get("title") or "")[:80]
+    section, entries, unparsed = _footprint_section(bead)
+    if section == SECTION_ABSENT:
+        return ActivationVerdict(
+            bead_id, NO_FOOTPRINT, section, (), (),
+            "declares no footprint — nothing to assess, dispatches normally",
+            title)
+    if blocked:
+        return ActivationVerdict(bead_id, ACTIVATION_UNASSESSED, section,
+                                 (), tuple(sorted(unparsed)), blocked, title)
+
+    rows = []
+    ranks = []
+    for entry in sorted(entries):
+        expanded, resolvable = expand_entry(repo_root, entry)
+        if not resolvable:
+            rows.append({"path": entry, "class": PATH_UNASSESSED,
+                         "installed": [],
+                         "reason": "not a repo-relative path"})
+            ranks.append(PATH_UNASSESSED)
+            continue
+        for rel in expanded:
+            klass, evidence, reason = classify_repo_path(
+                rel, repo_root, scan, tree_roots, closure)
+            rows.append({"path": rel, "class": klass,
+                         "installed": list(evidence), "reason": reason})
+            ranks.append(klass)
+    if unparsed:
+        # A token the borrowed tokenizer could not recognise as a path is a
+        # partially-understood declaration, and the write side has no
+        # mechanical fallback here the way sable_footprint_lib's does. Same
+        # ruling as SABLE-zx2yv on the read side: present-but-incomplete is
+        # not "declared, and complete".
+        ranks.append(PATH_UNASSESSED)
+    if not ranks:
+        # Declared, explicitly empty. A real answer ("this activates on
+        # nothing"), distinct from an absent section.
+        return ActivationVerdict(bead_id, LANDABLE, section, (), (),
+                                 "declared an empty footprint", title)
+    worst = max(ranks, key=lambda k: _ACTIVATION_RANK[k])
+    verdict = _VERDICT_FOR_CLASS[worst]
+    note = {
+        HOLD_EXPECTED: "landing ACTIVATES an installed artifact — expect a "
+                       "hold for activation shape, not for any defect",
+        LANDABLE_OWES_ACTIVATION: "lands inert, but owes an activation step "
+                                  "(re-pin / install) to take effect",
+        ACTIVATION_UNASSESSED: "at least one declared token could not be "
+                               "classified — not assumed inert",
+        LANDABLE: "every declared path is inert — lands and takes effect with "
+                  "no activation step",
+    }[verdict]
+    return ActivationVerdict(bead_id, verdict, section, tuple(rows),
+                             tuple(sorted(unparsed)), note, title)
+
+
+def scan_problem(scan: InstallScan, tree_roots) -> str:
+    """The instrument's own health, as a reason string ("" when healthy)."""
+    if scan.unreadable:
+        return ("install root(s) present but unreadable: "
+                f"{', '.join(scan.unreadable)} — an unreadable prefix is NOT "
+                "'nothing is installed'")
+    if not scan.scanned:
+        return ("no readable install root "
+                f"(absent: {', '.join(scan.absent) or 'none configured'}) — "
+                "cannot tell an uninstalled repo from an unresolvable one")
+    if not tree_roots:
+        return ("`git worktree list` could not enumerate this repo's working "
+                "trees — hot-swap and pin-managed are indistinguishable "
+                "without them")
+    return ""
+
+
 # --- bd-touching orchestration ------------------------------------------------
 
 def build_occupants(repo: str, integration_ref: str, exclude_ids) -> dict:
@@ -670,6 +1293,88 @@ def run_holds(repo: str) -> tuple[list, str]:
     return results, integration_ref
 
 
+def run_activation(repo: str, bead_ids: list, ready: bool = False,
+                   roots=None) -> tuple:
+    """(results, meta) for the activation screen.
+
+    ONE bulk `bd ready --json --limit 0` for the pool form, and one `bd show`
+    per explicitly named bead. The first hand-run of this screen called a
+    per-bead footprint reader and shelled bd ~460 times; it did not finish
+    inside two minutes. Parsing is in-process for exactly that reason — and the
+    install state is scanned ONCE for the whole invocation, not per bead.
+
+    --limit 0 is mandatory here for the same reason it is everywhere else in
+    this file (SABLE-52aym: a bare `bd ready` truncates at 50 SILENTLY), and it
+    fails in the releasing direction: beads past the cap would simply never be
+    screened, and a pool screen that quietly covers the first 50 of 486 looks
+    exactly like one that covered them all."""
+    scan = scan_install_roots(configured_install_roots(roots))
+    trees = worktree_roots(repo) or ()
+    blocked = scan_problem(scan, trees)
+    repo_root = os.path.realpath(repo)
+    closure = ClosureIndex(repo_root, hot_swap_seeds(scan, trees))
+
+    results = []
+    seen = set()
+    beads = []
+    for bid in bead_ids:
+        if bid in seen:
+            continue
+        seen.add(bid)
+        record = _bd_json(repo, "show", bid, "--json")
+        if not record:
+            results.append({"bead_id": bid, "verdict": "not-found",
+                            "section": "", "paths": [], "unparsed": [],
+                            "note": "bead could not be read", "title": ""})
+            continue
+        beads.append(record[0])
+    if ready:
+        rows = _bd_json(repo, "ready", "--json", "--limit", "0")
+        if rows is None:
+            results.append({"bead_id": "--ready", "verdict": "not-found",
+                            "section": "", "paths": [], "unparsed": [],
+                            "note": "`bd ready --json --limit 0` unreadable",
+                            "title": ""})
+            rows = []
+        for row in rows:
+            if (row.get("id") or "") in seen:
+                continue
+            seen.add(row.get("id") or "")
+            beads.append(row)
+
+    for bead in beads:
+        v = activation_for_bead(bead, repo_root, scan, trees, blocked, closure)
+        results.append({"bead_id": v.bead_id, "title": v.title,
+                        "verdict": v.verdict, "section": v.section,
+                        "paths": [dict(p) for p in v.paths],
+                        "unparsed": list(v.unparsed), "note": v.note})
+    meta = {
+        "install_roots_scanned": list(scan.scanned),
+        "install_roots_absent": list(scan.absent),
+        "install_roots_unreadable": list(scan.unreadable),
+        "installed_artifacts": len(scan.artifacts),
+        "worktrees": list(trees),
+        "blocked": blocked,
+    }
+    return results, meta
+
+
+def activation_exit_code(results: list) -> int:
+    """2 could-not-assess / unreadable bead, 1 hold-expected, else 0.
+
+    2 OUTRANKS 1 deliberately. Both are non-zero, so a caller gating on success
+    refuses either way; the difference is what a human does next. "The screen
+    did its job and the answer is no" is actionable (bundle it into an operator
+    window). "The screen could not do its job" is not, and must not be able to
+    hide behind a verdict that looks decided."""
+    if any(r["verdict"] in (ACTIVATION_UNASSESSED, "not-found")
+           for r in results):
+        return 2
+    if any(r["verdict"] == HOLD_EXPECTED for r in results):
+        return 1
+    return 0
+
+
 # --- rendering ----------------------------------------------------------------
 
 _DISPATCH_ICON = {NO_DECLARATION: "⚠", CLEAR: "✓", COLLIDES: "✗",
@@ -724,6 +1429,56 @@ def _render_readiness(r: dict) -> list:
     return []
 
 
+_ACTIVATION_ICON = {HOLD_EXPECTED: "✗", LANDABLE: "✓",
+                    LANDABLE_OWES_ACTIVATION: "◐",
+                    ACTIVATION_UNASSESSED: "?", NO_FOOTPRINT: "⚠"}
+
+
+def render_activation_text(results: list, meta: dict) -> str:
+    """Text form. A LANDABLE bead prints ONE line and no paths — the negative
+    control has to be quiet in the OUTPUT too, not merely in the exit code, or
+    the screen becomes the wall of text managers learn to skip past."""
+    lines = [
+        f"install roots: {', '.join(meta['install_roots_scanned']) or '(none)'}"
+        f"  [{meta['installed_artifacts']} artifact(s)]",
+        f"live working trees: {len(meta['worktrees'])}",
+    ]
+    if meta["install_roots_unreadable"]:
+        lines.append("UNREADABLE install root(s): "
+                     f"{', '.join(meta['install_roots_unreadable'])}")
+    if meta.get("blocked"):
+        lines.append(f"*** INSTRUMENT DEGRADED: {meta['blocked']} ***")
+    lines.append("")
+
+    for r in results:
+        icon = _ACTIVATION_ICON.get(r["verdict"], "?")
+        lines.append(f"{icon} {r['bead_id']} [{r['verdict'].upper()}] "
+                     f"{r.get('title', '')}".rstrip())
+        if r["verdict"] in (LANDABLE, NO_FOOTPRINT):
+            lines.append(f"    {r['note']}")
+            lines.append("")
+            continue
+        by_class: dict = {}
+        for p in r.get("paths") or []:
+            by_class.setdefault(p["class"], []).append(p)
+        for klass in sorted(by_class, key=lambda k: -_ACTIVATION_RANK[k]):
+            for p in by_class[klass]:
+                installed = (" ← " + ", ".join(p["installed"])
+                             if p["installed"] else "")
+                lines.append(f"    {klass:>15s}  {p['path']}{installed}")
+            if klass != INERT:
+                lines.append(f"    {'':>15s}  ({by_class[klass][0]['reason']})")
+        if r.get("unparsed"):
+            lines.append(f"    {'unparsed token':>15s}  "
+                         f"{', '.join(r['unparsed'])}")
+            lines.append(f"    {'':>15s}  (not recognised as a path — the "
+                         f"declaration is only partly understood, so it is "
+                         f"NOT reported inert)")
+        lines.append(f"    → {r['note']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def render_holds_text(results: list, integration_ref: str) -> str:
     needs = [r for r in results if r["verdict"] == NEEDS_HOLD]
     other = [r for r in results if r["verdict"] != NEEDS_HOLD]
@@ -775,12 +1530,38 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--repo", default=os.getcwd())
     h.add_argument("--format", choices=["text", "json"], default="text")
 
+    a = sub.add_parser("activation",
+                       help="pre-dispatch landability screen (SABLE-6eu9w)")
+    a.add_argument("bead_ids", nargs="*", metavar="BEAD-ID")
+    a.add_argument("--ready", action="store_true",
+                   help="also screen every bead in `bd ready --limit 0`")
+    a.add_argument("--install-root", action="append", dest="install_roots",
+                   metavar="DIR",
+                   help="install root to resolve against (repeatable); "
+                        "overrides SABLE_SCREEN_INSTALL_ROOTS")
+    a.add_argument("--repo", default=os.getcwd())
+    a.add_argument("--format", choices=["text", "json"], default="text")
+
     return parser
 
 
 def main(argv: list | None = None) -> int:
     args = build_parser().parse_args(argv)
     repo = os.path.abspath(args.repo)
+
+    if args.cmd == "activation":
+        if not args.bead_ids and not args.ready:
+            print("sable-screen activation: name at least one bead id, or "
+                  "pass --ready to screen the whole ready pool",
+                  file=sys.stderr)
+            return 2
+        results, meta = run_activation(repo, args.bead_ids, args.ready,
+                                       args.install_roots)
+        if args.format == "json":
+            print(json.dumps({"meta": meta, "results": results}, indent=2))
+        else:
+            print(render_activation_text(results, meta))
+        return activation_exit_code(results)
 
     if args.cmd == "dispatch":
         results, integration_ref = run_dispatch(repo, args.bead_ids)
