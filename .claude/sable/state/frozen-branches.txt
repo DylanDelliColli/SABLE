@@ -1,0 +1,23 @@
+# frozen-branches.txt — branches under a standing do-not-push/do-not-merge
+# ruling (SABLE-xgb29). TRACKED ON PURPOSE: this is doctrine, not runtime state.
+#
+# WHY THIS FILE EXISTS. A prohibition that lives only in bead prose can bind a
+# reader and nothing else. Every mechanical actor — sable-recover's push plan,
+# the merge hand-off, any future push-proposing path — executes without ever
+# seeing it. This is the machine-readable form, so the ruling reaches the tools.
+# It is read by bin/sable-recover (see FROZEN_RELPATH there), which must work
+# with bd absent, so this is a plain file and NOT a bead query.
+#
+# FORMAT — one branch per line:
+#   <branch>  <ruling-bead-id>  <reason>
+# Blank lines and #-comments are ignored. A line that names no ruling bead still
+# FREEZES its branch (a freeze is never dropped for being malformed) but warns
+# loudly, because a freeze the report cannot attribute is a freeze nobody can
+# lift on the record.
+#
+# ADDING a line freezes a branch. REMOVING one releases it — a release is an
+# operator ruling and belongs in a commit of its own, citing the bead that
+# lifted it. Do not tidy entries away because a branch "looks reaped": the
+# entry is what keeps the ruling true if the branch ever comes back.
+
+wk-hotswap-runners  SABLE-wvxb4  do-not-merge, never force-push, retires unmerged; local afd4cd0 is local-only and the origin ref has since been reaped, so an ordinary push would CREATE it — cockpit ruling stands until a cockpit ruling lifts it
