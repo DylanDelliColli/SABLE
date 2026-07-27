@@ -44,7 +44,9 @@ trap cleanup EXIT
 # was exactly that leak). Point it at a throwaway sandbox DB via BEADS_DB so
 # no run of this suite can ever touch the live tracker.
 if command -v bd >/dev/null 2>&1; then
-  ( cd "$SCRATCH_BEADS_DIR" && BD_NON_INTERACTIVE=1 bd init --prefix=e2e \
+  # -u BEADS_DB (SABLE-sx1rb): never inherit an ambient BEADS_DB (e.g. the
+  # impact tier's own) — this suite builds and must use its OWN isolated DB.
+  ( cd "$SCRATCH_BEADS_DIR" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=e2e \
       --non-interactive --skip-agents --skip-hooks --quiet >/dev/null 2>&1 )
 fi
 
