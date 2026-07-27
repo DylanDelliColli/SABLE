@@ -111,6 +111,30 @@ bash .github/ci/shell-run-set.sh --check-beads
 bash .github/ci/test-tiers.sh --run pre_push
 ```
 
+### Hot-swap clearance before merging a live-symlink bin
+
+~34 installed `sable-*` bins are SYMLINKS into the live working tree
+(SABLE-y6ik3), so merging one replaces it for every agent on the host
+instantly. Before such a merge, ask the run registry — never a hand-written
+`ps` probe (SABLE-pk15w: an enumeration of runner names cannot detect a runner
+nobody enumerated, and reads CLEAR when it misses one):
+
+```bash
+sable-run-registry clearance      # exit 0 ONLY when clear
+```
+
+Five outcomes, deliberately not folded together: `clear` (0), `busy` (1),
+`could-not-assess` (2), `unregistered-runner` (3 — a suite is running that
+no registration covers, i.e. a gap in the interlock), `stale` (4 — a crashed
+runner's entry; cleared by `sable-run-registry reap <token>`, never by a
+timeout).
+
+**Any new suite runner must take a registration for the duration of its run.**
+`sable-run-registry audit` enforces this statically over the repo and is part
+of the pytest suite (`bin/test_sable_runlock.py`). Runners that invoke pytest
+need nothing: `bin/conftest.py` registers every pytest session by
+construction.
+
 The two `bd preflight` checks that ARE language-agnostic (no beads pollution,
 AGENTS.md/CLAUDE.md doc-sync) are still worth a glance from its output —
 just ignore the tests/lint/format/version-sync rows.
