@@ -129,7 +129,9 @@ trap 'rm -rf "$FIXTURE_DIR"' EXIT
 
 SCRATCH_BEADS_DIR="$FIXTURE_DIR/sandbox"
 mkdir -p "$SCRATCH_BEADS_DIR"
-( cd "$SCRATCH_BEADS_DIR" && BD_NON_INTERACTIVE=1 bd init --prefix=ibg \
+# -u BEADS_DB (SABLE-sx1rb): never inherit an ambient BEADS_DB (e.g. the
+# impact tier's own) — this suite builds and must use its OWN isolated DB.
+( cd "$SCRATCH_BEADS_DIR" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=ibg \
     --non-interactive --skip-agents --skip-hooks --quiet >/dev/null 2>&1 )
 
 if [ ! -d "$SCRATCH_BEADS_DIR/.beads" ]; then
