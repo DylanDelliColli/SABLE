@@ -783,6 +783,7 @@ def test_resolve_view_lane_explicit_lane_wins():
 
 
 def test_resolve_view_lane_defaults_to_caller_agent_name(monkeypatch):
+    monkeypatch.delenv("SABLE_AGENT_NAME", raising=False)
     monkeypatch.setenv("CLAUDE_AGENT_NAME", "optimus")
     ns = argparse.Namespace(all=False, mine=False, lane=None)
     assert sws.resolve_view_lane(ns) == "optimus"
@@ -791,9 +792,17 @@ def test_resolve_view_lane_defaults_to_caller_agent_name(monkeypatch):
     assert sws.resolve_view_lane(ns_mine) == "optimus"
 
 
+def test_resolve_view_lane_prefers_sable_agent_name(monkeypatch):
+    monkeypatch.setenv("SABLE_AGENT_NAME", "tarzan")
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "wrong")
+    ns = argparse.Namespace(all=False, mine=False, lane=None)
+    assert sws.resolve_view_lane(ns) == "tarzan"
+
+
 def test_resolve_view_lane_unlaned_caller_falls_back_to_global(monkeypatch):
     # no CLAUDE_AGENT_NAME (the operator by hand) -> global view, not an empty
     # own-lane one
+    monkeypatch.delenv("SABLE_AGENT_NAME", raising=False)
     monkeypatch.delenv("CLAUDE_AGENT_NAME", raising=False)
     ns = argparse.Namespace(all=False, mine=False, lane=None)
     assert sws.resolve_view_lane(ns) is None
@@ -822,6 +831,11 @@ def test_session_limit_reset_none_when_absent():
 def test_rate_limit_stall_returns_reset_when_banner_present_and_composer_ready():
     cap = "turn output\nYou have hit your session limit - resets 2pm\n\n❯"
     assert sws.rate_limit_stall(cap) == "2pm"
+
+
+def test_codex_rate_limit_stall_uses_codex_banner_and_prompt():
+    cap = "You've hit your usage limit. Try again 3:15 PM\n› \n"
+    assert sws.rate_limit_stall(cap, "codex") == "3:15 PM"
 
 
 def test_rate_limit_stall_none_when_no_banner():

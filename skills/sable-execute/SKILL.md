@@ -73,11 +73,27 @@ the db.
 
 ## 1. Flip the mode-state
 
-Run exactly one command:
+Choose the provider map once for this execution session, then run exactly one
+mode transition. A Claude-only install uses the backwards-compatible default:
 
 ```bash
 sable-mode set execution --fleet optimus,tarzan,chuck
 ```
+
+When both Claude and Codex are installed, record the operator's session choice
+explicitly:
+
+```bash
+sable-mode set execution --fleet optimus,tarzan,chuck \
+  --providers optimus=claude,tarzan=codex,chuck=claude,worker=codex
+```
+
+The three manager roles may use different providers, but `worker` is one
+provider shared by every worker pane for the whole execution session. Missing
+entries default to Claude. The map is immutable while execution mode is active:
+do not switch providers per bead or per dispatch. To change it, stand down the
+fleet and return to planning/clear the ended session before starting a new
+execution session.
 
 This writes the **per-repo** mode-state file — `<repo>/.claude/sable/state/mode-state.json`
 when inside a git repo (resolved from the git common-dir, so all of the repo's
@@ -117,19 +133,22 @@ applies.
 ## 2. Bring up the warm-pane session
 
 Execution runs on the **tmux warm-pane topology** — the only execution topology
-(see `TMUX-AGENTS-DESIGN.md`): every role is a real, persistent `claude` session
-in its own tmux pane with an env-var identity (`CLAUDE_AGENT_NAME`), registered
+(see `TMUX-AGENTS-DESIGN.md`): every role is a real, persistent interactive
+Claude or Codex session
+in its own tmux pane with a provider-neutral identity (`SABLE_AGENT_NAME`),
 in the role→pane registry (`@sable_role` pane option) that `sable-msg` and the
 worker-spawn tooling resolve against.
 
 Determine which of two states you are in:
 
 - **You are the lincoln pane** of a running sable session (check:
-  `CLAUDE_AGENT_NAME` is `lincoln` and `$TMUX` is set;
+  `SABLE_AGENT_NAME` is `lincoln` and `$TMUX` is set (legacy Claude sessions
+  also carry `CLAUDE_AGENT_NAME`);
   `tmux display-message -p '#{@sable_role}'` prints `lincoln`). This is the
   normal case — `sable-launch` creates a Lincoln-only session. **Stand up the
   fleet now**: run `sable-spawn-manager --all` — each manager (optimus,
-  tarzan, chuck) opens as a warm `claude` session in its OWN detached window
+  tarzan, chuck) opens as a persistent interactive Claude or Codex session in
+  its OWN detached window
   (your window is not disturbed), launched with a bypass permission posture
   and kicked into its operating loop. Idempotent: already-running managers are
   skipped. The interlock allows this only in execution mode — which you just

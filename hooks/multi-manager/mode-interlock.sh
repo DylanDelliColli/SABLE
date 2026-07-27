@@ -218,7 +218,7 @@ if [ "$TOOL_NAME" = "Agent" ]; then
   if [ -n "$AGENT_ID" ]; then
     SPAWNER="subagent"
   else
-    case "${CLAUDE_AGENT_NAME:-}" in
+    case "${SABLE_AGENT_NAME:-${CLAUDE_AGENT_NAME:-}}" in
       lincoln|cockpit) SPAWNER="main" ;;
       *) exit 0 ;;   # other env terminal / plain session: Agent leg ungoverned
     esac
@@ -364,7 +364,7 @@ is_git_push() {
 # catastrophically rather than merely overriding the interlock — so this leg
 # does not check for --force at all.
 # ---------------------------------------------------------------------------
-if [ "${CLAUDE_AGENT_ROLE:-}" = "producer" ]; then
+if [ "${SABLE_AGENT_ROLE:-${CLAUDE_AGENT_ROLE:-}}" = "producer" ]; then
   if is_spawn_call 'sable-spawn-worker' "$CMD_TEXT" || is_spawn_call 'sable-spawn-manager' "$CMD_TEXT"; then
     deny "Producer identity (CLAUDE_AGENT_ROLE=producer) may not dispatch workers or stand up the fleet — producers are read-only analysis agents, not spawners. Set SABLE_ORCHESTRATION_FORCE=1 to override."
   fi
@@ -476,7 +476,7 @@ fi
 # push, backlog population. Subagents spawn via the Agent tool in v3, so the
 # Bash leg stays main-session scoped (subagent Bash launches are a non-scenario).
 # ---------------------------------------------------------------------------
-case "${CLAUDE_AGENT_NAME:-}" in
+case "${SABLE_AGENT_NAME:-${CLAUDE_AGENT_NAME:-}}" in
   lincoln|cockpit) ;;
   *) exit 0 ;;
 esac
@@ -524,9 +524,10 @@ launches() {
   printf '%s' "$(leading_cmd "$COMMAND")" | grep -qE "^($1)\$" && return 0
   # (b) bare launch alias in command-word position after a real shell separator.
   printf '%s' "$COMMAND" | grep -qE "(^|[;&|(])[[:space:]]*($1)([[:space:]]|\$)" && return 0
-  # (c) CLAUDE_AGENT_NAME=<name> launch env prefix in command-word position (not
+  # (c) provider-neutral or legacy agent-name launch env prefix in command-word
+  #     position (not
   #     merely a name assignment quoted inside another command's prose).
-  printf '%s' "$COMMAND" | grep -qE "(^|[;&|(])[[:space:]]*CLAUDE_AGENT_NAME=($1)([[:space:]]|\$)" && return 0
+  printf '%s' "$COMMAND" | grep -qE "(^|[;&|(])[[:space:]]*(SABLE_AGENT_NAME|CLAUDE_AGENT_NAME)=($1)([[:space:]]|\$)" && return 0
   return 1
 }
 

@@ -35,8 +35,9 @@ truth read and written through `sable-mode`:
 
 ```bash
 sable-mode get             # which mode am I in? (planning | execution)
-sable-mode show            # full state: {mode, since, fleet, substage}
+sable-mode show            # full state: {mode, since, fleet, substage/providers}
 sable-mode substage get    # in planning: which staged substage am I in?
+sable-mode providers get   # in execution: fixed role + worker provider map
 ```
 
 The operator flips your mode with the `/sable-plan` and `/sable-execute` skills, which call
@@ -84,8 +85,9 @@ over tmux and they spawn + watch their own workers.**
 - **The managers are panes, not subagents.** The session starts Lincoln-only
   (`sable-launch` — mode-neutral: launching says nothing about executing).
   Entering execution is when the fleet stands up: run `sable-spawn-manager
-  --all` (or per role) — each manager opens as a real warm `claude` session in
-  its OWN detached window with its own `CLAUDE_AGENT_NAME`, kicked into its
+  --all` (or per role) — each manager opens as a persistent interactive Claude
+  or Codex session in its OWN detached window with its own `SABLE_AGENT_NAME`,
+  kicked into its
   operating loop, never a split of the window the operator is looking at. You
   do not spawn managers via the Agent tool, and never in planning mode (the
   interlock blocks it). The operator deep-dives into manager windows with

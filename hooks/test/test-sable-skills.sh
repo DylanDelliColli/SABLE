@@ -48,6 +48,8 @@ assert_grep "$EXEC_SKILL" "name: sable-execute" "/sable-execute declares name: s
 # 3. wired to the shared mechanism
 assert_grep "$PLAN_SKILL" "sable-mode set planning"  "/sable-plan invokes sable-mode set planning"
 assert_grep "$EXEC_SKILL" "sable-mode set execution" "/sable-execute invokes sable-mode set execution"
+assert_grep "$EXEC_SKILL" "--providers"               "/sable-execute records the execution provider map"
+assert_grep "$EXEC_SKILL" "immutable"                 "/sable-execute documents provider-map immutability"
 
 # 4. persona loaded
 assert_grep "$PLAN_SKILL" "planning"  "/sable-plan loads the planning persona"

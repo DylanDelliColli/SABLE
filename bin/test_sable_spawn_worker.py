@@ -1822,7 +1822,14 @@ def test_resolve_lane_falls_back_to_invoking_manager_env(monkeypatch):
     assert ssw.resolve_lane(None) == "tarzan"
 
 
+def test_resolve_lane_prefers_provider_neutral_identity(monkeypatch):
+    monkeypatch.setenv("SABLE_AGENT_NAME", "optimus")
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "wrong")
+    assert ssw.resolve_lane(None) == "optimus"
+
+
 def test_resolve_lane_empty_when_no_identity(monkeypatch):
+    monkeypatch.delenv("SABLE_AGENT_NAME", raising=False)
     monkeypatch.delenv("CLAUDE_AGENT_NAME", raising=False)
     assert ssw.resolve_lane(None) == ""
 
@@ -1834,8 +1841,18 @@ def test_worker_env_args_stamps_manager_identity():
     # SABLE_WORKER_PANE marker so the SessionStart role-anchor refuses to load
     # that manager's role-card into the worker (identity bleed -> re-dispatch).
     assert ssw.worker_env_args("optimus") == [
+        "-e", "SABLE_AGENT_NAME=optimus", "-e", "SABLE_AGENT_ROLE=manager",
+        "-e", "SABLE_LANE=optimus",
         "-e", "CLAUDE_AGENT_NAME=optimus", "-e", "CLAUDE_AGENT_ROLE=manager",
-        "-e", "SABLE_WORKER_PANE=1",
+        "-e", "SABLE_PROVIDER=claude", "-e", "SABLE_WORKER_PANE=1",
+    ]
+
+
+def test_codex_worker_env_uses_only_provider_neutral_identity():
+    assert ssw.worker_env_args("tarzan", provider="codex") == [
+        "-e", "SABLE_AGENT_NAME=tarzan", "-e", "SABLE_AGENT_ROLE=manager",
+        "-e", "SABLE_LANE=tarzan",
+        "-e", "SABLE_PROVIDER=codex", "-e", "SABLE_WORKER_PANE=1",
     ]
 
 
@@ -1843,7 +1860,9 @@ def test_worker_env_args_marks_worker_pane_even_without_lane():
     # SABLE-38zi: the worker marker is ALWAYS stamped, independent of whether a
     # lane manager identity is resolvable — a lane-less worker pane must still be
     # recognizable as a worker (role-anchor stand-down + re-dispatch guard).
-    assert ssw.worker_env_args("") == ["-e", "SABLE_WORKER_PANE=1"]
+    assert ssw.worker_env_args("") == [
+        "-e", "SABLE_PROVIDER=claude", "-e", "SABLE_WORKER_PANE=1",
+    ]
 
 
 def test_worker_env_args_always_contains_worker_marker():
@@ -1858,7 +1877,8 @@ def test_worker_env_args_always_contains_worker_marker():
 
 def test_worker_pane_tags_stamps_lane_when_resolvable():
     assert ssw.worker_pane_tags("SABLE-x", "/repo", "optimus") == [
-        ("@sable_role", "worker"), ("@sable_bead", "SABLE-x"),
+        ("@sable_role", "worker"), ("@sable_provider", "claude"),
+        ("@sable_bead", "SABLE-x"),
         ("@sable_repo", "/repo"), ("@sable_lane", "optimus"),
     ]
 
@@ -1868,16 +1888,24 @@ def test_worker_pane_tags_omits_lane_when_empty():
     # as an empty @sable_repo is omitted — sable-worker-status then shows it only
     # under --all, never silently folding it into some manager's lane
     assert ssw.worker_pane_tags("SABLE-x", "/repo", "") == [
-        ("@sable_role", "worker"), ("@sable_bead", "SABLE-x"),
+        ("@sable_role", "worker"), ("@sable_provider", "claude"),
+        ("@sable_bead", "SABLE-x"),
         ("@sable_repo", "/repo"),
     ]
 
 
 def test_worker_pane_tags_omits_repo_when_empty_but_keeps_lane():
     assert ssw.worker_pane_tags("SABLE-x", "", "tarzan") == [
-        ("@sable_role", "worker"), ("@sable_bead", "SABLE-x"),
+        ("@sable_role", "worker"), ("@sable_provider", "claude"),
+        ("@sable_bead", "SABLE-x"),
         ("@sable_lane", "tarzan"),
     ]
+
+
+def test_worker_pane_tags_record_codex_provider():
+    assert ("@sable_provider", "codex") in ssw.worker_pane_tags(
+        "SABLE-x", "/repo", "tarzan", provider="codex"
+    )
 
 
 def test_worker_pane_tags_never_stamps_status():
@@ -1951,6 +1979,25 @@ def test_new_window_args_spawns_detached_in_background():
 def test_pane_ready_true_on_empty_prompt():
     cap = "splash\n\n❯ \n  ddc@host:~/wt\n  bypass permissions on"
     assert ssw.pane_ready(cap) is True
+
+
+def test_codex_pane_ready_and_dispatch_landing_use_codex_prompt():
+    idle = "OpenAI Codex\n\n› \n  gpt-5.6-sol · medium"
+    assert ssw.pane_ready(idle, "codex") is True
+    submitted = (
+        "› Read /x/SABLE-2cao.1.md in full and execute it.\n"
+        "• Working\n"
+        "› \n"
+    )
+    assert ssw.dispatch_landed(submitted, "SABLE-2cao.1", "codex") is True
+
+
+def test_worker_command_launches_interactive_codex_tui():
+    command = ssw.worker_command("sonnet", None, "codex", "/work/wk-sable-x")
+    assert command.startswith("codex --no-alt-screen")
+    assert "--model gpt-5.6-sol" in command
+    assert "--cd /work/wk-sable-x" in command
+    assert " exec " not in command
 
 
 def test_pane_ready_false_while_booting():

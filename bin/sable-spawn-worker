@@ -145,6 +145,9 @@ from sable_pane_lib import (  # noqa: E402
 )
 from sable_pane_lib import deliver_text as deliver_dispatch  # noqa: E402
 import sable_footprint_lib as fp_lib  # noqa: E402
+from sable_provider_lib import (  # noqa: E402
+    ProviderMapError, execution_provider, interactive_command,
+)
 
 DEFAULT_SESSION = "sable"
 DEFAULT_MODEL = "sonnet"
@@ -1462,7 +1465,10 @@ def release_stale_tree_claim(worktree: str, holder_pane_live: bool) -> str | Non
             "pane) so the fresh worker's git ops are not denied until TTL")
 
 
-def worker_command(model: str, override: str | None) -> str:
+def worker_command(
+    model: str, override: str | None, provider: str = "claude",
+    cwd: str | None = None,
+) -> str:
     """Default worker command pins the model AND an auto-approving permission
     posture — a hands-off worker must run writes AND bash (mkdir/pytest/git/tmux)
     without prompting (SABLE-bldh.12). Tune via SABLE_WORKER_PERMISSION; a full
@@ -1470,7 +1476,9 @@ def worker_command(model: str, override: str | None) -> str:
     if override:
         return override
     perm = os.environ.get("SABLE_WORKER_PERMISSION", "--permission-mode bypassPermissions")
-    return f"claude --model {model} {perm}".strip()
+    return interactive_command(
+        provider, model, claude_permission=perm, cwd=cwd,
+    )
 
 
 def with_lifecycle_flags(cmd: str) -> str:
@@ -1515,10 +1523,16 @@ def resolve_lane(override: str | None) -> str:
     for managers (SABLE-bldh.13)."""
     if override:
         return override.strip()
-    return (os.environ.get("CLAUDE_AGENT_NAME") or "").strip()
+    return (
+        os.environ.get("SABLE_AGENT_NAME")
+        or os.environ.get("CLAUDE_AGENT_NAME")
+        or ""
+    ).strip()
 
 
-def worker_pane_tags(bid: str, root: str, lane: str) -> list[tuple[str, str]]:
+def worker_pane_tags(
+    bid: str, root: str, lane: str, provider: str = "claude"
+) -> list[tuple[str, str]]:
     """The per-pane @options sable-spawn-worker stamps POST-creation. NOT
     @sable_status — with_lifecycle_flags owns that from inside the pane's own
     script (SABLE-5v9n), so a manager-side write here would race a fast-exiting
@@ -1534,7 +1548,11 @@ def worker_pane_tags(bid: str, root: str, lane: str) -> list[tuple[str, str]]:
     as orphans, and a reap consumed DONE panes the owning manager was still
     event-waiting on. As a pane @option it drives that tool's own-lane default
     filter (filter_by_lane)."""
-    tags = [("@sable_role", "worker"), ("@sable_bead", bid)]
+    tags = [
+        ("@sable_role", "worker"),
+        ("@sable_provider", provider),
+        ("@sable_bead", bid),
+    ]
     if root:
         tags.append(("@sable_repo", root))
     if lane:
@@ -1542,7 +1560,7 @@ def worker_pane_tags(bid: str, root: str, lane: str) -> list[tuple[str, str]]:
     return tags
 
 
-def worker_env_args(lane: str) -> list[str]:
+def worker_env_args(lane: str, provider: str = "claude") -> list[str]:
     """tmux `-e` args for the worker pane.
 
     Two purposes, deliberately separated:
@@ -1563,8 +1581,17 @@ def worker_env_args(lane: str) -> list[str]:
         pane is recognizable."""
     args: list[str] = []
     if lane:
-        args += ["-e", f"CLAUDE_AGENT_NAME={lane}", "-e", "CLAUDE_AGENT_ROLE=manager"]
-    args += ["-e", "SABLE_WORKER_PANE=1"]
+        args += [
+            "-e", f"SABLE_AGENT_NAME={lane}",
+            "-e", "SABLE_AGENT_ROLE=manager",
+            "-e", f"SABLE_LANE={lane}",
+        ]
+        if provider == "claude":
+            args += [
+                "-e", f"CLAUDE_AGENT_NAME={lane}",
+                "-e", "CLAUDE_AGENT_ROLE=manager",
+            ]
+    args += ["-e", f"SABLE_PROVIDER={provider}", "-e", "SABLE_WORKER_PANE=1"]
     return args
 
 
@@ -1827,7 +1854,7 @@ bead still open.
 
     return f"""# SABLE worker dispatch — warm-pane self-push
 
-You are a SABLE worker. You are a warm `claude` session in your own tmux pane,
+You are a SABLE worker. You are a persistent interactive agent in your own tmux pane,
 and your shell CWD already IS your worktree. Follow the warm-pane self-push
 contract below.
 
@@ -2331,9 +2358,16 @@ def main(argv: list[str] | None = None) -> int:
     # creation.
     subprocess.run(base + ["set-option", "-g", "remain-on-exit", "on"], check=True)
     win = window_name(bid)
-    wcmd = with_lifecycle_flags(worker_command(model, os.environ.get("SABLE_WORKER_CMD")))
+    try:
+        provider = execution_provider("worker", base=worktree)
+    except ProviderMapError as e:
+        sys.stderr.write(f"sable-spawn-worker: {e}\n")
+        return 5
+    wcmd = with_lifecycle_flags(
+        worker_command(model, os.environ.get("SABLE_WORKER_CMD"), provider, worktree)
+    )
     pane_id = _run(base + new_window_args(ns.session, win, worktree,
-                                          worker_env_args(lane), wcmd)).strip()
+                                          worker_env_args(lane, provider), wcmd)).strip()
 
     # --- tag the pane for the registry + reaper. @sable_status is NOT set
     # here (SABLE-5v9n): with_lifecycle_flags already sets it running/done
@@ -2342,7 +2376,7 @@ def main(argv: list[str] | None = None) -> int:
     # landed. @sable_role/@sable_bead/@sable_repo/@sable_lane have no such
     # writer on the pane side, so setting them post-creation is race-free. See
     # worker_pane_tags for the per-tag rationale (incl. the SABLE-dcw2 lane). ---
-    for key, val in worker_pane_tags(bid, repo_root(), lane):
+    for key, val in worker_pane_tags(bid, repo_root(), lane, provider):
         subprocess.run(base + ["set-option", "-p", "-t", pane_id, key, val], check=True)
 
     # --- deliver the read-instruction, beating the boot + dropped-Enter race
@@ -2359,7 +2393,10 @@ def main(argv: list[str] | None = None) -> int:
         # working lane until a manual capture-pane. Refuse to type instead:
         # fail LOUD (nonzero exit naming the pane), leave the bead claim
         # intact for the dispatching manager to retry.
-        if not wait_for_ready(base, pane_id, ready_timeout, interval=poll_interval):
+        if not wait_for_ready(
+            base, pane_id, ready_timeout, interval=poll_interval,
+            provider=provider,
+        ):
             cap = capture_pane(base, pane_id)
             posture = ("an interactive dialog/selector" if dialog_posture(cap)
                        else "not in composer posture (still booting or stuck)")
@@ -2370,7 +2407,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"`tmux capture-pane -p -t {pane_id}` and re-spawn once clear.\n")
             return 10
     delivered = deliver_dispatch(base, pane_id, read_instruction(str(dispatch_path)),
-                                 bid, tries=submit_tries, interval=poll_interval)
+                                 bid, tries=submit_tries, interval=poll_interval,
+                                 provider=provider)
     if not delivered:
         sys.stderr.write(f"sable-spawn-worker: WARNING dispatch may be unsubmitted in "
                          f"{pane_id}; nudge with: tmux send-keys -t {pane_id} Enter\n")

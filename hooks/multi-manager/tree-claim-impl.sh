@@ -148,7 +148,7 @@ except Exception:
     d = {}
 print(d.get('agent_type', '') or '')
 " 2>/dev/null) || AGENT_NAME=""
-[ -z "$AGENT_NAME" ] && AGENT_NAME="${CLAUDE_AGENT_NAME:-}"
+[ -z "$AGENT_NAME" ] && AGENT_NAME="${SABLE_AGENT_NAME:-${CLAUDE_AGENT_NAME:-}}"
 [ -z "$AGENT_NAME" ] && AGENT_NAME="-"
 
 # ---------------------------------------------------------------------------

@@ -122,6 +122,23 @@ run_case "malformed hook JSON falls back to env identity" \
   "tarzan" "manager" \
   "tarzan|one_off_manager|env|0|1|1"
 
+# Provider-neutral env identity wins over the Claude compatibility alias.
+got=$(
+  export SABLE_AGENT_NAME=optimus SABLE_AGENT_ROLE=manager
+  export CLAUDE_AGENT_NAME=tarzan CLAUDE_AGENT_ROLE=producer
+  # shellcheck disable=SC1090
+  source "$LIB"
+  sable_resolve_identity '{"tool_name":"Bash"}'
+  printf '%s|%s|%s|%s|%s|%s' "$SABLE_ID_NAME" "$SABLE_ID_TYPE" "$SABLE_ID_SOURCE" \
+    "$SABLE_ID_IS_SUBAGENT" "$SABLE_ID_IS_MANAGER" "$SABLE_ID_IS_REGISTERED"
+)
+if [ "$got" = "optimus|epic_manager|env|0|1|1" ]; then
+  pass "SABLE env identity wins over Claude compatibility alias"
+else
+  fail "SABLE env identity wins over Claude compatibility alias" \
+    "expected [optimus|epic_manager|env|0|1|1] got [$got]"
+fi
+
 # --------------------------------------------------------------------------
 # Agent-Teams member identity (SABLE-amj.2). Capture-verified (SABLE-amj.1):
 # a team member spawned with name=<registry name> produces a hook input whose

@@ -12,9 +12,8 @@
 #      SABLE-amj.1) — the team config's agentType field (e.g. general-purpose) is
 #      a DIFFERENT field and is NOT what appears here. Members thus need no
 #      special branch, but they MUST be spawned under their registry name.
-#   2. CLAUDE_AGENT_NAME / CLAUDE_AGENT_ROLE env vars (legacy terminal
-#      launches — Chuck's holdout terminal and any pre-v2 alias). Dual-mode
-#      support is a hard requirement of SABLE-uz9.3.
+#   2. SABLE_AGENT_NAME / SABLE_AGENT_ROLE env vars, falling back to the
+#      legacy CLAUDE_AGENT_NAME / CLAUDE_AGENT_ROLE aliases during migration.
 #
 # Usage (from a hook that already captured its stdin):
 #   source "$(dirname "${BASH_SOURCE[0]}")/lib-identity.sh"
@@ -83,8 +82,8 @@ print(d.get('agent_type', '') or '')
       SABLE_ID_SOURCE="agent_type"
     fi
     # NOTE: env deliberately not consulted — it belongs to the parent session.
-  elif [ -n "${CLAUDE_AGENT_NAME:-}" ]; then
-    SABLE_ID_NAME=$(printf '%s' "$CLAUDE_AGENT_NAME" | tr '[:upper:]' '[:lower:]')
+  elif [ -n "${SABLE_AGENT_NAME:-${CLAUDE_AGENT_NAME:-}}" ]; then
+    SABLE_ID_NAME=$(printf '%s' "${SABLE_AGENT_NAME:-$CLAUDE_AGENT_NAME}" | tr '[:upper:]' '[:lower:]')
     SABLE_ID_SOURCE="env"
   fi
 
@@ -106,7 +105,8 @@ print(d.get('agent_type', '') or '')
 
   # Legacy escape: custom env-launched manager alias not (yet) in the registry.
   if [ "$SABLE_ID_IS_MANAGER" -eq 0 ] && [ "$SABLE_ID_SOURCE" = "env" ] \
-     && [ "${CLAUDE_AGENT_ROLE:-}" = "manager" ] && [ "$SABLE_ID_IS_REGISTERED" -eq 0 ]; then
+     && [ "${SABLE_AGENT_ROLE:-${CLAUDE_AGENT_ROLE:-}}" = "manager" ] \
+     && [ "$SABLE_ID_IS_REGISTERED" -eq 0 ]; then
     SABLE_ID_IS_MANAGER=1
   fi
 

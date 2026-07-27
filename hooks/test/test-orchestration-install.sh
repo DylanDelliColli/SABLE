@@ -280,6 +280,12 @@ CLAUDE_USER_DIR="$U/.claude" bash "$INSTALLER" --user >/dev/null 2>&1
 exists "$U/.claude/skills/sable-execute/SKILL.md" "user: skill installed under ~/.claude"
 exists "$U/.claude/settings.json" "user: settings.json created"
 if [ "$(count_interlock "$U/.claude/settings.json")" = "2" ]; then pass "user: interlock registered on both legs"; else fail "user: interlock registered on both legs" "count=$(count_interlock "$U/.claude/settings.json")"; fi
+exists "$U/.codex/hooks.json" "user: Codex hooks.json created beside redirected ~/.claude"
+if valid_json "$U/.codex/hooks.json"; then pass "user: Codex hooks.json is valid JSON"; else fail "user: Codex hooks.json is valid JSON"; fi
+if [ "$(count_interlock "$U/.codex/hooks.json")" = "2" ]; then pass "user: Codex receives both interlock legs"; else fail "user: Codex receives both interlock legs" "count=$(count_interlock "$U/.codex/hooks.json")"; fi
+if grep -qF "$U/.claude/hooks/" "$U/.codex/hooks.json"; then pass "user: Codex hook commands target the installed SABLE hooks"; else fail "user: Codex hook commands target the installed SABLE hooks"; fi
+CLAUDE_USER_DIR="$U/.claude" bash "$INSTALLER" --user --uninstall >/dev/null 2>&1
+if [ "$(count_interlock "$U/.codex/hooks.json")" = "0" ]; then pass "user uninstall: Codex interlock rows removed"; else fail "user uninstall: Codex interlock rows removed"; fi
 
 # ---------- uninstall (project) ----------
 # seed a legacy agents-teams dir from a pre-tmux-only install: uninstall must still clean it

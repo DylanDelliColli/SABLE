@@ -241,7 +241,15 @@ def test_resolve_from_manager_pane_keeps_lane_name_regression_guard(monkeypatch)
     assert sable_msg.resolve_from() == "tarzan"
 
 
+def test_resolve_from_prefers_provider_neutral_manager_identity(monkeypatch):
+    monkeypatch.delenv("SABLE_WORKER_PANE", raising=False)
+    monkeypatch.setenv("SABLE_AGENT_NAME", "optimus")
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "wrong")
+    assert sable_msg.resolve_from() == "optimus"
+
+
 def test_resolve_from_operator_default_when_nothing_set(monkeypatch):
+    monkeypatch.delenv("SABLE_AGENT_NAME", raising=False)
     monkeypatch.delenv("SABLE_WORKER_PANE", raising=False)
     monkeypatch.delenv("CLAUDE_AGENT_NAME", raising=False)
     assert sable_msg.resolve_from() == "operator"
@@ -962,6 +970,41 @@ def test_deliver_message_idle_recipient_transitions_to_our_turn_and_lands():
         sleep=lambda s: None, tries=4, interval=0.01,
     )
     assert landed is True
+
+
+@pytest.mark.parametrize(
+    ("provider", "glyph", "message"),
+    [
+        (
+            "codex", "›",
+            "⟦SABLE-MSG⟧ from=optimus to=worker:SABLE-x :: revise the failing test",
+        ),
+        (
+            "claude", "❯",
+            "⟦SABLE-MSG⟧ from=worker:SABLE-x to=optimus :: need an API ruling",
+        ),
+    ],
+)
+def test_cross_provider_manager_worker_messages_land_both_directions(
+    monkeypatch, provider, glyph, message
+):
+    state = {"typed": False}
+    monkeypatch.setattr(sable_msg, "pane_provider_tag", lambda *_args: provider)
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
+        return True
+
+    def capture():
+        if not state["typed"]:
+            return f"interactive agent\n{glyph} \n  ready"
+        return f"{message}\n• Working (2s · esc to interrupt)\n{glyph} \n"
+
+    assert sable_msg.deliver_message(
+        "%4", message, interrupt=False, run=run, capture=capture,
+        sleep=lambda _seconds: None, tries=2, interval=0.01,
+    )
 
 
 def test_deliver_text_fresh_pane_dispatch_still_lands():

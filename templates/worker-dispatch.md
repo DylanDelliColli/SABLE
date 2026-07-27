@@ -276,9 +276,19 @@ your manager rather than guessing.
 ### Warm-pane self-push — DEFAULT in the tmux-native topology
 
 When a manager spawns you via `sable-spawn-worker` (the tmux warm-pane topology,
-TMUX-AGENTS-DESIGN.md), you are a **real, warm `claude` session in your own tmux
-pane**, and your shell **CWD is your worktree**. The result channel is the bead
-pool: the manager watches your bead's status, not a returned message. Lifecycle:
+TMUX-AGENTS-DESIGN.md), you are a **real, persistent interactive Claude or Codex
+session in your own tmux pane**, and your shell **CWD is your worktree**. The
+bead pool is the durable result channel. When you need a ruling before you can
+continue, use the live channel:
+
+```bash
+sable-msg "${SABLE_LANE:?missing owning manager}" \
+  "SABLE-<id> needs a ruling: <specific question and options>"
+```
+
+The manager replies with `sable-msg --bead <id> "..."`; do not poll or
+foreground-sleep while waiting, because an idle pane is what lets the reply
+land as a new turn. Lifecycle:
 
 1. Implement the bead(s). Your CWD already *is* the worktree — there is **no
    `git -C`** anywhere in your flow (the old in-process model's `git -C <tree>`

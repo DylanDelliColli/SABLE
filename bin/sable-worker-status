@@ -100,7 +100,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
     SessionCollision, capture_pane, overlay_evidence, overlay_posture,
-    pane_is_live_nonworker_agent, pane_process_identity, pane_ready,
+    pane_is_live_nonworker_agent, pane_process_identity, pane_provider_tag, pane_ready,
     pane_working, resolve_session, session_limit_reset)
 
 WORKER_ROLE_PREFIX = "worker"
@@ -264,7 +264,7 @@ def done_no_deliverable(workers: list[dict]) -> list[dict]:
             and not deliverable_ok(w.get("deliverable", ""))]
 
 
-def rate_limit_stall(capture: str) -> str | None:
+def rate_limit_stall(capture: str, provider: str = "claude") -> str | None:
     """The reset-time text when `capture` shows a pane STALLED on the Claude
     Code session-rate-limit banner: the banner text is present AND the
     composer is back to its idle empty prompt (pane_ready) — proof the turn
@@ -273,8 +273,8 @@ def rate_limit_stall(capture: str) -> str | None:
     present, or when it IS present but the composer isn't ready yet (still
     processing — not yet stalled; v1 is a detection surface only, no
     auto-nudge)."""
-    reset = session_limit_reset(capture)
-    if reset is None or not pane_ready(capture):
+    reset = session_limit_reset(capture, provider)
+    if reset is None or not pane_ready(capture, provider):
         return None
     return reset
 
@@ -296,12 +296,13 @@ def flag_rate_limit_stalls(workers: list[dict], socket: str | None, capture=None
         if w["status"] != "running":
             flagged.append(w)
             continue
-        reset = rate_limit_stall(cap(w["pane"]))
+        provider = pane_provider_tag(base, w["pane"])
+        reset = rate_limit_stall(cap(w["pane"]), provider)
         flagged.append({**w, "status": "stalled-rate-limit", "reset": reset} if reset else w)
     return flagged
 
 
-def dialog_stall(capture: str) -> bool:
+def dialog_stall(capture: str, provider: str = "claude") -> bool:
     """True when `capture` shows a pane STALLED on a dialog/overlay AND not
     mid-turn — the warm-pane analogue of rate_limit_stall (SABLE-axp0, hardened
     in SABLE-tz9f). overlay_posture now requires a POSITIVE selector/dismiss
@@ -313,7 +314,7 @@ def dialog_stall(capture: str) -> bool:
     told the operator to Esc a healthy pane, interrupting live work). A genuinely
     stalled pane swallows every keystroke into the overlay — the chuck /usage
     incident."""
-    return overlay_posture(capture) and not pane_working(capture)
+    return overlay_posture(capture, provider) and not pane_working(capture, provider)
 
 
 def live_beads(workers: list[dict]) -> set[str]:
@@ -495,12 +496,13 @@ def flag_dialog_stalls(panes: list[dict], socket: str | None, capture=None) -> l
         if is_done(p["status"]):
             continue
         cap_text = cap(p["pane"])
-        if dialog_stall(cap_text):
+        provider = pane_provider_tag(base, p["pane"])
+        if dialog_stall(cap_text, provider):
             # SABLE-ccxc: carry the matched pane-text line so the alert can show
             # the evidence — an operator judges true-vs-false from the alert
             # itself, without a manual capture-pane.
             stalled.append({**p, "status": "dialog-stalled",
-                            "evidence": overlay_evidence(cap_text) or ""})
+                            "evidence": overlay_evidence(cap_text, provider) or ""})
     return stalled
 
 
@@ -781,7 +783,11 @@ def resolve_view_lane(ns) -> str | None:
         return None
     if ns.lane:
         return ns.lane
-    return (os.environ.get("CLAUDE_AGENT_NAME") or "").strip() or None
+    return (
+        os.environ.get("SABLE_AGENT_NAME")
+        or os.environ.get("CLAUDE_AGENT_NAME")
+        or ""
+    ).strip() or None
 
 
 def empty_worker_message(view_lane: str | None, all_workers: list[dict]) -> str:

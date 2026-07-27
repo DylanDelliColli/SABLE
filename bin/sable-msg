@@ -148,7 +148,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
     SessionCollision, deliver_text, pane_bead_tag, pane_busy, pane_idle,
-    pane_process_identity, pane_ready, resolve_session, submitted_own_turn,
+    pane_process_identity, pane_provider_tag, pane_ready, resolve_session,
+    submitted_own_turn,
     wait_for_idle,
 )
 from sable_pane_lib import capture_pane as _capture_pane  # noqa: E402
@@ -246,7 +247,11 @@ def resolve_from(socket: str | None = None, run=None) -> str:
         bead = os.environ.get("SABLE_BEAD") or pane_bead_tag(
             tmux_base(socket), os.environ.get("TMUX_PANE", ""), run=run)
         return f"worker:{bead}" if bead else "worker"
-    return os.environ.get("CLAUDE_AGENT_NAME") or "operator"
+    return (
+        os.environ.get("SABLE_AGENT_NAME")
+        or os.environ.get("CLAUDE_AGENT_NAME")
+        or "operator"
+    )
 
 
 def parse_panes(output: str) -> dict[str, str]:
@@ -394,15 +399,18 @@ def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None
     run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True).returncode == 0)
     capture = capture or (lambda: _capture_pane(base, pane))
     snippet = message if snippet is None else snippet
+    provider = pane_provider_tag(base, pane)
 
     if interrupt:
         run(base + ["send-keys", "-t", pane, "Escape"])
         if ready_timeout > 0:
             wait_for_idle(base, pane, ready_timeout, interval=interval,
-                          capture=capture, sleep=sleep, run=run)
+                          capture=capture, sleep=sleep, run=run,
+                          provider=provider)
 
     return deliver_text(base, pane, message, snippet, tries=tries, interval=interval,
-                        run=run, capture=capture, sleep=sleep)
+                        run=run, capture=capture, sleep=sleep,
+                        provider=provider)
 
 
 # --------------------------------------------------------------------------

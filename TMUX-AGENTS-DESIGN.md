@@ -8,7 +8,8 @@ were removed). The original design text follows.
 
 This replaces the in-process, subagent-heavy manager methodology (v2 one-window /
 v3 nested / teams) with a **warm-pane substrate**: every role is a real,
-persistent `claude` session in its own tmux pane, with a stable env-var identity.
+persistent interactive Claude or Codex session in its own tmux pane, with a
+stable provider-neutral env-var identity.
 It is the **vanilla 3-terminal flow generalized to N panes** — the configuration
 that ran reliably for ~3 months — with the fragile in-process coordination layer
 removed entirely.
@@ -39,8 +40,10 @@ planning/exec split, parallel drain) without the cold-start tax.
 
 ## Topology
 
-One tmux session, **one warm `claude` pane per role**, each launched via
-`sable-launch <role>` (sets `CLAUDE_AGENT_NAME` — the vanilla identity mechanism).
+One tmux session, **one persistent interactive pane per role**. Execution mode
+freezes a provider for each manager and one provider shared by all workers;
+launchers stamp `SABLE_AGENT_NAME`, `SABLE_AGENT_ROLE`, and `SABLE_PROVIDER`
+(Claude also receives the legacy `CLAUDE_*` aliases).
 
 ```
 ┌─ lincoln (lead/cockpit) ───┬─ optimus (epic mgr) ──────┐
@@ -51,7 +54,7 @@ One tmux session, **one warm `claude` pane per role**, each launched via
 │ spawns worker panes        │ merges worktree branches  │
 ├────────────────────────────┴───────────────────────────┤
 │ worker panes (ephemeral, per-bead) — each cwd = its own │
-│ worktree; claude --model <ladder>; TDD → gates → push   │
+│ worktree; frozen worker provider; TDD → gates → push    │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -75,16 +78,17 @@ sessions — unchanged.
 
 ---
 
-## Messaging (`sable-msg`) — lead ↔ manager only
+## Messaging (`sable-msg`) — any managed pane ↔ any managed pane
 
-Messaging is **scoped to Lincoln ↔ Optimus/Tarzan** — low-volume, human-paced,
-conversational direction ("drop the auth epic, API is urgent now"). The
-high-volume worker path is deliberately message-free (workers are spawned with
-their instructions, then report via the bead pool), which is what keeps the
-coordination bug class out.
+Messaging supports low-volume direction and escalation between Lincoln,
+managers, Chuck, and workers. A worker addresses its manager by role name (or a
+manager addresses a particular worker with `--bead`). The bead pool remains the
+durable result channel; `sable-msg` is the live conversation channel.
 
 `sable-msg <to-role> "<text>" [--from <role>] [--interrupt]`:
 - Resolves `<to-role>` → tmux pane via the **role→pane registry**.
+- Reads the recipient's `@sable_provider` tag and uses that TUI's prompt
+  posture; sender and recipient providers may differ.
 - `send-keys -l` the body (literal; handles quoting), then `Enter` to submit —
   **the message is the turn**. No inbox, no injection hook.
 - `--interrupt` sends `Escape` first, so the message lands *now* instead of

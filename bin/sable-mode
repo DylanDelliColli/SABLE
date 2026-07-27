@@ -27,6 +27,7 @@
 #
 # Usage:
 #   sable-mode set <planning|execution> [--fleet a,b,c]
+#                   [--providers optimus=claude,tarzan=claude,chuck=claude,worker=claude]
 #   sable-mode get                 # print the bare mode word (nonzero if unset);
 #                                  # warns on stderr if the state is stale
 #   sable-mode show                # print the full JSON (nonzero if unset)
@@ -37,6 +38,10 @@
 #   sable-mode --help
 
 set -eu
+
+SELF="${BASH_SOURCE[0]:-$0}"
+[ -L "$SELF" ] && SELF="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 
 # resolve_state_path [base_dir] — MIRROR of sable_mode_state_path in
 # hooks/multi-manager/lib-mode-path.sh. Kept as a copy (not a source) because
@@ -123,11 +128,14 @@ sable-mode — read/write the orchestration mode-state file.
 
 Usage:
   sable-mode set <planning|execution> [--fleet a,b,c] [--tier quick|full|discovery]
+      [--providers optimus=claude,tarzan=claude,chuck=claude,worker=claude]
       Write the mode-state file. --fleet is a comma-separated list of the
       agents launched for this mode (recorded for the dashboard). --tier sets
       the planning tier (default full); quick telescopes the backlog gate, and
       discovery (Mode 1) is the lightest sub-mode — no backlog gate, since
       Discovery authors no implementation beads (it writes charters).
+      --providers is execution-only. Omitted roles default to Claude. The map
+      is immutable until execution mode is cleared or changed to planning.
   sable-mode get      Print the current mode word; nonzero exit if unset. Warns
                       on stderr (SABLE_MODE_STALE_HOURS, default 72) when the
                       state is older than that and suggests 'sable-mode clear'.
@@ -142,6 +150,9 @@ Usage:
                                  if already at decomposition.
   sable-mode tier get            Print the planning tier (quick|full|discovery,
                                  default full); nonzero if unset or not in planning.
+  sable-mode providers get [role]
+                                 Print the execution provider map, or the bare
+                                 provider for optimus|tarzan|chuck|worker.
   sable-mode --help
 
 State file (resolved per-repo): ${STATE}
@@ -214,16 +225,29 @@ case "$cmd" in
                 ;;
         esac
 
-        # Consume the verb + mode, then scan for --fleet and --tier.
+        # Consume the verb + mode, then scan for --fleet, --tier, and the
+        # immutable execution-session provider map.
         shift 2 || true
         fleet_csv=""
         tier=""
+        providers_csv=""
+        providers_seen=0
         while [ $# -gt 0 ]; do
             case "$1" in
                 --fleet)    fleet_csv="${2:-}"; shift 2 || shift ;;
                 --fleet=*)  fleet_csv="${1#--fleet=}"; shift ;;
                 --tier)     tier="${2:-}"; shift 2 || shift ;;
                 --tier=*)   tier="${1#--tier=}"; shift ;;
+                --providers)
+                    if [ $# -lt 2 ]; then
+                        printf 'sable-mode: --providers requires a role=provider map\n' >&2
+                        exit 2
+                    fi
+                    providers_csv="$2"; providers_seen=1; shift 2
+                    ;;
+                --providers=*)
+                    providers_csv="${1#--providers=}"; providers_seen=1; shift
+                    ;;
                 *)          shift ;;
             esac
         done
@@ -232,9 +256,57 @@ case "$cmd" in
             *) printf "sable-mode: invalid tier '%s' (must be quick, full, or discovery)\n" "$tier" >&2; exit 2 ;;
         esac
 
+        if [ "$mode" = "planning" ] && [ "$providers_seen" -eq 1 ]; then
+            printf 'sable-mode: --providers is valid only for execution mode\n' >&2
+            exit 2
+        fi
+
+        providers_json=""
+        if [ "$mode" = "execution" ]; then
+            if ! providers_json="$(
+                BIN_DIR="$BIN_DIR" PROVIDERS="$providers_csv" python3 -c "
+import json, os, sys
+sys.path.insert(0, os.environ['BIN_DIR'])
+from sable_provider_lib import ProviderMapError, parse_provider_map
+try:
+    print(json.dumps(parse_provider_map(os.environ.get('PROVIDERS'))))
+except ProviderMapError as exc:
+    print(f'sable-mode: {exc}', file=sys.stderr)
+    raise SystemExit(2)
+"
+            )"; then
+                exit 2
+            fi
+
+            # A running execution session owns one fixed provider map. Legacy
+            # state without the field is interpreted as all-Claude.
+            if [ -f "$STATE" ]; then
+                provider_guard_rc=0
+                STATE="$STATE" BIN_DIR="$BIN_DIR" PROVIDERS_JSON="$providers_json" python3 -c "
+import json, os, sys
+sys.path.insert(0, os.environ['BIN_DIR'])
+from sable_provider_lib import ProviderMapError, provider_map_from_state
+try:
+    current = json.load(open(os.environ['STATE']))
+    requested = json.loads(os.environ['PROVIDERS_JSON'])
+    if current.get('mode') == 'execution' and provider_map_from_state(current) != requested:
+        print(
+            'sable-mode: execution provider map is immutable; '
+            'stand down or clear the current mode before changing providers',
+            file=sys.stderr,
+        )
+        raise SystemExit(4)
+except ProviderMapError as exc:
+    print(f'sable-mode: invalid existing provider map: {exc}', file=sys.stderr)
+    raise SystemExit(4)
+" || provider_guard_rc=$?
+                [ "$provider_guard_rc" -eq 0 ] || exit "$provider_guard_rc"
+            fi
+        fi
+
         since="$(date +%Y-%m-%dT%H:%M:%S%z)"
         mkdir -p "$(dirname "$STATE")"
-        STATE="$STATE" MODE="$mode" SINCE="$since" FLEET="$fleet_csv" TIER="${tier:-full}" python3 -c "
+        STATE="$STATE" MODE="$mode" SINCE="$since" FLEET="$fleet_csv" TIER="${tier:-full}" PROVIDERS_JSON="$providers_json" python3 -c "
 import json, os
 fleet = [s for s in os.environ.get('FLEET', '').split(',') if s]
 mode = os.environ['MODE']
@@ -248,6 +320,8 @@ data = {'mode': mode, 'since': os.environ['SINCE'], 'fleet': fleet}
 if mode == 'planning':
     data['substage'] = 'framing'
     data['tier'] = os.environ.get('TIER') or 'full'
+else:
+    data['providers'] = json.loads(os.environ['PROVIDERS_JSON'])
 with open(os.environ['STATE'], 'w') as f:
     f.write(json.dumps(data, indent=2) + chr(10))
 "
@@ -333,6 +407,40 @@ print(d.get('tier') or 'full')
                 ;;
             *)
                 printf 'sable-mode: tier requires: get\n' >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    providers)
+        require_state
+        action="${2:-}"
+        role="${3:-}"
+        case "$action" in
+            get)
+                STATE="$STATE" BIN_DIR="$BIN_DIR" ROLE="$role" python3 -c "
+import json, os, sys
+sys.path.insert(0, os.environ['BIN_DIR'])
+from sable_provider_lib import (
+    ProviderMapError,
+    format_provider_map,
+    provider_for_role,
+    provider_map_from_state,
+)
+state = json.load(open(os.environ['STATE']))
+if state.get('mode') != 'execution':
+    raise SystemExit(1)
+try:
+    if os.environ.get('ROLE'):
+        print(provider_for_role(state, os.environ['ROLE']))
+    else:
+        print(format_provider_map(provider_map_from_state(state)))
+except ProviderMapError as exc:
+    print(f'sable-mode: {exc}', file=sys.stderr)
+    raise SystemExit(2)
+"
+                ;;
+            *)
+                printf 'sable-mode: providers requires: get [optimus|tarzan|chuck|worker]\n' >&2
                 exit 1
                 ;;
         esac

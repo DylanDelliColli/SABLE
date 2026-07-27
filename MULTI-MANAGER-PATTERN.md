@@ -108,15 +108,16 @@ sable-agents victor       # single agent + role file path
 
 ## The warm-pane topology (tmux)
 
-SABLE's execution surface is **one tmux session, one warm `claude` pane per
-role** — the only topology (SABLE-qa4d; designed in
+SABLE's execution surface is **one tmux session, one persistent interactive
+Claude or Codex pane per role** — the only topology (SABLE-qa4d; designed in
 [`TMUX-AGENTS-DESIGN.md`](TMUX-AGENTS-DESIGN.md)). The session starts
 **Lincoln-only** (`sable-launch`, wrapping the `sable-tmux` layout tool —
 mode-neutral: a planning session needs no fleet). When execution begins,
 `sable-spawn-manager` stands up optimus/tarzan/chuck **on demand** — each in
 its own detached window (the operator's Lincoln window is never disturbed),
-with its identity (`CLAUDE_AGENT_NAME` / `CLAUDE_AGENT_ROLE=manager`) set at
-launch, registered in the role→pane registry, and kicked into its operating
+with its provider-neutral identity (`SABLE_AGENT_NAME` /
+`SABLE_AGENT_ROLE=manager`) set at launch, registered in the role→pane registry,
+and kicked into its operating
 loop. The interlock gates manager spawning to execution mode.
 
 **Lincoln** is the pane you talk to. **Optimus and Tarzan** are resident manager
@@ -128,9 +129,10 @@ from their own CWD and close their beads with gate evidence; managers never
 push worker code. **Chuck** is the merge-queue pane — a manager's push notifies
 him message-first (`sable-msg chuck`, sent by the post-push hook), with the
 durable `for-chuck` bead as the fallback when his pane is unreachable.
-Lead↔manager conversation is `sable-msg` with the `⟦SABLE-MSG⟧ from=<sender>`
-framing header; the high-volume worker path is deliberately message-free
-(workers are spawned with their instructions and report via the bead pool).
+Live pane-to-pane conversation is `sable-msg` with the
+`⟦SABLE-MSG⟧ from=<sender>` framing header. Workers normally report durable
+results through the bead pool, but can message their owning manager when they
+need a ruling; managers can target a worker by bead id.
 
 | Mode | Job | Mechanics |
 |------|-----|-----------|
@@ -161,13 +163,15 @@ the Lincoln session from populating the implementation backlog until
 Mechanics:
 
 - **`bin/sable-mode`** — reads/writes the **per-repo** mode-state file
-  `<repo>/.claude/sable/state/mode-state.json` (`{mode, since, fleet, substage}`),
+  `<repo>/.claude/sable/state/mode-state.json`
+  (`{mode, since, fleet, substage, providers}`),
   resolved from the git common-dir so a repo's worktrees share one mode (falls
   back to `~/.claude/sable/state/mode-state.json` outside a git repo;
   `SABLE_MODE_STATE` overrides). The source of truth shared by the skills and the
   interlock — scoped per-repo so concurrent SABLE sessions in different repos
   keep independent modes. `sable-mode substage get|set|advance` walks the
-  planning substages; `sable-mode path` prints the resolved path.
+  planning substages; `sable-mode providers get [role]` reads the immutable
+  execution provider contract; `sable-mode path` prints the resolved path.
 - **`/sable-plan` and `/sable-execute`** (`skills/sable-plan`, `skills/sable-execute`) —
   flip the mode and swap Lincoln's persona.
 - **`hooks/multi-manager/mode-interlock.sh`** — the mechanical guarantee.

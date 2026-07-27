@@ -32,11 +32,16 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
     AUTONOMOUS_ROLES, KICK_TAG, SessionCollision, deliver_text, kick_message,
     repo_root, resolve_session, wait_for_ready,
+)
+from sable_provider_lib import (  # noqa: E402
+    ProviderMapError, execution_provider, interactive_command, pane_environment,
+    provider_boot_message,
 )
 from sable_registry_lib import (  # noqa: E402
     FLEET_PROJECT_ONLY_REMEDY, fleet_project_only, sable_registry_path,
@@ -269,7 +274,7 @@ def plan_spawns(requested: list[str], existing: set[str]) -> tuple[list[str], li
     return to_spawn, skipped
 
 
-def manager_command() -> str:
+def manager_command(provider: str = "claude", cwd: str | None = None) -> str:
     """The command used to launch a manager pane. Managers ALWAYS run on Opus
     (SABLE-gbd) — the per-bead model ladder (SABLE.md 6.9) governs the workers
     a manager dispatches, never the manager's own model. SABLE_TMUX_PANE_CMD is
@@ -278,10 +283,15 @@ def manager_command() -> str:
     if override:
         return override
     perm = os.environ.get("SABLE_WORKER_PERMISSION", "--permission-mode bypassPermissions")
-    return f"claude --model opus {perm}"
+    add_dirs = [str(Path(cwd).parent)] if provider == "codex" and cwd else []
+    return interactive_command(
+        provider, "opus", claude_permission=perm, cwd=cwd, add_dirs=add_dirs,
+    )
 
 
-def producer_command(model: str) -> str:
+def producer_command(
+    model: str, provider: str = "claude", cwd: str | None = None
+) -> str:
     """A producer's command line pins its CALLER-CHOSEN model tier
     (architecture.json decision 1) — unlike manager_command, which always
     pins Opus regardless of any tier argument (SABLE-gbd: the model ladder
@@ -291,19 +301,26 @@ def producer_command(model: str) -> str:
     if override:
         return override
     perm = os.environ.get("SABLE_WORKER_PERMISSION", "--permission-mode bypassPermissions")
-    return f"claude --model {model} {perm}".strip()
+    return interactive_command(
+        provider, model, claude_permission=perm, cwd=cwd,
+    )
 
 
-def window_args(session: str, role: str, cmd: str) -> list[str]:
+def window_args(
+    session: str, role: str, cmd: str, provider: str = "claude"
+) -> list[str]:
     """A DETACHED named window (-d): the operator's current window is never
     stolen. Managers/producers are windows, not splits. Producer roles get
     CLAUDE_AGENT_ROLE=producer; managers keep CLAUDE_AGENT_ROLE=manager
     byte-identical to before (regression-locked)."""
     agent_role = "producer" if role in PRODUCER_ROLES else "manager"
-    return ["new-window", "-d", "-t", session, "-n", role,
-            "-P", "-F", "#{pane_id}",
-            "-e", f"CLAUDE_AGENT_NAME={role}", "-e", f"CLAUDE_AGENT_ROLE={agent_role}",
-            cmd]
+    env_args: list[str] = []
+    for key, value in pane_environment(provider, role, agent_role).items():
+        env_args += ["-e", f"{key}={value}"]
+    return [
+        "new-window", "-d", "-t", session, "-n", role,
+        "-P", "-F", "#{pane_id}", *env_args, cmd,
+    ]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -398,17 +415,25 @@ def main(argv: list[str] | None = None) -> int:
     ready_timeout = float(os.environ.get("SABLE_DISPATCH_READY_TIMEOUT", "25"))
     submit_tries = int(os.environ.get("SABLE_DISPATCH_SUBMIT_TRIES", "8"))
     poll_interval = float(os.environ.get("SABLE_DISPATCH_POLL_INTERVAL", "1.0"))
-    mgr_cmd = manager_command()
     producer_model = ns.model or DEFAULT_PRODUCER_MODEL
 
     root = repo_root()
     for role in to_spawn:
         is_producer = role in PRODUCER_ROLES
-        cmd = producer_command(producer_model) if is_producer else mgr_cmd
-        pane = subprocess.run(base + window_args(session, role, cmd),
+        provider_role = "worker" if is_producer else strip_instance_suffix(role)
+        try:
+            provider = execution_provider(provider_role, base=root)
+        except ProviderMapError as e:
+            sys.stderr.write(f"sable-spawn-manager: {e}\n")
+            return 5
+        cmd = (producer_command(producer_model, provider, root)
+               if is_producer else manager_command(provider, root))
+        pane = subprocess.run(base + window_args(session, role, cmd, provider),
                               capture_output=True, text=True, check=True).stdout.strip()
         subprocess.run(base + ["set-option", "-p", "-t", pane, "@sable_role", role],
                        check=True)
+        subprocess.run(base + ["set-option", "-p", "-t", pane, "@sable_provider",
+                               provider], check=True)
         subprocess.run(base + ["set-option", "-p", "-t", pane, "@sable_class",
                                sable_class(role)], check=True)
         if is_producer:
@@ -424,12 +449,28 @@ def main(argv: list[str] | None = None) -> int:
         assigned = subprocess.run(
             base + ["display-message", "-p", "-t", pane, "#{@sable_role}"],
             capture_output=True, text=True).stdout.strip() or role
-        register_instance(assigned, actor=os.environ.get("CLAUDE_AGENT_NAME"))
+        register_instance(
+            assigned,
+            actor=(
+                os.environ.get("SABLE_AGENT_NAME")
+                or os.environ.get("CLAUDE_AGENT_NAME")
+            ),
+        )
         if ready_timeout > 0:
-            wait_for_ready(base, pane, ready_timeout, interval=poll_interval)
+            wait_for_ready(
+                base, pane, ready_timeout, interval=poll_interval,
+                provider=provider,
+            )
         kick = kick_message(role, deliverable=ns.deliverable if is_producer else None)
+        if not is_producer:
+            try:
+                kick = provider_boot_message(provider, role, kick, base=root)
+            except ProviderMapError as e:
+                sys.stderr.write(f"sable-spawn-manager: {e}\n")
+                return 5
         if deliver_text(base, pane, kick, KICK_TAG,
-                        tries=submit_tries, interval=poll_interval):
+                        tries=submit_tries, interval=poll_interval,
+                        provider=provider):
             sys.stderr.write(f"sable-spawn-manager: {role} up in its own window, "
                              f"kicked into its operating loop\n")
         else:

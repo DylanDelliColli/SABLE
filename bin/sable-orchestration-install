@@ -49,6 +49,16 @@ done
 
 if [ "$SCOPE" = "user" ]; then
     BASE="${CLAUDE_USER_DIR:-$HOME/.claude}"
+    if [ -n "${CODEX_HOME:-}" ]; then
+        CODEX_HOOKS="$CODEX_HOME/hooks.json"
+    elif [ -n "${CLAUDE_USER_DIR:-}" ]; then
+        # A redirected Claude user dir is the installer's established
+        # test/custom-scope boundary; keep Codex beside it instead of leaking
+        # into the real ~/.codex.
+        CODEX_HOOKS="$(dirname "$BASE")/.codex/hooks.json"
+    else
+        CODEX_HOOKS="$HOME/.codex/hooks.json"
+    fi
     SETTINGS="$BASE/settings.json"
     # --user hook commands are rewritten to the absolute BASE (byte-identical
     # to pre-SABLE-59t6.2 behavior — there's no portable placeholder for ~/.claude).
@@ -56,6 +66,7 @@ if [ "$SCOPE" = "user" ]; then
 else
     PROJECT="${SABLE_PROJECT_DIR:-$PWD}"
     BASE="$PROJECT/.claude"
+    CODEX_HOOKS=""
     # Project scope writes the COMMITTED settings.json (SABLE-59t6.2), so hook
     # commands must be portable across clones/machines: root them at the
     # literal ${CLAUDE_PROJECT_DIR} placeholder Claude Code expands at runtime,
@@ -542,6 +553,9 @@ EOF
     # that predate the tmux-only layer.
     rm -rf "$HOOKS_DIR" "$BASE/agents-teams" "$BASE/sable/reconcile-timer"
     remove_layer_hooks "$SETTINGS"
+    if [ -n "$CODEX_HOOKS" ]; then
+        remove_layer_hooks "$CODEX_HOOKS"
+    fi
     echo "Orchestration layer uninstalled from $BASE (scope: $SCOPE)."
     echo "  (left other hooks and the settings file intact)"
     echo "  (systemd/cron activation, if any, is NOT touched here — it lives outside"
@@ -653,11 +667,20 @@ if [ -n "$REFUSED_HOOK_NAMES" ]; then
     remove_retired_hook_rows "$SETTINGS" "$REFUSED_HOOK_NAMES" >/dev/null || true
 fi
 merge_snippet "$SETTINGS" "$SNIPPET" "$SNIPPET_BASE" "$REFUSED_HOOK_NAMES"
+if [ -n "$CODEX_HOOKS" ]; then
+    # Codex supports Claude-style lifecycle hook configuration in
+    # ~/.codex/hooks.json. Reuse the exact installed command graph so mixed
+    # fleets do not silently lose mode, identity, and command guardrails.
+    merge_snippet "$CODEX_HOOKS" "$SNIPPET" "$SNIPPET_BASE" "$REFUSED_HOOK_NAMES"
+fi
 
 # Stage the host timer entrypoint's systemd/cron artifacts (never activates them).
 install_reconcile_timer
 
 echo "Orchestration layer installed to $BASE (scope: $SCOPE)."
+if [ -n "$CODEX_HOOKS" ]; then
+    echo "Codex lifecycle hooks merged into $CODEX_HOOKS."
+fi
 echo "  • All multi-manager hooks + agents.yaml + SABLE skills + the four pane roles installed."
 echo "  • Settings snippet ($(basename "$SNIPPET")) merged into $SETTINGS (existing entries kept)."
 echo "  • /sable-plan and /sable-execute become available after you restart the session."

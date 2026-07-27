@@ -77,6 +77,78 @@ assert_eq "show mode after --fleet"  "planning" "$(printf '%s' "$SHOW" | jget "[
 assert_eq "fleet[0]"                 "sherlock" "$(printf '%s' "$SHOW" | jget "['fleet'][0]")"
 assert_eq "fleet[1]"                 "columbo"  "$(printf '%s' "$SHOW" | jget "['fleet'][1]")"
 
+# ---------- execution provider map ----------
+
+fresh_state
+"$MODE_BIN" set execution >/dev/null 2>&1
+SHOW="$("$MODE_BIN" show 2>/dev/null)"
+assert_eq "execution defaults optimus to Claude" "claude" "$(printf '%s' "$SHOW" | jget "['providers']['optimus']")"
+assert_eq "execution defaults tarzan to Claude"  "claude" "$(printf '%s' "$SHOW" | jget "['providers']['tarzan']")"
+assert_eq "execution defaults chuck to Claude"   "claude" "$(printf '%s' "$SHOW" | jget "['providers']['chuck']")"
+assert_eq "execution defaults workers to Claude" "claude" "$(printf '%s' "$SHOW" | jget "['providers']['worker']")"
+assert_eq "providers get renders canonical role order" \
+  "optimus=claude,tarzan=claude,chuck=claude,worker=claude" \
+  "$("$MODE_BIN" providers get 2>/dev/null)"
+
+fresh_state
+"$MODE_BIN" set execution \
+  --providers optimus=claude,tarzan=codex,chuck=claude,worker=codex \
+  >/dev/null 2>&1
+SHOW="$("$MODE_BIN" show 2>/dev/null)"
+assert_eq "mixed provider map round-trips tarzan" "codex" "$(printf '%s' "$SHOW" | jget "['providers']['tarzan']")"
+assert_eq "mixed provider map round-trips worker" "codex" "$(printf '%s' "$SHOW" | jget "['providers']['worker']")"
+assert_eq "providers get role returns bare provider" "codex" "$("$MODE_BIN" providers get worker 2>/dev/null)"
+
+# Partial maps are filled with the backwards-compatible Claude default.
+fresh_state
+"$MODE_BIN" set execution --providers worker=codex >/dev/null 2>&1
+SHOW="$("$MODE_BIN" show 2>/dev/null)"
+assert_eq "partial map defaults omitted manager" "claude" "$(printf '%s' "$SHOW" | jget "['providers']['optimus']")"
+assert_eq "partial map keeps explicit worker" "codex" "$(printf '%s' "$SHOW" | jget "['providers']['worker']")"
+
+# Provider intent is execution-only and malformed maps fail before writing.
+for bad in \
+  "optimus=openai" \
+  "lincoln=codex" \
+  "worker=codex,worker=claude" \
+  "=codex" \
+  "worker="
+do
+  fresh_state
+  "$MODE_BIN" set execution --providers "$bad" >/dev/null 2>&1
+  assert_nonzero "invalid provider map rejected: $bad" "$?"
+  if [ ! -f "$SABLE_MODE_STATE" ]; then
+    pass "invalid provider map writes nothing: $bad"
+  else
+    fail "invalid provider map writes nothing: $bad" "state file was created"
+  fi
+done
+
+fresh_state
+"$MODE_BIN" set planning --providers worker=codex >/dev/null 2>&1
+assert_nonzero "planning rejects execution provider map" "$?"
+if [ ! -f "$SABLE_MODE_STATE" ]; then
+  pass "planning provider-map rejection writes nothing"
+else
+  fail "planning provider-map rejection writes nothing" "state file was created"
+fi
+
+# Once execution starts, a different provider map is refused without replacing
+# the active session state. Re-applying the same map remains idempotent.
+fresh_state
+"$MODE_BIN" set execution --providers worker=codex >/dev/null 2>&1
+"$MODE_BIN" set execution --providers worker=claude >/dev/null 2>&1
+assert_nonzero "mid-execution provider change is refused" "$?"
+assert_eq "refused provider change preserves worker provider" \
+  "codex" "$("$MODE_BIN" providers get worker 2>/dev/null)"
+"$MODE_BIN" set execution --providers worker=codex >/dev/null 2>&1
+assert_zero "same provider map may be re-applied" "$?"
+
+fresh_state
+"$MODE_BIN" set planning >/dev/null 2>&1
+"$MODE_BIN" providers get >/dev/null 2>&1
+assert_nonzero "providers get is execution-only" "$?"
+
 # ---------- since timestamp present ----------
 
 fresh_state

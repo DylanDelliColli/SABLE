@@ -73,7 +73,12 @@ There is **one install** — no tiers, no topology choices. It:
    registry, the four pane role files, the SABLE skills) and auto-merges its
    settings snippet (backed up; existing entries preserved)
 6. Prepends the SABLE Prime Directives to `~/.claude/CLAUDE.md` (with a timestamped backup if one already exists)
-7. Prints the base-hook JSON snippet you paste into `~/.claude/settings.json` (does NOT auto-edit that block — you review and paste). The snippet includes the `sable-doctor --quiet` SessionStart drift-warn.
+7. Prints the base-hook JSON snippet you paste into `~/.claude/settings.json`
+   (does NOT auto-edit that block — you review and paste). The orchestration
+   installer also merges its Claude-style lifecycle hooks into
+   `~/.codex/hooks.json`, so Codex manager/worker panes receive the same
+   shell-command guardrails. The snippet includes the
+   `sable-doctor --quiet` SessionStart drift-warn.
 8. Stages (never activates) the reconciliation-floor host timer artifacts under `~/.claude/sable/reconcile-timer/` — activation is a deliberate operator step: one command, `sable-reconcile-timer --install-schedule`, which installs the units *and* verifies afterwards that a schedule really fires (exit 3 if not). By default it sweeps the repo you installed from; set `SABLE_RECONCILE_TARGET_REPO=<repo>[:<repo>...]` before installing to name other fleets, since a timer that sweeps one repo leaves every other fleet on the host unprotected while looking installed (SABLE-5xz68).
 
 Idempotent and safe to re-run. `bash install.sh --dry-run` reports exactly what
@@ -221,7 +226,22 @@ operator map.
 ls ~/.claude/hooks/multi-manager/        # governance hooks present
 head -1 ~/.claude/sable/agents.yaml      # registry present
 sable-mode get                           # mode-state helper resolves (planning|execution)
+sable-mode providers get                 # frozen execution provider map
 ```
+
+Execution defaults to Claude everywhere. To run a mixed interactive fleet,
+freeze the provider map before launching managers:
+
+```bash
+sable-mode set execution --fleet optimus,tarzan,chuck \
+  --providers optimus=claude,tarzan=codex,chuck=claude,worker=codex
+sable-spawn-manager --all
+```
+
+Managers may use different providers; every worker uses the single `worker`
+provider for that execution session. SABLE launches Codex as a persistent TUI,
+not `codex exec`, and `sable-msg` routes manager/worker messages by tmux pane
+identity regardless of provider.
 
 The mode is **per-repo** — `sable-mode` resolves the state file from the repo you
 are in (`<repo>/.claude/sable/state/mode-state.json`, shared across that repo's

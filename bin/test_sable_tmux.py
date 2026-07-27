@@ -24,7 +24,21 @@ def test_parse_roles_csv():
 
 def test_pane_env_args_sets_identity_and_role():
     args = st.pane_env_args("optimus")
-    assert args == ["-e", "CLAUDE_AGENT_NAME=optimus", "-e", "CLAUDE_AGENT_ROLE=manager"]
+    assert args == [
+        "-e", "SABLE_PROVIDER=claude",
+        "-e", "SABLE_AGENT_NAME=optimus",
+        "-e", "SABLE_AGENT_ROLE=manager",
+        "-e", "CLAUDE_AGENT_NAME=optimus",
+        "-e", "CLAUDE_AGENT_ROLE=manager",
+    ]
+
+
+def test_codex_pane_env_uses_provider_neutral_identity_only():
+    assert st.pane_env_args("tarzan", provider="codex") == [
+        "-e", "SABLE_PROVIDER=codex",
+        "-e", "SABLE_AGENT_NAME=tarzan",
+        "-e", "SABLE_AGENT_ROLE=manager",
+    ]
 
 
 def test_pane_command_plain_when_not_autostart(monkeypatch):
