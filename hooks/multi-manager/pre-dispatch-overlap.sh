@@ -129,78 +129,77 @@ stored_ids = set(os.environ.get('SERIALIZE_WITH_STORED', '').split())
 print(' '.join(sorted(prompt_ids | stored_ids)))
 ")
 
-# Aggregate declared-footprint file claims from this dispatch's beads. Priority:
-# 1) wip_claims metadata (already established — SABLE-szd dedicated field), then
-# 2) a planner-authored '## File footprint' description section (SABLE-jd5fj.6:
-#    the declared-footprint dogfood — see this bead's own description), which
-#    may name extension-less files (e.g. bin/sable-spawn-worker) the generic
-#    regex below would miss, then
-# 3) the generic per-token file-extension regex, for beads authored before the
-#    footprint-section convention. Claims may not exist yet at pre-dispatch time
-#    (this hook and pre-dispatch-claim.sh fire on the same trigger with no
-#    ordering guarantee), so all three sources are unioned.
+# Resolve the SHARED declared-footprint parser (SABLE-g0elq / SABLE-546m5 /
+# SABLE-7gesd — the footprint-parser consolidation). Repo-relative sibling of
+# THIS file, the same resolution inline-body-guard.sh uses: hooks are
+# COPY-installed, so a *.py sibling resolves from the INSTALLED path, and
+# sable-orchestration-install's closure scanner installs the lib (and its own
+# transitive sable_* imports) into BASE/bin alongside this hook because the
+# reference below appears on a NON-COMMENT line. There is no PATH form of a
+# *.py lib — sable-bin-install deliberately skips them.
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+FP_LIB="${HOOK_DIR}/../../bin/sable_footprint_lib.py"
+
+if [ ! -f "$FP_LIB" ]; then
+  # FAIL-OPEN, and LOUDLY. This gate is a scheduling constraint, not a
+  # correctness gate: denying every dispatch because a library is missing is the
+  # gate-that-can-never-release failure (SABLE-47try's do-not clause). But an
+  # unannounced stand-down is exactly the wired-and-inert state SABLE-nn54x was
+  # filed for — a hook that intercepts everything and checks nothing while
+  # every presence probe reports it ACTIVE.
+  python3 -c "
+import json
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'additionalContext': (
+            'OVERLAP CHECK DID NOT RUN — bin/sable_footprint_lib.py was not found '
+            'alongside this installed hook copy, so no declared-footprint overlap '
+            'check ran on this dispatch. ALLOWING (fail-open): a scheduling '
+            'constraint that cannot run must not block work. Re-run install.sh to '
+            'restore the hook dependency closure (SABLE-nn54x).')
+    }
+}))
+"
+  exit 0
+fi
+
+# Aggregate declared-footprint file claims from this dispatch's beads.
+#
+# *** THIS BLOCK USED TO CARRY ITS OWN PARSER, AND THAT WAS THE DEFECT. ***
+# (SABLE-7gesd.) It was the THIRD tokenizer over the '## File footprint'
+# convention, and it disagreed with bin/sable-spawn-worker's overlap_check —
+# the gate that is supposed to answer the SAME QUESTION. Two gates reading
+# different inputs are worse than one gate, because each is silently correct
+# about the subset it reads, so a bead was "declared" or "undeclared" depending
+# on WHICH GATE WAS ASKING. It now pipes bd's JSON to the shared resolver and
+# owns no tokenization at all; see the CLI seam at the bottom of the lib.
+#
+# The union the resolver reads is FOUR sources, not two: wip_claims metadata,
+# footprint_writes metadata, the '## File footprint' section, and WIP-CLAIMS
+# prose lines. `footprint_writes` is the SABLE-7gesd catch — a real, populated
+# field that NO gate read at all, caught live at dispatch on SABLE-21rug.4
+# (footprint_writes set, wip_claims None), which was covered only by luck of
+# good authoring because it ALSO carried a section naming the same paths.
+# Claims may not exist yet at pre-dispatch time (this hook and
+# pre-dispatch-claim.sh fire on the same trigger with no ordering guarantee),
+# which is why every source is unioned rather than tried in priority order.
+#
+# --scavenge keeps leg 3, the pre-convention file-shaped-token scrape over
+# arbitrary prose, for beads authored before the footprint-section convention.
+# It is DISPATCH-SIDE ONLY and the lib enforces that it fires only when no
+# '## File footprint' heading was present: a scavenge over a heading that IS
+# present and unreadable would launder a mis-authored declaration into a
+# "successful" parse and re-open the door SABLE-47try closed.
 #
 # SABLE-47try: each bead is read as TWO streams, not one — 'f<path>' for a file
 # and 'u<source>' for a footprint SOURCE THAT WAS PRESENT AND YIELDED NO PATH.
 # The old single stream could not tell "this bead declares no footprint" (fine,
 # dispatch) from "this bead's footprint could not be read" (the gate cannot run
 # at all), so the `[ -z "$DISPATCH_FILES" ] && exit 0` below silently STOOD DOWN
-# THE SCHEDULING CONSTRAINT for the second case. This is the shell twin of the
-# same defect in bin/sable-spawn-worker's overlap_check; both had to change or
-# the constraint stayed disable-able through whichever path was left.
-#
-# NOT a port of the python fix — the two gates read different inputs. This one
-# has a generic-regex fallback the python side does not, and does not parse
-# 'WIP-CLAIMS:' prose lines at all (which the python side does). The generic
-# regex is a scavenge over arbitrary prose rather than a declaration, so
-# finding nothing with it is never a failed read and it emits no 'u' marker.
+# THE SCHEDULING CONSTRAINT for the second case.
 DISPATCH_READ=$(for BID in $DISPATCH_IDS; do
-  bd show "$BID" --json 2>/dev/null | python3 -c "
-import json, sys, re
-try:
-    data = json.load(sys.stdin)
-    if not (isinstance(data, list) and data):
-        sys.exit(0)
-    metadata = data[0].get('metadata', {}) or {}
-    wip_claims = metadata.get('wip_claims', '') or ''
-    meta_files = [p.strip() for p in wip_claims.split(',') if p.strip()]
-    for p in meta_files:
-        print('f' + p)
-    if wip_claims.strip() and not meta_files:
-        print('uwip_claims metadata')
-    desc = data[0].get('description', '') or ''
-    # Line-wise body scan, not a body-capturing lookahead (SABLE-wihrz): the
-    # regex form required a non-empty body, so an EMPTY footprint section
-    # followed by another '##' heading captured that heading's literal '##' as
-    # a claimed path — a bogus non-empty footprint that reads as a successful
-    # parse and defeats the very distinction being drawn here.
-    heading = re.compile(r'^##\s*File footprint\s*\$')
-    found = False
-    body = []
-    for line in desc.splitlines():
-        if heading.match(line.strip()):
-            found = True
-            continue
-        if found:
-            if line.strip().startswith('#'):
-                break
-            body.append(line)
-    if found:
-        section_files = []
-        for part in chr(10).join(body).split(','):
-            part = part.strip()
-            if part:
-                section_files.append(part.split()[0])
-        for p in section_files:
-            print('f' + p)
-        if not section_files:
-            print('u' + chr(39) + '## File footprint' + chr(39) + ' section')
-    else:
-        for m in re.finditer(r'(?:^|[\s\(\[\"\\'])((?:[\w\-./]+/)?[\w\-./]+\.(?:ts|tsx|js|jsx|py|rs|go|java|rb|md|yaml|yml|toml|json|sh|sql|css|scss|html))(?=[\s\)\]\"\\',:;]|$)', desc, re.MULTILINE):
-            print('f' + m.group(1))
-except Exception:
-    pass
-" 2>/dev/null
+  bd show "$BID" --json 2>/dev/null | python3 "$FP_LIB" --read-declared --scavenge 2>/dev/null
 done | sort -u)
 
 DISPATCH_FILES=$(printf '%s\n' "$DISPATCH_READ" | sed -n 's/^f//p')
@@ -255,6 +254,7 @@ print(json.dumps({
             'NO-DECLARATION — dispatched bead(s) '
             + os.environ.get('DISPATCH_ID_LIST', '')
             + ' declare NO file footprint at all (no wip_claims metadata, no '
+              'footprint_writes metadata, no WIP-CLAIMS line, no '
             + chr(39) + '## File footprint' + chr(39) + ' section, no '
               'file-shaped token in the description). The overlap SCHEDULING '
               'CONSTRAINT has no input to compare this dispatch against, and '
@@ -270,34 +270,69 @@ fi
 # Find all in-progress beads (status=in_progress) not in dispatch set
 IN_PROGRESS=$(bd list --status=in_progress --json --limit 0 2>/dev/null || echo "[]")
 
-OVERLAPS_JSON=$(echo "$IN_PROGRESS" | DISPATCH_IDS="$DISPATCH_IDS" DISPATCH_FILES="$DISPATCH_FILES" python3 -c "
-import json, sys, os
+# *** SABLE-7gesd, THE BEAD. THE IN-PROGRESS SIDE IS READ THROUGH THE SAME
+# RESOLVER AS THE DISPATCHING SIDE. ***
+#
+# This block used to read `metadata.get('wip_claims')` AND NOTHING ELSE for each
+# in-progress bead — no footprint section, no footprint_writes, no prose. So an
+# in-progress bead whose footprint lives ONLY in its '## File footprint'
+# section — the DECOMPOSITION-authored form SABLE-jd5fj.6 introduced and the form
+# planners are TOLD to write — CONTRIBUTED NOTHING TO THIS COMPARISON. It could
+# not be overlapped with. Meanwhile bin/sable-spawn-worker's own overlap_check
+# read the full union for the same beads, so the two gates that exist to answer
+# the same question answered it from different inputs.
+#
+# Failure shape: RELEASING AND SILENT. The gate returned "no overlap" having
+# never looked at the declared footprint of the bead it should have collided
+# with. pre-dispatch-claim.sh normally writes wip_claims metadata, which MASKED
+# this whenever it had already fired — but this hook's own header states there is
+# NO ORDERING GUARANTEE between the two hooks, and that is precisely the window
+# this gate exists to cover.
+#
+# NOTE the asymmetry that is DELIBERATE and must stay: the dispatch read above
+# passes --scavenge, this one does not. A prose scavenge on the in-progress side
+# would make every bead claim every file its description happens to mention, and
+# the gate would deny every dispatch — the exact mirror of the failure being
+# fixed here, and trivially "safe" while destroying dispatch entirely.
+IN_PROGRESS_READ=$(printf '%s' "$IN_PROGRESS" | python3 "$FP_LIB" --read-declared-list 2>/dev/null) || IN_PROGRESS_READ=""
+
+OVERLAPS_JSON=$(IN_PROGRESS_JSON="$IN_PROGRESS" IN_PROGRESS_READ="$IN_PROGRESS_READ" DISPATCH_IDS="$DISPATCH_IDS" DISPATCH_FILES="$DISPATCH_FILES" python3 -c "
+import json, os
 
 dispatch_ids = set(os.environ.get('DISPATCH_IDS', '').split())
 dispatch_files = set(os.environ.get('DISPATCH_FILES', '').split('\n'))
 dispatch_files.discard('')
 
+# Assignees come from the bd payload; the FILES come from the shared resolver's
+# '<id>\tf<path>' stream. Splitting it this way keeps every tokenization decision
+# in the lib and leaves this block doing set algebra only.
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(os.environ.get('IN_PROGRESS_JSON') or '[]')
 except Exception:
     data = []
-
 if not isinstance(data, list):
     data = []
+assignees = {i.get('id', ''): (i.get('assignee', '') or 'unassigned')
+             for i in data if isinstance(i, dict)}
+
+claimed = {}
+for line in (os.environ.get('IN_PROGRESS_READ') or '').splitlines():
+    if chr(9) not in line:
+        continue
+    bid, rest = line.split(chr(9), 1)
+    if not bid or not rest.startswith('f'):
+        continue  # 'u' lines are the unreadable-source channel, not a claim
+    claimed.setdefault(bid, set()).add(rest[1:])
 
 overlaps = []
-for item in data:
-    bid = item.get('id', '')
-    if not bid or bid in dispatch_ids:
+for bid in sorted(claimed):
+    if bid in dispatch_ids:
         continue
-    metadata = item.get('metadata', {}) or {}
-    wip_claims = metadata.get('wip_claims', '') or ''
-    files = set(p.strip() for p in wip_claims.split(',') if p.strip())
-    shared = files & dispatch_files
+    shared = claimed[bid] & dispatch_files
     if shared:
         overlaps.append({
             'bead': bid,
-            'assignee': item.get('assignee', '') or 'unassigned',
+            'assignee': assignees.get(bid, 'unassigned'),
             'files': sorted(shared),
         })
 
