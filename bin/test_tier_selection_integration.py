@@ -8,6 +8,7 @@ a skip, never a false-fail/false-pass) when either plugin isn't importable in
 this interpreter.
 """
 import importlib.util
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -220,12 +221,95 @@ def test_missing_testmondata_falls_back_to_full_run_for_real_repo(fixture_repo):
 _THIS_FILE_RELATIVE = "bin/" + Path(__file__).name
 
 
+# WHY THIS ASSERTION EXPLAINS ITSELF (SABLE-jd5fj.19 revise, measured 2026-07-26)
+#
+# `assert rc == 0` used to be bare, and a bare red here is UNDIAGNOSABLE: it
+# reports `assert -15 == 0` and nothing else. That collapsed two failures
+# that need OPPOSITE responses into one indistinguishable red --
+#   rc > 0  the nested run exited on its own and classify_cache_warm_outcome
+#           refused to tolerate it. A REAL regression: the suite went red, or
+#           the crash-tolerance carve-out stopped matching. Must block a merge.
+#   rc < 0  the nested pytest was killed by a SIGNAL. run_cache_warm's
+#           tolerance logic cannot produce a negative rc at all, so this is
+#           not a tolerance failure -- the child process was destroyed from
+#           outside. Correct response is to re-run, not to change code.
+# -- and the collapse cost a full review cycle: this test was read as a
+# branch regression on the strength of `-15`, and the hypothesis (new unit
+# tests in bin/ interacting with the nested full-suite run) was reasonable
+# and wrong. A base-vs-branch control cleared it, and an isolated SIGTERM
+# delivered to only the nested pytest reproduced `assert -15 == 0` exactly,
+# including the truncated captured stdout.
+#
+# It is deliberately still a FAILURE in both cases -- a killed run proves
+# nothing and must never be tolerated or retried into a green. Only the
+# legibility of the red changes.
+
+
+def _explain_cache_warm_rc(rc):
+    """The message the bare assert should have carried. Pure; unit-tested in
+    both polarities below so it cannot silently stop discriminating."""
+    if rc < 0:
+        sig = signal.Signals(-rc).name if -rc in signal.Signals.__members__.values() \
+            else f"signal {-rc}"
+        return (
+            f"the nested cache-warm pytest was KILLED BY {sig} (rc={rc}). This is "
+            "NOT a cache-warm tolerance failure -- classify_cache_warm_outcome only "
+            "ever returns a returncode the child chose for itself, and a child that "
+            "picks its own exit status never yields a negative one. Something "
+            "destroyed the process. SIGTERM/SIGKILL here means an external agent "
+            "(an agent-harness or tool wall-clock timeout, a manual interrupt, a "
+            "concurrent reaper) reached the child; SIGSEGV/SIGBUS would instead mean "
+            "the interpreter itself crashed and IS worth investigating. Re-run "
+            "before treating this as a code regression -- and if you are bisecting a "
+            "branch, take a base-vs-branch control, because this red carries no "
+            "information about the diff."
+        )
+    return (
+        f"the nested cache-warm pytest exited {rc} and classify_cache_warm_outcome "
+        "refused to tolerate it. This IS a real regression: either a test in bin/ "
+        "went red, or the pytest-testmon extensionless-file carve-out stopped "
+        "matching (it requires the crash markers AND an 'N passed' line AND no "
+        "'N failed'/'N error'). Read the captured stdout above -- run_cache_warm "
+        "echoes the whole nested run -- and start from its summary line."
+    )
+
+
 def test_real_repo_full_suite_testmon_noselect_crash_is_tolerated():
     # --ignore=<this file> avoids the nested pytest run recursing into the
     # test that is currently invoking it (this suite runs bin/ broadly).
     repo_root = Path(__file__).resolve().parent.parent
     rc = ts.run_cache_warm(repo_root, extra_pytest_args=[f"--ignore={_THIS_FILE_RELATIVE}"])
-    assert rc == 0
+    assert rc == 0, _explain_cache_warm_rc(rc)
+
+
+def test_explain_cache_warm_rc_names_the_signal_for_a_killed_child():
+    msg = _explain_cache_warm_rc(-15)
+
+    assert "SIGTERM" in msg
+    assert "NOT a cache-warm tolerance failure" in msg
+    # The actionable half: a killed child means re-run, not edit code.
+    assert "Re-run" in msg
+
+
+def test_negative_control_explain_cache_warm_rc_does_not_cry_signal_for_a_real_failure():
+    # BOTH polarities. A message that called every red a killed child would be
+    # exactly as undiagnosable as the bare assert was, in the opposite
+    # direction -- it would talk a genuine suite regression into a re-run.
+    msg = _explain_cache_warm_rc(3)
+
+    assert "real regression" in msg
+    assert "KILLED" not in msg
+    assert "SIGTERM" not in msg
+    assert "Re-run" not in msg
+
+
+def test_explain_cache_warm_rc_falls_back_when_the_signal_number_is_unknown():
+    # -99 is not a real signal; the helper must still say something true
+    # rather than raise inside an assertion message and mask the failure.
+    msg = _explain_cache_warm_rc(-99)
+
+    assert "signal 99" in msg
+    assert "NOT a cache-warm tolerance failure" in msg
 
 
 # --- the extensionless-file crash: reachable by EXECUTION, not by collection -
