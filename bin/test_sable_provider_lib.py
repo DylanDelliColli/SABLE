@@ -14,7 +14,9 @@ from sable_provider_lib import (
     provider_model,
     interactive_command,
     execution_provider,
+    execution_provider_map,
     provider_boot_message,
+    validate_provider_capabilities,
 )
 
 
@@ -140,6 +142,20 @@ def test_execution_provider_rejects_nonexecution_state(tmp_path, monkeypatch):
     monkeypatch.setenv("SABLE_MODE_STATE", str(state))
     with pytest.raises(ProviderMapError, match="execution mode"):
         execution_provider("worker")
+    assert execution_provider_map() is None
+
+
+def test_execution_provider_map_fails_closed_on_corrupt_state(tmp_path, monkeypatch):
+    state = tmp_path / "mode.json"
+    state.write_text("{broken")
+    monkeypatch.setenv("SABLE_MODE_STATE", str(state))
+    with pytest.raises(ProviderMapError, match="cannot read"):
+        execution_provider_map()
+
+
+def test_supported_providers_declare_required_fleet_capabilities():
+    validate_provider_capabilities("claude")
+    validate_provider_capabilities("codex")
 
 
 def test_codex_boot_message_anchors_the_installed_role_card(tmp_path):

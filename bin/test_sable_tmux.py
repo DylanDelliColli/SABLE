@@ -41,6 +41,14 @@ def test_codex_pane_env_uses_provider_neutral_identity_only():
     ]
 
 
+def test_main_refuses_corrupt_execution_provider_state(tmp_path, monkeypatch, capsys):
+    state = tmp_path / "mode.json"
+    state.write_text("{broken")
+    monkeypatch.setenv("SABLE_MODE_STATE", str(state))
+    assert st.main(["--roles", "optimus"]) == 5
+    assert "refusing invalid provider state" in capsys.readouterr().err
+
+
 def test_pane_command_plain_when_not_autostart(monkeypatch):
     monkeypatch.delenv("SABLE_TMUX_PANE_CMD", raising=False)
     assert st.pane_command("optimus", False) == "claude"

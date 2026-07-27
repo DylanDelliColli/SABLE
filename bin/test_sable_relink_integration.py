@@ -2,7 +2,8 @@
 """Integration tests for bin/sable-relink against a REAL tmux server (SABLE-to8m).
 
 Isolated socket (-L). Proves end-to-end that a pane whose process carries an
-authoritative CLAUDE_AGENT_NAME can re-register its own mutable identity tags:
+authoritative SABLE_AGENT_NAME (or legacy CLAUDE_AGENT_NAME) can re-register its
+own mutable identity tags:
 running sable-relink FROM INSIDE the pane rewrites @sable_role to the process
 identity and clears the stale @sable_status. Models the resumed-cockpit fix — a
 finished worker window whose interactive session is now the operator.
@@ -77,6 +78,26 @@ def test_relink_refuses_to_forge_a_disagreeing_role(sock):
     assert rc == "rc=1"                                   # refused
     assert _opt(sock, "w", "@sable_role") == "worker"     # tag left untouched
     Path(rc_file).unlink(missing_ok=True)
+
+
+def test_codex_pane_relinks_sable_identity_and_provider(sock):
+    _tmux(
+        sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
+        "-e", "SABLE_AGENT_NAME=tarzan", "-e", "SABLE_AGENT_ROLE=manager",
+        "-e", "SABLE_PROVIDER=codex", "PS1='> ' bash --noprofile --norc",
+    )
+    time.sleep(0.4)
+    _tmux(sock, "set-option", "-p", "-t", "w", "@sable_role", "worker")
+    _tmux(sock, "set-option", "-p", "-t", "w", "@sable_provider", "claude")
+
+    _tmux(
+        sock, "send-keys", "-t", "w",
+        f"SABLE_TMUX_SOCKET={sock} python3 {BIN}", "Enter",
+    )
+    time.sleep(1.2)
+
+    assert _opt(sock, "w", "@sable_role") == "tarzan"
+    assert _opt(sock, "w", "@sable_provider") == "codex"
 
 
 if __name__ == "__main__":

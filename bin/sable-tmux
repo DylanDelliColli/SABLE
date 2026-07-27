@@ -37,7 +37,7 @@ from sable_pane_lib import (  # noqa: E402
     repo_root, resolve_session, wait_for_ready,
 )
 from sable_provider_lib import (  # noqa: E402
-    ProviderMapError, execution_provider, interactive_command, pane_environment,
+    ProviderMapError, execution_provider_map, interactive_command, pane_environment,
     provider_boot_message,
 )
 
@@ -118,17 +118,19 @@ def main(argv: list[str] | None = None) -> int:
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
     base = tmux_base(socket)
     root = repo_root()
+    try:
+        execution_providers = execution_provider_map(base=root)
+    except ProviderMapError as e:
+        sys.stderr.write(f"sable-tmux: refusing invalid provider state: {e}\n")
+        return 5
     providers: dict[str, str] = {}
     for role in roles:
         if role not in AUTONOMOUS_ROLES:
             providers[role] = "claude"
             continue
-        try:
-            providers[role] = execution_provider(role, base=root)
-        except ProviderMapError:
-            # Legacy/planning layouts remain all-Claude; execution launchers
-            # enforce the frozen map through sable-spawn-manager.
-            providers[role] = "claude"
+        providers[role] = (
+            execution_providers[role] if execution_providers else "claude"
+        )
     if ns.session:
         sess = ns.session
     else:

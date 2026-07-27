@@ -45,6 +45,13 @@ freezes a provider for each manager and one provider shared by all workers;
 launchers stamp `SABLE_AGENT_NAME`, `SABLE_AGENT_ROLE`, and `SABLE_PROVIDER`
 (Claude also receives the legacy `CLAUDE_*` aliases).
 
+Both adapters must supply the same fleet capabilities before launch:
+persistent interactive TUI, tmux message delivery, lifecycle hooks,
+workspace writes, and network access for the self-push lifecycle. Provider
+state is fail-closed: corrupt execution state, a retained pane whose
+`@sable_provider` disagrees with the frozen map, or a missing capability
+refuses fleet start instead of silently falling back to Claude.
+
 ```
 ┌─ lincoln (lead/cockpit) ───┬─ optimus (epic mgr) ──────┐
 │ operator talks here;       │ plans/bundles epic beads; │

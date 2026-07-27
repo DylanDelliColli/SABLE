@@ -48,6 +48,24 @@ def test_plan_spawns_skips_existing():
     assert skipped == ["optimus"]
 
 
+def test_existing_provider_map_defaults_legacy_panes_to_claude():
+    listing = "%1\toptimus\tcodex\n%2\ttarzan\t\n%3 chuck"
+    assert sm.parse_existing_providers(listing) == {
+        "optimus": "codex",
+        "tarzan": "claude",
+        "chuck": "claude",
+    }
+
+
+def test_retained_pane_provider_mismatch_is_refused():
+    mismatches = sm.provider_mismatches(
+        ["optimus", "tarzan"],
+        {"optimus": "claude", "tarzan": "codex"},
+        {"optimus": "codex", "tarzan": "codex"},
+    )
+    assert mismatches == [("optimus", "claude", "codex")]
+
+
 def test_window_args_are_detached_named_windows():
     args = sm.window_args("sable", "optimus", "bash")
     assert "new-window" in args

@@ -19,6 +19,17 @@ from pathlib import Path
 PROVIDER_ROLES = ("optimus", "tarzan", "chuck", "worker")
 SUPPORTED_PROVIDERS = frozenset({"claude", "codex"})
 DEFAULT_PROVIDER = "claude"
+REQUIRED_CAPABILITIES = frozenset({
+    "interactive_tui",
+    "pane_messaging",
+    "lifecycle_hooks",
+    "workspace_write",
+    "network",
+})
+PROVIDER_CAPABILITIES = {
+    "claude": REQUIRED_CAPABILITIES,
+    "codex": REQUIRED_CAPABILITIES,
+}
 MODEL_TIERS = {
     "claude": {
         "fast": "haiku", "balanced": "sonnet", "deep": "opus",
@@ -138,10 +149,15 @@ def resolve_mode_state_path(base: str | None = None) -> Path:
         return Path.home() / ".claude/sable/state/mode-state.json"
 
 
-def execution_provider(role: str, *, base: str | None = None) -> str:
-    """Return the provider frozen for ``role`` in active execution state."""
+def execution_provider_map(*, base: str | None = None) -> dict[str, str] | None:
+    """Return active execution providers, or None outside execution mode.
 
+    A missing state means no execution session. A present but malformed state
+    is an invariant violation and fails closed rather than selecting Claude.
+    """
     path = resolve_mode_state_path(base)
+    if not path.exists():
+        return None
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -149,14 +165,39 @@ def execution_provider(role: str, *, base: str | None = None) -> str:
             f"cannot read execution provider map from {path}: {exc}"
         ) from exc
     if state.get("mode") != "execution":
+        return None
+    return provider_map_from_state(state)
+
+
+def execution_provider(role: str, *, base: str | None = None) -> str:
+    """Return the provider frozen for ``role`` in active execution state."""
+
+    providers = execution_provider_map(base=base)
+    if providers is None:
         raise ProviderMapError("provider-aware panes require execution mode")
-    return provider_for_role(state, role)
+    normalized_role = role.strip().lower()
+    if normalized_role not in providers:
+        raise ProviderMapError(f"unknown provider role {role!r}")
+    return providers[normalized_role]
+
+
+def validate_provider_capabilities(provider: str) -> None:
+    normalized = normalize_provider(provider)
+    missing = REQUIRED_CAPABILITIES - PROVIDER_CAPABILITIES.get(
+        normalized, frozenset()
+    )
+    if missing:
+        raise ProviderMapError(
+            f"provider {normalized} lacks required fleet capabilities: "
+            + ", ".join(sorted(missing))
+        )
 
 
 def provider_model(provider: str, tier: str) -> tuple[str, str | None]:
     """Translate SABLE's existing model tiers into a provider model/effort."""
 
     normalized = normalize_provider(provider)
+    validate_provider_capabilities(normalized)
     key = (tier or "balanced").strip().lower()
     model = MODEL_TIERS[normalized].get(key)
     if model is None:

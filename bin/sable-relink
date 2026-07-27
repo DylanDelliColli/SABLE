@@ -7,8 +7,8 @@ with the process actually running in the pane — e.g. the lincoln cockpit resum
 into a finished worker window still carried the worker's @sable_role=worker and a
 stale @sable_status=done, so messaging misrouted and the reaper considered the
 cockpit killable. This command rewrites those tags to AGREE with the pane's
-AUTHORITATIVE identity: the CLAUDE_AGENT_NAME of the live process (this very
-process, which inherited it from the pane's env).
+AUTHORITATIVE identity: SABLE_AGENT_NAME (with the legacy CLAUDE_AGENT_NAME
+fallback) of the live process.
 
 It is authority-bound. It can only stamp the role the process env backs; you
 cannot use it to forge an identity the env does not carry (that would merely
@@ -21,7 +21,7 @@ Run it FROM INSIDE the pane you want to re-register.
 Usage:
   sable-relink [role] [--bead <id>] [--status <status>]
 
-  role        identity to stamp; must equal the pane process's CLAUDE_AGENT_NAME
+  role        identity to stamp; must equal the pane process's SABLE identity
               (default: that env value itself)
   --bead <id> also set @sable_bead=<id>
   --status <s> set @sable_status=<s> (default: CLEAR the tag)
@@ -33,6 +33,9 @@ import os
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_provider_lib import agent_name, normalize_provider  # noqa: E402
+
 
 class RelinkError(RuntimeError):
     """The requested relink cannot be performed (no authority / mismatch)."""
@@ -40,7 +43,8 @@ class RelinkError(RuntimeError):
 
 def resolve_relink_role(requested: str | None, env_identity: str | None) -> str:
     """The role to stamp, or raise RelinkError. The pane process's
-    CLAUDE_AGENT_NAME (`env_identity`) is the authority: with none, there is
+    SABLE_AGENT_NAME / legacy CLAUDE_AGENT_NAME (`env_identity`) is the authority:
+    with none, there is
     nothing to re-register to (relaunch the session with its identity in the env
     first); a `requested` role that disagrees with it is refused rather than
     stamped — relink can only re-assert the identity the process actually
@@ -48,7 +52,8 @@ def resolve_relink_role(requested: str | None, env_identity: str | None) -> str:
     if not env_identity:
         raise RelinkError(
             "no authoritative identity: this pane's process has no "
-            "CLAUDE_AGENT_NAME. Relaunch the session with its identity in the env "
+            "SABLE_AGENT_NAME (or legacy CLAUDE_AGENT_NAME). Relaunch the session "
+            "with its identity in the env "
             "(sable-tmux / sable-spawn-*) before relinking.")
     if requested and requested != env_identity:
         raise RelinkError(
@@ -59,11 +64,15 @@ def resolve_relink_role(requested: str | None, env_identity: str | None) -> str:
 
 
 def relink_ops(pane: str, role: str, bead: str | None = None,
-               status: str | None = None) -> list[list[str]]:
+               status: str | None = None,
+               provider: str = "claude") -> list[list[str]]:
     """The tmux set-option arg-lists (without the base) that re-register `pane`.
     @sable_status is SET when `status` is given, else UNSET (-u) so a
     re-registered cockpit/interactive pane sheds a prior worker's done flag."""
-    ops = [["set-option", "-p", "-t", pane, "@sable_role", role]]
+    ops = [
+        ["set-option", "-p", "-t", pane, "@sable_role", role],
+        ["set-option", "-p", "-t", pane, "@sable_provider", provider],
+    ]
     if bead:
         ops.append(["set-option", "-p", "-t", pane, "@sable_bead", bead])
     if status:
@@ -84,7 +93,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                     "its authoritative process env (SABLE-to8m).")
     p.add_argument("role", nargs="?",
                    help="identity to stamp (default: the pane process's "
-                        "CLAUDE_AGENT_NAME)")
+                        "SABLE_AGENT_NAME / legacy CLAUDE_AGENT_NAME)")
     p.add_argument("--bead", help="also set @sable_bead=<id>")
     p.add_argument("--status", help="set @sable_status=<s> (default: clear it)")
     return p.parse_args(argv)
@@ -98,16 +107,19 @@ def main(argv: list[str] | None = None) -> int:
             "sable-relink: not inside a tmux pane ($TMUX_PANE unset). Run this "
             "from inside the pane you want to re-register.\n")
         return 2
-    env_identity = (os.environ.get("CLAUDE_AGENT_NAME") or "").strip() or None
+    env_identity = agent_name(os.environ)
     try:
         role = resolve_relink_role(ns.role, env_identity)
-    except RelinkError as e:
+        provider = normalize_provider(os.environ.get("SABLE_PROVIDER"))
+    except (RelinkError, ValueError) as e:
         sys.stderr.write(f"sable-relink: {e}\n")
         return 1
 
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
     base = tmux_base(socket)
-    for op in relink_ops(pane, role, bead=ns.bead, status=ns.status):
+    for op in relink_ops(
+        pane, role, bead=ns.bead, status=ns.status, provider=provider
+    ):
         r = subprocess.run(base + op, capture_output=True, text=True)
         if r.returncode != 0:
             sys.stderr.write(
@@ -118,7 +130,8 @@ def main(argv: list[str] | None = None) -> int:
     bead_note = f", @sable_bead={ns.bead}" if ns.bead else ""
     sys.stderr.write(
         f"sable-relink: re-registered {pane} as @sable_role={role}"
-        f"{bead_note}{status_note} (authority: CLAUDE_AGENT_NAME={env_identity}).\n")
+        f"{bead_note}{status_note} (authority: SABLE identity={env_identity}, "
+        f"provider={provider}).\n")
     return 0
 
 

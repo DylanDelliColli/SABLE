@@ -268,6 +268,33 @@ def parse_existing_roles(output: str) -> set[str]:
     return roles
 
 
+def parse_existing_providers(output: str) -> dict[str, str]:
+    """Map role to its pane provider; legacy untagged panes are Claude."""
+
+    providers: dict[str, str] = {}
+    for line in output.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[1]:
+            providers[parts[1]] = parts[2] if len(parts) >= 3 and parts[2] else "claude"
+            continue
+        words = line.split()
+        if len(words) >= 2:
+            providers[words[1]] = "claude"
+    return providers
+
+
+def provider_mismatches(
+    requested: list[str],
+    existing: dict[str, str],
+    expected: dict[str, str],
+) -> list[tuple[str, str, str]]:
+    return [
+        (role, existing[role], expected[role])
+        for role in requested
+        if role in existing and existing[role] != expected[role]
+    ]
+
+
 def plan_spawns(requested: list[str], existing: set[str]) -> tuple[list[str], list[str]]:
     to_spawn = [r for r in requested if r not in existing]
     skipped = [r for r in requested if r in existing]
@@ -405,10 +432,33 @@ def main(argv: list[str] | None = None) -> int:
                          f"start one with: sable-launch\n")
         return 1
 
+    root = repo_root()
+    provider_by_role: dict[str, str] = {}
+    for role in requested:
+        provider_role = "worker" if role in PRODUCER_ROLES else strip_instance_suffix(role)
+        try:
+            provider_by_role[role] = execution_provider(provider_role, base=root)
+        except ProviderMapError as e:
+            sys.stderr.write(f"sable-spawn-manager: {e}\n")
+            return 5
+
     listing = subprocess.run(base + ["list-panes", "-s", "-t", session,
-                                     "-F", "#{pane_id} #{@sable_role}"],
+                                     "-F", "#{pane_id}\t#{@sable_role}\t#{@sable_provider}"],
                              capture_output=True, text=True).stdout
     to_spawn, skipped = plan_spawns(requested, parse_existing_roles(listing))
+    mismatches = provider_mismatches(
+        requested, parse_existing_providers(listing), provider_by_role
+    )
+    if mismatches:
+        detail = ", ".join(
+            f"{role} is {actual}, execution requires {wanted}"
+            for role, actual, wanted in mismatches
+        )
+        sys.stderr.write(
+            "sable-spawn-manager: refusing stale provider pane(s): "
+            f"{detail}. Stand down/reap those panes before relaunch.\n"
+        )
+        return 5
     for role in skipped:
         sys.stderr.write(f"sable-spawn-manager: {role} already running — skipping\n")
 
@@ -417,15 +467,9 @@ def main(argv: list[str] | None = None) -> int:
     poll_interval = float(os.environ.get("SABLE_DISPATCH_POLL_INTERVAL", "1.0"))
     producer_model = ns.model or DEFAULT_PRODUCER_MODEL
 
-    root = repo_root()
     for role in to_spawn:
         is_producer = role in PRODUCER_ROLES
-        provider_role = "worker" if is_producer else strip_instance_suffix(role)
-        try:
-            provider = execution_provider(provider_role, base=root)
-        except ProviderMapError as e:
-            sys.stderr.write(f"sable-spawn-manager: {e}\n")
-            return 5
+        provider = provider_by_role[role]
         cmd = (producer_command(producer_model, provider, root)
                if is_producer else manager_command(provider, root))
         pane = subprocess.run(base + window_args(session, role, cmd, provider),
