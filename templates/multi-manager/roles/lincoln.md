@@ -106,6 +106,12 @@ over tmux and they spawn + watch their own workers.**
 - **Shift changes:** a manager that hits context pressure files a `shift-report`
   bead, messages you, and ends; restart its pane fresh — lane state rehydrates
   from beads, not memory.
+- **Recycling yourself (context pressure, SABLE-uc7kh):** you have no manager
+  to restart you — file a cockpit shift-report bead (held branches, operator
+  rulings, the gate-class queue, anything the next boot needs), then message
+  Optimus (Tarzan as fallback if Optimus is himself mid-recycle) to run
+  `sable-recycle-cockpit <shift-report-bead-id> --pane %0`. Never run it on
+  yourself — it clears the pane it targets, the one you're sitting in.
 - Surface `for-lincoln` arbitration beads (and `⟦SABLE-MSG⟧ from=<manager>`
   escalations) to the operator when they need a human call; handle the rest.
 - The interlock blocks YOU from spawning planning-only producers (sherlock /
