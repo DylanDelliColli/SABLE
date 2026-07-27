@@ -232,6 +232,46 @@ else
   fail "(c) after fanning out the transitively-sourced lib too, --check exits 0" "rc=$RC_C2"
 fi
 
+# ---------------------------------------------------------------------------
+# Case (d): a production Python module with its convention-mandated pytest
+# companion is owned by the Python selector. With no explicit COVERS entry it
+# selects zero shell suites rather than the full ALLOW set. Removing the
+# companion restores the conservative full-shell fallback.
+# ---------------------------------------------------------------------------
+FIX_D="$(new_fixture case-d)"
+mkdir -p "$FIX_D/bin"
+mk_suite "$FIX_D/hooks/test/test-fixture-d.sh"
+printf 'VALUE = 1\n' > "$FIX_D/bin/widget.py"
+printf 'def test_widget(): assert True\n' > "$FIX_D/bin/test_widget.py"
+set_manifest "$FIX_D" "test-fixture-d.sh" '{}' '{}' '{}'
+
+OUT_D1=$(bash "$FIX_D/.github/ci/impact-manifest.sh" --select bin/widget.py 2>"$FIX_D/stderr"); RC_D1=$?
+ERR_D1=$(cat "$FIX_D/stderr")
+if [ "$RC_D1" -eq 0 ] && [ -z "$OUT_D1" ] && printf '%s' "$ERR_D1" | grep -q 'SCOPED'; then
+  pass "(d) bin/X.py with bin/test_X.py and no shell COVERS -> scoped zero shell suites"
+else
+  fail "(d) bin/X.py with bin/test_X.py and no shell COVERS -> scoped zero shell suites" "rc=$RC_D1 out=$OUT_D1 err=$ERR_D1"
+fi
+
+rm -f "$FIX_D/bin/test_widget.py"
+OUT_D2=$(bash "$FIX_D/.github/ci/impact-manifest.sh" --select bin/widget.py 2>"$FIX_D/stderr"); RC_D2=$?
+ERR_D2=$(cat "$FIX_D/stderr")
+if [ "$RC_D2" -eq 0 ] && [ "$OUT_D2" = "test-fixture-d.sh" ] && printf '%s' "$ERR_D2" | grep -q 'FULL'; then
+  pass "(d) removing the Python companion restores the conservative full-shell fallback"
+else
+  fail "(d) removing the Python companion restores the conservative full-shell fallback" "rc=$RC_D2 out=$OUT_D2 err=$ERR_D2"
+fi
+
+printf '#!/usr/bin/env python3\nVALUE = 1\n' > "$FIX_D/bin/sable-widget"
+printf 'def test_widget(): assert True\n' > "$FIX_D/bin/test_sable_widget_lib.py"
+OUT_D3=$(bash "$FIX_D/.github/ci/impact-manifest.sh" --select bin/sable-widget 2>"$FIX_D/stderr"); RC_D3=$?
+ERR_D3=$(cat "$FIX_D/stderr")
+if [ "$RC_D3" -eq 0 ] && [ -z "$OUT_D3" ] && printf '%s' "$ERR_D3" | grep -q 'SCOPED'; then
+  pass "(d) extensionless Python CLI with matching pytest module -> scoped zero shell suites"
+else
+  fail "(d) extensionless Python CLI with matching pytest module -> scoped zero shell suites" "rc=$RC_D3 out=$OUT_D3 err=$ERR_D3"
+fi
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

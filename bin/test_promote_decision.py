@@ -56,6 +56,23 @@ git_lib = smg.git_lib
 preview_lib = smg.preview_lib
 promote_lib = smg.promote_lib
 footprint_lib = smg.footprint_lib
+_REAL_SHUTIL_WHICH = shutil.which
+
+
+@pytest.fixture(autouse=True)
+def _do_not_build_a_real_bd_store_for_unrelated_unit_tests(monkeypatch):
+    """Keep ambient bd installation from adding seconds to every tier fixture.
+
+    One explicit test below restores the real binary and proves the isolated
+    BEADS_DB contract end to end. The other tests exercise worktree, locking,
+    selection, and reporting behavior; repeatedly initializing a real store
+    in each of them adds no coverage.
+    """
+    monkeypatch.setattr(
+        promote_lib.shutil,
+        "which",
+        lambda command: None if command == "bd" else _REAL_SHUTIL_WHICH(command),
+    )
 
 decide = promote_lib.decide_promotion
 
@@ -1570,9 +1587,8 @@ def test_impact_tier_uses_a_warm_testmon_map_when_one_exists(tmp_path, monkeypat
 
 def test_impact_tier_falls_back_to_the_gate_persisted_cache_when_the_repo_has_none(
         tmp_path, monkeypatch):
-    """SABLE-jd5fj.8 revise: `repo`'s own root .testmondata is CI's copy and a
-    checkout like Chuck's typically never carries one -- that is the actual gap
-    this bead's approach (a) closes. When repo has no root .testmondata but the
+    """SABLE-jd5fj.8 revise: `repo`'s own root .testmondata is optional and a
+    checkout like Chuck's may never carry one. When repo has no root map but the
     gate's OWN persisted cache (_warm_testmondata_path) does, that persisted copy
     must be used instead of silently falling all the way to cold."""
     repo, sha = _real_repo_with_bin_impact_tier(tmp_path)
@@ -1616,8 +1632,7 @@ def test_impact_tier_names_a_stale_or_corrupt_warm_map_that_falls_back_internall
 
 
 def test_warm_gate_testmon_cache_refreshes_the_persisted_cache(tmp_path, monkeypatch):
-    """SABLE-jd5fj.8: `sable-merge-gate warm-testmon-cache` is the LOCAL answer
-    to CI's testmon-cache-warm.sh -- it must actually populate the gate-owned
+    """SABLE-jd5fj.8: `sable-merge-gate warm-testmon-cache` must populate the gate-owned
     persisted cache (_warm_testmondata_path) from a real (stubbed, for speed)
     --cache-warm run against the repo's own root .testmondata, so the NEXT
     promote's cold-checkout fallback (the test above) has something to find."""
@@ -2465,10 +2480,10 @@ def test_entering_the_impact_tier_is_announced_even_with_no_queue_wait(isolated_
 # docstring — the same style test_lock_wait_is_not_charged... above already
 # uses for the timeout budget.
 
-HAVE_BD = shutil.which("bd") is not None
+HAVE_BD = _REAL_SHUTIL_WHICH("bd") is not None
 
 
-def test_the_tier_runs_suites_under_an_isolated_bd_db(isolated_lock, tmp_path, monkeypatch):
+def test_the_tier_runs_suites_under_isolated_home_and_tmp(isolated_lock, tmp_path, monkeypatch):
     repo, sha = _real_repo(tmp_path)
     monkeypatch.setenv("SABLE_MG_IMPACT", "true")
     real_run = git_lib._run
@@ -2510,13 +2525,10 @@ def test_the_tier_runs_suites_under_an_isolated_bd_db(isolated_lock, tmp_path, m
         assert env["HOME"].startswith(scratch_parent + os.sep), (
             f"HOME={env['HOME']!r} is not inside this run's own scratch parent {scratch_parent!r}")
         assert env["HOME"] != real_home, "the isolated HOME must not be the real one"
-        if HAVE_BD:
-            assert "BEADS_DB" in env, "bd is on PATH, so this run must have an isolated BEADS_DB"
-            assert env["BEADS_DB"].startswith(scratch_parent + os.sep), (
-                f"BEADS_DB={env['BEADS_DB']!r} is not inside this run's own scratch "
-                f"parent {scratch_parent!r}")
-            assert not env["BEADS_DB"].startswith(repo), (
-                "BEADS_DB must not point inside the gate's own repo")
+        assert "BEADS_DB" not in env, (
+            "this unit test deliberately models bd-absent; the dedicated real-bd "
+            "test below owns BEADS_DB initialization coverage"
+        )
 
     parents = {str(Path(cwd).parent) for cwd, _env in envs}
     assert len(parents) == 2, (
@@ -2530,6 +2542,7 @@ def test_bd_absent_env_still_isolates_home_but_bd_present_isolates_beads_db(tmp_
     bd` (bd ABSENT), not on whether BEADS_DB was redirected. So the isolated env
     must never point BEADS_DB at a DB it could not build — only ever set it once
     bd init on that path actually succeeded."""
+    monkeypatch.setattr(promote_lib.shutil, "which", _REAL_SHUTIL_WHICH)
     env = promote_lib._impact_isolated_env(tmp_path)
     assert "BEADS_DB" in env
     beads_db = Path(env["BEADS_DB"])

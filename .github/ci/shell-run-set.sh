@@ -204,6 +204,7 @@ declare -A EXCLUDE=(
 declare -A COVERS=(
   [test-active-contracts-integration.sh]="hooks/multi-manager/session-role-anchor.sh"
   [test-ci-bd-coverage-gap.sh]=".github/ci/shell-run-set.sh hooks/test/test-dep-merge-state.sh hooks/test/test-overlap-dispatch-e2e.sh hooks/test/lib-require-all.sh"
+  [test-impact-manifest.sh]=".github/ci/impact-manifest.sh"
   [test-control-trace.sh]="hooks/multi-manager/control-trace.sh"
   [test-dep-merge-state.sh]="bin/sable-dep-check bin/sable-spawn-worker"
   [test-doctor-snapshot-staleness.sh]="bin/sable-doctor bin/sable-bin-install install.sh"

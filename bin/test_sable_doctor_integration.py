@@ -45,11 +45,13 @@ def run_doctor(claude_dir: Path, *extra_args, env=None, bin_dir=None):
     # the actual dev machine's pinned bins into every assertion here.
     if bin_dir is None:
         bin_dir = claude_dir.parent / ".local" / "bin"
+    doctor_env = dict(os.environ if env is None else env)
+    doctor_env["HOME"] = str(claude_dir.parent)
     return subprocess.run(
         [sys.executable, str(DOCTOR), "--repo", str(REPO), "--claude-dir", str(claude_dir),
          "--bin-dir", str(bin_dir), *extra_args],
         capture_output=True, text=True, timeout=30,
-        env=env if env is not None else os.environ,
+        env=doctor_env,
     )
 
 
@@ -78,15 +80,16 @@ def run_doctor_project(cwd: Path, *extra_args, bin_dir=None):
          "--bin-dir", str(bin_dir), *extra_args],
         cwd=str(cwd),
         capture_output=True, text=True, timeout=30,
+        env={**os.environ, "HOME": str(cwd)},
     )
 
 
-@pytest.fixture()
-def project_install(tmp_path):
+@pytest.fixture(scope="module")
+def project_install_template(tmp_path_factory):
     # the project IS its own git root, and HOME=project makes install.sh's
     # ${HOME}/.claude land exactly at <project-root>/.claude — the same path
     # --project resolves via git-common-dir.
-    project = tmp_path / "project"
+    project = tmp_path_factory.mktemp("doctor-project-template") / "project"
     project.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
     run_project_install(project)
@@ -94,10 +97,24 @@ def project_install(tmp_path):
 
 
 @pytest.fixture()
-def installed_claude_dir(tmp_path):
-    home = tmp_path / "home"
+def project_install(tmp_path, project_install_template):
+    project = tmp_path / "project"
+    shutil.copytree(project_install_template, project, symlinks=True)
+    return project
+
+
+@pytest.fixture(scope="module")
+def installed_home_template(tmp_path_factory):
+    home = tmp_path_factory.mktemp("doctor-home-template") / "home"
     home.mkdir()
     run_install(home)
+    return home
+
+
+@pytest.fixture()
+def installed_claude_dir(tmp_path, installed_home_template):
+    home = tmp_path / "home"
+    shutil.copytree(installed_home_template, home, symlinks=True)
     return home / ".claude"
 
 

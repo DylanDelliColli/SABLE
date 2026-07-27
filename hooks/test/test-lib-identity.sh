@@ -844,11 +844,10 @@ resolve_timeout_test "sable_resolve_test_timeout: empty repo path falls back to 
 resolve_timeout_test "sable_resolve_test_timeout: empty repo path with no env returns default 60" \
   "" "" "60"
 
-# This repo's own checked-in .sable pins testTimeout=180 (SABLE-lp4n/dnfv
-# timeout-margin fix): the 3-file .sable testCommand suite runs ~53s and
-# was flaking against the old 60s default under fleet load.
-resolve_timeout_test "sable_resolve_test_timeout: this repo's checked-in .sable resolves to 180" \
-  "$REPO" "" "180"
+# This repo's own checked-in .sable gives the proportional developer check a
+# 120s outer ceiling around its 90s execution budget.
+resolve_timeout_test "sable_resolve_test_timeout: this repo's checked-in .sable resolves to 120" \
+  "$REPO" "" "120"
 
 # --------------------------------------------------------------------------
 # sable_resolve_push_repo_dir unit tests (SABLE-041)

@@ -152,7 +152,7 @@ jobs:
           # verbatim CI usage error that diagnosed it) -- the two needs
           # converged on the same package, so cmar4.5's superset line already
           # satisfies both.
-          pip install pytest pytest-testmon pytest-impact pytest-cov diff_cover
+          pip install -r .github/ci/test-requirements.txt
 
       - name: Configure git identity (SABLE-59zu — clean-room needs one)
         if: steps.dedup.outputs.already_verified != 'true'

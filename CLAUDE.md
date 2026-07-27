@@ -88,6 +88,16 @@ false-fails ("golangci-lint not found in PATH") or silently no-ops. Do not
 treat a red `bd preflight` run as signal here; use the commands below instead.
 
 ```bash
+# Install the exact Python environment shared by both authoritative workflows:
+python -m pip install -r .github/ci/test-requirements.txt
+
+# Fast deterministic feedback for staged/unstaged/untracked changes:
+bin/sable-dev-check
+
+# Include every commit on a worker branch, or inspect without executing:
+bin/sable-dev-check --base origin/tmux-only
+bin/sable-dev-check --base origin/tmux-only --dry-run
+
 # Full Python suite (unit + integration; bd/dolt-dependent tests self-skip
 # when those tools are absent — see ci-verify.yml):
 python -m pytest bin/ -q -p no:cacheprovider
@@ -106,8 +116,8 @@ bash .github/ci/shell-run-set.sh --run
 # automatically pre-push via test-shell-run-set-strict.sh's case (f):
 bash .github/ci/shell-run-set.sh --check-beads
 
-# Fast local pre-push subset (also runs automatically via the pre-push git
-# hook through this repo's .sable testCommand=):
+# Curated fixed shell subset (useful when checking pre-push machinery itself;
+# this repo's .sable hook uses sable-dev-check for proportional feedback):
 bash .github/ci/test-tiers.sh --run pre_push
 ```
 

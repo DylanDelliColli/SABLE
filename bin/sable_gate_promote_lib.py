@@ -381,9 +381,8 @@ def _selected_suites(repo: str, worktree: str, paths: list[str]) -> list[str]:
 # below best-effort copies one in before invoking the selector, from either
 # of two sources, in priority order:
 #
-#   1. `repo`'s OWN root .testmondata -- CI's copy, when the checkout running
-#      the gate happens to carry one (ci-verify's testmon-cache-warm.sh warms
-#      exactly this file on the runner).
+#   1. `repo`'s OWN root .testmondata, when an operator has warmed that
+#      checkout directly.
 #   2. WARM_TESTMON_FILE under this repo's gate-owned state dir
 #      (snapshot_lib.state_dir -- shared by every worktree of this repo,
 #      resolved through git-common-dir). Chuck's own checkout is NOT
@@ -437,8 +436,7 @@ def _selected_suites(repo: str, worktree: str, paths: list[str]) -> list[str]:
 #   node ids it collected and a checksum of each test FILE (measured) -- but
 #   it can never record which files a test EXECUTES, since nothing executed.
 #   Only a genuinely-executing --testmon/--testmon-noselect run produces
-#   those coverage fingerprints, which is what warm_gate_testmon_cache and
-#   CI's testmon-cache-warm.sh are for.
+#   those coverage fingerprints, which is what warm_gate_testmon_cache is for.
 #
 # Neither existing is the genuinely-cold case, reported honestly below.
 
@@ -502,10 +500,8 @@ def _refresh_warm_testmondata(repo: str, updated: Path) -> None:
 def warm_gate_testmon_cache(repo: str) -> int:
     """Refresh the gate's persisted warm .testmondata (see the module
     comment above) by running tier_selection.py's own --cache-warm directly
-    against `repo` -- the SAME full bin/ suite + tolerant classification of
-    the known pytest-testmon extensionless-file crash that
-    .github/ci/testmon-cache-warm.sh runs on CI's ephemeral runner, just run
-    locally so a checkout that never fetches CI's own copy still gets one.
+    against `repo` -- the full bin/ suite plus tolerant classification of the
+    known pytest-testmon extensionless-file crash.
     Meant to be invoked periodically or by an operator
     (`sable-merge-gate warm-testmon-cache`) -- it pays the full bin/ suite
     itself, which is exactly the cost this bead exists to keep OFF the

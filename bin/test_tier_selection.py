@@ -591,6 +591,19 @@ def test_runtime_diff_cover_scope_never_executes_a_testmon_run(tmp_path, monkeyp
     assert [argv for argv in calls if _hands_testmon_to_an_executing_run(argv)] == []
 
 
+def test_cli_help_is_metadata_only_and_returns_immediately():
+    result = subprocess.run(
+        [sys.executable, str(_TIER_SELECTION_SOURCE), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert result.returncode == 0
+    assert "usage:" in result.stdout
+    assert "tier_selection: full" not in result.stderr
+
+
 def test_negative_control_runtime_capture_catches_a_collector_missing_collect_only(
         tmp_path, monkeypatch):
     # Plant the same maintainer mistake at RUNTIME rather than in source text:

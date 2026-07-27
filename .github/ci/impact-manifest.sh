@@ -38,9 +38,11 @@
 # suites. A changed path matching a suite's covered file(s) — which now
 # ALWAYS includes the suite's own hooks/test/<suite> path, whether or not it
 # also has a COVERS entry (SABLE-m4exv) — selects that suite. A bin/test_*.py
-# pytest file maps to its production companion's coverage, if any
-# (SABLE-m4exv — see _py_test_companion). Any changed path matching none of
-# the above is UNMAPPED and selects the FULL ALLOW set (conservative
+# pytest file maps to its production companion's coverage, if any. A changed
+# bin/X.py with a matching bin/test_X.py is likewise classified as Python-
+# owned after any explicit shell COVERS entries are selected
+# (SABLE-m4exv/SABLE-z3j28.5 — see the companion helpers). Any changed path
+# matching none of the above is UNMAPPED and selects the FULL ALLOW set (conservative
 # default) — this is the impact tier's under-selection backstop; it is
 # intentional that an unrecognized path errs toward running everything
 # rather than guessing, and this fix does not touch that direction.
@@ -173,6 +175,34 @@ _py_test_companion() {
   esac
 }
 
+# Success when a production Python module has the matching pytest file
+# required by this repo's bin/*.py convention. This is checked only AFTER
+# explicit shell coverage, so a module with both Python and shell integration
+# coverage still selects the shell suite. A module with pytest coverage only
+# is classified rather than expanding the shell side to the full ALLOW set.
+_py_production_has_test() {
+  local path="$1" base
+  case "$path" in
+    bin/*.py)
+      case "$path" in bin/test_*.py) return 1 ;; esac
+      base="${path#bin/}"
+      base="${base%.py}"
+      [ -f "$REPO/bin/test_${base}.py" ] \
+        || [ -f "$REPO/bin/test_${base}_integration.py" ]
+      ;;
+    bin/*)
+      [ -f "$REPO/$path" ] || return 1
+      head -1 "$REPO/$path" | grep -q 'python' || return 1
+      base="${path#bin/}"
+      base="${base//-/_}"
+      [ -f "$REPO/bin/test_${base}.py" ] \
+        || [ -f "$REPO/bin/test_${base}_lib.py" ] \
+        || [ -f "$REPO/bin/test_${base}_integration.py" ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 sable_fanout_check() {
   local suite path abspath lib libpath errors=0
   for suite in "${ALLOW[@]}"; do
@@ -240,6 +270,11 @@ _match_path() {
         done < <(_covered_files "$suite")
       done
     fi
+  fi
+  if [ "$matched" -eq 0 ] && _py_production_has_test "$p"; then
+    # The Python dependency selector owns this module. Explicit COVERS were
+    # already considered above; zero shell suites here is intentional.
+    matched=1
   fi
   if [ "$matched" -eq 0 ] && [ -n "${EXCLUDE[${p#hooks/test/}]:-}" ] && [ "$p" != "${p#hooks/test/}" ]; then
     # p is itself an EXCLUDE-listed suite's own file (e.g.
@@ -324,7 +359,7 @@ TEST_COVERAGE_EXEMPT=(
 )
 
 sable_test_coverage_check() {
-  local path matched errors=0 f
+  local path matched errors=0 f line
   local -a tracked=()
   while IFS= read -r f; do
     [ -n "$f" ] && tracked+=("$f")
@@ -333,7 +368,9 @@ sable_test_coverage_check() {
     if in_array "$path" "${TEST_COVERAGE_EXEMPT[@]:-}"; then
       continue
     fi
-    matched="$(_match_path "$path" | head -1)"
+    local -a result=()
+    while IFS= read -r line; do result+=("$line"); done < <(_match_path "$path")
+    matched="${result[0]}"
     if [ "$matched" -ne 1 ]; then
       echo "::error::impact-manifest: $path (a test file) matches no selection rule — it would escalate to the full ALLOW set on every change touching it. Add a COVERS/self-mapping rule or an explicit TEST_COVERAGE_EXEMPT entry with a reason (SABLE-m4exv)."
       errors=$((errors+1))
