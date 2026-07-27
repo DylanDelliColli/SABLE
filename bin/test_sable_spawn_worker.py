@@ -20,6 +20,12 @@ _SPEC = importlib.util.spec_from_loader("sable_spawn_worker", _LOADER)
 ssw = importlib.util.module_from_spec(_SPEC)
 _LOADER.exec_module(ssw)
 
+# The footprint-parser consolidation (SABLE-g0elq / SABLE-546m5 / SABLE-7gesd)
+# made sable_footprint_lib the SINGLE owner of '## File footprint' tokenization,
+# so the parity assertions at the bottom of this file need both sides in scope.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sable_footprint_lib as fp_lib_for_parity  # noqa: E402
+
 
 # --- model ladder resolution ------------------------------------------------
 
@@ -2899,3 +2905,596 @@ def test_dep_merge_advisory_unparseable_timeout_keeps_the_default(tmp_path, monk
     monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(tmp_path / "sable-dep-check"))
     monkeypatch.setenv("SABLE_DEP_CHECK_TIMEOUT", "not-a-number")
     assert ssw.dep_merge_advisory(["SABLE-dep"], str(tmp_path)) is not None
+
+
+# ===========================================================================
+# SABLE-g0elq / SABLE-546m5 / SABLE-7gesd — THE FOOTPRINT-PARSER CONSOLIDATION
+# ===========================================================================
+# Three beads, one defect: there were TWO independent '## File footprint'
+# tokenizers and three consumers that disagreed about which one they used.
+# g0elq is the WIDENING half (prose after the path line became phantom paths),
+# 546m5 is the NARROWING half (comma-split-then-split()[0] kept a prose word and
+# dropped every real path), 7gesd is the shell gate reading a different input set
+# than the python gate. The fix is consolidation onto sable_footprint_lib, so the
+# assertions below are mostly about EQUALITY BETWEEN CALL PATHS — a divergence
+# that is corrected still recurs; a divergence that is impossible does not.
+
+_PROSE_TAIL_SECTION = (
+    "Story text about the bug.\n"
+    "\n"
+    "## File footprint\n"
+    "bin/sable-spawn-worker, bin/test_sable_spawn_worker.py, "
+    "bin/test_sable_spawn_worker_integration.py\n"
+    "\n"
+    "the fleet-binding lane rule (derive membership from declared footprints,\n"
+    "never from an enumerated list) is SILENT on a bead that declares nothing,\n"
+    "failing in the RELEASING direction. It had no footprint section, so it was\n"
+    "dispatchable.\n"
+)
+
+_REAL_PATHS = {
+    "bin/sable-spawn-worker",
+    "bin/test_sable_spawn_worker.py",
+    "bin/test_sable_spawn_worker_integration.py",
+}
+
+
+def test_prose_after_the_path_line_is_not_parsed_as_paths():
+    """SABLE-g0elq, the bead. The section body ran to the next '#' or EOF and was
+    split on commas, so an English paragraph after the path line yielded one
+    phantom path per comma — observed LIVE as `failing, never, so` inside an
+    overlap refusal message, which is how a legitimate refusal starts reading as
+    garbage and the gate starts reading as noisy.
+
+    Plant-and-fail: against the pre-consolidation parser this is RED on the three
+    named words specifically, not merely on set inequality."""
+    got = ssw.extract_footprint_section(_PROSE_TAIL_SECTION)
+    assert {"failing", "never", "so"} & got == set(), (
+        f"prose words parsed as claimed paths: {sorted({'failing', 'never', 'so'} & got)}")
+    assert got == _REAL_PATHS
+
+
+def test_extensionless_script_path_still_parses():
+    """NEGATIVE CONTROL, load-bearing. `bin/sable-spawn-worker` has no extension,
+    and the verbatim-leading-token design of the OLD dispatch-side parser existed
+    precisely so extension-less script paths survived. A path filter that keys off
+    file extensions alone would regress exactly that case, so the surviving filter
+    must accept a slash-bearing token with no suffix at all. Without this test the
+    fix silently narrows the one thing the old parser got right."""
+    assert "bin/sable-spawn-worker" in ssw.extract_footprint_section(
+        "S.\n\n## File footprint\nbin/sable-spawn-worker\n")
+    # And still survives when it is not the leading entry, and when a trailing
+    # parenthetical annotation follows it.
+    got = ssw.extract_footprint_section(
+        "S.\n\n## File footprint\n"
+        "hooks/multi-manager/pre-dispatch-overlap.sh, "
+        "bin/sable-spawn-worker (constraint surfacing), install.sh\n")
+    assert got == {"hooks/multi-manager/pre-dispatch-overlap.sh",
+                   "bin/sable-spawn-worker", "install.sh"}
+
+
+def test_multi_line_path_list_still_parses():
+    """A genuine multi-line comma list before the blank line is read WHOLE. The
+    g0elq fix terminates the body at prose, and the cheapest way to do that is to
+    stop at the first blank line — which would have truncated this. It does not,
+    because the surviving parser filters by token SHAPE rather than by position,
+    so a real declaration may span as many lines as it likes."""
+    desc = ("S.\n\n## File footprint\n"
+            "bin/sable-spawn-worker,\n"
+            "bin/test_sable_spawn_worker.py,\n"
+            "bin/test_sable_spawn_worker_integration.py\n"
+            "\nsome trailing prose, with commas, that is not a path\n")
+    assert ssw.extract_footprint_section(desc) == _REAL_PATHS
+
+
+def test_newline_and_bulleted_footprint_forms_no_longer_lose_paths():
+    """SABLE-546m5's authoring-form probe table, measured on the OLD dispatch
+    parser: newline-per-path scored 1 of 4 and a hyphen-bulleted list scored 1 of
+    4 with the surviving token being the literal '-'. *** THE DELIMITER WAS THE
+    COMMA AND A NEWLINE WAS NOT A DELIMITER *** — so the most readable way to
+    author a footprint was silently consumed as one path. All five forms must now
+    score 4 of 4, and the two that used to fail are the plant-and-fail rows."""
+    four = {"bin/a.py", "bin/b.py", "bin/c.py", "bin/d.py"}
+    forms = {
+        "comma + space": "bin/a.py, bin/b.py, bin/c.py, bin/d.py",
+        "comma, no space": "bin/a.py,bin/b.py,bin/c.py,bin/d.py",
+        "newline-per-path": "bin/a.py\nbin/b.py\nbin/c.py\nbin/d.py",
+        "hyphen-bulleted": "- bin/a.py\n- bin/b.py\n- bin/c.py\n- bin/d.py",
+        "newline + trailing commas": "bin/a.py,\nbin/b.py,\nbin/c.py,\nbin/d.py",
+    }
+    for name, body in forms.items():
+        got = ssw.extract_footprint_section(f"S.\n\n## File footprint\n{body}\n")
+        assert got == four, f"authoring form {name!r} lost paths: {sorted(got)}"
+        assert "-" not in got, f"authoring form {name!r} emitted the literal '-'"
+
+
+def test_footprint_section_keeps_real_paths_and_drops_prose_tokens():
+    """SABLE-546m5, the bead, on its own verbatim specimen: SABLE-rrn6r's real
+    '## File footprint' body. The OLD dispatch parser returned ['GitHub'] — it
+    KEPT A PROSE WORD AND DROPPED BOTH REAL PATHS. That is the NARROWING
+    direction, and it is the dangerous one: at dispatch time no diff exists yet,
+    so the declared footprint is the ONLY signal overlap_check has, and an
+    under-declared footprint hides a real collision at exactly the moment the
+    gate exists to prevent one."""
+    body = ("GitHub repo settings (rulesets) OR "
+            "hooks/multi-manager/pre-push-rebase-test.sh (leg 2); docs update in "
+            "MULTI-MANAGER-PATTERN.md merge-path section")
+    got = ssw.extract_footprint_section(f"S.\n\n## File footprint\n{body}\n")
+    assert got == {"hooks/multi-manager/pre-push-rebase-test.sh",
+                   "MULTI-MANAGER-PATTERN.md"}
+    assert "GitHub" not in got
+    # NEGATIVE CONTROLS, same test, per 546m5's spec.
+    assert ssw.extract_footprint_section(
+        "S.\n\n## File footprint\nbin/a.py, bin/b.py\n") == {"bin/a.py", "bin/b.py"}
+    assert ssw.extract_footprint_section(
+        "S.\n\n## File footprint\nnothing here but words\n") == set()
+
+
+def test_section_of_only_prose_reports_unreadable():
+    """SABLE-47try's could-not-assess distinction, which every one of the three
+    bundled beads can be "fixed" in a way that collapses — and the collapse fails
+    in the RELEASING direction. A section whose only content is prose is NOT a
+    successful empty read; it is "the author wrote prose instead of paths", and
+    those two facts must stay distinguishable. The trichotomy asserted whole:
+    ABSENT (nobody spoke) / PRESENT-but-unreadable / POPULATED."""
+    absent = ssw.read_footprint_section("no heading at all here")
+    assert absent.files == frozenset()
+    assert absent.unreadable_sources == ()
+    assert absent.could_not_assess is False
+
+    prose_only = ssw.read_footprint_section(
+        "S.\n\n## File footprint\nGitHub repo settings, or maybe not\n")
+    assert prose_only.files == frozenset()
+    assert prose_only.could_not_assess is True
+    assert "## File footprint" in prose_only.unreadable_sources[0]
+
+    populated = ssw.read_footprint_section("S.\n\n## File footprint\nbin/a.py\n")
+    assert populated.files == frozenset({"bin/a.py"})
+    assert populated.could_not_assess is False
+    assert populated.unreadable_sources == ()
+
+
+def test_unreadable_footprint_section_names_the_rejected_fragments():
+    """SABLE-g0elq suggested-approach 3, and the 47try polarity it serves: report
+    REJECTED fragments rather than dropping them silently, so a mis-authored
+    section is LOUD rather than quietly partial. A deny that says only "naming no
+    path" leaves the author guessing which of their words was the problem; one
+    that quotes the tokens it refused is actionable."""
+    read = ssw.read_footprint_section(
+        "S.\n\n## File footprint\nGitHub repo settings instead of paths\n")
+    source = read.unreadable_sources[0]
+    assert "GitHub" in source, f"rejected fragments not surfaced: {source!r}"
+
+
+# --- SABLE-g0elq notes leg: the SAME class in read_wip_claims ----------------
+
+def test_wip_claims_line_with_trailing_prose_yields_only_paths():
+    """The second parser had the same defect and it was ALREADY FIRING on a live
+    in-flight bead. read_wip_claims captured to end-of-line, split on commas, and
+    took each fragment WHOLE — not even a leading-token split — so prose sharing
+    that line became a claimed path. Measured on SABLE-sm269, whose WIP-CLAIMS
+    line had an incident narrative concatenated onto it by a `bd update --notes`
+    rewrite: the first token was a real path and its overlap block was CORRECT,
+    but every comma after it yielded a garbage claim.
+
+    *** SABLE-sm269 IS THE BEAD DOCUMENTING THAT `bd update --notes` DESTROYS A
+    WIP-CLAIMS LINE, AND ITS OWN WIP-CLAIMS LINE WAS DAMAGED BY EXACTLY THAT
+    MECHANISM. *** The specimen below is its real shape."""
+    text = (
+        'WIP-CLAIMS: .github/ci/shell-run-set.sh,...>). Optimus ran >bd update '
+        'SABLE-cmar4.1 --notes "SERIALIZE-WITH: ..."> to record a serialization '
+        'decision. --notes REPLACES the notes field, so the WIP-CLAIMS line was '
+        'destroyed. Caught by a read-back and restored manually\n'
+    )
+    got = ssw.extract_wip_claims(text)
+    assert ".github/ci/shell-run-set.sh" in got, "the real claim was lost"
+    for junk in got:
+        assert "/" in junk or junk.endswith((".py", ".sh", ".md", ".json")), (
+            f"non-path fragment claimed as a file: {junk!r}")
+    assert got == {".github/ci/shell-run-set.sh"}
+
+
+def test_wip_claims_multiple_real_paths_still_parse():
+    """NEGATIVE CONTROL. Without it the fix could narrow to first-token-only and
+    silently drop real claims — which fails RELEASING and is worse than the bug
+    it replaces."""
+    text = ("WIP-CLAIMS: bin/sable-spawn-worker, bin/test_sable_spawn_worker.py, "
+            "hooks/multi-manager/pre-dispatch-overlap.sh\n")
+    assert ssw.extract_wip_claims(text) == {
+        "bin/sable-spawn-worker",
+        "bin/test_sable_spawn_worker.py",
+        "hooks/multi-manager/pre-dispatch-overlap.sh",
+    }
+
+
+def test_wip_claims_present_but_yielding_no_path_is_unreadable():
+    """The 47try distinction on the WIP-CLAIMS source too: a line that exists and
+    names nothing path-shaped is an author who meant to declare and wrote it in a
+    form this parser does not read — not the same fact as writing no line."""
+    read = ssw.read_wip_claims("WIP-CLAIMS: whatever prose, more prose\n")
+    assert read.files == frozenset()
+    assert read.could_not_assess is True
+    assert "WIP-CLAIMS" in read.unreadable_sources[0]
+    assert ssw.read_wip_claims("no marker here").unreadable_sources == ()
+
+
+# --- SABLE-7gesd leg: the THIRD field no gate read --------------------------
+
+def test_read_bead_footprint_reads_footprint_writes_metadata():
+    """SABLE-7gesd's remaining gap, found live at dispatch on SABLE-21rug.4:
+    `footprint_writes` is a real, populated metadata field written by
+    tag_footprint_metadata, and grep for it returned ZERO in both gates. A bead
+    declaring ONLY footprint_writes was invisible to the overlap check entirely.
+    21rug.4 itself was covered only by LUCK OF GOOD AUTHORING — it also carried a
+    '## File footprint' section naming the same paths — which is exactly a
+    combined case masking a single-field gap."""
+    bead = {"id": "X-1", "metadata": {"footprint_writes": "bin/a.py, bin/b.py"},
+            "description": "no section here"}
+    assert ssw.bead_claimed_files(bead) == {"bin/a.py", "bin/b.py"}
+
+
+def test_each_declaration_field_alone_is_visible_to_the_python_gate():
+    """SABLE-7gesd's named NEGATIVE CONTROL: a bead declaring in EACH field alone
+    must be visible, tested ONE FIELD AT A TIME — four positive cases, not one
+    combined case that passes because some other field happened to be populated
+    too."""
+    one_at_a_time = {
+        "wip_claims metadata": {"metadata": {"wip_claims": "bin/only.py"}},
+        "footprint_writes metadata": {"metadata": {"footprint_writes": "bin/only.py"}},
+        "WIP-CLAIMS prose line": {"notes": "WIP-CLAIMS: bin/only.py"},
+        "'## File footprint' section": {
+            "description": "S.\n\n## File footprint\nbin/only.py\n"},
+    }
+    for field, bead in one_at_a_time.items():
+        assert ssw.bead_claimed_files(bead) == {"bin/only.py"}, (
+            f"declaration via {field} alone was INVISIBLE to the python gate")
+
+
+def test_footprint_writes_present_but_unparseable_is_a_failed_read():
+    read = ssw.read_bead_footprint({"metadata": {"footprint_writes": " , , "}})
+    assert read.could_not_assess is True
+    assert any("footprint_writes" in s for s in read.unreadable_sources)
+
+
+def test_footprint_writes_declared_empty_is_not_a_failed_read():
+    """tag_footprint_metadata stamps `footprint_writes=` (empty) for a section
+    that was PRESENT and named nothing — the declared-empty state. That is a
+    deliberate value, not a parse failure, and the section leg already reports
+    the unreadable section on its own; double-counting it here would be noise."""
+    read = ssw.read_bead_footprint({"metadata": {"footprint_writes": ""}})
+    assert read.unreadable_sources == ()
+    assert read.could_not_assess is False
+
+
+# --- THE CONSOLIDATION'S OWN PROPERTY: parser parity ------------------------
+
+_PARITY_BODIES = [
+    "bin/a.py, bin/b.py",
+    "bin/sable-spawn-worker",
+    "bin/sable-spawn-worker (constraint surfacing), hooks/x.sh",
+    "bin/a.py\nbin/b.py\nbin/c.py",
+    "- bin/a.py\n- bin/b.py",
+    ("GitHub repo settings (rulesets) OR "
+     "hooks/multi-manager/pre-push-rebase-test.sh (leg 2); docs update in "
+     "MULTI-MANAGER-PATTERN.md merge-path section"),
+    ("bin/sable-spawn-worker, bin/test_sable_spawn_worker.py\n\n"
+     "prose with commas, never, so, failing"),
+    "nothing path-shaped at all",
+    "",
+]
+
+
+@pytest.mark.parametrize("body", _PARITY_BODIES)
+def test_parser_parity_every_remaining_call_path_agrees(body):
+    """*** THE TEST THAT MAKES THE DIVERGENCE IMPOSSIBLE RATHER THAN MERELY
+    CURRENTLY-ABSENT. *** No single one of the three bundled beads can state this
+    property, because it is a property of the CONSOLIDATION: feed the SAME
+    section body to every remaining call path and assert they return the SAME
+    set. Without it the next author re-forks the parser and nothing fails —
+    which is precisely how two parsers became three consumers with three answers.
+
+    The call paths, all of which must now bottom out in
+    sable_footprint_lib._collect_section:
+      * sable-spawn-worker.extract_footprint_section  (dispatch gate, set form)
+      * sable-spawn-worker.read_footprint_section     (dispatch gate, 47try form)
+      * sable_footprint_lib.parse_declared_footprint  (promote gate)
+      * sable_footprint_lib.read_footprint_section    (the shared owner)
+    """
+    desc = f"Story.\n\n## File footprint\n{body}\n"
+    ssw_set = ssw.extract_footprint_section(desc)
+    ssw_read = set(ssw.read_footprint_section(desc).files)
+    lib_promote = set(fp_lib_for_parity.parse_declared_footprint(desc))
+    lib_read = set(fp_lib_for_parity.read_footprint_section(desc).files)
+    assert ssw_set == ssw_read == lib_promote == lib_read, (
+        f"call paths diverge on {body!r}: "
+        f"spawn-worker-set={sorted(ssw_set)} spawn-worker-read={sorted(ssw_read)} "
+        f"lib-promote={sorted(lib_promote)} lib-read={sorted(lib_read)}")
+
+
+def test_spawn_worker_footprint_parsing_is_the_lib_not_a_second_implementation():
+    """Parity by EQUALITY of the function objects, not merely of their outputs.
+    An output-equality test passes for two hand-written parsers that happen to
+    agree on the bodies someone thought to list; this one fails the moment
+    sable-spawn-worker grows a private tokenizer again."""
+    assert ssw.read_footprint_section is fp_lib_for_parity.read_footprint_section
+    assert ssw.read_wip_claims is fp_lib_for_parity.read_wip_claims
+    assert ssw.FootprintRead is fp_lib_for_parity.FootprintRead
+    assert not hasattr(ssw, "_collect_section"), (
+        "sable-spawn-worker has its own section tokenizer again")
+
+
+# ===========================================================================
+# SABLE-9dmuu — SECTION MULTIPLICITY, PHANTOM PATHS, AND THE MUTE OVERWRITE
+# ===========================================================================
+# The FOURTH independent defect in the same function, folded into the same
+# consolidation because a consolidated parser that still reads only the FIRST
+# '## File footprint' section keeps this bug verbatim.
+#
+# Three failures composed, each survivable alone:
+#   (1) the first section can name a non-existent file and nothing validated it;
+#   (2) an APPENDED correction was discarded with no signal;
+#   (3) unreadable_sources==() actively ASSERTED the read was clean.
+# Result: a footprint WRONG IN BOTH DIRECTIONS — a phantom path that can never
+# collide, and two real files left undeclared so a genuine collision is
+# invisible — while every instrument downstream reported a successful parse.
+
+_A4I8H_SHAPE = (
+    "Story about the coverage floor.\n"
+    "\n"
+    "## File footprint\n"
+    "bin/sable_coverage_floor_lib.py, bin/test_sable_coverage_floor_lib.py\n"
+    "\n"
+    "## Test spec\n"
+    "words\n"
+    "\n"
+    "## CORRECTED FOOTPRINT (appended by the dispatching manager)\n"
+    "\n"
+    "## File footprint\n"
+    "bin/sable_coverage_floor_lib.py, bin/test_coverage_floor.py, "
+    "bin/test_coverage_floor_integration.py\n"
+)
+
+
+def test_second_footprint_section_is_not_silently_discarded():
+    """THE BEAD. `found` was never reset and the scan `break`s at the first '#'
+    after the first heading, so only the FIRST section was ever read and a second
+    was DEAD TEXT — and the discard was indistinguishable from success, because
+    the first section did yield paths so unreadable_sources came back empty.
+
+    Found live on SABLE-a4i8h: its gate-visible footprint named
+    bin/test_sable_coverage_floor_lib.py, WHICH DOES NOT EXIST, while omitting
+    both real suites. A manager appended a corrected section — the obvious fix,
+    and the one that reads correctly to every human — and the parser ignored it
+    entirely while reporting no problem.
+
+    DECIDED BEHAVIOUR, stated explicitly because the bead says either is
+    defensible but silence is not: the sections are UNIONED (that is the reading
+    a human gives an appended correction, and it is the WIDENING direction, which
+    is the safe one at a dispatch gate where no diff exists yet) AND the
+    multiplicity is reported through the existing SABLE-47try unreadable-source
+    channel, so it surfaces as a DEGRADED-comparison warning rather than needing
+    a new channel or blocking the dispatch."""
+    read = ssw.read_footprint_section(_A4I8H_SHAPE)
+    assert "bin/test_coverage_floor.py" in read.files, (
+        "the appended correction was discarded — the bead, verbatim")
+    assert "bin/test_coverage_floor_integration.py" in read.files
+    assert read.files == {"bin/sable_coverage_floor_lib.py",
+                          "bin/test_sable_coverage_floor_lib.py",
+                          "bin/test_coverage_floor.py",
+                          "bin/test_coverage_floor_integration.py"}
+    assert read.unreadable_sources != (), (
+        "multiplicity reported as a CLEAN read — failure (3) of the three that "
+        "composed into the live defect")
+    assert any("2" in s and "File footprint" in s for s in read.unreadable_sources), (
+        f"the duplication is not named: {read.unreadable_sources}")
+    # Still ANSWERABLE: the union is non-empty, so the gate runs and warns rather
+    # than refusing. A contradictory declaration must not become undispatchable.
+    assert read.could_not_assess is False
+
+
+def test_single_section_behaviour_is_unchanged():
+    """NEGATIVE CONTROL, load-bearing. Without it the multiplicity fix is free to
+    change every existing bead's footprint as a side effect — and 299 live
+    sections were measured through this parser at the time of the fix."""
+    one = "S.\n\n## File footprint\nbin/a.py, bin/b.py\n\n## Test spec\nwords\n"
+    read = ssw.read_footprint_section(one)
+    assert read.files == {"bin/a.py", "bin/b.py"}
+    assert read.unreadable_sources == ()
+    assert read.could_not_assess is False
+    # And the trichotomy's other two arms, unchanged alongside it.
+    assert ssw.read_footprint_section("no heading").unreadable_sources == ()
+    assert ssw.read_footprint_section(
+        "S.\n\n## File footprint\n\n## Next\nx").could_not_assess is True
+
+
+def test_extensionless_and_multiline_declarations_still_parse():
+    """SABLE-9dmuu's named regression guard, run against the multiplicity fix
+    rather than only against g0elq's: the section scan changed shape, so the two
+    cases the old scan got right have to be re-proved against the new one."""
+    read = ssw.read_footprint_section(
+        "S.\n\n## File footprint\n"
+        "bin/sable-spawn-worker,\n"
+        "hooks/multi-manager/pre-dispatch-overlap.sh,\n"
+        "install.sh\n\n## Test spec\nx\n")
+    assert read.files == {"bin/sable-spawn-worker",
+                         "hooks/multi-manager/pre-dispatch-overlap.sh",
+                         "install.sh"}
+
+
+# --- phantom-path validation -----------------------------------------------
+
+def test_declared_path_that_does_not_exist_is_reported():
+    """SABLE-9dmuu approach 3. *** A PATH THAT CANNOT EXIST CANNOT COLLIDE, SO AN
+    UNVALIDATED FOOTPRINT FAILS IN THE RELEASING DIRECTION BY CONSTRUCTION. ***
+    Two of four beads screened in one wave declared a phantom, and both phantoms
+    were `test_sable_<lib>.py` guesses at a real `test_<lib>.py` — a shape a
+    reviewer's eye slides straight over.
+
+    REPORTED, NOT REFUSED, and the distinction is deliberate: a footprint
+    legitimately names files the worker is about to CREATE, so a non-existent
+    declared path is a strong smell and never proof of an error."""
+    advisory = ssw.footprint_existence_advisory(
+        {"bin/sable-spawn-worker", "bin/test_sable_coverage_floor_lib.py"},
+        str(Path(__file__).resolve().parent.parent))
+    assert advisory is not None
+    assert "bin/test_sable_coverage_floor_lib.py" in advisory
+    assert "bin/sable-spawn-worker" not in advisory, (
+        "a path that DOES exist was reported as missing")
+
+
+def test_footprint_existence_advisory_is_silent_when_every_path_is_real():
+    """NEGATIVE CONTROL alongside the above, named by the bead: the check must not
+    degrade into noise on every dispatch, or it will be tuned out and the next
+    phantom rides in behind the noise."""
+    root = str(Path(__file__).resolve().parent.parent)
+    assert ssw.footprint_existence_advisory(
+        {"bin/sable-spawn-worker", "bin/sable_footprint_lib.py"}, root) is None
+    # Nothing declared, and an unresolvable repo root, are both silent — an
+    # advisory that cannot run must not manufacture a finding.
+    assert ssw.footprint_existence_advisory(set(), root) is None
+    assert ssw.footprint_existence_advisory({"bin/whatever.py"}, "") is None
+
+
+def test_footprint_existence_advisory_accepts_a_declared_directory():
+    """A footprint may name a directory (`.claude/sable/state/planning/X/`), which
+    is a real declaration and must not be reported as a phantom just because it
+    is not a regular file."""
+    root = str(Path(__file__).resolve().parent.parent)
+    assert ssw.footprint_existence_advisory({"bin/", "hooks/multi-manager/"},
+                                           root) is None
+
+
+# --- the mute overwrite -----------------------------------------------------
+
+def test_tag_footprint_metadata_reports_a_divergent_overwrite(monkeypatch, capsys):
+    """SABLE-9dmuu's aggravating factor: tag_footprint_metadata unconditionally
+    overwrote `footprint_writes` with its re-derived set, with no comparison
+    against the stored value and no report of the change. A manager hand-stamped
+    a CORRECT footprint on SABLE-a4i8h before dispatch and *** THE ACT OF
+    DISPATCHING SILENTLY REVERTED THE CORRECTION. ***
+
+    The write still happens — the dispatch-time re-derivation is the value the
+    gates will use, so leaving a stale hand-stamp in place would be worse — but a
+    divergence is now announced rather than mutely performed."""
+    calls = []
+    monkeypatch.setattr(ssw.subprocess, "run",
+                        lambda *a, **k: calls.append(a[0]) or _ok())
+    ssw.tag_footprint_metadata(
+        "SABLE-a4i8h",
+        "S.\n\n## File footprint\nbin/derived.py\n",
+        stored={"footprint_writes": "bin/hand-stamped.py"})
+    err = capsys.readouterr().err
+    assert "footprint_writes" in err
+    assert "bin/hand-stamped.py" in err, "the value being DISCARDED is not named"
+    assert "bin/derived.py" in err, "the value replacing it is not named"
+    assert any("footprint_writes=bin/derived.py" in " ".join(c) for c in calls), (
+        "the re-derived value must still be written")
+
+
+def test_tag_footprint_metadata_is_silent_when_the_stored_value_agrees(monkeypatch, capsys):
+    """NEGATIVE CONTROL: an IDENTICAL re-derivation is the ordinary case on every
+    respawn, and announcing it would train managers to ignore the message that
+    matters. Order-insensitive, because the stored value is a sorted csv and a
+    hand-stamp may not be."""
+    monkeypatch.setattr(ssw.subprocess, "run", lambda *a, **k: _ok())
+    ssw.tag_footprint_metadata(
+        "SABLE-x1",
+        "S.\n\n## File footprint\nbin/b.py, bin/a.py\n",
+        stored={"footprint_writes": "bin/a.py,bin/b.py"})
+    assert capsys.readouterr().err == ""
+    # An ABSENT stored key is a first stamp, not a divergence.
+    ssw.tag_footprint_metadata("SABLE-x1", "S.\n\n## File footprint\nbin/a.py\n",
+                               stored={})
+    assert capsys.readouterr().err == ""
+
+
+def _ok():
+    return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+
+# --- a bare directory prefix is A QUANTIFIER, not a mildly-wrong path -------
+#
+# Found in the wild on SABLE-jd5fj.20 (optimus) and MEASURED across gates: the
+# same junk token is inert at two gates and catastrophic at the third.
+#
+#     pre-dispatch-overlap.sh + sable-screen   EXACT SET INTERSECTION -> inert
+#     sable_footprint_lib._entry_covers        DIRECTORY-PREFIX COVERAGE ->
+#         *** a phantom 'bin/' COVERS EVERY PATH UNDER bin/ ***
+#
+# Measured: two real disjoint bin/ footprints -> disjoint=True; a phantom 'bin/'
+# against an unrelated bin/ footprint -> disjoint=FALSE, the overlap naming every
+# path beneath it. And the direction INVERTS this bead's original write-up: at
+# _entry_covers this fails in the HOLDING direction (over-serialization), not the
+# releasing one — safe for correctness, but it silently destroys the optimistic
+# parallel-promotion path, which is the SABLE-47try "a gate that never releases is
+# indistinguishable from correct caution" erosion arriving from the other side.
+# The bead's "mostly harmless" line is true for the exact-match gates and FALSE
+# for the prefix one; it must not be inherited.
+#
+# DECIDED RULE, measured against the live corpus rather than guessed: a directory
+# entry needs at least TWO path components. Census of 3257 beads found the bare
+# depth-1 form on exactly 6 beads and it was PROSE every time — 'bin/ (new
+# sable_footprint_lib.py)', 'hooks/ (new write-time guard + its wiring)' — while
+# all 9 deeper directory entries ('.github/ci/', 'hooks/test/',
+# '.claude/sable/state/planning/SABLE-jd5fj/') were deliberate declarations. So
+# the rule rejects exactly the scraped quantifiers and keeps every real one.
+
+
+def test_bare_top_level_directory_prefix_is_rejected():
+    """The load-bearing case is 'bin/', NOT '/'. Validating against '/' alone
+    would LOOK successful and prove nothing, because '/' is inert BY ACCIDENT —
+    repo-relative paths do not start with a slash, so _entry_covers' prefix test
+    never fires on it. 'bin/' is the one that quantifies over the repo."""
+    got = ssw.extract_footprint_section(
+        "S.\n\n## File footprint\n"
+        "bin/ (new sable_footprint_lib.py), bin/sable-merge-gate, bin/test files\n")
+    assert "bin/" not in got, (
+        "a bare top-level directory prefix scraped from prose became a declared "
+        "entry — at _entry_covers that is a quantifier over every file beneath it")
+    assert "/" not in got
+    assert "bin/sable-merge-gate" in got, "the real path alongside it was lost"
+
+
+def test_deliberate_nested_directory_declaration_is_kept():
+    """NEGATIVE CONTROL, and the reason the rule is depth-based rather than
+    "no directories at all": these are real, deliberate whole-directory
+    declarations in the live corpus, and rejecting them would NARROW a genuine
+    declaration — the unsafe direction (SABLE-546m5)."""
+    got = ssw.extract_footprint_section(
+        "S.\n\n## File footprint\n"
+        ".github/ci/, hooks/test/, .claude/sable/state/planning/SABLE-jd5fj/\n")
+    assert got == {".github/ci/", "hooks/test/",
+                   ".claude/sable/state/planning/SABLE-jd5fj/"}
+
+
+def test_a_rejected_directory_prefix_is_reported_not_dropped_silently():
+    """Silence is what makes this class of defect survive. If the ONLY thing under
+    the heading is a bare directory, the section reads as unreadable and the deny
+    names the token — so an author who genuinely meant "all of bin/" is told to
+    say it differently rather than discovering at promote time that their bead
+    serializes against the whole tree."""
+    read = ssw.read_footprint_section("S.\n\n## File footprint\nbin/\n")
+    assert read.files == frozenset()
+    assert read.could_not_assess is True
+    assert "bin/" in read.unreadable_sources[0]
+
+
+def test_phantom_directory_prefix_no_longer_forces_non_disjointness():
+    """The measured harm, asserted at the gate that actually suffers it. Before the
+    filter, a footprint section carrying a prose 'bin/' produced a Footprint that
+    was NON-disjoint from every unrelated bin/ path; the control (two real disjoint
+    bin/ footprints) stayed disjoint, which is what made the defect look like
+    correct caution rather than a bug."""
+    prose_side = fp_lib_for_parity.footprint(
+        fp_lib_for_parity.parse_declared_footprint(
+            "S.\n\n## File footprint\nbin/ (the stranded-claim release path), "
+            "bin/sable-recover\n"))
+    unrelated = fp_lib_for_parity.footprint({"bin/sable_coverage_floor_lib.py"})
+    verdict = fp_lib_for_parity.is_disjoint(prose_side, unrelated)
+    assert verdict.disjoint is True, (
+        f"a prose-scraped directory prefix still quantifies over bin/: {verdict.reason}")
+    # POSITIVE CONTROL in the same test: a DELIBERATE directory declaration must
+    # still cover what is beneath it, or the fix has broken prefix coverage.
+    deliberate = fp_lib_for_parity.footprint({"hooks/test/"})
+    beneath = fp_lib_for_parity.footprint({"hooks/test/test-overlap-constraint.sh"})
+    assert fp_lib_for_parity.is_disjoint(deliberate, beneath).disjoint is False
