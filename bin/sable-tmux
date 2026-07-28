@@ -33,8 +33,8 @@ from pathlib import Path
 # next to THIS script even when invoked via a PATH symlink.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    AUTONOMOUS_ROLES, KICK_TAG, SessionCollision, deliver_text, kick_message,
-    repo_root, resolve_session, wait_for_ready,
+    AUTONOMOUS_ROLES, KICK_TAG, SessionCollision, capture_pane, deliver_text,
+    dialog_posture, kick_message, repo_root, resolve_session, wait_for_ready,
 )
 from sable_provider_lib import (  # noqa: E402
     ProviderMapError, execution_provider_map, interactive_command, pane_environment,
@@ -172,8 +172,6 @@ def main(argv: list[str] | None = None) -> int:
         panes[role] = pane
         subprocess.run(base + ["select-layout", "-t", sess, "tiled"], check=True)
 
-    sys.stderr.write(f"sable-tmux: session '{sess}' up with roles: {', '.join(roles)}\n")
-
     # --autostart: kick the autonomous roles into their operating loops once their
     # TUIs are ready (wait_for_ready also accepts the bypass-permissions gate).
     if ns.autostart:
@@ -186,10 +184,32 @@ def main(argv: list[str] | None = None) -> int:
             kpane = panes[role]
             provider = providers[role]
             if ready_timeout > 0:
-                wait_for_ready(
+                ready = wait_for_ready(
                     base, kpane, ready_timeout, interval=poll_interval,
                     provider=provider,
                 )
+                if not ready:
+                    cap = capture_pane(base, kpane)
+                    state = (
+                        "interactive dialog/selector"
+                        if dialog_posture(cap)
+                        else "not in composer posture (still booting, exited, or stuck)"
+                    )
+                    removed = subprocess.run(
+                        base + ["kill-session", "-t", sess],
+                        capture_output=True, text=True,
+                    ).returncode == 0
+                    cleanup = (
+                        "failed session removed; retry can recreate it"
+                        if removed
+                        else "WARNING: failed session cleanup did not succeed"
+                    )
+                    sys.stderr.write(
+                        "sable-tmux: REFUSING autostart "
+                        f"role={role} pane={kpane} provider={provider} state={state}; "
+                        f"operating-loop kick was NOT typed; {cleanup}.\n"
+                    )
+                    return 10
             kick = provider_boot_message(
                 provider, role, kick_message(role), base=root
             )
@@ -202,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stderr.write(f"sable-tmux: WARNING kick to {role} ({kpane}) "
                                  f"may be unsubmitted\n")
 
+    sys.stderr.write(f"sable-tmux: session '{sess}' up with roles: {', '.join(roles)}\n")
     sys.stderr.write(f"  attach: tmux{' -L ' + socket if socket else ''} attach -t {sess}\n")
     if ns.attach:
         os.execvp("tmux", base[0:1] + base[1:] + ["attach", "-t", sess])

@@ -36,8 +36,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    AUTONOMOUS_ROLES, KICK_TAG, SessionCollision, deliver_text, kick_message,
-    repo_root, resolve_session, wait_for_ready,
+    AUTONOMOUS_ROLES, KICK_TAG, SessionCollision, capture_pane, deliver_text,
+    dialog_posture, kick_message, repo_root, resolve_session, wait_for_ready,
 )
 from sable_provider_lib import (  # noqa: E402
     ProviderMapError, execution_provider, interactive_command, pane_environment,
@@ -501,10 +501,32 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         if ready_timeout > 0:
-            wait_for_ready(
+            ready = wait_for_ready(
                 base, pane, ready_timeout, interval=poll_interval,
                 provider=provider,
             )
+            if not ready:
+                cap = capture_pane(base, pane)
+                state = (
+                    "interactive dialog/selector"
+                    if dialog_posture(cap)
+                    else "not in composer posture (still booting, exited, or stuck)"
+                )
+                removed = subprocess.run(
+                    base + ["kill-pane", "-t", pane],
+                    capture_output=True, text=True,
+                ).returncode == 0
+                cleanup = (
+                    "failed pane removed; retry can recreate the role"
+                    if removed
+                    else "WARNING: failed pane cleanup did not succeed"
+                )
+                sys.stderr.write(
+                    "sable-spawn-manager: REFUSING bootstrap "
+                    f"role={role} pane={pane} provider={provider} state={state}; "
+                    f"operating-loop kick was NOT typed; {cleanup}.\n"
+                )
+                return 10
         kick = kick_message(role, deliverable=ns.deliverable if is_producer else None)
         if not is_producer:
             try:

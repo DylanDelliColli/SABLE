@@ -109,6 +109,98 @@ def test_all_spawns_three_roles(sock):
     assert {"chuck", "optimus", "tarzan"} <= set(_roles(sock))
 
 
+def test_unknown_dialog_refuses_manager_kick_without_typing(sock, tmp_path):
+    """A fresh manager pane parked on an unknown selector must remain untouched.
+
+    The stand-in records the first byte it receives. Discarding wait_for_ready's
+    False return types the autostart kick into that read and creates the file
+    even if Enter is never submitted.
+    """
+    rec = tmp_path / "typed-into-dialog.txt"
+    script = tmp_path / "fake-dialog.sh"
+    script.write_text(
+        "echo '  ? Which workspace should be opened?'\n"
+        "echo '  > 1. primary'\n"
+        "echo '    2. recovery'\n"
+        "echo '  (Use arrow keys, Enter to select)'\n"
+        "IFS= read -r -n 1 byte\n"
+        f'printf "%s" "$byte" > "{rec}"\n'
+        "sleep 2\n"
+    )
+    _seed_lincoln(sock)
+    env = {
+        **os.environ,
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_SESSION": SESSION,
+        "SABLE_TMUX_PANE_CMD": f"bash --noprofile --norc {script}",
+        "SABLE_DISPATCH_READY_TIMEOUT": "0.6",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.1",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+    }
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus"],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert r.returncode == 10, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "role=optimus" in r.stderr
+    assert "provider=claude" in r.stderr
+    assert "interactive dialog/selector" in r.stderr
+    assert "NOT typed" in r.stderr
+    assert "failed pane removed" in r.stderr
+    time.sleep(0.3)
+    assert not rec.exists(), (
+        f"manager kick landed in the unknown dialog: {rec.read_text()!r}"
+    )
+    assert "optimus" not in _roles(sock)
+
+    retry = _run(sock, "optimus")
+    assert retry.returncode == 0, retry.stderr
+    assert "optimus" in _roles(sock)
+    assert "already running" not in retry.stderr
+
+
+def test_known_startup_gate_is_accepted_then_manager_is_kicked(sock, tmp_path):
+    """The fail-closed branch must preserve explicitly recognized selectors."""
+    accepted = tmp_path / "accepted-key.txt"
+    kicked = tmp_path / "manager-kick.txt"
+    script = tmp_path / "fake-known-gate.sh"
+    script.write_text(
+        "echo 'WARNING: Claude Code running in Bypass Permissions mode'\n"
+        "echo '  1. No, exit'\n"
+        "echo '  2. Yes, I accept'\n"
+        "echo '  Enter to confirm'\n"
+        "IFS= read -r key\n"
+        f'printf "%s" "$key" > "{accepted}"\n'
+        "printf '❯ '\n"
+        "IFS= read -r line\n"
+        f'printf "%s" "$line" > "{kicked}"\n'
+        "sleep 2\n"
+    )
+    _seed_lincoln(sock)
+    env = {
+        **os.environ,
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_SESSION": SESSION,
+        "SABLE_TMUX_PANE_CMD": f"bash --noprofile --norc {script}",
+        "SABLE_DISPATCH_READY_TIMEOUT": "2",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.1",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+    }
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus"],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    for _ in range(20):
+        if accepted.exists() and kicked.exists():
+            break
+        time.sleep(0.1)
+    assert accepted.read_text() == "2"
+    assert "SABLE-AUTOSTART" in kicked.read_text()
+
+
 # --- SABLE-tz7h.1: producer spawn contract -------------------------------
 
 def test_producer_spawn_tags_class_and_deliverable(sock, tmp_path):

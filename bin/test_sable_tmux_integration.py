@@ -82,7 +82,7 @@ def test_autostart_kicks_autonomous_roles_only(sock, tmp_path):
         "SABLE_TMUX_SOCKET": sock,
         "SABLE_TMUX_PANE_CMD": f"bash --noprofile --norc {script}",
         "REC_DIR": str(rec),
-        "SABLE_DISPATCH_READY_TIMEOUT": "0",      # stand-in pane has no claude prompt
+        "SABLE_DISPATCH_READY_TIMEOUT": "2",      # exercise the ready=True branch
         "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
         "SABLE_DISPATCH_SUBMIT_TRIES": "1",
     }
@@ -101,6 +101,57 @@ def test_autostart_kicks_autonomous_roles_only(sock, tmp_path):
     lf = rec / "lincoln.txt"
     assert not lf.exists() or "SABLE-AUTOSTART" not in lf.read_text(), \
         "lincoln should not be auto-kicked"
+
+
+def test_autostart_unknown_dialog_refuses_without_typing(sock, tmp_path):
+    """Autostart must not submit its kick into an unrecognized pane dialog."""
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    script = tmp_path / "fake-dialog.sh"
+    script.write_text(
+        "echo '  ? Which workspace should be opened?'\n"
+        "echo '  > 1. primary'\n"
+        "echo '    2. recovery'\n"
+        "echo '  (Use arrow keys, Enter to select)'\n"
+        "IFS= read -r -n 1 byte\n"
+        'printf "%s" "$byte" > "$REC_DIR/$CLAUDE_AGENT_NAME.txt"\n'
+        "sleep 2\n"
+    )
+    env = {
+        **os.environ,
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_PANE_CMD": f"bash --noprofile --norc {script}",
+        "REC_DIR": str(rec),
+        "SABLE_DISPATCH_READY_TIMEOUT": "0.6",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.1",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+    }
+    r = subprocess.run(
+        ["python3", str(BIN), "--session", "sable", "--autostart"],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert r.returncode == 10, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "role=optimus" in r.stderr
+    assert "provider=claude" in r.stderr
+    assert "interactive dialog/selector" in r.stderr
+    assert "NOT typed" in r.stderr
+    assert "failed session removed" in r.stderr
+    time.sleep(0.3)
+    assert not list(rec.iterdir()), (
+        f"autostart kick landed in unknown dialog(s): "
+        f"{[(p.name, p.read_text()) for p in rec.iterdir()]}"
+    )
+    assert subprocess.run(
+        ["tmux", "-L", sock, "has-session", "-t", "sable"],
+        capture_output=True,
+    ).returncode != 0
+
+    retry = subprocess.run(
+        ["python3", str(BIN), "--session", "sable"],
+        capture_output=True, text=True, env=env,
+    )
+    assert retry.returncode == 0, retry.stderr
 
 
 def test_default_session_derives_from_repo(sock, tmp_path):
