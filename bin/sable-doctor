@@ -396,8 +396,8 @@ def _check_snapshot_pin(src: Path, dst: Path, cache: dict = None):
     return "clean", None
 
 # SABLE-mkj6k INTERIM GUARD — remove this set (and every branch that reads it
-# below, in check_manifest/render_text_report/main's --quiet path) once the
-# install.sh pin-preservation fix has been verified live everywhere on the
+# below, in check_manifest/render_text_report) once the install.sh
+# pin-preservation fix has been verified live everywhere on the
 # fleet: with sable-bin-install honoring pins, `bash install.sh` can no longer
 # silently un-pin these bins, so the ordinary remedy is safe again for them.
 # Until that verification lands, an agent running a STALE (pre-fix) installed
@@ -880,6 +880,18 @@ _STATUS_LABELS = {
 _SNAPSHOT_REMEDY_STATUSES = ("broken-copy-pin", "snapshot-drift", "snapshot-stale", "could-not-assess")
 
 
+def quiet_drift_summary(bad):
+    """Summarize boot-time drift without prescribing an unreviewed action."""
+    pinned = sum(r["category"] in GUARDED_CATEGORIES for r in bad)
+    snapshot = sum(r["category"] == "pinned snapshot bins" for r in bad)
+    ordinary = len(bad) - pinned - snapshot
+    return (
+        "sable-doctor: drifted from repo HEAD — "
+        f"ordinary files: {ordinary}; pinned bins: {pinned}; "
+        f"snapshot-pinned bins: {snapshot} — run `sable-doctor` for detail"
+    )
+
+
 def _guarded_remedy_lines(guarded_bad):
     """SABLE-mkj6k interim guard: the safe per-file remedy for a drifted
     GUARDED_CATEGORIES entry. Deliberately never spells out REFRESH_CMD (see
@@ -953,7 +965,7 @@ def _snapshot_remedy_lines(snapshot_bad):
             )
             lines.append("  runtime. Advance the pin (or drop it to track the repo):")
             lines.append(f"    sable-bin-install --pin-snapshot {name}      # re-pin at HEAD")
-            lines.append(f"    sable-bin-install --repin                    # un-pin, follow the repo")
+            lines.append("    sable-bin-install --repin                    # un-pin, follow the repo")
         elif r["status"] == "could-not-assess":
             lines.append(
                 f"  {r['installed_path']}'s pinned file could not be read (permission denied,"
@@ -1107,41 +1119,11 @@ def main(argv=None):
                 file=sys.stderr,
             )
         if bad:
-            guarded_bad = [r for r in bad if r["category"] in GUARDED_CATEGORIES]
-            snapshot_bad = [
-                r for r in bad
-                if r["category"] == "pinned snapshot bins" and r["status"] in _SNAPSHOT_REMEDY_STATUSES
-            ]
-            if guarded_bad:
-                # SABLE-mkj6k interim guard — see GUARDED_CATEGORIES comment.
-                # This is the SessionStart-hook path (`sable-doctor --quiet`),
-                # the highest-traffic message in the system; it must not tell
-                # a fresh pane with zero context to run the one command that
-                # could silently un-pin a deliberately pinned bin.
-                print(
-                    f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD, "
-                    f"including {len(guarded_bad)} pinned bin(s) — do not use the ordinary "
-                    "installer refresh for those (SABLE-mkj6k interim guard); run "
-                    "`sable-doctor` for the safe per-file refresh commands",
-                    file=sys.stderr,
-                )
-            elif snapshot_bad:
-                # SABLE-9boz4 — same principle as the mkj6k guard above: a
-                # broken/drifted snapshot pin needs `--pin-snapshot` repair,
-                # not the ordinary installer refresh (which skips it anyway).
-                print(
-                    f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD, "
-                    f"including {len(snapshot_bad)} snapshot-pinned bin(s) — do not use the "
-                    "ordinary installer refresh for those; run `sable-doctor` for the safe "
-                    "re-pin commands",
-                    file=sys.stderr,
-                )
-            else:
-                print(
-                    f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD "
-                    f"— run `{REFRESH_CMD}` to refresh (run `sable-doctor` for detail)",
-                    file=sys.stderr,
-                )
+            # SessionStart is an observation surface, not an authorization
+            # surface. A fresh pane has no context for choosing among ordinary,
+            # pinned, and snapshot-pinned remedies, so name the bounds and
+            # defer diagnosis to the detailed report.
+            print(quiet_drift_summary(bad), file=sys.stderr)
     else:
         render_text_report(results, provenance=provenance, current_head=current_head,
                             ancestor_ok=ancestor_ok, shadowed_roles=shadowed_roles)

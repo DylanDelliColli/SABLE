@@ -220,7 +220,8 @@ def test_quiet_mode_one_line_on_drift(installed_claude_dir):
     assert result.returncode == 1
     assert result.stdout == ""
     assert "drifted" in result.stderr
-    assert "bash install.sh" in result.stderr
+    assert "ordinary files: 1" in result.stderr
+    assert "bash install.sh" not in result.stderr
 
 
 # --- --project flag: targets the current git project's own install ----------
@@ -371,10 +372,10 @@ def test_guarded_pinned_bin_full_report_names_the_safe_cp_path_not_install_sh(in
     assert f"cp {REPO / 'bin' / target_name}" in result.stdout
 
 
-def test_unguarded_drift_sessionstart_hook_still_names_install_sh(installed_claude_dir):
-    # Over-suppression check: a drifted UNGUARDED file (no pinning involved
-    # at all) must still get the ordinary remedy — silencing it globally
-    # would hide real drift, which is its own regression.
+def test_unguarded_drift_sessionstart_reports_without_prescribing_an_action(
+        installed_claude_dir):
+    # The boot path reports the observation, while the full doctor owns the
+    # diagnosis and per-file remedy.
     (installed_claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
     bin_dir = installed_claude_dir.parent / ".local" / "bin"
 
@@ -385,7 +386,31 @@ def test_unguarded_drift_sessionstart_hook_still_names_install_sh(installed_clau
     )
     combined = result.stdout + result.stderr
     assert result.returncode == 1
-    assert "bash install.sh" in combined
+    assert "ordinary files: 1" in combined
+    assert "run `sable-doctor` for detail" in combined
+    assert "bash install.sh" not in combined
+
+
+def test_sessionstart_summary_separates_ordinary_and_pinned_drift(
+        installed_claude_dir):
+    bin_dir = installed_claude_dir.parent / ".local" / "bin"
+    target_name = "sable-dolt-push"
+    _establish_real_pin(bin_dir, target_name)
+    _revert_pin_to_symlink(bin_dir, target_name)
+    (installed_claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
+
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(REPO),
+         "--claude-dir", str(installed_claude_dir),
+         "--bin-dir", str(bin_dir), "--quiet"],
+        capture_output=True, text=True, timeout=30,
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode == 1
+    assert "ordinary files: 1" in combined
+    assert "pinned bins: 1" in combined
+    assert "bash install.sh" not in combined
 
 
 def test_pinned_bin_survives_real_reinstall_after_the_fix(installed_claude_dir):

@@ -13,7 +13,6 @@ landed in the repo).
 import importlib.util
 import json
 import subprocess
-import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -438,7 +437,8 @@ def test_quiet_mode_guarded_pinned_bin_does_not_recommend_install_sh(tmp_path, c
     assert captured.out == ""
 
 
-def test_quiet_mode_unguarded_drift_still_recommends_install_sh(tmp_path, capsys):
+def test_quiet_mode_unguarded_drift_reports_without_prescribing_install_sh(
+        tmp_path, capsys):
     def mutate(repo, claude_dir):
         (claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
 
@@ -450,7 +450,22 @@ def test_quiet_mode_unguarded_drift_still_recommends_install_sh(tmp_path, capsys
     captured = capsys.readouterr()
     assert rc == 1
     assert captured.out == ""
-    assert "bash install.sh" in captured.err
+    assert "ordinary files: 1" in captured.err
+    assert "run `sable-doctor` for detail" in captured.err
+    assert "bash install.sh" not in captured.err
+
+
+def test_quiet_drift_summary_separates_all_category_counts():
+    summary = doctor.quiet_drift_summary([
+        {"category": "hooks"},
+        {"category": "pinned bins"},
+        {"category": "pinned snapshot bins"},
+    ])
+
+    assert "ordinary files: 1" in summary
+    assert "pinned bins: 1" in summary
+    assert "snapshot-pinned bins: 1" in summary
+    assert "bash install.sh" not in summary
 
 
 # --- resolve_claude_dir ---------------------------------------------------------
@@ -575,7 +590,8 @@ def test_main_quiet_prints_one_line_to_stderr_when_drifted(tmp_path, capsys):
     assert rc == 1
     assert captured.out == ""
     assert "drifted" in captured.err
-    assert "bash install.sh" in captured.err
+    assert "ordinary files: 1" in captured.err
+    assert "bash install.sh" not in captured.err
 
 
 # --- worker cap line (SABLE-61dy) ----------------------------------------------

@@ -2242,7 +2242,6 @@ def test_the_auto_path_declines_loudly_and_lands_nothing_a_decider_would_have_he
     monkeypatch.setattr(promote_lib.preview, "delete_ci_ref", lambda *a, **kw: None)
     subprocess.run(["git", "-C", work, "fetch", "-q", "origin"], check=True,
                    capture_output=True)
-    base_sha = _ap_origin_tip(bare)
 
     # The PLANT: a branch whose declared footprint reaches the gate's own
     # dispatch file — gate-class, and therefore never mechanically promotable.
