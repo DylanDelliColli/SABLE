@@ -283,11 +283,11 @@ def test_landing_pair_is_never_split_by_the_batch_cap(monkeypatch):
         coordinator.admission.Candidate("SABLE-c", "wk-c", "c" * 40),
     ]
     monkeypatch.setattr(
-        coordinator.promote, "declared_landing_pair",
+        coordinator.promote, "validated_landing_pair",
         lambda repo, bead: (
-            frozenset({"SABLE-b"}) if bead == "SABLE-a"
-            else frozenset({"SABLE-a"}) if bead == "SABLE-b"
-            else frozenset()))
+            (frozenset({"SABLE-b"}), {}) if bead == "SABLE-a"
+            else (frozenset({"SABLE-a"}), {}) if bead == "SABLE-b"
+            else (frozenset(), {})))
 
     selected, deferred, excluded = coordinator._seal_admitted_members(
         "/repo", candidates, max_members=2)
@@ -304,10 +304,10 @@ def test_incomplete_landing_pair_excludes_the_whole_connected_group(monkeypatch)
         coordinator.admission.Candidate("SABLE-b", "wk-b", "b" * 40),
     ]
     monkeypatch.setattr(
-        coordinator.promote, "declared_landing_pair",
+        coordinator.promote, "validated_landing_pair",
         lambda repo, bead: (
-            frozenset({"SABLE-missing"}) if bead == "SABLE-a"
-            else frozenset({"SABLE-a"})))
+            (frozenset({"SABLE-missing"}), {}) if bead == "SABLE-a"
+            else (frozenset({"SABLE-a"}), {})))
     monkeypatch.setattr(
         coordinator.promote, "bead_landed", lambda *args: False)
 
@@ -318,6 +318,26 @@ def test_incomplete_landing_pair_excludes_the_whole_connected_group(monkeypatch)
     assert deferred == ()
     assert {item.candidate.bead for item in excluded} == {
         "SABLE-a", "SABLE-b"}
+
+
+def test_asymmetric_landing_pair_is_excluded_before_batch_ci(monkeypatch):
+    candidate = coordinator.admission.Candidate(
+        "SABLE-b", "wk-b", "b" * 40)
+
+    def asymmetric(repo, bead):
+        raise coordinator.promote.LandingPairRefused(
+            "asymmetric landing-pair declaration for [SABLE-a, SABLE-b]")
+
+    monkeypatch.setattr(
+        coordinator.promote, "validated_landing_pair", asymmetric)
+
+    selected, deferred, excluded = coordinator._seal_admitted_members(
+        "/repo", [candidate], max_members=8)
+
+    assert selected == []
+    assert deferred == ()
+    assert len(excluded) == 1
+    assert "asymmetric" in excluded[0].reason
 
 
 def test_drain_rediscovers_rolling_arrivals_only_between_sealed_cycles(

@@ -2583,9 +2583,10 @@ def test_bd_absent_env_still_isolates_home_but_bd_present_isolates_beads_db(tmp_
 # The near-miss this bead closes: chuck held one half of a deliberately-paired
 # change and said he would have promoted it on the other lane's sign-off
 # alone, because the pairing lived only in a bead note and a manager's working
-# memory — nowhere the promote path reads. The fix is a `landing_pair`
-# metadata field the promote decision reads mechanically, so a solo promote of
-# either half is refused BY DEFAULT rather than merely by luck.
+# memory — nowhere the promote path reads. The fix is reciprocal `landing_pair`
+# metadata plus a bidirectional Beads reverse index that the promote decision
+# reads mechanically, so a solo promote of either half is refused BY DEFAULT
+# rather than merely by luck.
 
 def _fake_bd_show(responses: dict[str, dict]):
     """Stand in for promote_lib._bd_show: <responses> maps bead id -> the
@@ -2599,6 +2600,168 @@ def _fake_bd_show(responses: dict[str, dict]):
     return fake
 
 
+def _related(record: dict, dependency_type: str = "relates-to") -> dict:
+    """How real `bd show --json` embeds the other endpoint of a relation."""
+    return {**record, "dependency_type": dependency_type}
+
+
+def _reciprocal_pair(
+        first: str = "SABLE-a", second: str = "SABLE-b",
+        first_notes: str = "", second_notes: str = "",
+        first_status: str = "open", second_status: str = "open",
+        ) -> dict[str, dict]:
+    canonical = ",".join(sorted((first, second)))
+    first_record = {
+        "id": first, "metadata": {"landing_pair": canonical},
+        "status": first_status, "notes": first_notes,
+    }
+    second_record = {
+        "id": second, "metadata": {"landing_pair": canonical},
+        "status": second_status, "notes": second_notes,
+    }
+    return {
+        first: {**first_record, "dependencies": [_related(second_record)]},
+        second: {**second_record, "dependencies": [_related(first_record)]},
+    }
+
+
+def test_asymmetric_landing_pair_refuses_either_member(monkeypatch):
+    """Regression for SABLE-8mfe6: the relation is the reverse index.
+
+    A declares B while B's metadata has been partially removed.  Because a
+    real Beads relates-to edge embeds A's metadata in B's own show result, B
+    must discover the reverse-only declaration without a store-wide scan.
+    """
+    a = {"id": "SABLE-a", "metadata": {"landing_pair": "SABLE-a,SABLE-b"},
+         "notes": ""}
+    b = {"id": "SABLE-b", "metadata": {}, "notes": ""}
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
+        "SABLE-a": {**a, "dependencies": [_related(b)]},
+        "SABLE-b": {**b, "dependencies": [_related(a)]},
+    }))
+
+    for bead in ("SABLE-a", "SABLE-b"):
+        with pytest.raises(promote_lib.LandingPairRefused) as exc:
+            promote_lib.assert_landing_pair_satisfied("/repo", bead)
+        assert "asymmetric" in str(exc.value).lower()
+        assert "SABLE-a" in str(exc.value)
+        assert "SABLE-b" in str(exc.value)
+
+
+def test_asymmetric_landing_pair_cannot_hide_inside_an_atomic_batch(monkeypatch):
+    """Batch membership satisfies co-landing, never declaration corruption."""
+    a = {"id": "SABLE-a", "metadata": {"landing_pair": "SABLE-a,SABLE-b"},
+         "notes": ""}
+    b = {"id": "SABLE-b", "metadata": {}, "notes": ""}
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
+        "SABLE-a": {**a, "dependencies": [_related(b)]},
+        "SABLE-b": {**b, "dependencies": [_related(a)]},
+    }))
+    members = [
+        promote_lib.BatchMember(
+            "wk-a", "a" * 40, ("SABLE-a",), ("bin/a.py",)),
+        promote_lib.BatchMember(
+            "wk-b", "b" * 40, ("SABLE-b",), ("bin/b.py",)),
+    ]
+
+    with pytest.raises(classify.GateError) as exc:
+        promote_lib.assert_batch_landing_pairs_satisfied("/repo", members)
+    assert exc.value.code == classify.EXIT_PAIR_REFUSED
+    assert "asymmetric" in str(exc.value).lower()
+
+
+def test_unrelated_bidirectional_relation_is_not_a_landing_pair_and_costs_one_read(
+        monkeypatch):
+    """The reverse index must not turn Beads' ordinary see-also edges into policy."""
+    calls = []
+    unrelated = {"id": "SABLE-history", "metadata": {}, "notes": ""}
+
+    def fake(repo, bead_id):
+        calls.append(bead_id)
+        return subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps({
+                "id": bead_id,
+                "metadata": {},
+                "notes": "",
+                "dependencies": [_related(unrelated)],
+            }))
+
+    monkeypatch.setattr(promote_lib, "_bd_show", fake)
+    promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a")
+    assert calls == ["SABLE-a"]
+
+
+def test_landing_pair_cli_is_the_single_declare_and_remove_interface(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        promote_lib, "declare_landing_pair",
+        lambda repo, first, second: calls.append(("declare", repo, first, second)))
+    monkeypatch.setattr(
+        promote_lib, "remove_landing_pair",
+        lambda repo, first, second: calls.append(("remove", repo, first, second)))
+
+    assert smg.main([
+        "landing-pair", "declare", "SABLE-a", "SABLE-b", "--repo", "/repo",
+    ]) == 0
+    assert smg.main([
+        "landing-pair", "remove", "SABLE-a", "SABLE-b", "--repo", "/repo",
+    ]) == 0
+    assert calls == [
+        ("declare", "/repo", "SABLE-a", "SABLE-b"),
+        ("remove", "/repo", "SABLE-a", "SABLE-b"),
+    ]
+
+
+def test_pair_declaration_builds_reverse_index_before_one_canonical_write(
+        monkeypatch):
+    mutations = []
+    monkeypatch.setattr(
+        promote_lib, "_pair_records",
+        lambda *args: (
+            {"id": "SABLE-a", "metadata": {}},
+            {"id": "SABLE-b", "metadata": {}}))
+    monkeypatch.setattr(
+        promote_lib, "_bd_pair_mutation",
+        lambda repo, args, description: mutations.append(args))
+    monkeypatch.setattr(
+        promote_lib, "validated_landing_pair",
+        lambda repo, bead: (
+            (frozenset({"SABLE-b"}), {}) if bead == "SABLE-a"
+            else (frozenset({"SABLE-a"}), {})))
+
+    promote_lib.declare_landing_pair("/repo", "SABLE-b", "SABLE-a")
+
+    assert mutations == [
+        ["dep", "relate", "SABLE-b", "SABLE-a"],
+        ["update", "SABLE-b", "SABLE-a", "--set-metadata",
+         "landing_pair=SABLE-a,SABLE-b"],
+    ]
+
+
+def test_pair_removal_is_one_multi_record_clear_and_never_deletes_see_also(
+        monkeypatch):
+    pair = {"landing_pair": "SABLE-a,SABLE-b"}
+    record_reads = iter([
+        ({"id": "SABLE-a", "metadata": pair},
+         {"id": "SABLE-b", "metadata": pair}),
+        ({"id": "SABLE-a", "metadata": {}},
+         {"id": "SABLE-b", "metadata": {}}),
+    ])
+    mutations = []
+    monkeypatch.setattr(
+        promote_lib, "_pair_records", lambda *args: next(record_reads))
+    monkeypatch.setattr(
+        promote_lib, "_bd_pair_mutation",
+        lambda repo, args, description: mutations.append(args))
+
+    promote_lib.remove_landing_pair("/repo", "SABLE-a", "SABLE-b")
+
+    assert mutations == [[
+        "update", "SABLE-a", "SABLE-b",
+        "--unset-metadata", "landing_pair",
+    ]]
+
+
 def test_landing_pair_refuses_a_solo_promote_but_never_touches_an_unpaired_bead(monkeypatch):
     """THE property this bead is accepted or rejected on: a bead declaring a
     landing_pair counterpart that has not already landed is REFUSED, naming
@@ -2606,11 +2769,9 @@ def test_landing_pair_refuses_a_solo_promote_but_never_touches_an_unpaired_bead(
     landing_pair metadata at all — however similar its footprint to the paired
     one — must never be touched by this check, proving it discriminates on the
     declared relation rather than on any file-level property."""
-    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
-        "SABLE-a": {"metadata": {"landing_pair": "SABLE-b"}, "notes": ""},
-        "SABLE-b": {"metadata": {}, "notes": ""},
-        "SABLE-c": {"metadata": {}, "notes": ""},
-    }))
+    responses = _reciprocal_pair()
+    responses["SABLE-c"] = {"id": "SABLE-c", "metadata": {}, "notes": ""}
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show(responses))
     with pytest.raises(promote_lib.LandingPairRefused) as exc:
         promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a")
     assert "SABLE-b" in str(exc.value)
@@ -2624,12 +2785,10 @@ def test_landing_pair_satisfied_when_the_counterpart_already_landed(monkeypatch)
     path in this module writes ('promoted byte-identical to') — not bead
     status. SABLE-d5iku already established a closed bead is not a merged
     bead; reusing status here would reopen that exact gap."""
-    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
-        "SABLE-a": {"metadata": {"landing_pair": "SABLE-b"}, "notes": ""},
-        "SABLE-b": {"metadata": {}, "status": "open",
-                    "notes": "merge-preview ci-verify gate GREEN: ... promoted "
-                             "byte-identical to trunk (verdict stored)."},
-    }))
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show(
+        _reciprocal_pair(
+            second_notes="merge-preview ci-verify gate GREEN: ... promoted "
+                         "byte-identical to trunk (verdict stored).")))
     promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a")  # must not raise
 
 
@@ -2639,10 +2798,9 @@ def test_a_closed_but_unlanded_counterpart_still_refuses(monkeypatch):
     worker's close-at-push (which happens before chuck ever merges, per
     SABLE-d5iku) would silently open the exact split-promote hole this bead
     closes."""
-    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
-        "SABLE-a": {"metadata": {"landing_pair": "SABLE-b"}, "notes": ""},
-        "SABLE-b": {"metadata": {}, "status": "closed", "notes": "closed at push time"},
-    }))
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show(
+        _reciprocal_pair(
+            second_status="closed", second_notes="closed at push time")))
     with pytest.raises(promote_lib.LandingPairRefused):
         promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a")
 
@@ -2650,10 +2808,8 @@ def test_a_closed_but_unlanded_counterpart_still_refuses(monkeypatch):
 def test_atomic_batch_satisfies_pair_only_when_counterpart_is_a_member(monkeypatch):
     """A pair authorization must correspond to the batch writer's concrete
     all-or-nothing member set, never a caller-supplied acknowledgement."""
-    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
-        "SABLE-a": {"metadata": {"landing_pair": "SABLE-b"}, "notes": ""},
-        "SABLE-b": {"metadata": {"landing_pair": "SABLE-a"}, "notes": ""},
-    }))
+    monkeypatch.setattr(
+        promote_lib, "_bd_show", _fake_bd_show(_reciprocal_pair()))
     members = [
         promote_lib.BatchMember(
             "wk-a", "a" * 40, ("SABLE-a",), ("bin/a.py",)),
@@ -2666,31 +2822,11 @@ def test_atomic_batch_satisfies_pair_only_when_counterpart_is_a_member(monkeypat
 def test_batch_landing_evidence_counts_as_genuinely_landed(monkeypatch):
     """The pair recovery read must recognize every successful writer owned by
     this module, including the batch writer's durable evidence."""
-    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
-        "SABLE-a": {"metadata": {"landing_pair": "SABLE-b"}, "notes": ""},
-        "SABLE-b": {"metadata": {}, "status": "open",
-                    "notes": "BATCH LANDED: 2 member(s) fast-forwarded trunk "
-                             "to fold tip abcdef0 in ONE cycle."},
-    }))
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show(
+        _reciprocal_pair(
+            second_notes="BATCH LANDED: 2 member(s) fast-forwarded trunk "
+                         "to fold tip abcdef0 in ONE cycle.")))
     promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a")
-
-
-def test_declared_landing_pair_parses_comma_and_whitespace_separated_ids(monkeypatch):
-    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
-        "SABLE-a": {"metadata": {"landing_pair": "SABLE-b, SABLE-c\nSABLE-d"}},
-    }))
-    assert promote_lib.declared_landing_pair("/repo", "SABLE-a") == {
-        "SABLE-b", "SABLE-c", "SABLE-d"}
-
-
-def test_declared_landing_pair_is_empty_when_bd_cannot_be_read(monkeypatch):
-    """Fail OPEN on the bead's OWN unreadable metadata — the pre-existing
-    default for every bead this mechanism does not apply to (almost all of
-    them) must not become 'refuse everything' just because bd hiccuped once."""
-    monkeypatch.setattr(promote_lib, "_bd_show",
-                        lambda repo, bead_id: subprocess.CompletedProcess([], 1, stdout=""))
-    assert promote_lib.declared_landing_pair("/repo", "SABLE-a") == frozenset()
-    promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a")  # must not raise
 
 
 def test_an_unresolvable_counterpart_fails_closed(monkeypatch):

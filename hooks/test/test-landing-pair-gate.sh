@@ -12,14 +12,19 @@
 # GitHub Actions verdict is injected, the same seam every other merge-gate
 # suite uses — see test-snapshot-freeze.sh/test-optimistic-promotion.sh):
 #
-#   C1  bead A declares metadata.landing_pair=B; B is not landed -> REFUSED
-#       (exit 28), naming B and the atomic batch path. The integration branch
-#       tip does not move.
-#   C2  the former --with-pair acknowledgement is rejected as unknown and
+#   C1  the authoritative CLI declares A/B, then B's metadata is removed to
+#       plant a real asymmetric store. A is refused and the tip does not move.
+#   C2  B also discovers A's reverse-only declaration through the durable
+#       relates-to index, is refused, and the tip still does not move.
+#   C3  the authoritative declaration CLI repairs the pair; the former
+#       --with-pair acknowledgement is rejected as unknown and
 #       cannot move the integration branch.
-#   C3  A and B form one CI-verified fold and land through ONE integration-ref
+#   C4  A and B form one CI-verified fold and land through ONE integration-ref
 #       update; both exact branch tips are ancestors of the new tip.
-#   C4  a bead with NO landing_pair metadata at all promotes independently,
+#   C5  the authoritative removal CLI clears both metadata records in one
+#       operation. The generic relation remains policy-inert and is not
+#       destructively removed because it may have predated the pair.
+#   C6  a bead with NO landing_pair metadata at all promotes independently,
 #       untouched by any of this — the negative control that proves the check
 #       discriminates on the declared relation, not on any file-level property.
 #
@@ -142,12 +147,25 @@ if [ -z "$BID_A" ] || [ -z "$BID_B" ] || [ -z "$BID_C" ]; then
   exit 2
 fi
 
-bdu "$BID_A" --set-metadata "landing_pair=$BID_B"
-bdu "$BID_B" --set-metadata "landing_pair=$BID_A"
+DECLARE_OUT="$(gate landing-pair declare "$BID_A" "$BID_B" --repo "$G_WORK")"
+DECLARE_RC=$?
+if [ "$DECLARE_RC" -eq 0 ]; then
+  pass "C1 authoritative landing-pair declaration succeeds"
+else
+  fail "C1 authoritative landing-pair declaration succeeds" \
+       "rc=$DECLARE_RC
+$DECLARE_OUT"
+fi
+
+# Plant the failure mode from SABLE-8mfe6 in a real store: a partially removed
+# declaration. The sanctioned remover never emits this state, but a killed old
+# two-write workflow or manual metadata edit can. The relation intentionally
+# remains, making A's declaration visible from B's single ordinary show read.
+bdu "$BID_B" --unset-metadata landing_pair
 # BID_C carries no landing_pair metadata at all — the negative control.
 
 # ---------------------------------------------------------------------------
-# C1 — a solo promote of the paired bead A is refused, naming B
+# C1 — the declaring endpoint is refused under asymmetric state
 # ---------------------------------------------------------------------------
 TIP_BEFORE="$(base_tip)"
 OUT1="$(gate promote --bead "$BID_A" --branch wk-a --base "$BASE_BR" \
@@ -166,10 +184,10 @@ else
   fail "C1 refusal names the counterpart" "$OUT1"
 fi
 
-if echo "$OUT1" | grep -Eq 'batch-cycle|land-batch'; then
-  pass "C1 the refusal names the atomic batch landing path"
+if echo "$OUT1" | grep -Eq 'landing-pair declare|landing-pair remove'; then
+  pass "C1 the asymmetric refusal names the mechanical repair paths"
 else
-  fail "C1 refusal names an atomic batch path" "$OUT1"
+  fail "C1 asymmetric refusal names a repair path" "$OUT1"
 fi
 
 if [ "$(base_tip)" = "$TIP_BEFORE" ]; then
@@ -179,21 +197,50 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# C2 — the former acknowledgement flag is gone and cannot move the base
+# C2 — the blank endpoint discovers the reverse-only declaration and refuses
 # ---------------------------------------------------------------------------
-OUT2="$(gate promote --bead "$BID_A" --branch wk-a --base "$BASE_BR" \
-        --repo "$G_WORK" --remote origin --manager chuck \
-        --with-pair "$BID_B")"; RC2=$?
+OUT2="$(gate promote --bead "$BID_B" --branch wk-b --base "$BASE_BR" \
+        --repo "$G_WORK" --remote origin --manager chuck)"; RC2=$?
 
-if [ "$RC2" -eq 2 ] && [ "$(base_tip)" = "$TIP_BEFORE" ]; then
-  pass "C2 removed --with-pair flag is rejected and moves nothing"
+if [ "$RC2" -eq 28 ] && echo "$OUT2" | grep -qi asymmetric; then
+  pass "C2 reverse-only endpoint is mechanically refused as asymmetric"
 else
-  fail "C2 removed --with-pair is fail-closed" "rc=$RC2 tip=$(base_tip) (was $TIP_BEFORE)
+  fail "C2 reverse-only endpoint is refused" "rc=$RC2
 $OUT2"
 fi
 
+if [ "$(base_tip)" = "$TIP_BEFORE" ]; then
+  pass "C2 the integration branch still did not move"
+else
+  fail "C2 reverse-only refusal moved the base" "$TIP_BEFORE -> $(base_tip)"
+fi
+
 # ---------------------------------------------------------------------------
-# C3 — both paired branches land through one exact combined-object ref update
+# C3 — the one declaration interface repairs state; old acknowledgement stays gone
+# ---------------------------------------------------------------------------
+REPAIR_OUT="$(gate landing-pair declare "$BID_A" "$BID_B" --repo "$G_WORK")"
+REPAIR_RC=$?
+OUT3="$(gate promote --bead "$BID_A" --branch wk-a --base "$BASE_BR" \
+        --repo "$G_WORK" --remote origin --manager chuck \
+        --with-pair "$BID_B")"; RC3=$?
+
+if [ "$REPAIR_RC" -eq 0 ]; then
+  pass "C3 authoritative declaration repairs partial metadata"
+else
+  fail "C3 authoritative declaration repairs partial metadata" \
+       "rc=$REPAIR_RC
+$REPAIR_OUT"
+fi
+
+if [ "$RC3" -eq 2 ] && [ "$(base_tip)" = "$TIP_BEFORE" ]; then
+  pass "C3 removed --with-pair flag is rejected and moves nothing"
+else
+  fail "C3 removed --with-pair is fail-closed" "rc=$RC3 tip=$(base_tip) (was $TIP_BEFORE)
+$OUT3"
+fi
+
+# ---------------------------------------------------------------------------
+# C4 — both paired branches land through one exact combined-object ref update
 # ---------------------------------------------------------------------------
 FOLD_INFO="$(
   env PYTHONPATH="$REPO_ROOT/bin" python3 - "$G_WORK" "$BASE_BR" "$BID_A" "$BID_B" <<'PY'
@@ -214,22 +261,22 @@ PY
 )"
 FOLD_TIP="${FOLD_INFO%% *}"
 REFLOG_BEFORE="$(base_reflog_count)"
-OUT3="$(gate land-batch --base "$BASE_BR" \
+OUT4="$(gate land-batch --base "$BASE_BR" \
         --member "wk-a:$BID_A" --member "wk-b:$BID_B" \
-        --repo "$G_WORK" --remote origin --manager chuck)"; RC3=$?
+        --repo "$G_WORK" --remote origin --manager chuck)"; RC4=$?
 REFLOG_AFTER="$(base_reflog_count)"
 
-if [ "$RC3" -eq 0 ] && [ "$(base_tip)" = "$FOLD_TIP" ]; then
-  pass "C3 the exact CI-verified pair fold lands"
+if [ "$RC4" -eq 0 ] && [ "$(base_tip)" = "$FOLD_TIP" ]; then
+  pass "C4 the exact CI-verified pair fold lands"
 else
-  fail "C3 exact pair fold lands" "rc=$RC3 tip=$(base_tip) expected=$FOLD_TIP
-$OUT3"
+  fail "C4 exact pair fold lands" "rc=$RC4 tip=$(base_tip) expected=$FOLD_TIP
+$OUT4"
 fi
 
 if [ $((REFLOG_AFTER - REFLOG_BEFORE)) -eq 1 ]; then
-  pass "C3 pair landing advances the integration ref exactly once"
+  pass "C4 pair landing advances the integration ref exactly once"
 else
-  fail "C3 pair landing uses one integration-ref update" \
+  fail "C4 pair landing uses one integration-ref update" \
        "reflog before=$REFLOG_BEFORE after=$REFLOG_AFTER"
 fi
 
@@ -237,13 +284,44 @@ if git --git-dir="$G_ORIGIN" merge-base --is-ancestor \
      "$(git --git-dir="$G_ORIGIN" rev-parse refs/heads/wk-a)" "$FOLD_TIP" &&
    git --git-dir="$G_ORIGIN" merge-base --is-ancestor \
      "$(git --git-dir="$G_ORIGIN" rev-parse refs/heads/wk-b)" "$FOLD_TIP"; then
-  pass "C3 both exact worker tips are contained in the landed fold"
+  pass "C4 both exact worker tips are contained in the landed fold"
 else
-  fail "C3 landed fold contains both exact worker tips"
+  fail "C4 landed fold contains both exact worker tips"
 fi
 
 # ---------------------------------------------------------------------------
-# C4 — an unpaired bead (no landing_pair metadata) promotes independently
+# C5 — removal clears both declarations and preserves generic relationship data
+# ---------------------------------------------------------------------------
+REMOVE_OUT="$(gate landing-pair remove "$BID_A" "$BID_B" --repo "$G_WORK")"
+REMOVE_RC=$?
+PAIR_STATE="$(
+  env BEADS_DB="$BEADS_DB" bd show "$BID_A" "$BID_B" --json |
+    python3 -c 'import json,sys
+rows=json.load(sys.stdin)
+bad=[r["id"] for r in rows
+     if (r.get("metadata") or {}).get("landing_pair")]
+print(",".join(bad))'
+)"
+RELATION_COUNT="$(
+  env BEADS_DB="$BEADS_DB" bd show "$BID_A" "$BID_B" --json |
+    python3 -c 'import json,sys
+rows=json.load(sys.stdin)
+members={r["id"] for r in rows}
+print(sum(1 for r in rows for d in r.get("dependencies", [])
+          if d.get("dependency_type") == "relates-to"
+          and d.get("id") in members))'
+)"
+if [ "$REMOVE_RC" -eq 0 ] && [ -z "$PAIR_STATE" ] &&
+   [ "$RELATION_COUNT" -eq 2 ]; then
+  pass "C5 removal clears both declarations without deleting generic relation"
+else
+  fail "C5 authoritative removal clears reciprocal state" \
+       "rc=$REMOVE_RC remaining=$PAIR_STATE relation_count=$RELATION_COUNT
+$REMOVE_OUT"
+fi
+
+# ---------------------------------------------------------------------------
+# C6 — an unpaired bead (no landing_pair metadata) promotes independently
 # ---------------------------------------------------------------------------
 git -C "$G_WORK" checkout -q "$BASE_BR"
 git -C "$G_WORK" pull -q origin "$BASE_BR"
@@ -259,9 +337,9 @@ OUT4="$(gate promote --bead "$BID_C" --branch wk-c --base "$BASE_BR" \
         --repo "$G_WORK" --remote origin --manager chuck)"; RC4=$?
 
 if [ "$RC4" -eq 0 ] && [ "$(base_tip)" != "$TIP_BEFORE_C" ]; then
-  pass "C4 an unpaired bead promotes independently, untouched by the check"
+  pass "C6 an unpaired bead promotes independently, untouched by the check"
 else
-  fail "C4 unpaired bead promotes independently" "rc=$RC4 tip=$(base_tip) (was $TIP_BEFORE_C)
+  fail "C6 unpaired bead promotes independently" "rc=$RC4 tip=$(base_tip) (was $TIP_BEFORE_C)
 $OUT4"
 fi
 

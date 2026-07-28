@@ -636,13 +636,20 @@ know it was half of a pair. That is a near-miss with no failure event at the
 promote: both halves are individually green, which is exactly what makes
 them individually signable, so nothing red announces the split.
 
-The ruling is now `metadata.landing_pair` on the bead itself, set on BOTH
-sides of the pair:
+The ruling is now reciprocal `metadata.landing_pair` state plus a durable
+Beads reverse index. Create or remove it only through the landing authority:
 
 ```bash
-bd update <id-a> --set-metadata landing_pair=<id-b>
-bd update <id-b> --set-metadata landing_pair=<id-a>
+sable-merge-gate landing-pair declare <id-a> <id-b>
+sable-merge-gate landing-pair remove <id-a> <id-b>
 ```
+
+Do not write the metadata directly. The command writes the same canonical
+member set to both beads in one operation. Its `relates-to` edge lets either
+bead detect a partial/manual one-sided edit from its own ordinary `bd show`;
+such an asymmetric state fails closed at both endpoints. Removing a pair
+clears both declarations but preserves the generic relation because it may
+have existed before the pair and is policy-inert without the metadata.
 
 `sable-merge-gate promote` reads it mechanically (exit 28, naming the
 counterpart) — see chuck.md's promote step for the full contract. An
@@ -654,9 +661,10 @@ or not at all; merely naming the counterpart cannot satisfy it. Every manual
 the declared relation. Solo promotion remains available only after the
 counterpart genuinely landed, as recovery for a historical half-landing.
 
-This is distinct from `bd dep add` (which means "cannot **start** until") — a
-landing pair CAN be worked in parallel; it can only never be **promoted**
-solo.
+This is distinct from a blocking `bd dep add` edge (which means "cannot
+**start** until") — the non-blocking `relates-to` reverse index does not gate
+work. A landing pair CAN be worked in parallel; it can only never be
+**promoted** solo.
 
 ---
 

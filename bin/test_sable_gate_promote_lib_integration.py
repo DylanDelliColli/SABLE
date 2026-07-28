@@ -1128,9 +1128,10 @@ def test_batch_writer_refuses_a_declared_pair_missing_from_the_atomic_set(
     combined_ref = "ci-verify/batch-incomplete-pair"
     before = _remote_head(bare, "trunk")
     monkeypatch.setattr(
-        promote_lib, "declared_landing_pair",
+        promote_lib, "validated_landing_pair",
         lambda repo_, bead: (
-            frozenset({"SABLE-b"}) if bead == "SABLE-a" else frozenset()))
+            (frozenset({"SABLE-b"}), {})
+            if bead == "SABLE-a" else (frozenset(), {})))
     monkeypatch.setattr(promote_lib, "_bead_landed", lambda *args: False)
 
     with pytest.raises(promote_lib.GateError) as exc:
@@ -1156,11 +1157,11 @@ def test_batch_writer_lands_both_members_of_a_declared_pair_atomically(
     fold_tip = _fold(repo, base_sha, members)
     combined_ref = "ci-verify/batch-complete-pair"
     monkeypatch.setattr(
-        promote_lib, "declared_landing_pair",
+        promote_lib, "validated_landing_pair",
         lambda repo_, bead: (
-            frozenset({"SABLE-b"}) if bead == "SABLE-a"
-            else frozenset({"SABLE-a"}) if bead == "SABLE-b"
-            else frozenset()))
+            (frozenset({"SABLE-b"}), {}) if bead == "SABLE-a"
+            else (frozenset({"SABLE-a"}), {}) if bead == "SABLE-b"
+            else (frozenset(), {})))
     monkeypatch.setattr(promote_lib, "_bead_landed", lambda *args: False)
 
     result = promote_lib.land_batch(

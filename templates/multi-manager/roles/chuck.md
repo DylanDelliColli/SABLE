@@ -117,12 +117,20 @@ Each merge request — message OR bead:
    Before this bead that ruling lived only in a bead note or a manager's
    working memory, which you as the seat never read — you could be holding
    one half of a deliberately-paired change with no way to know it. The
-   ruling is now `metadata.landing_pair` on the bead itself (`bd update <id>
-   --set-metadata landing_pair=<counterpart-id>`, set on BOTH sides of the
-   pair), and `sable-merge-gate promote` reads it MECHANICALLY: a solo
-   promote of either half exits 28, naming the counterpart, unless the
-   counterpart has already landed. An unlanded pair must enter the SAME
-   atomic batch; an ID acknowledgement is not landing evidence:
+   ruling is now a mechanically reciprocal Beads declaration. Create and
+   remove it only through the one authority that writes both metadata records
+   and their durable reverse index:
+   ```bash
+   sable-merge-gate landing-pair declare <id> <counterpart-id>
+   sable-merge-gate landing-pair remove <id> <counterpart-id>
+   ```
+   Never write `metadata.landing_pair` directly. A partial/manual one-sided
+   edit is treated as corrupt from EITHER bead and every landing writer exits
+   28 until the command above repairs or removes it. `sable-merge-gate
+   promote` reads this state MECHANICALLY: a solo promote of either half exits
+   28, naming the counterpart, unless the counterpart has already landed. An
+   unlanded pair must enter the SAME atomic batch; an ID acknowledgement is
+   not landing evidence:
    ```bash
    sable-merge-gate batch-cycle \
      --member <branch>:<id> \
@@ -135,9 +143,10 @@ Each merge request — message OR bead:
    counterpart has genuinely landed remains available only to repair a legacy
    half-landed pair.
 
-   Check `bd show <id> --json` for a `landing_pair` metadata field before you
-   sequence a queue — it changes the ORDER question above from "any two
-   independent greens" to "these two travel together."
+   Check `bd show <id> --json` for the reciprocal `landing_pair` metadata and
+   its `relates-to` reverse index before you sequence a queue — it changes the
+   ORDER question above from "any two independent greens" to "these two travel
+   together."
 
    `batch-cycle` enforces the same metadata at its final writer: every declared
    counterpart must be a member of the same atomic batch (or already landed).

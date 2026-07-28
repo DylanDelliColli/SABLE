@@ -433,7 +433,14 @@ def _pair_groups(
     excluded: list[admission.Exclusion] = []
     invalid: set[str] = set()
     for candidate in candidates:
-        counterparts = set(promote.declared_landing_pair(repo, candidate.bead))
+        try:
+            counterparts, _ = promote.validated_landing_pair(
+                repo, candidate.bead)
+        except promote.LandingPairRefused as exc:
+            invalid.add(candidate.bead)
+            excluded.append(admission.Exclusion(candidate, str(exc)))
+            continue
+        counterparts = set(counterparts)
         counterparts.update((extra_pairs or {}).get(candidate.bead, ()))
         for counterpart in counterparts:
             if counterpart in by_bead:

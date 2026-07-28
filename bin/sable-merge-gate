@@ -375,6 +375,8 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--dry-run", action="store_true", dest="dry_run",
                     help="report the refs that would be deleted, deleting nothing (SABLE-o9b8u)")
 
+    promote_lib.register_landing_pair_subcommand(sub)
+
     # SABLE-w0zjm. The gate's own worst-case promote wall-clock, so an operator
     # wrapper DERIVES its timeout instead of keeping a second copy of the number.
     # Named promote-budget, not budget, because sable_gate_budget_lib already owns
@@ -440,6 +442,8 @@ def main(argv: list[str] | None = None) -> int:
                                               args.remote, args.json)
         if args.command == "sweep":
             return preview_lib.sweep(args.repo, args.remote, args.max_age_hours, args.dry_run)
+        if args.command == "landing-pair":
+            return promote_lib.dispatch_landing_pair_command(args)
         if args.command == "promote-budget":
             print(promote_lib.render_promote_budget_report(
                 args.member_footprints, args.seconds, args.json))

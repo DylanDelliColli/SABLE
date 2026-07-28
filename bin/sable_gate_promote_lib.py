@@ -1671,14 +1671,23 @@ def assert_not_frozen(repo: str) -> None:
 # event at the promote; the damage is an invariant that only holds jointly
 # now half-landed.
 #
-# The fix is a metadata field ON THE BEAD ITSELF (`landing_pair`, set the
-# same way chuck.md's `hold` metadata already is: `bd update <id>
-# --set-metadata landing_pair=<counterpart-id>[,<counterpart-id>...]`) so the
-# declaration lives where THIS function already looks, instead of somewhere
-# it never reads. A solo promote of either half is refused, naming the
-# counterpart, unless the counterpart has ALREADY landed. An unlanded pair is
-# authorized only as concrete members of land_batch()'s single integration-ref
-# update; a caller-supplied acknowledgement cannot stand in for co-landing.
+# The declaration is metadata ON BOTH BEADS plus a Beads `relates-to` edge.
+# The edge is not itself landing policy; it is the durable reverse index that
+# lets B's ordinary `bd show B --json` expose A's metadata when A declares B.
+# That distinction matters because `relates-to` is also the project's generic
+# see-also relation.  The only supported writer is declare_landing_pair() /
+# remove_landing_pair(), exposed by `sable-merge-gate landing-pair`: it creates
+# the reverse index first, then writes the same canonical member set to both
+# beads in one `bd update` invocation.  If that write is interrupted after only
+# one record changes, either endpoint sees the mismatch through the relation
+# and refuses. Removal clears both metadata records in one command; the
+# policy-neutral relation remains as history rather than risking deletion of a
+# pre-existing see-also link.
+#
+# A solo promote of either half is refused, naming the counterpart, unless the
+# counterpart has ALREADY landed. An unlanded pair is authorized only as
+# concrete members of land_batch()'s single integration-ref update; a
+# caller-supplied acknowledgement cannot stand in for co-landing.
 #
 # "Landed" is deliberately NOT bead status. SABLE-d5iku (chuck.md) already
 # established that a CLOSED bead is not a MERGED bead — status flips at the
@@ -1694,7 +1703,7 @@ _BATCH_LANDED_MARKER = "BATCH LANDED:"
 
 
 class LandingPairRefused(Exception):
-    """A solo promote would split a declared, not-yet-landed pair."""
+    """Landing-pair authority is unsatisfied or its declaration is corrupt."""
 
 
 def _bd_show(repo: str, bead_id: str) -> subprocess.CompletedProcess:
@@ -1730,20 +1739,217 @@ def _bd_show_json(repo: str, bead_id: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def declared_landing_pair(repo: str, bead: str) -> frozenset[str]:
-    """The bead ids <bead> itself declares via `metadata.landing_pair`
-    (comma/whitespace-separated). Empty when unset, unreadable, or bead is
-    falsy — "no pairing declared" is the correct default for every bead this
-    mechanism does not apply to, which is almost all of them."""
-    if not bead:
+def _landing_pair_ids(record: dict, bead_id: str) -> frozenset[str]:
+    """Parse one record's declaration into its *other* member ids.
+
+    The authoritative writer stores the same canonical ``A,B`` value on A and
+    B so one multi-id Beads update cannot compute two divergent values.  Legacy
+    ``A: B`` / ``B: A`` records remain readable.  In both representations the
+    current bead is not its own counterpart.
+    """
+    metadata = record.get("metadata") or {}
+    if not isinstance(metadata, dict):
         return frozenset()
-    raw = (_bd_show_json(repo, bead).get("metadata") or {}).get(_LANDING_PAIR_KEY) or ""
-    return frozenset(tok.strip() for tok in re.split(r"[,\s]+", raw) if tok.strip())
+    raw = metadata.get(_LANDING_PAIR_KEY) or ""
+    if not isinstance(raw, str):
+        return frozenset()
+    ids = {tok.strip() for tok in re.split(r"[,\s]+", raw) if tok.strip()}
+    ids.discard(bead_id)
+    return frozenset(ids)
+
+
+def _related_records(record: dict) -> dict[str, dict]:
+    """The bidirectional `relates-to` records embedded by `bd show --json`."""
+    related = {}
+    dependencies = record.get("dependencies") or []
+    if not isinstance(dependencies, list):
+        return related
+    for dependency in dependencies:
+        if (not isinstance(dependency, dict)
+                or dependency.get("dependency_type") != "relates-to"):
+            continue
+        bead_id = str(dependency.get("id") or "").strip()
+        if bead_id:
+            related[bead_id] = dependency
+    return related
+
+
+def validated_landing_pair(
+        repo: str, bead: str,
+        ) -> tuple[frozenset[str], dict[str, dict]]:
+    """Return a reciprocal declaration and the already-read counterpart rows.
+
+    One ordinary ``bd show`` supplies the bead, every related endpoint, and
+    those endpoints' metadata.  That keeps the unpaired path at exactly the
+    pre-existing one process read while making reverse-only declarations
+    visible.  A generic relation with no landing metadata on either endpoint
+    remains inert.
+    """
+    if not bead:
+        return frozenset(), {}
+    record = _bd_show_json(repo, bead)
+    if not record:
+        # Preserve the historical default for unit fixtures and environments
+        # where Beads itself is absent.  When a declaration is readable but a
+        # counterpart/index is not, the checks below are fail-closed.
+        return frozenset(), {}
+
+    own = _landing_pair_ids(record, bead)
+    related = _related_records(record)
+    reverse = frozenset(
+        related_id for related_id, related_record in related.items()
+        if bead in _landing_pair_ids(related_record, related_id))
+    candidates = own | reverse
+    if not candidates:
+        return frozenset(), related
+
+    problems = []
+    for counterpart in sorted(candidates):
+        if counterpart not in related:
+            problems.append(
+                f"{bead}->{counterpart} has no relates-to reverse index")
+        if counterpart not in own:
+            problems.append(f"{bead} does not declare {counterpart}")
+        if counterpart not in reverse:
+            problems.append(f"{counterpart} does not declare {bead}")
+    if problems:
+        pair = ", ".join(sorted({bead, *candidates}))
+        raise LandingPairRefused(
+            f"asymmetric landing-pair declaration for [{pair}] "
+            f"(SABLE-8mfe6): {'; '.join(problems)}. Refusing every landing "
+            f"writer until `sable-merge-gate landing-pair declare` repairs it "
+            f"or `sable-merge-gate landing-pair remove` clears it.")
+    return own, related
+
+
+def _bd_pair_mutation(repo: str, args: list[str], description: str) -> None:
+    cp = git_lib._run(
+        git_lib._tool("SABLE_MG_BD", "bd") + args,
+        cwd=repo, check=False)
+    if cp.returncode != 0:
+        detail = cp.stdout.strip()[:500] or f"exit {cp.returncode}"
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"could not {description}: {detail}")
+
+
+def _pair_records(repo: str, first: str, second: str) -> tuple[dict, dict]:
+    if not first or not second or first == second:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            "landing-pair members must be two distinct, non-empty bead ids")
+    first_record = _bd_show_json(repo, first)
+    second_record = _bd_show_json(repo, second)
+    if not first_record or not second_record:
+        missing = first if not first_record else second
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"cannot change landing pair: bead {missing!r} is unreadable")
+    return first_record, second_record
+
+
+def declare_landing_pair(repo: str, first: str, second: str) -> None:
+    """Create or repair one mechanically reciprocal two-bead declaration.
+
+    The relation is written first.  It is policy-neutral by itself, but once
+    either metadata row exists it makes that row visible from both endpoints.
+    Therefore any interrupted/partial multi-id metadata update blocks both
+    writers instead of reopening serial promotion on the blank side.
+    """
+    first_record, second_record = _pair_records(repo, first, second)
+    expected = {first, second}
+    for bead_id, record in ((first, first_record), (second, second_record)):
+        existing = set(_landing_pair_ids(record, bead_id))
+        if existing and existing != expected - {bead_id}:
+            raise GateError(
+                classify.EXIT_PRECONDITION,
+                f"{bead_id} already declares a different landing pair: "
+                f"{', '.join(sorted(existing))}")
+
+    _bd_pair_mutation(
+        repo, ["dep", "relate", first, second],
+        f"create landing-pair reverse index for {first}/{second}")
+    canonical = ",".join(sorted(expected))
+    _bd_pair_mutation(
+        repo,
+        ["update", first, second, "--set-metadata",
+         f"{_LANDING_PAIR_KEY}={canonical}"],
+        f"declare reciprocal landing pair {first}/{second}")
+    try:
+        first_pair, _ = validated_landing_pair(repo, first)
+        second_pair, _ = validated_landing_pair(repo, second)
+    except LandingPairRefused as exc:
+        raise GateError(classify.EXIT_PAIR_REFUSED, str(exc)) from exc
+    if first_pair != {second} or second_pair != {first}:
+        raise GateError(
+            classify.EXIT_PAIR_REFUSED,
+            f"landing-pair write for {first}/{second} did not round-trip "
+            f"reciprocally; promotion remains refused")
+
+
+def remove_landing_pair(repo: str, first: str, second: str) -> None:
+    """Remove both declarations while preserving the generic relation."""
+    first_record, second_record = _pair_records(repo, first, second)
+    first_pair = set(_landing_pair_ids(first_record, first))
+    second_pair = set(_landing_pair_ids(second_record, second))
+    if second not in first_pair and first not in second_pair:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"{first}/{second} do not declare a landing pair")
+    if first_pair - {second} or second_pair - {first}:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"refusing to remove only part of a larger landing-pair group: "
+            f"{first}={sorted(first_pair)}, {second}={sorted(second_pair)}")
+
+    # Metadata disappears from both records in one multi-id command. If Beads
+    # stops after only one row, the relation exposes the surviving declaration
+    # to both endpoints and both gates refuse. The generic relation deliberately
+    # remains: it may have predated the pair, and without provenance metadata it
+    # would be unsafe for this narrowly-scoped command to delete it.
+    _bd_pair_mutation(
+        repo,
+        ["update", first, second, "--unset-metadata", _LANDING_PAIR_KEY],
+        f"clear reciprocal landing pair {first}/{second}")
+
+    first_after, second_after = _pair_records(repo, first, second)
+    if (_landing_pair_ids(first_after, first)
+            or _landing_pair_ids(second_after, second)):
+        raise GateError(
+            classify.EXIT_PAIR_REFUSED,
+            f"landing-pair removal for {first}/{second} did not clear both "
+            f"records; promotion remains refused")
+
+
+def register_landing_pair_subcommand(subparsers) -> None:
+    """Keep the merge-gate CLI thin while exposing the sole pair writer."""
+    pair = subparsers.add_parser(
+        "landing-pair",
+        help="declare/remove a mechanically reciprocal MUST-LAND-TOGETHER pair")
+    actions = pair.add_subparsers(dest="landing_pair_action", required=True)
+    for action in ("declare", "remove"):
+        command = actions.add_parser(action)
+        command.add_argument("first", help="first bead id")
+        command.add_argument("second", help="second bead id")
+        command.add_argument(
+            "--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+
+
+def dispatch_landing_pair_command(args) -> int:
+    if args.landing_pair_action == "declare":
+        declare_landing_pair(args.repo, args.first, args.second)
+    else:
+        remove_landing_pair(args.repo, args.first, args.second)
+    return 0
+
+
+def _record_landed(record: dict) -> bool:
+    notes = record.get("notes") or ""
+    return _LANDED_MARKER in notes or _BATCH_LANDED_MARKER in notes
 
 
 def _bead_landed(repo: str, bead_id: str) -> bool:
-    notes = _bd_show_json(repo, bead_id).get("notes") or ""
-    return _LANDED_MARKER in notes or _BATCH_LANDED_MARKER in notes
+    return _record_landed(_bd_show_json(repo, bead_id))
 
 
 def bead_landed(repo: str, bead_id: str) -> bool:
@@ -1757,8 +1963,9 @@ def assert_landing_pair_satisfied(repo: str, bead: str) -> None:
     `landing_pair` metadata at all — are never touched by this check, however
     similar their footprints: it discriminates on the declared relation, not
     on any file-level property."""
-    for counterpart in declared_landing_pair(repo, bead):
-        if _bead_landed(repo, counterpart):
+    counterparts, related = validated_landing_pair(repo, bead)
+    for counterpart in counterparts:
+        if _record_landed(related.get(counterpart) or {}):
             continue
         raise LandingPairRefused(
             f"{bead} declares metadata.{_LANDING_PAIR_KEY}={counterpart!r} (SABLE-rzkw7: "
@@ -1778,8 +1985,13 @@ def assert_batch_landing_pairs_satisfied(repo: str, members: list) -> None:
     batch_beads = frozenset(
         bead_id for member in members for bead_id in member.bead_ids)
     for bead_id in batch_beads:
-        for counterpart in declared_landing_pair(repo, bead_id):
-            if counterpart in batch_beads or _bead_landed(repo, counterpart):
+        try:
+            counterparts, related = validated_landing_pair(repo, bead_id)
+        except LandingPairRefused as exc:
+            raise GateError(classify.EXIT_PAIR_REFUSED, str(exc)) from exc
+        for counterpart in counterparts:
+            if (counterpart in batch_beads
+                    or _record_landed(related.get(counterpart) or {})):
                 continue
             raise GateError(
                 classify.EXIT_PAIR_REFUSED,
