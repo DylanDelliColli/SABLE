@@ -42,6 +42,7 @@ pytestmark = pytest.mark.skipif(
 _ENV_LEAKS = ("CLAUDE_AGENT_NAME", "TMUX_PANE", "SABLE_TMUX_SOCKET",
               "SABLE_INTEGRATION_BRANCH", "SABLE_BASE_BRANCH",
               "SABLE_SCREEN_INSTALL_ROOTS")
+_FIXTURE_TEMPLATE_ROOT = None
 
 
 def _env(home, extra=None):
@@ -94,7 +95,7 @@ def _robust_bd_init(work, home):
 
 # --- the real fixture -------------------------------------------------------
 
-def _setup(tmp_path):
+def _setup_fresh(tmp_path):
     """A real git working tree, a real bd store, and a real install prefix
     holding one artifact of each installed shape."""
     work = tmp_path / "work"
@@ -131,6 +132,81 @@ def _setup(tmp_path):
 
     _robust_bd_init(work, home)
     return work, home, prefix
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _immutable_fixture_template(tmp_path_factory):
+    """Build the real install/git/bd baseline once per pytest session."""
+    global _FIXTURE_TEMPLATE_ROOT
+    if not HAVE_BD:
+        yield
+        return
+
+    root = tmp_path_factory.mktemp("activation-screen-template")
+    _setup_fresh(root)
+    _FIXTURE_TEMPLATE_ROOT = root
+    try:
+        yield
+    finally:
+        _FIXTURE_TEMPLATE_ROOT = None
+
+
+def _setup(tmp_path):
+    """Deep-copy and rebind the immutable baseline for one isolated test."""
+    if _FIXTURE_TEMPLATE_ROOT is None:
+        return _setup_fresh(tmp_path)
+
+    for name in ("work", "local-bin", "pinned-snapshot"):
+        shutil.copytree(
+            _FIXTURE_TEMPLATE_ROOT / name,
+            tmp_path / name,
+            symlinks=True,
+        )
+    home = tmp_path / "home"
+    home.mkdir()
+    nohooks = tmp_path / "nohooks"
+    nohooks.mkdir()
+
+    work = tmp_path / "work"
+    prefix = tmp_path / "local-bin"
+    snapshot = tmp_path / "pinned-snapshot"
+    _git(work, "config", "--local", "core.hooksPath", str(nohooks))
+
+    # copytree preserves the template's absolute symlink targets. Rebind them
+    # so every activation verdict is about this test's own copied world.
+    (prefix / "toolA").unlink()
+    os.symlink(work / "bin" / "toolA", prefix / "toolA")
+    (prefix / "toolB").unlink()
+    os.symlink(snapshot / "toolB", prefix / "toolB")
+    return work, home, prefix
+
+
+def test_fixture_template_copies_share_no_mutable_state(tmp_path):
+    """Guard copied Git, Beads, and absolute activation symlink isolation."""
+    left_root = tmp_path / "left"
+    right_root = tmp_path / "right"
+    left_root.mkdir()
+    right_root.mkdir()
+    left_work, _, left_prefix = _setup(left_root)
+    right_work, _, right_prefix = _setup(right_root)
+
+    assert (left_prefix / "toolA").resolve() == left_work / "bin" / "toolA"
+    assert (right_prefix / "toolA").resolve() == right_work / "bin" / "toolA"
+    assert (left_prefix / "toolB").resolve() == left_root / "pinned-snapshot" / "toolB"
+    assert (right_prefix / "toolB").resolve() == right_root / "pinned-snapshot" / "toolB"
+
+    (left_work / "bin" / "lib_a.py").write_text("VALUE = 2\n")
+    assert (right_work / "bin" / "lib_a.py").read_text() == "VALUE = 1\n"
+
+    compared = 0
+    for left_file in (left_work / ".beads").rglob("*"):
+        if not left_file.is_file():
+            continue
+        right_file = right_work / ".beads" / left_file.relative_to(left_work / ".beads")
+        if right_file.is_file():
+            compared += 1
+            assert not os.path.samefile(left_file, right_file), left_file
+    assert compared > 0, "isolation probe compared no copied beads files"
 
 
 def _create_bead(work, home, *, title, footprint=None):

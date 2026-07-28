@@ -56,6 +56,7 @@ pytestmark = pytest.mark.skipif(
 
 _ENV_LEAKS = ("CLAUDE_AGENT_NAME", "TMUX_PANE", "SABLE_TMUX_SOCKET",
               "SABLE_INTEGRATION_BRANCH", "SABLE_BASE_BRANCH")
+_FIXTURE_TEMPLATE_ROOT = None
 
 
 def _env(home):
@@ -106,7 +107,7 @@ def _robust_bd_init(work, home):
     raise AssertionError(f"bd init never produced a clean DB: {last.stdout if last else '<none>'}")
 
 
-def _setup(tmp_path):
+def _setup_fresh(tmp_path):
     origin = tmp_path / "origin.git"
     work = tmp_path / "work"
     home = tmp_path / "home"
@@ -129,6 +130,82 @@ def _setup(tmp_path):
 
     _robust_bd_init(work, home)
     return origin, work, home
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _immutable_fixture_template(tmp_path_factory):
+    """Build the cold real-git/real-bd baseline once per pytest session."""
+    global _FIXTURE_TEMPLATE_ROOT
+    if not HAVE_BD:
+        yield
+        return
+
+    root = tmp_path_factory.mktemp("sable-screen-template")
+    _setup_fresh(root)
+    _FIXTURE_TEMPLATE_ROOT = root
+    try:
+        yield
+    finally:
+        _FIXTURE_TEMPLATE_ROOT = None
+
+
+def _rewrite_bd_remote(work, origin):
+    """Rebind the copied store's only location-bearing setting."""
+    config = work / ".beads" / "config.yaml"
+    lines = config.read_text().splitlines()
+    rewritten = [
+        f'sync.remote: "{origin}"' if line.startswith("sync.remote:") else line
+        for line in lines
+    ]
+    config.write_text("\n".join(rewritten) + "\n")
+
+
+def _setup(tmp_path):
+    """Deep-copy the immutable baseline into one isolated test world."""
+    if _FIXTURE_TEMPLATE_ROOT is None:
+        return _setup_fresh(tmp_path)
+
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    home = tmp_path / "home"
+    home.mkdir()
+    shutil.copytree(_FIXTURE_TEMPLATE_ROOT / "origin.git", origin)
+    shutil.copytree(_FIXTURE_TEMPLATE_ROOT / "work", work)
+
+    nohooks = tmp_path / "nohooks"
+    nohooks.mkdir()
+    _git(work, "remote", "set-url", "origin", str(origin))
+    _git(work, "config", "--local", "core.hooksPath", str(nohooks))
+    _rewrite_bd_remote(work, origin)
+    return origin, work, home
+
+
+def test_fixture_template_copies_share_no_mutable_state(tmp_path):
+    """Guard the optimization: Git remotes and copied stores stay isolated."""
+    left_root = tmp_path / "left"
+    right_root = tmp_path / "right"
+    left_root.mkdir()
+    right_root.mkdir()
+    left_origin, left_work, _ = _setup(left_root)
+    right_origin, right_work, _ = _setup(right_root)
+
+    assert _git(left_work, "remote", "get-url", "origin") == str(left_origin)
+    assert _git(right_work, "remote", "get-url", "origin") == str(right_origin)
+    assert str(left_origin) in (left_work / ".beads" / "config.yaml").read_text()
+    assert str(right_origin) in (right_work / ".beads" / "config.yaml").read_text()
+
+    (left_work / "README.md").write_text("left-only\n")
+    assert (right_work / "README.md").read_text() == "base\n"
+
+    compared = 0
+    for left_file in (left_work / ".beads").rglob("*"):
+        if not left_file.is_file():
+            continue
+        right_file = right_work / ".beads" / left_file.relative_to(left_work / ".beads")
+        if right_file.is_file():
+            compared += 1
+            assert not os.path.samefile(left_file, right_file), left_file
+    assert compared > 0, "isolation probe compared no copied beads files"
 
 
 def _push_branch(work, name, *, base=BASE, file_name=None, merge_into=None, delete_after=False):

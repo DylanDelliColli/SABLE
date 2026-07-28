@@ -145,6 +145,51 @@ contract is satisfied twice, but future work should treat post-push
 notification and high-variance concurrent suites as the next optimization
 targets rather than weakening the budget or dropping coverage.
 
+### Readiness and fixture follow-up (`SABLE-epi9c`)
+
+The five modules named by the follow-up were profiled together on the same
+unrestricted host. The initial premise was only partly correct: spawn-worker,
+worker-status, and message integration paid guessed tmux sleeps, while screen
+and activation-screen paid repeated cold Git/Dolt setup without using tmux at
+all. The fix follows the boundary that actually owns each cost rather than
+forcing one synchronization abstraction across unrelated modules.
+
+| Module | Before | After | Reduction |
+| --- | ---: | ---: | ---: |
+| `test_sable_spawn_worker_integration.py` | 345.75s | 172.78s | 50.0% |
+| `test_sable_screen_integration.py` | 241.20s | 118.66s | 50.8% |
+| `test_activation_screen_integration.py` | 108.33s | 43.09s | 60.2% |
+| `test_sable_worker_status_integration.py` | 72.04s | 46.93s | 34.9% |
+| `test_sable_msg_integration.py` | 66.62s | 36.69s | 44.9% |
+
+The final combined run passed all 128 tests in 419.03 wall seconds (418.15
+aggregate test-seconds), down from 834.28 wall seconds (833.94 aggregate) for
+the 126-test baseline: 49.8% lower, against a required 30%.
+
+The retained contract shape is:
+
+- Screen and activation-screen build their real Git/Dolt/install baseline once
+  per session, then deep-copy and rebind each test world. Isolation tests prove
+  Git remotes, Beads files, ordinary files, and absolute activation symlinks do
+  not share mutable state.
+- Spawn-worker, worker-status, and message integration wait on real session,
+  pane, content, prompt, marker, and file transitions. The stuck-dialog timeout
+  remains a real bounded negative control; it was not converted into an
+  immediate assertion.
+- The two three-bead bundle-success traversals were one authority exercised
+  twice. The retained real-store test now uses repeated `--bundle A --bundle B`
+  arguments while still proving self-overlap release, all three prompt members,
+  status, assignee, and a real worker pane. The separate real foreign-overlap
+  refusal remains.
+- The message controlled experiment now uses explicit busy and idle TUI
+  stand-ins with readiness markers. A bare Bash prompt was not an honest model
+  for the Claude composer's Escape behavior and produced a real flake when the
+  old startup sleep was removed.
+
+No production path changed in this follow-up. The speedup came from removing
+test harness latency and duplicate traversal while preserving the real
+authority boundaries and increasing the suite by two net tests.
+
 ## Guardrails and architecture decision
 
 `bin/conftest.py` fails the session when an ordinary test exceeds 10 seconds
