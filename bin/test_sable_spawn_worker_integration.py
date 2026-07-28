@@ -10,6 +10,7 @@ Proves: a worker WINDOW is created, its pane is tagged
 (@sable_role=worker/@sable_bead/@sable_status=running), the dispatch prompt file
 is written, and the read-instruction is delivered into the pane.
 """
+import hashlib
 import importlib.util
 import json
 import os
@@ -35,6 +36,40 @@ BEAD = "SABLE-bldh.2"  # an open bead in this repo (read-only here)
 BUNDLE_SIBLING = "SABLE-06dr"  # a second open bead, used only as --bundle sibling (read-only here)
 pytestmark = pytest.mark.skipif(not (HAVE_TMUX and HAVE_BD),
                                 reason="needs tmux + bd")
+
+
+def _signed_authority(*, kind="break-glass", tier=None, scope=()):
+    proof = {
+        "version": 1,
+        "kind": kind,
+        "approved_by": "test-operator",
+        "approved_at": "2026-07-28T00:00:00+00:00",
+        "base": {"ref": "HEAD", "sha": "a" * 40},
+    }
+    if kind == "break-glass":
+        proof.update({
+            "reason": "synthetic unbounded authority for existing spawn tests",
+            "failed_checks": ["test fixture"],
+        })
+    else:
+        proof.update({
+            "tier": tier,
+            "scope": list(scope),
+            "planning_since": "2026-07-28T00:00:00+00:00",
+            "artifacts": {},
+            "swarm": None,
+            "evidence_sha256": "e" * 64,
+        })
+    proof["receipt_id"] = hashlib.sha256(
+        json.dumps(
+            proof, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode()
+    ).hexdigest()
+    return proof
+
+
+def _write_execution_state(path, authority):
+    path.write_text(json.dumps({"mode": "execution", "handoff": authority}))
 
 
 def _wait_until(predicate, *, timeout=3.0, interval=0.02, description="condition"):
@@ -71,7 +106,7 @@ def sock():
 def execution_mode_state(tmp_path, monkeypatch):
     """Launch tests must not inherit the checkout's live planning/execution mode."""
     state = tmp_path / "mode-state.json"
-    state.write_text('{"mode":"execution"}')
+    _write_execution_state(state, _signed_authority())
     monkeypatch.setenv("SABLE_MODE_STATE", str(state))
 
 
@@ -104,7 +139,41 @@ def _refs_snapshot(repo: Path) -> set[str]:
     return set(r.stdout.split())
 
 
+def test_approved_handoff_refuses_outside_scope_before_external_work(tmp_path):
+    _write_execution_state(
+        Path(os.environ["SABLE_MODE_STATE"]),
+        _signed_authority(kind="approved", tier="quick", scope=[BEAD]),
+    )
+    dispatch_dir = tmp_path / "dispatch"
+    env = _clean_env(
+        SABLE_TMUX_SOCKET=f"absent-{uuid.uuid4().hex[:8]}",
+        SABLE_TMUX_SESSION="absent",
+        SABLE_DISPATCH_DIR=str(dispatch_dir),
+        SABLE_MAX_LOAD_PER_CORE="0",
+    )
+
+    result = subprocess.run(
+        [
+            "python3", str(BIN), BUNDLE_SIBLING,
+            "--worktree", str(tmp_path / "worktree"),
+            "--skip-governance",
+        ],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert result.returncode == 15, result.stderr
+    assert BUNDLE_SIBLING in result.stderr
+    assert "outside" in result.stderr
+    assert "receipt" in result.stderr
+    assert not dispatch_dir.exists(), \
+        "scope refusal happened after dispatch artifacts were written"
+
+
 def test_spawn_creates_tagged_worker_window(sock):
+    _write_execution_state(
+        Path(os.environ["SABLE_MODE_STATE"]),
+        _signed_authority(kind="approved", tier="quick", scope=[BEAD]),
+    )
     with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
         env = {
             **_clean_env(),
@@ -183,6 +252,8 @@ def test_spawn_bundle_renders_all_bead_descriptions_into_prompt(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stderr
+        assert "BREAK-GLASS receipt" in r.stderr, \
+            "the unbounded dispatch bypass was not surfaced"
         _wait_for_worker_count(sock, BEAD)
 
         dispatch = Path(dd) / f"{BEAD}.md"

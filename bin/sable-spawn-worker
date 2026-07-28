@@ -47,6 +47,11 @@ PreToolUse:Agent hooks (hooks/multi-manager/pre-dispatch-{overlap,preempt,
 refresh}.sh), now re-homed as pre-spawn steps here since those hooks only ever
 fired on the (now-unused) Agent dispatch path.
 
+Execution receipt scope is earlier and is never skipped: an approved Quick or
+Full receipt authorizes only its exact bead IDs, including every --bundle
+member. An out-of-scope dispatch refuses before bd/tmux/worktree activity
+(exit 15). Only the carried mode-level break-glass receipt is unbounded.
+
 Respawn (SABLE-3eax): the manager REVISE / push-only close-out pattern
 re-spawns a worker into the SAME worktree to finish a bead's landing. --respawn
 (requires --worktree) makes that a first-class flow rather than needing the
@@ -145,6 +150,10 @@ from sable_pane_lib import (  # noqa: E402
 )
 from sable_pane_lib import deliver_text as deliver_dispatch  # noqa: E402
 import sable_footprint_lib as fp_lib  # noqa: E402
+from sable_handoff_lib import (  # noqa: E402
+    HandoffRefused, read_execution_authority,
+)
+from sable_mode_store_lib import resolve_mode_state_path  # noqa: E402
 from sable_provider_lib import (  # noqa: E402
     ProviderMapError, execution_provider, interactive_command,
 )
@@ -286,6 +295,76 @@ class ModelChoice(NamedTuple):
     model: str
     reason: str | None
     source: str
+
+
+class DispatchScopeVerdict(NamedTuple):
+    """One receipt-scope decision made before dispatch side effects."""
+
+    decision: str
+    message: str
+
+
+def dispatch_scope_check(
+    authority: dict, dispatch_ids: list[str]
+) -> DispatchScopeVerdict:
+    """Authorize one lead+bundle set against the carried execution receipt.
+
+    Approved receipts authorize exact bead IDs.  Full-tier descendants created
+    after approval are deliberately not inferred into scope: changing the
+    approved work set requires a fresh planning receipt.  Only the mode-level
+    break-glass receipt is unbounded, and the caller surfaces it on every use.
+    """
+
+    receipt_id = str(authority.get("receipt_id") or "<unknown>")
+    if authority.get("kind") == "break-glass":
+        return DispatchScopeVerdict(
+            "break-glass",
+            f"BREAK-GLASS receipt {receipt_id} permits unbounded dispatch: "
+            f"{authority.get('reason') or '<no reason>'}",
+        )
+
+    scope = {
+        str(issue_id)
+        for issue_id in authority.get("scope", [])
+        if isinstance(issue_id, str) and issue_id
+    }
+    outside = sorted(set(dispatch_ids) - scope)
+    if outside:
+        tier = authority.get("tier") or "approved"
+        return DispatchScopeVerdict(
+            "deny",
+            f"{', '.join(outside)} outside {tier} handoff receipt {receipt_id}. "
+            "The approved ID set is immutable: operator-added work and new "
+            "descendants require a new approval; only an audited mode-level "
+            "break-glass receipt expands scope.",
+        )
+    return DispatchScopeVerdict(
+        "allow",
+        f"dispatch IDs are covered by {authority.get('tier')} handoff "
+        f"receipt {receipt_id}",
+    )
+
+
+def current_dispatch_authority(
+    base: str | os.PathLike[str] | None = None,
+) -> dict | None:
+    """Return execution authority when this invocation belongs to a fleet.
+
+    A standalone invocation with no mode-state remains backwards compatible.
+    A manager pane, or any invocation in a repo carrying mode-state, must read
+    valid execution authority.  Thus deleting the state under a live manager
+    fails closed while ordinary non-orchestrated use stays available.
+    """
+
+    state_path = resolve_mode_state_path(base)
+    role = (
+        os.environ.get("SABLE_AGENT_ROLE")
+        or os.environ.get("CLAUDE_AGENT_ROLE")
+        or ""
+    ).strip()
+    if not state_path.exists() and role != "manager":
+        return None
+    return read_execution_authority(base=base)
 
 
 def resolve_model(labels: list[str], override: str | None) -> ModelChoice:
@@ -2021,6 +2100,35 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"sable-spawn-worker: {guard_err}\n")
         return 9
 
+    # The receipt scope is the execution work set, not merely planning
+    # provenance.  Check the complete lead+bundle set before bd/tmux/worktree
+    # reads or writes.  --skip-governance and hook force flags are not authority
+    # expansion; the only unbounded path is the carried, audited break-glass
+    # receipt created by sable-mode.
+    bid = ns.bead_id
+    bundle_ids = resolve_bundle_ids(ns.bundle, bid)
+    try:
+        authority = current_dispatch_authority(os.getcwd())
+    except HandoffRefused as exc:
+        sys.stderr.write(
+            f"sable-spawn-worker: dispatch-scope refused — {exc}\n"
+        )
+        return 15
+    if authority is not None:
+        scope_verdict = dispatch_scope_check(
+            authority, [bid, *bundle_ids]
+        )
+        if scope_verdict.decision == "deny":
+            sys.stderr.write(
+                "sable-spawn-worker: dispatch-scope refused — "
+                f"{scope_verdict.message}\n"
+            )
+            return 15
+        if scope_verdict.decision == "break-glass":
+            sys.stderr.write(
+                f"sable-spawn-worker: {scope_verdict.message}\n"
+            )
+
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
     base = tmux_base(socket)
     if not ns.session:
@@ -2029,8 +2137,6 @@ def main(argv: list[str] | None = None) -> int:
         except SessionCollision as e:
             sys.stderr.write(f"sable-spawn-worker: {e}\n")
             return 4
-    bid = ns.bead_id
-
     # --- dispatch throttle + host-resource guard (SABLE-mmdt). Deliberately
     # NOT behind --skip-governance (host protection, not bead hygiene) and
     # BEFORE the bead fetch/claim, so a refused spawn leaves nothing claimed. ---
@@ -2078,7 +2184,6 @@ def main(argv: list[str] | None = None) -> int:
     # Fetched unconditionally (even under --skip-governance) since prompt
     # assembly always needs their titles/descriptions; only the up-front
     # claim below is gated on governance. ---
-    bundle_ids = resolve_bundle_ids(ns.bundle, bid)
     bundle_beads = [parse_bead(_run(["bd", "show", b, "--json"])) for b in bundle_ids]
 
     # Dispatch evidence: a LIVE running pane tagged with this bead. Computed once

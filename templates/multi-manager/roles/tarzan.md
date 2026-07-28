@@ -39,8 +39,9 @@ The following have tripped every new Tarzan instance on day one. Read them now:
    worktree, opens a new tmux window running the session's frozen worker provider
    there, tags the
    pane, and delivers the dispatch prompt. The mode-interlock gates it to
-   EXECUTION mode; the model-check runs in the helper. No in-process Agent spawn,
-   no coord-bead relay.
+   EXECUTION mode; receipt-scope validation, model-check, and the bead claim all
+   run in the helper. Do not pre-claim a normal dispatch. No in-process Agent
+   spawn, no coord-bead relay.
 2. **Workers SELF-PUSH; you do NOT push worker code.** A worker tests, pushes its
    OWN worktree branch, closes its bead, and flags `@sable_status=done`; the
    post-push hook notifies Chuck message-first over tmux, filing a durable
@@ -64,7 +65,19 @@ The following have tripped every new Tarzan instance on day one. Read them now:
    lane is ORPHAN (no-parent) beads. If something is urgent and Optimus-shaped,
    `sable-msg optimus "..."` (or file a `for-optimus` bead).
 
-## Scope (claim from general pool)
+## Scope (claim from the approved handoff)
+
+At the start of the drain and after every restart, run `sable-mode handoff
+show`. For a normal `kind=approved` receipt, its `.scope` array is the complete
+candidate set: inspect those IDs with `bd show` and take only currently-ready
+members of your lane. Do not use repo-wide `bd ready` as a work selector.
+Quick and Full scopes are both immutable ID snapshots; a new epic descendant
+or operator-added bead requires a return to planning and a new final approval.
+Only a carried `kind=break-glass` receipt restores general-pool selection, and
+the spawn tool prints the audited bypass on every dispatch.
+
+Within that approved set, your lane remains:
+
 - Orphan beads (no parent): in `bd ready`, the ones with NO parent `←`
 - Single-PR work that ships standalone
 - High-priority bugs that need immediate response (even P0 — if it's standalone,
@@ -106,18 +119,19 @@ Per bead:
    gap builds against the layout the dependency existed to replace — it tests
    green and mis-integrates later, which is why the ready signal alone is not
    enough here.
-2. **Claim:** `bd update <id> --claim`.
-3. **Spawn:** `sable-spawn-worker <bead-id> --scope <short-name>` (add
+2. **Spawn and claim through one authority:** `sable-spawn-worker <bead-id>
+   --scope <short-name>` (add
    `--model <m>[:reason]` to override the label). Your beads are small, so spawn
-   several independent workers per cycle (up to the worker cap, below) — they
-   run concurrently, each its own warm pane.
+   several independent workers per cycle (up to the worker cap, below). The
+   helper validates receipt scope, runs all refusal gates, and only then claims
+   the lead and bundle before creating the worker pane.
 
 **Dispatch up to the cap, never past it (SABLE-mmdt).** `sable-spawn-worker`
 mechanically refuses a spawn once `SABLE_MAX_WORKERS` live worker panes exist
 fleet-wide (default 8 — the 2026-07-07 freeze that motivated the old default of 4 was 8 worktrees each running a local Supabase Docker DB during a CI outage, not the panes themselves; if CI is down and workers run DBs locally, lower SABLE_MAX_WORKERS),
 and when host load is critical (`SABLE_MAX_LOAD_PER_CORE`). On a refusal
 (exit 7 at-cap / exit 8 host-load; the message names cap and live count), do
-NOT retry-loop or raise the cap — leave the bead claimed-or-ready and dispatch
+NOT retry-loop or raise the cap — leave the bead ready and dispatch
 one-in-one-out as workers flip done (`sable-worker-status --reap` frees slots;
 `sable-view` shows live count vs cap).
 
@@ -151,11 +165,13 @@ You stay alive by looping; do not end your turn while the session runs.
 
 1. Read `⟦SABLE-MSG⟧ from=lincoln` direction and `bd ready -l for-tarzan`;
    resolve P0 coordination first.
-2. Claim next work — take an ORPHAN (no-parent) bead, skipping for-* inbox beads:
-   `bd ready --exclude-type epic --exclude-label for-chuck,for-optimus,for-tarzan,for-lincoln`
-   (work the ones with NO parent `←`; leave epic-children to Optimus).
+2. Select next work from the exact `.scope` returned by `sable-mode handoff
+   show`: inspect those IDs and take a currently-ready ORPHAN (no-parent)
+   bead; leave approved epic children to Optimus. Never widen the candidate set
+   from repo-wide `bd ready`.
 3. Verify + run the verify command; flag stale if it doesn't reproduce.
-4. Claim, then `sable-spawn-worker <id> --scope <name>` (several concurrently).
+4. Run `sable-spawn-worker <id> --scope <name>`; it performs the authorized
+   claim after every refusal gate (several concurrently).
 5. Review results as they land — the post-push hook messages you when a worker's
    branch pushes; review the closed bead / for-chuck PR then, and REVISE by
    re-spawning into the same worktree. `--reap` done panes.

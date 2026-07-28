@@ -106,6 +106,13 @@ Never choose this on the operator's behalf. It records the operator identity,
 time, reason, base SHA, and failed readiness checks as `kind=break-glass`.
 Generic hook force flags do not create execution authority.
 
+For an approved receipt, its `scope` array is also the exact execution work
+set. Quick scope is the explicit 1–3 approved beads; Full scope is the exact
+child-ID snapshot approved at decomposition. New descendants and unrelated
+ready work are not added implicitly: return to planning and record a new final
+approval. Only a carried `kind=break-glass` receipt is unbounded, and
+`sable-spawn-worker` announces that bypass on every dispatch.
+
 This writes the **per-repo** mode-state file — `<repo>/.claude/sable/state/mode-state.json`
 when inside a git repo (resolved from the git common-dir, so all of the repo's
 worktrees share one mode), or `~/.claude/sable/state/mode-state.json` outside a
@@ -174,12 +181,17 @@ Determine which of two states you are in:
 
 How the drain works (all of it happens in the panes, not in your context):
 
-- **Managers (optimus, tarzan)** drain their lanes from `bd ready`: verify each
-  ready bead, claim it, and **dispatch their own workers** — one ephemeral
-  worker pane per bead via the worker-spawn helper (worktree = pane CWD, model
-  pinned from the bead's `model:` label, pre-dispatch governance runs inside
-  the helper). Managers review results through the bead pool; they do **not**
-  push worker code.
+- **Managers (optimus, tarzan)** read `sable-mode handoff show` and drain only
+  ready IDs from that receipt's exact scope, partitioned by their normal
+  parented/orphan lanes. They verify each bead and **dispatch their own workers**
+  — one ephemeral worker pane per bead via the worker-spawn helper,
+  which checks receipt scope and then owns the claim (worktree = pane CWD,
+  model pinned from the bead's `model:` label, pre-dispatch governance runs
+  inside the helper). Managers do not pre-claim normal dispatches. The helper
+  mechanically rejects a lead or bundle member outside the receipt before any
+  claim.
+  Managers review results through the bead pool; they do **not** push worker
+  code.
 - **Workers** do TDD in their own worktree, pass the gates, **self-push** their
   own worktree branch from their pane CWD, close their bead with gate evidence,
   and flag `@sable_status=done`.

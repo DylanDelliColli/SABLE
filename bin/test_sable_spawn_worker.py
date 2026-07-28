@@ -179,6 +179,89 @@ def test_bead_labels_handles_null():
     assert ssw.bead_labels({}) == []
 
 
+# --- approved handoff scope -------------------------------------------------
+
+def test_quick_handoff_scope_allows_only_its_explicit_ids():
+    authority = {
+        "kind": "approved",
+        "tier": "quick",
+        "scope": ["SABLE-a", "SABLE-b"],
+        "receipt_id": "receipt-quick",
+    }
+
+    allowed = ssw.dispatch_scope_check(authority, ["SABLE-a", "SABLE-b"])
+    denied = ssw.dispatch_scope_check(authority, ["SABLE-a", "SABLE-c"])
+
+    assert allowed.decision == "allow"
+    assert denied.decision == "deny"
+    assert "SABLE-c" in denied.message
+    assert "SABLE-a" not in denied.message
+
+
+def test_full_handoff_scope_does_not_auto_authorize_a_new_descendant():
+    authority = {
+        "kind": "approved",
+        "tier": "full",
+        "scope": ["SABLE-epic.1", "SABLE-epic.2"],
+        "epic": "SABLE-epic",
+        "receipt_id": "receipt-full",
+    }
+
+    approved_child = ssw.dispatch_scope_check(authority, ["SABLE-epic.2"])
+    new_child = ssw.dispatch_scope_check(authority, ["SABLE-epic.3"])
+
+    assert approved_child.decision == "allow"
+    assert new_child.decision == "deny"
+    assert "new descendants" in new_child.message
+    assert "new approval" in new_child.message
+
+
+def test_bundle_scope_is_atomic_and_cannot_hide_an_unapproved_sibling():
+    authority = {
+        "kind": "approved",
+        "tier": "quick",
+        "scope": ["SABLE-lead"],
+        "receipt_id": "receipt-bundle",
+    }
+
+    verdict = ssw.dispatch_scope_check(
+        authority, ["SABLE-lead", "SABLE-unapproved"]
+    )
+
+    assert verdict.decision == "deny"
+    assert "SABLE-unapproved" in verdict.message
+
+
+def test_break_glass_receipt_is_the_only_unbounded_scope():
+    authority = {
+        "kind": "break-glass",
+        "reason": "operator-approved recovery",
+        "receipt_id": "receipt-break-glass",
+    }
+
+    verdict = ssw.dispatch_scope_check(authority, ["SABLE-anything"])
+
+    assert verdict.decision == "break-glass"
+    assert "operator-approved recovery" in verdict.message
+
+
+def test_standalone_spawn_without_mode_state_remains_available(tmp_path, monkeypatch):
+    monkeypatch.setenv("SABLE_MODE_STATE", str(tmp_path / "missing.json"))
+    monkeypatch.delenv("SABLE_AGENT_ROLE", raising=False)
+    monkeypatch.delenv("CLAUDE_AGENT_ROLE", raising=False)
+
+    assert ssw.current_dispatch_authority(tmp_path) is None
+
+
+def test_manager_spawn_fails_closed_when_carried_state_disappears(tmp_path, monkeypatch):
+    state = tmp_path / "missing.json"
+    monkeypatch.setenv("SABLE_MODE_STATE", str(state))
+    monkeypatch.setenv("SABLE_AGENT_ROLE", "manager")
+
+    with pytest.raises(ssw.HandoffRefused, match="no mode state"):
+        ssw.current_dispatch_authority(tmp_path)
+
+
 # --- model-check enforcement (re-homed governance, SABLE-bldh.6) -------------
 
 def test_label_model_extracts():

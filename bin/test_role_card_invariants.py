@@ -60,6 +60,11 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 ROLES_DIR = REPO / "templates" / "multi-manager" / "roles"
 AGENTS_DIR = REPO / "templates" / "agents"
+EXECUTE_SKILL = REPO / "skills" / "sable-execute" / "SKILL.md"
+EXECUTION_MANAGER_FILES = [
+    ROLES_DIR / "optimus.md",
+    ROLES_DIR / "tarzan.md",
+]
 
 CONTAINMENT_FILES = [
     ROLES_DIR / "chuck.md",
@@ -122,3 +127,35 @@ def test_mandate_absent_from_non_containment_files(path):
         "makes containment determinations — this is the indiscriminate-paste "
         "failure the bead explicitly warns against (SABLE-rhsuj-class noise)"
     )
+
+
+@pytest.mark.parametrize("path", EXECUTION_MANAGER_FILES, ids=_rel)
+def test_execution_manager_selects_only_from_the_handoff_receipt(path):
+    text = _read(path)
+    compact = re.sub(r"\s+", " ", text)
+    rel = _rel(path)
+    assert "sable-mode handoff show" in compact, (
+        f"{rel} never loads the approved execution work set"
+    )
+    assert "immutable ID snapshot" in compact, (
+        f"{rel} can silently expand Quick/Full approval to later work"
+    )
+    assert "Never widen the candidate set" in compact, (
+        f"{rel} still permits repo-wide ready-pool selection"
+    )
+    assert "bd ready --exclude-type epic" not in compact, (
+        f"{rel} still carries the old repo-wide ready-pool command"
+    )
+    assert "bd update <id> --claim" not in compact, (
+        f"{rel} still tells managers to claim before scope enforcement"
+    )
+    assert "Claim, then" not in compact, (
+        f"{rel} still carries the duplicate pre-spawn claim step"
+    )
+
+
+def test_execute_skill_defines_receipt_scope_as_the_execution_work_set():
+    text = _read(EXECUTE_SKILL)
+    assert "exact execution work" in text
+    assert "New descendants and unrelated" in text
+    assert "rejects a lead or bundle member outside the receipt" in text
