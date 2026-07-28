@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # test-install.sh — front-door integration for install.sh (SABLE-ppy / iw0; tmux-only SABLE-qa4d).
 # Verifies install.sh delegates the Orchestration tier to sable-orchestration-install
-# (no topology fork — the tmux warm-pane layer is the only one), auto-merges the
-# settings snippet idempotently + non-clobbering, rejects the retired topology
+# (no topology fork — the tmux warm-pane layer is the only one), applies the
+# settings snippet only with explicit consent, rejects the retired topology
 # flags, skips the layer for Foundation, and leaves runnable installed hook copies.
 # Runs install.sh against scratch HOMEs (real bd/dolt/python on PATH).
 set -uo pipefail
@@ -24,7 +24,7 @@ print(sum(1 for bl in d.get('hooks',{}).values() if isinstance(bl,list) for b in
 # canonical-checkout guard here since these tests exercise install.sh's
 # delegation wiring, not the guard itself (see test-install-guard.sh for that).
 TS="$(mktemp -d)"
-HOME="$TS" bash "$INSTALL" --from-here >/tmp/ti-orch.log 2>&1
+HOME="$TS" bash "$INSTALL" --from-here --merge-settings >/tmp/ti-orch.log 2>&1
 SS="$TS/.claude/settings.json"
 present "$TS/.claude/hooks/multi-manager/mode-interlock.sh" "orchestration: delegate installed multi-manager hooks"
 present "$TS/.claude/sable/agents.yaml"                     "orchestration: registry installed"
@@ -44,14 +44,31 @@ printf '%s' '{"tool_name":"Bash","tool_input":{"command":"echo hi"}}' | bash "$T
 present "$TS/.claude/agents/sherlock.md" "plain install lands base agent defs"
 
 # idempotent re-run: interlock count stable
-HOME="$TS" bash "$INSTALL" --from-here >/dev/null 2>&1
+HOME="$TS" bash "$INSTALL" --from-here --merge-settings >/dev/null 2>&1
 [ "$(count_marker "$SS" mode-interlock.sh)" = "2" ] && pass "re-run idempotent (interlock still 2)" || fail "re-run idempotent" "count=$(count_marker "$SS" mode-interlock.sh)"
 
 # non-clobber: a pre-existing user hook survives the merge
 TN="$(mktemp -d)"; mkdir -p "$TN/.claude"
 printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash /tmp/user-own.sh"}]}]}}' > "$TN/.claude/settings.json"
-HOME="$TN" bash "$INSTALL" --from-here >/dev/null 2>&1
+HOME="$TN" bash "$INSTALL" --from-here --merge-settings >/dev/null 2>&1
 grep -q 'user-own.sh' "$TN/.claude/settings.json" && pass "non-clobber: pre-existing user hook survives" || fail "non-clobber: pre-existing user hook survives"
+
+# default is genuinely print-only, including when the proposal has changes.
+TP="$(mktemp -d)"; mkdir -p "$TP/.claude"
+printf '%s\n' '{"permissions":{"allow":["Read"]}}' > "$TP/.claude/settings.json"
+cp "$TP/.claude/settings.json" "$TP/settings.before"
+HOME="$TP" bash "$INSTALL" --from-here >/tmp/ti-print-only.log 2>&1
+cmp -s "$TP/settings.before" "$TP/.claude/settings.json" &&
+  pass "unflagged install leaves settings.json byte-identical" ||
+  fail "unflagged install leaves settings.json byte-identical"
+grep -q 'NOT APPLIED' /tmp/ti-print-only.log &&
+  pass "unflagged install names the unapplied settings proposal" ||
+  fail "unflagged install names the unapplied settings proposal"
+grep -q 'whole install is print-only for settings unless --merge-settings was' "$INSTALL" &&
+  pass "source contract and unflagged no-write behavior agree" ||
+  fail "source contract and unflagged no-write behavior agree"
+present "$TP/.claude/hooks/multi-manager/mode-interlock.sh" \
+  "print-only settings still stages the orchestration artifacts"
 
 # ---------- retired flags are rejected (one topology, one tier) ----------
 for _flag in --teams --subagent --nested --orchestration --foundation; do
@@ -104,7 +121,7 @@ printf 'pre-existing user notes\n' > "$TH1/.claude/CLAUDE.md"
 printf 'keep me\n' > "$TH1/.claude/agents/keep.md"
 PROJ1="$(mktemp -d)"; mkrepo "$PROJ1"
 SNAP1="$(claude_manifest "$TH1/.claude" "$TH1")"
-HOME="$TH1" bash "$INSTALL" --project="$PROJ1" --from-here >/tmp/ti-proj1.log 2>&1; rc1=$?
+HOME="$TH1" bash "$INSTALL" --project="$PROJ1" --from-here --merge-settings >/tmp/ti-proj1.log 2>&1; rc1=$?
 SNAP2="$(claude_manifest "$TH1/.claude" "$TH1")"
 [ "$rc1" = "0" ] && pass "project install runs (rc=0)" || fail "project install runs" "rc=$rc1 (see /tmp/ti-proj1.log)"
 present "$PROJ1/.claude/settings.json" "project install actually populated the project (control)"
@@ -130,7 +147,7 @@ fi
 # ---------- --project populates the FULL project .claude layer ----------
 TH3="$(mktemp -d)"; PROJ3="$(mktemp -d)"; mkrepo "$PROJ3"
 printf '# My Project\n\nExisting project instructions.\n' > "$PROJ3/CLAUDE.md"
-HOME="$TH3" bash "$INSTALL" --project="$PROJ3" --from-here >/tmp/ti-proj3.log 2>&1
+HOME="$TH3" bash "$INSTALL" --project="$PROJ3" --from-here --merge-settings >/tmp/ti-proj3.log 2>&1
 present "$PROJ3/.claude/hooks/multi-manager/mode-interlock.sh" "test_project_install_populates_project_claude_full_layer: orchestration hooks"
 present "$PROJ3/.claude/sable/agents.yaml"                     "test_project_install_populates_project_claude_full_layer: registry agents.yaml"
 present "$PROJ3/.claude/sable/roles/lincoln.md"               "test_project_install_populates_project_claude_full_layer: pane roles"
@@ -164,7 +181,7 @@ absent "$PROJ5/.claude" "test_install_project_refuses...: nothing written to the
 TH6="$(mktemp -d)"; mkdir -p "$TH6/.claude"
 printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash ~/.claude/hooks/multi-manager/mode-interlock.sh"}]}]}}' > "$TH6/.claude/settings.json"
 PROJ6="$(mktemp -d)"; mkrepo "$PROJ6"
-HOME="$TH6" bash "$INSTALL" --project="$PROJ6" --force --from-here >/tmp/ti-force.log 2>&1; rc6=$?
+HOME="$TH6" bash "$INSTALL" --project="$PROJ6" --force --from-here --merge-settings >/tmp/ti-force.log 2>&1; rc6=$?
 [ "$rc6" = "0" ] && pass "test_install_project_force_flag_proceeds: exits 0 with --force" || fail "--force proceeds (exit 0)" "rc=$rc6 (see /tmp/ti-force.log)"
 present "$PROJ6/.claude/settings.json" "test_install_project_force_flag_proceeds: project layer installed under --force"
 grep -q 'mode-interlock' "$TH6/.claude/settings.json" && pass "test_install_project_force_flag_proceeds: global settings left intact" || fail "--force left global settings intact"
@@ -186,7 +203,7 @@ absent "$PROJ8/.claude" "test_install_project_dry_run: writes nothing (bare --pr
 
 rm -rf "$TH1" "$PROJ1" "$TG2" "$TH3" "$PROJ3" "$TH5" "$PROJ5" "$TH6" "$PROJ6" "$TH8" "$PROJ8"
 
-rm -rf "$TS" "$TN"
+rm -rf "$TS" "$TN" "$TP"
 echo
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
 if [ "$FAIL" -gt 0 ]; then echo -e "Failed:$NAMES"; exit 1; fi

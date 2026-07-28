@@ -84,9 +84,12 @@ def make_repo(root, hooks, libs=None):
     return root
 
 
-def run_install(repo, project, expect_ok=True, env=None):
+def run_install(
+        repo, project, expect_ok=True, env=None, merge_settings=True,
+        extra_args=()):
+    settings_args = ("--merge-settings",) if merge_settings else ()
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--project"],
+        ["bash", str(INSTALLER), "--project", *settings_args, *extra_args],
         env={**os.environ,
              "SABLE_REPO_DIR": str(repo),
              "SABLE_PROJECT_DIR": str(project),
@@ -117,6 +120,82 @@ def registered_commands(project):
         for b in blocks
         for h in b.get("hooks", [])
     ]
+
+
+def test_direct_install_is_print_only_without_explicit_settings_consent(tmp_path):
+    repo = make_repo(tmp_path / "repo", {"plain.sh": PLAIN_HOOK})
+    project = tmp_path / "proj"
+    settings = project / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    original = b'{\n  "permissions": {"allow": ["Read"]}\n}\n'
+    settings.write_bytes(original)
+
+    result = run_install(repo, project, merge_settings=False)
+
+    assert settings.read_bytes() == original
+    assert not any("plain.sh" in c for c in registered_commands(project))
+    assert "plain.sh" in result.stdout
+    assert "not applied" in result.stdout.lower()
+    assert not list((project / ".claude").glob(".install-bak-*"))
+    assert not settings.with_suffix(".json.bak").exists()
+
+
+def test_direct_install_merges_settings_only_with_explicit_consent(tmp_path):
+    repo = make_repo(tmp_path / "repo", {"plain.sh": PLAIN_HOOK})
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    result = run_install(repo, project)
+
+    assert any("plain.sh" in c for c in registered_commands(project))
+    assert "plain.sh" in result.stdout
+    assert "applied" in result.stdout.lower()
+
+
+def test_settings_report_covers_add_remove_modify_and_rotates_snapshots(tmp_path):
+    repo = make_repo(tmp_path / "repo", {"plain.sh": PLAIN_HOOK})
+    project = tmp_path / "proj"
+    settings = project / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    original = b'{\n  "permissions": {"allow": ["Read"]}\n}\n'
+    settings.write_bytes(original)
+
+    first = run_install(repo, project)
+    first_snapshots = set((project / ".claude").glob(".install-bak-*"))
+    assert "ADDED    PreToolUse[Bash] plain.sh" in first.stdout
+    assert len(first_snapshots) == 1
+    first_snapshot = first_snapshots.pop()
+    assert str(first_snapshot) in first.stdout
+    assert (first_snapshot / "settings.json").read_bytes() == original
+
+    data = json.loads(settings.read_text())
+    bash_hooks = data["hooks"]["PreToolUse"][0]["hooks"]
+    plain = next(hook for hook in bash_hooks if "plain.sh" in hook["command"])
+    plain["timeout"] = 1
+    bash_hooks.append({
+        "type": "command",
+        "command": "bash ~/.claude/hooks/multi-manager/control-trace.sh",
+        "timeout": 3000,
+    })
+    changed_bytes = (json.dumps(data, indent=2) + "\n").encode()
+    settings.write_bytes(changed_bytes)
+
+    second = run_install(repo, project)
+    second_snapshots = set((project / ".claude").glob(".install-bak-*"))
+    new_snapshots = second_snapshots - {first_snapshot}
+    assert "MODIFIED PreToolUse[Bash] plain.sh" in second.stdout
+    assert "REMOVED  PreToolUse[Bash] control-trace.sh" in second.stdout
+    assert len(new_snapshots) == 1
+    second_snapshot = new_snapshots.pop()
+    assert str(second_snapshot) in second.stdout
+    assert (second_snapshot / "settings.json").read_bytes() == changed_bytes
+
+    third = run_install(repo, project)
+    assert "Settings unchanged" in third.stdout
+    assert "Settings changes for" not in third.stdout
+    assert set((project / ".claude").glob(".install-bak-*")) == {
+        first_snapshot, second_snapshot,
+    }
 
 
 def test_hook_with_sibling_lib_installs_the_lib_to_the_resolved_path(tmp_path):

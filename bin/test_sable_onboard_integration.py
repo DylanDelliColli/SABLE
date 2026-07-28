@@ -76,7 +76,7 @@ def run_onboard(project, home, *args):
 
 def run_install_project(project, home):
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--from-here", "--project"],
+        ["bash", str(INSTALLER), "--from-here", "--project", "--merge-settings"],
         env=_env(home), cwd=str(project),
         capture_output=True, text=True, timeout=180,
     )

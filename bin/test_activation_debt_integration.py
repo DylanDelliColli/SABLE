@@ -13,19 +13,18 @@ fixes accumulated while every instrument read green.
 
 THE SCRATCH HOME IS THE SAFETY PROPERTY OF THIS SUITE. Every install runs with
 CLAUDE_USER_DIR / --dir pointed inside tmp_path. SABLE-2avau records that
-`sable-orchestration-install --user` silently targets the LIVE ~/.claude with no
-escape other than that variable, and SABLE-k0nvp records a pinning suite
-polluting the real ~/.local twice. Landing a hook or a settings row on the
-developer's live scope from a test run is an unbrokered activation.
+`sable-orchestration-install --user` targets the LIVE ~/.claude for artifact
+writes unless that variable redirects it, and SABLE-k0nvp records a pinning
+suite polluting the real ~/.local twice. Landing a hook or a settings row on
+the developer's live scope from a test run is an unbrokered activation.
 
 ONE PIECE OF FIXTURE SETUP IS NOT AN INSTALLER RUN, and it is called out so it
 is not mistaken for a mock: the install.sh-owned hook is placed at its consumed
 path as a stale copy by hand. That is not standing in for the system under
 test — it reconstructs PRIOR HISTORY (an earlier install.sh run), which is
 exactly the state the live incident started from. install.sh installs from its
-own checkout by location and additionally writes settings.json registrations,
-so running it here would install the developer's real repo and could not be
-pointed at the scratch fleet at all.
+own checkout by location, so running it here would install the developer's real
+repo and could not be pointed at the scratch fleet at all.
 """
 import os
 import subprocess
@@ -300,7 +299,7 @@ def test_a_green_run_of_installer_A_does_not_discharge_installer_Bs_file(fleet):
 
     # And the seat-facing report says both things without a reader inferring.
     report = debt.format_ledger_report(statuses)
-    assert "install.sh:414" in report
+    assert "manual paste" in report
     assert "hooks/tdd-evidence.sh" in report
 
 

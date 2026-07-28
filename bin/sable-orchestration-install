@@ -5,8 +5,8 @@
 # ~/.claude (--user): all multi-manager hooks, the agents.yaml registry, the SABLE
 # skills (/sable-plan, /sable-execute, /columbo, /gaudi, ...), and the four
 # warm-pane roles (lincoln, optimus, tarzan, chuck) with identity injection.
-# The settings snippet is merged idempotently into the scope's settings file
-# (backed up + validated; existing entries never clobbered).
+# Settings are print-only by default. Pass --merge-settings to apply the
+# idempotent merge after reviewing the exact add/remove/modify report.
 #
 # Execution runs on the tmux warm-pane topology — the only topology (see
 # TMUX-AGENTS-DESIGN.md): bring the session up with `sable-tmux --autostart`.
@@ -15,7 +15,8 @@
 # Turn orchestration off at runtime WITHOUT uninstalling: export SABLE_ORCHESTRATION=off
 #
 # Usage:
-#   sable-orchestration-install [--project|--user] [--uninstall] [--help]
+#   sable-orchestration-install [--project|--user] [--merge-settings]
+#                              [--uninstall] [--help]
 #
 # Env (mainly for tests):
 #   SABLE_PROJECT_DIR   project root for --project scope (default: $PWD)
@@ -34,10 +35,12 @@ usage() {
 
 SCOPE="project"
 UNINSTALL=0
+MERGE_SETTINGS=0
 for arg in "${@:-}"; do
     case "$arg" in
         --project)          SCOPE="project" ;;
         --user)             SCOPE="user" ;;
+        --merge-settings)   MERGE_SETTINGS=1 ;;
         --uninstall)        UNINSTALL=1 ;;
         -h|--help)          usage; exit 0 ;;
         "")                 ;;
@@ -79,10 +82,10 @@ HOOKS_DIR="$BASE/hooks/multi-manager"
 AGENTS_DIR="$BASE/agents"
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 
-# Refuse an install before its first activation write when an existing
-# settings target cannot be safely merged.  The backup is made from the same
-# bytes that are parsed, so the refusal both preserves the live file and names
-# a usable recovery artifact.
+# Refuse before the first install write when an existing settings target cannot
+# be read as a JSON object. Invalid bytes are preserved and copied to the
+# familiar .bak recovery path; valid settings are not backed up until an
+# explicitly-consented write actually needs a snapshot.
 preflight_settings_targets() {
     local -a existing=()
     local target
@@ -97,26 +100,25 @@ import json, shutil, sys
 for path in sys.argv[1:]:
     backup = path + '.bak'
     try:
-        shutil.copy2(path, backup)
-    except OSError as exc:
-        print(
-            f"sable-orchestration-install: REFUSED settings merge for {path}: "
-            f"could not read or back up existing settings ({exc}). "
-            f"Backup path: {backup}",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
-
-    try:
-        with open(backup, encoding='utf-8') as f:
+        with open(path, encoding='utf-8') as f:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("top level must be a JSON object")
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        try:
+            shutil.copy2(path, backup)
+            recovery = f"backup path: {backup}"
+        except OSError as backup_exc:
+            recovery = f"backup path {backup} also failed: {backup_exc}"
+        reason = (
+            f"could not read or back up existing settings ({exc})"
+            if isinstance(exc, OSError)
+            else f"invalid JSON ({exc})"
+        )
         print(
             f"sable-orchestration-install: REFUSED settings merge for {path}: "
-            f"invalid JSON ({exc}). Existing bytes were preserved; "
-            f"backup path: {backup}",
+            f"{reason}. Existing bytes were preserved; "
+            f"{recovery}",
             file=sys.stderr,
         )
         raise SystemExit(1)
@@ -131,72 +133,178 @@ PY
 RETIRED_HOOK_FILES="inbox-injection.sh inbox-injection-precompact.sh control-trace.sh close-decay-sweep.sh"
 RETIRED_AGENT_DEFS="optimus.md tarzan.md chuck.md"
 
-# Merge a settings snippet's hooks into the target settings file, idempotently.
-# Rewrites the snippet's ~/.claude paths to BASE_DIR (the absolute BASE for
-# --user scope; the literal ${CLAUDE_PROJECT_DIR}/.claude placeholder for
-# --project scope, so the committed settings.json stays portable). Idempotency keys on
-# (event, matcher, command-basename) so a hook registered under two matchers (e.g.
-# mode-interlock.sh under both Bash and Agent) is preserved, while a re-run adds
-# nothing. Backs up, validates JSON, never clobbers existing entries.
+# Render the exact settings result without touching the live target. The caller
+# may then apply it through install_file() when --merge-settings was explicit,
+# gaining the same timestamped snapshot and manifest as every other artifact.
 #
-# $4 (optional) is a space-separated list of hook basenames to leave OUT of the
-# merge entirely — hooks this run REFUSED to install because their sibling
-# library closure could not be satisfied (SABLE-nn54x). Registering one of those
-# would wire an inert gate, which is worse than no gate at all.
-merge_snippet() {
-    SETTINGS_PATH="$1" SNIPPET_PATH="$2" BASE_DIR="$3" SKIP_MARKERS="${4:-}" python3 - <<'PY'
-import json, os, shutil
-settings = os.environ['SETTINGS_PATH']
-with open(os.environ['SNIPPET_PATH']) as f: snip = json.load(f)
-base = os.environ['BASE_DIR']
-skip = set(os.environ.get('SKIP_MARKERS', '').split())
-data = {}
+# Rewrites ~/.claude to BASE_DIR and keys rows by (event, matcher,
+# command-basename). Existing rows are refreshed when their timeout/type/path
+# changed instead of being silently left stale. SKIP_MARKERS are refused hooks;
+# RETIRED_MARKERS are old rows this version no longer ships. Both disappear
+# from the proposal, never directly from the live file.
+render_settings_proposal() {
+    SETTINGS_PATH="$1" SNIPPET_PATH="$2" BASE_DIR="$3" \
+    SKIP_MARKERS="${4:-}" RETIRED_MARKERS="$5" OUTPUT_PATH="$6" \
+    python3 - <<'PY'
+import copy
+import json
+import os
+
+settings = os.environ["SETTINGS_PATH"]
+with open(os.environ["SNIPPET_PATH"], encoding="utf-8") as f:
+    snippet = json.load(f)
 if os.path.exists(settings):
-    backup = settings + '.bak'
-    shutil.copy2(settings, backup)
-    try:
-        with open(backup, encoding='utf-8') as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError("top level must be a JSON object")
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
-        raise SystemExit(
-            f"sable-orchestration-install: REFUSED settings merge for {settings}: "
-            f"invalid JSON ({exc}). Existing bytes were preserved; "
-            f"backup path: {backup}"
-        )
-hooks = data.setdefault('hooks', {})
-def marker(cmd): return (cmd or '').rsplit('/', 1)[-1]
-for event, blocks in snip.get('hooks', {}).items():
-    ev = hooks.get(event)
-    if not isinstance(ev, list):
-        ev = hooks[event] = []
-    existing = set()
-    for b in ev:
-        if isinstance(b, dict):
-            bm = b.get('matcher', '')
-            for h in b.get('hooks', []):
-                if isinstance(h, dict): existing.add((bm, marker(h.get('command', ''))))
-    for b in blocks:
-        if not isinstance(b, dict): continue
-        m = b.get('matcher', '')
-        target = next((x for x in ev if isinstance(x, dict) and x.get('matcher', '') == m), None)
-        if target is None:
-            target = {'matcher': m, 'hooks': []}; ev.append(target)
-        tl = target.setdefault('hooks', [])
-        for h in b.get('hooks', []):
-            if not isinstance(h, dict): continue
-            cmd = (h.get('command', '') or '').replace('~/.claude', base)
-            if marker(cmd) in skip: continue
-            key = (m, marker(cmd))
-            if key in existing: continue
-            existing.add(key)
-            tl.append({**h, 'command': cmd})
-out = json.dumps(data, indent=2); json.loads(out)
-os.makedirs(os.path.dirname(settings), exist_ok=True)
-with open(settings, 'w') as f: f.write(out + '\n')
+    with open(settings, encoding="utf-8") as f:
+        before = json.load(f)
+else:
+    before = {}
+data = copy.deepcopy(before)
+base = os.environ["BASE_DIR"]
+excluded = set(os.environ.get("SKIP_MARKERS", "").split())
+excluded.update(os.environ.get("RETIRED_MARKERS", "").split())
+
+
+def marker(command):
+    return (command or "").rsplit("/", 1)[-1]
+
+
+def rows(document):
+    result = {}
+    hooks = document.get("hooks", {}) if isinstance(document, dict) else {}
+    if not isinstance(hooks, dict):
+        return result
+    for event, blocks in hooks.items():
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            matcher = block.get("matcher", "")
+            for hook in block.get("hooks", []):
+                if isinstance(hook, dict):
+                    result[(event, matcher, marker(hook.get("command", "")))] = hook
+    return result
+
+
+hooks = data.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    hooks = data["hooks"] = {}
+
+# Retire/refuse rows in the proposal only.
+for blocks in hooks.values():
+    if not isinstance(blocks, list):
+        continue
+    for block in blocks:
+        if isinstance(block, dict) and isinstance(block.get("hooks"), list):
+            block["hooks"] = [
+                hook for hook in block["hooks"]
+                if not (isinstance(hook, dict)
+                        and marker(hook.get("command", "")) in excluded)
+            ]
+
+# Add or refresh the rows this version ships.
+for event, blocks in snippet.get("hooks", {}).items():
+    event_blocks = hooks.get(event)
+    if not isinstance(event_blocks, list):
+        event_blocks = hooks[event] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        matcher = block.get("matcher", "")
+        matching_blocks = [
+            candidate for candidate in event_blocks
+            if isinstance(candidate, dict)
+            and candidate.get("matcher", "") == matcher
+        ]
+        if not matching_blocks:
+            matching_blocks = [{"matcher": matcher, "hooks": []}]
+            event_blocks.extend(matching_blocks)
+        target = matching_blocks[0]
+        target_hooks = target.setdefault("hooks", [])
+        for hook in block.get("hooks", []):
+            if not isinstance(hook, dict):
+                continue
+            desired = {
+                **hook,
+                "command": (hook.get("command", "") or "").replace(
+                    "~/.claude", base),
+            }
+            name = marker(desired["command"])
+            if name in excluded:
+                continue
+            location = next(
+                ((candidate, i)
+                 for candidate in matching_blocks
+                 for i, current in enumerate(candidate.get("hooks", []))
+                 if isinstance(current, dict)
+                 and marker(current.get("command", "")) == name),
+                None,
+            )
+            if location is None:
+                target_hooks.append(desired)
+            else:
+                existing_block, index = location
+                existing_block["hooks"][index] = desired
+
+with open(os.environ["OUTPUT_PATH"], "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+old_rows, new_rows = rows(before), rows(data)
+changes = []
+for key in sorted(set(old_rows) | set(new_rows)):
+    event, matcher, name = key
+    where = f"{event}[{matcher or '*'}] {name}"
+    if key not in old_rows:
+        changes.append(f"ADDED    {where}")
+    elif key not in new_rows:
+        changes.append(f"REMOVED  {where}")
+    elif old_rows[key] != new_rows[key]:
+        changes.append(f"MODIFIED {where}")
+
+for line in changes:
+    print(f"    {line}")
+raise SystemExit(10 if changes else 0)
 PY
 }
+
+
+apply_settings_proposal() {
+    _settings_target="$1"
+    _settings_base="$2"
+    _settings_label="$3"
+    _settings_skip="${4:-}"
+    _settings_tmp="$(mktemp -d)"
+    _settings_proposed="$_settings_tmp/proposed.json"
+    _settings_report="$_settings_tmp/report.txt"
+
+    if render_settings_proposal \
+            "$_settings_target" "$SNIPPET" "$_settings_base" \
+            "$_settings_skip" "$RETIRED_HOOK_FILES" \
+            "$_settings_proposed" >"$_settings_report"; then
+        echo "Settings unchanged: $_settings_target"
+        rm -rf "$_settings_tmp"
+        return 0
+    else
+        _settings_rc=$?
+    fi
+    if [ "$_settings_rc" -ne 10 ]; then
+        rm -rf "$_settings_tmp"
+        return "$_settings_rc"
+    fi
+
+    echo "Settings changes for $_settings_target:"
+    cat "$_settings_report"
+    if [ "$MERGE_SETTINGS" = "1" ]; then
+        mkdir -p "$(dirname "$_settings_target")"
+        install_file "$_settings_proposed" "$_settings_target" "$_settings_label"
+        echo "  APPLIED (--merge-settings explicitly given)."
+    else
+        echo "  NOT APPLIED (print-only default). Re-run with --merge-settings to consent."
+    fi
+    rm -rf "$_settings_tmp"
+}
+
 
 # Remove every layer hook (any command referencing multi-manager/) from settings.
 remove_layer_hooks() {
@@ -220,45 +328,12 @@ with open(path, 'w') as f: f.write(out + '\n')
 PY
 }
 
-# Remove settings rows whose command basename is in the (space-separated)
-# retired-name list. Backs up first. Prints the count of rows removed so the
-# caller can decide whether there's anything to report.
-remove_retired_hook_rows() {
-    SETTINGS_PATH="$1" RETIRED_NAMES="$2" python3 - <<'PY'
-import json, os, shutil
-path = os.environ['SETTINGS_PATH']
-retired = set(os.environ['RETIRED_NAMES'].split())
-if not os.path.exists(path):
-    print(0); raise SystemExit
-shutil.copy(path, path + '.bak')
-try:
-    with open(path) as f: data = json.load(f)
-except Exception:
-    print(0); raise SystemExit
-removed = 0
-for blocks in data.get('hooks', {}).values():
-    if not isinstance(blocks, list): continue
-    for b in blocks:
-        if not isinstance(b, dict) or not isinstance(b.get('hooks'), list): continue
-        kept = []
-        for h in b['hooks']:
-            marker = (h.get('command', '') or '').rsplit('/', 1)[-1] if isinstance(h, dict) else ''
-            if isinstance(h, dict) and marker in retired:
-                removed += 1
-            else:
-                kept.append(h)
-        b['hooks'] = kept
-out = json.dumps(data, indent=2); json.loads(out)
-with open(path, 'w') as f: f.write(out + '\n')
-print(removed)
-PY
-}
-
 # Retire dead machinery left behind by a purely additive install over a
-# pre-existing scope (SABLE-gsqj): retired hook files, their settings rows,
-# the pre-tmux-only agents-teams dir, and retired manager agent defs in the
-# scope's agents/ dir. Runs on every plain install (not just --uninstall) —
-# a no-op when the scope is already clean. Prints only what it actually removed.
+# pre-existing scope (SABLE-gsqj): retired hook files, the pre-tmux-only
+# agents-teams dir, and retired manager agent defs in the scope's agents/ dir.
+# Settings-row retirement is part of the single proposal above, not a separate
+# write. Runs on every plain install (not just --uninstall) and prints only
+# what it actually removed.
 cleanup_retired_artifacts() {
     local -a cleaned=()
 
@@ -268,13 +343,6 @@ cleanup_retired_artifacts() {
             cleaned+=("retired hook file: $HOOKS_DIR/$f")
         fi
     done
-
-    if [ -e "$SETTINGS" ]; then
-        removed_rows="$(remove_retired_hook_rows "$SETTINGS" "$RETIRED_HOOK_FILES")"
-        if [ "${removed_rows:-0}" -gt 0 ] 2>/dev/null; then
-            cleaned+=("$removed_rows retired settings hook row(s) in $SETTINGS")
-        fi
-    fi
 
     if [ -e "$BASE/agents-teams" ]; then
         rm -rf "$BASE/agents-teams"
@@ -309,7 +377,13 @@ BAK_DIR=""
 # leaving the parent's BAK_DIR empty even though the dir was created on disk.
 ensure_bak_dir() {
     if [ -z "$BAK_DIR" ]; then
-        BAK_DIR="$BASE/.install-bak-$(date +%Y%m%d-%H%M%S)"
+        _bak_base="$BASE/.install-bak-$(date +%Y%m%d-%H%M%S)"
+        BAK_DIR="$_bak_base"
+        _bak_n=1
+        while [ -e "$BAK_DIR" ]; do
+            BAK_DIR="${_bak_base}.${_bak_n}"
+            _bak_n=$((_bak_n + 1))
+        done
         mkdir -p "$BAK_DIR"
     fi
 }
@@ -740,19 +814,17 @@ for skdir in "$REPO"/skills/*/; do
     done
 done
 
-# Merge the settings snippet, minus any hook this run refused. A refused hook
-# may still be REGISTERED from an earlier install that did satisfy its closure
-# (or from before this check existed), and its file has just been removed — so
-# strip its rows too, rather than leaving settings pointing at nothing.
-if [ -n "$REFUSED_HOOK_NAMES" ]; then
-    remove_retired_hook_rows "$SETTINGS" "$REFUSED_HOOK_NAMES" >/dev/null || true
-fi
-merge_snippet "$SETTINGS" "$SNIPPET" "$SNIPPET_BASE" "$REFUSED_HOOK_NAMES"
+# Compute settings from the live bytes but never write them without explicit
+# consent. The proposal also removes refused/retired registrations, so the
+# exact activation delta is reviewed and applied as one state transition.
+apply_settings_proposal \
+    "$SETTINGS" "$SNIPPET_BASE" "settings.json" "$REFUSED_HOOK_NAMES"
 if [ -n "$CODEX_HOOKS" ]; then
     # Codex supports Claude-style lifecycle hook configuration in
     # ~/.codex/hooks.json. Reuse the exact installed command graph so mixed
     # fleets do not silently lose mode, identity, and command guardrails.
-    merge_snippet "$CODEX_HOOKS" "$SNIPPET" "$SNIPPET_BASE" "$REFUSED_HOOK_NAMES"
+    apply_settings_proposal \
+        "$CODEX_HOOKS" "$SNIPPET_BASE" "codex/hooks.json" "$REFUSED_HOOK_NAMES"
 fi
 
 # Stage the host timer entrypoint's systemd/cron artifacts (never activates them).
@@ -760,10 +832,18 @@ install_reconcile_timer
 
 echo "Orchestration layer installed to $BASE (scope: $SCOPE)."
 if [ -n "$CODEX_HOOKS" ]; then
-    echo "Codex lifecycle hooks merged into $CODEX_HOOKS."
+    if [ "$MERGE_SETTINGS" = "1" ]; then
+        echo "Codex lifecycle hooks applied to $CODEX_HOOKS."
+    else
+        echo "Codex lifecycle hook changes were printed but not applied."
+    fi
 fi
 echo "  • All multi-manager hooks + agents.yaml + SABLE skills + the four pane roles installed."
-echo "  • Settings snippet ($(basename "$SNIPPET")) merged into $SETTINGS (existing entries kept)."
+if [ "$MERGE_SETTINGS" = "1" ]; then
+    echo "  • Settings snippet applied to $SETTINGS (existing entries kept)."
+else
+    echo "  • Settings snippet was print-only; $SETTINGS was not changed."
+fi
 echo "  • /sable-plan and /sable-execute become available after you restart the session."
 echo "  • Start your session:  sable-launch   (Lincoln only, wraps sable-tmux; managers spawn on demand)"
 echo "  • Disable anytime without uninstalling:  export SABLE_ORCHESTRATION=off"

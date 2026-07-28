@@ -46,7 +46,7 @@ def installed_scope(tmp_path):
     base = tmp_path / "claude"
     base.mkdir()
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--user"],
+        ["bash", str(INSTALLER), "--user", "--merge-settings"],
         env={**os.environ, "CLAUDE_USER_DIR": str(base)},
         capture_output=True, text=True, timeout=180,
     )
@@ -68,13 +68,32 @@ def run_installed_guard(base, command):
     return json.loads(result.stdout)["hookSpecificOutput"]
 
 
-def run_real_install(base):
+def run_real_install(base, merge_settings=True):
     """Run the real installer against an isolated user scope."""
+    settings_args = ["--merge-settings"] if merge_settings else []
     return subprocess.run(
-        ["bash", str(INSTALLER), "--user"],
+        ["bash", str(INSTALLER), "--user", *settings_args],
         env={**os.environ, "CLAUDE_USER_DIR": str(base)},
         capture_output=True, text=True, timeout=180,
     )
+
+
+def test_direct_real_install_is_print_only_without_consent(tmp_path):
+    base = tmp_path / "claude"
+    base.mkdir()
+    settings = base / "settings.json"
+    original = b'{\n  "permissions": {"allow": ["Read"]}\n}\n'
+    settings.write_bytes(original)
+
+    result = run_real_install(base, merge_settings=False)
+
+    assert result.returncode == 0, result.stderr
+    assert settings.read_bytes() == original
+    assert "inline-body-guard.sh" in result.stdout
+    assert "NOT APPLIED" in result.stdout
+    assert (base / "hooks" / "multi-manager" / "inline-body-guard.sh").is_file()
+    assert not list(base.glob(".install-bak-*"))
+    assert not settings.with_suffix(".json.bak").exists()
 
 
 def test_malformed_settings_refuses_before_install_and_preserves_exact_bytes(tmp_path):

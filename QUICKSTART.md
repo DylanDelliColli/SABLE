@@ -70,14 +70,14 @@ There is **one install** — no tiers, no topology choices. It:
 3. Copies the base hook scripts into `~/.claude/hooks/`
 4. Copies the producer agent definitions into `~/.claude/agents/`
 5. Installs the orchestration layer (multi-manager hooks, `agents.yaml`
-   registry, the four pane role files, the SABLE skills) and auto-merges its
-   settings snippet (backed up; existing entries preserved)
+   registry, the four pane role files, the SABLE skills) and prints the exact
+   settings additions/removals/modifications without applying them
 6. Prepends the SABLE Prime Directives to `~/.claude/CLAUDE.md` (with a timestamped backup if one already exists)
 7. Prints the base-hook JSON snippet you paste into `~/.claude/settings.json`
-   (does NOT auto-edit that block — you review and paste). The orchestration
-   installer also merges its Claude-style lifecycle hooks into
-   `~/.codex/hooks.json`, so Codex manager/worker panes receive the same
-   shell-command guardrails. The snippet includes the
+   (does NOT auto-edit that block — you review and paste). After reviewing the
+   orchestration proposal, rerun `bash install.sh --merge-settings` to apply it
+   to `~/.claude/settings.json` and `~/.codex/hooks.json`; changed files are
+   preserved in named timestamped snapshot directories. The snippet includes the
    `sable-doctor --quiet` SessionStart drift-warn.
 8. Stages (never activates) the reconciliation-floor host timer artifacts under `~/.claude/sable/reconcile-timer/` — activation is a deliberate operator step: one command, `sable-reconcile-timer --install-schedule`, which installs the units *and* verifies afterwards that a schedule really fires (exit 3 if not). By default it sweeps the repo you installed from; set `SABLE_RECONCILE_TARGET_REPO=<repo>[:<repo>...]` before installing to name other fleets, since a timer that sweeps one repo leaves every other fleet on the host unprotected while looking installed (SABLE-5xz68).
 
@@ -155,10 +155,14 @@ If `bd close` succeeded the first time without asking for tests, the hooks aren'
 The three-step install above is **global** — it writes hooks, skills, and the Prime Directives into your `~/.claude`, so every project on the machine inherits SABLE. If instead you want SABLE **committed into a single repository** — so teammates get the exact same hooks and skills the moment they clone, with nothing to install into their home directory — use the project scope:
 
 ```bash
-bash install.sh --project=/path/to/your/project
+bash install.sh --project=/path/to/your/project --merge-settings
 ```
 
-Run it from inside the repo and you can drop the path: `install.sh --project` defaults to the current repo's root, resolved through the shared git dir so it works from any linked worktree.
+`--merge-settings` is the explicit consent that creates the committed,
+portable hook registrations. Omit it first if you want to review the exact
+proposal, then rerun with it. From inside the repo you can drop the path:
+`install.sh --project --merge-settings` defaults to the current repo's root,
+resolved through the shared git dir so it works from any linked worktree.
 
 Project scope is **hybrid**, by design:
 
@@ -212,8 +216,10 @@ The install already put in place:
 - `~/.claude/skills/` — the SABLE slash commands (`/sable-plan`, `/sable-execute`,
   `/gaudi`, `/columbo`, `/audit-deep-dive`, `/sable-review`), installed by their
   skill name.
-- The settings snippet, **merged into `~/.claude/settings.json`
-  automatically** (backed up first; existing entries preserved).
+- The exact settings proposal, printed without changing
+  `~/.claude/settings.json`. Apply it deliberately with
+  `bash install.sh --merge-settings` after review; existing entries are
+  preserved and changed files are snapshotted.
 - The producer agent definitions in `~/.claude/agents/`.
 
 **Restart Claude Code** after installing so the agent definitions, slash
