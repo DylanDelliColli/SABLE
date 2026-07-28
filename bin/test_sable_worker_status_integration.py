@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -55,6 +56,30 @@ def _scrubbed_env():
     return env
 
 
+@pytest.fixture(autouse=True)
+def _isolate_unresolvable_bead_lookups(tmp_path, monkeypatch):
+    """Keep fake-bead cases off the checkout's shared real Dolt store.
+
+    These integration cases exercise real tmux. Their placeholder bead ids
+    are intentionally unresolvable, so sable-worker-status's production
+    contract is to fail open and trust the settled pane tag. A tiny `bd`
+    shim preserves that exact result without making concurrent tmux workers
+    all open this repository's embedded Dolt store. The two cases that need
+    an OPEN bead prepend their own status-returning shim, while
+    test_sable_worker_status.py retains closed/open/unavailable parser and
+    confirmation coverage and test_footprint_lib_integration.py retains the
+    real bd/Dolt boundary.
+    """
+    stub_dir = tmp_path / "unresolvable-bd"
+    stub_dir.mkdir()
+    stub = stub_dir / "bd"
+    stub.write_text("#!/usr/bin/env sh\nexit 1\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv(
+        "PATH", f"{stub_dir}:{os.environ.get('PATH', '')}"
+    )
+
+
 def _wait_until(predicate, *, timeout=3.0, interval=0.02, description="condition"):
     """Poll a real tmux observation instead of sleeping for a guessed delay."""
     deadline = time.monotonic() + timeout
@@ -67,7 +92,9 @@ def _wait_until(predicate, *, timeout=3.0, interval=0.02, description="condition
 
 
 @pytest.fixture()
-def sock():
+def sock(monkeypatch):
+    socket_root = Path(tempfile.mkdtemp(prefix="sable-ws-tmux-"))
+    monkeypatch.setenv("TMUX_TMPDIR", str(socket_root))
     experiment = os.environ.get("SABLE_TEST_CONTENTION_EXPERIMENT")
     worker = os.environ.get("SABLE_TEST_CONTENTION_WORKER")
     if experiment and worker:
@@ -77,9 +104,16 @@ def sock():
         )
     else:
         s = f"sable-ws-{uuid.uuid4().hex[:8]}"
-    yield s
-    subprocess.run(["tmux", "-L", s, "kill-server"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        yield s
+    finally:
+        subprocess.run(
+            ["tmux", "-L", s, "kill-server"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=_scrubbed_env(),
+        )
+        shutil.rmtree(socket_root, ignore_errors=True)
 
 
 def _tmux(s, *args, check=True):
