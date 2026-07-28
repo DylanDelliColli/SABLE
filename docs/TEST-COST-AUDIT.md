@@ -260,8 +260,24 @@ coarse independent lanes and retains serial execution inside the shell lane.
 The local development host was not used for final latency acceptance once an
 unrelated worker's long-running pytest was observed alongside the SABLE run:
 that shared-host sample was green but took 715.72s and is local-swarm evidence,
-not a dedicated-runner comparison. Final timing acceptance is taken from the
-actual GitHub-hosted job and recorded on `SABLE-pfkwc`.
+not a dedicated-runner comparison.
+
+Two actual GitHub-hosted executions accepted the implementation at exact source
+SHA `3c3b2c5328147b989579e70a86d487ade8c0ffd9`:
+
+| GitHub execution | Job wall time | Sealed verdict | Result |
+| --- | ---: | ---: | --- |
+| [Representative serialized baseline](https://github.com/DylanDelliColli/SABLE/actions/runs/30236161394) | 11m06s | 10m47s from Python start through shell completion | Green |
+| [Acceptance 1](https://github.com/DylanDelliColli/SABLE/actions/runs/30375931009) | 4m14s | 3m45s | Green: 2,809 passed, 208 skipped; shell 95/95; static authority |
+| [Acceptance 2](https://github.com/DylanDelliColli/SABLE/actions/runs/30376402148) | 4m11s | 3m45s | Green: 2,809 passed, 208 skipped; shell 95/95; static authority |
+
+The end-to-end job reduction is 61.9% and 62.3%, respectively. The two
+acceptance jobs differ by three seconds (1.2%), use one Actions slot each, and
+retain the complete Python discovery, serial shell allowlist, and static
+fail-closed checks. The baseline is a representative prior source state rather
+than a synthetic same-SHA rewrite; upstream changes increased shell membership
+from 94 to 95 and changed Python disposition before acceptance, so the table
+reports the observed test counts instead of implying identical membership.
 
 The clean-room work also exposed a correctness defect in
 `test-doctor-snapshot-staleness.sh`: its fixture always piped the checkout's
@@ -275,9 +291,10 @@ The generalized method and standalone-auditor design learnings are recorded in
 The CI measurements use an otherwise isolated runner. They do not establish
 local behavior when 15+ workers each launch a scoped test process on one
 development host. SABLE deliberately leaves local shell execution serial and
-forbids workers from invoking the sealed full suite, but the broader-than-scoped
-one-per-host rule is currently prose rather than admission control. A
-representative swarm plant and the decision about a heavyweight-only host
-token budget are tracked separately in `SABLE-x2r7g`; adding a universal lock
-without that evidence could serialize cheap independent unit work and make the
-fleet slower.
+forbids workers from invoking the sealed full suite. Fifteen workers are already
+a parallel test scheduler, so enabling inner fan-out per worker would multiply
+contention. The broader-than-scoped one-per-host rule is currently prose rather
+than admission control. A representative swarm plant and the decision about a
+heavyweight-only host token budget are tracked separately in `SABLE-x2r7g`;
+adding a universal lock without that evidence could serialize cheap independent
+unit work and make the fleet slower.

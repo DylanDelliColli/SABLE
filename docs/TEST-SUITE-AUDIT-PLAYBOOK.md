@@ -194,6 +194,14 @@ independent unit runs. If admission control is needed, place the smallest
 configurable token budget around the measured contended boundary (for example
 real bd/tmux/Docker integration), not around all testing.
 
+Do not compare a shared development-host result with an isolated CI result as
+if only the code changed. During SABLE's audit, a green top-level run took
+715.72 seconds while an unrelated repository's pytest process and persistent
+database servers shared the 14-core host. The accepted ephemeral CI jobs took
+4m14s and 4m11s end to end. The shared result is valuable evidence that fleet
+contention needs its own experiment, but it is not a valid regression baseline
+for the CI topology.
+
 ## 6. Interpret speed versus contention honestly
 
 In SABLE's clean-room baseline:
