@@ -78,46 +78,41 @@ set -uo pipefail
 HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
 
 # ---------------------------------------------------------------------------
-# Parse hook input
+# Parse hook input once. This hook runs for every Bash tool call; four cold
+# Python starts formerly extracted four fields from the same immutable JSON.
+# A sentinel preserves empty leading fields through command substitution while
+# leaving the possibly-multiline command as the final field.
 # ---------------------------------------------------------------------------
-_python3_extract() {
-  python3 -c "
+PARSED=$(printf '%s' "$HOOK_INPUT" | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
     d = {}
-print(d.get('$1', '') or '')
-" 2>/dev/null
-}
-
-COMMAND=$(printf '%s' "$HOOK_INPUT" | python3 -c "
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    d = {}
-print((d.get('tool_input') or {}).get('command', '') or '')
-" 2>/dev/null) || COMMAND=""
-
-CWD=$(printf '%s' "$HOOK_INPUT" | python3 -c "
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    d = {}
+ti = d.get('tool_input') or {}
+if not isinstance(ti, dict):
+    ti = {}
 print(d.get('cwd', '') or '')
-" 2>/dev/null) || CWD=""
-[ -z "$CWD" ] && CWD="${PWD:-}"
-
-SESSION_ID=$(printf '%s' "$HOOK_INPUT" | python3 -c "
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    d = {}
 print(d.get('session_id', '') or '')
-" 2>/dev/null) || SESSION_ID=""
+print(d.get('agent_type', '') or '')
+print('__SABLE_COMMAND__')
+print(ti.get('command', '') or '')
+" 2>/dev/null) || PARSED=""
+
+_REST="${PARSED#*$'\n'}"
+CWD="${PARSED%%$'\n'*}"
+SESSION_ID="${_REST%%$'\n'*}"
+_REST="${_REST#*$'\n'}"
+AGENT_NAME="${_REST%%$'\n'*}"
+_REST="${_REST#*$'\n'}"
+case "$_REST" in
+  "__SABLE_COMMAND__"$'\n'*) COMMAND="${_REST#*$'\n'}" ;;
+  "__SABLE_COMMAND__") COMMAND="" ;;
+  *) COMMAND="" ;;
+esac
+unset _REST
+
+[ -z "$CWD" ] && CWD="${PWD:-}"
 
 # Fall back to env, then to unknown-PPID (fail open — don't deny on missing identity)
 # SABLE-hccq: CLAUDE_CODE_SESSION_ID is the actual env var Claude Code
@@ -140,32 +135,27 @@ fi
 # context) first, then the legacy env terminal name. "-" when neither is set
 # (the common case for an unnamed session) — sable-claim status/release still
 # work off the session_id field in that case.
-AGENT_NAME=$(printf '%s' "$HOOK_INPUT" | python3 -c "
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    d = {}
-print(d.get('agent_type', '') or '')
-" 2>/dev/null) || AGENT_NAME=""
 [ -z "$AGENT_NAME" ] && AGENT_NAME="${SABLE_AGENT_NAME:-${CLAUDE_AGENT_NAME:-}}"
 [ -z "$AGENT_NAME" ] && AGENT_NAME="-"
 
 # ---------------------------------------------------------------------------
 # Helper: emit an additionalContext response and exit 0 (allow)
 # ---------------------------------------------------------------------------
+json_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '%s' "$value"
+}
+
 allow_with_context() {
   # $1 = message
-  MSG="$1" python3 -c "
-import json, os
-print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'PreToolUse',
-        'permissionDecision': 'allow',
-        'additionalContext': os.environ.get('MSG', '')
-    }
-}))
-"
+  local message
+  message="$(json_escape "$1")"
+  printf '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "additionalContext": "%s"}}\n' "$message"
   exit 0
 }
 
@@ -174,16 +164,9 @@ print(json.dumps({
 # ---------------------------------------------------------------------------
 deny_with_reason() {
   # $1 = reason
-  REASON="$1" python3 -c "
-import json, os
-print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'PreToolUse',
-        'permissionDecision': 'deny',
-        'permissionDecisionReason': os.environ.get('REASON', '')
-    }
-}))
-"
+  local reason
+  reason="$(json_escape "$1")"
+  printf '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "%s"}}\n' "$reason"
   exit 0
 }
 

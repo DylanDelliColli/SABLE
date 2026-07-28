@@ -1303,6 +1303,15 @@ def _impact_isolated_env(parent: str | os.PathLike) -> dict[str, str]:
     env["HOME"] = str(home)
     env["TMPDIR"] = str(scratch_tmp)
 
+    # SABLE_MG_BD is the gate's documented subprocess seam. An explicit
+    # override owns its own state (normally a deterministic test double), so
+    # discovering some unrelated host `bd` and cold-initializing a real store
+    # here violates the seam and adds seconds to every injected-tier scenario.
+    # The production path leaves SABLE_MG_BD unset and still receives the
+    # isolated real store below.
+    if "SABLE_MG_BD" in os.environ:
+        return env
+
     if shutil.which("bd") is None:
         return env
 

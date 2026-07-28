@@ -607,44 +607,6 @@ def test_seat_gate_never_denies_a_normal_work_bd_create():
     assert "deny" not in result.stdout
 
 
-def test_seat_gate_annotates_the_created_bead_afterward(monkeypatch, tmp_path):
-    """The hook's actual job: after a successful chuck-identity `bd create`,
-    it runs a follow-up `bd update <id> --add-label seat-filed
-    --set-metadata priority_provisional=true`. Verified end to end against a
-    real, throwaway bd DB (real bd or self-skip — no mocks)."""
-    if not SEAT_GATE_HOOK.is_file():
-        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
-    if shutil.which("bd") is None:
-        pytest.skip("bd not on PATH")
-    beads_root = tmp_path / "beads"
-    beads_root.mkdir()
-    init = subprocess.run(["bd", "init", "--prefix=sga"], cwd=str(beads_root),
-                          env={**os.environ, "BD_NON_INTERACTIVE": "1"},
-                          text=True, capture_output=True, timeout=60)
-    assert init.returncode == 0, init.stdout + init.stderr
-    beads_db = str(beads_root / ".beads")
-
-    created = subprocess.run(
-        ["bd", "create", "--title=found a defect", "--description=text [no-test]",
-         "--type=task"],
-        env={**os.environ, "BEADS_DB": beads_db}, text=True, capture_output=True, timeout=30)
-    assert created.returncode == 0, created.stdout + created.stderr
-    bead_id = re.search(r"Created issue:\s*(\S+)", created.stdout).group(1)
-
-    result = _run_seat_gate(
-        'bd create --title="found a defect" --description="text [no-test]" --type=task',
-        agent_name="chuck", stdout=created.stdout, extra_env={"BEADS_DB": beads_db})
-    assert result.returncode == 0
-    # The hook's own `bd update` call must reach the SAME isolated DB.
-    show = subprocess.run(["bd", "show", bead_id, "--json"],
-                          env={**os.environ, "BEADS_DB": beads_db}, text=True,
-                          capture_output=True, timeout=30)
-    data = json.loads(show.stdout)
-    data = data[0] if isinstance(data, list) else data
-    assert "seat-filed" in (data.get("labels") or [])
-    assert (data.get("metadata") or {}).get("priority_provisional") in (True, "true", "True")
-
-
 def test_seat_gate_ignores_non_seat_identities():
     """Every other manager's `bd create` — the ordinary work-filing path —
     must pass through untouched. This hook has exactly one job."""

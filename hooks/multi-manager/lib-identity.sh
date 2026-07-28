@@ -71,19 +71,23 @@ except Exception:
     d = {}
 print(d.get('agent_id', '') or '')
 print(d.get('agent_type', '') or '')
+print('__SABLE_ID_PARSED__')
 " 2>/dev/null) || parsed=""
-  agent_id=$(printf '%s\n' "$parsed" | sed -n '1p')
-  agent_type=$(printf '%s\n' "$parsed" | sed -n '2p')
+  local -a identity_fields=()
+  mapfile -t identity_fields <<< "$parsed"
+  agent_id="${identity_fields[0]:-}"
+  agent_type="${identity_fields[1]:-}"
 
   if [ -n "$agent_id" ]; then
     SABLE_ID_IS_SUBAGENT=1
     if [ -n "$agent_type" ]; then
-      SABLE_ID_NAME=$(printf '%s' "$agent_type" | tr '[:upper:]' '[:lower:]')
+      SABLE_ID_NAME="${agent_type,,}"
       SABLE_ID_SOURCE="agent_type"
     fi
     # NOTE: env deliberately not consulted — it belongs to the parent session.
   elif [ -n "${SABLE_AGENT_NAME:-${CLAUDE_AGENT_NAME:-}}" ]; then
-    SABLE_ID_NAME=$(printf '%s' "${SABLE_AGENT_NAME:-$CLAUDE_AGENT_NAME}" | tr '[:upper:]' '[:lower:]')
+    SABLE_ID_NAME="${SABLE_AGENT_NAME:-$CLAUDE_AGENT_NAME}"
+    SABLE_ID_NAME="${SABLE_ID_NAME,,}"
     SABLE_ID_SOURCE="env"
   fi
 

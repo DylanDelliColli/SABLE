@@ -1,6 +1,6 @@
 # Test-cost audit
 
-Audit date: 2026-07-27
+Audit date: 2026-07-27–28
 Tracking bead: `SABLE-ssu6v`
 
 ## Reproduce the reports
@@ -52,6 +52,7 @@ environment for those modules.
 | Post-push isolation wrapper | >45s | 0.28s | One real sentinel plus structural assertions replaces repeated full-suite calls |
 | Library identity isolation wrapper | 25.3s | 12.14s | One sabotage case replaces four concurrent copies |
 | Gate-promotion test module | 104.48s ordinary | 66.56s declared integration | Correctly tier the existing real-repo/worktree/CLI contract |
+| Seat-sighting hook real-bd test | 8.16–12.87s in an ordinary module | 8.44s declared integration | Move the unchanged Dolt/hook boundary test to the existing integration module (`SABLE-kdn3y`) |
 
 The reconciliation production cache is deliberately narrow: cached records
 live only inside one branch-classification context. No result survives to
@@ -109,6 +110,40 @@ are local: persistent real-bd fixture stores, fewer process launches against
 the same immutable state, and deterministic tmux readiness signals in place
 of polling latency. Each module must retain at least one real end-to-end path
 for every authority boundary it owns.
+
+### Shell budget follow-up (`SABLE-rm6kl`)
+
+The full `ALLOW` membership remained unchanged at 94 suites. Two consecutive
+unrestricted profiles on the audit host were fully green at 883.44 and 897.52
+aggregate suite-seconds, below the 900-second `merge_preview` budget. No suite
+moved to `EXCLUDE`; real bd/git/tmux boundaries and planted negative controls
+remain in the authoritative run.
+
+The largest before/after changes (after is the mean of the two acceptance
+profiles) were:
+
+| Suite | Before | After | What changed |
+| --- | ---: | ---: | --- |
+| Post-push notification | 74.47s | 64.80s | One isolated real-bd store, no accidental preview worker launch, built-in parsing/intersection |
+| Overlap dispatch E2E | 68.08s | 38.20s | Keep the real deny/serialize/persistence boundary; leave duplicate decision permutations in the exhaustive unit suite |
+| Tree-claim oracle | 64.29s | 44.83s | One input parse and built-in JSON decision emission |
+| Mode interlock | 56.98s | 42.71s | One input/state snapshot, one cached leading-command classification, built-in decision emission |
+| Pre-dispatch claim | 51.47s | 31.50s | Reuse one isolated real store and bead across state transitions |
+| Close-hold authority | 48.11s | 29.50s | Isolated real store with the two load-bearing real dispositions; exhaustive state permutations stay in unit/plant coverage |
+| Optimistic promotion | 46.09s | 28.69s | Respect the explicit bd test seam instead of cold-initializing an unrelated host store |
+| Impact-tier serialization | 39.27s | 14.34s | Use the bd seam in transport-only cases; retain the concurrent real-bd isolation case |
+| Tier-red capture | 25.82s | 1.48s | Do not initialize real bd for injected tier-output fixtures |
+
+This follow-up exposed the recurring architectural cost pattern: a test often
+crossed the expensive real boundary for every state-machine permutation, even
+after a unit suite had already made those decisions load-bearing. The retained
+shape is one real boundary proof per authority, exhaustive fast decision tests,
+and an explicit plant where a false green would otherwise be plausible.
+
+The 897.52-second sample leaves only 2.48 seconds of budget headroom. The
+contract is satisfied twice, but future work should treat post-push
+notification and high-variance concurrent suites as the next optimization
+targets rather than weakening the budget or dropping coverage.
 
 ## Guardrails and architecture decision
 

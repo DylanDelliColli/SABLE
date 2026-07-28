@@ -29,12 +29,12 @@
 #   - dispatching B with 'Serialize-with: <A>' is ALLOWED, and the
 #     serialize_with tag lands in BOTH beads' real metadata (bd show --json) —
 #     the for-chuck handoff reads this same dedicated metadata field.
-#   - SABLE-47try: a bead whose '## File footprint' heading is PRESENT but names
-#     no path does NOT silently proceed — the gate reports could-not-assess and
-#     denies, instead of exiting 0 indistinguishably from a clean check.
-#   - SABLE-47try complement, load-bearing: a bead that declares NO footprint at
-#     all still dispatches while an overlapping bead is in-progress. Without
-#     this leg the fix above could be a gate that never releases.
+#   - an unrelated notes rewrite cannot erase that durable metadata grant.
+#
+# The exhaustive decision matrix (closed claimants, unreadable declarations,
+# no declarations, unrelated grants, and negative controls) belongs to the
+# stubbed unit suite in test-overlap-constraint.sh. Repeating those states
+# through a cold Dolt store added process cost without crossing a new boundary.
 #
 # Run with:
 #   bash hooks/test/test-overlap-dispatch-e2e.sh
@@ -59,13 +59,13 @@ fi
 # it (SABLE-jd5fj.16) — so print the same "Tests | Passed | Failed | Skipped"
 # shape the bd-present path below prints, with a non-zero Skipped count and a
 # named reason. Keep REALBD_SUBTESTS in sync with the number of distinct
-# pass()/fail() assertion titles below (12 today, SABLE-b0w8k added the
-# foreign-claimant, zero-residue, and plant-and-fail assertions) — this
+# pass()/fail() assertion titles below (8 today: five authority assertions and
+# three hermeticity plant assertions) — this
 # suite's own coverage is checked by hooks/test/test-shell-run-set-strict.sh
 # case (h) and by hooks/test/test-ci-bd-coverage-gap.sh's negative control,
 # which compares bd-present vs bd-absent subtest counts dynamically rather
 # than pinning this exact number.
-REALBD_SUBTESTS=12
+REALBD_SUBTESTS=8
 if ! command -v bd >/dev/null 2>&1; then
   echo "SKIP: bd not found on PATH — this suite requires a real bd (no mocks)"
   echo
@@ -145,29 +145,6 @@ except Exception:
 " "$2" 2>/dev/null || echo ""
 }
 
-cleanup_bead() { # <bead_id>
-  [ -z "$1" ] && return 0
-  bd update "$1" --sandbox --notes "[no-test] integration test scratch — safe to close" >/dev/null 2>&1 || true
-  bd close "$1" --sandbox >/dev/null 2>&1 || true
-}
-
-# --- TEST SPEC bullet 1: a foreign bead in ANY state claiming the fixture --
-# path must not break the suite. Plant one directly in THIS run's own
-# isolated DB — CLOSED, so it cannot itself participate in any overlap
-# decision — before this run's own bead A/B exist, standing in for "a run
-# that used this same DB before us left a claimant behind." The isolated-DB
-# fix (above) means that scenario can no longer arise by ACCIDENT across real
-# runs; this proves the suite also tolerates it if it ever did.
-BEAD_FOREIGN=$(bd create --sandbox \
-  --title="[int-test] b0w8k foreign pre-existing claimant" \
-  --description="Scratch foreign bead for the SABLE-b0w8k hermeticity test-spec bullet 1." \
-  --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
-if [ -n "$BEAD_FOREIGN" ]; then
-  bd update "$BEAD_FOREIGN" --sandbox --set-metadata "wip_claims=$SHARED_FILE" >/dev/null 2>&1
-  bd close "$BEAD_FOREIGN" --sandbox >/dev/null 2>&1
-  echo "Integration: planted foreign closed claimant = $BEAD_FOREIGN (test-spec bullet 1)"
-fi
-
 # --- bead A: already in-progress, claim already established ---------------
 BEAD_A=$(bd create --sandbox \
   --title="[int-test] jd5fj.6 overlap-e2e bead A" \
@@ -178,7 +155,6 @@ if [ -z "$BEAD_A" ]; then
   echo "SKIP (integration): could not create scratch bead A"
   exit 0
 fi
-trap 'cleanup_bead "${BEAD_FOREIGN:-}"; cleanup_bead "$BEAD_A"; cleanup_bead "${BEAD_B:-}"; rm -rf "$FIXTURE_DIR"' EXIT
 echo "Integration: created scratch bead A = $BEAD_A"
 
 bd update "$BEAD_A" --sandbox --claim >/dev/null 2>&1 || true
@@ -206,20 +182,6 @@ if printf '%s' "$OUT" | grep -q '"permissionDecision": "deny"' && printf '%s' "$
   pass "real bd: dispatching B with an overlapping declared footprint is DENIED, naming bead A and the file"
 else
   fail "real bd: dispatching B with an overlapping declared footprint is DENIED, naming bead A and the file" \
-       "got: ${OUT:-<empty>}"
-fi
-
-# TEST SPEC bullet 1, non-vacuity: the CLOSED foreign claimant planted above
-# (also on $SHARED_FILE) must not be what the deny names, nor break it —
-# bead A, the genuinely in-progress claimant, must still be the one cited.
-if [ -n "${BEAD_FOREIGN:-}" ] && printf '%s' "$OUT" | grep -q "$BEAD_A" \
-   && ! printf '%s' "$OUT" | grep -q "$BEAD_FOREIGN"; then
-  pass "real bd: a foreign CLOSED bead also claiming the fixture path does not break or get mistaken for the live deny"
-elif [ -z "${BEAD_FOREIGN:-}" ]; then
-  fail "real bd: a foreign CLOSED bead also claiming the fixture path does not break or get mistaken for the live deny" \
-       "could not create the foreign plant bead"
-else
-  fail "real bd: a foreign CLOSED bead also claiming the fixture path does not break or get mistaken for the live deny" \
        "got: ${OUT:-<empty>}"
 fi
 
@@ -267,81 +229,6 @@ else
        "B.serialize_with='$SERIALIZE_B_AFTER' A.serialize_with='$SERIALIZE_A_AFTER'"
 fi
 
-# --- Case 4 (SABLE-47try): unreadable footprint, against a REAL bd ----------
-# Bead C's description carries a '## File footprint' HEADING that names no
-# path. Bead A is still in-progress on SHARED_FILE. The gate cannot compare
-# anything, so it must NOT silently proceed — the old
-# `[ -z "$DISPATCH_FILES" ] && exit 0` exited 0 here, which is byte-identical
-# downstream to a check that ran and found no overlap.
-BEAD_C=$(bd create --sandbox \
-  --title="[int-test] 47try unreadable-footprint bead C" \
-  --description="Scratch bead C for the SABLE-47try could-not-assess e2e test.
-
-## File footprint
-
-## Test spec
-nothing here" \
-  --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
-
-if [ -n "$BEAD_C" ]; then
-  trap 'cleanup_bead "${BEAD_FOREIGN:-}"; cleanup_bead "$BEAD_A"; cleanup_bead "${BEAD_B:-}"; cleanup_bead "${BEAD_C:-}"; cleanup_bead "${BEAD_D:-}"; rm -rf "$FIXTURE_DIR"' EXIT
-  echo "Integration: created scratch bead C = $BEAD_C"
-  OUT=$(run_hook "Work $BEAD_C")
-  if printf '%s' "$OUT" | grep -q '"permissionDecision": "deny"' \
-     && printf '%s' "$OUT" | grep -q 'COULD NOT RUN'; then
-    pass "real bd: an unreadable declared footprint does NOT silently proceed — could-not-assess deny"
-  else
-    fail "real bd: an unreadable declared footprint does NOT silently proceed — could-not-assess deny" \
-         "got: ${OUT:-<empty>}"
-  fi
-else
-  fail "real bd: an unreadable declared footprint does NOT silently proceed — could-not-assess deny" \
-       "could not create scratch bead C"
-fi
-
-# --- Case 5 (SABLE-47try / SABLE-e2ic3): the LOAD-BEARING complement, real bd
-# Bead D declares NO footprint at all while bead A is still in-progress on
-# SHARED_FILE. It must dispatch — the assertion that proves the fix did not
-# turn the gate into one that can never release — but SABLE-e2ic3: no longer
-# SILENTLY. A bead declaring nothing and a bead whose footprint was checked
-# and found clean used to be the identical silent exit-0-no-output; this must
-# now be a DISTINCT, LOUD NO-DECLARATION additionalContext naming bead D,
-# still not a deny.
-BEAD_D=$(bd create --sandbox \
-  --title="[int-test] 47try no-footprint bead D" \
-  --description="Scratch bead D for the SABLE-47try negative control. It declares no footprint and names no file-shaped token at all." \
-  --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
-
-if [ -n "$BEAD_D" ]; then
-  echo "Integration: created scratch bead D = $BEAD_D"
-  OUT=$(run_hook "Work $BEAD_D")
-  if printf '%s' "$OUT" | grep -q 'NO-DECLARATION' \
-     && printf '%s' "$OUT" | grep -q "$BEAD_D" \
-     && ! printf '%s' "$OUT" | grep -q '"permissionDecision": "deny"'; then
-    pass "real bd: a bead declaring NO footprint still dispatches, LOUDLY as NO-DECLARATION (gate can still release)"
-  else
-    fail "real bd: a bead declaring NO footprint still dispatches, LOUDLY as NO-DECLARATION (gate can still release)" \
-         "got: ${OUT:-<empty>}"
-  fi
-else
-  fail "real bd: a bead declaring NO footprint still dispatches, LOUDLY as NO-DECLARATION (gate can still release)" \
-       "could not create scratch bead D"
-fi
-
-# --- Zero residue: every bead this run created is closed ------------------
-# Belt-and-suspenders on top of the isolated DB itself (which is destroyed by
-# the EXIT trap regardless): explicitly close the beads created above, then
-# assert none remain in-progress in THIS run's own DB before it is torn down.
-cleanup_bead "$BEAD_A"; cleanup_bead "${BEAD_B:-}"; cleanup_bead "${BEAD_C:-}"
-cleanup_bead "${BEAD_D:-}"; cleanup_bead "${BEAD_FOREIGN:-}"
-RESIDUE=$(bd list --status in_progress --json 2>/dev/null)
-if [ "$RESIDUE" = "[]" ] || [ -z "$RESIDUE" ]; then
-  pass "zero residue: no in-progress beads remain in this run's DB after cleanup"
-else
-  fail "zero residue: no in-progress beads remain in this run's DB after cleanup" \
-       "got: $RESIDUE"
-fi
-
 # ---------------------------------------------------------------------------
 # PLANT-AND-FAIL (SABLE-5lli.7) — the hermeticity fix above must not be a
 # vacuous no-op. Prove a NEW, throwaway hermeticity probe (never the isolated
@@ -352,34 +239,34 @@ fi
 # that the same probe reports GREEN when each "run" gets its own per-run
 # unique DB, which is the actual fix this suite now uses throughout.
 # ---------------------------------------------------------------------------
-hermeticity_probe_leaks() { # <db_dir> -> 0 if a prior call's probe bead is
-                            # already present (leak), 1 if this DB is clean
+probe_present() { # <db_dir> -> 0 when a probe bead is visible
   local db="$1"
-  if [ ! -d "$db/.beads" ]; then
-    mkdir -p "$db"
-    # -u BEADS_DB: this function runs after the suite's own BEADS_DB export
-    # above. Left ambient, `bd init` follows THAT var instead of CWD and
-    # "initializes" the already-initialized isolated DB instead of this
-    # probe's own dir — silently leaving $db/.beads never created.
-    (cd "$db" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=herm >/dev/null 2>&1)
-  fi
   local existing
   existing=$(BEADS_DB="$db/.beads" bd list --title-contains "hermeticity probe" --json 2>/dev/null)
+  [ "$existing" != "[]" ] && [ -n "$existing" ]
+}
+
+plant_probe() { # <db_dir>
+  local db="$1"
   BEADS_DB="$db/.beads" bd create --sandbox -q \
     --title="[int-test] hermeticity probe" \
     --description="[no-test] SABLE-5lli.7 plant-and-fail scratch — $SHARED_FILE" \
     --type=task >/dev/null 2>&1
-  [ "$existing" != "[]" ] && [ -n "$existing" ]
 }
 
 PLANT_DIR="$(mktemp -d)"
-if hermeticity_probe_leaks "$PLANT_DIR" >/dev/null 2>&1; then
+# The defect is two runs sharing one store, not how that store was initialized.
+# Copy the already-quiescent real store so the plant spends its time on the
+# discriminating read/write polarity instead of another cold `bd init`.
+cp -a -f "$BEADS_ROOT/." "$PLANT_DIR/"
+if probe_present "$PLANT_DIR"; then
   fail "PLANT-AND-FAIL precondition: a fresh shared-constant DB starts clean before the plant" \
        "unexpected pre-existing probe bead on the very first call"
 else
   pass "PLANT-AND-FAIL precondition: a fresh shared-constant DB starts clean before the plant"
 fi
-if hermeticity_probe_leaks "$PLANT_DIR"; then
+plant_probe "$PLANT_DIR"
+if probe_present "$PLANT_DIR"; then
   pass "PLANT-AND-FAIL: re-pointing two runs at the SAME constant DB reproduces cross-run leakage — hermeticity check correctly goes RED"
 else
   fail "PLANT-AND-FAIL: re-pointing two runs at the SAME constant DB reproduces cross-run leakage — hermeticity check correctly goes RED" \
@@ -390,12 +277,13 @@ rm -rf "$PLANT_DIR"
 # Reuse this run's OWN already-initialized isolated DB as one of the two
 # "runs" here — it is already a per-run-unique DB (that is the fix being
 # proven) and by this point carries no "hermeticity probe" bead, so it is a
-# safe, cheaper stand-in for a fresh mktemp+bd-init (each bd init cold-starts
-# an embedded Dolt server; avoiding a redundant one keeps this suite's
-# runtime reasonable).
+# safe, cheaper stand-in for a fresh mktemp+bd-init.
 FRESH_B="$(mktemp -d)"
-hermeticity_probe_leaks "$BEADS_ROOT" >/dev/null 2>&1
-if hermeticity_probe_leaks "$FRESH_B"; then
+# Two deep copies are the actual per-run isolation shape. Seed B before A is
+# mutated, then prove A's real bd create is invisible from B.
+cp -a -f "$BEADS_ROOT/." "$FRESH_B/"
+plant_probe "$BEADS_ROOT"
+if probe_present "$FRESH_B"; then
   fail "RESTORE GREEN: two runs on their OWN per-run-unique DBs do not leak into each other (the actual fix)" \
        "run B observed run A's probe bead despite separate scratch DBs"
 else

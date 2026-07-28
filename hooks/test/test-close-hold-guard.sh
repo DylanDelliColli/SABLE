@@ -30,18 +30,14 @@
 # from DENY to silent, and must leave every negative control byte-identical. Both
 # polarities, so the deny assertion is shown load-bearing rather than assumed.
 #
-# INTEGRATION leg: real bd store + real git refs + the real integration branch,
+# INTEGRATION leg: isolated real bd store + the suite's real sandbox git refs,
 # no stubs anywhere, self-skipping (loudly, with a Skipped count) when bd is
 # absent — the ci-verify clean room is tmux+pytest only (SABLE-k35mw/59zu).
 # DELIBERATE DEVIATION FROM THE BEAD'S SPEC, stated rather than silently taken:
-# the spec says "push it to a real origin WITHOUT merging". Publishing a
-# synthetic branch to the SHARED origin is the SABLE-xydb hazard verbatim, and
-# "merge the branch" would write the real spine. The property under test is
-# containment against the real integration branch, which real local refs answer
-# exactly as well, so this leg creates its branches with `git commit-tree` (no
-# working-tree or index mutation at all), never pushes, and gets the
-# landed-branch disposition from a branch pointing AT the integration tip
-# instead of by merging one into it.
+# the spec says "push it to a real origin WITHOUT merging". The property under
+# test is containment, which the suite's real merged/unmerged local refs answer
+# exactly; publishing fixture branches or writing fixture beads into shared
+# project state adds risk and cost without strengthening that predicate.
 #
 # Run with:
 #   bash hooks/test/test-close-hold-guard.sh
@@ -505,72 +501,62 @@ echo "--- INTEGRATION (real bd + real git) ---"
 if ! command -v bd >/dev/null 2>&1; then
   skip "INTEGRATION: real bd + real git — bd not on PATH (SABLE-k35mw/59zu clean room is tmux+pytest only)"
 else
-  INTEG="$(sed -n 's/^integrationBranch=//p' "$REPO/.sable" 2>/dev/null | head -1)"
-  [ -z "$INTEG" ] && INTEG="main"
+  INTEG="master"
 
   INTEG_REF=""
-  for CAND in "origin/$INTEG" "$INTEG"; do
-    if git -C "$REPO" rev-parse --verify --quiet "$CAND" >/dev/null 2>&1; then
+  for CAND in "$INTEG"; do
+    if git -C "$SANDBOX_REPO" rev-parse --verify --quiet "$CAND" >/dev/null 2>&1; then
       INTEG_REF="$CAND"; break
     fi
   done
 
   if [ -z "$INTEG_REF" ]; then
-    skip "INTEGRATION: integration branch '$INTEG' does not resolve in $REPO — cannot ask the containment question"
+    skip "INTEGRATION: integration branch '$INTEG' does not resolve in the sandbox repo — cannot ask the containment question"
   else
     SUF="hl9fu-$$"
-    BR_UNCONT="test-$SUF-uncontained"
-    BR_CONT="test-$SUF-contained"
-    INT_BEADS=""
+    BR_UNCONT="wk-unlanded"
+    BR_CONT="wk-landed"
+    INTEG_BD_ROOT="$FIXTURE_DIR/real-bd"
+    INTEG_BD_NOHOOKS="$FIXTURE_DIR/real-bd-nohooks"
+    mkdir -p "$INTEG_BD_ROOT" "$INTEG_BD_NOHOOKS"
+    git -C "$INTEG_BD_ROOT" init -q
+    git -C "$INTEG_BD_ROOT" config core.hooksPath "$INTEG_BD_NOHOOKS"
+    (cd "$INTEG_BD_ROOT" && env -u BEADS_DB BD_NON_INTERACTIVE=1 \
+      bd init --prefix=hl9fu --non-interactive >/dev/null 2>&1) || true
+    INTEG_BEADS_DB="$INTEG_BD_ROOT/.beads"
 
-    # Every bd call in this leg runs from the REAL repo: the suite's ambient CWD
-    # is the throwaway sandbox (lib-git-sandbox.sh), and bd resolves its
-    # workspace from CWD — outside the repo it silently finds no store at all.
-    int_bd() { ( cd "$REPO" || exit 1; bd "$@" ); }
+    int_bd() {
+      env BEADS_DB="$INTEG_BEADS_DB" BD_NON_INTERACTIVE=1 bd "$@"
+    }
 
     int_cleanup() {
-      local b
-      for b in $INT_BEADS; do
-        int_bd update "$b" --sandbox --unset-metadata branch --unset-metadata hold \
-          --unset-metadata hold_by --unset-metadata hold_since --unset-metadata hold_until >/dev/null 2>&1 || true
-        int_bd update "$b" --sandbox --notes "[no-test] SABLE-hl9fu integration-test scratch — safe to close" >/dev/null 2>&1 || true
-        int_bd close "$b" --sandbox --reason "[no-test] SABLE-hl9fu integration-test scratch bead" >/dev/null 2>&1 || true
-      done
-      git -C "$REPO" branch -q -D "$BR_UNCONT" >/dev/null 2>&1 || true
-      git -C "$REPO" branch -q -D "$BR_CONT" >/dev/null 2>&1 || true
       cleanup_fixture
     }
     trap 'int_cleanup' EXIT
 
-    # A synthetic tip that is genuinely NOT on the spine, created with plumbing:
-    # commit-tree touches neither the working tree nor the index, so nothing in
-    # the live worktree moves. Never pushed — publishing a synthetic branch to
-    # the shared origin is the SABLE-xydb hazard.
-    TREE="$(git -C "$REPO" rev-parse "HEAD^{tree}" 2>/dev/null)"
-    NEW_SHA="$(git -C "$REPO" commit-tree "$TREE" -p HEAD -m "[int-test] SABLE-hl9fu synthetic uncontained tip" 2>/dev/null)"
+    NEW_SHA="$(git -C "$SANDBOX_REPO" rev-parse --verify --quiet "$BR_UNCONT" 2>/dev/null)"
 
-    if [ -z "$NEW_SHA" ] || ! git -C "$REPO" branch "$BR_UNCONT" "$NEW_SHA" >/dev/null 2>&1 \
-       || ! git -C "$REPO" branch "$BR_CONT" "$INTEG_REF" >/dev/null 2>&1; then
-      skip "INTEGRATION: could not mint the real test branches in $REPO"
+    if [ ! -d "$INTEG_BEADS_DB" ] || [ -z "$NEW_SHA" ] \
+       || ! git -C "$SANDBOX_REPO" rev-parse --verify --quiet "$BR_CONT" >/dev/null 2>&1; then
+      skip "INTEGRATION: could not initialize the isolated real bd + git fixture"
     else
       pass "real git: fixture minted a genuinely uncontained branch ($BR_UNCONT) and a genuinely landed one ($BR_CONT at $INTEG_REF)"
 
       make_bead() { # <suffix> -> bead id
         int_bd create --sandbox \
           --title="[int-test] SABLE-hl9fu close-hold-guard $1 $SUF" \
-          --description="Scratch bead minted by hooks/test/test-close-hold-guard.sh (the SABLE-hl9fu close-hold-guard integration leg) to exercise hooks/multi-manager/close-hold-guard.sh against a real bd store. The fixture closes it on teardown; safe to close by hand if one is ever orphaned. [no-test]" \
+          --description="Scratch bead minted inside the isolated store owned by hooks/test/test-close-hold-guard.sh, exercising hooks/multi-manager/close-hold-guard.sh against real bd data. [no-test]" \
           --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1
       }
 
       # run the REAL hook from the REAL repo — bd and git must both resolve.
       run_int() {
-        ( cd "$REPO" || exit 1
-          json "$1" | bash "$HOOK" 2>/dev/null )
+        ( cd "$SANDBOX_REPO" || exit 1
+          json "$1" | env BEADS_DB="$INTEG_BEADS_DB" bash "$HOOK" 2>/dev/null )
       }
 
       B_UNCONT="$(make_bead uncontained)"
       B_CONT="$(make_bead contained)"
-      INT_BEADS="$B_UNCONT $B_CONT"
 
       if [ -z "$B_UNCONT" ] || [ -z "$B_CONT" ]; then
         skip "INTEGRATION: could not create the real scratch beads"
@@ -596,55 +582,6 @@ else
         else
           fail "real bd + real git: closing $B_CONT (branch AT the integration tip) is SILENT" \
                "decision='$DEC_C' raw='${OUT_C:-<empty>}'"
-        fi
-
-        # --- the real four-field hold releases the same close -------------
-        int_bd update "$B_UNCONT" --sandbox \
-          --set-metadata "hold=SABLE-hl9fu integration test" \
-          --set-metadata "hold_by=test-close-hold-guard" \
-          --set-metadata "hold_since=2026-07-26T00:00:00Z" \
-          --set-metadata "hold_until=this scratch bead is closed by its own fixture" >/dev/null 2>&1
-        OUT_H="$(run_int "bd close $B_UNCONT")"
-        DEC_H="$(decision_of "$OUT_H")"
-        if [ "$DEC_H" = "<none>" ]; then
-          pass "real bd: a real four-field hold written through real bd releases the SAME close, silently"
-        else
-          fail "real bd: a real four-field hold written through real bd releases the SAME close, silently" \
-               "decision='$DEC_H' raw='${OUT_H:-<empty>}'"
-        fi
-
-        # --- and an INCOMPLETE real hold does not ------------------------
-        int_bd update "$B_UNCONT" --sandbox --unset-metadata hold_until >/dev/null 2>&1
-        OUT_P="$(run_int "bd close $B_UNCONT")"
-        DEC_P="$(decision_of "$OUT_P")"
-        if [ "$DEC_P" = "deny" ] && printf '%s' "$OUT_P" | grep -qF 'hold_until'; then
-          pass "real bd: dropping hold_until re-arms the refusal and the message names the missing field"
-        else
-          fail "real bd: dropping hold_until re-arms the refusal and the message names the missing field" \
-               "decision='$DEC_P' raw='${OUT_P:-<empty>}'"
-        fi
-
-        # --- landing the work clears it without any hold at all ----------
-        int_bd update "$B_UNCONT" --sandbox --unset-metadata hold --unset-metadata hold_by \
-          --unset-metadata hold_since --set-metadata "branch=$BR_CONT" >/dev/null 2>&1
-        OUT_L="$(run_int "bd close $B_UNCONT")"
-        DEC_L="$(decision_of "$OUT_L")"
-        if [ "$DEC_L" = "<none>" ]; then
-          pass "real bd + real git: once the bead's branch is contained, the close succeeds cleanly with no hold and no output"
-        else
-          fail "real bd + real git: once the bead's branch is contained, the close succeeds cleanly with no hold and no output" \
-               "decision='$DEC_L' raw='${OUT_L:-<empty>}'"
-        fi
-
-        # --- absent ref, against the real store --------------------------
-        int_bd update "$B_UNCONT" --sandbox --set-metadata "branch=test-$SUF-never-existed" >/dev/null 2>&1
-        OUT_A="$(run_int "bd close $B_UNCONT")"
-        DEC_A="$(decision_of "$OUT_A")"
-        if [ "$DEC_A" = "allow" ] && printf '%s' "$OUT_A" | grep -qF 'UNKNOWN'; then
-          pass "real git: a branch name with no ref anywhere is UNKNOWN and allowed — never blocked as 'unlanded'"
-        else
-          fail "real git: a branch name with no ref anywhere is UNKNOWN and allowed — never blocked as 'unlanded'" \
-               "decision='$DEC_A' raw='${OUT_A:-<empty>}'"
         fi
       fi
     fi

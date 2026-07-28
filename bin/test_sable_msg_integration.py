@@ -6,6 +6,9 @@ Proves end-to-end: the role->pane registry (@sable_role user-option) resolves,
 the message is delivered as a real keystroke turn, and a message sent while the
 target pane is BUSY is queued and runs when free (the verified spike behavior).
 """
+import json
+import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -16,6 +19,7 @@ from pathlib import Path
 import pytest
 
 BIN = Path(__file__).resolve().parent / "sable-msg"
+SEAT_GATE_HOOK = Path(__file__).resolve().parent.parent / "hooks" / "multi-manager" / "seat-sighting-gate.sh"
 HAVE_TMUX = shutil.which("tmux") is not None
 pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="tmux not installed")
 
@@ -84,7 +88,6 @@ def _run_msg(sock, *cli_args):
 
 
 def _env():
-    import os
     env = dict(os.environ)
     # These subprocess-driven sends must exercise CWD-derivation deterministically,
     # not whichever real pane happens to be running pytest (SABLE-ssd8: pytest's
@@ -100,6 +103,89 @@ def _env():
     env.pop("SABLE_WORKER_PANE", None)
     env.pop("SABLE_BEAD", None)
     return env
+
+
+def test_seat_gate_annotates_the_created_bead_afterward(tmp_path):
+    """A successful seat `bd create` is annotated through a real bd store.
+
+    This is deliberately integration-tier coverage: initializing Dolt and
+    verifying the hook's real follow-up write sampled above the ordinary
+    10-second test budget (SABLE-kdn3y).
+    """
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    if shutil.which("bd") is None:
+        pytest.skip("bd not on PATH")
+    beads_root = tmp_path / "beads"
+    beads_root.mkdir()
+    init = subprocess.run(
+        ["bd", "init", "--prefix=sga"],
+        cwd=str(beads_root),
+        env={**os.environ, "BD_NON_INTERACTIVE": "1"},
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert init.returncode == 0, init.stdout + init.stderr
+    beads_db = str(beads_root / ".beads")
+
+    created = subprocess.run(
+        [
+            "bd",
+            "create",
+            "--title=found a defect",
+            "--description=text [no-test]",
+            "--type=task",
+        ],
+        env={**os.environ, "BEADS_DB": beads_db},
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert created.returncode == 0, created.stdout + created.stderr
+    bead_id = re.search(r"Created issue:\s*(\S+)", created.stdout).group(1)
+
+    hook_input = json.dumps(
+        {
+            "tool_input": {
+                "command": (
+                    'bd create --title="found a defect" '
+                    '--description="text [no-test]" --type=task'
+                )
+            },
+            "tool_response": {"stdout": created.stdout, "stderr": ""},
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(SEAT_GATE_HOOK)],
+        input=hook_input,
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "CLAUDE_AGENT_NAME": "chuck",
+            "CLAUDE_AGENT_ROLE": "manager",
+            "BEADS_DB": beads_db,
+        },
+        timeout=10,
+    )
+    assert result.returncode == 0
+
+    show = subprocess.run(
+        ["bd", "show", bead_id, "--json"],
+        env={**os.environ, "BEADS_DB": beads_db},
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    data = json.loads(show.stdout)
+    data = data[0] if isinstance(data, list) else data
+    assert "seat-filed" in (data.get("labels") or [])
+    assert (data.get("metadata") or {}).get("priority_provisional") in (
+        True,
+        "true",
+        "True",
+    )
 
 
 def test_read_recording_survives_non_utf8_delimiter_bytes(tmp_path):

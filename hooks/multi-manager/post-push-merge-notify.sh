@@ -53,8 +53,9 @@ print('---STDERR---')
 print(stderr)
 " 2>/dev/null) || exit 0
 
-CWD=$(echo "$PARSED" | sed -n '1p')
-COMMAND=$(echo "$PARSED" | sed -n '2p')
+CWD="${PARSED%%$'\n'*}"
+PARSED_REST="${PARSED#*$'\n'}"
+COMMAND="${PARSED_REST%%$'\n---STDOUT---'*}"
 
 # Only act on successful git push (SABLE-jpr: use shared matcher so
 # 'git -C <path> push' and other flag-interleaved forms are matched correctly)
@@ -98,8 +99,8 @@ sable_pp_trace "INVOKED cwd=${CWD} cmd=[${COMMAND}]"
 # can't catch this case on its own — remote tip == local HEAD looks identical
 # whether this push is the one that landed it or a resend of already-landed
 # content — so this text check stays as the no-op-specific leg.
-STDOUT_STDERR=$(echo "$PARSED" | sed -n '/---STDOUT---/,$p')
-if echo "$STDOUT_STDERR" | grep -qiE 'everything[[:space:]]+up-to-date'; then
+STDOUT_STDERR="${PARSED#*$'\n---STDOUT---'$'\n'}"
+if printf '%s' "$STDOUT_STDERR" | grep -qiE 'everything[[:space:]]+up-to-date'; then
   sable_pp_trace "EXIT no-op-push (everything up-to-date)"
   exit 0
 fi
@@ -285,8 +286,6 @@ fi
 # Try to detect PR URL via gh (best-effort, optional)
 PR_URL=$(gh pr view --json url -q .url 2>/dev/null || echo "")
 
-FILES_CSV=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')
-
 # --- Overlap scan against UNCONTAINED BRANCH REFS (SABLE-pfbjw) ------------
 # GROUND TRUTH, not declarations. The prior implementation intersected this
 # push's files against `bd list --status=in_progress`'s wip_claims metadata,
@@ -329,6 +328,10 @@ OVERLAPS=""
 if [ -z "$INTEGRATION_TIP" ]; then
   sable_pp_trace "OVERLAP-SCAN skipped unresolved-integration-ref ${INTEGRATION_REF}"
 else
+  declare -A PUSHED_FILE_SET=()
+  while IFS= read -r PUSHED_FILE; do
+    [ -n "$PUSHED_FILE" ] && PUSHED_FILE_SET["$PUSHED_FILE"]=1
+  done <<< "$FILES"
   CANDIDATE_REFS=$(git -C "$CWD" for-each-ref --format='%(refname:short)' 'refs/remotes/origin/wk-*' 2>/dev/null || echo "")
   OVERLAP_LINES=""
   while IFS= read -r CAND_REF; do
@@ -346,14 +349,13 @@ else
     CAND_FILES=$(git -C "$CWD" diff "${INTEGRATION_REF}...${CAND_REF}" --name-only 2>/dev/null)
     [ -z "$CAND_FILES" ] && continue
 
-    SHARED=$(FILES_CSV="$FILES_CSV" CAND_FILES="$CAND_FILES" python3 -c "
-import os
-pushed = set(f for f in os.environ.get('FILES_CSV', '').split(',') if f)
-cand = set(f for f in os.environ.get('CAND_FILES', '').split(chr(10)) if f)
-shared = sorted(pushed & cand)
-if shared:
-    print(','.join(shared))
-" 2>/dev/null)
+    SHARED=""
+    while IFS= read -r CAND_FILE; do
+      [ -n "$CAND_FILE" ] || continue
+      if [ "${PUSHED_FILE_SET[$CAND_FILE]:-0}" = "1" ]; then
+        SHARED="${SHARED}${SHARED:+,}${CAND_FILE}"
+      fi
+    done <<< "$CAND_FILES"
     [ -z "$SHARED" ] && continue
 
     # Label with any bead(s) declaring this branch — ANY status (the entire
@@ -387,11 +389,19 @@ fi
 # shared and WITH WHAT, instead of the previous bare, unactionable
 # "shares files with in-flight work" that cost a manual derivation to dismiss
 # on every false positive.
-OVERLAPS_BRIEF=$(printf '%s' "$OVERLAPS" | sed 's/^  - //' | tr '\n' ';' | sed 's/;$//' | sed 's/;/; /g')
+OVERLAPS_BRIEF="${OVERLAPS#  - }"
+OVERLAPS_BRIEF="${OVERLAPS_BRIEF//$'\n'/; }"
 
 # Brief basename list, shared by the message-based notifications below (the
 # worker-landing wake and the Chuck handoff).
-FILES_BRIEF=$(echo "$FILES" | sed 's#.*/##' | head -8 | tr '\n' ' ')
+FILES_BRIEF=""
+FILES_BRIEF_COUNT=0
+while IFS= read -r FILE_PATH; do
+  [ -n "$FILE_PATH" ] || continue
+  FILES_BRIEF="${FILES_BRIEF}${FILE_PATH##*/} "
+  FILES_BRIEF_COUNT=$((FILES_BRIEF_COUNT + 1))
+  [ "$FILES_BRIEF_COUNT" -ge 8 ] && break
+done <<< "$FILES"
 
 # SABLE-f916: both landing artifacts below (the live chuck message AND the
 # durable for-chuck bead fallback) were byte-identical in framing to what a

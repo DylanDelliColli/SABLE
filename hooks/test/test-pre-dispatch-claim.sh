@@ -94,6 +94,13 @@ exit 0
 STUB
 chmod +x "$STUB_DIR/bd"
 
+# Claims and dependency-merge warnings are independent hook interfaces. Keep
+# the advisory disabled for the claims matrix; its seven positive/negative
+# controls below explicitly re-enable it. This avoids rerunning the real
+# dependency checker against deliberately incomplete bd stubs in every claims
+# case.
+export SABLE_DEP_MERGE_GUARD=0
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -379,17 +386,32 @@ STUB
 chmod +x "$STUB_DIR/bd"
 
 # ---------------------------------------------------------------------------
-# INTEGRATION TEST — real bd in the project repo
+# INTEGRATION TEST — real bd in one isolated scratch repo
 # ---------------------------------------------------------------------------
-# Uses `bd q` to create a scratch bead in the real project DB, updates its
-# description to reference hooks/foo.sh, runs the real hook, then checks
-# WIP-CLAIMS was written. Closes the bead when done.
+# Initializes one small real store, creates scratch beads there, runs the real
+# hook from that repository, and checks WIP-CLAIMS through real bd readback.
+# The former fixture used SABLE's project store, making runtime proportional to
+# the live backlog and leaving test records in operational state.
 
 if ! command -v bd >/dev/null 2>&1; then
   echo "SKIP (integration): bd not found on PATH"
 else
+  REAL_BD_ROOT="$FIXTURE_DIR/real-bd"
+  REAL_BD_NOHOOKS="$FIXTURE_DIR/real-bd-nohooks"
+  mkdir -p "$REAL_BD_ROOT" "$REAL_BD_NOHOOKS"
+  git -C "$REAL_BD_ROOT" init -q
+  git -C "$REAL_BD_ROOT" config core.hooksPath "$REAL_BD_NOHOOKS"
+
+  real_bd() {
+    (cd "$REAL_BD_ROOT" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd "$@")
+  }
+
+  if ! (cd "$REAL_BD_ROOT" && env -u BEADS_DB BD_NON_INTERACTIVE=1 \
+        bd init --prefix=sable --non-interactive >/dev/null 2>&1); then
+    echo "SKIP (integration): could not initialize isolated real-bd fixture"
+  else
   # Create a scratch bead with a description mentioning hooks/foo.sh
-  SCRATCH_ID=$(bd create --sandbox \
+  SCRATCH_ID=$(real_bd create --sandbox \
     --title="[int-test] pre-dispatch-claim scratch bead" \
     --description="hooks/foo.sh is the implementation file for this scratch bead" \
     --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
@@ -399,18 +421,19 @@ else
   else
     echo "Integration: created scratch bead $SCRATCH_ID"
     # Add [no-test] immediately so tdd-gate won't block the close at the end
-    bd update "$SCRATCH_ID" --sandbox --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
+    real_bd update "$SCRATCH_ID" --sandbox --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
 
     # Run real hook with scratch bead ID in the dispatch prompt.
-    # Do NOT use stub bd — use real bd so WIP-CLAIMS is written to the real DB.
+    # Do NOT use stub bd — use the isolated real store.
     make_dispatch_input "${SCRATCH_ID}: implement the feature — hooks/foo.sh needs updating" | \
-      env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
-          SABLE_AGENTS_YAML="$AGENTS_YAML" \
-          SABLE_MODE_STATE="$EXEC_MODE_FILE" \
-          bash "$HOOK" 2>/dev/null
+      (cd "$REAL_BD_ROOT" && \
+       env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
+           SABLE_AGENTS_YAML="$AGENTS_YAML" \
+           SABLE_MODE_STATE="$EXEC_MODE_FILE" \
+           bash "$HOOK" 2>/dev/null)
 
     # Check that wip_claims landed in the bead's metadata (SABLE-szd)
-    CLAIMS=$(bd show "$SCRATCH_ID" --json 2>/dev/null | python3 -c "
+    CLAIMS=$(real_bd show "$SCRATCH_ID" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -427,32 +450,29 @@ except Exception:
            "metadata: '$CLAIMS'"
     fi
 
-    # Clean up: close the scratch bead
-    bd close "$SCRATCH_ID" --sandbox 2>/dev/null || true
+    # Reuse this isolated bead for the remaining real-bd legs. Clear the claim
+    # so the manager-subagent path must write it again.
+    real_bd update "$SCRATCH_ID" --sandbox --unset-metadata wip_claims >/dev/null 2>&1
   fi
 
   # --- Integration (SABLE-uz9.9): MANAGER-SUBAGENT native dispatch, real bd ---
   # The new path with NO env identity: identity is purely the subagent
   # agent_type=optimus. Proves the real hook + real lib-identity + real bd DB
   # compose to land WIP-CLAIMS for a manager-subagent dispatch.
-  SCRATCH_ID2=$(bd create --sandbox \
-    --title="[int-test] pre-dispatch-claim manager-subagent scratch" \
-    --description="hooks/foo.sh is the implementation file for this scratch bead" \
-    --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+  SCRATCH_ID2="${SCRATCH_ID:-}"
 
   if [ -z "$SCRATCH_ID2" ]; then
     echo "SKIP (integration): could not create manager-subagent scratch bead"
   else
     echo "Integration: created manager-subagent scratch bead $SCRATCH_ID2"
-    bd update "$SCRATCH_ID2" --sandbox --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
-
     make_manager_subagent_input "${SCRATCH_ID2}: implement the feature — hooks/foo.sh needs updating" "optimus" | \
-      env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE \
-          SABLE_AGENTS_YAML="$AGENTS_YAML" \
-          SABLE_MODE_STATE="$EXEC_MODE_FILE" \
-          bash "$HOOK" 2>/dev/null
+      (cd "$REAL_BD_ROOT" && \
+       env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE \
+           SABLE_AGENTS_YAML="$AGENTS_YAML" \
+           SABLE_MODE_STATE="$EXEC_MODE_FILE" \
+           bash "$HOOK" 2>/dev/null)
 
-    CLAIMS2=$(bd show "$SCRATCH_ID2" --json 2>/dev/null | python3 -c "
+    CLAIMS2=$(real_bd show "$SCRATCH_ID2" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -469,7 +489,7 @@ except Exception:
            "metadata: '$CLAIMS2'"
     fi
 
-    bd close "$SCRATCH_ID2" --sandbox 2>/dev/null || true
+    real_bd update "$SCRATCH_ID2" --sandbox --unset-metadata wip_claims >/dev/null 2>&1
   fi
 
   # -------------------------------------------------------------------------
@@ -480,10 +500,7 @@ except Exception:
   # asserts claims persist." Real bd, no mocks — this is the exact failure
   # mode that motivated the metadata migration (SABLE-szd) and recurred live
   # as a near-miss on SABLE-cmar4.1 (SABLE-sm269).
-  SCRATCH_ID3=$(bd create --sandbox \
-    --title="[int-test] pre-dispatch-claim notes-clobber regression" \
-    --description="[no-test] hooks/foo.sh is the implementation file for this scratch bead" \
-    --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+  SCRATCH_ID3="${SCRATCH_ID:-}"
 
   if [ -z "$SCRATCH_ID3" ]; then
     echo "SKIP (integration): could not create notes-clobber scratch bead"
@@ -491,13 +508,13 @@ except Exception:
     echo "Integration: created notes-clobber scratch bead $SCRATCH_ID3"
 
     # Establish the claim exactly as the hook does (real --set-metadata write).
-    bd update "$SCRATCH_ID3" --sandbox --set-metadata "wip_claims=a.sh,b.sh" >/dev/null 2>&1
+    real_bd update "$SCRATCH_ID3" --sandbox --set-metadata "wip_claims=a.sh,b.sh" >/dev/null 2>&1
 
     # Simulate the exact SABLE-szd/sm269 trigger: an unrelated notes write from
     # elsewhere in a bead's life (e.g. a manager's routine review-step note).
-    bd update "$SCRATCH_ID3" --sandbox --notes "manager review note" >/dev/null 2>&1
+    real_bd update "$SCRATCH_ID3" --sandbox --notes "manager review note" >/dev/null 2>&1
 
-    CLAIMS3=$(bd show "$SCRATCH_ID3" --json 2>/dev/null | python3 -c "
+    CLAIMS3=$(real_bd show "$SCRATCH_ID3" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -517,7 +534,7 @@ except Exception:
     # Positive control: the notes write really did replace notes — otherwise a
     # pass above would be vacuous (bd never being destructive to notes at all,
     # rather than the metadata field specifically being immune to it).
-    NOTES3=$(bd show "$SCRATCH_ID3" --json 2>/dev/null | python3 -c "
+    NOTES3=$(real_bd show "$SCRATCH_ID3" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -534,27 +551,23 @@ except Exception:
            "notes: '$NOTES3'"
     fi
 
-    bd close "$SCRATCH_ID3" --sandbox 2>/dev/null || true
   fi
 
   # --- SABLE-6la1: sibling-key --set-metadata merges, doesn't clobber ---------
   # The whole design relies on --set-metadata writing one key at a time without
   # disturbing siblings: proves setting a second, unrelated key leaves an
   # already-established wip_claims intact.
-  SCRATCH_ID4=$(bd create --sandbox \
-    --title="[int-test] pre-dispatch-claim sibling-key metadata merge" \
-    --description="[no-test] hooks/foo.sh is the implementation file for this scratch bead" \
-    --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+  SCRATCH_ID4="${SCRATCH_ID:-}"
 
   if [ -z "$SCRATCH_ID4" ]; then
     echo "SKIP (integration): could not create sibling-key scratch bead"
   else
     echo "Integration: created sibling-key scratch bead $SCRATCH_ID4"
 
-    bd update "$SCRATCH_ID4" --sandbox --set-metadata "wip_claims=x.sh" >/dev/null 2>&1
-    bd update "$SCRATCH_ID4" --sandbox --set-metadata "otherkey=y" >/dev/null 2>&1
+    real_bd update "$SCRATCH_ID4" --sandbox --set-metadata "wip_claims=x.sh" >/dev/null 2>&1
+    real_bd update "$SCRATCH_ID4" --sandbox --set-metadata "otherkey=y" >/dev/null 2>&1
 
-    META4=$(bd show "$SCRATCH_ID4" --json 2>/dev/null | python3 -c "
+    META4=$(real_bd show "$SCRATCH_ID4" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -572,7 +585,8 @@ except Exception:
            "expected 'x.sh | y', got: '$META4'"
     fi
 
-    bd close "$SCRATCH_ID4" --sandbox 2>/dev/null || true
+    real_bd close "$SCRATCH_ID4" --sandbox 2>/dev/null || true
+  fi
   fi
 fi
 
@@ -662,6 +676,7 @@ run_hook_dep() {
     env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
         SABLE_AGENTS_YAML="$AGENTS_YAML" \
         SABLE_MODE_STATE="$EXEC_MODE_FILE" \
+        SABLE_DEP_MERGE_GUARD=1 \
         SABLE_DEP_CHECK_BIN="$REPO/bin/sable-dep-check" \
         DEP_BLOCKER_STATUS="${1:-closed}" \
         DEP_DEP_TYPE="${2:-blocks}" \
@@ -751,6 +766,7 @@ DEP_OUT=$(make_dispatch_input_cwd "SABLE-dep: implement hooks/foo.sh" "$DEP_REPO
   env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
       SABLE_AGENTS_YAML="$AGENTS_YAML" \
       SABLE_MODE_STATE="$EXEC_MODE_FILE" \
+      SABLE_DEP_MERGE_GUARD=1 \
       SABLE_DEP_CHECK_BIN="$DEP_DIR/does-not-exist" \
       PATH="$DEP_STUB:/usr/bin:/bin" \
       bash "$HOOK" 2>/dev/null) || DEP_RC=$?

@@ -127,6 +127,13 @@ EOF
 chmod +x "$STUB_DIR/sable-msg"
 export SABLE_MSG_LOG
 
+# Preview dispatch has its own real end-to-end authority in test-preview-kick.sh.
+# This suite asserts notification, identity, overlap, and durable-fallback
+# behavior; letting every confirmed-push case launch a detached real
+# sable-merge-gate preview adds dozens of unobserved CI preparations and races
+# teardown without strengthening any assertion here.
+export SABLE_PREVIEW_KICK=0
+
 # Unified tmux stub. Two probes shell out to tmux and both are stubbed here so
 # every hook invocation is hermetic (never touches the operator's real tmux
 # server):
@@ -203,6 +210,7 @@ run_hook() {
   local env_prefix="$1" json="$2"
   env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" \
     SABLE_MSG_LOG="$SABLE_MSG_LOG" SABLE_MSG_STUB_RC="${SABLE_MSG_STUB_RC:-1}" \
+    SABLE_PREVIEW_KICK="$SABLE_PREVIEW_KICK" \
     SABLE_HOOK_TRACE_LOG="$STUB_DIR/hook-trace.log" \
     $env_prefix bash "$HOOK" <<< "$json" 2>/dev/null
 }
@@ -407,7 +415,8 @@ rm -f "$BD_LOG"
 # (the silent-failure regression: a dereference of $CLAUDE_AGENT_NAME would kill
 # the hook before bd create and drop the Chuck handoff).
 MEMBER_INPUT_T=$(make_member_post_input "git push" "$FIXTURE_REPO" "tarzan")
-ERR=$(env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" SABLE_AGENTS_YAML="$FIX_YAML" bash "$HOOK" <<< "$MEMBER_INPUT_T" 2>&1 >/dev/null); RC=$?
+ERR=$(env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" SABLE_AGENTS_YAML="$FIX_YAML" \
+  SABLE_PREVIEW_KICK=0 bash "$HOOK" <<< "$MEMBER_INPUT_T" 2>&1 >/dev/null); RC=$?
 if [ "$RC" -eq 0 ] && ! echo "$ERR" | grep -qi "unbound variable"; then
   pass "unset CLAUDE_AGENT_NAME: hook survives set -u (exit 0, no unbound variable)"
 else
@@ -1646,6 +1655,7 @@ else
   rm -f "$BD_LOG" "$SABLE_MSG_LOG"
   env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" \
     SABLE_MSG_LOG="$SABLE_MSG_LOG" SABLE_MSG_STUB_RC=0 \
+    SABLE_PREVIEW_KICK=0 \
     SABLE_HOOK_TRACE_LOG="$STUB_DIR/hook-trace-plant.log" \
     $MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker UNIT_BEAD_STATUS=in_progress UNIT_BEAD_ID=SABLE-gxunit \
     bash "$MUTATED_HOOK" <<< "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null 2>&1
@@ -1738,6 +1748,7 @@ else
   rm -f "$BD_LOG" "$SABLE_MSG_LOG"
   env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" \
     SABLE_MSG_LOG="$SABLE_MSG_LOG" SABLE_MSG_STUB_RC=0 \
+    SABLE_PREVIEW_KICK=0 \
     SABLE_HOOK_TRACE_LOG="$STUB_DIR/hook-trace-plant-card.log" \
     $MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker UNIT_BEAD_BUNDLE_FILE=$GX_BUNDLE_PARTIAL \
     bash "$CARDINALITY_MUTANT" <<< "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null 2>&1
@@ -1765,9 +1776,8 @@ EOF
 chmod +x "$STUB_DIR/bd"
 
 # --------------------------------------------------------------------------
-# INTEGRATION SABLE-gx7p3 — real bd in the project repo, real hook invocation,
-# no mocks of bd. Creates a scratch bead in the real, shared project Dolt db
-# (--sandbox on every write, never pushed to the shared remote) carrying the
+# INTEGRATION SABLE-gx7p3 — real bd in one isolated per-suite store, real hook
+# invocation, no mocks of bd. Creates a scratch bead carrying the
 # `branch` metadata sable-spawn-worker writes at dispatch time, pushes a real
 # worker branch naming it, and asserts the delivered worker-landing message
 # reflects the bead's REAL status rather than an assumed one.
@@ -1793,8 +1803,26 @@ chmod +x "$STUB_DIR/bd"
 # stubbed, the same scope the rest of this suite stubs them at.
 # --------------------------------------------------------------------------
 
-if ! command -v bd >/dev/null 2>&1; then
-  echo "SKIP (integration SABLE-gx7p3): bd not found on PATH"
+POST_BD_ROOT=""
+POST_BD_DB=""
+if command -v bd >/dev/null 2>&1; then
+  POST_BD_ROOT=$(mktemp -d)
+  POST_BD_NOHOOKS="$POST_BD_ROOT/nohooks"
+  mkdir -p "$POST_BD_NOHOOKS"
+  git -C "$POST_BD_ROOT" init -q
+  git -C "$POST_BD_ROOT" config core.hooksPath "$POST_BD_NOHOOKS"
+  if (cd "$POST_BD_ROOT" && env -u BEADS_DB BD_NON_INTERACTIVE=1 \
+      bd init --prefix=postnotify --non-interactive >/dev/null 2>&1); then
+    POST_BD_DB="$POST_BD_ROOT/.beads"
+  fi
+fi
+
+post_bd() {
+  env BEADS_DB="$POST_BD_DB" BD_NON_INTERACTIVE=1 bd "$@"
+}
+
+if [ -z "$POST_BD_DB" ]; then
+  echo "SKIP (integration SABLE-gx7p3): could not initialize isolated real-bd fixture"
 else
   GX_BARE=$(mktemp -d)
   GX_REPO=$(mktemp -d)
@@ -1807,7 +1835,7 @@ else
   # real EXIT time); GX_BRANCH is unset if the script dies before reaching its
   # assignment, in which case no push happened yet either — the guard makes
   # that a no-op rather than an error under set -u.
-  trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$GX_BARE" "$GX_REPO" "$GX_INT_STUB"; [ -n "${GX_BRANCH:-}" ] && command -v gx7p3_cleanup_stray_forchuck >/dev/null 2>&1 && gx7p3_cleanup_stray_forchuck "$GX_BRANCH"' EXIT
+  trap '[ -n "${GX_BRANCH:-}" ] && command -v gx7p3_cleanup_stray_forchuck >/dev/null 2>&1 && gx7p3_cleanup_stray_forchuck "$GX_BRANCH"; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$GX_BARE" "$GX_REPO" "$GX_INT_STUB" "$POST_BD_ROOT"' EXIT
 
   # Safety-net teardown (requirement 2): find and close/relabel ANY real
   # for-chuck bead naming $1, regardless of whether the assertions above it
@@ -1816,7 +1844,7 @@ else
   # that let the incident's stray beads go unnoticed.
   gx7p3_cleanup_stray_forchuck() {
     local branch="$1" ids
-    ids=$(bd list --status open,in_progress --label for-chuck --title-contains "$branch" --json 2>/dev/null \
+    ids=$(post_bd list --status open,in_progress --label for-chuck --title-contains "$branch" --json 2>/dev/null \
       | python3 -c "
 import json, sys
 try:
@@ -1830,8 +1858,8 @@ for i in d:
     for id in $ids; do
       [ -z "$id" ] && continue
       echo "SABLE-gx7p3 integration safety net: stray for-chuck bead $id named branch $branch — closing as test artifact"
-      bd update "$id" --sandbox --notes "[no-test] SABLE-gx7p3 integration-test safety net: this for-chuck bead names a scratch branch ($branch) that only ever existed in a test fixture. Closing immediately as test pollution." 2>/dev/null || true
-      bd close "$id" --sandbox --reason "SABLE-gx7p3 integration-test safety-net cleanup (test-fixture branch, never real work)" 2>/dev/null || true
+      post_bd update "$id" --sandbox --notes "[no-test] SABLE-gx7p3 integration-test safety net: this for-chuck bead names a scratch branch ($branch) that only ever existed in a test fixture. Closing immediately as test pollution." 2>/dev/null || true
+      post_bd close "$id" --sandbox --reason "SABLE-gx7p3 integration-test safety-net cleanup (test-fixture branch, never real work)" 2>/dev/null || true
     done
   }
 
@@ -1852,7 +1880,7 @@ for i in d:
   git update-ref "refs/remotes/origin/$GX_BRANCH" HEAD
   cd - >/dev/null
 
-  GX_SCRATCH_ID=$(bd create --sandbox \
+  GX_SCRATCH_ID=$(post_bd create --sandbox \
     --title="[int-test] SABLE-gx7p3 scratch bead for ${GX_BRANCH}" \
     --description="Scratch bead created by hooks/test/test-post-push-merge-notify.sh (SABLE-gx7p3 integration test) to verify the worker-landing auto-notify states only the bead's OBSERVED status. [no-test] — safe to close immediately, no code of its own." \
     --type=task \
@@ -1862,7 +1890,7 @@ for i in d:
     echo "SKIP (integration SABLE-gx7p3): could not create scratch bead — bd create output did not match ID pattern"
   else
     echo "Integration SABLE-gx7p3: created scratch bead $GX_SCRATCH_ID for branch $GX_BRANCH"
-    bd update "$GX_SCRATCH_ID" --sandbox --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
+    post_bd update "$GX_SCRATCH_ID" --sandbox --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
 
     # sable-msg/tmux stubs model a REACHABLE chuck who CONFIRMS delivery
     # (rc=0) — the message-first path this hook prefers — so the real
@@ -1894,7 +1922,7 @@ EOF
     # closure.
     INT_GX_INPUT=$(make_post_input "git push" "$GX_REPO")
     CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager TMUX_PANE=%gxinttest \
-      PATH="$GX_INT_STUB:$PATH" GX_MSG_LOG="$GX_MSG_LOG" \
+      PATH="$GX_INT_STUB:$PATH" GX_MSG_LOG="$GX_MSG_LOG" BEADS_DB="$POST_BD_DB" \
       bash "$HOOK" <<< "$INT_GX_INPUT" >/dev/null 2>&1
     gx7p3_cleanup_stray_forchuck "$GX_BRANCH"
 
@@ -1921,7 +1949,7 @@ EOF
     else
       fail "integration SABLE-gx7p3 NEGATIVE CONTROL: chuck handoff message still genuinely fires (notify not silenced)" "MSG_LOG: $(cat "$GX_MSG_LOG" 2>/dev/null)"
     fi
-    GX_STRAY_CHECK=$(bd list --status all --label for-chuck --title-contains "$GX_BRANCH" --json 2>/dev/null || echo "")
+    GX_STRAY_CHECK=$(post_bd list --status all --label for-chuck --title-contains "$GX_BRANCH" --json 2>/dev/null || echo "")
     if [ -z "$GX_STRAY_CHECK" ] || [ "$GX_STRAY_CHECK" = "[]" ] || [ "$GX_STRAY_CHECK" = "null" ]; then
       pass "integration SABLE-gx7p3 NEGATIVE CONTROL: no stray for-chuck bead was created for this fake branch (no pool pollution)"
     else
@@ -1931,7 +1959,7 @@ EOF
     # (2) POSITIVE CONTROL: close the bead for real, push a second commit on
     # the SAME branch (metadata association unchanged), and confirm the
     # notify DOES state closure once bd actually shows it closed.
-    bd close "$GX_SCRATCH_ID" --sandbox --reason "integration test complete" 2>/dev/null || true
+    post_bd close "$GX_SCRATCH_ID" --sandbox --reason "integration test complete" 2>/dev/null || true
     : > "$GX_MSG_LOG"
     cd_fixture "$GX_REPO"
     git checkout -q "$GX_BRANCH"
@@ -1942,7 +1970,7 @@ EOF
 
     INT_GX_INPUT2=$(make_post_input "git push" "$GX_REPO")
     CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager TMUX_PANE=%gxinttest \
-      PATH="$GX_INT_STUB:$PATH" GX_MSG_LOG="$GX_MSG_LOG" \
+      PATH="$GX_INT_STUB:$PATH" GX_MSG_LOG="$GX_MSG_LOG" BEADS_DB="$POST_BD_DB" \
       bash "$HOOK" <<< "$INT_GX_INPUT2" >/dev/null 2>&1
     gx7p3_cleanup_stray_forchuck "$GX_BRANCH"
 
@@ -1952,7 +1980,7 @@ EOF
     else
       fail "integration SABLE-gx7p3 POSITIVE CONTROL: genuinely closed bead — notify states closure" "MSG_LOG: $(cat "$GX_MSG_LOG" 2>/dev/null)"
     fi
-    GX_STRAY_CHECK2=$(bd list --status all --label for-chuck --title-contains "$GX_BRANCH" --json 2>/dev/null || echo "")
+    GX_STRAY_CHECK2=$(post_bd list --status all --label for-chuck --title-contains "$GX_BRANCH" --json 2>/dev/null || echo "")
     if [ -z "$GX_STRAY_CHECK2" ] || [ "$GX_STRAY_CHECK2" = "[]" ] || [ "$GX_STRAY_CHECK2" = "null" ]; then
       pass "integration SABLE-gx7p3 NEGATIVE CONTROL: no stray for-chuck bead after the positive-control push either"
     else
@@ -2131,6 +2159,7 @@ if [ "$PFBJW_PLANT_RC" -ne 0 ] || [ ! -s "$PFBJW_MUTANT" ]; then
 else
   rm -f "$BD_LOG" "$SABLE_MSG_LOG"
   env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" SABLE_MSG_LOG="$SABLE_MSG_LOG" SABLE_MSG_STUB_RC=0 \
+    SABLE_PREVIEW_KICK=0 \
     SABLE_HOOK_TRACE_LOG="$STUB_DIR/hook-trace-pfbjw-plant.log" \
     $MGR_ENV bash "$PFBJW_MUTANT" <<< "$PFBJW_NEWFILES_INPUT" >/dev/null 2>&1
 
@@ -2157,16 +2186,16 @@ EOF
 chmod +x "$STUB_DIR/bd"
 
 # --------------------------------------------------------------------------
-# INTEGRATION SABLE-pfbjw — real bd, real git, no mocks of either. Creates a
-# scratch bead in the real project Dolt db (--sandbox on every write, never
-# pushed to the shared remote), closes it immediately (modeling the fleet's
+# INTEGRATION SABLE-pfbjw — real bd, real git, no mocks of either. Reuses the
+# suite's isolated real store and closes its scratch bead immediately (modeling
+# the fleet's
 # normal end state), and confirms a genuinely overlapping push against its
 # still-uncontained branch warns anyway — the property no declaration-based
 # implementation (bd status OR wip_claims) can pass, per optimus.
 # --------------------------------------------------------------------------
 
-if ! command -v bd >/dev/null 2>&1; then
-  echo "SKIP (integration SABLE-pfbjw): bd not found on PATH"
+if [ -z "$POST_BD_DB" ]; then
+  echo "SKIP (integration SABLE-pfbjw): isolated real-bd fixture unavailable"
 else
   PFI_BARE=$(mktemp -d)
   PFI_REPO=$(mktemp -d)
@@ -2176,7 +2205,7 @@ else
   pfbjw_cleanup_stray_forchuck() {
     local branch="$1" ids
     [ -z "$branch" ] && return 0
-    ids=$(bd list --status open,in_progress --label for-chuck --title-contains "$branch" --json 2>/dev/null \
+    ids=$(post_bd list --status open,in_progress --label for-chuck --title-contains "$branch" --json 2>/dev/null \
       | python3 -c "
 import json, sys
 try:
@@ -2189,11 +2218,11 @@ for i in d:
 " 2>/dev/null)
     for id in $ids; do
       [ -z "$id" ] && continue
-      bd update "$id" --sandbox --notes "[no-test] SABLE-pfbjw integration-test safety net: scratch branch ($branch), test fixture only." 2>/dev/null || true
-      bd close "$id" --sandbox --reason "SABLE-pfbjw integration-test safety-net cleanup" 2>/dev/null || true
+      post_bd update "$id" --sandbox --notes "[no-test] SABLE-pfbjw integration-test safety net: scratch branch ($branch), test fixture only." 2>/dev/null || true
+      post_bd close "$id" --sandbox --reason "SABLE-pfbjw integration-test safety-net cleanup" 2>/dev/null || true
     done
   }
-  trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$PFBJW_BARE" "$PFBJW_REPO" "$PFI_BARE" "$PFI_REPO" "$PFI_STUB"; [ -n "${PFI_BRANCH:-}" ] && command -v pfbjw_cleanup_stray_forchuck >/dev/null 2>&1 && pfbjw_cleanup_stray_forchuck "$PFI_BRANCH"' EXIT
+  trap '[ -n "${PFI_BRANCH:-}" ] && command -v pfbjw_cleanup_stray_forchuck >/dev/null 2>&1 && pfbjw_cleanup_stray_forchuck "$PFI_BRANCH"; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$PFBJW_BARE" "$PFBJW_REPO" "$PFI_BARE" "$PFI_REPO" "$PFI_STUB" "$POST_BD_ROOT"' EXIT
 
   cat > "$PFI_STUB/sable-msg" <<'EOF'
 #!/usr/bin/env bash
@@ -2242,7 +2271,7 @@ EOF
   # Real bd: create a bead for the occupant branch, then CLOSE it immediately
   # (the fleet's normal end state) BEFORE the pusher's push runs. If the scan
   # were bd-status-gated in any way, a closed occupant would be invisible.
-  PFI_SCRATCH_ID=$(bd create --sandbox \
+  PFI_SCRATCH_ID=$(post_bd create --sandbox \
     --title="[int-test] SABLE-pfbjw scratch bead for ${PFI_OCC_BRANCH}" \
     --description="Scratch bead created by hooks/test/test-post-push-merge-notify.sh (SABLE-pfbjw integration test) to verify the overlap scan warns on a genuinely overlapping CLOSED-but-unlanded branch (the skrdj/qwthx shape). [no-test] — safe to close immediately, no code of its own." \
     --type=task \
@@ -2250,11 +2279,11 @@ EOF
   if [ -z "$PFI_SCRATCH_ID" ]; then
     echo "SKIP (integration SABLE-pfbjw): could not create scratch bead — bd create output did not match ID pattern"
   else
-    bd close "$PFI_SCRATCH_ID" --sandbox --reason "SABLE-pfbjw integration test: modeling closed-but-unlanded" 2>/dev/null || true
+    post_bd close "$PFI_SCRATCH_ID" --sandbox --reason "SABLE-pfbjw integration test: modeling closed-but-unlanded" 2>/dev/null || true
 
     PFI_INPUT=$(make_post_input "git push" "$PFI_REPO")
     CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
-      PATH="$PFI_STUB:$PATH" PFI_MSG_LOG="$PFI_MSG_LOG" \
+      PATH="$PFI_STUB:$PATH" PFI_MSG_LOG="$PFI_MSG_LOG" BEADS_DB="$POST_BD_DB" \
       bash "$HOOK" <<< "$PFI_INPUT" >/dev/null 2>&1
     pfbjw_cleanup_stray_forchuck "$PFI_BRANCH"
     pfbjw_cleanup_stray_forchuck "$PFI_OCC_BRANCH"

@@ -2535,6 +2535,24 @@ def test_the_tier_runs_suites_under_isolated_home_and_tmp(isolated_lock, tmp_pat
         f"two concurrent run_impact_tier calls shared a scratch parent: {parents}")
 
 
+def test_explicit_bd_subprocess_override_does_not_initialize_host_bd(tmp_path, monkeypatch):
+    """The documented SABLE_MG_BD seam is authoritative for injected runs.
+
+    A host `bd` installation must not leak around that seam and build an
+    unrelated real store before the configured test double is invoked.
+    """
+    fake_bd = tmp_path / "fake-bd"
+    fake_bd.write_text("#!/bin/sh\nexit 0\n")
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("SABLE_MG_BD", str(fake_bd))
+    monkeypatch.setattr(promote_lib.shutil, "which", _REAL_SHUTIL_WHICH)
+
+    env = promote_lib._impact_isolated_env(tmp_path)
+
+    assert "BEADS_DB" not in env
+    assert not (tmp_path / "beads").exists()
+
+
 @pytest.mark.skipif(not HAVE_BD, reason="nothing to isolate a bd DB from without bd on PATH")
 def test_bd_absent_env_still_isolates_home_but_bd_present_isolates_beads_db(tmp_path,
                                                                             monkeypatch):

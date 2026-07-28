@@ -237,6 +237,12 @@ EOF
 
 export SABLE_MERGE_GATE_STATE="$STATE"
 export SABLE_MG_IMPACT="bash $TIER"
+# S1-S6/S8-S9 exercise locking and window semantics with an injected tier body;
+# their bead store is deliberately irrelevant. Respect the gate's documented
+# subprocess seam so those runs do not cold-initialize a real bd database.
+# S7 explicitly unsets this override below: it is the one authority that
+# creates real beads and proves the per-run BEADS_DB isolation boundary.
+export SABLE_MG_BD=true
 unset SABLE_MG_IMPACT_LOCK SABLE_MG_IMPACT_SERIALIZE SABLE_MG_IMPACT_LOCK_TIMEOUT
 
 # ==========================================================================
@@ -384,7 +390,7 @@ exit 0
 PROBE
 chmod +x "$BDPROBE"
 
-run_pair "$TMPROOT/hermetic.jsonl" env SABLE_MG_IMPACT_SERIALIZE=0 \
+run_pair "$TMPROOT/hermetic.jsonl" env -u SABLE_MG_BD SABLE_MG_IMPACT_SERIALIZE=0 \
   SABLE_MG_IMPACT="bash $BDPROBE"
 
 if [ "$RC1" -eq 0 ] && [ "$RC2" -eq 0 ]; then
