@@ -24,13 +24,11 @@
 #
 # ── Silent-green guard (SABLE-7v3z / SABLE-lcevs) ────────────────────────────
 # pytest runs the WHOLE bin/ directory (auto-discovery, no testpaths/--ignore),
-# so no bin/ test can exist-but-not-run. The shell run-set's --manifest step
-# prints every hooks/test/test-*.sh as RUN / EXCLUDED(reason) / UNCLASSIFIED —
-# readable, but a ::warning:: annotation alone never fails a job (SABLE-lcevs:
-# this was the fail-OPEN gap that let a branch land fully green with new
-# suites UNCLASSIFIED and never executed). The --check step right after it is
-# the enforcement: same detection, but exits non-zero on any UNCLASSIFIED
-# suite or stale run-set entry, so this step is what actually blocks the gate.
+# so no bin/ test can exist-but-not-run. The sealed verifier's static lane runs
+# shell-run-set --check, which prints every hooks/test/test-*.sh as RUN /
+# EXCLUDED(reason) / UNCLASSIFIED AND exits non-zero on any UNCLASSIFIED suite
+# or stale run-set entry. One enforced pass supplies both readable evidence and
+# the fail-closed verdict; a separate --manifest pass would duplicate it.
 #
 # ── Cost (SABLE-oeci gotcha 5) ───────────────────────────────────────────────
 # Single job, no matrix. (Repo is public, so Actions minutes are free; kept lean
@@ -192,47 +190,13 @@ jobs:
           command -v bd   >/dev/null 2>&1 && echo "::warning::bd unexpectedly present in clean-room (SABLE-59zu)"   || true
           command -v dolt >/dev/null 2>&1 && echo "::warning::dolt unexpectedly present in clean-room (SABLE-59zu)" || true
 
-      - name: pytest — full bin/ suite (unit + integration; bd/dolt suites self-skip)
+      - name: Sealed verification — full Python + serial shell + static authority
         if: steps.dedup.outputs.already_verified != 'true'
         run: |
-          # The full bin/ suite runs with NOTHING deselected — auto-discovery,
-          # no testpaths/--ignore, so no bin/ test can exist-but-not-run
-          # (silent-green guard, SABLE-7v3z). The two tests once deselected here
-          # for shared-runner flakiness are both fixed and re-enabled:
-          #   - test_two_concurrent_wrappers_serialize (SABLE-l7gd): lock TOCTOU
-          #     race (create-then-write + unconditional stale-lock unlink) fixed.
-          #   - test_reap_protects_done_pane_in_attached_clients_current_window
-          #     (SABLE-7dva): the pty-attached tmux client now registers
-          #     headlessly (TERM set, own session, drained master fd) instead of
-          #     never attaching on the CI clean-room.
-          python -m pytest bin/ -q -p no:cacheprovider
-
-      - name: Fixture isolation tripwire (SABLE-0ssz.2 — ban unsandboxed real-repo git ops)
-        if: steps.dedup.outputs.already_verified != 'true'
-        run: |
-          # Static ban on the escape class behind the 2026-07-14 P0s (SABLE-xydb
-          # push-to-real-main, SABLE-a5a5 config-to-shared-.git/config): any
-          # test fixture that runs an unguarded-cd or an explicit git -C
-          # <real-repo> mutation reds the gate here, at CI time, not by the next
-          # P0. Known/tracked violations are excused via KNOWN_VIOLATIONS.
-          python bin/sable-fixture-tripwire
-
-      - name: Shell run-set coverage manifest (SABLE-7v3z — exclusions are visible)
-        if: steps.dedup.outputs.already_verified != 'true'
-        run: bash .github/ci/shell-run-set.sh --manifest
-
-      - name: Shell run-set fail-closed check (SABLE-lcevs — UNCLASSIFIED/stale blocks the gate)
-        if: steps.dedup.outputs.already_verified != 'true'
-        run: bash .github/ci/shell-run-set.sh --check
-
-      - name: Test-load declarations (SABLE-ssu6v — nested runners are explicit)
-        if: steps.dedup.outputs.already_verified != 'true'
-        run: python bin/columbo-cost-prefilter.py --check-load-declarations
-
-      - name: Shell impact manifest — lib fan-out completeness (SABLE-cmar4.2)
-        if: steps.dedup.outputs.already_verified != 'true'
-        run: bash .github/ci/impact-manifest.sh --check
-
-      - name: hooks/test shell suites (known-green allowlist)
-        if: steps.dedup.outputs.already_verified != 'true'
-        run: bash .github/ci/shell-run-set.sh --run
+          # One Actions job remains one preview slot. Inside that dedicated
+          # runner, three independently fail-closed lanes overlap:
+          #   - the complete bin/ pytest discovery (nothing deselected),
+          #   - every shell ALLOW suite through its existing serial runner,
+          #   - fixture/classification/load/fan-out static authority.
+          # Each lane must leave a parseable result; missing evidence is RED.
+          bash .github/ci/run-sealed-verification.sh

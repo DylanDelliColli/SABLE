@@ -120,6 +120,7 @@ ALLOW=(
   test-sable-test.sh
   test-sable-worker-status.sh
   test-script-dir-symlink.sh
+  test-sealed-verification.sh
   test-session-role-anchor.sh
   test-shell-run-set-strict.sh
   test-sherlock-research.sh
@@ -235,7 +236,8 @@ declare -A COVERS=(
   [test-pre-dispatch-model-check.sh]="hooks/multi-manager/pre-dispatch-model-check.sh"
   [test-pre-dispatch-preempt.sh]="hooks/multi-manager/pre-dispatch-preempt.sh"
   [test-pre-dispatch-refresh.sh]="hooks/multi-manager/pre-dispatch-refresh.sh"
-  [test-pre-push-rebase-test.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
+  [test-pre-push-rebase-concurrency.sh]="hooks/test/lib-pre-push-fixture-root.sh hooks/test/test-pre-push-rebase-test.sh"
+  [test-pre-push-rebase-test.sh]="hooks/multi-manager/pre-push-rebase-test.sh hooks/test/lib-pre-push-fixture-root.sh"
   [test-preview-kick.sh]="hooks/multi-manager/post-push-merge-notify.sh"
   [test-provenance-guard.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
   [test-read-guard.sh]="hooks/multi-manager/read-guard.sh"
@@ -248,6 +250,7 @@ declare -A COVERS=(
   [test-sable-test.sh]="bin/sable-test"
   [test-sable-worker-status.sh]="bin/sable-worker-status bin/sable_pane_lib.py"
   [test-seat-sighting.sh]="bin/sable-msg hooks/multi-manager/seat-sighting-gate.sh"
+  [test-sealed-verification.sh]=".github/ci/run-sealed-verification.sh .github/ci/shell-run-set.sh"
   [test-session-role-anchor.sh]="hooks/multi-manager/session-role-anchor.sh"
   [test-snapshot-freeze.sh]="bin/sable-snapshot bin/sable_snapshot_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py"
   [test-tarzan-optimus-accept-contract.sh]="templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/optimus.md"

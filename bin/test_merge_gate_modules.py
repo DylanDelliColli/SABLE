@@ -329,6 +329,7 @@ def test_the_gate_docstring_still_documents_every_code():
 # --- the parallel-preview concurrency regression -----------------------------
 
 _CI_VERIFY = _BIN.parent / ".github" / "workflows" / "ci-verify.yml"
+_SEALED_VERIFY = _BIN.parent / ".github" / "ci" / "run-sealed-verification.sh"
 
 
 def test_ci_verify_concurrency_group_is_keyed_on_the_ref():
@@ -355,12 +356,31 @@ def test_ci_verify_still_triggers_on_ci_verify_refs():
 def test_ci_verify_runs_the_full_python_suite_exactly_once():
     """A combined verdict must not pay a second full-suite run merely to warm
     a selector cache this workflow never consumes."""
-    text = _CI_VERIFY.read_text()
-    invocation = "python -m pytest bin/ -q -p no:cacheprovider"
-    assert text.count(invocation) == 1, \
-        f"ci-verify must run one authoritative Python suite, found {text.count(invocation)}"
-    assert "testmon-cache-warm.sh" not in text
-    assert "actions/cache@" not in text
+    workflow = _CI_VERIFY.read_text()
+    runner = _SEALED_VERIFY.read_text()
+    runner_invocation = "bash .github/ci/run-sealed-verification.sh"
+    invocation = " -m pytest bin/ -q -p no:cacheprovider"
+    assert workflow.count(runner_invocation) == 1, \
+        "ci-verify must delegate its verdict to one sealed-verification runner"
+    assert runner.count(invocation) == 1, \
+        f"sealed verification must run one authoritative Python suite, found {runner.count(invocation)}"
+    combined = workflow + runner
+    assert "testmon-cache-warm.sh" not in combined
+    assert "actions/cache@" not in combined
+
+
+def test_ci_verify_keeps_one_job_while_overlapping_complete_verdict_lanes():
+    """Rolling previews must consume one Actions slot each. Splitting Python
+    and shell into workflow jobs would halve useful fleet concurrency at the
+    account's 20-job ceiling."""
+    workflow = _CI_VERIFY.read_text()
+    runner = _SEALED_VERIFY.read_text()
+    job_ids = re.findall(r"(?m)^  ([A-Za-z0-9_-]+):\n    runs-on:", workflow)
+    assert job_ids == ["verify"], job_ids
+    for lane in ("python", "shell", "static"):
+        assert f"start_lane {lane} " in runner
+    assert 'bash "$SHELL_RUN_SET" --run' in runner
+    assert "--jobs" not in runner
 
 
 def test_the_split_makes_the_gate_a_snapshot_pinned_tool():

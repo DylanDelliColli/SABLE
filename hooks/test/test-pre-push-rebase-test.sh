@@ -19,7 +19,10 @@
 
 set -uo pipefail
 
-HOOK="$(cd "$(dirname "$0")/.." && pwd)/multi-manager/pre-push-rebase-test.sh"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+HOOK="$DIR/../multi-manager/pre-push-rebase-test.sh"
+# shellcheck source=lib-pre-push-fixture-root.sh
+. "$DIR/lib-pre-push-fixture-root.sh"
 # Absolute repo root, resolved once up front — needed by the SABLE-digiy
 # fixtures below, which `cd` into throwaway fixture repos and must not rely
 # on a relative $0 resolving correctly after the CWD has moved.
@@ -39,8 +42,9 @@ fi
 # runs the suite while the suite invokes the gate — raced on those shared paths,
 # clobbering each other's fixtures and flaking the gate nondeterministically.
 # Scoping everything under a unique root, and tearing down ONLY TMPROOT, makes
-# concurrent and nested runs collision-free. See test-pre-push-rebase-concurrency.sh.
-TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/sable-test-pre-push.XXXXXX")"
+# concurrent and nested runs collision-free. The allocation seam is raced
+# directly by test-pre-push-rebase-concurrency.sh.
+TMPROOT="$(sable_pre_push_fixture_root)"
 trap 'rm -rf "$TMPROOT"' EXIT
 
 PASS=0

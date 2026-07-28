@@ -224,3 +224,60 @@ sealed verdict, measure it in-band, declare expensive boundaries, and
 consolidate setup at the production seam that owns it. This avoids another
 web of per-suite hooks while still failing closed when accidental cost enters
 the ordinary developer path.
+
+## Merge-preview critical-path follow-up (`SABLE-pfkwc`)
+
+The earlier audit reduced individual test costs but left ci-verify's complete
+Python, static, and shell verdicts serialized inside one Actions job. A
+faithful bd/Dolt-absent clean-room baseline on current HEAD measured:
+
+| Lane | Wall time |
+| --- | ---: |
+| Full Python (2,817 passed, 196 skipped) | 304.90s |
+| Shell `ALLOW` (94/94 green) | 400.64s |
+| Sequential critical path | 705.54s |
+
+Splitting these into multiple Actions jobs would consume multiple slots per
+rolling preview and reduce fleet concurrency at the account's 20-job ceiling.
+The implemented design keeps one job and overlaps three fail-closed lanes on
+its dedicated runner: complete Python, the existing serial shell execution,
+and static fixture/classification/load/impact authority. It does not add
+within-suite parallelism locally or in CI.
+
+The parent owns each lane's exact PID, records `wait`'s exit status, and replays
+logs by stable lane name. A missing status is red. A planted regression suite
+proves all three lanes really overlap and that one failed lane fails the
+combined verdict.
+
+Within-shell concurrency was measured and rejected. Two shell workers looked
+attractive in isolation (282.70s versus 400.64s serial) and produced several
+green combined plants near 400s. A later repeat took 508.51s and failed the
+real tmux superseding-message integration when corrected delivery exhausted
+all eight verified attempts under load. That one-in-several contention flake
+invalidated the faster topology. The final design therefore uses only the
+coarse independent lanes and retains serial execution inside the shell lane.
+
+The local development host was not used for final latency acceptance once an
+unrelated worker's long-running pytest was observed alongside the SABLE run:
+that shared-host sample was green but took 715.72s and is local-swarm evidence,
+not a dedicated-runner comparison. Final timing acceptance is taken from the
+actual GitHub-hosted job and recorded on `SABLE-pfkwc`.
+
+The clean-room work also exposed a correctness defect in
+`test-doctor-snapshot-staleness.sh`: its fixture always piped the checkout's
+working-tree diff into `git apply`, which fails when the checkout is clean.
+The fixture now treats an empty tracked delta as a valid no-op and carries a
+regression assertion for a clean checkout.
+
+The generalized method and standalone-auditor design learnings are recorded in
+[TEST-SUITE-AUDIT-PLAYBOOK.md](TEST-SUITE-AUDIT-PLAYBOOK.md).
+
+The CI measurements use an otherwise isolated runner. They do not establish
+local behavior when 15+ workers each launch a scoped test process on one
+development host. SABLE deliberately leaves local shell execution serial and
+forbids workers from invoking the sealed full suite, but the broader-than-scoped
+one-per-host rule is currently prose rather than admission control. A
+representative swarm plant and the decision about a heavyweight-only host
+token budget are tracked separately in `SABLE-x2r7g`; adding a universal lock
+without that evidence could serialize cheap independent unit work and make the
+fleet slower.

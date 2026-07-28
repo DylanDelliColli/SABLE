@@ -73,6 +73,13 @@ fi
 git -C "$FIXREPO" config user.email "test@example.com"
 git -C "$FIXREPO" config user.name "Test"
 
+apply_tracked_delta() {
+  local source_repo="$1" target_repo="$2"
+  git -C "$source_repo" diff --quiet HEAD && return 0
+  git -C "$source_repo" diff --binary HEAD \
+    | git -C "$target_repo" apply --whitespace=nowarn
+}
+
 # Overlay the complete working-tree delta onto the clone. `git clone` copies
 # COMMITTED state, so without this the suite would exercise the last commit
 # instead of the code under test — a green that means nothing while you are
@@ -80,10 +87,17 @@ git -C "$FIXREPO" config user.name "Test"
 #
 # Apply the tracked delta rather than tarring `git ls-files`: that older shape
 # could not represent a tracked deletion and failed as soon as a test module
-# was renamed. Untracked files need a separate leg because `git diff HEAD`
-# deliberately omits them.
-if ! git -C "$REPO" diff --binary HEAD \
-     | git -C "$FIXREPO" apply --whitespace=nowarn; then
+# was renamed. A clean checkout has no patch to apply; feeding that empty
+# stream to `git apply` is an error, not evidence that the overlay failed.
+# Untracked files need a separate leg because `git diff HEAD` deliberately
+# omits them.
+if apply_tracked_delta "$FIXREPO" "$FIXREPO"; then
+  pass "a clean checkout needs no tracked-delta overlay"
+else
+  fail "a clean checkout must not feed an empty patch to git apply"
+  finish
+fi
+if ! apply_tracked_delta "$REPO" "$FIXREPO"; then
   fail "apply the tracked working-tree delta to the sandbox clone"
   finish
 fi
