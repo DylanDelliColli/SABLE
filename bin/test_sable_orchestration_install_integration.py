@@ -68,6 +68,93 @@ def run_installed_guard(base, command):
     return json.loads(result.stdout)["hookSpecificOutput"]
 
 
+def run_real_install(base):
+    """Run the real installer against an isolated user scope."""
+    return subprocess.run(
+        ["bash", str(INSTALLER), "--user"],
+        env={**os.environ, "CLAUDE_USER_DIR": str(base)},
+        capture_output=True, text=True, timeout=180,
+    )
+
+
+def test_malformed_settings_refuses_before_install_and_preserves_exact_bytes(tmp_path):
+    base = tmp_path / "claude"
+    base.mkdir()
+    settings = base / "settings.json"
+    original = b'{"hooks": {"PreToolUse": [}\n'
+    settings.write_bytes(original)
+
+    result = run_real_install(base)
+
+    assert result.returncode != 0, "malformed live settings were silently replaced"
+    assert settings.read_bytes() == original
+    assert settings.with_suffix(".json.bak").read_bytes() == original
+    diagnostic = result.stdout + result.stderr
+    assert "REFUSED" in diagnostic
+    assert "invalid JSON" in diagnostic
+    assert str(settings) in diagnostic
+    assert str(settings.with_suffix(".json.bak")) in diagnostic
+    assert not any((base / "hooks" / "multi-manager").glob("*.sh")), \
+        "settings validation happened after install artifacts were already copied"
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root ignores file mode, so unreadable settings cannot be simulated")
+def test_unreadable_settings_refuses_before_install_and_preserves_exact_bytes(tmp_path):
+    base = tmp_path / "claude"
+    base.mkdir()
+    settings = base / "settings.json"
+    original = b'{"hooks": {"custom": []}}\n'
+    settings.write_bytes(original)
+    settings.chmod(0o000)
+
+    try:
+        result = run_real_install(base)
+    finally:
+        settings.chmod(0o600)
+
+    assert result.returncode != 0
+    assert settings.read_bytes() == original
+    diagnostic = result.stdout + result.stderr
+    assert "REFUSED" in diagnostic
+    assert "could not read or back up" in diagnostic
+    assert str(settings) in diagnostic
+    assert str(settings.with_suffix(".json.bak")) in diagnostic
+    assert not any((base / "hooks" / "multi-manager").glob("*.sh"))
+
+
+def test_valid_settings_merge_is_idempotent_and_preserves_unrelated_hooks(tmp_path):
+    base = tmp_path / "claude"
+    base.mkdir()
+    settings = base / "settings.json"
+    custom_hook = {
+        "matcher": "CustomTool",
+        "hooks": [{"type": "command", "command": "run-my-private-hook"}],
+    }
+    settings.write_text(json.dumps({
+        "permissions": {"allow": ["Read"]},
+        "hooks": {"PreToolUse": [custom_hook]},
+    }, indent=2) + "\n")
+
+    first = run_real_install(base)
+    assert first.returncode == 0, first.stderr
+    first_bytes = settings.read_bytes()
+    first_data = json.loads(first_bytes)
+    assert first_data["permissions"] == {"allow": ["Read"]}
+    assert custom_hook in first_data["hooks"]["PreToolUse"]
+
+    second = run_real_install(base)
+    assert second.returncode == 0, second.stderr
+    assert settings.read_bytes() == first_bytes
+    second_data = json.loads(settings.read_bytes())
+    commands = [
+        hook.get("command")
+        for block in second_data["hooks"]["PreToolUse"]
+        for hook in block.get("hooks", [])
+    ]
+    assert commands.count("run-my-private-hook") == 1
+
+
 def test_installed_inline_body_guard_can_load_its_library_and_denies_a_corrupt_body(installed_scope):
     # THE ASSERTION THAT FAILED BEFORE THIS FIX, and the one that would have
     # caught the original defect: not "is the hook there" but "can the hook

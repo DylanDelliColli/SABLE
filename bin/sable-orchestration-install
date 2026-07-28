@@ -79,6 +79,50 @@ HOOKS_DIR="$BASE/hooks/multi-manager"
 AGENTS_DIR="$BASE/agents"
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
 
+# Refuse an install before its first activation write when an existing
+# settings target cannot be safely merged.  The backup is made from the same
+# bytes that are parsed, so the refusal both preserves the live file and names
+# a usable recovery artifact.
+preflight_settings_targets() {
+    local -a existing=()
+    local target
+    for target in "$@"; do
+        [ -n "$target" ] && [ -e "$target" ] && existing+=("$target")
+    done
+    [ "${#existing[@]}" -gt 0 ] || return 0
+
+    python3 - "${existing[@]}" <<'PY'
+import json, shutil, sys
+
+for path in sys.argv[1:]:
+    backup = path + '.bak'
+    try:
+        shutil.copy2(path, backup)
+    except OSError as exc:
+        print(
+            f"sable-orchestration-install: REFUSED settings merge for {path}: "
+            f"could not read or back up existing settings ({exc}). "
+            f"Backup path: {backup}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    try:
+        with open(backup, encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("top level must be a JSON object")
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        print(
+            f"sable-orchestration-install: REFUSED settings merge for {path}: "
+            f"invalid JSON ({exc}). Existing bytes were preserved; "
+            f"backup path: {backup}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+PY
+}
+
 # Retired-artifact list (SABLE-gsqj): names this repo used to ship into a scope
 # but no longer does. Upgrading over a pre-existing scope is purely additive
 # otherwise — these must be actively retired on every plain install, not just
@@ -108,11 +152,19 @@ base = os.environ['BASE_DIR']
 skip = set(os.environ.get('SKIP_MARKERS', '').split())
 data = {}
 if os.path.exists(settings):
-    shutil.copy(settings, settings + '.bak')
+    backup = settings + '.bak'
+    shutil.copy2(settings, backup)
     try:
-        with open(settings) as f: data = json.load(f)
-    except Exception:
-        data = {}
+        with open(backup, encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("top level must be a JSON object")
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise SystemExit(
+            f"sable-orchestration-install: REFUSED settings merge for {settings}: "
+            f"invalid JSON ({exc}). Existing bytes were preserved; "
+            f"backup path: {backup}"
+        )
 hooks = data.setdefault('hooks', {})
 def marker(cmd): return (cmd or '').rsplit('/', 1)[-1]
 for event, blocks in snip.get('hooks', {}).items():
@@ -585,6 +637,11 @@ EOF
 fi
 
 # --- Install the complete layer ---
+# Validate both live configuration targets before mkdir/copy/cleanup mutates
+# the scope.  A bad Claude settings file must not leave a half-installed
+# layer, and a bad Codex hooks file must not fail after Claude was activated.
+preflight_settings_targets "$SETTINGS" "$CODEX_HOOKS"
+
 mkdir -p "$HOOKS_DIR" "$BASE/sable/roles" "$SKILLS"
 
 cleanup_retired_artifacts
