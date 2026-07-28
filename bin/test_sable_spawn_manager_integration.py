@@ -45,11 +45,15 @@ def _tmux(s, *args, check=True):
 
 
 def _run(s, *args):
+    fake_tui = (
+        "bash --noprofile --norc -c 'while true; do printf \"❯ \"; "
+        "IFS= read -r line || break; printf \"%s\\n\" \"$line\"; done'"
+    )
     return subprocess.run(["python3", str(BIN), *args], capture_output=True, text=True,
                           env={**os.environ, "SABLE_TMUX_SOCKET": s,
                              "SABLE_TMUX_SESSION": SESSION,
-                             "SABLE_TMUX_PANE_CMD": "bash",
-                             "SABLE_DISPATCH_READY_TIMEOUT": "0",
+                             "SABLE_TMUX_PANE_CMD": fake_tui,
+                             "SABLE_DISPATCH_READY_TIMEOUT": "2",
                              "SABLE_DISPATCH_SUBMIT_TRIES": "1",
                              "SABLE_DISPATCH_POLL_INTERVAL": "0.1"})
 
@@ -175,7 +179,8 @@ def test_known_startup_gate_is_accepted_then_manager_is_kicked(sock, tmp_path):
         "printf '❯ '\n"
         "IFS= read -r line\n"
         f'printf "%s" "$line" > "{kicked}"\n'
-        "sleep 2\n"
+        "printf '\\n%s\\n❯ ' \"$line\"\n"
+        "IFS= read -r _hold\n"
     )
     _seed_lincoln(sock)
     env = {
@@ -199,6 +204,87 @@ def test_known_startup_gate_is_accepted_then_manager_is_kicked(sock, tmp_path):
         time.sleep(0.1)
     assert accepted.read_text() == "2"
     assert "SABLE-AUTOSTART" in kicked.read_text()
+
+
+def test_unverified_manager_kick_fails_closed_and_retry_converges(sock, tmp_path):
+    """A pane that exits on the first kick byte makes delivery unverifiable."""
+    first_byte = tmp_path / "first-byte.txt"
+    script = tmp_path / "exit-during-kick.sh"
+    script.write_text(
+        "printf '❯ '\n"
+        "IFS= read -r -n 1 byte\n"
+        f'printf "%s" "$byte" > "{first_byte}"\n'
+    )
+    _seed_lincoln(sock)
+    env = {
+        **os.environ,
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_SESSION": SESSION,
+        "SABLE_TMUX_PANE_CMD": f"bash --noprofile --norc {script}",
+        "SABLE_DISPATCH_READY_TIMEOUT": "2",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.1",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+    }
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus"],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert first_byte.read_text() == "[", "delivery-failure leg was not exercised"
+    assert r.returncode == 11, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "delivery could not be verified" in r.stderr
+    assert "role=optimus" in r.stderr
+    assert "optimus" not in _roles(sock)
+
+    retry = _run(sock, "optimus")
+    assert retry.returncode == 0, retry.stderr
+    assert "optimus" in _roles(sock)
+
+
+def test_provider_boot_failure_removes_manager_pane(sock, tmp_path):
+    """A missing Codex role card fails after pane creation but before typing."""
+    state = Path(os.environ["SABLE_MODE_STATE"])
+    state.write_text(
+        '{"mode":"execution","providers":{"optimus":"codex"}}'
+    )
+    empty_home = tmp_path / "home"
+    empty_home.mkdir()
+    first_byte = tmp_path / "first-byte.txt"
+    script = tmp_path / "codex-ready.sh"
+    script.write_text(
+        "printf '› '\n"
+        "IFS= read -r -n 1 byte\n"
+        f'printf "%s" "$byte" > "{first_byte}"\n'
+        "sleep 2\n"
+    )
+    _seed_lincoln(sock)
+    env = {
+        **os.environ,
+        "HOME": str(empty_home),
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_SESSION": SESSION,
+        "SABLE_TMUX_PANE_CMD": f"bash --noprofile --norc {script}",
+        "SABLE_DISPATCH_READY_TIMEOUT": "2",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.1",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+    }
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus"],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert r.returncode == 5, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "no installed role card" in r.stderr
+    assert "role=optimus" in r.stderr
+    assert "provider=codex" in r.stderr
+    assert "failed pane removed" in r.stderr
+    assert not first_byte.exists(), "provider failure typed into the pane"
+    assert "optimus" not in _roles(sock)
+
+    state.write_text('{"mode":"execution"}')
+    retry = _run(sock, "optimus")
+    assert retry.returncode == 0, retry.stderr
+    assert "optimus" in _roles(sock)
 
 
 # --- SABLE-tz7h.1: producer spawn contract -------------------------------
@@ -273,7 +359,8 @@ def test_manager_spawn_pins_real_claude_command_to_opus(sock, tmp_path):
     stub.write_text(
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{log_path}"\n'
-        "sleep 5\n"
+        "while true; do printf '❯ '; IFS= read -r line || break; "
+        "printf '%s\\n' \"$line\"; done\n"
     )
     stub.chmod(0o755)
 
@@ -283,7 +370,7 @@ def test_manager_spawn_pins_real_claude_command_to_opus(sock, tmp_path):
                        env={**os.environ, "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
                           "SABLE_TMUX_SOCKET": sock,
                           "SABLE_TMUX_SESSION": SESSION,
-                          "SABLE_DISPATCH_READY_TIMEOUT": "0",
+                          "SABLE_DISPATCH_READY_TIMEOUT": "2",
                           "SABLE_DISPATCH_SUBMIT_TRIES": "1",
                           "SABLE_DISPATCH_POLL_INTERVAL": "0.1"})
     assert r.returncode == 0, r.stderr

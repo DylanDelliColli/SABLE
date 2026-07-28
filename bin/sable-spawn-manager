@@ -105,6 +105,24 @@ def fleet_boundary_refusal(base: str | None = None) -> str | None:
     return FLEET_PROJECT_ONLY_REMEDY if fleet_project_only(base) else None
 
 
+def rollback_failed_pane(base: list[str], pane: str) -> str:
+    """Remove an invocation-owned pane and report whether retry is unblocked."""
+    subprocess.run(
+        base + ["kill-pane", "-t", pane],
+        capture_output=True, text=True,
+    )
+    listing = subprocess.run(
+        base + ["list-panes", "-a", "-F", "#{pane_id}"],
+        capture_output=True, text=True,
+    )
+    still_present = (
+        listing.returncode == 0 and pane in listing.stdout.splitlines()
+    )
+    if still_present:
+        return "WARNING: failed pane cleanup did not succeed"
+    return "failed pane removed; retry can recreate the role"
+
+
 def strip_instance_suffix(name: str) -> str:
     """Base registry name of a spawn-assigned instance (tarzan-2 -> tarzan).
     Diagnostic + write-time base lookup ONLY. Returns name unchanged when it
@@ -512,15 +530,7 @@ def main(argv: list[str] | None = None) -> int:
                     if dialog_posture(cap)
                     else "not in composer posture (still booting, exited, or stuck)"
                 )
-                removed = subprocess.run(
-                    base + ["kill-pane", "-t", pane],
-                    capture_output=True, text=True,
-                ).returncode == 0
-                cleanup = (
-                    "failed pane removed; retry can recreate the role"
-                    if removed
-                    else "WARNING: failed pane cleanup did not succeed"
-                )
+                cleanup = rollback_failed_pane(base, pane)
                 sys.stderr.write(
                     "sable-spawn-manager: REFUSING bootstrap "
                     f"role={role} pane={pane} provider={provider} state={state}; "
@@ -532,7 +542,12 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 kick = provider_boot_message(provider, role, kick, base=root)
             except ProviderMapError as e:
-                sys.stderr.write(f"sable-spawn-manager: {e}\n")
+                cleanup = rollback_failed_pane(base, pane)
+                sys.stderr.write(
+                    "sable-spawn-manager: REFUSING bootstrap "
+                    f"role={role} pane={pane} provider={provider}: {e}; "
+                    f"{cleanup}.\n"
+                )
                 return 5
         if deliver_text(base, pane, kick, KICK_TAG,
                         tries=submit_tries, interval=poll_interval,
@@ -540,8 +555,13 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"sable-spawn-manager: {role} up in its own window, "
                              f"kicked into its operating loop\n")
         else:
-            sys.stderr.write(f"sable-spawn-manager: WARNING kick to {role} ({pane}) "
-                             f"may be unsubmitted\n")
+            cleanup = rollback_failed_pane(base, pane)
+            sys.stderr.write(
+                "sable-spawn-manager: REFUSING bootstrap "
+                f"role={role} pane={pane} provider={provider}: delivery could "
+                f"not be verified; {cleanup}.\n"
+            )
+            return 11
     return 0
 
 

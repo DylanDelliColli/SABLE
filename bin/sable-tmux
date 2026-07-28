@@ -100,6 +100,21 @@ def _tag(base, pane, role, root=None, provider="claude"):
         subprocess.run(base + ["set-option", "-p", "-t", pane, "@sable_repo", root], check=True)
 
 
+def rollback_failed_session(base: list[str], session: str) -> str:
+    """Remove this invocation's session and report whether retry is unblocked."""
+    subprocess.run(
+        base + ["kill-session", "-t", session],
+        capture_output=True, text=True,
+    )
+    still_present = subprocess.run(
+        base + ["has-session", "-t", session],
+        capture_output=True, text=True,
+    ).returncode == 0
+    if still_present:
+        return "WARNING: failed session cleanup did not succeed"
+    return "failed session removed; retry can recreate it"
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sable-tmux")
     p.add_argument("--session", help="target session (default: SABLE_TMUX_SESSION, "
@@ -195,32 +210,38 @@ def main(argv: list[str] | None = None) -> int:
                         if dialog_posture(cap)
                         else "not in composer posture (still booting, exited, or stuck)"
                     )
-                    removed = subprocess.run(
-                        base + ["kill-session", "-t", sess],
-                        capture_output=True, text=True,
-                    ).returncode == 0
-                    cleanup = (
-                        "failed session removed; retry can recreate it"
-                        if removed
-                        else "WARNING: failed session cleanup did not succeed"
-                    )
+                    cleanup = rollback_failed_session(base, sess)
                     sys.stderr.write(
                         "sable-tmux: REFUSING autostart "
                         f"role={role} pane={kpane} provider={provider} state={state}; "
                         f"operating-loop kick was NOT typed; {cleanup}.\n"
                     )
                     return 10
-            kick = provider_boot_message(
-                provider, role, kick_message(role), base=root
-            )
+            try:
+                kick = provider_boot_message(
+                    provider, role, kick_message(role), base=root
+                )
+            except ProviderMapError as e:
+                cleanup = rollback_failed_session(base, sess)
+                sys.stderr.write(
+                    "sable-tmux: REFUSING autostart "
+                    f"role={role} pane={kpane} provider={provider}: {e}; "
+                    f"{cleanup}.\n"
+                )
+                return 5
             if deliver_text(
                 base, kpane, kick, KICK_TAG, tries=submit_tries,
                 interval=poll_interval, provider=provider,
             ):
                 sys.stderr.write(f"sable-tmux: kicked {role} into its operating loop\n")
             else:
-                sys.stderr.write(f"sable-tmux: WARNING kick to {role} ({kpane}) "
-                                 f"may be unsubmitted\n")
+                cleanup = rollback_failed_session(base, sess)
+                sys.stderr.write(
+                    "sable-tmux: REFUSING autostart "
+                    f"role={role} pane={kpane} provider={provider}: delivery "
+                    f"could not be verified; {cleanup}.\n"
+                )
+                return 11
 
     sys.stderr.write(f"sable-tmux: session '{sess}' up with roles: {', '.join(roles)}\n")
     sys.stderr.write(f"  attach: tmux{' -L ' + socket if socket else ''} attach -t {sess}\n")
