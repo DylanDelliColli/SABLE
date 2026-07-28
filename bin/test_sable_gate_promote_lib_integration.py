@@ -1144,6 +1144,60 @@ def test_batch_writer_refuses_a_declared_pair_missing_from_the_atomic_set(
     assert _remote_head(bare, "trunk") == before
 
 
+def test_batch_writer_lands_both_members_of_a_declared_pair_atomically(
+        tmp_path, monkeypatch, fleet_sink):
+    """Positive control for pair enforcement: the same pair refused above is
+    authorized when both exact members share the batch writer's one ref move."""
+    repo, bare, base_sha = _batch_sandbox(tmp_path)
+    members = [
+        _member_branch(repo, base_sha, "wk-a", "bin/a.py", "a=1\n", ("SABLE-a",)),
+        _member_branch(repo, base_sha, "wk-b", "bin/b.py", "b=1\n", ("SABLE-b",)),
+    ]
+    fold_tip = _fold(repo, base_sha, members)
+    combined_ref = "ci-verify/batch-complete-pair"
+    monkeypatch.setattr(
+        promote_lib, "declared_landing_pair",
+        lambda repo_, bead: (
+            frozenset({"SABLE-b"}) if bead == "SABLE-a"
+            else frozenset({"SABLE-a"}) if bead == "SABLE-b"
+            else frozenset()))
+    monkeypatch.setattr(promote_lib, "_bead_landed", lambda *args: False)
+
+    result = promote_lib.land_batch(
+        str(repo), "origin", "trunk", base_sha, fold_tip, members,
+        budget=_ok_budget(members), combined_ref=combined_ref,
+        verdict=_green_batch_verdict(fold_tip, combined_ref))
+
+    assert result.landed
+    assert _remote_head(bare, "trunk") == fold_tip
+    for member in members:
+        assert subprocess.run(
+            ["git", "--git-dir", str(bare), "merge-base", "--is-ancestor",
+             member.tip_sha, fold_tip],
+            check=False).returncode == 0
+
+
+def test_batch_writer_refuses_a_member_without_bead_identity_before_git(
+        tmp_path, monkeypatch, fleet_sink):
+    """A beadless member would be invisible to pair enforcement. The final
+    writer itself must reject it before resolving or moving any ref."""
+    member = promote_lib.BatchMember(
+        "wk-unnamed", "a" * 40, (), ("bin/a.py",))
+    monkeypatch.setattr(
+        promote_lib.git_lib, "resolve_commit",
+        lambda *args, **kwargs: pytest.fail(
+            "beadless batch member must be refused before git work"))
+
+    with pytest.raises(promote_lib.GateError) as exc:
+        promote_lib.land_batch(
+            str(tmp_path), "origin", "trunk", "b" * 40, "c" * 40, [member],
+            budget=_ok_budget([member]), combined_ref="ci-verify/batch-unnamed",
+            verdict=_green_batch_verdict("c" * 40, "ci-verify/batch-unnamed"))
+
+    assert exc.value.code == promote_lib.classify.EXIT_PRECONDITION
+    assert "bead" in str(exc.value).lower()
+
+
 def test_land_batch_lands_when_base_equals_the_formed_base(tmp_path, fleet_sink):
     """SABLE-be4lo.7 behavior 2 (positive polarity): base parent == integration
     tip → the batch lands. The single fast-forward moves trunk to the fold tip

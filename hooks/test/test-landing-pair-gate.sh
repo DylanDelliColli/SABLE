@@ -12,15 +12,13 @@
 # GitHub Actions verdict is injected, the same seam every other merge-gate
 # suite uses — see test-snapshot-freeze.sh/test-optimistic-promotion.sh):
 #
-#   C1  bead A declares metadata.landing_pair=B; B is neither landed nor named
-#       on this promote call -> REFUSED (exit 28), naming B. The integration
-#       branch tip does not move.
-#   C2  the SAME promote, with --with-pair B naming the counterpart, succeeds
-#       (exit 0) — C1's non-vacuity: the refusal was the missing
-#       acknowledgement, not a broken gate.
-#   C3  bead B, once bead A has genuinely LANDED (its notes carry this
-#       module's own "promoted byte-identical to" marker), promotes on its
-#       own — no --with-pair needed, because the counterpart already landed.
+#   C1  bead A declares metadata.landing_pair=B; B is not landed -> REFUSED
+#       (exit 28), naming B and the atomic batch path. The integration branch
+#       tip does not move.
+#   C2  the former --with-pair acknowledgement is rejected as unknown and
+#       cannot move the integration branch.
+#   C3  A and B form one CI-verified fold and land through ONE integration-ref
+#       update; both exact branch tips are ancestors of the new tip.
 #   C4  a bead with NO landing_pair metadata at all promotes independently,
 #       untouched by any of this — the negative control that proves the check
 #       discriminates on the declared relation, not on any file-level property.
@@ -61,6 +59,7 @@ BASE_BR="trunk"
 G_ORIGIN="$TMPROOT/gate-origin.git"
 G_WORK="$TMPROOT/gate-work"
 git init -q --bare -b "$BASE_BR" "$G_ORIGIN"
+git --git-dir="$G_ORIGIN" config core.logAllRefUpdates true
 git clone -q "$G_ORIGIN" "$G_WORK" 2>/dev/null
 git -C "$G_WORK" config user.email "t@sable.invalid"
 git -C "$G_WORK" config user.name "SABLE Test"
@@ -107,6 +106,9 @@ gate() {
       python3 "$GATE" "$@" 2>&1
 }
 base_tip() { git --git-dir="$G_ORIGIN" rev-parse "refs/heads/$BASE_BR"; }
+base_reflog_count() {
+  git --git-dir="$G_ORIGIN" reflog show --format=%H "refs/heads/$BASE_BR" | wc -l | tr -d ' '
+}
 
 # ---------------------------------------------------------------------------
 # A real, throwaway bd DB (SABLE-jd5fj.15's isolation recipe: a FRESH DB, not
@@ -164,6 +166,12 @@ else
   fail "C1 refusal names the counterpart" "$OUT1"
 fi
 
+if echo "$OUT1" | grep -Eq 'batch-cycle|land-batch'; then
+  pass "C1 the refusal names the atomic batch landing path"
+else
+  fail "C1 refusal names an atomic batch path" "$OUT1"
+fi
+
 if [ "$(base_tip)" = "$TIP_BEFORE" ]; then
   pass "C1 the integration branch tip did not move under a refused promote"
 else
@@ -171,31 +179,67 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# C2 — the SAME promote, with --with-pair naming the counterpart, succeeds
+# C2 — the former acknowledgement flag is gone and cannot move the base
 # ---------------------------------------------------------------------------
 OUT2="$(gate promote --bead "$BID_A" --branch wk-a --base "$BASE_BR" \
         --repo "$G_WORK" --remote origin --manager chuck \
         --with-pair "$BID_B")"; RC2=$?
 
-if [ "$RC2" -eq 0 ] && [ "$(base_tip)" != "$TIP_BEFORE" ]; then
-  pass "C2 --with-pair satisfies the check and the promote succeeds"
+if [ "$RC2" -eq 2 ] && [ "$(base_tip)" = "$TIP_BEFORE" ]; then
+  pass "C2 removed --with-pair flag is rejected and moves nothing"
 else
-  fail "C2 --with-pair promote succeeds" "rc=$RC2 tip=$(base_tip) (was $TIP_BEFORE)
+  fail "C2 removed --with-pair is fail-closed" "rc=$RC2 tip=$(base_tip) (was $TIP_BEFORE)
 $OUT2"
 fi
 
 # ---------------------------------------------------------------------------
-# C3 — bead B promotes on its own once A has genuinely LANDED (no --with-pair)
+# C3 — both paired branches land through one exact combined-object ref update
 # ---------------------------------------------------------------------------
-TIP_AFTER_A="$(base_tip)"
-OUT3="$(gate promote --bead "$BID_B" --branch wk-b --base "$BASE_BR" \
-        --repo "$G_WORK" --remote origin --manager chuck)"; RC3=$?
+FOLD_INFO="$(
+  env PYTHONPATH="$REPO_ROOT/bin" python3 - "$G_WORK" "$BASE_BR" "$BID_A" "$BID_B" <<'PY'
+import sys
+import sable_batch_fold_lib as fold
+import sable_gate_git_lib as git_lib
 
-if [ "$RC3" -eq 0 ] && [ "$(base_tip)" != "$TIP_AFTER_A" ]; then
-  pass "C3 bead B promotes solo once A has landed — no --with-pair needed"
+repo, base, bead_a, bead_b = sys.argv[1:]
+git_lib._git(repo, "fetch", "origin", base, "wk-a", "wk-b")
+base_sha = git_lib.resolve_commit(repo, "origin/" + base)
+members = [
+    fold.FoldMember("wk-a", git_lib.resolve_commit(repo, "origin/wk-a"), bead_a),
+    fold.FoldMember("wk-b", git_lib.resolve_commit(repo, "origin/wk-b"), bead_b),
+]
+tip, ref = fold.push_batch_ref(repo, "origin", base_sha, members)
+print(tip, ref)
+PY
+)"
+FOLD_TIP="${FOLD_INFO%% *}"
+REFLOG_BEFORE="$(base_reflog_count)"
+OUT3="$(gate land-batch --base "$BASE_BR" \
+        --member "wk-a:$BID_A" --member "wk-b:$BID_B" \
+        --repo "$G_WORK" --remote origin --manager chuck)"; RC3=$?
+REFLOG_AFTER="$(base_reflog_count)"
+
+if [ "$RC3" -eq 0 ] && [ "$(base_tip)" = "$FOLD_TIP" ]; then
+  pass "C3 the exact CI-verified pair fold lands"
 else
-  fail "C3 solo promote of B succeeds once A landed" "rc=$RC3 tip=$(base_tip) (was $TIP_AFTER_A)
+  fail "C3 exact pair fold lands" "rc=$RC3 tip=$(base_tip) expected=$FOLD_TIP
 $OUT3"
+fi
+
+if [ $((REFLOG_AFTER - REFLOG_BEFORE)) -eq 1 ]; then
+  pass "C3 pair landing advances the integration ref exactly once"
+else
+  fail "C3 pair landing uses one integration-ref update" \
+       "reflog before=$REFLOG_BEFORE after=$REFLOG_AFTER"
+fi
+
+if git --git-dir="$G_ORIGIN" merge-base --is-ancestor \
+     "$(git --git-dir="$G_ORIGIN" rev-parse refs/heads/wk-a)" "$FOLD_TIP" &&
+   git --git-dir="$G_ORIGIN" merge-base --is-ancestor \
+     "$(git --git-dir="$G_ORIGIN" rev-parse refs/heads/wk-b)" "$FOLD_TIP"; then
+  pass "C3 both exact worker tips are contained in the landed fold"
+else
+  fail "C3 landed fold contains both exact worker tips"
 fi
 
 # ---------------------------------------------------------------------------

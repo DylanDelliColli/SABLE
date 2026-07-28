@@ -645,9 +645,16 @@ bd update <id-b> --set-metadata landing_pair=<id-a>
 ```
 
 `sable-merge-gate promote` reads it mechanically (exit 28, naming the
-counterpart) — see chuck.md's promote step for the full contract and the
-`--with-pair` flag that lets Chuck promote both in one sitting. This is
-distinct from `bd dep add` (which means "cannot **start** until") — a
+counterpart) — see chuck.md's promote step for the full contract. An
+unlanded pair is authorized only when both exact branch tips are members of
+the same `batch-cycle`/`land-batch` operation. That operation binds one
+combined object to one green verdict and advances the integration ref once
+or not at all; merely naming the counterpart cannot satisfy it. Every manual
+`land-batch --member` must include its bead ID so the final writer can inspect
+the declared relation. Solo promotion remains available only after the
+counterpart genuinely landed, as recovery for a historical half-landing.
+
+This is distinct from `bd dep add` (which means "cannot **start** until") — a
 landing pair CAN be worked in parallel; it can only never be **promoted**
 solo.
 

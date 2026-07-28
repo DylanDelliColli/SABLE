@@ -2601,12 +2601,11 @@ def _fake_bd_show(responses: dict[str, dict]):
 
 def test_landing_pair_refuses_a_solo_promote_but_never_touches_an_unpaired_bead(monkeypatch):
     """THE property this bead is accepted or rejected on: a bead declaring a
-    landing_pair counterpart that is neither landed nor named on this call is
-    REFUSED, naming the counterpart. Negative control IN THE SAME TEST: a bead
-    with no landing_pair metadata at all — however similar its footprint to
-    the paired one — must never be touched by this check, proving it
-    discriminates on the declared relation rather than on any file-level
-    property."""
+    landing_pair counterpart that has not already landed is REFUSED, naming
+    the counterpart. Negative control IN THE SAME TEST: a bead with no
+    landing_pair metadata at all — however similar its footprint to the paired
+    one — must never be touched by this check, proving it discriminates on the
+    declared relation rather than on any file-level property."""
     monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
         "SABLE-a": {"metadata": {"landing_pair": "SABLE-b"}, "notes": ""},
         "SABLE-b": {"metadata": {}, "notes": ""},
@@ -2648,15 +2647,32 @@ def test_a_closed_but_unlanded_counterpart_still_refuses(monkeypatch):
         promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a")
 
 
-def test_landing_pair_satisfied_when_the_counterpart_is_named_on_this_same_call(monkeypatch):
-    """--with-pair: the operator's mechanical acknowledgement that both halves
-    are being promoted together satisfies the check even before either has
-    landed."""
+def test_atomic_batch_satisfies_pair_only_when_counterpart_is_a_member(monkeypatch):
+    """A pair authorization must correspond to the batch writer's concrete
+    all-or-nothing member set, never a caller-supplied acknowledgement."""
     monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
         "SABLE-a": {"metadata": {"landing_pair": "SABLE-b"}, "notes": ""},
-        "SABLE-b": {"metadata": {}, "notes": ""},
+        "SABLE-b": {"metadata": {"landing_pair": "SABLE-a"}, "notes": ""},
     }))
-    promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a", with_pair=frozenset({"SABLE-b"}))
+    members = [
+        promote_lib.BatchMember(
+            "wk-a", "a" * 40, ("SABLE-a",), ("bin/a.py",)),
+        promote_lib.BatchMember(
+            "wk-b", "b" * 40, ("SABLE-b",), ("bin/b.py",)),
+    ]
+    promote_lib.assert_batch_landing_pairs_satisfied("/repo", members)
+
+
+def test_batch_landing_evidence_counts_as_genuinely_landed(monkeypatch):
+    """The pair recovery read must recognize every successful writer owned by
+    this module, including the batch writer's durable evidence."""
+    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
+        "SABLE-a": {"metadata": {"landing_pair": "SABLE-b"}, "notes": ""},
+        "SABLE-b": {"metadata": {}, "status": "open",
+                    "notes": "BATCH LANDED: 2 member(s) fast-forwarded trunk "
+                             "to fold tip abcdef0 in ONE cycle."},
+    }))
+    promote_lib.assert_landing_pair_satisfied("/repo", "SABLE-a")
 
 
 def test_declared_landing_pair_parses_comma_and_whitespace_separated_ids(monkeypatch):
@@ -2705,19 +2721,6 @@ def test_promote_refuses_a_paired_bead_before_any_git_work(gate, monkeypatch):
     assert exc.value.code == classify.EXIT_PAIR_REFUSED
     assert "SABLE-y" in str(exc.value)
     assert gate["pushes"] == []
-
-
-def test_promote_succeeds_for_a_paired_bead_named_via_with_pair(gate, monkeypatch):
-    """Non-vacuity: the SAME paired bead promotes normally once --with-pair
-    names the counterpart — the refusal above was the missing acknowledgement,
-    not a broken gate."""
-    monkeypatch.setattr(promote_lib, "_bd_show", _fake_bd_show({
-        "SABLE-x": {"metadata": {"landing_pair": "SABLE-y"}, "notes": ""},
-        "SABLE-y": {"metadata": {}, "notes": ""},
-    }))
-    _arm(gate, disjoint=True, impact=promote_lib.IMPACT_GREEN)
-    assert promote_lib.promote("SABLE-x", BRANCH, BASE, REPO, REMOTE, MANAGER, None,
-                               with_pair=frozenset({"SABLE-y"})) == 0
 
 
 def test_promote_is_unaffected_for_a_bead_with_no_landing_pair_metadata(gate, monkeypatch):

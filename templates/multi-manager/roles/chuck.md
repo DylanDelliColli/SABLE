@@ -121,12 +121,20 @@ Each merge request — message OR bead:
    --set-metadata landing_pair=<counterpart-id>`, set on BOTH sides of the
    pair), and `sable-merge-gate promote` reads it MECHANICALLY: a solo
    promote of either half exits 28, naming the counterpart, unless the
-   counterpart has already landed or you pass `--with-pair <counterpart-id>`
-   to promote both in the same sitting:
+   counterpart has already landed. An unlanded pair must enter the SAME
+   atomic batch; an ID acknowledgement is not landing evidence:
    ```bash
-   sable-merge-gate promote --bead <id>  --branch <branch>  --with-pair <counterpart-id>
-   sable-merge-gate promote --bead <counterpart-id> --branch <counterpart-branch>
+   sable-merge-gate batch-cycle \
+     --member <branch>:<id> \
+     --member <counterpart-branch>:<counterpart-id>
    ```
+   `batch-cycle` binds both exact branch tips to one combined CI verdict and
+   advances the integration ref once or not at all. `land-batch` is the manual
+   recovery path only when that exact combined ref has already been formed and
+   verified; every `--member` must include its bead ID. Solo promotion after a
+   counterpart has genuinely landed remains available only to repair a legacy
+   half-landed pair.
+
    Check `bd show <id> --json` for a `landing_pair` metadata field before you
    sequence a queue — it changes the ORDER question above from "any two
    independent greens" to "these two travel together."

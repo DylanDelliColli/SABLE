@@ -1676,27 +1676,25 @@ def assert_not_frozen(repo: str) -> None:
 # --set-metadata landing_pair=<counterpart-id>[,<counterpart-id>...]`) so the
 # declaration lives where THIS function already looks, instead of somewhere
 # it never reads. A solo promote of either half is refused, naming the
-# counterpart, unless the counterpart is explicitly named on THIS SAME
-# promote call via --with-pair (the operator's mechanical acknowledgement
-# that both halves are being promoted together) or the counterpart has
-# ALREADY landed.
+# counterpart, unless the counterpart has ALREADY landed. An unlanded pair is
+# authorized only as concrete members of land_batch()'s single integration-ref
+# update; a caller-supplied acknowledgement cannot stand in for co-landing.
 #
 # "Landed" is deliberately NOT bead status. SABLE-d5iku (chuck.md) already
 # established that a CLOSED bead is not a MERGED bead — status flips at the
 # worker's push, landing happens only at chuck's promote — so reusing status
 # here would silently reopen the exact gap that bead documents. Instead this
-# reads for the literal marker every successful path through THIS module's
-# own promote() already writes via _append_evidence: "promoted
-# byte-identical to" appears in a bead's notes if and only if some earlier
-# promote() call actually landed it.
+# reads for the literal markers every successful path through THIS module's
+# own writers append as evidence. This preserves recovery from a historical
+# half-landing without confusing CLOSED with LANDED.
 
 _LANDING_PAIR_KEY = "landing_pair"
 _LANDED_MARKER = "promoted byte-identical to"
+_BATCH_LANDED_MARKER = "BATCH LANDED:"
 
 
 class LandingPairRefused(Exception):
-    """A bead's declared `landing_pair` counterpart is neither landed nor
-    named via --with-pair on this promote call."""
+    """A solo promote would split a declared, not-yet-landed pair."""
 
 
 def _bd_show(repo: str, bead_id: str) -> subprocess.CompletedProcess:
@@ -1732,12 +1730,6 @@ def _bd_show_json(repo: str, bead_id: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def parse_with_pair(values: list[str]) -> frozenset[str]:
-    """--with-pair CLI values (repeatable, or comma-separated) -> a flat id
-    set. Lives here, not in the CLI, so bin/sable-merge-gate stays thin."""
-    return frozenset(tok.strip() for raw in values for tok in raw.split(",") if tok.strip())
-
-
 def declared_landing_pair(repo: str, bead: str) -> frozenset[str]:
     """The bead ids <bead> itself declares via `metadata.landing_pair`
     (comma/whitespace-separated). Empty when unset, unreadable, or bead is
@@ -1751,7 +1743,7 @@ def declared_landing_pair(repo: str, bead: str) -> frozenset[str]:
 
 def _bead_landed(repo: str, bead_id: str) -> bool:
     notes = _bd_show_json(repo, bead_id).get("notes") or ""
-    return _LANDED_MARKER in notes
+    return _LANDED_MARKER in notes or _BATCH_LANDED_MARKER in notes
 
 
 def bead_landed(repo: str, bead_id: str) -> bool:
@@ -1759,43 +1751,59 @@ def bead_landed(repo: str, bead_id: str) -> bool:
     return _bead_landed(repo, bead_id)
 
 
-def assert_landing_pair_satisfied(repo: str, bead: str,
-                                  with_pair: frozenset[str] = frozenset()) -> None:
+def assert_landing_pair_satisfied(repo: str, bead: str) -> None:
     """Refuse a solo promote of <bead> when it declares a `landing_pair`
-    counterpart that is neither already landed nor named in <with_pair> (the
-    --with-pair CLI flag, i.e. this SAME promote call). Two unpaired beads —
-    no `landing_pair` metadata at all — are never touched by this check,
-    however similar their footprints: it discriminates on the declared
-    relation, not on any file-level property."""
+    counterpart that has not already landed. Two unpaired beads — no
+    `landing_pair` metadata at all — are never touched by this check, however
+    similar their footprints: it discriminates on the declared relation, not
+    on any file-level property."""
     for counterpart in declared_landing_pair(repo, bead):
-        if counterpart in with_pair:
-            continue
         if _bead_landed(repo, counterpart):
             continue
         raise LandingPairRefused(
             f"{bead} declares metadata.{_LANDING_PAIR_KEY}={counterpart!r} (SABLE-rzkw7: "
-            f"MUST-LAND-TOGETHER) and {counterpart} is neither landed nor named on this "
-            f"promote call. Refusing a solo promote of {bead}. Promote both together — "
-            f"sable-merge-gate promote --bead {bead} --branch <branch> --with-pair {counterpart} "
-            f"— or wait for {counterpart} to land first.")
+            f"MUST-LAND-TOGETHER) and {counterpart} has not landed. Refusing a solo "
+            f"promote of {bead}. Co-land both exact branches through one atomic "
+            f"`sable-merge-gate batch-cycle` or pre-verified `land-batch` operation, "
+            f"or use this recovery path only after {counterpart} genuinely lands.")
 
 
 def assert_batch_landing_pairs_satisfied(repo: str, members: list) -> None:
     """Apply the existing MUST-LAND-TOGETHER authority to a whole batch.
 
-    A batch is the one place where ``--with-pair`` has a concrete artifact:
-    every bead named in ``members`` will share the same atomic integration-ref
-    write.  A counterpart absent from that set still refuses exactly like a
-    solo promote.
+    Every bead named in ``members`` will share the same atomic integration-ref
+    write. A counterpart absent from that concrete set still refuses exactly
+    like a solo promote.
     """
     batch_beads = frozenset(
         bead_id for member in members for bead_id in member.bead_ids)
     for bead_id in batch_beads:
-        try:
-            assert_landing_pair_satisfied(
-                repo, bead_id, batch_beads - {bead_id})
-        except LandingPairRefused as exc:
-            raise GateError(classify.EXIT_PAIR_REFUSED, str(exc)) from exc
+        for counterpart in declared_landing_pair(repo, bead_id):
+            if counterpart in batch_beads or _bead_landed(repo, counterpart):
+                continue
+            raise GateError(
+                classify.EXIT_PAIR_REFUSED,
+                f"{bead_id} declares metadata.{_LANDING_PAIR_KEY}={counterpart!r} "
+                f"(SABLE-rzkw7: MUST-LAND-TOGETHER), but {counterpart} is neither "
+                f"already landed nor a member of this atomic batch. Nothing landed.")
+
+
+def assert_batch_members_identified(members: list) -> None:
+    """Every landing member must name the bead identities its write covers.
+
+    Pair authority is defined over beads, so accepting a beadless member would
+    make it invisible to the final writer's independent membership check.
+    Bisection may still inspect beadless branches; only a landing is denied.
+    """
+    unnamed = [
+        member.branch for member in members
+        if not member.bead_ids or any(not bead_id for bead_id in member.bead_ids)
+    ]
+    if unnamed:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            "batch landing requires at least one bead id for every member; "
+            f"pair authority cannot inspect beadless branch(es): {', '.join(unnamed)}")
 
 
 # --------------------------------------------------------------------------
@@ -3333,7 +3341,6 @@ def _adoption_miss_optimistic(bead: str, branch: str, base: str, repo: str, remo
 def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             manager: str, override: str | None,
             coverage_override: str | None = None,
-            with_pair: frozenset[str] = frozenset(),
             auto: bool = False) -> int:
     # FIRST, before any git work: is the fleet frozen? (SABLE-jd5fj.5)
     assert_not_frozen(repo)
@@ -3341,7 +3348,7 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
     # freeze read above: does <bead> declare a MUST-LAND-TOGETHER counterpart
     # that this solo promote would silently split? (SABLE-rzkw7)
     try:
-        assert_landing_pair_satisfied(repo, bead, with_pair)
+        assert_landing_pair_satisfied(repo, bead)
     except LandingPairRefused as exc:
         raise GateError(classify.EXIT_PAIR_REFUSED, str(exc)) from exc
     base_ref = classify.qualify_remote_ref(remote, base)
@@ -3741,6 +3748,7 @@ def land_batch(repo: str, remote: str, base: str, base_sha: str, fold_tip: str,
     assert_not_frozen(repo)
     # 1. AUTHORITY + BUDGET REFUSAL — before any git work.
     assert_exact_green_batch_verdict(verdict, fold_tip, combined_ref)
+    assert_batch_members_identified(members)
     assert_batch_landing_pairs_satisfied(repo, members)
     assert_batch_budget_present(budget)
     if not members:
@@ -3847,6 +3855,11 @@ def resolve_batch_members(repo: str, remote: str, base_sha: str, member_specs: l
     for spec in member_specs:
         branch, _, bead_part = spec.partition(":")
         bead_ids = tuple(b for b in bead_part.split(",") if b)
+        if command == "land-batch" and not bead_ids:
+            raise GateError(
+                classify.EXIT_USAGE,
+                f"land-batch member {branch!r} has no bead id; use "
+                f"--member {branch}:BEAD_ID so final pair authority can inspect it")
         if refresh_refs:
             git_lib._git(repo, "fetch", remote, branch, check=False)
         tip = git_lib.resolve_commit(
@@ -3870,8 +3883,8 @@ def land_batch_from_refs(base: str, member_specs: list, repo: str, remote: str,
     (test_cli_is_thin).
 
     `base` is the raw --base value (None → resolved here via resolve_base, the
-    same precedence promote() uses); `member_specs` are raw `branch` or
-    `branch:BEAD[,BEAD...]` strings."""
+    same precedence promote() uses); every landing `member_spec` must be
+    `branch:BEAD[,BEAD...]` so the final pair authority can inspect it."""
     base = git_lib.resolve_base(base, repo)
     base_ref = classify.qualify_remote_ref(remote, base)
     git_lib._git(repo, "fetch", remote, base, check=False)
@@ -3912,7 +3925,8 @@ def register_land_batch(sub) -> None:
     lb.add_argument("--base", default=None, help="integration branch to land onto; "
                     "same resolution as promote")
     lb.add_argument("--member", action="append", default=[], dest="members", required=True,
-                    metavar="BRANCH[:BEAD[,BEAD...]]", help="repeatable; one per batch member")
+                    metavar="BRANCH:BEAD[,BEAD...]",
+                    help="repeatable; one identified member per batch")
     lb.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
     lb.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
     lb.add_argument("--manager", default="lincoln")
