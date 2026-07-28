@@ -82,6 +82,15 @@ esac
 # Env soft override applies to every leg (Agent matrix + Bash).
 [ "${SABLE_ORCHESTRATION_FORCE:-}" = "1" ] && exit 0
 
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+MODE_BIN="$HOOK_DIR/../../bin/sable-mode"
+if [ ! -x "$MODE_BIN" ]; then
+  MODE_BIN="$(command -v sable-mode 2>/dev/null || true)"
+fi
+MODE_BIN_PHYSICAL="$(readlink -f "$MODE_BIN" 2>/dev/null || true)"
+MODE_LIB_DIR="${MODE_BIN_PHYSICAL%/*}"
+unset MODE_BIN_PHYSICAL
+
 # Single JSON parse for every field any leg might need (SABLE-s8x9): the hook
 # used to re-parse $INPUT with a SEPARATE cold python3 process per field
 # (tool_name, agent_id, cwd, subagent_type, command) — up to 5 python3 starts
@@ -89,16 +98,15 @@ esac
 # that cost is paid constantly in real sessions; hooks/test/test-mode-interlock.sh
 # alone drives 250+ invocations, and the stacked python3 cold-starts were long
 # enough to run the suite past a 30-40s test-harness timeout (read as "hangs
-# indefinitely" — it doesn't deadlock, it's just needlessly slow). One parse,
-# The same process also snapshots mode/tier/substage when SABLE_MODE_STATE is
-# an explicit override. That path is already authoritative, so starting a
-# second Python process to read the same file added latency without adding an
-# independent check. A non-empty sentinel preserves empty hint fields through
-# command substitution's trailing-newline stripping; command stays LAST since
-# it's the only field that can
+# indefinitely" — it doesn't deadlock, it's just needlessly slow). This process
+# also imports the canonical store for the common explicit-state-path case,
+# avoiding a second Python startup without duplicating the schema. A non-empty
+# sentinel preserves empty state fields and command position through command
+# substitution's trailing-newline stripping; command stays LAST since it is the
+# only field that can
 # legitimately contain embedded newlines — a multi-line command payload — so
 # it's captured as everything after the sentinel rather than a single sed line.
-PARSED="$(printf '%s' "$INPUT" | python3 -c "
+PARSED="$(printf '%s' "$INPUT" | MODE_LIB_DIR="$MODE_LIB_DIR" python3 -c "
 import json, os, sys
 try:
     d = json.load(sys.stdin)
@@ -114,21 +122,26 @@ try:
     command = ti.get('command', '') or ''
 except Exception:
     tool_name = agent_id = cwd = subtype = command = ''
-mode = tier = substage = ''
-state = os.environ.get('SABLE_MODE_STATE', '')
-if state:
-    try:
-        state_data = json.load(open(state))
-        if isinstance(state_data, dict):
-            mode = state_data.get('mode', '') or ''
-            tier = state_data.get('tier', '') or ''
-            substage = state_data.get('substage', '') or ''
-    except Exception:
-        pass
+mode = tier = substage = '-'
+state_path = os.environ.get('SABLE_MODE_STATE', '')
+try:
+    sys.path.insert(0, os.environ['MODE_LIB_DIR'])
+    from sable_mode_store_lib import read_mode_state, resolve_mode_state_path
+    if not state_path:
+        state_path = str(resolve_mode_state_path(cwd or None))
+    if os.path.exists(state_path):
+        state = read_mode_state(state_path)
+        mode = state['mode']
+        tier = state.get('tier') or '-'
+        substage = state.get('substage') or '-'
+except Exception:
+    if state_path and os.path.exists(state_path):
+        mode = '__SABLE_STATE_CORRUPT__'
 print(tool_name)
 print(agent_id)
 print(cwd)
 print(subtype)
+print(state_path or '-')
 print(mode)
 print(tier)
 print(substage)
@@ -146,12 +159,18 @@ HOOK_CWD="${_REST%%$'\n'*}"
 _REST="${_REST#*$'\n'}"
 SUBTYPE_RAW="${_REST%%$'\n'*}"
 _REST="${_REST#*$'\n'}"
+STATE_HINT="${_REST%%$'\n'*}"
+_REST="${_REST#*$'\n'}"
 MODE_HINT="${_REST%%$'\n'*}"
 _REST="${_REST#*$'\n'}"
 TIER_HINT="${_REST%%$'\n'*}"
 _REST="${_REST#*$'\n'}"
 SUBSTAGE_HINT="${_REST%%$'\n'*}"
 _REST="${_REST#*$'\n'}"
+[ "$MODE_HINT" = "-" ] && MODE_HINT=""
+[ "$STATE_HINT" = "-" ] && STATE_HINT=""
+[ "$TIER_HINT" = "-" ] && TIER_HINT=""
+[ "$SUBSTAGE_HINT" = "-" ] && SUBSTAGE_HINT=""
 case "$_REST" in
   "__SABLE_COMMAND__"$'\n'*) CMD_TEXT="${_REST#*$'\n'}" ;;
   "__SABLE_COMMAND__") CMD_TEXT="" ;;
@@ -159,18 +178,11 @@ case "$_REST" in
 esac
 unset _REST
 
-# Resolve current mode. Read the state file directly when it exists — this
-# hook already exported SABLE_MODE_STATE=$STATE above, and $MODE_BIN's own
-# resolve_state_path (bin/sable-mode) shortcuts on that same env var, so its
-# `get` subcommand would read this exact file with the identical
-# json.load(...).get('mode','') logic below. Shelling out to it costs a bash
-# process PLUS a python3 process per hook call — paid on every governed tool
-# call in real sessions, and 250+ times in hooks/test/test-mode-interlock.sh
-# alone (SABLE-s8x9: this stacked latency, not a deadlock, was what looked
-# like an indefinite hang). Fall back to the helper only when the file isn't
-# there yet — same empty-MODE result either way.
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-MODE_BIN="$HOOK_DIR/../../bin/sable-mode"
+# Resolve one current state snapshot through the canonical store (direct import
+# in the parser above, with sable-mode as the partial-install fallback). This
+# keeps the hook from growing a second validator while using only one state
+# reader. Atomic replacement guarantees an old or new complete version. A
+# missing file is intentionally inert; a present invalid file fails closed.
 
 # Resolve the mode-state file from the repo the tool call runs in (the hook-input
 # cwd, the dir git actually operates in — mirrors SABLE-041's push-repo resolve)
@@ -185,18 +197,31 @@ MODE_BIN="$HOOK_DIR/../../bin/sable-mode"
 . "$HOOK_DIR/lib-registry-path.sh"
 # shellcheck source=lib-identity.sh
 . "$HOOK_DIR/lib-identity.sh"
-STATE="$(sable_mode_state_path "$HOOK_CWD")"
+if [ -n "$STATE_HINT" ]; then
+  STATE="$STATE_HINT"
+else
+  STATE="$(sable_mode_state_path "$HOOK_CWD")"
+fi
 export SABLE_MODE_STATE="$STATE"
 
 MODE="$MODE_HINT"
 if [ -f "$STATE" ]; then
-  if [ -z "$MODE" ]; then
-    MODE="$(STATE="$STATE" python3 -c "import json,os; print(json.load(open(os.environ['STATE'])).get('mode','') or '')" 2>/dev/null || true)"
+  if [ -z "$MODE" ] && [ -n "$MODE_BIN" ] && [ -x "$MODE_BIN" ] \
+      && STATE_SNAPSHOT="$("$MODE_BIN" snapshot 2>/dev/null)"; then
+    MODE="${STATE_SNAPSHOT%%$'\n'*}"
+    _STATE_REST="${STATE_SNAPSHOT#*$'\n'}"
+    TIER_HINT="${_STATE_REST%%$'\n'*}"
+    SUBSTAGE_HINT="${_STATE_REST#*$'\n'}"
+    [ "$TIER_HINT" = "-" ] && TIER_HINT=""
+    [ "$SUBSTAGE_HINT" = "-" ] && SUBSTAGE_HINT=""
+    unset STATE_SNAPSHOT _STATE_REST
+  elif [ -z "$MODE" ]; then
+    MODE="__SABLE_STATE_CORRUPT__"
   fi
-elif [ -x "$MODE_BIN" ]; then
-  MODE="$("$MODE_BIN" get 2>/dev/null || true)"
 fi
 [ -z "$MODE" ] && exit 0
+STATE_CORRUPT=0
+[ "$MODE" = "__SABLE_STATE_CORRUPT__" ] && STATE_CORRUPT=1
 
 deny() {
   # $1 = reason
@@ -212,6 +237,10 @@ deny() {
   printf '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "%s"}}\n' "$reason"
   exit 0
 }
+
+if [ "$STATE_CORRUPT" -eq 1 ] && [ "$TOOL_NAME" = "Agent" ]; then
+  deny "Orchestration mode state is present but corrupt at $STATE. Agent dispatch is blocked until an operator runs 'sable-mode clear' and deliberately starts a new mode. Set SABLE_ORCHESTRATION_FORCE=1 only for an audited break-glass recovery."
+fi
 
 # classify_target <name> → echoes "manager" | "producer" | "free".
 # Looks the spawn target up in agents.yaml. Registered manager-class types are
@@ -320,6 +349,15 @@ leading_cmd() {
   done
 }
 LEADING_CMD="$(leading_cmd "$CMD_TEXT")"
+
+if [ "$STATE_CORRUPT" -eq 1 ]; then
+  case "${LEADING_CMD##*/}" in
+    sable-mode) exit 0 ;;
+    *)
+      deny "Orchestration mode state is present but corrupt at $STATE. Bash activity is blocked until an operator runs 'sable-mode clear' and deliberately starts a new mode. Set SABLE_ORCHESTRATION_FORCE=1 only for an audited break-glass recovery."
+      ;;
+  esac
+fi
 
 # is_prose_carrier <command> → true iff the leading command word legitimately
 # carries agent / producer / spawn-helper NAMES inside its arguments as prose
@@ -588,13 +626,7 @@ authors_backlog() {
 # Resolve the planning substage the same way MODE is resolved (helper preferred,
 # file fallback). Empty when unset or not in planning mode.
 get_substage() {
-  if [ -n "$SUBSTAGE_HINT" ]; then
-    printf '%s\n' "$SUBSTAGE_HINT"
-  elif [ -x "$MODE_BIN" ]; then
-    "$MODE_BIN" substage get 2>/dev/null || true
-  elif [ -f "$STATE" ]; then
-    STATE="$STATE" python3 -c "import json,os; print(json.load(open(os.environ['STATE'])).get('substage','') or '')" 2>/dev/null || true
-  fi
+  printf '%s\n' "$SUBSTAGE_HINT"
 }
 
 # Resolve the planning tier (quick|full|discovery). Empty/full => the full
@@ -604,13 +636,7 @@ get_substage() {
 # gate (it authors no implementation beads — only charters + epic-intention
 # shells). Fail-safe: anything other than 'quick'/'discovery' keeps the strict gate.
 get_tier() {
-  if [ -n "$TIER_HINT" ]; then
-    printf '%s\n' "$TIER_HINT"
-  elif [ -x "$MODE_BIN" ]; then
-    "$MODE_BIN" tier get 2>/dev/null || true
-  elif [ -f "$STATE" ]; then
-    STATE="$STATE" python3 -c "import json,os; print(json.load(open(os.environ['STATE'])).get('tier','') or '')" 2>/dev/null || true
-  fi
+  printf '%s\n' "$TIER_HINT"
 }
 
 case "$MODE" in

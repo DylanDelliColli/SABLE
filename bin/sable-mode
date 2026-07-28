@@ -1,452 +1,278 @@
-#!/usr/bin/env bash
-# sable-mode — read/write the orchestration mode-state file.
-#
-# Single source of truth for which mode the orchestration session is in. Written by
-# the /plan and /execute skills; read by the mode interlock hook
-# (mode-interlock.sh). Uses python3 for
-# JSON (always present — it defines the env); deliberately NO jq dependency,
-# which is fragile across conda envs (see SABLE-cav.8).
-#
-# State file — resolved PER-REPO by resolve_state_path (mirrors
-# hooks/multi-manager/lib-mode-path.sh): inside a git repo it is the repo's
-# main-worktree .claude/sable/state/mode-state.json (shared across the repo's
-# worktrees), so independent SABLE sessions in different repos keep independent
-# modes; outside a git repo it falls back to ~/.claude/sable/state/mode-state.json.
-# Override the location with SABLE_MODE_STATE (testing + manual escape hatch).
-#   ~/.claude/sable/state/mode-state.json
-# Shape:
-#   { "mode": "planning|execution", "since": "<ISO-8601>", "fleet": ["a","b"],
-#     "substage": "framing|research|architecture|test-strategy|decomposition" }
-#   substage is present only in planning mode (entering planning starts at
-#   framing). It is the gated sub-state machine the /plan flow walks and the
-#   interlock reads to block backlog authoring before decomposition.
-#
-# Runtime enable gate: when SABLE_ORCHESTRATION is off/0/false/no (case-insensitive),
-# `set` refuses (so /plan and /execute cannot flip mode); `get`/`show` still
-# read. Unset (or any other value) = enabled.
-#
-# Usage:
-#   sable-mode set <planning|execution> [--fleet a,b,c]
-#                   [--providers optimus=claude,tarzan=claude,chuck=claude,worker=claude]
-#   sable-mode get                 # print the bare mode word (nonzero if unset);
-#                                  # warns on stderr if the state is stale
-#   sable-mode show                # print the full JSON (nonzero if unset)
-#   sable-mode clear                # delete the mode-state file
-#   sable-mode substage get        # print the planning substage (nonzero if none)
-#   sable-mode substage set <name> # set substage to a named stage
-#   sable-mode substage advance    # move to the next substage (nonzero past end)
-#   sable-mode --help
+#!/usr/bin/env python3
+"""Read and transition SABLE's per-repository orchestration mode state.
 
-set -eu
+The CLI is intentionally thin. ``sable_mode_store_lib`` owns path resolution,
+schema validation, serialization, provider immutability, and atomic
+read-modify-write transitions.
+"""
 
-SELF="${BASH_SOURCE[0]:-$0}"
-[ -L "$SELF" ] && SELF="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
-BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+from __future__ import annotations
 
-# resolve_state_path [base_dir] — MIRROR of sable_mode_state_path in
-# hooks/multi-manager/lib-mode-path.sh. Kept as a copy (not a source) because
-# post-install there is no stable path from this binary (~/.local/bin symlink)
-# to the hooks dir (~/.claude/hooks copy); a drift-guard test in
-# test-sable-mode.sh asserts the two implementations stay identical.
-resolve_state_path() {
-    if [ -n "${SABLE_MODE_STATE:-}" ]; then
-        printf '%s\n' "$SABLE_MODE_STATE"
-        return 0
-    fi
-    local base="${1:-$PWD}"
-    local common root
-    if common="$(git -C "$base" rev-parse --git-common-dir 2>/dev/null)" && [ -n "$common" ]; then
-        case "$common" in
-            /*) ;;
-            *)  common="$base/$common" ;;
-        esac
-        if root="$(cd "$(dirname "$common")" 2>/dev/null && pwd)" && [ -n "$root" ]; then
-            printf '%s\n' "$root/.claude/sable/state/mode-state.json"
-            return 0
-        fi
-    fi
-    printf '%s\n' "${HOME:-}/.claude/sable/state/mode-state.json"
-}
-
-# ensure_state_gitignored <state-path> — best-effort: when the state file lives
-# inside a git repo at the canonical <root>/.claude/sable/state/ location, make
-# sure that path is gitignored so the ephemeral mode-state never shows up as
-# untracked in an adopter's repo (any install tier). Idempotent; respects a
-# pre-existing broader '.claude/sable/' ignore; silent on any failure. Skips
-# override / non-git paths (they don't match the canonical suffix).
-ensure_state_gitignored() {
-    local state="$1" root gi pattern=".claude/sable/state/"
-    case "$state" in
-        */.claude/sable/state/mode-state.json)
-            root="${state%/.claude/sable/state/mode-state.json}" ;;
-        *) return 0 ;;
-    esac
-    git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
-    gi="$root/.gitignore"
-    if [ -f "$gi" ] && grep -q '\.claude/sable/' "$gi" 2>/dev/null; then
-        return 0
-    fi
-    printf '%s\n' "$pattern" >> "$gi" 2>/dev/null || true
-}
-
-STATE="$(resolve_state_path)"
-
-# Staleness threshold (hours) for the 'get' warning below — overridable for
-# tests. A mode-state older than this almost certainly outlived the session
-# that wrote it (SABLE-rucp: a discovery-tier state from 2026-06-26 was still
-# being read as live 12 days later with a clean tree and no active run).
-STALE_HOURS="${SABLE_MODE_STALE_HOURS:-72}"
-
-# warn_if_stale <state-path> — best-effort stderr warning when the state's
-# 'since' timestamp is older than STALE_HOURS. Advisory only: never affects
-# exit code or stdout, silent on any parse error.
-warn_if_stale() {
-    STATE="$1" STALE_HOURS="$STALE_HOURS" python3 -c "
-import json, os, sys
+import argparse
+import json
+import os
+import sys
 from datetime import datetime, timezone
-try:
-    d = json.load(open(os.environ['STATE']))
-    since = d.get('since') or ''
-    if not since:
-        sys.exit(0)
-    ts = datetime.strptime(since, '%Y-%m-%dT%H:%M:%S%z')
-    age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
-    if age_hours > float(os.environ['STALE_HOURS']):
-        print(
-            \"sable-mode: WARNING - mode-state is stale (%.1fd old, mode=%s, since %s) - if this session has ended, run 'sable-mode clear'\"
-            % (age_hours / 24.0, d.get('mode', '') or '?', since),
-            file=sys.stderr,
-        )
-except Exception:
-    pass
-"
-}
+from pathlib import Path
 
-usage() {
-    cat <<EOF
-sable-mode — read/write the orchestration mode-state file.
-
-Usage:
-  sable-mode set <planning|execution> [--fleet a,b,c] [--tier quick|full|discovery]
-      [--providers optimus=claude,tarzan=claude,chuck=claude,worker=claude]
-      Write the mode-state file. --fleet is a comma-separated list of the
-      agents launched for this mode (recorded for the dashboard). --tier sets
-      the planning tier (default full); quick telescopes the backlog gate, and
-      discovery (Mode 1) is the lightest sub-mode — no backlog gate, since
-      Discovery authors no implementation beads (it writes charters).
-      --providers is execution-only. Omitted roles default to Claude. The map
-      is immutable until execution mode is cleared or changed to planning.
-  sable-mode get      Print the current mode word; nonzero exit if unset. Warns
-                      on stderr (SABLE_MODE_STALE_HOURS, default 72) when the
-                      state is older than that and suggests 'sable-mode clear'.
-  sable-mode show     Print the full mode-state JSON; nonzero exit if unset.
-  sable-mode path     Print the resolved mode-state file path (no state needed).
-  sable-mode clear    Delete the mode-state file; nonzero exit if none exists.
-  sable-mode substage get        Print the current planning substage; nonzero
-                                 if unset or not in planning mode.
-  sable-mode substage set <name> Set the substage to one of:
-                                 framing research architecture test-strategy decomposition
-  sable-mode substage advance    Advance to the next substage in order; nonzero
-                                 if already at decomposition.
-  sable-mode tier get            Print the planning tier (quick|full|discovery,
-                                 default full); nonzero if unset or not in planning.
-  sable-mode providers get [role]
-                                 Print the execution provider map, or the bare
-                                 provider for optimus|tarzan|chuck|worker.
-  sable-mode --help
-
-State file (resolved per-repo): ${STATE}
-  Inside a git repo this is <repo>/.claude/sable/state/mode-state.json (shared
-  across the repo's worktrees); otherwise ~/.claude/sable/state/mode-state.json.
-  Override the location with the SABLE_MODE_STATE environment variable.
-
-Disable at runtime with: SABLE_ORCHESTRATION=off
-EOF
-}
-
-# Runtime enable gate. Disabled when SABLE_ORCHESTRATION is off/0/false/no.
-orchestration_enabled() {
-    case "$(printf '%s' "${SABLE_ORCHESTRATION:-}" | tr '[:upper:]' '[:lower:]')" in
-        off|0|false|no) return 1 ;;
-        *) return 0 ;;
-    esac
-}
-
-require_state() {
-    if [ ! -f "$STATE" ]; then
-        printf 'sable-mode: no mode set (no state file at %s)\n' "$STATE" >&2
-        exit 1
-    fi
-}
-
-cmd="${1:-}"
-case "$cmd" in
-    -h|--help)
-        usage
-        exit 0
-        ;;
-    get)
-        require_state
-        warn_if_stale "$STATE"
-        STATE="$STATE" python3 -c "import json,os; print(json.load(open(os.environ['STATE'])).get('mode','') or '')"
-        ;;
-    show)
-        require_state
-        cat "$STATE"
-        ;;
-    path)
-        # Print the resolved state-file path. No state required — answers
-        # "where would the mode-state for this repo live?" even when unset.
-        printf '%s\n' "$STATE"
-        ;;
-    clear)
-        # Remove the mode-state file — the remedy the 'get' staleness warning
-        # suggests (SABLE-rucp). Idempotent-ish: nonzero + stderr message if
-        # there was nothing to clear, mirroring require_state's own message.
-        if [ -f "$STATE" ]; then
-            rm -f "$STATE"
-            printf 'sable-mode: cleared mode-state at %s\n' "$STATE"
-        else
-            printf 'sable-mode: no mode set (no state file at %s)\n' "$STATE" >&2
-            exit 1
-        fi
-        ;;
-    set)
-        if ! orchestration_enabled; then
-            printf 'sable-mode: orchestration disabled (SABLE_ORCHESTRATION=%s); unset SABLE_ORCHESTRATION to enable\n' "${SABLE_ORCHESTRATION:-}" >&2
-            exit 3
-        fi
-        mode="${2:-}"
-        case "$mode" in
-            planning|execution) ;;
-            *)
-                printf "sable-mode: invalid mode '%s' (must be planning or execution)\n" "$mode" >&2
-                exit 2
-                ;;
-        esac
-
-        # Consume the verb + mode, then scan for --fleet, --tier, and the
-        # immutable execution-session provider map.
-        shift 2 || true
-        fleet_csv=""
-        tier=""
-        providers_csv=""
-        providers_seen=0
-        while [ $# -gt 0 ]; do
-            case "$1" in
-                --fleet)    fleet_csv="${2:-}"; shift 2 || shift ;;
-                --fleet=*)  fleet_csv="${1#--fleet=}"; shift ;;
-                --tier)     tier="${2:-}"; shift 2 || shift ;;
-                --tier=*)   tier="${1#--tier=}"; shift ;;
-                --providers)
-                    if [ $# -lt 2 ]; then
-                        printf 'sable-mode: --providers requires a role=provider map\n' >&2
-                        exit 2
-                    fi
-                    providers_csv="$2"; providers_seen=1; shift 2
-                    ;;
-                --providers=*)
-                    providers_csv="${1#--providers=}"; providers_seen=1; shift
-                    ;;
-                *)          shift ;;
-            esac
-        done
-        case "${tier:-full}" in
-            quick|full|discovery) ;;
-            *) printf "sable-mode: invalid tier '%s' (must be quick, full, or discovery)\n" "$tier" >&2; exit 2 ;;
-        esac
-
-        if [ "$mode" = "planning" ] && [ "$providers_seen" -eq 1 ]; then
-            printf 'sable-mode: --providers is valid only for execution mode\n' >&2
-            exit 2
-        fi
-
-        providers_json=""
-        if [ "$mode" = "execution" ]; then
-            if ! providers_json="$(
-                BIN_DIR="$BIN_DIR" PROVIDERS="$providers_csv" python3 -c "
-import json, os, sys
-sys.path.insert(0, os.environ['BIN_DIR'])
-from sable_provider_lib import ProviderMapError, parse_provider_map
-try:
-    print(json.dumps(parse_provider_map(os.environ.get('PROVIDERS'))))
-except ProviderMapError as exc:
-    print(f'sable-mode: {exc}', file=sys.stderr)
-    raise SystemExit(2)
-"
-            )"; then
-                exit 2
-            fi
-
-            # A running execution session owns one fixed provider map. Legacy
-            # state without the field is interpreted as all-Claude.
-            if [ -f "$STATE" ]; then
-                provider_guard_rc=0
-                STATE="$STATE" BIN_DIR="$BIN_DIR" PROVIDERS_JSON="$providers_json" python3 -c "
-import json, os, sys
-sys.path.insert(0, os.environ['BIN_DIR'])
-from sable_provider_lib import ProviderMapError, provider_map_from_state
-try:
-    current = json.load(open(os.environ['STATE']))
-    requested = json.loads(os.environ['PROVIDERS_JSON'])
-    if current.get('mode') == 'execution' and provider_map_from_state(current) != requested:
-        print(
-            'sable-mode: execution provider map is immutable; '
-            'stand down or clear the current mode before changing providers',
-            file=sys.stderr,
-        )
-        raise SystemExit(4)
-except ProviderMapError as exc:
-    print(f'sable-mode: invalid existing provider map: {exc}', file=sys.stderr)
-    raise SystemExit(4)
-" || provider_guard_rc=$?
-                [ "$provider_guard_rc" -eq 0 ] || exit "$provider_guard_rc"
-            fi
-        fi
-
-        since="$(date +%Y-%m-%dT%H:%M:%S%z)"
-        mkdir -p "$(dirname "$STATE")"
-        STATE="$STATE" MODE="$mode" SINCE="$since" FLEET="$fleet_csv" TIER="${tier:-full}" PROVIDERS_JSON="$providers_json" python3 -c "
-import json, os
-fleet = [s for s in os.environ.get('FLEET', '').split(',') if s]
-mode = os.environ['MODE']
-data = {'mode': mode, 'since': os.environ['SINCE'], 'fleet': fleet}
-# Planning is a staged sub-state machine; entering it starts at framing.
-# Execution has no substage. The tier (quick|full|discovery, default full)
-# telescopes the substage gate: quick-tier planning lets the interlock allow
-# backlog authoring under the single /sable-plan approval instead of walking all
-# five substages; discovery (Mode 1) likewise bypasses the backlog gate (it
-# authors no implementation beads).
-if mode == 'planning':
-    data['substage'] = 'framing'
-    data['tier'] = os.environ.get('TIER') or 'full'
-else:
-    data['providers'] = json.loads(os.environ['PROVIDERS_JSON'])
-with open(os.environ['STATE'], 'w') as f:
-    f.write(json.dumps(data, indent=2) + chr(10))
-"
-        ensure_state_gitignored "$STATE"
-        ;;
-    substage)
-        # Planning sub-state machine. Ordered:
-        #   framing -> research -> architecture -> test-strategy -> decomposition
-        # Only meaningful while mode == planning.
-        require_state
-        action="${2:-}"
-        substages="framing research architecture test-strategy decomposition"
-        case "$action" in
-            get)
-                STATE="$STATE" python3 -c "
-import json, os
-d = json.load(open(os.environ['STATE']))
-if d.get('mode') != 'planning':
-    raise SystemExit(1)
-s = d.get('substage') or ''
-if not s:
-    raise SystemExit(1)
-print(s)
-"
-                ;;
-            set)
-                name="${3:-}"
-                case " $substages " in
-                    *" $name "*) ;;
-                    *)
-                        printf "sable-mode: invalid substage '%s' (must be one of: %s)\n" "$name" "$substages" >&2
-                        exit 2
-                        ;;
-                esac
-                STATE="$STATE" NAME="$name" python3 -c "
-import json, os
-d = json.load(open(os.environ['STATE']))
-if d.get('mode') != 'planning':
-    raise SystemExit(1)
-d['substage'] = os.environ['NAME']
-with open(os.environ['STATE'], 'w') as f:
-    f.write(json.dumps(d, indent=2) + chr(10))
-"
-                ;;
-            advance)
-                STATE="$STATE" SUBSTAGES="$substages" python3 -c "
-import json, os
-order = os.environ['SUBSTAGES'].split()
-d = json.load(open(os.environ['STATE']))
-if d.get('mode') != 'planning':
-    raise SystemExit(1)
-cur = d.get('substage')
-if cur not in order:
-    raise SystemExit(1)
-i = order.index(cur)
-if i + 1 >= len(order):
-    raise SystemExit(1)   # already at decomposition — cannot advance further
-d['substage'] = order[i + 1]
-with open(os.environ['STATE'], 'w') as f:
-    f.write(json.dumps(d, indent=2) + chr(10))
-"
-                ;;
-            *)
-                printf 'sable-mode: substage requires: get | set <name> | advance\n' >&2
-                exit 1
-                ;;
-        esac
-        ;;
-    tier)
-        # Planning tier (quick|full). Read by the interlock to telescope the
-        # backlog gate. Defaults to full when in planning mode and unset.
-        require_state
-        action="${2:-}"
-        case "$action" in
-            get)
-                STATE="$STATE" python3 -c "
-import json, os
-d = json.load(open(os.environ['STATE']))
-if d.get('mode') != 'planning':
-    raise SystemExit(1)
-print(d.get('tier') or 'full')
-"
-                ;;
-            *)
-                printf 'sable-mode: tier requires: get\n' >&2
-                exit 1
-                ;;
-        esac
-        ;;
-    providers)
-        require_state
-        action="${2:-}"
-        role="${3:-}"
-        case "$action" in
-            get)
-                STATE="$STATE" BIN_DIR="$BIN_DIR" ROLE="$role" python3 -c "
-import json, os, sys
-sys.path.insert(0, os.environ['BIN_DIR'])
+from sable_mode_store_lib import (
+    PLANNING_SUBSTAGES,
+    ModeStateCorrupt,
+    ModeStateMissing,
+    ModeTransitionRefused,
+    advance_planning_substage,
+    clear_mode_state,
+    read_mode_state,
+    resolve_mode_state_path,
+    set_mode_state,
+    set_planning_substage,
+)
 from sable_provider_lib import (
     ProviderMapError,
     format_provider_map,
+    parse_provider_map,
     provider_for_role,
     provider_map_from_state,
 )
-state = json.load(open(os.environ['STATE']))
-if state.get('mode') != 'execution':
-    raise SystemExit(1)
-try:
-    if os.environ.get('ROLE'):
-        print(provider_for_role(state, os.environ['ROLE']))
-    else:
-        print(format_provider_map(provider_map_from_state(state)))
-except ProviderMapError as exc:
-    print(f'sable-mode: {exc}', file=sys.stderr)
-    raise SystemExit(2)
-"
-                ;;
-            *)
-                printf 'sable-mode: providers requires: get [optimus|tarzan|chuck|worker]\n' >&2
-                exit 1
-                ;;
-        esac
-        ;;
-    ""|*)
-        usage
-        exit 1
-        ;;
-esac
+
+
+def _parser(state_path: Path) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sable-mode",
+        description=(
+            "Read or atomically transition the per-repository SABLE "
+            "orchestration mode state."
+        ),
+        epilog=(
+            f"State file: {state_path}\n"
+            "Override with SABLE_MODE_STATE; disable transitions with "
+            "SABLE_ORCHESTRATION=off."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    set_parser = commands.add_parser("set", help="set planning or execution mode")
+    set_parser.add_argument("mode", choices=("planning", "execution"))
+    set_parser.add_argument(
+        "--fleet", default="",
+        help="comma-separated launched agent names recorded for the dashboard",
+    )
+    set_parser.add_argument(
+        "--tier", default="full", choices=("quick", "full", "discovery"),
+        help="planning tier (default: full)",
+    )
+    set_parser.add_argument(
+        "--providers", default=None,
+        help=(
+            "execution-only role=provider CSV for "
+            "optimus,tarzan,chuck,worker"
+        ),
+    )
+
+    commands.add_parser("get", help="print the active mode")
+    commands.add_parser("show", help="print the complete validated state")
+    commands.add_parser(
+        "snapshot",
+        help="print validated mode, tier, and substage ('-' when absent)",
+    )
+    commands.add_parser("path", help="print the resolved state path")
+    commands.add_parser("clear", help="clear state, including corrupt state")
+
+    substage = commands.add_parser(
+        "substage", help="read or transition the planning substage"
+    )
+    subcommands = substage.add_subparsers(dest="substage_command", required=True)
+    subcommands.add_parser("get")
+    substage_set = subcommands.add_parser("set")
+    substage_set.add_argument("name", choices=PLANNING_SUBSTAGES)
+    subcommands.add_parser("advance")
+
+    tier = commands.add_parser("tier", help="read the planning tier")
+    tier_commands = tier.add_subparsers(dest="tier_command", required=True)
+    tier_commands.add_parser("get")
+
+    providers = commands.add_parser(
+        "providers", help="read the execution provider map"
+    )
+    provider_commands = providers.add_subparsers(
+        dest="providers_command", required=True
+    )
+    provider_get = provider_commands.add_parser("get")
+    provider_get.add_argument(
+        "role", nargs="?", choices=("optimus", "tarzan", "chuck", "worker")
+    )
+    return parser
+
+
+def _orchestration_enabled() -> bool:
+    return os.environ.get("SABLE_ORCHESTRATION", "").lower() not in {
+        "off", "0", "false", "no"}
+
+
+def _ensure_state_gitignored(state_path: Path) -> None:
+    """Best-effort protection for canonical repository-local runtime state."""
+
+    suffix = Path(".claude/sable/state/mode-state.json")
+    try:
+        root = state_path.parents[3]
+    except IndexError:
+        return
+    if state_path != root / suffix or not (root / ".git").exists():
+        return
+    gitignore = root / ".gitignore"
+    pattern = ".claude/sable/state/"
+    try:
+        existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+        if ".claude/sable/" not in existing:
+            with gitignore.open("a", encoding="utf-8") as handle:
+                handle.write(pattern + "\n")
+    except OSError:
+        pass
+
+
+def _warn_if_stale(state: dict) -> None:
+    since = state.get("since") or ""
+    if not since:
+        return
+    try:
+        timestamp = datetime.strptime(since, "%Y-%m-%dT%H:%M:%S%z")
+        age_hours = (
+            datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)
+        ).total_seconds() / 3600.0
+        threshold = float(os.environ.get("SABLE_MODE_STALE_HOURS", "72"))
+    except (TypeError, ValueError):
+        return
+    if age_hours > threshold:
+        print(
+            "sable-mode: WARNING - mode-state is stale "
+            f"({age_hours / 24.0:.1f}d old, mode={state.get('mode') or '?'}, "
+            f"since {since}) - if this session has ended, run 'sable-mode clear'",
+            file=sys.stderr,
+        )
+
+
+def _read_planning_state(path: Path) -> dict:
+    state = read_mode_state(path)
+    if state.get("mode") != "planning":
+        raise ModeTransitionRefused("planning state is not active")
+    return state
+
+
+def _read_execution_state(path: Path) -> dict:
+    state = read_mode_state(path)
+    if state.get("mode") != "execution":
+        raise ModeTransitionRefused("execution state is not active")
+    return state
+
+
+def _run(args: argparse.Namespace, path: Path) -> int:
+    if args.command == "path":
+        print(path)
+        return 0
+    if args.command == "clear":
+        clear_mode_state(path)
+        print(f"sable-mode: cleared mode-state at {path}")
+        return 0
+    if args.command == "get":
+        state = read_mode_state(path)
+        _warn_if_stale(state)
+        print(state["mode"])
+        return 0
+    if args.command == "show":
+        print(json.dumps(read_mode_state(path), indent=2))
+        return 0
+    if args.command == "snapshot":
+        state = read_mode_state(path)
+        print(state["mode"])
+        print(state.get("tier") or "-")
+        print(state.get("substage") or "-")
+        return 0
+    if args.command == "set":
+        if not _orchestration_enabled():
+            print(
+                "sable-mode: orchestration disabled "
+                f"(SABLE_ORCHESTRATION={os.environ.get('SABLE_ORCHESTRATION', '')}); "
+                "unset SABLE_ORCHESTRATION to enable",
+                file=sys.stderr,
+            )
+            return 3
+        if args.mode == "planning" and args.providers is not None:
+            print(
+                "sable-mode: --providers is valid only for execution mode",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            providers = (
+                parse_provider_map(args.providers)
+                if args.mode == "execution"
+                else None
+            )
+        except ProviderMapError as exc:
+            print(f"sable-mode: {exc}", file=sys.stderr)
+            return 2
+        set_mode_state(
+            path,
+            args.mode,
+            fleet=tuple(member for member in args.fleet.split(",") if member),
+            tier=args.tier,
+            providers=providers,
+        )
+        _ensure_state_gitignored(path)
+        return 0
+    if args.command == "substage":
+        if args.substage_command == "get":
+            state = _read_planning_state(path)
+            substage = state.get("substage")
+            if not substage:
+                raise ModeTransitionRefused("planning state has no substage")
+            print(substage)
+            return 0
+        if args.substage_command == "set":
+            set_planning_substage(path, args.name)
+            return 0
+        if args.substage_command == "advance":
+            advance_planning_substage(path)
+            return 0
+    if args.command == "tier":
+        print(_read_planning_state(path).get("tier") or "full")
+        return 0
+    if args.command == "providers":
+        state = _read_execution_state(path)
+        if args.role:
+            print(provider_for_role(state, args.role))
+        else:
+            print(format_provider_map(provider_map_from_state(state)))
+        return 0
+    return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    path = resolve_mode_state_path()
+    args = _parser(path).parse_args(argv)
+    try:
+        return _run(args, path)
+    except ModeStateMissing:
+        print(
+            f"sable-mode: no mode set (no state file at {path})",
+            file=sys.stderr,
+        )
+        return 1
+    except ModeStateCorrupt as exc:
+        print(
+            f"sable-mode: {exc}. Run `sable-mode clear` to remove the corrupt "
+            "state before starting a new session.",
+            file=sys.stderr,
+        )
+        return 5
+    except ModeTransitionRefused as exc:
+        print(f"sable-mode: {exc}", file=sys.stderr)
+        return 4 if "provider map is immutable" in str(exc) else 1
+    except ProviderMapError as exc:
+        print(f"sable-mode: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

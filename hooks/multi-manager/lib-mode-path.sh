@@ -7,8 +7,9 @@
 # executing) without clobbering each other's mode.
 #
 # Sourced by hooks/multi-manager/lib-identity.sh and mode-interlock.sh (siblings,
-# copied together to ~/.claude/hooks/multi-manager/). bin/sable-mode keeps a
-# MIRRORED copy of this logic rather than sourcing it: post-install there is no
+# copied together to ~/.claude/hooks/multi-manager/). sable_mode_store_lib.py
+# keeps the Python implementation used by bin/sable-mode rather than sourcing
+# this shell file: post-install there is no
 # stable relative path from the binary to this file (install.sh COPIES hooks to
 # ~/.claude/hooks while sable-bin-install SYMLINKS bin tools to ~/.local/bin), so
 # a shared source would break under --copy installs. The mirror is kept honest by

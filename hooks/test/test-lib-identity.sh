@@ -407,9 +407,29 @@ run_lane_env "lane row3a: planning-mode main session stands down" \
 # dd1 — Dispatching-for prompt IGNORED for main-session exec lane (lincoln, not optimus)
 run_lane_env "dd1: Dispatching-for prompt ignored for main-session lane (lincoln)" \
   '{"tool_name":"Agent","tool_input":{"prompt":"Dispatching-for: optimus\nwork on x"}}' '{"mode":"execution"}' "" "1|lincoln"
-# dd1 — malformed mode-file JSON fails open
-run_lane_env "dd1: malformed mode-file JSON stands down (fail open)" \
+# A corrupt file still stands down, but is observably different from a missing
+# file so callers and diagnostics cannot mistake lost authority for inactivity.
+run_lane_env "dd1: malformed mode-file JSON stands down" \
   '{"tool_name":"Agent"}' 'not-json{' "" "0|"
+lane_state=$(
+  unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE
+  printf '%s' 'not-json{' > "$FIXTURE_DIR/mode-case.json"
+  export SABLE_MODE_STATE="$FIXTURE_DIR/mode-case.json"
+  # shellcheck disable=SC1090
+  source "$LIB"
+  sable_resolve_dispatch_lane '{"tool_name":"Agent"}'
+  printf '%s' "$SABLE_DISPATCH_STATE_STATUS"
+)
+if [ "$lane_state" = "corrupt" ]; then pass "dbq9p.4: dispatch reader labels malformed state corrupt"; else fail "dbq9p.4: dispatch reader labels malformed state corrupt" "got [$lane_state]"; fi
+lane_state=$(
+  unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE
+  export SABLE_MODE_STATE="$FIXTURE_DIR/nonexistent-mode-state.json"
+  # shellcheck disable=SC1090
+  source "$LIB"
+  sable_resolve_dispatch_lane '{"tool_name":"Agent"}'
+  printf '%s' "$SABLE_DISPATCH_STATE_STATUS"
+)
+if [ "$lane_state" = "missing" ]; then pass "dbq9p.4: dispatch reader labels absent state missing"; else fail "dbq9p.4: dispatch reader labels absent state missing" "got [$lane_state]"; fi
 # dd1 — registry missing → manager subagent fails open (stands down)
 run_lane_env "dd1: registry missing → manager subagent fails open" \
   '{"agent_id":"a1","agent_type":"tarzan","tool_name":"Agent"}' "" "/nonexistent/agents.yaml" "0|"

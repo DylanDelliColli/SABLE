@@ -50,7 +50,7 @@ printf 'CHUCK STATIC ROLE: merge landed branches with bare git merge --no-ff + g
 
 # --- The flip choreography: write the live protocol state to disk -------------
 # (fix direction 3 — the flip persists its contract change to the surface.)
-( cd "$RREPO" && SABLE_ORCHESTRATION=1 bash "$MODE" set execution >/dev/null 2>&1 ) \
+( cd "$RREPO" && SABLE_ORCHESTRATION=1 "$MODE" set execution >/dev/null 2>&1 ) \
     || fail "sable-mode set execution succeeds"
 ( cd "$RREPO" && bash "$CONTRACT" add \
     "sable-merge-gate is the SOLE merge path; no bare git merge/push." >/dev/null 2>&1 ) \

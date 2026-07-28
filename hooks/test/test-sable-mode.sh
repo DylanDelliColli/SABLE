@@ -28,6 +28,9 @@ fi
 PASS=0
 FAIL=0
 FAIL_NAMES=""
+STATE_TEST_ROOT="$(mktemp -d)"
+STATE_SEQUENCE=0
+trap 'rm -rf "$STATE_TEST_ROOT"' EXIT
 
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() {
@@ -51,7 +54,9 @@ assert_zero() {
 
 # fresh, nonexistent state path per test
 fresh_state() {
-  SABLE_MODE_STATE="$(mktemp -u)"
+  STATE_SEQUENCE=$((STATE_SEQUENCE + 1))
+  SABLE_MODE_STATE="$STATE_TEST_ROOT/$STATE_SEQUENCE/mode-state.json"
+  mkdir -p "$(dirname "$SABLE_MODE_STATE")"
   export SABLE_MODE_STATE
 }
 
@@ -76,6 +81,10 @@ SHOW="$("$MODE_BIN" show 2>/dev/null)"
 assert_eq "show mode after --fleet"  "planning" "$(printf '%s' "$SHOW" | jget "['mode']")"
 assert_eq "fleet[0]"                 "sherlock" "$(printf '%s' "$SHOW" | jget "['fleet'][0]")"
 assert_eq "fleet[1]"                 "columbo"  "$(printf '%s' "$SHOW" | jget "['fleet'][1]")"
+SNAPSHOT="$("$MODE_BIN" snapshot 2>/dev/null)"
+assert_eq "snapshot mode" "planning" "$(printf '%s' "$SNAPSHOT" | sed -n '1p')"
+assert_eq "snapshot tier" "full" "$(printf '%s' "$SNAPSHOT" | sed -n '2p')"
+assert_eq "snapshot substage" "framing" "$(printf '%s' "$SNAPSHOT" | sed -n '3p')"
 
 # ---------- execution provider map ----------
 
@@ -184,6 +193,29 @@ assert_nonzero "get with no state exits nonzero" "$?"
 fresh_state
 "$MODE_BIN" show >/dev/null 2>&1
 assert_nonzero "show with no state exits nonzero" "$?"
+
+# A present but corrupt file is categorically different from no active mode:
+# reads fail loud, ordinary set does not silently erase the evidence, and the
+# explicit clear command remains the recovery path.
+fresh_state
+printf '%s' '{broken json' > "$SABLE_MODE_STATE"
+CORRUPT_BYTES="$(cat "$SABLE_MODE_STATE")"
+CORRUPT_OUT="$("$MODE_BIN" get 2>&1)"; CORRUPT_RC=$?
+assert_nonzero "get with corrupt state exits nonzero" "$CORRUPT_RC"
+case "$CORRUPT_OUT" in
+  *corrupt*) pass "get distinguishes corrupt state from missing state" ;;
+  *) fail "get distinguishes corrupt state from missing state" "got: $CORRUPT_OUT" ;;
+esac
+"$MODE_BIN" set planning >/dev/null 2>&1
+assert_nonzero "set refuses to overwrite corrupt state" "$?"
+assert_eq "refused set preserves corrupt bytes" "$CORRUPT_BYTES" "$(cat "$SABLE_MODE_STATE")"
+"$MODE_BIN" clear >/dev/null 2>&1
+assert_zero "clear is the explicit corrupt-state recovery path" "$?"
+if [ ! -f "$SABLE_MODE_STATE" ]; then
+  pass "corrupt-state recovery removes the state file"
+else
+  fail "corrupt-state recovery removes the state file"
+fi
 
 # ---------- overwrite: last set wins ----------
 

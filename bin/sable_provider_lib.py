@@ -8,13 +8,18 @@ rendering so launchers and hooks do not grow their own subtly different maps.
 
 from __future__ import annotations
 
-import json
 import os
 import shlex
-import subprocess
 from collections.abc import Mapping
 from collections.abc import Sequence
 from pathlib import Path
+
+from sable_mode_store_lib import (
+    ModeStateCorrupt,
+    ModeStateMissing,
+    read_mode_state,
+    resolve_mode_state_path,
+)
 
 PROVIDER_ROLES = ("optimus", "tarzan", "chuck", "worker")
 SUPPORTED_PROVIDERS = frozenset({"claude", "codex"})
@@ -129,26 +134,6 @@ def provider_for_role(state: Mapping[str, object], role: str) -> str:
     return provider_map_from_state(state)[normalized_role]
 
 
-def resolve_mode_state_path(base: str | None = None) -> Path:
-    """Mirror sable-mode's per-repository state resolution for launchers."""
-
-    override = os.environ.get("SABLE_MODE_STATE")
-    if override:
-        return Path(override)
-    cwd = base or os.getcwd()
-    try:
-        common = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        common_path = Path(common)
-        if not common_path.is_absolute():
-            common_path = Path(cwd) / common_path
-        return common_path.resolve().parent / ".claude/sable/state/mode-state.json"
-    except (OSError, subprocess.CalledProcessError):
-        return Path.home() / ".claude/sable/state/mode-state.json"
-
-
 def execution_provider_map(*, base: str | None = None) -> dict[str, str] | None:
     """Return active execution providers, or None outside execution mode.
 
@@ -156,11 +141,11 @@ def execution_provider_map(*, base: str | None = None) -> dict[str, str] | None:
     is an invariant violation and fails closed rather than selecting Claude.
     """
     path = resolve_mode_state_path(base)
-    if not path.exists():
-        return None
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        state = read_mode_state(path)
+    except ModeStateMissing:
+        return None
+    except ModeStateCorrupt as exc:
         raise ProviderMapError(
             f"cannot read execution provider map from {path}: {exc}"
         ) from exc

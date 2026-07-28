@@ -90,6 +90,17 @@ if [ -f "$D_COPY/sable-note" ] && [ ! -L "$D_COPY/sable-note" ] && [ -x "$D_COPY
 else
   fail "--copy mode" "$(ls -l "$D_COPY/sable-note" 2>/dev/null)"
 fi
+if SABLE_MODE_STATE="$D_COPY/mode-state.json" "$D_COPY/sable-mode" path >/dev/null 2>&1; then
+  pass "--copy carries sable-mode's Python support-module closure"
+else
+  fail "--copy carries sable-mode's Python support-module closure" \
+    "copied sable-mode could not import its sibling modules"
+fi
+if [ -f "$D_COPY/sable_mode_store_lib.py" ] && [ -f "$D_COPY/sable_provider_lib.py" ]; then
+  pass "--copy installs mode/provider support modules beside entrypoints"
+else
+  fail "--copy installs mode/provider support modules beside entrypoints"
+fi
 
 # ---- UNIT: --uninstall removes the installed tools ----
 bash "$INSTALL" --dir "$D1" --uninstall >/dev/null 2>&1 || true
@@ -97,6 +108,13 @@ if [ ! -e "$D1/sable-launch" ] && [ ! -e "$D1/sable-note" ]; then
   pass "--uninstall removes the installed tools"
 else
   fail "--uninstall" "still present: $(ls "$D1" 2>/dev/null)"
+fi
+
+bash "$INSTALL" --dir "$D_COPY" --uninstall >/dev/null 2>&1 || true
+if [ ! -e "$D_COPY/sable-mode" ] && [ ! -e "$D_COPY/sable_mode_store_lib.py" ]; then
+  pass "--uninstall removes copied Python support modules"
+else
+  fail "--uninstall removes copied Python support modules"
 fi
 
 # ---- UNIT: --dry-run writes nothing ----
