@@ -37,6 +37,7 @@ naming every path it searched. Putting reachability only in the subprocess leg
 would leave the suite green while asserting nothing about the exact property
 the bead exists to protect -- the bug's own shape, in the test for the bug.
 """
+import ast
 import json
 import os
 import shutil
@@ -452,9 +453,29 @@ def _stage(tmp_path, hide=()):
     binroot.mkdir()
     probe = state / "night-stall-probe.py"
     shutil.copyfile(_PROBE, probe)
-    for lib in ("sable_pane_lib.py", "sable_stall_probe_lib.py"):
+    # Derive the complete local import closure instead of maintaining another
+    # dependency list. sable_pane_lib became provider-aware for mixed
+    # Claude/Codex fleets, and the old two-file list silently omitted both
+    # sable_provider_lib and its mode-store dependency.
+    pending = ["sable_pane_lib.py", "sable_stall_probe_lib.py"]
+    seen = set()
+    while pending:
+        lib = pending.pop()
+        if lib in seen:
+            continue
+        seen.add(lib)
+        source = os.path.join(_BIN, lib)
+        with open(source, encoding="utf-8") as source_file:
+            tree = ast.parse(source_file.read(), filename=source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (
+                node.module or ""
+            ).startswith("sable_"):
+                dependency = f"{node.module}.py"
+                if os.path.isfile(os.path.join(_BIN, dependency)):
+                    pending.append(dependency)
         if lib not in hide:
-            shutil.copyfile(os.path.join(_BIN, lib), binroot / lib)
+            shutil.copyfile(source, binroot / lib)
     return probe
 
 
@@ -555,6 +576,7 @@ def test_script_agrees_with_lib_verdict(tmp_path, name, fixture_fn):
 
 @requires_probe
 @pytest.mark.parametrize("hidden", [
+    ("sable_provider_lib.py",),
     ("sable_stall_probe_lib.py",),
     ("sable_pane_lib.py",),
     ("sable_pane_lib.py", "sable_stall_probe_lib.py"),

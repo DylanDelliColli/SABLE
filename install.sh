@@ -12,6 +12,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 HOOKS_SRC="${REPO_DIR}/hooks"
 TEMPLATE_DIR="${REPO_DIR}/templates"
 PRIME_TEMPLATE="${TEMPLATE_DIR}/global-CLAUDE-prime.md"
+BASE_SETTINGS_SNIPPET="${TEMPLATE_DIR}/base-settings-snippet.json"
 
 # --- CLI flags (SABLE-106, front door SABLE-ppy; tmux-only SABLE-qa4d;
 # single-path install SABLE-ssws.1 — there are no tiers and no topologies) ---
@@ -49,8 +50,8 @@ for arg in "$@"; do
             echo "                         into ~/.local/bin (hybrid contract, SABLE-59t6)."
             echo "  --force                proceed with --project even when ~/.claude already"
             echo "                         carries SABLE hooks (accepts hooks firing twice)."
-            echo "  --merge-settings       explicitly consent to applying the orchestration"
-            echo "                         settings proposal; default is print-only"
+            echo "  --merge-settings       explicitly consent to applying the reviewed settings"
+            echo "                         proposal (including Codex base hooks); default is print-only"
             exit 0 ;;
     esac
 done
@@ -409,56 +410,27 @@ echo
 #
 # The whole install is print-only for settings unless --merge-settings was
 # explicit. Step 6 enforces that contract inside the settings authority itself,
-# so there is no write-then-revert window.
-bold "Step 8/8: Settings.json hook block (base tier — paste this yourself)"
+# so there is no write-then-revert window. This printed Claude block and the
+# Codex merge both render from the same canonical base snippet.
+bold "Step 8/8: Claude settings.json base hook block (paste this yourself)"
 echo "Add the following block to your ${SETTINGS_FILE} under the top-level 'hooks' key."
 echo "If you already have a 'hooks' key, merge carefully (don't overwrite existing entries)."
-echo "NOTE: this block is the BASE tier only. Step 6 printed the orchestration rows;"
-echo "those rows are applied only when --merge-settings is explicitly passed."
+echo "NOTE: Step 6 applies this base graph automatically to Codex, together with"
+echo "the orchestration rows, only when --merge-settings is explicitly passed."
+echo "Claude's base block remains a deliberate manual paste."
 echo
-cat <<EOF
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {"type": "command", "command": "bash ${HOOK_CMD_ROOT}/tdd-evidence.sh", "timeout": 3000},
-          {"type": "command", "command": "bash ${HOOK_CMD_ROOT}/tdd-gate.sh", "timeout": 5000},
-          {"type": "command", "command": "bash ${HOOK_CMD_ROOT}/bead-description-gate.sh", "timeout": 3000}
-        ]
-      },
-      {
-        "matcher": "Edit|Write",
-        "hooks": [
-          {"type": "command", "command": "bash ${HOOK_CMD_ROOT}/tdd-remind.sh", "timeout": 3000}
-        ]
-      },
-      {
-        "matcher": "Agent",
-        "hooks": [
-          {"type": "command", "command": "bash ${HOOK_CMD_ROOT}/agent-tdd-enforce.sh", "timeout": 3000}
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {"type": "command", "command": "bash ${HOOK_CMD_ROOT}/bead-quality.sh", "timeout": 5000}
-        ]
-      }
-    ],
-    "SessionStart": [
-      {"matcher": "", "hooks": [{"type": "command", "command": "bd prime"}]},
-      {"matcher": "", "hooks": [{"type": "command", "command": "sable-doctor --quiet 2>&1 || true"}]}
-    ],
-    "PreCompact": [
-      {"matcher": "", "hooks": [{"type": "command", "command": "bd prime"}]}
-    ]
-  }
-}
-EOF
+HOOK_ROOT="${HOOK_CMD_ROOT}" python3 - "${BASE_SETTINGS_SNIPPET}" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    data = json.load(source)
+rendered = json.dumps(data, indent=2).replace(
+    "~/.claude/hooks", os.environ["HOOK_ROOT"]
+)
+print(rendered)
+PY
 echo
 echo "The SessionStart sable-doctor entry above warns (non-fatal) at session start"
 echo "when your installed ~/.claude drifts from this repo — see SABLE-1i6m / bin/sable-doctor."
@@ -521,12 +493,16 @@ else
 fi
 echo
 
-bold "Orchestration hooks"
+bold "Lifecycle hooks"
 if [ "$MERGE_SETTINGS" = "1" ]; then
     echo "The reviewed orchestration settings proposal was applied (--merge-settings)."
+    if [ "$SCOPE" = "user" ]; then
+        echo "The canonical base hook graph was also applied to ~/.codex/hooks.json."
+    fi
 else
     echo "The orchestration settings proposal was printed but NOT applied."
-    echo "Re-run with --merge-settings after review to consent to that write."
+    echo "For user scope, that proposal includes Codex's canonical base hook graph."
+    echo "Re-run with --merge-settings after review to consent to those writes."
 fi
 echo "sable-orchestration-install also STAGES (never activates) the reconciliation"
 echo "floor's host timer artifacts (systemd --user unit + cron fallback line) under"
@@ -541,7 +517,8 @@ bold "Install complete."
 echo
 echo "Next steps:"
 echo "  1. Paste the BASE-tier hook block above into ${SETTINGS_FILE} (merge with existing"
-echo "     config). Apply orchestration rows by re-running with --merge-settings."
+echo "     config). Apply orchestration rows and Codex base rows by re-running with"
+echo "     --merge-settings."
 echo "  2. In your project: bd init && bd hooks install"
 echo "  3. RESTART Claude Code so the agent defs, /sable-plan /sable-execute /gaudi /columbo, and hooks register."
 echo "  4. Start your session:  sable-launch   (Lincoln only, wraps sable-tmux; managers spawn on demand)"

@@ -284,8 +284,19 @@ exists "$U/.codex/hooks.json" "user: Codex hooks.json created beside redirected 
 if valid_json "$U/.codex/hooks.json"; then pass "user: Codex hooks.json is valid JSON"; else fail "user: Codex hooks.json is valid JSON"; fi
 if [ "$(count_interlock "$U/.codex/hooks.json")" = "2" ]; then pass "user: Codex receives both interlock legs"; else fail "user: Codex receives both interlock legs" "count=$(count_interlock "$U/.codex/hooks.json")"; fi
 if grep -qF "$U/.claude/hooks/" "$U/.codex/hooks.json"; then pass "user: Codex hook commands target the installed SABLE hooks"; else fail "user: Codex hook commands target the installed SABLE hooks"; fi
+for _base_hook in tdd-evidence.sh tdd-gate.sh bead-description-gate.sh tdd-remind.sh agent-tdd-enforce.sh bead-quality.sh; do
+  if [ "$(count_marker "$U/.codex/hooks.json" "$_base_hook")" = "1" ]; then
+    pass "user: Codex receives canonical base hook exactly once ($_base_hook)"
+  else
+    fail "user: Codex receives canonical base hook exactly once ($_base_hook)" "count=$(count_marker "$U/.codex/hooks.json" "$_base_hook")"
+  fi
+  exists "$U/.claude/hooks/$_base_hook" "user: Codex base hook executable is installed ($_base_hook)"
+done
+CLAUDE_USER_DIR="$U/.claude" bash "$INSTALLER" --user --merge-settings >/dev/null 2>&1
+if [ "$(count_marker "$U/.codex/hooks.json" tdd-gate.sh)" = "1" ]; then pass "user: Codex base graph stays idempotent"; else fail "user: Codex base graph stays idempotent" "count=$(count_marker "$U/.codex/hooks.json" tdd-gate.sh)"; fi
 CLAUDE_USER_DIR="$U/.claude" bash "$INSTALLER" --user --uninstall >/dev/null 2>&1
 if [ "$(count_interlock "$U/.codex/hooks.json")" = "0" ]; then pass "user uninstall: Codex interlock rows removed"; else fail "user uninstall: Codex interlock rows removed"; fi
+if [ "$(count_marker "$U/.codex/hooks.json" tdd-gate.sh)" = "1" ]; then pass "user uninstall: Codex base layer remains registered"; else fail "user uninstall: Codex base layer remains registered" "count=$(count_marker "$U/.codex/hooks.json" tdd-gate.sh)"; fi
 
 # ---------- uninstall (project) ----------
 # seed a legacy agents-teams dir from a pre-tmux-only install: uninstall must still clean it

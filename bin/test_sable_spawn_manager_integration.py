@@ -297,6 +297,14 @@ def test_provider_boot_failure_removes_manager_pane(sock, tmp_path):
     env = {
         **os.environ,
         "HOME": str(empty_home),
+        # Keep fleet-boundary resolution project-local so this test reaches
+        # the intended post-pane provider-role-card failure. Boundary refusal
+        # itself has dedicated rc=6 coverage in test_sable_spawn_manager.py.
+        "SABLE_AGENTS_YAML": str(
+            Path(__file__).resolve().parent.parent
+            / "templates" / "multi-manager" / "agents.yaml"
+        ),
+        "SABLE_DISPATCH_DIR": str(tmp_path / "dispatch"),
         "SABLE_TMUX_SOCKET": sock,
         "SABLE_TMUX_SESSION": SESSION,
         "SABLE_TMUX_PANE_CMD": f"bash --noprofile --norc {script}",

@@ -71,13 +71,17 @@ There is **one install** — no tiers, no topology choices. It:
 4. Copies the producer agent definitions into `~/.claude/agents/`
 5. Installs the orchestration layer (multi-manager hooks, `agents.yaml`
    registry, the four pane role files, the SABLE skills) and prints the exact
-   settings additions/removals/modifications without applying them
+   settings additions/removals/modifications without applying them. The Codex
+   proposal composes the same base TDD/bead gates with the orchestration graph
+   in one atomic settings update.
 6. Prepends the SABLE Prime Directives to `~/.claude/CLAUDE.md` (with a timestamped backup if one already exists)
-7. Prints the base-hook JSON snippet you paste into `~/.claude/settings.json`
-   (does NOT auto-edit that block — you review and paste). After reviewing the
-   orchestration proposal, rerun `bash install.sh --merge-settings` to apply it
-   to `~/.claude/settings.json` and `~/.codex/hooks.json`; changed files are
-   preserved in named timestamped snapshot directories. The snippet includes the
+7. Prints the Claude base-hook JSON snippet you paste into
+   `~/.claude/settings.json` (does NOT auto-edit that block — you review and
+   paste). After reviewing the proposal, rerun
+   `bash install.sh --merge-settings` to apply orchestration rows to
+   `~/.claude/settings.json` and the complete base + orchestration graph to
+   `~/.codex/hooks.json`; changed files are preserved in named timestamped
+   snapshot directories. The base graph includes the
    `sable-doctor --quiet` SessionStart drift-warn.
 8. Stages (never activates) the reconciliation-floor host timer artifacts under `~/.claude/sable/reconcile-timer/` — activation is a deliberate operator step: one command, `sable-reconcile-timer --install-schedule`, which installs the units *and* verifies afterwards that a schedule really fires (exit 3 if not). By default it sweeps the repo you installed from; set `SABLE_RECONCILE_TARGET_REPO=<repo>[:<repo>...]` before installing to name other fleets, since a timer that sweeps one repo leaves every other fleet on the host unprotected while looking installed (SABLE-5xz68).
 
@@ -216,21 +220,23 @@ The install already put in place:
 - `~/.claude/skills/` — the SABLE slash commands (`/sable-plan`, `/sable-execute`,
   `/gaudi`, `/columbo`, `/audit-deep-dive`, `/sable-review`), installed by their
   skill name.
-- The exact settings proposal, printed without changing
-  `~/.claude/settings.json`. Apply it deliberately with
-  `bash install.sh --merge-settings` after review; existing entries are
-  preserved and changed files are snapshotted.
+- The exact settings proposal, printed without changing either live settings
+  file. Apply it deliberately with `bash install.sh --merge-settings` after
+  review; existing entries are preserved, changed files are snapshotted, and
+  `~/.codex/hooks.json` receives both the base gates and orchestration hooks in
+  one update.
 - The producer agent definitions in `~/.claude/agents/`.
 
-**Restart Claude Code** after installing so the agent definitions, slash
-commands, and hook registrations load. Lost? `sable --help` prints the whole
-operator map.
+**Restart Claude Code and any open Codex sessions** after installing so the
+agent definitions, slash commands, and hook registrations load. Lost?
+`sable --help` prints the whole operator map.
 
 **Verify orchestration:**
 
 ```bash
 ls ~/.claude/hooks/multi-manager/        # governance hooks present
 head -1 ~/.claude/sable/agents.yaml      # registry present
+grep -E 'tdd-gate|mode-interlock' ~/.codex/hooks.json  # Codex base + orchestration hooks
 sable-mode get                           # mode-state helper resolves (planning|execution)
 sable-mode providers get                 # frozen execution provider map
 ```
@@ -242,17 +248,18 @@ fleet provider map before launching managers:
 ```bash
 # Requires the fresh receipt created by sable-mode handoff approve.
 sable-mode set execution --fleet optimus,tarzan,chuck \
-  --providers optimus=claude,tarzan=codex,chuck=claude,worker=codex
+  --providers optimus=codex,tarzan=codex,chuck=codex,worker=codex
 sable-spawn-manager --all
 ```
 
-Managers may use different providers; every worker uses the single `worker`
-provider for that execution session. SABLE launches Codex as a persistent TUI,
-not `codex exec`, and `sable-msg` routes manager/worker messages by tmux pane
-identity regardless of provider. Direct execution without a receipt refuses;
-the explicit emergency path is `sable-mode set execution --break-glass
---reason "..."`, which persists the bypass instead of silently weakening the
-handoff.
+Lincoln remains the Claude Code control pane; the provider map above places
+every manager and worker under Codex. Managers may instead use different
+providers, while every worker uses the single `worker` provider for that
+execution session. SABLE launches Codex as a persistent TUI, not `codex exec`,
+and `sable-msg` routes manager/worker messages by tmux pane identity regardless
+of provider. Direct execution without a receipt refuses; the explicit
+emergency path is `sable-mode set execution --break-glass --reason "..."`,
+which persists the bypass instead of silently weakening the handoff.
 
 The mode is **per-repo** — `sable-mode` resolves the state file from the repo you
 are in (`<repo>/.claude/sable/state/mode-state.json`, shared across that repo's

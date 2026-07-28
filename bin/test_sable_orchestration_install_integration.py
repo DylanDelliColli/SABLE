@@ -30,6 +30,15 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 INSTALLER = REPO / "bin" / "sable-orchestration-install"
 LIB_NAME = "sable_inline_body_guard_lib.py"
+BASE_SNIPPET = REPO / "templates" / "base-settings-snippet.json"
+BASE_HOOKS = {
+    "tdd-evidence.sh": ("PreToolUse", "Bash", 3000),
+    "tdd-gate.sh": ("PreToolUse", "Bash", 5000),
+    "bead-description-gate.sh": ("PreToolUse", "Bash", 3000),
+    "tdd-remind.sh": ("PreToolUse", "Edit|Write", 3000),
+    "agent-tdd-enforce.sh": ("PreToolUse", "Agent", 3000),
+    "bead-quality.sh": ("PostToolUse", "Bash", 5000),
+}
 
 pytestmark = pytest.mark.skipif(
     shutil.which("bash") is None or shutil.which("python3") is None,
@@ -78,17 +87,56 @@ def run_real_install(base, merge_settings=True):
     )
 
 
+def codex_hooks_path(base):
+    return base.parent / ".codex" / "hooks.json"
+
+
+def hook_rows(path):
+    data = json.loads(path.read_text())
+    return [
+        (event, block.get("matcher", ""), hook)
+        for event, blocks in data.get("hooks", {}).items()
+        for block in blocks
+        for hook in block.get("hooks", [])
+    ]
+
+
+def test_canonical_base_snippet_has_the_complete_gate_graph():
+    rows = hook_rows(BASE_SNIPPET)
+    actual = {}
+    for event, matcher, hook in rows:
+        command = hook.get("command", "")
+        for name in BASE_HOOKS:
+            if command.endswith("/" + name):
+                actual[name] = (event, matcher, hook.get("timeout"))
+    assert actual == BASE_HOOKS
+    lifecycle_commands = [
+        (event, hook.get("command", "")) for event, _, hook in rows
+    ]
+    assert lifecycle_commands.count(
+        ("SessionStart", "sable-doctor --quiet 2>&1 || true")
+    ) == 1
+    assert lifecycle_commands.count(("SessionStart", "bd prime")) == 1
+    assert lifecycle_commands.count(("PreCompact", "bd prime")) == 1
+
+
 def test_direct_real_install_is_print_only_without_consent(tmp_path):
     base = tmp_path / "claude"
     base.mkdir()
     settings = base / "settings.json"
     original = b'{\n  "permissions": {"allow": ["Read"]}\n}\n'
     settings.write_bytes(original)
+    codex_hooks = codex_hooks_path(base)
+    codex_hooks.parent.mkdir()
+    codex_original = b'{\n  "hooks": {"CustomEvent": []}\n}\n'
+    codex_hooks.write_bytes(codex_original)
 
     result = run_real_install(base, merge_settings=False)
 
     assert result.returncode == 0, result.stderr
     assert settings.read_bytes() == original
+    assert codex_hooks.read_bytes() == codex_original
+    assert "tdd-gate.sh" in result.stdout
     assert "inline-body-guard.sh" in result.stdout
     assert "NOT APPLIED" in result.stdout
     assert (base / "hooks" / "multi-manager" / "inline-body-guard.sh").is_file()
@@ -154,6 +202,16 @@ def test_valid_settings_merge_is_idempotent_and_preserves_unrelated_hooks(tmp_pa
         "permissions": {"allow": ["Read"]},
         "hooks": {"PreToolUse": [custom_hook]},
     }, indent=2) + "\n")
+    codex_hooks = codex_hooks_path(base)
+    codex_hooks.parent.mkdir()
+    codex_custom = {
+        "matcher": "CustomTool",
+        "hooks": [{"type": "command", "command": "run-my-codex-hook"}],
+    }
+    codex_hooks.write_text(json.dumps({
+        "codex_setting": "preserve-me",
+        "hooks": {"PreToolUse": [codex_custom]},
+    }, indent=2) + "\n")
 
     first = run_real_install(base)
     assert first.returncode == 0, first.stderr
@@ -161,10 +219,22 @@ def test_valid_settings_merge_is_idempotent_and_preserves_unrelated_hooks(tmp_pa
     first_data = json.loads(first_bytes)
     assert first_data["permissions"] == {"allow": ["Read"]}
     assert custom_hook in first_data["hooks"]["PreToolUse"]
+    first_codex_bytes = codex_hooks.read_bytes()
+    first_codex = json.loads(first_codex_bytes)
+    assert first_codex["codex_setting"] == "preserve-me"
+    assert codex_custom in first_codex["hooks"]["PreToolUse"]
+    codex_commands = [
+        hook.get("command", "")
+        for _, _, hook in hook_rows(codex_hooks)
+    ]
+    for name in BASE_HOOKS:
+        assert sum(command.endswith("/" + name) for command in codex_commands) == 1
+        assert (base / "hooks" / name).is_file()
 
     second = run_real_install(base)
     assert second.returncode == 0, second.stderr
     assert settings.read_bytes() == first_bytes
+    assert codex_hooks.read_bytes() == first_codex_bytes
     second_data = json.loads(settings.read_bytes())
     commands = [
         hook.get("command")
@@ -172,6 +242,47 @@ def test_valid_settings_merge_is_idempotent_and_preserves_unrelated_hooks(tmp_pa
         for hook in block.get("hooks", [])
     ]
     assert commands.count("run-my-private-hook") == 1
+
+
+def test_codex_tdd_gate_wiring_denies_without_and_allows_with_evidence(installed_scope):
+    codex_hooks = codex_hooks_path(installed_scope)
+    commands = [
+        hook.get("command", "")
+        for _, _, hook in hook_rows(codex_hooks)
+    ]
+    expected_gate = f"bash {installed_scope}/hooks/tdd-gate.sh"
+    expected_evidence = f"bash {installed_scope}/hooks/tdd-evidence.sh"
+    assert commands.count(expected_gate) == 1
+    assert commands.count(expected_evidence) == 1
+
+    session_id = f"codex-base-canary-{os.getpid()}"
+    close_payload = json.dumps({
+        "tool_input": {"command": "bd close SABLE-canarya SABLE-canaryb"},
+        "session_id": session_id,
+    })
+    denied = subprocess.run(
+        ["bash", str(installed_scope / "hooks" / "tdd-gate.sh")],
+        input=close_payload, capture_output=True, text=True, timeout=60,
+    )
+    assert denied.returncode == 0, denied.stderr
+    decision = json.loads(denied.stdout)["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "deny"
+
+    evidence_payload = json.dumps({
+        "tool_input": {"command": "python -m pytest bin/test_example.py -q"},
+        "session_id": session_id,
+    })
+    observed = subprocess.run(
+        ["bash", str(installed_scope / "hooks" / "tdd-evidence.sh")],
+        input=evidence_payload, capture_output=True, text=True, timeout=60,
+    )
+    assert observed.returncode == 0, observed.stderr
+    allowed = subprocess.run(
+        ["bash", str(installed_scope / "hooks" / "tdd-gate.sh")],
+        input=close_payload, capture_output=True, text=True, timeout=60,
+    )
+    assert allowed.returncode == 0, allowed.stderr
+    assert allowed.stdout == ""
 
 
 def test_installed_inline_body_guard_can_load_its_library_and_denies_a_corrupt_body(installed_scope):

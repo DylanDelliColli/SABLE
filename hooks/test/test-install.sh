@@ -26,6 +26,7 @@ print(sum(1 for bl in d.get('hooks',{}).values() if isinstance(bl,list) for b in
 TS="$(mktemp -d)"
 HOME="$TS" bash "$INSTALL" --from-here --merge-settings >/tmp/ti-orch.log 2>&1
 SS="$TS/.claude/settings.json"
+CS="$TS/.codex/hooks.json"
 present "$TS/.claude/hooks/multi-manager/mode-interlock.sh" "orchestration: delegate installed multi-manager hooks"
 present "$TS/.claude/sable/agents.yaml"                     "orchestration: registry installed"
 present "$TS/.claude/skills/sable-plan/SKILL.md"            "orchestration: /sable-plan skill installed"
@@ -33,6 +34,12 @@ present "$TS/.claude/sable/roles/optimus.md"                "orchestration: pane
 absent  "$TS/.claude/agents-teams"                          "orchestration: no agents-teams defs (tmux-only)"
 [ "$(count_marker "$SS" mode-interlock.sh)" = "2" ] && pass "orchestration: interlock merged on both legs" || fail "orchestration: interlock merged on both legs" "count=$(count_marker "$SS" mode-interlock.sh)"
 [ "$(count_marker "$SS" pre-push-rebase-test)" -ge 1 ] && pass "orchestration: governance hooks present in settings" || fail "orchestration: governance hooks present" "count=$(count_marker "$SS" pre-push-rebase-test)"
+present "$CS" "Codex: hooks.json created"
+for _base_hook in tdd-evidence.sh tdd-gate.sh bead-description-gate.sh tdd-remind.sh agent-tdd-enforce.sh bead-quality.sh; do
+  [ "$(count_marker "$CS" "$_base_hook")" = "1" ] &&
+    pass "Codex: canonical base hook merged exactly once ($_base_hook)" ||
+    fail "Codex: canonical base hook merged exactly once ($_base_hook)" "count=$(count_marker "$CS" "$_base_hook")"
+done
 grep -q 'sable-tmux' /tmp/ti-orch.log && pass "orchestration: output points at the sable-tmux bring-up" || fail "orchestration: output points at the sable-tmux bring-up"
 ! grep -q 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS' /tmp/ti-orch.log && pass "orchestration: no experimental-teams-flag instruction printed" || fail "orchestration: no experimental-teams-flag instruction printed"
 
@@ -46,21 +53,32 @@ present "$TS/.claude/agents/sherlock.md" "plain install lands base agent defs"
 # idempotent re-run: interlock count stable
 HOME="$TS" bash "$INSTALL" --from-here --merge-settings >/dev/null 2>&1
 [ "$(count_marker "$SS" mode-interlock.sh)" = "2" ] && pass "re-run idempotent (interlock still 2)" || fail "re-run idempotent" "count=$(count_marker "$SS" mode-interlock.sh)"
+[ "$(count_marker "$CS" tdd-gate.sh)" = "1" ] && pass "re-run idempotent (Codex base gate still 1)" || fail "re-run idempotent (Codex base gate)" "count=$(count_marker "$CS" tdd-gate.sh)"
 
 # non-clobber: a pre-existing user hook survives the merge
-TN="$(mktemp -d)"; mkdir -p "$TN/.claude"
+TN="$(mktemp -d)"; mkdir -p "$TN/.claude" "$TN/.codex"
 printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash /tmp/user-own.sh"}]}]}}' > "$TN/.claude/settings.json"
+printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"CustomTool","hooks":[{"type":"command","command":"bash /tmp/codex-user-own.sh"}]}]}}' > "$TN/.codex/hooks.json"
 HOME="$TN" bash "$INSTALL" --from-here --merge-settings >/dev/null 2>&1
 grep -q 'user-own.sh' "$TN/.claude/settings.json" && pass "non-clobber: pre-existing user hook survives" || fail "non-clobber: pre-existing user hook survives"
+grep -q 'codex-user-own.sh' "$TN/.codex/hooks.json" && pass "non-clobber: pre-existing Codex hook survives" || fail "non-clobber: pre-existing Codex hook survives"
 
 # default is genuinely print-only, including when the proposal has changes.
-TP="$(mktemp -d)"; mkdir -p "$TP/.claude"
+TP="$(mktemp -d)"; mkdir -p "$TP/.claude" "$TP/.codex"
 printf '%s\n' '{"permissions":{"allow":["Read"]}}' > "$TP/.claude/settings.json"
+printf '%s\n' '{"hooks":{"CustomEvent":[]}}' > "$TP/.codex/hooks.json"
 cp "$TP/.claude/settings.json" "$TP/settings.before"
+cp "$TP/.codex/hooks.json" "$TP/codex-hooks.before"
 HOME="$TP" bash "$INSTALL" --from-here >/tmp/ti-print-only.log 2>&1
 cmp -s "$TP/settings.before" "$TP/.claude/settings.json" &&
   pass "unflagged install leaves settings.json byte-identical" ||
   fail "unflagged install leaves settings.json byte-identical"
+cmp -s "$TP/codex-hooks.before" "$TP/.codex/hooks.json" &&
+  pass "unflagged install leaves Codex hooks.json byte-identical" ||
+  fail "unflagged install leaves Codex hooks.json byte-identical"
+grep -q 'tdd-gate.sh' /tmp/ti-print-only.log &&
+  pass "unflagged install proposal names the Codex base gate" ||
+  fail "unflagged install proposal names the Codex base gate"
 grep -q 'NOT APPLIED' /tmp/ti-print-only.log &&
   pass "unflagged install names the unapplied settings proposal" ||
   fail "unflagged install names the unapplied settings proposal"

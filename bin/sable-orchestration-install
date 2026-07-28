@@ -81,6 +81,17 @@ SKILLS="$BASE/skills"
 HOOKS_DIR="$BASE/hooks/multi-manager"
 AGENTS_DIR="$BASE/agents"
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
+BASE_SNIPPET="$REPO/templates/base-settings-snippet.json"
+BASE_HOOK_FILES="tdd-evidence.sh tdd-gate.sh bead-description-gate.sh tdd-remind.sh agent-tdd-enforce.sh bead-quality.sh"
+BASE_HOOK_SUPPORT_FILES="lib-hook-trace.sh lib-evidence-key.sh"
+BASE_LAYER_AVAILABLE=1
+[ -r "$BASE_SNIPPET" ] || BASE_LAYER_AVAILABLE=0
+for _base_source in $BASE_HOOK_FILES; do
+    [ -r "$REPO/hooks/$_base_source" ] || BASE_LAYER_AVAILABLE=0
+done
+for _base_support in $BASE_HOOK_SUPPORT_FILES; do
+    [ -r "$REPO/hooks/multi-manager/$_base_support" ] || BASE_LAYER_AVAILABLE=0
+done
 
 # Refuse before the first install write when an existing settings target cannot
 # be read as a JSON object. Invalid bytes are preserved and copied to the
@@ -143,16 +154,22 @@ RETIRED_AGENT_DEFS="optimus.md tarzan.md chuck.md"
 # RETIRED_MARKERS are old rows this version no longer ships. Both disappear
 # from the proposal, never directly from the live file.
 render_settings_proposal() {
-    SETTINGS_PATH="$1" SNIPPET_PATH="$2" BASE_DIR="$3" \
-    SKIP_MARKERS="${4:-}" RETIRED_MARKERS="$5" OUTPUT_PATH="$6" \
-    python3 - <<'PY'
+    SETTINGS_PATH="$1" BASE_DIR="$2" SKIP_MARKERS="${3:-}" \
+    RETIRED_MARKERS="$4" OUTPUT_PATH="$5"
+    shift 5
+    SETTINGS_PATH="$SETTINGS_PATH" BASE_DIR="$BASE_DIR" \
+    SKIP_MARKERS="$SKIP_MARKERS" RETIRED_MARKERS="$RETIRED_MARKERS" \
+    OUTPUT_PATH="$OUTPUT_PATH" python3 - "$@" <<'PY'
 import copy
 import json
 import os
+import sys
 
 settings = os.environ["SETTINGS_PATH"]
-with open(os.environ["SNIPPET_PATH"], encoding="utf-8") as f:
-    snippet = json.load(f)
+snippets = []
+for snippet_path in sys.argv[1:]:
+    with open(snippet_path, encoding="utf-8") as f:
+        snippets.append(json.load(f))
 if os.path.exists(settings):
     with open(settings, encoding="utf-8") as f:
         before = json.load(f)
@@ -202,49 +219,52 @@ for blocks in hooks.values():
                         and marker(hook.get("command", "")) in excluded)
             ]
 
-# Add or refresh the rows this version ships.
-for event, blocks in snippet.get("hooks", {}).items():
-    event_blocks = hooks.get(event)
-    if not isinstance(event_blocks, list):
-        event_blocks = hooks[event] = []
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        matcher = block.get("matcher", "")
-        matching_blocks = [
-            candidate for candidate in event_blocks
-            if isinstance(candidate, dict)
-            and candidate.get("matcher", "") == matcher
-        ]
-        if not matching_blocks:
-            matching_blocks = [{"matcher": matcher, "hooks": []}]
-            event_blocks.extend(matching_blocks)
-        target = matching_blocks[0]
-        target_hooks = target.setdefault("hooks", [])
-        for hook in block.get("hooks", []):
-            if not isinstance(hook, dict):
+# Add or refresh the rows this version ships. Multiple snippets are composed
+# into one proposal/write so Codex's base and orchestration graphs cannot land
+# in separate partial states.
+for snippet in snippets:
+    for event, blocks in snippet.get("hooks", {}).items():
+        event_blocks = hooks.get(event)
+        if not isinstance(event_blocks, list):
+            event_blocks = hooks[event] = []
+        for block in blocks:
+            if not isinstance(block, dict):
                 continue
-            desired = {
-                **hook,
-                "command": (hook.get("command", "") or "").replace(
-                    "~/.claude", base),
-            }
-            name = marker(desired["command"])
-            if name in excluded:
-                continue
-            location = next(
-                ((candidate, i)
-                 for candidate in matching_blocks
-                 for i, current in enumerate(candidate.get("hooks", []))
-                 if isinstance(current, dict)
-                 and marker(current.get("command", "")) == name),
-                None,
-            )
-            if location is None:
-                target_hooks.append(desired)
-            else:
-                existing_block, index = location
-                existing_block["hooks"][index] = desired
+            matcher = block.get("matcher", "")
+            matching_blocks = [
+                candidate for candidate in event_blocks
+                if isinstance(candidate, dict)
+                and candidate.get("matcher", "") == matcher
+            ]
+            if not matching_blocks:
+                matching_blocks = [{"matcher": matcher, "hooks": []}]
+                event_blocks.extend(matching_blocks)
+            target = matching_blocks[0]
+            target_hooks = target.setdefault("hooks", [])
+            for hook in block.get("hooks", []):
+                if not isinstance(hook, dict):
+                    continue
+                desired = {
+                    **hook,
+                    "command": (hook.get("command", "") or "").replace(
+                        "~/.claude", base),
+                }
+                name = marker(desired["command"])
+                if name in excluded:
+                    continue
+                location = next(
+                    ((candidate, i)
+                     for candidate in matching_blocks
+                     for i, current in enumerate(candidate.get("hooks", []))
+                     if isinstance(current, dict)
+                     and marker(current.get("command", "")) == name),
+                    None,
+                )
+                if location is None:
+                    target_hooks.append(desired)
+                else:
+                    existing_block, index = location
+                    existing_block["hooks"][index] = desired
 
 with open(os.environ["OUTPUT_PATH"], "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
@@ -274,14 +294,15 @@ apply_settings_proposal() {
     _settings_base="$2"
     _settings_label="$3"
     _settings_skip="${4:-}"
+    shift 4
     _settings_tmp="$(mktemp -d)"
     _settings_proposed="$_settings_tmp/proposed.json"
     _settings_report="$_settings_tmp/report.txt"
 
     if render_settings_proposal \
-            "$_settings_target" "$SNIPPET" "$_settings_base" \
-            "$_settings_skip" "$RETIRED_HOOK_FILES" \
-            "$_settings_proposed" >"$_settings_report"; then
+            "$_settings_target" "$_settings_base" "$_settings_skip" \
+            "$RETIRED_HOOK_FILES" "$_settings_proposed" \
+            "$@" >"$_settings_report"; then
         echo "Settings unchanged: $_settings_target"
         rm -rf "$_settings_tmp"
         return 0
@@ -778,6 +799,18 @@ EOF
     chmod +x "$HOOKS_DIR/$_name" 2>/dev/null || true
 done
 
+# A direct --user invocation must never register Codex base gates whose
+# executables are absent. The front-door installer has already copied these;
+# installing them here too makes the orchestration entrypoint independently
+# safe and idempotent for user-scope refreshes.
+if [ "$SCOPE" = "user" ] && [ "$BASE_LAYER_AVAILABLE" = "1" ]; then
+    mkdir -p "$BASE/hooks"
+    for _base_hook in $BASE_HOOK_FILES; do
+        install_file "$REPO/hooks/$_base_hook" "$BASE/hooks/$_base_hook" "hooks/$_base_hook"
+        chmod +x "$BASE/hooks/$_base_hook" 2>/dev/null || true
+    done
+fi
+
 # Auditable per-hook record of the resolved closure — the thing no instrument
 # reported when this went wrong (SABLE-nn54x).
 if [ "${#HOOK_LIB_LOG[@]}" -gt 0 ]; then
@@ -818,13 +851,24 @@ done
 # consent. The proposal also removes refused/retired registrations, so the
 # exact activation delta is reviewed and applied as one state transition.
 apply_settings_proposal \
-    "$SETTINGS" "$SNIPPET_BASE" "settings.json" "$REFUSED_HOOK_NAMES"
+    "$SETTINGS" "$SNIPPET_BASE" "settings.json" "$REFUSED_HOOK_NAMES" \
+    "$SNIPPET"
 if [ -n "$CODEX_HOOKS" ]; then
     # Codex supports Claude-style lifecycle hook configuration in
-    # ~/.codex/hooks.json. Reuse the exact installed command graph so mixed
-    # fleets do not silently lose mode, identity, and command guardrails.
-    apply_settings_proposal \
-        "$CODEX_HOOKS" "$SNIPPET_BASE" "codex/hooks.json" "$REFUSED_HOOK_NAMES"
+    # ~/.codex/hooks.json. Compose the canonical base and orchestration graphs
+    # in one proposal so mixed fleets do not silently lose TDD/bead gates,
+    # mode, identity, or command guardrails.
+    if [ "$BASE_LAYER_AVAILABLE" = "1" ]; then
+        apply_settings_proposal \
+            "$CODEX_HOOKS" "$SNIPPET_BASE" "codex/hooks.json" "$REFUSED_HOOK_NAMES" \
+            "$BASE_SNIPPET" "$SNIPPET"
+    else
+        echo "WARNING: canonical Codex base hooks are unavailable in $REPO;" >&2
+        echo "  applying only the orchestration graph from this partial source tree." >&2
+        apply_settings_proposal \
+            "$CODEX_HOOKS" "$SNIPPET_BASE" "codex/hooks.json" "$REFUSED_HOOK_NAMES" \
+            "$SNIPPET"
+    fi
 fi
 
 # Stage the host timer entrypoint's systemd/cron artifacts (never activates them).
