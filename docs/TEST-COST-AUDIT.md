@@ -47,15 +47,28 @@ environment for those modules.
 | Doctor integration module | 208s | 43.66s in the final profile | Share immutable install/provenance fixtures; copy only for mutating cases |
 | Doctor provenance cases | ~27s | 9.86s | Share the clean repository template |
 | Ordinary footprint unit module | 24.06s | 1.85s | Move its two real-bd cases to the existing integration module |
-| Reconciliation integration module | 648.30s | 391.89s | Read a branch's real-bd record set once per classification |
+| Reconciliation integration module | 648.30s | 222.96s after `SABLE-9sxao` | Cache one record set per classification, then deep-copy one immutable real-git/real-bd fixture template per test |
 | CI bd coverage wrapper | ~115s timeout-class | 1.47s | Stop rerunning two authoritative real-bd suites already in `ALLOW` |
 | Post-push isolation wrapper | >45s | 0.28s | One real sentinel plus structural assertions replaces repeated full-suite calls |
 | Library identity isolation wrapper | 25.3s | 12.14s | One sabotage case replaces four concurrent copies |
 | Gate-promotion test module | 104.48s ordinary | 66.56s declared integration | Correctly tier the existing real-repo/worktree/CLI contract |
 
-The reconciliation change is deliberately narrow: cached records live only
-inside one branch-classification context. No result survives to another
-branch or reconciliation cadence.
+The reconciliation production cache is deliberately narrow: cached records
+live only inside one branch-classification context. No result survives to
+another branch or reconciliation cadence.
+
+`SABLE-9sxao` subsequently removed the remaining fixture churn. The module
+builds one real bare repository, clone, embedded Dolt store, and small pool of
+generic open/closed work beads per pytest session. Every test receives a deep
+copy, with its git remote, beads remote, hooks path, mutable refs, Dolt files,
+and in-memory bead pool rebound to that copy. The reconciler still executes as
+a subprocess and still queries real git and real `bd` for every verdict. A
+fixture guard proves the copies share no mutable files or pool objects.
+
+The same-host module run retained all 24 reconciliation verdict tests, added
+one fixture-isolation guard, and fell from the bead's 384.70-second acceptance
+baseline to 222.96 seconds (42.0% lower), including the one-time template
+build.
 
 The audit also found two correctness defects that timing-only work would have
 missed:
@@ -70,12 +83,12 @@ missed:
 
 ## What remains expensive on purpose
 
-The final green Python profile measured all 2,944 collected tests in
+The original audit's final green Python profile measured all 2,944 collected tests in
 1,599.25 aggregate test-seconds. The largest modules were:
 
 | Module | Seconds | Classification |
 | --- | ---: | --- |
-| `test_sable_reconcile_handoffs_integration.py` | 391.89 | Real bd/git branch-state authority |
+| `test_sable_reconcile_handoffs_integration.py` | 391.89 originally; 222.96 after `SABLE-9sxao` | Real bd/git branch-state authority |
 | `test_sable_spawn_worker_integration.py` | 214.04 | Real tmux, bd, dispatch, and lifecycle authority |
 | `test_sable_screen_integration.py` | 169.54 | Real terminal delivery and synchronization |
 | `test_activation_screen_integration.py` | 89.49 | Real activation/runtime screen contract |

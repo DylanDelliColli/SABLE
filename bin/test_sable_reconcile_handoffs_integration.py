@@ -21,7 +21,9 @@ What these pin (the contract's acceptance):
 
 Fixture discipline: sandbox bd (own HOME, own DB), hermetic + headless (env
 leaks stripped, BD_NON_INTERACTIVE), all git ops on tmp_path scratch repos
-(tripwire-clean: no real-repo mutation).
+(tripwire-clean: no real-repo mutation). One immutable, pre-populated git+bd
+template is built per pytest session, then deep-copied for every test. The
+copies share no mutable git refs or Dolt files.
 """
 import json
 import os
@@ -71,6 +73,15 @@ _OLD_DATE = "2001-01-01T00:00:00 +0000"
 # WANTS a live pane (test_4709h_live_worker_pane_suppresses_filing) overrides
 # this with its own stub tmux script.
 _NO_TMUX = "sable-reconcile-tests-hermetic-no-such-tmux-binary"
+
+# SABLE-9sxao: constructing the same real bare repo, clone, embedded Dolt
+# store, and generic work beads in every test was accidental integration cost.
+# The session template is immutable after construction. `_setup` deep-copies
+# it, rewrites every location-bearing setting, and gives each test independent
+# mutable refs and database files.
+_FIXTURE_TEMPLATE_ROOT = None
+_FIXTURE_TEMPLATE_BEADS = None
+_BEAD_POOLS = {}
 
 
 def _env(home):
@@ -142,7 +153,7 @@ def _bare_git(origin, *args, check=True):
 # unhanded-off push.
 # --------------------------------------------------------------------------
 
-def _setup(tmp_path, *, integration_branch=BASE, home=None):
+def _setup_fresh(tmp_path, *, integration_branch=BASE, home=None):
     origin = tmp_path / "origin.git"
     work = tmp_path / "work"
     home = (tmp_path / "home") if home is None else home
@@ -175,16 +186,123 @@ def _setup(tmp_path, *, integration_branch=BASE, home=None):
     return origin, work, home
 
 
-def _make_work_bead(work, home, *, status="closed"):
-    """Create a work bead (real, --sandbox), optionally close it, and return the
-    id. The worker branch is named `wk-<id>` so the reconciler resolves the bead
-    via the embedded-id path (parse_bead_id -> bd show)."""
+def _create_work_bead(work, home, *, status="closed"):
     cp = _bd(work, home, "create", "--sandbox", "--json",
              "--title", "worker unit of work", "--type=task", "--priority=2")
     bead_id = json.loads(cp.stdout)["id"]
     if status == "closed":
         _bd(work, home, "close", bead_id, "--sandbox")
     return bead_id
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _immutable_fixture_template(tmp_path_factory):
+    """Build the expensive real-git/real-bd baseline once per test session."""
+    global _FIXTURE_TEMPLATE_ROOT, _FIXTURE_TEMPLATE_BEADS
+    if not HAVE_BD:
+        yield
+        return
+
+    root = tmp_path_factory.mktemp("reconcile-handoffs-template")
+    _, work, home = _setup_fresh(root)
+    _FIXTURE_TEMPLATE_BEADS = {
+        "closed": [_create_work_bead(work, home, status="closed") for _ in range(4)],
+        "open": [_create_work_bead(work, home, status="open") for _ in range(2)],
+    }
+    _FIXTURE_TEMPLATE_ROOT = root
+    try:
+        yield
+    finally:
+        _FIXTURE_TEMPLATE_ROOT = None
+        _FIXTURE_TEMPLATE_BEADS = None
+        _BEAD_POOLS.clear()
+
+
+def _rewrite_bd_remote(work, origin):
+    """Rebind the copied store's only location-bearing setting."""
+    config = work / ".beads" / "config.yaml"
+    lines = config.read_text().splitlines()
+    rewritten = [
+        f'sync.remote: "{origin}"' if line.startswith("sync.remote:") else line
+        for line in lines
+    ]
+    config.write_text("\n".join(rewritten) + "\n")
+
+
+def _setup(tmp_path, *, integration_branch=BASE, home=None):
+    """Deep-copy the immutable session template into one isolated test world."""
+    if _FIXTURE_TEMPLATE_ROOT is None or _FIXTURE_TEMPLATE_BEADS is None:
+        # Keeps the helper usable when invoked outside pytest.
+        return _setup_fresh(tmp_path, integration_branch=integration_branch, home=home)
+
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    home = (tmp_path / "home") if home is None else home
+    home.mkdir(exist_ok=True)
+
+    shutil.copytree(_FIXTURE_TEMPLATE_ROOT / "origin.git", origin)
+    shutil.copytree(_FIXTURE_TEMPLATE_ROOT / "work", work)
+
+    nohooks = tmp_path / "nohooks"
+    nohooks.mkdir()
+    _git(work, "remote", "set-url", "origin", str(origin))
+    _git(work, "config", "--local", "core.hooksPath", str(nohooks))
+    _rewrite_bd_remote(work, origin)
+    (work / ".sable").write_text(f"integrationBranch={integration_branch}\n")
+
+    # Each copied store starts with the same immutable IDs, but consumption is
+    # scoped to this copied worktree. No list object or Dolt file is shared.
+    _BEAD_POOLS[str(work)] = {
+        status: list(ids) for status, ids in _FIXTURE_TEMPLATE_BEADS.items()
+    }
+    return origin, work, home
+
+
+def _make_work_bead(work, home, *, status="closed"):
+    """Return an isolated pre-populated bead, creating only on pool exhaustion.
+
+    The worker branch is named `wk-<id>` so the reconciler still resolves the
+    record through a real `bd show` subprocess against the copied Dolt store.
+    """
+    pool = _BEAD_POOLS.get(str(work), {}).get(status)
+    if pool:
+        return pool.pop()
+    return _create_work_bead(work, home, status=status)
+
+
+def test_fixture_template_copies_share_no_mutable_state(tmp_path):
+    """Guard the optimization itself: copied refs, Dolt files, and pools vary."""
+    left_root = tmp_path / "left"
+    right_root = tmp_path / "right"
+    left_root.mkdir()
+    right_root.mkdir()
+    left_origin, left_work, _ = _setup(left_root)
+    right_origin, right_work, _ = _setup(right_root)
+
+    assert _git(left_work, "remote", "get-url", "origin") == str(left_origin)
+    assert _git(right_work, "remote", "get-url", "origin") == str(right_origin)
+    assert str(left_origin) in (left_work / ".beads" / "config.yaml").read_text()
+    assert str(right_origin) in (right_work / ".beads" / "config.yaml").read_text()
+
+    left_pool = _BEAD_POOLS[str(left_work)]["closed"]
+    right_pool = _BEAD_POOLS[str(right_work)]["closed"]
+    assert left_pool == right_pool
+    assert left_pool is not right_pool
+    left_pool.pop()
+    assert len(right_pool) == len(_FIXTURE_TEMPLATE_BEADS["closed"])
+
+    # copytree must never regress to aliases with shared writes.
+    # The embedded store layout can evolve, so compare every regular file
+    # present on both sides rather than baking in a Dolt-internal filename.
+    compared = 0
+    for left_file in (left_work / ".beads").rglob("*"):
+        if not left_file.is_file():
+            continue
+        right_file = right_work / ".beads" / left_file.relative_to(left_work / ".beads")
+        if right_file.is_file():
+            compared += 1
+            assert not os.path.samefile(left_file, right_file), left_file
+    assert compared > 0, "isolation probe compared no copied beads files"
 
 
 def _push_worker_branch(work, bead_id, *, merged_into=None):
@@ -222,14 +340,9 @@ def _make_work_bead_with_branch_metadata(work, home, branch, *, status="closed")
     what sable-spawn-worker's tag_branch_metadata writes at dispatch time
     (SABLE-i5739). Under the OLD prose-search resolver this bead would never
     be found for `branch` (mode a: 0 hits)."""
-    cp = _bd(work, home, "create", "--sandbox", "--json",
-             "--title", "unit of work with a title naming nothing branch-shaped",
-             "--type=task", "--priority=2")
-    bead_id = json.loads(cp.stdout)["id"]
+    bead_id = _make_work_bead(work, home, status=status)
     _bd(work, home, "update", bead_id, "--sandbox",
         "--set-metadata", f"branch={branch}")
-    if status == "closed":
-        _bd(work, home, "close", bead_id, "--sandbox")
     return bead_id
 
 
