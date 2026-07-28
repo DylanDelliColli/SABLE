@@ -35,6 +35,7 @@ The three hardening axes are each driven end-to-end through the REAL CLI:
 Assertions are by ATTRIBUTABLE IDENTITY — the specific ids/branches the
 fixture created — never a global count (SABLE-jd5fj.15).
 """
+# sable-test-load: nested-runner -- one self-skip E2E proves the real module is sealed without bd
 import json
 import os
 import shutil

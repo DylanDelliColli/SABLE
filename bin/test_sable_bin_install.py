@@ -87,6 +87,20 @@ def run_install(bin_dir, dest, *extra_args, env=None):
 
 # --- import-check classifier (--classify) --------------------------------------
 
+def test_classify_all_reports_every_tool_in_one_machine_readable_stream(tmp_path):
+    _repo, bin_dir = make_fixture_repo(tmp_path)
+    result = run_install(bin_dir, tmp_path / "dest", "--classify-all")
+    assert result.returncode == 0, result.stderr
+
+    shapes = dict(line.split("\t", 1) for line in result.stdout.splitlines())
+    assert shapes == {
+        "sable-bin-install": "plain",
+        "sable-importer": "snapshot",
+        "sable-nolib-py": "plain",
+        "sable-plain": "plain",
+    }
+
+
 def test_classify_shell_script_is_plain(tmp_path):
     repo, bin_dir = make_fixture_repo(tmp_path)
     result = run_install(bin_dir, tmp_path / "dest", "--classify", "sable-plain")

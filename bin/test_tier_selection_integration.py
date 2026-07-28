@@ -7,6 +7,7 @@ no mocked pytest. Self-skips (SABLE-59zu clean-room contract: missing dep is
 a skip, never a false-fail/false-pass) when either plugin isn't importable in
 this interpreter.
 """
+# sable-test-load: nested-runner -- defining E2E exercises real pytest-testmon selection and fallback
 import importlib.util
 import sqlite3
 import subprocess

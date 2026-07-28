@@ -17,6 +17,7 @@ table directly (injected ImpactTierPlan, no subprocess). This file proves the
 real, wired-up path: tier_selection.run_diff_cover_scope end to end, and the
 real diff-cover-gate.sh end to end for the line-1400 shape.
 """
+# sable-test-load: nested-runner -- defining E2E exercises real pytest selector and gate fallbacks
 from __future__ import annotations
 
 import importlib.util

@@ -460,13 +460,37 @@ def git_head(repo_dir: Path) -> str:
     ).stdout.strip()
 
 
-@pytest.fixture()
-def provenance_fixture(tmp_path):
-    fixture_repo = make_fixture_repo(tmp_path / "fixture-repo")
-    home = tmp_path / "home"
+@pytest.fixture(scope="module")
+def provenance_template(tmp_path_factory):
+    """Pay the real repo snapshot + install once for read/modify audit cases.
+
+    Tests that specifically assert install-time dirty/untracked classification
+    still run the real installer from their own state below. These audit-path
+    tests need independent mutable copies, not repeated installation.
+    """
+    root = tmp_path_factory.mktemp("doctor-provenance-template")
+    fixture_repo = make_fixture_repo(root / "fixture-repo")
+    home = root / "home"
     home.mkdir()
     run_install_from(fixture_repo, home)
+    return root
+
+
+@pytest.fixture()
+def provenance_fixture(tmp_path, provenance_template):
+    root = tmp_path / "provenance"
+    shutil.copytree(provenance_template, root, symlinks=True)
+    fixture_repo = root / "fixture-repo"
+    home = root / "home"
     return fixture_repo, home / ".claude"
+
+
+@pytest.fixture()
+def provenance_repo(tmp_path, provenance_template):
+    """Independent committed repo copied from the immutable real template."""
+    fixture_repo = tmp_path / "fixture-repo"
+    shutil.copytree(provenance_template / "fixture-repo", fixture_repo, symlinks=True)
+    return fixture_repo
 
 
 def test_install_writes_provenance_stamp_with_the_actual_head_sha(provenance_fixture):
@@ -532,13 +556,13 @@ def test_installed_from_flag_fails_clearly_without_a_stamp(installed_claude_dir)
     assert "no provenance stamp" in result.stderr
 
 
-def test_install_from_a_dirty_tree_stamps_dirty_true(tmp_path):
+def test_install_from_a_dirty_tree_stamps_dirty_true(tmp_path, provenance_repo):
     # a genuinely TRACKED modification breaks reproducibility from the
     # recorded SHA -- install.sh installs tracked content, so this MUST
     # stamp dirty=true. (Modifying a tracked file, not adding a new
     # untracked one -- see the untracked-only test below for the contrast
     # this bead, SABLE-dt92b, is actually about.)
-    fixture_repo = make_fixture_repo(tmp_path / "fixture-repo")
+    fixture_repo = provenance_repo
     readme = fixture_repo / "README.md"
     readme.write_text(readme.read_text() + "\ndirties a tracked file post-commit\n")
     home = tmp_path / "home"
@@ -548,14 +572,14 @@ def test_install_from_a_dirty_tree_stamps_dirty_true(tmp_path):
     assert "dirty=true" in stamp
 
 
-def test_install_from_an_untracked_only_tree_stamps_dirty_false(tmp_path):
+def test_install_from_an_untracked_only_tree_stamps_dirty_false(tmp_path, provenance_repo):
     # SABLE-dt92b: this is the defect, reproduced end-to-end. An untracked
     # file (never `git add`ed) does not touch any tracked content, so the
     # recorded SHA still reconstructs the installed set exactly -- dirty
     # must read false, and doctor's rendered line must not claim "not
     # reproducible". Untracked presence may still be surfaced, but as its
     # own, separately-worded fact.
-    fixture_repo = make_fixture_repo(tmp_path / "fixture-repo")
+    fixture_repo = provenance_repo
     (fixture_repo / "UNCOMMITTED_CHANGE.md").write_text("an untracked scratch file\n")
     home = tmp_path / "home"
     home.mkdir()
@@ -574,8 +598,9 @@ def test_install_from_an_untracked_only_tree_stamps_dirty_false(tmp_path):
     assert "not reproducible" not in result.stdout
 
 
-def test_install_from_a_fully_clean_tree_stamps_dirty_false_and_untracked_false(tmp_path):
-    fixture_repo = make_fixture_repo(tmp_path / "fixture-repo")
+def test_install_from_a_fully_clean_tree_stamps_dirty_false_and_untracked_false(
+        tmp_path, provenance_repo):
+    fixture_repo = provenance_repo
     home = tmp_path / "home"
     home.mkdir()
     run_install_from(fixture_repo, home)

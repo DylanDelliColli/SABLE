@@ -106,7 +106,13 @@ python -m pytest bin/ -q -p no:cacheprovider
 # allowlisted suites; see .github/ci/shell-run-set.sh header for the
 # excluded-suite policy):
 bash .github/ci/shell-run-set.sh --check
+python bin/columbo-cost-prefilter.py --check-load-declarations
 bash .github/ci/shell-run-set.sh --run
+
+# Reproducible cost reports from the same authoritative executions:
+python -m pytest bin/ -q -p no:cacheprovider \
+  --sable-test-cost-report=/tmp/sable-python-cost.json
+bash .github/ci/shell-run-set.sh --profile /tmp/sable-shell-cost.tsv
 
 # Exclusion-freshness gate (LOCAL ONLY — resolves each EXCLUDE entry's
 # tracking beads against the real bd store and fails when a [blocked-by: ...]

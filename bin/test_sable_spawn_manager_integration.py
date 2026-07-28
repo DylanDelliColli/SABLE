@@ -31,6 +31,14 @@ def sock():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+@pytest.fixture(autouse=True)
+def execution_mode_state(tmp_path, monkeypatch):
+    """Launch tests must not inherit the checkout's live planning/execution mode."""
+    state = tmp_path / "mode-state.json"
+    state.write_text('{"mode":"execution"}')
+    monkeypatch.setenv("SABLE_MODE_STATE", str(state))
+
+
 def _tmux(s, *args, check=True):
     return subprocess.run(["tmux", "-L", s, *args],
                           capture_output=True, text=True, check=check)

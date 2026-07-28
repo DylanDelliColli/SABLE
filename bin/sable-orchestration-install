@@ -339,69 +339,89 @@ install_file() {
 # FOUR references and only three are in the table; the fourth's absence must
 # not have to be re-derived.
 #
-# hook_sibling_libs HOOK_FILE INSTALLED_HOOK_DIR — print one
-# "<abs-target-dir><TAB><lib-name><TAB><hard>" line per library the hook needs,
-# where <abs-target-dir> is where the INSTALLED hook will actually look. Closes
-# transitively: python resolves a lib's own sable_* imports from that lib's
-# directory, so a one-level scan would rebuild this same defect one level down.
-hook_sibling_libs() {
-    HOOK_FILE="$1" HOOK_DEST_DIR="$2" REPO_DIR="$REPO" python3 - <<'PY'
+# scan_hook_sibling_libs INSTALLED_HOOK_DIR — scan every hook in ONE Python
+# process and print one
+# "<hook-name><TAB><abs-target-dir><TAB><lib-name><TAB><hard>" row per library.
+# The hook name lets the shell loop below recover each hook's closure without
+# paying one interpreter startup per artifact. Closes transitively: python
+# resolves a lib's own sable_* imports from that lib's directory, so a
+# one-level scan would rebuild this same defect one level down.
+scan_hook_sibling_libs() {
+    HOOK_DEST_DIR="$1" REPO_DIR="$REPO" python3 - <<'PY'
 import os, re
+from pathlib import Path
 
 REF_RE = re.compile(r'((?:\.\./)+)bin/([A-Za-z0-9_]+\.py)')
 IMPORT_RE = re.compile(r'^\s*(?:import|from)\s+(sable_[A-Za-z0-9_]+)', re.M)
 
 repo = os.environ['REPO_DIR']
 dest = os.environ['HOOK_DEST_DIR']
-try:
-    with open(os.environ['HOOK_FILE'], encoding='utf-8', errors='replace') as f:
-        lines = f.read().splitlines()
-except OSError:
-    raise SystemExit(0)
-
-# hard[(target, name)] is True once the reference is seen off a comment line.
-hard, order, queue = {}, [], []
 
 
-def note(target, name, is_hard):
-    key = (target, name)
-    if key not in hard:
-        hard[key] = False
-        order.append(key)
-        queue.append(key)
-    if is_hard and not hard[key]:
-        # Upgrading to hard changes what this entry propagates, so it has to be
-        # walked again -- otherwise a dep first reached through a comment stays
-        # soft even after a real reference to its parent turns up.
-        hard[key] = True
-        queue.append(key)
-
-
-for line in lines:
-    is_comment = line.lstrip().startswith('#')
-    for updirs, name in REF_RE.findall(line):
-        note(os.path.normpath(os.path.join(dest, updirs, 'bin')), name, not is_comment)
-
-while queue:
-    target, name = queue.pop()
+def scan(hook_file):
     try:
-        with open(os.path.join(repo, 'bin', name), encoding='utf-8', errors='replace') as f:
-            body = f.read()
+        lines = hook_file.read_text(encoding='utf-8', errors='replace').splitlines()
     except OSError:
-        # Unreadable here means unresolvable at install time too; the caller's
-        # readability check reports it and refuses the hook when it is hard.
-        continue
-    for mod in IMPORT_RE.findall(body):
-        dep = mod + '.py'
-        if not os.path.exists(os.path.join(repo, 'bin', dep)):
-            continue  # not a repo sibling (stdlib / third party) — nothing to install
-        # A transitive dep is exactly as load-bearing as the parent that
-        # imports it: inherit the flag rather than re-deriving it.
-        note(target, dep, hard[(target, name)])
+        return []
 
-for target, name in order:
-    print('%s\t%s\t%d' % (target, name, 1 if hard[(target, name)] else 0))
+    # hard[(target, name)] becomes true once a reference is seen off a
+    # comment line. `order` keeps the old deterministic discovery order.
+    hard, order, queue = {}, [], []
+
+    def note(target, name, is_hard):
+        key = (target, name)
+        if key not in hard:
+            hard[key] = False
+            order.append(key)
+            queue.append(key)
+        if is_hard and not hard[key]:
+            # Upgrading to hard changes what this entry propagates, so walk
+            # it again; otherwise a comment-first dependency stays soft.
+            hard[key] = True
+            queue.append(key)
+
+    for line in lines:
+        is_comment = line.lstrip().startswith('#')
+        for updirs, name in REF_RE.findall(line):
+            note(os.path.normpath(os.path.join(dest, updirs, 'bin')), name, not is_comment)
+
+    while queue:
+        target, name = queue.pop()
+        try:
+            with open(os.path.join(repo, 'bin', name), encoding='utf-8', errors='replace') as f:
+                body = f.read()
+        except OSError:
+            # The shell caller reports/refuses unreadable hard dependencies.
+            continue
+        for mod in IMPORT_RE.findall(body):
+            dep = mod + '.py'
+            if not os.path.exists(os.path.join(repo, 'bin', dep)):
+                continue
+            # A transitive dependency inherits the parent's hardness.
+            note(target, dep, hard[(target, name)])
+
+    return [(target, name, hard[(target, name)]) for target, name in order]
+
+
+hooks_dir = Path(repo) / 'hooks' / 'multi-manager'
+for hook_file in sorted(hooks_dir.glob('*.sh')):
+    for target, name, is_hard in scan(hook_file):
+        print('%s\t%s\t%s\t%d' % (
+            hook_file.name, target, name, 1 if is_hard else 0
+        ))
 PY
+}
+
+# Print one selected hook's cached three-column closure. This is a pure shell
+# filter over the single batch result, not another scanner process.
+hook_sibling_libs_for() {
+    _wanted="$1"
+    while IFS="$(printf '\t')" read -r _hook _dir _lib _hard; do
+        [ "${_hook:-}" = "$_wanted" ] || continue
+        printf '%s\t%s\t%s\n' "$_dir" "$_lib" "$_hard"
+    done <<EOF
+$ALL_HOOK_SIBLING_LIBS
+EOF
 }
 
 # Stage (never activate) the host timer entrypoint's systemd/cron artifacts
@@ -530,6 +550,10 @@ skill_names() {
     done
 }
 
+# One authority crossing for the complete hook set. Both install and
+# uninstall consume this immutable snapshot.
+ALL_HOOK_SIBLING_LIBS="$(scan_hook_sibling_libs "$HOOKS_DIR")"
+
 if [ "$UNINSTALL" = "1" ]; then
     while IFS= read -r n; do rm -rf "$SKILLS/$n"; done <<EOF
 $(skill_names)
@@ -540,15 +564,12 @@ EOF
     # Sibling libraries installed for the hooks' dependency closure
     # (SABLE-nn54x). Removed FILE-BY-FILE, never as a directory: BASE/bin is a
     # shared location this installer does not own.
-    for hook in "$REPO"/hooks/multi-manager/*.sh; do
-        [ -f "$hook" ] || continue
-        while IFS="$(printf '\t')" read -r _dir _lib _hard; do
-            [ -n "${_lib:-}" ] || continue
-            rm -f "$_dir/$_lib"
-        done <<EOF
-$(hook_sibling_libs "$hook" "$HOOKS_DIR")
+    while IFS="$(printf '\t')" read -r _hook _dir _lib _hard; do
+        [ -n "${_lib:-}" ] || continue
+        rm -f "$_dir/$_lib"
+    done <<EOF
+$ALL_HOOK_SIBLING_LIBS
 EOF
-    done
     # agents-teams/ is no longer installed; the rm below cleans up installs
     # that predate the tmux-only layer.
     rm -rf "$HOOKS_DIR" "$BASE/agents-teams" "$BASE/sable/reconcile-timer"
@@ -580,7 +601,7 @@ for hook in "$REPO"/hooks/multi-manager/*.sh; do
         *" $_name "*) continue ;;
     esac
 
-    _libs="$(hook_sibling_libs "$hook" "$HOOKS_DIR")"
+    _libs="$(hook_sibling_libs_for "$_name")"
 
     # Resolve the whole closure BEFORE copying anything: a hook installed
     # first and refused second would still be sitting at the installed path.

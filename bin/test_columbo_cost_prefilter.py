@@ -650,6 +650,140 @@ def test_build_report_degenerate_signal_absent_with_single_or_zero_tests():
 
 
 # ---------------------------------------------------------------------------
+# Static load-boundary declarations
+# ---------------------------------------------------------------------------
+
+
+def test_nested_shell_runner_without_declaration_is_a_load_violation(tmp_path):
+    suite = tmp_path / "test-wrapper.sh"
+    suite.write_text('#!/usr/bin/env bash\nbash "$TARGET_SUITE"\n')
+
+    records = ccp.scan_test_load_boundaries([suite], repo_root=tmp_path)
+
+    assert records == [{
+        "path": "test-wrapper.sh",
+        "line": 2,
+        "kind": "nested-runner",
+        "declared": False,
+    }]
+    assert ccp.undeclared_load_boundaries(records) == records
+
+
+def test_nested_shell_runner_declaration_clears_only_that_violation(tmp_path):
+    suite = tmp_path / "test-wrapper.sh"
+    suite.write_text(
+        "#!/usr/bin/env bash\n"
+        "# sable-test-load: nested-runner -- one sealed composition check\n"
+        'bash "$TARGET_SUITE"\n'
+    )
+
+    records = ccp.scan_test_load_boundaries([suite], repo_root=tmp_path)
+
+    assert records[0]["declared"] is True
+    assert ccp.undeclared_load_boundaries(records) == []
+
+
+def test_nested_shell_runner_is_found_from_assigned_test_path_not_variable_name(tmp_path):
+    suite = tmp_path / "test-wrapper.sh"
+    suite.write_text(
+        "#!/usr/bin/env bash\n"
+        'TESTDIR="/repo/hooks/test"\n'
+        'DEP_MERGE="$TESTDIR/test-dep-merge-state.sh"\n'
+        'OUT=$(bash "$DEP_MERGE" 2>&1)\n'
+    )
+
+    records = ccp.scan_test_load_boundaries([suite], repo_root=tmp_path)
+
+    assert records == [{
+        "path": "test-wrapper.sh",
+        "line": 4,
+        "kind": "nested-runner",
+        "declared": False,
+    }]
+
+
+def test_literal_nested_shell_runner_is_not_an_escape_from_the_guard(tmp_path):
+    suite = tmp_path / "test-wrapper.sh"
+    suite.write_text(
+        "#!/usr/bin/env bash\n"
+        "OUT=$(bash hooks/test/test-real-authority.sh 2>&1)\n"
+    )
+
+    records = ccp.scan_test_load_boundaries([suite], repo_root=tmp_path)
+
+    assert records == [{
+        "path": "test-wrapper.sh",
+        "line": 2,
+        "kind": "nested-runner",
+        "declared": False,
+    }]
+
+
+def test_authoritative_tier_runner_counts_only_when_it_executes_tests(tmp_path):
+    suite = tmp_path / "test-wrapper.sh"
+    suite.write_text(
+        "#!/usr/bin/env bash\n"
+        "bash .github/ci/shell-run-set.sh --check\n"
+        "bash .github/ci/shell-run-set.sh --run\n"
+    )
+
+    records = ccp.scan_test_load_boundaries([suite], repo_root=tmp_path)
+
+    assert [record["line"] for record in records] == [3]
+
+
+def test_shell_text_that_merely_mentions_a_test_command_is_not_a_runner(tmp_path):
+    suite = tmp_path / "test-parser.sh"
+    suite.write_text(
+        '#!/usr/bin/env bash\n'
+        'input="bash hooks/test/test-example.sh"\n'
+        'assert_parser_recognizes "$input"\n'
+    )
+
+    assert ccp.scan_test_load_boundaries([suite], repo_root=tmp_path) == []
+
+
+def test_nested_pytest_subprocess_requires_the_same_declaration(tmp_path):
+    suite = tmp_path / "test_nested.py"
+    suite.write_text(
+        "import subprocess, sys\n"
+        "subprocess.run([sys.executable, '-m', 'pytest', 'bin/'])\n"
+    )
+
+    records = ccp.scan_test_load_boundaries([suite], repo_root=tmp_path)
+
+    assert records == [{
+        "path": "test_nested.py",
+        "line": 2,
+        "kind": "nested-runner",
+        "declared": False,
+    }]
+
+
+def test_load_declaration_does_not_hide_an_unknown_future_kind(tmp_path):
+    suite = tmp_path / "test-wrapper.sh"
+    suite.write_text(
+        "#!/usr/bin/env bash\n"
+        "# sable-test-load: fixed-sleep -- unrelated declaration\n"
+        'bash "$TARGET_SUITE"\n'
+    )
+
+    records = ccp.scan_test_load_boundaries([suite], repo_root=tmp_path)
+
+    assert records[0]["declared"] is False
+
+
+def test_real_repo_has_no_undeclared_nested_test_runners():
+    repo_root = SCRIPT_DIR.parent
+    records = ccp.scan_test_load_boundaries(
+        ccp._default_test_sources(repo_root), repo_root=repo_root
+    )
+
+    assert ccp.undeclared_load_boundaries(records) == []
+    assert records, "positive control: the real corpus must contain declared boundaries"
+
+
+# ---------------------------------------------------------------------------
 # format_json / format_text -- basic shape sanity
 # ---------------------------------------------------------------------------
 

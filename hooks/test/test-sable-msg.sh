@@ -313,13 +313,19 @@ if command -v bd >/dev/null 2>&1; then
   # concurrent bead cannot match BOTH, so this is immune to fleet activity
   # rather than merely unlikely to collide.
   #
-  # Derive the title from bin/sable-msg ITSELF rather than hand-typing it.
+  # Derive the stable title prefix from bin/sable-msg ITSELF rather than
+  # hand-typing it.
   # Hand-typing a format another file owns is what broke the first attempt at
   # this fix: the real title interpolates the FRAMED message (see
   # format_message), so the framing sits between the role and the body and a
   # guessed "...to chuck: sandbox fallback probe" matched nothing —
   # --title-contains then returned 0 unconditionally and the assertion could
-  # not fail. Control (b) below exists to catch precisely that relapse.
+  # not fail. `format_message` now carries a required per-send timestamp, so
+  # reconstructing the whole framed value after the send would be both stale
+  # and nondeterministic. `message_identity` is the production-owned stable
+  # prefix of that frame; passing it through the production title composer
+  # yields a prefix of the real bead title. Control (b) below exists to catch
+  # a non-matching derivation.
   fallback_title="$(SABLE_FIXTURE_BODY="$FIXTURE_BODY" python3 - "$BIN" <<'PY'
 import importlib.util, os, sys
 from importlib.machinery import SourceFileLoader
@@ -327,8 +333,8 @@ loader = SourceFileLoader("sable_msg", os.path.join(sys.argv[1], "sable-msg"))
 spec = importlib.util.spec_from_loader("sable_msg", loader)
 mod = importlib.util.module_from_spec(spec)
 loader.exec_module(mod)
-framed = mod.format_message("lincoln", "chuck", os.environ["SABLE_FIXTURE_BODY"])
-print(mod.fallback_bead_title("chuck", framed), end="")
+identity = mod.message_identity("lincoln", "chuck", os.environ["SABLE_FIXTURE_BODY"])
+print(mod.fallback_bead_title("chuck", identity), end="")
 PY
 )"
   if [ -n "$fallback_title" ] && [ "$fallback_title" != "${fallback_title#*$FIXTURE_BODY}" ]; then

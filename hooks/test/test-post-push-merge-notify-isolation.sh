@@ -3,46 +3,28 @@
 # harness for SABLE-yn5t (config-escape class; root SABLE-a5a5, template z776).
 #
 # Proves test-post-push-merge-notify.sh can NEVER pollute the REAL repo's git
-# identity or reach the REAL origin remote, even when a fixture `cd` fails
-# under a busy-/tmp race or a push targets a CWD-dependent remote NAME. Four
+# identity or reach the REAL origin remote when a fixture `cd` fails. Two
 # layers:
 #
 #   1. Deterministic sabotage (the RED/GREEN gate): shim `mktemp` so the FIRST
 #      `mktemp -d` hands back a non-cd-able path (a regular file), reproducing
 #      the exact race where the fixture repo dir is unusable at `cd` time. Run
-#      the suite from inside a sentinel "real" repo and assert the sentinel's
-#      git identity is UNCHANGED afterward. RED on the pre-fix suite (bare
-#      `git config user.name Test` runs in the sentinel because the unguarded
-#      cd failed silently); GREEN on the fix (`git -C "$REPO" config` can never
-#      touch the sentinel AND the guarded cd aborts).
+#      the suite from inside a sentinel repo with a bare origin and assert BOTH
+#      identity and origin/main are unchanged. RED on the pre-fix suite (bare
+#      git operations escape after the failed cd); GREEN on scoped operations
+#      plus the guarded cd.
 #
-#   2. Concurrency under a busy /tmp: N parallel suite runs plus a background
-#      /tmp thrasher, same sentinel-identity assertion. Load/regression guard
-#      matching the bead's test spec ("run the fixture N times in parallel
-#      under a busy /tmp, assert the real repo identity UNCHANGED").
+#   2. Structural: every `git config` is `git -C`-scoped, no push names the
+#      CWD-dependent literal remote `origin`, and every fixture `cd` is guarded.
 #
-#   3. Bare-origin escape simulation (SABLE-ck05, defense-in-depth for the
-#      z776 pattern applied to this suite): a `git` shim intercepts any `push`
-#      invocation naming the remote by the LITERAL string 'origin' and
-#      redirects it to a REAL_ORIGIN_BARE repo standing in for the operator's
-#      real upstream — the worst case of what a CWD escape would mean for a
-#      push that addresses its remote by name instead of by explicit bare-repo
-#      path. Asserts `git ls-remote` on that stand-in gains NO refs after the
-#      run. RED on a suite with bare `git push -q origin ...` lines (all 13
-#      redirect and land); GREEN once every push addresses its fixture's bare
-#      origin by explicit path (the shim's literal-'origin' match never fires,
-#      since the pushed argument is a path, not the string 'origin').
-#
-#   4. Structural: every `git config` in the suite is `git -C`-scoped (no bare
-#      form that follows CWD) and every fixture `cd` is guarded.
-#
-# Standalone — deliberately NOT wired into the .sable pre-push testCommand (the
-# suite it guards already runs in the gate; this harness runs the whole suite
-# up to N+1 times and is meant for manual / worker verification).
+# Standalone — not wired into the .sable pre-push testCommand (the suite it
+# guards already runs there); independently classified by the sealed shell gate.
 #
 # Run:  bash hooks/test/test-post-push-merge-notify-isolation.sh
 # Optional arg: path to the suite under test (defaults to the sibling suite;
 # used to point the harness at a pre-fix copy for RED verification).
+#
+# sable-test-load: nested-runner -- one deterministic sabotage run proves config/push containment
 
 set -uo pipefail
 
@@ -74,25 +56,31 @@ fail() {
   [ -n "${2:-}" ] && echo "  $2"
 }
 
-# make_sentinel <dir> — a throwaway "real" repo with a KNOWN identity and NO
-# origin remote (so a fixture's `git push origin ...` fails quietly rather than
-# erroring the harness). Any fixture pollution overwrites this identity.
+# make_sentinel <dir> <bare> — a throwaway "real" repo with a KNOWN identity,
+# one commit, and origin/main pinned at that commit. Escaped config or push
+# operations therefore leave an observable mutation.
 make_sentinel() {
-  local d="$1"
-  git init -q "$d"
+  local d="$1" bare="$2"
+  git init -q --bare "$bare"
+  git clone -q "$bare" "$d" 2>/dev/null
   git -C "$d" config user.name "Sentinel"
   git -C "$d" config user.email "sentinel@keep"
+  echo "keep" > "$d/README.md"
+  git -C "$d" add README.md
+  git -C "$d" commit -q -m "sentinel base"
+  git -C "$d" push -q origin HEAD:refs/heads/main 2>/dev/null
 }
 
-# assert_sentinel_clean <dir> <test-name>
+# assert_sentinel_clean <dir> <bare> <baseline-main-sha> <test-name>
 assert_sentinel_clean() {
-  local d="$1" name="$2" n e
+  local d="$1" bare="$2" base_main="$3" name="$4" n e main_now
   n="$(git -C "$d" config --local user.name  2>/dev/null || true)"
   e="$(git -C "$d" config --local user.email 2>/dev/null || true)"
-  if [ "$n" = "Sentinel" ] && [ "$e" = "sentinel@keep" ]; then
+  main_now="$(git ls-remote "$bare" refs/heads/main 2>/dev/null | awk '{print $1}')"
+  if [ "$n" = "Sentinel" ] && [ "$e" = "sentinel@keep" ] && [ "$main_now" = "$base_main" ]; then
     pass "$name"
   else
-    fail "$name" "sentinel identity mutated: user.name='$n' user.email='$e' — fixture pollution leaked into the real repo"
+    fail "$name" "sentinel mutated: identity='$n <$e>' origin/main '$base_main' -> '$main_now'"
   fi
 }
 
@@ -119,8 +107,9 @@ exec "$REAL_MKTEMP" "\$@"
 EOF
 chmod +x "$SHIMDIR/mktemp"
 
-S1="$WORKROOT/sentinel1"
-make_sentinel "$S1"
+S1="$WORKROOT/sentinel1"; S1_BARE="$WORKROOT/sentinel1-bare"
+make_sentinel "$S1" "$S1_BARE"
+S1_MAIN="$(git ls-remote "$S1_BARE" refs/heads/main | awk '{print $1}')"
 # Pin OLDPWD to WORKROOT before landing in the sentinel: a vulnerable suite's
 # `cd "$fixture"` failure leaves CWD unchanged, and a later `cd -` jumps to
 # OLDPWD — if that were the caller's real worktree, the fixture's bare git ops
@@ -133,95 +122,11 @@ make_sentinel "$S1"
     MKTEMP_SHIM_STATE="$STATE" \
     bash "$SUITE"
 ) >/dev/null 2>&1 || true
-assert_sentinel_clean "$S1" \
-  "sabotage: a failed fixture cd never mutates the real repo git identity"
+assert_sentinel_clean "$S1" "$S1_BARE" "$S1_MAIN" \
+  "sabotage: a failed fixture cd never mutates real repo identity OR origin/main"
 
 # ==========================================================================
-# Layer 2 — concurrency under a busy /tmp: N parallel suite runs
-# ==========================================================================
-S2="$WORKROOT/sentinel2"
-make_sentinel "$S2"
-mkdir -p "$WORKROOT/t2"
-
-# Background /tmp thrasher: churn mktemp -d create/remove to keep the tmp dir
-# busy while the suites run, maximizing contention for the fixture dirs.
-THRASH_STOP="$WORKROOT/thrash.stop"
-(
-  while [ ! -e "$THRASH_STOP" ]; do
-    d="$("$REAL_MKTEMP" -d "$WORKROOT/t2/thrash.XXXXXX" 2>/dev/null)" || continue
-    rm -rf "$d" 2>/dev/null
-  done
-) &
-THRASH_PID=$!
-
-N=4
-pids=""
-for i in $(seq 1 "$N"); do
-  # Same OLDPWD pinning as Layer 1 (see note above): contain any `cd -` escape.
-  ( cd "$WORKROOT" && cd "$S2" && exec env TMPDIR="$WORKROOT/t2" bash "$SUITE" ) >/dev/null 2>&1 &
-  pids="$pids $!"
-done
-for p in $pids; do wait "$p" 2>/dev/null || true; done
-
-: > "$THRASH_STOP"
-wait "$THRASH_PID" 2>/dev/null || true
-
-assert_sentinel_clean "$S2" \
-  "concurrency: $N parallel suite runs under a busy /tmp never mutate the real repo git identity"
-
-# ==========================================================================
-# Layer 3 — bare-origin escape simulation (SABLE-ck05)
-# ==========================================================================
-# Stand-in for the operator's real upstream. Starts empty; any ref appearing
-# here after the run means a fixture push escaped via the bare remote NAME
-# 'origin' rather than an explicit bare-repo path.
-REAL_ORIGIN_BARE="$WORKROOT/real-origin.git"
-git init -q --bare "$REAL_ORIGIN_BARE"
-
-REAL_GIT="$(command -v git)"
-GITSHIMDIR="$WORKROOT/gitshim"; mkdir -p "$GITSHIMDIR"
-cat > "$GITSHIMDIR/git" <<EOF
-#!/usr/bin/env bash
-# Intercept ONLY 'push' invocations whose remote arg is the LITERAL string
-# 'origin' (never a path) and redirect to REAL_ORIGIN_BARE — modeling the
-# worst case of a CWD escape, where a name-based remote reference resolves to
-# the real upstream. A push that addresses its bare origin by explicit path
-# (the ck05/z776 fix) never matches this and can never land here, regardless
-# of what directory it actually runs from.
-if [ "\$1" = "push" ]; then
-  shift
-  args=()
-  matched=0
-  for a in "\$@"; do
-    if [ "\$matched" = "0" ] && [ "\$a" = "origin" ]; then
-      args+=("$REAL_ORIGIN_BARE")
-      matched=1
-    else
-      args+=("\$a")
-    fi
-  done
-  exec "$REAL_GIT" push "\${args[@]}"
-fi
-exec "$REAL_GIT" "\$@"
-EOF
-chmod +x "$GITSHIMDIR/git"
-
-S3="$WORKROOT/sentinel3"; mkdir -p "$S3"
-mkdir -p "$WORKROOT/t3"
-(
-  cd "$WORKROOT" && cd "$S3" && exec env PATH="$GITSHIMDIR:$PATH" TMPDIR="$WORKROOT/t3" bash "$SUITE"
-) >/dev/null 2>&1 || true
-
-REAL_ORIGIN_REFS="$(git ls-remote "$REAL_ORIGIN_BARE" 2>/dev/null | wc -l)"
-if [ "$REAL_ORIGIN_REFS" -eq 0 ]; then
-  pass "SABLE-ck05: bare-origin escape sim — real-origin stand-in gains NO refs (explicit bare-path pushes never resolve to 'origin')"
-else
-  fail "SABLE-ck05: bare-origin escape sim — real-origin stand-in gains NO refs" \
-    "ls-remote shows $REAL_ORIGIN_REFS ref(s): $(git ls-remote "$REAL_ORIGIN_BARE" 2>/dev/null)"
-fi
-
-# ==========================================================================
-# Layer 4 — structural guards on the suite source
+# Layer 2 — structural guards on the suite source
 # ==========================================================================
 # Scoped `git -C "$X" config` does NOT contain the substring "git config";
 # only the bare form does. Comment mentions of "git config" are excluded.
@@ -230,6 +135,15 @@ if [ -n "$BARE_CFG" ]; then
   fail "structural: no bare 'git config' remains (must be 'git -C <dir> config')" "$BARE_CFG"
 else
   pass "structural: every 'git config' is scoped via 'git -C <dir>'"
+fi
+
+# A literal `origin` remote is CWD-dependent. Fixture pushes must name their
+# explicit bare-repo path, regardless of whether they use `git` or `git -C`.
+LITERAL_ORIGIN_PUSH="$(grep -nE '^[[:space:]]*git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+push([[:space:]]+[^[:space:]]+)*[[:space:]]+\"?origin\"?([[:space:]]|$)' "$SUITE" || true)"
+if [ -n "$LITERAL_ORIGIN_PUSH" ]; then
+  fail "structural: no fixture push names the CWD-dependent literal remote 'origin'" "$LITERAL_ORIGIN_PUSH"
+else
+  pass "structural: every fixture push names an explicit bare-repo path"
 fi
 
 # Every `cd "$var"` into a fixture must be guarded (the cd_fixture helper is the

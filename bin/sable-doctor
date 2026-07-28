@@ -120,7 +120,57 @@ def classify_bin_shape(repo: Path, name: str):
     return shape if shape in ("snapshot", "plain") else None
 
 
-def python_sibling_importing_bins(repo: Path):
+def _classifiable_bin_names(repo: Path):
+    """Names covered by sable-bin-install's tool classifier."""
+    bin_dir = repo / "bin"
+    if not bin_dir.is_dir():
+        return []
+    return [
+        f.name
+        for f in sorted(bin_dir.glob("sable-*"))
+        if f.is_file() and f.suffix not in (".py", ".bak") and not f.name.endswith("~")
+    ]
+
+
+def classify_bin_shapes(repo: Path):
+    """Return every installable bin's authoritative shape in one subprocess.
+
+    Doctor needs the complete classification while building its manifest.
+    Crossing into sable-bin-install once preserves that Module as the sole
+    classification authority without paying one shell startup per artifact.
+    A malformed or incomplete response is undetermined (None), never a
+    partially trusted map.
+    """
+    script = _bin_install_script(repo)
+    if not script.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            ["bash", str(script), "--classify-all"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+
+    shapes = {}
+    for line in proc.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 2:
+            return None
+        name, shape = fields
+        if not name or name in shapes or shape not in ("snapshot", "plain"):
+            return None
+        shapes[name] = shape
+
+    expected = set(_classifiable_bin_names(repo))
+    if not expected.issubset(shapes):
+        return None
+    return shapes
+
+
+def python_sibling_importing_bins(repo: Path, shapes=None):
     """Every bin/sable-* entrypoint that sable-bin-install's own classifier
     calls "snapshot" (has repo-local python imports, SABLE-9boz4) — i.e.
     needs --pin-snapshot rather than a plain regular-file copy.
@@ -131,15 +181,11 @@ def python_sibling_importing_bins(repo: Path):
     hardcoding: a bin gaining, losing, or being renamed with a sibling import
     must not silently drop out of doctor's coverage the way an enumerated
     list would."""
-    bin_dir = repo / "bin"
     names = []
-    if not bin_dir.is_dir():
-        return names
-    for f in sorted(bin_dir.glob("sable-*")):
-        if not f.is_file() or f.suffix in (".py", ".bak") or f.name.endswith("~"):
-            continue
-        if classify_bin_shape(repo, f.name) == "snapshot":
-            names.append(f.name)
+    for name in _classifiable_bin_names(repo):
+        shape = shapes.get(name) if shapes is not None else classify_bin_shape(repo, name)
+        if shape == "snapshot":
+            names.append(name)
     return names
 
 
@@ -556,6 +602,7 @@ def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
     # always supplies one for real runs; unit fixtures opt in explicitly).
     if bin_dir is not None:
         bin_dir = Path(bin_dir)
+        bin_shapes = classify_bin_shapes(repo)
         for name in PINNED_BIN_NAMES:
             src = repo / "bin" / name
             if not src.is_file():
@@ -569,11 +616,16 @@ def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
             # snapshot dir is still a pin," so it called a correctly
             # snapshot-pinned bin "unpinned" and recommended a destructive
             # plain cp. One name, one classification, one category.
-            if classify_bin_shape(repo, name) == "snapshot":
+            shape = (
+                bin_shapes.get(name)
+                if bin_shapes is not None
+                else classify_bin_shape(repo, name)
+            )
+            if shape == "snapshot":
                 continue
             entries.append(("pinned bins", src, bin_dir / name))
 
-        for name in python_sibling_importing_bins(repo):
+        for name in python_sibling_importing_bins(repo, shapes=bin_shapes):
             src = repo / "bin" / name
             entries.append(("pinned snapshot bins", src, bin_dir / name))
 

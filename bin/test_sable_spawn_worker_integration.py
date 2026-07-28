@@ -10,6 +10,7 @@ Proves: a worker WINDOW is created, its pane is tagged
 (@sable_role=worker/@sable_bead/@sable_status=running), the dispatch prompt file
 is written, and the read-instruction is delivered into the pane.
 """
+import importlib.util
 import json
 import os
 import re
@@ -18,11 +19,16 @@ import subprocess
 import tempfile
 import time
 import uuid
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
 
 BIN = Path(__file__).resolve().parent / "sable-spawn-worker"
+_LOADER = SourceFileLoader("sable_spawn_worker_integration", str(BIN))
+_SPEC = importlib.util.spec_from_loader("sable_spawn_worker_integration", _LOADER)
+ssw = importlib.util.module_from_spec(_SPEC)
+_LOADER.exec_module(ssw)
 HAVE_TMUX = shutil.which("tmux") is not None
 HAVE_BD = shutil.which("bd") is not None
 BEAD = "SABLE-bldh.2"  # an open bead in this repo (read-only here)
@@ -41,6 +47,14 @@ def sock():
     yield s
     subprocess.run(["tmux", "-L", s, "kill-server"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+@pytest.fixture(autouse=True)
+def execution_mode_state(tmp_path, monkeypatch):
+    """Launch tests must not inherit the checkout's live planning/execution mode."""
+    state = tmp_path / "mode-state.json"
+    state.write_text('{"mode":"execution"}')
+    monkeypatch.setenv("SABLE_MODE_STATE", str(state))
 
 
 def _tmux(s, *args):

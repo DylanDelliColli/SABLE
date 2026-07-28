@@ -124,6 +124,9 @@ jobs:
       - name: pytest — full bin/ suite
         run: python -m pytest bin/ -q -p no:cacheprovider
 
+      - name: Test-load declarations (SABLE-ssu6v — nested runners are explicit)
+        run: python bin/columbo-cost-prefilter.py --check-load-declarations
+
       - name: Green snapshot — full_snapshot tier, retry-as-classifier
         id: snapshot
         run: |

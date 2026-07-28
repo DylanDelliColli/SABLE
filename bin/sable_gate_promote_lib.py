@@ -2117,7 +2117,7 @@ def _coverage_floor_report(signal, run, decision) -> str:
 # re-derives NO clause of it: it never computes a footprint, never resolves
 # the gate-class roster, never reads a hold, never runs a fold check. A clause
 # appearing in two places is precisely the drift the factoring exists to
-# prevent, and bin/test_sable_gate_promote_lib.py asserts the absence
+# prevent, and bin/test_sable_gate_promote_lib_integration.py asserts the absence
 # structurally (test_the_auto_promote_assert_re_derives_no_mechanical_clause)
 # so the property is checked rather than promised.
 #

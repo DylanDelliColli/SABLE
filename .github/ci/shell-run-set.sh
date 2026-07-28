@@ -2,9 +2,14 @@
 # shell-run-set.sh — single source of truth for which hooks/test/test-*.sh
 # suites the ci-verify workflow runs, and which it deliberately excludes.
 #
-# Three modes:
+# Primary modes:
 #   --run       execute the allowlist; exit non-zero if ANY suite reds (this is
 #               the gating step the merge-preview ci-verify gate reads).
+#   --profile FILE
+#               execute that same allowlist once and write
+#               suite<TAB>status<TAB>seconds to FILE. Timing is taken around
+#               each existing suite invocation with a monotonic clock; this
+#               is a report adapter, not a second test pass.
 #   --manifest  print every hooks/test/test-*.sh as RUN / EXCLUDED(reason) /
 #               UNCLASSIFIED, then a totals line. Informational (exit 0) — kept
 #               for human-readable output — but it emits ::warning:: for any
@@ -534,7 +539,9 @@ check_loud_skip_cli() {
 }
 
 run_set() {
+  local profile_path="${1:-}"
   local failed=() skipped_realbd=() name rc out_file n_skip
+  local started_ns="" ended_ns="" elapsed="" status=""
   # SABLE-jd5fj.16: the top-level rollup below used to report only pass/fail
   # — "ci-verify shell run-set: all N suites GREEN" says nothing about a
   # suite that passed BY SKIPPING its real-bd leg. That is exactly how the
@@ -543,15 +550,35 @@ run_set() {
   # actually looks at. Tee each iron-rule suite's output to a scratch file so
   # it can be grepped for that marker AFTER streaming (unchanged) to the log.
   out_file="$(mktemp)"
+  if [ -n "$profile_path" ]; then
+    if ! printf 'suite\tstatus\tseconds\n' > "$profile_path"; then
+      echo "::error::could not create shell-suite profile: $profile_path" >&2
+      rm -f "$out_file"
+      return 2
+    fi
+  fi
   for name in "${ALLOW[@]}"; do
     if [ ! -f "$TESTDIR/$name" ]; then
-      echo "::error::run-set names $name but it is missing from hooks/test/"; failed+=("$name (missing)"); continue
+      echo "::error::run-set names $name but it is missing from hooks/test/"
+      failed+=("$name (missing)")
+      [ -n "$profile_path" ] && printf '%s\tmissing\t0.000000\n' "$name" >> "$profile_path"
+      continue
+    fi
+    if [ -n "$profile_path" ]; then
+      started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
     fi
     echo "::group::$name"
     bash "$TESTDIR/$name" 2>&1 | tee "$out_file"
     rc=${PIPESTATUS[0]}
     echo "::endgroup::"
     [ $rc -eq 0 ] || failed+=("$name (rc=$rc)")
+    if [ -n "$profile_path" ]; then
+      ended_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+      elapsed="$(awk -v start="$started_ns" -v end="$ended_ns" \
+        'BEGIN { printf "%.6f", (end - start) / 1000000000 }')"
+      if [ "$rc" -eq 0 ]; then status="pass"; else status="fail:$rc"; fi
+      printf '%s\t%s\t%s\n' "$name" "$status" "$elapsed" >> "$profile_path"
+    fi
     if in_array "$name" "${IRON_RULE_REALBD_SUITES[@]}"; then
       n_skip=$(grep -oE 'Skipped: [0-9]+' "$out_file" | tail -1 | grep -oE '[0-9]+' || true)
       if [ -n "${n_skip:-}" ] && [ "$n_skip" -gt 0 ]; then
@@ -571,6 +598,7 @@ run_set() {
     echo "::warning::ci-verify shell run-set: ${#skipped_realbd[@]} iron-rule suite(s) skipped their real-bd leg here — NOT counted as coverage, only as a non-failing exit (SABLE-jd5fj.16):"
     printf '  - %s\n' "${skipped_realbd[@]}"
   fi
+  [ -n "$profile_path" ] && echo "shell-run-set profile: $profile_path"
   [ ${#failed[@]} -eq 0 ]
 }
 
@@ -588,6 +616,13 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     --check-beads)     check_beads ;;
     --check-loud-skip) check_loud_skip_cli ;;
     --run)             run_set ;;
-    *) echo "usage: $0 --run | --manifest | --check | --check-beads | --check-loud-skip" >&2; exit 2 ;;
+    --profile)
+      if [ "$#" -ne 2 ] || [ -z "${2:-}" ]; then
+        echo "usage: $0 --profile FILE" >&2
+        exit 2
+      fi
+      run_set "$2"
+      ;;
+    *) echo "usage: $0 --run | --profile FILE | --manifest | --check | --check-beads | --check-loud-skip" >&2; exit 2 ;;
   esac
 fi

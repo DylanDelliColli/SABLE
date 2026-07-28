@@ -678,6 +678,24 @@ def test_python_sibling_importing_bins_detects_only_the_importer(tmp_path):
     assert doctor.python_sibling_importing_bins(repo) == ["sable-importer"]
 
 
+def test_build_manifest_classifies_all_bins_through_one_process_boundary(tmp_path, monkeypatch):
+    repo, _bin_dir, _sha = make_snapshot_repo(tmp_path)
+    real_run = doctor.subprocess.run
+    classifier_commands = []
+
+    def recording_run(command, *args, **kwargs):
+        if command[:2] == ["bash", str(repo / "bin" / "sable-bin-install")]:
+            classifier_commands.append(command)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(doctor.subprocess, "run", recording_run)
+    doctor.build_manifest(repo, tmp_path / "claude", tmp_path / "local-bin")
+
+    assert classifier_commands == [
+        ["bash", str(repo / "bin" / "sable-bin-install"), "--classify-all"],
+    ]
+
+
 def test_build_manifest_includes_pinned_snapshot_bins_category(tmp_path):
     repo, bin_dir, _sha = make_snapshot_repo(tmp_path)
     bin_dir_dest = tmp_path / "local-bin"

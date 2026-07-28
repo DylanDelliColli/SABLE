@@ -225,6 +225,10 @@ jobs:
         if: steps.dedup.outputs.already_verified != 'true'
         run: bash .github/ci/shell-run-set.sh --check
 
+      - name: Test-load declarations (SABLE-ssu6v — nested runners are explicit)
+        if: steps.dedup.outputs.already_verified != 'true'
+        run: python bin/columbo-cost-prefilter.py --check-load-declarations
+
       - name: Shell impact manifest — lib fan-out completeness (SABLE-cmar4.2)
         if: steps.dedup.outputs.already_verified != 'true'
         run: bash .github/ci/impact-manifest.sh --check

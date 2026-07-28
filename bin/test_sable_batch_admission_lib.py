@@ -13,7 +13,7 @@ git_lib._git is the one seam every git-dependent module shares (see
 test_footprint_lib.py's own `test_the_git_seam_is_the_shared_one`). The
 verdict/adoption seam (individually_green / clean_ff_adoption) is stubbed at
 sable_gate_preview_lib.adopt_kicked_preview / read_verdict, matching how
-test_sable_gate_promote_lib.py stubs the same module for ITS composition
+test_sable_gate_promote_lib_integration.py stubs the same module for ITS composition
 tests rather than simulating `gh` underneath them.
 """
 import os

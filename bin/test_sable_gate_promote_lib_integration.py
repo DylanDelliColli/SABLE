@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sable_gate_promote_lib's impact-tier RED-report propagation (SABLE-twpe2).
+"""Integration-heavy tests for sable_gate_promote_lib (SABLE-twpe2).
 
 bin/sable_gate_promote_lib.py's shell-suite and pytest branches of
 _run_impact_tier_locked used to report a failing suite's stdout as
@@ -14,10 +14,15 @@ for what that cost: three agents and an evening unable to tell which of three
 conjuncts in a control had actually failed, because the one artifact that
 would have said so was generated, printed, and then tailed away in transit.
 
-These tests exercise the REAL propagation path — a real git repo, a real
+These tests exercise the REAL propagation path — real git repos, real
 `.github/ci/impact-manifest.sh`, and a real failing shell suite run through
 promote_lib.run_impact_tier — rather than mocking the transport, because the
 whole point of the defect is WHERE in a real byte stream the cut lands.
+
+The module also retains small direct controls beside those rehearsals, but its
+dominant contract is integration: real worktrees, real subprocess CLIs, and
+real bd where installed.  Naming that boundary explicitly keeps ordinary-unit
+load budgets honest without weakening or duplicating these checks.
 """
 import ast
 import itertools

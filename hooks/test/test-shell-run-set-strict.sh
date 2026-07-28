@@ -437,6 +437,39 @@ else
   fail "(h) --check itself (the CI-wired gate) also fails closed on a loud-skip violation, not just the standalone --check-loud-skip CLI" "rc=$RC_H2 out=$OUT_H2"
 fi
 
+# ---------------------------------------------------------------------------
+# Case (i) SABLE-ssu6v: --profile runs the authoritative set once and emits a
+# machine-readable per-suite cost row with the real exit polarity.
+# ---------------------------------------------------------------------------
+FIX_I="$(new_fixture case-i-profile)"
+touch_suite "$FIX_I/hooks/test/test-fixture-profile-pass.sh"
+cat > "$FIX_I/hooks/test/test-fixture-profile-fail.sh" <<'SH'
+#!/usr/bin/env bash
+exit 7
+SH
+chmod +x "$FIX_I/hooks/test/test-fixture-profile-fail.sh"
+set_allow_exclude "$FIX_I" \
+  test-fixture-profile-pass.sh test-fixture-profile-fail.sh --SEP--
+PROFILE_I="$FIX_I/profile.tsv"
+OUT_I=$(bash "$FIX_I/.github/ci/shell-run-set.sh" --profile "$PROFILE_I" 2>&1); RC_I=$?
+
+if [ "$RC_I" -ne 0 ] && \
+   grep -Eq '^test-fixture-profile-pass\.sh[[:space:]]+pass[[:space:]]+[0-9]+\.[0-9]+$' "$PROFILE_I" && \
+   grep -Eq '^test-fixture-profile-fail\.sh[[:space:]]+fail:7[[:space:]]+[0-9]+\.[0-9]+$' "$PROFILE_I"; then
+  pass "(i) --profile writes one timed row per authoritative suite and preserves pass/fail polarity"
+else
+  fail "(i) --profile writes one timed row per authoritative suite and preserves pass/fail polarity" \
+    "rc=$RC_I out=$OUT_I profile=$(cat "$PROFILE_I" 2>/dev/null)"
+fi
+
+if [ "$(wc -l < "$PROFILE_I")" -eq 3 ] && \
+   [ "$(head -1 "$PROFILE_I")" = $'suite\tstatus\tseconds' ]; then
+  pass "(i) --profile emits exactly one header plus one row per suite (no duplicate pass)"
+else
+  fail "(i) --profile emits exactly one header plus one row per suite (no duplicate pass)" \
+    "profile=$(cat "$PROFILE_I" 2>/dev/null)"
+fi
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

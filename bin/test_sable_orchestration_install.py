@@ -84,12 +84,13 @@ def make_repo(root, hooks, libs=None):
     return root
 
 
-def run_install(repo, project, expect_ok=True):
+def run_install(repo, project, expect_ok=True, env=None):
     result = subprocess.run(
         ["bash", str(INSTALLER), "--project"],
         env={**os.environ,
              "SABLE_REPO_DIR": str(repo),
-             "SABLE_PROJECT_DIR": str(project)},
+             "SABLE_PROJECT_DIR": str(project),
+             **(env or {})},
         capture_output=True, text=True, timeout=120,
     )
     if expect_ok:
@@ -170,6 +171,34 @@ def test_hook_without_a_sibling_lib_installs_unchanged(tmp_path):
     assert installed.is_file()
     assert installed.read_text() == PLAIN_HOOK
     assert any("plain.sh" in c for c in registered_commands(project))
+
+
+def test_hook_closure_scan_crosses_python_boundary_once_for_many_hooks(tmp_path):
+    hooks = {f"plain-{i}.sh": PLAIN_HOOK for i in range(8)}
+    repo = make_repo(tmp_path / "repo", hooks)
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    real_python = shutil.which("python3")
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    count_file = tmp_path / "python-calls"
+    shim = shim_dir / "python3"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf x >> "$SABLE_PYTHON_COUNT_FILE"\n'
+        f'exec "{real_python}" "$@"\n'
+    )
+    shim.chmod(0o755)
+
+    run_install(repo, project, env={
+        "PATH": f"{shim_dir}:{os.environ['PATH']}",
+        "SABLE_PYTHON_COUNT_FILE": str(count_file),
+    })
+
+    # One dependency-closure scan + one settings merge. The count must not
+    # grow with hook cardinality.
+    assert count_file.read_text() == "xx"
 
 
 def test_install_log_names_each_resolved_lib_path(tmp_path):

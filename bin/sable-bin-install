@@ -41,6 +41,7 @@
 #   sable-bin-install [--dir DIR] [--copy] [--repin] [--uninstall] [--dry-run]
 #   sable-bin-install --pin-snapshot [NAME...]
 #   sable-bin-install --classify NAME   (debug: prints "plain" or "snapshot")
+#   sable-bin-install --classify-all    (debug: prints "NAME<TAB>SHAPE")
 
 set -u
 
@@ -70,6 +71,7 @@ Usage:
   sable-bin-install [--dir DIR] [--copy] [--repin] [--uninstall] [--dry-run]
   sable-bin-install --pin-snapshot [NAME...]
   sable-bin-install --classify NAME
+  sable-bin-install --classify-all
 
     --dir DIR         target directory (default: ~/.local/bin)
     --copy            copy the tools instead of symlinking (filesystems w/o symlinks)
@@ -81,6 +83,9 @@ Usage:
     --classify NAME   print "snapshot" (has repo-local python imports, needs
                       --pin-snapshot) or "plain" (safe to pin as a regular
                       file copy) for the named tool; writes nothing
+    --classify-all    classify every installable tool in one process and print
+                      one machine-readable "NAME<TAB>SHAPE" row per tool;
+                      writes nothing
     --uninstall       remove the SABLE tools previously installed into DIR
     --dry-run         print what would happen; write nothing
 
@@ -113,6 +118,7 @@ while [ $# -gt 0 ]; do
     --uninstall) ACTION="uninstall"; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --classify) ACTION="classify"; CLASSIFY_TARGET="${2:?--classify needs a tool name}"; shift 2 ;;
+    --classify-all) ACTION="classify-all"; shift ;;
     --pin-snapshot)
       ACTION="pin-snapshot"; shift
       while [ $# -gt 0 ]; do
@@ -214,6 +220,18 @@ if [ "$ACTION" = "classify" ]; then
   target="$CLASSIFY_TARGET"
   case "$target" in /*) : ;; *) target="$BIN_DIR/$target" ;; esac
   if needs_snapshot_pin "$target"; then echo snapshot; else echo plain; fi
+  exit 0
+fi
+
+if [ "$ACTION" = "classify-all" ]; then
+  for name in $TOOLS; do
+    if needs_snapshot_pin "$BIN_DIR/$name"; then
+      shape="snapshot"
+    else
+      shape="plain"
+    fi
+    printf '%s\t%s\n' "$name" "$shape"
+  done
   exit 0
 fi
 

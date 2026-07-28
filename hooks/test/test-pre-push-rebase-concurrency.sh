@@ -25,7 +25,10 @@
 #
 #   bash hooks/test/test-pre-push-rebase-concurrency.sh
 #
-# Tune the fan-out with SABLE_CONCURRENCY_N (default 4).
+# Tune the fan-out with SABLE_CONCURRENCY_N (default 2; values below 2 are
+# rejected because they do not exercise concurrency).
+#
+# sable-test-load: nested-runner -- defining E2E composes concurrent pre-push suite instances
 
 set -uo pipefail
 
@@ -37,7 +40,14 @@ if [ ! -f "$SUITE" ]; then
   exit 2
 fi
 
-N="${SABLE_CONCURRENCY_N:-4}"
+N="${SABLE_CONCURRENCY_N:-2}"
+case "$N" in
+  ''|*[!0-9]*) echo "FAIL: SABLE_CONCURRENCY_N must be an integer >= 2"; exit 2 ;;
+esac
+if [ "$N" -lt 2 ]; then
+  echo "FAIL: SABLE_CONCURRENCY_N must be >= 2 (got $N)"
+  exit 2
+fi
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/sable-test-concurrency.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 

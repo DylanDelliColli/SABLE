@@ -68,6 +68,7 @@ repo's actual bin/ corpus. Two changes here, both real-data-verified:
    than re-measured, and it is derived by a documented, real
    transformation of real values, not invented.
 """
+# sable-test-load: nested-runner -- defining E2E runs one bounded real pytest/coverage corpus
 from __future__ import annotations
 
 import subprocess
