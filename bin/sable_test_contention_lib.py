@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TIME_RECORD_PREFIX = "sable-time-v1"
 TIME_FORMAT = (
     TIME_RECORD_PREFIX
@@ -655,6 +655,8 @@ def _host_process_snapshot(*, cwd: Path, limit: int = 40) -> dict:
         if row["pid"] == os.getpid():
             benchmark_process = row
             continue
+        if row["ppid"] == os.getpid():
+            continue
         rows.append(row)
     result["benchmark_process"] = benchmark_process
     result["rows"] = rows[:limit]
@@ -794,6 +796,10 @@ def environment_fingerprint(
         "cpu_count": os.cpu_count(),
         "cpu_model": _cpu_model(),
         "memory_total_bytes": host.mem_total_bytes,
+        "relevant_environment": {
+            name: os.environ.get(name)
+            for name in ("PYTEST_ADDOPTS", "TMPDIR", "TMUX_TMPDIR")
+        },
         "cgroup": _cgroup_fingerprint(),
         "filesystems": {
             "repository": _filesystem_fingerprint(repo_root),
@@ -872,6 +878,7 @@ def _worker_environment(
     *,
     isolation: str,
     worker_root: Path,
+    tmux_tmp_root: Path | None,
     index: int,
     experiment_id: str,
 ) -> dict[str, str]:
@@ -883,7 +890,10 @@ def _worker_environment(
     private_tmp = worker_root / "tmp"
     private_tmp.mkdir(parents=True, exist_ok=True)
     env["TMPDIR"] = str(private_tmp)
-    env["TMUX_TMPDIR"] = str(private_tmp)
+    if tmux_tmp_root is None:
+        raise PlantError("private isolation requires a tmux temp root")
+    tmux_tmp_root.mkdir(parents=True, exist_ok=False, mode=0o700)
+    env["TMUX_TMPDIR"] = str(tmux_tmp_root)
     if isolation == "private-tmp":
         return env
     if isolation != "private-home":
@@ -932,6 +942,7 @@ def _start_worker(
     timeout_override: float | None,
     planted: str | None,
     experiment_id: str,
+    isolated_tmux_root: Path | None,
 ) -> _RunningWorker:
     worker_dir = artifacts_dir / f"worker-{assignment.index:02d}"
     worker_dir.mkdir(parents=True, exist_ok=False)
@@ -955,6 +966,11 @@ def _start_worker(
     env = _worker_environment(
         isolation=isolation,
         worker_root=worker_dir,
+        tmux_tmp_root=(
+            isolated_tmux_root / f"w{assignment.index:02d}"
+            if isolated_tmux_root is not None
+            else None
+        ),
         index=assignment.index,
         experiment_id=experiment_id,
     )
@@ -1029,6 +1045,7 @@ def _attributable_processes(experiment_id: str) -> list[dict]:
     marker = (
         f"SABLE_TEST_CONTENTION_EXPERIMENT={experiment_id}".encode() + b"\0"
     )
+    command_marker = f"sable-x2r7g-{experiment_id[:8]}-"
     found = []
     for proc_dir in Path("/proc").iterdir():
         if not proc_dir.name.isdigit():
@@ -1037,26 +1054,88 @@ def _attributable_processes(experiment_id: str) -> list[dict]:
             environment = (proc_dir / "environ").read_bytes()
         except OSError:
             continue
-        if marker not in environment:
-            continue
         try:
-            cmdline = (
-                (proc_dir / "cmdline")
-                .read_bytes()
-                .replace(b"\0", b" ")
-                .decode(errors="replace")
-                .strip()[:500]
-            )
+            raw_cmdline = (proc_dir / "cmdline").read_bytes()
+            cmdline = raw_cmdline.replace(b"\0", b" ").decode(
+                errors="replace"
+            ).strip()[:500]
+            stat_fields = (proc_dir / "stat").read_text().rsplit(
+                ")", 1
+            )[1].split()
         except OSError:
-            cmdline = None
+            continue
+        if marker not in environment and command_marker not in cmdline:
+            continue
         found.append(
             {
                 "pid": int(proc_dir.name),
+                "ppid": int(stat_fields[1]),
+                "starttime_ticks": int(stat_fields[19]),
                 "comm": _read_optional(proc_dir / "comm"),
                 "cmdline": cmdline,
             }
         )
     return sorted(found, key=lambda row: row["pid"])
+
+
+def _same_process(record: Mapping) -> bool:
+    try:
+        fields = Path(f"/proc/{record['pid']}/stat").read_text().rsplit(
+            ")", 1
+        )[1].split()
+        return (
+            fields[0] != "Z"
+            and int(fields[19]) == record["starttime_ticks"]
+        )
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def _cleanup_process_records(
+    records: Sequence[Mapping],
+    *,
+    term_grace_seconds: float = 2.0,
+) -> dict:
+    """Terminate only the immutable PID identities recorded for this plant."""
+    attempted = []
+    errors = []
+    for record in records:
+        if not _same_process(record):
+            continue
+        attempted.append(record["pid"])
+        try:
+            os.kill(record["pid"], signal.SIGTERM)
+        except (OSError, ProcessLookupError) as exc:
+            errors.append(f"SIGTERM {record['pid']}: {exc}")
+
+    deadline = time.monotonic() + term_grace_seconds
+    while time.monotonic() < deadline:
+        if not any(_same_process(record) for record in records):
+            break
+        time.sleep(0.05)
+
+    sigkill = []
+    for record in records:
+        if not _same_process(record):
+            continue
+        sigkill.append(record["pid"])
+        try:
+            os.kill(record["pid"], signal.SIGKILL)
+        except (OSError, ProcessLookupError) as exc:
+            errors.append(f"SIGKILL {record['pid']}: {exc}")
+    kill_deadline = time.monotonic() + 1.0
+    while time.monotonic() < kill_deadline:
+        if not any(_same_process(record) for record in records):
+            break
+        time.sleep(0.05)
+    return {
+        "attempted_pids": attempted,
+        "sigkill_pids": sigkill,
+        "remaining_pids": [
+            record["pid"] for record in records if _same_process(record)
+        ],
+        "errors": errors,
+    }
 
 
 def _artifact_sockets(artifacts_dir: Path) -> list[str]:
@@ -1193,6 +1272,7 @@ def summarize_workers(results: Sequence[WorkerResult], wall_seconds: float) -> d
     resource_rows = [
         result.resources for result in results if result.resources is not None
     ]
+    resources_complete = len(resource_rows) == len(results)
     counts = {
         status: sum(result.status == status for result in results)
         for status in ("passed", "failed", "timeout", "malformed")
@@ -1217,14 +1297,21 @@ def summarize_workers(results: Sequence[WorkerResult], wall_seconds: float) -> d
         **counts,
         "wall_seconds": wall_seconds,
         "aggregate_worker_wall_seconds": sum(latencies),
-        "aggregate_user_seconds": sum(
-            row["user_seconds"] for row in resource_rows
+        "resource_records": len(resource_rows),
+        "aggregate_user_seconds": (
+            sum(row["user_seconds"] for row in resource_rows)
+            if resources_complete
+            else None
         ),
-        "aggregate_system_seconds": sum(
-            row["system_seconds"] for row in resource_rows
+        "aggregate_system_seconds": (
+            sum(row["system_seconds"] for row in resource_rows)
+            if resources_complete
+            else None
         ),
-        "peak_worker_rss_kib_sum": sum(
-            row["max_rss_kib"] for row in resource_rows
+        "peak_worker_rss_kib_sum": (
+            sum(row["max_rss_kib"] for row in resource_rows)
+            if resources_complete
+            else None
         ),
         "latency_seconds": {
             "min": min(latencies) if latencies else None,
@@ -1319,7 +1406,18 @@ def run_plant(
             + " | ".join(environment["git"]["status_porcelain_v1"])
         )
 
+    isolated_tmux_root = (
+        Path("/tmp") / f"sx2t-{experiment_id[:8]}"
+        if isolation != "native"
+        else None
+    )
+    if isolated_tmux_root is not None and isolated_tmux_root.exists():
+        raise PlantError(
+            f"private tmux root already exists: {isolated_tmux_root}"
+        )
     artifacts_dir.mkdir(parents=True, exist_ok=False)
+    if isolated_tmux_root is not None:
+        isolated_tmux_root.mkdir(mode=0o700)
     before = snapshot_shared_resources(repo_root)
     started_wall = datetime.now(timezone.utc)
     started = time.monotonic()
@@ -1362,6 +1460,7 @@ def run_plant(
                         timeout_override=timeout_override,
                         planted=planted,
                         experiment_id=experiment_id,
+                        isolated_tmux_root=isolated_tmux_root,
                     )
                     pending.remove(assignment)
                     launched_any = True
@@ -1422,8 +1521,23 @@ def run_plant(
     ended_wall = datetime.now(timezone.utc)
     after = snapshot_shared_resources(repo_root)
     delta = shared_resource_delta(before, after)
-    delta["attributable_processes"] = _attributable_processes(experiment_id)
+    before_cleanup = _attributable_processes(experiment_id)
+    cleanup = _cleanup_process_records(before_cleanup)
+    after_cleanup = _attributable_processes(experiment_id)
+    delta["attributable_processes_before_cleanup"] = before_cleanup
+    delta["process_cleanup"] = cleanup
+    delta["attributable_processes_after_cleanup"] = after_cleanup
     delta["artifact_socket_residue"] = _artifact_sockets(artifacts_dir)
+    delta["isolated_socket_residue"] = (
+        _artifact_sockets(isolated_tmux_root)
+        if isolated_tmux_root is not None
+        else []
+    )
+    if isolated_tmux_root is not None:
+        shutil.rmtree(isolated_tmux_root)
+    delta["isolated_tmux_root_cleaned"] = (
+        isolated_tmux_root is None or not isolated_tmux_root.exists()
+    )
     tmux_root = f"/tmp/tmux-{os.getuid()}"
     delta["attributable_shared_path_residue"] = [
         entry
@@ -1449,11 +1563,18 @@ def run_plant(
             f"{worker_summary['collision_events']} attributable collision "
             "signature(s) appeared in worker logs"
         )
-    if delta["attributable_processes"]:
+    if delta["attributable_processes_before_cleanup"]:
         reasons.append(
-            "plant-owned processes survived: "
-            + repr(delta["attributable_processes"])
+            "plant-owned processes survived worker shutdown: "
+            + repr(delta["attributable_processes_before_cleanup"])
         )
+    if delta["attributable_processes_after_cleanup"]:
+        reasons.append(
+            "plant-owned processes survived parent cleanup: "
+            + repr(delta["attributable_processes_after_cleanup"])
+        )
+    if cleanup["errors"]:
+        reasons.append("plant process cleanup errors: " + repr(cleanup["errors"]))
     report = {
         "schema_version": SCHEMA_VERSION,
         "experiment_id": experiment_id,
@@ -1494,6 +1615,18 @@ def render_summary(report: Mapping) -> str:
     summary = report["summary"]
     latency = summary["latency_seconds"]
     host = summary["host"]
+    aggregate_cpu = None
+    if (
+        summary["aggregate_user_seconds"] is not None
+        and summary["aggregate_system_seconds"] is not None
+    ):
+        aggregate_cpu = (
+            summary["aggregate_user_seconds"]
+            + summary["aggregate_system_seconds"]
+        )
+    aggregate_cpu_text = (
+        f"{aggregate_cpu:.2f}s" if aggregate_cpu is not None else "unknown"
+    )
     lines = [
         (
             f"sable-test-contention: {report['verdict']['status'].upper()} "
@@ -1502,8 +1635,7 @@ def render_summary(report: Mapping) -> str:
         (
             f"  wall={summary['wall_seconds']:.2f}s "
             f"aggregate-worker={summary['aggregate_worker_wall_seconds']:.2f}s "
-            f"aggregate-cpu="
-            f"{summary['aggregate_user_seconds'] + summary['aggregate_system_seconds']:.2f}s"
+            f"aggregate-cpu={aggregate_cpu_text}"
         ),
         (
             f"  latency min/median/p95/max="

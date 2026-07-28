@@ -209,6 +209,33 @@ def test_host_summary_reports_pressure_and_capacity():
     assert summary["pressure_delta"]["io"]["full_total_usec"] == 20
 
 
+def test_parent_cleanup_targets_the_recorded_process_identity():
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    try:
+        fields = Path(f"/proc/{process.pid}/stat").read_text().rsplit(
+            ")", 1
+        )[1].split()
+        record = {
+            "pid": process.pid,
+            "starttime_ticks": int(fields[19]),
+        }
+
+        cleanup = plant._cleanup_process_records(
+            [record], term_grace_seconds=0.2
+        )
+
+        process.wait(timeout=2)
+        assert cleanup["attempted_pids"] == [process.pid]
+        assert cleanup["remaining_pids"] == []
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
 def test_small_green_plant_captures_every_worker_independently(tmp_path):
     report_path = tmp_path / "report.json"
     artifacts = tmp_path / "artifacts"
@@ -227,6 +254,7 @@ def test_small_green_plant_captures_every_worker_independently(tmp_path):
     assert report["summary"]["passed"] == 3
     assert [row["index"] for row in report["workers"]] == [1, 2, 3]
     assert all(row["log_sha256"] for row in report["workers"])
+    assert report["summary"]["resource_records"] == 3
     assert json.loads(report_path.read_text())["experiment_id"] == report["experiment_id"]
 
 
@@ -272,6 +300,8 @@ def test_planted_timeout_is_killed_and_missing_time_record_is_not_green(tmp_path
     assert worker["timed_out"] is True
     assert worker["resources"] is None
     assert worker["malformed_reasons"]
+    assert report["summary"]["aggregate_user_seconds"] is None
+    assert report["summary"]["aggregate_system_seconds"] is None
 
 
 def test_host_heavy_slot_does_not_block_an_ordinary_worker():
