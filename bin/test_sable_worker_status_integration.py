@@ -68,7 +68,15 @@ def _wait_until(predicate, *, timeout=3.0, interval=0.02, description="condition
 
 @pytest.fixture()
 def sock():
-    s = f"sable-ws-{uuid.uuid4().hex[:8]}"
+    experiment = os.environ.get("SABLE_TEST_CONTENTION_EXPERIMENT")
+    worker = os.environ.get("SABLE_TEST_CONTENTION_WORKER")
+    if experiment and worker:
+        s = (
+            f"sable-x2r7g-{experiment[:8]}-w{worker}-"
+            f"{uuid.uuid4().hex[:8]}"
+        )
+    else:
+        s = f"sable-ws-{uuid.uuid4().hex[:8]}"
     yield s
     subprocess.run(["tmux", "-L", s, "kill-server"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
