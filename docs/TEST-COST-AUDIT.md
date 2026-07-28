@@ -295,6 +295,8 @@ forbids workers from invoking the sealed full suite. Fifteen workers are already
 a parallel test scheduler, so enabling inner fan-out per worker would multiply
 contention. The broader-than-scoped one-per-host rule is currently prose rather
 than admission control. A representative swarm plant and the decision about a
-heavyweight-only host token budget are tracked separately in `SABLE-x2r7g`;
-adding a universal lock without that evidence could serialize cheap independent
-unit work and make the fleet slower.
+heavyweight-only host token budget were completed in `SABLE-x2r7g`. The plant
+found an accidental shared bd/Dolt lookup inside a tmux integration fixture,
+not a need for broad admission. The isolated fix and repeated 15-worker
+evidence are recorded in
+[TEST-CONTENTION-AUDIT.md](TEST-CONTENTION-AUDIT.md).

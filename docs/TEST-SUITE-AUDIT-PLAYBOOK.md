@@ -247,6 +247,47 @@ Do not allow a self-skip to look like full coverage. Important optional-boundary
 tests need an explicit skip count or disposition, and the top-level verdict
 should surface it.
 
+### Same-host swarm diagnosis
+
+When the production topology is many scoped workers on one development host,
+audit each selected workload for every boundary it actually reaches. A module
+named for tmux may also execute `bd`, Git, Docker, or a repository-local helper.
+Static classification by filename can therefore put admission around the
+symptom while leaving the contended resource hidden.
+
+Use this sequence:
+
+1. Establish sequential observations and a simultaneous representative plant
+   with identical membership.
+2. Preserve per-worker active latency, scheduler wait, aggregate worker wall,
+   aggregate CPU, host CPU/memory/pressure, stable logs, and shared-resource
+   deltas.
+3. Separate name/state isolation from performance. A private socket or temp
+   root can contain residue while every worker still blocks on another shared
+   database.
+4. Inspect blocked subprocess stacks and the complete command tree. Logged
+   lock errors are useful but not required evidence of a shared-resource
+   bottleneck.
+5. Change one boundary at a time. A test-local unavailable-resource shim is a
+   valid causal probe only when unavailability is already the intended case;
+   it is not a substitute for a required real-boundary proof.
+6. Repeat the unconstrained 15-worker plant after isolation. Add configurable
+   admission only if the isolated real boundary still fails or creates an
+   unacceptable tail.
+
+Timeout cleanup must account for daemonization. A subprocess can escape the
+worker's process group, and a daemon may rewrite the environment marker used
+to find it later. Capture descendants while their identity is attributable,
+pair each PID with an immutable start-time value to avoid PID reuse, report
+survivors before cleanup, terminate only exact recorded identities, and prove
+none remain. Missing resource records from killed workers are unknown, not
+zero.
+
+Keep queue time distinct from active worker latency when evaluating a token
+width. A narrow admission experiment may pass while making total wall time
+and worker service time much worse. Compare it with resource isolation and
+ordinary OS scheduling before adopting the queue.
+
 ## 8. Standalone tool shape
 
 A useful cross-repository auditor can stay small if it separates adapters from
@@ -302,4 +343,7 @@ On two comparable clean-room executions:
 ```
 
 The repository-specific measurements and reductions that produced these
-learnings remain in [TEST-COST-AUDIT.md](TEST-COST-AUDIT.md).
+learnings remain in [TEST-COST-AUDIT.md](TEST-COST-AUDIT.md). The separate
+15-worker local-host study, including full per-worker latency records and the
+decision not to add broad admission, is in
+[TEST-CONTENTION-AUDIT.md](TEST-CONTENTION-AUDIT.md).
