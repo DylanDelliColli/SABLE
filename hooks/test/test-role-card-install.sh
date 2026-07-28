@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test-role-card-install.sh — locks the copy-install leg of "merged != present
-# != executing" for the SABLE role cards (SABLE-2c2wb).
+# != executing" for the SABLE role cards and registry (SABLE-2c2wb).
 #
 # SABLE-4snb4 added the sable-contained containment mandate to
 # templates/multi-manager/roles/optimus.md and tarzan.md; chuck.md was left
@@ -34,6 +34,7 @@ set -uo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 INSTALLER="$REPO/bin/sable-orchestration-install"
 ROLES_DIR="$REPO/templates/multi-manager/roles"
+REGISTRY="$REPO/templates/multi-manager/agents.yaml"
 
 PASS=0; FAIL=0; FAIL_NAMES=""
 pass(){ PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -65,6 +66,17 @@ for role in lincoln optimus tarzan chuck; do
     fail "$role.md installed byte-identical to its template" "$(diff "$template" "$installed" | head -5)"
   fi
 done
+
+# The installed registry selects those role cards and encodes the
+# planning-producer/execution-pane boundary, so it belongs to the same
+# byte-identity contract as the cards.
+INSTALLED_REGISTRY="$TMPHOME/.claude/sable/agents.yaml"
+if diff -q "$REGISTRY" "$INSTALLED_REGISTRY" >/dev/null 2>&1; then
+  pass "agents.yaml installed byte-identical to its template"
+else
+  fail "agents.yaml installed byte-identical to its template" \
+    "$(diff "$REGISTRY" "$INSTALLED_REGISTRY" | head -5)"
+fi
 
 # --- the four session-scoped Agent-tool producers: never copy-installed here ---
 for role in columbo rudy sherlock victor; do
