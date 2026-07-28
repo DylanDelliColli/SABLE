@@ -42,6 +42,8 @@ SS='{"hook_event_name":"SessionStart"}'
 # --- A real temp git repo standing in for a project checkout ------------------
 RREPO="$(mktemp -d)"
 git -C "$RREPO" init -q >/dev/null 2>&1
+git -C "$RREPO" -c user.email=t@t -c user.name=t \
+  commit --allow-empty -m init -q
 mkdir -p "$RREPO/.claude/sable/roles"
 # chuck's STATIC identity — deliberately describes the OLD manual-merge flow,
 # exactly as it did during the gah9 incident.
@@ -50,7 +52,9 @@ printf 'CHUCK STATIC ROLE: merge landed branches with bare git merge --no-ff + g
 
 # --- The flip choreography: write the live protocol state to disk -------------
 # (fix direction 3 — the flip persists its contract change to the surface.)
-( cd "$RREPO" && SABLE_ORCHESTRATION=1 "$MODE" set execution >/dev/null 2>&1 ) \
+( cd "$RREPO" && SABLE_ORCHESTRATION=1 "$MODE" set execution \
+    --break-glass --reason "synthetic authority for active-contract test" \
+    >/dev/null 2>&1 ) \
     || fail "sable-mode set execution succeeds"
 ( cd "$RREPO" && bash "$CONTRACT" add \
     "sable-merge-gate is the SOLE merge path; no bare git merge/push." >/dev/null 2>&1 ) \

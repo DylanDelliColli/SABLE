@@ -229,10 +229,12 @@ sable-mode get                           # mode-state helper resolves (planning|
 sable-mode providers get                 # frozen execution provider map
 ```
 
-Execution defaults to Claude everywhere. To run a mixed interactive fleet,
-freeze the provider map before launching managers:
+Execution defaults to Claude everywhere. After `/sable-plan` records its final
+human-approved handoff receipt, `/sable-execute` can freeze a mixed interactive
+fleet provider map before launching managers:
 
 ```bash
+# Requires the fresh receipt created by sable-mode handoff approve.
 sable-mode set execution --fleet optimus,tarzan,chuck \
   --providers optimus=claude,tarzan=codex,chuck=claude,worker=codex
 sable-spawn-manager --all
@@ -241,7 +243,10 @@ sable-spawn-manager --all
 Managers may use different providers; every worker uses the single `worker`
 provider for that execution session. SABLE launches Codex as a persistent TUI,
 not `codex exec`, and `sable-msg` routes manager/worker messages by tmux pane
-identity regardless of provider.
+identity regardless of provider. Direct execution without a receipt refuses;
+the explicit emergency path is `sable-mode set execution --break-glass
+--reason "..."`, which persists the bypass instead of silently weakening the
+handoff.
 
 The mode is **per-repo** — `sable-mode` resolves the state file from the repo you
 are in (`<repo>/.claude/sable/state/mode-state.json`, shared across that repo's

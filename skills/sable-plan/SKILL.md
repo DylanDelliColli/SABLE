@@ -77,8 +77,16 @@ stay blocked (you hand to `/sable-execute` afterward).
    Stand up a bare epic only if there's more than one bead. A pure docs/config ask
    with no code change takes the `[no-test]` path — skip step 2.
 4. **One consolidated gate.** Show the human the frame + columbo's test spec + the
-   bead(s) in a single review. On approval, tell the operator to run
-   `/sable-execute` (→ Tarzan drains it).
+   bead(s) in a single review. On approval, record that exact 1–3 bead scope:
+
+   ```bash
+   sable-mode handoff approve --beads SABLE-id1,SABLE-id2
+   ```
+
+   This is still one human gate; the command makes its result durable and binds
+   it to the bead contracts, ready front, unresolved-question set, and current
+   integration base. Then tell the operator to run `/sable-execute` (→ Tarzan
+   drains it).
 
 **Escalation (one-way only).** If a quick plan hits a real unknown or an
 architecture fork mid-flight, say so and offer to bump to Full — never silently
@@ -123,8 +131,11 @@ Canonical schemas live in the `bin/sable_dossier_lib.py` docstring.
    every gate of the run (the dossier redeploys to one stable URL that grows
    section-by-section; keep the favicon constant across gates).
 3. Give the user the URL, then ask for signoff via `AskUserQuestion`.
-4. On approval: `sable-mode substage advance`. Never advance on a text-only
-   summary — the dossier IS the signoff deliverable.
+4. On approval for FRAMING through TEST-STRATEGY:
+   `sable-mode substage advance`. At DECOMPOSITION, record the final approval
+   instead (there is no sixth substage):
+   `sable-mode handoff approve --epic <epic-id>`. Never advance or approve on a
+   text-only summary — the dossier IS the signoff deliverable.
 
 ### FRAMING — owner: you, strategist hat (live with the user)
 Most human-intensive, not parallelizable. Run it as a conversation via
@@ -203,7 +214,10 @@ field, not the generic file-extension regex used as a fallback for older beads.
 
 **Deliverable:** write `decomposition.json` to the planning state dir — the
 children (id/title/type/deps/ready-state), the `bd swarm validate` verdict, and
-victor's summary line — then run the gate protocol for the final signoff.
+victor's summary line — then run the gate protocol for the final signoff. The
+approval command strictly validates all five dossier inputs, re-runs
+`bd swarm validate --json`, proves a ready front and zero unresolved questions,
+and records their hashes in the atomic mode state.
 
 ## Open-questions ledger
 
@@ -214,10 +228,11 @@ need the human.
 
 ## Hand off to execution
 
-When the backlog is authored (quick: approved; full: `substage=decomposition`,
-passes `bd swarm validate`) and no `open-question` beads remain, tell the operator
-to run `/sable-execute`. Don't launch managers from planning mode — the interlock
-blocks it, correctly.
+When the backlog is authored and the tier-appropriate
+`sable-mode handoff approve` command succeeds, tell the operator to run
+`/sable-execute`. Do not hand off merely because the prose review finished: the
+durable receipt is the mechanical boundary. Don't launch managers from planning
+mode — the interlock blocks it, correctly.
 
 ## Deploying changes to this flow
 Orchestration hooks/skills run from INSTALLED copies in `~/.claude/`. After editing

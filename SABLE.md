@@ -301,11 +301,16 @@ upstream thinking is done and human-signed-off:
 - **DECOMPOSITION** — the orchestrator authors the implementation children, each
   tracing to a story + acceptance scenario.
 
-The human signs off before each `sable-mode substage advance`, and the mode
-interlock mechanically blocks populating the backlog until DECOMPOSITION. The
-goal: by the time execution runs, the beads are scoped well enough to need only
-confirmations and prioritization — the human invests in planning so the swarm
-executes without questions.
+The human signs off before each `sable-mode substage advance`. Final
+DECOMPOSITION approval is recorded with
+`sable-mode handoff approve --epic <id>` (Quick records its one approval with
+`--beads <id,...>`). That versioned receipt binds the live backlog, unresolved
+questions, integration-base SHA, and Full-tier dossier hashes. The execution
+transition revalidates and atomically carries it; manager spawn refuses
+statusless execution state before creating a pane. The mode interlock also
+mechanically blocks populating the backlog until DECOMPOSITION. The goal: by
+the time execution runs, the human has approved a mechanically identified work
+contract, so the swarm executes without questions.
 
 **The mode is per-repo.** `sable-mode` and the interlock resolve the mode-state
 file from the repo the session operates on — `<repo>/.claude/sable/state/mode-state.json`,

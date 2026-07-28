@@ -69,7 +69,14 @@ YAML
 
 trap 'rm -rf "$MODE_TEST_ROOT"; rm -f "$SABLE_AGENTS_YAML"' EXIT
 
-set_mode() { "$MODE_BIN" set "$1" >/dev/null 2>&1; }
+set_mode() {
+  if [ "$1" = "execution" ]; then
+    "$MODE_BIN" set execution --break-glass \
+      --reason "synthetic authority for interlock posture tests" >/dev/null 2>&1
+  else
+    "$MODE_BIN" set "$1" >/dev/null 2>&1
+  fi
+}
 clear_mode() { rm -f "$SABLE_MODE_STATE"; }
 
 # run_hook <command> [agent_id] → stdout
@@ -827,7 +834,8 @@ assert_allow_cwd() { local out; out="$(run_hook_cwd "$2" "$3")"; if is_deny "$ou
 
 REPO_EXEC="$(mk_modes_repo)"
 REPO_PLAN="$(mk_modes_repo)"
-( cd "$REPO_EXEC" && env -u SABLE_MODE_STATE "$MODE_BIN" set execution >/dev/null 2>&1 )
+( cd "$REPO_EXEC" && env -u SABLE_MODE_STATE "$MODE_BIN" set execution \
+    --break-glass --reason "synthetic authority for interlock test" >/dev/null 2>&1 )
 ( cd "$REPO_PLAN" && env -u SABLE_MODE_STATE "$MODE_BIN" set planning  >/dev/null 2>&1 )
 
 # Same command, opposite verdicts depending on which repo's cwd the call carries.
@@ -855,7 +863,8 @@ agents:
   columbo:
     type: test_planner
 YAML
-( cd "$PROJ_EXEC" && env -u SABLE_MODE_STATE "$MODE_BIN" set execution >/dev/null 2>&1 )
+( cd "$PROJ_EXEC" && env -u SABLE_MODE_STATE "$MODE_BIN" set execution \
+    --break-glass --reason "synthetic authority for interlock test" >/dev/null 2>&1 )
 PROJ_EMPTY_HOME="$(mktemp -d)"
 
 # Producer (columbo, test_planner) spawned in execution → DENY only if the

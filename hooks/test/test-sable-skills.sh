@@ -47,6 +47,7 @@ assert_grep "$EXEC_SKILL" "name: sable-execute" "/sable-execute declares name: s
 
 # 3. wired to the shared mechanism
 assert_grep "$PLAN_SKILL" "sable-mode set planning"  "/sable-plan invokes sable-mode set planning"
+assert_grep "$PLAN_SKILL" "sable-mode handoff approve" "/sable-plan records durable final approval"
 assert_grep "$EXEC_SKILL" "sable-mode set execution" "/sable-execute invokes sable-mode set execution"
 assert_grep "$EXEC_SKILL" "--providers"               "/sable-execute records the execution provider map"
 assert_grep "$EXEC_SKILL" "immutable"                 "/sable-execute documents provider-map immutability"
@@ -57,20 +58,41 @@ assert_grep "$PLAN_SKILL" "producer"  "/sable-plan references the Tier-2 produce
 assert_grep "$EXEC_SKILL" "execution" "/sable-execute loads the execution persona"
 assert_grep "$EXEC_SKILL" "oversee"   "/sable-execute references overseeing the managers"
 
-# /sable-execute documents the soft handoff-readiness gate (substage + open-questions)
+# /sable-execute documents the mechanically enforced handoff gate.
 assert_grep "$EXEC_SKILL" "open-question" "/sable-execute documents the open-questions handoff gate"
-assert_grep "$EXEC_SKILL" "substage"      "/sable-execute checks the planning substage before handoff"
+assert_grep "$EXEC_SKILL" "hard gate"     "/sable-execute identifies handoff as a hard gate"
+assert_grep "$EXEC_SKILL" "break-glass"   "/sable-execute documents the audited emergency path"
+assert_no_grep "$EXEC_SKILL" "soft gate"  "/sable-execute no longer calls handoff advisory"
 
-# 5. end-to-end mechanism: the documented command flips state correctly
+# 5. End-to-end Quick mechanism: one approval creates a receipt, then the
+# documented command atomically carries it into execution. A tiny fake bd keeps
+# this contract hermetic while exercising the real sable-mode CLI.
 STATE_TMP="$(mktemp -u)"
-SABLE_MODE_STATE="$STATE_TMP" "$MODE_BIN" set planning --fleet sherlock,columbo,gaudi,victor >/dev/null 2>&1
+FAKE_BD_DIR="$(mktemp -d)"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'case "$1" in' \
+  '  show) printf '"'"'[%s]\n'"'"' '"'"'{"id":"SABLE-test","title":"test","description":"work","acceptance_criteria":"done","status":"open","priority":1,"issue_type":"task","labels":[],"dependencies":[]}'"'"' ;;' \
+  '  ready) printf '"'"'[%s]\n'"'"' '"'"'{"id":"SABLE-test","status":"open"}'"'"' ;;' \
+  '  list) printf '"'"'[]\n'"'"' ;;' \
+  '  *) exit 2 ;;' \
+  'esac' > "$FAKE_BD_DIR/bd"
+chmod +x "$FAKE_BD_DIR/bd"
+SABLE_MODE_STATE="$STATE_TMP" "$MODE_BIN" set planning --tier quick --fleet columbo >/dev/null 2>&1
 assert_planning="$(SABLE_MODE_STATE="$STATE_TMP" "$MODE_BIN" get 2>/dev/null)"
 if [ "$assert_planning" = "planning" ]; then pass "documented /sable-plan mechanism yields mode=planning"; else fail "documented /sable-plan mechanism yields mode=planning" "got '$assert_planning'"; fi
 
-SABLE_MODE_STATE="$STATE_TMP" "$MODE_BIN" set execution --fleet optimus,tarzan,chuck >/dev/null 2>&1
+PATH="$FAKE_BD_DIR:$PATH" SABLE_APPROVAL_ACTOR=test-operator \
+  SABLE_MODE_STATE="$STATE_TMP" "$MODE_BIN" handoff approve \
+  --beads SABLE-test >/dev/null 2>&1
+if [ "$?" -eq 0 ]; then pass "documented Quick gate writes durable handoff receipt"; else fail "documented Quick gate writes durable handoff receipt"; fi
+
+PATH="$FAKE_BD_DIR:$PATH" SABLE_MODE_STATE="$STATE_TMP" \
+  "$MODE_BIN" set execution --fleet optimus,tarzan,chuck >/dev/null 2>&1
 assert_exec="$(SABLE_MODE_STATE="$STATE_TMP" "$MODE_BIN" get 2>/dev/null)"
 if [ "$assert_exec" = "execution" ]; then pass "documented /sable-execute mechanism yields mode=execution"; else fail "documented /sable-execute mechanism yields mode=execution" "got '$assert_exec'"; fi
-rm -f "$STATE_TMP"
+rm -rf "$FAKE_BD_DIR"
+rm -f "$STATE_TMP" "$STATE_TMP.lock"
 
 # 6. staged-planning substages: all five present, named in canonical order
 for s in framing research architecture test-strategy decomposition; do

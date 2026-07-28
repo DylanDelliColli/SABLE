@@ -26,22 +26,21 @@ You are **Lincoln**, the orchestrator main session (see `roles/lincoln.md`). Thi
 flips you into **execution mode**, whose single job is to **drain the bead
 pool**.
 
-## 0. Verify handoff readiness (soft gate)
+## 0. Require the approved handoff (hard gate)
 
-Before flipping to execution, confirm the backlog is actually drainable —
-otherwise you send managers into under-scoped work. Two checks:
+Planning's final human gate records a tier-appropriate receipt in the atomic mode
+state:
 
-- **Planning reached the end.** `sable-mode substage get` returns
-  `decomposition` (or a prior planning session already handed off). If it returns
-  an earlier substage, the staged flow isn't finished.
-- **No open questions remain.** `bd ready -l open-question` is empty — every
-  ambiguity the human needed to resolve has been resolved.
+- **Quick** binds the one consolidated approval to its explicit 1–3 beads.
+- **Full** binds final decomposition approval to all five dossier artifacts, the
+  epic's live children, fresh `bd swarm validate --json`, and a ready front.
+- **Both** prove zero unresolved `open-question` beads across open, in-progress,
+  blocked, and deferred states, and bind the current integration-base SHA.
 
-If either fails, the pool is half-formed: return to `/sable-plan`, or drain the
-`open-question` beads, before proceeding. This is a **discipline gate, not a hard
-lock** — nothing stops you, but skipping it means execution surfaces questions
-the human should have answered during planning, which is exactly what staged
-planning exists to prevent.
+Do not reproduce these checks manually. The mode transition below revalidates
+the receipt and carries it into execution under the same state lock. If evidence
+changed after approval, it refuses without altering planning state; return to
+`/sable-plan`, resolve the drift, and ask for the single final approval again.
 
 ## 0.5 Docker Supabase preflight (hard gate, SABLE-n5rb)
 
@@ -74,7 +73,8 @@ the db.
 ## 1. Flip the mode-state
 
 Choose the provider map once for this execution session, then run exactly one
-mode transition. A Claude-only install uses the backwards-compatible default:
+mode transition. It succeeds only from a fresh approved planning receipt. A
+Claude-only install uses the backwards-compatible default:
 
 ```bash
 sable-mode set execution --fleet optimus,tarzan,chuck
@@ -94,6 +94,17 @@ entries default to Claude. The map is immutable while execution mode is active:
 do not switch providers per bead or per dispatch. To change it, stand down the
 fleet and return to planning/clear the ended session before starting a new
 execution session.
+
+There is one explicit emergency bypass, owned by the human operator:
+
+```bash
+sable-mode set execution --break-glass \
+  --reason "operator-provided reason" --fleet optimus,tarzan,chuck
+```
+
+Never choose this on the operator's behalf. It records the operator identity,
+time, reason, base SHA, and failed readiness checks as `kind=break-glass`.
+Generic hook force flags do not create execution authority.
 
 This writes the **per-repo** mode-state file — `<repo>/.claude/sable/state/mode-state.json`
 when inside a git repo (resolved from the git common-dir, so all of the repo's
@@ -152,7 +163,9 @@ Determine which of two states you are in:
   (your window is not disturbed), launched with a bypass permission posture
   and kicked into its operating loop. Idempotent: already-running managers are
   skipped. The interlock allows this only in execution mode — which you just
-  set in step 1.
+  set in step 1. The spawn tool independently checks the carried handoff before
+  any manager pane is created; a legacy or statusless execution file cannot
+  start the fleet.
 - **No sable session exists yet** (`tmux has-session -t sable` fails). Tell the
   operator to run `sable-launch` from a plain terminal (it wraps `sable-tmux`,
   creates the Lincoln-only session, and attaches — `tmux attach -t sable`),

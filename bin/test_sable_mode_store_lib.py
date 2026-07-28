@@ -2,12 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import multiprocessing
 from pathlib import Path
 
 import pytest
 
 import sable_mode_store_lib as store
+
+
+def _break_glass() -> dict:
+    proof = {
+        "version": 1,
+        "kind": "break-glass",
+        "approved_by": "test-operator",
+        "approved_at": "2026-07-28T00:00:00+00:00",
+        "reason": "synthetic authority for mode-store isolation",
+        "base": {"ref": "HEAD", "sha": "a" * 40},
+        "failed_checks": ["test fixture"],
+    }
+    proof["receipt_id"] = hashlib.sha256(
+        json.dumps(
+            proof, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode()
+    ).hexdigest()
+    return proof
 
 
 def _advance_substage(path: str, start) -> None:
@@ -27,6 +47,7 @@ def _set_execution_provider(path: str, worker: str, start, outcomes) -> None:
         store.set_mode_state(
             Path(path), "execution", providers=providers,
             since="2026-07-28T00:00:00+0000",
+            handoff=_break_glass(),
         )
     except store.ModeTransitionRefused:
         outcomes.put("refused")
@@ -129,6 +150,28 @@ def test_provider_guard_and_write_share_one_lock(tmp_path):
         "refused", "written"]
     assert store.read_mode_state(path)["providers"]["worker"] in {
         "claude", "codex"}
+
+
+def test_execution_without_authority_refuses_and_preserves_absence(tmp_path):
+    path = tmp_path / "mode-state.json"
+
+    with pytest.raises(store.ModeTransitionRefused, match="handoff proof"):
+        store.set_mode_state(path, "execution")
+
+    assert not path.exists()
+
+
+def test_execution_without_authority_preserves_planning_bytes(tmp_path):
+    path = tmp_path / "mode-state.json"
+    store.set_mode_state(
+        path, "planning", since="2026-07-28T00:00:00+0000"
+    )
+    before = path.read_bytes()
+
+    with pytest.raises(store.ModeTransitionRefused, match="handoff proof"):
+        store.set_mode_state(path, "execution")
+
+    assert path.read_bytes() == before
 
 
 def test_atomic_write_publishes_only_complete_json(tmp_path):

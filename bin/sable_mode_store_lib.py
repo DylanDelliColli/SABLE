@@ -226,8 +226,10 @@ def set_mode_state(
     tier: str = "full",
     providers: Mapping[str, str] | None = None,
     since: str | None = None,
+    handoff: Mapping[str, object] | None = None,
+    handoff_validator: Callable[[dict], Mapping[str, object]] | None = None,
 ) -> dict:
-    """Set a mode while checking execution-provider immutability under lock."""
+    """Set a mode while checking execution authority and providers under lock."""
 
     if mode not in MODES:
         raise ModeTransitionRefused(
@@ -239,6 +241,8 @@ def set_mode_state(
         )
     if mode == "planning" and providers is not None:
         raise ModeTransitionRefused("provider maps are valid only in execution mode")
+    if mode == "planning" and (handoff is not None or handoff_validator is not None):
+        raise ModeTransitionRefused("handoff proof is valid only in execution mode")
 
     target = Path(path)
     with _exclusive_lock(target):
@@ -248,10 +252,50 @@ def set_mode_state(
             current = None
 
         if mode == "execution":
+            from sable_handoff_lib import (
+                HandoffRefused,
+                validate_execution_authority,
+            )
             from sable_provider_lib import (
                 default_provider_map,
                 provider_map_from_state,
             )
+
+            requested_handoff: Mapping[str, object] | None = handoff
+            if handoff_validator is not None:
+                if current is None:
+                    raise ModeTransitionRefused(
+                        "execution transition requires planning state"
+                    )
+                try:
+                    requested_handoff = handoff_validator(copy.deepcopy(current))
+                except HandoffRefused as exc:
+                    raise ModeTransitionRefused(str(exc)) from exc
+            elif requested_handoff is None and (
+                current is not None and current.get("mode") == "execution"
+            ):
+                requested_handoff = current.get("handoff")  # idempotent reapply
+            try:
+                validate_execution_authority(
+                    {"mode": "execution", "handoff": requested_handoff}
+                )
+            except HandoffRefused as exc:
+                raise ModeTransitionRefused(
+                    f"execution transition requires handoff proof: {exc}"
+                ) from exc
+
+            if (
+                isinstance(requested_handoff, Mapping)
+                and requested_handoff.get("kind") == "approved"
+                and (
+                    current is None
+                    or current.get("mode") != "planning"
+                    or current.get("handoff") != requested_handoff
+                )
+            ):
+                raise ModeTransitionRefused(
+                    "approved handoff must be carried from the active planning state"
+                )
 
             requested_providers = dict(providers or default_provider_map())
             # Validate the requested map before comparing it.
@@ -269,6 +313,7 @@ def set_mode_state(
                 )
         else:
             requested_providers = {}
+            requested_handoff = None
 
         state: dict[str, object] = {
             "mode": mode,
@@ -283,8 +328,32 @@ def set_mode_state(
             state["tier"] = tier
         else:
             state["providers"] = requested_providers
+            state["handoff"] = dict(requested_handoff or {})
         _atomic_write_unlocked(target, state)
         return state
+
+
+def set_planning_handoff(
+    path: str | os.PathLike[str],
+    handoff: Mapping[str, object],
+    *,
+    expected_state: Mapping[str, object],
+) -> dict:
+    """Attach approval only if the planning snapshot is still byte-for-byte current."""
+
+    expected = dict(expected_state)
+
+    def update(state: dict) -> dict:
+        if state.get("mode") != "planning":
+            raise ModeTransitionRefused("handoff receipt requires planning mode")
+        if state != expected:
+            raise ModeTransitionRefused(
+                "planning state changed before receipt publication"
+            )
+        state["handoff"] = dict(handoff)
+        return state
+
+    return _mutate_mode_state(path, update)
 
 
 def set_planning_substage(
@@ -299,6 +368,7 @@ def set_planning_substage(
     def update(state: dict) -> dict:
         if state.get("mode") != "planning":
             raise ModeTransitionRefused("planning substage requires planning mode")
+        state.pop("handoff", None)
         state["substage"] = substage
         return state
 
@@ -309,6 +379,7 @@ def advance_planning_substage(path: str | os.PathLike[str]) -> dict:
     def advance(state: dict) -> dict:
         if state.get("mode") != "planning":
             raise ModeTransitionRefused("planning substage requires planning mode")
+        state.pop("handoff", None)
         current = state.get("substage")
         if current not in PLANNING_SUBSTAGES:
             raise ModeTransitionRefused("planning state has no valid substage")

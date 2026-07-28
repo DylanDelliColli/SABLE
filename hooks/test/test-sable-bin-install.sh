@@ -96,10 +96,12 @@ else
   fail "--copy carries sable-mode's Python support-module closure" \
     "copied sable-mode could not import its sibling modules"
 fi
-if [ -f "$D_COPY/sable_mode_store_lib.py" ] && [ -f "$D_COPY/sable_provider_lib.py" ]; then
-  pass "--copy installs mode/provider support modules beside entrypoints"
+if [ -f "$D_COPY/sable_mode_store_lib.py" ] \
+  && [ -f "$D_COPY/sable_provider_lib.py" ] \
+  && [ -f "$D_COPY/sable_handoff_lib.py" ]; then
+  pass "--copy installs mode/provider/handoff support modules beside entrypoints"
 else
-  fail "--copy installs mode/provider support modules beside entrypoints"
+  fail "--copy installs mode/provider/handoff support modules beside entrypoints"
 fi
 
 # ---- UNIT: --uninstall removes the installed tools ----
@@ -111,7 +113,9 @@ else
 fi
 
 bash "$INSTALL" --dir "$D_COPY" --uninstall >/dev/null 2>&1 || true
-if [ ! -e "$D_COPY/sable-mode" ] && [ ! -e "$D_COPY/sable_mode_store_lib.py" ]; then
+if [ ! -e "$D_COPY/sable-mode" ] \
+  && [ ! -e "$D_COPY/sable_mode_store_lib.py" ] \
+  && [ ! -e "$D_COPY/sable_handoff_lib.py" ]; then
   pass "--uninstall removes copied Python support modules"
 else
   fail "--uninstall removes copied Python support modules"

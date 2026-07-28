@@ -62,6 +62,10 @@ fresh_state() {
 
 # JSON field reader (python3 — keeps the test jq-free, matching sable-mode; SABLE-cav.8)
 jget() { python3 -c "import json,sys; print(json.load(sys.stdin)$1)"; }
+set_execution() {
+  "$MODE_BIN" set execution --break-glass \
+    --reason "synthetic execution authority for sable-mode tests" "$@"
+}
 
 # ---------- set + get round-trip ----------
 
@@ -70,8 +74,20 @@ fresh_state
 assert_eq "set planning then get" "planning" "$("$MODE_BIN" get 2>/dev/null)"
 
 fresh_state
-"$MODE_BIN" set execution >/dev/null 2>&1
+set_execution >/dev/null 2>&1
 assert_eq "set execution then get" "execution" "$("$MODE_BIN" get 2>/dev/null)"
+
+fresh_state
+"$MODE_BIN" set planning >/dev/null 2>&1
+BEFORE_DIRECT="$(<"$SABLE_MODE_STATE")"
+"$MODE_BIN" set execution >/dev/null 2>&1
+assert_nonzero "direct execution transition without handoff refuses" "$?"
+assert_eq "refused direct transition preserves planning bytes" \
+  "$BEFORE_DIRECT" "$(<"$SABLE_MODE_STATE")"
+
+fresh_state
+"$MODE_BIN" set execution --break-glass --reason " " >/dev/null 2>&1
+assert_nonzero "break-glass requires a nonblank reason" "$?"
 
 # ---------- fleet round-trip ----------
 
@@ -89,7 +105,7 @@ assert_eq "snapshot substage" "framing" "$(printf '%s' "$SNAPSHOT" | sed -n '3p'
 # ---------- execution provider map ----------
 
 fresh_state
-"$MODE_BIN" set execution >/dev/null 2>&1
+set_execution >/dev/null 2>&1
 SHOW="$("$MODE_BIN" show 2>/dev/null)"
 assert_eq "execution defaults optimus to Claude" "claude" "$(printf '%s' "$SHOW" | jget "['providers']['optimus']")"
 assert_eq "execution defaults tarzan to Claude"  "claude" "$(printf '%s' "$SHOW" | jget "['providers']['tarzan']")"
@@ -100,7 +116,7 @@ assert_eq "providers get renders canonical role order" \
   "$("$MODE_BIN" providers get 2>/dev/null)"
 
 fresh_state
-"$MODE_BIN" set execution \
+set_execution \
   --providers optimus=claude,tarzan=codex,chuck=claude,worker=codex \
   >/dev/null 2>&1
 SHOW="$("$MODE_BIN" show 2>/dev/null)"
@@ -110,7 +126,7 @@ assert_eq "providers get role returns bare provider" "codex" "$("$MODE_BIN" prov
 
 # Partial maps are filled with the backwards-compatible Claude default.
 fresh_state
-"$MODE_BIN" set execution --providers worker=codex >/dev/null 2>&1
+set_execution --providers worker=codex >/dev/null 2>&1
 SHOW="$("$MODE_BIN" show 2>/dev/null)"
 assert_eq "partial map defaults omitted manager" "claude" "$(printf '%s' "$SHOW" | jget "['providers']['optimus']")"
 assert_eq "partial map keeps explicit worker" "codex" "$(printf '%s' "$SHOW" | jget "['providers']['worker']")"
@@ -145,7 +161,7 @@ fi
 # Once execution starts, a different provider map is refused without replacing
 # the active session state. Re-applying the same map remains idempotent.
 fresh_state
-"$MODE_BIN" set execution --providers worker=codex >/dev/null 2>&1
+set_execution --providers worker=codex >/dev/null 2>&1
 "$MODE_BIN" set execution --providers worker=claude >/dev/null 2>&1
 assert_nonzero "mid-execution provider change is refused" "$?"
 assert_eq "refused provider change preserves worker provider" \
@@ -161,7 +177,7 @@ assert_nonzero "providers get is execution-only" "$?"
 # ---------- since timestamp present ----------
 
 fresh_state
-"$MODE_BIN" set execution >/dev/null 2>&1
+set_execution >/dev/null 2>&1
 SINCE="$("$MODE_BIN" show 2>/dev/null | jget ".get('since','')")"
 if [ -n "$SINCE" ] && [ "$SINCE" != "null" ]; then
   pass "since timestamp is non-empty"
@@ -221,7 +237,7 @@ fi
 
 fresh_state
 "$MODE_BIN" set planning >/dev/null 2>&1
-"$MODE_BIN" set execution >/dev/null 2>&1
+set_execution >/dev/null 2>&1
 assert_eq "second set overwrites first" "execution" "$("$MODE_BIN" get 2>/dev/null)"
 
 # ---------- runtime env gate (SABLE_ORCHESTRATION) ----------
@@ -232,7 +248,7 @@ assert_nonzero "set refused when SABLE_ORCHESTRATION=off" "$?"
 if [ ! -f "$SABLE_MODE_STATE" ]; then pass "disabled set writes nothing"; else fail "disabled set writes nothing" "file created"; fi
 
 fresh_state
-SABLE_ORCHESTRATION=0 "$MODE_BIN" set execution >/dev/null 2>&1
+SABLE_ORCHESTRATION=0 set_execution >/dev/null 2>&1
 assert_nonzero "set refused when SABLE_ORCHESTRATION=0" "$?"
 
 fresh_state
@@ -246,7 +262,7 @@ assert_eq "get works when disabled" "planning" "$(SABLE_ORCHESTRATION=off "$MODE
 
 # A non-disabling value still allows set.
 fresh_state
-SABLE_ORCHESTRATION=on "$MODE_BIN" set execution >/dev/null 2>&1
+SABLE_ORCHESTRATION=on set_execution >/dev/null 2>&1
 assert_eq "set allowed when SABLE_ORCHESTRATION=on" "execution" "$("$MODE_BIN" get 2>/dev/null)"
 
 # ---------- substage axis (planning sub-state machine) ----------
@@ -297,7 +313,7 @@ assert_eq "set planning resets substage to framing" "framing" "$("$MODE_BIN" sub
 
 # execution mode has no substage — substage get exits nonzero
 fresh_state
-"$MODE_BIN" set execution >/dev/null 2>&1
+set_execution >/dev/null 2>&1
 "$MODE_BIN" substage get >/dev/null 2>&1
 assert_nonzero "execution has no substage (get nonzero)" "$?"
 
@@ -346,7 +362,7 @@ assert_eq "path resolves to in-repo state file" \
   "$(cd "$RP" && "$MODE_BIN" path 2>/dev/null)"
 
 # in-repo set/get round-trip without an override writes under the repo
-( cd "$RP" && "$MODE_BIN" set execution >/dev/null 2>&1 )
+( cd "$RP" && set_execution >/dev/null 2>&1 )
 assert_eq "in-repo set then get (no override)" "execution" \
   "$(cd "$RP" && "$MODE_BIN" get 2>/dev/null)"
 if [ -f "$RP_C/.claude/sable/state/mode-state.json" ]; then
@@ -386,7 +402,7 @@ else
 fi
 UNTRACKED="$(cd "$GIR" && git status --porcelain --untracked-files=all 2>/dev/null | grep -c 'mode-state.json')"
 assert_eq "in-repo state file is not untracked" "0" "$UNTRACKED"
-( cd "$GIR" && "$MODE_BIN" set execution >/dev/null 2>&1 )
+( cd "$GIR" && set_execution >/dev/null 2>&1 )
 COUNT="$(grep -c '\.claude/sable/' "$GIR/.gitignore" 2>/dev/null)"
 assert_eq "gitignore entry not duplicated on repeat set" "1" "$COUNT"
 rm -rf "$GIR"
