@@ -37,7 +37,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
     AUTONOMOUS_ROLES, KICK_TAG, SessionCollision, capture_pane, deliver_text,
-    dialog_posture, kick_message, repo_root, resolve_session, wait_for_ready,
+    dialog_posture, git_common_dir, kick_message, repo_root, resolve_session,
+    wait_for_ready,
 )
 from sable_handoff_lib import (  # noqa: E402
     HandoffRefused, read_execution_authority,
@@ -332,8 +333,17 @@ def manager_command(provider: str = "claude", cwd: str | None = None) -> str:
         return override
     perm = os.environ.get("SABLE_WORKER_PERMISSION", "--permission-mode bypassPermissions")
     add_dirs = [str(Path(cwd).parent)] if provider == "codex" and cwd else []
+    # Codex's workspace-write sandbox blocks .git even inside the workspace, so
+    # a seat cannot fetch and a worker cannot push without naming it. The grant
+    # is the SHARED git dir, never <cwd>/.git — see git_common_dir (SABLE-82k8m).
+    roots = []
+    if provider == "codex" and cwd:
+        common = git_common_dir(cwd)
+        if common:
+            roots = [common]
     return interactive_command(
         provider, "opus", claude_permission=perm, cwd=cwd, add_dirs=add_dirs,
+        writable_roots=roots,
     )
 
 

@@ -198,8 +198,23 @@ def interactive_command(
     claude_permission: str = "--permission-mode bypassPermissions",
     cwd: str | None = None,
     add_dirs: Sequence[str] = (),
+    writable_roots: Sequence[str] = (),
 ) -> str:
-    """Shell command for a persistent interactive provider TUI."""
+    """Shell command for a persistent interactive provider TUI.
+
+    ``writable_roots`` is CODEX-ONLY and exists for one reason: Codex's
+    workspace-write sandbox treats ``.git`` as read-only even though it lives
+    inside the workspace — a separate exclusion from the workspace root itself,
+    proven by probe (granting an unrelated root leaves ``.git`` blocked;
+    naming it explicitly unblocks it). Without a grant, ``git fetch`` fails on
+    FETCH_HEAD and no worker can self-push (SABLE-82k8m).
+
+    Callers pass the roots rather than having them derived here, because the
+    correct root is the git COMMON dir, not ``<cwd>/.git``: a worker runs in a
+    LINKED WORKTREE where ``.git`` is a file and the real git dir lives under
+    the main repo. Resolving that needs repo context this function
+    deliberately does not have.
+    """
 
     normalized = normalize_provider(provider)
     model, reasoning = provider_model(normalized, tier)
@@ -213,6 +228,9 @@ def interactive_command(
         "--config", "sandbox_workspace_write.network_access=true",
         "--config", "shell_environment_policy.inherit=all",
     ]
+    if writable_roots:
+        roots = ",".join(f'"{path}"' for path in writable_roots)
+        argv += ["--config", f"sandbox_workspace_write.writable_roots=[{roots}]"]
     if cwd:
         argv += ["--cd", cwd]
     for path in add_dirs:
