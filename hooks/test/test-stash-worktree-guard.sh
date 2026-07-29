@@ -50,6 +50,14 @@ has_warning_text() {
   # "assert the warning text ... or the warn path is untested").
   printf '%s' "$1" | grep -q 'SINGLE stack shared across every worktree'
 }
+has_denial_context_labels() {
+  printf '%s' "$1" | grep -Eq 'hook-input cwd:|matched command:'
+}
+has_denial_context() {
+  local out="$1" expected_cwd="$2" expected_command="$3"
+  printf '%s' "$out" | grep -Fq -- "hook-input cwd: $expected_cwd" &&
+    printf '%s' "$out" | grep -Fq -- "matched command: $expected_command"
+}
 
 SCRATCH_ROOT="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH_ROOT"' EXIT
@@ -107,6 +115,11 @@ for CMD in "git stash pop stash@{2}" "git stash apply stash@{0}" "git stash drop
   else
     fail "break-glass carries shared-stack warning: $CMD" "got: $OUT"
   fi
+  if ! has_denial_context_labels "$OUT"; then
+    pass "break-glass carries no misleading denial context: $CMD"
+  else
+    fail "break-glass carries no misleading denial context: $CMD" "got: $OUT"
+  fi
 done
 
 # ==========================================================================
@@ -118,7 +131,7 @@ echo "--- Unit: silent-allow cases ---"
 for CMD in "git stash list" "git stash show" "git status" "git diff" "git log --oneline" "ls" "git fetch origin"; do
   JSON=$(make_json "$CMD" "$SCRATCH_ROOT")
   OUT=$(run_hook "$JSON")
-  if is_allow "$OUT" && ! has_warning_text "$OUT"; then
+  if is_allow "$OUT" && ! has_warning_text "$OUT" && ! has_denial_context_labels "$OUT"; then
     pass "silent allow: $CMD"
   else
     fail "silent allow: $CMD" "got: $OUT"
@@ -151,6 +164,83 @@ if is_deny "$OUT"; then
   pass "bare 'git stash' from the PRIMARY checkout DENIES (worktree location is not part of the decision)"
 else
   fail "bare 'git stash' from the PRIMARY checkout DENIES" "got: $OUT"
+fi
+
+# SABLE-fye8l RED: preserve the payload cwd and only the matched stash command
+# segment. The unrelated segments are distinctive negative controls: logging
+# the whole Bash line would preserve more transcript than the denial needs.
+PRIMARY_MATCHED="git stash push -m primary-unscoped-marker"
+PRIMARY_BEFORE="primary-unrelated-before-marker"
+PRIMARY_AFTER="primary-unrelated-after-marker"
+PRIMARY_COMMAND="printf $PRIMARY_BEFORE ; $PRIMARY_MATCHED ; printf $PRIMARY_AFTER"
+JSON=$(make_json "$PRIMARY_COMMAND" "$PRIMARY")
+OUT=$(run_hook "$JSON")
+if is_deny "$OUT" &&
+   has_denial_context "$OUT" "$PRIMARY" "$PRIMARY_MATCHED" &&
+   ! printf '%s' "$OUT" | grep -Fq -- "$PRIMARY_BEFORE" &&
+   ! printf '%s' "$OUT" | grep -Fq -- "$PRIMARY_AFTER"; then
+  pass "PRIMARY denial records hook-input cwd and only the exact matched stash command segment"
+else
+  fail "PRIMARY denial records hook-input cwd and only the exact matched stash command segment" "got: $OUT"
+fi
+
+# Environment assignments are stripped before classification and may carry
+# credentials. They are not part of the matched git invocation and must never
+# be copied into denial output.
+ENV_SECRET="fye8l-env-secret-do-not-log"
+ENV_MATCHED="git stash push -m plain"
+ENV_COMMAND="API_TOKEN=$ENV_SECRET $ENV_MATCHED"
+JSON=$(make_json "$ENV_COMMAND" "$PRIMARY")
+OUT=$(run_hook "$JSON")
+if is_deny "$OUT" &&
+   has_denial_context "$OUT" "$PRIMARY" "$ENV_MATCHED" &&
+   ! printf '%s' "$OUT" | grep -Fq -- "$ENV_SECRET" &&
+   ! printf '%s' "$OUT" | grep -Fq -- "API_TOKEN="; then
+  pass "denial context omits stripped environment assignments and secrets"
+else
+  fail "denial context omits stripped environment assignments and secrets" "got: $OUT"
+fi
+
+# Diagnostic context is flattened before it reaches a terminal or transcript.
+# Exercise both the raw payload cwd and the shlex-rendered matched command.
+CONTROL_CWD=$'/tmp/fye8l-control\nnext\tfield\e[31m'
+CONTROL_COMMAND=$'git stash push -m plain\nnext\tfield\e[31m'
+JSON=$(make_json "$CONTROL_COMMAND" "$CONTROL_CWD")
+OUT=$(run_hook "$JSON")
+if is_deny "$OUT" && printf '%s' "$OUT" | python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+reason = payload["hookSpecificOutput"]["permissionDecisionReason"]
+context = reason.split("Denial context -- ", 1)[1]
+bad = "\r\n\t\x1b"
+raise SystemExit(0 if not any(ch in context for ch in bad) and "?" in context else 1)
+'; then
+  pass "denial context flattens line controls and replaces terminal controls"
+else
+  fail "denial context flattens line controls and replaces terminal controls" "got: $OUT"
+fi
+
+# Both user-derived fields are independently capped at 512 characters.
+printf -v LONG_FILL '%600s' ''
+LONG_FILL=${LONG_FILL// /x}
+LONG_CWD="/tmp/$LONG_FILL"
+LONG_COMMAND="git stash push -m $LONG_FILL"
+JSON=$(make_json "$LONG_COMMAND" "$LONG_CWD")
+OUT=$(run_hook "$JSON")
+if is_deny "$OUT" && printf '%s' "$OUT" | python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+reason = payload["hookSpecificOutput"]["permissionDecisionReason"]
+context = reason.split("Denial context -- hook-input cwd: ", 1)[1]
+cwd, matched = context.split("; matched command: ", 1)
+matched = matched[:-1] if matched.endswith(".") else matched
+bounded = len(cwd) <= 512 and len(matched) <= 512
+truncated = cwd.endswith("...") and matched.endswith("...")
+raise SystemExit(0 if bounded and truncated else 1)
+'; then
+  pass "denial context independently bounds cwd and matched command"
+else
+  fail "denial context independently bounds cwd and matched command" "got: $OUT"
 fi
 
 # ==========================================================================
@@ -201,6 +291,23 @@ if is_deny "$OUT"; then
   pass "guard DENIES a bare 'git stash pop' issued from worktree B while A's stash sits on the shared stack"
 else
   fail "guard DENIES a bare 'git stash pop' issued from worktree B" "got: $OUT"
+fi
+
+# SABLE-fye8l RED at the linked-worktree seam. `--quiet` makes the exact
+# matched form distinguishable from the generic prose already in the reason.
+LINKED_MATCHED="git stash pop --quiet"
+LINKED_BEFORE="linked-unrelated-before-marker"
+LINKED_AFTER="linked-unrelated-after-marker"
+LINKED_COMMAND="printf $LINKED_BEFORE ; $LINKED_MATCHED ; printf $LINKED_AFTER"
+JSON=$(make_json "$LINKED_COMMAND" "$WK_B")
+OUT=$(run_hook "$JSON")
+if is_deny "$OUT" &&
+   has_denial_context "$OUT" "$WK_B" "$LINKED_MATCHED" &&
+   ! printf '%s' "$OUT" | grep -Fq -- "$LINKED_BEFORE" &&
+   ! printf '%s' "$OUT" | grep -Fq -- "$LINKED_AFTER"; then
+  pass "linked-worktree denial records hook-input cwd and only the exact matched stash command segment"
+else
+  fail "linked-worktree denial records hook-input cwd and only the exact matched stash command segment" "got: $OUT"
 fi
 
 # Confirm B's checkout is untouched (the guard fired before any real pop ran
