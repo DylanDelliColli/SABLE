@@ -26,6 +26,7 @@ SESS="sable"
 WT="$(mktemp -d)"
 DD="$(mktemp -d)"
 SCRATCH_BEADS_DIR="$(mktemp -d)"
+MODE_STATE_DIR="$(mktemp -d)"
 READ_BEAD="SABLE-bldh.8"   # an open bead, read-only here
 
 PASS=0; FAIL=0; SKIP=0; FAIL_NAMES=""
@@ -33,7 +34,10 @@ pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 skip() { SKIP=$((SKIP+1)); echo "SKIP: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 tmux_() { tmux -L "$SOCK" "$@"; }
-cleanup() { tmux_ kill-server >/dev/null 2>&1; rm -rf "$WT" "$DD" "$SCRATCH_BEADS_DIR"; }
+cleanup() {
+  tmux_ kill-server >/dev/null 2>&1
+  rm -rf "$WT" "$DD" "$SCRATCH_BEADS_DIR" "$MODE_STATE_DIR"
+}
 trap cleanup EXIT
 
 # SABLE-j0vr: the sable-msg leg below (step 2) invokes the REAL bin/sable-msg.
@@ -66,6 +70,22 @@ export SABLE_TMUX_PANE_CMD="bash --noprofile --norc"   # stand-in for claude
 # a later, call-site-only scrub cannot retroactively clean it up.
 source "$REPO/hooks/test/lib-identity-isolation.sh"
 sable_scrub_identity_env
+
+# sable-spawn-worker is intentionally execution-only when a repository carries
+# cockpit state. Point every tool in this composition at a throwaway state
+# before the first pane is launched, then establish real audited execution
+# authority through sable-mode. Without this override, an operator running the
+# suite during planning makes the worker leg fail for the operator's mode
+# rather than for any defect in the composition (SABLE-e58q1).
+export SABLE_MODE_STATE="$MODE_STATE_DIR/mode-state.json"
+if "$BIN/sable-mode" set execution --break-glass \
+    --reason "synthetic execution authority for tmux e2e isolation" \
+    >/dev/null 2>&1 \
+   && [ "$("$BIN/sable-mode" get 2>/dev/null)" = "execution" ]; then
+  pass "isolated execution-mode fixture established"
+else
+  fail "isolated execution-mode fixture established"
+fi
 
 # 1) sable-tmux brings up the role panes -------------------------------------
 if python3 "$BIN/sable-tmux" --session "$SESS" >/dev/null 2>&1; then pass "sable-tmux launches"; else fail "sable-tmux launches"; fi
