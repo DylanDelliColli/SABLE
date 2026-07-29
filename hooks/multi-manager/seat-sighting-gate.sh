@@ -2,7 +2,8 @@
 # seat-sighting-gate.sh — mechanical support for "capture is mandatory,
 # priority is advisory" (SABLE-441vl, cockpit ruling 2026-07-22 16:23).
 #
-# Trigger: PostToolUse on Bash (a SUCCESSFUL `bd create`) | identity-gated on chuck
+# Trigger: PostToolUse on Bash (a successful `bd create` OR
+# `sable-msg --file-sighting`) | identity-gated on chuck
 #
 # THE ACTUAL RULING, so no future worker re-litigates it. The bead this hook
 # implements was originally scoped on the premise that the merge seat (chuck)
@@ -20,10 +21,12 @@
 # chuck hand-typing a prose prefix into the description, which is real but
 # drifts the moment anyone forgets it.
 #
-# THIS HOOK NEVER DENIES. It fires AFTER a `bd create` already succeeded and
-# annotates the result: extracts the new bead id from the create's own
-# stdout ("Created issue: <id>", the same pattern bin/sable-msg's
-# file_fallback_bead already parses) and runs a follow-up `bd update
+# THIS HOOK NEVER DENIES. It fires AFTER a sighting create already succeeded
+# and annotates the result: extracts the new bead id from either the raw
+# create's stdout ("Created issue: <id>") or sable-msg's wrapper confirmation
+# on stderr ("sable-msg: filed <id>"). PostToolUse observes only the top-level
+# Bash command, never sable-msg's child `bd create`, so treating the wrapper as
+# its own supported event shape is load-bearing. It then runs a follow-up `bd update
 # --add-label seat-filed --set-metadata priority_provisional=true`. A
 # PreToolUse hook in this catalog can only allow/deny/inject context — see
 # bead-description-gate.sh — it cannot rewrite the command's own flags, which
@@ -43,7 +46,7 @@ HOOK_INPUT_JSON="$(cat)"
 # the running platform emits is picked up without a schema guess breaking the
 # other.
 PARSED=$(printf '%s' "$HOOK_INPUT_JSON" | python3 -c "
-import json, sys
+import json, os, re, shlex, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
@@ -55,16 +58,41 @@ if not isinstance(resp, dict) or not resp:
 if not isinstance(resp, dict):
     resp = {}
 stdout = resp.get('stdout', '') or ''
-print(cmd)
-print('---STDOUT---')
+stderr = resp.get('stderr', '') or ''
+
+def command_kind(command):
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return ''
+    while parts and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', parts[0]):
+        parts.pop(0)
+    if not parts:
+        return ''
+    program = os.path.basename(parts[0])
+    args = parts[1:]
+    if re.fullmatch(r'python(?:[0-9]+(?:\\.[0-9]+)?)?', program):
+        while args and args[0] in {
+            '-B', '-E', '-I', '-O', '-OO', '-P', '-s', '-S', '-u', '-v', '-x'
+        }:
+            args.pop(0)
+        if not args:
+            return ''
+        program = os.path.basename(args.pop(0))
+    if program == 'bd' and args and args[0] == 'create':
+        return 'bd-create'
+    if program == 'sable-msg' and '--file-sighting' in args:
+        return 'file-sighting'
+    return ''
+
+print(command_kind(cmd))
+print('---OUTPUT---')
 print(stdout)
+print(stderr)
 " 2>/dev/null) || exit 0
 
-COMMAND=$(echo "$PARSED" | sed -n '1p')
-[ -z "$COMMAND" ] && exit 0
-
-# Only act on bd create.
-echo "$COMMAND" | grep -q '^bd create' || exit 0
+COMMAND_KIND=$(echo "$PARSED" | sed -n '1p')
+[ -z "$COMMAND_KIND" ] && exit 0
 
 # shellcheck source=lib-identity.sh
 source "$(dirname "${BASH_SOURCE[0]:-$0}")/lib-identity.sh"
@@ -73,13 +101,28 @@ sable_resolve_identity "$HOOK_INPUT_JSON"
 # Not the seat: no-op. This hook has exactly one job.
 [ "$SABLE_ID_NAME" = "chuck" ] || exit 0
 
-STDOUT=$(echo "$PARSED" | sed -n '/^---STDOUT---$/,$p' | tail -n +2)
+OUTPUT=$(echo "$PARSED" | sed -n '/^---OUTPUT---$/,$p' | tail -n +2)
 
-# "Created issue: <id>" only appears in stdout on a genuine success — a
-# failed create never reaches this line, so no separate exit-code check is
-# needed (mirrors hooks/bead-quality.sh's own PostToolUse-after-bd-create
-# convention).
-BEAD_ID=$(echo "$STDOUT" | grep -oE 'Created issue:[[:space:]]*[A-Za-z0-9_-]+' | awk '{print $NF}')
+# Each success marker is mode-specific, so a command that merely mentions the
+# other tool cannot be misclassified. Failed creates emit neither marker; no
+# separate exit-code check is needed.
+if [ "$COMMAND_KIND" = "bd-create" ]; then
+  BEAD_ID=$(
+    echo "$OUTPUT" |
+      grep -oE 'Created issue:[[:space:]]*[A-Za-z0-9_.-]+' |
+      head -1 |
+      awk '{print $NF}' ||
+      true
+  )
+else
+  BEAD_ID=$(
+    echo "$OUTPUT" |
+      grep -oE 'sable-msg: filed[[:space:]]+[A-Za-z0-9_.-]+' |
+      head -1 |
+      awk '{print $NF}' ||
+      true
+  )
+fi
 [ -z "$BEAD_ID" ] && exit 0
 
 # Best-effort, never fails the hook: an annotation that could not be written

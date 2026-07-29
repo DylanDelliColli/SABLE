@@ -121,12 +121,14 @@ def _env():
     return env
 
 
-def test_seat_gate_annotates_the_created_bead_afterward(tmp_path):
-    """A successful seat `bd create` is annotated through a real bd store.
+def test_file_sighting_priorities_reach_bd_and_remain_provisional(tmp_path):
+    """P1 and default P2 survive the real CLI event, bd, ordering, and hook.
 
     This is deliberately integration-tier coverage: initializing Dolt and
-    verifying the hook's real follow-up write sampled above the ordinary
-    10-second test budget (SABLE-kdn3y).
+    passing the CLI's actual top-level command/stdout/stderr to the real
+    PostToolUse hook prevents a fabricated child `bd create` event from
+    masking a wrapper/hook contract gap. The hook's follow-up write sampled
+    above the ordinary 10-second test budget (SABLE-kdn3y).
     """
     if not SEAT_GATE_HOOK.is_file():
         pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
@@ -145,63 +147,98 @@ def test_seat_gate_annotates_the_created_bead_afterward(tmp_path):
     assert init.returncode == 0, init.stdout + init.stderr
     beads_db = str(beads_root / ".beads")
 
-    created = subprocess.run(
-        [
-            "bd",
-            "create",
-            "--title=found a defect",
-            "--description=text [no-test]",
-            "--type=task",
-        ],
-        env={**os.environ, "BEADS_DB": beads_db},
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
-    assert created.returncode == 0, created.stdout + created.stderr
-    bead_id = re.search(r"Created issue:\s*(\S+)", created.stdout).group(1)
+    bd_env = {
+        **os.environ,
+        "BEADS_DB": beads_db,
+        "BD_NON_INTERACTIVE": "1",
+    }
 
-    hook_input = json.dumps(
-        {
-            "tool_input": {
-                "command": (
-                    'bd create --title="found a defect" '
-                    '--description="text [no-test]" --type=task'
-                )
+    def file_and_annotate(body, priority=None):
+        expected_priority = 2 if priority is None else priority
+        cli = [
+            "python3",
+            str(BIN),
+            "--file-sighting",
+            "--from",
+            "chuck",
+        ]
+        if priority is not None:
+            cli.append(f"--priority={priority}")
+        cli.append(body)
+        created = subprocess.run(
+            cli,
+            env=bd_env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert created.returncode == 0, created.stdout + created.stderr
+        assert f"priority P{expected_priority}" in created.stderr
+        bead_id = re.search(r"sable-msg: filed\s+(\S+)", created.stderr).group(1)
+
+        hook_input = json.dumps(
+            {
+                "tool_input": {
+                    "command": shlex.join(cli)
+                },
+                "tool_response": {
+                    "stdout": created.stdout,
+                    "stderr": created.stderr,
+                },
+            }
+        )
+        annotated = subprocess.run(
+            ["bash", str(SEAT_GATE_HOOK)],
+            input=hook_input,
+            text=True,
+            capture_output=True,
+            env={
+                **bd_env,
+                "CLAUDE_AGENT_NAME": "chuck",
+                "CLAUDE_AGENT_ROLE": "manager",
             },
-            "tool_response": {"stdout": created.stdout, "stderr": ""},
-        }
-    )
-    result = subprocess.run(
-        ["bash", str(SEAT_GATE_HOOK)],
-        input=hook_input,
-        text=True,
-        capture_output=True,
-        env={
-            **os.environ,
-            "CLAUDE_AGENT_NAME": "chuck",
-            "CLAUDE_AGENT_ROLE": "manager",
-            "BEADS_DB": beads_db,
-        },
-        timeout=10,
-    )
-    assert result.returncode == 0
+            timeout=10,
+        )
+        assert annotated.returncode == 0
+        return bead_id
 
-    show = subprocess.run(
-        ["bd", "show", bead_id, "--json"],
-        env={**os.environ, "BEADS_DB": beads_db},
+    # Create P2 first so chronological ordering cannot accidentally satisfy
+    # the later priority-order assertion.
+    p2_id = file_and_annotate("default seat observation")
+    p1_id = file_and_annotate("urgent seat observation", priority=1)
+
+    listed = subprocess.run(
+        ["bd", "list", "--all", "--limit=0", "--sort=priority", "--json"],
+        env=bd_env,
         text=True,
         capture_output=True,
         timeout=30,
     )
-    data = json.loads(show.stdout)
-    data = data[0] if isinstance(data, list) else data
-    assert "seat-filed" in (data.get("labels") or [])
-    assert (data.get("metadata") or {}).get("priority_provisional") in (
-        True,
-        "true",
-        "True",
-    )
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    records = json.loads(listed.stdout)
+    by_id = {record["id"]: record for record in records}
+    assert by_id[p1_id]["priority"] == 1
+    assert by_id[p2_id]["priority"] == 2
+    ranked_ids = [record["id"] for record in records]
+    assert ranked_ids.index(p1_id) < ranked_ids.index(p2_id)
+
+    for bead_id in (p1_id, p2_id):
+        show = subprocess.run(
+            ["bd", "show", bead_id, "--json"],
+            env=bd_env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert show.returncode == 0, show.stdout + show.stderr
+        data = json.loads(show.stdout)
+        data = data[0] if isinstance(data, list) else data
+        assert "seat-filed" in (data.get("labels") or [])
+        assert (data.get("metadata") or {}).get("priority_provisional") in (
+            True,
+            "true",
+            "True",
+        )
 
 
 def test_read_recording_survives_non_utf8_delimiter_bytes(tmp_path):

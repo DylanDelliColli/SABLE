@@ -491,10 +491,10 @@ def test_file_fallback_bead_returns_none_when_bd_unavailable():
 # 16:23, recorded as a comment on SABLE-441vl — NOT in its description, which
 # is why an earlier pass here built the wrong thing: a DENY hook on the
 # premise the seat cannot create beads at all. That premise is measured
-# FALSE). `--file-sighting` is a plain `bd create`, never refused or
+# FALSE). `--file-sighting` performs one plain `bd create`, never refused or
 # deferred; hooks/multi-manager/seat-sighting-gate.sh annotates the result
-# AFTER it lands, for any chuck-identity `bd create` whether or not it went
-# through this wrapper.
+# AFTER it lands by recognizing either a raw chuck-identity `bd create` event
+# or this wrapper's own top-level PostToolUse event.
 
 def test_file_sighting_bead_is_a_single_plain_create():
     """One bd call, not two: capture is mandatory, so there is nothing to
@@ -523,6 +523,43 @@ def test_file_sighting_bead_is_a_single_plain_create():
         "capture is mandatory — a sighting must never be deferred"
 
 
+def test_file_sighting_bead_propagates_explicit_p1_to_bd_create():
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-p1\n"
+        stderr = ""
+
+    bead_id = sable_msg.file_sighting_bead(
+        "chuck",
+        "urgent seat observation",
+        priority=1,
+        runner=lambda args: seen.append(args) or R(),
+    )
+
+    assert bead_id == "SABLE-p1"
+    assert "--priority=1" in seen[0]
+
+
+def test_file_sighting_bead_defaults_to_p2_in_bd_create():
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-p2\n"
+        stderr = ""
+
+    bead_id = sable_msg.file_sighting_bead(
+        "chuck",
+        "ordinary seat observation",
+        runner=lambda args: seen.append(args) or R(),
+    )
+
+    assert bead_id == "SABLE-p2"
+    assert "--priority=2" in seen[0]
+
+
 def test_file_sighting_bead_returns_none_when_bd_unavailable():
     class R:
         returncode = 1
@@ -549,13 +586,49 @@ def test_main_file_sighting_bypasses_pane_lookup_entirely(monkeypatch, capsys):
     assert "SABLE-xyz" in capsys.readouterr().err
 
 
+def test_main_file_sighting_propagates_and_echoes_explicit_priority(monkeypatch, capsys):
+    received = {}
+
+    def file_sighting(frm, text, *, priority, **kwargs):
+        received.update(frm=frm, text=text, priority=priority)
+        return "SABLE-priority"
+
+    monkeypatch.setattr(sable_msg, "resolve_session", lambda *a, **k: pytest.fail(
+        "a sighting must not resolve a tmux session"))
+    monkeypatch.setattr(sable_msg, "file_sighting_bead", file_sighting)
+
+    rc = sable_msg.main([
+        "--file-sighting",
+        "--priority=1",
+        "--from",
+        "chuck",
+        "urgent observation",
+    ])
+
+    assert rc == 0
+    assert received == {
+        "frm": "chuck",
+        "text": "urgent observation",
+        "priority": 1,
+    }
+    assert "priority P1" in capsys.readouterr().err
+
+
 def test_main_file_sighting_reports_failure_and_a_manual_fallback(monkeypatch, capsys):
     monkeypatch.setattr(sable_msg, "resolve_session", lambda *a, **k: pytest.fail(
         "a sighting must not resolve a tmux session"))
     monkeypatch.setattr(sable_msg, "file_sighting_bead", lambda frm, text, **k: None)
-    rc = sable_msg.main(["--file-sighting", "--from", "chuck", "an observation"])
+    rc = sable_msg.main([
+        "--file-sighting",
+        "--priority=1",
+        "--from",
+        "chuck",
+        "an observation",
+    ])
+    err = capsys.readouterr().err
     assert rc == 1
-    assert "could not file" in capsys.readouterr().err
+    assert "could not file" in err
+    assert "--priority=1" in err
 
 
 def test_parse_args_file_sighting_treats_the_single_positional_as_body():
@@ -574,7 +647,9 @@ def test_parse_args_still_requires_to_role_without_file_sighting():
 SEAT_GATE_HOOK = Path(__file__).resolve().parent.parent / "hooks" / "multi-manager" / "seat-sighting-gate.sh"
 
 
-def _run_seat_gate(command, agent_name, agent_role="manager", stdout="", extra_env=None):
+def _run_seat_gate(
+        command, agent_name, agent_role="manager", stdout="", stderr="",
+        extra_env=None):
     env = dict(os.environ)
     if agent_name:
         env["CLAUDE_AGENT_NAME"] = agent_name
@@ -585,7 +660,7 @@ def _run_seat_gate(command, agent_name, agent_role="manager", stdout="", extra_e
     env.update(extra_env or {})
     hook_input = json.dumps({
         "tool_input": {"command": command},
-        "tool_response": {"stdout": stdout, "stderr": ""},
+        "tool_response": {"stdout": stdout, "stderr": stderr},
     })
     return subprocess.run(["bash", str(SEAT_GATE_HOOK)], input=hook_input, text=True,
                           capture_output=True, env=env, timeout=10)
@@ -624,6 +699,72 @@ def test_seat_gate_ignores_commands_that_are_not_bd_create():
     result = _run_seat_gate("bd show SABLE-x", agent_name="chuck")
     assert result.stdout.strip() == ""
     assert result.returncode == 0
+
+
+def _recording_bd(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    record = tmp_path / "bd-args"
+    fake_bd = fake_bin / "bd"
+    fake_bd.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$@\" > \"$BD_RECORD\"\n"
+    )
+    fake_bd.chmod(0o755)
+    return fake_bin, record
+
+
+def _assert_recorded_sighting_annotation(record):
+    assert record.read_text().splitlines() == [
+        "update",
+        "SABLE-ab12",
+        "--add-label",
+        "seat-filed",
+        "--set-metadata",
+        "priority_provisional=true",
+    ]
+
+
+def test_seat_gate_still_annotates_a_raw_bd_create_event(tmp_path):
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    fake_bin, record = _recording_bd(tmp_path)
+
+    result = _run_seat_gate(
+        "bd create --title='urgent observation' --priority=1",
+        agent_name="chuck",
+        stdout="Created issue: SABLE-ab12 — urgent observation\n",
+        extra_env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "BD_RECORD": str(record),
+        },
+    )
+
+    assert result.returncode == 0
+    _assert_recorded_sighting_annotation(record)
+
+
+def test_seat_gate_annotates_the_real_file_sighting_wrapper_event(tmp_path):
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    fake_bin, record = _recording_bd(tmp_path)
+
+    result = _run_seat_gate(
+        f"{Path(__file__).resolve().parent / 'sable-msg'} "
+        "--file-sighting --priority=1 'urgent observation'",
+        agent_name="chuck",
+        stderr=(
+            "sable-msg: filed SABLE-ab12 — capture is mandatory, this bead is "
+            "live in bd ready now; priority P1 is an estimate pending triage.\n"
+        ),
+        extra_env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "BD_RECORD": str(record),
+        },
+    )
+
+    assert result.returncode == 0
+    _assert_recorded_sighting_annotation(record)
 
 
 # --- deliver_message: stub-tmux retry + verification (SABLE-bq93) -----------
