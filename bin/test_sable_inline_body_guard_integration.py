@@ -46,6 +46,30 @@ WRAPPER_CLEAN = (
 # Hazard present, no bd/sable-msg write: the idiom that must keep working.
 WRAPPER_NO_BD_WRITE = 'python3 -c "print($(date +%s))"'
 
+# SABLE-4rhjv plant and controls. The first two differ only in whether Bash's
+# semicolon is glued to the file path. In both, the dollar-paren belongs to a
+# separate echo command and the bd note body comes from a file. The third puts
+# the same substitution inside inline prose and must remain denied; the fourth
+# places that hazardous prose after a valid fd-duplication redirection and must
+# be denied by the same guarded command rather than a fake post-`&` segment.
+FILE_NOTE_GLUED_SEPARATOR = (
+    'bd note SABLE-abc123 --file /tmp/note.txt; '
+    'echo "branches=$(git branch --list | wc -l)"'
+)
+FILE_NOTE_SPACED_SEPARATOR = (
+    'bd note SABLE-abc123 --file /tmp/note.txt ; '
+    'echo "branches=$(git branch --list | wc -l)"'
+)
+INLINE_APPEND_NOTES_HAZARD = (
+    'bd update SABLE-abc123 '
+    '--append-notes "branches=$(git branch --list | wc -l)"; '
+    'echo done'
+)
+INLINE_APPEND_NOTES_AFTER_FD_DUP = (
+    'bd update SABLE-abc123 2>&1 '
+    '--append-notes "branches=$(git branch --list | wc -l)"'
+)
+
 
 @pytest.fixture
 def installed_scope(tmp_path):
@@ -106,3 +130,27 @@ def test_installed_hook_still_refuses_the_classic_inline_body_shape(installed_sc
         'bd update SABLE-abc123 --append-notes "ran `bd hooks install` by accident"',
     )
     assert out.get("permissionDecision") == "deny", out
+
+
+def test_installed_hook_scopes_hazards_to_their_shell_segment(installed_scope):
+    # Exercise the installed copy, not the repo library directly. Compute all
+    # four outcomes before asserting so RED output proves the spaced, inline,
+    # and redirection controls were actually driven alongside the glued plant.
+    glued = run_installed_guard(installed_scope, FILE_NOTE_GLUED_SEPARATOR)
+    spaced = run_installed_guard(installed_scope, FILE_NOTE_SPACED_SEPARATOR)
+    inline = run_installed_guard(installed_scope, INLINE_APPEND_NOTES_HAZARD)
+    after_fd_dup = run_installed_guard(
+        installed_scope,
+        INLINE_APPEND_NOTES_AFTER_FD_DUP,
+    )
+
+    outcomes = {
+        "glued": glued,
+        "spaced": spaced,
+        "inline": inline,
+        "after_fd_dup": after_fd_dup,
+    }
+    assert glued == {}, outcomes
+    assert spaced == {}, outcomes
+    assert inline.get("permissionDecision") == "deny", outcomes
+    assert after_fd_dup.get("permissionDecision") == "deny", outcomes

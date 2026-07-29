@@ -14,6 +14,8 @@ bd-only name list -- that name-list shape is the one that already failed once
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sable_inline_body_guard_lib as guard  # noqa: E402
@@ -120,6 +122,113 @@ def test_allows_bd_note_via_file_flag():
     cmd = 'bd note SABLE-abc123 --file /tmp/note.txt'
     result = guard.classify(cmd)
     assert result['verdict'] == 'allow'
+
+
+def test_allows_file_backed_bd_note_before_unrelated_substitution_with_glued_separator():
+    # SABLE-4rhjv plant: Bash accepts a separator glued to the preceding
+    # argument. The substitution belongs to the following echo segment, not
+    # to bd note's file-backed body.
+    cmd = (
+        'bd note SABLE-abc123 --file /tmp/note.txt; '
+        'echo "branches=$(git branch --list | wc -l)"'
+    )
+    assert guard.classify(cmd)['verdict'] == 'allow'
+
+
+def test_allows_file_backed_bd_note_before_unrelated_substitution_with_spaced_separator():
+    # Control for the already-correct boundary: the fix for glued punctuation
+    # must preserve an ordinary whitespace-delimited separator.
+    cmd = (
+        'bd note SABLE-abc123 --file /tmp/note.txt ; '
+        'echo "branches=$(git branch --list | wc -l)"'
+    )
+    assert guard.classify(cmd)['verdict'] == 'allow'
+
+
+def test_still_refuses_substitution_inside_inline_append_notes_before_separator():
+    # Safety control: only the segment boundary is changing. A substitution
+    # carried by inline prose remains the exact SABLE-qwthx hazard.
+    cmd = (
+        'bd update SABLE-abc123 '
+        '--append-notes "branches=$(git branch --list | wc -l)"; '
+        'echo done'
+    )
+    result = guard.classify(cmd)
+    assert result['verdict'] == 'refuse'
+    assert result['surface_id'] == 'bd-notes'
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        (
+            r'bd note SABLE-abc123 --file /tmp/literal\>&'
+            'echo "branches=$(git branch --list | wc -l)"'
+        ),
+        (
+            r'bd note SABLE-abc123 --file /tmp/literal\>|'
+            'echo "branches=$(git branch --list | wc -l)"'
+        ),
+    ],
+    ids=['escaped-output-before-background', 'escaped-output-before-pipe'],
+)
+def test_escaped_redirection_marker_does_not_hide_a_real_separator(command):
+    # The `>` is an escaped filename character here, so the following `&` or
+    # `|` remains a genuine shell boundary and the echo hazard is unrelated.
+    assert guard.classify(command)['verdict'] == 'allow'
+
+
+@pytest.mark.parametrize(
+    ("command", "surface_id"),
+    [
+        (
+            'bd update SABLE-abc123 2>&1 '
+            '--append-notes "branches=$(git branch --list | wc -l)"',
+            'bd-notes',
+        ),
+        (
+            'bd note SABLE-abc123 >&2 '
+            '"branches=$(git branch --list | wc -l)"',
+            'bd-note-text',
+        ),
+        (
+            'bd note SABLE-abc123 <&0 '
+            '"branches=$(git branch --list | wc -l)"',
+            'bd-note-text',
+        ),
+        (
+            'sable-msg optimus &>/tmp/sable-msg.log '
+            '"branches=$(git branch --list | wc -l)"',
+            'sable-msg-body',
+        ),
+        (
+            'bd update SABLE-abc123 &>>/tmp/bd.log '
+            '--append-notes "branches=$(git branch --list | wc -l)"',
+            'bd-notes',
+        ),
+        (
+            'bd note SABLE-abc123 >|/tmp/bd.log '
+            '"branches=$(git branch --list | wc -l)"',
+            'bd-note-text',
+        ),
+    ],
+    ids=[
+        'fd-output-dup',
+        'default-output-dup',
+        'input-dup',
+        'combined-output',
+        'append-combined-output',
+        'clobber-output',
+    ],
+)
+def test_redirection_operators_do_not_split_guarded_inline_hazards(command, surface_id):
+    # SABLE-4rhjv review correction: redirections may appear between ordinary
+    # argv words. Their `&`/`|` punctuation is not a command boundary, so a
+    # hazardous prose argument after the redirection still belongs to the
+    # guarded command and must remain refused.
+    result = guard.classify(command)
+    assert result['verdict'] == 'refuse'
+    assert result['surface_id'] == surface_id
 
 
 def test_refuses_bd_note_inline_text_with_backtick():

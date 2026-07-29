@@ -45,6 +45,44 @@ ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # quotes disable all of it -- nothing inside them is ever substituted, so
 # tokens built from a single-quoted span are never marked hazardous.
 _DOUBLE_QUOTE_ESCAPABLE = set('\\$"`\n')
+_UNQUOTED_SEPARATOR_STARTS = set(';&|')
+
+
+def _backslash_escaped(text, index):
+    """True when text[index] is preceded by an odd run of backslashes."""
+    backslashes = 0
+    index -= 1
+    while index >= 0 and text[index] == '\\':
+        backslashes += 1
+        index -= 1
+    return backslashes % 2 == 1
+
+
+def _is_redirection_punctuation(command, index):
+    """True when `&`/`|` at index belongs to a shell redirection operator.
+
+    Redirections may sit between ordinary argv words, so splitting `2>&1`,
+    `>&2`, `<&0`, `&>file`, `&>>file`, or `>|file` as if their punctuation
+    were a command boundary can move later hazardous prose into a fake,
+    unguarded segment.
+    """
+    c = command[index]
+    previous = command[index - 1] if index > 0 else ''
+    following = command[index + 1] if index + 1 < len(command) else ''
+
+    if c == '&':
+        if following == '>':
+            return True
+        return (
+            previous in '<>'
+            and not _backslash_escaped(command, index - 1)
+        )
+    if c == '|':
+        return (
+            previous == '>'
+            and not _backslash_escaped(command, index - 1)
+        )
+    return False
 
 
 def tokenize_with_hazard(command):
@@ -79,6 +117,24 @@ def tokenize_with_hazard(command):
         if c in ' \t\n':
             flush()
             i += 1
+            continue
+
+        # Shell control operators do not require surrounding whitespace:
+        # `bd note ... --file path; echo $(...)` and the spaced `path ; echo`
+        # form have the same segment boundary. Quotes and backslash escapes
+        # are consumed in their own branches, so only genuinely unquoted,
+        # unescaped punctuation reaches this branch.
+        if (
+            c in _UNQUOTED_SEPARATOR_STARTS
+            and not _is_redirection_punctuation(command, i)
+        ):
+            flush()
+            if c in '&|' and i + 1 < n and command[i + 1] == c:
+                tokens.append((c + c, False))
+                i += 2
+            else:
+                tokens.append((c, False))
+                i += 1
             continue
 
         started = True
