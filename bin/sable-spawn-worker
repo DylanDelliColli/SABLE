@@ -145,8 +145,8 @@ from typing import NamedTuple
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
     SessionCollision, WORKER_CAP_DEFAULT, accept_startup_gate, capture_pane,
-    dialog_posture, dispatch_landed, pane_ready, repo_root, resolve_session,
-    wait_for_ready, worker_cap,
+    dialog_posture, dispatch_landed, git_common_dir, pane_ready, repo_root,
+    resolve_session, wait_for_ready, worker_cap,
 )
 from sable_pane_lib import deliver_text as deliver_dispatch  # noqa: E402
 import sable_footprint_lib as fp_lib  # noqa: E402
@@ -1585,8 +1585,18 @@ def worker_command(
     if override:
         return override
     perm = os.environ.get("SABLE_WORKER_PERMISSION", "--permission-mode bypassPermissions")
+    # A worker SELF-PUSHES its worktree branch, and Codex's workspace-write
+    # sandbox blocks .git writes, so without this grant every push fails at the
+    # end of otherwise-good work. cwd here is the WORKTREE, whose .git is a
+    # FILE — git_common_dir resolves the shared dir the push actually writes
+    # (SABLE-82k8m).
+    roots = []
+    if provider == "codex" and cwd:
+        common = git_common_dir(cwd)
+        if common:
+            roots = [common]
     return interactive_command(
-        provider, model, claude_permission=perm, cwd=cwd,
+        provider, model, claude_permission=perm, cwd=cwd, writable_roots=roots,
     )
 
 

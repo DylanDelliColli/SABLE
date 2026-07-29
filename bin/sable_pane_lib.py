@@ -21,6 +21,24 @@ from sable_provider_lib import agent_name, normalize_provider
 # stray echoed Escape on the prompt line must not defeat glyph detection
 # (SABLE-zaum).
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+# SGR ("select graphic rendition") sequences. Captures are taken with -e so the
+# codex composer check below can see styling, which means EVERY predicate now
+# meets escape sequences it never used to. _CTRL_RE alone is not enough: it
+# strips the ESC byte but leaves the "[2m" tail behind as literal text, which
+# would break the exact-glyph comparisons. Strip whole sequences first
+# (SABLE-6c391).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# A dim/faint span: SGR 2 opens it. This is how Codex renders the GHOST
+# SUGGESTION it parks in an idle composer. Text a human actually typed carries
+# no styling, so this span is the only reliable way to tell "empty composer
+# showing a hint" from "composer holding unsubmitted input" — the distinction
+# that keeps a deliberate hold from being typed over (SABLE-r3fg0).
+#
+# The closing reset is OPTIONAL and that is not defensive coding: against a
+# live pane Codex leaves the span open to end-of-line, so requiring a reset
+# stripped nothing and reproduced the very bug this exists to fix. Anchored to
+# EOL rather than \Z because callers pass one line at a time.
+_DIM_SPAN_RE = re.compile(r"\x1b\[2m.*?(?:\x1b\[0m|$)")
 _PROMPT_GLYPHS = {
     "claude": ("❯", ">"),
     "codex": ("›", ">"),
@@ -32,8 +50,11 @@ def prompt_glyphs(provider: str = "claude") -> tuple[str, ...]:
 
 
 def _clean(line: str) -> str:
-    """A pane line with control bytes stripped and whitespace trimmed."""
-    return _CTRL_RE.sub("", line).strip()
+    """A pane line with SGR sequences and control bytes stripped, whitespace
+    trimmed. Stripping SGR first is what lets a styled capture (-e) compare
+    byte-identically to the unstyled captures every existing caller was
+    written against (SABLE-6c391)."""
+    return _CTRL_RE.sub("", _ANSI_RE.sub("", line)).strip()
 
 
 def _canon(text: str) -> str:
@@ -41,7 +62,7 @@ def _canon(text: str) -> str:
     whitespace removed. Pane wraps can split a message MID-WORD (capture-pane
     without -J emits the segments as separate lines), so any comparison that
     preserves spaces mismatches across a wrap boundary (SABLE-1umr)."""
-    return "".join(_CTRL_RE.sub("", text).split())
+    return "".join(_CTRL_RE.sub("", _ANSI_RE.sub("", text)).split())
 
 
 def _already_pending(capture_text: str, snippet: str) -> bool:
@@ -55,6 +76,24 @@ def _already_pending(capture_text: str, snippet: str) -> bool:
     return bool(want) and want in _canon(capture_text)
 
 
+def _without_ghost(line: str, provider: str = "claude") -> str:
+    """Drop Codex's ghost-suggestion spans so an idle composer showing a hint
+    compares equal to a bare prompt glyph.
+
+    CODEX ONLY, deliberately. Claude suppresses its own suggestions at the
+    source with CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 (SABLE-ndaup), so a dim
+    span on a Claude composer is not a hint to skip — it is content, and
+    silently ignoring it would be the same over-type bug in the other
+    provider's clothes.
+
+    Only DIM-STYLED text is dropped. Unstyled text after the glyph is input a
+    human actually typed and must keep the pane out of ready state
+    (SABLE-6c391 / SABLE-r3fg0)."""
+    if normalize_provider(provider) != "codex":
+        return line
+    return _DIM_SPAN_RE.sub("", line)
+
+
 def pane_ready(capture: str, provider: str = "claude") -> bool:
     """The TUI is ready to accept input once its input box shows an EMPTY prompt
     line (just the prompt glyph). While booting (splash) or on a blocking gate
@@ -65,7 +104,7 @@ def pane_ready(capture: str, provider: str = "claude") -> bool:
     pane_idle for the stronger "ready AND not mid-turn" predicate the interrupt
     path needs (SABLE-m6is)."""
     for line in reversed(capture.splitlines()):
-        if _clean(line) in prompt_glyphs(provider):
+        if _clean(_without_ghost(line, provider)) in prompt_glyphs(provider):
             return True
     return False
 
@@ -84,7 +123,7 @@ def pane_busy(capture: str, provider: str = "claude") -> bool:
     matches (SABLE-m6is). The composer prompt is shown DURING a turn too, which
     is exactly why pane_ready alone reported a busy pane 'ready' and the
     interrupt path typed into a pane still redrawing."""
-    hay = " ".join(_CTRL_RE.sub(" ", capture).split()).lower()
+    hay = " ".join(_CTRL_RE.sub(" ", _ANSI_RE.sub("", capture)).split()).lower()
     return any(marker in hay for marker in _BUSY_MARKERS)
 
 
@@ -346,7 +385,26 @@ def dispatch_landed(
 # delivered-queued send timed out h0jw's poll budget and scored as failure
 # (SABLE-l8a5: closed false-fail, evidence the queued line was live in the pane
 # the whole time).
-_QUEUED_FOOTER_MARKERS = ("press up to edit queued messages",)
+# PROVIDER-KEYED, like _PROMPT_GLYPHS. It was a bare Claude constant, so a
+# Codex pane's queued footer never matched, queued sends were invisible, and
+# sable-msg reported UNDELIVERED for messages that had actually landed — filing
+# spurious durable inbox beads and handing recipients the same instruction
+# twice (SABLE-yuwrs, hit live lincoln->chuck 2026-07-29).
+#
+# The Codex marker is the STABLE PREFIX of its footer, deliberately stopping
+# before the parenthetical ("(press esc to interrupt and send immediately)"),
+# which is wording most likely to drift between releases.
+#
+# Markers are NOT shared across providers: one provider's footer appearing in
+# another's pane is not evidence, so each key holds only its own.
+_QUEUED_FOOTER_MARKERS = {
+    "claude": ("press up to edit queued messages",),
+    "codex": ("messages to be submitted after next tool call",),
+}
+
+
+def queued_footer_markers(provider: str = "claude") -> tuple[str, ...]:
+    return _QUEUED_FOOTER_MARKERS[normalize_provider(provider)]
 
 
 def pane_has_queued_message(
@@ -361,8 +419,8 @@ def pane_has_queued_message(
     want = _canon(snippet)
     if not want or want not in _canon(capture):
         return False
-    hay = " ".join(_CTRL_RE.sub(" ", capture).split()).lower()
-    return any(marker in hay for marker in _QUEUED_FOOTER_MARKERS)
+    hay = " ".join(_CTRL_RE.sub(" ", _ANSI_RE.sub("", capture)).split()).lower()
+    return any(marker in hay for marker in queued_footer_markers(provider))
 
 
 def submitted_own_turn(
@@ -420,7 +478,10 @@ def submitted_own_turn(
 def capture_pane(base: list[str], pane: str) -> str:
     # -J joins wrapped lines, so a message wider than the pane comes back as
     # the one line it really is — box detection then sees the whole composer.
-    return subprocess.run(base + ["capture-pane", "-p", "-J", "-t", pane],
+    # -e keeps SGR sequences, which _without_ghost needs to tell Codex's ghost
+    # suggestion from real held input; every predicate strips them via _clean /
+    # _canon, so callers see the same text they always did (SABLE-6c391).
+    return subprocess.run(base + ["capture-pane", "-p", "-J", "-e", "-t", pane],
                           capture_output=True, text=True).stdout
 
 
@@ -601,6 +662,30 @@ def _tmux_run(cmd):
 
 def tmux_base(socket: str | None = None) -> list[str]:
     return ["tmux", "-L", socket] if socket else ["tmux"]
+
+
+def git_common_dir(base: str | None = None) -> str | None:
+    """The SHARED git directory for the repo containing `base`, or None outside
+    a repo.
+
+    This is the correct sandbox grant for git writes (SABLE-82k8m), and it is
+    NOT `<base>/.git`: in a LINKED WORKTREE — which is where every worker runs
+    — `.git` is a FILE pointing at `<main>/.git/worktrees/<name>`, and the refs
+    and logs a push updates live under the shared directory. Granting the
+    worktree's own path would let managers fetch while every worker push stayed
+    blocked, a divergence that only surfaces at the push.
+    """
+    base = base or os.getcwd()
+    try:
+        r = subprocess.run(["git", "-C", base, "rev-parse", "--git-common-dir"],
+                           capture_output=True, text=True)
+        common = r.stdout.strip()
+        if r.returncode == 0 and common:
+            cpath = common if os.path.isabs(common) else os.path.join(base, common)
+            return os.path.realpath(cpath)
+    except Exception:
+        pass
+    return None
 
 
 def repo_root(base: str | None = None) -> str | None:
