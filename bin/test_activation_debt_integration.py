@@ -27,6 +27,7 @@ own checkout by location, so running it here would install the developer's real
 repo and could not be pointed at the scratch fleet at all.
 """
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -83,6 +84,19 @@ def fleet(tmp_path):
     (repo / "hooks" / "multi-manager").mkdir(parents=True)
     (repo / "bin").mkdir(parents=True)
     (repo / "templates" / "multi-manager" / "roles").mkdir(parents=True)
+
+    # Source validation in the real installer rejects a settings snippet whose
+    # registered hooks are absent: such a tree would wire silent instruments,
+    # not model a usable checkout. Copy the full registered hook surface while
+    # preserving this fixture's deliberately stale post-push hook below.
+    for source in sorted((REPO / "hooks" / "multi-manager").glob("*.sh")):
+        if source.name == "post-push-merge-notify.sh":
+            continue
+        shutil.copy2(source, repo / "hooks" / "multi-manager" / source.name)
+
+    skill = repo / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: demo\n---\n")
 
     # Pre-fix content everywhere: each of these is what the CONSUMED copy will
     # hold after the first install, and what the landing then supersedes.

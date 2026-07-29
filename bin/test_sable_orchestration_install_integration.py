@@ -143,6 +143,116 @@ def no_bd_path(tmp_path):
     return path
 
 
+def test_installed_live_symlink_resolves_artifacts_from_source_checkout(tmp_path):
+    """A PATH lookup through relative link hops derives the physical checkout."""
+    staged_bin = tmp_path / "staged" / "bin"
+    staged_bin.mkdir(parents=True)
+    staged_installer = staged_bin / INSTALLER.name
+    staged_installer.symlink_to(os.path.relpath(INSTALLER, staged_bin))
+
+    installed_bin = tmp_path / "local" / "bin"
+    installed_bin.mkdir(parents=True)
+    installed_installer = installed_bin / INSTALLER.name
+    installed_installer.symlink_to(os.path.relpath(staged_installer, installed_bin))
+
+    base = tmp_path / "claude"
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path / "home"),
+        "CLAUDE_USER_DIR": str(base),
+        "CODEX_HOME": str(tmp_path / "codex"),
+        "PATH": str(installed_bin) + os.pathsep + os.environ["PATH"],
+    }
+    env.pop("SABLE_REPO_DIR", None)
+
+    result = subprocess.run(
+        [INSTALLER.name, "--user"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    assert result.returncode == 0, (
+        f"live-symlink installer failed:\n{result.stdout}\n{result.stderr}"
+    )
+    installed_agents = base / "sable" / "agents.yaml"
+    installed_hook = base / "hooks" / "multi-manager" / "mode-interlock.sh"
+    assert installed_agents.read_bytes() == (
+        REPO / "templates" / "multi-manager" / "agents.yaml"
+    ).read_bytes()
+    assert installed_hook.read_bytes() == (
+        REPO / "hooks" / "multi-manager" / "mode-interlock.sh"
+    ).read_bytes()
+
+
+def test_invalid_explicit_repo_refuses_before_install_writes(tmp_path):
+    invalid_repo = tmp_path / "not-a-sable-checkout"
+    invalid_repo.mkdir()
+    base = tmp_path / "claude"
+
+    result = subprocess.run(
+        [str(INSTALLER), "--user"],
+        env={
+            **os.environ,
+            "HOME": str(tmp_path / "home"),
+            "CLAUDE_USER_DIR": str(base),
+            "CODEX_HOME": str(tmp_path / "codex"),
+            "SABLE_REPO_DIR": str(invalid_repo),
+        },
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    assert result.returncode != 0
+    diagnostic = result.stdout + result.stderr
+    assert "invalid SABLE_REPO_DIR" in diagnostic
+    assert str(invalid_repo) in diagnostic
+    assert "templates" in diagnostic
+    assert not base.exists(), "source validation ran after install writes began"
+
+
+def test_partial_repo_with_empty_hook_and_skill_dirs_refuses_before_writes(tmp_path):
+    """Directory-shaped placeholders must not satisfy source validation."""
+    partial_repo = tmp_path / "partial-sable-checkout"
+    required_templates = (
+        "templates/multi-manager/agents.yaml",
+        "templates/multi-manager/settings-snippet.json",
+        "templates/multi-manager/roles/lincoln.md",
+        "templates/multi-manager/roles/optimus.md",
+        "templates/multi-manager/roles/tarzan.md",
+        "templates/multi-manager/roles/chuck.md",
+    )
+    for relative in required_templates:
+        destination = partial_repo / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO / relative, destination)
+    (partial_repo / "hooks" / "multi-manager").mkdir(parents=True)
+    (partial_repo / "skills").mkdir()
+    base = tmp_path / "claude"
+
+    result = subprocess.run(
+        [str(INSTALLER), "--user"],
+        env={
+            **os.environ,
+            "HOME": str(tmp_path / "home"),
+            "CLAUDE_USER_DIR": str(base),
+            "CODEX_HOME": str(tmp_path / "codex"),
+            "SABLE_REPO_DIR": str(partial_repo),
+        },
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    assert result.returncode != 0
+    diagnostic = result.stdout + result.stderr
+    assert "mode-interlock.sh" in diagnostic
+    assert "skills/*/SKILL.md" in diagnostic
+    assert not base.exists(), "partial source validation ran after install writes began"
+
+
 def test_canonical_base_snippet_has_the_complete_gate_graph():
     rows = hook_rows(BASE_SNIPPET)
     actual = {}

@@ -26,7 +26,17 @@
 
 set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# Resolve this script's PHYSICAL dir before deriving the checkout. The supported
+# PATH install is a live symlink into repo/bin; dirname(BASH_SOURCE[0]) alone
+# would derive ~/.local (or another link parent) as REPO. Follow every link hop
+# portably instead of relying on GNU-only readlink -f (SABLE-4xj4y / SABLE-5p2).
+SOURCE="${BASH_SOURCE[0]:-$0}"
+while [ -h "$SOURCE" ]; do
+    SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    case "$SOURCE" in /*) ;; *) SOURCE="$SOURCE_DIR/$SOURCE" ;; esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 REPO="${SABLE_REPO_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
 usage() {
@@ -49,6 +59,58 @@ for arg in "${@:-}"; do
         *)                  echo "sable-orchestration-install: unknown argument '$arg'" >&2; exit 1 ;;
     esac
 done
+
+# Abort before deriving or mutating an install scope when the selected source
+# is not a complete orchestration checkout. Keep the diagnostic distinct for a
+# bad explicit test/custom override versus a broken physical-script derivation:
+# the former is caller input; the latter is an installer/path-resolution bug.
+validate_source_tree() {
+    local _required _registered_hooks _skill _skill_found=0 _missing=""
+    for _required in \
+        templates/multi-manager/agents.yaml \
+        templates/multi-manager/settings-snippet.json \
+        templates/multi-manager/roles/lincoln.md \
+        templates/multi-manager/roles/optimus.md \
+        templates/multi-manager/roles/tarzan.md \
+        templates/multi-manager/roles/chuck.md
+    do
+        [ -r "$REPO/$_required" ] || _missing="$_missing $_required"
+    done
+    if [ -r "$REPO/templates/multi-manager/settings-snippet.json" ]; then
+        _registered_hooks="$(
+            grep -oE 'multi-manager/[[:alnum:]_.-]+\.sh' \
+                "$REPO/templates/multi-manager/settings-snippet.json" |
+                LC_ALL=C sort -u || true
+        )"
+        if [ -z "$_registered_hooks" ]; then
+            _missing="$_missing registered multi-manager hook references"
+        else
+            while IFS= read -r _required; do
+                [ -r "$REPO/hooks/$_required" ] ||
+                    _missing="$_missing hooks/$_required"
+            done <<< "$_registered_hooks"
+        fi
+    fi
+    for _skill in "$REPO"/skills/*/SKILL.md; do
+        [ -r "$_skill" ] || continue
+        _skill_found=1
+        break
+    done
+    [ "$_skill_found" -eq 1 ] ||
+        _missing="$_missing skills/*/SKILL.md"
+    [ -z "$_missing" ] && return 0
+
+    if [ -n "${SABLE_REPO_DIR:-}" ]; then
+        echo "sable-orchestration-install: invalid SABLE_REPO_DIR '$SABLE_REPO_DIR':" >&2
+        echo "  required SABLE source artifacts are missing under '$REPO':$_missing" >&2
+    else
+        echo "sable-orchestration-install: could not resolve the SABLE source checkout from physical script '$SOURCE':" >&2
+        echo "  derived REPO '$REPO' is missing:$_missing" >&2
+    fi
+    exit 1
+}
+
+validate_source_tree
 
 if [ "$SCOPE" = "user" ]; then
     BASE="${CLAUDE_USER_DIR:-$HOME/.claude}"
