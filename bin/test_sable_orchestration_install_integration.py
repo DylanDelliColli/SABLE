@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration tests for the hook sibling-library closure (SABLE-nn54x).
+"""Integration tests for installed hook behavior (SABLE-nn54x / SABLE-4cad2).
 
 REAL COMPOSITION, NO FIXTURES: the REAL bin/sable-orchestration-install is run
 against the REAL repo into a throwaway scope, and then the REAL installed
@@ -15,6 +15,9 @@ never created. Every test that drove the REPO copy passed throughout, which
 is how the guard came to fire on every Bash call fleet-wide while checking
 nothing.
 
+SABLE-4cad2 adds the other installed-path seam: notes-clobber-guard must emit a
+valid, loud fail-open decision when `bd` is absent from the hook's PATH.
+
 THE SCOPE IS ALWAYS A tmp_path. This suite must never install into the real
 ~/.claude: landing a hook or a settings row on the developer's live scope is
 an unbrokered activation.
@@ -23,6 +26,7 @@ import json
 import os
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 import pytest
@@ -58,6 +62,32 @@ def installed_scope(tmp_path):
         ["bash", str(INSTALLER), "--user", "--merge-settings"],
         env={**os.environ, "CLAUDE_USER_DIR": str(base)},
         capture_output=True, text=True, timeout=180,
+    )
+    assert result.returncode == 0, f"installer failed:\n{result.stdout}\n{result.stderr}"
+    return base
+
+
+@pytest.fixture
+def installed_notes_scope(tmp_path):
+    """Install the notes guard with every user-owned path fully isolated."""
+    base = tmp_path / "notes-claude"
+    home = tmp_path / "notes-home"
+    codex_home = tmp_path / "notes-codex"
+    base.mkdir()
+    home.mkdir()
+    codex_home.mkdir()
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--user"],
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "CLAUDE_USER_DIR": str(base),
+            "CODEX_HOME": str(codex_home),
+            "SABLE_REPO_DIR": str(REPO),
+        },
+        capture_output=True,
+        text=True,
+        timeout=180,
     )
     assert result.returncode == 0, f"installer failed:\n{result.stdout}\n{result.stderr}"
     return base
@@ -99,6 +129,18 @@ def hook_rows(path):
         for block in blocks
         for hook in block.get("hooks", [])
     ]
+
+
+def no_bd_path(tmp_path):
+    """A minimal hook toolchain that cannot inherit a host bd binary."""
+    path = tmp_path / "no-bd-bin"
+    path.mkdir()
+    for command in ("bash", "cat", "head", "python3"):
+        source = shutil.which(command)
+        assert source is not None, f"required hook command is absent: {command}"
+        (path / command).symlink_to(Path(source).resolve())
+    assert shutil.which("bd", path=str(path)) is None
+    return path
 
 
 def test_canonical_base_snippet_has_the_complete_gate_graph():
@@ -255,7 +297,7 @@ def test_codex_tdd_gate_wiring_denies_without_and_allows_with_evidence(installed
     assert commands.count(expected_gate) == 1
     assert commands.count(expected_evidence) == 1
 
-    session_id = f"codex-base-canary-{os.getpid()}"
+    session_id = f"codex-base-canary-{os.getpid()}-{uuid.uuid4().hex}"
     close_payload = json.dumps({
         "tool_input": {"command": "bd close SABLE-canarya SABLE-canaryb"},
         "session_id": session_id,
@@ -305,6 +347,40 @@ def test_installed_hook_allows_a_clean_body(installed_scope):
     # allow from the fail-open allow the next test provokes.
     out = run_installed_guard(installed_scope, CLEAN_BODY)
     assert out == {}, out
+
+
+def test_installed_notes_clobber_guard_no_bd_door_is_loud(
+    installed_notes_scope, tmp_path,
+):
+    hook = (
+        installed_notes_scope / "hooks" / "multi-manager"
+        / "notes-clobber-guard.sh"
+    )
+    assert hook.is_file(), f"guard was not installed at {hook}"
+    path = no_bd_path(tmp_path)
+    payload = json.dumps({
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": 'bd update SABLE-canary --notes "replacement"',
+        },
+        "hook_event_name": "PreToolUse",
+    })
+    result = subprocess.run(
+        [str(path / "bash"), str(hook)],
+        input=payload,
+        env={**os.environ, "PATH": str(path)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)["hookSpecificOutput"]
+    assert output["hookEventName"] == "PreToolUse"
+    assert output["permissionDecision"] == "allow"
+    context = output["additionalContext"]
+    assert "COULD NOT ASSESS" in context
+    assert "not available on the hook's PATH" in context
 
 
 def test_the_library_lands_where_the_installed_hook_resolves_it(installed_scope):
