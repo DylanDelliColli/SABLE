@@ -23,10 +23,15 @@ TEST_TIERS_SH = REPO_ROOT / ".github" / "ci" / "test-tiers.sh"
 COVERAGE_FLOOR_GATE_SH = REPO_ROOT / "hooks" / "test" / "test-coverage-floor-gate.sh"
 TEST_REQUIREMENTS = REPO_ROOT / ".github" / "ci" / "test-requirements.txt"
 
-# Matches a clean-room `pip install <arguments>` line, excluding the
-# `pip install --upgrade pip` bootstrap line above it (that installs pip
-# itself, not a test dependency, and both workflows carry it verbatim).
-_PIP_INSTALL_RE = re.compile(r"^[ \t]*pip install (?!--upgrade\b)(.+?)[ \t]*$", re.MULTILINE)
+# Matches every clean-room `pip install <arguments>` line, including the
+# equivalent `python[3] -m pip install` spelling. The helper below excludes the
+# `--upgrade pip` bootstrap (pip itself, not a test dependency).
+_PIP_INSTALL_RE = re.compile(
+    r"^[ \t]*(?:python(?:[0-9.]+)?[ \t]+-m[ \t]+)?"
+    r"pip[ \t]+install[ \t]+(.+?)[ \t]*$",
+    re.MULTILINE,
+)
+_AUTHORITATIVE_INSTALL = (("-r", ".github/ci/test-requirements.txt"),)
 
 _TIER_ALIAS_RE = re.compile(
     r'^SABLE_TIER_(MERGE_PREVIEW|FULL_SNAPSHOT)=\(\s*"\$\{ALLOW\[@\]\}"\s*\)',
@@ -36,12 +41,24 @@ _TIER_ALIAS_RE = re.compile(
 
 # --- pure helpers (this is what's under test) --------------------------------
 
-def clean_room_pip_arguments(workflow_text: str) -> tuple[str, ...]:
-    """Arguments on the first non-bootstrap clean-room pip install."""
-    matches = _PIP_INSTALL_RE.findall(workflow_text)
-    if not matches:
-        return ()
-    return tuple(matches[0].split())
+def clean_room_pip_arguments(workflow_text: str) -> tuple[tuple[str, ...], ...]:
+    """Arguments on every non-bootstrap clean-room pip install."""
+    return tuple(
+        parsed
+        for arguments in _PIP_INSTALL_RE.findall(workflow_text)
+        if (parsed := tuple(arguments.split())) != ("--upgrade", "pip")
+    )
+
+
+def clean_rooms_use_the_authoritative_requirements(
+    ci_verify_text: str,
+    green_snapshot_text: str,
+) -> bool:
+    """True when both clean rooms have only the shared dependency declaration."""
+    return (
+        clean_room_pip_arguments(ci_verify_text) == _AUTHORITATIVE_INSTALL
+        and clean_room_pip_arguments(green_snapshot_text) == _AUTHORITATIVE_INSTALL
+    )
 
 
 def merge_preview_and_full_snapshot_share_suites(test_tiers_text: str) -> bool:
@@ -83,14 +100,44 @@ def test_merge_preview_and_full_snapshot_alias_the_same_suite_set():
     )
 
 
-def test_both_clean_rooms_install_the_one_shared_requirement_file():
-    expected = ("-r", ".github/ci/test-requirements.txt")
-    assert clean_room_pip_arguments(
-        CI_VERIFY_YML.read_text(encoding="utf-8")
-    ) == expected
-    assert clean_room_pip_arguments(
-        GREEN_SNAPSHOT_YML.read_text(encoding="utf-8")
-    ) == expected
+def test_clean_room_pip_arguments_include_every_dependency_declaration():
+    workflow = """
+      python -m pip install --upgrade pip
+      pip install -r .github/ci/test-requirements.txt
+      pip install ci-only-package==1.0
+      python -m pip install python-module-style-package==2.0
+    """
+
+    assert clean_room_pip_arguments(workflow) == (
+        ("-r", ".github/ci/test-requirements.txt"),
+        ("ci-only-package==1.0",),
+        ("python-module-style-package==2.0",),
+    )
+
+
+def test_authoritative_requirement_contract_checks_both_clean_rooms():
+    authoritative = "pip install -r .github/ci/test-requirements.txt"
+    drifted = f"{authoritative}\npip install one-sided-package==1.0"
+
+    assert clean_rooms_use_the_authoritative_requirements(
+        authoritative, authoritative
+    )
+    assert not clean_rooms_use_the_authoritative_requirements(
+        drifted, authoritative
+    )
+    assert not clean_rooms_use_the_authoritative_requirements(
+        authoritative, drifted
+    )
+
+
+def test_both_clean_rooms_install_only_the_one_shared_requirement_file():
+    assert clean_rooms_use_the_authoritative_requirements(
+        CI_VERIFY_YML.read_text(encoding="utf-8"),
+        GREEN_SNAPSHOT_YML.read_text(encoding="utf-8"),
+    ), (
+        "ci-verify.yml and green-snapshot.yml must each contain exactly one "
+        "non-bootstrap pip install: -r .github/ci/test-requirements.txt"
+    )
 
 
 def test_shared_clean_room_requirement_file_pins_every_dependency():
