@@ -137,6 +137,28 @@ Canonical schemas live in the `bin/sable_dossier_lib.py` docstring.
    `sable-mode handoff approve --epic <epic-id>`. Never advance or approve on a
    text-only summary — the dossier IS the signoff deliverable.
 
+### Producer non-delivery — bounded fallback
+
+Treat the expected JSON deliverable in the planning state dir as the completion
+signal. An idle/completed notification, a claimed bead, or a chat summary without
+that file does not count as delivery.
+
+When any producer idles or completes without its deliverable:
+
+1. Inspect the planning state dir and any durable producer output, then explicitly
+   resume/pull that producer for the missing deliverable. Make at most **two**
+   such pulls.
+2. If the deliverable is still absent, spawn exactly **one** fresh producer with
+   the same scope, epic id, state-dir path, and output contract. Do not keep
+   respawning.
+3. If the replacement also fails to deliver, stop pulling agents. Run the
+   producer brief's verification commands and checklist yourself, write the
+   required deliverable from that evidence, and record the substitution plus
+   verification evidence in the epic notes before proceeding to signoff.
+
+This fallback is the same for every producer substage; never wait or pull in an
+unbounded loop for a missing verdict.
+
 ### FRAMING — owner: you, strategist hat (live with the user)
 Most human-intensive, not parallelizable. Run it as a conversation via
 `/office-hours` or `/plan-ceo-review`. Produce: user stories, non-goals, success
