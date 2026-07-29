@@ -191,8 +191,19 @@ def test_unknown_dialog_refuses_manager_kick_without_typing(sock, tmp_path):
     assert "NOT typed" in r.stderr
     assert "failed pane removed" in r.stderr
     time.sleep(0.3)
-    assert not rec.exists(), (
-        f"manager kick landed in the unknown dialog: {rec.read_text()!r}"
+    # Assert on CONTENT, not existence. The fake pane records with
+    # `read -r -n 1 byte; printf "%s" "$byte" > rec`, and the `>` redirect
+    # creates the file the moment printf runs — which happens as soon as read
+    # RETURNS FOR ANY REASON, including EOF when the gate removes the failed
+    # pane. So an EMPTY file is evidence of the CORRECT outcome (read returned
+    # nothing typed), and the old `not rec.exists()` check only passed when the
+    # pane happened to die before printf ran. That is a race, and it went red
+    # in CI once suite timing shifted. Empty iff nothing was typed: a real kick
+    # would have given read its first byte and printf would have written it.
+    # The sibling tests in this file already assert on content this way.
+    typed = rec.read_text() if rec.exists() else ""
+    assert typed == "", (
+        f"manager kick landed in the unknown dialog: {typed!r}"
     )
     assert "optimus" not in _roles(sock)
 
