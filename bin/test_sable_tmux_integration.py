@@ -138,10 +138,17 @@ def test_autostart_unknown_dialog_refuses_without_typing(sock, tmp_path):
     assert "NOT typed" in r.stderr
     assert "failed session removed" in r.stderr
     time.sleep(0.3)
-    assert not list(rec.iterdir()), (
-        f"autostart kick landed in unknown dialog(s): "
-        f"{[(p.name, p.read_text()) for p in rec.iterdir()]}"
-    )
+    # Assert on CONTENT, not presence — same defect as SABLE-08w6h fixed in
+    # test_sable_spawn_manager_integration.py, which this file's sibling
+    # assertion shared. The fake pane records with
+    # `read -r -n 1 byte; printf "%s" "$byte" > $REC_DIR/$name.txt`, so the
+    # redirect creates the file as soon as read RETURNS FOR ANY REASON,
+    # including EOF when the failed session is removed. An EMPTY file is
+    # therefore evidence of the CORRECT outcome, and requiring an empty
+    # DIRECTORY only passed when the pane happened to die before printf ran.
+    # Empty iff nothing was typed: a real kick gives read its first byte.
+    typed = [(p.name, p.read_text()) for p in rec.iterdir() if p.read_text()]
+    assert not typed, f"autostart kick landed in unknown dialog(s): {typed}"
     assert subprocess.run(
         ["tmux", "-L", sock, "has-session", "-t", "sable"],
         capture_output=True,
