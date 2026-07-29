@@ -55,9 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--budget",
         type=float,
-        default=90,
+        default=None,
         metavar="SECONDS",
-        help="total execution budget (default: 90)",
+        help=(
+            "explicit total execution budget override (implicit: 90s for "
+            "scoped plans; full_snapshot tier budget for a FULL fallback)"
+        ),
     )
     return parser
 
@@ -65,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.budget <= 0:
+    if args.budget is not None and args.budget <= 0:
         parser.error("--budget must be positive")
     try:
         repo = _repo_root()
@@ -75,15 +78,22 @@ def main(argv: list[str] | None = None) -> int:
             else devcheck.collect_changed_paths(repo, args.base)
         )
         plan = devcheck.build_plan(repo, changed)
+        budget = devcheck.effective_budget(
+            repo, plan, explicit_seconds=args.budget,
+        )
         print(
             devcheck.render_plan(
-                plan, max_entries=None if args.dry_run else 20,
+                plan,
+                max_entries=None if args.dry_run else 20,
+                budget=budget,
             ),
             flush=True,
         )
         if args.dry_run:
             return 0
-        return devcheck.run_plan(repo, plan, budget_seconds=args.budget)
+        return devcheck.run_plan(
+            repo, plan, budget_seconds=budget.seconds,
+        )
     except devcheck.DeveloperCheckError as exc:
         print(f"sable-dev-check: precondition failed: {exc}", file=sys.stderr)
         return 2

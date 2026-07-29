@@ -1,3 +1,3 @@
 integrationBranch=tmux-only
-testCommand=bin/sable-test bin/sable-dev-check --base origin/tmux-only --budget 90
-testTimeout=120
+testCommand=bin/sable-test bin/sable-dev-check --base origin/tmux-only
+testTimeout=1830

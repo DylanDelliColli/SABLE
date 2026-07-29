@@ -162,9 +162,17 @@ def test_written_sable_is_exactly_confirmed_single_line(tmp_path):
     assert _shell_resolve("sable_resolve_test_command", str(tmp_path)) == confirmed
 
 
-def test_build_sable_emits_both_keys_single_line_each():
-    content = ssd.build_sable(test_command="pytest -q", integration_branch="tmux-only")
-    assert content == "testCommand=pytest -q\nintegrationBranch=tmux-only\n"
+def test_build_sable_emits_all_resolver_keys_single_line_each():
+    content = ssd.build_sable(
+        test_command="pytest -q",
+        integration_branch="tmux-only",
+        test_timeout="1830",
+    )
+    assert content == (
+        "testCommand=pytest -q\n"
+        "integrationBranch=tmux-only\n"
+        "testTimeout=1830\n"
+    )
 
 
 def test_build_sable_rejects_multiline_value():
@@ -178,6 +186,7 @@ def test_validate_classifies_each_line():
         "# a comment\n"               # reject
         " integrationBranch=main\n"   # reject: leading space
         "integrationBranch=tmux-only\n"  # accept
+        "testTimeout=1830\n"           # accept
         "TestCommand=nope\n"          # reject: wrong case
     )
     verdicts = [(lc.verdict, lc.key, lc.value) for lc in ssd.validate(text)]
@@ -186,6 +195,7 @@ def test_validate_classifies_each_line():
         ("reject", None, None),
         ("reject", None, None),
         ("accept", "integrationBranch", "tmux-only"),
+        ("accept", "testTimeout", "1830"),
         ("reject", None, None),
     ]
 
@@ -228,6 +238,19 @@ def test_write_refuses_without_execute_result(tmp_path):
     assert not sable.exists()
 
 
+def test_write_preserves_non_executed_resolver_keys(tmp_path):
+    sable = tmp_path / ".sable"
+
+    content = ssd.write(
+        str(sable),
+        integration_branch="tmux-only",
+        test_timeout="1830",
+    )
+
+    assert content == "integrationBranch=tmux-only\ntestTimeout=1830\n"
+    assert sable.read_text() == content
+
+
 def test_execute_once_output_folds_stderr():
     res = ssd.execute_once("echo out; echo err 1>&2")
     assert "out" in res.output and "err" in res.output
@@ -248,7 +271,7 @@ def _shell_resolve(func: str, repo_path: str) -> str:
     script = "source '%s'; %s '%s'" % (_LIB_IDENTITY, func, repo_path)
     env = {k: v for k, v in os.environ.items()
            if k not in ("SABLE_TEST_COMMAND", "SABLE_INTEGRATION_BRANCH",
-                        "SABLE_BASE_BRANCH")}
+                        "SABLE_BASE_BRANCH", "SABLE_PRE_PUSH_TEST_TIMEOUT")}
     env["GIT_CONFIG_GLOBAL"] = "/dev/null"
     env["GIT_CONFIG_SYSTEM"] = "/dev/null"
     proc = subprocess.run(
@@ -282,6 +305,7 @@ _KEY_MATRIX = [
     ("testCommand", "sable_resolve_test_command", "", "npm test", "vitest"),
     ("integrationBranch", "sable_resolve_integration_branch", "main",
      "tmux-only", "release"),
+    ("testTimeout", "sable_resolve_test_timeout", "60", "1830", "90"),
 ]
 
 
@@ -293,7 +317,8 @@ def test_scan_contract_matches_lib_identity_resolvers(
     parse_file) must agree with what the REAL resolver returns — an accepted
     line resolves to exactly the module's value; a rejected line leaves the
     resolver on its fallback (empty for testCommand, `main` for
-    integrationBranch)."""
+    integrationBranch, and `60` for testTimeout)."""
+    assert key in ssd.KNOWN_KEYS
     for i, (label, body, expect_accept, expect_value) in enumerate(
         _fixtures(key, value, second)
     ):
@@ -604,7 +629,11 @@ def make_onboard_repo(tmp_path, *, name="proj", branch="work"):
     (beads / "metadata.json").write_text("{}\n", encoding="utf-8")
 
     (repo / ".sable").write_text(
-        "testCommand=pytest -q\nintegrationBranch=%s\n" % branch, encoding="utf-8")
+        "testCommand=pytest -q\n"
+        "integrationBranch=%s\n"
+        "testTimeout=90\n" % branch,
+        encoding="utf-8",
+    )
 
     claude = repo / ".claude"
     claude.mkdir()
@@ -680,6 +709,13 @@ def test_report_names_present_missing_remedy_per_prereq(tmp_path):
     assert sable.status == onb.STATUS_GAP
     assert "sable-contract" in report
     assert sable.remedy in report            # remedy shown for the missing prereq
+    for shape in (
+        "testCommand=<cmd>",
+        "integrationBranch=<branch>",
+        "testTimeout=<seconds>",
+    ):
+        assert shape in sable.detail
+        assert shape in sable.remedy
     assert "GAP" in report                   # missing is labelled
 
     # a satisfied prereq is named present, and its remedy is NOT dangled
@@ -728,6 +764,8 @@ def test_already_onboarded_repo_reports_all_green_proposes_nothing(tmp_path):
 @pytest.mark.parametrize("line,accepts", [
     ("testCommand=pytest -q", True),
     ("integrationBranch=main", True),
+    ("testTimeout=1830", True),
+    ("testTimeout = 1830", False),           # space around '='
     (" testCommand=pytest", False),          # leading space
     ("testCommand = pytest", False),         # space around '='
     ("# testCommand=pytest", False),         # comment
@@ -747,6 +785,27 @@ def test_sable_line_shape_accept_reject_matrix(tmp_path, line, accepts):
     else:
         assert result.status == onb.STATUS_GAP
         assert "malformed" in result.detail
+        assert "testCommand=<cmd>" in result.detail
+        assert "integrationBranch=<branch>" in result.detail
+        assert "testTimeout=<seconds>" in result.detail
+
+
+def test_checked_in_sable_has_only_resolver_supported_line_shapes():
+    """The real repo contract must not contain comments or scanner-only gaps."""
+    text = (_REPO_ROOT / ".sable").read_text(encoding="utf-8")
+    lines = ssd.validate(text)
+
+    assert lines
+    assert all(line.verdict == "accept" for line in lines)
+    assert {line.key for line in lines} == set(ssd.KNOWN_KEYS)
+
+    result = onb.run_checks(
+        str(_REPO_ROOT),
+        only="sable-contract",
+        env=_green_env(),
+    )[0]
+    assert result.status == onb.STATUS_OK
+    assert "malformed" not in result.detail
 
 
 def test_prime_block_and_settings_wiring_checked_independently_of_doctor(tmp_path):

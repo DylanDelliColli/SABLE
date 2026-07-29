@@ -864,10 +864,29 @@ resolve_timeout_test "sable_resolve_test_timeout: empty repo path falls back to 
 resolve_timeout_test "sable_resolve_test_timeout: empty repo path with no env returns default 60" \
   "" "" "60"
 
-# This repo's own checked-in .sable gives the proportional developer check a
-# 120s outer ceiling around its 90s execution budget.
-resolve_timeout_test "sable_resolve_test_timeout: this repo's checked-in .sable resolves to 120" \
-  "$REPO" "" "120"
+# This repo's own checked-in .sable gives a fail-closed full fallback the
+# authoritative full_snapshot budget plus 30s for planning/teardown outside
+# sable-dev-check's internal execution timer. Derive the assertion from the
+# tier SSOT so a budget change cannot silently strand the hook at an old cap.
+FULL_SNAPSHOT_BUDGET=$(bash "$REPO/.github/ci/test-tiers.sh" --budget full_snapshot)
+FULL_SNAPSHOT_BUDGET_RC=$?
+if [ "$FULL_SNAPSHOT_BUDGET_RC" -ne 0 ]; then
+  fail "sable_resolve_test_timeout: full_snapshot tier budget query succeeds" \
+    "rc=$FULL_SNAPSHOT_BUDGET_RC got [$FULL_SNAPSHOT_BUDGET]"
+else
+  case "$FULL_SNAPSHOT_BUDGET" in
+    ''|*[!0-9]*)
+      fail "sable_resolve_test_timeout: full_snapshot tier exposes a numeric budget" \
+        "rc=$FULL_SNAPSHOT_BUDGET_RC got [$FULL_SNAPSHOT_BUDGET]"
+      ;;
+    *)
+      EXPECTED_REPO_TEST_TIMEOUT=$((FULL_SNAPSHOT_BUDGET + 30))
+      resolve_timeout_test \
+        "sable_resolve_test_timeout: this repo resolves to full_snapshot + 30s headroom" \
+        "$REPO" "" "$EXPECTED_REPO_TEST_TIMEOUT"
+      ;;
+  esac
+fi
 
 # --------------------------------------------------------------------------
 # sable_resolve_push_repo_dir unit tests (SABLE-041)

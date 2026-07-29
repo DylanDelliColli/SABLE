@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import re
 import shutil
 import subprocess
 import sys
@@ -34,10 +35,30 @@ class PythonSelection:
 
 
 @dataclass(frozen=True)
+class ShellSelection:
+    mode: str
+    suites: tuple[str, ...]
+    reason: str
+
+
+@dataclass(frozen=True)
 class DeveloperPlan:
     changed_paths: tuple[str, ...]
     python: PythonSelection
     shell_suites: tuple[str, ...]
+    shell_mode: str = "scoped"
+    shell_reason: str = "selected shell suites"
+
+
+@dataclass(frozen=True)
+class BudgetDecision:
+    seconds: float
+    mode: str
+    reason: str
+
+
+SCOPED_BUDGET_SECONDS = 90.0
+FULL_SNAPSHOT_TIER = "full_snapshot"
 
 
 def _normalise_path(path: str) -> str:
@@ -235,16 +256,23 @@ def collect_changed_paths(repo_root: Path, base_ref: str | None) -> tuple[str, .
     return tuple(sorted(changed))
 
 
-def select_shell_suites(
+def select_shell_selection(
     repo_root: Path,
     changed_paths: Iterable[str],
     *,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-) -> tuple[str, ...]:
-    """Delegate shell-suite selection to the existing manifest Interface."""
+) -> ShellSelection:
+    """Delegate shell-suite selection and its mode to the impact manifest.
+
+    FULL versus SCOPED is load-bearing budget input, not decorative logging:
+    an unmapped path intentionally selects the complete authoritative shell
+    set, which cannot inherit the fast scoped budget. If an older or broken
+    selector omits its mode line, fail closed to FULL for budget purposes
+    while preserving the missing-mode fact in the rendered plan.
+    """
     changed = tuple(sorted({_normalise_path(path) for path in changed_paths}))
     if not changed:
-        return ()
+        return ShellSelection("none", (), "no changed paths")
     manifest = repo_root / ".github/ci/impact-manifest.sh"
     if not manifest.is_file():
         raise DeveloperCheckError(f"shell impact manifest missing: {manifest}")
@@ -264,22 +292,133 @@ def select_shell_suites(
         # Preserve the manifest's FULL/SCOPED reason instead of turning this
         # Adapter into an observability sink.
         sys.stderr.write(result.stderr)
-    return tuple(sorted({
+    suites = tuple(sorted({
         line.strip() for line in result.stdout.splitlines()
         if line.strip() and not line.startswith("::")
     }))
+    matches = re.findall(
+        r"impact-manifest:\s*(FULL|SCOPED)\s*--\s*([^\r\n]*)",
+        result.stderr or "",
+        flags=re.IGNORECASE,
+    )
+    if not matches:
+        return ShellSelection(
+            "full",
+            suites,
+            "selector omitted its FULL/SCOPED reason; using full-budget fallback",
+        )
+    mode, reason = matches[-1]
+    return ShellSelection(mode.lower(), suites, reason.strip())
+
+
+def select_shell_suites(
+    repo_root: Path,
+    changed_paths: Iterable[str],
+    *,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> tuple[str, ...]:
+    """Compatibility wrapper returning only the selected suite names."""
+    return select_shell_selection(
+        repo_root, changed_paths, runner=runner,
+    ).suites
 
 
 def build_plan(repo_root: Path, changed_paths: Iterable[str]) -> DeveloperPlan:
     changed = tuple(sorted({_normalise_path(path) for path in changed_paths}))
+    shell = select_shell_selection(repo_root, changed)
     return DeveloperPlan(
         changed_paths=changed,
         python=select_python_tests(repo_root, changed),
-        shell_suites=select_shell_suites(repo_root, changed),
+        shell_suites=shell.suites,
+        shell_mode=shell.mode,
+        shell_reason=shell.reason,
     )
 
 
-def render_plan(plan: DeveloperPlan, *, max_entries: int | None = 20) -> str:
+def _tier_budget_seconds(
+    repo_root: Path,
+    tier: str,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> float:
+    """Read a duration from the authoritative tier SSOT.
+
+    In particular, the full-fallback duration must never be copied into this
+    module: changing full_snapshot in test-tiers.sh must change the developer
+    check's implicit budget on the next invocation.
+    """
+    script = repo_root / ".github/ci/test-tiers.sh"
+    if not script.is_file():
+        raise DeveloperCheckError(f"tier budget source missing: {script}")
+    bash = shutil.which("bash")
+    if not bash:
+        raise DeveloperCheckError("bash is required to read tier budgets")
+    result = runner(
+        [bash, str(script), "--budget", tier],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "tier query failed"
+        raise DeveloperCheckError(f"could not read {tier} budget: {detail}")
+    try:
+        seconds = float(result.stdout.strip())
+    except ValueError as exc:
+        raise DeveloperCheckError(
+            f"{tier} budget is not numeric: {result.stdout.strip()!r}"
+        ) from exc
+    if seconds <= 0:
+        raise DeveloperCheckError(f"{tier} budget must be positive, got {seconds:g}")
+    return seconds
+
+
+def effective_budget(
+    repo_root: Path,
+    plan: DeveloperPlan,
+    *,
+    explicit_seconds: float | None,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> BudgetDecision:
+    """Choose the execution budget after the selection shape is known.
+
+    An explicit CLI value always wins. Otherwise, any FULL selector expands
+    the budget to the authoritative full_snapshot tier. Truly proportional
+    plans retain the short 90-second developer-feedback ceiling.
+    """
+    if explicit_seconds is not None:
+        return BudgetDecision(
+            float(explicit_seconds), "explicit", "explicit --budget override",
+        )
+
+    full_reasons = []
+    if plan.python.mode == "full":
+        full_reasons.append(f"Python FULL ({plan.python.reason})")
+    if plan.shell_mode == "full":
+        full_reasons.append(f"Shell FULL ({plan.shell_reason})")
+    if full_reasons:
+        seconds = _tier_budget_seconds(
+            repo_root, FULL_SNAPSHOT_TIER, runner=runner,
+        )
+        return BudgetDecision(
+            seconds,
+            "full-fallback",
+            "; ".join(full_reasons)
+            + f"; budget from {FULL_SNAPSHOT_TIER} tier",
+        )
+    return BudgetDecision(
+        SCOPED_BUDGET_SECONDS,
+        "scoped",
+        "Python and shell selections remain proportional",
+    )
+
+
+def render_plan(
+    plan: DeveloperPlan,
+    *,
+    max_entries: int | None = 20,
+    budget: BudgetDecision | None = None,
+) -> str:
     lines = [
         f"sable-dev-check: {len(plan.changed_paths)} changed path(s)",
         f"  Python: {plan.python.mode} — {plan.python.reason}",
@@ -288,11 +427,18 @@ def render_plan(plan: DeveloperPlan, *, max_entries: int | None = 20) -> str:
         lines.extend(f"    {test}" for test in plan.python.tests)
     else:
         lines.append("    (list omitted; use --dry-run to inspect)")
-    lines.append(f"  Shell: {len(plan.shell_suites)} suite(s)")
+    lines.append(
+        f"  Shell: {plan.shell_mode} — {plan.shell_reason} "
+        f"({len(plan.shell_suites)} suite(s))"
+    )
     if max_entries is None or len(plan.shell_suites) <= max_entries:
         lines.extend(f"    hooks/test/{suite}" for suite in plan.shell_suites)
     else:
         lines.append("    (list omitted; use --dry-run to inspect)")
+    if budget is not None:
+        lines.append(
+            f"  Budget: {budget.mode} — {budget.seconds:g}s — {budget.reason}"
+        )
     lines.append(
         "  Scope: fast developer feedback only; sealed-candidate ci-verify "
         "remains authoritative."
@@ -319,7 +465,7 @@ def run_plan(
     repo_root: Path,
     plan: DeveloperPlan,
     *,
-    budget_seconds: float = 90,
+    budget_seconds: float = SCOPED_BUDGET_SECONDS,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> int:
     """Run one pytest process plus selected shell suites within one budget."""
