@@ -605,10 +605,21 @@ def test_worker_window_inherits_lane_manager_identity(sock):
     """SABLE-bldh.13 regression: the worker window must carry the invoking lane
     manager's CLAUDE_AGENT_NAME (+ manager role) so its push's for-chuck handoff
     fires (post-push-merge-notify gates on manager identity) and is attributed to
-    the lane, not the session-default 'lincoln'. Verified by dumping the worker
-    process env to a file."""
+    the lane, not the session-default 'lincoln'. SABLE-ndaup additionally
+    requires the worker window to disable Claude Code's generated prompt
+    suggestions. Verified by dumping the worker process env to a file."""
     with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
         dump = Path(dd) / "worker-env.txt"
+        # A contradictory session value proves the worker's value comes from
+        # worker_env_args' per-window `-e`, not ambient tmux inheritance.
+        _tmux(
+            sock,
+            "set-environment",
+            "-t",
+            "sable",
+            "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION",
+            "1",
+        )
         env = {
             **_clean_env(),
             "SABLE_TMUX_SOCKET": sock,
@@ -641,6 +652,7 @@ def test_worker_window_inherits_lane_manager_identity(sock):
         # re-dispatching its own bead) — while the manager identity above is
         # still present for the post-push for-chuck handoff.
         assert "SABLE_WORKER_PANE=1" in content, content
+        assert "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0" in content, content
 
 
 def test_dispatch_from_worker_pane_is_refused(sock):

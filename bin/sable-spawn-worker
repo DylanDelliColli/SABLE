@@ -1650,7 +1650,7 @@ def worker_pane_tags(
 def worker_env_args(lane: str, provider: str = "claude") -> list[str]:
     """tmux `-e` args for the worker pane.
 
-    Two purposes, deliberately separated:
+    Three purposes, deliberately separated:
       * Lane identity (CLAUDE_AGENT_NAME=<lane> + manager role): stamped so the
         worker's push fires the manager-gated for-chuck handoff attributed to the
         lane, not the session-default lincoln (SABLE-bldh.13). Without it the
@@ -1665,7 +1665,10 @@ def worker_env_args(lane: str, provider: str = "claude") -> list[str]:
         stands down on it (never loads a manager role-card into a worker), and
         sable-spawn-worker itself refuses to re-dispatch from a pane carrying it
         (worker_pane_guard). It is independent of lane so even a lane-less worker
-        pane is recognizable."""
+        pane is recognizable.
+      * CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 (ALWAYS stamped): prevents
+        Claude Code from placing generated, unsubmitted next-prompt text in a
+        worker pane's composer after it finishes (SABLE-ndaup)."""
     args: list[str] = []
     if lane:
         args += [
@@ -1678,7 +1681,11 @@ def worker_env_args(lane: str, provider: str = "claude") -> list[str]:
                 "-e", f"CLAUDE_AGENT_NAME={lane}",
                 "-e", "CLAUDE_AGENT_ROLE=manager",
             ]
-    args += ["-e", f"SABLE_PROVIDER={provider}", "-e", "SABLE_WORKER_PANE=1"]
+    args += [
+        "-e", f"SABLE_PROVIDER={provider}",
+        "-e", "SABLE_WORKER_PANE=1",
+        "-e", "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0",
+    ]
     return args
 
 

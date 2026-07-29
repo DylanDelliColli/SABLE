@@ -1997,6 +1997,7 @@ def test_worker_env_args_stamps_manager_identity():
         "-e", "SABLE_LANE=optimus",
         "-e", "CLAUDE_AGENT_NAME=optimus", "-e", "CLAUDE_AGENT_ROLE=manager",
         "-e", "SABLE_PROVIDER=claude", "-e", "SABLE_WORKER_PANE=1",
+        "-e", "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0",
     ]
 
 
@@ -2005,6 +2006,7 @@ def test_codex_worker_env_uses_only_provider_neutral_identity():
         "-e", "SABLE_AGENT_NAME=tarzan", "-e", "SABLE_AGENT_ROLE=manager",
         "-e", "SABLE_LANE=tarzan",
         "-e", "SABLE_PROVIDER=codex", "-e", "SABLE_WORKER_PANE=1",
+        "-e", "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0",
     ]
 
 
@@ -2014,7 +2016,16 @@ def test_worker_env_args_marks_worker_pane_even_without_lane():
     # recognizable as a worker (role-anchor stand-down + re-dispatch guard).
     assert ssw.worker_env_args("") == [
         "-e", "SABLE_PROVIDER=claude", "-e", "SABLE_WORKER_PANE=1",
+        "-e", "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0",
     ]
+
+
+@pytest.mark.parametrize("lane", ["optimus", ""])
+def test_worker_env_args_disables_prompt_suggestion_with_or_without_lane(lane):
+    assert (
+        "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0"
+        in ssw.worker_env_args(lane)
+    )
 
 
 def test_worker_env_args_always_contains_worker_marker():
