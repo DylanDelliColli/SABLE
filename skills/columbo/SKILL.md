@@ -271,6 +271,15 @@ bd children <epic-id> --json      # direct children (and grandchildren if any)
 
 For each child, also fetch description / type / labels / dependencies.
 
+**Framing stories (the traceability spine).** When the invocation context
+supplies a planning state dir (a `/sable-plan` run), read `framing.json` from
+it. Its story ids (`S1..Sn`) and titles are what every test case will be
+traced back to. If the file is absent, derive stories from the epic
+description instead and record `stories_source=derived` in the Phase E6 JSON
+so the dossier flags that the spine was not human-authored. If no planning
+state dir exists, derive stories for the review but silently skip dossier
+reads and writes; do not ask the user to create one.
+
 #### Phase E2 — Classify children
 
 Each child belongs to one of:
@@ -291,6 +300,10 @@ For each implementation bead:
 3. Note source patterns that imply additional categories (state-machine source ⇒ category 4 + 9; concurrency source ⇒ category 6; auth-touching ⇒ category 10)
 4. Determine if it touches existing code: look for "modify", "update", "fix", "refactor" language in the description; verify cited files exist (Glob); flag the IRON RULE if so
 5. Find sibling test beads in the epic that cite the same files / symbols
+6. Record which framing story the bead traces to (match the story id or
+   title text in the bead description). Put beads matching no story in
+   `unmapped_beads` in the Phase E6 JSON; an unmapped implementation bead is
+   itself a smell worth surfacing in Phase E5.
 
 #### Phase E4 — Coherence/completeness pass (generous mode)
 
@@ -360,6 +373,36 @@ Done.
 The execution agent (Tarzan / Optimus / the user dispatching workers
 manually) sees this when reviewing the epic before dispatch — gives them
 the full architecture picture without re-deriving it.
+
+**Dossier deliverable (`test-strategy.json`).** When a planning state dir
+exists, also write `test-strategy.json` there — the story×test traceability
+matrix the TEST-STRATEGY gate renders for signoff. The schema is canonical
+in `bin/sable_dossier_lib.py`'s docstring:
+
+```json
+{
+  "epic": "<epic-id>", "sha": "<head>",
+  "stories_source": "framing | derived",
+  "stories": [
+    { "id": "S1", "title": "<story title>",
+      "impl_beads": [{"id": "<bead>", "title": "<title>"}],
+      "cases": [{"name": "<concrete case>", "layer": "UNIT|E2E|EVAL",
+                 "status": "planned|gap", "bead": "<test bead or null>",
+                 "category": <rubric number>}] }
+  ],
+  "unmapped_beads": [{"id": "<bead>", "title": "<title>"}],
+  "findings": {"resolved": ["<one-liner>"], "deferred": ["<one-liner>"]},
+  "layer_mix": {"unit": 0, "e2e": 0, "eval": 0},
+  "coverage": {"covered": 0, "total": 0}
+}
+```
+
+Every case from the epic's test beads appears exactly once under the story it
+traces to. Cases surfaced as findings that the user deferred stay
+`status=gap` so the dossier shows them red. The epic-notes summary and this
+JSON are both required when a planning state dir exists — notes for execution
+agents, JSON for the human gate. Without a planning state dir, silently skip
+the JSON deliverable; the epic-notes summary remains required.
 
 ## Question taxonomy (12 categories)
 
@@ -841,6 +884,9 @@ You exit when ALL of:
   bead exists at priority ≤ 1 (IRON RULE)
 - The epic's `--notes` has been appended with the architecture-review
   summary (Phase E6 markdown section)
+- When a planning state dir exists: `test-strategy.json` has been written
+  there, every case is traced to a story or listed in `unmapped_beads`, and
+  deferred findings are present as `status=gap` cases
 - Architecture status line in the summary explicitly states
   "ready for execution" or "needs follow-up" with the deferred-findings
   list as the rationale
