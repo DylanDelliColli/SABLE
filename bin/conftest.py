@@ -54,17 +54,24 @@ _AMBIENT_FLEET_ENV = (
 )
 
 
+# A path that must never exist. Deliberately NOT tmp_path: this fixture is
+# autouse, so depending on tmp_path would force pytest to create a temporary
+# directory for EVERY test in the suite — thousands of them — purely to name a
+# file none of them opens. The fixture needs a non-existent path, not a real
+# directory, and CI minutes are hard-won (the pipeline was brought from 9m to
+# 4m over ~15 hours).
+_ABSENT_MODE_STATE = "/nonexistent/sable-hermetic/absent-mode-state.json"
+
+
 @pytest.fixture(autouse=True)
-def _hermetic_fleet_env(monkeypatch, tmp_path):
+def _hermetic_fleet_env(monkeypatch):
     """Detach every test from the ambient fleet: no inherited agent identity,
     no live tmux client, and a mode-state path that deliberately does not
     exist (so mode reads report 'no execution session' rather than picking up
     whatever the operator's fleet is mid-drain)."""
     for name in _AMBIENT_FLEET_ENV:
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv(
-        "SABLE_MODE_STATE", str(tmp_path / "absent-mode-state.json")
-    )
+    monkeypatch.setenv("SABLE_MODE_STATE", _ABSENT_MODE_STATE)
 
 MAX_ORDINARY_TEST_SECONDS = 10.0
 MAX_ORDINARY_MODULE_SECONDS = 45.0
