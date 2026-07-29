@@ -1545,6 +1545,12 @@ if grep -qE '^optimus .*\[AUTO-NOTIFY' "$SABLE_MSG_LOG" 2>/dev/null \
 else
   fail "UNIT SABLE-gx7p3 NEGATIVE CONTROL: genuinely closed bead — notify may state closure, still tagged" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
 fi
+if grep -qiE "^optimus .*primary merge handoff is direct.*durable for-chuck bead is created only if delivery fails.*absence is healthy" "$SABLE_MSG_LOG" 2>/dev/null \
+   && ! grep -qi "for-chuck PR" "$SABLE_MSG_LOG" 2>/dev/null; then
+  pass "UNIT SABLE-z2zrl: manager wake teaches direct primary, failure-only fallback, and healthy absence"
+else
+  fail "UNIT SABLE-z2zrl: manager wake teaches direct primary, failure-only fallback, and healthy absence" "MSG_LOG: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
+fi
 
 rm -f "$BD_LOG" "$SABLE_MSG_LOG"
 

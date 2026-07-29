@@ -104,8 +104,10 @@ over tmux and they spawn + watch their own workers.**
   worktree, model-pinned); the worker tests, pushes its OWN branch, closes its
   bead, and Chuck merges. You neither dispatch nor push; the mode-interlock gates
   `sable-spawn-worker` to execution mode and the gates enforce the push.
-- **Chuck is the merge-queue pane.** Worker pushes file `for-chuck` beads
-  automatically (post-push hook); the bead DB bridges the panes.
+- **Chuck is the merge-queue pane.** A worker push messages Chuck's pane
+  directly as the primary merge handoff. The post-push hook creates a durable
+  `for-chuck` bead only when direct delivery fails; no bead is the healthy
+  expected path, not a missed handoff.
 - **Shift changes:** a manager that hits context pressure files a `shift-report`
   bead, messages you, and ends; restart its pane fresh — lane state rehydrates
   from beads, not memory.

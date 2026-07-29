@@ -137,7 +137,7 @@ surfaces them into every fresh boot's identity:
 
 ```bash
 sable-contract set  "Merges go ONLY through sable-merge-gate. NO bare git merge/push on any integration branch."
-sable-contract add  "Workers self-push their worktree branch; the post-push hook files for-chuck; Chuck merges via the gate."
+sable-contract add  "Workers self-push their worktree branch; Chuck's PRIMARY handoff is a direct tmux message; a durable for-chuck bead is created only if delivery fails, so its absence is healthy; Chuck merges via the gate."
 # add any interim fleet rule live this shift, e.g.:
 # sable-contract add "Interim worker cap: 2 per manager until SABLE-p8rf lands."
 ```

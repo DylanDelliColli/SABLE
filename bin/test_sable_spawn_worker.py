@@ -298,6 +298,65 @@ def test_parse_bead_list_fails_open_on_malformed():
     assert ssw.parse_bead_list('{"id":"X-1"}') == []  # object, not array
 
 
+def test_fetch_bead_comments_degrades_when_bd_absent(monkeypatch, capsys):
+    def missing_bd(*_args, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "bd")
+
+    monkeypatch.setattr(ssw.subprocess, "run", missing_bd)
+
+    assert ssw.fetch_bead_comments("X-absent") == []
+    warning = capsys.readouterr().err
+    assert "could not fetch comments for X-absent" in warning
+    assert "No such file or directory" in warning
+    assert "bd" in warning
+
+
+def test_fetch_bead_comments_success_has_no_warning(monkeypatch, capsys):
+    result = subprocess.CompletedProcess(
+        ["bd", "comments", "X-ok", "--json"],
+        0,
+        stdout='[{"id":"comment-1","body":"context"}]',
+        stderr="",
+    )
+    monkeypatch.setattr(ssw.subprocess, "run", lambda *_args, **_kwargs: result)
+
+    assert ssw.fetch_bead_comments("X-ok") == [
+        {"id": "comment-1", "body": "context"}
+    ]
+    assert capsys.readouterr().err == ""
+
+
+def test_fetch_bead_comments_nonzero_empty_stderr_names_exit_status(
+        monkeypatch, capsys):
+    result = subprocess.CompletedProcess(
+        ["bd", "comments", "X-failed", "--json"],
+        17,
+        stdout="",
+        stderr="",
+    )
+    monkeypatch.setattr(ssw.subprocess, "run", lambda *_args, **_kwargs: result)
+
+    assert ssw.fetch_bead_comments("X-failed") == []
+    warning = capsys.readouterr().err
+    assert "could not fetch comments for X-failed" in warning
+    assert "exit status 17" in warning
+
+
+@pytest.mark.parametrize("stdout", ("not json", '{"id":"comment-1"}'))
+def test_fetch_bead_comments_malformed_success_warns(monkeypatch, capsys, stdout):
+    result = subprocess.CompletedProcess(
+        ["bd", "comments", "X-malformed", "--json"],
+        0,
+        stdout=stdout,
+        stderr="",
+    )
+    monkeypatch.setattr(ssw.subprocess, "run", lambda *_args, **_kwargs: result)
+
+    assert ssw.fetch_bead_comments("X-malformed") == []
+    warning = capsys.readouterr().err
+    assert "could not parse comments for X-malformed" in warning
+
+
 def test_already_in_progress_check_blocks_second_spawn_with_pane_evidence():
     err = ssw.already_in_progress_check(
         {"id": "X-1", "status": "in_progress", "assignee": "tarzan"},
@@ -1208,6 +1267,23 @@ def test_dispatch_prompt_done_flag_targets_own_pane():
     )
     assert 'tmux set-option -p -t "$TMUX_PANE" @sable_status done' in p
     assert "tmux set-option -p @sable_status done" not in p
+
+
+def test_dispatch_prompt_teaches_primary_chuck_delivery_and_failure_fallback():
+    """SABLE-z2zrl: workers must not diagnose a healthy direct handoff as
+    broken merely because its failure-only durable fallback was not created."""
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Do the thing", description="full desc here",
+        worktree="/wt/wk-x", branch="wk-x", model="sonnet",
+    )
+
+    assert "post-push hook files the for-chuck handoff" not in p
+    assert "direct tmux notification to Chuck" in p
+    assert "PRIMARY" in p
+    assert "durable `for-chuck` fallback bead" in p
+    assert "ONLY if direct delivery fails" in p
+    assert "No fallback bead is the healthy expected outcome" in p
+    assert "not that the handoff was missed" in p
 
 
 def test_dispatch_prompt_has_no_unresolvable_templates_reference():

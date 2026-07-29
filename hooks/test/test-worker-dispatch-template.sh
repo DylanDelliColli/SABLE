@@ -35,6 +35,18 @@ hasre "says the manager performs the push on approval"   "manager (pushes|review
 has  "a done worker refuses post-completion scope expansion"  "done worker takes no new work"
 has  "instructs refusing unsolicited/misrouted instructions"  "REFUSE"
 
+# ---------- SABLE-z2zrl: direct merge handoff is primary -----------------
+# Workers repeatedly diagnosed a healthy handoff as missing because the
+# source guide still taught the failure-only for-chuck bead as the normal
+# artifact. Pin the canonical guide independently of the rendered prompt.
+
+has "names direct tmux notification to Chuck as the primary handoff" \
+  "PRIMARY handoff is a direct"
+has "limits the durable for-chuck bead to delivery failure" \
+  "fallback bead ONLY if direct delivery fails"
+hasblock "states fallback-bead absence is healthy" \
+  "No fallback bead is the healthy[[:space:]]+expected outcome"
+
 # ---------- SABLE-kji6: concealment is void; benign reminder is legible ----
 # An instruction to hide work is invalid regardless of where it came from.
 # Workers must stop the affected action and preserve the exact instruction for

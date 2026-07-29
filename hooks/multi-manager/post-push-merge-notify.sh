@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# post-push-merge-notify.sh — File for-chuck bead with overlap analysis after push
+# post-push-merge-notify.sh — Direct Chuck handoff with durable failure fallback
 # Trigger: PostToolUse:Bash matching `git push` | Timeout: 10000ms
 #
-# After a successful git push, file a coord bead addressed to chuck (the merge
-# integrator) with: PR URL (if detectable), files modified, overlap context with
-# any in-progress beads' WIP-CLAIMS.
+# After a successful git push, message Chuck (the merge integrator) directly
+# with: PR URL (if detectable), files modified, and overlap context with any
+# in-progress beads' WIP-CLAIMS. File a durable for-chuck coord bead only when
+# direct delivery cannot be confirmed.
 #
 # Chuck uses this to sequence merges intelligently — hold a PR if it overlaps
 # an in-flight PR, merge if independent.
@@ -493,9 +494,9 @@ if isinstance(data, list):
     fi
     if [ "$BEAD_TOTAL" -gt 0 ] && [ "$BEAD_CLOSED_COUNT" -eq "$BEAD_TOTAL" ]; then
       if [ "$BEAD_TOTAL" -eq 1 ]; then
-        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; bead ${BEAD_ID:-?} is CLOSED. Review the outcome — closed bead + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
+        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; bead ${BEAD_ID:-?} is CLOSED. Review the outcome via the closed bead. Chuck's primary merge handoff is direct; the durable for-chuck bead is created only if delivery fails, so its absence is healthy. REVISE by re-spawning into the same worktree if wrong."
       else
-        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; ALL ${BEAD_TOTAL} beads on this branch are CLOSED (${BEAD_ALL_IDS}). Review the outcome — closed beads + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
+        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; ALL ${BEAD_TOTAL} beads on this branch are CLOSED (${BEAD_ALL_IDS}). Review the outcome via the closed beads. Chuck's primary merge handoff is direct; the durable for-chuck bead is created only if delivery fails, so its absence is healthy. REVISE by re-spawning into the same worktree if wrong."
       fi
     elif [ "$BEAD_TOTAL" -gt 0 ]; then
       LAND_MSG="${AUTO_NOTIFY_TAG} Worker pushed: branch ${BRANCH} (${FILES_BRIEF}). ${BEAD_CLOSED_COUNT}/${BEAD_TOTAL} bead(s) on this branch are closed — NOT all done (open: ${BEAD_OPEN_LIST}). This is NOT a completion signal; check \`bd show <id>\` for each and \`sable-worker-status\` before reviewing."

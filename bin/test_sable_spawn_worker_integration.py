@@ -34,8 +34,17 @@ HAVE_TMUX = shutil.which("tmux") is not None
 HAVE_BD = shutil.which("bd") is not None
 BEAD = "SABLE-bldh.2"  # an open bead in this repo (read-only here)
 BUNDLE_SIBLING = "SABLE-06dr"  # a second open bead, used only as --bundle sibling (read-only here)
-pytestmark = pytest.mark.skipif(not (HAVE_TMUX and HAVE_BD),
-                                reason="needs tmux + bd")
+pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="needs tmux")
+
+
+@pytest.fixture(autouse=True)
+def require_bd_except_for_missing_bd_regression(request):
+    """Only the Door-A regression is designed to run without host ``bd``."""
+    if (
+        not HAVE_BD
+        and request.node.name != "test_dispatch_succeeds_with_bd_absent"
+    ):
+        pytest.skip("needs bd")
 
 
 def _signed_authority(*, kind="break-glass", tier=None, scope=()):
@@ -127,6 +136,18 @@ def _clean_env(**overrides):
            if k not in ("SABLE_WORKER_PANE", "SABLE_LANE", "SABLE_ROLE")}
     env.update(overrides)
     return env
+
+
+def _curated_path_without_bd(path: Path) -> str:
+    """Keep the real dispatch prerequisites while proving ``bd`` is absent."""
+    path.mkdir()
+    for command in ("bash", "git", "tmux"):
+        executable = shutil.which(command)
+        assert executable is not None, f"integration prerequisite missing: {command}"
+        (path / command).symlink_to(Path(executable).resolve())
+    curated = str(path)
+    assert shutil.which("bd", path=curated) is None
+    return curated
 
 
 def _refs_snapshot(repo: Path) -> set[str]:
@@ -225,6 +246,75 @@ def test_spawn_creates_tagged_worker_window(sock):
         # the read-instruction (single-line) was delivered into the worker pane
         win = _tmux(sock, "list-windows", "-F", "#{window_name}").stdout
         assert "worker-sable-bldh-2" in win
+
+
+def test_dispatch_succeeds_with_bd_absent(sock, tmp_path, monkeypatch, capsys):
+    """The optional comments read must not turn ``bd`` into a launch prerequisite.
+
+    The mandatory bead record is supplied at the existing ``_run`` seam so the
+    rest of ``main`` is exercised unchanged: real git reads, prompt write, tmux
+    window creation/tagging, and dispatch delivery all run with a PATH that has
+    no ``bd`` executable.
+    """
+    bead_id = "SABLE-7rp12"
+    bead = [{
+        "id": bead_id,
+        "title": "Dispatch without optional comments",
+        "description": "Prove the worker dispatch survives a missing bd binary.",
+        "notes": "",
+        "labels": [],
+        "status": "open",
+    }]
+    real_run = ssw._run
+
+    def run_with_bead_fixture(args):
+        if args == ["bd", "show", bead_id, "--json"]:
+            return json.dumps(bead)
+        return real_run(args)
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    dispatch_dir = tmp_path / "dispatch"
+    monkeypatch.setattr(ssw, "_run", run_with_bead_fixture)
+    monkeypatch.setenv("PATH", _curated_path_without_bd(tmp_path / "path"))
+    monkeypatch.setenv("SABLE_TMUX_SOCKET", sock)
+    monkeypatch.setenv("SABLE_TMUX_SESSION", "sable")
+    monkeypatch.setenv("SABLE_WORKER_CMD", "bash --noprofile --norc")
+    monkeypatch.setenv("SABLE_DISPATCH_DIR", str(dispatch_dir))
+    monkeypatch.setenv("SABLE_DISPATCH_READY_TIMEOUT", "0")
+    monkeypatch.setenv("SABLE_MAX_LOAD_PER_CORE", "0")
+    monkeypatch.setenv("SABLE_DISPATCH_POLL_INTERVAL", "0.05")
+    monkeypatch.setenv("SABLE_DISPATCH_SUBMIT_TRIES", "2")
+    monkeypatch.delenv("SABLE_WORKER_PANE", raising=False)
+    monkeypatch.delenv("SABLE_LANE", raising=False)
+    monkeypatch.delenv("SABLE_ROLE", raising=False)
+    monkeypatch.delenv("CLAUDE_AGENT_NAME", raising=False)
+
+    result = ssw.main([
+        bead_id,
+        "--worktree", str(worktree),
+        "--model", "haiku",
+        "--skip-governance",
+    ])
+
+    assert result == 0
+    _wait_for_worker_count(sock, bead_id)
+    dispatch = dispatch_dir / f"{bead_id}.md"
+    assert dispatch.exists()
+    assert bead_id in dispatch.read_text()
+    listing = _tmux(
+        sock, "list-panes", "-a", "-F",
+        "#{@sable_role} #{@sable_bead} #{@sable_status}",
+    ).stdout
+    assert any(
+        line.startswith("worker") and bead_id in line and "running" in line
+        for line in listing.splitlines()
+    ), listing
+    stderr = capsys.readouterr().err
+    assert f"could not fetch comments for {bead_id}" in stderr
+    assert "bd" in stderr
+    assert "No such file or directory" in stderr
+    assert f"spawned {ssw.window_name(bead_id)} for {bead_id}" in stderr
 
 
 def test_spawn_bundle_renders_all_bead_descriptions_into_prompt(sock):

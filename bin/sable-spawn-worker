@@ -101,7 +101,7 @@ WIP-CLAIMS text) overlaps a DIFFERENT in-progress bead's footprint refuses the
 spawn — exit 11, naming the overlapping bead(s) and files. Two outs: wait for
 the overlapping bead to clear, or add an explicit 'Serialize-with: <bead-id>'
 line (bead notes/description) naming it — the spawn then proceeds and both
-beads' `serialize_with` metadata is tagged for Chuck's for-chuck handoff.
+beads' `serialize_with` metadata is tagged for Chuck's integration handoff.
 
 A bead that declares a footprint the parser CANNOT READ (a '## File footprint'
 heading naming no path, a WIP-CLAIMS line or wip_claims value that yields none)
@@ -513,14 +513,36 @@ def fetch_bead_comments(bead_id: str) -> list[dict]:
     dispatched worker. A fetch failure degrades to no comments rendered
     (warned to stderr, not raised) rather than aborting the whole spawn —
     comments are additive context, not a spawn precondition."""
-    r = subprocess.run(["bd", "comments", bead_id, "--json"],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
+    try:
+        r = subprocess.run(["bd", "comments", bead_id, "--json"],
+                           capture_output=True, text=True)
+    except OSError as exc:
+        cause = str(exc).strip() or type(exc).__name__
         sys.stderr.write(
             f"sable-spawn-worker: could not fetch comments for {bead_id}: "
-            f"{r.stderr.strip()}\n")
+            f"{cause}\n")
         return []
-    return parse_bead_list(r.stdout)
+    if r.returncode != 0:
+        cause = (r.stderr or "").strip()
+        if not cause:
+            cause = f"bd comments failed with exit status {r.returncode}"
+        sys.stderr.write(
+            f"sable-spawn-worker: could not fetch comments for {bead_id}: "
+            f"{cause}\n")
+        return []
+    try:
+        payload = json.loads(r.stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        sys.stderr.write(
+            f"sable-spawn-worker: could not parse comments for {bead_id}: "
+            f"{exc}\n")
+        return []
+    if not isinstance(payload, list):
+        sys.stderr.write(
+            f"sable-spawn-worker: could not parse comments for {bead_id}: "
+            "bd comments returned a non-list JSON value\n")
+        return []
+    return [item for item in payload if isinstance(item, dict)]
 
 
 # Tab-delimited @sable_bead + @sable_status dump for dispatch-evidence detection
@@ -816,7 +838,7 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict],
     wait for the in-progress bead to clear, or name the overlapping bead(s) in
     an explicit 'Serialize-with: <bead-id>' line (bead notes/description) — that
     ALLOWS the dispatch, and the caller tags both beads' `serialize_with`
-    metadata so Chuck's for-chuck handoff sequences the merges together. Naming
+    metadata so Chuck's integration handoff sequences the merges together. Naming
     an unrelated bead in Serialize-with does not launder an uncovered overlap:
     every overlap hit must be covered, or the whole dispatch still denies.
     Same-bead duplication is handled separately (blocking) by
@@ -1606,8 +1628,8 @@ def resolve_lane(override: str | None) -> str:
     """The identity to stamp on the worker = the invoking LANE MANAGER. Explicit
     --lane wins; else this process's CLAUDE_AGENT_NAME (the manager pane that ran
     sable-spawn-worker); else empty. The worker must carry a MANAGER identity
-    because post-push-merge-notify (which files the for-chuck handoff) fires only
-    for managers (SABLE-bldh.13)."""
+    because post-push-merge-notify (which notifies Chuck directly and files a
+    durable fallback only when needed) fires only for managers (SABLE-bldh.13)."""
     if override:
         return override.strip()
     return (
@@ -1652,7 +1674,7 @@ def worker_env_args(lane: str, provider: str = "claude") -> list[str]:
 
     Three purposes, deliberately separated:
       * Lane identity (CLAUDE_AGENT_NAME=<lane> + manager role): stamped so the
-        worker's push fires the manager-gated for-chuck handoff attributed to the
+        worker's push fires the manager-gated Chuck handoff attributed to the
         lane, not the session-default lincoln (SABLE-bldh.13). Without it the
         worker inherits the tmux SESSION env (CLAUDE_AGENT_NAME=lincoln, set by
         sable-tmux's `new-session -e`). Omitted when no lane is resolvable.
@@ -1998,7 +2020,12 @@ them the same form:
 - Rebase on the base branch, commit, and push YOUR OWN branch with plain
   `git push` from this CWD. NEVER use `git -C <other-tree>` — your CWD is the
   worktree (this deletes the SABLE-041 wrong-tree bug). Do NOT bypass pre-push.
-- The post-push hook files the for-chuck handoff; Chuck merges. You do NOT open PRs.
+- After your push, the PRIMARY handoff is a direct tmux notification to Chuck.
+  The post-push hook creates a durable `for-chuck` fallback bead
+  ONLY if direct delivery fails.
+  No fallback bead is the healthy expected outcome; its absence means direct
+  delivery succeeded, not that the handoff was missed. Chuck merges. You do
+  NOT open PRs.
 - State the plant-and-fail verdict in your close evidence — required on every
   close, regardless of whether this dispatch prompt happened to ask for it
   (SABLE-4jogz: an unreported verdict is indistinguishable from an

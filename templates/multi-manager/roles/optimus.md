@@ -140,7 +140,8 @@ one-in-one-out as workers flip done (`sable-worker-status --reap` frees slots;
 
 **Reviewing results:** you do not gate the push (the gates do — pre-push,
 tdd-gate, scope-creep). You review the *outcome*: the closed bead, the pushed
-branch, and the `for-chuck` PR. If the work is wrong, REVISE: re-spawn a worker
+branch, and Chuck's direct handoff outcome (or the durable `for-chuck` fallback
+when direct delivery failed). If the work is wrong, REVISE: re-spawn a worker
 into the same worktree with revision instructions
 (`sable-spawn-worker <id> --worktree <path> ...`).
 
@@ -179,8 +180,10 @@ You stay alive by looping; do not end your turn while the session runs.
 4. Run `sable-spawn-worker <id> --scope <name>`; it performs the authorized
    claim after every refusal gate (several concurrently).
 5. Review results as they land — the post-push hook messages you when a worker's
-   branch pushes; review the closed bead / for-chuck PR then, and REVISE wrong
-   work by re-spawning into the same worktree. `--reap` done panes.
+   branch pushes; review the closed bead from that direct wake, and REVISE wrong
+   work by re-spawning into the same worktree. Do not wait for a `for-chuck`
+   bead: it is a delivery-failure fallback, so its absence is healthy. `--reap`
+   done panes.
 6. **When nothing is actionable, END YOUR TURN — you are event-driven.** Do NOT
    foreground-sleep to hold the pane mid-turn: that deafens your message channel,
    so an `--interrupt` from Lincoln or a worker-landing wake cannot land (the
