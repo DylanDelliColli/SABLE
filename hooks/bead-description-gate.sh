@@ -31,6 +31,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 
@@ -59,7 +60,27 @@ except Exception:
     sys.exit(0)
 
 command = (payload.get("tool_input") or {}).get("command", "") or ""
-if not command or not command.startswith("bd create"):
+if not command:
+    sys.exit(0)
+
+# These exact argv vectors only inspect create usage. Tokenize instead of
+# comparing source spelling so equivalent whitespace/quoting remains benign.
+# punctuation_chars makes shell compounds/redirections additional tokens, so a
+# help vector cannot exempt another command in the same Bash invocation.
+try:
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    command_argv = list(lexer)
+except ValueError:
+    command_argv = []
+if command_argv[:2] != ["bd", "create"]:
+    sys.exit(0)
+if command_argv in (
+    ["bd", "create"],
+    ["bd", "create", "-h"],
+    ["bd", "create", "--help"],
+):
     sys.exit(0)
 
 if re.search(r"--type(?:=| )?epic", command, re.IGNORECASE):

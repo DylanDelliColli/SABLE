@@ -122,6 +122,38 @@ assert_allow "default: complete description allowed" "" "bd create --title=foo -
 
 MANAGER_ENV="CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager"
 
+# ---------- Simple create inspection commands (SABLE-gjorq) ----------
+
+assert_allow "inspection: bare bd create allowed" "$MANAGER_ENV" \
+  "bd create"
+assert_allow "inspection: bd create -h allowed" "$MANAGER_ENV" \
+  "bd create -h"
+assert_allow "inspection: bd create --help allowed" "$MANAGER_ENV" \
+  "bd create --help"
+assert_allow "inspection: whitespace-equivalent bd create --help allowed" "$MANAGER_ENV" \
+  "bd create    --help"
+assert_allow "inspection: whitespace between bd/create remains argv-equivalent" "$MANAGER_ENV" \
+  "bd    create --help"
+assert_allow "inspection: quoted --help argv allowed" "$MANAGER_ENV" \
+  "bd create '--help'"
+assert_deny "inspection: compound help plus real create remains denied" "$MANAGER_ENV" \
+  "bd create --help && bd create --title=real" \
+  "no --description"
+assert_deny "inspection: whitespace-equivalent help plus real create remains denied" "$MANAGER_ENV" \
+  "bd create    --help;bd create --title=real" \
+  "no --description"
+assert_deny "inspection: quoted help plus real create remains denied" "$MANAGER_ENV" \
+  "bd create '--help' || bd create --title=real" \
+  "no --description"
+assert_deny "inspection: actual create without description remains denied" "$MANAGER_ENV" \
+  "bd create --title=real" \
+  "no --description"
+assert_deny "inspection: spaced real create without description remains denied" "$MANAGER_ENV" \
+  "bd    create --title=real" \
+  "no --description"
+assert_allow "inspection: actual create with adequate description remains allowed" "$MANAGER_ENV" \
+  "bd create --title=real --labels=origin:planned --description=\"Update hooks/bead-description-gate.sh. Test in hooks/test/test-bead-description-gate.sh.\""
+
 # Test 6: missing description in manager mode → DENY
 assert_deny "manager: missing description denied" "$MANAGER_ENV" "bd create --title=foo" "no --description"
 
