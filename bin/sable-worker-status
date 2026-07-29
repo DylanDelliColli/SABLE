@@ -842,6 +842,37 @@ def main(argv: list[str] | None = None) -> int:
     workers = scoped_workers(all_workers, view_lane)
     workers = flag_rate_limit_stalls(workers, socket)
     dnd_panes = {w["pane"] for w in done_no_deliverable(workers)}
+    reap_report = None
+
+    if ns.reap:
+        doomed = reaping_decision(workers)
+        protected_count = len(doomed)
+        doomed = filter_protected(doomed, socket)
+        # SABLE-to8m/k8o5: after the attached-client guard, drop any candidate
+        # whose live process is an interactive agent (cockpit OR manager) resumed
+        # into a stale-done window — never kill a live claude we didn't spawn as a
+        # worker.
+        doomed = filter_live_agents(doomed, socket)
+        protected_count -= len(doomed)
+        flagged = reap(doomed, socket)
+        note = f", {len(flagged)} had pending input cleared+flagged" if flagged else ""
+        dnd_note = (f", {len(dnd_panes)} producer(s) done-no-deliverable (not reaped)"
+                    if dnd_panes else "")
+        protected_note = (f", {protected_count} pane(s) left for next sweep "
+                           "(attached client's current window)" if protected_count else "")
+        reap_report = (
+            f"sable-worker-status: reaped {len(doomed)} done pane(s)"
+            f"{note}{dnd_note}{protected_note}\n")
+
+        # SABLE-xyb92: reap mutates tmux synchronously, so the first confirmed
+        # snapshot is valid for the safety decision but stale for reporting.
+        # Read and classify the live state again rather than merely filtering
+        # doomed pane IDs: surviving panes may have changed state concurrently.
+        all_workers = list_workers_confirmed(socket, session=session, interval=interval)
+        workers = scoped_workers(all_workers, view_lane)
+        workers = flag_rate_limit_stalls(workers, socket)
+        dnd_panes = {w["pane"] for w in done_no_deliverable(workers)}
+
     # SABLE-h1fa7: the scope actually applied, and how many panes it did NOT
     # show, computed BEFORE anything prints — on every invocation, not just
     # the already-empty case empty_worker_message covers.
@@ -895,25 +926,8 @@ def main(argv: list[str] | None = None) -> int:
             f"dialog/overlay, silently absorbing messages — {names}. Dismiss (Esc) "
             f"or nudge each; nothing was auto-cleared (SABLE-axp0 v1 is detect-only).\n")
 
-    if ns.reap:
-        doomed = reaping_decision(workers)
-        protected_count = len(doomed)
-        doomed = filter_protected(doomed, socket)
-        # SABLE-to8m/k8o5: after the attached-client guard, drop any candidate
-        # whose live process is an interactive agent (cockpit OR manager) resumed
-        # into a stale-done window — never kill a live claude we didn't spawn as a
-        # worker.
-        doomed = filter_live_agents(doomed, socket)
-        protected_count -= len(doomed)
-        flagged = reap(doomed, socket)
-        note = f", {len(flagged)} had pending input cleared+flagged" if flagged else ""
-        dnd_note = (f", {len(dnd_panes)} producer(s) done-no-deliverable (not reaped)"
-                    if dnd_panes else "")
-        protected_note = (f", {protected_count} pane(s) left for next sweep "
-                           "(attached client's current window)" if protected_count else "")
-        sys.stderr.write(
-            f"sable-worker-status: reaped {len(doomed)} done pane(s)"
-            f"{note}{dnd_note}{protected_note}\n")
+    if reap_report is not None:
+        sys.stderr.write(reap_report)
     return 0
 
 

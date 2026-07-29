@@ -202,6 +202,12 @@ def test_reap_kills_only_done_pane(sock):
 
     r = _run(sock, "--reap")
     assert r.returncode == 0, r.stderr
+    assert "reaped 1 done pane(s)" in r.stderr
+    # SABLE-xyb92: this invocation's table must describe the post-reap tmux
+    # state. The running pane is the positive control; the killed pane must not
+    # remain in stdout from the pre-reap decision snapshot.
+    assert "bead-run" in r.stdout and "running" in r.stdout
+    assert "bead-done" not in r.stdout
     assert _pane_count(sock) == 1  # only the running worker survives
     survivors = _tmux(sock, "list-panes", "-a", "-F", "#{@sable_bead}").stdout
     assert "bead-run" in survivors
