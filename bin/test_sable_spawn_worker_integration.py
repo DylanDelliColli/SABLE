@@ -2351,6 +2351,16 @@ def real_bd_template(tmp_path_factory):
     dispatch-prep brief for this bead is explicit that stray scratch beads feed
     the very overlap_check under repair. Build the cold baseline once; each
     consumer receives a deep copy from ``real_bd_repo`` below."""
+    # The module's autouse skip guard cannot cover this: it is function-scoped,
+    # and pytest resolves this SESSION-scoped fixture first, so in a bd-less
+    # environment we reach the subprocess call before any skip can fire. The
+    # returncode check below is likewise unreachable — a missing binary raises
+    # FileNotFoundError rather than returning nonzero. That is why the CI clean
+    # room (python + tmux only, deliberately NO bd) reported 6 ERRORS instead of
+    # 6 skips, breaking the ci-verify contract that every test must pass or
+    # self-skip there (SABLE-59zu).
+    if not HAVE_BD:
+        pytest.skip("needs bd")
     repo = tmp_path_factory.mktemp("spawn-worker-real-bd-template")
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     init = subprocess.run(["bd", "init", "--prefix", "FZTEST"],

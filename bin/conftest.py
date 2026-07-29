@@ -29,6 +29,50 @@ from pathlib import Path
 
 import pytest
 
+# --- hermetic fleet environment (SABLE-4gxef) --------------------------------
+# The suite is routinely run from INSIDE a live SABLE pane, and a large part of
+# it resolves identity and mode from the ambient environment. Without this
+# fixture the results depend on who is running it and what the fleet is doing:
+# measured 2026-07-29, a full run inside the lincoln pane of an executing
+# all-Codex fleet produced 59 failures, and the SAME tree produced 0 once these
+# variables were cleared. That is the worst possible property for a commit
+# gate — it is reddest exactly when the fleet is busiest, and a real regression
+# would be indistinguishable from the ambient noise.
+#
+# Cleared rather than set: a test that needs an identity or a mode state
+# establishes its own (six modules already set SABLE_MODE_STATE themselves and
+# still win, since their setenv runs after this fixture).
+_AMBIENT_FLEET_ENV = (
+    "SABLE_AGENT_NAME",
+    "CLAUDE_AGENT_NAME",
+    "SABLE_AGENT_ROLE",
+    "CLAUDE_AGENT_ROLE",
+    "SABLE_PROVIDER",
+    "SABLE_BEAD",
+    "SABLE_WORKER_PANE",
+    "TMUX",
+)
+
+
+# A path that must never exist. Deliberately NOT tmp_path: this fixture is
+# autouse, so depending on tmp_path would force pytest to create a temporary
+# directory for EVERY test in the suite — thousands of them — purely to name a
+# file none of them opens. The fixture needs a non-existent path, not a real
+# directory, and CI minutes are hard-won (the pipeline was brought from 9m to
+# 4m over ~15 hours).
+_ABSENT_MODE_STATE = "/nonexistent/sable-hermetic/absent-mode-state.json"
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_fleet_env(monkeypatch):
+    """Detach every test from the ambient fleet: no inherited agent identity,
+    no live tmux client, and a mode-state path that deliberately does not
+    exist (so mode reads report 'no execution session' rather than picking up
+    whatever the operator's fleet is mid-drain)."""
+    for name in _AMBIENT_FLEET_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SABLE_MODE_STATE", _ABSENT_MODE_STATE)
+
 MAX_ORDINARY_TEST_SECONDS = 10.0
 MAX_ORDINARY_MODULE_SECONDS = 45.0
 _MEASURED_SLOW_DECLARATION = re.compile(

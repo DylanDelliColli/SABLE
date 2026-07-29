@@ -126,6 +126,37 @@ def test_interactive_codex_command_supports_the_worker_lifecycle():
     assert " exec " not in command
 
 
+def test_codex_command_grants_writable_roots_for_git(tmp_path):
+    """SABLE-82k8m: Codex's workspace-write sandbox makes .git READ-ONLY even
+    though it sits INSIDE the workspace — a deliberate, separate exclusion,
+    proven by probe: granting an unrelated root leaves .git blocked while
+    naming it explicitly unblocks it. Without this grant `git fetch` dies on
+    FETCH_HEAD and no worker can self-push."""
+    command = interactive_command(
+        "codex", "sonnet", cwd=str(tmp_path),
+        writable_roots=["/repo/.git"],
+    )
+    assert "sandbox_workspace_write.writable_roots=" in command
+    assert "/repo/.git" in command
+
+
+def test_codex_command_omits_writable_roots_when_none_requested():
+    """No grant unless asked — the sandbox stays as tight as it started."""
+    command = interactive_command("codex", "sonnet")
+    assert "writable_roots" not in command
+
+
+def test_claude_command_ignores_writable_roots(tmp_path):
+    """REGRESSION: writable_roots is a Codex sandbox concept. It must never
+    leak into the Claude command, which has no such flag."""
+    command = interactive_command(
+        "claude", "sonnet", cwd=str(tmp_path),
+        writable_roots=["/repo/.git"],
+    )
+    assert "writable_roots" not in command
+    assert "/repo/.git" not in command
+
+
 def test_execution_provider_reads_frozen_state(tmp_path, monkeypatch):
     state = tmp_path / "mode.json"
     state.write_text(
