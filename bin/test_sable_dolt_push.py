@@ -364,3 +364,7 @@ def test_do_push_non_dangling_failure_does_not_retry_or_bounce():
     assert rc == sdp.EXIT_PUSH_FAIL
     assert run.count("push") == 1              # no retry on a non-dangling error
     assert run.count("bounce") == 0
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

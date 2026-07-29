@@ -9,6 +9,10 @@ in the pane, not just assumed from a zero exit code), and SABLE-6izz
 manager-name lookups never fall through to a worker pane's bead tag).
 """
 import importlib.util
+import json
+import os
+import re
+import shutil
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
@@ -31,19 +35,56 @@ import sable_pane_lib  # noqa: E402
 # --- header / message formatting -------------------------------------------
 
 def test_format_message_basic():
-    msg = sable_msg.format_message("optimus", "lincoln", "API epic is urgent")
-    assert msg == "⟦SABLE-MSG⟧ from=optimus to=lincoln :: API epic is urgent"
+    msg = sable_msg.format_message("optimus", "lincoln", "API epic is urgent", 0.0)
+    assert msg == ("⟦SABLE-MSG⟧ from=optimus to=lincoln :: API epic is urgent "
+                   "[composed=1970-01-01T00:00:00Z]")
 
 
 def test_format_message_collapses_newlines_and_runs():
-    msg = sable_msg.format_message("lincoln", "optimus", "drop auth\n\n  do API   now")
+    msg = sable_msg.format_message("lincoln", "optimus", "drop auth\n\n  do API   now", 0.0)
     # newlines/extra spaces collapse to single spaces -> single-line, single turn
-    assert msg == "⟦SABLE-MSG⟧ from=lincoln to=optimus :: drop auth do API now"
+    assert msg == ("⟦SABLE-MSG⟧ from=lincoln to=optimus :: drop auth do API now "
+                   "[composed=1970-01-01T00:00:00Z]")
     assert "\n" not in msg
 
 
 def test_header_glyph_present():
     assert sable_msg.HEADER == "⟦SABLE-MSG⟧"
+
+
+# --- composition timestamp (SABLE-xwy0b) ------------------------------------
+
+def test_compose_timestamp_is_utc_iso8601():
+    assert sable_msg.compose_timestamp(0.0) == "1970-01-01T00:00:00Z"
+    assert sable_msg.compose_timestamp(1_700_000_000.0) == "2023-11-14T22:13:20Z"
+
+
+def test_format_message_carries_a_composition_timestamp_distinguishable_from_arrival():
+    # Fresh-Agent-Test spec item: every rendered message carries a composition
+    # timestamp. It is embedded in the HEADER (what's actually typed into the
+    # recipient's pane), not merely logged to the sender's stderr — the
+    # recipient never sees the sender's stderr, so anything less than this
+    # would not be "legible" to the recipient at all.
+    msg = sable_msg.format_message("lincoln", "optimus", "cap in force", 1_700_000_000.0)
+    assert "composed=2023-11-14T22:13:20Z" in msg
+    # distinguishable from arrival time: composed= is the ONLY timestamp in
+    # the header, fixed at send time -- nothing here is filled in on receipt.
+    assert msg.count("composed=") == 1
+
+
+def test_message_identity_is_format_message_without_the_composed_suffix():
+    # message_identity is what gets typed's IDENTITY for matching purposes
+    # (SABLE-xwy0b): the same (frm, to, body) must always produce the same
+    # identity regardless of when it was composed, and it must be an exact
+    # PREFIX of format_message's output so sable_pane_lib's substring-based
+    # matching (dispatch_landed / _already_pending) still finds it.
+    identity = sable_msg.message_identity("lincoln", "optimus", "cap in force")
+    assert identity == "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
+    full_a = sable_msg.format_message("lincoln", "optimus", "cap in force", 1000.0)
+    full_b = sable_msg.format_message("lincoln", "optimus", "cap in force", 2000.0)
+    assert full_a.startswith(identity)
+    assert full_b.startswith(identity)
+    assert full_a != full_b, "different composed_at must still change the full message"
 
 
 # --- registry parsing (tmux list-panes output) ------------------------------
@@ -69,13 +110,22 @@ def test_parse_panes_first_wins_on_duplicate_role():
 
 
 @pytest.fixture(autouse=True)
-def _pin_session(monkeypatch):
+def _pin_session(monkeypatch, tmp_path):
     """Keep every test hermetic: main() resolves the target session per-repo
     (SABLE-e1e3.3), which would consult the real tmux server — the env
     override short-circuits that. The recipient identity cross-check (SABLE-to8m)
     would likewise shell to the real tmux server + /proc, so it is stubbed to
-    None (no poisoning) by default; the cross-check's own test overrides it."""
+    None (no poisoning) by default; the cross-check's own test overrides it.
+
+    SABLE_MSG_STATE_DIR (SABLE-xwy0b) is pinned to a fresh tmp_path per test:
+    the supersession generation counter is a real on-disk file keyed by
+    (frm, to), and most tests here reuse the same lincoln/optimus pair —
+    without per-test isolation every test's registration would pile onto ONE
+    shared real-filesystem counter across the whole suite (and across
+    repeated local runs), which is exactly the kind of cross-test state
+    leakage that makes failures nondeterministic."""
     monkeypatch.setenv("SABLE_TMUX_SESSION", "s")
+    monkeypatch.setenv("SABLE_MSG_STATE_DIR", str(tmp_path / "sable-msg-freshness"))
     monkeypatch.setattr(sable_msg, "recipient_identity", lambda pane, socket=None: None)
 
 
@@ -191,7 +241,15 @@ def test_resolve_from_manager_pane_keeps_lane_name_regression_guard(monkeypatch)
     assert sable_msg.resolve_from() == "tarzan"
 
 
+def test_resolve_from_prefers_provider_neutral_manager_identity(monkeypatch):
+    monkeypatch.delenv("SABLE_WORKER_PANE", raising=False)
+    monkeypatch.setenv("SABLE_AGENT_NAME", "optimus")
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "wrong")
+    assert sable_msg.resolve_from() == "optimus"
+
+
 def test_resolve_from_operator_default_when_nothing_set(monkeypatch):
+    monkeypatch.delenv("SABLE_AGENT_NAME", raising=False)
     monkeypatch.delenv("SABLE_WORKER_PANE", raising=False)
     monkeypatch.delenv("CLAUDE_AGENT_NAME", raising=False)
     assert sable_msg.resolve_from() == "operator"
@@ -335,6 +393,86 @@ def test_file_fallback_bead_creates_for_role_inbox_bead():
     joined = " ".join(argv)
     assert "for-optimus" in joined
     assert message in joined
+    assert "coord" in joined
+
+
+def test_file_fallback_bead_is_not_filed_p1():
+    """costing-comparison-573: an undelivered-message bead is an INBOX item, not
+    a work item. Filing it P1 sorted it ABOVE genuine P1 engineering work in
+    `bd ready` — one measured pool held 26 items of which 11 were these, all
+    outranking the real work. The fallback itself is correct and must keep
+    existing: it is what made this session's tmux delivery failures lossless.
+    Only its priority is wrong."""
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-ab12\n"
+        stderr = ""
+
+    def runner(args):
+        seen.append(args)
+        return R()
+
+    sable_msg.file_fallback_bead("lincoln", "optimus", "body", runner=runner)
+    argv = seen[0]
+    assert "--priority=1" not in argv, (
+        "fallback inbox beads must not be P1 — they bury real engineering work "
+        "in bd ready (costing-comparison-573)"
+    )
+    assert "--priority=3" in argv
+    # The for-ROLE label is how the recipient actually reads their inbox, so it
+    # must survive any change to pool membership.
+    assert "--labels=for-optimus,coord" in argv
+
+
+def test_fallback_bead_title_is_composed_from_the_framed_message_3mrv3():
+    """SABLE-3mrv3 regression. A recogniser for "did the fallback pollute the
+    live DB?" needs the bead's title. The first attempt hand-typed it as
+    '<prefix> <role>: <body>' — but every real call site passes the FRAMED
+    message, so the framing sits BETWEEN the role and the body and the guess
+    matched nothing. `bd count --title-contains <guess>` then returned 0
+    unconditionally: an assertion that could not fail, which is worse than the
+    global counter it replaced because it looks like coverage.
+
+    Pin both directions: the composed title is what file_fallback_bead actually
+    uses, and the naive hand-typed form is NOT a substring of it."""
+    body = "sandbox fallback probe"
+    framed = sable_msg.format_message("lincoln", "chuck", body, 0.0)
+    title = sable_msg.fallback_bead_title("chuck", framed)
+
+    assert title == f"SABLE-MSG undelivered to chuck: {framed[:80]}"
+    assert sable_msg.HEADER in title, "the framing must be present in the title"
+    assert body in title
+
+    naive = f"SABLE-MSG undelivered to chuck: {body}"
+    assert naive not in title, (
+        "the hand-typed '<prefix> <role>: <body>' form must NOT match — if it "
+        "ever does, the SABLE-3mrv3 trap has silently reopened"
+    )
+
+
+def test_file_fallback_bead_uses_the_shared_title_and_label_helpers_3mrv3():
+    """The seam is only useful if the filer and the recogniser cannot drift:
+    file_fallback_bead must emit exactly what fallback_bead_title /
+    fallback_bead_labels produce, so a test deriving the title from those
+    helpers is guaranteed to match a real fallback bead."""
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-ab12\n"
+        stderr = ""
+
+    def runner(args):
+        seen.append(args)
+        return R()
+
+    framed = sable_msg.format_message("lincoln", "chuck", "sandbox fallback probe", 0.0)
+    sable_msg.file_fallback_bead("lincoln", "chuck", framed, runner=runner)
+    argv = seen[0]
+    assert f"--title={sable_msg.fallback_bead_title('chuck', framed)}" in argv
+    assert f"--labels={sable_msg.fallback_bead_labels('chuck')}" in argv
 
 
 def test_file_fallback_bead_returns_none_when_bd_unavailable():
@@ -345,6 +483,288 @@ def test_file_fallback_bead_returns_none_when_bd_unavailable():
 
     assert sable_msg.file_fallback_bead("lincoln", "optimus", "msg",
                                         runner=lambda a: R()) is None
+
+
+# --- seat sightings (SABLE-441vl) -------------------------------------------
+#
+# CAPTURE IS MANDATORY, PRIORITY IS ADVISORY (cockpit ruling, 2026-07-22
+# 16:23, recorded as a comment on SABLE-441vl — NOT in its description, which
+# is why an earlier pass here built the wrong thing: a DENY hook on the
+# premise the seat cannot create beads at all. That premise is measured
+# FALSE). `--file-sighting` performs one plain `bd create`, never refused or
+# deferred; hooks/multi-manager/seat-sighting-gate.sh annotates the result
+# AFTER it lands by recognizing either a raw chuck-identity `bd create` event
+# or this wrapper's own top-level PostToolUse event.
+
+def test_file_sighting_bead_is_a_single_plain_create():
+    """One bd call, not two: capture is mandatory, so there is nothing to
+    defer and nothing to promote later."""
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-ab12\n"
+        stderr = ""
+
+    def runner(args):
+        seen.append(args)
+        return R()
+
+    bead_id = sable_msg.file_sighting_bead(
+        "chuck", "found a defect while verifying wk-foo", runner=runner)
+    assert bead_id == "SABLE-ab12"
+    assert len(seen) == 1
+    argv = seen[0]
+    assert argv[:2] == ["bd", "create"]
+    joined = " ".join(argv)
+    assert "SEAT-FILED:" in joined
+    assert "found a defect while verifying wk-foo" in joined
+    assert not any(a.startswith("--status") for a in argv), \
+        "capture is mandatory — a sighting must never be deferred"
+
+
+def test_file_sighting_bead_propagates_explicit_p1_to_bd_create():
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-p1\n"
+        stderr = ""
+
+    bead_id = sable_msg.file_sighting_bead(
+        "chuck",
+        "urgent seat observation",
+        priority=1,
+        runner=lambda args: seen.append(args) or R(),
+    )
+
+    assert bead_id == "SABLE-p1"
+    assert "--priority=1" in seen[0]
+
+
+def test_file_sighting_bead_defaults_to_p2_in_bd_create():
+    seen = []
+
+    class R:
+        returncode = 0
+        stdout = "Created issue: SABLE-p2\n"
+        stderr = ""
+
+    bead_id = sable_msg.file_sighting_bead(
+        "chuck",
+        "ordinary seat observation",
+        runner=lambda args: seen.append(args) or R(),
+    )
+
+    assert bead_id == "SABLE-p2"
+    assert "--priority=2" in seen[0]
+
+
+def test_file_sighting_bead_returns_none_when_bd_unavailable():
+    class R:
+        returncode = 1
+        stdout = ""
+        stderr = "bd: not a beads workspace"
+
+    assert sable_msg.file_sighting_bead("chuck", "text", runner=lambda a: R()) is None
+
+
+def test_sighting_bead_title_truncates_and_prefixes():
+    title = sable_msg.sighting_bead_title("x" * 200)
+    assert title.startswith(f"{sable_msg.SIGHTING_TITLE_PREFIX}: ")
+    assert title == f"{sable_msg.SIGHTING_TITLE_PREFIX}: {'x' * 80}"
+
+
+def test_main_file_sighting_bypasses_pane_lookup_entirely(monkeypatch, capsys):
+    """--file-sighting is a bd write, not a message: it must never touch
+    tmux/session resolution at all."""
+    monkeypatch.setattr(sable_msg, "resolve_session", lambda *a, **k: pytest.fail(
+        "a sighting must not resolve a tmux session"))
+    monkeypatch.setattr(sable_msg, "file_sighting_bead", lambda frm, text, **k: "SABLE-xyz")
+    rc = sable_msg.main(["--file-sighting", "--from", "chuck", "an observation"])
+    assert rc == 0
+    assert "SABLE-xyz" in capsys.readouterr().err
+
+
+def test_main_file_sighting_propagates_and_echoes_explicit_priority(monkeypatch, capsys):
+    received = {}
+
+    def file_sighting(frm, text, *, priority, **kwargs):
+        received.update(frm=frm, text=text, priority=priority)
+        return "SABLE-priority"
+
+    monkeypatch.setattr(sable_msg, "resolve_session", lambda *a, **k: pytest.fail(
+        "a sighting must not resolve a tmux session"))
+    monkeypatch.setattr(sable_msg, "file_sighting_bead", file_sighting)
+
+    rc = sable_msg.main([
+        "--file-sighting",
+        "--priority=1",
+        "--from",
+        "chuck",
+        "urgent observation",
+    ])
+
+    assert rc == 0
+    assert received == {
+        "frm": "chuck",
+        "text": "urgent observation",
+        "priority": 1,
+    }
+    assert "priority P1" in capsys.readouterr().err
+
+
+def test_main_file_sighting_reports_failure_and_a_manual_fallback(monkeypatch, capsys):
+    monkeypatch.setattr(sable_msg, "resolve_session", lambda *a, **k: pytest.fail(
+        "a sighting must not resolve a tmux session"))
+    monkeypatch.setattr(sable_msg, "file_sighting_bead", lambda frm, text, **k: None)
+    rc = sable_msg.main([
+        "--file-sighting",
+        "--priority=1",
+        "--from",
+        "chuck",
+        "an observation",
+    ])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "could not file" in err
+    assert "--priority=1" in err
+
+
+def test_parse_args_file_sighting_treats_the_single_positional_as_body():
+    """--file-sighting takes no to_role — argparse fills the first optional
+    positional (to_role) greedily, so parse_args must re-route it into body."""
+    ns = sable_msg.parse_args(["--file-sighting", "an observation body"])
+    assert ns.to_role is None
+    assert ns.body == "an observation body"
+
+
+def test_parse_args_still_requires_to_role_without_file_sighting():
+    with pytest.raises(SystemExit):
+        sable_msg.parse_args(["--body-file", "-"])
+
+
+SEAT_GATE_HOOK = Path(__file__).resolve().parent.parent / "hooks" / "multi-manager" / "seat-sighting-gate.sh"
+
+
+def _run_seat_gate(
+        command, agent_name, agent_role="manager", stdout="", stderr="",
+        extra_env=None):
+    env = dict(os.environ)
+    if agent_name:
+        env["CLAUDE_AGENT_NAME"] = agent_name
+        env["CLAUDE_AGENT_ROLE"] = agent_role or ""
+    else:
+        env.pop("CLAUDE_AGENT_NAME", None)
+        env.pop("CLAUDE_AGENT_ROLE", None)
+    env.update(extra_env or {})
+    hook_input = json.dumps({
+        "tool_input": {"command": command},
+        "tool_response": {"stdout": stdout, "stderr": stderr},
+    })
+    return subprocess.run(["bash", str(SEAT_GATE_HOOK)], input=hook_input, text=True,
+                          capture_output=True, env=env, timeout=10)
+
+
+def test_seat_gate_never_denies_a_normal_work_bd_create():
+    """THE property SABLE-441vl is accepted or rejected on, corrected against
+    the actual cockpit ruling: capture is MANDATORY, so a plain work `bd
+    create` from the seat's own identity must NEVER be refused. (An earlier,
+    wrong pass here asserted the opposite — that this must be denied unless
+    labeled a sighting. The ruling that reopened this bead exists precisely
+    because that premise was measured false.)"""
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    result = _run_seat_gate(
+        'bd create --title="fix the thing" --description="foo bar" --type=task',
+        agent_name="chuck", stdout="Created issue: SABLE-ab12 — fix the thing\n")
+    assert result.returncode == 0
+    assert "deny" not in result.stdout
+
+
+def test_seat_gate_ignores_non_seat_identities():
+    """Every other manager's `bd create` — the ordinary work-filing path —
+    must pass through untouched. This hook has exactly one job."""
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    result = _run_seat_gate(
+        'bd create --title="fix the thing" --description="foo bar" --type=task',
+        agent_name="optimus", stdout="Created issue: SABLE-ab12 — fix the thing\n")
+    assert result.returncode == 0
+
+
+def test_seat_gate_ignores_commands_that_are_not_bd_create():
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    result = _run_seat_gate("bd show SABLE-x", agent_name="chuck")
+    assert result.stdout.strip() == ""
+    assert result.returncode == 0
+
+
+def _recording_bd(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    record = tmp_path / "bd-args"
+    fake_bd = fake_bin / "bd"
+    fake_bd.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$@\" > \"$BD_RECORD\"\n"
+    )
+    fake_bd.chmod(0o755)
+    return fake_bin, record
+
+
+def _assert_recorded_sighting_annotation(record):
+    assert record.read_text().splitlines() == [
+        "update",
+        "SABLE-ab12",
+        "--add-label",
+        "seat-filed",
+        "--set-metadata",
+        "priority_provisional=true",
+    ]
+
+
+def test_seat_gate_still_annotates_a_raw_bd_create_event(tmp_path):
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    fake_bin, record = _recording_bd(tmp_path)
+
+    result = _run_seat_gate(
+        "bd create --title='urgent observation' --priority=1",
+        agent_name="chuck",
+        stdout="Created issue: SABLE-ab12 — urgent observation\n",
+        extra_env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "BD_RECORD": str(record),
+        },
+    )
+
+    assert result.returncode == 0
+    _assert_recorded_sighting_annotation(record)
+
+
+def test_seat_gate_annotates_the_real_file_sighting_wrapper_event(tmp_path):
+    if not SEAT_GATE_HOOK.is_file():
+        pytest.skip(f"seat-sighting-gate.sh not found at {SEAT_GATE_HOOK}")
+    fake_bin, record = _recording_bd(tmp_path)
+
+    result = _run_seat_gate(
+        f"{Path(__file__).resolve().parent / 'sable-msg'} "
+        "--file-sighting --priority=1 'urgent observation'",
+        agent_name="chuck",
+        stderr=(
+            "sable-msg: filed SABLE-ab12 — capture is mandatory, this bead is "
+            "live in bd ready now; priority P1 is an estimate pending triage.\n"
+        ),
+        extra_env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "BD_RECORD": str(record),
+        },
+    )
+
+    assert result.returncode == 0
+    _assert_recorded_sighting_annotation(record)
 
 
 # --- deliver_message: stub-tmux retry + verification (SABLE-bq93) -----------
@@ -528,12 +948,18 @@ def test_main_landed_box_frame_send_does_not_double_file_fallback_bead_uh4b(monk
     monkeypatch.setenv("SABLE_MSG_SUBMIT_TRIES", "4")
     monkeypatch.setattr(sable_msg, "lookup_pane",
                         lambda role, run=None, socket=None, session=None: "%2")
+    # Pin _now() so main()'s OWN composed_at matches this test's independently
+    # built `framed` string exactly (SABLE-xwy0b) — the fake pane echoes
+    # `framed` back, and dispatch_landed needs the REAL delivered message
+    # (main()'s) to be a literal substring of that echo.
+    monkeypatch.setattr(sable_msg, "_now", lambda: 1_700_000_000.0)
 
     border = "─" * 128
     cwd = "  ddc@KW-LPT-050:~/dev-environment/wk-idle-pane-landed"
     mode = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
     framed = sable_msg.format_message("lincoln", "optimus",
-                                      "GO push your worktree branch now recovery landed")
+                                      "GO push your worktree branch now recovery landed",
+                                      1_700_000_000.0)
     state = {"typed": False}
 
     class FakeProc:
@@ -647,6 +1073,41 @@ def test_deliver_message_idle_recipient_transitions_to_our_turn_and_lands():
         sleep=lambda s: None, tries=4, interval=0.01,
     )
     assert landed is True
+
+
+@pytest.mark.parametrize(
+    ("provider", "glyph", "message"),
+    [
+        (
+            "codex", "›",
+            "⟦SABLE-MSG⟧ from=optimus to=worker:SABLE-x :: revise the failing test",
+        ),
+        (
+            "claude", "❯",
+            "⟦SABLE-MSG⟧ from=worker:SABLE-x to=optimus :: need an API ruling",
+        ),
+    ],
+)
+def test_cross_provider_manager_worker_messages_land_both_directions(
+    monkeypatch, provider, glyph, message
+):
+    state = {"typed": False}
+    monkeypatch.setattr(sable_msg, "pane_provider_tag", lambda *_args: provider)
+
+    def run(cmd):
+        if "-l" in cmd:
+            state["typed"] = True
+        return True
+
+    def capture():
+        if not state["typed"]:
+            return f"interactive agent\n{glyph} \n  ready"
+        return f"{message}\n• Working (2s · esc to interrupt)\n{glyph} \n"
+
+    assert sable_msg.deliver_message(
+        "%4", message, interrupt=False, run=run, capture=capture,
+        sleep=lambda _seconds: None, tries=2, interval=0.01,
+    )
 
 
 def test_deliver_text_fresh_pane_dispatch_still_lands():
@@ -792,8 +1253,11 @@ def test_main_busy_delayed_land_files_no_fallback_bead_h0jw(monkeypatch):
     monkeypatch.setenv("SABLE_MSG_READY_TIMEOUT", "1")
     monkeypatch.setattr(sable_msg, "lookup_pane",
                         lambda role, run=None, socket=None, session=None: "%2")
+    # Pin _now() (SABLE-xwy0b) so main()'s own composed_at matches this test's
+    # independently built `framed`, which fake_capture echoes back verbatim.
+    monkeypatch.setattr(sable_msg, "_now", lambda: 1_700_000_000.0)
 
-    framed = sable_msg.format_message("lincoln", "optimus", "cap in force")
+    framed = sable_msg.format_message("lincoln", "optimus", "cap in force", 1_700_000_000.0)
     other_turn = "● Running the auth refactor…\n✻ Thinking… (12s · esc to interrupt)"
     state = {"typed": False, "polls": 0}
 
@@ -1301,6 +1765,373 @@ def test_main_bead_addressed_only_done_pane_errors_with_reap_hint_qq6r(monkeypat
     assert "SABLE-pi5m" in err
     assert "done" in err
     assert "reap" in err.lower()
+
+
+# --- --body-file: caller-shell command-substitution hazard (SABLE-tmbx1) ----
+# The inline <body> positional is parsed by the CALLING shell before sable-msg
+# ever sees it: a body composed inside a double-quoted shell argument has its
+# backticks/$(...) command-substituted THERE, and the substituted command
+# actually runs. sable-msg cannot detect this — by the time argv reaches
+# main() the damage is already done. --body-file sidesteps the hazard
+# entirely by reading the body from a file (or stdin), which no shell ever
+# re-parses. These assertions use REAL metacharacter content, not an innocent
+# fixture — an implementation that regressed to string-interpolating the body
+# through a shell somewhere would fail them.
+
+HAZARDOUS_BODY = "see `hostname` and $(id) for the failing host — do not run this"
+
+
+def test_parse_args_body_file_flag_alone():
+    ns = sable_msg.parse_args(["optimus", "--body-file", "/tmp/whatever"])
+    assert ns.body is None
+    assert ns.body_file == "/tmp/whatever"
+
+
+def test_parse_args_body_and_body_file_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        sable_msg.parse_args(["optimus", "inline text", "--body-file", "/tmp/x"])
+
+
+def test_resolve_body_returns_inline_positional_when_no_body_file():
+    ns = sable_msg.parse_args(["optimus", HAZARDOUS_BODY])
+    assert sable_msg.resolve_body(ns) == HAZARDOUS_BODY
+
+
+def test_resolve_body_reads_hazardous_content_from_file_verbatim(tmp_path):
+    body_path = tmp_path / "body.txt"
+    body_path.write_text(HAZARDOUS_BODY, encoding="utf-8")
+    ns = sable_msg.parse_args(["optimus", "--body-file", str(body_path)])
+    assert sable_msg.resolve_body(ns) == HAZARDOUS_BODY
+
+
+def test_resolve_body_reads_hazardous_content_from_stdin_dash():
+    import io
+    ns = sable_msg.parse_args(["optimus", "--body-file", "-"])
+    fake_stdin = io.StringIO(HAZARDOUS_BODY)
+    assert sable_msg.resolve_body(ns, stdin=fake_stdin) == HAZARDOUS_BODY
+
+
+def test_main_body_file_delivers_hazardous_content_unmodified(monkeypatch, tmp_path):
+    # NEGATIVE-CONTROL-SHAPED: this is an equality assertion against literal
+    # backticks/$(...) — a regression that re-introduced shell interpolation
+    # anywhere in this path would corrupt the string and fail it, not pass
+    # vacuously the way a metacharacter-free fixture would.
+    body_path = tmp_path / "body.txt"
+    body_path.write_text(HAZARDOUS_BODY, encoding="utf-8")
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+    monkeypatch.setattr(sable_msg, "_now", lambda: 1_700_000_000.0)
+    delivered = {}
+
+    def fake_deliver(pane, message, interrupt, **kwargs):
+        delivered["message"] = message
+        return True
+
+    monkeypatch.setattr(sable_msg, "deliver_message", fake_deliver)
+    rc = sable_msg.main(["optimus", "--body-file", str(body_path), "--from", "lincoln"])
+    assert rc == 0
+    assert "message" in delivered
+    assert "`hostname`" in delivered["message"]
+    assert "$(id)" in delivered["message"]
+    assert delivered["message"] == sable_msg.format_message(
+        "lincoln", "optimus", HAZARDOUS_BODY, 1_700_000_000.0)
+
+
+def test_body_file_content_never_reaches_a_shell(monkeypatch, tmp_path):
+    # Assert no subprocess is spawned FROM the content of the body at all —
+    # not merely that delivery "looks right". Every subprocess.run call made
+    # anywhere below main() is recorded; none may carry the hazardous
+    # substring or shell=True.
+    import subprocess as subprocess_module
+
+    marker = "$(id)"
+    body_path = tmp_path / "body.txt"
+    body_path.write_text(f"see `hostname` and {marker} now", encoding="utf-8")
+
+    calls = []
+    real_run = subprocess_module.run
+
+    def spying_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_run(["true"], capture_output=True, text=True)
+
+    monkeypatch.setattr(subprocess_module, "run", spying_run)
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
+
+    rc = sable_msg.main(["optimus", "--body-file", str(body_path), "--from", "lincoln"])
+    assert rc == 0
+    for args, kwargs in calls:
+        flat = " ".join(str(a) for a in args)
+        assert marker not in flat
+        assert "hostname" not in flat
+        assert kwargs.get("shell") is not True
+
+
+# --- freshness: supersession + expiry (SABLE-xwy0b) -------------------------
+#
+# A retrying sable-msg can confirm delivery AFTER it has been superseded, and
+# neither the sender nor the recipient has any way to know — the retry loop
+# that verified delivery requires is itself the mechanism. These cover the
+# generation-counter primitives directly, deliver_with_freshness's own
+# early-exit/mid-retry behavior against a stubbed deliver_message, and (per
+# the bundle brief) the LOAD-BEARING negative controls: an over-matching
+# supersession rule that caught a different sender or a different recipient
+# would silently swallow unrelated coordination traffic, which is strictly
+# worse than the defect this bead fixes.
+
+def test_register_composition_increments_generation_per_pair():
+    gen1 = sable_msg.register_composition("lincoln", "optimus", 100.0)
+    gen2 = sable_msg.register_composition("lincoln", "optimus", 101.0)
+    assert gen2 > gen1
+    assert sable_msg.current_generation("lincoln", "optimus") == gen2
+
+
+def test_current_generation_zero_when_never_registered():
+    assert sable_msg.current_generation("nobody", "nowhere") == 0
+
+
+def test_register_composition_scoped_to_exact_sender_recipient_pair_negative_control():
+    # NEGATIVE CONTROL, load-bearing: a different sender to the same
+    # recipient, and the same sender to a different recipient, must NOT share
+    # a generation counter with the (lincoln, optimus) pair under test.
+    sable_msg.register_composition("lincoln", "optimus", 100.0)
+    assert sable_msg.current_generation("tarzan", "optimus") == 0
+    assert sable_msg.current_generation("lincoln", "chuck") == 0
+
+
+def test_register_composition_scoped_by_socket_and_session():
+    # Two isolated fleets (different socket/session) must never share a
+    # counter even for the identical (frm, to) role names (SABLE-e1e3.3-style
+    # scoping, mirrored for this bead's state).
+    sable_msg.register_composition("lincoln", "optimus", 100.0, socket="s1", session="a")
+    assert sable_msg.current_generation("lincoln", "optimus", socket="s2", session="a") == 0
+    assert sable_msg.current_generation("lincoln", "optimus", socket="s1", session="b") == 0
+    assert sable_msg.current_generation("lincoln", "optimus", socket="s1", session="a") == 1
+
+
+# --- deliver_with_freshness: delivery outcomes ------------------------------
+
+def test_deliver_with_freshness_delivers_when_fresh(monkeypatch):
+    monkeypatch.setattr(sable_msg, "_now", lambda: 1000.0)
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
+    outcome = sable_msg.deliver_with_freshness(
+        "%2", "msg body", False, "lincoln", "optimus",
+        composed_at=1000.0, expiry_seconds=300)
+    assert outcome == sable_msg.DELIVERED
+
+
+def test_deliver_with_freshness_reports_undelivered_when_pane_never_confirms(monkeypatch):
+    monkeypatch.setattr(sable_msg, "_now", lambda: 1000.0)
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: False)
+    outcome = sable_msg.deliver_with_freshness(
+        "%2", "msg body", False, "lincoln", "optimus",
+        composed_at=1000.0, expiry_seconds=300)
+    assert outcome == sable_msg.UNDELIVERED
+
+
+# --- deliver_with_freshness: expiry (SABLE-xwy0b) ---------------------------
+
+def test_deliver_with_freshness_expired_message_never_attempts_delivery(monkeypatch):
+    # UNIT spec item: an expired message (composed > N seconds ago) is not
+    # delivered. Checked upfront, before deliver_message is ever called, so a
+    # message that arrives already stale never so much as touches the pane.
+    monkeypatch.setattr(sable_msg, "_now", lambda: 2000.0)
+    attempted = []
+    monkeypatch.setattr(sable_msg, "deliver_message",
+                        lambda *a, **k: attempted.append(1) or True)
+    outcome = sable_msg.deliver_with_freshness(
+        "%2", "msg body", False, "lincoln", "optimus",
+        composed_at=1000.0, expiry_seconds=300)  # 1000s old, 300s window
+    assert outcome == sable_msg.EXPIRED
+    assert attempted == [], "an already-expired message must never attempt delivery"
+
+
+def test_deliver_with_freshness_delivers_inside_the_expiry_window(monkeypatch):
+    # Positive control for the same spec item: inside the window, delivery
+    # proceeds exactly as if expiry did not exist.
+    monkeypatch.setattr(sable_msg, "_now", lambda: 1200.0)
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
+    outcome = sable_msg.deliver_with_freshness(
+        "%2", "msg body", False, "lincoln", "optimus",
+        composed_at=1000.0, expiry_seconds=300)  # 200s old, inside the window
+    assert outcome == sable_msg.DELIVERED
+
+
+def test_deliver_with_freshness_expiry_disabled_by_zero(monkeypatch):
+    monkeypatch.setattr(sable_msg, "_now", lambda: 999999.0)
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
+    outcome = sable_msg.deliver_with_freshness(
+        "%2", "msg body", False, "lincoln", "optimus",
+        composed_at=0.0, expiry_seconds=0)
+    assert outcome == sable_msg.DELIVERED
+
+
+def test_deliver_with_freshness_expires_mid_retry(monkeypatch):
+    # The mid-retry leg of expiry: this send is still polling (not yet
+    # confirmed) when it ages past the window -- it must abort rather than
+    # keep polling toward an eventually-stale confirmation.
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(sable_msg, "_now", lambda: clock["t"])
+
+    def fake_deliver_message(pane, message, interrupt, socket=None, snippet=None, run=None,
+                             capture=None, sleep=None, ready_timeout=0,
+                             tries=8, interval=1.0):
+        for _ in range(tries):
+            clock["t"] += 200.0  # each poll ages the message another 200s
+            sleep(interval)
+        return False
+
+    monkeypatch.setattr(sable_msg, "deliver_message", fake_deliver_message)
+    outcome = sable_msg.deliver_with_freshness(
+        "%2", "hold", False, "lincoln", "optimus", composed_at=1000.0,
+        expiry_seconds=300, sleep=lambda s: None, tries=8, interval=0)
+    assert outcome == sable_msg.EXPIRED
+
+
+# --- deliver_with_freshness: supersession (SABLE-xwy0b) ---------------------
+
+def test_deliver_with_freshness_aborts_mid_retry_when_superseded(monkeypatch):
+    # The core xwy0b repro at the unit level: this send is mid-retry (still
+    # unconfirmed) when a LATER message from the SAME sender to the SAME
+    # recipient is composed -- it must abort and report SUPERSEDED, never
+    # eventually land after its replacement. Simulates deliver_text's own
+    # retry loop, which calls sleep() between every poll.
+    monkeypatch.setattr(sable_msg, "_now", lambda: 1000.0)
+    poll = {"n": 0}
+
+    def fake_deliver_message(pane, message, interrupt, socket=None, snippet=None, run=None,
+                             capture=None, sleep=None, ready_timeout=0,
+                             tries=8, interval=1.0):
+        for _ in range(tries):
+            sleep(interval)
+            poll["n"] += 1
+            if poll["n"] == 2:
+                # A later message from the SAME (frm, to) pair is composed
+                # while we are still mid-retry.
+                sable_msg.register_composition("lincoln", "optimus", 1050.0)
+        return False  # never confirmed landed within this stub
+
+    monkeypatch.setattr(sable_msg, "deliver_message", fake_deliver_message)
+    outcome = sable_msg.deliver_with_freshness(
+        "%2", "hold: push only", False, "lincoln", "optimus", composed_at=1000.0,
+        expiry_seconds=300, sleep=lambda s: None, tries=8, interval=0)
+    assert outcome == sable_msg.SUPERSEDED
+
+
+def test_deliver_with_freshness_not_superseded_when_still_freshest(monkeypatch):
+    # Positive control: nobody else registers -- this send stays the newest
+    # for its (frm, to) pair throughout, so it must deliver normally even
+    # though it is still busy-retrying for a while.
+    monkeypatch.setattr(sable_msg, "_now", lambda: 1000.0)
+
+    def fake_deliver_message(pane, message, interrupt, socket=None, snippet=None, run=None,
+                             capture=None, sleep=None, ready_timeout=0,
+                             tries=8, interval=1.0):
+        for _ in range(3):
+            sleep(interval)
+        return True
+
+    monkeypatch.setattr(sable_msg, "deliver_message", fake_deliver_message)
+    outcome = sable_msg.deliver_with_freshness(
+        "%2", "hold", False, "lincoln", "optimus", composed_at=1000.0,
+        expiry_seconds=300, sleep=lambda s: None, tries=8, interval=0)
+    assert outcome == sable_msg.DELIVERED
+
+
+def test_deliver_with_freshness_different_sender_does_not_supersede_negative_control(monkeypatch):
+    # NEGATIVE CONTROL, load-bearing: a message from a DIFFERENT sender to the
+    # same recipient must NOT suppress this one -- an over-matching
+    # supersession rule would silently swallow unrelated coordination
+    # traffic, converting a stale-message problem into a dropped-message
+    # problem (strictly worse than the defect being fixed).
+    monkeypatch.setattr(sable_msg, "_now", lambda: 1000.0)
+
+    def fake_deliver_message(pane, message, interrupt, socket=None, snippet=None, run=None,
+                             capture=None, sleep=None, ready_timeout=0,
+                             tries=8, interval=1.0):
+        sleep(interval)
+        sable_msg.register_composition("tarzan", "optimus", 1050.0)  # different sender
+        sleep(interval)
+        return True
+
+    monkeypatch.setattr(sable_msg, "deliver_message", fake_deliver_message)
+    outcome = sable_msg.deliver_with_freshness(
+        "%2", "hold", False, "lincoln", "optimus", composed_at=1000.0,
+        expiry_seconds=300, sleep=lambda s: None, tries=2, interval=0)
+    assert outcome == sable_msg.DELIVERED
+
+
+def test_deliver_with_freshness_different_recipient_does_not_supersede_negative_control(monkeypatch):
+    # NEGATIVE CONTROL, load-bearing: the SAME sender messaging a DIFFERENT
+    # recipient must not suppress this send either.
+    monkeypatch.setattr(sable_msg, "_now", lambda: 1000.0)
+
+    def fake_deliver_message(pane, message, interrupt, socket=None, snippet=None, run=None,
+                             capture=None, sleep=None, ready_timeout=0,
+                             tries=8, interval=1.0):
+        sleep(interval)
+        sable_msg.register_composition("lincoln", "chuck", 1050.0)  # different recipient
+        sleep(interval)
+        return True
+
+    monkeypatch.setattr(sable_msg, "deliver_message", fake_deliver_message)
+    outcome = sable_msg.deliver_with_freshness(
+        "%2", "hold", False, "lincoln", "optimus", composed_at=1000.0,
+        expiry_seconds=300, sleep=lambda s: None, tries=2, interval=0)
+    assert outcome == sable_msg.DELIVERED
+
+
+# --- main(): freshness outcomes are reported, never silent (SABLE-xwy0b) ----
+
+def test_main_reports_superseded_distinctly_and_exits_nonzero(monkeypatch, capsys):
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+    monkeypatch.setattr(sable_msg, "deliver_with_freshness",
+                        lambda *a, **k: sable_msg.SUPERSEDED)
+    filed = []
+    monkeypatch.setattr(sable_msg, "file_fallback_bead",
+                        lambda *a, **k: filed.append(a) or "SABLE-should-not-file")
+    rc = sable_msg.main(["optimus", "hold", "--from", "lincoln"])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "superseded" in err
+    assert "optimus" in err
+    assert filed == [], "a suppressed-as-stale send must not ALSO file a fallback bead"
+
+
+def test_main_reports_expired_distinctly_and_exits_nonzero(monkeypatch, capsys):
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+    monkeypatch.setattr(sable_msg, "deliver_with_freshness",
+                        lambda *a, **k: sable_msg.EXPIRED)
+    filed = []
+    monkeypatch.setattr(sable_msg, "file_fallback_bead",
+                        lambda *a, **k: filed.append(a) or "SABLE-should-not-file")
+    rc = sable_msg.main(["optimus", "hold", "--from", "lincoln"])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "expired" in err
+    assert filed == [], "an expired send must not ALSO file a fallback bead"
+
+
+def test_main_still_reports_undelivered_and_auto_files_when_outcome_undelivered(monkeypatch, capsys):
+    # Regression guard: routing through deliver_with_freshness must not
+    # disturb the pre-existing UNDELIVERED -> fallback-bead behavior.
+    monkeypatch.setattr(sable_msg, "lookup_pane",
+                        lambda role, run=None, socket=None, session=None: "%2")
+    monkeypatch.setattr(sable_msg, "deliver_with_freshness",
+                        lambda *a, **k: sable_msg.UNDELIVERED)
+    calls = []
+    monkeypatch.setattr(sable_msg, "file_fallback_bead",
+                        lambda frm, to, msg, runner=None: calls.append((frm, to)) or "SABLE-fb99")
+    rc = sable_msg.main(["optimus", "cap in force", "--from", "lincoln"])
+    assert rc != 0
+    assert calls == [("lincoln", "optimus")]
+    err = capsys.readouterr().err
+    assert "undelivered" in err
+    assert "SABLE-fb99" in err
 
 
 if __name__ == "__main__":

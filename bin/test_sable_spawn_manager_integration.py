@@ -7,6 +7,8 @@ stays active), a second spawn of the same role skips idempotently, --all
 stands up all three autonomous roles, and a missing session errors pointing
 at sable-launch.
 """
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -23,6 +25,31 @@ pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="tmux not installed")
 SESSION = "ssm"
 
 
+def _authority():
+    proof = {
+        "version": 1,
+        "kind": "break-glass",
+        "approved_by": "test-operator",
+        "approved_at": "2026-07-28T00:00:00+00:00",
+        "reason": "synthetic execution authority for spawn integration",
+        "base": {"ref": "HEAD", "sha": "a" * 40},
+        "failed_checks": ["test fixture"],
+    }
+    proof["receipt_id"] = hashlib.sha256(
+        json.dumps(
+            proof, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode()
+    ).hexdigest()
+    return proof
+
+
+def _write_execution_state(path, providers=None):
+    state = {"mode": "execution", "handoff": _authority()}
+    if providers:
+        state["providers"] = providers
+    path.write_text(json.dumps(state))
+
+
 @pytest.fixture()
 def sock():
     s = f"sable-sm-{uuid.uuid4().hex[:8]}"
@@ -31,17 +58,29 @@ def sock():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+@pytest.fixture(autouse=True)
+def execution_mode_state(tmp_path, monkeypatch):
+    """Launch tests must not inherit the checkout's live planning/execution mode."""
+    state = tmp_path / "mode-state.json"
+    _write_execution_state(state)
+    monkeypatch.setenv("SABLE_MODE_STATE", str(state))
+
+
 def _tmux(s, *args, check=True):
     return subprocess.run(["tmux", "-L", s, *args],
                           capture_output=True, text=True, check=check)
 
 
 def _run(s, *args):
+    fake_tui = (
+        "bash --noprofile --norc -c 'while true; do printf \"❯ \"; "
+        "IFS= read -r line || break; printf \"%s\\n\" \"$line\"; done'"
+    )
     return subprocess.run(["python3", str(BIN), *args], capture_output=True, text=True,
                           env={**os.environ, "SABLE_TMUX_SOCKET": s,
                              "SABLE_TMUX_SESSION": SESSION,
-                             "SABLE_TMUX_PANE_CMD": "bash",
-                             "SABLE_DISPATCH_READY_TIMEOUT": "0",
+                             "SABLE_TMUX_PANE_CMD": fake_tui,
+                             "SABLE_DISPATCH_READY_TIMEOUT": "2",
                              "SABLE_DISPATCH_SUBMIT_TRIES": "1",
                              "SABLE_DISPATCH_POLL_INTERVAL": "0.1"})
 
@@ -84,6 +123,17 @@ def test_spawn_creates_detached_role_window(sock):
     assert "optimus" in names
 
 
+def test_manager_refuses_statusless_execution_before_creating_pane(sock):
+    Path(os.environ["SABLE_MODE_STATE"]).write_text('{"mode":"execution"}')
+    _seed_lincoln(sock)
+
+    r = _run(sock, "optimus")
+
+    assert r.returncode == 5
+    assert "handoff" in r.stderr.lower()
+    assert "optimus" not in _roles(sock)
+
+
 def test_second_spawn_skips_idempotently(sock):
     _seed_lincoln(sock)
     _run(sock, "tarzan")
@@ -99,6 +149,186 @@ def test_all_spawns_three_roles(sock):
     r = _run(sock, "--all")
     assert r.returncode == 0, r.stderr
     assert {"chuck", "optimus", "tarzan"} <= set(_roles(sock))
+
+
+def test_unknown_dialog_refuses_manager_kick_without_typing(sock, tmp_path):
+    """A fresh manager pane parked on an unknown selector must remain untouched.
+
+    The stand-in records the first byte it receives. Discarding wait_for_ready's
+    False return types the autostart kick into that read and creates the file
+    even if Enter is never submitted.
+    """
+    rec = tmp_path / "typed-into-dialog.txt"
+    script = tmp_path / "fake-dialog.sh"
+    script.write_text(
+        "echo '  ? Which workspace should be opened?'\n"
+        "echo '  > 1. primary'\n"
+        "echo '    2. recovery'\n"
+        "echo '  (Use arrow keys, Enter to select)'\n"
+        "IFS= read -r -n 1 byte\n"
+        f'printf "%s" "$byte" > "{rec}"\n'
+        "sleep 2\n"
+    )
+    _seed_lincoln(sock)
+    env = {
+        **os.environ,
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_SESSION": SESSION,
+        "SABLE_TMUX_PANE_CMD": f"bash --noprofile --norc {script}",
+        "SABLE_DISPATCH_READY_TIMEOUT": "0.6",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.1",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+    }
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus"],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert r.returncode == 10, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "role=optimus" in r.stderr
+    assert "provider=claude" in r.stderr
+    assert "interactive dialog/selector" in r.stderr
+    assert "NOT typed" in r.stderr
+    assert "failed pane removed" in r.stderr
+    time.sleep(0.3)
+    assert not rec.exists(), (
+        f"manager kick landed in the unknown dialog: {rec.read_text()!r}"
+    )
+    assert "optimus" not in _roles(sock)
+
+    retry = _run(sock, "optimus")
+    assert retry.returncode == 0, retry.stderr
+    assert "optimus" in _roles(sock)
+    assert "already running" not in retry.stderr
+
+
+def test_known_startup_gate_is_accepted_then_manager_is_kicked(sock, tmp_path):
+    """The fail-closed branch must preserve explicitly recognized selectors."""
+    accepted = tmp_path / "accepted-key.txt"
+    kicked = tmp_path / "manager-kick.txt"
+    script = tmp_path / "fake-known-gate.sh"
+    script.write_text(
+        "echo 'WARNING: Claude Code running in Bypass Permissions mode'\n"
+        "echo '  1. No, exit'\n"
+        "echo '  2. Yes, I accept'\n"
+        "echo '  Enter to confirm'\n"
+        "IFS= read -r key\n"
+        f'printf "%s" "$key" > "{accepted}"\n'
+        "printf '❯ '\n"
+        "IFS= read -r line\n"
+        f'printf "%s" "$line" > "{kicked}"\n'
+        "printf '\\n%s\\n❯ ' \"$line\"\n"
+        "IFS= read -r _hold\n"
+    )
+    _seed_lincoln(sock)
+    env = {
+        **os.environ,
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_SESSION": SESSION,
+        "SABLE_TMUX_PANE_CMD": f"bash --noprofile --norc {script}",
+        "SABLE_DISPATCH_READY_TIMEOUT": "2",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.1",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+    }
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus"],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    for _ in range(20):
+        if accepted.exists() and kicked.exists():
+            break
+        time.sleep(0.1)
+    assert accepted.read_text() == "2"
+    assert "SABLE-AUTOSTART" in kicked.read_text()
+
+
+def test_unverified_manager_kick_fails_closed_and_retry_converges(sock, tmp_path):
+    """A pane that exits on the first kick byte makes delivery unverifiable."""
+    first_byte = tmp_path / "first-byte.txt"
+    script = tmp_path / "exit-during-kick.sh"
+    script.write_text(
+        "printf '❯ '\n"
+        "IFS= read -r -n 1 byte\n"
+        f'printf "%s" "$byte" > "{first_byte}"\n'
+    )
+    _seed_lincoln(sock)
+    env = {
+        **os.environ,
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_SESSION": SESSION,
+        "SABLE_TMUX_PANE_CMD": f"bash --noprofile --norc {script}",
+        "SABLE_DISPATCH_READY_TIMEOUT": "2",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.1",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+    }
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus"],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert first_byte.read_text() == "[", "delivery-failure leg was not exercised"
+    assert r.returncode == 11, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "delivery could not be verified" in r.stderr
+    assert "role=optimus" in r.stderr
+    assert "optimus" not in _roles(sock)
+
+    retry = _run(sock, "optimus")
+    assert retry.returncode == 0, retry.stderr
+    assert "optimus" in _roles(sock)
+
+
+def test_provider_boot_failure_removes_manager_pane(sock, tmp_path):
+    """A missing Codex role card fails after pane creation but before typing."""
+    state = Path(os.environ["SABLE_MODE_STATE"])
+    _write_execution_state(state, {"optimus": "codex"})
+    empty_home = tmp_path / "home"
+    empty_home.mkdir()
+    first_byte = tmp_path / "first-byte.txt"
+    script = tmp_path / "codex-ready.sh"
+    script.write_text(
+        "printf '› '\n"
+        "IFS= read -r -n 1 byte\n"
+        f'printf "%s" "$byte" > "{first_byte}"\n'
+        "sleep 2\n"
+    )
+    _seed_lincoln(sock)
+    env = {
+        **os.environ,
+        "HOME": str(empty_home),
+        # Keep fleet-boundary resolution project-local so this test reaches
+        # the intended post-pane provider-role-card failure. Boundary refusal
+        # itself has dedicated rc=6 coverage in test_sable_spawn_manager.py.
+        "SABLE_AGENTS_YAML": str(
+            Path(__file__).resolve().parent.parent
+            / "templates" / "multi-manager" / "agents.yaml"
+        ),
+        "SABLE_DISPATCH_DIR": str(tmp_path / "dispatch"),
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_SESSION": SESSION,
+        "SABLE_TMUX_PANE_CMD": f"bash --noprofile --norc {script}",
+        "SABLE_DISPATCH_READY_TIMEOUT": "2",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.1",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+    }
+    r = subprocess.run(
+        ["python3", str(BIN), "optimus"],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert r.returncode == 5, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "no installed role card" in r.stderr
+    assert "role=optimus" in r.stderr
+    assert "provider=codex" in r.stderr
+    assert "failed pane removed" in r.stderr
+    assert not first_byte.exists(), "provider failure typed into the pane"
+    assert "optimus" not in _roles(sock)
+
+    _write_execution_state(state)
+    retry = _run(sock, "optimus")
+    assert retry.returncode == 0, retry.stderr
+    assert "optimus" in _roles(sock)
 
 
 # --- SABLE-tz7h.1: producer spawn contract -------------------------------
@@ -119,6 +349,19 @@ def test_producer_spawn_tags_class_and_deliverable(sock, tmp_path):
     active = _tmux(sock, "display-message", "-t", SESSION, "-p",
                    "#{window_index}").stdout.strip()
     assert active == "0"
+
+
+def test_producer_spawn_remains_available_in_planning(sock, tmp_path):
+    Path(os.environ["SABLE_MODE_STATE"]).write_text(
+        '{"mode":"planning","tier":"full","substage":"research"}'
+    )
+    _seed_lincoln(sock)
+    deliverable = tmp_path / "victor-report.md"
+
+    r = _run(sock, "victor", "--deliverable", str(deliverable))
+
+    assert r.returncode == 0, r.stderr
+    assert "victor" in _roles(sock)
 
 
 def test_producer_spawn_requires_deliverable(sock):
@@ -173,7 +416,8 @@ def test_manager_spawn_pins_real_claude_command_to_opus(sock, tmp_path):
     stub.write_text(
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{log_path}"\n'
-        "sleep 5\n"
+        "while true; do printf '❯ '; IFS= read -r line || break; "
+        "printf '%s\\n' \"$line\"; done\n"
     )
     stub.chmod(0o755)
 
@@ -183,7 +427,7 @@ def test_manager_spawn_pins_real_claude_command_to_opus(sock, tmp_path):
                        env={**os.environ, "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
                           "SABLE_TMUX_SOCKET": sock,
                           "SABLE_TMUX_SESSION": SESSION,
-                          "SABLE_DISPATCH_READY_TIMEOUT": "0",
+                          "SABLE_DISPATCH_READY_TIMEOUT": "2",
                           "SABLE_DISPATCH_SUBMIT_TRIES": "1",
                           "SABLE_DISPATCH_POLL_INTERVAL": "0.1"})
     assert r.returncode == 0, r.stderr

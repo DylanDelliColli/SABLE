@@ -34,8 +34,10 @@ FAIL_NAMES=""
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 
-# Shared temp state; set mode per test group via the real helper.
-SABLE_MODE_STATE="$(mktemp -u)"
+# Shared temp state; set mode per test group via the real helper. Keep the
+# adjacent store lock inside the same throwaway directory.
+MODE_TEST_ROOT="$(mktemp -d)"
+SABLE_MODE_STATE="$MODE_TEST_ROOT/mode-state.json"
 export SABLE_MODE_STATE
 
 # Hermetic registry so the v3 Agent-leg matrix (SABLE-4k7) classifies spawn
@@ -65,9 +67,16 @@ agents:
     type: quality_validator
 YAML
 
-trap 'rm -f "$SABLE_MODE_STATE" "$SABLE_AGENTS_YAML"' EXIT
+trap 'rm -rf "$MODE_TEST_ROOT"; rm -f "$SABLE_AGENTS_YAML"' EXIT
 
-set_mode() { "$MODE_BIN" set "$1" >/dev/null 2>&1; }
+set_mode() {
+  if [ "$1" = "execution" ]; then
+    "$MODE_BIN" set execution --break-glass \
+      --reason "synthetic authority for interlock posture tests" >/dev/null 2>&1
+  else
+    "$MODE_BIN" set "$1" >/dev/null 2>&1
+  fi
+}
 clear_mode() { rm -f "$SABLE_MODE_STATE"; }
 
 # run_hook <command> [agent_id] → stdout
@@ -345,13 +354,21 @@ if is_deny "$out"; then fail "execution: manager-subagent spawning Explore worke
 out="$(agent_json sherlock mgr-sub-6 tarzan | SABLE_ORCHESTRATION_FORCE=1 CLAUDE_AGENT_NAME=lincoln bash "$HOOK" 2>/dev/null)"
 if is_deny "$out"; then fail "execution: SABLE_ORCHESTRATION_FORCE=1 flips subagent deny to allow" "got deny: $out"; else pass "execution: SABLE_ORCHESTRATION_FORCE=1 flips subagent deny to allow"; fi
 
-# (10) mode-file lifecycle: missing file and malformed JSON both leave it inert
+# (10) mode-file lifecycle: absence is inert; corruption fails closed while the
+# sanctioned state repair command remains reachable.
 clear_mode
 out="$(run_agent_t sherlock lincoln mgr-sub-7 tarzan)"
 if is_deny "$out"; then fail "lifecycle: missing mode file → interlock inert (allow)" "got deny: $out"; else pass "lifecycle: missing mode file → interlock inert (allow)"; fi
 printf '%s' '{broken json' > "$SABLE_MODE_STATE"
 out="$(run_agent_t sherlock lincoln mgr-sub-8 tarzan)"
-if is_deny "$out"; then fail "lifecycle: malformed mode file → fail open (allow)" "got deny: $out"; else pass "lifecycle: malformed mode file → fail open (allow)"; fi
+if is_deny "$out"; then pass "lifecycle: malformed mode file → fail closed (deny)"; else fail "lifecycle: malformed mode file → fail closed (deny)" "got: ${out:-<empty>}"; fi
+assert_deny "lifecycle: corrupt state blocks ordinary Bash work" 'ls -la'
+assert_allow "lifecycle: corrupt state still permits sable-mode clear" 'sable-mode clear'
+printf '%s' '{"mode":"bogus"}' > "$SABLE_MODE_STATE"
+assert_deny "lifecycle: valid JSON with invalid mode also fails closed" 'ls -la'
+printf '%s' '{"mode":"execution","providers":{"worker":"unsupported"}}' > "$SABLE_MODE_STATE"
+assert_deny "lifecycle: schema-invalid provider map also fails closed" 'ls -la'
+clear_mode
 
 # (11) mode flip mid-session honored without caching: same input, decisions track the file
 set_mode planning
@@ -817,7 +834,8 @@ assert_allow_cwd() { local out; out="$(run_hook_cwd "$2" "$3")"; if is_deny "$ou
 
 REPO_EXEC="$(mk_modes_repo)"
 REPO_PLAN="$(mk_modes_repo)"
-( cd "$REPO_EXEC" && env -u SABLE_MODE_STATE "$MODE_BIN" set execution >/dev/null 2>&1 )
+( cd "$REPO_EXEC" && env -u SABLE_MODE_STATE "$MODE_BIN" set execution \
+    --break-glass --reason "synthetic authority for interlock test" >/dev/null 2>&1 )
 ( cd "$REPO_PLAN" && env -u SABLE_MODE_STATE "$MODE_BIN" set planning  >/dev/null 2>&1 )
 
 # Same command, opposite verdicts depending on which repo's cwd the call carries.
@@ -845,7 +863,8 @@ agents:
   columbo:
     type: test_planner
 YAML
-( cd "$PROJ_EXEC" && env -u SABLE_MODE_STATE "$MODE_BIN" set execution >/dev/null 2>&1 )
+( cd "$PROJ_EXEC" && env -u SABLE_MODE_STATE "$MODE_BIN" set execution \
+    --break-glass --reason "synthetic authority for interlock test" >/dev/null 2>&1 )
 PROJ_EMPTY_HOME="$(mktemp -d)"
 
 # Producer (columbo, test_planner) spawned in execution → DENY only if the

@@ -70,7 +70,7 @@ git -C "$GITREPO" init -q >/dev/null 2>&1
 cpath="$(cd "$GITREPO" && bash "$TOOL" path)"
 expected="$GITREPO/.claude/sable/state/active-contracts.md"
 if [ "$cpath" = "$expected" ]; then pass "git-repo path resolves under .claude/sable/state"; else fail "git-repo path resolves under .claude/sable/state" "got: $cpath want: $expected"; fi
-mpath="$(cd "$GITREPO" && bash "$REPO/bin/sable-mode" path)"
+mpath="$(cd "$GITREPO" && "$REPO/bin/sable-mode" path)"
 if [ "$(dirname "$cpath")" = "$(dirname "$mpath")" ]; then pass "contracts colocated with mode-state dir (no drift)"; else fail "contracts colocated with mode-state dir (no drift)" "c=$cpath m=$mpath"; fi
 
 rm -rf "$TMP" "$GITREPO"

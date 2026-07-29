@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# post-push-merge-notify.sh — File for-chuck bead with overlap analysis after push
+# post-push-merge-notify.sh — Direct Chuck handoff with durable failure fallback
 # Trigger: PostToolUse:Bash matching `git push` | Timeout: 10000ms
 #
-# After a successful git push, file a coord bead addressed to chuck (the merge
-# integrator) with: PR URL (if detectable), files modified, overlap context with
-# any in-progress beads' WIP-CLAIMS.
+# After a successful git push, message Chuck (the merge integrator) directly
+# with: PR URL (if detectable), files modified, and overlap context with any
+# in-progress beads' WIP-CLAIMS. File a durable for-chuck coord bead only when
+# direct delivery cannot be confirmed.
 #
 # Chuck uses this to sequence merges intelligently — hold a PR if it overlaps
 # an in-flight PR, merge if independent.
@@ -53,8 +54,9 @@ print('---STDERR---')
 print(stderr)
 " 2>/dev/null) || exit 0
 
-CWD=$(echo "$PARSED" | sed -n '1p')
-COMMAND=$(echo "$PARSED" | sed -n '2p')
+CWD="${PARSED%%$'\n'*}"
+PARSED_REST="${PARSED#*$'\n'}"
+COMMAND="${PARSED_REST%%$'\n---STDOUT---'*}"
 
 # Only act on successful git push (SABLE-jpr: use shared matcher so
 # 'git -C <path> push' and other flag-interleaved forms are matched correctly)
@@ -98,8 +100,8 @@ sable_pp_trace "INVOKED cwd=${CWD} cmd=[${COMMAND}]"
 # can't catch this case on its own — remote tip == local HEAD looks identical
 # whether this push is the one that landed it or a resend of already-landed
 # content — so this text check stays as the no-op-specific leg.
-STDOUT_STDERR=$(echo "$PARSED" | sed -n '/---STDOUT---/,$p')
-if echo "$STDOUT_STDERR" | grep -qiE 'everything[[:space:]]+up-to-date'; then
+STDOUT_STDERR="${PARSED#*$'\n---STDOUT---'$'\n'}"
+if printf '%s' "$STDOUT_STDERR" | grep -qiE 'everything[[:space:]]+up-to-date'; then
   sable_pp_trace "EXIT no-op-push (everything up-to-date)"
   exit 0
 fi
@@ -234,57 +236,188 @@ if [ -z "$FILES" ]; then
   exit 0
 fi
 
+# --- Push-time preview kick (SABLE-jd5fj.1) ---------------------------------
+# The merge-preview ci-verify run is the slowest link in the worker->merge path,
+# and until now it only STARTED once Chuck picked the handoff up — so its whole
+# duration sat between the push and the merge. Fire `sable-merge-gate preview`
+# here instead — it builds the merge-preview commit, pushes the ci-verify ref
+# (the CI trigger) and returns WITHOUT waiting — so the verdict is already
+# computing before Chuck wakes. Chuck's later `promote` adopts that same ref via
+# the shared (base_sha, branch_sha) key, so this starts the run he waits on
+# rather than a second one.
+#
+# Placement is the contract: every no-kick guard already stands above this line
+# and stays authoritative — integration-branch self-push, 'Everything
+# up-to-date' no-op, unconfirmed-on-origin push, and empty diff vs the base all
+# exit before reaching here. So a kick happens exactly once per confirmed,
+# non-empty, non-self push, which is exactly the set of pushes that become a
+# Chuck merge.
+#
+# Fire-and-forget by construction: detached (setsid/nohup, own stdio) because the
+# kick's fetch+push outlives this hook's 10s timeout and must not be reaped with
+# the hook, and NON-BLOCKING because the handoff below must never wait on it. The
+# kick is pure warm-up — it writes no bead evidence and reports no verdict, so
+# losing one costs latency only (jd5fj.2's poll leg re-kicks a missed preview,
+# and promote still builds its own preview when none was kicked). Disable with
+# SABLE_PREVIEW_KICK=0; output lands in SABLE_PREVIEW_KICK_LOG.
+if [ "${SABLE_PREVIEW_KICK:-1}" = "1" ]; then
+  if command -v sable-merge-gate >/dev/null 2>&1; then
+    PREVIEW_KICK_LOG="${SABLE_PREVIEW_KICK_LOG:-$(dirname "$SABLE_HOOK_TRACE_LOG")/preview-kick.log}"
+    mkdir -p "$(dirname "$PREVIEW_KICK_LOG")" 2>/dev/null || true
+    if command -v setsid >/dev/null 2>&1; then
+      setsid sable-merge-gate preview --branch "$BRANCH" --repo "$CWD" \
+        >> "$PREVIEW_KICK_LOG" 2>&1 < /dev/null &
+    else
+      nohup sable-merge-gate preview --branch "$BRANCH" --repo "$CWD" \
+        >> "$PREVIEW_KICK_LOG" 2>&1 < /dev/null &
+    fi
+    PREVIEW_KICK_PID=$!
+    disown "$PREVIEW_KICK_PID" 2>/dev/null || true
+    sable_pp_trace "PREVIEW-KICK fired branch=${BRANCH} pid=${PREVIEW_KICK_PID}"
+  else
+    # Loud skip (SABLE-tb1y deliverable 3): never swallow a disposition on a
+    # confirmed push. Costs latency only — Chuck's promote builds its own preview.
+    echo "post-push-merge-notify: not kicking the merge preview — sable-merge-gate is not on PATH; Chuck's promote will build the preview at merge time (slower, not broken)."
+    sable_pp_trace "PREVIEW-KICK skipped no-binary branch=${BRANCH}"
+  fi
+else
+  sable_pp_trace "PREVIEW-KICK disabled (SABLE_PREVIEW_KICK=0) branch=${BRANCH}"
+fi
+
 # Try to detect PR URL via gh (best-effort, optional)
 PR_URL=$(gh pr view --json url -q .url 2>/dev/null || echo "")
 
-# Find overlaps with in-progress beads' WIP-CLAIMS
-FILES_CSV=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')
+# --- Overlap scan against UNCONTAINED BRANCH REFS (SABLE-pfbjw) ------------
+# GROUND TRUTH, not declarations. The prior implementation intersected this
+# push's files against `bd list --status=in_progress`'s wip_claims metadata,
+# which is wrong in BOTH directions and both were measured live, not
+# theorized: (A) FALSE POSITIVE — wip_claims is a claim, true only when
+# written and never invalidated; SABLE-23upx's (wk-sable-screen) own
+# wip_claims was byte-identical to its own pushed file list, and
+# SABLE-be4lo.4 (wk-trains-fold)'s wip_claims contained
+# bin/test_merge_gate_preview.py — the exact file its own push touched —
+# while each bead was still in_progress at push time, so the branch matched
+# itself. (B) FALSE NEGATIVE, the dangerous direction — `--status=in_progress`
+# can never see the CLOSED-BUT-UNLANDED population, which in this fleet is
+# the NORMAL end state (a worker's contract closes its bead before the branch
+# is actually merged). Live case (optimus): skrdj pushed with NO warning
+# while genuinely sharing .github/ci/shell-run-set.sh with qwthx, which was
+# CLOSED and its branch still uncontained — invisible to an in_progress-only
+# query. Silence was not clearance.
+#
+# So an "occupant" is now a fact about the git graph, not a claim about a
+# bead: a remote wk-* branch counts iff its ref currently resolves AND its
+# tip is NOT an ancestor of the integration branch (its work has not actually
+# landed). This structurally also removes the self-match failure mode
+# without a separate exclusion list — the pushing branch's own ref is
+# skipped by name, and a bundled dispatch (multiple beads, one branch) is
+# one git ref either way, so it can never appear as "another" occupant of
+# itself.
+#
+# `git rev-parse --verify --quiet` everywhere, never a bare rev-parse: a bare
+# rev-parse ECHOES an unresolvable ref back as if it were a real answer,
+# which manufactured hundreds of false findings in an earlier ad hoc sweep
+# (optimus). An empty tip is UNKNOWN and is skipped — never asserted
+# "contained" (which would wrongly suppress a real warning) and never
+# asserted "uncontained" (which would wrongly manufacture one). A reaped
+# branch simply does not appear in `for-each-ref` at all, so a deliberately
+# retired branch is correctly never an occupant without any extra check.
+INTEGRATION_REF="origin/${INTEGRATION_BRANCH}"
+INTEGRATION_TIP=$(git -C "$CWD" rev-parse --verify --quiet "$INTEGRATION_REF" 2>/dev/null || echo "")
 
-OVERLAPS=$(bd list --status=in_progress --json 2>/dev/null | FILES_CSV="$FILES_CSV" python3 -c "
-import json, sys, os, re
+OVERLAPS=""
+if [ -z "$INTEGRATION_TIP" ]; then
+  sable_pp_trace "OVERLAP-SCAN skipped unresolved-integration-ref ${INTEGRATION_REF}"
+else
+  declare -A PUSHED_FILE_SET=()
+  while IFS= read -r PUSHED_FILE; do
+    [ -n "$PUSHED_FILE" ] && PUSHED_FILE_SET["$PUSHED_FILE"]=1
+  done <<< "$FILES"
+  CANDIDATE_REFS=$(git -C "$CWD" for-each-ref --format='%(refname:short)' 'refs/remotes/origin/wk-*' 2>/dev/null || echo "")
+  OVERLAP_LINES=""
+  while IFS= read -r CAND_REF; do
+    [ -z "$CAND_REF" ] && continue
+    CAND_SHORT="${CAND_REF#origin/}"
+    [ "$CAND_SHORT" = "$BRANCH" ] && continue  # never compare the push to itself
 
-pushed = set(os.environ.get('FILES_CSV', '').split(','))
-pushed.discard('')
+    CAND_TIP=$(git -C "$CWD" rev-parse --verify --quiet "$CAND_REF" 2>/dev/null || echo "")
+    [ -z "$CAND_TIP" ] && continue  # unresolvable — unknown, never asserted contained
 
+    if git -C "$CWD" merge-base --is-ancestor "$CAND_TIP" "$INTEGRATION_TIP" 2>/dev/null; then
+      continue  # CONTAINED — already landed, not an active occupant
+    fi
+
+    CAND_FILES=$(git -C "$CWD" diff "${INTEGRATION_REF}...${CAND_REF}" --name-only 2>/dev/null)
+    [ -z "$CAND_FILES" ] && continue
+
+    SHARED=""
+    while IFS= read -r CAND_FILE; do
+      [ -n "$CAND_FILE" ] || continue
+      if [ "${PUSHED_FILE_SET[$CAND_FILE]:-0}" = "1" ]; then
+        SHARED="${SHARED}${SHARED:+,}${CAND_FILE}"
+      fi
+    done <<< "$CAND_FILES"
+    [ -z "$SHARED" ] && continue
+
+    # Label with any bead(s) declaring this branch — ANY status (the entire
+    # point is that a CLOSED bead's branch can still be unlanded), falling
+    # back to the bare branch name when bd is absent or nothing resolves.
+    LABEL="$CAND_SHORT"
+    BEAD_LABEL=$(bd list --status all --metadata-field "branch=$CAND_SHORT" --json --limit 0 2>/dev/null | python3 -c "
+import json, sys
 try:
     data = json.load(sys.stdin)
 except Exception:
-    sys.exit(0)
-if not isinstance(data, list):
-    sys.exit(0)
+    data = []
+if isinstance(data, list) and data:
+    ids = [i.get('id', '') for i in data if isinstance(i, dict) and i.get('id')]
+    if ids:
+        print(','.join(ids))
+" 2>/dev/null) || BEAD_LABEL=""
+    [ -n "$BEAD_LABEL" ] && LABEL="${CAND_SHORT} (${BEAD_LABEL})"
 
-overlaps = []
-for item in data:
-    # SABLE-szd: claims live in the dedicated wip_claims metadata field, NOT
-    # notes — bd update --notes overwrites the whole field, so a manager's
-    # routine notes update (e.g. a review-step write) silently wiped the
-    # WIP-CLAIMS line this overlap analysis depended on.
-    metadata = item.get('metadata', {}) or {}
-    wip_claims = metadata.get('wip_claims', '') or ''
-    if not wip_claims:
-        continue
-    files = set(p.strip() for p in wip_claims.split(',') if p.strip())
-    o = files & pushed
-    if o:
-        overlaps.append({
-            'bead': item.get('id', ''),
-            'title': item.get('title', ''),
-            'assignee': item.get('assignee', '') or 'unassigned',
-            'files': sorted(o),
-        })
+    SHARED_BRIEF=$(printf '%s' "$SHARED" | sed 's/,/, /g')
+    OVERLAP_LINES="${OVERLAP_LINES}${OVERLAP_LINES:+
+}  - ${LABEL}: ${SHARED_BRIEF}"
+  done <<< "$CANDIDATE_REFS"
+  OVERLAPS="$OVERLAP_LINES"
+fi
 
-if not overlaps:
-    sys.exit(0)
-
-lines = []
-for o in overlaps:
-    lines.append(f\"  - {o['bead']} ({o['assignee']}): {', '.join(o['files'])}\")
-print('\n'.join(lines))
-" 2>/dev/null)
+# SABLE-pfbjw: single-line, tmux-message-safe rendering of OVERLAPS (sable-msg
+# types ONE line into the recipient's composer and submits it — an embedded
+# newline would submit a partial message mid-composition). Empty whenever
+# OVERLAPS is empty. Used below so the two live notifications name WHAT is
+# shared and WITH WHAT, instead of the previous bare, unactionable
+# "shares files with in-flight work" that cost a manual derivation to dismiss
+# on every false positive.
+OVERLAPS_BRIEF="${OVERLAPS#  - }"
+OVERLAPS_BRIEF="${OVERLAPS_BRIEF//$'\n'/; }"
 
 # Brief basename list, shared by the message-based notifications below (the
 # worker-landing wake and the Chuck handoff).
-FILES_BRIEF=$(echo "$FILES" | sed 's#.*/##' | head -8 | tr '\n' ' ')
+FILES_BRIEF=""
+FILES_BRIEF_COUNT=0
+while IFS= read -r FILE_PATH; do
+  [ -n "$FILE_PATH" ] || continue
+  FILES_BRIEF="${FILES_BRIEF}${FILE_PATH##*/} "
+  FILES_BRIEF_COUNT=$((FILES_BRIEF_COUNT + 1))
+  [ "$FILES_BRIEF_COUNT" -ge 8 ] && break
+done <<< "$FILES"
+
+# SABLE-f916: both landing artifacts below (the live chuck message AND the
+# durable for-chuck bead fallback) were byte-identical in framing to what a
+# manager's deliberate, reviewed PR-ready sign-off would look like — Chuck had
+# no mechanical way to tell "hook auto-detected a push" apart from "a manager
+# actually reviewed this and accepts it." Incident 2026-07-15: an auto-notify
+# for wk-bin-symlink-parity (SABLE-59t6.6) was queued+inspected as if
+# PR-ready, but optimus had NOT accepted it (later rejected for false-green
+# tests). This tag self-labels every auto-notify so it's grep-distinguishable
+# from a real sign-off (which carries no such tag) — it does not change
+# firing/registration behavior. Defined here (moved up from just above the
+# Chuck-handoff block, SABLE-gx7p3) so the worker-landing wake below can also
+# carry it — that message went out untagged and asserted closure it never
+# observed.
+AUTO_NOTIFY_TAG="[AUTO-NOTIFY: push detected by hook, NOT a manager sign-off]"
 
 # --- Wake the dispatching manager on a worker landing (SABLE-nmmh) ---------
 # Managers now run an EVENT-DRIVEN loop: they END their turn when nothing is
@@ -305,8 +438,76 @@ if [ "${SABLE_WORKER_LAND_NOTIFY:-1}" = "1" ] \
    && command -v sable-msg >/dev/null 2>&1; then
   PANE_ROLE=$(tmux display-message -p -t "$TMUX_PANE" '#{@sable_role}' 2>/dev/null || echo "")
   if [ "$PANE_ROLE" = "worker" ]; then
-    LAND_MSG="Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed & bead closed. Review the outcome — closed bead + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
-    [ -n "$OVERLAPS" ] && LAND_MSG="${LAND_MSG} OVERLAP-WARNING: shares files with in-flight work."
+    # SABLE-gx7p3: the hook observed exactly one thing — a confirmed push. It
+    # previously asserted "bead closed" and "for-chuck PR" unconditionally,
+    # which is TRUE only when the branch's work bead is actually closed;
+    # every other case (in_progress, unresolvable query) rendered the same
+    # false terminal claim at the moment a lane manager is most likely to act
+    # on it. Resolve the bead(s) here (only on the worker-landing path — a
+    # manager's own push never reaches this branch) via the SAME structured
+    # `branch` metadata sable-spawn-worker writes at dispatch time (mirrors
+    # sable-reconcile-handoffs's find_work_bead_status resolver), and report
+    # closure only when actually observed; otherwise say what is known (the
+    # push, and the real status) and say explicitly this is not a sign-off.
+    # A query failure leaves the set empty ("unknown") rather than defaulting
+    # to a claim.
+    #
+    # CARDINALITY (live second instance, optimus/tarzan, SABLE-dhcyu bundle,
+    # same evening as the original finding): a BUNDLED dispatch joins N>1
+    # beads to the SAME branch metadata. Taking only the first matching
+    # bead's status — this hook's own first-cut fix — reproduces the exact
+    # defect one level down: if that first bead happens to be closed while a
+    # sibling in the same bundle is still in_progress, the notify again
+    # asserts a singular "bead closed" that is false about the unit of work.
+    # So closure is asserted ONLY when EVERY bead sharing this branch's
+    # metadata is closed; a partial bundle reports the set (closed count /
+    # total, and which remain open) rather than a singular claim.
+    BEAD_ID=""
+    BEAD_TOTAL=0
+    BEAD_CLOSED_COUNT=0
+    BEAD_OPEN_LIST=""
+    BEAD_ALL_IDS=""
+    BEAD_QUERY=$(bd list --status all --metadata-field "branch=$BRANCH" --json --limit 0 2>/dev/null || echo "")
+    if [ -n "$BEAD_QUERY" ]; then
+      BEAD_ROWS=$(printf '%s' "$BEAD_QUERY" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+if isinstance(data, list):
+    for item in data:
+        if isinstance(item, dict) and item.get('status'):
+            print(f\"{item.get('id', '')}\t{item.get('status', '')}\")
+" 2>/dev/null) || BEAD_ROWS=""
+      while IFS=$'\t' read -r bid bstatus; do
+        [ -z "$bid" ] && continue
+        BEAD_TOTAL=$((BEAD_TOTAL + 1))
+        BEAD_ALL_IDS="${BEAD_ALL_IDS}${BEAD_ALL_IDS:+ }${bid}"
+        if [ "$bstatus" = "closed" ]; then
+          BEAD_CLOSED_COUNT=$((BEAD_CLOSED_COUNT + 1))
+        else
+          BEAD_OPEN_LIST="${BEAD_OPEN_LIST}${BEAD_OPEN_LIST:+, }${bid}(${bstatus})"
+        fi
+      done <<< "$BEAD_ROWS"
+      BEAD_ID=$(printf '%s' "$BEAD_ALL_IDS" | cut -d' ' -f1)
+    fi
+    if [ "$BEAD_TOTAL" -gt 0 ] && [ "$BEAD_CLOSED_COUNT" -eq "$BEAD_TOTAL" ]; then
+      if [ "$BEAD_TOTAL" -eq 1 ]; then
+        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; bead ${BEAD_ID:-?} is CLOSED. Review the outcome via the closed bead. Chuck's primary merge handoff is direct; the durable for-chuck bead is created only if delivery fails, so its absence is healthy. REVISE by re-spawning into the same worktree if wrong."
+      else
+        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; ALL ${BEAD_TOTAL} beads on this branch are CLOSED (${BEAD_ALL_IDS}). Review the outcome via the closed beads. Chuck's primary merge handoff is direct; the durable for-chuck bead is created only if delivery fails, so its absence is healthy. REVISE by re-spawning into the same worktree if wrong."
+      fi
+    elif [ "$BEAD_TOTAL" -gt 0 ]; then
+      LAND_MSG="${AUTO_NOTIFY_TAG} Worker pushed: branch ${BRANCH} (${FILES_BRIEF}). ${BEAD_CLOSED_COUNT}/${BEAD_TOTAL} bead(s) on this branch are closed — NOT all done (open: ${BEAD_OPEN_LIST}). This is NOT a completion signal; check \`bd show <id>\` for each and \`sable-worker-status\` before reviewing."
+    else
+      LAND_MSG="${AUTO_NOTIFY_TAG} Worker pushed: branch ${BRANCH} (${FILES_BRIEF}). No bead resolved via branch metadata — status unknown. The worker may still be running. This is NOT a completion signal; check \`bd show <bead>\` and \`sable-worker-status\` before reviewing."
+    fi
+    # SABLE-pfbjw: name WHAT is shared and WITH WHAT (OVERLAPS_BRIEF) instead
+    # of the previous bare, unactionable "shares files with in-flight work" —
+    # that phrasing gave the waking manager nothing to act on and cost a
+    # manual derivation on every false positive to dismiss.
+    [ -n "$OVERLAPS" ] && LAND_MSG="${LAND_MSG} OVERLAP-WARNING: shares files with in-flight work -- ${OVERLAPS_BRIEF}"
     if sable-msg "$SABLE_ID_NAME" "$LAND_MSG" --from worker >/dev/null 2>&1; then
       sable_pp_trace "WORKER-LAND-MSG sent -> ${SABLE_ID_NAME}"
     else
@@ -331,17 +532,8 @@ sable_chuck_pane_present() {
   printf '%s\n' "$roles" | grep -qx chuck
 }
 
-# SABLE-f916: both landing artifacts below (the live chuck message AND the
-# durable for-chuck bead fallback) were byte-identical in framing to what a
-# manager's deliberate, reviewed PR-ready sign-off would look like — Chuck had
-# no mechanical way to tell "hook auto-detected a push" apart from "a manager
-# actually reviewed this and accepts it." Incident 2026-07-15: an auto-notify
-# for wk-bin-symlink-parity (SABLE-59t6.6) was queued+inspected as if
-# PR-ready, but optimus had NOT accepted it (later rejected for false-green
-# tests). This tag self-labels every auto-notify so it's grep-distinguishable
-# from a real sign-off (which carries no such tag) — it does not change
-# firing/registration behavior.
-AUTO_NOTIFY_TAG="[AUTO-NOTIFY: push detected by hook, NOT a manager sign-off]"
+# AUTO_NOTIFY_TAG (SABLE-f916) is defined earlier, above the worker-landing
+# wake block, so that message can carry it too (SABLE-gx7p3).
 
 # --- Message-first handoff with durable fallback (SABLE-bldh.15 / SABLE-wvk9) --
 # In the tmux warm-pane topology the worker->merge handoff is a direct message to
@@ -367,7 +559,9 @@ elif ! sable_chuck_pane_present; then
   FALLBACK_REASON="no reachable chuck pane (not spawned yet, or down)"
 else
   MSG="${AUTO_NOTIFY_TAG} PR ready from ${SABLE_ID_NAME}: branch ${BRANCH} (${FILES_BRIEF}). Review and merge into the integration branch, then report."
-  [ -n "$OVERLAPS" ] && MSG="${MSG} OVERLAP-WARNING: shares files with in-flight work — sequence carefully."
+  # SABLE-pfbjw: name WHAT is shared and WITH WHAT (OVERLAPS_BRIEF) — see the
+  # matching LAND_MSG comment above for why the bare phrase was unactionable.
+  [ -n "$OVERLAPS" ] && MSG="${MSG} OVERLAP-WARNING: shares files with in-flight work -- ${OVERLAPS_BRIEF} -- sequence carefully."
   if sable-msg chuck "$MSG" --from "$SABLE_ID_NAME" >/dev/null 2>&1; then
     sable_pp_trace "HANDOFF chuck-msg confirmed"
     exit 0
@@ -386,7 +580,7 @@ fi
 # for-chuck bead's title already names $BRANCH on a delimited-token boundary
 # (so wk-foo does not false-match wk-foobar) — that earlier bead already
 # covers this branch's handoff; update it by hand if the file list changed.
-EXISTING_FOR_CHUCK=$(bd list --status open,in_progress --label for-chuck --json 2>/dev/null || echo "")
+EXISTING_FOR_CHUCK=$(bd list --status open,in_progress --label for-chuck --json --limit 0 2>/dev/null || echo "")
 if printf '%s' "$EXISTING_FOR_CHUCK" | BRANCH="$BRANCH" python3 -c "
 import json, os, re, sys
 branch = os.environ.get('BRANCH', '')

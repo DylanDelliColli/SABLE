@@ -17,7 +17,7 @@ Columbo's interview workflow (taxonomy, decision rubric, 5-phase flow, skeleton-
 - **Skill (`skills/columbo/`)** — portable, single-file, no dependencies beyond `bd`. Right for work computers, repos where you don't run a manager swarm, or any setup where you want the workflow without the agent-coordination plumbing. Invokable as `/columbo` from any cwd.
 - **Multi-manager agent (`templates/multi-manager/roles/columbo.md`)** — full implementation with identity injection, `for-columbo` inbox, bead-template gate enforcement, runs as a peer to Sherlock / Victor / Rudy. Right for personal projects with the full SABLE stack installed.
 
-Both produce the same outputs: `columbo-test-spec` / `columbo-test-gap` beads + `*.skel.test.<ext>` skeleton files. Pick the one that matches your setup; the workflow content is the same.
+Both produce the same outputs: `columbo-test-spec` / `columbo-test-gap` beads plus skeleton files — `skel_<feature-name>.py` for pytest, validated with `pytest --collect-only`, and `*.skel.test.<ext>` for other frameworks. Pick the one that matches your setup; the workflow content is the same.
 
 ## Install on a new machine
 
@@ -96,7 +96,7 @@ See [`MULTI-MANAGER-PATTERN.md`](MULTI-MANAGER-PATTERN.md) for the full design a
 
 Files:
 - `MULTI-MANAGER-PATTERN.md` — design doc and setup instructions
-- `hooks/multi-manager/*.sh` — twelve coordination hooks (session-role-anchor, read-guard, inbox-injection, inbox-injection-precompact, pre-dispatch refresh/claim/overlap/preempt/model-check, edit-write-claim-reconciler, pre-push-rebase-test, post-push-merge-notify) + `upgrade-notes.md`
+- `hooks/multi-manager/*.sh` — coordination hooks (session-role-anchor, read-guard, pre-dispatch claim/overlap/preempt/model-check, edit-write-claim-reconciler, pre-push-rebase-test, post-push-merge-notify) + `upgrade-notes.md`. (`pre-dispatch-refresh.sh` — automatic rebase-on-dispatch — was retired, SABLE-o3xju/SABLE-mkj6k; the file remains on disk but is not registered in `settings.json`.)
 - `templates/multi-manager/agents.yaml` — agent registry: Optimus / Tarzan / Chuck (managers), Sherlock / Victor / Rudy / Columbo (planning agents), Lincoln (strategist)
 - `templates/multi-manager/roles/*.md` — role prompts injected at SessionStart (one per agent)
 - `templates/multi-manager/commands/inbox.md` — `/inbox` slash command

@@ -5,9 +5,11 @@ Isolated socket (-L). Proves: worker panes are discovered by their @sable_role/
 @sable_bead/@sable_status user-options, a done worker is reported done, and
 --reap kills ONLY the done worker pane (the running one survives).
 """
+import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -15,6 +17,7 @@ from pathlib import Path
 import pytest
 
 BIN = Path(__file__).resolve().parent / "sable-worker-status"
+VIEW_BIN = Path(__file__).resolve().parent / "sable-view"
 HAVE_TMUX = shutil.which("tmux") is not None
 pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="tmux not installed")
 
@@ -53,18 +56,80 @@ def _scrubbed_env():
     return env
 
 
+@pytest.fixture(autouse=True)
+def _isolate_unresolvable_bead_lookups(tmp_path, monkeypatch):
+    """Keep fake-bead cases off the checkout's shared real Dolt store.
+
+    These integration cases exercise real tmux. Their placeholder bead ids
+    are intentionally unresolvable, so sable-worker-status's production
+    contract is to fail open and trust the settled pane tag. A tiny `bd`
+    shim preserves that exact result without making concurrent tmux workers
+    all open this repository's embedded Dolt store. The two cases that need
+    an OPEN bead prepend their own status-returning shim, while
+    test_sable_worker_status.py retains closed/open/unavailable parser and
+    confirmation coverage and test_footprint_lib_integration.py retains the
+    real bd/Dolt boundary.
+    """
+    stub_dir = tmp_path / "unresolvable-bd"
+    stub_dir.mkdir()
+    stub = stub_dir / "bd"
+    stub.write_text("#!/usr/bin/env sh\nexit 1\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv(
+        "PATH", f"{stub_dir}:{os.environ.get('PATH', '')}"
+    )
+
+
+def _wait_until(predicate, *, timeout=3.0, interval=0.02, description="condition"):
+    """Poll a real tmux observation instead of sleeping for a guessed delay."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(interval)
+    raise AssertionError(f"timed out waiting for {description}")
+
+
 @pytest.fixture()
-def sock():
-    s = f"sable-ws-{uuid.uuid4().hex[:8]}"
-    yield s
-    subprocess.run(["tmux", "-L", s, "kill-server"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def sock(monkeypatch):
+    socket_root = Path(tempfile.mkdtemp(prefix="sable-ws-tmux-"))
+    monkeypatch.setenv("TMUX_TMPDIR", str(socket_root))
+    experiment = os.environ.get("SABLE_TEST_CONTENTION_EXPERIMENT")
+    worker = os.environ.get("SABLE_TEST_CONTENTION_WORKER")
+    if experiment and worker:
+        s = (
+            f"sable-x2r7g-{experiment[:8]}-w{worker}-"
+            f"{uuid.uuid4().hex[:8]}"
+        )
+    else:
+        s = f"sable-ws-{uuid.uuid4().hex[:8]}"
+    try:
+        yield s
+    finally:
+        subprocess.run(
+            ["tmux", "-L", s, "kill-server"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=_scrubbed_env(),
+        )
+        shutil.rmtree(socket_root, ignore_errors=True)
 
 
 def _tmux(s, *args, check=True):
+    # tmux's structural commands are synchronous: once this returns, the pane
+    # can be tagged/listed directly. Asynchronous pane output is synchronized
+    # at the helper that knows the exact marker it caused.
     return subprocess.run(["tmux", "-L", s, *args],
                           capture_output=True, text=True, check=check,
                           env=_scrubbed_env())
+
+
+def _wait_for_pane_text(s, target, marker):
+    _wait_until(
+        lambda: marker in _tmux(s, "capture-pane", "-p", "-t", target).stdout,
+        description=f"{marker!r} in pane {target}",
+    )
 
 
 def _tag(s, target, role, bead, status):
@@ -116,11 +181,9 @@ def _pane_count(s):
 def test_reports_done_and_running(sock):
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     # window w pane 0 = a done worker; split for a running worker
     _tag(sock, "w.0", "worker", "bead-done", "done")
     _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.1", "worker", "bead-run", "running")
 
     r = _run(sock)
@@ -132,16 +195,19 @@ def test_reports_done_and_running(sock):
 def test_reap_kills_only_done_pane(sock):
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.0", "worker", "bead-done", "done")
     _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.1", "worker", "bead-run", "running")
     assert _pane_count(sock) == 2
 
     r = _run(sock, "--reap")
     assert r.returncode == 0, r.stderr
-    time.sleep(0.4)
+    assert "reaped 1 done pane(s)" in r.stderr
+    # SABLE-xyb92: this invocation's table must describe the post-reap tmux
+    # state. The running pane is the positive control; the killed pane must not
+    # remain in stdout from the pre-reap decision snapshot.
+    assert "bead-run" in r.stdout and "running" in r.stdout
+    assert "bead-done" not in r.stdout
     assert _pane_count(sock) == 1  # only the running worker survives
     survivors = _tmux(sock, "list-panes", "-a", "-F", "#{@sable_bead}").stdout
     assert "bead-run" in survivors
@@ -158,7 +224,6 @@ def test_reap_kills_beadless_done_producer_with_valid_deliverable(sock, tmp_path
     deliverable.write_text('{"ok": true}')
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     # deliberately no @sable_bead set at all
     _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_role", "victor")
     _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_status", "done")
@@ -168,7 +233,6 @@ def test_reap_kills_beadless_done_producer_with_valid_deliverable(sock, tmp_path
 
     r = _run(sock, "--reap")
     assert r.returncode == 0, r.stderr
-    time.sleep(0.4)
     # the killed pane was the session's only one -- the whole server exits,
     # so list-panes itself now fails rather than reporting zero panes
     assert _tmux(sock, "has-session", "-t", "w", check=False).returncode != 0
@@ -186,7 +250,6 @@ def test_reap_scoped_to_caller_repo(sock, tmp_path):
         sess = f"sable-{name}"
         _tmux(sock, "new-session", "-d", "-s", sess, "-x", "180", "-y", "40",
               "bash --noprofile --norc")
-        time.sleep(0.3)
         _tmux(sock, "set-option", "-t", sess, "@sable_repo", str(repo.resolve()))
         _tag(sock, f"{sess}:0.0", "worker", f"bead-{name}", "done")
         sessions[name] = (repo, sess)
@@ -200,7 +263,6 @@ def test_reap_scoped_to_caller_repo(sock, tmp_path):
     r = subprocess.run(["python3", str(BIN), "--reap"], capture_output=True,
                        text=True, env=env, cwd=sessions["alpha"][0])
     assert r.returncode == 0, r.stderr
-    time.sleep(0.4)
     # alpha's done worker (its only pane -> the session) is gone
     assert _tmux(sock, "has-session", "-t", "sable-alpha",
                  check=False).returncode != 0
@@ -218,7 +280,6 @@ def test_reports_stale_done_tag_as_running_after_sampling_window(sock):
     import os
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.0", "worker", "bead-flip", "done")
     # fires mid-window, well before the second internal sample at ~1.5s
     subprocess.Popen(
@@ -321,10 +382,8 @@ def test_reap_protects_done_pane_in_attached_clients_current_window(sock):
     zero clients by definition and can't exercise this path)."""
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.0", "worker", "bead-watched", "done")
     _tmux(sock, "new-window", "-t", "w", "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w:1.0", "worker", "bead-other", "done")
     _tmux(sock, "select-window", "-t", "w:0")
 
@@ -332,7 +391,6 @@ def test_reap_protects_done_pane_in_attached_clients_current_window(sock):
     try:
         r = _run(sock, "--reap")
         assert r.returncode == 0, r.stderr
-        time.sleep(0.4)
         survivors = _tmux(sock, "list-panes", "-a", "-F", "#{@sable_bead}").stdout
         assert "bead-watched" in survivors  # protected: client's current window
         assert "bead-other" not in survivors  # different window: reaped normally
@@ -355,11 +413,9 @@ def _two_manager_session(sock):
     session out from under the assertions."""
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.0", "worker", "bead-optimus", "done")
     _tag_lane(sock, "w.0", "optimus")
     _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.1", "worker", "bead-tarzan", "done")
     _tag_lane(sock, "w.1", "tarzan")
 
@@ -391,7 +447,6 @@ def test_reap_under_other_manager_spares_owning_lane_done_pane(sock):
     # tarzan sweeps: only his own done pane is reaped
     r = _run_as(sock, "tarzan", "--reap")
     assert r.returncode == 0, r.stderr
-    time.sleep(0.4)
     survivors = _tmux(sock, "list-panes", "-a", "-F", "#{@sable_bead}").stdout
     assert "bead-optimus" in survivors, survivors  # owner's signal preserved
     assert "bead-tarzan" not in survivors, survivors  # tarzan reaped his own
@@ -399,7 +454,6 @@ def test_reap_under_other_manager_spares_owning_lane_done_pane(sock):
     # optimus now collects his own done pane
     r2 = _run_as(sock, "optimus", "--reap")
     assert r2.returncode == 0, r2.stderr
-    time.sleep(0.4)
     # optimus's pane was the session's only remaining one -> the session exits
     assert _tmux(sock, "has-session", "-t", "w", check=False).returncode != 0
 
@@ -416,7 +470,7 @@ def _prime_dialog(s, target):
     _tmux(s, "send-keys", "-t", target,
           "printf '  ? pick one\\n  > 1. alpha\\n    2. beta\\n"
           "  (Use arrow keys, Enter to select)\\n'", "Enter")
-    time.sleep(0.4)
+    _wait_for_pane_text(s, target, "Use arrow keys")
 
 
 def test_dialog_probe_flags_stalled_manager_and_spares_normal_pane(sock):
@@ -426,7 +480,6 @@ def test_dialog_probe_flags_stalled_manager_and_spares_normal_pane(sock):
     pane showing no overlay is NOT flagged."""
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     # pane 0: a MANAGER pane (chuck) parked on a dialog/overlay
     _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_role", "chuck")
     _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_class", "manager")
@@ -434,10 +487,8 @@ def test_dialog_probe_flags_stalled_manager_and_spares_normal_pane(sock):
     _prime_dialog(sock, "w.0")
     # pane 1: a normal worker pane, plain prompt, no overlay
     _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.1", "worker", "bead-ok", "running")
     _tag_lane(sock, "w.1", "optimus")
-    time.sleep(0.3)
 
     p0 = _tmux(sock, "display-message", "-p", "-t", "w.0", "#{pane_id}").stdout.strip()
     p1 = _tmux(sock, "display-message", "-p", "-t", "w.1", "#{pane_id}").stdout.strip()
@@ -460,7 +511,6 @@ def test_dialog_probe_silent_when_no_pane_is_stalled(sock):
     false-positive a legitimately-working lane."""
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.0", "worker", "bead-run", "running")
     r = _run(sock, "--all")
     assert r.returncode == 0, r.stderr
@@ -476,7 +526,7 @@ def _prime_idle_composer_with_numbered_block(s, target):
           "printf '  1. rebase\\n  2. run tests\\n"
           "  3. push\\n  \\342\\224\\200\\342\\224\\200\\342\\224\\200\\342\\224\\200\\n'",
           "Enter")
-    time.sleep(0.4)
+    _wait_for_pane_text(s, target, "run tests")
 
 
 def test_dialog_probe_does_not_flag_idle_composer_with_numbered_block(sock):
@@ -487,12 +537,10 @@ def test_dialog_probe_does_not_flag_idle_composer_with_numbered_block(sock):
     affordance, which plain numbered text lacks."""
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_role", "optimus")
     _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_class", "manager")
     _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_lane", "optimus")
     _prime_idle_composer_with_numbered_block(sock, "w.0")
-    time.sleep(0.3)
 
     r = _run(sock, "--all")
     assert r.returncode == 0, r.stderr
@@ -506,12 +554,10 @@ def test_dialog_probe_alert_surfaces_evidence_snippet(sock):
     menu is flagged AND its affordance line appears in the output."""
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_role", "chuck")
     _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_class", "manager")
     _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_lane", "chuck")
     _prime_dialog(sock, "w.0")
-    time.sleep(0.3)
 
     r = _run(sock, "--all")
     assert r.returncode == 0, r.stderr
@@ -529,11 +575,9 @@ def test_default_view_reports_other_lanes_instead_of_false_empty(sock):
     --all; --all then lists both."""
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.0", "worker", "SABLE-jfg6.3", "running")
     _tag_lane(sock, "w.0", "optimus")
     _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.1", "worker", "SABLE-done9", "done")
     _tag_lane(sock, "w.1", "optimus")
 
@@ -557,12 +601,10 @@ def test_dialog_probe_json_carries_stalls_and_workers(sock):
     import json as _json
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_role", "chuck")
     _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_class", "manager")
     _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_lane", "chuck")
     _prime_dialog(sock, "w.0")
-    time.sleep(0.3)
 
     r = _run(sock, "--all", "--json")
     assert r.returncode == 0, r.stderr
@@ -571,6 +613,80 @@ def test_dialog_probe_json_carries_stalls_and_workers(sock):
     assert len(payload["dialog_stalls"]) == 1
     assert payload["dialog_stalls"][0]["status"] == "dialog-stalled"
     assert payload["dialog_stalls"][0]["class"] == "manager"
+
+
+# --- SABLE-n87ov: reporting a stall reproduces the symptom on the reporter's
+# own audience. The probe used to grep the WHOLE visible pane for a dialog
+# affordance substring, so a sable-msg relay QUOTING that substring (to help
+# the recipient recognise the earlier true positive) rendered the same text
+# into the recipient's healthy pane and re-triggered the detector on it. Fixed
+# by anchoring the match to the pane's CURRENT CURSOR REGION -- content after
+# the last bare composer prompt line -- since a live overlay owns the bottom
+# of the pane (nothing, least of all a composer, follows it) while a mention
+# is followed, on an otherwise-idle pane, by the reappeared empty composer. ---
+
+def _echo_dialog_text_as_mention(s, target):
+    """Print the SAME dialog-affordance text a real overlay would show, but as
+    ordinary scrollback output -- a stand-in for a sable-msg relay quoting a
+    stall report -- followed by a bare composer prompt glyph proving the pane
+    is otherwise idle, not actually parked on a dialog."""
+    _tmux(s, "send-keys", "-t", target,
+          "printf '\\342\\237\\246SABLE-MSG\\342\\237\\247 pane w0 stalled -- "
+          "matched (Use arrow keys, Enter to select)\\n\\342\\235\\257\\n'", "Enter")
+    _wait_for_pane_text(s, target, "SABLE-MSG")
+
+
+def test_dialog_probe_ignores_mention_but_still_flags_real_overlay(sock):
+    """The bead's core two-pane repro: pane 0 genuinely shows the select-overlay
+    text (no composer follows it); pane 1 shows the IDENTICAL affordance text
+    as an ordinary echoed mention, followed by an idle composer glyph. Exactly
+    ONE pane -- the real overlay -- is reported DIALOG-STALLED."""
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_role", "tarzan")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_lane", "tarzan")
+    _prime_dialog(sock, "w.0")
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_role", "lincoln")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_lane", "lincoln")
+    _echo_dialog_text_as_mention(sock, "w.1")
+
+    p0 = _tmux(sock, "display-message", "-p", "-t", "w.0", "#{pane_id}").stdout.strip()
+    p1 = _tmux(sock, "display-message", "-p", "-t", "w.1", "#{pane_id}").stdout.strip()
+
+    r = _run(sock, "--all")
+    assert r.returncode == 0, r.stderr
+    combined = r.stdout + r.stderr
+    assert r.stdout.count("DIALOG-STALLED") == 1, r.stdout
+    assert p0 in combined, combined                 # the real overlay IS flagged
+    assert p1 not in r.stderr, r.stderr              # the mention is NOT flagged
+    assert "STALLED on a dialog/overlay" in r.stderr, r.stderr
+
+
+def test_dialog_probe_positive_control_neither_flagged_once_dismissed(sock):
+    """Positive control for the case above: once the genuinely-stalled pane's
+    overlay is dismissed (back to a plain idle composer) and the mention pane
+    is likewise idle, NEITHER pane is flagged -- the fix isn't 'detect
+    nothing', it correctly clears once the real condition is gone."""
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_role", "tarzan")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_lane", "tarzan")
+    _tmux(sock, "send-keys", "-t", "w.0", "printf 'back to normal\\n\\342\\235\\257\\n'", "Enter")
+    _wait_for_pane_text(sock, "w.0", "back to normal")
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_role", "lincoln")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_class", "manager")
+    _tmux(sock, "set-option", "-p", "-t", "w.1", "@sable_lane", "lincoln")
+    _echo_dialog_text_as_mention(sock, "w.1")
+
+    r = _run(sock, "--all")
+    assert r.returncode == 0, r.stderr
+    assert "DIALOG-STALLED" not in r.stdout, r.stdout
+    assert "STALLED on a dialog/overlay" not in r.stderr, r.stderr
 
 
 # --- reaper liveness guard: a live agent we didn't spawn as a worker survives
@@ -602,20 +718,16 @@ def test_reap_spares_pane_whose_live_process_is_the_cockpit(sock):
     # @sable_role=worker / @sable_status=done. --reap kills ONLY the real worker.
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
           "bash --noprofile --norc")
-    time.sleep(0.3)
     placeholder = _tmux(sock, "list-panes", "-t", "w", "-F", "#{pane_id}").stdout.strip()
     worker = _split_pane(sock, "CLAUDE_AGENT_NAME=optimus", "SABLE_WORKER_PANE=1")
     cockpit = _split_pane(sock, "CLAUDE_AGENT_NAME=lincoln", "SABLE_WORKER_PANE=")
-    time.sleep(0.3)
     _tag(sock, worker, "worker", "bead-real", "done")
     _tag(sock, cockpit, "worker", "bead-stale", "done")   # poisoned/leftover tags
     _tmux(sock, "kill-pane", "-t", placeholder)           # drop the ambient-env placeholder
-    time.sleep(0.3)
     assert _pane_count(sock) == 2
 
     r = _run(sock, "--reap")
     assert r.returncode == 0, r.stderr
-    time.sleep(0.4)
     assert _pane_count(sock) == 1  # the cockpit survives; the real worker is reaped
     survivors = _tmux(sock, "list-panes", "-a", "-F", "#{@sable_bead}").stdout
     assert "bead-stale" in survivors      # cockpit pane spared
@@ -634,20 +746,16 @@ def test_reap_spares_pane_whose_live_process_is_a_resumed_manager(sock):
     # real done worker that shares its manager's lane name.
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
           "bash --noprofile --norc")
-    time.sleep(0.3)
     placeholder = _tmux(sock, "list-panes", "-t", "w", "-F", "#{pane_id}").stdout.strip()
     worker = _split_pane(sock, "CLAUDE_AGENT_NAME=optimus", "SABLE_WORKER_PANE=1")
     manager = _split_pane(sock, "CLAUDE_AGENT_NAME=optimus", "SABLE_WORKER_PANE=")
-    time.sleep(0.3)
     _tag(sock, worker, "worker", "bead-real", "done")
     _tag(sock, manager, "worker", "bead-stale", "done")   # stale/leftover worker tags
     _tmux(sock, "kill-pane", "-t", placeholder)
-    time.sleep(0.3)
     assert _pane_count(sock) == 2
 
     r = _run(sock, "--reap")
     assert r.returncode == 0, r.stderr
-    time.sleep(0.4)
     assert _pane_count(sock) == 1  # the manager survives; the real worker is reaped
     survivors = _tmux(sock, "list-panes", "-a", "-F", "#{@sable_bead}").stdout
     assert "bead-stale" in survivors      # resumed manager spared
@@ -691,10 +799,8 @@ def test_reap_kills_done_unconfirmed_pane_superseded_by_live_successor(sock, tmp
 
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.0", "worker", "SABLE-c008-x1", "done")
     _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.1", "worker", "SABLE-c008-x1", "running")
     assert _pane_count(sock) == 2
     survivor_pane = _tmux(sock, "display-message", "-p", "-t", "w.1",
@@ -706,7 +812,6 @@ def test_reap_kills_done_unconfirmed_pane_superseded_by_live_successor(sock, tmp
     r = subprocess.run(["python3", str(BIN), "--reap"], capture_output=True,
                        text=True, env=env)
     assert r.returncode == 0, r.stderr
-    time.sleep(0.4)
     assert _pane_count(sock) == 1  # only the live successor survives
     remaining = _tmux(sock, "list-panes", "-a", "-F", "#{pane_id}").stdout.strip()
     assert remaining == survivor_pane, remaining
@@ -722,7 +827,6 @@ def test_reap_spares_lone_done_unconfirmed_pane(sock, tmp_path):
 
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
-    time.sleep(0.4)
     _tag(sock, "w.0", "worker", "SABLE-c008-x2", "done")
     assert _pane_count(sock) == 1
 
@@ -732,8 +836,126 @@ def test_reap_spares_lone_done_unconfirmed_pane(sock, tmp_path):
     r = subprocess.run(["python3", str(BIN), "--reap"], capture_output=True,
                        text=True, env=env)
     assert r.returncode == 0, r.stderr
-    time.sleep(0.4)
     assert _pane_count(sock) == 1  # lone done-unconfirmed pane survives
+
+
+# --- SABLE-1tzv: sable-view listed a done-tagged worker pane correctly while
+# sable-worker-status --reap, run moments later, printed 'no worker panes' and
+# reaped nothing -- read live as "reap vs view detection disagree". The
+# REVISED hypothesis (confirmed here): sable-view (parse_panes/_FORMAT above)
+# has NO lane concept at all -- it always lists the whole fleet -- while
+# sable-worker-status's DEFAULT view is scoped to the caller's own lane
+# (SABLE-dcw2, landed after this incident). The two tools were being compared
+# under DIFFERENT scopes, not disagreeing about the SAME scope. The honest
+# fleet-wide equivalent is `sable-worker-status --all` (also already
+# implicit in --reap: main() reaps exactly the `workers` list it prints, so
+# view and reap can never diverge for a given scope by construction). This
+# locks that parity in: under the SAME (fleet-wide) scope, sable-view and
+# `sable-worker-status --all` agree on a done worker pane, and --reap --all
+# actually collects what both list. ---
+
+def _run_view(s, *args):
+    return subprocess.run(["python3", str(VIEW_BIN), *args], capture_output=True,
+                          text=True, env={**_scrubbed_env(), "SABLE_TMUX_SOCKET": s,
+                                          "SABLE_TMUX_SESSION": "w"})
+
+
+def test_view_and_reap_all_scope_agree_on_done_worker_pane(sock):
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    pane = _tmux(sock, "display-message", "-p", "-t", "w.0", "#{pane_id}").stdout.strip()
+    _tag(sock, pane, "worker", "SABLE-1tzv-x", "done")
+
+    view = _run_view(sock, "--json")
+    assert view.returncode == 0, view.stderr
+    view_hit = [p for p in json.loads(view.stdout) if p["pane"] == pane]
+    assert view_hit and view_hit[0]["status"] == "done", view.stdout
+
+    status = _run_as(sock, "", "--all", "--json")
+    assert status.returncode == 0, status.stderr
+    status_hit = [w for w in json.loads(status.stdout)["workers"] if w["pane"] == pane]
+    assert status_hit and status_hit[0]["status"] == "done", status.stdout
+
+    reap = _run_as(sock, "", "--all", "--reap")
+    assert reap.returncode == 0, reap.stderr
+    # the lone pane was killed -- the server itself may have exited with it
+    # (no clients attached, no panes left), so tolerate a failed list-panes
+    # exactly like that: zero panes.
+    remaining = _tmux(sock, "list-panes", "-a", "-F", "#{pane_id}", check=False)
+    assert remaining.returncode != 0 or not remaining.stdout.strip()
+
+
+# --- SABLE-h1fa7: sable-worker-status answered a LANE question when asked a
+# FLEET one -- it filtered panes to the caller's own lane with NO indication
+# it had done so. Byte-indistinguishable from a genuine fleet-wide "nothing
+# else is running", so a stranded-claim sweep reading tarzan's own-lane table
+# nearly released four OTHER lanes' live workers' claims. Real tmux panes
+# across two lanes here (not mocked -- this tool reads live pane state), to
+# prove the fix against the actual failure, not a stand-in for it. ---
+
+def _three_lane_session(sock):
+    """Session 'w': pane0 = tarzan's ONE live worker (bead-t, running); panes
+    1-2 = optimus's TWO MORE live workers (bead-o1/bead-o2, running) --
+    reconstructs the incident shape: the caller's own lane has a single live
+    pane, while another lane has MULTIPLE live (not done) panes a silently
+    lane-scoped listing would make invisible."""
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    _tag(sock, "w.0", "worker", "bead-t", "running")
+    _tag_lane(sock, "w.0", "tarzan")
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    _tag(sock, "w.1", "worker", "bead-o1", "running")
+    _tag_lane(sock, "w.1", "optimus")
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    _tag(sock, "w.2", "worker", "bead-o2", "running")
+    _tag_lane(sock, "w.2", "optimus")
+
+
+def test_default_scope_named_and_hidden_count_for_real_panes(sock):
+    """THE REGRESSION THAT MATTERS: a lane-scoped default listing must never
+    read as a fleet-wide "nothing else is running". tarzan's default view
+    must name its own scope, show only its own pane (bead-t), and STATE that
+    two panes are hidden -- proof a reader cannot conclude bead-o1/bead-o2
+    aren't running, the exact conclusion that would have released four real
+    workers' claims in the recorded incident. --all then shows all three,
+    labelled all-lanes."""
+    _three_lane_session(sock)
+
+    mine = _run_as(sock, "tarzan")
+    assert mine.returncode == 0, mine.stderr
+    assert "bead-t" in mine.stdout, mine.stdout
+    assert "bead-o1" not in mine.stdout and "bead-o2" not in mine.stdout, mine.stdout
+    assert "lane=tarzan" in mine.stdout, mine.stdout
+    assert "2 hidden" in mine.stdout, mine.stdout
+
+    everything = _run_as(sock, "tarzan", "--all")
+    assert everything.returncode == 0, everything.stderr
+    assert "bead-t" in everything.stdout, everything.stdout
+    assert "bead-o1" in everything.stdout, everything.stdout
+    assert "bead-o2" in everything.stdout, everything.stdout
+    assert "all-lanes" in everything.stdout, everything.stdout
+
+
+def test_json_output_carries_scope_metadata(sock):
+    """--json exposes the same scope facts machine-readably (lane/shown/
+    hidden) so a scripted caller -- e.g. the stranded-claim sweep that
+    motivated this bead -- can check for hidden panes programmatically
+    instead of grepping table text."""
+    _three_lane_session(sock)
+
+    mine = _run_as(sock, "tarzan", "--json")
+    assert mine.returncode == 0, mine.stderr
+    payload = json.loads(mine.stdout)
+    assert payload["scope"]["lane"] == "tarzan"
+    assert payload["scope"]["shown"] == 1
+    assert payload["scope"]["hidden"] == 2
+
+    everything = _run_as(sock, "tarzan", "--all", "--json")
+    assert everything.returncode == 0, everything.stderr
+    payload_all = json.loads(everything.stdout)
+    assert payload_all["scope"]["lane"] is None
+    assert payload_all["scope"]["shown"] == 3
+    assert payload_all["scope"]["hidden"] == 0
 
 
 if __name__ == "__main__":

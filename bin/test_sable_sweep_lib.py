@@ -38,7 +38,7 @@ def test_export_snapshot_parses_json_list():
 
     result = lib.export_snapshot(run=fake_run)
     assert result == [{"id": "A"}, {"id": "B"}]
-    assert calls == [["bd", "list", "--json"]]
+    assert calls == [["bd", "list", "--json", "--limit", "0"]]
 
 
 def test_export_snapshot_appends_scope_args():
@@ -49,7 +49,55 @@ def test_export_snapshot_appends_scope_args():
         return "[]"
 
     lib.export_snapshot(scope_args=["--status=open", "--not-claimed"], run=fake_run)
-    assert calls == [["bd", "list", "--json", "--status=open", "--not-claimed"]]
+    assert calls == [["bd", "list", "--json", "--status=open", "--not-claimed", "--limit", "0"]]
+
+
+# --- export_snapshot: default-safe against the 50-row truncation cap
+# (SABLE-52aym) ------------------------------------------------------------
+
+def test_export_snapshot_defaults_to_unlimited_when_no_limit_given():
+    calls = []
+
+    def fake_run(cmd):
+        calls.append(cmd)
+        return "[]"
+
+    lib.export_snapshot(run=fake_run)
+    assert "--limit" in calls[0]
+    assert calls[0][calls[0].index("--limit") + 1] == "0"
+
+
+def test_export_snapshot_does_not_double_add_limit_when_caller_passes_one():
+    calls = []
+
+    def fake_run(cmd):
+        calls.append(cmd)
+        return "[]"
+
+    lib.export_snapshot(scope_args=["--status=open", "--limit", "25"], run=fake_run)
+    assert calls == [["bd", "list", "--json", "--status=open", "--limit", "25"]]
+
+
+def test_export_snapshot_does_not_double_add_limit_equals_form():
+    calls = []
+
+    def fake_run(cmd):
+        calls.append(cmd)
+        return "[]"
+
+    lib.export_snapshot(scope_args=["--limit=10"], run=fake_run)
+    assert calls == [["bd", "list", "--json", "--limit=10"]]
+
+
+def test_export_snapshot_does_not_double_add_short_limit_flag():
+    calls = []
+
+    def fake_run(cmd):
+        calls.append(cmd)
+        return "[]"
+
+    lib.export_snapshot(scope_args=["-n", "5"], run=fake_run)
+    assert calls == [["bd", "list", "--json", "-n", "5"]]
 
 
 def test_export_snapshot_empty_output_is_empty_list():

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # test-install.sh — front-door integration for install.sh (SABLE-ppy / iw0; tmux-only SABLE-qa4d).
 # Verifies install.sh delegates the Orchestration tier to sable-orchestration-install
-# (no topology fork — the tmux warm-pane layer is the only one), auto-merges the
-# settings snippet idempotently + non-clobbering, rejects the retired topology
+# (no topology fork — the tmux warm-pane layer is the only one), applies the
+# settings snippet only with explicit consent, rejects the retired topology
 # flags, skips the layer for Foundation, and leaves runnable installed hook copies.
 # Runs install.sh against scratch HOMEs (real bd/dolt/python on PATH).
 set -uo pipefail
@@ -24,8 +24,9 @@ print(sum(1 for bl in d.get('hooks',{}).values() if isinstance(bl,list) for b in
 # canonical-checkout guard here since these tests exercise install.sh's
 # delegation wiring, not the guard itself (see test-install-guard.sh for that).
 TS="$(mktemp -d)"
-HOME="$TS" bash "$INSTALL" --from-here >/tmp/ti-orch.log 2>&1
+HOME="$TS" bash "$INSTALL" --from-here --merge-settings >/tmp/ti-orch.log 2>&1
 SS="$TS/.claude/settings.json"
+CS="$TS/.codex/hooks.json"
 present "$TS/.claude/hooks/multi-manager/mode-interlock.sh" "orchestration: delegate installed multi-manager hooks"
 present "$TS/.claude/sable/agents.yaml"                     "orchestration: registry installed"
 present "$TS/.claude/skills/sable-plan/SKILL.md"            "orchestration: /sable-plan skill installed"
@@ -33,6 +34,12 @@ present "$TS/.claude/sable/roles/optimus.md"                "orchestration: pane
 absent  "$TS/.claude/agents-teams"                          "orchestration: no agents-teams defs (tmux-only)"
 [ "$(count_marker "$SS" mode-interlock.sh)" = "2" ] && pass "orchestration: interlock merged on both legs" || fail "orchestration: interlock merged on both legs" "count=$(count_marker "$SS" mode-interlock.sh)"
 [ "$(count_marker "$SS" pre-push-rebase-test)" -ge 1 ] && pass "orchestration: governance hooks present in settings" || fail "orchestration: governance hooks present" "count=$(count_marker "$SS" pre-push-rebase-test)"
+present "$CS" "Codex: hooks.json created"
+for _base_hook in tdd-evidence.sh tdd-gate.sh bead-description-gate.sh tdd-remind.sh agent-tdd-enforce.sh bead-quality.sh; do
+  [ "$(count_marker "$CS" "$_base_hook")" = "1" ] &&
+    pass "Codex: canonical base hook merged exactly once ($_base_hook)" ||
+    fail "Codex: canonical base hook merged exactly once ($_base_hook)" "count=$(count_marker "$CS" "$_base_hook")"
+done
 grep -q 'sable-tmux' /tmp/ti-orch.log && pass "orchestration: output points at the sable-tmux bring-up" || fail "orchestration: output points at the sable-tmux bring-up"
 ! grep -q 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS' /tmp/ti-orch.log && pass "orchestration: no experimental-teams-flag instruction printed" || fail "orchestration: no experimental-teams-flag instruction printed"
 
@@ -44,14 +51,42 @@ printf '%s' '{"tool_name":"Bash","tool_input":{"command":"echo hi"}}' | bash "$T
 present "$TS/.claude/agents/sherlock.md" "plain install lands base agent defs"
 
 # idempotent re-run: interlock count stable
-HOME="$TS" bash "$INSTALL" --from-here >/dev/null 2>&1
+HOME="$TS" bash "$INSTALL" --from-here --merge-settings >/dev/null 2>&1
 [ "$(count_marker "$SS" mode-interlock.sh)" = "2" ] && pass "re-run idempotent (interlock still 2)" || fail "re-run idempotent" "count=$(count_marker "$SS" mode-interlock.sh)"
+[ "$(count_marker "$CS" tdd-gate.sh)" = "1" ] && pass "re-run idempotent (Codex base gate still 1)" || fail "re-run idempotent (Codex base gate)" "count=$(count_marker "$CS" tdd-gate.sh)"
 
 # non-clobber: a pre-existing user hook survives the merge
-TN="$(mktemp -d)"; mkdir -p "$TN/.claude"
+TN="$(mktemp -d)"; mkdir -p "$TN/.claude" "$TN/.codex"
 printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash /tmp/user-own.sh"}]}]}}' > "$TN/.claude/settings.json"
-HOME="$TN" bash "$INSTALL" --from-here >/dev/null 2>&1
+printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"CustomTool","hooks":[{"type":"command","command":"bash /tmp/codex-user-own.sh"}]}]}}' > "$TN/.codex/hooks.json"
+HOME="$TN" bash "$INSTALL" --from-here --merge-settings >/dev/null 2>&1
 grep -q 'user-own.sh' "$TN/.claude/settings.json" && pass "non-clobber: pre-existing user hook survives" || fail "non-clobber: pre-existing user hook survives"
+grep -q 'codex-user-own.sh' "$TN/.codex/hooks.json" && pass "non-clobber: pre-existing Codex hook survives" || fail "non-clobber: pre-existing Codex hook survives"
+
+# default is genuinely print-only, including when the proposal has changes.
+TP="$(mktemp -d)"; mkdir -p "$TP/.claude" "$TP/.codex"
+printf '%s\n' '{"permissions":{"allow":["Read"]}}' > "$TP/.claude/settings.json"
+printf '%s\n' '{"hooks":{"CustomEvent":[]}}' > "$TP/.codex/hooks.json"
+cp "$TP/.claude/settings.json" "$TP/settings.before"
+cp "$TP/.codex/hooks.json" "$TP/codex-hooks.before"
+HOME="$TP" bash "$INSTALL" --from-here >/tmp/ti-print-only.log 2>&1
+cmp -s "$TP/settings.before" "$TP/.claude/settings.json" &&
+  pass "unflagged install leaves settings.json byte-identical" ||
+  fail "unflagged install leaves settings.json byte-identical"
+cmp -s "$TP/codex-hooks.before" "$TP/.codex/hooks.json" &&
+  pass "unflagged install leaves Codex hooks.json byte-identical" ||
+  fail "unflagged install leaves Codex hooks.json byte-identical"
+grep -q 'tdd-gate.sh' /tmp/ti-print-only.log &&
+  pass "unflagged install proposal names the Codex base gate" ||
+  fail "unflagged install proposal names the Codex base gate"
+grep -q 'NOT APPLIED' /tmp/ti-print-only.log &&
+  pass "unflagged install names the unapplied settings proposal" ||
+  fail "unflagged install names the unapplied settings proposal"
+grep -q 'whole install is print-only for settings unless --merge-settings was' "$INSTALL" &&
+  pass "source contract and unflagged no-write behavior agree" ||
+  fail "source contract and unflagged no-write behavior agree"
+present "$TP/.claude/hooks/multi-manager/mode-interlock.sh" \
+  "print-only settings still stages the orchestration artifacts"
 
 # ---------- retired flags are rejected (one topology, one tier) ----------
 for _flag in --teams --subagent --nested --orchestration --foundation; do
@@ -70,19 +105,62 @@ done
 # untouched, prime block project-side, double-fire refusal + --force.
 # ===================================================================
 
-# claude_manifest DIR HOMEDIR — content-hash manifest of every file under DIR,
-# with HOMEDIR normalized to a placeholder so HOME-embedding files (settings.json)
-# hash deterministically across scratch HOMEs. Excludes .bak / *install-bak*.
+# claude_manifest DIR HOMEDIR REPODIR — content-hash manifest of every file
+# under DIR. HOMEDIR is normalized throughout; REPODIR is normalized only in
+# the two generated timer artifacts that intentionally embed it. This keeps
+# hashes deterministic across scratch HOMEs and checkout/worktree paths without
+# hiding an accidental source-path leak elsewhere. Excludes .bak / *install-bak*.
+# .sable-install-provenance (SABLE-78kxu) additionally gets its commit=/branch=/
+# timestamp= fields normalized: those are stamped from the CURRENT repo HEAD and
+# wall-clock time, so they vary every run/commit/worktree and would make the
+# golden baseline re-drift immediately after any regen (SABLE-z31s1).
 # MUST stay byte-identical to fixtures/regen: golden was captured with this exact fn.
 claude_manifest() {
-  local dir="$1" home="$2"
+  local dir="$1" home_dir="$2" repo_dir="$3"
   [ -d "$dir" ] || { printf '(no dir: %s)\n' "$dir"; return 0; }
   ( cd "$dir" && find . -type f ! -name '*.bak' ! -path '*install-bak*' | LC_ALL=C sort | while IFS= read -r f; do
-      h="$(sed "s@${home}@__HOME__@g" "$f" | sha256sum | cut -d' ' -f1)"
+      if [ "$f" = "./.sable-install-provenance" ]; then
+        h="$(sed -e "s@${home_dir}@__HOME__@g" \
+                  -e 's/^commit=.*/commit=__COMMIT__/' \
+                  -e 's/^branch=.*/branch=__BRANCH__/' \
+                  -e 's/^timestamp=.*/timestamp=__TIMESTAMP__/' "$f" | sha256sum | cut -d' ' -f1)"
+      elif [ "$f" = "./sable/reconcile-timer/sable-reconcile-timer.service" ] ||
+           [ "$f" = "./sable/reconcile-timer/sable-reconcile-timer.cron" ]; then
+        # These two generated artifacts intentionally bind to the source
+        # checkout. Normalize only this known volatile field: a repo path
+        # appearing in any other installed file remains visible as drift.
+        h="$(sed -e "s@${repo_dir}@__REPO__@g" \
+                  -e "s@${home_dir}@__HOME__@g" "$f" | sha256sum | cut -d' ' -f1)"
+      else
+        h="$(sed -e "s@${home_dir}@__HOME__@g" "$f" | sha256sum | cut -d' ' -f1)"
+      fi
       printf '%s  %s\n' "$h" "$f"
     done )
 }
 mkrepo(){ git init "$1" >/dev/null 2>&1; }  # throwaway git repo (git-common-dir resolvable)
+
+# A golden regenerated in a clone/worktree must be valid in the canonical
+# checkout too. The raw artifacts deliberately differ (positive control);
+# only the normalized manifests may agree (SABLE-clla4).
+TM1="$(mktemp -d)"; TM2="$(mktemp -d)"
+TM1_TIMER="$TM1/install/sable/reconcile-timer/sable-reconcile-timer.service"
+TM2_TIMER="$TM2/install/sable/reconcile-timer/sable-reconcile-timer.service"
+mkdir -p "$(dirname "$TM1_TIMER")" "$(dirname "$TM2_TIMER")"
+printf 'ExecStart=%s/bin/sable-reconcile-handoffs --once\n' "$REPO" > "$TM1_TIMER"
+printf 'ExecStart=%s/bin/sable-reconcile-handoffs --once\n' "$TM2/source-repo" > "$TM2_TIMER"
+! cmp -s "$TM1_TIMER" "$TM2_TIMER" &&
+  pass "golden normalization control: source-path-bearing artifacts genuinely differ" ||
+  fail "golden normalization control: source-path-bearing artifacts genuinely differ"
+TM1_MANIFEST="$(claude_manifest "$TM1/install" "$TM1" "$REPO")"
+TM2_MANIFEST="$(claude_manifest "$TM2/install" "$TM2" "$TM2/source-repo")"
+[ "$TM1_MANIFEST" = "$TM2_MANIFEST" ] &&
+  pass "golden manifest normalizes the source checkout path" ||
+  fail "golden manifest normalizes the source checkout path"
+printf 'Environment=PLANTED_CONTENT_CHANGE=1\n' >> "$TM2_TIMER"
+[ "$TM1_MANIFEST" != "$(claude_manifest "$TM2/install" "$TM2" "$TM2/source-repo")" ] &&
+  pass "golden manifest still detects a real installed-content change" ||
+  fail "golden manifest still detects a real installed-content change"
+rm -rf "$TM1" "$TM2"
 
 # ---------- CRITICAL: --project leaves ~/.claude byte-identical ----------
 # Snapshot HOME/.claude ONLY (the ~/.local/bin CLI symlinks are by-design global,
@@ -92,9 +170,9 @@ printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"comma
 printf 'pre-existing user notes\n' > "$TH1/.claude/CLAUDE.md"
 printf 'keep me\n' > "$TH1/.claude/agents/keep.md"
 PROJ1="$(mktemp -d)"; mkrepo "$PROJ1"
-SNAP1="$(claude_manifest "$TH1/.claude" "$TH1")"
-HOME="$TH1" bash "$INSTALL" --project="$PROJ1" --from-here >/tmp/ti-proj1.log 2>&1; rc1=$?
-SNAP2="$(claude_manifest "$TH1/.claude" "$TH1")"
+SNAP1="$(claude_manifest "$TH1/.claude" "$TH1" "$REPO")"
+HOME="$TH1" bash "$INSTALL" --project="$PROJ1" --from-here --merge-settings >/tmp/ti-proj1.log 2>&1; rc1=$?
+SNAP2="$(claude_manifest "$TH1/.claude" "$TH1" "$REPO")"
 [ "$rc1" = "0" ] && pass "project install runs (rc=0)" || fail "project install runs" "rc=$rc1 (see /tmp/ti-proj1.log)"
 present "$PROJ1/.claude/settings.json" "project install actually populated the project (control)"
 [ "$SNAP1" = "$SNAP2" ] && pass "test_project_install_leaves_home_claude_snapshot_byte_identical" || { fail "test_project_install_leaves_home_claude_snapshot_byte_identical" "HOME/.claude changed under --project"; diff <(printf '%s\n' "$SNAP1") <(printf '%s\n' "$SNAP2") | head -20; }
@@ -103,7 +181,7 @@ present "$PROJ1/.claude/settings.json" "project install actually populated the p
 GOLDEN="$REPO/hooks/test/fixtures/install-golden-manifest.txt"
 TG2="$(mktemp -d)"
 HOME="$TG2" bash "$INSTALL" --from-here >/tmp/ti-golden.log 2>&1
-ACT="$(claude_manifest "$TG2/.claude" "$TG2")"
+ACT="$(claude_manifest "$TG2/.claude" "$TG2" "$REPO")"
 if [ "${GOLDEN_REGEN:-0}" = "1" ]; then
   mkdir -p "$(dirname "$GOLDEN")"; printf '%s\n' "$ACT" > "$GOLDEN"
   pass "REGEN wrote golden ($(printf '%s\n' "$ACT" | grep -c .) files) — rerun without GOLDEN_REGEN to assert"
@@ -119,7 +197,7 @@ fi
 # ---------- --project populates the FULL project .claude layer ----------
 TH3="$(mktemp -d)"; PROJ3="$(mktemp -d)"; mkrepo "$PROJ3"
 printf '# My Project\n\nExisting project instructions.\n' > "$PROJ3/CLAUDE.md"
-HOME="$TH3" bash "$INSTALL" --project="$PROJ3" --from-here >/tmp/ti-proj3.log 2>&1
+HOME="$TH3" bash "$INSTALL" --project="$PROJ3" --from-here --merge-settings >/tmp/ti-proj3.log 2>&1
 present "$PROJ3/.claude/hooks/multi-manager/mode-interlock.sh" "test_project_install_populates_project_claude_full_layer: orchestration hooks"
 present "$PROJ3/.claude/sable/agents.yaml"                     "test_project_install_populates_project_claude_full_layer: registry agents.yaml"
 present "$PROJ3/.claude/sable/roles/lincoln.md"               "test_project_install_populates_project_claude_full_layer: pane roles"
@@ -153,7 +231,7 @@ absent "$PROJ5/.claude" "test_install_project_refuses...: nothing written to the
 TH6="$(mktemp -d)"; mkdir -p "$TH6/.claude"
 printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash ~/.claude/hooks/multi-manager/mode-interlock.sh"}]}]}}' > "$TH6/.claude/settings.json"
 PROJ6="$(mktemp -d)"; mkrepo "$PROJ6"
-HOME="$TH6" bash "$INSTALL" --project="$PROJ6" --force --from-here >/tmp/ti-force.log 2>&1; rc6=$?
+HOME="$TH6" bash "$INSTALL" --project="$PROJ6" --force --from-here --merge-settings >/tmp/ti-force.log 2>&1; rc6=$?
 [ "$rc6" = "0" ] && pass "test_install_project_force_flag_proceeds: exits 0 with --force" || fail "--force proceeds (exit 0)" "rc=$rc6 (see /tmp/ti-force.log)"
 present "$PROJ6/.claude/settings.json" "test_install_project_force_flag_proceeds: project layer installed under --force"
 grep -q 'mode-interlock' "$TH6/.claude/settings.json" && pass "test_install_project_force_flag_proceeds: global settings left intact" || fail "--force left global settings intact"
@@ -175,7 +253,7 @@ absent "$PROJ8/.claude" "test_install_project_dry_run: writes nothing (bare --pr
 
 rm -rf "$TH1" "$PROJ1" "$TG2" "$TH3" "$PROJ3" "$TH5" "$PROJ5" "$TH6" "$PROJ6" "$TH8" "$PROJ8"
 
-rm -rf "$TS" "$TN"
+rm -rf "$TS" "$TN" "$TP"
 echo
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
 if [ "$FAIL" -gt 0 ]; then echo -e "Failed:$NAMES"; exit 1; fi

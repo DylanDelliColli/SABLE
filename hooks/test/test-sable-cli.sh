@@ -35,7 +35,7 @@ done
 
 # --- dispatch: sable <sub> execs sable-<sub> ---
 via_umbrella="$(bash "$SABLE" mode path 2>/dev/null)"
-direct="$(bash "$REPO/bin/sable-mode" path 2>/dev/null)"
+direct="$("$REPO/bin/sable-mode" path 2>/dev/null)"
 if [ -n "$via_umbrella" ] && [ "$via_umbrella" = "$direct" ]; then
   pass "sable mode path dispatches to sable-mode"
 else

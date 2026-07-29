@@ -37,11 +37,22 @@ def run_install(home_dir: Path):
     assert result.returncode == 0, f"install.sh failed:\n{result.stdout}\n{result.stderr}"
 
 
-def run_doctor(claude_dir: Path, *extra_args, env=None):
+def run_doctor(claude_dir: Path, *extra_args, env=None, bin_dir=None, cwd=None):
+    # bin_dir defaults to the fixture's OWN ~/.local/bin (claude_dir's sibling
+    # under the same redirected HOME run_install used) — never the real
+    # machine's ~/.local/bin. Without this, sable-doctor's --bin-dir default
+    # (~/.local/bin under the subprocess's real $HOME) would silently pull
+    # the actual dev machine's pinned bins into every assertion here.
+    if bin_dir is None:
+        bin_dir = claude_dir.parent / ".local" / "bin"
+    doctor_env = dict(os.environ if env is None else env)
+    doctor_env["HOME"] = str(claude_dir.parent)
     return subprocess.run(
-        [sys.executable, str(DOCTOR), "--repo", str(REPO), "--claude-dir", str(claude_dir), *extra_args],
+        [sys.executable, str(DOCTOR), "--repo", str(REPO), "--claude-dir", str(claude_dir),
+         "--bin-dir", str(bin_dir), *extra_args],
         capture_output=True, text=True, timeout=30,
-        env=env if env is not None else os.environ,
+        env=doctor_env,
+        cwd=cwd,
     )
 
 
@@ -58,20 +69,28 @@ def run_project_install(project_dir: Path):
     assert result.returncode == 0, f"install.sh failed:\n{result.stdout}\n{result.stderr}"
 
 
-def run_doctor_project(cwd: Path, *extra_args):
+def run_doctor_project(cwd: Path, *extra_args, bin_dir=None):
+    # The hybrid contract keeps CLI tools global under the HOME used at
+    # install time (project_install below runs install.sh with HOME=cwd), so
+    # that's the bin_dir to check here — never the real machine's ~/.local/bin
+    # (see run_doctor's comment for why that matters).
+    if bin_dir is None:
+        bin_dir = cwd / ".local" / "bin"
     return subprocess.run(
-        [sys.executable, str(DOCTOR), "--repo", str(REPO), "--project", *extra_args],
+        [sys.executable, str(DOCTOR), "--repo", str(REPO), "--project",
+         "--bin-dir", str(bin_dir), *extra_args],
         cwd=str(cwd),
         capture_output=True, text=True, timeout=30,
+        env={**os.environ, "HOME": str(cwd)},
     )
 
 
-@pytest.fixture()
-def project_install(tmp_path):
+@pytest.fixture(scope="module")
+def project_install_template(tmp_path_factory):
     # the project IS its own git root, and HOME=project makes install.sh's
     # ${HOME}/.claude land exactly at <project-root>/.claude — the same path
     # --project resolves via git-common-dir.
-    project = tmp_path / "project"
+    project = tmp_path_factory.mktemp("doctor-project-template") / "project"
     project.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
     run_project_install(project)
@@ -79,10 +98,24 @@ def project_install(tmp_path):
 
 
 @pytest.fixture()
-def installed_claude_dir(tmp_path):
-    home = tmp_path / "home"
+def project_install(tmp_path, project_install_template):
+    project = tmp_path / "project"
+    shutil.copytree(project_install_template, project, symlinks=True)
+    return project
+
+
+@pytest.fixture(scope="module")
+def installed_home_template(tmp_path_factory):
+    home = tmp_path_factory.mktemp("doctor-home-template") / "home"
     home.mkdir()
     run_install(home)
+    return home
+
+
+@pytest.fixture()
+def installed_claude_dir(tmp_path, installed_home_template):
+    home = tmp_path / "home"
+    shutil.copytree(installed_home_template, home, symlinks=True)
     return home / ".claude"
 
 
@@ -93,6 +126,34 @@ def test_fresh_install_is_clean(installed_claude_dir):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "clean" in result.stdout
     assert "DRIFT" not in result.stdout
+
+
+def test_project_local_install_present_is_explicitly_outside_user_scope(
+        installed_claude_dir, tmp_path):
+    project = tmp_path / "consumer-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    project_skill = project / ".claude" / "skills" / "columbo" / "SKILL.md"
+    project_skill.parent.mkdir(parents=True)
+    project_skill.write_text("stale project-local skill\n")
+    assert project_skill.read_bytes() != (
+        REPO / "skills" / "columbo" / "SKILL.md"
+    ).read_bytes()
+
+    result = run_doctor(installed_claude_dir, cwd=project)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        f"manifest install root: {installed_claude_dir.resolve()}"
+        in result.stdout
+    )
+    assert "no other .claude install roots are in the manifest." in result.stdout
+    assert (
+        f"Shadow-role roots: "
+        f"{(project / '.claude' / 'sable' / 'roles').resolve()}"
+        in result.stdout
+    )
+    assert f"manifest install root: {(project / '.claude').resolve()}" not in result.stdout
 
 
 def test_fresh_install_json_reports_clean_true(installed_claude_dir):
@@ -119,6 +180,31 @@ def test_stale_hook_missing_a_fix_is_detected(installed_claude_dir):
     assert "DRIFT DETECTED" in result.stdout
     assert "tdd-evidence.sh" in result.stdout
     assert "bash install.sh" in result.stdout
+
+
+# --- proactive check: syntax-broken installed hook copy (SABLE-9rj7m) --------
+# hooks/test/test-tree-claim.sh's `bash -n` tripwire only ever checks the REPO
+# copy — an installed copy that is truncated, half-written by an interrupted
+# install, or hand-edited in place is invisible to every test in that suite.
+# This proves the doctor-side check against a REAL install.sh install (real
+# `bash -n`, real subprocess, real filesystem), and that it discriminates
+# rather than always firing: corrupt -> reported, restore -> clean again.
+
+def test_installed_hook_syntax_error_is_detected_then_clears_on_restore(installed_claude_dir):
+    hook = installed_claude_dir / "hooks" / "tdd-evidence.sh"
+    original = hook.read_text()
+    hook.write_text('#!/bin/sh\necho "unterminated\n')  # real parse error, not mere drift
+
+    result = run_doctor(installed_claude_dir)
+    assert result.returncode == 1
+    assert "SYNTAX-ERROR" in result.stdout
+    assert "tdd-evidence.sh" in result.stdout
+
+    hook.write_text(original)
+    result = run_doctor(installed_claude_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "clean" in result.stdout
+    assert "SYNTAX-ERROR" not in result.stdout
 
 
 # --- real incident #2: installed role file missing a block -------------------
@@ -163,7 +249,8 @@ def test_quiet_mode_one_line_on_drift(installed_claude_dir):
     assert result.returncode == 1
     assert result.stdout == ""
     assert "drifted" in result.stderr
-    assert "bash install.sh" in result.stderr
+    assert "ordinary files: 1" in result.stderr
+    assert "bash install.sh" not in result.stderr
 
 
 # --- --project flag: targets the current git project's own install ----------
@@ -224,3 +311,562 @@ def test_doctor_run_shows_cap_line(installed_claude_dir):
     result = run_doctor(installed_claude_dir, env=env_set)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "worker cap: 2 (env SABLE_MAX_WORKERS)" in result.stdout
+
+
+# --- guarded remedy (SABLE-mkj6k acceptance criterion) --------------------------
+#
+# sable-doctor's SessionStart hook (`sable-doctor --quiet 2>&1 || true`) fires
+# on every fresh pane and, on drift, told the agent to `bash install.sh` —
+# while the pin-preservation fix (this same bead) is unverified fleet-wide,
+# that instruction can silently un-pin a deliberately pinned spine bin
+# (DEFECT 2). These invoke the REAL hook command against a real install with
+# a genuinely established pin (via the real sable-bin-install) that then gets
+# reverted to a symlink exactly as a stale/pre-fix install.sh would — and
+# assert the hook's ACTUAL emitted text, not a function's return value.
+
+def _establish_real_pin(bin_dir: Path, target_name: str):
+    """Turn an existing symlinked tool into a real pin the way an operator
+    would: overwrite it with a real copy, then run the REAL sable-bin-install
+    so it detects and records the pin for real (.sable-pinned marker)."""
+    target = bin_dir / target_name
+    content = target.resolve().read_bytes()
+    target.unlink()
+    target.write_bytes(content)
+    target.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(REPO / "bin" / "sable-bin-install"), "--dir", str(bin_dir)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert target.is_file() and not target.is_symlink()
+    assert (bin_dir / ".sable-pinned").is_file()
+
+
+def _revert_pin_to_symlink(bin_dir: Path, target_name: str):
+    """Simulate DEFECT 2 directly: something reverted a pinned bin back to a
+    symlink without updating the marker (a stale pre-fix install.sh, by
+    construction, since the FIXED sable-bin-install refuses to do this)."""
+    target = bin_dir / target_name
+    target.unlink()
+    target.symlink_to(REPO / "bin" / target_name)
+
+
+def test_guarded_pinned_bin_sessionstart_hook_output_has_no_install_sh_instruction(installed_claude_dir):
+    bin_dir = installed_claude_dir.parent / ".local" / "bin"
+    # A PLAIN-pinnable bin (`sable-bin-install --classify` says "plain"). These
+    # three cases test the plain per-file pin contract specifically, so the
+    # target must be a tool that contract still applies to: sable-merge-gate
+    # became a python-IMPORTING tool with the SABLE-jd5fj.3 module split and is
+    # now classified "snapshot" — a plain copy of it severs its sibling imports,
+    # which sable-doctor correctly reports as broken. That detection is the
+    # SABLE-9boz4 design working, not a regression, so the fixture moves to a
+    # tool it fits rather than the assertions moving.
+    target_name = "sable-dolt-push"
+    _establish_real_pin(bin_dir, target_name)
+    _revert_pin_to_symlink(bin_dir, target_name)
+
+    # The REAL SessionStart hook invocation: `sable-doctor --quiet 2>&1 || true`.
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(REPO), "--claude-dir", str(installed_claude_dir),
+         "--bin-dir", str(bin_dir), "--quiet"],
+        capture_output=True, text=True, timeout=30,
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1
+    assert "bash install.sh" not in combined
+    # quiet mode is deliberately a one-liner (no filenames) — same contract
+    # the ordinary drift path already has; the full report (next test) is
+    # where the safe per-file path gets named.
+    assert "pinned bin" in combined
+
+
+def test_guarded_pinned_bin_full_report_names_the_safe_cp_path_not_install_sh(installed_claude_dir):
+    bin_dir = installed_claude_dir.parent / ".local" / "bin"
+    # A PLAIN-pinnable bin (`sable-bin-install --classify` says "plain"). These
+    # three cases test the plain per-file pin contract specifically, so the
+    # target must be a tool that contract still applies to: sable-merge-gate
+    # became a python-IMPORTING tool with the SABLE-jd5fj.3 module split and is
+    # now classified "snapshot" — a plain copy of it severs its sibling imports,
+    # which sable-doctor correctly reports as broken. That detection is the
+    # SABLE-9boz4 design working, not a regression, so the fixture moves to a
+    # tool it fits rather than the assertions moving.
+    target_name = "sable-dolt-push"
+    _establish_real_pin(bin_dir, target_name)
+    _revert_pin_to_symlink(bin_dir, target_name)
+
+    result = run_doctor(installed_claude_dir, bin_dir=bin_dir)
+    assert result.returncode == 1
+    assert "bash install.sh" not in result.stdout
+    assert "UNPINNED" in result.stdout
+    assert f"cp {REPO / 'bin' / target_name}" in result.stdout
+
+
+def test_unguarded_drift_sessionstart_reports_without_prescribing_an_action(
+        installed_claude_dir):
+    # The boot path reports the observation, while the full doctor owns the
+    # diagnosis and per-file remedy.
+    (installed_claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
+    bin_dir = installed_claude_dir.parent / ".local" / "bin"
+
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(REPO), "--claude-dir", str(installed_claude_dir),
+         "--bin-dir", str(bin_dir), "--quiet"],
+        capture_output=True, text=True, timeout=30,
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1
+    assert "ordinary files: 1" in combined
+    assert "run `sable-doctor` for detail" in combined
+    assert "bash install.sh" not in combined
+
+
+def test_sessionstart_summary_separates_ordinary_and_pinned_drift(
+        installed_claude_dir):
+    bin_dir = installed_claude_dir.parent / ".local" / "bin"
+    target_name = "sable-dolt-push"
+    _establish_real_pin(bin_dir, target_name)
+    _revert_pin_to_symlink(bin_dir, target_name)
+    (installed_claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
+
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(REPO),
+         "--claude-dir", str(installed_claude_dir),
+         "--bin-dir", str(bin_dir), "--quiet"],
+        capture_output=True, text=True, timeout=30,
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode == 1
+    assert "ordinary files: 1" in combined
+    assert "pinned bins: 1" in combined
+    assert "bash install.sh" not in combined
+
+
+def test_pinned_bin_survives_real_reinstall_after_the_fix(installed_claude_dir):
+    # The other half of the acceptance criterion, exercised through
+    # sable-doctor: once genuinely pinned, a real re-run of THIS (fixed)
+    # install.sh must leave the pin clean, not flagged.
+    home = installed_claude_dir.parent
+    bin_dir = home / ".local" / "bin"
+    # A PLAIN-pinnable bin (`sable-bin-install --classify` says "plain"). These
+    # three cases test the plain per-file pin contract specifically, so the
+    # target must be a tool that contract still applies to: sable-merge-gate
+    # became a python-IMPORTING tool with the SABLE-jd5fj.3 module split and is
+    # now classified "snapshot" — a plain copy of it severs its sibling imports,
+    # which sable-doctor correctly reports as broken. That detection is the
+    # SABLE-9boz4 design working, not a regression, so the fixture moves to a
+    # tool it fits rather than the assertions moving.
+    target_name = "sable-dolt-push"
+    _establish_real_pin(bin_dir, target_name)
+
+    run_install(home)
+
+    result = run_doctor(installed_claude_dir, bin_dir=bin_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    target = bin_dir / target_name
+    assert target.is_file() and not target.is_symlink()
+
+
+# --- install provenance, end-to-end (SABLE-78kxu) -----------------------------
+#
+# Reproduces today's incident as a regression test: install.sh runs against a
+# sandbox HOME (never the real machine's ~/.claude — SABLE-mkj6k), then the
+# fixture REPO gets a new commit the installed set has never seen. The
+# manifest compare still reports the installed files clean (the new commit
+# doesn't touch any installed file), but the provenance stamp now visibly
+# PREDATES that new commit — an unresolvable "is X deployed?" is answered
+# with one git merge-base check instead of ad-hoc grepping.
+#
+# Uses a throwaway `git init` seeded with a COPY of the real working tree
+# (not a clone of its history) — this needs a repo it can freely commit a new
+# file into without touching the real SABLE repo or its git history.
+
+PROVENANCE_STAMP_NAME = ".sable-install-provenance"
+
+
+def make_fixture_repo(dest: Path):
+    shutil.copytree(
+        REPO, dest,
+        ignore=shutil.ignore_patterns(".git", ".beads", ".pytest_cache", "__pycache__"),
+    )
+    subprocess.run(["git", "init", "-q"], cwd=dest, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=dest, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "snapshot"],
+        cwd=dest, check=True,
+    )
+    return dest
+
+
+def run_install_from(repo_dir: Path, home_dir: Path):
+    result = subprocess.run(
+        ["bash", str(repo_dir / "install.sh")],
+        env={**os.environ, "HOME": str(home_dir)},
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, f"install.sh failed:\n{result.stdout}\n{result.stderr}"
+
+
+def git_head(repo_dir: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+@pytest.fixture(scope="module")
+def provenance_template(tmp_path_factory):
+    """Pay the real repo snapshot + install once for read/modify audit cases.
+
+    Tests that specifically assert install-time dirty/untracked classification
+    still run the real installer from their own state below. These audit-path
+    tests need independent mutable copies, not repeated installation.
+    """
+    root = tmp_path_factory.mktemp("doctor-provenance-template")
+    fixture_repo = make_fixture_repo(root / "fixture-repo")
+    home = root / "home"
+    home.mkdir()
+    run_install_from(fixture_repo, home)
+    return root
+
+
+@pytest.fixture()
+def provenance_fixture(tmp_path, provenance_template):
+    root = tmp_path / "provenance"
+    shutil.copytree(provenance_template, root, symlinks=True)
+    fixture_repo = root / "fixture-repo"
+    home = root / "home"
+    return fixture_repo, home / ".claude"
+
+
+@pytest.fixture()
+def provenance_repo(tmp_path, provenance_template):
+    """Independent committed repo copied from the immutable real template."""
+    fixture_repo = tmp_path / "fixture-repo"
+    shutil.copytree(provenance_template / "fixture-repo", fixture_repo, symlinks=True)
+    return fixture_repo
+
+
+def test_install_writes_provenance_stamp_with_the_actual_head_sha(provenance_fixture):
+    fixture_repo, claude_dir = provenance_fixture
+    expected_sha = git_head(fixture_repo)
+    stamp = claude_dir / PROVENANCE_STAMP_NAME
+    assert stamp.is_file()
+    content = stamp.read_text()
+    assert f"commit={expected_sha}" in content
+    assert "branch=" in content
+    assert "dirty=false" in content
+    assert "timestamp=" in content
+
+
+def test_provenance_reproduces_the_incident_clean_report_with_a_provable_predate(provenance_fixture):
+    fixture_repo, claude_dir = provenance_fixture
+    installed_sha = git_head(fixture_repo)
+
+    (fixture_repo / "NEW_GUARD_FILE.md").write_text("a file the installed set has never seen\n")
+    subprocess.run(["git", "add", "NEW_GUARD_FILE.md"], cwd=fixture_repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "add new file"],
+        cwd=fixture_repo, check=True,
+    )
+    new_head = git_head(fixture_repo)
+    assert new_head != installed_sha
+
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(fixture_repo), "--claude-dir", str(claude_dir),
+         "--bin-dir", str(claude_dir.parent / ".local" / "bin")],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "sable-doctor: clean" in result.stdout      # installed files: unaffected by the new commit
+    assert installed_sha in result.stdout               # the SHA the install actually came from
+
+    ancestor_check = subprocess.run(
+        ["git", "-C", str(fixture_repo), "merge-base", "--is-ancestor", installed_sha, new_head],
+    )
+    assert ancestor_check.returncode == 0  # installed sha genuinely predates the new commit
+
+
+def test_installed_from_flag_prints_the_bare_sha(provenance_fixture):
+    fixture_repo, claude_dir = provenance_fixture
+    installed_sha = git_head(fixture_repo)
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--claude-dir", str(claude_dir), "--installed-from"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == installed_sha
+
+
+def test_installed_from_flag_fails_clearly_without_a_stamp(installed_claude_dir):
+    # models a pre-existing install from before this bead: no stamp at all.
+    (installed_claude_dir / PROVENANCE_STAMP_NAME).unlink(missing_ok=True)
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--claude-dir", str(installed_claude_dir), "--installed-from"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "no provenance stamp" in result.stderr
+
+
+def test_install_from_a_dirty_tree_stamps_dirty_true(tmp_path, provenance_repo):
+    # a genuinely TRACKED modification breaks reproducibility from the
+    # recorded SHA -- install.sh installs tracked content, so this MUST
+    # stamp dirty=true. (Modifying a tracked file, not adding a new
+    # untracked one -- see the untracked-only test below for the contrast
+    # this bead, SABLE-dt92b, is actually about.)
+    fixture_repo = provenance_repo
+    readme = fixture_repo / "README.md"
+    readme.write_text(readme.read_text() + "\ndirties a tracked file post-commit\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    run_install_from(fixture_repo, home)
+    stamp = (home / ".claude" / PROVENANCE_STAMP_NAME).read_text()
+    assert "dirty=true" in stamp
+
+
+def test_install_from_an_untracked_only_tree_stamps_dirty_false(tmp_path, provenance_repo):
+    # SABLE-dt92b: this is the defect, reproduced end-to-end. An untracked
+    # file (never `git add`ed) does not touch any tracked content, so the
+    # recorded SHA still reconstructs the installed set exactly -- dirty
+    # must read false, and doctor's rendered line must not claim "not
+    # reproducible". Untracked presence may still be surfaced, but as its
+    # own, separately-worded fact.
+    fixture_repo = provenance_repo
+    (fixture_repo / "UNCOMMITTED_CHANGE.md").write_text("an untracked scratch file\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    run_install_from(fixture_repo, home)
+    claude_dir = home / ".claude"
+    stamp = (claude_dir / PROVENANCE_STAMP_NAME).read_text()
+    assert "dirty=false" in stamp
+    assert "untracked=true" in stamp
+
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(fixture_repo), "--claude-dir", str(claude_dir),
+         "--bin-dir", str(claude_dir.parent / ".local" / "bin")],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "not reproducible" not in result.stdout
+
+
+def test_install_from_a_fully_clean_tree_stamps_dirty_false_and_untracked_false(
+        tmp_path, provenance_repo):
+    fixture_repo = provenance_repo
+    home = tmp_path / "home"
+    home.mkdir()
+    run_install_from(fixture_repo, home)
+    stamp = (home / ".claude" / PROVENANCE_STAMP_NAME).read_text()
+    assert "dirty=false" in stamp
+    assert "untracked=false" in stamp
+
+
+def test_quiet_mode_sessionstart_hook_stays_silent_on_a_fresh_provenance_stamped_install(provenance_fixture):
+    # SABLE-78kxu must not make the highest-traffic path (`sable-doctor
+    # --quiet`, the SessionStart hook) start speaking on every healthy run
+    # just because provenance now exists.
+    fixture_repo, claude_dir = provenance_fixture
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(fixture_repo), "--claude-dir", str(claude_dir),
+         "--bin-dir", str(claude_dir.parent / ".local" / "bin"), "--quiet"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+# --- SABLE-rucuh: the shape-aware remedy is genuinely executable, real fs --
+#
+# The bug was never that doctor's message was worded wrong -- it's that the
+# message was EXECUTABLE and destructive. sable-merge-gate became
+# snapshot-shaped (repo-local python imports) after SABLE-jd5fj.3's module
+# split; doctor's old "pinned bins" check had no concept of that and called
+# a correctly snapshot-pinned instance "unpinned", then printed a bare `cp`
+# that severs the sibling import it now needs. These reproduce that exact
+# shape (a real module-importing entry point named sable-merge-gate) in a
+# fully sandboxed scratch tree -- never the real ~/.local/bin or
+# ~/.local/lib -- capture doctor's REAL printed remedy for a broken pin of
+# it, RUN that remedy verbatim, and assert the resulting binary still
+# executes. The companion test proves the contrast: the OLD naive cp this
+# bead is about still breaks the same bin the same way, so the fix changes
+# the OUTCOME, not merely the text.
+
+def _make_module_importing_gate_repo(repo: Path, target_name: str):
+    """repo/bin/<target_name> imports a sibling module -- modeling
+    sable-merge-gate after SABLE-jd5fj.3's module split -- plus a real,
+    executable copy of sable-bin-install so --classify / --pin-snapshot work
+    for real against this fixture."""
+    bin_dir = repo / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "sable_gate_classify_lib.py").write_text("def classify():\n    return 'ok'\n")
+    (bin_dir / target_name).write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "import sable_gate_classify_lib as classify\n"
+        "if '--help' in sys.argv:\n"
+        "    print('usage: sable-merge-gate [--help]')\n"
+        "    sys.exit(0)\n"
+        "print(classify.classify())\n"
+    )
+    (bin_dir / target_name).chmod(0o755)
+    shutil.copy(REPO / "bin" / "sable-bin-install", bin_dir / "sable-bin-install")
+    (bin_dir / "sable-bin-install").chmod(0o755)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+
+def test_snapshot_pin_repair_remedy_produces_a_binary_that_actually_runs(tmp_path):
+    target_name = "sable-merge-gate"
+    repo = tmp_path / "repo"
+    _make_module_importing_gate_repo(repo, target_name)
+
+    home_scratch = tmp_path / "sandbox-home"
+    bin_dir = home_scratch / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+
+    # Simulate a BROKEN pin: a bare regular-file copy of just the entry
+    # point -- the exact "broken-copy-pin" state a naive plain cp produces.
+    (bin_dir / target_name).write_bytes((repo / "bin" / target_name).read_bytes())
+    (bin_dir / target_name).chmod(0o755)
+
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(repo), "--claude-dir", str(tmp_path / "claude"),
+         "--bin-dir", str(bin_dir)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 1
+    assert "BROKEN-COPY-PIN" in result.stdout
+    remedy_cmd = next(
+        line.strip() for line in result.stdout.splitlines()
+        if "--pin-snapshot" in line and target_name in line
+    )
+    assert "cp " not in remedy_cmd  # never the destructive plain copy
+
+    # Execute doctor's ACTUAL printed remedy, verbatim, fully sandboxed via
+    # HOME (sable-bin-install's default DEST/LIB_DIR both derive from $HOME)
+    # and PATH (so the bare `sable-bin-install` named in the remedy resolves
+    # to THIS fixture's copy) -- never the real machine's ~/.local/bin or
+    # ~/.local/lib, per the dispatch note's explicit warning never to run the
+    # remedy under test against the live install tree.
+    env = {**os.environ, "HOME": str(home_scratch), "PATH": f"{repo / 'bin'}:{os.environ.get('PATH', '')}"}
+    repair = subprocess.run(["bash", "-c", remedy_cmd], env=env, capture_output=True, text=True)
+    assert repair.returncode == 0, repair.stdout + repair.stderr
+
+    repaired = subprocess.run([str(bin_dir / target_name), "--help"], capture_output=True, text=True)
+    assert repaired.returncode == 0, repaired.stdout + repaired.stderr
+    assert "ModuleNotFoundError" not in repaired.stderr
+
+
+def test_the_old_naive_cp_remedy_would_have_broken_the_same_bin(tmp_path):
+    # Contrast case, in a SEPARATE scratch dir: proves the destructive remedy
+    # this bead exists to prevent is real, not hypothetical -- the fix
+    # changes the OUTCOME, not just the wording.
+    target_name = "sable-merge-gate"
+    repo = tmp_path / "repo"
+    _make_module_importing_gate_repo(repo, target_name)
+
+    scratch = tmp_path / "old-remedy-scratch"
+    scratch.mkdir()
+    old_remedy = f"cp {repo / 'bin' / target_name} {scratch / target_name} && chmod +x {scratch / target_name}"
+    subprocess.run(["bash", "-c", old_remedy], check=True)
+
+    broken = subprocess.run([str(scratch / target_name), "--help"], capture_output=True, text=True)
+    assert broken.returncode != 0
+    assert "ModuleNotFoundError" in broken.stderr
+
+
+# --- SABLE-5gxj3: staleness is scoped to the pinned tool, not the whole
+# shared bin/ snapshot directory it lives in, end to end -------------------
+#
+# The live incident this reproduces: sable-reconcile-handoffs's pinned
+# snapshot content was measured BYTE-IDENTICAL to repo HEAD (git diff --stat
+# across the whole range was empty for that one path), yet sable-doctor
+# reported it "points into an honestly-named snapshot that is BEHIND repo
+# HEAD ... merged but NOT live" -- because dozens of OTHER, unrelated files
+# under bin/ had changed since the pin was taken. Real git checkout, real
+# `sable-bin-install --pin-snapshot`, real `sable-doctor` subprocess -- no
+# mocked filesystem, no mocked git -- and assertions are ATTRIBUTABLE to the
+# specific pinned tool name this test created (SABLE-jd5fj.15), never a
+# global drift count.
+
+def _make_snapshot_pin_with_an_unrelated_sibling(repo: Path, target_name: str):
+    """repo/bin/<target_name> imports a sibling module (needs --pin-snapshot,
+    modeling sable-merge-gate/-reconcile-handoffs after SABLE-jd5fj.3's module
+    split) plus a genuinely UNRELATED plain tool sharing the same bin/
+    directory -- and a real, executable copy of sable-bin-install so
+    --classify / --pin-snapshot run for real against this fixture."""
+    bin_dir = repo / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "sable_gate_helper_lib.py").write_text("MARK = 'v1'\n")
+    (bin_dir / target_name).write_text(
+        "#!/usr/bin/env python3\nfrom sable_gate_helper_lib import MARK\nprint(MARK)\n"
+    )
+    (bin_dir / target_name).chmod(0o755)
+    (bin_dir / "sable-unrelated-tool").write_text("#!/usr/bin/env bash\necho unrelated\n")
+    (bin_dir / "sable-unrelated-tool").chmod(0o755)
+    shutil.copy(REPO / "bin" / "sable-bin-install", bin_dir / "sable-bin-install")
+    (bin_dir / "sable-bin-install").chmod(0o755)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+
+def test_pin_drift_against_real_install_tree(tmp_path):
+    target_name = "sable-merge-gate"
+    repo = tmp_path / "repo"
+    _make_snapshot_pin_with_an_unrelated_sibling(repo, target_name)
+
+    home_scratch = tmp_path / "sandbox-home"
+    bin_dir = home_scratch / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+
+    pin_env = {**os.environ, "HOME": str(home_scratch)}
+    pin_result = subprocess.run(
+        ["bash", str(repo / "bin" / "sable-bin-install"), "--dir", str(bin_dir),
+         "--pin-snapshot", target_name],
+        env=pin_env, capture_output=True, text=True, timeout=30,
+    )
+    assert pin_result.returncode == 0, pin_result.stdout + pin_result.stderr
+    assert (bin_dir / target_name).is_symlink()
+
+    # Advance HEAD, touching only the UNRELATED tool -- the exact false-alarm
+    # shape measured live. The pinned tool's own content never moves.
+    (repo / "bin" / "sable-unrelated-tool").write_text("#!/usr/bin/env bash\necho changed\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "unrelated tool changes"], cwd=repo, check=True)
+
+    clean_check = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(repo), "--claude-dir", str(tmp_path / "claude"),
+         "--bin-dir", str(bin_dir)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert clean_check.returncode == 0, clean_check.stdout + clean_check.stderr
+    assert "sable-doctor: clean" in clean_check.stdout
+    assert "NOT live" not in clean_check.stdout
+    assert target_name not in clean_check.stdout  # attributable: never named as drifted
+
+    # NOW advance the pinned tool's OWN content -- genuine staleness must
+    # still be caught, and named specifically, never as a global count.
+    (repo / "bin" / target_name).write_text(
+        "#!/usr/bin/env python3\nfrom sable_gate_helper_lib import MARK\nprint('v2: ' + MARK)\n"
+    )
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "advance the pinned entrypoint"], cwd=repo, check=True)
+
+    stale_check = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(repo), "--claude-dir", str(tmp_path / "claude"),
+         "--bin-dir", str(bin_dir)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert stale_check.returncode == 1
+    assert "SNAPSHOT-STALE" in stale_check.stdout
+    assert target_name in stale_check.stdout
+    assert "sable-unrelated-tool" not in stale_check.stdout

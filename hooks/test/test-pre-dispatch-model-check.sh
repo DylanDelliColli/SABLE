@@ -171,10 +171,24 @@ assert_allow "research-keyword prompt skipped" "$MGR_ENV" "Task: explore the aut
 assert_deny "general-purpose implementation worker is gated, not skipped (SABLE-6qn)" "$MGR_ENV" "Working on SABLE-aaa, implement the refactor" "general-purpose" "sonnet" "model:opus but dispatch chose sonnet"
 assert_allow "general-purpose worker with matching model allowed (no over-deny)" "$MGR_ENV" "Working on SABLE-aaa, implement the refactor" "general-purpose" "opus"
 
+# A malformed longer token must never backtrack into a real shorter bead id.
+# SABLE-aaa is model:opus, so a false prefix extraction would deny this
+# sonnet dispatch; silent allow proves none of the malformed forms was
+# harvested as SABLE-aaa.
+assert_allow "malformed dotted/double-hyphen ids do not yield shorter valid prefixes" \
+  "$MGR_ENV" \
+  "Malformed references: SABLE-aaa.1x, SABLE-aaa.1-extra, SABLE-aaa--extra, SABLE-aaa..1, SABLE-aaa.1..2, SABLE-aaa.-extra." \
+  "" "sonnet"
+
 # ---- Match cases (silent allow) ----
 
 # Test 4: bead has model:opus, dispatch uses opus → allow
 assert_allow "match opus" "$MGR_ENV" "Working on SABLE-aaa, the auth refactor" "" "opus"
+
+# A single sentence-ending period is punctuation, not a malformed continuation.
+assert_deny "sentence-ending period preserves a valid bead id" \
+  "$MGR_ENV" "Working on SABLE-aaa." "" "sonnet" \
+  "model:opus but dispatch chose sonnet"
 
 # Test 5: bead has model:sonnet, dispatch uses claude-sonnet-4-6 → allow
 assert_allow "match sonnet via full model id" "$MGR_ENV" "Working on SABLE-bbb" "" "claude-sonnet-4-6"

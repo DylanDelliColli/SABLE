@@ -335,6 +335,72 @@ else
 fi
 rm -rf "$P84B_DIR"
 
+# ---------- SABLE-wkxtl: bd lookup failure is not marker absence ----------
+# These three legs keep the lookup state-space explicit. A backend failure
+# must remain fail-closed, but it must surface bd's status/stderr instead of
+# giving the impossible advice to add a marker that may already be present.
+WKXTL_DIR=$(mktemp -d)
+
+# Failure leg: bd itself fails. The diagnostic must name that failure and must
+# not reuse the successful-scan / marker-absent advice.
+cat > "$WKXTL_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  echo "store-locked" >&2
+  exit 7
+fi
+exit 0
+EOF
+chmod +x "$WKXTL_DIR/bd"
+WKXTL_FAIL_OUT=$(run_gate_stub 'bd close SABLE-lookupfail' "$WKXTL_DIR")
+if echo "$WKXTL_FAIL_OUT" | grep -q 'bd show failed' \
+  && echo "$WKXTL_FAIL_OUT" | grep -q 'exit 7' \
+  && echo "$WKXTL_FAIL_OUT" | grep -q 'store-locked' \
+  && ! echo "$WKXTL_FAIL_OUT" | grep -q 'add \[no-test\] to bead notes'; then
+  pa_pass "wkxtl: bd show failure is loud and distinct from an absent marker"
+else
+  pa_fail "wkxtl: bd show failure is loud and distinct from an absent marker" \
+    "expected bd/exit-7/store-locked diagnostic without add-marker advice; got: ${WKXTL_FAIL_OUT:-<empty>}"
+fi
+
+# Positive control: successful lookup with the marker still allows.
+cat > "$WKXTL_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  printf '%s\n' '[{"id":"SABLE-marker","notes":"[no-test] docs only","description":""}]'
+  exit 0
+fi
+exit 0
+EOF
+WKXTL_MARKER_OUT=$(run_gate_stub 'bd close SABLE-marker' "$WKXTL_DIR")
+if [ -z "$WKXTL_MARKER_OUT" ]; then
+  pa_pass "wkxtl control: successful lookup with [no-test] still allows"
+else
+  pa_fail "wkxtl control: successful lookup with [no-test] still allows" \
+    "expected silent allow; got: $WKXTL_MARKER_OUT"
+fi
+
+# Negative control: successful lookup without the marker keeps the ordinary
+# no-tests denial and actionable add-marker advice.
+cat > "$WKXTL_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  printf '%s\n' '[{"id":"SABLE-nomarker","notes":"","description":"code change"}]'
+  exit 0
+fi
+exit 0
+EOF
+WKXTL_ABSENT_OUT=$(run_gate_stub 'bd close SABLE-nomarker' "$WKXTL_DIR")
+if echo "$WKXTL_ABSENT_OUT" | grep -q '"permissionDecision": "deny"' \
+  && echo "$WKXTL_ABSENT_OUT" | grep -q 'add \[no-test\] to bead notes' \
+  && ! echo "$WKXTL_ABSENT_OUT" | grep -q 'bd show failed'; then
+  pa_pass "wkxtl control: successful lookup without marker keeps add-marker denial"
+else
+  pa_fail "wkxtl control: successful lookup without marker keeps add-marker denial" \
+    "expected ordinary add-marker denial; got: ${WKXTL_ABSENT_OUT:-<empty>}"
+fi
+rm -rf "$WKXTL_DIR"
+
 # ---------- SABLE-d72/lcs: per-agent evidence keying ----------
 # The gate must read the SAME per-agent key tdd-evidence.sh writes: with agent_id
 # present, /tmp/tdd-evidence-<sid>-<agent_id>; without, the session-global file.
@@ -669,6 +735,53 @@ else
   pa_fail "SABLE-f6aw e2e: redirect-suffixed test command unblocks the gate" "got: ${F6AW_OUT:-<empty>}; evidence file: $F6AW_EV_CONTENT"
 fi
 rm -f "$F6AW_EV"
+
+# ---------- SABLE-z95e2 e2e: 'timeout N <cmd>' unwrap unblocks the real gate ----------
+# Real composition, not a fabricated evidence line: pipe a timeout-wrapped
+# green test invocation through the ACTUAL tdd-evidence.sh writer hook, then
+# confirm the ACTUAL tdd-gate.sh reader hook allows the close on that
+# evidence. Regression guard for the SABLE-be4lo.8 bug: pre-fix,
+# tdd-evidence.sh did not unwrap a leading 'timeout' segment at all, so a
+# genuinely green 'timeout 900 python -m pytest ...' had head token
+# 'timeout', matched no runner, wrote no evidence, and this same close was
+# DENIED with "No tests were run this session" even though the suite ran
+# green. Paired negative: a timeout-wrapped NON-test command must still
+# leave the gate denying -- proving the fix did not loosen the gate itself.
+
+TIMEOUT_EVIDENCE_HOOK="$(cd "$(dirname "$0")/.." && pwd)/tdd-evidence.sh"
+
+TZ95_SID="tdd-z95e2-e2e-$$-$RANDOM"
+TZ95_EV="/tmp/tdd-evidence-${TZ95_SID}"
+rm -f "$TZ95_EV"
+
+# Real writer: a timeout-wrapped green pytest invocation, through tdd-evidence.sh.
+make_input "timeout 900 python -m pytest bin/ -q -p no:cacheprovider" "$TZ95_SID" | bash "$TIMEOUT_EVIDENCE_HOOK" >/dev/null 2>&1 || true
+
+# Real reader: a two-bead close routes past the [no-test] hatch to the evidence check.
+TZ95_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$TZ95_SID" | env PATH="$STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null)
+if [ -z "$TZ95_OUT" ]; then
+  pa_pass "SABLE-z95e2 e2e: timeout-wrapped pytest recorded by the real writer hook unblocks the real gate hook"
+else
+  TZ95_EV_CONTENT=$(cat "$TZ95_EV" 2>/dev/null || echo '<missing>')
+  pa_fail "SABLE-z95e2 e2e: timeout-wrapped pytest unblocks the gate" "got: ${TZ95_OUT:-<empty>}; evidence file: $TZ95_EV_CONTENT"
+fi
+rm -f "$TZ95_EV"
+
+# Paired negative: a timeout-wrapped NON-test command records no evidence,
+# so the real gate still denies the close (the gate was not loosened).
+TZ95N_SID="tdd-z95e2-e2e-neg-$$-$RANDOM"
+TZ95N_EV="/tmp/tdd-evidence-${TZ95N_SID}"
+rm -f "$TZ95N_EV"
+
+make_input "timeout 900 sleep 5" "$TZ95N_SID" | bash "$TIMEOUT_EVIDENCE_HOOK" >/dev/null 2>&1 || true
+
+TZ95N_OUT=$(make_input 'bd close SABLE-stub SABLE-other' "$TZ95N_SID" | env PATH="$STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null)
+if echo "$TZ95N_OUT" | grep -q '"permissionDecision": "deny"'; then
+  pa_pass "SABLE-z95e2 e2e negative: timeout-wrapped non-test command still leaves the real gate DENYING"
+else
+  pa_fail "SABLE-z95e2 e2e negative: timeout-wrapped non-test command must still deny" "got: ${TZ95N_OUT:-<empty>}"
+fi
+rm -f "$TZ95N_EV"
 
 # ---------- SABLE-jfg6.4 (D4): key-agreement invariant across BOTH consumers ----------
 # tdd-gate.sh (reader) and tdd-evidence.sh (writer) now derive the evidence path

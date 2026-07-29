@@ -25,18 +25,67 @@ SOCK="sable-e2e-$$"
 SESS="sable"
 WT="$(mktemp -d)"
 DD="$(mktemp -d)"
+SCRATCH_BEADS_DIR="$(mktemp -d)"
+MODE_STATE_DIR="$(mktemp -d)"
 READ_BEAD="SABLE-bldh.8"   # an open bead, read-only here
 
-PASS=0; FAIL=0; FAIL_NAMES=""
+PASS=0; FAIL=0; SKIP=0; FAIL_NAMES=""
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
+skip() { SKIP=$((SKIP+1)); echo "SKIP: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 tmux_() { tmux -L "$SOCK" "$@"; }
-cleanup() { tmux_ kill-server >/dev/null 2>&1; rm -rf "$WT" "$DD"; }
+cleanup() {
+  tmux_ kill-server >/dev/null 2>&1
+  rm -rf "$WT" "$DD" "$SCRATCH_BEADS_DIR" "$MODE_STATE_DIR"
+}
 trap cleanup EXIT
+
+# SABLE-j0vr: the sable-msg leg below (step 2) invokes the REAL bin/sable-msg.
+# When its verified-delivery check can't confirm landing (routine in an
+# isolated/CI run with no live optimus pane behind the stand-in -- see
+# SABLE-gcmu), sable-msg's SABLE-1umr fallback FILES A DURABLE BEAD. Without
+# an override that bead lands in THIS repo's real, live beads DB (SABLE-f3zp
+# was exactly that leak). Point it at a throwaway sandbox DB via BEADS_DB so
+# no run of this suite can ever touch the live tracker.
+if command -v bd >/dev/null 2>&1; then
+  ( cd "$SCRATCH_BEADS_DIR" && BD_NON_INTERACTIVE=1 bd init --prefix=e2e \
+      --non-interactive --skip-agents --skip-hooks --quiet >/dev/null 2>&1 )
+fi
 
 export SABLE_TMUX_SOCKET="$SOCK"
 export SABLE_TMUX_SESSION="$SESS"
 export SABLE_TMUX_PANE_CMD="bash --noprofile --norc"   # stand-in for claude
+
+# This suite is itself commonly run FROM a live SABLE agent pane (a worker or
+# manager dispatched to verify it), whose shell carries its own
+# CLAUDE_AGENT_NAME / SABLE_WORKER_PANE / CLAUDE_AGENT_ROLE / SABLE_BEAD.
+# bin/sable-tmux (step 1) and bin/sable-spawn-worker (step 3) both spawn tmux
+# panes as subprocesses of THIS shell, so an unscrubbed identity here leaks
+# into every pane they create -- e.g. sable-msg's from= resolution picking up
+# ambient SABLE_WORKER_PANE=1 and reporting from=worker instead of the
+# CLAUDE_AGENT_NAME override given at the call site, or a spawned worker pane
+# inheriting a contradicting identity that downstream checks then correctly
+# refuse. Scrub BEFORE the first pane-spawning call (SABLE-j3bi/SABLE-a9453) --
+# see hooks/test/lib-identity-isolation.sh for the confirmed mechanism and why
+# a later, call-site-only scrub cannot retroactively clean it up.
+source "$REPO/hooks/test/lib-identity-isolation.sh"
+sable_scrub_identity_env
+
+# sable-spawn-worker is intentionally execution-only when a repository carries
+# cockpit state. Point every tool in this composition at a throwaway state
+# before the first pane is launched, then establish real audited execution
+# authority through sable-mode. Without this override, an operator running the
+# suite during planning makes the worker leg fail for the operator's mode
+# rather than for any defect in the composition (SABLE-e58q1).
+export SABLE_MODE_STATE="$MODE_STATE_DIR/mode-state.json"
+if "$BIN/sable-mode" set execution --break-glass \
+    --reason "synthetic execution authority for tmux e2e isolation" \
+    >/dev/null 2>&1 \
+   && [ "$("$BIN/sable-mode" get 2>/dev/null)" = "execution" ]; then
+  pass "isolated execution-mode fixture established"
+else
+  fail "isolated execution-mode fixture established"
+fi
 
 # 1) sable-tmux brings up the role panes -------------------------------------
 if python3 "$BIN/sable-tmux" --session "$SESS" >/dev/null 2>&1; then pass "sable-tmux launches"; else fail "sable-tmux launches"; fi
@@ -50,8 +99,34 @@ done
 optpane="$(tmux_ list-panes -a -F '#{pane_id} #{@sable_role}' | awk '$2=="optimus"{print $1; exit}')"
 tmux_ send-keys -t "$optpane" "echo BUSY; sleep 2; echo FREE" Enter
 sleep 0.2
-if CLAUDE_AGENT_NAME=lincoln python3 "$BIN/sable-msg" optimus "drop auth, API urgent" >/dev/null 2>&1; then pass "sable-msg lincoln->optimus returns ok"; else fail "sable-msg lincoln->optimus returns ok"; fi
+live_count_before="$(cd "$REPO" && bd count 2>/dev/null)"
+# SABLE-gcmu: sable-msg's own exit code encodes VERIFIED delivery
+# (sable_pane_lib.dispatch_landed / pane_idle), which fails CLOSED
+# (SABLE-wvk9) whenever it cannot locate a Claude-TUI composer glyph
+# ("❯"/">") in the recipient pane's capture. The stand-in recipient here
+# is a bare `bash --noprofile --norc` pane (SABLE_TMUX_PANE_CMD, set
+# above) -- it never renders that glyph, so verified delivery is
+# STRUCTURALLY unattainable in this fixture regardless of whether the
+# message actually lands. Confirmed by direct repro: with this exact
+# invocation the message DOES land in the pane (see the "framed message
+# delivered to optimus pane" assertion below, which greps the pane
+# content directly and is the real check for this leg) while sable-msg
+# still exits 1. Do not gate the suite on sable-msg's exit code against a
+# non-TUI stand-in pane; record it as an observation instead.
+msg_rc=0
+CLAUDE_AGENT_NAME=lincoln BEADS_DB="$SCRATCH_BEADS_DIR/.beads" python3 "$BIN/sable-msg" optimus "drop auth, API urgent" >/dev/null 2>&1 || msg_rc=$?
+skip "sable-msg lincoln->optimus exit code (not gated)" "exit=$msg_rc against a bash stand-in pane -- dispatch_landed cannot locate a Claude-TUI composer glyph there (SABLE-gcmu); see 'framed message delivered to optimus pane' below for the real delivery check"
 sleep 3
+live_count_after="$(cd "$REPO" && bd count 2>/dev/null)"
+case "$SCRATCH_BEADS_DIR" in
+  "$REPO"*) fail "sable-msg leg sandboxed (BEADS_DB exported outside the live DB)" "SCRATCH_BEADS_DIR=$SCRATCH_BEADS_DIR is inside REPO=$REPO" ;;
+  *) pass "sable-msg leg sandboxed (BEADS_DB exported outside the live DB)" ;;
+esac
+if [ -n "$live_count_before" ] && [ "$live_count_before" = "$live_count_after" ]; then
+  pass "live bd DB bead count unchanged across the sable-msg leg"
+else
+  fail "live bd DB bead count unchanged across the sable-msg leg" "before=$live_count_before after=$live_count_after"
+fi
 cap="$(tmux_ capture-pane -t "$optpane" -p)"
 if printf '%s' "$cap" | grep -q '⟦SABLE-MSG⟧ from=lincoln to=optimus'; then pass "framed message delivered to optimus pane"; else fail "framed message delivered to optimus pane" "$cap"; fi
 if printf '%s' "$cap" | grep -q 'FREE' && [ "$(printf '%s' "$cap" | grep -n 'FREE' | head -1 | cut -d: -f1)" -le "$(printf '%s' "$cap" | grep -n 'API urgent' | tail -1 | cut -d: -f1)" ]; then pass "message queued behind busy turn (ran after FREE)"; else pass "message delivered (ordering best-effort under stand-in)"; fi
@@ -81,7 +156,7 @@ done
 
 echo
 echo "=========================================="
-echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
+echo "Tests: $((PASS+FAIL+SKIP)) | Passed: $PASS | Failed: $FAIL | Skipped: $SKIP"
 echo "=========================================="
 if [ "$FAIL" -gt 0 ]; then echo -e "Failed tests:$FAIL_NAMES"; exit 1; fi
 exit 0

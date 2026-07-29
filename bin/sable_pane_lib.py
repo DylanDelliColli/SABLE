@@ -15,10 +15,20 @@ import re
 import subprocess
 import time
 
+from sable_provider_lib import agent_name, normalize_provider
+
 # Non-printable control bytes (except \t\n which are whitespace-handled). A
 # stray echoed Escape on the prompt line must not defeat glyph detection
 # (SABLE-zaum).
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+_PROMPT_GLYPHS = {
+    "claude": ("❯", ">"),
+    "codex": ("›", ">"),
+}
+
+
+def prompt_glyphs(provider: str = "claude") -> tuple[str, ...]:
+    return _PROMPT_GLYPHS[normalize_provider(provider)]
 
 
 def _clean(line: str) -> str:
@@ -45,7 +55,7 @@ def _already_pending(capture_text: str, snippet: str) -> bool:
     return bool(want) and want in _canon(capture_text)
 
 
-def pane_ready(capture: str) -> bool:
+def pane_ready(capture: str, provider: str = "claude") -> bool:
     """The TUI is ready to accept input once its input box shows an EMPTY prompt
     line (just the prompt glyph). While booting (splash) or on a blocking gate
     screen there is no such empty line.
@@ -55,7 +65,7 @@ def pane_ready(capture: str) -> bool:
     pane_idle for the stronger "ready AND not mid-turn" predicate the interrupt
     path needs (SABLE-m6is)."""
     for line in reversed(capture.splitlines()):
-        if _clean(line) in ("❯", ">"):
+        if _clean(line) in prompt_glyphs(provider):
             return True
     return False
 
@@ -67,7 +77,7 @@ def pane_ready(capture: str) -> bool:
 _BUSY_MARKERS = ("esc to interrupt",)
 
 
-def pane_busy(capture: str) -> bool:
+def pane_busy(capture: str, provider: str = "claude") -> bool:
     """True while the pane is MID-TURN. Control bytes are stripped and all
     whitespace collapsed to single spaces before matching, so a status line
     padded/reflowed by box-drawing or a variable-width spinner prefix still
@@ -78,14 +88,14 @@ def pane_busy(capture: str) -> bool:
     return any(marker in hay for marker in _BUSY_MARKERS)
 
 
-def pane_idle(capture: str) -> bool:
+def pane_idle(capture: str, provider: str = "claude") -> bool:
     """The pane is ready for a NEW submitted turn: its composer shows the empty
     prompt (pane_ready) AND no turn is currently running (not pane_busy).
     --interrupt defers typing until THIS holds, not merely until pane_ready:
     a busy pane shows the empty composer prompt too, so typing on pane_ready
     alone raced the spinner redraw / composer-clear of the interrupted turn and
     silently dropped the message (SABLE-m6is)."""
-    return pane_ready(capture) and not pane_busy(capture)
+    return pane_ready(capture, provider) and not pane_busy(capture, provider)
 
 
 # A running turn's status row carries a spinner glyph AND an elapsed-time timer
@@ -100,7 +110,7 @@ _SPINNER_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯�
 _ELAPSED_RE = re.compile(r"\b\d+m\s*\d+s\b|\b\d+s\b")
 
 
-def pane_working(capture: str) -> bool:
+def pane_working(capture: str, provider: str = "claude") -> bool:
     """True while the pane is MID-TURN — a SUPERSET of pane_busy for the
     dialog-stall probe's authoritative not-busy guard (SABLE-tz9f). Returns True
     when pane_busy does (the "esc to interrupt" hint) OR when any line bears BOTH
@@ -111,7 +121,7 @@ def pane_working(capture: str) -> bool:
     interrupts its turn) is strictly harder to trigger. pane_busy itself is left
     byte-for-byte unchanged — the sable-msg delivery flow (dispatch_landed /
     submitted_own_turn) depends on its exact contract."""
-    if pane_busy(capture):
+    if pane_busy(capture, provider):
         return True
     for line in capture.splitlines():
         if _SPINNER_RE.search(line) and _ELAPSED_RE.search(line):
@@ -175,7 +185,7 @@ _OVERLAY_DISMISS_RE = re.compile(
     r"esc(ape)?\s+to\s+(close|exit|go back|dismiss)", re.IGNORECASE)
 
 
-def overlay_evidence(capture: str) -> str | None:
+def overlay_evidence(capture: str, provider: str = "claude") -> str | None:
     """The pane-text line proving `capture` is parked on a modal dialog/overlay
     demanding a keypress, or None. A POSITIVE-signature classifier (SABLE-tz9f):
     it keys on the explicit keypress AFFORDANCE a live selector or modal always
@@ -195,17 +205,38 @@ def overlay_evidence(capture: str) -> str | None:
     line is the evidence snippet the DIALOG-STALLED alert surfaces (SABLE-ccxc)
     so an operator can judge true-vs-false from the alert itself.
 
+    SABLE-n87ov: a MENTION of dialog text (e.g. a sable-msg relay quoting the
+    'Enter to select ...' string of a real stall elsewhere, so the recipient
+    could recognise it) rendered into an otherwise-healthy pane reproduced the
+    exact substring this used to grep for anywhere in the capture — reporting
+    a stall manufactured a false one on the reporter's own audience. A live
+    dialog/overlay OWNS the bottom of the pane (it blocks the composer, so no
+    empty prompt line is drawn below it); a mention is ordinary transcript
+    output, and on an otherwise-idle pane the empty composer prompt reappears
+    BELOW it. So the affordance/dismiss search is restricted to the pane's
+    current cursor region — everything strictly after the LAST bare composer
+    prompt line (❯ or >) in the capture. A mention followed by the reappeared
+    idle composer sits entirely above that region and cannot match; a genuine
+    overlay has no such composer line after it (any bare-prompt line found is
+    from an OLDER idle moment, further up), so its affordance text still falls
+    inside the region.
+
     dialog_posture (m94k's spawn gate) is intentionally left untouched: this is
     the probe-only classifier, and the spawn gate's looser numbered-menu match is
     fine in its own context (a freshly spawned, not-yet-ready pane)."""
-    for raw in capture.splitlines():
-        line = _clean(raw)
+    lines = [_clean(raw) for raw in capture.splitlines()]
+    last_composer_idx = -1
+    for i, line in enumerate(lines):
+        if line in prompt_glyphs(provider):
+            last_composer_idx = i
+    tail = lines[last_composer_idx + 1:]
+    for line in tail:
         if line and (_DIALOG_AFFORDANCE_RE.search(line)
                      or _OVERLAY_DISMISS_RE.search(line)):
             return line
-    if accept_startup_gate(capture) is not None:
-        for raw in capture.splitlines():
-            line = _clean(raw)
+    tail_text = "\n".join(tail)
+    if accept_startup_gate(tail_text) is not None:
+        for line in tail:
             low = line.lower()
             if "trust" in low or "bypass permissions" in low:
                 return line
@@ -213,14 +244,14 @@ def overlay_evidence(capture: str) -> str | None:
     return None
 
 
-def overlay_posture(capture: str) -> bool:
+def overlay_posture(capture: str, provider: str = "claude") -> bool:
     """True when the pane is parked on a modal dialog/overlay demanding a keypress
     — see overlay_evidence for the positive signature (selector/dismiss affordance
     or a known startup gate) and the SABLE-tz9f false-positive history the bare
     numbered-line superset it replaced caused. The caller (sable-worker-status
     dialog_stall) combines it with a not-working guard to mean genuinely
     idle-blocked, never a working pane."""
-    return overlay_evidence(capture) is not None
+    return overlay_evidence(capture, provider) is not None
 
 
 # The session-limit banner Claude Code prints when a message/session rate
@@ -230,10 +261,16 @@ def overlay_posture(capture: str) -> bool:
 # alive pane with a CUT turn (SABLE-ita7: the SABLE-tz7h.4 worker pane sat
 # "running" for ~5 hours after hitting this, invisible to sable-worker-status
 # the whole time).
-_SESSION_LIMIT_RE = re.compile(r"hit your session limit.*?resets?\s+(.+)", re.IGNORECASE)
+_SESSION_LIMIT_RES = {
+    "claude": re.compile(r"hit your session limit.*?resets?\s+(.+)", re.IGNORECASE),
+    "codex": re.compile(
+        r"(?:hit your usage limit|usage limit reached).*?(?:resets?|try again)\s+(.+)",
+        re.IGNORECASE,
+    ),
+}
 
 
-def session_limit_reset(capture: str) -> str | None:
+def session_limit_reset(capture: str, provider: str = "claude") -> str | None:
     """The reset-time text ('2pm', 'tomorrow at 9am', ...) when a line of
     `capture` carries the Claude Code session-rate-limit banner, or None if
     the banner isn't present anywhere in the pane. Only tests for the
@@ -242,13 +279,15 @@ def session_limit_reset(capture: str) -> str | None:
     scrollback while a later turn keeps processing is the caller's call,
     combining this with pane_ready (SABLE-ita7)."""
     for line in capture.splitlines():
-        m = _SESSION_LIMIT_RE.search(_clean(line))
+        m = _SESSION_LIMIT_RES[normalize_provider(provider)].search(_clean(line))
         if m:
             return m.group(1).strip()
     return None
 
 
-def dispatch_landed(capture: str, snippet: str) -> bool:
+def dispatch_landed(
+    capture: str, snippet: str, provider: str = "claude"
+) -> bool:
     """True once the instruction has been SUBMITTED: the snippet appears in the
     pane but no longer sits in the input box. The box is the LAST prompt-glyph
     line plus every line after it — the composer sits at the bottom of the
@@ -289,11 +328,11 @@ def dispatch_landed(capture: str, snippet: str) -> bool:
     lines = capture.splitlines()
     box_start = None
     for i, line in enumerate(lines):
-        if _clean(line).startswith(("❯", ">")):
+        if _clean(line).startswith(prompt_glyphs(provider)):
             box_start = i
     if box_start is None:
         return False
-    if pane_busy("\n".join(lines[box_start + 1:])):
+    if pane_busy("\n".join(lines[box_start + 1:]), provider):
         return True
     return want not in _canon("\n".join(lines[box_start:]))
 
@@ -310,7 +349,9 @@ def dispatch_landed(capture: str, snippet: str) -> bool:
 _QUEUED_FOOTER_MARKERS = ("press up to edit queued messages",)
 
 
-def pane_has_queued_message(capture: str, snippet: str) -> bool:
+def pane_has_queued_message(
+    capture: str, snippet: str, provider: str = "claude"
+) -> bool:
     """True when `snippet` sits in the pane ALONGSIDE the queued-messages footer
     hint — the real Claude-TUI posture for a line that queued behind a busy turn
     (SABLE-msxj). Unlike dispatch_landed, this does NOT require the snippet to
@@ -324,7 +365,9 @@ def pane_has_queued_message(capture: str, snippet: str) -> bool:
     return any(marker in hay for marker in _QUEUED_FOOTER_MARKERS)
 
 
-def submitted_own_turn(capture: str, snippet: str) -> bool:
+def submitted_own_turn(
+    capture: str, snippet: str, provider: str = "claude"
+) -> bool:
     """Positive proof that `snippet` is its OWN submitted turn — the signal the
     DELAYED-confirmation path (SABLE-h0jw) polls for after a BUSY-at-t0 send,
     instead of failing closed the instant the pane is busy at t0 (SABLE-d21h).
@@ -358,18 +401,20 @@ def submitted_own_turn(capture: str, snippet: str) -> bool:
          branches 1-2 above can time out the poll budget on a send that in fact
          already succeeded — the exact false-fail SABLE-l8a5 evidenced (closed
          false-fail after the queued line was confirmed live in the pane)."""
-    if pane_has_queued_message(capture, snippet):
+    if pane_has_queued_message(capture, snippet, provider):
         return True
-    if not dispatch_landed(capture, snippet):
+    if not dispatch_landed(capture, snippet, provider):
         return False
-    if pane_idle(capture):
+    if pane_idle(capture, provider):
         return True
     lines = capture.splitlines()
     box_start = None
     for i, line in enumerate(lines):
-        if _clean(line).startswith(("❯", ">")):
+        if _clean(line).startswith(prompt_glyphs(provider)):
             box_start = i
-    return box_start is not None and pane_busy("\n".join(lines[box_start + 1:]))
+    return box_start is not None and pane_busy(
+        "\n".join(lines[box_start + 1:]), provider
+    )
 
 
 def capture_pane(base: list[str], pane: str) -> str:
@@ -380,7 +425,7 @@ def capture_pane(base: list[str], pane: str) -> str:
 
 
 def wait_for_ready(base, pane, timeout, interval=0.5, capture=None, sleep=None,
-                   run=None) -> bool:
+                   run=None, provider: str = "claude") -> bool:
     """Poll until the pane shows its empty prompt, accepting any blocking startup
     gate (bypass warning / trust dialog) on the way so the session doesn't die on
     the gate's default 'No, exit'."""
@@ -391,7 +436,7 @@ def wait_for_ready(base, pane, timeout, interval=0.5, capture=None, sleep=None,
     waited = 0.0
     while waited < timeout:
         cap = capture()
-        if pane_ready(cap):
+        if pane_ready(cap, provider):
             return True
         key = accept_startup_gate(cap)
         if key is not None:
@@ -403,7 +448,7 @@ def wait_for_ready(base, pane, timeout, interval=0.5, capture=None, sleep=None,
 
 
 def wait_for_idle(base, pane, timeout, interval=0.5, capture=None, sleep=None,
-                  run=None) -> bool:
+                  run=None, provider: str = "claude") -> bool:
     """Poll until the pane is IDLE (empty prompt AND no running turn), accepting
     any blocking startup gate (bypass warning / trust dialog) on the way exactly
     as wait_for_ready does — a freshly spawned pane may be mid-kick-turn or
@@ -420,7 +465,7 @@ def wait_for_idle(base, pane, timeout, interval=0.5, capture=None, sleep=None,
     waited = 0.0
     while waited < timeout:
         cap = capture()
-        if pane_idle(cap):
+        if pane_idle(cap, provider):
             return True
         key = accept_startup_gate(cap)
         if key is not None:
@@ -432,7 +477,8 @@ def wait_for_idle(base, pane, timeout, interval=0.5, capture=None, sleep=None,
 
 
 def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
-                 run=None, capture=None, sleep=None) -> bool:
+                 run=None, capture=None, sleep=None,
+                 provider: str = "claude") -> bool:
     """Type `text` into the pane and submit it — Enter is sent IMMEDIATELY after
     the text (submission must not depend on the landed-check failing first,
     SABLE-1umr), then resent until the text leaves the input box (the
@@ -483,7 +529,7 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
     capture = capture or (lambda: capture_pane(base, pane))
     sleep = sleep or time.sleep
     cap0 = capture()
-    idle_at_send = pane_idle(cap0)
+    idle_at_send = pane_idle(cap0, provider)
     already_pending = (not idle_at_send) and _already_pending(cap0, snippet)
     if not already_pending:
         if run(base + ["send-keys", "-t", pane, "-l", text]) is False:
@@ -499,7 +545,7 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
         for _ in range(max(1, tries)):
             sleep(interval)
             cap = capture()
-            if submitted_own_turn(cap, snippet):
+            if submitted_own_turn(cap, snippet, provider):
                 return True
             # SABLE-l7uv self-heal (the false-undelivered class msxj's footer path
             # did NOT retire): the prior turn we were busy behind has ENDED (NO
@@ -522,18 +568,18 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
             # running, so there is nothing to drop a queued line, and the Enter
             # submits OUR non-empty box, not a blank turn. The next poll confirms
             # via submitted_own_turn once the composer clears and the line lands.
-            if (not pane_working(cap) and _already_pending(cap, snippet)
-                    and not dispatch_landed(cap, snippet)):
+            if (not pane_working(cap, provider) and _already_pending(cap, snippet)
+                    and not dispatch_landed(cap, snippet, provider)):
                 if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
                     return False
-        return submitted_own_turn(capture(), snippet)
+        return submitted_own_turn(capture(), snippet, provider)
     for _ in range(max(1, tries)):
         sleep(interval)
-        if dispatch_landed(capture(), snippet):
+        if dispatch_landed(capture(), snippet, provider):
             return True
         if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
             return False
-    return dispatch_landed(capture(), snippet)
+    return dispatch_landed(capture(), snippet, provider)
 
 
 # --- Per-repo session resolution (SABLE-e1e3.1). One tmux server can host one
@@ -603,7 +649,10 @@ def session_repo(base: list[str], name: str, run=None) -> str | None:
     """The repo root recorded on the session (@sable_repo session option), or
     None when unset (pre-e1e3 sessions / hand-made ones)."""
     run = run or _tmux_run
-    r = run(base + ["show-options", "-v", "-t", name, "@sable_repo"])
+    # show-options takes a target-pane, not a target-session. `=name` is exact
+    # only in target-session grammar; the trailing colon supplies the window
+    # component while preserving the exact session anchor (`=name:`).
+    r = run(base + ["show-options", "-v", "-t", f"={name}:", "@sable_repo"])
     val = (r.stdout or "").strip()
     return val if r.returncode == 0 and val else None
 
@@ -614,7 +663,11 @@ def _panes_under_root(base: list[str], name: str, root: str, run=None) -> bool:
     addressed by ITS repo (its lincoln pane sits at the root) while never
     matching a different repo's tools."""
     run = run or _tmux_run
-    r = run(base + ["list-panes", "-s", "-t", name, "-F", "#{pane_current_path}"])
+    # list-panes takes a target-window; see session_repo for why exact session
+    # targeting here is `=name:` rather than `=name`.
+    r = run(base + [
+        "list-panes", "-s", "-t", f"={name}:", "-F", "#{pane_current_path}"
+    ])
     if r.returncode != 0:
         return False
     prefix = root.rstrip("/") + "/"
@@ -725,15 +778,17 @@ def _read_environ(pid: str, proc_root: str = "/proc") -> dict[str, str]:
 
 def pane_process_identity(base: list[str], pane: str, run=None,
                           proc_root: str = "/proc") -> str | None:
-    """The AUTHORITATIVE agent identity of `pane`: the CLAUDE_AGENT_NAME of the
-    process actually running in it (tmux #{pane_pid} -> /proc/PID/environ), or
-    None when unresolvable — a pane SABLE did not spawn, a plain shell, or a
-    vanished pane (SABLE-to8m). This is the authority the mutable @sable_role
-    pane option is only a cache for."""
+    """The authoritative SABLE process identity of ``pane``.
+
+    ``SABLE_AGENT_NAME`` wins over the legacy ``CLAUDE_AGENT_NAME``. The
+    environment is read through tmux pane PID → ``/proc/PID/environ``; a pane
+    SABLE did not spawn, a plain shell, or a vanished pane returns ``None``.
+    This remains the authority the mutable ``@sable_role`` option only caches.
+    """
     pid = pane_pid(base, pane, run=run)
     if not pid:
         return None
-    return _read_environ(pid, proc_root=proc_root).get("CLAUDE_AGENT_NAME") or None
+    return agent_name(_read_environ(pid, proc_root=proc_root))
 
 
 def pane_role_tag(base: list[str], pane: str, run=None) -> str | None:
@@ -746,6 +801,22 @@ def pane_role_tag(base: list[str], pane: str, run=None) -> str | None:
         return None
     val = (getattr(r, "stdout", "") or "").strip()
     return val if getattr(r, "returncode", 1) == 0 and val else None
+
+
+def pane_provider_tag(base: list[str], pane: str, run=None) -> str:
+    """The pane's provider tag; an absent legacy tag means Claude."""
+
+    run = run or _tmux_run
+    try:
+        r = run(base + [
+            "show-options", "-p", "-v", "-t", pane, "@sable_provider",
+        ])
+    except Exception:
+        return "claude"
+    val = (getattr(r, "stdout", "") or "").strip()
+    if getattr(r, "returncode", 1) != 0:
+        val = ""
+    return normalize_provider(val or "claude")
 
 
 def pane_bead_tag(base: list[str], pane: str, run=None) -> str | None:
@@ -815,7 +886,7 @@ def pane_is_live_nonworker_agent(base: list[str], pane: str, run=None,
     if not pid:
         return False
     env = _read_environ(pid, proc_root=proc_root)
-    return bool(env.get("CLAUDE_AGENT_NAME")) and not env.get("SABLE_WORKER_PANE")
+    return bool(agent_name(env)) and not env.get("SABLE_WORKER_PANE")
 
 
 # --- Dispatch throttle knob (SABLE-mmdt), shared by sable-spawn-worker (the

@@ -2,10 +2,15 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+`AGENTS.md` is a symlink to this file (single source of truth, no drift). `bd`'s
+default agent-instructions target is `AGENTS.md` (see `bd onboard --help`), so
+anything that writes to it — `bd` tooling, `install.sh`, a future onboarding
+step — writes through the link into this file, `CLAUDE.md`.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+This project uses **bd (beads)** for issue tracking. Run `bd onboard` for the agent-instructions snippet; run `bd prime` for full workflow context.
 
 ### Quick Reference
 
@@ -49,21 +54,111 @@ bd close <id>         # Complete work
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
 
+## Non-Interactive Shell Commands
+
+**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
+
+Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
+
+**Use these forms instead:**
+```bash
+# Force overwrite without prompting
+cp -f source dest           # NOT: cp source dest
+mv -f source dest           # NOT: mv source dest
+rm -f file                  # NOT: rm file
+
+# For recursive operations
+rm -rf directory            # NOT: rm -r directory
+cp -rf source dest          # NOT: cp -r source dest
+```
+
+**Other commands that may prompt:**
+- `scp` - use `-o BatchMode=yes` for non-interactive
+- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
+- `apt-get` - use `-y` flag
+- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
 ## Build & Test
 
-_Add your build and test commands here_
+This repo's actual stack is Python + bash/tmux — there is no Go tooling here.
+**`bd preflight`'s built-in checklist is hardcoded to Go (`go test`,
+`golangci-lint`, `gofmt`, `cmd/bd/version.go`) and is not configurable per
+project (SABLE-4yp75)**, so on this repo every one of those checks either
+false-fails ("golangci-lint not found in PATH") or silently no-ops. Do not
+treat a red `bd preflight` run as signal here; use the commands below instead.
 
 ```bash
-# Example:
-# npm install
-# npm test
+# Install the exact Python environment shared by both authoritative workflows:
+python -m pip install -r .github/ci/test-requirements.txt
+
+# Fast deterministic feedback for staged/unstaged/untracked changes:
+bin/sable-dev-check
+
+# Include every commit on a worker branch, or inspect without executing:
+bin/sable-dev-check --base origin/tmux-only
+bin/sable-dev-check --base origin/tmux-only --dry-run
+
+# Full Python suite (unit + integration; bd/dolt-dependent tests self-skip
+# when those tools are absent — see ci-verify.yml). -rs reports reasons;
+# the SABLE reporter names every skipped node and the ADDED/REMOVED set since
+# the previous successful full run:
+python -m pytest bin/ -q -rs -p no:cacheprovider --sable-report-skip-set
+
+# Shell test suites (classification is fail-closed; --run executes the
+# allowlisted suites; see .github/ci/shell-run-set.sh header for the
+# excluded-suite policy):
+bash .github/ci/shell-run-set.sh --check
+python bin/columbo-cost-prefilter.py --check-load-declarations
+bash .github/ci/shell-run-set.sh --run
+
+# Reproducible cost reports from the same authoritative executions:
+python -m pytest bin/ -q -rs -p no:cacheprovider --sable-report-skip-set \
+  --sable-test-cost-report=/tmp/sable-python-cost.json
+bash .github/ci/shell-run-set.sh --profile /tmp/sable-shell-cost.tsv
+
+# Exclusion-freshness gate (LOCAL ONLY — resolves each EXCLUDE entry's
+# tracking beads against the real bd store and fails when a [blocked-by: ...]
+# entry's blockers have all closed, i.e. the suite should be promoted to
+# ALLOW). It prints SKIP and exits 0 where bd is absent, which is why it is
+# NOT part of ci-verify's clean room (SABLE-59zu/SABLE-wqe2e). Runs
+# automatically pre-push via test-shell-run-set-strict.sh's case (f):
+bash .github/ci/shell-run-set.sh --check-beads
+
+# Curated fixed shell subset (useful when checking pre-push machinery itself;
+# this repo's .sable hook uses sable-dev-check for proportional feedback):
+bash .github/ci/test-tiers.sh --run pre_push
 ```
+
+The two `bd preflight` checks that ARE language-agnostic (no beads pollution,
+AGENTS.md/CLAUDE.md doc-sync) are still worth a glance from its output —
+just ignore the tests/lint/format/version-sync rows.
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+SABLE is a methodology + tooling repo for bd-based multi-agent development:
+`bin/` holds the Python/bash CLI tools (`sable-*`) and their `test_*.py` /
+`hooks/test/test-*.sh` suites; `hooks/` holds the git-hook and multi-manager
+enforcement scripts; `skills/` and `templates/` hold the Claude Code skill
+definitions this methodology installs into consumer projects; `SABLE.md`
+and `QUICKSTART.md` are the portable methodology docs shipped to other repos
+(don't assume this repo's own stack when editing those — they describe
+whatever stack the *downstream* project uses).
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- New `bin/` tools follow the `sable-<name>` (bash) or `sable_<name>_lib.py`
+  (Python library) naming already in use — see `bin/sable-doctor` /
+  `bin/sable-test` for the header-comment style (context + contract, not
+  what the code obviously does).
+- Every `bin/*.py` needs a matching `test_*.py` (pytest auto-discovers all of
+  `bin/`, so an untested file is a silent gap, not a skip).
+- Every `hooks/test/test-*.sh` must be classified in
+  `.github/ci/shell-run-set.sh`'s `ALLOW`/`EXCLUDE` lists or `--check` fails
+  the gate — see that script's header for why.
+- Every `EXCLUDE` reason must carry exactly one tracking tag —
+  `[blocked-by: <bead-id> ...]` for a temporary exclusion (promote the suite
+  when those beads close) or `[permanent: <bead-id> ...]` for a structural one
+  (the clean room has no bd / no `~/.claude` install). `--check` enforces the
+  tag's shape; `--check-beads` enforces its freshness. Untagged reasons rot
+  invisibly, which is how a suite stayed ungated for two weeks after its
+  blocker was fixed (SABLE-wqe2e).

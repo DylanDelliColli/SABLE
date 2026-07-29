@@ -36,7 +36,7 @@ This pattern is described in terms of a concrete eight-agent roster — adapt th
 
 **Critical**: ownership is based on **work shape**, not priority. A P0 auth-breaking bug is Tarzan's territory if it's standalone. A P3 nice-to-have refactor is Optimus's territory if it's an epic. Priority signals urgency; structure signals ownership.
 
-These three are the original "managers." They launch with `CLAUDE_AGENT_ROLE=manager`, so all the coordination hooks (inbox injection, pre-dispatch refresh/claim/overlap/preempt/model-check, pre-push gate, post-push notify) fire for them.
+These three are the original "managers." They launch with `CLAUDE_AGENT_ROLE=manager`, so all the coordination hooks (inbox injection, pre-dispatch claim/overlap/preempt/model-check, pre-push gate, post-push notify) fire for them. (Pre-dispatch used to include an automatic rebase step too — `pre-dispatch-refresh.sh` — but that was retired; see the hook catalog below.)
 
 ### Tier 2 — Session-scoped planning agents (run during planning sessions, not continuous)
 
@@ -45,7 +45,7 @@ These three are the original "managers." They launch with `CLAUDE_AGENT_ROLE=man
 | **Sherlock** | auditor | Read-only repo audit producing high-quality finding beads (design rot, redundancy, verbosity, dead code, test gaps) | User invokes with scope arg (`sherlock src/auth`); writes beads, self-reviews, addresses, exits |
 | **Victor** | bead_validator | Validate open beads against current HEAD; update or close stale ones using differential validation | User invokes (`victor`, `victor --epic=…`); 5-run ramp-up before auto-closing |
 | **Rudy** | quality_validator | End-to-end browser validation on the integration-branch dev deploy (Vercel preview + Supabase dev only) | User invokes (`rudy`, `rudy --feature=…`); files bug beads + a `rudy-report` at session end; refuses prod / PR-preview / local-dev targets |
-| **Columbo** | test_planner | Interview-driven test-coverage planning. Forward mode produces `columbo-test-spec` beads + skeleton test files (`*.skel.test.<ext>`) for new feature work; audit mode produces `columbo-test-gap` finding beads against existing modules. | User invokes (`columbo --feature "<desc>"`, `columbo --bead SABLE-xxx`, `columbo --audit src/auth`); audit mode runs `bin/columbo-prefilter` first to triage; writes beads, self-reviews, exits |
+| **Columbo** | test_planner | Interview-driven test-coverage planning. Forward mode produces `columbo-test-spec` beads + skeleton test files (`skel_<feature-name>.py` for pytest, validated with `pytest --collect-only`; `*.skel.test.<ext>` for other frameworks); audit mode produces `columbo-test-gap` finding beads against existing modules. | User invokes (`columbo --feature "<desc>"`, `columbo --bead SABLE-xxx`, `columbo --audit src/auth`); audit mode runs `bin/columbo-prefilter` first to triage; writes beads, self-reviews, exits |
 
 These never run continuously. They are pure producers (Sherlock, Rudy, Columbo) or pool-maintainers (Victor) — the user kicks them off, they do their pass, they exit. Sherlock, Victor, and Columbo may dispatch read-only Explore subagents. Rudy runs browser interaction itself (browser sessions need state continuity).
 
@@ -108,15 +108,16 @@ sable-agents victor       # single agent + role file path
 
 ## The warm-pane topology (tmux)
 
-SABLE's execution surface is **one tmux session, one warm `claude` pane per
-role** — the only topology (SABLE-qa4d; designed in
+SABLE's execution surface is **one tmux session, one persistent interactive
+Claude or Codex pane per role** — the only topology (SABLE-qa4d; designed in
 [`TMUX-AGENTS-DESIGN.md`](TMUX-AGENTS-DESIGN.md)). The session starts
 **Lincoln-only** (`sable-launch`, wrapping the `sable-tmux` layout tool —
 mode-neutral: a planning session needs no fleet). When execution begins,
 `sable-spawn-manager` stands up optimus/tarzan/chuck **on demand** — each in
 its own detached window (the operator's Lincoln window is never disturbed),
-with its identity (`CLAUDE_AGENT_NAME` / `CLAUDE_AGENT_ROLE=manager`) set at
-launch, registered in the role→pane registry, and kicked into its operating
+with its provider-neutral identity (`SABLE_AGENT_NAME` /
+`SABLE_AGENT_ROLE=manager`) set at launch, registered in the role→pane registry,
+and kicked into its operating
 loop. The interlock gates manager spawning to execution mode.
 
 **Lincoln** is the pane you talk to. **Optimus and Tarzan** are resident manager
@@ -128,9 +129,10 @@ from their own CWD and close their beads with gate evidence; managers never
 push worker code. **Chuck** is the merge-queue pane — a manager's push notifies
 him message-first (`sable-msg chuck`, sent by the post-push hook), with the
 durable `for-chuck` bead as the fallback when his pane is unreachable.
-Lead↔manager conversation is `sable-msg` with the `⟦SABLE-MSG⟧ from=<sender>`
-framing header; the high-volume worker path is deliberately message-free
-(workers are spawned with their instructions and report via the bead pool).
+Live pane-to-pane conversation is `sable-msg` with the
+`⟦SABLE-MSG⟧ from=<sender>` framing header. Workers normally report durable
+results through the bead pool, but can message their owning manager when they
+need a ruling; managers can target a worker by bead id.
 
 | Mode | Job | Mechanics |
 |------|-----|-----------|
@@ -161,13 +163,15 @@ the Lincoln session from populating the implementation backlog until
 Mechanics:
 
 - **`bin/sable-mode`** — reads/writes the **per-repo** mode-state file
-  `<repo>/.claude/sable/state/mode-state.json` (`{mode, since, fleet, substage}`),
+  `<repo>/.claude/sable/state/mode-state.json`
+  (`{mode, since, fleet, substage, providers}`),
   resolved from the git common-dir so a repo's worktrees share one mode (falls
   back to `~/.claude/sable/state/mode-state.json` outside a git repo;
   `SABLE_MODE_STATE` overrides). The source of truth shared by the skills and the
   interlock — scoped per-repo so concurrent SABLE sessions in different repos
   keep independent modes. `sable-mode substage get|set|advance` walks the
-  planning substages; `sable-mode path` prints the resolved path.
+  planning substages; `sable-mode providers get [role]` reads the immutable
+  execution provider contract; `sable-mode path` prints the resolved path.
 - **`/sable-plan` and `/sable-execute`** (`skills/sable-plan`, `skills/sable-execute`) —
   flip the mode and swap Lincoln's persona.
 - **`hooks/multi-manager/mode-interlock.sh`** — the mechanical guarantee.
@@ -436,18 +440,38 @@ Claims exist *before* the worker starts editing, closing the dispatch-time race 
 
 A `PreToolUse:Edit|Write` hook reconciles emergent claims — if the worker modifies a file not declared in the bead description (legitimate scope creep), the file is appended to claims automatically.
 
-### 3. Overlap awareness (advisory, not blocking)
+### 3. Declared-footprint overlap is a scheduling constraint
 
-A `PreToolUse:Agent` hook reads claims from all in-progress beads. If the proposed dispatch would touch files claimed by another in-progress bead, the hook **annotates** rather than denies:
+The `PreToolUse:Agent` hook and `sable-spawn-worker` compare the proposed
+dispatch's declared file footprint with every *different* in-progress bead. If
+any path is shared, the dispatch is **denied**. The hook returns a hard
+`permissionDecision: deny`; `sable-spawn-worker` refuses the spawn with exit
+11 and names the overlapping bead(s) and paths.
 
-```
-OVERLAP DETECTED:
-  Proposed dispatch (bd-205): foo.ts, bar.ts
-  In-progress (bd-147, tarzan): foo.ts
-  Decision: dispatch will proceed; file a coord bead if intentional collaboration is needed.
-```
+There are exactly two operator remedies:
 
-The annotation is also pushed into the eventual PR description and the `for-chuck` notification bead, so Chuck can sequence merges intelligently. Information-rich, not enforcement-heavy.
+1. **Wait for every overlapping bead to clear** (close/land), then dispatch
+   again.
+2. Intentionally accept the overlap by adding an explicit
+   `Serialize-with: <bead-id>` line. Put the line in the Agent dispatch prompt
+   for the hook path, or in the dispatch bead's notes/description for
+   `sable-spawn-worker`. Every overlapping bead must be named; naming an
+   unrelated bead, or covering only some of several overlaps, does not bypass
+   the remaining constraint.
+
+An accepted declaration permits the dispatch and records reciprocal
+`serialize_with` metadata on both beads. That durable relation travels in the
+Chuck handoff payload (direct message or durable fallback) so Chuck can
+sequence the two merges instead of racing them. It is an explicit
+serialization decision, not a general overlap waiver.
+
+A footprint source that is present but names no readable path is a separate
+hard failure: the constraint could not be evaluated. The hook denies it, and
+`sable-spawn-worker` returns exit 12. Fix the `## File footprint` section to
+list comma-separated paths, or remove the empty declaration if the bead truly
+declares no files. A bead with no footprint source at all is allowed to
+dispatch, but is reported loudly as `NO-DECLARATION`; that is deliberately
+different from a footprint comparison that ran and found no overlap.
 
 ### 4. Selective dispatch preemption
 
@@ -576,9 +600,24 @@ The claim file lives at `$(git -C <cwd> rev-parse --git-dir)/sable-tree-claim` a
 - Session identity is unknowable (no `session_id` in JSON, no `CLAUDE_SESSION_ID` env) → allow + `additionalContext`.
 - The claim file is unreadable or corrupt → take over + allow + `additionalContext`.
 
+Each of these is a case where the gate **ran and reached a considered conclusion**. That is categorically different from the gate not running at all.
+
+**Fail-closed on the gate's own breakage (SABLE-k2h0m).** The hook is two files: `tree-claim.sh` is a small entrypoint, and `tree-claim-impl.sh` holds the logic (including the embedded python). The split exists because a single-file hook cannot fail closed on its own syntax error — bash parses the whole file before executing a line, so any self-check inside it is dead code exactly when it is needed. Observed live: one stray double quote in the embedded python made `bash tree-claim.sh` exit 2, and since a hook that exits non-zero without deny JSON is treated as ALLOW, the gate silently disarmed itself — 84 suite assertions flipped from deny to allow at once.
+
+Every normal path of `tree-claim-impl.sh` exits 0, so a non-zero exit means it could not run (unparseable, missing, truncated, crashed). The entrypoint then:
+
+| | Degraded behaviour |
+|---|---|
+| Git-index-write-shaped command | **Deny** — the gate has not established the write is safe |
+| Any other command | Allow (editors, tests, `bash -n`, `git status` — the means of repair) |
+| `SABLE_TREE_CLAIM_OVERRIDE=1`, in the hook env **or** inline in the command | Allow, announced — the break-glass. The inline form matters: a PreToolUse hook is a separate process, so a `VAR=1 git commit` prefix never reaches its environment |
+
+Every degraded decision prints the greppable token `SABLE-TREE-CLAIM-DEGRADED` to stderr and carries `additionalContext` or a reason. Silence was the worst property of the old mode. Note the blast radius: while broken, refusals can reach writes in other repos the command targets (see SABLE-vx4aj on attribution) — bounded by the narrow classifier, the override, and the lifetime of the breakage.
+
 ### 7. Post-push Chuck notification
 
-A `PostToolUse:Bash` hook matching successful `git push` files a `for-chuck` bead:
+A `PostToolUse:Bash` hook matching successful `git push` sends Chuck a direct
+tmux message as the primary merge handoff:
 
 ```
 PR <url> ready for review
@@ -588,7 +627,11 @@ Overlap analysis:
   - bd-203 (optimus, in-progress): bar.ts
 ```
 
-Chuck's inbox injection picks this up immediately. Chuck has overlap context to sequence merges intelligently — hold this PR if a related PR is in flight, merge if independent.
+Only when direct delivery cannot be confirmed does the hook file the same
+payload as a durable `for-chuck` fallback bead. Bead absence is therefore the
+healthy expected path, not evidence of a missed handoff. Chuck has overlap
+context to sequence merges intelligently — hold this PR if a related PR is in
+flight, merge if independent.
 
 ### 7. Chuck's fix-vs-delegate threshold
 
@@ -604,6 +647,50 @@ Chuck uses the registry's `fix_directly` and `delegate_to_author` lists to decid
 
 Mechanical conflicts (no intent to get wrong) → Chuck fixes inline. Semantic conflicts (where author intent matters) → Chuck files a `for-<author>` bead with the conflict context and a suggested resolution.
 
+### 8. MATCHED PAIR / MUST-LAND-TOGETHER beads (SABLE-rzkw7)
+
+A planner or manager can rule that two beads may be worked in parallel but
+must only be *promoted* together — e.g. two halves of one hardcoded-timeout
+fix ("twin hardcodes"), or a cross-epic contract where one side is only
+sound because the other backstops it ("this impact tier is sound only
+because the other epic's green snapshot backstops under-selection; neither
+ships without the other's counterpart"). Before this bead that ruling lived
+only in a bead note or a manager's working memory — nowhere Chuck's promote
+path ever read it, so he could be holding one signed-off half with no way to
+know it was half of a pair. That is a near-miss with no failure event at the
+promote: both halves are individually green, which is exactly what makes
+them individually signable, so nothing red announces the split.
+
+The ruling is now reciprocal `metadata.landing_pair` state plus a durable
+Beads reverse index. Create or remove it only through the landing authority:
+
+```bash
+sable-merge-gate landing-pair declare <id-a> <id-b>
+sable-merge-gate landing-pair remove <id-a> <id-b>
+```
+
+Do not write the metadata directly. The command writes the same canonical
+member set to both beads in one operation. Its `relates-to` edge lets either
+bead detect a partial/manual one-sided edit from its own ordinary `bd show`;
+such an asymmetric state fails closed at both endpoints. Removing a pair
+clears both declarations but preserves the generic relation because it may
+have existed before the pair and is policy-inert without the metadata.
+
+`sable-merge-gate promote` reads it mechanically (exit 28, naming the
+counterpart) — see chuck.md's promote step for the full contract. An
+unlanded pair is authorized only when both exact branch tips are members of
+the same `batch-cycle`/`land-batch` operation. That operation binds one
+combined object to one green verdict and advances the integration ref once
+or not at all; merely naming the counterpart cannot satisfy it. Every manual
+`land-batch --member` must include its bead ID so the final writer can inspect
+the declared relation. Solo promotion remains available only after the
+counterpart genuinely landed, as recovery for a historical half-landing.
+
+This is distinct from a blocking `bd dep add` edge (which means "cannot
+**start** until") — the non-blocking `relates-to` reverse index does not gate
+work. A landing pair CAN be worked in parallel; it can only never be
+**promoted** solo.
+
 ---
 
 ## Hook catalog (advanced — multi-manager)
@@ -613,18 +700,51 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | Hook | Trigger | Purpose | Mode |
 |------|---------|---------|------|
 | `session-role-anchor.sh` | SessionStart, PreCompact | Inject role identity from `~/.claude/sable/roles/<name>.md` | Inject context |
-| `tree-claim.sh` | PreToolUse:Bash | Lockfile: one main session per checkout — deny index-mutating git commands when another session holds a fresh claim (TTL 3600s; `SABLE_TREE_CLAIM_OVERRIDE=1` or manual delete to escape) | Hard deny |
+| `control-trace.sh` | PreToolUse:Bash | Neutral-observer trace: appends `ts pid tool-hint` to `~/.claude/sable/logs/control-trace.log` (or `SABLE_CONTROL_TRACE_LOG`) as its literal first executable line, before any other logic runs. Deliberately self-contained (does not source `lib-hook-trace.sh`) so a bug in the shared trace lib can't blind both observers at once (SABLE-jfg6.2) | Log only (never blocks) |
+| `tree-claim.sh` (+ `tree-claim-impl.sh`) | PreToolUse:Bash | Lockfile: one main session per checkout — deny index-mutating git commands when another session holds a fresh claim (TTL 3600s; `SABLE_TREE_CLAIM_OVERRIDE=1` or manual delete to escape). Denies git writes if the gate itself cannot run | Hard deny |
+| `stash-worktree-guard.sh` | PreToolUse:Bash | Deny unscoped `git stash`/`push`/`pop`/`apply`/`drop` — `refs/stash` is a single stack shared by every worktree of a repo, primary checkout included (SABLE-5dmh/SABLE-nhrb), so an unscoped op is indistinguishable from someone else's entry. `git stash clear` always denies (no break-glass); scoped pushes (`-m "<scope>: <what>"`) and explicit-index pop/apply/drop are allowed through with a warning; read-only forms (`list`/`show`/`branch`/`create`/`store`) pass silently | Hard deny (break-glass allow+warn) |
+| `worktree-placement-guard.sh` | PreToolUse:Bash | Deny `bd worktree create` targets nested inside the current checkout; absolute sibling/outside-repo placements remain allowed, preventing both nested worktrees and tracked `.gitignore` edits | Hard deny |
 | `read-guard.sh` | PreToolUse:Bash | Deny `bd ready -l for-<foreign>` queries (Lincoln bypassed via `cross_inbox_read: true`) | Hard deny |
-| `pre-dispatch-refresh.sh` | PreToolUse:Agent | Rebase target worktree on `$SABLE_BASE_BRANCH` | Side effect (rebase) |
+| `notes-clobber-guard.sh` | PreToolUse:Bash | Deny `bd update <id> --notes` when the bead's notes are non-empty — `--notes` REPLACES the field and the loss is silent (SABLE-sm269). Empty notes and `--append-notes` pass silently; an unparseable command or unreadable bead fails OPEN but says so | Hard deny |
 | `pre-dispatch-claim.sh` | PreToolUse:Agent | Read bead description, write file claims to bead notes | Side effect (bd update) |
-| `pre-dispatch-overlap.sh` | PreToolUse:Agent | Annotate overlap with other in-progress beads | Inject context |
+| `pre-dispatch-overlap.sh` | PreToolUse:Agent | Deny declared-footprint overlap with other in-progress beads; allow only after every hit is named by `Serialize-with` and tag both sides for merge sequencing | Hard deny (unless every overlap is explicitly serialized) |
 | `pre-dispatch-preempt.sh` | PreToolUse:Agent | Block dispatch if P0 coord bead in inbox | Hard deny |
 | `pre-dispatch-model-check.sh` | PreToolUse:Agent | Enforce model ladder — bead `model:` label must match dispatch's model param, or prompt must include `Model override: <reason>` | Hard deny |
 | `edit-write-claim-reconciler.sh` | PreToolUse:Edit\|Write | Append modified file to bead claims | Side effect (bd update) |
 | `pre-push-rebase-test.sh` | PreToolUse:Bash matching `git push` | Force rebase + tests before push | Hard deny |
-| `post-push-merge-notify.sh` | PostToolUse:Bash matching `git push` | File `for-chuck` bead with overlap analysis (Chuck's own pushes are skipped) | Side effect (bd create) |
+| `post-push-merge-notify.sh` | PostToolUse:Bash matching `git push` | Notify Chuck directly with overlap analysis; file a durable `for-chuck` fallback only when direct delivery fails (Chuck's own pushes are skipped) | Side effect (tmux delivery; fallback bd create) |
+| `seat-sighting-gate.sh` | PostToolUse:Bash matching `bd create`, identity-gated on chuck | Mechanizes "capture is mandatory, priority is advisory" (SABLE-441vl): after a seat-filed bead lands, auto-labels it `seat-filed` and marks `metadata.priority_provisional=true` for a manager's later triage. Never denies — the seat's `bd create` is never refused | Side effect (bd update), never blocks |
+| `close-decay-sweep.sh` | PreToolUse:Bash matching `bd close` | Identifier-decay sweep (SABLE-x9vby): flag OPEN beads whose INSTRUCTIONS still name the bead id being retired, with the matching line | Inject context (never denies) |
 
-Every continuous-mode hook (everything except `session-role-anchor.sh` and `read-guard.sh`) hard-exits when `CLAUDE_AGENT_ROLE != "manager"`, so they no-op in Sherlock / Victor / Rudy / Columbo sessions. (The former poll-based `inbox-injection` hooks were deleted with the tmux-only cutover — live messaging is `sable-msg`; the durable `for-X` labels remain the fallback channel.)
+**Identifier decay (`close-decay-sweep.sh`)**: an instruction pinned to an identifier decays *silently* when that identifier is retired through normal, correct action — nothing fails, and the stale instruction still reads as satisfiable, so whoever follows it does something harmless and wrong. This hook is the retirement-time catch: at `bd close`, it sweeps open beads for instructional references to the closing id and prints them inline (`sable-identifier-decay` does the work; the same detector runs at the merge gate's branch-delete, where a branch NAME is the retiring identifier). It is deliberately not role-gated — workers close their own beads, so a manager-only guard would miss most closes. It never denies: fail-open on the decision, loud on the report (a sweep that could not run says `COULD NOT ASSESS` rather than printing the silence a clean sweep prints). **Known limit, shipped in the flag text itself**: it sees instructions that NAME a retired identifier, not ones invalidated because a code path stopped being reached (SABLE-3nymz). A detector whose limits are undocumented gets trusted past them.
+
+Role scope is deliberately per-hook; there is no catalog-wide
+"continuous-mode hooks are manager-only" rule. `session-role-anchor.sh` and
+`read-guard.sh` are manager-gated, not exceptions: the former exits unless the
+resolved role kind is `manager`, and the latter exits unless the shared identity
+resolver reports a manager. `pre-push-rebase-test.sh` explicitly denies worker
+subagent pushes before restricting its rebase/test phases to managers (warm-pane
+workers intentionally carry manager identity and self-push);
+`post-push-merge-notify.sh` is manager-gated, while `seat-sighting-gate.sh` is
+narrower still (Chuck only).
+
+By contrast, the neutral observer (`control-trace.sh`) and scripts whose
+hazards exist in every pane (`tree-claim.sh` + `tree-claim-impl.sh`,
+`stash-worktree-guard.sh`, `inline-body-guard.sh`, `notes-clobber-guard.sh`,
+`close-hold-guard.sh`, and `close-decay-sweep.sh`) intentionally impose no
+blanket manager gate when invoked. `worktree-placement-guard.sh` is likewise role-neutral.
+That says nothing about activation: notably, `control-trace.sh`,
+`close-hold-guard.sh`, and `close-decay-sweep.sh` are not registered in the
+default lifecycle settings. The registered Agent/Edit/Write matcher hooks are
+bounded by those matchers and their own per-hook logic; `mode-interlock.sh`
+additionally carries explicit producer restrictions. Read the hook's catalog
+row, registration state, and identity gate rather than inferring its scope from
+a blanket role rule. (The former
+poll-based `inbox-injection` hooks were deleted with the tmux-only cutover —
+live messaging is `sable-msg`; the durable `for-X` labels remain the fallback
+channel.)
+
+`pre-dispatch-refresh.sh` (automatic rebase-on-dispatch) was likewise retired — SABLE-o3xju de-wired it from the live `settings.json` (both the global install and this repo's project-local copy), and SABLE-mkj6k removed it durably from `templates/multi-manager/settings-snippet.json` so `install.sh` no longer re-arms it. The script file still exists under `hooks/multi-manager/` for reference but is not registered anywhere. Dispatch no longer auto-rebases the worker's checkout — workers rebase themselves (see the "Verify current state first" step and the self-push rebase step in `templates/worker-dispatch.md`).
 
 **Bead quality hook**: `bead-description-gate.sh` (existing SABLE hook) is now mode-aware. When `CLAUDE_AGENT_NAME` is set or `CLAUDE_AGENT_ROLE=manager` (i.e. a multi-manager session), the hook hard-blocks (denies) `bd create` if the description is missing required content. Outside that context (single-agent SABLE), it nudges via `additionalContext`. Rolling execution depends on bead descriptions reliably naming files; the manager-context hard-block is the structural answer to bead-quality drift.
 
@@ -755,6 +875,38 @@ ls ~/.claude/agents/   # should list columbo.md rudy.md sherlock.md victor.md (p
 
 `sable-agents <name>` should print details for any registered agent — useful for spot-checking that the registry was copied to `~/.claude/sable/agents.yaml` correctly.
 
+### Step 10: Pin spine bins (optional hardening)
+
+By default every `sable-*` CLI tool is a live symlink from `~/.local/bin/` back into the repo's `bin/` (Step 6.5 above) — an in-flight worker or manager can be running an entrypoint whose repo source changes underneath it mid-execution. An operator can freeze a specific tool's *entrypoint* (its running invocation) to whatever content was on disk when they chose to pin it (the y6ik3 hot-swap hazard).
+
+There are two pinning mechanisms, and picking the wrong one for a given bin is exactly the failure this section exists to prevent:
+
+- **Regular-file pin** (`sable-bin-install`'s default protection): `cp bin/<tool> ~/.local/bin/<tool>` — safe only for a bin with **zero repo-local imports**. `sable-merge-gate`, `sable-reconcile-handoffs`, and `sable-dolt-push` are pinned this way.
+- **Snapshot pin** (`sable-bin-install --pin-snapshot`): freezes the **whole `bin/` directory** as one versioned unit at `~/.local/lib/sable-<sha>/` (every bin plus every sibling lib, at the repo sha current when you pin), then atomically repoints the entry symlink into it. Required for any bin that imports a sibling module — `sable-spawn-worker` and `sable-msg` import `sable_pane_lib.py`, so a bare regular-file copy severs the import (`ImportError`) the moment it runs outside the repo. This was caught live during the 2026-07-21 y6ik3 window (`sable-msg` was deliberately never copy-pinned for exactly this reason) and is why the mechanism exists as a first-class tool feature rather than an ad hoc `cp`.
+
+**Chuck's import-check gate — the pre-convert acceptance criterion**: before converting ANY bin from its default live symlink to a pin, classify it first:
+
+```bash
+sable-bin-install --classify <tool-name>   # prints "plain" or "snapshot"
+```
+
+`plain` → a regular-file `cp` pin is safe. `snapshot` → it imports a sibling module; pin it with `--pin-snapshot`, never a bare `cp`. Skipping this check is precisely the mistake the 2026-07-21 window rolled back live; `sable-doctor` now also catches it after the fact (a `snapshot`-classified bin pinned as a bare regular file reports `BROKEN-COPY-PIN`), but the classify-first step is the acceptance gate *before* the conversion, not a substitute for it.
+
+```bash
+# pin every auto-detected python-importing tool (default), or name specific ones:
+sable-bin-install --pin-snapshot
+sable-bin-install --pin-snapshot sable-msg sable-spawn-worker
+
+# rollback (either pin type) — re-symlinks the entry back to the live repo:
+sable-bin-install --repin
+```
+
+A pinned bin — regular-file or snapshot — is protected from an ordinary `sable-bin-install` / `bash install.sh` re-run: the installer detects a snapshot pin the same way it detects a regular-file pin (a snapshot's entry point is still a *symlink*, but one resolving **outside** the repo's `bin/`), and skips re-linking it with a loud notice instead of silently reverting the pin.
+
+**Doctor coverage**: `sable-doctor` reports a `pinned snapshot bins` category alongside the regular-file `pinned bins` category. Because a snapshot pin is deliberately frozen at an older sha, doctor does **not** sha256-compare it against current repo HEAD (that would treat every legitimate pin as "drifted" the moment the repo moves on — the exact "a drift check can only agree-while-wrong if the thing it compares is narrower than the thing that moved" failure this bead exists to prevent). It resolves the entry symlink, extracts the sha baked into its snapshot directory name, and compares **every file physically present in the snapshot directory** — not just the one entry-point file the symlink resolves to — against the repo's `bin/` **at that pinned sha**, file for file: a file whose content was hand-edited, a file added to the snapshot that the pinned sha never had, and a file the pinned sha shipped with that the snapshot has since lost (the shape a future `bin/` module split takes) are all reported as drift. Comparing only the entry point would have been a drift check narrower than the pin unit itself — exactly the failure this section's design argument exists to rule out — so the report also names the drifted file(s) by basename, not just the entry point's install path. Statuses: `missing` (never pinned or installed), `clean`, `BROKEN-COPY-PIN` (a snapshot-needing bin pinned as a bare regular file — the import-severing hazard), `SNAPSHOT-DRIFT` (one or more files inside the snapshot no longer match what it claims to be pinned to). The ordinary `bash install.sh` remedy is never offered for either bad status — `sable-doctor`'s own report names the safe re-pin command instead.
+
+**Gains, losses, and renames**: the pin unit is "the whole `bin/` directory", not an enumerated file list, and the *set* of tools `sable-doctor` checks is derived the same way `--pin-snapshot`'s auto-detect is — by classifying every `bin/sable-*` script live, not from a hardcoded name tuple. A bin gaining, losing, or being renamed with a sibling import (e.g. a future `bin/` module split) is covered automatically on the next run of either tool; nothing needs to be updated by hand when that happens.
+
 ---
 
 ## Operating discipline
@@ -778,6 +930,38 @@ ls ~/.claude/agents/   # should list columbo.md rudy.md sherlock.md victor.md (p
    c. Reap done panes: sable-worker-status --reap
 8. Repeat; stand down when the pool and the inbox are empty
 ```
+
+**`bd ready` is not a merge signal (SABLE-d5iku).** Step 4's verification has a
+blind spot the tool cannot see past: bd releases a dependent when its blocker's
+STATUS becomes `closed`, but a bead sequenced behind another with `bd dep add`
+almost always needs the blocker's CODE on the branch the worker will fork from.
+Those two events are separated by the entire merge queue — minutes to hours —
+and the false release is indistinguishable from a correct one, so a manager
+following the tool correctly dispatches into a tree missing the prerequisite.
+The work then tests green against the old layout and mis-integrates later.
+
+`bin/sable-dep-check` closes the visibility gap: for each bead it walks the
+`blocks` edges, resolves each CLOSED blocker's branch (structured `branch`
+metadata first — what the worker-spawn helper stamps at dispatch — then `wk-*`
+names in the bead's own prose, filtered against live remote refs), and reports
+any whose branch is not an ancestor of the integration branch.
+
+```bash
+sable-dep-check SABLE-abc     # exit 3 + a named branch = closed-but-unmerged blocker
+sable-dep-check --ready       # sweep the whole ready pool
+```
+
+`hooks/multi-manager/pre-dispatch-claim.sh` runs the same check on every worker
+dispatch and emits the warning as `additionalContext`. It is ADVISORY, never a
+deny: merge state has genuine unresolvable cases (pruned branches, stale
+remote-tracking refs, blockers that never produced code), and a withhold would
+trade the false-go for a false-block. A branch ABSENT from the remote is
+deliberately silent — this fleet deletes worker branches once they land, so
+absence overwhelmingly means merged-and-pruned. Disable with
+`SABLE_DEP_MERGE_GUARD=0`.
+
+Merge-aware readiness at the source — `bd ready` withholding a dependent whose
+blocker's branch is unmerged — lives in bd core, which is upstream of this repo.
 
 **The dispatch prompt is load-bearing.** Ad-hoc prompts drift mid-session
 (early dispatches say one thing, later ones say another), and workers absorb

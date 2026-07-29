@@ -5,8 +5,8 @@
 # ~/.claude (--user): all multi-manager hooks, the agents.yaml registry, the SABLE
 # skills (/sable-plan, /sable-execute, /columbo, /gaudi, ...), and the four
 # warm-pane roles (lincoln, optimus, tarzan, chuck) with identity injection.
-# The settings snippet is merged idempotently into the scope's settings file
-# (backed up + validated; existing entries never clobbered).
+# Settings are print-only by default. Pass --merge-settings to apply the
+# idempotent merge after reviewing the exact add/remove/modify report.
 #
 # Execution runs on the tmux warm-pane topology — the only topology (see
 # TMUX-AGENTS-DESIGN.md): bring the session up with `sable-tmux --autostart`.
@@ -15,7 +15,8 @@
 # Turn orchestration off at runtime WITHOUT uninstalling: export SABLE_ORCHESTRATION=off
 #
 # Usage:
-#   sable-orchestration-install [--project|--user] [--uninstall] [--help]
+#   sable-orchestration-install [--project|--user] [--merge-settings]
+#                              [--uninstall] [--help]
 #
 # Env (mainly for tests):
 #   SABLE_PROJECT_DIR   project root for --project scope (default: $PWD)
@@ -25,7 +26,17 @@
 
 set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# Resolve this script's PHYSICAL dir before deriving the checkout. The supported
+# PATH install is a live symlink into repo/bin; dirname(BASH_SOURCE[0]) alone
+# would derive ~/.local (or another link parent) as REPO. Follow every link hop
+# portably instead of relying on GNU-only readlink -f (SABLE-4xj4y / SABLE-5p2).
+SOURCE="${BASH_SOURCE[0]:-$0}"
+while [ -h "$SOURCE" ]; do
+    SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    case "$SOURCE" in /*) ;; *) SOURCE="$SOURCE_DIR/$SOURCE" ;; esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 REPO="${SABLE_REPO_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
 usage() {
@@ -34,10 +45,12 @@ usage() {
 
 SCOPE="project"
 UNINSTALL=0
+MERGE_SETTINGS=0
 for arg in "${@:-}"; do
     case "$arg" in
         --project)          SCOPE="project" ;;
         --user)             SCOPE="user" ;;
+        --merge-settings)   MERGE_SETTINGS=1 ;;
         --uninstall)        UNINSTALL=1 ;;
         -h|--help)          usage; exit 0 ;;
         "")                 ;;
@@ -47,8 +60,70 @@ for arg in "${@:-}"; do
     esac
 done
 
+# Abort before deriving or mutating an install scope when the selected source
+# is not a complete orchestration checkout. Keep the diagnostic distinct for a
+# bad explicit test/custom override versus a broken physical-script derivation:
+# the former is caller input; the latter is an installer/path-resolution bug.
+validate_source_tree() {
+    local _required _registered_hooks _skill _skill_found=0 _missing=""
+    for _required in \
+        templates/multi-manager/agents.yaml \
+        templates/multi-manager/settings-snippet.json \
+        templates/multi-manager/roles/lincoln.md \
+        templates/multi-manager/roles/optimus.md \
+        templates/multi-manager/roles/tarzan.md \
+        templates/multi-manager/roles/chuck.md
+    do
+        [ -r "$REPO/$_required" ] || _missing="$_missing $_required"
+    done
+    if [ -r "$REPO/templates/multi-manager/settings-snippet.json" ]; then
+        _registered_hooks="$(
+            grep -oE 'multi-manager/[[:alnum:]_.-]+\.sh' \
+                "$REPO/templates/multi-manager/settings-snippet.json" |
+                LC_ALL=C sort -u || true
+        )"
+        if [ -z "$_registered_hooks" ]; then
+            _missing="$_missing registered multi-manager hook references"
+        else
+            while IFS= read -r _required; do
+                [ -r "$REPO/hooks/$_required" ] ||
+                    _missing="$_missing hooks/$_required"
+            done <<< "$_registered_hooks"
+        fi
+    fi
+    for _skill in "$REPO"/skills/*/SKILL.md; do
+        [ -r "$_skill" ] || continue
+        _skill_found=1
+        break
+    done
+    [ "$_skill_found" -eq 1 ] ||
+        _missing="$_missing skills/*/SKILL.md"
+    [ -z "$_missing" ] && return 0
+
+    if [ -n "${SABLE_REPO_DIR:-}" ]; then
+        echo "sable-orchestration-install: invalid SABLE_REPO_DIR '$SABLE_REPO_DIR':" >&2
+        echo "  required SABLE source artifacts are missing under '$REPO':$_missing" >&2
+    else
+        echo "sable-orchestration-install: could not resolve the SABLE source checkout from physical script '$SOURCE':" >&2
+        echo "  derived REPO '$REPO' is missing:$_missing" >&2
+    fi
+    exit 1
+}
+
+validate_source_tree
+
 if [ "$SCOPE" = "user" ]; then
     BASE="${CLAUDE_USER_DIR:-$HOME/.claude}"
+    if [ -n "${CODEX_HOME:-}" ]; then
+        CODEX_HOOKS="$CODEX_HOME/hooks.json"
+    elif [ -n "${CLAUDE_USER_DIR:-}" ]; then
+        # A redirected Claude user dir is the installer's established
+        # test/custom-scope boundary; keep Codex beside it instead of leaking
+        # into the real ~/.codex.
+        CODEX_HOOKS="$(dirname "$BASE")/.codex/hooks.json"
+    else
+        CODEX_HOOKS="$HOME/.codex/hooks.json"
+    fi
     SETTINGS="$BASE/settings.json"
     # --user hook commands are rewritten to the absolute BASE (byte-identical
     # to pre-SABLE-59t6.2 behavior — there's no portable placeholder for ~/.claude).
@@ -56,6 +131,7 @@ if [ "$SCOPE" = "user" ]; then
 else
     PROJECT="${SABLE_PROJECT_DIR:-$PWD}"
     BASE="$PROJECT/.claude"
+    CODEX_HOOKS=""
     # Project scope writes the COMMITTED settings.json (SABLE-59t6.2), so hook
     # commands must be portable across clones/machines: root them at the
     # literal ${CLAUDE_PROJECT_DIR} placeholder Claude Code expands at runtime,
@@ -67,66 +143,251 @@ SKILLS="$BASE/skills"
 HOOKS_DIR="$BASE/hooks/multi-manager"
 AGENTS_DIR="$BASE/agents"
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
+BASE_SNIPPET="$REPO/templates/base-settings-snippet.json"
+BASE_HOOK_FILES="tdd-evidence.sh tdd-gate.sh bead-description-gate.sh tdd-remind.sh agent-tdd-enforce.sh bead-quality.sh"
+BASE_HOOK_SUPPORT_FILES="lib-hook-trace.sh lib-evidence-key.sh"
+BASE_LAYER_AVAILABLE=1
+[ -r "$BASE_SNIPPET" ] || BASE_LAYER_AVAILABLE=0
+for _base_source in $BASE_HOOK_FILES; do
+    [ -r "$REPO/hooks/$_base_source" ] || BASE_LAYER_AVAILABLE=0
+done
+for _base_support in $BASE_HOOK_SUPPORT_FILES; do
+    [ -r "$REPO/hooks/multi-manager/$_base_support" ] || BASE_LAYER_AVAILABLE=0
+done
+
+# Refuse before the first install write when an existing settings target cannot
+# be read as a JSON object. Invalid bytes are preserved and copied to the
+# familiar .bak recovery path; valid settings are not backed up until an
+# explicitly-consented write actually needs a snapshot.
+preflight_settings_targets() {
+    local -a existing=()
+    local target
+    for target in "$@"; do
+        [ -n "$target" ] && [ -e "$target" ] && existing+=("$target")
+    done
+    [ "${#existing[@]}" -gt 0 ] || return 0
+
+    python3 - "${existing[@]}" <<'PY'
+import json, shutil, sys
+
+for path in sys.argv[1:]:
+    backup = path + '.bak'
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("top level must be a JSON object")
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        try:
+            shutil.copy2(path, backup)
+            recovery = f"backup path: {backup}"
+        except OSError as backup_exc:
+            recovery = f"backup path {backup} also failed: {backup_exc}"
+        reason = (
+            f"could not read or back up existing settings ({exc})"
+            if isinstance(exc, OSError)
+            else f"invalid JSON ({exc})"
+        )
+        print(
+            f"sable-orchestration-install: REFUSED settings merge for {path}: "
+            f"{reason}. Existing bytes were preserved; "
+            f"{recovery}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+PY
+}
 
 # Retired-artifact list (SABLE-gsqj): names this repo used to ship into a scope
 # but no longer does. Upgrading over a pre-existing scope is purely additive
 # otherwise — these must be actively retired on every plain install, not just
 # --uninstall, or they stay live (e.g. a deleted poll hook still registered
 # in settings, or a retired manager def the Agent tool still offers).
-RETIRED_HOOK_FILES="inbox-injection.sh inbox-injection-precompact.sh"
+RETIRED_HOOK_FILES="inbox-injection.sh inbox-injection-precompact.sh control-trace.sh close-decay-sweep.sh"
 RETIRED_AGENT_DEFS="optimus.md tarzan.md chuck.md"
 
-# Merge a settings snippet's hooks into the target settings file, idempotently.
-# Rewrites the snippet's ~/.claude paths to BASE_DIR (the absolute BASE for
-# --user scope; the literal ${CLAUDE_PROJECT_DIR}/.claude placeholder for
-# --project scope, so the committed settings.json stays portable). Idempotency keys on
-# (event, matcher, command-basename) so a hook registered under two matchers (e.g.
-# mode-interlock.sh under both Bash and Agent) is preserved, while a re-run adds
-# nothing. Backs up, validates JSON, never clobbers existing entries.
-merge_snippet() {
-    SETTINGS_PATH="$1" SNIPPET_PATH="$2" BASE_DIR="$3" python3 - <<'PY'
-import json, os, shutil
-settings = os.environ['SETTINGS_PATH']
-with open(os.environ['SNIPPET_PATH']) as f: snip = json.load(f)
-base = os.environ['BASE_DIR']
-data = {}
+# Render the exact settings result without touching the live target. The caller
+# may then apply it through install_file() when --merge-settings was explicit,
+# gaining the same timestamped snapshot and manifest as every other artifact.
+#
+# Rewrites ~/.claude to BASE_DIR and keys rows by (event, matcher,
+# command-basename). Existing rows are refreshed when their timeout/type/path
+# changed instead of being silently left stale. SKIP_MARKERS are refused hooks;
+# RETIRED_MARKERS are old rows this version no longer ships. Both disappear
+# from the proposal, never directly from the live file.
+render_settings_proposal() {
+    SETTINGS_PATH="$1" BASE_DIR="$2" SKIP_MARKERS="${3:-}" \
+    RETIRED_MARKERS="$4" OUTPUT_PATH="$5"
+    shift 5
+    SETTINGS_PATH="$SETTINGS_PATH" BASE_DIR="$BASE_DIR" \
+    SKIP_MARKERS="$SKIP_MARKERS" RETIRED_MARKERS="$RETIRED_MARKERS" \
+    OUTPUT_PATH="$OUTPUT_PATH" python3 - "$@" <<'PY'
+import copy
+import json
+import os
+import sys
+
+settings = os.environ["SETTINGS_PATH"]
+snippets = []
+for snippet_path in sys.argv[1:]:
+    with open(snippet_path, encoding="utf-8") as f:
+        snippets.append(json.load(f))
 if os.path.exists(settings):
-    shutil.copy(settings, settings + '.bak')
-    try:
-        with open(settings) as f: data = json.load(f)
-    except Exception:
-        data = {}
-hooks = data.setdefault('hooks', {})
-def marker(cmd): return (cmd or '').rsplit('/', 1)[-1]
-for event, blocks in snip.get('hooks', {}).items():
-    ev = hooks.get(event)
-    if not isinstance(ev, list):
-        ev = hooks[event] = []
-    existing = set()
-    for b in ev:
-        if isinstance(b, dict):
-            bm = b.get('matcher', '')
-            for h in b.get('hooks', []):
-                if isinstance(h, dict): existing.add((bm, marker(h.get('command', ''))))
-    for b in blocks:
-        if not isinstance(b, dict): continue
-        m = b.get('matcher', '')
-        target = next((x for x in ev if isinstance(x, dict) and x.get('matcher', '') == m), None)
-        if target is None:
-            target = {'matcher': m, 'hooks': []}; ev.append(target)
-        tl = target.setdefault('hooks', [])
-        for h in b.get('hooks', []):
-            if not isinstance(h, dict): continue
-            cmd = (h.get('command', '') or '').replace('~/.claude', base)
-            key = (m, marker(cmd))
-            if key in existing: continue
-            existing.add(key)
-            tl.append({**h, 'command': cmd})
-out = json.dumps(data, indent=2); json.loads(out)
-os.makedirs(os.path.dirname(settings), exist_ok=True)
-with open(settings, 'w') as f: f.write(out + '\n')
+    with open(settings, encoding="utf-8") as f:
+        before = json.load(f)
+else:
+    before = {}
+data = copy.deepcopy(before)
+base = os.environ["BASE_DIR"]
+excluded = set(os.environ.get("SKIP_MARKERS", "").split())
+excluded.update(os.environ.get("RETIRED_MARKERS", "").split())
+
+
+def marker(command):
+    return (command or "").rsplit("/", 1)[-1]
+
+
+def rows(document):
+    result = {}
+    hooks = document.get("hooks", {}) if isinstance(document, dict) else {}
+    if not isinstance(hooks, dict):
+        return result
+    for event, blocks in hooks.items():
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            matcher = block.get("matcher", "")
+            for hook in block.get("hooks", []):
+                if isinstance(hook, dict):
+                    result[(event, matcher, marker(hook.get("command", "")))] = hook
+    return result
+
+
+hooks = data.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    hooks = data["hooks"] = {}
+
+# Retire/refuse rows in the proposal only.
+for blocks in hooks.values():
+    if not isinstance(blocks, list):
+        continue
+    for block in blocks:
+        if isinstance(block, dict) and isinstance(block.get("hooks"), list):
+            block["hooks"] = [
+                hook for hook in block["hooks"]
+                if not (isinstance(hook, dict)
+                        and marker(hook.get("command", "")) in excluded)
+            ]
+
+# Add or refresh the rows this version ships. Multiple snippets are composed
+# into one proposal/write so Codex's base and orchestration graphs cannot land
+# in separate partial states.
+for snippet in snippets:
+    for event, blocks in snippet.get("hooks", {}).items():
+        event_blocks = hooks.get(event)
+        if not isinstance(event_blocks, list):
+            event_blocks = hooks[event] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            matcher = block.get("matcher", "")
+            matching_blocks = [
+                candidate for candidate in event_blocks
+                if isinstance(candidate, dict)
+                and candidate.get("matcher", "") == matcher
+            ]
+            if not matching_blocks:
+                matching_blocks = [{"matcher": matcher, "hooks": []}]
+                event_blocks.extend(matching_blocks)
+            target = matching_blocks[0]
+            target_hooks = target.setdefault("hooks", [])
+            for hook in block.get("hooks", []):
+                if not isinstance(hook, dict):
+                    continue
+                desired = {
+                    **hook,
+                    "command": (hook.get("command", "") or "").replace(
+                        "~/.claude", base),
+                }
+                name = marker(desired["command"])
+                if name in excluded:
+                    continue
+                location = next(
+                    ((candidate, i)
+                     for candidate in matching_blocks
+                     for i, current in enumerate(candidate.get("hooks", []))
+                     if isinstance(current, dict)
+                     and marker(current.get("command", "")) == name),
+                    None,
+                )
+                if location is None:
+                    target_hooks.append(desired)
+                else:
+                    existing_block, index = location
+                    existing_block["hooks"][index] = desired
+
+with open(os.environ["OUTPUT_PATH"], "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+old_rows, new_rows = rows(before), rows(data)
+changes = []
+for key in sorted(set(old_rows) | set(new_rows)):
+    event, matcher, name = key
+    where = f"{event}[{matcher or '*'}] {name}"
+    if key not in old_rows:
+        changes.append(f"ADDED    {where}")
+    elif key not in new_rows:
+        changes.append(f"REMOVED  {where}")
+    elif old_rows[key] != new_rows[key]:
+        changes.append(f"MODIFIED {where}")
+
+for line in changes:
+    print(f"    {line}")
+raise SystemExit(10 if changes else 0)
 PY
 }
+
+
+apply_settings_proposal() {
+    _settings_target="$1"
+    _settings_base="$2"
+    _settings_label="$3"
+    _settings_skip="${4:-}"
+    shift 4
+    _settings_tmp="$(mktemp -d)"
+    _settings_proposed="$_settings_tmp/proposed.json"
+    _settings_report="$_settings_tmp/report.txt"
+
+    if render_settings_proposal \
+            "$_settings_target" "$_settings_base" "$_settings_skip" \
+            "$RETIRED_HOOK_FILES" "$_settings_proposed" \
+            "$@" >"$_settings_report"; then
+        echo "Settings unchanged: $_settings_target"
+        rm -rf "$_settings_tmp"
+        return 0
+    else
+        _settings_rc=$?
+    fi
+    if [ "$_settings_rc" -ne 10 ]; then
+        rm -rf "$_settings_tmp"
+        return "$_settings_rc"
+    fi
+
+    echo "Settings changes for $_settings_target:"
+    cat "$_settings_report"
+    if [ "$MERGE_SETTINGS" = "1" ]; then
+        mkdir -p "$(dirname "$_settings_target")"
+        install_file "$_settings_proposed" "$_settings_target" "$_settings_label"
+        echo "  APPLIED (--merge-settings explicitly given)."
+    else
+        echo "  NOT APPLIED (print-only default). Re-run with --merge-settings to consent."
+    fi
+    rm -rf "$_settings_tmp"
+}
+
 
 # Remove every layer hook (any command referencing multi-manager/) from settings.
 remove_layer_hooks() {
@@ -150,45 +411,12 @@ with open(path, 'w') as f: f.write(out + '\n')
 PY
 }
 
-# Remove settings rows whose command basename is in the (space-separated)
-# retired-name list. Backs up first. Prints the count of rows removed so the
-# caller can decide whether there's anything to report.
-remove_retired_hook_rows() {
-    SETTINGS_PATH="$1" RETIRED_NAMES="$2" python3 - <<'PY'
-import json, os, shutil
-path = os.environ['SETTINGS_PATH']
-retired = set(os.environ['RETIRED_NAMES'].split())
-if not os.path.exists(path):
-    print(0); raise SystemExit
-shutil.copy(path, path + '.bak')
-try:
-    with open(path) as f: data = json.load(f)
-except Exception:
-    print(0); raise SystemExit
-removed = 0
-for blocks in data.get('hooks', {}).values():
-    if not isinstance(blocks, list): continue
-    for b in blocks:
-        if not isinstance(b, dict) or not isinstance(b.get('hooks'), list): continue
-        kept = []
-        for h in b['hooks']:
-            marker = (h.get('command', '') or '').rsplit('/', 1)[-1] if isinstance(h, dict) else ''
-            if isinstance(h, dict) and marker in retired:
-                removed += 1
-            else:
-                kept.append(h)
-        b['hooks'] = kept
-out = json.dumps(data, indent=2); json.loads(out)
-with open(path, 'w') as f: f.write(out + '\n')
-print(removed)
-PY
-}
-
 # Retire dead machinery left behind by a purely additive install over a
-# pre-existing scope (SABLE-gsqj): retired hook files, their settings rows,
-# the pre-tmux-only agents-teams dir, and retired manager agent defs in the
-# scope's agents/ dir. Runs on every plain install (not just --uninstall) —
-# a no-op when the scope is already clean. Prints only what it actually removed.
+# pre-existing scope (SABLE-gsqj): retired hook files, the pre-tmux-only
+# agents-teams dir, and retired manager agent defs in the scope's agents/ dir.
+# Settings-row retirement is part of the single proposal above, not a separate
+# write. Runs on every plain install (not just --uninstall) and prints only
+# what it actually removed.
 cleanup_retired_artifacts() {
     local -a cleaned=()
 
@@ -198,13 +426,6 @@ cleanup_retired_artifacts() {
             cleaned+=("retired hook file: $HOOKS_DIR/$f")
         fi
     done
-
-    if [ -e "$SETTINGS" ]; then
-        removed_rows="$(remove_retired_hook_rows "$SETTINGS" "$RETIRED_HOOK_FILES")"
-        if [ "${removed_rows:-0}" -gt 0 ] 2>/dev/null; then
-            cleaned+=("$removed_rows retired settings hook row(s) in $SETTINGS")
-        fi
-    fi
 
     if [ -e "$BASE/agents-teams" ]; then
         rm -rf "$BASE/agents-teams"
@@ -239,7 +460,13 @@ BAK_DIR=""
 # leaving the parent's BAK_DIR empty even though the dir was created on disk.
 ensure_bak_dir() {
     if [ -z "$BAK_DIR" ]; then
-        BAK_DIR="$BASE/.install-bak-$(date +%Y%m%d-%H%M%S)"
+        _bak_base="$BASE/.install-bak-$(date +%Y%m%d-%H%M%S)"
+        BAK_DIR="$_bak_base"
+        _bak_n=1
+        while [ -e "$BAK_DIR" ]; do
+            BAK_DIR="${_bak_base}.${_bak_n}"
+            _bak_n=$((_bak_n + 1))
+        done
         mkdir -p "$BAK_DIR"
     fi
 }
@@ -263,6 +490,149 @@ install_file() {
     fi
 }
 
+# --- Hook sibling-library closure (SABLE-nn54x) ---
+#
+# Hooks are COPY-installed, so a repo-relative sibling a hook imports resolves
+# from the INSTALLED path, never the repo path. inline-body-guard.sh resolves
+# its pattern logic as "$HOOK_DIR/../../bin/sable_inline_body_guard_lib.py":
+# from hooks/multi-manager/ in the repo that lands on repo/bin/ and works, but
+# from BASE/hooks/multi-manager/ it lands on BASE/bin/, which this installer
+# never created. The copy severed the import and the hook was then WIRED,
+# FIRING AND INERT — it intercepted every Bash call fleet-wide and checked
+# nothing, while an installed-path presence probe, a settings.json wiring grep
+# and a cmp against the landed blob all reported it ACTIVE. None of them
+# inspected the DEPENDENCY CLOSURE. An activation check must verify the
+# closure, not the entry point.
+#
+# Scope is python sibling LIBRARIES (bin/*.py) reached through a literal
+# ../-prefixed reference. The two sable-* EXECUTABLES some hooks reference
+# (bin/sable-mode, bin/sable-dep-check) are deliberately out of scope: both
+# have a PATH-installed form via sable-bin-install and both already degrade
+# to silence when absent, whereas a *.py lib has no PATH form at all — which
+# is precisely why its absence was invisible.
+#
+# MENTION IS NOT EXECUTION, and the difference decides whether an install
+# REFUSES. This scanner reads text; it does not parse shell. A hook's own
+# comments routinely NAME the library they document, and a scanner that reads a
+# comment as a dependency would refuse to install a hook over a stale sentence.
+# So each reference carries a HARD flag:
+#   hard=1  the reference appears on at least one non-comment line — a real
+#           dependency. Unresolvable => REFUSE the hook.
+#   hard=0  the reference appears only on comment lines — documentation. If the
+#           named lib exists it is installed anyway (harmless, and correct if
+#           the comment is accurate); if it does not exist the reference is
+#           IGNORED. A comment can never cost the fleet a hook.
+# Comment detection is deliberately the crude "first non-space char is #" rule
+# rather than a half-written shell parser: it can only ever RELAX a refusal,
+# never cause one, so its failure direction is safe.
+#
+# THE SCANNER'S BOUNDARY, documented here because this is where it is enforced
+# and the person who adds a hook is reading the code, not a bead. Two reference
+# shapes are deliberately NOT dependencies of the installed hook:
+#
+#   1. VARIABLE-COMPOSED SIBLING PATHS — LIB="${HOOK_DIR}/../../bin/${NAME}"
+#      carries no literal *.py token and is NOT SEEN. This is genuine
+#      under-detection, not a decision: a hook written that way would be back
+#      in the wired-inert state with no warning. No shipped hook does this
+#      today (see the per-hook closure table on SABLE-nn54x), so the table must
+#      be re-run whenever a hook grows a new sibling reference.
+#   2. $CWD-ROOTED TOOL LOOKUPS — pre-push-rebase-test.sh:612's
+#      TRIPWIRE_BIN="$CWD/bin/sable-fixture-tripwire" resolves against the REPO
+#      BEING PUSHED FROM, not against this hook's installed location, so no
+#      amount of installing into BASE/bin would satisfy it. It is guarded by
+#      [ -x "$TRIPWIRE_BIN" ] and its own comment states the no-op case ("most
+#      repos this hook gates don't ship the checker"), so its absence costs a
+#      skipped check, never a failure. Correctly out of scope.
+#
+# Both shapes are named because a reader grepping these hooks for "bin/" finds
+# FOUR references and only three are in the table; the fourth's absence must
+# not have to be re-derived.
+#
+# scan_hook_sibling_libs INSTALLED_HOOK_DIR — scan every hook in ONE Python
+# process and print one
+# "<hook-name><TAB><abs-target-dir><TAB><lib-name><TAB><hard>" row per library.
+# The hook name lets the shell loop below recover each hook's closure without
+# paying one interpreter startup per artifact. Closes transitively: python
+# resolves a lib's own sable_* imports from that lib's directory, so a
+# one-level scan would rebuild this same defect one level down.
+scan_hook_sibling_libs() {
+    HOOK_DEST_DIR="$1" REPO_DIR="$REPO" python3 - <<'PY'
+import os, re
+from pathlib import Path
+
+REF_RE = re.compile(r'((?:\.\./)+)bin/([A-Za-z0-9_]+\.py)')
+IMPORT_RE = re.compile(r'^\s*(?:import|from)\s+(sable_[A-Za-z0-9_]+)', re.M)
+
+repo = os.environ['REPO_DIR']
+dest = os.environ['HOOK_DEST_DIR']
+
+
+def scan(hook_file):
+    try:
+        lines = hook_file.read_text(encoding='utf-8', errors='replace').splitlines()
+    except OSError:
+        return []
+
+    # hard[(target, name)] becomes true once a reference is seen off a
+    # comment line. `order` keeps the old deterministic discovery order.
+    hard, order, queue = {}, [], []
+
+    def note(target, name, is_hard):
+        key = (target, name)
+        if key not in hard:
+            hard[key] = False
+            order.append(key)
+            queue.append(key)
+        if is_hard and not hard[key]:
+            # Upgrading to hard changes what this entry propagates, so walk
+            # it again; otherwise a comment-first dependency stays soft.
+            hard[key] = True
+            queue.append(key)
+
+    for line in lines:
+        is_comment = line.lstrip().startswith('#')
+        for updirs, name in REF_RE.findall(line):
+            note(os.path.normpath(os.path.join(dest, updirs, 'bin')), name, not is_comment)
+
+    while queue:
+        target, name = queue.pop()
+        try:
+            with open(os.path.join(repo, 'bin', name), encoding='utf-8', errors='replace') as f:
+                body = f.read()
+        except OSError:
+            # The shell caller reports/refuses unreadable hard dependencies.
+            continue
+        for mod in IMPORT_RE.findall(body):
+            dep = mod + '.py'
+            if not os.path.exists(os.path.join(repo, 'bin', dep)):
+                continue
+            # A transitive dependency inherits the parent's hardness.
+            note(target, dep, hard[(target, name)])
+
+    return [(target, name, hard[(target, name)]) for target, name in order]
+
+
+hooks_dir = Path(repo) / 'hooks' / 'multi-manager'
+for hook_file in sorted(hooks_dir.glob('*.sh')):
+    for target, name, is_hard in scan(hook_file):
+        print('%s\t%s\t%s\t%d' % (
+            hook_file.name, target, name, 1 if is_hard else 0
+        ))
+PY
+}
+
+# Print one selected hook's cached three-column closure. This is a pure shell
+# filter over the single batch result, not another scanner process.
+hook_sibling_libs_for() {
+    _wanted="$1"
+    while IFS="$(printf '\t')" read -r _hook _dir _lib _hard; do
+        [ "${_hook:-}" = "$_wanted" ] || continue
+        printf '%s\t%s\t%s\n' "$_dir" "$_lib" "$_hard"
+    done <<EOF
+$ALL_HOOK_SIBLING_LIBS
+EOF
+}
+
 # Stage (never activate) the host timer entrypoint's systemd/cron artifacts
 # (SABLE-jfg6.5 / D3 TIMER LEG): sable-reconcile-timer needs NO tmux server and
 # NO live panes, so it's the catch for a stranded push when the operator has
@@ -274,9 +644,24 @@ install_file() {
 # window (8vlp convention). This install is repo-side only.
 install_reconcile_timer() {
     local dir="$BASE/sable/reconcile-timer"
-    local target_repo="${SABLE_RECONCILE_TARGET_REPO:-$REPO}"
     local cadence="${SABLE_RECONCILE_INTERVAL_MIN:-15}"
     mkdir -p "$dir"
+
+    # SABLE-5xz68 DEFECT TWO: the target repo is a PARAMETER, and it may name
+    # SEVERAL repos (':'-separated) because this host runs more than one fleet.
+    # A unit that sweeps one repo leaves every other fleet's stranded pushes
+    # invisible to the floor while LOOKING protected — worse than no timer.
+    local target_repos="${SABLE_RECONCILE_TARGET_REPO:-$REPO}"
+    local repo_args="" _r
+    local _oldifs="$IFS"
+    IFS=':'
+    for _r in $target_repos; do
+        [ -n "$_r" ] || continue
+        repo_args="${repo_args} --repo ${_r}"
+    done
+    IFS="$_oldifs"
+    # strip the leading space so the generated ExecStart/cron lines are clean
+    repo_args="${repo_args# }"
 
     local tmp
     tmp="$(mktemp -d)"
@@ -314,7 +699,7 @@ Description=SABLE reconciliation floor sweep (SABLE-jfg6.5 / D3 TIMER LEG)
 Type=oneshot
 ${bd_env_line}
 Environment=PATH=${fallback_path}
-ExecStart=%h/.local/bin/sable-reconcile-timer --once --repo ${target_repo}
+ExecStart=%h/.local/bin/sable-reconcile-timer --once ${repo_args}
 EOF
 
     cat > "$tmp/sable-reconcile-timer.timer" <<EOF
@@ -335,7 +720,7 @@ EOF
 # SABLE reconciliation floor sweep (SABLE-jfg6.5 / D3 TIMER LEG) — cron
 # fallback for hosts without systemd --user (e.g. macOS). Append to your
 # crontab with: (crontab -l 2>/dev/null; cat this-file) | crontab -
-*/${cadence} * * * * PATH="\$PATH:\$HOME/.local/bin:${bd_dir}" ${cron_bd_env}sable-reconcile-timer --once --repo ${target_repo} >> "\$HOME/.cache/sable/reconcile-timer.log" 2>&1
+*/${cadence} * * * * PATH="\$PATH:\$HOME/.local/bin:${bd_dir}" ${cron_bd_env}sable-reconcile-timer --once ${repo_args} >> "\$HOME/.cache/sable/reconcile-timer.log" 2>&1
 EOF
 
     install_file "$tmp/sable-reconcile-timer.service" "$dir/sable-reconcile-timer.service" "sable/reconcile-timer/sable-reconcile-timer.service"
@@ -345,14 +730,21 @@ EOF
 
     echo "Reconciliation timer (host-level, no tmux required) — staged, NOT activated:"
     echo "  Cadence: ${cadence}min (override next install with SABLE_RECONCILE_INTERVAL_MIN=<n>)"
+    echo "  Sweeps: ${repo_args}"
+    echo "    (override next install with SABLE_RECONCILE_TARGET_REPO=<repo>[:<repo>...])"
     echo "  Artifacts written under $dir/:"
     echo "    sable-reconcile-timer.service / .timer  (systemd --user; Linux)"
     echo "    sable-reconcile-timer.cron               (cron fallback line; any platform)"
-    echo "  To activate (systemd --user, Linux):"
-    echo "    cp $dir/sable-reconcile-timer.{service,timer} ~/.config/systemd/user/ && \\"
-    echo "      systemctl --user daemon-reload && systemctl --user enable --now sable-reconcile-timer.timer"
-    echo "  To activate (cron fallback, any platform):"
+    # SABLE-5xz68 DEFECT ONE: this used to echo a multi-command install recipe
+    # for a human to paste, and nobody ever ran it — the units sat staged for
+    # months while the floor's pane-independent leg did not exist. One command
+    # now, and it VERIFIES afterwards that a schedule really fires.
+    echo "  To activate — ONE command, which installs AND verifies (exit 3 if not scheduled):"
+    echo "    sable-reconcile-timer --install-schedule --units-dir $dir"
+    echo "  Cron fallback (hosts without systemd --user):"
     echo "    (crontab -l 2>/dev/null; cat $dir/sable-reconcile-timer.cron) | crontab -"
+    echo "  Either way, confirm the floor is really scheduled:"
+    echo "    sable-reconcile-timer --check-schedule ${repo_args}"
     echo "  Live activation rides the next operator-brokered install-refresh window —"
     echo "  this install only stages the artifacts (SABLE-jfg6.5 / D3, 8vlp convention)."
 }
@@ -367,6 +759,10 @@ skill_names() {
     done
 }
 
+# One authority crossing for the complete hook set. Both install and
+# uninstall consume this immutable snapshot.
+ALL_HOOK_SIBLING_LIBS="$(scan_hook_sibling_libs "$HOOKS_DIR")"
+
 if [ "$UNINSTALL" = "1" ]; then
     while IFS= read -r n; do rm -rf "$SKILLS/$n"; done <<EOF
 $(skill_names)
@@ -374,10 +770,22 @@ EOF
     rm -f "$BASE/sable/roles/lincoln.md" "$BASE/sable/roles/optimus.md" \
           "$BASE/sable/roles/tarzan.md" "$BASE/sable/roles/chuck.md" \
           "$BASE/sable/roles/cockpit.md" "$BASE/sable/agents.yaml"
+    # Sibling libraries installed for the hooks' dependency closure
+    # (SABLE-nn54x). Removed FILE-BY-FILE, never as a directory: BASE/bin is a
+    # shared location this installer does not own.
+    while IFS="$(printf '\t')" read -r _hook _dir _lib _hard; do
+        [ -n "${_lib:-}" ] || continue
+        rm -f "$_dir/$_lib"
+    done <<EOF
+$ALL_HOOK_SIBLING_LIBS
+EOF
     # agents-teams/ is no longer installed; the rm below cleans up installs
     # that predate the tmux-only layer.
     rm -rf "$HOOKS_DIR" "$BASE/agents-teams" "$BASE/sable/reconcile-timer"
     remove_layer_hooks "$SETTINGS"
+    if [ -n "$CODEX_HOOKS" ]; then
+        remove_layer_hooks "$CODEX_HOOKS"
+    fi
     echo "Orchestration layer uninstalled from $BASE (scope: $SCOPE)."
     echo "  (left other hooks and the settings file intact)"
     echo "  (systemd/cron activation, if any, is NOT touched here — it lives outside"
@@ -386,17 +794,96 @@ EOF
 fi
 
 # --- Install the complete layer ---
+# Validate both live configuration targets before mkdir/copy/cleanup mutates
+# the scope.  A bad Claude settings file must not leave a half-installed
+# layer, and a bad Codex hooks file must not fail after Claude was activated.
+preflight_settings_targets "$SETTINGS" "$CODEX_HOOKS"
+
 mkdir -p "$HOOKS_DIR" "$BASE/sable/roles" "$SKILLS"
 
 cleanup_retired_artifacts
 
-# All multi-manager hooks (lib-identity.sh included — sourced by the others).
+# All multi-manager hooks (lib-identity.sh included — sourced by the others),
+# each preceded by its sibling-library closure (SABLE-nn54x).
+HOOK_LIB_LOG=()
+REFUSED_HOOKS=()
+REFUSED_HOOK_NAMES=""
 for hook in "$REPO"/hooks/multi-manager/*.sh; do
     [ -f "$hook" ] || continue
     _name="$(basename "$hook")"
+    case " $RETIRED_HOOK_FILES " in
+        *" $_name "*) continue ;;
+    esac
+
+    _libs="$(hook_sibling_libs_for "$_name")"
+
+    # Resolve the whole closure BEFORE copying anything: a hook installed
+    # first and refused second would still be sitting at the installed path.
+    # Only HARD references (seen off a comment line) can refuse.
+    _missing=""
+    while IFS="$(printf '\t')" read -r _dir _lib _hard; do
+        [ -n "${_lib:-}" ] || continue
+        [ "${_hard:-0}" = "1" ] || continue
+        [ -r "$REPO/bin/$_lib" ] || _missing="${_missing} bin/$_lib"
+    done <<EOF
+$_libs
+EOF
+
+    if [ -n "$_missing" ]; then
+        # An UNREGISTERED hook is strictly better than a wired inert one: a
+        # gate that fires and checks nothing teaches the fleet to ignore its
+        # banner, and every activation probe reports it healthy.
+        REFUSED_HOOKS+=("$_name — sibling library not installable:${_missing}")
+        REFUSED_HOOK_NAMES="${REFUSED_HOOK_NAMES} $_name"
+        rm -f "$HOOKS_DIR/$_name"
+        continue
+    fi
+
+    while IFS="$(printf '\t')" read -r _dir _lib _hard; do
+        [ -n "${_lib:-}" ] || continue
+        # A soft (comment-only) reference to a lib that does not exist is
+        # documentation, not a dependency — install nothing, refuse nothing.
+        [ -r "$REPO/bin/$_lib" ] || continue
+        mkdir -p "$_dir"
+        _librel="${_dir#"$BASE"/}/$_lib"
+        install_file "$REPO/bin/$_lib" "$_dir/$_lib" "$_librel"
+        if [ -x "$REPO/bin/$_lib" ]; then chmod +x "$_dir/$_lib" 2>/dev/null || true; fi
+        if [ "${_hard:-0}" = "1" ]; then
+            HOOK_LIB_LOG+=("$_name -> $_dir/$_lib")
+        else
+            HOOK_LIB_LOG+=("$_name -> $_dir/$_lib  (comment-only reference)")
+        fi
+    done <<EOF
+$_libs
+EOF
+
     install_file "$hook" "$HOOKS_DIR/$_name" "hooks/multi-manager/$_name"
     chmod +x "$HOOKS_DIR/$_name" 2>/dev/null || true
 done
+
+# A direct --user invocation must never register Codex base gates whose
+# executables are absent. The front-door installer has already copied these;
+# installing them here too makes the orchestration entrypoint independently
+# safe and idempotent for user-scope refreshes.
+if [ "$SCOPE" = "user" ] && [ "$BASE_LAYER_AVAILABLE" = "1" ]; then
+    mkdir -p "$BASE/hooks"
+    for _base_hook in $BASE_HOOK_FILES; do
+        install_file "$REPO/hooks/$_base_hook" "$BASE/hooks/$_base_hook" "hooks/$_base_hook"
+        chmod +x "$BASE/hooks/$_base_hook" 2>/dev/null || true
+    done
+fi
+
+# Auditable per-hook record of the resolved closure — the thing no instrument
+# reported when this went wrong (SABLE-nn54x).
+if [ "${#HOOK_LIB_LOG[@]}" -gt 0 ]; then
+    echo "Hook sibling libraries installed (dependency closure, SABLE-nn54x):"
+    printf '  - %s\n' "${HOOK_LIB_LOG[@]}"
+fi
+if [ "${#REFUSED_HOOKS[@]}" -gt 0 ]; then
+    echo "REFUSED to install these hooks — their settings registration is NOT merged" >&2
+    echo "(an unregistered hook beats a wired inert one, SABLE-nn54x):" >&2
+    printf '  - %s\n' "${REFUSED_HOOKS[@]}" >&2
+fi
 
 # Registry + lincoln role + identity. Remove a stale installed cockpit role
 # (v2: the agent is lincoln; SABLE-uz9.5).
@@ -422,15 +909,47 @@ for skdir in "$REPO"/skills/*/; do
     done
 done
 
-# Merge the settings snippet.
-merge_snippet "$SETTINGS" "$SNIPPET" "$SNIPPET_BASE"
+# Compute settings from the live bytes but never write them without explicit
+# consent. The proposal also removes refused/retired registrations, so the
+# exact activation delta is reviewed and applied as one state transition.
+apply_settings_proposal \
+    "$SETTINGS" "$SNIPPET_BASE" "settings.json" "$REFUSED_HOOK_NAMES" \
+    "$SNIPPET"
+if [ -n "$CODEX_HOOKS" ]; then
+    # Codex supports Claude-style lifecycle hook configuration in
+    # ~/.codex/hooks.json. Compose the canonical base and orchestration graphs
+    # in one proposal so mixed fleets do not silently lose TDD/bead gates,
+    # mode, identity, or command guardrails.
+    if [ "$BASE_LAYER_AVAILABLE" = "1" ]; then
+        apply_settings_proposal \
+            "$CODEX_HOOKS" "$SNIPPET_BASE" "codex/hooks.json" "$REFUSED_HOOK_NAMES" \
+            "$BASE_SNIPPET" "$SNIPPET"
+    else
+        echo "WARNING: canonical Codex base hooks are unavailable in $REPO;" >&2
+        echo "  applying only the orchestration graph from this partial source tree." >&2
+        apply_settings_proposal \
+            "$CODEX_HOOKS" "$SNIPPET_BASE" "codex/hooks.json" "$REFUSED_HOOK_NAMES" \
+            "$SNIPPET"
+    fi
+fi
 
 # Stage the host timer entrypoint's systemd/cron artifacts (never activates them).
 install_reconcile_timer
 
 echo "Orchestration layer installed to $BASE (scope: $SCOPE)."
+if [ -n "$CODEX_HOOKS" ]; then
+    if [ "$MERGE_SETTINGS" = "1" ]; then
+        echo "Codex lifecycle hooks applied to $CODEX_HOOKS."
+    else
+        echo "Codex lifecycle hook changes were printed but not applied."
+    fi
+fi
 echo "  • All multi-manager hooks + agents.yaml + SABLE skills + the four pane roles installed."
-echo "  • Settings snippet ($(basename "$SNIPPET")) merged into $SETTINGS (existing entries kept)."
+if [ "$MERGE_SETTINGS" = "1" ]; then
+    echo "  • Settings snippet applied to $SETTINGS (existing entries kept)."
+else
+    echo "  • Settings snippet was print-only; $SETTINGS was not changed."
+fi
 echo "  • /sable-plan and /sable-execute become available after you restart the session."
 echo "  • Start your session:  sable-launch   (Lincoln only, wraps sable-tmux; managers spawn on demand)"
 echo "  • Disable anytime without uninstalling:  export SABLE_ORCHESTRATION=off"

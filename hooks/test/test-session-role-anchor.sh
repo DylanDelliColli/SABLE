@@ -26,8 +26,13 @@ fail(){ FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n 
 # the leak is invisible there. Unset them up front so the suite is hermetic
 # regardless of launch context. Also clear the live-state surfaces so the base
 # cases never pick up a stray real mode-state.
-unset SABLE_WORKER_PANE CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE \
-      SABLE_MODE_STATE SABLE_ACTIVE_CONTRACTS 2>/dev/null || true
+#
+# Central scrub lives in lib-identity-isolation.sh (SABLE-j3bi) so every
+# suite shares one definition of "identity vars" instead of drifting copies
+# of an unset list.
+source "$REPO/hooks/test/lib-identity-isolation.sh"
+sable_scrub_identity_env
+unset SABLE_MODE_STATE SABLE_ACTIVE_CONTRACTS 2>/dev/null || true
 
 SS='{"hook_event_name":"SessionStart"}'
 
@@ -90,6 +95,15 @@ if printf '%s' "$out" | grep -q 'execution'; then pass "9ozz: live orchestration
 if printf '%s' "$out" | grep -q 'LIVE PROTOCOL STATE'; then pass "9ozz: live-protocol banner delimits the surface"; else fail "9ozz: live-protocol banner delimits the surface" "got: ${out:0:200}"; fi
 if printf '%s' "$out" | grep -qi 'reconcile'; then pass "9ozz: boot reconciliation instruction present"; else fail "9ozz: boot reconciliation instruction present" "got: ${out:0:300}"; fi
 
+# Present corrupt state is not the same as absent state. A restarted manager
+# must see that authorization is unavailable instead of silently receiving only
+# its historical role card.
+printf '%s' 'not-json{' > "$LS_MODE"
+out="$(cd "$LS" && printf '%s' "$SS" | SABLE_MODE_STATE="$LS_MODE" CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
+if printf '%s' "$out" | grep -q 'CORRUPT STATE'; then pass "dbq9p.4: corrupt mode state is loud at manager boot"; else fail "dbq9p.4: corrupt mode state is loud at manager boot" "got: ${out:0:300}"; fi
+if printf '%s' "$out" | grep -q 'Do not dispatch or execute'; then pass "dbq9p.4: corrupt boot surface fails closed operationally"; else fail "dbq9p.4: corrupt boot surface fails closed operationally" "got: ${out:0:300}"; fi
+printf '{"mode":"execution","since":"2026-07-13T09:00:00-0700","fleet":["chuck"]}\n' > "$LS_MODE"
+
 # contracts present via SABLE_ACTIVE_CONTRACTS override, mode absent → still surfaces
 LS2="$(mktemp -d)"
 mkdir -p "$LS2/.claude/sable/roles"
@@ -126,6 +140,45 @@ if ! printf '%s' "$out" | grep -q 'additionalContext'; then pass "jiqm: PreCompa
 # hook_event_name=SessionStart) must be unaffected by the PreCompact no-op.
 out="$(cd "$PROJ" && printf '%s' "$SS" | CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
 if printf '%s' "$out" | grep -q '"hookEventName": "SessionStart"'; then pass "jiqm: SessionStart leg still emits valid hookEventName+additionalContext"; else fail "jiqm: SessionStart leg still emits valid hookEventName+additionalContext" "got: ${out:0:200}"; fi
+
+# ---------- SABLE-thx70: LOUD ON SHADOWING ----------
+# Six days of role-card edits went dark because a stale project-local copy
+# silently outranked a freshly-edited user-level one with no event. Precedence
+# stays project-first; the fix is that the disagreement is no longer silent.
+# The negative controls are load-bearing: without them this would warn on
+# every ordinary boot (either shape alone, or two byte-identical copies, is
+# the normal, unremarkable case).
+SHADOW="$(mktemp -d)"
+mkdir -p "$SHADOW/.claude/sable/roles"
+SHADOW_HOME="$(mktemp -d)"
+mkdir -p "$SHADOW_HOME/.claude/sable/roles"
+
+# both present and DIFFER -> warns, names both paths, precedence unchanged (project wins)
+printf 'PROJECT_SHADOW_MARKER\n' > "$SHADOW/.claude/sable/roles/cockpit.md"
+printf 'USER_SHADOW_MARKER\n' > "$SHADOW_HOME/.claude/sable/roles/cockpit.md"
+out="$(cd "$SHADOW" && printf '%s' "$SS" | HOME="$SHADOW_HOME" CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
+err="$(cd "$SHADOW" && printf '%s' "$SS" | HOME="$SHADOW_HOME" CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>&1 1>/dev/null)"
+if printf '%s' "$out" | grep -q 'PROJECT_SHADOW_MARKER'; then pass "thx70: differing shadow still resolves project-local (precedence unchanged)"; else fail "thx70: differing shadow still resolves project-local (precedence unchanged)" "got: ${out:0:200}"; fi
+if printf '%s' "$err" | grep -q 'SABLE-ROLE-CARD-SHADOWED'; then pass "thx70: differing shadow warns with fixed token"; else fail "thx70: differing shadow warns with fixed token" "got: ${err:0:300}"; fi
+if printf '%s' "$err" | grep -q "$SHADOW/.claude/sable/roles/cockpit.md" && printf '%s' "$err" | grep -q "$SHADOW_HOME/.claude/sable/roles/cockpit.md"; then pass "thx70: warning names both paths"; else fail "thx70: warning names both paths" "got: ${err:0:400}"; fi
+
+# NEGATIVE CONTROL 1: only project-local present -> no warning
+rm -f "$SHADOW_HOME/.claude/sable/roles/cockpit.md"
+err="$(cd "$SHADOW" && printf '%s' "$SS" | HOME="$SHADOW_HOME" CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>&1 1>/dev/null)"
+if ! printf '%s' "$err" | grep -q 'SABLE-ROLE-CARD-SHADOWED'; then pass "thx70: NEGATIVE CONTROL only-project-local -> no warning"; else fail "thx70: NEGATIVE CONTROL only-project-local -> no warning" "got: ${err:0:200}"; fi
+
+# NEGATIVE CONTROL 2: only user-level present -> no warning
+rm -f "$SHADOW/.claude/sable/roles/cockpit.md"
+printf 'USER_SHADOW_MARKER\n' > "$SHADOW_HOME/.claude/sable/roles/cockpit.md"
+err="$(cd "$SHADOW" && printf '%s' "$SS" | HOME="$SHADOW_HOME" CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>&1 1>/dev/null)"
+if ! printf '%s' "$err" | grep -q 'SABLE-ROLE-CARD-SHADOWED'; then pass "thx70: NEGATIVE CONTROL only-user-level -> no warning"; else fail "thx70: NEGATIVE CONTROL only-user-level -> no warning" "got: ${err:0:200}"; fi
+
+# NEGATIVE CONTROL 3: both present and IDENTICAL -> no warning
+printf 'USER_SHADOW_MARKER\n' > "$SHADOW/.claude/sable/roles/cockpit.md"
+err="$(cd "$SHADOW" && printf '%s' "$SS" | HOME="$SHADOW_HOME" CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>&1 1>/dev/null)"
+if ! printf '%s' "$err" | grep -q 'SABLE-ROLE-CARD-SHADOWED'; then pass "thx70: NEGATIVE CONTROL identical content -> no warning"; else fail "thx70: NEGATIVE CONTROL identical content -> no warning" "got: ${err:0:200}"; fi
+
+rm -rf "$SHADOW" "$SHADOW_HOME"
 
 rm -rf "$PROJ" "$HOMETMP" "$NOPROJ" "$LS" "$LS2" "$LS3"
 echo

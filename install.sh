@@ -12,6 +12,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 HOOKS_SRC="${REPO_DIR}/hooks"
 TEMPLATE_DIR="${REPO_DIR}/templates"
 PRIME_TEMPLATE="${TEMPLATE_DIR}/global-CLAUDE-prime.md"
+BASE_SETTINGS_SNIPPET="${TEMPLATE_DIR}/base-settings-snippet.json"
 
 # --- CLI flags (SABLE-106, front door SABLE-ppy; tmux-only SABLE-qa4d;
 # single-path install SABLE-ssws.1 — there are no tiers and no topologies) ---
@@ -19,6 +20,7 @@ DRY_RUN=0
 FROM_HERE=0
 PROJECT_MODE=0
 FORCE=0
+MERGE_SETTINGS=0
 PROJECT_PATH_ARG=""
 for arg in "$@"; do
     case "$arg" in
@@ -27,6 +29,7 @@ for arg in "$@"; do
         --project)       PROJECT_MODE=1 ;;
         --project=*)     PROJECT_MODE=1; PROJECT_PATH_ARG="${arg#--project=}" ;;
         --force)         FORCE=1 ;;
+        --merge-settings) MERGE_SETTINGS=1 ;;
         --subagent|--nested|--teams)
             echo "install.sh: '$arg' was retired — SABLE runs on the tmux warm-pane layout only (see TMUX-AGENTS-DESIGN.md)" >&2
             exit 1 ;;
@@ -34,7 +37,7 @@ for arg in "$@"; do
             echo "install.sh: '$arg' was retired — there is one install: the full workflow including the orchestration layer (see QUICKSTART.md)" >&2
             exit 1 ;;
         -h|--help)
-            echo "Usage: install.sh [--dry-run] [--from-here] [--project[=<path>]] [--force]"
+            echo "Usage: install.sh [--dry-run] [--from-here] [--project[=<path>]] [--force] [--merge-settings]"
             echo "  Installs the complete SABLE workflow: beads discipline + hooks,"
             echo "  producer agent defs, and the tmux warm-pane orchestration layer."
             echo "  --dry-run              report what would be done; write nothing"
@@ -47,6 +50,8 @@ for arg in "$@"; do
             echo "                         into ~/.local/bin (hybrid contract, SABLE-59t6)."
             echo "  --force                proceed with --project even when ~/.claude already"
             echo "                         carries SABLE hooks (accepts hooks firing twice)."
+            echo "  --merge-settings       explicitly consent to applying the reviewed settings"
+            echo "                         proposal (including Codex base hooks); default is print-only"
             exit 0 ;;
     esac
 done
@@ -350,13 +355,27 @@ echo
 # 6. Install the orchestration (multi-manager) layer by DELEGATING to the
 # complete-layer installer (SABLE-ppy). Always runs — there is one install
 # (SABLE-ssws.1). The delegate installs all hooks + registry + skills + the four
-# pane roles and merges the settings snippet.
+# pane roles. Settings are only applied when --merge-settings was explicit;
+# otherwise the delegate prints the exact proposal and leaves settings alone.
 bold "Step 6/8: Orchestration (multi-manager) layer"
 if [ "$DRY_RUN" = "1" ]; then
     yellow "  would delegate: sable-orchestration-install ${ORCH_SCOPE_FLAG}"
+    if [ "$MERGE_SETTINGS" = "1" ]; then
+        yellow "  would apply the reviewed settings proposal (--merge-settings)"
+    else
+        yellow "  would print settings changes without applying them"
+    fi
 elif [ -x "${REPO_DIR}/bin/sable-orchestration-install" ]; then
     green "  Delegating to sable-orchestration-install (${ORCH_SCOPE_FLAG})..."
-    SABLE_PROJECT_DIR="${PROJECT_ROOT}" bash "${REPO_DIR}/bin/sable-orchestration-install" "${ORCH_SCOPE_FLAG}"
+    if [ "$MERGE_SETTINGS" = "1" ]; then
+        SABLE_PROJECT_DIR="${PROJECT_ROOT}" bash \
+            "${REPO_DIR}/bin/sable-orchestration-install" \
+            "${ORCH_SCOPE_FLAG}" --merge-settings
+    else
+        SABLE_PROJECT_DIR="${PROJECT_ROOT}" bash \
+            "${REPO_DIR}/bin/sable-orchestration-install" \
+            "${ORCH_SCOPE_FLAG}"
+    fi
 else
     yellow "  bin/sable-orchestration-install not found — skipping the orchestration layer"
 fi
@@ -387,72 +406,119 @@ else
 fi
 echo
 
-# 8. Print settings.json snippet (do NOT auto-edit — settings is too important to clobber)
-bold "Step 8/8: Settings.json hook block"
+# 8. Print the BASE-tier settings.json snippet for manual pasting.
+#
+# The whole install is print-only for settings unless --merge-settings was
+# explicit. Step 6 enforces that contract inside the settings authority itself,
+# so there is no write-then-revert window. This printed Claude block and the
+# Codex merge both render from the same canonical base snippet.
+bold "Step 8/8: Claude settings.json base hook block (paste this yourself)"
 echo "Add the following block to your ${SETTINGS_FILE} under the top-level 'hooks' key."
 echo "If you already have a 'hooks' key, merge carefully (don't overwrite existing entries)."
+echo "NOTE: Step 6 applies this base graph automatically to Codex, together with"
+echo "the orchestration rows, only when --merge-settings is explicitly passed."
+echo "Claude's base block remains a deliberate manual paste."
 echo
-cat <<EOF
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {"type": "command", "command": "bash ${HOOK_CMD_ROOT}/tdd-evidence.sh", "timeout": 3000},
-          {"type": "command", "command": "bash ${HOOK_CMD_ROOT}/tdd-gate.sh", "timeout": 5000},
-          {"type": "command", "command": "bash ${HOOK_CMD_ROOT}/bead-description-gate.sh", "timeout": 3000}
-        ]
-      },
-      {
-        "matcher": "Edit|Write",
-        "hooks": [
-          {"type": "command", "command": "bash ${HOOK_CMD_ROOT}/tdd-remind.sh", "timeout": 3000}
-        ]
-      },
-      {
-        "matcher": "Agent",
-        "hooks": [
-          {"type": "command", "command": "bash ${HOOK_CMD_ROOT}/agent-tdd-enforce.sh", "timeout": 3000}
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {"type": "command", "command": "bash ${HOOK_CMD_ROOT}/bead-quality.sh", "timeout": 5000}
-        ]
-      }
-    ],
-    "SessionStart": [
-      {"matcher": "", "hooks": [{"type": "command", "command": "bd prime"}]},
-      {"matcher": "", "hooks": [{"type": "command", "command": "sable-doctor --quiet 2>&1 || true"}]}
-    ],
-    "PreCompact": [
-      {"matcher": "", "hooks": [{"type": "command", "command": "bd prime"}]}
-    ]
-  }
-}
-EOF
+HOOK_ROOT="${HOOK_CMD_ROOT}" python3 - "${BASE_SETTINGS_SNIPPET}" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    data = json.load(source)
+rendered = json.dumps(data, indent=2).replace(
+    "~/.claude/hooks", os.environ["HOOK_ROOT"]
+)
+print(rendered)
+PY
 echo
 echo "The SessionStart sable-doctor entry above warns (non-fatal) at session start"
 echo "when your installed ~/.claude drifts from this repo — see SABLE-1i6m / bin/sable-doctor."
 echo
 
-bold "Orchestration hooks"
-echo "The orchestration settings snippet was merged into the scope's settings file"
-echo "automatically by sable-orchestration-install (backed up; existing entries kept)."
+# 9. Record install provenance (SABLE-78kxu) — without this, "is X deployed?"
+# is unanswerable: sable-doctor's manifest check only asks "do installed files
+# MATCH the tree?", so a file that doesn't exist in the tree yet is invisible
+# to it and a "clean" report is fully compatible with a not-yet-merged guard
+# being entirely absent. Best-effort: a repo dir that isn't a git checkout
+# (unlikely for this installer) skips silently rather than failing the install.
+bold "Recording install provenance"
+if [ "$DRY_RUN" = "1" ]; then
+    yellow "  would write: ${CLAUDE_DIR}/.sable-install-provenance"
+elif command -v git >/dev/null 2>&1 && PROV_SHA="$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null)"; then
+    PROV_BRANCH="$(git -C "${REPO_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")"
+    # "dirty" is a reproducibility claim: can the recorded SHA reconstruct the
+    # INSTALLED SET? install.sh installs TRACKED content, so only tracked
+    # modifications break that (-uno excludes untracked entries). Untracked
+    # presence is a different fact — it does not affect reproducibility from
+    # the recorded SHA — so it gets its own field rather than being folded
+    # into "dirty" (SABLE-dt92b: an untracked-only tree was stamping DIRTY /
+    # "not reproducible", which is false).
+    if [ -n "$(git -C "${REPO_DIR}" status --porcelain -uno 2>/dev/null)" ]; then
+        PROV_DIRTY="true"
+    else
+        PROV_DIRTY="false"
+    fi
+    if git -C "${REPO_DIR}" status --porcelain 2>/dev/null | grep -q '^??'; then
+        PROV_UNTRACKED="true"
+    else
+        PROV_UNTRACKED="false"
+    fi
+    PROV_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    {
+        printf 'commit=%s\n' "${PROV_SHA}"
+        printf 'branch=%s\n' "${PROV_BRANCH}"
+        printf 'dirty=%s\n' "${PROV_DIRTY}"
+        printf 'untracked=%s\n' "${PROV_UNTRACKED}"
+        printf 'timestamp=%s\n' "${PROV_TIMESTAMP}"
+    } > "${CLAUDE_DIR}/.sable-install-provenance"
+    PROV_NOTE=""
+    if [ "${PROV_DIRTY}" = "true" ]; then
+        PROV_NOTE="DIRTY tree — not reproducible"
+    fi
+    if [ "${PROV_UNTRACKED}" = "true" ]; then
+        if [ -n "${PROV_NOTE}" ]; then
+            PROV_NOTE="${PROV_NOTE}; untracked files present"
+        else
+            PROV_NOTE="untracked files present"
+        fi
+    fi
+    if [ -n "${PROV_NOTE}" ]; then
+        green "  installed from ${PROV_SHA} (${PROV_BRANCH}) — ${PROV_NOTE}"
+    else
+        green "  installed from ${PROV_SHA} (${PROV_BRANCH})"
+    fi
+else
+    yellow "  Could not determine repo commit (not a git checkout?) — skipping provenance stamp."
+fi
+echo
+
+bold "Lifecycle hooks"
+if [ "$MERGE_SETTINGS" = "1" ]; then
+    echo "The reviewed orchestration settings proposal was applied (--merge-settings)."
+    if [ "$SCOPE" = "user" ]; then
+        echo "The canonical base hook graph was also applied to ~/.codex/hooks.json."
+    fi
+else
+    echo "The orchestration settings proposal was printed but NOT applied."
+    echo "For user scope, that proposal includes Codex's canonical base hook graph."
+    echo "Re-run with --merge-settings after review to consent to those writes."
+fi
 echo "sable-orchestration-install also STAGES (never activates) the reconciliation"
 echo "floor's host timer artifacts (systemd --user unit + cron fallback line) under"
-echo "${CLAUDE_DIR}/sable/reconcile-timer/ — see its own output above for the"
-echo "activation commands (SABLE-jfg6.5 / D3 TIMER LEG)."
+echo "${CLAUDE_DIR}/sable/reconcile-timer/. Activate with the ONE self-verifying"
+echo "command it prints above — 'sable-reconcile-timer --install-schedule' — and"
+echo "re-check any time with 'sable-reconcile-timer --check-schedule --repo <repo>',"
+echo "which fails loudly when nothing is scheduled OR when what is scheduled sweeps"
+echo "a different repo (SABLE-jfg6.5 / D3 TIMER LEG; SABLE-5xz68)."
 echo
 
 bold "Install complete."
 echo
 echo "Next steps:"
-echo "  1. Paste the hook block(s) above into ${SETTINGS_FILE} (merge with existing config)."
+echo "  1. Paste the BASE-tier hook block above into ${SETTINGS_FILE} (merge with existing"
+echo "     config). Apply orchestration rows and Codex base rows by re-running with"
+echo "     --merge-settings."
 echo "  2. In your project: bd init && bd hooks install"
 echo "  3. RESTART Claude Code so the agent defs, /sable-plan /sable-execute /gaudi /columbo, and hooks register."
 echo "  4. Start your session:  sable-launch   (Lincoln only, wraps sable-tmux; managers spawn on demand)"

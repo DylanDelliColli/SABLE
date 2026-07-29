@@ -26,6 +26,16 @@ PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 
+# Hermeticity (SABLE-j3bi/SABLE-a9453): scrub the ambient SABLE/Claude
+# identity vars BEFORE the first pane-spawning call below, and route every
+# such call through the guarded sable_tmux_spawn instead of plain tmux --
+# a scrub positioned any later (e.g. only on the --reap call, as
+# test-worker-flag-done.sh's SABLE-dcw2 fix did) cannot retroactively clean
+# a pane already spawned earlier in the file.
+source "$REPO/hooks/test/lib-identity-isolation.sh"
+sable_scrub_identity_env
+tmux_spawn() { sable_tmux_spawn -L "$SOCK" "$@"; }
+
 tag() { # tag <pane> <role> <bead> <status>
   tmux -L "$SOCK" set-option -p -t "$1" @sable_role "$2"
   tmux -L "$SOCK" set-option -p -t "$1" @sable_bead "$3"
@@ -56,11 +66,11 @@ run_status() { SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION="w" CLAUDE_AGENT_NAM
 
 # --- fixture: two worker panes, plus a SECOND session name grouped with the
 #     first — the exact mechanism that duplicates list-panes -a rows ---
-tmux -L "$SOCK" new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
+tmux_spawn new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
 sleep 0.3
-tmux -L "$SOCK" split-window -t w 'bash --noprofile --norc'
+tmux_spawn split-window -t w 'bash --noprofile --norc'
 sleep 0.3
-tmux -L "$SOCK" new-session -d -t w -s w2   # grouped alias — duplicates every pane row
+tmux_spawn new-session -d -t w -s w2   # grouped alias — duplicates every pane row
 sleep 0.2
 
 PANE1="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"
@@ -110,9 +120,9 @@ fi
 # --- market-brief-package-0h8k: a done pane holding unsubmitted composer
 #     input (a misrouted/queued instruction) must be flagged, not silently
 #     killed over — and no pane may survive reap still holding it ---
-tmux -L "$SOCK" new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
+tmux_spawn new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
 sleep 0.3
-tmux -L "$SOCK" split-window -t w 'bash --noprofile --norc'
+tmux_spawn split-window -t w 'bash --noprofile --norc'
 sleep 0.3
 PANE5="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"   # pending-input pane
 PANE6="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 2p)"   # clean done pane
@@ -133,7 +143,18 @@ if [ "$rc3" -eq 0 ]; then
 else
   fail "--reap exits 0 when a done pane holds pending input" "exit $rc3: $out3"
 fi
-if printf '%s' "$out3" | grep -q "market-brief-package-0h8k"; then
+# SABLE-o05cv RULING: this used to grep for the literal cross-tracker id
+# "market-brief-package-0h8k" in the flag line. SABLE-jb3o (commit f70a0f9,
+# 2026-07-21) deliberately dropped that id from reap()'s stderr — it is a
+# cross-tracker id `bd` cannot resolve against this DB, so it was noise to an
+# operator — but never updated this assertion, leaving it pinned to text the
+# tool no longer emits. Confirmed via `git log -S` that this assertion
+# predates f70a0f9 (added in 63cebbe) — TEST-EXPECTATION DRIFT, not a
+# regression: the flagging behavior itself is intact (see the two nearby
+# assertions on the literal pending text and on zero survivors), only the
+# unresolvable id was removed on purpose. Assert on the operator-facing
+# phrase the tool actually still emits instead.
+if printf '%s' "$out3" | grep -q "holds unsubmitted composer input"; then
   pass "--reap flags the pending-input pane instead of staying silent"
 else
   fail "--reap flags the pending-input pane instead of staying silent" "$out3"
@@ -162,9 +183,9 @@ fi
 DELIVERABLE="$(mktemp)"
 echo '{"ok": true}' > "$DELIVERABLE"
 
-tmux -L "$SOCK" new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
+tmux_spawn new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
 sleep 0.3
-tmux -L "$SOCK" split-window -t w 'bash --noprofile --norc'
+tmux_spawn split-window -t w 'bash --noprofile --norc'
 sleep 0.3
 PANE7="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"   # producer, done, valid deliverable
 PANE8="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 2p)"   # manager warm loop
@@ -202,7 +223,7 @@ sleep 0.2
 #     silently destroyed, and the pane is still reaped afterward ---
 DELIVERABLE2="$(mktemp)"
 echo '{"ok": true}' > "$DELIVERABLE2"
-tmux -L "$SOCK" new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
+tmux_spawn new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
 sleep 0.3
 PANE9="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"
 tag_full "$PANE9" victor bead-victor2 done producer "$DELIVERABLE2"
@@ -212,7 +233,10 @@ tmux -L "$SOCK" send-keys -t "$PANE9" -l "check the pool for next work"
 sleep 0.2
 
 out5="$(run_status --reap 2>&1)"
-if printf '%s' "$out5" | grep -q "market-brief-package-0h8k"; then
+# SABLE-o05cv: same ruling as the worker-pane case above — assert on the
+# still-live "holds unsubmitted composer input" phrase, not the cross-tracker
+# id SABLE-jb3o intentionally dropped from reap()'s stderr.
+if printf '%s' "$out5" | grep -q "holds unsubmitted composer input"; then
   pass "--reap flags a producer pane's pending composer input instead of staying silent"
 else
   fail "--reap flags a producer pane's pending composer input instead of staying silent" "$out5"
@@ -232,7 +256,7 @@ rm -f "$DELIVERABLE2"
 #     later column left and starve the kill decision ---
 DELIVERABLE3="$(mktemp)"
 echo '{"ok": true}' > "$DELIVERABLE3"
-tmux -L "$SOCK" new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
+tmux_spawn new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
 sleep 0.3
 PANE10="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"
 tag_full "$PANE10" victor "" done producer "$DELIVERABLE3"
@@ -256,7 +280,7 @@ rm -f "$DELIVERABLE3"
 # --- SABLE-ita7: a "running" pane whose turn was cut off by the Claude Code
 #     session-rate-limit banner must be flagged stalled-rate-limit (with the
 #     reset time) instead of reading "running" forever ---
-tmux -L "$SOCK" new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
+tmux_spawn new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
 sleep 0.3
 PANE11="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"
 tag "$PANE11" worker bead-eleven running

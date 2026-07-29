@@ -29,7 +29,17 @@
 
 set -eu
 
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+# Resolve the physical script before deriving the checkout. The supported
+# ~/.local/bin install is a live symlink to this repo copy; using dirname($0)
+# would otherwise target ~/.local/.github instead of the target checkout.
+SOURCE="${BASH_SOURCE[0]:-$0}"
+while [ -h "$SOURCE" ]; do
+    SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    case "$SOURCE" in /*) ;; *) SOURCE="$SOURCE_DIR/$SOURCE" ;; esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 usage() {
     cat <<'EOF'

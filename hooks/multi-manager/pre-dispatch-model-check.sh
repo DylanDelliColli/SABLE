@@ -87,7 +87,7 @@ echo "$PROMPT" | grep -qiE '^Task: (explore|investigate|research|audit|read-only
 BEAD_IDS=$(echo "$PROMPT" | python3 -c "
 import sys, re
 text = sys.stdin.read()
-ids = set(re.findall(r'\b((?:BD|SABLE|TWINE|EPIC|TASK|BUG|FEAT)-[a-zA-Z0-9]{2,6}(?:\.[0-9]+)*)\b(?!-[A-Za-z0-9])', text))
+ids = set(re.findall(r'\b((?:BD|SABLE|TWINE|EPIC|TASK|BUG|FEAT)-[a-zA-Z0-9]{2,6}(?:\.[0-9]+)*)\b(?!-|\.[A-Za-z0-9_.-])', text))
 for i in sorted(ids):
     print(i)
 " 2>/dev/null)

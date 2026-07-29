@@ -352,11 +352,14 @@ layer tags. Lock the diagram before Phase 5.
 
 **Forward mode (after framework detection):**
 
-1. Write skeleton test file(s) — one per cohesive feature surface. Each case is `it.todo("<case name>")` (vitest/jest), `pytest.mark.skip(reason="<why>")` (pytest), `t.Skip("<why>")` (Go), or framework equivalent.
-2. **Place each skeleton in the directory matching its test-layer tag** (from Phase 4): `[→UNIT]` cases land in the project's unit-test dir (`tests/`, `__tests__/`, `*_test.py`); `[→E2E]` cases land in `e2e/`, `cypress/`, or `playwright/` per detected config; `[→EVAL]` cases land in `evals/` or wherever the project keeps prompt-eval suites.
-3. File `columbo-test-spec` beads (one per skeleton file or per coherent cluster of cases) per the `templates/columbo-bead.md` spec. Each bead's `## Cases` section names the same case strings that appear in the skeleton file's `it.todo` calls — so the worker can map bead ↔ skeleton 1:1.
-4. **Regression beads (IRON RULE):** if the feature touched existing code, at least one filed bead must be a regression-test bead, marked CRITICAL (priority ≤ 1). Do not exit without it.
-5. Address each bead `for-tarzan` (small, <2hr) or assign as a child of the feature bead under Optimus's epic.
+1. Write skeleton test file(s) — one per cohesive feature surface. Each case is `it.todo("<case name>")` (vitest/jest), `pytest.mark.skip(reason="<why>")` (pytest), `t.Skip("<why>")` (Go), or framework equivalent. Filename:
+   - **pytest (Python):** `skel_<feature-name>.py` — no `test_` prefix and no `.test.py` suffix. Never use `<feature-name>.skel.test.py`: pytest may discover it, but its dotted module name is not importable, so collection crashes instead of skipping cleanly.
+   - **Every other framework:** `<feature-name>.skel.test.<ext>` — the `.skel` infix is the contract marker.
+2. **pytest projects only — validate collection before moving on:** run `pytest --collect-only <path-to-skeleton-or-its-directory>`. It must exit cleanly and must not list the skeleton's cases as collected. Rename and re-run if either condition fails.
+3. **Place each skeleton in the directory matching its test-layer tag** (from Phase 4): `[→UNIT]` cases land in the project's unit-test dir (`tests/`, `__tests__/`, `*_test.py`); `[→E2E]` cases land in `e2e/`, `cypress/`, or `playwright/` per detected config; `[→EVAL]` cases land in `evals/` or wherever the project keeps prompt-eval suites.
+4. File `columbo-test-spec` beads (one per skeleton file or per coherent cluster of cases) per the `templates/columbo-bead.md` spec. Each bead's `## Cases` section names the same case strings that appear in the skeleton file's `it.todo` calls — so the worker can map bead ↔ skeleton 1:1.
+5. **Regression beads (IRON RULE):** if the feature touched existing code, at least one filed bead must be a regression-test bead, marked CRITICAL (priority ≤ 1). Do not exit without it.
+6. Address each bead `for-tarzan` (small, <2hr) or assign as a child of the feature bead under Optimus's epic.
 
 **Audit mode (after framework detection):**
 
@@ -370,16 +373,17 @@ layer tags. Lock the diagram before Phase 5.
 Skeletons are unambiguous to humans, workers, and automated tooling.
 
 - **Location:** match the project layout. Look for the dominant pattern (`tests/`, `__tests__/`, sibling `*_test.go`/`*_test.py`/`*.test.ts`). Do not invent a new directory.
-- **Filename:** `<feature-name>.skel.test.<ext>` — the `.skel` infix is load-bearing. It tells humans and CI "this file is a contract waiting to be filled in." A pre-merge hook may eventually block `.skel` files from landing on main; until then, the convention signals intent.
+- **Filename:** use `skel_<feature-name>.py` for pytest (never `<feature-name>.skel.test.py`) and `<feature-name>.skel.test.<ext>` for every other framework. The pytest name keeps the skeleton non-collectable; elsewhere, the `.skel` infix is the contract marker.
+- **Collection validation (pytest only):** run `pytest --collect-only <path-to-skeleton-or-its-directory>` before exit. Collection must finish cleanly without listing the skeleton's cases.
 - **Body:** one `it.todo(...)` / `pytest.mark.skip(...)` / `t.Skip(...)` per case. Each todo's string is the case name. A short comment above each todo states the *why* (1 line). No setup, no fixtures, no mocking — the worker decides those when implementing.
 - **Header comment:** at the top of each skeleton file:
   ```
   // Columbo skeleton — see SABLE-<bead-id>
-  // Worker: fill in each it.todo body, remove .skel from filename when complete
+  // Worker: fill in each it.todo body and rename the skeleton when complete
   // (or merge cases into an existing test file with same coverage shape).
   ```
 
-The worker has two endpoints when done: rename `<name>.skel.test.ts` → `<name>.test.ts` (filling all bodies in place), or merge the cases into an existing file and delete the skeleton. Either is acceptable. The bead's acceptance criteria require all cases land somewhere, with bodies, exercising real behavior.
+The worker has two endpoints when done: rename `skel_<name>.py` → `test_<name>.py` for pytest or `<name>.skel.test.ts` → `<name>.test.ts` for other frameworks (filling all bodies in place), or merge the cases into an existing file and delete the skeleton. Either is acceptable. The bead's acceptance criteria require all cases land somewhere, with bodies, exercising real behavior.
 
 ## Exit criteria
 
@@ -389,6 +393,7 @@ You exit when ALL of:
 - Every selected category has at least one filed test bead
 - Every filed bead's case list maps 1:1 to `it.todo`s in a skeleton file
 - Skeleton files exist on disk in the correct test directory with correct extensions
+- **pytest projects:** every Python skeleton uses `skel_<feature-name>.py` (never `<feature-name>.skel.test.py`) and has passed `pytest --collect-only`
 - Every case in the coverage diagram carries a test-layer tag (`[→UNIT]` / `[→E2E]` / `[→EVAL]`)
 - **Regression rule honored:** if the feature touched existing code (any modification — not pure greenfield), at least one regression-test bead has been filed at priority ≤ 1
 - Summary message lists: bead IDs, skeleton file paths, category coverage matrix, layer mix
@@ -426,7 +431,7 @@ Do not skip this step. The session is not complete until the question has been a
 
 ## Out of scope
 
-- Running tests yourself — Rudy validates the integrated dev deploy; you write the spec
+- Running tests yourself — Rudy validates the integrated dev deploy; you write the spec. The one exception is `pytest --collect-only` on a just-written Python skeleton: it validates discovery without executing test bodies.
 - Writing test bodies — workers fill in skeletons; you only write `it.todo` placeholders
 - Writing or modifying source code — read-only with respect to implementation
 - Fixing tests in place — audit mode files gap beads; it does not edit existing tests
@@ -462,6 +467,7 @@ Before sending the summary message, re-read each filed bead and confirm:
 - [ ] **Regression rule:** if the feature touched any existing code, at least one regression-test bead is filed at priority ≤ 1 (no exceptions, no AskUserQuestion)
 - [ ] In forward mode: every case maps to an `it.todo` in a skeleton file (run a grep to confirm)
 - [ ] In forward mode: each skeleton file lives in the directory matching its test-layer tag
+- [ ] In forward mode, pytest projects: every skeleton is named `skel_<feature-name>.py` (never `<feature-name>.skel.test.py`), and `pytest --collect-only` exits cleanly without collecting its cases
 - [ ] In audit mode: every existing test in the cited scope has a recorded quality grade (★/★★/★★★)
 - [ ] In audit mode: every fingerprint greps to ≤3 matches in the cited file (run the greps)
 - [ ] In audit mode: every gap bead's `## Existing test quality` is populated (grade or `none — net-new test required`)
@@ -519,3 +525,5 @@ That's it. No prose explanation of what you found — the beads + skeletons are 
 - You may not invent categories outside the 12-category taxonomy.
 - You may not dispatch code-writing or test-running agents.
 - You may not exit forward mode without skeleton files on disk that map 1:1 to filed beads.
+- You may not leave a Python skeleton on disk without running `pytest --collect-only` against it.
+- You may never name a Python skeleton `<feature-name>.skel.test.py`; use `skel_<feature-name>.py`.

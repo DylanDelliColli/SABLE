@@ -122,6 +122,23 @@ run_case "malformed hook JSON falls back to env identity" \
   "tarzan" "manager" \
   "tarzan|one_off_manager|env|0|1|1"
 
+# Provider-neutral env identity wins over the Claude compatibility alias.
+got=$(
+  export SABLE_AGENT_NAME=optimus SABLE_AGENT_ROLE=manager
+  export CLAUDE_AGENT_NAME=tarzan CLAUDE_AGENT_ROLE=producer
+  # shellcheck disable=SC1090
+  source "$LIB"
+  sable_resolve_identity '{"tool_name":"Bash"}'
+  printf '%s|%s|%s|%s|%s|%s' "$SABLE_ID_NAME" "$SABLE_ID_TYPE" "$SABLE_ID_SOURCE" \
+    "$SABLE_ID_IS_SUBAGENT" "$SABLE_ID_IS_MANAGER" "$SABLE_ID_IS_REGISTERED"
+)
+if [ "$got" = "optimus|epic_manager|env|0|1|1" ]; then
+  pass "SABLE env identity wins over Claude compatibility alias"
+else
+  fail "SABLE env identity wins over Claude compatibility alias" \
+    "expected [optimus|epic_manager|env|0|1|1] got [$got]"
+fi
+
 # --------------------------------------------------------------------------
 # Agent-Teams member identity (SABLE-amj.2). Capture-verified (SABLE-amj.1):
 # a team member spawned with name=<registry name> produces a hook input whose
@@ -390,9 +407,29 @@ run_lane_env "lane row3a: planning-mode main session stands down" \
 # dd1 — Dispatching-for prompt IGNORED for main-session exec lane (lincoln, not optimus)
 run_lane_env "dd1: Dispatching-for prompt ignored for main-session lane (lincoln)" \
   '{"tool_name":"Agent","tool_input":{"prompt":"Dispatching-for: optimus\nwork on x"}}' '{"mode":"execution"}' "" "1|lincoln"
-# dd1 — malformed mode-file JSON fails open
-run_lane_env "dd1: malformed mode-file JSON stands down (fail open)" \
+# A corrupt file still stands down, but is observably different from a missing
+# file so callers and diagnostics cannot mistake lost authority for inactivity.
+run_lane_env "dd1: malformed mode-file JSON stands down" \
   '{"tool_name":"Agent"}' 'not-json{' "" "0|"
+lane_state=$(
+  unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE
+  printf '%s' 'not-json{' > "$FIXTURE_DIR/mode-case.json"
+  export SABLE_MODE_STATE="$FIXTURE_DIR/mode-case.json"
+  # shellcheck disable=SC1090
+  source "$LIB"
+  sable_resolve_dispatch_lane '{"tool_name":"Agent"}'
+  printf '%s' "$SABLE_DISPATCH_STATE_STATUS"
+)
+if [ "$lane_state" = "corrupt" ]; then pass "dbq9p.4: dispatch reader labels malformed state corrupt"; else fail "dbq9p.4: dispatch reader labels malformed state corrupt" "got [$lane_state]"; fi
+lane_state=$(
+  unset CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE
+  export SABLE_MODE_STATE="$FIXTURE_DIR/nonexistent-mode-state.json"
+  # shellcheck disable=SC1090
+  source "$LIB"
+  sable_resolve_dispatch_lane '{"tool_name":"Agent"}'
+  printf '%s' "$SABLE_DISPATCH_STATE_STATUS"
+)
+if [ "$lane_state" = "missing" ]; then pass "dbq9p.4: dispatch reader labels absent state missing"; else fail "dbq9p.4: dispatch reader labels absent state missing" "got [$lane_state]"; fi
 # dd1 — registry missing → manager subagent fails open (stands down)
 run_lane_env "dd1: registry missing → manager subagent fails open" \
   '{"agent_id":"a1","agent_type":"tarzan","tool_name":"Agent"}' "" "/nonexistent/agents.yaml" "0|"
@@ -827,11 +864,29 @@ resolve_timeout_test "sable_resolve_test_timeout: empty repo path falls back to 
 resolve_timeout_test "sable_resolve_test_timeout: empty repo path with no env returns default 60" \
   "" "" "60"
 
-# This repo's own checked-in .sable pins testTimeout=180 (SABLE-lp4n/dnfv
-# timeout-margin fix): the 3-file .sable testCommand suite runs ~53s and
-# was flaking against the old 60s default under fleet load.
-resolve_timeout_test "sable_resolve_test_timeout: this repo's checked-in .sable resolves to 180" \
-  "$REPO" "" "180"
+# This repo's own checked-in .sable gives a fail-closed full fallback the
+# authoritative full_snapshot budget plus 30s for planning/teardown outside
+# sable-dev-check's internal execution timer. Derive the assertion from the
+# tier SSOT so a budget change cannot silently strand the hook at an old cap.
+FULL_SNAPSHOT_BUDGET=$(bash "$REPO/.github/ci/test-tiers.sh" --budget full_snapshot)
+FULL_SNAPSHOT_BUDGET_RC=$?
+if [ "$FULL_SNAPSHOT_BUDGET_RC" -ne 0 ]; then
+  fail "sable_resolve_test_timeout: full_snapshot tier budget query succeeds" \
+    "rc=$FULL_SNAPSHOT_BUDGET_RC got [$FULL_SNAPSHOT_BUDGET]"
+else
+  case "$FULL_SNAPSHOT_BUDGET" in
+    ''|*[!0-9]*)
+      fail "sable_resolve_test_timeout: full_snapshot tier exposes a numeric budget" \
+        "rc=$FULL_SNAPSHOT_BUDGET_RC got [$FULL_SNAPSHOT_BUDGET]"
+      ;;
+    *)
+      EXPECTED_REPO_TEST_TIMEOUT=$((FULL_SNAPSHOT_BUDGET + 30))
+      resolve_timeout_test \
+        "sable_resolve_test_timeout: this repo resolves to full_snapshot + 30s headroom" \
+        "$REPO" "" "$EXPECTED_REPO_TEST_TIMEOUT"
+      ;;
+  esac
+fi
 
 # --------------------------------------------------------------------------
 # sable_resolve_push_repo_dir unit tests (SABLE-041)

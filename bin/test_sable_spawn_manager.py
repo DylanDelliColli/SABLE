@@ -48,6 +48,24 @@ def test_plan_spawns_skips_existing():
     assert skipped == ["optimus"]
 
 
+def test_existing_provider_map_defaults_legacy_panes_to_claude():
+    listing = "%1\toptimus\tcodex\n%2\ttarzan\t\n%3 chuck"
+    assert sm.parse_existing_providers(listing) == {
+        "optimus": "codex",
+        "tarzan": "claude",
+        "chuck": "claude",
+    }
+
+
+def test_retained_pane_provider_mismatch_is_refused():
+    mismatches = sm.provider_mismatches(
+        ["optimus", "tarzan"],
+        {"optimus": "claude", "tarzan": "codex"},
+        {"optimus": "codex", "tarzan": "codex"},
+    )
+    assert mismatches == [("optimus", "claude", "codex")]
+
+
 def test_window_args_are_detached_named_windows():
     args = sm.window_args("sable", "optimus", "bash")
     assert "new-window" in args
@@ -104,6 +122,22 @@ def test_window_args_manager_still_sets_agent_role_manager_regression():
     args = sm.window_args("sable", "optimus", "bash")
     assert "CLAUDE_AGENT_ROLE=manager" in args
     assert "CLAUDE_AGENT_ROLE=producer" not in args
+
+
+def test_window_args_dual_stamps_provider_neutral_claude_identity():
+    args = sm.window_args("sable", "optimus", "bash")
+    assert "SABLE_PROVIDER=claude" in args
+    assert "SABLE_AGENT_NAME=optimus" in args
+    assert "SABLE_AGENT_ROLE=manager" in args
+    assert "CLAUDE_AGENT_NAME=optimus" in args
+
+
+def test_window_args_codex_has_no_claude_identity_alias():
+    args = sm.window_args("sable", "tarzan", "bash", provider="codex")
+    assert "SABLE_PROVIDER=codex" in args
+    assert "SABLE_AGENT_NAME=tarzan" in args
+    assert "SABLE_AGENT_ROLE=manager" in args
+    assert not any(value.startswith("CLAUDE_AGENT_") for value in args)
 
 
 def test_producer_command_pins_model_tier(monkeypatch):
@@ -164,6 +198,21 @@ def test_manager_command_always_pins_opus(monkeypatch):
     monkeypatch.delenv("SABLE_TMUX_PANE_CMD", raising=False)
     monkeypatch.delenv("SABLE_WORKER_PERMISSION", raising=False)
     assert sm.manager_command() == "claude --model opus --permission-mode bypassPermissions"
+
+
+def test_manager_command_launches_deep_interactive_codex(monkeypatch):
+    monkeypatch.delenv("SABLE_TMUX_PANE_CMD", raising=False)
+    command = sm.manager_command("codex")
+    assert command.startswith("codex --no-alt-screen")
+    assert "--model gpt-5.6-sol" in command
+    assert 'model_reasoning_effort="high"' in command
+
+
+def test_codex_manager_can_create_sibling_worker_worktrees(monkeypatch):
+    monkeypatch.delenv("SABLE_TMUX_PANE_CMD", raising=False)
+    command = sm.manager_command("codex", "/work/projects/repo")
+    assert "--cd /work/projects/repo" in command
+    assert "--add-dir /work/projects" in command
 
 
 def test_manager_command_pins_opus_regardless_of_permission_override(monkeypatch):

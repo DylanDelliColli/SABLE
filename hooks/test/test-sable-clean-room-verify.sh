@@ -87,6 +87,27 @@ else
     fail "--help exits 0 and documents the default gate command" "rc=$rc out=$out"
 fi
 
+# ---------- no-arg default resolves from the checkout containing the tool ----------
+DEFAULT_PARENT="$(mktemp -d)"
+DEFAULT_REPO="$DEFAULT_PARENT/repo"
+DEFAULT_LINK_DIR="$DEFAULT_PARENT/local-bin"
+mkdir -p "$DEFAULT_REPO/bin" "$DEFAULT_REPO/.github/ci" "$DEFAULT_LINK_DIR"
+cp -f "$TOOL" "$DEFAULT_REPO/bin/sable-clean-room-verify"
+ln -s "$DEFAULT_REPO/bin/sable-clean-room-verify" \
+    "$DEFAULT_LINK_DIR/sable-clean-room-verify"
+printf '#!/usr/bin/env bash\nprintf "default-gate:%%s\\n" "$*"\n' \
+    > "$DEFAULT_REPO/.github/ci/shell-run-set.sh"
+chmod +x "$DEFAULT_REPO/.github/ci/shell-run-set.sh"
+
+out="$(PATH="$TEST_PATH" bash "$DEFAULT_LINK_DIR/sable-clean-room-verify" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] &&
+   printf '%s' "$out" | grep -q "default-gate:--run" &&
+   printf '%s' "$out" | grep -q "$DEFAULT_REPO/.github/ci/shell-run-set.sh"; then
+    pass "no-arg installed symlink runs its target checkout's canonical shell gate"
+else
+    fail "no-arg installed symlink runs its target checkout's canonical shell gate" "rc=$rc out=$out"
+fi
+
 # ---------- no bd/dolt on PATH to begin with: still runs, notes no signal added ----------
 CLEAN_PATH="/usr/bin:/bin"
 out="$(PATH="$CLEAN_PATH" bash "$TOOL" bash -c 'echo ran-ok' 2>&1)"; rc=$?
@@ -96,7 +117,7 @@ else
     fail "with no bd/dolt on PATH, still runs the command and says so" "rc=$rc out=$out"
 fi
 
-rm -rf "$FAKE_BIN" "$OTHER_BIN"
+rm -rf "$FAKE_BIN" "$OTHER_BIN" "$DEFAULT_PARENT"
 
 echo
 echo "=========================================="

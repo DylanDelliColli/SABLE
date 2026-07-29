@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""sable-test-contention — reproduce SABLE-x2r7g scoped-worker plants."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sable_test_contention_lib as contention  # noqa: E402
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sable-test-contention",
+        description=(
+            "Run attributable, scoped same-host test plants. This command "
+            "cannot invoke the sealed full suite."
+        ),
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=("cheap-unit", "subprocess-heavy", "tmux", "real-bd", "mixed"),
+        required=True,
+    )
+    parser.add_argument("--workers", type=int, default=15)
+    parser.add_argument(
+        "--parallelism",
+        type=int,
+        help="maximum simultaneously running workers (default: --workers)",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        required=True,
+        help="new JSON report path; existing files are never overwritten",
+    )
+    parser.add_argument(
+        "--artifacts",
+        type=Path,
+        help="new worker-log directory (default: REPORT-with-.artifacts suffix)",
+    )
+    parser.add_argument(
+        "--isolation",
+        choices=("native", "private-tmp", "private-home"),
+        default="native",
+        help="per-worker resource isolation applied outside suite-owned fixtures",
+    )
+    parser.add_argument(
+        "--heavy-slots",
+        type=int,
+        help=(
+            "experimental in-plant host-heavy admission width; ordinary "
+            "workers remain unconstrained"
+        ),
+    )
+    parser.add_argument(
+        "--worker-timeout",
+        type=float,
+        help="override the catalog's per-worker timeout",
+    )
+    parser.add_argument(
+        "--sample-interval",
+        type=float,
+        default=contention.DEFAULT_SAMPLE_INTERVAL,
+    )
+    parser.add_argument("--plant-failure", type=int, metavar="WORKER")
+    parser.add_argument("--plant-timeout", type=int, metavar="WORKER")
+    parser.add_argument("--label")
+    parser.add_argument(
+        "--require-clean",
+        action="store_true",
+        help="refuse before launch unless git status is empty",
+    )
+    return parser
+
+
+def _artifact_default(report: Path) -> Path:
+    if report.suffix:
+        return report.with_suffix(report.suffix + ".artifacts")
+    return report.with_name(report.name + ".artifacts")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    parallelism = args.parallelism or args.workers
+    artifacts = args.artifacts or _artifact_default(args.report)
+    try:
+        report = contention.run_plant(
+            repo_root=_repo_root(),
+            scenario=args.scenario,
+            workers=args.workers,
+            parallelism=parallelism,
+            report_path=args.report,
+            artifacts_dir=artifacts,
+            isolation=args.isolation,
+            heavy_slots=args.heavy_slots,
+            timeout_override=args.worker_timeout,
+            sample_interval=args.sample_interval,
+            plant_failure=args.plant_failure,
+            plant_timeout=args.plant_timeout,
+            label=args.label,
+            require_clean=args.require_clean,
+        )
+    except contention.PlantError as exc:
+        print(f"sable-test-contention: precondition failed: {exc}", file=sys.stderr)
+        return 2
+    print(contention.render_summary(report))
+    print(f"  report={args.report.resolve()}")
+    print(f"  artifacts={artifacts.resolve()}")
+    return 0 if report["verdict"]["status"] == "passed" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

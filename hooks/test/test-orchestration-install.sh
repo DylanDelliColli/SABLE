@@ -38,7 +38,7 @@ valid_json(){ python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$1" 2>
 
 # ---------- project scope (explicit) ----------
 P="$(mktemp -d)"
-out1="$(SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project 2>&1)"
+out1="$(SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --merge-settings 2>&1)"
 exists "$P/.claude/skills/sable-plan/SKILL.md"    "project: /plan skill installed"
 exists "$P/.claude/skills/sable-execute/SKILL.md" "project: /execute skill installed"
 exists "$P/.claude/sable/roles/lincoln.md"  "project: lincoln role installed"
@@ -84,10 +84,19 @@ if printf '%s' "$out1" | grep -qi "NOT activated"; then
 else
   fail "project: install output says the timer is staged, not activated"
 fi
-if printf '%s' "$out1" | grep -q "systemctl --user enable"; then
-  pass "project: install output prints the systemd activation command (for the operator, not run here)"
+# SABLE-5xz68 DEFECT ONE: the old output printed a multi-command recipe that
+# nobody ever ran, so the units sat staged and NOTHING was scheduled. The
+# activation instruction must now be ONE copy-pasteable command that verifies
+# itself, plus a standalone check the operator can re-run any time.
+if printf '%s' "$out1" | grep -q -- "sable-reconcile-timer --install-schedule"; then
+  pass "project: install output prints the ONE self-verifying activation command"
 else
-  fail "project: install output prints the systemd activation command"
+  fail "project: install output prints the ONE self-verifying activation command" "out=$out1"
+fi
+if printf '%s' "$out1" | grep -q -- "--check-schedule"; then
+  pass "project: install output points at the post-install schedule verification"
+else
+  fail "project: install output points at the post-install schedule verification"
 fi
 # the install itself must never actually touch a live systemd/cron surface.
 # SABLE-i8kv: run this against a SANDBOXED HOME, not the developer's real one —
@@ -101,7 +110,7 @@ home_has_timer_unit(){ [ -e "$1/.config/systemd/user/sable-reconcile-timer.timer
 
 HS="$(mktemp -d)"; mkdir -p "$HS/.config/systemd/user"
 HP="$(mktemp -d)"
-HOME="$HS" SABLE_PROJECT_DIR="$HP" bash "$INSTALLER" --project >/dev/null 2>&1
+HOME="$HS" SABLE_PROJECT_DIR="$HP" bash "$INSTALLER" --project --merge-settings >/dev/null 2>&1
 if home_has_timer_unit "$HS"; then
   fail "project: install does not copy the unit into the real ~/.config/systemd/user" "found $HS/.config/systemd/user/sable-reconcile-timer.timer"
 else
@@ -133,7 +142,7 @@ exit 0
 FAKEBD
 chmod +x "$FAKEBIN/bd"
 P_BD="$(mktemp -d)"
-SABLE_PROJECT_DIR="$P_BD" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --project >/dev/null 2>&1
+SABLE_PROJECT_DIR="$P_BD" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --project --merge-settings >/dev/null 2>&1
 SVC_BD="$P_BD/.claude/sable/reconcile-timer/sable-reconcile-timer.service"
 CRON_BD="$P_BD/.claude/sable/reconcile-timer/sable-reconcile-timer.cron"
 bd_env_val="$(grep -o 'Environment=SABLE_RC_BD=.*' "$SVC_BD" | cut -d= -f3-)"
@@ -156,7 +165,7 @@ fi
 # NEGATIVE CASE: no bd anywhere on PATH — the installer must not fabricate a
 # path, must warn, and must still emit the fallback Environment=PATH= line.
 P_NOBD="$(mktemp -d)"
-nobd_err="$(SABLE_PROJECT_DIR="$P_NOBD" PATH="/usr/bin:/bin" bash "$INSTALLER" --project 2>&1 >/dev/null)"
+nobd_err="$(SABLE_PROJECT_DIR="$P_NOBD" PATH="/usr/bin:/bin" bash "$INSTALLER" --project --merge-settings 2>&1 >/dev/null)"
 SVC_NOBD="$P_NOBD/.claude/sable/reconcile-timer/sable-reconcile-timer.service"
 if ! grep -q '^Environment=SABLE_RC_BD=' "$SVC_NOBD"; then
   pass "project: .service omits Environment=SABLE_RC_BD when bd is absent from PATH"
@@ -174,9 +183,55 @@ else
   fail "project: .service carries a fallback Environment=PATH= line even when bd is absent"
 fi
 
+# ---------- SABLE-5xz68 DEFECT TWO: the swept repo is a PARAMETER ----------
+# The shipped units used to hardcode the SABLE tooling repo, so an operator who
+# followed the printed recipe exactly got a timer that swept the WRONG repo and
+# never looked at the fleet it was meant to protect. These assert the generated
+# unit and cron lines carry the repo actually PASSED IN — and that a host
+# running several fleets gets every one of them swept, since a unit covering
+# one repo looks protected while leaving the others stranded.
+P_REPO="$(mktemp -d)"
+SABLE_PROJECT_DIR="$P_REPO" SABLE_RECONCILE_TARGET_REPO=/srv/fleet-alpha \
+  bash "$INSTALLER" --project --merge-settings >/dev/null 2>&1
+SVC_REPO="$P_REPO/.claude/sable/reconcile-timer/sable-reconcile-timer.service"
+CRON_REPO="$P_REPO/.claude/sable/reconcile-timer/sable-reconcile-timer.cron"
+if grep -q -- "--repo /srv/fleet-alpha" "$SVC_REPO"; then
+  pass "project: .service ExecStart carries the repo PASSED IN, not a hardcoded path"
+else
+  fail "project: .service ExecStart carries the repo PASSED IN, not a hardcoded path" "$(grep ExecStart "$SVC_REPO")"
+fi
+if grep -q -- "--repo /srv/fleet-alpha" "$CRON_REPO"; then
+  pass "project: .cron line carries the repo PASSED IN, not a hardcoded path"
+else
+  fail "project: .cron line carries the repo PASSED IN, not a hardcoded path" "$(cat "$CRON_REPO")"
+fi
+if grep -q -- "--repo $REPO" "$SVC_REPO"; then
+  fail "project: the passed-in repo REPLACES the default, it does not sweep both" "$(grep ExecStart "$SVC_REPO")"
+else
+  pass "project: the passed-in repo REPLACES the default, it does not sweep both"
+fi
+rm -rf "$P_REPO"
+
+P_MULTI="$(mktemp -d)"
+SABLE_PROJECT_DIR="$P_MULTI" SABLE_RECONCILE_TARGET_REPO=/srv/fleet-alpha:/srv/fleet-beta \
+  bash "$INSTALLER" --project --merge-settings >/dev/null 2>&1
+SVC_MULTI="$P_MULTI/.claude/sable/reconcile-timer/sable-reconcile-timer.service"
+CRON_MULTI="$P_MULTI/.claude/sable/reconcile-timer/sable-reconcile-timer.cron"
+if grep -q -- "--repo /srv/fleet-alpha --repo /srv/fleet-beta" "$SVC_MULTI"; then
+  pass "project: .service sweeps EVERY repo on a multi-fleet host"
+else
+  fail "project: .service sweeps EVERY repo on a multi-fleet host" "$(grep ExecStart "$SVC_MULTI")"
+fi
+if grep -q -- "--repo /srv/fleet-alpha --repo /srv/fleet-beta" "$CRON_MULTI"; then
+  pass "project: .cron line sweeps EVERY repo on a multi-fleet host"
+else
+  fail "project: .cron line sweeps EVERY repo on a multi-fleet host" "$(cat "$CRON_MULTI")"
+fi
+rm -rf "$P_MULTI"
+
 # env override of the cadence
 P_CADENCE="$(mktemp -d)"
-SABLE_PROJECT_DIR="$P_CADENCE" SABLE_RECONCILE_INTERVAL_MIN=5 bash "$INSTALLER" --project >/dev/null 2>&1
+SABLE_PROJECT_DIR="$P_CADENCE" SABLE_RECONCILE_INTERVAL_MIN=5 bash "$INSTALLER" --project --merge-settings >/dev/null 2>&1
 if grep -q "OnUnitActiveSec=5min" "$P_CADENCE/.claude/sable/reconcile-timer/sable-reconcile-timer.timer"; then
   pass "project: SABLE_RECONCILE_INTERVAL_MIN overrides the staged cadence"
 else
@@ -185,7 +240,7 @@ fi
 rm -rf "$P_CADENCE"
 
 # idempotent re-run
-SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project >/dev/null 2>&1
+SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --merge-settings >/dev/null 2>&1
 if [ "$(count_interlock "$SET")" = "2" ]; then pass "project: re-run stays idempotent"; else fail "project: re-run idempotent" "count=$(count_interlock "$SET")"; fi
 if valid_json "$SET"; then pass "project: settings valid after re-run"; else fail "project: settings valid after re-run"; fi
 
@@ -196,12 +251,12 @@ d=json.load(open(sys.argv[1]))
 d['hooks']['PreToolUse'].append({'matcher':'Bash','hooks':[{'type':'command','command':'bash /tmp/other-hook.sh','timeout':1000}]})
 open(sys.argv[1],'w').write(json.dumps(d,indent=2))
 PY
-SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project >/dev/null 2>&1
+SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --merge-settings >/dev/null 2>&1
 if grep -q 'other-hook.sh' "$SET"; then pass "project: preserves existing hooks"; else fail "project: preserves existing hooks"; fi
 
 # ---------- default scope is project; there is NO topology choice ----------
 P2="$(mktemp -d)"
-SABLE_PROJECT_DIR="$P2" bash "$INSTALLER" >/dev/null 2>&1
+SABLE_PROJECT_DIR="$P2" bash "$INSTALLER" --merge-settings >/dev/null 2>&1
 exists "$P2/.claude/skills/sable-plan/SKILL.md" "default (no flag) installs into project ./.claude"
 if [ ! -e "$P2/.claude/agents-teams" ]; then pass "default install: no agents-teams defs (tmux-only)"; else fail "default install: no agents-teams defs (tmux-only)" "unexpected agents-teams/"; fi
 SET2="$P2/.claude/settings.json"
@@ -210,7 +265,7 @@ if [ "$(count_marker "$SET2" pre-push-rebase-test)" -ge 1 ]; then pass "default 
 # retired topology flags are rejected with a clear error (tmux is the only topology)
 for _flag in --teams --subagent --nested; do
   PN="$(mktemp -d)"
-  if SABLE_PROJECT_DIR="$PN" bash "$INSTALLER" "$_flag" >/dev/null 2>&1; then
+  if SABLE_PROJECT_DIR="$PN" bash "$INSTALLER" "$_flag" --merge-settings >/dev/null 2>&1; then
     fail "retired topology flag $_flag is rejected" "installer exited 0"
   else
     pass "retired topology flag $_flag is rejected"
@@ -221,10 +276,27 @@ rm -rf "$P2"
 
 # ---------- user scope ----------
 U="$(mktemp -d)"
-CLAUDE_USER_DIR="$U/.claude" bash "$INSTALLER" --user >/dev/null 2>&1
+CLAUDE_USER_DIR="$U/.claude" bash "$INSTALLER" --user --merge-settings >/dev/null 2>&1
 exists "$U/.claude/skills/sable-execute/SKILL.md" "user: skill installed under ~/.claude"
 exists "$U/.claude/settings.json" "user: settings.json created"
 if [ "$(count_interlock "$U/.claude/settings.json")" = "2" ]; then pass "user: interlock registered on both legs"; else fail "user: interlock registered on both legs" "count=$(count_interlock "$U/.claude/settings.json")"; fi
+exists "$U/.codex/hooks.json" "user: Codex hooks.json created beside redirected ~/.claude"
+if valid_json "$U/.codex/hooks.json"; then pass "user: Codex hooks.json is valid JSON"; else fail "user: Codex hooks.json is valid JSON"; fi
+if [ "$(count_interlock "$U/.codex/hooks.json")" = "2" ]; then pass "user: Codex receives both interlock legs"; else fail "user: Codex receives both interlock legs" "count=$(count_interlock "$U/.codex/hooks.json")"; fi
+if grep -qF "$U/.claude/hooks/" "$U/.codex/hooks.json"; then pass "user: Codex hook commands target the installed SABLE hooks"; else fail "user: Codex hook commands target the installed SABLE hooks"; fi
+for _base_hook in tdd-evidence.sh tdd-gate.sh bead-description-gate.sh tdd-remind.sh agent-tdd-enforce.sh bead-quality.sh; do
+  if [ "$(count_marker "$U/.codex/hooks.json" "$_base_hook")" = "1" ]; then
+    pass "user: Codex receives canonical base hook exactly once ($_base_hook)"
+  else
+    fail "user: Codex receives canonical base hook exactly once ($_base_hook)" "count=$(count_marker "$U/.codex/hooks.json" "$_base_hook")"
+  fi
+  exists "$U/.claude/hooks/$_base_hook" "user: Codex base hook executable is installed ($_base_hook)"
+done
+CLAUDE_USER_DIR="$U/.claude" bash "$INSTALLER" --user --merge-settings >/dev/null 2>&1
+if [ "$(count_marker "$U/.codex/hooks.json" tdd-gate.sh)" = "1" ]; then pass "user: Codex base graph stays idempotent"; else fail "user: Codex base graph stays idempotent" "count=$(count_marker "$U/.codex/hooks.json" tdd-gate.sh)"; fi
+CLAUDE_USER_DIR="$U/.claude" bash "$INSTALLER" --user --uninstall >/dev/null 2>&1
+if [ "$(count_interlock "$U/.codex/hooks.json")" = "0" ]; then pass "user uninstall: Codex interlock rows removed"; else fail "user uninstall: Codex interlock rows removed"; fi
+if [ "$(count_marker "$U/.codex/hooks.json" tdd-gate.sh)" = "1" ]; then pass "user uninstall: Codex base layer remains registered"; else fail "user uninstall: Codex base layer remains registered" "count=$(count_marker "$U/.codex/hooks.json" tdd-gate.sh)"; fi
 
 # ---------- uninstall (project) ----------
 # seed a legacy agents-teams dir from a pre-tmux-only install: uninstall must still clean it
@@ -275,8 +347,8 @@ PY
 # run the real installer twice — count must remain 1).
 PU="$(mktemp -d)"; mkdir -p "$PU/.claude"
 seed_sibling_blocks "$PU/.claude/settings.json"
-CLAUDE_USER_DIR="$PU/.claude" bash "$INSTALLER" --user >/dev/null 2>&1
-CLAUDE_USER_DIR="$PU/.claude" bash "$INSTALLER" --user >/dev/null 2>&1
+CLAUDE_USER_DIR="$PU/.claude" bash "$INSTALLER" --user --merge-settings >/dev/null 2>&1
+CLAUDE_USER_DIR="$PU/.claude" bash "$INSTALLER" --user --merge-settings >/dev/null 2>&1
 PUSET="$PU/.claude/settings.json"
 if [ "$(count_in_event "$PUSET" SessionStart session-role-anchor.sh)" = "1" ]; then pass "md7: sibling-block dedup keeps identity hook once (SessionStart)"; else fail "md7: sibling-block dedup keeps identity hook once (SessionStart)" "count=$(count_in_event "$PUSET" SessionStart session-role-anchor.sh)"; fi
 if valid_json "$PUSET"; then pass "md7: settings valid after sibling-block dedup"; else fail "md7: settings valid after sibling-block dedup"; fi
@@ -286,7 +358,7 @@ if valid_json "$PUSET"; then pass "md7: settings valid after sibling-block dedup
 # one interlock, and preserves the bd prime entries.
 M="$(mktemp -d)"; mkdir -p "$M/.claude"
 seed_sibling_blocks "$M/.claude/settings.json"
-CLAUDE_USER_DIR="$M/.claude" bash "$INSTALLER" --user >/dev/null 2>&1
+CLAUDE_USER_DIR="$M/.claude" bash "$INSTALLER" --user --merge-settings >/dev/null 2>&1
 MSET="$M/.claude/settings.json"
 if [ "$(count_in_event "$MSET" SessionStart session-role-anchor.sh)" = "1" ]; then pass "md7: multi-manager re-install — identity once (SessionStart)"; else fail "md7: multi-manager re-install — identity once (SessionStart)" "count=$(count_in_event "$MSET" SessionStart session-role-anchor.sh)"; fi
 if [ "$(count_in_event "$MSET" PreCompact session-role-anchor.sh)" = "1" ]; then pass "md7: multi-manager re-install — identity once (PreCompact)"; else fail "md7: multi-manager re-install — identity once (PreCompact)" "count=$(count_in_event "$MSET" PreCompact session-role-anchor.sh)"; fi
@@ -296,16 +368,18 @@ if valid_json "$MSET"; then pass "md7: settings valid after multi-manager re-ins
 
 # ---------- SABLE-qa4d.6: poll-based inbox hooks are gone ----------
 PIH="$(mktemp -d)"
-SABLE_PROJECT_DIR="$PIH" bash "$INSTALLER" --project >/dev/null 2>&1
+SABLE_PROJECT_DIR="$PIH" bash "$INSTALLER" --project --merge-settings >/dev/null 2>&1
 PIHSET="$PIH/.claude/settings.json"
 if [ "$(count_marker "$PIHSET" inbox-injection)" = "0" ]; then pass "settings register no inbox-injection hooks (sable-msg replaces the poll)"; else fail "settings register no inbox-injection hooks" "count=$(count_marker "$PIHSET" inbox-injection)"; fi
 if [ ! -e "$PIH/.claude/hooks/multi-manager/inbox-injection.sh" ] && [ ! -e "$PIH/.claude/hooks/multi-manager/inbox-injection-precompact.sh" ]; then pass "no inbox-injection hook files installed"; else fail "no inbox-injection hook files installed"; fi
+if [ "$(count_marker "$PIHSET" control-trace.sh)" = "0" ] && [ "$(count_marker "$PIHSET" close-decay-sweep.sh)" = "0" ]; then pass "settings register no diagnostic/advisory observer hooks"; else fail "settings register no diagnostic/advisory observer hooks"; fi
+if [ ! -e "$PIH/.claude/hooks/multi-manager/control-trace.sh" ] && [ ! -e "$PIH/.claude/hooks/multi-manager/close-decay-sweep.sh" ]; then pass "retired observer hook files are not installed"; else fail "retired observer hook files are not installed"; fi
 if [ -e "$PIH/.claude/hooks/multi-manager/read-guard.sh" ]; then pass "read-guard survives (durable-inbox guard stays)"; else fail "read-guard survives (durable-inbox guard stays)"; fi
 rm -rf "$PIH"
 
 # ---------- SABLE-qa4d.2: no teams residue in a fresh install ----------
 TMONLY="$(mktemp -d)"
-TM_OUT="$(SABLE_PROJECT_DIR="$TMONLY" bash "$INSTALLER" --project 2>&1)"
+TM_OUT="$(SABLE_PROJECT_DIR="$TMONLY" bash "$INSTALLER" --project --merge-settings 2>&1)"
 if printf '%s' "$TM_OUT" | grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"; then fail "install output has no experimental-teams-flag instruction" "flag instruction still printed"; else pass "install output has no experimental-teams-flag instruction"; fi
 if printf '%s' "$TM_OUT" | grep -qi "topology"; then fail "install output does not speak of topologies" "topology wording still printed"; else pass "install output does not speak of topologies"; fi
 rm -rf "$TMONLY"
@@ -332,6 +406,8 @@ seed = {
     ],
     "PreToolUse": [
       {"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "bash ~/.claude/hooks/multi-manager/control-trace.sh", "timeout": 3000},
+        {"type": "command", "command": "bash ~/.claude/hooks/multi-manager/close-decay-sweep.sh", "timeout": 25000},
         {"type": "command", "command": "bash /tmp/other-hook.sh", "timeout": 1000}
       ]}
     ]
@@ -348,14 +424,18 @@ touch "$RA/.claude/agents/optimus.md" "$RA/.claude/agents/tarzan.md" "$RA/.claud
 touch "$RA/.claude/agents/my-custom-agent.md"
 printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/inbox-injection.sh"
 printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/inbox-injection-precompact.sh"
+printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/control-trace.sh"
+printf '#!/usr/bin/env bash\necho retired\n' > "$RA/.claude/hooks/multi-manager/close-decay-sweep.sh"
 seed_retired_settings "$RA/.claude/settings.json"
 
-RA_OUT="$(SABLE_PROJECT_DIR="$RA" bash "$INSTALLER" --project 2>&1)"
+RA_OUT="$(SABLE_PROJECT_DIR="$RA" bash "$INSTALLER" --project --merge-settings 2>&1)"
 RASET="$RA/.claude/settings.json"
 
 if [ ! -e "$RA/.claude/hooks/multi-manager/inbox-injection.sh" ]; then pass "gsqj: retired inbox-injection.sh removed on plain (upgrade) install"; else fail "gsqj: retired inbox-injection.sh removed on plain install"; fi
 if [ ! -e "$RA/.claude/hooks/multi-manager/inbox-injection-precompact.sh" ]; then pass "gsqj: retired inbox-injection-precompact.sh removed"; else fail "gsqj: retired inbox-injection-precompact.sh removed"; fi
 if [ "$(count_marker "$RASET" inbox-injection)" = "0" ]; then pass "gsqj: retired settings rows removed"; else fail "gsqj: retired settings rows removed" "count=$(count_marker "$RASET" inbox-injection)"; fi
+if [ ! -e "$RA/.claude/hooks/multi-manager/control-trace.sh" ] && [ ! -e "$RA/.claude/hooks/multi-manager/close-decay-sweep.sh" ]; then pass "gsqj: retired observer hook files removed"; else fail "gsqj: retired observer hook files removed"; fi
+if [ "$(count_marker "$RASET" control-trace.sh)" = "0" ] && [ "$(count_marker "$RASET" close-decay-sweep.sh)" = "0" ]; then pass "gsqj: retired observer settings rows removed"; else fail "gsqj: retired observer settings rows removed"; fi
 if [ ! -e "$RA/.claude/agents-teams" ]; then pass "gsqj: retired agents-teams dir removed on plain install (not just --uninstall)"; else fail "gsqj: retired agents-teams dir removed on plain install"; fi
 if [ ! -e "$RA/.claude/agents/optimus.md" ] && [ ! -e "$RA/.claude/agents/tarzan.md" ] && [ ! -e "$RA/.claude/agents/chuck.md" ]; then pass "gsqj: retired manager agent defs removed from scope's agents/ dir"; else fail "gsqj: retired manager agent defs removed from scope's agents/ dir"; fi
 if [ -e "$RA/.claude/agents/my-custom-agent.md" ]; then pass "gsqj: genuinely custom agent def survives"; else fail "gsqj: genuinely custom agent def survives"; fi
@@ -365,7 +445,7 @@ if valid_json "$RASET"; then pass "gsqj: settings valid JSON after retired-artif
 if printf '%s' "$RA_OUT" | grep -qi "retired artifacts cleaned"; then pass "gsqj: install output reports what was cleaned"; else fail "gsqj: install output reports what was cleaned"; fi
 
 # a second (already-clean) run is silent about retired artifacts and stays idempotent
-RA_OUT2="$(SABLE_PROJECT_DIR="$RA" bash "$INSTALLER" --project 2>&1)"
+RA_OUT2="$(SABLE_PROJECT_DIR="$RA" bash "$INSTALLER" --project --merge-settings 2>&1)"
 if printf '%s' "$RA_OUT2" | grep -qi "retired artifacts cleaned"; then fail "gsqj: re-run on clean scope reports nothing to clean" "still printed cleanup banner"; else pass "gsqj: re-run on clean scope reports nothing to clean"; fi
 if valid_json "$RASET"; then pass "gsqj: settings still valid JSON after second run"; else fail "gsqj: settings still valid JSON after second run"; fi
 rm -rf "$RA"
@@ -383,17 +463,17 @@ cp "$REPO"/templates/multi-manager/roles/*.md "$RS/templates/multi-manager/roles
 printf -- '---\nname: sample-skill\n---\nplaceholder\n' > "$RS/skills/sample-skill/SKILL.md"
 
 MF="$(mktemp -d)"
-out_first="$(SABLE_REPO_DIR="$RS" SABLE_PROJECT_DIR="$MF" bash "$INSTALLER" --project 2>&1)"
+out_first="$(SABLE_REPO_DIR="$RS" SABLE_PROJECT_DIR="$MF" bash "$INSTALLER" --project --merge-settings 2>&1)"
 if printf '%s' "$out_first" | grep -q "Change manifest"; then pass "manifest: first install prints a change manifest"; else fail "manifest: first install prints a change manifest"; fi
 if printf '%s' "$out_first" | grep -q "NEW "; then pass "manifest: first install reports NEW entries"; else fail "manifest: first install reports NEW entries"; fi
 
-out_second="$(SABLE_REPO_DIR="$RS" SABLE_PROJECT_DIR="$MF" bash "$INSTALLER" --project 2>&1)"
+out_second="$(SABLE_REPO_DIR="$RS" SABLE_PROJECT_DIR="$MF" bash "$INSTALLER" --project --merge-settings 2>&1)"
 if printf '%s' "$out_second" | grep -q "all files identical"; then pass "manifest: second run reports all-identical"; else fail "manifest: second run reports all-identical" "$out_second"; fi
 if printf '%s' "$out_second" | grep -q "CHANGED"; then fail "manifest: second run has no CHANGED entries"; else pass "manifest: second run has no CHANGED entries"; fi
 
 # modify one source file (in the throwaway RS tree, never the real repo)
 echo "# test-touch" >> "$RS/hooks/multi-manager/mode-interlock.sh"
-out_third="$(SABLE_REPO_DIR="$RS" SABLE_PROJECT_DIR="$MF" bash "$INSTALLER" --project 2>&1)"
+out_third="$(SABLE_REPO_DIR="$RS" SABLE_PROJECT_DIR="$MF" bash "$INSTALLER" --project --merge-settings 2>&1)"
 if printf '%s' "$out_third" | grep -q "CHANGED.*mode-interlock.sh"; then pass "manifest: third run reports the modified file as CHANGED"; else fail "manifest: third run reports the modified file as CHANGED" "$out_third"; fi
 changed_count="$(printf '%s' "$out_third" | grep -c '^  CHANGED')"
 if [ "$changed_count" = "1" ]; then pass "manifest: third run reports exactly one changed file"; else fail "manifest: third run reports exactly one changed file" "count=$changed_count"; fi

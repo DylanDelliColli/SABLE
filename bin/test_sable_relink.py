@@ -50,6 +50,7 @@ def test_absent_identity_is_a_hard_error():
 def test_relink_ops_sets_role_and_clears_status_by_default():
     ops = rl.relink_ops("%3", "lincoln")
     assert ops[0] == ["set-option", "-p", "-t", "%3", "@sable_role", "lincoln"]
+    assert ["set-option", "-p", "-t", "%3", "@sable_provider", "claude"] in ops
     # @sable_status is UNSET (-u) so a resumed cockpit sheds the stale done flag
     assert ["set-option", "-p", "-u", "-t", "%3", "@sable_status"] in ops
     assert not any("@sable_bead" in op for op in ops)
@@ -73,8 +74,28 @@ def test_main_refuses_outside_tmux(monkeypatch, capsys):
 def test_main_refuses_when_process_has_no_identity(monkeypatch, capsys):
     monkeypatch.setenv("TMUX_PANE", "%5")
     monkeypatch.delenv("CLAUDE_AGENT_NAME", raising=False)
+    monkeypatch.delenv("SABLE_AGENT_NAME", raising=False)
     assert rl.main([]) == 1
     assert "no authoritative identity" in capsys.readouterr().err
+
+
+def test_main_codex_identity_relinks_provider_neutral_pane(monkeypatch, capsys):
+    monkeypatch.setenv("TMUX_PANE", "%8")
+    monkeypatch.setenv("SABLE_AGENT_NAME", "optimus")
+    monkeypatch.setenv("SABLE_PROVIDER", "codex")
+    monkeypatch.delenv("CLAUDE_AGENT_NAME", raising=False)
+    calls = []
+
+    class Result:
+        returncode = 0
+        stderr = ""
+
+    monkeypatch.setattr(
+        rl.subprocess, "run", lambda cmd, **_kw: calls.append(cmd) or Result()
+    )
+    assert rl.main([]) == 0
+    assert any(cmd[-2:] == ["@sable_provider", "codex"] for cmd in calls)
+    assert "provider=codex" in capsys.readouterr().err
 
 
 if __name__ == "__main__":

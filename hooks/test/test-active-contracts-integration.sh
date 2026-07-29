@@ -27,8 +27,11 @@ CONTRACT="$REPO/bin/sable-contract"
 
 # Hermeticity (SABLE-j3bi): strip any ambient SABLE pane env so this suite is
 # deterministic whether or not it runs inside a live manager/worker pane.
-unset SABLE_WORKER_PANE CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE \
-      SABLE_MODE_STATE SABLE_ACTIVE_CONTRACTS 2>/dev/null || true
+# Central scrub lives in lib-identity-isolation.sh so every suite shares one
+# definition of "identity vars" instead of drifting copies of an unset list.
+source "$REPO/hooks/test/lib-identity-isolation.sh"
+sable_scrub_identity_env
+unset SABLE_MODE_STATE SABLE_ACTIVE_CONTRACTS 2>/dev/null || true
 
 PASS=0; FAIL=0; FAIL_NAMES=""
 pass(){ PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -39,6 +42,8 @@ SS='{"hook_event_name":"SessionStart"}'
 # --- A real temp git repo standing in for a project checkout ------------------
 RREPO="$(mktemp -d)"
 git -C "$RREPO" init -q >/dev/null 2>&1
+git -C "$RREPO" -c user.email=t@t -c user.name=t \
+  commit --allow-empty -m init -q
 mkdir -p "$RREPO/.claude/sable/roles"
 # chuck's STATIC identity — deliberately describes the OLD manual-merge flow,
 # exactly as it did during the gah9 incident.
@@ -47,7 +52,9 @@ printf 'CHUCK STATIC ROLE: merge landed branches with bare git merge --no-ff + g
 
 # --- The flip choreography: write the live protocol state to disk -------------
 # (fix direction 3 — the flip persists its contract change to the surface.)
-( cd "$RREPO" && SABLE_ORCHESTRATION=1 bash "$MODE" set execution >/dev/null 2>&1 ) \
+( cd "$RREPO" && SABLE_ORCHESTRATION=1 "$MODE" set execution \
+    --break-glass --reason "synthetic authority for active-contract test" \
+    >/dev/null 2>&1 ) \
     || fail "sable-mode set execution succeeds"
 ( cd "$RREPO" && bash "$CONTRACT" add \
     "sable-merge-gate is the SOLE merge path; no bare git merge/push." >/dev/null 2>&1 ) \

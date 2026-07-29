@@ -301,11 +301,16 @@ upstream thinking is done and human-signed-off:
 - **DECOMPOSITION** — the orchestrator authors the implementation children, each
   tracing to a story + acceptance scenario.
 
-The human signs off before each `sable-mode substage advance`, and the mode
-interlock mechanically blocks populating the backlog until DECOMPOSITION. The
-goal: by the time execution runs, the beads are scoped well enough to need only
-confirmations and prioritization — the human invests in planning so the swarm
-executes without questions.
+The human signs off before each `sable-mode substage advance`. Final
+DECOMPOSITION approval is recorded with
+`sable-mode handoff approve --epic <id>` (Quick records its one approval with
+`--beads <id,...>`). That versioned receipt binds the live backlog, unresolved
+questions, integration-base SHA, and Full-tier dossier hashes. The execution
+transition revalidates and atomically carries it; manager spawn refuses
+statusless execution state before creating a pane. The mode interlock also
+mechanically blocks populating the backlog until DECOMPOSITION. The goal: by
+the time execution runs, the human has approved a mechanically identified work
+contract, so the swarm executes without questions.
 
 **The mode is per-repo.** `sable-mode` and the interlock resolve the mode-state
 file from the repo the session operates on — `<repo>/.claude/sable/state/mode-state.json`,
@@ -1237,6 +1242,15 @@ mechanical the work in front of them looks; `sable-spawn-manager`'s
 manager pane. The ladder below never applies to a manager's own model — only
 to the workers a manager dispatches via `sable-spawn-worker`.
 
+**The ladder is a HUMAN/manager judgment — the tooling does not grade the bead
+(SABLE-mn1da).** `sable-spawn-worker` reads exactly two signals: an explicit
+`--model` and the bead's `model:` label. Nothing inspects bead type, priority,
+description size, or whether the bead carries an unresolved ruling. With
+neither signal present you get the flat `DEFAULT_MODEL` (Sonnet) — not a graded
+choice — so the spawn announces which of the three it used on every dispatch
+(`model sonnet, DEFAULT — no --model override and no model: label; …`). If you
+want a rung other than Sonnet, you must say so; the tool will never infer it.
+
 Different tasks need different models. Picking by bead structure (epic/feature/task) is wrong — bead structure is orthogonal to actual complexity. A 12-file rename is mechanical regardless of count; a single-file auth change is still security-sensitive. Apply the **model ladder** instead:
 
 **Default: Sonnet** (claude-sonnet-4-6). All work starts here.
@@ -1265,6 +1279,18 @@ Different tasks need different models. Picking by bead structure (epic/feature/t
 | "Many files → Opus" | Same pattern at every site is still mechanical | Mechanical-ness wins |
 
 **Encoding the choice on beads.** Beads can carry a `model:<haiku|sonnet|opus>` label set by the bead author (Sherlock auto-recommends in its bead template; manual creation should set it after applying the ladder). The label is the primary signal at dispatch time. If absent, the manager applies the ladder and adds the label after dispatch so the next worker doesn't re-derive.
+
+**Which model actually ran a bead (SABLE-qw9jv).** `sable-spawn-worker` stamps
+`model` and `model_source` metadata on the dispatched bead — and on every
+`--bundle` sibling — after the worker pane launches. Read it back with
+`bd show <id> --json` (`.metadata.model`, `.metadata.model_source`). Two rules
+make it evidence rather than intent: the value is parsed from the command that
+ACTUALLY launched (a `SABLE_WORKER_CMD` override that pins a different model,
+or none, is recorded as such — `model=unknown` rather than a claim), and a
+spawn refused by the throttle/host-guard/composer gate writes nothing at all,
+so a bead refused at one tier and re-dispatched at another carries the tier
+that ran. A `model:` label, a dispatch prompt line, or a manager note is
+INTENT and is never an attribution.
 
 **Mechanical enforcement.** When the multi-manager pattern is active, the `pre-dispatch-model-check.sh` hook hard-blocks dispatches where the dispatch's model parameter disagrees with the bead's `model:` label, unless the prompt includes a `Model override: <reason>` line. This catches "let's just send it to Opus" reflexes that compound on cost across a session of dispatches.
 
@@ -1532,7 +1558,7 @@ Normal in swarm execution. The orchestrator resolves conflicts, or dispatches a 
 `bd blocked` will surface beads that are blocked by each other. Break the cycle by removing one dependency: re-read the beads and determine which one can actually proceed independently.
 
 **Stranded push (merge never notified):**
-The push-based `post-push-merge-notify` hook fires ON the push itself, so a push whose hook is unwired, races the remote's ref-update, or dies mid-flight leaves the branch merge-ready on origin with no `for-chuck` handoff bead ever filed — Chuck has no way to learn the work exists. `bin/sable-reconcile-handoffs` (SABLE-jfg6.3) is the mechanical backstop: it never sits on the push path, instead querying origin + beads directly and filing exactly one `for-chuck` bead per branch that is genuinely unmerged, whose work bead is closed or in-progress, has no handoff bead already naming it, and is past a settle window (default 10min, override via `$SABLE_RECONCILE_AGE_MIN`). Re-running it is safe — the filed bead itself is the idempotency key. `sable-orchestration-install` stages (never activates) a host timer — a systemd `--user` unit plus a cron fallback line — under `~/.claude/sable/reconcile-timer/` (SABLE-jfg6.5) so this sweep runs on a schedule instead of depending on someone remembering to invoke it by hand.
+The push-based `post-push-merge-notify` hook fires ON the push itself, so a push whose hook is unwired, races the remote's ref-update, or dies mid-flight leaves the branch merge-ready on origin with no `for-chuck` handoff bead ever filed — Chuck has no way to learn the work exists. `bin/sable-reconcile-handoffs` (SABLE-jfg6.3) is the mechanical backstop: it never sits on the push path, instead querying origin + beads directly and filing exactly one `for-chuck` bead per branch that is genuinely unmerged, whose work bead is closed or in-progress, has no handoff bead already naming it, and is past a settle window (default 10min, override via `$SABLE_RECONCILE_AGE_MIN`). Re-running it is safe — the filed bead itself is the idempotency key. `sable-orchestration-install` stages (never activates) a host timer — a systemd `--user` unit plus a cron fallback line — under `~/.claude/sable/reconcile-timer/` (SABLE-jfg6.5) so this sweep runs on a schedule instead of depending on someone remembering to invoke it by hand. **Staged is not scheduled** (SABLE-5xz68): the install used to print a multi-command activation recipe for a human to run, nobody ran it, and the units sat on disk for months while the floor had no pane-independent leg at all — the log the cron line redirects to had never been created. Activation is therefore ONE self-verifying command, `sable-reconcile-timer --install-schedule`, and `--check-schedule` re-asks the running system (`systemctl --user is-active/cat`, `crontab -l`) at any time. Both fail loudly in two directions, because the second failure is the dangerous one: nothing scheduled, **or** something scheduled that sweeps a different repo — a timer firing on a cadence against the wrong fleet looks protected while protecting nothing. The swept repos are a parameter (`SABLE_RECONCILE_TARGET_REPO=<repo>[:<repo>...]`) and one firing sweeps every named fleet, since this host runs more than one and a failure on one must not skip the rest.
 
 ---
 

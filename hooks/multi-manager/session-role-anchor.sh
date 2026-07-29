@@ -21,18 +21,39 @@ set -euo pipefail
 # shares the same identity env; stand down unconditionally when it is set.
 [ -n "${SABLE_WORKER_PANE:-}" ] && exit 0
 
-# Manager identity must be set explicitly via launch alias
-[ -z "${CLAUDE_AGENT_NAME:-}" ] && exit 0
-[ "${CLAUDE_AGENT_ROLE:-}" != "manager" ] && exit 0
+# Manager identity must be set explicitly via launch alias. Provider-neutral
+# names win; Claude aliases keep existing installations compatible.
+ROLE_NAME="${SABLE_AGENT_NAME:-${CLAUDE_AGENT_NAME:-}}"
+ROLE_KIND="${SABLE_AGENT_ROLE:-${CLAUDE_AGENT_ROLE:-}}"
+[ -z "$ROLE_NAME" ] && exit 0
+[ "$ROLE_KIND" != "manager" ] && exit 0
+export ROLE_NAME
 
 # Resolve the role PROJECT-FIRST (a project-scoped orchestration install lives in
 # ./.claude) then fall back to the user-level install (~/.claude).
+_PROJECT_CAND="$PWD/.claude/sable/roles/${ROLE_NAME}.md"
+_USER_CAND="$HOME/.claude/sable/roles/${ROLE_NAME}.md"
 ROLE_FILE=""
-for _cand in "$PWD/.claude/sable/roles/${CLAUDE_AGENT_NAME}.md" \
-             "$HOME/.claude/sable/roles/${CLAUDE_AGENT_NAME}.md"; do
+for _cand in "$_PROJECT_CAND" "$_USER_CAND"; do
     if [ -f "$_cand" ]; then ROLE_FILE="$_cand"; break; fi
 done
 [ -z "$ROLE_FILE" ] && exit 0
+
+# SABLE-thx70: LOUD ON SHADOWING. Project-first precedence is a supported
+# feature (the comment above), but a stale project-local copy silently
+# outranking a freshly-edited user-level one, forever, with no event, is not
+# -- it defeated six days of role-card edits fleet-wide before anyone noticed
+# (measured on this bead's own optimus.md: 6 bead ids present ONLY in the
+# user-level copy, never read). Precedence is UNCHANGED here; this only makes
+# the disagreement visible. Fires ONLY when both candidates exist AND differ
+# in content -- identical content, or only one candidate present, is the
+# ordinary case and must stay silent or every boot would warn.
+if [ -f "$_PROJECT_CAND" ] && [ -f "$_USER_CAND" ] && ! cmp -s "$_PROJECT_CAND" "$_USER_CAND"; then
+    _proj_mtime=$(stat -c '%y' "$_PROJECT_CAND" 2>/dev/null || stat -f '%Sm' "$_PROJECT_CAND" 2>/dev/null || echo unknown)
+    _user_mtime=$(stat -c '%y' "$_USER_CAND" 2>/dev/null || stat -f '%Sm' "$_USER_CAND" 2>/dev/null || echo unknown)
+    printf 'SABLE-ROLE-CARD-SHADOWED: role card for %s differs between the project-local and user-level installs. Precedence is unchanged -- the project-local copy WINS -- but the user-level copy is being silently ignored:\n  WINNER   (project-local): %s (mtime: %s)\n  SHADOWED (user-level):    %s (mtime: %s)\nIf the user-level edit was intentional, it will never be read while the project-local copy exists.\n' \
+        "$ROLE_NAME" "$_PROJECT_CAND" "$_proj_mtime" "$_USER_CAND" "$_user_mtime" >&2
+fi
 
 ROLE_CONTENT=$(cat "$ROLE_FILE")
 
@@ -51,6 +72,7 @@ ROLE_CONTENT=$(cat "$ROLE_FILE")
 # each role card.
 LIVE_MODE=""
 LIVE_CONTRACTS=""
+LIVE_MODE_CORRUPT=""
 _lmp="$(dirname "${BASH_SOURCE[0]:-$0}")/lib-mode-path.sh"
 if [ -f "$_lmp" ]; then
     # shellcheck source=lib-mode-path.sh
@@ -66,10 +88,13 @@ if [ -n "${_mode_state:-}" ] && [ -f "$_mode_state" ]; then
 import json, os
 try:
     d = json.load(open(os.environ["STATE"]))
+    if not isinstance(d, dict):
+        raise ValueError("state root is not an object")
+    m = d.get("mode", "")
+    if m not in ("planning", "execution"):
+        raise ValueError("invalid mode")
 except Exception:
-    raise SystemExit(0)
-m = d.get("mode", "")
-if not m:
+    print("__SABLE_STATE_CORRUPT__")
     raise SystemExit(0)
 line = m
 sub = d.get("substage")
@@ -80,6 +105,10 @@ if since:
     line += " (since " + since + ")"
 print(line)
 ' 2>/dev/null || true)"
+    if [ "$LIVE_MODE" = "__SABLE_STATE_CORRUPT__" ]; then
+        LIVE_MODE=""
+        LIVE_MODE_CORRUPT="1"
+    fi
 fi
 # The contracts surface is colocated with the mode-state file; SABLE_ACTIVE_CONTRACTS
 # overrides the file directly (parallel to SABLE_MODE_STATE for mode-state).
@@ -94,11 +123,12 @@ if [ -n "${_contracts_file:-}" ] && [ -s "$_contracts_file" ]; then
     LIVE_CONTRACTS="$(cat "$_contracts_file" 2>/dev/null || true)"
 fi
 
-ROLE_CONTENT="$ROLE_CONTENT" LIVE_MODE="$LIVE_MODE" LIVE_CONTRACTS="$LIVE_CONTRACTS" python3 -c "
+ROLE_CONTENT="$ROLE_CONTENT" LIVE_MODE="$LIVE_MODE" LIVE_MODE_CORRUPT="$LIVE_MODE_CORRUPT" LIVE_CONTRACTS="$LIVE_CONTRACTS" python3 -c "
 import json, os, sys
 content = os.environ.get('ROLE_CONTENT', '')
-name = os.environ.get('CLAUDE_AGENT_NAME', '').upper()
+name = os.environ.get('ROLE_NAME', '').upper()
 live_mode = os.environ.get('LIVE_MODE', '').strip()
+live_mode_corrupt = os.environ.get('LIVE_MODE_CORRUPT', '') == '1'
 live_contracts = os.environ.get('LIVE_CONTRACTS', '').strip()
 
 # Detect which event fired us (SessionStart or PreCompact) so we emit the
@@ -127,7 +157,7 @@ identity = (
 
 # Only append the live-protocol block when there IS live state on disk, so a
 # non-orchestration manager session stays byte-identical to the legacy injection.
-if live_mode or live_contracts:
+if live_mode or live_mode_corrupt or live_contracts:
     parts = [
         '',
         '',
@@ -141,6 +171,11 @@ if live_mode or live_contracts:
     ]
     if live_mode:
         parts.append('Orchestration mode: ' + live_mode)
+        parts.append('')
+    if live_mode_corrupt:
+        parts.append('Orchestration mode: CORRUPT STATE — authorization is unavailable.')
+        parts.append('Do not dispatch or execute. Diagnose with  sable-mode show  and recover')
+        parts.append('explicitly with  sable-mode clear  or a new approved mode transition.')
         parts.append('')
     if live_contracts:
         parts.append('Active contracts:')
