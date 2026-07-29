@@ -39,7 +39,7 @@ trap cleanup EXIT
 trap on_signal HUP INT TERM
 
 run_python_lane() {
-  "$PYTHON_BIN" -m pytest bin/ -q -p no:cacheprovider
+  "$PYTHON_BIN" -m pytest bin/ -q -rs -p no:cacheprovider --sable-report-skip-set
 }
 
 run_shell_lane() {

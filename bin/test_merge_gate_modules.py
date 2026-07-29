@@ -359,7 +359,10 @@ def test_ci_verify_runs_the_full_python_suite_exactly_once():
     workflow = _CI_VERIFY.read_text()
     runner = _SEALED_VERIFY.read_text()
     runner_invocation = "bash .github/ci/run-sealed-verification.sh"
-    invocation = " -m pytest bin/ -q -p no:cacheprovider"
+    invocation = (
+        " -m pytest bin/ -q -rs -p no:cacheprovider "
+        "--sable-report-skip-set"
+    )
     assert workflow.count(runner_invocation) == 1, \
         "ci-verify must delegate its verdict to one sealed-verification runner"
     assert runner.count(invocation) == 1, \

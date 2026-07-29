@@ -122,7 +122,11 @@ jobs:
           git config --global init.defaultBranch master
 
       - name: pytest — full bin/ suite
-        run: python -m pytest bin/ -q -p no:cacheprovider
+        # Actions runners are ephemeral, so this run has no prior local
+        # baseline to diff. The SABLE reporter still names every skipped
+        # node; cross-run ADDED/REMOVED comparison is available to persistent
+        # manager checkouts, not across these disposable workflow machines.
+        run: python -m pytest bin/ -q -rs -p no:cacheprovider --sable-report-skip-set
 
       - name: Test-load declarations (SABLE-ssu6v — nested runners are explicit)
         run: python bin/columbo-cost-prefilter.py --check-load-declarations

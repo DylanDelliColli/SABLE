@@ -99,8 +99,10 @@ bin/sable-dev-check --base origin/tmux-only
 bin/sable-dev-check --base origin/tmux-only --dry-run
 
 # Full Python suite (unit + integration; bd/dolt-dependent tests self-skip
-# when those tools are absent — see ci-verify.yml):
-python -m pytest bin/ -q -p no:cacheprovider
+# when those tools are absent — see ci-verify.yml). -rs reports reasons;
+# the SABLE reporter names every skipped node and the ADDED/REMOVED set since
+# the previous successful full run:
+python -m pytest bin/ -q -rs -p no:cacheprovider --sable-report-skip-set
 
 # Shell test suites (classification is fail-closed; --run executes the
 # allowlisted suites; see .github/ci/shell-run-set.sh header for the
@@ -110,7 +112,7 @@ python bin/columbo-cost-prefilter.py --check-load-declarations
 bash .github/ci/shell-run-set.sh --run
 
 # Reproducible cost reports from the same authoritative executions:
-python -m pytest bin/ -q -p no:cacheprovider \
+python -m pytest bin/ -q -rs -p no:cacheprovider --sable-report-skip-set \
   --sable-test-cost-report=/tmp/sable-python-cost.json
 bash .github/ci/shell-run-set.sh --profile /tmp/sable-shell-cost.tsv
 

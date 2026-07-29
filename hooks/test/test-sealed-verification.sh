@@ -91,7 +91,7 @@ else
 fi
 
 if [ "$(cat "$GREEN_BARRIER/python.args")" = \
-     "-m pytest bin/ -q -p no:cacheprovider" ] && \
+     "-m pytest bin/ -q -rs -p no:cacheprovider --sable-report-skip-set" ] && \
    [ "$(cat "$GREEN_BARRIER/shell.args")" = "--run" ] && \
    [ -f "$GREEN_BARRIER/static.args" ] && \
    [ -z "$(cat "$GREEN_BARRIER/static.args")" ]; then
