@@ -5,6 +5,8 @@ Pure logic + an injected `collector` seam standing in for the real
 pytest-testmon / pytest-impact collect-only subprocess calls (those are
 exercised for real, with no mocking, in test_tier_selection_integration.py).
 """
+import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -218,6 +220,50 @@ def test_classify_cache_warm_outcome_rejects_partial_signature_match():
     # testmon_core.py alone (too broad; could mask an unrelated testmon bug).
     output = "231 passed in 5.00s\nINTERNALERROR> some other testmon_core.py failure\n"
     assert ts.classify_cache_warm_outcome(1, output) is False
+
+
+# --- run_cache_warm signal diagnostics (SABLE-rum46) -------------------------
+
+def test_run_cache_warm_names_the_signal_when_the_child_is_killed(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        ts.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0],
+            returncode=-signal.SIGTERM,
+            stdout="",
+            stderr="",
+        ),
+    )
+
+    rc = ts.run_cache_warm(tmp_path)
+    captured = capsys.readouterr()
+
+    assert rc == 128 + signal.SIGTERM
+    assert "killed by signal SIGTERM (15)" in captured.err
+    assert "test failure" not in captured.err.lower()
+
+
+def test_run_cache_warm_does_not_relabel_an_ordinary_failure_as_a_signal(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        ts.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0],
+            returncode=3,
+            stdout="ordinary pytest failure\n",
+            stderr="",
+        ),
+    )
+
+    rc = ts.run_cache_warm(tmp_path)
+    captured = capsys.readouterr()
+
+    assert rc == 3
+    assert "signal" not in captured.err.lower()
+    assert "ordinary pytest failure" in captured.out
 
 
 # --- build_diff_cover_scope_plan (SABLE-hauwa) --------------------------------

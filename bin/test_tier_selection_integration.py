@@ -9,9 +9,13 @@ this interpreter.
 """
 # sable-test-load: nested-runner -- defining E2E exercises real pytest-testmon selection and fallback
 import importlib.util
+import os
+import signal
+import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from textwrap import dedent
 
@@ -302,6 +306,68 @@ def test_cache_warm_tolerates_known_crash_on_minimal_fixture(extensionless_repo,
     for marker in _EXTENSIONLESS_CRASH_MARKERS:
         assert marker in output
     assert "KNOWN pytest-testmon extensionless-file crash tolerated" in output
+
+
+def test_real_cache_warm_cli_reports_signal_death(tmp_path):
+    """The real CLI must translate a killed nested pytest into a legible
+    signal-specific failure, not Python's opaque negative-SystemExit status."""
+    repo = tmp_path / "repo"
+    bin_dir = repo / "bin"
+    bin_dir.mkdir(parents=True)
+    shutil.copy2(Path(ts.__file__), bin_dir / "tier_selection.py")
+    child_pid_file = repo / "pytest-child.pid"
+    (bin_dir / "test_slow.py").write_text(
+        dedent(
+            """\
+            import os
+            import time
+            from pathlib import Path
+
+            def test_slow():
+                Path(__file__).resolve().parents[1].joinpath(
+                    "pytest-child.pid"
+                ).write_text(str(os.getpid()))
+                time.sleep(30)
+            """
+        )
+    )
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "baseline")
+
+    proc = subprocess.Popen(
+        [sys.executable, str(bin_dir / "tier_selection.py"), "--cache-warm"],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 15
+        while not child_pid_file.exists() and time.monotonic() < deadline:
+            if proc.poll() is not None:
+                stdout, stderr = proc.communicate()
+                pytest.fail(
+                    "cache-warm wrapper exited before its nested pytest ran:\n"
+                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                )
+            time.sleep(0.02)
+
+        assert child_pid_file.exists(), (
+            "nested pytest never reached the deliberately slow test")
+        child_pid = int(child_pid_file.read_text())
+        os.kill(child_pid, signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+    assert proc.returncode == 128 + signal.SIGTERM, (stdout, stderr)
+    assert "killed by signal SIGTERM (15)" in stderr
+    assert "test failure" not in stderr.lower()
 
 
 def test_collect_only_testmon_is_clean_on_the_same_fixture(extensionless_repo):

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -469,8 +470,11 @@ def classify_cache_warm_outcome(returncode: int, output: str) -> bool:
 def run_cache_warm(repo_root: Path) -> int:
     """Execute the opt-in full-suite local cache warm and classify its result.
 
-    Returns 0 for a real pass or a tolerated known crash, and the real
-    returncode for anything else.
+    Returns 0 for a real pass or a tolerated known crash, the real positive
+    returncode for an ordinary failure, and 128+signal for a signal-killed
+    child. The latter keeps the CLI failure status conventional and legible
+    instead of feeding a negative SystemExit through Python's modulo-256
+    mapping (SIGTERM -15 would otherwise surface as an opaque 241).
 
     The behavior is integration-tested against a minimal crash-capable
     fixture; ordinary test collection never recursively runs this repo's
@@ -496,6 +500,20 @@ def run_cache_warm(repo_root: Path) -> int:
                 file=sys.stderr,
             )
         return 0
+    if result.returncode < 0:
+        signum = -result.returncode
+        try:
+            signal_name = signal.Signals(signum).name
+        except ValueError:
+            signal_name = "UNKNOWN"
+        normalized_returncode = 128 + signum
+        print(
+            "tier_selection: cache-warm child was killed by signal "
+            f"{signal_name} ({signum}); cache warm failed "
+            f"(exit {normalized_returncode})",
+            file=sys.stderr,
+        )
+        return normalized_returncode
     return result.returncode
 
 
