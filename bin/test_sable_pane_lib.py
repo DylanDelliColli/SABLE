@@ -285,7 +285,7 @@ def test_tmux_session_metadata_helpers_build_exact_targets():
             "show-options",
             "-v",
             "-t",
-            "=sable-repo",
+            "=sable-repo:",
             "@sable_repo",
         ],
     ]

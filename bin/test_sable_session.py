@@ -36,16 +36,18 @@ class FakeTmux:
         verb = args[0]
         target = args[args.index("-t") + 1] if "-t" in args else None
         if verb == "has-session":
-            rc = 0 if self._resolve_session_target(target) is not None else 1
+            rc = 0 if self._resolve_session_target(
+                target, target_kind="session"
+            ) is not None else 1
             return subprocess.CompletedProcess(cmd, rc, "", "")
         if verb == "show-options":
-            session = self._resolve_session_target(target)
+            session = self._resolve_session_target(target, target_kind="pane")
             val = self.repos.get(session)
             if val is None:
                 return subprocess.CompletedProcess(cmd, 1, "", "")
             return subprocess.CompletedProcess(cmd, 0, val + "\n", "")
         if verb == "list-panes":
-            session = self._resolve_session_target(target)
+            session = self._resolve_session_target(target, target_kind="window")
             if session is None:
                 return subprocess.CompletedProcess(cmd, 1, "", "")
             paths = self.pane_paths.get(session, [])
@@ -57,12 +59,19 @@ class FakeTmux:
             return subprocess.CompletedProcess(cmd, 0, val + "\n", "")
         raise AssertionError(f"unexpected tmux verb {verb}")
 
-    def _resolve_session_target(self, target):
-        """Mirror tmux session target resolution for session-scoped verbs."""
+    def _resolve_session_target(self, target, *, target_kind):
+        """Mirror the verb-specific tmux grammar around exact session targets."""
         if target is None:
             return None
         if target.startswith("="):
-            exact = target[1:]
+            if target_kind == "session":
+                if target.endswith(":"):
+                    return None
+                exact = target[1:]
+            else:
+                if not target.endswith(":"):
+                    return None
+                exact = target[1:-1]
             return exact if exact in self.sessions else None
         if target in self.sessions:
             return target
@@ -126,15 +135,38 @@ def test_fake_tmux_bare_target_falls_back_but_exact_anchor_does_not():
     fake = FakeTmux(sessions={"sable-alpha"}, repos={"sable-alpha": OTHER})
 
     bare = fake(["tmux", "show-options", "-v", "-t", "sable", "@sable_repo"])
-    exact = fake(["tmux", "show-options", "-v", "-t", "=sable", "@sable_repo"])
+    exact = fake(["tmux", "show-options", "-v", "-t", "=sable:", "@sable_repo"])
 
     assert bare.stdout.strip() == OTHER
     assert exact.returncode != 0
 
 
+def test_fake_tmux_rejects_exact_target_grammar_for_the_wrong_verb():
+    fake = FakeTmux(sessions={"sable"}, repos={"sable": ROOT})
+
+    session_with_window = fake(["tmux", "has-session", "-t", "=sable:"])
+    pane_without_window = fake(
+        ["tmux", "show-options", "-v", "-t", "=sable", "@sable_repo"]
+    )
+    window_without_component = fake(
+        ["tmux", "list-panes", "-s", "-t", "=sable", "-F", "#{pane_current_path}"]
+    )
+
+    assert session_with_window.returncode != 0
+    assert pane_without_window.returncode != 0
+    assert window_without_component.returncode != 0
+
+
 def test_session_repo_reads_exact_session():
     fake = FakeTmux(sessions={"sable"}, repos={"sable": ROOT})
     assert lib.session_repo(["tmux"], "sable", run=fake) == ROOT
+
+
+def test_session_repo_uses_exact_session_plus_window_target():
+    fake = FakeTmux(sessions={"sable"}, repos={"sable": ROOT})
+    lib.session_repo(["tmux"], "sable", run=fake)
+    [call] = fake.calls
+    assert call[call.index("-t") + 1] == "=sable:"
 
 
 def test_session_repo_does_not_read_prefix_matched_session():
@@ -145,6 +177,13 @@ def test_session_repo_does_not_read_prefix_matched_session():
 def test_panes_under_root_reads_exact_session():
     fake = FakeTmux(sessions={"sable"}, pane_paths={"sable": [ROOT + "/worker"]})
     assert lib._panes_under_root(["tmux"], "sable", ROOT, run=fake) is True
+
+
+def test_panes_under_root_uses_exact_session_plus_window_target():
+    fake = FakeTmux(sessions={"sable"}, pane_paths={"sable": [ROOT + "/worker"]})
+    lib._panes_under_root(["tmux"], "sable", ROOT, run=fake)
+    [call] = fake.calls
+    assert call[call.index("-t") + 1] == "=sable:"
 
 
 def test_panes_under_root_does_not_read_prefix_matched_session():
