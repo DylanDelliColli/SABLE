@@ -73,6 +73,42 @@ else
   fail "idempotent on re-run"
 fi
 
+# ---- SABLE-5hwa: prune retired repo-owned dangling symlinks ----
+# A retired tool disappears from TOOLS, so the ordinary install loop never
+# visits its old destination. Scope cleanup to links that point into THIS
+# checkout's bin/: a broken user-managed sable-* link elsewhere is not ours.
+D_RETIRED=$(mktemp -d)
+RETIRED_LINK="$D_RETIRED/sable-retired-fixture"
+UNRELATED_LINK="$D_RETIRED/sable-private-fixture"
+REGULAR_FILE="$D_RETIRED/sable-retired-regular"
+ln -s "$REPO_BIN/sable-retired-fixture" "$RETIRED_LINK"
+ln -s "/opt/user-tools/sable-private-fixture" "$UNRELATED_LINK"
+printf 'user-owned\n' > "$REGULAR_FILE"
+
+DRY_RETIRED=$(bash "$INSTALL" --dir "$D_RETIRED" --dry-run 2>&1 1>/dev/null) || true
+if [ -L "$RETIRED_LINK" ] \
+  && printf '%s' "$DRY_RETIRED" | grep -q "would remove retired repo-owned symlink: $RETIRED_LINK"; then
+  pass "retired-link cleanup dry-run reports without writing"
+else
+  fail "retired-link cleanup dry-run reports without writing" \
+    "link=$(ls -ld "$RETIRED_LINK" 2>/dev/null) stderr=[$DRY_RETIRED]"
+fi
+
+RETIRED_ERR=$(bash "$INSTALL" --dir "$D_RETIRED" 2>&1 1>/dev/null) || true
+if [ ! -L "$RETIRED_LINK" ] && [ ! -e "$RETIRED_LINK" ] \
+  && printf '%s' "$RETIRED_ERR" | grep -q "removed retired repo-owned symlink: $RETIRED_LINK"; then
+  pass "plain install removes a retired repo-owned dangling symlink"
+else
+  fail "plain install removes a retired repo-owned dangling symlink" \
+    "link=$(ls -ld "$RETIRED_LINK" 2>/dev/null) stderr=[$RETIRED_ERR]"
+fi
+
+if [ -L "$UNRELATED_LINK" ] && [ -f "$REGULAR_FILE" ]; then
+  pass "retired-link cleanup preserves unrelated dangling links and regular files"
+else
+  fail "retired-link cleanup preserves unrelated dangling links and regular files"
+fi
+
 # ---- UNIT: target dir already on PATH -> no PATH warning ----
 D_ONPATH=$(mktemp -d)
 ERR_ON=$(PATH="$D_ONPATH:$PATH" bash "$INSTALL" --dir "$D_ONPATH" 2>&1 1>/dev/null) || true

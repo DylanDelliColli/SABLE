@@ -335,6 +335,25 @@ else
   mkdir -p "$DEST" || { note "sable-bin-install: cannot create $DEST"; exit 1; }
 fi
 
+# Retired entrypoints fall out of TOOLS, so the install loop below can no
+# longer visit (and replace) their old destination links. Remove only dangling
+# links whose immediate target is inside THIS checkout's bin/: that is the
+# ownership marker written by symlink mode. Broken links into a user's own
+# tool directory, snapshot pins, and regular-file pins are deliberately left
+# alone (SABLE-5hwa).
+for stale_link in "$DEST"/sable "$DEST"/sable-*; do
+  [ -L "$stale_link" ] || continue
+  [ -e "$stale_link" ] && continue
+  stale_target="$(readlink "$stale_link" 2>/dev/null || true)"
+  case "$stale_target" in "$BIN_DIR"/*) ;; *) continue ;; esac
+  if [ "$DRY_RUN" = "1" ]; then
+    note "  would remove retired repo-owned symlink: $stale_link"
+  else
+    rm -f -- "$stale_link"
+    note "sable-bin-install: removed retired repo-owned symlink: $stale_link"
+  fi
+done
+
 # Is $1 (an existing symlink) a deliberate PIN because it resolves OUTSIDE
 # $BIN_DIR (e.g. into a ~/.local/lib/sable-<sha>/ snapshot, SABLE-9boz4) —
 # as opposed to an ordinary managed symlink into the live repo? Empty/failed
