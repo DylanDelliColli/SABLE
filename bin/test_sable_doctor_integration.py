@@ -37,7 +37,7 @@ def run_install(home_dir: Path):
     assert result.returncode == 0, f"install.sh failed:\n{result.stdout}\n{result.stderr}"
 
 
-def run_doctor(claude_dir: Path, *extra_args, env=None, bin_dir=None):
+def run_doctor(claude_dir: Path, *extra_args, env=None, bin_dir=None, cwd=None):
     # bin_dir defaults to the fixture's OWN ~/.local/bin (claude_dir's sibling
     # under the same redirected HOME run_install used) — never the real
     # machine's ~/.local/bin. Without this, sable-doctor's --bin-dir default
@@ -52,6 +52,7 @@ def run_doctor(claude_dir: Path, *extra_args, env=None, bin_dir=None):
          "--bin-dir", str(bin_dir), *extra_args],
         capture_output=True, text=True, timeout=30,
         env=doctor_env,
+        cwd=cwd,
     )
 
 
@@ -125,6 +126,34 @@ def test_fresh_install_is_clean(installed_claude_dir):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "clean" in result.stdout
     assert "DRIFT" not in result.stdout
+
+
+def test_project_local_install_present_is_explicitly_outside_user_scope(
+        installed_claude_dir, tmp_path):
+    project = tmp_path / "consumer-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    project_skill = project / ".claude" / "skills" / "columbo" / "SKILL.md"
+    project_skill.parent.mkdir(parents=True)
+    project_skill.write_text("stale project-local skill\n")
+    assert project_skill.read_bytes() != (
+        REPO / "skills" / "columbo" / "SKILL.md"
+    ).read_bytes()
+
+    result = run_doctor(installed_claude_dir, cwd=project)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        f"manifest install root: {installed_claude_dir.resolve()}"
+        in result.stdout
+    )
+    assert "no other .claude install roots are in the manifest." in result.stdout
+    assert (
+        f"Shadow-role roots: "
+        f"{(project / '.claude' / 'sable' / 'roles').resolve()}"
+        in result.stdout
+    )
+    assert f"manifest install root: {(project / '.claude').resolve()}" not in result.stdout
 
 
 def test_fresh_install_json_reports_clean_true(installed_claude_dir):

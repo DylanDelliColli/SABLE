@@ -543,6 +543,23 @@ def test_main_returns_zero_and_prints_clean_when_matching(tmp_path, capsys):
     assert "clean" in out
 
 
+def test_clean_verdict_names_the_roots_compared(tmp_path, capsys):
+    repo, claude_dir = make_repo(tmp_path)
+    bin_dir = tmp_path / "installed-bin"
+
+    rc = doctor.main([
+        "--repo", str(repo),
+        "--claude-dir", str(claude_dir),
+        "--bin-dir", str(bin_dir),
+    ])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert f"manifest install root: {claude_dir.resolve()}" in out
+    assert f"pinned-bin root: {bin_dir.resolve()}" in out
+    assert "no other .claude install roots are in the manifest." in out
+
+
 def test_main_returns_one_and_reports_drift(tmp_path, capsys):
     def mutate(repo, claude_dir):
         (claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
@@ -554,6 +571,27 @@ def test_main_returns_one_and_reports_drift(tmp_path, capsys):
     assert "DRIFT DETECTED" in out
     assert "tdd-gate.sh" in out
     assert "bash install.sh" in out
+
+
+def test_drift_verdict_also_names_the_roots(tmp_path, capsys):
+    def mutate(repo, claude_dir):
+        (claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
+
+    repo, claude_dir = make_repo(tmp_path, mutate=mutate)
+    bin_dir = tmp_path / "installed-bin"
+
+    rc = doctor.main([
+        "--repo", str(repo),
+        "--claude-dir", str(claude_dir),
+        "--bin-dir", str(bin_dir),
+    ])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "DRIFT DETECTED" in out
+    assert f"manifest install root: {claude_dir.resolve()}" in out
+    assert f"pinned-bin root: {bin_dir.resolve()}" in out
+    assert "no other .claude install roots are in the manifest." in out
 
 
 def test_main_json_output_is_valid_and_matches_status(tmp_path, capsys):
@@ -569,6 +607,42 @@ def test_main_json_output_is_valid_and_matches_status(tmp_path, capsys):
     missing = [r for r in payload["results"] if r["status"] == "missing"]
     assert len(missing) == 1
     assert missing[0]["category"] == "agent definitions"
+
+
+def test_main_json_names_the_roots_compared(tmp_path, monkeypatch, capsys):
+    repo, claude_dir = make_repo(tmp_path)
+    bin_dir = tmp_path / "installed-bin"
+    cwd = tmp_path / "consumer"
+    home = tmp_path / "home"
+    cwd.mkdir()
+    home.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("HOME", str(home))
+
+    rc = doctor.main([
+        "--repo", str(repo),
+        "--claude-dir", str(claude_dir),
+        "--bin-dir", str(bin_dir),
+        "--json",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["scope"] == {
+        "manifest": {
+            "install_root": str(claude_dir.resolve()),
+            "pinned_bin_root": str(bin_dir.resolve()),
+            "other_claude_install_roots_included": False,
+        },
+        "shadowed_role_cards": {
+            "project_roles_root": str(
+                (cwd / ".claude" / "sable" / "roles").resolve()
+            ),
+            "user_roles_root": str(
+                (home / ".claude" / "sable" / "roles").resolve()
+            ),
+        },
+    }
 
 
 def test_main_quiet_suppresses_output_when_clean(tmp_path, capsys):
@@ -592,6 +666,29 @@ def test_main_quiet_prints_one_line_to_stderr_when_drifted(tmp_path, capsys):
     assert "drifted" in captured.err
     assert "ordinary files: 1" in captured.err
     assert "bash install.sh" not in captured.err
+
+
+def test_scope_line_survives_the_sessionstart_summary_path(tmp_path, capsys):
+    def mutate(repo, claude_dir):
+        (claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
+
+    repo, claude_dir = make_repo(tmp_path, mutate=mutate)
+    bin_dir = tmp_path / "installed-bin"
+
+    rc = doctor.main([
+        "--repo", str(repo),
+        "--claude-dir", str(claude_dir),
+        "--bin-dir", str(bin_dir),
+        "--quiet",
+    ])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert captured.out == ""
+    assert f"manifest install root: {claude_dir.resolve()}" in captured.err
+    assert f"pinned-bin root: {bin_dir.resolve()}" in captured.err
+    assert "no other .claude install roots are in the manifest." in captured.err
+    assert len(captured.err.splitlines()) == 1
 
 
 # --- worker cap line (SABLE-61dy) ----------------------------------------------
@@ -1699,6 +1796,14 @@ def test_main_json_includes_shadowed_role_cards_and_flips_clean_false(tmp_path, 
     assert rc == 1
     assert payload["clean"] is False
     assert payload["shadowed_role_cards"][0]["role"] == "chuck"
+    assert payload["scope"]["shadowed_role_cards"] == {
+        "project_roles_root": str(
+            (cwd / ".claude" / "sable" / "roles").resolve()
+        ),
+        "user_roles_root": str(
+            (home / ".claude" / "sable" / "roles").resolve()
+        ),
+    }
 
 
 def test_main_quiet_mode_reports_shadowed_role_card(tmp_path, monkeypatch, capsys):
@@ -1716,6 +1821,9 @@ def test_main_quiet_mode_reports_shadowed_role_card(tmp_path, monkeypatch, capsy
     assert rc == 1
     assert "shadowed" in captured.err.lower()
     assert "SABLE-thx70" in captured.err
+    assert f"Shadow-role roots: {(cwd / '.claude' / 'sable' / 'roles').resolve()}" in captured.err
+    assert str((home / ".claude" / "sable" / "roles").resolve()) in captured.err
+    assert len(captured.err.splitlines()) == 1
 
 
 def test_main_quiet_mode_clean_when_no_shadow_present(tmp_path, monkeypatch, capsys):
