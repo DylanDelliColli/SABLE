@@ -105,30 +105,62 @@ done
 # untouched, prime block project-side, double-fire refusal + --force.
 # ===================================================================
 
-# claude_manifest DIR HOMEDIR — content-hash manifest of every file under DIR,
-# with HOMEDIR normalized to a placeholder so HOME-embedding files (settings.json)
-# hash deterministically across scratch HOMEs. Excludes .bak / *install-bak*.
+# claude_manifest DIR HOMEDIR REPODIR — content-hash manifest of every file
+# under DIR. HOMEDIR is normalized throughout; REPODIR is normalized only in
+# the two generated timer artifacts that intentionally embed it. This keeps
+# hashes deterministic across scratch HOMEs and checkout/worktree paths without
+# hiding an accidental source-path leak elsewhere. Excludes .bak / *install-bak*.
 # .sable-install-provenance (SABLE-78kxu) additionally gets its commit=/branch=/
 # timestamp= fields normalized: those are stamped from the CURRENT repo HEAD and
 # wall-clock time, so they vary every run/commit/worktree and would make the
 # golden baseline re-drift immediately after any regen (SABLE-z31s1).
 # MUST stay byte-identical to fixtures/regen: golden was captured with this exact fn.
 claude_manifest() {
-  local dir="$1" home="$2"
+  local dir="$1" home_dir="$2" repo_dir="$3"
   [ -d "$dir" ] || { printf '(no dir: %s)\n' "$dir"; return 0; }
   ( cd "$dir" && find . -type f ! -name '*.bak' ! -path '*install-bak*' | LC_ALL=C sort | while IFS= read -r f; do
       if [ "$f" = "./.sable-install-provenance" ]; then
-        h="$(sed -e "s@${home}@__HOME__@g" \
+        h="$(sed -e "s@${home_dir}@__HOME__@g" \
                   -e 's/^commit=.*/commit=__COMMIT__/' \
                   -e 's/^branch=.*/branch=__BRANCH__/' \
                   -e 's/^timestamp=.*/timestamp=__TIMESTAMP__/' "$f" | sha256sum | cut -d' ' -f1)"
+      elif [ "$f" = "./sable/reconcile-timer/sable-reconcile-timer.service" ] ||
+           [ "$f" = "./sable/reconcile-timer/sable-reconcile-timer.cron" ]; then
+        # These two generated artifacts intentionally bind to the source
+        # checkout. Normalize only this known volatile field: a repo path
+        # appearing in any other installed file remains visible as drift.
+        h="$(sed -e "s@${repo_dir}@__REPO__@g" \
+                  -e "s@${home_dir}@__HOME__@g" "$f" | sha256sum | cut -d' ' -f1)"
       else
-        h="$(sed "s@${home}@__HOME__@g" "$f" | sha256sum | cut -d' ' -f1)"
+        h="$(sed -e "s@${home_dir}@__HOME__@g" "$f" | sha256sum | cut -d' ' -f1)"
       fi
       printf '%s  %s\n' "$h" "$f"
     done )
 }
 mkrepo(){ git init "$1" >/dev/null 2>&1; }  # throwaway git repo (git-common-dir resolvable)
+
+# A golden regenerated in a clone/worktree must be valid in the canonical
+# checkout too. The raw artifacts deliberately differ (positive control);
+# only the normalized manifests may agree (SABLE-clla4).
+TM1="$(mktemp -d)"; TM2="$(mktemp -d)"
+TM1_TIMER="$TM1/install/sable/reconcile-timer/sable-reconcile-timer.service"
+TM2_TIMER="$TM2/install/sable/reconcile-timer/sable-reconcile-timer.service"
+mkdir -p "$(dirname "$TM1_TIMER")" "$(dirname "$TM2_TIMER")"
+printf 'ExecStart=%s/bin/sable-reconcile-handoffs --once\n' "$REPO" > "$TM1_TIMER"
+printf 'ExecStart=%s/bin/sable-reconcile-handoffs --once\n' "$TM2/source-repo" > "$TM2_TIMER"
+! cmp -s "$TM1_TIMER" "$TM2_TIMER" &&
+  pass "golden normalization control: source-path-bearing artifacts genuinely differ" ||
+  fail "golden normalization control: source-path-bearing artifacts genuinely differ"
+TM1_MANIFEST="$(claude_manifest "$TM1/install" "$TM1" "$REPO")"
+TM2_MANIFEST="$(claude_manifest "$TM2/install" "$TM2" "$TM2/source-repo")"
+[ "$TM1_MANIFEST" = "$TM2_MANIFEST" ] &&
+  pass "golden manifest normalizes the source checkout path" ||
+  fail "golden manifest normalizes the source checkout path"
+printf 'Environment=PLANTED_CONTENT_CHANGE=1\n' >> "$TM2_TIMER"
+[ "$TM1_MANIFEST" != "$(claude_manifest "$TM2/install" "$TM2" "$TM2/source-repo")" ] &&
+  pass "golden manifest still detects a real installed-content change" ||
+  fail "golden manifest still detects a real installed-content change"
+rm -rf "$TM1" "$TM2"
 
 # ---------- CRITICAL: --project leaves ~/.claude byte-identical ----------
 # Snapshot HOME/.claude ONLY (the ~/.local/bin CLI symlinks are by-design global,
@@ -138,9 +170,9 @@ printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"comma
 printf 'pre-existing user notes\n' > "$TH1/.claude/CLAUDE.md"
 printf 'keep me\n' > "$TH1/.claude/agents/keep.md"
 PROJ1="$(mktemp -d)"; mkrepo "$PROJ1"
-SNAP1="$(claude_manifest "$TH1/.claude" "$TH1")"
+SNAP1="$(claude_manifest "$TH1/.claude" "$TH1" "$REPO")"
 HOME="$TH1" bash "$INSTALL" --project="$PROJ1" --from-here --merge-settings >/tmp/ti-proj1.log 2>&1; rc1=$?
-SNAP2="$(claude_manifest "$TH1/.claude" "$TH1")"
+SNAP2="$(claude_manifest "$TH1/.claude" "$TH1" "$REPO")"
 [ "$rc1" = "0" ] && pass "project install runs (rc=0)" || fail "project install runs" "rc=$rc1 (see /tmp/ti-proj1.log)"
 present "$PROJ1/.claude/settings.json" "project install actually populated the project (control)"
 [ "$SNAP1" = "$SNAP2" ] && pass "test_project_install_leaves_home_claude_snapshot_byte_identical" || { fail "test_project_install_leaves_home_claude_snapshot_byte_identical" "HOME/.claude changed under --project"; diff <(printf '%s\n' "$SNAP1") <(printf '%s\n' "$SNAP2") | head -20; }
@@ -149,7 +181,7 @@ present "$PROJ1/.claude/settings.json" "project install actually populated the p
 GOLDEN="$REPO/hooks/test/fixtures/install-golden-manifest.txt"
 TG2="$(mktemp -d)"
 HOME="$TG2" bash "$INSTALL" --from-here >/tmp/ti-golden.log 2>&1
-ACT="$(claude_manifest "$TG2/.claude" "$TG2")"
+ACT="$(claude_manifest "$TG2/.claude" "$TG2" "$REPO")"
 if [ "${GOLDEN_REGEN:-0}" = "1" ]; then
   mkdir -p "$(dirname "$GOLDEN")"; printf '%s\n' "$ACT" > "$GOLDEN"
   pass "REGEN wrote golden ($(printf '%s\n' "$ACT" | grep -c .) files) — rerun without GOLDEN_REGEN to assert"
