@@ -461,8 +461,9 @@ There are exactly two operator remedies:
 
 An accepted declaration permits the dispatch and records reciprocal
 `serialize_with` metadata on both beads. That durable relation travels in the
-`for-chuck` handoff so Chuck can sequence the two merges instead of racing
-them. It is an explicit serialization decision, not a general overlap waiver.
+Chuck handoff payload (direct message or durable fallback) so Chuck can
+sequence the two merges instead of racing them. It is an explicit
+serialization decision, not a general overlap waiver.
 
 A footprint source that is present but names no readable path is a separate
 hard failure: the constraint could not be evaluated. The hook denies it, and
@@ -615,7 +616,8 @@ Every degraded decision prints the greppable token `SABLE-TREE-CLAIM-DEGRADED` t
 
 ### 7. Post-push Chuck notification
 
-A `PostToolUse:Bash` hook matching successful `git push` files a `for-chuck` bead:
+A `PostToolUse:Bash` hook matching successful `git push` sends Chuck a direct
+tmux message as the primary merge handoff:
 
 ```
 PR <url> ready for review
@@ -625,7 +627,11 @@ Overlap analysis:
   - bd-203 (optimus, in-progress): bar.ts
 ```
 
-Chuck's inbox injection picks this up immediately. Chuck has overlap context to sequence merges intelligently — hold this PR if a related PR is in flight, merge if independent.
+Only when direct delivery cannot be confirmed does the hook file the same
+payload as a durable `for-chuck` fallback bead. Bead absence is therefore the
+healthy expected path, not evidence of a missed handoff. Chuck has overlap
+context to sequence merges intelligently — hold this PR if a related PR is in
+flight, merge if independent.
 
 ### 7. Chuck's fix-vs-delegate threshold
 
@@ -706,13 +712,37 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | `pre-dispatch-model-check.sh` | PreToolUse:Agent | Enforce model ladder — bead `model:` label must match dispatch's model param, or prompt must include `Model override: <reason>` | Hard deny |
 | `edit-write-claim-reconciler.sh` | PreToolUse:Edit\|Write | Append modified file to bead claims | Side effect (bd update) |
 | `pre-push-rebase-test.sh` | PreToolUse:Bash matching `git push` | Force rebase + tests before push | Hard deny |
-| `post-push-merge-notify.sh` | PostToolUse:Bash matching `git push` | File `for-chuck` bead with overlap analysis (Chuck's own pushes are skipped) | Side effect (bd create) |
+| `post-push-merge-notify.sh` | PostToolUse:Bash matching `git push` | Notify Chuck directly with overlap analysis; file a durable `for-chuck` fallback only when direct delivery fails (Chuck's own pushes are skipped) | Side effect (tmux delivery; fallback bd create) |
 | `seat-sighting-gate.sh` | PostToolUse:Bash matching `bd create`, identity-gated on chuck | Mechanizes "capture is mandatory, priority is advisory" (SABLE-441vl): after a seat-filed bead lands, auto-labels it `seat-filed` and marks `metadata.priority_provisional=true` for a manager's later triage. Never denies — the seat's `bd create` is never refused | Side effect (bd update), never blocks |
 | `close-decay-sweep.sh` | PreToolUse:Bash matching `bd close` | Identifier-decay sweep (SABLE-x9vby): flag OPEN beads whose INSTRUCTIONS still name the bead id being retired, with the matching line | Inject context (never denies) |
 
 **Identifier decay (`close-decay-sweep.sh`)**: an instruction pinned to an identifier decays *silently* when that identifier is retired through normal, correct action — nothing fails, and the stale instruction still reads as satisfiable, so whoever follows it does something harmless and wrong. This hook is the retirement-time catch: at `bd close`, it sweeps open beads for instructional references to the closing id and prints them inline (`sable-identifier-decay` does the work; the same detector runs at the merge gate's branch-delete, where a branch NAME is the retiring identifier). It is deliberately not role-gated — workers close their own beads, so a manager-only guard would miss most closes. It never denies: fail-open on the decision, loud on the report (a sweep that could not run says `COULD NOT ASSESS` rather than printing the silence a clean sweep prints). **Known limit, shipped in the flag text itself**: it sees instructions that NAME a retired identifier, not ones invalidated because a code path stopped being reached (SABLE-3nymz). A detector whose limits are undocumented gets trusted past them.
 
-Every continuous-mode hook (everything except `session-role-anchor.sh`, `read-guard.sh`, and `notes-clobber-guard.sh`) hard-exits when `CLAUDE_AGENT_ROLE != "manager"`, so they no-op in Sherlock / Victor / Rudy / Columbo sessions. That's also untrue for `tree-claim.sh` (+ `tree-claim-impl.sh`) and `stash-worktree-guard.sh`: neither checks role at all, because the hazards they guard — a concurrent index write, a cross-worktree stash pop — exist regardless of which role holds the pane, so both run in every session type, Sherlock/Victor/Rudy/Columbo included. `worktree-placement-guard.sh` is likewise role-neutral: nesting a checkout is hazardous regardless of the caller's role. `control-trace.sh` is the same way, by design: it's a neutral observer meant to fire unconditionally (SABLE-jfg6.2), never gating on role. (The former poll-based `inbox-injection` hooks were deleted with the tmux-only cutover — live messaging is `sable-msg`; the durable `for-X` labels remain the fallback channel.)
+Role scope is deliberately per-hook; there is no catalog-wide
+"continuous-mode hooks are manager-only" rule. `session-role-anchor.sh` and
+`read-guard.sh` are manager-gated, not exceptions: the former exits unless the
+resolved role kind is `manager`, and the latter exits unless the shared identity
+resolver reports a manager. `pre-push-rebase-test.sh` explicitly denies worker
+subagent pushes before restricting its rebase/test phases to managers (warm-pane
+workers intentionally carry manager identity and self-push);
+`post-push-merge-notify.sh` is manager-gated, while `seat-sighting-gate.sh` is
+narrower still (Chuck only).
+
+By contrast, the neutral observer (`control-trace.sh`) and scripts whose
+hazards exist in every pane (`tree-claim.sh` + `tree-claim-impl.sh`,
+`stash-worktree-guard.sh`, `inline-body-guard.sh`, `notes-clobber-guard.sh`,
+`close-hold-guard.sh`, and `close-decay-sweep.sh`) intentionally impose no
+blanket manager gate when invoked. `worktree-placement-guard.sh` is likewise role-neutral.
+That says nothing about activation: notably, `control-trace.sh`,
+`close-hold-guard.sh`, and `close-decay-sweep.sh` are not registered in the
+default lifecycle settings. The registered Agent/Edit/Write matcher hooks are
+bounded by those matchers and their own per-hook logic; `mode-interlock.sh`
+additionally carries explicit producer restrictions. Read the hook's catalog
+row, registration state, and identity gate rather than inferring its scope from
+a blanket role rule. (The former
+poll-based `inbox-injection` hooks were deleted with the tmux-only cutover —
+live messaging is `sable-msg`; the durable `for-X` labels remain the fallback
+channel.)
 
 `pre-dispatch-refresh.sh` (automatic rebase-on-dispatch) was likewise retired — SABLE-o3xju de-wired it from the live `settings.json` (both the global install and this repo's project-local copy), and SABLE-mkj6k removed it durably from `templates/multi-manager/settings-snippet.json` so `install.sh` no longer re-arms it. The script file still exists under `hooks/multi-manager/` for reference but is not registered anywhere. Dispatch no longer auto-rebases the worker's checkout — workers rebase themselves (see the "Verify current state first" step and the self-push rebase step in `templates/worker-dispatch.md`).
 
