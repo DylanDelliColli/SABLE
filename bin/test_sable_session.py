@@ -36,26 +36,19 @@ class FakeTmux:
         verb = args[0]
         target = args[args.index("-t") + 1] if "-t" in args else None
         if verb == "has-session":
-            # Mirrors real tmux target resolution (confirmed live, SABLE-hvwk):
-            # a '=' prefix forces exact match; a bare name matches exactly if
-            # possible, else falls back to a prefix/fnmatch scan -- which is
-            # the hazard this bead exists to close (has-session -t sable
-            # exiting 0 just because 'sable-alpha' exists).
-            if target is not None and target.startswith("="):
-                rc = 0 if target[1:] in self.sessions else 1
-            elif target in self.sessions:
-                rc = 0
-            else:
-                prefix_matches = [s for s in self.sessions if s.startswith(target)]
-                rc = 0 if len(prefix_matches) == 1 else 1
+            rc = 0 if self._resolve_session_target(target) is not None else 1
             return subprocess.CompletedProcess(cmd, rc, "", "")
         if verb == "show-options":
-            val = self.repos.get(target)
+            session = self._resolve_session_target(target)
+            val = self.repos.get(session)
             if val is None:
                 return subprocess.CompletedProcess(cmd, 1, "", "")
             return subprocess.CompletedProcess(cmd, 0, val + "\n", "")
         if verb == "list-panes":
-            paths = self.pane_paths.get(target, [])
+            session = self._resolve_session_target(target)
+            if session is None:
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+            paths = self.pane_paths.get(session, [])
             return subprocess.CompletedProcess(cmd, 0, "\n".join(paths) + "\n", "")
         if verb == "display-message":
             val = self.pane_sessions.get(target)
@@ -63,6 +56,18 @@ class FakeTmux:
                 return subprocess.CompletedProcess(cmd, 1, "", "")
             return subprocess.CompletedProcess(cmd, 0, val + "\n", "")
         raise AssertionError(f"unexpected tmux verb {verb}")
+
+    def _resolve_session_target(self, target):
+        """Mirror tmux session target resolution for session-scoped verbs."""
+        if target is None:
+            return None
+        if target.startswith("="):
+            exact = target[1:]
+            return exact if exact in self.sessions else None
+        if target in self.sessions:
+            return target
+        prefix_matches = sorted(s for s in self.sessions if s.startswith(target))
+        return prefix_matches[0] if len(prefix_matches) == 1 else None
 
 
 # --- sanitize / derive -------------------------------------------------------
@@ -113,6 +118,38 @@ def test_session_exists_sends_exact_match_anchor():
 
 ROOT = "/home/x/dev/repoA"
 OTHER = "/home/x/dev/repoB"
+
+
+# --- remaining session-name targets (SABLE-4fc4) ----------------------------
+
+def test_fake_tmux_bare_target_falls_back_but_exact_anchor_does_not():
+    fake = FakeTmux(sessions={"sable-alpha"}, repos={"sable-alpha": OTHER})
+
+    bare = fake(["tmux", "show-options", "-v", "-t", "sable", "@sable_repo"])
+    exact = fake(["tmux", "show-options", "-v", "-t", "=sable", "@sable_repo"])
+
+    assert bare.stdout.strip() == OTHER
+    assert exact.returncode != 0
+
+
+def test_session_repo_reads_exact_session():
+    fake = FakeTmux(sessions={"sable"}, repos={"sable": ROOT})
+    assert lib.session_repo(["tmux"], "sable", run=fake) == ROOT
+
+
+def test_session_repo_does_not_read_prefix_matched_session():
+    fake = FakeTmux(sessions={"sable-alpha"}, repos={"sable-alpha": OTHER})
+    assert lib.session_repo(["tmux"], "sable", run=fake) is None
+
+
+def test_panes_under_root_reads_exact_session():
+    fake = FakeTmux(sessions={"sable"}, pane_paths={"sable": [ROOT + "/worker"]})
+    assert lib._panes_under_root(["tmux"], "sable", ROOT, run=fake) is True
+
+
+def test_panes_under_root_does_not_read_prefix_matched_session():
+    fake = FakeTmux(sessions={"sable-alpha"}, pane_paths={"sable-alpha": [ROOT]})
+    assert lib._panes_under_root(["tmux"], "sable", ROOT, run=fake) is False
 
 
 def resolve(fake, root=ROOT, pane_session=None, **kw):

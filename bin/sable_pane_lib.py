@@ -649,7 +649,7 @@ def session_repo(base: list[str], name: str, run=None) -> str | None:
     """The repo root recorded on the session (@sable_repo session option), or
     None when unset (pre-e1e3 sessions / hand-made ones)."""
     run = run or _tmux_run
-    r = run(base + ["show-options", "-v", "-t", name, "@sable_repo"])
+    r = run(base + ["show-options", "-v", "-t", f"={name}", "@sable_repo"])
     val = (r.stdout or "").strip()
     return val if r.returncode == 0 and val else None
 
@@ -660,7 +660,7 @@ def _panes_under_root(base: list[str], name: str, root: str, run=None) -> bool:
     addressed by ITS repo (its lincoln pane sits at the root) while never
     matching a different repo's tools."""
     run = run or _tmux_run
-    r = run(base + ["list-panes", "-s", "-t", name, "-F", "#{pane_current_path}"])
+    r = run(base + ["list-panes", "-s", "-t", f"={name}", "-F", "#{pane_current_path}"])
     if r.returncode != 0:
         return False
     prefix = root.rstrip("/") + "/"
