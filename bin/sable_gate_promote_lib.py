@@ -1173,6 +1173,46 @@ def _bounded_failure_detail(stdout: str, limit: int = 4000) -> str:
     return f"{prefix}{excerpt[:limit]}\n[...truncated, {dropped} more char(s) omitted...]"
 
 
+_SUITE_FATAL_ABORT_RE = re.compile(r'^FATAL:', re.MULTILINE)
+
+
+def _is_suite_infra_abort(returncode: int, output: str) -> bool:
+    """True when a hooks/test/*.sh suite's non-zero exit is the SUITE'S OWN
+    fixture-setup abort, not a content test failure (SABLE-sx1rb — the
+    scratch bd DB collision that false-RED'd SABLE-r0mzn and SABLE-6eu9w).
+
+    Every suite under hooks/test/ follows one repo-wide convention — TWO
+    DISTINCT, SEPARATELY-VERIFIED measurements, not one number: bare `exit
+    2` occurs at 44 call sites (grep, `hooks/test/*.sh`), and NONE of those
+    44 sits inside a PASS/FAIL content-accounting branch (`[ "$FAIL" -gt 0
+    ] && exit N` uses exit 1 at every site, never 2) — so exit 2 is never a
+    genuine content-failure exit anywhere in the tree. Independently,
+    `FATAL: ...` self-report lines (optimus's own read, 2026-07-27: 39
+    sites) are ALL fixture/infrastructure in nature (missing files, `cd`
+    failures, clone failures, could-not-init, absent diff-cover/pytest-cov,
+    could-not-extract-bead-ids) and NONE is a content assertion. A genuine
+    content failure always goes through each suite's own PASS/FAIL loop and
+    exits 1, never 2, never via a `FATAL:` line. Requiring BOTH the code
+    and the suite's own `FATAL:` self-report — rather than trusting either
+    alone — is the same prefer-the-self-report-over-the-bare-code
+    discipline SABLE-9yjt5 landed for the coverage floor: an exit 2 without
+    a FATAL line (a future suite reusing the code for something else) reads
+    as content-attributable rather than silently swallowed as
+    infrastructure — fails toward blaming the branch, never toward
+    excusing it.
+
+    THE ASSUMPTION THIS RESTS ON, NAMED SO IT CANNOT DECAY UNEXAMINED: the
+    convention above must keep HOLDING GOING FORWARD. This function has no
+    way to distinguish "genuinely could not build its fixture" from "chose
+    to print FATAL: and exit 2 for a content reason" — it trusts the
+    convention, not the suite's intent. A future suite that prints FATAL:
+    and exits 2 for what is actually a content defect would be silently
+    excused as infrastructure, which is the ONE way this fix fails
+    permissive. Nothing enforces the convention mechanically; it holds only
+    because every site observed at fix time (2026-07-27) honors it."""
+    return returncode == 2 and bool(_SUITE_FATAL_ABORT_RE.search(output or ""))
+
+
 def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, str]:
     """Run the cmar4 impact tier against the REAL COMBINED TREE, ONE AT A TIME
     PER SEAT (SABLE-jd5fj.13), and report (GREEN|RED|ERROR, detail).
@@ -1317,9 +1357,16 @@ def _impact_isolated_env(parent: str | os.PathLike) -> dict[str, str]:
 
     beads_root = parent / "beads"
     beads_root.mkdir(parents=True, exist_ok=True)
+    # SABLE-sx1rb (Part B, tarzan): this is the isolation-CONSTRUCTING init —
+    # it must run under the isolated `env` built above (HOME/TMPDIR already
+    # scoped to `parent`), not the caller's real os.environ. Running it
+    # against the real HOME contradicts this function's own docstring and can
+    # touch the operator's real dolt config/registry. This is a real,
+    # independent hardening fix — it does NOT change the pointer the shell
+    # suites below inherit (BEADS_DB is set AFTER this call, at :1284/below).
     init = subprocess.run(
         ["bd", "init", "--prefix=impacttier"], cwd=str(beads_root),
-        env={**os.environ, "BD_NON_INTERACTIVE": "1"},
+        env={**env, "BD_NON_INTERACTIVE": "1"},
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
     )
     if init.returncode != 0:
@@ -1431,6 +1478,18 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str],
                     _record_phase(phases, f"shell:{suite}", _t0)
                 ran.append(suite)
                 if cp.returncode != 0:
+                    # SABLE-sx1rb: an INFRASTRUCTURE fault (the suite could
+                    # not build its own fixture) is not a property of the
+                    # branch under test and must not name it — IMPACT_ERROR,
+                    # not IMPACT_RED, exactly like the worktree-checkout and
+                    # missing-manifest cases above. A genuine content
+                    # failure (exit 1, or exit 2 without the suite's own
+                    # FATAL self-report) still returns IMPACT_RED unchanged.
+                    if _is_suite_infra_abort(cp.returncode, cp.stdout):
+                        return (IMPACT_ERROR,
+                            f"{suite} could not build its own test fixture on the combined "
+                            f"tree (rc={cp.returncode}, infrastructure — not a defect on the "
+                            f"branch): {_bounded_failure_detail(cp.stdout)}")
                     return (IMPACT_RED, f"{suite} FAILED on the combined tree (rc={cp.returncode}): "
                                         f"{_bounded_failure_detail(cp.stdout)}")
 

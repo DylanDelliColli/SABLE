@@ -114,7 +114,9 @@ fi
 # -unresolvable fallback.
 if command -v bd >/dev/null 2>&1; then
   SCRATCH_BEADS_DIR=$(mktemp -d)
-  ( cd "$SCRATCH_BEADS_DIR" && BD_NON_INTERACTIVE=1 bd init --prefix=wfd \
+  # -u BEADS_DB (SABLE-sx1rb): never inherit an ambient BEADS_DB (e.g. the
+  # impact tier's own) — this suite builds and must use its OWN isolated DB.
+  ( cd "$SCRATCH_BEADS_DIR" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=wfd \
       --non-interactive --skip-agents --skip-hooks --quiet >/dev/null 2>&1 )
   REAP_BEAD=$(cd "$SCRATCH_BEADS_DIR" && bd create --title="wfd reap-fixture bead" \
       --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
