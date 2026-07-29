@@ -29,6 +29,9 @@ from pathlib import Path
 # importlib pattern in test_tripwire_watcher.py.
 SCRIPT_DIR = Path(__file__).resolve().parent
 PREFILTER_PATH = SCRIPT_DIR / "columbo-prefilter.py"
+SHIPPED_PREFILTER_PATH = (
+    SCRIPT_DIR.parent / "skills" / "columbo" / "columbo-prefilter.py"
+)
 spec = importlib.util.spec_from_file_location("columbo_prefilter", PREFILTER_PATH)
 cp = importlib.util.module_from_spec(spec)
 sys.modules["columbo_prefilter"] = cp
@@ -101,6 +104,19 @@ def with_heuristics(heuristics):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_shipped_prefilter_stays_in_sync():
+    """The repository source and skill payload must remain byte-for-byte identical."""
+    if SHIPPED_PREFILTER_PATH.read_bytes() != PREFILTER_PATH.read_bytes():
+        raise AssertionError(
+            f"{SHIPPED_PREFILTER_PATH.relative_to(SCRIPT_DIR.parent)} drifted from "
+            f"{PREFILTER_PATH.relative_to(SCRIPT_DIR.parent)}"
+        )
+    assert_true(
+        "shipped prefilter: skills copy matches bin source",
+        True,
+    )
 
 
 def test_argparse_help():
@@ -1320,6 +1336,7 @@ def test_v1_integration_surfaces_shallow_skips_deep():
 
 TESTS = [
     # rjv.5.1 — scaffolding
+    test_shipped_prefilter_stays_in_sync,
     test_argparse_help,
     test_argparse_threshold,
     test_text_output_format,
