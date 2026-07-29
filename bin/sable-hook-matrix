@@ -44,10 +44,59 @@ CLI:
 Fixture isolation (SABLE-6cf9 lesson): every log path is redirectable via
 SABLE_HOOK_TRACE_LOG / SABLE_CONTROL_TRACE_LOG / SABLE_HOOK_TRACE_SESSION_MARKER,
 and the harness drives each cell inside its own scratch directory.
+
+--------------------------------------------------------------------------
+SECOND MATRIX: --wiring, the REGISTRY matrix (SABLE-31b5l)
+--------------------------------------------------------------------------
+The matrix above asks "when a hook is dispatched, does it FIRE correctly". It
+presupposes the hook is in the path at all. --wiring answers the question
+underneath it — IS IT WIRED, AND BY WHAT — and it exists because that question
+cost four people a correct conclusion.
+
+Someone measured `git config --get core.hooksPath` -> .beads/hooks, read that
+directory's 24-line pre-push in full, found it to be pure beads integration with
+no delegation, and concluded hooks/multi-manager/pre-push-rebase-test.sh was
+never invoked. Every step of that was accurate. The conclusion was wrong: the
+hook is wired as a CLAUDE CODE PreToolUse hook in settings.json, where
+core.hooksPath has no bearing on it whatsoever. The measurement was real, it
+just answered a different registry's question, and it arrived with all the
+authority of a real measurement — persuasive enough to make its author retract
+a correct hypothesis.
+
+*** "IS IT WIRED" IS NOT A YES/NO QUESTION UNTIL YOU NAME THE WIRING SYSTEM. ***
+A negative result in the wrong registry is indistinguishable from a genuine
+absence. So this tool never returns a bare "no": it enumerates every registry
+that COULD wire an artifact, names the one that does, and when it reports
+NOT-WIRED it reports which registries it checked to earn that. Silence about
+scope is the defect being fixed.
+
+Registries (see REGISTRIES):
+  git-hooks       core.hooksPath (or .git/hooks) — direct install or body chain
+  claude-settings settings.json hooks{} across the user/project/local files
+  PATH            an executable of that name resolvable on $PATH
+  source-chain    exec-shaped references from non-test repo files (HEURISTIC,
+                  supplementary; labelled as such and never silently trusted)
+
+Reported alongside wiring, because the wired command runs the INSTALLED copy
+while humans read the REPO copy: install SHAPE (SYMLINK tracks the repo; COPY
+does not and will silently serve a stale hook after any landing that edits the
+repo file) and content DRIFT. A copy-installed wired hook is the exact shape
+that produced SABLE-o7ipa; byte-identity today is a current fact, not a
+structural guarantee.
+
+CLI:
+  sable-hook-matrix --wiring                 # text report over this repo's hooks
+  sable-hook-matrix --wiring --json          # machine-readable
+  sable-hook-matrix --wiring --include-bin   # also scan bin/sable-* (PATH-wired)
+  sable-hook-matrix --wiring --name pre-push-rebase-test.sh
+Everything is redirectable for hermetic tests: --repo, --home (scratch HOME —
+never the live ~/.claude), --path-env, --settings.
 """
 import argparse
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -584,6 +633,841 @@ def render_doc(results: list) -> str:
 
 
 # ============================================================================
+# REGISTRY-WIRING MATRIX (SABLE-31b5l)
+#
+# Self-contained: nothing below is coupled to the firing classifier above. The
+# two share only the repo-root helper and the file they live in (SABLE-5lwst
+# tracks whether they should be split).
+# ============================================================================
+
+# --- the registries -----------------------------------------------------------
+# Every activation path that could make an artifact live. An artifact absent
+# from one can be fully live in another, which is the entire point.
+
+REG_GIT_HOOKS = "git-hooks"
+REG_CLAUDE_SETTINGS = "claude-settings"
+REG_PATH = "PATH"
+REG_SOURCE_CHAIN = "source-chain"
+
+# Exhaustively checkable: an artifact either appears in the registry's own data
+# or it does not, and absence there is a fact rather than a search result.
+PRIMARY_REGISTRIES = (REG_GIT_HOOKS, REG_CLAUDE_SETTINGS, REG_PATH)
+# Best-effort text scan. Reported, and allowed to promote a verdict to ACTIVE,
+# but its ABSENCE is explicitly not treated as proof — a shell variable holding
+# the path defeats it. Always labelled HEURISTIC in output.
+HEURISTIC_REGISTRIES = (REG_SOURCE_CHAIN,)
+REGISTRIES = PRIMARY_REGISTRIES + HEURISTIC_REGISTRIES
+
+# --- wiring statuses ----------------------------------------------------------
+# PRESENT-BUT-UNWIRED is deliberately its own loud outcome: SABLE-xbwo2's fifth
+# activation class. Collapsing it into "absent" hides a file that exists and
+# does nothing; collapsing it into "active" hides a guard that guards nothing.
+
+W_ACTIVE = "ACTIVE"
+W_UNWIRED = "PRESENT-BUT-UNWIRED"
+W_WIRED_MISSING = "WIRED-BUT-MISSING"
+W_INDETERMINATE = "INDETERMINATE"
+W_ABSENT = "ABSENT"
+
+ALL_WIRING_STATUSES = (W_ACTIVE, W_UNWIRED, W_WIRED_MISSING, W_INDETERMINATE, W_ABSENT)
+
+# --- install shapes -----------------------------------------------------------
+# SYMLINK tracks the repo by construction. COPY does not: it is correct only
+# until the next landing that edits the repo file, and nothing announces the
+# moment it stops being correct.
+
+SHAPE_SYMLINK = "SYMLINK"
+SHAPE_COPY = "COPY"
+SHAPE_ABSENT = "NOT-INSTALLED"
+
+CONTENT_MATCHES = "MATCHES"
+CONTENT_DRIFTED = "DRIFTED"
+CONTENT_UNKNOWN = "UNKNOWN"
+
+# Files scanned for source-chain references. Extensionless bin/ tools are added
+# separately (this repo's bash tools carry no suffix).
+_REF_SUFFIXES = (".sh", ".py", ".json", ".md", ".yaml", ".yml", ".bash")
+_REF_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".pytest_cache", ".venv"}
+
+# Only these can actually RUN something. A .md paragraph and a .json template
+# get collected as references (they answer "who talks about this artifact") but
+# may never promote it to wired: PERSONAL-TOOLING.md's line recording that
+# pre-dispatch-refresh.sh was RETIRED otherwise reads as evidence it is live —
+# a checker answering ACTIVE off prose is as useless as one that always says
+# UNWIRED, and fails in the more dangerous direction.
+_EXECUTABLE_REF_SUFFIXES = (".sh", ".bash", ".py")
+
+# A reference is TEST-ONLY when it comes from a suite rather than production
+# wiring. A test that invokes a hook proves the hook runs under test; it says
+# nothing about whether the hook runs in anger, and counting it as wiring is how
+# a checker starts answering ACTIVE for everything.
+_TEST_REF_MARKERS = ("hooks/test/", "/test-", "/test_", ".github/ci/")
+
+
+@dataclass(frozen=True)
+class Wiring:
+    """One concrete reason an artifact is live, traceable to its own evidence."""
+    registry: str
+    site: str          # the registry file/dir the evidence was read from
+    detail: str        # e.g. "PreToolUse:Bash", "chained from pre-push"
+    command: str = ""  # the raw text that names the artifact
+    target: str = ""   # filesystem path the site actually points at
+    target_exists: bool = True
+    heuristic: bool = False
+
+
+@dataclass(frozen=True)
+class Install:
+    """How the artifact reached the place the registry points at."""
+    shape: str
+    path: str = ""
+    symlink_target: str = ""
+    tracks_repo: bool = False
+    content: str = CONTENT_UNKNOWN
+
+
+@dataclass(frozen=True)
+class Reference:
+    """A repo file that names this artifact. `exec_shaped` is a heuristic.
+    Only a reference that is exec_shaped AND executable_file AND not is_test
+    promotes the artifact to wired — see _report_for."""
+    path: str
+    line: int
+    text: str
+    exec_shaped: bool
+    is_test: bool
+    executable_file: bool = True
+
+    def is_invocation(self) -> bool:
+        return self.exec_shaped and self.executable_file and not self.is_test
+
+
+@dataclass
+class HookReport:
+    name: str
+    repo_path: str = ""
+    exists: bool = False
+    role: str = "hook"                 # 'hook' | 'library' | 'bin'
+    install: Install = field(default_factory=lambda: Install(SHAPE_ABSENT))
+    wirings: tuple = ()
+    registries_checked: tuple = ()
+    registries_skipped: tuple = ()     # ((registry, reason), ...)
+    references: tuple = ()
+    status: str = W_ABSENT
+
+    def registry_names(self) -> tuple:
+        seen = []
+        for w in self.wirings:
+            if w.registry not in seen:
+                seen.append(w.registry)
+        return tuple(seen)
+
+    def scope_line(self) -> str:
+        """What this verdict is worth. A NOT-WIRED with no scope statement is
+        the defect this tool exists to remove, so every report carries one."""
+        checked = ", ".join(self.registries_checked) or "none"
+        s = f"checked: {checked}"
+        if self.registries_skipped:
+            skipped = "; ".join(f"{r} ({why})" for r, why in self.registries_skipped)
+            s += f" | NOT CHECKED: {skipped}"
+        return s
+
+
+# ============================================================================
+# THE WIRING CLASSIFIER — pure function, the core of the deliverable
+# ============================================================================
+
+def classify_wiring(exists: bool, wirings, registries_checked,
+                    registries_skipped=()) -> str:
+    """Decide an artifact's activation status. PURE: no I/O, no clock. Total:
+    every input yields exactly one of ALL_WIRING_STATUSES.
+
+    Rule order is load-bearing:
+      1. Any wiring at all -> the artifact is reachable. Split on whether the
+         file the registry points at is actually there: a registry entry naming
+         a missing file is WIRED-BUT-MISSING, which is a louder fact than either
+         half alone and must never render as plain ACTIVE.
+      2. No wiring, but some registry could NOT be checked -> INDETERMINATE.
+         *** THIS IS THE RULE THE BEAD EXISTS FOR. *** An unchecked registry
+         makes "not wired" unearned, and an unearned negative reads exactly like
+         a measured one. We refuse to say it.
+      3. No wiring, every registry checked -> a real verdict: PRESENT-BUT-UNWIRED
+         if the file is on disk (installed but not wired), ABSENT if it is not.
+    """
+    if wirings:
+        if exists or any(w.target_exists for w in wirings):
+            return W_ACTIVE
+        return W_WIRED_MISSING
+    if registries_skipped:
+        return W_INDETERMINATE
+    if not registries_checked:
+        # Nothing was checked at all: that is an unchecked registry set, not a
+        # clean negative. Same reasoning as rule 2.
+        return W_INDETERMINATE
+    return W_UNWIRED if exists else W_ABSENT
+
+
+# ============================================================================
+# INSTALL SHAPE
+# ============================================================================
+
+def _sha256(path: Path) -> Optional[str]:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def inspect_install(repo_path: Path, installed_path: Path) -> Install:
+    """Classify how the installed artifact relates to its repo source.
+
+    The distinction that matters: a SYMLINK is structurally current — it cannot
+    drift. A COPY is byte-identical only until the next landing touches the repo
+    file, and nothing announces the moment it stops being. Reporting the two as
+    one 'installed: yes' is what let a stale wired hook read as healthy.
+    """
+    try:
+        installed_path.lstat()
+    except OSError:
+        return Install(SHAPE_ABSENT)
+
+    if installed_path.is_symlink():
+        try:
+            raw = os.readlink(str(installed_path))
+        except OSError:
+            raw = ""
+        tracks = False
+        try:
+            tracks = installed_path.resolve() == repo_path.resolve()
+        except OSError:
+            pass
+        return Install(
+            shape=SHAPE_SYMLINK, path=str(installed_path), symlink_target=raw,
+            tracks_repo=tracks,
+            content=CONTENT_MATCHES if tracks else CONTENT_UNKNOWN,
+        )
+
+    a, b = _sha256(installed_path), _sha256(repo_path)
+    if a is None or b is None:
+        content = CONTENT_UNKNOWN
+    else:
+        content = CONTENT_MATCHES if a == b else CONTENT_DRIFTED
+    return Install(shape=SHAPE_COPY, path=str(installed_path),
+                   tracks_repo=False, content=content)
+
+
+# ============================================================================
+# REGISTRY SCANNERS
+# ============================================================================
+
+def expand_path_token(token: str, home: str) -> str:
+    """Expand ~ / $HOME / ${HOME} against the GIVEN home, never os.path
+    expanduser — the tests run against a scratch HOME and must not be able to
+    reach the live ~/.claude by accident (SABLE-2avau)."""
+    t = token.strip().strip("'\"")
+    if t.startswith("~/") or t == "~":
+        t = home + t[1:]
+    t = t.replace("${HOME}", home).replace("$HOME", home)
+    return t
+
+
+_PATHISH = re.compile(r"[^\s;|&()<>'\"]+")
+
+
+def referenced_paths(command: str, home: str) -> list:
+    """Path-looking tokens in a hook command, expanded against `home`.
+
+    A settings.json entry is `bash ~/.claude/hooks/multi-manager/x.sh`; the
+    thing that runs is the INSTALLED copy, so the extracted path is what the
+    registry actually points at and is what gets existence-checked.
+    """
+    out = []
+    for tok in _PATHISH.findall(command or ""):
+        if "/" not in tok and not tok.endswith((".sh", ".py")):
+            continue
+        expanded = expand_path_token(tok, home)
+        if expanded:
+            out.append(expanded)
+    return out
+
+
+def settings_candidates(home: str, repo_root: Path) -> list:
+    """Every settings file that could carry a Claude Code hook, in the order
+    Claude Code layers them. All four are checked: the overlooked registry is
+    not overlooked twice by only reading the user file."""
+    return [
+        Path(home) / ".claude" / "settings.json",
+        Path(home) / ".claude" / "settings.local.json",
+        repo_root / ".claude" / "settings.json",
+        repo_root / ".claude" / "settings.local.json",
+    ]
+
+
+def scan_claude_settings(paths, home: str):
+    """-> (entries, skipped). Each entry: (settings_file, event, matcher, command).
+
+    A settings file that exists but will not parse is reported as SKIPPED, not
+    as empty. An unparseable registry yields no hits, and 'no hits' is exactly
+    what a genuinely-unwired hook looks like — the two must not be conflated,
+    so this drives the INDETERMINATE verdict rather than a silent NOT-WIRED.
+    """
+    entries, skipped = [], []
+    for p in paths:
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            skipped.append(f"{p}: unreadable/unparseable ({type(exc).__name__})")
+            continue
+        hooks = data.get("hooks")
+        if not isinstance(hooks, dict):
+            continue
+        for event, groups in hooks.items():
+            if not isinstance(groups, list):
+                continue
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                matcher = group.get("matcher", "")
+                for hook in group.get("hooks") or []:
+                    if isinstance(hook, dict) and hook.get("command"):
+                        entries.append((str(p), event, matcher, hook["command"]))
+    return entries, skipped
+
+
+def resolve_git_hooks_dir(repo_root: Path):
+    """-> (Path|None, reason). Uses `git rev-parse --git-path hooks`, which
+    honours core.hooksPath — the same resolution git itself performs when it
+    decides which hook to run. Reading .git/hooks directly would reproduce the
+    original mistake in the opposite direction."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--git-path", "hooks"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"git unavailable ({type(exc).__name__})"
+    if proc.returncode != 0:
+        return None, "not a git work tree"
+    raw = proc.stdout.strip()
+    if not raw:
+        return None, "git returned no hooks path"
+    p = Path(raw)
+    if not p.is_absolute():
+        p = (repo_root / p).resolve()
+    if not p.is_dir():
+        return None, f"hooks path {p} does not exist"
+    return p, ""
+
+
+def scan_git_hooks(hooks_dir: Path):
+    """-> (entries, skipped). Each entry: (hook_file, resolved_realpath, body).
+
+    Both wiring shapes are captured: the artifact INSTALLED as the git hook
+    itself (realpath equality) and the artifact CHAINED from a hook's body. The
+    .beads/hooks pre-push that started all this does neither, which is a true
+    negative for this registry and a false negative for the question asked.
+    """
+    entries, skipped = [], []
+    try:
+        names = sorted(p for p in hooks_dir.iterdir() if p.is_file())
+    except OSError as exc:
+        return entries, [f"{hooks_dir}: unreadable ({type(exc).__name__})"]
+    for p in names:
+        if p.name.endswith(".sample"):
+            continue
+        try:
+            body = p.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            skipped.append(f"{p}: unreadable ({type(exc).__name__})")
+            continue
+        try:
+            real = str(p.resolve())
+        except OSError:
+            real = str(p)
+        entries.append((str(p), real, body))
+    return entries, skipped
+
+
+def scan_path_dirs(path_env: str):
+    """-> (dirs, skipped). PATH entries in resolution order; the FIRST match
+    wins at exec time, so order is preserved and later matches are reported as
+    shadowed rather than dropped."""
+    dirs, skipped = [], []
+    for raw in (path_env or "").split(os.pathsep):
+        if not raw:
+            continue
+        p = Path(raw)
+        if p.is_dir():
+            dirs.append(p)
+    if not dirs:
+        skipped.append("PATH is empty or contains no readable directories")
+    return dirs, skipped
+
+
+def _is_test_ref(rel: str) -> bool:
+    return any(m in "/" + rel for m in _TEST_REF_MARKERS)
+
+
+def strip_comment(line: str) -> str:
+    """Drop a shell/python trailing comment so prose inside one cannot read as
+    an invocation. `#` counts as a comment opener only at line start or after
+    whitespace — approximate (a `#` inside a string literal is cut too), which
+    costs at most a missed reference and never invents one."""
+    m = re.search(r"(?:^|\s)#", line)
+    return line[:m.start()] if m else line
+
+
+def prose_line_numbers(text: str) -> set:
+    """1-based line numbers of Python source that are string or comment, not code.
+
+    Comment stripping alone is not enough for Python: a docstring is prose
+    living in an executable file. This tool's own docstring — the paragraph
+    explaining that pre-dispatch-refresh.sh was RETIRED — parsed as an
+    invocation of it, which would have promoted a deliberately de-wired hook to
+    ACTIVE off the sentence recording its retirement.
+
+    Uses Python's own tokenizer, so it is exact rather than heuristic: a first
+    attempt counted triple-quote delimiters per line and desynchronised on
+    docstrings that open and close unevenly. On a file the tokenizer rejects
+    (partial write, py2 syntax) it degrades to comment-stripping only, which
+    can admit a docstring reference — never the reverse.
+    """
+    import io
+    import tokenize
+
+    inside = set()
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type in (tokenize.STRING, tokenize.COMMENT):
+                for ln in range(tok.start[0], tok.end[0] + 1):
+                    inside.add(ln)
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        return inside
+    return inside
+
+
+def _is_python_source(filename: str, text: str) -> bool:
+    if filename.endswith(".py"):
+        return True
+    first = text.split("\n", 1)[0] if text else ""
+    return first.startswith("#!") and "python" in first
+
+
+def _exec_shaped(line: str, base: str) -> bool:
+    """Heuristic: does this line look like it RUNS the artifact, as opposed to
+    mentioning it? Catches `bash <path>`, `source <path>`, `. <path>` and a bare
+    path in command position.
+
+    The interpreter alternation is anchored at a command boundary
+    (start-of-line, `;`, `&`, `|`, `(`, backtick, `then`/`do`/`else`). It was
+    not, and the bare `.` (source shorthand) then matched EVERY sentence-ending
+    period: `... + \\`upgrade-notes.md\\`. (\\`pre-dispatch-refresh.sh\\` ...)` in a
+    doc parsed as "source pre-dispatch-refresh.sh", promoting a retired hook to
+    ACTIVE off the very sentence recording its retirement.
+
+    Deliberately conservative and openly fallible — a path held in a shell
+    variable defeats it — which is why a source-chain miss never hardens into a
+    NOT-WIRED claim on its own.
+    """
+    line = strip_comment(line)
+    if not line.strip():
+        return False
+    esc = re.escape(base)
+    # Backtick is deliberately NOT a boundary. It is legal command
+    # substitution, but in this repo it appears overwhelmingly in prose, where
+    # `notes.md`. (`some-hook.sh` ...) parsed as ". some-hook.sh". $( ) already
+    # covers substitution via the "(" boundary, so dropping it costs nothing
+    # real and removes a whole class of false ACTIVEs.
+    boundary = r"(?:^|[;&|(]|\bthen\b|\bdo\b|\belse\b)\s*"
+    # The path between the interpreter and the basename may contain spaces —
+    # `. "$(dirname "${BASH_SOURCE[0]}")/lib-hook-trace.sh"` is the repo's
+    # standard sourcing idiom, and a \S* path pattern silently missed every one
+    # of them, reporting three genuinely-sourced libraries as unwired. Bounded
+    # by command separators so it cannot run past the end of the command.
+    interp = r"[^;&|]*?"
+    if re.search(boundary + r"(?:bash|sh|zsh|source|exec)\s+(?:-\S+\s+)*" + interp + esc, line):
+        return True
+    if re.search(boundary + r"\.\s+" + interp + esc, line):
+        return True
+    if re.match(r"^\s*\"?\$?\{?[\w/.\-]*\}?[\w/.\-]*" + esc + r"\"?(?:\s|$)", line):
+        return True
+    return False
+
+
+def indirect_exec_lines(text: str, base: str) -> set:
+    """Line numbers assigning a path containing `base` to a variable that the
+    same file later EXECUTES — `IMPL="$SELF_DIR/tree-claim-impl.sh"` … `bash
+    "$IMPL"`.
+
+    Single-line matching cannot see this: the executing line never names the
+    file, and the naming line never looks like a command. tree-claim-impl.sh
+    holds the entire tree-claim gate and was reported PRESENT-BUT-UNWIRED on
+    exactly this shape — a false alarm on a live guard, which is how a checker
+    earns being ignored.
+
+    Same-file only, so an assignment exported to a child script is still missed;
+    source-chain stays labelled HEURISTIC for this reason.
+    """
+    lines = text.splitlines()
+    esc = re.escape(base)
+    assigned = {}  # var -> [line numbers]
+    for i, raw in enumerate(lines, start=1):
+        m = re.match(r"^\s*(?:export\s+|local\s+|declare\s+(?:-\w+\s+)*)?"
+                     r"([A-Za-z_]\w*)=", strip_comment(raw))
+        if m and re.search(esc, raw):
+            assigned.setdefault(m.group(1), []).append(i)
+    if not assigned:
+        return set()
+
+    out = set()
+    for var, decl_lines in assigned.items():
+        ref = r"\"?\$\{?" + re.escape(var) + r"\}?\"?"
+        for raw in lines:
+            line = strip_comment(raw)
+            if not line.strip():
+                continue
+            if re.search(r"(?:^|[;&|(`]|\bthen\b|\bdo\b|\belse\b)\s*"
+                         r"(?:bash|sh|zsh|source|exec|\.)\s+(?:-\S+\s+)*" + ref, line):
+                out.update(decl_lines)
+                break
+            if re.match(r"^\s*" + ref + r"(?:\s|$)", line):
+                out.update(decl_lines)
+                break
+    return out
+
+
+def scan_references(root: Path, basenames):
+    """-> {basename: [Reference, ...]}. Text scan of the repo for each artifact
+    name. Supplementary evidence only (REG_SOURCE_CHAIN is heuristic)."""
+    found = {b: [] for b in basenames}
+    if not root.is_dir():
+        return found
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _REF_SKIP_DIRS]
+        for fn in filenames:
+            fp = Path(dirpath) / fn
+            rel = os.path.relpath(str(fp), str(root))
+            in_bin = rel.startswith("bin" + os.sep) or rel.startswith("bin/")
+            if not fn.endswith(_REF_SUFFIXES) and not in_bin:
+                continue
+            # Extensionless bin/ tools are this repo's bash executables.
+            executable_file = fn.endswith(_EXECUTABLE_REF_SUFFIXES) or (
+                in_bin and not fn.endswith(_REF_SUFFIXES))
+            try:
+                text = fp.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            is_py = _is_python_source(fn, text)
+            prose = prose_line_numbers(text) if is_py else frozenset()
+            indirect = {}
+            if executable_file and not is_py:
+                for base in basenames:
+                    if base in text:
+                        indirect[base] = indirect_exec_lines(text, base)
+            for i, line in enumerate(text.splitlines(), start=1):
+                for base in basenames:
+                    if base not in line:
+                        continue
+                    if rel.endswith("/" + base) or rel == base:
+                        continue  # the artifact naming itself is not a caller
+                    exec_shaped = (i not in prose) and (
+                        _exec_shaped(line, base) or i in indirect.get(base, ()))
+                    found[base].append(Reference(
+                        path=rel, line=i, text=line.strip()[:200],
+                        exec_shaped=exec_shaped,
+                        is_test=_is_test_ref(rel),
+                        executable_file=executable_file,
+                    ))
+    return found
+
+
+# ============================================================================
+# THE WIRING MATRIX
+# ============================================================================
+
+def enumerate_artifacts(repo_root: Path, include_bin: bool = False) -> list:
+    """(repo_path, role) for every artifact whose activation is a live question.
+
+    lib-*.sh are tagged 'library' because they are wired by being SOURCED, never
+    registered. Reporting six libraries as PRESENT-BUT-UNWIRED every run is the
+    crying-wolf failure that gets a checker ignored.
+    """
+    out = []
+    for sub in ("hooks", "hooks/multi-manager"):
+        d = repo_root / sub
+        if not d.is_dir():
+            continue
+        for p in sorted(d.glob("*.sh")):
+            role = "library" if p.name.startswith("lib-") else "hook"
+            out.append((p, role))
+    if include_bin:
+        d = repo_root / "bin"
+        if d.is_dir():
+            for p in sorted(d.glob("sable-*")):
+                if p.is_file():
+                    out.append((p, "bin"))
+    return out
+
+
+def build_wiring_matrix(repo_root: Path, home: str, path_env: Optional[str] = None,
+                        settings_paths=None, include_bin: bool = False,
+                        names=None, claude_dir: Optional[Path] = None) -> list:
+    """Scan every registry ONCE, then decide each artifact against all of them.
+
+    The registries are scanned up front and the checked/skipped sets are carried
+    onto every report, so each verdict states the scope that earned it.
+    """
+    repo_root = Path(repo_root)
+    claude_dir = Path(claude_dir) if claude_dir else Path(home) / ".claude"
+    path_env = os.environ.get("PATH", "") if path_env is None else path_env
+    settings_paths = (list(settings_paths) if settings_paths is not None
+                      else settings_candidates(home, repo_root))
+
+    checked, skipped = [], []
+
+    settings_entries, settings_skipped = scan_claude_settings(
+        [Path(p) for p in settings_paths], home)
+    if settings_skipped:
+        skipped.append((REG_CLAUDE_SETTINGS, "; ".join(settings_skipped)))
+    else:
+        checked.append(REG_CLAUDE_SETTINGS)
+
+    git_dir, git_reason = resolve_git_hooks_dir(repo_root)
+    git_entries = []
+    if git_dir is None:
+        skipped.append((REG_GIT_HOOKS, git_reason))
+    else:
+        git_entries, git_skipped = scan_git_hooks(git_dir)
+        if git_skipped:
+            skipped.append((REG_GIT_HOOKS, "; ".join(git_skipped)))
+        else:
+            checked.append(REG_GIT_HOOKS)
+
+    path_dirs, path_skipped = scan_path_dirs(path_env)
+    if path_skipped:
+        skipped.append((REG_PATH, "; ".join(path_skipped)))
+    else:
+        checked.append(REG_PATH)
+
+    artifacts = enumerate_artifacts(repo_root, include_bin=include_bin)
+    if names:
+        wanted = set(names)
+        artifacts = [(p, r) for p, r in artifacts if p.name in wanted]
+
+    basenames = [p.name for p, _ in artifacts]
+    refs = scan_references(repo_root, basenames)
+    checked.append(REG_SOURCE_CHAIN)
+
+    reports = []
+    for repo_path, role in artifacts:
+        reports.append(_report_for(
+            repo_path, role, repo_root, claude_dir, home,
+            settings_entries, git_entries, path_dirs,
+            refs.get(repo_path.name, []), tuple(checked), tuple(skipped)))
+    return reports
+
+
+def _report_for(repo_path: Path, role: str, repo_root: Path, claude_dir: Path,
+                home: str, settings_entries, git_entries, path_dirs,
+                references, checked, skipped) -> HookReport:
+    base = repo_path.name
+    rel = os.path.relpath(str(repo_path), str(repo_root))
+
+    if role == "bin":
+        installed_path = Path(home) / ".local" / "bin" / base
+    else:
+        installed_path = claude_dir / rel
+
+    wirings = []
+
+    # (b) claude-settings — the registry everyone overlooked.
+    for site, event, matcher, command in settings_entries:
+        for target in referenced_paths(command, home):
+            if os.path.basename(target) != base:
+                continue
+            wirings.append(Wiring(
+                registry=REG_CLAUDE_SETTINGS, site=site,
+                detail=f"{event}:{matcher or '*'}", command=command.strip(),
+                target=target, target_exists=os.path.exists(target)))
+            break
+
+    # (a) git-hooks — installed AS a hook, or chained from one's body.
+    for hook_file, real, body in git_entries:
+        hook_name = os.path.basename(hook_file)
+        if real == str(repo_path.resolve()) or os.path.basename(real) == base:
+            wirings.append(Wiring(
+                registry=REG_GIT_HOOKS, site=hook_file,
+                detail=f"installed as git hook '{hook_name}'",
+                target=real, target_exists=os.path.exists(real)))
+            continue
+        for i, line in enumerate(body.splitlines(), start=1):
+            if base in line and _exec_shaped(line, base):
+                targets = [t for t in referenced_paths(line, home)
+                           if os.path.basename(t) == base]
+                target = targets[0] if targets else ""
+                wirings.append(Wiring(
+                    registry=REG_GIT_HOOKS, site=f"{hook_file}:{i}",
+                    detail=f"chained from git hook '{hook_name}'",
+                    command=line.strip()[:200], target=target,
+                    target_exists=bool(target) and os.path.exists(target)))
+                break
+
+    # (c) PATH — first match wins at exec time; later ones are shadowed.
+    for idx, d in enumerate(path_dirs):
+        cand = d / base
+        if not cand.exists():
+            continue
+        detail = "PATH entry" if not any(
+            w.registry == REG_PATH for w in wirings) else "PATH entry (shadowed)"
+        try:
+            real = str(cand.resolve())
+        except OSError:
+            real = str(cand)
+        wirings.append(Wiring(
+            registry=REG_PATH, site=str(d), detail=f"{detail} #{idx}",
+            target=real, target_exists=os.path.exists(real)))
+
+    # (d) source-chain — HEURISTIC. Test-only callers are excluded on purpose (a
+    #     suite running a hook proves nothing about production), and so are
+    #     non-executable files (prose cannot invoke anything).
+    for r in references:
+        if r.is_invocation():
+            wirings.append(Wiring(
+                registry=REG_SOURCE_CHAIN, site=f"{r.path}:{r.line}",
+                detail="exec-shaped reference from a non-test repo file",
+                command=r.text, target=str(repo_path),
+                target_exists=repo_path.exists(), heuristic=True))
+
+    exists = repo_path.exists()
+    return HookReport(
+        name=base, repo_path=rel, exists=exists, role=role,
+        install=inspect_install(repo_path, installed_path),
+        wirings=tuple(wirings), registries_checked=checked,
+        registries_skipped=skipped, references=tuple(references),
+        status=classify_wiring(exists, tuple(wirings), checked, skipped),
+    )
+
+
+# ============================================================================
+# WIRING REPORT RENDERING
+# ============================================================================
+
+def wiring_to_dict(r: HookReport) -> dict:
+    return {
+        "name": r.name,
+        "repo_path": r.repo_path,
+        "role": r.role,
+        "exists": r.exists,
+        "status": r.status,
+        "install": {
+            "shape": r.install.shape,
+            "path": r.install.path,
+            "symlink_target": r.install.symlink_target,
+            "tracks_repo": r.install.tracks_repo,
+            "content": r.install.content,
+        },
+        "registries_wiring_it": list(r.registry_names()),
+        "registries_checked": list(r.registries_checked),
+        "registries_not_checked": [
+            {"registry": reg, "reason": why} for reg, why in r.registries_skipped
+        ],
+        "wirings": [
+            {"registry": w.registry, "site": w.site, "detail": w.detail,
+             "command": w.command, "target": w.target,
+             "target_exists": w.target_exists, "heuristic": w.heuristic}
+            for w in r.wirings
+        ],
+        "invocation_sites": [
+            {"path": f"{x.path}:{x.line}", "exec_shaped": x.exec_shaped,
+             "test_only": x.is_test, "executable_file": x.executable_file,
+             "counts_as_wiring": x.is_invocation(), "text": x.text}
+            for x in r.references
+        ],
+    }
+
+
+def render_wiring_report(reports) -> str:
+    """Text report. Ordered loudest-first so the states that cost someone a
+    conclusion are not buried under thirty healthy rows."""
+    order = {W_WIRED_MISSING: 0, W_INDETERMINATE: 1, W_UNWIRED: 2,
+             W_ABSENT: 3, W_ACTIVE: 4}
+    rows = sorted(reports, key=lambda r: (order.get(r.status, 9), r.name))
+
+    lines = ["# Hook registry-wiring matrix (SABLE-31b5l)", ""]
+    lines.append("Registries enumerated (an artifact absent from one can be fully "
+                 "live in another):")
+    for reg in PRIMARY_REGISTRIES:
+        lines.append(f"  * {reg}")
+    for reg in HEURISTIC_REGISTRIES:
+        lines.append(f"  * {reg}  [HEURISTIC — a miss here is not proof of absence]")
+    lines.append("")
+    if rows:
+        lines.append("SCOPE: " + rows[0].scope_line())
+        lines.append("")
+
+    for r in rows:
+        regs = ", ".join(r.registry_names()) or "-"
+        lines.append(f"{r.status:<20} {r.name}  [{r.role}]")
+        lines.append(f"    repo      {r.repo_path}")
+        shape = r.install.shape
+        if shape == SHAPE_SYMLINK:
+            note = "tracks repo" if r.install.tracks_repo else "elsewhere"
+            lines.append(f"    install   {shape} -> {r.install.symlink_target} ({note})")
+        elif shape == SHAPE_COPY:
+            lines.append(f"    install   {shape} {r.install.path} "
+                         f"content={r.install.content} "
+                         f"(does NOT track the repo; stale after the next landing)")
+        else:
+            lines.append(f"    install   {shape}")
+        lines.append(f"    wired by  {regs}")
+        for w in r.wirings:
+            flag = " [HEURISTIC]" if w.heuristic else ""
+            miss = "" if w.target_exists else "  *** TARGET MISSING ***"
+            lines.append(f"      - {w.registry}: {w.detail} @ {w.site}{flag}{miss}")
+        invocations = sum(1 for x in r.references if x.is_invocation())
+        testonly = sum(1 for x in r.references if x.is_test)
+        lines.append(f"    refs      {len(r.references)} textual "
+                     f"({invocations} exec-shaped non-test, {testonly} test-only); "
+                     f"a textual mention is not proof of invocation")
+        if r.status in (W_UNWIRED, W_INDETERMINATE, W_WIRED_MISSING):
+            lines.append(f"    scope     {r.scope_line()}")
+        lines.append("")
+
+    counts = {}
+    for r in rows:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    lines.append("## Summary")
+    lines.append("")
+    for st in ALL_WIRING_STATUSES:
+        if counts.get(st):
+            lines.append(f"  {st:<20} {counts[st]}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def run_wiring(args) -> int:
+    home = args.home or os.environ.get("HOME", "")
+    repo_root = Path(args.repo) if args.repo else _repo_root()
+    reports = build_wiring_matrix(
+        repo_root=repo_root, home=home, path_env=args.path_env,
+        settings_paths=args.settings, include_bin=args.include_bin,
+        names=args.name or None,
+    )
+    if args.json:
+        sys.stdout.write(json.dumps(
+            {"repo": str(repo_root), "home": home,
+             "registries": list(REGISTRIES),
+             "heuristic_registries": list(HEURISTIC_REGISTRIES),
+             "reports": [wiring_to_dict(r) for r in reports]},
+            indent=2) + "\n")
+    else:
+        sys.stdout.write(render_wiring_report(reports))
+    return 0
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -597,10 +1481,34 @@ def main(argv=None) -> int:
                     help="count ground-truth tool_use from a real session transcript jsonl")
     ap.add_argument("--workdir", metavar="DIR",
                     help="scratch dir for real hook invocations (default: a tempdir)")
+
+    # --- the registry-wiring matrix (SABLE-31b5l) ---
+    ap.add_argument("--wiring", action="store_true",
+                    help="report which REGISTRY wires each hook (git-hooks / "
+                         "claude-settings / PATH / source-chain) plus install shape")
+    ap.add_argument("--json", action="store_true",
+                    help="with --wiring: emit the machine-readable report")
+    ap.add_argument("--repo", metavar="DIR",
+                    help="with --wiring: repo root to scan (default: this repo)")
+    ap.add_argument("--home", metavar="DIR",
+                    help="with --wiring: HOME to resolve ~/.claude and ~/.local/bin "
+                         "against (use a SCRATCH home in tests; never the live one)")
+    ap.add_argument("--path-env", metavar="PATH",
+                    help="with --wiring: PATH value to check instead of $PATH")
+    ap.add_argument("--settings", metavar="FILE", action="append",
+                    help="with --wiring: settings.json to check (repeatable; "
+                         "default: the user+project layering)")
+    ap.add_argument("--include-bin", action="store_true",
+                    help="with --wiring: also scan bin/sable-* (PATH-wired tools)")
+    ap.add_argument("--name", metavar="BASENAME", action="append",
+                    help="with --wiring: restrict to these artifact basenames")
     args = ap.parse_args(argv)
 
+    if args.wiring:
+        return run_wiring(args)
+
     if not args.emit_doc and not args.print:
-        ap.error("nothing to do: pass --emit-doc PATH and/or --print")
+        ap.error("nothing to do: pass --emit-doc PATH, --print, and/or --wiring")
 
     if args.workdir:
         wd = Path(args.workdir)
