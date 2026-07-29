@@ -27,6 +27,10 @@
 #      mode/reason line on stderr, SCOPED with a suite/path count or FULL
 #      naming the unmapped path(s) — this is what makes the fallback
 #      diagnosable instead of a bare, unexplained count
+#   8. (SABLE-ak7og) the REAL production declarations select
+#      test-shell-run-set-strict.sh for a shell-run-set.sh change, preserving
+#      its local-only --check-beads exclusion-freshness gate under
+#      proportional pre-push selection
 #
 # Real bash processes throughout, REAL git repo + REAL `git diff --name-only`
 # output feeding sable_select_impacted — no mocks, no bd/dolt. Fixture: a
@@ -420,6 +424,22 @@ if [ "$DIFF_SEL" = "test-fixture-alpha.sh" ]; then
   pass "real 'git diff --name-only' output piped on stdin selects exactly test-fixture-alpha.sh for a hook-alpha.sh-only commit"
 else
   fail "real 'git diff --name-only' output piped on stdin selects exactly test-fixture-alpha.sh for a hook-alpha.sh-only commit" "got: $DIFF_SEL"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. (SABLE-ak7og) Production-declaration regression: this case deliberately
+#    invokes the REAL manifest rather than the fixture declaration above.
+#    test-shell-run-set-strict.sh case (f) is the local-only executor for
+#    shell-run-set.sh --check-beads. A proportional check for changes to the
+#    ALLOW/EXCLUDE declarations must therefore select that suite.
+# ---------------------------------------------------------------------------
+PROD_RUNSET_SEL=$(bash "$PROD_MANIFEST" --select .github/ci/shell-run-set.sh 2>/dev/null | sort)
+if printf '%s\n' "$PROD_RUNSET_SEL" | grep -qx 'test-shell-run-set-strict.sh' \
+   && printf '%s\n' "$PROD_RUNSET_SEL" | grep -qx 'test-impact-selection.sh'; then
+  pass "SABLE-ak7og: a shell-run-set.sh change selects the --check-beads executor and this regression guard"
+else
+  fail "SABLE-ak7og: a shell-run-set.sh change selects the --check-beads executor and this regression guard" \
+       "selected: ${PROD_RUNSET_SEL:-<none>}"
 fi
 
 echo
