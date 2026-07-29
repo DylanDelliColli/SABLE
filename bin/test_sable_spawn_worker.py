@@ -649,9 +649,28 @@ def test_bead_claimed_files_still_returns_a_plain_set_for_legacy_callers():
     assert ssw.bead_claimed_files({"notes": "WIP-CLAIMS: a.py"}) == {"a.py"}
 
 
-def test_extract_serialize_with_parses_comma_list():
-    text = "notes\nSerialize-with: SABLE-a, SABLE-b\nmore"
-    assert ssw.extract_serialize_with(text) == {"SABLE-a", "SABLE-b"}
+def test_extract_serialize_with_accepts_canonical_ids():
+    text = "notes\nSerialize-with: SABLE-aa, BD-b2 TWINE-c3.4\nmore"
+    assert ssw.extract_serialize_with(text) == {
+        "SABLE-aa",
+        "BD-b2",
+        "TWINE-c3.4",
+    }
+
+
+def test_extract_serialize_with_ignores_prose_around_punctuated_ids():
+    text = (
+        "Serialize-with: (SABLE-ab), TWINE-c3.4; EPIC-d4. coordinate this with the "
+        "partner through sable-spawn-worker, not BUG-deadbeef or "
+        "SABLE-ok-extra, SABLE-zz.1x, SABLE-yy.1-extra, or "
+        "SABLE-xx--extra; nor SABLE-ww..1, SABLE-vv.1..2, or "
+        "SABLE-uu.-extra.\n"
+    )
+    assert ssw.extract_serialize_with(text) == {
+        "SABLE-ab",
+        "TWINE-c3.4",
+        "EPIC-d4",
+    }
 
 
 def test_extract_serialize_with_empty_when_absent():
@@ -688,18 +707,32 @@ def test_overlap_check_no_declaration_when_bead_has_no_claims():
 
 
 def test_overlap_check_allows_with_matching_serialize_with():
-    bead = {"id": "X-1", "notes": "WIP-CLAIMS: shared.py\nSerialize-with: Y-1"}
-    other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
-    verdict = ssw.overlap_check("X-1", bead, [other])
+    bead = {
+        "id": "SABLE-x1",
+        "notes": "WIP-CLAIMS: shared.py\nSerialize-with: SABLE-y1",
+    }
+    other = {
+        "id": "SABLE-y1",
+        "notes": "WIP-CLAIMS: shared.py",
+        "assignee": "tarzan",
+    }
+    verdict = ssw.overlap_check("SABLE-x1", bead, [other])
     assert verdict.decision == "allow"
-    assert verdict.tagged_ids == ("Y-1",)
+    assert verdict.tagged_ids == ("SABLE-y1",)
 
 
 def test_overlap_check_denies_when_serialize_with_names_unrelated_bead():
     # Naming a DIFFERENT bead does not launder the actual overlap.
-    bead = {"id": "X-1", "notes": "WIP-CLAIMS: shared.py\nSerialize-with: Z-9"}
-    other = {"id": "Y-1", "notes": "WIP-CLAIMS: shared.py", "assignee": "tarzan"}
-    verdict = ssw.overlap_check("X-1", bead, [other])
+    bead = {
+        "id": "SABLE-x1",
+        "notes": "WIP-CLAIMS: shared.py\nSerialize-with: SABLE-z9",
+    }
+    other = {
+        "id": "SABLE-y1",
+        "notes": "WIP-CLAIMS: shared.py",
+        "assignee": "tarzan",
+    }
+    verdict = ssw.overlap_check("SABLE-x1", bead, [other])
     assert verdict.decision == "deny"
 
 
@@ -792,12 +825,19 @@ def test_bundle_serialize_with_is_read_from_the_whole_dispatch():
     """One worker, one branch, one merge — so the Serialize-with grant belongs to
     the DISPATCH, not to whichever bead happens to lead it. Mirrors the shell twin
     (pre-dispatch-overlap.sh aggregates SERIALIZE_WITH_STORED over DISPATCH_IDS)."""
-    lead = {"id": "X-1", "description": "S.\n\n## File footprint\nshared.py"}
-    sibling = {"id": "X-2", "notes": "Serialize-with: Y-9"}
-    foreign = {"id": "Y-9", "notes": "WIP-CLAIMS: shared.py", "assignee": "optimus"}
-    verdict = ssw.overlap_check("X-1", lead, [foreign], [sibling])
+    lead = {
+        "id": "SABLE-x1",
+        "description": "S.\n\n## File footprint\nshared.py",
+    }
+    sibling = {"id": "SABLE-x2", "notes": "Serialize-with: SABLE-y9"}
+    foreign = {
+        "id": "SABLE-y9",
+        "notes": "WIP-CLAIMS: shared.py",
+        "assignee": "optimus",
+    }
+    verdict = ssw.overlap_check("SABLE-x1", lead, [foreign], [sibling])
     assert verdict.decision == "allow"
-    assert verdict.tagged_ids == ("Y-9",)
+    assert verdict.tagged_ids == ("SABLE-y9",)
 
 
 def test_overlap_check_without_a_bundle_is_unchanged():
