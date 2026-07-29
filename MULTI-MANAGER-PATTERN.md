@@ -440,18 +440,37 @@ Claims exist *before* the worker starts editing, closing the dispatch-time race 
 
 A `PreToolUse:Edit|Write` hook reconciles emergent claims — if the worker modifies a file not declared in the bead description (legitimate scope creep), the file is appended to claims automatically.
 
-### 3. Overlap awareness (advisory, not blocking)
+### 3. Declared-footprint overlap is a scheduling constraint
 
-A `PreToolUse:Agent` hook reads claims from all in-progress beads. If the proposed dispatch would touch files claimed by another in-progress bead, the hook **annotates** rather than denies:
+The `PreToolUse:Agent` hook and `sable-spawn-worker` compare the proposed
+dispatch's declared file footprint with every *different* in-progress bead. If
+any path is shared, the dispatch is **denied**. The hook returns a hard
+`permissionDecision: deny`; `sable-spawn-worker` refuses the spawn with exit
+11 and names the overlapping bead(s) and paths.
 
-```
-OVERLAP DETECTED:
-  Proposed dispatch (bd-205): foo.ts, bar.ts
-  In-progress (bd-147, tarzan): foo.ts
-  Decision: dispatch will proceed; file a coord bead if intentional collaboration is needed.
-```
+There are exactly two operator remedies:
 
-The annotation is also pushed into the eventual PR description and the `for-chuck` notification bead, so Chuck can sequence merges intelligently. Information-rich, not enforcement-heavy.
+1. **Wait for every overlapping bead to clear** (close/land), then dispatch
+   again.
+2. Intentionally accept the overlap by adding an explicit
+   `Serialize-with: <bead-id>` line. Put the line in the Agent dispatch prompt
+   for the hook path, or in the dispatch bead's notes/description for
+   `sable-spawn-worker`. Every overlapping bead must be named; naming an
+   unrelated bead, or covering only some of several overlaps, does not bypass
+   the remaining constraint.
+
+An accepted declaration permits the dispatch and records reciprocal
+`serialize_with` metadata on both beads. That durable relation travels in the
+`for-chuck` handoff so Chuck can sequence the two merges instead of racing
+them. It is an explicit serialization decision, not a general overlap waiver.
+
+A footprint source that is present but names no readable path is a separate
+hard failure: the constraint could not be evaluated. The hook denies it, and
+`sable-spawn-worker` returns exit 12. Fix the `## File footprint` section to
+list comma-separated paths, or remove the empty declaration if the bead truly
+declares no files. A bead with no footprint source at all is allowed to
+dispatch, but is reported loudly as `NO-DECLARATION`; that is deliberately
+different from a footprint comparison that ran and found no overlap.
 
 ### 4. Selective dispatch preemption
 
@@ -681,7 +700,7 @@ All hooks live in `hooks/multi-manager/`. They compose with the existing SABLE h
 | `read-guard.sh` | PreToolUse:Bash | Deny `bd ready -l for-<foreign>` queries (Lincoln bypassed via `cross_inbox_read: true`) | Hard deny |
 | `notes-clobber-guard.sh` | PreToolUse:Bash | Deny `bd update <id> --notes` when the bead's notes are non-empty — `--notes` REPLACES the field and the loss is silent (SABLE-sm269). Empty notes and `--append-notes` pass silently; an unparseable command or unreadable bead fails OPEN but says so | Hard deny |
 | `pre-dispatch-claim.sh` | PreToolUse:Agent | Read bead description, write file claims to bead notes | Side effect (bd update) |
-| `pre-dispatch-overlap.sh` | PreToolUse:Agent | Annotate overlap with other in-progress beads | Inject context |
+| `pre-dispatch-overlap.sh` | PreToolUse:Agent | Deny declared-footprint overlap with other in-progress beads; allow only after every hit is named by `Serialize-with` and tag both sides for merge sequencing | Hard deny (unless every overlap is explicitly serialized) |
 | `pre-dispatch-preempt.sh` | PreToolUse:Agent | Block dispatch if P0 coord bead in inbox | Hard deny |
 | `pre-dispatch-model-check.sh` | PreToolUse:Agent | Enforce model ladder — bead `model:` label must match dispatch's model param, or prompt must include `Model override: <reason>` | Hard deny |
 | `edit-write-claim-reconciler.sh` | PreToolUse:Edit\|Write | Append modified file to bead claims | Side effect (bd update) |
