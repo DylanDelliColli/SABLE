@@ -130,9 +130,7 @@ def _clean_env(**overrides):
 
 
 def _refs_snapshot(repo: Path) -> set[str]:
-    """Full refs/heads snapshot of `repo` — used to assert a fixture that
-    mutates branches (worktree add/remove, branch -D) leaves the real repo's
-    tracked-branch set byte-identical before vs after (SABLE-0ssz.4)."""
+    """Return the names of every local branch in ``repo``."""
     r = subprocess.run(["git", "-C", str(repo), "for-each-ref", "refs/heads",
                         "--format=%(refname)"],
                        capture_output=True, text=True, check=True)
@@ -452,7 +450,7 @@ def test_dispatch_refused_on_notes_only_bead(sock):
         _delete_scratch_bead(bead_id)
 
 
-def test_spawn_without_worktree_lands_where_dispatch_points(sock):
+def test_spawn_without_worktree_lands_where_dispatch_points(sock, request):
     """SABLE-bldh.11 regression: with NO --worktree, the path `bd worktree create`
     actually creates MUST equal the path embedded in the dispatch file (== the
     tmux -c target) AND exist on disk. The original bug created the worktree
@@ -466,7 +464,25 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock):
     # SABLE-0ssz.4: fail fast on an orphan left by a prior hard-killed run
     # instead of silently colliding with `bd worktree create`'s own error.
     assert not expected.exists(), f"orphan worktree from a prior run at {expected}"
-    before_refs = _refs_snapshot(repo)
+    # SABLE-3yk8m: model an unrelated fleet actor creating a branch after this
+    # test starts. Cleanup must prove that this test's own artifacts are gone
+    # without treating legitimate concurrent repository activity as leakage.
+    unrelated_branch = f"wk-unrelated-{uuid.uuid4().hex[:8]}"
+    subprocess.run(
+        ["git", "-C", str(repo), "branch", unrelated_branch, "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    def cleanup_unrelated_branch():
+        subprocess.run(
+            ["git", "-C", str(repo), "branch", "-D", unrelated_branch],
+            capture_output=True,
+            text=True,
+        )
+
+    request.addfinalizer(cleanup_unrelated_branch)
     with tempfile.TemporaryDirectory() as dd:
         env = {
             **_clean_env(),
@@ -499,10 +515,10 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock):
                            capture_output=True, text=True)
             subprocess.run(["git", "-C", str(repo), "branch", "-D", wt_name],
                            capture_output=True, text=True)
-            # SABLE-0ssz.4: the real repo's branch set must be byte-identical
-            # before vs after — proves cleanup removed everything this run
-            # created and nothing else leaked.
-            assert _refs_snapshot(repo) == before_refs
+            refs_after_cleanup = _refs_snapshot(repo)
+            assert f"refs/heads/{wt_name}" not in refs_after_cleanup
+            assert f"refs/heads/{unrelated_branch}" in refs_after_cleanup
+            assert not expected.exists()
 
 
 def test_spawn_scope_already_prefixed_is_idempotent(sock):
