@@ -176,6 +176,89 @@ def test_report_names_which_anchor_rule_matched(isolated_lock, tmp_path):
 
 
 # --------------------------------------------------------------------------
+# SABLE-sx1rb: an INFRASTRUCTURE fault (the tier's OWN scratch bd DB
+# collided with a suite's own isolated init) must not be reported as a
+# CONTENT red naming the branch. Real end-to-end path, same harness as the
+# RED-report tests above — a real shell suite, run through
+# promote_lib.run_impact_tier, no mocked transport.
+# --------------------------------------------------------------------------
+
+def test_impact_tier_scratch_bd_init_failure_is_infrastructure_not_content_red(
+        isolated_lock, tmp_path):
+    """MEASURED signature from the wild (SABLE-r0mzn, SABLE-6eu9w): a suite
+    exits 2 with its own `FATAL: could not initialize an isolated per-run bd
+    DB: ... This workspace is already initialized.` self-report. That is the
+    tier's scratch failing to build, not a defect on the branch under test —
+    it must come back IMPACT_ERROR (which the decision layer already routes
+    to a re-preview, never naming the branch) instead of IMPACT_RED."""
+    suite = (
+        "#!/bin/sh\n"
+        "echo 'FATAL: could not initialize an isolated per-run bd DB: "
+        "Found existing Dolt database: /tmp/sable-impact-xxxx/beads/.beads/"
+        "embeddeddolt/impacttier - This workspace is already initialized.'\n"
+        "exit 2\n"
+    )
+    repo, sha = _real_repo_with_shell_impact_tier(tmp_path, suite)
+    outcome, detail = promote_lib.run_impact_tier(repo, sha, ["hooks/test/test-red-marker.sh"])
+    assert outcome == promote_lib.IMPACT_ERROR, detail
+    assert "infrastructure" in detail.lower(), (
+        f"the report must say this was infrastructure, not a branch defect: {detail!r}")
+    assert "FAILED on the combined tree" not in detail, (
+        f"an infrastructure abort must not read like a content-red report: {detail!r}")
+
+
+def test_impact_tier_genuine_test_failure_still_reports_content_red(isolated_lock, tmp_path):
+    """NEGATIVE CONTROL, load-bearing per the bead: a fix that reclassifies
+    every red as infrastructure would be strictly worse than one that blames
+    the branch for everything, because it fails PERMISSIVE. A real content
+    failure — the suite's own PASS/FAIL accounting, exit 1 — must still come
+    back IMPACT_RED, proving the fix discriminates rather than reclassifying
+    every red."""
+    suite = (
+        "#!/bin/sh\n"
+        f"echo 'FAIL: {MARKER}'\n"
+        "exit 1\n"
+    )
+    repo, sha = _real_repo_with_shell_impact_tier(tmp_path, suite)
+    outcome, detail = promote_lib.run_impact_tier(repo, sha, ["hooks/test/test-red-marker.sh"])
+    assert outcome == promote_lib.IMPACT_RED, detail
+    assert f"FAIL: {MARKER}" in detail, detail
+
+
+def test_impact_tier_exit_2_without_fatal_marker_still_reports_content_red(
+        isolated_lock, tmp_path):
+    """A second negative-control angle: exit code 2 ALONE (no `FATAL:` self-
+    report) must not be swallowed as infrastructure — a future suite reusing
+    2 for an unrelated reason would otherwise silently stop being
+    attributed to its branch. The classifier requires BOTH signals."""
+    suite = (
+        "#!/bin/sh\n"
+        f"echo 'FAIL: {MARKER} (unrelated use of exit code 2)'\n"
+        "exit 2\n"
+    )
+    repo, sha = _real_repo_with_shell_impact_tier(tmp_path, suite)
+    outcome, detail = promote_lib.run_impact_tier(repo, sha, ["hooks/test/test-red-marker.sh"])
+    assert outcome == promote_lib.IMPACT_RED, detail
+
+
+def test_is_suite_infra_abort_true_for_fatal_line_and_exit_2():
+    assert promote_lib._is_suite_infra_abort(
+        2, "FATAL: could not initialize an isolated per-run bd DB: boom")
+
+
+def test_is_suite_infra_abort_false_for_exit_1_even_with_fatal_text():
+    assert not promote_lib._is_suite_infra_abort(1, "FATAL: something")
+
+
+def test_is_suite_infra_abort_false_for_exit_2_without_fatal_line():
+    assert not promote_lib._is_suite_infra_abort(2, "FAIL: thing\n")
+
+
+def test_is_suite_infra_abort_false_for_exit_0():
+    assert not promote_lib._is_suite_infra_abort(0, "FATAL: unreachable in practice")
+
+
+# --------------------------------------------------------------------------
 # Direct coverage of the extracted helper — fast, no subprocess, pins the
 # anchoring/announcement logic the tests above exercise end-to-end.
 # --------------------------------------------------------------------------

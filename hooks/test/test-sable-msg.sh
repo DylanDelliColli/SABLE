@@ -257,7 +257,9 @@ fi
 # sandbox DB; the assertions below prove the live repo DB never gained a bead.
 if command -v bd >/dev/null 2>&1; then
   SCRATCH_BEADS_DIR="$(mktemp -d)"
-  ( cd "$SCRATCH_BEADS_DIR" && BD_NON_INTERACTIVE=1 bd init --prefix=sbx \
+  # -u BEADS_DB (SABLE-sx1rb): never inherit an ambient BEADS_DB (e.g. the
+  # impact tier's own) — this suite builds and must use its OWN isolated DB.
+  ( cd "$SCRATCH_BEADS_DIR" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=sbx \
       --non-interactive --skip-agents --skip-hooks --quiet >/dev/null 2>&1 )
 
   tmux_spawn_ new-window -d -t w: -n stuck 'sleep 60'
@@ -377,7 +379,9 @@ PY
   # Run against a throwaway "pretend-live" DB — simulating fleet activity by
   # writing to the REAL live DB is the very pollution this leg forbids.
   PRETEND_LIVE_DIR="$(mktemp -d)"
-  ( cd "$PRETEND_LIVE_DIR" && BD_NON_INTERACTIVE=1 bd init --prefix=plv \
+  # -u BEADS_DB (SABLE-sx1rb): never inherit an ambient BEADS_DB (e.g. the
+  # impact tier's own) — this suite builds and must use its OWN isolated DB.
+  ( cd "$PRETEND_LIVE_DIR" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=plv \
       --non-interactive --skip-agents --skip-hooks --quiet >/dev/null 2>&1 )
   PRETEND_LIVE_DB="$PRETEND_LIVE_DIR/.beads"
 
