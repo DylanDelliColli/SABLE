@@ -117,7 +117,10 @@ After reading, confirm in one short message that you understand and will follow:
    integration tests. Mocking the database in integration tests defeats the purpose.
    Smoke tests are encouraged but not gated.
 3. Issue Discovery: the moment you notice any bug, smell, or unexpected
-   behavior — even tangential to the current task — log a bead immediately.
+   behavior — even tangential to the current task — capture it with
+   `sable-note` before moving on. Captures become beads only through an
+   operator-invoked `/sable-review`, never at reflex speed. The one
+   exception: a defect blocking work in flight gets a bead immediately.
 4. Adoption stage: I am at the [Foundation | Hierarchy | Swarm] stage today.
    Default to single-agent sequential work unless I explicitly ask for swarm
    execution OR I've told you I'm at the Swarm stage. The full methodology
