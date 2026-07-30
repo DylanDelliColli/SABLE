@@ -47,7 +47,18 @@
 # go through sable_tmux_spawn — call tmux directly for those, as suites
 # already do.
 
-_SABLE_IDENTITY_VARS="SABLE_WORKER_PANE CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_BEAD"
+# SABLE_AGENT_NAME / SABLE_AGENT_ROLE are the PROVIDER-NEUTRAL identity vars and
+# they must lead this list, because the identity resolver reads them FIRST — a
+# suite that scrubs only the CLAUDE_* pair is still non-hermetic. Measured
+# 2026-07-30: test-active-contracts-integration.sh sets CLAUDE_AGENT_NAME=chuck
+# explicitly, yet run from the lincoln cockpit pane the boot hook injected the
+# real LINCOLN role card and the suite red-ed; the identical run under
+# `env -u SABLE_AGENT_NAME -u SABLE_AGENT_ROLE` went 14/14. That failure shape is
+# the worst kind: GREEN in CI (no ambient identity there) and RED for anyone
+# running the suite from inside a live pane — i.e. it fails for the people most
+# likely to run it locally and passes in the gate that is supposed to catch it.
+# Anything added to the identity resolver's precedence chain belongs here too.
+_SABLE_IDENTITY_VARS="SABLE_AGENT_NAME SABLE_AGENT_ROLE SABLE_WORKER_PANE CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_BEAD"
 
 # sable_scrub_identity_env — unset the ambient SABLE/Claude identity vars in
 # THIS shell so nothing spawned after this call (directly or via
