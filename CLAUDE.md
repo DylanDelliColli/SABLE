@@ -54,6 +54,36 @@ bd close <id>         # Complete work
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
 
+## Issue Discovery: Capture Is Mandatory, Filing Is Deliberate
+
+**This section is deliberately duplicated from the global `~/.claude/CLAUDE.md` because
+that file is Claude-only.** Codex reads `AGENTS.md` (a symlink to this file); nothing on
+this host loads `~/.claude/CLAUDE.md` into a Codex session — there is no
+`~/.codex/AGENTS.md`, no `instructions` key in `~/.codex/config.toml`, and
+`~/.codex/hooks.json` injects only `bd prime`. Since three of the four execution roles
+(optimus, tarzan, chuck) are Codex panes, doctrine that lives only in the global file
+reaches none of them. Keep this section in sync by hand (SABLE-jgax3).
+
+**Work** flows through beads. **Discovery** flows through capture-then-curate:
+
+```bash
+sable-note "<what's wrong, which file, one repro breadcrumb>"
+```
+
+Anything you merely *noticed* — a smell, a rough edge, a pre-existing bug tangential to
+your task — is captured, not filed. It enters the bead pool only through `/sable-review`,
+and **curation is operator-manual: it runs when the operator invokes it, never
+automatically.**
+
+**Carve-out: a defect that blocks or endangers in-flight work gets a bead immediately**,
+with full forensic detail while fresh. `bd ready` must remain the place where blocking
+defects surface at once.
+
+Not covered by this rule: auto-filed tooling exhaust (message-delivery fallback beads,
+`[reconcile]` records). That class is fixed at the send channel, not by a capture policy.
+
+See SABLE.md §3.7 for the full rationale.
+
 ## Non-Interactive Shell Commands
 
 **ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
