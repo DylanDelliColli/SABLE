@@ -192,6 +192,53 @@ def test_manager_kick_text_byte_identical_regression():
     assert spl.kick_message("chuck") == expected_chuck
 
 
+def _mock_codex_spawn_dependencies(monkeypatch, tmp_path):
+    monkeypatch.setattr(sm, "fleet_boundary_refusal", lambda: None)
+    monkeypatch.setattr(sm, "resolve_session", lambda socket=None: "sable")
+    monkeypatch.setattr(sm, "read_execution_authority", lambda base=None: {})
+    monkeypatch.setattr(sm, "repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(sm, "execution_provider", lambda role, base=None: "codex")
+    monkeypatch.setattr(sm, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(sm, "deliver_text", lambda *args, **kwargs: True)
+    monkeypatch.setattr(sm, "register_instance", lambda *args, **kwargs: "base")
+
+    def fake_run(argv, **kwargs):
+        stdout = "%9\n" if "new-window" in argv else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(sm.subprocess, "run", fake_run)
+
+
+def test_codex_spawn_refuses_missing_hook_graph_with_exact_remedy(
+    tmp_path, monkeypatch, capsys
+):
+    _mock_codex_spawn_dependencies(monkeypatch, tmp_path)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+
+    rc = sm.main(["optimus"])
+
+    assert rc != 0
+    assert (
+        "sable-orchestration-install --user --merge-settings"
+        in capsys.readouterr().err
+    )
+
+
+def test_codex_spawn_proceeds_with_installed_hook_graph(
+    tmp_path, monkeypatch
+):
+    _mock_codex_spawn_dependencies(monkeypatch, tmp_path)
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    (codex_home / "hooks.json").write_text('{"SessionStart": [{}]}')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    role = tmp_path / ".claude" / "sable" / "roles" / "optimus.md"
+    role.parent.mkdir(parents=True)
+    role.write_text("# Optimus")
+
+    assert sm.main(["optimus"]) == 0
+
+
 # --- SABLE-gbd: managers are ALWAYS Opus, the ladder is workers-only -------
 
 def test_manager_command_always_pins_opus(monkeypatch):
