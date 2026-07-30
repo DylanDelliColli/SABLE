@@ -8,6 +8,7 @@ rendering so launchers and hooks do not grow their own subtly different maps.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 from collections.abc import Mapping
@@ -54,6 +55,65 @@ CODEX_REASONING = {
 
 class ProviderMapError(ValueError):
     """The provider map cannot describe a valid execution session."""
+
+
+CODEX_HOOK_GRAPH_REMEDY = (
+    "sable-orchestration-install --user --merge-settings"
+)
+
+
+def codex_hook_graph_path(
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    """Resolve the user-scope Codex hook graph exactly as the installer does."""
+
+    env = os.environ if environment is None else environment
+    codex_home = (env.get("CODEX_HOME") or "").strip()
+    if codex_home:
+        return Path(codex_home) / "hooks.json"
+    claude_user_dir = (env.get("CLAUDE_USER_DIR") or "").strip()
+    if claude_user_dir:
+        return Path(claude_user_dir).parent / ".codex" / "hooks.json"
+    home = (env.get("HOME") or str(Path.home())).strip()
+    return Path(home) / ".codex" / "hooks.json"
+
+
+def validate_codex_hook_graph(
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    """Fail closed unless the installed Codex hook graph is non-empty JSON."""
+
+    path = codex_hook_graph_path(environment)
+    try:
+        raw = path.read_text()
+    except FileNotFoundError as exc:
+        raise ProviderMapError(
+            f"Codex hook graph is missing at {path}; install it with: "
+            f"{CODEX_HOOK_GRAPH_REMEDY}"
+        ) from exc
+    except OSError as exc:
+        raise ProviderMapError(
+            f"Codex hook graph cannot be read at {path}: {exc}; repair it with: "
+            f"{CODEX_HOOK_GRAPH_REMEDY}"
+        ) from exc
+    if not raw.strip():
+        raise ProviderMapError(
+            f"Codex hook graph is empty at {path}; install it with: "
+            f"{CODEX_HOOK_GRAPH_REMEDY}"
+        )
+    try:
+        graph = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ProviderMapError(
+            f"Codex hook graph is malformed JSON at {path}: {exc.msg}; "
+            f"repair it with: {CODEX_HOOK_GRAPH_REMEDY}"
+        ) from exc
+    if not isinstance(graph, dict) or not graph:
+        raise ProviderMapError(
+            f"Codex hook graph is empty at {path}; install it with: "
+            f"{CODEX_HOOK_GRAPH_REMEDY}"
+        )
+    return path
 
 
 def default_provider_map() -> dict[str, str]:

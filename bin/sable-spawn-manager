@@ -45,7 +45,7 @@ from sable_handoff_lib import (  # noqa: E402
 )
 from sable_provider_lib import (  # noqa: E402
     DEFAULT_PROVIDER, ProviderMapError, execution_provider, interactive_command,
-    pane_environment, provider_boot_message,
+    pane_environment, provider_boot_message, validate_codex_hook_graph,
 )
 from sable_registry_lib import (  # noqa: E402
     FLEET_PROJECT_ONLY_REMEDY, fleet_project_only, sable_registry_path,
@@ -504,6 +504,14 @@ def main(argv: list[str] | None = None) -> int:
             f"{detail}. Stand down/reap those panes before relaunch.\n"
         )
         return 5
+    if any(provider_by_role[role] == "codex" for role in to_spawn):
+        try:
+            validate_codex_hook_graph()
+        except ProviderMapError as e:
+            sys.stderr.write(
+                f"sable-spawn-manager: refusing Codex pane spawn: {e}\n"
+            )
+            return 5
     for role in skipped:
         sys.stderr.write(f"sable-spawn-manager: {role} already running — skipping\n")
 
