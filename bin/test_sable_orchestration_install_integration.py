@@ -117,6 +117,19 @@ def run_real_install(base, merge_settings=True):
     )
 
 
+def run_project_install(project, codex_home, *args):
+    """Run the real installer with every writable destination isolated."""
+    return subprocess.run(
+        ["bash", str(INSTALLER), "--project", *args],
+        env={
+            **os.environ,
+            "SABLE_PROJECT_DIR": str(project),
+            "CODEX_HOME": str(codex_home),
+        },
+        capture_output=True, text=True, timeout=180,
+    )
+
+
 def codex_hooks_path(base):
     return base.parent / ".codex" / "hooks.json"
 
@@ -294,6 +307,24 @@ def test_direct_real_install_is_print_only_without_consent(tmp_path):
     assert (base / "hooks" / "multi-manager" / "inline-body-guard.sh").is_file()
     assert not list(base.glob(".install-bak-*"))
     assert not settings.with_suffix(".json.bak").exists()
+
+
+def test_project_merge_reports_codex_scope_mismatch_without_writing_codex(tmp_path):
+    """REGRESSION (priority<=1): a successful project merge must not hide Codex."""
+    project = tmp_path / "project"
+    codex_home = tmp_path / "codex"
+    project.mkdir()
+
+    result = run_project_install(
+        project, codex_home, "--merge-settings",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not (codex_home / "hooks.json").exists()
+    assert (
+        "Codex lifecycle hooks are user-scoped and were not installed. "
+        "Re-run: sable-orchestration-install --user --merge-settings"
+    ) in result.stdout
 
 
 def test_malformed_settings_refuses_before_install_and_preserves_exact_bytes(tmp_path):

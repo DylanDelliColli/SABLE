@@ -39,6 +39,7 @@ valid_json(){ python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$1" 2>
 # ---------- project scope (explicit) ----------
 P="$(mktemp -d)"
 out1="$(SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --merge-settings 2>&1)"
+CODEX_SCOPE_NOTICE="Codex lifecycle hooks are user-scoped and were not installed. Re-run: sable-orchestration-install --user --merge-settings"
 exists "$P/.claude/skills/sable-plan/SKILL.md"    "project: /plan skill installed"
 exists "$P/.claude/skills/sable-execute/SKILL.md" "project: /execute skill installed"
 exists "$P/.claude/sable/roles/lincoln.md"  "project: lincoln role installed"
@@ -47,6 +48,7 @@ exists "$P/.claude/sable/roles/tarzan.md"   "project: tarzan pane role installed
 exists "$P/.claude/sable/roles/chuck.md"    "project: chuck pane role installed (tmux-native)"
 if [ ! -e "$P/.claude/agents-teams" ]; then pass "project: agents-teams defs NOT installed (tmux-only)"; else fail "project: agents-teams defs NOT installed (tmux-only)" "unexpected $P/.claude/agents-teams/"; fi
 if printf '%s' "$out1" | grep -q "sable-tmux"; then pass "project: install output points at the sable-tmux bring-up"; else fail "project: install output points at the sable-tmux bring-up" "no sable-tmux mention"; fi
+if printf '%s' "$out1" | grep -qF "$CODEX_SCOPE_NOTICE"; then pass "project: output explains Codex hooks require --user"; else fail "project: output explains Codex hooks require --user" "output=$out1"; fi
 if [ -x "$P/.claude/hooks/multi-manager/mode-interlock.sh" ]; then pass "project: interlock hook installed+exec"; else fail "project: interlock hook installed+exec"; fi
 SET="$P/.claude/settings.json"
 exists "$SET" "project: COMMITTED settings.json created"
@@ -276,7 +278,8 @@ rm -rf "$P2"
 
 # ---------- user scope ----------
 U="$(mktemp -d)"
-CLAUDE_USER_DIR="$U/.claude" bash "$INSTALLER" --user --merge-settings >/dev/null 2>&1
+user_out="$(CLAUDE_USER_DIR="$U/.claude" bash "$INSTALLER" --user --merge-settings 2>&1)"
+if printf '%s' "$user_out" | grep -qF "$CODEX_SCOPE_NOTICE"; then fail "user: project-scope Codex notice is absent" "output=$user_out"; else pass "user: project-scope Codex notice is absent"; fi
 exists "$U/.claude/skills/sable-execute/SKILL.md" "user: skill installed under ~/.claude"
 exists "$U/.claude/settings.json" "user: settings.json created"
 if [ "$(count_interlock "$U/.claude/settings.json")" = "2" ]; then pass "user: interlock registered on both legs"; else fail "user: interlock registered on both legs" "count=$(count_interlock "$U/.claude/settings.json")"; fi
@@ -301,7 +304,8 @@ if [ "$(count_marker "$U/.codex/hooks.json" tdd-gate.sh)" = "1" ]; then pass "us
 # ---------- uninstall (project) ----------
 # seed a legacy agents-teams dir from a pre-tmux-only install: uninstall must still clean it
 mkdir -p "$P/.claude/agents-teams"; touch "$P/.claude/agents-teams/chuck.md"
-SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --uninstall >/dev/null 2>&1
+project_uninstall_out="$(SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --uninstall 2>&1)"
+if printf '%s' "$project_uninstall_out" | grep -qi "Codex"; then fail "project uninstall: output says nothing about Codex" "output=$project_uninstall_out"; else pass "project uninstall: output says nothing about Codex"; fi
 if [ ! -e "$P/.claude/skills/sable-plan/SKILL.md" ]; then pass "uninstall removes skills"; else fail "uninstall removes skills"; fi
 if [ ! -e "$P/.claude/sable/agents.yaml" ]; then pass "uninstall removes registry"; else fail "uninstall removes registry"; fi
 if [ ! -e "$P/.claude/sable/roles/optimus.md" ] && [ ! -e "$P/.claude/sable/roles/chuck.md" ]; then pass "uninstall removes tmux-native pane roles"; else fail "uninstall removes tmux-native pane roles"; fi
