@@ -931,6 +931,8 @@ if [ -n "$CODEX_HOOKS" ]; then
             "$CODEX_HOOKS" "$SNIPPET_BASE" "codex/hooks.json" "$REFUSED_HOOK_NAMES" \
             "$SNIPPET"
     fi
+else
+    echo "Codex lifecycle hooks are user-scoped and were not installed. Re-run: sable-orchestration-install --user --merge-settings"
 fi
 
 # Stage the host timer entrypoint's systemd/cron artifacts (never activates them).
