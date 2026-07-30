@@ -43,9 +43,27 @@ if [ "$n" = "2" ]; then pass "add appends (does not overwrite)"; else fail "add 
 out="$(SABLE_ACTIVE_CONTRACTS="$CFILE" bash "$TOOL" show 2>/dev/null)"
 if printf '%s' "$out" | grep -q 'interim worker cap is 2'; then pass "show prints contracts"; else fail "show prints contracts" "got: ${out:0:120}"; fi
 
-SABLE_ACTIVE_CONTRACTS="$CFILE" bash "$TOOL" set "single replacing contract" >/dev/null 2>&1
+# ---------- SABLE-wx048: set must not silently destroy accumulated doctrine ----------
+# The /sable-execute flip prescribed `set` as its FIRST call, so every flip erased
+# everything accumulated since the last one (measured 2026-07-30: 25 of 29 committed
+# lines of operator doctrine destroyed by one flip). `set` on a NON-EMPTY surface now
+# refuses; the destructive path still exists but must be chosen on purpose.
+SABLE_ACTIVE_CONTRACTS="$CFILE" bash "$TOOL" set "single replacing contract" >/dev/null 2>&1; rc=$?
 n="$(grep -c '^- ' "$CFILE" 2>/dev/null || echo 0)"
-if [ "$n" = "1" ] && grep -q 'single replacing contract' "$CFILE"; then pass "set replaces the surface"; else fail "set replaces the surface" "count=$n"; fi
+if [ "$rc" -ne 0 ]; then pass "set on a NON-EMPTY surface refuses (nonzero)"; else fail "set on a NON-EMPTY surface refuses (nonzero)" "rc=$rc"; fi
+if [ "$n" = "2" ] && grep -q 'sable-merge-gate is the SOLE merge path' "$CFILE"; then pass "refused set PRESERVES prior entries"; else fail "refused set PRESERVES prior entries" "count=$n"; fi
+
+# NEGATIVE CONTROL: the fix must NARROW the destructive path, not remove it.
+# An explicitly-forced set still replaces the surface.
+SABLE_ACTIVE_CONTRACTS="$CFILE" bash "$TOOL" set --force "single replacing contract" >/dev/null 2>&1; rc=$?
+n="$(grep -c '^- ' "$CFILE" 2>/dev/null || echo 0)"
+if [ "$rc" -eq 0 ] && [ "$n" = "1" ] && grep -q 'single replacing contract' "$CFILE"; then pass "set --force still replaces the surface (negative control)"; else fail "set --force still replaces the surface (negative control)" "rc=$rc count=$n"; fi
+
+# set on an EMPTY/absent surface is the legitimate first write and must still work.
+EMPTYC="$TMP/first-write.md"
+SABLE_ACTIVE_CONTRACTS="$EMPTYC" bash "$TOOL" set "first contract on a fresh surface" >/dev/null 2>&1; rc=$?
+n="$(grep -c '^- ' "$EMPTYC" 2>/dev/null || echo 0)"
+if [ "$rc" -eq 0 ] && [ "$n" = "1" ]; then pass "set on an absent surface still writes (first-write path)"; else fail "set on an absent surface still writes (first-write path)" "rc=$rc count=$n"; fi
 
 SABLE_ACTIVE_CONTRACTS="$CFILE" bash "$TOOL" clear >/dev/null 2>&1
 if [ ! -f "$CFILE" ]; then pass "clear removes the surface"; else fail "clear removes the surface"; fi
