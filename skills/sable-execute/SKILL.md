@@ -135,18 +135,32 @@ merged with bare `git merge --no-ff` because his static identity still described
 the old manual flow. Persist the live contracts to disk so `session-role-anchor.sh`
 surfaces them into every fresh boot's identity:
 
+**Use `add` for every line — never `set`.** The surface ACCUMULATES across shifts:
+most of what a booting pane needs was written by earlier shifts, not by this flip.
+`set` REPLACES the whole surface, and this choreography used to lead with it —
+on 2026-07-30 one flip destroyed 25 of 29 committed lines of operator doctrine,
+including an entry marked BINDING ON EVERY INCOMING LINCOLN and the ruling naming
+the run's integration branch. They survived only because this one file is
+git-tracked (SABLE-ztks1), which is luck the mechanism must not depend on.
+`sable-contract set` now REFUSES (exit 3) against a non-empty surface for exactly
+this reason (SABLE-wx048); `set --force` is the deliberate reset.
+
 ```bash
-sable-contract set  "Merges go ONLY through sable-merge-gate. NO bare git merge/push on any integration branch."
+sable-contract add  "Merges go ONLY through sable-merge-gate. NO bare git merge/push on any integration branch."
 sable-contract add  "Workers self-push their worktree branch; Chuck's PRIMARY handoff is a direct tmux message; a durable for-chuck bead is created only if delivery fails, so its absence is healthy; Chuck merges via the gate."
 # add any interim fleet rule live this shift, e.g.:
 # sable-contract add "Interim worker cap: 2 per manager until SABLE-p8rf lands."
 ```
 
+Adding a line that already says the same thing is cheap and safe; erasing one that
+a previous shift is relying on is not — so when in doubt, `add`.
+
 `sable-contract` writes `<repo>/.claude/sable/state/active-contracts.md`, colocated
 with the mode-state (same per-repo resolution). Update it the moment a protocol
 flips — a contract change that lives only in this conversation dies with the next
-restart. Clear a rule with `sable-contract clear` / re-`set` when it no longer
-applies.
+restart. Retire a single rule with `sable-contract clear` (removes the surface) or
+`sable-contract set --force` (deliberate full reset) — both destroy accumulated
+history, so read the surface first and re-add what still applies.
 
 ## 2. Bring up the warm-pane session
 
