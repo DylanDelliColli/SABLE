@@ -98,6 +98,31 @@ def _without_ghost(line: str, provider: str = "claude") -> str:
     return _DIM_SPAN_RE.sub("", line)
 
 
+def _composer_line(
+    capture: str, provider: str = "claude"
+) -> tuple[int, str] | None:
+    """The bottom-most provider prompt row and its cleaned visible content.
+
+    Prompt glyphs also occur in transcript text, so a bare glyph anywhere in
+    the frame is not composer evidence. The editable composer is the last row
+    beginning with a provider glyph; Codex's dim ghost suggestion is removed
+    before deciding whether that row is empty.
+    """
+    glyphs = prompt_glyphs(provider)
+    lines = capture.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        cleaned = _clean(_without_ghost(lines[index], provider))
+        if cleaned.startswith(glyphs):
+            return index, cleaned
+    return None
+
+
+def composer_is_empty(capture: str, provider: str) -> bool:
+    """True when the provider's bottom-most composer row holds no input."""
+    composer = _composer_line(capture, provider)
+    return composer is not None and composer[1] in prompt_glyphs(provider)
+
+
 def pane_ready(capture: str, provider: str = "claude") -> bool:
     """The TUI is ready to accept input once its input box shows an EMPTY prompt
     line (just the prompt glyph). While booting (splash) or on a blocking gate
@@ -107,10 +132,7 @@ def pane_ready(capture: str, provider: str = "claude") -> bool:
     composer prompt at the bottom, so pane_ready returns True mid-turn — see
     pane_idle for the stronger "ready AND not mid-turn" predicate the interrupt
     path needs (SABLE-m6is)."""
-    for line in reversed(capture.splitlines()):
-        if _clean(_without_ghost(line, provider)) in prompt_glyphs(provider):
-            return True
-    return False
+    return composer_is_empty(capture, provider)
 
 
 # The status line a running Claude turn renders (whatever the spinner glyph /
@@ -131,14 +153,16 @@ def pane_busy(capture: str, provider: str = "claude") -> bool:
     return any(marker in hay for marker in _BUSY_MARKERS)
 
 
-def pane_idle(capture: str, provider: str = "claude") -> bool:
+def pane_idle(capture: str, provider: str) -> bool:
     """The pane is ready for a NEW submitted turn: its composer shows the empty
-    prompt (pane_ready) AND no turn is currently running (not pane_busy).
+    prompt AND no turn is currently running (not pane_working).
     --interrupt defers typing until THIS holds, not merely until pane_ready:
     a busy pane shows the empty composer prompt too, so typing on pane_ready
     alone raced the spinner redraw / composer-clear of the interrupted turn and
     silently dropped the message (SABLE-m6is)."""
-    return pane_ready(capture, provider) and not pane_busy(capture, provider)
+    return composer_is_empty(capture, provider) and not pane_working(
+        capture, provider
+    )
 
 
 # A running turn's status row carries a spinner glyph AND an elapsed-time timer
@@ -153,7 +177,7 @@ _SPINNER_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯�
 _ELAPSED_RE = re.compile(r"\b\d+m\s*\d+s\b|\b\d+s\b")
 
 
-def pane_working(capture: str, provider: str = "claude") -> bool:
+def pane_working(capture: str, provider: str) -> bool:
     """True while the pane is MID-TURN — a SUPERSET of pane_busy for the
     dialog-stall probe's authoritative not-busy guard (SABLE-tz9f). Returns True
     when pane_busy does (the "esc to interrupt" hint) OR when any line bears BOTH
@@ -167,9 +191,58 @@ def pane_working(capture: str, provider: str = "claude") -> bool:
     if pane_busy(capture, provider):
         return True
     for line in capture.splitlines():
-        if _SPINNER_RE.search(line) and _ELAPSED_RE.search(line):
+        # Claude completion summaries persist in transcript with the same
+        # spinner glyph and elapsed token as a live row (for example,
+        # "✻ Churned for 1s"). A live status row is progressive text and
+        # carries an ellipsis; requiring it retains the off-frame busy signal
+        # without making every completed Claude turn permanently working.
+        if (_SPINNER_RE.search(line) and _ELAPSED_RE.search(line)
+                and ("…" in line or "..." in line)):
             return True
     return False
+
+
+_PANE_BORDER_RE = re.compile(r"^[\s\-─│╭╮╰╯]*$")
+_PANE_CWD_RE = re.compile(r"^\s*\S+@\S+:")
+SABLE_MSG_MARK = "⟦SABLE-MSG⟧"
+
+
+def _is_pane_chrome(line: str) -> bool:
+    return bool(
+        not line or _PANE_BORDER_RE.match(line) or _PANE_CWD_RE.match(line)
+    )
+
+
+def deliberate_hold(capture: str, provider: str) -> bool | None:
+    """Classify a settled manager pane's tail by shape, not hold wording.
+
+    True means a bare composer has rendered turn output above it. False is a
+    dropped SABLE wake, a truncated turn, or a rate-limit cut. None means a
+    turn is active, the composer is not locatable, or non-SABLE text remains
+    deliberately held in the composer.
+    """
+    if pane_working(capture, provider):
+        return None
+
+    composer = _composer_line(capture, provider)
+    if composer is None:
+        return None
+    composer_index, composer_text = composer
+    if composer_text not in prompt_glyphs(provider):
+        return False if SABLE_MSG_MARK in composer_text else None
+
+    cleaned = [_clean(line) for line in capture.splitlines()]
+    above = [
+        line
+        for line in reversed(cleaned[:composer_index])
+        if not _is_pane_chrome(line)
+    ]
+    if not above:
+        return False
+    recent = "\n".join(reversed(above))
+    if session_limit_reset(recent, provider) is not None:
+        return False
+    return True
 
 
 def accept_startup_gate(capture: str) -> str | None:
@@ -369,12 +442,10 @@ def dispatch_landed(
     if not want or want not in _canon(capture):
         return False
     lines = capture.splitlines()
-    box_start = None
-    for i, line in enumerate(lines):
-        if _clean(line).startswith(prompt_glyphs(provider)):
-            box_start = i
-    if box_start is None:
+    composer = _composer_line(capture, provider)
+    if composer is None:
         return False
+    box_start = composer[0]
     if pane_busy("\n".join(lines[box_start + 1:]), provider):
         return True
     return want not in _canon("\n".join(lines[box_start:]))
@@ -470,12 +541,9 @@ def submitted_own_turn(
     if pane_idle(capture, provider):
         return True
     lines = capture.splitlines()
-    box_start = None
-    for i, line in enumerate(lines):
-        if _clean(line).startswith(prompt_glyphs(provider)):
-            box_start = i
-    return box_start is not None and pane_busy(
-        "\n".join(lines[box_start + 1:]), provider
+    composer = _composer_line(capture, provider)
+    return composer is not None and pane_busy(
+        "\n".join(lines[composer[0] + 1:]), provider
     )
 
 

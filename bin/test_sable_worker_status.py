@@ -1158,7 +1158,9 @@ def test_dialog_stall_false_on_idle_composer_with_numbered_block():
 def test_dialog_stall_false_on_busy_crafting_pane_with_queued_block():
     # the busy-guard near-miss: 'esc to interrupt' is NOT in frame, but the
     # spinner+elapsed status row proves the pane is working — never flag it.
-    assert sws.pane_working(BUSY_CRAFTING_WITH_QUEUED_BLOCK) is True
+    assert sws.pane_working(
+        BUSY_CRAFTING_WITH_QUEUED_BLOCK, "claude"
+    ) is True
     assert sws.dialog_stall(BUSY_CRAFTING_WITH_QUEUED_BLOCK) is False
 
 
@@ -1293,12 +1295,14 @@ def test_flag_dialog_stalls_ignores_busy_and_idle_false_positives():
 def test_pane_working_still_true_for_plain_esc_to_interrupt():
     # pane_working is a SUPERSET of pane_busy: the classic interrupt hint still
     # marks a working pane even without a visible elapsed timer.
-    assert sws.pane_working("● doing work\n✻ Thinking… (esc to interrupt)\n❯") is True
+    assert sws.pane_working(
+        "● doing work\n✻ Thinking… (esc to interrupt)\n❯", "claude"
+    ) is True
 
 
 def test_pane_working_false_for_idle_dialog():
     # a real idle dialog has neither a spinner nor a running timer.
-    assert sws.pane_working(REAL_PERMISSION_DIALOG) is False
+    assert sws.pane_working(REAL_PERMISSION_DIALOG, "claude") is False
 
 
 # --- SABLE-1g8i: sable-worker-status printed 'no worker panes' (a false-empty)
