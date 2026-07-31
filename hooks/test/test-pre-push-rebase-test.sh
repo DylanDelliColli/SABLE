@@ -261,10 +261,17 @@ assert_deny "«.sable» testCommand resolved and enforced → failing command de
 
 # Test 11c: .sable testCommand that passes → phase 3 runs clean, no deny and
 # no "no test command detected" fallback (proves manifest auto-detect was
-# bypassed in favor of the resolved .sable value)
+# bypassed in favor of the resolved .sable value).
+#
+# A passing push is no longer SILENT (SABLE-y4nom.4): it now carries a record
+# of the command actually executed. SABLE-b99hy is why — a worker narrowed
+# sable.testCommand to a two-file subset, pushed green, and restored it, so
+# the gate certified a narrower claim than it was configured to enforce while
+# printing "enforced". An allow that names what it ran is a strictly stronger
+# assertion than an allow that says nothing.
 echo "testCommand=true" > "$REPO_DIR/.sable"
-assert_allow "«.sable» testCommand resolved and enforced → passing command allows push" \
-  "$SABLE_TESTCMD_ENV" "git push" "$REPO_DIR"
+assert_context "«.sable» testCommand resolved and enforced → passing push RECORDS the executed command" \
+  "$SABLE_TESTCMD_ENV" "git push" "$REPO_DIR" "enforced test command (executed): \`true\`"
 
 # Test 11d: repo-local git config wins over the .sable file (precedence
 # mirrors sable_resolve_integration_branch's config > .sable ordering)
@@ -297,9 +304,36 @@ assert_deny "no per-repo override → 1s env default kills a 2s test command" \
 # push is allowed (proves the config override reaches the hook's `timeout`
 # call, not just the resolver function in isolation).
 git -C "$REPO_DIR" config sable.testTimeout 5
-assert_allow "repo-local git config testTimeout overrides 1s env default → 2s test command completes" \
-  "$SABLE_TIMEOUT_ENV" "git push" "$REPO_DIR"
+assert_context "repo-local git config testTimeout overrides 1s env default → 2s test command completes" \
+  "$SABLE_TIMEOUT_ENV" "git push" "$REPO_DIR" "enforced test command (executed): \`sleep 2 && exit 0\`"
 git -C "$REPO_DIR" config --unset sable.testTimeout
+
+# SABLE-y4nom.4 recorded-command leg: when a declared prior intent disagrees
+# with what actually ran, the gate reports the DIVERGENCE and certifies the
+# EXECUTED command — never the intent. SABLE-b99hy measured say-versus-do
+# divergence in both directions one drain apart, so a report of what was
+# enforced is not evidence of what was enforced.
+echo "testCommand=true" > "$REPO_DIR/.sable"
+assert_context "recorded-command: executed command is certified over a disagreeing prior intent" \
+  "$SABLE_TESTCMD_ENV SABLE_TEST_COMMAND_INTENT=pytest_bin_full" "git push" "$REPO_DIR" \
+  "DIVERGENCE: prior intent was \`pytest_bin_full\`"
+assert_context "recorded-command: the record names the command that actually ran" \
+  "$SABLE_TESTCMD_ENV SABLE_TEST_COMMAND_INTENT=pytest_bin_full" "git push" "$REPO_DIR" \
+  "enforced test command (executed): \`true\`"
+
+# Negative control: intent that AGREES must not manufacture a divergence.
+assert_context "recorded-command: agreeing intent reports no divergence" \
+  "$SABLE_TESTCMD_ENV SABLE_TEST_COMMAND_INTENT=true" "git push" "$REPO_DIR" \
+  "enforced test command (executed): \`true\`"
+DIVERGENCE_OUT=$(run_hook "$SABLE_TESTCMD_ENV SABLE_TEST_COMMAND_INTENT=true" "git push" "$REPO_DIR")
+if echo "$DIVERGENCE_OUT" | grep -qF "DIVERGENCE"; then
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  recorded-command: agreeing intent must not report a divergence"
+  echo "FAIL: recorded-command: agreeing intent must not report a divergence"
+else
+  PASS=$((PASS+1))
+  echo "PASS: recorded-command: agreeing intent must not report a divergence"
+fi
 
 rm -f "$REPO_DIR/.sable"
 
