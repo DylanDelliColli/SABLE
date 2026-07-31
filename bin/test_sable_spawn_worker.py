@@ -6,6 +6,7 @@ naming, dispatch-prompt assembly, bead JSON parsing.
 """
 import importlib.util
 import json
+import shlex
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
@@ -2237,6 +2238,199 @@ def test_worker_command_launches_interactive_codex_tui():
     assert "--model gpt-5.6-sol" in command
     assert "--cd /work/wk-sable-x" in command
     assert " exec " not in command
+
+
+# --- codex sandbox writable roots (SABLE-9qqrv) ------------------------------
+#
+# SABLE-82k8m granted Codex workers exactly ONE writable root, the git common
+# dir, because it was chasing a push failure. Everything else a worker
+# legitimately writes OUTSIDE its worktree is a SIBLING of `.git` under the repo
+# root, so the grant could not reach any of it: `.beads` (the tracker — bd close
+# at push, issue discovery, tdd-gate evidence, claim readback) and the
+# `sable-note` feedback dir (the mandatory discovery-capture funnel). Both are
+# strict descendants of the repo root, which is what lets us grant them WITHOUT
+# handing a worker write access to the whole primary checkout.
+
+def _roots_of(command: str) -> list[str]:
+    """The writable_roots list as it is actually rendered into the pane's start
+    command — parsed back out of the real shell string rather than read off an
+    intermediate, so a quoting or plumbing regression fails these tests too."""
+    for tok in shlex.split(command):
+        if tok.startswith("sandbox_workspace_write.writable_roots="):
+            body = tok.split("=", 1)[1].strip()
+            assert body.startswith("[") and body.endswith("]"), body
+            return [p.strip().strip('"') for p in body[1:-1].split(",") if p.strip()]
+    return []
+
+
+@pytest.fixture()
+def sandbox_repo(tmp_path, monkeypatch):
+    """A repo root carrying the three things a worker writes — the shared git
+    dir, the beads store, and the feedback dir — plus a LINKED WORKTREE beside
+    it, which is the only shape a worker ever runs in.
+
+    The resolvers are stubbed to the HEALTHY answers here so each test below
+    states only the resolution it is actually about; a test that cares about a
+    misresolving or absent store re-patches just that one."""
+    root = tmp_path / "repo"
+    (root / ".git").mkdir(parents=True)
+    (root / ".beads").mkdir()
+    (root / "feedback").mkdir()
+    tree = tmp_path / "wk-sable-x"
+    tree.mkdir()
+    monkeypatch.setattr(ssw, "repo_root", lambda base: str(root))
+    monkeypatch.setattr(ssw, "git_common_dir", lambda base: str(root / ".git"))
+    monkeypatch.setattr(ssw, "beads_root", lambda base: str(root / ".beads"))
+    monkeypatch.setattr(ssw, "feedback_root", lambda base: str(root / "feedback"))
+    return root, tree
+
+
+def test_codex_grant_covers_beads_store_beside_the_git_dir(sandbox_repo):
+    """The defect itself: the tracker must be reachable. Without this a Codex
+    worker cannot close its own bead, file a discovery bead, or record TDD
+    evidence — bd reads fail too, because embedded dolt takes locks."""
+    root, tree = sandbox_repo
+
+    roots = _roots_of(ssw.worker_command("sonnet", None, "codex", str(tree)))
+
+    assert str(root / ".git") in roots
+    assert str(root / ".beads") in roots
+
+
+def test_codex_grant_covers_the_sable_note_feedback_dir(sandbox_repo):
+    """`sable-note` is the MANDATORY discovery funnel, and it writes to a repo
+    sibling too — the same blind spot as `.beads`, found by the gotcha-(d) sweep
+    this bead required rather than by another live worker losing a cycle."""
+    root, tree = sandbox_repo
+
+    roots = _roots_of(ssw.worker_command("sonnet", None, "codex", str(tree)))
+
+    assert str(root / "feedback") in roots
+
+
+def test_codex_grant_never_widens_to_the_bare_repo_root(sandbox_repo):
+    """Gotcha (b), the one that makes this fix dangerous to get wrong: granting
+    the repo root would make every one of these tests pass while deleting the
+    worktree isolation boundary the whole model rests on. Each root must be a
+    STRICT descendant of the repo root, never the root itself."""
+    root, tree = sandbox_repo
+
+    roots = _roots_of(ssw.worker_command("sonnet", None, "codex", str(tree)))
+
+    assert roots, "expected a non-empty grant"
+    assert str(root) not in roots
+    for granted in roots:
+        assert granted != str(root)
+        assert Path(granted).parent == root or root in Path(granted).parents
+
+
+def test_codex_grant_drops_a_root_that_would_swallow_the_repo_root(monkeypatch,
+                                                                  sandbox_repo):
+    """The same guard, enforced against a resolver that MISRESOLVES rather than
+    against a caller that misconfigures: if a store ever resolves to the repo
+    root or above it, the root is dropped, not emitted. A resolver returning the
+    parent of the checkout must never silently become a full-checkout grant."""
+    root, tree = sandbox_repo
+    monkeypatch.setattr(ssw, "beads_root", lambda base: str(root))
+    monkeypatch.setattr(ssw, "feedback_root", lambda base: str(root.parent))
+
+    roots = _roots_of(ssw.worker_command("sonnet", None, "codex", str(tree)))
+
+    assert roots == [str(root / ".git")]
+
+
+def test_codex_grant_survives_unresolvable_stores(monkeypatch, sandbox_repo):
+    """A repo with no beads store and no sable-note on PATH still has to spawn a
+    worker — the grant degrades to what it can resolve rather than raising or
+    emitting empty strings."""
+    root, tree = sandbox_repo
+    monkeypatch.setattr(ssw, "beads_root", lambda base: None)
+    monkeypatch.setattr(ssw, "feedback_root", lambda base: None)
+
+    roots = _roots_of(ssw.worker_command("sonnet", None, "codex", str(tree)))
+
+    assert roots == [str(root / ".git")]
+
+
+def test_claude_workers_get_no_writable_roots(sandbox_repo):
+    """The grant is CODEX-ONLY — it exists to undo a Codex sandbox exclusion.
+    Claude workers have no such sandbox and must not acquire sandbox config."""
+    root, tree = sandbox_repo
+
+    command = ssw.worker_command("sonnet", None, "claude", str(tree))
+
+    assert "writable_roots" not in command
+    assert "sandbox_workspace_write" not in command
+
+
+def test_codex_grant_is_deduplicated_and_ordered(monkeypatch, sandbox_repo):
+    """A repo whose beads store and feedback dir resolve to the same place (or
+    to the git dir) must not emit that path twice — a duplicated root is
+    harmless to the sandbox but makes the operator-visible command unreadable
+    and hides which resolver actually contributed what."""
+    root, tree = sandbox_repo
+    monkeypatch.setattr(ssw, "git_common_dir", lambda base: str(root / ".beads"))
+    monkeypatch.setattr(ssw, "feedback_root", lambda base: str(root / ".beads"))
+
+    roots = _roots_of(ssw.worker_command("sonnet", None, "codex", str(tree)))
+
+    assert roots == [str(root / ".beads")]
+
+
+# --- beads-store resolution (SABLE-9qqrv) ------------------------------------
+#
+# The bead is explicit that the store must be RESOLVED, not hardcoded: a worker
+# in ANY repo needs the right root, so BEADS_DIR and bd's own auto-discovery
+# both have to be honoured. Asking `bd` itself is what makes that true for
+# redirects we do not model here.
+
+def test_beads_root_follows_beads_dir_override(monkeypatch, tmp_path):
+    """BEADS_DIR override, named directly by the test spec: a non-default store
+    location must be the granted root. Hardcoding `<repo>/.beads` passes every
+    other test in this file and strands exactly these workers."""
+    elsewhere = tmp_path / "elsewhere" / ".beads"
+    elsewhere.mkdir(parents=True)
+    tree = tmp_path / "wk-sable-x"
+    tree.mkdir()
+    monkeypatch.setenv("BEADS_DIR", str(elsewhere))
+
+    assert ssw.beads_root(str(tree)) == str(elsewhere)
+
+
+def test_beads_root_discovers_the_store_by_walking_up(monkeypatch, tmp_path):
+    """bd finds its store by walking up from CWD; with no override we must land
+    on the same directory bd would."""
+    monkeypatch.delenv("BEADS_DIR", raising=False)
+    root = tmp_path / "repo"
+    (root / ".beads").mkdir(parents=True)
+    nested = root / "a" / "b"
+    nested.mkdir(parents=True)
+
+    assert ssw.beads_root(str(nested)) == str(root / ".beads")
+
+
+def test_beads_root_none_when_no_store_exists(monkeypatch, tmp_path):
+    monkeypatch.delenv("BEADS_DIR", raising=False)
+    lonely = tmp_path / "lonely"
+    lonely.mkdir()
+
+    assert ssw.beads_root(str(lonely)) is None
+
+
+def test_beads_root_grants_the_directory_not_the_database_file(monkeypatch, tmp_path):
+    """Suggested-approach constraint: grant the `.beads` DIRECTORY, because dolt
+    writes lockfiles and siblings BESIDE the database. Granting the embedded
+    database file alone would block exactly the lock writes that make bd usable
+    — and would read as fixed right up until a worker took a write lock."""
+    monkeypatch.delenv("BEADS_DIR", raising=False)
+    root = tmp_path / "repo"
+    store = root / ".beads"
+    store.mkdir(parents=True)
+    (store / "embeddeddolt").write_text("db")
+    tree = root / "wk-sable-x"
+    tree.mkdir()
+
+    assert ssw.beads_root(str(tree)) == str(store)
 
 
 def test_pane_ready_false_while_booting():
