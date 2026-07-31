@@ -250,6 +250,51 @@ def test_deliver_text_idle_path_types_once_and_confirms_submission():
     ]
 
 
+def test_deliver_text_waits_before_sending_enter():
+    text = "submit after the paste-burst window"
+    events = []
+    typed = False
+
+    def run(cmd):
+        nonlocal typed
+        events.append(("run", cmd))
+        if "-l" in cmd:
+            typed = True
+        return True
+
+    def capture():
+        if not typed:
+            return "● prior output\n❯ "
+        return f"❯ {text}\n● accepted\n❯ "
+
+    assert lib.deliver_text(
+        ["tmux"],
+        "%8",
+        text,
+        text,
+        tries=1,
+        interval=0,
+        run=run,
+        capture=capture,
+        sleep=lambda delay: events.append(("sleep", delay)),
+    )
+
+    literal = ("run", ["tmux", "send-keys", "-t", "%8", "-l", text])
+    enter = ("run", ["tmux", "send-keys", "-t", "%8", "Enter"])
+    literal_index = events.index(literal)
+    enter_index = events.index(enter)
+    waits_between = [
+        delay
+        for kind, delay in events[literal_index + 1:enter_index]
+        if kind == "sleep"
+    ]
+    assert waits_between and max(waits_between) >= lib.SUBMIT_GAP_SECONDS
+
+    # Negative control: the fix inserts time, not another keystroke.
+    assert sum(kind == "run" and command[1] == "send-keys"
+               for kind, command in events) == 2
+
+
 def test_deliver_text_returns_false_when_literal_send_fails():
     calls = []
 
