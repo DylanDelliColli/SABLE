@@ -117,7 +117,7 @@ def _composer_line(
     return None
 
 
-def composer_is_empty(capture: str, provider: str = "claude") -> bool:
+def composer_is_empty(capture: str, provider: str) -> bool:
     """True when the provider's bottom-most composer row holds no input."""
     composer = _composer_line(capture, provider)
     return composer is not None and composer[1] in prompt_glyphs(provider)
@@ -153,7 +153,7 @@ def pane_busy(capture: str, provider: str = "claude") -> bool:
     return any(marker in hay for marker in _BUSY_MARKERS)
 
 
-def pane_idle(capture: str, provider: str = "claude") -> bool:
+def pane_idle(capture: str, provider: str) -> bool:
     """The pane is ready for a NEW submitted turn: its composer shows the empty
     prompt AND no turn is currently running (not pane_working).
     --interrupt defers typing until THIS holds, not merely until pane_ready:
@@ -177,7 +177,7 @@ _SPINNER_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯�
 _ELAPSED_RE = re.compile(r"\b\d+m\s*\d+s\b|\b\d+s\b")
 
 
-def pane_working(capture: str, provider: str = "claude") -> bool:
+def pane_working(capture: str, provider: str) -> bool:
     """True while the pane is MID-TURN — a SUPERSET of pane_busy for the
     dialog-stall probe's authoritative not-busy guard (SABLE-tz9f). Returns True
     when pane_busy does (the "esc to interrupt" hint) OR when any line bears BOTH
@@ -213,7 +213,7 @@ def _is_pane_chrome(line: str) -> bool:
     )
 
 
-def deliberate_hold(capture: str, provider: str = "claude") -> bool | None:
+def deliberate_hold(capture: str, provider: str) -> bool | None:
     """Classify a settled manager pane's tail by shape, not hold wording.
 
     True means a bare composer has rendered turn output above it. False is a

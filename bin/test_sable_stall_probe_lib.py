@@ -24,3 +24,12 @@ def test_stall_probe_reexports_the_one_pane_state_implementation():
         "capture",
         "provider",
     ]
+
+
+def test_reexport_requires_the_real_provider_for_a_codex_capture():
+    capture = REAL_PANE_CAPTURES["codex"]["idle"]
+
+    assert stall.deliberate_hold(capture, "codex") is True
+    assert stall.deliberate_hold(capture, "claude") is None
+    with pytest.raises(TypeError):
+        stall.deliberate_hold(capture)

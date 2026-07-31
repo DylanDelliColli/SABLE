@@ -98,6 +98,8 @@ def test_public_pane_state_predicates_share_one_interface():
             "capture",
             "provider",
         ]
+        assert inspect.signature(predicate).parameters["provider"].default \
+            is inspect.Parameter.empty
 
 
 def test_stray_prompt_line_cannot_hide_real_codex_held_text():
@@ -149,16 +151,16 @@ def test_pane_state_distinguishes_ready_busy_idle_and_working():
 
     assert lib.pane_ready(idle)
     assert not lib.pane_busy(idle)
-    assert lib.pane_idle(idle)
+    assert lib.pane_idle(idle, "claude")
 
     assert lib.pane_ready(busy)
     assert lib.pane_busy(busy)
-    assert not lib.pane_idle(busy)
-    assert lib.pane_working(busy)
+    assert not lib.pane_idle(busy, "claude")
+    assert lib.pane_working(busy, "claude")
 
     assert not lib.pane_busy(spinner_only)
-    assert lib.pane_working(spinner_only)
-    assert not lib.pane_working("● completed item 8s ago")
+    assert lib.pane_working(spinner_only, "claude")
+    assert not lib.pane_working("● completed item 8s ago", "claude")
 
 
 @pytest.mark.parametrize(

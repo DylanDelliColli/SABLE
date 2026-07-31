@@ -1530,10 +1530,12 @@ def test_pane_busy_true_only_while_turn_running():
 def test_pane_idle_requires_ready_and_not_busy():
     # the crux: a busy pane is READY (has the empty prompt) but NOT idle
     assert sable_msg.pane_ready(_BUSY_SCREEN) is True
-    assert sable_msg.pane_idle(_BUSY_SCREEN) is False
-    assert sable_msg.pane_idle(_IDLE_SCREEN) is True
+    assert sable_msg.pane_idle(_BUSY_SCREEN, "claude") is False
+    assert sable_msg.pane_idle(_IDLE_SCREEN, "claude") is True
     # a booting pane (no prompt yet) is neither ready nor idle
-    assert sable_msg.pane_idle("╭─ Claude Code ─╮\n│ booting… │") is False
+    assert sable_msg.pane_idle(
+        "╭─ Claude Code ─╮\n│ booting… │", "claude"
+    ) is False
 
 
 def test_interrupt_sends_escape_once_and_defers_injection_until_idle():

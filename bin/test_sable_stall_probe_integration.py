@@ -68,7 +68,7 @@ def test_settled_hold_pane_is_not_stall(sock):
 
     capture = _tmux(sock, "capture-pane", "-t", pane, "-p", "-J").stdout
     assert "Standing down" in capture
-    assert deliberate_hold(capture) is True
+    assert deliberate_hold(capture, "claude") is True
 
 
 def test_unanswered_wake_pane_is_stall(sock):
@@ -82,4 +82,4 @@ def test_unanswered_wake_pane_is_stall(sock):
 
     capture = _tmux(sock, "capture-pane", "-t", pane, "-p", "-J").stdout
     assert "SABLE-MSG" in capture
-    assert deliberate_hold(capture) is False
+    assert deliberate_hold(capture, "claude") is False
