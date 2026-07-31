@@ -17,6 +17,10 @@ import time
 
 from sable_provider_lib import agent_name, normalize_provider
 
+# Codex suppresses Enter for 120ms after detecting paste-burst input. Keep a
+# 30ms margin above that measured provider window (SABLE-dm6ek).
+SUBMIT_GAP_SECONDS = 0.15
+
 # Non-printable control bytes (except \t\n which are whitespace-handled). A
 # stray echoed Escape on the prompt line must not defeat glyph detection
 # (SABLE-zaum).
@@ -540,11 +544,11 @@ def wait_for_idle(base, pane, timeout, interval=0.5, capture=None, sleep=None,
 def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
                  run=None, capture=None, sleep=None,
                  provider: str = "claude") -> bool:
-    """Type `text` into the pane and submit it — Enter is sent IMMEDIATELY after
-    the text (submission must not depend on the landed-check failing first,
-    SABLE-1umr), then resent until the text leaves the input box (the
-    dropped-Enter race). A resent Enter on an already-empty box is a harmless
-    no-op. Returns False (clean) if the pane vanishes.
+    """Type `text` into the pane and submit it — Enter is sent after the short
+    paste-burst suppression gap (submission must not depend on the landed-check
+    failing first, SABLE-1umr), then resent until the text leaves the input box
+    (the dropped-Enter race). A resent Enter on an already-empty box is a
+    harmless no-op. Returns False (clean) if the pane vanishes.
 
     A landing is only counted when the pane was IDLE at send time — pane_idle at
     t0, captured BEFORE typing (SABLE-d21h). A message typed into a BUSY pane
@@ -595,6 +599,7 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
     if not already_pending:
         if run(base + ["send-keys", "-t", pane, "-l", text]) is False:
             return False
+        sleep(SUBMIT_GAP_SECONDS)
         if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
             return False
     if not idle_at_send:
@@ -631,6 +636,7 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
             # via submitted_own_turn once the composer clears and the line lands.
             if (not pane_working(cap, provider) and _already_pending(cap, snippet)
                     and not dispatch_landed(cap, snippet, provider)):
+                sleep(SUBMIT_GAP_SECONDS)
                 if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
                     return False
         return submitted_own_turn(capture(), snippet, provider)
@@ -638,6 +644,7 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
         sleep(interval)
         if dispatch_landed(capture(), snippet, provider):
             return True
+        sleep(SUBMIT_GAP_SECONDS)
         if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
             return False
     return dispatch_landed(capture(), snippet, provider)
