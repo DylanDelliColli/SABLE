@@ -46,12 +46,340 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable, Mapping
 
 import sable_gate_git_lib as git_lib
 
 LABEL = "suite-optimization"
 KEY_PREFIX = "budget-key:"
+
+# A derived budget exists to BOUND a runaway command, not to ASSERT a duration.
+# Performance enforcement is a separate, already-built lane: check_and_file()
+# below files a suite-optimization bead when a tier's real total drifts past
+# its declared budget. Keeping the two apart is what lets this factor be
+# generous — SABLE-af7u4 measured a wall-clock cap that FAILED at 10.04s and
+# PASSED at 10.16s on the same code, so a tight multiple of a measured cost is
+# a load detector, not a correctness signal, and every false trip it produces
+# costs a full verdict (exit 124, nothing verified).
+DERIVED_HEADROOM_FACTOR = 2.0
+
+
+@dataclass(frozen=True)
+class SuiteCosts:
+    """Measured wall-clock seconds keyed by executable suite identity."""
+
+    python: Mapping[str, float]
+    shell: Mapping[str, float]
+
+
+@dataclass(frozen=True)
+class ExecutionShard:
+    """One command-sized shard whose budget is derived from its members."""
+
+    kind: str
+    suites: tuple[str, ...]
+    measured_seconds: float
+    budget_seconds: float
+
+
+@dataclass(frozen=True)
+class DerivedPlan:
+    """A bounded execution plan plus an explicit incomplete-verification set.
+
+    ``omitted`` is the whole point of the type: a plan that cannot fit its
+    ceiling must say what it left unverified BY NAME. An implementation that
+    quietly returned a shorter shard list would be the silent narrowing this
+    module exists to prevent (SABLE-b99hy).
+    """
+
+    shards: tuple[ExecutionShard, ...]
+    omitted: tuple[str, ...]
+    measured_seconds: float
+    ceiling_seconds: float
+    budget_seconds: float = 0.0
+    # Suites running on a provisional (unmeasured) cost. Reported so a large
+    # derived total is legible as "mostly guesses" rather than mistaken for a
+    # measurement, and so the suppressed trim is explainable.
+    provisional: tuple[str, ...] = ()
+
+
+def _positive_seconds(value: object, *, identity: str) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"non-numeric measured cost for {identity}: {value!r}") from exc
+    if seconds <= 0:
+        raise ValueError(f"measured cost for {identity} must be positive")
+    return seconds
+
+
+def load_python_cost_report(path: str | Path) -> dict[str, float]:
+    """Read conftest.py's existing module-level cost report."""
+    report = json.loads(Path(path).read_text())
+    modules = report.get("modules")
+    if not isinstance(modules, list):
+        raise ValueError(f"Python cost report has no modules list: {path}")
+    costs: dict[str, float] = {}
+    for record in modules:
+        if not isinstance(record, dict) or not record.get("module"):
+            raise ValueError(f"invalid Python module cost record in {path}: {record!r}")
+        identity = str(record["module"])
+        costs[identity] = _positive_seconds(
+            record.get("seconds"), identity=identity,
+        )
+    return costs
+
+
+def load_shell_cost_profile(path: str | Path) -> dict[str, float]:
+    """Read shell-run-set.sh's existing tab-separated suite profile."""
+    lines = Path(path).read_text().splitlines()
+    if not lines or lines[0] != "suite\tstatus\tseconds":
+        raise ValueError(f"invalid shell cost profile header: {path}")
+    costs: dict[str, float] = {}
+    for line in lines[1:]:
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != 3:
+            raise ValueError(f"invalid shell cost profile row in {path}: {line!r}")
+        identity, status, raw_seconds = fields
+        if status != "pass":
+            continue
+        costs[identity] = _positive_seconds(raw_seconds, identity=identity)
+    return costs
+
+
+def load_suite_costs(
+    python_report: str | Path,
+    shell_profile: str | Path,
+) -> SuiteCosts:
+    """Load the two reporters that already own timing collection."""
+    return SuiteCosts(
+        python=load_python_cost_report(python_report),
+        shell=load_shell_cost_profile(shell_profile),
+    )
+
+
+def derived_seconds(
+    measured_seconds: float,
+    *,
+    headroom_factor: float = DERIVED_HEADROOM_FACTOR,
+) -> float:
+    """Turn an observed cost into a budget without introducing a time literal."""
+    measured = _positive_seconds(measured_seconds, identity="suite aggregate")
+    if headroom_factor < 1:
+        raise ValueError("headroom factor must be at least 1")
+    return measured * headroom_factor
+
+
+def has_measurements(costs: SuiteCosts) -> bool:
+    """Whether ANY measurement exists to derive from.
+
+    With an empty cost set there is no measured quantity in play, so nothing
+    can be derived and the caller must say so rather than invent a number.
+    """
+    return bool(costs.python) or bool(costs.shell)
+
+
+def provisional_seconds(costs: SuiteCosts, kind: str | None = None) -> float:
+    """The stand-in cost for a suite the reports have never measured.
+
+    A brand-new test file has no measurement, and dropping it as "unmeasured"
+    would mean the gate never runs the very test the change added — the exact
+    silent narrowing this module exists to prevent. So an unmeasured suite is
+    assumed to cost as much as the MOST EXPENSIVE thing of its OWN KIND we
+    have ever measured: conservative enough to reach a verdict, still derived
+    from real data rather than a literal.
+
+    KIND-AWARE ON PURPOSE. Measured on this repo: the priciest Python module
+    is a 200s integration suite, while shell suites are far cheaper. Charging
+    an unmeasured shell suite 200s would let a handful of them exhaust a real
+    ceiling and trigger a trim that the actual costs never justified — a
+    conservative estimate turning into the narrowing it was meant to avoid.
+    Only when its own kind has no measurements at all does it fall back to the
+    overall maximum.
+    """
+    same_kind = {"python": costs.python, "shell": costs.shell}.get(kind or "", {})
+    observed = list(same_kind.values()) or [*costs.python.values(), *costs.shell.values()]
+    if not observed:
+        raise ValueError("no measurements: nothing to derive a provisional cost from")
+    return max(_positive_seconds(value, identity="provisional") for value in observed)
+
+
+def _cost_entries(
+    python_suites: Iterable[str],
+    shell_suites: Iterable[str],
+    costs: SuiteCosts,
+) -> list[tuple[str, str, float]]:
+    """Cost every selected suite as (kind, suite, seconds), measured or not.
+
+    The fourth field records whether the cost is a real MEASUREMENT or a
+    provisional stand-in — the trim is not allowed to act on the latter.
+    """
+    cached: dict[str, float] = {}
+
+    def cost_of(suite: str, table: Mapping[str, float], kind: str) -> tuple[float, bool]:
+        if suite in table:
+            return _positive_seconds(table[suite], identity=suite), True
+        if kind not in cached:
+            cached[kind] = provisional_seconds(costs, kind)
+        return cached[kind], False
+
+    entries = [
+        ("python", suite, *cost_of(suite, costs.python, "python"))
+        for suite in python_suites
+    ]
+    entries.extend(
+        ("shell", suite, *cost_of(suite, costs.shell, "shell"))
+        for suite in shell_suites
+    )
+    return entries
+
+
+def _trim_to_ceiling(
+    entries: list[tuple[str, str, float, bool]],
+    ceiling_seconds: float,
+) -> tuple[list[tuple[str, str, float, bool]], list[str]]:
+    """Drop the most expensive suites until the MEASURED total fits.
+
+    The fit question is "will this actually finish inside the ceiling?", so it
+    is asked of the measured cost, NOT of the padded per-command budget.
+    Padding both would double-count the headroom: this repo's own full Python
+    suite measures ~1569s against an 1800s bound and fits comfortably, yet
+    against a 2x-padded 3138s it would "not fit" and half of it would be
+    trimmed away — turning the headroom that exists to PREVENT false timeouts
+    into a cause of silent narrowing.
+
+    A TRIM MAY NEVER ACT ON A PROVISIONAL COST. If any selected suite is
+    unmeasured this returns everything untouched: dropping a real suite to
+    satisfy a ceiling computed partly from invented numbers is the same silent
+    narrowing by another route. Measured on this repo — a Python cost report
+    with no shell profile made all 95 shell suites inherit the 200s Python
+    maximum, and 88 of them were "trimmed" on the strength of a number nobody
+    measured. Provisional costs may SIZE a per-command budget (generously);
+    they may not decide what goes unverified.
+
+    Most-expensive-first is chosen deliberately: for a given ceiling it leaves
+    the LARGEST NUMBER of suites still verified. The dropped names are returned
+    so the caller can print them — a trim nobody can see is a narrowing.
+    """
+    kept = list(entries)
+    if any(not measured for *_, measured in kept):
+        return kept, []
+    dropped: list[str] = []
+    while kept and sum(cost for _, _, cost, _ in kept) > ceiling_seconds:
+        index = max(range(len(kept)), key=lambda i: (kept[i][2], kept[i][1]))
+        dropped.append(kept.pop(index)[1])
+    return kept, sorted(dropped)
+
+
+def _pack_python_shards(
+    entries: Iterable[tuple[str, str, float, bool]],
+    shard_ceiling_seconds: float,
+    *,
+    headroom_factor: float,
+) -> list[ExecutionShard]:
+    """Split the Python selection into commands that each fit the shard bound.
+
+    Splitting does not reduce total cost; it keeps any SINGLE command's derived
+    timeout under the bound so one oversized pytest process cannot swallow the
+    whole run and return exit 124 with no verdict.
+    """
+    shards: list[ExecutionShard] = []
+    current: list[str] = []
+    current_cost = 0.0
+
+    def flush() -> None:
+        nonlocal current, current_cost
+        if current:
+            shards.append(ExecutionShard(
+                "python",
+                tuple(current),
+                current_cost,
+                derived_seconds(current_cost, headroom_factor=headroom_factor),
+            ))
+            current = []
+            current_cost = 0.0
+
+    for _, suite, cost, _measured in entries:
+        if current and derived_seconds(
+            current_cost + cost, headroom_factor=headroom_factor,
+        ) > shard_ceiling_seconds:
+            flush()
+        current.append(suite)
+        current_cost += cost
+    flush()
+    return shards
+
+
+def derive_plan(
+    python_suites: Iterable[str],
+    shell_suites: Iterable[str],
+    costs: SuiteCosts,
+    ceiling_seconds: float,
+    *,
+    headroom_factor: float = DERIVED_HEADROOM_FACTOR,
+    shard_max_seconds: float | None = None,
+    min_shard_seconds: float = 0.0,
+) -> DerivedPlan:
+    """Turn a selected suite set plus measurements into a plan that can finish.
+
+    Every command's budget is DERIVED from the measured cost of its own
+    members, so a bigger honest selection is granted a bigger budget instead of
+    being cut off by a fixed number it never had a chance against.
+
+    ``ceiling_seconds`` bounds the TOTAL. When the derived total exceeds it the
+    plan TRIMS — dropping suites and naming them in ``omitted`` — and when a
+    single Python command would exceed ``shard_max_seconds`` the plan SPLITS.
+    What it never does is return a plan that cannot complete.
+
+    ``min_shard_seconds`` is a per-command MINIMUM grant, not a ceiling: a
+    suite measured at 0.3s would otherwise derive a sub-second timeout and trip
+    on ordinary machine load. It only ever raises a small budget, so it cannot
+    push a plan over ``ceiling_seconds`` that the trim above already fitted.
+    """
+    if ceiling_seconds <= 0:
+        raise ValueError("ceiling must be positive")
+    shard_ceiling = (
+        ceiling_seconds if shard_max_seconds is None else float(shard_max_seconds)
+    )
+    if shard_ceiling <= 0:
+        raise ValueError("shard bound must be positive")
+
+    entries = _cost_entries(python_suites, shell_suites, costs)
+    kept, omitted = _trim_to_ceiling(entries, ceiling_seconds)
+    packed = _pack_python_shards(
+        [entry for entry in kept if entry[0] == "python"],
+        shard_ceiling,
+        headroom_factor=headroom_factor,
+    )
+    packed.extend(
+        ExecutionShard(
+            "shell", (suite,), cost,
+            derived_seconds(cost, headroom_factor=headroom_factor),
+        )
+        for kind, suite, cost, _measured in kept if kind == "shell"
+    )
+    floor = max(0.0, float(min_shard_seconds))
+    shards = tuple(
+        ExecutionShard(
+            shard.kind,
+            shard.suites,
+            shard.measured_seconds,
+            max(shard.budget_seconds, floor),
+        )
+        for shard in packed
+    )
+    return DerivedPlan(
+        shards,
+        tuple(omitted),
+        sum(shard.measured_seconds for shard in shards),
+        float(ceiling_seconds),
+        sum(shard.budget_seconds for shard in shards),
+        tuple(sorted(suite for _, suite, _, measured in kept if not measured)),
+    )
 
 
 def tier_budget_sec(repo: str, tier: str) -> float | None:
