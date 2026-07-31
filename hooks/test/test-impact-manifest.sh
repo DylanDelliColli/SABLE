@@ -272,6 +272,76 @@ else
   fail "(d) extensionless Python CLI with matching pytest module -> scoped zero shell suites" "rc=$RC_D3 out=$OUT_D3 err=$ERR_D3"
 fi
 
+# ---------------------------------------------------------------------------
+# Case (e): the golden-manifest pin rule (SABLE-slip0.7). A changed path that
+# hooks/test/fixtures/install-golden-manifest.txt pins a hash FOR also selects
+# test-install-golden-manifest.sh — the suite that compares each pin against
+# sha256 of its repo source. That is what stops "edit an installed artifact,
+# forget its pin" from passing a proportional run, which is how three golden
+# entries had already gone stale unnoticed.
+#
+# Exercised here against a SYNTHETIC golden, so these assertions test the RULE
+# (does the selector read the manifest it is given?) rather than today's real
+# artifact list — test-impact-selection.sh case 9 covers the real declarations.
+# ---------------------------------------------------------------------------
+FIX_E="$(new_fixture case-e)"
+mkdir -p "$FIX_E/hooks/test/fixtures"
+cp "$REPO/hooks/test/lib-golden-manifest.sh" "$FIX_E/hooks/test/lib-golden-manifest.sh"
+mk_lib "$FIX_E" lib-e.sh
+mk_hook "$FIX_E" hook-e.sh '. "$(dirname "${BASH_SOURCE[0]}")/lib-e.sh"'
+mk_suite "$FIX_E/hooks/test/test-fixture-e.sh"
+mk_suite "$FIX_E/hooks/test/test-install-golden-manifest.sh"
+
+E_GOLDEN="$FIX_E/hooks/test/fixtures/install-golden-manifest.txt"
+E_HASH="1111111111111111111111111111111111111111111111111111111111111111"
+# A pinned verbatim artifact, plus a GOLDEN_DERIVED entry (./CLAUDE.md is a
+# merge result, not a copy) that must NOT become a pinned source.
+{
+  printf '%s  ./hooks/multi-manager/hook-e.sh\n' "$E_HASH"
+  printf '%s  ./CLAUDE.md\n' "$E_HASH"
+} > "$E_GOLDEN"
+
+set_manifest "$FIX_E" "test-fixture-e.sh,test-install-golden-manifest.sh" '{}' \
+  '{"test-fixture-e.sh": "hooks/multi-manager/hook-e.sh"}' \
+  '{"hooks/multi-manager/lib-e.sh": "test-fixture-e.sh"}'
+
+E_SEL=$(bash "$FIX_E/.github/ci/impact-manifest.sh" --select hooks/multi-manager/hook-e.sh 2>/dev/null | sort)
+E_EXPECTED=$(printf 'test-fixture-e.sh\ntest-install-golden-manifest.sh' | sort)
+if [ "$E_SEL" = "$E_EXPECTED" ]; then
+  pass "(e) a golden-pinned artifact selects BOTH its own covering suite and the golden suite"
+else
+  fail "(e) a golden-pinned artifact selects BOTH its own covering suite and the golden suite" "got: $E_SEL"
+fi
+
+# A GOLDEN_DERIVED entry is excused from the hash check, so it must not be
+# published as a pinned source either — otherwise the two halves of the lib
+# would disagree about what the manifest covers.
+E_DERIVED_SEL=$(bash "$FIX_E/.github/ci/impact-manifest.sh" --select CLAUDE.md 2>/dev/null | sort)
+if ! printf '%s\n' "$E_DERIVED_SEL" | grep -qx 'test-fixture-e.sh' \
+   || ! printf '%s\n' "$E_DERIVED_SEL" | grep -qx 'test-install-golden-manifest.sh'; then
+  fail "(e) a GOLDEN_DERIVED golden entry is not a pinned source — it stays unmapped, not silently golden-covered" "got: $E_DERIVED_SEL"
+else
+  # Unmapped => the full ALLOW set, which here happens to contain both suites.
+  E_DERIVED_NOTICE=$(bash "$FIX_E/.github/ci/impact-manifest.sh" --select CLAUDE.md 2>&1 1>/dev/null)
+  if printf '%s' "$E_DERIVED_NOTICE" | grep -q 'FULL -- unmapped path(s): CLAUDE.md'; then
+    pass "(e) a GOLDEN_DERIVED golden entry is not a pinned source — it stays unmapped, not silently golden-covered"
+  else
+    fail "(e) a GOLDEN_DERIVED golden entry is not a pinned source — it stays unmapped, not silently golden-covered" \
+         "notice: $E_DERIVED_NOTICE"
+  fi
+fi
+
+# NEGATIVE CONTROL: drop the artifact's line from the golden. The same path must
+# stop selecting the golden suite — proving the selection is READ FROM the
+# manifest, not hardcoded against a path list that would rot beside it.
+printf '%s  ./CLAUDE.md\n' "$E_HASH" > "$E_GOLDEN"
+E_SEL2=$(bash "$FIX_E/.github/ci/impact-manifest.sh" --select hooks/multi-manager/hook-e.sh 2>/dev/null | sort)
+if [ "$E_SEL2" = "test-fixture-e.sh" ]; then
+  pass "(e) NEGATIVE CONTROL: un-pinning the artifact stops selecting the golden suite (the rule reads the manifest)"
+else
+  fail "(e) NEGATIVE CONTROL: un-pinning the artifact stops selecting the golden suite (the rule reads the manifest)" "got: $E_SEL2"
+fi
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
