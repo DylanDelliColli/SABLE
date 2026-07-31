@@ -8,27 +8,47 @@ turned that durable state back into a resume plan was done BY HAND. This codifie
 it: one command reproduces the manual post-crash forensics and orders the resume
 steps.
 
-It answers four questions, read-only by default:
+It answers five questions, read-only by default:
 
-  1. For every git worktree: is its branch pushed / ahead / unpushed vs origin,
-     is the tree dirty, and which bead owns it (a live pane's @sable_bead tag,
-     else the `wk-<bead>` branch name)?
+  1. For every git worktree: is its branch pushed / ahead / diverged / unpushed
+     vs origin, is the tree dirty, and which bead owns it (a live pane's
+     @sable_bead tag, else the `wk-<bead>` branch name)?
   2. Which in_progress beads have NO live worker pane? (stranded claims — the
      crash killed the pane but left the claim standing).
   3. Which wk-* branches are pushed to origin but not yet merged into the base
      branch? (the hand-off list Chuck still owes a merge).
-  4. Given all of the above, what is the ORDERED resume plan — push the clean
+  4. Which branches are FROZEN by a standing ruling, and therefore must never
+     be proposed for a push or a merge no matter what their git state is?
+  5. Given all of the above, what is the ORDERED resume plan — push the clean
      unpushed branches, re-dispatch the stranded claims, hand the merge list to
      Chuck?
 
 `--fix` applies only the SAFE step: pushing clean (non-dirty) unpushed/ahead
-branches. Re-dispatch and merge are never auto-applied — they need a manager and
-Chuck respectively, and a dirty tree is never auto-pushed (a human must look at
-uncommitted work first).
+branches that are not frozen. Re-dispatch and merge are never auto-applied —
+they need a manager and Chuck respectively, and a dirty tree is never
+auto-pushed (a human must look at uncommitted work first).
+
+TWO THINGS THIS TOOL REFUSES TO RECOMMEND, and why they are here (SABLE-su3j3,
+SABLE-xgb29 — both found during the SABLE-wvxb4 crash rescue):
+
+  - a DIVERGED branch is never a push step. Until SABLE-su3j3 the tool measured
+    only how far AHEAD a branch was, so a branch that had also fallen BEHIND
+    collapsed into `ahead` and entered the push plan. The push itself would have
+    failed loudly, but the PLAN TEXT is the hazard: an operator staring at a
+    rejected push reaches for --force-with-lease, which rewrites published
+    history. The tool must not author the first step of that path.
+  - a FROZEN branch is never a push or merge step. A do-not-push ruling that
+    lives only in bead prose can bind a reader and nothing else; every
+    mechanical actor executes without ever seeing it. The freeze list
+    (.claude/sable/state/frozen-branches.txt, tracked) is the machine-readable
+    form, so the ruling reaches the tool that authors the plan.
+
+Both matter more here than they would elsewhere: this is the POST-CRASH tool,
+so it runs exactly when judgement is most degraded and its output most trusted.
 
 Usage:
   sable-recover [--json] [--fix] [--base BRANCH] [--repo DIR]
-                [--beads-file PATH] [--panes-file PATH]
+                [--beads-file PATH] [--panes-file PATH] [--frozen-file PATH]
 
   --json         emit a machine-readable report instead of text
   --fix          apply the safe resume step (push clean unpushed branches)
@@ -40,6 +60,10 @@ Usage:
   --panes-file   read the tmux pane listing (path<TAB>bead<TAB>status per line)
                  from a file instead of shelling out to tmux (test seam / a
                  crash where tmux itself is gone — then EVERY claim is stranded)
+  --frozen-file  read the frozen-branch list from PATH instead of the repo's
+                 tracked .claude/sable/state/frozen-branches.txt (test seam).
+                 An absent or unreadable list WARNS LOUDLY — it is never
+                 silently equivalent to "nothing is frozen".
 
 Exit status: 0 always in report mode; 1 if --fix hit a push that failed.
 """
@@ -52,13 +76,27 @@ import subprocess
 import sys
 
 # --- push-state vocabulary ---------------------------------------------------
-# The three states the bead description names, plus "detached" for a worktree
-# with no branch (a HEAD checkout) — never a push candidate, surfaced so a human
-# notices it rather than the tool silently skipping it.
-PUSHED = "pushed"        # local branch == origin counterpart, nothing to push
-AHEAD = "ahead"          # origin has the branch but local has newer commits
+# Each state below is defined by what a PLAIN `git push` would do, because that
+# is the only question the resume plan actually asks. State the ancestry, not a
+# vibe: SABLE-su3j3 was born from a comment that described AHEAD as "origin has
+# the branch but local has newer commits" while the code checked only `ahead >
+# 0` — a docstring TRUE OF THE INTENT and FALSE OF THE FUNCTION, which let a
+# diverged branch answer to a name that means fast-forwardable.
+PUSHED = "pushed"        # origin already has every commit local has — nothing to push
+AHEAD = "ahead"          # origin's tip is a STRICT ANCESTOR of local — a plain push
+                         # fast-forwards and succeeds
 UNPUSHED = "unpushed"    # origin has NO counterpart — the branch never left disk
+DIVERGED = "diverged"    # BOTH sides hold commits the other lacks — a plain push is
+                         # non-fast-forward and is GUARANTEED to be rejected. Never a
+                         # push step (SABLE-su3j3)
 DETACHED = "detached"    # no branch (detached HEAD) — not a push candidate
+
+# FROZEN is deliberately NOT in this vocabulary. It is not a git state and no
+# amount of measuring refs can produce it: it is a standing human ruling, read
+# from the tracked freeze list, and it is orthogonal to every state above (a
+# frozen branch can be unpushed, ahead, or diverged). Collapsing it into the
+# push-state enum would make it something git could overwrite (SABLE-xgb29).
+FROZEN_RELPATH = os.path.join(".claude", "sable", "state", "frozen-branches.txt")
 
 
 # ============================================================================
@@ -66,19 +104,85 @@ DETACHED = "detached"    # no branch (detached HEAD) — not a push candidate
 # directly by the unit test's fixture matrix (bin/test_sable_recover.py).
 # ============================================================================
 
-def classify_push_state(has_origin: bool, ahead: int, detached: bool = False) -> str:
-    """Branch-vs-origin state from three primitives the I/O layer measures.
+def classify_push_state(has_origin: bool, ahead: int, behind: int = 0,
+                        detached: bool = False) -> str:
+    """Branch-vs-origin state from four primitives the I/O layer measures.
 
     A detached worktree short-circuits to DETACHED regardless of the counts.
     Otherwise: no origin counterpart -> UNPUSHED (the branch has never been
-    pushed, so all of its history is stranded on disk); an origin counterpart
-    plus local commits it lacks -> AHEAD; even with origin -> PUSHED. `ahead`
-    is a count so 0 is falsy on purpose (in-sync)."""
+    pushed, so all of its history is stranded on disk); commits on BOTH sides
+    that the other lacks -> DIVERGED; only local commits -> AHEAD; otherwise
+    origin already holds everything local does -> PUSHED. Both counts are counts
+    so 0 is falsy on purpose.
+
+    *** `behind` IS THE WHOLE POINT OF THIS SIGNATURE (SABLE-su3j3). *** Without
+    it, DIVERGED and AHEAD are indistinguishable and the diverged branch inherits
+    AHEAD's "just push it" recommendation. `behind` defaults to 0 for the callers
+    that genuinely cannot be behind (an UNPUSHED branch has no origin side), NOT
+    as a convenience for callers that skipped measuring it.
+
+    Note that `ahead == 0 and behind > 0` (local strictly behind origin) reads as
+    PUSHED. That is correct for THIS tool's only question — origin holds every
+    commit local has, so there is nothing to push — and the name is about
+    push-worthiness, not about the two tips being equal."""
     if detached:
         return DETACHED
     if not has_origin:
         return UNPUSHED
+    if ahead > 0 and behind > 0:
+        return DIVERGED
     return AHEAD if ahead > 0 else PUSHED
+
+
+def parse_frozen_branches(text: str) -> tuple[dict, list]:
+    """The frozen-branch list -> ({branch: {"bead", "reason"}}, warnings).
+
+    Line format is `<branch> <ruling-bead-id> <reason words...>`. Blank lines and
+    lines whose first non-space character is `#` are ignored SILENTLY — comments
+    are legitimate content, not damage, and warning about them would train the
+    reader to ignore the warnings that matter.
+
+    *** THE FAIL DIRECTION HERE IS THE OPPOSITE OF THE PUSH-STATE LAYER ABOVE,
+    AND IT IS THE ENTIRE REASON THIS FILE EXISTS (SABLE-xgb29). *** A line this
+    parser cannot fully understand still FREEZES its branch. Skipping it would
+    RELEASE a branch a human deliberately wrote down — the one outcome the freeze
+    list is here to prevent — and it would do so silently, because a shorter
+    frozen set looks exactly like a shorter freeze list. Only the CITATION can be
+    lost, and that loss is reported. Do not refactor this into a shared
+    "skip what you can't parse" helper with the push-state layer: the two want
+    opposite failures."""
+    frozen: dict = {}
+    warnings: list = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        branch = parts[0]
+        if len(parts) < 2:
+            warnings.append(
+                f"frozen-branch list line {lineno}: `{line}` names no ruling bead id. "
+                f"`{branch}` is treated as FROZEN anyway (a freeze is never dropped for "
+                f"being malformed), but the report cannot cite the ruling — fix the line."
+            )
+            frozen[branch] = {"bead": None, "reason": ""}
+            continue
+        frozen[branch] = {"bead": parts[1], "reason": " ".join(parts[2:])}
+    return frozen, warnings
+
+
+def frozen_entry(frozen, branch: str | None):
+    """The freeze record for `branch`, or None. Accepts either a local branch
+    name (`wk-foo`) or a remote-tracking short name (`origin/wk-foo`) so the
+    worktree sweep and the origin-side merge list can consult one declaration
+    written in local-branch terms."""
+    if not branch or not frozen:
+        return None
+    if branch in frozen:
+        return frozen[branch]
+    if branch.startswith("origin/"):
+        return frozen.get(branch[len("origin/"):])
+    return None
 
 
 def strip_wk(branch: str) -> str:
@@ -154,25 +258,38 @@ def unmerged_branches(origin_wk_branches, merged_wk_branches) -> list:
     return [b for b in origin_wk_branches if b not in merged]
 
 
-def enrich_worktree(wt: dict, panes, known_ids) -> dict:
+def enrich_worktree(wt: dict, panes, known_ids, frozen=None) -> dict:
     """One worktree record -> its full forensic row: push_state + owning bead
-    (+ source). `wt` carries the primitives the I/O layer measured
-    (branch/detached/dirty/has_origin/ahead); this adds the derived, testable
-    classification without touching git."""
+    (+ source) + freeze status. `wt` carries the primitives the I/O layer
+    measured (branch/detached/dirty/has_origin/ahead/behind); this adds the
+    derived, testable classification without touching git.
+
+    The ahead/behind counts are carried onto the row, not consumed here, because
+    the plan's DIVERGED review step has to STATE them — a review step that says
+    "reconcile with origin" without saying how far apart the two sides are sends
+    the reader straight back to the shell to measure it again."""
     branch = wt.get("branch")
+    ahead = wt.get("ahead", 0)
+    behind = wt.get("behind", 0)
     push_state = classify_push_state(
-        wt.get("has_origin", False), wt.get("ahead", 0), wt.get("detached", False)
+        wt.get("has_origin", False), ahead, behind, wt.get("detached", False)
     )
     pane_bead = pane_bead_for_path(panes, wt["path"])
     bead, source = owning_bead(branch, pane_bead, known_ids)
+    freeze = frozen_entry(frozen or {}, branch)
     return {
         "path": wt["path"],
         "branch": branch,
         "detached": wt.get("detached", False),
         "dirty": wt.get("dirty", False),
         "push_state": push_state,
+        "ahead": ahead,
+        "behind": behind,
         "bead": bead,
         "bead_source": source,
+        "frozen": freeze is not None,
+        "frozen_bead": freeze["bead"] if freeze else None,
+        "frozen_reason": freeze["reason"] if freeze else None,
     }
 
 
@@ -188,12 +305,19 @@ def build_plan(rows, stranded, unmerged) -> list:
     re-dispatch stranded claims (their worker died, the work must resume); then
     hand Chuck the full merge list last, once nothing new will land on origin.
 
-    - push:      a wk-* worktree that is clean (not dirty) and has commits not on
-                 origin (unpushed OR ahead). The one step --fix will apply.
-    - review:    a worktree with unpushed/ahead commits but a DIRTY tree — never
-                 auto-pushed; a human must resolve the uncommitted work first.
+    - push:      a wk-* worktree that is clean (not dirty), not frozen, and has
+                 commits not on origin that a plain push can deliver (unpushed OR
+                 ahead). The one step --fix will apply.
+    - review:    a worktree whose commits CANNOT be delivered by a plain push —
+                 a DIRTY tree, or a DIVERGED branch. Never auto-pushed; a human
+                 must resolve the uncommitted work / the divergence first.
     - redispatch: a stranded in_progress claim — re-spawn a worker for it.
     - merge:     a single step handing the unmerged-branch list to Chuck.
+
+    A FROZEN branch produces NO step at all — not push, and deliberately not
+    review either. "Review" invites an action, and on a frozen branch the correct
+    action is none; the freeze is surfaced instead in the report's own FROZEN
+    section, where it is visible without being a to-do (SABLE-xgb29).
 
     Each step is {order, action, target, detail}. `order` is the group rank so a
     caller can render or execute groups in sequence."""
@@ -202,6 +326,23 @@ def build_plan(rows, stranded, unmerged) -> list:
     # 1) push clean unpushed/ahead wk-* branches
     for r in rows:
         if not is_wk_branch(r["branch"]):
+            continue
+        # A standing ruling outranks every git measurement. This check comes
+        # FIRST so no later branch of this function can reintroduce the branch
+        # into the plan by a route that forgot to ask.
+        if r.get("frozen"):
+            continue
+        if r["push_state"] == DIVERGED:
+            dirt = " The tree is also DIRTY." if r["dirty"] else ""
+            steps.append({
+                "order": 1, "action": "review", "target": r["branch"],
+                "detail": f"DIVERGED from origin at {r['path']} — "
+                          f"{r.get('ahead', 0)} ahead, {r.get('behind', 0)} behind. "
+                          f"An ordinary push will be REJECTED (non-fast-forward). "
+                          f"Reconcile with origin (fetch, then rebase or merge) and "
+                          f"push normally; do NOT reach for --force-with-lease, which "
+                          f"rewrites published history." + dirt,
+            })
             continue
         if r["push_state"] not in (UNPUSHED, AHEAD):
             continue
@@ -236,23 +377,61 @@ def build_plan(rows, stranded, unmerged) -> list:
     return steps
 
 
+def frozen_section(frozen, rows, held_branches) -> list:
+    """Every DECLARED freeze, annotated with what this sweep saw of it.
+
+    Built from the freeze LIST rather than from the worktree rows on purpose: a
+    freeze whose worktree has already been reaped still has to appear, or the
+    section would go quiet exactly as the branch stops being visible anywhere
+    else and the ruling would decay back into something only a human remembers.
+    `seen` records whether this sweep found the branch at all."""
+    by_branch = {r["branch"]: r for r in rows if r.get("branch")}
+    held = {b[len("origin/"):] if b.startswith("origin/") else b for b in held_branches}
+    out = []
+    for branch, rec in frozen.items():
+        row = by_branch.get(branch)
+        out.append({
+            "branch": branch,
+            "bead": rec.get("bead"),
+            "reason": rec.get("reason", ""),
+            "worktree": row["path"] if row else None,
+            "push_state": row["push_state"] if row else None,
+            "held_from_merge_list": branch in held,
+            "seen": bool(row) or branch in held,
+        })
+    return out
+
+
 def build_report(worktrees, in_progress_beads, panes, origin_wk_branches,
-                 merged_wk_branches, known_ids=None, base_branch=None) -> dict:
+                 merged_wk_branches, known_ids=None, base_branch=None,
+                 frozen=None, warnings=None) -> dict:
     """Assemble the whole forensic report from already-collected primitives.
     Pure — the unit test drives this with synthetic fixtures; main() drives it
     with real git/tmux/bd output. `known_ids` defaults to the in_progress bead
-    ids (the set a worktree branch could resolve against)."""
+    ids (the set a worktree branch could resolve against).
+
+    `unmerged_branches` is the list Chuck is actually handed, so frozen branches
+    are withheld from it: the standing ruling on the live instance is
+    "do-not-merge, retires unmerged", and a report that excludes a branch from
+    the push plan while still queueing it for a merge has only moved the hazard
+    one line down. The withheld ones are not dropped — they surface in
+    `frozen_branches` with held_from_merge_list set."""
     if known_ids is None:
         known_ids = [b.get("id") for b in in_progress_beads if b.get("id")]
-    rows = [enrich_worktree(wt, panes, known_ids) for wt in worktrees]
+    frozen = frozen or {}
+    rows = [enrich_worktree(wt, panes, known_ids, frozen) for wt in worktrees]
     stranded = stranded_claims(in_progress_beads, panes)
-    unmerged = unmerged_branches(origin_wk_branches, merged_wk_branches)
+    all_unmerged = unmerged_branches(origin_wk_branches, merged_wk_branches)
+    held = [b for b in all_unmerged if frozen_entry(frozen, b)]
+    unmerged = [b for b in all_unmerged if not frozen_entry(frozen, b)]
     plan = build_plan(rows, stranded, unmerged)
     return {
         "base_branch": base_branch,
         "worktrees": rows,
         "stranded_claims": stranded,
         "unmerged_branches": unmerged,
+        "frozen_branches": frozen_section(frozen, rows, held),
+        "warnings": list(warnings or []),
         "plan": plan,
     }
 
@@ -333,20 +512,62 @@ def worktree_dirty(path: str) -> bool:
     return bool(r.stdout.strip())
 
 
-def origin_state(path: str, branch: str | None) -> tuple[bool, int]:
-    """(has_origin_counterpart, commits_ahead) for `branch` in worktree `path`.
-    has_origin is a real ref check; ahead counts commits in the local branch not
-    on origin/<branch> (0 when origin lacks it — meaningless there, and the
-    UNPUSHED classification ignores it anyway)."""
+def origin_state(path: str, branch: str | None) -> tuple[bool, int, int]:
+    """(has_origin_counterpart, commits_ahead, commits_behind) for `branch` in
+    worktree `path`. has_origin is a real ref check; the two counts come from a
+    SINGLE symmetric-difference call:
+
+        git rev-list --left-right --count <ref>...HEAD   ->  "<behind>\\t<ahead>"
+
+    Left is the ref side (commits origin has that local lacks = behind), right is
+    HEAD's side (commits local has that origin lacks = ahead). Three dots, not
+    two — two dots would give a one-sided range and put us back where SABLE-su3j3
+    started. Both counts are 0 when origin lacks the branch (meaningless there,
+    and the UNPUSHED classification ignores them anyway)."""
     if not branch:
-        return False, 0
+        return False, 0, 0
     ref = f"refs/remotes/origin/{branch}"
     has = _run(["git", "-C", path, "rev-parse", "--verify", "--quiet", ref]).returncode == 0
     if not has:
-        return False, 0
-    r = _run(["git", "-C", path, "rev-list", "--count", f"{ref}..HEAD"])
-    ahead = int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 0
-    return True, ahead
+        return False, 0, 0
+    r = _run(["git", "-C", path, "rev-list", "--left-right", "--count", f"{ref}...HEAD"])
+    behind = ahead = 0
+    if r.returncode == 0:
+        parts = r.stdout.split()
+        if len(parts) == 2 and all(p.isdigit() for p in parts):
+            behind, ahead = int(parts[0]), int(parts[1])
+    return True, ahead, behind
+
+
+def load_frozen_branches(path: str) -> tuple[dict, list]:
+    """Read the frozen-branch list at `path` -> (frozen, warnings).
+
+    *** AN ABSENT OR UNREADABLE LIST IS NOT THE SAME FACT AS "NOTHING IS FROZEN",
+    AND THIS FUNCTION REFUSES TO RENDER THEM IDENTICALLY (SABLE-xgb29). *** It
+    still returns an empty set — there is nothing else it could return, and
+    aborting the whole post-crash sweep over a missing policy file would be its
+    own outage — but it hands back a warning the caller is required to shout,
+    matching the runlock/clearance precedent. Silence here reads as a clean bill
+    of health and would release every branch the file was meant to protect."""
+    if not os.path.exists(path):
+        return {}, [
+            f"FROZEN-BRANCH LIST NOT FOUND at {path} — this run proceeded as if NOTHING "
+            f"is frozen, so every wk-* branch was treated as a push candidate. If a "
+            f"standing do-not-push ruling exists, this run could not see it."
+        ]
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return {}, [
+            f"FROZEN-BRANCH LIST AT {path} IS UNREADABLE ({exc}) — this run proceeded as "
+            f"if NOTHING is frozen, so every wk-* branch was treated as a push candidate."
+        ]
+    return parse_frozen_branches(text)
+
+
+def frozen_file_path(repo: str, override: str | None) -> str:
+    return override if override else os.path.join(repo, FROZEN_RELPATH)
 
 
 def collect_worktrees(repo: str) -> list:
@@ -356,7 +577,7 @@ def collect_worktrees(repo: str) -> list:
     for wt in git_worktrees(repo):
         if wt.get("bare"):
             continue
-        has_origin, ahead = origin_state(wt["path"], wt.get("branch"))
+        has_origin, ahead, behind = origin_state(wt["path"], wt.get("branch"))
         out.append({
             "path": wt["path"],
             "branch": wt.get("branch"),
@@ -364,6 +585,7 @@ def collect_worktrees(repo: str) -> list:
             "dirty": worktree_dirty(wt["path"]),
             "has_origin": has_origin,
             "ahead": ahead,
+            "behind": behind,
         })
     return out
 
@@ -425,13 +647,20 @@ def origin_wk_branch_state(repo: str, base_branch: str) -> tuple[list, list]:
 # --fix — apply only the safe step (push clean unpushed/ahead branches).
 # ============================================================================
 
-def apply_fix(report: dict) -> tuple[list, list]:
-    """Execute the `push` steps; return (pushed_ok, push_failed) branch lists.
+def apply_fix(report: dict) -> tuple[list, list, list]:
+    """Execute the `push` steps; return (pushed_ok, push_failed, refused).
     Only push steps run — review/redispatch/merge are printed as manual
     follow-ups by the caller. Each push runs from that worktree's own path
-    (`git -C <worktree> push`), never against the current tree."""
+    (`git -C <worktree> push`), never against the current tree.
+
+    The frozen/diverged re-check below is deliberately REDUNDANT with build_plan:
+    those branches never reach a push step today. It is here because this is the
+    line that actually mutates origin, and the cost of the check is one dict
+    lookup against the cost of a future plan-builder edit reopening the path this
+    whole change closed. `refused` is returned rather than logged so a refusal is
+    reported, never merely absent."""
     by_branch = {r["branch"]: r for r in report["worktrees"]}
-    ok, failed = [], []
+    ok, failed, refused = [], [], []
     for step in report["plan"]:
         if step["action"] != "push":
             continue
@@ -440,9 +669,12 @@ def apply_fix(report: dict) -> tuple[list, list]:
         if not row:
             failed.append(branch)
             continue
+        if row.get("frozen") or row.get("push_state") == DIVERGED:
+            refused.append(branch)
+            continue
         r = _run(["git", "-C", row["path"], "push", "origin", branch])
         (ok if r.returncode == 0 else failed).append(branch)
-    return ok, failed
+    return ok, failed, refused
 
 
 # ============================================================================
@@ -455,6 +687,14 @@ def render_text(report: dict) -> str:
     lines.append(f"sable-recover — post-crash forensics sweep (base: {base})")
     lines.append("")
 
+    # Warnings go FIRST and unconditionally. A warning that the freeze list could
+    # not be read is a caveat on every line below it, so it cannot be a footnote.
+    if report.get("warnings"):
+        lines.append("⚠️  WARNINGS")
+        for w in report["warnings"]:
+            lines.append(f"  {w}")
+        lines.append("")
+
     lines.append("WORKTREES")
     if not report["worktrees"]:
         lines.append("  (none)")
@@ -462,9 +702,24 @@ def render_text(report: dict) -> str:
         bead = r["bead"] or "unknown"
         src = f" [{r['bead_source']}]" if r["bead_source"] else ""
         dirty = "DIRTY" if r["dirty"] else "clean"
+        frozen = "  [FROZEN]" if r.get("frozen") else ""
         lines.append(f"  {r['push_state']:<8} {dirty:<5} {r['branch'] or '(detached)'}"
-                     f"  →  {bead}{src}")
+                     f"  →  {bead}{src}{frozen}")
         lines.append(f"           {r['path']}")
+
+    frozen_rows = report.get("frozen_branches") or []
+    lines.append("")
+    lines.append(f"FROZEN BRANCHES ({len(frozen_rows)}) — never pushed, never merged, "
+                 f"no matter what git says")
+    if not frozen_rows:
+        lines.append("  (none declared)")
+    for f in frozen_rows:
+        cite = f.get("bead") or "NO RULING BEAD CITED — fix the freeze list"
+        lines.append(f"  {f['branch']}  [{cite}]  {f.get('reason', '')}".rstrip())
+        where = f.get("worktree") or "no worktree in this sweep"
+        state = f.get("push_state") or "not measured"
+        held = "; withheld from Chuck's merge list" if f.get("held_from_merge_list") else ""
+        lines.append(f"           {state} — {where}{held}")
 
     lines.append("")
     lines.append(f"STRANDED CLAIMS ({len(report['stranded_claims'])})")
@@ -501,8 +756,10 @@ def collect_report(args) -> dict:
     in_progress = load_in_progress(args.beads_file)
     panes = load_panes(args.panes_file)
     origin_wk, merged_wk = origin_wk_branch_state(repo, base_branch)
+    frozen, warnings = load_frozen_branches(
+        frozen_file_path(repo, getattr(args, "frozen_file", None)))
     return build_report(worktrees, in_progress, panes, origin_wk, merged_wk,
-                        base_branch=base_branch)
+                        base_branch=base_branch, frozen=frozen, warnings=warnings)
 
 
 def main(argv=None) -> int:
@@ -520,16 +777,24 @@ def main(argv=None) -> int:
                         help="read `bd list --status in_progress --json` from a file")
     parser.add_argument("--panes-file", default=None,
                         help="read the tmux pane dump (path<TAB>bead<TAB>status) from a file")
+    parser.add_argument("--frozen-file", default=None,
+                        help=f"read the frozen-branch list from PATH "
+                             f"(default: <repo>/{FROZEN_RELPATH})")
     args = parser.parse_args(argv)
 
     report = collect_report(args)
 
     rc = 0
     if args.fix:
-        pushed, failed = apply_fix(report)
-        report["fix"] = {"pushed": pushed, "failed": failed}
+        pushed, failed, refused = apply_fix(report)
+        report["fix"] = {"pushed": pushed, "failed": failed, "refused": refused}
         if failed:
             rc = 1
+
+    # Warnings go to stderr as well as into the report body: --json callers get
+    # a clean stdout, and a piped/grepped text run still cannot lose them.
+    for w in report.get("warnings") or []:
+        print(f"sable-recover: WARNING: {w}", file=sys.stderr)
 
     if args.json:
         print(json.dumps(report, indent=2))
@@ -542,6 +807,8 @@ def main(argv=None) -> int:
             print(f"  pushed: {', '.join(f['pushed']) or '(none)'}")
             if f["failed"]:
                 print(f"  FAILED: {', '.join(f['failed'])}")
+            if f.get("refused"):
+                print(f"  REFUSED (frozen or diverged): {', '.join(f['refused'])}")
             manual = [s for s in report["plan"] if s["action"] != "push"]
             if manual:
                 print("  remaining (manual): "
