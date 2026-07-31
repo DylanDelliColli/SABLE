@@ -62,6 +62,7 @@ ALLOW=(
   test-edit-write-claim-reconciler.sh
   test-event-pair.sh
   test-full-ingestion.sh
+  test-git-pre-push-attestation.sh
   test-identity-hermeticity.sh
   test-impact-manifest.sh
   test-impact-selection.sh
@@ -216,6 +217,7 @@ declare -A COVERS=(
   [test-dep-merge-state.sh]="bin/sable-dep-check bin/sable-spawn-worker"
   [test-doctor-snapshot-staleness.sh]="bin/sable-doctor bin/sable-bin-install install.sh"
   [test-edit-write-claim-reconciler.sh]="hooks/multi-manager/edit-write-claim-reconciler.sh"
+  [test-git-pre-push-attestation.sh]=".beads/hooks/pre-push hooks/multi-manager/git-pre-push-attestation.sh hooks/multi-manager/pre-push-rebase-test.sh"
   [test-impact-tier-serialization.sh]="bin/sable_gate_promote_lib.py"
   [test-landing-pair-gate.sh]="bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py bin/sable-merge-gate"
   [test-lib-hook-trace.sh]="hooks/multi-manager/lib-hook-trace.sh"
@@ -325,10 +327,11 @@ check_loud_skip() {
 # list, fails the gate (SABLE-cmar4.2) — this table cannot silently drift out
 # of sync with the real sourcing graph the way a hand-audited doc could.
 declare -A LIB_FANOUT=(
-  [hooks/multi-manager/lib-identity.sh]="test-pre-push-rebase-test.sh test-tier-ssot-consumers.sh test-mode-interlock.sh test-mode-tier.sh test-post-push-merge-notify.sh test-preview-kick.sh test-pre-dispatch-claim.sh test-pre-dispatch-model-check.sh test-pre-dispatch-preempt.sh test-pre-dispatch-refresh.sh test-overlap-constraint.sh test-overlap-dispatch-e2e.sh test-read-guard.sh test-orchestration-install.sh test-lib-identity.sh test-provenance-guard.sh"
+  [hooks/multi-manager/lib-identity.sh]="test-pre-push-rebase-test.sh test-tier-ssot-consumers.sh test-mode-interlock.sh test-mode-tier.sh test-post-push-merge-notify.sh test-preview-kick.sh test-pre-dispatch-claim.sh test-pre-dispatch-model-check.sh test-pre-dispatch-preempt.sh test-pre-dispatch-refresh.sh test-overlap-constraint.sh test-overlap-dispatch-e2e.sh test-read-guard.sh test-orchestration-install.sh test-lib-identity.sh test-provenance-guard.sh test-git-pre-push-attestation.sh"
+  [hooks/multi-manager/lib-push-attestation.sh]="test-git-pre-push-attestation.sh test-pre-push-rebase-test.sh test-provenance-guard.sh test-tier-ssot-consumers.sh"
   [hooks/multi-manager/lib-hook-trace.sh]="test-post-push-merge-notify.sh test-preview-kick.sh test-tdd-gate.sh test-tdd-evidence.sh test-lib-hook-trace.sh"
-  [hooks/multi-manager/lib-mode-path.sh]="test-pre-push-rebase-test.sh test-tier-ssot-consumers.sh test-mode-interlock.sh test-mode-tier.sh test-post-push-merge-notify.sh test-preview-kick.sh test-pre-dispatch-claim.sh test-pre-dispatch-model-check.sh test-pre-dispatch-preempt.sh test-pre-dispatch-refresh.sh test-overlap-constraint.sh test-overlap-dispatch-e2e.sh test-read-guard.sh test-orchestration-install.sh test-lib-identity.sh test-session-role-anchor.sh test-active-contracts-integration.sh test-lib-mode-path.sh test-sable-mode.sh test-provenance-guard.sh"
-  [hooks/multi-manager/lib-registry-path.sh]="test-pre-push-rebase-test.sh test-tier-ssot-consumers.sh test-mode-interlock.sh test-mode-tier.sh test-post-push-merge-notify.sh test-preview-kick.sh test-pre-dispatch-claim.sh test-pre-dispatch-model-check.sh test-pre-dispatch-preempt.sh test-pre-dispatch-refresh.sh test-overlap-constraint.sh test-overlap-dispatch-e2e.sh test-read-guard.sh test-orchestration-install.sh test-lib-identity.sh test-registry.sh test-lib-registry-path.sh test-provenance-guard.sh"
+  [hooks/multi-manager/lib-mode-path.sh]="test-pre-push-rebase-test.sh test-tier-ssot-consumers.sh test-mode-interlock.sh test-mode-tier.sh test-post-push-merge-notify.sh test-preview-kick.sh test-pre-dispatch-claim.sh test-pre-dispatch-model-check.sh test-pre-dispatch-preempt.sh test-pre-dispatch-refresh.sh test-overlap-constraint.sh test-overlap-dispatch-e2e.sh test-read-guard.sh test-orchestration-install.sh test-lib-identity.sh test-session-role-anchor.sh test-active-contracts-integration.sh test-lib-mode-path.sh test-sable-mode.sh test-provenance-guard.sh test-git-pre-push-attestation.sh"
+  [hooks/multi-manager/lib-registry-path.sh]="test-pre-push-rebase-test.sh test-tier-ssot-consumers.sh test-mode-interlock.sh test-mode-tier.sh test-post-push-merge-notify.sh test-preview-kick.sh test-pre-dispatch-claim.sh test-pre-dispatch-model-check.sh test-pre-dispatch-preempt.sh test-pre-dispatch-refresh.sh test-overlap-constraint.sh test-overlap-dispatch-e2e.sh test-read-guard.sh test-orchestration-install.sh test-lib-identity.sh test-registry.sh test-lib-registry-path.sh test-provenance-guard.sh test-git-pre-push-attestation.sh"
   [hooks/multi-manager/lib-evidence-key.sh]="test-tdd-gate.sh test-tdd-evidence.sh test-sable-test.sh"
 )
 
