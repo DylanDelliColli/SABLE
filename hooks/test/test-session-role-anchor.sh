@@ -188,7 +188,7 @@ rm -rf "$SHADOW" "$SHADOW_HOME"
 # @sable_role tag (bin/sable-spawn-manager:283), which a cleared-but-alive pane
 # still carries. Measured 2026-07-30 — all three manager panes had been
 # context-cleared, spawn-manager reported "already running - skipping" for all
-# three and spawned nothing, and the cockpit had to hand-kick each over
+# three and spawned nothing, and lincoln had to hand-kick each over
 # sable-msg.
 #
 # The hook stamps an AGENT-WRITTEN boot epoch on every SessionStart, turning

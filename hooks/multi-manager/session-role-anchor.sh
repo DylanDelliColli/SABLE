@@ -94,7 +94,7 @@ print(ev if isinstance(ev, str) and ev else "__SABLE_EVENT_UNKNOWN__")
 # tag (bin/sable-spawn-manager:283), and a cleared-but-alive pane still carries
 # it. Measured 2026-07-30: all three manager panes had been context-cleared,
 # spawn-manager reported "already running - skipping" for all three and spawned
-# nothing, and the cockpit had to hand-kick each over sable-msg.
+# nothing, and lincoln had to hand-kick each over sable-msg.
 #
 # This hook is the fix's natural home because it is the only closed
 # write-then-read-at-boot loop in the fleet: it fires on every SessionStart
