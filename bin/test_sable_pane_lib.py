@@ -137,8 +137,11 @@ def test_completed_claude_turn_does_not_block_busy_leg_rescue_enter():
         sleep=lambda _interval: None,
         provider="claude",
     )
-    assert commands == [
-        ["tmux", "send-keys", "-t", "%8", "-l", snippet],
+    assert commands[0][0:3] == ["tmux", "load-buffer", "-b"]
+    assert commands[1][0:4] == ["tmux", "paste-buffer", "-p", "-d"]
+    assert commands[1][-2:] == ["-t", "%8"]
+    assert commands[0][3] == commands[1][5]
+    assert commands[2:] == [
         ["tmux", "send-keys", "-t", "%8", "Enter"],
         ["tmux", "send-keys", "-t", "%8", "Enter"],
     ]
@@ -341,7 +344,7 @@ def test_deliver_text_idle_path_types_once_and_confirms_submission():
 
     def run(cmd):
         commands.append(cmd)
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         return True
 
@@ -361,10 +364,21 @@ def test_deliver_text_idle_path_types_once_and_confirms_submission():
         capture=capture,
         sleep=lambda _interval: None,
     )
-    assert commands == [
-        ["tmux", "send-keys", "-t", "%8", "-l", text],
-        ["tmux", "send-keys", "-t", "%8", "Enter"],
-    ]
+    assert commands[0][0:3] == ["tmux", "load-buffer", "-b"]
+    assert commands[1][0:4] == ["tmux", "paste-buffer", "-p", "-d"]
+    assert commands[1][-2:] == ["-t", "%8"]
+    assert commands[0][3] == commands[1][5]
+    assert commands[2] == ["tmux", "send-keys", "-t", "%8", "Enter"]
+
+
+def test_deliver_text_keeps_transport_internal_to_its_existing_interface():
+    parameters = inspect.signature(lib.deliver_text).parameters
+
+    assert tuple(parameters) == (
+        "base", "pane", "text", "snippet", "tries", "interval", "run",
+        "capture", "sleep", "provider",
+    )
+    assert not ({"transport", "mechanism", "method"} & parameters.keys())
 
 
 def test_deliver_text_waits_before_sending_enter():
@@ -375,7 +389,7 @@ def test_deliver_text_waits_before_sending_enter():
     def run(cmd):
         nonlocal typed
         events.append(("run", cmd))
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             typed = True
         return True
 
@@ -396,9 +410,12 @@ def test_deliver_text_waits_before_sending_enter():
         sleep=lambda delay: events.append(("sleep", delay)),
     )
 
-    literal = ("run", ["tmux", "send-keys", "-t", "%8", "-l", text])
+    paste = next(
+        event for event in events
+        if event[0] == "run" and "paste-buffer" in event[1]
+    )
     enter = ("run", ["tmux", "send-keys", "-t", "%8", "Enter"])
-    literal_index = events.index(literal)
+    literal_index = events.index(paste)
     enter_index = events.index(enter)
     waits_between = [
         delay
@@ -409,10 +426,10 @@ def test_deliver_text_waits_before_sending_enter():
 
     # Negative control: the fix inserts time, not another keystroke.
     assert sum(kind == "run" and command[1] == "send-keys"
-               for kind, command in events) == 2
+               for kind, command in events) == 1
 
 
-def test_deliver_text_returns_false_when_literal_send_fails():
+def test_deliver_text_returns_false_when_load_buffer_fails():
     calls = []
 
     def run(cmd):
@@ -428,7 +445,8 @@ def test_deliver_text_returns_false_when_literal_send_fails():
         capture=lambda: "❯ ",
         sleep=lambda _interval: None,
     )
-    assert calls == [["tmux", "send-keys", "-t", "%9", "-l", "message"]]
+    assert len(calls) == 1
+    assert calls[0][0:3] == ["tmux", "load-buffer", "-b"]
 
 
 def test_tmux_session_metadata_helpers_build_exact_targets():

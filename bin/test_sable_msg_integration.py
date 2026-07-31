@@ -270,7 +270,7 @@ def test_message_delivered_to_registered_pane(tmux_socket):
 
 
 def test_submit_gap_is_present_against_real_tmux(tmux_socket):
-    """Measure the literal-send/Enter gap across real tmux invocations.
+    """Measure the paste/Enter gap across real tmux invocations.
 
     The recipient is intentionally the suite's bash stand-in, which has no
     paste-burst detector and therefore CANNOT reproduce Codex swallowing the
@@ -288,7 +288,7 @@ def test_submit_gap_is_present_against_real_tmux(tmux_socket):
     send_times = []
 
     def timed_run(cmd):
-        if "send-keys" in cmd:
+        if "paste-buffer" in cmd or "send-keys" in cmd:
             send_times.append(time.monotonic())
         return subprocess.run(cmd, capture_output=True, text=True).returncode == 0
 
@@ -351,7 +351,10 @@ def test_idle_pane_receives_interrupt_first_attempt(tmux_socket, tmp_path):
     # launched with an inputrc binding Escape to a standalone no-op, modeling the
     # TUI's non-destructive Escape so the interrupt path is exercised faithfully.
     inputrc = tmp_path / "inputrc"
-    inputrc.write_text('"\\e": redraw-current-line\n')
+    inputrc.write_text(
+        '"\\e": redraw-current-line\n'
+        "set keyseq-timeout 1\n"
+    )
     _tmux(tmux_socket, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
           f"INPUTRC={inputrc} PS1='> ' bash --noprofile --norc")
     _tmux(tmux_socket, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
@@ -361,7 +364,8 @@ def test_idle_pane_receives_interrupt_first_attempt(tmux_socket, tmp_path):
          "--from", "lincoln", "--interrupt"],
         capture_output=True, text=True,
         env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
-             "SABLE_MSG_SUBMIT_TRIES": "1", "SABLE_MSG_AUTO_FALLBACK": "0"},
+             "SABLE_MSG_SUBMIT_TRIES": "1", "SABLE_MSG_AUTO_FALLBACK": "0",
+             "SABLE_MSG_POLL_INTERVAL": "0.2"},
     )
     assert r.returncode == 0, r.stderr          # delivered, verified, first attempt
     _require_until(
