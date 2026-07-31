@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Sequence
 
+import sable_gate_budget_lib as gate_budget
+
 
 class DeveloperCheckError(RuntimeError):
     """A local environment or repository precondition is unavailable."""
@@ -55,10 +57,28 @@ class BudgetDecision:
     seconds: float
     mode: str
     reason: str
+    shards: tuple[gate_budget.ExecutionShard, ...] = ()
+    omitted: tuple[str, ...] = ()
 
 
-SCOPED_BUDGET_SECONDS = 90.0
+SCOPED_TIER = "pre_push"
 FULL_SNAPSHOT_TIER = "full_snapshot"
+
+# What a blocked developer is told to DO. This text is load-bearing, not
+# decoration: SABLE-b99hy records a worker who followed the old advice
+# literally — rewrote `git config sable.testCommand` down to a two-file subset,
+# pushed green, then restored it — so the gate certified a narrower claim than
+# it was configured to enforce while printing "enforced". Advice to shrink the
+# claim is therefore never offered here, and any edit that reintroduces it is
+# the defect, not a wording change.
+TIMEOUT_REMEDIATION = (
+    "This budget is DERIVED from measured suite cost, so overrunning it means "
+    "the suites really did get slower — not that the budget is too small. "
+    "Re-measure (--sable-test-cost-report / --profile) so the derivation sees "
+    "current cost, or reduce the suites' real runtime. Do NOT narrow "
+    "sable.testCommand or the selected suite set to fit: that certifies a "
+    "smaller claim than the one being enforced (SABLE-b99hy)."
+)
 
 
 def _normalise_path(path: str) -> str:
@@ -373,43 +393,154 @@ def _tier_budget_seconds(
     return seconds
 
 
+# Measured cost baselines live under .claude/sable/state/, which .gitignore
+# already treats as runtime state. That placement is deliberate on both counts:
+# these numbers are wall-clock and machine-relative, so they are not shared
+# configuration; and an UNTRACKED file anywhere the impact manifest does not
+# map would show up as a changed path and escalate the whole plan to a FULL
+# shell selection — a measurement artifact silently making every subsequent
+# run maximally expensive. Regenerate with the two reporters that already own
+# timing collection:
+#   python -m pytest bin/ -q \
+#     --sable-test-cost-report=.claude/sable/state/test-cost/python-cost.json
+#   bash .github/ci/shell-run-set.sh \
+#     --profile .claude/sable/state/test-cost/shell-cost.tsv
+PYTHON_COST_REPORT = ".claude/sable/state/test-cost/python-cost.json"
+SHELL_COST_PROFILE = ".claude/sable/state/test-cost/shell-cost.tsv"
+
+
+def load_costs(
+    repo_root: Path,
+    *,
+    python_report: str | Path | None = None,
+    shell_profile: str | Path | None = None,
+) -> gate_budget.SuiteCosts | None:
+    """Read whatever measurements exist, or None when there are none.
+
+    Both halves are OPTIONAL and independent. The two reporters that produce
+    them already exist — conftest.py's --sable-test-cost-report and
+    shell-run-set.sh's --profile — so this reads their output rather than
+    timing anything itself. A missing or corrupt report degrades to "no
+    measurement for those suites", which derive_plan then costs
+    conservatively; it never blocks the run.
+    """
+    python_path = Path(python_report or repo_root / PYTHON_COST_REPORT)
+    shell_path = Path(shell_profile or repo_root / SHELL_COST_PROFILE)
+    python_costs: dict[str, float] = {}
+    shell_costs: dict[str, float] = {}
+    for path, sink, reader in (
+        (python_path, "python", gate_budget.load_python_cost_report),
+        (shell_path, "shell", gate_budget.load_shell_cost_profile),
+    ):
+        if not path.is_file():
+            continue
+        try:
+            loaded = reader(path)
+        except (OSError, ValueError) as exc:
+            print(
+                f"sable-dev-check: ignoring unreadable {sink} cost report "
+                f"{path}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        if sink == "python":
+            python_costs = loaded
+        else:
+            shell_costs = loaded
+    costs = gate_budget.SuiteCosts(python=python_costs, shell=shell_costs)
+    return costs if gate_budget.has_measurements(costs) else None
+
+
 def effective_budget(
     repo_root: Path,
     plan: DeveloperPlan,
     *,
     explicit_seconds: float | None,
+    costs: gate_budget.SuiteCosts | None = None,
+    derived: bool = True,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> BudgetDecision:
     """Choose the execution budget after the selection shape is known.
 
-    An explicit CLI value always wins. Otherwise, any FULL selector expands
-    the budget to the authoritative full_snapshot tier. Truly proportional
-    plans retain the short 90-second developer-feedback ceiling.
-    """
-    if explicit_seconds is not None:
-        return BudgetDecision(
-            float(explicit_seconds), "explicit", "explicit --budget override",
-        )
+    THE BUDGET GRADIENT USED TO RUN BACKWARDS. An unmapped path escalated to
+    FULL and was handed the full_snapshot tier's duration, while a correctly
+    mapped SCOPED change — a strictly smaller, cheaper suite set — was handed a
+    fixed 90s and could die at exit 124 with no verdict at all (SABLE-1urtf:
+    69 passing dots, then nothing). Being precise about your blast radius was
+    punished; being vague was rewarded.
 
-    full_reasons = []
-    if plan.python.mode == "full":
-        full_reasons.append(f"Python FULL ({plan.python.reason})")
-    if plan.shell_mode == "full":
-        full_reasons.append(f"Shell FULL ({plan.shell_reason})")
-    if full_reasons:
-        seconds = _tier_budget_seconds(
-            repo_root, FULL_SNAPSHOT_TIER, runner=runner,
+    So the scoped tier's duration is no longer a ceiling anywhere in this
+    function. The ABSOLUTE bound is the full_snapshot tier for every mode — a
+    scoped plan is a subset of a full run and can never honestly need more —
+    and the OPERATIVE budget inside it is derived from the measured cost of the
+    suites actually selected. The scoped tier's duration survives only as
+    ``min_shard_seconds``, a per-command MINIMUM grant, so this change can
+    never hand any plan less time than it gets today.
+
+    With no measurements at all there is nothing to derive from, so the plan
+    runs against the absolute bound rather than against a number nobody
+    measured. That is deliberately the SAFE direction: an underived plan
+    reaches a verdict slowly instead of failing fast having verified nothing.
+    """
+    floor = 0.0
+    if explicit_seconds is not None:
+        ceiling = float(explicit_seconds)
+        mode = "explicit"
+        reason = "explicit --budget ceiling"
+    else:
+        full_reasons = []
+        if plan.python.mode == "full":
+            full_reasons.append(f"Python FULL ({plan.python.reason})")
+        if plan.shell_mode == "full":
+            full_reasons.append(f"Shell FULL ({plan.shell_reason})")
+        ceiling = _tier_budget_seconds(repo_root, FULL_SNAPSHOT_TIER, runner=runner)
+        floor = _tier_budget_seconds(repo_root, SCOPED_TIER, runner=runner)
+        if full_reasons:
+            mode = "full-fallback"
+            reason = (
+                "; ".join(full_reasons)
+                + f"; bound from {FULL_SNAPSHOT_TIER} tier"
+            )
+        else:
+            mode = "scoped"
+            reason = f"bound from {FULL_SNAPSHOT_TIER} tier"
+
+    if not derived or costs is None or not gate_budget.has_measurements(costs):
+        why = "derivation disabled" if not derived else "no measured cost data"
+        return BudgetDecision(ceiling, mode, f"{reason}; {why}")
+
+    derived_plan = gate_budget.derive_plan(
+        plan.python.tests,
+        plan.shell_suites,
+        costs,
+        ceiling,
+        min_shard_seconds=floor,
+    )
+    python_shards = sum(
+        1 for shard in derived_plan.shards if shard.kind == "python"
+    )
+    derived_reason = (
+        f"{reason}; derived from {derived_plan.measured_seconds:.1f}s measured "
+        f"across {len(derived_plan.shards)} command(s) "
+        f"({python_shards} Python shard(s))"
+    )
+    if derived_plan.provisional:
+        derived_reason += (
+            f"; {len(derived_plan.provisional)} suite(s) UNMEASURED and "
+            f"costed provisionally, so no trim was taken on guessed numbers "
+            f"(re-measure to tighten)"
         )
-        return BudgetDecision(
-            seconds,
-            "full-fallback",
-            "; ".join(full_reasons)
-            + f"; budget from {FULL_SNAPSHOT_TIER} tier",
+    if derived_plan.omitted:
+        derived_reason += (
+            f"; TRIMMED to fit — {len(derived_plan.omitted)} suite(s) "
+            f"left UNVERIFIED"
         )
     return BudgetDecision(
-        SCOPED_BUDGET_SECONDS,
-        "scoped",
-        "Python and shell selections remain proportional",
+        derived_plan.budget_seconds,
+        "derived",
+        derived_reason,
+        derived_plan.shards,
+        derived_plan.omitted,
     )
 
 
@@ -439,6 +570,16 @@ def render_plan(
         lines.append(
             f"  Budget: {budget.mode} — {budget.seconds:g}s — {budget.reason}"
         )
+        for index, shard in enumerate(budget.shards, start=1):
+            lines.append(
+                f"    Shard {index}: {shard.kind} — "
+                f"{shard.budget_seconds:g}s from "
+                f"{shard.measured_seconds:g}s measured — "
+                f"{' '.join(shard.suites)}"
+            )
+        if budget.omitted:
+            lines.append("  UNVERIFIED (trimmed from this run):")
+            lines.extend(f"    {suite}" for suite in budget.omitted)
     lines.append(
         "  Scope: fast developer feedback only; sealed-candidate ci-verify "
         "remains authoritative."
@@ -465,10 +606,11 @@ def run_plan(
     repo_root: Path,
     plan: DeveloperPlan,
     *,
-    budget_seconds: float = SCOPED_BUDGET_SECONDS,
+    budget_seconds: float | None = None,
+    budget: BudgetDecision | None = None,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> int:
-    """Run one pytest process plus selected shell suites within one budget."""
+    """Run the measured shards, or the legacy plan under one total budget."""
     if plan.python.tests and importlib.util.find_spec("pytest") is None:
         raise DeveloperCheckError("pytest is required for selected Python tests")
     bash = shutil.which("bash")
@@ -491,37 +633,76 @@ def run_plan(
             "before running"
         )
 
-    started = time.monotonic()
     failed = False
+    commands: list[tuple[list[str], float | None]] = []
+    derived = budget is not None and budget.mode == "derived"
+    if derived and not budget.shards and (plan.python.tests or plan.shell_suites):
+        # The bound cannot fit even one suite. Running the untrimmed plan under
+        # a leftover budget is how this used to end in exit 124 with nothing
+        # verified; reporting it GREEN would be worse still — SABLE-o1lnt
+        # records that a skip keeps the run green, nobody reads the Skipped
+        # line, and the assertion is silently retired. So: a loud verdict.
+        raise DeveloperCheckError(
+            "the execution bound fits NO selected suite, so this run would "
+            "verify nothing. Unverified: " + " ".join(budget.omitted) + ". "
+            "Raise the bound (--budget) or reduce the suites' real cost. "
+            + TIMEOUT_REMEDIATION
+        )
+    if derived:
+        for shard in budget.shards:
+            if shard.kind == "python":
+                command = [
+                    sys.executable, "-m", "pytest", *shard.suites,
+                    "-q", "-p", "no:cacheprovider",
+                ]
+            else:
+                command = [
+                    bash or "bash",
+                    str(repo_root / "hooks/test" / shard.suites[0]),
+                ]
+            commands.append((command, shard.budget_seconds))
+    else:
+        if plan.python.tests:
+            commands.append(([
+                sys.executable, "-m", "pytest", *plan.python.tests,
+                "-q", "-p", "no:cacheprovider",
+            ], None))
+        commands.extend(
+            ([bash or "bash", str(repo_root / "hooks/test" / suite)], None)
+            for suite in plan.shell_suites
+        )
 
-    def remaining() -> float:
-        return max(0.0, budget_seconds - (time.monotonic() - started))
+    if budget is not None and budget.omitted:
+        # Say it again at EXECUTION time, not only in the plan. A trim printed
+        # once during planning and never repeated is how "what we left
+        # unverified" quietly becomes "what we verified".
+        print(
+            "sable-dev-check: UNVERIFIED — trimmed to fit the budget: "
+            + " ".join(budget.omitted),
+            file=sys.stderr,
+        )
 
-    commands: list[list[str]] = []
-    if plan.python.tests:
-        commands.append([
-            sys.executable, "-m", "pytest", *plan.python.tests,
-            "-q", "-p", "no:cacheprovider",
-        ])
-    commands.extend(
-        [bash or "bash", str(repo_root / "hooks/test" / suite)]
-        for suite in plan.shell_suites
-    )
-
-    for command in commands:
-        timeout = remaining()
-        if timeout <= 0:
-            print(
-                f"sable-dev-check: budget exhausted after {budget_seconds:g}s",
-                file=sys.stderr,
-            )
-            return 124
+    started = time.monotonic()
+    for command, shard_timeout in commands:
+        timeout = shard_timeout
+        if timeout is None and budget_seconds is not None:
+            timeout = max(0.0, budget_seconds - (time.monotonic() - started))
+            if timeout <= 0:
+                print(
+                    f"sable-dev-check: budget exhausted after "
+                    f"{budget_seconds:g}s\n{TIMEOUT_REMEDIATION}",
+                    file=sys.stderr,
+                )
+                return 124
         try:
-            result = runner(command, cwd=repo_root, timeout=timeout)
+            kwargs = {"cwd": repo_root}
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            result = runner(command, **kwargs)
         except subprocess.TimeoutExpired:
             print(
-                f"sable-dev-check: command exceeded remaining {timeout:.1f}s budget: "
-                f"{' '.join(command)}",
+                f"sable-dev-check: command exceeded its {timeout:.1f}s budget: "
+                f"{' '.join(command)}\n{TIMEOUT_REMEDIATION}",
                 file=sys.stderr,
             )
             return 124

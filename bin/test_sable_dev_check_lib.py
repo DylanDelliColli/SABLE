@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sable_dev_check_lib as devcheck  # noqa: E402
+import sable_gate_budget_lib as gate_budget  # noqa: E402
 
 DEV_CHECK = Path(__file__).resolve().parent / "sable-dev-check"
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -169,11 +170,23 @@ def test_implicit_full_fallback_budget_comes_from_full_snapshot_ssot(tmp_path):
     assert decision.seconds == 347
     assert decision.mode == "full-fallback"
     assert "Shell FULL" in decision.reason
-    assert len(calls) == 1
-    assert calls[0][0][-2:] == ["--budget", "full_snapshot"]
+    assert ["--budget", "full_snapshot"] in [call[0][-2:] for call in calls]
 
 
-def test_implicit_scoped_budget_stays_fast_without_reading_full_snapshot(tmp_path):
+def test_scoped_plan_is_bounded_by_full_snapshot_not_the_scoped_tier_value(tmp_path):
+    """The budget gradient must not punish a precise blast radius.
+
+    This test replaces one that asserted the opposite — that a scoped plan
+    takes the pre_push tier's 90s as its ceiling and never reads
+    full_snapshot. That assertion WAS the defect: SABLE-1urtf measured a
+    correctly-mapped three-file change selecting a smaller, all-green suite
+    set, emitting 69 passing dots, and then dying at exit 124 with no verdict,
+    while an UNMAPPED path escalating to FULL was handed 1800s and finished.
+    Being precise was punished; being vague was rewarded. So the scoped tier's
+    duration is now a per-command minimum grant, and the absolute bound is the
+    same full_snapshot the FULL fallback gets.
+    """
+    _write(tmp_path, ".github/ci/test-tiers.sh", "# fake tier source\n")
     plan = devcheck.DeveloperPlan(
         changed_paths=("bin/widget.py",),
         python=devcheck.PythonSelection(
@@ -183,17 +196,22 @@ def test_implicit_scoped_budget_stays_fast_without_reading_full_snapshot(tmp_pat
         shell_mode="scoped",
         shell_reason="1 suite from 1 mapped path",
     )
+    answers = {"full_snapshot": "1800\n", "pre_push": "90\n"}
 
-    def forbidden_runner(*_args, **_kwargs):
-        pytest.fail("a scoped plan must not query the full_snapshot budget")
+    def fake_runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=answers[argv[-1]], stderr="",
+        )
 
     decision = devcheck.effective_budget(
-        tmp_path, plan, explicit_seconds=None, runner=forbidden_runner,
+        tmp_path, plan, explicit_seconds=None, runner=fake_runner,
     )
 
-    assert decision.seconds == 90
     assert decision.mode == "scoped"
-    assert "90" not in decision.reason  # duration and explanation stay separate
+    assert decision.seconds == 1800
+    # The whole point: the scoped tier's number is no longer the ceiling a
+    # scoped plan runs against.
+    assert decision.seconds != 90
 
 
 def test_python_full_alone_uses_the_full_snapshot_budget(tmp_path):
@@ -221,7 +239,7 @@ def test_python_full_alone_uses_the_full_snapshot_budget(tmp_path):
     assert decision.mode == "full-fallback"
     assert "Python FULL" in decision.reason
     assert "Shell FULL" not in decision.reason
-    assert len(calls) == 1
+    assert ["--budget", "full_snapshot"] in [call[0][-2:] for call in calls]
 
 
 def test_explicit_budget_wins_even_for_a_full_fallback(tmp_path):
@@ -264,6 +282,8 @@ def test_cli_dry_run_reports_selection_modes_reasons_and_effective_budget(
         """
         #!/usr/bin/env bash
         [ "$1" = --budget ] && [ "$2" = full_snapshot ] && echo 347
+        [ "$1" = --budget ] && [ "$2" = pre_push ] && echo 90
+        exit 0
         """,
     )
     _write(tmp_path, "bin/test_a.py", "def test_a(): assert True\n")
@@ -295,6 +315,8 @@ def test_cli_execution_hands_the_effective_full_budget_to_run_plan(
         """
         #!/usr/bin/env bash
         [ "$1" = --budget ] && [ "$2" = full_snapshot ] && echo 347
+        [ "$1" = --budget ] && [ "$2" = pre_push ] && echo 90
+        exit 0
         """,
     )
     plan = devcheck.DeveloperPlan(
@@ -312,7 +334,7 @@ def test_cli_execution_hands_the_effective_full_budget_to_run_plan(
         sable_dev_check_cli.devcheck, "build_plan", lambda _repo, _changed: plan,
     )
 
-    def fake_run_plan(repo, actual_plan, *, budget_seconds):
+    def fake_run_plan(repo, actual_plan, *, budget_seconds, budget=None):
         observed.update(
             repo=repo,
             plan=actual_plan,
@@ -614,3 +636,270 @@ def test_cli_help_does_not_inspect_repository_or_run_tests():
 
     assert result.returncode == 0
     assert "sealed-candidate" in result.stdout
+
+
+# --- derived budgets: split or trim, and report (SABLE-y4nom.4) ------------
+
+
+def _tier_runner(full_snapshot: float, pre_push: float):
+    answers = {"full_snapshot": f"{full_snapshot}\n", "pre_push": f"{pre_push}\n"}
+
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=answers[argv[-1]], stderr="")
+
+    return runner
+
+
+def _scoped_plan(python_tests, shell_suites=()):
+    return devcheck.DeveloperPlan(
+        changed_paths=("bin/sable-orchestration-install",),
+        python=devcheck.PythonSelection("selected", tuple(python_tests), "mapped"),
+        shell_suites=tuple(shell_suites),
+        shell_mode="scoped",
+        shell_reason="mapped suites",
+    )
+
+
+def test_effective_budget_trims_an_oversized_selection_and_names_the_omissions(
+    tmp_path,
+):
+    """A plan that cannot fit must not be returned as if it could."""
+    _write(tmp_path, ".github/ci/test-tiers.sh", "# fake tier source\n")
+    plan = _scoped_plan(("bin/test_a.py", "bin/test_b.py"), ("test-x.sh",))
+    costs = gate_budget.SuiteCosts(
+        python={"bin/test_a.py": 60.0, "bin/test_b.py": 50.0},
+        shell={"test-x.sh": 30.0},
+    )
+
+    decision = devcheck.effective_budget(
+        tmp_path, plan, explicit_seconds=None, costs=costs,
+        runner=_tier_runner(100, 10),
+    )
+
+    assert decision.mode == "derived"
+    assert decision.omitted == ("bin/test_a.py",)  # it says what it gave up
+    assert "UNVERIFIED" in decision.reason
+    # What still runs fits the ceiling it was trimmed to.
+    executed = {suite for shard in decision.shards for suite in shard.suites}
+    assert executed == {"bin/test_b.py", "test-x.sh"}
+
+
+def test_effective_budget_does_not_trim_a_selection_that_fits(tmp_path):
+    """Negative control: otherwise a function that always trims would pass."""
+    _write(tmp_path, ".github/ci/test-tiers.sh", "# fake tier source\n")
+    plan = _scoped_plan(("bin/test_a.py", "bin/test_b.py"), ("test-x.sh",))
+    costs = gate_budget.SuiteCosts(
+        python={"bin/test_a.py": 20.0, "bin/test_b.py": 10.0},
+        shell={"test-x.sh": 5.0},
+    )
+
+    decision = devcheck.effective_budget(
+        tmp_path, plan, explicit_seconds=None, costs=costs,
+        runner=_tier_runner(200, 10),
+    )
+
+    assert decision.mode == "derived"
+    assert decision.omitted == ()
+    assert "UNVERIFIED" not in decision.reason
+    executed = {suite for shard in decision.shards for suite in shard.suites}
+    assert executed == {"bin/test_a.py", "bin/test_b.py", "test-x.sh"}
+
+
+def test_scoped_budget_is_derived_from_cost_not_from_the_scoped_tier_value(tmp_path):
+    """SABLE-1urtf's shape: the selection costs more than the old 90s ceiling."""
+    _write(tmp_path, ".github/ci/test-tiers.sh", "# fake tier source\n")
+    suites = tuple(f"bin/test_{index}.py" for index in range(12))
+    plan = _scoped_plan(suites)
+    costs = gate_budget.SuiteCosts(
+        python={suite: 165.47 / 12 for suite in suites}, shell={},
+    )
+
+    decision = devcheck.effective_budget(
+        tmp_path, plan, explicit_seconds=None, costs=costs,
+        runner=_tier_runner(1800, 90),
+    )
+
+    assert decision.seconds > 90  # the literal is not the operative ceiling
+    assert decision.omitted == ()  # a green, mapped selection runs in full
+
+
+def test_without_measurements_the_bound_is_full_not_the_scoped_tier_value(tmp_path):
+    """The safe direction: reach a verdict slowly, never fail fast at 90s."""
+    _write(tmp_path, ".github/ci/test-tiers.sh", "# fake tier source\n")
+    decision = devcheck.effective_budget(
+        tmp_path, _scoped_plan(("bin/test_a.py",)), explicit_seconds=None,
+        costs=None, runner=_tier_runner(1800, 90),
+    )
+
+    assert decision.seconds == 1800
+    assert "no measured cost data" in decision.reason
+
+
+def test_timeout_remediation_never_recommends_narrowing_the_test_command():
+    """SABLE-b99hy: a worker followed the old advice and narrowed the claim.
+
+    The old text read "Either scope the test command to a faster subset
+    (recommended: smoke + changed units, <60s)". A blocked worker did exactly
+    that — rewrote sable.testCommand to two files, pushed green, restored it —
+    so the gate certified a narrower claim than it was configured to enforce.
+    """
+    text = devcheck.TIMEOUT_REMEDIATION.lower()
+
+    assert "scope the test command to a faster subset" not in text
+    assert "faster subset" not in text
+    assert "do not narrow" in text  # it forbids the move outright
+
+
+def test_pre_push_gate_no_longer_advises_narrowing_the_test_command():
+    """The same rule at the other site that renders exit 124 to a human."""
+    gate = (REPO_ROOT / "hooks/multi-manager/pre-push-rebase-test.sh").read_text()
+
+    assert "scope the test command to a faster subset" not in gate
+    assert "Do NOT narrow" in gate
+
+
+def test_run_plan_prints_the_remediation_when_a_shard_times_out(tmp_path, capsys):
+    repo = _python_repo(tmp_path, {"bin/test_a.py": "def test_a(): assert True\n"})
+    plan = _scoped_plan(("bin/test_a.py",))
+    budget = devcheck.BudgetDecision(
+        4.0, "derived", "derived", (
+            gate_budget.ExecutionShard("python", ("bin/test_a.py",), 2.0, 4.0),
+        ), (),
+    )
+
+    def timing_out_runner(argv, **_kwargs):
+        raise subprocess.TimeoutExpired(argv, 4.0)
+
+    rc = devcheck.run_plan(
+        repo, plan, budget_seconds=4.0, budget=budget, runner=timing_out_runner,
+    )
+
+    assert rc == 124
+    err = capsys.readouterr().err
+    assert "scope the test command to a faster subset" not in err
+    assert "Do NOT narrow" in err
+
+
+def test_run_plan_gives_each_shard_its_own_derived_timeout(tmp_path):
+    repo = _python_repo(
+        tmp_path,
+        {
+            "bin/test_a.py": "def test_a(): assert True\n",
+            "bin/test_b.py": "def test_b(): assert True\n",
+        },
+    )
+    plan = _scoped_plan(("bin/test_a.py", "bin/test_b.py"))
+    budget = devcheck.BudgetDecision(
+        30.0, "derived", "derived", (
+            gate_budget.ExecutionShard("python", ("bin/test_a.py",), 5.0, 10.0),
+            gate_budget.ExecutionShard("python", ("bin/test_b.py",), 10.0, 20.0),
+        ), (),
+    )
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0)
+
+    rc = devcheck.run_plan(
+        repo, plan, budget_seconds=30.0, budget=budget, runner=fake_runner,
+    )
+
+    assert rc == 0
+    # Two commands, each bounded by its OWN measured budget rather than by a
+    # shared countdown the first command can exhaust.
+    assert [kwargs["timeout"] for _, kwargs in calls] == [10.0, 20.0]
+
+
+def test_run_plan_reports_trimmed_suites_at_execution_time(tmp_path, capsys):
+    repo = _python_repo(tmp_path, {"bin/test_a.py": "def test_a(): assert True\n"})
+    plan = _scoped_plan(("bin/test_a.py",))
+    budget = devcheck.BudgetDecision(
+        10.0, "derived", "derived", (
+            gate_budget.ExecutionShard("python", ("bin/test_a.py",), 5.0, 10.0),
+        ), ("bin/test_slow.py", "test-slow.sh"),
+    )
+
+    devcheck.run_plan(
+        repo, plan, budget_seconds=10.0, budget=budget,
+        runner=lambda argv, **_k: subprocess.CompletedProcess(argv, 0),
+    )
+
+    err = capsys.readouterr().err
+    assert "UNVERIFIED" in err
+    assert "bin/test_slow.py" in err
+    assert "test-slow.sh" in err
+
+
+def test_render_plan_names_every_trimmed_suite(tmp_path):
+    plan = _scoped_plan(("bin/test_a.py",))
+    budget = devcheck.BudgetDecision(
+        10.0, "derived", "derived; TRIMMED to fit", (), ("bin/test_slow.py",),
+    )
+
+    rendered = devcheck.render_plan(plan, budget=budget)
+
+    assert "UNVERIFIED" in rendered
+    assert "bin/test_slow.py" in rendered
+
+
+def test_a_bound_that_fits_nothing_fails_loudly_rather_than_running_green(tmp_path):
+    """Trimming to EMPTY must not be reported as success.
+
+    Found by the paired negative control in the integration suite: a bound
+    small enough to trim every suite left zero shards, fell through to the
+    untrimmed legacy path, and produced exit 124 — a non-answer. Reporting it
+    green instead would be worse: SABLE-o1lnt records that a skip keeps the
+    run green, nobody reads the Skipped line, and the assertion is silently
+    retired. So this raises.
+    """
+    repo = _python_repo(tmp_path, {"bin/test_a.py": "def test_a(): assert True\n"})
+    plan = _scoped_plan(("bin/test_a.py",))
+    budget = devcheck.BudgetDecision(
+        0.0, "derived", "TRIMMED to fit", (), ("bin/test_a.py",),
+    )
+
+    with pytest.raises(devcheck.DeveloperCheckError, match="verify nothing"):
+        devcheck.run_plan(
+            repo, plan, budget_seconds=0.0, budget=budget,
+            runner=lambda argv, **_k: pytest.fail("nothing should execute"),
+        )
+
+
+def test_load_costs_reports_none_when_no_measurements_exist(tmp_path):
+    assert devcheck.load_costs(tmp_path) is None
+
+
+def test_load_costs_reads_the_two_existing_reporters(tmp_path):
+    _write(
+        tmp_path,
+        devcheck.PYTHON_COST_REPORT,
+        json.dumps({"modules": [{"module": "bin/test_a.py", "seconds": 3.0}]}),
+    )
+    _write(
+        tmp_path,
+        devcheck.SHELL_COST_PROFILE,
+        "suite\tstatus\tseconds\ntest-a.sh\tpass\t2.000000\n",
+    )
+
+    costs = devcheck.load_costs(tmp_path)
+
+    assert costs is not None
+    assert costs.python == {"bin/test_a.py": 3.0}
+    assert costs.shell == {"test-a.sh": 2.0}
+
+
+def test_an_unreadable_cost_report_degrades_instead_of_blocking(tmp_path, capsys):
+    _write(tmp_path, devcheck.PYTHON_COST_REPORT, "{ not json")
+    _write(
+        tmp_path,
+        devcheck.SHELL_COST_PROFILE,
+        "suite\tstatus\tseconds\ntest-a.sh\tpass\t2.000000\n",
+    )
+
+    costs = devcheck.load_costs(tmp_path)
+
+    assert costs is not None
+    assert costs.python == {}
+    assert costs.shell == {"test-a.sh": 2.0}
+    assert "ignoring unreadable python cost report" in capsys.readouterr().err

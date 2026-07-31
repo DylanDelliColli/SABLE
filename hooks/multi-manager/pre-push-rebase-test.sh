@@ -688,21 +688,43 @@ fi
 
 TEST_TIMEOUT=$(sable_resolve_test_timeout "$CWD")
 TEST_EXIT=0
-TEST_OUT=$(cd "$CWD" && timeout "$TEST_TIMEOUT" sh -c "$TEST_CMD" 2>&1) || TEST_EXIT=$?
+# The RECORDED command is captured HERE, at the invocation site, from the same
+# variable the shell is about to execute — never re-resolved from config
+# afterwards. SABLE-b99hy caught say-versus-do divergence in BOTH directions
+# one drain apart: a worker reporting a config applied that was not, and a
+# temporary override still in place after the push it was granted for. A
+# report of what was enforced is not evidence of what was enforced, so the
+# only string this gate is allowed to certify is the one it ran.
+TEST_CMD_EXECUTED="$TEST_CMD"
+TEST_OUT=$(cd "$CWD" && timeout "$TEST_TIMEOUT" sh -c "$TEST_CMD_EXECUTED" 2>&1) || TEST_EXIT=$?
+
+# Prior intent, if a dispatcher declared one. Evidence only — it never selects
+# what runs, and when it disagrees with the executed command the DIVERGENCE is
+# reported rather than reconciled away.
+TEST_CMD_RECORD="enforced test command (executed): \`$TEST_CMD_EXECUTED\`"
+if [ -n "${SABLE_TEST_COMMAND_INTENT:-}" ] && \
+   [ "${SABLE_TEST_COMMAND_INTENT}" != "$TEST_CMD_EXECUTED" ]; then
+  TEST_CMD_RECORD="$TEST_CMD_RECORD
+DIVERGENCE: prior intent was \`${SABLE_TEST_COMMAND_INTENT}\`, which is NOT what ran. The executed command above is what this gate certifies; the intent value certifies nothing."
+fi
 
 if [ "$TEST_EXIT" -ne 0 ]; then
   if [ "$TEST_EXIT" -eq 124 ]; then
-    SUFFIX="Tests exceeded the ${TEST_TIMEOUT}s test-phase timeout. Either scope the test command to a faster subset (recommended: smoke + changed units, <60s), or raise the timeout for this repo: \`git config sable.testTimeout <seconds>\` (repo-local), a \`testTimeout=<seconds>\` line in .sable (checked in), or \$SABLE_PRE_PUSH_TEST_TIMEOUT (legacy env, and raise the settings.json hook timeout together with it)."
+    SUFFIX="Tests exceeded the ${TEST_TIMEOUT}s test-phase timeout, so this push has NO verdict — nothing was verified, rather than something failing. Re-measure suite cost (pytest --sable-test-cost-report, .github/ci/shell-run-set.sh --profile) so the derived per-command budgets in bin/sable-dev-check reflect current cost, or reduce the suites' real runtime. Do NOT narrow \`sable.testCommand\` or the selected suite set to fit: a smaller claim that passes is not the configured claim passing, and this gate records what it actually ran (SABLE-b99hy)."
   else
     SUFFIX="Tests failed. Fix before pushing, or set SABLE_SKIP_PRE_PUSH=1 with explicit intent (rebase + static + build still run)."
   fi
-  emit_deny "Pre-push phase 4 (tests): \`$TEST_CMD\` failed.
+  emit_deny "Pre-push phase 4 (tests): \`$TEST_CMD_EXECUTED\` failed.
 ${SUFFIX}
+
+${TEST_CMD_RECORD}
 
 $(sable_tail_chars "$TEST_OUT" 1500)"
   exit 0
 fi
 
+emit_context "Pre-push: all phases passed.
+${TEST_CMD_RECORD}"
 exit 0
 }
 

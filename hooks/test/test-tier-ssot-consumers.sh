@@ -145,10 +145,19 @@ print(json.dumps({'tool_input': {'command': 'git push'}, 'cwd': '$2'}))
 PP_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true"
 OUT1=$(run_hook "$PP_ENV" "$REPO_DIR")
 
-if [ -z "$OUT1" ]; then
-  pass "consumer 1 (pre-push hook): no explicit testCommand + tier SSOT present -> resolves pre_push, both fixture suites pass -> push ALLOWED"
+# A passing push is ALLOWED but no longer SILENT (SABLE-y4nom.4): it carries a
+# record of the command actually executed, so this asserts the allow by the
+# absence of a deny plus the presence of that record — a strictly stronger
+# check than "produced no output". SABLE-b99hy is why the record exists: a
+# worker narrowed sable.testCommand to a two-file subset, pushed green, and
+# restored it, so the gate certified a narrower claim than it was configured
+# to enforce while printing "enforced".
+if ! printf '%s' "$OUT1" | grep -q '"permissionDecision": "deny"' && \
+   printf '%s' "$OUT1" | grep -qF 'enforced test command (executed):' && \
+   printf '%s' "$OUT1" | grep -qF 'test-tiers.sh --run pre_push'; then
+  pass "consumer 1 (pre-push hook): no explicit testCommand + tier SSOT present -> resolves pre_push, both fixture suites pass -> push ALLOWED and the resolved command is RECORDED"
 else
-  fail "consumer 1 (pre-push hook): no explicit testCommand + tier SSOT present -> resolves pre_push, both fixture suites pass -> push ALLOWED" "got: ${OUT1:0:400}"
+  fail "consumer 1 (pre-push hook): no explicit testCommand + tier SSOT present -> resolves pre_push, both fixture suites pass -> push ALLOWED and the resolved command is RECORDED" "got: ${OUT1:0:400}"
 fi
 
 # Mutate the SSOT (step 2): drop the passing beta suite, add a failing one.
