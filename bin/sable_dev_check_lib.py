@@ -54,11 +54,22 @@ class DeveloperPlan:
 
 @dataclass(frozen=True)
 class BudgetDecision:
+    """``seconds`` is the ABSOLUTE total this run may spend, end to end.
+
+    ``shard_headroom_seconds`` is the sum of the per-command grants and is
+    REPORTING ONLY. The two are separate fields on purpose (SABLE-8jln9): the
+    sum routinely exceeds the total — a per-command floor granting N cheap
+    suites 90s each sums to N*90 — and an executor handed the sum runs past the
+    bound it was told to honour, which is the exit-124-with-no-verdict defect
+    this whole change removes, reproduced at a larger scale.
+    """
+
     seconds: float
     mode: str
     reason: str
     shards: tuple[gate_budget.ExecutionShard, ...] = ()
     omitted: tuple[str, ...] = ()
+    shard_headroom_seconds: float = 0.0
 
 
 SCOPED_TIER = "pre_push"
@@ -481,6 +492,10 @@ def effective_budget(
     runs against the absolute bound rather than against a number nobody
     measured. That is deliberately the SAFE direction: an underived plan
     reaches a verdict slowly instead of failing fast having verified nothing.
+
+    WHAT ``seconds`` IS, IN EVERY MODE: the absolute total. Derivation changes
+    the PER-COMMAND grants inside that total, never the total itself. It is
+    emphatically not the sum of those grants (SABLE-8jln9) — see BudgetDecision.
     """
     floor = 0.0
     if explicit_seconds is not None:
@@ -522,7 +537,9 @@ def effective_budget(
     derived_reason = (
         f"{reason}; derived from {derived_plan.measured_seconds:.1f}s measured "
         f"across {len(derived_plan.shards)} command(s) "
-        f"({python_shards} Python shard(s))"
+        f"({python_shards} Python shard(s)); per-command headroom sums to "
+        f"{derived_plan.shard_headroom_seconds:.1f}s, spendable only within "
+        f"the {derived_plan.total_seconds:g}s total"
     )
     if derived_plan.provisional:
         derived_reason += (
@@ -536,11 +553,14 @@ def effective_budget(
             f"left UNVERIFIED"
         )
     return BudgetDecision(
-        derived_plan.budget_seconds,
+        # The TOTAL, not the summed per-command headroom. Reading the sum here
+        # is the SABLE-8jln9 defect; the sum travels in its own field below.
+        derived_plan.total_seconds,
         "derived",
         derived_reason,
         derived_plan.shards,
         derived_plan.omitted,
+        derived_plan.shard_headroom_seconds,
     )
 
 
@@ -570,6 +590,12 @@ def render_plan(
         lines.append(
             f"  Budget: {budget.mode} — {budget.seconds:g}s — {budget.reason}"
         )
+        if budget.shards:
+            lines.append(
+                f"  Total bound: {budget.seconds:g}s absolute; per-command "
+                f"headroom sums to {budget.shard_headroom_seconds:g}s and every "
+                f"command runs under min(its own grant, time left in the total)"
+            )
         for index, shard in enumerate(budget.shards, start=1):
             lines.append(
                 f"    Shard {index}: {shard.kind} — "
@@ -609,8 +635,28 @@ def run_plan(
     budget_seconds: float | None = None,
     budget: BudgetDecision | None = None,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    clock: Callable[[], float] = time.monotonic,
 ) -> int:
-    """Run the measured shards, or the legacy plan under one total budget."""
+    """Run the measured shards, or the legacy plan, under ONE total budget.
+
+    ``budget_seconds`` is the absolute wall-clock this whole call may spend,
+    and it binds in EVERY mode. Each command runs under
+    ``min(its own derived grant, the time left in the total)``, and a command
+    the total can no longer afford is never started — it is named as unrun and
+    the call returns 124 (SABLE-8jln9).
+
+    The two bounds do different jobs and neither substitutes for the other. The
+    per-command grant keeps ONE oversized command from swallowing the run; the
+    total keeps N commands, each individually within its grant, from summing
+    past the outer wrapper that would then kill the whole gate with no verdict
+    — the original defect, one scale up. A derived grant only ever narrows a
+    command's timeout below the remaining total, never widens it.
+
+    ``clock`` is injectable so a test can advance time deterministically:
+    SABLE-af7u4 measured a real wall-clock cap that FAILED at 10.04s and PASSED
+    at 10.16s on identical code, so a test that raced a real clock would be a
+    load detector rather than a discriminator.
+    """
     if plan.python.tests and importlib.util.find_spec("pytest") is None:
         raise DeveloperCheckError("pytest is required for selected Python tests")
     bash = shutil.which("bash")
@@ -634,7 +680,11 @@ def run_plan(
         )
 
     failed = False
-    commands: list[tuple[list[str], float | None]] = []
+    # (argv, per-command grant or None, the suites that command verifies).
+    # The third element exists so an unrun command can be named: "what this run
+    # did not verify" has to survive into the 124 report, or the report is the
+    # silent narrowing by another route.
+    commands: list[tuple[list[str], float | None, tuple[str, ...]]] = []
     derived = budget is not None and budget.mode == "derived"
     if derived and not budget.shards and (plan.python.tests or plan.shell_suites):
         # The bound cannot fit even one suite. Running the untrimmed plan under
@@ -660,15 +710,15 @@ def run_plan(
                     bash or "bash",
                     str(repo_root / "hooks/test" / shard.suites[0]),
                 ]
-            commands.append((command, shard.budget_seconds))
+            commands.append((command, shard.budget_seconds, shard.suites))
     else:
         if plan.python.tests:
             commands.append(([
                 sys.executable, "-m", "pytest", *plan.python.tests,
                 "-q", "-p", "no:cacheprovider",
-            ], None))
+            ], None, plan.python.tests))
         commands.extend(
-            ([bash or "bash", str(repo_root / "hooks/test" / suite)], None)
+            ([bash or "bash", str(repo_root / "hooks/test" / suite)], None, (suite,))
             for suite in plan.shell_suites
         )
 
@@ -682,18 +732,29 @@ def run_plan(
             file=sys.stderr,
         )
 
-    started = time.monotonic()
-    for command, shard_timeout in commands:
+    def _unrun(index: int) -> str:
+        """Every suite from ``index`` onward, by name."""
+        return " ".join(
+            suite for _, _, suites in commands[index:] for suite in suites
+        )
+
+    started = clock()
+    for index, (command, shard_timeout, _suites) in enumerate(commands):
         timeout = shard_timeout
-        if timeout is None and budget_seconds is not None:
-            timeout = max(0.0, budget_seconds - (time.monotonic() - started))
-            if timeout <= 0:
+        if budget_seconds is not None:
+            # Recomputed BEFORE every invocation, not once for the run: N
+            # commands each inside their own grant must still not outlive the
+            # total between them.
+            remaining = budget_seconds - (clock() - started)
+            if remaining <= 0:
                 print(
-                    f"sable-dev-check: budget exhausted after "
-                    f"{budget_seconds:g}s\n{TIMEOUT_REMEDIATION}",
+                    f"sable-dev-check: the {budget_seconds:g}s total bound is "
+                    f"exhausted; NOT STARTING the remaining command(s). "
+                    f"UNVERIFIED: {_unrun(index)}\n{TIMEOUT_REMEDIATION}",
                     file=sys.stderr,
                 )
                 return 124
+            timeout = remaining if timeout is None else min(timeout, remaining)
         try:
             kwargs = {"cwd": repo_root}
             if timeout is not None:
@@ -702,7 +763,8 @@ def run_plan(
         except subprocess.TimeoutExpired:
             print(
                 f"sable-dev-check: command exceeded its {timeout:.1f}s budget: "
-                f"{' '.join(command)}\n{TIMEOUT_REMEDIATION}",
+                f"{' '.join(command)}\nUNVERIFIED: {_unrun(index)}\n"
+                f"{TIMEOUT_REMEDIATION}",
                 file=sys.stderr,
             )
             return 124

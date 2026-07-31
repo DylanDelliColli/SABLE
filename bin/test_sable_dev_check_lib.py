@@ -780,7 +780,54 @@ def test_run_plan_prints_the_remediation_when_a_shard_times_out(tmp_path, capsys
     assert "Do NOT narrow" in err
 
 
+def _two_shard_budget(total_seconds: float) -> devcheck.BudgetDecision:
+    """Two shards granted 10s and 20s of their own inside ``total_seconds``."""
+    return devcheck.BudgetDecision(
+        total_seconds, "derived", "derived", (
+            gate_budget.ExecutionShard("python", ("bin/test_a.py",), 5.0, 10.0),
+            gate_budget.ExecutionShard("python", ("bin/test_b.py",), 10.0, 20.0),
+        ), (), 30.0,
+    )
+
+
+class _Stopwatch:
+    """A controlled monotonic clock advanced only by the commands that run.
+
+    Deterministic on purpose: SABLE-af7u4 measured a real wall-clock cap that
+    FAILED at 10.04s and PASSED at 10.16s on identical code, so a test racing
+    the real clock would be a load detector, not a discriminator. Time moves
+    here only when a command runs, and by exactly the amount declared — so an
+    assertion about a later command's cap is about the arithmetic under test
+    and about nothing else.
+    """
+
+    def __init__(self, cost_per_command: float, returncode: int = 0):
+        self.now = 0.0
+        self.cost = cost_per_command
+        self.returncode = returncode
+        self.calls: list = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def runner(self, argv, **kwargs):
+        self.calls.append((argv, kwargs))
+        self.now += self.cost
+        return subprocess.CompletedProcess(argv, self.returncode)
+
+    @property
+    def timeouts(self) -> list:
+        return [kwargs["timeout"] for _, kwargs in self.calls]
+
+
 def test_run_plan_gives_each_shard_its_own_derived_timeout(tmp_path):
+    """NEGATIVE CONTROL for the total bound: ample total, caps untouched.
+
+    Without this, capping every command at the remaining total would look
+    identical to preserving each command's own smaller derived grant. Here the
+    total is enormous relative to the work, so the observed timeouts can only
+    be the per-shard grants themselves.
+    """
     repo = _python_repo(
         tmp_path,
         {
@@ -789,26 +836,146 @@ def test_run_plan_gives_each_shard_its_own_derived_timeout(tmp_path):
         },
     )
     plan = _scoped_plan(("bin/test_a.py", "bin/test_b.py"))
-    budget = devcheck.BudgetDecision(
-        30.0, "derived", "derived", (
-            gate_budget.ExecutionShard("python", ("bin/test_a.py",), 5.0, 10.0),
-            gate_budget.ExecutionShard("python", ("bin/test_b.py",), 10.0, 20.0),
-        ), (),
-    )
-    calls = []
-
-    def fake_runner(argv, **kwargs):
-        calls.append((argv, kwargs))
-        return subprocess.CompletedProcess(argv, 0)
+    watch = _Stopwatch(cost_per_command=5.0)
 
     rc = devcheck.run_plan(
-        repo, plan, budget_seconds=30.0, budget=budget, runner=fake_runner,
+        repo, plan, budget_seconds=1800.0, budget=_two_shard_budget(1800.0),
+        runner=watch.runner, clock=watch.clock,
     )
 
     assert rc == 0
-    # Two commands, each bounded by its OWN measured budget rather than by a
-    # shared countdown the first command can exhaust.
-    assert [kwargs["timeout"] for _, kwargs in calls] == [10.0, 20.0]
+    # Two commands, each bounded by its OWN measured grant — the total is
+    # nowhere near binding, so it does not narrow either one.
+    assert watch.timeouts == [10.0, 20.0]
+
+
+def test_a_later_shard_is_capped_by_the_total_the_earlier_ones_already_spent(
+    tmp_path,
+):
+    """SABLE-8jln9: the second grant is reduced by elapsed TOTAL, not reissued.
+
+    Grants of 10s and 20s sum to 30s, but the total is 25s and the first
+    command consumes 15s of it. The second must therefore run under the 10s
+    that remain, not under the 20s it was granted in isolation.
+    """
+    repo = _python_repo(
+        tmp_path,
+        {
+            "bin/test_a.py": "def test_a(): assert True\n",
+            "bin/test_b.py": "def test_b(): assert True\n",
+        },
+    )
+    plan = _scoped_plan(("bin/test_a.py", "bin/test_b.py"))
+    watch = _Stopwatch(cost_per_command=15.0)
+
+    rc = devcheck.run_plan(
+        repo, plan, budget_seconds=25.0, budget=_two_shard_budget(25.0),
+        runner=watch.runner, clock=watch.clock,
+    )
+
+    assert rc == 0
+    # First: min(10 own grant, 25 remaining) = 10. Second, after 15s of total
+    # elapsed: min(20 own grant, 10 remaining) = 10 — the grant did NOT win.
+    assert watch.timeouts == [10.0, 10.0]
+
+
+def test_a_shard_the_total_can_no_longer_afford_is_never_started(tmp_path, capsys):
+    """Exhausted-before-invoke: 124 without running, and it says what it skipped."""
+    repo = _python_repo(
+        tmp_path,
+        {
+            "bin/test_a.py": "def test_a(): assert True\n",
+            "bin/test_b.py": "def test_b(): assert True\n",
+        },
+    )
+    plan = _scoped_plan(("bin/test_a.py", "bin/test_b.py"))
+    watch = _Stopwatch(cost_per_command=25.0)
+
+    rc = devcheck.run_plan(
+        repo, plan, budget_seconds=25.0, budget=_two_shard_budget(25.0),
+        runner=watch.runner, clock=watch.clock,
+    )
+
+    assert rc == 124
+    # The first command consumed the whole 25s total, so the second was never
+    # launched — not launched and killed, which would waste the wall-clock the
+    # bound exists to protect.
+    assert len(watch.calls) == 1
+    err = capsys.readouterr().err
+    assert "NOT STARTING" in err
+    assert "UNVERIFIED: bin/test_b.py" in err
+    assert "bin/test_a.py" not in err.split("UNVERIFIED:")[1]  # it DID run
+    assert "Do NOT narrow" in err
+
+
+# --- partial measurements: provisional costs must not escape the total -----
+
+
+def _partial_measurement_case(tmp_path, shell_count: int = 20):
+    """This checkout's real state: a Python cost report, no shell profile.
+
+    Every shell suite is therefore UNMEASURED and costed provisionally, which
+    deliberately suppresses trimming (a trim on invented numbers is the silent
+    narrowing this module forbids). SABLE-8jln9's amplification: with no total
+    bound, that suppression hands out N enormous per-command grants and the run
+    stops only when the outer 1830s wrapper kills it — with no verdict.
+    """
+    suites = tuple(f"test-{index}.sh" for index in range(shell_count))
+    files = {"bin/test_a.py": "def test_a(): assert True\n"}
+    files.update({f"hooks/test/{suite}": "#!/usr/bin/env bash\nexit 0\n"
+                  for suite in suites})
+    repo = _python_repo(tmp_path, files)
+    # effective_budget reads the tier SSOT from the path it is handed, which is
+    # tmp_path here; run_plan reads the suites from the repo _python_repo built.
+    _write(tmp_path, ".github/ci/test-tiers.sh", "# fake tier source\n")
+    plan = _scoped_plan(("bin/test_a.py",), suites)
+    costs = gate_budget.SuiteCosts(python={"bin/test_a.py": 200.0}, shell={})
+    return repo, plan, costs
+
+
+def test_provisional_costs_cannot_size_a_run_beyond_the_total_bound(tmp_path):
+    _repo, plan, costs = _partial_measurement_case(tmp_path)
+
+    decision = devcheck.effective_budget(
+        tmp_path, plan, explicit_seconds=None, costs=costs,
+        runner=_tier_runner(1800, 90),
+    )
+
+    assert decision.omitted == ()  # no trim on guessed numbers, by design
+    # The grants, summed, are multiples of the bound...
+    assert decision.shard_headroom_seconds > 1800
+    # ...and the run may still spend only the full_snapshot total, which the
+    # 1830s outer wrapper strictly covers. The old code returned the sum here.
+    assert decision.seconds == 1800
+    assert "UNMEASURED" in decision.reason
+
+
+def test_a_provisionally_sized_run_stops_at_the_total_not_at_the_outer_wrapper(
+    tmp_path, capsys,
+):
+    """The executable consequence of the decision above, end to end in run_plan."""
+    repo, plan, costs = _partial_measurement_case(tmp_path)
+    decision = devcheck.effective_budget(
+        tmp_path, plan, explicit_seconds=None, costs=costs,
+        runner=_tier_runner(1800, 90),
+    )
+    # Each command is granted far more than 300s, so only the total can stop
+    # this run before all 21 commands have executed.
+    assert all(shard.budget_seconds > 300 for shard in decision.shards)
+    watch = _Stopwatch(cost_per_command=300.0)
+
+    rc = devcheck.run_plan(
+        repo, plan, budget_seconds=decision.seconds, budget=decision,
+        runner=watch.runner, clock=watch.clock,
+    )
+
+    assert rc == 124
+    assert watch.now <= 1800  # never reaches the 1830s wrapper
+    assert len(watch.calls) == 6  # 6 x 300s exhausts the 1800s total
+    assert len(watch.calls) < len(decision.shards)
+    err = capsys.readouterr().err
+    assert "NOT STARTING" in err
+    assert "test-19.sh" in err  # what went unverified is NAMED, not counted
 
 
 def test_run_plan_reports_trimmed_suites_at_execution_time(tmp_path, capsys):

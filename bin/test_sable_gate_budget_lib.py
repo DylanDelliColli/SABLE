@@ -41,9 +41,9 @@ def test_budget_tracks_the_measurement_so_it_cannot_be_a_literal():
         ("bin/test_a.py",), (), _costs(python={"bin/test_a.py": 45.0}), 1800,
     )
 
-    assert cheap.budget_seconds == pytest.approx(60.0)
-    assert dear.budget_seconds == pytest.approx(90.0)
-    assert dear.budget_seconds > cheap.budget_seconds
+    assert cheap.shard_headroom_seconds == pytest.approx(60.0)
+    assert dear.shard_headroom_seconds == pytest.approx(90.0)
+    assert dear.shard_headroom_seconds > cheap.shard_headroom_seconds
 
 
 def test_scoped_selection_is_not_capped_at_the_ninety_second_literal():
@@ -59,8 +59,8 @@ def test_scoped_selection_is_not_capped_at_the_ninety_second_literal():
     plan = gate_budget.derive_plan(suites, (), _costs(python=measured), 1800)
 
     assert plan.measured_seconds == pytest.approx(165.47)
-    assert plan.budget_seconds == pytest.approx(330.94)
-    assert plan.budget_seconds > 90.0
+    assert plan.shard_headroom_seconds == pytest.approx(330.94)
+    assert plan.shard_headroom_seconds > 90.0
     assert plan.omitted == ()
 
 
@@ -75,8 +75,8 @@ def test_the_scoped_tier_value_is_a_floor_and_never_lowers_a_budget():
         min_shard_seconds=90.0,
     )
 
-    assert tiny.budget_seconds == pytest.approx(90.0)  # raised off 0.6s
-    assert large.budget_seconds == pytest.approx(800.0)  # not capped at 90
+    assert tiny.shard_headroom_seconds == pytest.approx(90.0)  # raised off 0.6s
+    assert large.shard_headroom_seconds == pytest.approx(800.0)  # not capped at 90
 
 
 # --- trim: it must fit, and it must say what it dropped --------------------
@@ -93,7 +93,7 @@ def test_oversized_total_trims_and_names_what_it_left_unverified():
     # and it goes BY NAME.
     assert plan.omitted == ("bin/test_a.py",)
     assert plan.measured_seconds == pytest.approx(80.0)  # 50 + 30, fits 100
-    assert plan.budget_seconds == pytest.approx(160.0)  # per-command headroom
+    assert plan.shard_headroom_seconds == pytest.approx(160.0)  # per-command headroom
     executed = {suite for shard in plan.shards for suite in shard.suites}
     assert executed == {"bin/test_b.py", "test-x.sh"}
 
@@ -104,6 +104,11 @@ def test_headroom_is_not_double_counted_into_a_false_trim():
     It fits, and must not be trimmed merely because a 2x per-command headroom
     would notionally total 3138s. Padding the fit decision would turn the
     mechanism that PREVENTS false timeouts into a cause of silent narrowing.
+
+    SABLE-8jln9 UPDATE. This test used to stop at "summed headroom may exceed
+    the bound, and that is fine" — true of the SUM, and read by the executor as
+    permission to SPEND it. Both halves are asserted now: the sum may exceed
+    the bound, and the executable total may not.
     """
     suites = tuple(f"bin/test_{index}.py" for index in range(100))
     plan = gate_budget.derive_plan(
@@ -112,7 +117,47 @@ def test_headroom_is_not_double_counted_into_a_false_trim():
 
     assert plan.omitted == ()
     assert plan.measured_seconds == pytest.approx(1569.0)
-    assert plan.budget_seconds > 1800  # headroom exceeds the bound, and that is fine
+    # The SUM of per-command grants may exceed the bound...
+    assert plan.shard_headroom_seconds > 1800
+    # ...and the plan's executable total may not.
+    assert plan.total_seconds == pytest.approx(1800)
+
+
+def test_a_per_command_floor_cannot_buy_the_plan_more_total_than_the_ceiling():
+    """SABLE-8jln9's exact control, reproduced from the finding's own numbers.
+
+    Two shell suites measured at 1s each, ceiling 100s, per-command floor 90s.
+    Nothing is trimmed (2s of work fits 100s easily), and each command is
+    granted the 90s floor so a 1s suite does not trip on load — so the grants
+    SUM to 180. The bug was that 180 was then handed to the executor as the
+    run's budget. N such suites give N*90, and a large honest selection runs
+    past the outer wrapper and dies at exit 124 with no verdict: the very
+    defect this module was written to remove, one scale up.
+    """
+    plan = gate_budget.derive_plan(
+        (), ("test-x.sh", "test-y.sh"),
+        _costs(shell={"test-x.sh": 1.0, "test-y.sh": 1.0}),
+        100, min_shard_seconds=90.0,
+    )
+
+    assert plan.omitted == ()
+    assert [shard.budget_seconds for shard in plan.shards] == [90.0, 90.0]
+    assert plan.shard_headroom_seconds == pytest.approx(180.0)
+    # THE ASSERTION THAT FAILED BEFORE THE FIX: what may actually be spent.
+    assert plan.total_seconds == pytest.approx(100.0)
+    assert plan.total_seconds != plan.shard_headroom_seconds
+
+
+def test_the_executable_total_is_the_ceiling_for_any_number_of_floored_suites():
+    """Generalises the control above: the gap grows with N, the total does not."""
+    suites = tuple(f"test-{index}.sh" for index in range(20))
+    plan = gate_budget.derive_plan(
+        (), suites, _costs(shell={suite: 1.0 for suite in suites}),
+        100, min_shard_seconds=90.0,
+    )
+
+    assert plan.shard_headroom_seconds == pytest.approx(1800.0)  # 20 x 90
+    assert plan.total_seconds == pytest.approx(100.0)
 
 
 def test_a_fitting_selection_is_never_trimmed():
@@ -127,7 +172,7 @@ def test_a_fitting_selection_is_never_trimmed():
     )
 
     assert plan.omitted == ()
-    assert plan.budget_seconds == pytest.approx(70.0)
+    assert plan.shard_headroom_seconds == pytest.approx(70.0)
     executed = {suite for shard in plan.shards for suite in shard.suites}
     assert executed == {"bin/test_a.py", "bin/test_b.py", "test-x.sh"}
 

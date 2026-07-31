@@ -92,17 +92,38 @@ class DerivedPlan:
     ceiling must say what it left unverified BY NAME. An implementation that
     quietly returned a shorter shard list would be the silent narrowing this
     module exists to prevent (SABLE-b99hy).
+
+    TWO DIFFERENT NUMBERS, DELIBERATELY NAMED APART (SABLE-8jln9).
+    ``total_seconds`` is the ABSOLUTE executable wall-clock bound for the whole
+    plan. ``shard_headroom_seconds`` is merely the SUM of the per-command
+    grants, and it may legitimately exceed the total — per-command headroom
+    exists so no single command trips on load, not so the run may spend the sum
+    of them. The field this type used to expose was called ``budget_seconds``
+    and held the SUM; every consumer read it as "the budget" and no total was
+    ever enforced, so two 1s shell suites under a 100s ceiling with a 90s
+    per-command floor became a 180s executable run. Handing the sum to an
+    executor reinstates the exit-124-with-no-verdict defect this module exists
+    to remove, one scale up.
     """
 
     shards: tuple[ExecutionShard, ...]
     omitted: tuple[str, ...]
     measured_seconds: float
     ceiling_seconds: float
-    budget_seconds: float = 0.0
+    shard_headroom_seconds: float = 0.0
     # Suites running on a provisional (unmeasured) cost. Reported so a large
     # derived total is legible as "mostly guesses" rather than mistaken for a
     # measurement, and so the suppressed trim is explainable.
     provisional: tuple[str, ...] = ()
+
+    @property
+    def total_seconds(self) -> float:
+        """THE number an executor may spend across the entire plan.
+
+        A property, not a stored field, so it cannot drift from the ceiling it
+        is and cannot be assigned the summed headroom by a later edit.
+        """
+        return self.ceiling_seconds
 
 
 def _positive_seconds(value: object, *, identity: str) -> float:
@@ -330,15 +351,21 @@ def derive_plan(
     members, so a bigger honest selection is granted a bigger budget instead of
     being cut off by a fixed number it never had a chance against.
 
-    ``ceiling_seconds`` bounds the TOTAL. When the derived total exceeds it the
-    plan TRIMS — dropping suites and naming them in ``omitted`` — and when a
-    single Python command would exceed ``shard_max_seconds`` the plan SPLITS.
-    What it never does is return a plan that cannot complete.
+    ``ceiling_seconds`` bounds the TOTAL, and is returned unchanged as
+    ``total_seconds``. When the measured total exceeds it the plan TRIMS —
+    dropping suites and naming them in ``omitted`` — and when a single Python
+    command would exceed ``shard_max_seconds`` the plan SPLITS. What it never
+    does is return a plan that cannot complete.
 
     ``min_shard_seconds`` is a per-command MINIMUM grant, not a ceiling: a
     suite measured at 0.3s would otherwise derive a sub-second timeout and trip
-    on ordinary machine load. It only ever raises a small budget, so it cannot
-    push a plan over ``ceiling_seconds`` that the trim above already fitted.
+    on ordinary machine load. IT CAN AND DOES PUSH THE SUMMED HEADROOM OVER
+    ``ceiling_seconds`` — two 1s shell suites under a 100s ceiling with a 90s
+    floor sum to 180s (SABLE-8jln9 measured exactly this), and N of them sum to
+    N*90. That is why the sum is not the executable bound: the caller runs
+    every command under min(its own grant, the time left in ``total_seconds``),
+    so the floor buys a small suite room to breathe without ever buying the
+    plan more wall-clock than the ceiling allows.
     """
     if ceiling_seconds <= 0:
         raise ValueError("ceiling must be positive")
@@ -377,6 +404,7 @@ def derive_plan(
         tuple(omitted),
         sum(shard.measured_seconds for shard in shards),
         float(ceiling_seconds),
+        # The SUM of the per-command grants — reported, never executed against.
         sum(shard.budget_seconds for shard in shards),
         tuple(sorted(suite for _, suite, _, measured in kept if not measured)),
     )

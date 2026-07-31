@@ -220,6 +220,21 @@ def test_the_derived_budget_is_not_the_scoped_tier_value(install_repo):
     assert "420" in result.stdout
 
 
+def test_the_report_separates_the_total_bound_from_the_summed_grants(install_repo):
+    """SABLE-8jln9: the two numbers were conflated, so both are now printed.
+
+    600s is the fixture's full_snapshot tier — the absolute total this run may
+    spend. 420s is the sum of the per-command grants. A reader who cannot tell
+    them apart cannot tell whether the gate is bounded at all, which is how the
+    summed value was handed to the executor unnoticed.
+    """
+    result = _dev_check(install_repo, "--dry-run")
+
+    assert "Budget: derived — 600s" in result.stdout
+    assert "Total bound: 600s absolute" in result.stdout
+    assert "headroom sums to 420s" in result.stdout
+
+
 # --- NEGATIVE CONTROL: the same input still dies without the derivation ----
 
 
@@ -280,6 +295,150 @@ def test_a_trim_is_reported_at_execution_time_not_only_while_planning(install_re
     result = _dev_check(install_repo, "--budget", "100")
 
     assert "UNVERIFIED" in result.stderr
+
+
+# --- the total bound, in real composition (SABLE-8jln9) --------------------
+
+
+@pytest.fixture(scope="module")
+def partial_measurement_repo(tmp_path_factory) -> Path:
+    """The install shape with the shell profile DELETED.
+
+    This is the state this very checkout was in when the defect was found: a
+    Python cost report exists, no shell profile does. Every shell suite is
+    therefore unmeasured, costed provisionally, and — correctly — exempt from
+    trimming, because a trim decided by invented numbers is the silent
+    narrowing this whole change forbids. What must NOT follow is an unbounded
+    run: without a total, each command keeps its own generous grant and the
+    plan stops only when the outer wrapper kills the gate outright.
+    """
+    repo = tmp_path_factory.mktemp("partial-measurement")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    _write(repo, "bin/sable-orchestration-install", "#!/usr/bin/env python3\n")
+    _write(repo, "bin/orchestration_lib.py", "def install(): return 'ok'\n")
+    _write(repo, "bin/orchestration_extra.py", "def extra(): return 'ok'\n")
+    _write(
+        repo,
+        "bin/test_install_tool.py",
+        f"""
+        import time
+        from pathlib import Path
+        TOOL = Path(__file__).parent / "sable-orchestration-install"
+        def test_tool_present():
+            time.sleep({SLEEP_SECONDS})
+            assert TOOL.name == "sable-orchestration-install"
+        """,
+    )
+    for index in range(PYTHON_SUITES - 1):
+        module = "orchestration_lib" if index % 2 == 0 else "orchestration_extra"
+        symbol = "install" if index % 2 == 0 else "extra"
+        _write(
+            repo,
+            f"bin/test_install_{index}.py",
+            f"""
+            import time
+            from {module} import {symbol}
+            def test_{symbol}_{index}():
+                time.sleep({SLEEP_SECONDS})
+                assert {symbol}() == 'ok'
+            """,
+        )
+    for name in ("test-install-a.sh", "test-install-b.sh"):
+        _write(repo, f"hooks/test/{name}", "#!/usr/bin/env bash\nexit 0\n",
+               executable=True)
+    _write(
+        repo,
+        ".github/ci/impact-manifest.sh",
+        """
+        #!/usr/bin/env bash
+        echo test-install-a.sh
+        echo test-install-b.sh
+        echo "::notice::impact-manifest: SCOPED -- 2 suites from 3 mapped paths" >&2
+        """,
+        executable=True,
+    )
+    _write(
+        repo,
+        ".github/ci/test-tiers.sh",
+        """
+        #!/usr/bin/env bash
+        [ "$1" = --budget ] && [ "$2" = full_snapshot ] && echo 600
+        [ "$1" = --budget ] && [ "$2" = pre_push ] && echo 60
+        exit 0
+        """,
+        executable=True,
+    )
+    # Python measurements only. No SHELL_COST_PROFILE is written — that absence
+    # IS the condition under test.
+    modules = ["bin/test_install_tool.py"] + [
+        f"bin/test_install_{index}.py" for index in range(PYTHON_SUITES - 1)
+    ]
+    _write(
+        repo,
+        devcheck.PYTHON_COST_REPORT,
+        json.dumps({
+            "modules": [
+                {"module": module, "seconds": DECLARED_COST, "declared_heavy": False}
+                for module in modules
+            ],
+            "tests": [],
+            "violations": [],
+        }),
+    )
+    assert not (repo / devcheck.SHELL_COST_PROFILE).exists()
+    return repo
+
+
+def test_provisional_grants_do_not_survive_the_total_bound(partial_measurement_repo):
+    """Every command is granted 60s; the total is 2s; the run must stop at 2s.
+
+    LOAD-SAFE BY CONSTRUCTION, and this is the whole point of the shape. The
+    selected Python files sleep 2.5s in aggregate against a 2s total, so the
+    total is exceeded on an idle machine and exceeded by MORE under load — the
+    measurement can only move further in the direction asserted. No per-command
+    grant is anywhere near binding (60s each), so a 124 here can only come from
+    the total.
+
+    WITHOUT THE FIX this run returns 0: each command runs under its own 60s
+    grant, nothing tracks the total, and roughly 5s of work sails past a 2s
+    bound that was never enforced.
+    """
+    result = _dev_check(partial_measurement_repo, "--budget", "2")
+
+    assert result.returncode == 124, (
+        f"the total bound did not stop a run that overran it\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    # It answers with a REPORT, not merely a non-zero exit: what did not get
+    # verified is named, which is the half of the contract exit 124 alone fails.
+    assert "UNVERIFIED:" in result.stderr
+    assert "Do NOT narrow" in result.stderr
+    assert any(
+        suite in result.stderr.split("UNVERIFIED:", 1)[1]
+        for suite in ("test-install-a.sh", "test-install-b.sh",
+                      "bin/test_install_tool.py")
+    )
+
+
+def test_negative_control_the_same_plan_completes_when_the_total_is_ample(
+    partial_measurement_repo,
+):
+    """One number differs from the test above: the total. Nothing else.
+
+    Same repo, same missing shell profile, same provisional costs, same
+    per-command grants. With room in the total the run reaches a verdict and
+    leaves nothing unverified — so the 124 above is provably the total binding
+    and not the fixture being broken, and the total is provably not capping
+    runs that fit.
+    """
+    result = _dev_check(partial_measurement_repo, "--budget", "600")
+
+    assert result.returncode == 0, (
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "UNVERIFIED" not in result.stderr
+    for suite in ("test-install-a.sh", "test-install-b.sh"):
+        assert suite in result.stdout
 
 
 # --- recorded-command leg -------------------------------------------------
