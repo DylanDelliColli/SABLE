@@ -32,7 +32,7 @@ def test_concurrent_enqueues_both_survive_and_create_recipient(scratch_store):
     assert recipient_dir.is_dir()
     assert len(ids) == 2
     assert {message.id for message in inbox.pending("optimus")} == ids
-    assert set(inbox.read("optimus")) == {"one", "two"}
+    assert {message.body for message in inbox.read("optimus")} == {"one", "two"}
 
 
 def test_unreadable_store_is_loud_and_never_empty(scratch_store):
@@ -48,4 +48,4 @@ def test_unreadable_store_is_loud_and_never_empty(scratch_store):
 
     # Both polarities prove the plant exercised the assessment boundary: the
     # same store is readable again and its message was never collapsed/lost.
-    assert inbox.read("tarzan") == ["still pending"]
+    assert [message.body for message in inbox.read("tarzan")] == ["still pending"]

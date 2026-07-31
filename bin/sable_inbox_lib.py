@@ -12,6 +12,7 @@ recipient directory with no message files returns an empty list.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -23,6 +24,9 @@ from typing import Any
 
 
 _SAFE_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+_MESSAGE_FILE = re.compile(
+    r"(?P<sequence>[0-9]{20})-(?P<id>[A-Za-z0-9][A-Za-z0-9_.-]*)\.json\Z"
+)
 
 
 class InboxError(RuntimeError):
@@ -49,6 +53,15 @@ class PendingMessage:
     sender: str
 
 
+@dataclass(frozen=True)
+class InboxMessage:
+    """One message read with its acknowledgement identity attached."""
+
+    id: str
+    sender: str
+    body: str
+
+
 def _inbox_root() -> Path:
     """Return the locked host-global, uid-scoped inbox root."""
 
@@ -65,10 +78,6 @@ def _safe_segment(value: str, field: str) -> str:
 
 def _recipient_dir(recipient: str) -> Path:
     return _inbox_root() / _safe_segment(recipient, "recipient")
-
-
-def _message_path(recipient: str, msg_id: str) -> Path:
-    return _recipient_dir(recipient) / f"{_safe_segment(msg_id, 'message id')}.json"
 
 
 def _make_store(recipient_dir: Path) -> None:
@@ -117,7 +126,7 @@ def _published_paths(recipient: str) -> list[Path]:
     unexpected = [
         p.name
         for p in entries
-        if not p.name.startswith(".") and p.suffix != ".json"
+        if not p.name.startswith(".") and not _MESSAGE_FILE.fullmatch(p.name)
     ]
     if unexpected:
         raise InboxCorruptError(
@@ -136,14 +145,28 @@ def _decode(path: Path) -> dict[str, Any]:
         ) from exc
     if (
         not isinstance(value, dict)
-        or set(value) != {"id", "sender", "body"}
+        or set(value) != {"sequence", "id", "sender", "body"}
+        or not isinstance(value["sequence"], int)
         or not isinstance(value["id"], str)
         or not isinstance(value["sender"], str)
         or not isinstance(value["body"], str)
-        or value["id"] != path.stem
+        or (match := _MESSAGE_FILE.fullmatch(path.name)) is None
+        or value["id"] != match.group("id")
+        or value.get("sequence") != int(match.group("sequence"))
     ):
         raise InboxCorruptError(f"invalid inbox message schema in {path.name}")
     return value
+
+
+def _next_sequence(recipient_dir: Path) -> int:
+    """Allocate a FIFO position while holding the recipient's enqueue lock."""
+
+    highest = 0
+    for path in recipient_dir.iterdir():
+        match = _MESSAGE_FILE.fullmatch(path.name)
+        if match:
+            highest = max(highest, int(match.group("sequence")))
+    return highest + 1
 
 
 def enqueue(recipient: str, sender: str, body: str) -> str:
@@ -157,20 +180,28 @@ def enqueue(recipient: str, sender: str, body: str) -> str:
     _make_store(recipient_dir)
 
     msg_id = uuid.uuid4().hex
-    final_path = recipient_dir / f"{msg_id}.json"
     temp_path = recipient_dir / f".{msg_id}.{uuid.uuid4().hex}.tmp"
-    payload = json.dumps(
-        {"id": msg_id, "sender": sender, "body": body},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
     try:
-        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp_path, final_path)
+        lock_fd = os.open(
+            recipient_dir / ".enqueue.lock", os.O_RDWR | os.O_CREAT, 0o600
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            sequence = _next_sequence(recipient_dir)
+            final_path = recipient_dir / f"{sequence:020d}-{msg_id}.json"
+            payload = json.dumps(
+                {"sequence": sequence, "id": msg_id, "sender": sender, "body": body},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, final_path)
+        finally:
+            os.close(lock_fd)
         dir_fd = os.open(recipient_dir, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(dir_fd)
@@ -196,19 +227,32 @@ def pending(recipient: str) -> list[PendingMessage]:
     ]
 
 
-def read(recipient: str) -> list[str]:
-    """Return pending bodies without acknowledging them."""
+def read(recipient: str) -> list[InboxMessage]:
+    """Return a FIFO snapshot with each body bound to its id and sender."""
 
-    return [_decode(path)["body"] for path in _published_paths(recipient)]
+    return [
+        InboxMessage(id=value["id"], sender=value["sender"], body=value["body"])
+        for value in (_decode(path) for path in _published_paths(recipient))
+    ]
 
 
 def ack(recipient: str, msg_id: str) -> None:
     """Remove one pending message; unknown ids fail loudly."""
 
-    path = _message_path(recipient, msg_id)
-    _require_readable_dir(path.parent)
+    _safe_segment(msg_id, "message id")
+    recipient_dir = _recipient_dir(recipient)
+    paths = _published_paths(recipient)
+    matches = [
+        path
+        for path in paths
+        if _MESSAGE_FILE.fullmatch(path.name).group("id") == msg_id
+    ]
+    if not matches:
+        raise UnknownMessageError(f"message {msg_id} is not pending for {recipient}")
+    if len(matches) != 1:
+        raise InboxCorruptError(f"duplicate message id {msg_id} for {recipient}")
     try:
-        path.unlink()
+        matches[0].unlink()
     except FileNotFoundError as exc:
         raise UnknownMessageError(
             f"message {msg_id} is not pending for {recipient}"

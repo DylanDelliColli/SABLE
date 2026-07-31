@@ -33,7 +33,49 @@ def test_body_round_trips_byte_exact_for_tmux_corruption_shapes(store):
     inbox.enqueue("tarzan", "chuck", body)
 
     [actual] = inbox.read("tarzan")
-    assert actual.encode("utf-8") == expected
+    assert actual.body.encode("utf-8") == expected
+
+
+def test_read_keeps_identity_attached_when_lower_id_arrives_after_pending(
+    store, monkeypatch
+):
+    ids = iter(["f" * 32, "temp-one", "0" * 32, "temp-two"])
+    monkeypatch.setattr(
+        inbox.uuid, "uuid4", lambda: type("UUID", (), {"hex": next(ids)})()
+    )
+
+    first_id = inbox.enqueue("optimus", "lincoln", "hold")
+    survey = inbox.pending("optimus")
+    second_id = inbox.enqueue("optimus", "chuck", "release")
+
+    messages = inbox.read("optimus")
+    assert survey == [inbox.PendingMessage(first_id, "lincoln")]
+    assert messages == [
+        inbox.InboxMessage(first_id, "lincoln", "hold"),
+        inbox.InboxMessage(second_id, "chuck", "release"),
+    ]
+
+    inbox.ack("optimus", messages[0].id)
+    assert inbox.read("optimus") == [
+        inbox.InboxMessage(second_id, "chuck", "release")
+    ]
+
+
+def test_sequential_enqueues_are_read_in_fifo_order_even_when_ids_sort_oppositely(
+    store, monkeypatch
+):
+    ids = iter(["f" * 32, "temp-one", "0" * 32, "temp-two"])
+    monkeypatch.setattr(
+        inbox.uuid, "uuid4", lambda: type("UUID", (), {"hex": next(ids)})()
+    )
+
+    first_id = inbox.enqueue("victor", "lincoln", "first")
+    second_id = inbox.enqueue("victor", "lincoln", "second")
+
+    assert inbox.read("victor") == [
+        inbox.InboxMessage(first_id, "lincoln", "first"),
+        inbox.InboxMessage(second_id, "lincoln", "second"),
+    ]
 
 
 def test_pending_has_three_distinct_observable_states(store):
@@ -45,4 +87,3 @@ def test_pending_has_three_distinct_observable_states(store):
 
     inbox.ack("victor", msg_id)
     assert inbox.pending("victor") == []
-
