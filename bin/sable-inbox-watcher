@@ -27,7 +27,7 @@ from typing import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_inbox_lib import InboxError, pending  # noqa: E402
-from sable_pane_lib import pane_idle  # noqa: E402
+from sable_pane_lib import deliver_text, pane_idle  # noqa: E402
 
 
 PROCESS_LIVE = "LIVE"
@@ -205,6 +205,7 @@ def wake_once(
     *,
     run: Callable[[list[str]], subprocess.CompletedProcess[str]] = _run,
     pending_fn=pending,
+    delivery_fn=deliver_text,
     status_command: str | None = None,
     socket: str | None = None,
     session: str,
@@ -231,26 +232,49 @@ def wake_once(
             f"refusing wake for pane {pane}: target process state is {state}, not LIVE"
         )
 
+    text = poke_text(count)
     base = _tmux_base(socket)
     capture_command = base + ["capture-pane", "-p", "-J", "-e", "-t", pane]
-    capture = run(capture_command)
-    if capture.returncode != 0:
-        detail = capture.stderr.strip() or f"exit {capture.returncode}"
+    fresh_capture = run(capture_command)
+    if fresh_capture.returncode != 0:
+        detail = fresh_capture.stderr.strip() or f"exit {fresh_capture.returncode}"
         raise WakeCannotAssess(f"could not capture pane {pane}: {detail}")
-    if not pane_idle(capture.stdout, provider):
+    if not pane_idle(fresh_capture.stdout, provider):
         raise WakeRefused(
             f"refusing wake for pane {pane}: fresh capture is not idle"
         )
 
-    text = poke_text(count)
-    literal = run(base + ["send-keys", "-t", pane, "-l", text])
-    if literal.returncode != 0:
-        detail = literal.stderr.strip() or f"exit {literal.returncode}"
-        raise WakeCannotAssess(f"could not inject wake text into pane {pane}: {detail}")
-    submit = run(base + ["send-keys", "-t", pane, "Enter"])
-    if submit.returncode != 0:
-        detail = submit.stderr.strip() or f"exit {submit.returncode}"
-        raise WakeCannotAssess(f"could not submit wake in pane {pane}: {detail}")
+    # The shared delivery path owns all transport details, including the
+    # paste-burst submit gap.  Seed its t0 check with the exact capture that
+    # authorized this wake; subsequent captures verify that the turn landed.
+    first_capture = True
+
+    def capture_for_delivery() -> str:
+        nonlocal first_capture
+        if first_capture:
+            first_capture = False
+            return fresh_capture.stdout
+        observed = run(capture_command)
+        if observed.returncode != 0:
+            detail = observed.stderr.strip() or f"exit {observed.returncode}"
+            raise WakeCannotAssess(f"could not capture pane {pane}: {detail}")
+        return observed.stdout
+
+    def send_for_delivery(command: list[str]) -> bool:
+        return run(command).returncode == 0
+
+    if not delivery_fn(
+        base,
+        pane,
+        text,
+        text,
+        run=send_for_delivery,
+        capture=capture_for_delivery,
+        provider=provider,
+    ):
+        raise WakeCannotAssess(
+            f"shared delivery path could not submit wake in pane {pane}"
+        )
     return WakeResult(count=count, text=text)
 
 

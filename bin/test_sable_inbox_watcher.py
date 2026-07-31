@@ -170,8 +170,9 @@ def test_busy_fresh_capture_refuses_loudly_and_never_injects():
     ]
 
 
-def test_live_then_fresh_idle_capture_immediately_precedes_one_submitted_poke():
+def test_live_then_fresh_idle_capture_routes_poke_through_shared_delivery():
     calls = []
+    deliveries = []
 
     def run(command):
         calls.append(command)
@@ -185,7 +186,20 @@ def test_live_then_fresh_idle_capture_immediately_precedes_one_submitted_poke():
             )
         if "capture-pane" in command:
             return completed(command, stdout="completed turn\n❯\n")
-        return completed(command)
+        raise AssertionError(f"watcher must not send directly: {command}")
+
+    def deliver(base, pane, text, snippet, **kwargs):
+        deliveries.append(
+            {
+                "base": base,
+                "pane": pane,
+                "text": text,
+                "snippet": snippet,
+                "provider": kwargs["provider"],
+                "capture": kwargs["capture"](),
+            }
+        )
+        return True
 
     result = watcher.wake_once(
         "optimus",
@@ -193,6 +207,7 @@ def test_live_then_fresh_idle_capture_immediately_precedes_one_submitted_poke():
         "claude",
         run=run,
         pending_fn=lambda _recipient: [object()] * 7,
+        delivery_fn=deliver,
         status_command="status-probe",
         socket="scratch",
         session="scratch",
@@ -203,9 +218,44 @@ def test_live_then_fresh_idle_capture_immediately_precedes_one_submitted_poke():
         registry_command(socket="scratch"),
         ["status-probe", "--quiescence-pane", "%8", "--json"],
         ["tmux", "-L", "scratch", "capture-pane", "-p", "-J", "-e", "-t", "%8"],
-        ["tmux", "-L", "scratch", "send-keys", "-t", "%8", "-l", watcher.poke_text(7)],
-        ["tmux", "-L", "scratch", "send-keys", "-t", "%8", "Enter"],
     ]
+    assert deliveries == [
+        {
+            "base": ["tmux", "-L", "scratch"],
+            "pane": "%8",
+            "text": watcher.poke_text(7),
+            "snippet": watcher.poke_text(7),
+            "provider": "claude",
+            "capture": "completed turn\n❯\n",
+        }
+    ]
+
+
+def test_shared_delivery_failure_is_loud():
+    def run(command):
+        if "list-panes" in command:
+            return completed(command, stdout=registry(("%8", "optimus", "")))
+        if command[0] == "status-probe":
+            return completed(
+                command,
+                stdout=process_report("%8", watcher.PROCESS_LIVE),
+                returncode=0,
+            )
+        if "capture-pane" in command:
+            return completed(command, stdout="completed turn\n❯\n")
+        raise AssertionError(f"watcher must not send directly: {command}")
+
+    with pytest.raises(watcher.WakeCannotAssess, match="shared delivery path"):
+        watcher.wake_once(
+            "optimus",
+            "%8",
+            "claude",
+            run=run,
+            pending_fn=lambda _recipient: [object()],
+            delivery_fn=lambda *_args, **_kwargs: False,
+            status_command="status-probe",
+            session="scratch",
+        )
 
 
 def test_empty_queue_never_assesses_or_pokes():
