@@ -17,10 +17,11 @@ integration.py for the complementary proof driven through the actual tier
 object, promote_lib.run_impact_tier, for one representative pattern —
 guarded GREEN twice in a row, unguarded reproducing the reported collision).
 
-Each row EXTRACTS the real, currently-shipped `bd init` invocation straight
-out of the named file at the named line range — never a hand-retyped copy —
-so a future edit that silently drops the `-u BEADS_DB` guard is caught by
-re-extracting the CURRENT text, not a frozen fixture. For each site this
+Each row LOCATES the real, currently-shipped `bd init` invocation by a unique
+piece of the command itself — never by a hardcoded line number and never by a
+hand-retyped copy — so edits above a site cannot break the harness. A future
+edit that silently drops the `-u BEADS_DB` guard is caught by failing loudly
+to resolve the site, not by yielding an empty span. For each site this
 proves BOTH directions against a real `bd`, under a real exported BEADS_DB
 pointing at an already-initialized decoy workspace:
 
@@ -33,6 +34,7 @@ pointing at an already-initialized decoy workspace:
     is wrong, and the assertion says so rather than banking a vacuous green
     (the negative-control discipline the bead's own test spec requires).
 """
+# sable-test-load: measured-slow -- per-site controls intentionally exercise real bd init and collision paths
 from __future__ import annotations
 
 import os
@@ -46,12 +48,42 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 HAVE_BD = shutil.which("bd") is not None
 
 
-def _extract(path: str, start: int, end: int) -> str:
-    """1-indexed, inclusive — the exact shipped text, re-read every run."""
-    lines = (REPO_ROOT / path).read_text().splitlines()
-    span = lines[start - 1:end]
-    assert span, f"{path}:{start}-{end} extracted nothing — line numbers drifted"
-    return "\n".join(span)
+def _resolve_site(path: str | Path, selector: str, *, wrapper: bool = False) -> str:
+    """Find one guarded command and return its shell command or wrapper body.
+
+    The selector is a stable, site-specific fragment of the command (normally
+    its bd prefix or target directory). Resolution is deliberately strict:
+    zero or multiple guarded matches mean this harness no longer identifies a
+    real site unambiguously and must fail before either test arm can run.
+    """
+    source = Path(path)
+    if not source.is_absolute():
+        source = REPO_ROOT / source
+    lines = source.read_text().splitlines()
+    matches = [index for index, line in enumerate(lines)
+               if "env -u BEADS_DB " in line and selector in line]
+    assert len(matches) == 1, (
+        f"{path}: expected exactly one guarded invocation matching "
+        f"{selector!r}, found {len(matches)}")
+    match = matches[0]
+
+    if wrapper:
+        starts = [index for index in range(match, -1, -1)
+                  if lines[index].strip().endswith("() {")]
+        assert starts, f"{path}: guarded match {selector!r} has no enclosing wrapper"
+        start = starts[0]
+        ends = [index for index in range(match + 1, len(lines))
+                if lines[index].strip() == "}"]
+        assert ends, f"{path}: guarded wrapper {selector!r} has no closing brace"
+        end = ends[0]
+    else:
+        start = match
+        end = match
+        while lines[end].rstrip().endswith("\\"):
+            end += 1
+            assert end < len(lines), (
+                f"{path}: guarded invocation {selector!r} ends in a dangling continuation")
+    return "\n".join(lines[start:end + 1])
 
 
 def _strip_comment_lines(text: str) -> str:
@@ -145,7 +177,7 @@ def _diagnostic_variant(text: str, capture_var: str | None) -> str:
     return diag
 
 
-# Each row: (id, file, start, end, setup — shell that binds the site's own
+# Each row: (id, file, selector, setup — shell that binds the site's own
 # scratch-dir var(s) fresh, check — the file this site's OWN init must
 # produce, capture_var — the shell var this site's own line captures bd's
 # combined output into via `$(... 2>&1)`, or None when the site instead
@@ -155,30 +187,30 @@ def _diagnostic_variant(text: str, capture_var: str | None) -> str:
 # directory variable(s)) — the extracted line is the thing under test, not
 # the rest of the suite.
 _DIRECT_SITES = [
-    ("overlap-dispatch-e2e:110", "hooks/test/test-overlap-dispatch-e2e.sh", 110, 110,
+    ("overlap-dispatch-e2e", "hooks/test/test-overlap-dispatch-e2e.sh", "--prefix=sable",
      'BEADS_ROOT="$(mktemp -d)/beads"; mkdir -p "$BEADS_ROOT"', "$BEADS_ROOT/.beads",
      "BD_INIT_OUT"),
-    ("landing-pair-gate:119", "hooks/test/test-landing-pair-gate.sh", 119, 119,
+    ("landing-pair-gate", "hooks/test/test-landing-pair-gate.sh", "--prefix=lpg",
      'BEADS_ROOT="$(mktemp -d)/beads"; mkdir -p "$BEADS_ROOT"', "$BEADS_ROOT/.beads",
      "INIT_OUT"),
-    ("seat-sighting:56", "hooks/test/test-seat-sighting.sh", 56, 56,
+    ("seat-sighting", "hooks/test/test-seat-sighting.sh", "--prefix=seat",
      'BEADS_ROOT="$(mktemp -d)/beads"; mkdir -p "$BEADS_ROOT"', "$BEADS_ROOT/.beads",
      "INIT_OUT"),
-    ("bd-inline-body-guard:134-135", "hooks/test/test-bd-inline-body-guard.sh", 134, 135,
+    ("bd-inline-body-guard", "hooks/test/test-bd-inline-body-guard.sh", "--prefix=ibg",
      'SCRATCH_BEADS_DIR="$(mktemp -d)"', "$SCRATCH_BEADS_DIR/.beads", None),
-    ("worktree-placement-guard:195-196", "hooks/test/test-worktree-placement-guard.sh", 195, 196,
+    ("worktree-placement-guard", "hooks/test/test-worktree-placement-guard.sh", "--prefix=wpg",
      'MAIN="$(mktemp -d)/main"; mkdir -p "$MAIN"', "$MAIN/.beads", None),
-    ("tmux-e2e:49-50", "hooks/test/test-tmux-e2e.sh", 49, 50,
+    ("tmux-e2e", "hooks/test/test-tmux-e2e.sh", "--prefix=e2e",
      'SCRATCH_BEADS_DIR="$(mktemp -d)"', "$SCRATCH_BEADS_DIR/.beads", None),
-    ("sable-msg:262-263", "hooks/test/test-sable-msg.sh", 262, 263,
+    ("sable-msg-sandbox", "hooks/test/test-sable-msg.sh", "--prefix=sbx",
      'SCRATCH_BEADS_DIR="$(mktemp -d)"', "$SCRATCH_BEADS_DIR/.beads", None),
-    ("sable-msg:378-379", "hooks/test/test-sable-msg.sh", 378, 379,
+    ("sable-msg-pretend-live", "hooks/test/test-sable-msg.sh", "--prefix=plv",
      'PRETEND_LIVE_DIR="$(mktemp -d)"', "$PRETEND_LIVE_DIR/.beads", None),
-    ("worker-flag-done:119-120", "hooks/test/test-worker-flag-done.sh", 119, 120,
+    ("worker-flag-done", "hooks/test/test-worker-flag-done.sh", "--prefix=wfd",
      'SCRATCH_BEADS_DIR="$(mktemp -d)"', "$SCRATCH_BEADS_DIR/.beads", None),
-    ("tier-budget-bead:89", "hooks/test/test-tier-budget-bead.sh", 89, 89,
+    ("tier-budget-bead", "hooks/test/test-tier-budget-bead.sh", "bd init --non-interactive",
      'REPO_DIR="$(mktemp -d)"; BD_HOME="$(mktemp -d)"', "$REPO_DIR/.beads/config.yaml", None),
-    ("bead-description-gate:538", "hooks/test/test-bead-description-gate.sh", 538, 538,
+    ("bead-description-gate", "hooks/test/test-bead-description-gate.sh", "ORIGIN_REPO_DIR",
      'ORIGIN_REPO_DIR="$(mktemp -d)"; ORIGIN_BD_HOME="$(mktemp -d)"',
      "$ORIGIN_REPO_DIR/.beads/config.yaml", None),
 ]
@@ -187,23 +219,39 @@ _DIRECT_SITES = [
 # function DEFINITION (every call through it must be isolated, not just
 # `init`), so these extract the whole function body and call it.
 _WRAPPER_SITES = [
-    ("tier-budget-bead:wrapper:100-104", "hooks/test/test-tier-budget-bead.sh", 100, 104,
+    ("tier-budget-bead-wrapper", "hooks/test/test-tier-budget-bead.sh", 'bd "$@"',
      'REPO_DIR="$(mktemp -d)"; BD_HOME="$(mktemp -d)"',
      "bd_in_sandbox init --non-interactive", "$REPO_DIR/.beads/config.yaml"),
-    ("snapshot-freeze:wrapper:444-449", "hooks/test/test-snapshot-freeze.sh", 444, 449,
+    ("snapshot-freeze-wrapper", "hooks/test/test-snapshot-freeze.sh", 'bd "$@"',
      'W5="$(mktemp -d)"; BD_HOME="$(mktemp -d)"',
      "bd_in_sandbox init --non-interactive", "$W5/.beads/config.yaml"),
 ]
 
 
+def test_site_resolver_finds_every_declared_site_without_line_coordinates():
+    for _site_id, path, selector, *_rest in _DIRECT_SITES:
+        resolved = _resolve_site(path, selector)
+        assert "env -u BEADS_DB " in resolved
+    for _site_id, path, selector, *_rest in _WRAPPER_SITES:
+        resolved = _resolve_site(path, selector, wrapper=True)
+        assert "env -u BEADS_DB " in resolved
+
+
+def test_site_resolver_fails_loudly_when_guarded_invocation_is_absent(tmp_path):
+    no_guard = tmp_path / "no-guard.sh"
+    no_guard.write_text("bd init --prefix=missing\n")
+    with pytest.raises(AssertionError, match="found 0"):
+        _resolve_site(no_guard, "--prefix=missing")
+
+
 @pytest.mark.skipif(not HAVE_BD, reason="requires a real bd on PATH")
-@pytest.mark.parametrize("site_id,path,start,end,setup,check_path,capture_var", _DIRECT_SITES,
+@pytest.mark.parametrize("site_id,path,selector,setup,check_path,capture_var", _DIRECT_SITES,
                          ids=[s[0] for s in _DIRECT_SITES])
 def test_shipped_init_builds_its_own_db_despite_ambient_beads_db(
-        tmp_path, site_id, path, start, end, setup, check_path, capture_var):
+        tmp_path, site_id, path, selector, setup, check_path, capture_var):
     """GREEN arm: the line as shipped isolates correctly."""
     ambient = _decoy_ambient_beads_db(tmp_path)
-    extracted = _extract(path, start, end)
+    extracted = _resolve_site(path, selector)
     script = f'{setup}\n{extracted}\necho "OWN_DB_EXISTS=$([ -e "{check_path}" ] && echo yes || echo no)"'
     cp = _run_under_ambient_beads_db(script, ambient)
     assert "OWN_DB_EXISTS=yes" in cp.stdout, (
@@ -212,10 +260,10 @@ def test_shipped_init_builds_its_own_db_despite_ambient_beads_db(
 
 
 @pytest.mark.skipif(not HAVE_BD, reason="requires a real bd on PATH")
-@pytest.mark.parametrize("site_id,path,start,end,setup,check_path,capture_var", _DIRECT_SITES,
+@pytest.mark.parametrize("site_id,path,selector,setup,check_path,capture_var", _DIRECT_SITES,
                          ids=[s[0] for s in _DIRECT_SITES])
 def test_stripping_the_guard_reproduces_the_reported_collision(
-        tmp_path, site_id, path, start, end, setup, check_path, capture_var):
+        tmp_path, site_id, path, selector, setup, check_path, capture_var):
     """RED arm, the negative control: proves the GREEN arm above is not
     vacuous. The SAME extracted text with `-u BEADS_DB ` mechanically
     removed must fail to build its own DB — it inherits the ambient one
@@ -231,7 +279,7 @@ def test_stripping_the_guard_reproduces_the_reported_collision(
     site's own output-hiding is not license to skip verifying WHY it
     failed."""
     ambient = _decoy_ambient_beads_db(tmp_path)
-    unguarded = _strip_guard(_extract(path, start, end))
+    unguarded = _strip_guard(_resolve_site(path, selector))
 
     script = f'{setup}\n{unguarded}\necho "OWN_DB_EXISTS=$([ -e "{check_path}" ] && echo yes || echo no)"'
     cp = _run_under_ambient_beads_db(script, ambient)
@@ -256,12 +304,12 @@ def test_stripping_the_guard_reproduces_the_reported_collision(
 
 
 @pytest.mark.skipif(not HAVE_BD, reason="requires a real bd on PATH")
-@pytest.mark.parametrize("site_id,path,start,end,setup,call,check_path", _WRAPPER_SITES,
+@pytest.mark.parametrize("site_id,path,selector,setup,call,check_path", _WRAPPER_SITES,
                          ids=[s[0] for s in _WRAPPER_SITES])
 def test_wrapper_shipped_definition_builds_its_own_db_despite_ambient_beads_db(
-        tmp_path, site_id, path, start, end, setup, call, check_path):
+        tmp_path, site_id, path, selector, setup, call, check_path):
     ambient = _decoy_ambient_beads_db(tmp_path)
-    extracted = _extract(path, start, end)
+    extracted = _resolve_site(path, selector, wrapper=True)
     script = f'{setup}\n{extracted}\n{call}\necho "OWN_DB_EXISTS=$([ -e "{check_path}" ] && echo yes || echo no)"'
     cp = _run_under_ambient_beads_db(script, ambient)
     assert "OWN_DB_EXISTS=yes" in cp.stdout, (
@@ -270,12 +318,12 @@ def test_wrapper_shipped_definition_builds_its_own_db_despite_ambient_beads_db(
 
 
 @pytest.mark.skipif(not HAVE_BD, reason="requires a real bd on PATH")
-@pytest.mark.parametrize("site_id,path,start,end,setup,call,check_path", _WRAPPER_SITES,
+@pytest.mark.parametrize("site_id,path,selector,setup,call,check_path", _WRAPPER_SITES,
                          ids=[s[0] for s in _WRAPPER_SITES])
 def test_wrapper_stripping_the_guard_reproduces_the_reported_collision(
-        tmp_path, site_id, path, start, end, setup, call, check_path):
+        tmp_path, site_id, path, selector, setup, call, check_path):
     ambient = _decoy_ambient_beads_db(tmp_path)
-    unguarded = _strip_guard(_extract(path, start, end))
+    unguarded = _strip_guard(_resolve_site(path, selector, wrapper=True))
     script = f'{setup}\n{unguarded}\n{call}\necho "OWN_DB_EXISTS=$([ -e "{check_path}" ] && echo yes || echo no)"'
     cp = _run_under_ambient_beads_db(script, ambient)
     assert "OWN_DB_EXISTS=no" in cp.stdout, (
