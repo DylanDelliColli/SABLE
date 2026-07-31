@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Wake a SABLE recipient without carrying any inbox payload (SABLE-m4kyf.4).
+
+One invocation is one watcher tick.  The payload stays in ``sable_inbox_lib``;
+the only text this process can inject is the fixed count-only string returned by
+``poke_text(count)``.  A wake is permitted only after both independent facts are
+observed immediately before the send: the target pane has a resident agent
+process (the per-pane LIVE state from an explicit ``sable-worker-status
+--quiescence-pane`` probe) and a fresh capture satisfies the shared
+provider-aware ``pane_idle`` predicate.
+
+EXITED, CANNOT-ASSESS, a missing target, an unreadable inbox, and a non-idle
+capture all refuse loudly.  There is no retry or fallback here: a later external
+tick repeats the same bounded observation, and duplicate count-only pokes cannot
+duplicate or corrupt the queued payload.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_inbox_lib import InboxError, pending  # noqa: E402
+from sable_pane_lib import deliver_text, pane_idle  # noqa: E402
+
+
+PROCESS_LIVE = "LIVE"
+PROCESS_EXITED = "EXITED"
+PROCESS_CANNOT_ASSESS = "CANNOT-ASSESS"
+_PROCESS_STATES = {PROCESS_LIVE, PROCESS_EXITED, PROCESS_CANNOT_ASSESS}
+
+
+class WakeError(RuntimeError):
+    """Base class for watcher outcomes that must be operator-visible."""
+
+
+class WakeRefused(WakeError):
+    """Current evidence proves that injection is unsafe."""
+
+
+class WakeCannotAssess(WakeError):
+    """Required evidence could not be obtained or decoded."""
+
+
+@dataclass(frozen=True)
+class WakeResult:
+    count: int
+    text: str | None
+
+    @property
+    def injected(self) -> bool:
+        return self.text is not None
+
+
+def poke_text(count: int) -> str:
+    """Return the fixed, single-line wake whose only variable is ``count``."""
+
+    if type(count) is not int or count < 0:
+        raise ValueError("count must be a non-negative integer")
+    return f"Check SABLE inbox: {count} pending."
+
+
+def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, capture_output=True, text=True, check=False)
+
+
+def _tmux_base(socket: str | None) -> list[str]:
+    return ["tmux", "-L", socket] if socket else ["tmux"]
+
+
+def bound_recipient_pane(
+    recipient: str,
+    pane: str,
+    session: str,
+    *,
+    run: Callable[[list[str]], subprocess.CompletedProcess[str]] = _run,
+    socket: str | None = None,
+) -> None:
+    """Require one registered identity for ``recipient``, bound to ``pane``.
+
+    Manager/cockpit identities are their ``@sable_role`` values.  Worker panes
+    share that role, so their inbox identity is instead ``@sable_bead``.  The
+    full explicitly configured session is enumerated so duplicate registrations
+    are an observable ambiguity, never silently resolved by caller pairing.
+    """
+
+    command = _tmux_base(socket) + [
+        "list-panes",
+        "-s",
+        "-t",
+        f"={session}:",
+        "-F",
+        "#{pane_id}\t#{@sable_role}\t#{@sable_bead}",
+    ]
+    listing = run(command)
+    if listing.returncode != 0:
+        detail = listing.stderr.strip() or f"exit {listing.returncode}"
+        raise WakeCannotAssess(
+            f"could not read pane registry for session {session}: {detail}"
+        )
+
+    matches: list[str] = []
+    target_seen = False
+    for line in listing.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 3:
+            raise WakeCannotAssess(
+                f"invalid pane registry row in session {session}: {line!r}"
+            )
+        pane_id, role, bead = fields
+        if pane_id == pane:
+            target_seen = True
+        identity = bead if role == "worker" else role
+        if identity == recipient:
+            matches.append(pane_id)
+
+    if not target_seen:
+        raise WakeRefused(
+            f"refusing wake for pane {pane}: pane is not registered in session {session}"
+        )
+    if not matches:
+        raise WakeRefused(
+            f"refusing wake for pane {pane}: no registered pane is bound to inbox "
+            f"recipient {recipient}"
+        )
+    if len(matches) != 1:
+        raise WakeRefused(
+            f"refusing wake for pane {pane}: inbox recipient {recipient} has "
+            f"ambiguous pane registrations {matches}"
+        )
+    if matches[0] != pane:
+        raise WakeRefused(
+            f"refusing wake for pane {pane}: inbox recipient {recipient} is bound "
+            f"to {matches[0]}"
+        )
+
+
+def target_process_state(
+    pane: str,
+    *,
+    run: Callable[[list[str]], subprocess.CompletedProcess[str]] = _run,
+    status_command: str | None = None,
+) -> str:
+    """Read only ``pane``'s process-tree state from the quiescence report.
+
+    The report has no aggregate policy boolean.  A target must occur exactly
+    once and carry one member of the frozen per-pane trichotomy.
+    """
+
+    command = status_command or str(
+        Path(os.path.realpath(__file__)).with_name("sable-worker-status")
+    )
+    try:
+        result = run([command, "--quiescence-pane", pane, "--json"])
+    except OSError as exc:
+        raise WakeCannotAssess(
+            f"could not run process-tree probe for pane {pane}: {exc}"
+        ) from exc
+    if result.returncode not in {0, 2}:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        raise WakeCannotAssess(
+            f"process-tree probe failed for pane {pane}: {detail}"
+        )
+    try:
+        report = json.loads(result.stdout)
+        panes = report["panes"]
+        if not isinstance(panes, list):
+            raise TypeError("panes is not a list")
+        if not all(isinstance(record, dict) for record in panes):
+            raise TypeError("panes contains a non-object record")
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise WakeCannotAssess(
+            f"invalid process-tree report for pane {pane}: {exc}"
+        ) from exc
+
+    matches = [record for record in panes if record.get("pane") == pane]
+    if len(matches) != 1:
+        raise WakeCannotAssess(
+            f"process-tree report contained {len(matches)} records for pane {pane}"
+        )
+    state = matches[0].get("state")
+    if state not in _PROCESS_STATES:
+        raise WakeCannotAssess(
+            f"process-tree report has invalid state {state!r} for pane {pane}"
+        )
+    expected_rc = 2 if state == PROCESS_CANNOT_ASSESS else 0
+    if result.returncode != expected_rc:
+        raise WakeCannotAssess(
+            f"process-tree report state {state} for pane {pane} conflicts with "
+            f"exit {result.returncode}"
+        )
+    return state
+
+
+def wake_once(
+    recipient: str,
+    pane: str,
+    provider: str,
+    *,
+    run: Callable[[list[str]], subprocess.CompletedProcess[str]] = _run,
+    pending_fn=pending,
+    delivery_fn=deliver_text,
+    status_command: str | None = None,
+    socket: str | None = None,
+    session: str,
+) -> WakeResult:
+    """Perform one fail-closed watcher tick for ``recipient`` and ``pane``."""
+
+    waiting = pending_fn(recipient)
+    count = len(waiting)
+    if count == 0:
+        return WakeResult(count=0, text=None)
+
+    bound_recipient_pane(
+        recipient, pane, session, run=run, socket=socket
+    )
+    state = target_process_state(
+        pane, run=run, status_command=status_command
+    )
+    if state == PROCESS_CANNOT_ASSESS:
+        raise WakeCannotAssess(
+            f"refusing wake for pane {pane}: target process state is {state}"
+        )
+    if state != PROCESS_LIVE:
+        raise WakeRefused(
+            f"refusing wake for pane {pane}: target process state is {state}, not LIVE"
+        )
+
+    text = poke_text(count)
+    base = _tmux_base(socket)
+    capture_command = base + ["capture-pane", "-p", "-J", "-e", "-t", pane]
+    fresh_capture = run(capture_command)
+    if fresh_capture.returncode != 0:
+        detail = fresh_capture.stderr.strip() or f"exit {fresh_capture.returncode}"
+        raise WakeCannotAssess(f"could not capture pane {pane}: {detail}")
+    if not pane_idle(fresh_capture.stdout, provider):
+        raise WakeRefused(
+            f"refusing wake for pane {pane}: fresh capture is not idle"
+        )
+
+    # The shared delivery path owns all transport details, including the
+    # paste-burst submit gap.  Seed its t0 check with the exact capture that
+    # authorized this wake; subsequent captures verify that the turn landed.
+    first_capture = True
+
+    def capture_for_delivery() -> str:
+        nonlocal first_capture
+        if first_capture:
+            first_capture = False
+            return fresh_capture.stdout
+        observed = run(capture_command)
+        if observed.returncode != 0:
+            detail = observed.stderr.strip() or f"exit {observed.returncode}"
+            raise WakeCannotAssess(f"could not capture pane {pane}: {detail}")
+        return observed.stdout
+
+    def send_for_delivery(command: list[str]) -> bool:
+        return run(command).returncode == 0
+
+    if not delivery_fn(
+        base,
+        pane,
+        text,
+        text,
+        run=send_for_delivery,
+        capture=capture_for_delivery,
+        provider=provider,
+    ):
+        raise WakeCannotAssess(
+            f"shared delivery path could not submit wake in pane {pane}"
+        )
+    return WakeResult(count=count, text=text)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="sable-inbox-watcher")
+    parser.add_argument("recipient", help="inbox recipient name")
+    parser.add_argument("pane", help="exact tmux pane id")
+    parser.add_argument("provider", choices=("claude", "codex"))
+    parser.add_argument(
+        "--session",
+        help="explicit tmux session (or set SABLE_TMUX_SESSION; no pane/PWD fallback)",
+    )
+    parser.add_argument(
+        "--status-command",
+        help="sable-worker-status path (test/install seam; defaults to sibling bin)",
+    )
+    ns = parser.parse_args(sys.argv[1:] if argv is None else argv)
+
+    socket = os.environ.get("SABLE_TMUX_SOCKET") or None
+    session = ns.session or os.environ.get("SABLE_TMUX_SESSION")
+    if not session:
+        sys.stderr.write(
+            "sable-inbox-watcher: CANNOT-ASSESS: no explicit tmux session; "
+            "pass --session or set SABLE_TMUX_SESSION (no TMUX_PANE/PWD fallback)\n"
+        )
+        return 2
+    try:
+        result = wake_once(
+            ns.recipient,
+            ns.pane,
+            ns.provider,
+            status_command=ns.status_command,
+            socket=socket,
+            session=session,
+        )
+    except WakeRefused as exc:
+        sys.stderr.write(f"sable-inbox-watcher: REFUSED: {exc}\n")
+        return 1
+    except (WakeCannotAssess, InboxError) as exc:
+        sys.stderr.write(f"sable-inbox-watcher: CANNOT-ASSESS: {exc}\n")
+        return 2
+
+    if result.injected:
+        print(f"sable-inbox-watcher: poked {ns.pane}: {result.text}")
+    else:
+        print(f"sable-inbox-watcher: no pending messages for {ns.recipient}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

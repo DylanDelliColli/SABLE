@@ -66,6 +66,7 @@ ALLOW=(
   test-impact-manifest.sh
   test-impact-selection.sh
   test-impact-tier-serialization.sh
+  test-inbox-wake.sh
   test-install-preserves-pins.sh
   test-lib-git-sandbox.sh
   test-lib-hook-trace.sh
