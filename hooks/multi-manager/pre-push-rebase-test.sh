@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # pre-push-rebase-test.sh — Four-phase pre-push gate
-# Trigger: PreToolUse:Bash matching `git push`
+# Producer: PreToolUse:Bash matching `git push`. A successful verdict writes a
+# short-lived, exact-HEAD proof consumed by .beads/hooks/pre-push, the
+# git-owned boundary reached by foreground and background execution alike.
 #
 # Phases (in order):
 #   1. REBASE   — always runs, never skippable. Fetch + rebase on $SABLE_BASE_BRANCH.
@@ -20,8 +22,8 @@
 # build phase still run. This is a deliberate weakening of the bypass to
 # prevent typecheck/build regressions from sneaking through to CI. If you
 # genuinely need to bypass everything (true emergency, e.g. CI infra outage),
-# disable the hook entry in settings.json explicitly, or use `git push --force`
-# which short-circuits this hook entirely.
+# `git push --force` skips the phases but records a loud degraded proof for the
+# git hook. SABLE_ALLOW_UNVERIFIED_PUSH=1 is the git-bound emergency override.
 #
 # Configuration:
 #   $SABLE_BASE_BRANCH                  — branch to rebase against (default: origin/main)
@@ -64,6 +66,8 @@ set -euo pipefail
 
 # shellcheck source=lib-identity.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib-identity.sh"
+# shellcheck source=lib-push-attestation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib-push-attestation.sh"
 
 emit_deny() {
   # $1 = reason text
@@ -323,6 +327,18 @@ print(f'{cwd}\n{cmd}')
 CWD=$(echo "$PARSED" | sed -n '1p')
 COMMAND=$(echo "$PARSED" | sed -n '2,$p')
 
+PUSH_REPO_DIR=""
+if sable_is_git_push "$COMMAND"; then
+  PUSH_REPO_DIR=$(sable_resolve_push_repo_dir "$CWD" "$COMMAND")
+fi
+
+attest_push_or_deny() {
+  if ! sable_write_push_attestation "$PUSH_REPO_DIR" "$1"; then
+    emit_deny "Pre-push denied: the configured gate reached an allow verdict but could not write the HEAD-bound proof required by git's pre-push hook. Verification cannot be bound to the remote update, so the push is refused."
+    return 1
+  fi
+}
+
 # --- v3 worker-push deny leg (SABLE-404, locked Gaudi decision; consolidates
 # SABLE-myg). A subagent that is NOT a manager (a worker type, or an unnamed
 # agent_id) must not push: workers return their stopped-before-push results to
@@ -337,6 +353,9 @@ COMMAND=$(echo "$PARSED" | sed -n '2,$p')
 if [ "$SABLE_ID_IS_SUBAGENT" -eq 1 ] && [ "$SABLE_ID_IS_MANAGER" -eq 0 ]; then
   if sable_is_git_push "$COMMAND"; then
     if [ "${SABLE_WORKER_PUSH_OVERRIDE:-}" = "1" ]; then
+      if git -C "$PUSH_REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        attest_push_or_deny "explicit worker-push override; configured verification did not run" || exit 0
+      fi
       emit_context "Pre-push: worker-identity push (${SABLE_ID_NAME:-unnamed}) ALLOWED via SABLE_WORKER_PUSH_OVERRIDE=1. Workers normally return results to their manager, who reviews and pushes the lane; this explicit override was recorded."
       exit 0
     fi
@@ -362,16 +381,24 @@ fi
 # are matched correctly; also prevents false-positives when "git push" appears
 # only as a quoted argument in another command (SABLE-0u1)
 sable_is_git_push "$COMMAND" || exit 0
-echo "$COMMAND" | grep -qE '(\-\-force|\-f\b)' && exit 0
 
 # Resolve the effective repo dir from the push command's `git -C <path>`
 # target, falling back to the shell cwd. Managers push worktrees via
 # `git -C <worktree> push` from the main checkout, so the dir git operates in
 # is the -C target, not the shell cwd — rebase/static/test must run THERE
 # (SABLE-041).
-CWD=$(sable_resolve_push_repo_dir "$CWD" "$COMMAND")
+CWD="$PUSH_REPO_DIR"
 
 [ -z "$CWD" ] && exit 0
+if echo "$COMMAND" | grep -qE '(\-\-force|\-f\b)'; then
+  # Preserve the old unit-level no-op for a synthetic non-repository CWD, but
+  # bind a real force push to a loud degraded proof that git can consume.
+  git -C "$CWD" rev-parse --git-dir >/dev/null 2>&1 || exit 0
+  attest_push_or_deny "explicit force-push bypass; configured verification did not run" || exit 0
+  emit_context "Pre-push: force-push bypass accepted explicitly. The configured verification phases did not run; git's pre-push hook will report this degraded verdict when it consumes the proof."
+  exit 0
+fi
+
 [ ! -d "$CWD/.git" ] && [ ! -f "$CWD/.git" ] && exit 0
 
 # BASE_BRANCH is resolved below, AFTER the integration branch is known
@@ -670,11 +697,13 @@ fi
 TEST_PHASE="${SABLE_PRE_PUSH_TEST_PHASE:-auto}"
 
 if [ "$TEST_PHASE" = "skip" ]; then
+  attest_push_or_deny "rebase + static + build passed; tests delegated to repository git hooks" || exit 0
   emit_context "Pre-push: rebase + static + build phases passed; test phase skipped (SABLE_PRE_PUSH_TEST_PHASE=skip). Repo git hooks handle test gating on the rebased state."
   exit 0
 fi
 
 if [ "${SABLE_SKIP_PRE_PUSH:-}" = "1" ]; then
+  attest_push_or_deny "rebase + static + build passed; explicit test-phase bypass" || exit 0
   emit_context "Pre-push: rebase + static + build phases passed; test phase bypassed (SABLE_SKIP_PRE_PUSH=1). Note: typecheck/lint/build were still enforced — bypass is now scoped to the test phase only."
   exit 0
 fi
@@ -682,6 +711,7 @@ fi
 TEST_CMD=$(detect_test_cmd "$CWD" "$BASE_BRANCH")
 
 if [ -z "$TEST_CMD" ]; then
+  attest_push_or_deny "rebase + static + build passed; no test command detected" || exit 0
   emit_context "Pre-push: rebase + static + build phases passed; no test command detected (no package.json/pyproject.toml/Cargo.toml/go.mod found upward or in any changed-file subdir). Add a testCommand= line to .sable (checked in), or set sable.testCommand via git config, or set SABLE_TEST_COMMAND, to enforce tests before push."
   exit 0
 fi
@@ -723,6 +753,7 @@ $(sable_tail_chars "$TEST_OUT" 1500)"
   exit 0
 fi
 
+attest_push_or_deny "all configured phases passed; $TEST_CMD_RECORD" || exit 0
 emit_context "Pre-push: all phases passed.
 ${TEST_CMD_RECORD}"
 exit 0
