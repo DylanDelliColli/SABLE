@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sable-msg — inter-agent messaging over tmux send-keys (SABLE-bldh.1).
+"""sable-msg — inter-agent messaging through tmux panes (SABLE-bldh.1).
 
 Scoped to the LEAD<->MANAGER conversation (Lincoln <-> Optimus/Tarzan), plus
 bead-addressed delivery to a specific WORKER pane (SABLE-6izz, via --bead).
@@ -18,9 +18,9 @@ tagged @sable_role=worker — the default role-only lookup used for manager
 names never consults @sable_bead, so a manager send can never accidentally
 land on a worker pane even if some tag is stale.
 
-Delivery is VERIFIED, not assumed (SABLE-bq93): tmux send-keys exiting 0 only
-proves the keystrokes were injected, not that the recipient's TUI actually
-accepted them as a submitted turn — a booting pane or an Escape hitting a
+Delivery is VERIFIED, not assumed (SABLE-bq93): tmux accepting a paste only
+proves the bytes were injected, not that the recipient's TUI actually accepted
+them as a submitted turn — a booting pane or an Escape hitting a
 blocking gate can silently swallow them (the same boot / dropped-Enter race
 documented as SABLE-91m3 and guarded against in sable-spawn-worker). We reuse
 its idle-wait + submit-retry helpers (sable_pane_lib) here: --interrupt sends
@@ -150,9 +150,9 @@ from pathlib import Path
 # sable-spawn-worker uses. Resolve next to THIS script even via a PATH symlink.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    SessionCollision, deliver_text, pane_bead_tag, pane_busy, pane_idle,
-    pane_process_identity, pane_provider_tag, pane_ready, resolve_session,
-    submitted_own_turn,
+    SUBMIT_GAP_SECONDS, SessionCollision, deliver_text, pane_bead_tag, pane_busy,
+    pane_idle, pane_process_identity, pane_provider_tag, pane_ready,
+    resolve_session, submitted_own_turn,
     wait_for_idle,
 )
 from sable_pane_lib import capture_pane as _capture_pane  # noqa: E402
@@ -207,10 +207,21 @@ def message_identity(frm: str, to: str, body: str) -> str:
     return f"{HEADER} from={frm} to={to} :: {collapsed}"
 
 
+class UnsafeMultilineMessage(ValueError):
+    """A body tmux cannot prove will remain one bracketed-paste submission."""
+
+
 def format_message(frm: str, to: str, body: str, composed_at: float) -> str:
-    """Single-line framed message, actually typed into the pane. Newlines/runs
-    collapse to single spaces so the whole thing is one submitted turn (Enter
-    submits; we never want a mid-body newline to submit early). The
+    """Single-line framed message, actually typed into the pane.
+
+    tmux before 3.7 cannot expose ``bracket_paste_flag``, so callers cannot
+    prove that ``paste-buffer -p`` will bracket a paste. Without that mode tmux
+    turns line feeds into carriage returns and a multi-line body becomes
+    multiple submitted turns. Refuse such bodies until that runtime proof is
+    available; ordinary runs of horizontal whitespace still collapse to one
+    space through :func:`message_identity`.
+
+    The
     composition timestamp (SABLE-xwy0b) is a TRAILING bracket rather than
     sitting between `to=` and the body: appended after message_identity()'s
     output, it never disturbs identity-based matching (see message_identity)
@@ -222,6 +233,11 @@ def format_message(frm: str, to: str, body: str, composed_at: float) -> str:
     per-call time.time() default would let those three drift apart and would
     also make any test that reconstructs the expected message
     non-deterministic."""
+    if "\n" in body or "\r" in body:
+        raise UnsafeMultilineMessage(
+            "sable-msg refuses a multi-line body: tmux cannot verify bracketed "
+            "paste mode on this host"
+        )
     return f"{message_identity(frm, to, body)} [composed={compose_timestamp(composed_at)}]"
 
 
@@ -406,6 +422,7 @@ def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None
 
     if interrupt:
         run(base + ["send-keys", "-t", pane, "Escape"])
+        (sleep or time.sleep)(SUBMIT_GAP_SECONDS)
         if ready_timeout > 0:
             wait_for_idle(base, pane, ready_timeout, interval=interval,
                           capture=capture, sleep=sleep, run=run,
@@ -907,7 +924,11 @@ def main(argv: list[str] | None = None) -> int:
 
     composed_at = _now()
     body = resolve_body(ns)
-    message = format_message(ns.frm, ns.to_role, body, composed_at)
+    try:
+        message = format_message(ns.frm, ns.to_role, body, composed_at)
+    except UnsafeMultilineMessage as exc:
+        sys.stderr.write(f"sable-msg: {exc}\n")
+        return 2
     # The matching snippet deliberately excludes composed= (SABLE-xwy0b): see
     # message_identity / deliver_message for why an identical-body resend
     # must still canonically match despite carrying a different timestamp.

@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import tempfile
 import time
 
 from sable_provider_lib import agent_name, normalize_provider
@@ -609,10 +610,35 @@ def wait_for_idle(base, pane, timeout, interval=0.5, capture=None, sleep=None,
     return False
 
 
+def _paste_text(base, pane, text, run) -> bool:
+    """Load ``text`` into a private tmux buffer and paste it into ``pane``."""
+    buffer_name = f"sable-delivery-{os.getpid()}-{time.monotonic_ns()}"
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                prefix="sable-delivery-", mode="wb", delete=False) as payload:
+            path = payload.name
+            payload.write(text.encode())
+        if run(base + ["load-buffer", "-b", buffer_name, path]) is False:
+            return False
+        pasted = run(base + [
+            "paste-buffer", "-p", "-d", "-b", buffer_name, "-t", pane,
+        ]) is not False
+        if not pasted:
+            run(base + ["delete-buffer", "-b", buffer_name])
+        return pasted
+    finally:
+        if path is not None:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
 def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
                  run=None, capture=None, sleep=None,
                  provider: str = "claude") -> bool:
-    """Type `text` into the pane and submit it — Enter is sent after the short
+    """Paste `text` into the pane and submit it — Enter is sent after the short
     paste-burst suppression gap (submission must not depend on the landed-check
     failing first, SABLE-1umr), then resent until the text leaves the input box
     (the dropped-Enter race). A resent Enter on an already-empty box is a
@@ -665,7 +691,7 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
     idle_at_send = pane_idle(cap0, provider)
     already_pending = (not idle_at_send) and _already_pending(cap0, snippet)
     if not already_pending:
-        if run(base + ["send-keys", "-t", pane, "-l", text]) is False:
+        if not _paste_text(base, pane, text, run):
             return False
         sleep(SUBMIT_GAP_SECONDS)
         if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
