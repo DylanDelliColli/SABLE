@@ -79,6 +79,25 @@ Usage:
   sable-worker-status --all      # every lane (the pre-dcw2 fleet-wide view)
   sable-worker-status --reap     # also kill OWN-lane panes whose @sable_status=done
   sable-worker-status --json
+  sable-worker-status --quiescence  # fleet-wide LIVE/EXITED/CANNOT-ASSESS tree probe
+  sable-worker-status --quiescence-pane %42 --json  # explicit pane, any class
+
+The quiescence modes are policy-neutral process-tree observations
+(SABLE-71i2x). `--quiescence` selects the fleet's worker panes for activation
+checks. Repeatable `--quiescence-pane <tmux-target>` instead resolves exactly
+the named panes without role or class filtering, so a host-side watcher can
+observe a manager pane. Both walk the complete Linux process tree rooted at
+each pane's `#{pane_pid}` and report an explicit LIVE / EXITED /
+CANNOT-ASSESS state.
+It never derives a generic safety boolean from that state, nor from
+`#{pane_current_command}` or `@sable_status`: both legacy signals have
+produced measured false answers in opposite directions. Policy belongs to
+the consumer. Activation permits only an all-EXITED set; a wake watcher needs
+its target LIVE plus a fresh pane-idle capture. CANNOT-ASSESS refuses both.
+Exit 0 means every requested tree was assessed (whether LIVE or EXITED); exit
+2 means a required tree or tmux scope could not be assessed. A caller whose
+PID namespace cannot see a host pane PID gets CANNOT-ASSESS; there is no
+fallback to either legacy signal.
 
 Env:
   SABLE_TMUX_SOCKET   tmux socket name (-L); for session isolation / tests
@@ -138,6 +157,30 @@ WINDOW_NAME_WORKER_PREFIX = "worker-"
 _FORMAT = ("#{pane_id}\t#{@sable_role}\t#{@sable_bead}\t#{@sable_status}\t"
            "#{@sable_class}\t#{@sable_deliverable}\t#{@sable_lane}\t"
            "#{window_name}")
+_QUIESCENCE_FORMAT = _FORMAT + "\t#{pane_pid}"
+
+QUIESCENCE_LIVE = "LIVE"
+QUIESCENCE_EXITED = "EXITED"
+QUIESCENCE_CANNOT_ASSESS = "CANNOT-ASSESS"
+
+# Exact executable identities, not arbitrary argv substrings. Prompts, paths,
+# and test names routinely contain the words "claude" and "codex"; treating a
+# substring anywhere in argv as an agent would turn the safety gate into an
+# always-refuse check. The runtime-wrapper branch below handles the historical
+# npm-distributed CLIs without widening this to prompt text.
+_AGENT_EXECUTABLES = {
+    "claude": "claude",
+    "claude-code": "claude",
+    "codex": "codex",
+}
+_SCRIPT_RUNTIMES = {
+    "bun", "node", "nodejs", "python", "python3", "python3.11", "python3.12",
+    "python3.13",
+}
+
+
+class ProcessTreeCannotAssess(RuntimeError):
+    """A required pane process-tree fact could not be read safely."""
 
 
 def tmux_base(socket: str | None) -> list[str]:
@@ -204,6 +247,304 @@ def parse_worker_panes(output: str) -> list[dict]:
             rec["lane"] = lane
         workers.append(rec)
     return workers
+
+
+# --- authoritative pane process-tree observation (SABLE-71i2x) ------------
+
+def _executable_kind(token: str) -> str | None:
+    """Claude/Codex identity from one executable-shaped token.
+
+    Only the token's basename is considered and only known executable names
+    match. This deliberately refuses the tempting `"codex" in argv` shape:
+    agent prompts and this tool's own test paths contain those words too.
+    """
+    name = os.path.basename(token).lower()
+    for suffix in (".exe", ".js", ".mjs", ".cjs"):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+    return _AGENT_EXECUTABLES.get(name)
+
+
+def agent_process_kind(node: dict) -> str | None:
+    """Return ``claude``/``codex`` when a process is a resident agent.
+
+    A zombie has exited even though its process-table row has not yet been
+    reaped. Native CLIs identify through ``comm`` or argv[0]. For older
+    script-distributed CLIs, argv[1] is accepted only when argv[0] is a known
+    script runtime; arbitrary later prompt arguments are never searched.
+    """
+    if node.get("proc_state") == "Z":
+        return None
+    comm_kind = _executable_kind(str(node.get("comm") or ""))
+    if comm_kind:
+        return comm_kind
+    argv = list(node.get("argv") or ())
+    if not argv:
+        return None
+    argv0_kind = _executable_kind(argv[0])
+    if argv0_kind:
+        return argv0_kind
+    runtime = os.path.basename(argv[0]).lower()
+    if runtime in _SCRIPT_RUNTIMES and len(argv) >= 2:
+        return _executable_kind(argv[1])
+    return None
+
+
+def _proc_read(path: str, *, binary: bool = False):
+    """Read one load-bearing /proc edge or fail closed with its exact path."""
+    try:
+        if binary:
+            with open(path, "rb") as handle:
+                return handle.read()
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise ProcessTreeCannotAssess(
+            f"cannot read process tree at {path}: {exc.strerror or exc}"
+        ) from exc
+
+
+def _proc_stat(pid: int, proc_root: str) -> tuple[str, str, int]:
+    """Return (comm, state, ppid) from /proc/PID/stat without naive splitting."""
+    path = os.path.join(proc_root, str(pid), "stat")
+    data = _proc_read(path)
+    open_paren = data.find("(")
+    close_paren = data.rfind(")")
+    if open_paren == -1 or close_paren <= open_paren:
+        raise ProcessTreeCannotAssess(f"malformed process stat at {path}")
+    fields = data[close_paren + 1:].split()
+    if len(fields) < 2:
+        raise ProcessTreeCannotAssess(f"malformed process stat at {path}")
+    try:
+        ppid = int(fields[1])
+    except ValueError as exc:
+        raise ProcessTreeCannotAssess(f"malformed parent pid at {path}") from exc
+    return data[open_paren + 1:close_paren], fields[0], ppid
+
+
+def _proc_node(pid: int, expected_parent: int | None, proc_root: str) -> tuple[dict, list[int]]:
+    """Read one process and the kernel-maintained direct-child edge.
+
+    `/proc/PID/task/PID/children` avoids inferring ancestry from a bounded
+    global `ps` listing. Every listed child is then verified through its own
+    stat parent field. A process racing out during the walk yields
+    CANNOT-ASSESS, not a convenient EXITED: the caller can immediately retry,
+    while a false clearance cannot be repaired after activation.
+    """
+    comm, proc_state, ppid = _proc_stat(pid, proc_root)
+    if expected_parent is not None and ppid != expected_parent:
+        raise ProcessTreeCannotAssess(
+            f"process-tree edge changed while reading pid {pid}: expected parent "
+            f"{expected_parent}, observed {ppid}"
+        )
+    cmdline_path = os.path.join(proc_root, str(pid), "cmdline")
+    raw_argv = _proc_read(cmdline_path, binary=True)
+    argv = [part.decode("utf-8", "replace")
+            for part in raw_argv.split(b"\x00") if part]
+    task_root = os.path.join(proc_root, str(pid), "task")
+    try:
+        task_ids = sorted(
+            (entry for entry in os.listdir(task_root) if entry.isdigit()),
+            key=int,
+        )
+    except OSError as exc:
+        raise ProcessTreeCannotAssess(
+            f"cannot enumerate process tasks at {task_root}: {exc.strerror or exc}"
+        ) from exc
+    if str(pid) not in task_ids:
+        raise ProcessTreeCannotAssess(
+            f"process leader task {pid} is missing from {task_root}"
+        )
+    children: list[int] = []
+    seen_children: set[int] = set()
+    for task_id in task_ids:
+        children_path = os.path.join(task_root, task_id, "children")
+        raw_children = _proc_read(children_path)
+        for token in raw_children.split():
+            try:
+                child = int(token)
+            except ValueError as exc:
+                raise ProcessTreeCannotAssess(
+                    f"malformed child pid {token!r} at {children_path}"
+                ) from exc
+            if child not in seen_children:
+                children.append(child)
+                seen_children.add(child)
+    return ({"pid": pid, "ppid": ppid, "proc_state": proc_state,
+             "comm": comm, "argv": argv}, children)
+
+
+def walk_process_tree(root_pid: int, proc_root: str = "/proc") -> list[dict]:
+    """Walk the complete descendant tree rooted at a tmux pane PID."""
+    pending: list[tuple[int, int | None]] = [(root_pid, None)]
+    seen: set[int] = set()
+    nodes: list[dict] = []
+    while pending:
+        pid, expected_parent = pending.pop()
+        if pid in seen:
+            raise ProcessTreeCannotAssess(
+                f"process tree rooted at {root_pid} contains repeated pid {pid}"
+            )
+        seen.add(pid)
+        node, children = _proc_node(pid, expected_parent, proc_root)
+        nodes.append(node)
+        # Reverse before the LIFO push so the kernel-reported child order is
+        # preserved in evidence and tests.
+        pending.extend((child, pid) for child in reversed(children))
+    return nodes
+
+
+def classify_pane_process_tree(pane_root: dict, proc_root: str = "/proc") -> dict:
+    """LIVE / EXITED / CANNOT-ASSESS for one pane process root.
+
+    This primitive is deliberately population-neutral. The fleet activation
+    command selects workers before calling it; explicit targets may be
+    workers, producers, managers, or otherwise unclassified panes.
+    """
+    pane = pane_root.get("pane") or "?"
+    bead = pane_root.get("bead") or ""
+    root_pid = pane_root.get("root_pid")
+    base = {"pane": pane, "bead": bead, "root_pid": root_pid,
+            "agents": [], "visited_pids": []}
+    if not isinstance(root_pid, int) or root_pid <= 0:
+        return {**base, "state": QUIESCENCE_CANNOT_ASSESS,
+                "reason": "tmux did not provide a valid pane_pid"}
+    try:
+        nodes = walk_process_tree(root_pid, proc_root=proc_root)
+    except ProcessTreeCannotAssess as exc:
+        return {**base, "state": QUIESCENCE_CANNOT_ASSESS,
+                "reason": str(exc)}
+    agents = []
+    for node in nodes:
+        kind = agent_process_kind(node)
+        if kind:
+            agents.append({**node, "kind": kind})
+    state = QUIESCENCE_LIVE if agents else QUIESCENCE_EXITED
+    reason = (
+        f"resident agent descendant(s): {', '.join(str(a['pid']) for a in agents)}"
+        if agents else
+        "full descendant tree contains no resident Claude/Codex process"
+    )
+    return {**base, "state": state, "agents": agents,
+            "visited_pids": [node["pid"] for node in nodes], "reason": reason}
+
+
+def list_worker_process_roots(socket: str | None, session: str, run=None) -> list[dict]:
+    """Enumerate every worker pane and its process-tree root, fail closed.
+
+    Unlike the ordinary status table, a missing/unreadable tmux session is not
+    equivalent to zero workers. A wrong socket and a quiet fleet otherwise
+    render the same empty result, which is release-dangerous.
+    """
+    run = run or _runner
+    cmd = tmux_base(socket) + [
+        "list-panes", "-s", "-t", f"={session}:", "-F", _QUIESCENCE_FORMAT,
+    ]
+    try:
+        output = run(cmd)
+    except Exception as exc:
+        raise ProcessTreeCannotAssess(
+            f"cannot enumerate worker panes in tmux session {session!r}: {exc}"
+        ) from exc
+
+    roots: list[dict] = []
+    for line in output.splitlines():
+        parsed = parse_worker_panes(line)
+        if not parsed:
+            continue
+        parts = line.split("\t")
+        raw_pid = parts[8].strip() if len(parts) >= 9 else ""
+        try:
+            root_pid = int(raw_pid)
+        except ValueError:
+            root_pid = None
+        roots.append({**parsed[0], "root_pid": root_pid})
+    return dedupe_panes(roots)
+
+
+def explicit_pane_process_root(socket: str | None, target: str,
+                               run=None) -> dict:
+    """Resolve one tmux target directly, without role/class population filters."""
+    run = run or _runner
+    cmd = tmux_base(socket) + [
+        "display-message", "-p", "-t", target, "-F", _QUIESCENCE_FORMAT,
+    ]
+    try:
+        output = run(cmd).strip()
+    except Exception as exc:
+        detail = (getattr(exc, "stderr", None)
+                  or getattr(exc, "output", None)
+                  or str(exc))
+        detail = str(detail).strip()
+        raise ProcessTreeCannotAssess(
+            f"cannot resolve tmux pane target {target!r}: {detail}"
+        ) from exc
+    lines = output.splitlines()
+    if len(lines) != 1:
+        raise ProcessTreeCannotAssess(
+            f"cannot resolve tmux pane target {target!r}: expected one pane fact, "
+            f"observed {len(lines)}"
+        )
+    parts = lines[0].split("\t")
+    pane = parts[0].strip() if parts and parts[0].strip() else target
+    bead = parts[2] if len(parts) >= 3 else ""
+    raw_pid = parts[8].strip() if len(parts) >= 9 else ""
+    try:
+        root_pid = int(raw_pid)
+    except ValueError:
+        root_pid = None
+    return {"pane": pane, "bead": bead, "root_pid": root_pid}
+
+
+def explicit_pane_quiescence(socket: str | None, targets: list[str],
+                              proc_root: str = "/proc", run=None) -> list[dict]:
+    """Observe named pane targets independently; one bad target cannot clear another."""
+    results: list[dict] = []
+    for target in targets:
+        try:
+            pane_root = explicit_pane_process_root(socket, target, run=run)
+        except ProcessTreeCannotAssess as exc:
+            results.append({
+                "pane": target, "bead": "", "root_pid": None,
+                "agents": [], "visited_pids": [],
+                "state": QUIESCENCE_CANNOT_ASSESS, "reason": str(exc),
+            })
+            continue
+        results.append(classify_pane_process_tree(
+            pane_root, proc_root=proc_root
+        ))
+    return results
+
+
+def worker_quiescence(socket: str | None, session: str,
+                      proc_root: str = "/proc", run=None) -> list[dict]:
+    roots = list_worker_process_roots(socket, session, run=run)
+    return [classify_pane_process_tree(worker, proc_root=proc_root)
+            for worker in roots]
+
+
+def render_quiescence(results: list[dict], session: str,
+                      reason: str | None = None) -> str:
+    """Render observations only; consumers own LIVE/EXITED policy polarity."""
+    lines = [f"QUIESCENCE session={session} panes={len(results)}"]
+    if reason:
+        lines.append(f"{QUIESCENCE_CANNOT_ASSESS} scope=session reason={reason}")
+    elif not results:
+        lines.append("workers=0 (worker enumeration succeeded; no worker panes)")
+    else:
+        for result in results:
+            line = (f"{result['state']} pane={result['pane']} "
+                    f"bead={result['bead'] or '-'} root_pid={result['root_pid']} "
+                    f"reason={result['reason']}")
+            lines.append(line)
+            for agent in result["agents"]:
+                argv = " ".join(agent["argv"])
+                lines.append(
+                    f"  agent pid={agent['pid']} ppid={agent['ppid']} "
+                    f"kind={agent['kind']} comm={agent['comm']} argv={argv}"
+                )
+    return "\n".join(lines)
 
 
 def parse_fleet_panes(output: str) -> list[dict]:
@@ -813,6 +1154,18 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sable-worker-status")
     p.add_argument("--reap", action="store_true",
                    help="kill panes whose @sable_status=done")
+    p.add_argument(
+        "--quiescence", action="store_true",
+        help="fleet-wide LIVE/EXITED/CANNOT-ASSESS process-tree sweep",
+    )
+    p.add_argument(
+        "--quiescence-pane", action="append", default=[], metavar="TMUX_TARGET",
+        help="observe one pane directly regardless of role/class (repeatable)",
+    )
+    p.add_argument(
+        "--proc-root", default="/proc", metavar="PATH",
+        help="process filesystem root for quiescence modes (default: /proc)",
+    )
     p.add_argument("--json", action="store_true", help="machine-readable output")
     scope = p.add_mutually_exclusive_group()
     scope.add_argument("--all", action="store_true",
@@ -822,12 +1175,53 @@ def main(argv: list[str] | None = None) -> int:
     scope.add_argument("--lane", metavar="NAME",
                        help="list only panes owned by lane NAME")
     ns = p.parse_args(sys.argv[1:] if argv is None else argv)
+    observing = ns.quiescence or bool(ns.quiescence_pane)
+    if ns.quiescence and ns.quiescence_pane:
+        p.error("--quiescence and --quiescence-pane are mutually exclusive")
+    if observing and (ns.reap or ns.all or ns.mine or ns.lane):
+        p.error("quiescence modes cannot be combined with --reap, --all, "
+                "--mine, or --lane")
+    if not observing and ns.proc_root != "/proc":
+        p.error("--proc-root is valid only with a quiescence mode")
     socket = os.environ.get("SABLE_TMUX_SOCKET") or None
     try:
         session = resolve_session(socket=socket)
     except SessionCollision as e:
         sys.stderr.write(f"sable-worker-status: {e}\n")
         return 4
+
+    if observing:
+        scope_reason = None
+        if ns.quiescence_pane:
+            quiescence = explicit_pane_quiescence(
+                socket, ns.quiescence_pane, proc_root=ns.proc_root
+            )
+        else:
+            try:
+                quiescence = worker_quiescence(
+                    socket, session, proc_root=ns.proc_root
+                )
+            except ProcessTreeCannotAssess as exc:
+                quiescence = []
+                scope_reason = str(exc)
+
+        if ns.json:
+            print(json.dumps({
+                "session": session,
+                "scope_error": ({"state": QUIESCENCE_CANNOT_ASSESS,
+                                 "reason": scope_reason}
+                                if scope_reason else None),
+                "panes": quiescence,
+            }, indent=2))
+        else:
+            print(render_quiescence(
+                quiescence, session, reason=scope_reason
+            ))
+        cannot_assess = scope_reason is not None or any(
+            result["state"] == QUIESCENCE_CANNOT_ASSESS
+            for result in quiescence
+        )
+        return 2 if cannot_assess else 0
 
     interval = float(os.environ.get("SABLE_STATUS_SAMPLE_INTERVAL", _DEFAULT_SAMPLE_INTERVAL))
     all_workers = list_workers_confirmed(socket, session=session, interval=interval)

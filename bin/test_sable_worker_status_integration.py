@@ -192,6 +192,159 @@ def test_reports_done_and_running(sock):
     assert "bead-run" in r.stdout and "running" in r.stdout
 
 
+# --- SABLE-71i2x: full process-tree quiescence ------------------------------
+
+def _pane_root_pid(sock, target):
+    return int(_tmux(sock, "display-message", "-p", "-t", target,
+                     "#{pane_pid}").stdout.strip())
+
+
+def _child_with_argv0(root_pid, expected):
+    children_path = Path(f"/proc/{root_pid}/task/{root_pid}/children")
+    try:
+        child_pids = children_path.read_text().split()
+    except OSError:
+        return None
+    for raw_pid in child_pids:
+        try:
+            argv = Path(f"/proc/{raw_pid}/cmdline").read_bytes().split(b"\x00")
+        except OSError:
+            continue
+        if argv and argv[0].decode(errors="replace") == expected:
+            return int(raw_pid)
+    return None
+
+
+def test_quiescence_finds_agent_child_hidden_by_shell_and_done_tag(sock):
+    """THE LOAD-BEARING CONTROL.
+
+    Launch `codex` as a CHILD of the pane shell, then leave it in the
+    background so tmux still reports the foreground shell. Combined with a
+    planted stale `@sable_status=done`, the old two-signal sweep clears this
+    pane. The process-tree probe must instead report LIVE. A second worker is
+    a genuinely bare shell with a planted `running` tag: it must report
+    EXITED, proving neither polarity is copied from the cache.
+    """
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    _tag(sock, "w.0", "worker", "bead-live-child", "done")
+    _tmux(sock, "send-keys", "-t", "w.0",
+          "bash -c 'exec -a codex sleep 45' &", "Enter")
+    live_root = _pane_root_pid(sock, "w.0")
+    live_child = _wait_until(
+        lambda: _child_with_argv0(live_root, "codex"),
+        description="resident codex child under the pane shell",
+    )
+
+    # Prove the old probe's actual false-clear inputs, not merely the setup we
+    # intended: it sees a shell + done while a Codex child demonstrably exists.
+    legacy = _tmux(
+        sock, "display-message", "-p", "-t", "w.0",
+        "#{pane_current_command}\t#{@sable_status}",
+    ).stdout.strip().split("\t")
+    assert legacy == ["bash", "done"]
+    assert live_child != live_root
+
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    _tag(sock, "w.1", "worker", "bead-bare-shell", "running")
+
+    result = _run(sock, "--quiescence", "--json")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    by_bead = {pane["bead"]: pane for pane in payload["panes"]}
+
+    assert "state" not in payload, "fleet policy must not be fused into the primitive"
+    assert "release_safe" not in payload, \
+        "activation safety is not wake safety; consumers own the polarity"
+    assert payload["scope_error"] is None
+    assert by_bead["bead-live-child"]["state"] == "LIVE"
+    assert [node["pid"] for node in by_bead["bead-live-child"]["agents"]] == [
+        live_child
+    ]
+    assert by_bead["bead-bare-shell"]["state"] == "EXITED"
+    assert by_bead["bead-bare-shell"]["agents"] == []
+
+
+def test_quiescence_unreadable_tree_is_cannot_assess(sock, tmp_path):
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    _tag(sock, "w.0", "worker", "bead-unreadable-tree", "done")
+    root_pid = _pane_root_pid(sock, "w.0")
+
+    # Mirror enough of the real root to reach the process-tree edge, then
+    # make that edge unreadable. This is a process-boundary control through
+    # the real CLI, not a mocked return value.
+    fake_root = tmp_path / "proc"
+    node = fake_root / str(root_pid)
+    task = node / "task" / str(root_pid)
+    task.mkdir(parents=True)
+    (node / "stat").write_bytes(Path(f"/proc/{root_pid}/stat").read_bytes())
+    (node / "comm").write_bytes(Path(f"/proc/{root_pid}/comm").read_bytes())
+    (node / "cmdline").write_bytes(Path(f"/proc/{root_pid}/cmdline").read_bytes())
+    (task / "children").mkdir()  # read_text -> IsADirectoryError
+
+    result = _run(
+        sock, "--quiescence", "--json", "--proc-root", str(fake_root)
+    )
+    assert result.returncode == 2, result.stderr
+    payload = json.loads(result.stdout)
+    assert "state" not in payload
+    assert "release_safe" not in payload
+    assert payload["scope_error"] is None
+    assert payload["panes"][0]["state"] == "CANNOT-ASSESS"
+    assert "children" in payload["panes"][0]["reason"]
+
+
+def test_explicit_quiescence_accepts_manager_pane_and_bypasses_population_filter(sock):
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+    _tag(sock, "w.0", "optimus", "", "running")
+    _tmux(sock, "set-option", "-p", "-t", "w.0", "@sable_class", "manager")
+    _tmux(sock, "send-keys", "-t", "w.0",
+          "bash -c 'exec -a codex sleep 45' &", "Enter")
+    root_pid = _pane_root_pid(sock, "w.0")
+    child_pid = _wait_until(
+        lambda: _child_with_argv0(root_pid, "codex"),
+        description="resident codex child under manager pane shell",
+    )
+    _tmux(sock, "split-window", "-t", "w", "bash --noprofile --norc")
+    _tag(sock, "w.1", "worker", "bare-worker", "running")
+
+    result = _run(
+        sock,
+        "--quiescence-pane", "w.0",
+        "--quiescence-pane", "w.1",
+        "--json",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert set(payload) == {"session", "scope_error", "panes"}
+    assert payload["scope_error"] is None
+    assert len(payload["panes"]) == 2
+    by_bead = {pane["bead"]: pane for pane in payload["panes"]}
+    manager = by_bead[""]
+    assert manager["state"] == "LIVE"
+    assert manager["root_pid"] == root_pid
+    assert [agent["pid"] for agent in manager["agents"]] == [child_pid]
+    assert by_bead["bare-worker"]["state"] == "EXITED"
+
+
+def test_explicit_missing_target_is_one_cannot_assess_pane_record(sock):
+    _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
+          "bash --noprofile --norc")
+
+    result = _run(sock, "--quiescence-pane", "%999999", "--json")
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["scope_error"] is None
+    assert len(payload["panes"]) == 1
+    assert payload["panes"][0]["pane"] == "%999999"
+    assert payload["panes"][0]["state"] == "CANNOT-ASSESS"
+    assert "cannot resolve tmux pane target" in payload["panes"][0]["reason"]
+
+
 def test_reap_kills_only_done_pane(sock):
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "180", "-y", "40",
           "bash --noprofile --norc")
