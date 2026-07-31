@@ -1,7 +1,7 @@
 d3b815d72f3b1141138dfb5852881d10a34dbe77912183ba3368f6a132fe090f  ./.sable-install-provenance
 6ad9a8c7c088f4750326a7dac7c751951860cc9dff127f23987115672d7a8351  ./CLAUDE.md
 f595d9fd7685073d898a8b80638e97e26dac98f4e117cf206771b2d5ac964bfe  ./agents/columbo.md
-e387f009b65f099f301679ff31b802c7606f4f6ef825f65e35f67b4504abafbd  ./agents/rudy.md
+8b4884da9b454bb5f55902944789de77438e5ba2daa40849317e4b18879e0f35  ./agents/rudy.md
 8dbe809a369c86ef1759e768b07e4e0294c31dd6b769c24a2af80b2eec61f089  ./agents/sherlock.md
 6650443849ddb45def0fb3f95ac6c068373043fd26e6978ea3a20d536eefb00d  ./agents/victor.md
 1f4240a635a648b1ac732e596309f0ab10f21b1db366f377149df46c7b0c7dff  ./bin/sable_inline_body_guard_lib.py
@@ -33,7 +33,7 @@ fe3d604367788420feff535d560846942f36482e3847ec7b3ea3ab7a33d11ecb  ./hooks/multi-
 13a5e989cec74933fc69331a8deba60bc6c2099495d21a4c91350c098d215593  ./hooks/multi-manager/tree-claim.sh
 5ea0a1b5741ba3ad54363a274596d55c79434c23b50f0b148bd487cd445cb6e1  ./hooks/multi-manager/worktree-placement-guard.sh
 1033819cdad67de18a24a945889fcec837232d992ddef24c88b3ec3fc87e2018  ./hooks/tdd-evidence.sh
-620cf3e92b7d96515223a73ea1da3096597000231762b6653eaf817c1b887918  ./hooks/tdd-gate.sh
+6c17efaf4cc73ae64b57d1247a202c60972d0926f117f995b4b9398d6289164f  ./hooks/tdd-gate.sh
 a0bb62e5e73b4af901891463cff80a0754c56bc2c3b7b3ebe2f2b54f7381f19f  ./hooks/tdd-remind.sh
 beda66a5848fac2df084ff074b3acfbc11bf0a28931d3e16ced22f8b01d8ba8e  ./sable/agents.yaml
 47c27910cb20c239a60ff4632f5654080e763ab2674ac9c48681259848cc49b2  ./sable/reconcile-timer/sable-reconcile-timer.cron
@@ -52,7 +52,7 @@ e9f574b38ca7ab28ad32e644c4b2d5fb30e9f36484dce3258857aabc74b4070b  ./skills/colum
 5eff875ba42d4cc71b5ccfa731d53fae3cc494349d927f93b1cf971ef8cce1af  ./skills/gaudi/TRADEOFFS.md
 f1a704016b72723dfc29e0679277bf351c33e2ffc0398b36e3e9b3d30a4ad984  ./skills/gaudi/gaudi-prefilter.py
 c6419da86418f902bf3987d2949035cc834c204c7fe46d52706a8fb16e504926  ./skills/sable-discover/SKILL.md
-2f30a70381a8c5551ee7814694607bc89a8de90a678da6c753b56400d17db639  ./skills/sable-execute/SKILL.md
+e1f19735c92612d20fd31cd4172904dfa8a2cc84864a88d5bfc220fe734ad266  ./skills/sable-execute/SKILL.md
 96162dfce4412a6b464c66977c16492e1ac8fe749e2f60ca7adfc5203ca8463a  ./skills/sable-onboarding/SKILL.md
 685dbef418c8c2080f868472e2bff981ad06a0e53f6871fcfc44d020b8271fe7  ./skills/sable-plan/SKILL.md
 2e32e54c16bd3bd4f21f05bc1e80ae08d83332c1538337cc59ec6de5179816cd  ./skills/sable-review/SKILL.md
