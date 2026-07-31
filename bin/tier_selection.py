@@ -206,6 +206,24 @@ class DiffCoverScopePlan(NamedTuple):
     reason: str
 
 
+def diff_cover_scope_is_full_cost(plan: DiffCoverScopePlan, repo_root: Path) -> bool:
+    """Recognize both ways a scope plan can cost the whole Python suite.
+
+    `mode == "full"` is the explicit fallback. A conftest-class change has a
+    second shape: testmon can validly return every test file, leaving the plan
+    labelled "scoped" even though its execution footprint is suite-wide.
+    """
+    if plan.mode == "full":
+        return True
+    bin_root = Path(repo_root) / "bin"
+    every_test_file = {
+        path.relative_to(repo_root).as_posix()
+        for path in bin_root.rglob("*.py")
+        if _PY_TEST_FILE_RE.search(path.relative_to(repo_root).as_posix())
+    }
+    return bool(every_test_file) and set(plan.test_paths) >= every_test_file
+
+
 def build_diff_cover_scope_plan(
     tier_plan: ImpactTierPlan,
     diff_touched_files: Optional[List[str]],

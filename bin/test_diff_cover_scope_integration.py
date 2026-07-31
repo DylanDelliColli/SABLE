@@ -403,6 +403,9 @@ def test_synthetic_genuine_pruning_pair_still_denies_scoped_through_the_real_gat
 
     cp = _run_gate(repo, base_sha)
 
+    assert "tier_selection: diff-cover-scope full" in cp.stderr, (
+        "the deleting-test pruning shape did not visibly resolve to the real "
+        f"full-run fallback:\n{cp.stdout}{cp.stderr}")
     assert cp.returncode != 0, (
         f"scoped real gate ALLOWED a genuine pruning diff (new uncovered "
         f"branch, only covering test deleted) — output:\n{cp.stdout}{cp.stderr}")

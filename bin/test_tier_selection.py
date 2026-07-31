@@ -412,6 +412,27 @@ def test_line_1400_shape_added_inline_skip_call_keeps_its_file_in_scope(tmp_path
     assert "bin/test_rehearsal.py" in plan.test_paths
 
 
+@pytest.mark.parametrize(
+    ("plan", "expected"),
+    [
+        (ts.DiffCoverScopePlan("full", [], "cache miss"), True),
+        (ts.DiffCoverScopePlan(
+            "scoped", ["bin/test_alpha.py", "bin/test_beta.py"],
+            "conftest invalidated every test"), True),
+        (ts.DiffCoverScopePlan(
+            "scoped", ["bin/test_alpha.py"], "genuinely narrow selection"), False),
+    ],
+)
+def test_diff_cover_scope_full_cost_predicate_distinguishes_both_degenerate_shapes(
+        tmp_path, plan, expected):
+    """U6: full mode and suite-wide scoped mode cost the same; narrow does not."""
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "test_alpha.py").write_text("def test_alpha(): pass\n")
+    (tmp_path / "bin" / "test_beta.py").write_text("def test_beta(): pass\n")
+
+    assert ts.diff_cover_scope_is_full_cost(plan, tmp_path) is expected
+
+
 # --- _git_diff_touched_files (SABLE-hauwa) ------------------------------------
 
 def test_git_diff_touched_files_returns_none_on_git_failure(tmp_path):

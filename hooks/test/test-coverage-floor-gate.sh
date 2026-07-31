@@ -61,6 +61,7 @@ TESTDIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$TESTDIR/../.." && pwd)"
 GATE="$REPO_ROOT/bin/sable-merge-gate"
 DIFF_COVER_GATE="$REPO_ROOT/.github/ci/diff-cover-gate.sh"
+TIER_SSOT="$REPO_ROOT/.github/ci/test-tiers.sh"
 
 # shellcheck source=lib-git-sandbox.sh
 source "$TESTDIR/lib-git-sandbox.sh"
@@ -340,6 +341,48 @@ if [ -n "$KICKED_SHA4" ] && [ "$(origin_sha "$BASE_BR")" = "$KICKED_SHA4" ]; the
   pass "C4: byte-identical promotion, untouched by the coverage floor"
 else
   fail "C4: byte-identical promotion" "tip=$(origin_sha "$BASE_BR") want=$KICKED_SHA4"
+fi
+
+# ==========================================================================
+# C5 — the two shipped budget CLIs expose a floor that fits its declared
+# full-suite fallback and an enclosing promote timeout that includes it.
+# ==========================================================================
+FLOOR_BUDGET="$(bash "$TIER_SSOT" --budget coverage_floor 2>&1)"; FLOOR_RC=$?
+PROMOTE_SECONDS="$(cd "$REPO_ROOT" && python3 "$GATE" promote-budget --seconds 2>&1)"; PROMOTE_RC=$?
+PROMOTE_JSON="$(cd "$REPO_ROOT" && python3 "$GATE" promote-budget --json 2>&1)"; JSON_RC=$?
+
+if [ "$FLOOR_RC" -eq 0 ] && [ "$PROMOTE_RC" -eq 0 ] && [ "$JSON_RC" -eq 0 ]; then
+  pass "C5: both shipped budget CLIs resolve the coverage-floor budget"
+else
+  fail "C5: budget CLIs resolve" \
+    "floor_rc=$FLOOR_RC promote_rc=$PROMOTE_RC json_rc=$JSON_RC"
+fi
+
+if python3 - "$FLOOR_BUDGET" "$PROMOTE_SECONDS" <<'PY'
+import sys
+floor, promote = map(float, sys.argv[1:])
+raise SystemExit(0 if promote > floor else 1)
+PY
+then
+  pass "C5: promote-budget --seconds exceeds the floor's own declared budget"
+else
+  fail "C5: promote budget encloses the floor term" \
+    "floor=$FLOOR_BUDGET promote=$PROMOTE_SECONDS"
+fi
+
+if python3 - "$FLOOR_BUDGET" "$PROMOTE_JSON" <<'PY'
+import json, sys
+floor = float(sys.argv[1])
+artifact = json.loads(sys.argv[2])
+cost = float(artifact["coverage_floor_declared_full_fallback_cost_s"])
+headroom = float(artifact["budget_headroom"])
+raise SystemExit(0 if floor >= cost * headroom else 1)
+PY
+then
+  pass "C5: coverage_floor budget clears the declared full fallback cost with headroom"
+else
+  fail "C5: coverage_floor budget fits its declared full fallback cost" \
+    "floor=$FLOOR_BUDGET artifact=$PROMOTE_JSON"
 fi
 
 echo "----------------------------------------------------------------------"
