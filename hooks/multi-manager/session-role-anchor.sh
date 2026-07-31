@@ -8,6 +8,23 @@
 # erodes silently otherwise). The PreCompact trigger itself is a no-op — its
 # hookSpecificOutput schema doesn't support additionalContext (SABLE-jiqm).
 #
+# ALSO stamps the pane's BOOT EPOCH (SABLE-slip0.1), which is what makes a
+# cleared-but-alive manager pane distinguishable from a working one. Two
+# agent-written pane options, readable from outside the pane with
+# `tmux display-message -p -t <pane> '#{@sable_boot_epoch}'`:
+#
+#   @sable_boot_epoch   <unix-seconds>-<12 hex>  — changes on EVERY agent
+#                       SessionStart (including post-/clear), never on a
+#                       compaction. A consumer that sees a different value than
+#                       it last observed knows the session restarted.
+#   @sable_boot_agent   the resolved agent name (SABLE_AGENT_NAME-first, D13),
+#                       written BEFORE the epoch so the epoch commits the pair.
+#
+# ABSENCE OF THE EPOCH IS NOT "WORKING" AND NOT "CLEARED" — it is UNKNOWN, and
+# consumers must render it that way. A pane predating this change, a manager
+# outside tmux, and a provider that dispatches the hook with no stdin payload
+# all present no epoch. See the stamp block below for the full contract.
+#
 # Fast-exits if env var is unset (non-manager sessions unaffected).
 
 set -euo pipefail
@@ -28,6 +45,126 @@ ROLE_KIND="${SABLE_AGENT_ROLE:-${CLAUDE_AGENT_ROLE:-}}"
 [ -z "$ROLE_NAME" ] && exit 0
 [ "$ROLE_KIND" != "manager" ] && exit 0
 export ROLE_NAME
+
+# --- Hook event resolution: read stdin ONCE (SABLE-slip0.1) ------------------
+# The event used to be parsed inside the final python from ITS stdin. The
+# boot-epoch stamp below has to know the event BEFORE role resolution, so stdin
+# is read here, once, and the resolved event is handed to that python through
+# the environment instead. A pipe cannot be read twice — whichever reader goes
+# first consumes it — so this move is not optional, it is the only ordering
+# that lets both consumers see the event.
+#
+# Deliberately placed AFTER the identity/manager gates: a non-manager session
+# must still fast-exit without touching stdin at all.
+#
+# stdin discipline is copied from lib-hook-trace.sh's sable_trace_read_stdin
+# (not sourced — that lib also writes a trace log, which is not this hook's
+# business): an interactive fd is treated as "no payload" rather than blocked
+# on, and a real read is bounded, so a provider that dispatches this hook with
+# no stdin can never burn the 3000ms budget waiting on EOF.
+HOOK_INPUT=""
+if [ ! -t 0 ]; then
+    if command -v timeout >/dev/null 2>&1; then
+        HOOK_INPUT="$(timeout "${SABLE_ROLE_ANCHOR_STDIN_TIMEOUT:-2}" cat 2>/dev/null)" || true
+    else
+        HOOK_INPUT="$(cat 2>/dev/null)" || true
+    fi
+fi
+
+# UNKNOWN is a THIRD value, not a synonym for SessionStart. The two consumers
+# below want opposite defaults for it and each gets its own, which is only
+# expressible if the ambiguity survives parsing.
+HOOK_EVENT="$(HOOK_INPUT="$HOOK_INPUT" python3 -c '
+import json, os
+try:
+    d = json.loads(os.environ.get("HOOK_INPUT", ""))
+    ev = d.get("hook_event_name") if isinstance(d, dict) else None
+except Exception:
+    ev = None
+print(ev if isinstance(ev, str) and ev else "__SABLE_EVENT_UNKNOWN__")
+' 2>/dev/null || true)"
+[ -z "$HOOK_EVENT" ] && HOOK_EVENT="__SABLE_EVENT_UNKNOWN__"
+
+# --- Boot epoch stamp (SABLE-slip0.1) ---------------------------------------
+# A pane whose agent session was CLEARED is indistinguishable from one that is
+# working: sable-spawn-manager decides "already running" from the @sable_role
+# tag (bin/sable-spawn-manager:283), and a cleared-but-alive pane still carries
+# it. Measured 2026-07-30: all three manager panes had been context-cleared,
+# spawn-manager reported "already running - skipping" for all three and spawned
+# nothing, and the cockpit had to hand-kick each over sable-msg.
+#
+# This hook is the fix's natural home because it is the only closed
+# write-then-read-at-boot loop in the fleet: it fires on every SessionStart
+# INCLUDING post-clear, on BOTH providers (~/.claude/settings.json and
+# ~/.codex/hooks.json), and until now it wrote nothing observable outside the
+# pane. Stamping here converts "the session restarted" from an inference into
+# an EVENT, written from inside the pane by the agent's own boot.
+#
+# D2 (binding): the signal must be AGENT-written. Of the @sable_* pane options,
+# all but @sable_status are written by the spawn TOOL and survive agent death,
+# process death and pane death — there is a pane on this host carrying
+# @sable_role=lincoln with pane_dead=1. A tool-written signal cannot report
+# agent death, so the epoch has to be written by this hook and by nothing else.
+#
+# D13 (binding): identity is SABLE_AGENT_NAME-first (resolved above).
+# CLAUDE_AGENT_NAME reads "lincoln" on all three Codex manager panes, so an
+# epoch stamped with the Claude-side name would mislabel every one of them.
+#
+# D3 (binding): this writes an EVENT, never a threshold. Nothing here reads
+# window_activity, pane idleness or elapsed time, because a cleared idle pane
+# and a working between-turns pane are equally quiet. Three candidate
+# discriminators were refuted BY MEASUREMENT and must not be reintroduced:
+# /proc/<pid>/environ (a /clear resets the session inside a still-running
+# process — the cleared managers' pids predated the clears by ~28h), pane
+# idleness (cleared and working-between-turns panes both measure idle), and
+# already_recycled's scrollback banner rule (returned False on all three live
+# cleared panes). The suite's zero-capture-pane invariant enforces the last one
+# structurally rather than one negative control per bad idea.
+_sable_stamp_boot_epoch() {
+    # A COMPACTION IS NOT A RESTART. Riding the additionalContext emit below
+    # would also fire this on PreCompact, so every /compact would read as a
+    # clear and Lincoln would re-kick healthy managers in a loop. Stamp on an
+    # EXPLICIT SessionStart only.
+    if [ "$HOOK_EVENT" != "SessionStart" ]; then
+        # Fail-closed on an unidentifiable event — but loudly. Silently not
+        # stamping would leave the pane looking never-booted forever, which is
+        # the same false-green in the other direction. The fixed token is the
+        # signal that a provider is dispatching this hook without a
+        # hook_event_name payload and the epoch is therefore inert on it.
+        if [ "$HOOK_EVENT" = "__SABLE_EVENT_UNKNOWN__" ]; then
+            printf 'SABLE-BOOT-EPOCH-EVENT-UNKNOWN: hook payload carried no hook_event_name, so this invocation cannot be told apart from a PreCompact. No boot epoch stamped for %s. A compaction misread as a restart re-kicks a healthy manager in a loop, so this fails closed; if this fires on a real SessionStart, that provider is dispatching the hook with no stdin payload and the boot epoch is inert on it.\n' \
+                "$ROLE_NAME" >&2
+        fi
+        return 0
+    fi
+    # Not in a pane (a manager session outside tmux) is the ordinary case, not
+    # an error: there is nothing to stamp and nobody to read it.
+    [ -n "${TMUX_PANE:-}" ] || return 0
+    command -v tmux >/dev/null 2>&1 || return 0
+
+    local ts uniq
+    ts="$(date +%s 2>/dev/null || true)"
+    [ -n "$ts" ] || ts=0
+    # Second resolution alone is not enough: a restart can land in the same
+    # second as the boot it replaces, and an epoch that fails to CHANGE across
+    # a restart is exactly the signal this bead exists to provide.
+    uniq="$(od -An -tx1 -N6 /dev/urandom 2>/dev/null | tr -d ' \n' || true)"
+    [ -n "$uniq" ] || uniq="$(printf '%04x%04x%04x' "$((RANDOM))" "$((RANDOM))" "$(($$ & 0xffff))")"
+
+    # ORDER IS LOAD-BEARING: identity first, epoch last. The epoch is the
+    # commit point — a reader that sees a fresh epoch is guaranteed the agent
+    # tag beside it was already updated, so no consumer can pair a new epoch
+    # with the previous session's identity.
+    tmux set-option -p -t "$TMUX_PANE" @sable_boot_agent "$ROLE_NAME" 2>/dev/null || true
+    if ! tmux set-option -p -t "$TMUX_PANE" @sable_boot_epoch "${ts}-${uniq}" 2>/dev/null; then
+        # Never fail the session boot over instrumentation — but never swallow
+        # it either, since an unstamped pane reads as never-booted downstream.
+        printf 'SABLE-BOOT-EPOCH-STAMP-FAILED: could not write @sable_boot_epoch to pane %s for %s. That pane will read as never-booted to the restart check.\n' \
+            "$TMUX_PANE" "$ROLE_NAME" >&2
+    fi
+    return 0
+}
+_sable_stamp_boot_epoch
 
 # Resolve the role PROJECT-FIRST (a project-scoped orchestration install lives in
 # ./.claude) then fall back to the user-level install (~/.claude).
@@ -123,7 +260,16 @@ if [ -n "${_contracts_file:-}" ] && [ -s "$_contracts_file" ]; then
     LIVE_CONTRACTS="$(cat "$_contracts_file" 2>/dev/null || true)"
 fi
 
-ROLE_CONTENT="$ROLE_CONTENT" LIVE_MODE="$LIVE_MODE" LIVE_MODE_CORRUPT="$LIVE_MODE_CORRUPT" LIVE_CONTRACTS="$LIVE_CONTRACTS" python3 -c "
+# The injection's default for an unidentifiable event is the OPPOSITE of the
+# stamp's, and deliberately so. The stamp fails closed (an ambiguous event must
+# not be mistaken for a restart); the injection fails open to SessionStart,
+# which is the behavior that shipped before the epoch existed — an identity
+# that fails to anchor is a manager operating without its role card, a strictly
+# worse outcome than an additionalContext payload the provider ignores.
+INJECT_EVENT="$HOOK_EVENT"
+[ "$INJECT_EVENT" = "__SABLE_EVENT_UNKNOWN__" ] && INJECT_EVENT="SessionStart"
+
+ROLE_CONTENT="$ROLE_CONTENT" LIVE_MODE="$LIVE_MODE" LIVE_MODE_CORRUPT="$LIVE_MODE_CORRUPT" LIVE_CONTRACTS="$LIVE_CONTRACTS" INJECT_EVENT="$INJECT_EVENT" python3 -c "
 import json, os, sys
 content = os.environ.get('ROLE_CONTENT', '')
 name = os.environ.get('ROLE_NAME', '').upper()
@@ -131,14 +277,13 @@ live_mode = os.environ.get('LIVE_MODE', '').strip()
 live_mode_corrupt = os.environ.get('LIVE_MODE_CORRUPT', '') == '1'
 live_contracts = os.environ.get('LIVE_CONTRACTS', '').strip()
 
-# Detect which event fired us (SessionStart or PreCompact) so we emit the
-# correct hookEventName in hookSpecificOutput. Claude Code silently drops
+# Which event fired us (SessionStart or PreCompact), so we emit the correct
+# hookEventName in hookSpecificOutput — Claude Code silently drops
 # additionalContext payloads if the wrapper/event name is missing or wrong.
-try:
-    hook_input = json.load(sys.stdin)
-    event = hook_input.get('hook_event_name', 'SessionStart')
-except Exception:
-    event = 'SessionStart'
+# Resolved in BASH now (SABLE-slip0.1) rather than re-read from stdin here: the
+# boot-epoch stamp needs the same answer earlier in the script, and stdin is a
+# pipe that only the first reader gets.
+event = os.environ.get('INJECT_EVENT') or 'SessionStart'
 
 # SABLE-jiqm: PreCompact's hookSpecificOutput schema does not support
 # additionalContext (only UserPromptSubmit/PostToolUse/PostToolBatch/Stop do) —
