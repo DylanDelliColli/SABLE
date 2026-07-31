@@ -6,6 +6,8 @@ parts of this module through their callers.  This matching suite pins the
 library's own boundaries: pane-text classification, polling/delivery state
 transitions, tmux command construction, and fail-open pane metadata reads.
 """
+import base64
+import inspect
 import os
 import subprocess
 import sys
@@ -18,6 +20,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sable_pane_lib as lib  # noqa: E402
 
 
+def _real_capture(encoded: str) -> str:
+    """Decode a byte-exact cropped `tmux capture-pane -p -J -e` frame."""
+    return base64.b64decode(encoded).decode()
+
+
+# Captured 2026-07-31 from real Claude Code (opus) and Codex (gpt-5.6-sol)
+# TUIs on the private `sable-pane-state-fixtures` tmux socket. Cropping retains
+# the composer/status/footer rows the state predicates consume; base64 retains
+# SGR styling, non-breaking spaces, and trailing cells exactly.
+REAL_PANE_CAPTURES = {
+    "claude": {
+        "idle": _real_capture(
+            "ICDijr8gwqBJbnRlcnJydXB0ZWQgwrcgV2hhdCBzaG91bGQgQ2xhdWRlIGRvIGluc3RlYWQ/ICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBDdHJsK1kgdG8gcGFzdGUgZGVsZXRlZCB0ZXh0CuKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKIgArina/CoCAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIArilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICDimqAgVHJhbnNjcmlwdCB3cml0ZXMgYXJlIGZhaWxpbmcgKHJlYWQtb25seSBmaWxlc3lzdGVtIOKAlCBFUk9GUykgwrcgcmVjZW50IG1lc3Nh4oCmCiAgZGRjQEtXLUxQVC0wNTA6fi9kZXYtZW52aXJvbm1lbnQvd2stcGFuZS1zdGF0ZQogIOKPteKPtSBieXBhc3MgcGVybWlzc2lvbnMgb24gKHNoaWZ0K3RhYiB0byBjeWNsZSkgwrcg4oaQIGZvciBhZ2VudHMK"
+        ),
+        "held": _real_capture(
+            "ICDijr8gwqBJbnRlcnJydXB0ZWQgwrcgV2hhdCBzaG91bGQgQ2xhdWRlIGRvIGluc3RlYWQ/ICAgICAgICAgICAgIAoK4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACuKdr8KgZml4dHVyZSBoZWxkIHRleHQgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCuKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAogIOKaoCBUcmFuc2NyaXB0IHdyaXRlcyBhcmUgZmFpbGluZyAocmVhZC1vbmx5IGZpbGVzeXN0ZW0g4oCUIEVST0ZTKSDCtyByZWNlbnQgbWVzc2HigKYKICBkZGNAS1ctTFBULTA1MDp+L2Rldi1lbnZpcm9ubWVudC93ay1wYW5lLXN0YXRlCiAg4o+14o+1IGJ5cGFzcyBwZXJtaXNzaW9ucyBvbiAoc2hpZnQrdGFiIHRvIGN5Y2xlKSAgICAgICAgICAgICAgIAo="
+        ),
+        "midturn": _real_capture(
+            "ICAgICAgICAgICAgIArinKIgRmlkZGxlLWZhZGRsaW5n4oCmICg0cyDCtyB0aGlua2luZyB3aXRoIHhoaWdoIGVmZm9ydCkgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCuKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKIgArina/CoCAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIArilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICDimqAgVHJhbnNjcmlwdCB3cml0ZXMgYXJlIGZhaWxpbmcgKHJlYWQtb25seSBmaWxlc3lzdGVtIOKAlCBFUk9GUykgwrcgcmVjZW50IG1lc3Nh4oCmCiAgZGRjQEtXLUxQVC0wNTA6fi9kZXYtZW52aXJvbm1lbnQvd2stcGFuZS1zdGF0ZQogIOKPteKPtSBieXBhc3MgcGVybWlzc2lvbnMgb24gKHNoaWZ0K3RhYiB0byBjeWNsZSkgwrcg4oaQIGZvciBhZ2VudHMK"
+        ),
+    },
+    "codex": {
+        "idle": _real_capture(
+            "ChtbMG3ilqAgQ29udmVyc2F0aW9uIGludGVycnVwdGVkIC0gdGVsbCB0aGUgbW9kZWwgd2hhdCB0byBkbyBkaWZmZXJlbnRseS4gU29tZXRoaW5nCndlbnQgd3Jvbmc/IEhpdCBgL2ZlZWRiYWNrYCB0byByZXBvcnQgdGhlIGlzc3VlLgoKChtbMW3igLobWzBtIBtbMm1TdW1tYXJpemUgcmVjZW50IGNvbW1pdHMKChtbMG0gIGdwdC01LjYtc29sIGhpZ2ggwrcgfi9kZXYtZW52aXJvbm1lbnQvd2stcGFuZS1zdGF0ZSDCtyBuZXZlciDCtyBDb250ZXh0IDEyJSB1c2Vk4oCmCg=="
+        ),
+        "held": _real_capture(
+            "ChtbMG3ilqAgQ29udmVyc2F0aW9uIGludGVycnVwdGVkIC0gdGVsbCB0aGUgbW9kZWwgd2hhdCB0byBkbyBkaWZmZXJlbnRseS4gU29tZXRoaW5nCndlbnQgd3Jvbmc/IEhpdCBgL2ZlZWRiYWNrYCB0byByZXBvcnQgdGhlIGlzc3VlLgoKChtbMW3igLobWzBtIGZpeHR1cmUgaGVsZCB0ZXh0ICAgICAgIAoKICBncHQtNS42LXNvbCBoaWdoIMK3IH4vZGV2LWVudmlyb25tZW50L3drLXBhbmUtc3RhdGUgwrcgbmV2ZXIgwrcgQ29udGV4dCAxMiUgdXNlZOKApgo="
+        ),
+        "midturn": _real_capture(
+            "G1sxOzJt4oC6IBtbMG1FeHBsYWluIHBhbmUgc3RhdGUgZGV0ZWN0aW9uIHdpdGggc2V2ZXJhbCBleGFtcGxlcy4KCgrigKIgG1sybVdvcmtpbhtbMG1nIBtbMm0oM3Mg4oCiIGVzYyB0byBpbnRlcnJ1cHQpCgoKG1swOzFt4oC6G1swbSAbWzJtU3VtbWFyaXplIHJlY2VudCBjb21taXRzCgobWzBtICBncHQtNS42LXNvbCBoaWdoIMK3IH4vZGV2LWVudmlyb25tZW50L3drLXBhbmUtc3RhdGUgwrcgbmV2ZXIgwrcgQ29udGV4dCAxMiUgdXNlZOKApgo="
+        ),
+    },
+}
+
+REAL_CLAUDE_COMPLETED = _real_capture(
+    "4p2vIFJlcGx5IG9ubHkgT0suCgril48gT0sKCuKcuyBDaHVybmVkIGZvciAxcwogICAgICAgICAgICAgIArina8gRXhwbGFpbiBwYW5lIHN0YXRlIGRldGVjdGlvbiB3aXRoIHNldmVyYWwgZXhhbXBsZXMuCgogIFJlYWQgNSBmaWxlcwo="
+)
+
+
 def _proc(returncode=0, stdout="", stderr=""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
@@ -25,6 +66,80 @@ def _proc(returncode=0, stdout="", stderr=""):
 def test_prompt_glyphs_are_provider_specific_and_normalized():
     assert lib.prompt_glyphs("CLAUDE") == ("❯", ">")
     assert lib.prompt_glyphs("CoDeX") == ("›", ">")
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_uniform_pane_state_predicates_on_real_provider_frames(provider):
+    captures = REAL_PANE_CAPTURES[provider]
+
+    assert lib.composer_is_empty(captures["idle"], provider)
+    assert lib.pane_idle(captures["idle"], provider)
+    assert not lib.pane_working(captures["idle"], provider)
+
+    assert not lib.composer_is_empty(captures["held"], provider)
+    assert not lib.pane_idle(captures["held"], provider)
+    assert not lib.pane_working(captures["held"], provider)
+
+    assert lib.composer_is_empty(captures["midturn"], provider)
+    assert not lib.pane_idle(captures["midturn"], provider)
+    assert lib.pane_working(captures["midturn"], provider)
+
+
+def test_public_pane_state_predicates_share_one_interface():
+    assert lib.composer_is_empty.__module__ == "sable_pane_lib"
+    for name in (
+        "pane_idle",
+        "pane_working",
+        "deliberate_hold",
+        "composer_is_empty",
+    ):
+        predicate = getattr(lib, name)
+        assert list(inspect.signature(predicate).parameters) == [
+            "capture",
+            "provider",
+        ]
+
+
+def test_stray_prompt_line_cannot_hide_real_codex_held_text():
+    poisoned = ">\n" + REAL_PANE_CAPTURES["codex"]["held"]
+
+    assert not lib.composer_is_empty(poisoned, "codex")
+    assert not lib.pane_idle(poisoned, "codex")
+
+
+def test_completed_claude_turn_is_not_still_working():
+    assert "✻ Churned for 1s" in REAL_CLAUDE_COMPLETED
+    assert not lib.pane_working(REAL_CLAUDE_COMPLETED, "claude")
+
+
+def test_completed_claude_turn_does_not_block_busy_leg_rescue_enter():
+    snippet = "parked dispatch"
+    parked = REAL_CLAUDE_COMPLETED + f"\n────\n❯ {snippet}\n────\n"
+    submitted = REAL_CLAUDE_COMPLETED + f"\n❯ {snippet}\n● accepted\n❯ \n"
+    captures = iter([
+        REAL_PANE_CAPTURES["claude"]["midturn"],
+        parked,
+        submitted,
+    ])
+    commands = []
+
+    assert lib.deliver_text(
+        ["tmux"],
+        "%8",
+        snippet,
+        snippet,
+        tries=1,
+        interval=0,
+        run=lambda cmd: commands.append(cmd) or True,
+        capture=lambda: next(captures),
+        sleep=lambda _interval: None,
+        provider="claude",
+    )
+    assert commands == [
+        ["tmux", "send-keys", "-t", "%8", "-l", snippet],
+        ["tmux", "send-keys", "-t", "%8", "Enter"],
+        ["tmux", "send-keys", "-t", "%8", "Enter"],
+    ]
 
 
 def test_pane_state_distinguishes_ready_busy_idle_and_working():
