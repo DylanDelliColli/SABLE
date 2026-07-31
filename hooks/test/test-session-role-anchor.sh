@@ -222,6 +222,16 @@ fi
 # SABLE_TEST_TMUX_FAIL makes the shim refuse the write, so the suite can drive
 # the hook's stamp-failure branch (a real tmux has no convenient way to fail a
 # set-option on demand).
+#
+# SABLE_TEST_TMUX_FAIL_FIRST names a marker file and refuses only the FIRST call
+# of a run, then succeeds. A whole-run switch cannot reach the one failure mode
+# that matters here (SABLE-rvbg0): the AGENT-TAG write failing while the epoch
+# write would still have succeeded. That is the shape in which a suppressed
+# failure publishes a fresh epoch beside a stale identity.
+if [ -n "${SABLE_TEST_TMUX_FAIL_FIRST:-}" ] && [ ! -e "$SABLE_TEST_TMUX_FAIL_FIRST" ]; then
+  : > "$SABLE_TEST_TMUX_FAIL_FIRST"
+  exit 1
+fi
 [ -n "${SABLE_TEST_TMUX_FAIL:-}" ] && exit 1
 exit 0
 EPOCH_TMUX_SHIM
@@ -346,6 +356,49 @@ rc=$?
 if [ "$rc" -eq 0 ]; then pass "slip0.1: a failed stamp does not fail the hook (boot survives instrumentation)"; else fail "slip0.1: a failed stamp does not fail the hook (boot survives instrumentation)" "exit=$rc"; fi
 if printf '%s' "$out" | grep -q 'EPOCH_CHUCK_ROLE_MARKER'; then pass "slip0.1: a failed stamp still injects identity"; else fail "slip0.1: a failed stamp still injects identity" "got: ${out:0:200}"; fi
 if grep -q 'SABLE-BOOT-EPOCH-STAMP-FAILED' "$EPOCH_ERR"; then pass "slip0.1: a failed stamp is LOUD (fixed token on stderr)"; else fail "slip0.1: a failed stamp is LOUD (fixed token on stderr)" "stderr: $(cat "$EPOCH_ERR")"; fi
+
+# ---------- SABLE-rvbg0: the agent tag is a TRANSACTIONAL PREREQUISITE ----------
+# Writing the identity first only makes the pair same-generation if a published
+# epoch IMPLIES the tag beside it was published too. Suppressing the agent-tag
+# failure and continuing broke exactly that implication: the tag write could
+# fail, be swallowed, and a fresh epoch still publish — pairing a NEW epoch with
+# the PREVIOUS session's identity, which is the one outcome the ordering existed
+# to make impossible. A whole-run tmux failure can never catch this, because it
+# fails both writes and the epoch is absent for the wrong reason; the failure has
+# to be first-write-ONLY, so the epoch write would have succeeded had it been
+# attempted. On that failure the contract is: attempt no epoch, say so loudly,
+# and let the boot proceed anyway.
+EPOCH_N=$((EPOCH_N+1)); EPOCH_LOG="$EPOCH_SHIM/calls.$EPOCH_N.log"; : > "$EPOCH_LOG"
+EPOCH_ERR="$EPOCH_SHIM/err.$EPOCH_N.log"; : > "$EPOCH_ERR"
+FAIL_FIRST_MARK="$EPOCH_SHIM/fail-first.$EPOCH_N"
+rm -f "$FAIL_FIRST_MARK"
+out="$(cd "$EPOCH_HOME" && printf '%s' "$SS" | env PATH="$EPOCH_SHIM:$PATH" \
+    SABLE_TEST_TMUX_LOG="$EPOCH_LOG" SABLE_TEST_TMUX_ALL_LOG="$EPOCH_ALL_LOG" \
+    SABLE_TEST_TMUX_FAIL_FIRST="$FAIL_FIRST_MARK" \
+    TMUX_PANE="%99" HOME="$EPOCH_HOME" \
+    SABLE_AGENT_NAME=chuck SABLE_AGENT_ROLE=manager bash "$HOOK" 2>"$EPOCH_ERR")"
+rc=$?
+# PRECONDITION: the shim refused the AGENT-TAG write specifically. Without this
+# the arm could pass vacuously against a hook that made no tmux calls at all.
+if head -1 "$EPOCH_LOG" 2>/dev/null | grep -qF '	@sable_boot_agent	'; then pass "rvbg0: PRECONDITION — the refused first call IS the agent-tag write"; else fail "rvbg0: PRECONDITION — the refused first call IS the agent-tag write" "calls: $(cat "$EPOCH_LOG")"; fi
+if [ -z "$(epoch_opt @sable_boot_epoch)" ]; then pass "rvbg0: a failed agent tag publishes NO epoch"; else fail "rvbg0: a failed agent tag publishes NO epoch" "got: $(epoch_opt @sable_boot_epoch)"; fi
+# Not merely unpublished — never ATTEMPTED. A second set-option here would mean
+# the epoch's absence depended on tmux refusing it, not on the hook's own gate.
+if ! grep -qF '	@sable_boot_epoch	' "$EPOCH_LOG"; then pass "rvbg0: the epoch write is not even ATTEMPTED after the agent tag fails"; else fail "rvbg0: the epoch write is not even ATTEMPTED after the agent tag fails" "calls: $(cat "$EPOCH_LOG")"; fi
+if [ "$(wc -l < "$EPOCH_LOG")" -eq 1 ]; then pass "rvbg0: exactly one tmux call — the stamp stops at the failed prerequisite"; else fail "rvbg0: exactly one tmux call — the stamp stops at the failed prerequisite" "calls: $(cat "$EPOCH_LOG")"; fi
+if grep -q 'SABLE-BOOT-EPOCH-STAMP-FAILED' "$EPOCH_ERR"; then pass "rvbg0: a failed agent tag is LOUD (same fixed token)"; else fail "rvbg0: a failed agent tag is LOUD (same fixed token)" "stderr: $(cat "$EPOCH_ERR")"; fi
+if [ "$rc" -eq 0 ]; then pass "rvbg0: a failed agent tag does not fail the hook"; else fail "rvbg0: a failed agent tag does not fail the hook" "exit=$rc"; fi
+if printf '%s' "$out" | grep -q 'EPOCH_CHUCK_ROLE_MARKER'; then pass "rvbg0: a failed agent tag still injects identity (boot proceeds)"; else fail "rvbg0: a failed agent tag still injects identity (boot proceeds)" "got: ${out:0:200}"; fi
+# NEGATIVE CONTROL for the shim itself: the marker is consumed by the first call,
+# so a SECOND run under the same env stamps normally. This proves the arm above
+# measured a first-write refusal and not a permanently broken tmux.
+EPOCH_N=$((EPOCH_N+1)); EPOCH_LOG="$EPOCH_SHIM/calls.$EPOCH_N.log"; : > "$EPOCH_LOG"
+( cd "$EPOCH_HOME" && printf '%s' "$SS" | env PATH="$EPOCH_SHIM:$PATH" \
+    SABLE_TEST_TMUX_LOG="$EPOCH_LOG" SABLE_TEST_TMUX_ALL_LOG="$EPOCH_ALL_LOG" \
+    SABLE_TEST_TMUX_FAIL_FIRST="$FAIL_FIRST_MARK" \
+    TMUX_PANE="%99" HOME="$EPOCH_HOME" \
+    SABLE_AGENT_NAME=chuck SABLE_AGENT_ROLE=manager bash "$HOOK" >/dev/null 2>&1 )
+if [ -n "$(epoch_opt @sable_boot_epoch)" ]; then pass "rvbg0: NEGATIVE CONTROL — with the agent tag succeeding, the epoch publishes"; else fail "rvbg0: NEGATIVE CONTROL — with the agent tag succeeding, the epoch publishes" "calls: $(cat "$EPOCH_LOG")"; fi
 
 # ---------- gates that precede the stamp ----------
 epoch_run "$SS" SABLE_WORKER_PANE=1 SABLE_AGENT_NAME=chuck SABLE_AGENT_ROLE=manager

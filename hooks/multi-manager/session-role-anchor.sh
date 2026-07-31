@@ -18,7 +18,10 @@
 #                       compaction. A consumer that sees a different value than
 #                       it last observed knows the session restarted.
 #   @sable_boot_agent   the resolved agent name (SABLE_AGENT_NAME-first, D13),
-#                       written BEFORE the epoch so the epoch commits the pair.
+#                       written BEFORE the epoch AND a hard prerequisite for it
+#                       (SABLE-rvbg0): if this write fails, no epoch is
+#                       attempted, so a published epoch always commits a
+#                       same-generation pair rather than merely following one.
 #
 # ABSENCE OF THE EPOCH IS NOT "WORKING" AND NOT "CLEARED" — it is UNKNOWN, and
 # consumers must render it that way. A pane predating this change, a manager
@@ -151,14 +154,32 @@ _sable_stamp_boot_epoch() {
     uniq="$(od -An -tx1 -N6 /dev/urandom 2>/dev/null | tr -d ' \n' || true)"
     [ -n "$uniq" ] || uniq="$(printf '%04x%04x%04x' "$((RANDOM))" "$((RANDOM))" "$(($$ & 0xffff))")"
 
-    # ORDER IS LOAD-BEARING: identity first, epoch last. The epoch is the
-    # commit point — a reader that sees a fresh epoch is guaranteed the agent
-    # tag beside it was already updated, so no consumer can pair a new epoch
-    # with the previous session's identity.
-    tmux set-option -p -t "$TMUX_PANE" @sable_boot_agent "$ROLE_NAME" 2>/dev/null || true
+    # ORDER IS LOAD-BEARING, AND THE FIRST WRITE IS A TRANSACTIONAL PREREQUISITE
+    # (SABLE-rvbg0). Identity first, epoch last, and the epoch is attempted ONLY
+    # if the identity write actually landed. Writing them in that order is not by
+    # itself enough — this line used to end in `|| true`, which suppressed an
+    # agent-tag failure and let a fresh epoch publish beside the PREVIOUS
+    # session's name. That is precisely the mispairing the ordering exists to
+    # prevent, so the ordering claim was false in exactly the case it was making
+    # a promise about. The epoch is the commit point BECAUSE it is unreachable
+    # when the tag write fails: a reader that sees a fresh epoch is thereby
+    # guaranteed a same-generation agent tag beside it.
+    if ! tmux set-option -p -t "$TMUX_PANE" @sable_boot_agent "$ROLE_NAME" 2>/dev/null; then
+        # Loud, no epoch, exit zero. An unstamped pane reads as never-booted
+        # downstream, which is a bad outcome — but a fresh epoch carrying a
+        # stale identity is a WORSE one, because it reads as authoritative.
+        printf 'SABLE-BOOT-EPOCH-STAMP-FAILED: could not write @sable_boot_agent to pane %s for %s. No epoch was stamped either — publishing one without its agent tag would pair a fresh epoch with a stale identity. That pane will read as never-booted to the restart check.\n' \
+            "$TMUX_PANE" "$ROLE_NAME" >&2
+        return 0
+    fi
     if ! tmux set-option -p -t "$TMUX_PANE" @sable_boot_epoch "${ts}-${uniq}" 2>/dev/null; then
         # Never fail the session boot over instrumentation — but never swallow
         # it either, since an unstamped pane reads as never-booted downstream.
+        # Residual, deliberately not "repaired" here: the pane keeps whatever
+        # epoch the PREVIOUS boot left, now beside this boot's agent tag. The
+        # tag is not rolled back, because a rollback write can fail for the same
+        # reason this one did and would only add a third state. The fixed token
+        # on stderr is the contract for this case.
         printf 'SABLE-BOOT-EPOCH-STAMP-FAILED: could not write @sable_boot_epoch to pane %s for %s. That pane will read as never-booted to the restart check.\n' \
             "$TMUX_PANE" "$ROLE_NAME" >&2
     fi
