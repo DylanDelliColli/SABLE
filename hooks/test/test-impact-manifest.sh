@@ -82,6 +82,14 @@ s = replace_block(s, "declare -A EXCLUDE=(", [f'  [{k}]="{v}"' for k, v in exclu
 covers = json.loads(covers_json)
 s = replace_block(s, "declare -A COVERS=(", [f'  [{k}]="{v}"' for k, v in covers.items()])
 
+# SABLE-y4nom.7.1: blank the production classification tables — their keys
+# name real-repo paths that do not exist in these minimal fixture universes,
+# and the table-key hygiene guard (rows must point at present paths) would
+# otherwise fail every happy-path --check here.
+s = replace_block(s, "declare -A ZERO_IMPACT=(", [])
+s = replace_block(s, "declare -A DECLARED_BROAD=(", [])
+s = replace_block(s, "PY_OWNED=(", [])
+
 fanout = json.loads(fanout_json)
 s = replace_block(s, "declare -A LIB_FANOUT=(", [f'  [{k}]="{v}"' for k, v in fanout.items()])
 
@@ -236,7 +244,9 @@ fi
 # Case (d): a production Python module with its convention-mandated pytest
 # companion is owned by the Python selector. With no explicit COVERS entry it
 # selects zero shell suites rather than the full ALLOW set. Removing the
-# companion restores the conservative full-shell fallback.
+# companion makes the module an EXISTING unclassified path, which is a loud
+# UNKNOWN error naming its remediation (SABLE-y4nom.7.1 — the old
+# conservative full-shell fallback is retired).
 # ---------------------------------------------------------------------------
 FIX_D="$(new_fixture case-d)"
 mkdir -p "$FIX_D/bin"
@@ -253,13 +263,18 @@ else
   fail "(d) bin/X.py with bin/test_X.py and no shell COVERS -> scoped zero shell suites" "rc=$RC_D1 out=$OUT_D1 err=$ERR_D1"
 fi
 
+# REVISED under SABLE-y4nom.7.1: the claim — losing the companion is LOUD,
+# never silently scoped — is preserved and strengthened. An existing path
+# with no classification is now an UNKNOWN error naming itself and the
+# remediation menu (nonzero, empty stdout), not a full-set escalation.
 rm -f "$FIX_D/bin/test_widget.py"
 OUT_D2=$(bash "$FIX_D/.github/ci/impact-manifest.sh" --select bin/widget.py 2>"$FIX_D/stderr"); RC_D2=$?
 ERR_D2=$(cat "$FIX_D/stderr")
-if [ "$RC_D2" -eq 0 ] && [ "$OUT_D2" = "test-fixture-d.sh" ] && printf '%s' "$ERR_D2" | grep -q 'FULL'; then
-  pass "(d) removing the Python companion restores the conservative full-shell fallback"
+if [ "$RC_D2" -ne 0 ] && [ -z "$OUT_D2" ] \
+   && printf '%s' "$ERR_D2" | grep -q 'UNKNOWN -- unclassified path: bin/widget.py'; then
+  pass "(d, y4nom.7.1-revised) removing the Python companion is a loud UNKNOWN error, never silently scoped"
 else
-  fail "(d) removing the Python companion restores the conservative full-shell fallback" "rc=$RC_D2 out=$OUT_D2 err=$ERR_D2"
+  fail "(d, y4nom.7.1-revised) removing the Python companion is a loud UNKNOWN error, never silently scoped" "rc=$RC_D2 out=$OUT_D2 err=$ERR_D2"
 fi
 
 printf '#!/usr/bin/env python3\nVALUE = 1\n' > "$FIX_D/bin/sable-widget"
@@ -294,11 +309,15 @@ mk_suite "$FIX_E/hooks/test/test-install-golden-manifest.sh"
 
 E_GOLDEN="$FIX_E/hooks/test/fixtures/install-golden-manifest.txt"
 E_HASH="1111111111111111111111111111111111111111111111111111111111111111"
-# A pinned verbatim artifact, plus a GOLDEN_DERIVED entry (./CLAUDE.md is a
-# merge result, not a copy) that must NOT become a pinned source.
+# A pinned verbatim artifact, plus a GOLDEN_DERIVED entry
+# (./.sable-install-provenance is written per-install, not copied) that must
+# NOT become a pinned source. y4nom.7.1 note: the derived probe deliberately
+# avoids CLAUDE.md — the production ZERO_IMPACT table (inherited by this
+# fixture copy) classifies CLAUDE.md, which would mask the derived-entry
+# outcome under the new class semantics.
 {
   printf '%s  ./hooks/multi-manager/hook-e.sh\n' "$E_HASH"
-  printf '%s  ./CLAUDE.md\n' "$E_HASH"
+  printf '%s  ./.sable-install-provenance\n' "$E_HASH"
 } > "$E_GOLDEN"
 
 set_manifest "$FIX_E" "test-fixture-e.sh,test-install-golden-manifest.sh" '{}' \
@@ -316,19 +335,21 @@ fi
 # A GOLDEN_DERIVED entry is excused from the hash check, so it must not be
 # published as a pinned source either — otherwise the two halves of the lib
 # would disagree about what the manifest covers.
-E_DERIVED_SEL=$(bash "$FIX_E/.github/ci/impact-manifest.sh" --select CLAUDE.md 2>/dev/null | sort)
-if ! printf '%s\n' "$E_DERIVED_SEL" | grep -qx 'test-fixture-e.sh' \
-   || ! printf '%s\n' "$E_DERIVED_SEL" | grep -qx 'test-install-golden-manifest.sh'; then
-  fail "(e) a GOLDEN_DERIVED golden entry is not a pinned source — it stays unmapped, not silently golden-covered" "got: $E_DERIVED_SEL"
+# REVISED under SABLE-y4nom.7.1: "not silently golden-covered" now lands in
+# the UNKNOWN-error branch — an existing path with no classification (and
+# deliberately NO golden pin) demands its class loudly, which is a stronger
+# form of the same claim than the old full-set escalation. The path is
+# created so the case exercises the existing-unknown branch, not the
+# deletion class.
+echo derived-fixture > "$FIX_E/.sable-install-provenance"
+E_DERIVED_OUT=$(bash "$FIX_E/.github/ci/impact-manifest.sh" --select .sable-install-provenance 2>"$FIX_E/stderr"); E_DERIVED_RC=$?
+E_DERIVED_NOTICE=$(cat "$FIX_E/stderr")
+if [ "$E_DERIVED_RC" -ne 0 ] && [ -z "$E_DERIVED_OUT" ] \
+   && printf '%s' "$E_DERIVED_NOTICE" | grep -q 'UNKNOWN -- unclassified path: .sable-install-provenance'; then
+  pass "(e, y4nom.7.1-revised) a GOLDEN_DERIVED golden entry is not a pinned source — it errors as unclassified, never silently golden-covered"
 else
-  # Unmapped => the full ALLOW set, which here happens to contain both suites.
-  E_DERIVED_NOTICE=$(bash "$FIX_E/.github/ci/impact-manifest.sh" --select CLAUDE.md 2>&1 1>/dev/null)
-  if printf '%s' "$E_DERIVED_NOTICE" | grep -q 'FULL -- unmapped path(s): CLAUDE.md'; then
-    pass "(e) a GOLDEN_DERIVED golden entry is not a pinned source — it stays unmapped, not silently golden-covered"
-  else
-    fail "(e) a GOLDEN_DERIVED golden entry is not a pinned source — it stays unmapped, not silently golden-covered" \
-         "notice: $E_DERIVED_NOTICE"
-  fi
+  fail "(e, y4nom.7.1-revised) a GOLDEN_DERIVED golden entry is not a pinned source — it errors as unclassified, never silently golden-covered" \
+       "rc=$E_DERIVED_RC out=[$E_DERIVED_OUT] notice: $E_DERIVED_NOTICE"
 fi
 
 # NEGATIVE CONTROL: drop the artifact's line from the golden. The same path must

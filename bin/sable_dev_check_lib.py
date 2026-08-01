@@ -271,15 +271,26 @@ def _git_lines(repo_root: Path, args: Sequence[str]) -> set[str]:
 
 
 def collect_changed_paths(repo_root: Path, base_ref: str | None) -> tuple[str, ...]:
-    """Union committed range changes, worktree changes, and untracked files."""
+    """Union committed range changes, worktree changes, and untracked files.
+
+    ``--no-renames`` (SABLE-y4nom.7.1 B1): with rename detection active,
+    ``--name-only`` emits ONLY the rename destination — proven on a real
+    R099 history probe even under ``--diff-filter=ACMRD`` — so the deleted
+    source path never reached the selector and a rename could never trigger
+    the DELETED class. Disabling detection decomposes a rename into A(dst)
+    + D(src), so BOTH sides are planned: the destination classifies as
+    itself, the vanished source takes the deletion path.
+    """
     changed: set[str] = set()
     if base_ref:
         changed.update(_git_lines(
             repo_root,
-            ["diff", "--name-only", "--diff-filter=ACMRD", f"{base_ref}...HEAD"],
+            ["diff", "--name-only", "--no-renames",
+             "--diff-filter=ACMRD", f"{base_ref}...HEAD"],
         ))
     changed.update(_git_lines(
-        repo_root, ["diff", "--name-only", "--diff-filter=ACMRD", "HEAD"],
+        repo_root,
+        ["diff", "--name-only", "--no-renames", "--diff-filter=ACMRD", "HEAD"],
     ))
     changed.update(_git_lines(
         repo_root, ["ls-files", "--others", "--exclude-standard"],
@@ -296,10 +307,12 @@ def select_shell_selection(
     """Delegate shell-suite selection and its mode to the impact manifest.
 
     FULL versus SCOPED is load-bearing budget input, not decorative logging:
-    an unmapped path intentionally selects the complete authoritative shell
-    set, which cannot inherit the fast scoped budget. If an older or broken
-    selector omits its mode line, fail closed to FULL for budget purposes
-    while preserving the missing-mode fact in the rendered plan.
+    a DELETED or DECLARED_BROAD path selects the complete authoritative
+    shell set, which cannot inherit the fast scoped budget. An UNCLASSIFIED
+    path is a selector ERROR (nonzero exit -> raise below), and a zero-exit
+    selection with no recognized classification notice raises too
+    (SABLE-y4nom.7.1 R5) — the old fail-closed-to-FULL swallow could green
+    an empty plan under a full-budget label.
     """
     changed = tuple(sorted({_normalise_path(path) for path in changed_paths}))
     if not changed:
@@ -333,10 +346,16 @@ def select_shell_selection(
         flags=re.IGNORECASE,
     )
     if not matches:
-        return ShellSelection(
-            "full",
-            suites,
-            "selector omitted its FULL/SCOPED reason; using full-budget fallback",
+        # SABLE-y4nom.7.1 (R5): a zero-exit selection with NO classification
+        # notice used to be silently accepted as a "full-budget fallback"
+        # while preserving whatever stdout said — possibly ZERO suites — so
+        # a notice-less selector could green an empty plan under a full
+        # budget label. An unclassifiable selection is a loud plan error,
+        # exactly like a nonzero selector exit.
+        raise DeveloperCheckError(
+            "shell impact selection returned no FULL/SCOPED classification "
+            "notice; refusing to plan from an unclassified selection "
+            f"(stdout suites: {len(suites)})"
         )
     mode, reason = matches[-1]
     return ShellSelection(mode.lower(), suites, reason.strip())

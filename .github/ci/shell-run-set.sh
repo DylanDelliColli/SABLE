@@ -201,6 +201,68 @@ declare -A EXCLUDE=(
   [test-seat-sighting.sh]="real-bd-only by construction — its whole claim is that a seat-filed bead's auto-label/provisional-priority annotation and live ready-pool presence are read back from a real bd store; prints 'SKIP: bd not on PATH' and exits 0 in the clean room [permanent: SABLE-59zu]"
 )
 
+# --- SABLE-y4nom.7.1 classification tables --------------------------------
+# Every governed tracked path carries exactly one class; an unknown tracked
+# path is a GATE ERROR naming its remediation (impact-manifest.sh). ZERO_IMPACT
+# and DECLARED_BROAD carry their reasons inline; PY_OWNED lists python-lane-
+# owned files whose test naming defeats the convention probes. Golden-pinned
+# selection (SABLE-slip0.7) and the install-surface families are RULES in
+# impact-manifest.sh — never duplicated here.
+declare -A ZERO_IMPACT=(
+  [.beads/.gitignore]="bd-managed store config; maintained by bd tooling, no repo suite consumes it"
+  [.beads/README.md]="bd-managed store doc"
+  [.claude/sable/state/merge-gate/README.md]="state-dir doc"
+  [.github/ci/test-requirements.txt]="python lane owns it: test_clean_room_dep_parity selects on change"
+  [.github/workflows/green-snapshot.yml]="workflow definition; no local suite executes workflows, CI validates itself"
+  [AGENTS.md]="symlink to CLAUDE.md; doc-sync is bd preflight's check"
+  [AGENT-TEAMS-DESIGN.md]="design doc, no lint-suite consumer (fixed lists verified 2026-08-01)"
+  [CLAUDE.md]="agent instructions; all suite hits are comment/fixture prose (audited 2026-08-01)"
+  [HERDR-EVALUATION.md]="evaluation doc, no consumer"
+  [PLANNING-MODES-DESIGN.md]="design doc, no consumer (lint lists are fixed)"
+  [install.ps1]="Windows installer; EXCLUDE'd install suites cover install.sh only"
+  [sable-potential-improvements.md]="research log, no consumer"
+  [docs/HOOK-FIRING-CLASSIFICATION.md]="audit doc"
+  [docs/MERGE-LATENCY-BASELINE.md]="measurement record"
+  [docs/TEST-CONTENTION-AUDIT.md]="measurement record"
+  [docs/TEST-COST-AUDIT.md]="measurement record"
+  [docs/TEST-SUITE-AUDIT-PLAYBOOK.md]="playbook doc"
+  [feedback/.gitkeep]="placeholder"
+  [hooks/multi-manager/upgrade-notes.md]="doc; mm-glob rule covers only *.sh"
+  [templates/ci-verify-project.yml]="python test_sable_ci_template owns it"
+  [templates/columbo-bead.md]="bead template, no suite consumer"
+  [templates/multi-manager/commands/inbox.md]="command doc, no suite consumer"
+)
+
+declare -A DECLARED_BROAD=(
+  [.claude/settings.json]="checked-in Claude hook authority: wiring touches every gated surface"
+  [.beads/hooks/post-checkout]="repo core.hooksPath shim: intercepts the git lifecycle globally"
+  [.beads/hooks/post-merge]="repo core.hooksPath shim"
+  [.beads/hooks/pre-commit]="repo core.hooksPath shim"
+  [.beads/hooks/pre-push]="repo core.hooksPath shim"
+  [.beads/hooks/prepare-commit-msg]="repo core.hooksPath shim"
+  [.beads/config.yaml]="bd backend authority (codex-consider, 2026-08-01)"
+  [.beads/metadata.json]="bd backend authority (codex-consider)"
+)
+
+PY_OWNED=(
+  bin/sable-identifier-decay
+  bin/sable-merge-report
+  bin/sable_activation_debt_lib.py
+  bin/sable_charter_lib.py
+  bin/sable_ci_template.py
+  bin/sable_coverage_floor_lib.py
+  bin/sable_dossier_lib.py
+  bin/sable_identifier_decay_lib.py
+  bin/sable_merge_report_lib.py
+  bin/sable_quiescence_validity_lib.py
+  bin/sable_registry_lib.py
+  bin/sable_stack_detect.py
+  bin/sable_telemetry_bd_source.py
+  bin/sable_telemetry_gh_source.py
+  bin/sable_telemetry_git_source.py
+  bin/sable_telemetry_lib.py
+)
+
 # --- Shell impact manifest (SABLE-cmar4.2) --------------------------------
 # COVERS: suite name -> the production file(s) it most directly exercises
 # (space-separated repo-relative paths). A suite absent from this array
@@ -210,15 +272,15 @@ declare -A EXCLUDE=(
 # elsewhere — that recreates the duplicated-list problem cmar4.1 already
 # closed for tier membership.
 declare -A COVERS=(
-  [test-active-contracts-integration.sh]="hooks/multi-manager/session-role-anchor.sh"
+  [test-active-contracts-integration.sh]="hooks/multi-manager/session-role-anchor.sh bin/sable-mode bin/sable-contract hooks/test/lib-identity-isolation.sh"
   [test-ci-bd-coverage-gap.sh]=".github/ci/shell-run-set.sh hooks/test/test-dep-merge-state.sh hooks/test/test-overlap-dispatch-e2e.sh hooks/test/lib-require-all.sh"
-  [test-impact-manifest.sh]=".github/ci/impact-manifest.sh"
+  [test-impact-manifest.sh]=".github/ci/impact-manifest.sh .github/ci/shell-run-set.sh"
   # The fixture and the shared resolver only. The ~50 SOURCES the golden pins
   # are NOT listed here — impact-manifest.sh derives those from the golden
   # itself (SABLE-slip0.7), so regenerating the golden updates the selection
   # rule in the same edit instead of leaving a hand-copied list to rot.
   [test-install-golden-manifest.sh]="hooks/test/fixtures/install-golden-manifest.txt hooks/test/lib-golden-manifest.sh"
-  [test-impact-selection.sh]=".github/ci/impact-manifest.sh .github/ci/shell-run-set.sh"
+  [test-impact-selection.sh]=".github/ci/impact-manifest.sh .github/ci/shell-run-set.sh bin/sable-orchestration-install"
   [test-control-trace.sh]="hooks/multi-manager/control-trace.sh"
   [test-dep-merge-state.sh]="bin/sable-dep-check bin/sable-spawn-worker"
   [test-doctor-snapshot-staleness.sh]="bin/sable-doctor bin/sable-bin-install install.sh"
@@ -226,51 +288,85 @@ declare -A COVERS=(
   [test-impact-tier-serialization.sh]="bin/sable_gate_promote_lib.py"
   [test-landing-pair-gate.sh]="bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py bin/sable-merge-gate"
   [test-lib-hook-trace.sh]="hooks/multi-manager/lib-hook-trace.sh"
-  [test-lib-identity.sh]="hooks/multi-manager/lib-identity.sh"
+  [test-lib-identity.sh]="hooks/multi-manager/lib-identity.sh .github/ci/test-tiers.sh .sable bin/sable-mode"
   [test-lib-mode-path.sh]="hooks/multi-manager/lib-mode-path.sh"
   [test-lib-registry-path.sh]="hooks/multi-manager/lib-registry-path.sh"
-  [test-mode-interlock.sh]="hooks/multi-manager/mode-interlock.sh"
-  [test-mode-tier.sh]="hooks/multi-manager/mode-interlock.sh"
+  [test-mode-interlock.sh]="hooks/multi-manager/mode-interlock.sh bin/sable-mode templates/multi-manager/settings-snippet.json"
+  [test-mode-tier.sh]="hooks/multi-manager/mode-interlock.sh .github/ci/test-tiers.sh bin/sable-mode"
   [test-notes-clobber-guard.sh]="hooks/multi-manager/notes-clobber-guard.sh"
   [test-notes-clobber-guard-e2e.sh]="hooks/multi-manager/notes-clobber-guard.sh"
   [test-bd-inline-body-guard.sh]="hooks/multi-manager/inline-body-guard.sh bin/sable_inline_body_guard_lib.py templates/multi-manager/settings-snippet.json"
-  [test-orchestration-install.sh]="hooks/multi-manager/inbox-injection-precompact.sh hooks/multi-manager/inbox-injection.sh hooks/multi-manager/mode-interlock.sh hooks/multi-manager/read-guard.sh hooks/multi-manager/session-role-anchor.sh"
-  [test-optimistic-promotion.sh]="bin/sable-merge-gate bin/sable_footprint_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_preview_lib.py bin/sable_gate_classify_lib.py bin/sable_gate_git_lib.py"
+  [test-orchestration-install.sh]="bin/sable-orchestration-install hooks/multi-manager/inbox-injection-precompact.sh hooks/multi-manager/inbox-injection.sh hooks/multi-manager/mode-interlock.sh hooks/multi-manager/read-guard.sh hooks/multi-manager/session-role-anchor.sh templates/base-settings-snippet.json templates/multi-manager/settings-snippet.json"
+  [test-project-clone-portability.sh]="bin/sable-orchestration-install"
+  [test-optimistic-promotion.sh]="bin/sable-merge-gate bin/sable_footprint_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_preview_lib.py bin/sable_gate_classify_lib.py bin/sable_gate_git_lib.py .github/ci/test-tiers.sh"
   [test-overlap-constraint.sh]="hooks/multi-manager/pre-dispatch-overlap.sh"
   [test-overlap-dispatch-e2e.sh]="hooks/multi-manager/pre-dispatch-overlap.sh"
-  [test-parallel-previews.sh]="bin/sable-merge-gate bin/sable_gate_preview_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py bin/sable_gate_git_lib.py"
+  [test-parallel-previews.sh]="bin/sable-merge-gate bin/sable_gate_preview_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py bin/sable_gate_git_lib.py .github/workflows/ci-verify.yml"
   [test-post-push-merge-notify.sh]="hooks/multi-manager/post-push-merge-notify.sh"
   [test-pre-dispatch-claim.sh]="hooks/multi-manager/pre-dispatch-claim.sh bin/sable-dep-check"
-  [test-pre-dispatch-model-check.sh]="hooks/multi-manager/pre-dispatch-model-check.sh"
+  [test-pre-dispatch-model-check.sh]="hooks/multi-manager/pre-dispatch-model-check.sh templates/multi-manager/settings-snippet.json"
   [test-pre-dispatch-preempt.sh]="hooks/multi-manager/pre-dispatch-preempt.sh"
   [test-pre-dispatch-refresh.sh]="hooks/multi-manager/pre-dispatch-refresh.sh"
   [test-pre-push-rebase-concurrency.sh]="hooks/test/lib-pre-push-fixture-root.sh hooks/test/test-pre-push-rebase-test.sh"
-  [test-pre-push-rebase-test.sh]="hooks/multi-manager/pre-push-rebase-test.sh hooks/test/lib-pre-push-fixture-root.sh"
+  [test-pre-push-rebase-test.sh]="hooks/multi-manager/pre-push-rebase-test.sh hooks/test/lib-pre-push-fixture-root.sh .gitignore .sable"
   [test-preview-kick.sh]="hooks/multi-manager/post-push-merge-notify.sh"
   [test-provenance-guard.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
   [test-read-guard.sh]="hooks/multi-manager/read-guard.sh"
-  [test-registry.sh]="hooks/multi-manager/lib-registry-path.sh"
+  [test-registry.sh]="hooks/multi-manager/lib-registry-path.sh bin/sable-agents"
   [test-require-all.sh]="hooks/test/lib-require-all.sh"
   [test-role-card-install.sh]="bin/sable-orchestration-install templates/multi-manager/agents.yaml templates/multi-manager/roles/lincoln.md templates/multi-manager/roles/optimus.md templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/chuck.md"
   [test-sable-contained.sh]="bin/sable-contained"
-  [test-sable-mode.sh]="hooks/multi-manager/lib-mode-path.sh"
-  [test-sable-msg.sh]="bin/sable-msg bin/sable_pane_lib.py"
+  [test-sable-mode.sh]="hooks/multi-manager/lib-mode-path.sh bin/sable-mode"
+  [test-sable-msg.sh]="bin/sable-msg bin/sable_pane_lib.py hooks/test/lib-identity-isolation.sh"
   [test-sable-test.sh]="bin/sable-test"
-  [test-sable-worker-status.sh]="bin/sable-worker-status bin/sable_pane_lib.py"
+  [test-sable-worker-status.sh]="bin/sable-worker-status bin/sable_pane_lib.py hooks/test/lib-identity-isolation.sh"
   [test-seat-sighting.sh]="bin/sable-msg hooks/multi-manager/seat-sighting-gate.sh"
   [test-sealed-verification.sh]=".github/ci/run-sealed-verification.sh .github/ci/shell-run-set.sh"
   [test-shell-run-set-strict.sh]=".github/ci/shell-run-set.sh"
-  [test-session-role-anchor.sh]="hooks/multi-manager/session-role-anchor.sh"
-  [test-snapshot-freeze.sh]="bin/sable-snapshot bin/sable_snapshot_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py"
+  [test-session-role-anchor.sh]="hooks/multi-manager/session-role-anchor.sh .claude/sable/state/active-contracts.md hooks/test/lib-identity-isolation.sh"
+  [test-snapshot-freeze.sh]="bin/sable-snapshot bin/sable_snapshot_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py .github/ci/test-tiers.sh .gitignore"
   [test-tarzan-optimus-accept-contract.sh]="templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/optimus.md"
-  [test-tdd-evidence.sh]="hooks/tdd-evidence.sh"
+  [test-tdd-evidence.sh]="hooks/tdd-evidence.sh .github/ci/test-tiers.sh"
   [test-tdd-gate.sh]="hooks/tdd-gate.sh"
-  [test-tier-budget-bead.sh]="bin/sable_gate_budget_lib.py bin/sable_gate_promote_lib.py bin/sable-merge-gate"
+  [test-tier-budget-bead.sh]="bin/sable_gate_budget_lib.py bin/sable_gate_promote_lib.py bin/sable-merge-gate .github/ci/test-tiers.sh"
   [test-tier-red-capture.sh]="bin/sable_gate_promote_lib.py hooks/test/lib-require-all.sh"
-  [test-tier-ssot-consumers.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
+  [test-tier-ssot-consumers.sh]="hooks/multi-manager/pre-push-rebase-test.sh .github/ci/test-tiers.sh"
   [test-tmux-roles.sh]="templates/multi-manager/roles/lincoln.md templates/multi-manager/roles/optimus.md templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/chuck.md templates/multi-manager/agents.yaml"
-  [test-tree-claim.sh]="hooks/multi-manager/tree-claim.sh hooks/multi-manager/tree-claim-impl.sh"
+  [test-tree-claim.sh]="hooks/multi-manager/tree-claim.sh hooks/multi-manager/tree-claim-impl.sh bin/sable-claim templates/multi-manager/settings-snippet.json"
   [test-worktree-placement-guard.sh]="hooks/multi-manager/worktree-placement-guard.sh"
+  [test-agent-definitions.sh]="MULTI-MANAGER-PATTERN.md PERSONAL-TOOLING.md templates/agents/columbo.md templates/agents/rudy.md templates/agents/sherlock.md templates/agents/victor.md templates/multi-manager/roles/columbo.md templates/multi-manager/roles/rudy.md templates/multi-manager/roles/sherlock.md templates/multi-manager/roles/victor.md"
+  [test-bead-description-gate.sh]="hooks/bead-description-gate.sh"
+  [test-close-hold-guard.sh]="hooks/multi-manager/close-hold-guard.sh"
+  [test-columbo-quick-mode.sh]="skills/columbo/SKILL.md"
+  [test-concurrent-sessions.sh]="bin/sable-mode"
+  [test-coverage-floor-gate.sh]=".github/ci/diff-cover-gate.sh .github/ci/test-tiers.sh"
+  [test-full-ingestion.sh]="skills/sable-plan/SKILL.md"
+  [test-identity-hermeticity.sh]="hooks/test/lib-identity-isolation.sh"
+  [test-install-preserves-pins.sh]="bin/sable-launch templates/multi-manager/settings-snippet.json"
+  [test-lib-git-sandbox.sh]="hooks/test/lib-git-sandbox.sh"
+  [test-multi-manager-pattern.sh]="MULTI-MANAGER-PATTERN.md TMUX-AGENTS-DESIGN.md"
+  [test-no-cockpit-naming.sh]="ENTRY-POINTS-DESIGN.md MULTI-MANAGER-PATTERN.md PERSONAL-TOOLING.md QUICKSTART.md SABLE.md bin/sable-mode skills/sable-execute/SKILL.md skills/sable-plan/SKILL.md templates/agents/sherlock.md templates/multi-manager/roles/sherlock.md templates/multi-manager/settings-snippet.json"
+  [test-preview-already-verified.sh]=".github/ci/preview-already-verified.sh"
+  [test-quickstart-orchestration.sh]="MULTI-MANAGER-PATTERN.md QUICKSTART.md"
+  [test-sable-bin-install.sh]="bin/sable-note templates/global-CLAUDE-prime.md"
+  [test-sable-claim.sh]="bin/sable-claim"
+  [test-sable-clean-room-verify-integration.sh]="bin/sable-clean-room-verify"
+  [test-sable-clean-room-verify.sh]="bin/sable-clean-room-verify"
+  [test-sable-cli.sh]="QUICKSTART.md TMUX-AGENTS-DESIGN.md bin/sable bin/sable-mode"
+  [test-sable-contract.sh]=".claude/sable/state/active-contracts.md bin/sable-contract bin/sable-mode"
+  [test-sable-discover.sh]="skills/sable-discover/SKILL.md"
+  [test-sable-launch.sh]="bin/sable-launch"
+  [test-sable-onboarding-skill.sh]="skills/sable-onboarding/SKILL.md"
+  [test-sable-plan-tiers.sh]="skills/sable-plan/SKILL.md"
+  [test-sable-skills.sh]="bin/sable-mode skills/sable-execute/SKILL.md skills/sable-plan/SKILL.md"
+  [test-script-dir-symlink.sh]="bin/sable-note"
+  [test-sherlock-research.sh]="templates/multi-manager/roles/sherlock.md templates/sherlock-bead.md"
+  [test-staged-planning-docs.sh]="ENTRY-POINTS-DESIGN.md MULTI-MANAGER-PATTERN.md SABLE.md"
+  [test-stash-worktree-guard.sh]="hooks/multi-manager/stash-worktree-guard.sh"
+  [test-thesis-docs.sh]="MULTI-MANAGER-PATTERN.md README.md SABLE.md"
+  [test-tier-ssot.sh]=".github/ci/test-tiers.sh"
+  [test-worker-dispatch-template.sh]="templates/worker-dispatch.md"
+  [test-worker-flag-done.sh]="hooks/test/lib-identity-isolation.sh"
 )
 
 # --- Iron-rule real-bd suites (SABLE-jd5fj.16) ------------------------------
