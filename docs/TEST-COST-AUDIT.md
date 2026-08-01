@@ -300,3 +300,47 @@ found an accidental shared bd/Dolt lookup inside a tmux integration fixture,
 not a need for broad admission. The isolated fix and repeated 15-worker
 evidence are recorded in
 [TEST-CONTENTION-AUDIT.md](TEST-CONTENTION-AUDIT.md).
+
+## Local xdist broad-seat audit (`SABLE-y4nom.7.4`)
+
+This experiment is deliberately separate from `sable-test-contention`. That
+tool forbids the sealed full suite and keeps doing so. The xdist ladder holds
+VE.2's existing git-common-dir publisher lock for one repo-wide broad-seat
+lease, uses only fixed widths (`serial`, `-n 2`, and `-n 4`) with
+`--dist=loadscope`, and changes no normal validation command.
+
+The pre-ladder audit examined the shared-resource families called out by
+`SABLE-poykv`, plus the resources added since that measurement:
+
+| Surface | Modules inspected | Parallel disposition |
+| --- | --- | --- |
+| Pytest session artifacts | `conftest.py`, `test_conftest.py` | Controller-owned after the planted xdist fix described below. |
+| Merge-gate lock/window state | `test_promote_decision.py`, `test_sable_gate_promote_lib_integration.py` | Real temp repos resolve per-repo state; synthetic-repo cases explicitly point lock/log paths at `tmp_path`. |
+| Snapshot/batch/telemetry state | `test_snapshot_classifier.py`, `test_sable_batch_coordinator_lib.py`, `test_sable_telemetry.py`, `test_sable_telemetry_integration.py` | Mutation uses `tmp_path` override seams; shipped repo state and the live beads store are read-only probes. |
+| Mode and manager state | `test_conftest_hermetic_env.py`, `test_sable_spawn_manager_integration.py`, `test_sable_spawn_worker_integration.py` | Autouse mode state is per-test. Tmux sockets and worker branch/worktree names are UUID-scoped. Spawn-worker deliberately mutates real repo refs and scratch beads, so repeated identity/tail evidence remains mandatory. |
+| Tmux integration | message/session/view/relink/pane/worker-status/stall/recycle integration modules | Every real server uses a unique `tmux -L` socket and teardown; fixed socket names appear only in unit strings/stubs. |
+| Git/coverage roots | `test_coverage_floor_integration.py`, `test_diff_cover_scope_integration.py`, `test_sable_recover_integration.py` | Real source root is read or locally cloned; mutable repos/worktrees are under pytest temp roots. |
+| Dolt/beads | `test_sable_dolt_push_integration.py`, `test_footprint_lib_integration.py`, identifier-decay and telemetry integration | Dolt config/remotes and ordinary bead mutation are per-test stores. Live-store operations are read-only except spawn-worker's uniquely named scratch beads. |
+| Install/doctor surfaces | activation-debt, orchestration-install, bin-install, doctor, onboard, and inline-body-guard integration modules | HOME, install prefixes, and destination trees are all redirected under `tmp_path`; source checkout files are read-only. |
+| Docker | `test_sable_docker_preflight_integration.py` | Container names are UUID-scoped, but the daemon and host cgroups are shared. Treat load/tail movement as a measured stop condition. |
+
+The reporter audit found a real precondition failure before any broad ladder
+run. A two-worker `loadscope` canary intentionally assigned two fully skipped
+modules to separate workers. Pytest's controller reported all 41 skips and the
+cost report held all 41 rows across both modules, but the persisted skip-set
+baseline held only the 11 rows from one worker. Each worker had run
+`pytest_sessionfinish` and written its partial set with a later start timestamp;
+the complete controller then correctly refused to overwrite that apparently
+newer result. A worker-shaped unit test first reproduced the partial cost write.
+`conftest.py` now returns from artifact publication on xdist workers, leaving
+the controller—the process that receives every remote test and collection
+report—as the sole writer. The repeated real canary produced 41/41 cost rows
+and 41/41 persisted skips across both modules. Serial behavior does not take
+that branch.
+
+`pytest-xdist` remains a local experiment dependency. It is not added to the
+clean-room requirements because this bead neither runs the experiment in CI
+nor enables xdist in an authoritative workflow. The dedicated sampler records
+collection and pass/fail/skip/xfail identity, per-test and per-module tails,
+wall time, timeout rate, child CPU time, and sampled host load. Its result table
+and GO/NO-GO decision are appended here after the bounded repeated ladder.
