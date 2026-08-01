@@ -156,11 +156,12 @@ def test_non_gate_class_fails_when_footprint_touches_the_gate_roster(repo, monke
     independently of whether THIS throwaway fixture repo happens to carry a
     real bin/sable-merge-gate."""
     base_sha = _sha(repo)
-    branch_sha = _branch(repo, base_sha, "gate", "ordinary.py", "x = 1\n")
-    _stub_bd(monkeypatch, {"SABLE-g1": _bead_record(writes="bin/sable_gate_promote_lib.py")})
+    gate_path = "bin/sable_gate_promote_lib.py"
+    branch_sha = _branch(repo, base_sha, "gate", gate_path, "x = 1\n")
+    _stub_bd(monkeypatch, {"SABLE-g1": _bead_record(writes="ordinary.py")})
     _stub_all_green(monkeypatch, {branch_sha: "cafef00d" * 5})
     monkeypatch.setattr(adm, "gate_class_roster",
-                        lambda repo_: frozenset({"bin/sable_gate_promote_lib.py"})
+                        lambda repo_: frozenset({gate_path})
                         | adm.GATE_TIER_FILES | {adm.DISPATCH_FILE})
 
     verdict = adm.is_this_branch_mechanical(str(repo), "origin", "SABLE-g1", "gate",
@@ -168,6 +169,57 @@ def test_non_gate_class_fails_when_footprint_touches_the_gate_roster(repo, monke
     assert verdict.mechanical is False
     assert verdict.clause("non_gate_class").passed is False
     assert "sable_gate_promote_lib.py" in verdict.clause("non_gate_class").reason
+
+
+def test_non_gate_class_uses_candidate_delta_not_stale_two_dot_diff(repo, monkeypatch):
+    """A stale four-file candidate must not inherit 229 files from the spine.
+
+    The shared footprint primitives deliberately remain two-tree/two-dot: they
+    see all 233 endpoint differences and therefore include a spine-only gate
+    file.  This clause asks a different question and must use the candidate's
+    merge-base-to-tip delta, which contains exactly its four ordinary files.
+    """
+    fork_sha = _sha(repo)
+    candidate_paths = {f"candidate-{number}.py" for number in range(4)}
+    _run(repo, "checkout", "-q", "-b", "stale-candidate", fork_sha)
+    for path in candidate_paths:
+        _write(repo, path, f"# {path}\n")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "-m", "four candidate files")
+    candidate_sha = _sha(repo)
+
+    gate_path = "bin/sable_gate_promote_lib.py"
+    _run(repo, "checkout", "-q", "trunk")
+    _write(repo, gate_path, "# landed on the spine only\n")
+    for number in range(228):
+        path = f"spine/unrelated-{number:03d}.txt"
+        _write(repo, path, f"spine {number}\n")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "-m", "229 unrelated spine files")
+    current_base = _sha(repo)
+
+    _stub_bd(monkeypatch, {
+        "SABLE-stale": _bead_record(writes=",".join(sorted(candidate_paths))),
+    })
+    monkeypatch.setattr(adm, "gate_class_roster",
+                        lambda repo_: frozenset({gate_path}))
+
+    two_dot_paths = fp.changed_paths(str(repo), current_base, candidate_sha)
+    two_dot_footprint = fp.mechanical_footprint(
+        str(repo), current_base, candidate_sha)
+    merge_base = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", current_base, candidate_sha],
+        check=True, capture_output=True, text=True).stdout.strip()
+    candidate_delta = fp.changed_paths(str(repo), merge_base, candidate_sha)
+
+    assert len(two_dot_paths) == 233
+    assert two_dot_paths == two_dot_footprint.paths
+    assert gate_path in two_dot_paths
+    assert candidate_delta == candidate_paths
+
+    clause = adm._non_gate_class(
+        str(repo), current_base, candidate_sha, "SABLE-stale")
+    assert clause.passed is True, clause.reason
 
 
 def test_non_gate_class_fires_on_78qck_tier_mechanism_file_and_not_on_ordinary_bin(repo, monkeypatch):
