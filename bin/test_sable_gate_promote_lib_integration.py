@@ -3314,7 +3314,8 @@ def _coverage_floor_repo(tmp_path, *, carry_script: bool = True,
 REPO_ROOT_FOR_FLOOR = Path(__file__).resolve().parent.parent
 
 
-def _force_gate_script(monkeypatch, *, returncode=None, stdout="", raises=None):
+def _force_gate_script(monkeypatch, *, returncode=None, stdout="", raises=None,
+                       observed_kwargs=None):
     """Force ONE deterministic outcome out of the gate script's subprocess and
     leave every other subprocess (all the real git plumbing) untouched.
 
@@ -3325,7 +3326,10 @@ def _force_gate_script(monkeypatch, *, returncode=None, stdout="", raises=None):
     real_run = promote_lib.git_lib._run
 
     def fake_run(argv, **kwargs):
-        if argv and argv[0] == "bash":
+        if (argv and argv[0] == "bash"
+                and len(argv) > 1 and Path(argv[1]).name == "diff-cover-gate.sh"):
+            if observed_kwargs is not None:
+                observed_kwargs.append(kwargs)
             if raises is not None:
                 raise raises
             return subprocess.CompletedProcess(argv, returncode, stdout, None)
@@ -3409,17 +3413,18 @@ def test_coverage_floor_timeout_reads_could_not_assess(tmp_path, monkeypatch):
     The timeout is INJECTED at the subprocess seam, never produced by making
     the host slow: a wall-clock-dependent timeout test is flaky AND is exactly
     the manufactured host load the standing fleet rule forbids."""
-    monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "900")
+    monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "1733")
     msg = _coverage_floor_deny_message(
         tmp_path, monkeypatch,
-        raises=subprocess.TimeoutExpired(cmd=["bash", "diff-cover-gate.sh"], timeout=900))
+        raises=subprocess.TimeoutExpired(cmd=["bash", "diff-cover-gate.sh"], timeout=1733))
 
     # (b) could-not-assess, with elapsed vs budget, and the branch DOES carry it.
     assert "COULD NOT ASSESS" in msg, msg
     for word in _TIMEOUT_PHASE_WORDS:
         assert word in msg, f"the timeout deny does not say {word!r}: {msg}"
-    assert re.search(r"killed after \d+s against a 900s budget", msg), \
+    assert re.search(r"killed after \d+s against a \d+s budget", msg), \
         f"the timeout deny does not state elapsed vs budget: {msg}"
+    assert "coverage_floor tier" in msg and "merge_preview tier" not in msg, msg
     assert "The branch DOES carry the check" in msg, msg
     assert "Adding tests LENGTHENS this run" in msg, \
         f"the timeout deny does not warn off the remedy that deepens it: {msg}"
@@ -3428,6 +3433,34 @@ def test_coverage_floor_timeout_reads_could_not_assess(tmp_path, monkeypatch):
     for word in _COVERAGE_PHASE_WORDS + _PYTEST_PHASE_WORDS + _ABSENT_SCRIPT_WORDS:
         assert word not in msg, \
             f"the timeout deny wrongly claims {word!r} — this is the be4lo.7 misreport: {msg}"
+
+
+def test_coverage_floor_subprocess_is_bounded_by_its_own_live_ssot_entry(
+        tmp_path, monkeypatch):
+    """I1: capture timeout= at the shipped runner seam, never by wall clock."""
+    repo, base_sha, tip_sha = _coverage_floor_repo(tmp_path)
+    tiers = repo / ".github" / "ci" / "test-tiers.sh"
+    tiers.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "--budget" ] && [ "$2" = "merge_preview" ]; then echo 11003; exit 0; fi\n'
+        'if [ "$1" = "--budget" ] && [ "$2" = "coverage_floor" ]; then echo 31337; exit 0; fi\n'
+        "exit 1\n"
+    )
+    tiers.chmod(0o755)
+    monkeypatch.delenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", raising=False)
+    observed = []
+    _force_gate_script(
+        monkeypatch,
+        returncode=0,
+        stdout="SABLE-COVERAGE-FLOOR-PHASE: ok rc=0 fail_under=80\n",
+        observed_kwargs=observed,
+    )
+
+    run = promote_lib.run_coverage_floor_check(str(repo), base_sha, tip_sha)
+
+    assert run.phase == promote_lib.PHASE_OK
+    assert len(observed) == 1
+    assert observed[0]["timeout"] == 31337.0
 
 
 def test_coverage_floor_unattributed_exit_claims_no_coverage_number(tmp_path, monkeypatch):

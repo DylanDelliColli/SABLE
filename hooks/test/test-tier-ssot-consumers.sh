@@ -76,7 +76,8 @@ exit 1
 EOF
 chmod +x "$REPO_DIR"/hooks/test/test-fixture-*.sh
 
-# set_pre_push <suite...> / set_merge_preview_budget <seconds> / set_allow
+# set_pre_push <suite...> / set_merge_preview_budget <seconds> /
+# set_coverage_floor_budget <seconds> / set_allow
 # <extra-suite>: mutate the fixture's copied SSOT files IN PLACE via a
 # targeted regex substitution (never append-at-EOF — the loader's CLI
 # dispatch runs top-to-bottom DURING sourcing/execution, before anything
@@ -101,6 +102,17 @@ p = '$REPO_DIR/.github/ci/test-tiers.sh'
 s = open(p).read()
 s, n = re.subn(r'\[merge_preview\]=\d+', '[merge_preview]=$1', s, count=1)
 assert n == 1, 'merge_preview budget entry not found'
+open(p, 'w').write(s)
+"
+}
+
+set_coverage_floor_budget() {
+  python3 -c "
+import re
+p = '$REPO_DIR/.github/ci/test-tiers.sh'
+s = open(p).read()
+s, n = re.subn(r'\[coverage_floor\]=\d+', '[coverage_floor]=$1', s, count=1)
+assert n == 1, 'coverage_floor budget entry not found'
 open(p, 'w').write(s)
 "
 }
@@ -270,15 +282,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Consumer 2c (SABLE-cmar4.9): sable_gate_promote_lib's coverage-floor-check
+# Consumer 2c (SABLE-1dmfc/cmar4.9): sable_gate_promote_lib's coverage-floor-check
 # timeout (_coverage_floor_timeout, consumed by run_coverage_floor_check for
-# the cmar4.5 pruning-diff coverage gate) reads the SAME merge_preview budget
-# from the SAME SSOT, borrowing it exactly as consumer 2b's impact timeout
-# does -- before this bead it was a fresh hand-picked 600 literal, the same
-# duplicated-list class closed for consumer 2b one bead earlier. Reuses the
-# fixture's SSOT already mutated to 777 by consumer 2b above, then mutates it
-# AGAIN to a fourth, distinctive value to prove this is live re-resolution
-# and not a value cached at an earlier mutation.
+# the cmar4.5 pruning-diff coverage gate) reads its OWN entry from the SAME
+# SSOT. Moving merge_preview must move consumer 2b but NOT this one; moving
+# coverage_floor must move this one but NOT consumer 2b. Both entries are
+# mutated twice so a cached value and a live resolution stay distinguishable.
 # ---------------------------------------------------------------------------
 
 read_coverage_floor_timeout() {
@@ -294,20 +303,41 @@ print(smg.promote_lib._coverage_floor_timeout('$REPO_DIR'))
 }
 
 unset SABLE_MG_COVERAGE_FLOOR_TIMEOUT
-COVERAGE_FLOOR_AT_777=$(read_coverage_floor_timeout)
-if [ "$COVERAGE_FLOOR_AT_777" = "777.0" ]; then
-  pass "consumer 2c (coverage-floor timeout): _coverage_floor_timeout reads the SAME merge_preview budget (777) as consumer 2b, not a third hardcoded copy"
+EXPECTED_FLOOR_BUDGET=$(bash "$REPO_DIR/.github/ci/test-tiers.sh" --budget coverage_floor)
+COVERAGE_FLOOR_AT_MERGE_777=$(read_coverage_floor_timeout)
+if [ "$COVERAGE_FLOOR_AT_MERGE_777" = "$EXPECTED_FLOOR_BUDGET.0" ]; then
+  pass "consumer 2c (coverage-floor timeout): moving merge_preview to 777 does NOT move the floor's own SSOT budget ($EXPECTED_FLOOR_BUDGET)"
 else
-  fail "consumer 2c (coverage-floor timeout): _coverage_floor_timeout reads the SAME merge_preview budget (777) as consumer 2b, not a third hardcoded copy" "got: $COVERAGE_FLOOR_AT_777"
+  fail "consumer 2c (coverage-floor timeout): moving merge_preview does not move the floor" "got: $COVERAGE_FLOOR_AT_MERGE_777"
 fi
 
 set_merge_preview_budget 4242
 
-COVERAGE_FLOOR_AT_4242=$(read_coverage_floor_timeout)
-if [ "$COVERAGE_FLOOR_AT_4242" = "4242.0" ]; then
-  pass "consumer 2c (coverage-floor timeout): after mutating the SAME file AGAIN, _coverage_floor_timeout re-resolves to the new budget (4242) -- a future hardcode would fail this"
+COVERAGE_FLOOR_AT_MERGE_4242=$(read_coverage_floor_timeout)
+if [ "$COVERAGE_FLOOR_AT_MERGE_4242" = "$EXPECTED_FLOOR_BUDGET.0" ]; then
+  pass "consumer 2c (coverage-floor timeout): mutating merge_preview AGAIN still leaves the floor unchanged"
 else
-  fail "consumer 2c (coverage-floor timeout): after mutating the SAME file AGAIN, _coverage_floor_timeout re-resolves to the new budget (4242) -- a future hardcode would fail this" "got: $COVERAGE_FLOOR_AT_4242"
+  fail "consumer 2c (coverage-floor timeout): a second merge_preview mutation does not move the floor" "got: $COVERAGE_FLOOR_AT_MERGE_4242"
+fi
+
+set_coverage_floor_budget 31337
+COVERAGE_FLOOR_AT_31337=$(read_coverage_floor_timeout)
+IMPACT_WITH_FLOOR_31337=$(read_impact_timeout)
+if [ "$COVERAGE_FLOOR_AT_31337" = "31337.0" ] && [ "$IMPACT_WITH_FLOOR_31337" = "4242.0" ]; then
+  pass "consumer 2c: moving coverage_floor to 31337 moves only the floor; impact remains 4242"
+else
+  fail "consumer 2c: coverage_floor and impact sources are independent" \
+    "floor=$COVERAGE_FLOOR_AT_31337 impact=$IMPACT_WITH_FLOOR_31337"
+fi
+
+set_coverage_floor_budget 32347
+COVERAGE_FLOOR_AT_32347=$(read_coverage_floor_timeout)
+IMPACT_WITH_FLOOR_32347=$(read_impact_timeout)
+if [ "$COVERAGE_FLOOR_AT_32347" = "32347.0" ] && [ "$IMPACT_WITH_FLOOR_32347" = "4242.0" ]; then
+  pass "consumer 2c: mutating coverage_floor AGAIN is live-resolved and still leaves impact unchanged"
+else
+  fail "consumer 2c: second coverage_floor mutation is live and independent" \
+    "floor=$COVERAGE_FLOOR_AT_32347 impact=$IMPACT_WITH_FLOOR_32347"
 fi
 
 # ---------------------------------------------------------------------------
