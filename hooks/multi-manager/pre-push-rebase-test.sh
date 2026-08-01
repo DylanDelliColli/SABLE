@@ -189,6 +189,182 @@ sable_tail_chars() {
   printf '%s' "$1" | tail -c "$2"
 }
 
+# sable_parse_push_update <command>
+#
+# Classifies a git-push invocation for the exact-object gate (SABLE-j90ba).
+# Pure function (no git/global reads) so it unit-tests by sourcing this file.
+# Output, single line: kind|remote|src|dst|detail
+#   kind = update       exactly one non-delete branch update (src/dst empty
+#                       for the bare form — the caller resolves them against
+#                       the current branch)
+#   kind = delete       deletion-only push (no new object)
+#   kind = unsupported  everything else; detail says why. FAIL CLOSED: a
+#                       command this parser cannot prove to be a single
+#                       update must not be certified as one — that includes
+#                       compound shell commands (certifying only the first
+#                       push of `a && b` certifies the wrong thing) and any
+#                       unrecognized flag.
+sable_parse_push_update() {
+  local command="$1"
+  case "$command" in
+    *'&&'*|*'||'*|*';'*|*'|'*|*$'\n'*|*'$('*|*'`'*|*'>'*|*'<'*)
+      printf 'unsupported||||compound command'
+      return 0
+      ;;
+  esac
+  # B4: the hook certifies the PRE-expansion text while Bash executes the
+  # POST-expansion command. A branch may be literally named '{main,side}' —
+  # the parser resolves one current branch, the shell expands to TWO
+  # refspecs. Dollar refs and glob/tilde forms diverge the same way. Every
+  # expansion-capable character fails closed; the pinned forms are literal.
+  case "$command" in
+    *'{'*|*'}'*|*'$'*|*'*'*|*'?'*|*'['*|*']'*|*'~'*)
+      printf 'unsupported||||shell expansion syntax'
+      return 0
+      ;;
+  esac
+  local -a toks=()
+  read -r -a toks <<< "$command"
+  local i=0 n=${#toks[@]} tok
+  # Leading environment assignments are REJECTED, not skipped (B3): the hook
+  # validates git state WITHOUT these command-local assignments while the
+  # actual push runs WITH them — GIT_DIR=/other/.git redirects the repo and
+  # GIT_CONFIG_COUNT/KEY/VALUE can inject push.followTags for the real
+  # command only. No env-prefixed form is in the pinned surface; broad
+  # rejection fails closed.
+  if [ "$n" -gt 0 ]; then
+    case "${toks[0]}" in
+      [A-Za-z_]*=*)
+        printf 'unsupported||||leading environment assignment %s' "${toks[0]%%=*}"
+        return 0
+        ;;
+    esac
+  fi
+  if [ "$i" -ge "$n" ] || [ "${toks[$i]}" != "git" ]; then
+    printf 'unsupported||||unrecognized invocation'
+    return 0
+  fi
+  i=$((i+1))
+  # Pre-subcommand git-global flags: FAIL CLOSED on anything that can change
+  # WHICH repo/config the eventual push acts on. -C is accepted because
+  # sable_resolve_push_repo_dir resolves the gate's own repo from the same
+  # flag (the validated repo IS the -C target); --no-pager is output-only.
+  # Everything else is rejected: --git-dir/--work-tree/--bare redirect the
+  # repo while the gate validates $CWD, and -c can inject
+  # remote.<name>.push/push.default at push time, invisible to the gate's
+  # repo-config soundness checks.
+  while [ "$i" -lt "$n" ] && [ "${toks[$i]}" != "push" ]; do
+    case "${toks[$i]}" in
+      -C) i=$((i+2)) ;;
+      --no-pager) i=$((i+1)) ;;
+      -*)
+        printf 'unsupported||||global flag %s' "${toks[$i]%%=*}"
+        return 0
+        ;;
+      *)
+        printf 'unsupported||||unrecognized invocation'
+        return 0
+        ;;
+    esac
+  done
+  if [ "$i" -ge "$n" ] || [ "${toks[$i]}" != "push" ]; then
+    printf 'unsupported||||unrecognized invocation'
+    return 0
+  fi
+  i=$((i+1))
+
+  local delete_flag=0 remote=""
+  local -a refspecs=()
+  while [ "$i" -lt "$n" ]; do
+    tok="${toks[$i]}"
+    case "$tok" in
+      -u|--set-upstream|-q|--quiet|-v|--verbose|--porcelain|--progress|--no-progress|--no-verify) ;;
+      -d|--delete) delete_flag=1 ;;
+      -*)
+        printf 'unsupported||||flag %s' "$tok"
+        return 0
+        ;;
+      *)
+        if [ -z "$remote" ] && [ ${#refspecs[@]} -eq 0 ]; then
+          remote="$tok"
+        else
+          refspecs+=("$tok")
+        fi
+        ;;
+    esac
+    i=$((i+1))
+  done
+
+  local count=${#refspecs[@]} spec src dst
+  if [ "$count" -gt 1 ]; then
+    local has_delete=0 has_update=0
+    for spec in "${refspecs[@]}"; do
+      case "$spec" in
+        :*) has_delete=1 ;;
+        *) has_update=1 ;;
+      esac
+    done
+    if [ "$has_delete" -eq 1 ] && [ "$has_update" -eq 1 ]; then
+      printf 'unsupported||||mixed delete and update'
+    else
+      printf 'unsupported||||multiple refspecs'
+    fi
+    return 0
+  fi
+  if [ "$count" -eq 0 ]; then
+    if [ "$delete_flag" -eq 1 ]; then
+      printf 'unsupported||||delete with no refspec'
+    else
+      printf 'update|%s|||' "$remote"
+    fi
+    return 0
+  fi
+  spec="${refspecs[0]}"
+  case "$spec" in
+    +*)
+      printf 'unsupported||||forced refspec'
+      return 0
+      ;;
+  esac
+  if [ "$delete_flag" -eq 1 ]; then
+    case "$spec" in
+      *:*)
+        printf 'unsupported||||mixed delete and update'
+        return 0
+        ;;
+    esac
+    printf 'delete|%s||%s|' "$remote" "${spec#refs/heads/}"
+    return 0
+  fi
+  case "$spec" in
+    :*)
+      # B1: a BARE colon is git's matching-push (every matching branch —
+      # reproduced moving a remote branch), NOT a deletion. The empty-source
+      # deletion carve-out is pinned to ':refs/heads/<nonempty>' only; every
+      # other colon form fails closed ('--delete origin <branch>' covers
+      # bare-name deletion).
+      dst="${spec#:}"
+      case "$dst" in
+        refs/heads/?*)
+          printf 'delete|%s||%s|' "$remote" "${dst#refs/heads/}"
+          ;;
+        *)
+          printf 'unsupported||||colon refspec outside the pinned deletion form'
+          ;;
+      esac
+      ;;
+    *:*)
+      src="${spec%%:*}"
+      dst="${spec#*:}"
+      printf 'update|%s|%s|%s|' "$remote" "$src" "${dst#refs/heads/}"
+      ;;
+    *)
+      printf 'update|%s|%s|%s|' "$remote" "${spec}" "${spec#refs/heads/}"
+      ;;
+  esac
+  return 0
+}
+
 # Auto-detect typecheck command from project markers.
 # Echoes the command (or empty if no typechecker found).
 detect_typecheck_cmd() {
@@ -364,15 +540,59 @@ fi
 sable_is_git_push "$COMMAND" || exit 0
 echo "$COMMAND" | grep -qE '(\-\-force|\-f\b)' && exit 0
 
+# ---------------------------------------------------------------------------
+# SABLE-j90ba exact-object gate, part A0: classify BEFORE repo resolution.
+# Ordering is load-bearing: sable_resolve_push_repo_dir selects the FIRST
+# `git -C <path>` in the command, so a compound like
+# `git -C /tmp status && git -C <repo> push ...` used to resolve /tmp, hit
+# the non-repo early exit below, and let the trailing push run UNGATED
+# (reproduced 2026-08-01). Unsupported syntax must fail closed before any
+# repo/dir logic gets a chance to exit quietly; only a supported SINGLE push
+# proceeds to repo resolution.
+# ---------------------------------------------------------------------------
+GATE_ACTIVE=0
+GATE_PARSE=$(sable_parse_push_update "$COMMAND")
+GATE_KIND="${GATE_PARSE%%|*}"
+GATE_REST="${GATE_PARSE#*|}"
+GATE_REMOTE="${GATE_REST%%|*}"
+GATE_REST="${GATE_REST#*|}"
+GATE_SRC="${GATE_REST%%|*}"
+GATE_REST="${GATE_REST#*|}"
+GATE_DST="${GATE_REST%%|*}"
+GATE_DETAIL="${GATE_PARSE##*|}"
+
+if [ "$GATE_KIND" = "unsupported" ]; then
+  emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): this invocation is not certifiable as exactly one branch update ($GATE_DETAIL). The gate validates the exact object being pushed, so the initial surface accepts exactly one supported non-delete refspec update per command. Accepted forms: 'git push'; 'git push origin <current-branch>'; 'git push -u origin <current-branch>'; 'git push origin HEAD:refs/heads/<current-branch>'. Deletion-only cleanup: 'git push --delete origin <branch>' or 'git push origin :refs/heads/<branch>'. Split compound commands into one push per Bash command; --all/--mirror/--tags/multiple refspecs and unrecognized flags fail closed rather than being certified by proxy."
+  exit 0
+fi
+
+if [ "$GATE_KIND" = "delete" ]; then
+  emit_context "Pre-push: deletion-only push of '${GATE_DST}' — no new object is published, so object validation not claimed and the rebase/static/build/test phases do not run (SABLE-j90ba deletion carve-out; remote branch cleanup is a legitimate session-close operation)."
+  exit 0
+fi
+
 # Resolve the effective repo dir from the push command's `git -C <path>`
 # target, falling back to the shell cwd. Managers push worktrees via
 # `git -C <worktree> push` from the main checkout, so the dir git operates in
 # is the -C target, not the shell cwd — rebase/static/test must run THERE
-# (SABLE-041).
+# (SABLE-041). Safe to run only now: part A0 guaranteed this is a single
+# supported push, so the first -C IS the push's -C.
 CWD=$(sable_resolve_push_repo_dir "$CWD" "$COMMAND")
 
-[ -z "$CWD" ] && exit 0
-[ ! -d "$CWD/.git" ] && [ ! -f "$CWD/.git" ] && exit 0
+# B5: normalize to the work-tree TOPLEVEL exactly as git will. Git searches
+# parent directories, so a push from repo/subdir (ambient cwd or -C target)
+# really pushes the repo — the old `$CWD/.git` existence check quiet-exited
+# there and the push ran UNGATED. Resolution failure (non-repo, bare repo,
+# empty cwd) DENIES rather than exiting silently: for this known-push
+# command, an unresolvable work tree means the gate cannot attribute a
+# verdict, not that there is nothing to gate.
+if [ -n "$CWD" ] && GATE_TOPLEVEL=$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null) \
+   && [ -n "$GATE_TOPLEVEL" ]; then
+  CWD="$GATE_TOPLEVEL"
+else
+  emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): could not resolve a work tree for this push (directory '${CWD:-<empty>}' is not inside a non-bare git work tree). A real 'git push' MAY still resolve a parent or bare repository by its own search rules, so the gate fails closed instead of exiting silently. Run the push from inside the repository work tree (or 'git -C <worktree> push')."
+  exit 0
+fi
 
 # BASE_BRANCH is resolved below, AFTER the integration branch is known
 # (SABLE-4amz) — the old unconditional origin/main default here re-parented
@@ -393,6 +613,134 @@ CURRENT_BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "
 # repo that session's manager ever pushes (e.g. a companion SABLE-repo
 # worktree pushed from a market-brief-package session).
 INTEGRATION_BRANCH=$(sable_resolve_integration_branch "$CWD")
+
+# ---------------------------------------------------------------------------
+# SABLE-j90ba exact-object gate, part A: resolve the pushed source object and
+# validate remote/destination BEFORE any mutation. UNSCOPED — applies to
+# every manager push traversing this hook (planning-pass ruling 2026-08-01;
+# explicit-integration scoping belongs only to the provenance guard). The
+# defect this closes: the gate used to validate the CHECKED-OUT tree, so a
+# push-by-ref from a shared checkout, or a dirty/untracked overlay, produced
+# a green attributed to an object the phases never touched. Classification
+# itself already happened in part A0, before repo resolution.
+# ---------------------------------------------------------------------------
+GATE_SRC_REF="${GATE_SRC:-HEAD}"
+
+# Remote rule. The gate's rebase, provenance, and base-object attribution are
+# all computed against 'origin' (the fetch below, BASE_BRANCH=origin/<int>,
+# the ci-verify provenance refs), so the initial surface requires that the
+# branch's EFFECTIVE push remote (branch.<name>.pushRemote >
+# remote.pushDefault > branch.<name>.remote > origin) IS origin, and that any
+# explicit remote token names it. Certifying a push to another remote would
+# attribute the verdict to lineage this gate never examined.
+GATE_EFFECTIVE_REMOTE=$(git -C "$CWD" config --get "branch.${CURRENT_BRANCH}.pushRemote" 2>/dev/null || true)
+[ -z "$GATE_EFFECTIVE_REMOTE" ] && GATE_EFFECTIVE_REMOTE=$(git -C "$CWD" config --get remote.pushDefault 2>/dev/null || true)
+[ -z "$GATE_EFFECTIVE_REMOTE" ] && GATE_EFFECTIVE_REMOTE=$(git -C "$CWD" config --get "branch.${CURRENT_BRANCH}.remote" 2>/dev/null || true)
+[ -z "$GATE_EFFECTIVE_REMOTE" ] && GATE_EFFECTIVE_REMOTE="origin"
+if [ "$GATE_EFFECTIVE_REMOTE" != "origin" ]; then
+  emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): the current branch's effective push remote is '$GATE_EFFECTIVE_REMOTE', but this gate proves rebase/provenance/base attribution against 'origin' only — multi-remote push flows are outside the initial surface. Push to origin, or remove the branch.${CURRENT_BRANCH}.pushRemote / remote.pushDefault override."
+  exit 0
+fi
+if [ -n "$GATE_REMOTE" ] && [ "$GATE_REMOTE" != "origin" ]; then
+  emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): push targets remote '$GATE_REMOTE', but this gate proves rebase/provenance/base attribution against 'origin' only, so a verdict for '$GATE_REMOTE' would be attributed to the wrong lineage. Push to origin; multi-remote flows are outside the initial surface."
+  exit 0
+fi
+
+# Config-expansion soundness for EVERY update push (B2, real-git repros):
+# push.followTags=true adds annotated tags to an explicit single-branch push
+# (--dry-run --porcelain printed refs/heads/main AND refs/tags/v1), and
+# remote.origin.mirror=true turns any push into a mirror of all refs. Either
+# way 'exactly one update' is disproven by repo config the refspec never
+# shows.
+if [ "$(git -C "$CWD" config --type=bool push.followTags 2>/dev/null)" = "true" ]; then
+  emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): push.followTags is enabled, so this push also publishes annotated tags beyond the single branch update — exactly-one is not proven. Unset push.followTags (git config --unset push.followTags) or push tags deliberately in a separate reviewed step."
+  exit 0
+fi
+if [ "$(git -C "$CWD" config --type=bool remote.origin.mirror 2>/dev/null)" = "true" ]; then
+  emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): remote.origin.mirror is enabled, so any push mirrors every ref — exactly-one is not proven and object validation cannot be attributed. Remove the mirror configuration for gated pushes."
+  exit 0
+fi
+
+# Upstream branch name, needed by both the bare-push destination resolution
+# and the explicit destination rule. origin/feat/x strips to feat/x.
+# Output is kept ONLY on rev-parse success: on failure --abbrev-ref can echo
+# the literal '@{upstream}' to stdout (observed with an upstream CONFIGURED
+# but unborn — branch.<name>.merge set by an empty-repo clone while the
+# remote-tracking ref does not exist), and '|| true' inside the substitution
+# kept that echo as a phantom upstream name.
+GATE_UPSTREAM_NAME=""
+if ! GATE_UPSTREAM_SHORT=$(git -C "$CWD" rev-parse --abbrev-ref --symbolic-full-name "@{upstream}" 2>/dev/null); then
+  GATE_UPSTREAM_SHORT=""
+fi
+[ -n "$GATE_UPSTREAM_SHORT" ] && GATE_UPSTREAM_NAME="${GATE_UPSTREAM_SHORT#*/}"
+
+if [ -z "$GATE_SRC" ] && [ -z "$GATE_DST" ]; then
+  # Bare-push config-expansion soundness: with no explicit refspec, git
+  # expands the push through remote.<name>.push refspecs and push.default.
+  # 'Exactly one update of HEAD' is only PROVEN when no push refspecs are
+  # configured and push.default names a single-update mode — and the
+  # DESTINATION must be resolved from that mode, not assumed to be the
+  # current branch name (push.default=upstream pushes to the upstream's
+  # name, which may differ).
+  GATE_REMOTE_PUSH=$(git -C "$CWD" config --get-all "remote.origin.push" 2>/dev/null || true)
+  if [ -n "$GATE_REMOTE_PUSH" ]; then
+    emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): remote.origin.push refspec(s) are configured, so a bare 'git push' expands through them and is not provably a single update of HEAD. Push explicitly ('git push origin $CURRENT_BRANCH') or remove the configured push refspec(s)."
+    exit 0
+  fi
+  GATE_PUSH_DEFAULT=$(git -C "$CWD" config --get push.default 2>/dev/null || echo "simple")
+  case "$GATE_PUSH_DEFAULT" in
+    current)
+      GATE_DST_NAME="$CURRENT_BRANCH"
+      ;;
+    upstream)
+      if [ -z "$GATE_UPSTREAM_NAME" ]; then
+        emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): push.default=upstream with no configured upstream for '$CURRENT_BRANCH' — the bare push's destination cannot be resolved, so the verdict cannot name it. Configure an upstream or push explicitly."
+        exit 0
+      fi
+      GATE_DST_NAME="$GATE_UPSTREAM_NAME"
+      ;;
+    simple)
+      if [ -n "$GATE_UPSTREAM_NAME" ] && [ "$GATE_UPSTREAM_NAME" != "$CURRENT_BRANCH" ]; then
+        emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): push.default=simple with an upstream named '$GATE_UPSTREAM_NAME' differing from the current branch '$CURRENT_BRANCH' — git itself refuses this bare push, so there is no single update to certify. Push explicitly."
+        exit 0
+      fi
+      GATE_DST_NAME="$CURRENT_BRANCH"
+      ;;
+    *)
+      emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): push.default is '$GATE_PUSH_DEFAULT', under which a bare 'git push' can expand to multiple or differently-named updates, so exactly-one is not proven. Set 'git config push.default simple' or push explicitly ('git push origin $CURRENT_BRANCH')."
+      exit 0
+      ;;
+  esac
+else
+  GATE_DST_NAME="${GATE_DST:-$CURRENT_BRANCH}"
+fi
+
+# Source rule: the pushed source must resolve, and must BE the current HEAD —
+# resolved before any mutation. Pushing ref B while ref A is checked out was
+# the original vacuous-green incident: the phases validated A's tree and the
+# green was read as B's. (Re-checked against the FINAL object after the
+# mandatory rebase in part B — a literal-SHA source can diverge there.)
+GATE_SRC_SHA=$(git -C "$CWD" rev-parse --verify --quiet "${GATE_SRC_REF}^{commit}" 2>/dev/null || true)
+GATE_HEAD_SHA=$(git -C "$CWD" rev-parse --verify --quiet "HEAD^{commit}" 2>/dev/null || true)
+if [ -z "$GATE_SRC_SHA" ] || [ -z "$GATE_HEAD_SHA" ]; then
+  emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): pushed source '$GATE_SRC_REF' does not resolve to a commit in this repo (fail closed rather than guessing)."
+  exit 0
+fi
+if [ "$GATE_SRC_SHA" != "$GATE_HEAD_SHA" ]; then
+  emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): pushed source '$GATE_SRC_REF' ($GATE_SRC_SHA) is not the current HEAD ($GATE_HEAD_SHA). The initial surface validates exactly the checked-out object — check out the branch you are pushing (workers push from their own worktrees; managers push via 'git -C <worktree> push'), so the gate rebases and validates the same object it certifies."
+  exit 0
+fi
+
+# Destination rule: the single update's destination must be the current
+# branch's own name or its configured upstream branch name. Without this,
+# 'git push origin HEAD:refs/heads/<integration>' tests the exact object but
+# publishes it under a destination the provenance guard keyed on
+# CURRENT_BRANCH never examines.
+if [ "$GATE_DST_NAME" != "$CURRENT_BRANCH" ] && { [ -z "$GATE_UPSTREAM_NAME" ] || [ "$GATE_DST_NAME" != "$GATE_UPSTREAM_NAME" ]; }; then
+  emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): destination '$GATE_DST_NAME' is neither the current branch '$CURRENT_BRANCH' nor its configured upstream branch${GATE_UPSTREAM_NAME:+ ('$GATE_UPSTREAM_NAME')}. The initial surface certifies a branch only to its own destination; pushing HEAD under another branch name publishes a verdict against lineage this gate never examined."
+  exit 0
+fi
+GATE_ACTIVE=1
 
 # --- yz5y (market-brief-package-yz5y): re-parent guard. Runs BEFORE any fetch/
 # rebase and is active ONLY for a LOCAL-ONLY integration branch (a local
@@ -550,16 +898,131 @@ ${REBASE_OUT:0:500}"
 fi
 
 # ---------------------------------------------------------------------------
+# SABLE-j90ba exact-object gate, part B: re-resolve the FINAL object after
+# the mandatory rebase (phase 1 may have moved HEAD — the verdict must name
+# the object that will actually be pushed, not the pre-rebase SHA), then
+# materialize it in a clean disposable detached worktree. Phases 2-4 execute
+# THERE: a dirty tracked file, an untracked overlay, or any working-tree
+# state can no longer alter the verdict, and — as a structural side effect —
+# untracked scratch files stop amplifying test selection for push-gate runs.
+#
+# Checkout hooks are suppressed during materialization/removal: repos on this
+# machine set core.hooksPath at the bd shims (post-checkout runs bd), and a
+# validation step must not trigger costful mutable hook work.
+#
+# Cleanup runs from an EXIT trap, with INT/TERM routed through exit so the
+# trap fires on signals too; a worktree-prune before materialization
+# self-heals stale admin entries left by a SIGKILLed prior run (cf
+# SABLE-fk157 — the signal-skips-finally leak class).
+# ---------------------------------------------------------------------------
+GATE_RECORD=""
+PHASE_DIR="$CWD"
+if [ "$GATE_ACTIVE" -eq 1 ]; then
+  GATE_FINAL_OBJECT=$(git -C "$CWD" rev-parse --verify --quiet "HEAD^{commit}" 2>/dev/null || true)
+
+  # Post-rebase source re-check: the branch ref and HEAD moved together
+  # through the rebase, but a LITERAL SHA (or any alias frozen at the
+  # pre-rebase object) now diverges — git would push the OLD object while
+  # the gate validates the new one. That divergence is exactly the
+  # 'source SHA changed by the rebase' negative control.
+  GATE_SRC_SHA_FINAL=$(git -C "$CWD" rev-parse --verify --quiet "${GATE_SRC_REF}^{commit}" 2>/dev/null || true)
+  if [ -z "$GATE_FINAL_OBJECT" ] || [ "$GATE_SRC_SHA_FINAL" != "$GATE_FINAL_OBJECT" ]; then
+    emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): after the mandatory rebase, pushed source '$GATE_SRC_REF' no longer resolves to the final rebased HEAD (${GATE_FINAL_OBJECT:-<unresolved>}) — the push would publish the pre-rebase object while the gate validated the post-rebase one. Push the branch by name (or HEAD) so the source follows the rebase."
+    exit 0
+  fi
+
+  GATE_BASE_OBJECT="(none)"
+  if [ -n "${BASE_BRANCH:-}" ]; then
+    GATE_BASE_OBJECT=$(git -C "$CWD" rev-parse --verify --quiet "${BASE_BRANCH}^{commit}" 2>/dev/null || echo "(unresolved)")
+  fi
+
+  GATE_COMMON_DIR=$(git -C "$CWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+
+  # Self-heal ONLY THIS GATE'S stale admin entries. Scope of the heal,
+  # stated precisely: a SIGKILLed run skips every trap and leaves BOTH its
+  # temp tree and its admin entry; this sweep removes the admin entry only
+  # AFTER external temp cleanup (tmp reaper/reboot) has made the recorded
+  # gitdir path absent — an intact orphan persists until then. Never
+  # 'git worktree prune': other agents keep legitimately-registered
+  # worktrees (coverage-floor records among them), and a global prune
+  # mutates records this gate does not own. Our entries are recognizable by
+  # the unique wt-sable-exact-object.* basename.
+  if [ -n "$GATE_COMMON_DIR" ] && [ -d "$GATE_COMMON_DIR/worktrees" ]; then
+    for GATE_STALE in "$GATE_COMMON_DIR"/worktrees/wt-sable-exact-object.*; do
+      [ -d "$GATE_STALE" ] || continue
+      GATE_STALE_GITDIR=$(cat "$GATE_STALE/gitdir" 2>/dev/null || true)
+      if [ -z "$GATE_STALE_GITDIR" ] || [ ! -e "$GATE_STALE_GITDIR" ]; then
+        rm -rf "$GATE_STALE"
+      fi
+    done
+  fi
+
+  GATE_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/sable-exact-object.XXXXXX" 2>/dev/null) || GATE_ROOT=""
+  GATE_TREE="${GATE_ROOT}/wt-${GATE_ROOT##*/}"
+  GATE_NOHOOKS="${GATE_ROOT}/nohooks"
+  sable_gate_cleanup() {
+    if [ -n "${GATE_ROOT:-}" ]; then
+      git -C "$CWD" -c core.hooksPath="$GATE_NOHOOKS" worktree remove --force "$GATE_TREE" >/dev/null 2>&1 || true
+      if [ -n "${GATE_COMMON_DIR:-}" ] && [ -d "$GATE_COMMON_DIR/worktrees/${GATE_TREE##*/}" ]; then
+        rm -rf "$GATE_COMMON_DIR/worktrees/${GATE_TREE##*/}"
+      fi
+      rm -rf "$GATE_ROOT"
+    fi
+  }
+  trap sable_gate_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [ -z "$GATE_ROOT" ] || ! mkdir -p "$GATE_NOHOOKS" 2>/dev/null || \
+     ! git -C "$CWD" -c core.hooksPath="$GATE_NOHOOKS" worktree add --detach "$GATE_TREE" "$GATE_FINAL_OBJECT" >/dev/null 2>&1; then
+    emit_deny "Pre-push denied (exact-object gate, SABLE-j90ba): could not materialize a clean detached worktree at final object ${GATE_FINAL_OBJECT:-<unresolved>} — the gate cannot validate the exact pushed object, so it fails closed rather than validating the working tree by proxy. Inspect 'git worktree list', check disk space under ${TMPDIR:-/tmp}, and retry."
+    exit 0
+  fi
+  PHASE_DIR="$GATE_TREE"
+
+  # Bridge AUDITED dependency dirs into the clean worktree by symlink.
+  # Without this the global hook breaks every JS/venv repo it gates: their
+  # auto-detected phases (npx --no-install tsc, npm test/build, pytest under
+  # .venv) need dependency dirs that are git-ignored and so absent from the
+  # materialized object; installing per push is not acceptable. A dir is
+  # bridged ONLY when it exists in the live repo, is ABSENT from the
+  # object's tree, and is IGNORED per the OBJECT's own gitignore rules
+  # (check-ignore runs in the worktree) — tracked source can never be
+  # shadowed, and an unrelated untracked source file stays excluded. The
+  # symlink lives inside GATE_ROOT, so cleanup removes the link, never the
+  # target.
+  GATE_BRIDGED=""
+  for GATE_DEP in node_modules .venv; do
+    # check-ignore queried WITH the trailing slash: the conventional ignore
+    # pattern 'node_modules/' is directory-only, and a slashless query for a
+    # path that does not exist in the clean worktree never matches it.
+    if [ -d "$CWD/$GATE_DEP" ] && [ ! -e "$GATE_TREE/$GATE_DEP" ] \
+       && git -C "$GATE_TREE" check-ignore -q "$GATE_DEP/" 2>/dev/null; then
+      if ln -s "$CWD/$GATE_DEP" "$GATE_TREE/$GATE_DEP" 2>/dev/null; then
+        GATE_BRIDGED="${GATE_BRIDGED:+$GATE_BRIDGED }$GATE_DEP"
+      fi
+    fi
+  done
+
+  GATE_RECORD="exact-object gate: source ref '$GATE_SRC_REF' -> destination '$GATE_DST_NAME' on remote 'origin'; final object $GATE_FINAL_OBJECT; base object $GATE_BASE_OBJECT (${BASE_BRANCH:-no base}); phases executed in a clean detached worktree at the final object${GATE_BRIDGED:+; bridged ignored dependency dir(s): $GATE_BRIDGED}"
+fi
+
+# ---------------------------------------------------------------------------
 # Phase 2: STATIC analysis (typecheck + optional lint) — never skippable
 # ---------------------------------------------------------------------------
 
 STATIC_TIMEOUT="${SABLE_PRE_PUSH_STATIC_TIMEOUT:-90}"
 
-TYPECHECK_CMD=$(detect_typecheck_cmd "$CWD" "$BASE_BRANCH")
+# SABLE-j90ba: commands, manifests, .sable, and timeouts all RESOLVE from the
+# clean worktree — the OBJECT is the configuration surface, so a dirty
+# .sable edit (invisible to any diff) cannot weaken the gate; a committed
+# weakening is at least reviewable and still faces the full ci-verify suite.
+# Repo-local git config is shared by linked worktrees, so sable.testCommand
+# resolution is unchanged.
+TYPECHECK_CMD=$(detect_typecheck_cmd "$PHASE_DIR" "$BASE_BRANCH")
 
 if [ -n "$TYPECHECK_CMD" ]; then
   TC_EXIT=0
-  TC_OUT=$(cd "$CWD" && timeout "$STATIC_TIMEOUT" sh -c "$TYPECHECK_CMD" 2>&1) || TC_EXIT=$?
+  TC_OUT=$(cd "$PHASE_DIR" && timeout "$STATIC_TIMEOUT" sh -c "$TYPECHECK_CMD" 2>&1) || TC_EXIT=$?
 
   if [ "$TC_EXIT" -ne 0 ]; then
     if [ "$TC_EXIT" -eq 124 ]; then
@@ -568,7 +1031,9 @@ if [ -n "$TYPECHECK_CMD" ]; then
       SUFFIX="Typecheck reported errors. This phase CANNOT be skipped via SABLE_SKIP_PRE_PUSH — it is structurally required. Fix the type errors before pushing."
     fi
     emit_deny "Pre-push phase 2 (static): typecheck failed (\`$TYPECHECK_CMD\`).
-${SUFFIX}
+${SUFFIX}${GATE_RECORD:+
+
+$GATE_RECORD}
 
 $(sable_tail_chars "$TC_OUT" 1500)"
     exit 0
@@ -580,7 +1045,7 @@ LINT_CMD="${SABLE_PRE_PUSH_LINT_COMMAND:-}"
 
 if [ -n "$LINT_CMD" ]; then
   LINT_EXIT=0
-  LINT_OUT=$(cd "$CWD" && timeout "$STATIC_TIMEOUT" sh -c "$LINT_CMD" 2>&1) || LINT_EXIT=$?
+  LINT_OUT=$(cd "$PHASE_DIR" && timeout "$STATIC_TIMEOUT" sh -c "$LINT_CMD" 2>&1) || LINT_EXIT=$?
 
   if [ "$LINT_EXIT" -ne 0 ]; then
     if [ "$LINT_EXIT" -eq 124 ]; then
@@ -609,7 +1074,7 @@ fi
 # silently no-ops there), and (b) the diff this push carries actually touches
 # a hooks/test/*.sh or bin/test_*.py file (a push touching neither pays no
 # added cost — the acceptance criterion this bead is scoped to).
-TRIPWIRE_BIN="$CWD/bin/sable-fixture-tripwire"
+TRIPWIRE_BIN="$PHASE_DIR/bin/sable-fixture-tripwire"
 
 if [ -x "$TRIPWIRE_BIN" ] && [ -n "$BASE_BRANCH" ]; then
   TRIPWIRE_TARGETS=()
@@ -618,11 +1083,11 @@ if [ -x "$TRIPWIRE_BIN" ] && [ -n "$BASE_BRANCH" ]; then
     case "$f" in
       hooks/test/*.sh|bin/test_*.py) TRIPWIRE_TARGETS+=("$f") ;;
     esac
-  done < <(git -C "$CWD" diff --name-only --diff-filter=ACMR "${BASE_BRANCH}...HEAD" 2>/dev/null || true)
+  done < <(git -C "$PHASE_DIR" diff --name-only --diff-filter=ACMR "${BASE_BRANCH}...HEAD" 2>/dev/null || true)
 
   if [ ${#TRIPWIRE_TARGETS[@]} -gt 0 ]; then
     TW_EXIT=0
-    TW_OUT=$(cd "$CWD" && timeout "$STATIC_TIMEOUT" "$TRIPWIRE_BIN" "${TRIPWIRE_TARGETS[@]}" 2>&1) || TW_EXIT=$?
+    TW_OUT=$(cd "$PHASE_DIR" && timeout "$STATIC_TIMEOUT" "$TRIPWIRE_BIN" "${TRIPWIRE_TARGETS[@]}" 2>&1) || TW_EXIT=$?
 
     if [ "$TW_EXIT" -ne 0 ]; then
       emit_deny "Pre-push phase 2 (static): fixture-tripwire failed (\`bin/sable-fixture-tripwire ${TRIPWIRE_TARGETS[*]}\`).
@@ -643,11 +1108,11 @@ fi
 
 BUILD_TIMEOUT="${SABLE_PRE_PUSH_BUILD_TIMEOUT:-120}"
 
-BUILD_CMD=$(detect_build_cmd "$CWD" "$BASE_BRANCH")
+BUILD_CMD=$(detect_build_cmd "$PHASE_DIR" "$BASE_BRANCH")
 
 if [ -n "$BUILD_CMD" ]; then
   BUILD_EXIT=0
-  BUILD_OUT=$(cd "$CWD" && timeout "$BUILD_TIMEOUT" sh -c "$BUILD_CMD" 2>&1) || BUILD_EXIT=$?
+  BUILD_OUT=$(cd "$PHASE_DIR" && timeout "$BUILD_TIMEOUT" sh -c "$BUILD_CMD" 2>&1) || BUILD_EXIT=$?
 
   if [ "$BUILD_EXIT" -ne 0 ]; then
     if [ "$BUILD_EXIT" -eq 124 ]; then
@@ -656,7 +1121,9 @@ if [ -n "$BUILD_CMD" ]; then
       SUFFIX="Build failed. This phase CANNOT be skipped via SABLE_SKIP_PRE_PUSH — it is structurally required (build-only errors, e.g. Next.js page-export errors, pass typecheck and the test suite but fail the real build)."
     fi
     emit_deny "Pre-push phase 3 (build): build failed (\`$BUILD_CMD\`).
-${SUFFIX}
+${SUFFIX}${GATE_RECORD:+
+
+$GATE_RECORD}
 
 $(sable_tail_chars "$BUILD_OUT" 1500)"
     exit 0
@@ -670,23 +1137,26 @@ fi
 TEST_PHASE="${SABLE_PRE_PUSH_TEST_PHASE:-auto}"
 
 if [ "$TEST_PHASE" = "skip" ]; then
-  emit_context "Pre-push: rebase + static + build phases passed; test phase skipped (SABLE_PRE_PUSH_TEST_PHASE=skip). Repo git hooks handle test gating on the rebased state."
+  emit_context "Pre-push: rebase + static + build phases passed; test phase skipped (SABLE_PRE_PUSH_TEST_PHASE=skip). Repo git hooks handle test gating on the rebased state.${GATE_RECORD:+
+$GATE_RECORD}"
   exit 0
 fi
 
 if [ "${SABLE_SKIP_PRE_PUSH:-}" = "1" ]; then
-  emit_context "Pre-push: rebase + static + build phases passed; test phase bypassed (SABLE_SKIP_PRE_PUSH=1). Note: typecheck/lint/build were still enforced — bypass is now scoped to the test phase only."
+  emit_context "Pre-push: rebase + static + build phases passed; test phase bypassed (SABLE_SKIP_PRE_PUSH=1). Note: typecheck/lint/build were still enforced — bypass is now scoped to the test phase only.${GATE_RECORD:+
+$GATE_RECORD}"
   exit 0
 fi
 
-TEST_CMD=$(detect_test_cmd "$CWD" "$BASE_BRANCH")
+TEST_CMD=$(detect_test_cmd "$PHASE_DIR" "$BASE_BRANCH")
 
 if [ -z "$TEST_CMD" ]; then
-  emit_context "Pre-push: rebase + static + build phases passed; no test command detected (no package.json/pyproject.toml/Cargo.toml/go.mod found upward or in any changed-file subdir). Add a testCommand= line to .sable (checked in), or set sable.testCommand via git config, or set SABLE_TEST_COMMAND, to enforce tests before push."
+  emit_context "Pre-push: rebase + static + build phases passed; no test command detected (no package.json/pyproject.toml/Cargo.toml/go.mod found upward or in any changed-file subdir). Add a testCommand= line to .sable (checked in), or set sable.testCommand via git config, or set SABLE_TEST_COMMAND, to enforce tests before push.${GATE_RECORD:+
+$GATE_RECORD}"
   exit 0
 fi
 
-TEST_TIMEOUT=$(sable_resolve_test_timeout "$CWD")
+TEST_TIMEOUT=$(sable_resolve_test_timeout "$PHASE_DIR")
 TEST_EXIT=0
 # The RECORDED command is captured HERE, at the invocation site, from the same
 # variable the shell is about to execute — never re-resolved from config
@@ -696,7 +1166,7 @@ TEST_EXIT=0
 # report of what was enforced is not evidence of what was enforced, so the
 # only string this gate is allowed to certify is the one it ran.
 TEST_CMD_EXECUTED="$TEST_CMD"
-TEST_OUT=$(cd "$CWD" && timeout "$TEST_TIMEOUT" sh -c "$TEST_CMD_EXECUTED" 2>&1) || TEST_EXIT=$?
+TEST_OUT=$(cd "$PHASE_DIR" && timeout "$TEST_TIMEOUT" sh -c "$TEST_CMD_EXECUTED" 2>&1) || TEST_EXIT=$?
 
 # Prior intent, if a dispatcher declared one. Evidence only — it never selects
 # what runs, and when it disagrees with the executed command the DIVERGENCE is
@@ -717,14 +1187,16 @@ if [ "$TEST_EXIT" -ne 0 ]; then
   emit_deny "Pre-push phase 4 (tests): \`$TEST_CMD_EXECUTED\` failed.
 ${SUFFIX}
 
-${TEST_CMD_RECORD}
+${TEST_CMD_RECORD}${GATE_RECORD:+
+$GATE_RECORD}
 
 $(sable_tail_chars "$TEST_OUT" 1500)"
   exit 0
 fi
 
 emit_context "Pre-push: all phases passed.
-${TEST_CMD_RECORD}"
+${TEST_CMD_RECORD}${GATE_RECORD:+
+$GATE_RECORD}"
 exit 0
 }
 

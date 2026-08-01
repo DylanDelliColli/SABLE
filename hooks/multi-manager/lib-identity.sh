@@ -213,7 +213,10 @@ cmd = os.environ.get('CMD_STR', '')
 
 SHELL_SEPS = {';', '&&', '||', '|'}
 # git global flags that consume the next token as an argument
-CONSUME_NEXT = {'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path'}
+# --config-env (SABLE-j90ba B3 addendum): 'git --config-env=push.followTags=E
+# push' was walked as subcommand '--config-env=...', returned non-push, and
+# the push ran UNGATED past the whole gate.
+CONSUME_NEXT = {'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env'}
 # git global flags that are standalone (no next-arg consumed)
 STANDALONE = {
     '--no-pager', '-p', '--paginate', '-P', '--no-replace-objects', '--bare',
@@ -222,7 +225,7 @@ STANDALONE = {
     '--info-path', '--version', '--help',
 }
 # prefixes that are standalone flags (--exec-path=, --git-dir=, etc.)
-STANDALONE_PREFIXES = ('--exec-path=', '--git-dir=', '--work-tree=', '--namespace=')
+STANDALONE_PREFIXES = ('--exec-path=', '--git-dir=', '--work-tree=', '--namespace=', '--config-env=')
 
 ENV_ASSIGN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
@@ -259,6 +262,7 @@ def walk(tokens):
         if at_cmd_pos and tok == 'git':
             # Found git at command position — now walk flags
             i += 1
+            subcmd = None
             while i < n:
                 t = tokens[i]
                 if t in CONSUME_NEXT:
@@ -268,9 +272,18 @@ def walk(tokens):
                     i += 1
                     continue
                 # Not a known flag — this must be the subcommand
-                return t == 'push'
-            # Ran out of tokens after git — no subcommand found
-            return False
+                subcmd = t
+                break
+            if subcmd == 'push':
+                return True
+            # A NON-push git subcommand must not end the scan (SABLE-j90ba
+            # matcher blocker): 'git pull --rebase && git push origin main'
+            # used to return False at 'pull' and the trailing push ran
+            # UNGATED. Keep walking — a later 'git push' after a shell
+            # separator still matches; quoted mentions stay negative because
+            # shlex keeps them inside a single non-command-position token.
+            at_cmd_pos = False
+            continue
         # Not at command position or not git/env/assignment
         at_cmd_pos = False
         i += 1

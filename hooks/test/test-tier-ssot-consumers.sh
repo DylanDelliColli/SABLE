@@ -173,7 +173,14 @@ else
 fi
 
 # Mutate the SSOT (step 2): drop the passing beta suite, add a failing one.
+# COMMITTED (SABLE-j90ba): the pre-push hook now resolves and executes every
+# phase in a clean detached worktree at the pushed object, so an UNCOMMITTED
+# SSOT mutation is deliberately invisible to it — that invisibility is the
+# gate's dirty-overlay defense, not a resolution bug. Live re-resolution is
+# still what this case proves: same repo, only the committed SSOT changed.
 set_pre_push test-fixture-alpha.sh test-fixture-gamma.sh
+git -C "$REPO_DIR" add .github/ci/test-tiers.sh
+git -C "$REPO_DIR" commit -q -m "fixture: mutate pre_push tier (gamma in, beta out)"
 
 OUT2=$(run_hook "$PP_ENV" "$REPO_DIR")
 

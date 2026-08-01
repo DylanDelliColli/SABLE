@@ -184,8 +184,12 @@ assert_allow "skips -f shorthand" "$MGR_ENV" "git push -f" "/tmp"
 # ignored when agent_id is present, so MGR_ENV does not make it a manager.
 assert_deny "subagent without agent_type → worker push DENIED" "$MGR_ENV" "git push" "/tmp" "worker subagents do not push" "subagent-123"
 
-# Test 5: skips when CWD has no .git directory
-assert_allow "skips non-repo CWD" "$MGR_ENV" "git push" "/tmp/nonexistent-non-repo"
+# Test 5: non-repo CWD. REVISED under SABLE-j90ba B5: a known-push command
+# whose work tree cannot be resolved DENIES (fail closed) instead of exiting
+# silently — the silent exit was the same bypass shape git's parent-dir
+# search exploited from repo subdirs.
+assert_deny "non-repo CWD fails closed instead of silently allowing a known push" \
+  "$MGR_ENV" "git push" "/tmp/nonexistent-non-repo" "work tree"
 
 # ---------- Routing tests via SABLE_PRE_PUSH_TYPECHECK_COMMAND override ----------
 # Use a stand-in "typechecker" command (just `true` or `false`) to exercise the
@@ -209,6 +213,11 @@ git clone -q "$BARE_DIR" "$REPO_DIR"
 cd "$REPO_DIR" || { echo "FATAL: cd to fixture repo $REPO_DIR failed — aborting so fixture git ops never touch the real worktree"; exit 2; }
 git config user.email "test@test"
 git config user.name "Test"
+# Pin the local branch name to 'main': the clone of an EMPTY bare adopts the
+# host's init.defaultBranch, and the exact-object destination rule
+# (SABLE-j90ba) compares refspec destinations against the CURRENT branch
+# name — 'git push origin main' cases must not depend on host git config.
+git checkout -q -B main
 echo "x" > README.md
 git add -A
 git commit -q -m "init"
@@ -254,8 +263,18 @@ assert_context "no typecheck detected → static no-ops" "$NO_STATIC" "git push"
 SABLE_TESTCMD_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true"
 
 # Test 11b: .sable testCommand that fails → phase 3 denies, message names the
-# RESOLVED command (proves detect_test_cmd read .sable, not env/manifest)
-echo "testCommand=exit 42" > "$REPO_DIR/.sable"
+# RESOLVED command (proves detect_test_cmd read .sable, not env/manifest).
+# SABLE-j90ba: .sable is COMMITTED — the gate resolves configuration from the
+# clean worktree at the pushed object, so an uncommitted .sable edit is
+# deliberately invisible to it (a dirty edit could otherwise weaken the gate
+# with no diff trace).
+sable_commit_dotsable() {
+  # $1 = content
+  printf '%s\n' "$1" > "$REPO_DIR/.sable"
+  git -C "$REPO_DIR" add .sable
+  git -C "$REPO_DIR" commit -q -m "fixture: .sable testCommand"
+}
+sable_commit_dotsable "testCommand=exit 42"
 assert_deny "«.sable» testCommand resolved and enforced → failing command denies phase 3" \
   "$SABLE_TESTCMD_ENV" "git push" "$REPO_DIR" "exit 42"
 
@@ -269,7 +288,7 @@ assert_deny "«.sable» testCommand resolved and enforced → failing command de
 # the gate certified a narrower claim than it was configured to enforce while
 # printing "enforced". An allow that names what it ran is a strictly stronger
 # assertion than an allow that says nothing.
-echo "testCommand=true" > "$REPO_DIR/.sable"
+sable_commit_dotsable "testCommand=true"
 assert_context "«.sable» testCommand resolved and enforced → passing push RECORDS the executed command" \
   "$SABLE_TESTCMD_ENV" "git push" "$REPO_DIR" "enforced test command (executed): \`true\`"
 
@@ -280,7 +299,8 @@ assert_deny "repo-local git config testCommand wins over .sable file" \
   "$SABLE_TESTCMD_ENV" "git push" "$REPO_DIR" "exit 43"
 git -C "$REPO_DIR" config --unset sable.testCommand
 
-rm -f "$REPO_DIR/.sable"
+git -C "$REPO_DIR" rm -q -f .sable
+git -C "$REPO_DIR" commit -q -m "fixture: drop .sable"
 
 # ---------- testTimeout resolution tests (SABLE-pf0g) ----------
 # pre-push-rebase-test.sh previously read TEST_TIMEOUT only from
@@ -292,7 +312,7 @@ rm -f "$REPO_DIR/.sable"
 # resolution into phase 3 end to end (the lib function itself is covered
 # separately in test-lib-identity.sh).
 SABLE_TIMEOUT_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true SABLE_PRE_PUSH_TEST_TIMEOUT=1"
-echo "testCommand=sleep 2 && exit 0" > "$REPO_DIR/.sable"
+sable_commit_dotsable "testCommand=sleep 2 && exit 0"
 
 # Test 11e: with only the 1s env default in effect, a test command that takes
 # 2s is killed by `timeout` → phase 3 denies citing the exceeded timeout.
@@ -313,7 +333,7 @@ git -C "$REPO_DIR" config --unset sable.testTimeout
 # EXECUTED command — never the intent. SABLE-b99hy measured say-versus-do
 # divergence in both directions one drain apart, so a report of what was
 # enforced is not evidence of what was enforced.
-echo "testCommand=true" > "$REPO_DIR/.sable"
+sable_commit_dotsable "testCommand=true"
 assert_context "recorded-command: executed command is certified over a disagreeing prior intent" \
   "$SABLE_TESTCMD_ENV SABLE_TEST_COMMAND_INTENT=pytest_bin_full" "git push" "$REPO_DIR" \
   "DIVERGENCE: prior intent was \`pytest_bin_full\`"
@@ -335,7 +355,8 @@ else
   echo "PASS: recorded-command: agreeing intent must not report a divergence"
 fi
 
-rm -f "$REPO_DIR/.sable"
+git -C "$REPO_DIR" rm -q -f .sable
+git -C "$REPO_DIR" commit -q -m "fixture: drop .sable"
 
 # ---------- Shared matcher tests (SABLE-jpr / SABLE-0u1) ----------
 # The pre-push gate must fire for real git push variants (positives) and
@@ -351,9 +372,14 @@ MATCHER_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COM
 assert_context "matcher: 'git -C <path> push' reaches gate" \
   "$MATCHER_ENV" "git -C $REPO_DIR push origin main" "$REPO_DIR" "phase skipped"
 
-# Test 13: 'git -c a=b push origin main' reaches the gate
-assert_context "matcher: 'git -c a=b push origin main' reaches gate" \
-  "$MATCHER_ENV" "git -c http.extraheader=Authorization:bearer push origin main" "$REPO_DIR" "phase skipped"
+# Test 13: 'git -c a=b push origin main' reaches the gate. REVISED under
+# SABLE-j90ba: it still must reach the gate (the matcher claim), but the
+# exact-object leg now fail-closes on '-c' — a push-time config injection
+# (e.g. -c remote.origin.push=...) can expand the push after the gate's
+# repo-config soundness checks approved a single update. A deny proves reach
+# just as a context did.
+assert_deny "matcher: 'git -c a=b push origin main' reaches gate and is fail-closed on the -c global flag" \
+  "$MATCHER_ENV" "git -c http.extraheader=Authorization:bearer push origin main" "$REPO_DIR" "global flag -c"
 
 # Test 14: 'git --no-pager push' reaches the gate
 assert_context "matcher: 'git --no-pager push' reaches gate" \
@@ -372,13 +398,16 @@ assert_allow "matcher: 'echo git pushed' does NOT trigger gate" \
 assert_allow "matcher: 'git pushd' does NOT trigger gate" \
   "$MGR_ENV" "git pushd" "$REPO_DIR"
 
-# Test 18: 'SABLE_SKIP_PRE_PUSH=1 git push' reaches gate (env-assignment prefix, SABLE-531)
-# The env-assignment is part of the command string seen by the hook; the hook itself is
-# invoked normally (no SABLE_SKIP_PRE_PUSH in the env-i context).  With TEST_PHASE=skip
-# and a passing typecheck the hook should produce additionalContext (phase skipped),
-# confirming it passed the matcher and entered the gate.
-assert_context "matcher: 'SABLE_SKIP_PRE_PUSH=1 git push' reaches gate (env-assignment prefix)" \
-  "$MATCHER_ENV" "SABLE_SKIP_PRE_PUSH=1 git push" "$REPO_DIR" "phase skipped"
+# Test 18: 'SABLE_SKIP_PRE_PUSH=1 git push' reaches gate (env-assignment prefix, SABLE-531).
+# REVISED under SABLE-j90ba B3: the matcher must still SEE the push (that is
+# the SABLE-531 claim, and a deny proves reach exactly as a context did), but
+# the exact-object leg now fail-closes on EVERY leading assignment — the hook
+# validates git state without command-local env while the real push runs with
+# it (GIT_DIR redirects the repo; GIT_CONFIG_* injects push config). The
+# hook's own SABLE_SKIP_PRE_PUSH is read from the SESSION env, where a
+# command-prefix assignment never arrives anyway.
+assert_deny "matcher: 'SABLE_SKIP_PRE_PUSH=1 git push' reaches gate and is fail-closed as a leading env assignment" \
+  "$MATCHER_ENV" "SABLE_SKIP_PRE_PUSH=1 git push" "$REPO_DIR" "leading environment assignment"
 
 # ===================================================================
 # v3 identity gate — SABLE-404 / SABLE-yzl
@@ -1086,6 +1115,532 @@ assert_context "SABLE-digiy: repo without bin/sable-fixture-tripwire → checker
 
 # Cleanup
 rm -rf "$REPO_DIR" "$BARE_DIR" "$V3_YAML"
+
+# ===================================================================
+# SABLE-j90ba: exact-object push gate. The gate must validate the OBJECT
+# being pushed, not the checked-out working tree. UNSCOPED: applies to every
+# manager push traversing this hook (review ruling 2026-08-01 — explicit-
+# integration scoping belongs only to the provenance guard; scoping this leg
+# would preserve the vacuous-green defect in ordinary repos).
+#
+#   RED (pre-fix): R1 — a committed-failing test suite with a dirty
+#     working-tree edit that makes it pass produces a GREEN attributed to an
+#     object whose tests fail. R2 — pushing a ref that is not HEAD runs the
+#     phases against HEAD's tree and greens a never-tested object.
+#   GREEN (post-fix): R1 denies in phase 4 from a clean detached worktree at
+#     the final object; R2 denies at the single-update source rule.
+# ===================================================================
+
+# ---------- UNIT: sable_parse_push_update ----------
+assert_parse() {
+  local name="$1" cmd="$2" expect="$3"
+  local out
+  out=$(call_hook_fn sable_parse_push_update "$cmd" 2>/dev/null)
+  if [ "$out" = "$expect" ]; then
+    PASS=$((PASS+1))
+    echo "PASS: $name"
+  else
+    FAIL=$((FAIL+1))
+    FAIL_NAMES="$FAIL_NAMES\n  $name (got: ${out:0:200})"
+    echo "FAIL: $name"
+    echo "  Expected: $expect"
+    echo "  Got:      ${out:0:200}"
+  fi
+}
+
+assert_parse "parse: bare 'git push' is a single update of HEAD to the current branch" \
+  "git push" "update||||"
+assert_parse "parse: 'git push origin br' is an update br->br carrying the remote" \
+  "git push origin br" "update|origin|br|br|"
+assert_parse "parse: '-u origin br' is an update br->br (flag ignored)" \
+  "git push -u origin br" "update|origin|br|br|"
+assert_parse "parse: 'origin HEAD:refs/heads/br' is an update HEAD->br (dst normalized)" \
+  "git push origin HEAD:refs/heads/br" "update|origin|HEAD|br|"
+assert_parse "parse: a non-origin remote token is carried, not discarded" \
+  "git push backup main" "update|backup|main|main|"
+assert_parse "parse: '--delete origin br' is deletion-only" \
+  "git push --delete origin br" "delete|origin||br|"
+assert_parse "parse: 'origin :refs/heads/br' (empty source) is deletion-only" \
+  "git push origin :refs/heads/br" "delete|origin||br|"
+assert_parse "parse: bare ':' is git's MATCHING push, never deletion (B1)" \
+  "git push origin :" "unsupported||||colon refspec outside the pinned deletion form"
+assert_parse "parse: ':br' bare-name empty-source form is outside the pinned deletion surface" \
+  "git push origin :br" "unsupported||||colon refspec outside the pinned deletion form"
+assert_parse "parse: leading GIT_DIR assignment redirects the real push and is rejected (B3)" \
+  "GIT_DIR=/other/.git git push origin br" "unsupported||||leading environment assignment GIT_DIR"
+assert_parse "parse: leading GIT_CONFIG_* assignments inject push config and are rejected" \
+  "GIT_CONFIG_COUNT=1 git push origin br" "unsupported||||leading environment assignment GIT_CONFIG_COUNT"
+assert_parse "parse: brace expansion in a refspec is rejected (B4)" \
+  "git push origin {main,side}" "unsupported||||shell expansion syntax"
+assert_parse "parse: dollar refspec is rejected (pre-expansion text diverges from execution)" \
+  'git push origin $BR' "unsupported||||shell expansion syntax"
+assert_parse "parse: colon-dollar deletion form is rejected" \
+  'git push origin :$BR' "unsupported||||shell expansion syntax"
+assert_parse "parse: tilde -C path is rejected (resolver would treat it literally and quiet-exit)" \
+  "git -C ~/somerepo push" "unsupported||||shell expansion syntax"
+assert_parse "parse: '--config-env' reaches the parser (matcher fixed) and is rejected as a global flag" \
+  "git --config-env=push.followTags=E push" "unsupported||||global flag --config-env"
+assert_parse "parse: '--all' is unsupported" \
+  "git push --all origin" "unsupported||||flag --all"
+assert_parse "parse: '--mirror' is unsupported" \
+  "git push --mirror origin" "unsupported||||flag --mirror"
+assert_parse "parse: '--tags' is unsupported" \
+  "git push --tags origin" "unsupported||||flag --tags"
+assert_parse "parse: two refspecs are unsupported (multiple updates)" \
+  "git push origin br1 br2" "unsupported||||multiple refspecs"
+assert_parse "parse: mixed delete+update refspecs are unsupported" \
+  "git push origin :old new" "unsupported||||mixed delete and update"
+assert_parse "parse: forced '+src:dst' refspec is unsupported" \
+  "git push origin +br:br" "unsupported||||forced refspec"
+assert_parse "parse: unknown flag '--dry-run' is unsupported (fail closed)" \
+  "git push --dry-run origin br" "unsupported||||flag --dry-run"
+assert_parse "parse: 'git -C /x push origin br' accepts the resolved -C global flag" \
+  "git -C /x/y push origin br" "update|origin|br|br|"
+assert_parse "parse: '--git-dir' redirects the repo and is rejected (fail closed)" \
+  "git --git-dir=/other/repo push origin br" "unsupported||||global flag --git-dir"
+assert_parse "parse: '--work-tree' redirects the tree and is rejected" \
+  "git --work-tree=/x push origin br" "unsupported||||global flag --work-tree"
+assert_parse "parse: '-c' can inject push config at push time and is rejected" \
+  "git -c remote.origin.push=refs/heads/a:refs/heads/b push" "unsupported||||global flag -c"
+assert_parse "parse: '--bare' is rejected" \
+  "git --bare push origin br" "unsupported||||global flag --bare"
+assert_parse "parse: a different local source still parses (denial happens at resolution)" \
+  "git push origin other:target" "update|origin|other|target|"
+assert_parse "parse: compound command with two push invocations is unsupported" \
+  "git push origin br && git push origin other" "unsupported||||compound command"
+assert_parse "parse: compound command via semicolon is unsupported" \
+  "git push origin br; echo done" "unsupported||||compound command"
+assert_parse "parse: compound command via pipe is unsupported" \
+  "git push origin br | cat" "unsupported||||compound command"
+
+# ---------- INTEGRATION: the j90ba fixture ----------
+# The committed runner is STABLE across branches: it checks a committed
+# PRODUCTION file (app.txt must contain 'good') and rejects the untracked
+# overlay file — one committed suite discriminates clean-object execution
+# from working-tree execution in both directions, with the dirtied file
+# being production code, never the test runner itself.
+J90_BARE="$TMPROOT/j90ba-bare.git"
+J90_REPO="$TMPROOT/j90ba-repo"
+rm -rf "$J90_BARE" "$J90_REPO"
+git init -q --bare "$J90_BARE"
+git clone -q "$J90_BARE" "$J90_REPO" 2>/dev/null
+(
+  cd "$J90_REPO" || exit 1
+  git config user.email t@t; git config user.name t
+  git checkout -q -B main
+  printf 'test "$(cat app.txt)" = good && test ! -f scratch-note.txt\n' > run-tests.sh
+  printf 'good\n' > app.txt
+  printf 'testCommand=bash ./run-tests.sh\n' > .sable
+  git add -A; git commit -q -m base
+  git push -q "$J90_BARE" HEAD:refs/heads/main
+  git checkout -q -b wk-dirty
+  printf 'bad\n' > app.txt
+  git add app.txt; git commit -q -m 'committed failing production file'
+  git config sable.integrationBranch main
+  # Dirty overlay on the PRODUCTION file: the WORKING TREE passes while the
+  # pushed OBJECT fails.
+  printf 'good\n' > app.txt
+)
+J90_ENV="$MGR_ENV SABLE_PRE_PUSH_TYPECHECK_COMMAND=true"
+
+# R1 (RED pre-fix): a dirty tracked PRODUCTION file must not green an object
+# whose committed state fails — the phases must run the OBJECT, not the
+# working tree.
+assert_deny "j90ba R1: dirty tracked production file cannot green a committed-failing object (clean-worktree phase 4)" \
+  "$J90_ENV" "git push origin wk-dirty" "$J90_REPO" "phase 4"
+
+# Failure-path admin cleanup: the deny above must leave no gate worktree
+# behind (asserted on worktree ADMIN state, not file presence).
+J90_WT_AFTER_DENY=$(git -C "$J90_REPO" worktree list 2>/dev/null | wc -l | tr -d ' ')
+if [ "$J90_WT_AFTER_DENY" = "1" ]; then
+  PASS=$((PASS+1))
+  echo "PASS: j90ba cleanup: deny path leaves no gate worktree admin entry"
+else
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  j90ba cleanup after deny: expected 1 worktree, got $J90_WT_AFTER_DENY"
+  echo "FAIL: j90ba cleanup after deny: expected 1 worktree, got $J90_WT_AFTER_DENY"
+  git -C "$J90_REPO" worktree list
+fi
+
+# R2 (RED pre-fix): push-by-ref from a shared checkout — HEAD on main, an
+# unrelated untracked file present (the exact shape of the 2026-07-30
+# incident) — must be denied by the single-update source rule, never
+# validated-by-proxy against HEAD's tree. checkout -f: R1's dirty overlay
+# must not block the branch switch (it silently did on the first run).
+( cd "$J90_REPO" && git checkout -q -f main )
+echo scratch > "$J90_REPO/scratch-note.txt"
+assert_deny "j90ba R2: shared-checkout push-by-ref of a non-HEAD object is denied (source rule), not greened against HEAD's tree" \
+  "$J90_ENV" "git push origin wk-dirty:refs/heads/wk-dirty" "$J90_REPO" "not the current HEAD"
+
+# Untracked overlay (RED pre-fix): with the unrelated untracked file still
+# present, an accepted-form push of main must GREEN — the committed suite
+# passes in the clean worktree; legacy working-tree execution fails it.
+assert_context "j90ba untracked overlay: unrelated untracked file cannot alter the object's verdict" \
+  "$J90_ENV" "git push" "$J90_REPO" "all phases passed"
+rm -f "$J90_REPO/scratch-note.txt"
+
+# A REAL shared-checkout push-by-ref, exercised THROUGH the guard decision
+# (acceptance criterion 7). Instrument positive control first: the literal
+# push-by-ref genuinely publishes the non-HEAD object to the bare remote.
+# Then a consumer executes the SAME literal push only when the hook did not
+# deny — pre-fix the hook greens, the bad push really lands, and the case is
+# red; post-fix the gate denies and the destination stays absent.
+J90_WKDIRTY_SHA=$(git -C "$J90_REPO" rev-parse wk-dirty)
+git -C "$J90_REPO" push -q "$J90_BARE" wk-dirty:refs/heads/probe-instrument 2>/dev/null
+J90_PROBE_SHA=$(git -C "$J90_BARE" rev-parse --verify --quiet probe-instrument 2>/dev/null || echo missing)
+git -C "$J90_REPO" push -q "$J90_BARE" :refs/heads/probe-instrument 2>/dev/null
+if [ "$J90_PROBE_SHA" = "$J90_WKDIRTY_SHA" ]; then
+  PASS=$((PASS+1))
+  echo "PASS: j90ba push-by-ref instrument: the literal push publishes the non-HEAD object (positive control)"
+else
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  j90ba push-by-ref instrument (got $J90_PROBE_SHA want $J90_WKDIRTY_SHA)"
+  echo "FAIL: j90ba push-by-ref instrument: expected $J90_WKDIRTY_SHA got $J90_PROBE_SHA"
+fi
+J90_R2_CMD="git -C $J90_REPO push origin wk-dirty:refs/heads/probe-guarded"
+J90_R2_OUT=$(run_hook "$J90_ENV" "$J90_R2_CMD" "$J90_REPO")
+if ! echo "$J90_R2_OUT" | grep -q '"permissionDecision": "deny"'; then
+  # Consumer honors the guard decision: no deny -> the push executes for real.
+  git -C "$J90_REPO" push -q origin wk-dirty:refs/heads/probe-guarded 2>/dev/null
+fi
+J90_GUARDED_REF=$(git -C "$J90_BARE" rev-parse --verify --quiet probe-guarded 2>/dev/null || echo absent)
+git -C "$J90_REPO" push -q "$J90_BARE" :refs/heads/probe-guarded 2>/dev/null || true
+if echo "$J90_R2_OUT" | grep -q '"permissionDecision": "deny"' && [ "$J90_GUARDED_REF" = "absent" ]; then
+  PASS=$((PASS+1))
+  echo "PASS: j90ba real push-by-ref through the guard: denied, and the destination ref never appeared on the remote"
+else
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  j90ba real push-by-ref through the guard (ref=$J90_GUARDED_REF out: ${J90_R2_OUT:0:150})"
+  echo "FAIL: j90ba real push-by-ref through the guard: ref=$J90_GUARDED_REF"
+  echo "  Got: ${J90_R2_OUT:0:300}"
+fi
+
+# Accepted forms (positive controls): each pinned form passes on a clean
+# checkout of main whose committed suite passes.
+assert_context "j90ba accepted form: bare 'git push'" \
+  "$J90_ENV" "git push" "$J90_REPO" "all phases passed"
+assert_context "j90ba accepted form: 'git push origin main'" \
+  "$J90_ENV" "git push origin main" "$J90_REPO" "all phases passed"
+assert_context "j90ba accepted form: 'git push -u origin main'" \
+  "$J90_ENV" "git push -u origin main" "$J90_REPO" "all phases passed"
+assert_context "j90ba accepted form: 'git push origin HEAD:refs/heads/main'" \
+  "$J90_ENV" "git push origin HEAD:refs/heads/main" "$J90_REPO" "all phases passed"
+
+# Named verdict: the green names source ref, destination, final object, and
+# base object — LITERAL values, not presence-only.
+J90_MAIN_SHA=$(git -C "$J90_REPO" rev-parse HEAD)
+J90_BASE_SHA=$(git -C "$J90_REPO" rev-parse origin/main)
+assert_context "j90ba named verdict: green names the final object" \
+  "$J90_ENV" "git push" "$J90_REPO" "final object $J90_MAIN_SHA"
+assert_context "j90ba named verdict: green names the exact source ref" \
+  "$J90_ENV" "git push" "$J90_REPO" "source ref 'HEAD'"
+assert_context "j90ba named verdict: green names the destination" \
+  "$J90_ENV" "git push" "$J90_REPO" "destination 'main'"
+assert_context "j90ba named verdict: green names the exact base object and base ref" \
+  "$J90_ENV" "git push" "$J90_REPO" "base object $J90_BASE_SHA (origin/main)"
+
+# Rebase-SHA-change: origin/main advances beneath a worker branch; phase 1
+# rebases it, and the verdict must name the POST-rebase final object — never
+# the pre-push SHA (which no longer exists on the branch).
+(
+  cd "$J90_REPO" || exit 1
+  git checkout -q -f -b wk-behind
+  echo w > w-behind.txt; git add w-behind.txt; git commit -q -m w-behind
+  git checkout -q -f main
+  echo adv > advance.txt; git add advance.txt; git commit -q -m advance
+  git push -q "$J90_BARE" HEAD:refs/heads/main
+  git checkout -q -f wk-behind
+)
+J90_PRE_REBASE_SHA=$(git -C "$J90_REPO" rev-parse wk-behind)
+J90_REBASE_OUT=$(run_hook "$J90_ENV" "git push origin wk-behind" "$J90_REPO")
+J90_POST_REBASE_SHA=$(git -C "$J90_REPO" rev-parse wk-behind)
+if [ "$J90_POST_REBASE_SHA" != "$J90_PRE_REBASE_SHA" ] \
+   && echo "$J90_REBASE_OUT" | grep -qF "final object $J90_POST_REBASE_SHA" \
+   && echo "$J90_REBASE_OUT" | grep -qF "all phases passed"; then
+  PASS=$((PASS+1))
+  echo "PASS: j90ba rebase-SHA-change: verdict names the post-rebase final object"
+else
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  j90ba rebase-SHA-change (pre=$J90_PRE_REBASE_SHA post=$J90_POST_REBASE_SHA got: ${J90_REBASE_OUT:0:200})"
+  echo "FAIL: j90ba rebase-SHA-change: verdict must name the post-rebase final object"
+  echo "  pre=$J90_PRE_REBASE_SHA post=$J90_POST_REBASE_SHA"
+  echo "  Got: ${J90_REBASE_OUT:0:300}"
+fi
+( cd "$J90_REPO" && git checkout -q -f main )
+
+# Post-rebase source divergence: a LITERAL SHA source frozen at the
+# pre-rebase object would make git push the OLD object while the gate
+# validated the rebased one — deny (the 'source SHA changed by rebase'
+# negative control, in its real form).
+(
+  cd "$J90_REPO" || exit 1
+  git checkout -q -f -b wk-pinned
+  echo p > p-pinned.txt; git add p-pinned.txt; git commit -q -m p-pinned
+  git checkout -q -f main
+  echo adv2 > advance2.txt; git add advance2.txt; git commit -q -m advance2
+  git push -q "$J90_BARE" HEAD:refs/heads/main
+  git checkout -q -f wk-pinned
+)
+J90_PINNED_SHA=$(git -C "$J90_REPO" rev-parse wk-pinned)
+assert_deny "j90ba post-rebase source divergence: literal-SHA source frozen at the pre-rebase object is denied" \
+  "$J90_ENV" "git push origin $J90_PINNED_SHA:refs/heads/wk-pinned" "$J90_REPO" "no longer resolves"
+( cd "$J90_REPO" && git checkout -q -f main )
+
+# Bare-push destination under push.default=upstream resolves the UPSTREAM
+# branch name (which may differ from the current branch); under simple with
+# a differing upstream, git itself refuses, so the gate fails closed.
+(
+  cd "$J90_REPO" || exit 1
+  git checkout -q -f -b wk-up main
+  git push -q "$J90_BARE" wk-up:refs/heads/upstream-dest
+  git fetch -q origin
+  git branch -q --set-upstream-to=origin/upstream-dest wk-up
+)
+git -C "$J90_REPO" config push.default upstream
+assert_context "j90ba bare push under push.default=upstream certifies the upstream destination" \
+  "$J90_ENV" "git push" "$J90_REPO" "destination 'upstream-dest'"
+git -C "$J90_REPO" config push.default simple
+assert_deny "j90ba bare push under push.default=simple with a differing upstream name is denied" \
+  "$J90_ENV" "git push" "$J90_REPO" "differing"
+git -C "$J90_REPO" config --unset push.default
+( cd "$J90_REPO" && git checkout -q -f main && git branch -q -D wk-up )
+
+# Deletion carve-out: allowed through WITHOUT claiming object validation.
+assert_context "j90ba deletion-only: '--delete' is allowed without claiming object validation" \
+  "$J90_ENV" "git push --delete origin wk-dirty" "$J90_REPO" "object validation not claimed"
+assert_context "j90ba deletion-only: empty-source ':refs/heads/x' form is allowed" \
+  "$J90_ENV" "git push origin :refs/heads/wk-dirty" "$J90_REPO" "object validation not claimed"
+
+# Fail-closed denials at the parse/destination layer.
+assert_deny "j90ba deny: '--all' is unsupported in the initial surface" \
+  "$J90_ENV" "git push --all origin" "$J90_REPO" "exactly one"
+assert_deny "j90ba deny: '--mirror' is unsupported" \
+  "$J90_ENV" "git push --mirror origin" "$J90_REPO" "exactly one"
+assert_deny "j90ba deny: multiple refspecs are unsupported" \
+  "$J90_ENV" "git push origin main wk-dirty" "$J90_REPO" "exactly one"
+assert_deny "j90ba deny: mixed delete+update is unsupported" \
+  "$J90_ENV" "git push origin :wk-dirty main" "$J90_REPO" "exactly one"
+assert_deny "j90ba deny: destination that is not the current branch's own name/upstream" \
+  "$J90_ENV" "git push origin HEAD:refs/heads/other-dest" "$J90_REPO" "destination"
+assert_deny "j90ba deny: compound command with a second push is not certified" \
+  "$J90_ENV" "git push origin main && git push origin wk-dirty" "$J90_REPO" "exactly one"
+assert_deny "j90ba deny: a push AFTER a non-push git command still reaches the gate and fails closed" \
+  "$J90_ENV" "git status && git push" "$J90_REPO" "exactly one"
+assert_deny "j90ba deny: 'git pull --rebase && git push origin main' is not an ungated push" \
+  "$J90_ENV" "git pull --rebase && git push origin main" "$J90_REPO" "exactly one"
+# Parse-order regression (reproduced 2026-08-01): a compound whose FIRST
+# 'git -C' targets a NON-repo used to resolve that dir, hit the non-repo
+# early exit, and let the trailing push run ungated (empty output).
+# Classification must fail closed BEFORE repo resolution.
+assert_deny "j90ba deny: nonrepo-leading compound cannot exit quietly before classification" \
+  "$J90_ENV" "git -C $TMPROOT status && git -C $J90_REPO push origin wk-dirty" "$TMPROOT" "exactly one"
+
+# Wrong-remote negative: a push to a remote that is not the branch's
+# effective push remote must not be certified against origin's refs.
+git -C "$J90_REPO" remote add backup "$J90_BARE"
+assert_deny "j90ba deny: push to a non-effective remote ('backup') is not certified" \
+  "$J90_ENV" "git push backup main" "$J90_REPO" "remote"
+git -C "$J90_REPO" remote remove backup
+
+# Config-expansion soundness: a bare push under push.default=matching (or any
+# remote.<name>.push refspec) is NOT provably a single update — deny.
+git -C "$J90_REPO" config push.default matching
+assert_deny "j90ba deny: bare push under push.default=matching is not provably single-update" \
+  "$J90_ENV" "git push" "$J90_REPO" "push.default"
+git -C "$J90_REPO" config --unset push.default
+git -C "$J90_REPO" config remote.origin.push "refs/heads/*:refs/heads/*"
+assert_deny "j90ba deny: bare push with a remote.origin.push refspec is not provably single-update" \
+  "$J90_ENV" "git push" "$J90_REPO" "remote.origin.push"
+git -C "$J90_REPO" config --unset remote.origin.push
+
+# B1 e2e: bare ':' must never take the deletion carve-out (real git: it is a
+# MATCHING push that can move remote branches).
+assert_deny "j90ba deny: bare ':' refspec is matching-push, not deletion — fails closed" \
+  "$J90_ENV" "git push origin :" "$J90_REPO" "exactly one"
+
+# B3 e2e: a GIT_DIR-prefixed push redirects the real git while the hook
+# validates CWD — denied at the parse layer.
+assert_deny "j90ba deny: GIT_DIR-prefixed push is rejected (env redirects the real command)" \
+  "$J90_ENV" "GIT_DIR=$TMPROOT git push origin main" "$J90_REPO" "exactly one"
+
+# B2 e2e with real-git semantic proof: push.followTags expands an explicit
+# single-branch push with annotated tags; remote.origin.mirror expands any
+# push to every ref. Prove the expansion with --dry-run --porcelain on THIS
+# git, then assert the gate denies each.
+git -C "$J90_REPO" tag -a v1-semantic -m v1 2>/dev/null
+git -C "$J90_REPO" config push.followTags true
+J90_FT_LINES=$(git -C "$J90_REPO" push --dry-run --porcelain origin main 2>/dev/null | grep -c "refs/")
+if [ "$J90_FT_LINES" -ge 2 ]; then
+  PASS=$((PASS+1))
+  echo "PASS: j90ba semantic proof: push.followTags expands 'origin main' to $J90_FT_LINES ref updates on this git"
+else
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  j90ba followTags semantic proof (got $J90_FT_LINES ref lines)"
+  echo "FAIL: j90ba semantic proof: expected >=2 ref updates under push.followTags, got $J90_FT_LINES"
+fi
+assert_deny "j90ba deny: push.followTags=true disproves exactly-one on an explicit update push" \
+  "$J90_ENV" "git push origin main" "$J90_REPO" "push.followTags"
+git -C "$J90_REPO" config --unset push.followTags
+git -C "$J90_REPO" config remote.origin.mirror true
+J90_MIR_LINES=$(git -C "$J90_REPO" push --dry-run --porcelain origin 2>/dev/null | grep -c "refs/")
+if [ "$J90_MIR_LINES" -ge 2 ]; then
+  PASS=$((PASS+1))
+  echo "PASS: j90ba semantic proof: remote.origin.mirror expands a push to $J90_MIR_LINES ref updates on this git"
+else
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  j90ba mirror semantic proof (got $J90_MIR_LINES ref lines)"
+  echo "FAIL: j90ba semantic proof: expected >=2 ref updates under remote.origin.mirror, got $J90_MIR_LINES"
+fi
+assert_deny "j90ba deny: remote.origin.mirror=true disproves exactly-one for any push" \
+  "$J90_ENV" "git push origin main" "$J90_REPO" "remote.origin.mirror"
+git -C "$J90_REPO" config --unset remote.origin.mirror
+git -C "$J90_REPO" tag -d v1-semantic >/dev/null 2>&1
+
+# Regression (near-miss during implementation): a DIRTY .sable cannot weaken
+# the gate — the OBJECT's committed testCommand governs.
+(
+  cd "$J90_REPO" || exit 1
+  git checkout -q -f -b wk-weaken main
+  printf 'testCommand=exit 47\n' > .sable
+  git add .sable; git commit -q -m 'committed failing testCommand'
+  printf 'testCommand=true\n' > .sable
+)
+assert_deny "j90ba dirty .sable cannot weaken the gate (committed exit 47 governs)" \
+  "$J90_ENV" "git push origin wk-weaken" "$J90_REPO" "exit 47"
+( cd "$J90_REPO" && git checkout -q -f main && git branch -q -D wk-weaken )
+
+# B4 e2e counterexample: a branch LITERALLY named '{main,side}' is valid to
+# git; pre-fix the parser certifies it as one update (src resolves, ==HEAD,
+# dst==CURRENT) while Bash expands the same text into TWO refspecs at
+# execution. The gate must deny on the expansion-capable text itself.
+( cd "$J90_REPO" && git checkout -q -f -b "{main,side}" main )
+assert_deny "j90ba B4: literally-brace-named branch cannot be certified (shell would expand to two refspecs)" \
+  "$J90_ENV" "git push origin {main,side}" "$J90_REPO" "expansion"
+( cd "$J90_REPO" && git checkout -q -f main && git branch -q -D "{main,side}" )
+
+# B4 -C variant: 'git -C ~/repo push' must deny at parse, NOT quiet-exit via
+# the resolver treating tilde literally as a non-repo (same bypass class as
+# the parse-order blocker) while Bash expands it and pushes for real.
+assert_deny "j90ba B4: tilde -C path denies at parse instead of quiet-exiting as non-repo" \
+  "$J90_ENV" "git -C ~/nonexistent-gate-probe push" "$TMPROOT" "expansion"
+
+# B3 addendum e2e: --config-env now reaches the gate (matcher fixed) and the
+# parser fails it closed as an unproved global flag.
+assert_deny "j90ba B3: '--config-env' push reaches the gate and is denied, not bypassed as non-push" \
+  "$J90_ENV" "git --config-env=push.followTags=E push" "$J90_REPO" "global flag --config-env"
+
+# B5: git searches parent dirs — a push from repo/subdir (ambient cwd or -C
+# target) gates the REPO, never quiet-exits; unresolvable/bare targets DENY.
+mkdir -p "$J90_REPO/subdir-b5"
+assert_context "j90ba B5: ambient-subdir push resolves the toplevel and is fully gated" \
+  "$J90_ENV" "git push" "$J90_REPO/subdir-b5" "all phases passed"
+assert_context "j90ba B5: '-C repo/subdir push' resolves the toplevel and is fully gated" \
+  "$J90_ENV" "git -C $J90_REPO/subdir-b5 push" "$TMPROOT" "all phases passed"
+assert_deny "j90ba B5: '-C <bare-repo> push' denies (no work tree), never silently allows" \
+  "$J90_ENV" "git -C $J90_BARE push origin main" "$TMPROOT" "work tree"
+rmdir "$J90_REPO/subdir-b5"
+
+# Checkout-hook suppression: this machine's repos set core.hooksPath (bd
+# shims include post-checkout); materializing the gate worktree must NOT run
+# them (cost + mutable bd state inside a validation step).
+J90_HOOKS_DIR="$TMPROOT/j90-hookspath"
+mkdir -p "$J90_HOOKS_DIR"
+printf '#!/usr/bin/env bash\necho fired > "%s/j90-hook-fired"\n' "$TMPROOT" > "$J90_HOOKS_DIR/post-checkout"
+chmod +x "$J90_HOOKS_DIR/post-checkout"
+git -C "$J90_REPO" config core.hooksPath "$J90_HOOKS_DIR"
+J90_HOOKS_OUT=$(run_hook "$J90_ENV" "git push" "$J90_REPO")
+git -C "$J90_REPO" config --unset core.hooksPath
+if [ ! -f "$TMPROOT/j90-hook-fired" ] && echo "$J90_HOOKS_OUT" | grep -qF "all phases passed"; then
+  PASS=$((PASS+1))
+  echo "PASS: j90ba hooksPath: gate materialization does not run checkout hooks"
+else
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  j90ba hooksPath suppression (fired=$([ -f "$TMPROOT/j90-hook-fired" ] && echo yes || echo no) got: ${J90_HOOKS_OUT:0:200})"
+  echo "FAIL: j90ba hooksPath: checkout hook fired during gate materialization or push not green"
+fi
+rm -f "$TMPROOT/j90-hook-fired"
+
+# Signal cleanup: TERM delivered mid-phase-4 (slow test command) must still
+# tear down the gate worktree ADMIN entry via the trap. setsid gives the hook
+# its own process group so TERM reaches the in-flight child too (bash defers
+# traps until the foreground child exits).
+git -C "$J90_REPO" config sable.testCommand "sleep 30"
+J90_SIG_INPUT=$(make_input "git push" "$J90_REPO")
+env -i PATH="$PATH" CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
+  SABLE_PRE_PUSH_TYPECHECK_COMMAND=true \
+  setsid bash "$HOOK" <<< "$J90_SIG_INPUT" >/dev/null 2>&1 &
+J90_SIG_PID=$!
+J90_SIG_SEEN=0
+for _ in $(seq 1 50); do
+  if [ "$(git -C "$J90_REPO" worktree list 2>/dev/null | wc -l | tr -d ' ')" = "2" ]; then
+    J90_SIG_SEEN=1
+    break
+  fi
+  sleep 0.2
+done
+kill -TERM -- "-$J90_SIG_PID" 2>/dev/null
+wait "$J90_SIG_PID" 2>/dev/null
+sleep 0.5
+J90_SIG_WT=$(git -C "$J90_REPO" worktree list 2>/dev/null | wc -l | tr -d ' ')
+git -C "$J90_REPO" config --unset sable.testCommand
+if [ "$J90_SIG_SEEN" = "1" ] && [ "$J90_SIG_WT" = "1" ]; then
+  PASS=$((PASS+1))
+  echo "PASS: j90ba signal cleanup: TERM mid-phase tears down the gate worktree admin entry"
+else
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  j90ba signal cleanup (materialized=$J90_SIG_SEEN worktrees-after=$J90_SIG_WT)"
+  echo "FAIL: j90ba signal cleanup: materialized=$J90_SIG_SEEN worktrees-after-TERM=$J90_SIG_WT"
+fi
+
+# Dependency-bridge fixture (portability): committed test code requires an
+# IGNORED untracked dependency dir (node_modules/gate-probe) AND asserts an
+# unrelated untracked SOURCE file is absent. One committed suite proves both
+# halves: the audited bridge makes ignored deps visible in the gate worktree,
+# while untracked source stays excluded. Without the bridge this push denies
+# (probe missing); with an over-broad bridge it also denies (stray present).
+J90DEP_BARE="$TMPROOT/j90dep-bare.git"
+J90DEP="$TMPROOT/j90dep-repo"
+rm -rf "$J90DEP_BARE" "$J90DEP"
+git init -q --bare "$J90DEP_BARE"
+git clone -q "$J90DEP_BARE" "$J90DEP" 2>/dev/null
+(
+  cd "$J90DEP" || exit 1
+  git config user.email t@t; git config user.name t
+  git checkout -q -B main
+  printf 'node_modules/\n' > .gitignore
+  printf 'test -f node_modules/gate-probe && test ! -f stray-source.txt\n' > run-tests.sh
+  printf 'testCommand=bash ./run-tests.sh\n' > .sable
+  git add -A; git commit -q -m base
+  git push -q "$J90DEP_BARE" HEAD:refs/heads/main
+  mkdir -p node_modules
+  echo probe > node_modules/gate-probe
+  echo stray > stray-source.txt
+)
+assert_context "j90ba dependency bridge: ignored node_modules is bridged into the gate worktree while untracked source stays excluded" \
+  "$J90_ENV" "git push" "$J90DEP" "all phases passed"
+assert_context "j90ba dependency bridge: the verdict names what was bridged" \
+  "$J90_ENV" "git push" "$J90DEP" "bridged ignored dependency dir(s): node_modules"
+rm -rf "$J90DEP_BARE" "$J90DEP"
+
+# Unscoped control: a repo with NO explicit integration config is still
+# governed — a multi-refspec push is denied there too.
+J90_PLAIN_BARE="$TMPROOT/j90ba-plain-bare.git"
+J90_PLAIN="$TMPROOT/j90ba-plain-repo"
+rm -rf "$J90_PLAIN_BARE" "$J90_PLAIN"
+git init -q --bare "$J90_PLAIN_BARE"
+git clone -q "$J90_PLAIN_BARE" "$J90_PLAIN" 2>/dev/null
+(
+  cd "$J90_PLAIN" || exit 1
+  git config user.email t@t; git config user.name t
+  git checkout -q -B main
+  echo x > f.txt; git add -A; git commit -q -m init
+  git push -q "$J90_PLAIN_BARE" HEAD:refs/heads/main
+  git checkout -q -b side
+)
+J90_PLAIN_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true SABLE_PRE_PUSH_TEST_PHASE=skip"
+assert_deny "j90ba unscoped: multi-refspec push is denied even without explicit integration config" \
+  "$J90_PLAIN_ENV" "git push origin main side" "$J90_PLAIN" "exactly one"
+rm -rf "$J90_BARE" "$J90_REPO" "$J90_PLAIN_BARE" "$J90_PLAIN"
 
 # ---------- Summary ----------
 

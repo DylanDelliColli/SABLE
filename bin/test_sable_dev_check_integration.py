@@ -483,7 +483,16 @@ def gate_repo(tmp_path_factory) -> Path:
         ["git", "-C", str(repo), "remote", "add", "origin", str(bare)], check=True,
     )
     subprocess.run(["git", "-C", str(repo), "fetch", "-q", "origin"], check=True)
+    # COMMITTED (SABLE-j90ba): the gate resolves configuration from a clean
+    # detached worktree at the pushed object, so an uncommitted .sable is
+    # deliberately invisible to it (that invisibility is the dirty-overlay
+    # defense, not a resolution bug).
     (repo / ".sable").write_text("testCommand=true\n")
+    subprocess.run(["git", "-C", str(repo), "add", ".sable"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "fixture: .sable testCommand"],
+        check=True,
+    )
     return repo
 
 
