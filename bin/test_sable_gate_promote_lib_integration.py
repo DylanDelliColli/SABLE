@@ -731,6 +731,135 @@ def _real_two_repo_sandbox(tmp_path):
     return str(work), str(bare), branch_sha
 
 
+def _real_worker_worktree_sandbox(tmp_path):
+    """A bare origin, stable main checkout, and disposable worker worktree.
+
+    The worker is the repo argument passed to promote(), matching the live
+    SABLE-fxe84 reproduction rather than the usual tests that promote from the
+    stable main checkout and therefore cannot expose a removed-CWD failure.
+    """
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "trunk", str(bare)],
+                   check=True, capture_output=True)
+    main = tmp_path / "main"
+    subprocess.run(["git", "clone", "-q", str(bare), str(main)],
+                   check=True, capture_output=True)
+    for args in (("config", "user.email", "t@sable.invalid"),
+                 ("config", "user.name", "SABLE Test")):
+        subprocess.run(["git", "-C", str(main), *args], check=True, capture_output=True)
+    (main / "README.md").write_text("trunk\n")
+    subprocess.run(["git", "-C", str(main), "add", "-A"], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-q", "-m", "init"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(main), "push", "-q", "origin", "trunk"],
+                   check=True, capture_output=True)
+    base_sha = subprocess.run(
+        ["git", "-C", str(main), "rev-parse", "trunk"], check=True,
+        capture_output=True, text=True).stdout.strip()
+
+    subprocess.run(["git", "-C", str(main), "checkout", "-q", "-b", "wk-x"],
+                   check=True, capture_output=True)
+    (main / "feature.txt").write_text("landing\n")
+    subprocess.run(["git", "-C", str(main), "add", "-A"], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-q", "-m", "feature"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(main), "push", "-q", "origin", "wk-x"],
+                   check=True, capture_output=True)
+    branch_sha = subprocess.run(
+        ["git", "-C", str(main), "rev-parse", "wk-x"], check=True,
+        capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "-C", str(main), "checkout", "-q", "trunk"],
+                   check=True, capture_output=True)
+
+    worker = tmp_path / "worker"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(worker), "wk-x"],
+                   check=True, capture_output=True)
+    ci_ref = "ci-verify/wk-x-fixture"
+    subprocess.run(
+        ["git", "-C", str(main), "push", "-q", "origin",
+         f"{branch_sha}:refs/heads/{ci_ref}"],
+        check=True, capture_output=True)
+    return main, worker, bare, base_sha, branch_sha, ci_ref
+
+
+def _sandbox_ref(repo, ref):
+    cp = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", ref],
+        check=False, capture_output=True, text=True)
+    return cp.stdout.strip() if cp.returncode == 0 else None
+
+
+def _stub_cleanup_order_promote_seams(monkeypatch, branch_sha, ci_ref, conclusion):
+    """Keep git cleanup/ref deletion real; isolate unrelated gate services."""
+    monkeypatch.setattr(promote_lib, "assert_not_frozen", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "assert_landing_pair_satisfied", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "assert_coverage_floor", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "_adoption_miss_optimistic", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "_append_evidence", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "_stamp_attention_record", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "_notify", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib, "_report_identifier_decay", lambda *a, **kw: None)
+    monkeypatch.setattr(promote_lib.budget_lib, "check_and_file", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        promote_lib.preview, "materialize_preview",
+        lambda *a, **kw: (branch_sha, ci_ref, False))
+    monkeypatch.setattr(
+        promote_lib.preview, "acquire_verdict",
+        lambda *a, **kw: promote_lib.classify.Verdict(
+            conclusion, "http://run/fixture", branch_sha, ci_ref, source="waited"))
+
+
+def test_green_promote_from_worker_reaps_everything_without_reusing_removed_cwd(
+        tmp_path, monkeypatch):
+    """SABLE-fxe84: the exact real call-order seam, including real deletion."""
+    main, worker, bare, _, branch_sha, ci_ref = _real_worker_worktree_sandbox(tmp_path)
+    _stub_cleanup_order_promote_seams(monkeypatch, branch_sha, ci_ref, "success")
+
+    rc = promote_lib.promote(
+        "SABLE-cleanup", "wk-x", "trunk", str(worker), "origin", "chuck", None)
+
+    assert rc == 0
+    assert _sandbox_ref(bare, "refs/heads/trunk") == branch_sha
+    assert not worker.exists(), "the disposable worker worktree was not removed"
+    assert _sandbox_ref(main, "refs/heads/wk-x") is None
+    assert _sandbox_ref(bare, "refs/heads/wk-x") is None
+    assert _sandbox_ref(bare, f"refs/heads/{ci_ref}") is None
+
+
+def test_dirty_worker_is_never_reaped_but_green_promote_stays_green(tmp_path, monkeypatch):
+    main, worker, bare, _, branch_sha, ci_ref = _real_worker_worktree_sandbox(tmp_path)
+    (worker / "uncommitted.txt").write_text("preserve me\n")
+    _stub_cleanup_order_promote_seams(monkeypatch, branch_sha, ci_ref, "success")
+
+    rc = promote_lib.promote(
+        "SABLE-dirty", "wk-x", "trunk", str(worker), "origin", "chuck", None)
+
+    assert rc == 0
+    assert _sandbox_ref(bare, "refs/heads/trunk") == branch_sha
+    assert worker.exists()
+    assert (worker / "uncommitted.txt").read_text() == "preserve me\n"
+    assert _sandbox_ref(main, "refs/heads/wk-x") == branch_sha
+    assert _sandbox_ref(bare, "refs/heads/wk-x") == branch_sha
+    assert _sandbox_ref(bare, f"refs/heads/{ci_ref}") is None
+
+
+def test_red_promote_deletes_only_ci_ref_and_never_reaps_worker_state(tmp_path, monkeypatch):
+    main, worker, bare, base_sha, branch_sha, ci_ref = _real_worker_worktree_sandbox(tmp_path)
+    _stub_cleanup_order_promote_seams(monkeypatch, branch_sha, ci_ref, "failure")
+
+    rc = promote_lib.promote(
+        "SABLE-red", "wk-x", "trunk", str(worker), "origin", "chuck", None)
+
+    assert rc == promote_lib.classify.EXIT_RED
+    assert _sandbox_ref(bare, "refs/heads/trunk") == base_sha
+    assert worker.exists()
+    assert _sandbox_ref(main, "refs/heads/wk-x") == branch_sha
+    assert _sandbox_ref(bare, "refs/heads/wk-x") == branch_sha
+    assert _sandbox_ref(bare, f"refs/heads/{ci_ref}") is None
+
+
 @pytest.mark.skipif(
     not HAVE_BD,
     reason="ci-verify clean-room has no bd/dolt by design; real-bd integration self-skips")
