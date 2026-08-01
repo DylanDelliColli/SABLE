@@ -23,6 +23,44 @@ def test_new_session_discards_prior_in_process_measurements(monkeypatch):
     assert load_guard._SESSION_STARTED_NS > 0
 
 
+def test_xdist_worker_never_publishes_partial_session_artifacts(monkeypatch, tmp_path):
+    """Only xdist's controller owns the aggregate report and skip baseline."""
+    partial_report = tmp_path / "worker-cost.json"
+    skip_writes = []
+    config = SimpleNamespace(
+        workerinput={"workerid": "gw0"},
+        rootpath=tmp_path,
+        getoption=lambda name: (
+            str(partial_report)
+            if name == "--sable-test-cost-report"
+            else name == "--sable-report-skip-set"
+        ),
+        pluginmanager=SimpleNamespace(get_plugin=lambda name: None),
+    )
+    session = SimpleNamespace(config=config, exitstatus=0)
+    monkeypatch.setattr(
+        load_guard,
+        "_DURATIONS",
+        {"bin/test_worker.py::test_partial": 1.0},
+    )
+    monkeypatch.setattr(
+        load_guard,
+        "_SKIPS",
+        {"bin/test_worker.py::test_partial": "worker-only skip"},
+    )
+    monkeypatch.setattr(
+        load_guard,
+        "report_skip_set",
+        lambda *args, **kwargs: skip_writes.append((args, kwargs)) or [],
+    )
+
+    load_guard.pytest_sessionfinish(session, 0)
+
+    assert not partial_report.exists()
+    assert skip_writes == []
+    assert session.exitstatus == 0
+
+
 def test_slow_ordinary_test_and_module_are_both_rejected():
     report = load_guard.build_cost_report(
         {
