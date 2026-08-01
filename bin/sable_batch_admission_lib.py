@@ -206,11 +206,14 @@ def _candidate_mechanical_footprint(
         repo: str, base_sha: str, branch_sha: str) -> fp.Footprint:
     """Return only changes attributable to this candidate branch.
 
-    ``fp.mechanical_footprint`` intentionally compares two trees directly so
-    sibling overlap checks stay commensurable.  Admission against a fixed gate
-    roster asks a different question: what changed from this branch's fork to
-    its tip?  Resolve that fork here and leave the shared two-dot primitive
-    unchanged for its existing callers.
+    ``fp.mechanical_footprint`` intentionally compares two explicit trees and
+    remains correct when callers provide the shared reference their question
+    requires. Candidate admission asks a different question: what did this
+    branch change from its own fork? Both gate-roster classification and
+    candidate-to-candidate overlap need that attributable delta; comparing a
+    stale tip directly to the moved base would add the same spine-only paths to
+    every candidate. Resolve the fork here and leave the shared two-tree
+    primitive unchanged for callers that genuinely compare from one base.
     """
     cp = git_lib._git(
         repo, "merge-base", base_sha, branch_sha, check=False)
@@ -449,7 +452,7 @@ def admit_batch(repo: str, remote: str, base_sha: str,
             # contract, this rejects a real write/write overlap before
             # spending a combined fold check.
             declared_writes = fp.declared_footprint(repo, cand.bead)
-            mechanical_writes = fp.mechanical_footprint(
+            mechanical_writes = _candidate_mechanical_footprint(
                 repo, base_sha, cand.sha)
             writes_c = fp.widen(mechanical_writes, declared_writes)
             reads_c = fp.declared_reads(repo, cand.bead)
