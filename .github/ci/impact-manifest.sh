@@ -44,25 +44,38 @@
 # (SABLE-m4exv/SABLE-z3j28.5 — see the companion helpers). A changed path that
 # the golden install manifest pins a hash for additionally selects
 # test-install-golden-manifest.sh (SABLE-slip0.7 — see the pin rule below).
-# Any changed path
-# matching none of the above is UNMAPPED and selects the FULL ALLOW set (conservative
-# default) — this is the impact tier's under-selection backstop; it is
-# intentional that an unrecognized path errs toward running everything
-# rather than guessing, and this fix does not touch that direction.
+# Install-surface families (immediate skills/<dir>/ files with SKILL.md,
+# immediate hooks/multi-manager/*.sh, BASE_HOOK_FILES members) additionally
+# select test-orchestration-install.sh by rule, and the declared classes
+# ZERO_IMPACT / DECLARED_BROAD / PY_OWNED classify with zero, full, and
+# zero-shell selections respectively (SABLE-y4nom.7.1).
 #
-# test_coverage_check(): a SEPARATE completeness enforcement (SABLE-m4exv),
-# scoped to test files specifically — every git-tracked bin/test_*.py and
-# hooks/test/test-*.sh must resolve to a matched (non-full-set) selection
-# rule, or the gate errors naming the path. This is what caught "test files
-# are unmapped as a class" in the first place and is what stops a NEW
-# unmapped test-file class from recurring silently.
+# THE TWO ABSENCE OUTCOMES AND THE ERROR DIRECTION (SABLE-y4nom.7.1 —
+# replaces the old UNMAPPED->FULL conservative fallback, which had silently
+# become the primary path: 111 of 434 tracked paths escalated to the full
+# 96-suite set on every touch):
+#   * A changed path ABSENT from the tree is the DELETED class — checked
+#     BEFORE any table row or rule, so a stale row or generic family match
+#     can never narrow a deletion — and deliberately selects the FULL set
+#     with a deletion-naming notice (its classification row leaves with it).
+#   * A changed path PRESENT but matching no classification is an ERROR
+#     naming the path and the remediation menu, with EMPTY stdout — never
+#     FULL and never zero. The author picks the class deliberately.
+#
+# test_coverage_check(): the completeness enforcement, generalized by
+# SABLE-y4nom.7.1 from the original test-files-only walk (SABLE-m4exv) to
+# EVERY git-tracked path: each must resolve to exactly one classification
+# (mapped-family / ZERO_IMPACT / DECLARED_BROAD / PY_OWNED), table rows must
+# point at present Python-eligible paths where claimed, and contradictions
+# across static tables AND dynamic rules (golden pins, install surface,
+# python convention, suite self-mapping, pytest companions) are gate errors.
 #
 # Usage (CLI):
 #   impact-manifest.sh --check             both completeness checks above;
 #                                           exit non-zero on any gap
 #   impact-manifest.sh --check-test-coverage
-#                                           just the test-file completeness
-#                                           check
+#                                           just the every-tracked-path
+#                                           classification walk
 #   impact-manifest.sh --select <path>...  print the suites selected for the
 #                                           given changed paths, one per line
 #                                           (reads stdin instead if no args)
@@ -71,7 +84,7 @@
 #   . .github/ci/impact-manifest.sh
 #   sable_check_all                        # -> same as --check
 #   sable_fanout_check                     # just the lib fan-out check
-#   sable_test_coverage_check              # just the test-file check
+#   sable_test_coverage_check              # just the classification walk
 #   sable_select_impacted path...          # -> same as --select
 set -uo pipefail
 
@@ -83,6 +96,69 @@ REPO="$(cd "$CI_DIR/../.." && pwd)"
 # sourced-vs-executed guard shell-run-set.sh already defines for exactly this
 # purpose (SABLE-cmar4.1 set the precedent with test-tiers.sh).
 . "$CI_DIR/shell-run-set.sh"
+
+# SABLE-y4nom.7.1 classification tables. Declared in shell-run-set.sh beside
+# COVERS (one classification surface); defaulted empty here so a consumer
+# repo carrying an older shell-run-set copy degrades to the pre-migration
+# behavior instead of aborting under `set -u`.
+declare -p ZERO_IMPACT   >/dev/null 2>&1 || declare -A ZERO_IMPACT=()
+declare -p DECLARED_BROAD >/dev/null 2>&1 || declare -A DECLARED_BROAD=()
+declare -p PY_OWNED      >/dev/null 2>&1 || PY_OWNED=()
+
+# The remediation menu every unknown-path error names (SABLE-y4nom.7.1):
+# an unknown is an ERROR, never FULL and never zero — the author picks the
+# class deliberately.
+SABLE_CLASS_REMEDIATION="add a COVERS entry mapping it to its consuming ALLOW suite(s), a ZERO_IMPACT entry with a reason, a DECLARED_BROAD entry with a reason, or a PY_OWNED entry (python-lane-owned), in .github/ci/shell-run-set.sh (SABLE-y4nom.7.1)"
+
+# Install-surface rule (SABLE-y4nom.7.1, transitive tested-entrypoint
+# closure): test-orchestration-install.sh executes the REAL installer, which
+# globs every skills/*/ file and every hooks/multi-manager/*.sh, and copies
+# each BASE_HOOK_FILES member — so those families select that suite BY RULE
+# (new files inherit automatically; per-path rows would rot). The member
+# list is read from the installer itself so the rule tracks its source.
+# Guarded on the suite being in ALLOW so fixture universes without it (and
+# repos without the installer) leave the rule inert.
+_INSTALL_SURFACE_SUITE="test-orchestration-install.sh"
+_installer_base_hooks() {
+  sed -n 's/^BASE_HOOK_FILES="\(.*\)"$/\1/p' "$REPO/bin/sable-orchestration-install" 2>/dev/null | head -1
+}
+# The rule mirrors the installer's ACTUAL read surface (B2 correction —
+# verified against bin/sable-orchestration-install :811 and :900-908):
+# IMMEDIATE hooks/multi-manager/*.sh only (bash case '*' matches '/', so the
+# nested-descendant exclusion is explicit), and IMMEDIATE files of a skill
+# dir ONLY when that dir carries SKILL.md (the installer's own gate).
+_install_surface_rule_matches() {
+  local p="$1" member rest dir file
+  in_array "$_INSTALL_SURFACE_SUITE" "${ALLOW[@]}" || return 1
+  case "$p" in
+    skills/*/*/*) return 1 ;;
+    skills/*/*)
+      # Dot-glob boundary (codex round-1 addendum): the installer globs with
+      # dotglob OFF, so a hidden skill dir or hidden skill file is never
+      # read — and bash `case *` WOULD match leading dots, so the exclusion
+      # is explicit. Actual-read rule, not a prefix approximation.
+      rest="${p#skills/}"
+      dir="${rest%%/*}"
+      file="${rest#*/}"
+      case "$dir" in .*) return 1 ;; esac
+      case "$file" in .*) return 1 ;; esac
+      [ -f "$REPO/skills/$dir/SKILL.md" ] && return 0
+      return 1
+      ;;
+    hooks/multi-manager/*.sh)
+      rest="${p#hooks/multi-manager/}"
+      case "$rest" in */*) return 1 ;; esac
+      case "$rest" in .*) return 1 ;; esac
+      return 0
+      ;;
+    hooks/*)
+      for member in $(_installer_base_hooks); do
+        [ "$p" = "hooks/$member" ] && return 0
+      done
+      ;;
+  esac
+  return 1
+}
 
 # The golden install-manifest relation (SABLE-slip0.7). Sourced — not
 # duplicated — so the selection rule below and the suite that asserts the
@@ -183,6 +259,14 @@ GOLDEN_PINS_LOADED=0
 _load_golden_pins() {
   [ "$GOLDEN_PINS_LOADED" -eq 1 ] && return 0
   GOLDEN_PINS_LOADED=1
+  # Optional load-count trace (SABLE-y4nom.7.1 perf regression control): the
+  # memo guard above is per-SHELL, so a caller that first touches the pins
+  # inside a command/process substitution loads them in a throwaway subshell
+  # and the parent pays again — measured reparsing the golden ~436 times
+  # (~52s walk) before the parents preloaded. Real loads append here so a
+  # test can assert the count stays small; time is never asserted (the
+  # SABLE-af7u4 wall-clock rule).
+  [ -n "${SABLE_GOLDEN_PIN_TRACE:-}" ] && echo load >> "$SABLE_GOLDEN_PIN_TRACE"
   command -v golden_pinned_sources >/dev/null 2>&1 || return 0
   local src
   while IFS= read -r src; do
@@ -191,11 +275,34 @@ _load_golden_pins() {
 }
 
 _covered_files() {
+  # Optional call trace (SABLE-y4nom.7.1 no-fork structural control): the
+  # per-path selection MUST NOT come through here — see COVERED_BY below.
+  [ -n "${SABLE_COVERED_TRACE:-}" ] && echo call >> "$SABLE_COVERED_TRACE"
   local suite="$1"
   printf 'hooks/test/%s\n' "$suite"
   if [ -n "${COVERS[$suite]:-}" ]; then
     printf '%s\n' ${COVERS[$suite]}
   fi
+}
+
+# COVERED_BY: reverse index path -> "suite ..." over ALLOW self-mappings and
+# COVERS values, built ONCE per shell (SABLE-y4nom.7.1 perf blocker: the
+# per-path ALLOW loop invoked _covered_files through a process substitution
+# per suite — ~97 forks per classified path, ~42k child shells across the
+# 436-path walk). Same semantics as _covered_files, indexed: every ALLOW
+# suite covers its own hooks/test/<suite> file plus its COVERS entries.
+declare -A COVERED_BY=()
+COVERED_INDEX_BUILT=0
+_build_covered_index() {
+  [ "$COVERED_INDEX_BUILT" -eq 1 ] && return 0
+  COVERED_INDEX_BUILT=1
+  local suite cf
+  for suite in "${ALLOW[@]}"; do
+    COVERED_BY["hooks/test/$suite"]="${COVERED_BY[hooks/test/$suite]:-} $suite"
+    for cf in ${COVERS[$suite]:-}; do
+      COVERED_BY["$cf"]="${COVERED_BY[$cf]:-} $suite"
+    done
+  done
 }
 
 # _py_test_companion <path>: for a pytest test file bin/test_X.py or
@@ -231,6 +338,12 @@ _py_production_has_test() {
       case "$path" in bin/test_*.py) return 1 ;; esac
       base="${path#bin/}"
       base="${base%.py}"
+      # SABLE-y4nom.7.1 F1: convert dashes exactly as the extensionless
+      # branch below does — bin/columbo-cost-prefilter.py's test is
+      # test_columbo_cost_prefilter.py, and without this conversion the
+      # dash-named .py class was permanently unmapped (measured escalating
+      # to the full ALLOW set on every touch).
+      base="${base//-/_}"
       [ -f "$REPO/bin/test_${base}.py" ] \
         || [ -f "$REPO/bin/test_${base}_integration.py" ]
       ;;
@@ -284,12 +397,13 @@ sable_fanout_check() {
 #
 # A path matches when it is a declared lib (LIB_FANOUT key), a declared or
 # self covered file for some ALLOW suite (_covered_files), a repo source the
-# golden install manifest pins a hash for (SABLE-slip0.7), OR — SABLE-m4exv —
-# a bin/test_*.py pytest file whose production companion (_py_test_companion)
-# matches either of those. The companion case can match with ZERO selected
-# suites: a pytest file whose companion has no shell coverage is still a
-# KNOWN, CLASSIFIED path (the pytest/testmon half of the tier owns its
-# scoping), not an unmapped one that should escalate the shell half to full.
+# golden install manifest pins a hash for (SABLE-slip0.7), a bin/test_*.py
+# pytest file whose production companion (_py_test_companion) matches either
+# of those (SABLE-m4exv), an EXCLUDE-listed suite's own file, a declared
+# ZERO_IMPACT / DECLARED_BROAD / PY_OWNED table row, or an install-surface
+# family member (SABLE-y4nom.7.1). Several of these legitimately match with
+# ZERO selected suites — classified-with-nothing-to-run is a DIFFERENT
+# outcome from unclassified, which is an ERROR at selection time.
 _match_path() {
   local p="$1" lib suite cf matched=0 companion
   declare -A sel=()
@@ -310,10 +424,10 @@ _match_path() {
     matched=1
     sel[$golden_suite]=1
   fi
-  for suite in "${ALLOW[@]}"; do
-    while IFS= read -r cf; do
-      [ "$cf" = "$p" ] && { matched=1; sel[$suite]=1; }
-    done < <(_covered_files "$suite")
+  _build_covered_index
+  for suite in ${COVERED_BY[$p]:-}; do
+    matched=1
+    sel[$suite]=1
   done
   if [ "$matched" -eq 0 ]; then
     companion="$(_py_test_companion "$p")"
@@ -322,10 +436,8 @@ _match_path() {
       if [ -n "${LIB_FANOUT[$companion]:-}" ]; then
         for suite in ${LIB_FANOUT[$companion]}; do sel[$suite]=1; done
       fi
-      for suite in "${ALLOW[@]}"; do
-        while IFS= read -r cf; do
-          [ "$cf" = "$companion" ] && sel[$suite]=1
-        done < <(_covered_files "$suite")
+      for suite in ${COVERED_BY[$companion]:-}; do
+        sel[$suite]=1
       done
     fi
   fi
@@ -343,23 +455,46 @@ _match_path() {
     # over (SABLE-m4exv).
     matched=1
   fi
+  # SABLE-y4nom.7.1 declared classes. ZERO_IMPACT: classified, zero shell
+  # suites, with a written reason in the table (the Python lane still
+  # selects wherever its own graph reaches — zero-shell is not
+  # zero-validation). PY_OWNED: exact entries for python-lane-owned files
+  # whose test naming defeats the convention probes above. DECLARED_BROAD is
+  # classified here for the completeness walk; its full-set selection is
+  # applied in sable_select_impacted where the notice can name it.
+  if [ -n "${ZERO_IMPACT[$p]:-}" ]; then
+    matched=1
+  fi
+  if [ -n "${DECLARED_BROAD[$p]:-}" ]; then
+    matched=1
+  fi
+  if [ "$matched" -eq 0 ] && in_array "$p" "${PY_OWNED[@]:-}"; then
+    matched=1
+  fi
+  # Install-surface rule: additive, like the golden-pin rule above — a
+  # skills/mm-hook/base-hook path selects the installer suite IN ADDITION to
+  # any dedicated consumers, and a NEW file in those families classifies by
+  # rule instead of falling to unknown.
+  if _install_surface_rule_matches "$p"; then
+    matched=1
+    sel[$_INSTALL_SURFACE_SUITE]=1
+  fi
   echo "$matched"
   printf '%s\n' "${!sel[@]}"
 }
 
-# sable_select_impacted also EMITS an observability line to stderr
-# (SABLE-m4exv, cockpit-raised gap): before this, --select had NO mode/reason
-# output at all — a FULL answer from the correct, intentional conservative
-# fallback was byte-for-byte identical to a FULL answer from a genuinely
-# unmapped diff, so nothing about a run ever revealed WHICH one occurred.
-# That silence is exactly how "test files are unmapped as a class" survived
-# undetected: the escalation fired on nearly every promote and the tool
-# never once said why. The line is prefixed "::notice::"/"::warning::" so it
-# rides the SAME GitHub-Actions-annotation convention this file already uses
-# for ::error:: — _selected_suites in bin/sable_gate_promote_lib.py already
-# strips any line starting with "::" from the suites it parses (that
-# filtering predates this change), so this needed no changes on the Python
-# side and stdout stays a clean, unpolluted suite list either way.
+# sable_select_impacted EMITS an observability line to stderr for every
+# outcome (SABLE-m4exv established the convention; SABLE-y4nom.7.1 owns the
+# current outcome set): SCOPED with a suite/path count; FULL naming its
+# CAUSE, which is always deliberate — declared-broad path(s) or deleted
+# path(s) — because the old anonymous unmapped->FULL fallback is GONE; and
+# for an existing unclassified path, "::error::" lines naming each path and
+# the remediation menu with a NONZERO exit and empty stdout. The lines ride
+# the GitHub-Actions-annotation convention ("::notice::"/"::error::") —
+# _selected_suites in bin/sable_gate_promote_lib.py strips "::"-prefixed
+# lines from the suites it parses, and its nonzero-exit branch is the
+# fail-closed path for the error outcome, so stdout stays a clean suite
+# list and an unclassifiable diff can never certify anything.
 sable_select_impacted() {
   local -a paths=("$@")
   local p suite matched line
@@ -370,11 +505,38 @@ sable_select_impacted() {
       [ -n "$p" ] && paths+=("$p")
     done
   fi
+  # Preload the golden pins AND the covered-by index in THIS shell:
+  # _match_path runs inside process substitutions below, and a memo first
+  # populated in a subshell is lost — measured as a per-path golden reparse
+  # (and a ~97-fork covered-files sweep per path) across the walk
+  # (SABLE-y4nom.7.1 perf notes at _load_golden_pins / _build_covered_index).
+  _load_golden_pins
+  _build_covered_index
+  local -a deleted=() declared_broad=()
   for p in "${paths[@]}"; do
+    # SABLE-y4nom.7.1 B1 (codex round-1): ABSENCE IS CHECKED FIRST, before
+    # any table row or rule can match. A changed path absent from the
+    # validated tree is the DELETED class regardless of what a stale
+    # COVERS/ZERO/BROAD row or a generic family rule would have said about
+    # the old name — a deleted mm-hook still pattern-matched the install
+    # rule and came back SCOPED (measured), which silently narrowed the
+    # deletion's blast radius to one suite. A deletion deliberately selects
+    # the full set; its classification row leaves with it (no tombstones).
+    # -L keeps a tracked-but-broken symlink (the AGENTS.md class) counted
+    # as present rather than deleted.
+    if [ ! -e "$REPO/$p" ] && [ ! -L "$REPO/$p" ]; then
+      deleted+=("$p")
+      continue
+    fi
+    if [ -n "${DECLARED_BROAD[$p]:-}" ]; then
+      declared_broad+=("$p")
+      continue
+    fi
     local -a result=()
     while IFS= read -r line; do result+=("$line"); done < <(_match_path "$p")
     matched="${result[0]}"
     if [ "$matched" -eq 0 ]; then
+      # Present but unclassifiable: an ERROR naming the remediation.
       unmapped+=("$p")
       continue
     fi
@@ -383,11 +545,23 @@ sable_select_impacted() {
     done
   done
   if [ "${#unmapped[@]}" -gt 0 ]; then
-    # One or more UNMAPPED paths: conservative default is the full ALLOW
-    # set, and it dominates any partial selection collected above — the
-    # unmapped paths are named so the fallback is diagnosable, not just
-    # observable as a bare count.
-    echo "::notice::impact-manifest: FULL -- unmapped path(s): ${unmapped[*]}" >&2
+    # SABLE-y4nom.7.1: UNKNOWN is an ERROR naming its remediation — never
+    # FULL (the old conservative default had silently become the primary
+    # path: 111 of 434 tracked paths escalated to all 96 suites) and never
+    # zero. Empty stdout: no suite list is certified from an error.
+    for p in "${unmapped[@]}"; do
+      echo "::error::impact-manifest: UNKNOWN -- unclassified path: $p. Remediation: $SABLE_CLASS_REMEDIATION" >&2
+    done
+    return 1
+  fi
+  if [ "${#declared_broad[@]}" -gt 0 ] || [ "${#deleted[@]}" -gt 0 ]; then
+    # Deliberate full-set selections, each naming its cause: the broad
+    # class is a declared decision, the deletion class is the no-tombstones
+    # contract. Either dominates any partial selection collected above.
+    [ "${#declared_broad[@]}" -gt 0 ] && \
+      echo "::notice::impact-manifest: FULL -- declared-broad path(s): ${declared_broad[*]}" >&2
+    [ "${#deleted[@]}" -gt 0 ] && \
+      echo "::notice::impact-manifest: FULL -- deleted path(s): ${deleted[*]} (a deletion selects the full set; its classification row leaves with it)" >&2
     printf '%s\n' "${ALLOW[@]}"
     return 0
   fi
@@ -397,48 +571,156 @@ sable_select_impacted() {
   fi
 }
 
-# --- Mechanical completeness check for TEST FILES AS A CLASS (SABLE-m4exv) -
-# The defect this bead fixes: bin/test_*.py and hooks/test/test-*.sh matched
-# NO manifest rule at all, so a change to one silently fell through to the
-# UNMAPPED full-ALLOW-set fallback on EVERY compliant branch (this fleet's
-# prime directive requires a test file with every change) — the conservative
-# backstop had silently become the primary path instead of the rare case it
-# was designed for (see this file's module comment; the fallback direction
-# itself is correct and must not be inverted).
+# --- Mechanical completeness check for EVERY TRACKED PATH ------------------
+# History: SABLE-m4exv built this for test files as a class, whose changes
+# silently fell through to the then-standard unmapped->FULL fallback on
+# every compliant branch. SABLE-y4nom.7.1 retired that fallback entirely
+# (UNKNOWN is now a selection ERROR; FULL is reserved for the declared-broad
+# and deleted classes) and generalized the walk to all tracked paths — this
+# check is what makes the error direction safe to hold, because a fully
+# classified tree never produces the error on ordinary work.
 #
-# sable_test_coverage_check walks every git-tracked path in those two
-# classes and asserts _match_path resolves it (matched=1), erroring — naming
-# the path — for any that still fall through. This is what makes a NEW
-# unmapped test-file class fail the gate at introduction instead of showing
-# up later as an unexplained full-set run. A path can be excused via
-# TEST_COVERAGE_EXEMPT below (with a reason), the same "state the exemption,
-# don't silently allow it" shape as shell-run-set.sh's own EXCLUDE table.
-TEST_COVERAGE_EXEMPT=(
-)
 
 sable_test_coverage_check() {
-  local path matched errors=0 f line
+  # SABLE-y4nom.7.1: generalized from the two test-file globs to EVERY
+  # git-tracked path. The original defect ("test files are unmapped as a
+  # class") was one instance of the wider one: 111 of 434 tracked paths —
+  # including production bin/, hooks/, and CI files — fell through to the
+  # full-ALLOW escalation, and nothing enforced their classification. Now an
+  # unclassified TRACKED path of any kind is a gate error naming the
+  # remediation menu; suffix-based definitions of "code" are gone (an
+  # extensionless bin/ script is a first-class governed path).
+  local path matched errors=0 f line key
   local -a tracked=()
   while IFS= read -r f; do
     [ -n "$f" ] && tracked+=("$f")
-  done < <(cd "$REPO" && git ls-files 'bin/test_*.py' 'hooks/test/test-*.sh' 2>/dev/null)
+  done < <(cd "$REPO" && git ls-files 2>/dev/null)
+  # Preload once in THIS shell (see the _load_golden_pins and
+  # _build_covered_index perf notes): the walk calls _match_path /
+  # _mapped_family_sources inside substitutions, and a subshell-first load
+  # is repaid on every one of the ~436 paths.
+  _load_golden_pins
+  _build_covered_index
   for path in "${tracked[@]}"; do
-    if in_array "$path" "${TEST_COVERAGE_EXEMPT[@]:-}"; then
-      continue
-    fi
     local -a result=()
     while IFS= read -r line; do result+=("$line"); done < <(_match_path "$path")
     matched="${result[0]}"
     if [ "$matched" -ne 1 ]; then
-      echo "::error::impact-manifest: $path (a test file) matches no selection rule — it would escalate to the full ALLOW set on every change touching it. Add a COVERS/self-mapping rule or an explicit TEST_COVERAGE_EXEMPT entry with a reason (SABLE-m4exv)."
+      echo "::error::impact-manifest: $path matches no classification — an unclassified tracked path is an error, never a silent full-set escalation. Remediation: $SABLE_CLASS_REMEDIATION"
       errors=$((errors+1))
     fi
   done
+  # Exactly-one-class enforcement (B3, codex round-1: the narrow static
+  # pairs missed DYNAMIC rules — a planted ZERO row on a golden-pinned,
+  # install-globbed skill file passed the walk). _mapped_family_sources
+  # enumerates every mapped-family and automatic source for a path USING THE
+  # SAME SEMANTICS AS _match_path (codex round-1 addendum: raw COVERS alone
+  # missed ALLOW suite self-mapping and pytest-companion-derived mapping):
+  # covered-file resolution via _covered_files (self + COVERS), the
+  # companion probe, golden pins, the install rule, and the python
+  # convention. Each TABLE class (ZERO_IMPACT, DECLARED_BROAD, PY_OWNED) is
+  # exclusive against ALL of them and against each other — a contradiction
+  # is the author's to resolve, never a precedence the tool guesses at.
+  _mapped_family_sources() {
+    local p="$1" f companion
+    [ -n "${LIB_FANOUT[$p]:-}" ] && echo "LIB_FANOUT"
+    _build_covered_index
+    for f in ${COVERED_BY[$p]:-}; do
+      echo "COVERED($f)"
+    done
+    companion="$(_py_test_companion "$p")"
+    [ -n "$companion" ] && echo "PY-COMPANION($companion)"
+    [ -n "${EXCLUDE[${p#hooks/test/}]:-}" ] && [ "$p" != "${p#hooks/test/}" ] && echo "EXCLUDE-OWN-FILE"
+    [ -n "${GOLDEN_PINS[$p]:-}" ] && echo "GOLDEN-PIN"
+    _install_surface_rule_matches "$p" && echo "INSTALL-RULE"
+    _py_production_has_test "$p" && echo "PY-AUTO"
+    return 0
+  }
+  # Table-key hygiene (codex round-1 addendum): a table row must point at a
+  # PRESENT path (rows leave with their files — the no-tombstones contract's
+  # other half; a stale row would otherwise sit unread forever because the
+  # walk only visits tracked paths), and PY_OWNED rows must actually BE
+  # Python — bin/*.py, or an extensionless file with a python shebang.
+  # Without the eligibility guard any doc/shell file could be parked in
+  # PY_OWNED and become zero-shell with no Python lane behind it.
+  local key
+  for key in "${!ZERO_IMPACT[@]}"; do
+    if [ ! -e "$REPO/$key" ] && [ ! -L "$REPO/$key" ]; then
+      echo "::error::impact-manifest: ZERO_IMPACT row for absent path $key — table rows leave with their files (SABLE-y4nom.7.1)"
+      errors=$((errors+1))
+    fi
+  done
+  for key in "${!DECLARED_BROAD[@]}"; do
+    if [ ! -e "$REPO/$key" ] && [ ! -L "$REPO/$key" ]; then
+      echo "::error::impact-manifest: DECLARED_BROAD row for absent path $key — table rows leave with their files (SABLE-y4nom.7.1)"
+      errors=$((errors+1))
+    fi
+  done
+  for key in "${PY_OWNED[@]:-}"; do
+    [ -z "$key" ] && continue
+    if [ ! -e "$REPO/$key" ] && [ ! -L "$REPO/$key" ]; then
+      echo "::error::impact-manifest: PY_OWNED row for absent path $key — table rows leave with their files (SABLE-y4nom.7.1)"
+      errors=$((errors+1))
+      continue
+    fi
+    case "$key" in
+      bin/*.py) : ;;
+      bin/*)
+        if ! head -1 "$REPO/$key" 2>/dev/null | grep -q 'python'; then
+          echo "::error::impact-manifest: PY_OWNED row $key is not Python (no python shebang) — PY requires Python identity, pick the right class (SABLE-y4nom.7.1)"
+          errors=$((errors+1))
+        fi
+        ;;
+      *)
+        # The Python selector owns bin/ ONLY (_is_python_owned in
+        # sable_dev_check_lib.py) — a python-shebang file elsewhere has no
+        # Python lane behind it, so the shell table may not claim Python
+        # ownership for it regardless of its shebang.
+        echo "::error::impact-manifest: PY_OWNED row $key is outside bin/ — the Python selector never owns it, pick the right class (SABLE-y4nom.7.1)"
+        errors=$((errors+1))
+        ;;
+    esac
+  done
+  local conflicts
+  for key in "${!ZERO_IMPACT[@]}"; do
+    conflicts=$(_mapped_family_sources "$key")
+    [ -n "${DECLARED_BROAD[$key]:-}" ] && conflicts="$conflicts DECLARED_BROAD"
+    in_array "$key" "${PY_OWNED[@]:-}" && conflicts="$conflicts PY_OWNED"
+    if [ -n "$(echo $conflicts)" ]; then
+      echo "::error::impact-manifest: $key is ZERO_IMPACT but also classified by: $(echo $conflicts) — exactly one class per path (SABLE-y4nom.7.1)"
+      errors=$((errors+1))
+    fi
+  done
+  for key in "${!DECLARED_BROAD[@]}"; do
+    conflicts=$(_mapped_family_sources "$key")
+    in_array "$key" "${PY_OWNED[@]:-}" && conflicts="$conflicts PY_OWNED"
+    if [ -n "$(echo $conflicts)" ]; then
+      echo "::error::impact-manifest: $key is DECLARED_BROAD but also classified by: $(echo $conflicts) — exactly one class per path (SABLE-y4nom.7.1)"
+      errors=$((errors+1))
+    fi
+  done
+  for key in "${PY_OWNED[@]:-}"; do
+    [ -z "$key" ] && continue
+    conflicts=$(_mapped_family_sources "$key")
+    if [ -n "$(echo $conflicts)" ]; then
+      echo "::error::impact-manifest: $key is PY_OWNED but also classified by: $(echo $conflicts) — exactly one class per path (SABLE-y4nom.7.1)"
+      errors=$((errors+1))
+    fi
+  done
+  # B2 loud-parser guard: if this repo ships the installer but the
+  # BASE_HOOK_FILES line cannot be parsed, the install-surface rule is
+  # silently inert for the base-hooks family — that failure must be loud.
+  if [ -f "$REPO/bin/sable-orchestration-install" ] \
+     && in_array "$_INSTALL_SURFACE_SUITE" "${ALLOW[@]}" \
+     && [ -z "$(_installer_base_hooks)" ]; then
+    echo "::error::impact-manifest: bin/sable-orchestration-install is present but its BASE_HOOK_FILES line did not parse — the install-surface rule would be silently inert for the base-hooks family (SABLE-y4nom.7.1 B2)"
+    errors=$((errors+1))
+  fi
   if [ "$errors" -gt 0 ]; then
-    echo "impact-manifest --check-test-coverage: $errors unmapped test file(s)"
+    echo "impact-manifest --check-test-coverage: $errors classification error(s)"
     return 1
   fi
-  echo "impact-manifest --check-test-coverage: complete — every tracked test file resolves to a scoped selection rule (${#tracked[@]} checked)"
+  echo "impact-manifest --check-test-coverage: complete — every tracked path resolves to exactly one classification (${#tracked[@]} checked)"
   return 0
 }
 

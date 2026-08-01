@@ -495,7 +495,14 @@ def test_shell_selection_delegates_to_manifest_and_preserves_reason(tmp_path, ca
     assert "SCOPED" in capsys.readouterr().err
 
 
-def test_shell_selection_without_a_mode_line_fails_closed_to_full(tmp_path):
+def test_shell_selection_without_a_mode_line_is_a_loud_plan_error(tmp_path):
+    """SABLE-y4nom.7.1 R5 — INVERTED from the fail-closed-to-full pin.
+
+    The old behavior kept whatever stdout said (possibly ZERO suites) while
+    merely labeling the budget full, so a notice-less selector could green an
+    empty plan. A zero-exit selection with no recognized classification
+    notice now raises, exactly like a nonzero selector exit.
+    """
     repo = _python_repo(
         tmp_path,
         {
@@ -513,13 +520,38 @@ def test_shell_selection_without_a_mode_line_fails_closed_to_full(tmp_path):
             stderr="selector completed without a classification line\n",
         )
 
-    selection = devcheck.select_shell_selection(
-        repo, ["bin/widget.py"], runner=fake_runner,
-    )
+    with pytest.raises(
+        devcheck.DeveloperCheckError, match="no FULL/SCOPED classification"
+    ):
+        devcheck.select_shell_selection(
+            repo, ["bin/widget.py"], runner=fake_runner,
+        )
 
-    assert selection.suites == ("test-widget.sh",)
-    assert selection.mode == "full"
-    assert "omitted" in selection.reason
+
+def test_shell_selection_without_a_mode_line_names_the_empty_suite_hazard(
+    tmp_path,
+):
+    """The decisive shape: zero-exit, EMPTY stdout, no notice — the old code
+    returned a plan with zero suites under a full-budget label (green with
+    nothing verified). It must raise, and the message carries the count."""
+    repo = _python_repo(
+        tmp_path,
+        {
+            "bin/widget.py": "VALUE = 1\n",
+            "bin/test_widget.py": "import widget\n",
+        },
+    )
+    _write(repo, ".github/ci/impact-manifest.sh", "# fixture\n")
+
+    def fake_runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    with pytest.raises(
+        devcheck.DeveloperCheckError, match="stdout suites: 0"
+    ):
+        devcheck.select_shell_selection(
+            repo, ["bin/widget.py"], runner=fake_runner,
+        )
 
 
 def test_shell_selector_failure_is_reported_as_environment_error(tmp_path):
@@ -1070,3 +1102,42 @@ def test_an_unreadable_cost_report_degrades_instead_of_blocking(tmp_path, capsys
     assert costs.python == {}
     assert costs.shell == {"test-a.sh": 2.0}
     assert "ignoring unreadable python cost report" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# SABLE-y4nom.7.1 B4 note: the combined per-lane plan matrix lives in
+# hooks/test/test-impact-selection.sh, which invokes the real
+# `sable-dev-check --path P --dry-run` — shell literals do not enter the
+# Python literal-dependency graph, so exact per-lane expectations can be
+# pinned there without the pin becoming its own consumer (which is what
+# happens to any bin/test_*.py that names a production path).
+# ---------------------------------------------------------------------------
+
+
+def test_collect_changed_paths_emits_both_sides_of_a_rename(tmp_path):
+    """B1 rename seam (historic R099 probe proved --name-only emits only the
+    destination even under --diff-filter=ACMRD): both sides must be planned —
+    the destination classifies as itself, the vanished source takes the
+    DELETED class."""
+    repo = tmp_path / "renamerepo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    for key, value in (("user.email", "t@t"), ("user.name", "t")):
+        subprocess.run(["git", "-C", str(repo), "config", key, value], check=True)
+    (repo / "old-name.txt").write_text("stable content that git rename-detects\n" * 10)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "-C", str(repo), "mv", "old-name.txt", "new-name.txt"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "rename"], check=True)
+
+    changed = devcheck.collect_changed_paths(repo, base)
+
+    assert "new-name.txt" in changed
+    assert "old-name.txt" in changed
