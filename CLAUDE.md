@@ -141,10 +141,23 @@ bash .github/ci/shell-run-set.sh --check
 python bin/columbo-cost-prefilter.py --check-load-declarations
 bash .github/ci/shell-run-set.sh --run
 
-# Reproducible cost reports from the same authoritative executions:
-python -m pytest bin/ -q -rs -p no:cacheprovider --sable-report-skip-set \
-  --sable-test-cost-report=/tmp/sable-python-cost.json
-bash .github/ci/shell-run-set.sh --profile /tmp/sable-shell-cost.tsv
+# Cost measurements that drive sable-dev-check's derived budgets live in ONE
+# shared machine-local store (<git-common-dir>/sable/test-cost/profile.json —
+# every worktree reads the same fingerprint-validated profile). Publish it
+# with the canonical serial publisher — EXPENSIVE (full Python suite + full
+# shell allowlist, serial), ONE per host in a coordinated quiet window
+# (the broad seat when a fleet exists, the standalone runner otherwise),
+# refuses a dirty worktree. Its python producer runs the authoritative
+# full-suite command (skip-identity reporting stays enabled, exactly like
+# the other authoritative full runs):
+#   python -m pytest bin/ -q -rs -p no:cacheprovider --sable-report-skip-set \
+#     --sable-test-cost-report=<staging>
+bin/sable-dev-check --publish-cost-profile
+
+# Raw per-run reporter flags (--sable-test-cost-report / --profile) still
+# exist for DIAGNOSTICS, consumed only as an explicit pair via
+# sable-dev-check --cost-report + --shell-profile; they never feed the
+# shared store.
 
 # Exclusion-freshness gate (LOCAL ONLY — resolves each EXCLUDE entry's
 # tracking beads against the real bd store and fails when a [blocked-by: ...]

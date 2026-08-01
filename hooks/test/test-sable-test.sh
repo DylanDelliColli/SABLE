@@ -64,6 +64,17 @@ if [ "$RC2" -eq 1 ]; then pass "S3-U2a: red run propagates exit 1"; else fail "S
 if [ ! -e "$EV2" ]; then pass "S3-U2b: red run writes NO evidence (false-permissive guard)"; else fail "S3-U2b: red run writes NO evidence" "unexpected: $(cat "$EV2" 2>/dev/null)"; fi
 rm -f "$EV2"
 
+# ---------- S3-U2c (SABLE-y4nom.7.2 pin): rc3 INCOMPLETE-BY-TRIM writes no
+# green evidence — an incomplete verdict is not a pass, and the evidence seam
+# must never certify it as one.
+SID2C=$(fake_session)
+EV2C="/tmp/tdd-evidence-${SID2C}"
+rm -f "$EV2C"
+OUT2C=$(CLAUDE_SESSION_ID="$SID2C" env -u CLAUDE_AGENT_ID "$SABLE_TEST" bash -c 'echo "SABLE_DEV_CHECK_INCOMPLETE_BY_TRIM=[\"test-x.sh\"]"; exit 3' 2>&1); RC2C=$?
+if [ "$RC2C" -eq 3 ]; then pass "S3-U2c-a: rc3 INCOMPLETE propagates as exit 3"; else fail "S3-U2c-a: rc3 INCOMPLETE propagates as exit 3" "rc=$RC2C out=[$OUT2C]"; fi
+if [ ! -e "$EV2C" ]; then pass "S3-U2c-b: rc3 INCOMPLETE writes NO green evidence"; else fail "S3-U2c-b: rc3 INCOMPLETE writes NO green evidence" "unexpected: $(cat "$EV2C" 2>/dev/null)"; fi
+rm -f "$EV2C"
+
 # ---------- S3-E1: a non-1 non-zero exit is propagated verbatim ----------
 SID3=$(fake_session)
 EV3="/tmp/tdd-evidence-${SID3}"

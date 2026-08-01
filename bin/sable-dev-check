@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import sable_dev_check_lib as devcheck  # noqa: E402
+import sable_test_cost_profile_lib as profile_lib  # noqa: E402
 
 
 def _repo_root() -> Path:
@@ -68,8 +69,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "Python suite cost report from pytest --sable-test-cost-report "
-            f"(default: {devcheck.PYTHON_COST_REPORT})"
+            "raw Python cost report (pytest --sable-test-cost-report) as a "
+            "DIAGNOSTIC override; must be paired with --shell-profile. The "
+            "default read is the shared canonical store in the git common "
+            "dir (publish it with --publish-cost-profile)."
         ),
     )
     parser.add_argument(
@@ -77,8 +80,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "shell suite cost profile from shell-run-set.sh --profile "
-            f"(default: {devcheck.SHELL_COST_PROFILE})"
+            "raw shell cost profile (shell-run-set.sh --profile) as a "
+            "DIAGNOSTIC override; must be paired with --cost-report. The "
+            "default read is the shared canonical store in the git common "
+            "dir."
         ),
     )
     parser.add_argument(
@@ -90,14 +95,60 @@ def build_parser() -> argparse.ArgumentParser:
             "with nothing verified."
         ),
     )
+    parser.add_argument(
+        "--publish-cost-profile",
+        action="store_true",
+        help=(
+            "run BOTH producers serially (full pytest + full shell profile) "
+            "and atomically publish the shared machine-local cost profile in "
+            "the git common dir. Expensive; run ONE per host in a coordinated "
+            "quiet window (the broad seat when a fleet exists, the "
+            "standalone runner otherwise). Exclusive of "
+            "every planning flag."
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.publish_cost_profile:
+        # v2.1 B8: the publisher mode is EXCLUSIVE of every planning flag —
+        # it measures the whole catalog, it does not plan a subset.
+        planning = [
+            args.base is not None, bool(args.path), args.dry_run,
+            args.budget is not None, args.cost_report is not None,
+            args.shell_profile is not None, args.no_derived_budget,
+        ]
+        if any(planning):
+            parser.error(
+                "--publish-cost-profile cannot be combined with planning "
+                "flags (--base/--path/--dry-run/--budget/--cost-report/"
+                "--shell-profile/--no-derived-budget)"
+            )
+        try:
+            profile = profile_lib.publish(_repo_root())
+        except (
+            profile_lib.ProfilePublishError, devcheck.DeveloperCheckError,
+        ) as exc:
+            print(f"sable-dev-check: publish refused: {exc}", file=sys.stderr)
+            return 2
+        print(
+            "sable-dev-check: published shared cost profile — "
+            f"{len(profile['python_costs'])} python module(s), "
+            f"{len(profile['shell_costs'])} shell suite(s), "
+            f"{len(profile['provisional_python'])} provisional",
+            flush=True,
+        )
+        return 0
     if args.budget is not None and args.budget <= 0:
         parser.error("--budget must be positive")
+    # The single marker-finalization seam (SABLE-y4nom.7.2): whatever exit
+    # path this call takes, an omission-carrying plan re-emits its marker as
+    # the LAST stdout line — run_plan's own emissions can be followed by
+    # precondition text, so main owns finality.
+    budget = None
     try:
         repo = _repo_root()
         changed = (
@@ -131,12 +182,18 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
         if args.dry_run:
+            if budget.omitted:
+                # An omitting plan is not a green plan, even unexecuted.
+                devcheck.emit_incomplete_marker(budget.omitted)
+                return devcheck.EXIT_INCOMPLETE_BY_TRIM
             return 0
         return devcheck.run_plan(
             repo, plan, budget_seconds=budget.seconds, budget=budget,
         )
     except devcheck.DeveloperCheckError as exc:
         print(f"sable-dev-check: precondition failed: {exc}", file=sys.stderr)
+        if budget is not None and budget.omitted:
+            devcheck.emit_incomplete_marker(budget.omitted)
         return 2
 
 

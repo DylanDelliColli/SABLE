@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import re
 import shutil
 import subprocess
@@ -85,11 +86,35 @@ FULL_SNAPSHOT_TIER = "full_snapshot"
 TIMEOUT_REMEDIATION = (
     "This budget is DERIVED from measured suite cost, so overrunning it means "
     "the suites really did get slower — not that the budget is too small. "
-    "Re-measure (--sable-test-cost-report / --profile) so the derivation sees "
-    "current cost, or reduce the suites' real runtime. Do NOT narrow "
-    "sable.testCommand or the selected suite set to fit: that certifies a "
-    "smaller claim than the one being enforced (SABLE-b99hy)."
+    "Re-measure with `sable-dev-check --publish-cost-profile` (the shared "
+    "serial publisher; run ONE per host in a coordinated quiet window — "
+    "the broad seat when a fleet exists, the standalone runner otherwise — "
+    "it is expensive) so the "
+    "derivation sees current cost, or reduce the suites' real runtime. Do "
+    "NOT narrow sable.testCommand or the selected suite set to fit: that "
+    "certifies a smaller claim than the one being enforced (SABLE-b99hy)."
 )
+
+# SABLE-y4nom.7.2: the INCOMPLETE-BY-TRIM verdict marker. ONE stable line —
+# the prefix followed by a sorted JSON array naming every omitted suite —
+# emitted as the FINAL stdout line on every exit path whose plan carries
+# omissions. The outer pre-push gate extracts this line SEPARATELY from its
+# truncated output tail and lets it DOMINATE the exit code: a wrapper that
+# launders rc3 to rc0 (`... || true`) still trips the INCOMPLETE deny.
+INCOMPLETE_MARKER_PREFIX = "SABLE_DEV_CHECK_INCOMPLETE_BY_TRIM="
+# rc for "everything that ran passed, but the plan omitted selected
+# suites" — distinct from failure (1), preconditions (2), and timeout (124).
+EXIT_INCOMPLETE_BY_TRIM = 3
+
+
+def emit_incomplete_marker(omitted: Sequence[str]) -> None:
+    """Print the marker line to stdout. Callers re-emit late rather than
+    early: the contract is that the LAST stdout line of an omission-carrying
+    run is the marker."""
+    print(
+        INCOMPLETE_MARKER_PREFIX + json.dumps(sorted(omitted)),
+        flush=True,
+    )
 
 
 def _normalise_path(path: str) -> str:
@@ -423,18 +448,16 @@ def _tier_budget_seconds(
     return seconds
 
 
-# Measured cost baselines live under .claude/sable/state/, which .gitignore
-# already treats as runtime state. That placement is deliberate on both counts:
-# these numbers are wall-clock and machine-relative, so they are not shared
-# configuration; and an UNTRACKED file anywhere the impact manifest does not
-# map would show up as a changed path and escalate the whole plan to a FULL
-# shell selection — a measurement artifact silently making every subsequent
-# run maximally expensive. Regenerate with the two reporters that already own
-# timing collection:
-#   python -m pytest bin/ -q \
-#     --sable-test-cost-report=.claude/sable/state/test-cost/python-cost.json
-#   bash .github/ci/shell-run-set.sh \
-#     --profile .claude/sable/state/test-cost/shell-cost.tsv
+# SABLE-y4nom.7.2: measured cost baselines live in the SHARED canonical
+# store — <git-common-dir>/sable/test-cost/profile.json, published with
+# `sable-dev-check --publish-cost-profile` and fingerprint-validated on
+# every read (see sable_test_cost_profile_lib). The two constants below are
+# the HISTORICAL repo-root default locations, HARD CUT as read paths (a
+# legacy file that silently bound would reintroduce the per-worktree
+# divergence this bead removes); they remain only as the conventional
+# locations some fixtures write raw reporter files to before handing them
+# to load_costs as an explicit --cost-report/--shell-profile DIAGNOSTIC
+# pair. They are never read by default.
 PYTHON_COST_REPORT = ".claude/sable/state/test-cost/python-cost.json"
 SHELL_COST_PROFILE = ".claude/sable/state/test-cost/shell-cost.tsv"
 
@@ -445,39 +468,61 @@ def load_costs(
     python_report: str | Path | None = None,
     shell_profile: str | Path | None = None,
 ) -> gate_budget.SuiteCosts | None:
-    """Read whatever measurements exist, or None when there are none.
+    """Measurements from the SHARED machine-local store, or None.
 
-    Both halves are OPTIONAL and independent. The two reporters that produce
-    them already exist — conftest.py's --sable-test-cost-report and
-    shell-run-set.sh's --profile — so this reads their output rather than
-    timing anything itself. A missing or corrupt report degrades to "no
-    measurement for those suites", which derive_plan then costs
-    conservatively; it never blocks the run.
+    SABLE-y4nom.7.2: the default read is the canonical fingerprint-validated
+    profile in the git common dir — ONE store for every worktree. The old
+    repo-root-relative defaults are HARD CUT (no fallback: a legacy file
+    that silently bound would reintroduce per-worktree divergence).
+
+    The explicit overrides remain as raw-file DIAGNOSTICS, but only as a
+    pair: mixing one override half with the shared store's other half would
+    silently combine measurements from two different provenances, so a
+    single override is refused loudly.
     """
-    python_path = Path(python_report or repo_root / PYTHON_COST_REPORT)
-    shell_path = Path(shell_profile or repo_root / SHELL_COST_PROFILE)
-    python_costs: dict[str, float] = {}
-    shell_costs: dict[str, float] = {}
-    for path, sink, reader in (
-        (python_path, "python", gate_budget.load_python_cost_report),
-        (shell_path, "shell", gate_budget.load_shell_cost_profile),
-    ):
-        if not path.is_file():
-            continue
-        try:
-            loaded = reader(path)
-        except (OSError, ValueError) as exc:
-            print(
-                f"sable-dev-check: ignoring unreadable {sink} cost report "
-                f"{path}: {exc}",
-                file=sys.stderr,
-            )
-            continue
-        if sink == "python":
-            python_costs = loaded
-        else:
-            shell_costs = loaded
-    costs = gate_budget.SuiteCosts(python=python_costs, shell=shell_costs)
+    if (python_report is None) != (shell_profile is None):
+        raise DeveloperCheckError(
+            "--cost-report and --shell-profile are raw-file diagnostics and "
+            "must be given as a PAIR — both or neither; one override half "
+            "never combines with the shared store's other half"
+        )
+    if python_report is not None:
+        python_costs: dict[str, float] = {}
+        shell_costs: dict[str, float] = {}
+        for path, sink, reader in (
+            (Path(python_report), "python", gate_budget.load_python_cost_report),
+            (Path(shell_profile), "shell", gate_budget.load_shell_cost_profile),
+        ):
+            if not path.is_file():
+                continue
+            try:
+                loaded = reader(path)
+            except (OSError, ValueError) as exc:
+                print(
+                    f"sable-dev-check: ignoring unreadable {sink} cost report "
+                    f"{path}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            if sink == "python":
+                python_costs = loaded
+            else:
+                shell_costs = loaded
+        costs = gate_budget.SuiteCosts(python=python_costs, shell=shell_costs)
+        return costs if gate_budget.has_measurements(costs) else None
+
+    import sable_test_cost_profile_lib as profile_lib
+    loaded_profile, message = profile_lib.load_profile(repo_root)
+    if loaded_profile is None:
+        # Plain absence stays quiet (the plan says "no measured cost data");
+        # corruption/mismatch is LOUD — never a silent flat-bound bind.
+        if message and "no shared cost profile" not in message:
+            print(f"sable-dev-check: {message}", file=sys.stderr)
+        return None
+    costs = gate_budget.SuiteCosts(
+        python=dict(loaded_profile["python"]),
+        shell=dict(loaded_profile["shell"]),
+    )
     return costs if gate_budget.has_measurements(costs) else None
 
 
@@ -772,6 +817,8 @@ def run_plan(
                     f"UNVERIFIED: {_unrun(index)}\n{TIMEOUT_REMEDIATION}",
                     file=sys.stderr,
                 )
+                if budget is not None and budget.omitted:
+                    emit_incomplete_marker(budget.omitted)
                 return 124
             timeout = remaining if timeout is None else min(timeout, remaining)
         try:
@@ -786,7 +833,17 @@ def run_plan(
                 f"{TIMEOUT_REMEDIATION}",
                 file=sys.stderr,
             )
+            if budget is not None and budget.omitted:
+                emit_incomplete_marker(budget.omitted)
             return 124
         if result.returncode != 0:
             failed = True
+    if budget is not None and budget.omitted:
+        # SABLE-y4nom.7.2: the marker is re-emitted as the FINAL stdout line
+        # on EVERY omission-carrying exit, and an otherwise-green run exits
+        # EXIT_INCOMPLETE_BY_TRIM — kept-pass never masks an omission. The
+        # pre-y4nom.7.2 behavior (exit 0 with "UNVERIFIED" only on stderr)
+        # was measured green-washing a trimmed selected suite end to end.
+        emit_incomplete_marker(budget.omitted)
+        return 1 if failed else EXIT_INCOMPLETE_BY_TRIM
     return 1 if failed else 0
