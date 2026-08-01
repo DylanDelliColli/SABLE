@@ -67,6 +67,7 @@ ALLOW=(
   test-impact-selection.sh
   test-impact-tier-serialization.sh
   test-inbox-wake.sh
+  test-install-golden-manifest.sh
   test-install-preserves-pins.sh
   test-lib-git-sandbox.sh
   test-lib-hook-trace.sh
@@ -212,6 +213,11 @@ declare -A COVERS=(
   [test-active-contracts-integration.sh]="hooks/multi-manager/session-role-anchor.sh"
   [test-ci-bd-coverage-gap.sh]=".github/ci/shell-run-set.sh hooks/test/test-dep-merge-state.sh hooks/test/test-overlap-dispatch-e2e.sh hooks/test/lib-require-all.sh"
   [test-impact-manifest.sh]=".github/ci/impact-manifest.sh"
+  # The fixture and the shared resolver only. The ~50 SOURCES the golden pins
+  # are NOT listed here — impact-manifest.sh derives those from the golden
+  # itself (SABLE-slip0.7), so regenerating the golden updates the selection
+  # rule in the same edit instead of leaving a hand-copied list to rot.
+  [test-install-golden-manifest.sh]="hooks/test/fixtures/install-golden-manifest.txt hooks/test/lib-golden-manifest.sh"
   [test-impact-selection.sh]=".github/ci/impact-manifest.sh .github/ci/shell-run-set.sh"
   [test-control-trace.sh]="hooks/multi-manager/control-trace.sh"
   [test-dep-merge-state.sh]="bin/sable-dep-check bin/sable-spawn-worker"

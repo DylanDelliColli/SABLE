@@ -442,6 +442,122 @@ else
        "selected: ${PROD_RUNSET_SEL:-<none>}"
 fi
 
+# ---------------------------------------------------------------------------
+# 9. (SABLE-slip0.7) The golden install manifest. Like case 8, these run
+#    against the REAL production declarations — the defect was in what the real
+#    manifest selects for two real paths, and a fixture universe cannot speak
+#    to that.
+#
+#    THE DEFECT: hooks/test/fixtures/install-golden-manifest.txt matched no
+#    selection rule, so the SABLE-slip0.1 diff (a change to
+#    session-role-anchor.sh plus the matching line-30 hash refresh) escalated
+#    the shell plan to the FULL 95-suite ALLOW set purely because the fixture
+#    path was unrecognized. That full plan is red at base for unrelated
+#    reasons, so the pre-push gate denied a two-line, obviously-correct change
+#    and the branch landed with a knowingly stale golden instead.
+#
+#    Both halves are asserted: the fixture path is now mapped (9a/9b), and —
+#    the half that actually prevents a recurrence — every artifact the golden
+#    PINS selects the golden suite too (9d), so changing a hook and forgetting
+#    the manifest can no longer pass a proportional run.
+# ---------------------------------------------------------------------------
+GOLDEN_REL="hooks/test/fixtures/install-golden-manifest.txt"
+GOLDEN_SUITE="test-install-golden-manifest.sh"
+ANCHOR_REL="hooks/multi-manager/session-role-anchor.sh"
+
+GOLDEN_SEL=$(bash "$PROD_MANIFEST" --select "$GOLDEN_REL" 2>/dev/null | sort)
+GOLDEN_NOTICE=$(bash "$PROD_MANIFEST" --select "$GOLDEN_REL" 2>&1 1>/dev/null)
+if [ "$GOLDEN_SEL" = "$GOLDEN_SUITE" ] && printf '%s' "$GOLDEN_NOTICE" | grep -q 'SCOPED'; then
+  pass "SABLE-slip0.7 (9a): the golden fixture path selects exactly $GOLDEN_SUITE — bounded and named, not the full set"
+else
+  fail "SABLE-slip0.7 (9a): the golden fixture path selects exactly $GOLDEN_SUITE — bounded and named, not the full set" \
+       "selected: ${GOLDEN_SEL:-<none>} notice: $GOLDEN_NOTICE"
+fi
+
+# 9b: the exact SABLE-slip0.1 changeset — source edit + matching pin refresh.
+PAIR_SEL=$(bash "$PROD_MANIFEST" --select "$ANCHOR_REL" "$GOLDEN_REL" 2>/dev/null | sort)
+PAIR_NOTICE=$(bash "$PROD_MANIFEST" --select "$ANCHOR_REL" "$GOLDEN_REL" 2>&1 1>/dev/null)
+PAIR_N=$(printf '%s\n' "$PAIR_SEL" | grep -c .)
+PROD_ALLOW_SIZE=$(bash -c "source '$PROD_RUNSET' 2>/dev/null; echo \${#ALLOW[@]}")
+if printf '%s' "$PAIR_NOTICE" | grep -q 'SCOPED' \
+   && printf '%s\n' "$PAIR_SEL" | grep -qx "$GOLDEN_SUITE" \
+   && [ "$PAIR_N" -lt "$PROD_ALLOW_SIZE" ]; then
+  pass "SABLE-slip0.7 (9b): the slip0.1 pair (source + its pin refresh) is SCOPED to $PAIR_N of $PROD_ALLOW_SIZE suites and includes the golden suite"
+else
+  fail "SABLE-slip0.7 (9b): the slip0.1 pair (source + its pin refresh) is SCOPED to a bounded set including the golden suite" \
+       "n=$PAIR_N allow=$PROD_ALLOW_SIZE notice=$PAIR_NOTICE selected: $PAIR_SEL"
+fi
+
+# 9c/9d/9e: the NEGATIVE CONTROLS. A fixture carrying real copies of both CI
+# scripts, the real golden resolver lib and the real golden fixture — so the
+# rule is live — with one ingredient removed per control. Without these, 9a/9b
+# would pass just as well against a selector that had been made to return the
+# right answer for the wrong reason.
+GFIX="$TMPROOT/golden-fixture"
+mkdir -p "$GFIX/.github/ci" "$GFIX/hooks/test/fixtures"
+cp "$PROD_RUNSET"                          "$GFIX/.github/ci/shell-run-set.sh"
+cp "$PROD_MANIFEST"                        "$GFIX/.github/ci/impact-manifest.sh"
+cp "$REPO/hooks/test/lib-golden-manifest.sh" "$GFIX/hooks/test/lib-golden-manifest.sh"
+cp "$REPO/$GOLDEN_REL"                     "$GFIX/hooks/test/fixtures/"
+
+# Baseline: with every ingredient present the fixture reproduces the real
+# answers, so a difference below is attributable to the removal and not to the
+# fixture being wired up wrong.
+GFIX_BASE_SEL=$(bash "$GFIX/.github/ci/impact-manifest.sh" --select "$GOLDEN_REL" 2>/dev/null | sort)
+GFIX_BASE_ANCHOR=$(bash "$GFIX/.github/ci/impact-manifest.sh" --select "$ANCHOR_REL" 2>/dev/null | sort)
+if [ "$GFIX_BASE_SEL" = "$GOLDEN_SUITE" ] && printf '%s\n' "$GFIX_BASE_ANCHOR" | grep -qx "$GOLDEN_SUITE"; then
+  pass "SABLE-slip0.7 (9c setup): the control fixture reproduces the real selection for both paths before anything is removed"
+else
+  fail "SABLE-slip0.7 (9c setup): the control fixture reproduces the real selection for both paths before anything is removed" \
+       "fixture=$GFIX_BASE_SEL anchor=$GFIX_BASE_ANCHOR"
+fi
+
+# 9c: remove ONLY the COVERS entry that maps the fixture path -> the same path
+# must fall back to the FULL ALLOW set, exactly as it did before this fix. This
+# is the pre-fix behavior, reproduced on demand.
+python3 - "$GFIX/.github/ci/shell-run-set.sh" <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s2, n = re.subn(r'\n *\[test-install-golden-manifest\.sh\]="[^"]*"', '', s, count=1)
+assert n == 1, "COVERS entry for the golden suite not found in the fixture copy"
+open(p, "w").write(s2)
+PYEOF
+NOMAP_SEL=$(bash "$GFIX/.github/ci/impact-manifest.sh" --select "$GOLDEN_REL" 2>/dev/null | sort)
+NOMAP_NOTICE=$(bash "$GFIX/.github/ci/impact-manifest.sh" --select "$GOLDEN_REL" 2>&1 1>/dev/null)
+NOMAP_N=$(printf '%s\n' "$NOMAP_SEL" | grep -c .)
+if [ "$NOMAP_N" -eq "$PROD_ALLOW_SIZE" ] \
+   && printf '%s' "$NOMAP_NOTICE" | grep -q "FULL -- unmapped path(s): $GOLDEN_REL"; then
+  pass "SABLE-slip0.7 (9c): NEGATIVE CONTROL — with the COVERS mapping removed, the golden fixture path escalates to the FULL $NOMAP_N-suite ALLOW set again, naming itself as unmapped"
+else
+  fail "SABLE-slip0.7 (9c): NEGATIVE CONTROL — with the COVERS mapping removed, the golden fixture path escalates to the FULL ALLOW set again" \
+       "n=$NOMAP_N allow=$PROD_ALLOW_SIZE notice=$NOMAP_NOTICE"
+fi
+
+# 9d: the pin rule proper. A change to session-role-anchor.sh ALONE — no
+# fixture edit at all — must select the golden suite. This is the property that
+# makes a stale pin unlandable: SABLE-slip0.1 pushed exactly this diff, and
+# nothing in the gate had anything to say about the manifest it left behind.
+ANCHOR_SEL=$(bash "$PROD_MANIFEST" --select "$ANCHOR_REL" 2>/dev/null | sort)
+if printf '%s\n' "$ANCHOR_SEL" | grep -qx "$GOLDEN_SUITE"; then
+  pass "SABLE-slip0.7 (9d): a pinned artifact changing ALONE still selects the golden suite — a stale pin cannot ride along unverified"
+else
+  fail "SABLE-slip0.7 (9d): a pinned artifact changing ALONE still selects the golden suite" "selected: $ANCHOR_SEL"
+fi
+
+# 9e: NEGATIVE CONTROL for 9d — the pin rule is derived from the golden, not
+# from a static list. Remove the golden from the fixture and the same path stops
+# selecting the golden suite (while still selecting its ordinary COVERS
+# suites), proving 9d's selection came from reading the manifest.
+rm -f "$GFIX/hooks/test/fixtures/install-golden-manifest.txt"
+NOGOLD_SEL=$(bash "$GFIX/.github/ci/impact-manifest.sh" --select "$ANCHOR_REL" 2>/dev/null | sort)
+if ! printf '%s\n' "$NOGOLD_SEL" | grep -qx "$GOLDEN_SUITE" \
+   && printf '%s\n' "$NOGOLD_SEL" | grep -qx 'test-session-role-anchor.sh'; then
+  pass "SABLE-slip0.7 (9e): NEGATIVE CONTROL — with the golden removed, the pin rule goes inert (the artifact keeps its ordinary COVERS suites but no longer selects the golden suite)"
+else
+  fail "SABLE-slip0.7 (9e): NEGATIVE CONTROL — with the golden removed, the pin rule goes inert" "selected: $NOGOLD_SEL"
+fi
+
 echo
 echo "=========================================="
 echo "Tests: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"

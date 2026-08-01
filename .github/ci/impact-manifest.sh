@@ -41,7 +41,10 @@
 # pytest file maps to its production companion's coverage, if any. A changed
 # bin/X.py with a matching bin/test_X.py is likewise classified as Python-
 # owned after any explicit shell COVERS entries are selected
-# (SABLE-m4exv/SABLE-z3j28.5 — see the companion helpers). Any changed path
+# (SABLE-m4exv/SABLE-z3j28.5 — see the companion helpers). A changed path that
+# the golden install manifest pins a hash for additionally selects
+# test-install-golden-manifest.sh (SABLE-slip0.7 — see the pin rule below).
+# Any changed path
 # matching none of the above is UNMAPPED and selects the FULL ALLOW set (conservative
 # default) — this is the impact tier's under-selection backstop; it is
 # intentional that an unrecognized path errs toward running everything
@@ -80,6 +83,15 @@ REPO="$(cd "$CI_DIR/../.." && pwd)"
 # sourced-vs-executed guard shell-run-set.sh already defines for exactly this
 # purpose (SABLE-cmar4.1 set the precedent with test-tiers.sh).
 . "$CI_DIR/shell-run-set.sh"
+
+# The golden install-manifest relation (SABLE-slip0.7). Sourced — not
+# duplicated — so the selection rule below and the suite that asserts the
+# golden read the SAME mapping. Guarded because the two test suites for this
+# file build fixture repos that carry only these .github/ci scripts: there the
+# rule is simply inert, which is what their negative controls exercise.
+GOLDEN_LIB="$REPO/hooks/test/lib-golden-manifest.sh"
+# shellcheck source=../../hooks/test/lib-golden-manifest.sh
+[ -f "$GOLDEN_LIB" ] && . "$GOLDEN_LIB"
 
 # --- direct lib-sourcing detector -------------------------------------------
 # Prints, one per line, the hooks/multi-manager/lib-*.sh basenames that the
@@ -146,6 +158,38 @@ _libs_closure() {
 # a suite with NO entry defaulted to covering itself), which is why editing
 # hooks/test/test-optimistic-promotion.sh — a suite with 5 COVERS files —
 # escalated to the full ALLOW set instead of selecting itself.
+# --- golden install-manifest pin rule (SABLE-slip0.7) -----------------------
+# hooks/test/fixtures/install-golden-manifest.txt pins a sha256 for every
+# artifact install.sh lands. Its historical consumer, test-install.sh, is
+# PERMANENTLY excluded from the run-set (it needs a real ~/.claude install;
+# SABLE-59zu), so the golden had no executor in the gate at all — an installed
+# artifact could change while its pinned hash stayed behind and nothing went
+# red. Three entries had already rotted that way when this rule was written.
+#
+# The rule: a changed path that the golden pins a hash FOR selects
+# test-install-golden-manifest.sh, the clean-room-runnable suite that compares
+# each pin against sha256 of its repo source. This is what makes "edit a hook,
+# forget the manifest" a proportional-run failure instead of a silent landing.
+#
+# DERIVED, NOT DECLARED. The pinned set comes from reading the golden itself
+# (golden_pinned_sources), not from a ~50-path COVERS string. A hand-copied list
+# would need its own completeness gate and would rot the first time someone
+# regenerated the golden without updating it — the exact drift class this file
+# exists to prevent. Loaded once and memoized: _match_path is called per tracked
+# test file by sable_test_coverage_check, and re-reading the fixture ~110 times
+# is pure waste.
+declare -A GOLDEN_PINS=()
+GOLDEN_PINS_LOADED=0
+_load_golden_pins() {
+  [ "$GOLDEN_PINS_LOADED" -eq 1 ] && return 0
+  GOLDEN_PINS_LOADED=1
+  command -v golden_pinned_sources >/dev/null 2>&1 || return 0
+  local src
+  while IFS= read -r src; do
+    [ -n "$src" ] && GOLDEN_PINS["$src"]=1
+  done < <(golden_pinned_sources)
+}
+
 _covered_files() {
   local suite="$1"
   printf 'hooks/test/%s\n' "$suite"
@@ -239,7 +283,8 @@ sable_fanout_check() {
 # exactly the drift class this whole manifest exists to prevent.
 #
 # A path matches when it is a declared lib (LIB_FANOUT key), a declared or
-# self covered file for some ALLOW suite (_covered_files), OR — SABLE-m4exv —
+# self covered file for some ALLOW suite (_covered_files), a repo source the
+# golden install manifest pins a hash for (SABLE-slip0.7), OR — SABLE-m4exv —
 # a bin/test_*.py pytest file whose production companion (_py_test_companion)
 # matches either of those. The companion case can match with ZERO selected
 # suites: a pytest file whose companion has no shell coverage is still a
@@ -251,6 +296,19 @@ _match_path() {
   if [ -n "${LIB_FANOUT[$p]:-}" ]; then
     matched=1
     for suite in ${LIB_FANOUT[$p]}; do sel[$suite]=1; done
+  fi
+  # The golden pin rule ADDS a suite rather than claiming the path, so it runs
+  # unconditionally alongside the other rules: most pinned artifacts (every
+  # shared lib, every covered hook) are already matched by COVERS/LIB_FANOUT,
+  # and they need the golden suite selected TOO, not instead.
+  _load_golden_pins
+  if [ -n "${GOLDEN_PINS[$p]:-}" ]; then
+    # Non-empty GOLDEN_PINS implies the lib was sourced, so the suite name is
+    # set; the fallback keeps `set -u` from turning a future refactor into an
+    # unbound-variable abort mid-selection.
+    local golden_suite="${GOLDEN_MANIFEST_SUITE:-test-install-golden-manifest.sh}"
+    matched=1
+    sel[$golden_suite]=1
   fi
   for suite in "${ALLOW[@]}"; do
     while IFS= read -r cf; do
