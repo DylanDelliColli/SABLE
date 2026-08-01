@@ -30,11 +30,12 @@
 # bin/tier_selection.py's --diff-cover-scope mode WHENEVER that mode can
 # PROVE the scoped selection covers this diff (see
 # tier_selection.build_diff_cover_scope_plan's docstring for the exact
-# guarantees) — a full `pytest bin/` run takes ~887s idle on a 24-core box
-# against this floor's 900s budget, so it does not fit even idle. On any
-# doubt (missing/broken selector, unprovable selection, tier_selection.py
-# itself absent — e.g. an older checkout) this falls back to exactly the
-# full run this script always did before this fix.
+# guarantees). A full `pytest bin/` run measured ~887s idle on a 24-core box
+# on 2026-07-29 after SABLE-4gxef's hermeticity fix; the dedicated
+# `coverage_floor` budget in test-tiers.sh is sized from that fallback with
+# explicit margin. On any doubt (missing/broken selector, unprovable
+# selection, tier_selection.py itself absent — e.g. an older checkout) this
+# falls back to exactly the full run this script always did before this fix.
 #
 # Usage: diff-cover-gate.sh <compare-ref> [fail-under]
 #   compare-ref   the base commit/ref to diff against (required)

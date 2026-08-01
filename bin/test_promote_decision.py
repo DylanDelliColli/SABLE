@@ -1349,14 +1349,16 @@ def _write_tiers_sh(repo: str, contents: str) -> None:
     path.chmod(0o755)
 
 
-def _tiers_sh_with_budget(merge_preview_budget: int) -> str:
-    """A test-tiers.sh reporting a caller-chosen merge_preview budget, for
-    tests that need to move the SSOT to a SPECIFIC value (not merely a
-    distinctive one) and observe what tracks it."""
+def _tiers_sh_with_budgets(merge_preview_budget: int, coverage_floor_budget: int) -> str:
+    """A test-tiers.sh reporting independently movable promote-path budgets."""
     return (
         "#!/usr/bin/env bash\n"
         'if [ "$1" = "--budget" ] && [ "$2" = "merge_preview" ]; then\n'
         f"  echo {merge_preview_budget}\n"
+        "  exit 0\n"
+        "fi\n"
+        'if [ "$1" = "--budget" ] && [ "$2" = "coverage_floor" ]; then\n'
+        f"  echo {coverage_floor_budget}\n"
         "  exit 0\n"
         "fi\n"
         "exit 1\n"
@@ -1412,34 +1414,82 @@ def test_impact_timeout_defaults_repo_to_cwd_for_repo_less_callers(tmp_path, mon
 
 
 # --------------------------------------------------------------------------
-# The coverage-floor check's timeout reads the tier-budget SSOT (SABLE-cmar4.9)
+# The coverage-floor check's timeout reads its own tier-budget SSOT entry
+# (SABLE-1dmfc, preserving SABLE-cmar4.9's no-third-hardcode guarantee)
 # --------------------------------------------------------------------------
 #
 # Before this bead, _coverage_floor_timeout() returned a fresh hand-picked
 # 600 — a second hardcoded promote-path constant landed after w0zjm's
 # derivable-budget mechanism existed, the same class jd5fj.9 just closed for
-# _impact_timeout. It must now derive from the same SSOT, borrowing
-# merge_preview's budget the same way _impact_timeout does.
+# _impact_timeout. It now derives from its OWN entry in that same SSOT: moving
+# merge_preview must not move the floor, and moving coverage_floor must not
+# move the impact tier.
 
-_DISTINCTIVE_COVERAGE_BUDGET_TIERS_SH = (
-    "#!/usr/bin/env bash\n"
-    'if [ "$1" = "--budget" ] && [ "$2" = "merge_preview" ]; then\n'
-    "  echo 54321\n"
-    "  exit 0\n"
-    "fi\n"
-    "exit 1\n"
-)
+_DISTINCTIVE_COVERAGE_BUDGET_TIERS_SH = _tiers_sh_with_budgets(9000, 31337)
 
 
 def test_coverage_floor_timeout_reads_the_tier_ssot(tmp_path, monkeypatch):
-    """(a) A DISTINCTIVE budget (54321 — cannot pass by coincidence against
-    the old 600 or the impact tier's 900, the ambient-satisfaction trap that
-    cost jd5fj.15 a revise cycle) from a repo-local test-tiers.sh is picked
-    up in place of the old literal."""
+    """U1/U2: each timeout reads its own distinctive, live SSOT entry."""
     monkeypatch.delenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", raising=False)
+    monkeypatch.delenv("SABLE_MG_IMPACT_TIMEOUT", raising=False)
     repo, _ = _real_repo(tmp_path)
     _write_tiers_sh(repo, _DISTINCTIVE_COVERAGE_BUDGET_TIERS_SH)
-    assert promote_lib._coverage_floor_timeout(repo) == 54321.0
+    assert promote_lib._coverage_floor_timeout(repo) == 31337.0
+    assert promote_lib._impact_timeout(repo) == 9000.0
+
+
+def test_coverage_floor_and_impact_timeouts_are_independently_live_resolved(
+        tmp_path, monkeypatch):
+    """P1: mutate each source twice; only its own consumer may move."""
+    monkeypatch.delenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", raising=False)
+    monkeypatch.delenv("SABLE_MG_IMPACT_TIMEOUT", raising=False)
+    repo, _ = _real_repo(tmp_path)
+
+    merge_observations = []
+    for merge_budget in (11003, 12007, 13009):
+        _write_tiers_sh(repo, _tiers_sh_with_budgets(merge_budget, 31337))
+        merge_observations.append(
+            (promote_lib._impact_timeout(repo), promote_lib._coverage_floor_timeout(repo)))
+    assert [impact for impact, _ in merge_observations] == [11003.0, 12007.0, 13009.0]
+    assert len({floor for _, floor in merge_observations}) == 1
+
+    floor_observations = []
+    for floor_budget in (21011, 22013, 23017):
+        _write_tiers_sh(repo, _tiers_sh_with_budgets(14009, floor_budget))
+        floor_observations.append(
+            (promote_lib._impact_timeout(repo), promote_lib._coverage_floor_timeout(repo)))
+    assert len({impact for impact, _ in floor_observations}) == 1
+    assert [floor for _, floor in floor_observations] == [21011.0, 22013.0, 23017.0]
+
+
+def test_independence_property_rejects_the_previous_refused_budget_source():
+    """P2 plant: the pre-fix resolver follows merge_preview and fails P1."""
+    merge_budgets = (11003.0, 12007.0, 13009.0)
+
+    def previous_coverage_floor_timeout(merge_preview_budget):
+        return merge_preview_budget
+
+    planted_floor_observations = [
+        previous_coverage_floor_timeout(value) for value in merge_budgets
+    ]
+    assert len(set(planted_floor_observations)) != 1, (
+        "the independence property must reject re-fusing the floor to merge_preview")
+
+
+def test_coverage_floor_ssot_budget_clears_declared_full_fallback_cost(monkeypatch):
+    """U5: the operative stock budget fits the measured full fallback + margin."""
+    monkeypatch.delenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", raising=False)
+    floor_budget = promote_lib._coverage_floor_timeout(str(_BIN.parent))
+    assert promote_lib.coverage_floor_budget_is_sized(floor_budget), (
+        f"coverage_floor budget {floor_budget}s is below the declared full fallback "
+        f"cost {promote_lib.COVERAGE_FLOOR_DECLARED_FULL_FALLBACK_COST_S}s times "
+        f"headroom {promote_lib.BUDGET_HEADROOM}")
+
+
+def test_coverage_floor_budget_sizing_rejects_the_incident_and_accepts_the_fix():
+    """P3: reproduce the production arithmetic without a 15-minute run."""
+    assert not promote_lib.coverage_floor_budget_is_sized(900, 887, 1.2)
+    assert promote_lib.coverage_floor_budget_is_sized(2400, 887, 1.2)
 
 
 def test_coverage_floor_timeout_override_still_wins_over_the_ssot(tmp_path, monkeypatch):
@@ -1458,7 +1508,8 @@ def test_coverage_floor_timeout_falls_back_without_raising_on_a_missing_ssot(tmp
     monkeypatch.delenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", raising=False)
     repo, _ = _real_repo(tmp_path)
     assert not (Path(repo) / ".github" / "ci" / "test-tiers.sh").exists()
-    assert promote_lib._coverage_floor_timeout(repo) == 600.0
+    assert promote_lib._coverage_floor_timeout(repo) == \
+        promote_lib.COVERAGE_FLOOR_FALLBACK_TIMEOUT_S
 
 
 def test_coverage_floor_timeout_falls_back_without_raising_on_a_broken_ssot(tmp_path, monkeypatch):
@@ -1467,7 +1518,8 @@ def test_coverage_floor_timeout_falls_back_without_raising_on_a_broken_ssot(tmp_
     monkeypatch.delenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", raising=False)
     repo, _ = _real_repo(tmp_path)
     _write_tiers_sh(repo, _BROKEN_TIERS_SH)
-    assert promote_lib._coverage_floor_timeout(repo) == 600.0
+    assert promote_lib._coverage_floor_timeout(repo) == \
+        promote_lib.COVERAGE_FLOOR_FALLBACK_TIMEOUT_S
 
 
 def test_coverage_floor_timeout_falls_back_without_raising_on_an_unparseable_override(tmp_path, monkeypatch):
@@ -1477,7 +1529,8 @@ def test_coverage_floor_timeout_falls_back_without_raising_on_an_unparseable_ove
     repo, _ = _real_repo(tmp_path)
     _write_tiers_sh(repo, _DISTINCTIVE_COVERAGE_BUDGET_TIERS_SH)
     monkeypatch.setenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", "not-a-number")
-    assert promote_lib._coverage_floor_timeout(repo) == 600.0
+    assert promote_lib._coverage_floor_timeout(repo) == \
+        promote_lib.COVERAGE_FLOOR_FALLBACK_TIMEOUT_S
 
 
 def test_coverage_floor_timeout_defaults_repo_to_cwd_for_repo_less_callers(tmp_path, monkeypatch):
@@ -1488,7 +1541,7 @@ def test_coverage_floor_timeout_defaults_repo_to_cwd_for_repo_less_callers(tmp_p
     repo, _ = _real_repo(tmp_path)
     _write_tiers_sh(repo, _DISTINCTIVE_COVERAGE_BUDGET_TIERS_SH)
     monkeypatch.chdir(repo)
-    assert promote_lib._coverage_floor_timeout() == 54321.0
+    assert promote_lib._coverage_floor_timeout() == 31337.0
 
 
 # --------------------------------------------------------------------------
@@ -2094,7 +2147,9 @@ def test_impact_budget_is_queryable(clean_budget_env, capsys):
     assert stock["tier_timeout_s"] == 900.0
     assert stock["lock_timeout_s"] == 3600.0
     assert stock["coverage_floor_timeout_s"] == 900.0
-    assert stock["worst_case_s"] == 5400.0, (
+    assert stock["worst_case_s"] == (
+        stock["tier_timeout_s"] + stock["lock_timeout_s"]
+        + stock["coverage_floor_timeout_s"]), (
         "worst case must be queue + tier + coverage floor; omitting any one "
         "term is the exact mis-sizing SABLE-w0zjm/SABLE-5v3d5 exist to prevent")
     assert stock["serialized"] is True
@@ -2111,8 +2166,10 @@ def test_impact_budget_is_queryable(clean_budget_env, capsys):
     tuned = promote_lib.impact_budget()
     assert (tuned["tier_timeout_s"], tuned["lock_timeout_s"],
             tuned["coverage_floor_timeout_s"]) == (123.0, 456.0, 789.0)
-    assert tuned["worst_case_s"] == 1368.0
-    assert tuned["recommended_wrapper_timeout_s"] > 1368
+    assert tuned["worst_case_s"] == (
+        tuned["tier_timeout_s"] + tuned["lock_timeout_s"]
+        + tuned["coverage_floor_timeout_s"])
+    assert tuned["recommended_wrapper_timeout_s"] > tuned["worst_case_s"]
 
     # With serialization off there is no queue to wait in, so charging the
     # wrapper for one would overstate the budget rather than understate it —
@@ -2121,7 +2178,8 @@ def test_impact_budget_is_queryable(clean_budget_env, capsys):
     monkeypatch.setenv("SABLE_MG_IMPACT_SERIALIZE", "0")
     off = promote_lib.impact_budget()
     assert off["lock_timeout_s"] == 0.0
-    assert off["worst_case_s"] == off["tier_timeout_s"] + off["coverage_floor_timeout_s"] == 912.0
+    assert off["worst_case_s"] == (
+        off["tier_timeout_s"] + off["coverage_floor_timeout_s"])
     assert off["serialized"] is False
 
     # The decomposition keys are present and PROVABLY sum to the total, so a
@@ -2135,7 +2193,8 @@ def test_impact_budget_is_queryable(clean_budget_env, capsys):
     text = promote_lib.format_impact_budget(stock)
     assert "SABLE_MG_IMPACT_LOCK_TIMEOUT" in text and "SABLE_MG_IMPACT_TIMEOUT" in text
     assert "SABLE_MG_COVERAGE_FLOOR_TIMEOUT" in text
-    assert "5400" in text and str(stock["recommended_wrapper_timeout_s"]) in text
+    assert f"{stock['worst_case_s']:.0f}" in text
+    assert str(stock["recommended_wrapper_timeout_s"]) in text
     capsys.readouterr()
 
 
@@ -2159,29 +2218,24 @@ def test_impact_budget_worst_case_tracks_the_coverage_floor_ssot_in_isolation(
     monkeypatch.delenv("SABLE_MG_COVERAGE_FLOOR_TIMEOUT", raising=False)
 
     repo, _ = _real_repo(tmp_path)
-    _write_tiers_sh(repo, _DISTINCTIVE_COVERAGE_BUDGET_TIERS_SH)  # merge_preview=54321
+    _write_tiers_sh(repo, _DISTINCTIVE_COVERAGE_BUDGET_TIERS_SH)
     before = promote_lib.impact_budget(repo)
-    assert before["coverage_floor_timeout_s"] == 54321.0
-    assert before["worst_case_s"] == 100.0 + 200.0 + 54321.0
+    assert before["coverage_floor_timeout_s"] == 31337.0
 
-    _write_tiers_sh(repo, _tiers_sh_with_budget(600))
+    _write_tiers_sh(repo, _tiers_sh_with_budgets(9000, 21011))
     after_small = promote_lib.impact_budget(repo)
-    assert after_small["coverage_floor_timeout_s"] == 600.0
-    assert after_small["worst_case_s"] == 100.0 + 200.0 + 600.0
 
-    _write_tiers_sh(repo, _tiers_sh_with_budget(900))
+    _write_tiers_sh(repo, _tiers_sh_with_budgets(9000, 23017))
     after_big = promote_lib.impact_budget(repo)
-    assert after_big["coverage_floor_timeout_s"] == 900.0
-    assert after_big["worst_case_s"] == 100.0 + 200.0 + 900.0
 
-    # THE CHECK ITSELF: the coverage-floor term moved (600 -> 900) and
+    # THE CHECK ITSELF: the coverage-floor term moved while merge_preview did
+    # not, and
     # worst_case_s MUST move with it, by exactly the delta.
     assert after_big["worst_case_s"] != after_small["worst_case_s"], (
         "the coverage-floor SSOT moved but worst_case_s did not -- the exact "
         "instrument-blindness SABLE-5v3d5 reports")
     assert (after_big["worst_case_s"] - after_small["worst_case_s"]
-            == after_big["coverage_floor_timeout_s"] - after_small["coverage_floor_timeout_s"]
-            == 300.0)
+            == after_big["coverage_floor_timeout_s"] - after_small["coverage_floor_timeout_s"])
 
 
 def test_impact_budget_worst_case_sum_is_wrong_for_a_reverted_two_term_sum():
