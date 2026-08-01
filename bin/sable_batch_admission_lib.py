@@ -60,6 +60,7 @@ from dataclasses import dataclass
 import sable_batch_fold_lib as fold_lib
 import sable_footprint_lib as fp
 import sable_gate_classify_lib as classify
+import sable_gate_git_lib as git_lib
 import sable_gate_preview_lib as preview_lib
 from sable_batch_fold_lib import FoldMember
 from sable_gate_classify_lib import GateError
@@ -201,10 +202,35 @@ class BatchabilityVerdict:
         raise KeyError(name)
 
 
+def _candidate_mechanical_footprint(
+        repo: str, base_sha: str, branch_sha: str) -> fp.Footprint:
+    """Return only changes attributable to this candidate branch.
+
+    ``fp.mechanical_footprint`` intentionally compares two trees directly so
+    sibling overlap checks stay commensurable.  Admission against a fixed gate
+    roster asks a different question: what changed from this branch's fork to
+    its tip?  Resolve that fork here and leave the shared two-dot primitive
+    unchanged for its existing callers.
+    """
+    cp = git_lib._git(
+        repo, "merge-base", base_sha, branch_sha, check=False)
+    merge_bases = [line.strip() for line in cp.stdout.splitlines()
+                   if line.strip()]
+    if cp.returncode != 0 or len(merge_bases) != 1:
+        detail = cp.stdout.strip() or "no unique merge base returned"
+        raise fp.FootprintUndetermined(
+            f"git merge-base {base_sha[:7]} {branch_sha[:7]} failed: {detail}")
+    merge_base = merge_bases[0]
+    return fp.mechanical_footprint(
+        repo, merge_base, branch_sha,
+        source=f"candidate diff {merge_base[:7]}..{branch_sha[:7]}")
+
+
 def _non_gate_class(repo: str, base_sha: str, branch_sha: str, bead: str) -> ClauseResult:
     try:
         declared = fp.declared_footprint(repo, bead)
-        mechanical_fp = fp.mechanical_footprint(repo, base_sha, branch_sha)
+        mechanical_fp = _candidate_mechanical_footprint(
+            repo, base_sha, branch_sha)
     except fp.FootprintUndetermined as exc:
         return ClauseResult("non_gate_class", False,
                             f"footprint undetermined, fails closed: {exc}")
