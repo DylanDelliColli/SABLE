@@ -1178,9 +1178,47 @@ if [ -n "${SABLE_TEST_COMMAND_INTENT:-}" ] && \
 DIVERGENCE: prior intent was \`${SABLE_TEST_COMMAND_INTENT}\`, which is NOT what ran. The executed command above is what this gate certifies; the intent value certifies nothing."
 fi
 
+# SABLE-y4nom.7.2: the INCOMPLETE-BY-TRIM marker DOMINATES the exit code.
+# sable-dev-check emits one machine line naming every selected suite its
+# plan omitted; a configured wrapper (`... || true`) can launder rc3 back
+# to rc0, so gating on TEST_EXIT alone would print all-phases-passed over
+# an unverified claim. The marker line is extracted SEPARATELY from the
+# truncated output tail — truncation can never eat the omitted set.
+INCOMPLETE_MARKER_LINE=$(printf '%s\n' "$TEST_OUT" \
+  | grep '^SABLE_DEV_CHECK_INCOMPLETE_BY_TRIM=' | tail -1 || true)
+if [ -n "$INCOMPLETE_MARKER_LINE" ]; then
+  # rc-sensitive detail: the marker legitimately rides kept-FAILURE (rc1)
+  # and internal-timeout (rc124) exits too, so "nothing failed" is only
+  # claimed when it is true. The marker still dominates CLASSIFICATION in
+  # every case — this deny is INCOMPLETE, never all-phases-passed.
+  if [ "$TEST_EXIT" -eq 0 ]; then
+    RC_NOTE="CONTRACT VIOLATION: the INCOMPLETE verdict was swallowed — the marker is present but the test command exited 0, which means a wrapper (e.g. \`|| true\`) laundered the exit code. Remove the wrapper; a gate command that cannot fail certifies nothing.
+"
+  elif [ "$TEST_EXIT" -eq 3 ]; then
+    RC_NOTE="Nothing that ran failed; the plan itself was incomplete.
+"
+  elif [ "$TEST_EXIT" -eq 124 ]; then
+    RC_NOTE="Additionally, the run TIMED OUT (exit 124) before finishing what it kept — the omissions below are on top of an unfinished run.
+"
+  else
+    RC_NOTE="Additionally, the kept suites did not all pass (exit ${TEST_EXIT}) — fix the failure AND close the omissions below.
+"
+  fi
+  emit_deny "Pre-push phase 4 (tests): INCOMPLETE — the run trimmed selected suite(s) to fit its budget, so the configured claim was NOT fully verified, and an unverified claim does not push.
+${RC_NOTE}Publish fresh shared measurements with \`sable-dev-check --publish-cost-profile\` (one per host, coordinated quiet window — broad seat when a fleet exists, standalone runner otherwise; expensive) so the derived budgets fit the real cost, raise the bound, or reduce the suites' real runtime. Do NOT narrow \`sable.testCommand\` or the selected suite set to fit (SABLE-b99hy).
+
+$INCOMPLETE_MARKER_LINE
+
+${TEST_CMD_RECORD}${GATE_RECORD:+
+$GATE_RECORD}
+
+$(sable_tail_chars "$TEST_OUT" 1500)"
+  exit 0
+fi
+
 if [ "$TEST_EXIT" -ne 0 ]; then
   if [ "$TEST_EXIT" -eq 124 ]; then
-    SUFFIX="Tests exceeded the ${TEST_TIMEOUT}s test-phase timeout, so this push has NO verdict — nothing was verified, rather than something failing. Re-measure suite cost (pytest --sable-test-cost-report, .github/ci/shell-run-set.sh --profile) so the derived per-command budgets in bin/sable-dev-check reflect current cost, or reduce the suites' real runtime. Do NOT narrow \`sable.testCommand\` or the selected suite set to fit: a smaller claim that passes is not the configured claim passing, and this gate records what it actually ran (SABLE-b99hy)."
+    SUFFIX="Tests exceeded the ${TEST_TIMEOUT}s test-phase timeout, so this push has NO verdict — nothing was verified, rather than something failing. Publish fresh shared measurements with \`sable-dev-check --publish-cost-profile\` (the one-per-host serial publisher — coordinated quiet window) so the derived per-command budgets in bin/sable-dev-check reflect current cost, or reduce the suites' real runtime. Do NOT narrow \`sable.testCommand\` or the selected suite set to fit: a smaller claim that passes is not the configured claim passing, and this gate records what it actually ran (SABLE-b99hy)."
   else
     SUFFIX="Tests failed. Fix before pushing, or set SABLE_SKIP_PRE_PUSH=1 with explicit intent (rebase + static + build still run)."
   fi

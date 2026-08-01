@@ -1070,18 +1070,19 @@ def test_load_costs_reports_none_when_no_measurements_exist(tmp_path):
 
 
 def test_load_costs_reads_the_two_existing_reporters(tmp_path):
-    _write(
-        tmp_path,
-        devcheck.PYTHON_COST_REPORT,
+    """REVISED under SABLE-y4nom.7.2: the repo-root default paths are HARD
+    CUT (per-worktree divergence); raw reporter files are now read only via
+    the explicit override PAIR (diagnostic mode)."""
+    py = tmp_path / "py-cost.json"
+    py.write_text(
         json.dumps({"modules": [{"module": "bin/test_a.py", "seconds": 3.0}]}),
     )
-    _write(
-        tmp_path,
-        devcheck.SHELL_COST_PROFILE,
+    shell = tmp_path / "shell-cost.tsv"
+    shell.write_text(
         "suite\tstatus\tseconds\ntest-a.sh\tpass\t2.000000\n",
     )
 
-    costs = devcheck.load_costs(tmp_path)
+    costs = devcheck.load_costs(tmp_path, python_report=py, shell_profile=shell)
 
     assert costs is not None
     assert costs.python == {"bin/test_a.py": 3.0}
@@ -1089,14 +1090,16 @@ def test_load_costs_reads_the_two_existing_reporters(tmp_path):
 
 
 def test_an_unreadable_cost_report_degrades_instead_of_blocking(tmp_path, capsys):
-    _write(tmp_path, devcheck.PYTHON_COST_REPORT, "{ not json")
-    _write(
-        tmp_path,
-        devcheck.SHELL_COST_PROFILE,
+    """REVISED under SABLE-y4nom.7.2: exercised through the override PAIR
+    (diagnostic raw-file mode) — the default read is the shared store now."""
+    py = tmp_path / "py-cost.json"
+    py.write_text("{ not json")
+    shell = tmp_path / "shell-cost.tsv"
+    shell.write_text(
         "suite\tstatus\tseconds\ntest-a.sh\tpass\t2.000000\n",
     )
 
-    costs = devcheck.load_costs(tmp_path)
+    costs = devcheck.load_costs(tmp_path, python_report=py, shell_profile=shell)
 
     assert costs is not None
     assert costs.python == {}
@@ -1141,3 +1144,283 @@ def test_collect_changed_paths_emits_both_sides_of_a_rename(tmp_path):
 
     assert "new-name.txt" in changed
     assert "old-name.txt" in changed
+
+
+# ---------------------------------------------------------------------------
+# SABLE-y4nom.7.2 — the no-omission exit contract (rc3 INCOMPLETE-BY-TRIM,
+# marker dominates) and the shared-store read side (hard cut, half-override
+# refusal, fingerprint gate).
+# ---------------------------------------------------------------------------
+
+def _trimming_fixture(tmp_path):
+    """A repo + raw override cost files where one selected suite cannot fit
+    the ceiling: the kept suite passes, the slow one is trimmed."""
+    repo = tmp_path / "trimrepo"
+    (repo / "hooks/test").mkdir(parents=True)
+    for name, body in (("test-fast-a.sh", "exit 0\n"), ("test-slow-b.sh", "exit 0\n")):
+        path = repo / "hooks/test" / name
+        path.write_text("#!/usr/bin/env bash\n" + body)
+        path.chmod(0o755)
+    py_report = repo / "py-cost.json"
+    py_report.write_text(json.dumps({"modules": [], "violations": []}))
+    shell_profile = repo / "shell-cost.tsv"
+    shell_profile.write_text(
+        "suite\tstatus\tseconds\ntest-fast-a.sh\tpass\t1.0\ntest-slow-b.sh\tpass\t9999.0\n"
+    )
+    plan = devcheck.DeveloperPlan(
+        changed_paths=("x",),
+        python=devcheck.PythonSelection("none", (), "none"),
+        shell_suites=("test-fast-a.sh", "test-slow-b.sh"),
+        shell_mode="scoped",
+        shell_reason="2 suites",
+    )
+    costs = devcheck.load_costs(
+        repo, python_report=py_report, shell_profile=shell_profile,
+    )
+    assert costs is not None
+    budget = devcheck.effective_budget(
+        repo, plan, explicit_seconds=100.0, costs=costs, derived=True,
+    )
+    assert budget.omitted == ("test-slow-b.sh",)
+    return repo, plan, budget
+
+
+def test_kept_pass_with_omission_exits_3_and_emits_the_marker(tmp_path, capsys):
+    repo, plan, budget = _trimming_fixture(tmp_path)
+    rc = devcheck.run_plan(repo, plan, budget_seconds=budget.seconds, budget=budget)
+    captured = capsys.readouterr()
+    assert rc == 3
+    lines = [l for l in (captured.out + captured.err).splitlines() if l]
+    marker = [l for l in lines if l.startswith(devcheck.INCOMPLETE_MARKER_PREFIX)]
+    assert marker, "marker line missing"
+    assert json.loads(marker[-1][len(devcheck.INCOMPLETE_MARKER_PREFIX):]) == [
+        "test-slow-b.sh"
+    ]
+    # the marker is the FINAL stdout line — untruncatable by earlier output
+    assert captured.out.splitlines()[-1] == marker[-1]
+
+
+def test_kept_failure_with_omission_still_emits_the_marker(tmp_path, capsys):
+    repo, plan, budget = _trimming_fixture(tmp_path)
+    (repo / "hooks/test/test-fast-a.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    rc = devcheck.run_plan(repo, plan, budget_seconds=budget.seconds, budget=budget)
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert any(
+        l.startswith(devcheck.INCOMPLETE_MARKER_PREFIX)
+        for l in (captured.out + captured.err).splitlines()
+    )
+
+
+def test_total_exhaustion_with_omission_emits_the_marker_before_124(tmp_path, capsys):
+    repo, plan, budget = _trimming_fixture(tmp_path)
+    ticks = iter([0.0, 1e6])
+    rc = devcheck.run_plan(
+        repo, plan, budget_seconds=budget.seconds, budget=budget,
+        clock=lambda: next(ticks, 2e6),
+    )
+    captured = capsys.readouterr()
+    assert rc == 124
+    assert any(
+        l.startswith(devcheck.INCOMPLETE_MARKER_PREFIX)
+        for l in (captured.out + captured.err).splitlines()
+    )
+
+
+def test_half_override_mixing_is_refused_loudly(tmp_path):
+    repo = _python_repo(tmp_path, {"bin/widget.py": "VALUE = 1\n"})
+    report = tmp_path / "py.json"
+    report.write_text(json.dumps({"modules": [], "violations": []}))
+    with pytest.raises(devcheck.DeveloperCheckError, match="both"):
+        devcheck.load_costs(repo, python_report=report)
+    with pytest.raises(devcheck.DeveloperCheckError, match="both"):
+        devcheck.load_costs(repo, shell_profile=report)
+
+
+def test_legacy_repo_root_paths_are_hard_cut(tmp_path):
+    """Old per-worktree default files must NOT be read any more — no silent
+    fallback that would reintroduce per-worktree divergence."""
+    from test_sable_test_cost_profile_lib import make_repo
+    repo = make_repo(tmp_path, "hardcut")
+    legacy = repo / devcheck.SHELL_COST_PROFILE
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text("suite\tstatus\tseconds\ntest-fx-a.sh\tpass\t42.0\n")
+    costs = devcheck.load_costs(repo)
+    assert costs is None
+
+
+def test_load_costs_reads_the_shared_store_and_fingerprint_gates_it(
+    tmp_path, capsys,
+):
+    from test_sable_test_cost_profile_lib import (
+        fake_producer_runner, make_repo,
+    )
+    import sable_test_cost_profile_lib as profile_lib
+    repo = make_repo(tmp_path, "storerepo")
+    profile_lib.publish(repo, runner=fake_producer_runner())
+    costs = devcheck.load_costs(repo)
+    assert costs is not None
+    assert costs.shell == {"test-fx-a.sh": 2.0, "test-fx-b.sh": 3.0}
+    # tamper: fingerprint mismatch must degrade LOUDLY to no-costs
+    store = profile_lib.store_dir(repo)
+    on_disk = json.loads((store / profile_lib.PROFILE_NAME).read_text())
+    on_disk["fingerprint"]["cpu_count"] = 9999
+    (store / profile_lib.PROFILE_NAME).write_text(json.dumps(on_disk))
+    capsys.readouterr()
+    costs = devcheck.load_costs(repo)
+    captured = capsys.readouterr()
+    assert costs is None
+    assert "cpu_count" in captured.err
+
+
+def test_cli_dry_run_with_omissions_is_nonzero_and_emits_marker(
+    tmp_path, monkeypatch, capsys,
+):
+    repo, plan, budget = _trimming_fixture(tmp_path)
+    monkeypatch.setattr(sable_dev_check_cli, "_repo_root", lambda: repo)
+    monkeypatch.setattr(
+        sable_dev_check_cli.devcheck, "collect_changed_paths",
+        lambda *_a, **_k: ("x",),
+    )
+    monkeypatch.setattr(
+        sable_dev_check_cli.devcheck, "build_plan", lambda *_a, **_k: plan,
+    )
+    monkeypatch.setattr(
+        sable_dev_check_cli.devcheck, "load_costs", lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        sable_dev_check_cli.devcheck, "effective_budget",
+        lambda *_a, **_k: budget,
+    )
+    rc = sable_dev_check_cli.main(["--dry-run"])
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert any(
+        l.startswith(devcheck.INCOMPLETE_MARKER_PREFIX)
+        for l in captured.out.splitlines()
+    )
+
+
+def test_timeout_remediation_teaches_the_shared_publisher():
+    assert "--publish-cost-profile" in devcheck.TIMEOUT_REMEDIATION
+
+
+def test_precondition_error_with_omissions_still_ends_on_the_marker(
+    tmp_path, monkeypatch, capsys,
+):
+    """codex marker-seam: a DeveloperCheckError AFTER the budget exists must
+    not push the marker off the end — main re-emits it as the FINAL stdout
+    line after the precondition text (which goes to stderr)."""
+    repo, plan, budget = _trimming_fixture(tmp_path)
+    monkeypatch.setattr(sable_dev_check_cli, "_repo_root", lambda: repo)
+    monkeypatch.setattr(
+        sable_dev_check_cli.devcheck, "collect_changed_paths",
+        lambda *_a, **_k: ("x",),
+    )
+    monkeypatch.setattr(
+        sable_dev_check_cli.devcheck, "build_plan", lambda *_a, **_k: plan,
+    )
+    monkeypatch.setattr(
+        sable_dev_check_cli.devcheck, "load_costs", lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        sable_dev_check_cli.devcheck, "effective_budget",
+        lambda *_a, **_k: budget,
+    )
+
+    def raising_run_plan(*_a, **_k):
+        raise devcheck.DeveloperCheckError("tool missing mid-run")
+
+    monkeypatch.setattr(
+        sable_dev_check_cli.devcheck, "run_plan", raising_run_plan,
+    )
+    rc = sable_dev_check_cli.main([])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "precondition failed" in captured.err
+    out_lines = [l for l in captured.out.splitlines() if l]
+    assert out_lines[-1].startswith(devcheck.INCOMPLETE_MARKER_PREFIX)
+
+
+def test_timeout_marker_is_the_final_stdout_line(tmp_path, capsys):
+    repo, plan, budget = _trimming_fixture(tmp_path)
+    ticks = iter([0.0, 1e6])
+    rc = devcheck.run_plan(
+        repo, plan, budget_seconds=budget.seconds, budget=budget,
+        clock=lambda: next(ticks, 2e6),
+    )
+    captured = capsys.readouterr()
+    assert rc == 124
+    out_lines = [l for l in captured.out.splitlines() if l]
+    assert out_lines[-1].startswith(devcheck.INCOMPLETE_MARKER_PREFIX)
+
+
+def test_kept_failure_marker_is_the_final_stdout_line(tmp_path, capsys):
+    repo, plan, budget = _trimming_fixture(tmp_path)
+    (repo / "hooks/test/test-fast-a.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    rc = devcheck.run_plan(repo, plan, budget_seconds=budget.seconds, budget=budget)
+    captured = capsys.readouterr()
+    assert rc == 1
+    out_lines = [l for l in captured.out.splitlines() if l]
+    assert out_lines[-1].startswith(devcheck.INCOMPLETE_MARKER_PREFIX)
+
+
+@pytest.mark.parametrize("planning_flags", [
+    ["--base", "origin/x"],
+    ["--path", "p"],
+    ["--dry-run"],
+    ["--budget", "5"],
+    ["--cost-report", "f.json"],
+    ["--shell-profile", "f.tsv"],
+    ["--no-derived-budget"],
+])
+def test_publish_flag_is_exclusive_with_every_planning_flag(
+    planning_flags, capsys,
+):
+    """v2.1 B8: --publish-cost-profile combined with ANY planning flag is a
+    parser-level refusal naming the exclusivity (not the generic
+    unrecognized-arguments text, which would pass vacuously pre-impl)."""
+    with pytest.raises(SystemExit) as excinfo:
+        sable_dev_check_cli.main(["--publish-cost-profile", *planning_flags])
+    assert excinfo.value.code == 2
+    assert "cannot be combined" in capsys.readouterr().err
+
+
+def test_publish_flag_dispatches_publish_once_and_never_plans(
+    monkeypatch, tmp_path, capsys,
+):
+    calls = []
+    monkeypatch.setattr(sable_dev_check_cli, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        sable_dev_check_cli.profile_lib, "publish",
+        lambda repo, **_k: calls.append(repo) or {
+            "schema": 1, "python_costs": {"a": 1.0}, "shell_costs": {"b": 2.0},
+            "provisional_python": [],
+        },
+    )
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("planning path entered during publish dispatch")
+
+    monkeypatch.setattr(sable_dev_check_cli.devcheck, "build_plan", forbidden)
+    monkeypatch.setattr(
+        sable_dev_check_cli.devcheck, "collect_changed_paths", forbidden,
+    )
+    rc = sable_dev_check_cli.main(["--publish-cost-profile"])
+    assert rc == 0
+    assert calls == [tmp_path]
+
+
+def test_publisher_mode_outside_a_repo_is_a_clean_rc2(monkeypatch, capsys):
+    """round-2 pin: _repo_root's DeveloperCheckError in publisher mode is
+    caught — a concise refusal, never a traceback."""
+
+    def raising_repo_root():
+        raise devcheck.DeveloperCheckError("not inside a git repository")
+
+    monkeypatch.setattr(sable_dev_check_cli, "_repo_root", raising_repo_root)
+    rc = sable_dev_check_cli.main(["--publish-cost-profile"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "publish refused" in captured.err
+    assert "Traceback" not in captured.err

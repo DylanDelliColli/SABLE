@@ -1642,6 +1642,147 @@ assert_deny "j90ba unscoped: multi-refspec push is denied even without explicit 
   "$J90_PLAIN_ENV" "git push origin main side" "$J90_PLAIN" "exactly one"
 rm -rf "$J90_BARE" "$J90_REPO" "$J90_PLAIN_BARE" "$J90_PLAIN"
 
+# ---------- SABLE-y4nom.7.2: INCOMPLETE-BY-TRIM verdict at the outer gate --
+# The marker line DOMINATES the exit code (codex v2.1 C1): a wrapper like
+# `sable-dev-check ... || true` launders rc3 to rc0 while the marker
+# survives, so gating on rc alone would print all-phases-passed over an
+# unverified claim. Marker present => deny INCOMPLETE regardless of
+# TEST_EXIT; marker with rc0 additionally names the swallowed-verdict
+# violation; a bare exit 3 WITHOUT the marker stays a generic test failure.
+# The marker is built >1500 bytes (40 omitted suite names) so that the
+# 1500-char output TAIL can only ever hold a TRUNCATED marker: a deny that
+# carries the FULL byte-exact line has necessarily extracted it SEPARATELY
+# from sable_tail_chars. (codex round-1: a short marker inside the tail let
+# the extraction assertion green vacuously.)
+VE2_MARKER='SABLE_DEV_CHECK_INCOMPLETE_BY_TRIM=['
+for _i in $(seq 1 40); do
+  VE2_MARKER="${VE2_MARKER}\"test-omitted-suite-number-${_i}-padding.sh\", "
+done
+VE2_MARKER="${VE2_MARKER}\"test-omitted-final.sh\"]"
+ve2_fixture() {
+  # $1 = the committed test script body
+  VE2_BARE="$TMPROOT/ve2-bare.git"
+  VE2_REPO="$TMPROOT/ve2-repo"
+  rm -rf "$VE2_BARE" "$VE2_REPO"
+  git init -q --bare "$VE2_BARE"
+  git clone -q "$VE2_BARE" "$VE2_REPO" 2>/dev/null
+  (
+    cd "$VE2_REPO" || exit 1
+    git config user.email t@t; git config user.name t
+    git checkout -q -B main
+    printf '%s\n' "$1" > run-tests.sh
+    printf 'testCommand=bash ./run-tests.sh\n' > .sable
+    git add -A; git commit -q -m base
+    git push -q "$VE2_BARE" HEAD:refs/heads/main
+    echo change > f.txt; git add -A; git commit -q -m change
+  )
+}
+VE2_ENV="$MGR_ENV SABLE_BASE_BRANCH=origin/main SABLE_PRE_PUSH_TYPECHECK_COMMAND=true"
+
+# ve2_deny_checks NAME OUT POS NEG1 NEG2: positive AND negative substring
+# assertions against the DECODED permissionDecisionReason — the hook output
+# is JSON, so a marker containing quotes is escaped in the raw stream and a
+# raw grep -F could never byte-match it (codex). Python containment also
+# sidesteps echo|grep SIGPIPE flakiness on the oversized value. Test names
+# are not assertions, so the absences are checked explicitly.
+ve2_deny_checks() {
+  local name="$1" out="$2" pos="$3" neg1="$4" neg2="$5" verdict
+  verdict=$(VE2_RAW="$out" VE2_POS="$pos" VE2_NEG1="$neg1" VE2_NEG2="$neg2" python3 - <<'PYEOF'
+import json, os
+raw = os.environ["VE2_RAW"]
+pos, neg1, neg2 = (os.environ[k] for k in ("VE2_POS", "VE2_NEG1", "VE2_NEG2"))
+why = []
+reason = ""
+try:
+    data = json.loads(raw)
+    hso = data.get("hookSpecificOutput", data)
+    if hso.get("permissionDecision") != "deny":
+        why.append("no-deny")
+    reason = str(hso.get("permissionDecisionReason", ""))
+except (ValueError, AttributeError) as exc:
+    why.append(f"unparseable:{exc}")
+if pos and pos not in reason:
+    why.append(f"missing[{pos[:60]}]")
+if neg1 and neg1 in reason:
+    why.append(f"forbidden[{neg1[:40]}]")
+if neg2 and neg2 in reason:
+    why.append(f"forbidden[{neg2[:40]}]")
+print("OK" if not why else ";".join(why))
+PYEOF
+)
+  if [ "$verdict" = "OK" ]; then PASS=$((PASS+1)); echo "PASS: $name"; else
+    FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $name ($verdict)"
+    echo "FAIL: $name"; echo "  $verdict"; echo "  Got: ${out:0:400}"
+  fi
+}
+
+# rc3 + oversized marker, with >1500 bytes of trailing filler AFTER it: the
+# tail window holds only filler, so both the INCOMPLETE verdict and the
+# byte-exact full marker must come from separate extraction.
+ve2_fixture "echo '$VE2_MARKER'; head -c 3000 /dev/zero | tr '\\0' 'y'; echo; exit 3"
+VE2_OUT=$(run_hook "$VE2_ENV" "git push" "$VE2_REPO")
+ve2_deny_checks "y4nom.7.2: marker + rc3 denies INCOMPLETE (never all-phases-passed, never generic failure)" \
+  "$VE2_OUT" "INCOMPLETE" "all phases passed" "Tests failed."
+ve2_deny_checks "y4nom.7.2: the deny carries the FULL byte-exact marker despite tail truncation" \
+  "$VE2_OUT" "$VE2_MARKER" "" ""
+
+# rc0 + marker (the || true laundering wrapper) => still INCOMPLETE, naming
+# the swallowed-verdict contract violation; never all-phases-passed.
+ve2_fixture "echo '$VE2_MARKER'; exit 0"
+VE2_OUT=$(run_hook "$VE2_ENV" "git push" "$VE2_REPO")
+ve2_deny_checks "y4nom.7.2: marker + rc0 (laundered) still denies INCOMPLETE" \
+  "$VE2_OUT" "INCOMPLETE" "all phases passed" ""
+ve2_deny_checks "y4nom.7.2: marker + rc0 names the swallowed-verdict contract violation" \
+  "$VE2_OUT" "swallowed" "" ""
+
+# marker + rc1 (kept suites failed AND the plan omitted) => INCOMPLETE
+# classification with the underlying failure ALSO named — "nothing failed"
+# must not be claimed here.
+ve2_fixture "echo '$VE2_MARKER'; exit 1"
+VE2_OUT=$(run_hook "$VE2_ENV" "git push" "$VE2_REPO")
+ve2_deny_checks "y4nom.7.2: marker + rc1 classifies INCOMPLETE and names the underlying failure" \
+  "$VE2_OUT" "INCOMPLETE" "all phases passed" "Nothing that ran failed"
+ve2_deny_checks "y4nom.7.2: marker + rc1 names the kept-suite failure alongside the omissions" \
+  "$VE2_OUT" "did not all pass" "" ""
+
+# marker + rc124 (round-1 B7): the command emits the oversized marker then
+# stays alive past the outer testTimeout — TEST_EXIT becomes 124 WITH the
+# marker in the captured output. Classification must be INCOMPLETE with the
+# timeout named, the full marker separately extracted, and neither
+# all-phases-passed nor the generic failure text present.
+ve2_fixture "echo '$VE2_MARKER'; sleep 30"
+(
+  cd "$VE2_REPO" || exit 1
+  printf 'testCommand=bash ./run-tests.sh\ntestTimeout=1\n' > .sable
+  git add .sable; git commit -q -m timeout-marker-fixture
+)
+VE2_OUT=$(run_hook "$VE2_ENV" "git push" "$VE2_REPO")
+ve2_deny_checks "y4nom.7.2: marker + rc124 classifies INCOMPLETE (decoded positive, not the test name)" \
+  "$VE2_OUT" "INCOMPLETE" "all phases passed" "Tests failed."
+ve2_deny_checks "y4nom.7.2: marker + rc124 names the timeout alongside the omissions" \
+  "$VE2_OUT" "TIMED OUT" "" ""
+ve2_deny_checks "y4nom.7.2: marker + rc124 still carries the FULL byte-exact marker" \
+  "$VE2_OUT" "$VE2_MARKER" "" ""
+
+# bare exit 3, NO marker => generic phase-4 failure; the INCOMPLETE verdict
+# must be ABSENT (checked, not implied by the name).
+ve2_fixture "exit 3"
+VE2_OUT=$(run_hook "$VE2_ENV" "git push" "$VE2_REPO")
+ve2_deny_checks "y4nom.7.2: exit 3 without the marker stays a generic test failure (no INCOMPLETE verdict)" \
+  "$VE2_OUT" "Tests failed." "INCOMPLETE" ""
+
+# timeout remediation names the shared publisher, not raw per-worktree
+# reporter runs (v2.1 C5's second site).
+ve2_fixture "sleep 30"
+(
+  cd "$VE2_REPO" || exit 1
+  printf 'testCommand=bash ./run-tests.sh\ntestTimeout=1\n' > .sable
+  git add .sable; git commit -q -m timeout-fixture
+)
+assert_deny "y4nom.7.2: the 124 remediation teaches sable-dev-check --publish-cost-profile" \
+  "$VE2_ENV" "git push" "$VE2_REPO" "publish-cost-profile"
+rm -rf "$VE2_BARE" "$VE2_REPO"
+
 # ---------- Summary ----------
 
 echo

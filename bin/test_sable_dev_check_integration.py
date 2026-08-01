@@ -168,9 +168,15 @@ def install_repo(tmp_path_factory) -> Path:
 
 
 def _dev_check(repo: Path, *extra: str) -> subprocess.CompletedProcess:
+    # SABLE-y4nom.7.2: the repo-root default read is HARD CUT; these
+    # fixtures deliver their raw measurement files via the override PAIR
+    # (an absent half is named and skipped — the partial fixture's shape).
     return subprocess.run(
-        [sys.executable, str(DEV_CHECK), *[arg for path in CHANGED
-                                           for arg in ("--path", path)], *extra],
+        [sys.executable, str(DEV_CHECK),
+         "--cost-report", str(repo / devcheck.PYTHON_COST_REPORT),
+         "--shell-profile", str(repo / devcheck.SHELL_COST_PROFILE),
+         *[arg for path in CHANGED
+           for arg in ("--path", path)], *extra],
         cwd=repo,
         capture_output=True,
         text=True,
@@ -281,8 +287,15 @@ def test_under_the_same_tight_bound_derivation_trims_and_still_answers(install_r
     result = _dev_check(install_repo, "--budget", "100")
 
     assert result.returncode != 124
-    assert result.returncode in (0, 1)
+    # REVISED under SABLE-y4nom.7.2 (the D12 verdict clarification): the
+    # answer to a trimmed-but-otherwise-green run is the INCOMPLETE-BY-TRIM
+    # verdict — rc3 with the machine marker as the final stdout line — never
+    # a bare 0 that green-washes the omission. Trim/report semantics from
+    # SABLE-y4nom.4 are unchanged; only the exit moved.
+    assert result.returncode == devcheck.EXIT_INCOMPLETE_BY_TRIM
     assert "UNVERIFIED" in result.stdout
+    out_lines = [l for l in result.stdout.splitlines() if l]
+    assert out_lines[-1].startswith(devcheck.INCOMPLETE_MARKER_PREFIX)
     # Dropped suites are named, not merely counted.
     combined = result.stdout + result.stderr
     assert any(
@@ -545,3 +558,53 @@ def test_the_gate_never_advises_narrowing_the_test_command():
 
     assert "scope the test command to a faster subset" not in gate
     assert "Do NOT narrow" in gate
+
+
+# ---------------------------------------------------------------------------
+# SABLE-y4nom.7.2 — the shared common-dir store, exercised across REAL linked
+# worktrees: one publish serves every checkout of the repository.
+# ---------------------------------------------------------------------------
+
+def test_linked_worktrees_share_one_published_cost_profile(
+    tmp_path, monkeypatch, capsys,
+):
+    import subprocess
+    import sable_dev_check_lib as devcheck
+    from test_sable_test_cost_profile_lib import fake_producer_runner, make_repo
+    from test_sable_dev_check_lib import sable_dev_check_cli
+
+    repo = make_repo(tmp_path, "sharedstore")
+    import sable_test_cost_profile_lib as profile_lib
+    profile_lib.publish(repo, runner=fake_producer_runner())
+
+    linked = tmp_path / "linked-consumer"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "consumer", str(linked)],
+        check=True, capture_output=True,
+    )
+    costs = devcheck.load_costs(linked)
+    assert costs is not None
+    assert costs.shell == {"test-fx-a.sh": 2.0, "test-fx-b.sh": 3.0}
+    assert costs.python == {"bin/test_alpha.py": 1.5}
+
+    # The acceptance NEGATIVE control at the CONSUMER level: a real CLI
+    # dry-run from the LINKED worktree — only _repo_root and build_plan are
+    # substituted (the fixture has no impact manifest); load_costs,
+    # effective_budget, and render_plan are the real ones. The rendered plan
+    # shows measured budgets and never the "no measured cost data" line.
+    plan = devcheck.DeveloperPlan(
+        changed_paths=("x",),
+        python=devcheck.PythonSelection("none", (), "none"),
+        shell_suites=("test-fx-a.sh", "test-fx-b.sh"),
+        shell_mode="scoped",
+        shell_reason="2 suites",
+    )
+    monkeypatch.setattr(sable_dev_check_cli, "_repo_root", lambda: linked)
+    monkeypatch.setattr(
+        sable_dev_check_cli.devcheck, "build_plan", lambda *_a, **_k: plan,
+    )
+    rc = sable_dev_check_cli.main(["--path", "x", "--budget", "100", "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "measured" in out
+    assert "no measured cost data" not in out
