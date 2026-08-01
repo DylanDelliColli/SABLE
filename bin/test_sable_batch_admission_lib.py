@@ -431,6 +431,110 @@ def test_plant_and_fail_positive_four_disjoint_members_all_admitted(repo, monkey
     assert len(pair_calls) == 6, "C(4,2) == 6 pairwise rw-disjoint checks expected"
 
 
+def test_stale_disjoint_members_compare_their_own_deltas_not_shared_spine(repo, monkeypatch):
+    """Two stale branches with disjoint writes remain batchable.
+
+    Computing both endpoint diffs from the moved base inflates each footprint
+    with the same 233 spine-only paths, making the old pairwise check report a
+    233-path overlap even though the branches themselves share nothing.
+    """
+    fork_sha = _sha(repo)
+    paths_a = {f"candidate-a/own-{number}.py" for number in range(5)}
+    paths_b = {f"candidate-b/own-{number}.py" for number in range(4)}
+
+    _run(repo, "checkout", "-q", "-b", "stale-a", fork_sha)
+    for path in paths_a:
+        _write(repo, path, f"# {path}\n")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "-m", "five paths on stale a")
+    sha_a = _sha(repo)
+
+    _run(repo, "checkout", "-q", "-b", "stale-b", fork_sha)
+    for path in paths_b:
+        _write(repo, path, f"# {path}\n")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "-m", "four paths on stale b")
+    sha_b = _sha(repo)
+
+    _run(repo, "checkout", "-q", "trunk")
+    spine_paths = {f"spine/landed-{number:03d}.txt" for number in range(233)}
+    for path in spine_paths:
+        _write(repo, path, f"spine {path}\n")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "-m", "233 shared spine landings")
+    current_base = _sha(repo)
+
+    inflated_a = fp.mechanical_footprint(str(repo), current_base, sha_a).paths
+    inflated_b = fp.mechanical_footprint(str(repo), current_base, sha_b).paths
+    assert len(inflated_a) == 238
+    assert len(inflated_b) == 237
+    assert inflated_a & inflated_b == spine_paths
+
+    _stub_bd(monkeypatch, {
+        "SABLE-a": _bead_record(writes=",".join(sorted(paths_a))),
+        "SABLE-b": _bead_record(writes=",".join(sorted(paths_b))),
+    })
+    _stub_all_green(monkeypatch, {sha_a: "a" * 40, sha_b: "b" * 40})
+
+    result = adm.admit_batch(
+        str(repo), "origin", current_base,
+        [Candidate(bead="SABLE-a", branch="stale-a", sha=sha_a),
+         Candidate(bead="SABLE-b", branch="stale-b", sha=sha_b)],
+    )
+
+    assert [candidate.branch for candidate in result.admitted] == ["stale-a", "stale-b"]
+    assert result.excluded == ()
+
+
+def test_stale_members_with_a_real_shared_write_are_still_excluded(repo, monkeypatch):
+    """Using each branch's fork removes spine inflation, not real overlap."""
+    fork_sha = _sha(repo)
+    paths_a = {f"candidate-a/own-{number}.py" for number in range(4)}
+    paths_b = {f"candidate-b/own-{number}.py" for number in range(3)}
+
+    _run(repo, "checkout", "-q", "-b", "stale-a", fork_sha)
+    _write(repo, "root.txt", "changed by stale a\n")
+    for path in paths_a:
+        _write(repo, path, f"# {path}\n")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "-m", "five paths including shared root on a")
+    sha_a = _sha(repo)
+
+    _run(repo, "checkout", "-q", "-b", "stale-b", fork_sha)
+    _write(repo, "root.txt", "changed by stale b\n")
+    for path in paths_b:
+        _write(repo, path, f"# {path}\n")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "-m", "four paths including shared root on b")
+    sha_b = _sha(repo)
+
+    _run(repo, "checkout", "-q", "trunk")
+    spine_paths = {f"spine/landed-{number:03d}.txt" for number in range(233)}
+    for path in spine_paths:
+        _write(repo, path, f"spine {path}\n")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "-m", "233 shared spine landings")
+    current_base = _sha(repo)
+
+    _stub_bd(monkeypatch, {
+        # Deliberately omit root.txt: the mechanical floor must still see it.
+        "SABLE-a": _bead_record(writes=",".join(sorted(paths_a))),
+        "SABLE-b": _bead_record(writes=",".join(sorted(paths_b))),
+    })
+    _stub_all_green(monkeypatch, {sha_a: "a" * 40, sha_b: "b" * 40})
+
+    result = adm.admit_batch(
+        str(repo), "origin", current_base,
+        [Candidate(bead="SABLE-a", branch="stale-a", sha=sha_a),
+         Candidate(bead="SABLE-b", branch="stale-b", sha=sha_b)],
+    )
+
+    assert [candidate.branch for candidate in result.admitted] == ["stale-a"]
+    assert len(result.excluded) == 1
+    assert result.excluded[0].candidate.branch == "stale-b"
+    assert "root.txt" in result.excluded[0].reason
+
+
 def test_plant_and_fail_negative_overlapping_footprint_excludes_with_no_combined_run_spent(repo, monkeypatch):
     base_sha = _sha(repo)
     sha_a = _branch(repo, base_sha, "a", "a.py", "a = 1\n")
