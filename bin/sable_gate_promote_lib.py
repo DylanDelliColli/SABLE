@@ -135,6 +135,51 @@ def worktree_for_branch(repo: str, branch: str) -> str | None:
     return None
 
 
+def stable_cleanup_repo(repo: str, branch: str) -> str:
+    """Return a registered worktree that survives cleanup of ``branch``.
+
+    promote() may be invoked from the worker worktree it is about to reap.  Git
+    metadata is shared across linked worktrees, but subprocess ``cwd`` is not:
+    once cleanup_after_merge removes that worker, every later git command run
+    from ``repo`` fails before git starts.  Resolve an existing sibling before
+    cleanup begins and use it for both branch cleanup and the final CI-ref
+    deletion.  If there is no sibling, keep ``repo``; in that topology Git will
+    refuse to remove the current worktree, leaving a usable cwd for the final
+    best-effort delete.
+    """
+    cp = git_lib._git(repo, "worktree", "list", "--porcelain", check=False)
+    if cp.returncode != 0:
+        return repo
+
+    target = f"refs/heads/{branch}"
+    worktrees: list[tuple[str, str | None]] = []
+    path: str | None = None
+    checked_out_branch: str | None = None
+    for line in [*cp.stdout.splitlines(), ""]:
+        if line.startswith("worktree "):
+            path = line[len("worktree "):].strip()
+            checked_out_branch = None
+        elif line.startswith("branch "):
+            checked_out_branch = line[len("branch "):].strip()
+        elif not line.strip() and path is not None:
+            worktrees.append((path, checked_out_branch))
+            path = None
+            checked_out_branch = None
+
+    doomed = next((path for path, ref in worktrees if ref == target), None)
+    if doomed is None:
+        return repo
+
+    doomed_real = os.path.realpath(doomed)
+    repo_real = os.path.realpath(repo)
+    if repo_real != doomed_real and os.path.isdir(repo):
+        return repo
+    for candidate, _ in worktrees:
+        if os.path.realpath(candidate) != doomed_real and os.path.isdir(candidate):
+            return candidate
+    return repo
+
+
 def worktree_is_dirty(worktree_path: str) -> bool:
     """True iff the worktree has uncommitted changes. Runs `git status
     --porcelain` INSIDE the worktree (its own CWD) — the one place this flow is
@@ -3412,6 +3457,7 @@ class _OptimisticNotApplicable(Exception):
 def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
                 manager: str, base_ref: str, ref: str, preview_sha: str,
                 base_sha: str, branch_sha: str, current_base: str,
+                cleanup_repo: str,
                 *, on_adoption_miss: bool = False,
                 verdict_source: str = VerdictSource.WAITED.value) -> int:
     """The base moved out from under a GREEN preview. Decide what that costs.
@@ -3515,7 +3561,7 @@ def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
             print(f"sable-merge-gate: attention record skipped after unexpected error: {exc}",
                   file=sys.stderr)
         try:
-            cleanup_after_merge(repo, remote, base_ref, branch)
+            cleanup_after_merge(cleanup_repo, remote, base_ref, branch)
         except Exception as exc:  # noqa: BLE001 — a green merge must stay green
             print(f"sable-merge-gate cleanup: skipped after unexpected error: {exc}",
                   file=sys.stderr)
@@ -3562,7 +3608,7 @@ def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
 
 def _adoption_miss_optimistic(bead: str, branch: str, base: str, repo: str, remote: str,
                               manager: str, base_ref: str, base_sha: str,
-                              branch_sha: str) -> int | None:
+                              branch_sha: str, cleanup_repo: str) -> int | None:
     """THE WIDENED ENTRY to the optimistic disjoint path (SABLE-kzi1a). An exit
     code if this promote was decided here, or None to run the ordinary flow.
 
@@ -3606,7 +3652,7 @@ def _adoption_miss_optimistic(bead: str, branch: str, base: str, repo: str, remo
     try:
         code = _stale_base(bead, branch, base, repo, remote, manager, base_ref,
                            stale.ref, stale.preview_sha, stale.base_sha, branch_sha,
-                           base_sha, on_adoption_miss=True,
+                           base_sha, cleanup_repo, on_adoption_miss=True,
                            # SABLE-21rug.1: a stale GREEN preview is CONSUMED
                            # here, never waited on — the same 'precomputed'
                            # semantics jd5fj.3 gives a stored-run read.
@@ -3620,7 +3666,7 @@ def _adoption_miss_optimistic(bead: str, branch: str, base: str, repo: str, remo
     # it. Best-effort, exactly like that one. NOT reached when _stale_base raises
     # (a second base move, an integrity abort, a conflict) — there the preview is
     # still the best evidence the next attempt has.
-    preview.delete_ci_ref(repo, remote, stale.ref)
+    preview.delete_ci_ref(cleanup_repo, remote, stale.ref)
     return code
 
 
@@ -3642,6 +3688,10 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
     git_lib._git(repo, "fetch", remote, base, branch)
     base_sha = git_lib.resolve_commit(repo, base_ref)
     branch_sha = git_lib.resolve_commit(repo, branch_ref)
+    # Resolve this while the worker cwd still exists.  A green cleanup may
+    # remove ``repo`` itself; the final CI-ref delete must run from a sibling
+    # that survives that operation (SABLE-fxe84).
+    cleanup_repo = stable_cleanup_repo(repo, branch)
 
     # SABLE-21rug.4: THE AUTO-PROMOTE GATE. Reached only when this promote is
     # running with NO HUMAN ASKING FOR IT (`auto`); a seat promote — every
@@ -3691,7 +3741,8 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
     # Skipped under --override: that bypass consults no run at all by contract,
     # and this entry is entirely about consuming a run that already exists.
     widened = None if override else _adoption_miss_optimistic(
-        bead, branch, base, repo, remote, manager, base_ref, base_sha, branch_sha)
+        bead, branch, base, repo, remote, manager, base_ref, base_sha, branch_sha,
+        cleanup_repo)
     if widened is not None:
         return widened
 
@@ -3744,6 +3795,7 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             if current_base != base_sha:
                 return _stale_base(bead, branch, base, repo, remote, manager, base_ref,
                                    ref, preview_sha, base_sha, branch_sha, current_base,
+                                   cleanup_repo,
                                    verdict_source=verdict.source)
             push_cp = git_lib._git(repo, "push", remote, f"{preview_sha}:refs/heads/{base}", check=False)
             if push_cp.returncode != 0:
@@ -3763,6 +3815,7 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
                 if current_base != base_sha:
                     return _stale_base(bead, branch, base, repo, remote, manager, base_ref,
                                        ref, preview_sha, base_sha, branch_sha, current_base,
+                                       cleanup_repo,
                                        verdict_source=verdict.source)
                 _notify(manager,
                     f"merge-preview ci-verify gate for {bead} ({branch}): promote to {base} was rejected "
@@ -3815,7 +3868,7 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             # worktree + local branch + remote branch are dead weight — reap them.
             # Wrapped so a cleanup fault can never flip a green merge to non-zero.
             try:
-                cleanup_after_merge(repo, remote, base_ref, branch)
+                cleanup_after_merge(cleanup_repo, remote, base_ref, branch)
             except Exception as exc:  # noqa: BLE001 — a green merge must stay green
                 print(f"sable-merge-gate cleanup: skipped after unexpected error: {exc}",
                       file=sys.stderr)
@@ -3853,7 +3906,7 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
         return classify.EXIT_RED
     finally:
         # Both-path cleanup: delete the throwaway ref (best-effort).
-        preview.delete_ci_ref(repo, remote, ref)
+        preview.delete_ci_ref(cleanup_repo, remote, ref)
 
 
 # --------------------------------------------------------------------------
