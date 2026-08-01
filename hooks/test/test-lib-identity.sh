@@ -613,6 +613,22 @@ is_push_test "sable_is_git_push: 'git -C /x push' on its own line is push" \
   "$(printf 'echo prep\ngit -C /x push')" 0
 is_push_test "sable_is_git_push: multi-line with NO push stays not-push" \
   "$(printf 'echo one\ngit status\ngit log --grep push')" 1
+# SABLE-j90ba matcher fix: a NON-push git subcommand must not end the scan —
+# 'git pull --rebase && git push' previously returned False at 'pull' and the
+# trailing push ran UNGATED (live bypass). The quoted mention stays negative.
+is_push_test "sable_is_git_push: 'git status && git push' IS push (scan continues past non-push git)" \
+  "git status && git push" 0
+is_push_test "sable_is_git_push: 'git pull --rebase && git push origin main' IS push" \
+  "git pull --rebase && git push origin main" 0
+is_push_test "sable_is_git_push: quoted 'git status && git push' mention is NOT push" \
+  "echo 'git status && git push'" 1
+# SABLE-j90ba B3 addendum: --config-env was absent from both global-flag sets,
+# so 'git --config-env=push.followTags=E push' walked '--config-env=...' as
+# the subcommand, returned non-push, and the push bypassed the gate entirely.
+is_push_test "sable_is_git_push: 'git --config-env=push.followTags=E push' IS push" \
+  "git --config-env=push.followTags=E push" 0
+is_push_test "sable_is_git_push: 'git --config-env push.followTags=E push' (space form) IS push" \
+  "git --config-env push.followTags=E push" 0
 is_push_test "sable_is_git_push: multi-line mention only (echo git push) is NOT push" \
   "$(printf 'echo starting\necho git push\ndone')" 1
 is_push_test "sable_is_git_push: multi-line quoted description mention is NOT push" \
