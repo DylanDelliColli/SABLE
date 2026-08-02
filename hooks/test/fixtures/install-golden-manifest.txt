@@ -27,7 +27,7 @@ cbdea65644eff16c2c462ee855ba11106185927b7d2d0f2fe899740337973f4d  ./hooks/multi-
 d609623bf1dba8f50ba3b02962af8014c90d679e31267bcf1f2d87dd4f042250  ./hooks/multi-manager/pre-push-rebase-test.sh
 f3cbdd63ee02a6de238cd889dc4c7eff228036fa5a3b9db9aa229c606021c429  ./hooks/multi-manager/read-guard.sh
 e1b207bc80a293d975beb76bfa671b3312d3979c10dabc46c807fcbae305752d  ./hooks/multi-manager/seat-sighting-gate.sh
-4235db973886204cdbd5bf1af904c647fb6848fadc9b8d469b7f57c4e6bb2469  ./hooks/multi-manager/session-role-anchor.sh
+a12b8972252a20299784ec10a8b84834d52cf6659ff0297381455090e033099f  ./hooks/multi-manager/session-role-anchor.sh
 22d9931473a342546330ba6a9c40694b825f312188af9f637d8b3bb661f0bd8e  ./hooks/multi-manager/stash-worktree-guard.sh
 836eeaab1cf2a4678a1a7bb03cffb277f30dba94eb502ceb42472ef00b388640  ./hooks/multi-manager/tree-claim-impl.sh
 13a5e989cec74933fc69331a8deba60bc6c2099495d21a4c91350c098d215593  ./hooks/multi-manager/tree-claim.sh
@@ -39,10 +39,10 @@ beda66a5848fac2df084ff074b3acfbc11bf0a28931d3e16ced22f8b01d8ba8e  ./sable/agents
 47c27910cb20c239a60ff4632f5654080e763ab2674ac9c48681259848cc49b2  ./sable/reconcile-timer/sable-reconcile-timer.cron
 b394155acb17e7467189c7934402cff7758228f2c5e74d00ae8de013c250a071  ./sable/reconcile-timer/sable-reconcile-timer.service
 7078a55b8318c640afd65ae6537024148c33cd0ee5fa89c82ee2f340573b68b3  ./sable/reconcile-timer/sable-reconcile-timer.timer
-309a5641228a8f459f47ad151cd6b9bb24185be9a418606f692bef93652d3d4e  ./sable/roles/chuck.md
-63450fa9c4bdb9f55b208b7f335f5d7de12939c583d7d89927185c573d9906c4  ./sable/roles/lincoln.md
-4137d361600cd7b15472355586ea98a3168f365dc2e99479725f6e86f5b33ad6  ./sable/roles/optimus.md
-aab8e5a3a8395c706574bbfb1ab114736b0fe91b1cfa0214f82c8d6558c0261d  ./sable/roles/tarzan.md
+c02726b1655be80cc7e70291d60172855f03c5ff0ee5870b11468d06191946bd  ./sable/roles/chuck.md
+2b6e03b60831059f40d14709ea88ccf8d34bf258e2357845413ac7036fa1ac21  ./sable/roles/lincoln.md
+329df3b91ee8cd48f065de3b8aadc875049369f9602a0723eb2c15227d70a1a1  ./sable/roles/optimus.md
+bc39b2bfb53ce2c938bf63fb846bda35d33d81a0d850ccbab42e7203c859d98a  ./sable/roles/tarzan.md
 b793b490e79cfd51e0ae202565ba95559391e6f5403b8047cd40bedb007de157  ./skills/audit-deep-dive/SKILL.md
 e9f574b38ca7ab28ad32e644c4b2d5fb30e9f36484dce3258857aabc74b4070b  ./skills/columbo/SKILL.md
 0fa391ad408285219237da088c3d05f8666cd004fcab7449959333f4d5a29dac  ./skills/columbo/columbo-prefilter.py

@@ -198,9 +198,11 @@ workers in flight. Before ending, `sable-msg lincoln` a shift report (lane state
 in-flight, anything the next shift needs) and file a `shift-report` bead.
 
 **Shift change (context pressure):** if your context grows heavy, message the
-shift report, file it, and end. Lincoln restarts your pane fresh; lane state
-lives in beads, not your memory. Persistence across tasks is the goal;
-immortality is not required.
+shift report, file it, and end. Lincoln restarts your pane fresh; on the new
+SessionStart run `sable-recover --repo "$PWD"` before dispatching. It recomputes
+the durable git/bead picture plus surviving tmux lane bindings; the shift report
+is a hint, not a complete copy of lane state. Persistence across tasks is the
+goal; immortality is not required.
 
 ## Worker model selection (the ladder)
 

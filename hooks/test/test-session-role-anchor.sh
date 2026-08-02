@@ -141,6 +141,55 @@ if ! printf '%s' "$out" | grep -q 'additionalContext'; then pass "jiqm: PreCompa
 out="$(cd "$PROJ" && printf '%s' "$SS" | CLAUDE_AGENT_NAME=cockpit CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
 if printf '%s' "$out" | grep -q '"hookEventName": "SessionStart"'; then pass "jiqm: SessionStart leg still emits valid hookEventName+additionalContext"; else fail "jiqm: SessionStart leg still emits valid hookEventName+additionalContext" "got: ${out:0:200}"; fi
 
+# ---------- SABLE-slip0.4: recovery is recomputed at manager boot -----------
+# Surface the existing read-only collector at SessionStart; never execute it
+# from the hook. Lincoln is a load-bearing arm: after an involuntary manager
+# end it is the main session that must reconstruct the fleet picture before it
+# decides which panes to restart. Optimus proves the same surface reaches an
+# execution manager. Workers/producers remain outside this manager-only path.
+RECOVERY_ROOT="$(mktemp -d)"
+mkdir -p "$RECOVERY_ROOT/.claude/sable/roles"
+printf 'RECOVERY_LINCOLN_ROLE\n' > "$RECOVERY_ROOT/.claude/sable/roles/lincoln.md"
+printf 'RECOVERY_OPTIMUS_ROLE\n' > "$RECOVERY_ROOT/.claude/sable/roles/optimus.md"
+RECOVERY_SHIM="$RECOVERY_ROOT/shim"
+RECOVERY_CALLED="$RECOVERY_ROOT/recover-called"
+mkdir -p "$RECOVERY_SHIM"
+cat > "$RECOVERY_SHIM/sable-recover" <<'SHIM'
+#!/usr/bin/env sh
+: > "${SABLE_TEST_RECOVER_CALLED:?}"
+SHIM
+chmod +x "$RECOVERY_SHIM/sable-recover"
+
+for recovery_role in lincoln optimus; do
+  out="$(cd "$RECOVERY_ROOT" && printf '%s' "$SS" | PATH="$RECOVERY_SHIM:$PATH" SABLE_TEST_RECOVER_CALLED="$RECOVERY_CALLED" SABLE_AGENT_NAME="$recovery_role" SABLE_AGENT_ROLE=manager HOME="$RECOVERY_ROOT" bash "$HOOK" 2>/dev/null)"
+  recovery_context="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["hookSpecificOutput"]["additionalContext"])' 2>/dev/null || true)"
+  if printf '%s' "$recovery_context" | grep -Fq 'sable-recover --repo "$PWD"'; then pass "slip0.4: SessionStart surfaces the exact portable sable-recover command for $recovery_role"; else fail "slip0.4: SessionStart surfaces the exact portable sable-recover command for $recovery_role" "got: ${recovery_context:0:400}"; fi
+  if printf '%s' "$out" | grep -qi 'recompute'; then pass "slip0.4: $recovery_role boot explains recovery is recomputed"; else fail "slip0.4: $recovery_role boot explains recovery is recomputed" "got: ${out:0:400}"; fi
+done
+if [ ! -e "$RECOVERY_CALLED" ]; then pass "slip0.4: hook surfaces recovery but never executes it"; else fail "slip0.4: hook surfaces recovery but never executes it" "recording sable-recover shim was invoked"; fi
+
+out="$(cd "$RECOVERY_ROOT" && printf '%s' "$PC" | SABLE_AGENT_NAME=lincoln SABLE_AGENT_ROLE=manager HOME="$RECOVERY_ROOT" bash "$HOOK" 2>/dev/null)"
+if [ -z "$out" ]; then pass "slip0.4: PreCompact carries no recovery surface"; else fail "slip0.4: PreCompact carries no recovery surface" "got: ${out:0:300}"; fi
+out="$(cd "$RECOVERY_ROOT" && printf '%s' "$SS" | SABLE_WORKER_PANE=1 SABLE_AGENT_NAME=optimus SABLE_AGENT_ROLE=manager HOME="$RECOVERY_ROOT" bash "$HOOK" 2>/dev/null)"
+if [ -z "$out" ]; then pass "slip0.4: worker pane carries no manager recovery instruction"; else fail "slip0.4: worker pane carries no manager recovery instruction" "got: ${out:0:300}"; fi
+out="$(cd "$RECOVERY_ROOT" && printf '%s' "$SS" | SABLE_AGENT_NAME=optimus SABLE_AGENT_ROLE=producer HOME="$RECOVERY_ROOT" bash "$HOOK" 2>/dev/null)"
+if [ -z "$out" ]; then pass "slip0.4: producer carries no manager recovery instruction"; else fail "slip0.4: producer carries no manager recovery instruction" "got: ${out:0:300}"; fi
+
+# D5 negative: no graceful-exit work exists to trust. The identical settings
+# object proves this inspection reaches a real registered event by naming
+# SessionStart, while neither provider-unsupported SessionEnd nor Stop exists.
+HOOK_EVENTS="$(python3 - "$REPO/templates/multi-manager/settings-snippet.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+print(" ".join(sorted(data.get("hooks", {}))))
+PY
+)"
+if printf '%s\n' "$HOOK_EVENTS" | grep -qw 'SessionStart'; then pass "slip0.4: D5 positive control finds registered SessionStart"; else fail "slip0.4: D5 positive control finds registered SessionStart" "events: $HOOK_EVENTS"; fi
+if ! printf '%s\n' "$HOOK_EVENTS" | grep -Eq '(^| )(SessionEnd|Stop)( |$)'; then pass "slip0.4: D5 no exit-path hook is registered"; else fail "slip0.4: D5 no exit-path hook is registered" "events: $HOOK_EVENTS"; fi
+if grep -qi 'no exit-path' "$HOOK"; then pass "slip0.4: D5 rationale is recorded at the recovery surface"; else fail "slip0.4: D5 rationale is recorded at the recovery surface" "anchor lacks the required no-exit-path explanation"; fi
+
+rm -rf "$RECOVERY_ROOT"
+
 # ---------- SABLE-thx70: LOUD ON SHADOWING ----------
 # Six days of role-card edits went dark because a stale project-local copy
 # silently outranked a freshly-edited user-level one with no event. Precedence
