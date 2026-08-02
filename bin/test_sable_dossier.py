@@ -26,6 +26,7 @@ FRAMING = {
     "non_goals": ["mobile layout"],
     "success_metric": "resize round-trips in under 200ms",
     "wedge": "desktop settings page only",
+    "prerequisites": [],
 }
 
 RESEARCH = {
@@ -175,6 +176,26 @@ def test_render_all_sections_present():
     assert "persist size as enum not pixels" in html
     assert "swarm validate: PASS" in html
     assert "stray infra bead" in html
+
+
+def test_render_prerequisite_declaration_states_are_not_conflated():
+    declared = full_state()
+    declared["framing"] = {**FRAMING, "prerequisites": ["SABLE-blocker"]}
+    empty = full_state()
+    empty["framing"] = {**FRAMING, "prerequisites": []}
+    missing = full_state()
+    missing["framing"] = {
+        key: value for key, value in FRAMING.items() if key != "prerequisites"
+    }
+
+    declared_html = lib.render("EPIC-1", declared)
+    empty_html = lib.render("EPIC-1", empty)
+    missing_html = lib.render("EPIC-1", missing)
+
+    assert "SABLE-blocker" in declared_html
+    assert "none declared" in empty_html
+    assert "not declared" in missing_html
+    assert len({declared_html, empty_html, missing_html}) == 3
 
 
 def test_render_partial_marks_missing():

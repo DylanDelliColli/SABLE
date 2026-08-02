@@ -54,5 +54,5 @@ f1a704016b72723dfc29e0679277bf351c33e2ffc0398b36e3e9b3d30a4ad984  ./skills/gaudi
 c6419da86418f902bf3987d2949035cc834c204c7fe46d52706a8fb16e504926  ./skills/sable-discover/SKILL.md
 e1f19735c92612d20fd31cd4172904dfa8a2cc84864a88d5bfc220fe734ad266  ./skills/sable-execute/SKILL.md
 96162dfce4412a6b464c66977c16492e1ac8fe749e2f60ca7adfc5203ca8463a  ./skills/sable-onboarding/SKILL.md
-685dbef418c8c2080f868472e2bff981ad06a0e53f6871fcfc44d020b8271fe7  ./skills/sable-plan/SKILL.md
+4f7c33232a3201e012d71b19144bdefd1d05288fbb61a4d22430cc70184f8731  ./skills/sable-plan/SKILL.md
 2e32e54c16bd3bd4f21f05bc1e80ae08d83332c1538337cc59ec6de5179816cd  ./skills/sable-review/SKILL.md

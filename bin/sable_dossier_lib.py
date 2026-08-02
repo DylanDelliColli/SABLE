@@ -15,7 +15,15 @@ without them; unknown extra keys are ignored):
 
 framing.json        (Lincoln, FRAMING gate)
   { "stories": [{"id": "S1", "title": str, "acceptance": str?}],
-    "non_goals": [str], "success_metric": str, "wedge": str }
+    "non_goals": [str], "success_metric": str, "wedge": str,
+    "prerequisites": [str] }
+  ``prerequisites`` is a list of bead ids that must land before this epic's
+  scope dispatches — REQUIRED by the handoff gate (sable_handoff_lib), where an
+  empty list is permitted and asserts "no prerequisite". The renderer shows it
+  because it is the one field on this page the gate MECHANICALLY enforces: the
+  gate refuses when a listed id is absent from decomposition's dependency
+  closure. The wedge prose is not a substitute — it is not machine-checkable,
+  which is how y4nom's signed "SABLE-9qqrv first" ordering was scoped away.
 
 research.json       (sherlock, RESEARCH gate)
   { "findings": [{"title": str, "kind": "prior_art"|"pitfall"|"unknown",
@@ -153,6 +161,31 @@ def _render_framing(d: dict) -> str:
         out.append(f'<p><b>Success metric:</b> {_e(d["success_metric"])}</p>')
     if d.get("wedge"):
         out.append(f'<p><b>Wedge:</b> {_e(d["wedge"])}</p>')
+    # Rendered in all three states, and they are three different states: a
+    # declared list, an explicit "none" (the empty array IS an assertion), and
+    # a missing field (which the handoff gate refuses as schema-invalid). A
+    # renderer that showed only the first would let the operator sign a page
+    # that looks identical whether the epic asserted no prerequisites or never
+    # answered the question.
+    prereqs = d.get("prerequisites")
+    if isinstance(prereqs, list) and prereqs:
+        out.append(
+            "<p><b>Prerequisites:</b> "
+            + " ".join(_chip(x) for x in prereqs)
+            + "</p>"
+        )
+    elif isinstance(prereqs, list):
+        out.append(
+            '<p><b>Prerequisites:</b> '
+            + _chip("none declared", "chip ok")
+            + "</p>"
+        )
+    else:
+        out.append(
+            '<p><b>Prerequisites:</b> '
+            + _chip("not declared — the handoff gate refuses this", "chip bad")
+            + "</p>"
+        )
     ng = _items(d, "non_goals")
     if ng:
         out.append("<p><b>Non-goals:</b> " + ", ".join(_e(x) for x in ng) + "</p>")

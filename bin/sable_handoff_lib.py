@@ -13,7 +13,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +35,44 @@ DOSSIER_NAMES = (
     "decomposition",
 )
 Runner = Callable[..., object]
+
+# --- the plan's own prerequisites (SABLE-slip0.6) -----------------------------
+#
+# The gate used to bind the plan's INTEGRITY and never read its CONTENT: it
+# sha256'd framing.json and required `wedge` to be a nonblank string, after
+# which the parsed document was never referenced again.  So a wedge naming
+# SABLE-9qqrv as prerequisite number one, and a decomposition depending on none
+# of it, was signed — a wave dispatched, two workers produced real code, and
+# not one bead could be closed.
+#
+# Prose extraction was rejected (D6) because it was measured inadequate in BOTH
+# directions over the six real framing.json files: bead ids appear in the wedge
+# on only 2 of 6, so the check is a silent no-op on the other 4; and where one
+# does appear it may be a CARRIER or a sequencing note rather than a blocker
+# (tz7h names SABLE-s0c3 that way), which a naive rule refuses wrongly.  The
+# distinction between "prerequisite" and "merely mentioned" is semantic, and
+# prose cannot carry it — so the plan states it in a structured field instead.
+PREREQUISITE_PASS = "PASS"
+PREREQUISITE_REFUSE = "REFUSE"
+PREREQUISITE_UNCHECKABLE = "UNCHECKABLE"
+PREREQUISITE_STATUSES = (
+    PREREQUISITE_PASS,
+    PREREQUISITE_REFUSE,
+    PREREQUISITE_UNCHECKABLE,
+)
+
+# Ported from .github/ci/shell-run-set.sh's parse_exclude_tag (D7) rather than
+# invented here, including its bead-id shape.  Two properties carry over and
+# both are load-bearing:
+#
+#   ANCHORED — matched with fullmatch, so a mention is never harvested.  "see
+#   SABLE-9qqrv first" is a malformed ENTRY, not a declaration of SABLE-9qqrv;
+#   the free-scan failure mode is structurally unavailable.
+#
+#   EXACTLY ONE — one entry states one rule.  "SABLE-9qqrv SABLE-1el7e" fails
+#   the same fullmatch, so a reader never has to guess whether an entry is one
+#   id or several.
+_BEAD_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9-]*-[A-Za-z0-9.]+")
 
 
 class HandoffRefused(RuntimeError):
@@ -260,6 +300,18 @@ def _validate_dossier(documents: Mapping[str, Mapping[str, object]]) -> None:
     for field in ("success_metric", "wedge"):
         if not isinstance(framing.get(field), str) or not framing[field].strip():
             raise HandoffRefused(f"framing.json requires {field}")
+    # REQUIRED, and an empty array is permitted AND meaningful: it is the
+    # explicit assertion "this epic declares no prerequisite".  Making the
+    # field optional would restore the silent no-op — a gate that looks
+    # enforced and enforces nothing is the exact shape this check exists to
+    # remove, so absence is schema-invalid rather than skipped.
+    prerequisites = framing.get("prerequisites")
+    if not isinstance(prerequisites, list):
+        raise HandoffRefused(
+            "framing.json requires a prerequisites array of bead ids "
+            "(an empty array is permitted and asserts that the epic declares "
+            "no prerequisite)"
+        )
 
     research = documents["research"]
     findings = _nonempty_list(research, "findings", "research")
@@ -361,6 +413,333 @@ def _validate_dossier(documents: Mapping[str, Mapping[str, object]]) -> None:
         raise HandoffRefused("decomposition.json requires victor_summary")
 
 
+def _verdict(
+    status: str,
+    reason: str,
+    *,
+    declared: Sequence[str] = (),
+    missing: Sequence[str] = (),
+    malformed: Sequence[str] = (),
+    unresolvable: Sequence[str] = (),
+    stale: Sequence[str] = (),
+) -> dict:
+    """One verdict shape, always fully populated.
+
+    It is digested into the receipt, so every field is sorted and every key is
+    present whatever the outcome — a consumer never has to distinguish "absent"
+    from "empty", and two runs over the same inputs produce the same bytes.
+    """
+
+    return {
+        "status": status,
+        "reason": reason,
+        "declared": sorted(set(declared)),
+        "missing": sorted(set(missing)),
+        "malformed": sorted(set(malformed)),
+        "unresolvable": sorted(set(unresolvable)),
+        "stale": sorted(set(stale)),
+    }
+
+
+def _dependency_closure(decomposition: Mapping[str, object]) -> tuple[list, list]:
+    """Every id the decomposition's children declare a dependency edge to.
+
+    Returns (dep ids, malformed entries).  Cross-epic ids are terminal and
+    within-epic ids resolve to siblings whose own deps are listed too, so the
+    union over children IS the closure represented by the artifact. Merely
+    being a child does not satisfy a prerequisite: without an incoming edge,
+    that child is in the same dispatch front rather than ordered first.
+    """
+
+    children = decomposition.get("children")
+    if not isinstance(children, list):
+        return [], ["decomposition.json children is not a list"]
+    closure: list[str] = []
+    malformed: list[str] = []
+    for child in children:
+        if not isinstance(child, dict):
+            malformed.append("decomposition.json child is not an object")
+            continue
+        deps = child.get("deps")
+        if not isinstance(deps, list):
+            malformed.append(
+                f"decomposition.json child {child.get('id')!r} deps is not a list"
+            )
+            continue
+        for dep in deps:
+            if isinstance(dep, str) and _BEAD_ID_RE.fullmatch(dep):
+                closure.append(dep)
+            else:
+                malformed.append(dep if isinstance(dep, str) else repr(dep))
+    return closure, malformed
+
+
+def prerequisite_verdict(
+    framing: Mapping[str, object],
+    decomposition: Mapping[str, object],
+    *,
+    resolve: Callable[[str], str | None] | None = None,
+) -> dict:
+    """Does the scope actually depend on what the plan said had to come first?
+
+    Reads framing's ``prerequisites`` and NOTHING else from framing — no scan
+    over ``wedge``, ``non_goals`` or ``stories``, which is why a mention like
+    tz7h's SABLE-s0c3 carrier cannot become a refusal.
+
+    Two halves, deliberately split by what each needs (D7):
+
+      SHAPE + CLOSURE are bd-free, so they decide everywhere — including the
+      clean room — and they REFUSE, because a malformed entry or a declared
+      prerequisite absent from the dependency closure is mechanically
+      unambiguous without asking the tracker anything.
+
+      RESOLUTION needs bd.  It separates UNRESOLVABLE (the id does not exist —
+      a typo or a deleted bead, so the claim is unfalsifiable) from STALE (the
+      prerequisite is already closed — a claim that outlived its cause, which
+      is reported, not refused: it landed).
+
+    ``resolve`` is a callable id -> status, returning None when the tracker
+    cannot resolve the id, or None itself when there is no tracker at all.  In
+    that last case the answer is UNCHECKABLE — never PASS (D8).
+    """
+
+    declared_raw = framing.get("prerequisites")
+    if not isinstance(declared_raw, list):
+        return _verdict(
+            PREREQUISITE_REFUSE,
+            "framing.json declares no prerequisites array; the field is "
+            "REQUIRED (an empty array asserts the epic has no prerequisite)",
+        )
+
+    declared: list[str] = []
+    malformed: list[str] = []
+    for entry in declared_raw:
+        if isinstance(entry, str) and _BEAD_ID_RE.fullmatch(entry):
+            declared.append(entry)
+        else:
+            malformed.append(entry if isinstance(entry, str) else repr(entry))
+
+    closure, dep_malformed = _dependency_closure(decomposition)
+    malformed.extend(dep_malformed)
+    if malformed:
+        return _verdict(
+            PREREQUISITE_REFUSE,
+            "prerequisite and dependency entries must each be exactly one "
+            "bead id; malformed: " + ", ".join(sorted(set(malformed))),
+            declared=declared,
+            malformed=malformed,
+        )
+
+    declared_set = set(declared)
+    closure_set = set(closure)
+    missing = [item for item in declared if item not in closure_set]
+    if missing:
+        return _verdict(
+            PREREQUISITE_REFUSE,
+            "the plan declares prerequisite(s) that no child in the "
+            "decomposition names through a dependency edge: "
+            + ", ".join(sorted(set(missing)))
+            + " — the scope would dispatch before its own stated blockers land",
+            declared=declared,
+            missing=missing,
+        )
+
+    if resolve is None:
+        return _verdict(
+            PREREQUISITE_UNCHECKABLE,
+            "the shape and dependency-closure halves hold, but no bead store "
+            "is reachable, so the declared ids were not resolved",
+            declared=declared,
+        )
+
+    unresolvable: list[str] = []
+    stale: list[str] = []
+    for issue_id in sorted(declared_set | closure_set):
+        status = resolve(issue_id)
+        if status is None:
+            unresolvable.append(issue_id)
+        elif status == "closed" and issue_id in declared_set:
+            stale.append(issue_id)
+    if unresolvable:
+        return _verdict(
+            PREREQUISITE_REFUSE,
+            "bead id(s) cited by the plan do not resolve in the bead store, so "
+            "the dependency closure this check compares against is itself "
+            "unsound: " + ", ".join(unresolvable),
+            declared=declared,
+            unresolvable=unresolvable,
+            stale=stale,
+        )
+    return _verdict(
+        PREREQUISITE_PASS,
+        f"{len(declared)} declared prerequisite(s), each present in the "
+        "decomposition dependency closure",
+        declared=declared,
+        stale=stale,
+    )
+
+
+def carried_prerequisite_verdict(proof: Mapping[str, object]) -> dict:
+    """Read a receipt's verdict without a bead store or a planning artifact.
+
+    Fleet start (read_execution_authority) has neither, so it cannot recompute
+    this — it can only report what was signed.  A receipt carrying no verdict,
+    or one carrying something unrecognized, therefore reads back UNCHECKABLE.
+    That covers legacy receipts without breaking them, and it keeps the one
+    property D8 insists on: the absence of an answer never renders as a clean
+    one.
+    """
+
+    carried = proof.get("prerequisites")
+    if isinstance(carried, dict) and carried.get("status") in PREREQUISITE_STATUSES:
+        return dict(carried)
+    return _verdict(
+        PREREQUISITE_UNCHECKABLE,
+        "this receipt carries no recognizable prerequisite verdict, so nothing "
+        "is asserted about the plan's own stated blockers",
+    )
+
+
+def render_prerequisite_verdict(verdict: Mapping[str, object]) -> str:
+    """One line per verdict, and the three never collapse into each other.
+
+    Asserting three distinct enum values proves nothing if the renderer prints
+    them the same way, so this is the single renderer every call site uses —
+    the gate, the mode transition, and fleet start — rather than three that can
+    drift apart.
+    """
+
+    status = verdict.get("status")
+    reason = str(verdict.get("reason") or "").strip()
+    if status == PREREQUISITE_PASS:
+        return f"prerequisites: {PREREQUISITE_PASS} — {reason or 'checked'}"
+    if status == PREREQUISITE_REFUSE:
+        return f"prerequisites: {PREREQUISITE_REFUSE} — {reason or 'refused'}"
+    if status == PREREQUISITE_UNCHECKABLE:
+        return (
+            f"prerequisites: {PREREQUISITE_UNCHECKABLE} — this check did NOT "
+            "run to a verdict" + (f"; {reason}" if reason else "")
+        )
+    return (
+        f"prerequisites: {PREREQUISITE_UNCHECKABLE} — unrecognized verdict, "
+        "treated as unverified"
+    )
+
+
+def _announce_prerequisites(verdict: Mapping[str, object]) -> None:
+    """Render the verdict at whichever call site is running.
+
+    Deliberately emitted from here rather than from sable-mode,
+    sable-spawn-manager and sable-spawn-worker separately: three renderers of
+    one three-valued verdict is the Shotgun Surgery the architecture review
+    named, and it is exactly how one of them ends up printing UNCHECKABLE the
+    same way it prints PASS.
+    """
+
+    sys.stderr.write(render_prerequisite_verdict(verdict) + "\n")
+
+
+class _ResolutionUnavailable(RuntimeError):
+    """The bead store could not be executed at all (not: an id was missing)."""
+
+
+def _bead_resolver(runner: Runner) -> Callable[[str], str | None]:
+    """A tolerant id -> status lookup for the resolution half.
+
+    Deliberately not _show: that raises on a missing bead, and here "the id
+    does not resolve" is a finding to REPORT (None), not an error to abort on.
+    The two unavailabilities stay separate — ONLY bd's explicit missing-issue
+    response returns None; an unrunnable command, a different nonzero result,
+    malformed JSON, or an unusable record raises _ResolutionUnavailable.
+    Conflating those cases is how "I could not look" becomes "it is not
+    there", falsely accusing the plan instead of reporting UNCHECKABLE.
+    """
+
+    def resolve(issue_id: str) -> str | None:
+        try:
+            result = runner(
+                ["bd", "show", issue_id, "--json"],
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            raise _ResolutionUnavailable(str(exc)) from exc
+        stdout = getattr(result, "stdout", "") or ""
+        stderr = getattr(result, "stderr", "") or ""
+        try:
+            payload = json.loads(stdout)
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+
+        if getattr(result, "returncode", 1) != 0:
+            # Current bd emits this structured envelope (and the matching
+            # stderr phrase) when the command DID reach the store and proved
+            # the id absent. Narrow matching is deliberate: a generic rc=1 is
+            # also how a locked/unreachable store reports failure, and that is
+            # UNCHECKABLE, not evidence that the bead does not exist.
+            error = payload.get("error") if isinstance(payload, dict) else None
+            diagnostic = " ".join(
+                value.strip().lower()
+                for value in (str(error or ""), str(stderr))
+                if value and value.strip()
+            )
+            if (
+                "no issue found matching" in diagnostic
+                or "no issues found matching" in diagnostic
+            ):
+                return None
+            detail = str(stderr or stdout or "no diagnostic").strip()
+            raise _ResolutionUnavailable(
+                f"bd show {issue_id} failed: {detail}"
+            )
+
+        if payload is None:
+            raise _ResolutionUnavailable(
+                f"bd show {issue_id} returned malformed JSON"
+            )
+        if isinstance(payload, dict):
+            payload = [payload]
+        if not isinstance(payload, list) or len(payload) != 1:
+            raise _ResolutionUnavailable(
+                f"bd show {issue_id} returned an invalid record set"
+            )
+        record = payload[0]
+        if not isinstance(record, dict) or record.get("id") != issue_id:
+            raise _ResolutionUnavailable(
+                f"bd show {issue_id} did not return that bead"
+            )
+        status = record.get("status")
+        if not isinstance(status, str) or not status.strip():
+            raise _ResolutionUnavailable(
+                f"bd show {issue_id} returned no usable status"
+            )
+        return status.strip()
+
+    return resolve
+
+
+def _checked_prerequisites(
+    framing: Mapping[str, object],
+    decomposition: Mapping[str, object],
+    runner: Runner,
+) -> dict:
+    """The gate's arm: refuse a REFUSE, carry a PASS or an UNCHECKABLE."""
+
+    try:
+        verdict = prerequisite_verdict(
+            framing, decomposition, resolve=_bead_resolver(runner)
+        )
+    except _ResolutionUnavailable as exc:
+        verdict = prerequisite_verdict(framing, decomposition, resolve=None)
+        if verdict["status"] == PREREQUISITE_UNCHECKABLE:
+            verdict["reason"] = (
+                f"{verdict['reason']} (bead store unreachable: {exc})"
+            )
+    if verdict["status"] == PREREQUISITE_REFUSE:
+        raise HandoffRefused(verdict["reason"])
+    return verdict
+
+
 def _swarm_validation(epic: str, runner: Runner) -> dict:
     payload = _run_json(
         runner,
@@ -427,6 +806,14 @@ def _collect_evidence(
             "base": base,
             "artifacts": {},
             "swarm": None,
+            # Quick tier has no framing artifact, so there is no declaration to
+            # check.  Recorded explicitly rather than omitted: "not asserted"
+            # must be readable off the receipt, not inferred from a missing key.
+            "prerequisites": _verdict(
+                PREREQUISITE_UNCHECKABLE,
+                "quick-tier handoff has no framing artifact, so no "
+                "prerequisite declaration was made or checked",
+            ),
         }
 
     if tier != "full":
@@ -481,6 +868,14 @@ def _collect_evidence(
         raise HandoffRefused(
             "decomposition artifact is stale relative to the live child backlog"
         )
+    # Placed HERE, at the handoff gate, and not at substage advance:
+    # advance_planning_substage reads no artifact and checks no file existence,
+    # so this check would run before decomposition.json exists and could only
+    # report UNCHECKABLE forever — enforcement-shaped and inert, which is the
+    # precise failure this bead exists to remove.
+    prerequisites = _checked_prerequisites(
+        documents["framing"], documents["decomposition"], runner
+    )
     swarm = _swarm_validation(epic, runner)
     return {
         "tier": "full",
@@ -493,6 +888,7 @@ def _collect_evidence(
         "base": base,
         "artifacts": artifact_hashes,
         "swarm": swarm,
+        "prerequisites": prerequisites,
     }
 
 
@@ -517,6 +913,7 @@ def _receipt(
         "base": evidence["base"],
         "artifacts": evidence["artifacts"],
         "swarm": evidence["swarm"],
+        "prerequisites": evidence["prerequisites"],
         "evidence_sha256": _digest(evidence),
     }
     if evidence.get("epic"):
@@ -551,6 +948,7 @@ def approve_handoff(
         raise HandoffRefused(
             f"planning state changed during handoff approval: {exc}"
         ) from exc
+    _announce_prerequisites(carried_prerequisite_verdict(receipt))
     return receipt
 
 
@@ -581,6 +979,7 @@ def validate_handoff_state(
             "handoff receipt is stale relative to planning state or evidence"
         )
     validate_execution_authority({"mode": "execution", "handoff": receipt})
+    _announce_prerequisites(carried_prerequisite_verdict(receipt))
     return dict(receipt)
 
 
@@ -678,4 +1077,9 @@ def read_execution_authority(
         state = read_mode_state(path)
     except ModeStateError as exc:
         raise HandoffRefused(str(exc)) from exc
-    return validate_execution_authority(state)
+    authority = validate_execution_authority(state)
+    # Fleet start has no bead store and no planning artifact, so it cannot
+    # recompute the verdict — it reports the one that was signed.  A receipt
+    # that asserts nothing here says so out loud instead of starting quietly.
+    _announce_prerequisites(carried_prerequisite_verdict(authority))
+    return authority
