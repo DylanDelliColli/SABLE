@@ -454,6 +454,17 @@ def pytest_collectreport(report):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    # xdist runs this conftest in every worker AND in the controller.  The
+    # controller receives every remote test/collection report, so its global
+    # maps are the complete session; each worker's maps are only its shard.
+    # A worker writing the shared paths here races partial cost reports and,
+    # worse, can stamp a later start time into the skip baseline so the complete
+    # controller result then refuses to replace it as stale (SABLE-y4nom.7.4).
+    # Detect the documented xdist worker shape without importing xdist: the
+    # serial path and clean-room dependency set stay unchanged.
+    if hasattr(session.config, "workerinput"):
+        return
+
     repo_root = Path(str(session.config.rootpath))
     modules = {_module_path(nodeid) for nodeid in _DURATIONS}
     declared = declared_heavy_modules(modules, repo_root=repo_root)
