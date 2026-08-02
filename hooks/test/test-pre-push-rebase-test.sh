@@ -23,6 +23,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 HOOK="$DIR/../multi-manager/pre-push-rebase-test.sh"
 # shellcheck source=lib-pre-push-fixture-root.sh
 . "$DIR/lib-pre-push-fixture-root.sh"
+# shellcheck source=lib-json-input-encoder.sh
+. "$DIR/lib-json-input-encoder.sh"
 # Absolute repo root, resolved once up front — needed by the SABLE-digiy
 # fixtures below, which `cd` into throwaway fixture repos and must not rely
 # on a relative $0 resolving correctly after the CWD has moved.
@@ -46,10 +48,7 @@ fi
 # directly by test-pre-push-rebase-concurrency.sh.
 TMPROOT="$(sable_pre_push_fixture_root)"
 cleanup_pre_push_fixture() {
-  if [ -n "${SYNTHETIC_INPUT_ENCODER_PID:-}" ]; then
-    kill "$SYNTHETIC_INPUT_ENCODER_PID" 2>/dev/null || true
-    wait "$SYNTHETIC_INPUT_ENCODER_PID" 2>/dev/null || true
-  fi
+  sable_json_encoder_stop >/dev/null 2>&1 || true
   rm -rf "$TMPROOT"
 }
 trap cleanup_pre_push_fixture EXIT
@@ -60,66 +59,16 @@ FAIL_NAMES=""
 ASSERT_DENY_CALLS=0
 ASSERT_CONTEXT_OUTPUT_CALLS=0
 
-# The suite sends the hook 105 synthetic JSON payloads. Starting python3 for
-# every payload was pure setup cost, but replacing json.dumps with hand-written
-# shell escaping would make quotes, control bytes, or non-ASCII values unsafe.
-# Keep one exact Python encoder alive and use NUL-delimited FIFOs: bash variables
-# cannot contain NUL, while every value they can contain (including newlines)
-# survives the protocol and is encoded by the same json.dumps implementation as
-# before. The suite is serial, so one request/response pair needs no request id.
-SYNTHETIC_INPUT_REQUEST_FIFO="$TMPROOT/synthetic-input.request"
-SYNTHETIC_INPUT_RESPONSE_FIFO="$TMPROOT/synthetic-input.response"
-SYNTHETIC_INPUT_ENCODER_TRACE="$TMPROOT/synthetic-input.trace"
-mkfifo "$SYNTHETIC_INPUT_REQUEST_FIFO" "$SYNTHETIC_INPUT_RESPONSE_FIFO"
-: > "$SYNTHETIC_INPUT_ENCODER_TRACE"
-python3 -u - "$SYNTHETIC_INPUT_REQUEST_FIFO" "$SYNTHETIC_INPUT_RESPONSE_FIFO" \
-  "$SYNTHETIC_INPUT_ENCODER_TRACE" <<'PYEOF' &
-import json
-import os
-import sys
-
-request_path, response_path, trace_path = sys.argv[1:]
-
-
-def read_field(stream):
-    value = bytearray()
-    while True:
-        byte = stream.read(1)
-        if not byte:
-            return None
-        if byte == b"\0":
-            return os.fsdecode(bytes(value))
-        value.extend(byte)
-
-
-with open(trace_path, "a", encoding="utf-8") as trace:
-    trace.write("start\n")
-    trace.flush()
-    while True:
-        with open(request_path, "rb", buffering=0) as request:
-            fields = [read_field(request) for _ in range(5)]
-        if any(field is None for field in fields):
-            continue
-        command, cwd, agent_id, agent_type, typed = fields
-        out = {"tool_input": {"command": command}, "cwd": cwd}
-        if agent_id:
-            out["agent_id"] = agent_id
-        if typed == "1" and agent_type:
-            out["agent_type"] = agent_type
-        encoded = json.dumps(out)
-        trace.write("request\n")
-        trace.flush()
-        with open(response_path, "w", encoding="utf-8") as response:
-            response.write(encoded + "\n")
-PYEOF
-SYNTHETIC_INPUT_ENCODER_PID=$!
+# Both high-volume hook suites share this encoder so their JSON schemas and
+# escaping cannot drift.  The suite is serial, so one request/response pair
+# needs no request id.
+sable_json_encoder_start "$TMPROOT"
+SYNTHETIC_INPUT_ENCODER_PID="$SABLE_JSON_ENCODER_PID"
+SYNTHETIC_INPUT_ENCODER_TRACE="$SABLE_JSON_ENCODER_TRACE"
 
 encode_synthetic_input() {
   # $1 = command, $2 = cwd, $3 = agent_id, $4 = agent_type, $5 = typed flag
-  printf '%s\0%s\0%s\0%s\0%s\0' "$1" "$2" "$3" "$4" "$5" \
-    > "$SYNTHETIC_INPUT_REQUEST_FIFO"
-  IFS= read -r SYNTHETIC_INPUT_JSON < "$SYNTHETIC_INPUT_RESPONSE_FIFO"
-  printf '%s\n' "$SYNTHETIC_INPUT_JSON"
+  sable_json_encoder_encode pre "$1" "$2" "" "" "$3" "$4" "$5"
 }
 
 make_input() {
@@ -1907,6 +1856,16 @@ else
   FAIL=$((FAIL+1))
   FAIL_NAMES="$FAIL_NAMES\n  synthetic-input encoder reuse/escaping (starts=$SYNTHETIC_INPUT_ENCODER_STARTS requests=$SYNTHETIC_INPUT_ENCODER_REQUESTS actual=$SYNTHETIC_INPUT_ESCAPE_ACTUAL)"
   echo "FAIL: synthetic-input encoder preserves exact JSON escaping and serves all 106 payloads from one python3 process"
+fi
+
+sable_json_encoder_stop
+if kill -0 "$SYNTHETIC_INPUT_ENCODER_PID" 2>/dev/null; then
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  synthetic-input encoder process was not reaped (pid=$SYNTHETIC_INPUT_ENCODER_PID)"
+  echo "FAIL: synthetic-input encoder is reaped before suite exit"
+else
+  PASS=$((PASS+1))
+  echo "PASS: synthetic-input encoder is reaped before suite exit"
 fi
 
 # The two high-volume fixed-substring assertion helpers execute for nearly

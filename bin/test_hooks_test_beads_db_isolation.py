@@ -140,17 +140,133 @@ def _strip_guard(text: str) -> str:
     return stripped
 
 
-def _decoy_ambient_beads_db(tmp_path: Path) -> str:
-    """An already-initialized workspace, distinct from anything a site under
-    test will build — reproducing the tier's own already-initialized DB
-    that a second, unguarded `bd init` collides with."""
-    decoy = tmp_path / "decoy-ambient"
-    decoy.mkdir()
-    cp = subprocess.run(["bd", "init", "--prefix=decoy"], cwd=str(decoy),
-                        env={**os.environ, "BD_NON_INTERACTIVE": "1"},
-                        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    assert (decoy / ".beads").is_dir(), f"decoy ambient DB setup itself failed: {cp.stdout}"
-    return str(decoy / ".beads")
+class _AmbientBdTemplate:
+    """One immutable real-bd baseline, deep-copied for each collision arm.
+
+    The old fixture paid for a fresh ``bd init`` on every call: 37 real inits
+    in this 28-case module.  The ambient store is evidence, not the subject of
+    any mutation, so building that evidence once and copying it preserves the
+    test contract while deleting manufactured integration load.  Copies stay
+    per-case because sharing a writable Dolt directory would trade runtime for
+    order dependence.
+    """
+
+    def __init__(self, workspace: Path):
+        self.workspace = workspace
+        self.beads_dir = workspace / ".beads"
+
+    @classmethod
+    def create(cls, parent: Path) -> "_AmbientBdTemplate":
+        workspace = parent / "decoy-ambient"
+        workspace.mkdir(parents=True)
+        env = dict(os.environ)
+        env.pop("BEADS_DB", None)
+        env["BD_NON_INTERACTIVE"] = "1"
+        cp = subprocess.run(
+            ["bd", "init", "--prefix=decoy"], cwd=str(workspace), env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        assert (workspace / ".beads").is_dir(), (
+            f"decoy ambient DB setup itself failed: {cp.stdout}"
+        )
+        return cls(workspace)
+
+    def copy_into(self, parent: Path) -> str:
+        destination = parent / "decoy-ambient"
+        shutil.copytree(self.workspace, destination)
+        beads_dir = destination / ".beads"
+        assert beads_dir.is_dir(), f"copied decoy DB is absent: {beads_dir}"
+        return str(beads_dir)
+
+
+@pytest.fixture(scope="session")
+def ambient_bd_template(tmp_path_factory):
+    """Build the real ambient-collision evidence exactly once per worker."""
+    return _AmbientBdTemplate.create(
+        tmp_path_factory.mktemp("ambient-beads-template")
+    )
+
+
+def _decoy_ambient_beads_db(
+        tmp_path: Path, template: _AmbientBdTemplate) -> str:
+    """Give one test arm an independent copy of the initialized ambient DB."""
+    return template.copy_into(tmp_path)
+
+
+@pytest.mark.skipif(not HAVE_BD, reason="requires a real bd on PATH")
+def test_decoy_template_initializes_real_bd_once_then_copies_without_more_inits(
+        tmp_path, monkeypatch):
+    """The optimization must delete real setup, not hide it behind another API."""
+    real_run = subprocess.run
+    init_argv = []
+
+    def recording_run(argv, *args, **kwargs):
+        if list(argv[:2]) == ["bd", "init"]:
+            init_argv.append(list(argv))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    template = _AmbientBdTemplate.create(tmp_path / "template")
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first = template.copy_into(first_root)
+    second = template.copy_into(second_root)
+
+    assert len(init_argv) == 1, init_argv
+    assert Path(first).is_dir() and Path(second).is_dir()
+
+
+@pytest.mark.skipif(not HAVE_BD, reason="requires a real bd on PATH")
+def test_decoy_template_copies_share_no_mutable_store_files(
+        ambient_bd_template, tmp_path):
+    """Per-case copies must not trade repeated setup for cross-test aliasing."""
+    left_root = tmp_path / "left"
+    right_root = tmp_path / "right"
+    left_root.mkdir()
+    right_root.mkdir()
+    left = Path(ambient_bd_template.copy_into(left_root))
+    right = Path(ambient_bd_template.copy_into(right_root))
+
+    compared = 0
+    for left_file in left.rglob("*"):
+        if not left_file.is_file():
+            continue
+        right_file = right / left_file.relative_to(left)
+        if right_file.is_file():
+            compared += 1
+            assert not os.path.samefile(left_file, right_file), left_file
+    assert compared > 0, "copy-isolation probe compared no real bd files"
+
+    left_config = left / "config.yaml"
+    right_config = right / "config.yaml"
+    template_config = ambient_bd_template.beads_dir / "config.yaml"
+    before_right = right_config.read_bytes()
+    before_template = template_config.read_bytes()
+    left_config.write_text(left_config.read_text() + "# left-only mutation\n")
+    assert right_config.read_bytes() == before_right
+    assert template_config.read_bytes() == before_template
+
+
+@pytest.mark.skipif(not HAVE_BD, reason="requires a real bd on PATH")
+def test_copied_decoy_still_fires_on_an_unguarded_ambient_consumer(
+        ambient_bd_template, tmp_path):
+    """Plant the missing guard and require the copied ambient DB to catch it."""
+    decoy_root = tmp_path / "decoy"
+    own_root = tmp_path / "unguarded-site"
+    decoy_root.mkdir()
+    own_root.mkdir()
+    ambient = ambient_bd_template.copy_into(decoy_root)
+    cp = _run_under_ambient_beads_db(
+        f'cd "{own_root}" && bd init --prefix=unguarded', ambient,
+    )
+
+    assert not (own_root / ".beads").exists(), (
+        "the planted unguarded consumer built its own DB, so the ambient "
+        "collision arm did not fire"
+    )
+    assert "already initialized" in cp.stdout.lower(), cp.stdout
 
 
 def _run_under_ambient_beads_db(script: str, ambient_beads_db: str) -> subprocess.CompletedProcess:
@@ -213,6 +329,16 @@ _DIRECT_SITES = [
     ("bead-description-gate", "hooks/test/test-bead-description-gate.sh", "ORIGIN_REPO_DIR",
      'ORIGIN_REPO_DIR="$(mktemp -d)"; ORIGIN_BD_HOME="$(mktemp -d)"',
      "$ORIGIN_REPO_DIR/.beads/config.yaml", None),
+    ("edit-write-claim-reconciler", "hooks/test/test-edit-write-claim-reconciler.sh",
+     "--prefix=task",
+     'FIXTURE_DIR="$(mktemp -d)"; EWCR_BD_ROOT="$FIXTURE_DIR/real-bd"; mkdir -p "$EWCR_BD_ROOT"',
+     "$EWCR_BD_ROOT/.beads", "EWCR_BD_INIT_OUT"),
+    ("sable-test", "hooks/test/test-sable-test.sh", "--prefix=stint",
+     'STUB_DIR="$(mktemp -d)"; SABLE_TEST_BD_ROOT="$STUB_DIR/real-bd"; mkdir -p "$SABLE_TEST_BD_ROOT"',
+     "$SABLE_TEST_BD_ROOT/.beads", "SABLE_TEST_BD_INIT_OUT"),
+    ("tdd-gate", "hooks/test/test-tdd-gate.sh", "--prefix=tddg",
+     'STUB_DIR="$(mktemp -d)"; TDD_GATE_BD_ROOT="$STUB_DIR/real-bd"; mkdir -p "$TDD_GATE_BD_ROOT"',
+     "$TDD_GATE_BD_ROOT/.beads", "TDD_GATE_BD_INIT_OUT"),
 ]
 
 # The two `bd_in_sandbox() { ... }` wrapper sites: the guard lives in the
@@ -248,9 +374,10 @@ def test_site_resolver_fails_loudly_when_guarded_invocation_is_absent(tmp_path):
 @pytest.mark.parametrize("site_id,path,selector,setup,check_path,capture_var", _DIRECT_SITES,
                          ids=[s[0] for s in _DIRECT_SITES])
 def test_shipped_init_builds_its_own_db_despite_ambient_beads_db(
-        tmp_path, site_id, path, selector, setup, check_path, capture_var):
+        tmp_path, ambient_bd_template,
+        site_id, path, selector, setup, check_path, capture_var):
     """GREEN arm: the line as shipped isolates correctly."""
-    ambient = _decoy_ambient_beads_db(tmp_path)
+    ambient = _decoy_ambient_beads_db(tmp_path, ambient_bd_template)
     extracted = _resolve_site(path, selector)
     script = f'{setup}\n{extracted}\necho "OWN_DB_EXISTS=$([ -e "{check_path}" ] && echo yes || echo no)"'
     cp = _run_under_ambient_beads_db(script, ambient)
@@ -263,7 +390,8 @@ def test_shipped_init_builds_its_own_db_despite_ambient_beads_db(
 @pytest.mark.parametrize("site_id,path,selector,setup,check_path,capture_var", _DIRECT_SITES,
                          ids=[s[0] for s in _DIRECT_SITES])
 def test_stripping_the_guard_reproduces_the_reported_collision(
-        tmp_path, site_id, path, selector, setup, check_path, capture_var):
+        tmp_path, ambient_bd_template,
+        site_id, path, selector, setup, check_path, capture_var):
     """RED arm, the negative control: proves the GREEN arm above is not
     vacuous. The SAME extracted text with `-u BEADS_DB ` mechanically
     removed must fail to build its own DB — it inherits the ambient one
@@ -278,7 +406,7 @@ def test_stripping_the_guard_reproduces_the_reported_collision(
     discards it into /dev/null or an uninspected capture variable — a
     site's own output-hiding is not license to skip verifying WHY it
     failed."""
-    ambient = _decoy_ambient_beads_db(tmp_path)
+    ambient = _decoy_ambient_beads_db(tmp_path, ambient_bd_template)
     unguarded = _strip_guard(_resolve_site(path, selector))
 
     script = f'{setup}\n{unguarded}\necho "OWN_DB_EXISTS=$([ -e "{check_path}" ] && echo yes || echo no)"'
@@ -291,7 +419,7 @@ def test_stripping_the_guard_reproduces_the_reported_collision(
 
     diag_root = tmp_path / "diag"
     diag_root.mkdir()
-    ambient2 = _decoy_ambient_beads_db(diag_root)
+    ambient2 = _decoy_ambient_beads_db(diag_root, ambient_bd_template)
     diag_script = f'{setup}\n{_diagnostic_variant(unguarded, capture_var)}'
     diag_cp = _run_under_ambient_beads_db(diag_script, ambient2)
     assert "already initialized" in diag_cp.stdout.lower(), (
@@ -307,8 +435,9 @@ def test_stripping_the_guard_reproduces_the_reported_collision(
 @pytest.mark.parametrize("site_id,path,selector,setup,call,check_path", _WRAPPER_SITES,
                          ids=[s[0] for s in _WRAPPER_SITES])
 def test_wrapper_shipped_definition_builds_its_own_db_despite_ambient_beads_db(
-        tmp_path, site_id, path, selector, setup, call, check_path):
-    ambient = _decoy_ambient_beads_db(tmp_path)
+        tmp_path, ambient_bd_template,
+        site_id, path, selector, setup, call, check_path):
+    ambient = _decoy_ambient_beads_db(tmp_path, ambient_bd_template)
     extracted = _resolve_site(path, selector, wrapper=True)
     script = f'{setup}\n{extracted}\n{call}\necho "OWN_DB_EXISTS=$([ -e "{check_path}" ] && echo yes || echo no)"'
     cp = _run_under_ambient_beads_db(script, ambient)
@@ -321,8 +450,9 @@ def test_wrapper_shipped_definition_builds_its_own_db_despite_ambient_beads_db(
 @pytest.mark.parametrize("site_id,path,selector,setup,call,check_path", _WRAPPER_SITES,
                          ids=[s[0] for s in _WRAPPER_SITES])
 def test_wrapper_stripping_the_guard_reproduces_the_reported_collision(
-        tmp_path, site_id, path, selector, setup, call, check_path):
-    ambient = _decoy_ambient_beads_db(tmp_path)
+        tmp_path, ambient_bd_template,
+        site_id, path, selector, setup, call, check_path):
+    ambient = _decoy_ambient_beads_db(tmp_path, ambient_bd_template)
     unguarded = _strip_guard(_resolve_site(path, selector, wrapper=True))
     script = f'{setup}\n{unguarded}\n{call}\necho "OWN_DB_EXISTS=$([ -e "{check_path}" ] && echo yes || echo no)"'
     cp = _run_under_ambient_beads_db(script, ambient)

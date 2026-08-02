@@ -28,9 +28,9 @@
 # the documented --sandbox contract keeps the case fast and CI-safe while
 # still asserting the observable property: NO remote advance).
 #
-# Integration test uses a real bd sandbox (real project DB, --sandbox on every
-# setup/teardown write so the scratch bead never touches the shared remote) to
-# verify end-to-end behavior including the actual WIP-CLAIMS note landing.
+# Integration test uses a real bd sandbox in a per-suite store.  --sandbox is
+# retained on every write as the production argv contract, while BEADS_DIR
+# prevents test records from entering either the shared remote or live store.
 #
 # Run with:
 #   bash hooks/test/test-edit-write-claim-reconciler.sh
@@ -323,18 +323,30 @@ rm -f "$LFQL_TIP"
 restore_plain_stub
 
 # ---------------------------------------------------------------------------
-# INTEGRATION TEST — real bd in the project repo
+# INTEGRATION TEST — real bd in an isolated per-suite store
 # ---------------------------------------------------------------------------
-# Creates a scratch bead in the real, shared project Dolt db (--sandbox on
-# every write so this test never pushes to the shared remote), a real
-# transcript file mentioning it, runs the real hook, then checks WIP-CLAIMS
-# was written. Closes the bead when done.
+# Creates a scratch bead in a real, isolated Dolt db, a real transcript file
+# mentioning it, runs the real hook against that same store, then checks
+# WIP-CLAIMS was written.  The live-store absence assertion is the
+# cross-lane discriminator that SABLE-a7q4p requires.
 
 INTEGRATION_INPUT_USED=0
 if ! command -v bd >/dev/null 2>&1; then
   echo "SKIP (integration): bd not found on PATH"
 else
-  SCRATCH_ID=$(bd create --sandbox --silent \
+  EWCR_BD_ROOT="$FIXTURE_DIR/real-bd"
+  mkdir -p "$EWCR_BD_ROOT"
+  git -C "$EWCR_BD_ROOT" init -q
+  # The production hook recognizes the historical bd/sable/epic/task/bug/feat
+  # id families in transcripts; use one of those families while keeping this
+  # store isolated from the live SABLE-prefixed pool.
+  EWCR_BD_INIT_OUT="$(cd "$EWCR_BD_ROOT" && env -u BEADS_DB -u BEADS_DIR BD_NON_INTERACTIVE=1 bd init --prefix=task --non-interactive --skip-agents --skip-hooks --quiet 2>&1)"
+  EWCR_BD_STORE="$EWCR_BD_ROOT/.beads"
+  ewcr_bd() {
+    env -u BEADS_DB BEADS_DIR="$EWCR_BD_STORE" BD_NON_INTERACTIVE=1 bd "$@"
+  }
+
+  SCRATCH_ID=$(ewcr_bd create --sandbox --silent \
     --title="[int-test] edit-write-claim-reconciler scratch bead" \
     --description="hooks/foo.sh is the implementation file for this scratch bead" \
     --notes="[no-test] integration test scratch — safe to close" \
@@ -351,9 +363,11 @@ else
     # via the transcript.
     use_edit_input integration
     INTEGRATION_INPUT_USED=1
-    printf '%s' "$EDIT_INPUT" | bash "$HOOK" 2>/dev/null
+    printf '%s' "$EDIT_INPUT" | \
+      env -u BEADS_DB BEADS_DIR="$EWCR_BD_STORE" BD_NON_INTERACTIVE=1 \
+      bash "$HOOK" 2>/dev/null
 
-    CLAIMS=$(bd show "$SCRATCH_ID" --json 2>/dev/null | python3 -c "
+    CLAIMS=$(ewcr_bd show "$SCRATCH_ID" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -369,7 +383,15 @@ except Exception:
       fail "integration: bead $SCRATCH_ID has wip_claims metadata after hook run" "metadata: '$CLAIMS'"
     fi
 
-    bd close "$SCRATCH_ID" --sandbox 2>/dev/null || true
+    if env -u BEADS_DB -u BEADS_DIR BD_NON_INTERACTIVE=1 \
+         bd show "$SCRATCH_ID" --json >/dev/null 2>&1; then
+      fail "integration: scratch bead is absent from the live store" \
+        "$SCRATCH_ID unexpectedly resolves outside $EWCR_BD_STORE"
+    else
+      pass "integration: scratch bead is absent from the live store"
+    fi
+
+    ewcr_bd close "$SCRATCH_ID" --sandbox 2>/dev/null || true
   fi
 fi
 
