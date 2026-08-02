@@ -42,8 +42,18 @@ class FakeBd:
             record = self.records.get(argv[2])
             return Result(
                 returncode=0 if record else 1,
-                stdout=json.dumps([record]) if record else "",
-                stderr="" if record else "not found",
+                stdout=(
+                    json.dumps([record])
+                    if record
+                    else json.dumps(
+                        {"error": "no issues found matching the provided IDs"}
+                    )
+                ),
+                stderr=(
+                    ""
+                    if record
+                    else f'no issue found matching "{argv[2]}"'
+                ),
             )
         if argv[1:3] == ["list", "--parent"]:
             ids = self.children.get(argv[3], [])
@@ -566,6 +576,26 @@ def test_declared_prerequisite_present_in_dep_closure_passes():
     assert verdict["missing"] == []
 
 
+def test_child_membership_without_a_dependency_edge_does_not_satisfy_ordering():
+    """A blocker in the same ready front has not been ordered before the work."""
+
+    prerequisite = "SABLE-y4nom.1"
+    verdict = handoff.prerequisite_verdict(
+        _framing([prerequisite]),
+        _decomposition(([], ["SABLE-y4nom.2"])),
+        resolve=_resolver(
+            {
+                prerequisite: "open",
+                "SABLE-y4nom.2": "open",
+            }
+        ),
+    )
+
+    assert verdict["status"] == handoff.PREREQUISITE_REFUSE
+    assert verdict["missing"] == [prerequisite]
+    assert "dependency edge" in verdict["reason"]
+
+
 def test_prose_mention_with_an_empty_declaration_is_not_a_refusal():
     """FALSE-REFUSAL GUARD — tz7h's real shape.
 
@@ -709,6 +739,75 @@ def test_resolution_unavailable_is_uncheckable_never_pass():
 
     assert verdict["status"] == handoff.PREREQUISITE_UNCHECKABLE
     assert verdict["status"] != handoff.PREREQUISITE_PASS
+
+
+def test_bd_execution_failure_is_uncheckable_not_a_missing_bead():
+    """A failed lookup did not prove that the named bead is absent."""
+
+    def failed_bd(argv, **_kwargs):
+        assert argv == ["bd", "show", "SABLE-9qqrv", "--json"]
+        return Result(returncode=2, stderr="database server unavailable")
+
+    verdict = handoff._checked_prerequisites(
+        _framing(["SABLE-9qqrv"]),
+        _decomposition((["SABLE-9qqrv"],)),
+        failed_bd,
+    )
+
+    assert verdict["status"] == handoff.PREREQUISITE_UNCHECKABLE
+    assert verdict["unresolvable"] == []
+    assert "database server unavailable" in verdict["reason"]
+
+
+@pytest.mark.parametrize(
+    ("stdout", "description"),
+    [
+        ("{not-json", "malformed JSON"),
+        (
+            json.dumps([{"id": "SABLE-other", "status": "open"}]),
+            "wrong bead",
+        ),
+        (json.dumps([{"id": "SABLE-9qqrv"}]), "missing status"),
+    ],
+)
+def test_malformed_bd_success_is_uncheckable_not_clean_or_missing(
+    stdout, description
+):
+    """A zero exit is not resolution evidence unless its record is usable."""
+
+    def malformed_bd(argv, **_kwargs):
+        assert argv == ["bd", "show", "SABLE-9qqrv", "--json"]
+        return Result(stdout=stdout)
+
+    verdict = handoff._checked_prerequisites(
+        _framing(["SABLE-9qqrv"]),
+        _decomposition((["SABLE-9qqrv"],)),
+        malformed_bd,
+    )
+
+    assert verdict["status"] == handoff.PREREQUISITE_UNCHECKABLE, description
+    assert verdict["unresolvable"] == []
+
+
+def test_explicit_bd_missing_record_remains_an_unresolvable_refusal():
+    """The real bd missing-id envelope is evidence of absence, not outage."""
+
+    def missing_bd(argv, **_kwargs):
+        assert argv == ["bd", "show", "SABLE-ghost", "--json"]
+        return Result(
+            returncode=1,
+            stdout=json.dumps(
+                {"error": "no issues found matching the provided IDs"}
+            ),
+            stderr='no issue found matching "SABLE-ghost"',
+        )
+
+    with pytest.raises(handoff.HandoffRefused, match="SABLE-ghost"):
+        handoff._checked_prerequisites(
+            _framing(["SABLE-ghost"]),
+            _decomposition((["SABLE-ghost"],)),
+            missing_bd,
+        )
 
 
 def test_mechanically_unambiguous_refusal_does_not_need_bd():

@@ -68,7 +68,8 @@ argv = sys.argv[1:]
 if argv[:1] == ["show"]:
     record = records["beads"].get(argv[1])
     if record is None:
-        sys.stderr.write("not found\\n")
+        sys.stderr.write(f'no issue found matching "{argv[1]}"\\n')
+        print(json.dumps({"error": "no issues found matching the provided IDs"}))
         raise SystemExit(1)
     print(json.dumps([record]))
 elif argv[:2] == ["swarm", "validate"]:

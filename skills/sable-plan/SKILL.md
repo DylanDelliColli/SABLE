@@ -168,16 +168,25 @@ same essence that does status/arbitration in execution.)
 
 **Deliverable:** write `framing.json` to the planning state dir — stories with
 stable ids (`S1..Sn`, later substages trace back to these), `non_goals`,
-`success_metric`, `wedge` — then run the gate protocol.
+`success_metric`, `wedge`, and a REQUIRED `prerequisites` array of anchored bead
+ids — then run the gate protocol. The empty array explicitly asserts that the
+epic has no prerequisite; it is meaningful and must be chosen deliberately,
+never substituted for an unanswered question. Ask the user which already-known
+beads must land before this epic's scope may dispatch, and write exactly those
+ids. Never extract ids from `wedge`, stories, or non-goals: a mentioned carrier
+or sequencing note is not necessarily a blocker.
 
 **Charter ingestion (Discovery composition).** Before generating framing cold,
 check whether this epic came from a Discovery charter: run
 `sable-charter ingest <epic-id>`. If it returns framing fields (a charter whose
 `epic_intention` matches this epic exists), FRAMING is already done — record those
-fields as the framing artifact on the epic, map them into `framing.json` in the
-planning state dir (same schema as the cold path), and skip straight ahead with
-`sable-mode substage set research`. Only generate framing as above when ingest
-returns nothing (exits nonzero). See PLANNING-MODES-DESIGN.md for the
+fields as the framing artifact on the epic and map them into `framing.json` in
+the planning state dir (same schema as the cold path). Charter ingestion does
+not decide prerequisites: explicitly obtain and add the REQUIRED
+`prerequisites` array before writing the artifact, including a deliberate empty
+array when the user confirms there is no prerequisite. Then skip straight ahead
+with `sable-mode substage set research`. Only generate framing as above when
+ingest returns nothing (exits nonzero). See PLANNING-MODES-DESIGN.md for the
 Discovery→Full seam.
 
 ### RESEARCH — owner: sherlock subagent (greenfield mode); fallback: `/deep-research`

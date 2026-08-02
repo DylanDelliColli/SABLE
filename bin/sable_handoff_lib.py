@@ -442,11 +442,13 @@ def _verdict(
 
 
 def _dependency_closure(decomposition: Mapping[str, object]) -> tuple[list, list]:
-    """Every id the decomposition's children declare a dependency on.
+    """Every id the decomposition's children declare a dependency edge to.
 
     Returns (dep ids, malformed entries).  Cross-epic ids are terminal and
     within-epic ids resolve to siblings whose own deps are listed too, so the
-    union over children IS the closure.
+    union over children IS the closure represented by the artifact. Merely
+    being a child does not satisfy a prerequisite: without an incoming edge,
+    that child is in the same dispatch front rather than ordered first.
     """
 
     children = decomposition.get("children")
@@ -535,7 +537,8 @@ def prerequisite_verdict(
         return _verdict(
             PREREQUISITE_REFUSE,
             "the plan declares prerequisite(s) that no child in the "
-            "decomposition depends on: " + ", ".join(sorted(set(missing)))
+            "decomposition names through a dependency edge: "
+            + ", ".join(sorted(set(missing)))
             + " — the scope would dispatch before its own stated blockers land",
             declared=declared,
             missing=missing,
@@ -645,9 +648,11 @@ def _bead_resolver(runner: Runner) -> Callable[[str], str | None]:
 
     Deliberately not _show: that raises on a missing bead, and here "the id
     does not resolve" is a finding to REPORT (None), not an error to abort on.
-    The two unavailabilities stay separate — a missing bead returns None, an
-    unrunnable bd raises _ResolutionUnavailable — because conflating them is
-    how "I could not look" becomes "it is not there".
+    The two unavailabilities stay separate — ONLY bd's explicit missing-issue
+    response returns None; an unrunnable command, a different nonzero result,
+    malformed JSON, or an unusable record raises _ResolutionUnavailable.
+    Conflating those cases is how "I could not look" becomes "it is not
+    there", falsely accusing the plan instead of reporting UNCHECKABLE.
     """
 
     def resolve(issue_id: str) -> str | None:
@@ -659,21 +664,56 @@ def _bead_resolver(runner: Runner) -> Callable[[str], str | None]:
             )
         except OSError as exc:
             raise _ResolutionUnavailable(str(exc)) from exc
-        if getattr(result, "returncode", 1) != 0:
-            return None
+        stdout = getattr(result, "stdout", "") or ""
+        stderr = getattr(result, "stderr", "") or ""
         try:
-            payload = json.loads(getattr(result, "stdout", "") or "")
+            payload = json.loads(stdout)
         except (TypeError, json.JSONDecodeError):
-            return None
+            payload = None
+
+        if getattr(result, "returncode", 1) != 0:
+            # Current bd emits this structured envelope (and the matching
+            # stderr phrase) when the command DID reach the store and proved
+            # the id absent. Narrow matching is deliberate: a generic rc=1 is
+            # also how a locked/unreachable store reports failure, and that is
+            # UNCHECKABLE, not evidence that the bead does not exist.
+            error = payload.get("error") if isinstance(payload, dict) else None
+            diagnostic = " ".join(
+                value.strip().lower()
+                for value in (str(error or ""), str(stderr))
+                if value and value.strip()
+            )
+            if (
+                "no issue found matching" in diagnostic
+                or "no issues found matching" in diagnostic
+            ):
+                return None
+            detail = str(stderr or stdout or "no diagnostic").strip()
+            raise _ResolutionUnavailable(
+                f"bd show {issue_id} failed: {detail}"
+            )
+
+        if payload is None:
+            raise _ResolutionUnavailable(
+                f"bd show {issue_id} returned malformed JSON"
+            )
         if isinstance(payload, dict):
             payload = [payload]
-        if not isinstance(payload, list) or not payload:
-            return None
+        if not isinstance(payload, list) or len(payload) != 1:
+            raise _ResolutionUnavailable(
+                f"bd show {issue_id} returned an invalid record set"
+            )
         record = payload[0]
         if not isinstance(record, dict) or record.get("id") != issue_id:
-            return None
+            raise _ResolutionUnavailable(
+                f"bd show {issue_id} did not return that bead"
+            )
         status = record.get("status")
-        return status.strip() if isinstance(status, str) and status.strip() else "unknown"
+        if not isinstance(status, str) or not status.strip():
+            raise _ResolutionUnavailable(
+                f"bd show {issue_id} returned no usable status"
+            )
+        return status.strip()
 
     return resolve
 

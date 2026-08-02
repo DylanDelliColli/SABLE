@@ -36,6 +36,12 @@ assert_no_grep() {
   # file pattern name
   if grep -qi -- "$2" "$1" 2>/dev/null; then fail "$3" "pattern unexpectedly present: $2"; else pass "$3"; fi
 }
+assert_text_grep() {
+  # text pattern name
+  # Prose wraps for readability; normalize the section before matching so a
+  # line break cannot retire a semantic contract or make the test phrase-keyed.
+  if printf '%s\n' "$1" | tr '\n' ' ' | grep -qi -- "$2"; then pass "$3"; else fail "$3" "pattern not found in section: $2"; fi
+}
 
 # 1. files exist
 assert_file "$PLAN_SKILL" "/sable-plan skill file exists"
@@ -44,6 +50,14 @@ assert_file "$EXEC_SKILL" "/sable-execute skill file exists"
 # 2. invocation name in frontmatter
 assert_grep "$PLAN_SKILL" "name: sable-plan"    "/sable-plan declares name: sable-plan"
 assert_grep "$EXEC_SKILL" "name: sable-execute" "/sable-execute declares name: sable-execute"
+
+# The handoff gate requires a structured prerequisite declaration. Pin the
+# PRODUCER brief, not merely the consumer schema: a perfectly strict gate is
+# inert if /sable-plan keeps generating artifacts that can never satisfy it.
+FRAMING_SECTION="$(awk '/^### FRAMING/{inside=1} /^### RESEARCH/{inside=0} inside' "$PLAN_SKILL")"
+assert_text_grep "$FRAMING_SECTION" "required.*prerequisites.*array" "/sable-plan FRAMING requires the prerequisites array"
+assert_text_grep "$FRAMING_SECTION" "empty.*array.*no prerequisite" "/sable-plan defines the explicit-empty prerequisite meaning"
+assert_text_grep "$FRAMING_SECTION" "charter ingestion.*prerequisite" "/sable-plan keeps charter ingestion from bypassing prerequisite judgment"
 
 # 3. wired to the shared mechanism
 assert_grep "$PLAN_SKILL" "sable-mode set planning"  "/sable-plan invokes sable-mode set planning"
