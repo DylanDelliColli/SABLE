@@ -382,3 +382,46 @@ serial shell lane under the same one-per-host lease. Their individual medians
 make sub-600-second wall time plausible, but the prior shell-contention flake
 means overlap needs repeated exact-outcome and tail evidence before it can
 become authoritative.
+
+## Broad-lane overlap result (`SABLE-y4nom.7.5`)
+
+The follow-up extended the same dedicated sampler with an overlap mode; it did
+not change `sable-dev-check` or any other authoritative validation path. One
+fixed-`n2` Python reference is followed by fixed-`n2` Python and the complete
+serial shell `ALLOW` lane running concurrently under the shared broad-seat
+lock. The parent owns both process groups, a single deadline, separate logs
+and statuses, and fail-closed cleanup. The exact benchmark object was
+`785b291a9cfa43668ae3e4484e733b8b6389bf01`; artifacts are under
+`.git/sable/xdist-benchmark/785b291a9cfa-20260802T012314/`.
+
+| Sample | Wall | Python | Shell | Exact Python outcome | Shell outcome | Decision |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| Same-object fixed-`n2` reference | 478.80s | 478.80s | -- | 3,428 passed, 17 skipped; zero load violations | -- | Green reference |
+| Overlap 1 | 666.82s | 576.63s | 666.82s (663.16s measured suites) | Same 3,428 passed and 17 skipped; identical collection/outcome digests; zero load violations | 96 passed, one false-red parser control | **NO-GO** |
+
+The first overlap sample exceeded the strict 600-second target by 66.82
+seconds, so the runner stopped before repetition two as required. Contention
+was diffuse rather than one pathological tail: Python slowed 20% relative to
+the same-object reference and shell grew about 31% relative to the 505.16s
+serial baseline. The largest shell increases were spread across
+`test-pre-push-rebase-test.sh` (+17.55s), `test-mode-interlock.sh` (+14.41s),
+`test-post-push-merge-notify.sh` (+12.29s), `test-impact-selection.sh`
+(+9.85s), and `test-edit-write-claim-reconciler.sh` (+8.92s). Coarse overlap
+is therefore not enabled, and fixed `n2` is not yet adopted into the broad
+local path by this bead.
+
+The shell red was independently diagnosed as an observation defect, not a
+selection or behavior failure. The canonical cost profile predates the new
+benchmark test module, so `sable-dev-check --dry-run` correctly emitted a loud
+catalog-drift warning naming `bin/test_sable_xdist_benchmark.py`. Six exact-set
+assertions in `test-impact-selection.sh` merged stdout and stderr and grepped
+every test-looking filename; they counted the warning as a planned test even
+though the indented plan itself was correct. The extractor now accepts only
+the renderer's four-space-indented plan rows, with a planted diagnostic/noise
+control. The suite is green at 61/61. This repairs the false red but does not
+change the measured 666.82-second performance verdict.
+
+The next boundary is measured rather than speculative: reduce at least about
+75 seconds from the contention-sensitive shell/setup surface while preserving
+all identities and verdicts, then rerun two clean overlap samples. Adoption
+remains gated on repeated p95 below 600 seconds.
