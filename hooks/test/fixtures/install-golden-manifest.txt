@@ -28,7 +28,7 @@ cbdea65644eff16c2c462ee855ba11106185927b7d2d0f2fe899740337973f4d  ./hooks/multi-
 d609623bf1dba8f50ba3b02962af8014c90d679e31267bcf1f2d87dd4f042250  ./hooks/multi-manager/pre-push-rebase-test.sh
 f3cbdd63ee02a6de238cd889dc4c7eff228036fa5a3b9db9aa229c606021c429  ./hooks/multi-manager/read-guard.sh
 e1b207bc80a293d975beb76bfa671b3312d3979c10dabc46c807fcbae305752d  ./hooks/multi-manager/seat-sighting-gate.sh
-a12b8972252a20299784ec10a8b84834d52cf6659ff0297381455090e033099f  ./hooks/multi-manager/session-role-anchor.sh
+a4f2079849e9193fa0b9c42a6985a5bcb3708c26574d6b4b020f9575c5b77c49  ./hooks/multi-manager/session-role-anchor.sh
 22d9931473a342546330ba6a9c40694b825f312188af9f637d8b3bb661f0bd8e  ./hooks/multi-manager/stash-worktree-guard.sh
 836eeaab1cf2a4678a1a7bb03cffb277f30dba94eb502ceb42472ef00b388640  ./hooks/multi-manager/tree-claim-impl.sh
 13a5e989cec74933fc69331a8deba60bc6c2099495d21a4c91350c098d215593  ./hooks/multi-manager/tree-claim.sh
