@@ -86,6 +86,55 @@ ensure_state_gitignored() {
     printf '%s\n' "$pattern" >> "$gi" 2>/dev/null || true
 }
 
+# contract_present <text> — timestamps record when a contract was first
+# published; they are not part of the contract's identity.  Compare the payload
+# after the first `] ` byte-for-byte so replaying /sable-execute's seed commands
+# is idempotent without collapsing whitespace-distinct operator doctrine.
+contract_present() {
+    local text="$1" line payload
+    [ -f "$STATE" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            '- ['*'] '*)
+                payload="${line#*] }"
+                [ "$payload" = "$text" ] && return 0
+                ;;
+        esac
+    done < "$STATE"
+    return 1
+}
+
+# publish_replacement_backup <path> — create one immutable generation before a
+# deliberate replacement.  mktemp's uniqueness suffix is load-bearing: two
+# force writes inside the same timestamp tick must never overwrite each other's
+# evidence.  The caller does not touch the surface unless this returns success.
+publish_replacement_backup() {
+    local state="$1" stamp backup
+    if ! stamp="$(date -u +%Y%m%dT%H%M%SZ)"; then
+        printf 'sable-contract: cannot timestamp backup for %s; replacement aborted\n' \
+            "$state" >&2
+        return 1
+    fi
+    if ! backup="$(mktemp "${state}.bak.${stamp}.XXXXXX")"; then
+        printf 'sable-contract: cannot create backup for %s; replacement aborted\n' \
+            "$state" >&2
+        return 1
+    fi
+    if ! cp -f -- "$state" "$backup"; then
+        rm -f -- "$backup"
+        printf 'sable-contract: cannot write backup for %s; replacement aborted\n' \
+            "$state" >&2
+        return 1
+    fi
+    if ! cmp -s -- "$state" "$backup"; then
+        rm -f -- "$backup"
+        printf 'sable-contract: backup verification failed for %s; replacement aborted\n' \
+            "$state" >&2
+        return 1
+    fi
+    printf '%s\n' "$backup"
+}
+
 STATE="$(resolve_contracts_path)"
 
 usage() {
@@ -159,13 +208,21 @@ case "$cmd" in
             exit 3
         fi
         mkdir -p "$(dirname "$STATE")"
+        ensure_state_gitignored "$STATE"
+        if [ "$cmd" = "add" ] && contract_present "$text"; then
+            exit 0
+        fi
+        if [ "$cmd" = "set" ] && [ "$force" -eq 1 ] && [ -s "$STATE" ]; then
+            if ! publish_replacement_backup "$STATE" >/dev/null; then
+                exit 4
+            fi
+        fi
         ts="$(date +%Y-%m-%dT%H:%M:%S%z)"
         if [ "$cmd" = "add" ]; then
             printf -- '- [%s] %s\n' "$ts" "$text" >> "$STATE"
         else
             printf -- '- [%s] %s\n' "$ts" "$text" > "$STATE"
         fi
-        ensure_state_gitignored "$STATE"
         ;;
     clear)
         rm -f "$STATE"

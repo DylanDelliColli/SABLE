@@ -20,6 +20,7 @@ from sable_handoff_lib import (
     approval_actor,
     approve_handoff,
     break_glass_authority,
+    validate_execution_authority,
     validate_handoff,
     validate_handoff_state,
 )
@@ -336,10 +337,22 @@ def _run(args: argparse.Namespace, path: Path) -> int:
             )
             print(json.dumps(receipt, indent=2))
             return 0
-        state = _read_planning_state(path)
-        receipt = state.get("handoff")
-        if not isinstance(receipt, dict):
-            raise HandoffRefused("planning state has no handoff receipt")
+        state = read_mode_state(path)
+        if state.get("mode") == "planning":
+            receipt = state.get("handoff")
+            if not isinstance(receipt, dict):
+                raise HandoffRefused("planning state has no handoff receipt")
+        else:
+            # Fleet start trusts validate_execution_authority through
+            # read_execution_authority.  Showing a carried receipt must use the
+            # same validator—not a second execution-shaped parser—so malformed
+            # or statusless proof can never render as authoritative scope.
+            try:
+                receipt = validate_execution_authority(state)
+            except HandoffRefused as exc:
+                raise HandoffRefused(
+                    f"CANNOT-ASSESS handoff receipt: {exc}"
+                ) from exc
         print(json.dumps(receipt, indent=2))
         return 0
     return 2
