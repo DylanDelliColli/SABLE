@@ -66,6 +66,7 @@ ALLOW=(
   test-impact-manifest.sh
   test-impact-selection.sh
   test-impact-tier-serialization.sh
+  test-inbox-timer.sh
   test-inbox-wake.sh
   test-install-golden-manifest.sh
   test-install-preserves-pins.sh
@@ -230,7 +231,6 @@ declare -A ZERO_IMPACT=(
   [hooks/multi-manager/upgrade-notes.md]="doc; mm-glob rule covers only *.sh"
   [templates/ci-verify-project.yml]="python test_sable_ci_template owns it"
   [templates/columbo-bead.md]="bead template, no suite consumer"
-  [templates/multi-manager/commands/inbox.md]="command doc, no suite consumer"
 )
 
 declare -A DECLARED_BROAD=(
@@ -286,6 +286,7 @@ declare -A COVERS=(
   [test-doctor-snapshot-staleness.sh]="bin/sable-doctor bin/sable-bin-install install.sh"
   [test-edit-write-claim-reconciler.sh]="hooks/multi-manager/edit-write-claim-reconciler.sh"
   [test-impact-tier-serialization.sh]="bin/sable_gate_promote_lib.py"
+  [test-inbox-timer.sh]="bin/sable-inbox-timer bin/sable-inbox-watcher bin/sable_inbox_lib.py bin/sable-worker-status"
   [test-landing-pair-gate.sh]="bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py bin/sable-merge-gate"
   [test-lib-hook-trace.sh]="hooks/multi-manager/lib-hook-trace.sh"
   [test-lib-identity.sh]="hooks/multi-manager/lib-identity.sh .github/ci/test-tiers.sh .sable bin/sable-mode"
@@ -296,7 +297,7 @@ declare -A COVERS=(
   [test-notes-clobber-guard.sh]="hooks/multi-manager/notes-clobber-guard.sh"
   [test-notes-clobber-guard-e2e.sh]="hooks/multi-manager/notes-clobber-guard.sh"
   [test-bd-inline-body-guard.sh]="hooks/multi-manager/inline-body-guard.sh bin/sable_inline_body_guard_lib.py templates/multi-manager/settings-snippet.json"
-  [test-orchestration-install.sh]="bin/sable-orchestration-install hooks/multi-manager/inbox-injection-precompact.sh hooks/multi-manager/inbox-injection.sh hooks/multi-manager/mode-interlock.sh hooks/multi-manager/read-guard.sh hooks/multi-manager/session-role-anchor.sh templates/base-settings-snippet.json templates/multi-manager/settings-snippet.json"
+  [test-orchestration-install.sh]="bin/sable-orchestration-install hooks/multi-manager/inbox-injection-precompact.sh hooks/multi-manager/inbox-injection.sh hooks/multi-manager/mode-interlock.sh hooks/multi-manager/read-guard.sh hooks/multi-manager/session-role-anchor.sh templates/base-settings-snippet.json templates/multi-manager/settings-snippet.json templates/multi-manager/commands/inbox.md"
   [test-project-clone-portability.sh]="bin/sable-orchestration-install"
   [test-optimistic-promotion.sh]="bin/sable-merge-gate bin/sable_footprint_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_preview_lib.py bin/sable_gate_classify_lib.py bin/sable_gate_git_lib.py .github/ci/test-tiers.sh"
   [test-overlap-constraint.sh]="hooks/multi-manager/pre-dispatch-overlap.sh"

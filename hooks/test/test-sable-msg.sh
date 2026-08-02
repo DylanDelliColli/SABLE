@@ -22,6 +22,8 @@ command -v tmux >/dev/null 2>&1 || { echo "SKIP: tmux not installed"; exit 0; }
 
 SOCK="sable-msg-e2e-$$"
 REC="$(mktemp -d)"
+export SABLE_TEST=1
+export SABLE_TEST_INBOX_ROOT="$REC/inbox"
 SCRATCH_BEADS_DIR=""
 
 PASS=0; FAIL=0; FAIL_NAMES=""
@@ -338,6 +340,39 @@ if command -v bd >/dev/null 2>&1; then
     pass "sable-msg's SABLE-1umr fallback fired"
   else
     fail "sable-msg's SABLE-1umr fallback fired" "$(cat "$ERRFILE2")"
+  fi
+
+  queued_count="$(PYTHONPATH="$BIN" python3 - <<'PY'
+from sable_inbox_lib import pending
+print(len(pending("chuck")))
+PY
+)"
+  if [ "$queued_count" = "1" ] \
+     && grep -q "QUEUED-BUT-DRAINER-UNVERIFIED" "$ERRFILE2"; then
+    pass "pre-activation send queues durably AND keeps the loud fallback"
+  else
+    fail "pre-activation send queues durably AND keeps the loud fallback" \
+      "queued=$queued_count err=$(cat "$ERRFILE2")"
+  fi
+
+  # Queue failure is a third state, not a synonym for queued or undelivered.
+  # A regular file where a directory is required is deterministic even for a
+  # privileged test runner (chmod-based unwritability is not).
+  printf 'not a directory\n' > "$REC/not-a-directory"
+  QUEUE_FAIL_ERR="$REC/queue-fail-err.txt"
+  if SABLE_TEST_INBOX_ROOT="$REC/not-a-directory/inbox" \
+      SABLE_MSG_AUTO_FALLBACK=0 CLAUDE_AGENT_NAME=lincoln \
+      SABLE_MSG_SUBMIT_TRIES=1 SABLE_MSG_POLL_INTERVAL=0.01 \
+      python3 "$BIN/sable-msg" chuck "queue failure probe" \
+        >/dev/null 2>"$QUEUE_FAIL_ERR"; then
+    fail "unwritable queue is loud and nonzero" "unexpected rc0"
+  elif grep -q "QUEUE-FAILED" "$QUEUE_FAIL_ERR" \
+       && grep -q "NOTHING WAS DELIVERED OR QUEUED" "$QUEUE_FAIL_ERR" \
+       && ! grep -q "queued successfully" "$QUEUE_FAIL_ERR"; then
+    pass "unwritable queue is loud and never claims queued success"
+  else
+    fail "unwritable queue is loud and never claims queued success" \
+      "$(cat "$QUEUE_FAIL_ERR")"
   fi
 
   sandbox_count="$(BEADS_DB="$SCRATCH_BEADS_DIR/.beads" bd count 2>/dev/null)"

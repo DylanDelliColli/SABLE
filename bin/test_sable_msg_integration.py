@@ -34,6 +34,14 @@ def tmux_socket():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+@pytest.fixture(autouse=True)
+def isolated_inbox(monkeypatch, tmp_path):
+    """Every real sable-msg subprocess uses a per-test queue/heartbeat root."""
+
+    monkeypatch.setenv("SABLE_TEST", "1")
+    monkeypatch.setenv("SABLE_TEST_INBOX_ROOT", str(tmp_path / "inbox"))
+
+
 def _server_env():
     """The env the tmux SERVER (and thus every pane without an explicit -e) is
     started under. CLAUDE_AGENT_NAME is stripped (SABLE-to8m): pane identity must

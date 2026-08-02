@@ -61,7 +61,9 @@ def make_repo(root, hooks, libs=None):
 
     tmpl = root / "templates" / "multi-manager"
     (tmpl / "roles").mkdir(parents=True)
+    (tmpl / "commands").mkdir()
     (tmpl / "agents.yaml").write_text("agents: []\n")
+    (tmpl / "commands" / "inbox.md").write_text("# inbox\n")
     for role in ("lincoln", "optimus", "tarzan", "chuck"):
         (tmpl / "roles" / f"{role}.md").write_text(f"# {role}\n")
     (tmpl / "settings-snippet.json").write_text(json.dumps({

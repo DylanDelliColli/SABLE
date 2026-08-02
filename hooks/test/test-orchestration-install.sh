@@ -58,6 +58,7 @@ if [ "$(count_interlock "$SET")" = "2" ]; then pass "project: interlock register
 if grep -qF '${CLAUDE_PROJECT_DIR}/.claude/hooks/' "$SET"; then pass "project: hook commands rooted at \${CLAUDE_PROJECT_DIR} placeholder"; else fail "project: hook commands rooted at \${CLAUDE_PROJECT_DIR} placeholder"; fi
 if grep -q "$P/.claude/hooks/" "$SET"; then fail "project: no absolute machine path in hook commands" "found absolute path in $SET"; else pass "project: no absolute machine path in hook commands"; fi
 exists "$P/.claude/sable/agents.yaml" "project: registry (agents.yaml) installed"
+exists "$P/.claude/commands/inbox.md" "project: /inbox command installed"
 if [ -x "$P/.claude/hooks/multi-manager/session-role-anchor.sh" ]; then pass "project: identity hook installed+exec"; else fail "project: identity hook installed+exec"; fi
 if [ "$(count_in_event "$SET" SessionStart session-role-anchor.sh)" = "1" ]; then pass "project: identity hook registered SessionStart"; else fail "project: identity hook registered SessionStart" "count=$(count_in_event "$SET" SessionStart session-role-anchor.sh)"; fi
 if [ "$(count_in_event "$SET" PreCompact session-role-anchor.sh)" = "1" ]; then pass "project: identity hook registered PreCompact"; else fail "project: identity hook registered PreCompact"; fi
@@ -100,6 +101,55 @@ if printf '%s' "$out1" | grep -q -- "--check-schedule"; then
 else
   fail "project: install output points at the post-install schedule verification"
 fi
+
+# ---------- SABLE-albyd: inbox drainer staged, command present, never activated ----------
+INBOX_TIMER="$P/.claude/sable/inbox-timer"
+exists "$INBOX_TIMER/sable-inbox-timer.service" "project: inbox-timer systemd .service staged"
+exists "$INBOX_TIMER/sable-inbox-timer.timer" "project: inbox-timer systemd .timer staged"
+exists "$INBOX_TIMER/sable-inbox-timer.cron" "project: inbox-timer cron fallback staged"
+if grep -q -- "sable-inbox-timer --once --interval-seconds 60" "$INBOX_TIMER/sable-inbox-timer.service" \
+   && grep -q "OnUnitActiveSec=60s" "$INBOX_TIMER/sable-inbox-timer.timer" \
+   && grep -q "^\*/1 " "$INBOX_TIMER/sable-inbox-timer.cron"; then
+  pass "project: inbox timer defaults to one minute on both schedulers"
+else
+  fail "project: inbox timer defaults to one minute on both schedulers"
+fi
+if printf '%s' "$out1" | grep -q -- "sable-inbox-timer --install-schedule" \
+   && printf '%s' "$out1" | grep -q -- "heartbeat freshness: 120s"; then
+  pass "project: inbox timer activation is one verified command and names 2x heartbeat"
+else
+  fail "project: inbox timer activation is one verified command and names 2x heartbeat" "out=$out1"
+fi
+
+# Timer configuration is a true preflight: invalid operator input must refuse
+# before the otherwise-large installer leaves a partial orchestration layer.
+P_BAD_CADENCE="$(mktemp -d)"
+if bad_out="$(SABLE_PROJECT_DIR="$P_BAD_CADENCE" \
+    SABLE_INBOX_INTERVAL_SECONDS=61 bash "$INSTALLER" --project --merge-settings 2>&1)"; then
+  fail "project: unrepresentable inbox cadence refuses before install writes" "unexpected rc0"
+elif [ ! -e "$P_BAD_CADENCE/.claude" ] \
+     && printf '%s' "$bad_out" | grep -q "cannot be represented"; then
+  pass "project: unrepresentable inbox cadence refuses before install writes"
+else
+  fail "project: unrepresentable inbox cadence refuses before install writes" \
+    "out=$bad_out tree=$(find "$P_BAD_CADENCE" -mindepth 1 -print 2>/dev/null)"
+fi
+rm -rf "$P_BAD_CADENCE"
+
+P_BAD_SOCKET="$(mktemp -d)"
+if bad_out="$(SABLE_PROJECT_DIR="$P_BAD_SOCKET" \
+    SABLE_INBOX_TMUX_SOCKET='unsafe socket' \
+    bash "$INSTALLER" --project --merge-settings 2>&1)"; then
+  fail "project: unsafe inbox socket refuses before install writes" "unexpected rc0"
+elif [ ! -e "$P_BAD_SOCKET/.claude" ] \
+     && printf '%s' "$bad_out" | grep -q "safe tmux socket"; then
+  pass "project: unsafe inbox socket refuses before install writes"
+else
+  fail "project: unsafe inbox socket refuses before install writes" \
+    "out=$bad_out tree=$(find "$P_BAD_SOCKET" -mindepth 1 -print 2>/dev/null)"
+fi
+rm -rf "$P_BAD_SOCKET"
+
 # the install itself must never actually touch a live systemd/cron surface.
 # SABLE-i8kv: run this against a SANDBOXED HOME, not the developer's real one —
 # on a host where the real D5 reconcile-timer is legitimately installed (e.g.
@@ -108,26 +158,29 @@ fi
 # SABLE-f00o: shared predicate so the guard below exercises the SAME detection
 # code path as the real assertion, instead of tautologically re-checking the
 # file it just touched itself.
-home_has_timer_unit(){ [ -e "$1/.config/systemd/user/sable-reconcile-timer.timer" ]; }
+home_has_timer_unit(){
+  [ -e "$1/.config/systemd/user/sable-reconcile-timer.timer" ] \
+    || [ -e "$1/.config/systemd/user/sable-inbox-timer.timer" ]
+}
 
 HS="$(mktemp -d)"; mkdir -p "$HS/.config/systemd/user"
 HP="$(mktemp -d)"
 HOME="$HS" SABLE_PROJECT_DIR="$HP" bash "$INSTALLER" --project --merge-settings >/dev/null 2>&1
 if home_has_timer_unit "$HS"; then
-  fail "project: install does not copy the unit into the real ~/.config/systemd/user" "found $HS/.config/systemd/user/sable-reconcile-timer.timer"
+  fail "project: install does not copy either staged timer into the real ~/.config/systemd/user" "found a timer unit under $HS/.config/systemd/user"
 else
-  pass "project: install does not copy the unit into the real ~/.config/systemd/user"
+  pass "project: install does not copy either staged timer into the real ~/.config/systemd/user"
 fi
 
 # guard: plant a unit inside the SANDBOXED HOME and re-invoke home_has_timer_unit
 # (the SAME predicate the assertion above calls) — proving detection actually
 # works. If home_has_timer_unit is ever neutered (e.g. hardcoded to report
 # "not found"), this guard must go red; that is the acceptance invariant.
-touch "$HS/.config/systemd/user/sable-reconcile-timer.timer"
+touch "$HS/.config/systemd/user/sable-inbox-timer.timer"
 if home_has_timer_unit "$HS"; then
-  pass "project: assertion still bites when a unit IS present under sandboxed HOME (guard)"
+  pass "project: assertion still bites when an inbox unit IS present under sandboxed HOME (guard)"
 else
-  fail "project: assertion still bites when a unit IS present under sandboxed HOME (guard)" "home_has_timer_unit reported absent after planting $HS/.config/systemd/user/sable-reconcile-timer.timer"
+  fail "project: assertion still bites when an inbox unit IS present under sandboxed HOME (guard)" "home_has_timer_unit reported absent after planting $HS/.config/systemd/user/sable-inbox-timer.timer"
 fi
 rm -rf "$HS" "$HP"
 
@@ -311,6 +364,8 @@ if [ ! -e "$P/.claude/sable/agents.yaml" ]; then pass "uninstall removes registr
 if [ ! -e "$P/.claude/sable/roles/optimus.md" ] && [ ! -e "$P/.claude/sable/roles/chuck.md" ]; then pass "uninstall removes tmux-native pane roles"; else fail "uninstall removes tmux-native pane roles"; fi
 if [ ! -e "$P/.claude/agents-teams" ]; then pass "uninstall cleans up legacy agents-teams defs"; else fail "uninstall cleans up legacy agents-teams defs"; fi
 if [ ! -e "$P/.claude/sable/reconcile-timer" ]; then pass "uninstall removes staged reconcile-timer artifacts"; else fail "uninstall removes staged reconcile-timer artifacts"; fi
+if [ ! -e "$P/.claude/sable/inbox-timer" ]; then pass "uninstall removes staged inbox-timer artifacts"; else fail "uninstall removes staged inbox-timer artifacts"; fi
+if [ ! -e "$P/.claude/commands/inbox.md" ]; then pass "uninstall removes installed /inbox command"; else fail "uninstall removes installed /inbox command"; fi
 if [ "$(count_interlock "$SET")" = "0" ]; then pass "uninstall de-registers interlock"; else fail "uninstall de-registers interlock" "count=$(count_interlock "$SET")"; fi
 if [ "$(count_marker "$SET" session-role-anchor.sh)" = "0" ]; then pass "uninstall de-registers identity hook"; else fail "uninstall de-registers identity hook" "count=$(count_marker "$SET" session-role-anchor.sh)"; fi
 if grep -q 'other-hook.sh' "$SET"; then pass "uninstall keeps unrelated hooks"; else fail "uninstall keeps unrelated hooks"; fi
@@ -459,11 +514,14 @@ rm -rf "$RA"
 # source file" never touches this repo's own tracked files; it's a copy of the
 # real hooks/templates/skills subset the installer actually reads from.
 RS="$(mktemp -d)"
-mkdir -p "$RS/hooks/multi-manager" "$RS/templates/multi-manager/roles" "$RS/skills/sample-skill"
+mkdir -p "$RS/hooks/multi-manager" "$RS/templates/multi-manager/roles" \
+         "$RS/templates/multi-manager/commands" "$RS/skills/sample-skill"
 cp "$REPO"/hooks/multi-manager/*.sh "$RS/hooks/multi-manager/"
 cp "$REPO/templates/multi-manager/agents.yaml" "$RS/templates/multi-manager/agents.yaml"
 cp "$REPO/templates/multi-manager/settings-snippet.json" "$RS/templates/multi-manager/settings-snippet.json"
 cp "$REPO"/templates/multi-manager/roles/*.md "$RS/templates/multi-manager/roles/"
+cp "$REPO/templates/multi-manager/commands/inbox.md" \
+   "$RS/templates/multi-manager/commands/inbox.md"
 printf -- '---\nname: sample-skill\n---\nplaceholder\n' > "$RS/skills/sample-skill/SKILL.md"
 
 MF="$(mktemp -d)"

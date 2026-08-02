@@ -132,6 +132,19 @@ def _pin_session(monkeypatch, tmp_path):
     monkeypatch.setenv("SABLE_TMUX_SESSION", "s")
     monkeypatch.setenv("SABLE_MSG_STATE_DIR", str(tmp_path / "sable-msg-freshness"))
     monkeypatch.setattr(sable_msg, "recipient_identity", lambda pane, socket=None: None)
+    # Most historical tests exercise the pre-drainer contract. Keep their queue
+    # writes hermetic and their fallback loud by default; the heartbeat-specific
+    # cases below override both seams explicitly.
+    monkeypatch.setattr(sable_msg, "enqueue", lambda *args, **kwargs: "test-message")
+    monkeypatch.setattr(
+        sable_msg,
+        "drain_health",
+        lambda: type(
+            "TestDrainHealth",
+            (),
+            {"fresh": False, "reason": "test drainer not active"},
+        )(),
+    )
 
 
 def test_lookup_pane_found_and_missing():
@@ -376,6 +389,106 @@ def test_main_undelivered_bead_addressed_does_not_auto_file(monkeypatch, capsys)
                         lambda *a, **k: pytest.fail("must not auto-file for --bead"))
     rc = sable_msg.main(["market-brief-package-73t4", "hold", "--from", "optimus", "--bead"])
     assert rc != 0
+
+
+def test_main_undelivered_queues_without_fallback_only_after_fresh_drain_heartbeat(
+    monkeypatch, capsys,
+):
+    monkeypatch.setattr(
+        sable_msg, "lookup_pane",
+        lambda role, run=None, socket=None, session=None: "%2",
+    )
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: False)
+    queued = []
+    filed = []
+    monkeypatch.setattr(
+        sable_msg,
+        "enqueue",
+        lambda recipient, sender, body: queued.append((recipient, sender, body)) or "msg-1",
+    )
+    monkeypatch.setattr(
+        sable_msg,
+        "drain_health",
+        lambda: type("Health", (), {"fresh": True, "reason": "fresh"})(),
+    )
+    monkeypatch.setattr(
+        sable_msg,
+        "file_fallback_bead",
+        lambda *args, **kwargs: filed.append(args) or "SABLE-noise",
+    )
+
+    rc = sable_msg.main(["optimus", "cap in force", "--from", "lincoln"])
+
+    assert rc == 0
+    assert len(queued) == 1
+    assert filed == []
+    err = capsys.readouterr().err
+    assert "queued" in err.lower()
+    assert "msg-1" in err
+    assert "drainer heartbeat is fresh" in err
+
+
+@pytest.mark.parametrize("health_reason", ["absent", "stale by 2.0s", "invalid JSON"])
+def test_main_undelivered_queues_and_preserves_loud_fallback_until_drainer_is_observed(
+    monkeypatch, capsys, health_reason,
+):
+    monkeypatch.setattr(
+        sable_msg, "lookup_pane",
+        lambda role, run=None, socket=None, session=None: "%2",
+    )
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: False)
+    monkeypatch.setattr(sable_msg, "enqueue", lambda *a, **k: "msg-2")
+    monkeypatch.setattr(
+        sable_msg,
+        "drain_health",
+        lambda: type("Health", (), {"fresh": False, "reason": health_reason})(),
+    )
+    filed = []
+    monkeypatch.setattr(
+        sable_msg,
+        "file_fallback_bead",
+        lambda *args, **kwargs: filed.append(args) or "SABLE-fallback",
+    )
+
+    rc = sable_msg.main(["optimus", "cap in force", "--from", "lincoln"])
+
+    assert rc != 0
+    assert len(filed) == 1
+    err = capsys.readouterr().err
+    assert "QUEUED-BUT-DRAINER-UNVERIFIED" in err
+    assert health_reason in err
+    assert "SABLE-fallback" in err
+
+
+def test_main_enqueue_failure_is_loud_never_claims_queued_and_keeps_fallback(
+    monkeypatch, capsys,
+):
+    monkeypatch.setattr(
+        sable_msg, "lookup_pane",
+        lambda role, run=None, socket=None, session=None: "%2",
+    )
+    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: False)
+    monkeypatch.setattr(
+        sable_msg,
+        "enqueue",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("read-only inbox")),
+    )
+    filed = []
+    monkeypatch.setattr(
+        sable_msg,
+        "file_fallback_bead",
+        lambda *args, **kwargs: filed.append(args) or "SABLE-fallback",
+    )
+
+    rc = sable_msg.main(["optimus", "cap in force", "--from", "lincoln"])
+
+    assert rc != 0
+    assert len(filed) == 1
+    err = capsys.readouterr().err
+    assert "QUEUE-FAILED" in err
+    assert "read-only inbox" in err
+    assert "queued successfully" not in err
+    assert "SABLE-fallback" in err
 
 
 def test_file_fallback_bead_creates_for_role_inbox_bead():

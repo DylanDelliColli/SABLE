@@ -72,7 +72,8 @@ validate_source_tree() {
         templates/multi-manager/roles/lincoln.md \
         templates/multi-manager/roles/optimus.md \
         templates/multi-manager/roles/tarzan.md \
-        templates/multi-manager/roles/chuck.md
+        templates/multi-manager/roles/chuck.md \
+        templates/multi-manager/commands/inbox.md
     do
         [ -r "$REPO/$_required" ] || _missing="$_missing $_required"
     done
@@ -140,6 +141,7 @@ else
     SNIPPET_BASE='${CLAUDE_PROJECT_DIR}/.claude'
 fi
 SKILLS="$BASE/skills"
+COMMANDS_DIR="$BASE/commands"
 HOOKS_DIR="$BASE/hooks/multi-manager"
 AGENTS_DIR="$BASE/agents"
 SNIPPET="$REPO/templates/multi-manager/settings-snippet.json"
@@ -749,6 +751,95 @@ EOF
     echo "  this install only stages the artifacts (SABLE-jfg6.5 / D3, 8vlp convention)."
 }
 
+# Host-global inbox drain cadence (SABLE-albyd). Like the reconciliation timer,
+# this stages systemd/cron artifacts but never activates them. Unlike the
+# reconciliation floor it is deliberately repo-independent: the payload queue
+# and heartbeat are uid-scoped host state, and the timer enumerates registered
+# panes on an explicit tmux socket without consulting PWD or TMUX_PANE.
+validate_inbox_timer_config() {
+    INBOX_TIMER_CADENCE="${SABLE_INBOX_INTERVAL_SECONDS:-60}"
+    case "$INBOX_TIMER_CADENCE" in
+        ''|*[!0-9]*)
+            echo "sable-orchestration-install: SABLE_INBOX_INTERVAL_SECONDS must be an integer >= 60 and divisible by 60" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$INBOX_TIMER_CADENCE" -lt 60 ] \
+        || [ $((INBOX_TIMER_CADENCE % 60)) -ne 0 ]; then
+        echo "sable-orchestration-install: SABLE_INBOX_INTERVAL_SECONDS=$INBOX_TIMER_CADENCE cannot be represented by both systemd and cron; use an integer >= 60 divisible by 60" >&2
+        exit 1
+    fi
+    INBOX_TIMER_CADENCE_MIN=$((INBOX_TIMER_CADENCE / 60))
+    INBOX_TIMER_SOCKET="${SABLE_INBOX_TMUX_SOCKET:-}"
+    case "$INBOX_TIMER_SOCKET" in
+        *[!A-Za-z0-9_.-]*)
+            echo "sable-orchestration-install: SABLE_INBOX_TMUX_SOCKET must be one safe tmux socket name" >&2
+            exit 1
+            ;;
+    esac
+    INBOX_TIMER_SOCKET_ARG=""
+    if [ -n "$INBOX_TIMER_SOCKET" ]; then
+        INBOX_TIMER_SOCKET_ARG="--socket $INBOX_TIMER_SOCKET"
+    fi
+}
+
+install_inbox_timer() {
+    local dir="$BASE/sable/inbox-timer"
+    local cadence="$INBOX_TIMER_CADENCE"
+    local cadence_min="$INBOX_TIMER_CADENCE_MIN"
+    local socket="$INBOX_TIMER_SOCKET"
+    local socket_arg="$INBOX_TIMER_SOCKET_ARG"
+    mkdir -p "$dir"
+    local tmp
+    tmp="$(mktemp -d)"
+    local fallback_path="%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+    cat > "$tmp/sable-inbox-timer.service" <<EOF
+[Unit]
+Description=SABLE host-global inbox drain sweep (SABLE-albyd)
+
+[Service]
+Type=oneshot
+Environment=PATH=${fallback_path}
+ExecStart=%h/.local/bin/sable-inbox-timer --once --interval-seconds ${cadence} ${socket_arg}
+EOF
+
+    cat > "$tmp/sable-inbox-timer.timer" <<EOF
+[Unit]
+Description=Run sable-inbox-timer on a cadence (SABLE-albyd)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=${cadence}s
+Persistent=true
+Unit=sable-inbox-timer.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    cat > "$tmp/sable-inbox-timer.cron" <<EOF
+# SABLE host-global inbox drain sweep (SABLE-albyd) — cron fallback.
+# Append with: (crontab -l 2>/dev/null; cat this-file) | crontab -
+*/${cadence_min} * * * * PATH="\$HOME/.local/bin:\$PATH" sable-inbox-timer --once --interval-seconds ${cadence} ${socket_arg} >> "\$HOME/.cache/sable/inbox-timer.log" 2>&1
+EOF
+
+    install_file "$tmp/sable-inbox-timer.service" "$dir/sable-inbox-timer.service" "sable/inbox-timer/sable-inbox-timer.service"
+    install_file "$tmp/sable-inbox-timer.timer" "$dir/sable-inbox-timer.timer" "sable/inbox-timer/sable-inbox-timer.timer"
+    install_file "$tmp/sable-inbox-timer.cron" "$dir/sable-inbox-timer.cron" "sable/inbox-timer/sable-inbox-timer.cron"
+    rm -rf "$tmp"
+
+    echo "Inbox drain timer (host-level, repo-independent) — staged, NOT activated:"
+    echo "  Cadence: ${cadence}s; heartbeat freshness: $((cadence * 2))s (2x cadence)"
+    echo "  Tmux socket: ${socket:-default}"
+    echo "  To activate — ONE command, which installs AND verifies:"
+    echo "    sable-inbox-timer --install-schedule --units-dir $dir ${socket_arg}"
+    echo "  Re-check any time:"
+    echo "    sable-inbox-timer --check-schedule ${socket_arg}"
+    echo "  Until a live sweep publishes a fresh heartbeat, sable-msg deliberately"
+    echo "  keeps the existing loud fallback; staged files alone change no behavior."
+}
+
 # Resolve the SABLE skill names the repo ships (by frontmatter 'name:').
 skill_names() {
     for skdir in "$REPO"/skills/*/; do
@@ -781,7 +872,9 @@ $ALL_HOOK_SIBLING_LIBS
 EOF
     # agents-teams/ is no longer installed; the rm below cleans up installs
     # that predate the tmux-only layer.
-    rm -rf "$HOOKS_DIR" "$BASE/agents-teams" "$BASE/sable/reconcile-timer"
+    rm -rf "$HOOKS_DIR" "$BASE/agents-teams" "$BASE/sable/reconcile-timer" \
+           "$BASE/sable/inbox-timer"
+    rm -f "$COMMANDS_DIR/inbox.md"
     remove_layer_hooks "$SETTINGS"
     if [ -n "$CODEX_HOOKS" ]; then
         remove_layer_hooks "$CODEX_HOOKS"
@@ -794,12 +887,13 @@ EOF
 fi
 
 # --- Install the complete layer ---
-# Validate both live configuration targets before mkdir/copy/cleanup mutates
-# the scope.  A bad Claude settings file must not leave a half-installed
-# layer, and a bad Codex hooks file must not fail after Claude was activated.
+# Validate every operator-controlled timer value and both live configuration
+# targets before mkdir/copy/cleanup mutates the scope. A bad cadence/socket or
+# settings target must not leave a half-installed layer.
+validate_inbox_timer_config
 preflight_settings_targets "$SETTINGS" "$CODEX_HOOKS"
 
-mkdir -p "$HOOKS_DIR" "$BASE/sable/roles" "$SKILLS"
+mkdir -p "$HOOKS_DIR" "$BASE/sable/roles" "$SKILLS" "$COMMANDS_DIR"
 
 cleanup_retired_artifacts
 
@@ -896,6 +990,11 @@ for _role in lincoln optimus tarzan chuck; do
 done
 rm -f "$BASE/sable/roles/cockpit.md"
 
+# The count-only poke tells the recipient to run /inbox; shipping the watcher
+# without the command left the final consumer absent (SABLE-albyd).
+install_file "$REPO/templates/multi-manager/commands/inbox.md" \
+    "$COMMANDS_DIR/inbox.md" "commands/inbox.md"
+
 # SABLE skills, installed by frontmatter 'name:' (repo dir may differ).
 for skdir in "$REPO"/skills/*/; do
     [ -f "${skdir}SKILL.md" ] || continue
@@ -937,6 +1036,7 @@ fi
 
 # Stage the host timer entrypoint's systemd/cron artifacts (never activates them).
 install_reconcile_timer
+install_inbox_timer
 
 echo "Orchestration layer installed to $BASE (scope: $SCOPE)."
 if [ -n "$CODEX_HOOKS" ]; then
@@ -946,7 +1046,7 @@ if [ -n "$CODEX_HOOKS" ]; then
         echo "Codex lifecycle hook changes were printed but not applied."
     fi
 fi
-echo "  • All multi-manager hooks + agents.yaml + SABLE skills + the four pane roles installed."
+echo "  • All multi-manager hooks + agents.yaml + SABLE skills + /inbox + the four pane roles installed."
 if [ "$MERGE_SETTINGS" = "1" ]; then
     echo "  • Settings snippet applied to $SETTINGS (existing entries kept)."
 else

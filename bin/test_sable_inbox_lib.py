@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Unit contract for the file-backed SABLE payload inbox (SABLE-m4kyf.3)."""
+import json
 import os
 import sys
 
@@ -87,3 +88,92 @@ def test_pending_has_three_distinct_observable_states(store):
 
     inbox.ack("victor", msg_id)
     assert inbox.pending("victor") == []
+
+
+def test_drain_heartbeat_is_host_global_atomic_and_fresh_for_two_cadences(store):
+    heartbeat = inbox.record_drain_heartbeat(
+        observed_at=100.0,
+        interval_seconds=30.0,
+    )
+
+    assert heartbeat == store / ".drain-heartbeat.json"
+    assert json.loads(heartbeat.read_text()) == {
+        "schema": 1,
+        "observed_at": 100.0,
+        "interval_seconds": 30.0,
+    }
+    assert list(store.glob(".drain-heartbeat.*.tmp")) == []
+
+    fresh = inbox.drain_health(now=159.9)
+    stale = inbox.drain_health(now=160.1)
+    assert fresh.fresh is True
+    assert fresh.age_seconds == pytest.approx(59.9)
+    assert stale.fresh is False
+    assert stale.age_seconds == pytest.approx(60.1)
+    assert "stale" in stale.reason
+
+
+def test_drain_health_fails_closed_for_absent_corrupt_future_and_bad_ttl(store):
+    path = store / ".drain-heartbeat.json"
+
+    absent = inbox.drain_health(now=100.0)
+    assert absent.fresh is False and "absent" in absent.reason
+
+    store.mkdir(parents=True)
+    path.write_text("not json")
+    corrupt = inbox.drain_health(now=100.0)
+    assert corrupt.fresh is False and "invalid" in corrupt.reason
+
+    path.write_text(json.dumps({
+        "schema": 1,
+        "observed_at": 101.0,
+        "interval_seconds": 30.0,
+    }))
+    future = inbox.drain_health(now=100.0)
+    assert future.fresh is False and "future" in future.reason
+
+    path.write_text(json.dumps({
+        "schema": 1,
+        "observed_at": 90.0,
+        "interval_seconds": True,
+    }))
+    invalid_ttl = inbox.drain_health(now=100.0)
+    assert invalid_ttl.fresh is False and "invalid" in invalid_ttl.reason
+
+
+def test_inbox_root_override_is_test_only(monkeypatch, tmp_path):
+    alternate = tmp_path / "isolated-inbox"
+    monkeypatch.setenv("SABLE_TEST_INBOX_ROOT", str(alternate))
+    monkeypatch.delenv("SABLE_TEST", raising=False)
+    assert inbox._inbox_root() != alternate
+
+    monkeypatch.setenv("SABLE_TEST", "1")
+    assert inbox._inbox_root() == alternate
+
+
+def test_pending_recipients_ignores_only_control_state_and_rejects_junk(store):
+    inbox.record_drain_heartbeat(observed_at=100.0, interval_seconds=30.0)
+    inbox.enqueue("optimus", "lincoln", "one")
+    empty_id = inbox.enqueue("tarzan", "lincoln", "two")
+    inbox.ack("tarzan", empty_id)
+
+    assert inbox.pending_recipients() == ["optimus"]
+
+    (store / "stray.txt").write_text("not a recipient")
+    with pytest.raises(inbox.InboxCorruptError, match="stray.txt"):
+        inbox.pending_recipients()
+
+    (store / "stray.txt").unlink()
+    (store / ".hidden-junk").write_text("must not disappear from the census")
+    with pytest.raises(inbox.InboxCorruptError, match="hidden-junk"):
+        inbox.pending_recipients()
+
+
+def test_pending_recipients_never_follows_a_recipient_symlink(store, tmp_path):
+    store.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (store / "optimus").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(inbox.InboxCorruptError, match="optimus"):
+        inbox.pending_recipients()

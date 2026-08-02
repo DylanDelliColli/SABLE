@@ -44,9 +44,13 @@ ORCH_INSTALLER = REPO / "bin" / "sable-orchestration-install"
 BIN_INSTALLER = REPO / "bin" / "sable-bin-install"
 SNIPPET = REPO / "templates" / "multi-manager" / "settings-snippet.json"
 AGENTS_YAML = REPO / "templates" / "multi-manager" / "agents.yaml"
+INBOX_COMMAND = REPO / "templates" / "multi-manager" / "commands" / "inbox.md"
 
 pytestmark = pytest.mark.skipif(
-    not all(Path(p).exists() for p in (ORCH_INSTALLER, BIN_INSTALLER, SNIPPET)),
+    not all(
+        Path(p).exists()
+        for p in (ORCH_INSTALLER, BIN_INSTALLER, SNIPPET, INBOX_COMMAND)
+    ),
     reason="real installers/templates absent from this checkout",
 )
 
@@ -84,6 +88,7 @@ def fleet(tmp_path):
     (repo / "hooks" / "multi-manager").mkdir(parents=True)
     (repo / "bin").mkdir(parents=True)
     (repo / "templates" / "multi-manager" / "roles").mkdir(parents=True)
+    (repo / "templates" / "multi-manager" / "commands").mkdir()
 
     # Source validation in the real installer rejects a settings snippet whose
     # registered hooks are absent: such a tree would wire silent instruments,
@@ -121,6 +126,9 @@ def fleet(tmp_path):
         SNIPPET.read_bytes())
     (repo / "templates" / "multi-manager" / "agents.yaml").write_bytes(
         AGENTS_YAML.read_bytes() if AGENTS_YAML.exists() else b"agents: {}\n")
+    (repo / "templates" / "multi-manager" / "commands" / "inbox.md").write_bytes(
+        INBOX_COMMAND.read_bytes()
+    )
 
     git(repo, "init", "-q")
     git(repo, "add", "-A")
