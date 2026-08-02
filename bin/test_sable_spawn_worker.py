@@ -493,6 +493,55 @@ def test_bead_claimed_files_reads_file_footprint_section():
     assert ssw.bead_claimed_files(bead) == {"hooks/foo.sh", "bin/sable-spawn-worker"}
 
 
+def test_spawn_worker_footprint_parser_is_the_shared_public_seam():
+    assert ssw.parse_footprint_section is ssw.fp_lib.parse_footprint_section
+
+
+def test_footprint_section_filters_prose_but_keeps_extensionless_cli():
+    prose = ssw.read_footprint_section(
+        "Story.\n\n## File footprint\n"
+        "GitHub repo settings and ordinary prose\n\n## Acceptance\nDone")
+    assert prose.files == frozenset()
+    assert prose.could_not_assess is True
+    assert "GitHub" not in prose.files
+    assert any("GitHub" in source for source in prose.unreadable_sources)
+
+    cli = ssw.read_footprint_section(
+        "Story.\n\n## File footprint\nbin/sable-spawn-worker\n\n"
+        "## Acceptance\nDone")
+    assert cli.files == frozenset({"bin/sable-spawn-worker"})
+    assert cli.unreadable_sources == ()
+    assert cli.could_not_assess is False
+
+
+def test_footprint_section_reads_every_newline_and_repeated_section_path():
+    read = ssw.read_footprint_section(
+        "## File footprint\n"
+        "bin/a.py\n"
+        "- bin/b.py\n"
+        "bin/sable-tool\n\n"
+        "## File footprint\n"
+        "docs/c.md\n")
+    assert read.files == frozenset(
+        {"bin/a.py", "bin/b.py", "bin/sable-tool", "docs/c.md"})
+    assert read.could_not_assess is False
+
+
+def test_partial_footprint_parse_is_unreadable_even_when_one_path_survives():
+    read = ssw.read_footprint_section(
+        "## File footprint\nbin/a.py, Makefile\n")
+    assert read.files == frozenset({"bin/a.py"})
+    assert read.could_not_assess is True
+    assert any("Makefile" in source for source in read.unreadable_sources)
+
+    verdict = ssw.overlap_check(
+        "X-1",
+        {"id": "X-1", "description": "## File footprint\nbin/a.py, Makefile\n"},
+        [{"id": "Y-1", "metadata": {"wip_claims": "other.py"}}],
+    )
+    assert verdict.decision == "could-not-assess"
+
+
 # --- SABLE-47try: could-not-assess vs declares-nothing -----------------------
 # The old `if not my_files: return OverlapVerdict("none")` collapsed two facts
 # into the releasing verdict. These assert the distinction now exists at the

@@ -682,6 +682,32 @@ def test_the_library_lands_where_the_installed_hook_resolves_it(installed_scope)
     assert resolved.read_bytes() == (REPO / "bin" / LIB_NAME).read_bytes()
 
 
+@pytest.mark.parametrize(
+    "hook_name",
+    ["pre-dispatch-claim.sh", "pre-dispatch-overlap.sh"],
+)
+def test_installed_dispatch_hooks_resolve_the_shared_footprint_parser(
+    installed_scope, hook_name,
+):
+    """Pin the installed-layout side of the shared-parser consolidation.
+
+    Driving the repository hooks proves their behavior but not their installed
+    dependency closure: from BASE/hooks/multi-manager, the hooks' literal
+    ``../../bin`` lookup must land on an installed byte-identical library.
+    Checking both consumers also proves neither retained a repository-only
+    resolution seam while appearing wired in settings.
+    """
+    hook = installed_scope / "hooks" / "multi-manager" / hook_name
+    assert hook.is_file(), f"dispatch hook was not installed at {hook}"
+    assert 'FP_LIB="$HOOK_DIR/../../bin/sable_footprint_lib.py"' in hook.read_text()
+
+    resolved = Path(os.path.normpath(
+        hook.parent / ".." / ".." / "bin" / "sable_footprint_lib.py"
+    ))
+    assert resolved.is_file(), f"dependency closure incomplete: {resolved} absent"
+    assert resolved.read_bytes() == (REPO / "bin" / resolved.name).read_bytes()
+
+
 def test_removing_the_installed_library_reproduces_the_wired_but_inert_state(installed_scope):
     """Plant-and-fail, kept permanently.
 

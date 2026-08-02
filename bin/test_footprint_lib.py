@@ -259,6 +259,112 @@ def test_parse_declared_footprint_is_empty_without_a_section():
     assert fp.parse_declared_footprint("no footprint here at all") == frozenset()
 
 
+# SABLE-rzrak / SABLE-mh967: the dispatch-time consumers need more than the
+# optimistic-promotion projection above.  They must retain whether the heading
+# existed and which tokens were rejected, because either fact can turn an
+# apparently-empty/partial set into a fail-closed dispatch verdict.
+def test_public_footprint_section_result_preserves_found_entries_and_dropped():
+    absent = fp.parse_footprint_section("ordinary prose only")
+    assert absent.found is False
+    assert absent.entries == frozenset()
+    assert absent.dropped == frozenset()
+
+    extensionless = fp.parse_footprint_section(
+        "## File footprint\nbin/sable-msg\n\n## Acceptance\nDone")
+    assert extensionless.found is True
+    assert extensionless.entries == frozenset({"bin/sable-msg"})
+    assert extensionless.dropped == frozenset()
+
+    prose = fp.parse_footprint_section(
+        "## File footprint\nGitHub repo settings and ordinary prose\n\n"
+        "## Acceptance\nDone")
+    assert prose.found is True
+    assert prose.entries == frozenset()
+    assert {"GitHub", "repo", "settings", "ordinary", "prose"} <= prose.dropped
+
+
+def test_public_footprint_section_unions_newline_bullets_and_repeated_sections():
+    result = fp.parse_footprint_section(
+        "## File footprint\n"
+        "bin/a.py\n"
+        "- bin/b.py\n"
+        "bin/sable-tool\n\n"
+        "## File footprint\n"
+        "docs/c.md\n")
+    assert result.found is True
+    assert result.entries == frozenset(
+        {"bin/a.py", "bin/b.py", "bin/sable-tool", "docs/c.md"})
+    assert result.dropped == frozenset()
+
+
+def test_public_footprint_section_matches_two_historical_corrupted_records():
+    # Exact SABLE-awmj4 section bytes: the old writer stored the parenthetical's
+    # first word as a phantom `if` claim.
+    awmj4 = fp.parse_footprint_section(
+        "## File footprint\n"
+        "hooks/test/test-impact-tier-serialization.sh "
+        "(and whatever window-log emitter it reads, if the fix needs a sequence field).")
+    assert awmj4.entries == frozenset(
+        {"hooks/test/test-impact-tier-serialization.sh"})
+    assert "if" not in awmj4.entries
+    assert awmj4.dropped == frozenset()
+
+    # Exact SABLE-rrn6r section bytes: the old writer stored only `GitHub`,
+    # suppressing both real path-shaped candidates and presenting prose as a
+    # successful claim.  The shared result retains both accepted and rejected
+    # evidence so dispatch consumers can refuse the partial declaration.
+    rrn6r = fp.parse_footprint_section(
+        "## File footprint\n"
+        "GitHub repo settings (rulesets) OR "
+        "hooks/multi-manager/pre-push-rebase-test.sh (leg 2); docs update in "
+        "MULTI-MANAGER-PATTERN.md merge-path section")
+    assert rrn6r.entries == frozenset({
+        "hooks/multi-manager/pre-push-rebase-test.sh",
+        "MULTI-MANAGER-PATTERN.md",
+    })
+    assert "GitHub" in rrn6r.dropped
+
+
+def test_dispatch_record_cli_preserves_the_three_states_and_scavenge_fallback():
+    cases = (
+        ({"description": "legacy prose names hooks/legacy.py", "metadata": {}},
+         {"c0", "fhooks/legacy.py"}),
+        ({"description": "## File footprint\n\n## Acceptance\nDone", "metadata": {}},
+         {"c0", "u'## File footprint' section"}),
+        ({"description": "## File footprint\nbin/sable-msg", "metadata": {}},
+         {"c0", "fbin/sable-msg"}),
+    )
+    for record, expected in cases:
+        cp = subprocess.run(
+            [sys.executable, str(Path(fp.__file__)),
+             "--read-dispatch-record", "--scavenge"],
+            input=json.dumps([record]), text=True, capture_output=True)
+        assert cp.returncode == 0, cp.stderr
+        assert set(cp.stdout.splitlines()) == expected
+
+
+def test_dispatch_record_cli_reports_partial_drops_and_rejects_bad_input():
+    record = [{
+        "description": "## File footprint\nbin/a.py, Makefile",
+        "metadata": {"wip_claims": ""},
+    }]
+    cp = subprocess.run(
+        [sys.executable, str(Path(fp.__file__)),
+         "--read-dispatch-record", "--scavenge"],
+        input=json.dumps(record), text=True, capture_output=True)
+    assert cp.returncode == 0, cp.stderr
+    assert "fbin/a.py" in cp.stdout.splitlines()
+    assert any(line.startswith("u") and "Makefile" in line
+               for line in cp.stdout.splitlines())
+
+    bad = subprocess.run(
+        [sys.executable, str(Path(fp.__file__)),
+         "--read-dispatch-record", "--scavenge"],
+        input="not-json", text=True, capture_output=True)
+    assert bad.returncode != 0
+    assert "record" in bad.stderr.lower() or "json" in bad.stderr.lower()
+
+
 # --------------------------------------------------------------------------
 # 5. Fail-closed: a non-answer is never an empty (vacuously disjoint) footprint
 # --------------------------------------------------------------------------

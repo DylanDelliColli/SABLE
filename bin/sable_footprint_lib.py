@@ -73,8 +73,10 @@ re-preview. An empty footprint means "git said nothing changed"; it never means
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
+import sys
 from dataclasses import dataclass
 
 import sable_gate_git_lib as git_lib
@@ -264,6 +266,22 @@ _CODE_SUFFIXES = (".py", ".sh", ".yml", ".yaml", ".json", ".md", ".ts", ".js", "
 _EMPTY_SECTION_MARKERS = frozenset({"none"})
 
 
+@dataclass(frozen=True)
+class FootprintSectionParse:
+    """Lossless evidence from one kind of declared-footprint section.
+
+    `entries` is the accepted path-shaped set.  `dropped` is equally
+    load-bearing at DISPATCH time: a partial parse can be narrower than the
+    author intended, so callers without a mechanical diff fallback must refuse
+    it rather than treating the accepted subset as complete.  `found` keeps an
+    absent heading distinct from a present empty/unreadable declaration.
+    """
+
+    found: bool
+    entries: frozenset[str]
+    dropped: frozenset[str]
+
+
 def _collect_section(description: str, heading: re.Pattern[str]
                      ) -> tuple[bool, frozenset[str], frozenset[str]]:
     """Shared prose-section extractor for the bead-description sub-sections
@@ -276,52 +294,90 @@ def _collect_section(description: str, heading: re.Pattern[str]
     write side, but `parse_declared_reads`'s caller very much does, because
     reads have no such fallback.
 
-    Parsing is deliberately lossy in the WIDENING direction only: parenthetical
-    asides are dropped (they are commentary), tokens are split on commas and
-    whitespace, and a token is kept in `entries` if it looks like a path
-    (contains '/' or ends in a known code suffix). A prose fragment that
-    survives as a bogus entry can only ADD to the set; a real path that is
-    missed leaves whatever fallback the caller has governing. Neither
-    direction can narrow `entries` itself.
+    Parenthetical asides are commentary. Commas/newlines delimit declaration
+    entries; all path-shaped tokens are retained, a short annotation after a
+    path is ignored, and tokens before the first path (or in a fragment with no
+    path) are reported in `dropped`. That last set is what lets dispatch-time
+    callers reject an incomplete parse rather than silently narrowing it.
 
     `dropped` is the SABLE-zx2yv completeness signal: every non-empty token
-    that was NOT kept in `entries` AND is not a recognised "this section is
-    declared, and empty" marker (`_EMPTY_SECTION_MARKERS`, e.g. a lone
-    'none' line) — a bare filename like 'Makefile', a directory name with no
-    trailing slash, an extensionless script. It is empty precisely when
-    every token in the section was either recognised as a path or was the
-    deliberate empty-section spelling. A caller with no mechanical fallback
-    for narrowing (declared_reads) must treat a non-empty `dropped` as "this
-    declaration could not be fully understood", not as "declared, and
-    complete" — the write side ignores it, because the mechanical footprint
-    already covers whatever a dropped write token would have named."""
-    lines = description.splitlines()
-    body: list[str] = []
-    collecting = False
-    found = False
-    for line in lines:
-        if heading.match(line.strip()):
-            collecting = True
-            found = True
+    that was not part of a recognised path/annotation form and is not a
+    recognised "declared empty" marker (`_EMPTY_SECTION_MARKERS`, e.g. a lone
+    'none' line) — notably a bare filename like 'Makefile'. A caller with no
+    mechanical fallback for narrowing must treat non-empty `dropped` as "this
+    declaration could not be fully understood", never as complete. Optimistic
+    promotion's write side may ignore it only because a mechanical diff is
+    always unioned behind it."""
+    # Every matching section contributes.  Appended corrections are common in
+    # long-lived bead descriptions; stopping at the first heading made later
+    # corrections dead text (SABLE-9dmuu).  Another heading ends only the
+    # current body, not the search for a later matching section.
+    bodies: list[list[str]] = []
+    body: list[str] | None = None
+    for line in description.splitlines():
+        stripped = line.strip()
+        if heading.match(stripped):
+            if body is not None:
+                bodies.append(body)
+            body = []
             continue
-        if collecting:
-            if line.strip().startswith("#"):
-                break
-            body.append(line)
-    if not found:
+        if body is not None:
+            if stripped.startswith("#"):
+                bodies.append(body)
+                body = None
+            else:
+                body.append(line)
+    if body is not None:
+        bodies.append(body)
+    if not bodies:
         return False, frozenset(), frozenset()
-    text = _PARENTHETICAL.sub(" ", "\n".join(body))
+
     entries: set[str] = set()
     dropped: set[str] = set()
-    for raw in re.split(r"[,\s]+", text):
-        tok = raw.strip().strip("`*-—;:").rstrip(".")
-        if not tok:
-            continue
-        if "/" in tok or tok.endswith(_CODE_SUFFIXES):
-            entries.add(tok)
-        elif tok.lower() not in _EMPTY_SECTION_MARKERS:
-            dropped.add(tok)
+    for section in bodies:
+        text = _PARENTHETICAL.sub(" ", "\n".join(section))
+        # Commas and newlines are declaration boundaries. Within one fragment,
+        # a path may carry a short trailing annotation (`hooks/a.sh
+        # implementation`); those words are commentary, matching the
+        # pre-consolidation accepted authoring form. Words BEFORE the first
+        # path remain `dropped`: `Likely hooks/a.sh` is an uncertain/partial
+        # declaration and cannot be laundered into a complete one. A fragment
+        # with NO path-shaped token (notably bare `Makefile`) is wholly dropped.
+        for line in text.splitlines():
+            for fragment in line.split(","):
+                tokens = [
+                    raw.strip().strip("`*-—;:").rstrip(".")
+                    for raw in fragment.split()
+                ]
+                tokens = [tok for tok in tokens if tok]
+                path_positions = [
+                    index for index, tok in enumerate(tokens)
+                    if "/" in tok or tok.endswith(_CODE_SUFFIXES)
+                ]
+                if path_positions:
+                    entries.update(tokens[index] for index in path_positions)
+                    for tok in tokens[:path_positions[0]]:
+                        if tok.lower() not in _EMPTY_SECTION_MARKERS:
+                            dropped.add(tok)
+                else:
+                    dropped.update(
+                        tok for tok in tokens
+                        if tok.lower() not in _EMPTY_SECTION_MARKERS)
     return True, frozenset(entries), frozenset(dropped)
+
+
+def parse_footprint_section(description: str) -> FootprintSectionParse:
+    """Public, lossless `## File footprint` parser shared by every dispatch
+    consumer (SABLE-rzrak/SABLE-mh967).
+
+    Do not replace this with a bare set projection in a dispatch gate: doing so
+    collapses absent, unreadable, and partially-readable declarations into the
+    same permissive shape.  Optimistic promotion's mechanical-diff-backed
+    projection remains `parse_declared_footprint` below.
+    """
+
+    found, entries, dropped = _collect_section(description, _FOOTPRINT_HEADING)
+    return FootprintSectionParse(found, entries, dropped)
 
 
 def parse_declared_footprint(description: str) -> frozenset[str]:
@@ -333,8 +389,7 @@ def parse_declared_footprint(description: str) -> frozenset[str]:
     write side's guarantee never depended on the prose parser catching every
     token, only on the mechanical footprint being unioned in afterward — see
     declared_footprint()."""
-    _, entries, _ = _collect_section(description, _FOOTPRINT_HEADING)
-    return entries
+    return parse_footprint_section(description).entries
 
 
 def parse_declared_reads(description: str) -> tuple[bool, frozenset[str]]:
@@ -624,3 +679,108 @@ def assess(repo: str, bead: str, base_sha: str, branch_sha: str,
         branch=branch_fp,
         base_move=base_fp,
     )
+
+
+# --------------------------------------------------------------------------
+# Dispatch-record CLI — shell hooks consume the same parser as Python callers
+# --------------------------------------------------------------------------
+
+_SCAVENGE_FILE_RE = re.compile(
+    r"(?:^|[\s\(\[\"'])("
+    r"(?:[\w\-./]+/)?[\w\-./]+\."
+    r"(?:ts|tsx|js|jsx|py|rs|go|java|rb|md|yaml|yml|toml|json|sh|sql|css|scss|html)"
+    r")(?=[\s\)\]\"',:;]|$)",
+    re.MULTILINE,
+)
+
+
+def scavenge_file_tokens(text: str) -> frozenset[str]:
+    """Pre-convention fallback for descriptions with NO footprint heading.
+
+    It is intentionally not used once an author supplied a declaration: a
+    malformed declaration must be repaired, not laundered by unrelated prose.
+    """
+
+    return frozenset(match.group(1) for match in _SCAVENGE_FILE_RE.finditer(text))
+
+
+def dispatch_record_lines(record: dict, *, scavenge: bool = False) -> tuple[str, ...]:
+    """Render one bead record as the established `c`/`f`/`u` line protocol.
+
+    `c0|c1` is the current wip-claim presence bit used by the claim writer,
+    `f<path>` is accepted evidence, and `u<reason>` is a declaration that was
+    present but could not be read completely.  A dispatch consumer must refuse
+    when ANY `u` line exists, even if some `f` lines were salvaged.
+    """
+
+    if not isinstance(record, dict):
+        raise ValueError("dispatch record is not an object")
+    description = record.get("description", "") or ""
+    if not isinstance(description, str):
+        raise ValueError("dispatch record description is not a string")
+    metadata = record.get("metadata", {}) or {}
+    if not isinstance(metadata, dict):
+        raise ValueError("dispatch record metadata is not an object")
+
+    raw_claims = metadata.get("wip_claims", "") or ""
+    if not isinstance(raw_claims, str):
+        raise ValueError("dispatch record wip_claims is not a string")
+    current_claims = raw_claims.rstrip("\n")
+    files = {part.strip() for part in current_claims.split(",") if part.strip()}
+    unreadable: list[str] = []
+    if current_claims.strip() and not files:
+        unreadable.append("wip_claims metadata")
+
+    section = parse_footprint_section(description)
+    if section.found:
+        files.update(section.entries)
+        if section.dropped:
+            unreadable.append(
+                "'## File footprint' section rejected token(s): "
+                + ", ".join(sorted(section.dropped)))
+        elif not section.entries:
+            unreadable.append("'## File footprint' section")
+    elif scavenge:
+        files.update(scavenge_file_tokens(description))
+
+    lines = ["c1" if current_claims else "c0"]
+    lines.extend("f" + path for path in sorted(files))
+    lines.extend("u" + reason for reason in unreadable)
+    return tuple(lines)
+
+
+def _dispatch_record_from_stdin() -> dict:
+    try:
+        data = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid dispatch record JSON: {exc}") from exc
+    if isinstance(data, list):
+        if len(data) != 1:
+            raise ValueError("dispatch record JSON must contain exactly one record")
+        data = data[0]
+    if not isinstance(data, dict):
+        raise ValueError("dispatch record JSON is not an object")
+    return data
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="SABLE footprint evidence parser")
+    parser.add_argument("--read-dispatch-record", action="store_true",
+                        help="read one bd-show JSON record and emit c/f/u evidence")
+    parser.add_argument("--scavenge", action="store_true",
+                        help="use the legacy file-token fallback only when no heading exists")
+    args = parser.parse_args(argv)
+    if not args.read_dispatch_record:
+        parser.error("--read-dispatch-record is required")
+    try:
+        lines = dispatch_record_lines(
+            _dispatch_record_from_stdin(), scavenge=args.scavenge)
+    except ValueError as exc:
+        print(f"footprint dispatch record error: {exc}", file=sys.stderr)
+        return 2
+    print("\n".join(lines))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

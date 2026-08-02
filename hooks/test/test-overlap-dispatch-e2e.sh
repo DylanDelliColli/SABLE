@@ -187,7 +187,7 @@ for bead_id in sys.argv[1:3]:
 # --- atomic overlap + hermeticity fixture seed -----------------------------
 if ! bd import - --sandbox >/dev/null 2>&1 <<JSONL
 {"id":"$BEAD_A","title":"[int-test] jd5fj.6 overlap-e2e bead A / hermeticity probe","description":"Scratch bead A for the SABLE-jd5fj.6 overlap-constraint e2e test.","issue_type":"task","status":"in_progress","assignee":"optimus","metadata":{"wip_claims":"$SHARED_FILE"}}
-{"id":"$BEAD_B","title":"[int-test] jd5fj.6 overlap-e2e bead B","description":"Scratch bead B for the SABLE-jd5fj.6 overlap-constraint e2e test.\n\n## File footprint\n$SHARED_FILE","issue_type":"task","status":"open"}
+{"id":"$BEAD_B","title":"[int-test] jd5fj.6 overlap-e2e bead B","description":"Scratch bead B for the SABLE-jd5fj.6 overlap-constraint e2e test.\n\n## File footprint\nbin/a.py\nbin/b.py\nbin/sable-tool\n$SHARED_FILE","issue_type":"task","status":"open"}
 JSONL
 then
   echo "SKIP (integration): could not import scratch overlap beads"
@@ -198,6 +198,9 @@ echo "Integration: created scratch bead A = $BEAD_A"
 echo "Integration: created scratch bead B = $BEAD_B"
 
 # --- Case 1: dispatch B, no Serialize-with -> DENIED -----------------------
+# The shared collision is deliberately FOURTH in a newline-authored section.
+# The old writer/shell tokenizer kept only bin/a.py, so this real-bd case is the
+# unsafe narrowing reproduction rather than another conventional comma-list.
 OUT=$(run_hook "Work $BEAD_B")
 if printf '%s' "$OUT" | grep -q '"permissionDecision": "deny"' && printf '%s' "$OUT" | grep -q "$BEAD_A" \
    && printf '%s' "$OUT" | grep -q "$SHARED_FILE"; then
