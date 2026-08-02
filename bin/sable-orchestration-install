@@ -219,11 +219,12 @@ RETIRED_AGENT_DEFS="optimus.md tarzan.md chuck.md"
 # from the proposal, never directly from the live file.
 render_settings_proposal() {
     SETTINGS_PATH="$1" BASE_DIR="$2" SKIP_MARKERS="${3:-}" \
-    RETIRED_MARKERS="$4" OUTPUT_PATH="$5"
-    shift 5
+    RETIRED_MARKERS="$4" OUTPUT_PATH="$5" SETTINGS_PROVIDER="$6"
+    shift 6
     SETTINGS_PATH="$SETTINGS_PATH" BASE_DIR="$BASE_DIR" \
     SKIP_MARKERS="$SKIP_MARKERS" RETIRED_MARKERS="$RETIRED_MARKERS" \
-    OUTPUT_PATH="$OUTPUT_PATH" python3 - "$@" <<'PY'
+    OUTPUT_PATH="$OUTPUT_PATH" SETTINGS_PROVIDER="$SETTINGS_PROVIDER" \
+    python3 - "$@" <<'PY'
 import copy
 import json
 import os
@@ -241,11 +242,45 @@ else:
     before = {}
 data = copy.deepcopy(before)
 base = os.environ["BASE_DIR"]
+provider = os.environ["SETTINGS_PROVIDER"]
 excluded = set(os.environ.get("SKIP_MARKERS", "").split())
 excluded.update(os.environ.get("RETIRED_MARKERS", "").split())
+BD_PRIME = "bd prime"
+CODEX_BD_PRIME = "bd prime --hook-json"
+
+
+def canonical_bd_prime(command):
+    return (command or "").strip() in {BD_PRIME, CODEX_BD_PRIME}
+
+
+def snippet_has_native_bd_prime():
+    for snippet in snippets:
+        for event, blocks in snippet.get("hooks", {}).items():
+            if event != "SessionStart" or not isinstance(blocks, list):
+                continue
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                if any(
+                    isinstance(hook, dict)
+                    and (hook.get("command", "") or "").strip() == BD_PRIME
+                    for hook in block.get("hooks", [])
+                ):
+                    return True
+    return False
+
+
+# Only a full canonical-base composition owns this migration.  A partial
+# orchestration source must not rewrite base-layer rows it cannot reproduce.
+adapt_codex_bd_prime = provider == "codex" and snippet_has_native_bd_prime()
 
 
 def marker(command):
+    # The native and Codex-envelope forms are two provider renderings of one
+    # logical row.  Giving them one identity upgrades an installed `bd prime`
+    # in place instead of appending a second SessionStart hook.
+    if canonical_bd_prime(command):
+        return BD_PRIME
     return (command or "").rsplit("/", 1)[-1]
 
 
@@ -271,8 +306,13 @@ hooks = data.setdefault("hooks", {})
 if not isinstance(hooks, dict):
     hooks = data["hooks"] = {}
 
-# Retire/refuse rows in the proposal only.
-for blocks in hooks.values():
+# Retire/refuse rows in the proposal only.  Codex PreCompact cannot consume
+# additionalContext, and its JSON-looking-output sniffer rejects bd's native
+# `[bd prime]` markdown.  Codex immediately dispatches SessionStart with
+# source=compact after compaction, so the canonical PreCompact row is both
+# broken and redundant there.  Provider-specific adaptation belongs here,
+# never in the shared Claude snippet.
+for event, blocks in hooks.items():
     if not isinstance(blocks, list):
         continue
     for block in blocks:
@@ -281,6 +321,12 @@ for blocks in hooks.values():
                 hook for hook in block["hooks"]
                 if not (isinstance(hook, dict)
                         and marker(hook.get("command", "")) in excluded)
+                and not (
+                    adapt_codex_bd_prime
+                    and event == "PreCompact"
+                    and isinstance(hook, dict)
+                    and canonical_bd_prime(hook.get("command", ""))
+                )
             ]
 
 # Add or refresh the rows this version ships. Multiple snippets are composed
@@ -308,11 +354,27 @@ for snippet in snippets:
             for hook in block.get("hooks", []):
                 if not isinstance(hook, dict):
                     continue
+                if (
+                    adapt_codex_bd_prime
+                    and event == "PreCompact"
+                    and canonical_bd_prime(hook.get("command", ""))
+                ):
+                    continue
                 desired = {
                     **hook,
                     "command": (hook.get("command", "") or "").replace(
                         "~/.claude", base),
                 }
+                if (
+                    adapt_codex_bd_prime
+                    and event == "SessionStart"
+                    and desired["command"].strip() == BD_PRIME
+                ):
+                    # bd owns the envelope and preserves its `[bd prime]`
+                    # readiness marker inside additionalContext.  Codex can
+                    # therefore validate and spill the large context without
+                    # mistaking the leading `[` for malformed hook JSON.
+                    desired["command"] = CODEX_BD_PRIME
                 name = marker(desired["command"])
                 if name in excluded:
                     continue
@@ -358,7 +420,8 @@ apply_settings_proposal() {
     _settings_base="$2"
     _settings_label="$3"
     _settings_skip="${4:-}"
-    shift 4
+    _settings_provider="$5"
+    shift 5
     _settings_tmp="$(mktemp -d)"
     _settings_proposed="$_settings_tmp/proposed.json"
     _settings_report="$_settings_tmp/report.txt"
@@ -366,6 +429,7 @@ apply_settings_proposal() {
     if render_settings_proposal \
             "$_settings_target" "$_settings_base" "$_settings_skip" \
             "$RETIRED_HOOK_FILES" "$_settings_proposed" \
+            "$_settings_provider" \
             "$@" >"$_settings_report"; then
         echo "Settings unchanged: $_settings_target"
         rm -rf "$_settings_tmp"
@@ -1012,7 +1076,7 @@ done
 # consent. The proposal also removes refused/retired registrations, so the
 # exact activation delta is reviewed and applied as one state transition.
 apply_settings_proposal \
-    "$SETTINGS" "$SNIPPET_BASE" "settings.json" "$REFUSED_HOOK_NAMES" \
+    "$SETTINGS" "$SNIPPET_BASE" "settings.json" "$REFUSED_HOOK_NAMES" "claude" \
     "$SNIPPET"
 if [ -n "$CODEX_HOOKS" ]; then
     # Codex supports Claude-style lifecycle hook configuration in
@@ -1021,13 +1085,13 @@ if [ -n "$CODEX_HOOKS" ]; then
     # mode, identity, or command guardrails.
     if [ "$BASE_LAYER_AVAILABLE" = "1" ]; then
         apply_settings_proposal \
-            "$CODEX_HOOKS" "$SNIPPET_BASE" "codex/hooks.json" "$REFUSED_HOOK_NAMES" \
+            "$CODEX_HOOKS" "$SNIPPET_BASE" "codex/hooks.json" "$REFUSED_HOOK_NAMES" "codex" \
             "$BASE_SNIPPET" "$SNIPPET"
     else
         echo "WARNING: canonical Codex base hooks are unavailable in $REPO;" >&2
         echo "  applying only the orchestration graph from this partial source tree." >&2
         apply_settings_proposal \
-            "$CODEX_HOOKS" "$SNIPPET_BASE" "codex/hooks.json" "$REFUSED_HOOK_NAMES" \
+            "$CODEX_HOOKS" "$SNIPPET_BASE" "codex/hooks.json" "$REFUSED_HOOK_NAMES" "codex" \
             "$SNIPPET"
     fi
 else

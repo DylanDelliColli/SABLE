@@ -77,16 +77,22 @@ fi
 # UNKNOWN is a THIRD value, not a synonym for SessionStart. The two consumers
 # below want opposite defaults for it and each gets its own, which is only
 # expressible if the ambiguity survives parsing.
-HOOK_EVENT="$(HOOK_INPUT="$HOOK_INPUT" python3 -c '
+HOOK_META="$(HOOK_INPUT="$HOOK_INPUT" python3 -c '
 import json, os
 try:
     d = json.loads(os.environ.get("HOOK_INPUT", ""))
     ev = d.get("hook_event_name") if isinstance(d, dict) else None
+    source = d.get("source") if isinstance(d, dict) else None
 except Exception:
     ev = None
-print(ev if isinstance(ev, str) and ev else "__SABLE_EVENT_UNKNOWN__")
+    source = None
+ev = ev if isinstance(ev, str) and ev else "__SABLE_EVENT_UNKNOWN__"
+source = source if isinstance(source, str) and source else "__SABLE_SOURCE_UNKNOWN__"
+print(f"{ev}\t{source}")
 ' 2>/dev/null || true)"
+IFS=$'\t' read -r HOOK_EVENT HOOK_SOURCE <<< "$HOOK_META"
 [ -z "$HOOK_EVENT" ] && HOOK_EVENT="__SABLE_EVENT_UNKNOWN__"
+[ -z "$HOOK_SOURCE" ] && HOOK_SOURCE="__SABLE_SOURCE_UNKNOWN__"
 
 # --- Boot epoch stamp (SABLE-slip0.1) ---------------------------------------
 # A pane whose agent session was CLEARED is indistinguishable from one that is
@@ -124,10 +130,17 @@ print(ev if isinstance(ev, str) and ev else "__SABLE_EVENT_UNKNOWN__")
 # cleared panes). The suite's zero-capture-pane invariant enforces the last one
 # structurally rather than one negative control per bad idea.
 _sable_stamp_boot_epoch() {
-    # A COMPACTION IS NOT A RESTART. Riding the additionalContext emit below
-    # would also fire this on PreCompact, so every /compact would read as a
-    # clear and Lincoln would re-kick healthy managers in a loop. Stamp on an
-    # EXPLICIT SessionStart only.
+    # A COMPACTION IS NOT A RESTART. Both providers re-anchor after compaction
+    # with hook_event_name=SessionStart and source=compact; checking only the
+    # event therefore publishes a fresh epoch and makes spawn-manager re-kick
+    # a healthy mid-work manager. Keep emitting the context below, but write
+    # ZERO pane options on this source. A missing source retains the historical
+    # SessionStart stamp for compatibility with source-less providers.
+    if [ "$HOOK_EVENT" = "SessionStart" ] && [ "$HOOK_SOURCE" = "compact" ]; then
+        return 0
+    fi
+    # PreCompact and every other event are not restarts either. Stamp on an
+    # explicit SessionStart only.
     if [ "$HOOK_EVENT" != "SessionStart" ]; then
         # Fail-closed on an unidentifiable event — but loudly. Silently not
         # stamping would leave the pane looking never-booted forever, which is
