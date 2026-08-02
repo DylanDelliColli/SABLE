@@ -859,10 +859,27 @@ fi
 # BOTH lanes so zero-shell is provably not zero-validation and vice versa.
 DEVCHECK_BIN="$REPO/bin/sable-dev-check"
 b4_plan() { ( cd "$REPO" && "$DEVCHECK_BIN" --path "$1" --dry-run 2>&1 ); }
-# Exact-set extractors: the dry-run indents each planned python test file and
-# shell suite on its own line.
-b4_python_set() { printf '%s\n' "$1" | grep -oE 'bin/test_[A-Za-z0-9_]+\.py' | sort -u; }
-b4_shell_set()  { printf '%s\n' "$1" | grep -oE 'hooks/test/test-[A-Za-z0-9-]+\.sh' | sort -u; }
+# Exact-set extractors: the dry-run indents each PLANNED identity on its own
+# line.  Anchor that render boundary instead of grepping any filename from the
+# merged stdout/stderr stream.  A loud stale-profile diagnostic legitimately
+# names catalog additions (for example ``bin/test_new.py``); counting that
+# warning as a planned test made all six exact-set controls false-red while
+# their actual plans remained correct (SABLE-y4nom.7.5 overlap preflight).
+b4_python_set() { printf '%s\n' "$1" | sed -nE 's/^    (bin\/test_[A-Za-z0-9_]+\.py)$/\1/p' | sort -u; }
+b4_shell_set()  { printf '%s\n' "$1" | sed -nE 's/^    (hooks\/test\/test-[A-Za-z0-9-]+\.sh)$/\1/p' | sort -u; }
+B4_DIAGNOSTIC_PLANT=$(printf '%s\n' \
+  'sable-dev-check: profile mismatch — catalog python_tests added: bin/test_noise.py' \
+  '  Python: selected — 1 test file(s)' \
+  '    bin/test_real.py' \
+  '  Shell: scoped — 1 suite(s)' \
+  '    hooks/test/test-real.sh')
+if [ "$(b4_python_set "$B4_DIAGNOSTIC_PLANT")" = "bin/test_real.py" ] \
+   && [ "$(b4_shell_set "$B4_DIAGNOSTIC_PLANT")" = "hooks/test/test-real.sh" ]; then
+  pass "y4nom.7.5: exact plan extraction ignores a profile diagnostic that names a test file"
+else
+  fail "y4nom.7.5: exact plan extraction ignores a profile diagnostic that names a test file" \
+    "py=[$(b4_python_set "$B4_DIAGNOSTIC_PLANT")] sh=[$(b4_shell_set "$B4_DIAGNOSTIC_PLANT")]"
+fi
 B4_ALLOW_SET=$(bash -c "source '$PROD_RUNSET' 2>/dev/null; printf 'hooks/test/%s\n' \"\${ALLOW[@]}\"" | sort -u)
 
 B4_MAP=$(b4_plan hooks/multi-manager/close-hold-guard.sh); B4_MAP_RC=$?

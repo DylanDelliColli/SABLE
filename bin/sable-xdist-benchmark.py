@@ -646,7 +646,7 @@ def record_integrity_reasons(record: dict, anchor: dict | None) -> list[str]:
     if record.get("collection_returncode") != 0:
         reasons.append(f"run {rep} collection rc={record.get('collection_returncode')}")
     if record.get("returncode") != 0:
-        reasons.append(f"run {rep} pytest rc={record.get('returncode')}")
+        reasons.append(f"run {rep} test command rc={record.get('returncode')}")
     if record.get("timed_out"):
         reasons.append(f"run {rep} timed out")
     if record.get("artifact_error"):
