@@ -37,14 +37,15 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
     AUTONOMOUS_ROLES, KICK_TAG, SessionCollision, capture_pane, deliver_text,
-    dialog_posture, kick_message, repo_root, resolve_session, wait_for_ready,
+    dialog_posture, git_common_dir, kick_message, repo_root, resolve_session,
+    wait_for_ready,
 )
 from sable_handoff_lib import (  # noqa: E402
     HandoffRefused, read_execution_authority,
 )
 from sable_provider_lib import (  # noqa: E402
     DEFAULT_PROVIDER, ProviderMapError, execution_provider, interactive_command,
-    pane_environment, provider_boot_message,
+    pane_environment, provider_boot_message, validate_codex_hook_graph,
 )
 from sable_registry_lib import (  # noqa: E402
     FLEET_PROJECT_ONLY_REMEDY, fleet_project_only, sable_registry_path,
@@ -332,8 +333,17 @@ def manager_command(provider: str = "claude", cwd: str | None = None) -> str:
         return override
     perm = os.environ.get("SABLE_WORKER_PERMISSION", "--permission-mode bypassPermissions")
     add_dirs = [str(Path(cwd).parent)] if provider == "codex" and cwd else []
+    # Codex's workspace-write sandbox blocks .git even inside the workspace, so
+    # a seat cannot fetch and a worker cannot push without naming it. The grant
+    # is the SHARED git dir, never <cwd>/.git — see git_common_dir (SABLE-82k8m).
+    roots = []
+    if provider == "codex" and cwd:
+        common = git_common_dir(cwd)
+        if common:
+            roots = [common]
     return interactive_command(
         provider, "opus", claude_permission=perm, cwd=cwd, add_dirs=add_dirs,
+        writable_roots=roots,
     )
 
 
@@ -494,6 +504,14 @@ def main(argv: list[str] | None = None) -> int:
             f"{detail}. Stand down/reap those panes before relaunch.\n"
         )
         return 5
+    if any(provider_by_role[role] == "codex" for role in to_spawn):
+        try:
+            validate_codex_hook_graph()
+        except ProviderMapError as e:
+            sys.stderr.write(
+                f"sable-spawn-manager: refusing Codex pane spawn: {e}\n"
+            )
+            return 5
     for role in skipped:
         sys.stderr.write(f"sable-spawn-manager: {role} already running — skipping\n")
 

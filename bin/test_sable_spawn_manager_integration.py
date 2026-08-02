@@ -191,8 +191,19 @@ def test_unknown_dialog_refuses_manager_kick_without_typing(sock, tmp_path):
     assert "NOT typed" in r.stderr
     assert "failed pane removed" in r.stderr
     time.sleep(0.3)
-    assert not rec.exists(), (
-        f"manager kick landed in the unknown dialog: {rec.read_text()!r}"
+    # Assert on CONTENT, not existence. The fake pane records with
+    # `read -r -n 1 byte; printf "%s" "$byte" > rec`, and the `>` redirect
+    # creates the file the moment printf runs — which happens as soon as read
+    # RETURNS FOR ANY REASON, including EOF when the gate removes the failed
+    # pane. So an EMPTY file is evidence of the CORRECT outcome (read returned
+    # nothing typed), and the old `not rec.exists()` check only passed when the
+    # pane happened to die before printf ran. That is a race, and it went red
+    # in CI once suite timing shifted. Empty iff nothing was typed: a real kick
+    # would have given read its first byte and printf would have written it.
+    # The sibling tests in this file already assert on content this way.
+    typed = rec.read_text() if rec.exists() else ""
+    assert typed == "", (
+        f"manager kick landed in the unknown dialog: {typed!r}"
     )
     assert "optimus" not in _roles(sock)
 
@@ -285,6 +296,9 @@ def test_provider_boot_failure_removes_manager_pane(sock, tmp_path):
     _write_execution_state(state, {"optimus": "codex"})
     empty_home = tmp_path / "home"
     empty_home.mkdir()
+    codex_home = empty_home / ".codex"
+    codex_home.mkdir()
+    (codex_home / "hooks.json").write_text('{"SessionStart": [{}]}')
     first_byte = tmp_path / "first-byte.txt"
     script = tmp_path / "codex-ready.sh"
     script.write_text(
@@ -297,6 +311,7 @@ def test_provider_boot_failure_removes_manager_pane(sock, tmp_path):
     env = {
         **os.environ,
         "HOME": str(empty_home),
+        "CODEX_HOME": str(codex_home),
         # Keep fleet-boundary resolution project-local so this test reaches
         # the intended post-pane provider-role-card failure. Boundary refusal
         # itself has dedicated rc=6 coverage in test_sable_spawn_manager.py.
@@ -328,6 +343,56 @@ def test_provider_boot_failure_removes_manager_pane(sock, tmp_path):
     _write_execution_state(state)
     retry = _run(sock, "optimus")
     assert retry.returncode == 0, retry.stderr
+    assert "optimus" in _roles(sock)
+
+
+def test_codex_hook_graph_preflight_refuses_then_spawn_converges(sock, tmp_path):
+    state = Path(os.environ["SABLE_MODE_STATE"])
+    _write_execution_state(state, {"optimus": "codex"})
+    home = tmp_path / "home"
+    home.mkdir()
+    codex_home = home / ".codex"
+    role = home / ".claude" / "sable" / "roles" / "optimus.md"
+    role.parent.mkdir(parents=True)
+    role.write_text("# Optimus")
+    _seed_lincoln(sock)
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "CODEX_HOME": str(codex_home),
+        "SABLE_AGENTS_YAML": str(
+            Path(__file__).resolve().parent.parent
+            / "templates" / "multi-manager" / "agents.yaml"
+        ),
+        "SABLE_DISPATCH_DIR": str(tmp_path / "dispatch"),
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_SESSION": SESSION,
+        "SABLE_TMUX_PANE_CMD": (
+            "bash --noprofile --norc -c 'while true; do printf \"› \"; "
+            "IFS= read -r line || break; printf \"%s\\n\" \"$line\"; done'"
+        ),
+        "SABLE_DISPATCH_READY_TIMEOUT": "2",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.1",
+    }
+
+    refused = subprocess.run(
+        ["python3", str(BIN), "optimus"],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert refused.returncode == 5
+    assert "sable-orchestration-install --user --merge-settings" in refused.stderr
+    assert "optimus" not in _roles(sock)
+
+    codex_home.mkdir()
+    (codex_home / "hooks.json").write_text('{"SessionStart": [{}]}')
+    accepted = subprocess.run(
+        ["python3", str(BIN), "optimus"],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
     assert "optimus" in _roles(sock)
 
 

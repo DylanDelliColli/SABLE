@@ -377,20 +377,30 @@ The parser silently ignores unknown node-level keys. These commonly-intuited key
 
 `bd create --graph FILE --dry-run` creates real, persisted issues despite the flag name. There is currently no safe way to do a non-destructive preview of a graph file. Validate the JSON structure manually before running. Both bugs are filed upstream; check the issue tracker for fix status.
 
-### 3.7 Issue Discovery Is Mandatory
+### 3.7 Issue Discovery: Capture Is Mandatory, Filing Is Deliberate
 
-Any bug, bad practice, incorrect behavior, pre-existing error, or code smell noticed at any time — by any agent, during any task — must be immediately logged as a bead. This is non-negotiable.
+Any bug, bad practice, incorrect behavior, pre-existing error, or code smell noticed at any time — by any agent, during any task — must be **captured** before you move on. This is non-negotiable. What is *not* automatic is turning that capture into a bead.
 
-Do not ask "should I log this?" Just log it:
+Do not ask "should I log this?" Just capture it:
+
+```bash
+sable-note "<what's wrong, which file, one repro breadcrumb>"
+```
+
+It enters the bead pool only through a curation pass — `/sable-review` — and **curation is operator-manual: it runs when the operator invokes it, never on a schedule and never automatically.**
+
+**The carve-out: a defect that blocks or endangers in-flight work gets a bead immediately**, with full forensic detail while it is fresh. `bd ready` must remain the place where blocking defects surface at once.
 
 ```bash
 bd create --title="<what's wrong>" --type=bug --priority=2 \
   --description="<file, function, what's wrong, how to reproduce, acceptance criteria>"
 ```
 
-The reasoning: agents are amnesiac. If it's not in a bead, it doesn't exist in the next session. The cost of a false-positive bead (turns out it wasn't a real issue) is trivial. The cost of a missed bug (nobody remembers it existed) compounds over time.
-
 **Important**: Before creating a bead, verify the referenced file or function actually exists (grep or glob). Hallucinated beads waste full agent cycles when the next agent tries to act on them.
+
+The reasoning: agents are amnesiac, so an uncaptured observation does not exist next session — that part is unchanged. What changed is where it lands. A false-positive *bead* is not free: it enters a pool that people plan against, and at reflex speed the pool grows faster than it drains until it stops being a plan at all. Capture is three seconds and costs nothing; filing is a commitment, so it gets a decision. (Measured on this repo: roughly a quarter of historical closed volume was discovery and coordination exhaust rather than planned work.)
+
+Out of scope for this rule: auto-filed tooling exhaust — message-delivery fallback beads, `[reconcile]` records. That class is fixed at the send channel, not by a capture policy.
 
 ### 3.8 Backlog Hygiene: Freshness Before Form
 
@@ -401,7 +411,7 @@ The rules:
 1. **Freshness validation is a prerequisite to authoring or promoting acceptance criteria.** Read the referenced source first. Run the bead's verify command (§3.3). Confirm the gap still reproduces at HEAD.
 2. **If a pass is form-only, label its output provisional** — it must not be treated as validated until a source-grounded pass confirms it.
 3. **Acceptance criteria that assert a design decision** (an invented enum value, prescribed copy, a threshold, a "cleanest" approach) **with no trace to a framing/architecture artifact are laundered decisions, not requirements.** Flag and rewrite them as explicit open questions rather than promoting them.
-4. **Capture needs a consolidation counterpart.** Issue discovery (§3.7) optimizes capture, but fragments of one decision get logged as N independent beads — e.g. five sighting beads each inventing a different value for the same enum is one architecture decision laundered five ways. Periodically detect beads sharing one upstream decision and group them under an epic parked at the architecture gate before any is decomposed.
+4. **Capture needs a consolidation counterpart.** Issue discovery (§3.7) optimizes capture, and curation is where fragments should be merged — but when they slip through, fragments of one decision get logged as N independent beads — e.g. five sighting beads each inventing a different value for the same enum is one architecture decision laundered five ways. Periodically detect beads sharing one upstream decision and group them under an epic parked at the architecture gate before any is decomposed.
 
 **The doctor recipe.** `bd doctor` is unavailable in embedded-dolt mode, so the composed equivalent is:
 
@@ -1725,7 +1735,7 @@ All projects use **bd (beads)** for issue tracking.
 
 ### Rules
 - Use `bd` for ALL task tracking
-- Issue discovery is mandatory — see a bug, log a bead
+- Capture discovery with `sable-note`; it becomes a bead only via operator-invoked `/sable-review`. Blocking defects are the carve-out — bead them immediately (§3.7)
 - **Every code change requires both unit AND integration tests** (smoke tests encouraged). Unit tests alone are insufficient — see SABLE §4.5.
 - One `bd` command per Bash call (no chaining with && or ;)
 - Never use `bd edit` — it opens $EDITOR and hangs agents

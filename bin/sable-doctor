@@ -71,6 +71,13 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_registry_lib import _main_worktree_root as main_worktree_root  # noqa: E402
 from sable_pane_lib import WORKER_CAP_DEFAULT, worker_cap  # noqa: E402
+from sable_provider_lib import (  # noqa: E402
+    CODEX_HOOK_GRAPH_REMEDY,
+    ProviderMapError,
+    codex_hook_graph_path,
+    execution_provider_map,
+    validate_codex_hook_graph,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 REFRESH_CMD = "bash install.sh"
@@ -704,6 +711,42 @@ def _shadowed_role_card_report_lines(shadowed):
     return lines
 
 
+def check_codex_hook_graph(base=None, environment=None):
+    """Return a doctor row only when execution mode assigns a Codex role."""
+
+    providers = execution_provider_map(base=base)
+    if providers is None or "codex" not in providers.values():
+        return None
+    path = codex_hook_graph_path(environment)
+    try:
+        validate_codex_hook_graph(environment)
+    except ProviderMapError as exc:
+        return {
+            "installed_path": str(path),
+            "status": "invalid",
+            "detail": str(exc),
+            "remedy": CODEX_HOOK_GRAPH_REMEDY,
+        }
+    return {
+        "installed_path": str(path),
+        "status": "clean",
+        "detail": None,
+        "remedy": CODEX_HOOK_GRAPH_REMEDY,
+    }
+
+
+def _codex_hook_graph_report_lines(result):
+    if result is None:
+        return []
+    if result["status"] == "clean":
+        return [f"[Codex hook graph] CLEAN {result['installed_path']}"]
+    return [
+        f"[Codex hook graph] INVALID {result['installed_path']}",
+        f"  {result['detail']}",
+        f"  Repair with: {result['remedy']}",
+    ]
+
+
 def _read_pin_marker(bin_dir: Path) -> set:
     """Names sable-bin-install currently considers pinned in bin_dir, per its
     DEST/.sable-pinned marker (regenerated from real filesystem state on every
@@ -1031,23 +1074,32 @@ def _snapshot_remedy_lines(snapshot_bad):
 
 def render_text_report(
         results, provenance=None, current_head=None, ancestor_ok=None,
-        shadowed_roles=None, scope=None):
+        shadowed_roles=None, scope=None, codex_hook_graph=None):
     shadowed_roles = shadowed_roles or []
     bad = [r for r in results if r["status"] != "clean"]
-    if not bad and not shadowed_roles:
+    hook_graph_bad = (
+        codex_hook_graph is not None
+        and codex_hook_graph["status"] != "clean"
+    )
+    if not bad and not shadowed_roles and not hook_graph_bad:
         print(f"sable-doctor: clean — {len(results)} installed files match repo HEAD.")
         if scope is not None:
             print(install_comparison_scope_line(scope))
         for line in _provenance_report_lines(provenance, ancestor_ok=ancestor_ok):
+            print(line)
+        for line in _codex_hook_graph_report_lines(codex_hook_graph):
             print(line)
         print(worker_cap_line())
         return
     if bad:
         print(f"sable-doctor: DRIFT DETECTED — {len(bad)}/{len(results)} installed files "
               "do not match repo HEAD.\n")
-    else:
+    elif shadowed_roles and not hook_graph_bad:
         print(f"sable-doctor: clean — {len(results)} installed files match repo HEAD, "
               f"but {len(shadowed_roles)} role card(s) are shadowed (see below).\n")
+    else:
+        print(f"sable-doctor: clean — {len(results)} installed files match repo HEAD, "
+              "but an independent runtime check failed (see below).\n")
     if scope is not None:
         print(install_comparison_scope_line(scope))
         print()
@@ -1088,6 +1140,10 @@ def render_text_report(
     if shadowed_roles:
         print()
         for line in _shadowed_role_card_report_lines(shadowed_roles):
+            print(line)
+    if codex_hook_graph is not None:
+        print()
+        for line in _codex_hook_graph_report_lines(codex_hook_graph):
             print(line)
     print(worker_cap_line())
 
@@ -1150,6 +1206,11 @@ def main(argv=None):
     # process's cwd and home, not whichever install the operator asked to
     # inspect.
     shadowed_roles = check_shadowed_role_cards(shadow_cwd, shadow_home)
+    codex_hook_graph = check_codex_hook_graph(base=repo, environment=os.environ)
+    hook_graph_bad = (
+        codex_hook_graph is not None
+        and codex_hook_graph["status"] != "clean"
+    )
 
     provenance = read_provenance(claude_dir)
     current_head = current_repo_head(repo)
@@ -1159,15 +1220,22 @@ def main(argv=None):
 
     if args.json:
         print(json.dumps({
-            "clean": not bad and not shadowed_roles,
+            "clean": not bad and not shadowed_roles and not hook_graph_bad,
             "results": results,
             "shadowed_role_cards": shadowed_roles,
+            "codex_hook_graph": codex_hook_graph,
             "provenance": provenance,
             "current_head": current_head,
             "provenance_ancestor_of_head": ancestor_ok,
             "scope": scope,
         }, indent=2))
     elif args.quiet:
+        if hook_graph_bad:
+            print(
+                "sable-doctor: Codex hook graph preflight failed — "
+                f"{codex_hook_graph['detail']}",
+                file=sys.stderr,
+            )
         if shadowed_roles:
             shadow_summary = (
                 f"sable-doctor: {len(shadowed_roles)} manager role card(s) shadowed by "
@@ -1185,9 +1253,9 @@ def main(argv=None):
     else:
         render_text_report(results, provenance=provenance, current_head=current_head,
                             ancestor_ok=ancestor_ok, shadowed_roles=shadowed_roles,
-                            scope=scope)
+                            scope=scope, codex_hook_graph=codex_hook_graph)
 
-    return 1 if (bad or shadowed_roles) else 0
+    return 1 if (bad or shadowed_roles or hook_graph_bad) else 0
 
 
 if __name__ == "__main__":

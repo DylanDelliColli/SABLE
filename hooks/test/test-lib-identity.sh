@@ -9,6 +9,18 @@
 
 set -uo pipefail
 
+# This suite is routinely invoked from inside a live SABLE worker pane.  Its
+# cases establish identity and mode explicitly, so inheriting the invoking
+# pane's identity/tmux context makes their result depend on who ran the suite.
+# Keep this entry-point scrub aligned with bin/conftest.py's fleet isolation;
+# include the tmux routing variables called out by SABLE-oz8v9 as well.
+AMBIENT_FLEET_ENV=(
+  SABLE_AGENT_NAME SABLE_AGENT_ROLE SABLE_ROLE SABLE_LANE
+  CLAUDE_AGENT_NAME CLAUDE_AGENT_ROLE SABLE_PROVIDER SABLE_BEAD SABLE_WORKER_PANE
+  TMUX TMUX_PANE SABLE_TMUX_SOCKET SABLE_TMUX_SESSION
+)
+unset "${AMBIENT_FLEET_ENV[@]}" 2>/dev/null || true
+
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 LIB="$REPO/hooks/multi-manager/lib-identity.sh"
 
@@ -17,6 +29,17 @@ FAIL=0
 FAIL_NAMES=""
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
+
+leaked_fleet_env=()
+for fleet_var in "${AMBIENT_FLEET_ENV[@]}"; do
+  if [[ -v $fleet_var ]]; then leaked_fleet_env+=("$fleet_var"); fi
+done
+if [ "${#leaked_fleet_env[@]}" -eq 0 ]; then
+  pass "suite process starts with ambient fleet identity/tmux variables unset"
+else
+  fail "suite process starts with ambient fleet identity/tmux variables unset" \
+    "still set: ${leaked_fleet_env[*]}"
+fi
 
 # Fixture registry (minimal mirror of templates/multi-manager/agents.yaml shapes)
 FIXTURE_DIR="$(mktemp -d)"

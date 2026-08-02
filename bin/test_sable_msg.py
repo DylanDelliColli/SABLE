@@ -40,12 +40,17 @@ def test_format_message_basic():
                    "[composed=1970-01-01T00:00:00Z]")
 
 
-def test_format_message_collapses_newlines_and_runs():
-    msg = sable_msg.format_message("lincoln", "optimus", "drop auth\n\n  do API   now", 0.0)
-    # newlines/extra spaces collapse to single spaces -> single-line, single turn
+def test_format_message_refuses_multiline_bodies_but_accepts_single_lines():
+    with pytest.raises(sable_msg.UnsafeMultilineMessage, match="multi-line body"):
+        sable_msg.format_message(
+            "lincoln", "optimus", "drop auth\n\n  do API now", 0.0,
+        )
+
+    msg = sable_msg.format_message(
+        "lincoln", "optimus", "drop auth   do API now", 0.0,
+    )
     assert msg == ("⟦SABLE-MSG⟧ from=lincoln to=optimus :: drop auth do API now "
                    "[composed=1970-01-01T00:00:00Z]")
-    assert "\n" not in msg
 
 
 def test_header_glyph_present():
@@ -800,8 +805,8 @@ def test_deliver_message_retries_until_header_lands_outside_input_box():
     )
     assert landed is True
     assert sent[0] == ["tmux", "send-keys", "-t", "%2", "Escape"]
-    assert any(c[-3:] == ["send-keys", "-t", "%2"] or c[-2:] == ["-l", message] for c in sent
-              if "-l" in c)
+    assert any("load-buffer" in c for c in sent)
+    assert any("paste-buffer" in c for c in sent)
     # it genuinely retried (multiple polls/resends), not a single blind send
     assert len(sleeps) >= 2
 
@@ -817,7 +822,7 @@ def test_deliver_message_gives_up_when_never_confirmed_landed():
     state = {"typed": False}
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         return True
 
@@ -914,7 +919,7 @@ def test_deliver_message_idle_box_frame_lands_via_redraw_race_uh4b():
     state = {"typed": False}
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         return True
 
@@ -966,7 +971,7 @@ def test_main_landed_box_frame_send_does_not_double_file_fallback_bead_uh4b(monk
         returncode = 0
 
     def fake_run(cmd, **kw):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         return FakeProc()
 
@@ -1025,7 +1030,7 @@ def test_deliver_message_queued_while_busy_is_not_landed():
     state = {"typed": False}
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         return True
 
@@ -1058,7 +1063,7 @@ def test_deliver_message_idle_recipient_transitions_to_our_turn_and_lands():
     state = {"typed": False}
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         return True
 
@@ -1095,7 +1100,7 @@ def test_cross_provider_manager_worker_messages_land_both_directions(
     monkeypatch.setattr(sable_msg, "pane_provider_tag", lambda *_args: provider)
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         return True
 
@@ -1121,7 +1126,7 @@ def test_deliver_text_fresh_pane_dispatch_still_lands():
     state = {"typed": False}
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         return True
 
@@ -1189,7 +1194,7 @@ def test_deliver_message_busy_at_t0_then_submits_lands_via_delayed_confirmation_
     state = {"typed": False, "polls": 0}
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         return True
 
@@ -1225,7 +1230,7 @@ def test_deliver_message_busy_at_t0_turn_never_ends_times_out_and_fails_h0jw():
     state = {"typed": False}
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         return True
 
@@ -1265,7 +1270,7 @@ def test_main_busy_delayed_land_files_no_fallback_bead_h0jw(monkeypatch):
         returncode = 0
 
     def fake_run(cmd, **kw):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         return FakeProc()
 
@@ -1335,7 +1340,7 @@ def test_deliver_message_busy_at_t0_queued_footer_confirms_without_waiting_out_b
     state = {"type_calls": 0}
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["type_calls"] += 1
         return True
 
@@ -1367,7 +1372,7 @@ def test_deliver_text_busy_at_t0_skips_retype_when_message_already_pending_msxj(
     state = {"type_calls": 0, "polls": 0}
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["type_calls"] += 1
         return True
 
@@ -1394,7 +1399,7 @@ def test_deliver_text_idle_at_t0_always_types_even_if_snippet_coincidentally_vis
     state = {"type_calls": 0}
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["type_calls"] += 1
         return True
 
@@ -1440,7 +1445,7 @@ def test_deliver_text_busy_at_t0_then_idle_with_text_stuck_in_box_resends_enter_
     state = {"typed": False, "submitted": False, "enter_after_type": 0}
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         elif cmd[-1] == "Enter" and state["typed"]:
             state["enter_after_type"] += 1
@@ -1479,7 +1484,7 @@ def test_deliver_text_busy_at_t0_genuinely_queued_no_selfheal_double_submit_l7uv
     state = {"typed": False, "polls": 0, "enter_after_type": 0}
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         elif cmd[-1] == "Enter" and state["typed"]:
             state["enter_after_type"] += 1
@@ -1530,10 +1535,12 @@ def test_pane_busy_true_only_while_turn_running():
 def test_pane_idle_requires_ready_and_not_busy():
     # the crux: a busy pane is READY (has the empty prompt) but NOT idle
     assert sable_msg.pane_ready(_BUSY_SCREEN) is True
-    assert sable_msg.pane_idle(_BUSY_SCREEN) is False
-    assert sable_msg.pane_idle(_IDLE_SCREEN) is True
+    assert sable_msg.pane_idle(_BUSY_SCREEN, "claude") is False
+    assert sable_msg.pane_idle(_IDLE_SCREEN, "claude") is True
     # a booting pane (no prompt yet) is neither ready nor idle
-    assert sable_msg.pane_idle("╭─ Claude Code ─╮\n│ booting… │") is False
+    assert sable_msg.pane_idle(
+        "╭─ Claude Code ─╮\n│ booting… │", "claude"
+    ) is False
 
 
 def test_interrupt_sends_escape_once_and_defers_injection_until_idle():
@@ -1555,7 +1562,7 @@ def test_interrupt_sends_escape_once_and_defers_injection_until_idle():
 
     def run(cmd):
         sent.append(cmd)
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             typed_at_capture.append(captures["n"])
         return True
 
@@ -1574,7 +1581,9 @@ def test_interrupt_sends_escape_once_and_defers_injection_until_idle():
     assert typed_at_capture == [4]                 # typed only after the idle polls (t0 check is #4)
     assert typed_at_capture[0] > 1                 # NOT at the first (busy) poll
     # ordering: Escape precedes the first keystroke injection
-    assert sent.index(escapes[0]) < next(i for i, c in enumerate(sent) if "-l" in c)
+    assert sent.index(escapes[0]) < next(
+        i for i, c in enumerate(sent) if "paste-buffer" in c
+    )
 
 
 def test_interrupt_never_types_while_pane_stays_busy_then_degrades():
@@ -1613,7 +1622,7 @@ def test_deliver_message_wrapped_composer_requires_a_real_enter():
     state = {"typed": False, "entered": False}
 
     def run(cmd):
-        if "-l" in cmd:
+        if "paste-buffer" in cmd:
             state["typed"] = True
         if cmd[-1] == "Enter":
             state["entered"] = True
@@ -1652,7 +1661,7 @@ def test_deliver_message_sends_enter_immediately_not_only_after_failed_poll():
         sleep=lambda s: None, tries=3, interval=0.01,
     )
     assert landed is True
-    li = next(i for i, c in enumerate(sent) if "-l" in c)
+    li = next(i for i, c in enumerate(sent) if "paste-buffer" in c)
     assert li + 1 < len(sent), "no keystroke followed the typed text"
     assert sent[li + 1][-1] == "Enter"
 

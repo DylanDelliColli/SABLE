@@ -13,14 +13,37 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import tempfile
 import time
 
 from sable_provider_lib import agent_name, normalize_provider
+
+# Codex suppresses Enter for 120ms after detecting paste-burst input. Keep a
+# 30ms margin above that measured provider window (SABLE-dm6ek).
+SUBMIT_GAP_SECONDS = 0.15
 
 # Non-printable control bytes (except \t\n which are whitespace-handled). A
 # stray echoed Escape on the prompt line must not defeat glyph detection
 # (SABLE-zaum).
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+# SGR ("select graphic rendition") sequences. Captures are taken with -e so the
+# codex composer check below can see styling, which means EVERY predicate now
+# meets escape sequences it never used to. _CTRL_RE alone is not enough: it
+# strips the ESC byte but leaves the "[2m" tail behind as literal text, which
+# would break the exact-glyph comparisons. Strip whole sequences first
+# (SABLE-6c391).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# A dim/faint span: SGR 2 opens it. This is how Codex renders the GHOST
+# SUGGESTION it parks in an idle composer. Text a human actually typed carries
+# no styling, so this span is the only reliable way to tell "empty composer
+# showing a hint" from "composer holding unsubmitted input" — the distinction
+# that keeps a deliberate hold from being typed over (SABLE-r3fg0).
+#
+# The closing reset is OPTIONAL and that is not defensive coding: against a
+# live pane Codex leaves the span open to end-of-line, so requiring a reset
+# stripped nothing and reproduced the very bug this exists to fix. Anchored to
+# EOL rather than \Z because callers pass one line at a time.
+_DIM_SPAN_RE = re.compile(r"\x1b\[2m.*?(?:\x1b\[0m|$)")
 _PROMPT_GLYPHS = {
     "claude": ("❯", ">"),
     "codex": ("›", ">"),
@@ -32,8 +55,11 @@ def prompt_glyphs(provider: str = "claude") -> tuple[str, ...]:
 
 
 def _clean(line: str) -> str:
-    """A pane line with control bytes stripped and whitespace trimmed."""
-    return _CTRL_RE.sub("", line).strip()
+    """A pane line with SGR sequences and control bytes stripped, whitespace
+    trimmed. Stripping SGR first is what lets a styled capture (-e) compare
+    byte-identically to the unstyled captures every existing caller was
+    written against (SABLE-6c391)."""
+    return _CTRL_RE.sub("", _ANSI_RE.sub("", line)).strip()
 
 
 def _canon(text: str) -> str:
@@ -41,7 +67,7 @@ def _canon(text: str) -> str:
     whitespace removed. Pane wraps can split a message MID-WORD (capture-pane
     without -J emits the segments as separate lines), so any comparison that
     preserves spaces mismatches across a wrap boundary (SABLE-1umr)."""
-    return "".join(_CTRL_RE.sub("", text).split())
+    return "".join(_CTRL_RE.sub("", _ANSI_RE.sub("", text)).split())
 
 
 def _already_pending(capture_text: str, snippet: str) -> bool:
@@ -55,6 +81,49 @@ def _already_pending(capture_text: str, snippet: str) -> bool:
     return bool(want) and want in _canon(capture_text)
 
 
+def _without_ghost(line: str, provider: str = "claude") -> str:
+    """Drop Codex's ghost-suggestion spans so an idle composer showing a hint
+    compares equal to a bare prompt glyph.
+
+    CODEX ONLY, deliberately. Claude suppresses its own suggestions at the
+    source with CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 (SABLE-ndaup), so a dim
+    span on a Claude composer is not a hint to skip — it is content, and
+    silently ignoring it would be the same over-type bug in the other
+    provider's clothes.
+
+    Only DIM-STYLED text is dropped. Unstyled text after the glyph is input a
+    human actually typed and must keep the pane out of ready state
+    (SABLE-6c391 / SABLE-r3fg0)."""
+    if normalize_provider(provider) != "codex":
+        return line
+    return _DIM_SPAN_RE.sub("", line)
+
+
+def _composer_line(
+    capture: str, provider: str = "claude"
+) -> tuple[int, str] | None:
+    """The bottom-most provider prompt row and its cleaned visible content.
+
+    Prompt glyphs also occur in transcript text, so a bare glyph anywhere in
+    the frame is not composer evidence. The editable composer is the last row
+    beginning with a provider glyph; Codex's dim ghost suggestion is removed
+    before deciding whether that row is empty.
+    """
+    glyphs = prompt_glyphs(provider)
+    lines = capture.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        cleaned = _clean(_without_ghost(lines[index], provider))
+        if cleaned.startswith(glyphs):
+            return index, cleaned
+    return None
+
+
+def composer_is_empty(capture: str, provider: str) -> bool:
+    """True when the provider's bottom-most composer row holds no input."""
+    composer = _composer_line(capture, provider)
+    return composer is not None and composer[1] in prompt_glyphs(provider)
+
+
 def pane_ready(capture: str, provider: str = "claude") -> bool:
     """The TUI is ready to accept input once its input box shows an EMPTY prompt
     line (just the prompt glyph). While booting (splash) or on a blocking gate
@@ -64,10 +133,7 @@ def pane_ready(capture: str, provider: str = "claude") -> bool:
     composer prompt at the bottom, so pane_ready returns True mid-turn — see
     pane_idle for the stronger "ready AND not mid-turn" predicate the interrupt
     path needs (SABLE-m6is)."""
-    for line in reversed(capture.splitlines()):
-        if _clean(line) in prompt_glyphs(provider):
-            return True
-    return False
+    return composer_is_empty(capture, provider)
 
 
 # The status line a running Claude turn renders (whatever the spinner glyph /
@@ -84,18 +150,20 @@ def pane_busy(capture: str, provider: str = "claude") -> bool:
     matches (SABLE-m6is). The composer prompt is shown DURING a turn too, which
     is exactly why pane_ready alone reported a busy pane 'ready' and the
     interrupt path typed into a pane still redrawing."""
-    hay = " ".join(_CTRL_RE.sub(" ", capture).split()).lower()
+    hay = " ".join(_CTRL_RE.sub(" ", _ANSI_RE.sub("", capture)).split()).lower()
     return any(marker in hay for marker in _BUSY_MARKERS)
 
 
-def pane_idle(capture: str, provider: str = "claude") -> bool:
+def pane_idle(capture: str, provider: str) -> bool:
     """The pane is ready for a NEW submitted turn: its composer shows the empty
-    prompt (pane_ready) AND no turn is currently running (not pane_busy).
+    prompt AND no turn is currently running (not pane_working).
     --interrupt defers typing until THIS holds, not merely until pane_ready:
     a busy pane shows the empty composer prompt too, so typing on pane_ready
     alone raced the spinner redraw / composer-clear of the interrupted turn and
     silently dropped the message (SABLE-m6is)."""
-    return pane_ready(capture, provider) and not pane_busy(capture, provider)
+    return composer_is_empty(capture, provider) and not pane_working(
+        capture, provider
+    )
 
 
 # A running turn's status row carries a spinner glyph AND an elapsed-time timer
@@ -110,7 +178,7 @@ _SPINNER_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯�
 _ELAPSED_RE = re.compile(r"\b\d+m\s*\d+s\b|\b\d+s\b")
 
 
-def pane_working(capture: str, provider: str = "claude") -> bool:
+def pane_working(capture: str, provider: str) -> bool:
     """True while the pane is MID-TURN — a SUPERSET of pane_busy for the
     dialog-stall probe's authoritative not-busy guard (SABLE-tz9f). Returns True
     when pane_busy does (the "esc to interrupt" hint) OR when any line bears BOTH
@@ -124,9 +192,58 @@ def pane_working(capture: str, provider: str = "claude") -> bool:
     if pane_busy(capture, provider):
         return True
     for line in capture.splitlines():
-        if _SPINNER_RE.search(line) and _ELAPSED_RE.search(line):
+        # Claude completion summaries persist in transcript with the same
+        # spinner glyph and elapsed token as a live row (for example,
+        # "✻ Churned for 1s"). A live status row is progressive text and
+        # carries an ellipsis; requiring it retains the off-frame busy signal
+        # without making every completed Claude turn permanently working.
+        if (_SPINNER_RE.search(line) and _ELAPSED_RE.search(line)
+                and ("…" in line or "..." in line)):
             return True
     return False
+
+
+_PANE_BORDER_RE = re.compile(r"^[\s\-─│╭╮╰╯]*$")
+_PANE_CWD_RE = re.compile(r"^\s*\S+@\S+:")
+SABLE_MSG_MARK = "⟦SABLE-MSG⟧"
+
+
+def _is_pane_chrome(line: str) -> bool:
+    return bool(
+        not line or _PANE_BORDER_RE.match(line) or _PANE_CWD_RE.match(line)
+    )
+
+
+def deliberate_hold(capture: str, provider: str) -> bool | None:
+    """Classify a settled manager pane's tail by shape, not hold wording.
+
+    True means a bare composer has rendered turn output above it. False is a
+    dropped SABLE wake, a truncated turn, or a rate-limit cut. None means a
+    turn is active, the composer is not locatable, or non-SABLE text remains
+    deliberately held in the composer.
+    """
+    if pane_working(capture, provider):
+        return None
+
+    composer = _composer_line(capture, provider)
+    if composer is None:
+        return None
+    composer_index, composer_text = composer
+    if composer_text not in prompt_glyphs(provider):
+        return False if SABLE_MSG_MARK in composer_text else None
+
+    cleaned = [_clean(line) for line in capture.splitlines()]
+    above = [
+        line
+        for line in reversed(cleaned[:composer_index])
+        if not _is_pane_chrome(line)
+    ]
+    if not above:
+        return False
+    recent = "\n".join(reversed(above))
+    if session_limit_reset(recent, provider) is not None:
+        return False
+    return True
 
 
 def accept_startup_gate(capture: str) -> str | None:
@@ -326,12 +443,10 @@ def dispatch_landed(
     if not want or want not in _canon(capture):
         return False
     lines = capture.splitlines()
-    box_start = None
-    for i, line in enumerate(lines):
-        if _clean(line).startswith(prompt_glyphs(provider)):
-            box_start = i
-    if box_start is None:
+    composer = _composer_line(capture, provider)
+    if composer is None:
         return False
+    box_start = composer[0]
     if pane_busy("\n".join(lines[box_start + 1:]), provider):
         return True
     return want not in _canon("\n".join(lines[box_start:]))
@@ -346,7 +461,26 @@ def dispatch_landed(
 # delivered-queued send timed out h0jw's poll budget and scored as failure
 # (SABLE-l8a5: closed false-fail, evidence the queued line was live in the pane
 # the whole time).
-_QUEUED_FOOTER_MARKERS = ("press up to edit queued messages",)
+# PROVIDER-KEYED, like _PROMPT_GLYPHS. It was a bare Claude constant, so a
+# Codex pane's queued footer never matched, queued sends were invisible, and
+# sable-msg reported UNDELIVERED for messages that had actually landed — filing
+# spurious durable inbox beads and handing recipients the same instruction
+# twice (SABLE-yuwrs, hit live lincoln->chuck 2026-07-29).
+#
+# The Codex marker is the STABLE PREFIX of its footer, deliberately stopping
+# before the parenthetical ("(press esc to interrupt and send immediately)"),
+# which is wording most likely to drift between releases.
+#
+# Markers are NOT shared across providers: one provider's footer appearing in
+# another's pane is not evidence, so each key holds only its own.
+_QUEUED_FOOTER_MARKERS = {
+    "claude": ("press up to edit queued messages",),
+    "codex": ("messages to be submitted after next tool call",),
+}
+
+
+def queued_footer_markers(provider: str = "claude") -> tuple[str, ...]:
+    return _QUEUED_FOOTER_MARKERS[normalize_provider(provider)]
 
 
 def pane_has_queued_message(
@@ -361,8 +495,8 @@ def pane_has_queued_message(
     want = _canon(snippet)
     if not want or want not in _canon(capture):
         return False
-    hay = " ".join(_CTRL_RE.sub(" ", capture).split()).lower()
-    return any(marker in hay for marker in _QUEUED_FOOTER_MARKERS)
+    hay = " ".join(_CTRL_RE.sub(" ", _ANSI_RE.sub("", capture)).split()).lower()
+    return any(marker in hay for marker in queued_footer_markers(provider))
 
 
 def submitted_own_turn(
@@ -408,19 +542,19 @@ def submitted_own_turn(
     if pane_idle(capture, provider):
         return True
     lines = capture.splitlines()
-    box_start = None
-    for i, line in enumerate(lines):
-        if _clean(line).startswith(prompt_glyphs(provider)):
-            box_start = i
-    return box_start is not None and pane_busy(
-        "\n".join(lines[box_start + 1:]), provider
+    composer = _composer_line(capture, provider)
+    return composer is not None and pane_busy(
+        "\n".join(lines[composer[0] + 1:]), provider
     )
 
 
 def capture_pane(base: list[str], pane: str) -> str:
     # -J joins wrapped lines, so a message wider than the pane comes back as
     # the one line it really is — box detection then sees the whole composer.
-    return subprocess.run(base + ["capture-pane", "-p", "-J", "-t", pane],
+    # -e keeps SGR sequences, which _without_ghost needs to tell Codex's ghost
+    # suggestion from real held input; every predicate strips them via _clean /
+    # _canon, so callers see the same text they always did (SABLE-6c391).
+    return subprocess.run(base + ["capture-pane", "-p", "-J", "-e", "-t", pane],
                           capture_output=True, text=True).stdout
 
 
@@ -476,14 +610,39 @@ def wait_for_idle(base, pane, timeout, interval=0.5, capture=None, sleep=None,
     return False
 
 
+def _paste_text(base, pane, text, run) -> bool:
+    """Load ``text`` into a private tmux buffer and paste it into ``pane``."""
+    buffer_name = f"sable-delivery-{os.getpid()}-{time.monotonic_ns()}"
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                prefix="sable-delivery-", mode="wb", delete=False) as payload:
+            path = payload.name
+            payload.write(text.encode())
+        if run(base + ["load-buffer", "-b", buffer_name, path]) is False:
+            return False
+        pasted = run(base + [
+            "paste-buffer", "-p", "-d", "-b", buffer_name, "-t", pane,
+        ]) is not False
+        if not pasted:
+            run(base + ["delete-buffer", "-b", buffer_name])
+        return pasted
+    finally:
+        if path is not None:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
 def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
                  run=None, capture=None, sleep=None,
                  provider: str = "claude") -> bool:
-    """Type `text` into the pane and submit it — Enter is sent IMMEDIATELY after
-    the text (submission must not depend on the landed-check failing first,
-    SABLE-1umr), then resent until the text leaves the input box (the
-    dropped-Enter race). A resent Enter on an already-empty box is a harmless
-    no-op. Returns False (clean) if the pane vanishes.
+    """Paste `text` into the pane and submit it — Enter is sent after the short
+    paste-burst suppression gap (submission must not depend on the landed-check
+    failing first, SABLE-1umr), then resent until the text leaves the input box
+    (the dropped-Enter race). A resent Enter on an already-empty box is a
+    harmless no-op. Returns False (clean) if the pane vanishes.
 
     A landing is only counted when the pane was IDLE at send time — pane_idle at
     t0, captured BEFORE typing (SABLE-d21h). A message typed into a BUSY pane
@@ -532,8 +691,9 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
     idle_at_send = pane_idle(cap0, provider)
     already_pending = (not idle_at_send) and _already_pending(cap0, snippet)
     if not already_pending:
-        if run(base + ["send-keys", "-t", pane, "-l", text]) is False:
+        if not _paste_text(base, pane, text, run):
             return False
+        sleep(SUBMIT_GAP_SECONDS)
         if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
             return False
     if not idle_at_send:
@@ -570,6 +730,7 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
             # via submitted_own_turn once the composer clears and the line lands.
             if (not pane_working(cap, provider) and _already_pending(cap, snippet)
                     and not dispatch_landed(cap, snippet, provider)):
+                sleep(SUBMIT_GAP_SECONDS)
                 if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
                     return False
         return submitted_own_turn(capture(), snippet, provider)
@@ -577,6 +738,7 @@ def deliver_text(base, pane, text, snippet, tries=8, interval=1.0,
         sleep(interval)
         if dispatch_landed(capture(), snippet, provider):
             return True
+        sleep(SUBMIT_GAP_SECONDS)
         if run(base + ["send-keys", "-t", pane, "Enter"]) is False:
             return False
     return dispatch_landed(capture(), snippet, provider)
@@ -601,6 +763,30 @@ def _tmux_run(cmd):
 
 def tmux_base(socket: str | None = None) -> list[str]:
     return ["tmux", "-L", socket] if socket else ["tmux"]
+
+
+def git_common_dir(base: str | None = None) -> str | None:
+    """The SHARED git directory for the repo containing `base`, or None outside
+    a repo.
+
+    This is the correct sandbox grant for git writes (SABLE-82k8m), and it is
+    NOT `<base>/.git`: in a LINKED WORKTREE — which is where every worker runs
+    — `.git` is a FILE pointing at `<main>/.git/worktrees/<name>`, and the refs
+    and logs a push updates live under the shared directory. Granting the
+    worktree's own path would let managers fetch while every worker push stayed
+    blocked, a divergence that only surfaces at the push.
+    """
+    base = base or os.getcwd()
+    try:
+        r = subprocess.run(["git", "-C", base, "rev-parse", "--git-common-dir"],
+                           capture_output=True, text=True)
+        common = r.stdout.strip()
+        if r.returncode == 0 and common:
+            cpath = common if os.path.isabs(common) else os.path.join(base, common)
+            return os.path.realpath(cpath)
+    except Exception:
+        pass
+    return None
 
 
 def repo_root(base: str | None = None) -> str | None:

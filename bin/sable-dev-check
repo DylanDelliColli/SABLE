@@ -58,8 +58,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SECONDS",
         help=(
-            "explicit total execution budget override (implicit: 90s for "
-            "scoped plans; full_snapshot tier budget for a FULL fallback)"
+            "explicit absolute execution bound (implicit: the full_snapshot "
+            "tier budget; within it, per-command budgets are derived from "
+            "measured suite cost)"
+        ),
+    )
+    parser.add_argument(
+        "--cost-report",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Python suite cost report from pytest --sable-test-cost-report "
+            f"(default: {devcheck.PYTHON_COST_REPORT})"
+        ),
+    )
+    parser.add_argument(
+        "--shell-profile",
+        default=None,
+        metavar="PATH",
+        help=(
+            "shell suite cost profile from shell-run-set.sh --profile "
+            f"(default: {devcheck.SHELL_COST_PROFILE})"
+        ),
+    )
+    parser.add_argument(
+        "--no-derived-budget",
+        action="store_true",
+        help=(
+            "ignore measured cost and run under one flat bound. Diagnostic "
+            "only: this is the pre-derivation behaviour that could exit 124 "
+            "with nothing verified."
         ),
     )
     return parser
@@ -78,8 +106,21 @@ def main(argv: list[str] | None = None) -> int:
             else devcheck.collect_changed_paths(repo, args.base)
         )
         plan = devcheck.build_plan(repo, changed)
+        costs = (
+            None
+            if args.no_derived_budget
+            else devcheck.load_costs(
+                repo,
+                python_report=args.cost_report,
+                shell_profile=args.shell_profile,
+            )
+        )
         budget = devcheck.effective_budget(
-            repo, plan, explicit_seconds=args.budget,
+            repo,
+            plan,
+            explicit_seconds=args.budget,
+            costs=costs,
+            derived=not args.no_derived_budget,
         )
         print(
             devcheck.render_plan(
@@ -92,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             return 0
         return devcheck.run_plan(
-            repo, plan, budget_seconds=budget.seconds,
+            repo, plan, budget_seconds=budget.seconds, budget=budget,
         )
     except devcheck.DeveloperCheckError as exc:
         print(f"sable-dev-check: precondition failed: {exc}", file=sys.stderr)

@@ -22,6 +22,7 @@ import time
 import uuid
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -2351,6 +2352,16 @@ def real_bd_template(tmp_path_factory):
     dispatch-prep brief for this bead is explicit that stray scratch beads feed
     the very overlap_check under repair. Build the cold baseline once; each
     consumer receives a deep copy from ``real_bd_repo`` below."""
+    # The module's autouse skip guard cannot cover this: it is function-scoped,
+    # and pytest resolves this SESSION-scoped fixture first, so in a bd-less
+    # environment we reach the subprocess call before any skip can fire. The
+    # returncode check below is likewise unreachable — a missing binary raises
+    # FileNotFoundError rather than returning nonzero. That is why the CI clean
+    # room (python + tmux only, deliberately NO bd) reported 6 ERRORS instead of
+    # 6 skips, breaking the ci-verify contract that every test must pass or
+    # self-skip there (SABLE-59zu).
+    if not HAVE_BD:
+        pytest.skip("needs bd")
     repo = tmp_path_factory.mktemp("spawn-worker-real-bd-template")
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     init = subprocess.run(["bd", "init", "--prefix", "FZTEST"],
@@ -2689,6 +2700,134 @@ def test_real_bd_widening_past_declaration_is_named_against_a_real_git_diff(real
     assert report is not None
     assert "undeclared_extra.py" in report
     assert "shared_target.py" not in report
+
+
+# --- SABLE-9qqrv: the Codex sandbox grant, enforced by a real sandbox --------
+#
+# WHY THIS CANNOT BE A UNIT TEST. The shipped defect passed every unit test in
+# bin/test_sable_spawn_worker.py all the way into production: asserting that a
+# path appears in a rendered flag says nothing about whether the kernel will let
+# a worker write there. The class of bug is "the grant does not cover what the
+# worker actually needs", and only a real write, denied by a real sandbox,
+# distinguishes a working grant from an inert one.
+#
+# The sandbox here is bubblewrap, which is what Codex's workspace-write posture
+# is built on for Linux: everything read-only, then the granted roots re-bound
+# read-write. The bind set is derived from `codex_writable_roots` — the SAME
+# function the spawn path renders into `sandbox_workspace_write.writable_roots`
+# — so if production stops granting the store, the positive case goes red here
+# rather than in a live worker pane.
+#
+# `/tmp` is deliberately NOT bound writable even though Codex grants it: the
+# fixture lives under /tmp, so binding it would make the negative control
+# unfalsifiable. TMPDIR is pointed inside the worktree instead, which keeps the
+# only writable surfaces the ones under test.
+
+HAVE_BWRAP = shutil.which("bwrap") is not None
+
+
+def _bwrap(writable, chdir, argv, tmpdir):
+    """Run `argv` with ONLY `writable` writable — the workspace-write shape."""
+    cmd = ["bwrap", "--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev",
+           "--proc", "/proc"]
+    for path in writable:
+        cmd += ["--bind", str(path), str(path)]
+    cmd += ["--chdir", str(chdir), "--setenv", "TMPDIR", str(tmpdir), "--"]
+    return subprocess.run(cmd + list(argv), capture_output=True, text=True)
+
+
+@pytest.fixture(scope="module")
+def codex_sandbox_repo(tmp_path_factory):
+    """A repo whose beads store and feedback dir sit OUTSIDE the worker's
+    worktree — the real production shape, where the store is a sibling of the
+    shared `.git` and the worktree is a sibling of the checkout itself."""
+    if not HAVE_BWRAP:
+        pytest.skip("needs bwrap (the Linux primitive Codex sandboxes with)")
+    tmp = tmp_path_factory.mktemp("codexgrant")
+    work, wt = _repo_with_linked_worktree(tmp)
+    init = subprocess.run(["bd", "init", "--prefix", "TSTX"], cwd=work,
+                          capture_output=True, text=True)
+    if init.returncode != 0:
+        pytest.skip(f"bd init unavailable here: {init.stderr.strip()[:200]}")
+    feedback = tmp / "feedback"
+    feedback.mkdir()
+    scratch = wt / ".tmp"
+    scratch.mkdir()
+
+    mp = pytest.MonkeyPatch()
+    mp.setenv("SABLE_FEEDBACK_DIR", str(feedback))
+    roots = ssw.codex_writable_roots(str(wt))
+    mp.undo()
+
+    yield SimpleNamespace(work=work, wt=wt, feedback=feedback, scratch=scratch,
+                          roots=roots, store=str((work / ".beads").resolve()),
+                          bd=shutil.which("bd"))
+
+
+def test_grant_resolves_the_real_store_outside_the_worktree(codex_sandbox_repo):
+    """Resolution, against a real bd store rather than a stubbed path: bd finds
+    its store from a LINKED WORKTREE by way of git, so the granted root must be
+    the checkout's `.beads` even though nothing under the worktree names it."""
+    r = codex_sandbox_repo
+    assert r.store in r.roots, r.roots
+    assert str((r.work / ".git").resolve()) in r.roots, r.roots
+    assert str(r.feedback.resolve()) in r.roots, r.roots
+    # gotcha (b), structurally: the checkout itself is never granted.
+    assert str(r.work.resolve()) not in r.roots, r.roots
+
+
+def test_bd_write_from_inside_the_worktree_succeeds_under_the_grant(codex_sandbox_repo):
+    """THE POSITIVE CONTROL. A real `bd create`, run from inside the worktree,
+    inside a real sandbox built from the production grant. This is the worker
+    contract the bead says is structurally impossible today: close-at-push,
+    issue discovery and tdd-gate evidence are all this same write."""
+    r = codex_sandbox_repo
+    got = _bwrap([r.wt, *r.roots], r.wt,
+                 [r.bd, "create", "--title=granted write", "--type=task"],
+                 r.scratch)
+    assert got.returncode == 0, f"stdout={got.stdout}\nstderr={got.stderr}"
+    assert "granted write" in got.stdout, got.stdout
+
+
+def test_bd_write_fails_when_only_the_beads_root_is_removed(codex_sandbox_repo):
+    """THE NEGATIVE CONTROL, and the reason this test proves anything at all.
+
+    Identical command, identical sandbox, ONE root removed — the beads store.
+    If this passed, the positive case above would be proving nothing but the
+    host's ambient permissions. It reproduces the live symptom exactly: the
+    failure is at `open db`, not at a mutation, which is why the bead reports
+    that even bd READS fail — embedded dolt takes a write lock to open at all,
+    so an ungranted worker is BLIND to the tracker, not merely unable to write."""
+    r = codex_sandbox_repo
+    without = [p for p in r.roots if p != r.store]
+    assert len(without) == len(r.roots) - 1, "the store must have been granted"
+
+    got = _bwrap([r.wt, *without], r.wt,
+                 [r.bd, "create", "--title=ungranted write", "--type=task"],
+                 r.scratch)
+
+    assert got.returncode != 0, f"expected denial, got: {got.stdout}"
+    assert "read-only file system" in (got.stdout + got.stderr).lower(), got.stderr
+    listed = subprocess.run([r.bd, "list"], cwd=r.work, capture_output=True, text=True)
+    assert "ungranted write" not in listed.stdout
+
+
+def test_the_grant_does_not_leak_write_access_to_the_checkout(codex_sandbox_repo):
+    """Gotcha (b) at RUNTIME, not merely in the rendered flag list. Widening the
+    grant to the repo root would make every other test in this block pass while
+    silently deleting worktree isolation — so prove the boundary still bites:
+    inside the SAME sandbox that just wrote to the tracker, a write to a tracked
+    file in the primary checkout must still be denied."""
+    r = codex_sandbox_repo
+    target = r.work / "f.txt"
+    assert target.exists(), "fixture should have a tracked file in the checkout"
+
+    got = _bwrap([r.wt, *r.roots], r.wt,
+                 ["/usr/bin/env", "bash", "-c", f"echo leaked >> {target}"],
+                 r.scratch)
+
+    assert got.returncode != 0, "the primary checkout must stay read-only"
+    assert "leaked" not in target.read_text()
 
 
 if __name__ == "__main__":

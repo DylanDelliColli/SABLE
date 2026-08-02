@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # test-tiers.sh — per-repo CI-tier SSOT + loader (SABLE-cmar4.1).
 #
-# The ONE place a repo's three CI tiers' suite membership and duration
-# budgets live. Consumers — hooks/multi-manager/pre-push-rebase-test.sh
+# The ONE place a repo's three executable CI tiers' suite membership and all
+# gate duration budgets live. Consumers — hooks/multi-manager/pre-push-rebase-test.sh
 # (pre_push), bin/sable-merge-gate (merge_preview budget), and the future
 # jd5fj.5 snapshot runner (full_snapshot) — source this file or shell out to
 # its CLI instead of hardcoding their own suite lists. No duplicated test
@@ -19,6 +19,12 @@
 #                  ALLOW list — a real periodic/cadence-driven snapshot runner
 #                  is SABLE-jd5fj.5 and does not exist yet; this tier is
 #                  reserved for it.
+#
+# Budget-only entries:
+#   coverage_floor the pruning-diff patch-coverage subprocess. This is not an
+#                  executable suite tier, so it is intentionally absent from
+#                  --names/--list/--run; `--budget coverage_floor` is its live
+#                  SSOT interface (SABLE-1dmfc).
 #
 # merge_preview and full_snapshot alias shell-run-set.sh's ALLOW array BY
 # REFERENCE (sourced, not copied) so that file stays the one place ALLOW/
@@ -58,6 +64,7 @@ SABLE_TIER_NAMES=(pre_push merge_preview full_snapshot)
 declare -A SABLE_TIER_BUDGET_SEC=(
   [pre_push]=90
   [merge_preview]=900
+  [coverage_floor]=2400
   [full_snapshot]=1800
 )
 

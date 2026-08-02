@@ -1844,3 +1844,71 @@ def test_main_quiet_mode_clean_when_no_shadow_present(tmp_path, monkeypatch, cap
     assert rc == 0
     assert captured.out == ""
     assert captured.err == ""
+
+
+# --- Codex hook-graph execution preflight (SABLE-q9r1o) ---------------------
+
+def _write_provider_state(path: Path, provider: str):
+    path.write_text(json.dumps({
+        "mode": "execution",
+        "providers": {
+            "optimus": provider,
+            "tarzan": provider,
+            "chuck": provider,
+            "worker": provider,
+        },
+    }))
+
+
+def test_doctor_reports_missing_codex_hook_graph_in_execution_mode(
+    tmp_path, monkeypatch, capsys
+):
+    repo, claude_dir = make_repo(tmp_path)
+    state = tmp_path / "mode.json"
+    _write_provider_state(state, "codex")
+    monkeypatch.setenv("SABLE_MODE_STATE", str(state))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir)])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "[Codex hook graph] INVALID" in captured.out
+    assert "sable-orchestration-install --user --merge-settings" in captured.out
+
+
+def test_doctor_reports_clean_codex_hook_graph_row_in_execution_mode(
+    tmp_path, monkeypatch, capsys
+):
+    repo, claude_dir = make_repo(tmp_path)
+    state = tmp_path / "mode.json"
+    _write_provider_state(state, "codex")
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    hooks = codex_home / "hooks.json"
+    hooks.write_text('{"PreToolUse": [{}]}')
+    monkeypatch.setenv("SABLE_MODE_STATE", str(state))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir)])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert f"[Codex hook graph] CLEAN {hooks}" in captured.out
+
+
+def test_doctor_all_claude_execution_map_is_silent_about_codex_hooks(
+    tmp_path, monkeypatch, capsys
+):
+    repo, claude_dir = make_repo(tmp_path)
+    state = tmp_path / "mode.json"
+    _write_provider_state(state, "claude")
+    monkeypatch.setenv("SABLE_MODE_STATE", str(state))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir)])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "Codex hook graph" not in captured.out
+    assert "Codex hook graph" not in captured.err

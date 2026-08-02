@@ -18,9 +18,10 @@ no turn output rendered before the composer went idle again (a truncated
 turn, including a session-rate-limit cut mid-turn). This module detects that
 SHAPE directly rather than enumerating its lexical complement.
 
-Reuses bin/sable_pane_lib's canonical pane-state primitives (pane_busy,
-session_limit_reset) instead of re-deriving them -- the original probe
-reimplemented a crude local BUSY_MARKER check rather than importing the
+Reuses bin/sable_pane_lib's canonical pane-state primitives instead of
+re-deriving them. In particular, deliberate_hold now lives in that one
+provider-aware module and is re-exported here for compatibility; the original
+probe reimplemented a crude local BUSY_MARKER check rather than importing the
 shared one, the same enumerate-vs-derive mistake one layer up.
 
 WHY THE MANAGER-RESOLUTION AND VERDICT HALVES LIVE HERE TOO (SABLE-r69ho).
@@ -49,89 +50,9 @@ tracking gap that forces the whole arrangement is SABLE-0m78j.
 """
 from __future__ import annotations
 
-import re
-
-from sable_pane_lib import pane_busy, session_limit_reset
+from sable_pane_lib import deliberate_hold, pane_busy
 
 MANAGER_ROLES = ("optimus", "tarzan", "chuck")
-
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
-
-# Composer/box furniture: blank, a box-drawing border row, or the shell-cwd
-# footer line (`  user@host:~/path`) printed below the composer. None of
-# these are turn CONTENT, so they must not count as evidence a turn ran.
-_BORDER_RE = re.compile(r"^[\s\-─│╭╮╰╯]*$")
-_CWD_LINE_RE = re.compile(r"^\s*\S+@\S+:")
-
-SABLE_MSG_MARK = "⟦SABLE-MSG⟧"
-
-
-def _clean(line: str) -> str:
-    return _CTRL_RE.sub("", line).strip()
-
-
-def _is_chrome(line: str) -> bool:
-    """A pane row that is composer/box furniture, not turn content."""
-    if not line:
-        return True
-    if _BORDER_RE.match(line):
-        return True
-    if _CWD_LINE_RE.match(line):
-        return True
-    return False
-
-
-def deliberate_hold(capture: str) -> bool | None:
-    """Classify an idle manager pane's tail as a deliberate hold or a
-    dropped-wake stall, by SHAPE rather than by matching known hold phrases.
-
-    Returns:
-      True  -- a settled, empty composer with rendered turn output before
-               it: a deliberate hold, in any phrasing whatsoever.
-      False -- the stall shape: an unanswered wake still sitting unsent in
-               the composer, an empty composer with no turn content
-               rendered since the last event (a truncated turn), or a turn
-               cut short by the session-rate-limit banner.
-      None  -- the pane is not in a settled idle-composer state at all
-               (still busy, or no composer row is locatable in the
-               captured window) -- COULD-NOT-ASSESS for this axis, never
-               guessed (the silent-instrument contract).
-    """
-    if pane_busy(capture):
-        return None
-
-    cleaned = [_clean(line) for line in capture.splitlines()]
-
-    bare_idx = None
-    glyph_idx = None
-    for i, line in enumerate(cleaned):
-        if line.startswith(("❯", ">")):  # ❯ or >
-            glyph_idx = i
-            if line in ("❯", ">"):
-                bare_idx = i
-
-    if glyph_idx is None:
-        return None  # no composer row in the captured window at all
-
-    if glyph_idx != bare_idx:
-        # The bottom-most composer row still holds unsubmitted text: the box
-        # never went back to bare. A wake sitting there unsent is exactly
-        # the dropped-wake shape -- nothing can act on a message that was
-        # never even sent.
-        return False if SABLE_MSG_MARK in cleaned[glyph_idx] else None
-
-    above = [ln for ln in reversed(cleaned[:bare_idx]) if not _is_chrome(ln)]
-    if not above:
-        return False  # empty composer, nothing rendered above it: a
-        # truncated turn -- the other dropped-wake shape.
-
-    recent = "\n".join(reversed(above))
-    if session_limit_reset(recent) is not None:
-        return False  # a turn cut short by the rate-limit banner still
-        # repaints a normal-looking empty composer below it.
-
-    return True
-
 
 def resolve_manager_panes(list_panes_text: str,
                           roles: tuple[str, ...] = MANAGER_ROLES

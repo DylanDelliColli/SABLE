@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+import sable_pane_lib as pane_lib
+
 BIN = Path(__file__).resolve().parent / "sable-msg"
 SEAT_GATE_HOOK = Path(__file__).resolve().parent.parent / "hooks" / "multi-manager" / "seat-sighting-gate.sh"
 HAVE_TMUX = shutil.which("tmux") is not None
@@ -267,6 +269,43 @@ def test_message_delivered_to_registered_pane(tmux_socket):
     assert "SABLE-MSG-DELIVERED" in pane
 
 
+def test_submit_gap_is_present_against_real_tmux(tmux_socket):
+    """Measure the paste/Enter gap across real tmux invocations.
+
+    The recipient is intentionally the suite's bash stand-in, which has no
+    paste-burst detector and therefore CANNOT reproduce Codex swallowing the
+    Enter. A green result proves only that deliver_text preserves the measured
+    gap while driving a real tmux server. Faithful symptom coverage would need
+    a real Codex pane, which this repository's test suite does not spawn.
+    """
+    _start_pane(tmux_socket)
+    _require_until(
+        lambda: ">" in _capture(tmux_socket, "w"),
+        description="bash stand-in prompt",
+    )
+    base = ["tmux", "-L", tmux_socket]
+    text = "echo SUBMIT-GAP-LANDED"
+    send_times = []
+
+    def timed_run(cmd):
+        if "paste-buffer" in cmd or "send-keys" in cmd:
+            send_times.append(time.monotonic())
+        return subprocess.run(cmd, capture_output=True, text=True).returncode == 0
+
+    assert pane_lib.deliver_text(
+        base,
+        "w",
+        text,
+        text,
+        tries=2,
+        interval=0.01,
+        run=timed_run,
+        capture=lambda: pane_lib.capture_pane(base, "w"),
+    )
+    assert len(send_times) == 2
+    assert send_times[1] - send_times[0] >= pane_lib.SUBMIT_GAP_SECONDS
+
+
 def test_message_to_unknown_role_fails(tmux_socket):
     _start_pane(tmux_socket)
     r = _run_msg(tmux_socket, "ghost", "hello", "--from", "lincoln")
@@ -312,7 +351,10 @@ def test_idle_pane_receives_interrupt_first_attempt(tmux_socket, tmp_path):
     # launched with an inputrc binding Escape to a standalone no-op, modeling the
     # TUI's non-destructive Escape so the interrupt path is exercised faithfully.
     inputrc = tmp_path / "inputrc"
-    inputrc.write_text('"\\e": redraw-current-line\n')
+    inputrc.write_text(
+        '"\\e": redraw-current-line\n'
+        "set keyseq-timeout 1\n"
+    )
     _tmux(tmux_socket, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
           f"INPUTRC={inputrc} PS1='> ' bash --noprofile --norc")
     _tmux(tmux_socket, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
@@ -322,7 +364,8 @@ def test_idle_pane_receives_interrupt_first_attempt(tmux_socket, tmp_path):
          "--from", "lincoln", "--interrupt"],
         capture_output=True, text=True,
         env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
-             "SABLE_MSG_SUBMIT_TRIES": "1", "SABLE_MSG_AUTO_FALLBACK": "0"},
+             "SABLE_MSG_SUBMIT_TRIES": "1", "SABLE_MSG_AUTO_FALLBACK": "0",
+             "SABLE_MSG_POLL_INTERVAL": "0.2"},
     )
     assert r.returncode == 0, r.stderr          # delivered, verified, first attempt
     _require_until(

@@ -598,6 +598,24 @@ mis-sized budget: if a wrapper needs materially more than this, the honest fix i
 to raise SABLE_MG_IMPACT_TIMEOUT / SABLE_MG_IMPACT_LOCK_TIMEOUT so the number the
 wrapper derives is the number the gate actually intends to spend."""
 
+COVERAGE_FLOOR_TIER = "coverage_floor"
+COVERAGE_FLOOR_FALLBACK_TIMEOUT_S = 600.0
+COVERAGE_FLOOR_DECLARED_FULL_FALLBACK_COST_S = 887.0
+"""Measured idle full `pytest bin/` fallback cost in seconds.
+
+Provenance: 2026-07-29 on the fleet's 24-core box, after SABLE-4gxef made 59
+previously-fast-failing tests run to completion. This is a declared sizing
+input, not a wall-clock assertion; refresh it from --sable-test-cost-report.
+"""
+
+
+def coverage_floor_budget_is_sized(
+        budget_s: float,
+        full_fallback_cost_s: float = COVERAGE_FLOOR_DECLARED_FULL_FALLBACK_COST_S,
+        headroom: float = BUDGET_HEADROOM) -> bool:
+    """Whether the floor can pay its deliberate full-suite fallback + margin."""
+    return budget_s >= full_fallback_cost_s * headroom
+
 
 def impact_budget(repo: str | None = None) -> dict:
     """The gate's own worst-case promote wall-clock, so an ENCLOSING wrapper can
@@ -619,8 +637,8 @@ def impact_budget(repo: str | None = None) -> dict:
     THE WORST CASE IS A SUM, NOT THE TIER BUDGET. The lock wait is deliberately
     EXCLUDED from the tier's own budget (see run_impact_tier — a queued promote
     still gets its full tier budget, which is correct and must not be "fixed"), so
-    a promote can spend LOCK WAIT + TIER + COVERAGE FLOOR, i.e. ~5400s on stock
-    defaults. A wrapper sized to the tier budget alone is MORE wrong after
+    a promote can spend LOCK WAIT + TIER + COVERAGE FLOOR. A wrapper sized to
+    the tier budget alone is MORE wrong after
     jd5fj.13, not less: under a burst the queue wait alone can exceed it.
 
     THE COVERAGE FLOOR IS A THIRD TERM, NOT A FOOTNOTE (SABLE-5v3d5). cmar4.5
@@ -629,10 +647,9 @@ def impact_budget(repo: str | None = None) -> dict:
     before any preview/CI work — so a promote may legitimately spend that
     ceiling too, on top of the queue wait and the impact tier. Before this fix
     that ceiling was NOT in this sum: cmar4.9 later re-pinned
-    _coverage_floor_timeout to borrow the same SSOT the tier budget does (900s
-    in place of a hardcoded 600s) and worst_case_s did not move, because the
-    changed term was never a summand — an instrument that cannot see its own
-    blind spot, pointed at the number that bounds every promote.
+    _coverage_floor_timeout to the tier SSOT and worst_case_s did not move,
+    because the changed term was never a summand — an instrument that cannot
+    see its own blind spot, pointed at the number that bounds every promote.
 
     Reported in seconds:
       tier_timeout_s           SABLE_MG_IMPACT_TIMEOUT — the tier's own run
@@ -659,6 +676,9 @@ def impact_budget(repo: str | None = None) -> dict:
         "tier_timeout_s": tier,
         "lock_timeout_s": lock,
         "coverage_floor_timeout_s": coverage_floor,
+        "coverage_floor_declared_full_fallback_cost_s":
+            COVERAGE_FLOOR_DECLARED_FULL_FALLBACK_COST_S,
+        "budget_headroom": BUDGET_HEADROOM,
         "worst_case_s": worst,
         "recommended_wrapper_timeout_s": int(math.ceil(worst * BUDGET_HEADROOM)),
         "serialized": impact_serialization_enabled(),
@@ -1173,6 +1193,46 @@ def _bounded_failure_detail(stdout: str, limit: int = 4000) -> str:
     return f"{prefix}{excerpt[:limit]}\n[...truncated, {dropped} more char(s) omitted...]"
 
 
+_SUITE_FATAL_ABORT_RE = re.compile(r'^FATAL:', re.MULTILINE)
+
+
+def _is_suite_infra_abort(returncode: int, output: str) -> bool:
+    """True when a hooks/test/*.sh suite's non-zero exit is the SUITE'S OWN
+    fixture-setup abort, not a content test failure (SABLE-sx1rb — the
+    scratch bd DB collision that false-RED'd SABLE-r0mzn and SABLE-6eu9w).
+
+    Every suite under hooks/test/ follows one repo-wide convention — TWO
+    DISTINCT, SEPARATELY-VERIFIED measurements, not one number: bare `exit
+    2` occurs at 44 call sites (grep, `hooks/test/*.sh`), and NONE of those
+    44 sits inside a PASS/FAIL content-accounting branch (`[ "$FAIL" -gt 0
+    ] && exit N` uses exit 1 at every site, never 2) — so exit 2 is never a
+    genuine content-failure exit anywhere in the tree. Independently,
+    `FATAL: ...` self-report lines (optimus's own read, 2026-07-27: 39
+    sites) are ALL fixture/infrastructure in nature (missing files, `cd`
+    failures, clone failures, could-not-init, absent diff-cover/pytest-cov,
+    could-not-extract-bead-ids) and NONE is a content assertion. A genuine
+    content failure always goes through each suite's own PASS/FAIL loop and
+    exits 1, never 2, never via a `FATAL:` line. Requiring BOTH the code
+    and the suite's own `FATAL:` self-report — rather than trusting either
+    alone — is the same prefer-the-self-report-over-the-bare-code
+    discipline SABLE-9yjt5 landed for the coverage floor: an exit 2 without
+    a FATAL line (a future suite reusing the code for something else) reads
+    as content-attributable rather than silently swallowed as
+    infrastructure — fails toward blaming the branch, never toward
+    excusing it.
+
+    THE ASSUMPTION THIS RESTS ON, NAMED SO IT CANNOT DECAY UNEXAMINED: the
+    convention above must keep HOLDING GOING FORWARD. This function has no
+    way to distinguish "genuinely could not build its fixture" from "chose
+    to print FATAL: and exit 2 for a content reason" — it trusts the
+    convention, not the suite's intent. A future suite that prints FATAL:
+    and exits 2 for what is actually a content defect would be silently
+    excused as infrastructure, which is the ONE way this fix fails
+    permissive. Nothing enforces the convention mechanically; it holds only
+    because every site observed at fix time (2026-07-27) honors it."""
+    return returncode == 2 and bool(_SUITE_FATAL_ABORT_RE.search(output or ""))
+
+
 def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, str]:
     """Run the cmar4 impact tier against the REAL COMBINED TREE, ONE AT A TIME
     PER SEAT (SABLE-jd5fj.13), and report (GREEN|RED|ERROR, detail).
@@ -1317,9 +1377,16 @@ def _impact_isolated_env(parent: str | os.PathLike) -> dict[str, str]:
 
     beads_root = parent / "beads"
     beads_root.mkdir(parents=True, exist_ok=True)
+    # SABLE-sx1rb (Part B, tarzan): this is the isolation-CONSTRUCTING init —
+    # it must run under the isolated `env` built above (HOME/TMPDIR already
+    # scoped to `parent`), not the caller's real os.environ. Running it
+    # against the real HOME contradicts this function's own docstring and can
+    # touch the operator's real dolt config/registry. This is a real,
+    # independent hardening fix — it does NOT change the pointer the shell
+    # suites below inherit (BEADS_DB is set AFTER this call, at :1284/below).
     init = subprocess.run(
         ["bd", "init", "--prefix=impacttier"], cwd=str(beads_root),
-        env={**os.environ, "BD_NON_INTERACTIVE": "1"},
+        env={**env, "BD_NON_INTERACTIVE": "1"},
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
     )
     if init.returncode != 0:
@@ -1431,6 +1498,18 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str],
                     _record_phase(phases, f"shell:{suite}", _t0)
                 ran.append(suite)
                 if cp.returncode != 0:
+                    # SABLE-sx1rb: an INFRASTRUCTURE fault (the suite could
+                    # not build its own fixture) is not a property of the
+                    # branch under test and must not name it — IMPACT_ERROR,
+                    # not IMPACT_RED, exactly like the worktree-checkout and
+                    # missing-manifest cases above. A genuine content
+                    # failure (exit 1, or exit 2 without the suite's own
+                    # FATAL self-report) still returns IMPACT_RED unchanged.
+                    if _is_suite_infra_abort(cp.returncode, cp.stdout):
+                        return (IMPACT_ERROR,
+                            f"{suite} could not build its own test fixture on the combined "
+                            f"tree (rc={cp.returncode}, infrastructure — not a defect on the "
+                            f"branch): {_bounded_failure_detail(cp.stdout)}")
                     return (IMPACT_RED, f"{suite} FAILED on the combined tree (rc={cp.returncode}): "
                                         f"{_bounded_failure_detail(cp.stdout)}")
 
@@ -2023,27 +2102,22 @@ def assert_batch_members_identified(members: list) -> None:
 # --------------------------------------------------------------------------
 
 def _coverage_floor_timeout(repo: str | None = None) -> float:
-    """SABLE-cmar4.9: the coverage-floor check's run budget, derived from the
-    merge_preview tier's SSOT (.github/ci/test-tiers.sh, via
+    """SABLE-1dmfc/cmar4.9: the coverage-floor check's run budget, derived
+    from its own budget entry in the tier SSOT (.github/ci/test-tiers.sh, via
     sable_gate_budget_lib.tier_budget_sec) instead of a fresh hand-picked
     literal — the same duplicated-list class SABLE-jd5fj.9 just closed for
     _impact_timeout, and that SABLE-w0zjm's promote-budget mechanism exists to
     eliminate generally.
 
-    Borrows merge_preview's budget rather than declaring the coverage floor
-    its own tier entry, mirroring jd5fj.9's choice for the same reason: it is
-    faithful to today's behaviour (600 sits under merge_preview's 900 today)
-    and adding a tier entry here would be scope creep this bead explicitly
-    disclaims. The coverage floor runs inside the promote path rather than
-    inside merge_preview's own suite list, so if its runtime characteristics
-    ever prove to need a different ceiling than merge_preview's, the SSOT
-    should grow a dedicated entry instead of a second borrow — flagged here,
-    not decided.
+    The coverage floor runs inside promote(), not inside merge_preview's suite
+    list, and deliberately falls back to the full Python suite whenever scope
+    cannot be proved. Its independently sized `coverage_floor` entry prevents
+    changes to merge-preview policy from silently moving this subprocess cap.
 
     SABLE_MG_COVERAGE_FLOOR_TIMEOUT is an explicit override and always wins
     over the SSOT, exactly as before. `repo` defaults to the current working
     directory. A missing or broken SSOT (or an unparseable override) falls
-    back to the pre-fix constant (600) — never raises, mirroring
+    back to the named pre-fix constant — never raises, mirroring
     _impact_timeout's and git_lib.default_mg_timeout's never-raises
     contract."""
     override = os.environ.get("SABLE_MG_COVERAGE_FLOOR_TIMEOUT")
@@ -2051,9 +2125,9 @@ def _coverage_floor_timeout(repo: str | None = None) -> float:
         try:
             return float(override)
         except ValueError:
-            return 600.0
-    budget = budget_lib.tier_budget_sec(repo or os.getcwd(), "merge_preview")
-    return budget if budget is not None else 600.0
+            return COVERAGE_FLOOR_FALLBACK_TIMEOUT_S
+    budget = budget_lib.tier_budget_sec(repo or os.getcwd(), COVERAGE_FLOOR_TIER)
+    return budget if budget is not None else COVERAGE_FLOOR_FALLBACK_TIMEOUT_S
 
 
 # --- Phase attribution for the coverage floor (SABLE-9yjt5) ---------------
@@ -2195,7 +2269,7 @@ def run_coverage_floor_check(repo: str, base_sha: str, branch_sha: str) -> Cover
         return CoverageFloorRun(None, PHASE_TIMED_OUT,
             f"the check RAN but did not finish: killed after {elapsed:.0f}s against a "
             f"{float(limit):.0f}s budget (SABLE_MG_COVERAGE_FLOOR_TIMEOUT / the "
-            f"merge_preview tier), so NO coverage number was produced. The branch DOES "
+            f"coverage_floor tier), so NO coverage number was produced. The branch DOES "
             f"carry the check. Adding tests LENGTHENS this run and makes it strictly "
             f"worse — raise the budget or shorten the suite")
     except OSError as exc:

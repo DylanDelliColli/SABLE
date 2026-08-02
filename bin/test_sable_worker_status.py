@@ -48,6 +48,146 @@ def test_parse_worker_panes_missing_status_defaults_running():
     assert panes == [{"pane": "%5", "bead": "abc-9", "status": "running"}]
 
 
+# --- SABLE-71i2x: quiescence is a process-tree fact, not a pane/tag claim ---
+
+def _write_proc_node(proc_root, pid, ppid, *, comm, argv, children=()):
+    node = proc_root / str(pid)
+    task = node / "task" / str(pid)
+    task.mkdir(parents=True)
+    (node / "stat").write_text(
+        f"{pid} ({comm}) S {ppid} 1 1 0 -1 4194304 100 0 0 0 1 2 3 4\n"
+    )
+    (node / "comm").write_text(f"{comm}\n")
+    (node / "cmdline").write_bytes(
+        b"\x00".join(part.encode() for part in argv) + b"\x00"
+    )
+    (task / "children").write_text(" ".join(str(child) for child in children))
+
+
+def test_process_tree_trichotomy_uses_descendants_not_legacy_pane_signals(tmp_path):
+    """The two legacy signals are deliberately absent from this fixture.
+
+    Root 100 is a bare pane shell and PID 200 is its resident Codex child.
+    A probe that reads only the root process (the pane_current_command shape)
+    says EXITED; walking the full descendant tree must say LIVE and name 200.
+    The sibling root 300 is the genuinely bare-shell negative control.
+    """
+    _write_proc_node(tmp_path, 100, 1, comm="zsh", argv=("zsh",), children=(200,))
+    _write_proc_node(
+        tmp_path, 200, 100, comm="codex", argv=("/opt/codex", "resume")
+    )
+    _write_proc_node(tmp_path, 300, 1, comm="zsh", argv=("zsh",))
+
+    live = sws.classify_pane_process_tree(
+        {"pane": "%live", "bead": "live-bead", "root_pid": 100},
+        proc_root=str(tmp_path),
+    )
+    exited = sws.classify_pane_process_tree(
+        {"pane": "%bare", "bead": "bare-bead", "root_pid": 300},
+        proc_root=str(tmp_path),
+    )
+
+    assert live["state"] == sws.QUIESCENCE_LIVE
+    assert [node["pid"] for node in live["agents"]] == [200]
+    assert live["visited_pids"] == [100, 200]
+    assert exited["state"] == sws.QUIESCENCE_EXITED
+    assert exited["agents"] == []
+    assert exited["visited_pids"] == [300]
+
+
+def test_process_tree_unreadable_is_cannot_assess_not_exited(tmp_path):
+    _write_proc_node(tmp_path, 400, 1, comm="zsh", argv=("zsh",))
+    children = tmp_path / "400" / "task" / "400" / "children"
+    children.unlink()
+    children.mkdir()  # opening a directory as the children file must fail closed
+
+    result = sws.classify_pane_process_tree(
+        {"pane": "%unknown", "bead": "unknown-bead", "root_pid": 400},
+        proc_root=str(tmp_path),
+    )
+
+    assert result["state"] == sws.QUIESCENCE_CANNOT_ASSESS
+    assert result["agents"] == []
+    assert "children" in result["reason"]
+
+
+def test_process_tree_walks_children_of_every_thread(tmp_path):
+    _write_proc_node(tmp_path, 500, 1, comm="zsh", argv=("zsh",))
+    threaded_task = tmp_path / "500" / "task" / "501"
+    threaded_task.mkdir()
+    (threaded_task / "children").write_text("600")
+    _write_proc_node(
+        tmp_path, 600, 500, comm="claude", argv=("/opt/claude",)
+    )
+
+    result = sws.classify_pane_process_tree(
+        {"pane": "%threaded", "bead": "threaded-bead", "root_pid": 500},
+        proc_root=str(tmp_path),
+    )
+
+    assert result["state"] == sws.QUIESCENCE_LIVE
+    assert result["visited_pids"] == [500, 600]
+    assert [node["kind"] for node in result["agents"]] == ["claude"]
+
+
+def test_agent_detection_is_executable_shaped_not_a_prompt_substring():
+    assert sws.agent_process_kind(
+        {"comm": "codex", "argv": ["/home/ddc/.local/bin/codex"]}
+    ) == "codex"
+    assert sws.agent_process_kind(
+        {"comm": "sleep", "argv": ["codex", "45"]}
+    ) == "codex"
+    assert sws.agent_process_kind(
+        {"comm": "python3", "argv": ["python3", "/tmp/test_codex_probe.py"]}
+    ) is None
+    assert sws.agent_process_kind(
+        {"comm": "bash", "argv": ["bash", "-c", "echo codex"]}
+    ) is None
+
+
+def test_explicit_pane_root_accepts_manager_without_worker_filtering():
+    line = "%42\toptimus\t\trunning\tmanager\t\toptimus\toptimus\t4242"
+
+    def runner(cmd):
+        assert cmd[-6:-1] == ["display-message", "-p", "-t", "%42", "-F"]
+        assert cmd[-1] == sws._QUIESCENCE_FORMAT
+        return line
+
+    root = sws.explicit_pane_process_root(None, "%42", run=runner)
+
+    assert root == {"pane": "%42", "bead": "", "root_pid": 4242}
+
+
+def test_explicit_missing_pane_is_per_pane_cannot_assess():
+    def runner(cmd):
+        raise subprocess.CalledProcessError(1, cmd, stderr="can't find pane: %404")
+
+    result = sws.explicit_pane_quiescence(
+        None, ["%404"], proc_root="/proc", run=runner
+    )
+
+    assert result == [{
+        "pane": "%404", "bead": "", "root_pid": None,
+        "agents": [], "visited_pids": [],
+        "state": sws.QUIESCENCE_CANNOT_ASSESS,
+        "reason": "cannot resolve tmux pane target '%404': can't find pane: %404",
+    }]
+
+
+@pytest.mark.parametrize("conflict", [
+    ["--quiescence"],
+    ["--reap"],
+    ["--all"],
+    ["--mine"],
+    ["--lane", "optimus"],
+])
+def test_explicit_quiescence_rejects_population_and_mutation_options(conflict):
+    with pytest.raises(SystemExit) as exc:
+        sws.main(["--quiescence-pane", "%42", *conflict])
+
+    assert exc.value.code == 2
+
+
 # --- SABLE-exab: whitespace-split collapsed an EMPTY @sable_bead field,
 # shifting every later column left by one -- reproduced live by a producer
 # pane (victor) spawned WITHOUT a bead tag, whose status/class/deliverable
@@ -1158,7 +1298,9 @@ def test_dialog_stall_false_on_idle_composer_with_numbered_block():
 def test_dialog_stall_false_on_busy_crafting_pane_with_queued_block():
     # the busy-guard near-miss: 'esc to interrupt' is NOT in frame, but the
     # spinner+elapsed status row proves the pane is working — never flag it.
-    assert sws.pane_working(BUSY_CRAFTING_WITH_QUEUED_BLOCK) is True
+    assert sws.pane_working(
+        BUSY_CRAFTING_WITH_QUEUED_BLOCK, "claude"
+    ) is True
     assert sws.dialog_stall(BUSY_CRAFTING_WITH_QUEUED_BLOCK) is False
 
 
@@ -1293,12 +1435,14 @@ def test_flag_dialog_stalls_ignores_busy_and_idle_false_positives():
 def test_pane_working_still_true_for_plain_esc_to_interrupt():
     # pane_working is a SUPERSET of pane_busy: the classic interrupt hint still
     # marks a working pane even without a visible elapsed timer.
-    assert sws.pane_working("● doing work\n✻ Thinking… (esc to interrupt)\n❯") is True
+    assert sws.pane_working(
+        "● doing work\n✻ Thinking… (esc to interrupt)\n❯", "claude"
+    ) is True
 
 
 def test_pane_working_false_for_idle_dialog():
     # a real idle dialog has neither a spinner nor a running timer.
-    assert sws.pane_working(REAL_PERMISSION_DIALOG) is False
+    assert sws.pane_working(REAL_PERMISSION_DIALOG, "claude") is False
 
 
 # --- SABLE-1g8i: sable-worker-status printed 'no worker panes' (a false-empty)

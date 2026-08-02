@@ -98,32 +98,34 @@ def test_settled_hold_is_not_stall():
         "  fresh Lincoln once it is booted. Recycle duty is complete and",
         "  verified... nothing is owed until morning.",
     ])
-    assert deliberate_hold(pane) is True
+    assert deliberate_hold(pane, "claude") is True
 
 
 def test_dropped_wake_is_stall():
     """Negative control: a delivered wake with no subsequent action."""
-    assert deliberate_hold(_stuck_wake_pane()) is False
+    assert deliberate_hold(_stuck_wake_pane(), "claude") is False
 
 
 def test_truncated_turn_is_stall():
     """An empty, settled composer with no rendered turn content at all."""
-    assert deliberate_hold(_truncated_pane()) is False
+    assert deliberate_hold(_truncated_pane(), "claude") is False
 
 
 def test_session_limit_cut_is_stall():
     """A turn cut by the rate-limit banner still repaints a normal composer
     (SABLE-ita7) -- must not be misread as a completed, deliberate hold."""
     pane = _settled_pane(["You have hit your session limit - resets 2pm"])
-    assert deliberate_hold(pane) is False
+    assert deliberate_hold(pane, "claude") is False
 
 
 def test_busy_pane_is_not_assessed():
-    assert deliberate_hold(_busy_pane()) is None
+    assert deliberate_hold(_busy_pane(), "claude") is None
 
 
 def test_no_composer_row_is_not_assessed():
-    assert deliberate_hold("● some scrollback with no composer visible\n") is None
+    assert deliberate_hold(
+        "● some scrollback with no composer visible\n", "claude"
+    ) is None
 
 
 @pytest.mark.parametrize("phrase", [
@@ -138,7 +140,7 @@ def test_hold_phrasing_variants(phrase):
     list this bead removed -- guards the enumeration regression class: any
     phrasing must classify as a hold, not just the ones on some list."""
     pane = _settled_pane([f"● {phrase}"])
-    assert deliberate_hold(pane) is True
+    assert deliberate_hold(pane, "claude") is True
 
 
 # ===========================================================================
@@ -247,7 +249,7 @@ def test_stall_path_is_reachable():
     assert degraded == [], "no axis may be unreadable in the STALL fixture"
     assert set(states.values()) == {"IDLE"}
 
-    held = {role: deliberate_hold(captures[pane])
+    held = {role: deliberate_hold(captures[pane], "claude")
             for role, pane in resolved.items()}
     assert set(held.values()) == {False}, "the dropped-wake shape, all three"
 
@@ -266,7 +268,7 @@ def test_running_when_a_manager_is_busy():
 
     assert states["tarzan"] == "BUSY"
     assert degraded == []
-    held = {role: deliberate_hold(captures[pane])
+    held = {role: deliberate_hold(captures[pane], "claude")
             for role, pane in resolved.items()}
     assert stall_verdict(states, held, ready=7, in_flight=1, cap=4,
                          degraded=degraded) == ("RUNNING", 0)
@@ -278,7 +280,7 @@ def test_all_idle_by_decision_is_running_held_not_stall():
     resolved = resolve_manager_panes(_fleet_dump())
     captures = {pane: _held_pane() for pane in _ALIEN.values()}
     states, degraded = manager_axis_states(resolved, _capture_from(captures))
-    held = {role: deliberate_hold(captures[pane])
+    held = {role: deliberate_hold(captures[pane], "claude")
             for role, pane in resolved.items()}
 
     assert set(held.values()) == {True}
@@ -562,7 +564,7 @@ def test_script_agrees_with_lib_verdict(tmp_path, name, fixture_fn):
     held = {}
     if states and all(v == "IDLE" for v in states.values()):
         for role, pane in resolved.items():
-            held[role] = deliberate_hold(captures[pane])
+            held[role] = deliberate_hold(captures[pane], "claude")
             if held[role] is None:
                 degraded.append(f"deliberate-idle unreadable for {pane}")
     _, expected = stall_verdict(states, held, fixture["ready"],
