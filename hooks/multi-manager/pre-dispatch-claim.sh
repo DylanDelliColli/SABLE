@@ -61,6 +61,34 @@ for i in sorted(ids):
 
 [ -z "$BEAD_IDS" ] && exit 0
 
+# One parser owns the declared-footprint grammar (SABLE-rzrak/mh967). This
+# literal non-comment reference is also the orchestration installer's hard
+# sibling-dependency signal (SABLE-nn54x).
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FP_LIB="$HOOK_DIR/../../bin/sable_footprint_lib.py"
+
+deny_footprint_claim() {
+  FOOTPRINT_DENY_REASON="$1" python3 -c "
+import json, os
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'permissionDecision': 'deny',
+        'permissionDecisionReason': (
+            'FOOTPRINT CLAIM COULD NOT RUN — '
+            + os.environ.get('FOOTPRINT_DENY_REASON', '')
+            + '. Dispatch is refused because an unreadable or partially-read '
+              'claim can release a real file collision.'),
+    }
+}))
+"
+}
+
+if [ ! -r "$FP_LIB" ]; then
+  deny_footprint_claim "footprint parser not found at $FP_LIB"
+  exit 0
+fi
+
 # For each bead, parse its record once for the footprint and initial claim
 # state. Already-claimed beads stop there. Before writing an initially empty
 # claim, re-read just that field at the old last-responsible-moment seam so a
@@ -69,59 +97,37 @@ for BEAD_ID in $BEAD_IDS; do
   BEAD_RECORD=$(bd show "$BEAD_ID" --json 2>/dev/null) || BEAD_RECORD=""
   [ -z "$BEAD_RECORD" ] && continue
 
-  # Parse the description, derived footprint, and initial claim state in one
-  # Python process. The first output line is only a presence bit (the claim's
-  # value is never used); the second is the footprint. This avoids transporting
-  # an arbitrary multiline description through a shell delimiter while
-  # preserving the footprint-section precedence and legacy regex fallback.
+  # Parse the description, derived footprint, and initial claim state in the
+  # shared CLI. `c` is claim presence, `f` is an accepted path, and `u` is a
+  # declaration that was present but not read completely. ANY `u` on an
+  # unclaimed bead refuses the dispatch: salvaging one path while dropping
+  # another is the unsafe narrowing direction this writer used to persist.
   #
   # SABLE-jd5fj.6: a planner-authored `## File footprint` section remains the
   # authoritative source, including extension-less paths such as
   # bin/sable-spawn-worker. The generic extension regex is only the fallback
   # for beads authored before that convention.
-  CLAIM_FIELDS=$(printf '%s' "$BEAD_RECORD" | python3 -c "
-import json, re, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-if not isinstance(data, list) or not data or not isinstance(data[0], dict):
-    sys.exit(0)
-record = data[0]
-description = record.get('description', '') or ''
-# The former DESC command substitution stripped trailing newlines printed by
-# Python; retain that normalization before applying the exact same matchers.
-text = str(description).rstrip('\\n')
-metadata = record.get('metadata', {}) or {}
-try:
-    current_claims = metadata.get('wip_claims', '') or ''
-except Exception:
-    current_claims = ''
-# The former command substitution also stripped trailing newlines from this
-# printed field before testing `-n`; preserve that edge-case normalization.
-current_claims = str(current_claims).rstrip('\\n') if current_claims else ''
-paths = set()
-section = re.search(r'^##\s*File footprint\s*\n(.+?)(?=\n##\s|\Z)', text,
-                     re.MULTILINE | re.DOTALL)
-if section:
-    for part in section.group(1).split(','):
-        part = part.strip()
-        if not part:
-            continue
-        paths.add(part.split()[0])
-else:
-    for m in re.finditer(r'(?:^|[\s\(\[\"\\'])((?:[\w\-./]+/)?[\w\-./]+\.(?:ts|tsx|js|jsx|py|rs|go|java|rb|md|yaml|yml|toml|json|sh|sql|css|scss|html))(?=[\s\)\]\"\\',:;]|$)', text, re.MULTILINE):
-        paths.add(m.group(1))
-print('1' if current_claims else '0')
-print(','.join(sorted(paths)))
-" 2>/dev/null) || CLAIM_FIELDS=""
+  if ! CLAIM_FIELDS=$(printf '%s' "$BEAD_RECORD" | \
+      python3 "$FP_LIB" --read-dispatch-record --scavenge 2>&1); then
+    deny_footprint_claim "footprint parser failed for $BEAD_ID: $(printf '%s' "$CLAIM_FIELDS" | head -c 240)"
+    exit 0
+  fi
 
-  [ -z "$CLAIM_FIELDS" ] && continue
-  CURRENT_CLAIMS_PRESENT="${CLAIM_FIELDS%%$'\n'*}"
-  case "$CLAIM_FIELDS" in
-    *$'\n'*) FILES="${CLAIM_FIELDS#*$'\n'}" ;;
-    *) FILES="" ;;
+  CURRENT_CLAIMS_PRESENT=$(printf '%s\n' "$CLAIM_FIELDS" | sed -n 's/^c//p' | head -1)
+  case "$CURRENT_CLAIMS_PRESENT" in
+    1) continue ;;  # claims already established; the overlap gate assesses them
+    0) ;;
+    *)
+      deny_footprint_claim "footprint parser returned an invalid claim-state record for $BEAD_ID"
+      exit 0
+      ;;
   esac
+  FILES=$(printf '%s\n' "$CLAIM_FIELDS" | sed -n 's/^f//p' | sort -u | paste -sd, -)
+  UNREADABLE=$(printf '%s\n' "$CLAIM_FIELDS" | sed -n 's/^u//p' | paste -sd';' -)
+  if [ -n "$UNREADABLE" ]; then
+    deny_footprint_claim "$BEAD_ID has an unreadable declared footprint: $UNREADABLE"
+    exit 0
+  fi
 
   [ -z "$FILES" ] && continue
 
@@ -147,8 +153,6 @@ print(','.join(sorted(paths)))
   # replace, any blob write here would silently clobber wip_claims. See
   # SABLE-gkofi (filed to reconcile this with SABLE-szd/SABLE-sm269, whose
   # descriptions assumed the blob form already replaces).
-  [ "$CURRENT_CLAIMS_PRESENT" = "1" ] && continue  # claims already established
-
   # Preserve the original concurrency guard: footprint parsing is deliberately
   # outside the write boundary, so refresh wip_claims immediately before the
   # update. An unreadable refresh is not evidence of absence and therefore

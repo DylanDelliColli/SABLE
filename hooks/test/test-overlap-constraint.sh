@@ -115,7 +115,7 @@ print(json.dumps(d))
 }
 
 # run_hook <json> <overlap_file> [disp_desc] [disp_serialize_with] [disp_notes]
-#          [disp_wip_claims]
+#          [disp_wip_claims] [hook_path]
 run_hook() {
   BD_CALL_LOG="$FIXTURE_DIR/bd_calls.log"
   : > "$BD_CALL_LOG"
@@ -130,7 +130,7 @@ run_hook() {
         DISP_WIP_CLAIMS="${6:-}" \
         BD_CALL_LOG="$BD_CALL_LOG" \
         PATH="$STUB_DIR:$PATH" \
-        bash "$HOOK" 2>/dev/null
+        bash "${7:-$HOOK}" 2>/dev/null
 }
 
 # Case 1: manager-subagent dispatch whose bead file (hooks/foo.sh) collides
@@ -319,6 +319,62 @@ if printf '%s' "$OUT" | grep -q 'OVERLAP DETECTED' && ! printf '%s' "$OUT" | gre
   pass "well-formed overlapping footprint still denies with the ORDINARY overlap reason"
 else
   fail "well-formed overlapping footprint still denies with the ORDINARY overlap reason" "got: ${OUT:-<empty>}"
+fi
+
+# SABLE-rzrak/mh967: historical bytes, partial-declaration refusal, repeated
+# sections, and the shell-facing parser dependency failure polarities.
+AWMJ4_DESC=$'## File footprint\nhooks/test/test-impact-tier-serialization.sh (and whatever window-log emitter it reads, if the fix needs a sequence field).'
+OUT=$(run_hook "$(make_input a15 optimus 'Work SABLE-disp')" "hooks/test/test-impact-tier-serialization.sh" "$AWMJ4_DESC")
+if printf '%s' "$OUT" | grep -q 'OVERLAP DETECTED' \
+   && ! printf '%s' "$OUT" | grep -qE '(^|[, ])if([, ]|$)'; then
+  pass "shared parser: historical awmj4 bytes overlap only on the real path"
+else
+  fail "shared parser: historical awmj4 bytes overlap only on the real path" "got: ${OUT:-<empty>}"
+fi
+
+RRN6R_DESC=$'## File footprint\nGitHub repo settings (rulesets) OR hooks/multi-manager/pre-push-rebase-test.sh (leg 2); docs update in MULTI-MANAGER-PATTERN.md merge-path section'
+OUT=$(run_hook "$(make_input a16 optimus 'Work SABLE-disp')" "unrelated/other.py" "$RRN6R_DESC")
+if printf '%s' "$OUT" | grep -q 'permissionDecision.*deny' \
+   && printf '%s' "$OUT" | grep -q 'GitHub' \
+   && printf '%s' "$OUT" | grep -q 'COULD NOT RUN'; then
+  pass "shared parser: historical rrn6r partial declaration refuses loudly"
+else
+  fail "shared parser: historical rrn6r partial declaration refuses loudly" "got: ${OUT:-<empty>}"
+fi
+
+REPEATED_DESC=$'## File footprint\nbin/a.py\nbin/b.py\n\n## File footprint\nhooks/shared.sh\n'
+OUT=$(run_hook "$(make_input a17 optimus 'Work SABLE-disp')" "hooks/shared.sh" "$REPEATED_DESC")
+if printf '%s' "$OUT" | grep -q 'OVERLAP DETECTED' \
+   && printf '%s' "$OUT" | grep -q 'hooks/shared.sh'; then
+  pass "shared parser: newline and repeated sections reach the shell overlap gate"
+else
+  fail "shared parser: newline and repeated sections reach the shell overlap gate" "got: ${OUT:-<empty>}"
+fi
+
+BROKEN_HOOK_ROOT="$FIXTURE_DIR/broken-hook"
+mkdir -p "$BROKEN_HOOK_ROOT/hooks/multi-manager" "$BROKEN_HOOK_ROOT/bin"
+cp -f "$REPO"/hooks/multi-manager/*.sh "$BROKEN_HOOK_ROOT/hooks/multi-manager/"
+OUT=$(run_hook "$(make_input a18 optimus 'Work SABLE-disp')" "hooks/foo.sh" "$FOOTPRINT_DESC" "" "" "" \
+  "$BROKEN_HOOK_ROOT/hooks/multi-manager/pre-dispatch-overlap.sh")
+if printf '%s' "$OUT" | grep -q 'permissionDecision.*deny' \
+   && printf '%s' "$OUT" | grep -qi 'footprint.*not found'; then
+  pass "shared parser: absent CLI dependency refuses overlap assessment loudly"
+else
+  fail "shared parser: absent CLI dependency refuses overlap assessment loudly" "got: ${OUT:-<empty>}"
+fi
+
+cat > "$BROKEN_HOOK_ROOT/bin/sable_footprint_lib.py" <<'PY'
+#!/usr/bin/env python3
+raise SystemExit(9)
+PY
+chmod +x "$BROKEN_HOOK_ROOT/bin/sable_footprint_lib.py"
+OUT=$(run_hook "$(make_input a19 optimus 'Work SABLE-disp')" "hooks/foo.sh" "$FOOTPRINT_DESC" "" "" "" \
+  "$BROKEN_HOOK_ROOT/hooks/multi-manager/pre-dispatch-overlap.sh")
+if printf '%s' "$OUT" | grep -q 'permissionDecision.*deny' \
+   && printf '%s' "$OUT" | grep -qi 'parser.*failed'; then
+  pass "shared parser: crashing CLI dependency refuses overlap assessment loudly"
+else
+  fail "shared parser: crashing CLI dependency refuses overlap assessment loudly" "got: ${OUT:-<empty>}"
 fi
 
 echo

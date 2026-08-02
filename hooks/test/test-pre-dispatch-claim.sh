@@ -152,9 +152,13 @@ make_manager_subagent_input() {
     "$agent_type" "$prompt"
 }
 
-# run_hook_as_manager <prompt>
-# Runs the hook in manager context (via CLAUDE_AGENT_NAME/ROLE env vars).
-run_hook_as_manager() {
+# run_hook_path_as_manager <hook> <prompt>
+# Runs one hook copy in manager context.  The explicit path is load-bearing for
+# the sibling-library absent/crash controls below: they exercise a real copied
+# hook, not a source mutation or a mocked parser call.
+run_hook_path_as_manager() {
+  local hook_path="$1"
+  shift
   : > "$BD_CALL_LOG"
   make_dispatch_input "$1" | \
     env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
@@ -162,7 +166,12 @@ run_hook_as_manager() {
         SABLE_MODE_STATE="$EXEC_MODE_FILE" \
         BD_CALL_LOG="$BD_CALL_LOG" \
         PATH="$STUB_DIR:$PATH" \
-        bash "$HOOK" 2>/dev/null
+        bash "$hook_path" 2>/dev/null
+}
+
+# run_hook_as_manager <prompt>
+run_hook_as_manager() {
+  run_hook_path_as_manager "$HOOK" "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -410,21 +419,159 @@ else
        "show-count=$REFRESH_BAD_SHOWS calls=$(tr '\n' '|' < "$BD_CALL_LOG")"
 fi
 
-for BAD_MODE in malformed empty; do
-  export BD_SHOW_MODE="$BAD_MODE"
-  : > "$BD_SHOW_COUNT"
-  BAD_RC=0
-  run_hook_as_manager "SABLE-one: malformed-read fail-open control" >/dev/null || BAD_RC=$?
-  BAD_SHOWS=$(wc -l < "$BD_SHOW_COUNT" | tr -d ' ')
-  if [ "$BAD_RC" -eq 0 ] && [ "$BAD_SHOWS" = "1" ] \
-     && ! grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
-    pass "SABLE-y4nom.7.6: $BAD_MODE bead read fails open after one show (no update)"
-  else
-    fail "SABLE-y4nom.7.6: $BAD_MODE bead read fails open after one show (no update)" \
-         "rc=$BAD_RC show-count=$BAD_SHOWS calls=$(tr '\n' '|' < "$BD_CALL_LOG")"
-  fi
-done
+export BD_SHOW_MODE=malformed
+: > "$BD_SHOW_COUNT"
+BAD_OUT=$(run_hook_as_manager "SABLE-one: malformed parser input refuses")
+BAD_SHOWS=$(wc -l < "$BD_SHOW_COUNT" | tr -d ' ')
+if [ "$BAD_SHOWS" = "1" ] \
+   && printf '%s' "$BAD_OUT" | grep -q 'permissionDecision.*deny' \
+   && ! grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+  pass "SABLE-rzrak: malformed nonempty record is a loud parser refusal after one show"
+else
+  fail "SABLE-rzrak: malformed nonempty record is a loud parser refusal after one show" \
+       "show-count=$BAD_SHOWS output=${BAD_OUT:-<empty>} calls=$(tr '\n' '|' < "$BD_CALL_LOG")"
+fi
+
+# A genuinely empty bd response never reached a parser at all and retains the
+# old best-effort read posture. This is distinct from the CLI-failure controls:
+# once a record is handed to the parser, a non-answer refuses.
+export BD_SHOW_MODE=empty
+: > "$BD_SHOW_COUNT"
+EMPTY_OUT=$(run_hook_as_manager "SABLE-one: empty bead read control")
+EMPTY_SHOWS=$(wc -l < "$BD_SHOW_COUNT" | tr -d ' ')
+if [ "$EMPTY_SHOWS" = "1" ] && [ -z "$EMPTY_OUT" ] \
+   && ! grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+  pass "SABLE-y4nom.7.6: empty bead read remains a one-show no-write stand-down"
+else
+  fail "SABLE-y4nom.7.6: empty bead read remains a one-show no-write stand-down" \
+       "show-count=$EMPTY_SHOWS output=${EMPTY_OUT:-<empty>} calls=$(tr '\n' '|' < "$BD_CALL_LOG")"
+fi
 unset BD_SHOW_MODE
+
+# ---------------------------------------------------------------------------
+# SABLE-rzrak / SABLE-mh967: one dispatch-footprint parser, writer authority.
+# These fixtures use exact historical section bytes where available rather
+# than invented prose: SABLE-awmj4 produced the phantom `if`, and SABLE-rrn6r
+# stored `GitHub` while dropping both real path-shaped candidates.
+# ---------------------------------------------------------------------------
+cat > "$STUB_DIR/bd" <<'STUB'
+#!/usr/bin/env bash
+echo "BD_CALLED: $*" >> "$BD_CALL_LOG"
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  python3 -c '
+import json, os
+print(json.dumps([{"id":"SABLE-one","description":os.environ.get("CLAIM_DESCRIPTION", ""),"metadata":{}}]))
+'
+fi
+exit 0
+STUB
+chmod +x "$STUB_DIR/bd"
+
+run_claim_description() { # <description> [hook]
+  local description="$1" hook_path="${2:-$HOOK}"
+  : > "$BD_CALL_LOG"
+  make_dispatch_input "SABLE-one: governed footprint parser case" | \
+    env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
+        SABLE_AGENTS_YAML="$AGENTS_YAML" \
+        SABLE_MODE_STATE="$EXEC_MODE_FILE" \
+        CLAIM_DESCRIPTION="$description" \
+        BD_CALL_LOG="$BD_CALL_LOG" \
+        PATH="$STUB_DIR:$PATH" \
+        bash "$hook_path" 2>/dev/null
+}
+
+AWMJ4_DESC=$'## File footprint\nhooks/test/test-impact-tier-serialization.sh (and whatever window-log emitter it reads, if the fix needs a sequence field).'
+OUT=$(run_claim_description "$AWMJ4_DESC")
+UPDATE=$(grep 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null || true)
+if printf '%s' "$UPDATE" | grep -q 'wip_claims=hooks/test/test-impact-tier-serialization.sh' \
+   && ! printf '%s' "$UPDATE" | grep -q ',if'; then
+  pass "SABLE-rzrak: historical awmj4 bytes write the real path without phantom if"
+else
+  fail "SABLE-rzrak: historical awmj4 bytes write the real path without phantom if" \
+       "output=${OUT:-<empty>} update=${UPDATE:-<none>}"
+fi
+
+RRN6R_DESC=$'## File footprint\nGitHub repo settings (rulesets) OR hooks/multi-manager/pre-push-rebase-test.sh (leg 2); docs update in MULTI-MANAGER-PATTERN.md merge-path section'
+OUT=$(run_claim_description "$RRN6R_DESC")
+if printf '%s' "$OUT" | grep -q 'permissionDecision.*deny' \
+   && printf '%s' "$OUT" | grep -q 'GitHub' \
+   && ! grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+  pass "SABLE-mh967: historical rrn6r partial declaration is loud and never written"
+else
+  fail "SABLE-mh967: historical rrn6r partial declaration is loud and never written" \
+       "output=${OUT:-<empty>} calls=$(tr '\n' '|' < "$BD_CALL_LOG")"
+fi
+
+NEWLINE_DESC=$'## File footprint\nbin/a.py\nbin/b.py\nbin/sable-tool\ndocs/c.md\n\n## Acceptance\nDone'
+OUT=$(run_claim_description "$NEWLINE_DESC")
+UPDATE=$(grep 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null || true)
+if printf '%s' "$UPDATE" | grep -q 'wip_claims=bin/a.py,bin/b.py,bin/sable-tool,docs/c.md'; then
+  pass "SABLE-rzrak: newline footprint writes every path"
+else
+  fail "SABLE-rzrak: newline footprint writes every path" "update=${UPDATE:-<none>} output=${OUT:-<empty>}"
+fi
+
+REPEATED_DESC=$'## File footprint\nbin/a.py\n\n## File footprint\nhooks/b.sh\n'
+OUT=$(run_claim_description "$REPEATED_DESC")
+UPDATE=$(grep 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null || true)
+if printf '%s' "$UPDATE" | grep -q 'wip_claims=bin/a.py,hooks/b.sh'; then
+  pass "SABLE-rzrak: repeated footprint sections union instead of discarding the correction"
+else
+  fail "SABLE-rzrak: repeated footprint sections union instead of discarding the correction" \
+       "update=${UPDATE:-<none>} output=${OUT:-<empty>}"
+fi
+
+EMPTY_DESC=$'## File footprint\n\n## Acceptance\nDone'
+OUT=$(run_claim_description "$EMPTY_DESC")
+if printf '%s' "$OUT" | grep -q 'permissionDecision.*deny' \
+   && ! grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+  pass "SABLE-rzrak: present-empty footprint refuses instead of writing a bogus heading"
+else
+  fail "SABLE-rzrak: present-empty footprint refuses instead of writing a bogus heading" \
+       "output=${OUT:-<empty>} calls=$(tr '\n' '|' < "$BD_CALL_LOG")"
+fi
+
+OUT=$(run_claim_description 'legacy description names hooks/legacy.py without a heading')
+if grep -q 'wip_claims=hooks/legacy.py' "$BD_CALL_LOG" 2>/dev/null; then
+  pass "SABLE-rzrak: heading-absent legacy scavenge remains live"
+else
+  fail "SABLE-rzrak: heading-absent legacy scavenge remains live" \
+       "output=${OUT:-<empty>} calls=$(tr '\n' '|' < "$BD_CALL_LOG")"
+fi
+
+OUT=$(run_claim_description $'## File footprint\nbin/sable-msg')
+if grep -q 'wip_claims=bin/sable-msg' "$BD_CALL_LOG" 2>/dev/null; then
+  pass "SABLE-mh967: slash-bearing extensionless CLI remains claimable"
+else
+  fail "SABLE-mh967: slash-bearing extensionless CLI remains claimable" \
+       "output=${OUT:-<empty>} calls=$(tr '\n' '|' < "$BD_CALL_LOG")"
+fi
+
+# The copied hook has its real identity dependencies but deliberately lacks the
+# new parser sibling.  A second copy has an executable sibling that crashes.
+BROKEN_HOOK_ROOT="$FIXTURE_DIR/broken-hook"
+mkdir -p "$BROKEN_HOOK_ROOT/hooks/multi-manager" "$BROKEN_HOOK_ROOT/bin"
+cp -f "$REPO"/hooks/multi-manager/*.sh "$BROKEN_HOOK_ROOT/hooks/multi-manager/"
+OUT=$(run_claim_description "$NEWLINE_DESC" "$BROKEN_HOOK_ROOT/hooks/multi-manager/pre-dispatch-claim.sh")
+if printf '%s' "$OUT" | grep -q 'permissionDecision.*deny' \
+   && printf '%s' "$OUT" | grep -qi 'footprint.*not found'; then
+  pass "SABLE-rzrak: absent parser dependency refuses the claim loudly"
+else
+  fail "SABLE-rzrak: absent parser dependency refuses the claim loudly" "output=${OUT:-<empty>}"
+fi
+
+cat > "$BROKEN_HOOK_ROOT/bin/sable_footprint_lib.py" <<'PY'
+#!/usr/bin/env python3
+raise SystemExit(9)
+PY
+chmod +x "$BROKEN_HOOK_ROOT/bin/sable_footprint_lib.py"
+OUT=$(run_claim_description "$NEWLINE_DESC" "$BROKEN_HOOK_ROOT/hooks/multi-manager/pre-dispatch-claim.sh")
+if printf '%s' "$OUT" | grep -q 'permissionDecision.*deny' \
+   && printf '%s' "$OUT" | grep -qi 'parser.*failed'; then
+  pass "SABLE-rzrak: crashing parser dependency refuses the claim loudly"
+else
+  fail "SABLE-rzrak: crashing parser dependency refuses the claim loudly" "output=${OUT:-<empty>}"
+fi
 
 # ---------------------------------------------------------------------------
 # SABLE-lfql / SABLE-rq9k: hermetic push-prevention regression guard.
@@ -561,7 +708,33 @@ except Exception:
     fi
 
     # Reuse this isolated bead for the remaining real-bd legs. Clear the claim
-    # so the manager-subagent path must write it again.
+    # after first exercising the load-bearing rzrak shape through the REAL hook
+    # and REAL store: the colliding path is fourth in a newline-authored section.
+    real_bd update "$SCRATCH_ID" --sandbox --unset-metadata wip_claims >/dev/null 2>&1
+
+    real_bd update "$SCRATCH_ID" --sandbox --description "$NEWLINE_DESC" >/dev/null 2>&1
+    make_dispatch_input "${SCRATCH_ID}: claim every newline footprint path" | \
+      (cd "$REAL_BD_ROOT" && \
+       env CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
+           SABLE_AGENTS_YAML="$AGENTS_YAML" \
+           SABLE_MODE_STATE="$EXEC_MODE_FILE" \
+           bash "$HOOK" 2>/dev/null)
+    NEWLINE_CLAIMS=$(real_bd show "$SCRATCH_ID" --json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print((d[0].get('metadata', {}) or {}).get('wip_claims', '') if d else '')
+except Exception:
+    pass
+" 2>/dev/null || true)
+    if [ "$NEWLINE_CLAIMS" = "bin/a.py,bin/b.py,bin/sable-tool,docs/c.md" ]; then
+      pass "integration: real claim hook stores all four newline footprint paths"
+    else
+      fail "integration: real claim hook stores all four newline footprint paths" \
+           "expected four paths, got '$NEWLINE_CLAIMS'"
+    fi
+
+    # The manager-subagent path below must perform its own write.
     real_bd update "$SCRATCH_ID" --sandbox --unset-metadata wip_claims >/dev/null 2>&1
   fi
 
