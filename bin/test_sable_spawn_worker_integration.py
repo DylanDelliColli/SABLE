@@ -2437,25 +2437,25 @@ def real_bd_template(tmp_path_factory):
     # self-skip there (SABLE-59zu).
     if not HAVE_BD:
         pytest.skip("needs bd")
-    repo = tmp_path_factory.mktemp("spawn-worker-real-bd-template")
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.email",
+    fixture_root = tmp_path_factory.mktemp("spawn-worker-real-bd-template")
+    subprocess.run(["git", "init", "-q", str(fixture_root)], check=True)
+    subprocess.run(["git", "-C", str(fixture_root), "config", "user.email",
                     "spawn-test@sable.invalid"], check=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.name",
+    subprocess.run(["git", "-C", str(fixture_root), "config", "user.name",
                     "SABLE Spawn Test"], check=True)
     init = subprocess.run(["bd", "init", "--prefix", "FZTEST"],
-                          cwd=repo, capture_output=True, text=True)
+                          cwd=fixture_root, capture_output=True, text=True)
     if init.returncode != 0:
         pytest.skip(f"could not create an isolated bd store: {init.stderr[-400:]}")
     # SABLE-35mqf: every governance dispatch now validates declarations against
     # a real HEAD object.  The shared path used by the pre-existing bundle and
     # overlap tests is deliberately tracked; a separate test below names an
     # absent path and proves that state is refused before a claim.
-    (repo / "shared_target.py").write_text("tracked dispatch fixture\n")
-    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m",
+    (fixture_root / "shared_target.py").write_text("tracked dispatch fixture\n")
+    subprocess.run(["git", "-C", str(fixture_root), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(fixture_root), "commit", "-q", "-m",
                     "fixture HEAD"], check=True)
-    return repo
+    return fixture_root
 
 
 @pytest.fixture()
