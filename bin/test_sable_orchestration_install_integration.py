@@ -35,6 +35,7 @@ REPO = Path(__file__).resolve().parent.parent
 INSTALLER = REPO / "bin" / "sable-orchestration-install"
 LIB_NAME = "sable_inline_body_guard_lib.py"
 BASE_SNIPPET = REPO / "templates" / "base-settings-snippet.json"
+CODEX_BD_PRIME = "bd prime --hook-json"
 BASE_HOOKS = {
     "tdd-evidence.sh": ("PreToolUse", "Bash", 3000),
     "tdd-gate.sh": ("PreToolUse", "Bash", 5000),
@@ -142,6 +143,65 @@ def hook_rows(path):
         for block in blocks
         for hook in block.get("hooks", [])
     ]
+
+
+def codex_accepts_session_start_stdout(stdout):
+    """Mirror Codex rust-v0.146.0's JSON-sniff + SessionStart schema.
+
+    Codex treats ordinary text as context, but a leading ``{`` or ``[`` is a
+    claim that the whole output is hook JSON.  This tiny mirror is deliberately
+    pinned to the installed engine contract that reproduced SABLE-cftx3; if
+    Codex changes that contract, this test should force an explicit review.
+    """
+    stripped = stdout.lstrip()
+    if not stripped:
+        return True
+    if stripped[0] not in "[{":
+        return True
+    try:
+        output = json.loads(stdout)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(output, dict):
+        return False
+    universal = {"continue", "stopReason", "suppressOutput", "systemMessage"}
+    if not set(output) <= universal | {"hookSpecificOutput"}:
+        return False
+    if "continue" in output and not isinstance(output["continue"], bool):
+        return False
+    if (
+        "stopReason" in output
+        and output["stopReason"] is not None
+        and not isinstance(output["stopReason"], str)
+    ):
+        return False
+    if "suppressOutput" in output and not isinstance(output["suppressOutput"], bool):
+        return False
+    if (
+        "systemMessage" in output
+        and output["systemMessage"] is not None
+        and not isinstance(output["systemMessage"], str)
+    ):
+        return False
+    specific = output.get("hookSpecificOutput")
+    if specific is None:
+        return True
+    if not isinstance(specific, dict):
+        return False
+    if not set(specific) <= {"hookEventName", "additionalContext"}:
+        return False
+    event_names = {
+        "PreToolUse", "PermissionRequest", "PostToolUse", "PreCompact",
+        "PostCompact", "SessionStart", "UserPromptSubmit", "SubagentStart",
+        "SubagentStop", "Stop",
+    }
+    if specific.get("hookEventName") not in event_names:
+        return False
+    return (
+        "additionalContext" not in specific
+        or specific["additionalContext"] is None
+        or isinstance(specific["additionalContext"], str)
+    )
 
 
 def no_bd_path(tmp_path):
@@ -285,6 +345,71 @@ def test_canonical_base_snippet_has_the_complete_gate_graph():
     assert lifecycle_commands.count(("PreCompact", "bd prime")) == 1
 
 
+@pytest.mark.parametrize(
+    ("stdout", "accepted"),
+    [
+        ("[bd prime] markdown context\n", False),
+        ('{"hookSpecificOutput":{"hookEventName":"SessionStart",'
+         '"additionalContext":"[bd prime] markdown context"}}\n', True),
+        ("ordinary context\n", True),
+        ("  ordinary context\n", True),
+        ("", True),
+        ("  [not valid JSON]\n", False),
+        # The 0.146 runtime enum accepts another known event name here even
+        # though the public SessionStart contract says to return SessionStart.
+        ('{"hookSpecificOutput":{"hookEventName":"PreCompact"}}', True),
+        ('{"hookSpecificOutput":{"hookEventName":"NotARealEvent"}}', False),
+        ('{"stopReason":null,"systemMessage":null}', True),
+    ],
+)
+def test_codex_session_start_output_contract(stdout, accepted):
+    assert codex_accepts_session_start_stdout(stdout) is accepted
+
+
+@pytest.mark.skipif(shutil.which("bd") is None,
+                    reason="real bd hook envelope cannot be verified")
+def test_real_bd_hook_json_is_accepted_and_preserves_the_boot_marker():
+    plain = subprocess.run(
+        ["bd", "prime"], capture_output=True, text=True, timeout=30,
+    )
+    wrapped = subprocess.run(
+        ["bd", "prime", "--hook-json"],
+        capture_output=True, text=True, timeout=30,
+    )
+
+    assert plain.returncode == wrapped.returncode == 0
+    assert plain.stdout.startswith("[bd prime]")
+    assert not codex_accepts_session_start_stdout(plain.stdout)
+    assert codex_accepts_session_start_stdout(wrapped.stdout)
+    output = json.loads(wrapped.stdout)
+    context = output["hookSpecificOutput"]["additionalContext"]
+    assert context.startswith("[bd prime]")
+
+
+def test_codex_adapter_uses_native_prime_envelope_and_omits_precompact(
+    installed_scope,
+):
+    # The shared provider-native source stays byte-for-byte on its original
+    # commands.  Direct orchestration installs do not merge that base layer
+    # into Claude settings; only the separately rendered Codex graph composes
+    # it here, which is precisely the adapter boundary under test.
+    shared_lifecycle = [
+        (event, hook.get("command", ""))
+        for event, _, hook in hook_rows(BASE_SNIPPET)
+    ]
+    assert shared_lifecycle.count(("SessionStart", "bd prime")) == 1
+    assert shared_lifecycle.count(("PreCompact", "bd prime")) == 1
+
+    codex_lifecycle = [
+        (event, hook.get("command", ""))
+        for event, _, hook in hook_rows(codex_hooks_path(installed_scope))
+    ]
+    assert codex_lifecycle.count(("SessionStart", CODEX_BD_PRIME)) == 1
+    assert ("SessionStart", "bd prime") not in codex_lifecycle
+    assert ("PreCompact", "bd prime") not in codex_lifecycle
+    assert ("PreCompact", CODEX_BD_PRIME) not in codex_lifecycle
+
+
 def test_direct_real_install_is_print_only_without_consent(tmp_path):
     base = tmp_path / "claude"
     base.mkdir()
@@ -391,9 +516,26 @@ def test_valid_settings_merge_is_idempotent_and_preserves_unrelated_hooks(tmp_pa
         "matcher": "CustomTool",
         "hooks": [{"type": "command", "command": "run-my-codex-hook"}],
     }
+    custom_prime = "bd prime 2>/dev/null || true"
     codex_hooks.write_text(json.dumps({
         "codex_setting": "preserve-me",
-        "hooks": {"PreToolUse": [codex_custom]},
+        "hooks": {
+            "PreToolUse": [codex_custom],
+            "SessionStart": [{
+                "matcher": "",
+                "hooks": [
+                    {"type": "command", "command": "bd prime"},
+                    {"type": "command", "command": custom_prime},
+                ],
+            }],
+            "PreCompact": [{
+                "matcher": "",
+                "hooks": [
+                    {"type": "command", "command": "bd prime"},
+                    {"type": "command", "command": custom_prime},
+                ],
+            }],
+        },
     }, indent=2) + "\n")
 
     first = run_real_install(base)
@@ -406,6 +548,15 @@ def test_valid_settings_merge_is_idempotent_and_preserves_unrelated_hooks(tmp_pa
     first_codex = json.loads(first_codex_bytes)
     assert first_codex["codex_setting"] == "preserve-me"
     assert codex_custom in first_codex["hooks"]["PreToolUse"]
+    first_codex_lifecycle = [
+        (event, hook.get("command", ""))
+        for event, _, hook in hook_rows(codex_hooks)
+    ]
+    assert first_codex_lifecycle.count(("SessionStart", CODEX_BD_PRIME)) == 1
+    assert ("SessionStart", "bd prime") not in first_codex_lifecycle
+    assert ("PreCompact", "bd prime") not in first_codex_lifecycle
+    assert first_codex_lifecycle.count(("SessionStart", custom_prime)) == 1
+    assert first_codex_lifecycle.count(("PreCompact", custom_prime)) == 1
     codex_commands = [
         hook.get("command", "")
         for _, _, hook in hook_rows(codex_hooks)

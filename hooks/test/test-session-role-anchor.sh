@@ -35,6 +35,7 @@ sable_scrub_identity_env
 unset SABLE_MODE_STATE SABLE_ACTIVE_CONTRACTS 2>/dev/null || true
 
 SS='{"hook_event_name":"SessionStart"}'
+SS_COMPACT='{"hook_event_name":"SessionStart","source":"compact"}'
 
 # ---------- project-first resolution ----------
 PROJ="$(mktemp -d)"
@@ -329,6 +330,14 @@ epoch_run "$SS" SABLE_AGENT_NAME=chuck SABLE_AGENT_ROLE=manager
 e2="$(epoch_opt @sable_boot_epoch)"
 if [ -n "$e2" ] && [ "$e2" != "$e1" ]; then pass "slip0.1: a second SessionStart yields a DIFFERENT epoch"; else fail "slip0.1: a second SessionStart yields a DIFFERENT epoch" "first='$e1' second='$e2'"; fi
 
+# Every provider-specified non-compact source is a fresh operating loop.  The
+# source field must not accidentally suppress these while the compact carve-out
+# is added; clear is the founding incident and resume is an equally fresh prompt.
+for boot_source in startup resume clear; do
+  epoch_run "{\"hook_event_name\":\"SessionStart\",\"source\":\"$boot_source\"}" SABLE_AGENT_NAME=chuck SABLE_AGENT_ROLE=manager
+  if [ -n "$(epoch_opt @sable_boot_epoch)" ]; then pass "slip0.1: SessionStart source=$boot_source stamps a fresh epoch"; else fail "slip0.1: SessionStart source=$boot_source stamps a fresh epoch" "calls: $(cat "$EPOCH_LOG")"; fi
+done
+
 # ---------- NAMED HAZARD: a compaction is NOT a restart ----------
 # If the stamp rode the existing additionalContext emit it would also fire on
 # PreCompact, every /compact would read as a clear, and Lincoln would re-kick
@@ -336,6 +345,18 @@ if [ -n "$e2" ] && [ "$e2" != "$e1" ]; then pass "slip0.1: a second SessionStart
 epoch_run "$PC" SABLE_AGENT_NAME=chuck SABLE_AGENT_ROLE=manager
 if [ -z "$(epoch_opt @sable_boot_epoch)" ]; then pass "slip0.1: NAMED HAZARD — PreCompact stamps NO epoch"; else fail "slip0.1: NAMED HAZARD — PreCompact stamps NO epoch" "got: $(epoch_opt @sable_boot_epoch)"; fi
 if [ -z "$(epoch_opt @sable_boot_agent)" ]; then pass "slip0.1: PreCompact writes no pane option at all"; else fail "slip0.1: PreCompact writes no pane option at all" "calls: $(cat "$EPOCH_LOG")"; fi
+
+# Codex and Claude re-anchor AFTER compaction by dispatching SessionStart with
+# source=compact.  hook_event_name alone therefore cannot distinguish a real
+# restart from compaction.  This exact payload is the loop-producing shape:
+# context must still be emitted, but neither boot option may move.
+compact_out="$(cd "$EPOCH_HOME" && printf '%s' "$SS_COMPACT" | env \
+    PATH="$EPOCH_SHIM:$PATH" SABLE_TEST_TMUX_LOG="$EPOCH_SHIM/compact.log" \
+    SABLE_TEST_TMUX_ALL_LOG="$EPOCH_ALL_LOG" TMUX_PANE="%99" \
+    HOME="$EPOCH_HOME" SABLE_AGENT_NAME=chuck SABLE_AGENT_ROLE=manager \
+    bash "$HOOK" 2>"$EPOCH_SHIM/compact.err")"
+if printf '%s' "$compact_out" | grep -q 'EPOCH_CHUCK_ROLE_MARKER'; then pass "slip0.1: SessionStart source=compact still re-anchors context"; else fail "slip0.1: SessionStart source=compact still re-anchors context" "got: ${compact_out:0:200}"; fi
+if [ ! -s "$EPOCH_SHIM/compact.log" ]; then pass "slip0.1: SessionStart source=compact writes no pane options"; else fail "slip0.1: SessionStart source=compact writes no pane options" "calls: $(cat "$EPOCH_SHIM/compact.log")"; fi
 
 # ---------- D13: identity resolves SABLE_AGENT_NAME-first ----------
 # CLAUDE_AGENT_NAME reads 'lincoln' on all three Codex manager panes, so an
