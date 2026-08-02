@@ -343,4 +343,42 @@ clean-room requirements because this bead neither runs the experiment in CI
 nor enables xdist in an authoritative workflow. The dedicated sampler records
 collection and pass/fail/skip/xfail identity, per-test and per-module tails,
 wall time, timeout rate, child CPU time, and sampled host load. Its result table
-and GO/NO-GO decision are appended here after the bounded repeated ladder.
+and GO/NO-GO decision follow.
+
+### Bounded ladder result
+
+The exact benchmark object was `8475d1761ec298e65b9750ca0c653635731180c6`
+on a 14-logical-CPU WSL2 host with Python 3.13.9, pytest 9.1.1, and
+pytest-xdist 3.8.0. One benchmark invocation held the shared broad-seat lock
+from collection through the final decision. Its durable artifact root is
+`.git/sable/xdist-benchmark/8475d1761ec2-20260802T000057/`.
+
+| Width | Repeated wall result | Outcomes | Median average CPU | Median load p95 | Median max-module tail | Decision |
+| --- | ---: | --- | ---: | ---: | ---: | --- |
+| Serial | 795.32s, 797.49s; median 796.40s | Each: 3,421 passed, 17 skipped; identical collection and outcome digests | 0.71 cores | 2.33 | 108.63s | Reference green |
+| `-n 2 --dist=loadscope` | 512.80s, 514.67s; median 513.74s | Each: 3,421 passed, 17 skipped; byte-identical digests to serial | 1.51 cores | 3.79 | 139.15s | **GO** |
+| `-n 4 --dist=loadscope` | 383.64s; stopped after run 1 | 3,421 passed, 17 skipped; byte-identical digests, but session rc 1 | 3.10 cores | 6.92 | 198.70s | **NO-GO** |
+
+Two workers reduced Python wall time by 35.5% with a 0.36% spread between
+repetitions. The worst module tail grew by 1.28x relative to serial, below the
+sampler's material-tail stop threshold, and there were no load-boundary
+violations. This is the largest safe measured width and the sampler's
+recommendation.
+
+Four workers were faster but invalid. All test outcomes still matched, yet
+`bin/test_sable_test_cost_profile_lib.py` grew from 29.85--32.14 seconds
+serial and 36.28--41.92 seconds at two workers to 68.21 seconds. That breached
+the ordinary-module 45-second load contract, made pytest exit 1, and stopped
+the width before a second repetition. The guard is not waived and `-n 4` is
+not an adoption candidate.
+
+Using VE.2's unchanged 505.16-second serial-shell baseline, the recommended
+two-worker Python median yields a sequential broad-local estimate of 1,018.89
+seconds (16m59s), down from 1,301.56 seconds (21m42s) for this ladder's serial
+Python plus the same shell lane. It remains above the epic's 600-second target.
+This bead therefore enables nothing. A follow-up must adopt the proven fixed
+width and measure coarse overlap between that Python lane and the unchanged
+serial shell lane under the same one-per-host lease. Their individual medians
+make sub-600-second wall time plausible, but the prior shell-contention flake
+means overlap needs repeated exact-outcome and tail evidence before it can
+become authoritative.
