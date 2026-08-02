@@ -21,15 +21,23 @@ fi
 PASS=0
 FAIL=0
 FAIL_NAMES=""
+IMMUTABLE_OBSERVATION_REUSES=0
 
 # Helpers
 make_input() {
   # $1 = command string
-  python3 -c "
-import json, sys
-cmd = sys.argv[1]
-print(json.dumps({'tool_input': {'command': cmd}}))
-" "$1"
+  # Shell command strings cannot contain NUL. Escape every other control
+  # character used by this corpus directly, avoiding one Python startup per
+  # hook observation.
+  local command="$1"
+  command=${command//\\/\\\\}
+  command=${command//\"/\\\"}
+  command=${command//$'\b'/\\b}
+  command=${command//$'\f'/\\f}
+  command=${command//$'\n'/\\n}
+  command=${command//$'\r'/\\r}
+  command=${command//$'\t'/\\t}
+  printf -v HOOK_INPUT_JSON '{"tool_input":{"command":"%s"}}\n' "$command"
 }
 
 # run_hook <env-prefix> <command>
@@ -38,7 +46,8 @@ run_hook() {
   local env_prefix="$1"
   local command="$2"
   local input
-  input=$(make_input "$command")
+  make_input "$command"
+  input="$HOOK_INPUT_JSON"
   local out
   out=$(env -i PATH="$PATH" $env_prefix bash "$HOOK" <<< "$input" 2>/dev/null || echo "RUN_ERR:$?")
   echo -n "$out"
@@ -67,7 +76,7 @@ assert_deny() {
   local name="$1" env="$2" cmd="$3" expect="$4"
   local out
   out=$(run_hook "$env" "$cmd")
-  if echo "$out" | grep -q '"permissionDecision": "deny"' && echo "$out" | grep -qF "$expect"; then
+  if [[ "$out" == *'"permissionDecision": "deny"'* && "$out" == *"$expect"* ]]; then
     PASS=$((PASS+1))
     echo "PASS: $name"
   else
@@ -79,12 +88,10 @@ assert_deny() {
   fi
 }
 
-assert_nudge() {
-  # $1 = test name, $2 = env, $3 = command, $4 = substring expected
-  local name="$1" env="$2" cmd="$3" expect="$4"
-  local out
-  out=$(run_hook "$env" "$cmd")
-  if echo "$out" | grep -q '"additionalContext"' && echo "$out" | grep -qF "$expect"; then
+assert_nudge_output() {
+  # $1 = test name, $2 = captured output, $3 = substring expected
+  local name="$1" out="$2" expect="$3"
+  if [[ "$out" == *'"additionalContext"'* && "$out" == *"$expect"* ]]; then
     PASS=$((PASS+1))
     echo "PASS: $name"
   else
@@ -94,6 +101,20 @@ assert_nudge() {
     echo "  Expected: nudge containing '$expect'"
     echo "  Got:      $out"
   fi
+}
+
+assert_nudge() {
+  # $1 = test name, $2 = env, $3 = command, $4 = substring expected
+  local name="$1" env="$2" cmd="$3" expect="$4"
+  local out
+  out=$(run_hook "$env" "$cmd")
+  assert_nudge_output "$name" "$out" "$expect"
+}
+
+assert_reused_nudge() {
+  # $1 = test name, $2 = immutable captured output, $3 = substring expected
+  IMMUTABLE_OBSERVATION_REUSES=$((IMMUTABLE_OBSERVATION_REUSES+1))
+  assert_nudge_output "$1" "$2" "$3"
 }
 
 # Build a sherlock-complete description with real newlines (matches what
@@ -417,8 +438,10 @@ assert_allow "docs: dot-dir extensionless path passes file-path check (default)"
   "bd create --title=foo --labels=origin:planned --description=\"$DOTDIR_PATH_DESC\""
 
 # Test 44e: a genuinely pathless description still trips the gate (regression guard)
-assert_nudge "docs: pathless description still flagged after bin//.yml/dot-dir fix (default)" "" \
-  "bd create --title=foo --description=\"Fix the thing properly. TDD red-green confirms fix.\"" \
+PATHLESS_REGRESSION_CMD="bd create --title=foo --description=\"Fix the thing properly. TDD red-green confirms fix.\""
+PATHLESS_REGRESSION_OUT=$(run_hook "" "$PATHLESS_REGRESSION_CMD")
+assert_nudge_output "docs: pathless description still flagged after bin//.yml/dot-dir fix (default)" \
+  "$PATHLESS_REGRESSION_OUT" \
   "file paths"
 
 # ---------- Extensionless build-file + location-briefing/ tests (SABLE-w2x7) ----------
@@ -439,8 +462,8 @@ assert_allow "docs: location-briefing/ path passes file-path check (default)" ""
   "bd create --title=foo --labels=origin:planned --description=\"$LOCATION_BRIEFING_DESC\""
 
 # Test 44i: regression — pathless description still flagged after Makefile/Dockerfile/location-briefing fix
-assert_nudge "docs: pathless description still flagged after extensionless fix (default)" "" \
-  "bd create --title=foo --description=\"Fix the thing properly. TDD red-green confirms fix.\"" \
+assert_reused_nudge "docs: pathless description still flagged after extensionless fix (default)" \
+  "$PATHLESS_REGRESSION_OUT" \
   "file paths"
 
 # ---------- Justfile/Rakefile extensionless build-file tests (SABLE-i0db) ----------
@@ -456,8 +479,8 @@ assert_allow "docs: Rakefile-only path passes file-path check (default)" "" \
   "bd create --title=foo --labels=origin:planned --description=\"$RAKEFILE_DESC\""
 
 # Test 44l: regression — pathless description still flagged after Justfile/Rakefile fix
-assert_nudge "docs: pathless description still flagged after Justfile/Rakefile fix (default)" "" \
-  "bd create --title=foo --description=\"Fix the thing properly. TDD red-green confirms fix.\"" \
+assert_reused_nudge "docs: pathless description still flagged after Justfile/Rakefile fix (default)" \
+  "$PATHLESS_REGRESSION_OUT" \
   "file paths"
 
 # ---------- Short-flag alias tests (-d / -f) (SABLE-iyv) ----------
@@ -579,7 +602,7 @@ else
     # 1) Real hook, real command string, MANAGER mode (the strictest —
     #    proves the deny-leg does NOT fire even under block enforcement).
     ORIGIN_HOOK_OUT=$(run_hook "$MANAGER_ENV" "$ORIGIN_BD_CREATE_CMD")
-    if ! echo "$ORIGIN_HOOK_OUT" | grep -q '"permissionDecision": "deny"'; then
+    if [[ "$ORIGIN_HOOK_OUT" != *'"permissionDecision": "deny"'* ]]; then
       PASS=$((PASS+1))
       echo "PASS: origin integration — hook does not deny a real bd create missing origin: (manager mode)"
     else
@@ -611,6 +634,19 @@ except Exception: print(0)')
   fi
 
   rm -rf "$ORIGIN_TMPROOT"
+fi
+
+# The three pathless regression assertions above intentionally share one
+# immutable hook observation: the first evaluates it and the next two reuse it.
+# Keep this structural check load-bearing so a future edit cannot silently
+# restore two redundant hook/Python startups.
+if [ "$IMMUTABLE_OBSERVATION_REUSES" -eq 2 ]; then
+  PASS=$((PASS+1))
+  echo "PASS: structure: repeated immutable hook observation reused twice"
+else
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  structure: expected 2 immutable observation reuses, got $IMMUTABLE_OBSERVATION_REUSES"
+  echo "FAIL: structure: repeated immutable hook observation reused twice"
 fi
 
 # ---------- Summary ----------

@@ -59,13 +59,13 @@ fi
 # it (SABLE-jd5fj.16) — so print the same "Tests | Passed | Failed | Skipped"
 # shape the bd-present path below prints, with a non-zero Skipped count and a
 # named reason. Keep REALBD_SUBTESTS in sync with the number of distinct
-# pass()/fail() assertion titles below (8 today: five authority assertions and
-# three hermeticity plant assertions) — this
+# pass()/fail() assertion titles below (10 today: five authority assertions,
+# two structural batching controls, and three hermeticity plant assertions) — this
 # suite's own coverage is checked by hooks/test/test-shell-run-set-strict.sh
 # case (h) and by hooks/test/test-ci-bd-coverage-gap.sh's negative control,
 # which compares bd-present vs bd-absent subtest counts dynamically rather
 # than pinning this exact number.
-REALBD_SUBTESTS=8
+REALBD_SUBTESTS=10
 if ! command -v bd >/dev/null 2>&1; then
   echo "SKIP: bd not found on PATH — this suite requires a real bd (no mocks)"
   echo
@@ -107,7 +107,8 @@ mkdir -p "$BEADS_ROOT"
 # content RED on whichever branch happened to be the first to enter the
 # tier. Same pattern this file already applies at the hermeticity probe
 # below (line ~364) and test-dep-merge-state.sh applies at its own init.
-BD_INIT_OUT="$(cd "$BEADS_ROOT" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=sable 2>&1)"
+BD_INIT_OUT="$(cd "$BEADS_ROOT" && env -u BEADS_DB BD_NON_INTERACTIVE=1 \
+  bd init --prefix=sable --skip-agents --skip-hooks --quiet 2>&1)"
 if [ ! -d "$BEADS_ROOT/.beads" ]; then
   echo "FATAL: could not initialize an isolated per-run bd DB: $BD_INIT_OUT"
   exit 2
@@ -125,6 +126,30 @@ EXEC_MODE="$FIXTURE_DIR/mode-exec.json"
 echo '{"mode":"execution","since":"2026-07-21"}' > "$EXEC_MODE"
 
 SHARED_FILE="hooks/foo-e2e-jd5fj6-test.sh"
+FIXTURE_SEED_WRITES=0
+PROBE_READ_STATES=()
+BEAD_A="sable-overlap-a"
+BEAD_B="sable-overlap-b"
+
+probe_present() { # <db_dir> <state_label> -> 0 when the planted overlap bead is visible
+  local db="$1" state="$2"
+  local existing
+  PROBE_READ_STATES+=("$state")
+  existing=$(BEADS_DB="$db/.beads" bd show "$BEAD_A" --json 2>/dev/null) || return 1
+  [ "$existing" != "[]" ] && [ -n "$existing" ]
+}
+
+# Snapshot the initialized-but-unseeded store. The one batch import below is
+# both the overlap fixture transition and the hermeticity plant: the shared
+# store must see BEAD_A afterward, while this pre-mutation copy must not.
+FRESH_B="$FIXTURE_DIR/fresh-b"
+mkdir -p "$FRESH_B"
+cp -a -f "$BEADS_ROOT/." "$FRESH_B/"
+if probe_present "$BEADS_ROOT" shared-before-seed; then
+  PLANT_PRECONDITION_CLEAN=0
+else
+  PLANT_PRECONDITION_CLEAN=1
+fi
 
 make_input() { # <prompt>
   python3 -c "
@@ -142,46 +167,35 @@ run_hook() { # <prompt>
         bash "$HOOK" 2>/dev/null
 }
 
-metadata_field() { # <bead_id> <field>
-  bd show "$1" --json 2>/dev/null | python3 -c "
+METADATA_READ_LOG="$FIXTURE_DIR/metadata-read.log"
+: > "$METADATA_READ_LOG"
+metadata_pair() { # <bead_id_a> <bead_id_b> <field> -> two NUL-delimited values
+  printf '%s %s\n' "$1" "$2" >> "$METADATA_READ_LOG"
+  bd show "$1" "$2" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
-    if isinstance(d, list) and d:
-        print((d[0].get('metadata', {}) or {}).get(sys.argv[1], '') or '')
 except Exception:
-    pass
-" "$2" 2>/dev/null || echo ""
+    d = []
+by_id = {item.get('id', ''): item for item in d if isinstance(item, dict)} if isinstance(d, list) else {}
+for bead_id in sys.argv[1:3]:
+    item = by_id.get(bead_id, {})
+    value = (item.get('metadata', {}) or {}).get(sys.argv[3], '') or ''
+    sys.stdout.write(str(value) + '\\0')
+" "$1" "$2" "$3" 2>/dev/null
 }
 
-# --- bead A: already in-progress, claim already established ---------------
-BEAD_A=$(bd create --sandbox \
-  --title="[int-test] jd5fj.6 overlap-e2e bead A" \
-  --description="Scratch bead A for the SABLE-jd5fj.6 overlap-constraint e2e test." \
-  --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
-
-if [ -z "$BEAD_A" ]; then
-  echo "SKIP (integration): could not create scratch bead A"
+# --- atomic overlap + hermeticity fixture seed -----------------------------
+if ! bd import - --sandbox >/dev/null 2>&1 <<JSONL
+{"id":"$BEAD_A","title":"[int-test] jd5fj.6 overlap-e2e bead A / hermeticity probe","description":"Scratch bead A for the SABLE-jd5fj.6 overlap-constraint e2e test.","issue_type":"task","status":"in_progress","assignee":"optimus","metadata":{"wip_claims":"$SHARED_FILE"}}
+{"id":"$BEAD_B","title":"[int-test] jd5fj.6 overlap-e2e bead B","description":"Scratch bead B for the SABLE-jd5fj.6 overlap-constraint e2e test.\n\n## File footprint\n$SHARED_FILE","issue_type":"task","status":"open"}
+JSONL
+then
+  echo "SKIP (integration): could not import scratch overlap beads"
   exit 0
 fi
+FIXTURE_SEED_WRITES=$((FIXTURE_SEED_WRITES + 1))
 echo "Integration: created scratch bead A = $BEAD_A"
-
-bd update "$BEAD_A" --sandbox --claim >/dev/null 2>&1 || true
-bd update "$BEAD_A" --sandbox --set-metadata "wip_claims=$SHARED_FILE" >/dev/null 2>&1
-
-# --- bead B: the dispatch target, declared footprint via description ------
-BEAD_B=$(bd create --sandbox \
-  --title="[int-test] jd5fj.6 overlap-e2e bead B" \
-  --description="Scratch bead B for the SABLE-jd5fj.6 overlap-constraint e2e test.
-
-## File footprint
-$SHARED_FILE" \
-  --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
-
-if [ -z "$BEAD_B" ]; then
-  echo "SKIP (integration): could not create scratch bead B"
-  exit 0
-fi
 echo "Integration: created scratch bead B = $BEAD_B"
 
 # --- Case 1: dispatch B, no Serialize-with -> DENIED -----------------------
@@ -203,8 +217,10 @@ else
   fail "real bd: Serialize-with naming bead A ALLOWS the dispatch" "got: ${OUT:-<empty>}"
 fi
 
-SERIALIZE_B=$(metadata_field "$BEAD_B" "serialize_with")
-SERIALIZE_A=$(metadata_field "$BEAD_A" "serialize_with")
+SERIALIZE_PAIR=()
+mapfile -d '' -t SERIALIZE_PAIR < <(metadata_pair "$BEAD_B" "$BEAD_A" "serialize_with")
+SERIALIZE_B="${SERIALIZE_PAIR[0]:-}"
+SERIALIZE_A="${SERIALIZE_PAIR[1]:-}"
 if printf '%s' "$SERIALIZE_B" | grep -q "$BEAD_A" && printf '%s' "$SERIALIZE_A" | grep -q "$BEAD_B"; then
   pass "real bd: serialize-together tag lands in BOTH beads' real metadata (the for-chuck handoff field)"
 else
@@ -229,8 +245,10 @@ else
        "got: ${OUT:-<empty>}"
 fi
 
-SERIALIZE_B_AFTER=$(metadata_field "$BEAD_B" "serialize_with")
-SERIALIZE_A_AFTER=$(metadata_field "$BEAD_A" "serialize_with")
+SERIALIZE_PAIR_AFTER=()
+mapfile -d '' -t SERIALIZE_PAIR_AFTER < <(metadata_pair "$BEAD_B" "$BEAD_A" "serialize_with")
+SERIALIZE_B_AFTER="${SERIALIZE_PAIR_AFTER[0]:-}"
+SERIALIZE_A_AFTER="${SERIALIZE_PAIR_AFTER[1]:-}"
 if printf '%s' "$SERIALIZE_B_AFTER" | grep -q "$BEAD_A" && printf '%s' "$SERIALIZE_A_AFTER" | grep -q "$BEAD_B"; then
   pass "real bd: metadata still agrees on both beads after the notes rewrite"
 else
@@ -238,67 +256,56 @@ else
        "B.serialize_with='$SERIALIZE_B_AFTER' A.serialize_with='$SERIALIZE_A_AFTER'"
 fi
 
-# ---------------------------------------------------------------------------
-# PLANT-AND-FAIL (SABLE-5lli.7) — the hermeticity fix above must not be a
-# vacuous no-op. Prove a NEW, throwaway hermeticity probe (never the isolated
-# DB the suite itself uses, and never the real project pool) actually goes
-# RED when re-pointed at a SHARED CONSTANT DB across two "runs" — reproducing
-# the established defect (section 1 of SABLE-b0w8k: a constant fixture
-# location lets one run observe another's leftover bead) — before trusting
-# that the same probe reports GREEN when each "run" gets its own per-run
-# unique DB, which is the actual fix this suite now uses throughout.
-# ---------------------------------------------------------------------------
-probe_present() { # <db_dir> -> 0 when a probe bead is visible
-  local db="$1"
-  local existing
-  existing=$(BEADS_DB="$db/.beads" bd list --title-contains "hermeticity probe" --json 2>/dev/null)
-  [ "$existing" != "[]" ] && [ -n "$existing" ]
-}
+METADATA_READS=0
+METADATA_PAIR_READS=0
+METADATA_READ_DETAIL=""
+while IFS= read -r METADATA_READ; do
+  METADATA_READS=$((METADATA_READS + 1))
+  [ "$METADATA_READ" = "$BEAD_B $BEAD_A" ] && METADATA_PAIR_READS=$((METADATA_PAIR_READS + 1))
+  METADATA_READ_DETAIL="${METADATA_READ_DETAIL}${METADATA_READ}|"
+done < "$METADATA_READ_LOG"
+if [ "$METADATA_READS" = "2" ] && [ "$METADATA_PAIR_READS" = "2" ]; then
+  pass "real bd: two fresh pair snapshots reuse each store read for both beads (one before and one after the state transition)"
+else
+  fail "real bd: two fresh pair snapshots reuse each store read for both beads (one before and one after the state transition)" \
+       "expected two '$BEAD_B $BEAD_A' reads; observed $METADATA_READS: $METADATA_READ_DETAIL"
+fi
 
-plant_probe() { # <db_dir>
-  local db="$1"
-  BEADS_DB="$db/.beads" bd create --sandbox -q \
-    --title="[int-test] hermeticity probe" \
-    --description="[no-test] SABLE-5lli.7 plant-and-fail scratch — $SHARED_FILE" \
-    --type=task >/dev/null 2>&1
-}
-
-PLANT_DIR="$(mktemp -d)"
-# The defect is two runs sharing one store, not how that store was initialized.
-# Copy the already-quiescent real store so the plant spends its time on the
-# discriminating read/write polarity instead of another cold `bd init`.
-cp -a -f "$BEADS_ROOT/." "$PLANT_DIR/"
-if probe_present "$PLANT_DIR"; then
+# ---------------------------------------------------------------------------
+# PLANT-AND-FAIL (SABLE-5lli.7) — the overlap fixture's one batch import is
+# also the real hermeticity plant. The pre-seed read above proved the shared
+# store clean. A fresh read after that mutation must find BEAD_A in the same
+# store (the established constant-location leak), while the pre-mutation copy
+# must remain clean (the per-run isolation fix). No observation crosses the
+# batch-import mutation: each side performs its own real bd read.
+# ---------------------------------------------------------------------------
+if [ "$PLANT_PRECONDITION_CLEAN" = "0" ]; then
   fail "PLANT-AND-FAIL precondition: a fresh shared-constant DB starts clean before the plant" \
        "unexpected pre-existing probe bead on the very first call"
 else
   pass "PLANT-AND-FAIL precondition: a fresh shared-constant DB starts clean before the plant"
 fi
-plant_probe "$PLANT_DIR"
-if probe_present "$PLANT_DIR"; then
+if probe_present "$BEADS_ROOT" shared-after-seed; then
   pass "PLANT-AND-FAIL: re-pointing two runs at the SAME constant DB reproduces cross-run leakage — hermeticity check correctly goes RED"
 else
   fail "PLANT-AND-FAIL: re-pointing two runs at the SAME constant DB reproduces cross-run leakage — hermeticity check correctly goes RED" \
        "second call on the shared DB did not observe the first call's probe bead — the plant did not arm"
 fi
-rm -rf "$PLANT_DIR"
-
-# Reuse this run's OWN already-initialized isolated DB as one of the two
-# "runs" here — it is already a per-run-unique DB (that is the fix being
-# proven) and by this point carries no "hermeticity probe" bead, so it is a
-# safe, cheaper stand-in for a fresh mktemp+bd-init.
-FRESH_B="$(mktemp -d)"
-# Two deep copies are the actual per-run isolation shape. Seed B before A is
-# mutated, then prove A's real bd create is invisible from B.
-cp -a -f "$BEADS_ROOT/." "$FRESH_B/"
-plant_probe "$BEADS_ROOT"
-if probe_present "$FRESH_B"; then
+if probe_present "$FRESH_B" isolated-copy-after-seed; then
   fail "RESTORE GREEN: two runs on their OWN per-run-unique DBs do not leak into each other (the actual fix)" \
        "run B observed run A's probe bead despite separate scratch DBs"
 else
   pass "RESTORE GREEN: two runs on their OWN per-run-unique DBs do not leak into each other (the actual fix)"
 fi
-rm -rf "$FRESH_B"
+
+expected_probe_reads="shared-before-seed shared-after-seed isolated-copy-after-seed"
+actual_probe_reads="${PROBE_READ_STATES[*]}"
+if [ "$FIXTURE_SEED_WRITES" = "1" ] && [ "$actual_probe_reads" = "$expected_probe_reads" ]; then
+  pass "structure: one batched fixture seed write spans the overlap and hermeticity scenarios"
+else
+  fail "structure: one batched fixture seed write spans the overlap and hermeticity scenarios" \
+       "fixture seed writes=$FIXTURE_SEED_WRITES expected=1; probe reads='$actual_probe_reads'"
+fi
 
 echo
 echo "=========================================="

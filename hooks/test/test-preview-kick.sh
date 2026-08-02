@@ -59,6 +59,8 @@ trap 'rm -rf "$TMPROOT"; sable_test_git_sandbox_cleanup' EXIT
 STUB_DIR="$TMPROOT/stubs"
 mkdir -p "$STUB_DIR"
 KICK_LOG="$STUB_DIR/kick-calls.log"
+HOOK_TRACE_LOG="$STUB_DIR/hook-trace.log"
+KICK_PROOF_LOG="$STUB_DIR/kick-readiness-proof.log"
 export KICK_LOG
 
 # sable-merge-gate recorder. Logs its argv (so 'exactly once' and the argument
@@ -142,19 +144,23 @@ run_hook_on() {
   local branch="$1" env_prefix="${2:-}" stderr_text="${3:-}"
   git -C "$HOOK_REPO" checkout -q "$branch"
   : > "$KICK_LOG"
+  : > "$HOOK_TRACE_LOG"
   local json
   json="$(make_post_input "git push" "$HOOK_REPO" "" "$stderr_text")"
   # shellcheck disable=SC2086 — env_prefix is a deliberate word-split list
   env -i PATH="${HOOK_PATH:-$STUB_DIR:$PATH}" HOME="$HOME" KICK_LOG="$KICK_LOG" \
       GIT_CONFIG_GLOBAL="${GIT_CONFIG_GLOBAL:-}" GIT_CONFIG_SYSTEM="${GIT_CONFIG_SYSTEM:-/dev/null}" \
-      SABLE_HOOK_TRACE_LOG="$STUB_DIR/hook-trace.log" \
+      SABLE_HOOK_TRACE_LOG="$HOOK_TRACE_LOG" \
       CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
       $env_prefix timeout 30 bash "$HOOK" <<< "$json" 2>&1
 }
 
-# The kick is detached, so its log line can land after the hook returns. Poll a
-# bounded window for the expected count instead of reading once (an immediate
-# read would make every "fires none" assertion race-flaky in the other direction).
+# The kick is detached, so its stub log line can land after the hook returns.
+# Poll a bounded window only when a kick is expected. For both positive and
+# negative cases, the hook's synchronous PREVIEW-KICK trace is the structural
+# launch boundary: once the hook has returned, its trace count cannot grow.
+# Requiring that count to agree with the stub's observed calls catches a late or
+# duplicate launch without the old unconditional 0.4s timing guess.
 # grep -c always PRINTS the count (0 when none) but exits 1 on zero matches, so
 # capture it rather than chaining `|| echo 0` (which would print 0 twice).
 kick_count() {
@@ -163,14 +169,22 @@ kick_count() {
   echo "${n:-0}"
 }
 await_kicks() {
-  local want="$1" i
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    [ "$(kick_count)" -ge "$want" ] && break
-    sleep 0.2
-  done
-  # Settle a beat past the target so an unexpected SECOND kick is still caught.
-  sleep 0.4
-  kick_count
+  local want="$1" i observed launches
+  if [ "$want" -gt 0 ]; then
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      [ "$(kick_count)" -ge "$want" ] && break
+      sleep 0.2
+    done
+  fi
+  observed="$(kick_count)"
+  launches="$(grep -c 'PREVIEW-KICK fired' "$HOOK_TRACE_LOG" 2>/dev/null)"
+  launches="${launches:-0}"
+  printf '%s %s %s\n' "$want" "$observed" "$launches" >> "$KICK_PROOF_LOG"
+  if [ "$observed" -ne "$launches" ]; then
+    echo -1
+  else
+    echo "$observed"
+  fi
 }
 
 # (A1) confirmed worker push → exactly one kick, naming the branch and repo
@@ -247,6 +261,16 @@ if [ "$N" -eq 1 ]; then
   pass "A7: slow kick is still fired exactly once"
 else
   fail "A7: slow kick is still fired exactly once" "got $N"
+fi
+
+# Structural proof for the readiness optimization: every Part A count check
+# must agree three ways (expected, stub-observed, synchronously traced launch).
+# This makes zero-kick cases exact without waiting for time to pass.
+if [ "$(wc -l < "$KICK_PROOF_LOG")" -eq 7 ] \
+   && awk '$1 != $2 || $2 != $3 { exit 1 }' "$KICK_PROOF_LOG"; then
+  pass "A-readiness: all seven kick checks agree with synchronous launch traces"
+else
+  fail "A-readiness: kick checks agree with synchronous launch traces" "proof: $(cat "$KICK_PROOF_LOG" 2>/dev/null)"
 fi
 
 # (A8) sable-merge-gate absent → loud skip, hook still exits 0 and still hands

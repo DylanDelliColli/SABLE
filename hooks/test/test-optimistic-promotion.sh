@@ -222,7 +222,7 @@ elif mode == "dominant-shell-no-pytest":
     dominant = max(by_name, key=by_name.get) if by_name else None
     has_pytest = "pytest" in by_name
     ok = (dominant is not None and dominant.startswith("shell:")
-          and by_name[dominant] >= 4.0 and not has_pytest)
+          and by_name[dominant] >= 3.5 and not has_pytest)
     print(f"{'OK' if ok else 'FAIL'} dominant={dominant} seconds={by_name.get(dominant)} "
           f"has_pytest={has_pytest} phases={by_name}")
 else:
@@ -623,7 +623,7 @@ fi
 # exactly where it was and the ci-verify ref is still there to retry against.
 scenario c7 mut_branch_disjoint_ok mut_base_disjoint_ok
 REFS_BEFORE="$(ci_refs)"
-OUT="$(SLOW_TIER=8 FAKE_GH_ADVANCE="$MOVED_SHA" gate_wrapped 3 promote --bead TEST-C7 \
+OUT="$(SLOW_TIER=4 FAKE_GH_ADVANCE="$MOVED_SHA" gate_wrapped 2 promote --bead TEST-C7 \
         --branch wk-1 --base "$BASE_BR" --repo "$B_WORK" --remote origin)"; RC=$?
 
 if [ "$RC" -eq 124 ]; then
@@ -654,7 +654,7 @@ fi
 # an enclosing timeout from the optimistic path genuinely malfunctioning, which
 # is the exact misdiagnosis the bead predicts.
 scenario c8 mut_branch_disjoint_ok mut_base_disjoint_ok
-OUT="$(SLOW_TIER=8 FAKE_GH_ADVANCE="$MOVED_SHA" gate_wrapped 120 promote --bead TEST-C8 \
+OUT="$(SLOW_TIER=4 FAKE_GH_ADVANCE="$MOVED_SHA" gate_wrapped 120 promote --bead TEST-C8 \
         --branch wk-1 --base "$BASE_BR" --repo "$B_WORK" --remote origin)"; RC=$?
 LANDED="$(origin_sha "$BASE_BR")"
 
@@ -675,14 +675,14 @@ else
 fi
 
 # SABLE-mbkbm INTEGRATION, POSITIVE CONTROL: C8's fixture already stubs a REAL
-# ~8s cost into test-left.sh (SLOW_TIER=8, above) under a wrapper that does NOT
+# ~4s cost into test-left.sh (SLOW_TIER=4, above) under a wrapper that does NOT
 # kill the promote — an instrument that cannot show a KNOWN slow phase as
 # dominant is decorative, not a measurement. C8's footprint (mut_branch_
 # disjoint_ok / mut_base_disjoint_ok) never touches bin/, so this doubles as
 # the NEGATIVE CONTROL: no "pytest" phase entry should exist at all.
 PHASE_CHECK_C8="$(python3 "$PHASE_JOURNAL_CHECK" "$(window_log)" dominant-shell-no-pytest)"
 if printf '%s' "$PHASE_CHECK_C8" | grep -q '^OK'; then
-  pass "C8: the impact-tier journal names the stubbed 8s shell suite as the dominant phase, with no fabricated pytest entry"
+  pass "C8: the impact-tier journal names the stubbed 4s shell suite as the dominant phase, with no fabricated pytest entry"
 else
   fail "C8: the journal attributes the stubbed slow phase as dominant with no pytest entry" "$PHASE_CHECK_C8"
 fi
@@ -722,7 +722,7 @@ fi
 if [ "$(SABLE_MG_IMPACT_TIMEOUT=8 SABLE_MG_IMPACT_SERIALIZE=0 \
         SABLE_MG_COVERAGE_FLOOR_TIMEOUT=8 \
         python3 "$GATE" promote-budget --seconds)" -le 120 ]; then
-  pass "C9: C8's wrapper (120s) is above what the gate itself would recommend for an 8s tier"
+  pass "C9: C8's wrapper (120s) is above what the gate itself would recommend for a 4s tier"
 else
   fail "C9: C8's wrapper is above the recommended bound" "recommendation exceeds 120s"
 fi

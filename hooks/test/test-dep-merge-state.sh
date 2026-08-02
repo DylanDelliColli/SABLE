@@ -281,18 +281,23 @@ sys.exit(0 if any(isinstance(b, dict) and b.get('id') == want for b in data) els
     # Writing valid authority makes the WIRING leg reach the intended rc=5 in
     # BOTH shapes, and the guard itself is left untouched.
     #
-    # The receipt is minted by the REAL library (`_digest` and
-    # `validate_execution_authority` from bin/sable_handoff_lib.py) and written
-    # at the program's OWN resolved path (`resolve_mode_state_path`), so no part
-    # of the receipt schema or the path rule is re-implemented here. A future
-    # change to either breaks this setup loudly, with a named cause, instead of
-    # regressing to six opaque rc=15s.
-    write_dispatch_authority() {
+    # The receipt is minted and read back by the REAL authority library, written
+    # at the program's OWN resolved path, and the duplicate-control worktree is
+    # derived by sable-spawn-worker's OWN rule. Build that immutable fixture in
+    # one Python import/parser process: the former write, read-validation, and
+    # worktree-derivation processes loaded the same production closure three
+    # times before any live mutation occurred.
+    build_dispatch_fixture() {
       ( cd "$WORK" && env -u SABLE_MODE_STATE python3 - "$REPO/bin" "$DEPENDENT_ID" "$INT_BRANCH" <<'PY'
-import json, sys
+import importlib.util, json, pathlib, sys
+from importlib.machinery import SourceFileLoader
 
 sys.path.insert(0, sys.argv[1])
-from sable_handoff_lib import _digest, validate_execution_authority
+from sable_handoff_lib import (
+    _digest,
+    read_execution_authority,
+    validate_execution_authority,
+)
 from sable_mode_store_lib import resolve_mode_state_path
 
 dependent_id, int_branch = sys.argv[2], sys.argv[3]
@@ -319,13 +324,29 @@ validate_execution_authority(state)
 path = resolve_mode_state_path()
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+# Read through the same public validator the dispatch guard uses. If either the
+# schema or resolved-path contract drifts, this fixture build fails by name.
+read_execution_authority()
+
+worker_bin = str(pathlib.Path(sys.argv[1]) / "sable-spawn-worker")
+loader = SourceFileLoader("ssw_dep_merge_fixture", worker_bin)
+spec = importlib.util.spec_from_loader("ssw_dep_merge_fixture", loader)
+worker = importlib.util.module_from_spec(spec)
+loader.exec_module(worker)
+derived = worker.resolve_worktree_path(
+    str(pathlib.Path.cwd()), worker.worktree_name(dependent_id, None)
+)
 print(path)
+print(derived)
 PY
       )
     }
 
-    MODE_STATE_PATH=$(write_dispatch_authority)
+    DISPATCH_FIXTURE=$(build_dispatch_fixture)
     AUTHORITY_RC=$?
+    MODE_STATE_PATH="${DISPATCH_FIXTURE%%$'\n'*}"
+    DERIVED_WT="${DISPATCH_FIXTURE#*$'\n'}"
 
     # PRECONDITION, asserted rather than assumed (SABLE-0dg7n test spec): the
     # scratch repo carries readable, VALID execution authority BEFORE the first
@@ -333,18 +354,15 @@ PY
     # so a future guard change fails here by name instead of six opaque rc=15s
     # four assertions later.
     if [ "$AUTHORITY_RC" -eq 0 ] && [ -r "$MODE_STATE_PATH" ] \
-       && ( cd "$WORK" && env -u SABLE_MODE_STATE python3 -c "
-import sys
-sys.path.insert(0, sys.argv[1])
-from sable_handoff_lib import read_execution_authority
-read_execution_authority()
-" "$REPO/bin" >/dev/null 2>&1 ); then
+       && [ -n "$DERIVED_WT" ] && [ "$DERIVED_WT" != "$MODE_STATE_PATH" ]; then
       pass "fixture: the scratch repo carries VALID execution dispatch authority before any real sable-spawn-worker run (precondition for the WIRING leg)"
     else
       fail "fixture: the scratch repo carries VALID execution dispatch authority before any real sable-spawn-worker run (precondition for the WIRING leg)" \
            "rc=$AUTHORITY_RC path=${MODE_STATE_PATH:-<unresolved>} — the WIRING assertions below will abort at exit 15 without this"
     fi
 
+    SPAWN_GOVERNANCE_RUN_LOG="$FIX/spawn-governance-real-runs"
+    : > "$SPAWN_GOVERNANCE_RUN_LOG"
     spawn_governance_run() {
       # $1.. = extra env assignments; runs the real program from the fixture
       # repo, with the worker-pane guard and host-load guard neutralized (this
@@ -356,6 +374,7 @@ read_execution_authority()
       # guard at the REAL repo's authority, whose scope does not name this
       # fixture's bead — an out-of-scope refusal that looks exactly like the
       # rc=15 this bead fixed.
+      printf '%s\n' real >> "$SPAWN_GOVERNANCE_RUN_LOG"
       ( cd "$WORK" && env -u SABLE_WORKER_PANE -u SABLE_MODE_STATE \
           SABLE_MAX_LOAD_PER_CORE=0 \
           SABLE_TMUX_SOCKET="$FIX/no-such-tmux-socket" \
@@ -365,19 +384,8 @@ read_execution_authority()
             --session "sable-int-d5iku-$$" 2>&1 )
     }
 
-    # The derived worktree path is computed by the program's OWN rule rather
-    # than a re-implementation of it here, so a future rename of that rule
-    # breaks the test loudly instead of silently disarming the abort.
-    DERIVED_WT=$(python3 - "$REPO/bin/sable-spawn-worker" "$WORK" "$DEPENDENT_ID" <<'PY'
-import importlib.util, sys
-from importlib.machinery import SourceFileLoader
-loader = SourceFileLoader("ssw", sys.argv[1])
-spec = importlib.util.spec_from_loader("ssw", loader)
-m = importlib.util.module_from_spec(spec)
-loader.exec_module(m)
-print(m.resolve_worktree_path(sys.argv[2], m.worktree_name(sys.argv[3], None)))
-PY
-)
+    # DERIVED_WT came from the same validated production fixture build above;
+    # no test-side path rule is duplicated here.
     mkdir -p "$DERIVED_WT"
     bd -C "$BEADS_ROOT" update "$DEPENDENT_ID" --sandbox --status in_progress >/dev/null 2>&1
 
@@ -515,8 +523,12 @@ SH
     # this fleet-wide activation depends on that one continuing to pass too,
     # since bin/sable-spawn-worker is a live symlink into the shared checkout
     # with no staged rollout.)
-    SPAWN_HEALTHY_OUT=$(spawn_governance_run)
-    SPAWN_HEALTHY_RC=$?
+    # Authority restoration was already observed through a fresh real run above.
+    # Guard-off and slow-bd are per-invocation env negatives and mutate no fixture
+    # state, so reuse that immutable healthy observation instead of starting the
+    # identical parser/governance chain a seventh time.
+    SPAWN_HEALTHY_OUT="$SPAWN_REARMED"
+    SPAWN_HEALTHY_RC="$SPAWN_REARMED_RC"
     if [ "$SPAWN_HEALTHY_RC" -eq 5 ] \
        && echo "$SPAWN_HEALTHY_OUT" | grep -q 'UNMERGED-BLOCKER WARNING' \
        && ! echo "$SPAWN_HEALTHY_OUT" | grep -q 'COULD NOT ASSESS'; then
@@ -567,6 +579,14 @@ SH
     else
       fail "WIRING: after the REAL merge the same real dispatch run is SILENT" \
            "rc=$SPAWN_AFTER_RC (want 5 — a crash must not read as silence) output: $SPAWN_AFTER"
+    fi
+
+    SPAWN_GOVERNANCE_REAL_RUNS=$(wc -l < "$SPAWN_GOVERNANCE_RUN_LOG" | tr -d '[:space:]')
+    if [ "$SPAWN_GOVERNANCE_REAL_RUNS" -eq 6 ]; then
+      pass "fixture reuse: exactly six semantic transitions execute the real sable-spawn-worker governance path"
+    else
+      fail "fixture reuse: exactly six semantic transitions execute the real sable-spawn-worker governance path" \
+           "saw $SPAWN_GOVERNANCE_REAL_RUNS real runs (expected 6; immutable observations must be reused)"
     fi
   fi
 fi

@@ -34,10 +34,15 @@ FAIL_NAMES=""
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 
-# Shared temp state; set mode per test group via the real helper. Keep the
-# adjacent store lock inside the same throwaway directory.
+# Shared temp state. The first planning/execution postures are written and
+# validated by the real helper, then captured as immutable test-local snapshots.
+# Ordinary posture setup atomically republishes those bytes; the explicit live
+# mode-flip lifecycle controls below still use the real writer. Keep snapshots,
+# publication temporaries, and the adjacent store lock in one throwaway directory.
 MODE_TEST_ROOT="$(mktemp -d)"
 SABLE_MODE_STATE="$MODE_TEST_ROOT/mode-state.json"
+PLANNING_MODE_SNAPSHOT="$MODE_TEST_ROOT/planning-mode-state.json"
+EXECUTION_MODE_SNAPSHOT="$MODE_TEST_ROOT/execution-mode-state.json"
 export SABLE_MODE_STATE
 
 # Hermetic registry so the v3 Agent-leg matrix (SABLE-4k7) classifies spawn
@@ -69,28 +74,101 @@ YAML
 
 trap 'rm -rf "$MODE_TEST_ROOT"; rm -f "$SABLE_AGENTS_YAML"' EXIT
 
-set_mode() {
+fixture_fatal() {
+  echo "FAIL: mode-interlock fixture setup: $1" >&2
+  exit 2
+}
+
+set_mode_real() {
   if [ "$1" = "execution" ]; then
     "$MODE_BIN" set execution --break-glass \
-      --reason "synthetic authority for interlock posture tests" >/dev/null 2>&1
+      --reason "synthetic authority for interlock posture tests" >/dev/null 2>&1 \
+      || fixture_fatal "real execution transition failed"
   else
-    "$MODE_BIN" set "$1" >/dev/null 2>&1
+    "$MODE_BIN" set "$1" >/dev/null 2>&1 \
+      || fixture_fatal "real $1 transition failed"
   fi
+}
+
+capture_mode_snapshot() {
+  local mode="$1" snapshot expected actual
+  case "$mode" in
+    planning)
+      snapshot="$PLANNING_MODE_SNAPSHOT"
+      expected="planning
+full
+framing"
+      ;;
+    execution)
+      snapshot="$EXECUTION_MODE_SNAPSHOT"
+      expected="execution
+-
+-"
+      ;;
+    *) fixture_fatal "cannot capture unknown mode '$mode'" ;;
+  esac
+  [ ! -e "$snapshot" ] || fixture_fatal "$mode snapshot is already seeded"
+  cp -f "$SABLE_MODE_STATE" "$snapshot" \
+    || fixture_fatal "cannot capture $mode snapshot"
+  actual="$(SABLE_MODE_STATE="$snapshot" "$MODE_BIN" snapshot 2>/dev/null)" \
+    || fixture_fatal "$mode snapshot failed canonical validation"
+  [ "$actual" = "$expected" ] \
+    || fixture_fatal "$mode snapshot has unexpected posture: ${actual:-<empty>}"
+}
+
+seed_mode_snapshot() {
+  set_mode_real "$1"
+  capture_mode_snapshot "$1"
+}
+
+set_mode() {
+  local mode="$1" snapshot temporary
+  case "$mode" in
+    planning) snapshot="$PLANNING_MODE_SNAPSHOT" ;;
+    execution) snapshot="$EXECUTION_MODE_SNAPSHOT" ;;
+    *) fixture_fatal "cannot publish unknown mode '$mode'" ;;
+  esac
+  [ -f "$snapshot" ] || fixture_fatal "$mode snapshot has not been seeded"
+  temporary="${SABLE_MODE_STATE}.snapshot.$$"
+  cp -f "$snapshot" "$temporary" \
+    || fixture_fatal "cannot stage $mode snapshot"
+  mv -f "$temporary" "$SABLE_MODE_STATE" \
+    || fixture_fatal "cannot atomically publish $mode snapshot"
 }
 clear_mode() { rm -f "$SABLE_MODE_STATE"; }
 
-# run_hook <command> [agent_id] → stdout
-run_hook() {
-  python3 -c "
-import json, sys
-d = {'tool_input': {'command': sys.argv[1]}}
-if len(sys.argv) > 2 and sys.argv[2]:
-    d['agent_id'] = sys.argv[2]
-print(json.dumps(d))
-" "$1" "${2:-}" | bash "$HOOK" 2>/dev/null
+json_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\b'/\\b}
+  value=${value//$'\f'/\\f}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  JSON_ESCAPED="$value"
 }
 
-is_deny() { printf '%s' "$1" | grep -q '"permissionDecision": *"deny"'; }
+make_hook_input() {
+  local command agent_id
+  json_escape "$1"
+  command="$JSON_ESCAPED"
+  json_escape "${2:-}"
+  agent_id="$JSON_ESCAPED"
+  if [ -n "$agent_id" ]; then
+    HOOK_INPUT_JSON="{\"tool_input\":{\"command\":\"$command\"},\"agent_id\":\"$agent_id\"}"
+  else
+    HOOK_INPUT_JSON="{\"tool_input\":{\"command\":\"$command\"}}"
+  fi
+}
+
+# run_hook <command> [agent_id] → stdout
+run_hook() {
+  make_hook_input "$1" "${2:-}"
+  bash "$HOOK" <<< "$HOOK_INPUT_JSON" 2>/dev/null
+}
+
+is_deny() { [[ "$1" == *'"permissionDecision": "deny"'* ]]; }
 
 assert_deny() {
   # name command [agent_id]
@@ -111,7 +189,7 @@ unset CLAUDE_AGENT_ROLE 2>/dev/null || true
 unset SABLE_ORCHESTRATION_FORCE 2>/dev/null || true
 
 # ---------- PLANNING mode ----------
-set_mode planning
+seed_mode_snapshot planning
 
 assert_deny  "planning blocks optimus spawn"  'CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager claude'
 assert_deny  "planning blocks tarzan spawn"   'CLAUDE_AGENT_NAME=tarzan CLAUDE_AGENT_ROLE=manager claude'
@@ -142,7 +220,7 @@ if is_deny "$out_env"; then fail "planning SABLE_ORCHESTRATION_FORCE=1 allows ma
 # allowed throughout.
 set_substage() { "$MODE_BIN" substage set "$1" >/dev/null 2>&1; }
 
-set_mode planning   # re-initializes substage=framing
+set_mode planning   # restores the canonical substage=framing snapshot
 
 assert_allow "framing allows bare epic shell"    'bd create --type=epic --title="x"'
 assert_allow "framing allows bare epic (-t)"     'bd create -t epic --title="x"'
@@ -165,7 +243,7 @@ assert_allow "decomposition allows graph create" 'bd create --graph /tmp/plan.js
 assert_allow "decomposition allows file create"  'bd create --file /tmp/beads.md'
 
 # soft override regardless of substage (use a gated shape — bare epic is always allowed)
-set_mode planning   # back to framing
+set_mode planning   # restore canonical framing snapshot
 assert_allow "framing --force allows child create" 'bd create --type=task --parent=SABLE-ni8 --title="x" --force'
 
 # not the cockpit → no-op even on a gated child-create in framing
@@ -173,7 +251,7 @@ out_nc="$(printf '%s' '{"tool_input":{"command":"bd create --type=task --parent=
 if is_deny "$out_nc"; then fail "framing child-create no-op when not cockpit" "got deny"; else pass "framing child-create no-op when not cockpit"; fi
 
 # ---------- EXECUTION mode ----------
-set_mode execution
+seed_mode_snapshot execution
 
 assert_deny  "execution blocks sherlock spawn" 'CLAUDE_AGENT_NAME=sherlock CLAUDE_AGENT_ROLE=auditor claude src/auth'
 assert_deny  "execution blocks victor spawn"   'CLAUDE_AGENT_NAME=victor CLAUDE_AGENT_ROLE=bead_validator claude'
@@ -371,11 +449,11 @@ assert_deny "lifecycle: schema-invalid provider map also fails closed" 'ls -la'
 clear_mode
 
 # (11) mode flip mid-session honored without caching: same input, decisions track the file
-set_mode planning
+set_mode_real planning
 o1="$(run_agent sherlock lincoln)"   # planning + producer + main → allow
-set_mode execution
+set_mode_real execution
 o2="$(run_agent sherlock lincoln)"   # execution + producer + main → deny
-set_mode planning
+set_mode_real planning
 o3="$(run_agent sherlock lincoln)"   # planning again → allow
 if ! is_deny "$o1" && is_deny "$o2" && ! is_deny "$o3"; then
   pass "mode flip mid-session honored without caching (allow → deny → allow)"
@@ -479,7 +557,7 @@ assert_allow "pi5m: planning allows sable-note naming sable-spawn-manager" \
 set_substage decomposition
 assert_allow "pi5m: decomposition allows --parent child naming sable-spawn-worker" \
   'bd create --type=task --parent=SABLE-qa4d --title="x" --description="child dispatched by sable-spawn-worker helper"'
-set_mode planning   # back to framing
+set_mode planning   # restore canonical framing snapshot
 
 # (1) real invocations still DENIED in planning (command-word position preserved)
 assert_deny  "pi5m: planning still blocks real sable-spawn-worker" 'sable-spawn-worker SABLE-x --worktree /wt'
@@ -664,7 +742,7 @@ assert_allow "qs3r: planning allows multi-line prose that only names git push" \
 
 # ykij def2: sable-mode exemption anchored to a real LEADING sable-mode command.
 # A bd create whose description NAMES sable-mode must NOT bypass the backlog gate.
-set_mode planning   # substage=framing
+set_mode planning   # restore canonical substage=framing snapshot
 assert_deny  "ykij: framing blocks --parent child whose --description names sable-mode" \
   'bd create --type=task --parent=SABLE-ni8 --title="x" --description="then run sable-mode set execution"'
 assert_deny  "ykij: framing blocks graph create whose --description names sable-mode" \
@@ -811,6 +889,46 @@ if len(sys.argv)>2 and sys.argv[2]: d[\"agent_id\"]=sys.argv[2]
 print(json.dumps(d))
 " "$@"; }; SABLE_MODE_STATE="'"$SABLE_MODE_STATE"'" agent_json sherlock sub-9 | CLAUDE_AGENT_NAME=lincoln bash "'"$HOOK"'" '
 
+# ---------- physical mode-lib resolution without GNU readlink -f ----------
+# Installed hooks cannot use their own ../../bin path, so they resolve sable-mode
+# from PATH. Exercise the real installed shape with a multi-hop relative symlink
+# and a readlink shim that fails if the hook still shells out to GNU readlink -f.
+# A valid planning state plus benign Bash work must ALLOW; an import failure would
+# misclassify the present state as corrupt and DENY, making this a sharp seam.
+MODE_LIB_SEAM="$MODE_TEST_ROOT/mode-lib-seam"
+MODE_LIB_SEAM_HOOKS="$MODE_LIB_SEAM/install/hooks/multi-manager"
+MODE_LIB_SEAM_PATH="$MODE_LIB_SEAM/path"
+MODE_LIB_SEAM_READLINK_LOG="$MODE_LIB_SEAM/readlink-called"
+mkdir -p "$MODE_LIB_SEAM_HOOKS" "$MODE_LIB_SEAM_PATH"
+cp -f "$HOOK" "$MODE_LIB_SEAM_HOOKS/mode-interlock.sh"
+cp -f "$REPO/hooks/multi-manager/lib-mode-path.sh" "$MODE_LIB_SEAM_HOOKS/lib-mode-path.sh"
+cp -f "$REPO/hooks/multi-manager/lib-registry-path.sh" "$MODE_LIB_SEAM_HOOKS/lib-registry-path.sh"
+cp -f "$REPO/hooks/multi-manager/lib-identity.sh" "$MODE_LIB_SEAM_HOOKS/lib-identity.sh"
+ln -s "$MODE_BIN" "$MODE_LIB_SEAM/mode-hop-2"
+ln -s ../mode-hop-2 "$MODE_LIB_SEAM_PATH/mode-hop-1"
+ln -s mode-hop-1 "$MODE_LIB_SEAM_PATH/sable-mode"
+cat > "$MODE_LIB_SEAM_PATH/readlink" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' called >> "${MODE_LIB_SEAM_READLINK_LOG:?}"
+exit 1
+SH
+chmod +x "$MODE_LIB_SEAM_PATH/readlink"
+
+mode_lib_seam_out="$(printf '%s' '{"tool_input":{"command":"ls -la"}}' | \
+  PATH="$MODE_LIB_SEAM_PATH:$PATH" \
+  MODE_LIB_SEAM_READLINK_LOG="$MODE_LIB_SEAM_READLINK_LOG" \
+  bash "$MODE_LIB_SEAM_HOOKS/mode-interlock.sh" 2>/dev/null)"
+if is_deny "$mode_lib_seam_out"; then
+  fail "mode lib resolution follows a multi-hop PATH symlink" "got deny: $mode_lib_seam_out"
+else
+  pass "mode lib resolution follows a multi-hop PATH symlink"
+fi
+if [ -s "$MODE_LIB_SEAM_READLINK_LOG" ]; then
+  fail "mode lib resolution does not invoke external readlink"
+else
+  pass "mode lib resolution does not invoke external readlink"
+fi
+
 # ---------- per-repo mode resolution (SABLE-5hck.3) ----------
 # The interlock must read the mode of the repo the tool call runs in (hook-input
 # cwd), so two sessions in different repos enforce independent modes. These cases
@@ -893,6 +1011,33 @@ else
   pass "59t6.1: unregistered target stays free under project registry (allow)"
 fi
 rm -rf "$PROJ_EXEC" "$PROJ_EMPTY_HOME"
+
+# Byte-exact encoder control: these are every escapable character exercised by
+# shell command/identity payloads in this suite.
+ESCAPE_CONTROL_COMMAND=$'say "hi" \\ path\nnext\tcell'
+ESCAPE_CONTROL_AGENT=$'agent-"id"\\lane'
+ESCAPE_CONTROL_EXPECTED='{"tool_input":{"command":"say \"hi\" \\ path\nnext\tcell"},"agent_id":"agent-\"id\"\\lane"}'
+make_hook_input "$ESCAPE_CONTROL_COMMAND" "$ESCAPE_CONTROL_AGENT"
+if [ "$HOOK_INPUT_JSON" = "$ESCAPE_CONTROL_EXPECTED" ]; then
+  pass "structure: shell hook-input encoder escapes command and agent_id exactly"
+else
+  fail "structure: shell hook-input encoder escapes command and agent_id exactly" \
+    "got: $HOOK_INPUT_JSON"
+fi
+
+# Test-local hot helpers must not start an external encoder or matcher per
+# assertion. Derive the count from their definitions so this remains
+# load-bearing if either helper regresses.
+HELPER_EXTERNAL_START_SITES=0
+HOT_HELPER_DEFINITIONS="$(declare -f json_escape make_hook_input run_hook is_deny)"
+[[ "$HOT_HELPER_DEFINITIONS" == *python3* ]] && HELPER_EXTERNAL_START_SITES=$((HELPER_EXTERNAL_START_SITES+1))
+[[ "$HOT_HELPER_DEFINITIONS" == *grep* ]] && HELPER_EXTERNAL_START_SITES=$((HELPER_EXTERNAL_START_SITES+1))
+if [ "$HELPER_EXTERNAL_START_SITES" -eq 0 ]; then
+  pass "structure: hot hook helpers have zero external process-start sites"
+else
+  fail "structure: hot hook helpers have zero external process-start sites" \
+    "found $HELPER_EXTERNAL_START_SITES external start site(s)"
+fi
 
 echo
 echo "=========================================="

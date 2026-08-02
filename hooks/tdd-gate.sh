@@ -33,21 +33,57 @@ sable_trace_entry tdd-gate
 
 HOOK_INPUT=$(sable_trace_read_stdin) || exit 0
 
-# Read stdin and parse with python3 (jq not available)
-PARSED=$(printf '%s' "$HOOK_INPUT" | python3 -c "
-import json, sys
+# Parse the hook identity, bd-close matcher, and positional bead IDs at one
+# Python boundary (jq is unavailable). NUL-delimited fields let Bash consume
+# the result without sed/grep/wc subprocesses. Invalid JSON or an unexpected
+# payload shape emits no complete field set and preserves the silent fail-open.
+TDD_GATE_FIELDS=()
+mapfile -d '' -t TDD_GATE_FIELDS < <(printf '%s' "$HOOK_INPUT" | python3 -c "
+import json, re, shlex, sys
+
 d = json.load(sys.stdin)
 cmd = d.get('tool_input', {}).get('command', '')
 sid = d.get('session_id', '')
 aid = d.get('agent_id', '') or ''
-print(f'{sid}\n{aid}\n{cmd}')
-" 2>/dev/null) || exit 0
 
-SESSION_ID=$(echo "$PARSED" | sed -n '1p')
-AGENT_ID=$(echo "$PARSED" | sed -n '2p')
-COMMAND=$(echo "$PARSED" | sed -n '3p')
+# Preserve the former print + sed -n '1p/2p/3p' field behavior exactly,
+# including its first-line command boundary.
+legacy_lines = f'{sid}\n{aid}\n{cmd}'.split('\\n')
+session_id = legacy_lines[0] if legacy_lines else ''
+agent_id = legacy_lines[1] if len(legacy_lines) > 1 else ''
+command = legacy_lines[2] if len(legacy_lines) > 2 else ''
 
-[ -z "$COMMAND" ] && exit 0
+is_bd_close = bool(command) and command.startswith('bd close')
+ids = []
+if is_bd_close:
+    close_args = re.sub(r'^bd close\s+', '', command)
+    try:
+        tokens = shlex.split(close_args)
+    except ValueError:
+        tokens = []
+    # Only consider tokens before the first flag. Flag values such as
+    # 'docs-only' can look like bead IDs but must not inflate the count.
+    positional = []
+    for token in tokens:
+        if token.startswith('-'):
+            break
+        positional.append(token)
+    id_pattern = re.compile(r'^[A-Za-z][A-Za-z0-9-]*-[a-z0-9]+(\\.[0-9]+)?\$')
+    ids = [token for token in positional if id_pattern.match(token)]
+
+fields = [session_id, agent_id, '1' if is_bd_close else '0',
+          ' '.join(ids), str(len(ids))]
+sys.stdout.write('\\0'.join(fields) + '\\0')
+" 2>/dev/null)
+
+[ "${#TDD_GATE_FIELDS[@]}" -eq 5 ] || exit 0
+SESSION_ID="${TDD_GATE_FIELDS[0]}"
+AGENT_ID="${TDD_GATE_FIELDS[1]}"
+IS_BD_CLOSE="${TDD_GATE_FIELDS[2]}"
+BEAD_ARGS="${TDD_GATE_FIELDS[3]}"
+ID_COUNT="${TDD_GATE_FIELDS[4]}"
+
+[ "$IS_BD_CLOSE" = "1" ] || exit 0
 
 deny_with_reason() {
   TDD_GATE_DENY_REASON="$1" python3 -c "
@@ -62,11 +98,8 @@ print(json.dumps({
 "
 }
 
-# Only act on bd close commands
-echo "$COMMAND" | grep -q '^bd close' || exit 0
-
-# Extract bead IDs from the close command. Strategy: shlex-tokenize the
-# string, then keep only tokens that match the bead-ID shape
+# Bead IDs from the close command are shlex-tokenized above. Strategy: keep
+# only tokens that match the bead-ID shape
 # (PREFIX-suffix or PREFIX-suffix.N, with any-case prefix + lowercase
 # alphanumeric suffix). This naturally excludes flags (--reason, --json),
 # flag values (text after a flag), pipes (|), redirects (2>&1, > file),
@@ -81,26 +114,6 @@ echo "$COMMAND" | grep -q '^bd close' || exit 0
 # (market-brief-package-2e4o) so monorepo rigs with multi-hyphen prefixes
 # (market-brief-package-*) bind the suffix to the LAST hyphen segment; without
 # it those IDs matched zero tokens and the [no-test] hatch was silently skipped.
-BEAD_ARGS=$(BEAD_CMD="$COMMAND" python3 -c "
-import os, re, shlex
-cmd = re.sub(r'^bd close\s+', '', os.environ.get('BEAD_CMD', ''))
-try:
-    tokens = shlex.split(cmd)
-except ValueError:
-    tokens = []
-# Only consider tokens before the first flag (first token starting with '-').
-# Flag values after a flag token (e.g. 'docs-only' after '--reason') can
-# match the bead-ID shape and would inflate ID_COUNT — SABLE-3uw / SABLE-9we.
-positional = []
-for t in tokens:
-    if t.startswith('-'):
-        break
-    positional.append(t)
-ID_PATTERN = re.compile(r'^[A-Za-z][A-Za-z0-9-]*-[a-z0-9]+(\.[0-9]+)?\$')
-ids = [t for t in positional if ID_PATTERN.match(t)]
-print(' '.join(ids))
-")
-ID_COUNT=$(echo "$BEAD_ARGS" | wc -w)
 
 # Single-bead close: check [no-test] escape hatch
 MARKER_LOOKUP_FAILURE=""
@@ -195,27 +208,40 @@ if [ -n "$BEAD_ARGS" ]; then
   # two forms explicitly — instead of one open-ended glob — closes the
   # prefix collision without narrowing the legitimate agent-variant match.
   _companion_evidence_base=$(sable_evidence_key "$SESSION_ID" "")
-  for _bid in $BEAD_ARGS; do
-    _companion=$(bd show "$_bid" --json 2>/dev/null | python3 -c "
+  # All positional IDs are already validated by the parser above. Resolve
+  # their records in one bd read and extract every declaration in one Python
+  # parse; the acceptance rule is additive (ANY bead + ANY same-session
+  # evidence), so batching changes no ordering or verdict semantics while
+  # removing a Dolt/Python startup per additional bead (SABLE-y4nom.7.6).
+  read -r -a _bead_ids <<< "$BEAD_ARGS"
+  _companion_json=$(bd show "${_bead_ids[@]}" --json 2>/dev/null) || true
+  while IFS= read -r _companion; do
+    [ -n "$_companion" ] || continue
+    for _f in "${_companion_evidence_base}" "${_companion_evidence_base}"-*; do
+      if [ -f "$_f" ] && grep -qF "REPO=${_companion}" "$_f" 2>/dev/null; then
+        exit 0
+      fi
+    done
+  done < <(printf '%s' "${_companion_json:-}" | python3 -c "
 import json, re, sys
 try:
     data = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-if not isinstance(data, list) or not data:
+if isinstance(data, dict):
+    data = [data]
+if not isinstance(data, list):
     sys.exit(0)
-notes = data[0].get('notes', '') or ''
-m = re.search(r'Companion repo:\s*(\S+)', notes)
-print(m.group(1) if m else '')
-" 2>/dev/null) || _companion=""
-    if [ -n "$_companion" ]; then
-      for _f in "${_companion_evidence_base}" "${_companion_evidence_base}"-*; do
-        if [ -f "$_f" ] && grep -qF "REPO=${_companion}" "$_f" 2>/dev/null; then
-          exit 0
-        fi
-      done
-    fi
-  done
+seen = set()
+for record in data:
+    if not isinstance(record, dict):
+        continue
+    notes = record.get('notes', '') or ''
+    match = re.search(r'Companion repo:\s*(\S+)', str(notes))
+    if match and match.group(1) not in seen:
+        seen.add(match.group(1))
+        print(match.group(1))
+" 2>/dev/null)
 fi
 
 # No evidence found — block the close

@@ -42,6 +42,11 @@ fi
 PASS=0
 FAIL=0
 FAIL_NAMES=""
+REAL_BD_FIXTURE_READY=0
+REAL_BD_SETUP_WRITES_ELIDED=0
+REAL_BD_READBACK_REUSES=0
+REAL_BD_CLOSE_READBACK_REUSES=0
+IMMUTABLE_UNIT_OBSERVATION_REUSES=0
 
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() {
@@ -105,34 +110,32 @@ export SABLE_DEP_MERGE_GUARD=0
 # Helpers
 # ---------------------------------------------------------------------------
 
+json_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\b'/\\b}
+  value=${value//$'\f'/\\f}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  JSON_ESCAPED="$value"
+}
+
 # make_dispatch_input <prompt>
 # Produces a PreToolUse:Agent JSON payload (no agent_id = manager/main-session context).
 make_dispatch_input() {
-  python3 -c "
-import json, sys
-prompt = sys.argv[1]
-print(json.dumps({
-    'tool_name': 'Agent',
-    'tool_input': {'prompt': prompt, 'subagent_type': 'general-purpose'},
-    'hook_event_name': 'PreToolUse'
-}))
-" "$1"
+  json_escape "$1"
+  printf '{"tool_name":"Agent","tool_input":{"prompt":"%s","subagent_type":"general-purpose"},"hook_event_name":"PreToolUse"}\n' \
+    "$JSON_ESCAPED"
 }
 
 # make_subagent_input <prompt>
 # Produces a PreToolUse:Agent JSON payload WITH agent_id (subagent context).
 make_subagent_input() {
-  python3 -c "
-import json, sys
-prompt = sys.argv[1]
-print(json.dumps({
-    'tool_name': 'Agent',
-    'agent_id': 'agent-abc-123',
-    'agent_type': 'general-purpose',
-    'tool_input': {'prompt': prompt, 'subagent_type': 'general-purpose'},
-    'hook_event_name': 'PreToolUse'
-}))
-" "$1"
+  json_escape "$1"
+  printf '{"tool_name":"Agent","agent_id":"agent-abc-123","agent_type":"general-purpose","tool_input":{"prompt":"%s","subagent_type":"general-purpose"},"hook_event_name":"PreToolUse"}\n' \
+    "$JSON_ESCAPED"
 }
 
 # make_manager_subagent_input <prompt> <agent_type>
@@ -140,17 +143,13 @@ print(json.dumps({
 # (agent_id present + manager agent_type, NO env identity) — the SABLE-uz9.9
 # native-dispatch path.
 make_manager_subagent_input() {
-  python3 -c "
-import json, sys
-prompt, atype = sys.argv[1], sys.argv[2]
-print(json.dumps({
-    'tool_name': 'Agent',
-    'agent_id': 'mgr-sub-001',
-    'agent_type': atype,
-    'tool_input': {'prompt': prompt, 'subagent_type': 'general-purpose'},
-    'hook_event_name': 'PreToolUse'
-}))
-" "$1" "$2"
+  local prompt agent_type
+  json_escape "$1"
+  prompt="$JSON_ESCAPED"
+  json_escape "$2"
+  agent_type="$JSON_ESCAPED"
+  printf '{"tool_name":"Agent","agent_id":"mgr-sub-001","agent_type":"%s","tool_input":{"prompt":"%s","subagent_type":"general-purpose"},"hook_event_name":"PreToolUse"}\n' \
+    "$agent_type" "$prompt"
 }
 
 # run_hook_as_manager <prompt>
@@ -172,7 +171,8 @@ run_hook_as_manager() {
 
 # --- Test 1: uppercase SABLE-xyz ID in prompt → bd update --notes called ---
 run_hook_as_manager "SABLE-xyz: implement the feature"
-if grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+IMMUTABLE_CLAIM_UPDATE_LINE=$(grep 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null | head -1)
+if [ -n "$IMMUTABLE_CLAIM_UPDATE_LINE" ]; then
   pass "uppercase SABLE-xyz in prompt → bd update --notes called"
 else
   fail "uppercase SABLE-xyz in prompt → bd update --notes called" \
@@ -226,15 +226,16 @@ else
 fi
 
 # --- Test 6: WIP-CLAIMS content includes the file path from description ---
-: > "$BD_CALL_LOG"
-run_hook_as_manager "SABLE-xyz: implement hooks/foo.sh"
-# The update call args are all in one line in the log (--notes ... appends path)
-UPDATE_LINE=$(grep 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null | head -1)
+# Test 1 already produced this update from the bead description even though its
+# prompt carried no path; keep that stronger immutable observation rather than
+# starting the hook again with a path-bearing prompt.
+UPDATE_LINE="$IMMUTABLE_CLAIM_UPDATE_LINE"
+IMMUTABLE_UNIT_OBSERVATION_REUSES=$((IMMUTABLE_UNIT_OBSERVATION_REUSES+1))
 if echo "$UPDATE_LINE" | grep -q 'WIP-CLAIMS.*hooks/foo.sh\|hooks/foo.sh'; then
   pass "WIP-CLAIMS note includes file path from bead description"
 else
   # update was called — check if we can see the note value
-  if grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+  if [ -n "$UPDATE_LINE" ]; then
     pass "bd update --notes called (WIP-CLAIMS path check: log format varies)"
   else
     fail "WIP-CLAIMS note includes file path from bead description" \
@@ -309,15 +310,121 @@ fi
 # pushed WIP-CLAIMS bookkeeping to the remote as a pure hook side effect on
 # EVERY dispatch — the exact chuck-only-convention violation behind the
 # 2026-07-09 cross-fleet corruption incident.
-: > "$BD_CALL_LOG"
-run_hook_as_manager "SABLE-xyz: implement hooks/foo.sh"
-UPDATE_LINE_LFQL=$(grep 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null | head -1)
+# Tests 1/6 already established the exact identity, fixture, update, and
+# description-derived path. Reuse that immutable observation; later
+# concurrency/stateful cases remain fresh hook invocations.
+UPDATE_LINE_LFQL="$UPDATE_LINE"
+IMMUTABLE_UNIT_OBSERVATION_REUSES=$((IMMUTABLE_UNIT_OBSERVATION_REUSES+1))
 if echo "$UPDATE_LINE_LFQL" | grep -q -- '--sandbox'; then
   pass "SABLE-lfql: bd update --notes call carries --sandbox (Dolt auto-push disabled)"
 else
   fail "SABLE-lfql: bd update --notes call carries --sandbox (Dolt auto-push disabled)" \
        "update line: ${UPDATE_LINE_LFQL:-<none>}"
 fi
+
+# ---------------------------------------------------------------------------
+# SABLE-y4nom.7.6: one initial bead parse supplies description + wip_claims.
+# A two-bead dispatch is the load-bearing control: an already-claimed bead
+# stops after one read, while an unclaimed bead gets one last-responsible-moment
+# refresh before its update. That refresh preserves the old concurrent-claim
+# guard while reducing per-bead Python parses from three to one or two.
+# Malformed/empty initial reads remain fail-open (one attempt, no update).
+# ---------------------------------------------------------------------------
+BD_SHOW_COUNT="$FIXTURE_DIR/bd-show-count.log"
+export BD_SHOW_COUNT
+cat > "$STUB_DIR/bd" <<'STUB'
+#!/usr/bin/env bash
+echo "BD_CALLED: $*" >> "$BD_CALL_LOG"
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  printf '%s\n' "$2" >> "$BD_SHOW_COUNT"
+  case "${BD_SHOW_MODE:-records}" in
+    malformed) printf '{malformed\n'; exit 0 ;;
+    empty) exit 0 ;;
+    refresh-malformed)
+      if [ "$2" = "SABLE-one" ] \
+         && [ "$(grep -c '^SABLE-one$' "$BD_SHOW_COUNT" 2>/dev/null)" -ge 2 ]; then
+        printf '{malformed\n'
+        exit 0
+      fi
+      ;;
+  esac
+  case "$2" in
+    SABLE-one)
+      if [ "${BD_SHOW_MODE:-records}" = "concurrent" ] \
+         && [ "$(grep -c '^SABLE-one$' "$BD_SHOW_COUNT" 2>/dev/null)" -ge 2 ]; then
+        echo '[{"id":"SABLE-one","description":"Mention hooks/fallback-only.sh.\n## File footprint\nbin/sable-spawn-worker, hooks/one.sh implementation\n## Acceptance\nDone.","metadata":{"wip_claims":"hooks/concurrent.sh"}}]'
+      else
+        echo '[{"id":"SABLE-one","description":"Mention hooks/fallback-only.sh.\n## File footprint\nbin/sable-spawn-worker, hooks/one.sh implementation\n## Acceptance\nDone.","metadata":{}}]'
+      fi
+      ;;
+    SABLE-two)
+      echo '[{"id":"SABLE-two","description":"hooks/two.sh is the implementation","metadata":{"wip_claims":"hooks/already.sh"}}]'
+      ;;
+    *)
+      echo '[]'
+      ;;
+  esac
+  exit 0
+fi
+exit 0
+STUB
+chmod +x "$STUB_DIR/bd"
+
+export BD_SHOW_MODE=records
+: > "$BD_SHOW_COUNT"
+run_hook_as_manager "SABLE-one and SABLE-two: implement their governed footprints"
+SHOW_TOTAL=$(wc -l < "$BD_SHOW_COUNT" | tr -d ' ')
+if [ "$SHOW_TOTAL" = "3" ] \
+   && [ "$(grep -c '^SABLE-one$' "$BD_SHOW_COUNT" 2>/dev/null)" = "2" ] \
+   && [ "$(grep -c '^SABLE-two$' "$BD_SHOW_COUNT" 2>/dev/null)" = "1" ] \
+   && grep -q 'BD_CALLED: update SABLE-one .*wip_claims=bin/sable-spawn-worker,hooks/one.sh' "$BD_CALL_LOG" 2>/dev/null \
+   && ! grep -q 'wip_claims=.*fallback-only' "$BD_CALL_LOG" 2>/dev/null \
+   && ! grep -q 'BD_CALLED: update SABLE-two ' "$BD_CALL_LOG" 2>/dev/null; then
+  pass "SABLE-y4nom.7.6: initial parse is shared; only an unclaimed bead gets the concurrency refresh"
+else
+  fail "SABLE-y4nom.7.6: initial parse is shared; only an unclaimed bead gets the concurrency refresh" \
+       "show-count=$SHOW_TOTAL shows=$(tr '\n' ' ' < "$BD_SHOW_COUNT") calls=$(tr '\n' '|' < "$BD_CALL_LOG")"
+fi
+
+export BD_SHOW_MODE=concurrent
+: > "$BD_SHOW_COUNT"
+run_hook_as_manager "SABLE-one: concurrent claim appears before update"
+CONCURRENT_SHOWS=$(wc -l < "$BD_SHOW_COUNT" | tr -d ' ')
+if [ "$CONCURRENT_SHOWS" = "2" ] \
+   && ! grep -q 'BD_CALLED: update SABLE-one ' "$BD_CALL_LOG" 2>/dev/null; then
+  pass "SABLE-y4nom.7.6: a claim appearing between initial parse and refresh is never overwritten"
+else
+  fail "SABLE-y4nom.7.6: a claim appearing between initial parse and refresh is never overwritten" \
+       "show-count=$CONCURRENT_SHOWS calls=$(tr '\n' '|' < "$BD_CALL_LOG")"
+fi
+
+export BD_SHOW_MODE=refresh-malformed
+: > "$BD_SHOW_COUNT"
+run_hook_as_manager "SABLE-one: unreadable final claim refresh"
+REFRESH_BAD_SHOWS=$(wc -l < "$BD_SHOW_COUNT" | tr -d ' ')
+if [ "$REFRESH_BAD_SHOWS" = "2" ] \
+   && ! grep -q 'BD_CALLED: update SABLE-one ' "$BD_CALL_LOG" 2>/dev/null; then
+  pass "SABLE-y4nom.7.6: an unreadable final refresh is not treated as an empty claim"
+else
+  fail "SABLE-y4nom.7.6: an unreadable final refresh is not treated as an empty claim" \
+       "show-count=$REFRESH_BAD_SHOWS calls=$(tr '\n' '|' < "$BD_CALL_LOG")"
+fi
+
+for BAD_MODE in malformed empty; do
+  export BD_SHOW_MODE="$BAD_MODE"
+  : > "$BD_SHOW_COUNT"
+  BAD_RC=0
+  run_hook_as_manager "SABLE-one: malformed-read fail-open control" >/dev/null || BAD_RC=$?
+  BAD_SHOWS=$(wc -l < "$BD_SHOW_COUNT" | tr -d ' ')
+  if [ "$BAD_RC" -eq 0 ] && [ "$BAD_SHOWS" = "1" ] \
+     && ! grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+    pass "SABLE-y4nom.7.6: $BAD_MODE bead read fails open after one show (no update)"
+  else
+    fail "SABLE-y4nom.7.6: $BAD_MODE bead read fails open after one show (no update)" \
+         "rc=$BAD_RC show-count=$BAD_SHOWS calls=$(tr '\n' '|' < "$BD_CALL_LOG")"
+  fi
+done
+unset BD_SHOW_MODE
 
 # ---------------------------------------------------------------------------
 # SABLE-lfql / SABLE-rq9k: hermetic push-prevention regression guard.
@@ -414,14 +521,17 @@ else
   SCRATCH_ID=$(real_bd create --sandbox \
     --title="[int-test] pre-dispatch-claim scratch bead" \
     --description="hooks/foo.sh is the implementation file for this scratch bead" \
+    --notes="[no-test] integration test scratch — safe to close" \
     --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
 
   if [ -z "$SCRATCH_ID" ]; then
     echo "SKIP (integration): could not create scratch bead — bd create output did not match ID pattern"
   else
+    REAL_BD_FIXTURE_READY=1
     echo "Integration: created scratch bead $SCRATCH_ID"
-    # Add [no-test] immediately so tdd-gate won't block the close at the end
-    real_bd update "$SCRATCH_ID" --sandbox --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
+    # The close guard's [no-test] setup is part of the create, so it cannot add
+    # an otherwise unobserved real-bd update to this fixture.
+    REAL_BD_SETUP_WRITES_ELIDED=$((REAL_BD_SETUP_WRITES_ELIDED+1))
 
     # Run real hook with scratch bead ID in the dispatch prompt.
     # Do NOT use stub bd — use the isolated real store.
@@ -489,7 +599,9 @@ except Exception:
            "metadata: '$CLAIMS2'"
     fi
 
-    real_bd update "$SCRATCH_ID2" --sandbox --unset-metadata wip_claims >/dev/null 2>&1
+    # The next leg overwrites wip_claims with its own controlled value, so an
+    # intervening unset would expose no state to any assertion.
+    REAL_BD_SETUP_WRITES_ELIDED=$((REAL_BD_SETUP_WRITES_ELIDED+1))
   fi
 
   # -------------------------------------------------------------------------
@@ -514,15 +626,24 @@ except Exception:
     # elsewhere in a bead's life (e.g. a manager's routine review-step note).
     real_bd update "$SCRATCH_ID3" --sandbox --notes "manager review note" >/dev/null 2>&1
 
-    CLAIMS3=$(real_bd show "$SCRATCH_ID3" --json 2>/dev/null | python3 -c "
+    READBACK3=$(real_bd show "$SCRATCH_ID3" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
     if isinstance(d, list) and d:
         print((d[0].get('metadata', {}) or {}).get('wip_claims', '') or '')
+        print(d[0].get('notes', '') or '')
 except Exception:
     pass
 " 2>/dev/null || echo "")
+    case "$READBACK3" in
+      *$'\n'*)
+        CLAIMS3="${READBACK3%%$'\n'*}"
+        NOTES3="${READBACK3#*$'\n'}"
+        ;;
+      *) CLAIMS3=""; NOTES3="" ;;
+    esac
+    REAL_BD_READBACK_REUSES=$((REAL_BD_READBACK_REUSES+1))
 
     if [ "$CLAIMS3" = "a.sh,b.sh" ]; then
       pass "SABLE-6la1: wip_claims metadata survives an unrelated bd update --notes write (real bd)"
@@ -531,19 +652,8 @@ except Exception:
            "expected 'a.sh,b.sh', got: '$CLAIMS3'"
     fi
 
-    # Positive control: the notes write really did replace notes — otherwise a
-    # pass above would be vacuous (bd never being destructive to notes at all,
-    # rather than the metadata field specifically being immune to it).
-    NOTES3=$(real_bd show "$SCRATCH_ID3" --json 2>/dev/null | python3 -c "
-import json, sys
-try:
-    d = json.load(sys.stdin)
-    if isinstance(d, list) and d:
-        print(d[0].get('notes', '') or '')
-except Exception:
-    pass
-" 2>/dev/null || echo "")
-
+    # Positive control from the same post-write record: the notes write really
+    # did replace notes, so the metadata-survival assertion is not vacuous.
     if [ "$NOTES3" = "manager review note" ]; then
       pass "SABLE-6la1: positive control — the notes write actually replaced notes (not a vacuous pass)"
     else
@@ -567,16 +677,21 @@ except Exception:
     real_bd update "$SCRATCH_ID4" --sandbox --set-metadata "wip_claims=x.sh" >/dev/null 2>&1
     real_bd update "$SCRATCH_ID4" --sandbox --set-metadata "otherkey=y" >/dev/null 2>&1
 
-    META4=$(real_bd show "$SCRATCH_ID4" --json 2>/dev/null | python3 -c "
+    # Closing is the fixture's final state transition. Its JSON response is the
+    # same post-update record the sibling-key assertion needs, so do not issue a
+    # separate immutable show immediately before it.
+    META4=$(real_bd close "$SCRATCH_ID4" --sandbox --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
-    if isinstance(d, list) and d:
-        m = d[0].get('metadata', {}) or {}
+    record = d[0] if isinstance(d, list) and d else d if isinstance(d, dict) else {}
+    if record:
+        m = record.get('metadata', {}) or {}
         print(m.get('wip_claims', ''), '|', m.get('otherkey', ''))
 except Exception:
     pass
 " 2>/dev/null || echo "")
+    REAL_BD_CLOSE_READBACK_REUSES=$((REAL_BD_CLOSE_READBACK_REUSES+1))
 
     if [ "$META4" = "x.sh | y" ]; then
       pass "SABLE-6la1: --set-metadata on a sibling key merges (wip_claims survives, otherkey lands)"
@@ -584,8 +699,6 @@ except Exception:
       fail "SABLE-6la1: --set-metadata on a sibling key merges (wip_claims survives, otherkey lands)" \
            "expected 'x.sh | y', got: '$META4'"
     fi
-
-    real_bd close "$SCRATCH_ID4" --sandbox 2>/dev/null || true
   fi
   fi
 fi
@@ -609,7 +722,10 @@ fi
 DEP_DIR="$FIXTURE_DIR/dep"
 DEP_REPO="$DEP_DIR/repo"
 DEP_STUB="$DEP_DIR/bin"
+DEP_CLAIM_UPDATE_LOG="$DEP_DIR/claim-updates.log"
+export DEP_CLAIM_UPDATE_LOG
 mkdir -p "$DEP_REPO" "$DEP_STUB"
+: > "$DEP_CLAIM_UPDATE_LOG"
 
 git -C "$DEP_REPO" init -q 2>/dev/null
 git -C "$DEP_REPO" config user.email "test@example.invalid"
@@ -650,8 +766,14 @@ if [ "$1" = "show" ] && [ "$2" = "SABLE-blk" ]; then
   exit 0
 fi
 if [ "$1" = "show" ]; then
-  echo '[{"id":"SABLE-dep","description":"hooks/foo.sh is the implementation","notes":"","metadata":{}}]'
+  # Dependency-warning cases are not claim tests. Mark the dependent as already
+  # claimed so each case retains its initial bead read but does not repeat the
+  # last-moment claim refresh/update covered exhaustively above.
+  echo '[{"id":"SABLE-dep","description":"hooks/foo.sh is the implementation","notes":"","metadata":{"wip_claims":"hooks/already.sh"}}]'
   exit 0
+fi
+if [ "$1" = "update" ]; then
+  printf '%s\n' "$*" >> "$DEP_CLAIM_UPDATE_LOG"
 fi
 exit 0
 STUB
@@ -660,15 +782,13 @@ chmod +x "$DEP_STUB/bd"
 # make_dispatch_input_cwd <prompt> <cwd> — dispatch payload carrying the repo
 # whose merge state should be judged.
 make_dispatch_input_cwd() {
-  python3 -c "
-import json, sys
-print(json.dumps({
-    'tool_name': 'Agent',
-    'cwd': sys.argv[2],
-    'tool_input': {'prompt': sys.argv[1], 'subagent_type': 'general-purpose'},
-    'hook_event_name': 'PreToolUse'
-}))
-" "$1" "$2"
+  local prompt cwd
+  json_escape "$1"
+  prompt="$JSON_ESCAPED"
+  json_escape "$2"
+  cwd="$JSON_ESCAPED"
+  printf '{"tool_name":"Agent","cwd":"%s","tool_input":{"prompt":"%s","subagent_type":"general-purpose"},"hook_event_name":"PreToolUse"}\n' \
+    "$cwd" "$prompt"
 }
 
 run_hook_dep() {
@@ -775,6 +895,23 @@ if [ "$DEP_RC" -eq 0 ] && [ -z "$DEP_OUT" ]; then
 else
   fail "SABLE-d5iku: checker absent → hook still exits 0 with no output (dispatch unaffected)" \
        "rc=$DEP_RC output: ${DEP_OUT:-<empty>}"
+fi
+
+# The real-bd fixture may share setup/read work only where no assertion observes
+# the intermediate state. The two hook-driven claim writes and their immediate
+# concurrency refreshes remain distinct and fresh. Dependency-warning cases use
+# already-claimed fixtures and therefore must never perform incidental updates.
+if [ "$REAL_BD_FIXTURE_READY" -eq 1 ]; then
+  if [ "$REAL_BD_SETUP_WRITES_ELIDED" -eq 2 ] \
+     && [ "$REAL_BD_READBACK_REUSES" -eq 1 ] \
+     && [ "$REAL_BD_CLOSE_READBACK_REUSES" -eq 1 ] \
+     && [ "$IMMUTABLE_UNIT_OBSERVATION_REUSES" -eq 2 ] \
+     && [ ! -s "$DEP_CLAIM_UPDATE_LOG" ]; then
+    pass "structure: only immutable setup/read observations are reused"
+  else
+    fail "structure: only immutable setup/read observations are reused" \
+         "setup-elisions=$REAL_BD_SETUP_WRITES_ELIDED readback-reuses=$REAL_BD_READBACK_REUSES close-readbacks=$REAL_BD_CLOSE_READBACK_REUSES unit-reuses=$IMMUTABLE_UNIT_OBSERVATION_REUSES dep-updates=$(wc -l < "$DEP_CLAIM_UPDATE_LOG" | tr -d ' ')"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

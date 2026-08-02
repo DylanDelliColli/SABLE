@@ -486,21 +486,6 @@ check_exclude_tags() {
   done
 }
 
-# bead_status <id>: prints the bead's status, or the literal __unresolved__
-# when bd cannot resolve the id at all (typo'd, deleted, wrong tracker).
-bead_status() {
-  bd show "$1" --json 2>/dev/null | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print("__unresolved__"); raise SystemExit
-if isinstance(d, dict):
-    d = [d]
-print((d[0].get("status") if d else None) or "__unresolved__")
-'
-}
-
 # check_beads: the FRESHNESS gate. Local-only by design — the ci-verify clean
 # room has no bd (SABLE-59zu), so there it prints an explicit SKIP and exits 0
 # rather than silently passing. A silent no-op here would reproduce exactly the
@@ -519,7 +504,46 @@ check_beads() {
     return 1
   fi
 
-  local name id status all_closed closed_ids
+  # Resolve the complete unique id set in one store read and one JSON parse.
+  # `bd show` accepts multiple ids; missing ids are omitted from its array, so
+  # pre-seeding every requested id as __unresolved__ preserves the old
+  # per-record tri-state exactly while avoiding one Dolt/Python startup per
+  # EXCLUDE reference (SABLE-y4nom.7.6).
+  local name id status all_closed closed_ids batch_json
+  local -a requested_ids=()
+  local -A status_by_id=()
+  for name in "${!EXCLUDE[@]}"; do
+    parse_exclude_tag "${EXCLUDE[$name]}"
+    for id in "${TAG_IDS[@]}"; do
+      if [ -z "${status_by_id[$id]+present}" ]; then
+        requested_ids+=("$id")
+        status_by_id["$id"]="__unresolved__"
+      fi
+    done
+  done
+  batch_json="$(bd show "${requested_ids[@]}" --json 2>/dev/null)" || batch_json=""
+  while IFS=$'\t' read -r id status; do
+    [ -n "$id" ] || continue
+    [ -n "${status_by_id[$id]+present}" ] || continue
+    status_by_id["$id"]="${status:-__unresolved__}"
+  done < <(printf '%s' "$batch_json" | python3 -c '
+import json, sys
+try:
+    records = json.load(sys.stdin)
+except Exception:
+    records = []
+if isinstance(records, dict):
+    records = [records]
+if isinstance(records, list):
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        identifier = record.get("id")
+        status = record.get("status")
+        if isinstance(identifier, str) and identifier and isinstance(status, str) and status:
+            print(f"{identifier}\t{status}")
+')
+
   local promote=() unresolved=()
   for name in "${!EXCLUDE[@]}"; do
     parse_exclude_tag "${EXCLUDE[$name]}"
@@ -527,7 +551,7 @@ check_beads() {
     local ids=("${TAG_IDS[@]}")
     all_closed=1; closed_ids=""
     for id in "${ids[@]}"; do
-      status="$(bead_status "$id")"
+      status="${status_by_id[$id]:-__unresolved__}"
       case "$status" in
         __unresolved__)
           unresolved+=("$name — cites $id, which does not resolve in the bead store")

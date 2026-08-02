@@ -192,6 +192,33 @@ run_hook_with() {
 
 run_hook() { local cmd="$1"; shift; run_hook_with "$HOOK" "$STUB_DIR:$PATH" "$cmd" "$@"; }
 
+# The stubbed unit phase is immutable: its git topology, bd responses, hook
+# bytes, PATH, command, and explicit environment fully determine one result.
+# Several assertions deliberately inspect different properties of that SAME
+# result (decision, branch name, remediation, absence of a false claim).  Do
+# not relaunch the Python parser + evaluator + bd/git probes for each property.
+# Keep the cache test-local and key every behavior-bearing input; mutant and
+# integration runs below continue through the uncached helper.
+declare -A HOOK_OUTPUT_CACHE=()
+HOOK_OUTPUT=""
+HOOK_CACHE_HITS=0
+capture_hook_with() { # <hook-path> <path-value> <command> [env assignments...]
+  local hook="$1" path="$2" cmd="$3" key="" quoted part
+  shift 3
+  for part in "$hook" "$path" "$cmd" "$@"; do
+    printf -v quoted '%q' "$part"
+    key+="${#quoted}:$quoted"
+  done
+  if [ "${HOOK_OUTPUT_CACHE[$key]+present}" = "present" ]; then
+    HOOK_OUTPUT="${HOOK_OUTPUT_CACHE[$key]}"
+    HOOK_CACHE_HITS=$((HOOK_CACHE_HITS + 1))
+    return 0
+  fi
+  HOOK_OUTPUT="$(run_hook_with "$hook" "$path" "$cmd" "$@")"
+  HOOK_OUTPUT_CACHE[$key]="$HOOK_OUTPUT"
+}
+capture_hook() { local cmd="$1"; shift; capture_hook_with "$HOOK" "$STUB_DIR:$PATH" "$cmd" "$@"; }
+
 # decision_of <hook stdout> -> the exact permissionDecision string, '<none>' for
 # no output at all, or '<malformed>' if it is not the documented shape.
 decision_of() {
@@ -214,7 +241,8 @@ print(hso.get('permissionDecision') or '<malformed>')
 assert_decision() { # <label> <expected> <command> [env assignments...]
   local label="$1" expected="$2" cmd="$3" out got
   shift 3
-  out="$(run_hook "$cmd" "$@")"
+  capture_hook "$cmd" "$@"
+  out="$HOOK_OUTPUT"
   got="$(decision_of "$out")"
   if [ "$got" = "$expected" ]; then
     pass "$label"
@@ -225,7 +253,8 @@ assert_decision() { # <label> <expected> <command> [env assignments...]
 
 assert_mentions() { # <label> <needle> <command>
   local label="$1" needle="$2" cmd="$3" out
-  out="$(run_hook "$cmd")"
+  capture_hook "$cmd"
+  out="$HOOK_OUTPUT"
   if printf '%s' "$out" | grep -qF -- "$needle"; then
     pass "$label"
   else
@@ -235,7 +264,8 @@ assert_mentions() { # <label> <needle> <command>
 
 assert_absent() { # <label> <needle-that-must-not-appear> <command>
   local label="$1" needle="$2" cmd="$3" out
-  out="$(run_hook "$cmd")"
+  capture_hook "$cmd"
+  out="$HOOK_OUTPUT"
   if printf '%s' "$out" | grep -qF -- "$needle"; then
     fail "$label" "output unexpectedly contained '$needle': ${out:-<empty>}"
   else
@@ -356,7 +386,8 @@ assert_mentions "the prefix-boundary refusal names the right branch" \
 # ===========================================================================
 assert_decision "an unreadable for-chuck corpus ALLOWS (never denies on a failed query)" \
   allow 'bd close SABLE-unlanded' SABLE_TEST_FORCHUCK_FAIL=1
-OUT="$(run_hook_with "$HOOK" "$STUB_DIR:$PATH" 'bd close SABLE-unlanded' SABLE_TEST_FORCHUCK_FAIL=1)"
+capture_hook 'bd close SABLE-unlanded' SABLE_TEST_FORCHUCK_FAIL=1
+OUT="$HOOK_OUTPUT"
 if printf '%s' "$OUT" | grep -qF 'UNKNOWN'; then
   pass "the unreadable for-chuck corpus is reported as UNKNOWN, not folded into 'no handoff'"
 else
@@ -420,6 +451,13 @@ assert_decision "multi-id close DENIES when ANY target is uncontained" \
 # would deny closes that never named that bead.
 assert_decision "a bead id inside a --reason value is not treated as a target" \
   '<none>' 'bd close SABLE-landed --reason "supersedes SABLE-unlanded"'
+
+if [ "$HOOK_CACHE_HITS" -ge 15 ]; then
+  pass "y4nom.7.6: immutable unit results are reused across property assertions ($HOOK_CACHE_HITS cache hits)"
+else
+  fail "y4nom.7.6: immutable unit results are reused across property assertions" \
+    "expected at least 15 cache hits, got $HOOK_CACHE_HITS"
+fi
 
 # ===========================================================================
 # Degenerate hook input must never crash or deny (#16047 empty-stdin
