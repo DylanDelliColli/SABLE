@@ -95,6 +95,16 @@ NON_CONTAINMENT_FILES = [
 _DISAGREE_RE = re.compile(r"DISAGREE", re.IGNORECASE)
 _COULD_NOT_ASSESS_RE = re.compile(r"COULD[\s-]+NOT[\s-]+ASSESS", re.IGNORECASE)
 
+# These are the three measured-false persistence claims from SABLE-slip0.5.
+# Match against whitespace-normalized text because the historical role cards
+# wrapped the load-bearing phrases across Markdown lines.  A line-oriented grep
+# returned zero matches while the promises were still present.
+_FALSE_RECOVERY_PROMISES = (
+    "lane state lives in beads, not your memory",
+    "lane state rehydrates from beads, not memory",
+    "queue and hold state live in beads",
+)
+
 
 def _rel(path):
     return str(path.relative_to(REPO))
@@ -103,6 +113,15 @@ def _rel(path):
 def _read(path):
     assert path.exists(), f"role card not found: {path}"
     return path.read_text()
+
+
+def _normalized_prose(text):
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _false_recovery_promises(text):
+    normalized = _normalized_prose(text)
+    return [phrase for phrase in _FALSE_RECOVERY_PROMISES if phrase in normalized]
 
 
 @pytest.mark.parametrize("path", CONTAINMENT_FILES, ids=_rel)
@@ -173,18 +192,34 @@ def test_every_restarting_manager_recomputes_instead_of_trusting_beads(path):
     compact = re.sub(r"\s+", " ", text)
     lowered = compact.lower()
     rel = _rel(path)
-    assert "sable-recover" in compact, (
-        f"{rel} can restart without invoking the recovery collector"
+    assert 'sable-recover --repo "$PWD"' in compact, (
+        f"{rel} can restart without the portable recovery invocation"
     )
     assert "recomput" in lowered, (
         f"{rel} mentions recovery but never says the fleet picture is recomputed"
     )
-    for false_promise in (
-        "lane state lives in beads",
-        "lane state rehydrates from beads",
-        "queue and hold state live in beads",
-    ):
-        assert false_promise not in lowered, (
-            f"{rel} still makes the measured-false persistence claim: "
-            f"{false_promise!r}"
-        )
+    false_promises = _false_recovery_promises(text)
+    assert not false_promises, (
+        f"{rel} still makes measured-false persistence claim(s): "
+        f"{false_promises}"
+    )
+
+
+@pytest.mark.parametrize(
+    "planted",
+    [
+        "lane state\nlives in beads, not your memory",
+        "lane state rehydrates\nfrom beads, not memory",
+        "queue and hold state\nlive in beads",
+    ],
+)
+def test_recovery_promise_guard_detects_wrapped_historical_claims(planted):
+    """Negative control: the prose guard must detect every retired wording.
+
+    Without this planted arm an empty or line-oriented matcher would let the
+    real-card test above pass vacuously, reproducing the bead's original
+    zero-result fingerprint error.
+    """
+    assert _false_recovery_promises(planted), (
+        "planted historical recovery promise escaped the normalized matcher"
+    )
