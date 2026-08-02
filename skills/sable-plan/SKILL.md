@@ -243,6 +243,22 @@ isn't surprised by the constraint. Entries may be extension-less (e.g.
 `bin/sable-spawn-worker`) — the footprint section is parsed as a dedicated
 field, not the generic file-extension regex used as a fallback for older beads.
 
+If any declared write path is intentionally **absent from dispatch-time HEAD**
+because the child will create it, record that authority explicitly after
+creating the bead:
+
+```bash
+bd update <child-id> --set-metadata \
+  "footprint_creates=path/to/new-file.py,path/to/other-new-file.sh"
+```
+
+`footprint_creates` is a hand-authored subset of the child's `## File
+footprint`, never a replacement for that footprint and never inferred from a
+filename convention or the ambient filesystem. Omit it when every declared
+path is already tracked. Dispatch fails closed on an absent path with no such
+authority and surfaces a stale annotation when a formerly-new path is already
+tracked, so the first refusal is not how a fresh planner learns this schema.
+
 **Deliverable:** write `decomposition.json` to the planning state dir — the
 children (id/title/type/deps/ready-state), the `bd swarm validate` verdict, and
 victor's summary line — then run the gate protocol for the final signoff. The

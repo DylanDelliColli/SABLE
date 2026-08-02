@@ -249,6 +249,62 @@ def mechanical_footprint(repo: str, from_sha: str, to_sha: str, source: str = ""
                      source or f"diff {from_sha[:7]}..{to_sha[:7]}")
 
 
+@dataclass(frozen=True)
+class TrackedPathClassification:
+    """Dispatch-time existence evidence from one git tree census.
+
+    ``present`` and ``absent`` partition exactly the caller's declarations.
+    They say nothing about the ambient filesystem: an untracked file on disk
+    is absent from the validated object and therefore absent here.  That is the
+    load-bearing distinction for SABLE-35mqf — a phantom claim cannot collide
+    with another worker, so filesystem presence would let local residue turn a
+    releasing error into a false green.
+    """
+
+    present: frozenset[str]
+    absent: frozenset[str]
+
+
+def classify_tracked_paths(repo: str, paths) -> TrackedPathClassification:
+    """Partition declared paths by presence in dispatch-time ``HEAD``.
+
+    One ``git ls-tree`` is the authority for the whole declaration.  Concrete
+    paths require an exact tracked entry; directory declarations ending in
+    ``/`` accept the corresponding tracked tree; slash-bearing directory names
+    without the cosmetic trailing slash do too. Broken symlinks and submodules
+    count because git tracks the entry regardless of whether its ambient
+    target/content can currently be traversed.
+
+    Git failure is a non-answer and raises ``FootprintUndetermined``.  Never
+    replace it with an empty tree: that would classify every declared path as
+    absent and turn an instrument failure into a false authoring accusation.
+    """
+    declared = frozenset(path.strip() for path in paths if path.strip())
+    if not declared:
+        return TrackedPathClassification(frozenset(), frozenset())
+
+    cp = git_lib._git(
+        repo,
+        "-c", "core.quotepath=false",
+        "ls-tree", "-r", "-t", "-z", "--name-only", "HEAD", "--",
+        check=False,
+    )
+    if cp.returncode != 0:
+        detail = cp.stdout.strip().replace("\x00", " ")[:240]
+        raise FootprintUndetermined(
+            "git tree census for declared paths failed at HEAD"
+            + (f": {detail}" if detail else ""))
+
+    tracked = frozenset(entry for entry in cp.stdout.split("\x00") if entry)
+    present = frozenset(
+        path for path in declared
+        if ((path.rstrip("/") in tracked
+             or any(entry.startswith(path) for entry in tracked))
+            if path.endswith("/") else path in tracked)
+    )
+    return TrackedPathClassification(present, declared - present)
+
+
 # --- planner-declared footprint (bead metadata) -----------------------------
 
 _FOOTPRINT_HEADING = re.compile(r"^#+\s*File footprint\s*$", re.IGNORECASE)

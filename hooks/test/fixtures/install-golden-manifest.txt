@@ -5,7 +5,7 @@ f595d9fd7685073d898a8b80638e97e26dac98f4e117cf206771b2d5ac964bfe  ./agents/colum
 8dbe809a369c86ef1759e768b07e4e0294c31dd6b769c24a2af80b2eec61f089  ./agents/sherlock.md
 4e1c5ed5c56a915fc7f7231d675b49ee8259e4a8923f12005d93884686ceab5f  ./agents/victor.md
 f3942ab0979cdbb0c2fd11077adcba80c5c67d540227b761c64809efabe95357  ./bin/sable_batch_key_lib.py
-2abb0757c670e45e3bc1294cd76d0534a10c05158c44e6730b58ffcb348ffb2a  ./bin/sable_footprint_lib.py
+90cefbfe6fa7aa16c8b6c400a1505d6947896fe878173a8159e273328e44bb49  ./bin/sable_footprint_lib.py
 9aeed413db28ebcf45c0e48e2c7b784d07c02daf3ebc3091f0683301abc979cf  ./bin/sable_gate_classify_lib.py
 c29ca3b672e9f2a9cf6b7c2af7782e1a34eb5faa983b67761e3b44ba2b8031cb  ./bin/sable_gate_git_lib.py
 1f4240a635a648b1ac732e596309f0ab10f21b1db366f377149df46c7b0c7dff  ./bin/sable_inline_body_guard_lib.py
@@ -62,5 +62,5 @@ f1a704016b72723dfc29e0679277bf351c33e2ffc0398b36e3e9b3d30a4ad984  ./skills/gaudi
 c6419da86418f902bf3987d2949035cc834c204c7fe46d52706a8fb16e504926  ./skills/sable-discover/SKILL.md
 e1f19735c92612d20fd31cd4172904dfa8a2cc84864a88d5bfc220fe734ad266  ./skills/sable-execute/SKILL.md
 96162dfce4412a6b464c66977c16492e1ac8fe749e2f60ca7adfc5203ca8463a  ./skills/sable-onboarding/SKILL.md
-4f7c33232a3201e012d71b19144bdefd1d05288fbb61a4d22430cc70184f8731  ./skills/sable-plan/SKILL.md
+1b2c6e19eb466b95422bfd9e15d9be4c7cdeab0fc923abde91464929603272cd  ./skills/sable-plan/SKILL.md
 2e32e54c16bd3bd4f21f05bc1e80ae08d83332c1538337cc59ec6de5179816cd  ./skills/sable-review/SKILL.md

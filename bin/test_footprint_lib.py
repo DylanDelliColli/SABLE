@@ -70,6 +70,65 @@ def _commit(repo, message):
 
 
 # --------------------------------------------------------------------------
+# SABLE-35mqf: declared paths must exist in the validated git object
+# --------------------------------------------------------------------------
+
+def test_classify_tracked_paths_uses_head_not_the_ambient_filesystem(repo):
+    """A merely-present untracked file cannot validate a dispatch claim.
+
+    Directories are legitimate footprint entries too: a trailing-slash entry
+    is present when HEAD contains at least one tracked descendant.  Both facts
+    come from one git tree census, never from ``Path.exists()``.
+    """
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "tracked.py").write_text("tracked\n")
+    _commit(repo, "add tracked directory")
+    (repo / "untracked.py").write_text("ambient only\n")
+
+    result = fp.classify_tracked_paths(
+        str(repo),
+        {"alpha.py", "pkg", "pkg/", "untracked.py", "missing.py"},
+    )
+
+    assert result.present == frozenset({"alpha.py", "pkg", "pkg/"})
+    assert result.absent == frozenset({"untracked.py", "missing.py"})
+
+
+def test_name_shape_cannot_substitute_for_git_tree_existence():
+    """The historical phantom and a real file share one naming stem.
+
+    ``bin/test_footprint_lib.py`` is tracked while the old prefixed spelling
+    ``bin/test_sable_footprint_lib.py`` is not.  A second prefixed-real file
+    proves that neither prefix policy can classify existence correctly.  The
+    other absent path is the exact 2026-07-26 phantom from SABLE-35mqf.
+    """
+    project = Path(__file__).resolve().parent.parent
+    result = fp.classify_tracked_paths(
+        str(project),
+        {
+            "bin/test_footprint_lib.py",
+            "bin/test_sable_footprint_lib.py",
+            "bin/test_sable_gate_budget_lib.py",
+            "bin/test_sable_coverage_floor_lib.py",
+        },
+    )
+
+    assert result.present == frozenset({
+        "bin/test_footprint_lib.py",
+        "bin/test_sable_gate_budget_lib.py",
+    })
+    assert result.absent == frozenset({
+        "bin/test_sable_footprint_lib.py",
+        "bin/test_sable_coverage_floor_lib.py",
+    })
+
+
+def test_classify_tracked_paths_fails_closed_when_git_cannot_read_head(tmp_path):
+    with pytest.raises(fp.FootprintUndetermined, match="git.*tree|tracked path"):
+        fp.classify_tracked_paths(str(tmp_path), {"bin/a.py"})
+
+
+# --------------------------------------------------------------------------
 # 1. Rename detection — BOTH sides of the rename are in the footprint
 # --------------------------------------------------------------------------
 

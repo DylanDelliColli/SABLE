@@ -24,4 +24,11 @@ for s in FRAMING RESEARCH ARCHITECTURE TEST-STRATEGY DECOMPOSITION; do
   has "$SKILL" "$s" "full flow still names substage $s"
 done
 
+# SABLE-35mqf: the dispatch gate refuses a declared path absent from HEAD unless
+# the planner explicitly classifies it as a create.  Pin the PRODUCER doctrine,
+# not merely the consumer schema, so a fresh planner never learns the required
+# authority by first-contact refusal.
+has "$SKILL" 'footprint_creates' 'new footprint paths carry explicit footprint_creates metadata'
+has "$SKILL" 'absent.*HEAD\|HEAD.*absent' 'new-path guidance names the git-object boundary'
+
 if [ "$fails" -eq 0 ]; then printf 'PASS test-sable-plan-tiers\n'; else printf 'FAIL test-sable-plan-tiers (%d)\n' "$fails"; exit 1; fi

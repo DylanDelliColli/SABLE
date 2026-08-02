@@ -690,6 +690,178 @@ def test_absent_footprint_still_dispatches():
     assert verdict.decision not in ("deny", "could-not-assess")
 
 
+# --- SABLE-35mqf: declared paths must name tracked objects at HEAD ----------
+
+def _path_classification(*, present=(), absent=()):
+    return ssw.fp_lib.TrackedPathClassification(
+        present=frozenset(present), absent=frozenset(absent))
+
+
+def test_declared_path_gate_denies_the_two_historical_phantoms_by_exact_name():
+    project = Path(__file__).resolve().parent.parent
+    bead = {
+        "id": "SABLE-historical",
+        "description": (
+            "## File footprint\n"
+            "bin/test_footprint_lib.py, "
+            "bin/test_sable_coverage_floor_lib.py, "
+            "bin/test_sable_footprint_lib.py\n"
+        ),
+    }
+
+    verdict = ssw.declared_path_existence_check(str(project), [bead])
+
+    assert verdict.decision == "deny"
+    assert "SABLE-historical" in verdict.message
+    assert "bin/test_sable_coverage_floor_lib.py" in verdict.message
+    assert "bin/test_sable_footprint_lib.py" in verdict.message
+    assert "bin/test_footprint_lib.py" not in verdict.message
+
+
+def test_declared_path_gate_allows_absent_paths_only_when_explicitly_created(monkeypatch):
+    bead = {
+        "id": "SABLE-new",
+        "description": "## File footprint\nbin/new_tool.py\n",
+        "metadata": {"footprint_creates": "bin/new_tool.py"},
+    }
+    monkeypatch.setattr(
+        ssw.fp_lib,
+        "classify_tracked_paths",
+        lambda repo, paths: _path_classification(absent=paths),
+    )
+
+    verdict = ssw.declared_path_existence_check("/repo", [bead])
+
+    assert verdict.decision == "allow"
+    assert any(
+        "SABLE-new" in warning
+        and "bin/new_tool.py" in warning
+        and "footprint_creates" in warning
+        for warning in verdict.warnings
+    )
+
+
+def test_declared_path_gate_surfaces_stale_create_annotation(monkeypatch):
+    bead = {
+        "id": "SABLE-stale",
+        "description": "## File footprint\nbin/already_here.py\n",
+        "metadata": {"footprint_creates": "bin/already_here.py"},
+    }
+    monkeypatch.setattr(
+        ssw.fp_lib,
+        "classify_tracked_paths",
+        lambda repo, paths: _path_classification(present=paths),
+    )
+
+    verdict = ssw.declared_path_existence_check("/repo", [bead])
+
+    assert verdict.decision == "allow"
+    assert any(
+        "SABLE-stale" in warning
+        and "bin/already_here.py" in warning
+        and "stale" in warning.lower()
+        for warning in verdict.warnings
+    )
+
+
+@pytest.mark.parametrize("metadata", [
+    {"footprint_creates": ["bin/new.py"]},
+    {"footprint_creates": {"bin/new.py": True}},
+    "not-an-object",
+])
+def test_declared_path_gate_refuses_malformed_create_metadata_before_git(
+        monkeypatch, metadata):
+    bead = {
+        "id": "SABLE-bad-meta",
+        "description": "## File footprint\nbin/new.py\n",
+        "metadata": metadata,
+    }
+
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("git classifier ran before metadata validation")
+
+    monkeypatch.setattr(ssw.fp_lib, "classify_tracked_paths", should_not_run)
+    verdict = ssw.declared_path_existence_check("/repo", [bead])
+
+    assert verdict.decision == "could-not-assess"
+    assert "SABLE-bad-meta" in verdict.message
+    assert "footprint_creates" in verdict.message
+
+
+def test_declared_path_gate_refuses_create_exemption_outside_the_claim(monkeypatch):
+    bead = {
+        "id": "SABLE-wide-exemption",
+        "description": "## File footprint\nbin/claimed.py\n",
+        "metadata": {"footprint_creates": "bin/not_claimed.py"},
+    }
+
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("git classifier ran before exemption validation")
+
+    monkeypatch.setattr(ssw.fp_lib, "classify_tracked_paths", should_not_run)
+    verdict = ssw.declared_path_existence_check("/repo", [bead])
+
+    assert verdict.decision == "could-not-assess"
+    assert "bin/not_claimed.py" in verdict.message
+    assert "not declared" in verdict.message.lower()
+
+
+def test_declared_path_gate_does_not_run_git_for_no_declaration(monkeypatch):
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("a no-footprint dispatch must not pay a git census")
+
+    monkeypatch.setattr(ssw.fp_lib, "classify_tracked_paths", should_not_run)
+    verdict = ssw.declared_path_existence_check(
+        "/repo", [{"id": "SABLE-bare", "description": "ordinary prose"}])
+    assert verdict.decision == "no-declaration"
+
+
+def test_declared_path_gate_does_not_launder_an_unreadable_parse_through_git(monkeypatch):
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("existence ran before the declaration parsed")
+
+    monkeypatch.setattr(ssw.fp_lib, "classify_tracked_paths", should_not_run)
+    verdict = ssw.declared_path_existence_check(
+        "/repo",
+        [{"id": "SABLE-unreadable",
+          "description": "## File footprint\nMakefile\n"}],
+    )
+    assert verdict.decision == "could-not-assess"
+    assert "SABLE-unreadable" in verdict.message
+    assert "parse" in verdict.message.lower() or "read" in verdict.message.lower()
+
+
+def test_declared_path_gate_fails_closed_when_git_cannot_assess(monkeypatch):
+    def unavailable(repo, paths):
+        raise ssw.fp_lib.FootprintUndetermined("git tree unavailable")
+
+    monkeypatch.setattr(ssw.fp_lib, "classify_tracked_paths", unavailable)
+    verdict = ssw.declared_path_existence_check(
+        "/repo",
+        [{"id": "SABLE-git-down",
+          "description": "## File footprint\nbin/a.py\n"}],
+    )
+    assert verdict.decision == "could-not-assess"
+    assert "git tree unavailable" in verdict.message
+
+
+def test_declared_path_gate_censuses_a_bundle_once(monkeypatch):
+    calls = []
+
+    def classify(repo, paths):
+        calls.append((repo, frozenset(paths)))
+        return _path_classification(present=paths)
+
+    monkeypatch.setattr(ssw.fp_lib, "classify_tracked_paths", classify)
+    beads = [
+        {"id": "SABLE-lead", "description": "## File footprint\nbin/a.py\n"},
+        {"id": "SABLE-sibling", "description": "## File footprint\nbin/b.py\n"},
+    ]
+    verdict = ssw.declared_path_existence_check("/repo", beads)
+    assert verdict.decision == "allow"
+    assert calls == [("/repo", frozenset({"bin/a.py", "bin/b.py"}))]
+
+
 def test_widening_past_declaration_is_reported():
     """SABLE-e2ic3 suggested-approach item 3: widening_report() is the pure
     comparison PRIMITIVE between a bead's DECLARED footprint and what a worker
@@ -1061,7 +1233,8 @@ def test_allowed_dispatch_still_claims_the_lead_and_the_bundle(monkeypatch, tmp_
     fp = "S.\n\n## File footprint\nshared.py"
     rec = _RecordingBd({
         bid: {"id": bid, "title": bid, "labels": [], "status": "open",
-              "assignee": None, "description": fp}
+              "assignee": None, "description": fp,
+              "metadata": {"footprint_creates": "shared.py"}}
         for bid in ("X-1", "X-2", "X-3")})
     monkeypatch.setattr(ssw, "_run", rec.run_read)
     monkeypatch.setattr(ssw.subprocess, "run", rec.run_write)
@@ -1455,11 +1628,14 @@ def test_dispatch_fails_loud_when_a_bundled_bead_did_not_claim(monkeypatch, tmp_
     the argparse layer."""
     fp = "S.\n\n## File footprint\nunique.py"
     lead = {"id": "X-1", "title": "lead", "labels": [], "status": "open",
-            "assignee": None, "description": fp}
+            "assignee": None, "description": fp,
+            "metadata": {"footprint_creates": "unique.py"}}
     sib_ok = {"id": "Y-2", "title": "sib ok", "labels": [], "status": "open",
-              "assignee": None, "description": fp}
+              "assignee": None, "description": fp,
+              "metadata": {"footprint_creates": "unique.py"}}
     sib_dropped = {"id": "Z-3", "title": "sib dropped", "labels": [], "status": "open",
-                   "assignee": None, "description": fp}
+                   "assignee": None, "description": fp,
+                   "metadata": {"footprint_creates": "unique.py"}}
     rec = _RecordingBd({"X-1": lead, "Y-2": sib_ok, "Z-3": sib_dropped})
     monkeypatch.setattr(ssw, "_run", rec.run_read)
     monkeypatch.setattr(ssw.subprocess, "run", rec.run_write)
@@ -1946,6 +2122,36 @@ def test_tag_footprint_metadata_writes_both_fields_when_both_sections_present(mo
         ["bd", "update", "SABLE-x1", "--sandbox", "--set-metadata",
          "footprint_reads_declared=hooks/read.sh"],
     ]
+
+
+def test_tag_footprint_metadata_preserves_hand_authored_creates(monkeypatch):
+    """Re-deriving prose-backed footprint fields must not erase the explicit
+    new-file authority.  ``footprint_creates`` is deliberately hand-authored;
+    it has no derivation source in the description and owns a separate key.
+    """
+    metadata = {
+        "footprint_creates": "bin/new.py",
+        "unrelated": "keep-me",
+    }
+
+    def fake_run(args, **kwargs):
+        assert args[:5] == ["bd", "update", "SABLE-x1", "--sandbox", "--set-metadata"]
+        key, _, value = args[5].partition("=")
+        metadata[key] = value
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ssw.subprocess, "run", fake_run)
+    ssw.tag_footprint_metadata(
+        "SABLE-x1",
+        "## File footprint\nbin/old.py\n\n## File reads\nhooks/read.sh\n",
+    )
+
+    assert metadata == {
+        "footprint_creates": "bin/new.py",
+        "unrelated": "keep-me",
+        "footprint_writes": "bin/old.py",
+        "footprint_reads_declared": "hooks/read.sh",
+    }
 
 
 def test_tag_footprint_metadata_omits_both_keys_when_no_sections_at_all(monkeypatch):
