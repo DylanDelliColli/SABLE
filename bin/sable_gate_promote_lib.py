@@ -1060,6 +1060,25 @@ def impact_tier_lock(repo: str | os.PathLike = "."):
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
+@contextlib.contextmanager
+def _locked_impact_journal(path: Path, mode: str):
+    """Serialize mutations of the tier journal itself.
+
+    This is deliberately independent of ``impact_tier_lock``.  The latter can
+    be disabled to prove that hermetic tiers are safe to overlap, but the
+    journal still has a read/modify/write augmentation step.  Without this
+    smaller lock, that rewrite can erase a concurrent O_APPEND record even
+    though both tier processes finish successfully (SABLE-y4nom.7.8).
+    """
+    with open(path, mode) as journal:
+        fcntl.flock(journal.fileno(), fcntl.LOCK_EX)
+        try:
+            yield journal
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(journal.fileno(), fcntl.LOCK_UN)
+
+
 def _stamp_impact_window(repo: str | os.PathLike, event: str, tree_sha: str,
                          waited: float, phases: list[dict] | None = None) -> None:
     """Append one start/end record for this tier run. Best-effort and never
@@ -1084,7 +1103,7 @@ def _stamp_impact_window(repo: str | os.PathLike, event: str, tree_sha: str,
                   "at": time.time(), "tree": tree_sha[:12], "waited": round(waited, 3)}
         if phases is not None:
             record["phases"] = phases
-        with open(path, "a") as fh:
+        with _locked_impact_journal(path, "a") as fh:
             fh.write(json.dumps(record) + "\n")
     except OSError:
         pass
@@ -1119,7 +1138,7 @@ class TierVerdict(str, Enum):
 
 def _stamp_impact_verdict(repo: str | os.PathLike, tree_sha: str, verdict: str,
                           writer_identity: TierWriterIdentity = TierWriterIdentity.GATE) -> None:
-    """Fold the tier's typed outcome + producer identity into the JUST-WRITTEN
+    """Fold the tier's typed outcome + producer identity into ITS JUST-WRITTEN
     'end' record of impact-tier-windows.jsonl, as ADDITIVE keys on that SAME
     line (SABLE-21rug.1) — never a new line/event, and never a change to
     _stamp_impact_window's own call signature.
@@ -1135,9 +1154,10 @@ def _stamp_impact_verdict(repo: str | os.PathLike, tree_sha: str, verdict: str,
     line's own dict in place is the shape compatible with both constraints,
     and it is exactly what 'additive fields' means at the record level.
 
-    Safe under concurrency: this runs inside run_impact_tier's SAME
-    impact_tier_lock critical section that guards every write to this file,
-    so no other writer can be mid-append while this reads/rewrites it.
+    Safe under concurrency even when impact-tier serialization is deliberately
+    disabled: this and _stamp_impact_window take the journal's own short-lived
+    mutation lock.  The wider tier lock is a scheduling policy; it must not be
+    required for lossless instrumentation.
 
     Best-effort like its sibling: any failure here (file absent because
     _stamp_impact_window was itself stubbed out by a caller, an unenumerated
@@ -1149,17 +1169,29 @@ def _stamp_impact_verdict(repo: str | os.PathLike, tree_sha: str, verdict: str,
                     or (snapshot_lib.ensure_state_dir(repo) / IMPACT_WINDOW_FILE))
         if not path.is_file():
             return
-        lines = path.read_text().splitlines()
-        if not lines:
-            return
-        last = json.loads(lines[-1])
-        if (last.get("event") != "end" or last.get("tree") != tree_sha[:12]
-                or last.get("pid") != os.getpid()):
-            return
-        last["verdict"] = TierVerdict(verdict).value
-        last["writer_identity"] = TierWriterIdentity(writer_identity).value
-        lines[-1] = json.dumps(last)
-        path.write_text("\n".join(lines) + "\n")
+        with _locked_impact_journal(path, "r+"):
+            lines = path.read_text().splitlines()
+            if not lines:
+                return
+            target_index = None
+            target = None
+            for index in range(len(lines) - 1, -1, -1):
+                try:
+                    candidate = json.loads(lines[index])
+                except json.JSONDecodeError:
+                    continue
+                if (candidate.get("event") == "end"
+                        and candidate.get("tree") == tree_sha[:12]
+                        and candidate.get("pid") == os.getpid()):
+                    target_index = index
+                    target = candidate
+                    break
+            if target_index is None or target is None:
+                return
+            target["verdict"] = TierVerdict(verdict).value
+            target["writer_identity"] = TierWriterIdentity(writer_identity).value
+            lines[target_index] = json.dumps(target)
+            path.write_text("\n".join(lines) + "\n")
     except (OSError, ValueError, json.JSONDecodeError):
         pass
 
