@@ -7,6 +7,7 @@ must never be disturbed: new-window with -d). tmux behavior is covered by
 test_sable_spawn_manager_integration.py.
 """
 import importlib.util
+import inspect
 import os
 import subprocess
 from importlib.machinery import SourceFileLoader
@@ -37,24 +38,207 @@ def test_validate_roles_rejects_unknown():
     assert "lincoln" in str(e.value) and "optimus" in str(e.value)
 
 
-def test_parse_existing_roles():
-    out = "%0 lincoln\n%1 optimus\n%2 \n"
-    assert sm.parse_existing_roles(out) == {"lincoln", "optimus"}
+def _manager_pane(
+    *,
+    pane_id="%1",
+    role="optimus",
+    provider="claude",
+    pane_dead=False,
+    status="running",
+    boot_epoch="100-aaaaaaaaaaaa",
+    kicked_epoch="100-aaaaaaaaaaaa",
+):
+    return sm.ExistingPane(
+        pane_id=pane_id,
+        role=role,
+        provider=provider,
+        pane_dead=pane_dead,
+        status=status,
+        boot_epoch=boot_epoch,
+        kicked_epoch=kicked_epoch,
+    )
 
 
-def test_plan_spawns_skips_existing():
-    to_spawn, skipped = sm.plan_spawns(["optimus", "tarzan"], {"lincoln", "optimus"})
-    assert to_spawn == ["tarzan"]
-    assert skipped == ["optimus"]
+def test_parse_existing_panes_preserves_only_authoritative_liveness_fields():
+    out = (
+        "%0\tlincoln\t\t0\trunning\t100-a\t100-a\n"
+        "%1\toptimus\tcodex\t1\tdone\t200-b\t100-a\n"
+        "%2\t\t\t0\t\t\t\n"
+    )
 
+    panes = sm.parse_existing_panes(out)
 
-def test_existing_provider_map_defaults_legacy_panes_to_claude():
-    listing = "%1\toptimus\tcodex\n%2\ttarzan\t\n%3 chuck"
-    assert sm.parse_existing_providers(listing) == {
-        "optimus": "codex",
-        "tarzan": "claude",
-        "chuck": "claude",
+    assert panes == {
+        "lincoln": sm.ExistingPane("%0", "lincoln", "claude", False,
+                                   "running", "100-a", "100-a"),
+        "optimus": sm.ExistingPane("%1", "optimus", "codex", True,
+                                   "done", "200-b", "100-a"),
     }
+
+
+def test_parse_existing_panes_refuses_duplicate_role_owners():
+    out = (
+        "%1\toptimus\tclaude\t0\trunning\t100-a\t100-a\n"
+        "%2\toptimus\tclaude\t1\tdone\t100-a\t100-a\n"
+    )
+    with pytest.raises(ValueError, match=r"duplicate.*optimus.*%1.*%2"):
+        sm.parse_existing_panes(out)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, "ALIVE_AND_SESSIONED"),
+        ({"boot_epoch": "200-bbbbbbbbbbbb"}, "RESTARTED_SINCE"),
+        ({"pane_dead": True}, "DEAD"),
+        ({"status": "done"}, "DEAD"),
+    ],
+)
+def test_manager_liveness_trichotomy(overrides, expected):
+    pane = _manager_pane(**overrides)
+    assert sm.classify_manager_pane(pane).name == expected
+
+
+def test_process_alive_correct_environ_old_pid_shape_without_agent_epoch_is_unknown():
+    """The measured 28-hour-old process had every process-derived ALIVE hint.
+
+    None is an agent SessionStart event.  Even a lifecycle-running pane must
+    fail closed when the agent-written epoch is absent.
+    """
+    pane = _manager_pane(boot_epoch="", kicked_epoch="")
+    assert sm.classify_manager_pane(pane).name == "UNKNOWN"
+
+
+def test_pre_migration_epoch_present_but_status_and_reference_absent_is_unknown():
+    pane = _manager_pane(
+        status="", boot_epoch="100-aaaaaaaaaaaa", kicked_epoch=""
+    )
+    assert sm.classify_manager_pane(pane).name == "UNKNOWN"
+    assert sm.plan_spawns(["optimus"], {"optimus": pane}) == {
+        "optimus": sm.SpawnAction.REFUSE_UNKNOWN,
+    }
+
+
+def test_idle_does_not_collapse_working_and_cleared_manager_states():
+    """Both measured panes are idle; only the boot/reference relation differs."""
+    working_between_turns = _manager_pane()
+    cleared_and_idle = _manager_pane(boot_epoch="200-bbbbbbbbbbbb")
+
+    assert sm.classify_manager_pane(working_between_turns).name == "ALIVE_AND_SESSIONED"
+    assert sm.classify_manager_pane(cleared_and_idle).name == "RESTARTED_SINCE"
+    assert tuple(inspect.signature(sm.classify_manager_pane).parameters) == ("pane",)
+
+
+def test_scrollback_is_not_consulted_for_liveness(monkeypatch):
+    monkeypatch.setattr(
+        sm,
+        "capture_pane",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("scrollback consulted")
+        ),
+    )
+    assert sm.classify_manager_pane(_manager_pane()).name == "ALIVE_AND_SESSIONED"
+
+
+def test_plan_spawns_consumes_all_three_liveness_arms_distinctly():
+    existing = {
+        "optimus": _manager_pane(role="optimus"),
+        "tarzan": _manager_pane(
+            pane_id="%2", role="tarzan", boot_epoch="200-bbbbbbbbbbbb"
+        ),
+        "chuck": _manager_pane(pane_id="%3", role="chuck", pane_dead=True),
+    }
+
+    decisions = sm.plan_spawns(["optimus", "tarzan", "chuck"], existing)
+
+    assert decisions == {
+        "optimus": sm.SpawnAction.SKIP_ALIVE,
+        "tarzan": sm.SpawnAction.REKICK_RESTARTED,
+        "chuck": sm.SpawnAction.RESPAWN_DEAD,
+    }
+    assert len(set(decisions.values())) == 3
+
+
+def test_plan_spawns_absent_role_creates_new_pane():
+    assert sm.plan_spawns(["tarzan"], {}) == {
+        "tarzan": sm.SpawnAction.SPAWN_NEW,
+    }
+
+
+def test_plan_spawns_adopts_running_epoch_without_reference_but_never_kicks_it():
+    pane = _manager_pane(kicked_epoch="")
+    assert sm.plan_spawns(["optimus"], {"optimus": pane}) == {
+        "optimus": sm.SpawnAction.ADOPT_REFERENCE,
+    }
+
+
+def test_plan_spawns_refuses_missing_agent_epoch_instead_of_skipping_role_tag():
+    pane = _manager_pane(boot_epoch="", kicked_epoch="")
+    assert sm.plan_spawns(["optimus"], {"optimus": pane}) == {
+        "optimus": sm.SpawnAction.REFUSE_UNKNOWN,
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "dead", "expected"),
+    [
+        ("running", False, "SKIP_ALIVE"),
+        ("done", False, "RESPAWN_DEAD"),
+        ("running", True, "RESPAWN_DEAD"),
+        ("", False, "REFUSE_UNKNOWN"),
+    ],
+)
+def test_producer_planning_uses_lifecycle_without_boot_epoch(status, dead, expected):
+    pane = _manager_pane(
+        role="victor", status=status, pane_dead=dead,
+        boot_epoch="", kicked_epoch="",
+    )
+    decision = sm.plan_spawns(["victor"], {"victor": pane})["victor"]
+    assert decision.name == expected
+
+
+def test_stable_epoch_kick_retries_when_session_restarts_during_delivery():
+    reads = iter(("100-a", "200-b", "200-b", "200-b"))
+    delivered = []
+    recorded = []
+
+    ok, epoch = sm.stabilize_manager_kick(
+        ready=lambda: True,
+        read_epoch=lambda: next(reads),
+        deliver=lambda observed: delivered.append(observed) or True,
+        record=lambda observed: recorded.append(observed) or True,
+        attempts=2,
+    )
+
+    assert ok is True
+    assert epoch == "200-b"
+    assert delivered == ["100-a", "200-b"]
+    assert recorded == ["200-b"]
+
+
+def test_stable_epoch_kick_never_delivers_without_agent_epoch():
+    delivered = []
+    ok, reason = sm.stabilize_manager_kick(
+        ready=lambda: True,
+        read_epoch=lambda: "",
+        deliver=lambda observed: delivered.append(observed) or True,
+        record=lambda _observed: True,
+        attempts=2,
+    )
+    assert ok is False
+    assert "epoch" in reason.lower()
+    assert delivered == []
+
+
+def test_lifecycle_wrapper_is_one_shared_object_for_workers_and_managers():
+    assert sm.with_lifecycle_flags is spl.with_lifecycle_flags
+    wrapped = sm.with_lifecycle_flags("bash -c 'exit 7'")
+    assert wrapped.startswith(
+        'tmux set-option -p -t "$TMUX_PANE" @sable_status running;'
+    )
+    assert wrapped.endswith(
+        '; tmux set-option -p -t "$TMUX_PANE" @sable_status done'
+    )
 
 
 def test_retained_pane_provider_mismatch_is_refused():
@@ -203,7 +387,12 @@ def _mock_codex_spawn_dependencies(monkeypatch, tmp_path):
     monkeypatch.setattr(sm, "register_instance", lambda *args, **kwargs: "base")
 
     def fake_run(argv, **kwargs):
-        stdout = "%9\n" if "new-window" in argv else ""
+        if "new-window" in argv:
+            stdout = "%9\n"
+        elif "show-options" in argv and "@sable_boot_epoch" in argv:
+            stdout = "test-epoch\n"
+        else:
+            stdout = ""
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
     monkeypatch.setattr(sm.subprocess, "run", fake_run)

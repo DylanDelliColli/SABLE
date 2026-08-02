@@ -22,6 +22,23 @@ from sable_provider_lib import agent_name, normalize_provider
 # 30ms margin above that measured provider window (SABLE-dm6ek).
 SUBMIT_GAP_SECONDS = 0.15
 
+
+def with_lifecycle_flags(cmd: str) -> str:
+    """Wrap ``cmd`` so its own pane shell owns the running/done lifecycle.
+
+    ``running`` is the first action and ``done`` is unconditional after the
+    command exits.  The semicolon before the final write is deliberate: a
+    non-zero command exit still means the pane is done running.  Keeping both
+    writes in the same pane-local script prevents a fast exit from racing a
+    launcher-side ``running`` write (SABLE-5v9n).
+
+    This lives in the shared pane layer because worker, manager, and bounded
+    producer panes all use the same lifecycle contract.  Callers import this
+    object; they must not grow per-spawner copies whose crash semantics drift.
+    """
+    tag = 'tmux set-option -p -t "$TMUX_PANE" @sable_status'
+    return f'{tag} running; {cmd}; {tag} done'
+
 # Non-printable control bytes (except \t\n which are whitespace-handled). A
 # stray echoed Escape on the prompt line must not defeat glyph detection
 # (SABLE-zaum).

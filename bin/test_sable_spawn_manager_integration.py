@@ -10,6 +10,7 @@ at sable-launch.
 import hashlib
 import json
 import os
+import signal
 import shutil
 import subprocess
 import time
@@ -73,7 +74,10 @@ def _tmux(s, *args, check=True):
 
 def _run(s, *args):
     fake_tui = (
-        "bash --noprofile --norc -c 'while true; do printf \"❯ \"; "
+        "bash --noprofile --norc -c '"
+        "tmux set-option -p -t \"$TMUX_PANE\" @sable_boot_epoch \"test-$BASHPID\"; "
+        "tmux set-option -p -t \"$TMUX_PANE\" @sable_test_tui_pid \"$BASHPID\"; "
+        "while true; do printf \"❯ \"; "
         "IFS= read -r line || break; printf \"%s\\n\" \"$line\"; done'"
     )
     return subprocess.run(["python3", str(BIN), *args], capture_output=True, text=True,
@@ -110,6 +114,33 @@ def _pane_option(s, pane, name):
     return _tmux(s, "show-options", "-p", "-v", "-t", pane, name, check=False).stdout.strip()
 
 
+def _wait_pane(s, pane, *, status=None, dead=None, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    observed = None
+    while time.monotonic() < deadline:
+        out = _tmux(
+            s,
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{pane_dead}\t#{@sable_status}",
+            check=False,
+        )
+        if out.returncode == 0:
+            fields = out.stdout.rstrip("\n").split("\t")
+            observed = (fields[0] == "1", fields[1] if len(fields) > 1 else "")
+            if (status is None or observed[1] == status) and (
+                dead is None or observed[0] is dead
+            ):
+                return observed
+        time.sleep(0.05)
+    raise AssertionError(
+        f"pane {pane} never reached status={status!r} dead={dead!r}; "
+        f"last={observed!r}"
+    )
+
+
 def test_spawn_creates_detached_role_window(sock):
     _seed_lincoln(sock)
     r = _run(sock, "optimus")
@@ -121,6 +152,13 @@ def test_spawn_creates_detached_role_window(sock):
     names = _tmux(sock, "list-windows", "-t", SESSION,
                   "-F", "#{window_name}").stdout
     assert "optimus" in names
+
+    pane = _pane_for_role(sock, "optimus")
+    assert pane is not None
+    _wait_pane(sock, pane, status="running", dead=False)
+    epoch = _pane_option(sock, pane, "@sable_boot_epoch")
+    assert epoch
+    assert _pane_option(sock, pane, "@sable_kicked_epoch") == epoch
 
 
 def test_manager_refuses_statusless_execution_before_creating_pane(sock):
@@ -142,6 +180,121 @@ def test_second_spawn_skips_idempotently(sock):
     assert r.returncode == 0
     assert _roles(sock) == before
     assert "skip" in (r.stderr + r.stdout).lower()
+
+
+def test_restarted_epoch_rekicks_same_pane_and_advances_reference(sock):
+    _seed_lincoln(sock)
+    first = _run(sock, "tarzan")
+    assert first.returncode == 0, first.stderr
+    pane = _pane_for_role(sock, "tarzan")
+    assert pane is not None
+    old_ref = _pane_option(sock, pane, "@sable_kicked_epoch")
+    assert old_ref
+
+    _tmux(sock, "set-option", "-p", "-t", pane, "@sable_boot_epoch", "new-session")
+    restarted = _run(sock, "tarzan")
+
+    assert restarted.returncode == 0, restarted.stderr
+    assert _pane_for_role(sock, "tarzan") == pane
+    assert _pane_option(sock, pane, "@sable_kicked_epoch") == "new-session"
+    assert "re-kick" in (restarted.stdout + restarted.stderr).lower()
+
+
+def test_done_manager_respawns_in_same_pane_with_fresh_lifecycle(sock):
+    _seed_lincoln(sock)
+    first = _run(sock, "optimus")
+    assert first.returncode == 0, first.stderr
+    pane = _pane_for_role(sock, "optimus")
+    assert pane is not None
+    old_epoch = _pane_option(sock, pane, "@sable_boot_epoch")
+    window = _tmux(sock, "display-message", "-p", "-t", pane,
+                   "#{window_id}").stdout.strip()
+    _tmux(sock, "set-option", "-w", "-t", window, "remain-on-exit", "on")
+
+    tui_pid = int(_pane_option(sock, pane, "@sable_test_tui_pid"))
+    os.kill(tui_pid, signal.SIGTERM)
+    _wait_pane(sock, pane, status="done", dead=True)
+
+    respawned = _run(sock, "optimus")
+
+    assert respawned.returncode == 0, respawned.stderr
+    assert _pane_for_role(sock, "optimus") == pane
+    _wait_pane(sock, pane, status="running", dead=False)
+    new_epoch = _pane_option(sock, pane, "@sable_boot_epoch")
+    assert new_epoch and new_epoch != old_epoch
+    assert _pane_option(sock, pane, "@sable_kicked_epoch") == new_epoch
+    assert "respawn" in (respawned.stdout + respawned.stderr).lower()
+
+
+def test_reference_less_running_manager_is_adopted_without_typing(sock):
+    _seed_lincoln(sock)
+    pane = _tmux(
+        sock,
+        "new-window",
+        "-d",
+        "-t",
+        SESSION,
+        "-n",
+        "optimus",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "bash --noprofile --norc",
+    ).stdout.strip()
+    for option, value in (
+        ("@sable_role", "optimus"),
+        ("@sable_provider", "claude"),
+        ("@sable_class", "manager"),
+        ("@sable_status", "running"),
+        ("@sable_boot_epoch", "adopt-me"),
+    ):
+        _tmux(sock, "set-option", "-p", "-t", pane, option, value)
+
+    adopted = _run(sock, "optimus")
+
+    assert adopted.returncode == 0, adopted.stderr
+    assert _pane_for_role(sock, "optimus") == pane
+    assert _pane_option(sock, pane, "@sable_kicked_epoch") == "adopt-me"
+    assert "adopted" in (adopted.stdout + adopted.stderr).lower()
+    assert "SABLE-AUTOSTART" not in _tmux(
+        sock, "capture-pane", "-p", "-t", pane
+    ).stdout
+
+
+def test_bare_tagged_manager_without_sessionstart_epoch_refuses_unknown(sock):
+    _seed_lincoln(sock)
+    pane = _tmux(
+        sock,
+        "new-window",
+        "-d",
+        "-t",
+        SESSION,
+        "-n",
+        "optimus",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "bash --noprofile --norc",
+    ).stdout.strip()
+    for option, value in (
+        ("@sable_role", "optimus"),
+        ("@sable_provider", "claude"),
+        ("@sable_class", "manager"),
+        ("@sable_status", "running"),
+    ):
+        _tmux(sock, "set-option", "-p", "-t", pane, option, value)
+    before = _tmux(sock, "list-panes", "-s", "-t", SESSION,
+                    "-F", "#{pane_id}").stdout.split()
+
+    refused = _run(sock, "optimus", "tarzan")
+
+    after = _tmux(sock, "list-panes", "-s", "-t", SESSION,
+                   "-F", "#{pane_id}").stdout.split()
+    assert refused.returncode != 0
+    assert "unknown" in (refused.stdout + refused.stderr).lower()
+    assert after == before
+    assert _pane_for_role(sock, "optimus") == pane
+    assert _pane_for_role(sock, "tarzan") is None
 
 
 def test_all_spawns_three_roles(sock):
@@ -219,6 +372,7 @@ def test_known_startup_gate_is_accepted_then_manager_is_kicked(sock, tmp_path):
     kicked = tmp_path / "manager-kick.txt"
     script = tmp_path / "fake-known-gate.sh"
     script.write_text(
+        "tmux set-option -p -t \"$TMUX_PANE\" @sable_boot_epoch \"test-$BASHPID\"\n"
         "echo 'WARNING: Claude Code running in Bypass Permissions mode'\n"
         "echo '  1. No, exit'\n"
         "echo '  2. Yes, I accept'\n"
@@ -260,6 +414,7 @@ def test_unverified_manager_kick_fails_closed_and_retry_converges(sock, tmp_path
     first_byte = tmp_path / "first-byte.txt"
     script = tmp_path / "exit-during-kick.sh"
     script.write_text(
+        "tmux set-option -p -t \"$TMUX_PANE\" @sable_boot_epoch \"test-$BASHPID\"\n"
         "printf '❯ '\n"
         "IFS= read -r -n 1 byte\n"
         f'printf "%s" "$byte" > "{first_byte}"\n'
@@ -304,7 +459,7 @@ def test_provider_boot_failure_removes_manager_pane(sock, tmp_path):
     script.write_text(
         "printf '› '\n"
         "IFS= read -r -n 1 byte\n"
-        f'printf "%s" "$byte" > "{first_byte}"\n'
+        f'[ -z "$byte" ] || printf "%s" "$byte" > "{first_byte}"\n'
         "sleep 2\n"
     )
     _seed_lincoln(sock)
@@ -368,7 +523,9 @@ def test_codex_hook_graph_preflight_refuses_then_spawn_converges(sock, tmp_path)
         "SABLE_TMUX_SOCKET": sock,
         "SABLE_TMUX_SESSION": SESSION,
         "SABLE_TMUX_PANE_CMD": (
-            "bash --noprofile --norc -c 'while true; do printf \"› \"; "
+            "bash --noprofile --norc -c '"
+            "tmux set-option -p -t \"$TMUX_PANE\" @sable_boot_epoch \"test-$BASHPID\"; "
+            "while true; do printf \"› \"; "
             "IFS= read -r line || break; printf \"%s\\n\" \"$line\"; done'"
         ),
         "SABLE_DISPATCH_READY_TIMEOUT": "2",
@@ -480,6 +637,7 @@ def test_manager_spawn_pins_real_claude_command_to_opus(sock, tmp_path):
     # though PATH-based command resolution does (see class docstring).
     stub.write_text(
         "#!/bin/sh\n"
+        "tmux set-option -p -t \"$TMUX_PANE\" @sable_boot_epoch \"test-$$\"\n"
         f'printf "%s\\n" "$*" >> "{log_path}"\n'
         "while true; do printf '❯ '; IFS= read -r line || break; "
         "printf '%s\\n' \"$line\"; done\n"
