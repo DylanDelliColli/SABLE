@@ -4,6 +4,10 @@ f595d9fd7685073d898a8b80638e97e26dac98f4e117cf206771b2d5ac964bfe  ./agents/colum
 8b4884da9b454bb5f55902944789de77438e5ba2daa40849317e4b18879e0f35  ./agents/rudy.md
 8dbe809a369c86ef1759e768b07e4e0294c31dd6b769c24a2af80b2eec61f089  ./agents/sherlock.md
 6650443849ddb45def0fb3f95ac6c068373043fd26e6978ea3a20d536eefb00d  ./agents/victor.md
+f3942ab0979cdbb0c2fd11077adcba80c5c67d540227b761c64809efabe95357  ./bin/sable_batch_key_lib.py
+2abb0757c670e45e3bc1294cd76d0534a10c05158c44e6730b58ffcb348ffb2a  ./bin/sable_footprint_lib.py
+9aeed413db28ebcf45c0e48e2c7b784d07c02daf3ebc3091f0683301abc979cf  ./bin/sable_gate_classify_lib.py
+c29ca3b672e9f2a9cf6b7c2af7782e1a34eb5faa983b67761e3b44ba2b8031cb  ./bin/sable_gate_git_lib.py
 1f4240a635a648b1ac732e596309f0ab10f21b1db366f377149df46c7b0c7dff  ./bin/sable_inline_body_guard_lib.py
 cbeae4ebf177b0899fd0214366f0750ee3b4d36ddd11e9fb6db91e8ccac5f63b  ./commands/inbox.md
 7dba45bda78926dd80ee92ff27e70c1650e29e670fd0f3db8bdd7e4303d9c851  ./hooks/agent-tdd-enforce.sh
@@ -20,9 +24,9 @@ cf263f46c916d834bce9c944d9ec2b0708f5349d128064ed185739eb38314aba  ./hooks/multi-
 492926423b2627a91f338b38eb78fe90abec6d500cd88f07091fff7e167331ad  ./hooks/multi-manager/mode-interlock.sh
 86bde07c1e3a1d9005e6462ea8f24ee0c051c846fbe162b3c60f0de48451f385  ./hooks/multi-manager/notes-clobber-guard.sh
 9767a2f76c842dfec641b3fef5c8dac231911b88d694b6319c5947ddef575479  ./hooks/multi-manager/post-push-merge-notify.sh
-f20a1bf403eece84f95eb5be0b19e88a39d40c1a1276344d8282f28032948fc3  ./hooks/multi-manager/pre-dispatch-claim.sh
+462d8ef002322073cbd39fe2b03f2852da86d37b38127a27c4661499603f3e63  ./hooks/multi-manager/pre-dispatch-claim.sh
 ddd4cfb9db11c9f17199ccb8470a37a185a68ef9f435da1d9d6d7efe120371dc  ./hooks/multi-manager/pre-dispatch-model-check.sh
-b19d58c12a7d0f82b5a7bfbb3247a21e128262855751e6a6fe15b8eeaa56fc77  ./hooks/multi-manager/pre-dispatch-overlap.sh
+4c027de9e702ef6968d6bff4db7e102b0201d5d5fa44406783e5cb9b6f154702  ./hooks/multi-manager/pre-dispatch-overlap.sh
 0ce839ca0fbbd0a9ff60128296e8bc0dfe19fa9cff3ff0f2efa568e4aa2d8cdb  ./hooks/multi-manager/pre-dispatch-preempt.sh
 cbdea65644eff16c2c462ee855ba11106185927b7d2d0f2fe899740337973f4d  ./hooks/multi-manager/pre-dispatch-refresh.sh
 d609623bf1dba8f50ba3b02962af8014c90d679e31267bcf1f2d87dd4f042250  ./hooks/multi-manager/pre-push-rebase-test.sh
