@@ -29,12 +29,14 @@ turn still running) before typing — waiting only for the prompt to reappear
 raced the interrupted turn's redraw and dropped the message (SABLE-m6is);
 submission is retried until the framed message is visible in the pane and no
 longer sitting in the input box. Only then do we print `delivered`; on
-genuine failure we print `undelivered`, AUTO-FILE the durable for-<role>
-inbox bead (SABLE-1umr — delivery degrades to the bead substrate, not to
-nothing; set SABLE_MSG_AUTO_FALLBACK=0 to disable, and bead-addressed worker
-sends never auto-file since the dispatching manager sees the failure live),
-and exit non-zero. If bd itself is unavailable we fall back to printing the
-manual bead-filing hint.
+genuine immediate-delivery failure we atomically enqueue the payload in the
+host-global inbox.  A fresh host-drainer heartbeat makes that durable queue a
+successful delivery state.  Until a complete drain sweep is actually observed,
+the existing for-<role> fallback remains loud and the send remains non-zero —
+source landing alone never silently retires the backstop (SABLE-m4kyf.5/albyd).
+If the queue itself fails, the fallback remains loud as well.  Set
+SABLE_MSG_AUTO_FALLBACK=0 to disable auto-filing; bead-addressed worker sends
+never auto-file because their dispatching manager sees the failure live.
 
 Usage:
   sable-msg <to-role> "<text>" [--from <role>] [--interrupt] [--bead]
@@ -149,6 +151,7 @@ from pathlib import Path
 # Shared pane-readiness/dispatch helpers (SABLE-bldh.14), same module
 # sable-spawn-worker uses. Resolve next to THIS script even via a PATH symlink.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_inbox_lib import InboxError, drain_health, enqueue  # noqa: E402
 from sable_pane_lib import (  # noqa: E402
     SUBMIT_GAP_SECONDS, SessionCollision, deliver_text, pane_bead_tag, pane_busy,
     pane_idle, pane_process_identity, pane_provider_tag, pane_ready,
@@ -675,8 +678,10 @@ def file_fallback_bead(frm: str, to_role: str, message: str, runner=None) -> str
     `bd ready`, and one measured pool held 26 items of which 11 were these —
     roughly doubling the apparent queue and pushing the real work down it. The
     recipient still finds them by the for-<role> label, which is how the inbox
-    is read anyway. Do NOT stop filing them: the fallback is what makes an
-    unverified delivery lossless, and it has worked correctly every time."""
+    is read anyway. Keep filing them whenever automatic queue draining is not
+    proven by a fresh heartbeat: this fallback is what makes an unverified
+    delivery lossless. Once a live drainer is observed, the durable file queue
+    carries that responsibility without manufacturing tracker work."""
     runner = runner or (lambda args: subprocess.run(args, capture_output=True, text=True))
     title = fallback_bead_title(to_role, message)
     desc = (f"Auto-filed by sable-msg after verified-delivery failure (SABLE-1umr). "
@@ -693,6 +698,29 @@ def file_fallback_bead(frm: str, to_role: str, message: str, runner=None) -> str
     out = (getattr(r, "stdout", "") or "") + (getattr(r, "stderr", "") or "")
     m = re.search(r"Created issue:\s*(\S+)", out) or re.search(r"([A-Za-z0-9_-]+-[a-z0-9.]+)", out)
     return m.group(1) if m else None
+
+
+def _loud_fallback_suffix(
+    frm: str,
+    to_role: str,
+    message: str,
+    *,
+    bead_addressed: bool,
+) -> str:
+    """Preserve the existing durable backstop until live draining is proven."""
+
+    bead_id = None
+    if not bead_addressed and os.environ.get("SABLE_MSG_AUTO_FALLBACK", "1") != "0":
+        bead_id = file_fallback_bead(frm, to_role, message)
+    if bead_id:
+        return (
+            f"Filed durable inbox bead {bead_id} (label for-{to_role}) so the "
+            "unverified drain remains visible."
+        )
+    return (
+        "Fallback remains required: bd create --title=\"<summary>\" "
+        f"--label=for-{to_role} --type=task"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -958,21 +986,51 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 6
     if outcome == UNDELIVERED:
-        bead_id = None
-        if not ns.bead and os.environ.get("SABLE_MSG_AUTO_FALLBACK", "1") != "0":
-            bead_id = file_fallback_bead(ns.frm, ns.to_role, message)
-        if bead_id:
-            sys.stderr.write(
-                f"sable-msg: undelivered {ns.frm} -> {ns.to_role} ({pane}); the message did not "
-                f"land as a submitted turn after {submit_tries} attempt(s). Filed durable inbox "
-                f"bead {bead_id} (label for-{ns.to_role}) so it survives.\n"
+        try:
+            message_id = enqueue(ns.to_role, ns.frm, message)
+        except (InboxError, OSError, ValueError, TypeError) as exc:
+            fallback = _loud_fallback_suffix(
+                ns.frm,
+                ns.to_role,
+                message,
+                bead_addressed=ns.bead,
             )
-        else:
             sys.stderr.write(
-                f"sable-msg: undelivered {ns.frm} -> {ns.to_role} ({pane}); the message did not "
-                f"land as a submitted turn after {submit_tries} attempt(s). Fall back to a durable "
-                f"inbox bead: bd create --title=\"<summary>\" --label=for-{ns.to_role} --type=task\n"
+                f"sable-msg: QUEUE-FAILED {ns.frm} -> {ns.to_role} ({pane}); immediate "
+                f"delivery was not verified after {submit_tries} attempt(s), and the "
+                f"message could not be queued: {exc}. NOTHING WAS DELIVERED OR QUEUED. "
+                f"{fallback}\n"
             )
+            return 1
+
+        try:
+            health = drain_health()
+        except (InboxError, OSError, ValueError, TypeError) as exc:
+            health = type(
+                "UnavailableDrainHealth",
+                (),
+                {"fresh": False, "reason": f"heartbeat assessment failed: {exc}"},
+            )()
+        if health.fresh:
+            sys.stderr.write(
+                f"sable-msg: queued {ns.frm} -> {ns.to_role} ({pane}); immediate delivery "
+                f"was not verified after {submit_tries} attempt(s), but inbox message "
+                f"{message_id} is durable and the drainer heartbeat is fresh.\n"
+            )
+            return 0
+
+        fallback = _loud_fallback_suffix(
+            ns.frm,
+            ns.to_role,
+            message,
+            bead_addressed=ns.bead,
+        )
+        sys.stderr.write(
+            f"sable-msg: QUEUED-BUT-DRAINER-UNVERIFIED {ns.frm} -> {ns.to_role} "
+            f"({pane}); the immediate path was undelivered and inbox message "
+            f"{message_id} is durable, but automatic draining "
+            f"is not currently proven ({health.reason}). {fallback}\n"
+        )
         return 1
 
     sys.stderr.write(f"sable-msg: delivered {ns.frm} -> {ns.to_role} ({pane})\n")
