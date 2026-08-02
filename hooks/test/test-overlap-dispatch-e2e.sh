@@ -107,8 +107,7 @@ mkdir -p "$BEADS_ROOT"
 # content RED on whichever branch happened to be the first to enter the
 # tier. Same pattern this file already applies at the hermeticity probe
 # below (line ~364) and test-dep-merge-state.sh applies at its own init.
-BD_INIT_OUT="$(cd "$BEADS_ROOT" && env -u BEADS_DB BD_NON_INTERACTIVE=1 \
-  bd init --prefix=sable --skip-agents --skip-hooks --quiet 2>&1)"
+BD_INIT_OUT="$(cd "$BEADS_ROOT" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=sable --skip-agents --skip-hooks --quiet 2>&1)"
 if [ ! -d "$BEADS_ROOT/.beads" ]; then
   echo "FATAL: could not initialize an isolated per-run bd DB: $BD_INIT_OUT"
   exit 2
