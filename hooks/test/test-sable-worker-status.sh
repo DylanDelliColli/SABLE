@@ -25,6 +25,7 @@ trap cleanup EXIT
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); echo "PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
+READINESS_PREDICATES_FIRED=0
 
 # Hermeticity (SABLE-j3bi/SABLE-a9453): scrub the ambient SABLE/Claude
 # identity vars BEFORE the first pane-spawning call below, and route every
@@ -50,6 +51,49 @@ tag_full() { # tag_full <pane> <role> <bead> <status> <class> <deliverable>
   tmux -L "$SOCK" set-option -p -t "$1" @sable_deliverable "$6"
 }
 
+# Bound every asynchronous tmux transition by observable state, never elapsed
+# setup time. Most predicates are true on their first read; the short poll is
+# only a scheduler allowance and fails loudly after two seconds.
+READINESS_POLL_INTERVAL=0.02
+READINESS_MAX_POLLS=100
+wait_ready() { # wait_ready <description> <predicate> [args...]
+  local description="$1" attempts=0
+  shift
+  until "$@"; do
+    attempts=$((attempts+1))
+    if [ "$attempts" -ge "$READINESS_MAX_POLLS" ]; then
+      echo "FATAL: tmux fixture readiness timed out: $description" >&2
+      exit 2
+    fi
+    sleep "$READINESS_POLL_INTERVAL"
+  done
+  READINESS_PREDICATES_FIRED=$((READINESS_PREDICATES_FIRED+1))
+}
+
+pane_count_is() {
+  local -a panes=()
+  mapfile -t panes < <(tmux -L "$SOCK" list-panes -t "$1" -F '#{pane_id}' 2>/dev/null)
+  [ "${#panes[@]}" -eq "$2" ]
+}
+session_exists() { tmux -L "$SOCK" has-session -t "$1" >/dev/null 2>&1; }
+session_absent() { ! session_exists "$1"; }
+all_panes_absent() {
+  [ -z "$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null || true)" ]
+}
+pane_exists() {
+  tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null \
+    | grep -Fxq -- "$1"
+}
+pane_absent() { ! pane_exists "$1"; }
+producer_reaped_manager_alive() { pane_absent "$1" && pane_exists "$2"; }
+pane_option_is() {
+  [ "$(tmux -L "$SOCK" show-options -p -v -t "$1" "$2" 2>/dev/null)" = "$3" ]
+}
+pane_capture_contains() {
+  tmux -L "$SOCK" capture-pane -p -t "$1" -S -20 2>/dev/null \
+    | grep -Fq -- "$2"
+}
+
 # SABLE-v4e5: resolve_session() (bin/sable_pane_lib.py) now scopes list-panes
 # to a derived-per-repo or calling-pane session (SABLE-e1e3) rather than -a
 # across the whole socket, so the fixture's literal 'w' session must be named
@@ -67,11 +111,11 @@ run_status() { SABLE_TMUX_SOCKET="$SOCK" SABLE_TMUX_SESSION="w" CLAUDE_AGENT_NAM
 # --- fixture: two worker panes, plus a SECOND session name grouped with the
 #     first — the exact mechanism that duplicates list-panes -a rows ---
 tmux_spawn new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
-sleep 0.3
+wait_ready "initial session has one pane" pane_count_is w 1
 tmux_spawn split-window -t w 'bash --noprofile --norc'
-sleep 0.3
+wait_ready "initial session has two panes" pane_count_is w 2
 tmux_spawn new-session -d -t w -s w2   # grouped alias — duplicates every pane row
-sleep 0.2
+wait_ready "grouped alias session exists" session_exists w2
 
 PANE1="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"
 PANE2="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 2p)"
@@ -109,7 +153,7 @@ if ! printf '%s' "$out" | grep -qi "traceback"; then
 else
   fail "--reap prints no traceback" "$out"
 fi
-sleep 0.3
+wait_ready "grouped done panes were reaped" all_panes_absent
 remaining="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | sort -u | wc -l)"
 if [ "$remaining" -eq 0 ]; then
   pass "--reap killed both done panes"
@@ -121,9 +165,9 @@ fi
 #     input (a misrouted/queued instruction) must be flagged, not silently
 #     killed over — and no pane may survive reap still holding it ---
 tmux_spawn new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
-sleep 0.3
+wait_ready "pending-input session has one pane" pane_count_is w 1
 tmux_spawn split-window -t w 'bash --noprofile --norc'
-sleep 0.3
+wait_ready "pending-input session has two panes" pane_count_is w 2
 PANE5="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"   # pending-input pane
 PANE6="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 2p)"   # clean done pane
 tag "$PANE5" worker bead-five done
@@ -131,10 +175,11 @@ tag "$PANE6" worker bead-six done
 # emulate a claude composer's '> ' prompt glyph, then type an unsubmitted,
 # queued line into it with NO Enter — mirrors a misrouted/queued instruction
 # sitting in the composer un-submitted
-tmux -L "$SOCK" send-keys -t "$PANE5" "PS1='> '" Enter
-sleep 0.3
+tmux -L "$SOCK" send-keys -t "$PANE5" \
+  "PS1='> '; tmux -L '$SOCK' set-option -p -t '$PANE5' @fixture_prompt_ready 1" Enter
+wait_ready "worker composer prompt is active" pane_option_is "$PANE5" @fixture_prompt_ready 1
 tmux -L "$SOCK" send-keys -t "$PANE5" -l "check the pool for next work"
-sleep 0.2
+wait_ready "worker pending input is visible" pane_capture_contains "$PANE5" "check the pool for next work"
 
 out3="$(run_status --reap 2>&1)"
 rc3=$?
@@ -167,7 +212,7 @@ if printf '%s' "$out3" | grep -q "check the pool for next work"; then
 else
   fail "--reap flag message includes the literal pending-input text" "$out3"
 fi
-sleep 0.3
+wait_ready "pending-input worker panes were reaped" all_panes_absent
 survivors5="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$PANE5" || true)"
 survivors6="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$PANE6" || true)"
 if [ "$survivors5" -eq 0 ] && [ "$survivors6" -eq 0 ]; then
@@ -184,9 +229,9 @@ DELIVERABLE="$(mktemp)"
 echo '{"ok": true}' > "$DELIVERABLE"
 
 tmux_spawn new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
-sleep 0.3
+wait_ready "producer-manager session has one pane" pane_count_is w 1
 tmux_spawn split-window -t w 'bash --noprofile --norc'
-sleep 0.3
+wait_ready "producer-manager session has two panes" pane_count_is w 2
 PANE7="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"   # producer, done, valid deliverable
 PANE8="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 2p)"   # manager warm loop
 tag_full "$PANE7" victor bead-victor done producer "$DELIVERABLE"
@@ -199,7 +244,8 @@ if [ "$rc4" -eq 0 ]; then
 else
   fail "--reap exits 0 with a done producer + a manager pane present" "exit $rc4: $out4"
 fi
-sleep 0.3
+wait_ready "producer was reaped while manager survived" \
+  producer_reaped_manager_alive "$PANE7" "$PANE8"
 p7_alive="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$PANE7" || true)"
 p8_alive="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$PANE8" || true)"
 if [ "$p7_alive" -eq 0 ]; then
@@ -216,7 +262,7 @@ rm -f "$DELIVERABLE"
 # the manager pane survives by design -- tear its session down explicitly so
 # the next fixture block gets a clean 'w' session, not a collision
 tmux -L "$SOCK" kill-session -t w >/dev/null 2>&1 || true
-sleep 0.2
+wait_ready "manager fixture session was removed" session_absent w
 
 # --- composer-safety regression (SABLE-1umr) must also fire for producer
 #     panes: unsubmitted input is cleared + flagged before the kill, not
@@ -224,13 +270,14 @@ sleep 0.2
 DELIVERABLE2="$(mktemp)"
 echo '{"ok": true}' > "$DELIVERABLE2"
 tmux_spawn new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
-sleep 0.3
+wait_ready "producer composer session has one pane" pane_count_is w 1
 PANE9="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"
 tag_full "$PANE9" victor bead-victor2 done producer "$DELIVERABLE2"
-tmux -L "$SOCK" send-keys -t "$PANE9" "PS1='> '" Enter
-sleep 0.3
+tmux -L "$SOCK" send-keys -t "$PANE9" \
+  "PS1='> '; tmux -L '$SOCK' set-option -p -t '$PANE9' @fixture_prompt_ready 1" Enter
+wait_ready "producer composer prompt is active" pane_option_is "$PANE9" @fixture_prompt_ready 1
 tmux -L "$SOCK" send-keys -t "$PANE9" -l "check the pool for next work"
-sleep 0.2
+wait_ready "producer pending input is visible" pane_capture_contains "$PANE9" "check the pool for next work"
 
 out5="$(run_status --reap 2>&1)"
 # SABLE-o05cv: same ruling as the worker-pane case above — assert on the
@@ -241,7 +288,7 @@ if printf '%s' "$out5" | grep -q "holds unsubmitted composer input"; then
 else
   fail "--reap flags a producer pane's pending composer input instead of staying silent" "$out5"
 fi
-sleep 0.3
+wait_ready "pending-input producer was reaped" pane_absent "$PANE9"
 p9_alive="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$PANE9" || true)"
 if [ "$p9_alive" -eq 0 ]; then
   pass "producer pane is still reaped after its pending input is cleared+flagged"
@@ -257,7 +304,7 @@ rm -f "$DELIVERABLE2"
 DELIVERABLE3="$(mktemp)"
 echo '{"ok": true}' > "$DELIVERABLE3"
 tmux_spawn new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
-sleep 0.3
+wait_ready "beadless producer session has one pane" pane_count_is w 1
 PANE10="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"
 tag_full "$PANE10" victor "" done producer "$DELIVERABLE3"
 
@@ -268,7 +315,7 @@ if [ "$rc6" -eq 0 ]; then
 else
   fail "--reap exits 0 with a beadless done producer present" "exit $rc6: $out6"
 fi
-sleep 0.3
+wait_ready "beadless producer was reaped" pane_absent "$PANE10"
 p10_alive="$(tmux -L "$SOCK" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -xc "$PANE10" || true)"
 if [ "$p10_alive" -eq 0 ]; then
   pass "--reap kills a beadless done producer pane with a valid deliverable"
@@ -281,13 +328,16 @@ rm -f "$DELIVERABLE3"
 #     session-rate-limit banner must be flagged stalled-rate-limit (with the
 #     reset time) instead of reading "running" forever ---
 tmux_spawn new-session -d -s w -x 200 -y 50 'bash --noprofile --norc'
-sleep 0.3
+wait_ready "rate-limit worker session has one pane" pane_count_is w 1
 PANE11="$(tmux -L "$SOCK" list-panes -t w -F '#{pane_id}' | sed -n 1p)"
 tag "$PANE11" worker bead-eleven running
-tmux -L "$SOCK" send-keys -t "$PANE11" "echo 'You have hit your session limit - resets 2pm'" Enter
-sleep 0.2
-tmux -L "$SOCK" send-keys -t "$PANE11" "PS1='❯ '" Enter
-sleep 0.3
+tmux -L "$SOCK" send-keys -t "$PANE11" \
+  "echo 'You have hit your session limit - resets 2pm'; tmux -L '$SOCK' set-option -p -t '$PANE11' @fixture_banner_ready 1" Enter
+wait_ready "rate-limit banner was emitted" pane_option_is "$PANE11" @fixture_banner_ready 1
+tmux -L "$SOCK" send-keys -t "$PANE11" \
+  "PS1='❯ '; tmux -L '$SOCK' set-option -p -t '$PANE11' @fixture_prompt_ready 1" Enter
+wait_ready "rate-limit prompt is active" pane_option_is "$PANE11" @fixture_prompt_ready 1
+wait_ready "rate-limit prompt is rendered" pane_capture_contains "$PANE11" "❯ "
 
 out7="$(run_status)"
 if printf '%s' "$out7" | grep -q "bead-eleven" && printf '%s' "$out7" | grep -q "stalled-rate-limit"; then
@@ -299,6 +349,13 @@ if printf '%s' "$out7" | grep -q "resets=2pm"; then
   pass "the flagged row reports the reset time"
 else
   fail "the flagged row reports the reset time" "$out7"
+fi
+
+if [ "$READINESS_PREDICATES_FIRED" -eq 23 ]; then
+  pass "fixture synchronization: all 23 tmux readiness predicates fired"
+else
+  fail "fixture synchronization: all 23 tmux readiness predicates fired" \
+       "saw $READINESS_PREDICATES_FIRED; fixed setup sleeps must not substitute for readiness"
 fi
 
 echo

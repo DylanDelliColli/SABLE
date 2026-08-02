@@ -35,9 +35,10 @@
 #      its local-only --check-beads exclusion-freshness gate under
 #      proportional pre-push selection
 #
-# Real bash processes throughout, REAL git repo + REAL `git diff --name-only`
-# output feeding sable_select_impacted — no mocks, no bd/dolt. Fixture: a
-# throwaway git repo carrying REAL, unmodified copies of
+# Selector calls run in isolated inherited bash subshells; the setup checks,
+# REAL git repo + REAL `git diff --name-only` process boundary, and production
+# declaration controls remain fresh processes — no mocks, no bd/dolt. Fixture:
+# a throwaway git repo carrying REAL, unmodified copies of
 # .github/ci/shell-run-set.sh and .github/ci/impact-manifest.sh, with
 # ALLOW/EXCLUDE/COVERS/LIB_FANOUT replaced wholesale for a small,
 # fully-classified fixture universe (same substitution technique as
@@ -48,16 +49,25 @@
 
 set -uo pipefail
 
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-PROD_RUNSET="$REPO/.github/ci/shell-run-set.sh"
-PROD_MANIFEST="$REPO/.github/ci/impact-manifest.sh"
+SOURCE_REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+PROD_RUNSET="$SOURCE_REPO/.github/ci/shell-run-set.sh"
+PROD_MANIFEST="$SOURCE_REPO/.github/ci/impact-manifest.sh"
 
 PASS=0; FAIL=0; FAIL_NAMES=""
 pass(){ PASS=$((PASS+1)); echo "PASS: $1"; }
 fail(){ FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; }
 
 TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/sable-test-impact-selection.XXXXXX")"
-trap 'rm -rf "$TMPROOT"' EXIT
+cleanup_impact_selection_fixture() { rm -rf "$TMPROOT"; }
+restore_impact_selection_shell_state() {
+  # Both sourced declaration files currently set exactly these options and no
+  # traps. Reassert the harness contract so a future library-side change cannot
+  # enable errexit or replace the cleanup trap in this long-running suite.
+  set +e
+  set -uo pipefail
+  trap cleanup_impact_selection_fixture EXIT
+}
+trap cleanup_impact_selection_fixture EXIT
 
 REPO_DIR="$TMPROOT/fixture-repo"
 BARE_DIR="$TMPROOT/fixture-bare.git"
@@ -205,18 +215,35 @@ else
   fail "fixture setup: the fixture's own COVERS/LIB_FANOUT/test-coverage is complete (--check exits 0) before selection is exercised" "$FANOUT_CHECK_OUT"
 fi
 
+# Load the fixture declarations and selector functions once. This must stay at
+# top level: shell-run-set.sh's `declare -A` arrays would be local and disappear
+# if the file were sourced from inside a loader function. impact-manifest.sh
+# intentionally sets REPO to the fixture; production paths were captured above
+# under SOURCE_REPO before this source.
+# shellcheck source=/dev/null
+. "$REPO_DIR/.github/ci/impact-manifest.sh"
+restore_impact_selection_shell_state
+
 # select_for: STDOUT ONLY — the suite list a real consumer (e.g.
 # bin/sable_gate_promote_lib.py's _selected_suites) parses. The
-# "::notice::" mode/reason line goes to stderr and is asserted separately
-# via select_notice_for, below — merging them here would make every
-# exact-match assertion below fragile against the observability line.
-select_for() {
-  bash "$REPO_DIR/.github/ci/impact-manifest.sh" --select "$@" 2>/dev/null | sort
-}
+# "::notice::" mode/reason line remains on stderr. The explicit subshell keeps
+# selector-local option, trap, variable, and cwd changes out of the harness.
+select_for() (
+  sable_select_impacted "$@" 2>/dev/null | sort
+)
 
-# select_notice_for: just the "::notice::" line(s) on stderr.
-select_notice_for() {
-  bash "$REPO_DIR/.github/ci/impact-manifest.sh" --select "$@" 2>&1 1>/dev/null
+# Cases asserting both output channels call the selector once and retain both
+# streams. Fixed files are safe because this suite is serial and TMPROOT is
+# unique; the selector itself still runs in an isolated inherited subshell.
+capture_select_for() {
+  local stdout_file="$TMPROOT/select.stdout"
+  local stderr_file="$TMPROOT/select.stderr"
+  CAPTURED_SELECT_RC=0
+  ( sable_select_impacted "$@" >"$stdout_file" 2>"$stderr_file" ) \
+    || CAPTURED_SELECT_RC=$?
+  CAPTURED_SELECT_STDOUT="$(<"$stdout_file")"
+  CAPTURED_SELECT_SORTED="$(sort <"$stdout_file")"
+  CAPTURED_SELECT_STDERR="$(<"$stderr_file")"
 }
 
 # ---------------------------------------------------------------------------
@@ -234,11 +261,15 @@ fi
 # 2. A changed path under a mapped suite's own covered file selects EXACTLY
 #    that suite.
 # ---------------------------------------------------------------------------
-MAPPED_SEL=$(select_for hooks/multi-manager/hook-beta.sh)
-if [ "$MAPPED_SEL" = "test-fixture-beta.sh" ]; then
+capture_select_for hooks/multi-manager/hook-beta.sh
+MAPPED_SEL="$CAPTURED_SELECT_SORTED"
+MAPPED_STDOUT="$CAPTURED_SELECT_STDOUT"
+SCOPED_NOTICE="$CAPTURED_SELECT_STDERR"
+MAPPED_RC="$CAPTURED_SELECT_RC"
+if [ "$MAPPED_RC" -eq 0 ] && [ "$MAPPED_SEL" = "test-fixture-beta.sh" ]; then
   pass "mapped covered-file change (hooks/multi-manager/hook-beta.sh) selects exactly test-fixture-beta.sh"
 else
-  fail "mapped covered-file change (hooks/multi-manager/hook-beta.sh) selects exactly test-fixture-beta.sh" "got: $MAPPED_SEL"
+  fail "mapped covered-file change (hooks/multi-manager/hook-beta.sh) selects exactly test-fixture-beta.sh" "rc=$MAPPED_RC got: $MAPPED_SEL"
 fi
 
 # A suite with no COVERS entry defaults to covering its own file.
@@ -259,17 +290,20 @@ fi
 #    below (R1), where the file is actually created.
 # ---------------------------------------------------------------------------
 FULL_EXPECTED=$(printf 'test-fixture-alpha.sh\ntest-fixture-beta.sh\ntest-fixture-gamma.sh\ntest-fixture-standalone.sh' | sort)
-UNMAPPED_SEL=$(select_for unmapped-area/something.py)
-UNMAPPED_NOTICE=$(select_notice_for unmapped-area/something.py)
-if [ "$UNMAPPED_SEL" = "$FULL_EXPECTED" ] && printf '%s' "$UNMAPPED_NOTICE" | grep -qi 'delet'; then
+capture_select_for unmapped-area/something.py
+UNMAPPED_SEL="$CAPTURED_SELECT_SORTED"
+UNMAPPED_NOTICE="$CAPTURED_SELECT_STDERR"
+FULL_NOTICE="$CAPTURED_SELECT_STDERR"
+UNMAPPED_RC="$CAPTURED_SELECT_RC"
+if [ "$UNMAPPED_RC" -eq 0 ] && [ "$UNMAPPED_SEL" = "$FULL_EXPECTED" ] && printf '%s' "$UNMAPPED_NOTICE" | grep -qi 'delet'; then
   pass "y4nom.7.1: an ABSENT changed path (unmapped-area/something.py, not yet created) is the DELETED class -> FULL set with deletion notice"
 else
-  fail "y4nom.7.1: an ABSENT changed path (unmapped-area/something.py, not yet created) is the DELETED class -> FULL set with deletion notice" "got: $UNMAPPED_SEL notice: $UNMAPPED_NOTICE"
+  fail "y4nom.7.1: an ABSENT changed path (unmapped-area/something.py, not yet created) is the DELETED class -> FULL set with deletion notice" "rc=$UNMAPPED_RC got: $UNMAPPED_SEL notice: $UNMAPPED_NOTICE"
 fi
 
 # The full-set deletion selection must be BY CONSTRUCTION identical in size
 # to ALLOW, not a number that can silently drift apart from it.
-ALLOW_SIZE=$(bash -c "source '$REPO_DIR/.github/ci/shell-run-set.sh' 2>/dev/null; echo \${#ALLOW[@]}")
+ALLOW_SIZE="${#ALLOW[@]}"
 UNMAPPED_COUNT=$(printf '%s\n' "$UNMAPPED_SEL" | grep -c .)
 if [ "$UNMAPPED_COUNT" -eq "$ALLOW_SIZE" ]; then
   pass "the full-set deletion selection count ($UNMAPPED_COUNT) equals \${#ALLOW[@]} ($ALLOW_SIZE) — cannot silently drift apart"
@@ -395,6 +429,12 @@ cd "$REPO_DIR" || { echo "FATAL: cd to fixture repo failed"; exit 2; }
 git add -A
 git commit -q -m "add orphan suite to ALLOW"
 cd - >/dev/null
+# This is the suite's one deliberate persistent declaration rewrite. Reload at
+# top level so the cached ALLOW array and reverse indexes include the orphan;
+# ordinary tracked-file creation/deletion does not require a declaration load.
+# shellcheck source=/dev/null
+. "$REPO_DIR/.github/ci/impact-manifest.sh"
+restore_impact_selection_shell_state
 ORPHAN_FIXED_RC=0
 bash "$REPO_DIR/.github/ci/impact-manifest.sh" --check-test-coverage >/dev/null 2>&1 || ORPHAN_FIXED_RC=$?
 if [ "$ORPHAN_FIXED_RC" -eq 0 ]; then
@@ -411,7 +451,6 @@ fi
 #    paths. Before m4exv, --select emitted no mode line at all, so one FULL
 #    answer was byte-for-byte identical to any other.
 # ---------------------------------------------------------------------------
-SCOPED_NOTICE=$(select_notice_for hooks/multi-manager/hook-beta.sh)
 case "$SCOPED_NOTICE" in
   *"::notice::impact-manifest: SCOPED"*)
     pass "SABLE-m4exv: a scoped selection emits an '::notice:: ... SCOPED' line on stderr"
@@ -424,7 +463,6 @@ esac
 # (y4nom.7.1-revised: the probe path is ABSENT here — created only later in
 # the migration section — so the notice this case pins is the DELETED cause,
 # named per path.)
-FULL_NOTICE=$(select_notice_for unmapped-area/something.py)
 case "$FULL_NOTICE" in
   *"::notice::impact-manifest: FULL -- deleted path(s):"*"unmapped-area/something.py"*)
     pass "SABLE-m4exv/y4nom.7.1: a full-set DELETED selection emits an '::notice:: ... FULL -- deleted path(s): ...' line naming the path"
@@ -438,7 +476,7 @@ esac
 # this is the property bin/sable_gate_promote_lib.py's _selected_suites
 # parsing depends on (it filters "::"-prefixed lines, but stdout should
 # never have needed that filter for THIS reason in the first place).
-STDOUT_ONLY=$(bash "$REPO_DIR/.github/ci/impact-manifest.sh" --select hooks/multi-manager/hook-beta.sh 2>/dev/null)
+STDOUT_ONLY="$MAPPED_STDOUT"
 if ! printf '%s' "$STDOUT_ONLY" | grep -q '^::'; then
   pass "SABLE-m4exv: the observability line goes to stderr only — stdout carries no '::'-prefixed line"
 else
@@ -534,12 +572,12 @@ GFIX="$TMPROOT/golden-fixture"
 mkdir -p "$GFIX/.github/ci" "$GFIX/hooks/test/fixtures" "$GFIX/hooks/multi-manager"
 cp "$PROD_RUNSET"                          "$GFIX/.github/ci/shell-run-set.sh"
 cp "$PROD_MANIFEST"                        "$GFIX/.github/ci/impact-manifest.sh"
-cp "$REPO/hooks/test/lib-golden-manifest.sh" "$GFIX/hooks/test/lib-golden-manifest.sh"
-cp "$REPO/$GOLDEN_REL"                     "$GFIX/hooks/test/fixtures/"
+cp "$SOURCE_REPO/hooks/test/lib-golden-manifest.sh" "$GFIX/hooks/test/lib-golden-manifest.sh"
+cp "$SOURCE_REPO/$GOLDEN_REL"                     "$GFIX/hooks/test/fixtures/"
 # SABLE-y4nom.7.1: the anchor probe path must EXIST in this fixture —
 # absence-first DELETED semantics would otherwise route it to the full set
 # and make 9c-setup/9e vacuous.
-cp "$REPO/$ANCHOR_REL"                     "$GFIX/$ANCHOR_REL"
+cp "$SOURCE_REPO/$ANCHOR_REL"                     "$GFIX/$ANCHOR_REL"
 
 # Baseline: with every ingredient present the fixture reproduces the real
 # answers, so a difference below is attributable to the removal and not to the
@@ -620,13 +658,14 @@ fi
 # fully classified and fully present before the setup --check assertion.
 # The full-set expectation is recomputed HERE because earlier cases mutate
 # the fixture ALLOW (the m4exv orphan-suite case commits a fifth suite).
-FULL_NOW=$(bash -c "source '$REPO_DIR/.github/ci/shell-run-set.sh' 2>/dev/null; printf '%s\n' \"\${ALLOW[@]}\"" | sort)
+FULL_NOW=$(printf '%s\n' "${ALLOW[@]}" | sort)
 echo x > "$REPO_DIR/unmapped-area/something.py"
 
 # R1: an EXISTING unclassified path is an ERROR naming path + remediation —
 # exit nonzero, EMPTY stdout (no suites to certify), never the full set.
-R1_OUT=$(bash "$REPO_DIR/.github/ci/impact-manifest.sh" --select unmapped-area/something.py 2>&1 1>/dev/null); R1_RC=$?
-R1_STDOUT=$(bash "$REPO_DIR/.github/ci/impact-manifest.sh" --select unmapped-area/something.py 2>/dev/null)
+capture_select_for unmapped-area/something.py
+R1_OUT="$CAPTURED_SELECT_STDERR"; R1_RC="$CAPTURED_SELECT_RC"
+R1_STDOUT="$CAPTURED_SELECT_STDOUT"
 if [ "$R1_RC" -ne 0 ] && [ -z "$R1_STDOUT" ] \
    && printf '%s' "$R1_OUT" | grep -q 'unmapped-area/something.py' \
    && printf '%s' "$R1_OUT" | grep -qi 'ZERO_IMPACT\|zero-impact'; then
@@ -636,8 +675,9 @@ else
 fi
 
 # ZERO_IMPACT class: matched, zero suites, SCOPED notice — and never FULL.
-ZI_SEL=$(select_for zero-area/zero-doc.md)
-ZI_NOTICE=$(select_notice_for zero-area/zero-doc.md)
+capture_select_for zero-area/zero-doc.md
+ZI_SEL="$CAPTURED_SELECT_SORTED"
+ZI_NOTICE="$CAPTURED_SELECT_STDERR"
 if [ -z "$ZI_SEL" ] && printf '%s' "$ZI_NOTICE" | grep -q 'SCOPED'; then
   pass "y4nom.7.1 ZERO_IMPACT: declared zero-impact path is matched with zero suites (SCOPED, not FULL)"
 else
@@ -646,8 +686,9 @@ fi
 
 # DECLARED_BROAD class: full ALLOW set, notice names the declared-broad
 # path — FULL stays expressible without being the unknown default (G3).
-DB_SEL=$(select_for broad-area/authority.json)
-DB_NOTICE=$(select_notice_for broad-area/authority.json)
+capture_select_for broad-area/authority.json
+DB_SEL="$CAPTURED_SELECT_SORTED"
+DB_NOTICE="$CAPTURED_SELECT_STDERR"
 if [ "$DB_SEL" = "$FULL_NOW" ] && printf '%s' "$DB_NOTICE" | grep -qi 'declared-broad\|declared broad'; then
   pass "y4nom.7.1 DECLARED_BROAD: declared-broad path selects the full ALLOW set with a naming notice (G3: FULL expressible)"
 else
@@ -655,8 +696,9 @@ else
 fi
 
 # PY_OWNED class: matched, zero shell suites (python lane owns validation).
-PYO_SEL=$(select_for bin/pyowned_lib.py)
-PYO_NOTICE=$(select_notice_for bin/pyowned_lib.py)
+capture_select_for bin/pyowned_lib.py
+PYO_SEL="$CAPTURED_SELECT_SORTED"
+PYO_NOTICE="$CAPTURED_SELECT_STDERR"
 if [ -z "$PYO_SEL" ] && printf '%s' "$PYO_NOTICE" | grep -q 'SCOPED'; then
   pass "y4nom.7.1 PY_OWNED: python-owned exact entry is matched with zero shell suites"
 else
@@ -719,6 +761,9 @@ s = open(p).read()
 s = s.replace('\n  [hooks/multi-manager/hook-alpha.sh]="dual-class plant"', '')
 open(p, "w").write(s)
 PYEOF
+# The plant existed only for the fresh-process --check above and is now removed
+# byte-for-byte before another cached selector runs. The resident declarations
+# never observed it, so re-sourcing here would add work without changing state.
 
 # R3: the four reproduced escalation paths (2026-08-01) against the REAL
 # production declarations — each yields its v4.2-ledger classified plan, not
@@ -857,8 +902,8 @@ fi
 # consumer and can never honestly pin "Python: none"). One representative
 # per class through the REAL `sable-dev-check --path P --dry-run`, pinning
 # BOTH lanes so zero-shell is provably not zero-validation and vice versa.
-DEVCHECK_BIN="$REPO/bin/sable-dev-check"
-b4_plan() { ( cd "$REPO" && "$DEVCHECK_BIN" --path "$1" --dry-run 2>&1 ); }
+DEVCHECK_BIN="$SOURCE_REPO/bin/sable-dev-check"
+b4_plan() { ( cd "$SOURCE_REPO" && "$DEVCHECK_BIN" --path "$1" --dry-run 2>&1 ); }
 # Exact-set extractors: the dry-run indents each PLANNED identity on its own
 # line.  Anchor that render boundary instead of grepping any filename from the
 # merged stdout/stderr stream.  A loud stale-profile diagnostic legitimately
@@ -1003,8 +1048,9 @@ fi
 # with a ZERO row is PRESENT (the AGENTS.md class) — SCOPED-zero, never
 # DELETED->FULL. Locks the contract carve-out instead of relying on the
 # comment.
-BSL_SEL=$(select_for zero-area/broken-link.md)
-BSL_NOTICE=$(select_notice_for zero-area/broken-link.md)
+capture_select_for zero-area/broken-link.md
+BSL_SEL="$CAPTURED_SELECT_SORTED"
+BSL_NOTICE="$CAPTURED_SELECT_STDERR"
 if [ -z "$BSL_SEL" ] && printf '%s' "$BSL_NOTICE" | grep -q 'SCOPED'; then
   pass "y4nom.7.1 B1: a tracked BROKEN symlink with a ZERO row stays PRESENT (SCOPED-zero), never DELETED->FULL"
 else
@@ -1067,8 +1113,9 @@ fi
 # dominate the stale row.
 # ---------------------------------------------------------------------------
 ( cd "$REPO_DIR" && git rm -q -f bin/gamma.py && git commit -q -m "real delete" )
-R7_DEL_SEL=$(select_for bin/gamma.py)
-R7_DEL_NOTICE=$(select_notice_for bin/gamma.py)
+capture_select_for bin/gamma.py
+R7_DEL_SEL="$CAPTURED_SELECT_SORTED"
+R7_DEL_NOTICE="$CAPTURED_SELECT_STDERR"
 if [ "$R7_DEL_SEL" = "$FULL_NOW" ] && printf '%s' "$R7_DEL_NOTICE" | grep -qi 'delet'; then
   pass "y4nom.7.1 R7: REAL git rm of a COVERS-classified file — stale row cannot narrow the deletion; FULL set + deletion notice"
 else
@@ -1076,8 +1123,9 @@ else
 fi
 
 ( cd "$REPO_DIR" && git mv hooks/multi-manager/hook-alpha.sh hooks/multi-manager/hook-alpha-renamed.sh && git commit -q -m "real rename" )
-R7_REN_SEL=$(select_for hooks/multi-manager/hook-alpha.sh)
-R7_REN_NOTICE=$(select_notice_for hooks/multi-manager/hook-alpha.sh)
+capture_select_for hooks/multi-manager/hook-alpha.sh
+R7_REN_SEL="$CAPTURED_SELECT_SORTED"
+R7_REN_NOTICE="$CAPTURED_SELECT_STDERR"
 if [ "$R7_REN_SEL" = "$FULL_NOW" ] && printf '%s' "$R7_REN_NOTICE" | grep -qi 'delet'; then
   pass "y4nom.7.1 R7: REAL git mv — the vanished rename SOURCE (still COVERS/LIB_FANOUT-rowed) is the DELETED class"
 else

@@ -183,10 +183,26 @@ else
 fi
 
 # Kill-switch: SABLE_HOOK_TRACE=0 leaves the log file uncreated, but read_stdin
-# still returns the payload so the hook keeps working.
+# still returns the payload so the hook keeps working. PATH spies make the
+# disabled-path performance contract load-bearing: byte counting must not spawn
+# wc/tr when there will be no STDIN_BYTES line to write.
 U11D_LOG="$WORK/u11-disabled.log"; U11D_MARK="$WORK/u11d.mark"; U11D_CAP="$WORK/u11d.cap"
-rm -f "$U11D_LOG"
-printf '%s' '{"a":1}' | run_driver "$U11D_LOG" "$U11D_MARK" "$U11D_CAP" u11dhook SABLE_HOOK_TRACE=0 >/dev/null 2>&1
+U11D_SPY_BIN="$WORK/u11d-spy-bin"; U11D_SPY_LOG="$WORK/u11d-spy.log"
+mkdir -p "$U11D_SPY_BIN"
+cat > "$U11D_SPY_BIN/wc" <<'EOF'
+#!/usr/bin/env bash
+printf 'wc\n' >> "$SABLE_TRACE_SPY_LOG"
+printf '0\n'
+EOF
+cat > "$U11D_SPY_BIN/tr" <<'EOF'
+#!/usr/bin/env bash
+printf 'tr\n' >> "$SABLE_TRACE_SPY_LOG"
+cat
+EOF
+chmod +x "$U11D_SPY_BIN/wc" "$U11D_SPY_BIN/tr"
+rm -f "$U11D_LOG" "$U11D_SPY_LOG"
+printf '%s' '{"a":1}' | run_driver "$U11D_LOG" "$U11D_MARK" "$U11D_CAP" u11dhook \
+  SABLE_HOOK_TRACE=0 PATH="$U11D_SPY_BIN:$PATH" SABLE_TRACE_SPY_LOG="$U11D_SPY_LOG" >/dev/null 2>&1
 if [ ! -f "$U11D_LOG" ]; then
   pass "S1-U11: SABLE_HOOK_TRACE=0 disables tracing (log file never created)"
 else
@@ -196,6 +212,47 @@ if [ "$(cat "$U11D_CAP" 2>/dev/null)" = '{"a":1}' ]; then
   pass "S1-U11: SABLE_HOOK_TRACE=0 still passes the stdin payload through to the hook"
 else
   fail "S1-U11: SABLE_HOOK_TRACE=0 still passes the stdin payload through" "got: $(cat "$U11D_CAP" 2>/dev/null)"
+fi
+if [ ! -e "$U11D_SPY_LOG" ]; then
+  pass "S1-U11: SABLE_HOOK_TRACE=0 skips wc/tr byte-counting subprocesses"
+else
+  fail "S1-U11: SABLE_HOOK_TRACE=0 skips wc/tr byte-counting subprocesses" "spawned: $(tr '\n' ' ' < "$U11D_SPY_LOG" 2>/dev/null)"
+fi
+
+# The fast path must remain AFTER the single bounded stdin read. A writer leaves
+# the FIFO open after sending a partial payload; the helper's inner timeout must
+# return those bytes promptly even though tracing is disabled.
+U11F_LOG="$WORK/u11-disabled-fifo.log"; U11F_MARK="$WORK/u11f.mark"; U11F_CAP="$WORK/u11f.cap"
+U11F_FIFO="$WORK/u11-disabled.fifo"
+mkfifo "$U11F_FIFO"
+(
+  exec 3>"$U11F_FIFO"
+  printf 'partial-disabled-payload' >&3
+  sleep 5
+) &
+U11F_WRITER=$!
+if command -v timeout >/dev/null 2>&1; then
+  timeout 3 bash -c '
+    LIB="'"$LIB"'"; DRIVER="'"$DRIVER"'"; HEADLESS="'"$HEADLESS"'"
+    $HEADLESS env -u TERM SABLE_WORKER_PANE=zzz CLAUDE_AGENT_NAME=zzz \
+      SABLE_HOOK_TRACE=0 SABLE_HOOK_TRACE_STDIN_TIMEOUT=0.2 \
+      SABLE_HOOK_TRACE_LOG="'"$U11F_LOG"'" SABLE_HOOK_TRACE_SESSION_MARKER="'"$U11F_MARK"'" \
+      CAPTURE="'"$U11F_CAP"'" bash "$DRIVER" "$LIB" u11fhook <"'"$U11F_FIFO"'"
+  ' >/dev/null 2>&1
+  U11F_RC=$?
+else
+  U11F_RC=0
+fi
+kill "$U11F_WRITER" 2>/dev/null || true
+wait "$U11F_WRITER" 2>/dev/null || true
+if ! command -v timeout >/dev/null 2>&1; then
+  pass "S1-U11: disabled tracing retains bounded stdin read (SKIP: timeout unavailable)"
+elif [ "$U11F_RC" -eq 0 ] && [ "$(cat "$U11F_CAP" 2>/dev/null)" = 'partial-disabled-payload' ] \
+     && [ ! -e "$U11F_LOG" ]; then
+  pass "S1-U11: disabled tracing retains bounded stdin read and partial payload"
+else
+  fail "S1-U11: disabled tracing retains bounded stdin read and partial payload" \
+    "rc=$U11F_RC payload=$(cat "$U11F_CAP" 2>/dev/null) log=$(cat "$U11F_LOG" 2>/dev/null)"
 fi
 
 # ==========================================================================

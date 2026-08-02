@@ -474,7 +474,15 @@ detect_build_cmd() {
 }
 
 main() {
-HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
+# Read to EOF with Bash's builtin `read`, then reproduce command substitution's
+# trailing-newline normalization. This avoids spawning `cat` for every hook
+# observation; /dev/stdin cannot be slurped from a command substitution here
+# because `main` is a function and Bash gives that substitution an empty stdin.
+HOOK_INPUT=""
+IFS= read -r -d '' HOOK_INPUT || true
+while [[ "$HOOK_INPUT" == *$'\n' ]]; do
+  HOOK_INPUT="${HOOK_INPUT%$'\n'}"
+done
 
 # Identity via lib-identity.sh (SABLE-uz9.3 / SABLE-404): the gated phases fire
 # for ANY manager identity — legacy env terminals (Chuck holdout), the Lincoln
@@ -485,7 +493,8 @@ HOOK_INPUT=$(cat 2>/dev/null) || HOOK_INPUT=""
 # lane); anonymous main sessions stand down.
 sable_resolve_identity "$HOOK_INPUT"
 
-PARSED=$(printf '%s' "$HOOK_INPUT" | python3 -c "
+PRE_PUSH_FIELDS=()
+mapfile -d '' -t PRE_PUSH_FIELDS < <(printf '%s' "$HOOK_INPUT" | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -493,11 +502,20 @@ except Exception:
     d = {}
 cmd = d.get('tool_input', {}).get('command', '')
 cwd = d.get('cwd', '')
-print(f'{cwd}\n{cmd}')
-" 2>/dev/null) || exit 0
-
-CWD=$(echo "$PARSED" | sed -n '1p')
-COMMAND=$(echo "$PARSED" | sed -n '2,$p')
+# Preserve the former print -> command-substitution -> sed field semantics,
+# including multiline commands, a newline-bearing cwd, and stripped trailing
+# newlines. NUL delimiters then let Bash consume both fields without two sed
+# processes at this per-hook boundary (SABLE-y4nom.7.6).
+legacy = f'{cwd}\n{cmd}'.rstrip('\n')
+if '\n' in legacy:
+    cwd_field, command_field = legacy.split('\n', 1)
+else:
+    cwd_field, command_field = legacy, ''
+sys.stdout.write(cwd_field + '\0' + command_field + '\0')
+" 2>/dev/null)
+[ "${#PRE_PUSH_FIELDS[@]}" -eq 2 ] || exit 0
+CWD="${PRE_PUSH_FIELDS[0]}"
+COMMAND="${PRE_PUSH_FIELDS[1]}"
 
 # --- v3 worker-push deny leg (SABLE-404, locked Gaudi decision; consolidates
 # SABLE-myg). A subagent that is NOT a manager (a worker type, or an unnamed

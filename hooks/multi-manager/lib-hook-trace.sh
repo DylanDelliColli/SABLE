@@ -137,6 +137,13 @@ sable_trace_read_stdin() {
   else
     payload=$(cat 2>/dev/null) || true
   fi
+  # The kill-switch still preserves the hook's single, bounded stdin read and
+  # payload pass-through, but there is no byte count to record. Return before
+  # spawning wc/tr or entering the trace writer's (disabled) no-op path.
+  if ! _sable_trace_enabled; then
+    printf '%s' "$payload"
+    return 0
+  fi
   local bytes
   bytes=$(printf '%s' "$payload" | wc -c 2>/dev/null | tr -d ' ') || bytes=0
   [ -n "$bytes" ] || bytes=0

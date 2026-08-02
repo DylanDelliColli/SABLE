@@ -45,25 +45,96 @@ fi
 # concurrent and nested runs collision-free. The allocation seam is raced
 # directly by test-pre-push-rebase-concurrency.sh.
 TMPROOT="$(sable_pre_push_fixture_root)"
-trap 'rm -rf "$TMPROOT"' EXIT
+cleanup_pre_push_fixture() {
+  if [ -n "${SYNTHETIC_INPUT_ENCODER_PID:-}" ]; then
+    kill "$SYNTHETIC_INPUT_ENCODER_PID" 2>/dev/null || true
+    wait "$SYNTHETIC_INPUT_ENCODER_PID" 2>/dev/null || true
+  fi
+  rm -rf "$TMPROOT"
+}
+trap cleanup_pre_push_fixture EXIT
 
 PASS=0
 FAIL=0
 FAIL_NAMES=""
+ASSERT_DENY_CALLS=0
+ASSERT_CONTEXT_OUTPUT_CALLS=0
+
+# The suite sends the hook 105 synthetic JSON payloads. Starting python3 for
+# every payload was pure setup cost, but replacing json.dumps with hand-written
+# shell escaping would make quotes, control bytes, or non-ASCII values unsafe.
+# Keep one exact Python encoder alive and use NUL-delimited FIFOs: bash variables
+# cannot contain NUL, while every value they can contain (including newlines)
+# survives the protocol and is encoded by the same json.dumps implementation as
+# before. The suite is serial, so one request/response pair needs no request id.
+SYNTHETIC_INPUT_REQUEST_FIFO="$TMPROOT/synthetic-input.request"
+SYNTHETIC_INPUT_RESPONSE_FIFO="$TMPROOT/synthetic-input.response"
+SYNTHETIC_INPUT_ENCODER_TRACE="$TMPROOT/synthetic-input.trace"
+mkfifo "$SYNTHETIC_INPUT_REQUEST_FIFO" "$SYNTHETIC_INPUT_RESPONSE_FIFO"
+: > "$SYNTHETIC_INPUT_ENCODER_TRACE"
+python3 -u - "$SYNTHETIC_INPUT_REQUEST_FIFO" "$SYNTHETIC_INPUT_RESPONSE_FIFO" \
+  "$SYNTHETIC_INPUT_ENCODER_TRACE" <<'PYEOF' &
+import json
+import os
+import sys
+
+request_path, response_path, trace_path = sys.argv[1:]
+
+
+def read_field(stream):
+    value = bytearray()
+    while True:
+        byte = stream.read(1)
+        if not byte:
+            return None
+        if byte == b"\0":
+            return os.fsdecode(bytes(value))
+        value.extend(byte)
+
+
+with open(trace_path, "a", encoding="utf-8") as trace:
+    trace.write("start\n")
+    trace.flush()
+    while True:
+        with open(request_path, "rb", buffering=0) as request:
+            fields = [read_field(request) for _ in range(5)]
+        if any(field is None for field in fields):
+            continue
+        command, cwd, agent_id, agent_type, typed = fields
+        out = {"tool_input": {"command": command}, "cwd": cwd}
+        if agent_id:
+            out["agent_id"] = agent_id
+        if typed == "1" and agent_type:
+            out["agent_type"] = agent_type
+        encoded = json.dumps(out)
+        trace.write("request\n")
+        trace.flush()
+        with open(response_path, "w", encoding="utf-8") as response:
+            response.write(encoded + "\n")
+PYEOF
+SYNTHETIC_INPUT_ENCODER_PID=$!
+
+encode_synthetic_input() {
+  # $1 = command, $2 = cwd, $3 = agent_id, $4 = agent_type, $5 = typed flag
+  printf '%s\0%s\0%s\0%s\0%s\0' "$1" "$2" "$3" "$4" "$5" \
+    > "$SYNTHETIC_INPUT_REQUEST_FIFO"
+  IFS= read -r SYNTHETIC_INPUT_JSON < "$SYNTHETIC_INPUT_RESPONSE_FIFO"
+  printf '%s\n' "$SYNTHETIC_INPUT_JSON"
+}
 
 make_input() {
   # $1 = command, $2 = cwd, $3 (optional) = agent_id
-  python3 -c "
-import json, sys
-cmd = sys.argv[1]
-cwd = sys.argv[2]
-agent_id = sys.argv[3] if len(sys.argv) > 3 else ''
-out = {'tool_input': {'command': cmd}, 'cwd': cwd}
-if agent_id:
-    out['agent_id'] = agent_id
-print(json.dumps(out))
-" "$1" "$2" "${3:-}"
+  encode_synthetic_input "$1" "$2" "${3:-}" "" 0
 }
+
+# Load-bearing escaping plant: this request crosses every boundary that makes a
+# pure-shell JSON encoder risky. The exact expected json.dumps result is checked
+# with the one-process/request counts at suite end.
+SYNTHETIC_INPUT_ESCAPE_ACTUAL=$(make_input \
+  $'git push "snowman ☃"\nnext\\tail\tend' \
+  $'/tmp/space dir/é' \
+  $'agent"id\\tail\n')
+SYNTHETIC_INPUT_ESCAPE_EXPECTED='{"tool_input": {"command": "git push \"snowman \u2603\"\nnext\\tail\tend"}, "cwd": "/tmp/space dir/\u00e9", "agent_id": "agent\"id\\tail\n"}'
 
 run_hook() {
   # $1 = env prefix, $2 = command, $3 = cwd, $4 = optional agent_id
@@ -97,8 +168,9 @@ assert_allow() {
 assert_deny() {
   local name="$1" env="$2" cmd="$3" cwd="$4" expect="$5" aid="${6:-}"
   local out
+  ASSERT_DENY_CALLS=$((ASSERT_DENY_CALLS + 1))
   out=$(run_hook "$env" "$cmd" "$cwd" "$aid")
-  if echo "$out" | grep -q '"permissionDecision": "deny"' && echo "$out" | grep -qF "$expect"; then
+  if [[ "$out" == *'"permissionDecision": "deny"'* && "$out" == *"$expect"* ]]; then
     PASS=$((PASS+1))
     echo "PASS: $name"
   else
@@ -114,7 +186,17 @@ assert_context() {
   local name="$1" env="$2" cmd="$3" cwd="$4" expect="$5"
   local out
   out=$(run_hook "$env" "$cmd" "$cwd")
-  if echo "$out" | grep -q '"additionalContext"' && echo "$out" | grep -qF "$expect"; then
+  assert_context_output "$name" "$out" "$expect"
+}
+
+assert_context_output() {
+  # <name> <already-captured-hook-output> <expected text>. Several assertions
+  # intentionally inspect different claims in one immutable exact-object
+  # verdict; reuse that observation instead of rebuilding/revalidating the
+  # same detached worktree for each property (SABLE-y4nom.7.6).
+  local name="$1" out="$2" expect="$3"
+  ASSERT_CONTEXT_OUTPUT_CALLS=$((ASSERT_CONTEXT_OUTPUT_CALLS + 1))
+  if [[ "$out" == *'"additionalContext"'* && "$out" == *"$expect"* ]]; then
     PASS=$((PASS+1))
     echo "PASS: $name"
   else
@@ -170,7 +252,39 @@ EOF
 MGR_ENV="CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager"
 
 # Test 1: ignores non-git-push commands
+INITIAL_PARSE_TOOL_TRACE="$TMPROOT/initial-parse-tools.trace"
+INITIAL_PARSE_SPY_DIR="$TMPROOT/initial-parse-spies"
+mkdir -p "$INITIAL_PARSE_SPY_DIR"
+: > "$INITIAL_PARSE_TOOL_TRACE"
+REAL_CAT="$(command -v cat)"
+REAL_SED="$(command -v sed)"
+cat > "$INITIAL_PARSE_SPY_DIR/cat" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' cat >> "$INITIAL_PARSE_TOOL_TRACE"
+exec "$REAL_CAT" "\$@"
+EOF
+cat > "$INITIAL_PARSE_SPY_DIR/sed" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' sed >> "$INITIAL_PARSE_TOOL_TRACE"
+exec "$REAL_SED" "\$@"
+EOF
+chmod +x "$INITIAL_PARSE_SPY_DIR/cat" "$INITIAL_PARSE_SPY_DIR/sed"
+ORIGINAL_TEST_PATH="$PATH"
+PATH="$INITIAL_PARSE_SPY_DIR:$PATH"
 assert_allow "ignores non-git-push" "$MGR_ENV" "git status" "/tmp"
+PATH="$ORIGINAL_TEST_PATH"
+INITIAL_PARSE_TOOL_CALLS=0
+while IFS= read -r tool_call; do
+  [ -n "$tool_call" ] && INITIAL_PARSE_TOOL_CALLS=$((INITIAL_PARSE_TOOL_CALLS + 1))
+done < "$INITIAL_PARSE_TOOL_TRACE"
+if [ "$INITIAL_PARSE_TOOL_CALLS" -eq 0 ]; then
+  PASS=$((PASS+1))
+  echo "PASS: initial hook-input read and field extraction use builtins plus one JSON boundary (no cat/sed processes)"
+else
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  initial hook-input parsing spawned $INITIAL_PARSE_TOOL_CALLS cat/sed process(es): $(<"$INITIAL_PARSE_TOOL_TRACE")"
+  echo "FAIL: initial hook-input read and field extraction use builtins plus one JSON boundary (no cat/sed processes)"
+fi
 
 # Test 2: ignores when no manager identity
 assert_allow "no manager identity → no-op" "" "git push" "/tmp"
@@ -435,14 +549,7 @@ YAML
 
 # make_typed_input <cmd> <cwd> <agent_id> <agent_type>
 make_typed_input() {
-  python3 -c "
-import json, sys
-cmd, cwd, aid, atype = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-out = {'tool_input': {'command': cmd}, 'cwd': cwd}
-if aid: out['agent_id'] = aid
-if atype: out['agent_type'] = atype
-print(json.dumps(out))
-" "$1" "$2" "$3" "$4"
+  encode_synthetic_input "$1" "$2" "$3" "$4" 1
 }
 
 # run_typed <env_prefix> <cmd> <cwd> <agent_id> <agent_type>
@@ -1317,8 +1424,9 @@ fi
 
 # Accepted forms (positive controls): each pinned form passes on a clean
 # checkout of main whose committed suite passes.
-assert_context "j90ba accepted form: bare 'git push'" \
-  "$J90_ENV" "git push" "$J90_REPO" "all phases passed"
+J90_BARE_PUSH_OUT=$(run_hook "$J90_ENV" "git push" "$J90_REPO")
+assert_context_output "j90ba accepted form: bare 'git push'" \
+  "$J90_BARE_PUSH_OUT" "all phases passed"
 assert_context "j90ba accepted form: 'git push origin main'" \
   "$J90_ENV" "git push origin main" "$J90_REPO" "all phases passed"
 assert_context "j90ba accepted form: 'git push -u origin main'" \
@@ -1330,14 +1438,14 @@ assert_context "j90ba accepted form: 'git push origin HEAD:refs/heads/main'" \
 # base object — LITERAL values, not presence-only.
 J90_MAIN_SHA=$(git -C "$J90_REPO" rev-parse HEAD)
 J90_BASE_SHA=$(git -C "$J90_REPO" rev-parse origin/main)
-assert_context "j90ba named verdict: green names the final object" \
-  "$J90_ENV" "git push" "$J90_REPO" "final object $J90_MAIN_SHA"
-assert_context "j90ba named verdict: green names the exact source ref" \
-  "$J90_ENV" "git push" "$J90_REPO" "source ref 'HEAD'"
-assert_context "j90ba named verdict: green names the destination" \
-  "$J90_ENV" "git push" "$J90_REPO" "destination 'main'"
-assert_context "j90ba named verdict: green names the exact base object and base ref" \
-  "$J90_ENV" "git push" "$J90_REPO" "base object $J90_BASE_SHA (origin/main)"
+assert_context_output "j90ba named verdict: green names the final object" \
+  "$J90_BARE_PUSH_OUT" "final object $J90_MAIN_SHA"
+assert_context_output "j90ba named verdict: green names the exact source ref" \
+  "$J90_BARE_PUSH_OUT" "source ref 'HEAD'"
+assert_context_output "j90ba named verdict: green names the destination" \
+  "$J90_BARE_PUSH_OUT" "destination 'main'"
+assert_context_output "j90ba named verdict: green names the exact base object and base ref" \
+  "$J90_BARE_PUSH_OUT" "base object $J90_BASE_SHA (origin/main)"
 
 # Rebase-SHA-change: origin/main advances beneath a worker branch; phase 1
 # rebases it, and the verdict must name the POST-rebase final object — never
@@ -1616,10 +1724,11 @@ git clone -q "$J90DEP_BARE" "$J90DEP" 2>/dev/null
   echo probe > node_modules/gate-probe
   echo stray > stray-source.txt
 )
-assert_context "j90ba dependency bridge: ignored node_modules is bridged into the gate worktree while untracked source stays excluded" \
-  "$J90_ENV" "git push" "$J90DEP" "all phases passed"
-assert_context "j90ba dependency bridge: the verdict names what was bridged" \
-  "$J90_ENV" "git push" "$J90DEP" "bridged ignored dependency dir(s): node_modules"
+J90DEP_OUT=$(run_hook "$J90_ENV" "git push" "$J90DEP")
+assert_context_output "j90ba dependency bridge: ignored node_modules is bridged into the gate worktree while untracked source stays excluded" \
+  "$J90DEP_OUT" "all phases passed"
+assert_context_output "j90ba dependency bridge: the verdict names what was bridged" \
+  "$J90DEP_OUT" "bridged ignored dependency dir(s): node_modules"
 rm -rf "$J90DEP_BARE" "$J90DEP"
 
 # Unscoped control: a repo with NO explicit integration config is still
@@ -1782,6 +1891,38 @@ ve2_fixture "sleep 30"
 assert_deny "y4nom.7.2: the 124 remediation teaches sable-dev-check --publish-cost-profile" \
   "$VE2_ENV" "git push" "$VE2_REPO" "publish-cost-profile"
 rm -rf "$VE2_BARE" "$VE2_REPO"
+
+# The escaping plant is one request in addition to the suite's 105 real hook
+# executions. Pinning one encoder start and all 106 serviced requests makes the
+# optimization load-bearing: restoring either per-call python3 implementation,
+# or bypassing the shared encoder for one case, fails this control.
+SYNTHETIC_INPUT_ENCODER_STARTS=$(grep -c '^start$' "$SYNTHETIC_INPUT_ENCODER_TRACE")
+SYNTHETIC_INPUT_ENCODER_REQUESTS=$(grep -c '^request$' "$SYNTHETIC_INPUT_ENCODER_TRACE")
+if [ "$SYNTHETIC_INPUT_ESCAPE_ACTUAL" = "$SYNTHETIC_INPUT_ESCAPE_EXPECTED" ] \
+   && [ "$SYNTHETIC_INPUT_ENCODER_STARTS" -eq 1 ] \
+   && [ "$SYNTHETIC_INPUT_ENCODER_REQUESTS" -eq 106 ]; then
+  PASS=$((PASS+1))
+  echo "PASS: synthetic-input encoder preserves exact JSON escaping and serves all 106 payloads from one python3 process"
+else
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  synthetic-input encoder reuse/escaping (starts=$SYNTHETIC_INPUT_ENCODER_STARTS requests=$SYNTHETIC_INPUT_ENCODER_REQUESTS actual=$SYNTHETIC_INPUT_ESCAPE_ACTUAL)"
+  echo "FAIL: synthetic-input encoder preserves exact JSON escaping and serves all 106 payloads from one python3 process"
+fi
+
+# The two high-volume fixed-substring assertion helpers execute for nearly
+# every guarded fixture. Keep their matching in Bash: restoring echo|grep
+# pipelines would add hundreds of avoidable processes to this one suite.
+ASSERT_MATCH_HELPERS="$(declare -f assert_deny assert_context_output)"
+if [ "$ASSERT_DENY_CALLS" -gt 0 ] \
+   && [ "$ASSERT_CONTEXT_OUTPUT_CALLS" -gt 0 ] \
+   && [[ "$ASSERT_MATCH_HELPERS" != *grep* ]]; then
+  PASS=$((PASS+1))
+  echo "PASS: high-volume verdict assertions use Bash fixed-substring matching (no grep pipelines)"
+else
+  FAIL=$((FAIL+1))
+  FAIL_NAMES="$FAIL_NAMES\n  verdict assertion helper structure (deny=$ASSERT_DENY_CALLS context=$ASSERT_CONTEXT_OUTPUT_CALLS)"
+  echo "FAIL: high-volume verdict assertions use Bash fixed-substring matching (no grep pipelines)"
+fi
 
 # ---------- Summary ----------
 

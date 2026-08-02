@@ -34,6 +34,39 @@ tmux_spawn_() { sable_tmux_spawn -L "$SOCK" "$@"; }
 cleanup() { tmux_ kill-server >/dev/null 2>&1; rm -rf "$REC"; [ -n "$SCRATCH_BEADS_DIR" ] && rm -rf "$SCRATCH_BEADS_DIR" 2>/dev/null || true; }
 trap cleanup EXIT
 
+# Fixture transitions are event-driven, with a generous deadline for loaded CI
+# hosts. The short sleep is only the polling cadence; no case earns correctness
+# merely by waiting an assumed amount of time.
+READINESS_TRACE="$REC/readiness-events"
+: > "$READINESS_TRACE"
+READINESS_POLL_INTERVAL=0.05
+READINESS_TIMEOUT=5
+await_event() {
+  # $1 = trace label, $2 = predicate function, remaining args = predicate args
+  local label="$1" predicate="$2" deadline
+  shift 2
+  deadline=$((SECONDS + READINESS_TIMEOUT))
+  until "$predicate" "$@"; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "FATAL: timed out waiting for fixture event: $label" >&2
+      return 1
+    fi
+    sleep "$READINESS_POLL_INTERVAL"
+  done
+  printf '%s\n' "$label" >> "$READINESS_TRACE"
+}
+require_event() {
+  await_event "$@" || exit 2
+}
+file_exists() { [ -e "$1" ]; }
+pane_contains() { tmux_ capture-pane -t "$1" -p 2>/dev/null | grep -qF "$2"; }
+pane_command_is() { [ "$(tmux_ display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null)" = "$2" ]; }
+pane_count_at_least() {
+  local count
+  count="$(tmux_ list-panes -t "$1" -F '#{pane_id}' 2>/dev/null | grep -c .)"
+  [ "${count:-0}" -ge "$2" ]
+}
+
 # This suite is itself commonly run FROM a real SABLE pane (a worker or
 # manager dispatched to verify it, per the normal workflow) whose shell
 # carries its own CLAUDE_AGENT_NAME / SABLE_WORKER_PANE / SABLE_BEAD. tmux
@@ -62,14 +95,20 @@ export SABLE_MSG_READY_TIMEOUT="5"
 # own CWD-derivation path.
 export SABLE_TMUX_SESSION="w"
 
-# A stand-in "TUI" pane: shows nothing (not ready) for BOOT_DELAY seconds, then
-# a bare `❯ ` prompt line -- exactly the shape sable_pane_lib.pane_ready looks
-# for. Each submitted line is appended to $REC_FILE so we can assert on what
-# actually landed as a turn (not just that send-keys exited 0).
+# A stand-in "TUI" pane: shows nothing while its boot gate is closed, records
+# the interrupt byte that proves sable-msg contacted it while still unready,
+# then renders a bare `❯ ` prompt -- exactly the shape pane_ready looks for.
+# Each submitted line is appended to $REC_FILE so we can assert on what actually
+# landed as a turn (not just that send-keys exited 0).
 STAND_IN="$REC/stand-in.sh"
 cat > "$STAND_IN" <<'SCRIPT'
 #!/usr/bin/env bash
-sleep "${BOOT_DELAY:-0}"
+: > "$BOOT_STARTED"
+while [ ! -e "$BOOT_RELEASE" ]; do
+  if IFS= read -r -N 1 -t 0.05 _junk; then
+    : > "$BOOT_CONTACT"
+  fi
+done
 # Drain + scroll away anything sent while booting (e.g. --interrupt's Escape):
 # a real TUI redraws its own UI once ready rather than leaving pre-ready
 # keystrokes' raw tty-echo bleeding into the first prompt line, which would
@@ -86,13 +125,25 @@ done
 SCRIPT
 chmod +x "$STAND_IN"
 
-# --- 1) manager pane, booting for 2s: --interrupt must not drop the turn ----
+# --- 1) manager pane, held behind a boot gate: --interrupt must not drop it --
+BOOT_STARTED="$REC/optimus.started"
+BOOT_RELEASE="$REC/optimus.release"
+BOOT_CONTACT="$REC/optimus.contacted"
 tmux_spawn_ new-session -d -s w -x 200 -y 50
-tmux_spawn_ respawn-pane -k -t w "REC_FILE=$REC/optimus.txt BOOT_DELAY=2 $STAND_IN"
+tmux_spawn_ respawn-pane -k -t w \
+  "REC_FILE=$REC/optimus.txt BOOT_STARTED=$BOOT_STARTED BOOT_RELEASE=$BOOT_RELEASE BOOT_CONTACT=$BOOT_CONTACT $STAND_IN"
 tmux_ set-option -p -t w @sable_role optimus
-sleep 0.2   # still booting at this point
+require_event boot-process-started file_exists "$BOOT_STARTED"
 
-if CLAUDE_AGENT_NAME=lincoln python3 "$BIN/sable-msg" optimus "cap in force" --interrupt >/dev/null 2>&1; then
+CLAUDE_AGENT_NAME=lincoln python3 "$BIN/sable-msg" optimus "cap in force" --interrupt >/dev/null 2>&1 &
+BOOT_MSG_PID=$!
+# The stand-in can create this only by receiving input while BOOT_RELEASE is
+# absent, so the transition is proved rather than inferred from elapsed time.
+require_event boot-pane-contacted-before-release file_exists "$BOOT_CONTACT"
+: > "$BOOT_RELEASE"
+BOOT_MSG_RC=0
+wait "$BOOT_MSG_PID" || BOOT_MSG_RC=$?
+if [ "$BOOT_MSG_RC" -eq 0 ]; then
   pass "sable-msg --interrupt into a booting pane returns ok"
 else
   fail "sable-msg --interrupt into a booting pane returns ok"
@@ -116,7 +167,7 @@ wpane="$(tmux_ list-panes -a -F '#{pane_id} #{window_name}' | awk '$2=="worker"{
 tmux_ set-option -p -t "$wpane" @sable_role worker
 tmux_ set-option -p -t "$wpane" @sable_bead "$BEAD"
 tmux_ set-option -p -t "$wpane" @sable_status running
-sleep 0.3
+require_event worker-shell-ready pane_command_is "$wpane" bash
 
 if CLAUDE_AGENT_NAME=optimus python3 "$BIN/sable-msg" "$BEAD" "hold the tree claim" --bead >/dev/null 2>&1; then
   pass "sable-msg --bead resolves a worker pane by @sable_bead (SABLE-6izz)"
@@ -170,21 +221,24 @@ tmux_ set-option -t "$SESS_A" @sable_repo "$REPO_A"
 tmux_ set-option -p -t "$SESS_A" @sable_role tarzan
 tmux_spawn_ new-session -d -s "$SESS_B" -x 200 -y 50 -c "$REPO_B" "PS1='> ' bash --noprofile --norc"
 tmux_ set-option -t "$SESS_B" @sable_repo "$REPO_B"
-sleep 0.3
+require_event repo-a-manager-shell-ready pane_command_is "$SESS_A" bash
+require_event repo-b-manager-shell-ready pane_command_is "$SESS_B" bash
 
 tarzan_pane="$(tmux_ list-panes -t "$SESS_A" -F '#{pane_id}')"
 # a second pane in alpha's OWN session, shelled into beta's worktree — exactly
 # the mismatched-CWD shape a cross-repo worker dispatch produces.
 tmux_spawn_ split-window -t "$SESS_A" -d -c "$REPO_B" "PS1='> ' bash --noprofile --norc"
-sleep 0.3
+require_event cross-repo-worker-pane-created pane_count_at_least "$SESS_A" 2
 worker_pane="$(tmux_ list-panes -t "$SESS_A" -F '#{pane_id}' | grep -v "^$tarzan_pane$")"
 tmux_ set-option -p -t "$worker_pane" @sable_role worker
+require_event cross-repo-worker-shell-ready pane_command_is "$worker_pane" bash
 
 # sent FROM the worker pane itself via send-keys, so $TMUX_PANE is real (set
 # by tmux for that pane's own bash, not injected) even though CWD is beta.
+CROSS_REPO_DONE="$REC/cross-repo.done"
 tmux_ send-keys -t "$worker_pane" \
-  "unset SABLE_TMUX_SESSION; SABLE_TMUX_SOCKET=$SOCK python3 $BIN/sable-msg tarzan 'cross-repo-ssd8-check' --from worker" Enter
-sleep 1.5
+  "unset SABLE_TMUX_SESSION; SABLE_TMUX_SOCKET=$SOCK python3 $BIN/sable-msg tarzan 'cross-repo-ssd8-check' --from worker; : > '$CROSS_REPO_DONE'" Enter
+require_event cross-repo-send-completed file_exists "$CROSS_REPO_DONE"
 
 acap="$(tmux_ capture-pane -t "$SESS_A" -p)"
 bcap="$(tmux_ capture-pane -t "$SESS_B" -p)"
@@ -233,7 +287,7 @@ chmod +x "$BUSY_TUI"
 tmux_spawn_ new-window -d -t w: -n mgr2 "REC_FILE=$REC/tarzan.txt $BUSY_TUI"
 mpane="$(tmux_ list-panes -a -F '#{pane_id} #{window_name}' | awk '$2=="mgr2"{print $1; exit}')"
 tmux_ set-option -p -t "$mpane" @sable_role tarzan
-sleep 0.3   # send within the fresh-spawn window, while the turn is busy
+require_event busy-turn-rendered pane_contains "$mpane" "Running the turn (esc to interrupt)"
 
 if CLAUDE_AGENT_NAME=lincoln python3 "$BIN/sable-msg" tarzan "fresh spawn wake" --interrupt >/dev/null 2>&1; then
   pass "sable-msg --interrupt lands on a freshly spawned mid-turn pane (SABLE-m6is)"
@@ -265,7 +319,7 @@ if command -v bd >/dev/null 2>&1; then
   tmux_spawn_ new-window -d -t w: -n stuck 'sleep 60'
   stuckpane="$(tmux_ list-panes -a -F '#{pane_id} #{window_name}' | awk '$2=="stuck"{print $1; exit}')"
   tmux_ set-option -p -t "$stuckpane" @sable_role chuck
-  sleep 0.2
+  require_event never-ready-pane-running pane_command_is "$stuckpane" sleep
 
   # Single-sourced so the fixture body the probe SENDS and the body the
   # attribution check LOOKS FOR can never drift apart.
@@ -429,6 +483,34 @@ PY
   fi
 
   rm -rf "$PRETEND_LIVE_DIR" 2>/dev/null || true
+fi
+
+# Load-bearing structural control: every former timing assumption must leave a
+# named readiness event, and none of the removed 0.2/0.3/1.5-second fixture
+# sleeps may return. The never-ready fallback event exists only where bd does.
+EXPECTED_READINESS_EVENTS=$(printf '%s\n' \
+  boot-process-started \
+  boot-pane-contacted-before-release \
+  worker-shell-ready \
+  repo-a-manager-shell-ready \
+  repo-b-manager-shell-ready \
+  cross-repo-worker-pane-created \
+  cross-repo-worker-shell-ready \
+  cross-repo-send-completed \
+  busy-turn-rendered)
+if command -v bd >/dev/null 2>&1; then
+  EXPECTED_READINESS_EVENTS="$EXPECTED_READINESS_EVENTS
+never-ready-pane-running"
+fi
+ACTUAL_READINESS_EVENTS=$(sort "$READINESS_TRACE")
+EXPECTED_READINESS_EVENTS=$(printf '%s\n' "$EXPECTED_READINESS_EVENTS" | sort)
+LEGACY_FIXED_WAITS=$(grep -Ec '^[[:space:]]*sleep (0[.]2|0[.]3|1[.]5)([[:space:]#]|$)' "$0" || true)
+if [ "$ACTUAL_READINESS_EVENTS" = "$EXPECTED_READINESS_EVENTS" ] \
+   && [ "$LEGACY_FIXED_WAITS" -eq 0 ]; then
+  pass "fixture readiness is event-driven for every former fixed-wait transition (no legacy 0.2/0.3/1.5s sleeps)"
+else
+  fail "fixture readiness is event-driven for every former fixed-wait transition" \
+    "legacy_sleeps=$LEGACY_FIXED_WAITS expected=[$EXPECTED_READINESS_EVENTS] actual=[$ACTUAL_READINESS_EVENTS]"
 fi
 
 echo
