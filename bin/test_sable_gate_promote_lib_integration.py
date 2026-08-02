@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -530,6 +531,105 @@ def test_stamp_impact_verdict_augments_the_end_record_in_place(isolated_lock):
     report = promote_lib.impact_tier_phase_report(".")
     assert report["tiers_with_phase_data"] == 1
     assert report["legacy_records_excluded"] == 0
+
+
+def test_stamp_impact_verdict_cannot_erase_a_concurrent_window_append(
+        isolated_lock, monkeypatch):
+    """Regression for SABLE-y4nom.7.8's observed lost-update schedule.
+
+    The impact-tier lock is deliberately disabled by the serialization suite's
+    negative control.  Pause verdict augmentation after its journal read, then
+    append another tier's record before allowing the rewrite to continue.  The
+    old read_text/write_text pair erased that append; journal-local locking must
+    make the append wait and preserve both records independently of the tier
+    serialization policy.
+    """
+    tree_sha = "d" * 40
+    other_tree = "e" * 40
+    promote_lib._stamp_impact_window(".", "start", tree_sha, 0.0)
+    promote_lib._stamp_impact_window(".", "end", tree_sha, 0.0,
+                                     phases=[{"name": "pytest", "seconds": 1.0}])
+
+    log_path = isolated_lock / "windows.jsonl"
+    real_read_text = Path.read_text
+    verdict_read = threading.Event()
+    allow_rewrite = threading.Event()
+    append_attempted = threading.Event()
+    append_finished = threading.Event()
+    failures = []
+
+    def pause_after_verdict_read(path, *args, **kwargs):
+        text = real_read_text(path, *args, **kwargs)
+        if path == log_path and threading.current_thread().name == "verdict-writer":
+            verdict_read.set()
+            if not allow_rewrite.wait(timeout=5):
+                raise AssertionError("test failed to release the paused verdict writer")
+        return text
+
+    def augment_verdict():
+        try:
+            promote_lib._stamp_impact_verdict(".", tree_sha, promote_lib.IMPACT_GREEN)
+        except BaseException as exc:  # surface thread failures in the main test
+            failures.append(exc)
+
+    def append_other_window():
+        try:
+            append_attempted.set()
+            promote_lib._stamp_impact_window(".", "start", other_tree, 0.0)
+            append_finished.set()
+        except BaseException as exc:  # surface thread failures in the main test
+            failures.append(exc)
+
+    monkeypatch.setattr(Path, "read_text", pause_after_verdict_read)
+    verdict_thread = threading.Thread(target=augment_verdict, name="verdict-writer")
+    verdict_thread.start()
+    assert verdict_read.wait(timeout=5), "verdict writer never reached the controlled race"
+
+    append_thread = threading.Thread(target=append_other_window, name="window-appender")
+    append_thread.start()
+    assert append_attempted.wait(timeout=5)
+    # On the fixed implementation the append blocks here on the journal's own
+    # lock.  On the old implementation it completes here and is then erased by
+    # the stale rewrite below — the exact production failure this test plants.
+    append_finished.wait(timeout=0.25)
+    allow_rewrite.set()
+    verdict_thread.join(timeout=5)
+    append_thread.join(timeout=5)
+
+    assert not verdict_thread.is_alive() and not append_thread.is_alive()
+    assert failures == []
+    rows = [json.loads(line) for line in real_read_text(log_path).splitlines() if line]
+    assert [(row["event"], row["tree"]) for row in rows] == [
+        ("start", tree_sha[:12]),
+        ("end", tree_sha[:12]),
+        ("start", other_tree[:12]),
+    ]
+    assert rows[1]["verdict"] == promote_lib.IMPACT_GREEN
+    assert rows[1]["writer_identity"] == "gate"
+
+
+def test_stamp_impact_verdict_finds_its_end_behind_a_later_tier_record(isolated_lock):
+    """A concurrent append may already be durable before augmentation starts.
+
+    Journal locking prevents lost writes, but the augmenter must also find its
+    own completed window rather than silently returning whenever another tier's
+    record is now last.
+    """
+    tree_sha = "f" * 40
+    later_tree = "1" * 40
+    promote_lib._stamp_impact_window(".", "start", tree_sha, 0.0)
+    promote_lib._stamp_impact_window(".", "end", tree_sha, 0.0,
+                                     phases=[{"name": "setup", "seconds": 0.5}])
+    promote_lib._stamp_impact_window(".", "start", later_tree, 0.0)
+
+    promote_lib._stamp_impact_verdict(".", tree_sha, promote_lib.IMPACT_GREEN)
+
+    log_path = isolated_lock / "windows.jsonl"
+    rows = [json.loads(line) for line in log_path.read_text().splitlines() if line]
+    assert [row["event"] for row in rows] == ["start", "end", "start"]
+    assert rows[1]["verdict"] == promote_lib.IMPACT_GREEN
+    assert rows[1]["writer_identity"] == "gate"
+    assert "verdict" not in rows[2]
 
 
 def test_stamp_impact_verdict_is_a_noop_when_there_is_no_end_line_to_augment():

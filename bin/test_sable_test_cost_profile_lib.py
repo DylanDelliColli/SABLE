@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -29,6 +30,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sable_test_cost_profile_lib as profile_lib  # noqa: E402
+
+
+_REAL_TOOL_IDENTITY = profile_lib._tool_identity
+_REAL_PYTEST11_PLUGINS = profile_lib._pytest11_plugins
+_REPO_TEMPLATE: Path | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -54,8 +60,7 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def make_repo(tmp_path: Path, name: str = "repo") -> Path:
-    repo = tmp_path / name
+def _initialize_repo(repo: Path) -> None:
     (repo / ".github/ci").mkdir(parents=True)
     (repo / "hooks/test").mkdir(parents=True)
     (repo / "bin").mkdir()
@@ -70,7 +75,104 @@ def make_repo(tmp_path: Path, name: str = "repo") -> Path:
     _git(repo, "config", "user.name", "t")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "base")
+
+
+def make_repo(tmp_path: Path, name: str = "repo") -> Path:
+    repo = tmp_path / name
+    if _REPO_TEMPLATE is None:
+        _initialize_repo(repo)
+    else:
+        shutil.copytree(_REPO_TEMPLATE, repo)
     return repo
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _committed_repo_template(tmp_path_factory):
+    """One real committed source object, copied into isolated per-test repos."""
+    global _REPO_TEMPLATE
+    template = tmp_path_factory.mktemp("cost-profile-repo-template") / "repo"
+    _initialize_repo(template)
+    _REPO_TEMPLATE = template
+    try:
+        yield
+    finally:
+        _REPO_TEMPLATE = None
+
+
+@pytest.fixture(scope="session")
+def _static_fingerprint_identity():
+    """Host identities are immutable during one module run; probe them once."""
+    return {
+        "tools": {
+            name: _REAL_TOOL_IDENTITY(name)
+            for name in ("bd", "dolt", "tmux", "git")
+        },
+        "plugins": _REAL_PYTEST11_PLUGINS(),
+    }
+
+
+@pytest.fixture(autouse=True)
+def _reuse_static_fingerprint_identity(monkeypatch, _static_fingerprint_identity):
+    snapshot = _static_fingerprint_identity
+    monkeypatch.setattr(
+        profile_lib,
+        "_tool_identity",
+        lambda name: dict(snapshot["tools"][name]),
+    )
+    monkeypatch.setattr(
+        profile_lib,
+        "_pytest11_plugins",
+        lambda: [list(record) for record in snapshot["plugins"]],
+    )
+
+
+def test_fixture_reuses_one_committed_template_without_sharing_mutation(
+    tmp_path, monkeypatch,
+):
+    """Per-test repos stay real and independent, but repeated cases must not
+    pay another git-init/config/add/commit process tree after session setup."""
+    real_run = subprocess.run
+    init_calls = []
+
+    def recording_run(argv, *args, **kwargs):
+        if list(argv[:2]) == ["git", "init"]:
+            init_calls.append(list(argv))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    left = make_repo(tmp_path, "left")
+    right = make_repo(tmp_path, "right")
+
+    assert init_calls == []
+    (left / "left-only.txt").write_text("left\n")
+    _git(left, "add", "left-only.txt")
+    _git(left, "commit", "-qm", "left-only")
+    assert not (right / "left-only.txt").exists()
+    assert _git(left, "rev-parse", "HEAD") != _git(right, "rev-parse", "HEAD")
+
+
+def test_publish_cases_reuse_the_session_static_tool_identity(
+    tmp_path, monkeypatch,
+):
+    """Publisher protocol cases must not re-spawn four immutable version
+    probes for every pre/post fingerprint; dedicated tests retain real probes."""
+    repo = make_repo(tmp_path)
+    real_run = subprocess.run
+    version_probes = []
+
+    def recording_run(argv, *args, **kwargs):
+        command = [str(part) for part in argv]
+        name = Path(command[0]).name if command else ""
+        if name in profile_lib._TOOL_VERSION_ARGS \
+                and command[1:] == profile_lib._TOOL_VERSION_ARGS[name]:
+            version_probes.append(command)
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    profile_lib.publish(repo, runner=fake_producer_runner())
+    profile_lib.publish(repo, runner=fake_producer_runner())
+
+    assert version_probes == []
 
 
 PY_REPORT = {
@@ -172,8 +274,13 @@ def test_publish_provenance_records_argv_arrays_head_and_durations(tmp_path):
     assert "source_sha" not in json.dumps(profile["fingerprint"])
 
 
-def test_fingerprint_carries_resolved_identities_and_catalog(tmp_path):
-    import shutil
+def test_fingerprint_carries_resolved_identities_and_catalog(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(profile_lib, "_tool_identity", _REAL_TOOL_IDENTITY)
+    monkeypatch.setattr(
+        profile_lib, "_pytest11_plugins", _REAL_PYTEST11_PLUGINS,
+    )
     repo = make_repo(tmp_path)
     fp = profile_lib.compute_fingerprint(repo)
     assert fp["python_executable"] == sys.executable
@@ -805,11 +912,13 @@ def test_tool_version_argvs_are_tool_specific():
     }
 
 
-def test_present_tool_versions_are_real_identities_not_error_strings(tmp_path):
+def test_present_tool_versions_are_real_identities_not_error_strings(
+    tmp_path, monkeypatch,
+):
     """Real-host discriminator: every PRESENT tool's recorded version must
     carry a digit — 'unknown option' error strings do not — so this cannot
     pass by key/path presence."""
-    import shutil
+    monkeypatch.setattr(profile_lib, "_tool_identity", _REAL_TOOL_IDENTITY)
     repo = make_repo(tmp_path)
     fp = profile_lib.compute_fingerprint(repo)
     for tool in ("bd", "dolt", "tmux", "git"):
@@ -829,6 +938,7 @@ def test_present_tool_with_failing_version_probe_refuses_fingerprint(
     fake_dolt.write_text("#!/usr/bin/env bash\necho 'unknown option' >&2\nexit 1\n")
     fake_dolt.chmod(0o755)
     monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+    monkeypatch.setattr(profile_lib, "_tool_identity", _REAL_TOOL_IDENTITY)
     repo = make_repo(tmp_path)
     with pytest.raises(profile_lib.ProfilePublishError, match="dolt"):
         profile_lib.compute_fingerprint(repo)

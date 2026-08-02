@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded local broad-validation sampler (SABLE-y4nom.7.4/.7.5).
+"""Bounded local broad-validation sampler for an explicit active bead.
 
 This command MEASURES serial/-n2/-n4 behavior under one broad-seat lease.  It
 does not edit any normal validation command and never chooses ``-n auto``.
@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import functools
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -32,7 +33,9 @@ import json
 import math
 import os
 import platform
+import re
 import resource
+import shutil
 import signal
 import statistics
 import subprocess
@@ -50,10 +53,50 @@ DEFAULT_MIN_IMPROVEMENT = 0.10
 DEFAULT_TAIL_RATIO = 1.50
 DEFAULT_TAIL_ABSOLUTE_SECONDS = 5.0
 DEFAULT_BROAD_TARGET_SECONDS = 600.0
+BEAD_ID_RE = re.compile(
+    r"[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?"
+)
 
 
 class BenchmarkError(RuntimeError):
     """A loud precondition/artifact error, never a test verdict."""
+
+
+def parse_bead_identity(value: str) -> str:
+    """Require one explicit tracker identity; ambient task state is unsafe."""
+    if not BEAD_ID_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            "must be a bead id such as SABLE-y4nom.7.7"
+        )
+    return value
+
+
+@functools.lru_cache(maxsize=1)
+def bash_identity() -> dict[str, str]:
+    """Resolve and content-address the Bash executable this sampler runs."""
+    discovered = shutil.which("bash")
+    if not discovered:
+        raise BenchmarkError("bash is absent from PATH")
+    executable = Path(discovered).resolve()
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise BenchmarkError(f"resolved bash is not executable: {executable}")
+    try:
+        sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise BenchmarkError(f"cannot hash resolved bash {executable}: {exc}") from exc
+    cp = subprocess.run(
+        [str(executable), "--version"], text=True, capture_output=True, check=False,
+    )
+    version = (cp.stdout or cp.stderr).splitlines()
+    if cp.returncode != 0 or not version:
+        raise BenchmarkError(
+            f"cannot identify resolved bash {executable}: rc={cp.returncode}"
+        )
+    return {
+        "executable": str(executable),
+        "version": version[0],
+        "sha256": sha256,
+    }
 
 
 def _run(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -188,7 +231,7 @@ def collection_command(width: str) -> list[str]:
 
 
 def overlap_commands(run_dir: Path) -> tuple[list[str], list[str]]:
-    """The only candidate topology SABLE-y4nom.7.5 is authorized to sample.
+    """The candidate topology is authorized only for the explicit active bead.
 
     Python is the fixed width VE.4 accepted.  Shell remains the existing
     complete serial runner: this experiment overlaps coarse lanes and never
@@ -197,7 +240,8 @@ def overlap_commands(run_dir: Path) -> tuple[list[str], list[str]]:
     return (
         pytest_command(run_dir, "2"),
         [
-            "bash", ".github/ci/shell-run-set.sh", "--profile",
+            bash_identity()["executable"],
+            ".github/ci/shell-run-set.sh", "--profile",
             str(run_dir / "shell.tsv"),
         ],
     )
@@ -210,7 +254,7 @@ def shell_catalog(repo: Path) -> tuple[str, ...]:
         raise BenchmarkError(f"shell run-set is absent: {script}")
     cp = _run(
         repo,
-        "bash", "-c",
+        bash_identity()["executable"], "-c",
         'source "$1"; printf "%s\\n" "${ALLOW[@]}"',
         "sable-xdist-benchmark", str(script),
     )
@@ -748,9 +792,13 @@ def environment_record() -> dict:
     xdist_version = None
     if importlib.util.find_spec("xdist") is not None:
         xdist_version = importlib.metadata.version("pytest-xdist")
+    shell = bash_identity()
     return {
         "python_executable": str(Path(sys.executable).resolve()),
         "python_version": platform.python_version(),
+        "bash_executable": shell["executable"],
+        "bash_version": shell["version"],
+        "bash_sha256": shell["sha256"],
         "pytest_version": importlib.metadata.version("pytest"),
         "xdist_version": xdist_version,
         "platform": platform.platform(),
@@ -759,7 +807,8 @@ def environment_record() -> dict:
     }
 
 
-def run_ladder(repo: Path, root: Path, *, repetitions: int, timeout_seconds: float,
+def run_ladder(repo: Path, root: Path, *, bead: str, repetitions: int,
+               timeout_seconds: float,
                min_improvement: float, tail_ratio: float,
                tail_absolute_seconds: float, shell_baseline_seconds: float) -> tuple[int, dict]:
     expected_head = _require_clean(repo)
@@ -813,7 +862,7 @@ def run_ladder(repo: Path, root: Path, *, repetitions: int, timeout_seconds: flo
     )
     result = {
         "schema": 1,
-        "bead": "SABLE-y4nom.7.4",
+        "bead": bead,
         "verdict": verdict,
         "recommended_width": recommended,
         "stop_reason": stop_reason,
@@ -839,7 +888,8 @@ def run_ladder(repo: Path, root: Path, *, repetitions: int, timeout_seconds: flo
 
 
 def run_overlap_experiment(
-        repo: Path, root: Path, *, repetitions: int, timeout_seconds: float,
+        repo: Path, root: Path, *, bead: str, repetitions: int,
+        timeout_seconds: float,
         tail_ratio: float, tail_absolute_seconds: float,
         broad_target_seconds: float) -> tuple[int, dict]:
     """Same-object n2 reference followed by repeated coarse-lane overlap."""
@@ -885,7 +935,7 @@ def run_overlap_experiment(
     verdict = "GO" if eligible else "NO-GO"
     result = {
         "schema": 1,
-        "bead": "SABLE-y4nom.7.5",
+        "bead": bead,
         "mode": "fixed-n2+serial-shell-overlap",
         "verdict": verdict,
         "source_head": expected_head,
@@ -909,6 +959,12 @@ def run_overlap_experiment(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--bead",
+        required=True,
+        type=parse_bead_identity,
+        help="active measurement bead id recorded in summary.json",
+    )
     parser.add_argument("--repo", default=".")
     parser.add_argument("--output-dir")
     parser.add_argument("--repetitions", type=int, default=3)
@@ -954,6 +1010,7 @@ def main(argv: list[str] | None = None) -> int:
                 rc, result = run_overlap_experiment(
                     repo,
                     root,
+                    bead=args.bead,
                     repetitions=args.repetitions,
                     timeout_seconds=args.timeout_seconds,
                     tail_ratio=args.tail_ratio,
@@ -964,6 +1021,7 @@ def main(argv: list[str] | None = None) -> int:
                 rc, result = run_ladder(
                     repo,
                     root,
+                    bead=args.bead,
                     repetitions=args.repetitions,
                     timeout_seconds=args.timeout_seconds,
                     min_improvement=args.min_improvement,

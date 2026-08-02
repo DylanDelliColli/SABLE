@@ -134,6 +134,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -1205,6 +1206,36 @@ def _dep_check_could_not_assess(reason: str) -> str:
             "git merge-base --is-ancestor <blocker-branch> <integration>.")
 
 
+def _run_dep_check(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
+    """Run one checker in a reapable process group.
+
+    ``subprocess.run(timeout=...)`` kills only its direct child.  The checker
+    itself starts ``bd``; a contended bd can therefore survive the timeout and
+    keep doing work after dispatch has already continued.  A new session gives
+    this bounded advisory its own process group, and timeout reaps that complete
+    tree before returning the same TimeoutExpired verdict to the caller.
+    """
+    process = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            argv, timeout, output=stdout, stderr=stderr,
+        ) from exc
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
 def dep_merge_advisory(bead_ids: list[str], repo: str) -> str | None:
     """Run the checker over the beads being dispatched and return its warning
     or could-not-assess text, or None only on the genuinely healthy path.
@@ -1217,7 +1248,7 @@ def dep_merge_advisory(bead_ids: list[str], repo: str) -> str | None:
 
     But the checker not completing at all is a SEPARATE could-not-assess door,
     and it used to collapse into the same `None` the healthy path returns
-    (SABLE-wezu1): a bd hiccup that hangs the OUTER subprocess.run past
+    (SABLE-wezu1): a bd hiccup that hangs the OUTER checker subprocess past
     `timeout`, or one that raises before any text is captured, left nothing to
     relay. Those legs now report explicitly instead of going silent.
 
@@ -1254,9 +1285,9 @@ def dep_merge_advisory(bead_ids: list[str], repo: str) -> str | None:
     except ValueError:
         timeout = 8.0
     try:
-        proc = subprocess.run(
-            [binary, "--format=hook", "--repo", repo, *ids],
-            capture_output=True, text=True, timeout=timeout)
+        proc = _run_dep_check(
+            [binary, "--format=hook", "--repo", repo, *ids], timeout,
+        )
     except subprocess.TimeoutExpired:
         return _dep_check_could_not_assess(
             f"sable-dep-check did not finish within {timeout:g}s (bd likely "

@@ -488,8 +488,16 @@ PY
     # — that is the specific call this fixture needs to hang, so only that
     # subcommand is intercepted; everything else delegates to the real bd.
     REAL_BD="$(command -v bd)"
+    REAL_SLEEP="$(command -v sleep)"
     SLOWBD_DIR="$FIX/slowbd"
+    SLOWBD_SLEEP_PID_FILE="$FIX/slowbd-sleep-pid"
     mkdir -p "$SLOWBD_DIR"
+    cat > "$SLOWBD_DIR/sleep" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$\$" > "$SLOWBD_SLEEP_PID_FILE"
+exec "$REAL_SLEEP" "\$@"
+SH
+    chmod +x "$SLOWBD_DIR/sleep"
     cat > "$SLOWBD_DIR/bd" <<SH
 #!/usr/bin/env bash
 if [ "\$1" = "dep" ]; then
@@ -499,6 +507,14 @@ fi
 exec "$REAL_BD" "\$@"
 SH
     chmod +x "$SLOWBD_DIR/bd"
+
+    SLOWBD_SCRIPT="$(<"$SLOWBD_DIR/bd")"
+    if [[ "$SLOWBD_SCRIPT" == *$'\n  sleep 2\n  exit 1\n'* ]]; then
+      pass "slow-bd fixture: plants a real descendant that can outlive the timed checker"
+    else
+      fail "slow-bd fixture: plants a real descendant that can outlive the timed checker" \
+           "intercepted dep command no longer spawns the sleeper as a child"
+    fi
 
     SPAWN_SLOWBD_OUT=$(spawn_governance_run "PATH=$SLOWBD_DIR:$PATH" \
                           SABLE_DEP_CHECK_TIMEOUT=0.5)
@@ -510,6 +526,26 @@ SH
     else
       fail "WIRING: bd PRESENT-BUT-UNAVAILABLE (hung under contention) reports COULD NOT ASSESS on the real dispatch path, not silence (SABLE-wezu1)" \
            "rc=$SPAWN_SLOWBD_RC output: ${SPAWN_SLOWBD_OUT:-<empty — the SABLE-wezu1 defect, reproduced>}"
+    fi
+    SLOWBD_SLEEP_PID=""
+    if [ -s "$SLOWBD_SLEEP_PID_FILE" ]; then
+      SLOWBD_SLEEP_PID="$(<"$SLOWBD_SLEEP_PID_FILE")"
+    fi
+    for _ in $(seq 1 50); do
+      if [ -z "$SLOWBD_SLEEP_PID" ] || ! kill -0 "$SLOWBD_SLEEP_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 0.01
+    done
+    if [[ "$SLOWBD_SLEEP_PID" =~ ^[0-9]+$ ]] \
+       && ! kill -0 "$SLOWBD_SLEEP_PID" 2>/dev/null; then
+      pass "slow-bd fixture: timeout reaps the checker process group before its descendant completes naturally"
+    else
+      fail "slow-bd fixture: timeout reaps the checker process group before its descendant completes naturally" \
+           "descendant_pid=${SLOWBD_SLEEP_PID:-missing} still_alive=$(kill -0 "${SLOWBD_SLEEP_PID:-0}" 2>/dev/null && echo yes || echo no)"
+      if [[ "$SLOWBD_SLEEP_PID" =~ ^[0-9]+$ ]]; then
+        kill -9 "$SLOWBD_SLEEP_PID" 2>/dev/null || true
+      fi
     fi
 
     # Complement, same fixture (still a genuine unmerged blocker), healthy bd:
