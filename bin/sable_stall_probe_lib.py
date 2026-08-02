@@ -25,28 +25,20 @@ probe reimplemented a crude local BUSY_MARKER check rather than importing the
 shared one, the same enumerate-vs-derive mistake one layer up.
 
 WHY THE MANAGER-RESOLUTION AND VERDICT HALVES LIVE HERE TOO (SABLE-r69ho).
-night-stall-probe.py is GITIGNORED and worktree-local, so nothing in CI can
-ever import it and no suite on a fresh checkout can assert anything about it.
-Its exit-1 STALL path was structurally unreachable for an unknown length of
-time and no test noticed, because there was no test that COULD. *** A CHECK
-THAT CANNOT FIRE IS INDISTINGUISHABLE FROM A CONDITION NEVER MET *** -- which
-is the bead's own thesis, one layer up.
+The driver used to be gitignored and worktree-local, so nothing in CI could
+assert anything about it. Its exit-1 STALL path was structurally unreachable
+for an unknown length of time and no test noticed, because there was no test
+that COULD. *** A CHECK THAT CANNOT FIRE IS INDISTINGUISHABLE FROM A CONDITION
+NEVER MET *** -- which is the bead's own thesis, one layer up.
 
 So the two properties that must never silently regress -- managers resolve by
 @sable_role tag rather than by pane id, and the STALL verdict is REACHABLE --
 are implemented here, in the tracked module, where test_sable_stall_probe.py
-asserts them on every run on every machine. The subprocess leg of that suite
-drives the real script where it exists and DIFFERENTIALLY asserts it agrees
-with these functions, so the two cannot drift unobserved; where the script is
-absent that leg skips loudly and these assertions still hold.
-
-*** THESE FUNCTIONS ARE NOT YET CALLED BY night-stall-probe.py, AND THAT IS
-DELIBERATE, NOT AN OVERSIGHT. *** The live script resolves its imports from
-the MAIN checkout's bin/, not from this branch, so wiring it to a symbol that
-only exists here would raise ImportError in the cockpit the moment it ran --
-converting a working instrument into a permanently-DEGRADED one, which is the
-exact failure r69ho was. It lands inert; adoption is SABLE-4udwf, and the
-tracking gap that forces the whole arrangement is SABLE-0m78j.
+asserts them on every run on every machine. SABLE-0m78j tracks the driver at
+the existing operator-contract path; its subprocess and real-tmux legs now run
+in every clean checkout and differentially assert that transport agrees with
+these functions. Import failure is rendered DEGRADED without a traceback, so
+a partial checkout cannot turn a missing dependency into a silent instrument.
 """
 from __future__ import annotations
 
@@ -133,14 +125,14 @@ def manager_axis_states(resolved: dict[str, str], capture,
 
 def stall_verdict(states: dict[str, str], held: dict[str, bool | None],
                   ready: int | None, in_flight: int | None, cap: int,
-                  degraded=()) -> tuple[str, int]:
+                  degraded=(), hold_unassessed=()) -> tuple[str, int]:
     """(verdict, exit_code) for the probe's three-way outcome.
 
-      DEGRADED       2  at least one axis could not be assessed -- verdict
-                        WITHHELD. Checked first and unconditionally: an
-                        instrument that cannot read an axis must never score
-                        it, in either direction (the silent-instrument
-                        contract). DEGRADED outranks STALL.
+      DEGRADED       2  a required manager/count axis could not be assessed,
+                        or all managers are idle but no hold verdict can be
+                        established. Hard-axis degradation always outranks a
+                        stall; a missing HOLD reading does not erase a stall
+                        already established by another manager (SABLE-r3fg0).
       STALL          1  every manager IDLE, the fleet below cap, and at least
                         one manager idle with NO stated hold decision. That
                         last conjunct is the dropped-wake shape; see
@@ -161,11 +153,31 @@ def stall_verdict(states: dict[str, str], held: dict[str, bool | None],
     """
     if degraded or ready is None or in_flight is None:
         return "DEGRADED", 2
-    all_idle = bool(states) and all(v == "IDLE" for v in states.values())
+    if not states or any(v not in {"IDLE", "BUSY"} for v in states.values()):
+        return "DEGRADED", 2
+
+    all_idle = all(v == "IDLE" for v in states.values())
+    if not all_idle:
+        return "RUNNING", 0
+
     below_cap = in_flight < cap
+    if not below_cap:
+        return "RUNNING", 0
+
     stuck = [n for n, h in held.items() if h is False]
-    if all_idle and below_cap and stuck:
+    if stuck:
         return "STALL", 1
-    if all_idle and ready > 0 and not stuck:
+
+    # A None/missing HOLD value remains epistemically unassessed. It withholds
+    # a verdict only after the observable manager/count axes and every
+    # assessable hold have failed to determine one. This is the r3fg0 split:
+    # never invent a hold decision, and never let an unknown neighbour erase a
+    # confirmed dropped wake.
+    idle_roles = {name for name, state in states.items() if state == "IDLE"}
+    unknown_holds = {name for name in idle_roles if held.get(name) is None}
+    if hold_unassessed or unknown_holds:
+        return "DEGRADED", 2
+
+    if ready > 0:
         return "RUNNING (HELD)", 0
     return "RUNNING", 0

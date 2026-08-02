@@ -26,20 +26,18 @@ PART 3 (SABLE-ocnld) covers the import layer: an unguarded module-level import
 crashed the probe with a traceback instead of honouring its own contract, in a
 cron job whose stderr nobody reads.
 
-WHERE THE ASSERTIONS LIVE, AND WHY IT IS NOT ARBITRARY. .claude/sable/state/
-night-stall-probe.py is GITIGNORED and worktree-local (SABLE-0m78j), so no
-fresh checkout and no CI clean room can run it. *** THE LOAD-BEARING
-ASSERTIONS THEREFORE RUN AGAINST THE TRACKED LIB, WHICH IS PRESENT
-EVERYWHERE. *** The subprocess leg drives the real script where it exists and
-DIFFERENTIALLY asserts its exit code matches the lib's, so the two cannot
-drift unobserved; where the script is absent that leg skips with a reason
-naming every path it searched. Putting reachability only in the subprocess leg
-would leave the suite green while asserting nothing about the exact property
-the bead exists to protect -- the bug's own shape, in the test for the bug.
+WHERE THE ASSERTIONS LIVE, AND WHY IT IS NOT ARBITRARY. The load-bearing
+semantics live in the tracked lib and are tested directly. SABLE-0m78j now
+tracks the thin driver at the existing operator-contract path too, so the
+subprocess and real-tmux legs run in every clean checkout and differentially
+assert that transport agrees with the lib. Putting reachability only in the
+subprocess leg would still be too weak: the direct lib tests keep the semantic
+property independently visible when transport itself fails.
 """
 import ast
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -74,6 +72,15 @@ def _stuck_wake_pane(sender="lincoln", to="optimus", body="cap in force"):
     )
 
 
+def _codex_stuck_wake_pane(sender="lincoln", to="optimus", body="cap in force"):
+    """The same dropped-wake shape with Codex's provider-specific glyph."""
+    return (
+        f"● prior turn output\n{_BORDER}\n"
+        f"› ⟦SABLE-MSG⟧ from={sender} to={to} :: {body}\n"
+        f"{_BORDER}\n{_CWD}\n"
+    )
+
+
 def _truncated_pane():
     """Composer settled empty with NOTHING rendered above it."""
     return f"{_BORDER}\n❯ \n{_BORDER}\n{_CWD}\n"
@@ -81,6 +88,15 @@ def _truncated_pane():
 
 def _busy_pane():
     return f"● doing work\n✻ Thinking… (12s · esc to interrupt)\n❯ \n"
+
+
+def _pasted_blob_pane():
+    """Settled composer holding non-SABLE text: observable, but not semantic."""
+    return (
+        f"● prior turn output\n{_BORDER}\n"
+        "❯ [Pasted text #83 +1 lines]\n"
+        f"{_BORDER}\n{_CWD}\n"
+    )
 
 
 def _held_pane():
@@ -126,6 +142,11 @@ def test_no_composer_row_is_not_assessed():
     assert deliberate_hold(
         "● some scrollback with no composer visible\n", "claude"
     ) is None
+
+
+def test_unsubmitted_non_sable_msg_composer_is_not_assessed():
+    """SABLE-r3fg0: arbitrary held text is not evidence of a decision."""
+    assert deliberate_hold(_pasted_blob_pane(), "claude") is None
 
 
 @pytest.mark.parametrize("phrase", [
@@ -306,6 +327,51 @@ def test_degraded_outranks_stall():
                          degraded=["bd ready failed"]) == ("DEGRADED", 2)
 
 
+def test_confirmed_stall_survives_one_unassessed_hold_axis():
+    """A missing HOLD reading cannot erase two observed dropped wakes."""
+    states = {r: "IDLE" for r in MANAGER_ROLES}
+    held = {"optimus": False, "tarzan": False, "chuck": None}
+
+    assert stall_verdict(
+        states,
+        held,
+        ready=7,
+        in_flight=1,
+        cap=4,
+        hold_unassessed=["chuck: non-SABLE text remains in composer"],
+    ) == ("STALL", 1)
+
+
+def test_all_holds_unassessed_still_withhold_the_verdict():
+    """The aggregation fix must not turn unknown axes into a clean result."""
+    states = {r: "IDLE" for r in MANAGER_ROLES}
+    held = {r: None for r in MANAGER_ROLES}
+
+    assert stall_verdict(
+        states,
+        held,
+        ready=7,
+        in_flight=1,
+        cap=4,
+        hold_unassessed=[f"{r}: hold unreadable" for r in MANAGER_ROLES],
+    ) == ("DEGRADED", 2)
+
+
+def test_busy_manager_makes_an_unassessed_hold_axis_irrelevant():
+    """With observed work, RUNNING is known without guessing at the hold."""
+    states = {"optimus": "BUSY", "tarzan": "IDLE", "chuck": "IDLE"}
+    held = {"optimus": None, "tarzan": None, "chuck": None}
+
+    assert stall_verdict(
+        states,
+        held,
+        ready=7,
+        in_flight=1,
+        cap=4,
+        hold_unassessed=["hold axes unreadable while optimus is busy"],
+    ) == ("RUNNING", 0)
+
+
 @pytest.mark.parametrize("ready,in_flight", [(None, 1), (7, None)])
 def test_unassessed_counts_withhold_the_verdict(ready, in_flight):
     """A count the probe could not read is COULD-NOT-ASSESS, not zero."""
@@ -315,10 +381,8 @@ def test_unassessed_counts_withhold_the_verdict(ready, in_flight):
 
 
 # ===========================================================================
-# PART 3 -- the real script, driven as a subprocess (SABLE-r69ho, SABLE-ocnld)
-#
-# night-stall-probe.py is gitignored and worktree-local, so this leg skips
-# loudly wherever it is absent. Everything above still runs there.
+# PART 3 -- the tracked real script, driven as a subprocess
+# (SABLE-r69ho, SABLE-ocnld, SABLE-0m78j)
 # ===========================================================================
 
 _PROBE_ENV = "SABLE_NIGHT_STALL_PROBE"
@@ -328,29 +392,11 @@ _REPO = os.path.dirname(_BIN)
 
 
 def _probe_candidates():
-    """Every path searched for the probe, in order.
-
-    A linked worktree materialises only TRACKED files, so the probe is never
-    in one; it lives in the checkout that created it. Derive that checkout
-    from git rather than hardcoding a machine-specific path -- the same
-    derive-don't-enumerate rule this whole bead is about.
-    """
+    """The tracked contract path, with one explicit test-only override."""
     override = os.environ.get(_PROBE_ENV)
     if override:
         return [override]
-    out = [os.path.join(_REPO, _PROBE_RELPATH)]
-    try:
-        r = subprocess.run(["git", "-C", _REPO, "rev-parse", "--git-common-dir"],
-                           capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
-        return out
-    if r.returncode == 0 and r.stdout.strip():
-        main_root = os.path.dirname(os.path.abspath(
-            os.path.join(_REPO, r.stdout.strip())))
-        candidate = os.path.join(main_root, _PROBE_RELPATH)
-        if candidate not in out:
-            out.append(candidate)
-    return out
+    return [os.path.join(_REPO, _PROBE_RELPATH)]
 
 
 _CANDIDATES = _probe_candidates()
@@ -358,11 +404,25 @@ _PROBE = next((p for p in _CANDIDATES if os.path.exists(p)), None)
 
 requires_probe = pytest.mark.skipif(
     _PROBE is None,
-    reason=("night-stall-probe.py not found, so the differential leg cannot "
-            "run. It is GITIGNORED and worktree-local (SABLE-0m78j), so no "
-            "fresh checkout or CI clean room has it; the load-bearing "
-            "assertions in PART 2 run regardless. Searched: "
+    reason=("tracked night-stall-probe.py is missing, so the differential "
+            "leg cannot run; the non-skipped tracking control will fail too. "
+            "Searched: "
             + ", ".join([f"${_PROBE_ENV}"] + _CANDIDATES)))
+
+
+def test_night_stall_probe_is_tracked_at_the_operator_contract_path():
+    """SABLE-0m78j: the real driver must exist in every clean checkout."""
+    expected = os.path.join(_REPO, _PROBE_RELPATH)
+    assert _PROBE == expected, (
+        "the active operator contract invokes the repo state path; a probe "
+        f"found elsewhere is not that contract: {_PROBE!r}"
+    )
+    tracked = subprocess.run(
+        ["git", "-C", _REPO, "ls-files", "--error-unmatch", _PROBE_RELPATH],
+        capture_output=True,
+        text=True,
+    )
+    assert tracked.returncode == 0, tracked.stderr
 
 
 def _worker_cap():
@@ -399,7 +459,7 @@ def die(msg):
 if tool == "tmux":
     if argv[:3] == ["list-panes", "-a", "-F"]:
         if "@sable_role" in argv[3]:
-            emit("".join("%s %s\\n" % (p, r) for p, r in fx["roles"]))
+            emit("".join(" ".join(row) + "\\n" for row in fx["roles"]))
         emit("".join("%s %s\\n" % (p, w) for p, w in fx["windows"]))
     if argv[:1] == ["capture-pane"]:
         pane = argv[argv.index("-t") + 1]
@@ -421,12 +481,21 @@ die("unexpected tool: %s" % tool)
 _WORKER_PANES = [("%20", "worker-SABLE-abc")]
 
 
-def _fixture(captures_by_role, roles=None, ready=7, in_progress=("SABLE-abc",)):
+def _fixture(
+    captures_by_role,
+    roles=None,
+    ready=7,
+    in_progress=("SABLE-abc",),
+    providers=None,
+):
     """A whole fabricated fleet, in the two `tmux list-panes` shapes the probe
     reads plus the two `bd` counts."""
     roles = _ALIEN if roles is None else roles
-    role_rows = [["%0", "lincoln"]] + [[p, r] for r, p in roles.items()]
-    role_rows += [[p, ""] for p, _ in _WORKER_PANES]
+    if providers is None:
+        providers = {role: "claude" for role in roles}
+    role_rows = [["%0", "lincoln", "claude"]]
+    role_rows += [[p, r, providers.get(r, "")] for r, p in roles.items()]
+    role_rows += [[p, "", ""] for p, _ in _WORKER_PANES]
     window_rows = [["%0", "claude"]] + [[p, r] for r, p in roles.items()]
     window_rows += [list(p) for p in _WORKER_PANES]
     return {
@@ -515,6 +584,42 @@ def test_script_resolves_managers_by_role_tag_not_pane_id(tmp_path):
 
 
 @requires_probe
+def test_script_uses_each_managers_registered_provider(tmp_path):
+    """D5: the tracked driver may not revive the old implicit-Claude path."""
+    captures = {
+        "optimus": _codex_stuck_wake_pane(to="optimus"),
+        "tarzan": _stuck_wake_pane(to="tarzan"),
+        "chuck": _codex_stuck_wake_pane(to="chuck"),
+    }
+    providers = {"optimus": "codex", "tarzan": "claude", "chuck": "codex"}
+    result = _run(
+        tmp_path,
+        _stage(tmp_path),
+        _fixture(captures, providers=providers),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "VERDICT: STALL" in result.stdout
+    for role in MANAGER_ROLES:
+        assert f"'{role}': False" in result.stdout
+
+
+@requires_probe
+def test_script_missing_provider_tag_is_degraded_not_default_claude(tmp_path):
+    providers = {"optimus": "claude", "tarzan": "claude"}
+    result = _run(
+        tmp_path,
+        _stage(tmp_path),
+        _fixture(_all(_stuck_wake_pane()), providers=providers),
+    )
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "@sable_provider" in result.stdout
+    assert "chuck" in result.stdout
+    assert "VERDICT: DEGRADED" in result.stdout
+
+
+@requires_probe
 def test_script_stall_path_is_reachable(tmp_path):
     """Exit 1, end to end, through the real script. This is the property whose
     absence was the bug."""
@@ -523,6 +628,22 @@ def test_script_stall_path_is_reachable(tmp_path):
     result = _run(tmp_path, _stage(tmp_path), fixture)
     assert result.returncode == 1, result.stdout + result.stderr
     assert "VERDICT: STALL" in result.stdout
+
+
+@requires_probe
+def test_script_stall_survives_one_unassessed_hold_axis(tmp_path):
+    """The live r3fg0 shape: one pasted composer cannot blind two stalls."""
+    captures = {
+        "optimus": _stuck_wake_pane(),
+        "tarzan": _stuck_wake_pane(),
+        "chuck": _pasted_blob_pane(),
+    }
+    result = _run(tmp_path, _stage(tmp_path), _fixture(captures))
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "VERDICT: STALL" in result.stdout
+    assert "chuck" in result.stdout
+    assert "unassessed" in result.stdout.lower()
 
 
 @requires_probe
@@ -549,27 +670,24 @@ def test_script_missing_role_tag_is_degraded_not_healthy(tmp_path):
                                 in_progress=tuple(f"SABLE-abc{i}" for i in range(4)))),
 ])
 def test_script_agrees_with_lib_verdict(tmp_path, name, fixture_fn):
-    """*** THE MIRROR IS CHECKED, NOT ASSUMED (SABLE-4udwf). *** The script
-    still carries its own inline copy of this logic because it cannot import
-    an unmerged branch's lib without crashing the live cockpit. So assert the
-    two agree on every polarity, and the drift is caught the moment it starts
-    -- wherever the script exists to be read."""
+    """The driver imports the lib; this pins its transport and argument wiring."""
     fixture = fixture_fn()
     result = _run(tmp_path, _stage(tmp_path), fixture)
 
     resolved = resolve_manager_panes(
-        "".join(f"{p} {r}\n" for p, r in fixture["roles"]))
+        "".join(" ".join(row) + "\n" for row in fixture["roles"]))
     captures = fixture["captures"]
     states, degraded = manager_axis_states(resolved, _capture_from(captures))
     held = {}
+    hold_unassessed = []
     if states and all(v == "IDLE" for v in states.values()):
         for role, pane in resolved.items():
             held[role] = deliberate_hold(captures[pane], "claude")
             if held[role] is None:
-                degraded.append(f"deliberate-idle unreadable for {pane}")
+                hold_unassessed.append(f"deliberate-idle unreadable for {pane}")
     _, expected = stall_verdict(states, held, fixture["ready"],
                                 len(fixture["in_progress"]), _worker_cap(),
-                                degraded)
+                                degraded, hold_unassessed)
 
     assert result.returncode == expected, (
         f"{name}: script exited {result.returncode}, lib says {expected}\n"
@@ -686,6 +804,15 @@ def real_fleet(tmp_path):
         assert set(panes) == set(MANAGER_ROLES), panes
         for role, pane in panes.items():
             _srv(sock, "set-option", "-p", "-t", pane, "@sable_role", role)
+            _srv(
+                sock,
+                "set-option",
+                "-p",
+                "-t",
+                pane,
+                "@sable_provider",
+                "claude",
+            )
 
         deadline = time.time() + 10
         while time.time() < deadline:
@@ -744,6 +871,47 @@ def test_real_tmux_stall_path_is_reachable(tmp_path, real_fleet):
     for role in MANAGER_ROLES:
         assert f"'{role}': 'IDLE'" in result.stdout, (
             "manager states must be READ, not withheld\n" + result.stdout)
+
+
+@requires_probe
+@requires_tmux
+def test_real_tmux_stall_survives_one_unassessed_hold_axis(
+    tmp_path, real_fleet
+):
+    """A real held composer cannot suppress two independently proven stalls."""
+    sock, panes = real_fleet
+    pasted = tmp_path / "pasted-composer.txt"
+    pasted.write_text(_pasted_blob_pane(), encoding="utf-8")
+    replacement = _srv(
+        sock,
+        "respawn-pane",
+        "-k",
+        "-t",
+        panes["chuck"],
+        f"cat {shlex.quote(str(pasted))}; sleep 300",
+    )
+    assert replacement.returncode == 0, replacement.stderr
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        capture = _srv(
+            sock, "capture-pane", "-p", "-J", "-e", "-t", panes["chuck"]
+        ).stdout
+        if "Pasted text #83" in capture:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("replacement pane never rendered the held-composer fixture")
+
+    result = _run_against_server(tmp_path, sock)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "VERDICT: STALL" in result.stdout
+    assert "UNASSESSED HOLD AXIS" in result.stdout
+    assert "chuck" in result.stdout
+    assert "'optimus': False" in result.stdout
+    assert "'tarzan': False" in result.stdout
+    assert "'chuck': None" in result.stdout
 
 
 @requires_probe

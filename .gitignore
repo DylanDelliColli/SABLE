@@ -53,6 +53,10 @@ __pycache__/
 # cockpit re-commits it at shift boundaries and after operator rulings; runtime
 # state (mode-state.json etc.) stays ignored by the line above.
 !.claude/sable/state/active-contracts.md
+# THIRD exception (SABLE-0m78j): the cockpit's read-only stall driver is code,
+# not ephemeral state. It stays at the existing operator-contract path so the
+# tracked fix does not require rewriting live active-contracts state.
+!.claude/sable/state/night-stall-probe.py
 !.claude/sable/state/merge-gate/
 .claude/sable/state/merge-gate/*
 !.claude/sable/state/merge-gate/README.md
