@@ -109,8 +109,10 @@ over tmux and they spawn + watch their own workers.**
   `for-chuck` bead only when direct delivery fails; no bead is the healthy
   expected path, not a missed handoff.
 - **Shift changes:** a manager that hits context pressure files a `shift-report`
-  bead, messages you, and ends; restart its pane fresh — lane state rehydrates
-  from beads, not memory.
+  bead, messages you, and ends; restart its pane fresh. On the fresh
+  SessionStart, run `sable-recover --repo "$PWD"` before directing panes. It
+  recomputes the durable git/bead picture plus surviving tmux lane bindings;
+  the shift-report bead is a hint, not a complete copy of lane state.
 - Surface `for-lincoln` arbitration beads (and `⟦SABLE-MSG⟧ from=<manager>`
   escalations) to the operator when they need a human call; handle the rest.
 - The interlock blocks YOU from spawning planning-only producers (sherlock /

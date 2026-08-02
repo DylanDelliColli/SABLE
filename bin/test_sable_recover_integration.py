@@ -27,9 +27,13 @@ all three correctly and orders the resume steps. git is required (universally
 present in CI); the suite self-skips only if git is somehow absent.
 """
 import json
+import os
+import signal
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -40,6 +44,8 @@ RECOVER = REPO / "bin" / "sable-recover"
 pytestmark = pytest.mark.skipif(
     shutil.which("git") is None, reason="git not available"
 )
+HAVE_BD = shutil.which("bd") is not None
+HAVE_TMUX = shutil.which("tmux") is not None
 
 
 def _git(cwd, *args, check=True):
@@ -120,6 +126,85 @@ def _run_recover(main, beads_file, panes_file, *extra):
          "--panes-file", str(panes_file), *extra],
         capture_output=True, text=True,
     )
+
+
+def _private_env(home, *, store=None, socket=None):
+    env = dict(os.environ)
+    for name in (
+        "BEADS_DB", "BEADS_DIR", "TMUX", "TMUX_PANE",
+        "SABLE_TMUX_SOCKET", "SABLE_TMUX_SESSION",
+    ):
+        env.pop(name, None)
+    env["HOME"] = str(home)
+    env["BD_NON_INTERACTIVE"] = "1"
+    if store is not None:
+        env["BEADS_DIR"] = str(store)
+    if socket is not None:
+        env["SABLE_TMUX_SOCKET"] = socket
+    return env
+
+
+def _robust_bd_init(repo, home):
+    beads = repo / ".beads"
+    last = None
+    for _ in range(4):
+        if beads.exists():
+            shutil.rmtree(beads)
+        last = subprocess.run(
+            [
+                "bd", "init", "--prefix=RCV", "--non-interactive",
+                "--skip-agents", "--skip-hooks", "--quiet",
+            ],
+            cwd=repo,
+            env=_private_env(home),
+            capture_output=True,
+            text=True,
+        )
+        if last.returncode == 0 and (beads / "config.yaml").is_file():
+            return beads
+    raise AssertionError(
+        "bd init never produced a complete private store: "
+        + ((last.stdout + last.stderr) if last else "no attempt")
+    )
+
+
+def _tmux(socket, *args, check=True):
+    env = dict(os.environ)
+    for name in ("TMUX", "TMUX_PANE", "SABLE_TMUX_SOCKET", "SABLE_TMUX_SESSION"):
+        env.pop(name, None)
+    return subprocess.run(
+        ["tmux", "-L", socket, *args],
+        capture_output=True,
+        text=True,
+        check=check,
+        env=env,
+    )
+
+
+def _run_production_recover(main, home, store, socket):
+    result = subprocess.run(
+        [
+            sys.executable, str(RECOVER), "--repo", str(main),
+            "--base", "main", "--json",
+        ],
+        cwd=main,
+        env=_private_env(home, store=store, socket=socket),
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return json.loads(result.stdout)
+
+
+def _binding(report, bead):
+    return next(row for row in report["pane_bindings"] if row["bead"] == bead)
+
+
+def _durable_worktree_picture(report):
+    """The git-owned fields that survive independently of pane annotations."""
+    keys = ("path", "branch", "detached", "dirty", "push_state")
+    return [{key: row[key] for key in keys} for row in report["worktrees"]]
 
 
 def test_report_names_all_three_states(tmp_path):
@@ -210,6 +295,131 @@ def test_fix_pushes_clean_unpushed_branch_but_not_dirty(tmp_path):
     after = _git(main, "for-each-ref", "--format=%(refname:short)",
                  "refs/remotes/origin/wk-clean")
     assert after.stdout.strip() == "origin/wk-clean"
+
+
+@pytest.mark.skipif(
+    not (HAVE_BD and HAVE_TMUX),
+    reason="real recovery-world proof requires bd/dolt and tmux",
+)
+def test_production_collectors_distinguish_manager_clear_from_host_crash(tmp_path):
+    """The involuntary-end contract through the production collectors.
+
+    One private world drives both mode arms without --beads-file or
+    --panes-file: first SIGKILL only the manager while its worker survives,
+    then destroy the whole named-socket server. The durable git/bd picture must
+    survive both; worker-owned topology survives only the first.
+    """
+    main, _, _ = _build_crash_scene(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    store = _robust_bd_init(main, home)
+    created = subprocess.run(
+        [
+            "bd", "create", "--title=Recovery world in-flight work",
+            "--type=task", "--json",
+        ],
+        cwd=main,
+        env=_private_env(home, store=store),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(created.stdout)
+    if isinstance(payload, list):
+        payload = payload[0]
+    bead = payload["id"]
+    subprocess.run(
+        ["bd", "update", bead, "--claim"],
+        cwd=main,
+        env=_private_env(home, store=store),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    socket = f"recover-{uuid.uuid4().hex[:10]}"
+    worker_path = tmp_path / "wk-stranded"
+    try:
+        _tmux(
+            socket, "new-session", "-d", "-s", "recovery", "-n", "lincoln",
+            "-c", str(main), "bash --noprofile --norc",
+        )
+        manager = _tmux(
+            socket, "display-message", "-p", "-t", "recovery:lincoln",
+            "#{pane_id}\t#{pane_pid}",
+        ).stdout.strip().split("\t")
+        manager_pane, manager_pid = manager[0], int(manager[1])
+        _tmux(socket, "set-option", "-p", "-t", manager_pane, "@sable_role", "lincoln")
+        _tmux(socket, "set-option", "-p", "-t", manager_pane, "@sable_status", "running")
+        _tmux(socket, "set-option", "-p", "-t", manager_pane, "@sable_repo", str(main))
+
+        _tmux(
+            socket, "new-window", "-d", "-t", "recovery", "-n", "worker",
+            "-c", str(worker_path), "bash --noprofile --norc",
+        )
+        worker_pane = _tmux(
+            socket, "display-message", "-p", "-t", "recovery:worker",
+            "#{pane_id}",
+        ).stdout.strip()
+        for option, value in (
+            ("@sable_role", "worker"),
+            ("@sable_bead", bead),
+            ("@sable_status", "running"),
+            ("@sable_lane", "optimus"),
+            ("@sable_repo", str(main)),
+        ):
+            _tmux(socket, "set-option", "-p", "-t", worker_pane, option, value)
+
+        before = _run_production_recover(main, home, store, socket)
+        assert before["recovery"] == {
+            "observed_mode": "tmux-reachable",
+            "tmux_socket": socket,
+            "pane_source": "tmux",
+            "missing_facts": [],
+        }
+        before_worker = _binding(before, bead)
+        assert before_worker["lane"] == "optimus"
+        assert before_worker["pane"] == worker_pane
+        assert before_worker["session"] == "recovery"
+        assert before_worker["repo_in_worktree_census"] is True
+
+        # Involuntary manager end: SIGKILL, never a graceful quit.
+        os.kill(manager_pid, signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            listed = _tmux(
+                socket, "list-panes", "-a", "-F", "#{pane_id}", check=False,
+            ).stdout.splitlines()
+            if manager_pane not in listed:
+                break
+            time.sleep(0.05)
+        assert manager_pane not in listed, "SIGKILLed manager pane remained live"
+
+        manager_clear = _run_production_recover(main, home, store, socket)
+        assert manager_clear["recovery"]["observed_mode"] == "tmux-reachable"
+        assert manager_clear["recovery"]["tmux_socket"] == socket
+        assert manager_clear["worktrees"] == before["worktrees"]
+        assert manager_clear["in_progress_beads"] == before["in_progress_beads"]
+        assert _binding(manager_clear, bead) == before_worker
+
+        # Whole-host analogue: the configured socket is now unreachable.
+        _tmux(socket, "kill-server")
+        host_crash = _run_production_recover(main, home, store, socket)
+        assert host_crash["recovery"]["observed_mode"] == "tmux-unreachable"
+        assert host_crash["recovery"]["tmux_socket"] == socket
+        assert host_crash["recovery"]["missing_facts"] == [
+            "owning lane", "pane/bead binding", "tmux session identity",
+        ]
+        assert _durable_worktree_picture(host_crash) == _durable_worktree_picture(before)
+        assert host_crash["in_progress_beads"] == before["in_progress_beads"]
+        assert host_crash["pane_bindings"] == []
+        crashed_worker = next(
+            row for row in host_crash["worktrees"] if row["path"] == str(worker_path)
+        )
+        assert crashed_worker["bead"] is None
+        assert crashed_worker["bead_source"] is None
+    finally:
+        _tmux(socket, "kill-server", check=False)
 
 
 if __name__ == "__main__":

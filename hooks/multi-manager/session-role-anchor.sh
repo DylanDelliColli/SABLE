@@ -321,6 +321,30 @@ identity = (
     f'You are {name}. Operate within this role. Do not act as another manager.'
 )
 
+# SABLE-slip0.4: recovery is a read-at-boot recomputation, not another state
+# file and not hook-owned work. Surface the existing read-only collector on
+# every manager SessionStart so a new/restarted Lincoln or execution manager
+# reconstructs the durable git/bd picture plus any surviving tmux topology
+# before acting. The hook deliberately DOES NOT execute the command: collector
+# latency and any follow-up judgment belong to the manager turn. D5 is binding:
+# there is no exit-path hook to trust, and no graceful-end write is introduced.
+identity += '\n'.join([
+    '',
+    '',
+    '=== RECOVERY RECOMPUTE (SABLE-slip0.4) ===',
+    '',
+    'Before your first action, recompute the in-flight fleet picture from the',
+    'durable git worktrees + complete bead store + any surviving tmux panes:',
+    '',
+    '  sable-recover --repo \"\$PWD\"',
+    '',
+    'This hook only surfaces that read-only command; it never executes it.',
+    'Read the report\'s OBSERVED MODE and exact tmux socket before deciding',
+    'that a manager or host was lost.',
+    '',
+    '=== END RECOVERY RECOMPUTE ===',
+])
+
 # Only append the live-protocol block when there IS live state on disk, so a
 # non-orchestration manager session stays byte-identical to the legacy injection.
 if live_mode or live_mode_corrupt or live_contracts:

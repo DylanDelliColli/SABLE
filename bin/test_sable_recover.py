@@ -11,6 +11,7 @@ repo with real worktrees) is the integration variant.
 import importlib.util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from types import SimpleNamespace
 
 _LOADER = SourceFileLoader(
     "sable_recover", str(Path(__file__).resolve().parent / "sable-recover")
@@ -139,8 +140,87 @@ def test_parse_panes_tab_delimited_empty_bead_keeps_column():
         "/wt/b\t\trunning\n"          # empty bead field must not shift status
     )
     panes = rec.parse_panes(text)
-    assert panes[0] == {"path": "/wt/a", "bead": "SABLE-aaaa", "status": "running"}
-    assert panes[1] == {"path": "/wt/b", "bead": "", "status": "running"}
+    assert panes[0] == {
+        "path": "/wt/a", "bead": "SABLE-aaaa", "status": "running",
+        "pane": "", "session": "", "lane": "", "repo": "",
+    }
+    assert panes[1] == {
+        "path": "/wt/b", "bead": "", "status": "running",
+        "pane": "", "session": "", "lane": "", "repo": "",
+    }
+
+
+def test_parse_panes_retains_recovery_topology():
+    panes = rec.parse_panes(
+        "/wt/a\tSABLE-aaaa\trunning\t%7\tsable\toptimus\t/repo\n"
+    )
+    assert panes == [{
+        "path": "/wt/a",
+        "bead": "SABLE-aaaa",
+        "status": "running",
+        "pane": "%7",
+        "session": "sable",
+        "lane": "optimus",
+        "repo": "/repo",
+    }]
+
+
+def test_bd_collector_explicitly_disables_the_silent_fifty_row_limit(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, cwd=None):
+        calls.append((cmd, cwd))
+        return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(rec, "_run", fake_run)
+    assert rec.load_in_progress(None) == []
+    assert calls == [
+        (["bd", "list", "--status", "in_progress", "--json", "--limit", "0"], None)
+    ]
+
+
+def test_pane_collector_honors_named_socket_and_records_the_observation(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, cwd=None):
+        calls.append((cmd, cwd))
+        return SimpleNamespace(
+            returncode=0,
+            stdout="/wt/a\tSABLE-a\trunning\t%3\tfleet\toptimus\t/repo\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(rec, "_run", fake_run)
+    monkeypatch.setenv("SABLE_TMUX_SOCKET", "private-fleet")
+    panes, observation = rec.load_panes(None)
+
+    assert calls == [([
+        "tmux", "-L", "private-fleet", "list-panes", "-a", "-F",
+        "#{pane_current_path}\t#{@sable_bead}\t#{@sable_status}\t"
+        "#{pane_id}\t#{session_name}\t#{@sable_lane}\t#{@sable_repo}",
+    ], None)]
+    assert panes[0]["lane"] == "optimus"
+    assert observation == {
+        "observed_mode": rec.TMUX_REACHABLE,
+        "tmux_socket": "private-fleet",
+        "pane_source": "tmux",
+    }
+
+
+def test_unreachable_named_socket_is_a_loud_mode_not_an_empty_live_fleet(monkeypatch):
+    monkeypatch.setenv("SABLE_TMUX_SOCKET", "missing-fleet")
+    monkeypatch.setattr(
+        rec,
+        "_run",
+        lambda cmd, cwd=None: SimpleNamespace(returncode=1, stdout="", stderr="no server"),
+    )
+    panes, observation = rec.load_panes(None)
+    assert panes == []
+    assert observation == {
+        "observed_mode": rec.TMUX_UNREACHABLE,
+        "tmux_socket": "missing-fleet",
+        "pane_source": "tmux",
+    }
 
 
 # --- full report assembly + ordered plan -------------------------------------
@@ -176,6 +256,103 @@ def test_build_report_classifies_three_canonical_states():
     assert rows["wk-dirty"]["bead"] == "SABLE-dirty"
     assert [b["id"] for b in report["stranded_claims"]] == ["SABLE-gone"]
     assert report["unmerged_branches"] == ["origin/wk-pushed"]
+
+
+def test_reachable_report_surfaces_lane_session_and_repo_binding_consistency():
+    worktrees = [
+        _wt("/repo", "main", has_origin=True),
+        _wt("/repo/.git/sable/worktrees/wk-a", "wk-a", has_origin=True),
+    ]
+    panes = [{
+        "path": "/repo/.git/sable/worktrees/wk-a",
+        "bead": "SABLE-a",
+        "status": "running",
+        "pane": "%7",
+        "session": "sable",
+        "lane": "optimus",
+        "repo": "/repo",
+    }]
+    observation = {
+        "observed_mode": rec.TMUX_REACHABLE,
+        "tmux_socket": "fleet-socket",
+        "pane_source": "tmux",
+    }
+    report = rec.build_report(
+        worktrees, [{"id": "SABLE-a", "title": "live"}], panes, [], [],
+        pane_observation=observation,
+    )
+
+    assert report["recovery"] == {
+        **observation,
+        "missing_facts": [],
+    }
+    assert report["pane_bindings"] == [{
+        **panes[0],
+        "repo_in_worktree_census": True,
+    }]
+    assert report["in_progress_beads"] == [{"id": "SABLE-a", "title": "live"}]
+
+
+def test_stale_pane_repo_is_named_instead_of_silently_trusted():
+    pane = {
+        "path": "/reaped/wk-old",
+        "bead": "SABLE-old",
+        "status": "running",
+        "pane": "%9",
+        "session": "sable",
+        "lane": "tarzan",
+        "repo": "/reaped/repo",
+    }
+    report = rec.build_report(
+        [_wt("/repo", "main", has_origin=True)], [], [pane], [], [],
+        pane_observation={
+            "observed_mode": rec.TMUX_REACHABLE,
+            "tmux_socket": "default",
+            "pane_source": "tmux",
+        },
+    )
+    assert report["pane_bindings"][0]["repo_in_worktree_census"] is False
+    assert "STALE" in rec.render_text(report)
+
+
+def test_unreachable_report_names_only_the_topology_tmux_destroyed():
+    report = rec.build_report(
+        [_wt("/repo", "main", has_origin=True)],
+        [{"id": "SABLE-a", "title": "still durable"}],
+        [], [], [],
+        pane_observation={
+            "observed_mode": rec.TMUX_UNREACHABLE,
+            "tmux_socket": "fleet-socket",
+            "pane_source": "tmux",
+        },
+    )
+    assert report["recovery"]["observed_mode"] == rec.TMUX_UNREACHABLE
+    assert report["recovery"]["tmux_socket"] == "fleet-socket"
+    assert report["recovery"]["missing_facts"] == [
+        "owning lane",
+        "pane/bead binding",
+        "tmux session identity",
+    ]
+    assert report["worktrees"][0]["path"] == "/repo"
+    assert report["in_progress_beads"][0]["id"] == "SABLE-a"
+    text = rec.render_text(report)
+    assert "OBSERVED MODE: tmux-unreachable" in text
+    assert "fleet-socket" in text
+    assert "owning lane" in text
+
+
+def test_reachable_default_socket_with_no_sable_panes_names_the_likely_misroute():
+    report = rec.build_report(
+        [_wt("/repo", "main", has_origin=True)], [], [], [], [],
+        pane_observation={
+            "observed_mode": rec.TMUX_REACHABLE,
+            "tmux_socket": "default",
+            "pane_source": "tmux",
+        },
+    )
+    text = rec.render_text(report)
+    assert "no SABLE panes on the default socket" in text
+    assert "set SABLE_TMUX_SOCKET" in text
 
 
 def test_plan_is_ordered_push_then_redispatch_then_merge():

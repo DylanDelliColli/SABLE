@@ -65,6 +65,12 @@ EXECUTION_MANAGER_FILES = [
     ROLES_DIR / "optimus.md",
     ROLES_DIR / "tarzan.md",
 ]
+RECOVERY_MANAGER_FILES = [
+    ROLES_DIR / "lincoln.md",
+    ROLES_DIR / "optimus.md",
+    ROLES_DIR / "tarzan.md",
+    ROLES_DIR / "chuck.md",
+]
 
 CONTAINMENT_FILES = [
     ROLES_DIR / "chuck.md",
@@ -159,3 +165,26 @@ def test_execute_skill_defines_receipt_scope_as_the_execution_work_set():
     assert "exact execution work" in text
     assert "New descendants and unrelated" in text
     assert "rejects a lead or bundle member outside the receipt" in text
+
+
+@pytest.mark.parametrize("path", RECOVERY_MANAGER_FILES, ids=_rel)
+def test_every_restarting_manager_recomputes_instead_of_trusting_beads(path):
+    text = _read(path)
+    compact = re.sub(r"\s+", " ", text)
+    lowered = compact.lower()
+    rel = _rel(path)
+    assert "sable-recover" in compact, (
+        f"{rel} can restart without invoking the recovery collector"
+    )
+    assert "recomput" in lowered, (
+        f"{rel} mentions recovery but never says the fleet picture is recomputed"
+    )
+    for false_promise in (
+        "lane state lives in beads",
+        "lane state rehydrates from beads",
+        "queue and hold state live in beads",
+    ):
+        assert false_promise not in lowered, (
+            f"{rel} still makes the measured-false persistence claim: "
+            f"{false_promise!r}"
+        )
