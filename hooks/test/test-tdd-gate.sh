@@ -908,20 +908,28 @@ D4N_OUT=$(cat "$D4N_TMP"); rm -f "$D4N_TMP"
 if echo "$D4N_OUT" | grep -q '"permissionDecision": "deny"'; then pa_pass "D4 negative (absent): no evidence at the derived key -> reader DENIES"; else pa_fail "D4 negative (absent)" "got: ${D4N_OUT:-<empty>}"; fi
 rm -f "$D4N_KEY"
 
-# ---------- SABLE-p84b INTEGRATION: real bd, [no-test] in description ----------
+# ---------- SABLE-p84b INTEGRATION: isolated real bd, [no-test] in description ----------
 # Exercises the REAL bd --json read (notes + description) through the REAL gate
-# hook — no stub bd on PATH. Creates a scratch bead in the shared project Dolt
-# db with [no-test] in the DESCRIPTION and empty notes (--sandbox on every write
-# so this test never pushes to the shared remote), then closes it. With NO
-# session evidence file, the gate must ALLOW the single-bead close because the
-# description carries the marker. Keeps a deny leg: a scratch bead with NEITHER
-# marker NOR evidence must still be DENIED.
+# hook — no stub bd on PATH. Creates a scratch bead in a real per-suite Dolt db
+# with [no-test] in the DESCRIPTION and empty notes (--sandbox retained on every
+# write), then closes it. With NO session evidence file, the gate must ALLOW the
+# single-bead close because the description carries the marker. Keeps a deny
+# leg: a scratch bead with NEITHER marker NOR evidence must still be DENIED.
 
 if ! command -v bd >/dev/null 2>&1; then
   echo "SKIP (integration): bd not found on PATH"
 else
+  TDD_GATE_BD_ROOT="$STUB_DIR/real-bd"
+  mkdir -p "$TDD_GATE_BD_ROOT"
+  git -C "$TDD_GATE_BD_ROOT" init -q
+  TDD_GATE_BD_INIT_OUT="$(cd "$TDD_GATE_BD_ROOT" && env -u BEADS_DB -u BEADS_DIR BD_NON_INTERACTIVE=1 bd init --prefix=tddg --non-interactive --skip-agents --skip-hooks --quiet 2>&1)"
+  TDD_GATE_BD_STORE="$TDD_GATE_BD_ROOT/.beads"
+  tdd_gate_bd() {
+    env -u BEADS_DB BEADS_DIR="$TDD_GATE_BD_STORE" BD_NON_INTERACTIVE=1 bd "$@"
+  }
+
   # (a) allow leg — [no-test] lives in the DESCRIPTION only, notes empty.
-  P84B_INT_ID=$(bd create --sandbox \
+  P84B_INT_ID=$(tdd_gate_bd create --sandbox \
     --title="[int-test] tdd-gate p84b no-test-in-description scratch" \
     --description="Update hooks/tdd-gate.sh docs. [no-test] pure docs/config change, no runtime surface." \
     --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
@@ -933,17 +941,26 @@ else
     P84B_INT_SID="tdd-gate-p84b-int-$$-$RANDOM"
     rm -f "/tmp/tdd-evidence-${P84B_INT_SID}"  # ensure the no-evidence path
     # Real gate, real bd (no stub on PATH): marker is only in the description.
-    P84B_INT_OUT=$(make_input "bd close $P84B_INT_ID" "$P84B_INT_SID" | bash "$HOOK" 2>/dev/null)
+    P84B_INT_OUT=$(make_input "bd close $P84B_INT_ID" "$P84B_INT_SID" | \
+      env -u BEADS_DB BEADS_DIR="$TDD_GATE_BD_STORE" BD_NON_INTERACTIVE=1 \
+      bash "$HOOK" 2>/dev/null)
     if [ -z "$P84B_INT_OUT" ]; then
       pa_pass "p84b integration: real bd, [no-test] in description only, no evidence → gate ALLOWS close"
     else
       pa_fail "p84b integration: real bd, [no-test] in description only → gate ALLOWS close" "got: ${P84B_INT_OUT:-<empty>}"
     fi
-    bd close "$P84B_INT_ID" --sandbox 2>/dev/null || true
+    if env -u BEADS_DB -u BEADS_DIR BD_NON_INTERACTIVE=1 \
+         bd show "$P84B_INT_ID" --json >/dev/null 2>&1; then
+      pa_fail "p84b integration: allow-leg scratch bead stays out of the live store" \
+        "$P84B_INT_ID unexpectedly resolves outside $TDD_GATE_BD_STORE"
+    else
+      pa_pass "p84b integration: allow-leg scratch bead stays out of the live store"
+    fi
+    tdd_gate_bd close "$P84B_INT_ID" --sandbox 2>/dev/null || true
   fi
 
   # (b) deny leg — real bead with NO marker in either field, no evidence.
-  P84B_DENY_ID=$(bd create --sandbox \
+  P84B_DENY_ID=$(tdd_gate_bd create --sandbox \
     --title="[int-test] tdd-gate p84b no-marker scratch" \
     --description="Implement a real code change in hooks/foo.sh; this needs tests." \
     --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
@@ -952,13 +969,22 @@ else
   else
     P84B_DENY_SID="tdd-gate-p84b-deny-$$-$RANDOM"
     rm -f "/tmp/tdd-evidence-${P84B_DENY_SID}"
-    P84B_DENY_OUT=$(make_input "bd close $P84B_DENY_ID" "$P84B_DENY_SID" | bash "$HOOK" 2>/dev/null)
+    P84B_DENY_OUT=$(make_input "bd close $P84B_DENY_ID" "$P84B_DENY_SID" | \
+      env -u BEADS_DB BEADS_DIR="$TDD_GATE_BD_STORE" BD_NON_INTERACTIVE=1 \
+      bash "$HOOK" 2>/dev/null)
     if echo "$P84B_DENY_OUT" | grep -q '"permissionDecision": "deny"'; then
       pa_pass "p84b integration: real bd, no marker in either field, no evidence → gate DENIES close"
     else
       pa_fail "p84b integration: real bd, no marker + no evidence → gate DENIES close" "got: ${P84B_DENY_OUT:-<empty>}"
     fi
-    bd close "$P84B_DENY_ID" --sandbox 2>/dev/null || true
+    if env -u BEADS_DB -u BEADS_DIR BD_NON_INTERACTIVE=1 \
+         bd show "$P84B_DENY_ID" --json >/dev/null 2>&1; then
+      pa_fail "p84b integration: deny-leg scratch bead stays out of the live store" \
+        "$P84B_DENY_ID unexpectedly resolves outside $TDD_GATE_BD_STORE"
+    else
+      pa_pass "p84b integration: deny-leg scratch bead stays out of the live store"
+    fi
+    tdd_gate_bd close "$P84B_DENY_ID" --sandbox 2>/dev/null || true
   fi
 fi
 
