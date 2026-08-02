@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""Host-side fleet enumerator and cadence for SABLE inbox wakes (SABLE-albyd).
+
+The payload queue and its drain heartbeat are host-global under
+``/tmp/sable-<uid>/inbox``.  This process is therefore host-global too: it
+never resolves a repository from PWD and never trusts TMUX_PANE.  One sweep
+enumerates every registered pane on one explicitly configured tmux server,
+binds each pending recipient to exactly one pane, proves host PID visibility,
+then delegates readiness and count-only delivery to ``sable-inbox-watcher``.
+
+The timer does not inspect composer posture and cannot carry a message body.
+Watcher rc=1 is a safe, expected deferral (busy, booting, or exited); rc=2 is
+CANNOT-ASSESS and prevents the drain heartbeat from advancing.  A heartbeat is
+published only after a complete assessable sweep, and is fresh for exactly two
+configured cadences.  ``sable-msg`` keeps its loud fallback whenever that
+evidence is absent, stale, or malformed.
+
+Usage:
+  sable-inbox-timer --once [--socket NAME] [--interval-seconds N]
+  sable-inbox-timer [--socket NAME] [--interval-seconds N]
+  sable-inbox-timer --check-schedule [--socket NAME]
+  sable-inbox-timer --install-schedule [--units-dir PATH]
+
+Socket resolution is deliberately narrow: ``--socket`` then
+``SABLE_INBOX_TMUX_SOCKET``; otherwise tmux's default server.  The pane-shaped
+``SABLE_TMUX_SOCKET``, TMUX_PANE, and PWD are never timer inputs.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Callable, NamedTuple
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_inbox_lib import (  # noqa: E402
+    InboxError,
+    pending_recipients,
+    record_drain_heartbeat,
+)
+
+
+DEFAULT_INTERVAL_SECONDS = 60.0
+TIMER_UNIT = "sable-inbox-timer.timer"
+SERVICE_UNIT = "sable-inbox-timer.service"
+DEFAULT_UNITS_DIR = Path.home() / ".claude" / "sable" / "inbox-timer"
+_REGISTRY_FORMAT = (
+    "#{pane_id}\t#{session_name}\t#{@sable_role}\t#{@sable_bead}\t"
+    "#{@sable_provider}"
+)
+_PROVIDERS = {"claude", "codex"}
+
+
+class TimerError(RuntimeError):
+    """Base class for a timer verdict that must be visible to the operator."""
+
+
+class TimerCannotAssess(TimerError):
+    """Required registry, process, inbox, or watcher evidence is unavailable."""
+
+
+class PaneRecord(NamedTuple):
+    pane: str
+    session: str
+    role: str
+    bead: str
+    provider: str
+    identity: str
+
+
+class SweepResult(NamedTuple):
+    returncode: int
+    poked: tuple[str, ...]
+    deferred: tuple[str, ...]
+    errors: tuple[str, ...]
+
+
+def _run(argv: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, capture_output=True, text=True, check=False, **kwargs)
+
+
+def resolve_socket(
+    cli_socket: str | None,
+    env: dict[str, str] | None = None,
+) -> str | None:
+    """Resolve only explicit host-timer configuration, never pane context."""
+
+    if cli_socket:
+        return cli_socket
+    source = os.environ if env is None else env
+    return source.get("SABLE_INBOX_TMUX_SOCKET") or None
+
+
+def _tmux_base(socket: str | None) -> list[str]:
+    return ["tmux", "-L", socket] if socket else ["tmux"]
+
+
+def parse_registry(text: str) -> list[PaneRecord]:
+    """Parse registered pane identities; roleless terminal panes are noise."""
+
+    records: list[PaneRecord] = []
+    for line in text.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 5:
+            raise TimerCannotAssess(f"invalid pane registry row: {line!r}")
+        pane, session, role, bead, provider = fields
+        identity = bead if role == "worker" else role
+        if not identity:
+            continue
+        if not pane or not session:
+            raise TimerCannotAssess(f"invalid pane registry row: {line!r}")
+        provider = provider.strip().lower()
+        if provider not in _PROVIDERS:
+            raise TimerCannotAssess(
+                f"registered pane {pane} identity {identity} has invalid or missing "
+                f"provider {provider!r}"
+            )
+        records.append(PaneRecord(pane, session, role, bead, provider, identity))
+    return records
+
+
+def enumerate_registry(
+    socket: str | None,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = _run,
+) -> list[PaneRecord]:
+    argv = _tmux_base(socket) + ["list-panes", "-a", "-F", _REGISTRY_FORMAT]
+    try:
+        result = run(argv)
+    except OSError as exc:
+        raise TimerCannotAssess(f"could not enumerate tmux panes: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip() or f"exit {result.returncode}"
+        raise TimerCannotAssess(f"could not enumerate tmux panes: {detail}")
+    records = parse_registry(result.stdout or "")
+    if not records:
+        label = socket or "default"
+        raise TimerCannotAssess(
+            f"no registered SABLE panes are visible on tmux socket {label!r}"
+        )
+    return records
+
+
+def _subprocess_env(socket: str | None) -> dict[str, str]:
+    env = os.environ.copy()
+    if socket:
+        env["SABLE_TMUX_SOCKET"] = socket
+    else:
+        env.pop("SABLE_TMUX_SOCKET", None)
+    env.pop("TMUX_PANE", None)
+    return env
+
+
+def prove_host_pid_visibility(
+    record: PaneRecord,
+    *,
+    socket: str | None,
+    status_command: str,
+    run: Callable[..., subprocess.CompletedProcess[str]] = _run,
+) -> None:
+    """Require the real process-tree seam to assess one registered pane."""
+
+    argv = [status_command, "--quiescence-pane", record.pane, "--json"]
+    try:
+        result = run(argv, env=_subprocess_env(socket))
+    except OSError as exc:
+        raise TimerCannotAssess(
+            f"host PID visibility probe could not start for {record.pane}: {exc}"
+        ) from exc
+    try:
+        payload = json.loads(result.stdout or "")
+        panes = payload["panes"]
+        matches = [row for row in panes if row.get("pane") == record.pane]
+        if len(matches) != 1:
+            raise ValueError(f"expected one pane record, found {len(matches)}")
+        state = matches[0]["state"]
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise TimerCannotAssess(
+            f"host PID visibility probe returned invalid evidence for {record.pane}: {exc}"
+        ) from exc
+    if result.returncode != 0 or state == "CANNOT-ASSESS":
+        detail = (result.stderr or "").strip() or f"state={state} rc={result.returncode}"
+        raise TimerCannotAssess(
+            f"host PID visibility is unavailable for pane {record.pane}: {detail}"
+        )
+    if state not in {"LIVE", "EXITED"}:
+        raise TimerCannotAssess(
+            f"host PID visibility probe returned invalid state {state!r} for {record.pane}"
+        )
+
+
+def _watcher_argv(
+    record: PaneRecord,
+    *,
+    watcher_command: str,
+    status_command: str,
+) -> list[str]:
+    return [
+        watcher_command,
+        record.identity,
+        record.pane,
+        record.provider,
+        "--session",
+        record.session,
+        "--status-command",
+        status_command,
+    ]
+
+
+def sweep_once(
+    *,
+    socket: str | None,
+    interval_seconds: float,
+    status_command: str,
+    watcher_command: str,
+    run: Callable[..., subprocess.CompletedProcess[str]] = _run,
+    recipients_fn=pending_recipients,
+    heartbeat_fn=record_drain_heartbeat,
+) -> SweepResult:
+    """Run one complete sweep; only complete assessable sweeps heartbeat."""
+
+    try:
+        records = enumerate_registry(socket, run=run)
+        prove_host_pid_visibility(
+            records[0], socket=socket, status_command=status_command, run=run
+        )
+        recipients = recipients_fn()
+    except (TimerCannotAssess, InboxError, OSError, ValueError, TypeError) as exc:
+        return SweepResult(2, (), (), (str(exc),))
+
+    by_identity: dict[str, list[PaneRecord]] = {}
+    for record in records:
+        by_identity.setdefault(record.identity, []).append(record)
+
+    poked: list[str] = []
+    deferred: list[str] = []
+    errors: list[str] = []
+    for recipient in recipients:
+        matches = by_identity.get(recipient, [])
+        if not matches:
+            errors.append(f"no registered pane is bound to pending recipient {recipient}")
+            continue
+        if len(matches) != 1:
+            errors.append(
+                f"pending recipient {recipient} has ambiguous pane bindings "
+                f"{[row.pane for row in matches]}"
+            )
+            continue
+        record = matches[0]
+        argv = _watcher_argv(
+            record,
+            watcher_command=watcher_command,
+            status_command=status_command,
+        )
+        try:
+            result = run(argv, env=_subprocess_env(socket))
+        except OSError as exc:
+            errors.append(f"watcher could not start for {recipient}: {exc}")
+            continue
+        if result.returncode == 0:
+            poked.append(recipient)
+        elif result.returncode == 1:
+            # The watcher has positively refused an unsafe CURRENT posture.
+            # That is a healthy drainer deferral, not missing infrastructure.
+            deferred.append(recipient)
+            detail = (result.stderr or "").strip()
+            if detail:
+                print(f"sable-inbox-timer: DEFERRED {recipient}: {detail}", file=sys.stderr)
+        else:
+            detail = (result.stderr or "").strip() or f"exit {result.returncode}"
+            errors.append(f"watcher CANNOT-ASSESS recipient {recipient}: {detail}")
+
+    if errors:
+        return SweepResult(2, tuple(poked), tuple(deferred), tuple(errors))
+    try:
+        heartbeat_fn(interval_seconds=interval_seconds)
+    except (InboxError, OSError, ValueError, TypeError) as exc:
+        return SweepResult(
+            2,
+            tuple(poked),
+            tuple(deferred),
+            (f"could not publish drain heartbeat: {exc}",),
+        )
+    return SweepResult(0, tuple(poked), tuple(deferred), ())
+
+
+# Schedule verification mirrors sable-reconcile-timer's host-side precedent.
+_SOCKET_RE = re.compile(r"--socket(?:=|\s+)(\S+)")
+
+
+def _scheduled_lines(text: str) -> list[str]:
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+        and not line.strip().startswith("#")
+        and "sable-inbox-timer" in line
+    ]
+
+
+def scheduled_sockets(text: str) -> list[str | None]:
+    sockets: list[str | None] = []
+    for line in _scheduled_lines(text):
+        match = _SOCKET_RE.search(line)
+        sockets.append(match.group(1).strip('"\'') if match else None)
+    return sockets
+
+
+def _run_text(argv: list[str]) -> tuple[int, str]:
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 127, ""
+    return result.returncode, (result.stdout or "") + (result.stderr or "")
+
+
+def read_live_schedule() -> tuple[bool, str, str]:
+    active = False
+    unit_text = ""
+    if shutil.which("systemctl"):
+        rc, _ = _run_text(["systemctl", "--user", "is-active", TIMER_UNIT])
+        active = rc == 0
+        _, unit_text = _run_text(["systemctl", "--user", "cat", SERVICE_UNIT])
+    cron_text = ""
+    if shutil.which("crontab"):
+        rc, output = _run_text(["crontab", "-l"])
+        cron_text = output if rc == 0 else ""
+    return active, unit_text, cron_text
+
+
+def check_schedule(expected_socket: str | None) -> int:
+    active, unit_text, cron_text = read_live_schedule()
+    active_text = unit_text if active else ""
+    cron_lines = "\n".join(_scheduled_lines(cron_text))
+    configured = scheduled_sockets(active_text) + scheduled_sockets(cron_lines)
+    label = expected_socket or "default"
+    print("sable-inbox-timer schedule check:")
+    print(f"  systemd --user {TIMER_UNIT}: {'ACTIVE' if active else 'not active'}")
+    print(f"  crontab entries: {len(_scheduled_lines(cron_text))}")
+    print(f"  expected tmux socket: {label}")
+    if not configured:
+        print(
+            "sable-inbox-timer: SCHEDULE CHECK FAILED: no active systemd timer "
+            "or crontab entry invokes the inbox drainer",
+            file=sys.stderr,
+        )
+        return 3
+    if expected_socket not in configured:
+        rendered = [item or "default" for item in configured]
+        print(
+            f"sable-inbox-timer: SCHEDULE CHECK FAILED: live schedule targets "
+            f"{rendered}, not {label}",
+            file=sys.stderr,
+        )
+        return 3
+    print("  OK: a live schedule invokes the drainer for the expected tmux socket.")
+    return 0
+
+
+def install_schedule(units_dir: Path, expected_socket: str | None) -> int:
+    service = units_dir / SERVICE_UNIT
+    timer = units_dir / TIMER_UNIT
+    missing = [str(path) for path in (service, timer) if not path.is_file()]
+    if missing:
+        print(
+            f"sable-inbox-timer: staged unit(s) not found: {missing}. Run "
+            "sable-orchestration-install first.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        staged_sockets = scheduled_sockets(service.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as exc:
+        print(
+            f"sable-inbox-timer: could not read staged service {service}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    if len(staged_sockets) != 1:
+        print(
+            f"sable-inbox-timer: staged service must contain exactly one drainer "
+            f"invocation, found {len(staged_sockets)}",
+            file=sys.stderr,
+        )
+        return 2
+    staged_socket = staged_sockets[0]
+    if expected_socket is not None and expected_socket != staged_socket:
+        print(
+            f"sable-inbox-timer: requested tmux socket {expected_socket!r} does "
+            f"not match staged socket {(staged_socket or 'default')!r}; rerun "
+            "sable-orchestration-install with the intended socket first",
+            file=sys.stderr,
+        )
+        return 2
+    if expected_socket is None:
+        expected_socket = staged_socket
+    if not shutil.which("systemctl"):
+        print(
+            "sable-inbox-timer: no systemctl on this host; install the staged "
+            f"cron line from {units_dir / 'sable-inbox-timer.cron'} and re-run "
+            "--check-schedule",
+            file=sys.stderr,
+        )
+        return 3
+    destination = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    destination = destination / "systemd" / "user"
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        for source in (service, timer):
+            shutil.copyfile(source, destination / source.name)
+    except OSError as exc:
+        print(
+            f"sable-inbox-timer: could not install staged units into "
+            f"{destination}: {exc}",
+            file=sys.stderr,
+        )
+        return 3
+    for argv in (
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", TIMER_UNIT],
+    ):
+        rc, output = _run_text(argv)
+        if rc != 0:
+            print(
+                f"sable-inbox-timer: {' '.join(argv)} failed (rc={rc}): {output}",
+                file=sys.stderr,
+            )
+            return 3
+    return check_schedule(expected_socket)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="sable-inbox-timer")
+    parser.add_argument("--socket", help="explicit tmux socket name")
+    parser.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=os.environ.get(
+            "SABLE_INBOX_INTERVAL_SECONDS", str(DEFAULT_INTERVAL_SECONDS)
+        ),
+        help="sweep cadence and heartbeat basis (default 60; heartbeat lasts 2x)",
+    )
+    parser.add_argument("--once", action="store_true", help="run one sweep and exit")
+    parser.add_argument("--status-command", help="sable-worker-status path")
+    parser.add_argument("--watcher-command", help="sable-inbox-watcher path")
+    schedule = parser.add_mutually_exclusive_group()
+    schedule.add_argument("--check-schedule", action="store_true")
+    schedule.add_argument("--install-schedule", action="store_true")
+    parser.add_argument("--units-dir", default=str(DEFAULT_UNITS_DIR))
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+
+    if not math.isfinite(args.interval_seconds) or args.interval_seconds <= 0:
+        parser.error("--interval-seconds must be a finite positive number")
+    socket = resolve_socket(args.socket)
+    if args.install_schedule:
+        return install_schedule(Path(args.units_dir), socket)
+    if args.check_schedule:
+        return check_schedule(socket)
+
+    sibling = Path(os.path.realpath(__file__)).parent
+    status_command = args.status_command or str(sibling / "sable-worker-status")
+    watcher_command = args.watcher_command or str(sibling / "sable-inbox-watcher")
+
+    def run_sweep() -> int:
+        result = sweep_once(
+            socket=socket,
+            interval_seconds=args.interval_seconds,
+            status_command=status_command,
+            watcher_command=watcher_command,
+        )
+        for error in result.errors:
+            print(f"sable-inbox-timer: CANNOT-ASSESS: {error}", file=sys.stderr)
+        print(
+            f"sable-inbox-timer: sweep poked={len(result.poked)} "
+            f"deferred={len(result.deferred)} errors={len(result.errors)}"
+        )
+        return result.returncode
+
+    if args.once:
+        return run_sweep()
+
+    def _stop(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _stop)
+    try:
+        while True:
+            run_sweep()
+            time.sleep(args.interval_seconds)
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
