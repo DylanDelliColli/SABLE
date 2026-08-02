@@ -1,4 +1,4 @@
-cd2f143ad51e9b78e13d5ead6d3036e3f98b21bb31b11050c3d5bf9f9c639639  ./.sable-install-provenance
+d3b815d72f3b1141138dfb5852881d10a34dbe77912183ba3368f6a132fe090f  ./.sable-install-provenance
 6ad9a8c7c088f4750326a7dac7c751951860cc9dff127f23987115672d7a8351  ./CLAUDE.md
 f595d9fd7685073d898a8b80638e97e26dac98f4e117cf206771b2d5ac964bfe  ./agents/columbo.md
 8b4884da9b454bb5f55902944789de77438e5ba2daa40849317e4b18879e0f35  ./agents/rudy.md
@@ -27,7 +27,7 @@ cbdea65644eff16c2c462ee855ba11106185927b7d2d0f2fe899740337973f4d  ./hooks/multi-
 d609623bf1dba8f50ba3b02962af8014c90d679e31267bcf1f2d87dd4f042250  ./hooks/multi-manager/pre-push-rebase-test.sh
 f3cbdd63ee02a6de238cd889dc4c7eff228036fa5a3b9db9aa229c606021c429  ./hooks/multi-manager/read-guard.sh
 e1b207bc80a293d975beb76bfa671b3312d3979c10dabc46c807fcbae305752d  ./hooks/multi-manager/seat-sighting-gate.sh
-fe3d604367788420feff535d560846942f36482e3847ec7b3ea3ab7a33d11ecb  ./hooks/multi-manager/session-role-anchor.sh
+4235db973886204cdbd5bf1af904c647fb6848fadc9b8d469b7f57c4e6bb2469  ./hooks/multi-manager/session-role-anchor.sh
 22d9931473a342546330ba6a9c40694b825f312188af9f637d8b3bb661f0bd8e  ./hooks/multi-manager/stash-worktree-guard.sh
 836eeaab1cf2a4678a1a7bb03cffb277f30dba94eb502ceb42472ef00b388640  ./hooks/multi-manager/tree-claim-impl.sh
 13a5e989cec74933fc69331a8deba60bc6c2099495d21a4c91350c098d215593  ./hooks/multi-manager/tree-claim.sh
