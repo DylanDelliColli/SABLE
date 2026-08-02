@@ -262,19 +262,29 @@ else
 fi
 rm -f "$OW_INT_EV"
 
-# ---------- INTEGRATION: real bd --sandbox close succeeds after sable-test green ----------
+# ---------- INTEGRATION: isolated real bd close succeeds after sable-test green ----------
 # The worker's real workflow: run the suite through sable-test (green), then
-# close its OWN bead. Exercises real bd (sandbox DB, no Dolt push). The gate is a
-# Claude Code PreToolUse hook (not wired into bd itself in a shell test), so we
-# drive the real gate hook against the REAL bead's real notes for the close —
-# the genuine composition a worker self-close performs.
+# close its OWN bead. Exercises real bd in a per-suite store while preserving
+# the production --sandbox argv. The gate is a Claude Code PreToolUse hook (not
+# wired into bd itself in a shell test), so we drive the real gate hook against
+# the REAL scratch bead's notes for the close — the genuine composition a
+# worker self-close performs without polluting the live tracker (SABLE-a7q4p).
 if ! command -v bd >/dev/null 2>&1; then
   echo "SKIP (integration): bd not found on PATH — real-sandbox close test"
 else
+  SABLE_TEST_BD_ROOT="$STUB_DIR/real-bd"
+  mkdir -p "$SABLE_TEST_BD_ROOT"
+  git -C "$SABLE_TEST_BD_ROOT" init -q
+  SABLE_TEST_BD_INIT_OUT="$(cd "$SABLE_TEST_BD_ROOT" && env -u BEADS_DB -u BEADS_DIR BD_NON_INTERACTIVE=1 bd init --prefix=stint --non-interactive --skip-agents --skip-hooks --quiet 2>&1)"
+  SABLE_TEST_BD_STORE="$SABLE_TEST_BD_ROOT/.beads"
+  sable_test_bd() {
+    env -u BEADS_DB BEADS_DIR="$SABLE_TEST_BD_STORE" BD_NON_INTERACTIVE=1 bd "$@"
+  }
+
   SB_SID="sable-test-bd-$$-$RANDOM"
   SB_EV="/tmp/tdd-evidence-${SB_SID}"
   rm -f "$SB_EV"
-  SCRATCH_ID=$(bd create --sandbox \
+  SCRATCH_ID=$(sable_test_bd create --sandbox \
     --title="[int-test] sable-test green-close scratch bead" \
     --description="scratch bead for sable-test integration; safe to close" \
     --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
@@ -285,20 +295,31 @@ else
     CLAUDE_SESSION_ID="$SB_SID" env -u CLAUDE_AGENT_ID "$SABLE_TEST" bash -c 'exit 0' >/dev/null 2>&1
     # Real gate hook, real bead notes (no [no-test]): a single-bead close must be
     # ALLOWED because sable-test recorded green evidence for this session.
-    CLOSE_OUT=$(gate_input "bd close $SCRATCH_ID" "$SB_SID" | bash "$GATE_HOOK" 2>/dev/null)
+    CLOSE_OUT=$(gate_input "bd close $SCRATCH_ID" "$SB_SID" | \
+      env -u BEADS_DB BEADS_DIR="$SABLE_TEST_BD_STORE" BD_NON_INTERACTIVE=1 \
+      bash "$GATE_HOOK" 2>/dev/null)
     if [ -z "$CLOSE_OUT" ]; then
       pass "integration(real bd): sable-test green evidence lets the real gate allow the worker self-close of $SCRATCH_ID"
     else
       fail "integration(real bd): sable-test green evidence allows the real gate close" "gate denied: $CLOSE_OUT"
     fi
     # And the negative: a fresh session with no sable-test run is DENIED for the same bead.
-    NOEV_OUT=$(gate_input "bd close $SCRATCH_ID" "sable-test-noev-$$-$RANDOM" | bash "$GATE_HOOK" 2>/dev/null)
+    NOEV_OUT=$(gate_input "bd close $SCRATCH_ID" "sable-test-noev-$$-$RANDOM" | \
+      env -u BEADS_DB BEADS_DIR="$SABLE_TEST_BD_STORE" BD_NON_INTERACTIVE=1 \
+      bash "$GATE_HOOK" 2>/dev/null)
     if echo "$NOEV_OUT" | grep -q '"permissionDecision": "deny"'; then
       pass "integration(real bd): same bead, a session with no sable-test evidence is DENIED"
     else
       fail "integration(real bd): session with no evidence is DENIED" "got: ${NOEV_OUT:-<empty>}"
     fi
-    bd close "$SCRATCH_ID" --sandbox 2>/dev/null || true
+    if env -u BEADS_DB -u BEADS_DIR BD_NON_INTERACTIVE=1 \
+         bd show "$SCRATCH_ID" --json >/dev/null 2>&1; then
+      fail "integration(real bd): scratch bead is absent from the live store" \
+        "$SCRATCH_ID unexpectedly resolves outside $SABLE_TEST_BD_STORE"
+    else
+      pass "integration(real bd): scratch bead is absent from the live store"
+    fi
+    sable_test_bd close "$SCRATCH_ID" --sandbox 2>/dev/null || true
   fi
   rm -f "$SB_EV"
 fi

@@ -21,6 +21,8 @@ set -uo pipefail
 
 HOOK="$(cd "$(dirname "$0")/.." && pwd)/multi-manager/post-push-merge-notify.sh"
 LIB_DIR="$(cd "$(dirname "$0")/.." && pwd)/multi-manager"
+# shellcheck source=lib-json-input-encoder.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib-json-input-encoder.sh"
 
 if [ ! -x "$HOOK" ]; then
   echo "FAIL: hook not executable at $HOOK"
@@ -58,7 +60,7 @@ cd_fixture() {
 # git -C <path> diff origin/main...HEAD works.
 FIXTURE_REPO=$(mktemp -d)
 BARE_ORIGIN=$(mktemp -d)
-trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR"' EXIT
+trap 'sable_json_encoder_stop; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR"' EXIT
 
 git init -q --bare "$BARE_ORIGIN"
 git clone -q "$BARE_ORIGIN" "$FIXTURE_REPO"
@@ -98,6 +100,9 @@ cd - >/dev/null
 
 # Create stub bd binary that counts calls and logs for-chuck label usage
 STUB_DIR=$(mktemp -d)
+sable_json_encoder_start "$STUB_DIR"
+POST_INPUT_ENCODER_PID="$SABLE_JSON_ENCODER_PID"
+POST_INPUT_ENCODER_TRACE="$SABLE_JSON_ENCODER_TRACE"
 BD_LOG="$STUB_DIR/bd-calls.log"
 cat > "$STUB_DIR/bd" <<'EOF'
 #!/usr/bin/env bash
@@ -171,15 +176,7 @@ MGR_ENV="CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager"
 # make_post_input <command> <cwd> [stdout] [stderr]
 make_post_input() {
   local cmd="$1" cwd="$2" stdout="${3:-}" stderr="${4:-}"
-  python3 -c "
-import json, sys
-cmd, cwd, stdout, stderr = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-print(json.dumps({
-    'tool_input': {'command': cmd},
-    'cwd': cwd,
-    'tool_response': {'stdout': stdout, 'stderr': stderr}
-}))
-" "$cmd" "$cwd" "$stdout" "$stderr"
+  sable_json_encoder_encode post "$cmd" "$cwd" "$stdout" "$stderr" "" "" 0
 }
 
 # make_member_post_input <command> <cwd> <agent_type> [stdout] [stderr]
@@ -189,18 +186,32 @@ print(json.dumps({
 # (SABLE-amj.5; the same resolved-identity fix as SABLE-8fp for nested v2).
 make_member_post_input() {
   local cmd="$1" cwd="$2" atype="$3" stdout="${4:-}" stderr="${5:-}"
-  python3 -c "
-import json, sys
-cmd, cwd, atype, stdout, stderr = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
-print(json.dumps({
-    'agent_id': 'opaque-member-id',
-    'agent_type': atype,
-    'tool_input': {'command': cmd},
-    'cwd': cwd,
-    'tool_response': {'stdout': stdout, 'stderr': stderr},
-}))
-" "$cmd" "$cwd" "$atype" "$stdout" "$stderr"
+  sable_json_encoder_encode post "$cmd" "$cwd" "$stdout" "$stderr" \
+    'opaque-member-id' "$atype" 1
 }
+
+# Load-bearing escaping plants: empty stdout/stderr is the common post-hook
+# shape, while the member shape crosses every risky shell/JSON boundary.  Their
+# exact json.dumps outputs are checked with the one-process/request count at the
+# end of the suite.
+POST_INPUT_EMPTY_ACTUAL=$(make_post_input \
+  $'git push "snowman ☃"\nnext\\tail\tend' \
+  $'/tmp/post space/é' \
+  "" "")
+POST_INPUT_EMPTY_EXPECTED='{"tool_input": {"command": "git push \"snowman \u2603\"\nnext\\tail\tend"}, "cwd": "/tmp/post space/\u00e9", "tool_response": {"stdout": "", "stderr": ""}}'
+POST_INPUT_MEMBER_ACTUAL=$(make_member_post_input \
+  $'git push "snowman ☃"\nnext\\tail\tend' \
+  $'/tmp/post space/é' \
+  $'tarzan"\\\n☃' \
+  $'out\n"quoted"\\tail' \
+  $'err\t☃')
+POST_INPUT_MEMBER_EXPECTED='{"agent_id": "opaque-member-id", "agent_type": "tarzan\"\\\n\u2603", "tool_input": {"command": "git push \"snowman \u2603\"\nnext\\tail\tend"}, "cwd": "/tmp/post space/\u00e9", "tool_response": {"stdout": "out\n\"quoted\"\\tail", "stderr": "err\t\u2603"}}'
+# The clean-room path has 59 ordinary/member payloads plus these two plants.
+# Three real-bd integration payloads are conditional by design; increment next
+# to each executed call so both the no-bd CI population and local real-bd
+# population retain an exact (never lower-bound) request-count assertion.
+POST_INPUT_BASE_REQUESTS=61
+POST_INPUT_OPTIONAL_REQUESTS=0
 
 # run_hook <env_prefix> <json> → prints hook stdout+stderr
 # SABLE-y4nom.7.6: tracing is off for the ordinary behavior matrix; only the
@@ -312,7 +323,7 @@ assert_bd_called "bogus base ref: bd create still called via fallback base"
 # Set up a second clean repo pair for the integration scenario
 INT_BARE=$(mktemp -d)
 INT_REPO=$(mktemp -d)
-trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO"' EXIT
+trap 'sable_json_encoder_stop; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO"' EXIT
 
 git init -q --bare "$INT_BARE"
 git clone -q "$INT_BARE" "$INT_REPO"
@@ -549,7 +560,7 @@ assert_bd_called "SABLE-wvk9: durable for-chuck bead filed when Chuck pane absen
 
 INTNOTIFY_REPO=$(mktemp -d)
 INTNOTIFY_BARE=$(mktemp -d)
-trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE"' EXIT
+trap 'sable_json_encoder_stop; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE"' EXIT
 git init -q --bare "$INTNOTIFY_BARE"
 git clone -q "$INTNOTIFY_BARE" "$INTNOTIFY_REPO"
 cd_fixture "$INTNOTIFY_REPO"
@@ -655,7 +666,7 @@ rm -f "$BD_LOG" "$SABLE_MSG_LOG"
 
 PZFK_BARE=$(mktemp -d)
 PZFK_REPO=$(mktemp -d)
-trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO"' EXIT
+trap 'sable_json_encoder_stop; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO"' EXIT
 
 git init -q --bare "$PZFK_BARE"
 git clone -q "$PZFK_BARE" "$PZFK_REPO"
@@ -744,7 +755,7 @@ chmod +x "$STUB_DIR/bd"
 
 B06T_BARE=$(mktemp -d)
 B06T_REPO=$(mktemp -d)
-trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO"' EXIT
+trap 'sable_json_encoder_stop; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO"' EXIT
 
 git init -q --bare "$B06T_BARE"
 git clone -q "$B06T_BARE" "$B06T_REPO"
@@ -978,7 +989,7 @@ chmod +x "$STUB_DIR/bd"
 # must not file a for-chuck bead (there is genuinely nothing to review).
 EMPTYDIFF_BARE=$(mktemp -d)
 EMPTYDIFF_REPO=$(mktemp -d)
-trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO"' EXIT
+trap 'sable_json_encoder_stop; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO"' EXIT
 
 git init -q --bare "$EMPTYDIFF_BARE"
 git clone -q "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO"
@@ -1326,7 +1337,7 @@ chmod +x "$STUB_DIR/bd"
 
 RIU_BARE=$(mktemp -d)
 RIU_REPO=$(mktemp -d)
-trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$RIU_BARE" "$RIU_REPO"' EXIT
+trap 'sable_json_encoder_stop; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$RIU_BARE" "$RIU_REPO"' EXIT
 
 git init -q --bare "$RIU_BARE"
 git clone -q "$RIU_BARE" "$RIU_REPO"
@@ -1848,7 +1859,7 @@ else
   # real EXIT time); GX_BRANCH is unset if the script dies before reaching its
   # assignment, in which case no push happened yet either — the guard makes
   # that a no-op rather than an error under set -u.
-  trap '[ -n "${GX_BRANCH:-}" ] && command -v gx7p3_cleanup_stray_forchuck >/dev/null 2>&1 && gx7p3_cleanup_stray_forchuck "$GX_BRANCH"; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$GX_BARE" "$GX_REPO" "$GX_INT_STUB" "$POST_BD_ROOT"' EXIT
+  trap 'sable_json_encoder_stop; [ -n "${GX_BRANCH:-}" ] && command -v gx7p3_cleanup_stray_forchuck >/dev/null 2>&1 && gx7p3_cleanup_stray_forchuck "$GX_BRANCH"; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$GX_BARE" "$GX_REPO" "$GX_INT_STUB" "$POST_BD_ROOT"' EXIT
 
   # Safety-net teardown (requirement 2): find and close/relabel ANY real
   # for-chuck bead naming $1, regardless of whether the assertions above it
@@ -1933,6 +1944,7 @@ EOF
     # (1) Bead is genuinely in_progress (its natural post-create state): the
     # delivered message must carry the AUTO-NOTIFY tag and must NOT assert
     # closure.
+    POST_INPUT_OPTIONAL_REQUESTS=$((POST_INPUT_OPTIONAL_REQUESTS + 1))
     INT_GX_INPUT=$(make_post_input "git push" "$GX_REPO")
     CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager TMUX_PANE=%gxinttest SABLE_HOOK_TRACE=0 \
       PATH="$GX_INT_STUB:$PATH" GX_MSG_LOG="$GX_MSG_LOG" BEADS_DB="$POST_BD_DB" \
@@ -1981,6 +1993,7 @@ EOF
     git update-ref "refs/remotes/origin/$GX_BRANCH" HEAD
     cd - >/dev/null
 
+    POST_INPUT_OPTIONAL_REQUESTS=$((POST_INPUT_OPTIONAL_REQUESTS + 1))
     INT_GX_INPUT2=$(make_post_input "git push" "$GX_REPO")
     CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager TMUX_PANE=%gxinttest SABLE_HOOK_TRACE=0 \
       PATH="$GX_INT_STUB:$PATH" GX_MSG_LOG="$GX_MSG_LOG" BEADS_DB="$POST_BD_DB" \
@@ -2029,7 +2042,7 @@ fi
 
 PFBJW_BARE=$(mktemp -d)
 PFBJW_REPO=$(mktemp -d)
-trap 'rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$PFBJW_BARE" "$PFBJW_REPO"' EXIT
+trap 'sable_json_encoder_stop; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$PFBJW_BARE" "$PFBJW_REPO"' EXIT
 
 git init -q --bare "$PFBJW_BARE"
 git clone -q "$PFBJW_BARE" "$PFBJW_REPO"
@@ -2236,7 +2249,7 @@ for i in d:
       post_bd close "$id" --sandbox --reason "SABLE-pfbjw integration-test safety-net cleanup" 2>/dev/null || true
     done
   }
-  trap '[ -n "${PFI_BRANCH:-}" ] && command -v pfbjw_cleanup_stray_forchuck >/dev/null 2>&1 && pfbjw_cleanup_stray_forchuck "$PFI_BRANCH"; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$PFBJW_BARE" "$PFBJW_REPO" "$PFI_BARE" "$PFI_REPO" "$PFI_STUB" "$POST_BD_ROOT"' EXIT
+  trap 'sable_json_encoder_stop; [ -n "${PFI_BRANCH:-}" ] && command -v pfbjw_cleanup_stray_forchuck >/dev/null 2>&1 && pfbjw_cleanup_stray_forchuck "$PFI_BRANCH"; rm -rf "$FIXTURE_REPO" "$BARE_ORIGIN" "$STUB_DIR" "$INT_BARE" "$INT_REPO" "$INTNOTIFY_REPO" "$INTNOTIFY_BARE" "$PZFK_BARE" "$PZFK_REPO" "$B06T_BARE" "$B06T_REPO" "$EMPTYDIFF_BARE" "$EMPTYDIFF_REPO" "$PFBJW_BARE" "$PFBJW_REPO" "$PFI_BARE" "$PFI_REPO" "$PFI_STUB" "$POST_BD_ROOT"' EXIT
 
   cat > "$PFI_STUB/sable-msg" <<'EOF'
 #!/usr/bin/env bash
@@ -2295,6 +2308,7 @@ EOF
   else
     post_bd close "$PFI_SCRATCH_ID" --sandbox --reason "SABLE-pfbjw integration test: modeling closed-but-unlanded" 2>/dev/null || true
 
+    POST_INPUT_OPTIONAL_REQUESTS=$((POST_INPUT_OPTIONAL_REQUESTS + 1))
     PFI_INPUT=$(make_post_input "git push" "$PFI_REPO")
     CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager SABLE_HOOK_TRACE=0 \
       PATH="$PFI_STUB:$PATH" PFI_MSG_LOG="$PFI_MSG_LOG" BEADS_DB="$POST_BD_DB" \
@@ -2308,6 +2322,38 @@ EOF
       fail "integration SABLE-pfbjw: real bd + real git — CLOSED-but-unlanded occupant STILL warns" "MSG_LOG: $(cat "$PFI_MSG_LOG" 2>/dev/null)"
     fi
   fi
+fi
+
+# Pin both json.dumps schemas and the exact request count for the population
+# that ran, so restoring a per-payload python3 process or bypassing the shared
+# encoder for one case fails loudly in both clean-room and real-bd runs.
+if [ "$POST_INPUT_EMPTY_ACTUAL" = "$POST_INPUT_EMPTY_EXPECTED" ] \
+   && [ "$POST_INPUT_MEMBER_ACTUAL" = "$POST_INPUT_MEMBER_EXPECTED" ]; then
+  pass "shared post-input encoder preserves empty fields and exact Unicode/newline/backslash/tab escaping"
+else
+  fail "shared post-input encoder preserves empty fields and exact Unicode/newline/backslash/tab escaping" \
+    "empty=$POST_INPUT_EMPTY_ACTUAL member=$POST_INPUT_MEMBER_ACTUAL"
+fi
+
+POST_INPUT_ENCODER_STARTS=$(grep -c '^start$' "$POST_INPUT_ENCODER_TRACE")
+POST_INPUT_ENCODER_REQUESTS=$(grep -c '^request$' "$POST_INPUT_ENCODER_TRACE")
+POST_INPUT_EXPECTED_REQUESTS=$((POST_INPUT_BASE_REQUESTS + POST_INPUT_OPTIONAL_REQUESTS))
+POST_INPUT_HELPERS=$(declare -f make_post_input make_member_post_input)
+if [ "$POST_INPUT_ENCODER_STARTS" -eq 1 ] \
+   && [ "$POST_INPUT_ENCODER_REQUESTS" -eq "$POST_INPUT_EXPECTED_REQUESTS" ] \
+   && [[ "$POST_INPUT_HELPERS" != *"python3 -c"* ]]; then
+  pass "one shared encoder process serves all $POST_INPUT_EXPECTED_REQUESTS post-hook payloads"
+else
+  fail "one shared encoder process serves every post-hook payload" \
+    "starts=$POST_INPUT_ENCODER_STARTS requests=$POST_INPUT_ENCODER_REQUESTS expected=$POST_INPUT_EXPECTED_REQUESTS"
+fi
+
+sable_json_encoder_stop
+if kill -0 "$POST_INPUT_ENCODER_PID" 2>/dev/null; then
+  fail "shared post-input encoder is reaped before suite exit" \
+    "pid=$POST_INPUT_ENCODER_PID is still alive"
+else
+  pass "shared post-input encoder is reaped before suite exit"
 fi
 
 # --------------------------------------------------------------------------

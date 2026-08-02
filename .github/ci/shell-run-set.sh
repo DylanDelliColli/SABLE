@@ -70,6 +70,7 @@ ALLOW=(
   test-inbox-wake.sh
   test-install-golden-manifest.sh
   test-install-preserves-pins.sh
+  test-json-input-encoder.sh
   test-lib-git-sandbox.sh
   test-lib-hook-trace.sh
   test-lib-identity.sh
@@ -281,6 +282,7 @@ declare -A COVERS=(
   # itself (SABLE-slip0.7), so regenerating the golden updates the selection
   # rule in the same edit instead of leaving a hand-copied list to rot.
   [test-install-golden-manifest.sh]="hooks/test/fixtures/install-golden-manifest.txt hooks/test/lib-golden-manifest.sh"
+  [test-json-input-encoder.sh]="hooks/test/lib-json-input-encoder.sh"
   [test-impact-selection.sh]=".github/ci/impact-manifest.sh .github/ci/shell-run-set.sh bin/sable-orchestration-install"
   [test-control-trace.sh]="hooks/multi-manager/control-trace.sh"
   [test-dep-merge-state.sh]="bin/sable-dep-check bin/sable-spawn-worker"
@@ -304,13 +306,13 @@ declare -A COVERS=(
   [test-overlap-constraint.sh]="hooks/multi-manager/pre-dispatch-overlap.sh"
   [test-overlap-dispatch-e2e.sh]="hooks/multi-manager/pre-dispatch-overlap.sh"
   [test-parallel-previews.sh]="bin/sable-merge-gate bin/sable_gate_preview_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py bin/sable_gate_git_lib.py .github/workflows/ci-verify.yml"
-  [test-post-push-merge-notify.sh]="hooks/multi-manager/post-push-merge-notify.sh"
+  [test-post-push-merge-notify.sh]="hooks/multi-manager/post-push-merge-notify.sh hooks/test/lib-json-input-encoder.sh"
   [test-pre-dispatch-claim.sh]="hooks/multi-manager/pre-dispatch-claim.sh bin/sable-dep-check"
   [test-pre-dispatch-model-check.sh]="hooks/multi-manager/pre-dispatch-model-check.sh templates/multi-manager/settings-snippet.json"
   [test-pre-dispatch-preempt.sh]="hooks/multi-manager/pre-dispatch-preempt.sh"
   [test-pre-dispatch-refresh.sh]="hooks/multi-manager/pre-dispatch-refresh.sh"
   [test-pre-push-rebase-concurrency.sh]="hooks/test/lib-pre-push-fixture-root.sh hooks/test/test-pre-push-rebase-test.sh"
-  [test-pre-push-rebase-test.sh]="hooks/multi-manager/pre-push-rebase-test.sh hooks/test/lib-pre-push-fixture-root.sh .gitignore .sable"
+  [test-pre-push-rebase-test.sh]="hooks/multi-manager/pre-push-rebase-test.sh hooks/test/lib-pre-push-fixture-root.sh hooks/test/lib-json-input-encoder.sh .gitignore .sable"
   [test-preview-kick.sh]="hooks/multi-manager/post-push-merge-notify.sh"
   [test-provenance-guard.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
   [test-read-guard.sh]="hooks/multi-manager/read-guard.sh"
