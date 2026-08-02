@@ -12,13 +12,9 @@ rendered content above it (the hold shape), versus literal text typed via
 prompt line exactly the way an unsent ⟦SABLE-MSG⟧ wake would (the
 dropped-wake shape).
 
-NOTE: this deliberately does not shell out to
-`.claude/sable/state/night-stall-probe.py` -- that path is gitignored and
-worktree-local (it exists only in whichever checkout created it, not in this
-repo's tracked tree or other worktrees/clones), so a portable, git-tracked
-test cannot depend on it existing. It targets the actual importable
-classification logic (sable_stall_probe_lib.deliberate_hold, imported by
-that script) against real tmux capture-pane output instead.
+The end-to-end subprocess cases for the now-tracked driver live in
+test_sable_stall_probe.py. This module stays focused on the shared pane-state
+classification against real tmux capture bytes.
 """
 import shutil
 import subprocess
@@ -27,6 +23,7 @@ import uuid
 
 import pytest
 
+from sable_pane_lib import pane_idle
 from sable_stall_probe_lib import deliberate_hold
 
 HAVE_TMUX = shutil.which("tmux") is not None
@@ -83,3 +80,23 @@ def test_unanswered_wake_pane_is_stall(sock):
     capture = _tmux(sock, "capture-pane", "-t", pane, "-p", "-J").stdout
     assert "SABLE-MSG" in capture
     assert deliberate_hold(capture, "claude") is False
+
+
+def test_stray_transcript_glyph_cannot_hide_real_held_composer(sock):
+    """SABLE-6cu65 on real tmux bytes, including the poison transcript row."""
+    pane = _new_pane(sock)
+    _tmux(sock, "send-keys", "-t", pane, "printf '%s\\n' '>'", "Enter")
+    held = "operator text not yet submitted"
+    _tmux(sock, "send-keys", "-t", pane, "-l", held)
+    time.sleep(0.4)
+
+    capture = _tmux(
+        sock, "capture-pane", "-t", pane, "-p", "-J", "-e"
+    ).stdout
+    assert ">" in capture.splitlines(), (
+        "positive control: the transcript poison row must really be present"
+    )
+    assert held in capture, (
+        "positive control: real unsubmitted composer text must really be present"
+    )
+    assert not pane_idle(capture, "claude")

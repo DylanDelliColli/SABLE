@@ -213,6 +213,7 @@ declare -A ZERO_IMPACT=(
   [.beads/.gitignore]="bd-managed store config; maintained by bd tooling, no repo suite consumes it"
   [.beads/README.md]="bd-managed store doc"
   [.claude/sable/state/merge-gate/README.md]="state-dir doc"
+  [.claude/sable/state/night-stall-probe.py]="tracked operator driver is exercised as a real subprocess by bin/test_sable_stall_probe.py; no shell suite consumes it"
   [.github/ci/test-requirements.txt]="python lane owns it: test_clean_room_dep_parity selects on change"
   [.github/workflows/green-snapshot.yml]="workflow definition; no local suite executes workflows, CI validates itself"
   [AGENTS.md]="symlink to CLAUDE.md; doc-sync is bd preflight's check"
