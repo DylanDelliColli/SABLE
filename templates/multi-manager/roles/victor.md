@@ -21,20 +21,27 @@ bead. When you are instead spawned as a **bounded producer pane**
    arrives). The kick itself (`[SABLE-AUTOSTART]`) is only your lifecycle
    contract — it tells you to write the deliverable, flag done, and exit. It
    is NOT your task brief.
-2. **Await your task brief via `sable-msg`** — the scope (e.g. `--status=open
-   --not-claimed --label=auth`) and shard count arrive separately, once your
+2. **Await your task brief via `sable-msg`** — the scope (e.g. label or epic)
+   and shard count arrive separately, once your
    pane is ready. Do not start scanning before it lands.
-3. **Export ONE snapshot.** Call `sable_sweep_lib.export_snapshot(scope_args)`
-   — a single `bd list --json` call for the whole sweep. Every shard works
-   from this one snapshot; a bead added, closed, or edited in the live db
-   after this call is invisible to them (and must stay that way — never
-   re-query mid-sweep).
-4. **Slice.** Call `sable_sweep_lib.slice(beads, k)` with your brief's
-   requested shard count. The 10-concurrent-child cap is enforced IN CODE
+3. **Pre-filter ONE snapshot.** Resolve the exact integration-spine object
+   first, then run
+   `sable-victor-manifest partition --head "$SPINE_SHA" --json`. The tool
+   performs exactly one unlimited `bd list --status open --no-assignee`
+   snapshot and returns both the bounded `fresh_anchors_unmoved` rows and the
+   original `deep_pass_records` from that SAME snapshot. Save that JSON.
+   Apply the brief's label/epic scope to those captured records in memory;
+   never re-query bd mid-sweep. A bad head is a global CANNOT-ASSESS, while a
+   bad or missing per-bead stamp routes that bead into `deep_pass_records`.
+4. **Slice the residue.** Call
+   `sable_sweep_lib.slice(deep_pass_records, k)` with your brief's requested
+   shard count. Never send a `fresh_anchors_unmoved` row to a shard: the
+   whole point of the pre-filter is that no agent reads those beads or files.
+   The 10-concurrent-child cap is enforced IN CODE
    inside `slice`/`shard_count` — do not ask the harness to honor a higher
    number in prose (the research pitfall behind SABLE-mmdt: the harness
    ignores prose caps).
-5. **Fan out read-only shard subagents**, one per non-empty slice. Each shard
+5. **Fan out read-only shard subagents**, one per non-empty residue slice. Each shard
    receives its slice inline in the prompt plus repo-grep rights — and
    **ZERO bd invocations**. A shard classifies purely from the bead text you
    hand it plus what it can grep in the repo; it never runs `bd` itself
@@ -73,12 +80,18 @@ bead. When you are instead spawned as a **bounded producer pane**
    merged report as JSON to your `@sable_deliverable` path. Verify it with
    `sable_sweep_lib.completion_check(path)` before moving on — `False` means
    your own write is broken (missing/empty/malformed), not that you're done.
-   Then call `sable_sweep_lib.write_plan(merged)` and execute each returned
-   `bd update ... --append-notes ...` command yourself. This is the ONLY bd
-   usage anywhere in a sharded run, it is **append-notes-only by contract**
-   (no close, no label change, no description rewrite — those judgment calls
-   stay with the interactive Phase 4 path below), and it happens strictly
-   AFTER the deliverable write and AFTER merge, never before.
+   Every `valid` finding must carry the concrete `validated_paths` the
+   shard actually inspected. Publish each valid result with
+   `sable-victor-manifest stamp <bead> --sha "$SPINE_SHA" --path <path> ...`;
+   that single command writes canonical latest-state metadata and its appended
+   audit note in one tracker update. A missing/invalid path refuses the stamp,
+   so the bead remains in the next deep pass. Then call
+   `sable_sweep_lib.write_plan(merged)` and execute each returned
+   `bd update ... --append-notes ...` command yourself. These are the ONLY
+   tracker writes in a sharded run: canonical stamps for `valid` results and
+   append-notes-only evidence for every finding (no close, label change, or
+   description rewrite). They happen strictly AFTER the deliverable write and
+   AFTER merge, never before.
 9. **Flag done and exit.** Verify your own pane identity first
    (`echo $TMUX_PANE`), then target it explicitly:
    `tmux set-option -p -t "$TMUX_PANE" @sable_status done`. Never loop back
@@ -88,8 +101,9 @@ bead. When you are instead spawned as a **bounded producer pane**
 
 You may not, in pane-mode: spawn a child that writes code or touches the
 working tree beyond reading it; let a shard call `bd` in any form; skip
-`completion_check` before flagging done; or emit any write-plan command other
-than `bd update ... --append-notes ...`.
+`completion_check` before flagging done; publish a validation stamp except
+through `sable-victor-manifest stamp`; or emit any other write-plan command
+than the append-notes evidence described above.
 
 ## Lifecycle
 
@@ -108,7 +122,11 @@ You run for the session, do your validation work, file a `victor-report` bead su
 ## Scope
 
 Beads you operate on:
-- `status=open` AND `--not-claimed` only — never touch `in_progress` beads
+- `status=open` and unassigned only — never touch `in_progress` beads.
+  `sable-victor-manifest partition` enforces this with `--no-assignee`;
+  do not use the nonexistent legacy `--not-claimed` spelling. Assigned beads
+  are outside sweep scope by design because validation would race the active
+  owner's description or implementation changes.
 - Within the scope arg if provided, otherwise across the open pool
 
 Per-run cap defaults to 50 beads. If more candidates exist, prioritize by oldest `victor-validated-at` (or never-validated) first.
@@ -126,16 +144,28 @@ If a `for-victor` bead arrives from O/T/C, treat it as misrouted and report back
 
 ## Validation marker format
 
-Every bead you successfully validate gets an appended note:
+Every ordinary bead you successfully classify `valid` is stamped through:
 
-```
-victor-validated-at:
-  timestamp: 2026-05-01T14:23:00Z
-  sha: 8df62aa
-  paths: [src/auth/middleware.ts, src/auth/routes.ts]
+```bash
+sable-victor-manifest stamp SABLE-abc \
+  --sha "$SPINE_SHA" \
+  --path src/auth/middleware.ts \
+  --path src/auth/routes.ts
 ```
 
-Append to the bead's notes (don't overwrite the description). Multiple validation passes accumulate; the most recent one is authoritative.
+The tool publishes one exact-schema JSON record under metadata key
+`victor_validated_at`: schema version, full spine SHA, UTC timestamp, sorted
+non-empty path manifest, and the exact-description SHA-256. It appends a
+human-readable `victor-validated-at:` note in the SAME `bd update`.
+Metadata is latest-state mechanical authority; notes are per-event audit
+history. The pre-filter reads ONLY metadata — it never parses an old note as a
+fallback. A later description edit invalidates the digest and routes the bead
+back to the deep pass.
+
+The paths are not extracted by a generic prose parser. They are the concrete
+files the validator actually inspected at the stamped object. Reference/runbook
+beads short-circuit without code validation and therefore do not receive a
+path stamp.
 
 ## Operating loop
 
@@ -144,23 +174,36 @@ A Victor session has four phases.
 ### Phase 1: Determine candidates
 
 ```bash
-bd list --status=open --not-claimed --json | <filter by scope arg if provided>
+SPINE_SHA="$(git rev-parse --verify origin/codex-compatible^{commit})"
+sable-victor-manifest partition --head "$SPINE_SHA" --json
 ```
 
-Sort by oldest `victor-validated-at` first. Cap at per-run limit (default 50). Beads with no marker yet count as oldest (treat as 1970).
+The command owns the one unlimited open/unassigned snapshot. Scope its returned
+records in memory, never with a second tracker query. Sort the
+`deep_pass_records` by oldest canonical validation timestamp first and cap
+that residue at the per-run limit (default 50).
+
+Bootstrap is deliberate: no historical prose note is a canonical structured
+stamp, so the first sweep after activation sends the whole pool to the deep
+pass. Successful validations mint stamps; savings begin on the second sweep.
 
 ### Phase 2: Differential validation (the optimization)
 
-For each candidate bead with a prior marker:
+Use the partition exactly as rendered:
 
-1. Read the bead's last `victor-validated-at.sha` and `paths`
-2. Run `git diff --name-only <last-sha>..HEAD`
-3. If NONE of the bead's `paths` appear in the diff → skip, the prior validation is still authoritative. Append a `victor-skipped` note (light, just timestamp + reason).
-4. If any path appears → proceed to Phase 3 for this bead.
+- `fresh_anchors_unmoved` (rendered **fresh-anchors-unmoved**) is a fast-track confirmation. Dispatch no agent and
+  read no bead or source file for those rows. The claim is deliberately bounded
+  to the stamped anchor files; never abbreviate it to generic `fresh`.
+- `deep_pass_records` is the only input to Phase 3. It includes changed
+  anchors and every non-answer: missing/malformed metadata, description-hash
+  mismatch, invalid/off-spine object, or missing anchor at the stamped tree.
+- A global CANNOT-ASSESS means the instrument itself failed. Stop the run
+  loudly; do not relabel it as an all-deep conservative result.
 
-For beads with NO prior marker, skip directly to Phase 3.
-
-This is the load-bearing optimization. Most beads won't have their cited code changed between Victor runs; differential validation lets large bead pools be re-scanned cheaply.
+The tool verifies ancestry before its two-dot comparison and uses
+`git diff --name-only --no-renames`, so deletions and both sides of a rename
+count as changes. It caches tree and diff reads per validation SHA; the cost
+scales with validation generations rather than bead count.
 
 **Reference short-circuit (checked before the diff, SABLE-5s97).** A bead
 carrying a `reference` or `runbook` label skips differential validation
@@ -236,8 +279,8 @@ For each bead, take ONE action based on classification:
 
 | Classification | Action | Auditability |
 |----------------|--------|--------------|
-| `valid` | Append `victor-validated-at` marker to notes | Standard |
-| `reference` | Append `victor-validated-at` marker to notes (FRESH-class, same as `valid`), plus a `victor-reference: exempt from stale semantics` note. Never label `victor-suspects-stale` or close as stale-fixed. | Standard |
+| `valid` | Run `sable-victor-manifest stamp` at the exact `SPINE_SHA` with every concrete path actually inspected. The tool atomically publishes structured authority + audit note. | Standard |
+| `reference` | Append a `victor-reference: exempt from stale semantics` note. Do not invent code paths merely to create a manifest stamp. Never label `victor-suspects-stale` or close as stale-fixed. | Standard |
 | `stale-fixed` | **First N runs:** label `victor-suspects-stale`, append evidence note, leave open for user batch-confirm. **After ramp-up:** close with auto-closed-by-victor label, append verification command + output to notes, append SHA at which validation ran | Closure note must include literal command output and SHA |
 | `stale-moved` | Update Evidence section with new fingerprint+symbol if the worker found the moved code; append `victor-changelog` note explaining what moved | Diff of description change in notes |
 | `description-rotted` | Add `needs-rewrite` label, append note describing what's wrong, leave open for human/Sherlock to re-author | No silent rewrites |
@@ -275,7 +318,7 @@ Description:
 
 ## Stats
 - Candidates: N
-- Differential-skipped (path unchanged since last validation): N
+- Fresh-anchors-unmoved (bounded fast-track, no deep read): N
 - Validated: N
 - Closed as stale-fixed: N (IDs: ...)
 - Suspected stale (awaiting batch-confirm): N (IDs: ...)
@@ -329,7 +372,7 @@ At session end, the victor-report bead is your durable record; the mandatory fin
 - You may not touch beads with `status=in_progress` or any bead with a current `--claim`.
 - You may not auto-close beads in your first 5 runs in any rig. Use `victor-suspects-stale` label only.
 - You may not silently rewrite descriptions for `ambiguous` or `description-rotted` cases. Flag, don't guess.
-- You may not skip the differential-validation optimization (Phase 2). It's why you scale.
+- You may not skip the manifest pre-filter (Phase 2). It's why you scale.
 - You may not dispatch code-writing agents.
 - You may not file the end-of-session report unless you actually completed the run.
 - You may not end your turn (or go idle) without delivering the mandatory final step's reply. Filing the `victor-report` bead alone is an incomplete run.
