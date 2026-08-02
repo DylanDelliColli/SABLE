@@ -19,6 +19,9 @@ from pathlib import Path
 
 import pytest
 
+import sable_provider_lib as provider_lib
+from sable_pane_lib import with_lifecycle_flags
+
 BIN = Path(__file__).resolve().parent / "sable-spawn-manager"
 HAVE_TMUX = shutil.which("tmux") is not None
 pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="tmux not installed")
@@ -72,7 +75,7 @@ def _tmux(s, *args, check=True):
                           capture_output=True, text=True, check=check)
 
 
-def _run(s, *args):
+def _run(s, *args, env_overrides=None):
     fake_tui = (
         "bash --noprofile --norc -c '"
         "tmux set-option -p -t \"$TMUX_PANE\" @sable_boot_epoch \"test-$BASHPID\"; "
@@ -80,13 +83,16 @@ def _run(s, *args):
         "while true; do printf \"❯ \"; "
         "IFS= read -r line || break; printf \"%s\\n\" \"$line\"; done'"
     )
-    return subprocess.run(["python3", str(BIN), *args], capture_output=True, text=True,
-                          env={**os.environ, "SABLE_TMUX_SOCKET": s,
-                             "SABLE_TMUX_SESSION": SESSION,
-                             "SABLE_TMUX_PANE_CMD": fake_tui,
-                             "SABLE_DISPATCH_READY_TIMEOUT": "2",
-                             "SABLE_DISPATCH_SUBMIT_TRIES": "1",
-                             "SABLE_DISPATCH_POLL_INTERVAL": "0.1"})
+    env = {**os.environ, "SABLE_TMUX_SOCKET": s,
+           "SABLE_TMUX_SESSION": SESSION,
+           "SABLE_TMUX_PANE_CMD": fake_tui,
+           "SABLE_DISPATCH_READY_TIMEOUT": "2",
+           "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+           "SABLE_DISPATCH_POLL_INTERVAL": "0.1"}
+    env.update(env_overrides or {})
+    return subprocess.run(
+        ["python3", str(BIN), *args], capture_output=True, text=True, env=env
+    )
 
 
 def _seed_lincoln(s):
@@ -112,6 +118,17 @@ def _pane_for_role(s, role):
 
 def _pane_option(s, pane, name):
     return _tmux(s, "show-options", "-p", "-v", "-t", pane, name, check=False).stdout.strip()
+
+
+def _pane_process_environ(s, pane):
+    pid = _tmux(s, "display-message", "-p", "-t", pane, "#{pane_pid}").stdout.strip()
+    raw = Path(f"/proc/{pid}/environ").read_bytes()
+    return {
+        key.decode(): value.decode()
+        for entry in raw.split(b"\0")
+        if entry and b"=" in entry
+        for key, value in [entry.split(b"=", 1)]
+    }
 
 
 def _wait_pane(s, pane, *, status=None, dead=None, timeout=3.0):
@@ -159,6 +176,92 @@ def test_spawn_creates_detached_role_window(sock):
     epoch = _pane_option(sock, pane, "@sable_boot_epoch")
     assert epoch
     assert _pane_option(sock, pane, "@sable_kicked_epoch") == epoch
+
+
+def test_codex_spawn_removes_inherited_claude_identity_from_pane_pid(
+    sock, tmp_path
+):
+    """The real pane PID is the authority sable_pane_lib reads.  Polluting the
+    tmux session and the invoking parent reproduces the live lincoln leak; a
+    successful spawn must retain SABLE identity while both Claude keys vanish.
+    """
+    state = Path(os.environ["SABLE_MODE_STATE"])
+    _write_execution_state(state, {"optimus": "codex"})
+    home = tmp_path / "home"
+    codex_home = home / ".codex"
+    role = home / ".claude" / "sable" / "roles" / "optimus.md"
+    role.parent.mkdir(parents=True)
+    role.write_text("# Optimus")
+    codex_home.mkdir(parents=True)
+    (codex_home / "hooks.json").write_text('{"SessionStart": [{}]}')
+    _seed_lincoln(sock)
+    _tmux(sock, "set-environment", "-t", SESSION, "CLAUDE_AGENT_NAME", "lincoln")
+    _tmux(sock, "set-environment", "-t", SESSION, "CLAUDE_AGENT_ROLE", "cockpit")
+    assert "lincoln" in _tmux(
+        sock, "show-environment", "-t", SESSION, "CLAUDE_AGENT_NAME"
+    ).stdout
+    codex_tui = (
+        "bash --noprofile --norc -c '"
+        "tmux set-option -p -t \"$TMUX_PANE\" @sable_boot_epoch \"test-$BASHPID\"; "
+        "tmux set-option -p -t \"$TMUX_PANE\" @sable_test_tui_pid \"$BASHPID\"; "
+        "while true; do printf \"› \"; "
+        "IFS= read -r line || break; printf \"%s\\n\" \"$line\"; done'"
+    )
+
+    spawned = _run(
+        sock,
+        "optimus",
+        env_overrides={
+            "HOME": str(home),
+            "CODEX_HOME": str(codex_home),
+            "CLAUDE_AGENT_NAME": "lincoln",
+            "CLAUDE_AGENT_ROLE": "cockpit",
+            "SABLE_TMUX_PANE_CMD": codex_tui,
+            "SABLE_AGENTS_YAML": str(
+                Path(__file__).resolve().parent.parent
+                / "templates" / "multi-manager" / "agents.yaml"
+            ),
+            "SABLE_DISPATCH_DIR": str(tmp_path / "dispatch"),
+        },
+    )
+
+    assert spawned.returncode == 0, spawned.stderr
+    pane = _pane_for_role(sock, "optimus")
+    assert pane is not None
+    environ = _pane_process_environ(sock, pane)
+    assert environ["SABLE_PROVIDER"] == "codex"
+    assert environ["SABLE_AGENT_NAME"] == "optimus"
+    assert environ["SABLE_AGENT_ROLE"] == "manager"
+    assert "CLAUDE_AGENT_NAME" not in environ
+    assert "CLAUDE_AGENT_ROLE" not in environ
+
+
+def test_codex_scrub_wrapper_preserves_running_to_done_lifecycle(sock):
+    _seed_lincoln(sock)
+    _tmux(sock, "set-option", "-g", "remain-on-exit", "on")
+    observe_running = (
+        'if [ "$(tmux show-options -p -v -t "$TMUX_PANE" '
+        '@sable_status)" = running ]; then '
+        'tmux set-option -p -t "$TMUX_PANE" @sable_saw_running yes; fi'
+    )
+    lifecycle = with_lifecycle_flags(observe_running)
+    command = provider_lib.provider_pane_command("codex", lifecycle)
+    env_args = [
+        part
+        for key, value in provider_lib.pane_environment(
+            "codex", "optimus", "manager"
+        ).items()
+        for part in ("-e", f"{key}={value}")
+    ]
+    pane = _tmux(
+        sock,
+        "new-window", "-d", "-t", SESSION, "-n", "lifecycle",
+        "-P", "-F", "#{pane_id}", *env_args, command,
+    ).stdout.strip()
+
+    _wait_pane(sock, pane, status="done", dead=True)
+    assert _pane_option(sock, pane, "@sable_saw_running") == "yes"
+    assert _pane_option(sock, pane, "@sable_status") == "done"
 
 
 def test_manager_refuses_statusless_execution_before_creating_pane(sock):

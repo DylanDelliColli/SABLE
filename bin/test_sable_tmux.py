@@ -33,12 +33,13 @@ def test_pane_env_args_sets_identity_and_role():
     ]
 
 
-def test_codex_pane_env_uses_provider_neutral_identity_only():
-    assert st.pane_env_args("tarzan", provider="codex") == [
-        "-e", "SABLE_PROVIDER=codex",
-        "-e", "SABLE_AGENT_NAME=tarzan",
-        "-e", "SABLE_AGENT_ROLE=manager",
-    ]
+def test_codex_pane_env_neutralizes_legacy_aliases_at_tmux_boundary():
+    args = st.pane_env_args("tarzan", provider="codex")
+    assert "SABLE_PROVIDER=codex" in args
+    assert "SABLE_AGENT_NAME=tarzan" in args
+    assert "SABLE_AGENT_ROLE=manager" in args
+    assert "CLAUDE_AGENT_NAME=" in args
+    assert "CLAUDE_AGENT_ROLE=" in args
 
 
 def test_main_refuses_corrupt_execution_provider_state(tmp_path, monkeypatch, capsys):
@@ -65,6 +66,17 @@ def test_pane_command_autostart_bypass_for_autonomous(monkeypatch):
 def test_pane_command_override_wins(monkeypatch):
     monkeypatch.setenv("SABLE_TMUX_PANE_CMD", "bash --norc")
     assert st.pane_command("optimus", True) == "bash --norc"
+
+
+def test_codex_pane_command_scrubs_override_but_claude_stays_byte_exact(monkeypatch):
+    override = "[[ -n \"$BASH_VERSION\" ]] && printf ready"
+    monkeypatch.setenv("SABLE_TMUX_PANE_CMD", override)
+    assert st.pane_command("optimus", True, provider="claude") == override
+    codex = st.pane_command("optimus", True, provider="codex")
+    assert codex.startswith(
+        "exec env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE bash -c "
+    )
+    assert override in codex
 
 
 def test_autonomous_roles_excludes_lincoln():

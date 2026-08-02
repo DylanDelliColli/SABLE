@@ -310,18 +310,35 @@ def test_window_args_manager_still_sets_agent_role_manager_regression():
 
 def test_window_args_dual_stamps_provider_neutral_claude_identity():
     args = sm.window_args("sable", "optimus", "bash")
-    assert "SABLE_PROVIDER=claude" in args
-    assert "SABLE_AGENT_NAME=optimus" in args
-    assert "SABLE_AGENT_ROLE=manager" in args
-    assert "CLAUDE_AGENT_NAME=optimus" in args
+    assert args == [
+        "new-window", "-d", "-t", "sable", "-n", "optimus",
+        "-P", "-F", "#{pane_id}",
+        "-e", "SABLE_PROVIDER=claude",
+        "-e", "SABLE_AGENT_NAME=optimus",
+        "-e", "SABLE_AGENT_ROLE=manager",
+        "-e", "CLAUDE_AGENT_NAME=optimus",
+        "-e", "CLAUDE_AGENT_ROLE=manager",
+        "bash",
+    ]
 
 
-def test_window_args_codex_has_no_claude_identity_alias():
+def test_window_args_codex_neutralizes_then_removes_claude_identity_aliases():
     args = sm.window_args("sable", "tarzan", "bash", provider="codex")
     assert "SABLE_PROVIDER=codex" in args
     assert "SABLE_AGENT_NAME=tarzan" in args
     assert "SABLE_AGENT_ROLE=manager" in args
-    assert not any(value.startswith("CLAUDE_AGENT_") for value in args)
+    assert "CLAUDE_AGENT_NAME=" in args
+    assert "CLAUDE_AGENT_ROLE=" in args
+    assert args[-1].startswith("exec env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE ")
+    assert "bash -c" in args[-1]
+
+
+def test_respawn_args_codex_carries_both_scrub_layers_too():
+    args = sm.respawn_args("%7", "chuck", "bash", provider="codex")
+    assert args[:4] == ["respawn-pane", "-k", "-t", "%7"]
+    assert "CLAUDE_AGENT_NAME=" in args
+    assert "CLAUDE_AGENT_ROLE=" in args
+    assert args[-1].startswith("exec env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE ")
 
 
 def test_producer_command_pins_model_tier(monkeypatch):

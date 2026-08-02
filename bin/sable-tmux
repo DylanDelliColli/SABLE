@@ -38,7 +38,7 @@ from sable_pane_lib import (  # noqa: E402
 )
 from sable_provider_lib import (  # noqa: E402
     ProviderMapError, execution_provider_map, interactive_command, pane_environment,
-    provider_boot_message,
+    provider_boot_message, provider_pane_command,
 )
 
 DEFAULT_ROLES = ["lincoln", "optimus", "tarzan", "chuck"]
@@ -66,20 +66,24 @@ def pane_command(
     sable-spawn-worker / git merge without prompting (SABLE-bldh.14 / .12)."""
     override = os.environ.get("SABLE_TMUX_PANE_CMD")
     if override:
-        return override
-    if provider == "claude":
+        cmd = override
+    elif provider == "claude":
         cmd = "claude"
         if autostart and role in AUTONOMOUS_ROLES:
             permission = os.environ.get(
                 "SABLE_WORKER_PERMISSION", "--permission-mode bypassPermissions"
             )
             cmd = f"{cmd} {permission}"
-        return cmd
-    tier = "opus" if role in AUTONOMOUS_ROLES else "sonnet"
-    add_dirs = [str(Path(cwd).parent)] if role in AUTONOMOUS_ROLES and cwd else []
-    return interactive_command(
-        provider, tier, cwd=cwd, add_dirs=add_dirs,
-    )
+    else:
+        tier = "opus" if role in AUTONOMOUS_ROLES else "sonnet"
+        add_dirs = [str(Path(cwd).parent)] if role in AUTONOMOUS_ROLES and cwd else []
+        cmd = interactive_command(
+            provider, tier, cwd=cwd, add_dirs=add_dirs,
+        )
+    # sable-tmux is a third pane-creation surface alongside spawn-manager and
+    # spawn-worker.  Apply the same process-level scrub to both real commands
+    # and test/operator overrides; Claude returns byte-for-byte unchanged.
+    return provider_pane_command(provider, cmd)
 
 
 def tmux_base(socket: str | None) -> list[str]:

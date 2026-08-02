@@ -738,17 +738,26 @@ def _exercise_full_round_trip_unchecked(tmp_path: Path) -> dict[str, object]:
         assert posture is SandboxPosture.ESTABLISHED
         assert worker_result["tracker_writes"] == ["claim", "close"]
         assert evidence.is_file() and f"REPO={worker}" in evidence.read_text()
-        pane_rows = _checked(
-            [
-                "tmux", "-L", socket, "list-panes", "-s", "-t", session,
-                "-F",
-                ("#{@sable_role}\t#{@sable_provider}\t#{@sable_bead}"
-                 "\t#{@sable_status}"),
+        # The stand-in publishes its outcome immediately before SystemExit;
+        # the lifecycle wrapper can only write `done` after that process exits.
+        # Poll the pane-owned verdict rather than racing those two events.
+        deadline = time.monotonic() + 3
+        worker_rows: list[list[str]] = []
+        while time.monotonic() < deadline:
+            pane_rows = _checked(
+                [
+                    "tmux", "-L", socket, "list-panes", "-s", "-t", session,
+                    "-F",
+                    ("#{@sable_role}\t#{@sable_provider}\t#{@sable_bead}"
+                     "\t#{@sable_status}"),
+                ]
+            ).splitlines()
+            worker_rows = [
+                row.split("\t") for row in pane_rows if row.startswith("worker\t")
             ]
-        ).splitlines()
-        worker_rows = [
-            row.split("\t") for row in pane_rows if row.startswith("worker\t")
-        ]
+            if worker_rows == [["worker", "codex", bead, "done"]]:
+                break
+            time.sleep(0.02)
         assert worker_rows == [["worker", "codex", bead, "done"]], worker_rows
 
         remote_worker = _git(

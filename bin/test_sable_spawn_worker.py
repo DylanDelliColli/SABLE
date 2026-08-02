@@ -2078,13 +2078,24 @@ def test_worker_env_args_stamps_manager_identity():
     ]
 
 
-def test_codex_worker_env_uses_only_provider_neutral_identity():
+def test_codex_worker_env_neutralizes_legacy_identity_at_tmux_boundary():
     assert ssw.worker_env_args("tarzan", provider="codex") == [
         "-e", "SABLE_AGENT_NAME=tarzan", "-e", "SABLE_AGENT_ROLE=manager",
         "-e", "SABLE_LANE=tarzan",
+        "-e", "CLAUDE_AGENT_NAME=", "-e", "CLAUDE_AGENT_ROLE=",
         "-e", "SABLE_PROVIDER=codex", "-e", "SABLE_WORKER_PANE=1",
         "-e", "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0",
     ]
+
+
+def test_codex_worker_scrubs_the_entire_lifecycle_compound():
+    raw = ssw.with_lifecycle_flags("bash --noprofile --norc")
+    assert ssw.worker_lifecycle_command(raw, "claude") == raw
+    wrapped = ssw.worker_lifecycle_command(raw, "codex")
+    assert wrapped.startswith(
+        "exec env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE bash -c "
+    )
+    assert shlex.quote(raw) in wrapped
 
 
 def test_worker_env_args_marks_worker_pane_even_without_lane():
