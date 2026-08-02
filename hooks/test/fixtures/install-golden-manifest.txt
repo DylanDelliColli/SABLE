@@ -5,6 +5,7 @@ f595d9fd7685073d898a8b80638e97e26dac98f4e117cf206771b2d5ac964bfe  ./agents/colum
 8dbe809a369c86ef1759e768b07e4e0294c31dd6b769c24a2af80b2eec61f089  ./agents/sherlock.md
 6650443849ddb45def0fb3f95ac6c068373043fd26e6978ea3a20d536eefb00d  ./agents/victor.md
 1f4240a635a648b1ac732e596309f0ab10f21b1db366f377149df46c7b0c7dff  ./bin/sable_inline_body_guard_lib.py
+b6d721d377a13593d358c3b2ad9ca5c76dd418d1d59931a206d6f946eb795e06  ./commands/inbox.md
 7dba45bda78926dd80ee92ff27e70c1650e29e670fd0f3db8bdd7e4303d9c851  ./hooks/agent-tdd-enforce.sh
 bf8994bc7412de717cac5d02d36eb4b8f561acac55f147c0dbc55402c91f18d3  ./hooks/bead-description-gate.sh
 57a40923f3a49399063c79eef5768404ff9cbf467b59ef19d98adf02d2b7c5e8  ./hooks/bead-quality.sh
@@ -36,6 +37,9 @@ a12b8972252a20299784ec10a8b84834d52cf6659ff0297381455090e033099f  ./hooks/multi-
 638516a99ee8700e2194a7270e6e7f48d36091cfe1c5e3aba7a63e34504a5bf6  ./hooks/tdd-gate.sh
 a0bb62e5e73b4af901891463cff80a0754c56bc2c3b7b3ebe2f2b54f7381f19f  ./hooks/tdd-remind.sh
 beda66a5848fac2df084ff074b3acfbc11bf0a28931d3e16ced22f8b01d8ba8e  ./sable/agents.yaml
+066b1563e39e7e975edcd9e816f2e770669d417b5ae622017789b6c5cf205ea8  ./sable/inbox-timer/sable-inbox-timer.cron
+34426233bd3b7abff3609366c663b87ebca0a711758788bee6277b91728dec60  ./sable/inbox-timer/sable-inbox-timer.service
+3a6df8ee7e6e3951fb673909efbc128782da3a2b96c0cefc86e1b4adde47ce2f  ./sable/inbox-timer/sable-inbox-timer.timer
 47c27910cb20c239a60ff4632f5654080e763ab2674ac9c48681259848cc49b2  ./sable/reconcile-timer/sable-reconcile-timer.cron
 b394155acb17e7467189c7934402cff7758228f2c5e74d00ae8de013c250a071  ./sable/reconcile-timer/sable-reconcile-timer.service
 7078a55b8318c640afd65ae6537024148c33cd0ee5fa89c82ee2f340573b68b3  ./sable/reconcile-timer/sable-reconcile-timer.timer

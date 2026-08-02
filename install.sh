@@ -511,6 +511,11 @@ echo "command it prints above — 'sable-reconcile-timer --install-schedule' —
 echo "re-check any time with 'sable-reconcile-timer --check-schedule --repo <repo>',"
 echo "which fails loudly when nothing is scheduled OR when what is scheduled sweeps"
 echo "a different repo (SABLE-jfg6.5 / D3 TIMER LEG; SABLE-5xz68)."
+echo "It also stages the host-global inbox drain timer under"
+echo "${CLAUDE_DIR}/sable/inbox-timer/. Activate it only in the brokered install"
+echo "window with 'sable-inbox-timer --install-schedule'; until a real sweep"
+echo "publishes a fresh heartbeat, sable-msg keeps the existing loud fallback"
+echo "automatically (SABLE-albyd / SABLE-m4kyf.5)."
 echo
 
 bold "Install complete."

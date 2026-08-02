@@ -61,12 +61,18 @@ GOLDEN_MANIFEST_SUITE="test-install-golden-manifest.sh"
 #                                 bin/sable-orchestration-install, embedding the
 #                                 source checkout path and the chosen cadence
 #                                 (SABLE-jfg6.5 / D3 TIMER LEG)
+#   ./sable/inbox-timer/*         three host-timer heredocs emitted by the same
+#                                 installer, embedding the cadence/socket
+#                                 selected for SABLE-albyd
 GOLDEN_DERIVED=(
   "./.sable-install-provenance"
   "./CLAUDE.md"
   "./sable/reconcile-timer/sable-reconcile-timer.service"
   "./sable/reconcile-timer/sable-reconcile-timer.timer"
   "./sable/reconcile-timer/sable-reconcile-timer.cron"
+  "./sable/inbox-timer/sable-inbox-timer.service"
+  "./sable/inbox-timer/sable-inbox-timer.timer"
+  "./sable/inbox-timer/sable-inbox-timer.cron"
 )
 
 golden_is_derived() {
@@ -90,6 +96,7 @@ golden_source_for() {
     sable/agents.yaml)  printf 'templates/multi-manager/agents.yaml\n' ;;
     sable/roles/*)      printf 'templates/multi-manager/roles/%s\n' "${p#sable/roles/}" ;;
     agents/*)           printf 'templates/%s\n' "$p" ;;
+    commands/*)         printf 'templates/multi-manager/%s\n' "$p" ;;
     hooks/*|bin/*|skills/*) printf '%s\n' "$p" ;;
   esac
 }
