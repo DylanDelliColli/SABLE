@@ -23,8 +23,6 @@ three independent self-collision observations logged on the bead). Running
 twice in the same test proves a correctly-guarded suite's isolation holds
 run over run, not just once.
 """
-import glob
-import os
 import shutil
 import subprocess
 import sys
@@ -102,38 +100,81 @@ def _real_repo_with_bd_suite(tmp_path):
     return str(r), sha
 
 
-def _sable_impact_scratch_dirs():
-    return set(glob.glob(os.path.join(os.environ.get("TMPDIR", "/tmp"), "sable-impact-*")))
+def _sable_impact_scratch_dirs(root):
+    """Return only impact-tier scratch owned by the supplied temp root.
+
+    The broad benchmark runs this pytest module alongside the shell lane, whose
+    real tier drivers use the same ``sable-impact-*`` prefix in the host temp
+    directory.  A process-global census cannot distinguish a live directory
+    owned by that lane from a leak owned by this test.
+    """
+    return set(Path(root).glob("sable-impact-*"))
 
 
 @pytest.mark.skipif(not HAVE_BD, reason="requires a real bd on PATH")
-def test_impact_tier_runs_twice_without_scratch_collision(isolated_lock, tmp_path):
+def test_impact_tier_runs_twice_without_scratch_collision(
+        isolated_lock, tmp_path, monkeypatch):
     """The real regression test for SABLE-sx1rb: a correctly-isolated suite
     (env -u BEADS_DB at its own `bd init`) must complete GREEN through the
     real tier, twice in a row, with each run's own scratch fully swept —
     proving the second run neither reuses nor collides with the first's."""
     repo, sha = _real_repo_with_bd_suite(tmp_path)
     paths = ["hooks/test/test-sx1rb-bd-init.sh"]
+    owned_root = tmp_path / "impact-scratch"
+    owned_root.mkdir()
 
-    before = _sable_impact_scratch_dirs()
+    # tempfile.gettempdir() caches its answer in tempfile.tempdir, so changing
+    # TMPDIR here would not reliably redirect the in-process mkdtemp call. Pin
+    # the stdlib module's default directly for this test instead.
+    default_root = Path(promote_lib.tempfile.gettempdir())
+    real_mkdtemp = promote_lib.tempfile.mkdtemp
+    foreign_scratch = Path(real_mkdtemp(
+        prefix="sable-impact-foreign-", dir=str(default_root)))
+    created_impact_scratch = []
 
-    outcome1, detail1 = promote_lib.run_impact_tier(repo, sha, paths)
-    assert outcome1 == promote_lib.IMPACT_GREEN, (
-        f"run 1 did not complete GREEN — a correctly-guarded suite's own "
-        f"isolated bd init must not collide with the tier's: {detail1!r}")
-    after_run1 = _sable_impact_scratch_dirs()
-    leaked_after_1 = after_run1 - before
-    assert not leaked_after_1, (
-        f"run 1 left scratch behind instead of sweeping it: {leaked_after_1}")
+    def recording_mkdtemp(*args, **kwargs):
+        created = Path(real_mkdtemp(*args, **kwargs))
+        prefix = kwargs.get("prefix", args[0] if args else None)
+        if prefix == "sable-impact-":
+            created_impact_scratch.append(created)
+        return str(created)
 
-    outcome2, detail2 = promote_lib.run_impact_tier(repo, sha, paths)
-    assert outcome2 == promote_lib.IMPACT_GREEN, (
-        f"run 2 did not complete GREEN — it must not reuse or collide with "
-        f"run 1's already-cleaned-up scratch: {detail2!r}")
-    after_run2 = _sable_impact_scratch_dirs()
-    leaked_after_2 = after_run2 - before
-    assert not leaked_after_2, (
-        f"run 2 left scratch behind instead of sweeping it: {leaked_after_2}")
+    monkeypatch.setattr(promote_lib.tempfile, "tempdir", str(owned_root))
+    monkeypatch.setattr(promote_lib.tempfile, "mkdtemp", recording_mkdtemp)
+
+    # Both polarities keep the cleanup check load-bearing: an owned sentinel
+    # is visible, while a concurrent tier's same-prefix directory is not.
+    owned_sentinel = owned_root / "sable-impact-accounting-sentinel"
+    owned_sentinel.mkdir()
+    assert owned_sentinel in _sable_impact_scratch_dirs(owned_root)
+    assert foreign_scratch not in _sable_impact_scratch_dirs(owned_root)
+    owned_sentinel.rmdir()
+
+    try:
+        outcome1, detail1 = promote_lib.run_impact_tier(repo, sha, paths)
+        assert outcome1 == promote_lib.IMPACT_GREEN, (
+            f"run 1 did not complete GREEN — a correctly-guarded suite's own "
+            f"isolated bd init must not collide with the tier's: {detail1!r}")
+        assert created_impact_scratch, (
+            "run 1 did not create a witnessed impact-tier scratch directory")
+        assert all(path.parent == owned_root for path in created_impact_scratch), (
+            f"run 1 created scratch outside its owned root: {created_impact_scratch}")
+        assert not _sable_impact_scratch_dirs(owned_root), (
+            "run 1 left owned scratch behind instead of sweeping it")
+
+        created_impact_scratch.clear()
+        outcome2, detail2 = promote_lib.run_impact_tier(repo, sha, paths)
+        assert outcome2 == promote_lib.IMPACT_GREEN, (
+            f"run 2 did not complete GREEN — it must not reuse or collide with "
+            f"run 1's already-cleaned-up scratch: {detail2!r}")
+        assert created_impact_scratch, (
+            "run 2 did not create a witnessed impact-tier scratch directory")
+        assert all(path.parent == owned_root for path in created_impact_scratch), (
+            f"run 2 created scratch outside its owned root: {created_impact_scratch}")
+        assert not _sable_impact_scratch_dirs(owned_root), (
+            "run 2 left owned scratch behind instead of sweeping it")
+    finally:
+        shutil.rmtree(foreign_scratch, ignore_errors=True)
 
 
 @pytest.mark.skipif(not HAVE_BD, reason="requires a real bd on PATH")
