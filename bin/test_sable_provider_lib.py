@@ -1,4 +1,10 @@
+import os
+import shlex
+import subprocess
+
 import pytest
+
+import sable_provider_lib as provider_lib
 
 from sable_provider_lib import (
     ProviderMapError,
@@ -100,7 +106,59 @@ def test_pane_environment_dual_stamps_claude_but_not_codex():
         "SABLE_PROVIDER": "codex",
         "SABLE_AGENT_NAME": "tarzan",
         "SABLE_AGENT_ROLE": "manager",
+        "CLAUDE_AGENT_NAME": "",
+        "CLAUDE_AGENT_ROLE": "",
     }
+
+
+def test_codex_empty_overrides_are_not_process_absence():
+    """Layer 1 blocks the stale value at tmux creation, but it is deliberately
+    not mistaken for layer 2: presence-based readers still see an empty key.
+    This is the real-tmux distinction that invalidated the bead's one-line fix.
+    """
+    env = pane_environment("codex", "tarzan", "manager")
+    aliases = provider_lib.CLAUDE_IDENTITY_ALIASES
+
+    assert aliases == ("CLAUDE_AGENT_NAME", "CLAUDE_AGENT_ROLE")
+    assert all(alias in env and env[alias] == "" for alias in aliases)
+    assert all(alias not in {} for alias in aliases)
+
+
+def test_codex_pane_command_removes_aliases_from_child_process():
+    probe = (
+        "import os; "
+        "print(' '.join('present' if key in os.environ else 'absent' "
+        "for key in ('CLAUDE_AGENT_NAME','CLAUDE_AGENT_ROLE')))"
+    )
+    command = "python3 -c " + shlex.quote(probe)
+    wrapped = provider_lib.provider_pane_command("codex", command)
+    result = subprocess.run(
+        ["bash", "-c", wrapped],
+        env={
+            **os.environ,
+            "CLAUDE_AGENT_NAME": "lincoln",
+            "CLAUDE_AGENT_ROLE": "cockpit",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "absent absent"
+    for alias in provider_lib.CLAUDE_IDENTITY_ALIASES:
+        assert f"-u {alias}" in wrapped
+
+
+def test_codex_pane_command_retains_bash_top_level_and_claude_is_byte_exact():
+    # SABLE's declared shell stack is Bash.  The scrub wrapper must not demote a
+    # previously valid SABLE_TMUX_PANE_CMD/SABLE_WORKER_CMD bashism to POSIX sh.
+    bashism = '[[ -n "$BASH_VERSION" ]] && printf bash'
+    wrapped = provider_lib.provider_pane_command("codex", bashism)
+    result = subprocess.run(
+        ["bash", "-c", wrapped], capture_output=True, text=True, check=True
+    )
+    assert result.stdout == "bash"
+    assert provider_lib.provider_pane_command("claude", bashism) == bashism
 
 
 def test_provider_normalization_defaults_to_claude_and_rejects_unknown():

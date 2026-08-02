@@ -52,6 +52,15 @@ CODEX_REASONING = {
     "haiku": "low", "sonnet": "medium", "opus": "high",
 }
 
+# The legacy identity surface is one enumerated set for BOTH layers of the
+# Codex scrub: tmux's per-pane empty overrides and the persistent process's
+# `env -u` wrapper.  Keeping one constant is load-bearing; adding a future
+# compatibility alias to only one layer would recreate the inherited leak.
+CLAUDE_IDENTITY_ALIASES = (
+    "CLAUDE_AGENT_NAME",
+    "CLAUDE_AGENT_ROLE",
+)
+
 
 class ProviderMapError(ValueError):
     """The provider map cannot describe a valid execution session."""
@@ -360,7 +369,9 @@ def pane_environment(
     """Environment stamped into a SABLE-managed interactive pane.
 
     Claude aliases remain during migration so hooks not yet moved to the
-    provider-neutral names preserve their current behavior.
+    provider-neutral names preserve their current behavior.  Non-Claude panes
+    receive explicit empty overrides because tmux otherwise inherits the
+    session's aliases before the pane command can remove them completely.
     """
 
     normalized = normalize_provider(provider)
@@ -376,4 +387,26 @@ def pane_environment(
                 "CLAUDE_AGENT_ROLE": role,
             }
         )
+    elif normalized != "claude":
+        env.update({alias: "" for alias in CLAUDE_IDENTITY_ALIASES})
     return env
+
+
+def provider_pane_command(provider: str, command: str) -> str:
+    """Remove legacy Claude identity from a non-Claude pane process.
+
+    tmux ``-e KEY=`` neutralizes an inherited value but leaves a PRESENT-empty
+    key in ``/proc/<pane_pid>/environ``.  The exec chain is the second layer:
+    the persistent pane process starts with both keys genuinely absent, which
+    protects presence-based readers as well as ordinary truthiness readers.
+
+    Bash is this repository's declared shell runtime.  Re-entering Bash (not
+    POSIX ``sh``) preserves top-level Bash syntax in SABLE_TMUX_PANE_CMD and
+    SABLE_WORKER_CMD overrides while ``shlex.quote`` keeps the whole lifecycle
+    compound one command argument.
+    """
+
+    if normalize_provider(provider) == "claude":
+        return command
+    unset_args = " ".join(f"-u {alias}" for alias in CLAUDE_IDENTITY_ALIASES)
+    return f"exec env {unset_args} bash -c {shlex.quote(command)}"

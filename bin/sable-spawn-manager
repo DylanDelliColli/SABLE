@@ -47,7 +47,8 @@ from sable_handoff_lib import (  # noqa: E402
 )
 from sable_provider_lib import (  # noqa: E402
     DEFAULT_PROVIDER, ProviderMapError, execution_provider, interactive_command,
-    pane_environment, provider_boot_message, validate_codex_hook_graph,
+    pane_environment, provider_boot_message, provider_pane_command,
+    validate_codex_hook_graph,
 )
 from sable_registry_lib import (  # noqa: E402
     FLEET_PROJECT_ONLY_REMEDY, fleet_project_only, sable_registry_path,
@@ -503,6 +504,7 @@ def window_args(
     env_args: list[str] = []
     for key, value in pane_environment(provider, role, agent_role).items():
         env_args += ["-e", f"{key}={value}"]
+    cmd = provider_pane_command(provider, cmd)
     return [
         "new-window", "-d", "-t", session, "-n", role,
         "-P", "-F", "#{pane_id}", *env_args, cmd,
@@ -517,6 +519,7 @@ def respawn_args(
     env_args: list[str] = []
     for key, value in pane_environment(provider, role, agent_role).items():
         env_args += ["-e", f"{key}={value}"]
+    cmd = provider_pane_command(provider, cmd)
     return ["respawn-pane", "-k", "-t", pane, *env_args, cmd]
 
 

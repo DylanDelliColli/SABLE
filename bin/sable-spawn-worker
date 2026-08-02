@@ -156,7 +156,8 @@ from sable_handoff_lib import (  # noqa: E402
 )
 from sable_mode_store_lib import resolve_mode_state_path  # noqa: E402
 from sable_provider_lib import (  # noqa: E402
-    ProviderMapError, execution_provider, interactive_command,
+    CLAUDE_IDENTITY_ALIASES, ProviderMapError, execution_provider,
+    interactive_command, provider_pane_command,
 )
 
 DEFAULT_SESSION = "sable"
@@ -1728,6 +1729,17 @@ def worker_command(
     )
 
 
+def worker_lifecycle_command(command: str, provider: str) -> str:
+    """Apply the provider scrub AFTER lifecycle wrapping.
+
+    The ordering is load-bearing: the running/worker/done compound must execute
+    inside the scrubbed Bash process.  Prefixing only the worker executable
+    would leave the pane PID's wrapper shell carrying present-empty aliases.
+    """
+
+    return provider_pane_command(provider, command)
+
+
 def resolve_lane(override: str | None) -> str:
     """The identity to stamp on the worker = the invoking LANE MANAGER. Explicit
     --lane wins; else this process's CLAUDE_AGENT_NAME (the manager pane that ran
@@ -1781,7 +1793,10 @@ def worker_env_args(lane: str, provider: str = "claude") -> list[str]:
         worker's push fires the manager-gated Chuck handoff attributed to the
         lane, not the session-default lincoln (SABLE-bldh.13). Without it the
         worker inherits the tmux SESSION env (CLAUDE_AGENT_NAME=lincoln, set by
-        sable-tmux's `new-session -e`). Omitted when no lane is resolvable.
+        sable-tmux's `new-session -e`). Claude panes retain those aliases;
+        non-Claude panes receive empty tmux overrides here and
+        worker_lifecycle_command removes the keys from the persistent process.
+        Provider-neutral lane identity is omitted when no lane is resolvable.
       * SABLE_WORKER_PANE=1 (ALWAYS stamped): marks the pane as a WORKER. That
         manager identity is exactly what let a worker BOOT as its manager and
         re-dispatch its own bead (SABLE-38zi: identity bleed -> the SessionStart
@@ -1807,6 +1822,9 @@ def worker_env_args(lane: str, provider: str = "claude") -> list[str]:
                 "-e", f"CLAUDE_AGENT_NAME={lane}",
                 "-e", "CLAUDE_AGENT_ROLE=manager",
             ]
+    if provider != "claude":
+        for alias in CLAUDE_IDENTITY_ALIASES:
+            args += ["-e", f"{alias}="]
     args += [
         "-e", f"SABLE_PROVIDER={provider}",
         "-e", "SABLE_WORKER_PANE=1",
@@ -2628,8 +2646,13 @@ def main(argv: list[str] | None = None) -> int:
     except ProviderMapError as e:
         sys.stderr.write(f"sable-spawn-worker: {e}\n")
         return 5
-    wcmd = with_lifecycle_flags(
-        worker_command(model, os.environ.get("SABLE_WORKER_CMD"), provider, worktree)
+    wcmd = worker_lifecycle_command(
+        with_lifecycle_flags(
+            worker_command(
+                model, os.environ.get("SABLE_WORKER_CMD"), provider, worktree
+            )
+        ),
+        provider,
     )
     pane_id = _run(base + new_window_args(ns.session, win, worktree,
                                           worker_env_args(lane, provider), wcmd)).strip()
