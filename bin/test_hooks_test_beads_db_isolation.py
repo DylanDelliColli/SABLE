@@ -193,6 +193,7 @@ def _decoy_ambient_beads_db(
     return template.copy_into(tmp_path)
 
 
+@pytest.mark.skipif(not HAVE_BD, reason="requires a real bd on PATH")
 def test_decoy_template_initializes_real_bd_once_then_copies_without_more_inits(
         tmp_path, monkeypatch):
     """The optimization must delete real setup, not hide it behind another API."""
@@ -217,6 +218,7 @@ def test_decoy_template_initializes_real_bd_once_then_copies_without_more_inits(
     assert Path(first).is_dir() and Path(second).is_dir()
 
 
+@pytest.mark.skipif(not HAVE_BD, reason="requires a real bd on PATH")
 def test_decoy_template_copies_share_no_mutable_store_files(
         ambient_bd_template, tmp_path):
     """Per-case copies must not trade repeated setup for cross-test aliasing."""
@@ -247,6 +249,7 @@ def test_decoy_template_copies_share_no_mutable_store_files(
     assert template_config.read_bytes() == before_template
 
 
+@pytest.mark.skipif(not HAVE_BD, reason="requires a real bd on PATH")
 def test_copied_decoy_still_fires_on_an_unguarded_ambient_consumer(
         ambient_bd_template, tmp_path):
     """Plant the missing guard and require the copied ambient DB to catch it."""
