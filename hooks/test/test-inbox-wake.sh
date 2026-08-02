@@ -126,10 +126,18 @@ else
 fi
 
 enqueue "$RECIPIENT"
+disabled_capture="$(tmux_ capture-pane -p -J -t "$IDLE_PANE")"
+if [ "$(pending_count "$RECIPIENT")" -eq 1 ] \
+   && ! printf '%s\n' "$disabled_capture" | grep -Fq 'sable-inbox read'; then
+  pass "watcher-disabled control leaves payload pending and pane unpoked"
+else
+  fail "watcher-disabled control leaves payload pending and pane unpoked" \
+    "capture=$disabled_capture"
+fi
 first_out="$(run_watcher "$RECIPIENT" "$IDLE_PANE")"
 first_rc=$?
 first_capture="$(tmux_ capture-pane -p -J -t "$IDLE_PANE")"
-poke='Check SABLE inbox: 1 pending.'
+poke='⟦SABLE-MSG⟧ Run sable-inbox read: 1 pending.'
 first_pokes="$(printf '%s\n' "$first_capture" | grep -Fc "$poke" || true)"
 if [ "$first_rc" -eq 0 ] && [ "$first_pokes" -eq 1 ] \
    && ! printf '%s' "$first_capture" | grep -Fq 'payload stays byte-exact'; then

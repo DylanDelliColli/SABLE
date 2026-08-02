@@ -35,7 +35,7 @@ fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n
 [ -x "$INSTALL" ] || { fail "sable-bin-install is executable"; echo "Tests: 1 | Passed: 0 | Failed: 1"; exit 1; }
 pass "sable-bin-install is executable"
 
-CORE_TOOLS="sable sable-launch sable-note sable-mode sable-tmux sable-msg sable-view"
+CORE_TOOLS="sable sable-launch sable-note sable-mode sable-tmux sable-msg sable-inbox sable-view"
 
 # ---- UNIT: symlink install into a dir NOT on PATH ----
 D1=$(mktemp -d)
@@ -131,6 +131,12 @@ if SABLE_MODE_STATE="$D_COPY/mode-state.json" "$D_COPY/sable-mode" path >/dev/nu
 else
   fail "--copy carries sable-mode's Python support-module closure" \
     "copied sable-mode could not import its sibling modules"
+fi
+if "$D_COPY/sable-inbox" --help >/dev/null 2>&1; then
+  pass "--copy carries sable-inbox's Python support-module closure"
+else
+  fail "--copy carries sable-inbox's Python support-module closure" \
+    "copied sable-inbox could not import its sibling modules"
 fi
 if [ -f "$D_COPY/sable_mode_store_lib.py" ] \
   && [ -f "$D_COPY/sable_provider_lib.py" ] \

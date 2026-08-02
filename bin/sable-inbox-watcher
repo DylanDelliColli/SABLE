@@ -27,7 +27,7 @@ from typing import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_inbox_lib import InboxError, pending  # noqa: E402
-from sable_pane_lib import deliver_text, pane_idle  # noqa: E402
+from sable_pane_lib import SABLE_MSG_MARK, deliver_text, pane_idle  # noqa: E402
 
 
 PROCESS_LIVE = "LIVE"
@@ -63,7 +63,7 @@ def poke_text(count: int) -> str:
 
     if type(count) is not int or count < 0:
         raise ValueError("count must be a non-negative integer")
-    return f"Check SABLE inbox: {count} pending."
+    return f"{SABLE_MSG_MARK} Run sable-inbox read: {count} pending."
 
 
 def _run(command: list[str]) -> subprocess.CompletedProcess[str]:

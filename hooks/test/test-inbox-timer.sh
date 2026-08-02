@@ -13,7 +13,7 @@ SESS="timer-test"
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sable-inbox-timer.XXXXXX")/inbox"
 MANAGER="timer-manager-$$"
 WORKER="timer-worker-$$"
-POKE='Check SABLE inbox: 1 pending.'
+POKE='⟦SABLE-MSG⟧ Run sable-inbox read: 1 pending.'
 
 PASS=0
 FAIL=0

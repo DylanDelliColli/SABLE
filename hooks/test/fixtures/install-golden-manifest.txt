@@ -5,7 +5,7 @@ f595d9fd7685073d898a8b80638e97e26dac98f4e117cf206771b2d5ac964bfe  ./agents/colum
 8dbe809a369c86ef1759e768b07e4e0294c31dd6b769c24a2af80b2eec61f089  ./agents/sherlock.md
 6650443849ddb45def0fb3f95ac6c068373043fd26e6978ea3a20d536eefb00d  ./agents/victor.md
 1f4240a635a648b1ac732e596309f0ab10f21b1db366f377149df46c7b0c7dff  ./bin/sable_inline_body_guard_lib.py
-b6d721d377a13593d358c3b2ad9ca5c76dd418d1d59931a206d6f946eb795e06  ./commands/inbox.md
+cbeae4ebf177b0899fd0214366f0750ee3b4d36ddd11e9fb6db91e8ccac5f63b  ./commands/inbox.md
 7dba45bda78926dd80ee92ff27e70c1650e29e670fd0f3db8bdd7e4303d9c851  ./hooks/agent-tdd-enforce.sh
 bf8994bc7412de717cac5d02d36eb4b8f561acac55f147c0dbc55402c91f18d3  ./hooks/bead-description-gate.sh
 57a40923f3a49399063c79eef5768404ff9cbf467b59ef19d98adf02d2b7c5e8  ./hooks/bead-quality.sh

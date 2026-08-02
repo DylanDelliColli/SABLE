@@ -17,6 +17,10 @@ def store(tmp_path, monkeypatch):
     return root
 
 
+def bound_payloads(messages):
+    return [(message.id, message.sender, message.body) for message in messages]
+
+
 def test_enqueue_pending_ack_and_unknown_ack_is_loud(store):
     msg_id = inbox.enqueue("optimus", "lincoln", "payload")
 
@@ -51,14 +55,14 @@ def test_read_keeps_identity_attached_when_lower_id_arrives_after_pending(
 
     messages = inbox.read("optimus")
     assert survey == [inbox.PendingMessage(first_id, "lincoln")]
-    assert messages == [
-        inbox.InboxMessage(first_id, "lincoln", "hold"),
-        inbox.InboxMessage(second_id, "chuck", "release"),
+    assert bound_payloads(messages) == [
+        (first_id, "lincoln", "hold"),
+        (second_id, "chuck", "release"),
     ]
 
     inbox.ack("optimus", messages[0].id)
-    assert inbox.read("optimus") == [
-        inbox.InboxMessage(second_id, "chuck", "release")
+    assert bound_payloads(inbox.read("optimus")) == [
+        (second_id, "chuck", "release")
     ]
 
 
@@ -73,10 +77,21 @@ def test_sequential_enqueues_are_read_in_fifo_order_even_when_ids_sort_oppositel
     first_id = inbox.enqueue("victor", "lincoln", "first")
     second_id = inbox.enqueue("victor", "lincoln", "second")
 
-    assert inbox.read("victor") == [
-        inbox.InboxMessage(first_id, "lincoln", "first"),
-        inbox.InboxMessage(second_id, "lincoln", "second"),
+    assert bound_payloads(inbox.read("victor")) == [
+        (first_id, "lincoln", "first"),
+        (second_id, "lincoln", "second"),
     ]
+
+
+def test_read_surfaces_atomic_artifact_mtime_as_enqueue_ordering_evidence(store):
+    msg_id = inbox.enqueue("optimus", "lincoln", "older queued instruction")
+    [path] = inbox._published_paths("optimus")
+    os.utime(path, (100.25, 100.25))
+
+    [message] = inbox.read("optimus")
+
+    assert message.id == msg_id
+    assert message.enqueued_at == pytest.approx(100.25)
 
 
 def test_pending_has_three_distinct_observable_states(store):
