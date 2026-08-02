@@ -1,0 +1,727 @@
+#!/usr/bin/env python3
+"""Stamp and pre-filter Victor validations by exact anchor-file history
+(SABLE-t6bv6.1).
+
+This is deliberately a manifest instrument, not an Evidence/Fingerprint
+tokenizer. Victor records the exact paths it inspected at validation time;
+that event-shaped path set is the authority for the next sweep. The latest
+structured metadata record answers the mechanical question while the appended
+note remains append-only audit history. A note is NEVER parsed as fallback
+authority: old or malformed state must enter the deep pass, not become a
+vacuously unchanged set.
+
+fresh_anchors_unmoved is a bounded result. It says only that every anchor file
+named by the last validation exists at that object and did not change on the
+spine since then. It never says the bead or its prose premises are fresh.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Callable, Mapping, Sequence
+
+
+METADATA_KEY = "victor_validated_at"
+STAMP_SCHEMA = 1
+STAMP_KEYS = frozenset({"schema", "sha", "at", "paths", "description_sha256"})
+ANCHOR_ONLY_CLAIM = (
+    "fresh-anchors-unmoved is an anchor-files-only claim; prose and non-anchor "
+    "premises still require confirmation"
+)
+
+_FULL_OBJECT_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+class ManifestError(RuntimeError):
+    """Base class for a loud non-answer."""
+
+
+class InvalidStamp(ManifestError):
+    """One bead's stored validation record is not canonical authority."""
+
+
+class ManifestUnavailable(ManifestError):
+    """Repository or tracker state could not be assessed."""
+
+
+@dataclass(frozen=True)
+class ValidationStamp:
+    schema: int
+    sha: str
+    at: str
+    paths: tuple[str, ...]
+    description_sha256: str
+
+
+GitRunner = Callable[..., subprocess.CompletedProcess]
+BdRunner = Callable[[Sequence[str], Path], subprocess.CompletedProcess]
+
+
+def description_sha256(description: str) -> str:
+    """Hash the exact UTF-8 description bytes; whitespace is premise data."""
+
+    if not isinstance(description, str):
+        raise InvalidStamp("bead description must be a string")
+    return hashlib.sha256(description.encode("utf-8")).hexdigest()
+
+
+def _canonical_path(path: object) -> str:
+    if not isinstance(path, str) or not path:
+        raise InvalidStamp("paths must contain non-empty strings")
+    if "\x00" in path or "\n" in path or "\r" in path:
+        raise InvalidStamp("paths must be single-line repository-relative names")
+    if path.endswith("/"):
+        raise InvalidStamp("paths must name concrete files, not directory prefixes")
+    raw_parts = path.split("/")
+    candidate = PurePosixPath(path)
+    if (
+        candidate.is_absolute()
+        or any(part in ("", ".", "..") for part in raw_parts)
+        or str(candidate) != path
+    ):
+        raise InvalidStamp(
+            f"path {path!r} is not a canonical repository-relative file"
+        )
+    return path
+
+
+def _canonical_paths(
+    paths: object, *, require_stored_order: bool
+) -> tuple[str, ...]:
+    if not isinstance(paths, list) or not paths:
+        raise InvalidStamp("paths must be a non-empty JSON array")
+    validated = tuple(_canonical_path(path) for path in paths)
+    if require_stored_order and len(set(validated)) != len(validated):
+        raise InvalidStamp("paths must be unique")
+    ordered = tuple(sorted(set(validated)))
+    if require_stored_order and validated != ordered:
+        raise InvalidStamp("paths must be sorted")
+    return ordered
+
+
+def _validate_timestamp(value: object) -> str:
+    if not isinstance(value, str):
+        raise InvalidStamp("timestamp must be a UTC string")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise InvalidStamp("timestamp must use YYYY-MM-DDTHH:MM:SSZ") from exc
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+        raise InvalidStamp("timestamp is not canonical UTC")
+    return value
+
+
+def parse_stamp(record: Mapping[str, object]) -> ValidationStamp:
+    """Read ONLY canonical metadata; note prose is intentionally invisible."""
+
+    metadata = record.get("metadata")
+    if not isinstance(metadata, Mapping) or METADATA_KEY not in metadata:
+        raise InvalidStamp(f"metadata key {METADATA_KEY!r} is absent")
+    raw = metadata[METADATA_KEY]
+    if not isinstance(raw, str) or not raw:
+        raise InvalidStamp("stamp metadata must be a non-empty JSON string")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise InvalidStamp("stamp metadata is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise InvalidStamp("stamp metadata must decode to one JSON object")
+    if set(value) != STAMP_KEYS:
+        raise InvalidStamp(
+            f"stamp keys must be exactly {sorted(STAMP_KEYS)}, got {sorted(value)}"
+        )
+    schema = value["schema"]
+    if isinstance(schema, bool) or not isinstance(schema, int) or schema != STAMP_SCHEMA:
+        raise InvalidStamp(f"schema must be integer {STAMP_SCHEMA}")
+    sha = value["sha"]
+    if not isinstance(sha, str) or not _FULL_OBJECT_ID.fullmatch(sha):
+        raise InvalidStamp("sha must be a full lowercase Git object id")
+    at = _validate_timestamp(value["at"])
+    paths = _canonical_paths(value["paths"], require_stored_order=True)
+    digest = value["description_sha256"]
+    if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+        raise InvalidStamp("description digest must be lowercase SHA-256")
+    return ValidationStamp(schema, sha, at, paths, digest)
+
+
+def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def _run_bd(argv: Sequence[str], cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        list(argv),
+        cwd=str(cwd),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def _command_detail(cp: subprocess.CompletedProcess) -> str:
+    return (cp.stderr or cp.stdout or "no diagnostic").strip()[:500]
+
+
+def _resolve_commit(
+    repo: Path,
+    ref: str,
+    *,
+    git_run: GitRunner,
+    subject: str,
+) -> str:
+    cp = git_run(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    value = cp.stdout.strip() if cp.returncode == 0 else ""
+    if cp.returncode != 0 or not _FULL_OBJECT_ID.fullmatch(value):
+        raise ManifestUnavailable(
+            f"could not resolve {subject} {ref!r} as a full commit: "
+            f"{_command_detail(cp)}"
+        )
+    return value
+
+
+def _tree_paths(
+    repo: Path, sha: str, *, git_run: GitRunner
+) -> frozenset[str]:
+    cp = git_run(repo, "ls-tree", "-r", "--name-only", "-z", sha)
+    if cp.returncode != 0:
+        raise ManifestUnavailable(
+            f"could not read validation tree {sha}: {_command_detail(cp)}"
+        )
+    return frozenset(path for path in cp.stdout.split("\0") if path)
+
+
+def _changed_paths(
+    repo: Path,
+    from_sha: str,
+    head_sha: str,
+    *,
+    git_run: GitRunner,
+) -> frozenset[str]:
+    # This is intentionally a TWO-DOT comparison. Unlike a branch comparison,
+    # the validated object must first prove it is an ancestor of the selected
+    # spine head, so the range is exactly the spine changes since validation.
+    # --no-renames renders a rename as deletion+addition, putting BOTH names in
+    # the set without depending on similarity heuristics.
+    cp = git_run(
+        repo,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        f"{from_sha}..{head_sha}",
+        "--",
+    )
+    if cp.returncode != 0:
+        raise ManifestUnavailable(
+            f"could not diff validation {from_sha} to spine {head_sha}: "
+            f"{_command_detail(cp)}"
+        )
+    return frozenset(path for path in cp.stdout.split("\0") if path)
+
+
+def _deep_row(bead_id: str, code: str, reason: str, **fields) -> dict:
+    return {
+        "id": bead_id,
+        "category": "deep_pass",
+        "reason_code": code,
+        "reason": reason,
+        **fields,
+    }
+
+
+def _fresh_row(bead_id: str, stamp: ValidationStamp) -> dict:
+    return {
+        "id": bead_id,
+        "category": "fresh_anchors_unmoved",
+        "reason_code": "anchors-unchanged",
+        "reason": (
+            "stamped anchor files are unchanged; confirmation remains bounded "
+            "to those anchors"
+        ),
+        "validated_sha": stamp.sha,
+        "validated_at": stamp.at,
+        "paths": list(stamp.paths),
+    }
+
+
+def partition_records(
+    records: object,
+    *,
+    repo: Path | str,
+    head_ref: str,
+    git_run: GitRunner | None = None,
+) -> dict:
+    """Partition one snapshot; every per-bead non-answer goes to deep_pass."""
+
+    if not isinstance(records, list):
+        raise ManifestUnavailable("bd snapshot must be one JSON array")
+    repo_path = Path(repo).resolve()
+    git_run = git_run or _run_git
+    head_sha = _resolve_commit(
+        repo_path, head_ref, git_run=git_run, subject="spine head"
+    )
+    fresh: list[dict] = []
+    deep: list[dict] = []
+
+    # Most sweeps stamp many beads at the same spine object. Cache the expensive
+    # tree and diff reads by that object so cost scales with validation
+    # generations, not bead count.
+    assessment_cache: dict[
+        str, tuple[str | None, str, frozenset[str], frozenset[str]]
+    ] = {}
+
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ManifestUnavailable("bd snapshot contains a non-object record")
+        bead_id = record.get("id")
+        if not isinstance(bead_id, str) or not bead_id:
+            raise ManifestUnavailable("bd snapshot contains a record without an id")
+        labels = record.get("labels") or []
+        if not isinstance(labels, list) or not all(
+            isinstance(label, str) for label in labels
+        ):
+            deep.append(
+                _deep_row(
+                    bead_id,
+                    "invalid-labels",
+                    "bead labels are not a JSON string array",
+                )
+            )
+            continue
+        if {"reference", "runbook"} & set(labels):
+            # Existing Victor policy classifies these by identity, not source
+            # freshness. Force them into the cheap Phase-3 short-circuit even
+            # if a historical ordinary validation stamp is still attached.
+            deep.append(
+                _deep_row(
+                    bead_id,
+                    "reference-short-circuit",
+                    "reference/runbook policy bypasses code-drift assessment",
+                )
+            )
+            continue
+        metadata = record.get("metadata")
+        if not isinstance(metadata, Mapping) or METADATA_KEY not in metadata:
+            deep.append(
+                _deep_row(
+                    bead_id,
+                    "missing-stamp",
+                    "canonical structured validation metadata is absent; "
+                    "note history is not authority",
+                )
+            )
+            continue
+        try:
+            stamp = parse_stamp(record)
+        except InvalidStamp as exc:
+            deep.append(_deep_row(bead_id, "invalid-stamp", str(exc)))
+            continue
+
+        description = record.get("description")
+        try:
+            current_digest = description_sha256(description)
+        except InvalidStamp as exc:
+            deep.append(_deep_row(bead_id, "invalid-description", str(exc)))
+            continue
+        if current_digest != stamp.description_sha256:
+            deep.append(
+                _deep_row(
+                    bead_id,
+                    "description-changed",
+                    "bead description changed after the recorded validation",
+                    validated_sha=stamp.sha,
+                    paths=list(stamp.paths),
+                )
+            )
+            continue
+
+        if stamp.sha not in assessment_cache:
+            try:
+                resolved = _resolve_commit(
+                    repo_path,
+                    stamp.sha,
+                    git_run=git_run,
+                    subject="validation sha",
+                )
+            except ManifestUnavailable as exc:
+                assessment_cache[stamp.sha] = (
+                    "unresolved-validation-sha",
+                    str(exc),
+                    frozenset(),
+                    frozenset(),
+                )
+            else:
+                ancestor = git_run(
+                    repo_path, "merge-base", "--is-ancestor", resolved, head_sha
+                )
+                if ancestor.returncode == 1:
+                    assessment_cache[stamp.sha] = (
+                        "validation-not-on-spine",
+                        f"validation {resolved} is not an ancestor of spine {head_sha}",
+                        frozenset(),
+                        frozenset(),
+                    )
+                elif ancestor.returncode != 0:
+                    assessment_cache[stamp.sha] = (
+                        "ancestry-unavailable",
+                        "could not assess validation ancestry: "
+                        + _command_detail(ancestor),
+                        frozenset(),
+                        frozenset(),
+                    )
+                else:
+                    try:
+                        tree = _tree_paths(repo_path, resolved, git_run=git_run)
+                        changed = _changed_paths(
+                            repo_path, resolved, head_sha, git_run=git_run
+                        )
+                    except ManifestUnavailable as exc:
+                        assessment_cache[stamp.sha] = (
+                            "git-assessment-unavailable",
+                            str(exc),
+                            frozenset(),
+                            frozenset(),
+                        )
+                    else:
+                        assessment_cache[stamp.sha] = (
+                            None,
+                            "",
+                            tree,
+                            changed,
+                        )
+
+        error_code, error_reason, tree_paths, changed_paths = assessment_cache[
+            stamp.sha
+        ]
+        if error_code is not None:
+            deep.append(
+                _deep_row(
+                    bead_id,
+                    error_code,
+                    error_reason,
+                    validated_sha=stamp.sha,
+                    paths=list(stamp.paths),
+                )
+            )
+            continue
+        missing = sorted(set(stamp.paths) - tree_paths)
+        if missing:
+            deep.append(
+                _deep_row(
+                    bead_id,
+                    "anchor-missing-at-validation",
+                    "stamped anchor path was not present in the validated tree",
+                    missing_anchors=missing,
+                    validated_sha=stamp.sha,
+                    paths=list(stamp.paths),
+                )
+            )
+            continue
+        changed = sorted(set(stamp.paths) & changed_paths)
+        if changed:
+            deep.append(
+                _deep_row(
+                    bead_id,
+                    "anchors-changed",
+                    "one or more stamped anchor files changed on the spine",
+                    changed_anchors=changed,
+                    validated_sha=stamp.sha,
+                    paths=list(stamp.paths),
+                )
+            )
+            continue
+        fresh.append(_fresh_row(bead_id, stamp))
+
+    deep_ids = {row["id"] for row in deep}
+    return {
+        "schema": 1,
+        "head": head_sha,
+        "claim_bound": ANCHOR_ONLY_CLAIM,
+        "fresh_anchors_unmoved": fresh,
+        "deep_pass": deep,
+        # Pane-mode Victor slices these exact records. Returning the residue
+        # from this SAME snapshot avoids a second bd list whose moving contents
+        # could disagree with the partition that admitted or skipped a bead.
+        "deep_pass_records": [
+            record
+            for record in records
+            if record["id"] in deep_ids
+        ],
+        "counts": {
+            "total": len(records),
+            "fresh_anchors_unmoved": len(fresh),
+            "deep_pass": len(deep),
+        },
+    }
+
+
+def _decode_one_record(raw: str, *, subject: str) -> Mapping[str, object]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ManifestUnavailable(f"{subject} returned malformed JSON") from exc
+    if isinstance(value, list):
+        if len(value) != 1:
+            raise ManifestUnavailable(
+                f"{subject} returned {len(value)} records, expected one"
+            )
+        value = value[0]
+    if not isinstance(value, Mapping):
+        raise ManifestUnavailable(f"{subject} did not return an object")
+    return value
+
+
+def _timestamp_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def publish_stamp(
+    bead_id: str,
+    *,
+    repo: Path | str,
+    sha_ref: str,
+    paths: list[str],
+    now: str | None = None,
+    bd_run: BdRunner | None = None,
+    git_run: GitRunner | None = None,
+) -> dict:
+    """Publish latest-state metadata and append-only audit in ONE bd update.
+
+    The bead is read before the update. If its description races and changes
+    after that read, the stored digest no longer matches and the next partition
+    routes it to deep_pass; the race cannot manufacture a permissive result.
+    """
+
+    if not isinstance(bead_id, str) or not bead_id.strip():
+        raise ManifestUnavailable("bead id must be non-empty")
+    repo_path = Path(repo).resolve()
+    bd_run = bd_run or _run_bd
+    git_run = git_run or _run_git
+    sha = _resolve_commit(
+        repo_path, sha_ref, git_run=git_run, subject="validation sha"
+    )
+
+    shown = bd_run(["bd", "show", bead_id, "--json"], repo_path)
+    if shown.returncode != 0:
+        raise ManifestUnavailable(
+            f"could not read bead {bead_id}: {_command_detail(shown)}"
+        )
+    record = _decode_one_record(shown.stdout, subject=f"bd show {bead_id}")
+    if record.get("id") != bead_id:
+        raise ManifestUnavailable(
+            f"bd show returned id {record.get('id')!r}, expected {bead_id!r}"
+        )
+    description = record.get("description")
+    try:
+        digest = description_sha256(description)
+        canonical_paths = _canonical_paths(
+            list(paths), require_stored_order=False
+        )
+    except InvalidStamp as exc:
+        raise ManifestUnavailable(str(exc)) from exc
+    tree = _tree_paths(repo_path, sha, git_run=git_run)
+    missing = sorted(set(canonical_paths) - tree)
+    if missing:
+        raise ManifestUnavailable(
+            f"anchor path(s) not present at validation object {sha}: {missing}"
+        )
+
+    timestamp = now or _timestamp_now()
+    try:
+        timestamp = _validate_timestamp(timestamp)
+    except InvalidStamp as exc:
+        raise ManifestUnavailable(str(exc)) from exc
+    stamp_record = {
+        "schema": STAMP_SCHEMA,
+        "sha": sha,
+        "at": timestamp,
+        "paths": list(canonical_paths),
+        "description_sha256": digest,
+    }
+    encoded = json.dumps(
+        stamp_record, sort_keys=True, separators=(",", ":")
+    )
+    encoded_paths = json.dumps(
+        list(canonical_paths), ensure_ascii=False, separators=(",", ":")
+    )
+    note = (
+        f"victor-validated-at: at={timestamp} sha={sha} paths={encoded_paths} "
+        f"description_sha256={digest}"
+    )
+    # One tracker mutation carries latest-state authority and event history.
+    # Splitting these into two updates would make interruption produce a
+    # metadata/note divergence that no reader could distinguish from drift.
+    updated = bd_run(
+        [
+            "bd",
+            "update",
+            bead_id,
+            "--set-metadata",
+            f"{METADATA_KEY}={encoded}",
+            "--append-notes",
+            note,
+        ],
+        repo_path,
+    )
+    if updated.returncode != 0:
+        raise ManifestUnavailable(
+            f"could not publish validation stamp for {bead_id}: "
+            f"{_command_detail(updated)}"
+        )
+    return {"id": bead_id, "record": stamp_record, "audit_note": note}
+
+
+def _open_snapshot(repo: Path, *, bd_run: BdRunner) -> list:
+    argv = [
+        "bd",
+        "list",
+        "--status",
+        "open",
+        "--no-assignee",
+        "--json",
+        "--limit",
+        "0",
+    ]
+    cp = bd_run(argv, repo)
+    if cp.returncode != 0:
+        raise ManifestUnavailable(
+            "could not load the unlimited open-bead snapshot: "
+            + _command_detail(cp)
+        )
+    try:
+        value = json.loads(cp.stdout)
+    except json.JSONDecodeError as exc:
+        raise ManifestUnavailable("open-bead snapshot is malformed JSON") from exc
+    if not isinstance(value, list):
+        raise ManifestUnavailable("open-bead snapshot must be one JSON array")
+    return value
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sable-victor-manifest",
+        description=(
+            "Stamp Victor validation anchors and partition open beads into "
+            "fresh_anchors_unmoved versus deep_pass."
+        ),
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    partition = commands.add_parser(
+        "partition", help="partition one unlimited open-bead snapshot"
+    )
+    partition.add_argument("--repo", default=".", help="repository checkout")
+    partition.add_argument(
+        "--head",
+        default="HEAD",
+        help="spine ref/object to assess (default: HEAD)",
+    )
+    partition.add_argument(
+        "--json", action="store_true", help="emit canonical JSON"
+    )
+
+    stamp = commands.add_parser(
+        "stamp", help="publish one canonical validation record and audit note"
+    )
+    stamp.add_argument("bead_id")
+    stamp.add_argument("--repo", default=".", help="repository checkout")
+    stamp.add_argument(
+        "--sha",
+        default="HEAD",
+        help="exact validated spine ref/object (default: HEAD)",
+    )
+    stamp.add_argument(
+        "--path",
+        action="append",
+        required=True,
+        dest="paths",
+        help="concrete repository-relative anchor file; repeat for each anchor",
+    )
+    stamp.add_argument(
+        "--json", action="store_true", help="emit canonical JSON"
+    )
+    return parser
+
+
+def _print_partition(result: dict) -> None:
+    print(f"HEAD\t{result['head']}")
+    print(f"CLAIM-BOUND\t{result['claim_bound']}")
+    for row in result["fresh_anchors_unmoved"]:
+        print(
+            "FRESH-ANCHORS-UNMOVED\t"
+            f"{row['id']}\t{row['validated_sha']}\t{','.join(row['paths'])}"
+        )
+    for row in result["deep_pass"]:
+        print(
+            f"DEEP-PASS\t{row['id']}\t{row['reason_code']}\t{row['reason']}"
+        )
+    counts = result["counts"]
+    print(
+        "COUNTS\t"
+        f"total={counts['total']} "
+        f"fresh_anchors_unmoved={counts['fresh_anchors_unmoved']} "
+        f"deep_pass={counts['deep_pass']}"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        if args.command == "partition":
+            repo = Path(args.repo).resolve()
+            records = _open_snapshot(repo, bd_run=_run_bd)
+            result = partition_records(
+                records, repo=repo, head_ref=args.head
+            )
+            if args.json:
+                print(
+                    json.dumps(
+                        result, sort_keys=True, separators=(",", ":")
+                    )
+                )
+            else:
+                _print_partition(result)
+            return 0
+
+        result = publish_stamp(
+            args.bead_id,
+            repo=args.repo,
+            sha_ref=args.sha,
+            paths=args.paths,
+        )
+        if args.json:
+            print(
+                json.dumps(result, sort_keys=True, separators=(",", ":"))
+            )
+        else:
+            print(
+                f"STAMPED\t{result['id']}\t{result['record']['sha']}\t"
+                f"{','.join(result['record']['paths'])}"
+            )
+        return 0
+    except (ManifestError, OSError, ValueError, TypeError) as exc:
+        sys.stderr.write(
+            f"sable-victor-manifest: CANNOT-ASSESS: {exc}\n"
+        )
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
