@@ -87,9 +87,6 @@ MODE_BIN="$HOOK_DIR/../../bin/sable-mode"
 if [ ! -x "$MODE_BIN" ]; then
   MODE_BIN="$(command -v sable-mode 2>/dev/null || true)"
 fi
-MODE_BIN_PHYSICAL="$(readlink -f "$MODE_BIN" 2>/dev/null || true)"
-MODE_LIB_DIR="${MODE_BIN_PHYSICAL%/*}"
-unset MODE_BIN_PHYSICAL
 
 # Single JSON parse for every field any leg might need (SABLE-s8x9): the hook
 # used to re-parse $INPUT with a SEPARATE cold python3 process per field
@@ -106,7 +103,10 @@ unset MODE_BIN_PHYSICAL
 # only field that can
 # legitimately contain embedded newlines — a multi-line command payload — so
 # it's captured as everything after the sentinel rather than a single sed line.
-PARSED="$(printf '%s' "$INPUT" | MODE_LIB_DIR="$MODE_LIB_DIR" python3 -c "
+# Resolve MODE_BIN's physical sibling directory inside this already-required
+# Python process: os.path.realpath follows live and pinned multi-hop symlinks
+# portably, without one GNU-only `readlink -f` subprocess per hook invocation.
+PARSED="$(printf '%s' "$INPUT" | MODE_BIN="$MODE_BIN" python3 -c "
 import json, os, sys
 try:
     d = json.load(sys.stdin)
@@ -125,7 +125,10 @@ except Exception:
 mode = tier = substage = '-'
 state_path = os.environ.get('SABLE_MODE_STATE', '')
 try:
-    sys.path.insert(0, os.environ['MODE_LIB_DIR'])
+    mode_bin = os.environ.get('MODE_BIN', '')
+    if not (mode_bin and os.path.isfile(mode_bin) and os.access(mode_bin, os.X_OK)):
+        raise ImportError('sable-mode executable is unavailable')
+    sys.path.insert(0, os.path.dirname(os.path.realpath(mode_bin)))
     from sable_mode_store_lib import read_mode_state, resolve_mode_state_path
     if not state_path:
         state_path = str(resolve_mode_state_path(cwd or None))

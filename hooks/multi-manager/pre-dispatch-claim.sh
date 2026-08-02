@@ -61,31 +61,45 @@ for i in sorted(ids):
 
 [ -z "$BEAD_IDS" ] && exit 0
 
-# For each bead, read its description, extract file paths, write claims
+# For each bead, parse its record once for the footprint and initial claim
+# state. Already-claimed beads stop there. Before writing an initially empty
+# claim, re-read just that field at the old last-responsible-moment seam so a
+# concurrent dispatcher that claimed the bead during parsing is not clobbered.
 for BEAD_ID in $BEAD_IDS; do
-  DESC=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
-import json, sys
+  BEAD_RECORD=$(bd show "$BEAD_ID" --json 2>/dev/null) || BEAD_RECORD=""
+  [ -z "$BEAD_RECORD" ] && continue
+
+  # Parse the description, derived footprint, and initial claim state in one
+  # Python process. The first output line is only a presence bit (the claim's
+  # value is never used); the second is the footprint. This avoids transporting
+  # an arbitrary multiline description through a shell delimiter while
+  # preserving the footprint-section precedence and legacy regex fallback.
+  #
+  # SABLE-jd5fj.6: a planner-authored `## File footprint` section remains the
+  # authoritative source, including extension-less paths such as
+  # bin/sable-spawn-worker. The generic extension regex is only the fallback
+  # for beads authored before that convention.
+  CLAIM_FIELDS=$(printf '%s' "$BEAD_RECORD" | python3 -c "
+import json, re, sys
 try:
     data = json.load(sys.stdin)
-    if isinstance(data, list) and data:
-        print(data[0].get('description', '') or '')
 except Exception:
-    pass
-" 2>/dev/null || echo "")
-
-  [ -z "$DESC" ] && continue
-
-  # SABLE-jd5fj.6: footprint->wip_claims wiring. A planner-authored '## File
-  # footprint' description section (authored at DECOMPOSITION — see this
-  # bead's own description for the format) is the AUTHORITATIVE declared
-  # footprint: parse it in preference to the generic file-extension regex,
-  # since it may name extension-less scripts (e.g. bin/sable-spawn-worker)
-  # the regex would miss, and it is the exact list pre-dispatch-overlap.sh's
-  # scheduling constraint compares against. Falls back to the generic regex
-  # for beads authored before the footprint-section convention.
-  FILES=$(echo "$DESC" | python3 -c "
-import sys, re
-text = sys.stdin.read()
+    sys.exit(0)
+if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+    sys.exit(0)
+record = data[0]
+description = record.get('description', '') or ''
+# The former DESC command substitution stripped trailing newlines printed by
+# Python; retain that normalization before applying the exact same matchers.
+text = str(description).rstrip('\\n')
+metadata = record.get('metadata', {}) or {}
+try:
+    current_claims = metadata.get('wip_claims', '') or ''
+except Exception:
+    current_claims = ''
+# The former command substitution also stripped trailing newlines from this
+# printed field before testing `-n`; preserve that edge-case normalization.
+current_claims = str(current_claims).rstrip('\\n') if current_claims else ''
 paths = set()
 section = re.search(r'^##\s*File footprint\s*\n(.+?)(?=\n##\s|\Z)', text,
                      re.MULTILINE | re.DOTALL)
@@ -98,8 +112,16 @@ if section:
 else:
     for m in re.finditer(r'(?:^|[\s\(\[\"\\'])((?:[\w\-./]+/)?[\w\-./]+\.(?:ts|tsx|js|jsx|py|rs|go|java|rb|md|yaml|yml|toml|json|sh|sql|css|scss|html))(?=[\s\)\]\"\\',:;]|$)', text, re.MULTILINE):
         paths.add(m.group(1))
+print('1' if current_claims else '0')
 print(','.join(sorted(paths)))
-" 2>/dev/null || echo "")
+" 2>/dev/null) || CLAIM_FIELDS=""
+
+  [ -z "$CLAIM_FIELDS" ] && continue
+  CURRENT_CLAIMS_PRESENT="${CLAIM_FIELDS%%$'\n'*}"
+  case "$CLAIM_FIELDS" in
+    *$'\n'*) FILES="${CLAIM_FIELDS#*$'\n'}" ;;
+    *) FILES="" ;;
+  esac
 
   [ -z "$FILES" ] && continue
 
@@ -125,17 +147,32 @@ print(','.join(sorted(paths)))
   # replace, any blob write here would silently clobber wip_claims. See
   # SABLE-gkofi (filed to reconcile this with SABLE-szd/SABLE-sm269, whose
   # descriptions assumed the blob form already replaces).
-  CURRENT_CLAIMS=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
+  [ "$CURRENT_CLAIMS_PRESENT" = "1" ] && continue  # claims already established
+
+  # Preserve the original concurrency guard: footprint parsing is deliberately
+  # outside the write boundary, so refresh wip_claims immediately before the
+  # update. An unreadable refresh is not evidence of absence and therefore
+  # performs no write. Stable unclaimed beads still use two record reads, but
+  # only two Python parses instead of the former three; already-claimed beads
+  # use one of each.
+  CURRENT_CLAIMS_PRESENT=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     data = json.load(sys.stdin)
-    if isinstance(data, list) and data:
-        print((data[0].get('metadata', {}) or {}).get('wip_claims', '') or '')
+    record = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+    metadata = (record.get('metadata', {}) or {}) if record is not None else None
+    if not isinstance(metadata, dict):
+        raise ValueError('metadata is not an object')
+    claims = metadata.get('wip_claims', '') or ''
+    print('1' if str(claims).rstrip('\\n') else '0')
 except Exception:
     pass
-" 2>/dev/null || echo "")
-
-  [ -n "$CURRENT_CLAIMS" ] && continue  # claims already established
+" 2>/dev/null) || CURRENT_CLAIMS_PRESENT=""
+  case "$CURRENT_CLAIMS_PRESENT" in
+    0) ;;
+    1) continue ;;
+    *) continue ;;  # unreadable is not safely unclaimed
+  esac
 
   # SABLE-lfql: --sandbox disables bd's Dolt auto-push (SABLE-rq9k). bd pushes
   # to the shared Dolt remote on EVERY mutating write (create/update/close) by

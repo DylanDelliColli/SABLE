@@ -20,6 +20,7 @@ fi
 PASS=0
 FAIL=0
 FAIL_NAMES=""
+IMMUTABLE_HOOK_OUTPUT_REUSES=0
 
 # Make a temp dir to stage a fake `bd` shim.
 TMP_DIR=$(mktemp -d)
@@ -27,10 +28,10 @@ TMP_DIR=$(mktemp -d)
 # Set SABLE_MODE_STATE to an isolated path (SABLE-ierm) so the test doesn't read
 # the ambient repo's mode-state.json. This ensures tests run consistently regardless
 # of the repo's execution mode. Mirrors test-mode-interlock.sh's pattern.
-SABLE_MODE_STATE="$(mktemp -u)"
+SABLE_MODE_STATE="$TMP_DIR/mode-state.json"
 export SABLE_MODE_STATE
 
-trap 'rm -rf "$TMP_DIR" "$SABLE_MODE_STATE" 2>/dev/null || true' EXIT
+trap 'rm -rf "$TMP_DIR" 2>/dev/null || true' EXIT
 
 # We'll write a small bd stub that returns canned JSON based on the bead ID
 # in argv. The fixture data is keyed by bead-id in $TMP_DIR/fixtures.
@@ -43,7 +44,8 @@ cat > "$TMP_DIR/bd" <<'STUB'
 if [ "$1" = "show" ] && [ -n "${2:-}" ]; then
   ID="$2"
   if [ -f "$TMP_DIR/fixtures/$ID.json" ]; then
-    cat "$TMP_DIR/fixtures/$ID.json"
+    IFS= read -r FIXTURE < "$TMP_DIR/fixtures/$ID.json"
+    printf '%s\n' "$FIXTURE"
     exit 0
   fi
 fi
@@ -51,28 +53,49 @@ exit 1
 STUB
 chmod +x "$TMP_DIR/bd"
 
+json_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\b'/\\b}
+  value=${value//$'\f'/\\f}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  JSON_ESCAPED="$value"
+}
+
 write_fixture() {
   # $1 = bead id, $2 = comma-separated labels (or empty)
-  local id="$1" labels="$2"
-  python3 -c "
-import json, sys
-labels = sys.argv[1].split(',') if sys.argv[1] else []
-print(json.dumps([{'id': sys.argv[2], 'labels': labels}]))
-" "$labels" "$id" > "$TMP_DIR/fixtures/$id.json"
+  local id="$1" labels="$2" encoded_id encoded_label json sep label
+  local -a label_items=()
+  json_escape "$id"
+  encoded_id="$JSON_ESCAPED"
+  json="[{\"id\":\"$encoded_id\",\"labels\":["
+  sep=""
+  if [ -n "$labels" ]; then
+    IFS=',' read -r -a label_items <<< "$labels"
+    for label in "${label_items[@]}"; do
+      json_escape "$label"
+      encoded_label="$JSON_ESCAPED"
+      json="$json$sep\"$encoded_label\""
+      sep=","
+    done
+  fi
+  printf '%s]}]\n' "$json" > "$TMP_DIR/fixtures/$id.json"
 }
 
 make_input() {
   # $1 = prompt, $2 = subagent_type, $3 = model
-  python3 -c "
-import json, sys
-prompt = sys.argv[1]
-subtype = sys.argv[2]
-model = sys.argv[3]
-out = {'tool_input': {'prompt': prompt, 'subagent_type': subtype}}
-if model:
-    out['tool_input']['model'] = model
-print(json.dumps(out))
-" "$1" "$2" "$3"
+  local prompt subtype model
+  json_escape "$1"; prompt="$JSON_ESCAPED"
+  json_escape "$2"; subtype="$JSON_ESCAPED"
+  json_escape "$3"; model="$JSON_ESCAPED"
+  if [ -n "$model" ]; then
+    HOOK_INPUT_JSON="{\"tool_input\":{\"prompt\":\"$prompt\",\"subagent_type\":\"$subtype\",\"model\":\"$model\"}}"
+  else
+    HOOK_INPUT_JSON="{\"tool_input\":{\"prompt\":\"$prompt\",\"subagent_type\":\"$subtype\"}}"
+  fi
 }
 
 run_hook() {
@@ -82,7 +105,8 @@ run_hook() {
   local subtype="$3"
   local model="$4"
   local input
-  input=$(make_input "$prompt" "$subtype" "$model")
+  make_input "$prompt" "$subtype" "$model"
+  input="$HOOK_INPUT_JSON"
   # Inject our bd stub onto PATH and pass TMP_DIR through so the stub can find fixtures.
   # Also pass SABLE_MODE_STATE so the test doesn't read the ambient repo's mode file.
   local out
@@ -99,7 +123,7 @@ assert_allow() {
     echo "PASS: $name"
   else
     # Allow can also include additionalContext (nudge)
-    if echo "$out" | grep -q '"additionalContext"' && ! echo "$out" | grep -q '"permissionDecision"'; then
+    if [[ "$out" == *'"additionalContext"'* && "$out" != *'"permissionDecision"'* ]]; then
       PASS=$((PASS+1))
       echo "PASS: $name (with nudge)"
     else
@@ -112,11 +136,9 @@ assert_allow() {
   fi
 }
 
-assert_deny() {
-  local name="$1" env="$2" prompt="$3" subtype="$4" model="$5" expect="$6"
-  local out
-  out=$(run_hook "$env" "$prompt" "$subtype" "$model")
-  if echo "$out" | grep -q '"permissionDecision": "deny"' && echo "$out" | grep -qF "$expect"; then
+assert_deny_output() {
+  local name="$1" out="$2" expect="$3"
+  if [[ "$out" == *'"permissionDecision": "deny"'* && "$out" == *"$expect"* ]]; then
     PASS=$((PASS+1))
     echo "PASS: $name"
   else
@@ -128,11 +150,18 @@ assert_deny() {
   fi
 }
 
+assert_deny() {
+  local name="$1" env="$2" prompt="$3" subtype="$4" model="$5" expect="$6"
+  local out
+  out=$(run_hook "$env" "$prompt" "$subtype" "$model")
+  assert_deny_output "$name" "$out" "$expect"
+}
+
 assert_nudge() {
   local name="$1" env="$2" prompt="$3" subtype="$4" model="$5" expect="$6"
   local out
   out=$(run_hook "$env" "$prompt" "$subtype" "$model")
-  if echo "$out" | grep -q '"additionalContext"' && echo "$out" | grep -qF "$expect"; then
+  if [[ "$out" == *'"additionalContext"'* && "$out" == *"$expect"* ]]; then
     PASS=$((PASS+1))
     echo "PASS: $name"
   else
@@ -238,11 +267,10 @@ assert_allow "no bead + explicit model → allow" "$MGR_ENV" "Just do this gener
 # Test 15b: prompt mentions sable-* filenames alongside a real unlabeled bead →
 # deny must name only the real bead, never the filenames (regression for the
 # false 'unlabeled bead' deny caused by over-matching the ID regex).
-assert_deny "sable-execute/sable-teams-preflight filenames not treated as beads" "$MGR_ENV" \
-  "Dispatching for SABLE-ddd: run sable-execute, sable-orchestration-install, and sable-teams-preflight against the epic." \
-  "" "" "have no model: label"
 OUT=$(run_hook "$MGR_ENV" "Dispatching for SABLE-ddd: run sable-execute, sable-orchestration-install, and sable-teams-preflight against the epic." "" "")
-if echo "$OUT" | grep -qF "sable-execute" || echo "$OUT" | grep -qF "sable-orchestration-install" || echo "$OUT" | grep -qF "sable-teams-preflight"; then
+assert_deny_output "sable-execute/sable-teams-preflight filenames not treated as beads" "$OUT" "have no model: label"
+IMMUTABLE_HOOK_OUTPUT_REUSES=$((IMMUTABLE_HOOK_OUTPUT_REUSES+1))
+if [[ "$OUT" == *"sable-execute"* || "$OUT" == *"sable-orchestration-install"* || "$OUT" == *"sable-teams-preflight"* ]]; then
   FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  sable-* filenames absent from deny reason"
   echo "FAIL: sable-* filenames absent from deny reason"
   echo "  Got: ${OUT:0:400}"
@@ -283,11 +311,10 @@ assert_allow "fxv3: tool-name-only prompt with explicit model takes ad-hoc no-be
 # sable-plan ] have no model: label'). End-to-end hook invocation must deny
 # naming ONLY SABLE-ddd; sable-launch/sable-plan must never appear in the
 # no-label-beads list or anywhere in the emitted JSON.
-assert_deny "fxv3: sable-launch/sable-plan not counted as no-label beads (live-observed shape)" \
-  "$MGR_ENV" "Dispatching for SABLE-ddd: run sable-launch and sable-plan for the rollout." "" "" \
-  "have no model: label"
 OUT=$(run_hook "$MGR_ENV" "Dispatching for SABLE-ddd: run sable-launch and sable-plan for the rollout." "" "")
-if echo "$OUT" | grep -qF "sable-launch" || echo "$OUT" | grep -qF "sable-plan"; then
+assert_deny_output "fxv3: sable-launch/sable-plan not counted as no-label beads (live-observed shape)" "$OUT" "have no model: label"
+IMMUTABLE_HOOK_OUTPUT_REUSES=$((IMMUTABLE_HOOK_OUTPUT_REUSES+1))
+if [[ "$OUT" == *"sable-launch"* || "$OUT" == *"sable-plan"* ]]; then
   FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  fxv3: sable-launch/sable-plan absent from deny reason"
   echo "FAIL: fxv3: sable-launch/sable-plan absent from deny reason"
   echo "  Got: ${OUT:0:400}"
@@ -314,33 +341,27 @@ YAML
 
 # make_subagent_input <prompt> <model> — agent_id + agent_type=optimus payload
 make_subagent_input() {
-  python3 -c "
-import json, sys
-prompt, model = sys.argv[1], sys.argv[2]
-ti = {'prompt': prompt, 'subagent_type': 'claude'}
-if model:
-    ti['model'] = model
-print(json.dumps({
-    'tool_name': 'Agent',
-    'agent_id': 'mgr-sub-001',
-    'agent_type': 'optimus',
-    'tool_input': ti,
-    'hook_event_name': 'PreToolUse'
-}))
-" "$1" "$2"
+  local prompt model
+  json_escape "$1"; prompt="$JSON_ESCAPED"
+  json_escape "$2"; model="$JSON_ESCAPED"
+  if [ -n "$model" ]; then
+    HOOK_INPUT_JSON="{\"tool_name\":\"Agent\",\"agent_id\":\"mgr-sub-001\",\"agent_type\":\"optimus\",\"tool_input\":{\"prompt\":\"$prompt\",\"subagent_type\":\"claude\",\"model\":\"$model\"},\"hook_event_name\":\"PreToolUse\"}"
+  else
+    HOOK_INPUT_JSON="{\"tool_name\":\"Agent\",\"agent_id\":\"mgr-sub-001\",\"agent_type\":\"optimus\",\"tool_input\":{\"prompt\":\"$prompt\",\"subagent_type\":\"claude\"},\"hook_event_name\":\"PreToolUse\"}"
+  fi
 }
 
 # run_hook_subagent <prompt> <model> — no env identity; registry resolves optimus
 run_hook_subagent() {
-  make_subagent_input "$1" "$2" | \
-    env -i PATH="$TMP_DIR:$PATH" TMP_DIR="$TMP_DIR" SABLE_AGENTS_YAML="$AGENTS_YAML" SABLE_MODE_STATE="$SABLE_MODE_STATE" \
-        bash "$HOOK" 2>/dev/null || echo "RUN_ERR:$?"
+  make_subagent_input "$1" "$2"
+  env -i PATH="$TMP_DIR:$PATH" TMP_DIR="$TMP_DIR" SABLE_AGENTS_YAML="$AGENTS_YAML" SABLE_MODE_STATE="$SABLE_MODE_STATE" \
+      bash "$HOOK" <<< "$HOOK_INPUT_JSON" 2>/dev/null || echo "RUN_ERR:$?"
 }
 
 # Test 16 (6zt case 5): manager-subagent dispatch, bead model:opus, dispatch
 # model unspecified → DENY (activation proves the gate engaged via agent_type).
 OUT=$(run_hook_subagent "Working on SABLE-aaa, the auth refactor" "")
-if echo "$OUT" | grep -q '"permissionDecision": "deny"' && echo "$OUT" | grep -qF "model:opus but dispatch model is unspecified"; then
+if [[ "$OUT" == *'"permissionDecision": "deny"'* && "$OUT" == *"model:opus but dispatch model is unspecified"* ]]; then
   PASS=$((PASS+1)); echo "PASS: manager-subagent (agent_type=optimus) missing model → deny"
 else
   FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  manager-subagent (agent_type=optimus) missing model → deny"
@@ -361,13 +382,24 @@ fi
 # install snippet, or it silently never fires on new installs — the gap that
 # left pre-dispatch-model-check.sh unregistered while the others were present.
 SNIPPET="$(cd "$(dirname "$0")/../.." && pwd)/templates/multi-manager/settings-snippet.json"
+SNIPPET_CONTENT=$(<"$SNIPPET")
 for h in pre-dispatch-claim pre-dispatch-model-check pre-dispatch-overlap pre-dispatch-preempt pre-dispatch-refresh; do
-  if grep -q "$h.sh" "$SNIPPET" 2>/dev/null; then
+  if [[ "$SNIPPET_CONTENT" == *"$h.sh"* ]]; then
     PASS=$((PASS+1)); echo "PASS: $h.sh registered in settings-snippet.json"
   else
     FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $h.sh registered in settings-snippet.json"; echo "FAIL: $h.sh registered in settings-snippet.json"
   fi
 done
+
+# Two deny cases below have a second assertion over the exact same immutable
+# hook response. Keep this structural counter load-bearing so those assertions
+# cannot silently regain redundant encoder/hook/fixture reads.
+if [ "$IMMUTABLE_HOOK_OUTPUT_REUSES" -eq 2 ]; then
+  PASS=$((PASS+1)); echo "PASS: structure: immutable deny outputs reused twice"
+else
+  FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  structure: expected 2 immutable output reuses, got $IMMUTABLE_HOOK_OUTPUT_REUSES"
+  echo "FAIL: structure: immutable deny outputs reused twice"
+fi
 
 # ---- Summary ----
 

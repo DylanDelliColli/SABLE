@@ -48,7 +48,7 @@ FAIL_NAMES=""
 # Make a temp bin/bd that returns a canned `[no-test]` notes payload for
 # any single-arg `show ... --json` call.
 STUB_DIR=$(mktemp -d)
-trap 'rm -rf "$STUB_DIR"' EXIT
+trap 'rm -rf "$STUB_DIR"; [ -z "${BOUNDARY_EVIDENCE:-}" ] || rm -f "$BOUNDARY_EVIDENCE"' EXIT
 
 cat > "$STUB_DIR/bd" <<'EOF'
 #!/usr/bin/env bash
@@ -444,6 +444,70 @@ out=$(run_gate_agent "$CLOSE2" "$PG_SID" "")
 if [ -z "$out" ]; then pa_pass "per-agent gate: main-session close allowed by session-global evidence (single-agent unchanged)"; else pa_fail "per-agent gate: main-session allowed by session-global evidence" "got: $out"; fi
 rm -f "$PG_MAIN" "$PG_A" "$PG_B"
 
+# ---------- SABLE-y4nom.7.6: one Python boundary parses input + close args ---
+# Route a two-bead close through an existing per-agent evidence file so the hook
+# exits immediately after its initial parsing boundary: no marker lookup, deny
+# renderer, or companion scan can contaminate the process count. PATH spies
+# make the removed sed x3 / grep / second-python / wc chain load-bearing.
+BOUNDARY_BIN="$STUB_DIR/boundary-spies"
+BOUNDARY_LOG="$STUB_DIR/boundary-processes.log"
+mkdir -p "$BOUNDARY_BIN"
+cat > "$BOUNDARY_BIN/process-spy" <<'EOF'
+#!/usr/bin/env bash
+tool=${0##*/}
+printf '%s\n' "$tool" >> "$TDD_GATE_BOUNDARY_LOG"
+case "$tool" in
+  python3) exec "$TDD_GATE_REAL_PYTHON" "$@" ;;
+  sed) exec "$TDD_GATE_REAL_SED" "$@" ;;
+  grep) exec "$TDD_GATE_REAL_GREP" "$@" ;;
+  wc) exec "$TDD_GATE_REAL_WC" "$@" ;;
+  *) exit 127 ;;
+esac
+EOF
+chmod +x "$BOUNDARY_BIN/process-spy"
+for BOUNDARY_TOOL in python3 sed grep wc; do
+  ln -s process-spy "$BOUNDARY_BIN/$BOUNDARY_TOOL"
+done
+
+BOUNDARY_SID="tdd-gate-boundary-$$-$RANDOM"
+BOUNDARY_AGENT="boundaryAgent"
+BOUNDARY_EVIDENCE="/tmp/tdd-evidence-${BOUNDARY_SID}-${BOUNDARY_AGENT}"
+printf 'ran tests\n' > "$BOUNDARY_EVIDENCE"
+: > "$BOUNDARY_LOG"
+BOUNDARY_OUT=$(make_input_agent 'bd close SABLE-stub SABLE-other' "$BOUNDARY_SID" "$BOUNDARY_AGENT" | \
+  env PATH="$BOUNDARY_BIN:$STUB_DIR:$PATH" \
+      SABLE_HOOK_TRACE=0 \
+      TDD_GATE_BOUNDARY_LOG="$BOUNDARY_LOG" \
+      TDD_GATE_REAL_PYTHON="$(command -v python3)" \
+      TDD_GATE_REAL_SED="$(command -v sed)" \
+      TDD_GATE_REAL_GREP="$(command -v grep)" \
+      TDD_GATE_REAL_WC="$(command -v wc)" \
+      bash "$HOOK" 2>/dev/null)
+BOUNDARY_PYTHON=$(grep -c '^python3$' "$BOUNDARY_LOG" 2>/dev/null)
+BOUNDARY_SED=$(grep -c '^sed$' "$BOUNDARY_LOG" 2>/dev/null)
+BOUNDARY_GREP=$(grep -c '^grep$' "$BOUNDARY_LOG" 2>/dev/null)
+BOUNDARY_WC=$(grep -c '^wc$' "$BOUNDARY_LOG" 2>/dev/null)
+if [ -z "$BOUNDARY_OUT" ] && [ "$BOUNDARY_PYTHON" = "1" ] \
+   && [ "$BOUNDARY_SED" = "0" ] && [ "$BOUNDARY_GREP" = "0" ] \
+   && [ "$BOUNDARY_WC" = "0" ]; then
+  pa_pass "SABLE-y4nom.7.6: initial input + bd-close args use one Python boundary (no sed/grep/wc)"
+else
+  pa_fail "SABLE-y4nom.7.6: initial input + bd-close args use one Python boundary (no sed/grep/wc)" \
+    "counts: python=$BOUNDARY_PYTHON sed=$BOUNDARY_SED grep=$BOUNDARY_GREP wc=$BOUNDARY_WC; output=${BOUNDARY_OUT:-<empty>}"
+fi
+rm -f "$BOUNDARY_EVIDENCE"
+BOUNDARY_EVIDENCE=""
+
+BOUNDARY_BAD_RC=0
+BOUNDARY_BAD_OUT=$(printf '{malformed' | \
+  env PATH="$STUB_DIR:$PATH" SABLE_HOOK_TRACE=0 bash "$HOOK" 2>/dev/null) || BOUNDARY_BAD_RC=$?
+if [ "$BOUNDARY_BAD_RC" -eq 0 ] && [ -z "$BOUNDARY_BAD_OUT" ]; then
+  pa_pass "SABLE-y4nom.7.6: malformed hook input remains a silent fail-open"
+else
+  pa_fail "SABLE-y4nom.7.6: malformed hook input remains a silent fail-open" \
+    "rc=$BOUNDARY_BAD_RC output=${BOUNDARY_BAD_OUT:-<empty>}"
+fi
+
 # ---------- market-brief-package-sqcr: companion-repo evidence acceptance ----------
 # A cross-repo bead (73t4 pattern: a SABLE-hooks fix tracked as a
 # market-brief-package bead) declares its companion repo in notes
@@ -454,9 +518,12 @@ rm -f "$PG_MAIN" "$PG_A" "$PG_B"
 # never declared a companion repo.
 
 CR_STUB_DIR=$(mktemp -d)
+CR_BD_LOG="$CR_STUB_DIR/bd-show.log"
+export CR_BD_LOG
 cat > "$CR_STUB_DIR/bd" <<'EOF'
 #!/usr/bin/env bash
 if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  printf '%s\n' "$*" >> "$CR_BD_LOG"
   cat <<'JSON'
 [{"id":"market-brief-package-companion","notes":"Companion repo: /home/ddc/dev-environment/SABLE"}]
 JSON
@@ -469,6 +536,7 @@ chmod +x "$CR_STUB_DIR/bd"
 CR_SID="tdd-gate-companion-$$-$RANDOM"
 CR_CLOSE='bd close market-brief-package-companion market-brief-package-other'
 rm -f /tmp/tdd-evidence-"${CR_SID}"*
+: > "$CR_BD_LOG"
 
 # (a) companion declared, but no REPO=-tagged evidence anywhere → still denied
 CR_OUT=$(make_input "$CR_CLOSE" "$CR_SID" | env PATH="$CR_STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null)
@@ -486,6 +554,13 @@ if [ -z "$CR_OUT2" ]; then
   pa_pass "companion-repo: REPO=-tagged evidence under a different agent_id accepted"
 else
   pa_fail "companion-repo: REPO=-tagged evidence under a different agent_id accepted" "got: $CR_OUT2"
+fi
+if [ "$(wc -l < "$CR_BD_LOG" | tr -d ' ')" = "2" ] \
+   && ! grep -v 'market-brief-package-companion market-brief-package-other --json' "$CR_BD_LOG" | grep -q .; then
+  pa_pass "SABLE-y4nom.7.6: each multi-bead companion scan uses one batched bd show"
+else
+  pa_fail "SABLE-y4nom.7.6: each multi-bead companion scan uses one batched bd show" \
+    "calls=$(tr '\n' '|' < "$CR_BD_LOG")"
 fi
 rm -f /tmp/tdd-evidence-"${CR_SID}"*
 

@@ -203,14 +203,16 @@ print(json.dumps({
 }
 
 # run_hook <env_prefix> <json> → prints hook stdout+stderr
-# SABLE-tb1y: default the invocation-trace log into STUB_DIR (trap-cleaned) so
-# tracing is hermetic; a test may override SABLE_HOOK_TRACE_LOG / SABLE_HOOK_TRACE
-# in env_prefix (later `env` assignment wins).
+# SABLE-y4nom.7.6: tracing is off for the ordinary behavior matrix; only the
+# trace-contract and trace-backed non-vacuity cases opt in. Keep the log rooted
+# in STUB_DIR for those cases. A test may override either assignment in
+# env_prefix because the later `env` assignment wins.
 run_hook() {
   local env_prefix="$1" json="$2"
   env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" \
     SABLE_MSG_LOG="$SABLE_MSG_LOG" SABLE_MSG_STUB_RC="${SABLE_MSG_STUB_RC:-1}" \
     SABLE_PREVIEW_KICK="$SABLE_PREVIEW_KICK" \
+    SABLE_HOOK_TRACE=0 \
     SABLE_HOOK_TRACE_LOG="$STUB_DIR/hook-trace.log" \
     $env_prefix bash "$HOOK" <<< "$json" 2>/dev/null
 }
@@ -416,7 +418,8 @@ rm -f "$BD_LOG"
 # the hook before bd create and drop the Chuck handoff).
 MEMBER_INPUT_T=$(make_member_post_input "git push" "$FIXTURE_REPO" "tarzan")
 ERR=$(env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" SABLE_AGENTS_YAML="$FIX_YAML" \
-  SABLE_PREVIEW_KICK=0 bash "$HOOK" <<< "$MEMBER_INPUT_T" 2>&1 >/dev/null); RC=$?
+  SABLE_PREVIEW_KICK=0 SABLE_HOOK_TRACE=0 \
+  bash "$HOOK" <<< "$MEMBER_INPUT_T" 2>&1 >/dev/null); RC=$?
 if [ "$RC" -eq 0 ] && ! echo "$ERR" | grep -qi "unbound variable"; then
   pass "unset CLAUDE_AGENT_NAME: hook survives set -u (exit 0, no unbound variable)"
 else
@@ -1180,7 +1183,7 @@ fi
 TB1Y_TRACE="$STUB_DIR/tb1y-trace.log"
 rm -f "$BD_LOG" "$SABLE_MSG_LOG" "$TB1Y_COUNT" "$TB1Y_TRACE"
 SABLE_MSG_STUB_RC=0 run_hook \
-  "$MGR_ENV SABLE_HOOK_TRACE_LOG=$TB1Y_TRACE" \
+  "$MGR_ENV SABLE_HOOK_TRACE=1 SABLE_HOOK_TRACE_LOG=$TB1Y_TRACE" \
   "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
 if [ -s "$TB1Y_TRACE" ] && grep -q 'INVOKED' "$TB1Y_TRACE" 2>/dev/null \
    && grep -q 'CONFIRMED' "$TB1Y_TRACE" 2>/dev/null \
@@ -1194,21 +1197,23 @@ fi
 # SABLE_HOOK_TRACE=0 disables tracing entirely.
 rm -f "$TB1Y_TRACE" "$TB1Y_COUNT"
 run_hook \
-  "$MGR_ENV SABLE_STUB_CHUCK_PRESENT=0 SABLE_TEST_LSREMOTE_LAG=99 SABLE_TEST_LSREMOTE_COUNT_FILE=$TB1Y_COUNT SABLE_PUSH_CONFIRM_RETRIES=1 SABLE_PUSH_CONFIRM_SLEEP=0.02 SABLE_HOOK_TRACE_LOG=$TB1Y_TRACE" \
+  "$MGR_ENV SABLE_STUB_CHUCK_PRESENT=0 SABLE_TEST_LSREMOTE_LAG=99 SABLE_TEST_LSREMOTE_COUNT_FILE=$TB1Y_COUNT SABLE_PUSH_CONFIRM_RETRIES=1 SABLE_PUSH_CONFIRM_SLEEP=0.02 SABLE_HOOK_TRACE=1 SABLE_HOOK_TRACE_LOG=$TB1Y_TRACE" \
   "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
 if grep -q 'EXIT unconfirmed' "$TB1Y_TRACE" 2>/dev/null; then
   pass "SABLE-tb1y: unconfirmed disposition is traced (EXIT unconfirmed)"
 else
   fail "SABLE-tb1y: unconfirmed disposition is traced (EXIT unconfirmed)" "TRACE: $(cat "$TB1Y_TRACE" 2>/dev/null)"
 fi
-rm -f "$TB1Y_TRACE"
-run_hook \
+rm -f "$TB1Y_TRACE" "$SABLE_MSG_LOG"
+SABLE_MSG_STUB_RC=0 run_hook \
   "$MGR_ENV SABLE_HOOK_TRACE=0 SABLE_HOOK_TRACE_LOG=$TB1Y_TRACE" \
   "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null
 if [ -f "$TB1Y_TRACE" ]; then
   fail "SABLE-tb1y: SABLE_HOOK_TRACE=0 disables tracing" "trace file written despite disable: $(cat "$TB1Y_TRACE" 2>/dev/null)"
+elif ! grep -qE '^chuck .*PR ready from optimus' "$SABLE_MSG_LOG" 2>/dev/null; then
+  fail "SABLE-tb1y: SABLE_HOOK_TRACE=0 disables tracing without silencing the hook" "trace absent but chuck handoff did not fire: $(cat "$SABLE_MSG_LOG" 2>/dev/null)"
 else
-  pass "SABLE-tb1y: SABLE_HOOK_TRACE=0 disables tracing (no trace file)"
+  pass "SABLE-tb1y: SABLE_HOOK_TRACE=0 disables tracing without silencing the hook"
 fi
 
 # --------------------------------------------------------------------------
@@ -1662,6 +1667,7 @@ else
   env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" \
     SABLE_MSG_LOG="$SABLE_MSG_LOG" SABLE_MSG_STUB_RC=0 \
     SABLE_PREVIEW_KICK=0 \
+    SABLE_HOOK_TRACE=1 \
     SABLE_HOOK_TRACE_LOG="$STUB_DIR/hook-trace-plant.log" \
     $MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker UNIT_BEAD_STATUS=in_progress UNIT_BEAD_ID=SABLE-gxunit \
     bash "$MUTATED_HOOK" <<< "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null 2>&1
@@ -1755,6 +1761,7 @@ else
   env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" \
     SABLE_MSG_LOG="$SABLE_MSG_LOG" SABLE_MSG_STUB_RC=0 \
     SABLE_PREVIEW_KICK=0 \
+    SABLE_HOOK_TRACE=1 \
     SABLE_HOOK_TRACE_LOG="$STUB_DIR/hook-trace-plant-card.log" \
     $MGR_ENV TMUX_PANE=%worker SABLE_STUB_PANE_ROLE=worker UNIT_BEAD_BUNDLE_FILE=$GX_BUNDLE_PARTIAL \
     bash "$CARDINALITY_MUTANT" <<< "$(make_post_input "git push" "$FIXTURE_REPO")" >/dev/null 2>&1
@@ -1927,7 +1934,7 @@ EOF
     # delivered message must carry the AUTO-NOTIFY tag and must NOT assert
     # closure.
     INT_GX_INPUT=$(make_post_input "git push" "$GX_REPO")
-    CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager TMUX_PANE=%gxinttest \
+    CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager TMUX_PANE=%gxinttest SABLE_HOOK_TRACE=0 \
       PATH="$GX_INT_STUB:$PATH" GX_MSG_LOG="$GX_MSG_LOG" BEADS_DB="$POST_BD_DB" \
       bash "$HOOK" <<< "$INT_GX_INPUT" >/dev/null 2>&1
     gx7p3_cleanup_stray_forchuck "$GX_BRANCH"
@@ -1975,7 +1982,7 @@ EOF
     cd - >/dev/null
 
     INT_GX_INPUT2=$(make_post_input "git push" "$GX_REPO")
-    CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager TMUX_PANE=%gxinttest \
+    CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager TMUX_PANE=%gxinttest SABLE_HOOK_TRACE=0 \
       PATH="$GX_INT_STUB:$PATH" GX_MSG_LOG="$GX_MSG_LOG" BEADS_DB="$POST_BD_DB" \
       bash "$HOOK" <<< "$INT_GX_INPUT2" >/dev/null 2>&1
     gx7p3_cleanup_stray_forchuck "$GX_BRANCH"
@@ -2166,6 +2173,7 @@ else
   rm -f "$BD_LOG" "$SABLE_MSG_LOG"
   env -i PATH="$STUB_DIR:$PATH" BD_LOG="$BD_LOG" SABLE_MSG_LOG="$SABLE_MSG_LOG" SABLE_MSG_STUB_RC=0 \
     SABLE_PREVIEW_KICK=0 \
+    SABLE_HOOK_TRACE=1 \
     SABLE_HOOK_TRACE_LOG="$STUB_DIR/hook-trace-pfbjw-plant.log" \
     $MGR_ENV bash "$PFBJW_MUTANT" <<< "$PFBJW_NEWFILES_INPUT" >/dev/null 2>&1
 
@@ -2288,7 +2296,7 @@ EOF
     post_bd close "$PFI_SCRATCH_ID" --sandbox --reason "SABLE-pfbjw integration test: modeling closed-but-unlanded" 2>/dev/null || true
 
     PFI_INPUT=$(make_post_input "git push" "$PFI_REPO")
-    CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager \
+    CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager SABLE_HOOK_TRACE=0 \
       PATH="$PFI_STUB:$PATH" PFI_MSG_LOG="$PFI_MSG_LOG" BEADS_DB="$POST_BD_DB" \
       bash "$HOOK" <<< "$PFI_INPUT" >/dev/null 2>&1
     pfbjw_cleanup_stray_forchuck "$PFI_BRANCH"

@@ -85,27 +85,64 @@ TRANSCRIPT="$FIXTURE_DIR/transcript.jsonl"
 cat > "$TRANSCRIPT" <<'JSONL'
 {"role":"user","content":"Please implement SABLE-stub: hooks/foo.sh needs updating"}
 JSONL
+INT_TRANSCRIPT="$FIXTURE_DIR/int-transcript.jsonl"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-# make_edit_input <file_path> [agent_id] [transcript_path]
-make_edit_input() {
-  python3 -c "
-import json, sys
-file_path, agent_id, transcript = sys.argv[1], sys.argv[2], sys.argv[3]
-d = {
-    'tool_name': 'Edit',
-    'tool_input': {'file_path': file_path},
-    'hook_event_name': 'PreToolUse',
-}
-if agent_id:
-    d['agent_id'] = agent_id
-if transcript:
-    d['transcript_path'] = transcript
-print(json.dumps(d))
-" "$1" "${2:-}" "${3:-}"
+# Encode the six immutable request shapes in one Python process. Keeping
+# json.dumps preserves exact path/agent escaping; reusing the resulting strings
+# is safe because later tests mutate bd/stub state, never these hook inputs.
+EDIT_INPUT_ENCODER_TRACE="$FIXTURE_DIR/edit-input-encoder.trace"
+: > "$EDIT_INPUT_ENCODER_TRACE"
+mapfile -t EDIT_INPUTS < <(python3 - "$TRANSCRIPT" "$INT_TRANSCRIPT" "$EDIT_INPUT_ENCODER_TRACE" <<'PYEOF'
+import json
+import sys
+
+transcript, int_transcript, trace_path = sys.argv[1:]
+with open(trace_path, "a", encoding="utf-8") as trace:
+    trace.write("encode\n")
+
+
+def edit_input(file_path, agent_id, transcript_path):
+    data = {
+        "tool_name": "Edit",
+        "tool_input": {"file_path": file_path},
+        "hook_event_name": "PreToolUse",
+    }
+    if agent_id:
+        data["agent_id"] = agent_id
+    if transcript_path:
+        data["transcript_path"] = transcript_path
+    return json.dumps(data)
+
+
+for values in (
+    ("hooks/foo.sh", "agent-abc-123", transcript),
+    ("hooks/foo.sh", "", transcript),
+    ("", "agent-abc-123", transcript),
+    ("hooks/foo.sh", "agent-abc-123", ""),
+    ("hooks/foo.test.sh", "agent-abc-123", transcript),
+    ("hooks/foo.sh", "agent-int-001", int_transcript),
+):
+    print(edit_input(*values))
+PYEOF
+)
+
+EDIT_INPUT_USES=0
+EDIT_INPUT_NORMAL_USES=0
+use_edit_input() {
+  EDIT_INPUT_USES=$((EDIT_INPUT_USES + 1))
+  case "$1" in
+    normal)        EDIT_INPUT="${EDIT_INPUTS[0]}"; EDIT_INPUT_NORMAL_USES=$((EDIT_INPUT_NORMAL_USES + 1)) ;;
+    no-agent)      EDIT_INPUT="${EDIT_INPUTS[1]}" ;;
+    no-file)       EDIT_INPUT="${EDIT_INPUTS[2]}" ;;
+    no-transcript) EDIT_INPUT="${EDIT_INPUTS[3]}" ;;
+    test-file)     EDIT_INPUT="${EDIT_INPUTS[4]}" ;;
+    integration)  EDIT_INPUT="${EDIT_INPUTS[5]}" ;;
+    *) echo "FATAL: unknown cached edit input: $1" >&2; exit 2 ;;
+  esac
 }
 
 # run_hook <json>
@@ -113,6 +150,17 @@ run_hook() {
   : > "$BD_CALL_LOG"
   printf '%s' "$1" | env BD_CALL_LOG="$BD_CALL_LOG" PATH="$STUB_DIR:$PATH" bash "$HOOK" 2>/dev/null
 }
+
+# A snapshot is fresh after each hook mutation boundary, then reused by every
+# assertion about that immutable post-run log. This avoids re-running
+# grep/head pipelines without allowing observations to cross mutations.
+BD_LOG_SNAPSHOTS=0
+snapshot_bd_log() {
+  BD_LOG_SNAPSHOTS=$((BD_LOG_SNAPSHOTS + 1))
+  BD_LOG_SNAPSHOT=""
+  [ -f "$BD_CALL_LOG" ] && BD_LOG_SNAPSHOT="$(<"$BD_CALL_LOG")"
+}
+bd_log_has_update() { [[ "$BD_LOG_SNAPSHOT" == *"BD_CALLED: update"* ]]; }
 
 restore_plain_stub() {
   cat > "$STUB_DIR/bd" <<'STUB'
@@ -132,8 +180,10 @@ STUB
 # ---------------------------------------------------------------------------
 
 # --- Test 1: agent_id + file_path + transcript with bead ID → bd update --notes called ---
-run_hook "$(make_edit_input "hooks/foo.sh" "agent-abc-123" "$TRANSCRIPT")" >/dev/null
-if grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+use_edit_input normal
+run_hook "$EDIT_INPUT" >/dev/null
+snapshot_bd_log
+if bd_log_has_update; then
   pass "agent_id + file_path + transcript with bead ID → bd update --notes called"
 else
   fail "agent_id + file_path + transcript with bead ID → bd update --notes called" \
@@ -141,15 +191,18 @@ else
 fi
 
 # --- Test 2: WIP-CLAIMS note includes the file path ---
-UPDATE_LINE=$(grep 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null | head -1)
-if echo "$UPDATE_LINE" | grep -q 'hooks/foo.sh'; then
+UPDATE_LINE=""
+while IFS= read -r line; do
+  [[ "$line" == *"BD_CALLED: update"* ]] && { UPDATE_LINE="$line"; break; }
+done <<< "$BD_LOG_SNAPSHOT"
+if [[ "$UPDATE_LINE" == *"hooks/foo.sh"* ]]; then
   pass "WIP-CLAIMS note includes the edited file path"
 else
   fail "WIP-CLAIMS note includes the edited file path" "update line: ${UPDATE_LINE:-<none>}"
 fi
 
 # --- Test 3 (SABLE-lfql): the update call carries --sandbox ---
-if echo "$UPDATE_LINE" | grep -q -- '--sandbox'; then
+if [[ "$UPDATE_LINE" == *"--sandbox"* ]]; then
   pass "SABLE-lfql: bd update --notes call carries --sandbox (Dolt auto-push disabled)"
 else
   fail "SABLE-lfql: bd update --notes call carries --sandbox (Dolt auto-push disabled)" \
@@ -157,32 +210,40 @@ else
 fi
 
 # --- Test 4: no agent_id (manager/main-session context) → hook stands down ---
-run_hook "$(make_edit_input "hooks/foo.sh" "" "$TRANSCRIPT")" >/dev/null
-if grep -q 'BD_CALLED:' "$BD_CALL_LOG" 2>/dev/null; then
+use_edit_input no-agent
+run_hook "$EDIT_INPUT" >/dev/null
+snapshot_bd_log
+if [ -n "$BD_LOG_SNAPSHOT" ]; then
   fail "no agent_id → hook stands down (no bd calls)" "bd calls: $(cat "$BD_CALL_LOG")"
 else
   pass "no agent_id → hook stands down (no bd calls)"
 fi
 
 # --- Test 5: no file_path → hook stands down ---
-run_hook "$(make_edit_input "" "agent-abc-123" "$TRANSCRIPT")" >/dev/null
-if grep -q 'BD_CALLED:' "$BD_CALL_LOG" 2>/dev/null; then
+use_edit_input no-file
+run_hook "$EDIT_INPUT" >/dev/null
+snapshot_bd_log
+if [ -n "$BD_LOG_SNAPSHOT" ]; then
   fail "no file_path → hook stands down (no bd calls)" "bd calls: $(cat "$BD_CALL_LOG")"
 else
   pass "no file_path → hook stands down (no bd calls)"
 fi
 
 # --- Test 6: no transcript_path → hook stands down ---
-run_hook "$(make_edit_input "hooks/foo.sh" "agent-abc-123" "")" >/dev/null
-if grep -q 'BD_CALLED:' "$BD_CALL_LOG" 2>/dev/null; then
+use_edit_input no-transcript
+run_hook "$EDIT_INPUT" >/dev/null
+snapshot_bd_log
+if [ -n "$BD_LOG_SNAPSHOT" ]; then
   fail "no transcript_path → hook stands down (no bd calls)" "bd calls: $(cat "$BD_CALL_LOG")"
 else
   pass "no transcript_path → hook stands down (no bd calls)"
 fi
 
 # --- Test 7: test file path (.test.) is skipped ---
-run_hook "$(make_edit_input "hooks/foo.test.sh" "agent-abc-123" "$TRANSCRIPT")" >/dev/null
-if grep -q 'BD_CALLED:' "$BD_CALL_LOG" 2>/dev/null; then
+use_edit_input test-file
+run_hook "$EDIT_INPUT" >/dev/null
+snapshot_bd_log
+if [ -n "$BD_LOG_SNAPSHOT" ]; then
   fail "test file path (.test.) is skipped (no bd calls)" "bd calls: $(cat "$BD_CALL_LOG")"
 else
   pass "test file path (.test.) is skipped (no bd calls)"
@@ -199,8 +260,10 @@ fi
 exit 0
 STUB
 chmod +x "$STUB_DIR/bd"
-run_hook "$(make_edit_input "hooks/foo.sh" "agent-abc-123" "$TRANSCRIPT")" >/dev/null
-if grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+use_edit_input normal
+run_hook "$EDIT_INPUT" >/dev/null
+snapshot_bd_log
+if bd_log_has_update; then
   fail "file already in wip_claims → not re-appended (no bd update)" "bd calls: $(cat "$BD_CALL_LOG")"
 else
   pass "file already in wip_claims → not re-appended (no bd update)"
@@ -236,13 +299,15 @@ chmod +x "$STUB_DIR/bd"
 LFQL_TIP="$FIXTURE_DIR/dolt-remote-tip"
 : > "$LFQL_TIP"
 : > "$BD_CALL_LOG"
-printf '%s' "$(make_edit_input "hooks/foo.sh" "agent-abc-123" "$TRANSCRIPT")" | \
+use_edit_input normal
+printf '%s' "$EDIT_INPUT" | \
   env BD_CALL_LOG="$BD_CALL_LOG" DOLT_REMOTE_TIP="$LFQL_TIP" PATH="$STUB_DIR:$PATH" \
   bash "$HOOK" 2>/dev/null
+snapshot_bd_log
 
 # Precondition: the WIP-CLAIMS update really was attempted (so a pass below is
 # not vacuous from the hook exiting before bd update).
-if grep -q 'BD_CALLED: update' "$BD_CALL_LOG" 2>/dev/null; then
+if bd_log_has_update; then
   pass "SABLE-lfql: WIP-CLAIMS update is attempted (precondition)"
 else
   fail "SABLE-lfql: WIP-CLAIMS update is attempted (precondition)" "BD_CALL_LOG: $(cat "$BD_CALL_LOG" 2>/dev/null)"
@@ -265,28 +330,28 @@ restore_plain_stub
 # transcript file mentioning it, runs the real hook, then checks WIP-CLAIMS
 # was written. Closes the bead when done.
 
+INTEGRATION_INPUT_USED=0
 if ! command -v bd >/dev/null 2>&1; then
   echo "SKIP (integration): bd not found on PATH"
 else
-  SCRATCH_ID=$(bd create --sandbox \
+  SCRATCH_ID=$(bd create --sandbox --silent \
     --title="[int-test] edit-write-claim-reconciler scratch bead" \
     --description="hooks/foo.sh is the implementation file for this scratch bead" \
-    --type=task 2>/dev/null | grep -oE '[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+' | head -1)
+    --notes="[no-test] integration test scratch — safe to close" \
+    --type=task 2>/dev/null)
 
-  if [ -z "$SCRATCH_ID" ]; then
+  if [[ ! "$SCRATCH_ID" =~ ^[A-Za-z][A-Za-z0-9]*-[a-zA-Z0-9]+$ ]]; then
     echo "SKIP (integration): could not create scratch bead — bd create output did not match ID pattern"
   else
     echo "Integration: created scratch bead $SCRATCH_ID"
-    # Add [no-test] immediately so tdd-gate won't block the close at the end.
-    bd update "$SCRATCH_ID" --sandbox --notes "[no-test] integration test scratch — safe to close" 2>/dev/null || true
 
-    INT_TRANSCRIPT="$FIXTURE_DIR/int-transcript.jsonl"
     printf '{"role":"user","content":"%s: implement the feature — hooks/foo.sh needs updating"}\n' "$SCRATCH_ID" > "$INT_TRANSCRIPT"
 
     # Run real hook (no stub bd on PATH) with the scratch bead ID reachable
     # via the transcript.
-    INT_INPUT=$(make_edit_input "hooks/foo.sh" "agent-int-001" "$INT_TRANSCRIPT")
-    printf '%s' "$INT_INPUT" | bash "$HOOK" 2>/dev/null
+    use_edit_input integration
+    INTEGRATION_INPUT_USED=1
+    printf '%s' "$EDIT_INPUT" | bash "$HOOK" 2>/dev/null
 
     CLAIMS=$(bd show "$SCRATCH_ID" --json 2>/dev/null | python3 -c "
 import json, sys
@@ -306,6 +371,27 @@ except Exception:
 
     bd close "$SCRATCH_ID" --sandbox 2>/dev/null || true
   fi
+fi
+
+# Load-bearing reuse control. Six immutable payloads are encoded by one Python
+# process, the common payload is consumed at three distinct stub-state
+# boundaries, and seven post-hook logs are freshly snapshotted exactly once per
+# mutation boundary. A future per-case encoder or repeated grep observation
+# makes these counts diverge.
+EXPECTED_EDIT_INPUT_USES=$((7 + INTEGRATION_INPUT_USED))
+EDIT_INPUT_ENCODER_RUNS=0
+while IFS= read -r encoder_event; do
+  [ "$encoder_event" = "encode" ] && EDIT_INPUT_ENCODER_RUNS=$((EDIT_INPUT_ENCODER_RUNS + 1))
+done < "$EDIT_INPUT_ENCODER_TRACE"
+if [ "$EDIT_INPUT_ENCODER_RUNS" -eq 1 ] \
+   && [ "${#EDIT_INPUTS[@]}" -eq 6 ] \
+   && [ "$EDIT_INPUT_USES" -eq "$EXPECTED_EDIT_INPUT_USES" ] \
+   && [ "$EDIT_INPUT_NORMAL_USES" -eq 3 ] \
+   && [ "$BD_LOG_SNAPSHOTS" -eq 7 ]; then
+  pass "immutable hook inputs are batch-encoded once and each mutated stub log is observed once"
+else
+  fail "immutable hook inputs are batch-encoded once and each mutated stub log is observed once" \
+    "encoders=$EDIT_INPUT_ENCODER_RUNS payloads=${#EDIT_INPUTS[@]} uses=$EDIT_INPUT_USES normal_uses=$EDIT_INPUT_NORMAL_USES snapshots=$BD_LOG_SNAPSHOTS"
 fi
 
 # ---------------------------------------------------------------------------

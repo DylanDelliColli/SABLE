@@ -212,14 +212,29 @@ fi
 # ---------------------------------------------------------------------------
 STUBBIN="$TMPROOT/stubbin"
 mkdir -p "$STUBBIN"
+BD_BATCH_LOG="$TMPROOT/bd-batch.log"
+export BD_BATCH_LOG
 cat > "$STUBBIN/bd" <<'STUB'
 #!/usr/bin/env bash
-# Stub bd: only `bd show <id> --json` is used by --check-beads.
-case "${2:-}" in
-  SABLE-fixclosed|SABLE-fixclosed2) printf '[{"id":"%s","status":"closed"}]\n' "$2" ;;
-  SABLE-fixopen)                    printf '[{"id":"%s","status":"open"}]\n'   "$2" ;;
-  *) printf '[]\n'; exit 1 ;;
-esac
+# Stub bd: `bd show <id>... --json` returns every resolvable requested record
+# in one array, matching the real CLI's multi-id contract.
+[ "${1:-}" = "show" ] || exit 1
+printf '%s\n' "$*" >> "$BD_BATCH_LOG"
+shift
+printf '['
+first=1
+for id in "$@"; do
+  [ "$id" = "--json" ] && continue
+  case "$id" in
+    SABLE-fixclosed|SABLE-fixclosed2) status=closed ;;
+    SABLE-fixopen) status=open ;;
+    *) continue ;;
+  esac
+  [ "$first" -eq 1 ] || printf ','
+  first=0
+  printf '{"id":"%s","status":"%s"}' "$id" "$status"
+done
+printf ']\n'
 STUB
 chmod +x "$STUBBIN/bd"
 
@@ -234,6 +249,7 @@ set_allow_exclude "$FIX_E" --SEP-- \
   "test-fixture-permanent.sh=structural, needs the install [permanent: SABLE-fixclosed]" \
   "test-fixture-ghostbead.sh=known-red [blocked-by: SABLE-typoed]"
 
+: > "$BD_BATCH_LOG"
 OUT_E=$(PATH="$STUBBIN:$PATH" bash "$FIX_E/.github/ci/shell-run-set.sh" --check-beads 2>&1); RC_E=$?
 
 if [ "$RC_E" -ne 0 ] && printf '%s' "$OUT_E" | grep -q 'test-fixture-stale.sh' \
@@ -241,6 +257,16 @@ if [ "$RC_E" -ne 0 ] && printf '%s' "$OUT_E" | grep -q 'test-fixture-stale.sh' \
   pass "(e) exclusion whose tracking bead is closed is flagged — rc!=0 and the message names BOTH the suite file and the closed bead id"
 else
   fail "(e) exclusion whose tracking bead is closed is flagged — rc!=0 and the message names BOTH the suite file and the closed bead id" "rc=$RC_E out=$OUT_E"
+fi
+
+if [ "$(wc -l < "$BD_BATCH_LOG" | tr -d ' ')" = "1" ] \
+   && grep -q 'SABLE-fixclosed' "$BD_BATCH_LOG" \
+   && grep -q 'SABLE-fixopen' "$BD_BATCH_LOG" \
+   && grep -q 'SABLE-typoed' "$BD_BATCH_LOG"; then
+  pass "(e) y4nom.7.6: exclusion freshness resolves all unique ids in one batched bd show"
+else
+  fail "(e) y4nom.7.6: exclusion freshness resolves all unique ids in one batched bd show" \
+    "calls=$(tr '\n' '|' < "$BD_BATCH_LOG")"
 fi
 
 if printf '%s' "$OUT_E" | grep -q 'test-fixture-fresh.sh'; then
