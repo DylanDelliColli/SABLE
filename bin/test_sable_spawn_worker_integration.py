@@ -1162,13 +1162,14 @@ def _overlap_env(stub_dir, sock, dd):
     return env
 
 
-def _overlap_db(stub_dir, dispatch_description):
+def _overlap_db(stub_dir, dispatch_description, *, dispatch_metadata=None):
     """DB with an in-progress bead holding a claim on shared.py, plus the
     dispatch target carrying `dispatch_description`."""
     db_path = Path(stub_dir) / "beads.json"
     db_path.write_text(json.dumps([
         {"id": "FAKE-47try-target", "title": "T", "description": dispatch_description,
-         "labels": [], "status": "open", "assignee": None},
+         "labels": [], "status": "open", "assignee": None,
+         "metadata": dispatch_metadata or {}},
         {"id": "FAKE-47try-active", "title": "active", "description": "",
          "labels": [], "status": "in_progress", "assignee": "tarzan",
          "metadata": {"wip_claims": "shared.py"}},
@@ -1249,6 +1250,80 @@ def test_wellformed_overlapping_footprint_still_denies_with_overlap_code(sock):
         assert "OVERLAP DETECTED" in r.stderr
         assert "could-not-assess" not in r.stderr
         assert _worker_panes(sock, "FAKE-47try-target") == []
+
+
+# --- SABLE-35mqf: existence refusal is before every dispatch mutation -------
+
+def test_absent_declared_path_refuses_before_claim_or_spawn(sock):
+    """A readable, non-overlapping declaration can still be a phantom.
+
+    The exact main-path ordering is load-bearing: the target stays OPEN and
+    unassigned, and no pane exists, proving the refusal happened before the
+    first claim/worktree/pane mutation rather than being rolled back later.
+    """
+    missing = "bin/test_sable_footprint_lib.py"
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        db_path = _overlap_db(
+            stub_dir, f"Story.\n\n## File footprint\n{missing}\n")
+        r = subprocess.run(
+            ["python3", str(BIN), "FAKE-47try-target", "--worktree", wt,
+             "--model", "haiku"],
+            capture_output=True, text=True,
+            env=_overlap_env(stub_dir, sock, dd), cwd=BIN.parent.parent,
+        )
+
+        assert r.returncode == 16, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "declared-path" in r.stderr.lower()
+        assert "FAKE-47try-target" in r.stderr and missing in r.stderr
+        assert _worker_panes(sock, "FAKE-47try-target") == []
+        target = next(
+            bead for bead in json.loads(db_path.read_text())
+            if bead["id"] == "FAKE-47try-target"
+        )
+        assert target["status"] == "open"
+        assert target["assignee"] is None
+
+
+def test_explicit_new_path_exemption_dispatches_and_is_surfaced(sock):
+    new_path = "bin/future_sable_tool.py"
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        _overlap_db(
+            stub_dir,
+            f"Story.\n\n## File footprint\n{new_path}\n",
+            dispatch_metadata={"footprint_creates": new_path},
+        )
+        r = subprocess.run(
+            ["python3", str(BIN), "FAKE-47try-target", "--worktree", wt,
+             "--model", "haiku"],
+            capture_output=True, text=True,
+            env=_overlap_env(stub_dir, sock, dd), cwd=BIN.parent.parent,
+        )
+
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "footprint_creates" in r.stderr and new_path in r.stderr
+        _wait_for_worker_count(sock, "FAKE-47try-target")
+
+
+def test_real_tracked_path_passes_without_a_naming_heuristic(sock):
+    tracked = "bin/test_sable_gate_budget_lib.py"
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as wt:
+        _overlap_db(stub_dir, f"Story.\n\n## File footprint\n{tracked}\n")
+        r = subprocess.run(
+            ["python3", str(BIN), "FAKE-47try-target", "--worktree", wt,
+             "--model", "haiku"],
+            capture_output=True, text=True,
+            env=_overlap_env(stub_dir, sock, dd), cwd=BIN.parent.parent,
+        )
+
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "declared-path" not in r.stderr.lower()
+        _wait_for_worker_count(sock, "FAKE-47try-target")
 
 
 # --- SABLE-676c: claim-then-hold first dispatch must succeed ------------------
@@ -2364,10 +2439,22 @@ def real_bd_template(tmp_path_factory):
         pytest.skip("needs bd")
     repo = tmp_path_factory.mktemp("spawn-worker-real-bd-template")
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email",
+                    "spawn-test@sable.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name",
+                    "SABLE Spawn Test"], check=True)
     init = subprocess.run(["bd", "init", "--prefix", "FZTEST"],
                           cwd=repo, capture_output=True, text=True)
     if init.returncode != 0:
         pytest.skip(f"could not create an isolated bd store: {init.stderr[-400:]}")
+    # SABLE-35mqf: every governance dispatch now validates declarations against
+    # a real HEAD object.  The shared path used by the pre-existing bundle and
+    # overlap tests is deliberately tracked; a separate test below names an
+    # absent path and proves that state is refused before a claim.
+    (repo / "shared_target.py").write_text("tracked dispatch fixture\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m",
+                    "fixture HEAD"], check=True)
     return repo
 
 
@@ -2495,6 +2582,66 @@ def test_real_bd_bundle_sharing_a_declared_path_dispatches(sock, real_bd_repo):
         status, assignee = _status_and_assignee(real_bd_repo, bid)
         assert status == "in_progress", bid
         assert assignee, bid
+
+
+def test_real_bd_absent_declared_path_refuses_with_store_unchanged(sock, real_bd_repo):
+    """Real bd + real git + real tmux boundary for SABLE-35mqf.
+
+    The declaration parses cleanly and overlaps nothing; only HEAD-object
+    existence can refuse it.  Store equality proves the gate sits before the
+    claim rather than relying on a rollback path.
+    """
+    missing = "bin/test_sable_coverage_floor_lib.py"
+    bead_id = _new_bead(
+        real_bd_repo,
+        "phantom declared path",
+        f"Story.\n\n## File footprint\n{missing}\n\n## Test spec\nx",
+    )
+    before = _status_and_assignee(real_bd_repo, bead_id)
+    assert before == ("open", "")
+    refs_before = _refs_snapshot(real_bd_repo)
+    prospective = Path(ssw.resolve_worktree_path(
+        str(real_bd_repo), ssw.worktree_name(bead_id, None)))
+    assert not prospective.exists()
+
+    with tempfile.TemporaryDirectory() as dd:
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--model", "haiku"],
+            capture_output=True, text=True, env=_real_bd_env(sock, dd),
+            cwd=real_bd_repo,
+        )
+        assert r.returncode == 16, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert bead_id in r.stderr and missing in r.stderr
+        assert _worker_panes(sock, bead_id) == []
+        assert not (Path(dd) / f"{bead_id}.md").exists()
+
+    assert _status_and_assignee(real_bd_repo, bead_id) == before
+    assert _refs_snapshot(real_bd_repo) == refs_before
+    assert not prospective.exists(), "refusal created its prospective worktree"
+
+
+def test_real_bd_explicit_create_authority_allows_new_path(sock, real_bd_repo):
+    new_path = "bin/future_generated_tool.py"
+    bead_id = _new_bead(
+        real_bd_repo,
+        "intentional new path",
+        f"Story.\n\n## File footprint\n{new_path}\n\n## Test spec\nx",
+    )
+    _bd(real_bd_repo, "update", bead_id, "--set-metadata",
+        f"footprint_creates={new_path}")
+
+    with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as wt:
+        r = subprocess.run(
+            ["python3", str(BIN), bead_id, "--worktree", wt, "--model", "haiku"],
+            capture_output=True, text=True, env=_real_bd_env(sock, dd),
+            cwd=real_bd_repo,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "footprint_creates" in r.stderr and new_path in r.stderr
+        _wait_for_worker_count(sock, bead_id)
+
+    status, assignee = _status_and_assignee(real_bd_repo, bead_id)
+    assert status == "in_progress" and assignee
 
 
 def test_real_bd_foreign_overlap_denies_and_leaves_the_bundle_open(sock, real_bd_repo):

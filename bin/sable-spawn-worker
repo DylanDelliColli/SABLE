@@ -828,6 +828,123 @@ class OverlapVerdict(NamedTuple):
     warnings: tuple[str, ...] = ()
 
 
+class DeclaredPathVerdict(NamedTuple):
+    """Dispatch-time existence verdict for the lead bead and its bundle.
+
+    ``allow`` means every declaration either exists in HEAD or carries
+    explicit ``footprint_creates`` authority. ``deny`` means at least one
+    unmarked path is absent. ``could-not-assess`` preserves parser, metadata,
+    and git failures as non-answers. ``no-declaration`` is the existing
+    legitimate footprint-less case and deliberately avoids the git census.
+
+    Warnings carry both accepted-create evidence and stale create annotations;
+    either condition is premise-relevant and must be surfaced even though it
+    does not block dispatch.
+    """
+    decision: str
+    message: str = ""
+    warnings: tuple[str, ...] = ()
+
+
+def declared_path_existence_check(repo: str,
+                                  beads: list[dict] | tuple[dict, ...]
+                                  ) -> DeclaredPathVerdict:
+    """Validate every declared write against the dispatch-time HEAD object.
+
+    Parsing and ``footprint_creates`` validation finish for the WHOLE bundle
+    before git runs.  This ordering is load-bearing: an unreadable declaration
+    must be repaired, never laundered by an existence check over the subset the
+    parser happened to salvage.  Once the declarations are sound, one shared
+    tree census classifies the whole bundle.
+
+    ``footprint_creates`` is hand-authored flat metadata containing a
+    comma-separated subset of the bead's claimed paths.  It is the only
+    authority for an intentionally absent/new path.  Ambient untracked files,
+    filename conventions, and prose annotations are never substitutes.
+    """
+    reads: list[tuple[str, FootprintRead, frozenset[str]]] = []
+    all_paths: set[str] = set()
+
+    for bead in beads:
+        bead_id = str(bead.get("id") or "<unknown bead>")
+        metadata = bead.get("metadata", {})
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            return DeclaredPathVerdict(
+                "could-not-assess",
+                f"{bead_id} footprint_creates metadata container is not an object")
+
+        read = read_bead_footprint(bead)
+        if read.could_not_assess:
+            detail = "; ".join(read.unreadable_sources) or "unknown parse failure"
+            return DeclaredPathVerdict(
+                "could-not-assess",
+                f"{bead_id} declared footprint could not be read completely: {detail}")
+
+        if "footprint_creates" in metadata:
+            raw_creates = metadata["footprint_creates"]
+            if not isinstance(raw_creates, str):
+                return DeclaredPathVerdict(
+                    "could-not-assess",
+                    f"{bead_id} footprint_creates must be a comma-separated string")
+            creates = frozenset(
+                path.strip() for path in raw_creates.split(",") if path.strip())
+        else:
+            creates = frozenset()
+
+        outside = creates - read.files
+        if outside:
+            return DeclaredPathVerdict(
+                "could-not-assess",
+                f"{bead_id} footprint_creates names path(s) not declared in its "
+                f"write footprint: {', '.join(sorted(outside))}")
+
+        reads.append((bead_id, read, creates))
+        all_paths.update(read.files)
+
+    if not all_paths:
+        return DeclaredPathVerdict("no-declaration")
+
+    try:
+        classified = fp_lib.classify_tracked_paths(repo, all_paths)
+    except fp_lib.FootprintUndetermined as exc:
+        return DeclaredPathVerdict(
+            "could-not-assess",
+            f"declared-path git census could not run: {exc}")
+
+    missing_by_bead: list[str] = []
+    warnings: list[str] = []
+    for bead_id, read, creates in reads:
+        absent = read.files & classified.absent
+        unmarked = absent - creates
+        if unmarked:
+            missing_by_bead.append(
+                f"{bead_id}: {', '.join(sorted(unmarked))}")
+
+        exempted = absent & creates
+        if exempted:
+            warnings.append(
+                f"{bead_id} footprint_creates authority accepts intentionally "
+                f"absent/new path(s): {', '.join(sorted(exempted))}")
+
+        stale = read.files & classified.present & creates
+        if stale:
+            warnings.append(
+                f"{bead_id} has stale footprint_creates annotation(s); already "
+                f"tracked at HEAD and treated as ordinary write claims: "
+                f"{', '.join(sorted(stale))}")
+
+    if missing_by_bead:
+        return DeclaredPathVerdict(
+            "deny",
+            "declared path(s) absent from dispatch-time HEAD without explicit "
+            "footprint_creates authority — " + "; ".join(missing_by_bead),
+            tuple(warnings),
+        )
+    return DeclaredPathVerdict("allow", warnings=tuple(warnings))
+
+
 def overlap_check(bead_id: str, bead: dict, in_progress: list[dict],
                   bundle: list[dict] | tuple[dict, ...] = ()) -> OverlapVerdict:
     """SABLE-jd5fj.6: overlap flips from ADVISORY (re-homed pre-dispatch-overlap,
@@ -2450,6 +2567,29 @@ def main(argv: list[str] | None = None) -> int:
             # the case where nothing was checked, not the release itself.
             sys.stderr.write(
                 f"sable-spawn-worker: NO-DECLARATION — {overlap_verdict.message}\n")
+
+        # SABLE-35mqf: a syntactically readable footprint can still name a
+        # path that does not exist in the git object being dispatched. Such a
+        # phantom can never collide, so accepting it fails in the RELEASE
+        # direction while making the declaration look checked. Run this after
+        # the shared parser/overlap decision (never launder a partial parse),
+        # but before the first claim/worktree/pane mutation below. One HEAD-tree
+        # census covers the lead and every bundled sibling.
+        path_verdict = declared_path_existence_check(
+            os.getcwd(), [bead, *bundle_beads])
+        for warning in path_verdict.warnings:
+            sys.stderr.write(
+                f"sable-spawn-worker: DECLARED-PATH NOTICE — {warning}\n")
+        if path_verdict.decision == "could-not-assess":
+            sys.stderr.write(
+                "sable-spawn-worker: declared-path could-not-assess — "
+                f"{path_verdict.message}\n")
+            return 17
+        if path_verdict.decision == "deny":
+            sys.stderr.write(
+                "sable-spawn-worker: declared-path blocked — "
+                f"{path_verdict.message}\n")
+            return 16
 
         # --- claims land HERE (SABLE-fz8kd), below the LAST gate that can
         # refuse. They used to run above the overlap check, so a denied dispatch
