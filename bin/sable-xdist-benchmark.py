@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded, local-only pytest-xdist ladder sampler (SABLE-y4nom.7.4).
+"""Bounded local broad-validation sampler (SABLE-y4nom.7.4/.7.5).
 
 This command MEASURES serial/-n2/-n4 behavior under one broad-seat lease.  It
 does not edit any normal validation command and never chooses ``-n auto``.
@@ -7,6 +7,13 @@ Every run records exact collection and outcome identities, pytest's per-test
 cost report, wall/CPU/load observations, and timeout/source-integrity state.
 The ladder advances only when the prior width is complete, identity-equivalent,
 materially faster, and free of a material tail regression.
+
+The follow-up ``--overlap-shell`` mode first records one same-object ``-n2``
+Python reference, then repeats the candidate topology: fixed ``-n2`` Python
+and the complete SERIAL shell ALLOW lane at the same time.  Both process groups
+are owned, both verdicts and artifact sets are required, and the mode is GO
+only when repeated exact outcomes remain below the declared broad-wall target.
+It is still a sampler; production adoption is a separate change after GO.
 
 Artifacts live below git-common-dir so they are shared by linked worktrees but
 can never become a changed source path.  pytest-xdist is deliberately a local
@@ -42,6 +49,7 @@ DEFAULT_TIMEOUT_SECONDS = 1800.0
 DEFAULT_MIN_IMPROVEMENT = 0.10
 DEFAULT_TAIL_RATIO = 1.50
 DEFAULT_TAIL_ABSOLUTE_SECONDS = 5.0
+DEFAULT_BROAD_TARGET_SECONDS = 600.0
 
 
 class BenchmarkError(RuntimeError):
@@ -177,6 +185,84 @@ def collection_command(width: str) -> list[str]:
         "no:cacheprovider",
         *width_args(width),
     ]
+
+
+def overlap_commands(run_dir: Path) -> tuple[list[str], list[str]]:
+    """The only candidate topology SABLE-y4nom.7.5 is authorized to sample.
+
+    Python is the fixed width VE.4 accepted.  Shell remains the existing
+    complete serial runner: this experiment overlaps coarse lanes and never
+    introduces within-shell concurrency.
+    """
+    return (
+        pytest_command(run_dir, "2"),
+        [
+            "bash", ".github/ci/shell-run-set.sh", "--profile",
+            str(run_dir / "shell.tsv"),
+        ],
+    )
+
+
+def shell_catalog(repo: Path) -> tuple[str, ...]:
+    """Read the authoritative ALLOW array by sourcing its owning script."""
+    script = repo / ".github" / "ci" / "shell-run-set.sh"
+    if not script.is_file():
+        raise BenchmarkError(f"shell run-set is absent: {script}")
+    cp = _run(
+        repo,
+        "bash", "-c",
+        'source "$1"; printf "%s\\n" "${ALLOW[@]}"',
+        "sable-xdist-benchmark", str(script),
+    )
+    suites = tuple(line.strip() for line in cp.stdout.splitlines() if line.strip())
+    if not suites or len(suites) != len(set(suites)):
+        raise BenchmarkError(
+            "shell ALLOW discovery was empty or contained duplicate identities"
+        )
+    return tuple(sorted(suites))
+
+
+def parse_shell_profile(path: Path, expected: tuple[str, ...]) -> dict[str, dict]:
+    """Parse one complete shell profile without laundering failed statuses."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as exc:
+        raise BenchmarkError(f"cannot read shell profile {path}: {exc}") from exc
+    if not lines or lines[0] != "suite\tstatus\tseconds":
+        raise BenchmarkError(f"shell profile has an invalid header: {path}")
+    rows: dict[str, dict] = {}
+    for line in lines[1:]:
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != 3 or not fields[0] or not fields[1]:
+            raise BenchmarkError(f"malformed shell profile row: {line!r}")
+        suite, status, raw_seconds = fields
+        if suite in rows:
+            raise BenchmarkError(f"duplicate shell profile identity: {suite}")
+        try:
+            seconds = float(raw_seconds)
+        except ValueError as exc:
+            raise BenchmarkError(
+                f"non-numeric shell duration for {suite}: {raw_seconds!r}"
+            ) from exc
+        if not math.isfinite(seconds) or seconds < 0:
+            raise BenchmarkError(
+                f"invalid shell duration for {suite}: {raw_seconds!r}"
+            )
+        rows[suite] = {"status": status, "seconds": seconds}
+    actual = set(rows)
+    wanted = set(expected)
+    if actual != wanted:
+        missing = sorted(wanted - actual)
+        extra = sorted(actual - wanted)
+        detail = []
+        if missing:
+            detail.append("missing " + " ".join(missing))
+        if extra:
+            detail.append("unexpected " + " ".join(extra))
+        raise BenchmarkError("shell profile identity mismatch: " + "; ".join(detail))
+    return dict(sorted(rows.items()))
 
 
 def collection_identities(output: str) -> list[str]:
@@ -368,6 +454,158 @@ def run_once(repo: Path, root: Path, width: str, repetition: int,
     return record
 
 
+def run_overlap_once(repo: Path, root: Path, repetition: int,
+                     timeout_seconds: float, expected_head: str) -> dict:
+    """Run fixed-n2 Python and the complete serial shell lane concurrently.
+
+    The two children are separate process-group leaders.  A shared absolute
+    deadline terminates and reaps every still-live group; an ordinary red lane
+    is allowed to finish alongside its sibling so the rejected sample still
+    carries complete attribution rather than a misleading partial artifact.
+    """
+    run_dir = root / f"overlap-run-{repetition}"
+    run_dir.mkdir()
+    collect = _run(repo, *collection_command("2"), check=False)
+    (run_dir / "collection.log").write_text(collect.stdout + collect.stderr)
+    collected = collection_identities(collect.stdout)
+    expected_shell = shell_catalog(repo)
+    python_command, shell_command = overlap_commands(run_dir)
+    env = dict(os.environ)
+    env["SABLE_PYTEST_SKIP_SET_STATE"] = str(run_dir / "skip-set.json")
+
+    samples: list[tuple[float, float, float]] = []
+    stop = threading.Event()
+    sampler = threading.Thread(target=_load_sampler, args=(stop, samples), daemon=True)
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    timed_out = False
+    processes: dict[str, subprocess.Popen] = {}
+    returncodes: dict[str, int] = {}
+    lane_walls: dict[str, float] = {}
+
+    with ((run_dir / "python.log").open("w") as python_log,
+          (run_dir / "shell.log").open("w") as shell_log):
+        try:
+            processes["python"] = subprocess.Popen(
+                python_command, cwd=repo, env=env,
+                stdout=python_log, stderr=subprocess.STDOUT,
+                text=True, start_new_session=True,
+            )
+            processes["shell"] = subprocess.Popen(
+                shell_command, cwd=repo, env=env,
+                stdout=shell_log, stderr=subprocess.STDOUT,
+                text=True, start_new_session=True,
+            )
+        except OSError as exc:
+            for proc in processes.values():
+                _terminate_group(proc)
+            raise BenchmarkError(f"cannot start overlap lane: {exc}") from exc
+
+        sampler.start()
+        live = dict(processes)
+        try:
+            while live:
+                now = time.monotonic()
+                for lane, proc in tuple(live.items()):
+                    rc = proc.poll()
+                    if rc is not None:
+                        returncodes[lane] = rc
+                        lane_walls[lane] = now - started
+                        del live[lane]
+                if not live:
+                    break
+                if now >= deadline:
+                    timed_out = True
+                    for lane, proc in tuple(live.items()):
+                        _terminate_group(proc)
+                        returncodes[lane] = 124
+                        lane_walls[lane] = time.monotonic() - started
+                        del live[lane]
+                    break
+                time.sleep(min(0.05, max(0.0, deadline - now)))
+        finally:
+            stop.set()
+            sampler.join(timeout=2)
+
+    wall = time.monotonic() - started
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    artifact_errors = []
+    outcomes: dict[str, str] = {}
+    tails: dict[str, float | int] = {}
+    shell_rows: dict[str, dict] = {}
+    try:
+        outcomes = parse_junit(run_dir / "junit.xml")
+        tails = cost_tails(run_dir / "cost.json")
+    except BenchmarkError as exc:
+        artifact_errors.append(str(exc))
+    try:
+        shell_rows = parse_shell_profile(run_dir / "shell.tsv", expected_shell)
+    except BenchmarkError as exc:
+        artifact_errors.append(str(exc))
+
+    shell_statuses = {
+        suite: row["status"] for suite, row in shell_rows.items()
+    }
+    head_after = git_head(repo)
+    dirty_after = git_porcelain(repo)
+    python_rc = returncodes.get("python", 124 if timed_out else 2)
+    shell_rc = returncodes.get("shell", 124 if timed_out else 2)
+    aggregate_rc = 124 if timed_out else (0 if python_rc == shell_rc == 0 else 1)
+    record = {
+        "schema": 1,
+        "width": "overlap-n2+serial-shell",
+        "repetition": repetition,
+        "command": python_command,
+        "python_command": python_command,
+        "shell_command": shell_command,
+        "collection_command": collection_command("2"),
+        "collection_returncode": collect.returncode,
+        "collection_identities": collected,
+        "collection_digest": digest_json(collected),
+        "returncode": aggregate_rc,
+        "python_returncode": python_rc,
+        "shell_returncode": shell_rc,
+        "timed_out": timed_out,
+        "wall_seconds": wall,
+        "python_wall_seconds": lane_walls.get("python", wall),
+        "shell_wall_seconds": lane_walls.get("shell", wall),
+        "child_user_seconds": after.ru_utime - before.ru_utime,
+        "child_system_seconds": after.ru_stime - before.ru_stime,
+        "average_cpu_cores": (
+            (after.ru_utime - before.ru_utime + after.ru_stime - before.ru_stime) / wall
+            if wall > 0 else 0.0
+        ),
+        "load_1m_samples": [sample[0] for sample in samples],
+        "load_1m_median": (
+            statistics.median([sample[0] for sample in samples]) if samples else 0.0
+        ),
+        "load_1m_p95": percentile([sample[0] for sample in samples], 0.95),
+        "outcomes": outcomes,
+        "outcome_digest": digest_json(outcomes),
+        "outcome_counts": _outcome_counts(outcomes),
+        "shell": shell_rows,
+        "shell_digest": digest_json(shell_statuses),
+        "shell_all_passed": (
+            len(shell_rows) == len(expected_shell)
+            and all(status == "pass" for status in shell_statuses.values())
+        ),
+        "shell_seconds_total": sum(
+            float(row["seconds"]) for row in shell_rows.values()
+        ),
+        "artifact_error": "; ".join(artifact_errors),
+        "head_before": expected_head,
+        "head_after": head_after,
+        "source_moved": head_after != expected_head,
+        "dirty_after": dirty_after,
+        **tails,
+    }
+    (run_dir / "record.json").write_text(
+        json.dumps(record, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    )
+    return record
+
+
 def width_summary(width: str, records: list[dict]) -> dict:
     def med(key: str) -> float:
         return statistics.median(float(record.get(key, 0.0)) for record in records)
@@ -448,6 +686,61 @@ def evaluate_stage(width: str, records: list[dict], baseline: dict | None,
                 absolute_seconds=tail_absolute_seconds,
             )
         )
+    return not reasons, reasons, summary
+
+
+def evaluate_overlap(records: list[dict], python_reference: dict, *,
+                     broad_target_seconds: float, tail_ratio: float,
+                     tail_absolute_seconds: float) -> tuple[bool, list[str], dict]:
+    """Accept only repeated, exact, sub-target combined-lane evidence."""
+    summary = width_summary("overlap-n2+serial-shell", records)
+    summary.update({
+        "python_wall_median_seconds": statistics.median(
+            float(record.get("python_wall_seconds", record["wall_seconds"]))
+            for record in records
+        ),
+        "shell_wall_median_seconds": statistics.median(
+            float(record.get("shell_wall_seconds", record["wall_seconds"]))
+            for record in records
+        ),
+        "shell_seconds_median": statistics.median(
+            float(record.get("shell_seconds_total", 0.0)) for record in records
+        ),
+    })
+    reasons = []
+    if len(records) < 2:
+        reasons.append("overlap needs at least two repetitions")
+    shell_anchor = records[0].get("shell_digest") if records else None
+    for record in records:
+        reasons.extend(record_integrity_reasons(record, python_reference))
+        rep = record.get("repetition")
+        if record.get("python_returncode") != 0:
+            reasons.append(
+                f"run {rep} Python lane rc={record.get('python_returncode')}"
+            )
+        if record.get("shell_returncode") != 0:
+            reasons.append(
+                f"run {rep} shell lane rc={record.get('shell_returncode')}"
+            )
+        if not record.get("shell_all_passed"):
+            reasons.append(f"run {rep} shell lane was not complete and all-pass")
+        if record.get("shell_digest") != shell_anchor:
+            reasons.append(f"run {rep} shell identity/status diverged")
+
+    if float(summary["wall_p95_seconds"]) >= broad_target_seconds:
+        reasons.append(
+            f"combined wall p95 {summary['wall_p95_seconds']:.3f}s is not "
+            f"under the {broad_target_seconds:g}s broad target"
+        )
+    reference_summary = width_summary("2-reference", [python_reference])
+    reasons.extend(
+        "material tail regression: " + item
+        for item in material_tail_regressions(
+            reference_summary, summary,
+            ratio=tail_ratio,
+            absolute_seconds=tail_absolute_seconds,
+        )
+    )
     return not reasons, reasons, summary
 
 
@@ -545,6 +838,75 @@ def run_ladder(repo: Path, root: Path, *, repetitions: int, timeout_seconds: flo
     return (0 if verdict == "GO" else 3), result
 
 
+def run_overlap_experiment(
+        repo: Path, root: Path, *, repetitions: int, timeout_seconds: float,
+        tail_ratio: float, tail_absolute_seconds: float,
+        broad_target_seconds: float) -> tuple[int, dict]:
+    """Same-object n2 reference followed by repeated coarse-lane overlap."""
+    expected_head = _require_clean(repo)
+    if importlib.util.find_spec("xdist") is None:
+        raise BenchmarkError(
+            "pytest-xdist is absent; install the pinned local dependency before "
+            "running the overlap experiment"
+        )
+
+    reference = run_once(
+        repo, root, "2", 1, timeout_seconds, expected_head,
+    )
+    reference_reasons = record_integrity_reasons(reference, None)
+    records = []
+    hard_reasons = list(reference_reasons)
+    if not hard_reasons:
+        for repetition in range(1, repetitions + 1):
+            record = run_overlap_once(
+                repo, root, repetition, timeout_seconds, expected_head,
+            )
+            records.append(record)
+            hard_reasons.extend(record_integrity_reasons(record, reference))
+            if hard_reasons:
+                break
+
+    if records:
+        eligible, reasons, summary = evaluate_overlap(
+            records,
+            reference,
+            broad_target_seconds=broad_target_seconds,
+            tail_ratio=tail_ratio,
+            tail_absolute_seconds=tail_absolute_seconds,
+        )
+        if hard_reasons:
+            eligible = False
+            reasons = list(dict.fromkeys([*hard_reasons, *reasons]))
+    else:
+        eligible = False
+        reasons = hard_reasons or ["no overlap sample ran"]
+        summary = {}
+
+    verdict = "GO" if eligible else "NO-GO"
+    result = {
+        "schema": 1,
+        "bead": "SABLE-y4nom.7.5",
+        "mode": "fixed-n2+serial-shell-overlap",
+        "verdict": verdict,
+        "source_head": expected_head,
+        "environment": environment_record(),
+        "repetitions_requested": repetitions,
+        "timeout_seconds": timeout_seconds,
+        "broad_target_seconds": broad_target_seconds,
+        "thresholds": {
+            "tail_ratio": tail_ratio,
+            "tail_absolute_seconds": tail_absolute_seconds,
+        },
+        "python_reference": width_summary("2-reference", [reference]),
+        "overlap": summary,
+        "reasons": reasons,
+    }
+    (root / "summary.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    )
+    return (0 if eligible else 3), result
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=".")
@@ -556,6 +918,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tail-absolute-seconds", type=float,
                         default=DEFAULT_TAIL_ABSOLUTE_SECONDS)
     parser.add_argument("--shell-baseline-seconds", type=float, default=505.157)
+    parser.add_argument(
+        "--overlap-shell", action="store_true",
+        help=(
+            "run one same-object fixed-n2 reference, then repeat fixed-n2 "
+            "Python concurrently with the complete serial shell lane"
+        ),
+    )
+    parser.add_argument(
+        "--broad-target-seconds", type=float,
+        default=DEFAULT_BROAD_TARGET_SECONDS,
+    )
     args = parser.parse_args(argv)
     if args.repetitions < 2:
         parser.error("--repetitions must be at least 2; a sample is not a distribution")
@@ -565,6 +938,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--min-improvement must be between 0 and 1")
     if args.tail_ratio <= 1 or args.tail_absolute_seconds < 0:
         parser.error("tail thresholds must be ratio > 1 and absolute >= 0")
+    if args.broad_target_seconds <= 0:
+        parser.error("--broad-target-seconds must be positive")
     return args
 
 
@@ -575,31 +950,55 @@ def main(argv: list[str] | None = None) -> int:
         head = _require_clean(repo)
         with broad_seat(repo):
             root = artifact_root(repo, args.output_dir, head)
-            rc, result = run_ladder(
-                repo,
-                root,
-                repetitions=args.repetitions,
-                timeout_seconds=args.timeout_seconds,
-                min_improvement=args.min_improvement,
-                tail_ratio=args.tail_ratio,
-                tail_absolute_seconds=args.tail_absolute_seconds,
-                shell_baseline_seconds=args.shell_baseline_seconds,
-            )
+            if args.overlap_shell:
+                rc, result = run_overlap_experiment(
+                    repo,
+                    root,
+                    repetitions=args.repetitions,
+                    timeout_seconds=args.timeout_seconds,
+                    tail_ratio=args.tail_ratio,
+                    tail_absolute_seconds=args.tail_absolute_seconds,
+                    broad_target_seconds=args.broad_target_seconds,
+                )
+            else:
+                rc, result = run_ladder(
+                    repo,
+                    root,
+                    repetitions=args.repetitions,
+                    timeout_seconds=args.timeout_seconds,
+                    min_improvement=args.min_improvement,
+                    tail_ratio=args.tail_ratio,
+                    tail_absolute_seconds=args.tail_absolute_seconds,
+                    shell_baseline_seconds=args.shell_baseline_seconds,
+                )
     except BenchmarkError as exc:
         print(f"sable-xdist-benchmark: REFUSED — {exc}", file=sys.stderr)
         return 2
-    print(
-        f"sable-xdist-benchmark: {result['verdict']} "
-        f"recommended_width={result['recommended_width']} artifacts={root}"
-    )
-    if result["estimated_combined_broad_median_seconds"] is not None:
+    if args.overlap_shell:
         print(
-            "sable-xdist-benchmark: estimated Python+serial-shell broad median "
-            f"{result['estimated_combined_broad_median_seconds']:.3f}s "
-            f"(target < {result['broad_target_seconds']:.0f}s)"
+            f"sable-xdist-benchmark: overlap {result['verdict']} artifacts={root}"
         )
-    if result["stop_reason"]:
-        print(f"sable-xdist-benchmark: {result['stop_reason']}")
+        if result["overlap"]:
+            print(
+                "sable-xdist-benchmark: combined wall p95 "
+                f"{result['overlap']['wall_p95_seconds']:.3f}s "
+                f"(target < {result['broad_target_seconds']:.0f}s)"
+            )
+        if result["reasons"]:
+            print("sable-xdist-benchmark: " + "; ".join(result["reasons"]))
+    else:
+        print(
+            f"sable-xdist-benchmark: {result['verdict']} "
+            f"recommended_width={result['recommended_width']} artifacts={root}"
+        )
+        if result["estimated_combined_broad_median_seconds"] is not None:
+            print(
+                "sable-xdist-benchmark: estimated Python+serial-shell broad median "
+                f"{result['estimated_combined_broad_median_seconds']:.3f}s "
+                f"(target < {result['broad_target_seconds']:.0f}s)"
+            )
+        if result["stop_reason"]:
+            print(f"sable-xdist-benchmark: {result['stop_reason']}")
     return rc
 
 
