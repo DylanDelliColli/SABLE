@@ -147,7 +147,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
     SessionCollision, WORKER_CAP_DEFAULT, accept_startup_gate, capture_pane,
     dialog_posture, dispatch_landed, git_common_dir, pane_ready, repo_root,
-    resolve_session, wait_for_ready, worker_cap,
+    resolve_session, wait_for_ready, with_lifecycle_flags, worker_cap,
 )
 from sable_pane_lib import deliver_text as deliver_dispatch  # noqa: E402
 import sable_footprint_lib as fp_lib  # noqa: E402
@@ -1726,40 +1726,6 @@ def worker_command(
     return interactive_command(
         provider, model, claude_permission=perm, cwd=cwd, writable_roots=roots,
     )
-
-
-def with_lifecycle_flags(cmd: str) -> str:
-    """Wrap `cmd` so its OWN pane process flips @sable_status running -> done
-    itself, at both ends (SABLE-5v9n). `running` is set as the FIRST action,
-    before `cmd` starts; `done` is set LAST, unconditionally, once `cmd` exits
-    — `;` (not `&&`) is deliberate: the flag must flip even when `cmd` exits
-    non-zero or crashes, since whether the worker succeeded is irrelevant to
-    whether the pane is DONE running.
-
-    Both flips happen INSIDE the pane's own shell, sequentially in the SAME
-    script as `cmd` — the manager does NOT separately set @sable_status via
-    its own post-creation `set-option` call (see main(): only @sable_role/
-    @sable_bead/@sable_repo are set that way). A manager-side 'running' write
-    races a fast-exiting worker (a test stand-in, or a `claude` boot that
-    dies immediately): if the worker's own done-flip lands before the
-    manager's post-creation call fires, that call CLOBBERS done back to
-    running — observed while writing this fix's own integration test, whose
-    stub worker exits in milliseconds. Doing both flips from inside the pane
-    removes the two-actor race entirely: @sable_status is written by exactly
-    one process, in one deterministic order, regardless of how fast `cmd`
-    runs. $TMUX_PANE is set by tmux for any process running inside a pane
-    from the moment it starts, so no pane id needs to be known up front and
-    no readiness wait is needed before the leading `running` write.
-
-    Previously the done-flag was the worker LLM's own DISCRETIONARY final
-    act — a worker that treated `bd close` as the end of its job (the
-    observed SABLE-2cao.1 failure) left its pane stuck at `running` forever,
-    so `sable-worker-status --reap` never reclaimed it. Applied to the
-    resolved command AFTER any SABLE_WORKER_CMD override, deliberately: the
-    wrapping must be unconditional across every worker command shape,
-    including test stand-ins, not just the default `claude` invocation."""
-    tag = 'tmux set-option -p -t "$TMUX_PANE" @sable_status'
-    return f'{tag} running; {cmd}; {tag} done'
 
 
 def resolve_lane(override: str | None) -> str:

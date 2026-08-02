@@ -32,13 +32,15 @@ import os
 import re
 import subprocess
 import sys
+from enum import Enum, auto
 from pathlib import Path
+from typing import Callable, NamedTuple
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    AUTONOMOUS_ROLES, KICK_TAG, SessionCollision, capture_pane, deliver_text,
+    KICK_TAG, SessionCollision, capture_pane, deliver_text,
     dialog_posture, git_common_dir, kick_message, repo_root, resolve_session,
-    wait_for_ready,
+    wait_for_ready, with_lifecycle_flags,
 )
 from sable_handoff_lib import (  # noqa: E402
     HandoffRefused, read_execution_authority,
@@ -62,6 +64,39 @@ VALID_ROLES = ("optimus", "tarzan", "chuck")
 PRODUCER_ROLES = ("victor",)
 ALL_ROLES = VALID_ROLES + PRODUCER_ROLES
 DEFAULT_PRODUCER_MODEL = "sonnet"
+
+
+class PaneLiveness(Enum):
+    """Three actionable manager states plus an out-of-domain refusal.
+
+    UNKNOWN is deliberately not a fourth action: without an agent-written boot
+    epoch (or without the pane-local lifecycle bit) the trichotomy's
+    preconditions are not met, so the caller must refuse without mutation.
+    """
+
+    ALIVE_AND_SESSIONED = auto()
+    RESTARTED_SINCE = auto()
+    DEAD = auto()
+    UNKNOWN = auto()
+
+
+class SpawnAction(Enum):
+    SPAWN_NEW = auto()
+    SKIP_ALIVE = auto()
+    REKICK_RESTARTED = auto()
+    RESPAWN_DEAD = auto()
+    ADOPT_REFERENCE = auto()
+    REFUSE_UNKNOWN = auto()
+
+
+class ExistingPane(NamedTuple):
+    pane_id: str
+    role: str
+    provider: str
+    pane_dead: bool
+    status: str
+    boot_epoch: str
+    kicked_epoch: str
 
 # --- Instance-entry registry writer (market-brief-package-73t4, Lincoln ruling
 # 2026-07-07, mechanism (b) EXPLICIT INSTANCE REGISTRATION). When a manager role
@@ -280,29 +315,55 @@ def missing_deliverable_error(requested: list[str], deliverable: str | None) -> 
     return None
 
 
-def parse_existing_roles(output: str) -> set[str]:
-    """Roles already present, from `list-panes -s -F '#{pane_id} #{@sable_role}'`."""
-    roles = set()
+def parse_existing_panes(output: str) -> dict[str, ExistingPane]:
+    """Parse the session-scoped pane registry used by liveness planning.
+
+    The seven tab-delimited fields are all event/state data.  Process age,
+    scrollback, and pane-idle heuristics are intentionally absent because the
+    measured cleared and working panes were indistinguishable on those axes.
+    """
+    panes: dict[str, ExistingPane] = {}
     for line in output.splitlines():
-        parts = line.split()
-        if len(parts) >= 2:
-            roles.add(parts[1])
-    return roles
-
-
-def parse_existing_providers(output: str) -> dict[str, str]:
-    """Map role to its pane provider; legacy untagged panes are Claude."""
-
-    providers: dict[str, str] = {}
-    for line in output.splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 2 and parts[1]:
-            providers[parts[1]] = parts[2] if len(parts) >= 3 and parts[2] else "claude"
+        fields = line.split("\t")
+        if len(fields) < 2 or not fields[1]:
             continue
-        words = line.split()
-        if len(words) >= 2:
-            providers[words[1]] = "claude"
-    return providers
+        fields += [""] * (7 - len(fields))
+        pane = ExistingPane(
+            pane_id=fields[0],
+            role=fields[1],
+            provider=fields[2] or "claude",
+            pane_dead=fields[3] == "1",
+            status=fields[4],
+            boot_epoch=fields[5],
+            kicked_epoch=fields[6],
+        )
+        if pane.role in panes:
+            raise ValueError(
+                f"duplicate @sable_role={pane.role} in panes "
+                f"{panes[pane.role].pane_id} and {pane.pane_id}"
+            )
+        panes[pane.role] = pane
+    return panes
+
+
+def classify_manager_pane(pane: ExistingPane) -> PaneLiveness:
+    """Classify a manager from native death, lifecycle, and boot events only."""
+    if pane.pane_dead or pane.status == "done":
+        return PaneLiveness.DEAD
+    if pane.status != "running" or not pane.boot_epoch or not pane.kicked_epoch:
+        return PaneLiveness.UNKNOWN
+    if pane.boot_epoch != pane.kicked_epoch:
+        return PaneLiveness.RESTARTED_SINCE
+    return PaneLiveness.ALIVE_AND_SESSIONED
+
+
+def classify_producer_pane(pane: ExistingPane) -> PaneLiveness:
+    """Bounded producers have lifecycle state but no SessionStart epoch."""
+    if pane.pane_dead or pane.status == "done":
+        return PaneLiveness.DEAD
+    if pane.status == "running":
+        return PaneLiveness.ALIVE_AND_SESSIONED
+    return PaneLiveness.UNKNOWN
 
 
 def provider_mismatches(
@@ -317,10 +378,77 @@ def provider_mismatches(
     ]
 
 
-def plan_spawns(requested: list[str], existing: set[str]) -> tuple[list[str], list[str]]:
-    to_spawn = [r for r in requested if r not in existing]
-    skipped = [r for r in requested if r in existing]
-    return to_spawn, skipped
+def plan_spawns(
+    requested: list[str], existing: dict[str, ExistingPane]
+) -> dict[str, SpawnAction]:
+    """Turn liveness verdicts into distinct mutation plans.
+
+    A running manager with a real boot epoch but no kick reference is the
+    one-time upgrade seam.  It is adopted without typing: recording the current
+    epoch makes subsequent changes detectable without risking a kick into a
+    healthy mid-turn manager.
+    """
+    decisions: dict[str, SpawnAction] = {}
+    for role in requested:
+        pane = existing.get(role)
+        if pane is None:
+            decisions[role] = SpawnAction.SPAWN_NEW
+            continue
+        if (
+            role not in PRODUCER_ROLES
+            and not pane.pane_dead
+            and pane.status == "running"
+            and pane.boot_epoch
+            and not pane.kicked_epoch
+        ):
+            decisions[role] = SpawnAction.ADOPT_REFERENCE
+            continue
+        liveness = (
+            classify_producer_pane(pane)
+            if role in PRODUCER_ROLES
+            else classify_manager_pane(pane)
+        )
+        decisions[role] = {
+            PaneLiveness.ALIVE_AND_SESSIONED: SpawnAction.SKIP_ALIVE,
+            PaneLiveness.RESTARTED_SINCE: SpawnAction.REKICK_RESTARTED,
+            PaneLiveness.DEAD: SpawnAction.RESPAWN_DEAD,
+            PaneLiveness.UNKNOWN: SpawnAction.REFUSE_UNKNOWN,
+        }[liveness]
+    return decisions
+
+
+def stabilize_manager_kick(
+    *,
+    ready: Callable[[], bool],
+    read_epoch: Callable[[], str],
+    deliver: Callable[[str], bool],
+    record: Callable[[str], bool],
+    attempts: int,
+) -> tuple[bool, str]:
+    """Deliver under one stable boot epoch and publish its kick reference.
+
+    Readiness may span a concurrent clear, so the epoch is read only after the
+    readiness check and immediately before delivery.  A changed post-delivery
+    epoch causes a bounded re-kick; the reference is committed only after two
+    equal reads and verified delivery.
+    """
+    for _ in range(max(1, attempts)):
+        if not ready():
+            return False, "pane-not-ready"
+        before = read_epoch()
+        if not before:
+            return False, "missing-agent-boot-epoch"
+        if not deliver(before):
+            return False, "delivery-unverified"
+        after = read_epoch()
+        if not after:
+            return False, "missing-agent-boot-epoch-after-delivery"
+        if after != before:
+            continue
+        if not record(after):
+            return False, "kick-reference-write-failed"
+        return True, after
+    return False, "boot-epoch-changed-during-every-delivery-attempt"
 
 
 def manager_command(provider: str = "claude", cwd: str | None = None) -> str:
@@ -379,6 +507,55 @@ def window_args(
         "new-window", "-d", "-t", session, "-n", role,
         "-P", "-F", "#{pane_id}", *env_args, cmd,
     ]
+
+
+def respawn_args(
+    pane: str, role: str, cmd: str, provider: str = "claude"
+) -> list[str]:
+    """Replace a dead role in place, preserving its tmux pane identity."""
+    agent_role = "producer" if role in PRODUCER_ROLES else "manager"
+    env_args: list[str] = []
+    for key, value in pane_environment(provider, role, agent_role).items():
+        env_args += ["-e", f"{key}={value}"]
+    return ["respawn-pane", "-k", "-t", pane, *env_args, cmd]
+
+
+def pane_option(base: list[str], pane: str, name: str) -> str:
+    result = subprocess.run(
+        base + ["show-options", "-p", "-v", "-t", pane, name],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def write_pane_option(base: list[str], pane: str, name: str, value: str) -> bool:
+    return subprocess.run(
+        base + ["set-option", "-p", "-t", pane, name, value],
+        capture_output=True,
+        text=True,
+    ).returncode == 0
+
+
+def clear_pane_option(base: list[str], pane: str, name: str) -> bool:
+    return subprocess.run(
+        base + ["set-option", "-p", "-u", "-t", pane, name],
+        capture_output=True,
+        text=True,
+    ).returncode == 0
+
+
+def unknown_liveness_reason(role: str, pane: ExistingPane) -> str:
+    missing: list[str] = []
+    if not pane.status:
+        missing.append("@sable_status")
+    elif pane.status not in ("running", "done"):
+        missing.append(f"recognized @sable_status (got {pane.status!r})")
+    if role not in PRODUCER_ROLES and not pane.boot_epoch:
+        missing.append("agent-written @sable_boot_epoch")
+    if role not in PRODUCER_ROLES and pane.boot_epoch and not pane.kicked_epoch:
+        missing.append("@sable_kicked_epoch")
+    return ", ".join(missing) or "incomplete liveness evidence"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -487,12 +664,60 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stderr.write(f"sable-spawn-manager: {e}\n")
                 return 5
 
-    listing = subprocess.run(base + ["list-panes", "-s", "-t", session,
-                                     "-F", "#{pane_id}\t#{@sable_role}\t#{@sable_provider}"],
-                             capture_output=True, text=True).stdout
-    to_spawn, skipped = plan_spawns(requested, parse_existing_roles(listing))
+    listing_result = subprocess.run(
+        base + [
+            "list-panes", "-s", "-t", session, "-F",
+            ("#{pane_id}\t#{@sable_role}\t#{@sable_provider}\t#{pane_dead}\t"
+             "#{@sable_status}\t#{@sable_boot_epoch}\t#{@sable_kicked_epoch}"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if listing_result.returncode != 0:
+        detail = listing_result.stderr.strip() or f"exit {listing_result.returncode}"
+        sys.stderr.write(
+            "sable-spawn-manager: UNKNOWN liveness precondition — session pane "
+            f"registry could not be read ({detail}); refusing without mutation.\n"
+        )
+        return 12
+    try:
+        existing = parse_existing_panes(listing_result.stdout)
+    except ValueError as e:
+        sys.stderr.write(
+            "sable-spawn-manager: UNKNOWN liveness precondition — ambiguous "
+            f"session pane registry ({e}); refusing without mutation.\n"
+        )
+        return 12
+    decisions = plan_spawns(requested, existing)
+
+    unknown = [
+        role for role in requested
+        if decisions[role] is SpawnAction.REFUSE_UNKNOWN
+    ]
+    if unknown:
+        details = "; ".join(
+            f"role={role} pane={existing[role].pane_id} missing="
+            f"{unknown_liveness_reason(role, existing[role])}"
+            for role in unknown
+        )
+        sys.stderr.write(
+            "sable-spawn-manager: UNKNOWN liveness precondition — refusing "
+            f"without kick, kill, or spawn: {details}. A bare role tag is not "
+            "proof of a live agent; start the pane through sable-spawn-manager "
+            "or restore its SessionStart/lifecycle hooks. For a live "
+            "pre-migration manager with no lifecycle status, deliberately stop "
+            "that pane so tmux reports pane_dead=1, then rerun; UNKNOWN is never "
+            "killed automatically.\n"
+        )
+        return 12
+
+    retained_providers = {
+        role: pane.provider
+        for role, pane in existing.items()
+        if decisions.get(role) is not SpawnAction.RESPAWN_DEAD
+    }
     mismatches = provider_mismatches(
-        requested, parse_existing_providers(listing), provider_by_role
+        requested, retained_providers, provider_by_role
     )
     if mismatches:
         detail = ", ".join(
@@ -504,7 +729,11 @@ def main(argv: list[str] | None = None) -> int:
             f"{detail}. Stand down/reap those panes before relaunch.\n"
         )
         return 5
-    if any(provider_by_role[role] == "codex" for role in to_spawn):
+    starts_process = {SpawnAction.SPAWN_NEW, SpawnAction.RESPAWN_DEAD}
+    if any(
+        provider_by_role[role] == "codex" and decisions[role] in starts_process
+        for role in requested
+    ):
         try:
             validate_codex_hook_graph()
         except ProviderMapError as e:
@@ -512,53 +741,149 @@ def main(argv: list[str] | None = None) -> int:
                 f"sable-spawn-manager: refusing Codex pane spawn: {e}\n"
             )
             return 5
-    for role in skipped:
-        sys.stderr.write(f"sable-spawn-manager: {role} already running — skipping\n")
+    for role in requested:
+        action = decisions[role]
+        if action is SpawnAction.SKIP_ALIVE:
+            sys.stderr.write(
+                f"sable-spawn-manager: {role} ALIVE-AND-SESSIONED in "
+                f"pane={existing[role].pane_id} — skipping\n"
+            )
+        elif action is SpawnAction.ADOPT_REFERENCE:
+            pane = existing[role]
+            if not write_pane_option(
+                base, pane.pane_id, "@sable_kicked_epoch", pane.boot_epoch
+            ):
+                sys.stderr.write(
+                    "sable-spawn-manager: UNKNOWN liveness precondition — "
+                    f"could not adopt role={role} pane={pane.pane_id}; no kick "
+                    "or kill attempted.\n"
+                )
+                return 12
+            sys.stderr.write(
+                f"sable-spawn-manager: ADOPTED role={role} pane={pane.pane_id} "
+                f"at epoch={pane.boot_epoch} without typing or killing\n"
+            )
 
     ready_timeout = float(os.environ.get("SABLE_DISPATCH_READY_TIMEOUT", "25"))
     submit_tries = int(os.environ.get("SABLE_DISPATCH_SUBMIT_TRIES", "8"))
     poll_interval = float(os.environ.get("SABLE_DISPATCH_POLL_INTERVAL", "1.0"))
+    epoch_tries = int(os.environ.get("SABLE_MANAGER_REKICK_TRIES", "3"))
     producer_model = ns.model or DEFAULT_PRODUCER_MODEL
 
-    for role in to_spawn:
+    for role in requested:
+        action = decisions[role]
+        if action in (SpawnAction.SKIP_ALIVE, SpawnAction.ADOPT_REFERENCE):
+            continue
         is_producer = role in PRODUCER_ROLES
         provider = provider_by_role[role]
-        cmd = (producer_command(producer_model, provider, root)
-               if is_producer else manager_command(provider, root))
-        pane = subprocess.run(base + window_args(session, role, cmd, provider),
-                              capture_output=True, text=True, check=True).stdout.strip()
-        subprocess.run(base + ["set-option", "-p", "-t", pane, "@sable_role", role],
-                       check=True)
-        subprocess.run(base + ["set-option", "-p", "-t", pane, "@sable_provider",
-                               provider], check=True)
-        subprocess.run(base + ["set-option", "-p", "-t", pane, "@sable_class",
-                               sable_class(role)], check=True)
-        if is_producer:
-            subprocess.run(base + ["set-option", "-p", "-t", pane, "@sable_deliverable",
-                                   ns.deliverable], check=True)
-        if root:
-            subprocess.run(base + ["set-option", "-p", "-t", pane, "@sable_repo", root],
-                           check=True)
-        # Constraint 3 (73t4): read the pane's ACTUAL assigned name post-spawn and
-        # register it when the harness suffixed it into an instance. For a bare
-        # role this is a no-op (base == name), so the default single-instance flow
-        # writes nothing to the registry.
-        assigned = subprocess.run(
-            base + ["display-message", "-p", "-t", pane, "#{@sable_role}"],
-            capture_output=True, text=True).stdout.strip() or role
-        register_instance(
-            assigned,
-            actor=(
-                os.environ.get("SABLE_AGENT_NAME")
-                or os.environ.get("CLAUDE_AGENT_NAME")
-            ),
-        )
-        if ready_timeout > 0:
-            ready = wait_for_ready(
+        invocation_owned = action in starts_process
+
+        if action is SpawnAction.REKICK_RESTARTED:
+            pane = existing[role].pane_id
+        else:
+            raw_cmd = (
+                producer_command(producer_model, provider, root)
+                if is_producer
+                else manager_command(provider, root)
+            )
+            cmd = with_lifecycle_flags(raw_cmd)
+            if action is SpawnAction.RESPAWN_DEAD:
+                pane = existing[role].pane_id
+                for option in (
+                    "@sable_status",
+                    "@sable_boot_agent",
+                    "@sable_boot_epoch",
+                    "@sable_kicked_epoch",
+                ):
+                    if not clear_pane_option(base, pane, option):
+                        sys.stderr.write(
+                            "sable-spawn-manager: refused respawn for "
+                            f"role={role} pane={pane}: could not clear stale "
+                            f"{option}.\n"
+                        )
+                        return 12
+                subprocess.run(
+                    base + respawn_args(pane, role, cmd, provider),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+            else:
+                pane = subprocess.run(
+                    base + window_args(session, role, cmd, provider),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip()
+
+            for option, value in (
+                ("@sable_role", role),
+                ("@sable_provider", provider),
+                ("@sable_class", sable_class(role)),
+            ):
+                if not write_pane_option(base, pane, option, value):
+                    cleanup = rollback_failed_pane(base, pane)
+                    sys.stderr.write(
+                        "sable-spawn-manager: REFUSING bootstrap "
+                        f"role={role} pane={pane}: could not stamp {option}; "
+                        f"{cleanup}.\n"
+                    )
+                    return 12
+            if is_producer and not write_pane_option(
+                base, pane, "@sable_deliverable", ns.deliverable or ""
+            ):
+                cleanup = rollback_failed_pane(base, pane)
+                sys.stderr.write(
+                    "sable-spawn-manager: REFUSING producer bootstrap "
+                    f"role={role} pane={pane}: deliverable tag failed; {cleanup}.\n"
+                )
+                return 12
+            if root and not write_pane_option(base, pane, "@sable_repo", root):
+                cleanup = rollback_failed_pane(base, pane)
+                sys.stderr.write(
+                    "sable-spawn-manager: REFUSING bootstrap "
+                    f"role={role} pane={pane}: repo tag failed; {cleanup}.\n"
+                )
+                return 12
+
+            assigned = subprocess.run(
+                base + ["display-message", "-p", "-t", pane, "#{@sable_role}"],
+                capture_output=True,
+                text=True,
+            ).stdout.strip() or role
+            register_instance(
+                assigned,
+                actor=(
+                    os.environ.get("SABLE_AGENT_NAME")
+                    or os.environ.get("CLAUDE_AGENT_NAME")
+                ),
+            )
+
+        kick = kick_message(role, deliverable=ns.deliverable if is_producer else None)
+        if not is_producer:
+            try:
+                kick = provider_boot_message(provider, role, kick, base=root)
+            except ProviderMapError as e:
+                cleanup = (
+                    rollback_failed_pane(base, pane)
+                    if invocation_owned
+                    else "existing restarted pane left untouched"
+                )
+                sys.stderr.write(
+                    "sable-spawn-manager: REFUSING bootstrap "
+                    f"role={role} pane={pane} provider={provider}: {e}; "
+                    f"{cleanup}.\n"
+                )
+                return 5
+
+        def pane_ready_now() -> bool:
+            return ready_timeout <= 0 or wait_for_ready(
                 base, pane, ready_timeout, interval=poll_interval,
                 provider=provider,
             )
-            if not ready:
+
+        if is_producer:
+            if not pane_ready_now():
                 cap = capture_pane(base, pane)
                 state = (
                     "interactive dialog/selector"
@@ -569,34 +894,85 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stderr.write(
                     "sable-spawn-manager: REFUSING bootstrap "
                     f"role={role} pane={pane} provider={provider} state={state}; "
-                    f"operating-loop kick was NOT typed; {cleanup}.\n"
+                    f"producer kick was NOT typed; {cleanup}.\n"
                 )
                 return 10
-        kick = kick_message(role, deliverable=ns.deliverable if is_producer else None)
-        if not is_producer:
-            try:
-                kick = provider_boot_message(provider, role, kick, base=root)
-            except ProviderMapError as e:
+            if not deliver_text(
+                base, pane, kick, KICK_TAG, tries=submit_tries,
+                interval=poll_interval, provider=provider,
+            ):
                 cleanup = rollback_failed_pane(base, pane)
                 sys.stderr.write(
                     "sable-spawn-manager: REFUSING bootstrap "
-                    f"role={role} pane={pane} provider={provider}: {e}; "
-                    f"{cleanup}.\n"
+                    f"role={role} pane={pane} provider={provider}: delivery "
+                    f"could not be verified; {cleanup}.\n"
                 )
-                return 5
-        if deliver_text(base, pane, kick, KICK_TAG,
-                        tries=submit_tries, interval=poll_interval,
-                        provider=provider):
-            sys.stderr.write(f"sable-spawn-manager: {role} up in its own window, "
-                             f"kicked into its operating loop\n")
-        else:
-            cleanup = rollback_failed_pane(base, pane)
+                return 11
+            verb = "respawned" if action is SpawnAction.RESPAWN_DEAD else "up"
+            sys.stderr.write(
+                f"sable-spawn-manager: {role} {verb} in pane={pane}, kicked "
+                "into its bounded producer run\n"
+            )
+            continue
+
+        stable, detail = stabilize_manager_kick(
+            ready=pane_ready_now,
+            read_epoch=lambda: pane_option(base, pane, "@sable_boot_epoch"),
+            deliver=lambda _epoch: deliver_text(
+                base, pane, kick, KICK_TAG, tries=submit_tries,
+                interval=poll_interval, provider=provider,
+            ),
+            record=lambda epoch: write_pane_option(
+                base, pane, "@sable_kicked_epoch", epoch
+            ),
+            attempts=epoch_tries,
+        )
+        if not stable:
+            diagnostic = (
+                "delivery could not be verified"
+                if detail == "delivery-unverified"
+                else detail
+            )
+            if detail == "pane-not-ready":
+                cap = capture_pane(base, pane)
+                state = (
+                    "interactive dialog/selector"
+                    if dialog_posture(cap)
+                    else "not in composer posture (still booting, exited, or stuck)"
+                )
+                diagnostic = f"{detail}; state={state}; kick was NOT typed"
+            cleanup = (
+                rollback_failed_pane(base, pane)
+                if invocation_owned
+                else "existing restarted pane left untouched"
+            )
+            exit_code = (
+                10 if detail == "pane-not-ready"
+                else 11 if detail == "delivery-unverified"
+                else 12
+            )
             sys.stderr.write(
                 "sable-spawn-manager: REFUSING bootstrap "
-                f"role={role} pane={pane} provider={provider}: delivery could "
-                f"not be verified; {cleanup}.\n"
+                f"role={role} pane={pane} provider={provider}: {diagnostic}; "
+                f"kick reference NOT published; {cleanup}.\n"
             )
-            return 11
+            return exit_code
+
+        if action is SpawnAction.REKICK_RESTARTED:
+            sys.stderr.write(
+                f"sable-spawn-manager: RESTARTED-SINCE detected for role={role} "
+                f"pane={pane}; re-kicked operating loop at epoch={detail}\n"
+            )
+        elif action is SpawnAction.RESPAWN_DEAD:
+            sys.stderr.write(
+                f"sable-spawn-manager: DEAD role={role} respawned in same "
+                f"pane={pane}; kicked at epoch={detail}\n"
+            )
+        else:
+            sys.stderr.write(
+                f"sable-spawn-manager: {role} up in pane={pane}, kicked into "
+                f"its operating loop at epoch={detail}\n"
+            )
     return 0
 
 
