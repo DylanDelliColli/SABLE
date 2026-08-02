@@ -493,16 +493,25 @@ PY
     cat > "$SLOWBD_DIR/bd" <<SH
 #!/usr/bin/env bash
 if [ "\$1" = "dep" ]; then
-  sleep 2
-  exit 1
+  exec sleep 2
 fi
 exec "$REAL_BD" "\$@"
 SH
     chmod +x "$SLOWBD_DIR/bd"
 
+    SLOWBD_SCRIPT="$(<"$SLOWBD_DIR/bd")"
+    if [[ "$SLOWBD_SCRIPT" == *$'\n  exec sleep 2\n'* ]]; then
+      pass "slow-bd fixture: timed process execs the sleeper instead of leaving an orphan child"
+    else
+      fail "slow-bd fixture: timed process execs the sleeper instead of leaving an orphan child" \
+           "intercepted dep command does not replace its shell with sleep"
+    fi
+
+    SLOWBD_STARTED_SECONDS=$SECONDS
     SPAWN_SLOWBD_OUT=$(spawn_governance_run "PATH=$SLOWBD_DIR:$PATH" \
                           SABLE_DEP_CHECK_TIMEOUT=0.5)
     SPAWN_SLOWBD_RC=$?
+    SLOWBD_ELAPSED_SECONDS=$((SECONDS - SLOWBD_STARTED_SECONDS))
     if echo "$SPAWN_SLOWBD_OUT" | grep -q 'COULD NOT ASSESS' \
        && ! echo "$SPAWN_SLOWBD_OUT" | grep -q 'UNMERGED-BLOCKER WARNING' \
        && [ "$SPAWN_SLOWBD_RC" -eq 5 ]; then
@@ -510,6 +519,12 @@ SH
     else
       fail "WIRING: bd PRESENT-BUT-UNAVAILABLE (hung under contention) reports COULD NOT ASSESS on the real dispatch path, not silence (SABLE-wezu1)" \
            "rc=$SPAWN_SLOWBD_RC output: ${SPAWN_SLOWBD_OUT:-<empty — the SABLE-wezu1 defect, reproduced>}"
+    fi
+    if [ "$SLOWBD_ELAPSED_SECONDS" -lt 2 ]; then
+      pass "slow-bd fixture: outer timeout returns before the two-second sleeper can hold the capture pipe open"
+    else
+      fail "slow-bd fixture: outer timeout returns before the two-second sleeper can hold the capture pipe open" \
+           "elapsed=${SLOWBD_ELAPSED_SECONDS}s (outer timeout=500ms, sleeper=2000ms)"
     fi
 
     # Complement, same fixture (still a genuine unmerged blocker), healthy bd:

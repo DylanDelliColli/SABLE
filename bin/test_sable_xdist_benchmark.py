@@ -2,6 +2,7 @@
 """Unit tests for the bounded xdist benchmark sampler."""
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -18,6 +19,43 @@ SPEC = importlib.util.spec_from_file_location("sable_xdist_benchmark", TARGET)
 benchmark = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(benchmark)
+
+
+def test_cli_requires_an_explicit_valid_active_bead():
+    with pytest.raises(SystemExit):
+        benchmark.parse_args(["--repetitions", "2"])
+    with pytest.raises(SystemExit):
+        benchmark.parse_args(["--bead", "not a bead", "--repetitions", "2"])
+
+    args = benchmark.parse_args([
+        "--bead", "SABLE-y4nom.7.7", "--repetitions", "2",
+    ])
+    assert args.bead == "SABLE-y4nom.7.7"
+
+
+def test_bash_identity_is_resolved_versioned_and_content_addressed():
+    identity = benchmark.bash_identity()
+    executable = Path(identity["executable"])
+
+    assert executable.is_absolute()
+    assert executable == executable.resolve()
+    assert identity["version"].startswith("GNU bash, version ")
+    assert identity["sha256"] == hashlib.sha256(executable.read_bytes()).hexdigest()
+
+
+def test_environment_record_carries_the_executed_bash_identity(monkeypatch):
+    identity = {
+        "executable": "/verified/bin/bash",
+        "version": "GNU bash, version test",
+        "sha256": "b" * 64,
+    }
+    monkeypatch.setattr(benchmark, "bash_identity", lambda: identity)
+
+    environment = benchmark.environment_record()
+
+    assert environment["bash_executable"] == identity["executable"]
+    assert environment["bash_version"] == identity["version"]
+    assert environment["bash_sha256"] == identity["sha256"]
 
 
 def test_width_commands_are_bounded_and_loadscope_only(tmp_path):
@@ -220,14 +258,24 @@ def test_run_once_records_real_process_collection_outcomes_and_costs(tmp_path, m
     assert record["dirty_after"] == ""
 
 
-def test_overlap_commands_pin_n2_python_and_the_serial_shell_allowlist(tmp_path):
+def test_overlap_commands_pin_n2_python_and_the_resolved_serial_shell_allowlist(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        benchmark,
+        "bash_identity",
+        lambda: {
+            "executable": "/verified/bin/bash",
+            "version": "GNU bash, version test",
+            "sha256": "a" * 64,
+        },
+    )
     python, shell = benchmark.overlap_commands(tmp_path)
 
     assert python[-3:] == ["-n", "2", "--dist=loadscope"]
     assert "auto" not in python
     assert "4" not in python[-3:]
     assert shell == [
-        "bash", ".github/ci/shell-run-set.sh", "--profile",
+        "/verified/bin/bash", ".github/ci/shell-run-set.sh", "--profile",
         str(tmp_path / "shell.tsv"),
     ]
 
@@ -424,6 +472,39 @@ def test_overlap_timeout_reaps_both_process_groups(tmp_path, monkeypatch):
             os.kill(int(raw), 0)
 
 
+def test_ladder_summary_uses_the_explicit_active_bead(tmp_path, monkeypatch):
+    monkeypatch.setattr(benchmark, "_require_clean", lambda _repo: "a" * 40)
+    monkeypatch.setattr(benchmark.importlib.util, "find_spec", lambda _name: object())
+    monkeypatch.setattr(benchmark, "environment_record", lambda: {"test": True})
+
+    walls = {
+        "serial": (100.0, 101.0),
+        "2": (70.0, 71.0),
+        "4": (50.0, 51.0),
+    }
+
+    def fake_run(_repo, _root, width, repetition, _timeout, _head):
+        return _record(repetition, wall=walls[width][repetition - 1])
+
+    monkeypatch.setattr(benchmark, "run_once", fake_run)
+
+    rc, result = benchmark.run_ladder(
+        tmp_path,
+        tmp_path,
+        bead="SABLE-y4nom.7.7",
+        repetitions=2,
+        timeout_seconds=1000,
+        min_improvement=.10,
+        tail_ratio=1.5,
+        tail_absolute_seconds=5,
+        shell_baseline_seconds=400,
+    )
+
+    assert rc == 0
+    assert result["bead"] == "SABLE-y4nom.7.7"
+    assert json.loads((tmp_path / "summary.json").read_text())["bead"] == "SABLE-y4nom.7.7"
+
+
 def test_overlap_experiment_runs_one_reference_then_repeated_candidate(tmp_path, monkeypatch):
     reference = _record(1, wall=510.0, outcome="python", max_module=140.0)
     overlap = {
@@ -447,16 +528,20 @@ def test_overlap_experiment_runs_one_reference_then_repeated_candidate(tmp_path,
     monkeypatch.setattr(benchmark, "environment_record", lambda: {"test": True})
 
     rc, result = benchmark.run_overlap_experiment(
-        tmp_path, tmp_path, repetitions=2, timeout_seconds=1000,
+        tmp_path, tmp_path, bead="SABLE-y4nom.7.7",
+        repetitions=2, timeout_seconds=1000,
         tail_ratio=1.5, tail_absolute_seconds=5,
         broad_target_seconds=600,
     )
 
     assert rc == 0
     assert result["verdict"] == "GO"
+    assert result["bead"] == "SABLE-y4nom.7.7"
     assert result["overlap"]["wall_p95_seconds"] == 550.0
     assert calls == [("reference", "2", 1), ("overlap", 1), ("overlap", 2)]
-    assert json.loads((tmp_path / "summary.json").read_text())["verdict"] == "GO"
+    written = json.loads((tmp_path / "summary.json").read_text())
+    assert written["verdict"] == "GO"
+    assert written["bead"] == "SABLE-y4nom.7.7"
 
 
 def test_overlap_experiment_stops_after_the_first_red_lane(tmp_path, monkeypatch):
@@ -476,7 +561,8 @@ def test_overlap_experiment_stops_after_the_first_red_lane(tmp_path, monkeypatch
     monkeypatch.setattr(benchmark, "environment_record", lambda: {"test": True})
 
     rc, result = benchmark.run_overlap_experiment(
-        tmp_path, tmp_path, repetitions=3, timeout_seconds=1000,
+        tmp_path, tmp_path, bead="SABLE-y4nom.7.7",
+        repetitions=3, timeout_seconds=1000,
         tail_ratio=1.5, tail_absolute_seconds=5,
         broad_target_seconds=600,
     )

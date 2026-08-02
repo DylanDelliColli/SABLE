@@ -425,3 +425,57 @@ The next boundary is measured rather than speculative: reduce at least about
 75 seconds from the contention-sensitive shell/setup surface while preserving
 all identities and verdicts, then rerun two clean overlap samples. Adoption
 remains gated on repeated p95 below 600 seconds.
+
+## Broad-lane contention reduction result (`SABLE-y4nom.7.6`)
+
+The follow-up reduced repeated fixture and process setup without removing a
+suite, weakening an assertion family, widening a timeout/load limit, or changing
+any production validation topology. The landed payload is
+`71055f5788963b93f98a3f7e7d3750371bea77a9`; exact-object preview run
+`30732482002` passed, and preview `420297c6a1f8bb801c6341a5488cf6ca9b3d68c2`
+was promoted.
+
+The clean serial publisher bound all 124 Python modules and all 97 shell
+`ALLOW` suites with zero provisional entries:
+
+| Canonical producer | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Complete publisher | 1,309.70s | 1,227.84s | -81.86s |
+| Python | 826.764s | 775.706s | -51.058s |
+| Shell | 481.349s | 429.941s | -51.408s |
+
+An independent frozen shell run was also 97/97 green in 426.76 seconds, with
+418.064 seconds of measured suite work. Across the 18 changed shell suites,
+15 improved against the prior overlap artifact; their aggregate overlap time
+fell from 422.458 seconds to a two-run mean of 362.502 seconds (-59.957s,
+14.2%). This established that the setup reductions were real even though the
+broader topology still failed its adoption boundary.
+
+The exact rerun artifacts are under
+`.git/sable/xdist-benchmark/71055f5-y4nom76-final/`:
+
+| Sample | Combined wall | Python | Shell | Result |
+| --- | ---: | ---: | ---: | --- |
+| Same-object fixed-`n2` reference | 474.536s | 474.536s | -- | Green |
+| Overlap 1 | 624.892s | 583.729s, rc 0 | 624.892s wall / 620.824s suite sum, 97/97 | **NO-GO** |
+| Overlap 2 | 650.347s | 611.286s, rc 1 load guard | 650.346s wall / 646.117s suite sum, 97/97 | **NO-GO** |
+
+All three Python executions collected the same 3,445 identities and produced
+3,428 passes plus 17 skips, with identical collection and semantic outcome
+digests. Both shell repetitions executed the exact 97-suite catalog once and
+all passed. Source stayed clean and fixed; there were no timeouts, artifact
+errors, or source movement.
+
+The second Python lane exited 1 solely because
+`bin/test_sable_test_cost_profile_lib.py` grew from 35.405 seconds in the
+reference to 41.541 and 53.926 seconds under overlap, crossing the unchanged
+45-second ordinary-module load limit. No test failed and no individual test
+crossed its limit. That guard is not waived. Independently, the combined p95
+was 650.347 seconds, 50.347 seconds above the strict target, so production
+overlap remains disabled.
+
+`SABLE-y4nom.7.7` owns the measured residual: duplicated clean-room/bin-install
+execution, timeout-process reaping in the dep-merge fixture, cost-profile
+module setup amplification, and a benchmark-provenance correction. A future
+production-adoption bead may be created only after that work produces two
+complete rc-0 repetitions with p95 strictly below 600 seconds.
