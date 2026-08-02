@@ -101,10 +101,21 @@ PATH="$FAKE_BD_DIR:$PATH" SABLE_APPROVAL_ACTOR=test-operator \
   --beads SABLE-test >/dev/null 2>&1
 if [ "$?" -eq 0 ]; then pass "documented Quick gate writes durable handoff receipt"; else fail "documented Quick gate writes durable handoff receipt"; fi
 
+PLANNING_HANDOFF="$(PATH="$FAKE_BD_DIR:$PATH" SABLE_MODE_STATE="$STATE_TMP" \
+  "$MODE_BIN" handoff show 2>/dev/null)"; PLANNING_HANDOFF_RC=$?
+if [ "$PLANNING_HANDOFF_RC" -eq 0 ]; then pass "planning handoff show renders the approved receipt"; else fail "planning handoff show renders the approved receipt" "rc=$PLANNING_HANDOFF_RC"; fi
+
 PATH="$FAKE_BD_DIR:$PATH" SABLE_MODE_STATE="$STATE_TMP" \
   "$MODE_BIN" set execution --fleet optimus,tarzan,chuck >/dev/null 2>&1
 assert_exec="$(SABLE_MODE_STATE="$STATE_TMP" "$MODE_BIN" get 2>/dev/null)"
 if [ "$assert_exec" = "execution" ]; then pass "documented /sable-execute mechanism yields mode=execution"; else fail "documented /sable-execute mechanism yields mode=execution" "got '$assert_exec'"; fi
+EXECUTION_HANDOFF="$(SABLE_MODE_STATE="$STATE_TMP" "$MODE_BIN" handoff show 2>/dev/null)"; EXECUTION_HANDOFF_RC=$?
+if [ "$EXECUTION_HANDOFF_RC" -eq 0 ]; then pass "execution handoff show renders the carried receipt"; else fail "execution handoff show renders the carried receipt" "rc=$EXECUTION_HANDOFF_RC"; fi
+if [ "$PLANNING_HANDOFF" = "$EXECUTION_HANDOFF" ]; then
+  pass "planning and execution handoff show output is byte-identical"
+else
+  fail "planning and execution handoff show output is byte-identical"
+fi
 rm -rf "$FAKE_BD_DIR"
 rm -f "$STATE_TMP" "$STATE_TMP.lock"
 

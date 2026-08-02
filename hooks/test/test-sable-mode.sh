@@ -89,6 +89,57 @@ fresh_state
 "$MODE_BIN" set execution --break-glass --reason " " >/dev/null 2>&1
 assert_nonzero "break-glass requires a nonblank reason" "$?"
 
+# ---------- SABLE-1zau6: the carried handoff is readable in execution ----------
+# Fleet start validates this exact embedded authority through
+# validate_execution_authority.  `handoff show` must expose that same validated
+# object in execution mode instead of rejecting the mode that consumes it.
+fresh_state
+set_execution >/dev/null 2>&1
+EXPECTED_HANDOFF="$("$MODE_BIN" show 2>/dev/null | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["handoff"], indent=2))')"
+ACTUAL_HANDOFF="$("$MODE_BIN" handoff show 2>/dev/null)"; rc=$?
+assert_zero "handoff show succeeds in execution mode with carried authority" "$rc"
+assert_eq "execution handoff show renders the carried authority byte-for-byte" "$EXPECTED_HANDOFF" "$ACTUAL_HANDOFF"
+
+# Absence and corruption are evidence failures, not wrong-mode failures.  They
+# remain nonzero and name CANNOT-ASSESS so a manager cannot widen scope after a
+# damaged receipt.
+python3 -c 'import json,os; p=os.environ["SABLE_MODE_STATE"]; d=json.load(open(p)); d.pop("handoff", None); open(p,"w").write(json.dumps(d)+"\n")'
+MISSING_HANDOFF_OUT="$("$MODE_BIN" handoff show 2>&1)"; rc=$?
+assert_nonzero "execution handoff show without proof exits nonzero" "$rc"
+case "$MISSING_HANDOFF_OUT" in
+  *CANNOT-ASSESS*) pass "missing execution proof is named CANNOT-ASSESS" ;;
+  *) fail "missing execution proof is named CANNOT-ASSESS" "got: $MISSING_HANDOFF_OUT" ;;
+esac
+case "$MISSING_HANDOFF_OUT" in
+  *"planning state is not active"*) fail "missing execution proof is not mislabeled as wrong mode" "got: $MISSING_HANDOFF_OUT" ;;
+  *) pass "missing execution proof is not mislabeled as wrong mode" ;;
+esac
+
+fresh_state
+set_execution >/dev/null 2>&1
+python3 -c 'import json,os; p=os.environ["SABLE_MODE_STATE"]; d=json.load(open(p)); d["handoff"]["receipt_id"]="tampered"; open(p,"w").write(json.dumps(d)+"\n")'
+CORRUPT_HANDOFF_OUT="$("$MODE_BIN" handoff show 2>&1)"; rc=$?
+assert_nonzero "execution handoff show with corrupt proof exits nonzero" "$rc"
+case "$CORRUPT_HANDOFF_OUT" in
+  *CANNOT-ASSESS*digest*) pass "corrupt execution proof is rejected by the authority validator" ;;
+  *) fail "corrupt execution proof is rejected by the authority validator" "got: $CORRUPT_HANDOFF_OUT" ;;
+esac
+
+# Planning without a receipt keeps its definitive no-receipt result and never
+# claims the caller chose the wrong mode.
+fresh_state
+"$MODE_BIN" set planning >/dev/null 2>&1
+NO_PLANNING_HANDOFF_OUT="$("$MODE_BIN" handoff show 2>&1)"; rc=$?
+assert_nonzero "planning handoff show without a receipt exits nonzero" "$rc"
+case "$NO_PLANNING_HANDOFF_OUT" in
+  *"no handoff receipt"*) pass "planning no-receipt error names the missing receipt" ;;
+  *) fail "planning no-receipt error names the missing receipt" "got: $NO_PLANNING_HANDOFF_OUT" ;;
+esac
+case "$NO_PLANNING_HANDOFF_OUT" in
+  *"planning state is not active"*) fail "planning no-receipt error is not a wrong-mode error" "got: $NO_PLANNING_HANDOFF_OUT" ;;
+  *) pass "planning no-receipt error is not a wrong-mode error" ;;
+esac
+
 # ---------- fleet round-trip ----------
 
 fresh_state
