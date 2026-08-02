@@ -3279,7 +3279,7 @@ def test_dep_merge_advisory_reports_could_not_assess_on_unexpected_crash(
 
 def test_dep_merge_advisory_relays_trimmed_stderr_on_could_not_assess(
         tmp_path, monkeypatch):
-    """stderr is captured (capture_output=True) via subprocess.run but was
+    """stderr is captured from the checker process but was
     previously discarded on every could-not-assess leg. On a crash it holds
     the whole diagnostic; without it a manager seeing COULD NOT ASSESS has to
     reproduce the crash by hand just to learn why."""
@@ -3315,14 +3315,14 @@ def test_dep_merge_advisory_reports_could_not_assess_when_checker_errors_to_run(
     script.chmod(0o755)
     monkeypatch.setenv("SABLE_DEP_CHECK_BIN", str(script))
 
-    real_run = ssw.subprocess.run
+    real_popen = ssw.subprocess.Popen
 
     def _boom(*args, **kwargs):
         raise OSError("simulated exec failure")
 
-    monkeypatch.setattr(ssw.subprocess, "run", _boom)
+    monkeypatch.setattr(ssw.subprocess, "Popen", _boom)
     out = ssw.dep_merge_advisory(["SABLE-dep"], str(tmp_path))
-    monkeypatch.setattr(ssw.subprocess, "run", real_run)
+    monkeypatch.setattr(ssw.subprocess, "Popen", real_popen)
     assert out is not None
     assert "COULD NOT ASSESS" in out
 
